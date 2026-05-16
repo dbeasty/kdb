@@ -1,1 +1,70 @@
-# kdb
+# KDB — Portable Embedded Database Engine
+
+> **Status: exploratory speccing work.** This repository contains the architecture specification and design artefacts for KDB. No production implementation exists yet. Everything here is subject to change.
+
+---
+
+## Overview
+
+KDB is a portable, multi-runtime embedded database engine written in Kotlin Multiplatform. The **entire engine** — not a client library, not a thin SDK — compiles and runs on browser clients (via Kotlin/JS), JVM backends, and native targets (via Kotlin/Native). The same Kotlin codebase produces all three runtimes. Only storage adapters and transport adapters differ per platform; all engine logic is shared.
+
+KDB is best understood as **source control for structured documents**. You store whole JSON documents. You retrieve whole JSON documents. Optionally you declare a schema — a typed, indexed lens over part of each document — which unlocks SQL querying, JDBC connectivity, and ORM integration. The document is always the truth. The schema is always a lens. Both coexist without friction.
+
+Primary storage is JSON. Binary storage uses BSON (Apache 2.0 licensed open spec) compressed with zstd. SQL operates as an index and query layer over schema-declared fields, but raw JSON access is always available alongside SQL in the same query. All data lives in versioned, content-addressed namespaces with git-like history. Peer synchronisation follows a source-control model: peers are fully independent, can diverge arbitrarily, and merge when they choose to.
+
+---
+
+## Goals
+
+- Full engine runs on every target: browser (JS), JVM backend, native binary
+- Single Kotlin codebase compiled to all targets via Kotlin Multiplatform
+- Documents are stored and retrieved as whole JSON — always, exactly as provided
+- Schema is an optional typed lens over document fields, not a constraint on document shape
+- SQL and raw JSON access work together in the same query via the `_doc` column
+- JDBC driver for full compatibility with Java ORMs, SQL IDEs, and BI tools — highest priority
+- Git-like versioning per namespace: full commit DAG, branches, tags, checkout, diff
+- Source-control peer protocol: peers diverge independently and merge on reconnect
+- Three client modes: pure stream, write-back stream, full peer
+- Transaction-based conflict resolution with application-controlled replay
+- Tiered storage: hot → warm → cold → ice archive
+- CLI interface modelled on git for developer tooling
+- GPU-accelerated bulk read path and vector similarity as an optional index type
+
+## Non-Goals
+
+- KDB is not a general-purpose SQL database; SQL is an index and query interface, not the storage model
+- KDB does not enforce a central authoritative node; all peers are equal
+- KDB does not replace Kafka as a high-throughput event bus
+- KDB does not manage network topology; peer discovery is the application's responsibility
+
+## Design Principles
+
+- The document is always the truth; schema is always a lens
+- The engine is the same on every platform; only adapters differ
+- JSON is always the canonical representation of meaning
+- BSON+zstd is always a storage and transport optimisation, never a requirement
+- SQL addresses data via schema; `_doc` always gives access to the whole document
+- Peers are equal; any peer can sync with any other peer directly
+- Divergence is normal; merging is explicit and application-controlled
+- Conflicts surface to the application; KDB never silently resolves them
+- History is cheap because unchanged content is shared by hash
+
+---
+
+## Specification
+
+The current architecture specification is [`docs/kdb-spec-v0_9.md`](docs/kdb-spec-v0_9.md).
+
+---
+
+## License
+
+Copyright © 2026 Limidus Corp. All rights reserved.
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+---
+
+## Disclaimer
+
+This software and its associated specifications are provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software.
