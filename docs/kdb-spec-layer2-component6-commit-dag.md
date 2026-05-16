@@ -455,7 +455,7 @@ Pure in-memory implementation backed by `LinkedHashMap`. Required for tests and 
 - **Does not manage storage persistence** — the `CommitDag` interface is backed by a storage adapter (RocksDB, IndexedDB, mmap). The adapter is provided via constructor injection. This module only defines the interface and the in-memory implementation.
 - **Does not implement the wire protocol** — DAG exchange between peers is handled by the Peer Sync module (Component 21).
 - **Does not implement index maintenance** — the Index Layer (Component 8) is responsible for keeping indexes consistent with commits.
-- **Does not perform garbage collection** — GC beyond `squash` (removing unreachable orphan commits) is the Compaction Engine’s responsibility (Component 17).
+- **Does not perform garbage collection** — GC beyond `squash` (removing unreachable orphan commits) is the Compaction Engine’s responsibility (Component 19, Layer 6).
 
 -----
 

@@ -125,7 +125,7 @@ data class NamespaceTierPolicy(
 interface TierSignalHooks {
   /** Layer 4a compaction registers here. */
   fun onCompactionCandidate(listener: (TierSignalEvent.CompactionCandidate) -> Unit)
-  /** Future Layer 6 Storage Tier Manager registers here. */
+  /** Future Layer 7 Storage Tier Manager (Component 20) registers here. */
   fun onTierTransition(listener: (TierSignalEvent.Transitioned) -> Unit)
   /** Rebuild scheduler / GPU engine registers here. */
   fun onGpuPromotionCandidate(listener: (TierSignalEvent.GpuPromotionCandidate) -> Unit)
@@ -147,8 +147,8 @@ class DefaultDeltaLogTierRegistry(
 |---|---|---|
 | `HOT` | Typed binary, fast random access; may include unsealed tail | Layer 4a engine |
 | `WARM` | Typed binary + zstd on local segment files | Layer 4a + signals |
-| `COLD` | zstd on object store / secondary path | Future Tier Manager (Layer 6) |
-| `ICE` | Self-contained archive bundle | Future Tier Manager (Layer 6) |
+| `COLD` | zstd on object store / secondary path | Future Tier Manager (Layer 7, Component 20) |
+| `ICE` | Self-contained archive bundle | Future Tier Manager (Layer 7, Component 20) |
 
 Component 11e **implements** HOT/WARM transitions and **signals** COLD/ICE; byte movement for COLD/ICE is out of scope.
 
@@ -182,7 +182,7 @@ Updates `lastAccessAt` and `accessCount`. Does not promote tier by itself except
 When ≥2 `HOT` segments in same namespace total size > `pageTargetSizeBytes`, emit `CompactionCandidate` with segment id list. Compaction engine (10f) subscribes via `TierSignalHooks.onCompactionCandidate`.
 
 ### Future Storage Tier Manager hook
-`onTierTransition` receives all transitions; Layer 6 Component 20 will perform physical COLD/ICE moves and call `transition` with `ARCHIVE_JOB` when complete.
+`onTierTransition` receives all transitions; Layer 7 Component 20 will perform physical COLD/ICE moves and call `transition` with `ARCHIVE_JOB` when complete.
 
 ### Browser / InMemory engines
 Segments may never leave `HOT` (no durable segment files). Registry returns empty or in-memory-only entries; hooks no-op.

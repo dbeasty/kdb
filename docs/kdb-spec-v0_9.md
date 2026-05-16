@@ -50,7 +50,12 @@ Layer 5 — Index + Query      [IMPLEMENTED — first Kotlin cut]
   [x] 16. Virtual View Engine      — `dev.kdb.sql.view` in `:kdb-sql`
   [x] Composite factory            — `:kdb-index-composite` — `compositeIndexStoreFactory`, `productionIndexManager`
 
-Layers 6–10                  [NOT STARTED]
+Layer 6 — Hybrid Query + Policy [IMPLEMENTED — first Kotlin cut]
+  [x] 17. Hybrid Query Engine      — `:kdb-hybrid-query`; spec `kdb-spec-layer6-component17-hybrid-query-engine.md`
+  [x] 18. Namespace Policy Engine  — `:kdb-namespace-policy`; spec `kdb-spec-layer6-component18-namespace-policy-engine.md`
+  [x] 19. Compaction Engine (DAG)    — `:kdb-compaction`; spec `kdb-spec-layer6-component19-compaction-engine.md`
+
+Layers 7–10                  [NOT STARTED]
 ```
 
 ### What Has Been Done
@@ -72,10 +77,12 @@ Layers 6–10                  [NOT STARTED]
 - Layer 4 implemented (Gradle modules): `:kdb-compression`, `:kdb-storage-io` (10g), `:kdb-storage-wal` (10a), `:kdb-storage-sstable` (10c), `:kdb-storage-memtable` (10b), `:kdb-storage-delta` (10d), `:kdb-storage-engine` (10e), `:kdb-storage-compaction` (10f), `:kdb-storage-manager` (11a–11e). Production I/O via `FileBackedPlatformIoShimFactory`; tests use `InMemoryPlatformIoShim`.
 - Layer 5 component specs generated (5 files): Components 12–16 — hash+btree, full-text, vector, SQL DSL + planner, virtual view engine. See Section 16.1 Layer 5 execution order.
 - Layer 5 implemented (first Kotlin cut): `:kdb-index-hash`, `:kdb-index-btree`, `:kdb-index-fulltext`, `:kdb-index-vector`, `:kdb-index-composite`, `:kdb-sql`. Index writer JSONPath fixed (`$.field`). Vector index uses brute-force cosine v1.
+- Layer 6 component specs generated (3 files): Components 17–19 — hybrid query, namespace policy, DAG compaction engine. Execution plan: `kdb-spec-layer6-execution-plan.md`. See Section 16.1 Layer 6 implementation order.
+- Layer 6 implemented (first Kotlin cut): `:kdb-namespace-policy`, `:kdb-hybrid-query`, `:kdb-compaction`. Hybrid engine wraps `:kdb-sql` with `AT VERSION`/`AT COMMIT`/`AT TIME`; policy JSON via kotlinx.serialization; DAG compaction orchestrates `CommitDag.squash` (distinct from `:kdb-storage-compaction`).
 
 ### What To Do Next
 
-**Layer 6 — Hybrid query + policy** (depends on Layer 5). See Section 16.1 for Components 17–19.
+**Layer 7 — Network foundation** (depends on Layer 6). See Section 16.1 for Components 20–22 (Storage Tier Manager, Wire Protocol, Stream Mode).
 
 Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
 
@@ -92,7 +99,8 @@ Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kd
 - Layer 4a depends on Layer 3 (`StorageAdapter`, `DeltaSegmentWriter`, `PlatformIoShim` expect); implement 10g → 10a–c → 10d → 10e → 10f
 - Layer 4b depends on Layer 4a; implement 11a → 11b → 11c, then 11d and 11e (11d/11e may overlap once pool + rebuild exist)
 - Layer 5 depends on Layers 3 + 4a/4b — interfaces in Section 17 (Layers 0–4). Implement 12 (hash + btree) first; 13 and 14 may proceed in parallel once 12’s `CompositeIndexStoreFactory` pattern exists; 15 requires 12–14 for index planning; 16 requires 15 parser/planner hooks
-- Component 15 DML paths delegate writes to Component 7 (`TransactionEngine`) — do not duplicate commit logic
+- Layer 6 depends on Layer 5 — implement **18 → 17 → 19** (policy before hybrid query and DAG compaction). Component 19 is **not** `:kdb-storage-compaction` (10f); DAG squash only. Physical tier moves remain Layer 7 Component 20.
+- Component 15 DML paths delegate writes to Component 7 (`TransactionEngine`) — do not duplicate commit logic; Component 17 routes hybrid `_doc` DML through the same engine
 - Never mix spec generation and implementation in the same session
 - Always save component spec output as `.md` files for download (see Section 16.4)
 
@@ -1036,6 +1044,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |SQL DSL (parser, planner, index selection, result assembly)                      |5,000      |
 |Virtual view engine                                                              |1,500      |
 |*Layer 5 subtotal (Components 12–16)*                                            |*~18,800*  |
+|*Layer 6 subtotal (Components 17–19)*                                            |*~6,500*   |
 |JDBC driver (Driver, Connection, Statement, ResultSet, MetaData)                 |4,500      |
 |JDBC SQL extensions (AT VERSION, kdb_json_*, kdb_id, _doc)                       |1,000      |
 |Connection URL parser + embedded + memory modes                                  |500        |
@@ -1061,7 +1070,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |Error model                                                                      |500        |
 |Test infrastructure (fixtures, in-memory adapters, test DSL)                    |5,000      |
 |JDBC integration tests (Hibernate, jOOQ, Spring Data)                           |2,000      |
-|**Total**                                                                        |**~97,350**|
+|**Total**                                                                        |**~103,850**|
 
 > **Note:** Storage adapter line items for RocksDB, IndexedDB, LMDB, and mmap are removed. The KDB Storage Engine and Storage Manager components above replace them entirely. The B-tree index estimate increases slightly because it now owns the full LSM path in pure Kotlin rather than delegating to RocksDB.
 
@@ -1129,7 +1138,7 @@ The SQL engine, JDBC driver, peer sync protocol, and KDB Storage Engine are the 
 
 -----
 
-*KDB Architecture Specification v0.9 (Layer 5 specs added)*
+*KDB Architecture Specification v0.9 (Layer 6 specs added)*
 *Status: Living document — update completed interfaces in Section 17 after each layer.*
 
 -----
@@ -1234,10 +1243,20 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 6 — Query + Policy (depends on Layer 5)
 
 ```
-[ ] 17. Hybrid Query Engine (_doc, kdb_json_*, AT VERSION)
-[ ] 18. Namespace Policy Engine
-[ ] 19. Compaction Engine
+[x] 17. Hybrid Query Engine          — `:kdb-hybrid-query`; spec `kdb-spec-layer6-component17-hybrid-query-engine.md`
+[x] 18. Namespace Policy Engine      — `:kdb-namespace-policy`; spec `kdb-spec-layer6-component18-namespace-policy-engine.md`
+[x] 19. Compaction Engine (DAG)      — `:kdb-compaction`; spec `kdb-spec-layer6-component19-compaction-engine.md`
 ```
+
+**Layer 6 implementation order (normative):**
+
+1. **18 — Namespace Policy** — policy registry, JSON/DSL parse, `CompactionPolicyEvaluator`; required by 17 and 19.
+2. **17 — Hybrid Query** — `AT VERSION` / `AT COMMIT` / `AT TIME`, checkout, `_doc` + `kdb_json_*` DML routing; facade over `:kdb-sql`.
+3. **19 — DAG Compaction** — squash + peer coordination hooks + orphan GC; **not** SSTable merge (`:kdb-storage-compaction` / 10f).
+
+**Detailed execution plan:** `docs/kdb-spec-layer6-execution-plan.md`
+
+**Estimated NBNC (Layer 6 production + tests):** ~6,500 lines (17: ~2,000; 18: ~1,500; 19: ~3,000).
 
 #### LAYER 7 — Network Foundation (depends on Layer 6)
 
@@ -2651,10 +2670,72 @@ fun compositeIndexStoreFactory(dag: CommitDag, storage: StorageAdapter, vectorDi
 fun sqlEngine(indexManager: IndexManager, storage: StorageAdapter, dag: CommitDag, ...): SqlEngine
 ```
 
-### Layer 6 Interfaces
+### Layer 6 Interfaces — Hybrid Query + Policy
 
-```
-[ not yet completed — depends on Layer 5 ]
+> **Status: IMPLEMENTED (first Kotlin cut)** — normative detail in `docs/kdb-spec-layer6-component17-*.md` … `component19-*.md`.
+
+| Component | Module | Primary entry points |
+|---|---|---|
+| 17 Hybrid Query | `:kdb-hybrid-query` | `hybridQueryEngine`, `hybridSqlParser`, `defaultVersionResolver`, `CheckoutStore` |
+| 18 Namespace Policy | `:kdb-namespace-policy` | `namespacePolicyRegistry`, `inMemoryNamespacePolicyRegistry`, `defaultNamespacePolicyParser`, `DefaultCompactionPolicyEvaluator` |
+| 19 Compaction (DAG) | `:kdb-compaction` | `compactionEngine`, `InProcessCompactionCoordinator`, `DefaultSnapshotMaterializer` |
+
+```kotlin
+package dev.kdb.policy
+
+interface NamespacePolicyRegistry {
+    suspend fun get(namespaceId: String): NamespacePolicy
+    suspend fun getOrNull(namespaceId: String): NamespacePolicy?
+    suspend fun put(policy: NamespacePolicy)
+    suspend fun delete(namespaceId: String): Boolean
+    suspend fun list(): List<String>
+}
+fun namespacePolicyRegistry(storage: StorageAdapter): NamespacePolicyRegistry
+fun inMemoryNamespacePolicyRegistry(): NamespacePolicyRegistry
+
+data class NamespacePolicy(
+    val namespaceId: String,
+    val schema: KdbSchema?,
+    val mode: NamespaceMode,
+    val history: HistoryMode,
+    val conflict: ConflictPolicy,
+    val compaction: CompactionPolicy,
+    val tiers: TierPolicy = TierPolicy(),
+    val indexRetentionDefault: IndexRetention = IndexRetention.EVICTABLE,
+    val revision: Long = 1L,
+)
+enum class HistoryMode { FULL, NONE }
+enum class SquashMode { AUTO, NEVER }
+
+interface CompactionPolicyEvaluator {
+    fun boundaryCandidates(...): List<CompactionBoundaryPlan>
+}
+object DefaultCompactionPolicyEvaluator : CompactionPolicyEvaluator
+
+package dev.kdb.query.hybrid
+
+interface HybridQueryEngine {
+    suspend fun execute(sql: String, request: HybridQueryRequest): HybridQueryResult
+    suspend fun explain(sql: String, request: HybridQueryRequest): ExplainResult
+    suspend fun checkout(namespaceId: String, ref: CommitRef): CheckoutHandle
+    suspend fun resetCheckout(namespaceId: String)
+}
+fun hybridQueryEngine(sql: SqlEngine, dag: CommitDag, policyRegistry: NamespacePolicyRegistry, ...): HybridQueryEngine
+
+sealed class VersionClause {
+    data class AtTag(val tag: String) : VersionClause()
+    data class AtCommit(val hex: String) : VersionClause()
+    data class AtTime(val iso8601: String) : VersionClause()
+}
+
+package dev.kdb.compaction
+
+interface CompactionEngine {
+    suspend fun runCycle(request: CompactionRequest): CompactionResult
+    suspend fun plan(request: CompactionRequest): CompactionPlan
+    fun updatePeerHeads(namespaceId: String, heads: Map<String, KdbHash>)
+}
+fun compactionEngine(dag: CommitDag, storage: StorageAdapter, policyRegistry: NamespacePolicyRegistry, ...): CompactionEngine
 ```
 
 ### Layer 7 Interfaces

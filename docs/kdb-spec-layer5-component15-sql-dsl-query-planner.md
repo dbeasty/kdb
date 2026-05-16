@@ -312,7 +312,7 @@ class SqlPlanningException(message: String, val sql: String) : KdbException(mess
 
 - **Full SQL-92** — v1 subset: single-table `SELECT`, basic `WHERE`, `ORDER BY`, `LIMIT`, `INSERT`/`UPDATE`/`DELETE` with simple predicates, `CREATE INDEX` / `DROP INDEX`.
 - **JOINs, subqueries, window functions, CTEs** — future.
-- **`AT VERSION` / `AT COMMIT` parsing** — Layer 6 sets `QueryContext.atCommit`; parser may accept syntax stub only.
+- **`AT VERSION` / `AT COMMIT` / `AT TIME` parsing and checkout** — Component 17 (`kdb-spec-layer6-component17-hybrid-query-engine.md`) sets `QueryContext.atCommit` via `HybridSqlParser`; this module only exposes the hook on `QueryContext`.
 - **JDBC `ResultSet` mapping** — Layer 8.
 - **Query optimisation cost model** — v1 rule-based index picker only.
 - **Virtual view expansion** — Component 16 rewrites to underlying `SelectQuery` before planning.

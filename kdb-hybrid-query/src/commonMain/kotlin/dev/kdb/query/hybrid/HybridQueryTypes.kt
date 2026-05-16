@@ -1,0 +1,47 @@
+package dev.kdb.query.hybrid
+
+import dev.kdb.codec.KdbHash
+import dev.kdb.dag.CommitRef
+import dev.kdb.schema.KdbSchema
+import dev.kdb.sql.ExplainResult
+import dev.kdb.sql.QueryResult
+import dev.kdb.sql.SqlParameter
+
+public sealed class VersionClause {
+    public data class AtTag(val tag: String) : VersionClause()
+    public data class AtCommit(val hex: String) : VersionClause()
+    public data class AtTime(val iso8601: String) : VersionClause()
+}
+
+public data class HybridQueryRequest(
+    val namespaceId: String,
+    val schema: KdbSchema,
+    val version: VersionClause? = null,
+    val parameters: List<SqlParameter> = emptyList(),
+    val maxRows: Int = 10_000,
+)
+
+public data class HybridQueryResult(
+    val result: QueryResult,
+    val resolvedCommit: KdbHash,
+    val readOnly: Boolean,
+)
+
+public data class CheckoutHandle(
+    val namespaceId: String,
+    val commitHash: KdbHash,
+    val readOnly: Boolean = true,
+)
+
+public interface PreparedHybridQuery {
+    public val parameterCount: Int
+    public suspend fun execute(
+        bindings: List<SqlParameter>,
+        request: HybridQueryRequest,
+    ): HybridQueryResult
+}
+
+public data class ParsedHybridStatement(
+    val sql: String,
+    val version: VersionClause?,
+)

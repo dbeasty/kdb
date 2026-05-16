@@ -258,7 +258,7 @@ Failed compaction must not delete delta segments referenced by open enlistments 
 
 ## 8. Non-Goals
 
-- **DAG squash / peer CompactionIntent** — Layer 6 compaction engine.
+- **DAG squash / peer CompactionIntent** — Layer 6 Component 19 (`kdb-spec-layer6-component19-compaction-engine.md`).
 - **Ice archival / cold tier** — tier manager Layer 6.
 - **GPU segment recompaction** — GPU engine idle compaction is Layer 9.
 - **Cross-namespace compaction** — one planner instance per namespace.
