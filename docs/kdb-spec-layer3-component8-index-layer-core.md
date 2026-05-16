@@ -4,7 +4,7 @@
 
 **File:** `kdb-spec-layer3-component8-index-layer-core.md`
 **Layer:** 3 — Write Path
-**Depends on:** Layer 0 (BSON Codec, Error Model), Layer 1 (Document + Commit Model, JSON Functions Engine), Layer 2 (Schema Engine, Commit DAG)
+**Depends on:** Layer 0 (Type System & Codec, Error Model), Layer 1 (Document + Commit Model, JSON Functions Engine), Layer 2 (Schema Engine, Commit DAG)
 
 ---
 
@@ -20,7 +20,7 @@ A key responsibility is version awareness: every index operation is stamped with
 
 | Module | Interface used |
 |---|---|
-| `dev.kdb.codec` | `KdbUuid`, `KdbHash`, `KdbTimestamp`, `BsonDocument` |
+| `dev.kdb.codec` | `KdbUuid`, `KdbHash`, `KdbTimestamp`, `KdbValue` |
 | `dev.kdb.error` | `KdbException`, `KdbErrorCode`, `KdbResult`, `IndexCorruptionException` |
 | `dev.kdb.document` | `KdbDocument`, `KdbCommit`, `KdbOp`, `DocumentTree` |
 | `dev.kdb.json` | `kdbJsonGet`, `JsonValue` |
@@ -316,8 +316,8 @@ data class IndexHint(
 
 enum class IndexHintAction { PUT, DELETE }
 
-fun IndexHint.toBson(): BsonDocument
-fun IndexHint.Companion.fromBson(bson: BsonDocument): IndexHint
+fun IndexHint.toKdbValue(): KdbValue
+fun IndexHint.Companion.fromKdbValue(value: KdbValue): IndexHint
 
 // ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -464,7 +464,7 @@ Pure `commonMain`. No `expect/actual`. All physical I/O is inside the `IndexStor
 | `IndexRegistry` interface + implementation | 300 |
 | `IndexWriter` interface + implementation | 350 |
 | `IndexReader` interface + implementation | 200 |
-| `IndexHint` + BSON serialisation | 100 |
+| `IndexHint` + Layer 0 wire serialisation | 100 |
 | `IndexManager` interface + implementation | 150 |
 | Exception classes | 60 |
 | Unit tests | 600 |

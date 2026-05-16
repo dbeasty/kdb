@@ -21,10 +21,10 @@ Layer 2 — Schema + DAG       [COMPLETE]
   [x] 5. Schema Engine             — module `:kdb-schema`; normative detail in `kdb-spec-layer2-component5-schema-engine.md`
   [x] 6. Commit DAG                — module `:kdb-dag`; normative detail in `kdb-spec-layer2-component6-commit-dag.md`
 
-Layer 3 — Write Path         [IN PROGRESS — specs generated, awaiting implementation]
-  [~] 7. Transaction Engine        — component spec generated (see file: kdb-spec-layer3-component7-transaction-engine.md)
-  [~] 8. Index Layer — Core        — component spec generated (see file: kdb-spec-layer3-component8-index-layer-core.md)
-  [~] 9. Storage Adapter Interface — component spec generated (see file: kdb-spec-layer3-component9-storage-adapter-interface.md)
+Layer 3 — Write Path         [IN PROGRESS — component specs + §17 drafts ready; Kotlin modules not yet added]
+  [~] 7. Transaction Engine        — `dev.kdb.transaction`; spec: `kdb-spec-layer3-component7-transaction-engine.md`
+  [~] 8. Index Layer — Core        — `dev.kdb.index`; spec: `kdb-spec-layer3-component8-index-layer-core.md`
+  [~] 9. Storage Adapter Interface — `dev.kdb.storage`; spec: `kdb-spec-layer3-component9-storage-adapter-interface.md`
 
 All other layers             [NOT STARTED]
 ```
@@ -42,10 +42,11 @@ All other layers             [NOT STARTED]
 - Storage engine design decisions applied (v0.7 → v0.8): removed external storage dependencies, introduced two-store architecture (Delta Store + Realized Store), browser multi-enlistment model, delta authorship envelope, Storage Manager layer, split Layer 4 into 4a (Storage Engine) and 4b (Storage Manager), renumbered Layers 5–9
 - Layer 3 component specs generated (v0.8 → v0.9): Transaction Engine (Component 7), Index Layer Core (Component 8), Storage Adapter Interface (Component 9). Storage Adapter Interface incorporates all v3 design decisions: StorageCapabilitySet with GPU fields, DeltaAuthorshipEnvelope, sub-enlistment eviction state machine (FULL/DOC_EVICTED/EVICTED/RELEASED), IndexRetention (PINNED/EVICTABLE), GPU direct delta ingest path, browser snapshot repair model, IndexPinViolationEvent escalation path.
 - Layer 3 draft interfaces recorded in Section 17 → Layer 3
+- Layer 3 specs and §17 drafts are aligned with **implemented** Layer 2: transactional writes are expected to go through `CommitDag.appendCommit` / `appendMergeCommit` (with `schemaHash` carried on `KdbCommit`); `SchemaEngine.computeSchemaHash` and commit payload hashing (`KdbCommit.build` / `computeCommitHash`) are the normative hooks for schema- and content-addressed heads. Component 7 remains the only caller of those append methods once it exists.
 
 ### What To Do Next — Layer 3 Implementation
 
-Layers 0–2 are implemented in-tree (`:kdb-error`, `:kdb-codec`, `:kdb-document`, `:kdb-json`, `:kdb-schema`, `:kdb-dag`). Layer 3 component specs are complete; implement Component 9 → 7 / 8 next.
+Layers 0–2 are implemented in-tree (`:kdb-error`, `:kdb-codec`, `:kdb-document`, `:kdb-json`, `:kdb-schema`, `:kdb-dag`); their public shapes in Section 17 → Layers 0–2 are **final** for Layer 3 work. Layer 3 has no Gradle modules yet — add `:kdb-storage`, then `:kdb-transaction` and/or `:kdb-index` per dependency order below. Component specs are complete; implement Component 9 → 7 / 8 next.
 
 **Step 1 — Implement Layer 3:**
 
@@ -81,9 +82,10 @@ Save each component spec as a separate .md file for download.
 - Layer 2 depends on Layer 0 and Layer 1 — interfaces are in Section 17
 - Component 3 and Component 4 within Layer 1 are independent of each other and may be implemented in parallel
 - Component 5 and Component 6 within Layer 2 are independent of each other and may be implemented in parallel
-- Layer 3 depends on Layers 0, 1, and 2 — interfaces are in Section 17
+- Layer 3 depends on Layers 0, 1, and 2 — interfaces are in Section 17 (Layers 0–2 are implemented and stable inputs for Layer 3)
 - Component 9 (Storage Adapter Interface) within Layer 3 has no inter-Layer-3 dependencies and should be implemented first
 - Component 7 and Component 8 within Layer 3 are independent of each other and may be implemented in parallel; both depend on Component 9
+- Component 7 should use `CommitDag.appendCommit` / `appendMergeCommit` for publishing commits (not ad-hoc `putCommit` alone); `putCommit` remains for replication/ingest paths that already have a materialised `KdbCommit`
 - Do not start Layer 4a until all of Layer 3 components are complete and their final interfaces are in Section 17
 - Never mix spec generation and implementation in the same session
 - Always save component spec output as `.md` files for download (see Section 16.4)
@@ -2116,7 +2118,7 @@ class CompactionSafetyException(
 
 ### Layer 3 Interfaces
 
-> **Status: DRAFT** — these interfaces were generated during the spec phase. Replace each with the final extracted interface after implementation is complete and tested. Mark the component `[x]` in the Section 0 checklist at that point.
+> **Status: DRAFT** — these interfaces were generated during the spec phase. They are written to sit on top of **implemented** Layers 0–2 (Section 17): e.g. `StorageAdapter` and `TransactionEngine` consume `CommitDag`, `KdbCommit` (including `schemaHash`), `DocumentTree`, `KdbTransaction`, `SchemaEngine`, and Layer 0 codecs — not provisional drafts. After each component ships in Kotlin, replace the corresponding block below with the extracted public API and mark it `[x]` in Section 0.
 
 #### 7. Transaction Engine — `dev.kdb.transaction`
 

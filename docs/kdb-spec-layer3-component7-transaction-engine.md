@@ -4,7 +4,7 @@
 
 **File:** `kdb-spec-layer3-component7-transaction-engine.md`
 **Layer:** 3 — Write Path
-**Depends on:** Layer 0 (BSON Codec, Error Model), Layer 1 (Document + Commit Model, JSON Functions Engine), Layer 2 (Schema Engine, Commit DAG)
+**Depends on:** Layer 0 (Type System & Codec, Error Model), Layer 1 (Document + Commit Model, JSON Functions Engine), Layer 2 (Schema Engine, Commit DAG)
 
 ---
 
@@ -20,7 +20,7 @@ The Transaction Engine does not own persistence. It delegates document-tree read
 
 | Module | Interface used |
 |---|---|
-| `dev.kdb.codec` (BSON Codec) | `KdbUuid`, `KdbHash`, `KdbTimestamp`, `BsonDocument` |
+| `dev.kdb.codec` (Layer 0 codec) | `KdbUuid`, `KdbHash`, `KdbTimestamp`, `KdbValue`, encoding helpers |
 | `dev.kdb.error` (Error Model) | `KdbException`, `KdbErrorCode`, `ConflictReport`, `ConflictItem`, `ConflictOperationType`, `KdbResult` |
 | `dev.kdb.document` (Document + Commit Model) | `KdbDocument`, `KdbOp`, `KdbTransaction`, `KdbCommit`, `DocumentTree` |
 | `dev.kdb.json` (JSON Functions Engine) | `kdbJsonMerge`, `kdbJsonGet`, `JsonValue` |

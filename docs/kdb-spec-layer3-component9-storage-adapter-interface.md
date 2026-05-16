@@ -4,7 +4,7 @@
 
 **File:** `kdb-spec-layer3-component9-storage-adapter-interface.md`
 **Layer:** 3 — Write Path
-**Depends on:** Layer 0 (BSON Codec, Error Model), Layer 1 (Document + Commit Model), Layer 2 (Schema Engine, Commit DAG)
+**Depends on:** Layer 0 (Type System & Codec, Error Model), Layer 1 (Document + Commit Model), Layer 2 (Schema Engine, Commit DAG)
 
 ---
 
@@ -20,7 +20,7 @@ This component is **interface-only**: no implementation logic lives here. Every 
 
 | Module | Interface used |
 |---|---|
-| `dev.kdb.codec` | `KdbUuid`, `KdbHash`, `KdbTimestamp`, `BsonDocument`, `BsonValue` |
+| `dev.kdb.codec` | `KdbUuid`, `KdbHash`, `KdbTimestamp`, `KdbValue` |
 | `dev.kdb.error` | `KdbException`, `KdbErrorCode`, `KdbResult` |
 | `dev.kdb.document` | `KdbDocument`, `KdbCommit`, `DocumentTree` |
 
@@ -89,24 +89,26 @@ data class DeltaAuthorshipEnvelope(
 
 /**
  * One entry in the delta log. Corresponds to one committed [KdbCommit].
- * BSON-native; stored in large append-only pages (8 MB–16 MB per segment).
+ * Payloads use the Layer 0 typed binary codec (normative: `kdb-spec-layer0-codec.md`, same family as commit/document encoding in Layer 1).
+ * Stored in large append-only pages (8 MB–16 MB per segment).
  */
 data class DeltaRecord(
     val commitHash: KdbHash,
     val namespaceId: String,
     val authorship: DeltaAuthorshipEnvelope,
-    val commitBson: BsonDocument,       // serialised KdbCommit
+    /** Canonical Layer 0 bytes for the commit (`CommitPayload` / `KdbCommit.toPayloadBytes()`, Layer 1). */
+    val commitPayload: ByteArray,
     val documentPatches: List<DocumentPatch>,
 )
 
 /**
- * The before/after BSON for one document within a delta record.
+ * The before/after document for one identity within a delta record ([KdbDocument] = id + canonical JSON text).
  * Either [before] or [after] may be null (insert / delete respectively).
  */
 data class DocumentPatch(
     val docId: KdbUuid,
-    val before: BsonDocument?,
-    val after: BsonDocument?,
+    val before: KdbDocument?,
+    val after: KdbDocument?,
     val contentHashAfter: KdbHash?,
 )
 
@@ -427,7 +429,7 @@ interface EnlistmentHandle : RealizedStoreHandle {
 
     /**
      * Write the current realized store to localStorage/sessionStorage as a
-     * BSON+zstd snapshot. Best-effort; failures are logged but not thrown.
+     * Layer 0–encoded + zstd snapshot. Best-effort; failures are logged but not thrown.
      */
     suspend fun writeSnapshot()
 
@@ -610,7 +612,7 @@ Queried at enlistment creation. The Storage Manager uses this to select the corr
 Stored in every `DeltaRecord`. The `principal` and `rightsToken` fields enable blame queries. The engine stores them verbatim; it never validates them. The `clientContext` field is a free-form opaque blob for caller use (session tracking, etc.).
 
 ### `DeltaRecord`
-The physical unit of the delta log. One record per committed `KdbCommit`. Contains the commit BSON and the before/after document patches for all affected documents. BSON-native; written to large append-only segments.
+The physical unit of the delta log. One record per committed `KdbCommit`. Contains the canonical commit payload bytes and the before/after document patches for all affected documents. On disk, records are Layer 0–encoded (then typically compressed — see Implementation Notes); logical layout is as in this section.
 
 ### `DeltaSegmentRef`
 An opaque reference to a sealed, compressed segment on disk. Passed to `ingestDeltaSegment` for GPU direct ingest. Contains enough metadata for the Storage Manager to make promotion decisions without opening the segment.
@@ -659,7 +661,7 @@ All implementations must accept a list of docIds and return results in input ord
 | `DocumentNotFoundException` | `getDocumentOrThrow` finds no document at the given commit. |
 | `StorageAdapterException` | Unrecoverable I/O error during read or write. Wraps the underlying platform exception. |
 | `DeltaSegmentSealedException` | `DeltaSegmentWriter.append` called after `seal()`. |
-| `SnapshotIntegrityException` | `restoreSnapshot` finds a snapshot whose checksum or BSON structure is invalid. |
+| `SnapshotIntegrityException` | `restoreSnapshot` finds a snapshot whose checksum or Layer 0 decode fails. |
 | `EnlistmentNotFoundException` | `evictDocuments`, `evictIndex`, `rebuildDocuments`, or `rebuildIndex` called with an unknown `enlistmentId`. |
 
 ---
@@ -707,7 +709,7 @@ The `PlatformIoShim` is the **only** `expect/actual` in the storage layer. Every
 
 ### `DeltaRecord` serialisation
 
-BSON-encoded, then zstd-compressed, then appended to the segment with a 4-byte length prefix (big-endian) before the compressed payload. The length prefix allows forward scanning and corruption detection. The `commitHash` is recorded in the prefix metadata so the reader can skip records without full BSON decode.
+Records are **Layer 0–encoded** (a value containing `commitPayload`, patch list, and metadata as fixed fields), then **zstd-compressed**, then appended to the segment with a **4-byte big-endian length prefix** before the compressed payload. The length prefix enables forward scanning and corruption detection. The `commitHash` is duplicated in plaintext prefix metadata so the reader can skip records without decoding the full payload.
 
 ### Content-addressed blob store
 
@@ -715,7 +717,7 @@ BSON-encoded, then zstd-compressed, then appended to the segment with a 4-byte l
 
 ### Browser snapshot format
 
-BSON+zstd of `{ commitHash: BinData, documentMap: { [docId]: BsonDocument, ... }, indexState: BinData }` per enlistment. The index state is the `IndexStore.snapshot()` byte array for each index in the realized store. The whole blob is written atomically to a single localStorage key per enlistment. Max size: ~5 MB per key (localStorage limit); if the realized store exceeds this, the snapshot is skipped and a warning is logged.
+**Layer 0 + zstd:** a single record (or versioned envelope) per enlistment containing at least: the snapshot anchor `commitHash` (`KdbHash` / fixed 32-byte digest), a map of `KdbUuid` → document body (`KdbDocument` / `toDocumentBodyValue()` wire shape from Layer 1), and opaque `indexState` bytes per index from `IndexStore.snapshot()`. The whole blob is written atomically to a single localStorage key per enlistment. Max size: ~5 MB per key (localStorage limit); if the realized store exceeds this, the snapshot is skipped and a warning is logged.
 
 ### `ingestDeltaSegment` for GPU
 
