@@ -1,7 +1,6 @@
 package dev.kdb.codec
 
 import dev.kdb.codec.internal.secureRandomBytes
-import kotlin.jvm.JvmInline
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 
@@ -114,14 +113,19 @@ private fun nibbleHex(v: Int): Char = HEX[v and 0xF]
 private val HEX = "0123456789abcdef".toCharArray()
 
 /**
- * SHA-256 hash (32 raw bytes).
+ * SHA-256 hash (32 raw bytes). Equality is by digest contents, not array identity.
  */
-@JvmInline
-public value class KdbHash(public val bytes: ByteArray) {
+public class KdbHash(bytes: ByteArray) {
+
+    public val bytes: ByteArray = bytes.copyOf()
 
     init {
         require(bytes.size == HASH_LEN) { "KdbHash requires 32 bytes" }
     }
+
+    override fun equals(other: Any?): Boolean = other is KdbHash && bytes.contentEquals(other.bytes)
+
+    override fun hashCode(): Int = bytes.contentHashCode()
 
     public fun toHex(): String =
         buildString(HASH_LEN * 2) {
@@ -149,7 +153,7 @@ public value class KdbHash(public val bytes: ByteArray) {
 
         public fun fromBytes(bytes: ByteArray): KdbHash {
             require(bytes.size == HASH_LEN)
-            return KdbHash(bytes.copyOf())
+            return KdbHash(bytes)
         }
     }
 }

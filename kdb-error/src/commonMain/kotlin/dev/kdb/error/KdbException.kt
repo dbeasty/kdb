@@ -1,6 +1,6 @@
 package dev.kdb.error
 
-public sealed class KdbException(message: String, cause: Throwable? = null) : Exception(message, cause) {
+public abstract class KdbException(message: String, cause: Throwable? = null) : Exception(message, cause) {
     public abstract val code: KdbErrorCode
 }
 

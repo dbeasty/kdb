@@ -13,9 +13,9 @@ Layer 0 — Foundation         [COMPLETE]
   [x] 1. Type System & Codec — interface in Section 17; normative detail in `kdb-spec-layer0-codec.md`
   [x] 2. Error Model         — interface in Section 17
 
-Layer 1 — Core Types         [IN PROGRESS — specs generated, awaiting implementation]
-  [~] 3. Document + Commit Model   — component spec generated (see file: kdb-spec-layer1-component3-document-commit-model.md)
-  [~] 4. JSON Functions Engine     — component spec generated (see file: kdb-spec-layer1-component4-json-functions-engine.md)
+Layer 1 — Core Types         [COMPLETE]
+  [x] 3. Document + Commit Model   — module `:kdb-document`; normative detail in `kdb-spec-layer1-component3-document-commit-model.md`
+  [x] 4. JSON Functions Engine     — module `:kdb-json`; normative detail in `kdb-spec-layer1-component4-json-functions-engine.md`
 
 Layer 2 — Schema + DAG       [IN PROGRESS — specs generated, awaiting implementation]
   [~] 5. Schema Engine             — component spec generated (see file: kdb-spec-layer2-component5-schema-engine.md)
@@ -34,7 +34,7 @@ All other layers             [NOT STARTED]
 - Layer 0 component specs generated (Type System & Codec — `kdb-spec-layer0-codec.md`, Error Model)
 - Both Layer 0 components implemented and tested (per plan)
 - Public interfaces extracted and recorded in Section 17 → Layer 0
-- Layer 1 component specs generated (Document + Commit Model, JSON Functions Engine)
+- Layer 1 components implemented: `:kdb-document` (Component 3), `:kdb-json` (Component 4); public interfaces recorded in Section 17 → Layer 1
 - Layer 1 draft interfaces recorded in Section 17 → Layer 1 (replace with final after implementation)
 - Layer 2 component specs generated (Schema Engine, Commit DAG)
 - Layer 2 draft interfaces recorded in Section 17 → Layer 2 (replace with final after implementation)
@@ -1375,9 +1375,11 @@ data class KdbUuid(val msb: Long, val lsb: Long) {
     }
 }
 
-@JvmInline
-value class KdbHash(val bytes: ByteArray) {
+class KdbHash(bytes: ByteArray) {
+    val bytes: ByteArray // copy-on-construct; `equals`/`hashCode` use digest contents (not array identity)
     fun toHex(): String
+    override fun equals(other: Any?): Boolean
+    override fun hashCode(): Int
     companion object {
         fun fromHex(hex: String): KdbHash
         fun fromBytes(bytes: ByteArray): KdbHash
@@ -1454,7 +1456,7 @@ fun KdbValue.TimestampVal.toKdbTimestamp(): KdbTimestamp
 ```kotlin
 // ── Root + code enum ──────────────────────────────────────────────────────────
 
-sealed class KdbException(message: String, cause: Throwable? = null) : Exception(message, cause) {
+abstract class KdbException(message: String, cause: Throwable? = null) : Exception(message, cause) {
     abstract val code: KdbErrorCode
 }
 
@@ -1518,7 +1520,7 @@ inline fun <T> kdbRunCatching(block: () -> T): KdbResult<T>
 
 ### Layer 1 Interfaces
 
-> **Status: DRAFT** — these interfaces were generated during the spec phase. Replace each with the final extracted interface after implementation is complete and tested. Mark the component `[x]` in the Section 0 checklist at that point.
+> **Status: COMPLETE (v0.9)** — source modules `:kdb-document`, `:kdb-json`. Normative behaviour remains the component spec `.md` files; this section summarizes the public Kotlin API.
 
 #### 3. Document + Commit Model — `dev.kdb.document`
 
@@ -1533,8 +1535,7 @@ val DocumentBodyType: dev.kdb.codec.schema.KdbType
 val CommitPayloadType: dev.kdb.codec.schema.KdbType
 val KdbOpWireType: dev.kdb.codec.schema.KdbType
 val DocumentTreeWireType: dev.kdb.codec.schema.KdbType
-
-// ── Document ──────────────────────────────────────────────────────────────────
+val CommitStubWireType: dev.kdb.codec.schema.KdbType
 
 data class KdbDocument(
     val id: KdbUuid,
@@ -1643,7 +1644,12 @@ data class CommitStub(
     val originalHash: KdbHash,
     val archiveLocation: String,
     val stubbedAt: KdbTimestamp,
-)
+) {
+    fun toKdbValue(): KdbValue
+    companion object {
+        fun fromKdbValue(value: KdbValue): CommitStub
+    }
+}
 
 // ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -1688,8 +1694,8 @@ sealed class JsonValue {
     data class JNumber(val value: Double) : JsonValue()
     data class JInt(val value: Long) : JsonValue()
     data class JBool(val value: Boolean) : JsonValue()
-    object JNull : JsonValue()
-    data class JObject(val fields: Map<String, JsonValue>) : JsonValue()
+    data object JNull : JsonValue()
+    data class JObject(val fields: LinkedHashMap<String, JsonValue>) : JsonValue()
     data class JArray(val elements: List<JsonValue>) : JsonValue()
 
     fun toJsonString(): String

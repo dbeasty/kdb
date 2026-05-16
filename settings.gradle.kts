@@ -8,3 +8,5 @@ dependencyResolutionManagement {
 
 include(":kdb-error")
 include(":kdb-codec")
+include(":kdb-document")
+include(":kdb-json")
