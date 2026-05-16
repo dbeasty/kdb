@@ -29,3 +29,14 @@ public class IndexRebuildException(
 ) : KdbException(message, cause) {
     override val code: KdbErrorCode get() = KdbErrorCode.INDEX_CORRUPTION
 }
+
+public class UniqueIndexViolationException(
+    message: String,
+    val namespaceId: String,
+    val fieldName: String,
+    val key: IndexKey,
+    val existingDocId: dev.kdb.codec.KdbUuid,
+    val incomingDocId: dev.kdb.codec.KdbUuid,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.SCHEMA_VIOLATION
+}

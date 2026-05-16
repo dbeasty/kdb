@@ -26,23 +26,31 @@ Layer 3 — Write Path         [COMPLETE]
   [x] 8. Index Layer — Core        — module `:kdb-index`; `dev.kdb.index`; spec: `kdb-spec-layer3-component8-index-layer-core.md`
   [x] 9. Storage Adapter Interface — module `:kdb-storage`; `dev.kdb.storage`; spec: `kdb-spec-layer3-component9-storage-adapter-interface.md`
 
-Layer 4a — Storage Engine    [SPECS READY — implement in component order below]
-  [ ] 10a. WAL                     — `dev.kdb.storage.wal`; spec: `kdb-spec-layer4a-component10a-wal.md`
-  [ ] 10b. MemTable                — `dev.kdb.storage.memtable`; spec: `kdb-spec-layer4a-component10b-memtable.md`
-  [ ] 10c. SSTable + Block Cache   — `dev.kdb.storage.sstable`; spec: `kdb-spec-layer4a-component10c-sstable-block-cache.md`
-  [ ] 10d. Delta Segment Writer    — `dev.kdb.storage.delta`; spec: `kdb-spec-layer4a-component10d-delta-segment-writer.md`
-  [ ] 10e. Storage Engine Core     — `dev.kdb.storage.engine`; spec: `kdb-spec-layer4a-component10e-storage-engine-core.md`
-  [ ] 10f. Storage Compaction      — `dev.kdb.storage.compaction`; spec: `kdb-spec-layer4a-component10f-storage-compaction.md`
-  [ ] 10g. Platform I/O Shim       — `dev.kdb.storage.io`; spec: `kdb-spec-layer4a-component10g-platform-io-shim.md`
+Layer 4a — Storage Engine    [COMPLETE]
+  [x] 10a. WAL                     — `:kdb-storage-wal`; `dev.kdb.storage.wal`; spec: `kdb-spec-layer4a-component10a-wal.md`
+  [x] 10b. MemTable                — `:kdb-storage-memtable`; `dev.kdb.storage.memtable`; spec: `kdb-spec-layer4a-component10b-memtable.md`
+  [x] 10c. SSTable + Block Cache   — `:kdb-storage-sstable`; `dev.kdb.storage.sstable`; spec: `kdb-spec-layer4a-component10c-sstable-block-cache.md`
+  [x] 10d. Delta Segment Writer    — `:kdb-storage-delta`; `dev.kdb.storage.delta`; spec: `kdb-spec-layer4a-component10d-delta-segment-writer.md`
+  [x] 10e. Storage Engine Core     — `:kdb-storage-engine`; `dev.kdb.storage.engine`; spec: `kdb-spec-layer4a-component10e-storage-engine-core.md`
+  [x] 10f. Storage Compaction      — `:kdb-storage-compaction`; `dev.kdb.storage.compaction`; spec: `kdb-spec-layer4a-component10f-storage-compaction.md`
+  [x] 10g. Platform I/O Shim       — `:kdb-storage-io`; `dev.kdb.storage.io`; spec: `kdb-spec-layer4a-component10g-platform-io-shim.md`
 
-Layer 4b — Storage Manager   [SPECS READY — depends on Layer 4a]
-  [ ] 11a. Realized Store Pool     — `dev.kdb.storage.manager.pool`; spec: `kdb-spec-layer4b-component11a-realized-store-pool.md`
-  [ ] 11b. Eviction Manager        — `dev.kdb.storage.manager.eviction`; spec: `kdb-spec-layer4b-component11b-eviction-manager.md`
-  [ ] 11c. Rebuild Scheduler       — `dev.kdb.storage.manager.rebuild`; spec: `kdb-spec-layer4b-component11c-rebuild-scheduler.md`
-  [ ] 11d. Enlistment Manager      — `dev.kdb.storage.manager.enlistment`; spec: `kdb-spec-layer4b-component11d-enlistment-manager.md`
-  [ ] 11e. Delta Log Tier Signals  — `dev.kdb.storage.manager.tier`; spec: `kdb-spec-layer4b-component11e-delta-log-tier-signals.md`
+Layer 4b — Storage Manager   [COMPLETE]
+  [x] 11a. Realized Store Pool     — `:kdb-storage-manager`; `dev.kdb.storage.manager.pool`; spec: `kdb-spec-layer4b-component11a-realized-store-pool.md`
+  [x] 11b. Eviction Manager        — `:kdb-storage-manager`; `dev.kdb.storage.manager.eviction`; spec: `kdb-spec-layer4b-component11b-eviction-manager.md`
+  [x] 11c. Rebuild Scheduler       — `:kdb-storage-manager`; `dev.kdb.storage.manager.rebuild`; spec: `kdb-spec-layer4b-component11c-rebuild-scheduler.md`
+  [x] 11d. Enlistment Manager      — `:kdb-storage-manager`; `dev.kdb.storage.manager.enlistment`; spec: `kdb-spec-layer4b-component11d-enlistment-manager.md`
+  [x] 11e. Delta Log Tier Signals  — `:kdb-storage-manager`; `dev.kdb.storage.manager.tier`; spec: `kdb-spec-layer4b-component11e-delta-log-tier-signals.md`
 
-Layers 5–10                  [NOT STARTED]
+Layer 5 — Index + Query      [IMPLEMENTED — first Kotlin cut]
+  [x] 12. Index — Hash + B-tree    — `:kdb-index-hash`, `:kdb-index-btree`; shared `VersionedIndexEngine` in `:kdb-index`
+  [x] 13. Index — Full-text        — `:kdb-index-fulltext`
+  [x] 14. Index — Vector           — `:kdb-index-vector` (flat cosine ANN v1; HNSW graph deferred)
+  [x] 15. SQL DSL + Query Planner  — `:kdb-sql`
+  [x] 16. Virtual View Engine      — `dev.kdb.sql.view` in `:kdb-sql`
+  [x] Composite factory            — `:kdb-index-composite` — `compositeIndexStoreFactory`, `productionIndexManager`
+
+Layers 6–10                  [NOT STARTED]
 ```
 
 ### What Has Been Done
@@ -60,35 +68,16 @@ Layers 5–10                  [NOT STARTED]
 - Layer 3 draft interfaces recorded in Section 17 → Layer 3
 - Layer 3 specs and §17 drafts are aligned with **implemented** Layer 2: transactional writes are expected to go through `CommitDag.appendCommit` / `appendMergeCommit` (with `schemaHash` carried on `KdbCommit`); `SchemaEngine.computeSchemaHash` and commit payload hashing (`KdbCommit.build` / `computeCommitHash`) are the normative hooks for schema- and content-addressed heads. Component 7 (`DefaultTransactionEngine`) is now the orchestration path atop those primitives.
 - Layer 3 Gradle modules landed: `:kdb-storage` (adapter surface + memory adapter +expect/actual `PlatformIoShim`), `:kdb-index` (`IndexStore`, `MemoryIndexStore`, registry/writer/reader/manager stack, wire helpers), `:kdb-transaction` (`TransactionEngine`, builder, replay/merge atop the DAG).
-- Layer 4 component specs generated (12 files): Layer 4a Components 10a–10g (WAL, MemTable, SSTable, Delta Segment Writer, Storage Engine Core, Compaction, Platform I/O Shim) and Layer 4b Components 11a–11e (Realized Store Pool, Eviction, Rebuild, Enlistment, Delta Log Tier Signals). See Section 0 checklist for filenames.
+- Layer 4 component specs generated (12 files): Layer 4a Components 10a–10g and Layer 4b Components 11a–11e.
+- Layer 4 implemented (Gradle modules): `:kdb-compression`, `:kdb-storage-io` (10g), `:kdb-storage-wal` (10a), `:kdb-storage-sstable` (10c), `:kdb-storage-memtable` (10b), `:kdb-storage-delta` (10d), `:kdb-storage-engine` (10e), `:kdb-storage-compaction` (10f), `:kdb-storage-manager` (11a–11e). Production I/O via `FileBackedPlatformIoShimFactory`; tests use `InMemoryPlatformIoShim`.
+- Layer 5 component specs generated (5 files): Components 12–16 — hash+btree, full-text, vector, SQL DSL + planner, virtual view engine. See Section 16.1 Layer 5 execution order.
+- Layer 5 implemented (first Kotlin cut): `:kdb-index-hash`, `:kdb-index-btree`, `:kdb-index-fulltext`, `:kdb-index-vector`, `:kdb-index-composite`, `:kdb-sql`. Index writer JSONPath fixed (`$.field`). Vector index uses brute-force cosine v1.
 
-### What To Do Next — Layer 4 Implementation (spec-driven)
+### What To Do Next
 
-Layer 3 interfaces ship in `:kdb-storage`, `:kdb-index`, and `:kdb-transaction`. **Layer 4 component specs are now in `docs/`** (see Section 0 checklist). Use those `.md` files as the sole normative source when implementing each component; paste Section 17 + the relevant component spec into implementation sessions.
+**Layer 6 — Hybrid query + policy** (depends on Layer 5). See Section 16.1 for Components 17–19.
 
-**Step 1 — Implement Layer 4a (strict order):**
-
-1. **10g Platform I/O Shim** — file-backed segments + snapshot keys (JVM / Native / Browser actuals).
-2. **10a WAL → 10b MemTable → 10c SSTable + Block Cache** — LSM substrate for content-addressed blobs and realized-store blocks.
-3. **10d Delta Segment Writer** — durable delta log atop the shim (Layer 0 record framing per Component 9).
-4. **10e Storage Engine Core** — `ServerStorageEngine` / `InMemoryStorageEngine` implementing `StorageAdapter`.
-5. **10f Storage Compaction** — SSTable merge + delta segment seal/roll policy.
-
-**Step 2 — Implement Layer 4b (after 4a core is green):**
-
-1. **11a Realized Store Pool** → **11b Eviction Manager** → **11c Rebuild Scheduler** (can harden eviction + rebuild together).
-2. **11d Enlistment Manager** — browser push/resolve + snapshot repair model (`kdb-storage-engine-design-decisions-v3.md`).
-3. **11e Delta Log Tier Signals** — hot/warm/cold segment lifecycle hooks into compaction.
-
-**Step 3 — Optional Layer 3 hardening (parallel OK):**
-
-Add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
-
-**Step 4 — After each Layer 4 component ships:**
-
-1. Extract public API into Section 17 under Layer 4a or 4b.
-2. Mark `[x]` in the Section 0 checklist.
-3. Add Gradle module(s) (`:kdb-storage-engine`, `:kdb-storage-manager`, or subpackages under `:kdb-storage` — follow the component spec package names).
+Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
 
 ### Dependency Rules
 
@@ -102,6 +91,8 @@ Add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:
 - Component 7 should use `CommitDag.appendCommit` / `appendMergeCommit` for publishing commits (not ad-hoc `putCommit` alone); `putCommit` remains for replication/ingest paths that already have a materialised `KdbCommit`
 - Layer 4a depends on Layer 3 (`StorageAdapter`, `DeltaSegmentWriter`, `PlatformIoShim` expect); implement 10g → 10a–c → 10d → 10e → 10f
 - Layer 4b depends on Layer 4a; implement 11a → 11b → 11c, then 11d and 11e (11d/11e may overlap once pool + rebuild exist)
+- Layer 5 depends on Layers 3 + 4a/4b — interfaces in Section 17 (Layers 0–4). Implement 12 (hash + btree) first; 13 and 14 may proceed in parallel once 12’s `CompositeIndexStoreFactory` pattern exists; 15 requires 12–14 for index planning; 16 requires 15 parser/planner hooks
+- Component 15 DML paths delegate writes to Component 7 (`TransactionEngine`) — do not duplicate commit logic
 - Never mix spec generation and implementation in the same session
 - Always save component spec output as `.md` files for download (see Section 16.4)
 
@@ -1038,11 +1029,13 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |Transaction engine (write path, conflict detection, replay)                      |3,000      |
 |Hybrid query engine (_doc, AT VERSION, schema+JSON integration)                  |2,000      |
 |Index layer — core (registry, projection, consistency)                           |2,000      |
+|Index layer — hash (exact equality, unique constraints)                            |800        |
 |Index layer — B-tree (KDB LSM adapter, range scan, composite)                   |3,500      |
 |Index layer — full-text (tokeniser, inverted index, fuzzy)                       |3,500      |
 |Index layer — vector (HNSW, embedding interface, ANN, GPU dispatch)              |4,000      |
 |SQL DSL (parser, planner, index selection, result assembly)                      |5,000      |
 |Virtual view engine                                                              |1,500      |
+|*Layer 5 subtotal (Components 12–16)*                                            |*~18,800*  |
 |JDBC driver (Driver, Connection, Statement, ResultSet, MetaData)                 |4,500      |
 |JDBC SQL extensions (AT VERSION, kdb_json_*, kdb_id, _doc)                       |1,000      |
 |Connection URL parser + embedded + memory modes                                  |500        |
@@ -1068,7 +1061,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |Error model                                                                      |500        |
 |Test infrastructure (fixtures, in-memory adapters, test DSL)                    |5,000      |
 |JDBC integration tests (Hibernate, jOOQ, Spring Data)                           |2,000      |
-|**Total**                                                                        |**~96,550**|
+|**Total**                                                                        |**~97,350**|
 
 > **Note:** Storage adapter line items for RocksDB, IndexedDB, LMDB, and mmap are removed. The KDB Storage Engine and Storage Manager components above replace them entirely. The B-tree index estimate increases slightly because it now owns the full LSM path in pure Kotlin rather than delegating to RocksDB.
 
@@ -1136,7 +1129,7 @@ The SQL engine, JDBC driver, peer sync protocol, and KDB Storage Engine are the 
 
 -----
 
-*KDB Architecture Specification v0.9*
+*KDB Architecture Specification v0.9 (Layer 5 specs added)*
 *Status: Living document — update completed interfaces in Section 17 after each layer.*
 
 -----
@@ -1199,34 +1192,44 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 4a — KDB Storage Engine (depends on Layer 3)
 
 ```
-[ ] 10a. WAL                        — spec `kdb-spec-layer4a-component10a-wal.md`
-[ ] 10b. MemTable                   — spec `kdb-spec-layer4a-component10b-memtable.md`
-[ ] 10c. SSTable + Block Cache      — spec `kdb-spec-layer4a-component10c-sstable-block-cache.md`
-[ ] 10d. Delta Segment Writer       — spec `kdb-spec-layer4a-component10d-delta-segment-writer.md`
-[ ] 10e. Storage Engine Core        — spec `kdb-spec-layer4a-component10e-storage-engine-core.md`
-[ ] 10f. Storage Compaction         — spec `kdb-spec-layer4a-component10f-storage-compaction.md`
-[ ] 10g. Platform I/O Shim          — spec `kdb-spec-layer4a-component10g-platform-io-shim.md`
+[x] 10a. WAL                        — `:kdb-storage-wal`; spec `kdb-spec-layer4a-component10a-wal.md`
+[x] 10b. MemTable                   — `:kdb-storage-memtable`; spec `kdb-spec-layer4a-component10b-memtable.md`
+[x] 10c. SSTable + Block Cache      — `:kdb-storage-sstable`; spec `kdb-spec-layer4a-component10c-sstable-block-cache.md`
+[x] 10d. Delta Segment Writer       — `:kdb-storage-delta`; spec `kdb-spec-layer4a-component10d-delta-segment-writer.md`
+[x] 10e. Storage Engine Core        — `:kdb-storage-engine`; spec `kdb-spec-layer4a-component10e-storage-engine-core.md`
+[x] 10f. Storage Compaction         — `:kdb-storage-compaction`; spec `kdb-spec-layer4a-component10f-storage-compaction.md`
+[x] 10g. Platform I/O Shim          — `:kdb-storage-io`; spec `kdb-spec-layer4a-component10g-platform-io-shim.md`
 ```
 
 #### LAYER 4b — Storage Manager (depends on Layer 4a)
 
 ```
-[ ] 11a. Realized Store Pool        — spec `kdb-spec-layer4b-component11a-realized-store-pool.md`
-[ ] 11b. Eviction Manager           — spec `kdb-spec-layer4b-component11b-eviction-manager.md`
-[ ] 11c. Rebuild Scheduler          — spec `kdb-spec-layer4b-component11c-rebuild-scheduler.md`
-[ ] 11d. Enlistment Manager         — spec `kdb-spec-layer4b-component11d-enlistment-manager.md`
-[ ] 11e. Delta Log Tier Signals     — spec `kdb-spec-layer4b-component11e-delta-log-tier-signals.md`
+[x] 11a. Realized Store Pool        — `:kdb-storage-manager`; spec `kdb-spec-layer4b-component11a-realized-store-pool.md`
+[x] 11b. Eviction Manager           — `:kdb-storage-manager`; spec `kdb-spec-layer4b-component11b-eviction-manager.md`
+[x] 11c. Rebuild Scheduler          — `:kdb-storage-manager`; spec `kdb-spec-layer4b-component11c-rebuild-scheduler.md`
+[x] 11d. Enlistment Manager         — `:kdb-storage-manager`; spec `kdb-spec-layer4b-component11d-enlistment-manager.md`
+[x] 11e. Delta Log Tier Signals     — `:kdb-storage-manager`; spec `kdb-spec-layer4b-component11e-delta-log-tier-signals.md`
 ```
 
-#### LAYER 5 — Index Implementations (depends on Layers 3 + 4a/4b)
+#### LAYER 5 — Index + Query (depends on Layers 3 + 4a/4b)
 
 ```
-[ ] 12. Index — B-tree
-[ ] 13. Index — Full-text
-[ ] 14. Index — Vector
-[ ] 15. SQL DSL + Query Planner
-[ ] 16. Virtual View Engine
+[x] 12. Index — Hash + B-tree       — `:kdb-index-hash`, `:kdb-index-btree`; spec `kdb-spec-layer5-component12-index-hash-btree.md`
+[x] 13. Index — Full-text            — `:kdb-index-fulltext`; spec `kdb-spec-layer5-component13-index-fulltext.md`
+[x] 14. Index — Vector               — `:kdb-index-vector`; spec `kdb-spec-layer5-component14-index-vector.md`
+[x] 15. SQL DSL + Query Planner      — `:kdb-sql`; spec `kdb-spec-layer5-component15-sql-dsl-query-planner.md`
+[x] 16. Virtual View Engine          — `dev.kdb.sql.view` (in `:kdb-sql`); spec `kdb-spec-layer5-component16-virtual-view-engine.md`
+[x] —  Composite index factory       — `:kdb-index-composite`
 ```
+
+**Layer 5 implementation order (normative):**
+
+1. **12 — Hash + B-tree** — durable `IndexStore` for `IndexType.HASH` and `IndexType.BTREE`; wire `CompositeIndexStoreFactory` into node bootstrap (replace test-only `MemoryIndexStore` for production).
+2. **13 — Full-text** and **14 — Vector** — may run in parallel after 12; register factories on `CompositeIndexStoreFactory`.
+3. **15 — SQL DSL + planner** — parser, index rule planner, executor; depends on all index types for `MATCH` / `similarity` / equality plans.
+4. **16 — Virtual views** — metadata catalog + query rewrite; integrate into `SqlEngine` planning path.
+
+**Estimated NBNC (Layer 5 production + tests):** ~18,430 lines (12: ~4,430; 13: ~3,500; 14: ~4,000; 15: ~5,000; 16: ~1,500).
 
 #### LAYER 6 — Query + Policy (depends on Layer 5)
 
@@ -2604,34 +2607,48 @@ class EnlistmentNotFoundException(message: String, val enlistmentId: KdbUuid) : 
 
 ### Layer 4a Interfaces — KDB Storage Engine
 
-> **Status: SPECS READY** — normative detail in `docs/kdb-spec-layer4a-component10*.md`. Layer 3 already defines consumer-facing `StorageAdapter`, `DeltaSegmentWriter`, and `expect PlatformIoShim`; Layer 4a adds internal LSM primitives and the concrete engine implementation.
+> **Status: IMPLEMENTED (first Kotlin cut)** — modules `:kdb-compression`, `:kdb-storage-io`, `:kdb-storage-wal`, `:kdb-storage-memtable`, `:kdb-storage-sstable`, `:kdb-storage-delta`, `:kdb-storage-engine`, `:kdb-storage-compaction`. Normative detail remains in `docs/kdb-spec-layer4a-component10*.md`. Entry points: `FileBackedPlatformIoShimFactory.open`, `DefaultWriteAheadLogFactory`, `DefaultSsTableWriter`/`Reader`, `MemTableManager`, `DefaultDeltaSegmentWriter`, `DefaultStorageEngineFactory.forTarget`, `runSstableCompaction`.
 
-| Component | Spec file | Primary packages |
+| Component | Module | Primary packages |
 |---|---|---|
-| 10a WAL | `kdb-spec-layer4a-component10a-wal.md` | `dev.kdb.storage.wal` |
-| 10b MemTable | `kdb-spec-layer4a-component10b-memtable.md` | `dev.kdb.storage.memtable` |
-| 10c SSTable + Block Cache | `kdb-spec-layer4a-component10c-sstable-block-cache.md` | `dev.kdb.storage.sstable` |
-| 10d Delta Segment Writer | `kdb-spec-layer4a-component10d-delta-segment-writer.md` | `dev.kdb.storage.delta` |
-| 10e Storage Engine Core | `kdb-spec-layer4a-component10e-storage-engine-core.md` | `dev.kdb.storage.engine` |
-| 10f Storage Compaction | `kdb-spec-layer4a-component10f-storage-compaction.md` | `dev.kdb.storage.compaction` |
-| 10g Platform I/O Shim | `kdb-spec-layer4a-component10g-platform-io-shim.md` | `dev.kdb.storage.io` |
+| 10g Platform I/O Shim | `:kdb-storage-io` | `dev.kdb.storage.io` — `SegmentNameBuilder`, `FileBackedPlatformIoShimFactory` |
+| 10a WAL | `:kdb-storage-wal` | `dev.kdb.storage.wal` — `WriteAheadLog`, `DefaultWriteAheadLog` |
+| 10b MemTable | `:kdb-storage-memtable` | `dev.kdb.storage.memtable` — `SortedMemTable`, `MemTableManager` |
+| 10c SSTable + Block Cache | `:kdb-storage-sstable` | `dev.kdb.storage.sstable` — `SsTableWriter`, `BlockCache`, `LsmBlobStore` |
+| 10d Delta Segment Writer | `:kdb-storage-delta` | `dev.kdb.storage.delta` — `DefaultDeltaSegmentWriter` |
+| 10e Storage Engine Core | `:kdb-storage-engine` | `dev.kdb.storage.engine` — `ServerStorageEngine`, `StorageEngineFactory` |
+| 10f Storage Compaction | `:kdb-storage-compaction` | `dev.kdb.storage.compaction` — `CompactionPlanner`, `runSstableCompaction` |
 
 ### Layer 4b Interfaces — Storage Manager
 
-> **Status: SPECS READY** — normative detail in `docs/kdb-spec-layer4b-component11*.md`. Consumes Layer 4a engines and exposes `StorageManager`, `RealizedStoreHandle`, and `EnlistmentHandle` (Layer 3 §D contracts).
+> **Status: IMPLEMENTED (first Kotlin cut)** — module `:kdb-storage-manager`. Exposes `StorageManager.install/get`, `DefaultStorageManager`, `EvictionManager`, `RebuildScheduler`, `EnlistmentManager`, `DeltaLogTierRegistry`.
 
-| Component | Spec file | Primary packages |
+| Component | Module | Primary packages |
 |---|---|---|
-| 11a Realized Store Pool | `kdb-spec-layer4b-component11a-realized-store-pool.md` | `dev.kdb.storage.manager.pool` |
-| 11b Eviction Manager | `kdb-spec-layer4b-component11b-eviction-manager.md` | `dev.kdb.storage.manager.eviction` |
-| 11c Rebuild Scheduler | `kdb-spec-layer4b-component11c-rebuild-scheduler.md` | `dev.kdb.storage.manager.rebuild` |
-| 11d Enlistment Manager | `kdb-spec-layer4b-component11d-enlistment-manager.md` | `dev.kdb.storage.manager.enlistment` |
-| 11e Delta Log Tier Signals | `kdb-spec-layer4b-component11e-delta-log-tier-signals.md` | `dev.kdb.storage.manager.tier` |
+| 11a Realized Store Pool | `:kdb-storage-manager` | `dev.kdb.storage.manager.pool` |
+| 11b Eviction Manager | `:kdb-storage-manager` | `dev.kdb.storage.manager.eviction` |
+| 11c Rebuild Scheduler | `:kdb-storage-manager` | `dev.kdb.storage.manager.rebuild` |
+| 11d Enlistment Manager | `:kdb-storage-manager` | `dev.kdb.storage.manager.enlistment` |
+| 11e Delta Log Tier Signals | `:kdb-storage-manager` | `dev.kdb.storage.manager.tier` |
 
-### Layer 5 Interfaces
+### Layer 5 Interfaces — Index + Query
 
-```
-[ not yet completed — depends on Layers 3 + 4a/4b ]
+> **Status: IMPLEMENTED (first Kotlin cut)** — normative detail in `docs/kdb-spec-layer5-component12-*.md` … `component16-*.md`.
+
+| Component | Module(s) | Primary entry points |
+|---|---|---|
+| 12 Hash + B-tree | `:kdb-index-hash`, `:kdb-index-btree`, `:kdb-index` (`VersionedIndexEngine`) | `hashIndexStoreFactory`, `btreeIndexStoreFactory` |
+| 13 Full-text | `:kdb-index-fulltext` | `fullTextIndexStoreFactory`, `parseFullTextQuery` |
+| 14 Vector | `:kdb-index-vector` | `vectorIndexStoreFactory(dag, storage, dimensions)` |
+| Composite | `:kdb-index-composite` | `compositeIndexStoreFactory`, `productionIndexManager` |
+| 15 SQL | `:kdb-sql` | `sqlEngine`, `defaultSqlParser`, `DefaultQueryPlanner` |
+| 16 Virtual views | `:kdb-sql` | `virtualViewRegistry`, `virtualViewEngine`, `InMemoryVirtualViewRegistry` |
+
+```kotlin
+// Bootstrap
+fun productionIndexManager(dag: CommitDag, storage: StorageAdapter, vectorDimensions: Int = 128): IndexManager
+fun compositeIndexStoreFactory(dag: CommitDag, storage: StorageAdapter, vectorDimensions: Int = 128): IndexStoreFactory
+fun sqlEngine(indexManager: IndexManager, storage: StorageAdapter, dag: CommitDag, ...): SqlEngine
 ```
 
 ### Layer 6 Interfaces

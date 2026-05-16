@@ -139,7 +139,7 @@ internal class DefaultIndexWriter(
                     val doc = storage.getDocument(ns, op.docId, treeHash) ?: continue
                     for ((fieldName, store, descriptor, field) in matchingStores(registry, schema)) {
                         val raw =
-                            jsonAt(doc.json, ".$fieldName")
+                            jsonAt(doc.json, "$.$fieldName")
                         if (!shouldIndex(raw)) continue
                         val key = indexKeyFromJsonValue(raw, field.type)
                         if (key === IndexKey.NullKey) continue
@@ -182,7 +182,7 @@ internal class DefaultIndexWriter(
         }
         for (doc in docs) {
             for ((_, store, descriptor, field) in matchingStores(registry, schema)) {
-                val raw = jsonAt(doc.json, ".${descriptor.fieldName}")
+                val raw = jsonAt(doc.json, "$.${descriptor.fieldName}")
                 if (!shouldIndex(raw)) continue
                 val key = indexKeyFromJsonValue(raw, field.type)
                 if (key === IndexKey.NullKey) continue

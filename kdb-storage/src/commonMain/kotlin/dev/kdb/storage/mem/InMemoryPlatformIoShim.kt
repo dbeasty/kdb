@@ -54,7 +54,7 @@ public class InMemoryPlatformIoShim : PlatformIoShim {
 
     override suspend fun listSegments(namespaceId: String): List<String> =
         mutex.withLock {
-            val prefix = "ns_$namespaceId/"
+            val prefix = "ns/$namespaceId/"
             segments.keys.filter { it.startsWith(prefix) }.toList()
         }
 
