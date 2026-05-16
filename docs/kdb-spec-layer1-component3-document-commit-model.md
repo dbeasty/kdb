@@ -4,7 +4,7 @@
 
 # Package: `dev.kdb.document`
 
-# Spec version: aligned with master spec v0.5
+# Spec version: aligned with Layer 0 codec spec v0.2 and master spec v0.5+
 
 -----
 
@@ -12,14 +12,18 @@
 
 Defines the canonical in-memory and serialisable representations of a KDB document, a commit, a commit DAG node, and the operations that flow through the transaction engine. This module is the shared vocabulary of the entire engine — every higher layer passes documents and commits using these types. It provides content-addressable hashing of documents and commit trees, which underpins the git-like version model described in master spec §6.
 
+Structured persistence and hashing use **Layer 0’s typed value model** (`KdbValue`) and **canonical binary encoding** (`encodeToBytes` / `decodeFromBytes` per `kdb-spec-layer0-codec.md`). BSON is not part of the public contract.
+
 -----
 
 ## 2. Dependencies
 
-|Module         |Interfaces Used                                                                                                                                                                                                                                                                             |
-|---------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|`dev.kdb.codec`|`KdbUuid`, `KdbHash`, `KdbTimestamp`, `BsonDocument`, `BsonValue`, `BsonBinary`, `BsonDateTime`, `BsonNull`, `BsonString`, `BsonInt64`, `BsonArray`, `BsonDocument.toBytes()`, `BsonDocument.fromBytes()`, `BsonDocument.fromJson()`, `BsonDocument.toJson()`, `BsonDocument.toPrettyJson()`|
-|`dev.kdb.error`|`KdbException`, `KdbResult`, `KdbErrorCode`, `kdbRunCatching`                                                                                                                                                                                                                               |
+**Depends on:** Layer 0 — Type System & Codec (`kdb-spec-layer0-codec.md`), Error Model (`kdb-spec-layer0-error-model.md` — codec exceptions renamed to `KdbDecodeException` / `KdbEncodeException`; stable numeric codes unchanged).
+
+|Module         |Interfaces Used |
+|---------------|----------------|
+|`dev.kdb.codec`|`KdbUuid`, `KdbHash`, `KdbTimestamp`, `KdbValue`, `KdbType`, `KdbTypeRegistry`, `encodeToBytes`, `decodeFromBytes`, `KdbValue.fromJson`, `KdbValue.toJson`, named record schemas registered under `dev.kdb.document.*` (see §4.1)|
+|`dev.kdb.error`|`KdbException`, `KdbResult`, `KdbErrorCode`, `KdbDecodeException`, `kdbRunCatching`|
 
 No other KDB modules. This module has no dependency on Layer 1 Component 4 (JSON Functions Engine) — JSON merging at the document level is a simple root-level key merge only, not a JSONPath operation.
 
@@ -31,21 +35,37 @@ No other KDB modules. This module has no dependency on Layer 1 Component 4 (JSON
 package dev.kdb.document
 
 import dev.kdb.codec.*
+import dev.kdb.codec.schema.*
 import dev.kdb.error.*
+
+// ── Layer 0 registry ───────────────────────────────────────────────────────────
+
+/**
+ * Builtin schemas for document/commit/op/tree wire shapes.
+ * Frozen before any encode/decode; includes every `dev.kdb.document.*` record,
+ * enum, fixed, and union type referenced in this spec.
+ */
+fun KdbDocumentWireRegistry(): KdbTypeRegistry
 
 // ── Document ──────────────────────────────────────────────────────────────────
 
 /**
  * A KDB document: a stable-identity wrapper around a JSON string.
- * [json] is the canonical source of truth, always exactly as stored.
- * [bson] and [contentHash] are computed lazily.
+ * [json] is the canonical source of truth for the application-visible body,
+ * always exactly as stored. Identity lives in [id]; do not require `_kdb_id`
+ * inside [json] (the engine may omit it — unlike BSON storage, identity is not injected into the JSON text).
+ *
+ * [contentHash] is computed lazily from the canonical Layer 0 binary encoding
+ * of record `dev.kdb.document.DocumentBody` (see §4.1).
  */
 data class KdbDocument(
     val id: KdbUuid,
     val json: String,
 ) {
-    val bson: BsonDocument by lazy { BsonDocument.fromJson(json) }
     val contentHash: KdbHash by lazy { computeContentHash(this) }
+
+    /** Typed storage/hash payload: `DocumentBody` record (`id` + `json` fields per §4.1). */
+    fun toDocumentBodyValue(): KdbValue
 
     /** Return new document with [patchJson] merged (shallow root-level merge). */
     fun merge(patchJson: String): KdbDocument
@@ -56,15 +76,17 @@ data class KdbDocument(
     companion object {
         fun fromJson(json: String): KdbDocument
         fun fromJson(id: KdbUuid, json: String): KdbDocument
-        fun fromBson(bson: BsonDocument): KdbDocument
+
+        /** Decode from typed storage record produced by [toDocumentBodyValue]. */
+        fun fromDocumentBodyValue(value: KdbValue): KdbDocument
     }
 }
 
-/** Encode document to BSON storage form. Injects `_kdb_id` (BinData/UUID subtype). */
-fun KdbDocument.toBson(): BsonDocument
-
-/** SHA-256 of the canonical BSON encoding of [doc]. */
+/** SHA-256 of `encodeToBytes(doc.toDocumentBodyValue(), DocumentBodyType, registry)`. */
 fun computeContentHash(doc: KdbDocument): KdbHash
+
+/** Resolved `KdbType.Ref("dev.kdb.document.DocumentBody")` from [KdbDocumentWireRegistry]. */
+val DocumentBodyType: KdbType
 
 // ── Operations ────────────────────────────────────────────────────────────────
 
@@ -123,7 +145,8 @@ data class KdbTransaction(
 
 /**
  * An immutable, content-addressed node in the commit DAG.
- * [hash] is the SHA-256 of the canonical BSON encoding of this commit (excluding [hash] itself).
+ * [hash] is the SHA-256 of the canonical Layer 0 binary encoding of the commit **payload**
+ * (record `dev.kdb.document.CommitPayload` — all fields except [hash]; see §4.1).
  * [parentHashes] is empty only for a root commit.
  * Merge commits have exactly two parent hashes.
  */
@@ -145,15 +168,23 @@ fun computeCommitHash(commit: KdbCommit): KdbHash
 
 // ── Commit serialisation ──────────────────────────────────────────────────────
 
-fun KdbCommit.toBson(): BsonDocument
-fun KdbCommit.toBytes(): ByteArray
-fun KdbCommit.Companion.fromBson(bson: BsonDocument): KdbCommit
+/** Encode payload only (fields other than [KdbCommit.hash]) as `CommitPayload` bytes. */
+fun KdbCommit.toPayloadBytes(): ByteArray
+
+fun KdbCommit.toBytes(): ByteArray   // preferred persisted form = payload bytes + optional framing TBD by storage layer
+
+fun KdbCommit.Companion.fromPayloadBytes(bytes: ByteArray): KdbCommit   // fills [hash] via computeCommitHash
 fun KdbCommit.Companion.fromBytes(bytes: ByteArray): KdbCommit
+
+/** Resolved ref types from [KdbDocumentWireRegistry]. */
+val CommitPayloadType: KdbType
+val KdbOpWireType: KdbType
 
 // ── Operation serialisation ───────────────────────────────────────────────────
 
-fun KdbOp.toBson(): BsonDocument
-fun KdbOp.Companion.fromBson(bson: BsonDocument): KdbOp
+/** Union wire encoding — branch index then branch record (§4.2). */
+fun KdbOp.toKdbValue(): KdbValue
+fun KdbOp.Companion.fromKdbValue(value: KdbValue): KdbOp
 
 // ── Document tree ─────────────────────────────────────────────────────────────
 
@@ -180,13 +211,15 @@ data class DocumentTree(
     companion object {
         val EMPTY: DocumentTree
 
-        /** Recompute treeHash from entries (SHA-256 of sorted BSON encoding). */
+        /** Recompute treeHash from entries (SHA-256 of sorted canonical encoding — §4.3). */
         fun build(entries: Map<KdbUuid, KdbHash>): DocumentTree
     }
 }
 
-fun DocumentTree.toBson(): BsonDocument
-fun DocumentTree.Companion.fromBson(bson: BsonDocument): DocumentTree
+fun DocumentTree.toKdbValue(): KdbValue
+fun DocumentTree.Companion.fromKdbValue(value: KdbValue): DocumentTree
+
+val DocumentTreeWireType: KdbType
 
 // ── Branch + Tag pointers ─────────────────────────────────────────────────────
 
@@ -227,7 +260,8 @@ class DocumentDecodeException(
     val docId: KdbUuid? = null,
     cause: Throwable? = null,
 ) : KdbException(message, cause) {
-    override val code: KdbErrorCode get() = KdbErrorCode.BSON_DECODE_ERROR
+    /** Same numeric legacy as BSON decode (Layer 0 typed codec decode). */
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_DECODE_ERROR
 }
 
 class CommitDecodeException(
@@ -235,7 +269,7 @@ class CommitDecodeException(
     val hash: KdbHash? = null,
     cause: Throwable? = null,
 ) : KdbException(message, cause) {
-    override val code: KdbErrorCode get() = KdbErrorCode.BSON_DECODE_ERROR
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_DECODE_ERROR
 }
 ```
 
@@ -243,25 +277,59 @@ class CommitDecodeException(
 
 ## 4. Data Structures
 
+### 4.1 Named Layer 0 schemas (`dev.kdb.document`)
+
+Register these in `KdbDocumentWireRegistry()` before encode/decode. Field IDs must remain stable.
+
+**Fixed:** `dev.kdb.document.Hash32` — `FIXED(32)`, SHA-256 raw digest.
+
+**Record `dev.kdb.document.DocumentBody`** — canonical input to `computeContentHash`:
+
+|Field ID|Name|Type|
+|--------|-----|-----|
+|1|`id`|`UuidVal` (logical `uuid` on `FIXED(16)` — same semantics as Layer 0)|
+|2|`json`|`STRING`|UTF-8 JSON object text; must parse as a JSON object `{}` (same payload as [KdbDocument.json])|
+
+**Record `dev.kdb.document.CommitPayload`** — hashed by `computeCommitHash` (all columns below; **no** `hash` field):
+
+|Field ID|Name|Type|
+|--------|-----|-----|
+|1|`parentHashes`|`ARRAY` of `Ref("dev.kdb.document.Hash32")`|
+|2|`namespaceId`|`STRING`|
+|3|`transactionId`|`UuidVal`|
+|4|`timestamp`|`TimestampVal` (micros)|
+|5|`authorNodeId`|`UuidVal`|
+|6|`operations`|`ARRAY` of `KdbOpWire` union type|
+|7|`documentTreeHash`|`Ref("dev.kdb.document.Hash32")`|
+|8|`schemaHash`|`Nullable(Ref("dev.kdb.document.Hash32"))`|Absent/`null` when the namespace has no schema|
+|9|`message`|`STRING`|
+
+The persisted `KdbCommit` row still carries `hash`; hashing applies only to `CommitPayload`.
+
 ### KdbDocument
 
 |Field        |Type          |Notes                                                    |
 |-------------|--------------|---------------------------------------------------------|
 |`id`         |`KdbUuid`     |Stable document identity, never changes across versions  |
-|`json`       |`String`      |Canonical UTF-8 JSON, exactly as stored — source of truth|
-|`bson`       |`BsonDocument`|Lazy; computed from `json` on first access               |
-|`contentHash`|`KdbHash`     |Lazy; SHA-256 of BSON encoding of the document body      |
+|`json`       |`String`      |Canonical UTF-8 JSON object text — source of truth for body|
+|`contentHash`|`KdbHash`     |Lazy; SHA-256 of Layer 0 binary `DocumentBody` record      |
 
-The BSON storage encoding injects a `_kdb_id` field (BinData, UUID subtype 0x04) so documents are self-identifying when read back from storage without a separate index lookup.
+Identity is carried explicitly as record field `id`, not injected into JSON keys.
 
-### KdbOp discriminator BSON encoding
+### 4.2 `KdbOp` wire union (`dev.kdb.document.KdbOpWire`)
 
-|Op type          |BSON field `"t"` value|
-|-----------------|----------------------|
-|`Write`          |`"w"`                 |
-|`Delete`         |`"d"`                 |
-|`FileWrite`      |`"f"`                 |
-|`SchemaMigration`|`"m"`                 |
+Encoded as Layer 0 `UNION` (`INT8` branch index + payload):
+
+|Branch|`Op`|Payload record|
+|-----|-----|----------------|
+|0|`Write`|`docId`: `UuidVal`, `patch`: `STRING`|
+|1|`Delete`|`docId`: `UuidVal`|
+|2|`FileWrite`|`path`: `STRING`, `blobHash`: `Ref("dev.kdb.document.Hash32")`|
+|3|`SchemaMigration`|`migrationId`: `UuidVal`, `migrationPayload`: `STRING`|
+
+### KdbOp discriminator (reference)
+
+Legacy BSON discriminator `"t"` / `"w"|"d"|"f"|"m"` is **not** used on the wire; union ordinal above is authoritative.
 
 ### KdbCommit
 
@@ -275,7 +343,11 @@ The BSON storage encoding injects a `_kdb_id` field (BinData, UUID subtype 0x04)
 
 ### DocumentTree
 
-The tree is a flat map of `docId → contentHash`. It does not store document bodies — those are stored separately by content hash, enabling deduplication across commits. The `treeHash` is a deterministic SHA-256 of the BSON encoding of the sorted entries (sorted by `docId.toString()` lexicographically).
+The tree is a flat map of `docId → contentHash`. It does not store document bodies — those are stored separately by content hash, enabling deduplication across commits.
+
+### 4.3 DocumentTree wire encoding (`treeHash`)
+
+`treeHash` is SHA-256 of `encodeToBytes(tree.toKdbValue(), DocumentTreeWireType, registry)` where `tree.toKdbValue()` is an `ARRAY` of **records** `{ docId: UuidVal, contentHash: Ref("dev.kdb.document.Hash32") }`, sorted by **`docId.toString()`** ascending (lower-case UUID with hyphens). `DocumentTreeWireType` is that array type (registered under `dev.kdb.document`).
 
 -----
 
@@ -291,7 +363,7 @@ The tree is a flat map of `docId → contentHash`. It does not store document bo
 
 - **Pre:** `json` is a valid JSON object string; `id` is a valid `KdbUuid`.
 - **Post:** Returns a `KdbDocument` with the provided `id`.
-- **Guarantee:** Round-trip `fromBson(doc.toBson())` returns a document with identical `id` and `json`.
+- **Guarantee:** Round-trip `fromDocumentBodyValue(doc.toDocumentBodyValue())` returns a document with identical `id` and `json`.
 
 ### `KdbDocument.merge(patchJson)`
 
@@ -301,18 +373,18 @@ The tree is a flat map of `docId → contentHash`. It does not store document bo
 
 ### `computeContentHash(doc)`
 
-- **Post:** Returns SHA-256 of `doc.toBson().toBytes()` (i.e. the BSON encoding including the injected `_kdb_id` field).
+- **Post:** Returns SHA-256 of `encodeToBytes(doc.toDocumentBodyValue(), DocumentBodyType, registry)` using `registry = KdbDocumentWireRegistry()`.
 - **Guarantee:** Two documents with identical `id` and `json` always produce the same `contentHash`.
 
 ### `computeCommitHash(commit)`
 
 - **Pre:** All fields of `commit` except `hash` must be populated.
-- **Post:** SHA-256 of canonical BSON encoding of the commit with `hash` field omitted.
+- **Post:** SHA-256 of canonical binary encoding of `CommitPayload` (Layer 0 record), omitting `hash`.
 - **Guarantee:** Deterministic — same inputs always produce the same hash.
 
 ### `DocumentTree.build(entries)`
 
-- **Post:** `treeHash` is SHA-256 of the BSON encoding of entries sorted by `docId.toString()` ascending.
+- **Post:** `treeHash` matches §4.3 (sorted array-of-records encoding).
 - **Guarantee:** Same entries in any order → same `treeHash`.
 
 ### `DocumentTree.with(docId, contentHash)`
@@ -322,11 +394,11 @@ The tree is a flat map of `docId → contentHash`. It does not store document bo
 
 ### `KdbOp` round-trip
 
-- **Guarantee:** `KdbOp.fromBson(op.toBson()) == op` for all op types.
+- **Guarantee:** `KdbOp.fromKdbValue(op.toKdbValue()) == op` for all op types.
 
 ### `KdbCommit` round-trip
 
-- **Guarantee:** `KdbCommit.fromBson(commit.toBson()).hash == commit.hash`.
+- **Guarantee:** Payload decode + hash recompute: `fromPayloadBytes(commit.toPayloadBytes())` yields equal logical commit (including `hash`).
 
 -----
 
@@ -334,9 +406,9 @@ The tree is a flat map of `docId → contentHash`. It does not store document bo
 
 |Exception                         |When Thrown                                                                                                                |
 |----------------------------------|---------------------------------------------------------------------------------------------------------------------------|
-|`DocumentDecodeException`         |`fromBson` receives a BSON document missing `_kdb_id` or with malformed `_kdb_id`, or the JSON body cannot be reconstructed|
-|`CommitDecodeException`           |`KdbCommit.fromBson` or `fromBytes` encounters missing required fields, unknown op type discriminator, or malformed hashes |
-|`BsonDecodeException` (from codec)|Propagated when `BsonDocument.fromBytes` fails during deserialisation of commit or document bytes                          |
+|`DocumentDecodeException`         |Invalid `DocumentBody` bytes/value, missing fields, non-object JSON in `body`, or UUID/hash malformed                     |
+|`CommitDecodeException`           |`fromPayloadBytes` / `fromBytes` encounters truncated bytes, unknown union branch, or malformed hashes                     |
+|`KdbDecodeException` (from codec)|Malformed binary (`decodeFromBytes`), including truncated records / bad union discriminant                                  |
 
 Neither `KdbDocument.merge` nor `KdbDocument.withJson` throw — invalid patch JSON results in a `DocumentDecodeException` wrapped in a `KdbResult.Failure` at the call site (callers should use `kdbRunCatching`).
 
@@ -348,17 +420,17 @@ Neither `KdbDocument.merge` nor `KdbDocument.withJson` throw — invalid patch J
 |--|----------------------------------|--------------------------------------------------|----------------------------------------------------------------------------|
 |1 |`fromJson_assignsFreshId`         |Valid JSON object string                          |Document returned; `id` is a valid non-nil UUID; `json` exactly equals input|
 |2 |`fromJson_withId_preservesId`     |Known UUID + valid JSON                           |`doc.id == providedId`                                                      |
-|3 |`toBson_roundTrip`                |Any `KdbDocument`                                 |`fromBson(doc.toBson())` produces doc with same `id` and `json`             |
+|3 |`documentBody_roundTrip`          |Any `KdbDocument`                                 |`fromDocumentBodyValue(toDocumentBodyValue())` preserves `id` and `json`   |
 |4 |`contentHash_deterministic`       |Two documents built from same `(id, json)`        |`contentHash` values are equal                                              |
 |5 |`merge_rootLevelOverwrite`        |`doc` with `{"a":1,"b":2}`, patch `{"b":99,"c":3}`|Result `json` parses to `{"a":1,"b":99,"c":3}`                              |
 |6 |`merge_preservesNestedJson`       |`doc` with `{"a":{"x":1,"y":2}}`, patch `{"z":3}` |`{"a":{"x":1,"y":2},"z":3}` — nested untouched                              |
 |7 |`documentTree_withAndWithout`     |`EMPTY.with(id, hash).without(id)`                |`treeHash == DocumentTree.EMPTY.treeHash`                                   |
 |8 |`documentTree_hashDeterministic`  |Same entries inserted in different order          |`treeHash` values are equal                                                 |
 |9 |`commitHash_deterministic`        |Same commit data built twice                      |`computeCommitHash` returns same hash both times                            |
-|10|`op_roundTrip_allTypes`           |One of each `KdbOp` subtype                       |`fromBson(op.toBson()) == op` for all types                                 |
-|11|`fromBson_missingKdbId_throws`    |BSON document without `_kdb_id` field             |`DocumentDecodeException`                                                   |
+|10|`op_roundTrip_allTypes`           |One of each `KdbOp` subtype                       |`fromKdbValue(toKdbValue()) == op` for all types                            |
+|11|`fromDocumentBody_badUuid_throws` |Corrupt UUID field in wire record                  |`DocumentDecodeException` or `KdbDecodeException`                           |
 |12|`mergeCommit_twoParents`          |`KdbCommit` with `parentHashes` of length 2       |Serialises and deserialises correctly; `parentHashes.size == 2`             |
-|13|`commitStub_preservesOriginalHash`|`CommitStub` with known `originalHash`            |Hash survives BSON round-trip unchanged                                     |
+|13|`commitStub_preservesOriginalHash`|`CommitStub` with known `originalHash`            |Hash survives typed-binary round-trip unchanged                             |
 |14|`fromJson_arrayRoot_throws`       |JSON string `"[1,2,3]"` (array, not object)       |`DocumentDecodeException`                                                   |
 
 -----
@@ -378,29 +450,29 @@ Neither `KdbDocument.merge` nor `KdbDocument.withJson` throw — invalid patch J
 
 ## 9. Implementation Notes
 
-### Canonical BSON encoding for hashing
+### Canonical binary encoding for hashing
 
-For both `computeContentHash` and `computeCommitHash`, the BSON encoding must be canonical and deterministic:
+Layer 0 already guarantees deterministic bytes per `(KdbValue, KdbType, frozen registry)`. Implementations **must**:
 
-- Fields in `BsonDocument` must be in a defined order (insertion order is fine if construction order is fixed in code — always build the document in the same field order).
-- Do not rely on `LinkedHashMap` ordering surviving serialisation differently on JS vs JVM. Explicitly build the BSON document field by field in a fixed sequence.
+- Register all §4.1 schemas in a single frozen registry singleton used by hash functions.
+- Build `RecordVal` maps with explicit field IDs matching the tables — never infer field order from Kotlin reflection alone.
 
-### Content hash includes the `_kdb_id` field
+### Content hash includes document id
 
-`computeContentHash` hashes the full BSON storage form (including `_kdb_id`). This means two documents with the same JSON body but different IDs have different content hashes, which is correct — they are different documents.
+`computeContentHash` hashes `DocumentBody` (`id` + `body`), so two documents with the same JSON body but different IDs produce different content hashes.
 
-### Lazy BSON computation
+### Lazy `contentHash`
 
-`bson` and `contentHash` are `by lazy` delegates. On Kotlin/JS, `lazy` is not thread-safe by default — use `LazyThreadSafetyMode.NONE` on JS (single-threaded) and `LazyThreadSafetyMode.SYNCHRONIZED` on JVM/Native. Use `expect/actual` if needed, or unconditionally use `SYNCHRONIZED` (acceptable overhead for these one-time computations).
+`contentHash` is a `by lazy` delegate. On Kotlin/JS use `LazyThreadSafetyMode.NONE`; on JVM/Native prefer `SYNCHRONIZED` or explicit freezing after construction.
 
 ### JSON merge implementation
 
 `merge` should:
 
-1. Parse `this.json` into a `Map<String, Any?>` using the BSON codec’s JSON parser.
-1. Parse `patchJson` similarly.
-1. Apply patch keys over base map (shallow).
-1. Re-serialise to JSON string.
+1. Parse `this.json` with `KdbValue.fromJson(...)` using a **JSON-object** schema (`STRING`-keyed map type per Layer 0 extended JSON rules), **or** use the JSON Functions Engine / a dedicated recursive parser — BSON-backed parsers are not required.
+2. Parse `patchJson` similarly.
+3. Apply patch keys over base map (shallow).
+4. Re-serialise with `toJson`.
 
 Do not use string concatenation or regex. Parse both sides fully.
 
@@ -426,10 +498,10 @@ The treeHash sorts entries by `docId.toString()` (UUID string representation, lo
 |Sub-component                                                              |NBNC lines|
 |---------------------------------------------------------------------------|----------|
 |`KdbDocument` data class + companion + extensions                          |200       |
-|`KdbOp` sealed hierarchy + BSON serialisation                              |250       |
+|`KdbOp` sealed hierarchy + Layer 0 union/value encoding                       |280       |
 |`KdbTransaction`                                                           |80        |
-|`KdbCommit` + hash + BSON serialisation                                    |350       |
-|`DocumentTree` + hash + BSON serialisation                                 |300       |
+|`KdbCommit` + hash + `CommitPayload` binary encode/decode                     |380       |
+|`DocumentTree` + hash + sorted array wire encoding                           |320       |
 |`KdbBranch`, `KdbTag`, `CommitStub`                                        |120       |
 |SHA-256 expect/actual (commonMain stub + jvmMain/jsMain/nativeMain actuals)|150       |
 |Exceptions                                                                 |80        |

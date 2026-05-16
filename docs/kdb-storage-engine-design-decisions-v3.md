@@ -1,6 +1,6 @@
 # KDB Storage Engine — Design Decisions v3
 
-**Purpose:** Extended and updated storage engine design decisions. Covers multi-implementation model, mixed enlistment model, browser snapshot + repair, sub-enlistment eviction tiers, policy-driven index pinning, and GPU direct-from-delta-log materialisation. Feed this into a Layer 3 spec session alongside kdb-spec-v0.8.md.
+**Purpose:** Extended and updated storage engine design decisions. Covers multi-implementation model, mixed enlistment model, browser snapshot + repair, sub-enlistment eviction tiers, policy-driven index pinning, and GPU direct-from-delta-log materialisation. Feed this into a Layer 3 spec session alongside `kdb-spec-v0_9.md`.
 
 **Supersedes:** kdb-storage-engine-design-decisions-v2.md. All decisions from v1 and v2 remain in force unless explicitly updated here.
 

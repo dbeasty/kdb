@@ -10,7 +10,7 @@
 
 ```
 Layer 0 — Foundation         [COMPLETE]
-  [x] 1. BSON Codec          — interface in Section 17
+  [x] 1. Type System & Codec — interface in Section 17; normative detail in `kdb-spec-layer0-codec.md`
   [x] 2. Error Model         — interface in Section 17
 
 Layer 1 — Core Types         [IN PROGRESS — specs generated, awaiting implementation]
@@ -31,7 +31,7 @@ All other layers             [NOT STARTED]
 
 ### What Has Been Done
 
-- Layer 0 component specs generated (BSON Codec, Error Model)
+- Layer 0 component specs generated (Type System & Codec — `kdb-spec-layer0-codec.md`, Error Model)
 - Both Layer 0 components implemented and tested (per plan)
 - Public interfaces extracted and recorded in Section 17 → Layer 0
 - Layer 1 component specs generated (Document + Commit Model, JSON Functions Engine)
@@ -116,7 +116,7 @@ KDB is a portable, multi-runtime embedded database engine written in Kotlin Mult
 
 KDB is best understood as **source control for structured documents**. You store whole JSON documents. You retrieve whole JSON documents. Optionally you declare a schema — a typed, indexed lens over part of each document — which unlocks SQL querying, JDBC connectivity, and ORM integration. The document is always the truth. The schema is always a lens. Both coexist without friction.
 
-Primary storage is JSON. Binary storage uses BSON (Apache 2.0 licensed open spec) compressed with zstd. SQL operates as an index and query layer over schema-declared fields, but raw JSON access is always available alongside SQL in the same query. All data lives in versioned, content-addressed namespaces with git-like history. Peer synchronisation follows a source-control model: peers are fully independent, can diverge arbitrarily, and merge when they choose to.
+Primary storage is JSON. Binary storage and on-the-wire structured data use the **Layer 0 typed binary codec** (tagged physical types, schema-driven records, deterministic encoding per `kdb-spec-layer0-codec.md`), typically **compressed with zstd** in warm/cold tiers. BSON is not the public interchange format. SQL operates as an index and query layer over schema-declared fields, but raw JSON access is always available alongside SQL in the same query. All data lives in versioned, content-addressed namespaces with git-like history. Peer synchronisation follows a source-control model: peers are fully independent, can diverge arbitrarily, and merge when they choose to.
 
 ### 1.1 Goals
 
@@ -146,7 +146,7 @@ Primary storage is JSON. Binary storage uses BSON (Apache 2.0 licensed open spec
 - The document is always the truth; schema is always a lens
 - The engine is the same on every platform; only adapters differ
 - JSON is always the canonical representation of meaning
-- BSON+zstd is always a storage and transport optimisation, never a requirement
+- Typed binary + zstd is always a storage and transport optimisation; JSON remains valid end-to-end
 - SQL addresses data via schema; `_doc` always gives access to the whole document
 - Peers are equal; any peer can sync with any other peer directly
 - Divergence is normal; merging is explicit and application-controlled
@@ -162,7 +162,7 @@ The entire engine lives in `commonMain`. Every platform — browser, JVM, native
 ```
 commonMain  ←  the entire engine lives here
   │
-  ├── Document model, BSON codec, commit DAG
+  ├── Document model, Layer 0 codec, commit DAG
   ├── Transaction engine, conflict resolution
   ├── Schema engine, validation, migration
   ├── Hybrid query engine (SQL + JSON functions)
@@ -640,7 +640,7 @@ Before compacting, the node broadcasts `CompactionIntent` to all known peers and
 
 ### 6.5 Ice Archival
 
-Tagged snapshots are materialised as self-contained BSON+zstd archive bundles and shipped to configured archive storage. A stub commit replaces the original in the DAG. Accessing an archived commit returns `IceStorageException`. Restore targets an isolated namespace to avoid disturbing live data.
+Tagged snapshots are materialised as self-contained **typed-binary+zstd** archive bundles and shipped to configured archive storage. A stub commit replaces the original in the DAG. Accessing an archived commit returns `IceStorageException`. Restore targets an isolated namespace to avoid disturbing live data.
 
 -----
 
@@ -737,7 +737,7 @@ On reconnect:
 [int16]   message type
 [int16]   protocol version
 [int32]   correlation id
-[bytes]   payload (BSON or JSON per negotiated encoding)
+[bytes]   payload (KDB typed binary or JSON per negotiated encoding)
 ```
 
 ### 8.5 Message Types
@@ -760,15 +760,17 @@ On reconnect:
 
 ### 8.6 DeltaCommit Payload
 
+Structured payload encoded as **Layer 0 values** (records / unions per `dev.kdb.document.*` and related wire schemas), not BSON. Illustrative logical layout:
+
 ```
-BSON {
-  namespace:    string
-  commitHash:   BinData(hash)
-  parentHash:   BinData(hash)
-  timestamp:    Date
-  operations:   [ Op, ... ]
-  indexHints:   [ { index, key, action }, ... ]   // pre-computed for read-only clients
-  schemaDelta:  SchemaDelta?                       // present if schema changed
+DeltaCommitPayload {
+  namespace:     string
+  commitHash:    bytes[32]     // SHA-256
+  parentHash:    bytes[32]
+  timestamp:     timestamp     // microsecond instant
+  operations:    [ Op, ... ]   // union-discriminated ops
+  indexHints:    [ { index, key, action }, ... ]   // pre-computed for read-only clients
+  schemaDelta:   SchemaDelta?   // present if schema changed
 }
 ```
 
@@ -860,9 +862,9 @@ namespace("myapp/users") {
 
     tiers {
         hot  { maxAge = 7.days;    storage = LOCAL_DB }
-        warm { maxAge = 90.days;   storage = LOCAL_FS;     format = BSON_ZSTD }
-        cold { maxAge = 365.days;  storage = OBJECT_STORE; format = BSON_ZSTD }
-        ice  { storage = ARCHIVE;  format = BSON_ZSTD;     restoreLatency = HOURS }
+        warm { maxAge = 90.days;   storage = LOCAL_FS;     format = KDB_BINARY_ZSTD }
+        cold { maxAge = 365.days;  storage = OBJECT_STORE; format = KDB_BINARY_ZSTD }
+        ice  { storage = ARCHIVE;  format = KDB_BINARY_ZSTD;     restoreLatency = HOURS }
     }
 }
 
@@ -968,29 +970,25 @@ The CLI is implemented in `jvmMain` and distributed as a native binary via Graal
 
 ## 12. Storage Format Details
 
-### 12.1 BSON + zstd
+### 12.1 Layer 0 typed binary + zstd
 
-BSON (bsonspec.org, Apache 2.0 licensed) is used for binary storage and peer wire transport. BSON provides typed values, length-prefixed traversal, and efficient encoding of numbers, timestamps, and binary data. The field-name repetition overhead inherent to BSON is mitigated by zstd compression, which handles repeated strings extremely well. Typical size reduction: 50–75% over equivalent JSON, with fast decompression suitable for read-heavy workloads.
-
-```
-hot tier    →  BSON uncompressed  (fast random access)
-warm tier   →  BSON + zstd
-cold tier   →  BSON + zstd        (object storage)
-ice tier    →  BSON + zstd        (archive bundle, fully self-contained)
-wire        →  BSON uncompressed between peers; zstd for bulk/snapshots
-```
-
-### 12.2 BSON Conventions for KDB Internal Types
+Structured engine data uses the **Layer 0 codec** (`kdb-spec-layer0-codec.md`): physical type tags, varints, schema-addressed records, and deterministic encoding suitable for content hashing. **zstd** applies as an outer compression wrapper on segments, snapshots, and bulk sync — repeated field structure compresses well even though the binary format is not BSON.
 
 ```
-BinData subtype 0x04  →  UUID  (16 bytes): document IDs, node IDs, tx IDs
-BinData subtype 0x00  →  Hash  (32 bytes): SHA-256 commit and blob hashes
-BSON Date             →  Timestamp: microsecond precision as int64
+hot tier    →  typed binary uncompressed (fast random access)
+warm tier   →  typed binary + zstd
+cold tier   →  typed binary + zstd        (object storage)
+ice tier    →  typed binary + zstd       (archive bundle, fully self-contained)
+wire        →  typed binary or JSON per handshake; zstd for bulk/snapshots
 ```
+
+### 12.2 Physical encoding of KDB primitives
+
+UUIDs (16-byte RFC 4122), hashes (32-byte SHA-256), and timestamps (microsecond instants) map onto Layer 0 logical types (`uuid`, `timestamp-micros`, etc.) over fixed/binary/int64 physical forms — see Layer 0 §4. **They are not BSON BinData / BSON Date.**
 
 ### 12.3 Ice Archive Bundle
 
-Self-contained BSON+zstd file, restorable into any KDB instance without external references:
+Self-contained **typed-binary+zstd** file, restorable into any KDB instance without external references:
 
 ```
 {
@@ -1021,10 +1019,10 @@ IndexCorruptionException       index inconsistent with document tree; rebuild tr
 StorageTierException           tier transition failed (e.g. object store unreachable)
 SchemaMigrationException       migration failed; namespace rolled back to pre-migration state
 JsonPathException              invalid or non-matching JSONPath expression; path string attached
-DocumentDecodeException        document BSON/JSON decode failed; optional docId attached
-                               (reuses KdbErrorCode.BSON_DECODE_ERROR)
-CommitDecodeException          commit BSON decode failed; optional hash attached
-                               (reuses KdbErrorCode.BSON_DECODE_ERROR)
+DocumentDecodeException        document typed-binary / JSON decode failed; optional docId attached
+                               (`KdbErrorCode.KDB_DECODE_ERROR`, numeric legacy of BSON decode)
+CommitDecodeException          commit payload decode failed; optional hash attached
+                               (`KdbErrorCode.KDB_DECODE_ERROR`)
 ```
 
 -----
@@ -1035,7 +1033,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 
 |Module                                                                           |Est. lines |
 |---------------------------------------------------------------------------------|-----------|
-|BSON codec (commonMain, all types + KDB conventions)                             |2,500      |
+|Layer 0 typed codec (`kdb-codec`, physical types + schema + JSON/binary bridges)           |2,500      |
 |Document + commit data model                                                     |1,800      |
 |JSON Functions Engine (JSONPath eval, kdb_json_* functions)                      |2,250      |
 |Schema engine (declaration, validation, migration, evolution)                    |3,500      |
@@ -1055,7 +1053,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |Compaction engine (squash, granularity, peer coordination, GC)                   |3,000      |
 |Storage tier manager (hot/warm/cold/ice, archive bundle, restore)                |3,500      |
 |KDB Storage Engine — WAL + MemTable + SSTable + Block Cache                      |5,000      |
-|KDB Storage Engine — Delta Segment Writer (BSON-native, authorship envelope)     |2,500      |
+|KDB Storage Engine — Delta Segment Writer (Layer-0-binary-native, authorship envelope)|2,500      |
 |KDB Storage Engine — Storage Compaction (SSTable + delta segment merge)          |2,000      |
 |KDB Storage Engine — Platform I/O Shim (JVM/Native/Browser)                     |1,500      |
 |Storage Manager — Realized Store Pool + Eviction Manager                         |2,000      |
@@ -1081,7 +1079,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 
 ```
 Phase 1 — Core engine + JDBC  (highest priority, 3–4 months)
-  BSON codec, document + commit model, schema engine,
+  Layer 0 typed codec, document + commit model, schema engine,
   hybrid query engine (_doc + kdb_json_* + schema fields),
   commit DAG, B-tree index, SQL engine, transaction engine,
   KDB Storage Engine (WAL, MemTable, SSTable, Delta Segment Writer),
@@ -1135,7 +1133,7 @@ The SQL engine, JDBC driver, peer sync protocol, and KDB Storage Engine are the 
 1. **Schema registry** — centralised versioning across peer network, or fully decentralised
 1. **Conflict UI conventions** — recommended patterns for surfacing ConflictReports to end users
 1. **Mode 2 → Mode 3 upgrade path** — how does a write-back client transition to full peer mid-session
-1. **Delta compression strategy** — zstd over raw BSON deltas vs. a custom BSON-aware diff format that exploits document structure for better compression ratios on sparse changes
+1. **Delta compression strategy** — zstd over raw typed-binary deltas vs. a structure-aware diff format for better compression ratios on sparse changes
 1. **Rights validation boundary** — the storage engine stores the rights token in every delta's authorship envelope but does not enforce it. A Transaction Engine or Auth Interceptor layer above must validate the token before allowing a delta to be appended. The exact boundary and trust model between these layers needs to be specified.
 1. **Conflict resolution UX contract for browser enlistments** — when an enlistment enters resolve state after a rejected push, what is the exact API contract presented to the caller? What conflict-resolution primitives does the Enlistment Manager expose, and how does the caller signal resolution before re-attempting push?
 
@@ -1175,7 +1173,7 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 0 — Foundation (no dependencies)
 
 ```
-[x] 1.  BSON Codec
+[x] 1.  Type System & Codec (`kdb-spec-layer0-codec.md`)
 [x] 2.  Error Model
 ```
 
@@ -1207,7 +1205,7 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 [ ] 10a. WAL (write-ahead log)
 [ ] 10b. MemTable
 [ ] 10c. SSTable + Block Cache
-[ ] 10d. Delta Segment Writer (BSON-native, large pages, authorship envelope per delta)
+[ ] 10d. Delta Segment Writer (Layer-0-binary-native, large pages, authorship envelope per delta)
 [ ] 10e. Storage Engine Core (coordinates above, implements StorageAdapter interface)
 [ ] 10f. Storage Compaction (SSTable + delta segment merge, tier policy)
 [ ] 10g. Platform I/O Shim (JVM: java.nio | Native: POSIX | Browser: in-memory + localStorage/sessionStorage zstd snapshot)
@@ -1355,10 +1353,18 @@ When a session asks about a dependency, point it here. Do not re-explain what th
 
 ### Layer 0 Interfaces
 
-#### 1. BSON Codec — `dev.kdb.codec`
+#### 1. Type System & Codec — `dev.kdb.codec`
+
+> **Normative detail:** `docs/kdb-spec-layer0-codec.md` (v0.2). BSON is **not** the public interchange contract; dependents use `KdbValue`, schemas (`KdbType`, `RecordSchema`, …), and the binary / JSON bridges below.
 
 ```kotlin
-// ── Primitive types ────────────────────────────────────────────────────────────
+package dev.kdb.codec
+
+import dev.kdb.codec.schema.*
+import kotlinx.io.Sink
+import kotlinx.io.Source
+
+// ── Primitive helpers (engine-facing ids, hashes, timestamps) ─────────────────
 
 data class KdbUuid(val msb: Long, val lsb: Long) {
     override fun toString(): String
@@ -1387,86 +1393,60 @@ data class KdbTimestamp(val epochMillis: Long, val microRemainder: Int = 0) : Co
     }
 }
 
-// ── BSON value hierarchy ──────────────────────────────────────────────────────
+// ── Typed value model (sum type — see spec for full sealed subclasses) ────────
 
-sealed class BsonValue { abstract val bsonType: BsonType }
-data class BsonString(val value: String) : BsonValue()
-data class BsonInt32(val value: Int) : BsonValue()
-data class BsonInt64(val value: Long) : BsonValue()
-data class BsonDouble(val value: Double) : BsonValue()
-data class BsonBoolean(val value: Boolean) : BsonValue()
-data class BsonDateTime(val epochMillis: Long) : BsonValue()
-data class BsonBinary(val subtype: Byte, val data: ByteArray) : BsonValue()
-object BsonNull : BsonValue()
-data class BsonDocument(val fields: LinkedHashMap<String, BsonValue> = LinkedHashMap()) : BsonValue() {
-    operator fun get(key: String): BsonValue?
-    operator fun set(key: String, value: BsonValue)
-    fun getString(key: String): String?
-    fun getInt32(key: String): Int?
-    fun getInt64(key: String): Long?
-    fun getDouble(key: String): Double?
-    fun getBoolean(key: String): Boolean?
-    fun getDocument(key: String): BsonDocument?
-    fun getArray(key: String): BsonArray?
-    fun getBinary(key: String): BsonBinary?
-    fun getDateTime(key: String): BsonDateTime?
-    fun containsKey(key: String): Boolean
-    fun keys(): Set<String>
-    fun isEmpty(): Boolean
-    companion object
-}
-data class BsonArray(val elements: MutableList<BsonValue> = mutableListOf()) : BsonValue() {
-    operator fun get(index: Int): BsonValue
-    fun size(): Int
-    fun isEmpty(): Boolean
-    fun add(value: BsonValue)
-}
-enum class BsonType(val byte: Byte) {
-    DOUBLE(0x01), STRING(0x02), DOCUMENT(0x03), ARRAY(0x04),
-    BINARY(0x05), BOOLEAN(0x08), DATETIME(0x09), NULL(0x0A),
-    INT32(0x10), INT64(0x12)
-}
-object BsonBinarySubtype { const val GENERIC: Byte = 0x00; const val UUID: Byte = 0x04 }
+sealed class KdbValue {
+    data object Null : KdbValue()
+    data class Bool(val v: Boolean) : KdbValue()
+    data class Int64Val(val v: Long) : KdbValue()
+    data class Float64Val(val v: Double) : KdbValue()
+    data class StringVal(val v: String) : KdbValue()
+    data class BytesVal(val v: ByteArray) : KdbValue()
+    data class ArrayVal(val elements: List<KdbValue>) : KdbValue()
+    data class MapVal(val entries: List<Pair<KdbValue, KdbValue>>) : KdbValue()
+    data class RecordVal(val fields: Map<Int, KdbValue>) : KdbValue()
+    // … plus remaining physical primitives, unions, enums, fixed,
+    //   and logical variants (DateVal, TimestampVal, UuidVal, …) per Layer 0 §6.
 
-// ── Codec registry ─────────────────────────────────────────────────────────────
-
-interface BsonCodec<T> {
-    fun encode(value: T): BsonValue
-    fun decode(bson: BsonValue): T
-}
-object BsonCodecRegistry {
-    fun <T : Any> register(kClass: kotlin.reflect.KClass<T>, codec: BsonCodec<T>)
-    fun <T : Any> get(kClass: kotlin.reflect.KClass<T>): BsonCodec<T>?
-    fun <T : Any> getOrThrow(kClass: kotlin.reflect.KClass<T>): BsonCodec<T>
+    companion object {
+        fun decodeFromBytes(bytes: ByteArray, type: KdbType, registry: KdbTypeRegistry): KdbValue
+        fun decodeFrom(source: Source, type: KdbType, registry: KdbTypeRegistry): KdbValue
+        fun fromJson(json: String, type: KdbType, registry: KdbTypeRegistry): KdbValue
+    }
 }
 
-// ── Top-level encode / decode ─────────────────────────────────────────────────
+// ── Binary codec (canonical persistence / hashing wire form) ─────────────────
 
-fun BsonDocument.toBytes(): ByteArray
-fun BsonDocument.writeTo(sink: kotlinx.io.Sink)
-fun BsonDocument.Companion.fromBytes(bytes: ByteArray): BsonDocument
-fun BsonDocument.Companion.fromSource(source: kotlinx.io.Source): BsonDocument
-fun BsonDocument.Companion.fromJson(json: String): BsonDocument
-fun BsonDocument.toJson(): String
-fun BsonDocument.toPrettyJson(indent: Int = 2): String
-fun BsonDocument.encodedSize(): Int
-fun BsonValue.encodedSize(): Int
-fun <T : Any> T.toBsonValue(): BsonValue
-inline fun <reified T : Any> BsonValue.decode(): T
+fun KdbValue.encodeToBytes(type: KdbType, registry: KdbTypeRegistry): ByteArray
+fun KdbValue.encodeTo(sink: Sink, type: KdbType, registry: KdbTypeRegistry)
+fun KdbValue.encodedSize(type: KdbType, registry: KdbTypeRegistry): Int
 
-// ── KDB convention helpers ────────────────────────────────────────────────────
+// ── JSON ↔ typed model (schema-guided; JSON only at the boundary) ─────────────
 
-fun KdbUuid.toBsonBinary(): BsonBinary
-fun BsonBinary.toKdbUuid(): KdbUuid
-fun KdbHash.toBsonBinary(): BsonBinary
-fun BsonBinary.toKdbHash(): KdbHash
-fun KdbTimestamp.toBsonDate(): BsonDateTime
-fun BsonDateTime.toKdbTimestamp(microRemainder: Long = 0L): KdbTimestamp
+fun KdbValue.toJson(type: KdbType, registry: KdbTypeRegistry): String
+fun KdbValue.toPrettyJson(type: KdbType, registry: KdbTypeRegistry, indent: Int = 2): String
 
-// ── Exceptions ────────────────────────────────────────────────────────────────
+// ── Kotlin ↔ KdbValue registry ─────────────────────────────────────────────────
 
-class BsonDecodeException(message: String, val offset: Int = -1, cause: Throwable? = null) : KdbException(message, cause)
-class BsonEncodeException(message: String, cause: Throwable? = null) : KdbException(message, cause)
+interface KdbCodec<T : Any> {
+    val schema: KdbType
+    fun encode(value: T): KdbValue
+    fun decode(value: KdbValue): T
+}
+
+object KdbCodecRegistry {
+    fun <T : Any> register(kClass: kotlin.reflect.KClass<T>, codec: KdbCodec<T>)
+    fun <T : Any> get(kClass: kotlin.reflect.KClass<T>): KdbCodec<T>?
+    fun <T : Any> getOrThrow(kClass: kotlin.reflect.KClass<T>): KdbCodec<T>
+}
+
+fun KdbUuid.toUuidVal(): KdbValue.UuidVal
+fun KdbValue.UuidVal.toKdbUuid(): KdbUuid
+
+fun KdbTimestamp.toTimestampVal(): KdbValue.TimestampVal
+fun KdbValue.TimestampVal.toKdbTimestamp(): KdbTimestamp
+
+// Typed codec errors are `KdbDecodeException` / `KdbEncodeException` in `dev.kdb.error`.
 ```
 
 #### 2. Error Model — `dev.kdb.error`
@@ -1479,7 +1459,9 @@ sealed class KdbException(message: String, cause: Throwable? = null) : Exception
 }
 
 enum class KdbErrorCode(val numericCode: Int) {
-    BSON_DECODE_ERROR(1001), BSON_ENCODE_ERROR(1002),
+    KDB_DECODE_ERROR(1001),   // Layer 0 typed codec decode (numeric legacy of BSON decode)
+    KDB_ENCODE_ERROR(1002),
+    KDB_SCHEMA_ERROR(1005),
     JSON_PATH_ERROR(2001),
     SCHEMA_VIOLATION(3001), SCHEMA_MIGRATION_FAILED(3002),
     VERSION_NOT_FOUND(3101), ICE_STORAGE(3102), COMPACTION_BOUNDARY(3103),
@@ -1492,8 +1474,9 @@ enum class KdbErrorCode(val numericCode: Int) {
 
 // ── Exception types ───────────────────────────────────────────────────────────
 
-class BsonDecodeException(message: String, val offset: Int = -1, cause: Throwable? = null) : KdbException(message, cause)
-class BsonEncodeException(message: String, cause: Throwable? = null) : KdbException(message, cause)
+class KdbDecodeException(message: String, val offset: Int = -1, cause: Throwable? = null) : KdbException(message, cause)
+class KdbEncodeException(message: String, cause: Throwable? = null) : KdbException(message, cause)
+class KdbSchemaException(message: String, cause: Throwable? = null) : KdbException(message, cause)
 class JsonPathException(message: String, val path: String, cause: Throwable? = null) : KdbException(message, cause)
 class SchemaViolationException(message: String, val violations: List<FieldViolation>) : KdbException(message)
 class SchemaMigrationException(message: String, val namespaceName: String, val failedStep: String, cause: Throwable? = null) : KdbException(message, cause)
@@ -1540,14 +1523,26 @@ inline fun <T> kdbRunCatching(block: () -> T): KdbResult<T>
 #### 3. Document + Commit Model — `dev.kdb.document`
 
 ```kotlin
+import dev.kdb.codec.*
+
+// ── Layer 0 wire registry (built-in `dev.kdb.document.*` schemas) ──────────────
+
+fun KdbDocumentWireRegistry(): dev.kdb.codec.schema.KdbTypeRegistry
+
+val DocumentBodyType: dev.kdb.codec.schema.KdbType
+val CommitPayloadType: dev.kdb.codec.schema.KdbType
+val KdbOpWireType: dev.kdb.codec.schema.KdbType
+val DocumentTreeWireType: dev.kdb.codec.schema.KdbType
+
 // ── Document ──────────────────────────────────────────────────────────────────
 
 data class KdbDocument(
     val id: KdbUuid,
     val json: String,
 ) {
-    val bson: BsonDocument                        // lazy
-    val contentHash: KdbHash                      // lazy; SHA-256 of BSON storage form
+    val contentHash: KdbHash               // lazy; SHA-256 of `DocumentBody` bytes (Layer 0 record)
+
+    fun toDocumentBodyValue(): KdbValue
 
     fun merge(patchJson: String): KdbDocument     // root-level shallow merge
     fun withJson(newJson: String): KdbDocument    // full body replacement, ID preserved
@@ -1555,11 +1550,10 @@ data class KdbDocument(
     companion object {
         fun fromJson(json: String): KdbDocument
         fun fromJson(id: KdbUuid, json: String): KdbDocument
-        fun fromBson(bson: BsonDocument): KdbDocument
+        fun fromDocumentBodyValue(value: KdbValue): KdbDocument
     }
 }
 
-fun KdbDocument.toBson(): BsonDocument
 fun computeContentHash(doc: KdbDocument): KdbHash
 
 // ── Operations ────────────────────────────────────────────────────────────────
@@ -1571,8 +1565,8 @@ sealed class KdbOp {
     data class SchemaMigration(val migrationId: KdbUuid, val migrationPayload: String) : KdbOp()
 }
 
-fun KdbOp.toBson(): BsonDocument
-fun KdbOp.Companion.fromBson(bson: BsonDocument): KdbOp
+fun KdbOp.toKdbValue(): KdbValue
+fun KdbOp.Companion.fromKdbValue(value: KdbValue): KdbOp
 
 // ── Transaction ───────────────────────────────────────────────────────────────
 
@@ -1601,9 +1595,9 @@ data class KdbCommit(
 )
 
 fun computeCommitHash(commit: KdbCommit): KdbHash
-fun KdbCommit.toBson(): BsonDocument
+fun KdbCommit.toPayloadBytes(): ByteArray
 fun KdbCommit.toBytes(): ByteArray
-fun KdbCommit.Companion.fromBson(bson: BsonDocument): KdbCommit
+fun KdbCommit.Companion.fromPayloadBytes(bytes: ByteArray): KdbCommit
 fun KdbCommit.Companion.fromBytes(bytes: ByteArray): KdbCommit
 
 // ── Document tree ─────────────────────────────────────────────────────────────
@@ -1621,11 +1615,11 @@ data class DocumentTree(
     companion object {
         val EMPTY: DocumentTree
         fun build(entries: Map<KdbUuid, KdbHash>): DocumentTree
+        fun fromKdbValue(value: KdbValue): DocumentTree
     }
 }
 
-fun DocumentTree.toBson(): BsonDocument
-fun DocumentTree.Companion.fromBson(bson: BsonDocument): DocumentTree
+fun DocumentTree.toKdbValue(): KdbValue
 
 // ── Branch + Tag + Stub ───────────────────────────────────────────────────────
 
@@ -1658,7 +1652,7 @@ class DocumentDecodeException(
     val docId: KdbUuid? = null,
     cause: Throwable? = null,
 ) : KdbException(message, cause) {
-    override val code: KdbErrorCode get() = KdbErrorCode.BSON_DECODE_ERROR
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_DECODE_ERROR
 }
 
 class CommitDecodeException(
@@ -1666,13 +1660,15 @@ class CommitDecodeException(
     val hash: KdbHash? = null,
     cause: Throwable? = null,
 ) : KdbException(message, cause) {
-    override val code: KdbErrorCode get() = KdbErrorCode.BSON_DECODE_ERROR
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_DECODE_ERROR
 }
 ```
 
 #### 4. JSON Functions Engine — `dev.kdb.json`
 
 ```kotlin
+import dev.kdb.codec.KdbValue
+
 // ── JsonPath ──────────────────────────────────────────────────────────────────
 
 class JsonPath private constructor(val expression: String) {
@@ -1697,14 +1693,15 @@ sealed class JsonValue {
     data class JArray(val elements: List<JsonValue>) : JsonValue()
 
     fun toJsonString(): String
-    fun toBsonValue(): BsonValue
+    fun toKdbValue(): KdbValue                 // structural bridge — see Layer 1 Component 4 spec
 
     companion object {
         fun fromJsonString(json: String): JsonValue
+        fun fromKdbValue(value: KdbValue): JsonValue
     }
 }
 
-fun BsonValue.toJsonValue(): JsonValue
+fun KdbValue.toJsonValue(): JsonValue
 
 // ── Core functions ────────────────────────────────────────────────────────────
 
@@ -1786,7 +1783,8 @@ sealed class KdbFieldType {
     data class EnumType(val values: Set<String>) : KdbFieldType()
 
     fun sqlTypeName(): String
-    fun bsonTypeName(): String
+    /** JDBC / introspection hint aligned with Layer 0 physical mapping (not BSON). */
+    fun codecTypeLabel(): String
 }
 
 // ── Field declaration ─────────────────────────────────────────────────────────
@@ -1825,9 +1823,7 @@ data class KdbSchema(
 
 val KdbSchema.isNone: Boolean
 
-fun KdbSchema.toBson(): BsonDocument
-fun KdbSchema.Companion.fromBson(bson: BsonDocument): KdbSchema
-fun KdbSchema.toBytes(): ByteArray
+fun KdbSchema.toBytes(): ByteArray               // canonical Layer 0 encoding (draft API)
 fun KdbSchema.Companion.fromBytes(bytes: ByteArray): KdbSchema
 
 // ── Migration DSL ─────────────────────────────────────────────────────────────
@@ -1909,8 +1905,8 @@ sealed class FieldChange {
     data class EnumValuesChanged(val added: Set<String>, val removed: Set<String>)     : FieldChange()
 }
 
-fun SchemaMigration.toBson(): BsonDocument
-fun SchemaMigration.Companion.fromBson(bson: BsonDocument): SchemaMigration
+fun SchemaMigration.toBytes(): ByteArray
+fun SchemaMigration.Companion.fromBytes(bytes: ByteArray): SchemaMigration
 
 // ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -1918,7 +1914,7 @@ class SchemaDecodeException(
     message: String,
     cause: Throwable? = null,
 ) : KdbException(message, cause) {
-    override val code: KdbErrorCode get() = KdbErrorCode.BSON_DECODE_ERROR
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_DECODE_ERROR
 }
 
 class SchemaMigrationConflictException(
@@ -2337,8 +2333,8 @@ data class IndexHint(
 
 enum class IndexHintAction { PUT, DELETE }
 
-fun IndexHint.toBson(): BsonDocument
-fun IndexHint.Companion.fromBson(bson: BsonDocument): IndexHint
+fun IndexHint.toBytes(): ByteArray              // Layer 0 encoded hint record (draft)
+fun IndexHint.Companion.fromBytes(bytes: ByteArray): IndexHint
 
 // ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -2392,14 +2388,17 @@ data class DeltaRecord(
     val commitHash: KdbHash,
     val namespaceId: String,
     val authorship: DeltaAuthorshipEnvelope,
-    val commitBson: BsonDocument,
+    /** Canonical persisted commit payload (`CommitPayload` + hash), Layer 0 binary — see Layer 1 Component 3. */
+    val commitWireBytes: ByteArray,
     val documentPatches: List<DocumentPatch>,
 )
 
 data class DocumentPatch(
     val docId: KdbUuid,
-    val before: BsonDocument?,
-    val after: BsonDocument?,
+    /** JSON document body immediately before op; null on insert. */
+    val beforeJson: String?,
+    /** JSON document body immediately after op; null on delete. */
+    val afterJson: String?,
     val contentHashAfter: KdbHash?,
 )
 
@@ -2561,7 +2560,7 @@ class EnlistmentNotFoundException(message: String, val enlistmentId: KdbUuid) : 
 
 Interfaces to define:
   - StorageAdapter          (implemented by Storage Engine Core; consumed by Transaction Engine + Index Layer)
-  - DeltaSegmentWriter      (BSON-native append-only log; includes DeltaRecord with authorship envelope)
+  - DeltaSegmentWriter      (Layer-0-binary-native append-only log; includes DeltaRecord with authorship envelope)
   - DeltaRecord / AuthorshipEnvelope  (principal, timestamp, rights_token, client_context, delta payload)
   - PlatformIoShim          (expect/actual; JVM = java.nio, Native = POSIX, Browser = in-memory + snapshot)
   - StorageEngineConfig     (page size, memory budget, shim selection)

@@ -1,14 +1,18 @@
 # KDB Component Spec — Layer 0: Error Model
 
-**Version:** 0.1  
+**Version:** 0.2  
 **Layer:** 0 (Foundation — no dependencies)  
-**Module:** `commonMain/error/KdbError`
+**Module:** `kdb-error` (`commonMain`)
+
+**Companion:** [`kdb-spec-layer0-codec.md`](kdb-spec-layer0-codec.md) — `KdbDecodeException` / `KdbEncodeException` are thrown at binary and schema-guided JSON boundaries in `dev.kdb.codec`.
 
 -----
 
 ## 1. Purpose
 
 The Error Model defines every exception type the KDB engine can throw, their structured payload fields, and the conventions callers use to handle them. It is the single, exhaustive error vocabulary for the entire engine — every other module throws only types defined here. Centralising error types in Layer 0 means all dependent layers can reference the same sealed hierarchy without circular dependencies.
+
+Layer 0 codec failures use **`KDB_DECODE_ERROR`** / **`KDB_ENCODE_ERROR`** (numeric legacy of removed BSON-named codes). Registry / type-binding failures use **`KDB_SCHEMA_ERROR`**.
 
 -----
 
@@ -46,26 +50,26 @@ sealed class KdbException(
  * New codes are always additive.
  */
 enum class KdbErrorCode(val numericCode: Int) {
-    // Layer 0 — codec
-    BSON_DECODE_ERROR(1001),
-    BSON_ENCODE_ERROR(1002),
+    // Layer 0 — typed codec + schema registry (see kdb-spec-layer0-codec.md)
+    /** Decode failure at binary or schema-guided JSON boundary. Numeric legacy of BSON decode. */
+    KDB_DECODE_ERROR(1001),
+    /** Encode failure at binary or schema-guided JSON boundary. Numeric legacy of BSON encode. */
+    KDB_ENCODE_ERROR(1002),
+    /** Frozen registry violations, unknown field IDs, incompatible logical bindings, etc. */
+    KDB_SCHEMA_ERROR(1005),
 
-    // Layer 1 — document model
+    // Layer 1 — JSON path
     JSON_PATH_ERROR(2001),
 
-    // Layer 2 — schema
+    // Layer 2 — schema + DAG
     SCHEMA_VIOLATION(3001),
     SCHEMA_MIGRATION_FAILED(3002),
-
-    // Layer 2 — DAG
     VERSION_NOT_FOUND(3101),
     ICE_STORAGE(3102),
     COMPACTION_BOUNDARY(3103),
 
-    // Layer 3 — write path
+    // Layer 3 — write path + storage adapter
     CONFLICT(4001),
-
-    // Layer 3 — storage adapter
     STORAGE_TIER_ERROR(4101),
     NAMESPACE_NOT_FOUND(4201),
 
@@ -82,30 +86,47 @@ enum class KdbErrorCode(val numericCode: Int) {
 
 // ── Exception hierarchy ────────────────────────────────────────────────────────
 
-// ---------- Layer 0: codec errors -------------------------------------------
+// ---------- Layer 0: typed codec + registry -----------------------------------
 
 /**
- * BSON bytes are structurally invalid, truncated, or violate a KDB encoding
- * convention (e.g. wrong binary subtype length).
+ * Binary or schema-guided JSON input is malformed, truncated, or inconsistent with [KdbType].
  */
-class BsonDecodeException(
+class KdbDecodeException(
     message: String,
-    /** Byte offset within the input where decoding failed. -1 if unknown. */
+    /** Byte offset within the input where decoding failed. -1 if unknown or not applicable (e.g. JSON). */
     val offset: Int = -1,
     cause: Throwable? = null
 ) : KdbException(message, cause) {
-    override val code get() = KdbErrorCode.BSON_DECODE_ERROR
+    override val code get() = KdbErrorCode.KDB_DECODE_ERROR
 }
 
 /**
- * A value cannot be encoded to BSON (e.g. NaN, Infinity, oversized string).
+ * A value cannot be encoded (e.g. NaN in double wire form, oversized payload for constraints).
  */
-class BsonEncodeException(
+class KdbEncodeException(
     message: String,
     cause: Throwable? = null
 ) : KdbException(message, cause) {
-    override val code get() = KdbErrorCode.BSON_ENCODE_ERROR
+    override val code get() = KdbErrorCode.KDB_ENCODE_ERROR
 }
+
+/**
+ * Schema registry misuse: duplicate IDs, unresolved refs after freeze, incompatible logical annotation, etc.
+ */
+class KdbSchemaException(
+    message: String,
+    cause: Throwable? = null
+) : KdbException(message, cause) {
+    override val code get() = KdbErrorCode.KDB_SCHEMA_ERROR
+}
+
+/** @deprecated Binary-era names; prefer [KdbDecodeException]. */
+@Deprecated("Use KdbDecodeException", ReplaceWith("KdbDecodeException"))
+typealias BsonDecodeException = KdbDecodeException
+
+/** @deprecated Binary-era names; prefer [KdbEncodeException]. */
+@Deprecated("Use KdbEncodeException", ReplaceWith("KdbEncodeException"))
+typealias BsonEncodeException = KdbEncodeException
 
 // ---------- Layer 1: JSON path errors ----------------------------------------
 
@@ -133,6 +154,10 @@ class SchemaViolationException(
     /** Per-field violation details. Never empty. */
     val violations: List<FieldViolation>
 ) : KdbException(message) {
+    init {
+        require(violations.isNotEmpty()) { "violations must be non-empty" }
+    }
+
     override val code get() = KdbErrorCode.SCHEMA_VIOLATION
 }
 
@@ -217,6 +242,10 @@ class ConflictException(
     message: String,
     val report: ConflictReport
 ) : KdbException(message) {
+    init {
+        require(report.conflicts.isNotEmpty()) { "report.conflicts must be non-empty" }
+    }
+
     override val code get() = KdbErrorCode.CONFLICT
 }
 
@@ -299,7 +328,7 @@ class UnsupportedProtocolVersionException(
 
 /**
  * Handshake failed because there is no mutually supported encoding
- * (e.g. one peer speaks only JSON, the other only BSON).
+ * (e.g. JSON-only peer vs typed-binary-only peer).
  */
 class EncodingNegotiationFailureException(
     message: String,
@@ -364,6 +393,7 @@ All data structures are defined in Section 3 inline with their owning exception 
 |-----------------------|---------------------------------------------------------------|
 |`KdbException`         |Sealed root; all engine exceptions extend this                 |
 |`KdbErrorCode`         |Stable numeric code per exception type                         |
+|`KdbDecodeException`, `KdbEncodeException`, `KdbSchemaException` |Layer 0 typed codec decode/encode and frozen-registry errors |
 |`FieldViolation`       |Per-field schema constraint failure detail                     |
 |`ViolationType`        |Enum of schema violation categories                            |
 |`ConflictReport`       |Full payload for a failed transaction replay                   |
@@ -419,7 +449,7 @@ This module is the error model itself — it does not throw errors. The only sit
 |# |Name                                                  |Input / Scenario                                        |Expected                                                       |
 |--|------------------------------------------------------|--------------------------------------------------------|---------------------------------------------------------------|
 |1 |**code uniqueness**                                   |All `KdbErrorCode` entries                              |No two codes share the same `numericCode` value                |
-|2 |**BsonDecodeException fields**                        |Construct with `offset=42`                              |`exception.offset == 42`; `exception.code == BSON_DECODE_ERROR`|
+|2 |**KdbDecodeException fields**                          |Construct with `offset=42`                              |`exception.offset == 42`; `exception.code == KDB_DECODE_ERROR` |
 |3 |**SchemaViolationException — all violations returned**|Construct with 3 `FieldViolation`s                      |`exception.violations.size == 3`; each field accessible        |
 |4 |**SchemaViolationException — empty violations guard** |Construct with empty list                               |`IllegalArgumentException` thrown                              |
 |5 |**ConflictReport round-trip**                         |Construct `ConflictReport` with 2 `ConflictItem`s       |All fields accessible; `report.conflicts.size == 2`            |
@@ -438,7 +468,7 @@ This module is the error model itself — it does not throw errors. The only sit
 - **No logging** — this module does not log; logging is the responsibility of the calling layer
 - **No i18n / localisation** — exception messages are English developer strings; user-facing messages are the application’s responsibility
 - **No error recovery logic** — this module only defines the taxonomy; recovery strategies live in their respective layer modules
-- **No serialisation of exceptions** — wire-protocol representation of errors is handled by the Wire Protocol module (Layer 6); this module does not define BSON encoding of exceptions
+- **No serialisation of exceptions** — wire-protocol representation of errors is handled by the Wire Protocol module (Layer 6); this module does not define encoding of exceptions on the wire
 - **No cause-chaining policy** — individual modules decide whether to wrap lower-level exceptions as `cause`; this module imposes no rule beyond making `cause` available on all types
 - **No HTTP status mapping** — mapping `KdbErrorCode` to HTTP status codes is the application’s responsibility
 
@@ -469,8 +499,9 @@ This module is the error model itself — it does not throw errors. The only sit
 
 ### Numeric code assignment policy
 
-- Groups: 1000s = codec, 2000s = document/JSON, 3000s = schema/DAG, 4000s = write path, 5000s = indexes, 6000s = wire, 7000s = archive
-- Leave gaps within groups (e.g. 3001, 3002, then 3101, 3102) for later additions without renumbering
+- Groups: 1000s = codec + Layer 0 schema registry (`1005`), 2000s = document/JSON path, 3000s = schema/DAG, 4000s = write path, 5000s = indexes, 6000s = wire, 7000s = archive
+- **`1003`–`1004`** intentionally unused today; **`1005`** is `KDB_SCHEMA_ERROR`
+- Leave gaps within groups for later additions without renumbering
 
 -----
 
@@ -479,11 +510,11 @@ This module is the error model itself — it does not throw errors. The only sit
 |Sub-component                                              |Est. NBNC lines|
 |-----------------------------------------------------------|---------------|
 |`KdbException` sealed root + `KdbErrorCode` enum           |60             |
-|Codec exceptions (BsonDecodeException, BsonEncodeException)|30             |
+|Codec exceptions (`KdbDecodeException`, `KdbEncodeException`, `KdbSchemaException`, deprecated BSON aliases)|35             |
 |Schema exceptions + payload data classes                   |80             |
 |DAG/version exceptions                                     |60             |
 |Write path / conflict exceptions + payload                 |80             |
 |Storage / network / archive exceptions                     |60             |
 |`KdbResult<T>` + `kdbRunCatching`                          |60             |
 |Unit tests                                                 |70             |
-|**Total**                                                  |**~500**       |
+|**Total**                                                  |**~505**       |

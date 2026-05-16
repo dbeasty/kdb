@@ -4,7 +4,7 @@
 
 # Package: `dev.kdb.json`
 
-# Spec version: aligned with master spec v0.5
+# Spec version: aligned with Layer 0 codec spec v0.2 and master spec v0.5+
 
 -----
 
@@ -12,16 +12,20 @@
 
 Implements the `kdb_json_*` SQL function set and the equivalent Kotlin API for JSONPath-based document access and mutation described in master spec §3.4. This module is the runtime that evaluates JSONPath expressions against JSON strings, returning extracted values or producing new JSON strings with mutations applied. It is the foundation of the hybrid query engine (Layer 5) and is used directly by the transaction engine for non-schema field writes (the `SET _doc = kdb_json_set(...)` pattern).
 
+Higher layers use Layer 0’s **`KdbValue`** model for typed/binary interchange (`kdb-spec-layer0-codec.md`). This module continues to parse and mutate **JSON text** via `JsonValue`; conversions to `KdbValue` are structural (§4 / §9), not BSON-based.
+
 -----
 
 ## 2. Dependencies
 
+**Depends on:** Layer 0 Type System & Codec (`kdb-spec-layer0-codec.md`) for typed value bridges only — **not** BSON.
+
 |Module         |Interfaces Used                                                                                                                                                     |
 |---------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|`dev.kdb.codec`|`BsonValue`, `BsonDocument`, `BsonArray`, `BsonString`, `BsonInt32`, `BsonInt64`, `BsonDouble`, `BsonBoolean`, `BsonNull`, `BsonDateTime`, `KdbUuid`, `KdbTimestamp`|
+|`dev.kdb.codec`|`KdbValue` (+ primitives such as `StringVal`, `Int64Val`, `Float64Val`, `Bool`, `Null`, `ArrayVal`, `MapVal`), optional `KdbType` / `KdbTypeRegistry` when delegating merge/set to schema-guided JSON APIs|
 |`dev.kdb.error`|`KdbException`, `KdbResult`, `KdbErrorCode`, `JsonPathException`, `kdbRunCatching`                                                                                  |
 
-No dependency on Component 3 (Document + Commit Model). This module operates on raw JSON strings and `BsonValue` trees — it does not know about `KdbDocument` or commits. Higher layers compose the two.
+No dependency on Component 3 (Document + Commit Model). This module operates on raw JSON strings and `JsonValue` trees — it does not know about `KdbDocument` or commits. Higher layers compose the two.
 
 -----
 
@@ -156,15 +160,24 @@ sealed class JsonValue {
     /** Encode this value to a JSON string fragment. */
     fun toJsonString(): String
 
-    /** Convert to a BsonValue for index or codec interop. */
-    fun toBsonValue(): BsonValue
+    /**
+     * Structural conversion to Layer 0 `KdbValue` for codec / index interop.
+     * Objects → `MapVal` of `(StringVal(key), value)` pairs preserving insertion order;
+     * arrays → `ArrayVal`; numbers → `Int64Val` vs `Float64Val` matching `JInt`/`JNumber`.
+     */
+    fun toKdbValue(): KdbValue
+
+    companion object {
+        /** Parse a JSON string fragment into a [JsonValue]. */
+        fun fromJsonString(json: String): JsonValue
+
+        /** Inverse of [JsonValue.toKdbValue] for JSON-shaped structural values (subset — §9). */
+        fun fromKdbValue(value: KdbValue): JsonValue
+    }
 }
 
-/** Parse a JSON string fragment into a [JsonValue]. */
-fun JsonValue.Companion.fromJsonString(json: String): JsonValue
-
-/** Convert a [BsonValue] to a [JsonValue]. */
-fun BsonValue.toJsonValue(): JsonValue
+/** Structural mapping `KdbValue` → `JsonValue` for JSON-compatible subtrees (inverse of [JsonValue.toKdbValue]). */
+fun KdbValue.toJsonValue(): JsonValue
 
 // ── Wildcard / multi-match ────────────────────────────────────────────────────
 
@@ -226,7 +239,7 @@ enum class JsonFunctionReturnType {
 
 `JsonValue` is the bridge type between raw JSON parsing and the rest of the engine. Key decisions:
 
-- JSON has a single `number` type; this module preserves the distinction between integer-valued numbers (`JInt`, backed by `Long`) and floating-point (`JNumber`, backed by `Double`). A JSON value `42` parses to `JInt(42)`, while `42.5` parses to `JNumber(42.5)`. This distinction is important for codec interop (BSON `Int64` vs `Double`).
+- JSON has a single `number` type; this module preserves the distinction between integer-valued numbers (`JInt`, backed by `Long`) and floating-point (`JNumber`, backed by `Double`). A JSON value `42` parses to `JInt(42)`, while `42.5` parses to `JNumber(42.5)`. This distinction is important for typed codec interop: maps cleanly to Layer 0 `Int64Val` vs `Float64Val`.
 - `JObject` uses a `Map<String, JsonValue>`. For deterministic serialisation, always use `LinkedHashMap` internally to preserve insertion order.
 - `JNull` is a singleton object, not a data class.
 
@@ -308,6 +321,11 @@ Used by the SQL query planner (Layer 4) for type checking and evaluation delegat
 
 - **Guarantee:** `JsonValue.fromJsonString(v.toJsonString()) == v` for all `JsonValue` instances (excluding floating-point edge cases `NaN`, `Infinity` — these are not valid JSON and must throw `JsonPathException`).
 
+### `JsonValue` ↔ `KdbValue` structural round-trip
+
+- **Guarantee:** For any `JsonValue` `v`, `JsonValue.fromKdbValue(v.toKdbValue()) == v`.
+- **Subset:** Mapping is defined only for the structural JSON shapes listed in §9; rich Layer 0 scalars passed to `fromKdbValue` are a programming error / documented throw (`JsonPathException`).
+
 -----
 
 ## 6. Error Cases
@@ -376,7 +394,23 @@ Used by the SQL query planner (Layer 4) for type checking and evaluation delegat
 
 Do not use `kotlinx.serialization` for the internal parse tree — it is not designed for structural mutation and re-serialisation. Instead, build a lightweight recursive descent JSON parser that produces `JsonValue` trees directly. This gives full control over number type preservation (`JInt` vs `JNumber`), insertion-order preservation, and round-trip fidelity.
 
-Alternatively, parse into `BsonDocument` via the existing codec and then convert via `BsonValue.toJsonValue()`. This is acceptable for a first implementation and avoids a second parser, but adds a BSON round-trip overhead for pure-JSON paths.
+Alternatively, parse via **`kotlinx.serialization` `Json.parseToJsonElement`** (or Layer 0 `KdbValue.fromJson` with an explicit JSON-object schema and conversion rules) if that reduces duplication — avoid any BSON-shaped intermediate representation.
+
+### Structural `JsonValue` ↔ `KdbValue` mapping
+
+Supported subset for `toJsonValue` / `fromKdbValue`:
+
+| `JsonValue` | `KdbValue` |
+|-------------|------------|
+| `JString` | `StringVal` |
+| `JInt` | `Int64Val` |
+| `JNumber` | `Float64Val` |
+| `JBool` | `Bool` |
+| `JNull` | `Null` |
+| `JArray` | `ArrayVal` (recursive) |
+| `JObject` | `MapVal` of `(StringVal(key), value)` pairs in insertion order |
+
+Rich Layer 0 scalars (`DateVal`, `UuidVal`, `TimestampVal`, …) **must not** appear inside subtrees passed to `fromKdbValue` — those conversions belong at schema-guided boundaries (`fromJson` / `toJson` with `KdbType`), not inside this JSON Functions module.
 
 ### Path compilation
 
@@ -433,7 +467,7 @@ When deserialising JSON numbers:
 |`kdbJsonDelete`                                                         |120       |
 |`kdbJsonMerge`                                                          |80        |
 |`kdbJsonContains` / `kdbJsonKeys` / `kdbJsonType` / `kdbJsonArrayLength`|180       |
-|`BsonValue.toJsonValue()` / `JsonValue.toBsonValue()` interop           |120       |
+|`JsonValue` ↔ `KdbValue` structural bridge                                       |120       |
 |`KdbJsonFunctionRegistry` + descriptors                                 |150       |
 |Unit tests                                                              |400       |
 |**Total**                                                               |**~2,250**|
