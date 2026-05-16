@@ -1,0 +1,145 @@
+package dev.kdb.error
+
+public sealed class KdbException(message: String, cause: Throwable? = null) : Exception(message, cause) {
+    public abstract val code: KdbErrorCode
+}
+
+// ---------- Layer 0: codec ------------------------------
+
+public class BsonDecodeException(
+    message: String,
+    public val offset: Int = -1,
+    cause: Throwable? = null,
+) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.BSON_DECODE_ERROR
+}
+
+public class BsonEncodeException(message: String, cause: Throwable? = null) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.BSON_ENCODE_ERROR
+}
+
+// ---------- Layer 1: JSON path ------------------------------
+
+public class JsonPathException(
+    message: String,
+    public val path: String,
+    cause: Throwable? = null,
+) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.JSON_PATH_ERROR
+}
+
+// ---------- Layer 2: schema ------------------------------
+
+public class SchemaViolationException(
+    message: String,
+    public val violations: List<FieldViolation>,
+) : KdbException(message) {
+    init {
+        require(violations.isNotEmpty()) { "violations must be non-empty" }
+    }
+
+    override val code: KdbErrorCode get() = KdbErrorCode.SCHEMA_VIOLATION
+}
+
+public class SchemaMigrationException(
+    message: String,
+    public val namespaceName: String,
+    public val failedStep: String,
+    cause: Throwable? = null,
+) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.SCHEMA_MIGRATION_FAILED
+}
+
+// ---------- Layer 2: DAG ------------------------------
+
+public class VersionNotFoundException(
+    message: String,
+    public val namespaceName: String,
+    public val reference: String,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.VERSION_NOT_FOUND
+}
+
+public class IceStorageException(
+    message: String,
+    public val namespaceName: String,
+    public val commitHash: String,
+    public val archiveLocation: String?,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.ICE_STORAGE
+}
+
+public class CompactionBoundaryException(
+    message: String,
+    public val namespaceName: String,
+    public val requestedBaseHash: String,
+    public val compactionBoundaryHash: String,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.COMPACTION_BOUNDARY
+}
+
+// ---------- Layer 3: write path ------------------------------
+
+public class ConflictException(message: String, public val report: ConflictReport) : KdbException(message) {
+    init {
+        require(report.conflicts.isNotEmpty()) { "report.conflicts must be non-empty" }
+    }
+
+    override val code: KdbErrorCode get() = KdbErrorCode.CONFLICT
+}
+
+// ---------- Layer 3: storage ------------------------------
+
+public class StorageTierException(
+    message: String,
+    public val tier: String,
+    cause: Throwable? = null,
+) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.STORAGE_TIER_ERROR
+}
+
+public class NamespaceNotFoundException(
+    message: String,
+    public val namespaceName: String,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.NAMESPACE_NOT_FOUND
+}
+
+// ---------- Layer 4: index ------------------------------
+
+public class IndexCorruptionException(
+    message: String,
+    public val namespaceName: String,
+    public val indexName: String,
+    cause: Throwable? = null,
+) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.INDEX_CORRUPTION
+}
+
+// ---------- Layer 6: wire ------------------------------
+
+public class UnsupportedProtocolVersionException(
+    message: String,
+    public val peerRequiredVersion: Int,
+    public val localMaxVersion: Int,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.UNSUPPORTED_PROTOCOL_VERSION
+}
+
+public class EncodingNegotiationFailureException(
+    message: String,
+    public val localEncodings: List<String>,
+    public val peerEncodings: List<String>,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.ENCODING_NEGOTIATION_FAILURE
+}
+
+// ---------- Layer 7: archive ------------------------------
+
+public class ArchiveRestoreException(
+    message: String,
+    public val archiveLocation: String,
+    cause: Throwable? = null,
+) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.ARCHIVE_RESTORE
+}
