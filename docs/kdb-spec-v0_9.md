@@ -116,7 +116,7 @@ KDB is a portable, multi-runtime embedded database engine written in Kotlin Mult
 
 KDB is best understood as **source control for structured documents**. You store whole JSON documents. You retrieve whole JSON documents. Optionally you declare a schema — a typed, indexed lens over part of each document — which unlocks SQL querying, JDBC connectivity, and ORM integration. The document is always the truth. The schema is always a lens. Both coexist without friction.
 
-Primary storage is JSON. Binary storage and on-the-wire structured data use the **Layer 0 typed binary codec** (tagged physical types, schema-driven records, deterministic encoding per `kdb-spec-layer0-codec.md`), typically **compressed with zstd** in warm/cold tiers. BSON is not the public interchange format. SQL operates as an index and query layer over schema-declared fields, but raw JSON access is always available alongside SQL in the same query. All data lives in versioned, content-addressed namespaces with git-like history. Peer synchronisation follows a source-control model: peers are fully independent, can diverge arbitrarily, and merge when they choose to.
+Primary storage is JSON. Binary storage and on-the-wire structured data use the **Layer 0 typed binary codec** (tagged physical types, schema-driven records, deterministic encoding per `kdb-spec-layer0-codec.md`), typically **compressed with zstd** in warm/cold tiers. **Layer 0 binary is the only in-tree structured binary interchange.** SQL operates as an index and query layer over schema-declared fields, but raw JSON access is always available alongside SQL in the same query. All data lives in versioned, content-addressed namespaces with git-like history. Peer synchronisation follows a source-control model: peers are fully independent, can diverge arbitrarily, and merge when they choose to.
 
 ### 1.1 Goals
 
@@ -760,7 +760,7 @@ On reconnect:
 
 ### 8.6 DeltaCommit Payload
 
-Structured payload encoded as **Layer 0 values** (records / unions per `dev.kdb.document.*` and related wire schemas), not BSON. Illustrative logical layout:
+Structured payload encoded as **Layer 0 values** (records / unions per `dev.kdb.document.*` and related wire schemas). Illustrative logical layout:
 
 ```
 DeltaCommitPayload {
@@ -972,7 +972,7 @@ The CLI is implemented in `jvmMain` and distributed as a native binary via Graal
 
 ### 12.1 Layer 0 typed binary + zstd
 
-Structured engine data uses the **Layer 0 codec** (`kdb-spec-layer0-codec.md`): physical type tags, varints, schema-addressed records, and deterministic encoding suitable for content hashing. **zstd** applies as an outer compression wrapper on segments, snapshots, and bulk sync — repeated field structure compresses well even though the binary format is not BSON.
+Structured engine data uses the **Layer 0 codec** (`kdb-spec-layer0-codec.md`): physical type tags, varints, schema-addressed records, and deterministic encoding suitable for content hashing. **zstd** applies as an outer compression wrapper on segments, snapshots, and bulk sync — repeated field structure compresses well over this layout.
 
 ```
 hot tier    →  typed binary uncompressed (fast random access)
@@ -984,7 +984,7 @@ wire        →  typed binary or JSON per handshake; zstd for bulk/snapshots
 
 ### 12.2 Physical encoding of KDB primitives
 
-UUIDs (16-byte RFC 4122), hashes (32-byte SHA-256), and timestamps (microsecond instants) map onto Layer 0 logical types (`uuid`, `timestamp-micros`, etc.) over fixed/binary/int64 physical forms — see Layer 0 §4. **They are not BSON BinData / BSON Date.**
+UUIDs (16-byte RFC 4122), hashes (32-byte SHA-256), and timestamps (microsecond instants) map onto Layer 0 logical types (`uuid`, `timestamp-micros`, etc.) over fixed/binary/int64 physical forms — see Layer 0 §4.
 
 ### 12.3 Ice Archive Bundle
 
@@ -1020,7 +1020,7 @@ StorageTierException           tier transition failed (e.g. object store unreach
 SchemaMigrationException       migration failed; namespace rolled back to pre-migration state
 JsonPathException              invalid or non-matching JSONPath expression; path string attached
 DocumentDecodeException        document typed-binary / JSON decode failed; optional docId attached
-                               (`KdbErrorCode.KDB_DECODE_ERROR`, numeric legacy of BSON decode)
+                               (`KdbErrorCode.KDB_DECODE_ERROR`, Layer 0 typed codec decode)
 CommitDecodeException          commit payload decode failed; optional hash attached
                                (`KdbErrorCode.KDB_DECODE_ERROR`)
 ```
@@ -1355,7 +1355,7 @@ When a session asks about a dependency, point it here. Do not re-explain what th
 
 #### 1. Type System & Codec — `dev.kdb.codec`
 
-> **Normative detail:** `docs/kdb-spec-layer0-codec.md` (v0.2). BSON is **not** the public interchange contract; dependents use `KdbValue`, schemas (`KdbType`, `RecordSchema`, …), and the binary / JSON bridges below.
+> **Normative detail:** `docs/kdb-spec-layer0-codec.md` (v0.2). Dependents use `KdbValue`, schemas (`KdbType`, `RecordSchema`, …), and the binary / JSON bridges below.
 
 ```kotlin
 package dev.kdb.codec
@@ -1461,7 +1461,7 @@ abstract class KdbException(message: String, cause: Throwable? = null) : Excepti
 }
 
 enum class KdbErrorCode(val numericCode: Int) {
-    KDB_DECODE_ERROR(1001),   // Layer 0 typed codec decode (numeric legacy of BSON decode)
+    KDB_DECODE_ERROR(1001),   // Layer 0 typed codec decode
     KDB_ENCODE_ERROR(1002),
     KDB_SCHEMA_ERROR(1005),
     JSON_PATH_ERROR(2001),
@@ -1771,9 +1771,20 @@ enum class JsonFunctionReturnType {
 
 > **Status: DRAFT** — these interfaces were generated during the spec phase. Replace each with the final extracted interface after implementation is complete and tested. Mark the component `[x]` in the Section 0 checklist at that point.
 
+> **Encoding:** Normative detail in `kdb-spec-layer2-component5-schema-engine.md` and `kdb-spec-layer2-component6-commit-dag.md`. **Schema** snapshots and migrations use Layer 0 typed binary via **`KdbSchemaWireRegistry()`** and **`encodeToBytes` / `decodeFromBytes`**. **Commits and document trees** in the DAG use the Layer 1 wire shapes (**`KdbCommit.toPayloadBytes()`**, **`CommitPayloadType`**, **`DocumentTree`**, **`DocumentTreeWireType`**, **`KdbDocumentWireRegistry()`**). Structured binary interchange is Layer 0 only throughout.
+
 #### 5. Schema Engine — `dev.kdb.schema`
 
 ```kotlin
+import dev.kdb.codec.*
+import dev.kdb.document.KdbDocument
+import dev.kdb.error.*
+import dev.kdb.json.JsonValue
+
+// ── Layer 0 registry (`dev.kdb.schema.*` wire shapes) ──────────────────────────
+
+fun KdbSchemaWireRegistry(): dev.kdb.codec.schema.KdbTypeRegistry
+
 // ── Field type hierarchy ───────────────────────────────────────────────────────
 
 sealed class KdbFieldType {
@@ -1786,10 +1797,12 @@ sealed class KdbFieldType {
     object UuidType      : KdbFieldType()
     object ObjectType    : KdbFieldType()
     object ArrayType     : KdbFieldType()
-    data class EnumType(val values: Set<String>) : KdbFieldType()
+    data class EnumType(val values: Set<String>) : KdbFieldType() {
+        init { require(values.isNotEmpty()) { "EnumType must have at least one value" } }
+    }
 
     fun sqlTypeName(): String
-    /** JDBC / introspection hint aligned with Layer 0 physical mapping (not BSON). */
+    /** JDBC / introspection hint aligned with Layer 0 physical mapping. */
     fun codecTypeLabel(): String
 }
 
@@ -1801,11 +1814,19 @@ data class SchemaField(
     val required: Boolean,
     val indexed: Boolean,
     val unique: Boolean = false,
-)
+) {
+    init {
+        require(name.matches(Regex("[a-zA-Z_][a-zA-Z0-9_]*"))) {
+            "Field name must be a valid identifier: $name"
+        }
+        require(!(unique && !indexed)) { "unique=true requires indexed=true: $name" }
+    }
+}
 
 // ── Schema declaration ─────────────────────────────────────────────────────────
 
 data class KdbSchema(
+    /** SHA-256 of canonical Layer 0 bytes of the schema wire record. */
     val schemaHash: KdbHash,
     val fields: List<SchemaField>,
     val version: Int,
@@ -1829,7 +1850,11 @@ data class KdbSchema(
 
 val KdbSchema.isNone: Boolean
 
-fun KdbSchema.toBytes(): ByteArray               // canonical Layer 0 encoding (draft API)
+fun KdbSchema.toKdbValue(): KdbValue
+fun KdbSchema.Companion.fromKdbValue(value: KdbValue): KdbSchema
+
+/** Canonical typed-binary form via [KdbSchemaWireRegistry] and the registered schema wire type. */
+fun KdbSchema.toBytes(): ByteArray
 fun KdbSchema.Companion.fromBytes(bytes: ByteArray): KdbSchema
 
 // ── Migration DSL ─────────────────────────────────────────────────────────────
@@ -1840,7 +1865,12 @@ data class SchemaMigration(
     val toVersion: Int,
     val steps: List<MigrationStep>,
     val description: String = "",
-)
+) {
+    companion object {
+        fun fromKdbValue(value: KdbValue): SchemaMigration
+        fun fromBytes(bytes: ByteArray): SchemaMigration
+    }
+}
 
 sealed class MigrationStep {
     data class AddField(val field: SchemaField)                                    : MigrationStep()
@@ -1879,7 +1909,10 @@ fun KdbSchema.migrate(block: SchemaMigrationBuilder.() -> Unit): SchemaMigration
 object SchemaEngine {
     fun validate(document: KdbDocument, schema: KdbSchema): KdbResult<KdbDocument>
     fun applyMigration(currentSchema: KdbSchema, migration: SchemaMigration): KdbResult<KdbSchema>
+
+    /** SHA-256 of canonical Layer 0 bytes for [schema]. */
     fun computeSchemaHash(schema: KdbSchema): KdbHash
+
     fun isBackwardCompatible(currentSchema: KdbSchema, migration: SchemaMigration): Boolean
     fun diff(from: KdbSchema, to: KdbSchema): SchemaDiff
     fun checkFieldValue(field: SchemaField, value: JsonValue?): FieldViolation?
@@ -1911,8 +1944,8 @@ sealed class FieldChange {
     data class EnumValuesChanged(val added: Set<String>, val removed: Set<String>)     : FieldChange()
 }
 
+fun SchemaMigration.toKdbValue(): KdbValue
 fun SchemaMigration.toBytes(): ByteArray
-fun SchemaMigration.Companion.fromBytes(bytes: ByteArray): SchemaMigration
 
 // ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -1935,6 +1968,9 @@ class SchemaMigrationConflictException(
 #### 6. Commit DAG — `dev.kdb.dag`
 
 ```kotlin
+// Commits persist via Layer 1: KdbCommit.toPayloadBytes() / fromPayloadBytes(), CommitPayloadType,
+// KdbDocumentWireRegistry(). Document trees: DocumentTree + DocumentTreeWireType (same registry).
+
 // ── DAG store interface ────────────────────────────────────────────────────────
 
 interface CommitDag {
