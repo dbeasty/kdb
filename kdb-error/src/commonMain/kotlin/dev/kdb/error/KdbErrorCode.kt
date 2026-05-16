@@ -4,8 +4,14 @@ package dev.kdb.error
  * Stable machine-readable error codes. Numeric values must not change once published.
  */
 public enum class KdbErrorCode(public val numericCode: Int) {
-    BSON_DECODE_ERROR(1001),
-    BSON_ENCODE_ERROR(1002),
+    /** Layer 0 typed codec decode (binary or JSON boundary). Same numeric legacy as BSON decode. */
+    KDB_DECODE_ERROR(1001),
+
+    /** Layer 0 typed codec encode (binary or JSON boundary). Same numeric legacy as BSON encode. */
+    KDB_ENCODE_ERROR(1002),
+
+    /** Layer 0 invalid or inconsistent schema registry / type bindings. */
+    KDB_SCHEMA_ERROR(1005),
 
     JSON_PATH_ERROR(2001),
 

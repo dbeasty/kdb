@@ -204,3 +204,12 @@ public data class KdbTimestamp(
         }
     }
 }
+
+public fun KdbUuid.toUuidVal(): KdbValue.UuidVal = KdbValue.UuidVal(msb, lsb)
+
+public fun KdbValue.UuidVal.toKdbUuid(): KdbUuid = KdbUuid(msb, lsb)
+
+public fun KdbTimestamp.toTimestampVal(tz: String? = null): KdbValue.TimestampVal =
+    KdbValue.TimestampVal(toEpochMicros(), tz)
+
+public fun KdbValue.TimestampVal.toKdbTimestamp(): KdbTimestamp = KdbTimestamp.fromEpochMicros(epochMicros)

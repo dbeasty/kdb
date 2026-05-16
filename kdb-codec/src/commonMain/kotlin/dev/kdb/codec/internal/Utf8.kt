@@ -1,6 +1,6 @@
 package dev.kdb.codec.internal
 
-import dev.kdb.error.BsonDecodeException
+import dev.kdb.error.KdbDecodeException
 
 /** UTF-8 byte sequence validated and decoded as a Kotlin string (no replacement characters). */
 internal fun decodeUtf8Strict(bytes: ByteArray, offset: Int, length: Int): String {
@@ -18,8 +18,8 @@ internal fun decodeUtf8Strict(bytes: ByteArray, offset: Int, length: Int): Strin
 
 private fun decodeOneUtf8Cp(bytes: ByteArray, i: Int, limit: Int): Pair<Int, Int> {
     val start = i
-    fun truncated(): Nothing = throw BsonDecodeException("truncated UTF-8", offset = start)
-    fun bad(): Nothing = throw BsonDecodeException("invalid UTF-8", offset = start)
+    fun truncated(): Nothing = throw KdbDecodeException("truncated UTF-8", offset = start)
+    fun bad(): Nothing = throw KdbDecodeException("invalid UTF-8", offset = start)
 
     val b0 = bytes[i].toInt() and 0xFF
     when {

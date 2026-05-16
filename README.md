@@ -10,7 +10,7 @@ KDB is a portable, multi-runtime embedded database engine written in Kotlin Mult
 
 KDB is best understood as **source control for structured documents**. You store whole JSON documents. You retrieve whole JSON documents. Optionally you declare a schema — a typed, indexed lens over part of each document — which unlocks SQL querying, JDBC connectivity, and ORM integration. The document is always the truth. The schema is always a lens. Both coexist without friction.
 
-Primary storage is JSON. Binary storage uses BSON (Apache 2.0 licensed open spec) compressed with zstd. SQL operates as an index and query layer over schema-declared fields, but raw JSON access is always available alongside SQL in the same query. All data lives in versioned, content-addressed namespaces with git-like history. Peer synchronisation follows a source-control model: peers are fully independent, can diverge arbitrarily, and merge when they choose to.
+Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-driven typed encoding supporting dates, timestamps, decimals, UUIDs, enums, named record types, maps with non-string keys, BigInteger, BigDecimal, and extensible custom types — compressed with zstd. SQL operates as an index and query layer over schema-declared fields, but raw JSON access is always available alongside SQL in the same query. All data lives in versioned, content-addressed namespaces with git-like history. Peer synchronisation follows a source-control model: peers are fully independent, can diverge arbitrarily, and merge when they choose to.
 
 ---
 
@@ -42,7 +42,7 @@ Primary storage is JSON. Binary storage uses BSON (Apache 2.0 licensed open spec
 - The document is always the truth; schema is always a lens
 - The engine is the same on every platform; only adapters differ
 - JSON is always the canonical representation of meaning
-- BSON+zstd is always a storage and transport optimisation, never a requirement
+- KDB binary codec + zstd is always a storage and transport optimisation, never a requirement
 - SQL addresses data via schema; `_doc` always gives access to the whole document
 - Peers are equal; any peer can sync with any other peer directly
 - Divergence is normal; merging is explicit and application-controlled

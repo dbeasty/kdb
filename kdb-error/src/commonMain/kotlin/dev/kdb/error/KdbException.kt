@@ -4,19 +4,29 @@ public sealed class KdbException(message: String, cause: Throwable? = null) : Ex
     public abstract val code: KdbErrorCode
 }
 
-// ---------- Layer 0: codec ------------------------------
+// ---------- Layer 0: typed codec ------------------------------
 
-public class BsonDecodeException(
+public class KdbDecodeException(
     message: String,
     public val offset: Int = -1,
     cause: Throwable? = null,
 ) : KdbException(message, cause) {
-    override val code: KdbErrorCode get() = KdbErrorCode.BSON_DECODE_ERROR
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_DECODE_ERROR
 }
 
-public class BsonEncodeException(message: String, cause: Throwable? = null) : KdbException(message, cause) {
-    override val code: KdbErrorCode get() = KdbErrorCode.BSON_ENCODE_ERROR
+public class KdbEncodeException(message: String, cause: Throwable? = null) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_ENCODE_ERROR
 }
+
+public class KdbSchemaException(message: String, cause: Throwable? = null) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.KDB_SCHEMA_ERROR
+}
+
+@Deprecated("Use KdbDecodeException", ReplaceWith("KdbDecodeException", "dev.kdb.error.KdbDecodeException"))
+public typealias BsonDecodeException = KdbDecodeException
+
+@Deprecated("Use KdbEncodeException", ReplaceWith("KdbEncodeException", "dev.kdb.error.KdbEncodeException"))
+public typealias BsonEncodeException = KdbEncodeException
 
 // ---------- Layer 1: JSON path ------------------------------
 

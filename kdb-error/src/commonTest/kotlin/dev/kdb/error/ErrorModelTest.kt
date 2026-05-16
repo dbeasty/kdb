@@ -14,10 +14,10 @@ class ErrorModelTest {
     }
 
     @Test
-    fun bson_decode_exception_offset_and_code() {
-        val e = BsonDecodeException("oops", offset = 42)
+    fun kdb_decode_exception_offset_and_code() {
+        val e = KdbDecodeException("oops", offset = 42)
         assertEquals(42, e.offset)
-        assertEquals(KdbErrorCode.BSON_DECODE_ERROR, e.code)
+        assertEquals(KdbErrorCode.KDB_DECODE_ERROR, e.code)
     }
 
     @Test
@@ -112,7 +112,7 @@ class ErrorModelTest {
 
     @Test
     fun map_failure_preserves_failure() {
-        val ex = BsonDecodeException("x")
+        val ex = KdbDecodeException("x")
         val r = KdbResult.Failure(ex).map { _: Nothing -> kotlin.test.fail("unexpected") }
         assertSame(ex, assertIs<KdbResult.Failure>(r).exception)
     }
