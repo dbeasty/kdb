@@ -21,10 +21,10 @@ Layer 2 — Schema + DAG       [COMPLETE]
   [x] 5. Schema Engine             — module `:kdb-schema`; normative detail in `kdb-spec-layer2-component5-schema-engine.md`
   [x] 6. Commit DAG                — module `:kdb-dag`; normative detail in `kdb-spec-layer2-component6-commit-dag.md`
 
-Layer 3 — Write Path         [IN PROGRESS — component specs + §17 drafts ready; Kotlin modules not yet added]
-  [~] 7. Transaction Engine        — `dev.kdb.transaction`; spec: `kdb-spec-layer3-component7-transaction-engine.md`
-  [~] 8. Index Layer — Core        — `dev.kdb.index`; spec: `kdb-spec-layer3-component8-index-layer-core.md`
-  [~] 9. Storage Adapter Interface — `dev.kdb.storage`; spec: `kdb-spec-layer3-component9-storage-adapter-interface.md`
+Layer 3 — Write Path         [COMPLETE — initial Kotlin shipment; reconcile §17 verbatim]
+  [x] 7. Transaction Engine        — module `:kdb-transaction`; `dev.kdb.transaction`; spec: `kdb-spec-layer3-component7-transaction-engine.md`
+  [x] 8. Index Layer — Core        — module `:kdb-index`; `dev.kdb.index`; spec: `kdb-spec-layer3-component8-index-layer-core.md`
+  [x] 9. Storage Adapter Interface — module `:kdb-storage`; `dev.kdb.storage`; spec: `kdb-spec-layer3-component9-storage-adapter-interface.md`
 
 All other layers             [NOT STARTED]
 ```
@@ -42,28 +42,30 @@ All other layers             [NOT STARTED]
 - Storage engine design decisions applied (v0.7 → v0.8): removed external storage dependencies, introduced two-store architecture (Delta Store + Realized Store), browser multi-enlistment model, delta authorship envelope, Storage Manager layer, split Layer 4 into 4a (Storage Engine) and 4b (Storage Manager), renumbered Layers 5–9
 - Layer 3 component specs generated (v0.8 → v0.9): Transaction Engine (Component 7), Index Layer Core (Component 8), Storage Adapter Interface (Component 9). Storage Adapter Interface incorporates all v3 design decisions: StorageCapabilitySet with GPU fields, DeltaAuthorshipEnvelope, sub-enlistment eviction state machine (FULL/DOC_EVICTED/EVICTED/RELEASED), IndexRetention (PINNED/EVICTABLE), GPU direct delta ingest path, browser snapshot repair model, IndexPinViolationEvent escalation path.
 - Layer 3 draft interfaces recorded in Section 17 → Layer 3
-- Layer 3 specs and §17 drafts are aligned with **implemented** Layer 2: transactional writes are expected to go through `CommitDag.appendCommit` / `appendMergeCommit` (with `schemaHash` carried on `KdbCommit`); `SchemaEngine.computeSchemaHash` and commit payload hashing (`KdbCommit.build` / `computeCommitHash`) are the normative hooks for schema- and content-addressed heads. Component 7 remains the only caller of those append methods once it exists.
+- Layer 3 specs and §17 drafts are aligned with **implemented** Layer 2: transactional writes are expected to go through `CommitDag.appendCommit` / `appendMergeCommit` (with `schemaHash` carried on `KdbCommit`); `SchemaEngine.computeSchemaHash` and commit payload hashing (`KdbCommit.build` / `computeCommitHash`) are the normative hooks for schema- and content-addressed heads. Component 7 (`DefaultTransactionEngine`) is now the orchestration path atop those primitives.
+- Layer 3 Gradle modules landed: `:kdb-storage` (adapter surface + memory adapter +expect/actual `PlatformIoShim`), `:kdb-index` (`IndexStore`, `MemoryIndexStore`, registry/writer/reader/manager stack, wire helpers), `:kdb-transaction` (`TransactionEngine`, builder, replay/merge atop the DAG).
 
-### What To Do Next — Layer 3 Implementation
+### What To Do Next — Layer 3 Hardening + Section 17 Sync
 
-Layers 0–2 are implemented in-tree (`:kdb-error`, `:kdb-codec`, `:kdb-document`, `:kdb-json`, `:kdb-schema`, `:kdb-dag`); their public shapes in Section 17 → Layers 0–2 are **final** for Layer 3 work. Layer 3 has no Gradle modules yet — add `:kdb-storage`, then `:kdb-transaction` and/or `:kdb-index` per dependency order below. Component specs are complete; implement Component 9 → 7 / 8 next.
+Layers 0–3 are represented in-tree by `:kdb-error`, `:kdb-codec`, `:kdb-document`, `:kdb-json`, `:kdb-schema`, `:kdb-dag`, `:kdb-storage`, `:kdb-index`, and `:kdb-transaction`. Section 17 → Layer 3 below remains an editorial snapshot; reconcile it component-by-component with the Kotlin packages (suspend vs blocking was chosen for builders; `SchemaMigrationCodec` delegates to `SchemaMigration.fromBytes`, and `OperationConflict` carries `baseDoc` for CUSTOM merge contexts).
 
-**Step 1 — Implement Layer 3:**
+**Step 1 — Harden Layer 3 (engineering):**
 
-Implement in this order:
+1. Add targeted common tests (`kdb-storage` mem adapter, `kdb-index` event log replay + snapshot round-trip, `kdb-transaction` commit/conflict/schema paths) covering the component specs’ critical scenarios.
+2. Close spec gaps surfaced in implementation: fuller CUSTOM-policy coverage for deletes, merge edge cases around empty-op markers, GPU direct ingest / eviction paths where the stubs need behaviour (still Layer 4a territory for real I/O).
+3. Decide how `expect`/`actual` `PlatformIoShim` should evolve once file-backed adapters land (suppress `-Xexpect-actual-classes`, or refactor to sealed interfaces).
 
-1. Component 9 (Storage Adapter Interface) — interface-only; no implementation logic; depends only on Layers 0–2
-1. Component 7 (Transaction Engine) — depends on Layers 0–2 + Component 9
-1. Component 8 (Index Layer Core) — depends on Layers 0–2 + Component 9; independent of Component 7, may be done in parallel
+**Step 2 — Sync Section 17 with shipped Kotlin:**
 
-**Step 2 — After each Layer 3 component is implemented:**
+1. For each Layer 3 component, replace or annotate the excerpt below with pointers to the authoritative `dev.kdb.*` source (or regenerate the verbatim API block via tooling).
+2. Once Section 17 matches the tree on all three Layer 3 components, freeze that subsection as **`[COMPLETE]`** in any future revision table you maintain alongside this document.
+3. When Layer 3 is exercised end-to-end in production wiring, bump the architecture spec revision (beyond v0.9) accordingly.
 
-1. Replace the draft interface in Section 17 for that component with the actual public interface extracted from the implementation
-1. Mark `[x]` in the Section 0 checklist above
-1. Save the updated spec (increment version after each component or after each layer)
-1. Once all of Layer 3 components are `[x]`, generate Layer 4a specs using the spec session prompt in Section 16
+**Step 3 — Layer 4a gate:**
 
-**Step 3 — Generating Layer 4a + 4b specs (new conversation, after Layer 3 is complete):**
+Do not invoke the Layer 4a generation prompt until Section 17 matches the Kotlin tree for Components 7–9 and adapters have survived at least basic integration exercises.
+
+**Step 4 — Layer 4a prompt (new conversation once §17 Layer 3 is frozen):**
 
 Paste this document and say:
 
@@ -2118,7 +2120,7 @@ class CompactionSafetyException(
 
 ### Layer 3 Interfaces
 
-> **Status: DRAFT** — these interfaces were generated during the spec phase. They are written to sit on top of **implemented** Layers 0–2 (Section 17): e.g. `StorageAdapter` and `TransactionEngine` consume `CommitDag`, `KdbCommit` (including `schemaHash`), `DocumentTree`, `KdbTransaction`, `SchemaEngine`, and Layer 0 codecs — not provisional drafts. After each component ships in Kotlin, replace the corresponding block below with the extracted public API and mark it `[x]` in Section 0.
+> **Status: IMPLEMENTED (first Kotlin cut) / §17 PENDING SYNC** — the modules `:kdb-storage`, `:kdb-index`, and `:kdb-transaction` now contain the runnable contracts. Treat the excerpts below as design shorthand until they are refreshed from source. Notable deltas already known: `TransactionBuilder` methods are `suspend` (Mutex-backed buffering), `suspend fun transactionBuilder(...)` snaps `dag.head()` as `baseVersion`, migration ops round-trip via `SchemaMigrationCodec` (`toBytes` / `fromBytes` from `SchemaSerialization.kt`), and `OperationConflict.baseDoc` is populated for merge/replay tooling.
 
 #### 7. Transaction Engine — `dev.kdb.transaction`
 
@@ -2154,12 +2156,12 @@ class TransactionBuilder(
     val authorNodeId: KdbUuid,
     val schema: KdbSchema = KdbSchema.NONE,
 ) {
-    fun write(docId: KdbUuid, patchJson: String): TransactionBuilder
-    fun writeDocument(document: KdbDocument): TransactionBuilder
-    fun delete(docId: KdbUuid): TransactionBuilder
-    fun fileWrite(path: String, blobHash: KdbHash): TransactionBuilder
-    fun schemaMigration(migration: SchemaMigration): TransactionBuilder
-    fun build(timestamp: KdbTimestamp = KdbTimestamp.now()): KdbTransaction
+    suspend fun write(docId: KdbUuid, patchJson: String): TransactionBuilder
+    suspend fun writeDocument(document: KdbDocument): TransactionBuilder
+    suspend fun delete(docId: KdbUuid): TransactionBuilder
+    suspend fun fileWrite(path: String, blobHash: KdbHash): TransactionBuilder
+    suspend fun schemaMigration(migration: SchemaMigration): TransactionBuilder
+    suspend fun build(timestamp: KdbTimestamp = KdbTimestamp.now()): KdbTransaction
 }
 
 // ── Transaction engine ────────────────────────────────────────────────────────
@@ -2217,6 +2219,7 @@ data class OperationConflict(
     val type: ConflictOperationType,
     val existingDoc: KdbDocument?,
     val incomingDoc: KdbDocument?,
+    val baseDoc: KdbDocument?,
 )
 
 data class OperationViolation(
@@ -2236,7 +2239,7 @@ sealed class DocWriteOutcome {
 
 fun transactionEngine(conflictPolicy: ConflictPolicy, customResolver: ConflictResolver? = null): TransactionEngine
 
-fun TransactionBuilder(namespaceId: String, dag: CommitDag, authorNodeId: KdbUuid, schema: KdbSchema = KdbSchema.NONE): TransactionBuilder
+suspend fun transactionBuilder(namespaceId: String, dag: CommitDag, authorNodeId: KdbUuid, schema: KdbSchema = KdbSchema.NONE): TransactionBuilder
 
 // ── Exceptions ────────────────────────────────────────────────────────────────
 

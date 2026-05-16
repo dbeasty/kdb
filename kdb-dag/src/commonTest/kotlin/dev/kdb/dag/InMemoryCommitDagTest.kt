@@ -6,7 +6,7 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbCommit
 import dev.kdb.document.KdbTransaction
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -15,8 +15,8 @@ import kotlin.test.assertTrue
 
 class InMemoryCommitDagTest {
     @Test
-    fun tc01_appendAndHeadMovesLinear(): Unit =
-        runBlocking {
+    fun tc01_appendAndHeadMovesLinear() =
+        runTest {
             val dag = inMemoryCommitDag("ns")
             val root = dag.head()
             val tx =
@@ -34,8 +34,8 @@ class InMemoryCommitDagTest {
         }
 
     @Test
-    fun tc02_putCommitIdempotent(): Unit =
-        runBlocking {
+    fun tc02_putCommitIdempotent() =
+        runTest {
             val dag = inMemoryCommitDag("ns")
             val root = dag.head()
             val tx =
@@ -53,8 +53,8 @@ class InMemoryCommitDagTest {
         }
 
     @Test
-    fun tc06_diffMaps(): Unit =
-        runBlocking {
+    fun tc06_diffMaps() =
+        runTest {
             val dag = inMemoryCommitDag("ns")
             val id1 = KdbUuid.random()
             val id2 = KdbUuid.random()
@@ -100,16 +100,16 @@ class InMemoryCommitDagTest {
         }
 
     @Test
-    fun tc07_emptyDiffSameCommit(): Unit =
-        runBlocking {
+    fun tc07_emptyDiffSameCommit() =
+        runTest {
             val dag = inMemoryCommitDag("ns")
             val h = dag.head()
             assertTrue(dag.diff(h, h).isEmpty)
         }
 
     @Test
-    fun tc09_stubShowsInWalk(): Unit =
-        runBlocking {
+    fun tc09_stubShowsInWalk() =
+        runTest {
             val dag = inMemoryCommitDag("ns")
             val genesis = dag.head()
             val tx1 =
@@ -136,8 +136,8 @@ class InMemoryCommitDagTest {
         }
 
     @Test
-    fun compactionBlockedWhenBranchHeadInSquash(): Unit =
-        runBlocking {
+    fun compactionBlockedWhenBranchHeadInSquash() =
+        runTest {
             val dag = inMemoryCommitDag("ns")
             val head = dag.head()
             assertFailsWith<CompactionSafetyException> {
@@ -151,8 +151,8 @@ class InMemoryCommitDagTest {
         }
 
     @Test
-    fun missingParentRejected(): Unit =
-        runBlocking {
+    fun missingParentRejected() =
+        runTest {
             val dag = inMemoryCommitDag("ns")
             val bogusParent = KdbHash.fromBytes(ByteArray(32) { 0x7f })
             val bad =

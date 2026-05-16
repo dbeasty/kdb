@@ -27,15 +27,13 @@ kotlin {
 
         commonMain.dependencies {
             implementation(project(":kdb-codec"))
-            implementation(project(":kdb-error"))
             implementation(project(":kdb-document"))
-            implementation(project(":kdb-schema"))
+            implementation(project(":kdb-error"))
             implementation(libs.kotlinx.coroutines.core)
         }
 
         commonTest.dependencies {
             implementation(libs.kotlin.test)
-            implementation(libs.kotlinx.coroutines.test)
         }
     }
 }
