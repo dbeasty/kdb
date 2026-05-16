@@ -55,7 +55,12 @@ Layer 6 — Hybrid Query + Policy [IMPLEMENTED — first Kotlin cut]
   [x] 18. Namespace Policy Engine  — `:kdb-namespace-policy`; spec `kdb-spec-layer6-component18-namespace-policy-engine.md`
   [x] 19. Compaction Engine (DAG)    — `:kdb-compaction`; spec `kdb-spec-layer6-component19-compaction-engine.md`
 
-Layers 7–10                  [NOT STARTED]
+Layer 7 — Network Foundation [IMPLEMENTED — first Kotlin cut]
+  [x] 20. Storage Tier Manager     — `:kdb-storage-tier`; spec `kdb-spec-layer7-component20-storage-tier-manager.md`
+  [x] 21. Wire Protocol + Framing  — `:kdb-wire`; spec `kdb-spec-layer7-component21-wire-protocol-framing.md`
+  [x] 22. Stream Mode (Mode 1 + 2) — `:kdb-stream`; spec `kdb-spec-layer7-component22-stream-mode.md`
+
+Layers 8–10                  [NOT STARTED]
 ```
 
 ### What Has Been Done
@@ -79,10 +84,12 @@ Layers 7–10                  [NOT STARTED]
 - Layer 5 implemented (first Kotlin cut): `:kdb-index-hash`, `:kdb-index-btree`, `:kdb-index-fulltext`, `:kdb-index-vector`, `:kdb-index-composite`, `:kdb-sql`. Index writer JSONPath fixed (`$.field`). Vector index uses brute-force cosine v1.
 - Layer 6 component specs generated (3 files): Components 17–19 — hybrid query, namespace policy, DAG compaction engine. Execution plan: `kdb-spec-layer6-execution-plan.md`. See Section 16.1 Layer 6 implementation order.
 - Layer 6 implemented (first Kotlin cut): `:kdb-namespace-policy`, `:kdb-hybrid-query`, `:kdb-compaction`. Hybrid engine wraps `:kdb-sql` with `AT VERSION`/`AT COMMIT`/`AT TIME`; policy JSON via kotlinx.serialization; DAG compaction orchestrates `CommitDag.squash` (distinct from `:kdb-storage-compaction`).
+- Layer 7 component specs generated (3 files): Components 20–22 — storage tier manager, wire protocol + framing, stream mode. Execution plan: `kdb-spec-layer7-execution-plan.md`. Draft interfaces in Section 17 → Layer 7.
+- Layer 7 implemented (first Kotlin cut): `:kdb-wire`, `:kdb-stream`, `:kdb-storage-tier`. Wire frame codec (JSON payload v1), in-memory transport, stream coordinator/subscriber, ice bundle archive/stub/restore.
 
 ### What To Do Next
 
-**Layer 7 — Network foundation** (depends on Layer 6). See Section 16.1 for Components 20–22 (Storage Tier Manager, Wire Protocol, Stream Mode).
+**Layer 8 — Advanced Sync + JDBC** (depends on Layer 7). See Section 16.1 for Components 23–24 (Peer Sync Mode 3, JDBC Driver).
 
 Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
 
@@ -100,6 +107,7 @@ Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kd
 - Layer 4b depends on Layer 4a; implement 11a → 11b → 11c, then 11d and 11e (11d/11e may overlap once pool + rebuild exist)
 - Layer 5 depends on Layers 3 + 4a/4b — interfaces in Section 17 (Layers 0–4). Implement 12 (hash + btree) first; 13 and 14 may proceed in parallel once 12’s `CompositeIndexStoreFactory` pattern exists; 15 requires 12–14 for index planning; 16 requires 15 parser/planner hooks
 - Layer 6 depends on Layer 5 — implement **18 → 17 → 19** (policy before hybrid query and DAG compaction). Component 19 is **not** `:kdb-storage-compaction` (10f); DAG squash only. Physical tier moves remain Layer 7 Component 20.
+- Layer 7 depends on Layer 6 — implement **21 → 22 → 20** (wire before stream; tier manager subscribes to 11e). Component 22 is Mode 1/2 only; Mode 3 peer sync is Layer 8 Component 23. Transport sockets are Layer 9 (25–26).
 - Component 15 DML paths delegate writes to Component 7 (`TransactionEngine`) — do not duplicate commit logic; Component 17 routes hybrid `_doc` DML through the same engine
 - Never mix spec generation and implementation in the same session
 - Always save component spec output as `.md` files for download (see Section 16.4)
@@ -1045,6 +1053,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |Virtual view engine                                                              |1,500      |
 |*Layer 5 subtotal (Components 12–16)*                                            |*~18,800*  |
 |*Layer 6 subtotal (Components 17–19)*                                            |*~6,500*   |
+|*Layer 7 subtotal (Components 20–22)*                                            |*~9,000*   |
 |JDBC driver (Driver, Connection, Statement, ResultSet, MetaData)                 |4,500      |
 |JDBC SQL extensions (AT VERSION, kdb_json_*, kdb_id, _doc)                       |1,000      |
 |Connection URL parser + embedded + memory modes                                  |500        |
@@ -1261,10 +1270,20 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 7 — Network Foundation (depends on Layer 6)
 
 ```
-[ ] 20. Storage Tier Manager
-[ ] 21. Wire Protocol + Framing
-[ ] 22. Stream Mode (Mode 1 + Mode 2)
+[x] 20. Storage Tier Manager         — `:kdb-storage-tier`; spec `kdb-spec-layer7-component20-storage-tier-manager.md`
+[x] 21. Wire Protocol + Framing      — `:kdb-wire`; spec `kdb-spec-layer7-component21-wire-protocol-framing.md`
+[x] 22. Stream Mode (Mode 1 + Mode 2)  — `:kdb-stream`; spec `kdb-spec-layer7-component22-stream-mode.md`
 ```
+
+**Layer 7 implementation order (normative):**
+
+1. **21 — Wire Protocol** — frame codec, handshake, encoding negotiation, message types `0x01`–`0x0D` (decode all; stream path uses subset).
+2. **22 — Stream Mode** — coordinator/subscriber, `DeltaCommit` + `PositionAck`, Mode 2 `TransactionReplay`; `InMemoryWireTransport` for tests.
+3. **20 — Storage Tier Manager** — WARM→COLD moves, ice bundle + `stubCommit`, restore to isolated namespace; subscribe to `TierSignalHooks`.
+
+**Detailed execution plan:** `docs/kdb-spec-layer7-execution-plan.md`
+
+**Estimated NBNC (Layer 7 production + tests):** ~9,000 lines (20: ~3,500; 21: ~3,000; 22: ~2,500).
 
 #### LAYER 8 — Advanced Sync + JDBC (depends on Layer 7)
 
@@ -2740,8 +2759,50 @@ fun compactionEngine(dag: CommitDag, storage: StorageAdapter, policyRegistry: Na
 
 ### Layer 7 Interfaces
 
-```
-[ not yet completed — depends on Layer 6 ]
+| Component | Module | Key types |
+|---|---|---|
+| 20 Storage Tier Manager | `:kdb-storage-tier` | `storageTierManager`, `DefaultIceBundleWriter`, `inMemoryTierBackendRegistry` |
+| 21 Wire Protocol | `:kdb-wire` | `defaultWireCodec`, `WireMessage`, `defaultHandshakeNegotiator` |
+| 22 Stream Mode | `:kdb-stream` | `streamCoordinator`, `streamSubscriber`, `InMemoryWireTransport` |
+
+```kotlin
+package dev.kdb.tier
+
+interface StorageTierManager {
+    fun start()
+    fun stop()
+    suspend fun runCycle(namespaceId: String): TierCycleResult
+    suspend fun archiveCommit(request: ArchiveRequest): ArchiveResult
+    suspend fun restoreArchive(request: RestoreRequest): RestoreResult
+}
+fun storageTierManager(dag: CommitDag, storage: StorageAdapter, tierRegistry: DeltaLogTierRegistry, ...): StorageTierManager
+
+package dev.kdb.wire
+
+const val KDB_WIRE_PROTOCOL_VERSION: Int = 1
+interface WireCodec {
+    fun encode(message: WireMessage): ByteArray
+    fun decode(frame: ByteArray): WireMessage
+}
+fun defaultWireCodec(encoding: PayloadEncoding = PayloadEncoding.KDB_BINARY): WireCodec
+
+sealed class WireMessage { /* Handshake, DeltaCommit, PositionAck, … */ }
+
+package dev.kdb.stream
+
+interface StreamCoordinator {
+    suspend fun start(session: StreamSessionConfig)
+    suspend fun publish(commit: PublishedCommit)
+}
+interface StreamSubscriber {
+    suspend fun connect(config: StreamSubscriberConfig): StreamConnection
+}
+fun streamCoordinator(wire: WireCodec, transport: WireTransport, ...): StreamCoordinator
+fun streamSubscriber(wire: WireCodec, transport: WireTransport, ...): StreamSubscriber
+
+interface WireTransport {
+    suspend fun connect(uri: String): WireConnection
+}
 ```
 
 ### Layer 8 Interfaces
