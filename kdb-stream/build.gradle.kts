@@ -29,6 +29,7 @@ kotlin {
             implementation(project(":kdb-storage"))
             implementation(project(":kdb-transaction"))
             implementation(project(":kdb-wire"))
+            implementation(project(":kdb-inspect"))
             implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies {

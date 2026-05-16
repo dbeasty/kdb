@@ -166,3 +166,7 @@ Subscribe to TierSignalHooks from :kdb-storage-manager. Do not implement S3 SDK 
 - [x] Master spec §0 Layer 7 checklist updated
 - [x] Master spec §17 Layer 7 interfaces populated
 - [x] Master spec §14 includes Layer 7 subtotal row
+
+### Post–Layer 7 — Debug JSON (Component 31)
+
+Implement `:kdb-inspect` per `kdb-spec-layer10-component31-inspect-tooling.md`: JSONL sidecars for delta/wire, offline `kdb inspect dump-*`, and wire JSON payload fixes. Does not change normative storage or hash bytes.

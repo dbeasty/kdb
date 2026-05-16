@@ -5,10 +5,13 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.compression.Crc32
 import dev.kdb.compression.ZstdCompression
 import dev.kdb.storage.CompressionCodec
+import dev.kdb.storage.DeltaAuthorshipEnvelope
+import dev.kdb.storage.DeltaDebugHook
 import dev.kdb.storage.DeltaRecord
 import dev.kdb.storage.DeltaSegmentReader
 import dev.kdb.storage.DeltaSegmentRef
 import dev.kdb.storage.DeltaSegmentWriter
+import dev.kdb.storage.NoOpDeltaDebugHook
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.StorageEngineConfig
 import dev.kdb.storage.io.SegmentNameBuilder
@@ -20,6 +23,7 @@ public class DefaultDeltaSegmentWriter(
     override val segmentId: KdbUuid,
     private val ioShim: PlatformIoShim,
     private val config: StorageEngineConfig,
+    private val debugHook: DeltaDebugHook = NoOpDeltaDebugHook,
 ) : DeltaSegmentWriter {
     private val mutex = Mutex()
     private val segmentName = SegmentNameBuilder.delta(namespaceId, segmentId.toString())
@@ -40,6 +44,7 @@ public class DefaultDeltaSegmentWriter(
             val frame = DeltaPageCodec.frame(payload, config.compressionCodec)
             val offset = sizeBytes
             sizeBytes = ioShim.appendToSegment(segmentName, frame)
+            debugHook.onAppend(record, segmentId, offset)
             offset
         }
 
@@ -53,7 +58,7 @@ public class DefaultDeltaSegmentWriter(
             sealed = true
             ioShim.sealSegment(segmentName)
         }
-        val zero = KdbHash.fromHex("0".repeat(64))
+        val zero = KdbHash.fromBytes(ByteArray(32))
         return DeltaSegmentRef(
             segmentId = segmentId,
             namespaceId = namespaceId,
@@ -102,24 +107,102 @@ internal object DeltaPageCodec {
 public class DefaultDeltaSegmentReader(
     override val namespaceId: String,
     private val ioShim: PlatformIoShim,
+    private val config: StorageEngineConfig,
 ) : DeltaSegmentReader {
-    override suspend fun readAll(segment: DeltaSegmentRef): List<DeltaRecord> = emptyList()
+    override suspend fun readAll(segment: DeltaSegmentRef): List<DeltaRecord> {
+        val segmentName = SegmentNameBuilder.delta(segment.namespaceId, segment.segmentId.toString())
+        val bytes = readFullSegment(segmentName, segment.sizeBytes)
+        return DeltaSegmentScanner.scanSegmentBytes(bytes, segment.compressionCodec).map { scanned ->
+            DeltaRecord(
+                commitHash = scanned.commitHash,
+                namespaceId = segment.namespaceId,
+                authorship =
+                    DeltaAuthorshipEnvelope(
+                        principal = "unknown",
+                        timestamp = scanned.commit.timestamp,
+                        rightsToken = "",
+                        clientContext = "",
+                    ),
+                commitPayload = scanned.commit.toPayloadBytes(),
+                documentPatches = emptyList(),
+            )
+        }
+    }
 
     override suspend fun readRange(
         segment: DeltaSegmentRef,
         sinceCommit: KdbHash,
         untilCommit: KdbHash,
-    ): List<DeltaRecord> = emptyList()
+    ): List<DeltaRecord> {
+        val all = readAll(segment)
+        var pastSince = false
+        return all.filter { record ->
+            if (record.commitHash == sinceCommit) pastSince = true
+            pastSince && record.commitHash != untilCommit
+        }
+    }
 
-    override suspend fun listSegments(): List<DeltaSegmentRef> = emptyList()
+    override suspend fun listSegments(): List<DeltaSegmentRef> {
+        val names =
+            ioShim.listSegments(namespaceId).filter {
+                it.startsWith(SegmentNameBuilder.namespacePrefix(namespaceId) + "delta/")
+            }
+        return names.mapNotNull { name -> scanSegmentRef(name) }
+    }
+
+    private suspend fun readFullSegment(segmentName: String, sizeBytes: Long): ByteArray {
+        if (sizeBytes <= 0) return byteArrayOf()
+        val len = sizeBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        return ioShim.readFromSegment(segmentName, 0, len)
+    }
+
+    private suspend fun scanSegmentRef(segmentName: String): DeltaSegmentRef? {
+        val segmentIdStr = segmentName.substringAfterLast('/')
+        val segmentId =
+            try {
+                KdbUuid.fromString(segmentIdStr)
+            } catch (_: Exception) {
+                return null
+            }
+        val bytes =
+            try {
+                readEntireSegment(segmentName)
+            } catch (_: Exception) {
+                return null
+            }
+        val scanned = DeltaSegmentScanner.scanSegmentBytes(bytes, config.compressionCodec)
+        val zero = KdbHash.fromBytes(ByteArray(32))
+        if (scanned.isEmpty()) {
+            return DeltaSegmentRef(
+                segmentId = segmentId,
+                namespaceId = namespaceId,
+                firstCommitHash = zero,
+                lastCommitHash = zero,
+                sizeBytes = bytes.size.toLong(),
+                compressionCodec = config.compressionCodec,
+            )
+        }
+        return DeltaSegmentRef(
+            segmentId = segmentId,
+            namespaceId = namespaceId,
+            firstCommitHash = scanned.first().commitHash,
+            lastCommitHash = scanned.last().commitHash,
+            sizeBytes = bytes.size.toLong(),
+            compressionCodec = config.compressionCodec,
+        )
+    }
+
+    private suspend fun readEntireSegment(segmentName: String): ByteArray =
+        ioShim.readFromSegment(segmentName, 0, Int.MAX_VALUE / 4)
 }
 
 public class DeltaSegmentFactory(
     private val config: StorageEngineConfig,
+    private val debugHook: DeltaDebugHook = NoOpDeltaDebugHook,
 ) {
     public fun openWriter(namespaceId: String): DefaultDeltaSegmentWriter =
-        DefaultDeltaSegmentWriter(namespaceId, KdbUuid.random(), config.ioShim, config)
+        DefaultDeltaSegmentWriter(namespaceId, KdbUuid.random(), config.ioShim, config, debugHook)
 
     public fun openReader(namespaceId: String): DefaultDeltaSegmentReader =
-        DefaultDeltaSegmentReader(namespaceId, config.ioShim)
+        DefaultDeltaSegmentReader(namespaceId, config.ioShim, config)
 }

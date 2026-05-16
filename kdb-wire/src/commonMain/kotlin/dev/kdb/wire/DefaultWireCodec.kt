@@ -26,6 +26,10 @@ internal class DefaultWireCodec(override val encoding: PayloadEncoding) : WireCo
         }
         val tag = frame[payloadOffset].toInt()
         val body = frame.copyOfRange(payloadOffset + 1, payloadOffset + header.payloadLength)
+        // v1: KDB_BINARY (0) and JSON (1) both use UTF-8 JSON envelope for debug/interop.
+        if (tag != 0 && tag != 1) {
+            throw WireDecodeException("unsupported encoding tag: $tag")
+        }
         val env = json.decodeFromString<WirePayloadEnvelope>(body.decodeToString())
         return env.toMessage(header)
     }

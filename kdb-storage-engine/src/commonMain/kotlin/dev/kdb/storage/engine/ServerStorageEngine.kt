@@ -7,6 +7,7 @@ import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.kdbSha256
 import dev.kdb.storage.*
+import dev.kdb.inspect.sidecar.deltaDebugHookOrNoOp
 import dev.kdb.storage.delta.DeltaSegmentFactory
 import dev.kdb.storage.memtable.MemTableManager
 import dev.kdb.storage.sstable.BlockCache
@@ -148,7 +149,7 @@ public class DefaultStorageEngineFactory(
                 StorageEngineTarget.IN_MEMORY -> InMemoryStorageEngine(namespaceId, config)
                 StorageEngineTarget.GPU -> GpuStorageEngine(namespaceId, config)
             }
-        val deltaFactory = DeltaSegmentFactory(config)
+        val deltaFactory = DeltaSegmentFactory(config, deltaDebugHookOrNoOp(config.debugSidecar))
         val delta = if (target == StorageEngineTarget.SERVER) deltaFactory.openWriter(namespaceId) else null
         val reader = deltaFactory.openReader(namespaceId)
         return DefaultStorageEngineHandle(namespaceId, engine, delta, reader)

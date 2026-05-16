@@ -5,6 +5,7 @@ import dev.kdb.dag.CommitDag
 import dev.kdb.index.IndexManager
 import dev.kdb.storage.StorageAdapter
 import kotlinx.coroutines.flow.Flow
+import dev.kdb.inspect.sidecar.WireDebugHook
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.wire.*
 
@@ -22,8 +23,9 @@ public fun streamCoordinator(
     dag: CommitDag,
     storage: StorageAdapter,
     transactionEngine: TransactionEngine? = null,
+    wireDebugHook: WireDebugHook? = null,
 ): StreamCoordinator =
-    DefaultStreamCoordinator(wire, transport, indexManager, dag, storage, transactionEngine)
+    DefaultStreamCoordinator(wire, transport, indexManager, dag, storage, transactionEngine, wireDebugHook)
 
 internal class DefaultStreamCoordinator(
     private val wire: WireCodec,
@@ -32,6 +34,7 @@ internal class DefaultStreamCoordinator(
     private val dag: CommitDag,
     @Suppress("UNUSED_PARAMETER") private val storage: StorageAdapter,
     private val transactionEngine: TransactionEngine?,
+    private val wireDebugHook: WireDebugHook? = null,
 ) : StreamCoordinator {
     private val subscriberEvents = kotlinx.coroutines.flow.MutableSharedFlow<SubscriberState>(extraBufferCapacity = 16)
     private var session: StreamSessionConfig? = null
@@ -71,6 +74,7 @@ internal class DefaultStreamCoordinator(
                     indexHints = commit.indexHints,
                 ),
             )
+        wireDebugHook?.onWire(msg, "out")
         if (transport is InMemoryWireTransport) {
             InMemoryWireTransportHub.hub(cfg.namespaceId).serverSend(wire.encode(msg))
         }
@@ -81,7 +85,9 @@ internal class DefaultStreamCoordinator(
         frame: ByteArray,
         hub: InMemoryWireTransportHub.Hub,
     ) {
-        when (val message = wire.decode(frame)) {
+        val message = wire.decode(frame)
+        wireDebugHook?.onWire(message, "in")
+        when (message) {
             is WireMessage.Handshake -> {
                 val ack =
                     HandshakeAckPayload(

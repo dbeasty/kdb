@@ -12,6 +12,7 @@ kotlin {
             implementation(project(":kdb-storage-memtable"))
             implementation(project(":kdb-storage-sstable"))
             implementation(project(":kdb-storage-delta"))
+            implementation(project(":kdb-inspect"))
             implementation(project(":kdb-document"))
             implementation(project(":kdb-codec"))
             implementation(project(":kdb-error"))

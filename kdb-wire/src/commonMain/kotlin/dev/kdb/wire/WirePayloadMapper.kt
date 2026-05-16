@@ -48,8 +48,8 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         commitHashHex = payload.commitHash.toHex(),
                         parentHashHex = payload.parentHash.toHex(),
                         timestampMicros = payload.timestampMicros,
-                        operationsPayload = ByteArray(0),
-                        indexHintsPayload = ByteArray(0),
+                        operations = payload.operations.map { it.toOpDto() },
+                        indexHints = payload.indexHints.map { it.toHintDto() },
                         schemaDeltaBytes = payload.schemaDeltaBytes,
                     ),
             )
@@ -222,8 +222,8 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                     commitHash = KdbHash.fromHex(d.commitHashHex),
                     parentHash = KdbHash.fromHex(d.parentHashHex),
                     timestampMicros = d.timestampMicros,
-                    operations = emptyList(),
-                    indexHints = emptyList(),
+                    operations = d.operations.map { it.toKdbOp() },
+                    indexHints = d.indexHints.map { it.toIndexHint() },
                     schemaDeltaBytes = d.schemaDeltaBytes,
                 ),
             )

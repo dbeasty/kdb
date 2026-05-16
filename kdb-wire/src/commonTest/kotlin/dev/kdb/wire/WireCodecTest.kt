@@ -1,7 +1,9 @@
 package dev.kdb.wire
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbUuid
 import dev.kdb.compaction.CompactionIntent
+import dev.kdb.document.KdbOp
 import dev.kdb.error.EncodingNegotiationFailureException
 import dev.kdb.error.UnsupportedProtocolVersionException
 import kotlin.test.Test
@@ -49,6 +51,30 @@ class WireCodecTest {
         val back = codec.decode(codec.encode(msg)) as WireMessage.DeltaCommit
         assertEquals(hash, back.payload.commitHash)
         assertEquals(parent, back.payload.parentHash)
+    }
+
+    @Test
+    fun frameRoundtripDeltaCommit_withOps() {
+        val hash = KdbHash.fromHex("11".repeat(32))
+        val parent = KdbHash.fromHex("22".repeat(32))
+        val docId = KdbUuid.random()
+        val msg =
+            WireMessage.DeltaCommit(
+                header(20, WireMessageType.DELTA_COMMIT),
+                DeltaCommitPayload(
+                    namespace = "app/data",
+                    commitHash = hash,
+                    parentHash = parent,
+                    timestampMicros = 1_700_000_000_000_001,
+                    operations = listOf(KdbOp.Write(docId, """{"k":"v"}""")),
+                    indexHints = emptyList(),
+                ),
+            )
+        val back = codec.decode(codec.encode(msg)) as WireMessage.DeltaCommit
+        assertEquals(1, back.payload.operations.size)
+        val op = back.payload.operations.single() as KdbOp.Write
+        assertEquals(docId, op.docId)
+        assertEquals("{\"k\":\"v\"}", op.patch)
     }
 
     @Test

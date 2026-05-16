@@ -60,7 +60,10 @@ Layer 7 — Network Foundation [IMPLEMENTED — first Kotlin cut]
   [x] 21. Wire Protocol + Framing  — `:kdb-wire`; spec `kdb-spec-layer7-component21-wire-protocol-framing.md`
   [x] 22. Stream Mode (Mode 1 + 2) — `:kdb-stream`; spec `kdb-spec-layer7-component22-stream-mode.md`
 
-Layers 8–10                  [NOT STARTED]
+Layer 10 — Tooling (partial)  [IN PROGRESS]
+  [x] 31. Inspect / Debug Tooling — `:kdb-inspect`; spec `kdb-spec-layer10-component31-inspect-tooling.md`
+
+Layers 8–9                   [NOT STARTED]
 ```
 
 ### What Has Been Done
@@ -156,6 +159,7 @@ Primary storage is JSON. Binary storage and on-the-wire structured data use the 
 - Divergence is normal; merging is explicit and application-controlled
 - Conflicts surface to the application; KDB never silently resolves them
 - History is cheap because unchanged content is shared by hash
+- Debug JSONL sidecars and `kdb inspect` dumps are **non-authoritative**; never used for content hashing, peer sync, or tier moves
 
 -----
 
@@ -966,6 +970,12 @@ kdb gc      myapp/users                       # garbage collect blobs
 kdb node status                               # node ID, peers, namespaces
 kdb node peers                                # known peer list
 kdb node connect peer://192.168.1.10:4242     # connect to peer
+
+# ── Debug / inspect (non-authoritative JSON views) ───────────
+kdb inspect dump-delta  --data-dir DIR --namespace NS [--segment SEG]
+kdb inspect dump-wire   --file FRAME.bin [--pretty]
+kdb inspect dump-commit --file PAYLOAD.bin
+kdb inspect dump-blob   --data-dir DIR --hash HEX
 ```
 
 The CLI is implemented in `jvmMain` and distributed as a native binary via GraalVM native-image or Kotlin/Native. It calls the same engine APIs as any other consumer — no special internal access.
@@ -1004,6 +1014,18 @@ Self-contained **typed-binary+zstd** file, restorable into any KDB instance with
   blobs:            all referenced file blobs packed inline
 }
 ```
+
+### 12.4 Debug observability (non-normative for interchange)
+
+Production storage and sync use Layer 0 typed binary + zstd (§12.1). For operator and developer visibility, KDB supports **optional debug JSON** that does not participate in hashing or replication:
+
+| Mechanism | Location | Purpose |
+|---|---|---|
+| Delta JSONL sidecar | `{dataDir}/{namespaceId}/debug/delta.jsonl` | One JSON object per appended `DeltaRecord` (commit + patches when available) |
+| Wire JSONL sidecar | `{dataDir}/{namespaceId}/debug/wire.jsonl` | Optional log of decoded `WireMessage` frames (`in` / `out`) |
+| Offline dump | `kdb inspect dump-*` | Decode on-disk KDBP delta frames, wire captures, commit payloads, blobs |
+
+Sidecar writes are **best-effort**; their absence must not affect engine correctness. Offline dump reads the same bytes as production (KDBP-framed commit payloads → `KdbCommit.fromPayloadBytes`). Normative detail: `kdb-spec-layer10-component31-inspect-tooling.md`.
 
 -----
 
@@ -1306,6 +1328,7 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 10 — Tooling (depends on everything)
 
 ```
+[x] 31. Inspect / Debug Tooling       — `:kdb-inspect`; JSON sidecar + dump; spec: `kdb-spec-layer10-component31-inspect-tooling.md`
 [ ] 29. CLI
 [ ] 30. Integration Test Suite
 ```
@@ -2819,6 +2842,33 @@ interface WireTransport {
 
 ### Layer 10 Interfaces
 
-```
-[ not yet completed — depends on all layers ]
+```kotlin
+// dev.kdb.inspect — Component 31 (debug JSON; non-authoritative)
+object InspectJson {
+    fun commitToJsonLine(commit: KdbCommit): String
+    fun deltaRecordToJsonLine(record: DeltaRecord, segmentId: KdbUuid, offset: Long): String
+    fun wireMessageToJsonLine(message: WireMessage, direction: String): String
+}
+
+object DeltaSegmentScanner {
+    fun scanSegmentBytes(bytes: ByteArray, compression: CompressionCodec): List<ScannedCommit>
+}
+
+class WireFrameInspector(codec: WireCodec) {
+    fun dumpFrame(frame: ByteArray, pretty: Boolean = true): String
+}
+
+data class DebugSidecarConfig(
+    val enabled: Boolean,
+    val directory: String,
+    val logDelta: Boolean = true,
+    val logWire: Boolean = false,
+)
+
+fun interface DeltaDebugHook {
+    suspend fun onAppend(record: DeltaRecord, segmentId: KdbUuid, offset: Long)
+}
+
+fun deltaDebugHookOrNoOp(config: DebugSidecarConfig?): DeltaDebugHook
+fun wireDebugHookOrNoOp(config: DebugSidecarConfig?, namespaceId: String): WireDebugHook
 ```

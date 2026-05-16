@@ -11,4 +11,5 @@ public data class StorageEngineConfig(
     val compressionCodec: CompressionCodec = CompressionCodec.ZSTD,
     val defaultIndexRetention: IndexRetention = IndexRetention.EVICTABLE,
     val ioShim: PlatformIoShim,
+    val debugSidecar: DebugSidecarConfig? = null,
 )

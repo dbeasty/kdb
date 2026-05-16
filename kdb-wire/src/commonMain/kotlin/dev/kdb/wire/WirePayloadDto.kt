@@ -50,8 +50,8 @@ internal data class DeltaCommitDto(
     val commitHashHex: String,
     val parentHashHex: String,
     val timestampMicros: Long,
-    val operationsPayload: ByteArray,
-    val indexHintsPayload: ByteArray,
+    val operations: List<OpDto> = emptyList(),
+    val indexHints: List<IndexHintDto> = emptyList(),
     val schemaDeltaBytes: ByteArray? = null,
 )
 
