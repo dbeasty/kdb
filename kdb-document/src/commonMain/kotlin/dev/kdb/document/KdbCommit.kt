@@ -11,6 +11,38 @@ import dev.kdb.codec.toTimestampVal
 import dev.kdb.codec.toUuidVal
 import dev.kdb.document.internal.sha256Digest
 
+internal fun commitPayloadRecord(
+    parentHashes: List<KdbHash>,
+    namespaceId: String,
+    transactionId: KdbUuid,
+    timestamp: KdbTimestamp,
+    authorNodeId: KdbUuid,
+    operations: List<KdbOp>,
+    documentTreeHash: KdbHash,
+    schemaHash: KdbHash?,
+    message: String,
+): KdbValue.RecordVal =
+    KdbValue.RecordVal(
+        buildMap {
+            put(1, KdbValue.ArrayVal(parentHashes.map { KdbValue.FixedVal(it.bytes.copyOf()) }))
+            put(2, KdbValue.StringVal(namespaceId))
+            put(3, transactionId.toUuidVal())
+            put(4, timestamp.toTimestampVal())
+            put(5, authorNodeId.toUuidVal())
+            put(6, KdbValue.ArrayVal(operations.map { it.toKdbValue() }))
+            put(7, KdbValue.FixedVal(documentTreeHash.bytes.copyOf()))
+            put(
+                8,
+                if (schemaHash == null) {
+                    KdbValue.Null
+                } else {
+                    KdbValue.FixedVal(schemaHash.bytes.copyOf())
+                },
+            )
+            put(9, KdbValue.StringVal(message))
+        },
+    )
+
 /**
  * Immutable content-addressed commit DAG node.
  */
@@ -27,25 +59,16 @@ public data class KdbCommit(
     val message: String = "",
 ) {
     public fun toCommitPayloadValue(): KdbValue =
-        KdbValue.RecordVal(
-            buildMap {
-                put(1, KdbValue.ArrayVal(parentHashes.map { KdbValue.FixedVal(it.bytes.copyOf()) }))
-                put(2, KdbValue.StringVal(namespaceId))
-                put(3, transactionId.toUuidVal())
-                put(4, timestamp.toTimestampVal())
-                put(5, authorNodeId.toUuidVal())
-                put(6, KdbValue.ArrayVal(operations.map { it.toKdbValue() }))
-                put(7, KdbValue.FixedVal(documentTreeHash.bytes.copyOf()))
-                put(
-                    8,
-                    if (schemaHash == null) {
-                        KdbValue.Null
-                    } else {
-                        KdbValue.FixedVal(schemaHash.bytes.copyOf())
-                    },
-                )
-                put(9, KdbValue.StringVal(message))
-            },
+        commitPayloadRecord(
+            parentHashes,
+            namespaceId,
+            transactionId,
+            timestamp,
+            authorNodeId,
+            operations,
+            documentTreeHash,
+            schemaHash,
+            message,
         )
 
     public fun toPayloadBytes(): ByteArray {
@@ -56,6 +79,48 @@ public data class KdbCommit(
     public fun toBytes(): ByteArray = toPayloadBytes()
 
     public companion object {
+        /**
+         * Build a commit whose [hash] is SHA-256 of the canonical Layer 0 commit payload bytes.
+         */
+        public fun build(
+            parentHashes: List<KdbHash>,
+            namespaceId: String,
+            transactionId: KdbUuid,
+            timestamp: KdbTimestamp,
+            authorNodeId: KdbUuid,
+            operations: List<KdbOp>,
+            documentTreeHash: KdbHash,
+            schemaHash: KdbHash?,
+            message: String = "",
+        ): KdbCommit {
+            val reg = KdbDocumentWireRegistry()
+            val bytes =
+                commitPayloadRecord(
+                    parentHashes,
+                    namespaceId,
+                    transactionId,
+                    timestamp,
+                    authorNodeId,
+                    operations,
+                    documentTreeHash,
+                    schemaHash,
+                    message,
+                ).encodeToBytes(CommitPayloadType, reg)
+            val hash = KdbHash.fromBytes(sha256Digest(bytes))
+            return KdbCommit(
+                hash,
+                parentHashes,
+                namespaceId,
+                transactionId,
+                timestamp,
+                authorNodeId,
+                operations,
+                documentTreeHash,
+                schemaHash,
+                message,
+            )
+        }
+
         public fun fromPayloadBytes(bytes: ByteArray): KdbCommit {
             val reg = KdbDocumentWireRegistry()
             val v =

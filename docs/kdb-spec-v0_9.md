@@ -17,9 +17,9 @@ Layer 1 — Core Types         [COMPLETE]
   [x] 3. Document + Commit Model   — module `:kdb-document`; normative detail in `kdb-spec-layer1-component3-document-commit-model.md`
   [x] 4. JSON Functions Engine     — module `:kdb-json`; normative detail in `kdb-spec-layer1-component4-json-functions-engine.md`
 
-Layer 2 — Schema + DAG       [IN PROGRESS — specs generated, awaiting implementation]
-  [~] 5. Schema Engine             — component spec generated (see file: kdb-spec-layer2-component5-schema-engine.md)
-  [~] 6. Commit DAG                — component spec generated (see file: kdb-spec-layer2-component6-commit-dag.md)
+Layer 2 — Schema + DAG       [COMPLETE]
+  [x] 5. Schema Engine             — module `:kdb-schema`; normative detail in `kdb-spec-layer2-component5-schema-engine.md`
+  [x] 6. Commit DAG                — module `:kdb-dag`; normative detail in `kdb-spec-layer2-component6-commit-dag.md`
 
 Layer 3 — Write Path         [IN PROGRESS — specs generated, awaiting implementation]
   [~] 7. Transaction Engine        — component spec generated (see file: kdb-spec-layer3-component7-transaction-engine.md)
@@ -35,39 +35,19 @@ All other layers             [NOT STARTED]
 - Both Layer 0 components implemented and tested (per plan)
 - Public interfaces extracted and recorded in Section 17 → Layer 0
 - Layer 1 components implemented: `:kdb-document` (Component 3), `:kdb-json` (Component 4); public interfaces recorded in Section 17 → Layer 1
-- Layer 1 draft interfaces recorded in Section 17 → Layer 1 (replace with final after implementation)
-- Layer 2 component specs generated (Schema Engine, Commit DAG)
-- Layer 2 draft interfaces recorded in Section 17 → Layer 2 (replace with final after implementation)
+- Layer 1 draft interfaces recorded in Section 17 → Layer 1 (historical note; Layer 1 is implemented — see interfaces there)
+- Layer 2 components implemented: `:kdb-schema` (Component 5), `:kdb-dag` (Component 6); public interfaces recorded in Section 17 → Layer 2 (final)
 - Component spec files saved as downloadable `.md` files (see file-output convention in Section 16.4)
 - Master spec updated from v0.6 → v0.7
 - Storage engine design decisions applied (v0.7 → v0.8): removed external storage dependencies, introduced two-store architecture (Delta Store + Realized Store), browser multi-enlistment model, delta authorship envelope, Storage Manager layer, split Layer 4 into 4a (Storage Engine) and 4b (Storage Manager), renumbered Layers 5–9
 - Layer 3 component specs generated (v0.8 → v0.9): Transaction Engine (Component 7), Index Layer Core (Component 8), Storage Adapter Interface (Component 9). Storage Adapter Interface incorporates all v3 design decisions: StorageCapabilitySet with GPU fields, DeltaAuthorshipEnvelope, sub-enlistment eviction state machine (FULL/DOC_EVICTED/EVICTED/RELEASED), IndexRetention (PINNED/EVICTABLE), GPU direct delta ingest path, browser snapshot repair model, IndexPinViolationEvent escalation path.
 - Layer 3 draft interfaces recorded in Section 17 → Layer 3
 
-### What To Do Next — Layer 1 + 2 Implementation, then Layer 3
+### What To Do Next — Layer 3 Implementation
 
-Layer 1, Layer 2, and Layer 3 component specs are complete. Implement in dependency order.
+Layers 0–2 are implemented in-tree (`:kdb-error`, `:kdb-codec`, `:kdb-document`, `:kdb-json`, `:kdb-schema`, `:kdb-dag`). Layer 3 component specs are complete; implement Component 9 → 7 / 8 next.
 
-**Step 1 — Implement Layer 1 and Layer 2 first (new conversation, per component):**
-
-Paste this document + the component spec file and say:
-
-```
-You are implementing KDB, a portable embedded database engine in Kotlin Multiplatform.
-This document is the master architecture spec. The attached component spec is your implementation contract.
-Implement [Component Name] in Kotlin Multiplatform (commonMain).
-All dependencies are in Section 17 — treat those interfaces as already existing.
-Produce production-quality Kotlin. No placeholders.
-```
-
-Implement in this order:
-
-1. Component 3 (Document + Commit Model)
-1. Component 4 (JSON Functions Engine) — independent of Component 3, may be done in parallel
-1. Component 5 (Schema Engine) — depends on Layer 1 interfaces
-1. Component 6 (Commit DAG) — depends on Layer 1 interfaces; independent of Component 5, may be done in parallel
-
-**Step 2 — Implement Layer 3 (after Layer 1 + 2 are complete and Section 17 is updated):**
+**Step 1 — Implement Layer 3:**
 
 Implement in this order:
 
@@ -75,14 +55,14 @@ Implement in this order:
 1. Component 7 (Transaction Engine) — depends on Layers 0–2 + Component 9
 1. Component 8 (Index Layer Core) — depends on Layers 0–2 + Component 9; independent of Component 7, may be done in parallel
 
-**Step 3 — After each component is implemented:**
+**Step 2 — After each Layer 3 component is implemented:**
 
 1. Replace the draft interface in Section 17 for that component with the actual public interface extracted from the implementation
-1. Mark `[x]` in the checklist above
+1. Mark `[x]` in the Section 0 checklist above
 1. Save the updated spec (increment version after each component or after each layer)
 1. Once all of Layer 3 components are `[x]`, generate Layer 4a specs using the spec session prompt in Section 16
 
-**Step 4 — Generating Layer 4a + 4b specs (new conversation, after Layer 3 is complete):**
+**Step 3 — Generating Layer 4a + 4b specs (new conversation, after Layer 3 is complete):**
 
 Paste this document and say:
 
@@ -1180,15 +1160,15 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 1 — Core Types (depends on Layer 0)
 
 ```
-[~] 3.  Document + Commit Model    — spec complete (kdb-spec-layer1-component3-document-commit-model.md)
-[~] 4.  JSON Functions Engine      — spec complete (kdb-spec-layer1-component4-json-functions-engine.md)
+[x] 3.  Document + Commit Model    — `:kdb-document`; spec `kdb-spec-layer1-component3-document-commit-model.md`
+[x] 4.  JSON Functions Engine      — `:kdb-json`; spec `kdb-spec-layer1-component4-json-functions-engine.md`
 ```
 
 #### LAYER 2 — Schema + DAG (depends on Layer 1)
 
 ```
-[~] 5.  Schema Engine      — spec complete (kdb-spec-layer2-component5-schema-engine.md)
-[~] 6.  Commit DAG         — spec complete (kdb-spec-layer2-component6-commit-dag.md)
+[x] 5.  Schema Engine      — `:kdb-schema`; spec `kdb-spec-layer2-component5-schema-engine.md`
+[x] 6.  Commit DAG         — `:kdb-dag`; spec `kdb-spec-layer2-component6-commit-dag.md`
 ```
 
 #### LAYER 3 — Write Path (depends on Layer 2)
@@ -1769,9 +1749,11 @@ enum class JsonFunctionReturnType {
 
 ### Layer 2 Interfaces
 
-> **Status: DRAFT** — these interfaces were generated during the spec phase. Replace each with the final extracted interface after implementation is complete and tested. Mark the component `[x]` in the Section 0 checklist at that point.
+> **Status:** Implemented — modules `:kdb-schema` (Component 5) and `:kdb-dag` (Component 6); normative behaviour remains in the Layer 2 component spec files.
 
 > **Encoding:** Normative detail in `kdb-spec-layer2-component5-schema-engine.md` and `kdb-spec-layer2-component6-commit-dag.md`. **Schema** snapshots and migrations use Layer 0 typed binary via **`KdbSchemaWireRegistry()`** and **`encodeToBytes` / `decodeFromBytes`**. **Commits and document trees** in the DAG use the Layer 1 wire shapes (**`KdbCommit.toPayloadBytes()`**, **`CommitPayloadType`**, **`DocumentTree`**, **`DocumentTreeWireType`**, **`KdbDocumentWireRegistry()`**). Structured binary interchange is Layer 0 only throughout.
+
+> **`CommitDag`:** Implementations supply **`lookupHashPrefix`** for opaque-store hash scans. **`resolveRef`** / **`resolveRefOrThrow`** are **default methods on the interface** (Kotlin MPP), implemented in terms of branches/tags/`walk` plus **`lookupHashPrefix`** for `ByHash`.
 
 #### 5. Schema Engine — `dev.kdb.schema`
 
@@ -1976,6 +1958,9 @@ class SchemaMigrationConflictException(
 interface CommitDag {
     val namespaceId: String
 
+    /** Returns commits whose canonical lowercase hex starts with [hexPrefixLower]. */
+    suspend fun lookupHashPrefix(hexPrefixLower: String): List<KdbHash>
+
     // Commit read
     suspend fun getCommit(hash: KdbHash): KdbCommit?
     suspend fun getCommitOrThrow(hash: KdbHash): KdbCommit
@@ -2046,6 +2031,11 @@ interface CommitDag {
         syntheticSchemaHash: KdbHash?,
         message: String = "compaction",
     ): KdbCommit
+
+    /** Default implementation resolves branches/tags/time/`ByHash` via [lookupHashPrefix] + graph accessors. */
+    suspend fun resolveRef(ref: CommitRef): KdbHash?
+
+    suspend fun resolveRefOrThrow(ref: CommitRef): KdbHash
 }
 
 // ── Traversal + diff results ───────────────────────────────────────────────────
@@ -2081,8 +2071,7 @@ sealed class CommitRef {
     data class ByTime(val timestamp: KdbTimestamp)  : CommitRef()
 }
 
-suspend fun CommitDag.resolveRef(ref: CommitRef): KdbHash?
-suspend fun CommitDag.resolveRefOrThrow(ref: CommitRef): KdbHash
+// resolveRef / resolveRefOrThrow: default methods on CommitDag (see note above).
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
