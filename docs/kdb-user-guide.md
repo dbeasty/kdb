@@ -175,7 +175,7 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 | `jdbc:kdb:memory:///demo/users` + `readOnly=true` property | same | **Yes** (SELECT only) |
 | `jdbc:kdb:file:///path/to/data/demo/users` | `demo/users`; data under `/path/to/data/ns/demo/users/` | **Yes** — survives process restart |
 | `jdbc:kdb:file:///path/to/data/myapp` | `myapp/main` (path ends with catalog only) | **Yes** |
-| `jdbc:kdb://host:port/catalog` | parsed | **No** — `SQLFeatureNotSupportedException` |
+| `jdbc:kdb://host:port/catalog` | network SQL wire | Multi-client sessions; see [component 25](kdb-spec-layer8-component25-multi-client-sessions.md) |
 
 **Mapping** (see [spec §5](kdb-spec.md#5-jdbc-driver-highest-priority)):
 
@@ -199,7 +199,7 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 
 | Area | Behaviour |
 |------|-----------|
-| **Network URLs** | `SQLFeatureNotSupportedException` |
+| **Network URLs (legacy)** | Plain `jdbc:kdb://host:port/catalog` without wire hub may still throw; use documented wire/inproc forms |
 | **DML** | `UPDATE` / `INSERT` / `DELETE` via `executeUpdate` (embedded); read-only connections reject writes |
 | **Read-only connection** | `executeUpdate` → `SQLException` |
 | **Advanced JDBC** | `CallableStatement`, `Savepoint`, `Blob`/`Clob`, batch, generated keys → `SQLFeatureNotSupportedException` |
@@ -394,6 +394,8 @@ await db.close();
 | `fields[].required` | boolean | optional |
 | `fields[].indexed` | boolean | optional; required for indexed `WHERE` |
 | `fields[].unique` | boolean | optional |
+
+**Concurrency:** The network SQL server uses pessimistic **document write locks** per session (exclusive per document until commit/rollback) plus optimistic conflict detection at commit. `JsonPath` and virtual-view registries are synchronized for multi-threaded JDBC. Details: [component 25](kdb-spec-layer8-component25-multi-client-sessions.md).
 
 **SQL limits (v1):** hybrid `SELECT` and single-table DML (`INSERT`/`UPDATE`/`DELETE`) work in embedded runtimes. `SELECT _doc` works without a schema; indexed predicates need a non-empty schema. `BETWEEN`, `IS NULL`, `ORDER BY`, `LIMIT`/`OFFSET`, and prepared `?` parameters are supported. `ORDER BY similarity(col, 'text')` requires a text-embedding path (not yet available). No `JOIN`s or aggregates.
 

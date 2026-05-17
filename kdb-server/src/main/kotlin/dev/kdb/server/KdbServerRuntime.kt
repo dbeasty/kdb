@@ -7,6 +7,7 @@ import dev.kdb.embed.commitViaEngine
 import dev.kdb.error.ConflictException
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
+import dev.kdb.transaction.DocumentLockManager
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
 import dev.kdb.transaction.transactionEngine
@@ -17,6 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger
 public class KdbServerRuntime(
     public val runtime: EmbeddedKdbRuntime,
     public val writeCoordinator: WriteCoordinator = WriteCoordinator(),
+    public val documentLocks: DocumentLockManager = DocumentLockManager(),
 ) {
     private val refCount = AtomicInteger(1)
     private val closeMutex = Mutex()
@@ -34,9 +36,18 @@ public class KdbServerRuntime(
         namespaceId: String,
         transaction: KdbTransaction,
         schema: KdbSchema = runtime.schema,
+        sessionId: String? = null,
     ): KdbCommit =
         writeCoordinator.run {
-            commitViaEngine(runtime, namespaceId, transaction, schema, engineFor(namespaceId))
+            commitViaEngine(
+                runtime,
+                namespaceId,
+                transaction,
+                schema,
+                engineFor(namespaceId),
+                documentLocks = documentLocks,
+                sessionId = sessionId,
+            )
         }
 
     public suspend fun replay(

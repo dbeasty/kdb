@@ -98,6 +98,15 @@ public class ConflictException(message: String, public val report: ConflictRepor
     override val code: KdbErrorCode get() = KdbErrorCode.CONFLICT
 }
 
+public class DocumentLockedException(
+    message: String,
+    public val namespaceId: String,
+    public val docId: String,
+    public val holderSessionId: String,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.DOCUMENT_LOCKED
+}
+
 // ---------- Layer 3: storage ------------------------------
 
 public class StorageTierException(

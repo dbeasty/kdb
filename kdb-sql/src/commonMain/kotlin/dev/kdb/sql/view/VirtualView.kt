@@ -187,12 +187,15 @@ internal class StorageVirtualViewRegistry(
     private val storage: StorageAdapter,
 ) : VirtualViewRegistry {
     private val inner = InMemoryVirtualViewRegistry()
+    private val mutex = Mutex()
     private val loaded = mutableSetOf<String>()
 
     private suspend fun ensureLoaded(namespaceId: String) {
-        if (namespaceId in loaded) return
-        // v1: in-memory only until namespace meta op exists
-        loaded += namespaceId
+        mutex.withLock {
+            if (namespaceId in loaded) return
+            // v1: in-memory only until namespace meta op exists
+            loaded += namespaceId
+        }
     }
 
     override suspend fun list(namespaceId: String): List<VirtualViewDefinition> {

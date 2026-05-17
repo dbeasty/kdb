@@ -86,6 +86,16 @@ public suspend fun materializeCommitHistory(
     }
 }
 
+/** Applies one commit's document ops to storage and SQL indexes. */
+public suspend fun materializeCommit(
+    runtime: EmbeddedKdbRuntime,
+    namespaceId: String,
+    commit: dev.kdb.document.KdbCommit,
+    schema: KdbSchema = runtime.schema,
+) {
+    materializeSingleCommit(runtime, namespaceId, schema, commit)
+}
+
 private suspend fun materializeSingleCommit(
     runtime: EmbeddedKdbRuntime,
     namespaceId: String,

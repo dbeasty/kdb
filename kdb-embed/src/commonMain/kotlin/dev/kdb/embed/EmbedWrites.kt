@@ -5,6 +5,7 @@ import dev.kdb.document.KdbTransaction
 import dev.kdb.error.ConflictException
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
+import dev.kdb.transaction.DocumentLockManager
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
 import dev.kdb.transaction.transactionEngine
@@ -16,10 +17,17 @@ public suspend fun commitViaEngine(
     transaction: KdbTransaction,
     schema: KdbSchema = runtime.schema,
     engine: TransactionEngine? = null,
+    documentLocks: DocumentLockManager? = null,
+    sessionId: String? = null,
 ): KdbCommit {
     val policy = runtime.policyRegistry.get(namespaceId)
     val txEngine = engine ?: transactionEngine(policy.conflict)
-    return when (val result = txEngine.commit(transaction, runtime.dag, runtime.storage, schema)) {
+    val lockSession = sessionId ?: "embed-single-shot"
+    if (documentLocks != null) {
+        documentLocks.acquireAllForTransaction(namespaceId, lockSession, transaction)
+    }
+    return try {
+        when (val result = txEngine.commit(transaction, runtime.dag, runtime.storage, schema)) {
         is TransactionResult.Success -> {
             if (!schema.isNone) {
                 runtime.indexManager.writer.applyCommit(
@@ -40,5 +48,10 @@ public suspend fun commitViaEngine(
             throw IllegalArgumentException(
                 "schema rejection: ${result.violations.size} violation(s)",
             )
+        }
+    } finally {
+        if (documentLocks != null) {
+            documentLocks.releaseAll(lockSession)
+        }
     }
 }

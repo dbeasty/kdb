@@ -4,6 +4,7 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitRef
 import dev.kdb.schema.KdbSchema
 import dev.kdb.sql.ExplainResult
+import dev.kdb.transaction.DocumentLockManager
 import dev.kdb.sql.QueryResult
 import dev.kdb.sql.SqlParameter
 
@@ -28,6 +29,8 @@ public data class HybridQueryRequest(
     val readConsistency: ReadConsistency = ReadConsistency.READ_COMMITTED,
     val readPin: KdbHash? = null,
     val sessionCheckout: CheckoutHandle? = null,
+    val writeSessionId: String? = null,
+    val documentLocks: DocumentLockManager? = null,
 )
 
 public data class HybridQueryResult(

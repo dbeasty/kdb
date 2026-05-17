@@ -4,10 +4,13 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
 import dev.kdb.document.KdbCommit
 
+public typealias CommitMaterializer = suspend (KdbCommit) -> Unit
+
 public data class PeerHostConfig(
     val namespaceId: String,
     val nodeId: String,
     val transportHub: String,
+    val materializeCommit: CommitMaterializer? = null,
 )
 
 public data class PeerClientConfig(

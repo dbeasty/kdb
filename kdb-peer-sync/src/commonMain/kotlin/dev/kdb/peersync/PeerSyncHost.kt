@@ -115,6 +115,7 @@ internal class DefaultPeerSyncHost(
             if (dag.hasCommit(commit.hash)) continue
             try {
                 dag.putCommit(commit, requireParents = true)
+                cfg.materializeCommit?.invoke(commit)
                 applied++
             } catch (e: Exception) {
                 throw PeerSyncException("failed to apply commit ${commit.hash.toHex()}", e)

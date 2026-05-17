@@ -47,20 +47,29 @@ public class SessionManager(
     public suspend fun get(sessionId: String): KdbSession? = mutex.withLock { sessions[sessionId] }
 
     public suspend fun end(sessionId: String) {
-        mutex.withLock { sessions.remove(sessionId) }
+        mutex.withLock {
+            sessions.remove(sessionId)?.let {
+                server.documentLocks.releaseAll(sessionId)
+            }
+        }
     }
 
-    public suspend fun pendingBuilder(session: KdbSession): TransactionBuilder {
+    public suspend fun pendingBuilder(session: KdbSession): LockingTransactionBuilder {
         if (session.pending == null) {
-            session.pending =
+            val inner =
                 TransactionBuilder(
                     namespaceId = session.namespaceId,
                     baseVersion = session.baseVersion,
                     authorNodeId = KdbUuid.random(),
                     schema = server.runtime.schema,
                 )
+            session.pending = inner
         }
-        return session.pending!!
+        return LockingTransactionBuilder(
+            inner = session.pending!!,
+            locks = server.documentLocks,
+            sessionId = session.id.value,
+        )
     }
 
     public suspend fun clearPending(session: KdbSession) {

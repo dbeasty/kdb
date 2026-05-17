@@ -1,6 +1,7 @@
 package dev.kdb.service
 
 import dev.kdb.embed.EmbeddedKdbRuntime
+import dev.kdb.embed.materializeCommit
 import dev.kdb.embed.openMemoryRuntimeBlocking
 import dev.kdb.embed.runPeerSyncOverWebSocketListen
 import dev.kdb.server.runSqlWireListen
@@ -25,7 +26,14 @@ public fun main(args: Array<String>) {
     val sqlUri = config.listenSqlWs ?: "kdb-ws://0.0.0.0:7444/kdb?bind=true"
     println("KDB service peer=$peerUri sql=$sqlUri namespace=${config.namespace}")
     runBlocking {
-        peerHost.start(dev.kdb.peersync.PeerHostConfig(config.namespace, "kdb-service", "ws"))
+        peerHost.start(
+            dev.kdb.peersync.PeerHostConfig(
+                namespaceId = config.namespace,
+                nodeId = "kdb-service",
+                transportHub = "ws",
+                materializeCommit = { commit -> materializeCommit(runtime, config.namespace, commit) },
+            ),
+        )
         launch {
             runPeerSyncOverWebSocketListen(defaultWebSocketWireTransport(), peerUri, peerHost)
         }

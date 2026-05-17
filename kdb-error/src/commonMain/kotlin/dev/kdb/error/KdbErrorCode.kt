@@ -23,6 +23,7 @@ public enum class KdbErrorCode(public val numericCode: Int) {
     COMPACTION_BOUNDARY(3103),
 
     CONFLICT(4001),
+    DOCUMENT_LOCKED(4002),
 
     STORAGE_TIER_ERROR(4101),
     NAMESPACE_NOT_FOUND(4201),

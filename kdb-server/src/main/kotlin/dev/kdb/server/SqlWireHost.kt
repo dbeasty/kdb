@@ -6,6 +6,7 @@ import dev.kdb.document.KdbTransaction
 import dev.kdb.embed.toQueryResultJson
 import dev.kdb.error.ConflictException
 import dev.kdb.error.ConflictReport
+import dev.kdb.error.DocumentLockedException
 import dev.kdb.query.hybrid.HybridQueryRequest
 import dev.kdb.query.hybrid.ReadConsistency
 import dev.kdb.sql.SqlCell
@@ -96,6 +97,8 @@ public class SqlWireHost(
                         readConsistency = session.readConsistency,
                         readPin = session.readPin,
                         sessionCheckout = session.sessionCheckout,
+                        writeSessionId = session.id.value,
+                        documentLocks = server.documentLocks,
                     ),
                 )
             val json = result.toQueryResultJson()
@@ -132,8 +135,14 @@ public class SqlWireHost(
                         tx
                     }
                 }
-            val commit = server.commit(session.namespaceId, effective)
+            val commit =
+                server.commit(
+                    session.namespaceId,
+                    effective,
+                    sessionId = session.id.value,
+                )
             sessions.clearPending(session)
+            server.documentLocks.releaseAll(session.id.value)
             session.baseVersion = commit.hash
             if (session.readConsistency == ReadConsistency.SNAPSHOT) {
                 session.readPin = commit.hash
@@ -149,12 +158,17 @@ public class SqlWireHost(
                 readOnly = false,
             )
         } catch (e: ConflictException) {
+            server.documentLocks.releaseAll(session.id.value)
             WireMessage.ConflictReport(
                 header(msg.header.correlationId, WireMessageType.CONFLICT_REPORT),
                 namespace = msg.namespace,
                 reportBytes = encodeConflictReport(e.report),
             )
+        } catch (e: DocumentLockedException) {
+            server.documentLocks.releaseAll(session.id.value)
+            sqlError(msg, e.message ?: "document locked")
         } catch (e: Throwable) {
+            server.documentLocks.releaseAll(session.id.value)
             sqlError(msg, e.message ?: e.toString())
         }
     }
@@ -162,6 +176,7 @@ public class SqlWireHost(
     private suspend fun handleTxRollback(msg: WireMessage.TxRollback): WireMessage.SqlResult {
         val session = sessions.get(msg.sessionId)
         if (session != null) {
+            server.documentLocks.releaseAll(session.id.value)
             sessions.clearPending(session)
         }
         return WireMessage.SqlResult(

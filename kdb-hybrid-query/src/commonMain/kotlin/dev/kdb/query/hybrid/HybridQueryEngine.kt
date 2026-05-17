@@ -22,6 +22,7 @@ import dev.kdb.sql.statementParameterCount
 import dev.kdb.storage.StorageAdapter
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
+import dev.kdb.transaction.documentIdsIn
 import dev.kdb.transaction.transactionEngine
 
 public interface HybridQueryEngine {
@@ -107,7 +108,13 @@ internal class DefaultHybridQueryEngine(
             )
         if (isDmlStatement(stmt)) {
             val dml = sqlEngine.executeDml(parsed.sql, ctx.copy(atCommit = null))
-            val commitHash = commitDml(dml.operations, request)
+            acquireDmlLocks(dml.operations, request)
+            val commitHash =
+                try {
+                    commitDml(dml.operations, request)
+                } finally {
+                    releaseDmlLocks(dml.operations, request)
+                }
             val result = QueryResult(emptyList(), emptyList(), rowsAffected = dml.rowsAffected)
             return HybridQueryResult(result, commitHash, readOnly = false)
         }
@@ -135,6 +142,28 @@ internal class DefaultHybridQueryEngine(
                 maxRows = request.maxRows,
             )
         return sqlEngine.explain(parsed.sql, ctx)
+    }
+
+    private suspend fun acquireDmlLocks(
+        operations: List<dev.kdb.document.KdbOp>,
+        request: HybridQueryRequest,
+    ) {
+        val locks = request.documentLocks ?: return
+        val sessionId = request.writeSessionId ?: return
+        for (docId in documentIdsIn(operations)) {
+            locks.tryAcquire(request.namespaceId, docId, sessionId)
+        }
+    }
+
+    private suspend fun releaseDmlLocks(
+        operations: List<dev.kdb.document.KdbOp>,
+        request: HybridQueryRequest,
+    ) {
+        val locks = request.documentLocks ?: return
+        val sessionId = request.writeSessionId ?: return
+        for (docId in documentIdsIn(operations)) {
+            locks.release(request.namespaceId, docId, sessionId)
+        }
     }
 
     private suspend fun commitDml(

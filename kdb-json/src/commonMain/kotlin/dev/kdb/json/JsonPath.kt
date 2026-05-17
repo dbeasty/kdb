@@ -28,17 +28,18 @@ public class JsonPath private constructor(
     public companion object {
         private val cache = LinkedHashMap<String, JsonPath>()
 
-        public fun compile(expression: String): JsonPath {
-            cache[expression]?.let { return it }
-            val p = parse(expression)
-            val jp = JsonPath(expression, p)
-            if (cache.size >= 256) {
-                val k = cache.keys.iterator().next()
-                cache.remove(k)
+        public fun compile(expression: String): JsonPath =
+            JsonPathCacheLock.withLock {
+                cache[expression]?.let { return@withLock it }
+                val p = parse(expression)
+                val jp = JsonPath(expression, p)
+                if (cache.size >= 256) {
+                    val k = cache.keys.iterator().next()
+                    cache.remove(k)
+                }
+                cache[expression] = jp
+                jp
             }
-            cache[expression] = jp
-            return jp
-        }
 
         public fun compileOrNull(expression: String): JsonPath? =
             try {
