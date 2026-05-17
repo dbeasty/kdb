@@ -15,8 +15,16 @@ import kotlinx.coroutines.launch
 
 public class JvmWebSocketWireTransport : WebSocketWireTransport {
     private var networkServer: JvmNetworkWebSocketServer? = null
+
+    internal fun networkListenPort(): Int =
+        networkServer?.port ?: error("network WebSocket server is not listening")
     private val listenScope = CoroutineScope(SupervisorJob())
-    override suspend fun connect(uri: String): WireConnection {
+    override suspend fun connect(uri: String): WireConnection = connect(uri, TransportConnectOptions())
+
+    override suspend fun connect(
+        uri: String,
+        options: TransportConnectOptions,
+    ): WireConnection {
         if (uri.startsWith("inproc-ws://")) {
             val name = uri.removePrefix("inproc-ws://").substringBefore('?')
             return InProcessWebSocketHub.connect(name)
@@ -27,11 +35,15 @@ public class JvmWebSocketWireTransport : WebSocketWireTransport {
             port = parsed.port,
             path = parsed.path.ifEmpty { "/" },
             secure = parsed.secure,
-            options = TransportConnectOptions(),
+            options = options,
         )
     }
 
-    override suspend fun listen(uri: String, handler: suspend (WireConnection) -> Unit) {
+    override suspend fun listen(
+        uri: String,
+        options: TransportConnectOptions,
+        handler: suspend (WireConnection) -> Unit,
+    ) {
         if (uri.startsWith("inproc-ws://")) {
             val name = uri.removePrefix("inproc-ws://").substringBefore('?')
             InProcessWebSocketHub.hub(name).listen(handler)
@@ -39,7 +51,7 @@ public class JvmWebSocketWireTransport : WebSocketWireTransport {
         }
         val parsed = WebSocketTransportUriParser.parse(uri)
         require(parsed.query["bind"] == "true") { "listen URI requires bind=true: $uri" }
-        val server = JvmNetworkWebSocketServer()
+        val server = JvmNetworkWebSocketServer(options = options, secure = parsed.secure)
         networkServer = server
         server.start(parsed.host, parsed.port, parsed.path) { conn ->
             listenScope.launch {

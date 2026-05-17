@@ -4,8 +4,10 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
 import dev.kdb.document.KdbCommit
 import dev.kdb.storage.StorageAdapter
+import dev.kdb.auth.toHttpHeaders
 import dev.kdb.stream.WireConnection
-import dev.kdb.stream.WireTransport
+import dev.kdb.transport.core.TransportConnectOptions
+import dev.kdb.transport.ws.WebSocketWireTransport
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.wire.*
 import kotlinx.coroutines.delay
@@ -25,7 +27,7 @@ public interface PeerSession {
 
 public fun peerSyncClient(
     wire: WireCodec,
-    transport: WireTransport,
+    transport: dev.kdb.stream.WireTransport,
     dag: CommitDag,
     storage: StorageAdapter,
     transactionEngine: TransactionEngine? = null,
@@ -33,7 +35,7 @@ public fun peerSyncClient(
 
 internal class DefaultPeerSyncClient(
     private val wire: WireCodec,
-    private val transport: WireTransport,
+    private val transport: dev.kdb.stream.WireTransport,
     private val dag: CommitDag,
     @Suppress("UNUSED_PARAMETER") private val storage: StorageAdapter,
     @Suppress("UNUSED_PARAMETER") private val transactionEngine: TransactionEngine?,
@@ -42,7 +44,18 @@ internal class DefaultPeerSyncClient(
     private var correlation = 2000
 
     override suspend fun connect(config: PeerClientConfig): PeerSession {
-        val conn = transport.connect(config.peerUri)
+        val conn =
+            when (transport) {
+                is WebSocketWireTransport ->
+                    transport.connect(
+                        config.peerUri,
+                        TransportConnectOptions(
+                            connectHeaders = config.connectionContext.toHttpHeaders(),
+                            tls = config.tls,
+                        ),
+                    )
+                else -> transport.connect(config.peerUri)
+            }
         connection = conn
         val localHead = dag.head()
         val hs =

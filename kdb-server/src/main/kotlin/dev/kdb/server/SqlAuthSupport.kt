@@ -1,11 +1,7 @@
 package dev.kdb.server
 
-import dev.kdb.auth.AuthAction
-import dev.kdb.auth.AuthEngine
-import dev.kdb.auth.KdbAuthenticationException
-import dev.kdb.auth.KdbAuthorizationException
+import dev.kdb.auth.ConnectionAuthSupport
 import dev.kdb.auth.ConnectionContext
-import dev.kdb.auth.Principal
 import dev.kdb.sql.SqlStatement
 import dev.kdb.sql.isDdlStatement
 import dev.kdb.sql.isDmlStatement
@@ -16,29 +12,20 @@ internal fun sqlRequiresWrite(stmt: SqlStatement): Boolean =
         stmt is SqlStatement.Commit
 
 internal class SqlAuthSupport(
-    private val auth: AuthEngine,
-    private val connectionContext: ConnectionContext,
+    auth: dev.kdb.auth.AuthEngine,
+    connectionContext: ConnectionContext,
 ) {
-    var connectionPrincipal: Principal? = null
+    private val delegate = ConnectionAuthSupport(auth, connectionContext)
 
-    suspend fun authenticateConnection(): Principal {
-        val principal = auth.authenticator.authenticate(connectionContext.toCredentials())
-        connectionPrincipal = principal
-        return principal
-    }
+    val connectionPrincipal: dev.kdb.auth.Principal?
+        get() = delegate.connectionPrincipal
+
+    suspend fun authenticateConnection() = delegate.authenticateConnection()
 
     suspend fun authorize(
-        principal: Principal?,
-        action: AuthAction,
-    ) {
-        val effective = principal ?: connectionPrincipal ?: authenticateConnection()
-        auth.authorizer.authorize(effective, action)
-    }
+        principal: dev.kdb.auth.Principal?,
+        action: dev.kdb.auth.AuthAction,
+    ) = delegate.authorize(principal, action)
 
-    fun authFailureMessage(e: Throwable): String =
-        when (e) {
-            is KdbAuthenticationException -> "authentication failed: ${e.message}"
-            is KdbAuthorizationException -> "forbidden: ${e.message}"
-            else -> e.message ?: e.toString()
-        }
+    fun authFailureMessage(e: Throwable): String = delegate.authFailureMessage(e)
 }

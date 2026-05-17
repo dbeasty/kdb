@@ -63,7 +63,9 @@ class PeerSyncTest {
             val c1 = appendCommit(dag, storage, ns, parent, "a")
             val c2 = appendCommit(dag, storage, ns, c1.hash, "b")
             val host = peerSyncHost(wire, dag, storage) as DefaultPeerSyncHost
+            host.start(PeerHostConfig(ns, "test", ns))
             val fetched = host.fetchCommits(sinceHash = c1.hash, maxCommits = 10)
+            host.stop()
             assertEquals(1, fetched.size)
             assertEquals(c2.hash, fetched.single().hash)
         }

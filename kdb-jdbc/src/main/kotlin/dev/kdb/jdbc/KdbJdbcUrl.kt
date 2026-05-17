@@ -16,13 +16,20 @@ data class KdbJdbcUrl(
     val inprocHub: String? = null,
     /** Semicolon-separated JDBC properties embedded in the URL (memory mode). */
     val memoryParams: Map<String, String> = emptyMap(),
+    val sslEnabled: Boolean = false,
+    val sslTrustStore: String? = null,
+    val sslTrustStorePassword: String? = null,
+    val sslKeyStore: String? = null,
+    val sslKeyStorePassword: String? = null,
+    val sslTrustAll: Boolean = false,
 ) {
     fun networkWebSocketUri(): String {
         if (inprocHub != null) {
             return "inproc-ws://$inprocHub"
         }
         val host = networkHost ?: "localhost"
-        return "kdb-ws://$host:$networkPort/kdb"
+        val scheme = if (sslEnabled) "kdb-wss" else "kdb-ws"
+        return "$scheme://$host:$networkPort/kdb"
     }
     fun namespaceForTable(table: String): String = "$catalog/$table"
 }
@@ -51,6 +58,7 @@ internal object KdbJdbcUrlParser {
         val readOnly =
             info?.getProperty("readOnly")?.toBooleanStrictOrNull()
                 ?: url.contains("read_only=true")
+        val ssl = sslSettingsFromProperties(info)
         return when {
             rest.startsWith("memory:") -> {
                 val memBody = rest.removePrefix("memory:").trimStart('/')
@@ -58,7 +66,19 @@ internal object KdbJdbcUrlParser {
                 val params = parseSemicolonParams(memBody.substringAfter(';', ""))
                 val catalog = pathPart.substringBefore('/').ifEmpty { "default" }
                 val namespace = if (pathPart.contains('/')) pathPart else "$catalog/main"
-                KdbJdbcUrl(JdbcMode.MEMORY, catalog, namespace, readOnly, memoryParams = params)
+                KdbJdbcUrl(
+                    JdbcMode.MEMORY,
+                    catalog,
+                    namespace,
+                    readOnly,
+                    memoryParams = params,
+                    sslEnabled = ssl.enabled,
+                    sslTrustStore = ssl.trustStore,
+                    sslTrustStorePassword = ssl.trustStorePassword,
+                    sslKeyStore = ssl.keyStore,
+                    sslKeyStorePassword = ssl.keyStorePassword,
+                    sslTrustAll = ssl.trustAll,
+                )
             }
             rest.startsWith("file:") -> {
                 val fileRest = rest.removePrefix("file:")
@@ -87,7 +107,19 @@ internal object KdbJdbcUrlParser {
                             FileUrlParts(root, cat, "$cat/main")
                         }
                     }
-                KdbJdbcUrl(JdbcMode.FILE, fileParts.catalog, fileParts.namespaceId, readOnly, fileParts.dataRoot)
+                KdbJdbcUrl(
+                    JdbcMode.FILE,
+                    fileParts.catalog,
+                    fileParts.namespaceId,
+                    readOnly,
+                    fileParts.dataRoot,
+                    sslEnabled = ssl.enabled,
+                    sslTrustStore = ssl.trustStore,
+                    sslTrustStorePassword = ssl.trustStorePassword,
+                    sslKeyStore = ssl.keyStore,
+                    sslKeyStorePassword = ssl.keyStorePassword,
+                    sslTrustAll = ssl.trustAll,
+                )
             }
             rest.startsWith("inproc:") -> {
                 val after = rest.removePrefix("inproc:")
@@ -102,6 +134,12 @@ internal object KdbJdbcUrlParser {
                     namespace,
                     readOnly,
                     inprocHub = hub,
+                    sslEnabled = ssl.enabled,
+                    sslTrustStore = ssl.trustStore,
+                    sslTrustStorePassword = ssl.trustStorePassword,
+                    sslKeyStore = ssl.keyStore,
+                    sslKeyStorePassword = ssl.keyStorePassword,
+                    sslTrustAll = ssl.trustAll,
                 )
             }
             else -> {
@@ -124,6 +162,12 @@ internal object KdbJdbcUrlParser {
                     readOnly,
                     networkHost = host,
                     networkPort = port,
+                    sslEnabled = ssl.enabled,
+                    sslTrustStore = ssl.trustStore,
+                    sslTrustStorePassword = ssl.trustStorePassword,
+                    sslKeyStore = ssl.keyStore,
+                    sslKeyStorePassword = ssl.keyStorePassword,
+                    sslTrustAll = ssl.trustAll,
                 )
             }
         }

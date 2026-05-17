@@ -5,6 +5,7 @@ plugins {
 dependencies {
     implementation(project(":kdb-auth"))
     implementation(project(":kdb-auth-static"))
+    implementation(project(":kdb-config"))
     implementation(project(":kdb-document"))
     implementation(project(":kdb-embed"))
     implementation(project(":kdb-server"))
@@ -14,6 +15,7 @@ dependencies {
     implementation(project(":kdb-schema"))
     implementation(project(":kdb-storage"))
     implementation(project(":kdb-transaction"))
+    implementation(project(":kdb-transport-core"))
     implementation(project(":kdb-transport-ws"))
     implementation(project(":kdb-wire"))
     implementation(libs.kotlinx.coroutines.core)

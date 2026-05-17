@@ -510,7 +510,7 @@ const result = await db.query("SELECT userId FROM users WHERE userId = 'u1'");
 
 - **Read-heavy:** `sync()` pulls remote commits into the local runtime; `put()` in remote mode writes **local commits only** (no push to the server yet).
 - **Not stream mode:** live `StreamCoordinator` fan-out over the network is not wired; use peer sync + local SQL instead.
-- **Dev networking:** use `kdb-ws://localhost` in development; production `wss://` behind a reverse proxy is an application concern (CORS, TLS, auth).
+- **Dev networking:** use `kdb-ws://localhost` in development (TLS off). For encrypted wire traffic, switch listen URIs to `kdb-wss://` and configure a `tls` block in `config.json` (PKCS12 keystore/truststore paths; passwords via `KDB_TLS_KEYSTORE_PASSWORD` / `KDB_TLS_TRUSTSTORE_PASSWORD`). JDBC remote: `ssl=true` plus `sslTrustStore` / `sslKeyStore` properties. mTLS is JVM-only (not browser WebSocket). Browser embeds use `kdb-wss://` / `wss://` and rely on the platform TLS stack.
 
 Wire transport: [component 25 WebSocket spec](kdb-spec-layer9-component25-transport-websocket.md). Integration tests: `WebSocketPeerSyncIntegrationTest` and `layer9_tcpPeerSync` in `:kdb-integration`.
 

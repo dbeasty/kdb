@@ -56,4 +56,18 @@ class StaticAuthEngineTest {
                 engine.authorizer.authorize(p, AuthAction.TxCommit("demo/users"))
             }
         }
+
+    @Test
+    fun authorize_syncRoleForPeerSync() =
+        runTest {
+            val syncEngine =
+                staticAuthEngine(
+                    StaticAuthConfig(
+                        users = mapOf("syncer" to StaticUserConfig("s-secret", listOf("syncer"))),
+                        roles = mapOf("syncer" to listOf("sync:demo/*")),
+                    ),
+                )
+            val p = syncEngine.authenticator.authenticate(AuthCredentials(user = "syncer", password = "s-secret"))
+            syncEngine.authorizer.authorize(p, AuthAction.PeerSync("demo/users"))
+        }
 }

@@ -13,6 +13,7 @@ dependencies {
     testImplementation(project(":kdb-sql"))
     testImplementation(project(":kdb-jdbc"))
     testImplementation(project(":kdb-peer-sync"))
+    testImplementation(project(":kdb-auth-static"))
     testImplementation(project(":kdb-stream"))
     testImplementation(project(":kdb-transport-core"))
     testImplementation(project(":kdb-transport-tcp"))

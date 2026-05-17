@@ -3,6 +3,7 @@ package dev.kdb.jdbc.remote
 import dev.kdb.codec.KdbHash
 import dev.kdb.jdbc.KdbDatabaseMetaData
 import dev.kdb.jdbc.KdbJdbcUrl
+import dev.kdb.jdbc.transportConnectOptions
 import dev.kdb.jdbc.KdbPreparedStatement
 import dev.kdb.jdbc.KdbSqlConnection
 import dev.kdb.jdbc.KdbStatement
@@ -43,7 +44,7 @@ public class KdbRemoteConnection(
     private val transport = defaultWebSocketWireTransport()
     private val socket =
         runBlocking {
-            transport.connect(url.networkWebSocketUri())
+            transport.connect(url.networkWebSocketUri(), url.transportConnectOptions())
         }
     private val rpc = WireRpcClient(wire, socket)
     private var closed = false

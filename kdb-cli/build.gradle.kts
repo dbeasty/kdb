@@ -4,6 +4,8 @@ plugins {
 }
 
 dependencies {
+    implementation(project(":kdb-auth"))
+    implementation(project(":kdb-config"))
     implementation(project(":kdb-codec"))
     implementation(project(":kdb-dag"))
     implementation(project(":kdb-document"))

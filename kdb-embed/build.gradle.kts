@@ -39,8 +39,10 @@ kotlin {
         }
         val jvmMain by getting {
             dependencies {
+                implementation(project(":kdb-auth"))
                 implementation(project(":kdb-peer-sync"))
                 implementation(project(":kdb-stream"))
+                implementation(project(":kdb-transport-core"))
                 implementation(project(":kdb-transport-ws"))
             }
         }

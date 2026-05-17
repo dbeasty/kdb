@@ -5,6 +5,9 @@ import dev.kdb.jdbc.file.DataDirectoryLockLease
 import dev.kdb.jdbc.file.DataDirectoryLockRegistry
 import dev.kdb.jdbc.file.NamespacePaths
 import dev.kdb.jdbc.file.openFileRuntime
+import dev.kdb.config.KdbProductConfig
+import dev.kdb.config.defaultDataDirConfigPath
+import dev.kdb.config.resolveKdbProductConfig
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.exists
@@ -13,6 +16,7 @@ public data class CliConfig(
     val dataDir: String = "${System.getProperty("user.home")}/.kdb",
     val nodeId: String = "local",
     val quiet: Boolean = false,
+    val productConfig: KdbProductConfig = KdbProductConfig.DEFAULT,
 )
 
 public class CliRuntime(
@@ -95,12 +99,26 @@ internal fun parseArgs(args: Array<String>): Pair<CliConfig, CliCommand?> =
 private fun parseCoreArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
     var dataDir: String? = null
     var quiet = false
+    var configPath: String? = null
+    var peerSyncEnabled: Boolean? = null
     val rest = mutableListOf<String>()
     var i = 0
     while (i < args.size) {
         when (args[i]) {
             "--data-dir" -> {
                 dataDir = args.getOrNull(++i)
+                i++
+            }
+            "--config" -> {
+                configPath = args.getOrNull(++i)
+                i++
+            }
+            "--peer-sync" -> {
+                peerSyncEnabled = true
+                i++
+            }
+            "--no-peer-sync" -> {
+                peerSyncEnabled = false
                 i++
             }
             "--quiet" -> {
@@ -113,7 +131,19 @@ private fun parseCoreArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
             }
         }
     }
-    val config = CliConfig(dataDir = dataDir ?: CliConfig().dataDir, quiet = quiet)
+    val resolvedDataDir = dataDir ?: CliConfig().dataDir
+    val productConfig =
+        resolveKdbProductConfig(
+            configFile = configPath?.let { Path.of(it) },
+            dataDirConfig = defaultDataDirConfigPath(resolvedDataDir),
+            peerSyncEnabledOverride = peerSyncEnabled,
+        )
+    val config =
+        CliConfig(
+            dataDir = resolvedDataDir,
+            quiet = quiet,
+            productConfig = productConfig,
+        )
     if (rest.isEmpty()) return config to null
     if (rest[0] == "file") return config to null
     val cmd =

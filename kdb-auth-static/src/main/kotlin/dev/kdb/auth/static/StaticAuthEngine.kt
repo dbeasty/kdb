@@ -79,7 +79,7 @@ private class StaticAuthorizer(
                 is AuthAction.TxCommit ->
                     "write" to action.namespace
                 is AuthAction.PeerSync ->
-                    "write" to action.namespace
+                    "sync" to action.namespace
             }
         if (!principalHasPermission(principal, roles, kind, namespace)) {
             throw KdbAuthorizationException(

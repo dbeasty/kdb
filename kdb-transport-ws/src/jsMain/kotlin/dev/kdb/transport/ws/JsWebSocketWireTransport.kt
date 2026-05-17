@@ -18,12 +18,21 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 public class JsWebSocketWireTransport : WebSocketWireTransport {
-    override suspend fun connect(uri: String): WireConnection {
+    override suspend fun connect(uri: String): WireConnection = connect(uri, TransportConnectOptions())
+
+    override suspend fun connect(
+        uri: String,
+        options: TransportConnectOptions,
+    ): WireConnection {
         val parsed = WebSocketTransportUriParser.parse(uri)
-        return JsBrowserWebSocketConnection(parsed.toWireUri(), TransportConnectOptions())
+        return JsBrowserWebSocketConnection(parsed.toWireUri(), options)
     }
 
-    override suspend fun listen(uri: String, handler: suspend (WireConnection) -> Unit) {
+    override suspend fun listen(
+        uri: String,
+        options: TransportConnectOptions,
+        handler: suspend (WireConnection) -> Unit,
+    ) {
         throw TransportException("WebSocket listen is JVM-only in v1: $uri")
     }
 }

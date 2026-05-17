@@ -20,17 +20,21 @@ kotlin {
         val macosArm64Main by getting { dependsOn(nativeMain) }
 
         commonMain.dependencies {
+            implementation(project(":kdb-auth"))
             implementation(project(":kdb-codec"))
             implementation(project(":kdb-dag"))
             implementation(project(":kdb-document"))
             implementation(project(":kdb-error"))
             implementation(project(":kdb-storage"))
             implementation(project(":kdb-stream"))
+            implementation(project(":kdb-transport-core"))
+            implementation(project(":kdb-transport-ws"))
             implementation(project(":kdb-transaction"))
             implementation(project(":kdb-wire"))
             implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies {
+            implementation(project(":kdb-auth-static"))
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
         }

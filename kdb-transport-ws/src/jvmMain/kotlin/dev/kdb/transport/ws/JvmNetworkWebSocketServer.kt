@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 public class JvmNetworkWebSocketServer(
     private val options: TransportConnectOptions = TransportConnectOptions(),
+    private val secure: Boolean = false,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverSocket: ServerSocket? = null
@@ -35,7 +36,10 @@ public class JvmNetworkWebSocketServer(
         private set
 
     val listenUri: String
-        get() = "kdb-ws://127.0.0.1:$port$listenPath?bind=true"
+        get() {
+            val scheme = if (secure) "kdb-wss" else "kdb-ws"
+            return "$scheme://127.0.0.1:$port$listenPath?bind=true"
+        }
 
     suspend fun start(
         host: String,
@@ -44,8 +48,17 @@ public class JvmNetworkWebSocketServer(
         handler: suspend (WireConnection) -> Unit,
     ) {
         withContext(Dispatchers.IO) {
-            val ss = ServerSocket()
-            ss.bind(java.net.InetSocketAddress(host, portHint), 128)
+            val ss =
+                if (secure) {
+                    val tls =
+                        JvmTransportTls.resolveTlsSettings(secure = true, tls = options.tls)
+                            ?: error("unreachable")
+                    JvmTransportTls.createServerSocket(host, portHint, tls)
+                } else {
+                    ServerSocket().also { plain ->
+                        plain.bind(java.net.InetSocketAddress(host, portHint), 128)
+                    }
+                }
             serverSocket = ss
             port = ss.localPort
             listenPath = path.ifEmpty { "/" }

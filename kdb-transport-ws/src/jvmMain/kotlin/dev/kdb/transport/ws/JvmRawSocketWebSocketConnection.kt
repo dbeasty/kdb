@@ -29,7 +29,7 @@ internal class JvmRawSocketWebSocketConnection(
     private val options: TransportConnectOptions,
 ) : WireConnection {
     private val socket: Socket =
-        Socket(host, if (port > 0) port else if (secure) 443 else 80)
+        openSocket(host, if (port > 0) port else if (secure) 443 else 80, secure, options)
     private val input = BufferedInputStream(socket.getInputStream())
     private val output = BufferedOutputStream(socket.getOutputStream())
     private val closed = AtomicBoolean(false)
@@ -61,11 +61,16 @@ internal class JvmRawSocketWebSocketConnection(
         val keyBytes = ByteArray(16).also { SecureRandom().nextBytes(it) }
         val key = Base64.getEncoder().encodeToString(keyBytes)
         val portSuffix = if ((port > 0 && port != 80 && port != 443)) ":$port" else ""
+        val extraHeaders =
+            options.connectHeaders.entries.joinToString("") { (name, value) ->
+                "$name: $value\r\n"
+            }
         val request =
             "GET $path HTTP/1.1\r\n" +
                 "Host: $host$portSuffix\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
+                extraHeaders +
                 "Sec-WebSocket-Key: $key\r\n" +
                 "Sec-WebSocket-Version: 13\r\n\r\n"
         output.write(request.toByteArray(StandardCharsets.US_ASCII))
@@ -105,6 +110,28 @@ internal class JvmRawSocketWebSocketConnection(
                 }
             }
             incomingChannel.close(ConnectionClosedException())
+        }
+    }
+
+    companion object {
+        private fun openSocket(
+            host: String,
+            port: Int,
+            secure: Boolean,
+            options: TransportConnectOptions,
+        ): Socket {
+            if (!secure) {
+                return Socket(host, port)
+            }
+            val tls =
+                JvmTransportTls.resolveTlsSettings(secure = true, tls = options.tls)
+                    ?: error("unreachable")
+            return JvmTransportTls.createClientSocket(
+                host = host,
+                port = port,
+                settings = tls,
+                connectTimeoutMs = options.connectTimeoutMs,
+            )
         }
     }
 }

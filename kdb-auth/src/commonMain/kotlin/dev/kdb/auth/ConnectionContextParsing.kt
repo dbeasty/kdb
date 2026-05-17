@@ -38,3 +38,18 @@ public fun connectionContextFromHeaders(headers: Map<String, String>): Connectio
     }
     return ConnectionContext(headers = headers)
 }
+
+@OptIn(ExperimentalEncodingApi::class)
+public fun ConnectionContext.toHttpHeaders(): Map<String, String> {
+    val out = mutableMapOf<String, String>()
+    when {
+        user != null && password != null ->
+            out["Authorization"] =
+                "Basic " + Base64.encode("$user:$password".encodeToByteArray())
+        token != null && token.contains(':') ->
+            out["Authorization"] = "Basic " + Base64.encode(token.encodeToByteArray())
+        token != null ->
+            out["Authorization"] = "Bearer $token"
+    }
+    return out
+}

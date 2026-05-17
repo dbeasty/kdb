@@ -13,6 +13,7 @@ import dev.kdb.error.DataDirectoryLockedException
 import dev.kdb.error.KdbException
 import dev.kdb.jdbc.file.StaleLockReleaseResult
 import dev.kdb.jdbc.file.releaseStaleDataDirectoryLock
+import dev.kdb.config.requireNetworkPeerSyncEnabled
 import dev.kdb.peersync.PeerClientConfig
 import dev.kdb.peersync.peerSyncClient
 import dev.kdb.transport.tcp.defaultTcpWireTransport
@@ -202,6 +203,7 @@ internal object CliCommands {
     }
 
     internal suspend fun executeSync(session: CliSession, peerUri: String) {
+        requireNetworkPeerSyncEnabled(session.config.productConfig.features, peerUri)
         val wire = defaultWireCodec()
         val transport =
             when {

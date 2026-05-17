@@ -1,6 +1,7 @@
 package dev.kdb.peersync
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.transport.core.TransportTlsSettings
 import dev.kdb.dag.CommitDag
 import dev.kdb.document.KdbCommit
 
@@ -17,6 +18,8 @@ public data class PeerClientConfig(
     val namespaceId: String,
     val nodeId: String,
     val peerUri: String,
+    val connectionContext: dev.kdb.auth.ConnectionContext = dev.kdb.auth.ConnectionContext.EMPTY,
+    val tls: TransportTlsSettings? = null,
 )
 
 public data class DagSyncPlan(

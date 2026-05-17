@@ -1,13 +1,15 @@
 package dev.kdb.peersync
 
+import dev.kdb.auth.AllowAllAuth
+import dev.kdb.auth.AuthEngine
+import dev.kdb.auth.ConnectionContext
 import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
-import dev.kdb.dag.TraversalEntry
 import dev.kdb.document.KdbCommit
 import dev.kdb.storage.StorageAdapter
 import dev.kdb.stream.InMemoryWireTransportHub
 import dev.kdb.transaction.TransactionEngine
-import dev.kdb.wire.*
+import dev.kdb.wire.WireCodec
 
 public interface PeerSyncHost {
     public suspend fun start(config: PeerHostConfig)
@@ -20,21 +22,61 @@ public fun peerSyncHost(
     dag: CommitDag,
     storage: StorageAdapter,
     transactionEngine: TransactionEngine? = null,
-): PeerSyncHost = DefaultPeerSyncHost(wire, dag, storage, transactionEngine)
+    auth: AuthEngine = AllowAllAuth,
+    connectionContext: ConnectionContext = ConnectionContext.EMPTY,
+): PeerSyncHost = DefaultPeerSyncHost(wire, dag, storage, transactionEngine, auth, connectionContext)
+
+public fun peerSyncHostFactory(
+    wire: WireCodec,
+    dag: CommitDag,
+    storage: StorageAdapter,
+    config: PeerHostConfig,
+    auth: AuthEngine = AllowAllAuth,
+    transactionEngine: TransactionEngine? = null,
+): (ConnectionContext) -> PeerSyncHost =
+    { ctx ->
+        ConnectionPeerSyncHost(
+            PeerSyncFrameHandler(wire, dag, storage, config, auth, ctx),
+        )
+    }
+
+internal class ConnectionPeerSyncHost(
+    private val handler: PeerSyncFrameHandler,
+) : PeerSyncHost {
+    override suspend fun start(config: PeerHostConfig) {
+        error("ConnectionPeerSyncHost does not support in-memory hub start")
+    }
+
+    override suspend fun stop() = Unit
+
+    override suspend fun handleFrame(frame: ByteArray): ByteArray? = handler.handleFrame(frame)
+}
 
 internal class DefaultPeerSyncHost(
     private val wire: WireCodec,
     private val dag: CommitDag,
-    @Suppress("UNUSED_PARAMETER") private val storage: StorageAdapter,
+    private val storage: StorageAdapter,
     @Suppress("UNUSED_PARAMETER") private val transactionEngine: TransactionEngine?,
+    private val auth: AuthEngine,
+    private val connectionContext: ConnectionContext,
 ) : PeerSyncHost {
     private var config: PeerHostConfig? = null
+    private var handler: PeerSyncFrameHandler? = null
 
     override suspend fun start(config: PeerHostConfig) {
         this.config = config
+        handler =
+            PeerSyncFrameHandler(
+                wire = wire,
+                dag = dag,
+                storage = storage,
+                cfg = config,
+                auth = auth,
+                connectionContext = connectionContext,
+            )
         val hub = InMemoryWireTransportHub.hub(config.transportHub)
         hub.serverHandler = { frame ->
-            val response = handleFrame(frame)
+            val response = handler?.handleFrame(frame)
             if (response != null) {
                 hub.serverSend(response)
             }
@@ -45,105 +87,19 @@ internal class DefaultPeerSyncHost(
         val cfg = config ?: return
         InMemoryWireTransportHub.hub(cfg.transportHub).serverHandler = null
         this.config = null
+        handler = null
     }
 
     override suspend fun handleFrame(frame: ByteArray): ByteArray? {
-        val cfg = config ?: throw PeerSyncException("PeerSyncHost not started")
-        return when (val msg = wire.decode(frame)) {
-            is WireMessage.Handshake -> handleHandshake(msg, cfg)
-            is WireMessage.CommitFetch -> handleCommitFetch(msg, cfg)
-            is WireMessage.CommitPush -> handleCommitPush(msg, cfg)
-            else -> null
-        }
-    }
-
-    private suspend fun handleHandshake(
-        msg: WireMessage.Handshake,
-        cfg: PeerHostConfig,
-    ): ByteArray {
-        val heads =
-            mapOf(cfg.namespaceId to dag.head().toHex())
-        val ack =
-            WireMessage.HandshakeAck(
-                WireHeader(
-                    WireMessageType.HANDSHAKE,
-                    KDB_WIRE_PROTOCOL_VERSION,
-                    msg.header.correlationId,
-                    0,
-                ),
-                HandshakeAckPayload(
-                    accepted = true,
-                    negotiatedEncoding = PayloadEncoding.KDB_BINARY,
-                    protocolVersion = KDB_WIRE_PROTOCOL_VERSION,
-                    remoteHeads = heads,
-                ),
-            )
-        return wire.encode(ack)
-    }
-
-    private suspend fun handleCommitFetch(
-        msg: WireMessage.CommitFetch,
-        cfg: PeerHostConfig,
-    ): ByteArray {
-        require(msg.namespace == cfg.namespaceId) {
-            throw PeerSyncException("namespace mismatch: ${msg.namespace}")
-        }
-        val commits = fetchCommits(msg.sinceHash, msg.maxCommits)
-        val push =
-            WireMessage.CommitPush(
-                WireHeader(
-                    WireMessageType.COMMIT_PUSH,
-                    KDB_WIRE_PROTOCOL_VERSION,
-                    msg.header.correlationId,
-                    0,
-                ),
-                msg.namespace,
-                commits,
-            )
-        return wire.encode(push)
-    }
-
-    private suspend fun handleCommitPush(
-        msg: WireMessage.CommitPush,
-        cfg: PeerHostConfig,
-    ): ByteArray {
-        require(msg.namespace == cfg.namespaceId) {
-            throw PeerSyncException("namespace mismatch: ${msg.namespace}")
-        }
-        var applied = 0
-        for (commit in msg.commits) {
-            if (dag.hasCommit(commit.hash)) continue
-            try {
-                dag.putCommit(commit, requireParents = true)
-                cfg.materializeCommit?.invoke(commit)
-                applied++
-            } catch (e: Exception) {
-                throw PeerSyncException("failed to apply commit ${commit.hash.toHex()}", e)
-            }
-        }
-        val ack =
-            WireMessage.CommitPush(
-                WireHeader(
-                    WireMessageType.COMMIT_PUSH,
-                    KDB_WIRE_PROTOCOL_VERSION,
-                    msg.header.correlationId,
-                    0,
-                ),
-                msg.namespace,
-                emptyList(),
-            )
-        return wire.encode(ack)
+        val h = handler ?: throw PeerSyncException("PeerSyncHost not started")
+        return h.handleFrame(frame)
     }
 
     internal suspend fun fetchCommits(
         sinceHash: KdbHash?,
         maxCommits: Int,
     ): List<KdbCommit> {
-        val head = dag.head()
-        val walked = dag.walk(from = head, until = sinceHash, limit = maxCommits)
-        return walked
-            .filterIsInstance<TraversalEntry.Full>()
-            .map { it.commit }
-            .reversed()
+        val h = handler ?: throw PeerSyncException("PeerSyncHost not started")
+        return h.fetchCommits(sinceHash, maxCommits)
     }
 }
