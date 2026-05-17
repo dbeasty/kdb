@@ -55,8 +55,13 @@ public class JvmNetworkWebSocketServer(
                     active.incrementAndGet()
                     scope.launch {
                         try {
-                            val conn = acceptWebSocket(socket, listenPath)
-                            handler(conn)
+                            val (conn, headers) = acceptWebSocket(socket, listenPath)
+                            handler(
+                                JvmAttributedWebSocketConnection(
+                                    conn,
+                                    dev.kdb.transport.core.WireConnectionAttributes(httpHeaders = headers),
+                                ),
+                            )
                         } catch (_: Exception) {
                             try {
                                 socket.close()
@@ -82,7 +87,7 @@ public class JvmNetworkWebSocketServer(
     private fun acceptWebSocket(
         socket: Socket,
         expectedPath: String,
-    ): WireConnection {
+    ): Pair<JvmSocketWebSocketConnection, Map<String, String>> {
         socket.tcpNoDelay = true
         val input = BufferedInputStream(socket.getInputStream())
         val output = BufferedOutputStream(socket.getOutputStream())
@@ -103,9 +108,16 @@ public class JvmNetworkWebSocketServer(
                 "Sec-WebSocket-Accept: $accept\r\n\r\n"
         output.write(response.toByteArray(StandardCharsets.US_ASCII))
         output.flush()
-        return JvmSocketWebSocketConnection(socket, input, output, options)
+        val conn = JvmSocketWebSocketConnection(socket, input, output, options)
+        return conn to request.headers
     }
 }
+
+internal class JvmAttributedWebSocketConnection(
+    private val inner: WireConnection,
+    override val attributes: dev.kdb.transport.core.WireConnectionAttributes,
+) : WireConnection by inner,
+    dev.kdb.transport.core.AttributedWireConnection
 
 private class JvmSocketWebSocketConnection(
     private val socket: Socket,

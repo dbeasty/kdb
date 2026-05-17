@@ -17,6 +17,8 @@ dependencies {
     testImplementation(project(":kdb-transport-core"))
     testImplementation(project(":kdb-transport-tcp"))
     testImplementation(project(":kdb-transport-ws"))
+    testImplementation(project(":kdb-auth"))
+    testImplementation(project(":kdb-auth-static"))
     testImplementation(project(":kdb-embed"))
     testImplementation(project(":kdb-server"))
     testImplementation(project(":kdb-wire"))

@@ -1,5 +1,9 @@
 package dev.kdb.server
 
+import dev.kdb.auth.AllowAllAuth
+import dev.kdb.auth.AuthAction
+import dev.kdb.auth.AuthEngine
+import dev.kdb.auth.ConnectionContext
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbUuid
 import dev.kdb.document.KdbTransaction
@@ -28,10 +32,13 @@ import kotlinx.serialization.json.jsonPrimitive
 
 public class SqlWireHost(
     private val wire: WireCodec,
-    private val server: KdbServerRuntime,
+    public val server: KdbServerRuntime,
     private val defaultNamespace: String,
+    auth: AuthEngine = AllowAllAuth,
+    connectionContext: ConnectionContext = ConnectionContext.EMPTY,
 ) {
     private val sessions = SessionManager(server)
+    private val sqlAuth = SqlAuthSupport(auth, connectionContext)
     private var correlation = 1
 
     public suspend fun handleFrame(frame: ByteArray): ByteArray? {
@@ -50,34 +57,69 @@ public class SqlWireHost(
     }
 
     private suspend fun handleHandshake(msg: WireMessage.Handshake): WireMessage.HandshakeAck {
-        val accepted = msg.request.clientMode == dev.kdb.wire.WireClientMode.SQL_CLIENT
+        val modeOk = msg.request.clientMode == dev.kdb.wire.WireClientMode.SQL_CLIENT
         val head = server.runtime.dag.head().toHex()
-        if (accepted && msg.request.namespaces.isNotEmpty()) {
-            val ns = msg.request.namespaces.first()
-            sessions.begin(ns, ReadConsistency.READ_COMMITTED)
-        } else if (accepted) {
-            sessions.begin(defaultNamespace, ReadConsistency.READ_COMMITTED)
+        if (!modeOk) {
+            return handshakeAck(msg, accepted = false, head, "SQL_CLIENT mode required")
         }
-        return WireMessage.HandshakeAck(
+        val principal =
+            try {
+                sqlAuth.authenticateConnection()
+            } catch (e: Throwable) {
+                return handshakeAck(msg, accepted = false, head, sqlAuth.authFailureMessage(e))
+            }
+        val ns =
+            if (msg.request.namespaces.isNotEmpty()) {
+                msg.request.namespaces.first()
+            } else {
+                defaultNamespace
+            }
+        try {
+            sqlAuth.authorize(principal, AuthAction.SessionBegin(ns))
+        } catch (e: Throwable) {
+            return handshakeAck(msg, accepted = false, head, sqlAuth.authFailureMessage(e))
+        }
+        sessions.begin(ns, ReadConsistency.READ_COMMITTED, principal = principal)
+        return handshakeAck(msg, accepted = true, head, rejectionReason = null)
+    }
+
+    private fun handshakeAck(
+        msg: WireMessage.Handshake,
+        accepted: Boolean,
+        headHex: String,
+        rejectionReason: String?,
+    ): WireMessage.HandshakeAck =
+        WireMessage.HandshakeAck(
             header(msg.header.correlationId, WireMessageType.HANDSHAKE),
             dev.kdb.wire.HandshakeAckPayload(
                 accepted = accepted,
                 negotiatedEncoding = wire.encoding,
                 protocolVersion = KDB_WIRE_PROTOCOL_VERSION,
-                remoteHeads = mapOf(defaultNamespace to head),
-                rejectionReason = if (accepted) null else "SQL_CLIENT mode required",
+                remoteHeads = mapOf(defaultNamespace to headHex),
+                rejectionReason = rejectionReason,
             ),
         )
-    }
 
     private suspend fun handleSessionBegin(msg: WireMessage.SessionBegin): WireMessage.SessionBeginAck {
         val consistency = ReadConsistency.valueOf(msg.readConsistency)
+        val principal =
+            try {
+                sqlAuth.authenticateConnection()
+            } catch (e: Throwable) {
+                return sessionBeginAuthError(msg, sqlAuth.authFailureMessage(e))
+            }
+        try {
+            sqlAuth.authorize(principal, AuthAction.SessionBegin(msg.namespace))
+        } catch (e: Throwable) {
+            return sessionBeginAuthError(msg, sqlAuth.authFailureMessage(e))
+        }
         val session =
             sessions.begin(
                 namespaceId = msg.namespace,
                 readConsistency = consistency,
                 baseVersionHex = msg.baseVersionHex,
                 sessionId = msg.sessionId,
+                principal = principal,
             )
         return WireMessage.SessionBeginAck(
             header(msg.header.correlationId, WireMessageType.SESSION_BEGIN_ACK),
@@ -98,6 +140,14 @@ public class SqlWireHost(
         }
         if (!session.autoCommit && isDdlStatement(parsed)) {
             return sqlError(msg, "DDL not allowed inside a transaction")
+        }
+        try {
+            sqlAuth.authorize(
+                session.principal,
+                AuthAction.SqlExec(msg.namespace, readOnly = !sqlRequiresWrite(parsed)),
+            )
+        } catch (e: Throwable) {
+            return sqlError(msg, sqlAuth.authFailureMessage(e))
         }
         return try {
             val deferCommit = !session.autoCommit
@@ -190,6 +240,11 @@ public class SqlWireHost(
         val session =
             sessions.get(msg.sessionId)
                 ?: return sqlError(msg, "unknown session: ${msg.sessionId}")
+        try {
+            sqlAuth.authorize(session.principal, AuthAction.TxCommit(msg.namespace))
+        } catch (e: Throwable) {
+            return sqlError(msg, sqlAuth.authFailureMessage(e))
+        }
         if (msg.transactionBytes.isNotEmpty()) {
             return commitEncodedTransaction(msg, session)
         }
@@ -344,6 +399,24 @@ public class SqlWireHost(
         )
 
     private suspend fun handleTransactionReplay(msg: WireMessage.TransactionReplay): WireMessage {
+        try {
+            sqlAuth.authorize(
+                sqlAuth.connectionPrincipal,
+                AuthAction.TxCommit(msg.namespace),
+            )
+        } catch (e: Throwable) {
+            return WireMessage.SqlResult(
+                header(msg.header.correlationId, WireMessageType.SQL_RESULT),
+                namespace = msg.namespace,
+                sessionId = "",
+                columns = emptyList(),
+                rows = emptyList(),
+                rowsAffected = 0,
+                resolvedCommitHex = "",
+                readOnly = false,
+                error = sqlAuth.authFailureMessage(e),
+            )
+        }
         val tx = TransactionWireCodec.decode(msg.transactionBytes)
         val replayTarget = server.runtime.dag.head()
         return when (val result = server.replay(msg.namespace, tx, replayTarget)) {
@@ -426,4 +499,16 @@ public class SqlWireHost(
         (
             """{"transactionId":"${report.transactionId}","baseHash":"${report.baseHash}","targetHash":"${report.targetHash}"}"""
         ).encodeToByteArray()
+
+    private fun sessionBeginAuthError(
+        msg: WireMessage.SessionBegin,
+        @Suppress("UNUSED_PARAMETER") error: String,
+    ): WireMessage.SessionBeginAck =
+        WireMessage.SessionBeginAck(
+            header(msg.header.correlationId, WireMessageType.SESSION_BEGIN_ACK),
+            namespace = msg.namespace,
+            sessionId = "",
+            headHex = "",
+            readConsistency = msg.readConsistency,
+        )
 }

@@ -20,6 +20,7 @@ public class SessionManager(
         readConsistency: ReadConsistency,
         baseVersionHex: String? = null,
         sessionId: String? = null,
+        principal: dev.kdb.auth.Principal? = null,
     ): KdbSession {
         val head =
             baseVersionHex?.let { KdbHash.fromHex(it) }
@@ -39,6 +40,7 @@ public class SessionManager(
                 readPin = readPin,
                 readConsistency = readConsistency,
                 pending = null,
+                principal = principal,
             )
         mutex.withLock { sessions[id.value] = session }
         return session

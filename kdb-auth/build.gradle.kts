@@ -21,8 +21,6 @@ kotlin {
 
         commonMain.dependencies {
             implementation(project(":kdb-error"))
-            implementation(project(":kdb-stream"))
-            implementation(project(":kdb-wire"))
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)

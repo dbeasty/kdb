@@ -3,6 +3,8 @@ plugins {
 }
 
 dependencies {
+    implementation(project(":kdb-auth"))
+    implementation(project(":kdb-auth-static"))
     implementation(project(":kdb-document"))
     implementation(project(":kdb-embed"))
     implementation(project(":kdb-server"))

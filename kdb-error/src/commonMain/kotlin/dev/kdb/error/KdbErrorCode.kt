@@ -39,4 +39,7 @@ public enum class KdbErrorCode(public val numericCode: Int) {
     TRANSPORT_ERROR(6101),
     COMPUTE_UNAVAILABLE(6201),
     COMPUTE_DISPATCH_ERROR(6202),
+
+    AUTHENTICATION_FAILED(6301),
+    AUTHORIZATION_FAILED(6302),
 }

@@ -1,5 +1,6 @@
 package dev.kdb.server
 
+import dev.kdb.auth.Principal
 import dev.kdb.codec.KdbHash
 import dev.kdb.query.hybrid.CheckoutHandle
 import dev.kdb.query.hybrid.ReadConsistency
@@ -16,4 +17,5 @@ public data class KdbSession(
     var pending: TransactionBuilder?,
     var sessionCheckout: CheckoutHandle? = null,
     var autoCommit: Boolean = true,
+    var principal: Principal? = null,
 )
