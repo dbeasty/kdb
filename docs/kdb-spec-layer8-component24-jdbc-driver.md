@@ -12,7 +12,7 @@
 
 ## 1. Purpose
 
-Provides a **thin JDBC 4.x adapter** (master §5) that maps `java.sql.*` to KDB engine APIs. Query execution delegates to `HybridQueryEngine`; the driver does not reimplement SQL planning. v1 targets **embedded memory mode** (`jdbc:kdb:memory:///catalog`) for ORM/IDE compatibility tests.
+Provides a **thin JDBC 4.x adapter** (master §5) that maps `java.sql.*` to KDB engine APIs. Query execution delegates to `HybridQueryEngine`; the driver does not reimplement SQL planning. v1 targets **embedded memory** (`jdbc:kdb:memory:///catalog`) and **embedded file** (`jdbc:kdb:file:///dataRoot/catalog/table`) modes for ORM/IDE compatibility and local persistence.
 
 -----
 
@@ -50,7 +50,9 @@ class KdbDriver : Driver {
 data class KdbJdbcUrl(
     val mode: JdbcMode,
     val catalog: String,
+    val namespaceId: String,
     val readOnly: Boolean,
+    val dataRoot: String?, // FILE mode only
 )
 
 enum class JdbcMode { MEMORY, FILE, NETWORK }
@@ -77,6 +79,9 @@ class EmbeddedKdbRuntime(
 )
 
 fun openMemoryRuntime(catalog: String, namespaceId: String, schema: KdbSchema): EmbeddedKdbRuntime
+
+// JVM only — `kdb-jdbc` jvmMain `dev.kdb.jdbc.file`
+fun openFileRuntime(dataRoot: String, catalog: String, namespaceId: String, schema: KdbSchema): EmbeddedKdbRuntime
 ```
 
 -----
@@ -87,7 +92,8 @@ fun openMemoryRuntime(catalog: String, namespaceId: String, schema: KdbSchema): 
 | JDBC | KDB |
 |---|---|
 | `jdbc:kdb:memory:///myapp` | catalog=`myapp`, default namespace `myapp/main` |
-| Table `users` in connection | namespace `myapp/users` |
+| `jdbc:kdb:file:///data/myapp/users` | `dataRoot=/data`, namespace `myapp/users` |
+| Table `users` in connection | namespace `catalog/users` |
 | `readOnly=true` property | SELECT only; DML throws |
 
 ### ResultSet columns
@@ -102,8 +108,9 @@ Schema fields + `kdb_id` + `_doc` per master §3.2. `SqlCell` mapped to JDBC typ
 
 ### `KdbDriver.connect`
 - **Preconditions:** `acceptsURL(url)`.
-- **Postconditions:** Returns `KdbConnection` for memory URLs; `null` if URL not handled.
+- **Postconditions:** Returns `KdbConnection` for memory and file URLs; `null` if URL not handled.
 - **Memory mode:** New isolated `EmbeddedKdbRuntime` per connection (tests).
+- **File mode:** `openFileRuntime` — SERVER storage engine, delta replay on open, `PersistingCommitDag` on write. See [`kdb-spec-layer8-file-persistence-plan.md`](kdb-spec-layer8-file-persistence-plan.md).
 
 ### `KdbStatement.executeQuery`
 - **Postconditions:** `ResultSet` positioned before first row; column labels match projection aliases.
@@ -118,7 +125,7 @@ Schema fields + `kdb_id` + `_doc` per master §3.2. `SqlCell` mapped to JDBC typ
 | Type | When |
 |---|---|
 | `SQLException` | Parse errors, closed connection, unsupported API |
-| `SQLFeatureNotSupportedException` | `CallableStatement`, savepoints, network mode in v1 |
+| `SQLFeatureNotSupportedException` | `CallableStatement`, savepoints, network mode |
 | `HistoryDisabledException` | Wrapped when version SQL on NONE policy |
 
 -----
@@ -139,13 +146,16 @@ Schema fields + `kdb_id` + `_doc` per master §3.2. `SqlCell` mapped to JDBC typ
 | 10 | `closeConnection` | further execute throws |
 | 11 | `resultSetTypes` | `getString`/`getLong` for typed columns |
 | 12 | `catalogMatchesUrl` | `getCatalog()` == parsed catalog |
+| 13 | `fileRuntime_roundTrip` | `openFileRuntime` → seed → reopen → SELECT returns row |
+| 14 | `jdbcFileUrl_roundTrip` | `jdbc:kdb:file://…` survives reconnect |
+| 15 | `replay_idempotent` | double open same dataRoot → same HEAD |
 
 -----
 
 ## 8. Non-Goals
 
 - Network `jdbc:kdb://host:port` (Layer 9 transport + future driver work).
-- File `jdbc:kdb:file://` persistence wiring (uses storage engine later).
+- Cross-process file locking (single-writer assumption for file mode).
 - Full Hibernate dialect (integration tests are Layer 10 Component 30).
 - `CallableStatement`, UDTs, sharding.
 

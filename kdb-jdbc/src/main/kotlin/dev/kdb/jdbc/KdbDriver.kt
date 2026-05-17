@@ -1,5 +1,6 @@
 package dev.kdb.jdbc
 
+import dev.kdb.jdbc.file.openFileRuntime
 import java.sql.Connection
 import java.sql.Driver
 import java.sql.DriverManager
@@ -22,7 +23,16 @@ public class KdbDriver : Driver {
                     openMemoryRuntime(parsed.catalog, parsed.namespaceId),
                     parsed,
                 )
-            JdbcMode.FILE, JdbcMode.NETWORK ->
+            JdbcMode.FILE -> {
+                val root =
+                    parsed.dataRoot
+                        ?: throw SQLException("file JDBC URL missing data root")
+                KdbConnection(
+                    openFileRuntime(root, parsed.catalog, parsed.namespaceId),
+                    parsed,
+                )
+            }
+            JdbcMode.NETWORK ->
                 throw SQLFeatureNotSupportedException("KDB JDBC mode ${parsed.mode} is not implemented in v1")
         }
     }

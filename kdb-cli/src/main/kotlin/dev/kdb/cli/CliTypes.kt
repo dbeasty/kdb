@@ -1,7 +1,8 @@
 package dev.kdb.cli
 
 import dev.kdb.jdbc.EmbeddedKdbRuntime
-import dev.kdb.jdbc.openMemoryRuntime
+import dev.kdb.jdbc.file.NamespacePaths
+import dev.kdb.jdbc.file.openFileRuntime
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.exists
@@ -18,13 +19,14 @@ public class CliRuntime(
 )
 
 public fun openCliRuntime(config: CliConfig, namespaceId: String): CliRuntime {
-    val metaDir = Path.of(config.dataDir, "namespaces", namespaceId)
+    val metaDir = NamespacePaths.nsDir(config.dataDir, namespaceId)
     Files.createDirectories(metaDir)
     val metaFile = metaDir.resolve("meta.json")
     if (!metaFile.exists()) {
         metaFile.toFile().writeText("""{"namespaceId":"$namespaceId","createdAt":"${System.currentTimeMillis()}"}""")
     }
-    return CliRuntime(namespaceId, openMemoryRuntime(config.dataDir, namespaceId))
+    val catalog = NamespacePaths.catalogFromNamespace(namespaceId)
+    return CliRuntime(namespaceId, openFileRuntime(config.dataDir, catalog, namespaceId))
 }
 
 internal sealed class CliCommand {

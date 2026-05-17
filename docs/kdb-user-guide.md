@@ -15,14 +15,15 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 | Core engine (codec, storage, SQL, indexes, wire, peer sync, …) | Implemented; unit and integration tests |
 | **Product CLI** (`:kdb-cli`) — `init`, `put`, `get`, `query`, `log`, `status`, `sync` | Implemented via Gradle `runCli` |
 | **Inspect CLI** (`:kdb-inspect`) — `dump-delta`, `dump-wire`, … | Implemented via Gradle `inspectCli` |
-| **JDBC driver** — `jdbc:kdb:memory://…` | In-memory embedded mode (SELECT, metadata, prepared statements) |
+| **JDBC driver** — `jdbc:kdb:memory://…`, `jdbc:kdb:file://…` | Embedded SELECT, metadata, prepared statements; file mode persists under `dataRoot/ns/{namespaceId}/` |
 | Peer sync (in-memory hub + TCP loopback) | Implemented (`:kdb-peer-sync`, `:kdb-transport-tcp`) |
 | Integration test suite | `:kdb-integration` |
-| **JDBC** — `jdbc:kdb:file://…`, network URLs | Parsed but not implemented (`SQLFeatureNotSupportedException`) |
+| **JDBC** — `jdbc:kdb://…` network URLs | Parsed but not implemented (`SQLFeatureNotSupportedException`) |
 | JDBC DML (`INSERT` / `UPDATE` / `DELETE`) | Not implemented in v1 (`HybridDmlNotSupportedException`) |
-| CLI persistence across separate invocations | v1 uses in-memory runtime per process; `put` then `get` in a new CLI run may not see data |
+| CLI persistence (`--data-dir`) | `put` / `get` / `query` survive separate CLI invocations (delta log + SERVER engine) |
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
+| **File attachments** (`file put` / `get`, ZIP, bundles, `fileId` GUID) | Specified in [file attachments spec](kdb-spec-layer1-component3b-file-attachments.md); not in v1 CLI |
 
 ---
 
@@ -80,7 +81,7 @@ Example:
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb query myapp/users 'SELECT _doc FROM users'"
 ```
 
-**v1 persistence note:** Each CLI invocation opens a fresh in-memory engine. Metadata files are created under `--data-dir`, but `put` in one Gradle invocation and `get` in another may not see the same documents until persistent CLI storage lands. Use a single process or the JDBC/engine APIs for durable in-process tests.
+**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. Assume a **single writer** per data directory (no cross-process file locking in v1).
 
 Additional git-style commands (`branch`, `merge`, `schema migrate`, `push`, …) are described in [§11 CLI Interface](kdb-spec.md#11-cli-interface) and are not yet exposed on the v1 CLI.
 
@@ -107,7 +108,7 @@ Non-authoritative JSON views of binary on-disk or captured wire data. Does not m
 
 ## JDBC (Java) — what you can do today
 
-The **JDBC driver** in `:kdb-jdbc` maps `java.sql.*` to the KDB hybrid query engine. v1 targets **embedded in-memory** mode for ORM/IDE compatibility and application tests.
+The **JDBC driver** in `:kdb-jdbc` maps `java.sql.*` to the KDB hybrid query engine. v1 supports **embedded memory** and **embedded file** modes for ORM/IDE compatibility, local apps, and tests.
 
 ### Add the dependency (from source)
 
@@ -136,8 +137,9 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 | `jdbc:kdb:memory:///demo/users` | `demo/users` | **Yes** |
 | `jdbc:kdb:memory:///myapp` | `myapp/main` (no slash in path) | **Yes** |
 | `jdbc:kdb:memory:///demo/users` + `readOnly=true` property | same | **Yes** (SELECT only) |
-| `jdbc:kdb:file:///path/to/data/catalog` | parsed | **No** — throws `SQLFeatureNotSupportedException` |
-| `jdbc:kdb://host:port/catalog` | parsed | **No** |
+| `jdbc:kdb:file:///path/to/data/demo/users` | `demo/users`; data under `/path/to/data/ns/demo/users/` | **Yes** — survives process restart |
+| `jdbc:kdb:file:///path/to/data/myapp` | `myapp/main` (path ends with catalog only) | **Yes** |
+| `jdbc:kdb://host:port/catalog` | parsed | **No** — `SQLFeatureNotSupportedException` |
 
 **Mapping** (see [spec §5](kdb-spec.md#5-jdbc-driver-highest-priority)):
 
@@ -161,7 +163,7 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 
 | Area | Behaviour |
 |------|-----------|
-| **File / network URLs** | `SQLFeatureNotSupportedException` |
+| **Network URLs** | `SQLFeatureNotSupportedException` |
 | **DML** | `UPDATE` / `INSERT` / `DELETE` → `HybridDmlNotSupportedException` |
 | **Read-only connection** | `executeUpdate` → `SQLException` |
 | **Advanced JDBC** | `CallableStatement`, `Savepoint`, `Blob`/`Clob`, batch, generated keys → `SQLFeatureNotSupportedException` |
@@ -169,7 +171,9 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 
 ### Seeding data (required before SELECT returns rows)
 
-Each JDBC connection gets an **empty** in-memory engine. You must write documents through the embedded runtime (or run CLI/engine code in the same process) before `SELECT` returns rows.
+**Memory mode (`jdbc:kdb:memory://…`):** Each connection is an **isolated** empty engine. Seed documents in the same process (or use the CLI with `--data-dir` and file mode instead).
+
+**File mode (`jdbc:kdb:file://…`):** Data is replayed from disk on connect. After a prior run (CLI `put`, `openFileRuntime`, or an earlier JDBC session) wrote commits, `SELECT` can return rows without re-seeding. New empty directories still need an initial write.
 
 **Kotlin example** (from `KdbJdbcTest`):
 
@@ -273,11 +277,13 @@ try (Connection conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/user
 }
 ```
 
-Each connection is an **isolated** in-memory database; two connections do not share data.
+**Memory mode:** Each connection is an **isolated** in-memory database; two connections do not share data.
+
+**File mode:** Connections to the same `jdbc:kdb:file://…` URL share on-disk state (replay on open). Pass a `KdbSchema` when opening programmatically so indexes rebuild after reload (see `openFileRuntime`).
 
 ### Kotlin without JDBC
 
-Use `openMemoryRuntime` from `:kdb-jdbc` for direct access to `dag`, `storage`, `hybrid`, and `indexManager`:
+Use `openMemoryRuntime` or `openFileRuntime` from `:kdb-jdbc` for direct access to `dag`, `storage`, `hybrid`, and `indexManager`:
 
 ```kotlin
 import dev.kdb.jdbc.openMemoryRuntime
@@ -292,6 +298,20 @@ fun main() = runBlocking {
     )
     result.result.rows.forEach { println(it) }
 }
+```
+
+**Durable JVM embedding** (`dev.kdb.jdbc.file.openFileRuntime`):
+
+```kotlin
+import dev.kdb.jdbc.file.openFileRuntime
+import dev.kdb.schema.KdbSchema
+
+val runtime = openFileRuntime(
+    dataRoot = "/var/lib/myapp",
+    catalog = "myapp",
+    namespaceId = "myapp/users",
+    schema = myUsersSchema, // required for indexed WHERE after reopen
+)
 ```
 
 ---

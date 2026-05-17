@@ -20,7 +20,7 @@ Provides the **git-style command-line interface** for KDB (master §11). Develop
 
 | Module | Interfaces used |
 |---|---|
-| `dev.kdb.jdbc` | `openMemoryRuntime`, `EmbeddedKdbRuntime` |
+| `dev.kdb.jdbc` | `openFileRuntime`, `EmbeddedKdbRuntime`, `NamespacePaths` |
 | `dev.kdb.transaction` | `TransactionEngine`, commit builder |
 | `dev.kdb.dag` | `CommitDag`, `head`, `log` traversal |
 | `dev.kdb.document` | `KdbDocument`, `KdbOp`, `KdbCommit` |
@@ -92,13 +92,17 @@ internal sealed class CliCommand {
 }
 ```
 
-Workspace layout under `{dataDir}`:
+Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.md`](kdb-spec-layer8-file-persistence-plan.md)):
 
 ```
-{dataDir}/namespaces/{namespace}/meta.json
+{dataDir}/ns/{namespaceId}/
+  meta.json
+  delta/          # sealed segments (KDBP-framed commits)
+  wal/ ...
+  sstable/ ...
 ```
 
-v1 memory runtime: metadata file only; engine state is in-process (re-init on each CLI invocation for `put`/`get`/`query` uses fresh `openMemoryRuntime` — acceptable for v1 smoke; persistent store deferred).
+`openCliRuntime` calls `openFileRuntime(dataDir, catalog, namespaceId)` — SERVER engine + delta replay on each open; `PersistingCommitDag` appends on commit. Separate CLI invocations with the same `--data-dir` see prior `put` data.
 
 -----
 
@@ -128,7 +132,7 @@ v1 memory runtime: metadata file only; engine state is in-process (re-init on ea
 |---|---|---|---|
 | 1 | `init_createsMeta` | `init app/demo` | meta.json exists |
 | 2 | `put_inlineJson` | `put app/demo '{"id":"1","v":1}'` | exit 0 |
-| 3 | `get_returnsDoc` | after put | JSON contains `"v":1` |
+| 3 | `putGet_survivesReopen` | put then `openFileRuntime` reopen | JSON contains `"v":1` |
 | 4 | `query_select` | `query app/demo "SELECT _doc"` | ≥1 JSONL row |
 | 5 | `log_listsCommits` | after 2 puts | ≥2 lines |
 | 6 | `status_showsHead` | after put | non-empty HEAD |
@@ -142,7 +146,8 @@ v1 memory runtime: metadata file only; engine state is in-process (re-init on ea
 ## 8. Non-Goals
 
 - GraalVM native-image packaging (follow-on).
-- Persistent on-disk engine (Layer 4 production store) — v1 uses memory runtime per invocation.
+- Cross-process file locking or multi-writer safety on one data directory.
+- WAL-only document recovery without delta replay (v1 reloads via delta segments).
 - Full git parity (branch, merge UI, blame) — deferred commands return usage error.
 - Auth / TLS on `sync`.
 
@@ -150,7 +155,7 @@ v1 memory runtime: metadata file only; engine state is in-process (re-init on ea
 
 ## 9. Implementation Notes
 
-- Reuse `openMemoryRuntime(catalog, namespaceId)` from JDBC module.
+- Reuse `openFileRuntime(dataRoot, catalog, namespaceId)` from `dev.kdb.jdbc.file`.
 - Argument parsing: manual v1 (no Clikt) to limit dependencies; upgrade in v2.
 - `put` generates random `KdbUuid` when JSON has no `id` field.
 - `sync` uses `kdb-tcp://` or `memory://` hub for tests.

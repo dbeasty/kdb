@@ -17,6 +17,7 @@ Layer 0 — Foundation         [COMPLETE]
 
 Layer 1 — Core Types         [COMPLETE]
   [x] 3. Document + Commit Model   — module `:kdb-document`; normative detail in `kdb-spec-layer1-component3-document-commit-model.md`
+  [ ] 3b. File attachments (draft) — `kdb-spec-layer1-component3b-file-attachments.md` (metadata `kdb.file`, `fileId` GUID, optional ZIP, bundles); CLI/ingest not implemented
   [x] 4. JSON Functions Engine     — module `:kdb-json`; normative detail in `kdb-spec-layer1-component4-json-functions-engine.md`
 
 Layer 2 — Schema + DAG       [COMPLETE]
@@ -102,7 +103,7 @@ Layer 10 — Tooling            [IMPLEMENTED — first Kotlin cut]
 - Layer 7 component specs generated (3 files): Components 20–22 — storage tier manager, wire protocol + framing, stream mode. Execution plan: `kdb-spec-layer7-execution-plan.md`. Draft interfaces in Section 17 → Layer 7.
 - Layer 7 implemented (first Kotlin cut): `:kdb-wire`, `:kdb-stream`, `:kdb-storage-tier`. Wire frame codec (JSON payload v1), in-memory transport, stream coordinator/subscriber, ice bundle archive/stub/restore.
 - Layer 8 component specs generated (2 files): Components 23–24 — peer sync Mode 3, JDBC driver. Execution plan: `kdb-spec-layer8-execution-plan.md`.
-- Layer 8 implemented (first Kotlin cut): `:kdb-peer-sync` (FULL_PEER handshake, CommitFetch/Push, bidirectional in-memory sync), `:kdb-jdbc` (memory-mode Driver/Connection/Statement/ResultSet/MetaData).
+- Layer 8 implemented (first Kotlin cut): `:kdb-peer-sync` (FULL_PEER handshake, CommitFetch/Push, bidirectional in-memory sync), `:kdb-jdbc` (memory- and file-mode Driver/Connection/Statement/ResultSet/MetaData; delta replay on open).
 - Layer 9 component specs generated (4 files + shared modules): Components 25–28 — WebSocket transport, TCP transport, WebGPU compute, CUDA/Vulkan/CPU compute. Execution plan: `kdb-spec-layer9-execution-plan.md`.
 - Layer 9 implemented (first Kotlin cut): `:kdb-transport-core`, `:kdb-transport-tcp`, `:kdb-transport-ws`, `:kdb-compute`, `:kdb-compute-jvm`, `:kdb-compute-webgpu`. TCP loopback + peer sync integration; CPU compute fallback for WebGPU/CUDA.
 - Layer 10 component specs generated: Components 29–30 — CLI, integration test suite. Execution plan: `kdb-spec-layer10-execution-plan.md`.
@@ -110,7 +111,7 @@ Layer 10 — Tooling            [IMPLEMENTED — first Kotlin cut]
 
 ### What To Do Next
 
-**All planned layers (0–10) have a first Kotlin implementation.** Follow-on work: persistent CLI store, CUDA/Vulkan real backends, GraalVM CLI binary, Hibernate integration tests, TLS on transport.
+**All planned layers (0–10) have a first Kotlin implementation.** Follow-on work: browser snapshot persistence, CUDA/Vulkan real backends, GraalVM CLI binary, Hibernate file-mode integration tests, TLS on transport, WAL-backed document recovery on SERVER open, **file attachments** (Component 3b — ingest, CLI `file put`/`get`, blob GC reachability, peer blob sync).
 
 Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
 

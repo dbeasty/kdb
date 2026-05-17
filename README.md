@@ -1,6 +1,6 @@
 # KDB — Portable Embedded Database Engine
 
-> **Status: early implementation.** This repository contains the architecture specification, a growing Kotlin Multiplatform implementation, and design artefacts for KDB. APIs and behaviour are subject to change. See the [user guide](docs/kdb-user-guide.md) for how to run and embed what exists today.
+> **Status: early implementation.** This repository contains the architecture specification, a growing Kotlin Multiplatform implementation, and design artefacts for KDB. APIs and behaviour are subject to change. See the [user guide](docs/kdb-user-guide.md) for how to run and embed what exists today. JVM **file persistence** (`jdbc:kdb:file://…`, CLI `--data-dir`) is implemented via the SERVER storage engine and delta log replay.
 
 ---
 

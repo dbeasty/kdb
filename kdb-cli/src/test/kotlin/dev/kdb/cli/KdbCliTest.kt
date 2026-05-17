@@ -1,9 +1,13 @@
 package dev.kdb.cli
 
+import dev.kdb.codec.KdbUuid
+import dev.kdb.jdbc.file.openFileRuntime
 import kotlin.io.path.createTempDirectory
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
 
 class KdbCliTest {
     @Test
@@ -11,20 +15,27 @@ class KdbCliTest {
         val dir = createTempDirectory("kdb-cli").toString()
         val code = KdbCli.run(arrayOf("--data-dir", dir, "init", "app/demo"))
         assertEquals(0, code)
-        assertTrue(java.nio.file.Files.exists(java.nio.file.Path.of(dir, "namespaces", "app", "demo", "meta.json")))
+        assertTrue(java.nio.file.Files.exists(java.nio.file.Path.of(dir, "ns", "app", "demo", "meta.json")))
     }
 
     @Test
-    fun putAndGet_roundtrip() {
+    fun putAndGet_survivesReopen() {
         val dir = createTempDirectory("kdb-cli").toString()
-        KdbCli.run(arrayOf("--data-dir", dir, "init", "app/t"))
-        val putCode =
+        val docId = "00000000-0000-0000-0000-000000000001"
+        assertEquals(0, KdbCli.run(arrayOf("--data-dir", dir, "init", "app/t")))
+        assertEquals(
+            0,
             KdbCli.run(
-                arrayOf("--data-dir", dir, "put", "app/t", """{"id":"00000000-0000-0000-0000-000000000001","v":1}"""),
-            )
-        assertEquals(0, putCode)
-        // fresh runtime still memory-only v1 — get uses new runtime; doc may not persist across invocations
-        // verify put exit code only for v1 memory model
+                arrayOf("--data-dir", dir, "put", "app/t", """{"id":"$docId","v":1}"""),
+            ),
+        )
+        runBlocking {
+            val rt = openFileRuntime(dir, "app", "app/t")
+            val head = rt.dag.head()
+            val doc = rt.storage.getDocument("app/t", KdbUuid.fromString(docId), head)
+            assertNotNull(doc)
+            assertTrue(doc!!.json.contains("\"v\":1"))
+        }
     }
 
     @Test

@@ -109,6 +109,11 @@ sealed class KdbOp {
     /**
      * Raw file blob write, keyed by path within the namespace.
      * [blobHash] refers to content stored in the storage adapter.
+     *
+     * **Normative file model:** applications should store opaque files via metadata
+     * documents (`kdb.file` / `kdb.file.bundle`, stable [fileId], optional ZIP ingest)
+     * plus [writeBlob]; see `kdb-spec-layer1-component3b-file-attachments.md`.
+     * [FileWrite] is optional path history alongside metadata; it does not update [DocumentTree].
      */
     data class FileWrite(
         val path: String,
