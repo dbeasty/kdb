@@ -3,6 +3,8 @@ package dev.kdb.stream
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 public interface WireTransport {
     public suspend fun connect(uri: String): WireConnection
@@ -23,10 +25,11 @@ public class InMemoryWireTransport : WireTransport {
 }
 
 public object InMemoryWireTransportHub {
+    private val hubsMutex = Mutex()
     private val hubs = mutableMapOf<String, Hub>()
 
-    public fun hub(name: String): Hub =
-        synchronized(hubs) {
+    public suspend fun hub(name: String): Hub =
+        hubsMutex.withLock {
             hubs.getOrPut(name) { Hub(name) }
         }
 
@@ -40,18 +43,19 @@ public object InMemoryWireTransportHub {
     }
 
     public class Hub(internal val name: String) {
+        private val clientsMutex = Mutex()
         private val clients = mutableListOf<ClientLink>()
 
         public var serverHandler: (suspend (ByteArray) -> Unit)? = null
 
-        internal fun createConnection(): ClientLink {
+        internal suspend fun createConnection(): ClientLink {
             val link = ClientLink(this)
-            synchronized(clients) { clients += link }
+            clientsMutex.withLock { clients += link }
             return link
         }
 
         public suspend fun serverSend(frame: ByteArray) {
-            val snapshot = synchronized(clients) { clients.toList() }
+            val snapshot = clientsMutex.withLock { clients.toList() }
             for (c in snapshot) {
                 c.deliverFromServer(frame)
             }

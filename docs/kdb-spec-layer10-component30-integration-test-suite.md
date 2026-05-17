@@ -99,7 +99,7 @@ Tests **expect** failures only in negative cases (`@Test expected = ...`). Produ
 
 - Hibernate/jOOQ/Spring Data (listed in master §14 as follow-on).
 - Browser Playwright tests.
-- Performance benchmarks / load tests.
+- Performance benchmarks / load tests (see `:kdb-benchmark` JMH module).
 - CI matrix for CUDA/WebGPU hardware.
 
 -----

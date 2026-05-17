@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>KDB Browser Demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 960px; }
+    label { display: block; margin-top: 1rem; font-weight: 600; }
+    textarea, input { width: 100%; font-family: ui-monospace, monospace; }
+    textarea { min-height: 6rem; }
+    button { margin-top: 1rem; margin-right: 0.5rem; }
+    pre { background: #f4f4f4; padding: 1rem; overflow: auto; }
+    #status { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>KDB Browser Demo</h1>
+  <p id="status">Loading engine…</p>
+  <label>Document JSON</label>
+  <textarea id="doc">{"userId":"u1","name":"Alice"}</textarea>
+  <button id="putBtn" disabled>Put document</button>
+  <label>SQL</label>
+  <input id="sql" value="SELECT userId, _doc FROM users WHERE userId = 'u1'" />
+  <button id="queryBtn" disabled>Run query</button>
+  <button id="syncBtn" disabled style="display:none">Sync from server</button>
+  <label>Result</label>
+  <pre id="out">(no results yet)</pre>
+  <script src="kdb-browser-demo.js"></script>
+  <script type="module">
+    const params = new URLSearchParams(location.search);
+    const remote = params.get("mode") === "remote";
+    const peerUri = params.get("ws") || "kdb-ws://127.0.0.1:7443/kdb";
+    const schema = JSON.stringify({
+      fields: [{ name: "userId", type: "string", required: true, indexed: true }]
+    });
+
+    async function main() {
+      const status = document.getElementById("status");
+      let db;
+      if (remote) {
+        status.textContent = "Opening remote connection to " + peerUri + "…";
+        document.getElementById("syncBtn").style.display = "inline-block";
+        db = await KdbBrowser.openRemote("demo/users", peerUri, schema);
+        await db.sync();
+        status.textContent = "Synced from " + peerUri;
+      } else {
+        status.textContent = "Opening in-memory database…";
+        db = await KdbBrowser.openWithSchema("demo/users", schema);
+        status.textContent = "Ready (standalone memory mode)";
+      }
+      document.getElementById("putBtn").disabled = false;
+      document.getElementById("queryBtn").disabled = false;
+      document.getElementById("syncBtn").disabled = false;
+
+      document.getElementById("putBtn").onclick = async () => {
+        const id = await db.put(document.getElementById("doc").value);
+        document.getElementById("out").textContent = "put ok, doc id: " + id;
+      };
+      document.getElementById("queryBtn").onclick = async () => {
+        const json = await db.query(document.getElementById("sql").value);
+        document.getElementById("out").textContent = JSON.stringify(JSON.parse(json), null, 2);
+      };
+      document.getElementById("syncBtn").onclick = async () => {
+        const json = await db.sync();
+        document.getElementById("out").textContent = "sync: " + json;
+      };
+    }
+    main().catch((e) => {
+      document.getElementById("status").textContent = "Error: " + e;
+      console.error(e);
+    });
+  </script>
+</body>
+</html>

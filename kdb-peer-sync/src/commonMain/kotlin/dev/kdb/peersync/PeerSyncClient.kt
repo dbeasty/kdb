@@ -87,13 +87,13 @@ internal class DefaultPeerSyncClient(
                 else -> message.header.correlationId
             }
         conn.send(wire.encode(message))
-        repeat(200) {
+        repeat(2_000) {
             val frame = conn.tryPoll()
             if (frame != null) {
                 val decoded = wire.decode(frame)
                 if (decoded.header.correlationId == cid) return decoded
             }
-            delay(1)
+            delay(2)
         }
         throw PeerSyncException("no response for correlation $cid")
     }

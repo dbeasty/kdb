@@ -10,8 +10,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.khronos.webgl.ArrayBuffer
-import org.khronos.webgl.Int8Array
-import org.w3c.dom.BinaryType
+import org.khronos.webgl.Uint8Array
 import org.w3c.dom.MessageEvent
 import org.w3c.dom.WebSocket
 import org.w3c.dom.events.Event
@@ -38,18 +37,11 @@ internal class JsBrowserWebSocketConnection(
 
     init {
         socket = WebSocket(wsUri)
-        socket.binaryType = BinaryType.ARRAYBUFFER
+        socket.asDynamic().binaryType = "arraybuffer"
         socket.onmessage = { event: MessageEvent ->
             val data = event.data
             when (data) {
-                is ArrayBuffer -> {
-                    val arr = Int8Array(data)
-                    val bytes = ByteArray(arr.length)
-                    for (i in 0 until arr.length) {
-                        bytes[i] = arr[i]
-                    }
-                    incomingChannel.trySend(bytes)
-                }
+                is ArrayBuffer -> incomingChannel.trySend(data.toByteArray())
                 is String -> {
                     incomingChannel.close(TransportException("text frames not supported"))
                 }
@@ -77,6 +69,8 @@ internal class JsBrowserWebSocketConnection(
 
     override fun incoming(): Flow<ByteArray> = incomingChannel.receiveAsFlow()
 
+    override fun tryPoll(): ByteArray? = incomingChannel.tryReceive().getOrNull()
+
     override suspend fun close() {
         socket.close()
         incomingChannel.close(ConnectionClosedException())
@@ -101,11 +95,19 @@ internal class JsBrowserWebSocketConnection(
         }
 }
 
+private fun ArrayBuffer.toByteArray(): ByteArray {
+    val view = Uint8Array(this)
+    val len = view.length
+    val dyn = view.asDynamic()
+    return ByteArray(len) { i -> (dyn[i] as Number).toInt().toByte() }
+}
+
 private fun ByteArray.toArrayBuffer(): ArrayBuffer {
     val buffer = ArrayBuffer(size)
-    val view = Int8Array(buffer)
+    val view = Uint8Array(buffer)
+    val dyn = view.asDynamic()
     for (i in indices) {
-        view[i] = this[i]
+        dyn[i] = this[i]
     }
     return buffer
 }

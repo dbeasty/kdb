@@ -9,6 +9,7 @@ dependencies {
     implementation(project(":kdb-document"))
     implementation(project(":kdb-file"))
     implementation(project(":kdb-error"))
+    implementation(project(":kdb-embed"))
     implementation(project(":kdb-jdbc"))
     implementation(project(":kdb-peer-sync"))
     implementation(project(":kdb-transport-tcp"))

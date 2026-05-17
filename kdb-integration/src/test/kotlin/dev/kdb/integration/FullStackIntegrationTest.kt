@@ -1,6 +1,11 @@
 package dev.kdb.integration
 
+import dev.kdb.embed.putJson
+import dev.kdb.embed.querySql
 import dev.kdb.integration.fixtures.integrationFixture
+import dev.kdb.schema.KdbFieldType
+import dev.kdb.schema.KdbSchema
+import dev.kdb.schema.SchemaField
 import dev.kdb.peersync.PeerClientConfig
 import dev.kdb.peersync.peerSyncClient
 import dev.kdb.peersync.peerSyncHost
@@ -20,6 +25,16 @@ class FullStackIntegrationTest {
     init {
         dev.kdb.jdbc.KdbDriver
     }
+
+    @Test
+    fun embedQueryMemory() =
+        runBlocking {
+            val ns = "integration/embed-query"
+            val fx = integrationFixture(ns)
+            putJson(fx.runtime, ns, """{"v":1}""")
+            val rows = querySql(fx.runtime, ns, "SELECT _doc FROM users", KdbSchema.NONE)
+            assertEquals(1, rows.rows.size)
+        }
 
     @Test
     fun layer3_writePath() =
@@ -85,6 +100,7 @@ class FullStackIntegrationTest {
             val session =
                 client.connect(PeerClientConfig(ns, "local", server.connectUri))
             assertEquals(1, session.pullMissing().appliedCommits)
+            client.disconnect()
             host.stop()
             server.stop()
         }

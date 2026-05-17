@@ -4,7 +4,7 @@ import dev.kdb.dag.CommitDag
 import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.index.compositeIndexStoreFactory
 import dev.kdb.index.productionIndexManager
-import dev.kdb.jdbc.EmbeddedKdbRuntime
+import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.policy.inMemoryNamespacePolicyRegistry
 import dev.kdb.query.hybrid.hybridQueryEngine
 import dev.kdb.schema.KdbSchema

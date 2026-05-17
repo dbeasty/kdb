@@ -9,11 +9,11 @@ public actual object FileBackedPlatformIoShimFactory {
 }
 
 public actual class JvmFileBackedPlatformIoShim actual constructor(config: PlatformIoConfig) :
-    BrowserFileBackedPlatformIoShim(config),
+    FileBackedPlatformIoShimBase(config, BrowserSegmentByteStore()),
     PlatformIoShim
 
 public actual class NativeFileBackedPlatformIoShim actual constructor(config: PlatformIoConfig) :
-    BrowserFileBackedPlatformIoShim(config),
+    FileBackedPlatformIoShimBase(config, BrowserSegmentByteStore()),
     PlatformIoShim
 
 public actual class BrowserFileBackedPlatformIoShim actual constructor(config: PlatformIoConfig) :

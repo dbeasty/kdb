@@ -15,7 +15,7 @@ public data class CliConfig(
 
 public class CliRuntime(
     public val namespaceId: String,
-    internal val embedded: EmbeddedKdbRuntime,
+    public val embedded: EmbeddedKdbRuntime,
 )
 
 public fun openCliRuntime(config: CliConfig, namespaceId: String): CliRuntime {

@@ -1,0 +1,154 @@
+package dev.kdb.transport.ws
+
+import dev.kdb.error.ConnectionClosedException
+import dev.kdb.error.TransportException
+import dev.kdb.stream.WireConnection
+import dev.kdb.transport.core.FrameStreamWriter
+import dev.kdb.transport.core.TransportConnectOptions
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.net.ServerSocket
+import java.net.Socket
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+public class JvmNetworkWebSocketServer(
+    private val options: TransportConnectOptions = TransportConnectOptions(),
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var serverSocket: ServerSocket? = null
+    private val active = AtomicInteger(0)
+    var port: Int = 0
+        private set
+    var listenPath: String = "/"
+        private set
+
+    val listenUri: String
+        get() = "kdb-ws://127.0.0.1:$port$listenPath?bind=true"
+
+    suspend fun start(
+        host: String,
+        portHint: Int,
+        path: String,
+        handler: suspend (WireConnection) -> Unit,
+    ) {
+        withContext(Dispatchers.IO) {
+            val ss = ServerSocket()
+            ss.bind(java.net.InetSocketAddress(host, portHint), 128)
+            serverSocket = ss
+            port = ss.localPort
+            listenPath = path.ifEmpty { "/" }
+            scope.launch {
+                while (isActive) {
+                    val socket = ss.accept()
+                    active.incrementAndGet()
+                    scope.launch {
+                        try {
+                            val conn = acceptWebSocket(socket, listenPath)
+                            handler(conn)
+                        } catch (_: Exception) {
+                            try {
+                                socket.close()
+                            } catch (_: Exception) {
+                            }
+                        } finally {
+                            active.decrementAndGet()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun stop() {
+        scope.cancel()
+        withContext(Dispatchers.IO) {
+            serverSocket?.close()
+            serverSocket = null
+        }
+    }
+
+    private fun acceptWebSocket(
+        socket: Socket,
+        expectedPath: String,
+    ): WireConnection {
+        socket.tcpNoDelay = true
+        val input = BufferedInputStream(socket.getInputStream())
+        val output = BufferedOutputStream(socket.getOutputStream())
+        val request = WebSocketFraming.readHttpHeaders(input)
+        val firstLine = request.line(0)
+        val path = firstLine.split(' ').getOrNull(1) ?: "/"
+        if (path != expectedPath && path != expectedPath.trimEnd('/')) {
+            throw TransportException("unexpected WebSocket path: $path")
+        }
+        val key =
+            request.headers["sec-websocket-key"]
+                ?: throw TransportException("missing Sec-WebSocket-Key")
+        val accept = WebSocketFraming.websocketAccept(key)
+        val response =
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Accept: $accept\r\n\r\n"
+        output.write(response.toByteArray(StandardCharsets.US_ASCII))
+        output.flush()
+        return JvmSocketWebSocketConnection(socket, input, output, options)
+    }
+}
+
+private class JvmSocketWebSocketConnection(
+    private val socket: Socket,
+    private val input: BufferedInputStream,
+    private val output: BufferedOutputStream,
+    private val options: TransportConnectOptions,
+) : WireConnection {
+    private val closed = AtomicBoolean(false)
+    private val incomingChannel = Channel<ByteArray>(Channel.BUFFERED)
+    private val reader =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                while (!closed.get()) {
+                    val payload = WebSocketFraming.readFrame(input, output) ?: break
+                    incomingChannel.send(payload)
+                }
+            } catch (_: Exception) {
+            } finally {
+                incomingChannel.close()
+            }
+        }
+
+    override suspend fun send(frame: ByteArray) {
+        if (closed.get()) throw ConnectionClosedException()
+        FrameStreamWriter.validateOutgoing(frame, options.maxFrameBytes)
+        WebSocketFraming.writeBinaryFrame(output, frame, maskOutbound = false)
+        output.flush()
+    }
+
+    override fun incoming(): Flow<ByteArray> = incomingChannel.receiveAsFlow()
+
+    override fun tryPoll(): ByteArray? = incomingChannel.tryReceive().getOrNull()
+
+    override suspend fun close() {
+        if (closed.compareAndSet(false, true)) {
+            reader.cancel()
+            withContext(Dispatchers.IO) {
+                try {
+                    socket.close()
+                } catch (_: Exception) {
+                }
+            }
+            incomingChannel.close()
+        }
+    }
+}

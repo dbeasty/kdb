@@ -32,10 +32,11 @@ internal class DefaultPeerSyncHost(
 
     override suspend fun start(config: PeerHostConfig) {
         this.config = config
-        InMemoryWireTransportHub.hub(config.transportHub).serverHandler = { frame ->
+        val hub = InMemoryWireTransportHub.hub(config.transportHub)
+        hub.serverHandler = { frame ->
             val response = handleFrame(frame)
             if (response != null) {
-                InMemoryWireTransportHub.hub(config.transportHub).serverSend(response)
+                hub.serverSend(response)
             }
         }
     }

@@ -354,37 +354,110 @@ val runtime = openFileRuntime(
 
 ## Embedding in a JavaScript project
 
-KDB’s browser runtime is the **same Kotlin engine** compiled to **Kotlin/JS**. There is no standalone pure-JavaScript npm package yet.
+KDB ships a **Kotlin/JS** embed layer (`:kdb-embed`) with an exported **`KdbBrowser`** API. Build the bundle with Gradle; there is no published npm package yet.
 
-### Option 1 — Full engine in the browser (Kotlin/JS)
+### Phase 1 — Standalone browser (memory mode)
 
-Add KDB modules to a Kotlin Multiplatform project with a `js` browser target (`kdb-hybrid-query`, `kdb-storage`, `kdb-stream`, `kdb-transport-ws`, …). Bootstrap with `inMemoryCommitDag`, `InMemoryStorageAdapter`, `sqlEngine`, and `hybridQueryEngine` (same pattern as `openMemoryRuntime` on the JVM).
+The engine runs entirely in the tab: put JSON documents and run SQL without JDBC or a backend.
+
+**Build the demo:**
 
 ```bash
-./gradlew :your-app:jsBrowserDevelopmentWebpack
+./gradlew :kdb-browser-demo:jsBrowserDevelopmentWebpack
+cd kdb-browser-demo/build/dist/js/developmentExecutable
+python3 -m http.server 8080
 ```
 
-Optional: `:kdb-compute-webgpu` for vector / bulk-read acceleration with CPU fallback.
+Then open `http://localhost:8080/`.
 
-### Option 2 — Stream client over WebSocket
+**JavaScript API** (from the compiled `kdb-embed` artifact):
 
-Connect to a JVM coordinator using **read-only** or **write-back** stream mode:
+```javascript
+const schema = JSON.stringify({
+  fields: [
+    { name: "userId", type: "string", required: true, indexed: true },
+  ],
+});
+const db = await KdbBrowser.openWithSchema("demo/users", schema);
+await db.put('{"userId":"u1","name":"Alice"}');
+const result = await db.query("SELECT userId FROM users WHERE userId = 'u1'");
+console.log(JSON.parse(result)); // { columns: [...], rows: [...] }
+await db.close();
+```
+
+**Schema JSON shape** (maps to `KdbSchema`):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `fields[].name` | string | Field name |
+| `fields[].type` | string | `string`, `int32`, `int64`, `float64`, `bool`, `timestamp`, `uuid`, `object`, `array` |
+| `fields[].required` | boolean | optional |
+| `fields[].indexed` | boolean | optional; required for indexed `WHERE` |
+| `fields[].unique` | boolean | optional |
+
+**SQL limits (v1):** hybrid `SELECT` works; DML (`INSERT`/`UPDATE`/`DELETE`) is not supported in the browser embed and surfaces as an error. `SELECT _doc` works without a schema; indexed predicates need a non-empty schema.
+
+**Kotlin embed** (same behavior as the CLI put/query path):
 
 ```kotlin
-val transport = JsWebSocketWireTransport()
-val subscriber = streamSubscriber(defaultWireCodec(), transport, indexManager)
-subscriber.connect(
-    StreamSubscriberConfig(
-        namespaceId = "myapp/events",
-        nodeId = "browser-1",
-        mode = StreamClientMode.READ_ONLY,
-        coordinatorUri = "wss://api.example.com/kdb/stream",
-        resumeFrom = lastKnownHead,
-    ),
-)
+val runtime = openMemoryRuntime("demo", "demo/users", schema)
+putJson(runtime, "demo/users", """{"userId":"u1"}""", schema)
+val rows = querySql(runtime, "demo/users", "SELECT userId FROM users WHERE userId = 'u1'", schema)
 ```
 
-See [wire protocol spec](kdb-spec-layer7-component21-wire-protocol-framing.md) and integration tests (`layer9_tcpPeerSync` in `:kdb-integration`).
+### Phase 2 — Backend service + remote sync
+
+Run a JVM **peer-sync host** over WebSocket; the browser keeps a **local in-memory copy**, syncs commits, then queries locally (same model as CLI `sync` over TCP).
+
+**Start the service** (Gradle keeps running until you press **Ctrl+C**; you should not get an immediate `BUILD SUCCESSFUL` prompt while the server is up):
+
+```bash
+./gradlew :kdb-service:runService --args="--memory --namespace demo/users --listen-ws kdb-ws://127.0.0.1:7443/kdb?bind=true"
+```
+
+Use `--data-dir /path/to/data` instead of `--memory` for a persistent file-backed runtime.
+
+**Serve the demo UI** (separate terminal):
+
+```bash
+./gradlew :kdb-browser-demo:jsBrowserDevelopmentWebpack
+cd kdb-browser-demo/build/dist/js/developmentExecutable
+python3 -m http.server 8080
+```
+
+Open `http://localhost:8080/` for memory mode, or  
+`http://localhost:8080/?mode=remote&ws=kdb-ws://127.0.0.1:7443/kdb` with the service running above.
+
+**Remote browser:**
+
+```javascript
+const db = await KdbBrowser.openRemote(
+  "demo/users",
+  "kdb-ws://127.0.0.1:7443/kdb",
+  schemaJson,
+);
+await db.sync(); // pullMissing over WebSocket
+const result = await db.query("SELECT userId FROM users WHERE userId = 'u1'");
+```
+
+**Demo with remote mode:** open the demo page with  
+`index.html?mode=remote&ws=kdb-ws://127.0.0.1:7443/kdb` after seeding data on the server (or put locally after sync).
+
+**v1 caveats:**
+
+- **Read-heavy:** `sync()` pulls remote commits into the local runtime; `put()` in remote mode writes **local commits only** (no push to the server yet).
+- **Not stream mode:** live `StreamCoordinator` fan-out over the network is not wired; use peer sync + local SQL instead.
+- **Dev networking:** use `kdb-ws://localhost` in development; production `wss://` behind a reverse proxy is an application concern (CORS, TLS, auth).
+
+Wire transport: [component 25 WebSocket spec](kdb-spec-layer9-component25-transport-websocket.md). Integration tests: `WebSocketPeerSyncIntegrationTest` and `layer9_tcpPeerSync` in `:kdb-integration`.
+
+### Advanced — custom Kotlin/JS app
+
+Add `:kdb-embed` (or lower-level modules) to your own KMP `js(IR) { browser() }` target and webpack task, same as the demo. Optional: `:kdb-compute-webgpu` for vector acceleration with CPU fallback.
+
+### Deferred — stream subscriber over WebSocket
+
+Read-only / write-back **stream mode** (`StreamCoordinator` live fan-out) is not ready over network transports in v1. See [stream mode spec](kdb-spec-layer7-component22-stream-mode.md).
 
 ---
 
@@ -406,6 +479,34 @@ Use `dump-delta` and `dump-blob` against this tree for debugging.
 
 ---
 
+## Performance benchmarks
+
+JMH microbenchmarks live in the `:kdb-benchmark` module. They measure CLI and JDBC workloads on shared seeded datasets (file-backed and in-memory). Results are **informational only** — they are not part of `./gradlew build` or `check`, and CI does not fail on latency.
+
+```bash
+./gradlew :kdb-benchmark:jmh
+```
+
+Reports are written under `kdb-benchmark/build/reports/jmh/` (HTML) and `kdb-benchmark/build/results/jmh/` (text). To run a subset:
+
+```bash
+./gradlew :kdb-benchmark:jmh -Pjmh.include='.*CliOpen.*'
+```
+
+Scheduled or manual CI runs upload those directories as artifacts via the **Benchmark** workflow (`.github/workflows/benchmark.yml`).
+
+| Benchmark family | What it measures |
+|------------------|------------------|
+| `CliOpen*` | `openCliRuntime` cold vs warm on file data |
+| `CliWrite*` | `cliPut_batch` (one session) vs `cliPut_oneShot` (`KdbCli.run` per put) |
+| `CliQuery*` | Point SELECT, full scan, get by id |
+| `JdbcConnect*` | JDBC connect memory / file cold / file warm |
+| `JdbcQuery*` | SELECT loops, prepared statements, direct `hybrid.execute` vs JDBC |
+
+One-shot CLI commands reopen the file runtime on every invocation; compare `cliPut_batch` and `cliPut_oneShot` to see that cost.
+
+---
+
 ## Getting help
 
 | Topic | Document |
@@ -424,6 +525,10 @@ Use `dump-delta` and `dump-blob` against this tree for debugging.
 ./gradlew build
 ./gradlew :kdb-cli:runCli --args="init myapp/users"
 ./gradlew :kdb-jdbc:test
+./gradlew :kdb-embed:jvmTest :kdb-embed:jsNodeTest
+./gradlew :kdb-browser-demo:jsBrowserDevelopmentWebpack
+./gradlew :kdb-service:runService --args="--memory --listen-ws kdb-ws://127.0.0.1:7443/kdb?bind=true"
+./gradlew :kdb-benchmark:jmh
 ./gradlew :kdb-inspect:inspectCli --args="dump-wire --file /path/to/frame.bin"
 ```
 
