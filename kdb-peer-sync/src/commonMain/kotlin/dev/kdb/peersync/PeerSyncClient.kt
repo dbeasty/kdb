@@ -23,6 +23,8 @@ public interface PeerSession {
     public suspend fun pullMissing(): PeerSyncResult
     public suspend fun pushCommits(commits: List<KdbCommit>): Int
     public suspend fun syncBidirectional(): PeerSyncResult
+    /** Fetches commits from the peer's tip back to [sinceHash] (exclusive). */
+    public suspend fun fetchCommitsSince(sinceHash: KdbHash?): List<KdbCommit>
 }
 
 public fun peerSyncClient(
@@ -184,4 +186,7 @@ internal class DefaultPeerSession(
         val pushed = pushCommits(toPush)
         return pull.copy(pushedCommits = pushed, finalHead = dag.head())
     }
+
+    override suspend fun fetchCommitsSince(sinceHash: KdbHash?): List<KdbCommit> =
+        client.fetchRemote(conn, namespaceId, sinceHash = sinceHash)
 }

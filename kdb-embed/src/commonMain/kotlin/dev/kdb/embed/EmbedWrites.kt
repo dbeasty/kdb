@@ -1,5 +1,6 @@
 package dev.kdb.embed
 
+import dev.kdb.codec.KdbHash
 import dev.kdb.document.KdbCommit
 import dev.kdb.document.KdbTransaction
 import dev.kdb.error.ConflictException
@@ -19,6 +20,7 @@ public suspend fun commitViaEngine(
     engine: TransactionEngine? = null,
     documentLocks: DocumentLockManager? = null,
     sessionId: String? = null,
+    targetHead: KdbHash? = null,
 ): KdbCommit {
     val policy = runtime.policyRegistry.get(namespaceId)
     val txEngine = engine ?: transactionEngine(policy.conflict)
@@ -27,7 +29,7 @@ public suspend fun commitViaEngine(
         documentLocks.acquireAllForTransaction(namespaceId, lockSession, transaction)
     }
     return try {
-        when (val result = txEngine.commit(transaction, runtime.dag, runtime.storage, schema)) {
+        when (val result = txEngine.commit(transaction, runtime.dag, runtime.storage, schema, targetHead)) {
         is TransactionResult.Success -> {
             if (!schema.isNone) {
                 runtime.indexManager.writer.applyCommit(

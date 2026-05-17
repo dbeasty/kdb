@@ -1,5 +1,6 @@
 package dev.kdb.embed
 
+import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.index.IndexManager
@@ -24,6 +25,8 @@ public class EmbeddedKdbRuntime(
     public val schema: KdbSchema,
     public val defaultNamespace: String,
     public val policyRegistry: NamespacePolicyRegistry,
+    /** When set, [putJson] commits from this parent instead of [CommitDag.head]. */
+    public var writeBaseVersion: KdbHash? = null,
 )
 
 public suspend fun openMemoryRuntime(

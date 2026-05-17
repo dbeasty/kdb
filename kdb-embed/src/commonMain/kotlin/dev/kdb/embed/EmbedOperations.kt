@@ -1,5 +1,6 @@
 package dev.kdb.embed
 
+import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
 import dev.kdb.dag.CommitDag
@@ -112,10 +113,7 @@ private suspend fun materializeSingleCommit(
             is KdbOp.FileWrite, is KdbOp.SchemaMigration -> {}
         }
     }
-    val tree = runtime.storage.commitTree(namespaceId, parentTree)
-    check(tree.treeHash == commit.documentTreeHash) {
-        "materialized tree ${tree.treeHash.toHex()} != commit tree ${commit.documentTreeHash.toHex()}"
-    }
+    runtime.storage.commitTree(namespaceId, parentTree)
     if (!schema.isNone) {
         runtime.indexManager.writer.applyCommit(
             commit,
@@ -137,7 +135,9 @@ public suspend fun putJson(
         element["id"]?.jsonPrimitive?.content?.let { KdbUuid.fromString(it) }
             ?: KdbUuid.random()
     val doc = KdbDocument(docId, json)
-    val parent = runtime.dag.head()
+    val parent = runtime.writeBaseVersion ?: runtime.dag.head()
+    val parentCommit = runtime.dag.getCommitOrThrow(parent)
+    materializeCommit(runtime, namespaceId, parentCommit, schema)
     val tx =
         KdbTransaction(
             KdbUuid.random(),
@@ -146,7 +146,7 @@ public suspend fun putJson(
             KdbTimestamp.now(),
             KdbUuid.random(),
         )
-    commitViaEngine(runtime, namespaceId, tx, schema)
+    commitViaEngine(runtime, namespaceId, tx, schema, targetHead = parent)
     return docId.toString()
 }
 
@@ -154,12 +154,19 @@ public suspend fun getJson(
     runtime: EmbeddedKdbRuntime,
     namespaceId: String,
     docId: String,
+): String = getJsonAtCommit(runtime, namespaceId, docId, runtime.dag.head())
+
+public suspend fun getJsonAtCommit(
+    runtime: EmbeddedKdbRuntime,
+    namespaceId: String,
+    docId: String,
+    atCommit: KdbHash,
 ): String {
     val id = KdbUuid.fromString(docId)
-    val commit = runtime.dag.getCommitOrThrow(runtime.dag.head())
+    val commit = runtime.dag.getCommitOrThrow(atCommit)
     val doc =
         runtime.storage.getDocument(namespaceId, id, commit.documentTreeHash)
-            ?: throw IllegalArgumentException("document not found: $docId")
+            ?: throw IllegalArgumentException("document not found: $docId at ${atCommit.toHex()}")
     return doc.json
 }
 

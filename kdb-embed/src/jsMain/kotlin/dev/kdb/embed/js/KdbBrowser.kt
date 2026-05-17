@@ -4,8 +4,16 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.embed.EmbedSchemaDto
 import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.embed.StreamReconnectPolicy
+import dev.kdb.embed.acceptRemoteChanges
 import dev.kdb.embed.applyRemoteStreamDelta
+import dev.kdb.embed.branchActionResultJson
+import dev.kdb.embed.currentHeadHex
 import dev.kdb.embed.getJson
+import dev.kdb.embed.getJsonAtCommit
+import dev.kdb.embed.mergeBranches as embedMergeBranches
+import dev.kdb.embed.rejectRemoteChanges
+import dev.kdb.embed.setWriteBaseVersionHex
+import dev.kdb.embed.writeBaseVersion
 import dev.kdb.embed.pushCommitsSinceRemoteHead
 import dev.kdb.embed.putJson
 import dev.kdb.embed.querySql
@@ -57,6 +65,70 @@ public class KdbBrowserHandle internal constructor(
     private var subscribeWanted: Boolean = false
     private var streamConnected: Boolean = false
     private var streamReconnectAttempt: Int = 0
+    private var streamApplyDeltas: Boolean = true
+
+    public fun head(): Promise<String> = scope.promise { currentHeadHex(runtime) }
+
+    public fun getBaseVersion(): Promise<String?> =
+        scope.promise {
+            writeBaseVersion(runtime)?.toHex()
+        }
+
+    public fun setBaseVersion(commitHex: String?): Promise<Unit> =
+        scope.promise {
+            setWriteBaseVersionHex(runtime, commitHex)
+        }
+
+    public fun getAtCommit(
+        docId: String,
+        commitHex: String,
+    ): Promise<String> =
+        scope.promise {
+            getJsonAtCommit(runtime, namespaceId, docId, KdbHash.fromHex(commitHex))
+        }
+
+    /**
+     * Apply remote commits through [remoteHeadHex] and advance `main`.
+     * When null, uses the last known peer head from handshake / sync.
+     */
+    public fun acceptRemote(remoteHeadHex: String? = null): Promise<String> =
+        scope.promise {
+            remotePeerUri
+                ?: throw IllegalStateException("acceptRemote() requires remote mode with peerUri")
+            val session = ensurePeerSession()
+            val remote =
+                remoteHeadHex?.let { KdbHash.fromHex(it) }
+                    ?: lastRemoteHead
+                    ?: session.remoteHead
+            val result = acceptRemoteChanges(runtime, session, namespaceId, remote, schema)
+            lastRemoteHead = result.head
+            branchActionResultJson(result)
+        }
+
+    /**
+     * Fork away from [remoteHeadHex]: rewind `main` to the common ancestor and set the write parent.
+     */
+    public fun rejectRemote(remoteHeadHex: String): Promise<String> =
+        scope.promise {
+            remotePeerUri
+                ?: throw IllegalStateException("rejectRemote() requires remote mode with peerUri")
+            val session = ensurePeerSession()
+            val remote = KdbHash.fromHex(remoteHeadHex)
+            val result = rejectRemoteChanges(runtime, session, namespaceId, remote, schema)
+            lastRemoteHead = runtime.dag.head()
+            branchActionResultJson(result)
+        }
+
+    public fun mergeBranches(
+        primaryBranch: String,
+        mergedBranch: String,
+    ): Promise<String> =
+        scope.promise {
+            val result =
+                embedMergeBranches(runtime, namespaceId, primaryBranch, mergedBranch, schema)
+            lastRemoteHead = result.head
+            branchActionResultJson(result)
+        }
 
     public fun put(json: String): Promise<String> =
         scope.promise {
@@ -97,9 +169,19 @@ public class KdbBrowserHandle internal constructor(
      * On disconnect or error, runs [sync] via peer sync once, then reconnects with backoff.
      */
     public fun subscribe(onEventJson: (String) -> Unit): Promise<Unit> =
+        subscribeWithOptions(onEventJson, applyDeltas = true)
+
+    /**
+     * @param applyDeltas When false, emit [DeltaReceived] without pulling commits (use [acceptRemote] / [rejectRemote]).
+     */
+    public fun subscribeWithOptions(
+        onEventJson: (String) -> Unit,
+        applyDeltas: Boolean = true,
+    ): Promise<Unit> =
         scope.promise {
             remotePeerUri
                 ?: throw IllegalStateException("subscribe() requires remote mode with peerUri")
+            streamApplyDeltas = applyDeltas
             subscribeWanted = true
             if (streamEventsJob?.isActive == true) return@promise
             startStreamSubscriptionLoop(onEventJson)
@@ -171,10 +253,12 @@ public class KdbBrowserHandle internal constructor(
                         else -> {}
                     }
                     val json = streamEventToJson(event) ?: return@collect
-                    if (event is StreamEvent.DeltaReceived) {
+                    if (event is StreamEvent.DeltaReceived && streamApplyDeltas) {
                         val peer = ensurePeerSession()
                         applyRemoteStreamDelta(runtime, peer, namespaceId, event.commitHash, schema)
                         lastRemoteHead = runtime.dag.head()
+                    } else if (event is StreamEvent.DeltaReceived) {
+                        lastRemoteHead = event.commitHash
                     }
                     onEventJson(json)
                     if (event is StreamEvent.Error) {

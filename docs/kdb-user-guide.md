@@ -529,6 +529,29 @@ await db.subscribe((e) => {
 });
 ```
 
+### Accept / reject remote changes (Phase 3)
+
+Review incoming commits before advancing `main`:
+
+```javascript
+// Optional: notify only, decide later
+await db.subscribeWithOptions((e) => console.log(e), false);
+
+const ev = JSON.parse(eventJson);
+if (ev.type === "DeltaReceived") {
+  const remoteHead = ev.commitHash;
+  // Inspect at that version:
+  const json = await db.getAtCommit(docId, remoteHead);
+  // Keep remote work:
+  await db.acceptRemote(remoteHead);
+  // Or fork away from it (rewind main, next put branches from ancestor):
+  await db.rejectRemote(remoteHead);
+  await db.put(updatedJson);
+}
+```
+
+APIs: `head()`, `getBaseVersion()`, `setBaseVersion(hex)`, `acceptRemote(remoteHead?)`, `rejectRemote(remoteHead)`, `mergeBranches("main", "incoming")`.
+
 ---
 
 ## Data layout (for inspect CLI)
