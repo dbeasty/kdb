@@ -2,6 +2,7 @@ package dev.kdb.query.hybrid
 
 import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitRef
+import dev.kdb.document.KdbOp
 import dev.kdb.schema.KdbSchema
 import dev.kdb.sql.ExplainResult
 import dev.kdb.transaction.DocumentLockManager
@@ -31,6 +32,11 @@ public data class HybridQueryRequest(
     val sessionCheckout: CheckoutHandle? = null,
     val writeSessionId: String? = null,
     val documentLocks: DocumentLockManager? = null,
+    /** When true, DML ops are passed to [bufferOps] instead of committing immediately. */
+    val deferCommit: Boolean = false,
+    /** Commit hash reported for deferred DML (typically the transaction base). */
+    val transactionBase: KdbHash? = null,
+    val bufferOps: (suspend (List<KdbOp>) -> Unit)? = null,
 )
 
 public data class HybridQueryResult(

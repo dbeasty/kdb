@@ -162,39 +162,42 @@ public class KdbRemoteConnection(
     override fun isReadOnly(): Boolean = readOnly
 
     override fun setAutoCommit(autoCommit: Boolean) {
+        if (this.autoCommit == autoCommit) return
+        blocking {
+            if (autoCommit && !this.autoCommit) {
+                execTransactionControl("COMMIT")
+            } else if (!autoCommit && this.autoCommit) {
+                execTransactionControl("BEGIN")
+            }
+        }
         this.autoCommit = autoCommit
     }
 
     override fun getAutoCommit(): Boolean = autoCommit
 
     override fun commit() {
-        blocking {
-            val reply =
-                rpc.request(
-                    WireMessage.TxCommit(
-                        WireHeader(WireMessageType.TX_COMMIT, KDB_WIRE_PROTOCOL_VERSION, 0, 0),
-                        namespace = url.namespaceId,
-                        sessionId = sessionId,
-                        transactionBytes = ByteArray(0),
-                    ),
-                )
-            when (reply) {
-                is WireMessage.ConflictReport -> throw SQLException("transaction conflict", "40001")
-                is WireMessage.SqlResult -> if (reply.error != null) throw SQLException(reply.error)
-                else -> throw SQLException("unexpected commit reply")
-            }
-        }
+        blocking { execTransactionControl("COMMIT") }
     }
 
     override fun rollback() {
-        blocking {
+        blocking { execTransactionControl("ROLLBACK") }
+    }
+
+    private suspend fun execTransactionControl(sql: String) {
+        val reply =
             rpc.request(
-                WireMessage.TxRollback(
-                    WireHeader(WireMessageType.TX_ROLLBACK, KDB_WIRE_PROTOCOL_VERSION, 0, 0),
+                WireMessage.SqlExec(
+                    WireHeader(WireMessageType.SQL_EXEC, KDB_WIRE_PROTOCOL_VERSION, 0, 0),
                     namespace = url.namespaceId,
                     sessionId = sessionId,
+                    sql = sql,
+                    parametersJson = null,
                 ),
             )
+        when (reply) {
+            is WireMessage.ConflictReport -> throw SQLException("transaction conflict", "40001")
+            is WireMessage.SqlResult -> if (reply.error != null) throw SQLException(reply.error)
+            else -> throw SQLException("unexpected transaction reply: ${reply.header.messageType}")
         }
     }
 

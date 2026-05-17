@@ -106,6 +106,10 @@ internal class DefaultSqlEngine(
             is SqlStatement.Insert,
             is SqlStatement.Delete,
             -> throw SqlPlanningException("DML must be executed via executeDml", sql)
+            is SqlStatement.BeginTransaction,
+            is SqlStatement.Commit,
+            is SqlStatement.Rollback,
+            -> throw SqlPlanningException("transaction control must be handled by the session host", sql)
         }
     }
 

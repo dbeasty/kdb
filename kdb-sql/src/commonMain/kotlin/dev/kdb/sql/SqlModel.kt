@@ -13,6 +13,9 @@ public sealed class SqlStatement {
     public data class Delete(val delete: DeleteStatement) : SqlStatement()
     public data class CreateIndex(val ddl: CreateIndexStatement) : SqlStatement()
     public data class DropIndex(val ddl: DropIndexStatement) : SqlStatement()
+    public data object BeginTransaction : SqlStatement()
+    public data object Commit : SqlStatement()
+    public data object Rollback : SqlStatement()
 }
 
 public data class UpdateStatement(

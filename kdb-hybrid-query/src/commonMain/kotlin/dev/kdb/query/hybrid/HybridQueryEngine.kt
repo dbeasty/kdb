@@ -108,13 +108,15 @@ internal class DefaultHybridQueryEngine(
             )
         if (isDmlStatement(stmt)) {
             val dml = sqlEngine.executeDml(parsed.sql, ctx.copy(atCommit = null))
-            acquireDmlLocks(dml.operations, request)
-            val commitHash =
-                try {
-                    commitDml(dml.operations, request)
-                } finally {
-                    releaseDmlLocks(dml.operations, request)
-                }
+            if (request.deferCommit) {
+                val buffer = request.bufferOps
+                    ?: throw IllegalStateException("deferCommit requires bufferOps")
+                buffer(dml.operations)
+                val base = request.transactionBase ?: dag.head()
+                val result = QueryResult(emptyList(), emptyList(), rowsAffected = dml.rowsAffected)
+                return HybridQueryResult(result, base, readOnly = false)
+            }
+            val commitHash = commitDml(dml.operations, request)
             val result = QueryResult(emptyList(), emptyList(), rowsAffected = dml.rowsAffected)
             return HybridQueryResult(result, commitHash, readOnly = false)
         }
@@ -144,28 +146,6 @@ internal class DefaultHybridQueryEngine(
         return sqlEngine.explain(parsed.sql, ctx)
     }
 
-    private suspend fun acquireDmlLocks(
-        operations: List<dev.kdb.document.KdbOp>,
-        request: HybridQueryRequest,
-    ) {
-        val locks = request.documentLocks ?: return
-        val sessionId = request.writeSessionId ?: return
-        for (docId in documentIdsIn(operations)) {
-            locks.tryAcquire(request.namespaceId, docId, sessionId)
-        }
-    }
-
-    private suspend fun releaseDmlLocks(
-        operations: List<dev.kdb.document.KdbOp>,
-        request: HybridQueryRequest,
-    ) {
-        val locks = request.documentLocks ?: return
-        val sessionId = request.writeSessionId ?: return
-        for (docId in documentIdsIn(operations)) {
-            locks.release(request.namespaceId, docId, sessionId)
-        }
-    }
-
     private suspend fun commitDml(
         operations: List<dev.kdb.document.KdbOp>,
         request: HybridQueryRequest,
@@ -184,28 +164,41 @@ internal class DefaultHybridQueryEngine(
                 timestamp = KdbTimestamp.now(),
                 authorNodeId = KdbUuid.random(),
             )
-        when (val result = txEngine.commit(tx, dag, storage, request.schema)) {
-            is TransactionResult.Success -> {
-                if (!request.schema.isNone) {
-                    indexManager.writer.applyCommit(
-                        result.commit,
-                        indexManager.registryFor(request.namespaceId),
-                        storage,
-                        request.schema,
-                    )
-                }
-                return result.commit.hash
+        val locks = request.documentLocks
+        val sessionId = request.writeSessionId
+        if (locks != null && sessionId != null) {
+            for (docId in documentIdsIn(operations)) {
+                locks.tryAcquire(request.namespaceId, docId, sessionId)
             }
-            is TransactionResult.Conflict ->
-                throw ConflictException(
-                    "transaction conflict: ${result.report.conflicts.size} operation(s)",
-                    result.report,
-                )
-            is TransactionResult.SchemaError ->
-                throw dev.kdb.sql.SqlPlanningException(
-                    "schema rejection: ${result.violations.size} violation(s)",
-                    "",
-                )
+        }
+        return try {
+            when (val result = txEngine.commit(tx, dag, storage, request.schema)) {
+                is TransactionResult.Success -> {
+                    if (!request.schema.isNone) {
+                        indexManager.writer.applyCommit(
+                            result.commit,
+                            indexManager.registryFor(request.namespaceId),
+                            storage,
+                            request.schema,
+                        )
+                    }
+                    result.commit.hash
+                }
+                is TransactionResult.Conflict ->
+                    throw ConflictException(
+                        "transaction conflict: ${result.report.conflicts.size} operation(s)",
+                        result.report,
+                    )
+                is TransactionResult.SchemaError ->
+                    throw dev.kdb.sql.SqlPlanningException(
+                        "schema rejection: ${result.violations.size} violation(s)",
+                        "",
+                    )
+            }
+        } finally {
+            if (locks != null && sessionId != null) {
+                locks.releaseAll(sessionId)
+            }
         }
     }
 

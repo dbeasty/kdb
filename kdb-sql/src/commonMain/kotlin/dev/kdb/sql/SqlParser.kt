@@ -17,6 +17,10 @@ internal class RecursiveDescentSqlParser : SqlParser {
         nextParamIndex = 0
         skipWs()
         return when {
+            matchKeyword("BEGIN") -> parseBegin()
+            matchKeyword("START") -> parseStartTransaction()
+            matchKeyword("COMMIT") -> parseCommit()
+            matchKeyword("ROLLBACK") -> parseRollback()
             matchKeyword("CREATE") -> parseCreate()
             matchKeyword("DROP") -> parseDrop()
             matchKeyword("INSERT") -> SqlStatement.Insert(parseInsert())
@@ -25,6 +29,26 @@ internal class RecursiveDescentSqlParser : SqlParser {
             matchKeyword("SELECT") -> SqlStatement.Select(parseSelectQuery())
             else -> throw parseError("expected SQL statement")
         }
+    }
+
+    private fun parseBegin(): SqlStatement {
+        if (matchKeyword("WORK")) { /* optional */ }
+        return SqlStatement.BeginTransaction
+    }
+
+    private fun parseStartTransaction(): SqlStatement {
+        expectKeyword("TRANSACTION")
+        return SqlStatement.BeginTransaction
+    }
+
+    private fun parseCommit(): SqlStatement {
+        if (matchKeyword("WORK")) { /* optional */ }
+        return SqlStatement.Commit
+    }
+
+    private fun parseRollback(): SqlStatement {
+        if (matchKeyword("WORK")) { /* optional */ }
+        return SqlStatement.Rollback
     }
 
     private fun parseCreate(): SqlStatement {

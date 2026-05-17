@@ -63,7 +63,7 @@ public class KdbDatabaseMetaData(
 
     override fun getIdentifierQuoteString(): String = "\""
 
-    override fun getSQLKeywords(): String = "AT,VERSION,COMMIT,TIME"
+    override fun getSQLKeywords(): String = "AT,BEGIN,ROLLBACK,START,TRANSACTION,VERSION,COMMIT,TIME,WORK"
 
     override fun getNumericFunctions(): String = ""
 

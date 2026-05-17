@@ -19,7 +19,7 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 | Peer sync (in-memory hub + TCP loopback) | Implemented (`:kdb-peer-sync`, `:kdb-transport-tcp`) |
 | Integration test suite | `:kdb-integration` |
 | **JDBC** — `jdbc:kdb://…` network URLs | Parsed but not implemented (`SQLFeatureNotSupportedException`) |
-| JDBC DML (`INSERT` / `UPDATE` / `DELETE`) | Implemented (embedded memory/file); auto-commit per statement |
+| JDBC DML (`INSERT` / `UPDATE` / `DELETE`) | Implemented (embedded memory/file); auto-commit per statement; multi-statement transactions on network SQL (`BEGIN` … `COMMIT`) |
 | CLI persistence (`--data-dir`) | `put` / `get` / `query` survive separate CLI invocations (delta log + SERVER engine) |
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
@@ -188,12 +188,57 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 | Area | Details |
 |------|---------|
 | **Driver** | `dev.kdb.jdbc.KdbDriver`; registers with `DriverManager`; `acceptsURL("jdbc:kdb:…")` |
-| **Connection** | `getCatalog()`, `setReadOnly`, `close`, `isValid`, `getMetaData`, `setAutoCommit` / `commit` (no-op in v1 memory mode) |
+| **Connection** | `getCatalog()`, `setReadOnly`, `close`, `isValid`, `getMetaData`, `setAutoCommit` / `commit` / `rollback` (embedded memory: no-op; network SQL: `BEGIN` / `COMMIT` / `ROLLBACK`) |
 | **Statement** | `executeQuery` for `SELECT`; `FROM table` auto-qualified to `catalog/table` |
 | **PreparedStatement** | `setString`, `setInt`/`setLong`/`setFloat`/`setDouble`, `setBoolean`, `setNull`, `setObject`; `executeQuery` |
 | **ResultSet** | Forward-only; `next`, `getString`/`getLong`/`getInt`/`getBoolean`/`getDouble`/`getObject` by index or column label; `findColumn`, `getMetaData` |
-| **SQL** | `SELECT` with `WHERE` on schema/indexed fields; `SELECT _doc …`; `AT VERSION` / `AT COMMIT` / `AT TIME` (parsed by hybrid engine when history exists) |
-| **DatabaseMetaData** | Product name `KDB`; `getTables`, `getColumns` (`kdb_id`, `_doc`), `getCatalogs`, `getSchemas`; keywords `AT`, `VERSION`, `COMMIT`, `TIME`; functions `kdb_json_get`, `kdb_json_set` |
+| **SQL** | `SELECT` with `WHERE` on schema/indexed fields; `SELECT _doc …`; `AT VERSION` / `AT COMMIT` / `AT TIME`; write transactions on network SQL — see [SQL transactions](#sql-transactions) |
+| **DatabaseMetaData** | Product name `KDB`; `getTables`, `getColumns` (`kdb_id`, `_doc`), `getCatalogs`, `getSchemas`; keywords include `BEGIN`, `COMMIT`, `ROLLBACK`, `START`, `TRANSACTION`, `AT`, `VERSION`, `TIME`, `WORK`; functions `kdb_json_get`, `kdb_json_set` |
+
+### SQL transactions
+
+Multi-statement write transactions are supported on **network SQL** sessions (`jdbc:kdb://…` with the SQL wire hub). Each JDBC connection gets a server-side session; `BEGIN` buffers `INSERT` / `UPDATE` / `DELETE` until `COMMIT` or `ROLLBACK`. Other clients do not see buffered writes until commit.
+
+**Not supported in v1:** embedded `jdbc:kdb:memory://…` and `jdbc:kdb:file://…` (each DML still auto-commits; `Connection.commit()` is a no-op there). `SAVEPOINT`, `SET TRANSACTION` as SQL, and DDL inside an open transaction (`CREATE INDEX`, `CREATE VIRTUAL VIEW`, etc.) are rejected.
+
+**SQL syntax:**
+
+```sql
+BEGIN;
+-- or: START TRANSACTION;
+
+UPDATE users SET name = 'Alice' WHERE userId = 'u1';
+INSERT INTO users (_doc) VALUES ('{"userId":"u2","name":"Bob"}');
+DELETE FROM users WHERE userId = 'u3';
+
+COMMIT;
+-- or: ROLLBACK;
+```
+
+Optional `WORK` after `BEGIN`, `COMMIT`, or `ROLLBACK` is accepted (`BEGIN WORK`, `COMMIT WORK`, …).
+
+**JDBC (network connection):**
+
+```java
+conn.setAutoCommit(false);   // sends BEGIN
+stmt.executeUpdate("UPDATE users SET name = 'Alice' WHERE userId = 'u1'");
+stmt.executeUpdate("UPDATE users SET status = 'active' WHERE userId = 'u1'");
+conn.commit();               // sends COMMIT (one DAG commit for both updates)
+// conn.rollback();          // sends ROLLBACK (discards pending ops, releases locks)
+conn.setAutoCommit(true);    // sends COMMIT if a transaction is still open
+```
+
+**Semantics:**
+
+| Topic | Behaviour |
+|-------|-----------|
+| **Visibility** | Buffered DML is visible only to the same session until `COMMIT`. |
+| **Atomicity** | All buffered ops succeed or fail together on `COMMIT` (git-style transaction engine). |
+| **Conflicts** | Optimistic detection at commit (`STRICT` policy); overlapping writers get a conflict report. |
+| **Locks** | Pessimistic exclusive lock per document for the session from first buffered write until commit/rollback. |
+| **Reads** | `SELECT` during a transaction uses the session read consistency (`READ_COMMITTED` default; `SNAPSHOT` when isolation maps to repeatable read). Historical reads still use `AT COMMIT` / `AT VERSION` / `AT TIME` on the `SELECT`. |
+
+See also [component 25 — multi-client sessions](kdb-spec-layer8-component25-multi-client-sessions.md).
 
 ### What does not work (throws)
 
@@ -395,7 +440,7 @@ await db.close();
 | `fields[].indexed` | boolean | optional; required for indexed `WHERE` |
 | `fields[].unique` | boolean | optional |
 
-**Concurrency:** The network SQL server uses pessimistic **document write locks** per session (exclusive per document until commit/rollback) plus optimistic conflict detection at commit. `JsonPath` and virtual-view registries are synchronized for multi-threaded JDBC. Details: [component 25](kdb-spec-layer8-component25-multi-client-sessions.md).
+**Concurrency:** The network SQL server uses pessimistic **document write locks** per session (exclusive per document until commit/rollback) plus optimistic conflict detection at commit. Multi-statement SQL transactions use the same model; see [SQL transactions](#sql-transactions). `JsonPath` and virtual-view registries are synchronized for multi-threaded JDBC. Details: [component 25](kdb-spec-layer8-component25-multi-client-sessions.md).
 
 **SQL limits (v1):** hybrid `SELECT` and single-table DML (`INSERT`/`UPDATE`/`DELETE`) work in embedded runtimes. `SELECT _doc` works without a schema; indexed predicates need a non-empty schema. `BETWEEN`, `IS NULL`, `ORDER BY`, `LIMIT`/`OFFSET`, and prepared `?` parameters are supported. `ORDER BY similarity(col, 'text')` requires a text-embedding path (not yet available). No `JOIN`s or aggregates.
 

@@ -10,6 +10,10 @@ import dev.kdb.error.DocumentLockedException
 import dev.kdb.query.hybrid.HybridQueryRequest
 import dev.kdb.query.hybrid.ReadConsistency
 import dev.kdb.sql.SqlCell
+import dev.kdb.sql.defaultSqlParser
+import dev.kdb.sql.isDdlStatement
+import dev.kdb.sql.isTransactionControlStatement
+import dev.kdb.sql.SqlStatement
 import dev.kdb.transaction.TransactionBuilder
 import dev.kdb.transaction.TransactionResult
 import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
@@ -83,11 +87,19 @@ public class SqlWireHost(
         )
     }
 
-    private suspend fun handleSqlExec(msg: WireMessage.SqlExec): WireMessage.SqlResult {
+    private suspend fun handleSqlExec(msg: WireMessage.SqlExec): WireMessage {
         val session =
             sessions.get(msg.sessionId)
                 ?: return sqlError(msg, "unknown session: ${msg.sessionId}")
+        val parsed = defaultSqlParser().parse(msg.sql.trim())
+        if (isTransactionControlStatement(parsed)) {
+            return handleTransactionControlSql(msg, session, parsed)
+        }
+        if (!session.autoCommit && isDdlStatement(parsed)) {
+            return sqlError(msg, "DDL not allowed inside a transaction")
+        }
         return try {
+            val deferCommit = !session.autoCommit
             val result =
                 server.runtime.hybrid.execute(
                     msg.sql,
@@ -99,6 +111,16 @@ public class SqlWireHost(
                         sessionCheckout = session.sessionCheckout,
                         writeSessionId = session.id.value,
                         documentLocks = server.documentLocks,
+                        deferCommit = deferCommit,
+                        transactionBase = if (deferCommit) session.baseVersion else null,
+                        bufferOps =
+                            if (deferCommit) {
+                                { ops ->
+                                    appendPendingOps(sessions.pendingBuilder(session), ops)
+                                }
+                            } else {
+                                null
+                            },
                     ),
                 )
             val json = result.toQueryResultJson()
@@ -118,22 +140,73 @@ public class SqlWireHost(
         }
     }
 
+    private suspend fun handleTransactionControlSql(
+        msg: WireMessage.SqlExec,
+        session: KdbSession,
+        stmt: SqlStatement,
+    ): WireMessage =
+        when (stmt) {
+            SqlStatement.BeginTransaction ->
+                when {
+                    session.pending != null ->
+                        sqlError(msg, "transaction already in progress")
+                    !session.autoCommit ->
+                        sqlSuccess(
+                            msg,
+                            session,
+                            resolvedCommitHex = session.baseVersion.toHex(),
+                        )
+                    else -> {
+                        session.autoCommit = false
+                        sqlSuccess(
+                            msg,
+                            session,
+                            resolvedCommitHex = session.baseVersion.toHex(),
+                        )
+                    }
+                }
+            SqlStatement.Commit ->
+                commitSession(
+                    correlationId = msg.header.correlationId,
+                    namespace = msg.namespace,
+                    session = session,
+                ) { err -> sqlError(msg, err) }
+            SqlStatement.Rollback -> {
+                rollbackSession(session)
+                sqlSuccess(
+                    msg,
+                    session,
+                    resolvedCommitHex = server.runtime.dag.head().toHex(),
+                )
+            }
+            else -> sqlError(msg, "unsupported transaction statement")
+        }
+
     private suspend fun handleTxCommit(msg: WireMessage.TxCommit): WireMessage {
         val session =
             sessions.get(msg.sessionId)
                 ?: return sqlError(msg, "unknown session: ${msg.sessionId}")
-        return try {
+        if (msg.transactionBytes.isNotEmpty()) {
+            return commitEncodedTransaction(msg, session)
+        }
+        return commitSession(
+            correlationId = msg.header.correlationId,
+            namespace = msg.namespace,
+            session = session,
+        ) { err -> sqlError(msg, err) }
+    }
+
+    private suspend fun commitEncodedTransaction(
+        msg: WireMessage.TxCommit,
+        session: KdbSession,
+    ): WireMessage =
+        try {
+            val tx = TransactionWireCodec.decode(msg.transactionBytes)
             val effective =
-                if (msg.transactionBytes.isEmpty()) {
-                    session.pending?.build()
-                        ?: return sqlError(msg, "no pending transaction to commit")
+                if (tx.operations.isEmpty() && session.pending != null) {
+                    session.pending!!.build()
                 } else {
-                    val tx = TransactionWireCodec.decode(msg.transactionBytes)
-                    if (tx.operations.isEmpty() && session.pending != null) {
-                        session.pending!!.build()
-                    } else {
-                        tx
-                    }
+                    tx
                 }
             val commit =
                 server.commit(
@@ -141,12 +214,7 @@ public class SqlWireHost(
                     effective,
                     sessionId = session.id.value,
                 )
-            sessions.clearPending(session)
-            server.documentLocks.releaseAll(session.id.value)
-            session.baseVersion = commit.hash
-            if (session.readConsistency == ReadConsistency.SNAPSHOT) {
-                session.readPin = commit.hash
-            }
+            finishCommittedSession(session, commit.hash, effective.operations.size)
             WireMessage.SqlResult(
                 header(msg.header.correlationId, WireMessageType.SQL_RESULT),
                 namespace = msg.namespace,
@@ -158,26 +226,89 @@ public class SqlWireHost(
                 readOnly = false,
             )
         } catch (e: ConflictException) {
-            server.documentLocks.releaseAll(session.id.value)
+            abortSessionAfterFailedCommit(session)
             WireMessage.ConflictReport(
                 header(msg.header.correlationId, WireMessageType.CONFLICT_REPORT),
                 namespace = msg.namespace,
                 reportBytes = encodeConflictReport(e.report),
             )
         } catch (e: DocumentLockedException) {
-            server.documentLocks.releaseAll(session.id.value)
+            abortSessionAfterFailedCommit(session)
             sqlError(msg, e.message ?: "document locked")
         } catch (e: Throwable) {
-            server.documentLocks.releaseAll(session.id.value)
+            abortSessionAfterFailedCommit(session)
             sqlError(msg, e.message ?: e.toString())
         }
+
+    private suspend fun commitSession(
+        correlationId: Int,
+        namespace: String,
+        session: KdbSession,
+        onError: (String) -> WireMessage,
+    ): WireMessage =
+        try {
+            val effective =
+                session.pending?.build()
+                    ?: return onError("no pending transaction to commit")
+            val commit =
+                server.commit(
+                    session.namespaceId,
+                    effective,
+                    sessionId = session.id.value,
+                )
+            finishCommittedSession(session, commit.hash, effective.operations.size)
+            WireMessage.SqlResult(
+                header(correlationId, WireMessageType.SQL_RESULT),
+                namespace = namespace,
+                sessionId = session.id.value,
+                columns = emptyList(),
+                rows = emptyList(),
+                rowsAffected = effective.operations.size,
+                resolvedCommitHex = commit.hash.toHex(),
+                readOnly = false,
+            )
+        } catch (e: ConflictException) {
+            abortSessionAfterFailedCommit(session)
+            WireMessage.ConflictReport(
+                header(correlationId, WireMessageType.CONFLICT_REPORT),
+                namespace = namespace,
+                reportBytes = encodeConflictReport(e.report),
+            )
+        } catch (e: DocumentLockedException) {
+            abortSessionAfterFailedCommit(session)
+            onError(e.message ?: "document locked")
+        } catch (e: Throwable) {
+            abortSessionAfterFailedCommit(session)
+            onError(e.message ?: e.toString())
+        }
+
+    private suspend fun finishCommittedSession(
+        session: KdbSession,
+        commitHash: KdbHash,
+        @Suppress("UNUSED_PARAMETER") rowsAffected: Int,
+    ) {
+        sessions.clearPending(session)
+        server.documentLocks.releaseAll(session.id.value)
+        session.baseVersion = commitHash
+        if (session.readConsistency == ReadConsistency.SNAPSHOT) {
+            session.readPin = commitHash
+        }
+    }
+
+    private suspend fun abortSessionAfterFailedCommit(session: KdbSession) {
+        server.documentLocks.releaseAll(session.id.value)
+        sessions.clearPending(session)
+    }
+
+    private suspend fun rollbackSession(session: KdbSession) {
+        server.documentLocks.releaseAll(session.id.value)
+        sessions.clearPending(session)
     }
 
     private suspend fun handleTxRollback(msg: WireMessage.TxRollback): WireMessage.SqlResult {
         val session = sessions.get(msg.sessionId)
         if (session != null) {
-            server.documentLocks.releaseAll(session.id.value)
-            sessions.clearPending(session)
+            rollbackSession(session)
         }
         return WireMessage.SqlResult(
             header(msg.header.correlationId, WireMessageType.SQL_RESULT),
@@ -190,6 +321,23 @@ public class SqlWireHost(
             readOnly = false,
         )
     }
+
+    private fun sqlSuccess(
+        msg: WireMessage.SqlExec,
+        session: KdbSession,
+        resolvedCommitHex: String,
+        rowsAffected: Int = 0,
+    ): WireMessage.SqlResult =
+        WireMessage.SqlResult(
+            header(msg.header.correlationId, WireMessageType.SQL_RESULT),
+            namespace = msg.namespace,
+            sessionId = session.id.value,
+            columns = emptyList(),
+            rows = emptyList(),
+            rowsAffected = rowsAffected,
+            resolvedCommitHex = resolvedCommitHex,
+            readOnly = false,
+        )
 
     private suspend fun handleTransactionReplay(msg: WireMessage.TransactionReplay): WireMessage {
         val tx = TransactionWireCodec.decode(msg.transactionBytes)

@@ -44,6 +44,10 @@ public fun statementParameterCount(stmt: SqlStatement): Int {
             is SqlStatement.Delete -> listOfNotNull(stmt.delete.where)
             is SqlStatement.CreateIndex -> emptyList()
             is SqlStatement.DropIndex -> emptyList()
+            is SqlStatement.BeginTransaction,
+            is SqlStatement.Commit,
+            is SqlStatement.Rollback,
+            -> emptyList()
         }
     val maxIdx = exprs.maxOfOrNull { maxParameterIndex(it) } ?: -1
     return maxIdx + 1
@@ -64,3 +68,14 @@ internal fun recomposeAnd(parts: List<SqlExpr>): SqlExpr? {
 
 public fun isDmlStatement(stmt: SqlStatement): Boolean =
     stmt is SqlStatement.Update || stmt is SqlStatement.Insert || stmt is SqlStatement.Delete
+
+public fun isTransactionControlStatement(stmt: SqlStatement): Boolean =
+    stmt is SqlStatement.BeginTransaction ||
+        stmt is SqlStatement.Commit ||
+        stmt is SqlStatement.Rollback
+
+public fun isDdlStatement(stmt: SqlStatement): Boolean =
+    stmt is SqlStatement.CreateVirtualView ||
+        stmt is SqlStatement.DropVirtualView ||
+        stmt is SqlStatement.CreateIndex ||
+        stmt is SqlStatement.DropIndex
