@@ -112,7 +112,10 @@ private suspend fun materializeSingleCommit(
             is KdbOp.FileWrite, is KdbOp.SchemaMigration -> {}
         }
     }
-    runtime.storage.commitTree(namespaceId, parentTree)
+    val tree = runtime.storage.commitTree(namespaceId, parentTree)
+    check(tree.treeHash == commit.documentTreeHash) {
+        "materialized tree ${tree.treeHash.toHex()} != commit tree ${commit.documentTreeHash.toHex()}"
+    }
     if (!schema.isNone) {
         runtime.indexManager.writer.applyCommit(
             commit,
@@ -153,9 +156,9 @@ public suspend fun getJson(
     docId: String,
 ): String {
     val id = KdbUuid.fromString(docId)
-    val head = runtime.dag.head()
+    val commit = runtime.dag.getCommitOrThrow(runtime.dag.head())
     val doc =
-        runtime.storage.getDocument(namespaceId, id, head)
+        runtime.storage.getDocument(namespaceId, id, commit.documentTreeHash)
             ?: throw IllegalArgumentException("document not found: $docId")
     return doc.json
 }

@@ -36,6 +36,21 @@ public data class KdbFeatures(
             } else {
                 null
             }
+
+        /** Stream coordinator URI derived from peer listen URI when peer sync is enabled. */
+        public fun streamListenUri(features: KdbFeatures): String? =
+            peerListenUri(features)?.let { peer ->
+                val pathEnd = peer.indexOf('?')
+                val base = if (pathEnd >= 0) peer.substring(0, pathEnd) else peer
+                val query = if (pathEnd >= 0) peer.substring(pathEnd) else ""
+                val streamBase =
+                    when {
+                        base.endsWith("/kdb") -> base + "/stream"
+                        base.endsWith("/") -> base + "kdb/stream"
+                        else -> base.trimEnd('/') + "/stream"
+                    }
+                streamBase + query
+            }
     }
 }
 

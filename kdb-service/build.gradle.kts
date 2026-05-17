@@ -3,6 +3,7 @@ plugins {
 }
 
 dependencies {
+    implementation(project(":kdb-codec"))
     implementation(project(":kdb-auth"))
     implementation(project(":kdb-auth-static"))
     implementation(project(":kdb-config"))
@@ -11,6 +12,7 @@ dependencies {
     implementation(project(":kdb-server"))
     implementation(project(":kdb-jdbc"))
     implementation(project(":kdb-peer-sync"))
+    implementation(project(":kdb-stream"))
     implementation(project(":kdb-dag"))
     implementation(project(":kdb-schema"))
     implementation(project(":kdb-storage"))

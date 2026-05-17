@@ -4,6 +4,7 @@ plugins {
 
 dependencies {
     testImplementation(project(":kdb-codec"))
+    testImplementation(project(":kdb-index"))
     testImplementation(project(":kdb-dag"))
     testImplementation(project(":kdb-document"))
     testImplementation(project(":kdb-schema"))

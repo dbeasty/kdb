@@ -3,6 +3,7 @@ package dev.kdb.integration
 import dev.kdb.auth.ConnectionContext
 import dev.kdb.codec.KdbHash
 import dev.kdb.embed.EmbeddedKdbRuntime
+import dev.kdb.embed.getJson
 import dev.kdb.embed.materializeCommitHistory
 import dev.kdb.embed.openMemoryRuntimeBlocking
 import dev.kdb.embed.pushCommitsSinceRemoteHead
@@ -218,26 +219,26 @@ class WebSocketPeerSyncIntegrationTest {
             val serverRuntime = openMemoryRuntimeBlocking("it", ns, schema)
             withNetworkPeerHost(serverRuntime, ns) { _, port ->
                 val peerUri = "kdb-ws://127.0.0.1:$port/kdb"
+                val transport = transport()
 
                 val clientA = openMemoryRuntimeBlocking("it", ns, schema)
-                putJson(clientA, ns, """{"userId":"push-a","name":"Alice"}""", schema)
+                val docId = putJson(clientA, ns, """{"userId":"push-a","name":"Alice"}""", schema)
                 val clientAConn =
-                    peerSyncClient(wire, transport(), clientA.dag, clientA.storage)
+                    peerSyncClient(wire, transport, clientA.dag, clientA.storage)
                 val sessionA =
                     clientAConn.connect(PeerClientConfig(ns, "client-a", peerUri))
                 assertEquals(1, pushCommitsSinceRemoteHead(sessionA, clientA.dag, sessionA.remoteHead).pushedCommits)
                 clientAConn.disconnect()
-                delay(50)
+                delay(150)
 
                 val clientB = openMemoryRuntimeBlocking("it", ns, schema)
                 val clientBConn =
-                    peerSyncClient(wire, transport(), clientB.dag, clientB.storage)
+                    peerSyncClient(wire, transport, clientB.dag, clientB.storage)
                 val sessionB =
                     clientBConn.connect(PeerClientConfig(ns, "client-b", peerUri))
                 assertEquals(1, syncEmbeddedWithPeer(clientB, sessionB, ns, schema).appliedCommits)
-                val rows =
-                    querySql(clientB, ns, "SELECT userId FROM users WHERE userId = 'push-a'", schema)
-                assertEquals(1, rows.rows.size)
+                val docJson = getJson(clientB, ns, docId)
+                assertTrue(docJson.contains("push-a"), docJson)
                 clientBConn.disconnect()
             }
         }

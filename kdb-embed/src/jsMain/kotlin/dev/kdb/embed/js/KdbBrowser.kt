@@ -3,6 +3,7 @@ package dev.kdb.embed.js
 import dev.kdb.codec.KdbHash
 import dev.kdb.embed.EmbedSchemaDto
 import dev.kdb.embed.EmbeddedKdbRuntime
+import dev.kdb.embed.applyRemoteStreamDelta
 import dev.kdb.embed.getJson
 import dev.kdb.embed.pushCommitsSinceRemoteHead
 import dev.kdb.embed.putJson
@@ -15,13 +16,19 @@ import dev.kdb.embed.toKdbSchema
 import dev.kdb.peersync.PeerClientConfig
 import dev.kdb.peersync.peerSyncClient
 import dev.kdb.schema.KdbSchema
-import dev.kdb.schema.isNone
+import dev.kdb.stream.StreamClientMode
+import dev.kdb.stream.StreamEvent
+import dev.kdb.stream.StreamSubscriberConfig
+import dev.kdb.stream.streamSubscriber
+import dev.kdb.stream.streamUriFromPeerUri
 import dev.kdb.transport.ws.JsWebSocketWireTransport
 import dev.kdb.wire.defaultWireCodec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.promise
 import kotlinx.serialization.json.Json
 import kotlin.js.Promise
@@ -38,6 +45,8 @@ public class KdbBrowserHandle internal constructor(
     private var peerClient: dev.kdb.peersync.PeerSyncClient? = null
     private var peerSession: dev.kdb.peersync.PeerSession? = null
     private var lastRemoteHead: KdbHash? = null
+    private var streamSub: dev.kdb.stream.StreamSubscriber? = null
+    private var streamEventsJob: Job? = null
 
     public fun put(json: String): Promise<String> =
         scope.promise {
@@ -71,8 +80,51 @@ public class KdbBrowserHandle internal constructor(
             """{"appliedCommits":${result.appliedCommits},"pushedCommits":${result.pushedCommits},"head":"${result.finalHead.toHex()}"}"""
         }
 
+    /**
+     * Subscribe to server commit notifications over stream mode.
+     * [onEventJson] receives JSON strings, e.g. `{"type":"DeltaReceived","commitHash":"..."}`.
+     */
+    public fun subscribe(onEventJson: (String) -> Unit): Promise<Unit> =
+        scope.promise {
+            val peerUri =
+                remotePeerUri
+                    ?: throw IllegalStateException("subscribe() requires remote mode with peerUri")
+            if (streamEventsJob != null) return@promise
+            val session = ensurePeerSession()
+            val resumeFrom = lastRemoteHead ?: session.remoteHead
+            val wire = defaultWireCodec()
+            val transport = JsWebSocketWireTransport()
+            val sub = streamSubscriber(wire, transport, runtime.indexManager)
+            streamSub = sub
+            sub.connect(
+                StreamSubscriberConfig(
+                    namespaceId = namespaceId,
+                    nodeId = "$nodeId-stream",
+                    mode = StreamClientMode.READ_ONLY,
+                    coordinatorUri = streamUriFromPeerUri(peerUri),
+                    resumeFrom = resumeFrom,
+                ),
+            )
+            streamEventsJob =
+                scope.launch {
+                    sub.events.collect { event ->
+                        val json = streamEventToJson(event) ?: return@collect
+                        if (event is StreamEvent.DeltaReceived) {
+                            val session = ensurePeerSession()
+                            applyRemoteStreamDelta(runtime, session, namespaceId, event.commitHash, schema)
+                            lastRemoteHead = runtime.dag.head()
+                        }
+                        onEventJson(json)
+                    }
+                }
+        }
+
     public fun close(): Promise<Unit> =
         scope.promise {
+            streamEventsJob?.cancel()
+            streamEventsJob = null
+            streamSub?.disconnect()
+            streamSub = null
             peerSession = null
             lastRemoteHead = null
             peerClient?.disconnect()
@@ -100,6 +152,23 @@ public class KdbBrowserHandle internal constructor(
         lastRemoteHead = session.remoteHead
         return session
     }
+
+    private fun streamEventToJson(event: StreamEvent): String? =
+        when (event) {
+            is StreamEvent.Connected ->
+                """{"type":"Connected"}"""
+            is StreamEvent.DeltaReceived ->
+                """{"type":"DeltaReceived","commitHash":"${event.commitHash.toHex()}","hintCount":${event.hintCount}}"""
+            is StreamEvent.PositionUpdated ->
+                """{"type":"PositionUpdated","commitHash":"${event.commitHash.toHex()}"}"""
+            is StreamEvent.Disconnected ->
+                """{"type":"Disconnected"}"""
+            is StreamEvent.Error ->
+                """{"type":"Error","message":"${event.throwable.message?.replace("\"", "'") ?: "unknown"}"}"""
+            is StreamEvent.CompactionWarning,
+            is StreamEvent.IceArchived,
+            -> null
+        }
 }
 
 @JsExport

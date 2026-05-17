@@ -7,6 +7,9 @@ import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.embed.materializeCommit
 import dev.kdb.embed.openMemoryRuntimeBlocking
 import dev.kdb.embed.runPeerSyncOverWebSocketListen
+import dev.kdb.embed.runStreamOverWebSocketListen
+import dev.kdb.stream.StreamBroadcastHub
+import dev.kdb.stream.publishedCommitFrom
 import dev.kdb.auth.AllowAllAuth
 import dev.kdb.auth.static.staticAuthEngineFromFile
 import dev.kdb.server.runSqlWireListen
@@ -30,21 +33,32 @@ public fun main(args: Array<String>) {
     val product = config.productConfig
     val auth = product.authConfigPath?.let { staticAuthEngineFromFile(it) } ?: AllowAllAuth
     val peerListenUri = KdbFeatures.peerListenUri(product.features)
+    val streamListenUri = KdbFeatures.streamListenUri(product.features)
     val sqlListenUri = KdbFeatures.sqlListenUri(product.features)
+    val streamHub =
+        StreamBroadcastHub(
+            wire = wire,
+            namespaceId = config.namespace,
+            headProvider = { runtime.dag.head() },
+        )
     val peerHostConfig =
         PeerHostConfig(
             namespaceId = config.namespace,
             nodeId = "kdb-service",
             transportHub = "ws",
-            materializeCommit = { commit -> materializeCommit(runtime, config.namespace, commit) },
+            materializeCommit = { commit ->
+                materializeCommit(runtime, config.namespace, commit)
+                streamHub.publish(publishedCommitFrom(commit))
+            },
         )
     val peerHostFactory = peerSyncHostFactory(wire, runtime.dag, runtime.storage, peerHostConfig, auth)
     val sqlHostFactory = sqlWireHostFactory(wire, serverRuntime, config.namespace, auth)
     val transportOptions = transportOptionsForProduct(product.tls)
     val transport = defaultWebSocketWireTransport()
     val peerStatus = peerListenUri ?: "disabled"
+    val streamStatus = streamListenUri ?: "disabled"
     val sqlStatus = sqlListenUri ?: "disabled"
-    println("KDB service peer=$peerStatus sql=$sqlStatus namespace=${config.namespace}")
+    println("KDB service peer=$peerStatus stream=$streamStatus sql=$sqlStatus namespace=${config.namespace}")
     runBlocking {
         if (peerListenUri != null) {
             launch {
@@ -52,6 +66,16 @@ public fun main(args: Array<String>) {
                     transport,
                     peerListenUri,
                     peerHostFactory,
+                    transportOptions = transportOptions,
+                )
+            }
+        }
+        if (streamListenUri != null) {
+            launch {
+                runStreamOverWebSocketListen(
+                    transport,
+                    streamListenUri,
+                    streamHub,
                     transportOptions = transportOptions,
                 )
             }
