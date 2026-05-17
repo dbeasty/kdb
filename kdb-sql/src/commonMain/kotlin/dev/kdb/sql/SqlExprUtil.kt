@@ -44,13 +44,16 @@ public fun statementParameterCount(stmt: SqlStatement): Int {
                 val u = stmt.update
                 listOfNotNull(u.where) + u.assignments.map { it.expr }
             }
-            is SqlStatement.Insert -> stmt.insert.values
+            is SqlStatement.Insert -> stmt.insert.rows.flatten()
             is SqlStatement.Delete -> listOfNotNull(stmt.delete.where)
             is SqlStatement.CreateIndex -> emptyList()
             is SqlStatement.DropIndex -> emptyList()
             is SqlStatement.BeginTransaction,
             is SqlStatement.Commit,
             is SqlStatement.Rollback,
+            is SqlStatement.CreateTable,
+            is SqlStatement.AlterTableAddColumn,
+            is SqlStatement.DropTable,
             -> emptyList()
         }
     val maxIdx = exprs.maxOfOrNull { maxParameterIndex(it) } ?: -1
@@ -82,4 +85,7 @@ public fun isDdlStatement(stmt: SqlStatement): Boolean =
     stmt is SqlStatement.CreateVirtualView ||
         stmt is SqlStatement.DropVirtualView ||
         stmt is SqlStatement.CreateIndex ||
-        stmt is SqlStatement.DropIndex
+        stmt is SqlStatement.DropIndex ||
+        stmt is SqlStatement.CreateTable ||
+        stmt is SqlStatement.AlterTableAddColumn ||
+        stmt is SqlStatement.DropTable

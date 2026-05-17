@@ -43,6 +43,7 @@ public data class HybridQueryResult(
     val result: QueryResult,
     val resolvedCommit: KdbHash,
     val readOnly: Boolean,
+    val appliedSchema: dev.kdb.schema.KdbSchema? = null,
 )
 
 public data class CheckoutHandle(

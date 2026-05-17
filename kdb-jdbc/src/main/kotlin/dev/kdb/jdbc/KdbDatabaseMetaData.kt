@@ -116,7 +116,7 @@ public class KdbDatabaseMetaData(
 
     override fun supportsMinimumSQLGrammar(): Boolean = true
 
-    override fun supportsCoreSQLGrammar(): Boolean = false
+    override fun supportsCoreSQLGrammar(): Boolean = true
 
     override fun supportsExtendedSQLGrammar(): Boolean = false
 
@@ -410,7 +410,7 @@ public class KdbDatabaseMetaData(
 
     override fun insertsAreDetected(type: Int): Boolean = false
 
-    override fun supportsBatchUpdates(): Boolean = false
+    override fun supportsBatchUpdates(): Boolean = true
 
     override fun getUDTs(
         catalog: String?,

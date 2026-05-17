@@ -49,19 +49,22 @@ internal class DmlExecutor(
         insert: InsertStatement,
         context: QueryContext,
     ): List<KdbOp> {
-        val id = KdbUuid.random()
         val fields = insert.columns
-        val values = insert.values
-        if (fields.size != values.size) {
-            throw SqlPlanningException("column count does not match value count", "")
+        val ops = mutableListOf<KdbOp>()
+        for (values in insert.rows) {
+            if (fields.size != values.size) {
+                throw SqlPlanningException("column count does not match value count", "")
+            }
+            val id = KdbUuid.random()
+            var json = "{}"
+            for (i in fields.indices) {
+                val cell = evalValueExpr(values[i], null, context) ?: SqlCell.Null
+                json = kdbJsonSet(json, "$.${fields[i]}", cellToJsonValue(cell))
+            }
+            validateJson(id, json, context.schema)
+            ops += KdbOp.Write(id, json)
         }
-        var json = "{}"
-        for (i in fields.indices) {
-            val cell = evalValueExpr(values[i], null, context) ?: SqlCell.Null
-            json = kdbJsonSet(json, "$.${fields[i]}", cellToJsonValue(cell))
-        }
-        validateJson(id, json, context.schema)
-        return listOf(KdbOp.Write(id, json))
+        return ops
     }
 
     suspend fun executeDelete(

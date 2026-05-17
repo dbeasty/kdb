@@ -13,6 +13,9 @@ public sealed class SqlStatement {
     public data class Delete(val delete: DeleteStatement) : SqlStatement()
     public data class CreateIndex(val ddl: CreateIndexStatement) : SqlStatement()
     public data class DropIndex(val ddl: DropIndexStatement) : SqlStatement()
+    public data class CreateTable(val ddl: CreateTableStatement) : SqlStatement()
+    public data class AlterTableAddColumn(val ddl: AlterTableAddColumnStatement) : SqlStatement()
+    public data class DropTable(val table: TableRef) : SqlStatement()
     public data object BeginTransaction : SqlStatement()
     public data object Commit : SqlStatement()
     public data object Rollback : SqlStatement()
@@ -29,10 +32,27 @@ public data class Assignment(
     val expr: SqlExpr,
 )
 
+public data class ColumnDefinition(
+    val name: String,
+    val type: dev.kdb.schema.KdbFieldType,
+    val required: Boolean,
+    val indexed: Boolean = true,
+)
+
+public data class CreateTableStatement(
+    val table: TableRef,
+    val columns: List<ColumnDefinition>,
+)
+
+public data class AlterTableAddColumnStatement(
+    val table: TableRef,
+    val column: ColumnDefinition,
+)
+
 public data class InsertStatement(
     val table: TableRef,
     val columns: List<String>,
-    val values: List<SqlExpr>,
+    val rows: List<List<SqlExpr>>,
 )
 
 public data class DeleteStatement(
@@ -173,6 +193,10 @@ public data class QueryResult(
     val columns: List<ResultColumn>,
     val rows: List<QueryRow>,
     val rowsAffected: Int = 0,
+    /** Document ids produced by INSERT (for JDBC generated keys). */
+    val generatedIds: List<String> = emptyList(),
+    /** Schema after DDL (CREATE/ALTER/DROP TABLE). */
+    val appliedSchema: dev.kdb.schema.KdbSchema? = null,
 )
 
 public sealed class PhysicalPlan {

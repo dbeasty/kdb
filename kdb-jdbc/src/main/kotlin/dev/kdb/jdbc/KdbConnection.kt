@@ -114,23 +114,29 @@ public class KdbConnection(
             throw SQLException("DDL not allowed inside a transaction")
         }
         val deferCommit = !sqlSession.autoCommit
-        return runtime.hybrid.execute(
-            sql,
-            HybridQueryRequest(
-                namespaceId = namespaceId,
-                schema = effectiveSchema(),
-                parameters = parameters,
-                readConsistency = ReadConsistency.READ_COMMITTED,
-                deferCommit = deferCommit,
-                transactionBase = sqlSession.transactionBase(),
-                bufferOps =
-                    if (deferCommit) {
-                        { ops -> sqlSession.appendOps(ops) }
-                    } else {
-                        null
-                    },
-            ),
-        )
+        val hybridResult =
+            runtime.hybrid.execute(
+                sql,
+                HybridQueryRequest(
+                    namespaceId = namespaceId,
+                    schema = effectiveSchema(),
+                    parameters = parameters,
+                    readConsistency = ReadConsistency.READ_COMMITTED,
+                    deferCommit = deferCommit,
+                    transactionBase = sqlSession.transactionBase(),
+                    bufferOps =
+                        if (deferCommit) {
+                            { ops -> sqlSession.appendOps(ops) }
+                        } else {
+                            null
+                        },
+                ),
+            )
+        val applied = hybridResult.appliedSchema ?: hybridResult.result.appliedSchema
+        if (applied != null) {
+            registerSchemaBlocking(applied)
+        }
+        return hybridResult
     }
 
     private suspend fun executeTransactionControl(
@@ -150,6 +156,8 @@ public class KdbConnection(
             readOnly = false,
         )
     }
+
+    internal fun effectiveKdbSchema(): KdbSchema = effectiveSchema()
 
     private fun effectiveSchema(): KdbSchema {
         val leased = memoryLease?.currentSchema()

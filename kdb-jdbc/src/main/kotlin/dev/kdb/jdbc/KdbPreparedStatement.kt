@@ -12,40 +12,55 @@ public class KdbPreparedStatement(
     connection: KdbConnection,
     private val sql: String,
 ) : KdbStatement(connection), PreparedStatement {
-    private val bindings = mutableListOf<SqlParameter>()
+    private val bindingSlots = mutableListOf<SqlParameter?>()
+    private val batchBindings = mutableListOf<List<SqlParameter>>()
 
     override fun executeQuery(): ResultSet {
         checkOpen()
-        return executeQuery(sql, bindings.toList())
+        return executeQuery(sql, resolvedBindings())
     }
 
-    override fun execute(): Boolean = execute(sql, bindings.toList())
+    override fun execute(): Boolean = execute(sql, resolvedBindings())
 
-    override fun executeUpdate(): Int = executeUpdate(sql, bindings.toList())
+    override fun executeUpdate(): Int {
+        val (keys, count) = executeUpdateReturningKeys(sql, resolvedBindings())
+        lastGeneratedKeys = keys
+        return count
+    }
+
+    private fun executeUpdateReturningKeys(
+        sql: String,
+        parameters: List<SqlParameter>,
+    ): Pair<List<String>, Int> {
+        connection.checkWritable()
+        val hybridResult =
+            connection.blocking { connection.executeHybrid(qualifyTable(sql), parameters) }
+        return hybridResult.result.generatedIds to hybridResult.result.rowsAffected
+    }
 
     override fun setString(
         parameterIndex: Int,
         x: String?,
     ) {
-        bindings += if (x == null) SqlParameter.NullParam else SqlParameter.StringParam(x)
+        bind(parameterIndex, if (x == null) SqlParameter.NullParam else SqlParameter.StringParam(x))
     }
 
     override fun setLong(
         parameterIndex: Int,
         x: Long,
     ) {
-        bindings += SqlParameter.IntParam(x)
+        bind(parameterIndex, SqlParameter.IntParam(x))
     }
 
     override fun setNull(
         parameterIndex: Int,
         sqlType: Int,
     ) {
-        bindings += SqlParameter.NullParam
+        bind(parameterIndex, SqlParameter.NullParam)
     }
 
     override fun clearParameters() {
-        bindings.clear()
+        bindingSlots.clear()
     }
 
     override fun getMetaData(): ResultSetMetaData? = null
@@ -56,49 +71,52 @@ public class KdbPreparedStatement(
         parameterIndex: Int,
         x: Boolean,
     ) {
-        bindings += SqlParameter.BoolParam(x)
+        bind(parameterIndex, SqlParameter.BoolParam(x))
     }
 
     override fun setByte(
         parameterIndex: Int,
         x: Byte,
     ) {
-        bindings += SqlParameter.IntParam(x.toLong())
+        bind(parameterIndex, SqlParameter.IntParam(x.toLong()))
     }
 
     override fun setShort(
         parameterIndex: Int,
         x: Short,
     ) {
-        bindings += SqlParameter.IntParam(x.toLong())
+        bind(parameterIndex, SqlParameter.IntParam(x.toLong()))
     }
 
     override fun setInt(
         parameterIndex: Int,
         x: Int,
     ) {
-        bindings += SqlParameter.IntParam(x.toLong())
+        bind(parameterIndex, SqlParameter.IntParam(x.toLong()))
     }
 
     override fun setFloat(
         parameterIndex: Int,
         x: Float,
     ) {
-        bindings += SqlParameter.DoubleParam(x.toDouble())
+        bind(parameterIndex, SqlParameter.DoubleParam(x.toDouble()))
     }
 
     override fun setDouble(
         parameterIndex: Int,
         x: Double,
     ) {
-        bindings += SqlParameter.DoubleParam(x)
+        bind(parameterIndex, SqlParameter.DoubleParam(x))
     }
 
     override fun setBigDecimal(
         parameterIndex: Int,
         x: BigDecimal?,
     ) {
-        bindings += if (x == null) SqlParameter.NullParam else SqlParameter.StringParam(x.toPlainString())
+        bind(
+            parameterIndex,
+            if (x == null) SqlParameter.NullParam else SqlParameter.StringParam(x.toPlainString()),
+        )
     }
 
     override fun setBytes(
@@ -327,7 +345,54 @@ public class KdbPreparedStatement(
         setObject(parameterIndex, x, targetSqlType)
     }
 
-    override fun addBatch() {}
+    override fun addBatch() {
+        batchBindings += resolvedBindings()
+        bindingSlots.clear()
+    }
+
+    override fun clearBatch() {
+        batchBindings.clear()
+    }
+
+    override fun executeBatch(): IntArray {
+        checkOpen()
+        connection.checkWritable()
+        if (batchBindings.isEmpty()) return IntArray(0)
+        val counts = IntArray(batchBindings.size)
+        val keys = mutableListOf<String>()
+        for (i in batchBindings.indices) {
+            val (generated, count) = executeUpdateReturningKeys(sql, batchBindings[i])
+            counts[i] = count
+            keys += generated
+        }
+        batchBindings.clear()
+        bindingSlots.clear()
+        lastGeneratedKeys = keys
+        return counts
+    }
+
+    private fun bind(
+        parameterIndex: Int,
+        value: SqlParameter,
+    ) {
+        if (parameterIndex < 1) {
+            throw SQLException("parameter index must be >= 1")
+        }
+        while (bindingSlots.size < parameterIndex) {
+            bindingSlots.add(null)
+        }
+        bindingSlots[parameterIndex - 1] = value
+    }
+
+    private fun resolvedBindings(): List<SqlParameter> {
+        if (bindingSlots.isEmpty()) {
+            return emptyList()
+        }
+        if (bindingSlots.any { it == null }) {
+            throw SQLException("not all parameters were set")
+        }
+        return bindingSlots.filterNotNull()
+    }
 
     private fun unsupported(): Nothing = throw SQLFeatureNotSupportedException()
 }

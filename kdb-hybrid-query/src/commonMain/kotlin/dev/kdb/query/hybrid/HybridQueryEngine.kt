@@ -113,15 +113,27 @@ internal class DefaultHybridQueryEngine(
                     ?: throw IllegalStateException("deferCommit requires bufferOps")
                 buffer(dml.operations)
                 val base = request.transactionBase ?: dag.head()
-                val result = QueryResult(emptyList(), emptyList(), rowsAffected = dml.rowsAffected)
+                val result =
+                    QueryResult(
+                        emptyList(),
+                        emptyList(),
+                        rowsAffected = dml.rowsAffected,
+                        generatedIds = dml.generatedIds,
+                    )
                 return HybridQueryResult(result, base, readOnly = false)
             }
             val commitHash = commitDml(dml.operations, request)
-            val result = QueryResult(emptyList(), emptyList(), rowsAffected = dml.rowsAffected)
+            val result =
+                QueryResult(
+                    emptyList(),
+                    emptyList(),
+                    rowsAffected = dml.rowsAffected,
+                    generatedIds = dml.generatedIds,
+                )
             return HybridQueryResult(result, commitHash, readOnly = false)
         }
         val result = sqlEngine.execute(parsed.sql, ctx)
-        return HybridQueryResult(result, resolved, readOnly)
+        return HybridQueryResult(result, resolved, readOnly, appliedSchema = result.appliedSchema)
     }
 
     override suspend fun explain(

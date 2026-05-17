@@ -11,6 +11,8 @@ import java.sql.ResultSetMetaData
 import java.sql.SQLException
 import java.sql.SQLFeatureNotSupportedException
 import java.sql.Statement
+import java.math.BigDecimal
+import java.sql.Timestamp
 import java.sql.Types
 
 public fun queryResultSet(result: QueryResult): ResultSet {
@@ -109,6 +111,18 @@ public fun queryResultSet(result: QueryResult): ResultSet {
                         else -> unsupported(method)
                     }
                 }
+                "getBigDecimal" ->
+                    when (args[0]) {
+                        is Int -> state.getBigDecimal(args[0] as Int)
+                        is String -> state.getBigDecimal(state.findColumn(args[0] as String))
+                        else -> unsupported(method)
+                    }
+                "getTimestamp" ->
+                    when (args[0]) {
+                        is Int -> state.getTimestamp(args[0] as Int)
+                        is String -> state.getTimestamp(state.findColumn(args[0] as String))
+                        else -> unsupported(method)
+                    }
                 "unwrap" -> {
                     val iface = args[0] as Class<*>
                     if (iface.isInstance(state)) iface.cast(state) else throw SQLFeatureNotSupportedException()
@@ -206,6 +220,29 @@ private class ResultSetState(
         }
     }
 
+    fun getBigDecimal(columnIndex: Int): BigDecimal? {
+        val c = cell(columnIndex)
+        wasNull = c is SqlCell.Null
+        return when (c) {
+            SqlCell.Null -> null
+            is SqlCell.LongVal -> BigDecimal.valueOf(c.value)
+            is SqlCell.DoubleVal -> BigDecimal.valueOf(c.value)
+            is SqlCell.StringVal -> c.value.toBigDecimalOrNull()
+            else -> throw SQLException("not a decimal column")
+        }
+    }
+
+    fun getTimestamp(columnIndex: Int): Timestamp? {
+        val c = cell(columnIndex)
+        wasNull = c is SqlCell.Null
+        return when (c) {
+            SqlCell.Null -> null
+            is SqlCell.LongVal -> Timestamp(c.value)
+            is SqlCell.StringVal -> Timestamp.valueOf(c.value.replace('T', ' ').take(19))
+            else -> throw SQLException("not a timestamp column")
+        }
+    }
+
     fun metaData(): ResultSetMetaData = KdbResultSetMetaData(result)
 }
 
@@ -223,6 +260,8 @@ private class KdbResultSetMetaData(
             "INTEGER", "BIGINT" -> Types.BIGINT
             "BOOLEAN" -> Types.BOOLEAN
             "DOUBLE" -> Types.DOUBLE
+            "DECIMAL" -> Types.DECIMAL
+            "TIMESTAMP" -> Types.TIMESTAMP
             "JSON" -> Types.LONGVARCHAR
             else -> Types.VARCHAR
         }

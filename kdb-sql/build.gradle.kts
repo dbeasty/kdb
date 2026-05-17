@@ -36,6 +36,7 @@ kotlin {
             implementation(project(":kdb-dag"))
             implementation(project(":kdb-storage"))
             implementation(project(":kdb-index-composite"))
+            implementation(project(":kdb-transaction"))
             implementation(libs.kotlinx.coroutines.test)
         }
     }

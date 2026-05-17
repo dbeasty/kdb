@@ -38,6 +38,11 @@ public interface SqlEngine {
 public data class DmlResult(
     val operations: List<KdbOp>,
     val rowsAffected: Int,
+    val generatedIds: List<String> = emptyList(),
+)
+
+public data class DdlResult(
+    val schema: dev.kdb.schema.KdbSchema,
 )
 
 public fun sqlEngine(
@@ -77,6 +82,7 @@ internal class DefaultSqlEngine(
 
     private val executor = SqlExecutor(indexManager, storage, dag, namespaceDags)
     private val dmlExecutor = DmlExecutor(executor, storage, dag, planner)
+    private val ddlExecutor = DdlExecutor(indexManager, dag, storage, indexStoreFactory)
 
     override suspend fun execute(
         sql: String,
@@ -105,6 +111,18 @@ internal class DefaultSqlEngine(
                 val plan = planner.plan(SqlStatement.Select(query), context)
                 executor.executeSelect(query, plan, context)
             }
+            is SqlStatement.CreateTable -> {
+                val schema = ddlExecutor.executeCreateTable(stmt.ddl, context)
+                QueryResult(emptyList(), emptyList(), appliedSchema = schema)
+            }
+            is SqlStatement.AlterTableAddColumn -> {
+                val schema = ddlExecutor.executeAlterTableAddColumn(stmt.ddl, context)
+                QueryResult(emptyList(), emptyList(), appliedSchema = schema)
+            }
+            is SqlStatement.DropTable -> {
+                val schema = ddlExecutor.executeDropTable(stmt.table, context)
+                QueryResult(emptyList(), emptyList(), appliedSchema = schema)
+            }
             is SqlStatement.Update,
             is SqlStatement.Insert,
             is SqlStatement.Delete,
@@ -128,7 +146,9 @@ internal class DefaultSqlEngine(
                 is SqlStatement.Delete -> dmlExecutor.executeDelete(stmt.delete, context)
                 else -> throw SqlPlanningException("not a DML statement", sql)
             }
-        return DmlResult(ops, ops.size)
+        val generatedIds =
+            ops.filterIsInstance<dev.kdb.document.KdbOp.Write>().map { it.docId.toString() }
+        return DmlResult(ops, ops.size, generatedIds)
     }
 
     override suspend fun explain(

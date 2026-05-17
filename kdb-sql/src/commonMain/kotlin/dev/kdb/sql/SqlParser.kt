@@ -22,6 +22,7 @@ internal class RecursiveDescentSqlParser : SqlParser {
             matchKeyword("COMMIT") -> parseCommit()
             matchKeyword("ROLLBACK") -> parseRollback()
             matchKeyword("CREATE") -> parseCreate()
+            matchKeyword("ALTER") -> parseAlter()
             matchKeyword("DROP") -> parseDrop()
             matchKeyword("INSERT") -> SqlStatement.Insert(parseInsert())
             matchKeyword("UPDATE") -> SqlStatement.Update(parseUpdate())
@@ -52,7 +53,6 @@ internal class RecursiveDescentSqlParser : SqlParser {
     }
 
     private fun parseCreate(): SqlStatement {
-        expectKeyword("CREATE")
         return when {
             matchKeyword("VIRTUAL") -> {
                 expectKeyword("VIEW")
@@ -61,11 +61,50 @@ internal class RecursiveDescentSqlParser : SqlParser {
                 expectKeyword("SELECT")
                 SqlStatement.CreateVirtualView(name, parseSelectQuery())
             }
-            matchKeyword("INDEX") -> {
-                expectKeyword("INDEX")
-                SqlStatement.CreateIndex(parseCreateIndexBody())
-            }
-            else -> throw parseError("expected VIRTUAL VIEW or INDEX")
+            matchKeyword("INDEX") -> SqlStatement.CreateIndex(parseCreateIndexBody())
+            matchKeyword("TABLE") -> SqlStatement.CreateTable(parseCreateTableBody())
+            else -> throw parseError("expected VIRTUAL VIEW, INDEX, or TABLE")
+        }
+    }
+
+    private fun parseCreateTableBody(): CreateTableStatement {
+        val table = TableRef(readIdentifier())
+        expectChar('(')
+        val columns = mutableListOf<ColumnDefinition>()
+        do {
+            columns += parseColumnDefinition()
+        } while (matchChar(','))
+        expectChar(')')
+        return CreateTableStatement(table, columns)
+    }
+
+    private fun parseColumnDefinition(): ColumnDefinition {
+        val name = readIdentifier()
+        val type = parseColumnType()
+        var required = false
+        if (matchKeyword("NOT")) {
+            expectKeyword("NULL")
+            required = true
+        }
+        return ColumnDefinition(name, type, required, indexed = true)
+    }
+
+    private fun parseColumnType(): dev.kdb.schema.KdbFieldType {
+        val typeName = readIdentifier().uppercase()
+        if (peek() == '(') {
+            expectChar('(')
+            readNumber()
+            expectChar(')')
+        }
+        return when (typeName) {
+            "VARCHAR", "TEXT", "STRING", "CHAR" -> dev.kdb.schema.KdbFieldType.StringType
+            "INT", "INTEGER" -> dev.kdb.schema.KdbFieldType.Int32Type
+            "BIGINT", "LONG" -> dev.kdb.schema.KdbFieldType.Int64Type
+            "DOUBLE", "FLOAT", "REAL" -> dev.kdb.schema.KdbFieldType.Float64Type
+            "BOOLEAN", "BOOL" -> dev.kdb.schema.KdbFieldType.BoolType
+            "TIMESTAMP", "DATETIME" -> dev.kdb.schema.KdbFieldType.TimestampType
+            "UUID" -> dev.kdb.schema.KdbFieldType.UuidType
+            else -> throw parseError("unsupported column type: $typeName")
         }
     }
 
@@ -102,18 +141,24 @@ internal class RecursiveDescentSqlParser : SqlParser {
     }
 
     private fun parseDrop(): SqlStatement {
-        expectKeyword("DROP")
         return when {
             matchKeyword("VIRTUAL") -> {
                 expectKeyword("VIEW")
                 SqlStatement.DropVirtualView(readIdentifier())
             }
-            matchKeyword("INDEX") -> {
-                expectKeyword("INDEX")
-                SqlStatement.DropIndex(parseDropIndexBody())
-            }
-            else -> throw parseError("expected VIRTUAL VIEW or INDEX")
+            matchKeyword("INDEX") -> SqlStatement.DropIndex(parseDropIndexBody())
+            matchKeyword("TABLE") -> SqlStatement.DropTable(TableRef(readIdentifier()))
+            else -> throw parseError("expected VIRTUAL VIEW, INDEX, or TABLE")
         }
+    }
+
+    private fun parseAlter(): SqlStatement {
+        expectKeyword("TABLE")
+        val table = TableRef(readIdentifier())
+        expectKeyword("ADD")
+        expectKeyword("COLUMN")
+        val column = parseColumnDefinition()
+        return SqlStatement.AlterTableAddColumn(AlterTableAddColumnStatement(table, column))
     }
 
     private fun parseUpdate(): UpdateStatement {
@@ -135,20 +180,24 @@ internal class RecursiveDescentSqlParser : SqlParser {
     private fun parseInsert(): InsertStatement {
         expectKeyword("INTO")
         val table = TableRef(readIdentifier(), parseOptionalTableAlias())
-        expectKeyword("(")
+        expectChar('(')
         val columns = mutableListOf<String>()
         do {
             columns += readIdentifier()
         } while (matchChar(','))
         expectChar(')')
         expectKeyword("VALUES")
-        expectChar('(')
-        val values = mutableListOf<SqlExpr>()
+        val rows = mutableListOf<List<SqlExpr>>()
         do {
-            values += parseExpr()
+            expectChar('(')
+            val values = mutableListOf<SqlExpr>()
+            do {
+                values += parseExpr()
+            } while (matchChar(','))
+            expectChar(')')
+            rows += values
         } while (matchChar(','))
-        expectChar(')')
-        return InsertStatement(table, columns, values)
+        return InsertStatement(table, columns, rows)
     }
 
     private fun parseDelete(): DeleteStatement {
