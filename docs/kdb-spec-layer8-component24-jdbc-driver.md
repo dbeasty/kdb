@@ -109,14 +109,15 @@ Schema fields + `kdb_id` + `_doc` per master §3.2. `SqlCell` mapped to JDBC typ
 ### `KdbDriver.connect`
 - **Preconditions:** `acceptsURL(url)`.
 - **Postconditions:** Returns `KdbConnection` for memory and file URLs; `null` if URL not handled.
-- **Memory mode:** New isolated `EmbeddedKdbRuntime` per connection (tests).
+- **Memory mode:** `MemoryRuntimeRegistry` returns one shared `EmbeddedKdbRuntime` per URL identity `(catalog, namespaceId, isolate)`. Reference count on connect/close. URL params: `unique=true` (random isolate per connect), `isolate=name` (named instance), `dropOnClose=true` (evict registry entry when refcount reaches zero). Thread-safe access via per-runtime lock.
 - **File mode:** `openFileRuntime` — SERVER storage engine, delta replay on open, `PersistingCommitDag` on write. See [`kdb-spec-layer8-file-persistence-plan.md`](kdb-spec-layer8-file-persistence-plan.md).
 
 ### `KdbStatement.executeQuery`
 - **Postconditions:** `ResultSet` positioned before first row; column labels match projection aliases.
 
 ### `KdbConnection.commit`
-- v1 memory mode: no-op when `autoCommit=true`; when false, flushes pending `TransactionEngine` work (if any).
+- When `autoCommit=true`: no-op.
+- When `autoCommit=false`: flushes buffered DML via `EmbeddedSqlSession` / `TransactionEngine` (embedded memory and file). Network mode sends wire `COMMIT`.
 
 -----
 

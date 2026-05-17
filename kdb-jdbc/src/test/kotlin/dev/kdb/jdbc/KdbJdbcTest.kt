@@ -1,28 +1,32 @@
 package dev.kdb.jdbc
 
-import dev.kdb.codec.KdbTimestamp
-import dev.kdb.codec.KdbUuid
-import dev.kdb.document.KdbDocument
-import dev.kdb.document.KdbOp
-import dev.kdb.document.KdbTransaction
-import dev.kdb.index.compositeIndexStoreFactory
-import dev.kdb.schema.KdbFieldType
-import dev.kdb.schema.KdbSchema
-import dev.kdb.schema.SchemaField
 import java.sql.DriverManager
 import java.sql.SQLException
-import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import org.junit.After
+import org.junit.Before
 
 class KdbJdbcTest {
     init {
         KdbDriver
     }
+
+    @Before
+    fun setUp() {
+        JdbcTestSupport.clearMemoryRegistries()
+    }
+
+    @After
+    fun tearDown() {
+        JdbcTestSupport.clearMemoryRegistries()
+    }
+
+    private fun memoryUrl(): String = "jdbc:kdb:memory:///demo/users;unique=true"
 
     @Test
     fun driverRegisters() {
@@ -38,8 +42,8 @@ class KdbJdbcTest {
 
     @Test
     fun selectStar() {
-        val conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/users") as KdbConnection
-        seedUsers(conn)
+        val conn = DriverManager.getConnection(memoryUrl()) as KdbConnection
+        JdbcTestSupport.seedUsers(conn)
         val rs = conn.createStatement().executeQuery("SELECT _doc FROM users WHERE userId = 'u1'")
         assertTrue(rs.next())
         assertTrue(rs.getString(1)!!.contains("u1"))
@@ -48,14 +52,15 @@ class KdbJdbcTest {
 
     @Test
     fun catalogMatchesUrl() {
-        val conn = DriverManager.getConnection("jdbc:kdb:memory:///myapp/users") as KdbConnection
+        val conn =
+            DriverManager.getConnection("jdbc:kdb:memory:///myapp/users;unique=true") as KdbConnection
         assertEquals("myapp", conn.catalog)
         conn.close()
     }
 
     @Test
     fun metadataTables() {
-        val conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/users") as KdbConnection
+        val conn = DriverManager.getConnection(memoryUrl()) as KdbConnection
         val rs = conn.metaData.getTables(null, null, null, null)
         assertTrue(rs.next())
         assertEquals("demo", rs.getString("TABLE_CAT"))
@@ -64,7 +69,7 @@ class KdbJdbcTest {
 
     @Test
     fun metadataColumns() {
-        val conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/users") as KdbConnection
+        val conn = DriverManager.getConnection(memoryUrl()) as KdbConnection
         val rs = conn.metaData.getColumns(null, null, "users", null)
         val names = mutableListOf<String>()
         while (rs.next()) {
@@ -77,8 +82,8 @@ class KdbJdbcTest {
 
     @Test
     fun preparedSelect() {
-        val conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/users") as KdbConnection
-        seedUsers(conn)
+        val conn = DriverManager.getConnection(memoryUrl()) as KdbConnection
+        JdbcTestSupport.seedUsers(conn)
         val ps = conn.prepareStatement("SELECT _doc FROM users WHERE userId = 'u1'")
         val rs = ps.executeQuery()
         assertTrue(rs.next())
@@ -88,8 +93,8 @@ class KdbJdbcTest {
 
     @Test
     fun executeUpdateSchemaField() {
-        val conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/users") as KdbConnection
-        seedUsers(conn)
+        val conn = DriverManager.getConnection(memoryUrl()) as KdbConnection
+        JdbcTestSupport.seedUsers(conn)
         val updated =
             conn.createStatement().executeUpdate(
                 "UPDATE users SET status = 'inactive' WHERE userId = 'u1'",
@@ -105,7 +110,7 @@ class KdbJdbcTest {
     fun readOnlyRejectsUpdate() {
         val conn =
             DriverManager.getConnection(
-                "jdbc:kdb:memory:///demo/users",
+                memoryUrl(),
                 java.util.Properties().apply { setProperty("readOnly", "true") },
             ) as KdbConnection
         assertFailsWith<SQLException> {
@@ -116,48 +121,10 @@ class KdbJdbcTest {
 
     @Test
     fun closeConnection() {
-        val conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/users")
+        val conn = DriverManager.getConnection(memoryUrl())
         conn.close()
         assertFailsWith<SQLException> {
             conn.createStatement().executeQuery("SELECT 1")
         }
     }
-
-    private fun seedUsers(conn: KdbConnection) =
-        runBlocking {
-        val runtime = conn.embedded
-        val ns = runtime.defaultNamespace
-        val dag = runtime.dag
-        val storage = runtime.storage
-        val manager = runtime.indexManager
-        val schema =
-            KdbSchema.build(
-                listOf(
-                    SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
-                    SchemaField("status", KdbFieldType.StringType, required = true, indexed = true),
-                ),
-            )
-        manager.registryFor(ns).syncSchema(
-            KdbSchema.NONE,
-            schema,
-            compositeIndexStoreFactory(dag, storage),
-            dag,
-            storage,
-        )
-        val doc = KdbDocument(KdbUuid.random(), """{"userId":"u1","status":"active"}""")
-        storage.putDocument(ns, doc)
-        val parent = dag.head()
-        val tree = storage.commitTree(ns, dag.getCommitOrThrow(parent).documentTreeHash)
-        val tx =
-            KdbTransaction(
-                KdbUuid.random(),
-                parent,
-                listOf(KdbOp.Write(doc.id, doc.json)),
-                KdbTimestamp.now(),
-                KdbUuid.random(),
-            )
-        val commit = dag.appendCommit(tx, parent, tree, null)
-        manager.writer.applyCommit(commit, manager.registryFor(ns), storage, schema)
-        conn.applyQuerySchema(schema)
-        }
 }

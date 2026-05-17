@@ -1,6 +1,7 @@
 package dev.kdb.jdbc
 
 import dev.kdb.jdbc.file.openFileRuntime
+import dev.kdb.jdbc.memory.MemoryRuntimeRegistry
 import dev.kdb.jdbc.remote.KdbRemoteConnection
 import java.sql.Connection
 import java.sql.Driver
@@ -19,11 +20,10 @@ public class KdbDriver : Driver {
         if (!acceptsURL(url)) return null
         val parsed = KdbJdbcUrlParser.parse(url, info)
         return when (parsed.mode) {
-            JdbcMode.MEMORY ->
-                KdbConnection(
-                    openMemoryRuntime(parsed.catalog, parsed.namespaceId),
-                    parsed,
-                )
+            JdbcMode.MEMORY -> {
+                val lease = MemoryRuntimeRegistry.acquireBlocking(parsed, info)
+                KdbConnection(lease.runtime, parsed, memoryLease = lease)
+            }
             JdbcMode.FILE -> {
                 val root =
                     parsed.dataRoot

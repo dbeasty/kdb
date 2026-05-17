@@ -170,9 +170,12 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 
 | URL | Namespace | v1 |
 |-----|-----------|-----|
-| `jdbc:kdb:memory:///demo/users` | `demo/users` | **Yes** |
+| `jdbc:kdb:memory:///demo/users` | `demo/users` | **Yes** — shared in-process DB per URL (pool-safe) |
 | `jdbc:kdb:memory:///myapp` | `myapp/main` (no slash in path) | **Yes** |
 | `jdbc:kdb:memory:///demo/users` + `readOnly=true` property | same | **Yes** (SELECT only) |
+| `jdbc:kdb:memory:///demo/users;unique=true` | new empty DB per connect (tests) | **Yes** |
+| `jdbc:kdb:memory:///demo/users;isolate=mytest` | separate DB per isolate name | **Yes** |
+| `jdbc:kdb:memory:///demo/users;dropOnClose=true` | dropped when last connection closes | **Yes** |
 | `jdbc:kdb:file:///path/to/data/demo/users` | `demo/users`; data under `/path/to/data/ns/demo/users/` | **Yes** — survives process restart |
 | `jdbc:kdb:file:///path/to/data/myapp` | `myapp/main` (path ends with catalog only) | **Yes** |
 | `jdbc:kdb://host:port/catalog` | network SQL wire | Multi-client sessions; see [component 25](kdb-spec-layer8-component25-multi-client-sessions.md) |
@@ -188,18 +191,18 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 | Area | Details |
 |------|---------|
 | **Driver** | `dev.kdb.jdbc.KdbDriver`; registers with `DriverManager`; `acceptsURL("jdbc:kdb:…")` |
-| **Connection** | `getCatalog()`, `setReadOnly`, `close`, `isValid`, `getMetaData`, `setAutoCommit` / `commit` / `rollback` (embedded memory: no-op; network SQL: `BEGIN` / `COMMIT` / `ROLLBACK`) |
+| **Connection** | `getCatalog()`, `setReadOnly`, `close`, `isValid`, `getMetaData`, `setAutoCommit` / `commit` / `rollback` (embedded memory + file: transaction buffer; network SQL: wire session) |
 | **Statement** | `executeQuery` for `SELECT`; `FROM table` auto-qualified to `catalog/table` |
 | **PreparedStatement** | `setString`, `setInt`/`setLong`/`setFloat`/`setDouble`, `setBoolean`, `setNull`, `setObject`; `executeQuery` |
 | **ResultSet** | Forward-only; `next`, `getString`/`getLong`/`getInt`/`getBoolean`/`getDouble`/`getObject` by index or column label; `findColumn`, `getMetaData` |
-| **SQL** | `SELECT` with `WHERE` on schema/indexed fields; `SELECT _doc …`; `AT VERSION` / `AT COMMIT` / `AT TIME`; write transactions on network SQL — see [SQL transactions](#sql-transactions) |
+| **SQL** | `SELECT` with `WHERE` on schema/indexed fields; `SELECT _doc …`; `AT VERSION` / `AT COMMIT` / `AT TIME`; `BEGIN` / `COMMIT` / `ROLLBACK` on embedded and network — see [SQL transactions](#sql-transactions) |
 | **DatabaseMetaData** | Product name `KDB`; `getTables`, `getColumns` (`kdb_id`, `_doc`), `getCatalogs`, `getSchemas`; keywords include `BEGIN`, `COMMIT`, `ROLLBACK`, `START`, `TRANSACTION`, `AT`, `VERSION`, `TIME`, `WORK`; functions `kdb_json_get`, `kdb_json_set` |
 
 ### SQL transactions
 
-Multi-statement write transactions are supported on **network SQL** sessions (`jdbc:kdb://…` with the SQL wire hub). Each JDBC connection gets a server-side session; `BEGIN` buffers `INSERT` / `UPDATE` / `DELETE` until `COMMIT` or `ROLLBACK`. Other clients do not see buffered writes until commit.
+Multi-statement write transactions are supported on **embedded** (`jdbc:kdb:memory://…`, `jdbc:kdb:file://…`) and **network SQL** (`jdbc:kdb://…` with the SQL wire hub). With `autoCommit=false` or `BEGIN`, DML is buffered until `COMMIT` or `ROLLBACK`. On shared memory/file URLs, other connections see committed writes only after `COMMIT` (read-committed).
 
-**Not supported in v1:** embedded `jdbc:kdb:memory://…` and `jdbc:kdb:file://…` (each DML still auto-commits; `Connection.commit()` is a no-op there). `SAVEPOINT`, `SET TRANSACTION` as SQL, and DDL inside an open transaction (`CREATE INDEX`, `CREATE VIRTUAL VIEW`, etc.) are rejected.
+**Not supported in v1:** `SAVEPOINT`, `SET TRANSACTION` as SQL, and DDL inside an open transaction (`CREATE INDEX`, `CREATE VIRTUAL VIEW`, etc.) are rejected.
 
 **SQL syntax:**
 
@@ -217,10 +220,10 @@ COMMIT;
 
 Optional `WORK` after `BEGIN`, `COMMIT`, or `ROLLBACK` is accepted (`BEGIN WORK`, `COMMIT WORK`, …).
 
-**JDBC (network connection):**
+**JDBC (embedded or network):**
 
 ```java
-conn.setAutoCommit(false);   // sends BEGIN
+conn.setAutoCommit(false);   // begins transaction (embedded) or sends BEGIN (network)
 stmt.executeUpdate("UPDATE users SET name = 'Alice' WHERE userId = 'u1'");
 stmt.executeUpdate("UPDATE users SET status = 'active' WHERE userId = 'u1'");
 conn.commit();               // sends COMMIT (one DAG commit for both updates)
@@ -252,7 +255,9 @@ See also [component 25 — multi-client sessions](kdb-spec-layer8-component25-mu
 
 ### Seeding data (required before SELECT returns rows)
 
-**Memory mode (`jdbc:kdb:memory://…`):** Each connection is an **isolated** empty engine. Seed documents in the same process (or use the CLI with `--data-dir` and file mode instead).
+**Memory mode (`jdbc:kdb:memory://…`):** Connections to the **same URL** share one in-process engine (like file mode shares disk). The database starts empty until you seed or write. Use `;unique=true` on the URL when a test needs a fresh isolated database per connect; use `;isolate=name` to pin a named shared instance for parallel test classes.
+
+**Connection pools (HikariCP, etc.):** Point the pool at a stable memory URL (no `unique=true`). All pooled connections see the same data. Optional `;dropOnClose=true` removes the database when the last connection closes (H2-style test cleanup).
 
 **File mode (`jdbc:kdb:file://…`):** Data is replayed from disk on connect. After a prior run (CLI `put`, `openFileRuntime`, or an earlier JDBC session) wrote commits, `SELECT` can return rows without re-seeding. New empty directories still need an initial write.
 
@@ -358,7 +363,7 @@ try (Connection conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/user
 }
 ```
 
-**Memory mode:** Each connection is an **isolated** in-memory database; two connections do not share data.
+**Memory mode:** Connections to the same `jdbc:kdb:memory://…` URL share one in-process database. Use `conn.applyQuerySchema(schema)` (or register schema on first write) so indexed `WHERE` clauses work after reconnect.
 
 **File mode:** Connections to the same `jdbc:kdb:file://…` URL share on-disk state (replay on open). Pass a `KdbSchema` when opening programmatically so indexes rebuild after reload (see `openFileRuntime`).
 

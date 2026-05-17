@@ -14,6 +14,8 @@ data class KdbJdbcUrl(
     val networkHost: String? = null,
     val networkPort: Int = 7444,
     val inprocHub: String? = null,
+    /** Semicolon-separated JDBC properties embedded in the URL (memory mode). */
+    val memoryParams: Map<String, String> = emptyMap(),
 ) {
     fun networkWebSocketUri(): String {
         if (inprocHub != null) {
@@ -51,10 +53,12 @@ internal object KdbJdbcUrlParser {
                 ?: url.contains("read_only=true")
         return when {
             rest.startsWith("memory:") -> {
-                val path = rest.removePrefix("memory:").trimStart('/')
-                val catalog = path.substringBefore('/').ifEmpty { "default" }
-                val namespace = if (path.contains('/')) path else "$catalog/main"
-                KdbJdbcUrl(JdbcMode.MEMORY, catalog, namespace, readOnly)
+                val memBody = rest.removePrefix("memory:").trimStart('/')
+                val pathPart = memBody.substringBefore(';')
+                val params = parseSemicolonParams(memBody.substringAfter(';', ""))
+                val catalog = pathPart.substringBefore('/').ifEmpty { "default" }
+                val namespace = if (pathPart.contains('/')) pathPart else "$catalog/main"
+                KdbJdbcUrl(JdbcMode.MEMORY, catalog, namespace, readOnly, memoryParams = params)
             }
             rest.startsWith("file:") -> {
                 val fileRest = rest.removePrefix("file:")
@@ -126,4 +130,18 @@ internal object KdbJdbcUrlParser {
     }
 
     fun accepts(url: String): Boolean = url.startsWith(PREFIX)
+
+    private fun parseSemicolonParams(segment: String): Map<String, String> {
+        if (segment.isEmpty()) return emptyMap()
+        return segment.split(';').mapNotNull { part ->
+            val trimmed = part.trim()
+            if (trimmed.isEmpty()) return@mapNotNull null
+            val eq = trimmed.indexOf('=')
+            if (eq < 0) {
+                trimmed to "true"
+            } else {
+                trimmed.substring(0, eq).trim() to trimmed.substring(eq + 1).trim()
+            }
+        }.toMap()
+    }
 }

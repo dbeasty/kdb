@@ -16,8 +16,19 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Before
 
 class FilePersistenceTest {
+    @Before
+    fun setUp() {
+        JdbcTestSupport.clearMemoryRegistries()
+    }
+
+    @After
+    fun tearDown() {
+        JdbcTestSupport.clearMemoryRegistries()
+    }
     private val usersSchema =
         KdbSchema.build(
             listOf(
@@ -56,6 +67,38 @@ class FilePersistenceTest {
             var found = false
             while (rs.next()) {
                 if (rs.getString(1)?.contains("u1") == true) {
+                    found = true
+                    break
+                }
+            }
+            assertTrue(found)
+        }
+    }
+
+    @Test
+    fun fileJdbcEmbeddedTransaction() {
+        val root = createTempDirectory("kdb-file-tx").toString()
+        val url = "jdbc:kdb:file://$root/demo/users"
+        val schema = JdbcTestSupport.usersSchema()
+        DriverManager.getConnection(url).use { conn ->
+            val kdb = conn as KdbConnection
+            JdbcTestSupport.seedUsers(kdb, schema)
+            kdb.autoCommit = false
+            val updated =
+                kdb.createStatement().executeUpdate(
+                    "UPDATE users SET status = 'committed' WHERE userId = 'u1'",
+                )
+            assertEquals(1, updated)
+            kdb.commit()
+        }
+        DriverManager.getConnection(url).use { conn ->
+            val kdb = conn as KdbConnection
+            kdb.applyQuerySchema(schema)
+            val rs = kdb.createStatement().executeQuery("SELECT _doc FROM users")
+            var found = false
+            while (rs.next()) {
+                val doc = rs.getString(1) ?: continue
+                if (doc.contains("u1") && doc.contains("committed")) {
                     found = true
                     break
                 }

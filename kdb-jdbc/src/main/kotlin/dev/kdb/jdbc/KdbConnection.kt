@@ -1,8 +1,18 @@
 package dev.kdb.jdbc
 
+import dev.kdb.embed.syncEmbedSchema
 import dev.kdb.query.hybrid.HybridQueryRequest
 import dev.kdb.query.hybrid.HybridQueryResult
+import dev.kdb.query.hybrid.ReadConsistency
 import dev.kdb.schema.KdbSchema
+import dev.kdb.schema.isNone
+import dev.kdb.sql.QueryResult
+import dev.kdb.sql.defaultSqlParser
+import dev.kdb.sql.isDdlStatement
+import dev.kdb.sql.isDmlStatement
+import dev.kdb.sql.isTransactionControlStatement
+import dev.kdb.jdbc.memory.MemoryRuntimeLease
+import dev.kdb.jdbc.session.EmbeddedSqlSession
 import dev.kdb.sql.SqlParameter
 import kotlinx.coroutines.runBlocking
 import java.sql.Array
@@ -27,25 +37,68 @@ import java.util.concurrent.Executor
 public class KdbConnection(
     private val runtime: EmbeddedKdbRuntime,
     private val url: KdbJdbcUrl,
+    private val memoryLease: MemoryRuntimeLease? = null,
 ) : Connection,
     KdbSqlConnection {
     private var closed = false
-    private var autoCommit = true
-    private var schema: KdbSchema = runtime.schema
+    private var schema: KdbSchema = memoryLease?.currentSchema() ?: runtime.schema
     private var currentNamespace: String = url.namespaceId
     private var readOnly = url.readOnly
+
+    private val sqlSession =
+        EmbeddedSqlSession(
+            namespaceId = url.namespaceId,
+            dag = runtime.dag,
+            schema = { effectiveSchema() },
+        )
 
     internal val embedded: EmbeddedKdbRuntime get() = runtime
 
     internal fun applyQuerySchema(schema: KdbSchema) {
+        if (schema.isNone) return
         this.schema = schema
+        memoryLease?.publishSchema(schema)
+            ?: blocking {
+                syncEmbedSchema(runtime, url.namespaceId, schema)
+                runtime.indexManager.writer.rebuildAll(
+                    runtime.dag.head(),
+                    runtime.dag,
+                    runtime.indexManager.registryFor(url.namespaceId),
+                    runtime.storage,
+                    schema,
+                )
+            }
+    }
+
+    /** First schema on an empty shared memory database (syncs index registry). */
+    internal fun registerSchemaBlocking(schema: KdbSchema) {
+        if (schema.isNone) return
+        this.schema = schema
+        memoryLease?.registerSchemaBlocking(schema)
+            ?: blocking {
+                syncEmbedSchema(runtime, url.namespaceId, schema)
+                runtime.indexManager.writer.rebuildAll(
+                    runtime.dag.head(),
+                    runtime.dag,
+                    runtime.indexManager.registryFor(url.namespaceId),
+                    runtime.storage,
+                    schema,
+                )
+            }
     }
 
     override fun namespaceForTable(table: String): String = url.namespaceForTable(table)
 
     override fun <T> blocking(block: suspend () -> T): T {
         checkOpen()
-        return runBlocking { block() }
+        val lease = memoryLease
+        return if (lease != null) {
+            lease.withAccess {
+                runBlocking { block() }
+            }
+        } else {
+            runBlocking { block() }
+        }
     }
 
     override suspend fun executeHybrid(
@@ -53,14 +106,55 @@ public class KdbConnection(
         parameters: List<SqlParameter>,
     ): HybridQueryResult {
         val namespaceId = resolveNamespace(sql)
+        val stmt = defaultSqlParser().parse(sql.trim())
+        if (isTransactionControlStatement(stmt)) {
+            return executeTransactionControl(namespaceId, stmt)
+        }
+        if (!sqlSession.autoCommit && isDdlStatement(stmt)) {
+            throw SQLException("DDL not allowed inside a transaction")
+        }
+        val deferCommit = !sqlSession.autoCommit
         return runtime.hybrid.execute(
             sql,
             HybridQueryRequest(
                 namespaceId = namespaceId,
-                schema = schema,
+                schema = effectiveSchema(),
                 parameters = parameters,
+                readConsistency = ReadConsistency.READ_COMMITTED,
+                deferCommit = deferCommit,
+                transactionBase = sqlSession.transactionBase(),
+                bufferOps =
+                    if (deferCommit) {
+                        { ops -> sqlSession.appendOps(ops) }
+                    } else {
+                        null
+                    },
             ),
         )
+    }
+
+    private suspend fun executeTransactionControl(
+        namespaceId: String,
+        stmt: dev.kdb.sql.SqlStatement,
+    ): HybridQueryResult {
+        val control = sqlSession.handleTransactionControl(stmt)
+        val resolved =
+            if (control.needsCommit) {
+                sqlSession.commit(runtime)
+            } else {
+                control.resolvedCommit
+            }
+        return HybridQueryResult(
+            result = QueryResult(emptyList(), emptyList(), rowsAffected = 0),
+            resolvedCommit = resolved,
+            readOnly = false,
+        )
+    }
+
+    private fun effectiveSchema(): KdbSchema {
+        val leased = memoryLease?.currentSchema()
+        if (leased != null && !leased.isNone) return leased
+        return schema
     }
 
     private fun resolveNamespace(sql: String): String {
@@ -79,7 +173,10 @@ public class KdbConnection(
     override fun getMetaData(): DatabaseMetaData = KdbDatabaseMetaData(this)
 
     override fun close() {
+        if (closed) return
+        val lease = memoryLease
         closed = true
+        lease?.release()
     }
 
     override fun isClosed(): Boolean = closed
@@ -97,16 +194,27 @@ public class KdbConnection(
     override fun getCatalog(): String = runtime.catalog
 
     override fun setAutoCommit(autoCommit: Boolean) {
-        this.autoCommit = autoCommit
+        if (autoCommit) {
+            sqlSession.setAutoCommit(true)
+        } else if (sqlSession.autoCommit) {
+            sqlSession.begin()
+        }
     }
 
-    override fun getAutoCommit(): Boolean = autoCommit
+    override fun getAutoCommit(): Boolean = sqlSession.autoCommit
 
     override fun commit() {
-        // v1 memory mode: no buffered transaction state
+        checkOpen()
+        if (sqlSession.autoCommit) return
+        blocking {
+            sqlSession.commit(runtime)
+        }
     }
 
-    override fun rollback() {}
+    override fun rollback() {
+        checkOpen()
+        sqlSession.rollback()
+    }
 
     override fun checkOpen() {
         if (closed) throw SQLException("Connection is closed")
