@@ -1,7 +1,7 @@
 # KDB Layer 9 — Implementation Execution Plan
 
 **Status:** Implemented (first Kotlin cut — May 2026)  
-**Master spec:** `docs/kdb-spec-v0_9.md` §16.1 (Layer 9), §0 (session state)  
+**Master spec:** `docs/kdb-spec.md` §16.1 (Layer 9), §0 (session state)  
 **Depends on:** Layer 7–8 complete (Components 20–24; `WireTransport` in §17)
 
 -----

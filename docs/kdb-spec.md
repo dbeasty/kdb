@@ -1,6 +1,8 @@
 # KDB — Portable Embedded Database Engine
 
-## Architecture Specification v0.9
+## Architecture Specification
+
+Document version: **v0.9**
 
 -----
 

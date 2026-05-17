@@ -1,7 +1,7 @@
 # KDB Layer 7 — Implementation Execution Plan
 
 **Status:** Implemented (first Kotlin cut — May 2026)  
-**Master spec:** `docs/kdb-spec-v0_9.md` §16.1 (Layer 7), §0 (session state)  
+**Master spec:** `docs/kdb-spec.md` §16.1 (Layer 7), §0 (session state)  
 **Depends on:** Layer 6 complete (Components 17–19 implemented; interfaces in §17)
 
 -----

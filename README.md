@@ -56,17 +56,19 @@ Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-d
 | Document | Audience |
 |----------|----------|
 | [**User guide**](docs/kdb-user-guide.md) | Run the inspect CLI, embed via JDBC (Java), or Kotlin/JS (browser) |
-| [**Architecture specification**](docs/kdb-spec-v0_9.md) | Full system design, protocols, and planned CLI |
+| [**Architecture specification**](docs/kdb-spec.md) | Full system design, protocols, and layer specs |
 
 ### Quick start
 
 ```bash
 ./gradlew build
+./gradlew :kdb-cli:runCli --args="init myapp/users"
+./gradlew :kdb-jdbc:test
 ./gradlew :kdb-inspect:inspectCli --args="dump-wire --file /path/to/frame.bin"
 ```
 
 ```java
-// JDBC (in-memory); see user guide for setup
+// JDBC (in-memory) — seed data via embedded runtime; see user guide
 Class.forName("dev.kdb.jdbc.KdbDriver");
 Connection c = DriverManager.getConnection("jdbc:kdb:memory:///demo/users");
 ```
@@ -75,7 +77,7 @@ Connection c = DriverManager.getConnection("jdbc:kdb:memory:///demo/users");
 
 ## Specification
 
-The current architecture specification is [`docs/kdb-spec-v0_9.md`](docs/kdb-spec-v0_9.md).
+The current architecture specification is [`docs/kdb-spec.md`](docs/kdb-spec.md).
 
 ---
 
