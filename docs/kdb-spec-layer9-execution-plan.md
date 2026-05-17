@@ -1,6 +1,6 @@
 # KDB Layer 9 — Implementation Execution Plan
 
-**Status:** Specs ready — implementation not started  
+**Status:** Implemented (first Kotlin cut — May 2026)  
 **Master spec:** `docs/kdb-spec-v0_9.md` §16.1 (Layer 9), §0 (session state)  
 **Depends on:** Layer 7–8 complete (Components 20–24; `WireTransport` in §17)
 
@@ -181,13 +181,13 @@ kdb-spec-layer9-component27/28. Hook GpuStorageEngine and vector index.
 
 ## Verification checklist
 
-- [ ] `./gradlew :kdb-transport-core:jvmTest`
-- [ ] `./gradlew :kdb-transport-tcp:jvmTest`
-- [ ] `./gradlew :kdb-transport-ws:jvmTest`
-- [ ] `./gradlew :kdb-compute-jvm:test`
-- [ ] `./gradlew :kdb-compute-webgpu:jsTest` (or CPU fallback tests)
-- [ ] `./gradlew :kdb-peer-sync:jvmTest` (existing) + TCP integration test
-- [ ] Layer 7–8 tests still pass
-- [ ] Master spec §0 Layer 9 checklist updated
-- [ ] Master spec §17 Layer 9 interfaces populated
-- [ ] Master spec §14 includes Layer 9 subtotal row
+- [x] `./gradlew :kdb-transport-core:jvmTest`
+- [x] `./gradlew :kdb-transport-tcp:jvmTest`
+- [x] `./gradlew :kdb-transport-ws:jvmTest`
+- [x] `./gradlew :kdb-compute-jvm:test`
+- [x] `./gradlew :kdb-compute-webgpu:jsTest` (CPU fallback)
+- [x] `./gradlew :kdb-peer-sync:jvmTest` + TCP integration test
+- [x] Layer 7–8 tests still pass
+- [x] Master spec §0 Layer 9 checklist updated
+- [x] Master spec §17 Layer 9 interfaces populated
+- [x] Master spec §14 includes Layer 9 subtotal row

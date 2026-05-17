@@ -1,6 +1,6 @@
 # KDB — Portable Embedded Database Engine
 
-> **Status: exploratory speccing work.** This repository contains the architecture specification and design artefacts for KDB. No production implementation exists yet. Everything here is subject to change.
+> **Status: early implementation.** This repository contains the architecture specification, a growing Kotlin Multiplatform implementation, and design artefacts for KDB. APIs and behaviour are subject to change. See the [user guide](docs/kdb-user-guide.md) for how to run and embed what exists today.
 
 ---
 
@@ -48,6 +48,28 @@ Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-d
 - Divergence is normal; merging is explicit and application-controlled
 - Conflicts surface to the application; KDB never silently resolves them
 - History is cheap because unchanged content is shared by hash
+
+---
+
+## Documentation
+
+| Document | Audience |
+|----------|----------|
+| [**User guide**](docs/kdb-user-guide.md) | Run the inspect CLI, embed via JDBC (Java), or Kotlin/JS (browser) |
+| [**Architecture specification**](docs/kdb-spec-v0_9.md) | Full system design, protocols, and planned CLI |
+
+### Quick start
+
+```bash
+./gradlew build
+./gradlew :kdb-inspect:inspectCli --args="dump-wire --file /path/to/frame.bin"
+```
+
+```java
+// JDBC (in-memory); see user guide for setup
+Class.forName("dev.kdb.jdbc.KdbDriver");
+Connection c = DriverManager.getConnection("jdbc:kdb:memory:///demo/users");
+```
 
 ---
 

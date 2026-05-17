@@ -6,6 +6,8 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.kdbSha256
+import dev.kdb.compute.ComputeAdapter
+import dev.kdb.compute.GpuSegmentIngestRequest
 import dev.kdb.storage.*
 import dev.kdb.inspect.sidecar.deltaDebugHookOrNoOp
 import dev.kdb.storage.delta.DeltaSegmentFactory
@@ -179,4 +181,28 @@ public class InMemoryStorageEngine(
 public class GpuStorageEngine(
     namespaceId: String,
     config: StorageEngineConfig,
-) : ServerStorageEngine(namespaceId, config, null)
+    private val computeAdapter: ComputeAdapter? = null,
+) : ServerStorageEngine(namespaceId, config, null) {
+    private val pendingSegments = mutableListOf<DeltaSegmentRef>()
+
+    override val capabilities: StorageCapabilitySet =
+        StorageCapabilitySet(
+            persistsDeltaLog = false,
+            persistsAcrossReload = false,
+            supportsGpuBulkRead = computeAdapter?.capabilities?.supportsVectorSearch == true,
+            supportsDirectDeltaIngest = computeAdapter?.capabilities?.supportsDirectDeltaIngest == true,
+            maxEnlistments = null,
+            indexRetentionDefault = IndexRetention.EVICTABLE,
+        )
+
+    override suspend fun ingestDeltaSegment(segment: DeltaSegmentRef) {
+        pendingSegments.add(segment)
+        val adapter = computeAdapter ?: return
+        val handle =
+            adapter.ingestDeltaSegment(GpuSegmentIngestRequest(segment, ByteArray(0)))
+        pendingSegments.remove(segment)
+        adapter.releaseSegment(handle)
+    }
+
+    public fun pendingSegments(): List<DeltaSegmentRef> = pendingSegments.toList()
+}

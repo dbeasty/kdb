@@ -64,14 +64,16 @@ Layer 8 — Advanced Sync + JDBC [IMPLEMENTED — first Kotlin cut]
   [x] 23. Peer Sync Mode (Mode 3)  — `:kdb-peer-sync`; spec `kdb-spec-layer8-component23-peer-sync-mode.md`
   [x] 24. JDBC Driver              — `:kdb-jdbc`; spec `kdb-spec-layer8-component24-jdbc-driver.md`
 
-Layer 9 — Platform Adapters    [SPECS READY]
-  [ ] 25. Transport — WebSocket     — `:kdb-transport-ws`; spec `kdb-spec-layer9-component25-transport-websocket.md`
-  [ ] 26. Transport — TCP           — `:kdb-transport-tcp` + `:kdb-transport-core`; spec `kdb-spec-layer9-component26-transport-tcp.md`
-  [ ] 27. Compute — WebGPU          — `:kdb-compute-webgpu`; spec `kdb-spec-layer9-component27-compute-webgpu.md`
-  [ ] 28. Compute — CUDA/Vulkan     — `:kdb-compute-jvm` + `:kdb-compute`; spec `kdb-spec-layer9-component28-compute-cuda-vulkan.md`
+Layer 9 — Platform Adapters    [IMPLEMENTED — first Kotlin cut]
+  [x] 25. Transport — WebSocket     — `:kdb-transport-ws`; spec `kdb-spec-layer9-component25-transport-websocket.md`
+  [x] 26. Transport — TCP           — `:kdb-transport-tcp` + `:kdb-transport-core`; spec `kdb-spec-layer9-component26-transport-tcp.md`
+  [x] 27. Compute — WebGPU          — `:kdb-compute-webgpu`; spec `kdb-spec-layer9-component27-compute-webgpu.md`
+  [x] 28. Compute — CUDA/Vulkan     — `:kdb-compute-jvm` + `:kdb-compute`; spec `kdb-spec-layer9-component28-compute-cuda-vulkan.md`
 
-Layer 10 — Tooling (partial)  [IN PROGRESS]
+Layer 10 — Tooling            [IMPLEMENTED — first Kotlin cut]
   [x] 31. Inspect / Debug Tooling — `:kdb-inspect`; spec `kdb-spec-layer10-component31-inspect-tooling.md`
+  [x] 29. CLI                     — `:kdb-cli`; spec `kdb-spec-layer10-component29-cli.md`
+  [x] 30. Integration Test Suite  — `:kdb-integration`; spec `kdb-spec-layer10-component30-integration-test-suite.md`
 ```
 
 ### What Has Been Done
@@ -99,13 +101,14 @@ Layer 10 — Tooling (partial)  [IN PROGRESS]
 - Layer 7 implemented (first Kotlin cut): `:kdb-wire`, `:kdb-stream`, `:kdb-storage-tier`. Wire frame codec (JSON payload v1), in-memory transport, stream coordinator/subscriber, ice bundle archive/stub/restore.
 - Layer 8 component specs generated (2 files): Components 23–24 — peer sync Mode 3, JDBC driver. Execution plan: `kdb-spec-layer8-execution-plan.md`.
 - Layer 8 implemented (first Kotlin cut): `:kdb-peer-sync` (FULL_PEER handshake, CommitFetch/Push, bidirectional in-memory sync), `:kdb-jdbc` (memory-mode Driver/Connection/Statement/ResultSet/MetaData).
-- Layer 9 component specs generated (4 files + shared modules): Components 25–28 — WebSocket transport, TCP transport, WebGPU compute, CUDA/Vulkan/CPU compute. Execution plan: `kdb-spec-layer9-execution-plan.md`. Draft interfaces in Section 17 → Layer 9.
+- Layer 9 component specs generated (4 files + shared modules): Components 25–28 — WebSocket transport, TCP transport, WebGPU compute, CUDA/Vulkan/CPU compute. Execution plan: `kdb-spec-layer9-execution-plan.md`.
+- Layer 9 implemented (first Kotlin cut): `:kdb-transport-core`, `:kdb-transport-tcp`, `:kdb-transport-ws`, `:kdb-compute`, `:kdb-compute-jvm`, `:kdb-compute-webgpu`. TCP loopback + peer sync integration; CPU compute fallback for WebGPU/CUDA.
+- Layer 10 component specs generated: Components 29–30 — CLI, integration test suite. Execution plan: `kdb-spec-layer10-execution-plan.md`.
+- Layer 10 implemented (first Kotlin cut): `:kdb-cli` (init/put/get/query/log/status/sync), `:kdb-integration` (cross-layer scenarios). Component 31 inspect landed earlier.
 
 ### What To Do Next
 
-**Layer 9 — Platform Adapters** (depends on Layer 8). Implement per `kdb-spec-layer9-execution-plan.md`: **transport-core → TCP (26) → WebSocket (25) → compute API → CPU/GPU backends (28, 27)**. See Section 16.1.
-
-**Layer 10 — Tooling** (after Layer 9): Component 29 CLI, Component 30 integration test suite (Component 31 inspect tooling already landed).
+**All planned layers (0–10) have a first Kotlin implementation.** Follow-on work: persistent CLI store, CUDA/Vulkan real backends, GraalVM CLI binary, Hibernate integration tests, TLS on transport.
 
 Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
 
@@ -1120,7 +1123,7 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |JDBC integration tests (Hibernate, jOOQ, Spring Data)                           |2,000      |
 |**Total**                                                                        |**~131,850**|
 
-> **Cumulative note:** Layer 9 specs add ~9,500 NBNC to the plan; implementation not yet started. Prior cumulative with Layers 0–8 implemented was ~122,350.
+> **Cumulative note:** Layers 9–10 implemented add ~12,700 NBNC (9: ~9,500; 10: ~3,200). **~135,050** total planned NBNC with all layers at first Kotlin cut.
 
 > **Note:** Storage adapter line items for RocksDB, IndexedDB, LMDB, and mmap are removed. The KDB Storage Engine and Storage Manager components above replace them entirely. The B-tree index estimate increases slightly because it now owns the full LSM path in pure Kotlin rather than delegating to RocksDB.
 
@@ -1345,10 +1348,10 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 9 — Platform Adapters (depends on Layer 7–8)
 
 ```
-[ ] 25. Transport Adapter — WebSocket   — `:kdb-transport-ws`; spec `kdb-spec-layer9-component25-transport-websocket.md`
-[ ] 26. Transport Adapter — TCP         — `:kdb-transport-tcp`, `:kdb-transport-core`; spec `kdb-spec-layer9-component26-transport-tcp.md`
-[ ] 27. Compute Adapter — WebGPU        — `:kdb-compute-webgpu`; spec `kdb-spec-layer9-component27-compute-webgpu.md`
-[ ] 28. Compute Adapter — CUDA/Vulkan   — `:kdb-compute-jvm`, `:kdb-compute`; spec `kdb-spec-layer9-component28-compute-cuda-vulkan.md`
+[x] 25. Transport Adapter — WebSocket   — `:kdb-transport-ws`; spec `kdb-spec-layer9-component25-transport-websocket.md`
+[x] 26. Transport Adapter — TCP         — `:kdb-transport-tcp`, `:kdb-transport-core`; spec `kdb-spec-layer9-component26-transport-tcp.md`
+[x] 27. Compute Adapter — WebGPU        — `:kdb-compute-webgpu`; spec `kdb-spec-layer9-component27-compute-webgpu.md`
+[x] 28. Compute Adapter — CUDA/Vulkan   — `:kdb-compute-jvm`, `:kdb-compute`; spec `kdb-spec-layer9-component28-compute-cuda-vulkan.md`
 ```
 
 **Layer 9 implementation order (normative):**
@@ -1369,9 +1372,13 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 
 ```
 [x] 31. Inspect / Debug Tooling       — `:kdb-inspect`; JSON sidecar + dump; spec: `kdb-spec-layer10-component31-inspect-tooling.md`
-[ ] 29. CLI
-[ ] 30. Integration Test Suite
+[x] 29. CLI                           — `:kdb-cli`; spec: `kdb-spec-layer10-component29-cli.md`
+[x] 30. Integration Test Suite        — `:kdb-integration`; spec: `kdb-spec-layer10-component30-integration-test-suite.md`
 ```
+
+**Layer 10 implementation order (normative):** 31 (inspect, early) → **29 CLI** → **30 integration suite**. Detailed plan: `docs/kdb-spec-layer10-execution-plan.md`.
+
+**Estimated NBNC (Layer 10 production + tests):** ~4,200 lines (31: ~1,000; 29: ~1,800; 30: ~1,400).
 
 ### 16.2 Component Spec Structure
 
@@ -2910,7 +2917,7 @@ fun openMemoryRuntime(catalog: String, namespaceId: String, schema: KdbSchema): 
 
 ### Layer 9 Interfaces
 
-> **Normative detail:** component specs `kdb-spec-layer9-component25-*.md` through `28-*.md`. Draft below — paste final signatures when each module is implemented.
+> **Normative detail:** `kdb-spec-layer9-component25-*.md` through `28-*.md`, `kdb-spec-layer9-execution-plan.md`.
 
 | Component | Module | Key types |
 |---|---|---|
@@ -2966,8 +2973,35 @@ expect fun createWebGpuComputeAdapter(): ComputeAdapter?
 
 ### Layer 10 Interfaces
 
+#### 29. CLI — `dev.kdb.cli`
+
 ```kotlin
-// dev.kdb.inspect — Component 31 (debug JSON; non-authoritative)
+package dev.kdb.cli
+
+data class CliConfig(val dataDir: String, val nodeId: String = "local", val quiet: Boolean = false)
+fun openCliRuntime(config: CliConfig, namespaceId: String): CliRuntime
+class CliRuntime(val namespaceId: String, internal val embedded: dev.kdb.jdbc.EmbeddedKdbRuntime)
+object KdbCli { fun run(args: Array<String>): Int }
+fun main(args: Array<String>)
+```
+
+#### 30. Integration fixtures — `dev.kdb.integration.fixtures`
+
+```kotlin
+package dev.kdb.integration.fixtures
+
+class IntegrationFixture(val namespaceId: String = "integration/test") {
+    val runtime: dev.kdb.jdbc.EmbeddedKdbRuntime
+    suspend fun writeJson(json: String): dev.kdb.codec.KdbUuid
+    suspend fun head(): dev.kdb.codec.KdbHash
+}
+fun integrationFixture(namespaceId: String = "integration/test"): IntegrationFixture
+```
+
+#### 31. Inspect — `dev.kdb.inspect` (debug JSON; non-authoritative)
+
+```kotlin
+// dev.kdb.inspect — Component 31
 object InspectJson {
     fun commitToJsonLine(commit: KdbCommit): String
     fun deltaRecordToJsonLine(record: DeltaRecord, segmentId: KdbUuid, offset: Long): String

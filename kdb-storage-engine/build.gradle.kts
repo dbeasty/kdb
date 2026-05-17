@@ -16,6 +16,7 @@ kotlin {
             implementation(project(":kdb-document"))
             implementation(project(":kdb-codec"))
             implementation(project(":kdb-error"))
+            implementation(project(":kdb-compute"))
             implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies {

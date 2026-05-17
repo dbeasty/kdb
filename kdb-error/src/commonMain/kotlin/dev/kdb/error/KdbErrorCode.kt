@@ -33,4 +33,8 @@ public enum class KdbErrorCode(public val numericCode: Int) {
     ENCODING_NEGOTIATION_FAILURE(6002),
 
     ARCHIVE_RESTORE(7001),
+
+    TRANSPORT_ERROR(6101),
+    COMPUTE_UNAVAILABLE(6201),
+    COMPUTE_DISPATCH_ERROR(6202),
 }
