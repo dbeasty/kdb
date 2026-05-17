@@ -178,7 +178,7 @@ public class KdbConnection(
 
     override fun prepareStatement(sql: String): PreparedStatement = KdbPreparedStatement(this, sql)
 
-    override fun getMetaData(): DatabaseMetaData = KdbDatabaseMetaData(this)
+    override fun getMetaData(): DatabaseMetaData = KdbDatabaseMetaData.forEmbedded(this)
 
     override fun close() {
         if (closed) return

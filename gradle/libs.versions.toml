@@ -8,6 +8,8 @@ zstd-jni = "1.5.6-3"
 jmh = "1.37"
 jmh-plugin = "0.7.3"
 hikari = "6.2.1"
+hibernate = "6.4.4.Final"
+flyway = "10.10.0"
 
 [libraries]
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
@@ -20,6 +22,8 @@ zstd-jni = { module = "com.github.luben:zstd-jni", version.ref = "zstd-jni" }
 jmh-core = { module = "org.openjdk.jmh:jmh-core", version.ref = "jmh" }
 jmh-generator = { module = "org.openjdk.jmh:jmh-generator-annprocess", version.ref = "jmh" }
 hikari = { module = "com.zaxxer:HikariCP", version.ref = "hikari" }
+hibernate-core = { module = "org.hibernate.orm:hibernate-core", version.ref = "hibernate" }
+flyway-core = { module = "org.flywaydb:flyway-core", version.ref = "flyway" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }

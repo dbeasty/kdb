@@ -10,6 +10,7 @@ dependencies {
     testImplementation(project(":kdb-storage"))
     testImplementation(project(":kdb-transaction"))
     testImplementation(project(":kdb-hybrid-query"))
+    testImplementation(project(":kdb-sql"))
     testImplementation(project(":kdb-jdbc"))
     testImplementation(project(":kdb-peer-sync"))
     testImplementation(project(":kdb-stream"))
@@ -21,4 +22,8 @@ dependencies {
     testImplementation(project(":kdb-wire"))
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
+}
+
+tasks.test {
+    maxParallelForks = 1
 }

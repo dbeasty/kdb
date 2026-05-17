@@ -8,18 +8,57 @@ import java.sql.SQLException
 import java.sql.SQLFeatureNotSupportedException
 import java.sql.Types
 
-public class KdbDatabaseMetaData(
-    private val connection: KdbConnection,
+public class KdbDatabaseMetaData private constructor(
+    private val connection: Connection,
+    private val jdbcCatalog: String,
+    private val defaultTable: String,
+    private val schemaName: String,
+    private val readOnly: Boolean,
+    private val jdbcUrl: String,
 ) : DatabaseMetaData {
+    internal companion object {
+        fun forEmbedded(connection: KdbConnection): KdbDatabaseMetaData =
+            KdbDatabaseMetaData(
+                connection = connection,
+                jdbcCatalog = connection.catalog,
+                defaultTable = connection.embedded.defaultNamespace.substringAfterLast('/'),
+                schemaName = connection.schema ?: connection.embedded.defaultNamespace.substringAfterLast('/'),
+                readOnly = connection.isReadOnly,
+                jdbcUrl = "${KdbDriver.URL_PREFIX}memory:///${connection.catalog}",
+            )
+
+        fun forRemote(
+            connection: Connection,
+            url: KdbJdbcUrl,
+        ): KdbDatabaseMetaData =
+            KdbDatabaseMetaData(
+                connection = connection,
+                jdbcCatalog = url.catalog,
+                defaultTable = url.namespaceId.substringAfterLast('/'),
+                schemaName = url.namespaceId.substringAfterLast('/'),
+                readOnly = connection.isReadOnly,
+                jdbcUrl =
+                    when (url.mode) {
+                        JdbcMode.NETWORK ->
+                            if (url.inprocHub != null) {
+                                "${KdbDriver.URL_PREFIX}inproc://${url.inprocHub}/${url.namespaceId}"
+                            } else {
+                                "${KdbDriver.URL_PREFIX}//${url.networkHost}:${url.networkPort}/${url.namespaceId}"
+                            }
+                        else -> "${KdbDriver.URL_PREFIX}memory:///${url.catalog}"
+                    },
+            )
+    }
+
     override fun allProceduresAreCallable(): Boolean = false
 
     override fun allTablesAreSelectable(): Boolean = true
 
-    override fun getURL(): String = "${KdbDriver.URL_PREFIX}memory:///${connection.catalog}"
+    override fun getURL(): String = jdbcUrl
 
     override fun getUserName(): String = ""
 
-    override fun isReadOnly(): Boolean = connection.isReadOnly
+    override fun isReadOnly(): Boolean = readOnly
 
     override fun nullsAreSortedHigh(): Boolean = false
 
@@ -270,10 +309,9 @@ public class KdbDatabaseMetaData(
         tableNamePattern: String?,
         types: Array<out String>?,
     ): ResultSet {
-        val table = connection.embedded.defaultNamespace.substringAfterLast('/')
         return singleRowResultSet(
             arrayOf("TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "TABLE_TYPE"),
-            arrayOf(connection.catalog, schemaPattern ?: "", table, "TABLE"),
+            arrayOf(jdbcCatalog, schemaPattern ?: "", defaultTable, "TABLE"),
         )
     }
 
@@ -285,13 +323,13 @@ public class KdbDatabaseMetaData(
     ): ResultSet =
         singleRowResultSet(
             arrayOf("TABLE_SCHEM"),
-            arrayOf(schemaPattern ?: connection.schema ?: "main"),
+            arrayOf(schemaPattern ?: schemaName),
         )
 
     override fun getCatalogs(): ResultSet =
         singleRowResultSet(
             arrayOf("TABLE_CAT"),
-            arrayOf(connection.catalog),
+            arrayOf(jdbcCatalog),
         )
 
     override fun getTableTypes(): ResultSet =
@@ -308,8 +346,8 @@ public class KdbDatabaseMetaData(
     ): ResultSet {
         val cols =
             listOf(
-                arrayOf(connection.catalog, schemaPattern ?: "", tableNamePattern ?: "users", "kdb_id", Types.VARCHAR, "VARCHAR"),
-                arrayOf(connection.catalog, schemaPattern ?: "", tableNamePattern ?: "users", "_doc", Types.LONGVARCHAR, "JSON"),
+                arrayOf(jdbcCatalog, schemaPattern ?: "", tableNamePattern ?: defaultTable, "kdb_id", Types.VARCHAR, "VARCHAR"),
+                arrayOf(jdbcCatalog, schemaPattern ?: "", tableNamePattern ?: defaultTable, "_doc", Types.LONGVARCHAR, "JSON"),
             )
         return multiRowResultSet(
             arrayOf("TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE", "TYPE_NAME"),
@@ -427,7 +465,7 @@ public class KdbDatabaseMetaData(
 
     override fun supportsMultipleOpenResults(): Boolean = false
 
-    override fun supportsGetGeneratedKeys(): Boolean = false
+    override fun supportsGetGeneratedKeys(): Boolean = true
 
     override fun getSuperTypes(
         catalog: String?,

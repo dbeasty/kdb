@@ -281,6 +281,7 @@ public sealed class WireMessage {
         val resolvedCommitHex: String,
         val readOnly: Boolean,
         val error: String? = null,
+        val generatedIds: List<String> = emptyList(),
     ) : WireMessage()
 
     public data class TxCommit(

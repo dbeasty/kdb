@@ -5,6 +5,7 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.embed.commitViaEngine
 import dev.kdb.index.compositeIndexStoreFactory
 import dev.kdb.jdbc.memory.MemoryRuntimeRegistry
 import dev.kdb.schema.KdbFieldType
@@ -42,19 +43,15 @@ internal object JdbcTestSupport {
                 storage,
             )
             val doc = KdbDocument(KdbUuid.random(), """{"userId":"u1","status":"active"}""")
-            storage.putDocument(ns, doc)
-            val parent = dag.head()
-            val tree = storage.commitTree(ns, dag.getCommitOrThrow(parent).documentTreeHash)
             val tx =
                 KdbTransaction(
                     KdbUuid.random(),
-                    parent,
+                    dag.head(),
                     listOf(KdbOp.Write(doc.id, doc.json)),
                     KdbTimestamp.now(),
                     KdbUuid.random(),
                 )
-            val commit = dag.appendCommit(tx, parent, tree, null)
-            manager.writer.applyCommit(commit, manager.registryFor(ns), storage, schema)
+            commitViaEngine(runtime, ns, tx, schema)
         }
         conn.applyQuerySchema(schema)
     }

@@ -10,6 +10,7 @@ import dev.kdb.error.DocumentLockedException
 import dev.kdb.query.hybrid.HybridQueryRequest
 import dev.kdb.query.hybrid.ReadConsistency
 import dev.kdb.sql.SqlCell
+import dev.kdb.sql.decodeSqlParameters
 import dev.kdb.sql.defaultSqlParser
 import dev.kdb.sql.isDdlStatement
 import dev.kdb.sql.isTransactionControlStatement
@@ -100,12 +101,14 @@ public class SqlWireHost(
         }
         return try {
             val deferCommit = !session.autoCommit
+            val parameters = decodeSqlParameters(msg.parametersJson)
             val result =
                 server.runtime.hybrid.execute(
                     msg.sql,
                     HybridQueryRequest(
                         namespaceId = session.namespaceId,
                         schema = server.runtime.schema,
+                        parameters = parameters,
                         readConsistency = session.readConsistency,
                         readPin = session.readPin,
                         sessionCheckout = session.sessionCheckout,
@@ -134,6 +137,7 @@ public class SqlWireHost(
                 resolvedCommitHex = json.resolvedCommit,
                 readOnly = json.readOnly,
                 error = null,
+                generatedIds = result.result.generatedIds,
             )
         } catch (e: Throwable) {
             sqlError(msg, e.message ?: e.toString())

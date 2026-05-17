@@ -172,7 +172,13 @@ public class TcpLoopbackServer(
             port = ss.localPort
             scope.launch {
                 while (scope.isActive) {
-                    val client = ss.accept()
+                    val client =
+                        try {
+                            ss.accept()
+                        } catch (_: java.net.SocketException) {
+                            if (!scope.isActive) break
+                            continue
+                        }
                     client.tcpNoDelay = true
                     active.incrementAndGet()
                     val conn = TcpSocketConnection(client, options)

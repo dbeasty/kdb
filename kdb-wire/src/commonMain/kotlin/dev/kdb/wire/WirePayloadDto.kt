@@ -170,6 +170,7 @@ internal data class SqlResultDto(
     val resolvedCommitHex: String = "",
     val readOnly: Boolean = true,
     val error: String? = null,
+    val generatedIds: List<String> = emptyList(),
 )
 
 @Serializable

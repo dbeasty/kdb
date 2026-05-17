@@ -5,6 +5,7 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.embed.commitViaEngine
 import dev.kdb.index.compositeIndexStoreFactory
 import dev.kdb.jdbc.file.openFileRuntime
 import dev.kdb.schema.KdbFieldType
@@ -81,10 +82,21 @@ class FilePersistenceTest {
         val url = "jdbc:kdb:file://$root/demo/users"
         val schema = JdbcTestSupport.usersSchema()
         DriverManager.getConnection(url).use { conn ->
-            val kdb = conn as KdbConnection
-            JdbcTestSupport.seedUsers(kdb, schema)
+            conn.createStatement().use { st ->
+                st.executeUpdate(
+                    """CREATE TABLE users (
+                    userId VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL
+                )""",
+                )
+            }
+            conn.prepareStatement("INSERT INTO users (userId, status) VALUES (?, ?)").use { ps ->
+                ps.setString(1, "u1")
+                ps.setString(2, "active")
+                assertEquals(1, ps.executeUpdate())
+            }
             val updated =
-                kdb.createStatement().executeUpdate(
+                conn.createStatement().executeUpdate(
                     "UPDATE users SET status = 'committed' WHERE userId = 'u1'",
                 )
             assertEquals(1, updated)
@@ -129,18 +141,14 @@ class FilePersistenceTest {
             storage,
         )
         val doc = KdbDocument(KdbUuid.random(), """{"userId":"u1"}""")
-        storage.putDocument(ns, doc)
-        val parent = dag.head()
-        val tree = storage.commitTree(ns, dag.getCommitOrThrow(parent).documentTreeHash)
         val tx =
             KdbTransaction(
                 KdbUuid.random(),
-                parent,
+                dag.head(),
                 listOf(KdbOp.Write(doc.id, doc.json)),
                 KdbTimestamp.now(),
                 KdbUuid.random(),
             )
-        val commit = dag.appendCommit(tx, parent, tree, null)
-        manager.writer.applyCommit(commit, manager.registryFor(ns), storage, schema)
+        commitViaEngine(runtime, ns, tx, schema)
     }
 }

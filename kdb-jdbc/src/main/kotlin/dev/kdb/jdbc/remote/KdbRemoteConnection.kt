@@ -1,9 +1,12 @@
 package dev.kdb.jdbc.remote
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.jdbc.KdbDatabaseMetaData
 import dev.kdb.jdbc.KdbJdbcUrl
+import dev.kdb.jdbc.KdbPreparedStatement
 import dev.kdb.jdbc.KdbSqlConnection
 import dev.kdb.jdbc.KdbStatement
+import dev.kdb.sql.encodeSqlParameters
 import dev.kdb.query.hybrid.HybridQueryResult
 import dev.kdb.query.hybrid.ReadConsistency
 import dev.kdb.sql.ColumnSource
@@ -88,9 +91,6 @@ public class KdbRemoteConnection(
         parameters: List<SqlParameter>,
     ): HybridQueryResult {
         checkOpen()
-        if (parameters.isNotEmpty()) {
-            throw SQLFeatureNotSupportedException("remote parameters not supported in v1")
-        }
         val reply =
             rpc.request(
                 WireMessage.SqlExec(
@@ -98,7 +98,7 @@ public class KdbRemoteConnection(
                     namespace = url.namespaceId,
                     sessionId = sessionId,
                     sql = sql,
-                    parametersJson = null,
+                    parametersJson = encodeSqlParameters(parameters),
                 ),
             )
         return when (reply) {
@@ -124,6 +124,7 @@ public class KdbRemoteConnection(
                             columns = columns,
                             rows = rows,
                             rowsAffected = reply.rowsAffected,
+                            generatedIds = reply.generatedIds,
                         ),
                     resolvedCommit = KdbHash.fromHex(reply.resolvedCommitHex),
                     readOnly = reply.readOnly,
@@ -144,8 +145,7 @@ public class KdbRemoteConnection(
 
     override fun createStatement(): java.sql.Statement = KdbStatement(this)
 
-    override fun prepareStatement(sql: String): java.sql.PreparedStatement =
-        throw SQLFeatureNotSupportedException("remote prepared statements not supported in v1")
+    override fun prepareStatement(sql: String): java.sql.PreparedStatement = KdbPreparedStatement(this, sql)
 
     override fun close() {
         closed = true
@@ -225,7 +225,7 @@ public class KdbRemoteConnection(
         if (readOnly) throw SQLException("Connection is read-only")
     }
 
-    override fun getMetaData() = throw SQLFeatureNotSupportedException()
+    override fun getMetaData(): java.sql.DatabaseMetaData = KdbDatabaseMetaData.forRemote(this, url)
     override fun getCatalog(): String = url.catalog
     override fun setCatalog(catalog: String) {}
     override fun getSchema(): String? = url.namespaceId.substringAfterLast('/')

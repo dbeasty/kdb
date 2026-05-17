@@ -128,6 +128,7 @@ public fun queryResultSet(result: QueryResult): ResultSet {
                     if (iface.isInstance(state)) iface.cast(state) else throw SQLFeatureNotSupportedException()
                 }
                 "isWrapperFor" -> args[0] is Class<*> && (args[0] as Class<*>).isInstance(state)
+                "hashCode" -> System.identityHashCode(state)
                 else -> unsupported(method)
             }
         }

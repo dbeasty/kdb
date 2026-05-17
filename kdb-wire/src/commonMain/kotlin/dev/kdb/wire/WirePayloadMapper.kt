@@ -222,6 +222,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         resolvedCommitHex = resolvedCommitHex,
                         readOnly = readOnly,
                         error = error,
+                        generatedIds = generatedIds,
                     ),
             )
 
@@ -434,6 +435,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                 s.resolvedCommitHex,
                 s.readOnly,
                 s.error,
+                s.generatedIds,
             )
         }
 

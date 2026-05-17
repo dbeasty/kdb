@@ -9,7 +9,7 @@ import java.sql.*
 import java.util.Calendar
 
 public class KdbPreparedStatement(
-    connection: KdbConnection,
+    connection: KdbSqlConnection,
     private val sql: String,
 ) : KdbStatement(connection), PreparedStatement {
     private val bindingSlots = mutableListOf<SqlParameter?>()
