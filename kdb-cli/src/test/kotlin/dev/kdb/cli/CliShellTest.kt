@@ -92,7 +92,7 @@ class CliShellTest {
     @Test
     fun parseArgs_shell() {
         val (_, cmd) = parseArgs(arrayOf("--data-dir", "/tmp/kdb", "shell", "app/ns"))
-        assertEquals("app/ns", (cmd as CliCommand.Shell).namespace)
+        assertEquals("app/ns", (cmd as CoreCliCommand.Shell).namespace)
     }
 
     private fun captureStdout(block: () -> Unit): String {

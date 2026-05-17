@@ -12,6 +12,7 @@ import dev.kdb.schema.isNone
 import dev.kdb.sql.sqlEngine
 import dev.kdb.storage.StorageEngineConfig
 import dev.kdb.storage.engine.DefaultStorageEngineFactory
+import dev.kdb.storage.engine.ServerStorageEngine
 import dev.kdb.storage.engine.StorageEngineTarget
 import dev.kdb.storage.io.FileBackedPlatformIoShimFactory
 import dev.kdb.storage.io.PlatformIoConfig
@@ -42,6 +43,9 @@ public fun openFileRuntime(
         runBlocking {
             DefaultStorageEngineFactory(StorageEngineTarget.SERVER).open(namespaceId, config)
         }
+    runBlocking {
+        (handle.adapter as? ServerStorageEngine)?.recoverBlobsFromWal()
+    }
     val deltaWriter =
         handle.deltaWriter
             ?: error("SERVER storage engine requires delta writer for file mode")

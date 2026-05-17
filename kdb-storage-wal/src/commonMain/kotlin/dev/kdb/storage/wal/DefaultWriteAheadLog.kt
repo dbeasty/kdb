@@ -111,6 +111,22 @@ public class DefaultWriteAheadLogFactory(
         config: StorageEngineConfig,
         ioShim: PlatformIoShim,
     ): WriteAheadLog {
+        val existing =
+            ioShim.listSegments(partitionKey).filter { segment ->
+                segment.contains("/wal/")
+            }
+        if (existing.isNotEmpty()) {
+            val name = existing.max()
+            val walId = KdbUuid.fromString(name.substringAfterLast('/'))
+            return DefaultWriteAheadLog(
+                walId,
+                partitionKey,
+                name,
+                ioShim,
+                walMaxSegmentBytes,
+                skipCorrupt,
+            )
+        }
         val walId = KdbUuid.random()
         val name = activeSegmentName(partitionKey, walId)
         ioShim.appendToSegment(name, byteArrayOf())

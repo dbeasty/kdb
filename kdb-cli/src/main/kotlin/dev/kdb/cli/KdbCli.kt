@@ -39,6 +39,14 @@ private fun printUsage() {
           status <namespace>
           sync <namespace> <peer-uri>
           shell <namespace>          interactive REPL (put, query, get, …)
+
+        File attachments (see kdb-spec-layer1-component3b-file-attachments.md):
+          file put <namespace> [--id UUID] [--zip] <local-path>
+          file put <namespace> --bundle <UUID> [--zip] <paths...>
+          file get <namespace> --id <UUID> [-o path]
+          file get <namespace> --bundle <UUID> [-o archive.zip]
+          file get <namespace> --bundle <UUID> --member <fileId> [-o path]
+          file meta <namespace> --id <UUID> | --bundle <UUID>
         """.trimIndent(),
     )
 }

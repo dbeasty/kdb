@@ -24,14 +24,15 @@ internal object CliCommands {
     fun execute(config: CliConfig, command: CliCommand): Int {
         return try {
             when (command) {
-                is CliCommand.Init -> cmdInit(config, command.namespace)
-                is CliCommand.Put -> runBlocking { cmdPut(config, command) }
-                is CliCommand.Get -> runBlocking { cmdGet(config, command) }
-                is CliCommand.Query -> runBlocking { cmdQuery(config, command) }
-                is CliCommand.Log -> runBlocking { cmdLog(config, command) }
-                is CliCommand.Status -> runBlocking { cmdStatus(config, command) }
-                is CliCommand.Sync -> runBlocking { cmdSync(config, command) }
-                is CliCommand.Shell -> runShell(config, command.namespace)
+                is CoreCliCommand.Init -> cmdInit(config, command.namespace)
+                is CoreCliCommand.Put -> runBlocking { cmdPut(config, command) }
+                is CoreCliCommand.Get -> runBlocking { cmdGet(config, command) }
+                is CoreCliCommand.Query -> runBlocking { cmdQuery(config, command) }
+                is CoreCliCommand.Log -> runBlocking { cmdLog(config, command) }
+                is CoreCliCommand.Status -> runBlocking { cmdStatus(config, command) }
+                is CoreCliCommand.Sync -> runBlocking { cmdSync(config, command) }
+                is CoreCliCommand.Shell -> runShell(config, command.namespace)
+                is FileCliWrapper -> runBlocking { cmdFile(config, command.command) }
             }
         } catch (e: IllegalArgumentException) {
             System.err.println("Error: ${e.message}")
@@ -51,37 +52,47 @@ internal object CliCommands {
         return 0
     }
 
-    private suspend fun cmdPut(config: CliConfig, cmd: CliCommand.Put): Int {
+    private suspend fun cmdFile(config: CliConfig, cmd: FileCliCommand): Int {
+        val session = CliSession(config, cmd.namespace, openCliRuntime(config, cmd.namespace))
+        when (cmd) {
+            is FileCliCommand.Put -> FileCli.executePut(session, cmd)
+            is FileCliCommand.Get -> FileCli.executeGet(session, cmd)
+            is FileCliCommand.Meta -> FileCli.executeMeta(session, cmd)
+        }
+        return 0
+    }
+
+    private suspend fun cmdPut(config: CliConfig, cmd: CoreCliCommand.Put): Int {
         val rt = openCliRuntime(config, cmd.namespace)
         executePut(CliSession(config, cmd.namespace, rt), cmd.payload)
         return 0
     }
 
-    private suspend fun cmdGet(config: CliConfig, cmd: CliCommand.Get): Int {
+    private suspend fun cmdGet(config: CliConfig, cmd: CoreCliCommand.Get): Int {
         val rt = openCliRuntime(config, cmd.namespace)
         executeGet(CliSession(config, cmd.namespace, rt), cmd.docId)
         return 0
     }
 
-    private suspend fun cmdQuery(config: CliConfig, cmd: CliCommand.Query): Int {
+    private suspend fun cmdQuery(config: CliConfig, cmd: CoreCliCommand.Query): Int {
         val rt = openCliRuntime(config, cmd.namespace)
         executeQuery(CliSession(config, cmd.namespace, rt), cmd.sql)
         return 0
     }
 
-    private suspend fun cmdLog(config: CliConfig, cmd: CliCommand.Log): Int {
+    private suspend fun cmdLog(config: CliConfig, cmd: CoreCliCommand.Log): Int {
         val rt = openCliRuntime(config, cmd.namespace)
         executeLog(CliSession(config, cmd.namespace, rt))
         return 0
     }
 
-    private suspend fun cmdStatus(config: CliConfig, cmd: CliCommand.Status): Int {
+    private suspend fun cmdStatus(config: CliConfig, cmd: CoreCliCommand.Status): Int {
         val rt = openCliRuntime(config, cmd.namespace)
         executeStatus(CliSession(config, cmd.namespace, rt))
         return 0
     }
 
-    private suspend fun cmdSync(config: CliConfig, cmd: CliCommand.Sync): Int {
+    private suspend fun cmdSync(config: CliConfig, cmd: CoreCliCommand.Sync): Int {
         val rt = openCliRuntime(config, cmd.namespace)
         executeSync(CliSession(config, cmd.namespace, rt), cmd.peerUri)
         return 0

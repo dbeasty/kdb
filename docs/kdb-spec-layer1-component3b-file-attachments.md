@@ -4,7 +4,7 @@
 
 # Package: `dev.kdb.document` (conventions) · `dev.kdb.file` (future helpers)
 
-# Status: **Draft** — normative for new CLI / transaction / GC work
+# Status: **Implemented (first cut)** — `:kdb-file` module + CLI `file` subcommands
 
 # Depends on: [Component 3 — Document + Commit Model](kdb-spec-layer1-component3-document-commit-model.md), Layer 0 Codec, Component 9 Storage Adapter, [Layer 8 File Persistence](kdb-spec-layer8-file-persistence-plan.md)
 

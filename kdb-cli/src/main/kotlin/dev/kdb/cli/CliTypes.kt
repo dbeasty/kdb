@@ -29,25 +29,34 @@ public fun openCliRuntime(config: CliConfig, namespaceId: String): CliRuntime {
     return CliRuntime(namespaceId, openFileRuntime(config.dataDir, catalog, namespaceId))
 }
 
-internal sealed class CliCommand {
-    data class Init(val namespace: String) : CliCommand()
+internal sealed interface CliCommand
 
-    data class Put(val namespace: String, val payload: String) : CliCommand()
+internal sealed class CoreCliCommand : CliCommand {
+    data class Init(val namespace: String) : CoreCliCommand()
 
-    data class Get(val namespace: String, val docId: String) : CliCommand()
+    data class Put(val namespace: String, val payload: String) : CoreCliCommand()
 
-    data class Query(val namespace: String, val sql: String) : CliCommand()
+    data class Get(val namespace: String, val docId: String) : CoreCliCommand()
 
-    data class Log(val namespace: String) : CliCommand()
+    data class Query(val namespace: String, val sql: String) : CoreCliCommand()
 
-    data class Status(val namespace: String) : CliCommand()
+    data class Log(val namespace: String) : CoreCliCommand()
 
-    data class Sync(val namespace: String, val peerUri: String) : CliCommand()
+    data class Status(val namespace: String) : CoreCliCommand()
 
-    data class Shell(val namespace: String) : CliCommand()
+    data class Sync(val namespace: String, val peerUri: String) : CoreCliCommand()
+
+    data class Shell(val namespace: String) : CoreCliCommand()
 }
 
-internal fun parseArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
+internal data class FileCliWrapper(val command: FileCliCommand) : CliCommand
+
+internal fun parseArgs(args: Array<String>): Pair<CliConfig, CliCommand?> =
+    parseCoreArgs(args).let { (config, core) ->
+        if (core != null) config to core else parseFileCommandAsCli(args)
+    }
+
+private fun parseCoreArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
     var dataDir: String? = null
     var quiet = false
     val rest = mutableListOf<String>()
@@ -70,41 +79,47 @@ internal fun parseArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
     }
     val config = CliConfig(dataDir = dataDir ?: CliConfig().dataDir, quiet = quiet)
     if (rest.isEmpty()) return config to null
+    if (rest[0] == "file") return config to null
     val cmd =
         when (rest[0]) {
             "init" -> {
                 require(rest.size >= 2) { "usage: kdb init <namespace>" }
-                CliCommand.Init(rest[1])
+                CoreCliCommand.Init(rest[1])
             }
             "put" -> {
                 require(rest.size >= 3) { "usage: kdb put <namespace> <file|json>" }
-                CliCommand.Put(rest[1], rest[2])
+                CoreCliCommand.Put(rest[1], rest[2])
             }
             "get" -> {
                 require(rest.size >= 3) { "usage: kdb get <namespace> <docId>" }
-                CliCommand.Get(rest[1], rest[2])
+                CoreCliCommand.Get(rest[1], rest[2])
             }
             "query" -> {
                 require(rest.size >= 3) { "usage: kdb query <namespace> <sql>" }
-                CliCommand.Query(rest[1], rest.drop(2).joinToString(" "))
+                CoreCliCommand.Query(rest[1], rest.drop(2).joinToString(" "))
             }
             "log" -> {
                 require(rest.size >= 2) { "usage: kdb log <namespace>" }
-                CliCommand.Log(rest[1])
+                CoreCliCommand.Log(rest[1])
             }
             "status" -> {
                 require(rest.size >= 2) { "usage: kdb status <namespace>" }
-                CliCommand.Status(rest[1])
+                CoreCliCommand.Status(rest[1])
             }
             "sync" -> {
                 require(rest.size >= 3) { "usage: kdb sync <namespace> <peer-uri>" }
-                CliCommand.Sync(rest[1], rest[2])
+                CoreCliCommand.Sync(rest[1], rest[2])
             }
             "shell" -> {
                 require(rest.size >= 2) { "usage: kdb shell <namespace>" }
-                CliCommand.Shell(rest[1])
+                CoreCliCommand.Shell(rest[1])
             }
             else -> throw IllegalArgumentException("unknown command: ${rest[0]}")
         }
     return config to cmd
+}
+
+internal fun parseFileCommandAsCli(args: Array<String>): Pair<CliConfig, CliCommand?> {
+    val (config, fileCmd) = parseFileCommand(args)
+    return config to fileCmd?.let { FileCliWrapper(it) }
 }

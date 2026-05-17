@@ -23,7 +23,7 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 | CLI persistence (`--data-dir`) | `put` / `get` / `query` survive separate CLI invocations (delta log + SERVER engine) |
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
-| **File attachments** (`file put` / `get`, ZIP, bundles, `fileId` GUID) | Specified in [file attachments spec](kdb-spec-layer1-component3b-file-attachments.md); not in v1 CLI |
+| **File attachments** (`file put` / `get` / `meta`, ZIP, bundles, `fileId` GUID) | Implemented — see [file attachments spec](kdb-spec-layer1-component3b-file-attachments.md) |
 
 ---
 
@@ -72,6 +72,10 @@ Commands:
 | `log` | `log <namespace>` | Print commit history |
 | `status` | `status <namespace>` | Print HEAD hash and document count |
 | `sync` | `sync <namespace> <peer-uri>` | Bidirectional peer sync (e.g. TCP loopback URI) |
+| `file put` | `file put <namespace> [--id UUID] [--zip] <path>` | Store opaque file (metadata doc + blob) |
+| `file put` (bundle) | `file put <namespace> --bundle <UUID> [--zip] <paths...>` | Store multiple files in one ZIP blob |
+| `file get` | `file get <namespace> --id <UUID> [-o path]` | Fetch file bytes |
+| `file meta` | `file meta <namespace> --id <UUID>` | Print `kdb.file` JSON metadata |
 | `shell` | `shell <namespace>` | Interactive REPL (one open runtime per session) |
 
 Example:
@@ -80,6 +84,8 @@ Example:
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb init myapp/users"
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb put myapp/users '{\"userId\":\"u1\"}'"
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb query myapp/users 'SELECT _doc FROM users'"
+./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb file put myapp/files --id 00000000-0000-0000-0000-0000000000f1 --zip ./report.pdf"
+./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb file get myapp/files --id 00000000-0000-0000-0000-0000000000f1 -o ./report-copy.pdf"
 ```
 
 **Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. Assume a **single writer** per data directory (no cross-process file locking in v1).

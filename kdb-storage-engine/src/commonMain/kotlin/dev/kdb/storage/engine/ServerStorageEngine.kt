@@ -63,6 +63,21 @@ public open class ServerStorageEngine(
 
     override suspend fun readBlob(contentHash: KdbHash): ByteArray? = memTable.get(contentHash)
 
+    /** Replay [WriteAheadLog] PutBlob records into the memtable (file-mode reopen). */
+    public suspend fun recoverBlobsFromWal() {
+        val log = wal ?: return
+        log.recover { record ->
+            if (record.kind != WalRecordKind.PutBlob) return@recover
+            val payload = record.payload
+            if (payload.size < 32) return@recover
+            val hash = KdbHash.fromBytes(payload.copyOfRange(0, 32))
+            val bytes = payload.copyOfRange(32, payload.size)
+            mutex.withLock {
+                memTable.put(hash, bytes)
+            }
+        }
+    }
+
     override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
         mutex.withLock { docs[document.id] = document }
     }

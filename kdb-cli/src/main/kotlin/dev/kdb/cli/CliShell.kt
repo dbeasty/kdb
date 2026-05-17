@@ -118,6 +118,22 @@ internal suspend fun executeShellLine(session: CliSession, line: String): ShellL
                 CliCommands.executeUse(session, rest)
                 ShellLineResult.Continue
             }
+            "file" -> {
+                val fileArgs = arrayOf("file") + rest.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                if (fileArgs.size < 3) {
+                    return ShellLineResult.Error("usage: file <put|get|meta> ... (see help)")
+                }
+                val sub = fileArgs[1]
+                val ns = session.namespaceId
+                val opts = fileArgs.drop(2)
+                val cmd = parseFileSubcommand(sub, ns, opts)
+                when (cmd) {
+                    is FileCliCommand.Put -> FileCli.executePut(session, cmd)
+                    is FileCliCommand.Get -> FileCli.executeGet(session, cmd)
+                    is FileCliCommand.Meta -> FileCli.executeMeta(session, cmd)
+                }
+                ShellLineResult.Continue
+            }
             else -> ShellLineResult.Error("unknown command: $verb (type help)")
         }
     } catch (e: IllegalArgumentException) {
@@ -134,6 +150,9 @@ private fun printShellHelp() {
         """
         Shell commands (namespace is ${"fixed at start; use 'use' to switch"}):
           put <file|json>     write document + commit
+          file put <path> [--id UUID] [--zip]   store opaque file (metadata + blob)
+          file get --id <UUID> [-o path]      fetch file bytes
+          file meta --id <UUID>               print kdb.file JSON metadata
           get <docId>         print document JSON
           query <sql>         run SELECT (single line)
           log                 commit history

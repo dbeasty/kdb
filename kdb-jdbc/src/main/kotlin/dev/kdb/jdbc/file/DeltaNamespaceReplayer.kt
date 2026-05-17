@@ -44,7 +44,12 @@ public object DeltaNamespaceReplayer {
         for (op in commit.operations) {
             when (op) {
                 is KdbOp.Write -> {
-                    val doc = KdbDocument(op.docId, op.patch)
+                    val doc =
+                        runCatching {
+                            KdbDocument.fromJson(op.docId, op.patch)
+                        }.getOrElse {
+                            KdbDocument(op.docId, op.patch)
+                        }
                     storage.putDocument(namespaceId, doc)
                 }
                 is KdbOp.Delete -> storage.deleteDocument(namespaceId, op.docId)

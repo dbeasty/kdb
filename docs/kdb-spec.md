@@ -17,7 +17,7 @@ Layer 0 — Foundation         [COMPLETE]
 
 Layer 1 — Core Types         [COMPLETE]
   [x] 3. Document + Commit Model   — module `:kdb-document`; normative detail in `kdb-spec-layer1-component3-document-commit-model.md`
-  [ ] 3b. File attachments (draft) — `kdb-spec-layer1-component3b-file-attachments.md` (metadata `kdb.file`, `fileId` GUID, optional ZIP, bundles); CLI/ingest not implemented
+  [x] 3b. File attachments — `:kdb-file`; spec `kdb-spec-layer1-component3b-file-attachments.md`; CLI `file put`/`get`/`meta`
   [x] 4. JSON Functions Engine     — module `:kdb-json`; normative detail in `kdb-spec-layer1-component4-json-functions-engine.md`
 
 Layer 2 — Schema + DAG       [COMPLETE]
