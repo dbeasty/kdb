@@ -92,6 +92,23 @@ class PeerSyncTest {
         }
 
     @Test
+    fun commitsToPushListsForkBranch() =
+        runTest {
+            val ns = "app/fork-push"
+            val dag = inMemoryCommitDag(ns)
+            val storage = InMemoryStorageAdapter()
+            val root = dag.head()
+            val a = appendCommit(dag, storage, ns, root, "a")
+            val b = appendCommit(dag, storage, ns, a.hash, "b")
+            dag.setHead("main", a.hash)
+            appendCommit(dag, storage, ns, a.hash, "c")
+            val commits = commitsToPush(dag, b.hash, a.hash)
+            assertEquals(1, commits.size)
+            assertEquals(b.hash, commits.single().hash)
+            assertTrue(commitsToPush(dag, a.hash, a.hash).isEmpty())
+        }
+
+    @Test
     fun computePlanFork() =
         runTest {
             val ns = "app/fork"

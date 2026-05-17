@@ -27,6 +27,7 @@ kotlin {
                 implementation(project(":kdb-transaction"))
                 implementation(project(":kdb-sql"))
                 implementation(project(":kdb-storage"))
+                implementation(project(":kdb-peer-sync"))
                 implementation(libs.kotlinx.coroutines.core)
                 implementation(libs.kotlinx.serialization.json)
             }
@@ -40,7 +41,6 @@ kotlin {
         val jvmMain by getting {
             dependencies {
                 implementation(project(":kdb-auth"))
-                implementation(project(":kdb-peer-sync"))
                 implementation(project(":kdb-stream"))
                 implementation(project(":kdb-transport-core"))
                 implementation(project(":kdb-transport-ws"))
@@ -48,7 +48,8 @@ kotlin {
         }
         val jsMain by getting {
             dependencies {
-                implementation(project(":kdb-peer-sync"))
+                implementation(project(":kdb-auth"))
+                implementation(project(":kdb-transport-core"))
                 implementation(project(":kdb-stream"))
                 implementation(project(":kdb-transaction"))
                 implementation(project(":kdb-transport-ws"))

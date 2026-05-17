@@ -100,6 +100,9 @@ internal class PeerSyncFrameHandler(
                 throw PeerSyncException("failed to apply commit ${commit.hash.toHex()}", e)
             }
         }
+        if (msg.commits.isNotEmpty()) {
+            dag.setHead("main", msg.commits.last().hash)
+        }
         val ack =
             WireMessage.CommitPush(
                 WireHeader(

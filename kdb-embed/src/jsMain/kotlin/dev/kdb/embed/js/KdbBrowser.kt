@@ -1,13 +1,15 @@
 package dev.kdb.embed.js
 
+import dev.kdb.codec.KdbHash
 import dev.kdb.embed.EmbedSchemaDto
 import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.embed.getJson
-import dev.kdb.embed.materializeCommitHistory
-import dev.kdb.embed.openMemoryRuntime
+import dev.kdb.embed.pushCommitsSinceRemoteHead
 import dev.kdb.embed.putJson
 import dev.kdb.embed.querySql
+import dev.kdb.embed.syncEmbeddedWithPeer
 import dev.kdb.embed.syncEmbedSchema
+import dev.kdb.embed.openMemoryRuntime
 import dev.kdb.embed.toJsonString
 import dev.kdb.embed.toKdbSchema
 import dev.kdb.peersync.PeerClientConfig
@@ -32,12 +34,21 @@ public class KdbBrowserHandle internal constructor(
     private val schema: KdbSchema,
     private val remotePeerUri: String?,
 ) {
+    private val nodeId: String = "browser-${kotlin.random.Random.nextInt()}"
     private var peerClient: dev.kdb.peersync.PeerSyncClient? = null
     private var peerSession: dev.kdb.peersync.PeerSession? = null
+    private var lastRemoteHead: KdbHash? = null
 
     public fun put(json: String): Promise<String> =
         scope.promise {
-            putJson(runtime, namespaceId, json, schema)
+            val docId = putJson(runtime, namespaceId, json, schema)
+            if (remotePeerUri != null) {
+                val session = ensurePeerSession()
+                val remoteHead = lastRemoteHead ?: session.remoteHead
+                val result = pushCommitsSinceRemoteHead(session, runtime.dag, remoteHead)
+                lastRemoteHead = result.localHead
+            }
+            docId
         }
 
     public fun get(docId: String): Promise<String> =
@@ -52,36 +63,43 @@ public class KdbBrowserHandle internal constructor(
 
     public fun sync(): Promise<String> =
         scope.promise {
-            val uri =
-                remotePeerUri
-                    ?: throw IllegalStateException("sync() requires remote mode with peerUri")
-            val wire = defaultWireCodec()
-            val transport = JsWebSocketWireTransport()
-            val client = peerSyncClient(wire, transport, runtime.dag, runtime.storage)
-            peerClient = client
-            val session =
-                client.connect(
-                    PeerClientConfig(
-                        namespaceId = namespaceId,
-                        nodeId = "browser-${kotlin.random.Random.nextInt()}",
-                        peerUri = uri,
-                    ),
-                )
-            peerSession = session
-            val result = session.pullMissing()
-            materializeCommitHistory(runtime, namespaceId, schema)
-            if (!schema.isNone) {
-                syncEmbedSchema(runtime, namespaceId, schema)
-            }
+            remotePeerUri
+                ?: throw IllegalStateException("sync() requires remote mode with peerUri")
+            val session = ensurePeerSession()
+            val result = syncEmbeddedWithPeer(runtime, session, namespaceId, schema)
+            lastRemoteHead = result.finalHead
             """{"appliedCommits":${result.appliedCommits},"pushedCommits":${result.pushedCommits},"head":"${result.finalHead.toHex()}"}"""
         }
 
     public fun close(): Promise<Unit> =
         scope.promise {
             peerSession = null
+            lastRemoteHead = null
             peerClient?.disconnect()
             peerClient = null
         }
+
+    private suspend fun ensurePeerSession(): dev.kdb.peersync.PeerSession {
+        peerSession?.let { return it }
+        val uri =
+            remotePeerUri
+                ?: throw IllegalStateException("peer session requires remote mode with peerUri")
+        val wire = defaultWireCodec()
+        val transport = JsWebSocketWireTransport()
+        val client = peerSyncClient(wire, transport, runtime.dag, runtime.storage)
+        peerClient = client
+        val session =
+            client.connect(
+                PeerClientConfig(
+                    namespaceId = namespaceId,
+                    nodeId = nodeId,
+                    peerUri = uri,
+                ),
+            )
+        peerSession = session
+        lastRemoteHead = session.remoteHead
+        return session
+    }
 }
 
 @JsExport

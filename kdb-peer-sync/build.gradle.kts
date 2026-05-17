@@ -34,9 +34,13 @@ kotlin {
             implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies {
-            implementation(project(":kdb-auth-static"))
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
+        }
+        val jvmTest by getting {
+            dependencies {
+                implementation(project(":kdb-auth-static"))
+            }
         }
     }
 }

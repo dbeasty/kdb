@@ -100,13 +100,13 @@ internal class DefaultPeerSyncClient(
                 else -> message.header.correlationId
             }
         conn.send(wire.encode(message))
-        repeat(2_000) {
+        repeat(4_000) {
             val frame = conn.tryPoll()
             if (frame != null) {
                 val decoded = wire.decode(frame)
                 if (decoded.header.correlationId == cid) return decoded
             }
-            delay(2)
+            delay(5)
         }
         throw PeerSyncException("no response for correlation $cid")
     }
@@ -180,13 +180,7 @@ internal class DefaultPeerSession(
     override suspend fun syncBidirectional(): PeerSyncResult {
         val pull = pullMissing()
         val localHead = dag.head()
-        val toPush =
-            if (dag.hasCommit(remoteHead)) {
-                val walked = dag.walk(from = localHead, until = remoteHead, limit = 100)
-                walked.filterIsInstance<dev.kdb.dag.TraversalEntry.Full>().map { it.commit }.reversed()
-            } else {
-                emptyList()
-            }
+        val toPush = commitsToPush(dag, localHead, remoteHead)
         val pushed = pushCommits(toPush)
         return pull.copy(pushedCommits = pushed, finalHead = dag.head())
     }

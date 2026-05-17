@@ -3,6 +3,7 @@ package dev.kdb.peersync
 import dev.kdb.codec.KdbHash
 import dev.kdb.transport.core.TransportTlsSettings
 import dev.kdb.dag.CommitDag
+import dev.kdb.dag.TraversalEntry
 import dev.kdb.document.KdbCommit
 
 public typealias CommitMaterializer = suspend (KdbCommit) -> Unit
@@ -53,4 +54,16 @@ public suspend fun computeSyncPlan(
             emptyList()
         }
     return DagSyncPlan(ancestor, localOnly, remoteOnly)
+}
+
+public suspend fun commitsToPush(
+    dag: CommitDag,
+    localHead: KdbHash,
+    remoteHead: KdbHash,
+    limit: Int = 100,
+): List<KdbCommit> {
+    if (localHead == remoteHead) return emptyList()
+    if (!dag.hasCommit(remoteHead)) return emptyList()
+    val walked = dag.walk(from = localHead, until = remoteHead, limit = limit)
+    return walked.filterIsInstance<TraversalEntry.Full>().map { it.commit }.reversed()
 }
