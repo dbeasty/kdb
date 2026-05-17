@@ -508,8 +508,8 @@ const result = await db.query("SELECT userId FROM users WHERE userId = 'u1'");
 
 **v1 caveats:**
 
-- **Read-heavy:** `sync()` pulls remote commits into the local runtime; `put()` in remote mode writes **local commits only** (no push to the server yet).
-- **Stream subscribe:** `await db.subscribe((eventJson) => { ... })` receives `DeltaReceived` JSON when the server commits (peer URI `/kdb` → stream `/kdb/stream`). Falls back to `sync()` if the stream disconnects.
+- **Remote writes:** `put()` commits locally and **pushes** to the server over peer sync.
+- **Stream subscribe:** `await db.subscribe((eventJson) => { ... })` receives `DeltaReceived` when the server commits (peer `/kdb` → stream `/kdb/stream`). On disconnect or error, the client runs **`sync()` once** via peer sync (`SyncFallback` / `SyncRecovered` events), then **reconnects the stream** with backoff. Call `sync()` manually anytime for recovery; `unsubscribe()` stops the stream loop without closing the DB.
 - **Dev networking:** use `kdb-ws://localhost` in development (TLS off). For encrypted wire traffic, switch listen URIs to `kdb-wss://` and configure a `tls` block in `config.json` (PKCS12 keystore/truststore paths; passwords via `KDB_TLS_KEYSTORE_PASSWORD` / `KDB_TLS_TRUSTSTORE_PASSWORD`). JDBC remote: `ssl=true` plus `sslTrustStore` / `sslKeyStore` properties. mTLS is JVM-only (not browser WebSocket). Browser embeds use `kdb-wss://` / `wss://` and rely on the platform TLS stack.
 
 Wire transport: [component 25 WebSocket spec](kdb-spec-layer9-component25-transport-websocket.md). Integration tests: `WebSocketPeerSyncIntegrationTest` and `layer9_tcpPeerSync` in `:kdb-integration`.
@@ -520,7 +520,14 @@ Add `:kdb-embed` (or lower-level modules) to your own KMP `js(IR) { browser() }`
 
 ### Stream subscribe over WebSocket
 
-With `kdb-service` running peer sync, stream mode listens on the same host with path `/kdb/stream` (e.g. `kdb-ws://127.0.0.1:7443/kdb/stream`). After `openRemote`, call `subscribe` for live server commits; `put()` still pushes via peer sync. See [stream mode spec](kdb-spec-layer7-component22-stream-mode.md).
+With `kdb-service` running peer sync, stream mode listens on the same host with path `/kdb/stream` (e.g. `kdb-ws://127.0.0.1:7443/kdb/stream`). After `openRemote`, call `subscribe` for live server commits; `put()` still pushes via peer sync. If the stream drops, subscribe recovery runs `sync()` automatically and retries the stream connection. See [stream mode spec](kdb-spec-layer7-component22-stream-mode.md).
+
+```javascript
+await db.subscribe((e) => {
+  const ev = JSON.parse(e);
+  if (ev.type === "SyncRecovered") console.log("caught up via peer sync", ev);
+});
+```
 
 ---
 

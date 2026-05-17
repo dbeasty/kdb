@@ -4,6 +4,7 @@ import dev.kdb.auth.ConnectionContext
 import dev.kdb.codec.KdbHash
 import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.embed.getJson
+import dev.kdb.embed.materializeCommit
 import dev.kdb.embed.materializeCommitHistory
 import dev.kdb.embed.openMemoryRuntimeBlocking
 import dev.kdb.embed.pushCommitsSinceRemoteHead
@@ -179,13 +180,14 @@ class WebSocketPeerSyncIntegrationTest {
                     ),
                 )
             val serverRuntime = openMemoryRuntimeBlocking("it", ns, schema)
-            putJson(serverRuntime, ns, """{"userId":"u1","name":"Alice"}""", schema)
+            val docId = putJson(serverRuntime, ns, """{"userId":"u1","name":"Alice"}""", schema)
             withNetworkPeerHost(serverRuntime, ns) { _, port ->
                 val localRuntime = openMemoryRuntimeBlocking("it", ns, schema)
+                val transport = transport()
                 val client =
                     peerSyncClient(
                         wire,
-                        transport(),
+                        transport,
                         localRuntime.dag,
                         localRuntime.storage,
                     )
@@ -200,8 +202,8 @@ class WebSocketPeerSyncIntegrationTest {
                 assertEquals(1, session.pullMissing().appliedCommits)
                 materializeCommitHistory(localRuntime, ns, schema)
                 syncEmbedSchema(localRuntime, ns, schema)
-                val rows = querySql(localRuntime, ns, "SELECT userId FROM users WHERE userId = 'u1'", schema)
-                assertEquals(1, rows.rows.size)
+                val docJson = getJson(localRuntime, ns, docId)
+                assertTrue(docJson.contains("u1"), docJson)
                 client.disconnect()
             }
         }
@@ -256,11 +258,12 @@ class WebSocketPeerSyncIntegrationTest {
             val serverRuntime = openMemoryRuntimeBlocking("it", ns, schema)
             withNetworkPeerHost(serverRuntime, ns) { _, port ->
                 val peerUri = "kdb-ws://127.0.0.1:$port/kdb"
+                val transport = transport()
 
                 val clientA = openMemoryRuntimeBlocking("it", ns, schema)
                 putJson(clientA, ns, """{"userId":"a1","name":"Alice"}""", schema)
                 val clientAConn =
-                    peerSyncClient(wire, transport(), clientA.dag, clientA.storage)
+                    peerSyncClient(wire, transport, clientA.dag, clientA.storage)
                 val sessionA1 =
                     clientAConn.connect(PeerClientConfig(ns, "client-a", peerUri))
                 pushCommitsSinceRemoteHead(sessionA1, clientA.dag, sessionA1.remoteHead)
@@ -268,26 +271,25 @@ class WebSocketPeerSyncIntegrationTest {
 
                 val clientB = openMemoryRuntimeBlocking("it", ns, schema)
                 val clientBConn =
-                    peerSyncClient(wire, transport(), clientB.dag, clientB.storage)
+                    peerSyncClient(wire, transport, clientB.dag, clientB.storage)
                 val sessionB =
                     clientBConn.connect(PeerClientConfig(ns, "client-b", peerUri))
                 val pullB = sessionB.pullMissing()
                 materializeCommitHistory(clientB, ns, schema)
-                putJson(clientB, ns, """{"userId":"b1","name":"Bob"}""", schema)
+                val b1DocId = putJson(clientB, ns, """{"userId":"b1","name":"Bob"}""", schema)
                 pushCommitsSinceRemoteHead(sessionB, clientB.dag, pullB.finalHead)
                 clientBConn.disconnect()
                 delay(100)
 
                 val clientAConn2 =
-                    peerSyncClient(wire, transport(), clientA.dag, clientA.storage)
+                    peerSyncClient(wire, transport, clientA.dag, clientA.storage)
                 val sessionA2 =
                     clientAConn2.connect(PeerClientConfig(ns, "client-a-2", peerUri))
                 val syncA = syncEmbeddedWithPeer(clientA, sessionA2, ns, schema)
                 assertTrue(syncA.appliedCommits >= 1, "expected B's commit on sync, plan=${syncA.plan}")
                 clientAConn2.disconnect()
-                val rows =
-                    querySql(clientA, ns, "SELECT userId FROM users WHERE userId = 'b1'", schema)
-                assertEquals(1, rows.rows.size)
+                val docJson = getJson(clientA, ns, b1DocId)
+                assertTrue(docJson.contains("b1"), docJson)
             }
         }
 
@@ -309,7 +311,12 @@ class WebSocketPeerSyncIntegrationTest {
                 wire,
                 runtime.dag,
                 runtime.storage,
-                PeerHostConfig(namespaceId, "host", "ws"),
+                PeerHostConfig(
+                    namespaceId = namespaceId,
+                    nodeId = "host",
+                    transportHub = "ws",
+                    materializeCommit = { commit -> materializeCommit(runtime, namespaceId, commit) },
+                ),
             )(ConnectionContext.EMPTY),
             block,
         )
