@@ -77,6 +77,7 @@ Commands:
 | `file get` | `file get <namespace> --id <UUID> [-o path]` | Fetch file bytes |
 | `file meta` | `file meta <namespace> --id <UUID>` | Print `kdb.file` JSON metadata |
 | `shell` | `shell <namespace>` | Interactive REPL (one open runtime per session) |
+| `unlock` | `unlock` | Remove a stale `.kdb.lock` after a crash (holder process must be gone) |
 
 Example:
 
@@ -88,7 +89,17 @@ Example:
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb file get myapp/files --id 00000000-0000-0000-0000-0000000000f1 -o ./report-copy.pdf"
 ```
 
-**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. Assume a **single writer** per data directory (no cross-process file locking in v1).
+**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`.
+
+**Workspace lock:** File mode takes an exclusive lock on `{dataDir}/.kdb.lock` while a process has the database open (CLI, JDBC `jdbc:kdb:file://…`, or your app via `openFileRuntime`). A second process opening the same `--data-dir` fails with a clear error naming the holder PID when known. Only one live writer per workspace.
+
+If your app crashes and leaves the lock file behind, the OS releases the underlying lock when the process exits; you can remove a leftover file with:
+
+```bash
+./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb unlock"
+```
+
+`unlock` deletes `.kdb.lock` only when the PID recorded in the file is **not** running. If another instance is still open, `unlock` refuses and tells you to stop that process first.
 
 ### Interactive shell
 
@@ -117,7 +128,7 @@ Shell commands omit the namespace on each line (it is fixed at startup; use `use
 | `help`, `?` | Command summary |
 | `exit`, `quit` | Leave shell (exit code 0) |
 
-Errors on a line are printed to stderr and the shell continues. Gradle still starts one JVM per `runCli` invocation; within a session, only the first line pays full open/replay cost. Do not run two shells (or a shell plus another CLI process) against the same `--data-dir` concurrently.
+Errors on a line are printed to stderr and the shell continues. Gradle still starts one JVM per `runCli` invocation; within a session, only the first line pays full open/replay cost. A second shell or CLI against the same `--data-dir` is rejected while the lock is held; use `unlock` only after a crash if a stale lock file remains.
 
 Additional git-style commands (`branch`, `merge`, `schema migrate`, `push`, …) are described in [§11 CLI Interface](kdb-spec.md#11-cli-interface) and are not yet exposed on the v1 CLI.
 

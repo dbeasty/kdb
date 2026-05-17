@@ -1,5 +1,6 @@
 package dev.kdb.jdbc
 
+import dev.kdb.error.DataDirectoryLockedException
 import dev.kdb.jdbc.file.openFileRuntime
 import dev.kdb.jdbc.memory.MemoryRuntimeRegistry
 import dev.kdb.jdbc.remote.KdbRemoteConnection
@@ -28,10 +29,14 @@ public class KdbDriver : Driver {
                 val root =
                     parsed.dataRoot
                         ?: throw SQLException("file JDBC URL missing data root")
-                KdbConnection(
-                    openFileRuntime(root, parsed.catalog, parsed.namespaceId),
-                    parsed,
-                )
+                try {
+                    KdbConnection(
+                        openFileRuntime(root, parsed.catalog, parsed.namespaceId, lockHolder = "jdbc"),
+                        parsed,
+                    )
+                } catch (e: DataDirectoryLockedException) {
+                    throw SQLException(e.message, "KDB${e.code.numericCode}", e.code.numericCode, e)
+                }
             }
             JdbcMode.NETWORK -> KdbRemoteConnection(parsed)
         }

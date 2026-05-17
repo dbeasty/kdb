@@ -9,7 +9,10 @@ import dev.kdb.schema.KdbSchema
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.error.DataDirectoryLockedException
 import dev.kdb.error.KdbException
+import dev.kdb.jdbc.file.StaleLockReleaseResult
+import dev.kdb.jdbc.file.releaseStaleDataDirectoryLock
 import dev.kdb.peersync.PeerClientConfig
 import dev.kdb.peersync.peerSyncClient
 import dev.kdb.transport.tcp.defaultTcpWireTransport
@@ -32,11 +35,15 @@ internal object CliCommands {
                 is CoreCliCommand.Status -> runBlocking { cmdStatus(config, command) }
                 is CoreCliCommand.Sync -> runBlocking { cmdSync(config, command) }
                 is CoreCliCommand.Shell -> runShell(config, command.namespace)
+                is CoreCliCommand.Unlock -> cmdUnlock(config)
                 is FileCliWrapper -> runBlocking { cmdFile(config, command.command) }
             }
         } catch (e: IllegalArgumentException) {
             System.err.println("Error: ${e.message}")
             2
+        } catch (e: DataDirectoryLockedException) {
+            System.err.println("Error: ${e.message}")
+            1
         } catch (e: KdbException) {
             System.err.println("Error: ${e.message}")
             1
@@ -47,54 +54,93 @@ internal object CliCommands {
     }
 
     private fun cmdInit(config: CliConfig, namespace: String): Int {
-        openCliRuntime(config, namespace)
-        if (!config.quiet) println("Initialized namespace $namespace")
+        openCliRuntime(config, namespace).use {
+            if (!config.quiet) println("Initialized namespace $namespace")
+        }
+        return 0
+    }
+
+    private fun cmdUnlock(config: CliConfig): Int {
+        when (val result = releaseStaleDataDirectoryLock(config.dataDir)) {
+            StaleLockReleaseResult.NoLockFile -> {
+                if (!config.quiet) println("No lock file at ${config.dataDir}")
+            }
+            is StaleLockReleaseResult.Removed -> {
+                val prev = result.previous
+                if (!config.quiet) {
+                    if (prev != null) {
+                        println(
+                            "Removed stale lock (pid ${prev.pid}, ${prev.holder} on ${prev.host}, acquired ${prev.acquiredAt})",
+                        )
+                    } else {
+                        println("Removed stale lock file")
+                    }
+                }
+            }
+            is StaleLockReleaseResult.StillHeld -> {
+                val info = result.info
+                throw DataDirectoryLockedException(
+                    "database workspace is still open (pid ${info.pid}, ${info.holder} on ${info.host}); stop that process before unlock",
+                    dataRoot = config.dataDir,
+                    holderPid = info.pid,
+                    holderLabel = info.holder,
+                )
+            }
+        }
         return 0
     }
 
     private suspend fun cmdFile(config: CliConfig, cmd: FileCliCommand): Int {
-        val session = CliSession(config, cmd.namespace, openCliRuntime(config, cmd.namespace))
-        when (cmd) {
-            is FileCliCommand.Put -> FileCli.executePut(session, cmd)
-            is FileCliCommand.Get -> FileCli.executeGet(session, cmd)
-            is FileCliCommand.Meta -> FileCli.executeMeta(session, cmd)
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            val session = CliSession(config, cmd.namespace, rt)
+            when (cmd) {
+                is FileCliCommand.Put -> FileCli.executePut(session, cmd)
+                is FileCliCommand.Get -> FileCli.executeGet(session, cmd)
+                is FileCliCommand.Meta -> FileCli.executeMeta(session, cmd)
+            }
         }
         return 0
     }
 
     private suspend fun cmdPut(config: CliConfig, cmd: CoreCliCommand.Put): Int {
-        val rt = openCliRuntime(config, cmd.namespace)
-        executePut(CliSession(config, cmd.namespace, rt), cmd.payload)
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            executePut(CliSession(config, cmd.namespace, rt), cmd.payload)
+        }
         return 0
     }
 
     private suspend fun cmdGet(config: CliConfig, cmd: CoreCliCommand.Get): Int {
-        val rt = openCliRuntime(config, cmd.namespace)
-        executeGet(CliSession(config, cmd.namespace, rt), cmd.docId)
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            executeGet(CliSession(config, cmd.namespace, rt), cmd.docId)
+        }
         return 0
     }
 
     private suspend fun cmdQuery(config: CliConfig, cmd: CoreCliCommand.Query): Int {
-        val rt = openCliRuntime(config, cmd.namespace)
-        executeQuery(CliSession(config, cmd.namespace, rt), cmd.sql)
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            executeQuery(CliSession(config, cmd.namespace, rt), cmd.sql)
+        }
         return 0
     }
 
     private suspend fun cmdLog(config: CliConfig, cmd: CoreCliCommand.Log): Int {
-        val rt = openCliRuntime(config, cmd.namespace)
-        executeLog(CliSession(config, cmd.namespace, rt))
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            executeLog(CliSession(config, cmd.namespace, rt))
+        }
         return 0
     }
 
     private suspend fun cmdStatus(config: CliConfig, cmd: CoreCliCommand.Status): Int {
-        val rt = openCliRuntime(config, cmd.namespace)
-        executeStatus(CliSession(config, cmd.namespace, rt))
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            executeStatus(CliSession(config, cmd.namespace, rt))
+        }
         return 0
     }
 
     private suspend fun cmdSync(config: CliConfig, cmd: CoreCliCommand.Sync): Int {
-        val rt = openCliRuntime(config, cmd.namespace)
-        executeSync(CliSession(config, cmd.namespace, rt), cmd.peerUri)
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            executeSync(CliSession(config, cmd.namespace, rt), cmd.peerUri)
+        }
         return 0
     }
 
@@ -187,7 +233,7 @@ internal object CliCommands {
 
     internal fun executeUse(session: CliSession, namespaceId: String) {
         session.namespaceId = namespaceId
-        session.runtime = openCliRuntime(session.config, namespaceId)
+        session.runtime = session.runtime.switchNamespace(session.config, namespaceId)
         if (!session.config.quiet) {
             println("namespace $namespaceId")
         }

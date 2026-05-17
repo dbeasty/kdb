@@ -156,7 +156,7 @@ Schema fields + `kdb_id` + `_doc` per master §3.2. `SqlCell` mapped to JDBC typ
 ## 8. Non-Goals
 
 - Network `jdbc:kdb://host:port` (Layer 9 transport + future driver work).
-- Cross-process file locking (single-writer assumption for file mode).
+- Cross-process coordination beyond `.kdb.lock` (single-writer per `dataRoot` is enforced; see `DataDirectoryLock`).
 - Full Hibernate dialect (integration tests are Layer 10 Component 30).
 - `CallableStatement`, UDTs, sharding.
 

@@ -25,7 +25,12 @@ public fun openFileRuntime(
     catalog: String,
     namespaceId: String,
     schema: KdbSchema = KdbSchema.NONE,
+    acquireDirectoryLock: Boolean = true,
+    lockHolder: String = "kdb-jdbc",
 ): EmbeddedKdbRuntime {
+    if (acquireDirectoryLock) {
+        DataDirectoryLockRegistry.acquire(dataRoot, lockHolder)
+    }
     NamespacePaths.ensureDirs(dataRoot, namespaceId)
     val io =
         FileBackedPlatformIoShimFactory.open(

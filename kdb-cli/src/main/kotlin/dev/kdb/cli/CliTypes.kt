@@ -1,6 +1,8 @@
 package dev.kdb.cli
 
 import dev.kdb.jdbc.EmbeddedKdbRuntime
+import dev.kdb.jdbc.file.DataDirectoryLockLease
+import dev.kdb.jdbc.file.DataDirectoryLockRegistry
 import dev.kdb.jdbc.file.NamespacePaths
 import dev.kdb.jdbc.file.openFileRuntime
 import java.nio.file.Files
@@ -16,7 +18,29 @@ public data class CliConfig(
 public class CliRuntime(
     public val namespaceId: String,
     public val embedded: EmbeddedKdbRuntime,
-)
+    private val lockLease: DataDirectoryLockLease,
+) : AutoCloseable {
+    override fun close() {
+        lockLease.close()
+    }
+
+    internal fun switchNamespace(config: CliConfig, namespaceId: String): CliRuntime {
+        val metaDir = NamespacePaths.nsDir(config.dataDir, namespaceId)
+        Files.createDirectories(metaDir)
+        val metaFile = metaDir.resolve("meta.json")
+        if (!metaFile.exists()) {
+            metaFile.toFile().writeText(
+                """{"namespaceId":"$namespaceId","createdAt":"${System.currentTimeMillis()}"}""",
+            )
+        }
+        val catalog = NamespacePaths.catalogFromNamespace(namespaceId)
+        return CliRuntime(
+            namespaceId,
+            openFileRuntime(config.dataDir, catalog, namespaceId, acquireDirectoryLock = false),
+            lockLease,
+        )
+    }
+}
 
 public fun openCliRuntime(config: CliConfig, namespaceId: String): CliRuntime {
     val metaDir = NamespacePaths.nsDir(config.dataDir, namespaceId)
@@ -26,7 +50,17 @@ public fun openCliRuntime(config: CliConfig, namespaceId: String): CliRuntime {
         metaFile.toFile().writeText("""{"namespaceId":"$namespaceId","createdAt":"${System.currentTimeMillis()}"}""")
     }
     val catalog = NamespacePaths.catalogFromNamespace(namespaceId)
-    return CliRuntime(namespaceId, openFileRuntime(config.dataDir, catalog, namespaceId))
+    val lockLease = DataDirectoryLockRegistry.acquire(config.dataDir, "kdb-cli")
+    return CliRuntime(
+        namespaceId,
+        openFileRuntime(
+            config.dataDir,
+            catalog,
+            namespaceId,
+            acquireDirectoryLock = false,
+        ),
+        lockLease,
+    )
 }
 
 internal sealed interface CliCommand
@@ -47,6 +81,8 @@ internal sealed class CoreCliCommand : CliCommand {
     data class Sync(val namespace: String, val peerUri: String) : CoreCliCommand()
 
     data class Shell(val namespace: String) : CoreCliCommand()
+
+    data object Unlock : CoreCliCommand()
 }
 
 internal data class FileCliWrapper(val command: FileCliCommand) : CliCommand
@@ -113,6 +149,10 @@ private fun parseCoreArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
             "shell" -> {
                 require(rest.size >= 2) { "usage: kdb shell <namespace>" }
                 CoreCliCommand.Shell(rest[1])
+            }
+            "unlock" -> {
+                require(rest.size == 1) { "usage: kdb unlock (removes stale .kdb.lock when holder process has exited)" }
+                CoreCliCommand.Unlock
             }
             else -> throw IllegalArgumentException("unknown command: ${rest[0]}")
         }

@@ -15,6 +15,7 @@ import dev.kdb.schema.SchemaField
 internal object JdbcTestSupport {
     fun clearMemoryRegistries() {
         MemoryRuntimeRegistry.clearAllBlocking()
+        dev.kdb.jdbc.file.DataDirectoryLockRegistry.clearAllForTests()
     }
 
     fun usersSchema(): KdbSchema =

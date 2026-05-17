@@ -1,5 +1,6 @@
 package dev.kdb.cli
 
+import dev.kdb.error.DataDirectoryLockedException
 import dev.kdb.error.KdbException
 import kotlinx.coroutines.runBlocking
 
@@ -34,25 +35,29 @@ internal fun runShell(
     input: LineReader = SystemLineReader,
 ): Int {
     return try {
-        val runtime = openCliRuntime(config, namespaceId)
-        val session = CliSession(config, namespaceId, runtime)
-        if (!config.quiet) {
-            println("KDB shell — data-dir=${config.dataDir} namespace=$namespaceId (type help)")
-        }
-        while (true) {
+        openCliRuntime(config, namespaceId).use { runtime ->
+            val session = CliSession(config, namespaceId, runtime)
             if (!config.quiet) {
-                print("kdb:${session.namespaceId}> ")
+                println("KDB shell — data-dir=${config.dataDir} namespace=$namespaceId (type help)")
             }
-            val line = input.readLine() ?: break
-            when (val result = runBlocking { executeShellLine(session, line) }) {
-                ShellLineResult.Continue -> {}
-                ShellLineResult.Exit -> return 0
-                is ShellLineResult.Error -> {
-                    System.err.println("Error: ${result.message}")
+            while (true) {
+                if (!config.quiet) {
+                    print("kdb:${session.namespaceId}> ")
+                }
+                val line = input.readLine() ?: break
+                when (val result = runBlocking { executeShellLine(session, line) }) {
+                    ShellLineResult.Continue -> {}
+                    ShellLineResult.Exit -> return 0
+                    is ShellLineResult.Error -> {
+                        System.err.println("Error: ${result.message}")
+                    }
                 }
             }
+            0
         }
-        0
+    } catch (e: DataDirectoryLockedException) {
+        System.err.println("Error: ${e.message}")
+        1
     } catch (e: IllegalArgumentException) {
         System.err.println("Error: ${e.message}")
         2

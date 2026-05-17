@@ -117,6 +117,15 @@ public class StorageTierException(
     override val code: KdbErrorCode get() = KdbErrorCode.STORAGE_TIER_ERROR
 }
 
+public class DataDirectoryLockedException(
+    message: String,
+    public val dataRoot: String,
+    public val holderPid: Long? = null,
+    public val holderLabel: String? = null,
+) : KdbException(message) {
+    override val code: KdbErrorCode get() = KdbErrorCode.DATA_DIRECTORY_LOCKED
+}
+
 public class NamespaceNotFoundException(
     message: String,
     public val namespaceName: String,

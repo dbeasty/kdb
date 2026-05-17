@@ -26,6 +26,7 @@ public enum class KdbErrorCode(public val numericCode: Int) {
     DOCUMENT_LOCKED(4002),
 
     STORAGE_TIER_ERROR(4101),
+    DATA_DIRECTORY_LOCKED(4102),
     NAMESPACE_NOT_FOUND(4201),
 
     INDEX_CORRUPTION(5001),

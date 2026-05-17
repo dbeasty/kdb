@@ -3,6 +3,7 @@ plugins {
 }
 
 dependencies {
+    implementation(project(":kdb-error"))
     implementation(project(":kdb-embed"))
     implementation(project(":kdb-codec"))
     implementation(project(":kdb-dag"))

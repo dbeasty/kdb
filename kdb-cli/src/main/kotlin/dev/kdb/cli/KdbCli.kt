@@ -39,6 +39,7 @@ private fun printUsage() {
           status <namespace>
           sync <namespace> <peer-uri>
           shell <namespace>          interactive REPL (put, query, get, …)
+          unlock                     remove stale .kdb.lock after a crash
 
         File attachments (see kdb-spec-layer1-component3b-file-attachments.md):
           file put <namespace> [--id UUID] [--zip] <local-path>

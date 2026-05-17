@@ -11,6 +11,7 @@ import dev.kdb.sql.defaultSqlParser
 import dev.kdb.sql.isDdlStatement
 import dev.kdb.sql.isDmlStatement
 import dev.kdb.sql.isTransactionControlStatement
+import dev.kdb.jdbc.file.DataDirectoryLockRegistry
 import dev.kdb.jdbc.memory.MemoryRuntimeLease
 import dev.kdb.jdbc.session.EmbeddedSqlSession
 import dev.kdb.sql.SqlParameter
@@ -185,6 +186,9 @@ public class KdbConnection(
         val lease = memoryLease
         closed = true
         lease?.release()
+        if (url.mode == JdbcMode.FILE) {
+            url.dataRoot?.let { DataDirectoryLockRegistry.releaseBlocking(it) }
+        }
     }
 
     override fun isClosed(): Boolean = closed
