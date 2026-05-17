@@ -14,6 +14,7 @@ dependencies {
     implementation(project(":kdb-embed"))
     implementation(project(":kdb-jdbc"))
     implementation(project(":kdb-peer-sync"))
+    implementation(project(":kdb-transport-core"))
     implementation(project(":kdb-transport-tcp"))
     implementation(project(":kdb-hybrid-query"))
     implementation(project(":kdb-schema"))
@@ -26,6 +27,15 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
+}
+
+tasks.register("writeCliClasspath") {
+    dependsOn("jar")
+    val out = layout.buildDirectory.file("cli-classpath.txt")
+    outputs.file(out)
+    doLast {
+        out.get().asFile.writeText(sourceSets.main.get().runtimeClasspath.asPath)
+    }
 }
 
 tasks.register<JavaExec>("runCli") {

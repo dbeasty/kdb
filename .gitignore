@@ -28,6 +28,7 @@ replay_pid*
 
 # Gradle / KMP
 **/build/
+kdb-integration/e2e/.venv/
 .gradle/
 kotlin-js-store/
 **/node_modules/
