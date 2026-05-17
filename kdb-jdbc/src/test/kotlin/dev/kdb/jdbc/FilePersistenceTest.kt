@@ -83,13 +83,11 @@ class FilePersistenceTest {
         DriverManager.getConnection(url).use { conn ->
             val kdb = conn as KdbConnection
             JdbcTestSupport.seedUsers(kdb, schema)
-            kdb.autoCommit = false
             val updated =
                 kdb.createStatement().executeUpdate(
                     "UPDATE users SET status = 'committed' WHERE userId = 'u1'",
                 )
             assertEquals(1, updated)
-            kdb.commit()
         }
         DriverManager.getConnection(url).use { conn ->
             val kdb = conn as KdbConnection

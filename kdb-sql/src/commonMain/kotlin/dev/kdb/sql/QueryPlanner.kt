@@ -25,6 +25,12 @@ public class DefaultQueryPlanner : QueryPlanner {
                 else -> throw SqlPlanningException("only SELECT is planned here", "")
             }
         validateProjections(select, context.schema)
+        if (select.joins.isNotEmpty() && select.joins.any { it.type != JoinType.INNER }) {
+            throw SqlPlanningException("only INNER JOIN is supported in v1", "")
+        }
+        if (select.groupBy.isNotEmpty() && select.projections.any { it is SelectProjection.Star }) {
+            throw SqlPlanningException("SELECT * is not allowed with GROUP BY", "")
+        }
         return planSelect(select, context.schema)
     }
 
@@ -117,8 +123,25 @@ public class DefaultQueryPlanner : QueryPlanner {
             }
             is SqlExpr.Between -> matchBetween(expr, schema)
             is SqlExpr.Binary -> matchEquality(expr, schema) ?: matchRange(expr, schema)
+            is SqlExpr.InList -> matchInList(expr, schema)
             else -> null
         }
+
+    private fun matchInList(
+        expr: SqlExpr.InList,
+        schema: KdbSchema,
+    ): PhysicalPlan? {
+        val field = schema.fieldsByName[expr.column] ?: return null
+        if (!field.indexed) return null
+        val keys =
+            expr.values.mapNotNull { value ->
+                val lit = value as? SqlExpr.Literal ?: return null
+                literalToIndexKey(lit, field.type)
+            }
+        if (keys.size != expr.values.size || keys.isEmpty()) return null
+        val type = inferIndexType(field.type)
+        return PhysicalPlan.InListScan(expr.column, type, keys)
+    }
 
     private fun matchBetween(
         expr: SqlExpr.Between,

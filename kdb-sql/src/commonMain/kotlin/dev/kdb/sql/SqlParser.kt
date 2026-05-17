@@ -166,10 +166,25 @@ internal class RecursiveDescentSqlParser : SqlParser {
         val projections = parseProjections()
         expectKeyword("FROM")
         val table = TableRef(readIdentifier(), parseOptionalTableAlias())
+        val joins = mutableListOf<JoinClause>()
+        while (matchKeyword("INNER")) {
+            expectKeyword("JOIN")
+            val joinTable = TableRef(readIdentifier(), parseOptionalTableAlias())
+            expectKeyword("ON")
+            val on = parseExpr()
+            joins += JoinClause(JoinType.INNER, joinTable, on)
+        }
         skipWs()
         var where: SqlExpr? = null
         if (matchKeyword("WHERE")) {
             where = parseExpr()
+        }
+        val groupBy = mutableListOf<SqlExpr>()
+        if (matchKeyword("GROUP")) {
+            expectKeyword("BY")
+            do {
+                groupBy += parseExpr()
+            } while (matchChar(','))
         }
         val orderBy = mutableListOf<OrderItem>()
         if (matchKeyword("ORDER")) {
@@ -194,7 +209,7 @@ internal class RecursiveDescentSqlParser : SqlParser {
         if (matchKeyword("OFFSET")) {
             offset = readInt()
         }
-        return SelectQuery(distinct, projections, table, where, orderBy, limit, offset)
+        return SelectQuery(distinct, projections, table, joins, where, groupBy, orderBy, limit, offset)
     }
 
     private fun parseOrderExpr(): SqlExpr {
@@ -249,7 +264,12 @@ internal class RecursiveDescentSqlParser : SqlParser {
             id.equals("AS", ignoreCase = true) ||
             id.equals("ON", ignoreCase = true) ||
             id.equals("USING", ignoreCase = true) ||
-            id.equals("UNIQUE", ignoreCase = true)
+            id.equals("UNIQUE", ignoreCase = true) ||
+            id.equals("GROUP", ignoreCase = true) ||
+            id.equals("INNER", ignoreCase = true) ||
+            id.equals("JOIN", ignoreCase = true) ||
+            id.equals("IN", ignoreCase = true) ||
+            id.equals("HAVING", ignoreCase = true)
 
     private fun parseProjections(): List<SelectProjection> {
         val out = mutableListOf<SelectProjection>()
@@ -258,17 +278,36 @@ internal class RecursiveDescentSqlParser : SqlParser {
             if (peek() == '*') {
                 consume()
                 out += SelectProjection.Star()
+            } else if (matchKeyword("COUNT")) {
+                expectChar('(')
+                skipWs()
+                val arg =
+                    if (peek() == '*') {
+                        consume()
+                        SqlExpr.ColumnRef("*")
+                    } else {
+                        parseExpr()
+                    }
+                expectChar(')')
+                out += SelectProjection.Expression(SqlExpr.FunctionCall("count", listOf(arg)), parseOptionalAlias())
             } else if (peekKeyword("kdb_json_") || peekKeyword("MATCH")) {
                 val expr = parseExpr()
                 val alias = parseOptionalAlias()
                 out += SelectProjection.Expression(expr, alias)
             } else {
+                val mark = pos
                 val name = readIdentifier()
-                val alias = parseOptionalAlias()
-                if (alias != null || peek() != '.') {
-                    out += SelectProjection.Column(name, alias)
+                if (peek() == '.') {
+                    expectChar('.')
+                    val field = readIdentifier()
+                    out += SelectProjection.Expression(SqlExpr.QualifiedColumn(name, field), parseOptionalAlias())
+                } else if (peek() == '(') {
+                    pos = mark
+                    val expr = parseExpr()
+                    out += SelectProjection.Expression(expr, parseOptionalAlias())
                 } else {
-                    out += SelectProjection.Column(name, null)
+                    val alias = parseOptionalAlias()
+                    out += SelectProjection.Column(name, alias)
                 }
             }
         } while (matchChar(','))
@@ -315,6 +354,18 @@ internal class RecursiveDescentSqlParser : SqlParser {
         }
         var left = parsePrimary()
         skipWs()
+        if (left is SqlExpr.ColumnRef && matchKeyword("IN")) {
+            expectChar('(')
+            if (matchKeyword("SELECT")) {
+                throw parseError("subquery IN is not supported in v1")
+            }
+            val values = mutableListOf<SqlExpr>()
+            do {
+                values += parseExpr()
+            } while (matchChar(','))
+            expectChar(')')
+            return SqlExpr.InList(left.name, values)
+        }
         if (left is SqlExpr.ColumnRef && matchKeyword("BETWEEN")) {
             val low = parsePrimary()
             expectKeyword("AND")
@@ -322,13 +373,12 @@ internal class RecursiveDescentSqlParser : SqlParser {
             return SqlExpr.Between(left.name, low, high)
         }
         if (matchKeyword("IS")) {
-            val inner = parsePrimary()
             if (matchKeyword("NOT")) {
                 expectKeyword("NULL")
-                return SqlExpr.Unary(UnaryOp.NOT, SqlExpr.Unary(UnaryOp.IS_NULL, inner))
+                return SqlExpr.Unary(UnaryOp.NOT, SqlExpr.Unary(UnaryOp.IS_NULL, left))
             }
             expectKeyword("NULL")
-            return SqlExpr.Unary(UnaryOp.IS_NULL, inner)
+            return SqlExpr.Unary(UnaryOp.IS_NULL, left)
         }
         val op =
             when {
@@ -364,6 +414,11 @@ internal class RecursiveDescentSqlParser : SqlParser {
             matchKeyword("NULL") -> return SqlExpr.Literal(SqlCell.Null)
             peek().isLetter() || peek() == '_' -> {
                 val name = readIdentifier()
+                if (peek() == '.') {
+                    expectChar('.')
+                    val field = readIdentifier()
+                    return SqlExpr.QualifiedColumn(name, field)
+                }
                 if (peek() == '(') {
                     expectChar('(')
                     val args = mutableListOf<SqlExpr>()

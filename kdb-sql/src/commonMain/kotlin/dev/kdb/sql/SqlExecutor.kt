@@ -12,12 +12,19 @@ internal class SqlExecutor(
     private val indexManager: IndexManager,
     private val storage: StorageAdapter,
     private val dag: CommitDag,
+    private val namespaceDags: Map<String, CommitDag> = emptyMap(),
 ) {
     suspend fun executeSelect(
         query: SelectQuery,
         plan: PhysicalPlan,
         context: QueryContext,
     ): QueryResult {
+        if (query.joins.isNotEmpty()) {
+            return executeJoinSelect(query, context)
+        }
+        if (query.groupBy.isNotEmpty() || SqlAggregates.queryHasAggregates(query)) {
+            return executeAggregateSelect(query, plan, context)
+        }
         val docIds = resolveDocIds(plan, context)
         val atCommit = context.atCommit ?: dag.head()
         val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
@@ -35,13 +42,112 @@ internal class SqlExecutor(
         return QueryResult(columns = columnsFor(query, context.schema), rows = rows)
     }
 
+    private suspend fun executeAggregateSelect(
+        query: SelectQuery,
+        plan: PhysicalPlan,
+        context: QueryContext,
+    ): QueryResult {
+        val docIds = resolveDocIds(plan, context)
+        val atCommit = context.atCommit ?: dag.head()
+        val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
+        val docs =
+            docIds.mapNotNull { id ->
+                storage.getDocument(context.namespaceId, id, treeHash)
+            }
+        val rows =
+            if (query.groupBy.isEmpty()) {
+                listOf(QueryRow(projectAggregateRow(query.projections, docs, context.schema, context.parameters)))
+            } else {
+                docs
+                    .groupBy { doc -> groupKey(query.groupBy, doc, context.schema, context.parameters) }
+                    .map { (_, groupDocs) ->
+                        QueryRow(projectAggregateRow(query.projections, groupDocs, context.schema, context.parameters))
+                    }
+            }
+        return QueryResult(columns = columnsFor(query, context.schema), rows = rows)
+    }
+
+    private suspend fun executeJoinSelect(
+        query: SelectQuery,
+        context: QueryContext,
+    ): QueryResult {
+        val leftAlias = query.from.alias ?: query.from.name
+        val leftBinding = resolveBinding(query.from.name, context)
+        val leftNs = leftBinding.namespaceId
+        val leftSchema = leftBinding.schema
+        val leftDag = dagFor(leftNs)
+        val leftCtx = context.copy(namespaceId = leftNs, schema = leftSchema)
+        val leftPlan =
+            DefaultQueryPlanner().plan(
+                SqlStatement.Select(
+                    SelectQuery(
+                        false,
+                        listOf(SelectProjection.Star()),
+                        query.from,
+                        emptyList(),
+                        query.where,
+                        emptyList(),
+                        emptyList(),
+                        null,
+                        0,
+                    ),
+                ),
+                leftCtx,
+            )
+        val leftIds = resolveDocIds(leftPlan, leftCtx, leftDag)
+        val join = query.joins.single()
+        val rightAlias = join.table.alias ?: join.table.name
+        val rightBinding = resolveBinding(join.table.name, context)
+        val rightNs = rightBinding.namespaceId
+        val rightSchema = rightBinding.schema
+        val rightDag = dagFor(rightNs)
+        val rightCtx = context.copy(namespaceId = rightNs, schema = rightSchema)
+        val rightPlan = PhysicalPlan.FullTableScan("join probe")
+        val rightIds = resolveDocIds(rightPlan, rightCtx, rightDag)
+        val schemas = mapOf(leftAlias to leftSchema, rightAlias to rightSchema)
+        val rows = mutableListOf<QueryRow>()
+        val leftAt = context.atCommit ?: leftDag.head()
+        val rightAt = context.atCommit ?: rightDag.head()
+        val leftTree = leftDag.getCommitOrThrow(leftAt).documentTreeHash
+        val rightTree = rightDag.getCommitOrThrow(rightAt).documentTreeHash
+        for (leftId in leftIds) {
+            val leftDoc = storage.getDocument(leftNs, leftId, leftTree) ?: continue
+            for (rightId in rightIds) {
+                val rightDoc = storage.getDocument(rightNs, rightId, rightTree) ?: continue
+                val joined = mapOf(leftAlias to leftDoc, rightAlias to rightDoc)
+                if (!SqlPredicate.evalJoin(join.on, joined, schemas, context.parameters)) continue
+                rows +=
+                    QueryRow(
+                        projectJoinRow(query.projections, joined, schemas, context.parameters),
+                    )
+            }
+        }
+        return QueryResult(columns = columnsFor(query, leftSchema), rows = rows.take(context.maxRows))
+    }
+
     suspend fun resolveDocIdsForWhere(
         where: SqlExpr?,
         schema: KdbSchema,
         context: QueryContext,
         planner: QueryPlanner = DefaultQueryPlanner(),
     ): List<KdbUuid> {
-        val plan = planner.plan(SqlStatement.Select(SelectQuery(false, listOf(SelectProjection.Star()), TableRef("t", null), where, emptyList(), null, 0)), context)
+        val plan =
+            planner.plan(
+                SqlStatement.Select(
+                    SelectQuery(
+                        false,
+                        listOf(SelectProjection.Star()),
+                        TableRef("t", null),
+                        emptyList(),
+                        where,
+                        emptyList(),
+                        emptyList(),
+                        null,
+                        0,
+                    ),
+                ),
+                context,
+            )
         return resolveDocIds(plan, context)
     }
 
@@ -73,21 +179,37 @@ internal class SqlExecutor(
     private suspend fun resolveDocIds(
         plan: PhysicalPlan,
         context: QueryContext,
+        commitDag: CommitDag = dag,
     ): List<KdbUuid> =
         when (plan) {
             is PhysicalPlan.Limit -> {
-                val inner = resolveDocIds(plan.input, context)
+                val inner = resolveDocIds(plan.input, context, commitDag)
                 inner.drop(plan.offset).take(plan.limit).take(context.maxRows)
             }
-            is PhysicalPlan.Sort -> resolveDocIds(plan.input, context)
-            is PhysicalPlan.Project -> resolveDocIds(plan.input, context)
+            is PhysicalPlan.Sort -> resolveDocIds(plan.input, context, commitDag)
+            is PhysicalPlan.Project -> resolveDocIds(plan.input, context, commitDag)
             is PhysicalPlan.Filter -> {
-                val ids = resolveDocIds(plan.input, context)
-                filterIds(ids, plan.predicate, context)
+                val ids = resolveDocIds(plan.input, context, commitDag)
+                filterIds(ids, plan.predicate, context, commitDag)
             }
             is PhysicalPlan.IndexScan -> indexScan(plan, context)
-            is PhysicalPlan.FullTableScan -> fullScan(context)
+            is PhysicalPlan.InListScan -> inListScan(plan, context)
+            is PhysicalPlan.FullTableScan -> fullScan(context, commitDag)
         }
+
+    private suspend fun inListScan(
+        plan: PhysicalPlan.InListScan,
+        context: QueryContext,
+    ): List<KdbUuid> {
+        val registry = indexManager.registryFor(context.namespaceId)
+        val reader = indexManager.reader
+        return plan.keys
+            .flatMap { key ->
+                reader.lookupExact(registry, plan.fieldName, key, context.atCommit)
+            }
+            .distinct()
+            .take(context.maxRows)
+    }
 
     private suspend fun indexScan(
         plan: PhysicalPlan.IndexScan,
@@ -129,9 +251,12 @@ internal class SqlExecutor(
         }
     }
 
-    private suspend fun fullScan(context: QueryContext): List<KdbUuid> {
-        val atCommit = context.atCommit ?: dag.head()
-        val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
+    private suspend fun fullScan(
+        context: QueryContext,
+        commitDag: CommitDag,
+    ): List<KdbUuid> {
+        val atCommit = context.atCommit ?: commitDag.head()
+        val treeHash = commitDag.getCommitOrThrow(atCommit).documentTreeHash
         val ids = mutableListOf<KdbUuid>()
         storage.scanDocuments(context.namespaceId, treeHash, batchSize = 256) { batch ->
             ids += batch.map { it.id }
@@ -143,9 +268,10 @@ internal class SqlExecutor(
         ids: List<KdbUuid>,
         predicate: SqlExpr,
         context: QueryContext,
+        commitDag: CommitDag,
     ): List<KdbUuid> {
-        val atCommit = context.atCommit ?: dag.head()
-        val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
+        val atCommit = context.atCommit ?: commitDag.head()
+        val treeHash = commitDag.getCommitOrThrow(atCommit).documentTreeHash
         return ids.filter { id ->
             val doc = storage.getDocument(context.namespaceId, id, treeHash) ?: return@filter false
             SqlPredicate.eval(predicate, doc, context.schema, context.parameters)
@@ -172,11 +298,81 @@ internal class SqlExecutor(
                 is SelectProjection.Column ->
                     SqlPredicate.cellForColumn(proj.name, doc, schema) ?: SqlCell.Null
                 is SelectProjection.Expression ->
-                    SqlPredicate.evalCell(proj.expr, doc, schema, context.parameters) ?: SqlCell.Null
+                    when (val expr = proj.expr) {
+                        is SqlExpr.FunctionCall ->
+                            SqlAggregates.evalAggregate(expr, listOf(doc), schema, context.parameters)
+                        else ->
+                            SqlPredicate.evalCell(expr, doc, schema, context.parameters) ?: SqlCell.Null
+                    }
                 is SelectProjection.Star -> SqlCell.Null
             }
         }
     }
+
+    private fun projectAggregateRow(
+        projections: List<SelectProjection>,
+        docs: List<KdbDocument>,
+        schema: KdbSchema,
+        parameters: List<SqlParameter>,
+    ): List<SqlCell> =
+        projections.map { proj ->
+            when (proj) {
+                is SelectProjection.Expression ->
+                    when (val expr = proj.expr) {
+                        is SqlExpr.FunctionCall ->
+                            SqlAggregates.evalAggregate(expr, docs, schema, parameters)
+                        else -> SqlCell.Null
+                    }
+                is SelectProjection.Column -> SqlCell.Null
+                is SelectProjection.Star -> SqlCell.Null
+            }
+        }
+
+    private fun projectJoinRow(
+        projections: List<SelectProjection>,
+        joined: Map<String, KdbDocument>,
+        schemas: Map<String, KdbSchema>,
+        parameters: List<SqlParameter>,
+    ): List<SqlCell> =
+        projections.map { proj ->
+            when (proj) {
+                is SelectProjection.Column -> {
+                    val alias = proj.name.substringBefore('.', proj.name)
+                    val col = proj.name.substringAfter('.', proj.name)
+                    val doc = joined[alias] ?: joined.values.first()
+                    val schema = schemas[alias] ?: schemas.values.first()
+                    SqlPredicate.cellForColumn(col, doc, schema) ?: SqlCell.Null
+                }
+                is SelectProjection.Expression ->
+                    when (val expr = proj.expr) {
+                        is SqlExpr.QualifiedColumn -> {
+                            val doc = joined[expr.qualifier] ?: return@map SqlCell.Null
+                            val schema = schemas[expr.qualifier] ?: return@map SqlCell.Null
+                            SqlPredicate.cellForColumn(expr.name, doc, schema) ?: SqlCell.Null
+                        }
+                        is SqlExpr.FunctionCall ->
+                            SqlAggregates.evalAggregate(expr, joined.values.toList(), schemas.values.first(), parameters, joined)
+                        else -> SqlCell.Null
+                    }
+                is SelectProjection.Star -> SqlCell.Null
+            }
+        }
+
+    private fun groupKey(
+        exprs: List<SqlExpr>,
+        doc: KdbDocument,
+        schema: KdbSchema,
+        parameters: List<SqlParameter>,
+    ): List<SqlCell?> = exprs.map { SqlPredicate.evalCell(it, doc, schema, parameters) }
+
+    private fun resolveBinding(
+        tableName: String,
+        context: QueryContext,
+    ): NamespaceBinding =
+        context.namespacesByTable[tableName]
+            ?: NamespaceBinding(context.namespaceId, context.schema)
+
+    private fun dagFor(namespaceId: String): CommitDag = namespaceDags[namespaceId] ?: dag
 
     private fun columnsFor(
         query: SelectQuery,

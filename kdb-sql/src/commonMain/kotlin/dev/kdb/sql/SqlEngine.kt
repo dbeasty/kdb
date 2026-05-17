@@ -49,6 +49,7 @@ public fun sqlEngine(
     planner: QueryPlanner = DefaultQueryPlanner(),
     viewEngine: VirtualViewEngine = DefaultVirtualViewEngine(parser),
     indexStoreFactory: IndexStoreFactory = compositeIndexStoreFactory(dag, storage),
+    namespaceDags: Map<String, CommitDag> = emptyMap(),
 ): SqlEngine =
     DefaultSqlEngine(
         indexManager,
@@ -59,6 +60,7 @@ public fun sqlEngine(
         planner,
         viewEngine,
         indexStoreFactory,
+        namespaceDags,
     )
 
 internal class DefaultSqlEngine(
@@ -70,9 +72,10 @@ internal class DefaultSqlEngine(
     private val planner: QueryPlanner,
     private val viewEngine: VirtualViewEngine,
     private val indexStoreFactory: IndexStoreFactory,
+    private val namespaceDags: Map<String, CommitDag> = emptyMap(),
 ) : SqlEngine {
 
-    private val executor = SqlExecutor(indexManager, storage, dag)
+    private val executor = SqlExecutor(indexManager, storage, dag, namespaceDags)
     private val dmlExecutor = DmlExecutor(executor, storage, dag, planner)
 
     override suspend fun execute(

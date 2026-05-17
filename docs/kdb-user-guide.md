@@ -195,7 +195,7 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 | **Statement** | `executeQuery` for `SELECT`; `FROM table` auto-qualified to `catalog/table` |
 | **PreparedStatement** | `setString`, `setInt`/`setLong`/`setFloat`/`setDouble`, `setBoolean`, `setNull`, `setObject`; `executeQuery` |
 | **ResultSet** | Forward-only; `next`, `getString`/`getLong`/`getInt`/`getBoolean`/`getDouble`/`getObject` by index or column label; `findColumn`, `getMetaData` |
-| **SQL** | `SELECT` with `WHERE` on schema/indexed fields; `SELECT _doc …`; `AT VERSION` / `AT COMMIT` / `AT TIME`; `BEGIN` / `COMMIT` / `ROLLBACK` on embedded and network — see [SQL transactions](#sql-transactions) |
+| **SQL** | `SELECT` with `WHERE` on schema/indexed fields (including `IN (…)`, `IS NOT NULL`); `COUNT(*)` / `COUNT(col)`; `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`; `INNER JOIN` (same catalog, two tables); `SELECT _doc …`; `AT VERSION` / `AT COMMIT` / `AT TIME`; `BEGIN` / `COMMIT` / `ROLLBACK` on embedded and network — see [SQL transactions](#sql-transactions) |
 | **DatabaseMetaData** | Product name `KDB`; `getTables`, `getColumns` (`kdb_id`, `_doc`), `getCatalogs`, `getSchemas`; keywords include `BEGIN`, `COMMIT`, `ROLLBACK`, `START`, `TRANSACTION`, `AT`, `VERSION`, `TIME`, `WORK`; functions `kdb_json_get`, `kdb_json_set` |
 
 ### SQL transactions

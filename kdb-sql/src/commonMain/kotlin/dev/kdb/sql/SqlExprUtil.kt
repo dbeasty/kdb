@@ -10,6 +10,8 @@ internal fun maxParameterIndex(expr: SqlExpr?): Int {
         -> -1
         is SqlExpr.Between -> maxOf(maxParameterIndex(expr.low), maxParameterIndex(expr.high))
         is SqlExpr.Similarity -> -1
+        is SqlExpr.InList -> expr.values.maxOfOrNull { maxParameterIndex(it) } ?: -1
+        is SqlExpr.QualifiedColumn -> -1
         is SqlExpr.Binary ->
             maxOf(maxParameterIndex(expr.left), maxParameterIndex(expr.right))
         is SqlExpr.Unary -> maxParameterIndex(expr.expr)
@@ -23,6 +25,8 @@ public fun statementParameterCount(stmt: SqlStatement): Int {
             is SqlStatement.Select -> {
                 val q = stmt.query
                 listOfNotNull(q.where) +
+                    q.groupBy +
+                    q.joins.map { it.on } +
                     q.orderBy.map { it.expr } +
                     q.projections.mapNotNull {
                         when (it) {

@@ -147,9 +147,87 @@ class Layer5SqlIntegrationTest {
             assertEquals(1, result.rows.size)
         }
 
+    @Test
+    fun inListPredicate() =
+        runTest {
+            val fx = seededFixture()
+            fx.commitDoc("""{"userId":"u2","status":"inactive"}""")
+            val result =
+                fx.engine.execute(
+                    "SELECT userId FROM users WHERE userId IN ('u1', 'u2')",
+                    QueryContext(namespaceId = fx.ns, schema = fx.schema),
+                )
+            assertEquals(2, result.rows.size)
+        }
+
+    @Test
+    fun countStar() =
+        runTest {
+            val fx = seededFixture()
+            fx.commitDoc("""{"userId":"u2","status":"active"}""")
+            val result =
+                fx.engine.execute(
+                    "SELECT COUNT(*) AS n FROM users",
+                    QueryContext(namespaceId = fx.ns, schema = fx.schema),
+                )
+            assertEquals(1, result.rows.size)
+            assertEquals(2L, (result.rows.first().values[0] as SqlCell.LongVal).value)
+        }
+
+    @Test
+    fun isNotNullPredicate() =
+        runTest {
+            val fx = seededFixture()
+            val result =
+                fx.engine.execute(
+                    "SELECT userId FROM users WHERE userId IS NOT NULL",
+                    QueryContext(namespaceId = fx.ns, schema = fx.schema),
+                )
+            assertEquals(1, result.rows.size)
+        }
+
+    @Test
+    fun groupByStatusWithCount() =
+        runTest {
+            val fx = seededFixture()
+            fx.commitDoc("""{"userId":"u2","status":"active"}""")
+            val result =
+                fx.engine.execute(
+                    "SELECT status, COUNT(*) AS n FROM users GROUP BY status",
+                    QueryContext(namespaceId = fx.ns, schema = fx.schema),
+                )
+            assertEquals(1, result.rows.size)
+            assertEquals(2L, (result.rows.first().values[1] as SqlCell.LongVal).value)
+        }
+
+    @Test
+    fun innerJoinUsersAndOrders() =
+        runTest {
+            val fx = joinFixture()
+            val ctx =
+                QueryContext(
+                    namespaceId = fx.usersNs,
+                    schema = fx.usersSchema,
+                    namespacesByTable =
+                        mapOf(
+                            "users" to NamespaceBinding(fx.usersNs, fx.usersSchema),
+                            "orders" to NamespaceBinding(fx.ordersNs, fx.ordersSchema),
+                        ),
+                )
+            val result =
+                fx.engine.execute(
+                    "SELECT u.userId, o.orderId FROM users u INNER JOIN orders o ON u.userId = o.userId",
+                    ctx,
+                )
+            assertEquals(1, result.rows.size)
+            assertEquals("u1", (result.rows.first().values[0] as SqlCell.StringVal).value)
+            assertEquals("o1", (result.rows.first().values[1] as SqlCell.StringVal).value)
+        }
+
     private fun containsIndexScan(plan: PhysicalPlan): Boolean =
         when (plan) {
             is PhysicalPlan.IndexScan -> true
+            is PhysicalPlan.InListScan -> true
             is PhysicalPlan.Filter -> containsIndexScan(plan.input)
             is PhysicalPlan.Limit -> containsIndexScan(plan.input)
             is PhysicalPlan.Project -> containsIndexScan(plan.input)
@@ -210,5 +288,111 @@ class Layer5SqlIntegrationTest {
         val fx = SqlFixture(sqlEngine(manager, storage, dag), ns, schema, dag, storage, manager, registry)
         fx.commitDoc(initialJson)
         return fx
+    }
+
+    private suspend fun joinFixture(): JoinFixture {
+        val usersNs = "app/users"
+        val ordersNs = "app/orders"
+        val usersDag = inMemoryCommitDag(usersNs)
+        val ordersDag = inMemoryCommitDag(ordersNs)
+        val storage = InMemoryStorageAdapter()
+        val manager = productionIndexManager(usersDag, storage)
+        manager.bindNamespace(usersNs, usersDag)
+        manager.bindNamespace(ordersNs, ordersDag)
+        val usersSchema =
+            KdbSchema.build(
+                listOf(
+                    SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
+                ),
+            )
+        val ordersSchema =
+            KdbSchema.build(
+                listOf(
+                    SchemaField("orderId", KdbFieldType.StringType, required = true, indexed = true),
+                    SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
+                ),
+            )
+        val usersRegistry = manager.registryFor(usersNs)
+        usersRegistry.syncSchema(
+            KdbSchema.NONE,
+            usersSchema,
+            dev.kdb.index.compositeIndexStoreFactory(usersDag, storage),
+            usersDag,
+            storage,
+        )
+        val ordersRegistry = manager.registryFor(ordersNs)
+        ordersRegistry.syncSchema(
+            KdbSchema.NONE,
+            ordersSchema,
+            dev.kdb.index.compositeIndexStoreFactory(ordersDag, storage),
+            ordersDag,
+            storage,
+        )
+        val engine =
+            sqlEngine(
+                manager,
+                storage,
+                usersDag,
+                namespaceDags = mapOf(ordersNs to ordersDag),
+            )
+        val fx =
+            JoinFixture(
+                engine,
+                usersNs,
+                ordersNs,
+                usersSchema,
+                ordersSchema,
+                usersDag,
+                ordersDag,
+                storage,
+                manager,
+                usersRegistry,
+                ordersRegistry,
+            )
+        fx.commitUsers("""{"userId":"u1"}""")
+        fx.commitOrders("""{"orderId":"o1","userId":"u1"}""")
+        return fx
+    }
+
+    private class JoinFixture(
+        val engine: SqlEngine,
+        val usersNs: String,
+        val ordersNs: String,
+        val usersSchema: KdbSchema,
+        val ordersSchema: KdbSchema,
+        private val usersDag: CommitDag,
+        private val ordersDag: CommitDag,
+        private val storage: StorageAdapter,
+        private val manager: IndexManager,
+        private val usersRegistry: IndexRegistry,
+        private val ordersRegistry: IndexRegistry,
+    ) {
+        suspend fun commitUsers(json: String) = commitDoc(usersNs, usersDag, usersRegistry, usersSchema, json)
+
+        suspend fun commitOrders(json: String) = commitDoc(ordersNs, ordersDag, ordersRegistry, ordersSchema, json)
+
+        private suspend fun commitDoc(
+            ns: String,
+            dag: CommitDag,
+            registry: IndexRegistry,
+            schema: KdbSchema,
+            json: String,
+        ) {
+            val docId = KdbUuid.random()
+            storage.putDocument(ns, KdbDocument(docId, json))
+            val parentCommit = dag.head()
+            val parentTree = dag.getCommitOrThrow(parentCommit).documentTreeHash
+            val tx =
+                KdbTransaction(
+                    id = KdbUuid.random(),
+                    baseVersion = parentCommit,
+                    operations = listOf(KdbOp.Write(docId, json)),
+                    timestamp = KdbTimestamp.now(),
+                    authorNodeId = KdbUuid.random(),
+                )
+            val tree = storage.commitTree(ns, parentTree)
+            val commit = dag.appendCommit(tx, parentCommit, tree, schemaHash = null)
+            manager.writer.applyCommit(commit, registry, storage, schema)
+        }
     }
 }

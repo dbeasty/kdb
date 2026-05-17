@@ -53,11 +53,23 @@ public data class DropIndexStatement(
     val table: String,
 )
 
+public enum class JoinType {
+    INNER,
+}
+
+public data class JoinClause(
+    val type: JoinType,
+    val table: TableRef,
+    val on: SqlExpr,
+)
+
 public data class SelectQuery(
     val distinct: Boolean,
     val projections: List<SelectProjection>,
     val from: TableRef,
+    val joins: List<JoinClause> = emptyList(),
     val where: SqlExpr?,
+    val groupBy: List<SqlExpr> = emptyList(),
     val orderBy: List<OrderItem>,
     val limit: Int?,
     val offset: Int?,
@@ -84,6 +96,8 @@ public sealed class SqlExpr {
     public data class Match(val column: String, val query: String) : SqlExpr()
     public data class Between(val column: String, val low: SqlExpr, val high: SqlExpr) : SqlExpr()
     public data class Similarity(val column: String, val query: String, val limit: Int?) : SqlExpr()
+    public data class InList(val column: String, val values: List<SqlExpr>) : SqlExpr()
+    public data class QualifiedColumn(val qualifier: String, val name: String) : SqlExpr()
 }
 
 public enum class BinaryOp {
@@ -125,12 +139,19 @@ public sealed class SqlParameter {
     public data object NullParam : SqlParameter()
 }
 
+public data class NamespaceBinding(
+    val namespaceId: String,
+    val schema: dev.kdb.schema.KdbSchema,
+)
+
 public data class QueryContext(
     val namespaceId: String,
     val schema: dev.kdb.schema.KdbSchema,
     val atCommit: dev.kdb.codec.KdbHash? = null,
     val parameters: List<SqlParameter> = emptyList(),
     val maxRows: Int = 10_000,
+    /** catalog/table → namespace id (for JOIN). */
+    val namespacesByTable: Map<String, NamespaceBinding> = emptyMap(),
 )
 
 public data class ResultColumn(
@@ -170,6 +191,12 @@ public sealed class PhysicalPlan {
     public data class Sort(val orderBy: List<OrderItem>, val input: PhysicalPlan) : PhysicalPlan()
 
     public data class Limit(val limit: Int, val offset: Int, val input: PhysicalPlan) : PhysicalPlan()
+
+    public data class InListScan(
+        val fieldName: String,
+        val indexType: IndexType,
+        val keys: List<IndexKey>,
+    ) : PhysicalPlan()
 }
 
 public sealed class IndexLookupSpec {

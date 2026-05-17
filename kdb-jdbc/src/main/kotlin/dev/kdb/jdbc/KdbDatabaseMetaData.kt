@@ -100,7 +100,7 @@ public class KdbDatabaseMetaData(
 
     override fun supportsOrderByUnrelated(): Boolean = true
 
-    override fun supportsGroupBy(): Boolean = false
+    override fun supportsGroupBy(): Boolean = true
 
     override fun supportsGroupByUnrelated(): Boolean = false
 

@@ -19,7 +19,72 @@ internal object SqlPredicate {
             is SqlExpr.Unary -> evalUnary(expr, doc, schema, parameters)
             is SqlExpr.Match -> evalMatch(expr, doc, schema, parameters)
             is SqlExpr.Between -> evalBetween(expr, doc, schema, parameters)
+            is SqlExpr.InList -> evalInList(expr, doc, schema, parameters)
             else -> false
+        }
+
+    fun evalJoin(
+        expr: SqlExpr,
+        joinedDocs: Map<String, KdbDocument>,
+        schemas: Map<String, KdbSchema>,
+        parameters: List<SqlParameter>,
+    ): Boolean = evalWithJoin(expr, joinedDocs, schemas, parameters)
+
+    private fun evalWithJoin(
+        expr: SqlExpr,
+        joinedDocs: Map<String, KdbDocument>,
+        schemas: Map<String, KdbSchema>,
+        parameters: List<SqlParameter>,
+    ): Boolean =
+        when (expr) {
+            is SqlExpr.Binary ->
+                when (expr.op) {
+                    BinaryOp.AND ->
+                        evalWithJoin(expr.left, joinedDocs, schemas, parameters) &&
+                            evalWithJoin(expr.right, joinedDocs, schemas, parameters)
+                    BinaryOp.OR ->
+                        evalWithJoin(expr.left, joinedDocs, schemas, parameters) ||
+                            evalWithJoin(expr.right, joinedDocs, schemas, parameters)
+                    else -> {
+                        val left = evalCellForContext(expr.left, joinedDocs, schemas, parameters)
+                        val right = evalCellForContext(expr.right, joinedDocs, schemas, parameters)
+                        compareOp(expr.op, left, right)
+                    }
+                }
+            is SqlExpr.Unary ->
+                when (expr.op) {
+                    UnaryOp.NOT -> !evalWithJoin(expr.expr, joinedDocs, schemas, parameters)
+                    UnaryOp.IS_NULL ->
+                        evalCellForContext(expr.expr, joinedDocs, schemas, parameters) is SqlCell.Null
+                }
+            is SqlExpr.InList -> {
+                val qualifier = expr.column.substringBefore('.', expr.column)
+                val colName = expr.column.substringAfter('.', expr.column)
+                val doc =
+                    joinedDocs[qualifier]
+                        ?: joinedDocs.values.first()
+                val schema = schemas[qualifier] ?: schemas.values.first()
+                evalInList(expr.copy(column = colName), doc, schema, parameters)
+            }
+            else -> false
+        }
+
+    private fun compareOp(
+        op: BinaryOp,
+        left: SqlCell?,
+        right: SqlCell?,
+    ): Boolean =
+        when (op) {
+            BinaryOp.EQ -> compareCells(left, right) == 0
+            BinaryOp.NE -> compareCells(left, right) != 0
+            BinaryOp.LT -> compareCells(left, right) < 0
+            BinaryOp.LE -> compareCells(left, right) <= 0
+            BinaryOp.GT -> compareCells(left, right) > 0
+            BinaryOp.GE -> compareCells(left, right) >= 0
+            BinaryOp.LIKE -> false
+            BinaryOp.AND,
+            BinaryOp.OR,
+            -> false
         }
 
     fun evalCell(
@@ -33,6 +98,49 @@ internal object SqlPredicate {
             is SqlExpr.ColumnRef -> cellForColumn(expr.name, doc, schema)
             is SqlExpr.Parameter -> parameterToCell(parameters.getOrNull(expr.index))
             is SqlExpr.FunctionCall -> evalFunction(expr, doc, schema, parameters)
+            is SqlExpr.QualifiedColumn -> {
+                val field = schema.fieldsByName[expr.name] ?: return null
+                val raw = kdbJsonGet(doc.json, "$.${expr.name}")
+                jsonToCell(raw, field)
+            }
+            else -> null
+        }
+
+    fun evalCellForContext(
+        expr: SqlExpr,
+        doc: KdbDocument,
+        schema: KdbSchema,
+        parameters: List<SqlParameter>,
+        joinedDocs: Map<String, KdbDocument> = emptyMap(),
+    ): SqlCell? {
+        if (joinedDocs.isEmpty()) return evalCell(expr, doc, schema, parameters)
+        return evalCellForContext(expr, joinedDocs, mapOf("" to schema), parameters)
+    }
+
+    fun evalCellForContext(
+        expr: SqlExpr,
+        joinedDocs: Map<String, KdbDocument>,
+        schemas: Map<String, KdbSchema>,
+        parameters: List<SqlParameter>,
+    ): SqlCell? =
+        when (expr) {
+            is SqlExpr.Literal -> expr.cell
+            is SqlExpr.ColumnRef -> {
+                val doc = joinedDocs.values.first()
+                val schema = schemas.values.first()
+                cellForColumn(expr.name, doc, schema)
+            }
+            is SqlExpr.QualifiedColumn -> {
+                val doc = joinedDocs[expr.qualifier] ?: return null
+                val schema = schemas[expr.qualifier] ?: schemas.values.first()
+                cellForColumn(expr.name, doc, schema)
+            }
+            is SqlExpr.Parameter -> parameterToCell(parameters.getOrNull(expr.index))
+            is SqlExpr.FunctionCall -> {
+                val doc = joinedDocs.values.first()
+                val schema = schemas.values.first()
+                evalFunction(expr, doc, schema, parameters)
+            }
             else -> null
         }
 
@@ -78,6 +186,20 @@ internal object SqlPredicate {
         val cell = cellForColumn(expr.column, doc, schema) ?: return false
         val text = (cell as? SqlCell.StringVal)?.value ?: return false
         return text.contains(expr.query, ignoreCase = true)
+    }
+
+    private fun evalInList(
+        expr: SqlExpr.InList,
+        doc: KdbDocument,
+        schema: KdbSchema,
+        parameters: List<SqlParameter>,
+    ): Boolean {
+        val cell = cellForColumn(expr.column, doc, schema) ?: return false
+        for (valueExpr in expr.values) {
+            val expected = evalCell(valueExpr, doc, schema, parameters)
+            if (compareCells(cell, expected) == 0) return true
+        }
+        return false
     }
 
     private fun evalBetween(
@@ -206,7 +328,7 @@ internal object SqlPredicate {
         return -1
     }
 
-    private fun SqlCell.toComparableDouble(): Double? =
+    internal fun SqlCell.toComparableDouble(): Double? =
         when (this) {
             is SqlCell.LongVal -> value.toDouble()
             is SqlCell.DoubleVal -> value

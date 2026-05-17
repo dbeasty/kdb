@@ -55,7 +55,7 @@ internal object JdbcTestSupport {
                 )
             val commit = dag.appendCommit(tx, parent, tree, null)
             manager.writer.applyCommit(commit, manager.registryFor(ns), storage, schema)
-            conn.applyQuerySchema(schema)
         }
+        conn.applyQuerySchema(schema)
     }
 }
