@@ -43,6 +43,8 @@ internal sealed class CliCommand {
     data class Status(val namespace: String) : CliCommand()
 
     data class Sync(val namespace: String, val peerUri: String) : CliCommand()
+
+    data class Shell(val namespace: String) : CliCommand()
 }
 
 internal fun parseArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
@@ -97,6 +99,10 @@ internal fun parseArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
             "sync" -> {
                 require(rest.size >= 3) { "usage: kdb sync <namespace> <peer-uri>" }
                 CliCommand.Sync(rest[1], rest[2])
+            }
+            "shell" -> {
+                require(rest.size >= 2) { "usage: kdb shell <namespace>" }
+                CliCommand.Shell(rest[1])
             }
             else -> throw IllegalArgumentException("unknown command: ${rest[0]}")
         }

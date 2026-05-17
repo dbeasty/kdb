@@ -13,7 +13,7 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 | Capability | Status |
 |------------|--------|
 | Core engine (codec, storage, SQL, indexes, wire, peer sync, …) | Implemented; unit and integration tests |
-| **Product CLI** (`:kdb-cli`) — `init`, `put`, `get`, `query`, `log`, `status`, `sync` | Implemented via Gradle `runCli` |
+| **Product CLI** (`:kdb-cli`) — `init`, `put`, `get`, `query`, `log`, `status`, `sync`, `shell` | Implemented via Gradle `runCli` |
 | **Inspect CLI** (`:kdb-inspect`) — `dump-delta`, `dump-wire`, … | Implemented via Gradle `inspectCli` |
 | **JDBC driver** — `jdbc:kdb:memory://…`, `jdbc:kdb:file://…` | Embedded SELECT, metadata, prepared statements; file mode persists under `dataRoot/ns/{namespaceId}/` |
 | Peer sync (in-memory hub + TCP loopback) | Implemented (`:kdb-peer-sync`, `:kdb-transport-tcp`) |
@@ -72,6 +72,7 @@ Commands:
 | `log` | `log <namespace>` | Print commit history |
 | `status` | `status <namespace>` | Print HEAD hash and document count |
 | `sync` | `sync <namespace> <peer-uri>` | Bidirectional peer sync (e.g. TCP loopback URI) |
+| `shell` | `shell <namespace>` | Interactive REPL (one open runtime per session) |
 
 Example:
 
@@ -82,6 +83,35 @@ Example:
 ```
 
 **Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. Assume a **single writer** per data directory (no cross-process file locking in v1).
+
+### Interactive shell
+
+For multiple commands against the same workspace without paying a full JVM + delta replay per line, start the shell once:
+
+```bash
+./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb shell myapp/users"
+# kdb:myapp/users> put '{"userId":"u1"}'
+# kdb:myapp/users> query SELECT _doc FROM users
+# kdb:myapp/users> status
+# kdb:myapp/users> use myapp/archive
+# kdb:myapp/archive> exit
+```
+
+Shell commands omit the namespace on each line (it is fixed at startup; use `use <namespace>` to switch and reopen the runtime):
+
+| Line command | Description |
+|--------------|-------------|
+| `put <file\|json>` | Same rules as one-shot `put` |
+| `get <docId>` | Print document JSON |
+| `query <sql>` | Single-line SQL only |
+| `log` | Commit history |
+| `status` | HEAD hash and namespace |
+| `sync <peer-uri>` | Bidirectional peer sync |
+| `use <namespace>` | Switch namespace (reopens runtime) |
+| `help`, `?` | Command summary |
+| `exit`, `quit` | Leave shell (exit code 0) |
+
+Errors on a line are printed to stderr and the shell continues. Gradle still starts one JVM per `runCli` invocation; within a session, only the first line pays full open/replay cost. Do not run two shells (or a shell plus another CLI process) against the same `--data-dir` concurrently.
 
 Additional git-style commands (`branch`, `merge`, `schema migrate`, `push`, …) are described in [§11 CLI Interface](kdb-spec.md#11-cli-interface) and are not yet exposed on the v1 CLI.
 

@@ -70,6 +70,7 @@ Subcommands (v1 minimum):
 | `log` | `<namespace>` | Print commit hashes + messages |
 | `status` | `<namespace>` | HEAD hash, doc count |
 | `sync` | `<namespace> <peer-uri>` | Bidirectional peer sync over transport |
+| `shell` | `<namespace>` | Interactive REPL; one `openCliRuntime` per session; `use` reopens another namespace |
 
 -----
 
@@ -89,8 +90,11 @@ internal sealed class CliCommand {
     data class Log(val namespace: String) : CliCommand()
     data class Status(val namespace: String) : CliCommand()
     data class Sync(val namespace: String, val peerUri: String) : CliCommand()
+    data class Shell(val namespace: String) : CliCommand()
 }
 ```
+
+Interactive shell (`shell` subcommand): `CliSession` holds `CliConfig`, current `namespaceId`, and `CliRuntime`. `runShell` reads lines via `LineReader` (default `SystemLineReader`; `ListLineReader` in tests). Line verbs: `put`, `get`, `query`, `log`, `status`, `sync`, `use`, `help`/`?`, `exit`/`quit`. Session-scoped execution reuses `executePut` / `executeGet` / … from `CliCommands`; one-shot commands wrap the same helpers after a single `openCliRuntime`.
 
 Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.md`](kdb-spec-layer8-file-persistence-plan.md)):
 
@@ -140,6 +144,10 @@ Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.
 | 8 | `put_invalidJson` | `put ns not-json` | exit 1 |
 | 9 | `sync_inMemoryPeer` | two runtimes, in-memory URI | heads converge (integration) |
 | 10 | `help_text` | no args | usage on stderr, exit 2 |
+| 11 | `shell_putQuery_exit` | shell + `put`, `query`, `exit` | exit 0; doc at HEAD after reopen |
+| 12 | `shell_use` | `use` + `status` | output shows new namespace |
+| 13 | `shell_unknownCommand` | bad verb + `exit` | stderr error; exit 0 |
+| 14 | `shell_help` | `help` | usage fragment on stdout |
 
 -----
 

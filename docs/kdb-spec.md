@@ -978,6 +978,7 @@ kdb pull   myapp/users origin                 # pull + apply peer commits
 kdb fetch  myapp/users origin                 # fetch without applying
 kdb sync   myapp/users origin                 # bidirectional peer sync
 kdb status myapp/users                        # local changes, peer divergence
+kdb shell  myapp/users                        # interactive REPL (v1: put, query, get, log, status, sync, use)
 
 # ── Maintenance ───────────────────────────────────────────────
 kdb compact myapp/users                       # run compaction

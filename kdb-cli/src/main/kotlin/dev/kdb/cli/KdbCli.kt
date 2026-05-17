@@ -38,6 +38,7 @@ private fun printUsage() {
           log <namespace>
           status <namespace>
           sync <namespace> <peer-uri>
+          shell <namespace>          interactive REPL (put, query, get, …)
         """.trimIndent(),
     )
 }
