@@ -50,7 +50,7 @@ public object InMemoryWireTransportHub {
             return link
         }
 
-        internal suspend fun serverSend(frame: ByteArray) {
+        public suspend fun serverSend(frame: ByteArray) {
             val snapshot = synchronized(clients) { clients.toList() }
             for (c in snapshot) {
                 c.deliverFromServer(frame)

@@ -60,10 +60,18 @@ Layer 7 — Network Foundation [IMPLEMENTED — first Kotlin cut]
   [x] 21. Wire Protocol + Framing  — `:kdb-wire`; spec `kdb-spec-layer7-component21-wire-protocol-framing.md`
   [x] 22. Stream Mode (Mode 1 + 2) — `:kdb-stream`; spec `kdb-spec-layer7-component22-stream-mode.md`
 
+Layer 8 — Advanced Sync + JDBC [IMPLEMENTED — first Kotlin cut]
+  [x] 23. Peer Sync Mode (Mode 3)  — `:kdb-peer-sync`; spec `kdb-spec-layer8-component23-peer-sync-mode.md`
+  [x] 24. JDBC Driver              — `:kdb-jdbc`; spec `kdb-spec-layer8-component24-jdbc-driver.md`
+
+Layer 9 — Platform Adapters    [SPECS READY]
+  [ ] 25. Transport — WebSocket     — `:kdb-transport-ws`; spec `kdb-spec-layer9-component25-transport-websocket.md`
+  [ ] 26. Transport — TCP           — `:kdb-transport-tcp` + `:kdb-transport-core`; spec `kdb-spec-layer9-component26-transport-tcp.md`
+  [ ] 27. Compute — WebGPU          — `:kdb-compute-webgpu`; spec `kdb-spec-layer9-component27-compute-webgpu.md`
+  [ ] 28. Compute — CUDA/Vulkan     — `:kdb-compute-jvm` + `:kdb-compute`; spec `kdb-spec-layer9-component28-compute-cuda-vulkan.md`
+
 Layer 10 — Tooling (partial)  [IN PROGRESS]
   [x] 31. Inspect / Debug Tooling — `:kdb-inspect`; spec `kdb-spec-layer10-component31-inspect-tooling.md`
-
-Layers 8–9                   [NOT STARTED]
 ```
 
 ### What Has Been Done
@@ -89,10 +97,15 @@ Layers 8–9                   [NOT STARTED]
 - Layer 6 implemented (first Kotlin cut): `:kdb-namespace-policy`, `:kdb-hybrid-query`, `:kdb-compaction`. Hybrid engine wraps `:kdb-sql` with `AT VERSION`/`AT COMMIT`/`AT TIME`; policy JSON via kotlinx.serialization; DAG compaction orchestrates `CommitDag.squash` (distinct from `:kdb-storage-compaction`).
 - Layer 7 component specs generated (3 files): Components 20–22 — storage tier manager, wire protocol + framing, stream mode. Execution plan: `kdb-spec-layer7-execution-plan.md`. Draft interfaces in Section 17 → Layer 7.
 - Layer 7 implemented (first Kotlin cut): `:kdb-wire`, `:kdb-stream`, `:kdb-storage-tier`. Wire frame codec (JSON payload v1), in-memory transport, stream coordinator/subscriber, ice bundle archive/stub/restore.
+- Layer 8 component specs generated (2 files): Components 23–24 — peer sync Mode 3, JDBC driver. Execution plan: `kdb-spec-layer8-execution-plan.md`.
+- Layer 8 implemented (first Kotlin cut): `:kdb-peer-sync` (FULL_PEER handshake, CommitFetch/Push, bidirectional in-memory sync), `:kdb-jdbc` (memory-mode Driver/Connection/Statement/ResultSet/MetaData).
+- Layer 9 component specs generated (4 files + shared modules): Components 25–28 — WebSocket transport, TCP transport, WebGPU compute, CUDA/Vulkan/CPU compute. Execution plan: `kdb-spec-layer9-execution-plan.md`. Draft interfaces in Section 17 → Layer 9.
 
 ### What To Do Next
 
-**Layer 8 — Advanced Sync + JDBC** (depends on Layer 7). See Section 16.1 for Components 23–24 (Peer Sync Mode 3, JDBC Driver).
+**Layer 9 — Platform Adapters** (depends on Layer 8). Implement per `kdb-spec-layer9-execution-plan.md`: **transport-core → TCP (26) → WebSocket (25) → compute API → CPU/GPU backends (28, 27)**. See Section 16.1.
+
+**Layer 10 — Tooling** (after Layer 9): Component 29 CLI, Component 30 integration test suite (Component 31 inspect tooling already landed).
 
 Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
 
@@ -111,6 +124,8 @@ Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kd
 - Layer 5 depends on Layers 3 + 4a/4b — interfaces in Section 17 (Layers 0–4). Implement 12 (hash + btree) first; 13 and 14 may proceed in parallel once 12’s `CompositeIndexStoreFactory` pattern exists; 15 requires 12–14 for index planning; 16 requires 15 parser/planner hooks
 - Layer 6 depends on Layer 5 — implement **18 → 17 → 19** (policy before hybrid query and DAG compaction). Component 19 is **not** `:kdb-storage-compaction` (10f); DAG squash only. Physical tier moves remain Layer 7 Component 20.
 - Layer 7 depends on Layer 6 — implement **21 → 22 → 20** (wire before stream; tier manager subscribes to 11e). Component 22 is Mode 1/2 only; Mode 3 peer sync is Layer 8 Component 23. Transport sockets are Layer 9 (25–26).
+- Layer 8 depends on Layer 7 — implement **23 → 24** (peer sync before JDBC; JDBC delegates to `HybridQueryEngine`). Network JDBC requires Layer 9 transport.
+- Layer 9 depends on Layer 7–8 — implement **transport-core → 26 → 25 → `:kdb-compute` API → 28 (CPU first) → 27** (TCP before WebSocket for backend; compute CPU path before CUDA/WebGPU). Transport implements `WireTransport` from Component 22; compute implements `ComputeAdapter` for `GpuStorageEngine` and vector index.
 - Component 15 DML paths delegate writes to Component 7 (`TransactionEngine`) — do not duplicate commit logic; Component 17 routes hybrid `_doc` DML through the same engine
 - Never mix spec generation and implementation in the same session
 - Always save component spec output as `.md` files for download (see Section 16.4)
@@ -1076,6 +1091,8 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |*Layer 5 subtotal (Components 12–16)*                                            |*~18,800*  |
 |*Layer 6 subtotal (Components 17–19)*                                            |*~6,500*   |
 |*Layer 7 subtotal (Components 20–22)*                                            |*~9,000*   |
+|*Layer 8 subtotal (Components 23–24)*                                            |*~9,500*   |
+|*Layer 9 subtotal (Components 25–28 + transport-core)*                          |*~9,500*   |
 |JDBC driver (Driver, Connection, Statement, ResultSet, MetaData)                 |4,500      |
 |JDBC SQL extensions (AT VERSION, kdb_json_*, kdb_id, _doc)                       |1,000      |
 |Connection URL parser + embedded + memory modes                                  |500        |
@@ -1101,7 +1118,9 @@ Estimated non-blank non-comment Kotlin source lines for production-quality v1.0.
 |Error model                                                                      |500        |
 |Test infrastructure (fixtures, in-memory adapters, test DSL)                    |5,000      |
 |JDBC integration tests (Hibernate, jOOQ, Spring Data)                           |2,000      |
-|**Total**                                                                        |**~103,850**|
+|**Total**                                                                        |**~131,850**|
+
+> **Cumulative note:** Layer 9 specs add ~9,500 NBNC to the plan; implementation not yet started. Prior cumulative with Layers 0–8 implemented was ~122,350.
 
 > **Note:** Storage adapter line items for RocksDB, IndexedDB, LMDB, and mmap are removed. The KDB Storage Engine and Storage Manager components above replace them entirely. The B-tree index estimate increases slightly because it now owns the full LSM path in pure Kotlin rather than delegating to RocksDB.
 
@@ -1310,18 +1329,39 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 #### LAYER 8 — Advanced Sync + JDBC (depends on Layer 7)
 
 ```
-[ ] 23. Peer Sync Mode (Mode 3)
-[ ] 24. JDBC Driver
+[x] 23. Peer Sync Mode (Mode 3)  — `:kdb-peer-sync`; spec `kdb-spec-layer8-component23-peer-sync-mode.md`
+[x] 24. JDBC Driver              — `:kdb-jdbc`; spec `kdb-spec-layer8-component24-jdbc-driver.md`
 ```
 
-#### LAYER 9 — Platform Adapters (depends on interfaces, not implementations)
+**Layer 8 implementation order (normative):**
+
+1. **23 — Peer Sync** — `CommitPush` payload codec; `PeerSyncHost` / `PeerSyncClient`; `computeSyncPlan`; in-memory wire tests.
+2. **24 — JDBC Driver** — `KdbDriver`, memory URL, `EmbeddedKdbRuntime`, Statement/ResultSet/MetaData over `HybridQueryEngine`.
+
+**Detailed execution plan:** `docs/kdb-spec-layer8-execution-plan.md`
+
+**Estimated NBNC (Layer 8 production + tests):** ~9,500 lines (23: ~4,500; 24: ~5,000).
+
+#### LAYER 9 — Platform Adapters (depends on Layer 7–8)
 
 ```
-[ ] 25. Transport Adapter — WebSocket
-[ ] 26. Transport Adapter — TCP
-[ ] 27. Compute Adapter — WebGPU (jsMain)
-[ ] 28. Compute Adapter — CUDA/Vulkan (jvmMain)
+[ ] 25. Transport Adapter — WebSocket   — `:kdb-transport-ws`; spec `kdb-spec-layer9-component25-transport-websocket.md`
+[ ] 26. Transport Adapter — TCP         — `:kdb-transport-tcp`, `:kdb-transport-core`; spec `kdb-spec-layer9-component26-transport-tcp.md`
+[ ] 27. Compute Adapter — WebGPU        — `:kdb-compute-webgpu`; spec `kdb-spec-layer9-component27-compute-webgpu.md`
+[ ] 28. Compute Adapter — CUDA/Vulkan   — `:kdb-compute-jvm`, `:kdb-compute`; spec `kdb-spec-layer9-component28-compute-cuda-vulkan.md`
 ```
+
+**Layer 9 implementation order (normative):**
+
+1. **transport-core + 26 — TCP** — `FrameStreamReader`/`Writer`; JVM + native loopback; `PeerSyncClient` over `kdb-tcp://`.
+2. **25 — WebSocket** — binary message = one wire frame; jsMain client + jvmMain test server.
+3. **`:kdb-compute` API + 28 (CPU)** — `ComputeAdapter` reference backend; hook `GpuStorageEngine` + vector index.
+4. **27 — WebGPU** — WGSL cosine top-k v1; CPU fallback in headless CI.
+5. **28 — CUDA/Vulkan** — optional JVM GPU backends behind `kdb.cuda` property.
+
+**Detailed execution plan:** `docs/kdb-spec-layer9-execution-plan.md`
+
+**Estimated NBNC (Layer 9 production + tests):** ~9,500 lines (core: ~350; 26: ~1,650; 25: ~1,500; compute API: ~200; 27: ~3,000; 28: ~2,800).
 
 > **Note:** Storage adapters (IndexedDB, RocksDB, LMDB, mmap) are removed from this layer. Their role is replaced by the Platform I/O Shim in Layer 4a and the KDB Storage Engine running in commonMain.
 
@@ -2830,14 +2870,98 @@ interface WireTransport {
 
 ### Layer 8 Interfaces
 
-```
-[ not yet completed — depends on Layer 7 ]
+| Component | Module | Key types |
+|---|---|---|
+| 23 Peer Sync Mode 3 | `:kdb-peer-sync` | `peerSyncHost`, `peerSyncClient`, `computeSyncPlan` |
+| 24 JDBC Driver | `:kdb-jdbc` | `KdbDriver`, `openMemoryRuntime`, `KdbConnection` |
+
+```kotlin
+package dev.kdb.peersync
+
+interface PeerSyncHost {
+    suspend fun start(config: PeerHostConfig)
+    suspend fun stop()
+    suspend fun handleFrame(frame: ByteArray): ByteArray?
+}
+interface PeerSyncClient {
+    suspend fun connect(config: PeerClientConfig): PeerSession
+}
+interface PeerSession {
+    val remoteHead: KdbHash
+    suspend fun pullMissing(): PeerSyncResult
+    suspend fun syncBidirectional(): PeerSyncResult
+}
+fun peerSyncHost(wire: WireCodec, dag: CommitDag, storage: StorageAdapter, ...): PeerSyncHost
+fun peerSyncClient(wire: WireCodec, transport: WireTransport, dag: CommitDag, ...): PeerSyncClient
+suspend fun computeSyncPlan(dag: CommitDag, localHead: KdbHash, remoteHead: KdbHash): DagSyncPlan
+
+package dev.kdb.wire
+object CommitPushCodec {
+    fun encodeCommits(commits: List<KdbCommit>): ByteArray
+    fun decodeCommits(bytes: ByteArray): List<KdbCommit>
+}
+
+package dev.kdb.jdbc
+
+class KdbDriver : java.sql.Driver
+class KdbConnection(...) : java.sql.Connection
+fun openMemoryRuntime(catalog: String, namespaceId: String, schema: KdbSchema): EmbeddedKdbRuntime
 ```
 
 ### Layer 9 Interfaces
 
-```
-[ not yet completed — depends on Layer 3 Storage Adapter Interface ]
+> **Normative detail:** component specs `kdb-spec-layer9-component25-*.md` through `28-*.md`. Draft below — paste final signatures when each module is implemented.
+
+| Component | Module | Key types |
+|---|---|---|
+| (shared) | `:kdb-transport-core` | `FrameStreamReader`, `FrameFramer`, `TransportConnectOptions` |
+| 25 WebSocket | `:kdb-transport-ws` | `WebSocketWireTransport`, `defaultWebSocketWireTransport()` |
+| 26 TCP | `:kdb-transport-tcp` | `TcpWireTransport`, `defaultTcpWireTransport()` |
+| (shared) | `:kdb-compute` | `ComputeAdapter`, `GpuVectorSearchRequest` |
+| 27 WebGPU | `:kdb-compute-webgpu` | `createWebGpuComputeAdapter()` |
+| 28 JVM compute | `:kdb-compute-jvm` | `createJvmComputeAdapter()`, `probeComputeAdapter()` |
+
+```kotlin
+package dev.kdb.transport.core
+
+class FrameStreamReader(maxFrameBytes: Int = DEFAULT_MAX_FRAME_BYTES)
+data class TransportConnectOptions(
+    val connectTimeoutMs: Long = 10_000,
+    val readTimeoutMs: Long = 0,
+    val maxFrameBytes: Int = DEFAULT_MAX_FRAME_BYTES,
+)
+
+package dev.kdb.transport.tcp
+interface TcpWireTransport : dev.kdb.stream.WireTransport {
+    suspend fun listen(uri: String, handler: suspend (dev.kdb.stream.WireConnection) -> Unit)
+}
+fun defaultTcpWireTransport(): TcpWireTransport
+
+package dev.kdb.transport.ws
+interface WebSocketWireTransport : dev.kdb.stream.WireTransport {
+    suspend fun listen(uri: String, handler: suspend (dev.kdb.stream.WireConnection) -> Unit)
+}
+fun defaultWebSocketWireTransport(): WebSocketWireTransport
+
+package dev.kdb.compute
+
+interface ComputeAdapter {
+    val capabilities: ComputeAdapterCapabilities
+    val isAvailable: Boolean
+    val backend: ComputeBackend
+    suspend fun ingestDeltaSegment(request: GpuSegmentIngestRequest): GpuSegmentHandle
+    suspend fun releaseSegment(handle: GpuSegmentHandle)
+    suspend fun vectorNearestNeighbours(request: GpuVectorSearchRequest): List<dev.kdb.index.RankedResult>
+    suspend fun shutdown()
+}
+
+enum class ComputeBackend { CPU, CUDA, VULKAN, WEBGPU }
+
+package dev.kdb.compute.jvm
+fun createJvmComputeAdapter(config: JvmComputeConfig = JvmComputeConfig()): ComputeAdapter
+
+package dev.kdb.compute.webgpu
+expect fun createWebGpuComputeAdapter(): ComputeAdapter?
 ```
 
 ### Layer 10 Interfaces

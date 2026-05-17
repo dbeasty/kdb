@@ -203,6 +203,30 @@ class WireCodecTest {
     }
 
     @Test
+    fun commitPushRoundtrip() {
+        val commit =
+            dev.kdb.document.KdbCommit.build(
+                parentHashes = listOf(KdbHash.fromHex("00".repeat(32))),
+                namespaceId = "app/data",
+                transactionId = KdbUuid.random(),
+                timestamp = dev.kdb.codec.KdbTimestamp.now(),
+                authorNodeId = KdbUuid.random(),
+                operations = listOf(KdbOp.Write(KdbUuid.random(), """{"a":1}""")),
+                documentTreeHash = KdbHash.fromHex("11".repeat(32)),
+                schemaHash = null,
+            )
+        val msg =
+            WireMessage.CommitPush(
+                header(9, WireMessageType.COMMIT_PUSH),
+                "app/data",
+                listOf(commit),
+            )
+        val back = codec.decode(codec.encode(msg)) as WireMessage.CommitPush
+        assertEquals(1, back.commits.size)
+        assertEquals(commit.hash, back.commits.single().hash)
+    }
+
+    @Test
     fun unknownMessageTypeOnDecode() {
         val frame = ByteArray(20)
         writeInt32Le(frame, 0, 20)

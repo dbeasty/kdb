@@ -71,7 +71,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                 commitPush =
                     CommitPushDto(
                         namespace = namespace,
-                        commitsPayload = ByteArray(0),
+                        commitsPayload = CommitPushCodec.encodeCommits(commits),
                     ),
             )
 
@@ -241,7 +241,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
 
         "commitPush" -> {
             val c = commitPush ?: throw WireDecodeException("missing commitPush body")
-            WireMessage.CommitPush(header, c.namespace, emptyList())
+            WireMessage.CommitPush(header, c.namespace, CommitPushCodec.decodeCommits(c.commitsPayload))
         }
 
         "dagDiff" -> {
