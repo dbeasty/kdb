@@ -34,6 +34,23 @@ public interface IndexRegistry {
         dag: CommitDag,
         storage: StorageAdapter,
     ): SchemaSyncResult
+
+    /** Registers an index declared via SQL `CREATE INDEX` (not from schema sync). */
+    public suspend fun registerSqlIndex(
+        descriptor: IndexDescriptor,
+        storeFactory: IndexStoreFactory,
+        dag: CommitDag,
+        storage: StorageAdapter,
+        schema: KdbSchema,
+        sqlIndexName: String,
+        rebuild: Boolean,
+    ): SchemaSyncResult
+
+    /** Drops an index created via `CREATE INDEX`; returns false if name unknown. */
+    public suspend fun dropSqlIndex(
+        namespaceId: String,
+        sqlIndexName: String,
+    ): Boolean
 }
 
 public interface IndexWriter {

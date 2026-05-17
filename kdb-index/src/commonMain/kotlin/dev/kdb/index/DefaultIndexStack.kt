@@ -25,6 +25,7 @@ internal class DefaultIndexRegistry(
     private val lock = Mutex()
     private val byKey = mutableMapOf<Pair<String, IndexType>, IndexStore>()
     private val byId = mutableMapOf<KdbUuid, Pair<IndexDescriptor, IndexStore>>()
+    private val bySqlName = mutableMapOf<String, IndexDescriptor>()
 
     override val indexes: List<IndexStore>
         get() = byId.values.map { (_, store) -> store }
@@ -116,6 +117,54 @@ internal class DefaultIndexRegistry(
     private fun descriptorFor(fieldName: String): IndexDescriptor =
         indexes.firstOrNull { it.descriptor.fieldName == fieldName }?.descriptor
             ?: throw IllegalStateException("No live index backing $fieldName")
+
+    override suspend fun registerSqlIndex(
+        descriptor: IndexDescriptor,
+        storeFactory: IndexStoreFactory,
+        dag: CommitDag,
+        storage: StorageAdapter,
+        schema: KdbSchema,
+        sqlIndexName: String,
+        rebuild: Boolean,
+    ): SchemaSyncResult =
+        lock.withLock {
+            if (sqlIndexName in bySqlName) {
+                throw IllegalArgumentException("SQL index already exists: $sqlIndexName")
+            }
+            val store = storeFactory.create(descriptor)
+            byKey[descriptor.fieldName to descriptor.type] = store
+            byId[descriptor.indexId] = descriptor to store
+            bySqlName[sqlIndexName] = descriptor
+            val created = listOf(descriptor)
+            if (rebuild) {
+                DefaultIndexWriter(hintSink = null).rebuildAll(
+                    dag.head(),
+                    dag,
+                    this,
+                    storage,
+                    schema,
+                )
+            }
+            SchemaSyncResult(
+                created = created,
+                removed = emptyList(),
+                unchanged = emptyList(),
+                rebuilding = if (rebuild) created else emptyList(),
+            )
+        }
+
+    override suspend fun dropSqlIndex(
+        namespaceId: String,
+        sqlIndexName: String,
+    ): Boolean =
+        lock.withLock {
+            if (namespaceId != this.namespaceId) return false
+            val descriptor = bySqlName.remove(sqlIndexName) ?: return false
+            val pair = descriptor.fieldName to descriptor.type
+            val store = byKey.remove(pair) ?: return false
+            byId.remove(descriptor.indexId)
+            true
+        }
 }
 
 internal class DefaultIndexWriter(

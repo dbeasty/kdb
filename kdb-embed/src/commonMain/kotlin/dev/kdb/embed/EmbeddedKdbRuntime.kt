@@ -37,7 +37,7 @@ public suspend fun openMemoryRuntime(
     indexManager.bindNamespace(namespaceId, dag)
     val policies = inMemoryNamespacePolicyRegistry()
     val sql: SqlEngine = sqlEngine(indexManager, storage, dag)
-    val hybrid = hybridQueryEngine(sql, dag, policies)
+    val hybrid = hybridQueryEngine(sql, dag, policies, indexManager, storage)
     val runtime =
         EmbeddedKdbRuntime(
             catalog = catalog,

@@ -33,6 +33,12 @@ public enum class WireMessageType(public val code: Short) {
     SNAPSHOT_RESPONSE(0x0B),
     POSITION_ACK(0x0C),
     SCHEMA_PUSH(0x0D),
+    SESSION_BEGIN(0x0E),
+    SQL_EXEC(0x0F),
+    SQL_RESULT(0x10),
+    TX_COMMIT(0x11),
+    TX_ROLLBACK(0x12),
+    SESSION_BEGIN_ACK(0x13),
     ;
 
     public companion object {
@@ -49,6 +55,7 @@ public enum class WireClientMode {
     STREAM_READ_ONLY,
     STREAM_WRITE_BACK,
     FULL_PEER,
+    SQL_CLIENT,
 }
 
 public data class WireCapabilitySet(
@@ -239,6 +246,65 @@ public sealed class WireMessage {
         override fun hashCode(): Int =
             header.hashCode() xor namespace.hashCode() xor revision.hashCode() xor schemaBytes.contentHashCode()
     }
+
+    public data class SessionBegin(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String?,
+        val readConsistency: String,
+        val baseVersionHex: String?,
+    ) : WireMessage()
+
+    public data class SessionBeginAck(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String,
+        val headHex: String,
+        val readConsistency: String,
+    ) : WireMessage()
+
+    public data class SqlExec(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String,
+        val sql: String,
+        val parametersJson: String?,
+    ) : WireMessage()
+
+    public data class SqlResult(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String,
+        val columns: List<String>,
+        val rows: List<List<String>>,
+        val rowsAffected: Int,
+        val resolvedCommitHex: String,
+        val readOnly: Boolean,
+        val error: String? = null,
+    ) : WireMessage()
+
+    public data class TxCommit(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String,
+        val transactionBytes: ByteArray,
+    ) : WireMessage() {
+        override fun equals(other: Any?): Boolean =
+            other is TxCommit &&
+                header == other.header &&
+                namespace == other.namespace &&
+                sessionId == other.sessionId &&
+                transactionBytes.contentEquals(other.transactionBytes)
+
+        override fun hashCode(): Int =
+            header.hashCode() xor namespace.hashCode() xor sessionId.hashCode() xor transactionBytes.contentHashCode()
+    }
+
+    public data class TxRollback(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String,
+    ) : WireMessage()
 }
 
 public interface WireCodec {

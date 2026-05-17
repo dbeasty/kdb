@@ -176,6 +176,11 @@ internal class DefaultTransactionEngine(
         targetDocTreeHash: KdbHash,
         message: String,
     ): TransactionResult {
+        val fileViolations = preflightFileWrites(transaction, storage)
+        if (fileViolations.isNotEmpty()) {
+            return TransactionResult.SchemaError(fileViolations)
+        }
+
         val schemaFrame =
             runSchemaPhase(
                 transaction,
@@ -354,6 +359,32 @@ internal class DefaultTransactionEngine(
             }
         }
         return out
+    }
+
+    private suspend fun preflightFileWrites(
+        transaction: KdbTransaction,
+        storage: StorageAdapter,
+    ): List<OperationViolation> {
+        val violations = mutableListOf<OperationViolation>()
+        for ((index, op) in transaction.operations.withIndex()) {
+            if (op !is KdbOp.FileWrite) continue
+            if (storage.readBlob(op.blobHash) == null) {
+                violations +=
+                    OperationViolation(
+                        opIndex = index,
+                        op = op,
+                        violations =
+                            listOf(
+                                FieldViolation(
+                                    fieldName = op.path,
+                                    violationType = ViolationType.CUSTOM_CONSTRAINT,
+                                    detail = "blob not found: ${op.blobHash.toHex()}",
+                                ),
+                            ),
+                    )
+            }
+        }
+        return violations
     }
 
     private suspend fun runSchemaPhase(

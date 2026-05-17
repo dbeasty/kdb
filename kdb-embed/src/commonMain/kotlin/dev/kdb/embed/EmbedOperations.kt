@@ -124,10 +124,7 @@ public suspend fun putJson(
         element["id"]?.jsonPrimitive?.content?.let { KdbUuid.fromString(it) }
             ?: KdbUuid.random()
     val doc = KdbDocument(docId, json)
-    runtime.storage.putDocument(namespaceId, doc)
     val parent = runtime.dag.head()
-    val parentTree = runtime.dag.getCommitOrThrow(parent).documentTreeHash
-    val tree = runtime.storage.commitTree(namespaceId, parentTree)
     val tx =
         KdbTransaction(
             KdbUuid.random(),
@@ -136,15 +133,7 @@ public suspend fun putJson(
             KdbTimestamp.now(),
             KdbUuid.random(),
         )
-    val commit = runtime.dag.appendCommit(tx, parent, tree, null)
-    if (!schema.isNone) {
-        runtime.indexManager.writer.applyCommit(
-            commit,
-            runtime.indexManager.registryFor(namespaceId),
-            runtime.storage,
-            schema,
-        )
-    }
+    commitViaEngine(runtime, namespaceId, tx, schema)
     return docId.toString()
 }
 

@@ -81,7 +81,7 @@ public fun openFileRuntime(
     }
     val policies = inMemoryNamespacePolicyRegistry()
     val sql = sqlEngine(indexManager, storage, dag)
-    val hybrid = hybridQueryEngine(sql, dag, policies)
+    val hybrid = hybridQueryEngine(sql, dag, policies, indexManager, storage)
     return EmbeddedKdbRuntime(
         catalog = catalog,
         dag = dag,

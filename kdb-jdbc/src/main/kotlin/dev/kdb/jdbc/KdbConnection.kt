@@ -27,7 +27,8 @@ import java.util.concurrent.Executor
 public class KdbConnection(
     private val runtime: EmbeddedKdbRuntime,
     private val url: KdbJdbcUrl,
-) : Connection {
+) : Connection,
+    KdbSqlConnection {
     private var closed = false
     private var autoCommit = true
     private var schema: KdbSchema = runtime.schema
@@ -36,16 +37,20 @@ public class KdbConnection(
 
     internal val embedded: EmbeddedKdbRuntime get() = runtime
 
-    internal fun namespaceForTable(table: String): String = url.namespaceForTable(table)
+    internal fun applyQuerySchema(schema: KdbSchema) {
+        this.schema = schema
+    }
 
-    internal fun <T> blocking(block: suspend () -> T): T {
+    override fun namespaceForTable(table: String): String = url.namespaceForTable(table)
+
+    override fun <T> blocking(block: suspend () -> T): T {
         checkOpen()
         return runBlocking { block() }
     }
 
-    internal suspend fun executeHybrid(
+    override suspend fun executeHybrid(
         sql: String,
-        parameters: List<SqlParameter> = emptyList(),
+        parameters: List<SqlParameter>,
     ): HybridQueryResult {
         val namespaceId = resolveNamespace(sql)
         return runtime.hybrid.execute(
@@ -103,11 +108,11 @@ public class KdbConnection(
 
     override fun rollback() {}
 
-    internal fun checkOpen() {
+    override fun checkOpen() {
         if (closed) throw SQLException("Connection is closed")
     }
 
-    internal fun checkWritable() {
+    override fun checkWritable() {
         if (readOnly) throw SQLException("Connection is read-only")
     }
 

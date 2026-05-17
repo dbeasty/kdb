@@ -7,6 +7,12 @@ import dev.kdb.sql.ExplainResult
 import dev.kdb.sql.QueryResult
 import dev.kdb.sql.SqlParameter
 
+public enum class ReadConsistency {
+    SNAPSHOT,
+    READ_COMMITTED,
+    READ_YOUR_WRITES,
+}
+
 public sealed class VersionClause {
     public data class AtTag(val tag: String) : VersionClause()
     public data class AtCommit(val hex: String) : VersionClause()
@@ -19,6 +25,9 @@ public data class HybridQueryRequest(
     val version: VersionClause? = null,
     val parameters: List<SqlParameter> = emptyList(),
     val maxRows: Int = 10_000,
+    val readConsistency: ReadConsistency = ReadConsistency.READ_COMMITTED,
+    val readPin: KdbHash? = null,
+    val sessionCheckout: CheckoutHandle? = null,
 )
 
 public data class HybridQueryResult(

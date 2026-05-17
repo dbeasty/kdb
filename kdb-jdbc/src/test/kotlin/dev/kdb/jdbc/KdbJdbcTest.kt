@@ -87,6 +87,21 @@ class KdbJdbcTest {
     }
 
     @Test
+    fun executeUpdateSchemaField() {
+        val conn = DriverManager.getConnection("jdbc:kdb:memory:///demo/users") as KdbConnection
+        seedUsers(conn)
+        val updated =
+            conn.createStatement().executeUpdate(
+                "UPDATE users SET status = 'inactive' WHERE userId = 'u1'",
+            )
+        assertEquals(1, updated)
+        val rs = conn.createStatement().executeQuery("SELECT _doc FROM users WHERE userId = 'u1'")
+        assertTrue(rs.next())
+        assertTrue(rs.getString(1)!!.contains("inactive"))
+        conn.close()
+    }
+
+    @Test
     fun readOnlyRejectsUpdate() {
         val conn =
             DriverManager.getConnection(
@@ -119,6 +134,7 @@ class KdbJdbcTest {
             KdbSchema.build(
                 listOf(
                     SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
+                    SchemaField("status", KdbFieldType.StringType, required = true, indexed = true),
                 ),
             )
         manager.registryFor(ns).syncSchema(
@@ -128,7 +144,7 @@ class KdbJdbcTest {
             dag,
             storage,
         )
-        val doc = KdbDocument(KdbUuid.random(), """{"userId":"u1"}""")
+        val doc = KdbDocument(KdbUuid.random(), """{"userId":"u1","status":"active"}""")
         storage.putDocument(ns, doc)
         val parent = dag.head()
         val tree = storage.commitTree(ns, dag.getCommitOrThrow(parent).documentTreeHash)
@@ -142,5 +158,6 @@ class KdbJdbcTest {
             )
         val commit = dag.appendCommit(tx, parent, tree, null)
         manager.writer.applyCommit(commit, manager.registryFor(ns), storage, schema)
+        conn.applyQuerySchema(schema)
         }
 }

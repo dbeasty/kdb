@@ -19,6 +19,12 @@ internal data class WirePayloadEnvelope(
     val snapshotResponse: SnapshotResponseDto? = null,
     val positionAck: PositionAckDto? = null,
     val schemaPush: SchemaPushDto? = null,
+    val sessionBegin: SessionBeginDto? = null,
+    val sessionBeginAck: SessionBeginAckDto? = null,
+    val sqlExec: SqlExecDto? = null,
+    val sqlResult: SqlResultDto? = null,
+    val txCommit: TxCommitDto? = null,
+    val txRollback: TxRollbackDto? = null,
 )
 
 @Serializable
@@ -128,4 +134,53 @@ internal data class SchemaPushDto(
     val namespace: String,
     val schemaBytes: ByteArray,
     val revision: Long,
+)
+
+@Serializable
+internal data class SessionBeginDto(
+    val namespace: String,
+    val sessionId: String? = null,
+    val readConsistency: String,
+    val baseVersionHex: String? = null,
+)
+
+@Serializable
+internal data class SessionBeginAckDto(
+    val namespace: String,
+    val sessionId: String,
+    val headHex: String,
+    val readConsistency: String,
+)
+
+@Serializable
+internal data class SqlExecDto(
+    val namespace: String,
+    val sessionId: String,
+    val sql: String,
+    val parametersJson: String? = null,
+)
+
+@Serializable
+internal data class SqlResultDto(
+    val namespace: String,
+    val sessionId: String,
+    val columns: List<String> = emptyList(),
+    val rows: List<List<String>> = emptyList(),
+    val rowsAffected: Int = 0,
+    val resolvedCommitHex: String = "",
+    val readOnly: Boolean = true,
+    val error: String? = null,
+)
+
+@Serializable
+internal data class TxCommitDto(
+    val namespace: String,
+    val sessionId: String,
+    val transactionBytes: ByteArray,
+)
+
+@Serializable
+internal data class TxRollbackDto(
+    val namespace: String,
+    val sessionId: String,
 )

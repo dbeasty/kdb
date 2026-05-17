@@ -19,7 +19,7 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 | Peer sync (in-memory hub + TCP loopback) | Implemented (`:kdb-peer-sync`, `:kdb-transport-tcp`) |
 | Integration test suite | `:kdb-integration` |
 | **JDBC** — `jdbc:kdb://…` network URLs | Parsed but not implemented (`SQLFeatureNotSupportedException`) |
-| JDBC DML (`INSERT` / `UPDATE` / `DELETE`) | Not implemented in v1 (`HybridDmlNotSupportedException`) |
+| JDBC DML (`INSERT` / `UPDATE` / `DELETE`) | Implemented (embedded memory/file); auto-commit per statement |
 | CLI persistence (`--data-dir`) | `put` / `get` / `query` survive separate CLI invocations (delta log + SERVER engine) |
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
@@ -200,7 +200,7 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 | Area | Behaviour |
 |------|-----------|
 | **Network URLs** | `SQLFeatureNotSupportedException` |
-| **DML** | `UPDATE` / `INSERT` / `DELETE` → `HybridDmlNotSupportedException` |
+| **DML** | `UPDATE` / `INSERT` / `DELETE` via `executeUpdate` (embedded); read-only connections reject writes |
 | **Read-only connection** | `executeUpdate` → `SQLException` |
 | **Advanced JDBC** | `CallableStatement`, `Savepoint`, `Blob`/`Clob`, batch, generated keys → `SQLFeatureNotSupportedException` |
 | **Compliance** | `jdbcCompliant()` returns `false` |
@@ -395,7 +395,7 @@ await db.close();
 | `fields[].indexed` | boolean | optional; required for indexed `WHERE` |
 | `fields[].unique` | boolean | optional |
 
-**SQL limits (v1):** hybrid `SELECT` works; DML (`INSERT`/`UPDATE`/`DELETE`) is not supported in the browser embed and surfaces as an error. `SELECT _doc` works without a schema; indexed predicates need a non-empty schema.
+**SQL limits (v1):** hybrid `SELECT` and single-table DML (`INSERT`/`UPDATE`/`DELETE`) work in embedded runtimes. `SELECT _doc` works without a schema; indexed predicates need a non-empty schema. `BETWEEN`, `IS NULL`, `ORDER BY`, `LIMIT`/`OFFSET`, and prepared `?` parameters are supported. `ORDER BY similarity(col, 'text')` requires a text-embedding path (not yet available). No `JOIN`s or aggregates.
 
 **Kotlin embed** (same behavior as the CLI put/query path):
 

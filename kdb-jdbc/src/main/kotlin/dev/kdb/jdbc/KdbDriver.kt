@@ -1,6 +1,7 @@
 package dev.kdb.jdbc
 
 import dev.kdb.jdbc.file.openFileRuntime
+import dev.kdb.jdbc.remote.KdbRemoteConnection
 import java.sql.Connection
 import java.sql.Driver
 import java.sql.DriverManager
@@ -32,8 +33,7 @@ public class KdbDriver : Driver {
                     parsed,
                 )
             }
-            JdbcMode.NETWORK ->
-                throw SQLFeatureNotSupportedException("KDB JDBC mode ${parsed.mode} is not implemented in v1")
+            JdbcMode.NETWORK -> KdbRemoteConnection(parsed)
         }
     }
 

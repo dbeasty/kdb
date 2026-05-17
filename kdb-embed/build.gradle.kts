@@ -15,6 +15,7 @@ kotlin {
         val commonMain by getting {
             dependencies {
                 implementation(project(":kdb-codec"))
+                implementation(project(":kdb-error"))
                 implementation(project(":kdb-dag"))
                 implementation(project(":kdb-document"))
                 implementation(project(":kdb-hybrid-query"))
@@ -23,6 +24,7 @@ kotlin {
                 implementation(project(":kdb-json"))
                 implementation(project(":kdb-namespace-policy"))
                 implementation(project(":kdb-schema"))
+                implementation(project(":kdb-transaction"))
                 implementation(project(":kdb-sql"))
                 implementation(project(":kdb-storage"))
                 implementation(libs.kotlinx.coroutines.core)

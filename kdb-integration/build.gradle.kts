@@ -17,6 +17,7 @@ dependencies {
     testImplementation(project(":kdb-transport-tcp"))
     testImplementation(project(":kdb-transport-ws"))
     testImplementation(project(":kdb-embed"))
+    testImplementation(project(":kdb-server"))
     testImplementation(project(":kdb-wire"))
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)

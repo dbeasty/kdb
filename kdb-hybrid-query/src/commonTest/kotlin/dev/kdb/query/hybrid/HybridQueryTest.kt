@@ -46,11 +46,14 @@ class HybridQueryTest {
             val storage = InMemoryStorageAdapter()
             val policies = inMemoryNamespacePolicyRegistry()
             policies.put(cacheNoHistory(ns))
+            val manager = productionIndexManager(dag, storage)
             val engine =
                 hybridQueryEngine(
-                    sqlEngine(productionIndexManager(dag, storage), storage, dag),
+                    sqlEngine(manager, storage, dag),
                     dag,
                     policies,
+                    manager,
+                    storage,
                 )
             assertFailsWith<HistoryDisabledException> {
                 engine.execute(
@@ -103,6 +106,8 @@ class HybridQueryTest {
                     sqlEngine(manager, storage, dag),
                     dag,
                     policies,
+                    manager,
+                    storage,
                 )
             val result =
                 hybrid.execute(
@@ -112,5 +117,65 @@ class HybridQueryTest {
             assertTrue(result.result.rows.isNotEmpty())
             val docCell = result.result.rows.first().values.last() as SqlCell.JsonVal
             assertEquals("""{"userId":"u1"}""", docCell.json)
+        }
+
+    @Test
+    fun updateSchemaFieldViaDml() =
+        runTest {
+            val ns = "app/users"
+            val dag = inMemoryCommitDag(ns)
+            val storage = InMemoryStorageAdapter()
+            val manager = productionIndexManager(dag, storage)
+            manager.bindNamespace(ns, dag)
+            val schema =
+                KdbSchema.build(
+                    listOf(
+                        SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
+                        SchemaField("status", KdbFieldType.StringType, required = true, indexed = true),
+                    ),
+                )
+            val registry = manager.registryFor(ns)
+            registry.syncSchema(
+                KdbSchema.NONE,
+                schema,
+                compositeIndexStoreFactory(dag, storage),
+                dag,
+                storage,
+            )
+            val docId = KdbUuid.random()
+            val doc = KdbDocument(docId, """{"userId":"u1","status":"active"}""")
+            storage.putDocument(ns, doc)
+            val parent = dag.head()
+            val tree = storage.commitTree(ns, dag.getCommitOrThrow(parent).documentTreeHash)
+            val tx =
+                KdbTransaction(
+                    KdbUuid.random(),
+                    parent,
+                    listOf(KdbOp.Write(docId, doc.json)),
+                    KdbTimestamp.now(),
+                    KdbUuid.random(),
+                )
+            val commit = dag.appendCommit(tx, parent, tree, null)
+            manager.writer.applyCommit(commit, registry, storage, schema)
+            val hybrid =
+                hybridQueryEngine(
+                    sqlEngine(manager, storage, dag),
+                    dag,
+                    inMemoryNamespacePolicyRegistry(),
+                    manager,
+                    storage,
+                )
+            val dml =
+                hybrid.execute(
+                    "UPDATE users SET status = 'inactive' WHERE userId = 'u1'",
+                    HybridQueryRequest(ns, schema),
+                )
+            assertEquals(1, dml.result.rowsAffected)
+            val read =
+                hybrid.execute(
+                    "SELECT status FROM users WHERE userId = 'u1'",
+                    HybridQueryRequest(ns, schema),
+                )
+            assertEquals("inactive", (read.result.rows.first().values[0] as SqlCell.StringVal).value)
         }
 }

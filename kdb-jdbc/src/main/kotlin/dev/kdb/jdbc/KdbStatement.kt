@@ -9,7 +9,7 @@ import java.sql.SQLWarning
 import java.sql.Statement
 
 open class KdbStatement(
-    private val connection: KdbConnection,
+    private val connection: KdbSqlConnection,
 ) : Statement {
     private var closed = false
     private var maxRows = 0
@@ -34,7 +34,7 @@ open class KdbStatement(
             true
         } else {
             connection.checkWritable()
-            connection.blocking { connection.executeHybrid(qualifyTable(sql)) }
+            connection.blocking { connection.executeHybrid(qualifyTable(sql), emptyList()) }
             false
         }
     }
@@ -65,7 +65,7 @@ open class KdbStatement(
         }
     }
 
-    override fun getConnection(): Connection = connection
+    override fun getConnection(): Connection = connection as Connection
 
     override fun close() {
         closed = true
@@ -175,14 +175,6 @@ open class KdbStatement(
         if (closed) throw SQLException("Statement is closed")
     }
 
-  private fun qualifyTable(sql: String): String {
-        val from = Regex("""FROM\s+([A-Za-z_][A-Za-z0-9_]*)""", RegexOption.IGNORE_CASE).find(sql)
-        if (from != null) {
-            val table = from.groupValues[1]
-            if (!table.contains('/')) {
-                return sql.replaceFirst(from.value, "FROM ${connection.namespaceForTable(table)}")
-            }
-        }
-        return sql
-    }
+    /** SQL table names stay short (e.g. `users`); namespace comes from [KdbSqlConnection] context. */
+    private fun qualifyTable(sql: String): String = sql
 }

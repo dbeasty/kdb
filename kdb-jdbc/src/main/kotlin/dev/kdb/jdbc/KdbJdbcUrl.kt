@@ -11,7 +11,17 @@ data class KdbJdbcUrl(
     val readOnly: Boolean,
     /** Filesystem root for [JdbcMode.FILE]; segments live under `ns/{namespaceId}/`. */
     val dataRoot: String? = null,
+    val networkHost: String? = null,
+    val networkPort: Int = 7444,
+    val inprocHub: String? = null,
 ) {
+    fun networkWebSocketUri(): String {
+        if (inprocHub != null) {
+            return "inproc-ws://$inprocHub"
+        }
+        val host = networkHost ?: "localhost"
+        return "kdb-ws://$host:$networkPort/kdb"
+    }
     fun namespaceForTable(table: String): String = "$catalog/$table"
 }
 
@@ -75,11 +85,42 @@ internal object KdbJdbcUrlParser {
                     }
                 KdbJdbcUrl(JdbcMode.FILE, fileParts.catalog, fileParts.namespaceId, readOnly, fileParts.dataRoot)
             }
+            rest.startsWith("inproc:") -> {
+                val after = rest.removePrefix("inproc:")
+                val hub = after.substringBefore('/').ifEmpty { "kdb" }
+                val path = after.substringAfter('/', "").substringBefore('?')
+                val catalog = path.substringBefore('/').ifEmpty { "default" }
+                val namespace =
+                    if (path.contains('/')) path else "$catalog/main"
+                KdbJdbcUrl(
+                    JdbcMode.NETWORK,
+                    catalog,
+                    namespace,
+                    readOnly,
+                    inprocHub = hub,
+                )
+            }
             else -> {
-                val withoutScheme = rest.removePrefix("//")
-                val catalog = withoutScheme.substringBefore('/').substringBefore('?').ifEmpty { "default" }
-                val namespace = withoutScheme.substringBefore('?').ifEmpty { "$catalog/main" }
-                KdbJdbcUrl(JdbcMode.NETWORK, catalog, namespace, readOnly)
+                val uri = java.net.URI("kdb:$rest")
+                val host = uri.host ?: "localhost"
+                val port = if (uri.port > 0) uri.port else 7444
+                val path = uri.path?.trimStart('/')?.substringBefore('?').orEmpty()
+                val catalog =
+                    path.substringBefore('/').ifEmpty { "default" }
+                val namespace =
+                    if (path.contains('/')) {
+                        path
+                    } else {
+                        "$catalog/main"
+                    }
+                KdbJdbcUrl(
+                    JdbcMode.NETWORK,
+                    catalog,
+                    namespace,
+                    readOnly,
+                    networkHost = host,
+                    networkPort = port,
+                )
             }
         }
     }

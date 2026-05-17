@@ -62,6 +62,7 @@ public interface VirtualViewEngine {
         sql: String,
         context: QueryContext,
         storage: StorageAdapter,
+        registry: VirtualViewRegistry,
         parser: SqlParser = defaultSqlParser(),
     )
 
@@ -116,13 +117,13 @@ public class DefaultVirtualViewEngine(
         sql: String,
         context: QueryContext,
         storage: StorageAdapter,
+        registry: VirtualViewRegistry,
         parser: SqlParser,
     ) {
         val stmt = parser.parse(sql)
         val create =
             stmt as? SqlStatement.CreateVirtualView
                 ?: throw SqlPlanningException("not a CREATE VIRTUAL VIEW", sql)
-        val registry = storageBackedRegistry(storage)
         if (registry.get(context.namespaceId, create.name) != null) {
             throw VirtualViewExistsException("view ${create.name} exists", create.name)
         }
@@ -170,8 +171,6 @@ public class DefaultVirtualViewEngine(
             }
         }
 
-    private fun storageBackedRegistry(storage: StorageAdapter): VirtualViewRegistry =
-        InMemoryVirtualViewRegistry()
 }
 
 public fun virtualViewRegistry(): VirtualViewRegistry = InMemoryVirtualViewRegistry()

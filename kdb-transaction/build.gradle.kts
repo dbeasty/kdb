@@ -38,6 +38,8 @@ kotlin {
 
         commonTest.dependencies {
             implementation(libs.kotlin.test)
+            implementation(libs.kotlinx.coroutines.test)
+            implementation(project(":kdb-dag"))
             implementation(project(":kdb-storage"))
             implementation(project(":kdb-schema"))
             implementation(project(":kdb-document"))

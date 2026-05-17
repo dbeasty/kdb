@@ -172,6 +172,79 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         revision = revision,
                     ),
             )
+
+        is WireMessage.SessionBegin ->
+            WirePayloadEnvelope(
+                kind = "sessionBegin",
+                sessionBegin =
+                    SessionBeginDto(
+                        namespace = namespace,
+                        sessionId = sessionId,
+                        readConsistency = readConsistency,
+                        baseVersionHex = baseVersionHex,
+                    ),
+            )
+
+        is WireMessage.SessionBeginAck ->
+            WirePayloadEnvelope(
+                kind = "sessionBeginAck",
+                sessionBeginAck =
+                    SessionBeginAckDto(
+                        namespace = namespace,
+                        sessionId = sessionId,
+                        headHex = headHex,
+                        readConsistency = readConsistency,
+                    ),
+            )
+
+        is WireMessage.SqlExec ->
+            WirePayloadEnvelope(
+                kind = "sqlExec",
+                sqlExec =
+                    SqlExecDto(
+                        namespace = namespace,
+                        sessionId = sessionId,
+                        sql = sql,
+                        parametersJson = parametersJson,
+                    ),
+            )
+
+        is WireMessage.SqlResult ->
+            WirePayloadEnvelope(
+                kind = "sqlResult",
+                sqlResult =
+                    SqlResultDto(
+                        namespace = namespace,
+                        sessionId = sessionId,
+                        columns = columns,
+                        rows = rows,
+                        rowsAffected = rowsAffected,
+                        resolvedCommitHex = resolvedCommitHex,
+                        readOnly = readOnly,
+                        error = error,
+                    ),
+            )
+
+        is WireMessage.TxCommit ->
+            WirePayloadEnvelope(
+                kind = "txCommit",
+                txCommit =
+                    TxCommitDto(
+                        namespace = namespace,
+                        sessionId = sessionId,
+                        transactionBytes = transactionBytes,
+                    ),
+            )
+
+        is WireMessage.TxRollback ->
+            WirePayloadEnvelope(
+                kind = "txRollback",
+                txRollback =
+                    TxRollbackDto(
+                        namespace = namespace,
+                        sessionId = sessionId,
+                    ),
+            )
     }
 
 internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
@@ -320,6 +393,58 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
         "schemaPush" -> {
             val s = schemaPush ?: throw WireDecodeException("missing schemaPush body")
             WireMessage.SchemaPush(header, s.namespace, s.schemaBytes, s.revision)
+        }
+
+        "sessionBegin" -> {
+            val s = sessionBegin ?: throw WireDecodeException("missing sessionBegin body")
+            WireMessage.SessionBegin(
+                header,
+                s.namespace,
+                s.sessionId,
+                s.readConsistency,
+                s.baseVersionHex,
+            )
+        }
+
+        "sessionBeginAck" -> {
+            val s = sessionBeginAck ?: throw WireDecodeException("missing sessionBeginAck body")
+            WireMessage.SessionBeginAck(
+                header,
+                s.namespace,
+                s.sessionId,
+                s.headHex,
+                s.readConsistency,
+            )
+        }
+
+        "sqlExec" -> {
+            val s = sqlExec ?: throw WireDecodeException("missing sqlExec body")
+            WireMessage.SqlExec(header, s.namespace, s.sessionId, s.sql, s.parametersJson)
+        }
+
+        "sqlResult" -> {
+            val s = sqlResult ?: throw WireDecodeException("missing sqlResult body")
+            WireMessage.SqlResult(
+                header,
+                s.namespace,
+                s.sessionId,
+                s.columns,
+                s.rows,
+                s.rowsAffected,
+                s.resolvedCommitHex,
+                s.readOnly,
+                s.error,
+            )
+        }
+
+        "txCommit" -> {
+            val c = txCommit ?: throw WireDecodeException("missing txCommit body")
+            WireMessage.TxCommit(header, c.namespace, c.sessionId, c.transactionBytes)
+        }
+
+        "txRollback" -> {
+            val r = txRollback ?: throw WireDecodeException("missing txRollback body")
+            WireMessage.TxRollback(header, r.namespace, r.sessionId)
         }
 
         else -> throw WireDecodeException("unknown payload kind: $kind")

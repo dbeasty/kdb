@@ -4,6 +4,7 @@ plugins {
 
 dependencies {
     implementation(project(":kdb-embed"))
+    implementation(project(":kdb-server"))
     implementation(project(":kdb-jdbc"))
     implementation(project(":kdb-peer-sync"))
     implementation(project(":kdb-dag"))

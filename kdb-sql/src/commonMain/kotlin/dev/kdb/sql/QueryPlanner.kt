@@ -24,40 +24,79 @@ public class DefaultQueryPlanner : QueryPlanner {
                 is SqlStatement.Select -> statement.query
                 else -> throw SqlPlanningException("only SELECT is planned here", "")
             }
+        validateProjections(select, context.schema)
         return planSelect(select, context.schema)
+    }
+
+    private fun validateProjections(
+        query: SelectQuery,
+        schema: KdbSchema,
+    ) {
+        for (proj in query.projections) {
+            if (proj is SelectProjection.Column) {
+                val name = proj.name
+                if (name != "kdb_id" && name != "_doc" && name !in schema.fieldsByName) {
+                    throw SqlPlanningException("unknown column: $name", "")
+                }
+            }
+        }
     }
 
     private fun planSelect(
         query: SelectQuery,
         schema: KdbSchema,
     ): PhysicalPlan {
-        val scan = planWhere(query.where, schema)
+        val (scan, residual) = planWhere(query.where, schema)
         var plan: PhysicalPlan = scan
-        if (query.where != null && scan !is PhysicalPlan.IndexScan) {
-            plan = PhysicalPlan.Filter(query.where, scan)
-        } else if (query.where != null && scan is PhysicalPlan.IndexScan) {
-            val residual = residualPredicate(query.where, scan)
-            if (residual != null) {
-                plan = PhysicalPlan.Filter(residual, scan)
-            }
+        if (residual != null) {
+            plan = PhysicalPlan.Filter(residual, scan)
         }
         plan = PhysicalPlan.Project(query.projections, plan)
         if (query.orderBy.isNotEmpty()) {
             plan = PhysicalPlan.Sort(query.orderBy, plan)
         }
         val limit = query.limit ?: Int.MAX_VALUE
-        val offset = query.offset ?: 0
-        plan = PhysicalPlan.Limit(limit, offset, plan)
+        plan = PhysicalPlan.Limit(limit, query.offset ?: 0, plan)
         return plan
     }
 
     private fun planWhere(
         expr: SqlExpr?,
         schema: KdbSchema,
-    ): PhysicalPlan {
-        if (expr == null) return PhysicalPlan.FullTableScan("no predicate")
-        val indexPlan = findIndexScan(expr, schema)
-        return indexPlan ?: PhysicalPlan.FullTableScan("no index for predicate")
+    ): Pair<PhysicalPlan, SqlExpr?> {
+        if (expr == null) return PhysicalPlan.FullTableScan("no predicate") to null
+        val conjuncts = andConjuncts(expr)
+        var scan: PhysicalPlan? = null
+        var used: SqlExpr? = null
+        for (c in conjuncts) {
+            val candidate = findIndexScan(c, schema)
+            if (candidate != null) {
+                scan = candidate
+                used = c
+                break
+            }
+        }
+        val base = scan ?: PhysicalPlan.FullTableScan("no index for predicate")
+        val residualParts =
+            conjuncts.filter { c ->
+                c != used && !isSubsumedByScan(c, used, base)
+            }
+        val residual = recomposeAnd(residualParts)
+        return base to residual
+    }
+
+    private fun isSubsumedByScan(
+        conjunct: SqlExpr,
+        used: SqlExpr?,
+        scan: PhysicalPlan,
+    ): Boolean {
+        if (used == null || scan !is PhysicalPlan.IndexScan) return false
+        if (conjunct == used) return true
+        if (conjunct is SqlExpr.Binary && conjunct.op == BinaryOp.EQ) {
+            val (col, _) = columnAndLiteral(conjunct) ?: return false
+            if (col == scan.fieldName && scan.lookup is IndexLookupSpec.Exact) return true
+        }
+        return false
     }
 
     private fun findIndexScan(
@@ -66,22 +105,33 @@ public class DefaultQueryPlanner : QueryPlanner {
     ): PhysicalPlan? =
         when (expr) {
             is SqlExpr.Match -> {
-                val field = schema.fieldsByName[expr.column] ?: return null
-                PhysicalPlan.IndexScan(
-                    expr.column,
-                    IndexType.FULLTEXT,
-                    IndexLookupSpec.FullText(expr.query),
-                )
-            }
-            is SqlExpr.Binary -> {
-                if (expr.op == BinaryOp.AND) {
-                    findIndexScan(expr.left, schema) ?: findIndexScan(expr.right, schema)
+                if (expr.column !in schema.fieldsByName) {
+                    null
                 } else {
-                    matchEquality(expr, schema) ?: matchRange(expr, schema)
+                    PhysicalPlan.IndexScan(
+                        expr.column,
+                        IndexType.FULLTEXT,
+                        IndexLookupSpec.FullText(expr.query),
+                    )
                 }
             }
+            is SqlExpr.Between -> matchBetween(expr, schema)
+            is SqlExpr.Binary -> matchEquality(expr, schema) ?: matchRange(expr, schema)
             else -> null
         }
+
+    private fun matchBetween(
+        expr: SqlExpr.Between,
+        schema: KdbSchema,
+    ): PhysicalPlan? {
+        val field = schema.fieldsByName[expr.column] ?: return null
+        if (!field.indexed || inferIndexType(field.type) != IndexType.BTREE) return null
+        val lowLit = expr.low as? SqlExpr.Literal ?: return null
+        val highLit = expr.high as? SqlExpr.Literal ?: return null
+        val from = literalToIndexKey(lowLit, field.type) ?: return null
+        val to = literalToIndexKey(highLit, field.type) ?: return null
+        return PhysicalPlan.IndexScan(expr.column, IndexType.BTREE, IndexLookupSpec.Range(from, to))
+    }
 
     private fun matchEquality(
         expr: SqlExpr.Binary,
@@ -101,10 +151,17 @@ public class DefaultQueryPlanner : QueryPlanner {
         schema: KdbSchema,
     ): PhysicalPlan? {
         if (expr.op !in setOf(BinaryOp.GT, BinaryOp.GE, BinaryOp.LT, BinaryOp.LE)) return null
-        val (col, _) = columnAndLiteral(expr) ?: return null
+        val (col, lit) = columnAndLiteral(expr) ?: return null
         val field = schema.fieldsByName[col] ?: return null
         if (!field.indexed || inferIndexType(field.type) != IndexType.BTREE) return null
-        return PhysicalPlan.IndexScan(col, IndexType.BTREE, IndexLookupSpec.Range(null, null))
+        val key = literalToIndexKey(lit, field.type) ?: return null
+        val (from, to) =
+            when (expr.op) {
+                BinaryOp.GT, BinaryOp.GE -> key to null
+                BinaryOp.LT, BinaryOp.LE -> null to key
+                else -> null to null
+            }
+        return PhysicalPlan.IndexScan(col, IndexType.BTREE, IndexLookupSpec.Range(from, to))
     }
 
     private fun columnAndLiteral(expr: SqlExpr.Binary): Pair<String, SqlExpr.Literal>? {
@@ -136,15 +193,4 @@ public class DefaultQueryPlanner : QueryPlanner {
 
             else -> null
         }
-
-    private fun residualPredicate(
-        where: SqlExpr,
-        scan: PhysicalPlan.IndexScan,
-    ): SqlExpr? {
-        if (where is SqlExpr.Binary && where.op == BinaryOp.EQ) {
-            val (col, _) = columnAndLiteral(where) ?: return where
-            if (col == scan.fieldName) return null
-        }
-        return where
-    }
 }

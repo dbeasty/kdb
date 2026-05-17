@@ -8,7 +8,47 @@ public sealed class SqlStatement {
     public data class Select(val query: SelectQuery) : SqlStatement()
     public data class CreateVirtualView(val name: String, val query: SelectQuery) : SqlStatement()
     public data class DropVirtualView(val name: String) : SqlStatement()
+    public data class Update(val update: UpdateStatement) : SqlStatement()
+    public data class Insert(val insert: InsertStatement) : SqlStatement()
+    public data class Delete(val delete: DeleteStatement) : SqlStatement()
+    public data class CreateIndex(val ddl: CreateIndexStatement) : SqlStatement()
+    public data class DropIndex(val ddl: DropIndexStatement) : SqlStatement()
 }
+
+public data class UpdateStatement(
+    val table: TableRef,
+    val assignments: List<Assignment>,
+    val where: SqlExpr?,
+)
+
+public data class Assignment(
+    val column: String,
+    val expr: SqlExpr,
+)
+
+public data class InsertStatement(
+    val table: TableRef,
+    val columns: List<String>,
+    val values: List<SqlExpr>,
+)
+
+public data class DeleteStatement(
+    val table: TableRef,
+    val where: SqlExpr?,
+)
+
+public data class CreateIndexStatement(
+    val indexName: String,
+    val table: String,
+    val fields: List<String>,
+    val type: IndexType,
+    val unique: Boolean = false,
+)
+
+public data class DropIndexStatement(
+    val indexName: String,
+    val table: String,
+)
 
 public data class SelectQuery(
     val distinct: Boolean,
@@ -39,6 +79,8 @@ public sealed class SqlExpr {
     public data class Unary(val op: UnaryOp, val expr: SqlExpr) : SqlExpr()
     public data class FunctionCall(val name: String, val args: List<SqlExpr>) : SqlExpr()
     public data class Match(val column: String, val query: String) : SqlExpr()
+    public data class Between(val column: String, val low: SqlExpr, val high: SqlExpr) : SqlExpr()
+    public data class Similarity(val column: String, val query: String, val limit: Int?) : SqlExpr()
 }
 
 public enum class BinaryOp {

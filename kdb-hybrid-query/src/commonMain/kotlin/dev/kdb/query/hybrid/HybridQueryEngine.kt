@@ -1,14 +1,28 @@
 package dev.kdb.query.hybrid
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbTimestamp
+import dev.kdb.codec.KdbUuid
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.CommitRef
+import dev.kdb.document.KdbTransaction
+import dev.kdb.error.ConflictException
+import dev.kdb.index.IndexManager
 import dev.kdb.policy.HistoryMode
 import dev.kdb.policy.NamespacePolicyRegistry
+import dev.kdb.schema.isNone
 import dev.kdb.sql.ExplainResult
 import dev.kdb.sql.QueryContext
+import dev.kdb.sql.QueryResult
 import dev.kdb.sql.SqlEngine
 import dev.kdb.sql.SqlParameter
+import dev.kdb.sql.defaultSqlParser
+import dev.kdb.sql.isDmlStatement
+import dev.kdb.sql.statementParameterCount
+import dev.kdb.storage.StorageAdapter
+import dev.kdb.transaction.TransactionEngine
+import dev.kdb.transaction.TransactionResult
+import dev.kdb.transaction.transactionEngine
 
 public interface HybridQueryEngine {
     public suspend fun execute(
@@ -38,16 +52,29 @@ public fun hybridQueryEngine(
     sql: SqlEngine,
     dag: CommitDag,
     policyRegistry: NamespacePolicyRegistry,
+    indexManager: IndexManager,
+    storage: StorageAdapter,
     parser: HybridSqlParser = hybridSqlParser(),
     versionResolver: VersionResolver = defaultVersionResolver(),
     checkoutStore: CheckoutStore = CheckoutStore(),
 ): HybridQueryEngine =
-    DefaultHybridQueryEngine(sql, dag, policyRegistry, parser, versionResolver, checkoutStore)
+    DefaultHybridQueryEngine(
+        sql,
+        dag,
+        policyRegistry,
+        indexManager,
+        storage,
+        parser,
+        versionResolver,
+        checkoutStore,
+    )
 
 internal class DefaultHybridQueryEngine(
     private val sqlEngine: SqlEngine,
     private val dag: CommitDag,
     private val policyRegistry: NamespacePolicyRegistry,
+    private val indexManager: IndexManager,
+    private val storage: StorageAdapter,
     private val parser: HybridSqlParser,
     private val versionResolver: VersionResolver,
     private val checkoutStore: CheckoutStore,
@@ -64,15 +91,11 @@ internal class DefaultHybridQueryEngine(
         if (version != null && policy.history == HistoryMode.NONE) {
             throw HistoryDisabledException(request.namespaceId)
         }
-        val checkout = checkoutStore.get(request.namespaceId)
-        val resolved =
-            versionResolver.resolve(dag, version, checkout)
-        val readOnly = version != null || checkout != null
-        if (readOnly && isDml(parsed.sql)) {
+        val resolved = resolveReadCommit(request, version)
+        val readOnly = version != null || request.sessionCheckout != null || checkoutStore.get(request.namespaceId) != null
+        val stmt = defaultSqlParser().parse(parsed.sql)
+        if (readOnly && isDmlStatement(stmt)) {
             throw ReadOnlyCheckoutException(request.namespaceId, resolved)
-        }
-        if (isDml(parsed.sql)) {
-            throw HybridDmlNotSupportedException("DML via HybridQueryEngine is not implemented in v1")
         }
         val ctx =
             QueryContext(
@@ -82,6 +105,12 @@ internal class DefaultHybridQueryEngine(
                 parameters = request.parameters,
                 maxRows = request.maxRows,
             )
+        if (isDmlStatement(stmt)) {
+            val dml = sqlEngine.executeDml(parsed.sql, ctx.copy(atCommit = null))
+            val commitHash = commitDml(dml.operations, request)
+            val result = QueryResult(emptyList(), emptyList(), rowsAffected = dml.rowsAffected)
+            return HybridQueryResult(result, commitHash, readOnly = false)
+        }
         val result = sqlEngine.execute(parsed.sql, ctx)
         return HybridQueryResult(result, resolved, readOnly)
     }
@@ -96,8 +125,7 @@ internal class DefaultHybridQueryEngine(
         if (version != null && policy.history == HistoryMode.NONE) {
             throw HistoryDisabledException(request.namespaceId)
         }
-        val checkout = checkoutStore.get(request.namespaceId)
-        val resolved = versionResolver.resolve(dag, version, checkout)
+        val resolved = resolveReadCommit(request, version)
         val ctx =
             QueryContext(
                 namespaceId = request.namespaceId,
@@ -109,10 +137,71 @@ internal class DefaultHybridQueryEngine(
         return sqlEngine.explain(parsed.sql, ctx)
     }
 
+    private suspend fun commitDml(
+        operations: List<dev.kdb.document.KdbOp>,
+        request: HybridQueryRequest,
+    ): KdbHash {
+        if (operations.isEmpty()) {
+            return dag.head()
+        }
+        val policy = policyRegistry.get(request.namespaceId)
+        val txEngine: TransactionEngine = transactionEngine(policy.conflict)
+        val parent = dag.head()
+        val tx =
+            KdbTransaction(
+                id = KdbUuid.random(),
+                baseVersion = parent,
+                operations = operations,
+                timestamp = KdbTimestamp.now(),
+                authorNodeId = KdbUuid.random(),
+            )
+        when (val result = txEngine.commit(tx, dag, storage, request.schema)) {
+            is TransactionResult.Success -> {
+                if (!request.schema.isNone) {
+                    indexManager.writer.applyCommit(
+                        result.commit,
+                        indexManager.registryFor(request.namespaceId),
+                        storage,
+                        request.schema,
+                    )
+                }
+                return result.commit.hash
+            }
+            is TransactionResult.Conflict ->
+                throw ConflictException(
+                    "transaction conflict: ${result.report.conflicts.size} operation(s)",
+                    result.report,
+                )
+            is TransactionResult.SchemaError ->
+                throw dev.kdb.sql.SqlPlanningException(
+                    "schema rejection: ${result.violations.size} violation(s)",
+                    "",
+                )
+        }
+    }
+
+    private suspend fun resolveReadCommit(
+        request: HybridQueryRequest,
+        version: VersionClause?,
+    ): KdbHash {
+        val checkout = request.sessionCheckout ?: checkoutStore.get(request.namespaceId)
+        return when {
+            version != null || checkout != null ->
+                versionResolver.resolve(dag, version, checkout)
+            request.readConsistency == ReadConsistency.SNAPSHOT && request.readPin != null ->
+                request.readPin
+            else -> dag.head()
+        }
+    }
+
     override fun prepare(
         sql: String,
         request: HybridQueryRequest,
-    ): PreparedHybridQuery = DefaultPreparedHybridQuery(this, sql, request)
+    ): PreparedHybridQuery {
+        val parsed = parser.parseWithVersion(sql)
+        val paramCount = statementParameterCount(defaultSqlParser().parse(parsed.sql))
+        return DefaultPreparedHybridQuery(this, sql, request, paramCount)
+    }
 
     override suspend fun checkout(
         namespaceId: String,
@@ -131,20 +220,14 @@ internal class DefaultHybridQueryEngine(
             "namespaceId $namespaceId does not match DAG ${dag.namespaceId}"
         }
     }
-
-    private fun isDml(sql: String): Boolean {
-        val u = sql.trimStart().uppercase()
-        return u.startsWith("UPDATE") || u.startsWith("INSERT") || u.startsWith("DELETE")
-    }
 }
 
 private class DefaultPreparedHybridQuery(
     private val engine: DefaultHybridQueryEngine,
     private val sql: String,
     private val request: HybridQueryRequest,
+    override val parameterCount: Int,
 ) : PreparedHybridQuery {
-    override val parameterCount: Int = 0
-
     override suspend fun execute(
         bindings: List<SqlParameter>,
         request: HybridQueryRequest,

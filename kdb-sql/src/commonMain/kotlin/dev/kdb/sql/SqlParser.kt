@@ -9,42 +9,139 @@ public fun defaultSqlParser(): SqlParser = RecursiveDescentSqlParser()
 internal class RecursiveDescentSqlParser : SqlParser {
     private lateinit var input: String
     private var pos = 0
+    private var nextParamIndex = 0
 
     override fun parse(sql: String): SqlStatement {
         input = sql.trim()
         pos = 0
+        nextParamIndex = 0
         skipWs()
         return when {
-            matchKeyword("CREATE") -> parseCreateVirtualView()
-            matchKeyword("DROP") -> parseDropVirtualView()
+            matchKeyword("CREATE") -> parseCreate()
+            matchKeyword("DROP") -> parseDrop()
+            matchKeyword("INSERT") -> SqlStatement.Insert(parseInsert())
+            matchKeyword("UPDATE") -> SqlStatement.Update(parseUpdate())
+            matchKeyword("DELETE") -> SqlStatement.Delete(parseDelete())
             matchKeyword("SELECT") -> SqlStatement.Select(parseSelectQuery())
-            else -> throw parseError("expected SELECT or CREATE VIRTUAL VIEW")
+            else -> throw parseError("expected SQL statement")
         }
     }
 
-    private fun parseCreateVirtualView(): SqlStatement.CreateVirtualView {
+    private fun parseCreate(): SqlStatement {
         expectKeyword("CREATE")
-        expectKeyword("VIRTUAL")
-        expectKeyword("VIEW")
-        val name = readIdentifier()
-        expectKeyword("AS")
-        expectKeyword("SELECT")
-        val query = parseSelectQuery()
-        return SqlStatement.CreateVirtualView(name, query)
+        return when {
+            matchKeyword("VIRTUAL") -> {
+                expectKeyword("VIEW")
+                val name = readIdentifier()
+                expectKeyword("AS")
+                expectKeyword("SELECT")
+                SqlStatement.CreateVirtualView(name, parseSelectQuery())
+            }
+            matchKeyword("INDEX") -> {
+                expectKeyword("INDEX")
+                SqlStatement.CreateIndex(parseCreateIndexBody())
+            }
+            else -> throw parseError("expected VIRTUAL VIEW or INDEX")
+        }
     }
 
-    private fun parseDropVirtualView(): SqlStatement.DropVirtualView {
+    private fun parseCreateIndexBody(): CreateIndexStatement {
+        val indexName = readIdentifier()
+        expectKeyword("ON")
+        val table = readIdentifier()
+        expectChar('(')
+        val fields = mutableListOf<String>()
+        do {
+            fields += readIdentifier()
+        } while (matchChar(','))
+        expectChar(')')
+        var type = dev.kdb.index.IndexType.BTREE
+        if (matchKeyword("USING")) {
+            type =
+                when (readIdentifier().uppercase()) {
+                    "HASH" -> dev.kdb.index.IndexType.HASH
+                    "BTREE" -> dev.kdb.index.IndexType.BTREE
+                    "FULLTEXT" -> dev.kdb.index.IndexType.FULLTEXT
+                    "VECTOR" -> dev.kdb.index.IndexType.VECTOR
+                    else -> throw parseError("unknown index type")
+                }
+        }
+        val unique = matchKeyword("UNIQUE")
+        return CreateIndexStatement(indexName, table, fields, type, unique)
+    }
+
+    private fun parseDropIndexBody(): DropIndexStatement {
+        val indexName = readIdentifier()
+        expectKeyword("ON")
+        val table = readIdentifier()
+        return DropIndexStatement(indexName, table)
+    }
+
+    private fun parseDrop(): SqlStatement {
         expectKeyword("DROP")
-        expectKeyword("VIRTUAL")
-        expectKeyword("VIEW")
-        return SqlStatement.DropVirtualView(readIdentifier())
+        return when {
+            matchKeyword("VIRTUAL") -> {
+                expectKeyword("VIEW")
+                SqlStatement.DropVirtualView(readIdentifier())
+            }
+            matchKeyword("INDEX") -> {
+                expectKeyword("INDEX")
+                SqlStatement.DropIndex(parseDropIndexBody())
+            }
+            else -> throw parseError("expected VIRTUAL VIEW or INDEX")
+        }
+    }
+
+    private fun parseUpdate(): UpdateStatement {
+        val table = TableRef(readIdentifier(), parseOptionalTableAlias())
+        expectKeyword("SET")
+        val assignments = mutableListOf<Assignment>()
+        do {
+            val col = readIdentifier()
+            expectChar('=')
+            assignments += Assignment(col, parseExpr())
+        } while (matchChar(','))
+        var where: SqlExpr? = null
+        if (matchKeyword("WHERE")) {
+            where = parseExpr()
+        }
+        return UpdateStatement(table, assignments, where)
+    }
+
+    private fun parseInsert(): InsertStatement {
+        expectKeyword("INTO")
+        val table = TableRef(readIdentifier(), parseOptionalTableAlias())
+        expectKeyword("(")
+        val columns = mutableListOf<String>()
+        do {
+            columns += readIdentifier()
+        } while (matchChar(','))
+        expectChar(')')
+        expectKeyword("VALUES")
+        expectChar('(')
+        val values = mutableListOf<SqlExpr>()
+        do {
+            values += parseExpr()
+        } while (matchChar(','))
+        expectChar(')')
+        return InsertStatement(table, columns, values)
+    }
+
+    private fun parseDelete(): DeleteStatement {
+        expectKeyword("FROM")
+        val table = TableRef(readIdentifier(), parseOptionalTableAlias())
+        var where: SqlExpr? = null
+        if (matchKeyword("WHERE")) {
+            where = parseExpr()
+        }
+        return DeleteStatement(table, where)
     }
 
     private fun parseSelectQuery(): SelectQuery {
         val distinct = matchKeyword("DISTINCT")
         val projections = parseProjections()
         expectKeyword("FROM")
-        val table = TableRef(readIdentifier(), null)
+        val table = TableRef(readIdentifier(), parseOptionalTableAlias())
         skipWs()
         var where: SqlExpr? = null
         if (matchKeyword("WHERE")) {
@@ -54,26 +151,81 @@ internal class RecursiveDescentSqlParser : SqlParser {
         if (matchKeyword("ORDER")) {
             expectKeyword("BY")
             do {
-                val expr = parseExpr()
-                val asc = !matchKeyword("DESC")
-                if (!asc) {
-                    // consumed DESC
-                } else {
-                    matchKeyword("ASC")
-                }
-                orderBy += OrderItem(expr, asc)
+                val expr = parseOrderExpr()
+                skipWs()
+                val ascending =
+                    when {
+                        matchKeyword("DESC") -> false
+                        matchKeyword("ASC") -> true
+                        else -> true
+                    }
+                orderBy += OrderItem(expr, ascending)
             } while (matchChar(','))
         }
         var limit: Int? = null
         var offset = 0
         if (matchKeyword("LIMIT")) {
             limit = readInt()
-            if (matchKeyword("OFFSET")) {
-                offset = readInt()
-            }
+        }
+        if (matchKeyword("OFFSET")) {
+            offset = readInt()
         }
         return SelectQuery(distinct, projections, table, where, orderBy, limit, offset)
     }
+
+    private fun parseOrderExpr(): SqlExpr {
+        if (matchKeyword("SIMILARITY")) {
+            expectChar('(')
+            val col = readIdentifier()
+            expectChar(',')
+            if (peek() != '\'') {
+                throw parseError("similarity text query requires embedding (not yet available)")
+            }
+            val q = readStringLiteral()
+            expectChar(')')
+            return SqlExpr.Similarity(col, q, null)
+        }
+        return parseExpr()
+    }
+
+    private fun parseOptionalTableAlias(): String? {
+        skipWs()
+        if (!isTableAliasStart()) return null
+        val mark = pos
+        val id = readIdentifier()
+        if (isReservedTableKeyword(id)) {
+            pos = mark
+            return null
+        }
+        return id
+    }
+
+    private fun isTableAliasStart(): Boolean {
+        val c = peek()
+        return c.isLetter() || c == '_'
+    }
+
+    private fun isReservedTableKeyword(id: String): Boolean =
+        id.equals("WHERE", ignoreCase = true) ||
+            id.equals("SET", ignoreCase = true) ||
+            id.equals("ORDER", ignoreCase = true) ||
+            id.equals("BY", ignoreCase = true) ||
+            id.equals("LIMIT", ignoreCase = true) ||
+            id.equals("OFFSET", ignoreCase = true) ||
+            id.equals("VALUES", ignoreCase = true) ||
+            id.equals("AND", ignoreCase = true) ||
+            id.equals("OR", ignoreCase = true) ||
+            id.equals("NOT", ignoreCase = true) ||
+            id.equals("BETWEEN", ignoreCase = true) ||
+            id.equals("IS", ignoreCase = true) ||
+            id.equals("NULL", ignoreCase = true) ||
+            id.equals("INTO", ignoreCase = true) ||
+            id.equals("FROM", ignoreCase = true) ||
+            id.equals("SELECT", ignoreCase = true) ||
+            id.equals("AS", ignoreCase = true) ||
+            id.equals("ON", ignoreCase = true) ||
+            id.equals("USING", ignoreCase = true) ||
+            id.equals("UNIQUE", ignoreCase = true)
 
     private fun parseProjections(): List<SelectProjection> {
         val out = mutableListOf<SelectProjection>()
@@ -107,9 +259,7 @@ internal class RecursiveDescentSqlParser : SqlParser {
         return null
     }
 
-    private fun parseExpr(): SqlExpr {
-        return parseOr()
-    }
+    private fun parseExpr(): SqlExpr = parseOr()
 
     private fun parseOr(): SqlExpr {
         var left = parseAnd()
@@ -141,6 +291,21 @@ internal class RecursiveDescentSqlParser : SqlParser {
         }
         var left = parsePrimary()
         skipWs()
+        if (left is SqlExpr.ColumnRef && matchKeyword("BETWEEN")) {
+            val low = parsePrimary()
+            expectKeyword("AND")
+            val high = parsePrimary()
+            return SqlExpr.Between(left.name, low, high)
+        }
+        if (matchKeyword("IS")) {
+            val inner = parsePrimary()
+            if (matchKeyword("NOT")) {
+                expectKeyword("NULL")
+                return SqlExpr.Unary(UnaryOp.NOT, SqlExpr.Unary(UnaryOp.IS_NULL, inner))
+            }
+            expectKeyword("NULL")
+            return SqlExpr.Unary(UnaryOp.IS_NULL, inner)
+        }
         val op =
             when {
                 matchOp("=") -> BinaryOp.EQ
@@ -162,7 +327,7 @@ internal class RecursiveDescentSqlParser : SqlParser {
             peek() == '\'' -> return SqlExpr.Literal(SqlCell.StringVal(readStringLiteral()))
             peek() == '?' -> {
                 consume()
-                return SqlExpr.Parameter(0)
+                return SqlExpr.Parameter(nextParamIndex++)
             }
             peek().isDigit() -> {
                 val num = readNumber()
@@ -218,12 +383,17 @@ internal class RecursiveDescentSqlParser : SqlParser {
     }
 
     private fun readNumber(): String {
+        skipWs()
         val start = pos
         while (pos < input.length && (input[pos].isDigit() || input[pos] == '.')) pos++
         return input.substring(start, pos)
     }
 
-    private fun readInt(): Int = readNumber().toInt()
+    private fun readInt(): Int {
+        val n = readNumber()
+        if (n.isEmpty()) throw parseError("expected integer")
+        return n.toInt()
+    }
 
     private fun readIdentifier(): String {
         skipWs()

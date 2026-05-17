@@ -1,0 +1,69 @@
+package dev.kdb.server
+
+import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbUuid
+import dev.kdb.query.hybrid.ReadConsistency
+import dev.kdb.transaction.TransactionBuilder
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicInteger
+
+public class SessionManager(
+    private val server: KdbServerRuntime,
+) {
+    private val mutex = Mutex()
+    private val sessions = mutableMapOf<String, KdbSession>()
+    private val idSeq = AtomicInteger()
+
+    public suspend fun begin(
+        namespaceId: String,
+        readConsistency: ReadConsistency,
+        baseVersionHex: String? = null,
+        sessionId: String? = null,
+    ): KdbSession {
+        val head =
+            baseVersionHex?.let { KdbHash.fromHex(it) }
+                ?: server.runtime.dag.head()
+        require(server.runtime.dag.hasCommit(head)) { "unknown base version: $baseVersionHex" }
+        val id = SessionId(sessionId ?: "sess-${idSeq.incrementAndGet()}")
+        val readPin =
+            when (readConsistency) {
+                ReadConsistency.SNAPSHOT -> head
+                ReadConsistency.READ_COMMITTED, ReadConsistency.READ_YOUR_WRITES -> null
+            }
+        val session =
+            KdbSession(
+                id = id,
+                namespaceId = namespaceId,
+                baseVersion = head,
+                readPin = readPin,
+                readConsistency = readConsistency,
+                pending = null,
+            )
+        mutex.withLock { sessions[id.value] = session }
+        return session
+    }
+
+    public suspend fun get(sessionId: String): KdbSession? = mutex.withLock { sessions[sessionId] }
+
+    public suspend fun end(sessionId: String) {
+        mutex.withLock { sessions.remove(sessionId) }
+    }
+
+    public suspend fun pendingBuilder(session: KdbSession): TransactionBuilder {
+        if (session.pending == null) {
+            session.pending =
+                TransactionBuilder(
+                    namespaceId = session.namespaceId,
+                    baseVersion = session.baseVersion,
+                    authorNodeId = KdbUuid.random(),
+                    schema = server.runtime.schema,
+                )
+        }
+        return session.pending!!
+    }
+
+    public suspend fun clearPending(session: KdbSession) {
+        session.pending = null
+    }
+}
