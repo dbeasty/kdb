@@ -106,7 +106,7 @@ Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.
   sstable/ ...
 ```
 
-`openCliRuntime` calls `openFileRuntime(dataDir, catalog, namespaceId)` — SERVER engine + delta replay on each open; `PersistingCommitDag` appends on commit. Separate CLI invocations with the same `--data-dir` see prior `put` data.
+`openCliRuntime` calls `openFileRuntime(dataDir, catalog, namespaceId)` — SERVER engine + delta replay on each open; `PersistingCommitDag` appends on commit. Separate CLI invocations with the same `--data-dir` see prior `put` data. The Go `kdb` binary uses the same delta layout; Kotlin and Go can share one workspace directory.
 
 -----
 
@@ -116,6 +116,9 @@ Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.
 - **Postconditions:** `put` advances DAG head; `get` returns latest doc at HEAD; `query` uses `HybridQueryEngine` at HEAD.
 - **Exit codes:** `0` success; `1` user error or `KdbException`; `2` usage error.
 - **Output:** UTF-8 stdout; errors on stderr; `--quiet` suppresses informational lines only.
+- **`put` stdout:** One JSON object per successful write: `{"docId":"<uuid>","docIdShort":"<8-hex>","commit":"<64-hex>"}`. `docId` is the document UUID for `get`; `docIdShort` is the first 8 hex nibbles of the UUID (no dashes), matching the minimum accepted `get` prefix length; `commit` is the new DAG head commit hash (distinct from `docId`).
+- **`get` document id:** Full canonical UUID, 32 hex without dashes, or a **case-insensitive hex prefix** of the 32-nibble form. Require at least **8** hex digits unless the token parses as a full UUID. Resolve at **HEAD** via `scanDocuments`; **0** hits → not found; **1** hit → that document; **2+** hits → stderr lists candidate UUIDs (ambiguous prefix).
+- **`put` document id:** If JSON has no `"id"` field, the CLI assigns a random UUID and injects `"id"` into the stored document body so `get` returns self-describing JSON.
 
 -----
 
@@ -135,8 +138,9 @@ Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.
 | # | Name | Input | Expected |
 |---|---|---|---|
 | 1 | `init_createsMeta` | `init app/demo` | meta.json exists |
-| 2 | `put_inlineJson` | `put app/demo '{"id":"1","v":1}'` | exit 0 |
-| 3 | `putGet_survivesReopen` | put then `openFileRuntime` reopen | JSON contains `"v":1` |
+| 2 | `put_inlineJson` | `put app/demo '{"id":"1","v":1}'` | exit 0; stdout JSON with `docId` + `commit` |
+| 3 | `putGet_survivesReopen` | put then `openFileRuntime` reopen | JSON contains `"v":1`; `get` by `docId` works |
+| 3b | `put_autoId` | `put app/demo '{"v":1}'` (no id) | stdout `docId`; stored JSON contains injected `"id"` |
 | 4 | `query_select` | `query app/demo "SELECT _doc"` | ≥1 JSONL row |
 | 5 | `log_listsCommits` | after 2 puts | ≥2 lines |
 | 6 | `status_showsHead` | after put | non-empty HEAD |
@@ -154,7 +158,7 @@ Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.
 ## 8. Non-Goals
 
 - GraalVM native-image packaging (follow-on).
-- Cross-process file locking or multi-writer safety on one data directory.
+- Cross-process **multi-writer** safety beyond the workspace lock (still one live holder per `dataDir`).
 - WAL-only document recovery without delta replay (v1 reloads via delta segments).
 - Full git parity (branch, merge UI, blame) — deferred commands return usage error.
 - Auth / TLS on `sync`.
@@ -165,7 +169,7 @@ Workspace layout under `{dataDir}` (see [`kdb-spec-layer8-file-persistence-plan.
 
 - Reuse `openFileRuntime(dataRoot, catalog, namespaceId)` from `dev.kdb.jdbc.file`.
 - Argument parsing: manual v1 (no Clikt) to limit dependencies; upgrade in v2.
-- `put` generates random `KdbUuid` when JSON has no `id` field.
+- `put` generates random `KdbUuid` when JSON has no `id` field; `ensureIdInJson` injects `"id"` into the stored body; stdout prints `docId` and `commit` (see §5).
 - `sync` uses `kdb-tcp://` or `memory://` hub for tests.
 
 -----

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -88,29 +89,64 @@ func cmdPut(cfg Config, rt *embed.EmbeddedKdbRuntime, c PutCmd) int {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
-	hash, err := embed.PutJSONDocument(rt, c.Namespace, jsonText)
+	result, err := embed.PutJSONDocument(rt, c.Namespace, jsonText)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
 	if !cfg.Quiet {
-		fmt.Println(hash.Hex())
+		out, err := formatPutStdout(result)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		fmt.Println(out)
 	}
 	return 0
 }
 
-func cmdGet(cfg Config, rt *embed.EmbeddedKdbRuntime, c GetCmd) int {
-	id, err := codec.ParseUUID(c.DocID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+// FormatPutStdoutForTest exposes put stdout formatting for unit tests.
+func FormatPutStdoutForTest(result embed.PutResult) (string, error) {
+	return formatPutStdout(result)
+}
+
+func formatPutStdout(result embed.PutResult) (string, error) {
+	docShort := strings.ToLower(strings.ReplaceAll(result.DocID.String(), "-", ""))
+	if len(docShort) > 8 {
+		docShort = docShort[:8]
 	}
+	out, err := json.Marshal(struct {
+		DocID  string `json:"docId"`
+		Short  string `json:"docIdShort"`
+		Commit string `json:"commit"`
+	}{
+		DocID:  result.DocID.String(),
+		Short:  docShort,
+		Commit: result.Commit.Hex(),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func cmdGet(cfg Config, rt *embed.EmbeddedKdbRuntime, c GetCmd) int {
 	head, err := rt.DAG.Head()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
-	doc, err := rt.Storage.GetDocument(c.Namespace, id, head)
+	commit, err := rt.DAG.GetCommitOrThrow(head)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	id, err := resolveDocSelector(c.Namespace, rt.Storage, commit.DocumentTreeHash, c.DocID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	doc, err := rt.Storage.GetDocument(c.Namespace, id, commit.DocumentTreeHash)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
@@ -130,17 +166,12 @@ func cmdQuery(cfg Config, c QueryCmd) int {
 }
 
 func cmdLog(cfg Config, rt *embed.EmbeddedKdbRuntime) int {
-	dagImpl, ok := rt.DAG.(*dag.InMemoryCommitDag)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: log requires in-memory DAG\n")
-		return 1
-	}
-	head, err := dagImpl.Head()
+	head, err := rt.DAG.Head()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
-	entries := dagImpl.Walk(head, nil, 8192)
+	entries := rt.DAG.Walk(head, nil, 8192)
 	for _, e := range entries {
 		full, ok := e.(dag.FullEntry)
 		if !ok {
@@ -163,12 +194,7 @@ func cmdStatus(cfg Config, rt *embed.EmbeddedKdbRuntime, namespace string) int {
 }
 
 func cmdBranchList(cfg Config, rt *embed.EmbeddedKdbRuntime) int {
-	dagImpl, ok := rt.DAG.(*dag.InMemoryCommitDag)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: branch requires in-memory DAG\n")
-		return 1
-	}
-	for _, b := range dagImpl.ListBranches() {
+	for _, b := range rt.DAG.ListBranches() {
 		if !cfg.Quiet {
 			fmt.Printf("%s\t%s\n", b.Name, b.HeadHash.Hex())
 		}
@@ -177,11 +203,6 @@ func cmdBranchList(cfg Config, rt *embed.EmbeddedKdbRuntime) int {
 }
 
 func cmdBranchCreate(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCreateCmd) int {
-	dagImpl, ok := rt.DAG.(*dag.InMemoryCommitDag)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: branch requires in-memory DAG\n")
-		return 1
-	}
 	from, err := rt.DAG.Head()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -194,7 +215,7 @@ func cmdBranchCreate(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCreateCmd
 			return 1
 		}
 	}
-	b, err := dagImpl.CreateBranch(c.Name, from)
+	b, err := rt.DAG.CreateBranch(c.Name, from)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
@@ -206,17 +227,12 @@ func cmdBranchCreate(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCreateCmd
 }
 
 func cmdBranchCheckout(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCheckoutCmd) int {
-	dagImpl, ok := rt.DAG.(*dag.InMemoryCommitDag)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: branch requires in-memory DAG\n")
-		return 1
-	}
-	b, ok := dagImpl.GetBranch(c.Name)
+	b, ok := rt.DAG.GetBranch(c.Name)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "Error: branch not found: %s\n", c.Name)
 		return 1
 	}
-	if err := dagImpl.SetHead(c.Name, b.HeadHash); err != nil {
+	if err := rt.DAG.SetHead(c.Name, b.HeadHash); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}

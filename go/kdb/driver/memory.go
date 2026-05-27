@@ -92,7 +92,11 @@ func openRuntime(parsed ParsedURL) (*embed.EmbeddedKdbRuntime, func(), error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		return rt, func() {}, nil
+		return rt, func() {
+			if rt != nil {
+				rt.Release()
+			}
+		}, nil
 	default:
 		return nil, nil, fmt.Errorf("unsupported mode")
 	}

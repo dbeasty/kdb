@@ -9,6 +9,7 @@ import dev.kdb.schema.KdbSchema
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.document.ensureIdInJson
 import dev.kdb.error.DataDirectoryLockedException
 import dev.kdb.error.KdbException
 import dev.kdb.jdbc.file.StaleLockReleaseResult
@@ -151,7 +152,8 @@ internal object CliCommands {
         val docId =
             element["id"]?.jsonPrimitive?.content?.let { KdbUuid.fromString(it) }
                 ?: KdbUuid.random()
-        val doc = KdbDocument(docId, json)
+        val storedJson = ensureIdInJson(json, docId)
+        val doc = KdbDocument(docId, storedJson)
         val ns = session.namespaceId
         session.runtime.embedded.storage.putDocument(ns, doc)
         val parent = session.runtime.embedded.dag.head()
@@ -166,16 +168,49 @@ internal object CliCommands {
                 KdbUuid.random(),
             )
         val commit = session.runtime.embedded.dag.appendCommit(tx, parent, tree, null)
-        if (!session.config.quiet) println(commit.hash.toHex())
+        if (!session.config.quiet) {
+            val short = docId.toString().replace("-", "").lowercase().take(8)
+            println(
+                """{"docId":"${docId}","docIdShort":"$short","commit":"${commit.hash.toHex()}"}""",
+            )
+        }
     }
 
     internal suspend fun executeGet(session: CliSession, docId: String) {
-        val id = KdbUuid.fromString(docId)
         val head = session.runtime.embedded.dag.head()
+        val id =
+            runCatching { KdbUuid.fromString(docId) }.getOrNull()
+                ?: resolveDocIdPrefix(session, docId, head)
         val doc =
             session.runtime.embedded.storage.getDocument(session.namespaceId, id, head)
                 ?: throw IllegalArgumentException("document not found: $docId")
         println(doc.json)
+    }
+
+    private suspend fun resolveDocIdPrefix(session: CliSession, input: String, head: KdbHash): KdbUuid {
+        val prefix =
+            input.trim()
+                .removePrefix("0x")
+                .replace("-", "")
+                .lowercase()
+        require(prefix.length >= 8) { "doc id prefix too short: $input" }
+        require(prefix.length <= 32) { "doc id too long: $input" }
+        require(prefix.all { it in '0'..'9' || it in 'a'..'f' }) { "invalid doc id prefix: $input" }
+
+        val matches = mutableListOf<KdbUuid>()
+        session.runtime.embedded.storage.scanDocuments(session.namespaceId, head, batchSize = 256) { batch ->
+            for (d in batch) {
+                val full = d.id.toString().replace("-", "").lowercase()
+                if (full.startsWith(prefix)) {
+                    matches += d.id
+                    if (matches.size > 16) break
+                }
+            }
+        }
+        if (matches.isEmpty()) throw IllegalArgumentException("document not found: $input")
+        if (matches.size == 1) return matches.single()
+        val sample = matches.take(5).joinToString(",") { it.toString() }
+        throw IllegalArgumentException("ambiguous document id prefix: $input (matches: $sample${if (matches.size > 5) ",..." else ""})")
     }
 
     internal suspend fun executeQuery(session: CliSession, sql: String) {

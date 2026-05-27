@@ -20,7 +20,7 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 | Integration test suite | `:kdb-integration` |
 | **JDBC** — `jdbc:kdb://…` network URLs | Parsed but not implemented (`SQLFeatureNotSupportedException`) |
 | JDBC DML (`INSERT` / `UPDATE` / `DELETE`) | Implemented (embedded memory/file); auto-commit per statement; multi-statement transactions on network SQL (`BEGIN` … `COMMIT`) |
-| CLI persistence (`--data-dir`) | `put` / `get` / `query` survive separate CLI invocations (delta log + SERVER engine) |
+| CLI persistence (`--data-dir`) | Kotlin & Go: `put` / `get` / `query` survive separate CLI invocations (delta log + SERVER engine); Go uses `flock` on `{dataDir}/.kdb.lock` while open |
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
 | **File attachments** (`file put` / `get` / `meta`, ZIP, bundles, `fileId` GUID) | Implemented — see [file attachments spec](kdb-spec-layer1-component3b-file-attachments.md) |
@@ -66,8 +66,8 @@ Commands:
 | Command | Usage | Description |
 |---------|-------|-------------|
 | `init` | `init <namespace>` | Create namespace metadata under `--data-dir` |
-| `put` | `put <namespace> <file\|json>` | Write a JSON document and append a commit |
-| `get` | `get <namespace> <docId>` | Print document JSON by UUID |
+| `put` | `put <namespace> <file\|json>` | Write a JSON document and append a commit; prints `{"docId":"…","docIdShort":"…","commit":"…"}` (`docIdShort` is the first 8 hex digits of the UUID, for copy/paste only) |
+| `get` | `get <namespace> <docId>` | Print document JSON: full UUID (canonical or 32 hex), or an **unambiguous** case-insensitive hex **prefix** (minimum **8** hex digits, up to 31; if two or more documents at HEAD match, the CLI errors with candidate UUIDs) |
 | `query` | `query <namespace> <sql>` | Run hybrid SQL; print tab-separated rows |
 | `log` | `log <namespace>` | Print commit history |
 | `status` | `status <namespace>` | Print HEAD hash and document count |
@@ -84,14 +84,16 @@ Example:
 ```bash
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb init myapp/users"
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb put myapp/users '{\"userId\":\"u1\"}'"
+# stdout: {"docId":"<uuid>","commit":"<64-hex>"} — copy docId for get
+./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb get myapp/users <docId>"
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb query myapp/users 'SELECT _doc FROM users'"
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb file put myapp/files --id 00000000-0000-0000-0000-0000000000f1 --zip ./report.pdf"
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb file get myapp/files --id 00000000-0000-0000-0000-0000000000f1 -o ./report-copy.pdf"
 ```
 
-**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`.
+**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. The Go `kdb` binary uses the same on-disk layout and KDBP-framed delta segments as Kotlin file mode; **either CLI can read data written by the other** on the same `--data-dir` (same SHA-256 and commit payload rules).
 
-**Workspace lock:** File mode takes an exclusive lock on `{dataDir}/.kdb.lock` while a process has the database open (CLI, JDBC `jdbc:kdb:file://…`, or your app via `openFileRuntime`). A second process opening the same `--data-dir` fails with a clear error naming the holder PID when known. Only one live writer per workspace.
+**Workspace lock:** File mode takes an exclusive lock on `{dataDir}/.kdb.lock` while a process has the database open (CLI, JDBC `jdbc:kdb:file://…`, or your app via `openFileRuntime`). On macOS/Linux the Go CLI uses `flock(2)` on that file. A second process opening the same `--data-dir` fails with a clear error naming the holder PID when known. Only one live writer per workspace.
 
 If your app crashes and leaves the lock file behind, the OS releases the underlying lock when the process exits; you can remove a leftover file with:
 

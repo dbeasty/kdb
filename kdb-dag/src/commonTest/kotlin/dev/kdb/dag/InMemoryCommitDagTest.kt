@@ -14,6 +14,17 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class InMemoryCommitDagTest {
+    /** Matches Go `dag.NewInMemoryCommitDag("app/t")` genesis after RFC-6234 SHA-256 alignment. */
+    @Test
+    fun genesisCommitHash_matchesGoForNamespaceAppSlashT() =
+        runTest {
+            val dag = inMemoryCommitDag("app/t")
+            assertEquals(
+                "5ed3ef44f65fc2f179890bbeb3e5fb05fa0ed5972e3c8cb9bac045f1fe6602d8",
+                dag.head().toHex(),
+            )
+        }
+
     @Test
     fun tc01_appendAndHeadMovesLinear() =
         runTest {

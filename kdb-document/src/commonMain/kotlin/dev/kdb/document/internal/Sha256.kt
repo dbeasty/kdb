@@ -2,6 +2,10 @@ package dev.kdb.document.internal
 
 /**
  * Pure Kotlin SHA-256 (RFC 6234). Multiplatform-safe.
+ *
+ * Parentheses matter: `ushr`/`shl` bind tighter than `or` in `rotr`; for Maj/Ch and σ xor
+ * chains, `and`/`xor` must be grouped explicitly — Kotlin does not match Java `&`/`^`
+ * precedence for the infix `and`/`xor` spellings.
  */
 internal fun sha256Digest(message: ByteArray): ByteArray {
     val msgLen = message.size.toLong()
@@ -88,7 +92,8 @@ internal fun sha256Digest(message: ByteArray): ByteArray {
             i32(0xc67178f2u),
         )
 
-    fun rotr(x: Int, n: Int): Int = (x ushr n) or (x shl (32 - n))
+    // Parentheses required: `ushr`/`shl` bind tighter than `or`.
+    fun rotr(x: Int, n: Int): Int = ((x ushr n) or (x shl (32 - n)))
 
     val h0 =
         intArrayOf(
@@ -112,8 +117,10 @@ internal fun sha256Digest(message: ByteArray): ByteArray {
                     (padded[offset + t * 4 + 3].toInt() and 0xFF)
         }
         for (t in 16 until 64) {
-            val s0 = rotr(w[t - 15], 7) xor rotr(w[t - 15], 18) xor (w[t - 15] ushr 3)
-            val s1 = rotr(w[t - 2], 17) xor rotr(w[t - 2], 19) xor (w[t - 2] ushr 10)
+            val wp15 = w[t - 15]
+            val s0 = (rotr(wp15, 7) xor rotr(wp15, 18)) xor (wp15 ushr 3)
+            val wp2 = w[t - 2]
+            val s1 = (rotr(wp2, 17) xor rotr(wp2, 19)) xor (wp2 ushr 10)
             w[t] = w[t - 16] + s0 + w[t - 7] + s1
         }
 
@@ -127,11 +134,11 @@ internal fun sha256Digest(message: ByteArray): ByteArray {
         var h = h0[7]
 
         for (t in 0 until 64) {
-            val s1 = rotr(e, 6) xor rotr(e, 11) xor rotr(e, 25)
-            val ch = e and f xor (e.inv() and g)
-            val t1 = h + s1 + ch + k[t] + w[t]
-            val s0a = rotr(a, 2) xor rotr(a, 13) xor rotr(a, 22)
-            val maj = a and b xor a and c xor b and c
+            val s1r = (rotr(e, 6) xor rotr(e, 11)) xor rotr(e, 25)
+            val ch = ((e and f) xor ((e.inv()) and g))
+            val t1 = h + s1r + ch + k[t] + w[t]
+            val s0a = (rotr(a, 2) xor rotr(a, 13)) xor rotr(a, 22)
+            val maj = ((a and b) xor (a and c)) xor (b and c)
             val t2 = s0a + maj
             h = g
             g = f

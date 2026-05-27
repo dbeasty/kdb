@@ -1,6 +1,6 @@
 # KDB — Portable Embedded Database Engine
 
-> **Status: early implementation.** This repository contains the architecture specification, a **Kotlin Multiplatform** implementation, a parallel **Go** implementation under [`go/`](go/), and design artefacts for KDB. APIs and behaviour are subject to change. See the [user guide](docs/kdb-user-guide.md) for how to run and embed what exists today. JVM **file persistence** (`jdbc:kdb:file://…`, CLI `--data-dir`) is implemented via the SERVER storage engine and delta log replay.
+> **Status: early implementation.** This repository contains the architecture specification, a **Kotlin Multiplatform** implementation, a parallel **Go** implementation under [`go/`](go/), and design artefacts for KDB. APIs and behaviour are subject to change. See the [user guide](docs/kdb-user-guide.md) for how to run and embed what exists today. JVM **file persistence** (`jdbc:kdb:file://…`, Kotlin CLI `--data-dir`) and Go **`--data-dir`** (CLI + `kdb://file://…`) use the SERVER storage engine, delta replay, and an exclusive `{dataRoot}/.kdb.lock` while open. Content-addressed digests use **RFC 6234 SHA-256** in both Kotlin (`internal.sha256Digest`) and Go (`crypto/sha256`).
 
 ---
 
@@ -80,7 +80,10 @@ Connection c = DriverManager.getConnection("jdbc:kdb:memory:///demo/users");
 cd go && go test ./...
 make build-go
 ./go/bin/kdb --data-dir /tmp/kdb-data init myapp/users
-./go/bin/kdb --data-dir /tmp/kdb-data put myapp/users doc1 '{"name":"Ada"}'
+OUT=$(./go/bin/kdb --data-dir /tmp/kdb-data put myapp/users '{"name":"Ada"}')
+# prints {"docId":"<uuid>","docIdShort":"<8-hex>","commit":"<64-hex>"}
+./go/bin/kdb --data-dir /tmp/kdb-data get myapp/users "$(echo "$OUT" | jq -r .docId)"
+# get also accepts an unambiguous 8+ hex digit prefix of the 32-nibble UUID (see user guide)
 ```
 
 ```go

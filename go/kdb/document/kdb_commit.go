@@ -37,11 +37,7 @@ func commitPayloadRecord(
 	for i, op := range operations {
 		opEls[i] = op.toValue()
 	}
-	var schemaField codec.Value = codec.Null
-	if schemaHash != nil {
-		schemaField = hashVal(*schemaHash)
-	}
-	return codec.RecordValue{Fields: map[int]codec.Value{
+	fields := map[int]codec.Value{
 		1: codec.ArrayValue{Elements: parentEls},
 		2: codec.StringValue{V: namespaceID},
 		3: uuidVal(transactionID),
@@ -49,9 +45,13 @@ func commitPayloadRecord(
 		5: uuidVal(authorNodeID),
 		6: codec.ArrayValue{Elements: opEls},
 		7: hashVal(documentTreeHash),
-		8: schemaField,
 		9: codec.StringValue{V: message},
-	}}
+	}
+	// Match Kotlin wire: omit field 8 when null so commit hashes match JVM genesis/delta.
+	if schemaHash != nil {
+		fields[8] = hashVal(*schemaHash)
+	}
+	return codec.RecordValue{Fields: fields}
 }
 
 func (c *Commit) ToCommitPayloadValue() codec.Value {
@@ -163,7 +163,10 @@ func parseCommitFromRecord(rec codec.RecordValue, hash codec.Hash) (Commit, erro
 		return Commit{}, NewCommitDecodeError("documentTreeHash", nil)
 	}
 	var schemaH *codec.Hash
+	// Kotlin omits nullable fields at default (null); map lookup yields nil, not NullValue.
 	switch sf := rec.Fields[8].(type) {
+	case nil:
+		schemaH = nil
 	case codec.NullValue:
 		schemaH = nil
 	case codec.FixedValue:

@@ -166,6 +166,9 @@ func omitField(cur Value, def any) bool {
 
 func valuesEqual(a Value, b any) bool {
 	switch av := a.(type) {
+	case NullValue:
+		_, ok := b.(NullValue)
+		return ok
 	case Int32Value:
 		bv, ok := b.(Int32Value)
 		return ok && av.V == bv.V

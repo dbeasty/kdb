@@ -3,6 +3,7 @@ package delta
 import (
 	"fmt"
 	"sync"
+	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -199,6 +200,10 @@ func (r *DefaultReader) scanSegmentRef(segmentName string) (*storage.DeltaSegmen
 				}
 			}
 		}
+	}
+	// Allow optional file extension (e.g. "<uuid>.seg").
+	if dot := strings.IndexByte(idStr, '.'); dot >= 0 {
+		idStr = idStr[:dot]
 	}
 	segmentID, err := codec.UUIDFromString(idStr)
 	if err != nil {

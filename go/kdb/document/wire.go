@@ -96,7 +96,7 @@ func WireRegistry() *schema.Registry {
 				{ID: 5, Name: "authorNodeId", Type: uuidPrim},
 				{ID: 6, Name: "operations", Type: schema.Array{Element: kdbOpWire}},
 				{ID: 7, Name: "documentTreeHash", Type: hashRef},
-				{ID: 8, Name: "schemaHash", Type: schema.Nullable{Inner: hashRef}},
+				{ID: 8, Name: "schemaHash", Type: schema.Nullable{Inner: hashRef}, Default: codec.Null},
 				{ID: 9, Name: "message", Type: schema.Prim(schema.PhysicalString)},
 			},
 		})

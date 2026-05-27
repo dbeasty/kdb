@@ -13,7 +13,17 @@ type CommitDAG interface {
 	GetDocumentTree(treeHash codec.Hash) (document.DocumentTree, bool)
 	GetDocumentTreeOrThrow(treeHash codec.Hash) (document.DocumentTree, error)
 	PutDocumentTree(tree document.DocumentTree)
+	AppendCommit(
+		tx document.Transaction,
+		parentHash codec.Hash,
+		newDocumentTree document.DocumentTree,
+		schemaHash *codec.Hash,
+		message string,
+	) (document.Commit, error)
 	Head() (codec.Hash, error)
 	SetHead(branchName string, hash codec.Hash) error
 	GetBranch(name string) (document.Branch, bool)
+	ListBranches() []document.Branch
+	CreateBranch(name string, fromHash codec.Hash) (document.Branch, error)
+	Walk(from codec.Hash, until *codec.Hash, limit int) []TraversalEntry
 }

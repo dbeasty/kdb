@@ -1,39 +1,86 @@
 package embed
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
-	storagemem "github.com/limidus/kdb/go/kdb/storage/mem"
+	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/engine"
+	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
 // OpenFileRuntime opens an embedded runtime backed by a data directory.
-// v1 Go port: ensures namespace layout on disk and uses in-memory DAG/storage
-// until the file storage engine is ported from Kotlin.
 func OpenFileRuntime(dataRoot, catalog, namespaceID string, sch schema.KdbSchema) (*EmbeddedKdbRuntime, error) {
-	if err := ensureNamespaceDirs(dataRoot, namespaceID); err != nil {
-		return nil, err
-	}
-	d, err := dag.NewInMemoryCommitDag(namespaceID)
+	lock, err := acquireDirLock(dataRoot)
 	if err != nil {
 		return nil, err
 	}
-	s := storagemem.NewInMemoryStorageAdapter()
+	if err := ensureNamespaceDirs(dataRoot, namespaceID); err != nil {
+		lock.Release()
+		return nil, err
+	}
+
+	io, err := (&storio.FileBackedPlatformIOFactory{
+		NewStore: func(config storio.PlatformIOConfig) (storio.SegmentByteStore, error) {
+			return storio.NewOSByteStore(config)
+		},
+	}).Open(storio.PlatformIOConfig{RootDirectory: &dataRoot, FsyncOnFlush: true})
+	if err != nil {
+		lock.Release()
+		return nil, err
+	}
+
+	cfg := storage.StorageEngineConfig{
+		GlobalMemoryBudgetBytes: 64 * 1024 * 1024,
+		CompressionCodec:        storage.CompressionZSTD,
+		DefaultIndexRetention:   storage.IndexRetentionEvictable,
+		IOShim:                  io,
+	}
+	handle, err := engine.DefaultFactory{EngineTarget: engine.TargetServer}.Open(namespaceID, cfg)
+	if err != nil {
+		lock.Release()
+		return nil, err
+	}
+
+	d, err := dag.NewInMemoryCommitDag(namespaceID)
+	if err != nil {
+		lock.Release()
+		return nil, err
+	}
+
+	store := handle.Adapter()
+	if store == nil {
+		lock.Release()
+		return nil, fmt.Errorf("file runtime missing storage adapter")
+	}
+
+	if err := replayDeltaNamespace(d, store, handle.DeltaReader()); err != nil {
+		lock.Release()
+		return nil, err
+	}
+	dagOut := dag.CommitDAG(d)
+	if w := handle.DeltaWriter(); w != nil {
+		dagOut = NewPersistingCommitDAG(d, w)
+	}
+
 	rt := &EmbeddedKdbRuntime{
 		Catalog:          catalog,
-		DAG:              d,
-		Storage:          s,
+		DAG:              dagOut,
+		Storage:          store,
 		Schema:           sch,
 		DefaultNamespace: namespaceID,
 		DataRoot:         dataRoot,
 	}
 	if !sch.IsNone() {
 		if err := syncEmbedSchema(rt, namespaceID, sch); err != nil {
+			lock.Release()
 			return nil, err
 		}
 	}
+	rt.release = lock.Release
 	return rt, nil
 }
 
