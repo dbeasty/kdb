@@ -1,0 +1,3 @@
+// Package root is the Go port of KDB (github.com/limidus/kdb).
+// Import subpackages under github.com/limidus/kdb/go/kdb/...
+package root

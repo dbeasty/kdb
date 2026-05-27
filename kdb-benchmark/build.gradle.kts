@@ -6,6 +6,7 @@ plugins {
 dependencies {
     jmh(libs.jmh.core)
     annotationProcessor(libs.jmh.generator)
+    implementation(project(":kdb-config"))
     implementation(project(":kdb-cli"))
     implementation(project(":kdb-embed"))
     implementation(project(":kdb-jdbc"))

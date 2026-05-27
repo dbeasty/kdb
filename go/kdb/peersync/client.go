@@ -1,0 +1,275 @@
+package peersync
+
+import (
+	"sync"
+	"time"
+
+	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/dag"
+	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transport/core"
+	"github.com/limidus/kdb/go/kdb/transport/ws"
+	"github.com/limidus/kdb/go/kdb/wire"
+)
+
+// Client connects to a peer and synchronizes commits.
+type Client interface {
+	Connect(config ClientConfig) (Session, error)
+	Disconnect() error
+}
+
+// Session is an active peer sync session.
+type Session interface {
+	NamespaceID() string
+	RemoteHead() codec.Hash
+	PullMissing() (Result, error)
+	PushCommits(commits []document.Commit) (int, error)
+	SyncBidirectional() (Result, error)
+	FetchCommitsSince(sinceHash *codec.Hash) ([]document.Commit, error)
+}
+
+type defaultClient struct {
+	wire        wire.Codec
+	transport   stream.Transport
+	dag         *dag.InMemoryCommitDag
+	correlation int
+	conn        stream.ConnectionHandle
+	mu          sync.Mutex
+}
+
+// NewClient creates a peer sync client skeleton.
+func NewClient(w wire.Codec, transport stream.Transport, dagInst *dag.InMemoryCommitDag) Client {
+	return &defaultClient{wire: w, transport: transport, dag: dagInst, correlation: 2000}
+}
+
+func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
+	var conn stream.ConnectionHandle
+	var err error
+	if wsTransport, ok := c.transport.(ws.Transport); ok {
+		opts := coreConnectOptions(config)
+		conn, err = wsTransport.ConnectWithOptions(config.PeerURI, opts)
+	} else {
+		conn, err = c.transport.Connect(config.PeerURI)
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.conn = conn
+	c.mu.Unlock()
+
+	localHead, err := c.dag.Head()
+	if err != nil {
+		return nil, err
+	}
+	hs := wire.HandshakeMessage{
+		H: wire.Header{
+			MessageType:     wire.MsgHandshake,
+			ProtocolVersion: wire.KdbWireProtocolVersion,
+			CorrelationID:   c.nextCorrelation(),
+		},
+		Request: wire.HandshakePayload{
+			NodeID:     config.NodeID,
+			Namespaces: []string{config.NamespaceID},
+			LocalHeads: map[string]string{config.NamespaceID: localHead.Hex()},
+			ClientMode: wire.ClientFullPeer,
+		},
+	}
+	ackMsg, err := c.request(conn, hs)
+	if err != nil {
+		return nil, err
+	}
+	ack, ok := ackMsg.(wire.HandshakeAckMessage)
+	if !ok {
+		return nil, NewError("expected HandshakeAck", nil)
+	}
+	if !ack.Response.Accepted {
+		reason := "handshake rejected"
+		if ack.Response.RejectionReason != nil {
+			reason = *ack.Response.RejectionReason
+		}
+		return nil, NewError(reason, nil)
+	}
+	remoteHex, ok := ack.Response.RemoteHeads[config.NamespaceID]
+	if !ok {
+		return nil, NewError("remote head missing for "+config.NamespaceID, nil)
+	}
+	remoteHead, err := codec.HashFromHex(remoteHex)
+	if err != nil {
+		return nil, err
+	}
+	return &defaultSession{client: c, dag: c.dag, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn}, nil
+}
+
+func (c *defaultClient) Disconnect() error {
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.mu.Unlock()
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
+}
+
+func (c *defaultClient) nextCorrelation() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id := c.correlation
+	c.correlation++
+	return id
+}
+
+func (c *defaultClient) request(conn stream.ConnectionHandle, message wire.Message) (wire.Message, error) {
+	frame, err := c.wire.Encode(message)
+	if err != nil {
+		return nil, err
+	}
+	cid := message.Header().CorrelationID
+	if err := conn.Send(frame); err != nil {
+		return nil, err
+	}
+	for i := 0; i < 4000; i++ {
+		if frame := conn.TryPoll(); frame != nil {
+			decoded, err := c.wire.Decode(frame)
+			if err != nil {
+				return nil, err
+			}
+			if decoded.Header().CorrelationID == cid {
+				return decoded, nil
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return nil, NewError("no response for correlation", nil)
+}
+
+func (c *defaultClient) fetchRemote(conn stream.ConnectionHandle, namespaceID string, sinceHash *codec.Hash, maxCommits int) ([]document.Commit, error) {
+	fetch := wire.CommitFetchMessage{
+		H: wire.Header{
+			MessageType:     wire.MsgCommitFetch,
+			ProtocolVersion: wire.KdbWireProtocolVersion,
+			CorrelationID:   c.nextCorrelation(),
+		},
+		Namespace:  namespaceID,
+		SinceHash:  sinceHash,
+		MaxCommits: maxCommits,
+	}
+	resp, err := c.request(conn, fetch)
+	if err != nil {
+		return nil, err
+	}
+	push, ok := resp.(wire.CommitPushMessage)
+	if !ok {
+		return nil, NewError("expected CommitPush response to CommitFetch", nil)
+	}
+	return push.Commits, nil
+}
+
+func (c *defaultClient) pushToRemote(conn stream.ConnectionHandle, namespaceID string, commits []document.Commit) (int, error) {
+	if len(commits) == 0 {
+		return 0, nil
+	}
+	push := wire.CommitPushMessage{
+		H: wire.Header{
+			MessageType:     wire.MsgCommitPush,
+			ProtocolVersion: wire.KdbWireProtocolVersion,
+			CorrelationID:   c.nextCorrelation(),
+		},
+		Namespace: namespaceID,
+		Commits:   commits,
+	}
+	if _, err := c.request(conn, push); err != nil {
+		return 0, err
+	}
+	return len(commits), nil
+}
+
+type defaultSession struct {
+	client      *defaultClient
+	dag         *dag.InMemoryCommitDag
+	namespaceID string
+	remoteHead  codec.Hash
+	conn        stream.ConnectionHandle
+}
+
+func (s *defaultSession) NamespaceID() string  { return s.namespaceID }
+func (s *defaultSession) RemoteHead() codec.Hash { return s.remoteHead }
+
+func (s *defaultSession) PullMissing() (Result, error) {
+	localHead, err := s.dag.Head()
+	if err != nil {
+		return Result{}, err
+	}
+	if localHead == s.remoteHead {
+		plan, _ := ComputeSyncPlan(s.dag, localHead, s.remoteHead)
+		return Result{FinalHead: localHead, Plan: plan}, nil
+	}
+	fetched, err := s.client.fetchRemote(s.conn, s.namespaceID, &localHead, 100)
+	if err != nil {
+		return Result{}, err
+	}
+	applied := 0
+	for _, commit := range fetched {
+		if _, ok := s.dag.GetCommit(commit.Hash); ok {
+			continue
+		}
+		if err := s.dag.PutCommit(commit, true); err != nil {
+			return Result{}, err
+		}
+		applied++
+	}
+	if len(fetched) > 0 {
+		_ = s.dag.SetHead("main", fetched[len(fetched)-1].Hash)
+	}
+	finalHead, err := s.dag.Head()
+	if err != nil {
+		return Result{}, err
+	}
+	plan, _ := ComputeSyncPlan(s.dag, finalHead, s.remoteHead)
+	return Result{AppliedCommits: applied, FinalHead: finalHead, Plan: plan}, nil
+}
+
+func (s *defaultSession) PushCommits(commits []document.Commit) (int, error) {
+	return s.client.pushToRemote(s.conn, s.namespaceID, commits)
+}
+
+func (s *defaultSession) SyncBidirectional() (Result, error) {
+	pull, err := s.PullMissing()
+	if err != nil {
+		return Result{}, err
+	}
+	localHead, err := s.dag.Head()
+	if err != nil {
+		return Result{}, err
+	}
+	toPush, err := CommitsToPush(s.dag, localHead, s.remoteHead, 100)
+	if err != nil {
+		return Result{}, err
+	}
+	pushed, err := s.PushCommits(toPush)
+	if err != nil {
+		return Result{}, err
+	}
+	finalHead, err := s.dag.Head()
+	if err != nil {
+		return Result{}, err
+	}
+	pull.PushedCommits = pushed
+	pull.FinalHead = finalHead
+	return pull, nil
+}
+
+func (s *defaultSession) FetchCommitsSince(sinceHash *codec.Hash) ([]document.Commit, error) {
+	return s.client.fetchRemote(s.conn, s.namespaceID, sinceHash, 100)
+}
+
+func coreConnectOptions(config ClientConfig) core.TransportConnectOptions {
+	opts := core.DefaultConnectOptions()
+	opts.TLS = config.TLS
+	if config.ConnectionContext.Headers != nil {
+		opts.ConnectHeaders = config.ConnectionContext.Headers
+	}
+	return opts
+}

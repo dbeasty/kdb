@@ -32,3 +32,8 @@ kdb-integration/e2e/.venv/
 .gradle/
 kotlin-js-store/
 **/node_modules/
+
+# Go
+go/bin/
+go/**/*.wasm
+go/**/wasm_exec.js

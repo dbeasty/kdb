@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>KDB Browser Demo (Go WASM)</title>
+</head>
+<body>
+  <h1>KDB Go WASM demo</h1>
+  <button id="open">Open in-memory runtime</button>
+  <pre id="out"></pre>
+  <script src="wasm_exec.js"></script>
+  <script>
+    const go = new Go();
+    WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then((result) => {
+      go.run(result.instance);
+      document.getElementById("open").onclick = () => {
+        const r = KdbBrowser.openMemory("demo", "demo/users");
+        document.getElementById("out").textContent = JSON.stringify(r, null, 2);
+      };
+    });
+  </script>
+</body>
+</html>

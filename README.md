@@ -1,12 +1,12 @@
 # KDB — Portable Embedded Database Engine
 
-> **Status: early implementation.** This repository contains the architecture specification, a growing Kotlin Multiplatform implementation, and design artefacts for KDB. APIs and behaviour are subject to change. See the [user guide](docs/kdb-user-guide.md) for how to run and embed what exists today. JVM **file persistence** (`jdbc:kdb:file://…`, CLI `--data-dir`) is implemented via the SERVER storage engine and delta log replay.
+> **Status: early implementation.** This repository contains the architecture specification, a **Kotlin Multiplatform** implementation, a parallel **Go** implementation under [`go/`](go/), and design artefacts for KDB. APIs and behaviour are subject to change. See the [user guide](docs/kdb-user-guide.md) for how to run and embed what exists today. JVM **file persistence** (`jdbc:kdb:file://…`, CLI `--data-dir`) is implemented via the SERVER storage engine and delta log replay.
 
 ---
 
 ## Overview
 
-KDB is a portable, multi-runtime embedded database engine written in Kotlin Multiplatform. The **entire engine** — not a client library, not a thin SDK — compiles and runs on browser clients (via Kotlin/JS), JVM backends, and native targets (via Kotlin/Native). The same Kotlin codebase produces all three runtimes. Only storage adapters and transport adapters differ per platform; all engine logic is shared.
+KDB is a portable, multi-runtime embedded database engine. The **Kotlin Multiplatform** tree is the original implementation: the entire engine compiles to browser (Kotlin/JS), JVM, and native (Kotlin/Native). A **Go** port in [`go/`](go/) mirrors the same layered architecture for native servers, CLI, `database/sql`, and WASM (browser). Both implementations follow [`docs/kdb-spec.md`](docs/kdb-spec.md); Kotlin and Go are maintained side by side with cross-language wire golden tests.
 
 KDB is best understood as **source control for structured documents**. You store whole JSON documents. You retrieve whole JSON documents. Optionally you declare a schema — a typed, indexed lens over part of each document — which unlocks SQL querying, JDBC connectivity, and ORM integration. The document is always the truth. The schema is always a lens. Both coexist without friction.
 
@@ -56,9 +56,10 @@ Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-d
 | Document | Audience |
 |----------|----------|
 | [**User guide**](docs/kdb-user-guide.md) | Run the inspect CLI, embed via JDBC (Java), or Kotlin/JS (browser) |
+| [**Go porting guide**](docs/go-porting.md) | Go module layout, build tags, interop tests |
 | [**Architecture specification**](docs/kdb-spec.md) | Full system design, protocols, and layer specs |
 
-### Quick start
+### Quick start (Kotlin)
 
 ```bash
 ./gradlew build
@@ -71,6 +72,23 @@ Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-d
 // JDBC (in-memory) — seed data via embedded runtime; see user guide
 Class.forName("dev.kdb.jdbc.KdbDriver");
 Connection c = DriverManager.getConnection("jdbc:kdb:memory:///demo/users");
+```
+
+### Quick start (Go)
+
+```bash
+cd go && go test ./...
+make build-go
+./go/bin/kdb --data-dir /tmp/kdb-data init myapp/users
+./go/bin/kdb --data-dir /tmp/kdb-data put myapp/users doc1 '{"name":"Ada"}'
+```
+
+```go
+import (
+    "database/sql"
+    _ "github.com/limidus/kdb/go/kdb/driver"
+)
+db, _ := sql.Open("kdb", "kdb://memory:///demo/users?unique=true")
 ```
 
 ---

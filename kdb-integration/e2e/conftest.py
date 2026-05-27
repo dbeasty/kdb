@@ -62,6 +62,19 @@ def run_kdb(
     quiet: bool = True,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    go_bin = os.environ.get("KDB_CLI_BIN")
+    if go_bin:
+        cmd = [go_bin, "--data-dir", data_dir]
+        if quiet:
+            cmd.append("--quiet")
+        cmd.extend(args)
+        return subprocess.run(
+            cmd,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     cmd = [
         java_executable,
         "-cp",
