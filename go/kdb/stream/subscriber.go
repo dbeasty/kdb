@@ -1,7 +1,7 @@
 package stream
 
 import (
-	"fmt"
+	"errors"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -147,7 +147,7 @@ func (s *defaultSubscriber) handleFrame(frame []byte) {
 			if m.Response.RejectionReason != nil {
 				reason = *m.Response.RejectionReason
 			}
-			s.emit(Event{Kind: EventError, Cause: fmt.Errorf(reason)})
+			s.emit(Event{Kind: EventError, Cause: errors.New(reason)})
 			return
 		}
 		s.emit(Event{Kind: EventConnected, Encoding: m.Response.NegotiatedEncoding})
@@ -188,7 +188,7 @@ func (s *defaultSubscriber) handleFrame(frame []byte) {
 	case wire.IceArchiveNoticeMessage:
 		s.emit(Event{Kind: EventIceArchived, OriginalHash: m.OriginalHash, ArchiveLoc: m.ArchiveLocation})
 	case wire.ConflictReportMessage:
-		s.emit(Event{Kind: EventError, Cause: fmt.Errorf("conflict reported")})
+		s.emit(Event{Kind: EventError, Cause: errors.New("conflict reported")})
 	}
 }
 

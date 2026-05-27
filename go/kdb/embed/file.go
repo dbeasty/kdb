@@ -10,10 +10,17 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
+	s3io "github.com/limidus/kdb/go/kdb/storage/io/s3"
 )
 
 // OpenFileRuntime opens an embedded runtime backed by a data directory.
+// When KDB_S3_BUCKET is set, sealed segments and snapshots are replicated to S3 (see FileRuntimeOptionsFromEnv).
 func OpenFileRuntime(dataRoot, catalog, namespaceID string, sch schema.KdbSchema) (*EmbeddedKdbRuntime, error) {
+	return OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID, sch, FileRuntimeOptionsFromEnv())
+}
+
+// OpenFileRuntimeWithOptions opens a file runtime with explicit storage options.
+func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schema.KdbSchema, opts FileRuntimeOptions) (*EmbeddedKdbRuntime, error) {
 	lock, err := acquireDirLock(dataRoot)
 	if err != nil {
 		return nil, err
@@ -23,9 +30,15 @@ func OpenFileRuntime(dataRoot, catalog, namespaceID string, sch schema.KdbSchema
 		return nil, err
 	}
 
+	s3Cfg := opts.S3
+	if s3Cfg == nil {
+		s3Cfg = s3io.ConfigFromEnv()
+	}
+	policy := opts.ReplicationPolicy
+
 	io, err := (&storio.FileBackedPlatformIOFactory{
 		NewStore: func(config storio.PlatformIOConfig) (storio.SegmentByteStore, error) {
-			return storio.NewOSByteStore(config)
+			return buildSegmentByteStore(config, s3Cfg, policy)
 		},
 	}).Open(storio.PlatformIOConfig{RootDirectory: &dataRoot, FsyncOnFlush: true})
 	if err != nil {

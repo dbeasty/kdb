@@ -1,0 +1,17 @@
+# LocalStack S3 for hybrid storage development and integration tests.
+# Usage:
+#   docker compose -f docker-compose.s3.yml up -d
+#   export KDB_S3_ENDPOINT=http://localhost:4566
+#   export KDB_S3_BUCKET=kdb-dev
+#   export AWS_ACCESS_KEY_ID=test
+#   export AWS_SECRET_ACCESS_KEY=test
+#   go test -tags=s3integration ./kdb/storage/io/s3/...
+
+services:
+  localstack:
+    image: localstack/localstack:4
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEBUG: "0"
