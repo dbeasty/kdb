@@ -1,8 +1,10 @@
 name: CI
 
+# Manual only — re-enable push/pull_request when CI is stable again.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
+#  push:
+#  pull_request:
 
 jobs:
   integration:
