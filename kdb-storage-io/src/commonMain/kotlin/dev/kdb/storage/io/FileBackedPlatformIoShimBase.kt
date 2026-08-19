@@ -12,12 +12,23 @@ public abstract class FileBackedPlatformIoShimBase(
     private val store: SegmentByteStore,
 ) : PlatformIoShim {
     private val segmentMutexes = mutableMapOf<String, Mutex>()
+    // Deliberately separate from segmentMutexes: appendToSegment needs mutual exclusion against
+    // other appends (position bookkeeping isn't atomic in the underlying store), but a running
+    // fsync must not block new appends from being written and queuing up for the *next* sync --
+    // that pipelining is what makes WAL-level group commit (DefaultWriteAheadLog.sync) actually
+    // batch multiple writers onto one fsync instead of degenerating back to one-at-a-time.
+    private val flushMutexes = mutableMapOf<String, Mutex>()
     private val sealedSegments = mutableSetOf<String>()
     private val globalMutex = Mutex()
 
     private suspend fun mutexFor(segmentName: String): Mutex =
         globalMutex.withLock {
             segmentMutexes.getOrPut(segmentName) { Mutex() }
+        }
+
+    private suspend fun flushMutexFor(segmentName: String): Mutex =
+        globalMutex.withLock {
+            flushMutexes.getOrPut(segmentName) { Mutex() }
         }
 
     override suspend fun appendToSegment(segmentName: String, bytes: ByteArray): Long {
@@ -56,7 +67,7 @@ public abstract class FileBackedPlatformIoShimBase(
 
     override suspend fun flushSegment(segmentName: String) {
         validateSegmentName(segmentName)
-        mutexFor(segmentName).withLock {
+        flushMutexFor(segmentName).withLock {
             try {
                 store.flush(segmentName, config.fsyncOnFlush)
             } catch (e: Exception) {
@@ -89,6 +100,7 @@ public abstract class FileBackedPlatformIoShimBase(
         mutexFor(segmentName).withLock {
             sealedSegments.remove(segmentName)
             segmentMutexes.remove(segmentName)
+            flushMutexes.remove(segmentName)
             store.delete(segmentName)
         }
     }

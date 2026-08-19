@@ -4,6 +4,7 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.StorageEngineConfig
 import dev.kdb.storage.io.SegmentNameBuilder
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -19,6 +20,23 @@ public class DefaultWriteAheadLog internal constructor(
     private var sequenceCounter: Long = 0
     private var segmentSize: Long = 0
     private var closed = false
+
+    // Group commit: concurrent sync() callers that arrive while a flush is already in flight
+    // piggyback on that single flushSegment() call instead of each paying a full fsync
+    // themselves -- N concurrent durable writes cost ~1 fsync instead of N under load, the
+    // same technique real WAL implementations (Postgres, SQLite WAL mode) use.
+    //
+    // Correctness requires more than "is a flush currently running": a caller may only join an
+    // in-flight round if its own append is guaranteed to have completed *before* that round's
+    // flushSegment() call started -- otherwise it could return from sync() believing its write
+    // is durable when the running fsync never covered it. append() is fully serialized by
+    // [mutex], so sequence numbers give a real happens-before order: the leader snapshots the
+    // highest sequence appended at the moment it starts flushing, and only a caller whose own
+    // sequence is <= that snapshot may join. Anyone else waits for the round to clear and
+    // retries (as either a fresh leader or a joiner of a newer, covering round).
+    private val syncGate = Mutex()
+    private var inFlightSync: CompletableDeferred<Unit>? = null
+    private var inFlightTargetSeq: Long = -1
 
     override val lastSequence: Long get() = sequenceCounter
     override val activeSegmentSizeBytes: Long get() = segmentSize
@@ -52,7 +70,53 @@ public class DefaultWriteAheadLog internal constructor(
         }
 
     override suspend fun sync() {
-        ioShim.flushSegment(segmentName)
+        val mySeq = mutex.withLock { sequenceCounter }
+        while (true) {
+            lateinit var round: CompletableDeferred<Unit>
+            var isLeader = false
+            var covered = false
+            syncGate.withLock {
+                val existing = inFlightSync
+                when {
+                    existing == null -> {
+                        round = CompletableDeferred()
+                        inFlightSync = round
+                        inFlightTargetSeq = mySeq
+                        isLeader = true
+                        covered = true
+                    }
+                    mySeq <= inFlightTargetSeq -> {
+                        round = existing
+                        covered = true
+                    }
+                    else -> {
+                        // A round is running but started before my append landed; it can't
+                        // cover me. Wait for it to clear, then loop -- I'll either become the
+                        // leader of a fresh round or join one whose target has moved past mySeq.
+                        round = existing
+                        covered = false
+                    }
+                }
+            }
+            if (isLeader) {
+                val outcome =
+                    try {
+                        ioShim.flushSegment(segmentName)
+                        null
+                    } catch (e: Throwable) {
+                        e
+                    }
+                // Clear the slot *before* completing the deferred: otherwise a caller could
+                // observe inFlightSync still pointing at this (already-finished) round between
+                // complete() and the clear, and wrongly treat it as still-joinable.
+                syncGate.withLock { if (inFlightSync === round) inFlightSync = null }
+                if (outcome == null) round.complete(Unit) else round.completeExceptionally(outcome)
+                round.await()
+                return
+            }
+            round.await()
+            if (covered) return
+        }
     }
 
     override suspend fun recover(handler: suspend (WalRecord) -> Unit): WalRecoverySummary {
@@ -89,16 +153,24 @@ public class DefaultWriteAheadLog internal constructor(
 
     private suspend fun readFullSegment(): ByteArray {
         val chunk = 64 * 1024
-        val out = mutableListOf<Byte>()
+        val parts = mutableListOf<ByteArray>()
+        var total = 0
         var off = 0L
         while (true) {
             val part = ioShim.readFromSegment(segmentName, off, chunk)
             if (part.isEmpty()) break
-            part.forEach { out.add(it) }
+            parts += part
+            total += part.size
             off += part.size
             if (part.size < chunk) break
         }
-        return out.toByteArray()
+        val out = ByteArray(total)
+        var pos = 0
+        for (part in parts) {
+            part.copyInto(out, destinationOffset = pos)
+            pos += part.size
+        }
+        return out
     }
 }
 
