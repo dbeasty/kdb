@@ -20,6 +20,16 @@ import dev.kdb.storage.wal.WalPutBlob
 import dev.kdb.storage.wal.WalRecord
 import dev.kdb.storage.wal.WalRecordKind
 import dev.kdb.storage.wal.WriteAheadLog
+import dev.kdb.storage.Durability
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlin.time.TimeSource
 
 public open class ServerStorageEngine(
@@ -51,6 +61,34 @@ public open class ServerStorageEngine(
     private val docs = ShardedDocStore()
     private val enlistmentStates = mutableMapOf<KdbUuid, EnlistmentEvictionState>()
 
+    private val asyncScope: CoroutineScope? =
+        if (wal != null && config.durability == Durability.ASYNC) {
+            CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        } else {
+            null
+        }
+
+    init {
+        asyncScope?.launch {
+            val interval = config.asyncSyncIntervalMillis ?: 5L
+            while (isActive) {
+                delay(interval)
+                wal?.sync()
+            }
+        }
+    }
+
+    /**
+     * Stops the background async-sync loop (if running) and does a final
+     * flush, so an ASYNC-durability namespace doesn't lose writes made
+     * just before shutdown. No-op for other durability modes.
+     */
+    public fun stopAsyncSync() {
+        val scope = asyncScope ?: return
+        scope.cancel()
+        runBlocking { wal?.sync() }
+    }
+
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {
         val hash = KdbHash.fromBytes(kdbSha256(bytes))
         val w = wal
@@ -64,9 +102,21 @@ public open class ServerStorageEngine(
                         WalPutBlob(hash, bytes).encode(),
                     ),
                 )
-            val fsyncStart = TimeSource.Monotonic.markNow()
-            groupCommit.syncTo(result.sequence) { w.sync() }
-            StageRecorder.Default.record(StorageStage.FSYNC_WAIT, fsyncStart.elapsedNow())
+            when (config.durability) {
+                Durability.SYNC -> {
+                    val fsyncStart = TimeSource.Monotonic.markNow()
+                    groupCommit.syncTo(result.sequence) { w.sync() }
+                    StageRecorder.Default.record(StorageStage.FSYNC_WAIT, fsyncStart.elapsedNow())
+                }
+                Durability.ASYNC -> {
+                    // Acknowledged once appended; the background loop
+                    // above syncs periodically instead of per-write. A
+                    // crash can lose up to one sync interval of writes.
+                }
+                Durability.MEMORY_ONLY -> {
+                    // Never synced by this engine; caller owns any checkpointing.
+                }
+            }
         }
         memTable.put(hash, bytes)
         return hash
@@ -190,7 +240,9 @@ private class DefaultStorageEngineHandle(
     override val deltaWriter: DeltaSegmentWriter?,
     override val deltaReader: DeltaSegmentReader?,
 ) : StorageEngineHandle {
-    override fun close() {}
+    override fun close() {
+        (adapter as? ServerStorageEngine)?.stopAsyncSync()
+    }
 }
 
 public class BrowserStorageEngine(
