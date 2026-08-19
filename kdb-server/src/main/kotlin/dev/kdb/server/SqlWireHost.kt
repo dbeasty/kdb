@@ -27,6 +27,8 @@ import dev.kdb.wire.WireCodec
 import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -41,20 +43,53 @@ public class SqlWireHost(
     private val sqlAuth = SqlAuthSupport(auth, connectionContext)
     private var correlation = 1
 
+    // Per-session ordering lock: SqlExec/TxCommit/TxRollback for the same
+    // sessionId must still execute one at a time (transaction semantics
+    // depend on it - e.g. a Commit must see the effects of every prior
+    // statement in that session), but different sessions - and therefore
+    // different connections, or multiple in-flight requests pipelined on
+    // one connection - now run fully concurrently instead of being
+    // serialized by a single blocking read loop. See Phase 6 of
+    // docs/benchmarks/phase0-baseline.md: the wire protocol already
+    // carries a correlationId for exactly this, but the default
+    // perConnection handler (SqlWireListen.kt) awaited each response
+    // before reading the next frame, so it went unused.
+    private val sessionLocksGuard = Mutex()
+    private val sessionLocks = mutableMapOf<String, Mutex>()
+
+    private suspend fun sessionLockFor(sessionId: String): Mutex =
+        sessionLocksGuard.withLock { sessionLocks.getOrPut(sessionId) { Mutex() } }
+
     public suspend fun handleFrame(frame: ByteArray): ByteArray? {
         val message = wire.decode(frame)
+        val sessionId = sessionIdOf(message)
         val reply =
-            when (message) {
-                is WireMessage.Handshake -> handleHandshake(message)
-                is WireMessage.SessionBegin -> handleSessionBegin(message)
-                is WireMessage.SqlExec -> handleSqlExec(message)
-                is WireMessage.TxCommit -> handleTxCommit(message)
-                is WireMessage.TxRollback -> handleTxRollback(message)
-                is WireMessage.TransactionReplay -> handleTransactionReplay(message)
-                else -> null
+            if (sessionId != null) {
+                sessionLockFor(sessionId).withLock { dispatch(message) }
+            } else {
+                dispatch(message)
             }
         return reply?.let { wire.encode(it) }
     }
+
+    private fun sessionIdOf(message: WireMessage): String? =
+        when (message) {
+            is WireMessage.SqlExec -> message.sessionId
+            is WireMessage.TxCommit -> message.sessionId
+            is WireMessage.TxRollback -> message.sessionId
+            else -> null
+        }
+
+    private suspend fun dispatch(message: WireMessage): WireMessage? =
+        when (message) {
+            is WireMessage.Handshake -> handleHandshake(message)
+            is WireMessage.SessionBegin -> handleSessionBegin(message)
+            is WireMessage.SqlExec -> handleSqlExec(message)
+            is WireMessage.TxCommit -> handleTxCommit(message)
+            is WireMessage.TxRollback -> handleTxRollback(message)
+            is WireMessage.TransactionReplay -> handleTransactionReplay(message)
+            else -> null
+        }
 
     private suspend fun handleHandshake(msg: WireMessage.Handshake): WireMessage.HandshakeAck {
         val modeOk = msg.request.clientMode == dev.kdb.wire.WireClientMode.SQL_CLIENT
