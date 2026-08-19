@@ -449,6 +449,18 @@ public class SqlWireHost(
                     readOnly = false,
                     error = "schema rejection",
                 )
+            is TransactionResult.Aborted ->
+                WireMessage.SqlResult(
+                    header(msg.header.correlationId, WireMessageType.SQL_RESULT),
+                    namespace = msg.namespace,
+                    sessionId = "",
+                    columns = emptyList(),
+                    rows = emptyList(),
+                    rowsAffected = 0,
+                    resolvedCommitHex = replayTarget.toHex(),
+                    readOnly = false,
+                    error = "transaction aborted: ${result.cause.message ?: result.cause.toString()}",
+                )
         }
     }
 

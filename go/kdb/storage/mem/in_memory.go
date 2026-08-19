@@ -190,6 +190,14 @@ func (a *InMemoryStorageAdapter) CommitTree(namespaceID string, parentTreeHash c
 	return built, nil
 }
 
+func (a *InMemoryStorageAdapter) DiscardPending(namespaceID string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.pendingPuts, namespaceID)
+	delete(a.pendingDeletes, namespaceID)
+	return nil
+}
+
 func (a *InMemoryStorageAdapter) Flush(namespaceID string) error { return nil }
 
 func (a *InMemoryStorageAdapter) ReadBlob(contentHash codec.Hash) ([]byte, error) {

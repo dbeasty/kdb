@@ -175,6 +175,80 @@ class DocumentLockIntegrationTest {
         }
 
     @Test
+    fun multiDocTransactionRejectedAtomicallyWhenOneDocIsLocked() =
+        runTest {
+            val ns = "demo/users"
+            val runtime = openMemoryRuntime("demo", ns)
+            val docA = KdbUuid.fromString(putJson(runtime, ns, """{"userId":"a","name":"A"}"""))
+            val docB = KdbUuid.fromString(putJson(runtime, ns, """{"userId":"b","name":"B"}"""))
+
+            val wire = defaultWireCodec()
+            val server = KdbServerRuntime(runtime)
+            val host = SqlWireHost(wire, server, ns)
+
+            // Another session holds docB, so a transaction touching both docA and docB must be
+            // rejected wholesale, before anything is written or docA gets locked/left dangling.
+            server.documentLocks.tryAcquire(ns, docB, "other-session")
+            val headBefore = runtime.dag.head()
+
+            val sessionId = "multi-doc-sess"
+            wire.decode(
+                host.handleFrame(
+                    wire.encode(
+                        WireMessage.SessionBegin(
+                            WireHeader(WireMessageType.SESSION_BEGIN, KDB_WIRE_PROTOCOL_VERSION, 0, 0),
+                            namespace = ns,
+                            sessionId = sessionId,
+                            readConsistency = ReadConsistency.READ_COMMITTED.name,
+                            baseVersionHex = null,
+                        ),
+                    ),
+                )!!,
+            )
+            val parent = runtime.dag.head()
+            val tx =
+                KdbTransaction(
+                    id = KdbUuid.random(),
+                    baseVersion = parent,
+                    operations =
+                        listOf(
+                            KdbOp.Write(docA, """{"userId":"a","name":"A2"}"""),
+                            KdbOp.Write(docB, """{"userId":"b","name":"B2"}"""),
+                        ),
+                    timestamp = KdbTimestamp.now(),
+                    authorNodeId = KdbUuid.random(),
+                )
+
+            val result =
+                wire.decode(
+                    host.handleFrame(
+                        wire.encode(
+                            WireMessage.TxCommit(
+                                WireHeader(WireMessageType.TX_COMMIT, KDB_WIRE_PROTOCOL_VERSION, 1, 0),
+                                namespace = ns,
+                                sessionId = sessionId,
+                                transactionBytes = TransactionWireCodec.encode(tx),
+                            ),
+                        ),
+                    )!!,
+                ) as WireMessage.SqlResult
+
+            assertNotNull(result.error)
+            assertTrue(result.error!!.contains("locked"))
+            // Nothing was committed.
+            assertEquals(headBefore, runtime.dag.head())
+
+            try {
+                // docA must not have been left locked by the rejected multi-doc attempt.
+                server.documentLocks.tryAcquire(ns, docA, "another-session")
+            } finally {
+                server.documentLocks.releaseAll("another-session")
+                server.documentLocks.releaseAll("other-session")
+                server.documentLocks.releaseAll(sessionId)
+            }
+        }
+
+    @Test
     fun snapshotReadUnaffectedWhileLockHeld() =
         runTest {
             val ns = "demo/users"

@@ -16,7 +16,7 @@ func NewBaseNotFoundError(msg string, txID codec.UUID, missing codec.Hash) *Base
 	return &BaseNotFoundError{
 		VersionNotFoundError: kdberr.NewVersionNotFoundError(msg, "", missing.Hex()),
 		TransactionID:        txID,
-		MissingHash:            missing,
+		MissingHash:          missing,
 	}
 }
 

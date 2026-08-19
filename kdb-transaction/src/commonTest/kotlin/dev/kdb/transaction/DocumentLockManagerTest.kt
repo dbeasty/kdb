@@ -76,4 +76,66 @@ class DocumentLockManagerTest {
         locks.releaseAll("sess-a")
         assertEquals(2, documentIdsIn(tx).size)
       }
+
+  @Test
+  fun acquireAllForTransactionReleasesPartialAcquisitionOnFailure() =
+      runTest {
+        val doc2 = KdbUuid.random()
+        val tx =
+            KdbTransaction(
+                id = KdbUuid.random(),
+                baseVersion =
+                    KdbHash.fromHex(
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                    ),
+                operations =
+                    listOf(
+                        KdbOp.Write(doc, """{"id":"${doc.toString()}"}"""),
+                        KdbOp.Delete(doc2),
+                    ),
+                timestamp = KdbTimestamp.now(),
+                authorNodeId = KdbUuid.random(),
+            )
+        // doc2 is already held by another session, so acquireAllForTransaction must fail...
+        locks.tryAcquire(ns, doc2, "sess-b")
+
+        assertFailsWith<DocumentLockedException> {
+          locks.acquireAllForTransaction(ns, "sess-a", tx)
+        }
+
+        // ...and must not leak the lock it newly granted on `doc` before hitting the conflict.
+        locks.tryAcquire(ns, doc, "sess-c")
+      }
+
+  @Test
+  fun acquireAllForTransactionLeavesPreexistingLocksHeldOnFailure() =
+      runTest {
+        val doc2 = KdbUuid.random()
+        val tx =
+            KdbTransaction(
+                id = KdbUuid.random(),
+                baseVersion =
+                    KdbHash.fromHex(
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                    ),
+                operations =
+                    listOf(
+                        KdbOp.Write(doc, """{"id":"${doc.toString()}"}"""),
+                        KdbOp.Delete(doc2),
+                    ),
+                timestamp = KdbTimestamp.now(),
+                authorNodeId = KdbUuid.random(),
+            )
+        // sess-a already holds `doc` from prior per-statement locking...
+        locks.tryAcquire(ns, doc, "sess-a")
+        // ...and doc2 is held by a different session, so the whole call must fail.
+        locks.tryAcquire(ns, doc2, "sess-b")
+
+        assertFailsWith<DocumentLockedException> {
+          locks.acquireAllForTransaction(ns, "sess-a", tx)
+        }
+
+        // The pre-existing lock on `doc` must survive the failed call, not be released.
+        assertFailsWith<DocumentLockedException> { locks.tryAcquire(ns, doc, "sess-c") }
+      }
 }

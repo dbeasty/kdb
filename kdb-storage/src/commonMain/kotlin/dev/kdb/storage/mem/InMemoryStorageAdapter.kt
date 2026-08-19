@@ -127,6 +127,13 @@ public class InMemoryStorageAdapter(
             built
         }
 
+    override suspend fun discardPending(namespaceId: String) {
+        mutex.withLock {
+            pendingPuts.remove(namespaceId)
+            pendingDeletes.remove(namespaceId)
+        }
+    }
+
     override suspend fun flush(namespaceId: String) {
         mutex.withLock { }
     }

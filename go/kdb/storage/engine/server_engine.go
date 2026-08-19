@@ -18,11 +18,13 @@ type ServerEngine struct {
 	config      storage.StorageEngineConfig
 	wal         wal.WriteAheadLog
 
-	mu                sync.Mutex
-	cap               storage.CapabilitySet
-	memTable          *memtable.Manager
-	docs              map[codec.UUID]document.Document
-	enlistmentStates  map[codec.UUID]storage.EnlistmentEvictionState
+	mu               sync.Mutex
+	cap              storage.CapabilitySet
+	memTable         *memtable.Manager
+	docs             map[codec.UUID]document.Document
+	pendingPuts      map[codec.UUID]document.Document
+	pendingDeletes   map[codec.UUID]struct{}
+	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 }
 
 // NewServerEngine constructs a server engine; wal may be nil for in-memory targets.
@@ -43,6 +45,8 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		cap:              cap,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
 		docs:             make(map[codec.UUID]document.Document),
+		pendingPuts:      make(map[codec.UUID]document.Document),
+		pendingDeletes:   make(map[codec.UUID]struct{}),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
 	}
 }
@@ -111,7 +115,8 @@ func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) er
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	cp := doc
-	e.docs[doc.ID] = cp
+	delete(e.pendingDeletes, doc.ID)
+	e.pendingPuts[doc.ID] = cp
 	return nil
 }
 
@@ -175,13 +180,22 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 func (e *ServerEngine) DeleteDocument(namespaceID string, docID codec.UUID) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.docs, docID)
+	delete(e.pendingPuts, docID)
+	e.pendingDeletes[docID] = struct{}{}
 	return nil
 }
 
 func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for id := range e.pendingDeletes {
+		delete(e.docs, id)
+	}
+	for id, doc := range e.pendingPuts {
+		e.docs[id] = doc
+	}
+	e.pendingPuts = make(map[codec.UUID]document.Document)
+	e.pendingDeletes = make(map[codec.UUID]struct{})
 	entries := make(map[codec.UUID]codec.Hash, len(e.docs))
 	for id, d := range e.docs {
 		h, err := d.ContentHash()
@@ -191,6 +205,14 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 		entries[id] = h
 	}
 	return document.BuildDocumentTree(entries)
+}
+
+func (e *ServerEngine) DiscardPending(namespaceID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pendingPuts = make(map[codec.UUID]document.Document)
+	e.pendingDeletes = make(map[codec.UUID]struct{})
+	return nil
 }
 
 func (e *ServerEngine) Flush(namespaceID string) error {
@@ -291,8 +313,8 @@ type defaultHandle struct {
 	deltaReader storage.DeltaSegmentReader
 }
 
-func (h *defaultHandle) NamespaceID() string                      { return h.namespaceID }
-func (h *defaultHandle) Adapter() storage.EvictableAdapter        { return h.adapter }
-func (h *defaultHandle) DeltaWriter() storage.DeltaSegmentWriter  { return h.deltaWriter }
-func (h *defaultHandle) DeltaReader() storage.DeltaSegmentReader  { return h.deltaReader }
-func (h *defaultHandle) Close() error                             { return nil }
+func (h *defaultHandle) NamespaceID() string                     { return h.namespaceID }
+func (h *defaultHandle) Adapter() storage.EvictableAdapter       { return h.adapter }
+func (h *defaultHandle) DeltaWriter() storage.DeltaSegmentWriter { return h.deltaWriter }
+func (h *defaultHandle) DeltaReader() storage.DeltaSegmentReader { return h.deltaReader }
+func (h *defaultHandle) Close() error                            { return nil }

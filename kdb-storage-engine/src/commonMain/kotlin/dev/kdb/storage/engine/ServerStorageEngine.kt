@@ -42,6 +42,8 @@ public open class ServerStorageEngine(
     private val blobStore = LsmBlobStore(config.ioShim, namespaceId, cache)
     private val memTable = MemTableManager(namespaceId, config.ioShim, blobStore)
     private val docs = mutableMapOf<KdbUuid, KdbDocument>()
+    private val pendingPuts = mutableMapOf<KdbUuid, KdbDocument>()
+    private val pendingDeletes = mutableSetOf<KdbUuid>()
     private val enlistmentStates = mutableMapOf<KdbUuid, EnlistmentEvictionState>()
 
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {
@@ -85,7 +87,10 @@ public open class ServerStorageEngine(
     }
 
     override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
-        mutex.withLock { docs[document.id] = document }
+        mutex.withLock {
+            pendingDeletes.remove(document.id)
+            pendingPuts[document.id] = document
+        }
     }
 
     override suspend fun getDocument(
@@ -120,12 +125,29 @@ public open class ServerStorageEngine(
     }
 
     override suspend fun deleteDocument(namespaceId: String, docId: KdbUuid) {
-        mutex.withLock { docs.remove(docId) }
+        mutex.withLock {
+            pendingPuts.remove(docId)
+            pendingDeletes.add(docId)
+        }
     }
 
     override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
-        val entries = mutex.withLock { docs.mapValues { (_, d) -> d.contentHash } }
+        val entries =
+            mutex.withLock {
+                for (id in pendingDeletes) docs.remove(id)
+                for ((id, doc) in pendingPuts) docs[id] = doc
+                pendingPuts.clear()
+                pendingDeletes.clear()
+                docs.mapValues { (_, d) -> d.contentHash }
+            }
         return DocumentTree.build(entries)
+    }
+
+    override suspend fun discardPending(namespaceId: String) {
+        mutex.withLock {
+            pendingPuts.clear()
+            pendingDeletes.clear()
+        }
     }
 
     override suspend fun flush(namespaceId: String) {

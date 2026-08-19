@@ -7,6 +7,7 @@ import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.storage.StorageAdapter
 import dev.kdb.storage.mem.InMemoryStorageAdapter
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -87,6 +88,34 @@ class TransactionEngineTest {
             assertEquals(first.commit.hash, second.commit.hash)
         }
 
+    @Test
+    fun commit_writeFailsMidTransaction_abortsAndRollsBackWithoutPartialWrites() =
+        runTest {
+            val ns = "app/abort"
+            val dag = inMemoryCommitDag(ns)
+            val inner = InMemoryStorageAdapter()
+            val docA = KdbDocument(KdbUuid.random(), """{"v":"a"}""")
+            val docB = KdbDocument(KdbUuid.random(), """{"v":"b"}""")
+            val storage = FailingStorageAdapter(inner, failOnPutDocId = docB.id)
+            val base = dag.head()
+            val tx = tx(base, KdbOp.Write(docA.id, docA.json), KdbOp.Write(docB.id, docB.json))
+
+            val result = engine.commit(tx, dag, storage)
+            assertIs<TransactionResult.Aborted>(result)
+
+            // Nothing was committed: the head is unchanged and neither doc is visible.
+            assertEquals(base, dag.head())
+            assertEquals(null, storage.getDocument(ns, docA.id, base))
+            assertEquals(null, storage.getDocument(ns, docB.id, base))
+
+            // A retried transaction (this time without the injected failure) succeeds cleanly,
+            // proving the aborted attempt didn't leave corrupted/leaked pending state behind.
+            val retryTx = tx(base, KdbOp.Write(docA.id, docA.json), KdbOp.Write(docB.id, docB.json))
+            val retried = engine.commit(retryTx, dag, inner)
+            assertIs<TransactionResult.Success>(retried)
+            assertEquals(2, retried.commit.operations.size)
+        }
+
     private fun tx(
         base: KdbHash,
         vararg ops: KdbOp,
@@ -98,4 +127,20 @@ class TransactionEngineTest {
             timestamp = KdbTimestamp.now(),
             authorNodeId = KdbUuid.random(),
         )
+
+    /** Delegates to [inner] but throws when [failOnPutDocId] is written, to exercise rollback. */
+    private class FailingStorageAdapter(
+        private val inner: StorageAdapter,
+        private val failOnPutDocId: KdbUuid,
+    ) : StorageAdapter by inner {
+        override suspend fun putDocument(
+            namespaceId: String,
+            document: KdbDocument,
+        ) {
+            if (document.id == failOnPutDocId) {
+                throw IllegalStateException("simulated storage failure on $failOnPutDocId")
+            }
+            inner.putDocument(namespaceId, document)
+        }
+    }
 }

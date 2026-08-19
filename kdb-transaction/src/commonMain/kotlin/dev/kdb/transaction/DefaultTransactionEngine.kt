@@ -119,6 +119,7 @@ internal class DefaultTransactionEngine(
                 is TransactionResult.Success -> head = res.commit.hash
                 is TransactionResult.Conflict -> return res
                 is TransactionResult.SchemaError -> return res
+                is TransactionResult.Aborted -> return res
             }
         }
 
@@ -256,14 +257,19 @@ internal class DefaultTransactionEngine(
             }
         }
 
-        for ((idx, op) in transaction.operations.withIndex()) {
-            when (op) {
-                is KdbOp.Write ->
-                    writes[idx]?.let { storage.putDocument(dag.namespaceId, it) }
+        try {
+            for ((idx, op) in transaction.operations.withIndex()) {
+                when (op) {
+                    is KdbOp.Write ->
+                        writes[idx]?.let { storage.putDocument(dag.namespaceId, it) }
 
-                is KdbOp.Delete -> storage.deleteDocument(dag.namespaceId, op.docId)
-                else -> Unit
+                    is KdbOp.Delete -> storage.deleteDocument(dag.namespaceId, op.docId)
+                    else -> Unit
+                }
             }
+        } catch (t: Throwable) {
+            storage.discardPending(dag.namespaceId)
+            return TransactionResult.Aborted(t)
         }
 
         val newTree =

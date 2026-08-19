@@ -18,6 +18,12 @@ type Adapter interface {
 	DeleteDocument(namespaceID string, docID codec.UUID) error
 
 	CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error)
+
+	// DiscardPending drops any PutDocument/DeleteDocument calls made since the last
+	// CommitTree for this namespace, restoring the last-committed visible state. Used to
+	// roll back a transaction whose write phase failed partway through.
+	DiscardPending(namespaceID string) error
+
 	Flush(namespaceID string) error
 
 	ReadBlob(contentHash codec.Hash) ([]byte, error)
