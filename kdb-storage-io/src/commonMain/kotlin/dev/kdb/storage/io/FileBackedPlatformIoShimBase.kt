@@ -54,14 +54,24 @@ public abstract class FileBackedPlatformIoShimBase(
         }
     }
 
+    // Deliberately does NOT take mutexFor(segmentName): that mutex also
+    // guards appendToSegment, and group commit relies on new appends
+    // being able to proceed (and register with the GroupCommitter)
+    // *while* a physical fsync is in flight. Sharing the lock here would
+    // serialize every writer behind each fsync's full duration, silently
+    // defeating batching - this was found by benchmarking (see Phase 1
+    // notes in docs/benchmarks/phase0-baseline.md): with a slow physical
+    // fsync (JVM's FileChannel.force on macOS), throughput collapsed to
+    // one write per fsync round-trip until this lock was removed here.
+    // Safe because SegmentByteStore implementations must tolerate
+    // force()/flush() running concurrently with writes to the same
+    // segment (true of java.nio.FileChannel and Go's os.File).
     override suspend fun flushSegment(segmentName: String) {
         validateSegmentName(segmentName)
-        mutexFor(segmentName).withLock {
-            try {
-                store.flush(segmentName, config.fsyncOnFlush)
-            } catch (e: Exception) {
-                throw PlatformIoException("flush failed: ${e.message}", segmentName, e)
-            }
+        try {
+            store.flush(segmentName, config.fsyncOnFlush)
+        } catch (e: Exception) {
+            throw PlatformIoException("flush failed: ${e.message}", segmentName, e)
         }
     }
 

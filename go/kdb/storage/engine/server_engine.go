@@ -19,12 +19,21 @@ type ServerEngine struct {
 	namespaceID string
 	config      storage.StorageEngineConfig
 	wal         wal.WriteAheadLog
+	groupCommit *wal.GroupCommitter
 
-	mu                sync.Mutex
+	// docsMu guards the document map only. It is intentionally separate
+	// from the blob write path (WriteBlob): WAL.Append and memTable.Put
+	// are each independently thread-safe, so blob writes never take a
+	// namespace-wide lock at all - see WriteBlob and Phase 1/2 of
+	// docs/benchmarks/phase0-baseline.md for why that mattered.
+	docsMu            sync.Mutex
 	cap               storage.CapabilitySet
 	memTable          *memtable.Manager
 	docs              map[codec.UUID]document.Document
 	enlistmentStates  map[codec.UUID]storage.EnlistmentEvictionState
+
+	asyncStop chan struct{}
+	asyncDone chan struct{}
 }
 
 // NewServerEngine constructs a server engine; wal may be nil for in-memory targets.
@@ -38,42 +47,97 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		SupportsDirectDeltaIngest: false,
 		IndexRetentionDefault:     storage.IndexRetentionEvictable,
 	}
-	return &ServerEngine{
+	e := &ServerEngine{
 		namespaceID:      namespaceID,
 		config:           config,
 		wal:              w,
+		groupCommit:      wal.NewGroupCommitter(),
 		cap:              cap,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
 		docs:             make(map[codec.UUID]document.Document),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
 	}
+	if w != nil && config.Durability == storage.DurabilityAsync {
+		e.startAsyncSync()
+	}
+	return e
+}
+
+func (e *ServerEngine) startAsyncSync() {
+	interval := time.Duration(e.config.AsyncSyncIntervalMillis) * time.Millisecond
+	if interval <= 0 {
+		interval = 5 * time.Millisecond
+	}
+	e.asyncStop = make(chan struct{})
+	e.asyncDone = make(chan struct{})
+	go func() {
+		defer close(e.asyncDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_ = e.wal.Sync()
+			case <-e.asyncStop:
+				_ = e.wal.Sync() // final flush on shutdown
+				return
+			}
+		}
+	}()
+}
+
+// Close stops the background async-sync ticker, if one is running. Safe
+// to call on engines without one (no-op).
+func (e *ServerEngine) Close() error {
+	if e.asyncStop == nil {
+		return nil
+	}
+	close(e.asyncStop)
+	<-e.asyncDone
+	return nil
 }
 
 func (e *ServerEngine) NamespaceID() string { return e.namespaceID }
 
 func (e *ServerEngine) Capabilities() storage.CapabilitySet { return e.cap }
 
+// WriteBlob is on the hot path for the 1M writes/sec target, so it
+// deliberately takes no namespace-wide lock. WAL.Append and memTable.Put
+// are each independently thread-safe (their own internal mutexes), and
+// durability is provided by GroupCommitter, which coalesces concurrent
+// fsync requests into as few physical syncs as possible instead of
+// serializing writers behind one lock held across the fsync call. See
+// docs/benchmarks/phase0-baseline.md for the before/after measurements
+// that motivated this.
 func (e *ServerEngine) WriteBlob(bytes []byte) (codec.Hash, error) {
 	sum := document.SHA256Digest(bytes)
 	hash, err := codec.HashFromBytes(sum)
 	if err != nil {
 		return codec.Hash{}, err
 	}
-	lockWaitStart := time.Now()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	metrics.Default.Record(metrics.StageLockWait, time.Since(lockWaitStart))
 	if e.wal != nil {
-		if _, err := e.wal.Append(wal.Record{
+		result, err := e.wal.Append(wal.Record{
 			Timestamp: codec.TimestampNow(),
 			Kind:      wal.RecordKindPutBlob,
 			Payload:   wal.EncodePutBlob(wal.PutBlob{ContentHash: hash, Bytes: bytes}),
-		}); err != nil {
+		})
+		if err != nil {
 			return codec.Hash{}, err
 		}
-		fsyncStart := time.Now()
-		_ = e.wal.Sync()
-		metrics.Default.Record(metrics.StageFsyncWait, time.Since(fsyncStart))
+		switch e.config.Durability {
+		case storage.DurabilitySync:
+			fsyncStart := time.Now()
+			if err := e.groupCommit.SyncTo(result.Sequence, e.wal.Sync); err != nil {
+				return codec.Hash{}, err
+			}
+			metrics.Default.Record(metrics.StageFsyncWait, time.Since(fsyncStart))
+		case storage.DurabilityAsync:
+			// Acknowledged once appended; a background ticker (started in
+			// NewServerEngine) syncs periodically instead of per-write. A
+			// crash can lose up to one sync interval of writes.
+		case storage.DurabilityMemoryOnly:
+			// Never synced by this engine; caller owns any checkpointing.
+		}
 	}
 	e.memTable.Put(hash, bytes)
 	return hash, nil
@@ -105,25 +169,25 @@ func (e *ServerEngine) RecoverBlobsFromWal() error {
 			return err
 		}
 		bytes := append([]byte(nil), payload[32:]...)
-		e.mu.Lock()
+		e.docsMu.Lock()
 		e.memTable.Put(h, bytes)
-		e.mu.Unlock()
+		e.docsMu.Unlock()
 		return nil
 	})
 	return err
 }
 
 func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.docsMu.Lock()
+	defer e.docsMu.Unlock()
 	cp := doc
 	e.docs[doc.ID] = cp
 	return nil
 }
 
 func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.docsMu.Lock()
+	defer e.docsMu.Unlock()
 	d, ok := e.docs[docID]
 	if !ok {
 		return nil, nil
@@ -160,12 +224,12 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	if batchSize <= 0 {
 		batchSize = 256
 	}
-	e.mu.Lock()
+	e.docsMu.Lock()
 	vals := make([]document.Document, 0, len(e.docs))
 	for _, d := range e.docs {
 		vals = append(vals, d)
 	}
-	e.mu.Unlock()
+	e.docsMu.Unlock()
 	for i := 0; i < len(vals); i += batchSize {
 		end := i + batchSize
 		if end > len(vals) {
@@ -179,15 +243,15 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 }
 
 func (e *ServerEngine) DeleteDocument(namespaceID string, docID codec.UUID) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.docsMu.Lock()
+	defer e.docsMu.Unlock()
 	delete(e.docs, docID)
 	return nil
 }
 
 func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.docsMu.Lock()
+	defer e.docsMu.Unlock()
 	entries := make(map[codec.UUID]codec.Hash, len(e.docs))
 	for id, d := range e.docs {
 		h, err := d.ContentHash()
@@ -200,8 +264,8 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 }
 
 func (e *ServerEngine) Flush(namespaceID string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.docsMu.Lock()
+	defer e.docsMu.Unlock()
 	_, err := e.memTable.Flush(0)
 	if err != nil {
 		return err
@@ -301,4 +365,9 @@ func (h *defaultHandle) NamespaceID() string                      { return h.nam
 func (h *defaultHandle) Adapter() storage.EvictableAdapter        { return h.adapter }
 func (h *defaultHandle) DeltaWriter() storage.DeltaSegmentWriter  { return h.deltaWriter }
 func (h *defaultHandle) DeltaReader() storage.DeltaSegmentReader  { return h.deltaReader }
-func (h *defaultHandle) Close() error                             { return nil }
+func (h *defaultHandle) Close() error {
+	if closer, ok := h.adapter.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}

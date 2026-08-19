@@ -6,43 +6,88 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // OSByteStore is a filesystem-backed SegmentByteStore rooted at PlatformIOConfig.RootDirectory.
 // Segment names are validated upstream (must start with "ns/").
+//
+// Append keeps one *os.File open per segment instead of reopening on
+// every call: the original implementation did open+write+fstat+close per
+// append, which meant every WriteBlob paid for 4 syscalls plus directory
+// lookup regardless of any in-process locking work done above it. That
+// was found to be the dominant cost once the engine-wide mutex was
+// removed from ServerEngine.WriteBlob - see docs/benchmarks/phase0-baseline.md
+// Phase 1. Callers (FileBackedPlatformIO) already serialize Append calls
+// per segment, so the handle cache itself only needs to guard the map,
+// not each write.
 type OSByteStore struct {
 	root string
+
+	mu      sync.Mutex
+	handles map[string]*openSegment
+}
+
+type openSegment struct {
+	file *os.File
+	size int64 // atomic
 }
 
 func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 	if config.RootDirectory == nil || *config.RootDirectory == "" {
 		return nil, fmt.Errorf("os byte store requires root directory")
 	}
-	return &OSByteStore{root: *config.RootDirectory}, nil
+	return &OSByteStore{root: *config.RootDirectory, handles: make(map[string]*openSegment)}, nil
 }
 
 func (s *OSByteStore) pathFor(segmentName string) string {
 	return filepath.Join(s.root, filepath.FromSlash(segmentName))
 }
 
-func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
+func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
+	s.mu.Lock()
+	seg, ok := s.handles[segmentName]
+	s.mu.Unlock()
+	if ok {
+		return seg, nil
+	}
+
 	p := s.pathFor(segmentName)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return 0, err
+		return nil, err
 	}
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	if _, err := f.Write(bytes); err != nil {
-		return 0, err
+		return nil, err
 	}
 	info, err := f.Stat()
 	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	s.mu.Lock()
+	if existing, raced := s.handles[segmentName]; raced {
+		s.mu.Unlock()
+		_ = f.Close()
+		return existing, nil
+	}
+	seg = &openSegment{file: f, size: info.Size()}
+	s.handles[segmentName] = seg
+	s.mu.Unlock()
+	return seg, nil
+}
+
+func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
+	seg, err := s.openFor(segmentName)
+	if err != nil {
 		return 0, err
 	}
-	return info.Size(), nil
+	if _, err := seg.file.Write(bytes); err != nil {
+		return 0, err
+	}
+	return atomic.AddInt64(&seg.size, int64(len(bytes))), nil
 }
 
 func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte, error) {
@@ -78,6 +123,14 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 	if !fsync {
 		return nil
 	}
+	s.mu.Lock()
+	seg, ok := s.handles[segmentName]
+	s.mu.Unlock()
+	if ok {
+		return seg.file.Sync()
+	}
+	// No open handle yet (e.g. Flush called before any Append in this
+	// process): fall back to a one-off open, matching prior behavior.
 	p := s.pathFor(segmentName)
 	f, err := os.OpenFile(p, os.O_RDONLY, 0o644)
 	if err != nil {
@@ -88,6 +141,21 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 	}
 	defer f.Close()
 	return f.Sync()
+}
+
+// Close releases all cached file handles. Safe to call multiple times.
+func (s *OSByteStore) Close() error {
+	s.mu.Lock()
+	handles := s.handles
+	s.handles = make(map[string]*openSegment)
+	s.mu.Unlock()
+	var firstErr error
+	for _, seg := range handles {
+		if err := seg.file.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *OSByteStore) MarkSealed(segmentName string) error {
@@ -123,6 +191,15 @@ func (s *OSByteStore) List(prefix string) ([]string, error) {
 }
 
 func (s *OSByteStore) Delete(segmentName string) error {
+	s.mu.Lock()
+	seg, ok := s.handles[segmentName]
+	if ok {
+		delete(s.handles, segmentName)
+	}
+	s.mu.Unlock()
+	if ok {
+		_ = seg.file.Close()
+	}
 	p := s.pathFor(segmentName)
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err

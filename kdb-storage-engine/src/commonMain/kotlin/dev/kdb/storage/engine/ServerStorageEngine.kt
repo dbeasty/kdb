@@ -15,6 +15,7 @@ import dev.kdb.storage.memtable.MemTableManager
 import dev.kdb.storage.sstable.BlockCache
 import dev.kdb.storage.sstable.LsmBlobStore
 import dev.kdb.storage.wal.DefaultWriteAheadLogFactory
+import dev.kdb.storage.wal.GroupCommitter
 import dev.kdb.storage.wal.WalPutBlob
 import dev.kdb.storage.wal.WalRecord
 import dev.kdb.storage.wal.WalRecordKind
@@ -38,7 +39,13 @@ public open class ServerStorageEngine(
             indexRetentionDefault = IndexRetention.EVICTABLE,
         )
 
-    private val mutex = Mutex()
+    // docsMu guards the document map only. It is intentionally separate
+    // from writeBlob: WriteAheadLog.append and MemTableManager.put are
+    // each independently thread-safe (their own internal Mutex), so blob
+    // writes never take a namespace-wide lock at all - mirrors the Go
+    // ServerEngine change; see docs/benchmarks/phase0-baseline.md Phase 1.
+    private val docsMu = Mutex()
+    private val groupCommit = GroupCommitter()
     private val cache = BlockCache(config.globalMemoryBudgetBytes / 4)
     private val blobStore = LsmBlobStore(config.ioShim, namespaceId, cache)
     private val memTable = MemTableManager(namespaceId, config.ioShim, blobStore)
@@ -47,22 +54,22 @@ public open class ServerStorageEngine(
 
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {
         val hash = KdbHash.fromBytes(kdbSha256(bytes))
-        val lockWaitStart = TimeSource.Monotonic.markNow()
-        mutex.withLock {
-            StageRecorder.Default.record(StorageStage.LOCK_WAIT, lockWaitStart.elapsedNow())
-            wal?.append(
-                WalRecord(
-                    0,
-                    KdbTimestamp.now(),
-                    WalRecordKind.PutBlob,
-                    WalPutBlob(hash, bytes).encode(),
-                ),
-            )
+        val w = wal
+        if (w != null) {
+            val result =
+                w.append(
+                    WalRecord(
+                        0,
+                        KdbTimestamp.now(),
+                        WalRecordKind.PutBlob,
+                        WalPutBlob(hash, bytes).encode(),
+                    ),
+                )
             val fsyncStart = TimeSource.Monotonic.markNow()
-            wal?.sync()
+            groupCommit.syncTo(result.sequence) { w.sync() }
             StageRecorder.Default.record(StorageStage.FSYNC_WAIT, fsyncStart.elapsedNow())
-            memTable.put(hash, bytes)
         }
+        memTable.put(hash, bytes)
         return hash
     }
 
@@ -77,21 +84,21 @@ public open class ServerStorageEngine(
             if (payload.size < 32) return@recover
             val hash = KdbHash.fromBytes(payload.copyOfRange(0, 32))
             val bytes = payload.copyOfRange(32, payload.size)
-            mutex.withLock {
+            docsMu.withLock {
                 memTable.put(hash, bytes)
             }
         }
     }
 
     override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
-        mutex.withLock { docs[document.id] = document }
+        docsMu.withLock { docs[document.id] = document }
     }
 
     override suspend fun getDocument(
         namespaceId: String,
         docId: KdbUuid,
         atCommit: KdbHash,
-    ): KdbDocument? = mutex.withLock { docs[docId] }
+    ): KdbDocument? = docsMu.withLock { docs[docId] }
 
     override suspend fun getDocumentOrThrow(
         namespaceId: String,
@@ -113,18 +120,18 @@ public open class ServerStorageEngine(
         batchSize: Int,
         onBatch: suspend (List<KdbDocument>) -> Unit,
     ) {
-        mutex.withLock {
+        docsMu.withLock {
             docs.values.chunked(batchSize).forEach { onBatch(it) }
         }
     }
 
     override suspend fun deleteDocument(namespaceId: String, docId: KdbUuid) {
-        mutex.withLock { docs.remove(docId) }
+        docsMu.withLock { docs.remove(docId) }
     }
 
     override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
         val lockWaitStart = TimeSource.Monotonic.markNow()
-        val entries = mutex.withLock {
+        val entries = docsMu.withLock {
             StageRecorder.Default.record(StorageStage.LOCK_WAIT, lockWaitStart.elapsedNow())
             docs.mapValues { (_, d) -> d.contentHash }
         }
@@ -135,7 +142,7 @@ public open class ServerStorageEngine(
     }
 
     override suspend fun flush(namespaceId: String) {
-        mutex.withLock {
+        docsMu.withLock {
             memTable.flush()
             wal?.sync()
         }

@@ -87,13 +87,20 @@ func (f *FileBackedPlatformIO) ReadFromSegment(segmentName string, offset int64,
 	return b, nil
 }
 
+// FlushSegment deliberately does NOT take mutexFor(segmentName): that
+// mutex also guards AppendToSegment, and group commit relies on new
+// appends being able to proceed (and register with the GroupCommitter)
+// *while* a physical fsync is in flight. Sharing the lock here would
+// serialize every writer behind each fsync's full duration, silently
+// defeating batching - found by benchmarking the Kotlin side, where a
+// slower physical fsync exposed it clearly (see Phase 1 notes in
+// docs/benchmarks/phase0-baseline.md). Safe because SegmentByteStore
+// implementations must tolerate Flush running concurrently with writes
+// to the same segment (true of os.File.Sync and Go's O_APPEND writes).
 func (f *FileBackedPlatformIO) FlushSegment(segmentName string) error {
 	if err := ValidateSegmentName(segmentName); err != nil {
 		return err
 	}
-	mu := f.mutexFor(segmentName)
-	mu.Lock()
-	defer mu.Unlock()
 	if err := f.store.Flush(segmentName, f.config.FsyncOnFlush); err != nil {
 		return &PlatformIOError{Message: "flush failed: " + err.Error(), SegmentName: segmentName, Cause: err}
 	}
