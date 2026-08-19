@@ -205,6 +205,71 @@ class GraalProcedureRuntimeTest {
         }
     }
 
+    private val bulkInsertSource =
+        """
+        function main(args) {
+          let inserted = 0;
+          for (let i = 0; i < args.count; i++) {
+            kdb.put({ seq: i });
+            inserted++;
+          }
+          return { inserted: inserted };
+        }
+        """.trimIndent()
+
+    @Test
+    fun loopOfInserts_thenCount_allCommitAtomicallyInOneTransaction() {
+        runBlocking {
+            val h = harness(allowedKinds = setOf("read", "write", "proc"))
+            h.registry.put(ProcedureDefinition(namespaceId = ns, name = "bulkInsert", source = bulkInsertSource))
+            val headBefore = h.dag.head()
+
+            val result =
+                h.runtime.invoke(
+                    Principal(id = "writer", roles = setOf("writer")),
+                    ns,
+                    "bulkInsert",
+                    """{"count":25}""",
+                )
+
+            // The script's own running total, from inside the (still-uncommitted) loop.
+            assertTrue(result.value.contains("\"inserted\":25"))
+
+            // Nothing is visible to a fresh read until the script returns and the whole batch
+            // commits as a single transaction (spec §6) - so the real count check happens here,
+            // against the engine, after invoke() has returned.
+            val after =
+                h.hybrid.execute(
+                    "SELECT _doc FROM $ns",
+                    HybridQueryRequest(namespaceId = ns, schema = KdbSchema.NONE),
+                )
+            assertEquals(25, after.result.rows.size)
+
+            // One transaction, not 25: exactly one new commit past the base version.
+            assertEquals(headBefore, h.dag.getCommitOrThrow(h.dag.head()).parentHashes.single())
+        }
+    }
+
+    @Test
+    fun loopOfInserts_zeroCount_staysNoOpAndCommitsNothing() {
+        runBlocking {
+            val h = harness(allowedKinds = setOf("read", "write", "proc"))
+            h.registry.put(ProcedureDefinition(namespaceId = ns, name = "bulkInsert", source = bulkInsertSource))
+            val headBefore = h.dag.head()
+
+            val result =
+                h.runtime.invoke(
+                    Principal(id = "writer", roles = setOf("writer")),
+                    ns,
+                    "bulkInsert",
+                    """{"count":0}""",
+                )
+
+            assertTrue(result.value.contains("\"inserted\":0"))
+            assertEquals(headBefore, h.dag.head())
+        }
+    }
+
     @Test
     fun infiniteLoop_isInterruptedByWallClockTimeout() {
         runBlocking {
