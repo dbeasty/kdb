@@ -24,6 +24,16 @@ kotlin {
         val macosArm64Main by getting {
             dependsOn(nativeMain)
         }
+        val commonTest by getting
+        val nativeTest by creating {
+            dependsOn(commonTest)
+        }
+        val linuxX64Test by getting {
+            dependsOn(nativeTest)
+        }
+        val macosArm64Test by getting {
+            dependsOn(nativeTest)
+        }
 
         commonMain.dependencies {
             implementation(project(":kdb-codec"))
