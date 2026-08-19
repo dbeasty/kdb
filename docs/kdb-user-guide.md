@@ -24,6 +24,7 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
 | **File attachments** (`file put` / `get` / `meta`, ZIP, bundles, `fileId` GUID) | Implemented — see [file attachments spec](kdb-spec-layer1-component3b-file-attachments.md) |
+| **Stored procedures** (`:kdb-script`, sandboxed JS) | Library-level API implemented and tested (registry, GraalVM sandbox, per-call authorized `kdb` host API); no wire protocol frame or CLI subcommand yet — see [Component 32 spec](kdb-spec-layer11-component32-stored-procedures.md) |
 
 ---
 
@@ -556,6 +557,52 @@ APIs: `head()`, `getBaseVersion()`, `setBaseVersion(hex)`, `acceptRemote(remoteH
 
 ---
 
+## Stored procedures (`:kdb-script`)
+
+> **Status: library-level API today.** The pieces below (`ProcedureRegistry`, `GraalProcedureRuntime`) work end-to-end and are unit-tested against the real engines, but there is no wire protocol frame or CLI subcommand yet — you drive them from Kotlin, on the JVM backend, in the same process as the rest of the engine. See [Component 32 spec](kdb-spec-layer11-component32-stored-procedures.md) for the full design and what's left (§9 Implementation phases, §11 Implementation status).
+
+Stored procedures are restricted-JavaScript functions that run **inside the backend process**, next to storage, instead of round-tripping documents to a client for simple read-modify-write logic. They are sandboxed (no filesystem, network, process, or Java-class access) and every data access they make is re-authorized against the *calling* principal's own permissions — a procedure never runs with elevated "owner" rights, so being allowed to invoke one never implies being allowed to do what it attempts.
+
+**Define a procedure** — source is a JS function named `main(args)`; `args` and a `kdb` object (`get`/`put`/`delete`/`query`/`log`/`callProc`) are the only globals available:
+
+```kotlin
+val registry = procedureRegistry(storage) // or inMemoryProcedureRegistry() for tests
+registry.put(
+    ProcedureDefinition(
+        namespaceId = "orders",
+        name = "shipOrder",
+        source = """
+            function main(args) {
+              const doc = kdb.get(args.id);
+              if (!doc) throw new Error("order " + args.id + " not found");
+              kdb.put(Object.assign({}, doc, { status: "shipped" }));
+              kdb.log("shipped " + args.id);
+              return { ok: true, id: args.id };
+            }
+        """.trimIndent(),
+    ),
+)
+```
+
+**Run one:**
+
+```kotlin
+val runtime = graalProcedureRuntime(registry, hybrid, dag, storage, schema, txEngine, indexManager, authorizer)
+val result = runtime.invoke(principal, "orders", "shipOrder", """{"id":"$docId"}""")
+// result.value  -> JSON string returned by main()
+// result.logs   -> lines from kdb.log(), capped by ProcLimits.maxLogBytes
+```
+
+All `kdb.put`/`kdb.delete` calls made during one invocation are staged and commit together as a single transaction when `main()` returns — a loop of inserts lands as one commit, not one per insert (see `GraalProcedureRuntimeTest.loopOfInserts_thenCount_allCommitAtomicallyInOneTransaction`). Because reads inside a procedure see the last *committed* head, a script can't `kdb.query` its own in-flight writes from the same invocation — count them from outside after `invoke()` returns, or have the script return its own running total.
+
+Tune sandbox limits per call with `ProcLimits(wallClockMillis, maxHostCalls, maxLogBytes, maxStatements)` — a runaway `while(true){}` is force-interrupted at `wallClockMillis` regardless of what it's doing (`ProcException.Timeout`), not just cooperatively cancelled.
+
+```bash
+./gradlew :kdb-script:test
+```
+
+---
+
 ## Data layout (for inspect CLI)
 
 File-backed storage on the JVM typically uses:
@@ -611,6 +658,7 @@ One-shot CLI commands reopen the file runtime on every invocation; compare `cliP
 | Product CLI spec | [kdb-spec-layer10-component29-cli.md](kdb-spec-layer10-component29-cli.md) |
 | Inspect tooling spec | [kdb-spec-layer10-component31-inspect-tooling.md](kdb-spec-layer10-component31-inspect-tooling.md) |
 | Stream / browser modes | [kdb-spec-layer7-component22-stream-mode.md](kdb-spec-layer7-component22-stream-mode.md) |
+| Stored procedures | [kdb-spec-layer11-component32-stored-procedures.md](kdb-spec-layer11-component32-stored-procedures.md) |
 
 ---
 
@@ -625,6 +673,7 @@ One-shot CLI commands reopen the file runtime on every invocation; compare `cliP
 ./gradlew :kdb-service:runService --args="--memory --listen-ws kdb-ws://127.0.0.1:7443/kdb?bind=true"
 ./gradlew :kdb-benchmark:jmh
 ./gradlew :kdb-inspect:inspectCli --args="dump-wire --file /path/to/frame.bin"
+./gradlew :kdb-script:test
 ```
 
 ```java
