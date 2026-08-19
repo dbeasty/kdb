@@ -145,6 +145,8 @@ class SqlPhase4Test {
                     error("transaction conflict: ${result.report.conflicts.size} operation(s)")
                 is TransactionResult.SchemaError ->
                     error("schema rejection: ${result.violations.size} violation(s)")
+                is TransactionResult.Aborted ->
+                    error("transaction aborted: ${result.cause.message ?: result.cause.toString()}")
             }
             return dml
         }

@@ -7,11 +7,13 @@ import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.storage.StorageAdapter
 import dev.kdb.storage.mem.InMemoryStorageAdapter
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TransactionEngineTest {
@@ -87,6 +89,36 @@ class TransactionEngineTest {
             assertEquals(first.commit.hash, second.commit.hash)
         }
 
+    @Test
+    fun commit_writeFailsMidTransaction_abortsAndRollsBackWithoutPartialWrites() =
+        runTest {
+            val ns = "app/rollback"
+            val dag = inMemoryCommitDag(ns)
+            val delegate = InMemoryStorageAdapter()
+            val failOnDoc = KdbUuid.random()
+            val storage = FailingStorageAdapter(delegate, failOnDoc)
+            val base = dag.head()
+            val okDoc = KdbDocument(KdbUuid.random(), """{"v":"ok"}""")
+            val tx =
+                tx(
+                    base,
+                    KdbOp.Write(okDoc.id, okDoc.json),
+                    KdbOp.Write(failOnDoc, """{"v":"boom"}"""),
+                )
+            val result = engine.commit(tx, dag, storage)
+            assertIs<TransactionResult.Aborted>(result)
+
+            // Neither the doc written before the failing one, nor any tree
+            // mutation, should be visible: the write phase is all-or-nothing.
+            assertNull(delegate.getDocument(ns, okDoc.id, base))
+            assertNull(delegate.getDocument(ns, failOnDoc, base))
+            assertEquals(1, storage.discardPendingCalls)
+
+            // The namespace is still usable for a subsequent, successful transaction.
+            val retry = tx(base, KdbOp.Write(okDoc.id, okDoc.json))
+            assertIs<TransactionResult.Success>(engine.commit(retry, dag, storage))
+        }
+
     private fun tx(
         base: KdbHash,
         vararg ops: KdbOp,
@@ -98,4 +130,25 @@ class TransactionEngineTest {
             timestamp = KdbTimestamp.now(),
             authorNodeId = KdbUuid.random(),
         )
+}
+
+/** Delegates to [delegate] but throws on putDocument for [failOnDocId], to exercise write-phase rollback. */
+private class FailingStorageAdapter(
+    private val delegate: StorageAdapter,
+    private val failOnDocId: KdbUuid,
+) : StorageAdapter by delegate {
+    var discardPendingCalls: Int = 0
+        private set
+
+    override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
+        if (document.id == failOnDocId) {
+            throw RuntimeException("injected write failure")
+        }
+        delegate.putDocument(namespaceId, document)
+    }
+
+    override suspend fun discardPending(namespaceId: String) {
+        discardPendingCalls++
+        delegate.discardPending(namespaceId)
+    }
 }

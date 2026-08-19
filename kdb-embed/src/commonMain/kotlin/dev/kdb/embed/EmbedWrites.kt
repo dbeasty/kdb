@@ -7,6 +7,7 @@ import dev.kdb.error.ConflictException
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
 import dev.kdb.transaction.DocumentLockManager
+import dev.kdb.transaction.TransactionAbortedException
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
 import dev.kdb.transaction.transactionEngine
@@ -49,6 +50,11 @@ public suspend fun commitViaEngine(
         is TransactionResult.SchemaError ->
             throw IllegalArgumentException(
                 "schema rejection: ${result.violations.size} violation(s)",
+            )
+        is TransactionResult.Aborted ->
+            throw TransactionAbortedException(
+                "transaction aborted: ${result.cause.message ?: result.cause.toString()}",
+                result.cause,
             )
         }
     } finally {

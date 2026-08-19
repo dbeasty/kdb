@@ -36,6 +36,11 @@ public sealed class TransactionResult {
     data class SchemaError(
         val violations: List<OperationViolation>,
     ) : TransactionResult()
+
+    /** The write phase failed after validation passed; any staged storage writes were rolled back. */
+    data class Aborted(
+        val cause: Throwable,
+    ) : TransactionResult()
 }
 
 public data class OperationConflict(
