@@ -71,13 +71,46 @@ public class DocumentLockManager {
         }
     }
 
+    /**
+     * Locks every document referenced by [transaction] for [sessionId], in deterministic
+     * (sorted) order. If any document is held by another session, any locks newly granted by
+     * this call are released before the exception propagates — locks [sessionId] already held
+     * coming in (e.g. from prior per-statement acquisition) are left untouched.
+     */
     public suspend fun acquireAllForTransaction(
         namespaceId: String,
         sessionId: String,
         transaction: KdbTransaction,
     ) {
-        for (docId in documentIdsIn(transaction)) {
-            tryAcquire(namespaceId, docId, sessionId)
+        val newlyAcquired = mutableListOf<KdbUuid>()
+        try {
+            for (docId in documentIdsIn(transaction).sortedBy { it.toString() }) {
+                val key = LockKey(namespaceId, docId)
+                val grantedNow =
+                    mutex.withLock {
+                        val owner = locks[key]
+                        when {
+                            owner == null -> {
+                                locks[key] = sessionId
+                                true
+                            }
+                            owner == sessionId -> false
+                            else ->
+                                throw DocumentLockedException(
+                                    "document ${docId.toString()} is locked by session $owner",
+                                    namespaceId,
+                                    docId.toString(),
+                                    owner,
+                                )
+                        }
+                    }
+                if (grantedNow) newlyAcquired += docId
+            }
+        } catch (e: DocumentLockedException) {
+            for (docId in newlyAcquired) {
+                release(namespaceId, docId, sessionId)
+            }
+            throw e
         }
     }
 

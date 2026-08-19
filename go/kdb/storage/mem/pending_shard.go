@@ -68,3 +68,13 @@ func (p *pendingByNamespace) takeAndClear(namespaceID string) (map[codec.UUID]do
 	n.deletes = make(map[codec.UUID]struct{})
 	return puts, dels
 }
+
+// discardAll clears the namespace's pending puts/deletes without
+// applying them, restoring the last-committed visible state.
+func (p *pendingByNamespace) discardAll(namespaceID string) {
+	n := p.forNamespace(namespaceID)
+	n.mu.Lock()
+	n.puts = make(map[codec.UUID]document.Document)
+	n.deletes = make(map[codec.UUID]struct{})
+	n.mu.Unlock()
+}

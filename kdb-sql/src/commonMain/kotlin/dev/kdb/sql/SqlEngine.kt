@@ -131,6 +131,13 @@ internal class DefaultSqlEngine(
             is SqlStatement.Commit,
             is SqlStatement.Rollback,
             -> throw SqlPlanningException("transaction control must be handled by the session host", sql)
+            is SqlStatement.CreateRole,
+            is SqlStatement.DropRole,
+            is SqlStatement.Grant,
+            is SqlStatement.Revoke,
+            is SqlStatement.CreateUser,
+            is SqlStatement.DropUser,
+            -> throw SqlPlanningException("RBAC admin statements must be handled by the session host", sql)
         }
     }
 

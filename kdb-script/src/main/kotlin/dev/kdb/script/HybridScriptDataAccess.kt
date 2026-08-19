@@ -208,6 +208,11 @@ public class HybridScriptDataAccess(
                 throw ProcException.ScriptRuntimeError(
                     "schema rejection: ${result.violations.size} violation(s)",
                 )
+            is TransactionResult.Aborted ->
+                throw ProcException.ScriptRuntimeError(
+                    "stored procedure transaction aborted during write phase: ${result.cause.message}",
+                    result.cause,
+                )
         }
     }
 }

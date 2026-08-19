@@ -49,10 +49,14 @@ public open class ServerStorageEngine(
             indexRetentionDefault = IndexRetention.EVICTABLE,
         )
 
-    // docs is sharded (ShardedDocStore) rather than guarded by one
-    // namespace-wide mutex: put/get/delete for different documents now
-    // proceed in parallel as long as they land in different shards. It
-    // is intentionally separate from writeBlob: WriteAheadLog.append and
+    // docs holds committed (visible) documents, sharded (ShardedDocStore)
+    // rather than guarded by one namespace-wide mutex. putDocument/
+    // deleteDocument stage into pending instead of writing here directly:
+    // writes are not visible via getDocument until commitTree flushes
+    // them, matching the pre-existing InMemoryStorageAdapter contract and
+    // letting a failed transaction's write phase be rolled back via
+    // discardPending without ever having mutated committed state. It is
+    // intentionally separate from writeBlob: WriteAheadLog.append and
     // MemTableManager.put are each independently thread-safe, so blob
     // writes never take a lock at all - see Phase 1/2 of
     // docs/benchmarks/phase0-baseline.md.
@@ -61,17 +65,20 @@ public open class ServerStorageEngine(
     private val blobStore = LsmBlobStore(config.ioShim, namespaceId, cache)
     private val memTable = MemTableManager(namespaceId, config.ioShim, blobStore)
     private val docs = ShardedDocStore()
+    private val pending = ShardedPendingStore()
     private val enlistmentStates = mutableMapOf<KdbUuid, EnlistmentEvictionState>()
 
     // treeMu guards tree, a running DocumentTree updated incrementally
-    // (O(delta) via its persistent trie - see DocumentTreeTrie.kt) on
-    // every putDocument/deleteDocument instead of being rebuilt from a
-    // full docs snapshot in commitTree, which is what it did before this
-    // gap fix (mirrors Go's ServerEngine - see
-    // docs/benchmarks/phases-1-6-summary.md). This reintroduces a single
-    // lock on the put/delete path, but the work done under it is now
-    // O(delta) (one trie insert/delete) rather than commitTree's old
-    // O(namespace size) snapshot-and-rebuild.
+    // (O(delta) via its persistent trie - see DocumentTreeTrie.kt) as
+    // commitTree flushes staged writes, instead of being rebuilt from a
+    // full docs snapshot each time. Reintroducing staging (recovering a
+    // WIP feature - see docs/benchmarks/phases-1-6-summary.md) put
+    // putDocument/deleteDocument's visibility back behind commitTree; an
+    // earlier pass had them update docs+tree immediately, which was
+    // faster but silently dropped the "not visible until commit"
+    // guarantee transactions depend on for write-phase rollback. The
+    // O(delta) tree update from that pass is preserved; only the "when"
+    // changed.
     private val treeMu = Mutex()
     private var tree = DocumentTree.EMPTY
 
@@ -151,9 +158,9 @@ public open class ServerStorageEngine(
         }
     }
 
+    /** Stages document; it is not visible via getDocument until commitTree flushes staged writes. */
     override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
-        docs.put(document)
-        treeMu.withLock { tree = tree.with(document.id, document.contentHash) }
+        pending.put(document)
     }
 
     override suspend fun getDocument(
@@ -185,20 +192,43 @@ public open class ServerStorageEngine(
         docs.snapshot().chunked(batchSize).forEach { onBatch(it) }
     }
 
+    /** Stages a deletion; it is not applied via getDocument until commitTree flushes staged writes. */
     override suspend fun deleteDocument(namespaceId: String, docId: KdbUuid) {
-        docs.delete(docId)
-        treeMu.withLock { tree = tree.without(docId) }
+        pending.delete(docId)
     }
 
     /**
-     * Returns the running tree maintained incrementally by
-     * putDocument/deleteDocument (parentTreeHash is ignored, matching the
-     * pre-existing behavior this preserves: ServerStorageEngine has
-     * always reflected current live state rather than tracking
-     * per-branch history).
+     * Drops any putDocument/deleteDocument calls made since the last
+     * commitTree, restoring the last-committed visible state. Used to
+     * roll back a transaction whose write phase failed partway through.
      */
-    override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree =
-        treeMu.withLock { tree }
+    override suspend fun discardPending(namespaceId: String) {
+        pending.discardAll()
+    }
+
+    /**
+     * Flushes staged puts/deletes into docs (committed, sharded) and
+     * applies them to the running tree incrementally (O(delta) per
+     * changed doc via its persistent trie - DocumentTreeTrie.kt), then
+     * returns it. parentTreeHash is ignored, matching the pre-existing
+     * behavior this preserves: ServerStorageEngine has always reflected
+     * current live (now: current committed) state rather than tracking
+     * per-branch history.
+     */
+    override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
+        val (puts, deletes) = pending.takeAllAndClear()
+        return treeMu.withLock {
+            for (id in deletes) {
+                docs.delete(id)
+                tree = tree.without(id)
+            }
+            for (doc in puts) {
+                docs.put(doc)
+                tree = tree.with(doc.id, doc.contentHash)
+            }
+            tree
+        }
+    }
 
     override suspend fun flush(namespaceId: String) {
         memTable.flush()
@@ -220,7 +250,7 @@ public open class ServerStorageEngine(
     override suspend fun rebuildIndex(enlistmentId: KdbUuid, fromDocuments: StorageAdapter) {}
 
     override fun evictionState(enlistmentId: KdbUuid): EnlistmentEvictionState =
-        enlistmentStates.getOrDefault(enlistmentId, EnlistmentEvictionState.FULL)
+        enlistmentStates[enlistmentId] ?: EnlistmentEvictionState.FULL
 }
 
 private fun WalPutBlob.encode(): ByteArray = contentHash.bytes + bytes

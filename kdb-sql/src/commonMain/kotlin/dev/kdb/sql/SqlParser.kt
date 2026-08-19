@@ -24,6 +24,8 @@ internal class RecursiveDescentSqlParser : SqlParser {
             matchKeyword("CREATE") -> parseCreate()
             matchKeyword("ALTER") -> parseAlter()
             matchKeyword("DROP") -> parseDrop()
+            matchKeyword("GRANT") -> SqlStatement.Grant(parseGrantSpec("TO"))
+            matchKeyword("REVOKE") -> SqlStatement.Revoke(parseGrantSpec("FROM"))
             matchKeyword("INSERT") -> SqlStatement.Insert(parseInsert())
             matchKeyword("UPDATE") -> SqlStatement.Update(parseUpdate())
             matchKeyword("DELETE") -> SqlStatement.Delete(parseDelete())
@@ -63,8 +65,68 @@ internal class RecursiveDescentSqlParser : SqlParser {
             }
             matchKeyword("INDEX") -> SqlStatement.CreateIndex(parseCreateIndexBody())
             matchKeyword("TABLE") -> SqlStatement.CreateTable(parseCreateTableBody())
-            else -> throw parseError("expected VIRTUAL VIEW, INDEX, or TABLE")
+            matchKeyword("ROLE") -> SqlStatement.CreateRole(readIdentifier())
+            matchKeyword("USER") -> parseCreateUserBody()
+            else -> throw parseError("expected VIRTUAL VIEW, INDEX, TABLE, ROLE, or USER")
         }
+    }
+
+    private fun parseCreateUserBody(): SqlStatement {
+        val id = readIdentifier()
+        expectKeyword("WITH")
+        expectKeyword("PASSWORD")
+        val password = readStringLiteral()
+        val roles = mutableListOf<String>()
+        if (matchKeyword("ROLES")) {
+            expectChar('(')
+            do {
+                roles += readIdentifier()
+            } while (matchChar(','))
+            expectChar(')')
+        }
+        return SqlStatement.CreateUser(id, password, roles)
+    }
+
+    /** `<kind> ON DATABASE|COLLECTION|DOCUMENT <db>[.<collection>[.<documentId>]] TO|FROM <role>`
+     * — [terminator] is `"TO"` for GRANT, `"FROM"` for REVOKE. */
+    private fun parseGrantSpec(terminator: String): GrantSpec {
+        val kind = readIdentifier().lowercase()
+        expectKeyword("ON")
+        val expectedSegments =
+            when {
+                matchKeyword("DATABASE") -> 1
+                matchKeyword("COLLECTION") -> 2
+                matchKeyword("DOCUMENT") -> 3
+                else -> throw parseError("expected DATABASE, COLLECTION, or DOCUMENT")
+            }
+        val segments = mutableListOf<String>()
+        segments += readResourcePathSegment()
+        while (matchChar('.')) {
+            segments += readResourcePathSegment()
+        }
+        if (segments.size != expectedSegments) {
+            throw parseError(
+                "expected $expectedSegments dot-separated path segment(s), got ${segments.size}",
+            )
+        }
+        expectKeyword(terminator)
+        val role = readIdentifier()
+        return GrantSpec(
+            kind = kind,
+            database = segments[0],
+            collection = segments.getOrNull(1),
+            documentId = segments.getOrNull(2),
+            role = role,
+        )
+    }
+
+    /** Like [readIdentifier] but also accepts `-` so a document id (typically a UUID) parses. */
+    private fun readResourcePathSegment(): String {
+        skipWs()
+        val start = pos
+        while (pos < input.length && (input[pos].isLetterOrDigit() || input[pos] == '_' || input[pos] == '-')) pos++
+        if (start == pos) throw parseError("expected resource path segment")
+        return input.substring(start, pos)
     }
 
     private fun parseCreateTableBody(): CreateTableStatement {
@@ -148,7 +210,9 @@ internal class RecursiveDescentSqlParser : SqlParser {
             }
             matchKeyword("INDEX") -> SqlStatement.DropIndex(parseDropIndexBody())
             matchKeyword("TABLE") -> SqlStatement.DropTable(TableRef(readIdentifier()))
-            else -> throw parseError("expected VIRTUAL VIEW, INDEX, or TABLE")
+            matchKeyword("ROLE") -> SqlStatement.DropRole(readIdentifier())
+            matchKeyword("USER") -> SqlStatement.DropUser(readIdentifier())
+            else -> throw parseError("expected VIRTUAL VIEW, INDEX, TABLE, ROLE, or USER")
         }
     }
 

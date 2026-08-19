@@ -53,6 +53,13 @@ public interface StorageAdapter {
         parentTreeHash: KdbHash,
     ): DocumentTree
 
+    /**
+     * Drops any [putDocument]/[deleteDocument] calls made since the last [commitTree] for
+     * this namespace, restoring the last-committed visible state. Used to roll back a
+     * transaction whose write phase failed partway through.
+     */
+    public suspend fun discardPending(namespaceId: String)
+
     public suspend fun flush(namespaceId: String)
 
     public suspend fun readBlob(contentHash: KdbHash): ByteArray?

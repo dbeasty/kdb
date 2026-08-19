@@ -6,8 +6,8 @@ import dev.kdb.document.KdbCommit
 import dev.kdb.storage.StorageAdapter
 import dev.kdb.auth.toHttpHeaders
 import dev.kdb.stream.WireConnection
+import dev.kdb.transport.core.OptionAwareWireTransport
 import dev.kdb.transport.core.TransportConnectOptions
-import dev.kdb.transport.ws.WebSocketWireTransport
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.wire.*
 import kotlinx.coroutines.delay
@@ -48,7 +48,7 @@ internal class DefaultPeerSyncClient(
     override suspend fun connect(config: PeerClientConfig): PeerSession {
         val conn =
             when (transport) {
-                is WebSocketWireTransport ->
+                is OptionAwareWireTransport ->
                     transport.connect(
                         config.peerUri,
                         TransportConnectOptions(

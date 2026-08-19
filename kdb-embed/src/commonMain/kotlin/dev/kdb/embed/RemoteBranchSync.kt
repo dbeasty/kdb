@@ -8,6 +8,7 @@ import dev.kdb.peersync.PeerSession
 import dev.kdb.peersync.computeSyncPlan
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
+import dev.kdb.transaction.TransactionAbortedException
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
 import dev.kdb.transaction.transactionEngine
@@ -149,6 +150,11 @@ public suspend fun mergeBranches(
         is TransactionResult.SchemaError ->
             throw IllegalArgumentException(
                 "schema rejection: ${result.violations.size} violation(s)",
+            )
+        is TransactionResult.Aborted ->
+            throw TransactionAbortedException(
+                "merge aborted: ${result.cause.message ?: result.cause.toString()}",
+                result.cause,
             )
     }
 }

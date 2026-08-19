@@ -64,6 +64,15 @@ internal class DefaultIndexRegistry(
 
             fun add(field: SchemaField, version: Int) {
                 val type = inferIndexType(field.type)
+                // Defensive against a caller passing a stale/wrong oldSchema (this registry is
+                // the actual source of truth for what's live): if a store already backs this
+                // (fieldName, type), drop its byId entry too before replacing it in byKey, or
+                // byId silently accumulates orphaned generations of the same field's index --
+                // registry.indexes (backed by byId) would then return multiple stores for one
+                // field, and readers picking among them nondeterministically (tie-break order
+                // depends on KdbUuid hash bucket layout) could resolve a stale, empty store
+                // instead of the one live writes actually land in.
+                byKey[field.name to type]?.let { stale -> byId.remove(stale.descriptor.indexId) }
                 val descriptor =
                     IndexDescriptor(
                         indexId = KdbUuid.random(),

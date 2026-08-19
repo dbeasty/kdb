@@ -10,6 +10,8 @@ import dev.kdb.schema.isNone
 import dev.kdb.transaction.DocumentLockManager
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
+import dev.kdb.transaction.WriteAuthorizer
+import dev.kdb.transaction.authorizingTransactionEngine
 import dev.kdb.transaction.transactionEngine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -37,6 +39,7 @@ public class KdbServerRuntime(
         transaction: KdbTransaction,
         schema: KdbSchema = runtime.schema,
         sessionId: String? = null,
+        authorizer: WriteAuthorizer? = null,
     ): KdbCommit =
         writeCoordinator.run {
             commitViaEngine(
@@ -44,7 +47,7 @@ public class KdbServerRuntime(
                 namespaceId,
                 transaction,
                 schema,
-                engineFor(namespaceId),
+                effectiveEngine(namespaceId, authorizer),
                 documentLocks = documentLocks,
                 sessionId = sessionId,
             )
@@ -55,10 +58,23 @@ public class KdbServerRuntime(
         transaction: KdbTransaction,
         replayTarget: dev.kdb.codec.KdbHash,
         schema: KdbSchema = runtime.schema,
+        authorizer: WriteAuthorizer? = null,
     ): TransactionResult =
         writeCoordinator.run {
-            engineFor(namespaceId).replay(transaction, runtime.dag, runtime.storage, schema, replayTarget)
+            effectiveEngine(namespaceId, authorizer)
+                .replay(transaction, runtime.dag, runtime.storage, schema, replayTarget)
         }
+
+    /** The cached per-namespace engine, wrapped per call with [authorizer] when the caller
+     * (the wire layer) has a principal to check writes against. Wrapping happens outside the
+     * cache since the authorizer is bound to one request's principal, not to the namespace. */
+    private suspend fun effectiveEngine(
+        namespaceId: String,
+        authorizer: WriteAuthorizer?,
+    ): TransactionEngine {
+        val engine = engineFor(namespaceId)
+        return if (authorizer != null) authorizingTransactionEngine(engine, namespaceId, authorizer) else engine
+    }
 
     public fun retain() {
         refCount.incrementAndGet()

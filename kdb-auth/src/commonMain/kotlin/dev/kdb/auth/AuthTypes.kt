@@ -42,6 +42,23 @@ public sealed class AuthAction {
 
     public data class PeerSync(val namespace: String) : AuthAction()
 
+    /** Per-document write/delete check, resolved at document > collection > database grant
+     * specificity. Raised by the Transaction Engine for each op in a transaction, not just at
+     * the wire layer, so a grant scoped below the namespace can actually be enforced. */
+    public data class DocumentWrite(val namespace: String, val docId: String) : AuthAction()
+
+    public data class DocumentDelete(val namespace: String, val docId: String) : AuthAction()
+
+    public data class DocumentRead(val namespace: String, val docId: String) : AuthAction()
+
+    /** RBAC admin surface: CREATE/DROP ROLE, GRANT/REVOKE, CREATE/DROP USER (see
+     * docs/kdb-rbac-plan.md phase 4). Gated behind the "admin" permission kind — deliberately
+     * separate from "write" so ordinary write access to a namespace never implies the ability to
+     * change who has access to it. [scope] defaults to the reserved system namespace; it is not
+     * the target database of the GRANT/REVOKE, since managing roles isn't itself scoped to one
+     * business namespace. */
+    public data class Admin(val scope: String = "_system") : AuthAction()
+
     /** May this principal invoke the named stored procedure at all (Layer 11 Component 32)? */
     public data class ProcExec(
         val namespace: String,

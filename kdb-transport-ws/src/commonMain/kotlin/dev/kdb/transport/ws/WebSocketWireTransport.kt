@@ -2,11 +2,12 @@ package dev.kdb.transport.ws
 
 import dev.kdb.stream.WireConnection
 import dev.kdb.stream.WireTransport
+import dev.kdb.transport.core.OptionAwareWireTransport
 
-public interface WebSocketWireTransport : WireTransport {
-    public suspend fun connect(
+public interface WebSocketWireTransport : WireTransport, OptionAwareWireTransport {
+    public override suspend fun connect(
         uri: String,
-        options: dev.kdb.transport.core.TransportConnectOptions = dev.kdb.transport.core.TransportConnectOptions(),
+        options: dev.kdb.transport.core.TransportConnectOptions,
     ): dev.kdb.stream.WireConnection
 
     public suspend fun listen(

@@ -24,6 +24,7 @@ public enum class KdbErrorCode(public val numericCode: Int) {
 
     CONFLICT(4001),
     DOCUMENT_LOCKED(4002),
+    TRANSACTION_ABORTED(4003),
 
     STORAGE_TIER_ERROR(4101),
     DATA_DIRECTORY_LOCKED(4102),

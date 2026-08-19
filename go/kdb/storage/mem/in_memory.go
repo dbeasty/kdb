@@ -128,6 +128,15 @@ func (a *InMemoryStorageAdapter) DeleteDocument(namespaceID string, docID codec.
 	return nil
 }
 
+// DiscardPending drops any PutDocument/DeleteDocument calls made since
+// the last CommitTree for namespaceID, restoring the last-committed
+// visible state. Used to roll back a transaction whose write phase
+// failed partway through.
+func (a *InMemoryStorageAdapter) DiscardPending(namespaceID string) error {
+	a.pending.discardAll(namespaceID)
+	return nil
+}
+
 func (a *InMemoryStorageAdapter) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
 	lockWaitStart := time.Now()
 	a.treesMu.Lock()

@@ -10,8 +10,8 @@ const (
 
 	JSONPathError Code = 2001
 
-	SchemaViolation        Code = 3001
-	SchemaMigrationFailed  Code = 3002
+	SchemaViolation       Code = 3001
+	SchemaMigrationFailed Code = 3002
 
 	VersionNotFound    Code = 3101
 	IceStorage         Code = 3102
@@ -20,9 +20,9 @@ const (
 	Conflict       Code = 4001
 	DocumentLocked Code = 4002
 
-	StorageTierError     Code = 4101
-	DataDirectoryLocked  Code = 4102
-	NamespaceNotFound    Code = 4201
+	StorageTierError    Code = 4101
+	DataDirectoryLocked Code = 4102
+	NamespaceNotFound   Code = 4201
 
 	IndexCorruption Code = 5001
 

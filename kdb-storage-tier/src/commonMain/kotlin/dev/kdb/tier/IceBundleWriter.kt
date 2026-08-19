@@ -95,7 +95,17 @@ public data class IceBundleManifest(
     val indexSnapshotsHex: String? = null,
 )
 
-private fun ByteArray.toHexString(): String = joinToString("") { b -> "%02x".format(b.toInt() and 0xFF) }
+private val HEX_DIGITS = "0123456789abcdef".toCharArray()
+
+// String.format relies on java.util.Formatter, which is JVM-only; this stays portable.
+private fun ByteArray.toHexString(): String =
+    buildString(size * 2) {
+        for (b in this@toHexString) {
+            val v = b.toInt() and 0xFF
+            append(HEX_DIGITS[v ushr 4])
+            append(HEX_DIGITS[v and 0xF])
+        }
+    }
 
 private fun String.decodeHex(): ByteArray {
     require(length % 2 == 0)

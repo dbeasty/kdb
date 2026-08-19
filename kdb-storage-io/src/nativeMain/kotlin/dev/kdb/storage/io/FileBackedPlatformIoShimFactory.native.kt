@@ -13,7 +13,7 @@ public actual class JvmFileBackedPlatformIoShim actual constructor(config: Platf
     NativeFileBackedPlatformIoShim(config),
     PlatformIoShim
 
-public actual class NativeFileBackedPlatformIoShim actual constructor(config: PlatformIoConfig) :
+public actual open class NativeFileBackedPlatformIoShim actual constructor(config: PlatformIoConfig) :
     FileBackedPlatformIoShimBase(
         config,
         NativeSegmentByteStore(

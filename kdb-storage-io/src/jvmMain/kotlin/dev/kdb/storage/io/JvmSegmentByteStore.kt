@@ -111,7 +111,10 @@ internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
             Long.MAX_VALUE
         }
 
-    private fun snapFile(key: String): File = File(File(root, "snap"), key.replace(':', '_'))
+    private fun snapFile(key: String): File {
+        val safeKey = key.replace(':', '_').replace('/', File.separatorChar)
+        return File(File(root, "snap"), safeKey)
+    }
 
     override suspend fun readSnapshot(key: String): ByteArray? {
         val f = snapFile(key)
@@ -119,7 +122,9 @@ internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
     }
 
     override suspend fun writeSnapshot(key: String, data: ByteArray) {
-        snapFile(key).writeBytes(data)
+        val f = snapFile(key)
+        f.parentFile?.mkdirs()
+        f.writeBytes(data)
     }
 
     override suspend fun deleteSnapshot(key: String) {
