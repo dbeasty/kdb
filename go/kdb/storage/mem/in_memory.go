@@ -3,9 +3,11 @@ package mem
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/metrics"
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
@@ -150,8 +152,14 @@ func (a *InMemoryStorageAdapter) DeleteDocument(namespaceID string, docID codec.
 }
 
 func (a *InMemoryStorageAdapter) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
+	lockWaitStart := time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	metrics.Default.Record(metrics.StageLockWait, time.Since(lockWaitStart))
+	rebuildStart := time.Now()
+	defer func() {
+		metrics.Default.Record(metrics.StageTreeRebuild, time.Since(rebuildStart))
+	}()
 	base, ok := a.trees[parentTreeHash]
 	if !ok {
 		return document.DocumentTree{}, fmt.Errorf("missing parent tree %s", parentTreeHash.Hex())

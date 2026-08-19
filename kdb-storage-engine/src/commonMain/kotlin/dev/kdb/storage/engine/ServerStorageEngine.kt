@@ -21,6 +21,7 @@ import dev.kdb.storage.wal.WalRecordKind
 import dev.kdb.storage.wal.WriteAheadLog
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.time.TimeSource
 
 public open class ServerStorageEngine(
     override val namespaceId: String,
@@ -46,7 +47,9 @@ public open class ServerStorageEngine(
 
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {
         val hash = KdbHash.fromBytes(kdbSha256(bytes))
+        val lockWaitStart = TimeSource.Monotonic.markNow()
         mutex.withLock {
+            StageRecorder.Default.record(StorageStage.LOCK_WAIT, lockWaitStart.elapsedNow())
             wal?.append(
                 WalRecord(
                     0,
@@ -55,7 +58,9 @@ public open class ServerStorageEngine(
                     WalPutBlob(hash, bytes).encode(),
                 ),
             )
+            val fsyncStart = TimeSource.Monotonic.markNow()
             wal?.sync()
+            StageRecorder.Default.record(StorageStage.FSYNC_WAIT, fsyncStart.elapsedNow())
             memTable.put(hash, bytes)
         }
         return hash
@@ -118,8 +123,15 @@ public open class ServerStorageEngine(
     }
 
     override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
-        val entries = mutex.withLock { docs.mapValues { (_, d) -> d.contentHash } }
-        return DocumentTree.build(entries)
+        val lockWaitStart = TimeSource.Monotonic.markNow()
+        val entries = mutex.withLock {
+            StageRecorder.Default.record(StorageStage.LOCK_WAIT, lockWaitStart.elapsedNow())
+            docs.mapValues { (_, d) -> d.contentHash }
+        }
+        val rebuildStart = TimeSource.Monotonic.markNow()
+        val tree = DocumentTree.build(entries)
+        StageRecorder.Default.record(StorageStage.TREE_REBUILD, rebuildStart.elapsedNow())
+        return tree
     }
 
     override suspend fun flush(namespaceId: String) {

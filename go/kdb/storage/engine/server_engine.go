@@ -2,9 +2,11 @@ package engine
 
 import (
 	"sync"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/metrics"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/delta"
 	"github.com/limidus/kdb/go/kdb/storage/memtable"
@@ -57,8 +59,10 @@ func (e *ServerEngine) WriteBlob(bytes []byte) (codec.Hash, error) {
 	if err != nil {
 		return codec.Hash{}, err
 	}
+	lockWaitStart := time.Now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	metrics.Default.Record(metrics.StageLockWait, time.Since(lockWaitStart))
 	if e.wal != nil {
 		if _, err := e.wal.Append(wal.Record{
 			Timestamp: codec.TimestampNow(),
@@ -67,7 +71,9 @@ func (e *ServerEngine) WriteBlob(bytes []byte) (codec.Hash, error) {
 		}); err != nil {
 			return codec.Hash{}, err
 		}
+		fsyncStart := time.Now()
 		_ = e.wal.Sync()
+		metrics.Default.Record(metrics.StageFsyncWait, time.Since(fsyncStart))
 	}
 	e.memTable.Put(hash, bytes)
 	return hash, nil
