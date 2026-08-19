@@ -75,18 +75,29 @@ func BuildDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) 
 }
 
 func entriesToArrayValue(entries map[codec.UUID]codec.Hash) codec.Value {
-	ids := make([]codec.UUID, 0, len(entries))
-	for id := range entries {
-		ids = append(ids, id)
+	// Sort keys are computed once per entry (O(n) String() calls) rather
+	// than inside the comparator (O(n log n) calls, ~2x per comparison):
+	// at 2000 entries this step alone was ~12ms, over 95% of
+	// BuildDocumentTree's total cost and two orders of magnitude more
+	// than the actual SHA256/wire-encode work - see the Phase 3 note in
+	// docs/benchmarks/phase0-baseline.md. Sort order (and therefore the
+	// resulting hash) is unchanged: same comparator, same strings.
+	type keyed struct {
+		id  codec.UUID
+		key string
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		return ids[i].String() < ids[j].String()
+	sorted := make([]keyed, 0, len(entries))
+	for id := range entries {
+		sorted = append(sorted, keyed{id: id, key: id.String()})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].key < sorted[j].key
 	})
-	els := make([]codec.Value, len(ids))
-	for i, id := range ids {
+	els := make([]codec.Value, len(sorted))
+	for i, k := range sorted {
 		els[i] = codec.RecordValue{Fields: map[int]codec.Value{
-			1: uuidVal(id),
-			2: hashVal(entries[id]),
+			1: uuidVal(k.id),
+			2: hashVal(entries[k.id]),
 		}}
 	}
 	return codec.ArrayValue{Elements: els}

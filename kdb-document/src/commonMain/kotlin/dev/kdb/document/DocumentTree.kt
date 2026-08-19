@@ -60,7 +60,18 @@ public data class DocumentTree(
 }
 
 private fun entriesToArrayValue(entries: Map<KdbUuid, KdbHash>): KdbValue {
-    val sorted = entries.keys.sortedBy { it.toString() }
+    // Sort keys are computed once per entry rather than via sortedBy's
+    // Comparator (which calls the selector on every comparison, i.e.
+    // O(n log n) toString() calls instead of O(n)): at 2000 entries this
+    // was the dominant cost of BuildDocumentTree by ~two orders of
+    // magnitude over the actual hash/encode work - see the Phase 3 note
+    // in docs/benchmarks/phase0-baseline.md. Sort order (and therefore
+    // the resulting hash) is unchanged.
+    val sorted =
+        entries.keys
+            .map { it to it.toString() }
+            .sortedBy { it.second }
+            .map { it.first }
     return KdbValue.ArrayVal(
         sorted.map { id ->
             KdbValue.RecordVal(
