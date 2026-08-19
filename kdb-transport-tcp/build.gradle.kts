@@ -32,6 +32,7 @@ kotlin {
             implementation(libs.kotlinx.coroutines.test)
         }
         jvmTest.dependencies {
+            implementation(project(":kdb-auth"))
             implementation(project(":kdb-codec"))
             implementation(project(":kdb-dag"))
             implementation(project(":kdb-document"))

@@ -27,6 +27,7 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.hikari)
+    testImplementation(project(":kdb-auth"))
     testImplementation(project(":kdb-server"))
     testImplementation(project(":kdb-transport-core"))
     testImplementation(project(":kdb-transport-ws"))
