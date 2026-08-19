@@ -103,33 +103,54 @@ writers instead of paying per write.
 | 8  | 44.1µs  | 28.7µs |
 | 64 | 47.5µs  | 22.3µs |
 
-`lock_wait` here is dominated by the commit DAG's own mutex, which was
-identified but deliberately not sharded in Phase 2 (see that phase's
-scope note) - the next concurrency bottleneck to address if this work
-continues.
+`lock_wait` here was dominated by the commit DAG's own mutex - see the
+gap-fix update below for what changed. `tree_rebuild` at parallel-1 with
+namespace grown to 3000 docs is now consistently ~14-31µs (further down
+from 130.9µs above), no longer meaningfully growing with document count
+- the incremental Merkle trie gap fix below.
 
-## What's still not done (honest gaps)
+## Gap-fix follow-up (same effort, after the above landed)
 
-- **True O(delta) commit trees.** Still O(n) per commit (with a much
-  smaller constant after Phase 3). Requires an incremental Merkle-style
-  hash, which changes the wire format and needs byte-identical Go/Kotlin
-  parity for the existing interop test. Out of scope for a "test and
-  merge" pass; deserves its own dedicated, reviewed migration.
-- **Commit DAG sharding.** `InMemoryCommitDag`'s mutex (Go) is still a
-  single lock across all commits in a namespace. Its critical section is
-  small (map inserts, no I/O), so it's a real but secondary bottleneck
-  compared to what Phases 1-3 fixed.
-- **`InMemoryStorageAdapter` (Go).** Not sharded; it's the test/lightweight
-  target, not the production disk-backed engine Phases 1-5 focused on.
-- **Kotlin/Native and JS memory detection.** `totalSystemMemoryBytes()`
-  returns `null` (falls back to the 128MiB default) on those targets;
-  only the JVM server target has real detection.
-- **Cross-shard atomicity, crash recovery under `ASYNC`/`MEMORY_ONLY`.**
-  These are the durability/consistency trade-offs the original
-  architecture proposal called out explicitly - Phase 4 makes them
-  possible per-namespace but doesn't change what they cost: an `ASYNC`
-  namespace can still lose up to one sync interval on crash, and that's
-  the point of the mode, not a bug to fix.
+Four of the five gaps originally listed here were revisited and fixed;
+see commits after the Phase 1-6 series for full detail. Summary:
+
+- **True O(delta) commit trees - fixed.** `document_tree_trie.go` /
+  `DocumentTreeTrie.kt`: a persistent 16-ary Merkle trie over the UUID's
+  32 hex nibbles replaces the old sort+wire-encode+SHA256 algorithm.
+  Canonical (same entries -> same hash, independent of insertion order)
+  and incremental (insert/delete touches O(32) nodes, sharing every other
+  subtree). `DocumentTree.Entries`/`entries` and its cheap O(n) copy are
+  untouched - only `TreeHash`'s computation changed. Cross-language
+  parity secured via hardcoded vectors generated from Go and checked in
+  both languages, since no live interop test compares hash output.
+  Rewired the two production hot paths (`InMemoryStorageAdapter.CommitTree`,
+  `ServerEngine.CommitTree` / `ServerStorageEngine.commitTree`) to update
+  incrementally on every put/delete instead of rebuilding from a full
+  snapshot at commit time. Full rebuild-from-scratch (wire decode) is
+  slower per-entry than the old algorithm (many small SHA256 calls vs.
+  one big one) - an accepted tradeoff since it's off the hot path.
+- **Commit DAG sharding - addressed via RWMutex, not full sharding.**
+  Full sharding of `InMemoryCommitDag` risked deadlocks for limited gain,
+  since branch-head advancement is inherently sequential per branch and
+  the critical section was already small. Converted to `sync.RWMutex` so
+  concurrent reads (`GetCommit`/`Walk`/`Diff`/etc.) no longer block each
+  other; writes stay serialized as they structurally must.
+- **`InMemoryStorageAdapter` (Go) - fixed.** Split into a 64-way
+  content-hash-sharded blob/document store and per-namespace-locked
+  pending writes; `trees` stays under its own single mutex (low
+  cardinality, never the contention source the blob/doc maps were).
+- **Kotlin/Native memory detection - fixed for Native, JS left as-is.**
+  Real detection via POSIX `sysconf(_SC_PHYS_PAGES)`/`sysconf(_SC_PAGESIZE)`
+  for `linuxX64`/`macosArm64`. Compiles clean for both but could not be
+  executed in this environment (missing full Xcode install blocks the
+  Kotlin/Native link step even for the Linux target) - a real,
+  acknowledged verification gap, not glossed over. JS/browser still
+  returns `null`; there's no portable browser API for this.
+- **Cross-shard atomicity, crash recovery under `ASYNC`/`MEMORY_ONLY` -
+  not a gap.** This is the durability/consistency trade-off the original
+  architecture proposal called out explicitly as the cost of the plan,
+  not a bug: an `ASYNC` namespace can still lose up to one sync interval
+  on crash, by design.
 
 ## Test coverage added
 
@@ -141,6 +162,15 @@ integration tests proving the new per-session lock in `SqlWireHost`
 prevents corruption under concurrently-submitted same-session requests
 while different sessions run independently
 (`SqlWirePipeliningIntegrationTest`).
+
+Gap-fix follow-up added: Go trie correctness/parity tests
+(`document_tree_trie_test.go` - insertion-order independence, incremental-
+vs-full-rebuild parity, update/delete/collapse-to-empty), a DAG
+concurrent readers-vs-writers test (`concurrency_test.go`), sharded
+`InMemoryStorageAdapter` concurrency tests (`in_memory_concurrency_test.go`),
+Kotlin cross-language parity vectors (`DocumentTreeTrieParityTest`), and
+a Kotlin/Native memory-detection test (compiles but unexecuted in this
+environment - see above).
 
 Full suite status at time of writing: all Go and Kotlin tests pass except
 two pre-existing failures unrelated to this work - `TestKotlinPutThenGoGet_InteropDelta`
