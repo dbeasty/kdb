@@ -5,6 +5,7 @@ import dev.kdb.codec.KdbHash
 public data class ChunkGcResult(
     val manifestsRemoved: Int,
     val chunksRemoved: Int,
+    val bytesReclaimed: Long,
 )
 
 /**
@@ -28,15 +29,24 @@ public class ChunkGc(private val store: ChunkedBlobStore) {
 
         val liveChunkRefs = reachableContentHashes.flatMap { store.chunkRefs(it) }.toSet()
 
+        var bytesReclaimed = 0L
+
         val orphanManifests = manifestStore.allHashes() - reachableContentHashes
-        for (hash in orphanManifests) manifestStore.remove(hash)
+        for (hash in orphanManifests) {
+            manifestStore.get(hash)?.let { bytesReclaimed += it.size }
+            manifestStore.remove(hash)
+        }
 
         val orphanChunks = chunkStore.allHashes() - liveChunkRefs
-        for (hash in orphanChunks) chunkStore.remove(hash)
+        for (hash in orphanChunks) {
+            chunkStore.get(hash)?.let { bytesReclaimed += it.size }
+            chunkStore.remove(hash)
+        }
 
         return ChunkGcResult(
             manifestsRemoved = orphanManifests.size,
             chunksRemoved = orphanChunks.size,
+            bytesReclaimed = bytesReclaimed,
         )
     }
 }

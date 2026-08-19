@@ -1,5 +1,7 @@
 package dev.kdb.storage.chunking
 
+import dev.kdb.codec.KdbHash
+import dev.kdb.document.kdbSha256
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -38,7 +40,7 @@ class ChunkedBlobStoreTest {
     @Test
     fun readBlob_unknownHash_returnsNull() {
         val store = newStore()
-        val bogus = dev.kdb.codec.KdbHash.fromBytes(dev.kdb.document.kdbSha256("nope".encodeToByteArray()))
+        val bogus = KdbHash.fromBytes(kdbSha256("nope".encodeToByteArray()))
         assertEquals(null, store.readBlob(bogus))
     }
 

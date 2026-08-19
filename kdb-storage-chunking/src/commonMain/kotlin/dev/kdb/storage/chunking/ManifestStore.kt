@@ -26,7 +26,9 @@ public class InMemoryManifestStore : ManifestStore {
         contentHash: KdbHash,
         manifestBytes: ByteArray,
     ) {
-        manifests.putIfAbsent(contentHash, manifestBytes.copyOf())
+        if (!manifests.containsKey(contentHash)) {
+            manifests[contentHash] = manifestBytes.copyOf()
+        }
     }
 
     override fun get(contentHash: KdbHash): ByteArray? = manifests[contentHash]?.copyOf()

@@ -28,7 +28,9 @@ public class InMemoryChunkStore : ChunkStore {
         hash: KdbHash,
         bytes: ByteArray,
     ) {
-        chunks.putIfAbsent(hash, bytes.copyOf())
+        if (!chunks.containsKey(hash)) {
+            chunks[hash] = bytes.copyOf()
+        }
     }
 
     override fun get(hash: KdbHash): ByteArray? = chunks[hash]?.copyOf()

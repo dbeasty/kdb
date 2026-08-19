@@ -30,6 +30,7 @@ class ChunkGcTest {
 
         assertEquals(1, result.manifestsRemoved)
         assertTrue(result.chunksRemoved > 0, "chunks unique to v1 should be swept")
+        assertTrue(result.bytesReclaimed > 0, "bytes-reclaimed estimate should be positive")
 
         assertNull(store.readBlob(hashV1))
         assertContentEquals(v2, store.readBlob(hashV2))
@@ -50,6 +51,7 @@ class ChunkGcTest {
 
         assertEquals(0, result.manifestsRemoved)
         assertEquals(0, result.chunksRemoved)
+        assertEquals(0L, result.bytesReclaimed)
         assertContentEquals(a, store.readBlob(hashA))
     }
 

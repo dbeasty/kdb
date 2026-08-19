@@ -20,7 +20,8 @@ public data class ChunkerConfig(
 public data class ChunkSlice(val offset: Int, val length: Int)
 
 /**
- * Gear-hash content-defined chunker (FastCDC-style cut rule).
+ * Gear-hash content-defined chunker (FastCDC-style cut rule). Pure `commonMain` — no
+ * platform I/O — so it runs identically on JVM, JS, and native targets.
  */
 public object ContentDefinedChunker {
 
@@ -57,7 +58,7 @@ public object ContentDefinedChunker {
     /** Mask whose popcount targets an expected run length of [avgSize] bytes between cuts. */
     private fun maskFor(avgSize: Int): Long {
         val clamped = avgSize.coerceAtLeast(2)
-        val bits = 32 - Integer.numberOfLeadingZeros(clamped - 1)
+        val bits = 32 - (clamped - 1).countLeadingZeroBits()
         return (1L shl bits) - 1
     }
 

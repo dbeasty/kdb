@@ -1,8 +1,6 @@
 package dev.kdb.storage.chunking
 
 import dev.kdb.codec.KdbHash
-import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 
 private const val TAG_RAW: Byte = 0
 private const val TAG_CHUNKED: Byte = 1
@@ -19,15 +17,19 @@ internal sealed class BlobManifest {
             is Raw -> {
                 val out = ByteArray(bytes.size + 1)
                 out[0] = TAG_RAW
-                System.arraycopy(bytes, 0, out, 1, bytes.size)
+                bytes.copyInto(out, destinationOffset = 1)
                 out
             }
             is Chunked -> {
-                val out = ByteArrayOutputStream(5 + chunkHashes.size * HASH_LEN)
-                out.write(byteArrayOf(TAG_CHUNKED))
-                out.write(ByteBuffer.allocate(4).putInt(chunkHashes.size).array())
-                for (h in chunkHashes) out.write(h.bytes)
-                out.toByteArray()
+                val out = ByteArray(5 + chunkHashes.size * HASH_LEN)
+                out[0] = TAG_CHUNKED
+                writeInt32BE(out, 1, chunkHashes.size)
+                var offset = 5
+                for (h in chunkHashes) {
+                    h.bytes.copyInto(out, destinationOffset = offset)
+                    offset += HASH_LEN
+                }
+                out
             }
         }
 
@@ -36,8 +38,8 @@ internal sealed class BlobManifest {
             when (manifestBytes[0]) {
                 TAG_RAW -> Raw(manifestBytes.copyOfRange(1, manifestBytes.size))
                 TAG_CHUNKED -> {
-                    val count = ByteBuffer.wrap(manifestBytes, 1, 4).int
-                    val hashes = mutableListOf<KdbHash>()
+                    val count = readInt32BE(manifestBytes, 1)
+                    val hashes = ArrayList<KdbHash>(count)
                     var offset = 5
                     repeat(count) {
                         hashes += KdbHash.fromBytes(manifestBytes.copyOfRange(offset, offset + HASH_LEN))
@@ -47,5 +49,25 @@ internal sealed class BlobManifest {
                 }
                 else -> error("unknown blob manifest tag ${manifestBytes[0]}")
             }
+
+        private fun writeInt32BE(
+            out: ByteArray,
+            at: Int,
+            value: Int,
+        ) {
+            out[at] = (value ushr 24).toByte()
+            out[at + 1] = (value ushr 16).toByte()
+            out[at + 2] = (value ushr 8).toByte()
+            out[at + 3] = value.toByte()
+        }
+
+        private fun readInt32BE(
+            data: ByteArray,
+            at: Int,
+        ): Int =
+            ((data[at].toInt() and 0xFF) shl 24) or
+                ((data[at + 1].toInt() and 0xFF) shl 16) or
+                ((data[at + 2].toInt() and 0xFF) shl 8) or
+                (data[at + 3].toInt() and 0xFF)
     }
 }

@@ -14,9 +14,9 @@ import dev.kdb.document.kdbSha256
  * stored once in [chunkStore], content-addressed. Two blobs sharing byte runs (a file re-ingested
  * with a small edit) automatically reuse the unchanged chunks; two unrelated blobs simply produce
  * no shared chunks, which costs no more than storing them separately — there is no explicit
- * similarity check or "worth it" threshold anywhere in this path, the chunk-level dedup handles
- * both cases uniformly. Blobs below the threshold are stored as a single literal chunk (skips
- * chunking overhead for small payloads).
+ * similarity check or "worth it" threshold anywhere in this path, chunk-level dedup handles both
+ * cases uniformly. Blobs below the threshold are stored as a single literal chunk (skips chunking
+ * overhead for small payloads).
  */
 public class ChunkedBlobStore(
     private val chunkStore: ChunkStore = InMemoryChunkStore(),
@@ -50,14 +50,15 @@ public class ChunkedBlobStore(
         return when (val manifest = BlobManifest.decode(manifestBytes)) {
             is BlobManifest.Raw -> manifest.bytes
             is BlobManifest.Chunked -> {
-                val out = java.io.ByteArrayOutputStream()
-                for (hash in manifest.chunkHashes) {
-                    val chunkBytes =
-                        chunkStore.get(hash)
-                            ?: error("missing chunk $hash referenced by manifest $contentHash")
-                    out.write(chunkBytes)
+                val chunks = manifest.chunkHashes.map { hash -> chunkStore.get(hash) ?: error("missing chunk $hash referenced by manifest $contentHash") }
+                val total = chunks.sumOf { it.size }
+                val out = ByteArray(total)
+                var offset = 0
+                for (chunkBytes in chunks) {
+                    chunkBytes.copyInto(out, destinationOffset = offset)
+                    offset += chunkBytes.size
                 }
-                out.toByteArray()
+                out
             }
         }
     }
@@ -76,7 +77,7 @@ public class ChunkedBlobStore(
         return BlobManifest.decode(manifestBytes) is BlobManifest.Chunked
     }
 
-    internal fun manifests(): ManifestStore = manifestStore
+    public fun manifests(): ManifestStore = manifestStore
 
-    internal fun chunks(): ChunkStore = chunkStore
+    public fun chunks(): ChunkStore = chunkStore
 }
