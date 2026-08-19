@@ -95,6 +95,42 @@ Kotlin's absolute numbers are far below Go's because JVM's
 platform cost that group commit now actually amortizes across many
 writers instead of paying per write.
 
+### Reads (added after the gap fixes above, requested separately)
+
+Read paths were never a bottleneck in this work - no lock was ever taken
+across them the way WriteBlob's used to be - but hadn't been measured.
+`read_throughput_bench_test.go` / `ReadThroughputBenchTest.kt` mirror the
+write benchmarks: `ReadBlob`/`readBlob` (memTable lookup, no disk I/O
+once written) and `GetDocument`/`getDocument` (Phase 2's sharded doc
+store lookup), 5000 entries pre-populated, concurrent reads over them.
+
+**Go**, ns/op (higher parallelism only lightly loaded on a 12-core host,
+these are near the noise floor):
+
+| Parallelism | ReadBlob | GetDocument |
+|---:|---:|---:|
+| 1   | 222 ns/op (~4.5M/s) | 35 ns/op (~28.7M/s) |
+| 8   | 173 ns/op (~5.8M/s) | 77 ns/op (~13.0M/s) |
+| 64  | 177 ns/op (~5.6M/s) | 90 ns/op (~11.1M/s) |
+| 256 | 260 ns/op (~3.8M/s) | 94 ns/op (~10.7M/s) |
+
+**Kotlin**, ops/sec:
+
+| Parallelism | readBlob | getDocument |
+|---:|---:|---:|
+| 1   | ~1,027,700/s | ~4,672,900/s |
+| 8   | ~206,900/s   | ~4,651,200/s |
+| 64  | ~248,900/s   | ~9,523,800/s |
+| 256 | ~338,300/s   | ~6,329,100/s |
+
+Reads are 3-4 orders of magnitude faster than writes in both languages,
+as expected: they never touch disk (WAL/fsync) or take the group-commit
+path - `GetDocument`/`getDocument` is just a sharded in-memory map
+lookup. Kotlin's `readBlob` numbers below parallel-1 are coroutine/JVM
+dispatch overhead on a memTable lookup, not disk cost - contrast with
+`writeBlob`, where the ~4-9ms physical fsync (see above) actually
+dominates.
+
 ### Go: transaction commit path (`defaultEngine.Commit` + `CommitTree`)
 
 | Parallelism | Phase 0 tree_rebuild mean | Final tree_rebuild mean |
