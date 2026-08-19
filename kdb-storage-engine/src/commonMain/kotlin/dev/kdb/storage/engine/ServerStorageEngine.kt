@@ -55,7 +55,7 @@ public open class ServerStorageEngine(
     // writes never take a lock at all - see Phase 1/2 of
     // docs/benchmarks/phase0-baseline.md.
     private val groupCommit = GroupCommitter()
-    private val cache = BlockCache(config.globalMemoryBudgetBytes / 4)
+    private val cache = BlockCache(config.resolvedGlobalMemoryBudgetBytes() / 4)
     private val blobStore = LsmBlobStore(config.ioShim, namespaceId, cache)
     private val memTable = MemTableManager(namespaceId, config.ioShim, blobStore)
     private val docs = ShardedDocStore()

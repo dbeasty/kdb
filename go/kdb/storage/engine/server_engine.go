@@ -38,7 +38,7 @@ type ServerEngine struct {
 
 // NewServerEngine constructs a server engine; wal may be nil for in-memory targets.
 func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w wal.WriteAheadLog) *ServerEngine {
-	cache := sstable.NewBlockCache(config.GlobalMemoryBudgetBytes / 4)
+	cache := sstable.NewBlockCache(config.ResolvedGlobalMemoryBudgetBytes() / 4)
 	blobStore := sstable.NewLsmBlobStore(config.IOShim, namespaceID, cache)
 	cap := storage.CapabilitySet{
 		PersistsDeltaLog:          true,

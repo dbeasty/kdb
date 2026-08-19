@@ -33,7 +33,17 @@ public enum class Durability {
 public data class StorageEngineConfig(
     val pageTargetSizeBytes: Long = 8L * 1024 * 1024,
     val pageMaxSizeBytes: Long = 16L * 1024 * 1024,
-    val globalMemoryBudgetBytes: Long,
+    /**
+     * If > 0, used directly as the hot-tier byte budget (block cache +
+     * memtable sizing). If <= 0 (the default), resolved from
+     * [hotTierMemory] instead (see [resolveHotTierBytes]) - small by
+     * default, configurable via an absolute value or a percentage of
+     * total system memory. Set this field directly only when you want
+     * to bypass that resolution entirely.
+     */
+    val globalMemoryBudgetBytes: Long = 0,
+    /** Configures the hot-tier budget when [globalMemoryBudgetBytes] is left at zero. */
+    val hotTierMemory: HotTierMemoryConfig = HotTierMemoryConfig(),
     val compressionCodec: CompressionCodec = CompressionCodec.ZSTD,
     val defaultIndexRetention: IndexRetention = IndexRetention.EVICTABLE,
     val ioShim: PlatformIoShim,
@@ -42,4 +52,8 @@ public data class StorageEngineConfig(
     val durability: Durability = Durability.SYNC,
     /** Background fsync period used when [durability] is ASYNC. Null uses a built-in default. */
     val asyncSyncIntervalMillis: Long? = null,
-)
+) {
+    /** [globalMemoryBudgetBytes] if set, otherwise resolved from [hotTierMemory]. */
+    public fun resolvedGlobalMemoryBudgetBytes(): Long =
+        if (globalMemoryBudgetBytes > 0) globalMemoryBudgetBytes else resolveHotTierBytes(hotTierMemory)
+}

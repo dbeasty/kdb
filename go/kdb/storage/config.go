@@ -22,16 +22,35 @@ const (
 
 // StorageEngineConfig bundles runtime limits with a platform I/O shim.
 type StorageEngineConfig struct {
-	PageTargetSizeBytes     int64
-	PageMaxSizeBytes        int64
+	PageTargetSizeBytes int64
+	PageMaxSizeBytes    int64
+	// GlobalMemoryBudgetBytes, if > 0, is used directly as the hot-tier
+	// byte budget (block cache + memtable sizing). If <= 0, it is
+	// resolved from HotTierMemory instead (see ResolveHotTierBytes) -
+	// small by default, configurable via an absolute value or a
+	// percentage of total system memory. Set this field directly only
+	// when you want to bypass that resolution entirely.
 	GlobalMemoryBudgetBytes int64
-	CompressionCodec        CompressionCodec
-	DefaultIndexRetention   IndexRetention
-	IOShim                  PlatformIOShim
+	// HotTierMemory configures the hot-tier budget when
+	// GlobalMemoryBudgetBytes is left at zero. See Phase 5 of
+	// docs/benchmarks/phase0-baseline.md.
+	HotTierMemory         HotTierMemoryConfig
+	CompressionCodec      CompressionCodec
+	DefaultIndexRetention IndexRetention
+	IOShim                PlatformIOShim
 	// Durability controls WAL sync behavior for this namespace. Zero
 	// value is DurabilitySync, preserving prior behavior.
 	Durability Durability
 	// AsyncSyncIntervalMillis is the background fsync period used when
 	// Durability is DurabilityAsync. Zero uses a built-in default.
 	AsyncSyncIntervalMillis int64
+}
+
+// ResolvedGlobalMemoryBudgetBytes returns GlobalMemoryBudgetBytes if set,
+// otherwise resolves HotTierMemory (falling back to DefaultHotTierBytes).
+func (c StorageEngineConfig) ResolvedGlobalMemoryBudgetBytes() int64 {
+	if c.GlobalMemoryBudgetBytes > 0 {
+		return c.GlobalMemoryBudgetBytes
+	}
+	return ResolveHotTierBytes(c.HotTierMemory)
 }
