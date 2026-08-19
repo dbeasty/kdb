@@ -125,6 +125,8 @@ func (e *defaultEngine) Merge(
 			return r, nil
 		case ResultSchemaError:
 			return r, nil
+		case ResultAborted:
+			return r, nil
 		}
 	}
 
@@ -235,19 +237,29 @@ func (e *defaultEngine) finalizeTransaction(
 		}
 	}
 
-	for idx, op := range tx.Operations {
-		switch o := op.(type) {
-		case document.WriteOp:
-			if doc, ok := writes[idx]; ok {
-				if err := store.PutDocument(d.NamespaceID, doc); err != nil {
-					return nil, err
+	if abortErr := func() error {
+		for idx, op := range tx.Operations {
+			switch o := op.(type) {
+			case document.WriteOp:
+				if doc, ok := writes[idx]; ok {
+					if err := store.PutDocument(d.NamespaceID, doc); err != nil {
+						return err
+					}
+				}
+			case document.DeleteOp:
+				if err := store.DeleteDocument(d.NamespaceID, o.DocID); err != nil {
+					return err
 				}
 			}
-		case document.DeleteOp:
-			if err := store.DeleteDocument(d.NamespaceID, o.DocID); err != nil {
-				return nil, err
-			}
 		}
+		return nil
+	}(); abortErr != nil {
+		// The write phase failed after validation/conflict checks passed -
+		// roll back whatever was staged rather than leaving a half-applied
+		// transaction, and report it distinctly from a hard error so
+		// callers can retry cleanly.
+		_ = store.DiscardPending(d.NamespaceID)
+		return ResultAborted{Cause: abortErr}, nil
 	}
 
 	anchor, err := d.GetCommitOrThrow(anchorCommit)

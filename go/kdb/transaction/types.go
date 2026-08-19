@@ -55,6 +55,14 @@ type ResultSchemaError struct {
 
 func (ResultSchemaError) isTransactionResult() {}
 
+// ResultAborted is returned when the write phase fails after validation passed; any staged
+// storage writes were rolled back via Adapter.DiscardPending.
+type ResultAborted struct {
+	Cause error
+}
+
+func (ResultAborted) isTransactionResult() {}
+
 // OperationConflict describes one conflicting operation.
 type OperationConflict struct {
 	OpIndex     int

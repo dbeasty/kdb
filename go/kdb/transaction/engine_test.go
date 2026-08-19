@@ -1,15 +1,98 @@
 package transaction_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
+
+// failingStorageAdapter delegates to an inner storage.Adapter but fails PutDocument for one
+// doc id, to exercise transaction rollback.
+type failingStorageAdapter struct {
+	storage.Adapter
+	failOnPutDocID codec.UUID
+}
+
+func (a *failingStorageAdapter) PutDocument(namespaceID string, doc document.Document) error {
+	if doc.ID == a.failOnPutDocID {
+		return errors.New("simulated storage failure")
+	}
+	return a.Adapter.PutDocument(namespaceID, doc)
+}
+
+func TestCommitWriteFailsMidTransactionAbortsAndRollsBack(t *testing.T) {
+	ns := "app/abort"
+	d, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := mem.NewInMemoryStorageAdapter()
+	docA, err := document.FromJSON(`{"v":"a"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docB, err := document.FromJSON(`{"v":"b"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &failingStorageAdapter{Adapter: inner, failOnPutDocID: docB.ID}
+	base, err := d.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := transaction.NewEngine(transaction.ConflictPolicyStrict, nil)
+	tx := newTx(base,
+		document.WriteOp{DocID: docA.ID, Patch: docA.JSON},
+		document.WriteOp{DocID: docB.ID, Patch: docB.JSON},
+	)
+
+	res, err := engine.Commit(tx, d, store, schema.None(), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := res.(transaction.ResultAborted); !ok {
+		t.Fatalf("expected aborted, got %T", res)
+	}
+
+	headAfter, err := d.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headAfter != base {
+		t.Fatalf("expected head unchanged, got %s vs base %s", headAfter.Hex(), base.Hex())
+	}
+	if got, _ := store.GetDocument(ns, docA.ID, base); got != nil {
+		t.Fatalf("expected docA not visible, got %+v", got)
+	}
+	if got, _ := store.GetDocument(ns, docB.ID, base); got != nil {
+		t.Fatalf("expected docB not visible, got %+v", got)
+	}
+
+	// A retried transaction (without the injected failure) succeeds cleanly, proving the
+	// aborted attempt didn't leave corrupted/leaked pending state behind.
+	retryTx := newTx(base,
+		document.WriteOp{DocID: docA.ID, Patch: docA.JSON},
+		document.WriteOp{DocID: docB.ID, Patch: docB.JSON},
+	)
+	retried, err := engine.Commit(retryTx, d, inner, schema.None(), nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	success, ok := retried.(transaction.ResultSuccess)
+	if !ok {
+		t.Fatalf("expected success on retry, got %T", retried)
+	}
+	if len(success.Commit.Operations) != 2 {
+		t.Fatalf("expected 2 ops, got %d", len(success.Commit.Operations))
+	}
+}
 
 func TestCommitSingleWriteSucceeds(t *testing.T) {
 	ns := "app/tx"
