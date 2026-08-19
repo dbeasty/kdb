@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"sync"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -32,6 +33,18 @@ type ServerEngine struct {
 	docs             *shardedDocStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
+	// treeMu guards tree, a running DocumentTree updated incrementally
+	// (O(delta) via its persistent trie - see
+	// document/document_tree_trie.go) on every PutDocument/DeleteDocument
+	// instead of being rebuilt from a full docs snapshot in CommitTree,
+	// which is what it did before this gap fix. This reintroduces a
+	// single lock on the put/delete path, but the work done under it is
+	// now O(delta) (one trie insert/delete) rather than CommitTree's old
+	// O(namespace size) snapshot-and-rebuild, so it's a net win even
+	// though Phase 2 sharded the docs map itself for lock-free access.
+	treeMu sync.Mutex
+	tree   document.DocumentTree
+
 	asyncStop chan struct{}
 	asyncDone chan struct{}
 }
@@ -56,6 +69,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
 		docs:             newShardedDocStore(),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
+		tree:             document.EmptyDocumentTree(),
 	}
 	if w != nil && config.Durability == storage.DurabilityAsync {
 		e.startAsyncSync()
@@ -177,7 +191,14 @@ func (e *ServerEngine) RecoverBlobsFromWal() error {
 
 func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) error {
 	e.docs.Put(doc)
-	return nil
+	h, err := doc.ContentHash()
+	if err != nil {
+		return err
+	}
+	e.treeMu.Lock()
+	e.tree, err = e.tree.With(doc.ID, h)
+	e.treeMu.Unlock()
+	return err
 }
 
 func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
@@ -232,20 +253,21 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 
 func (e *ServerEngine) DeleteDocument(namespaceID string, docID codec.UUID) error {
 	e.docs.Delete(docID)
-	return nil
+	var err error
+	e.treeMu.Lock()
+	e.tree, err = e.tree.Without(docID)
+	e.treeMu.Unlock()
+	return err
 }
 
+// CommitTree returns the running tree maintained incrementally by
+// PutDocument/DeleteDocument (parentTreeHash is ignored, matching the
+// pre-existing behavior this preserves: ServerEngine has always reflected
+// current live state rather than tracking per-branch history).
 func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
-	vals := e.docs.Snapshot()
-	entries := make(map[codec.UUID]codec.Hash, len(vals))
-	for _, d := range vals {
-		h, err := d.ContentHash()
-		if err != nil {
-			return document.DocumentTree{}, err
-		}
-		entries[d.ID] = h
-	}
-	return document.BuildDocumentTree(entries)
+	e.treeMu.Lock()
+	defer e.treeMu.Unlock()
+	return e.tree, nil
 }
 
 func (e *ServerEngine) Flush(namespaceID string) error {

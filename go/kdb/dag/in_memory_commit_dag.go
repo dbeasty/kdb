@@ -16,7 +16,7 @@ const mainBranch = "main"
 type InMemoryCommitDag struct {
 	NamespaceID string
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	commits  map[codec.Hash]document.Commit
 	stubs    map[codec.Hash]document.CommitStub
 	trees    map[codec.Hash]document.DocumentTree
@@ -79,8 +79,8 @@ func (d *InMemoryCommitDag) removeHex(hexLower string) {
 
 // LookupHashPrefix returns hashes whose hex starts with prefix (lowercase).
 func (d *InMemoryCommitDag) LookupHashPrefix(hexPrefixLower string) []codec.Hash {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	p := strings.ToLower(hexPrefixLower)
 	var out []codec.Hash
 	for _, h := range d.hexSorted {
@@ -93,15 +93,15 @@ func (d *InMemoryCommitDag) LookupHashPrefix(hexPrefixLower string) []codec.Hash
 }
 
 func (d *InMemoryCommitDag) GetCommit(hash codec.Hash) (document.Commit, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	c, ok := d.commits[hash]
 	return c, ok
 }
 
 func (d *InMemoryCommitDag) GetCommitOrThrow(hash codec.Hash) (document.Commit, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	if stub, ok := d.stubs[hash]; ok {
 		return document.Commit{}, kdberr.NewIceStorageError(
 			"commit archived", d.NamespaceID, hash.Hex(), stub.ArchiveLocation,
@@ -117,22 +117,22 @@ func (d *InMemoryCommitDag) GetCommitOrThrow(hash codec.Hash) (document.Commit, 
 }
 
 func (d *InMemoryCommitDag) GetStub(hash codec.Hash) (document.CommitStub, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	s, ok := d.stubs[hash]
 	return s, ok
 }
 
 func (d *InMemoryCommitDag) HasCommit(hash codec.Hash) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	_, ok := d.commits[hash]
 	return ok
 }
 
 func (d *InMemoryCommitDag) HasStub(hash codec.Hash) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	_, ok := d.stubs[hash]
 	return ok
 }
@@ -186,15 +186,15 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 }
 
 func (d *InMemoryCommitDag) GetDocumentTree(treeHash codec.Hash) (document.DocumentTree, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	t, ok := d.trees[treeHash]
 	return t, ok
 }
 
 func (d *InMemoryCommitDag) GetDocumentTreeOrThrow(treeHash codec.Hash) (document.DocumentTree, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	t, ok := d.trees[treeHash]
 	if !ok {
 		return document.DocumentTree{}, kdberr.NewVersionNotFoundError(
@@ -211,8 +211,8 @@ func (d *InMemoryCommitDag) PutDocumentTree(tree document.DocumentTree) {
 }
 
 func (d *InMemoryCommitDag) Head() (codec.Hash, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	b, ok := d.branches[mainBranch]
 	if !ok {
 		return codec.Hash{}, NewConsistencyError("missing default branch", d.NamespaceID, nil)
@@ -238,15 +238,15 @@ func (d *InMemoryCommitDag) SetHead(branchName string, hash codec.Hash) error {
 }
 
 func (d *InMemoryCommitDag) GetBranch(name string) (document.Branch, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	b, ok := d.branches[name]
 	return b, ok
 }
 
 func (d *InMemoryCommitDag) GetBranchOrThrow(name string) (document.Branch, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	b, ok := d.branches[name]
 	if !ok {
 		return document.Branch{}, NewBranchNotFoundError("branch not found", d.NamespaceID, name)
@@ -255,8 +255,8 @@ func (d *InMemoryCommitDag) GetBranchOrThrow(name string) (document.Branch, erro
 }
 
 func (d *InMemoryCommitDag) ListBranches() []document.Branch {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	out := make([]document.Branch, 0, len(d.branches))
 	for _, b := range d.branches {
 		out = append(out, b)
@@ -296,8 +296,8 @@ func (d *InMemoryCommitDag) DeleteBranch(name string) error {
 }
 
 func (d *InMemoryCommitDag) Walk(from codec.Hash, until *codec.Hash, limit int) []TraversalEntry {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	type frontierItem struct {
 		hash codec.Hash
 		ts   codec.Timestamp
@@ -349,8 +349,8 @@ func (d *InMemoryCommitDag) Walk(from codec.Hash, until *codec.Hash, limit int) 
 }
 
 func (d *InMemoryCommitDag) Diff(fromHash, toHash codec.Hash) (CommitDiff, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	if fromHash == toHash {
 		return CommitDiff{FromHash: fromHash, ToHash: toHash}, nil
 	}
