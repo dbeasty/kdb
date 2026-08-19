@@ -6,6 +6,7 @@ dependencies {
     implementation(project(":kdb-codec"))
     implementation(project(":kdb-auth"))
     implementation(project(":kdb-auth-static"))
+    implementation(project(":kdb-auth-store"))
     implementation(project(":kdb-config"))
     implementation(project(":kdb-document"))
     implementation(project(":kdb-embed"))

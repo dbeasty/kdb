@@ -76,3 +76,12 @@ type DocumentReadAction struct {
 }
 
 func (DocumentReadAction) isAction() {}
+
+// AdminAction is the RBAC admin surface: CREATE/DROP ROLE, GRANT/REVOKE, CREATE/DROP USER.
+// Gated behind the "admin" permission kind, separate from "write".
+type AdminAction struct {
+	// Scope defaults to the reserved system namespace when empty; see engine wiring.
+	Scope string
+}
+
+func (AdminAction) isAction() {}

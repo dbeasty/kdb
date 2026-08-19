@@ -66,6 +66,7 @@ private class DynamicAuthEngine(
                         is AuthAction.DocumentWrite -> "write" to ResourcePath.of(action.namespace, action.docId)
                         is AuthAction.DocumentDelete -> "write" to ResourcePath.of(action.namespace, action.docId)
                         is AuthAction.DocumentRead -> "read" to ResourcePath.of(action.namespace, action.docId)
+                        is AuthAction.Admin -> "admin" to ResourcePath.of(action.scope)
                     }
                 if (!principalHasPermission(principal, roles, kind, resource)) {
                     throw KdbAuthorizationException(

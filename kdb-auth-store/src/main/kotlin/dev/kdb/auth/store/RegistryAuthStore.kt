@@ -40,7 +40,13 @@ public class RegistryAuthStore(
     private val engine: TransactionEngine = transactionEngine(ConflictPolicy.LAST_WRITE),
 ) : UserStore, RoleStore {
     private val mutex = Mutex()
-    private val json = Json { ignoreUnknownKeys = true }
+
+    // encodeDefaults = true is required: writes go through KdbDocument.merge, a shallow overlay
+    // that only replaces keys present in the patch. Json omits fields equal to their default
+    // value by default (e.g. an emptied grants: Set<String> = emptySet()), which would leave
+    // the old value in place instead of clearing it — encodeDefaults=true always includes every
+    // field so every write is a true full replacement, not an accidental partial patch.
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
     override suspend fun createUser(
         id: String,

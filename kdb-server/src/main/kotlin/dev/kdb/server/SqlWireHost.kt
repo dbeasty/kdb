@@ -4,6 +4,12 @@ import dev.kdb.auth.AllowAllAuth
 import dev.kdb.auth.AuthAction
 import dev.kdb.auth.AuthEngine
 import dev.kdb.auth.ConnectionContext
+import dev.kdb.auth.store.RoleAlreadyExistsException
+import dev.kdb.auth.store.RoleNotFoundException
+import dev.kdb.auth.store.RoleStore
+import dev.kdb.auth.store.UserAlreadyExistsException
+import dev.kdb.auth.store.UserNotFoundException
+import dev.kdb.auth.store.UserStore
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbUuid
 import dev.kdb.document.KdbTransaction
@@ -13,9 +19,11 @@ import dev.kdb.error.ConflictReport
 import dev.kdb.error.DocumentLockedException
 import dev.kdb.query.hybrid.HybridQueryRequest
 import dev.kdb.query.hybrid.ReadConsistency
+import dev.kdb.sql.GrantSpec
 import dev.kdb.sql.SqlCell
 import dev.kdb.sql.decodeSqlParameters
 import dev.kdb.sql.defaultSqlParser
+import dev.kdb.sql.isAdminStatement
 import dev.kdb.sql.isDdlStatement
 import dev.kdb.sql.isTransactionControlStatement
 import dev.kdb.sql.SqlStatement
@@ -38,6 +46,12 @@ public class SqlWireHost(
     private val defaultNamespace: String,
     auth: AuthEngine = AllowAllAuth,
     connectionContext: ConnectionContext = ConnectionContext.EMPTY,
+    /** RBAC admin surface (CREATE/DROP ROLE, GRANT/REVOKE, CREATE/DROP USER, see
+     * docs/kdb-rbac-plan.md phase 4). Null means those statements are rejected — a server that
+     * hasn't been configured with a [dev.kdb.auth.store.RegistryAuthStore] has no durable place
+     * to put them. */
+    private val userStore: UserStore? = null,
+    private val roleStore: RoleStore? = null,
 ) {
     private val sessions = SessionManager(server)
     private val sqlAuth = SqlAuthSupport(auth, connectionContext)
@@ -173,6 +187,9 @@ public class SqlWireHost(
         if (isTransactionControlStatement(parsed)) {
             return handleTransactionControlSql(msg, session, parsed)
         }
+        if (isAdminStatement(parsed)) {
+            return handleAdminSql(msg, session, parsed)
+        }
         if (!session.autoCommit && isDdlStatement(parsed)) {
             return sqlError(msg, "DDL not allowed inside a transaction")
         }
@@ -227,6 +244,89 @@ public class SqlWireHost(
         } catch (e: Throwable) {
             sqlError(msg, e.message ?: e.toString())
         }
+    }
+
+    /** CREATE/DROP ROLE, GRANT/REVOKE, CREATE/DROP USER — see docs/kdb-rbac-plan.md phase 4.
+     * Gated behind [AuthAction.Admin] rather than the ordinary write check, and executed
+     * directly against [userStore]/[roleStore] rather than going through
+     * [dev.kdb.query.hybrid.HybridQueryEngine] — those stores live in `kdb-auth-store`, which
+     * `kdb-sql`/`kdb-embed` have no dependency on. */
+    private suspend fun handleAdminSql(
+        msg: WireMessage.SqlExec,
+        session: KdbSession,
+        stmt: SqlStatement,
+    ): WireMessage {
+        try {
+            sqlAuth.authorize(session.principal, AuthAction.Admin())
+        } catch (e: Throwable) {
+            return sqlError(msg, sqlAuth.authFailureMessage(e))
+        }
+        val users = userStore
+        val roles = roleStore
+        if (users == null || roles == null) {
+            return sqlError(msg, "RBAC admin statements are not enabled on this server")
+        }
+        return try {
+            when (stmt) {
+                is SqlStatement.CreateRole -> {
+                    roles.createRole(stmt.name)
+                    sqlSuccess(msg, session, resolvedCommitHex = "", rowsAffected = 1)
+                }
+                is SqlStatement.DropRole -> {
+                    roles.deleteRole(stmt.name)
+                    sqlSuccess(msg, session, resolvedCommitHex = "", rowsAffected = 1)
+                }
+                is SqlStatement.Grant -> {
+                    applyGrant(roles, stmt.grant, add = true)
+                    sqlSuccess(msg, session, resolvedCommitHex = "", rowsAffected = 1)
+                }
+                is SqlStatement.Revoke -> {
+                    applyGrant(roles, stmt.grant, add = false)
+                    sqlSuccess(msg, session, resolvedCommitHex = "", rowsAffected = 1)
+                }
+                is SqlStatement.CreateUser -> {
+                    users.createUser(stmt.id, stmt.password, stmt.roles.toSet())
+                    sqlSuccess(msg, session, resolvedCommitHex = "", rowsAffected = 1)
+                }
+                is SqlStatement.DropUser -> {
+                    users.deleteUser(stmt.id)
+                    sqlSuccess(msg, session, resolvedCommitHex = "", rowsAffected = 1)
+                }
+                else -> sqlError(msg, "not an admin statement: $stmt")
+            }
+        } catch (e: UserAlreadyExistsException) {
+            sqlError(msg, e.message ?: "user already exists")
+        } catch (e: UserNotFoundException) {
+            sqlError(msg, e.message ?: "user not found")
+        } catch (e: RoleAlreadyExistsException) {
+            sqlError(msg, e.message ?: "role already exists")
+        } catch (e: RoleNotFoundException) {
+            sqlError(msg, e.message ?: "role not found")
+        }
+    }
+
+    private suspend fun applyGrant(
+        roles: RoleStore,
+        spec: GrantSpec,
+        add: Boolean,
+    ) {
+        val existing = roles.getRole(spec.role) ?: throw RoleNotFoundException(spec.role)
+        val grantString =
+            buildString {
+                append(spec.kind)
+                append(':')
+                append(spec.database)
+                if (spec.collection != null) {
+                    append('/')
+                    append(spec.collection)
+                    if (spec.documentId != null) {
+                        append('/')
+                        append(spec.documentId)
+                    }
+                }
+            }
+        val updated = if (add) existing.grants + grantString else existing.grants - grantString
+        roles.updateGrants(spec.role, updated)
     }
 
     private suspend fun handleTransactionControlSql(

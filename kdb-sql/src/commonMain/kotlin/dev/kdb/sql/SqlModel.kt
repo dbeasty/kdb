@@ -19,7 +19,38 @@ public sealed class SqlStatement {
     public data object BeginTransaction : SqlStatement()
     public data object Commit : SqlStatement()
     public data object Rollback : SqlStatement()
+
+    // RBAC admin statements (docs/kdb-rbac-plan.md phase 4). These carry only primitive fields —
+    // no dependency on kdb-auth's ResourcePath — since kdb-sql has no dependency on the auth
+    // modules; SqlWireHost (which does) resolves them against UserStore/RoleStore directly,
+    // intercepting before the statement would otherwise reach SqlEngine/HybridQueryEngine.
+    public data class CreateRole(val name: String) : SqlStatement()
+
+    public data class DropRole(val name: String) : SqlStatement()
+
+    public data class Grant(val grant: GrantSpec) : SqlStatement()
+
+    public data class Revoke(val grant: GrantSpec) : SqlStatement()
+
+    public data class CreateUser(
+        val id: String,
+        val password: String,
+        val roles: List<String>,
+    ) : SqlStatement()
+
+    public data class DropUser(val id: String) : SqlStatement()
 }
+
+/** `<kind> ON <scope> <database>[.<collection>[.<documentId>]] TO/FROM <role>` — [scope] is one
+ * of "DATABASE"/"COLLECTION"/"DOCUMENT", validated at parse time against how many of
+ * [collection]/[documentId] are present. */
+public data class GrantSpec(
+    val kind: String,
+    val database: String,
+    val collection: String? = null,
+    val documentId: String? = null,
+    val role: String,
+)
 
 public data class UpdateStatement(
     val table: TableRef,

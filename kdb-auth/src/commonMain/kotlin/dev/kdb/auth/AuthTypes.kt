@@ -50,4 +50,12 @@ public sealed class AuthAction {
     public data class DocumentDelete(val namespace: String, val docId: String) : AuthAction()
 
     public data class DocumentRead(val namespace: String, val docId: String) : AuthAction()
+
+    /** RBAC admin surface: CREATE/DROP ROLE, GRANT/REVOKE, CREATE/DROP USER (see
+     * docs/kdb-rbac-plan.md phase 4). Gated behind the "admin" permission kind — deliberately
+     * separate from "write" so ordinary write access to a namespace never implies the ability to
+     * change who has access to it. [scope] defaults to the reserved system namespace; it is not
+     * the target database of the GRANT/REVOKE, since managing roles isn't itself scoped to one
+     * business namespace. */
+    public data class Admin(val scope: String = "_system") : AuthAction()
 }

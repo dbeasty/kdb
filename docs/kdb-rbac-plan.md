@@ -1,8 +1,8 @@
 # KDB User Management & Resource-Scoped RBAC — Plan
 
-Status: phases 1-3 implemented (2026-08-19); phase 4 (SQL DDL surface) and Go-side store/
-enforcement not yet done. Not a numbered spec component. See "Implementation status" at the
-bottom for what actually landed vs. what's still open.
+Status: phases 1-4 implemented (2026-08-19), Kotlin/JVM only; Go-side store/enforcement not yet
+done. Not a numbered spec component. See "Implementation status" at the bottom for what actually
+landed vs. what's still open.
 
 ## Current state (as of this writing)
 
@@ -206,12 +206,46 @@ existing namespace-level check (they aren't document-scoped). Unit-tested at the
 `kdb-server` has no test source set at all yet (nothing to extend) — a good next addition once
 the module gets one.
 
-**Phase 4 — not started.** `CREATE ROLE`/`GRANT`/`REVOKE`/`CREATE USER` SQL DDL and the embedded
-admin API. Needs `kdb-sql` grammar/AST work.
+**Phase 4 — done.** `CREATE ROLE`/`DROP ROLE`/`GRANT ... ON DATABASE|COLLECTION|DOCUMENT ...
+TO/FROM role`/`CREATE USER ... WITH PASSWORD ... ROLES (...)`/`DROP USER` added to `kdb-sql`'s
+`SqlStatement` sealed class and hand-rolled recursive-descent parser
+(`kdb-sql/.../SqlParser.kt`), using only primitive fields (no `ResourcePath` dependency, since
+`kdb-sql` has no dependency on the auth modules) plus a new `isAdminStatement()` predicate.
+`SqlEngine.execute`'s exhaustive `when` throws for these (by design — they never reach it).
+`SqlWireHost.handleSqlExec` intercepts admin statements *before* delegating to
+`HybridQueryEngine`, gated behind a new `AuthAction.Admin` (kind `"admin"`, default scope
+`_system` — deliberately separate from the `"write"` kind, so ordinary write access to a
+namespace never implies the ability to change who has access to it), and executes them directly
+against `UserStore`/`RoleStore` (`kdb-server/.../SqlWireHost.kt` `handleAdminSql`/`applyGrant`).
+`SqlWireHost` takes optional `userStore`/`roleStore` constructor params — null (the default)
+means admin statements are rejected. Covered by parser unit tests
+(`kdb-sql/.../RbacAdminParserTest.kt`) and a real wire-protocol integration test exercising
+`CREATE ROLE`/`GRANT`/`REVOKE`/`CREATE USER` end-to-end against a live `RegistryAuthStore`,
+including a non-admin-principal-rejected case and a grant-takes-effect-immediately case
+(`kdb-integration/.../RbacAdminSqlIntegrationTest.kt`).
+
+**Server startup wiring — done.** `KdbServiceMain` gained `--auth-registry`, which builds a
+`RegistryAuthStore` over the runtime's own `StorageAdapter` (fresh in-memory `CommitDag`s for the
+`_system/users`/`_system/roles` collections — see the phase 2 durability caveat above) and wires
+`dynamicAuthEngine(store)` plus the store itself into `SqlWireHost` via `sqlWireHostFactory`. It
+takes precedence over `--auth-config` when both are set. `sqlWireHostFactory` gained optional
+`userStore`/`roleStore` parameters to carry this through.
+
+**Bug found and fixed during phase 4 testing:** `RegistryAuthStore`'s `Json` instance omitted
+fields equal to their Kotlin default value (`grants: Set<String> = emptySet()`) — since writes go
+through `KdbDocument.merge`, a *shallow* overlay that only replaces keys present in the patch, a
+`REVOKE` that emptied a role's grants produced `{"name":"analyst"}` with no `"grants"` key at
+all, silently leaving the *old* grants in place instead of clearing them. Fixed by setting
+`encodeDefaults = true` on the store's `Json` config, so every write always includes every field
+and is a true full replacement. Caught by the wire-protocol integration test, not the phase 2
+unit tests (which happened not to exercise revoking down to an empty set) — worth keeping in mind
+for any other code that partial-merges JSON records with default-valued fields.
 
 **Not started:** Go-side `UserStore`/`RoleStore` and transaction-boundary enforcement (`go/kdb/
 server` has zero existing auth wiring to build on — this is new work, not an extension), and the
-migration tooling from `StaticAuthConfig` to the registry store.
+migration tooling from `StaticAuthConfig` to the registry store. A persistent `CommitDag`
+implementation (see the phase 2 caveat) would also be needed before `RegistryAuthStore` durability
+survives a process restart in a real deployment.
 
 ## Open questions to resolve before implementation
 
