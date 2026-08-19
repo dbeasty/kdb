@@ -234,6 +234,98 @@ ProcDefine  { namespace, procName, source, params? } → ProcDefineAck { revisio
 
 `SqlWireHost` (or a sibling `ProcWireHost`) handles these the same way it already handles `handleSqlExec`: authenticate → authorize → delegate → map exceptions to `ProcError` using existing `KdbErrorCode` conventions.
 
+### 7.1 Worked example — define then execute
+
+**Step 1 — write the procedure.** A restricted-JS source file, `shipOrder.js`. `main` is the only required export; `args` and `kdb` are the only globals available:
+
+```js
+// shipOrder.js — namespace: orders
+function main(args) {
+  const doc = kdb.get(args.id);
+  if (!doc) throw new Error(`order ${args.id} not found`);
+  if (doc.status !== "pending") throw new Error(`order ${args.id} is not pending`);
+
+  kdb.put({ ...doc, status: "shipped", shippedAt: args.now });
+
+  const stillPending = kdb.query(
+    "SELECT count(*) AS n FROM orders WHERE status = ?", ["pending"]
+  );
+
+  kdb.log(`shipped ${args.id}; ${stillPending[0].n} orders still pending`);
+  return { ok: true, id: args.id };
+}
+```
+
+**Step 2 — define it (`ProcDefine`).** Over the wire (CLI shown as the human-facing equivalent — `kdb-cli`, Component 29, would add a `proc` subcommand that just encodes this frame):
+
+```
+$ kdb proc put orders shipOrder ./shipOrder.js
+```
+
+which the client encodes as, and the server handles as:
+
+```kotlin
+// client → server
+WireMessage.ProcDefine(namespace = "orders", procName = "shipOrder", source = fileText, params = null)
+
+// server (ProcWireHost / SqlWireHost)
+sqlAuth.authorize(principal, AuthAction.ProcManage("orders"))   // can this principal edit procs in `orders`?
+val def = ProcedureDefinition(
+    namespaceId = "orders", name = "shipOrder", source = fileText,
+    paramSchema = null, requiredPermission = "proc:orders/*",
+    createdBy = principal.id, createdAt = now(),
+)
+registry.put(def)   // versioned document write — revision 1, then 2, 3... on each redefine
+→ WireMessage.ProcDefineAck(revision = 1)
+```
+
+`registry.put` goes through the ordinary document/commit path (Component 3), so `kdb log --namespace orders` shows the procedure's own edit history alongside data commits.
+
+**Step 3 — execute it (`ProcExec`).**
+
+```
+$ kdb proc exec orders shipOrder '{"id": "ord-42", "now": 1755600000000}'
+```
+
+```kotlin
+// client → server
+WireMessage.ProcExec(namespace = "orders", procName = "shipOrder", argsJson = """{"id":"ord-42","now":1755600000000}""")
+
+// server
+sqlAuth.authorize(principal, AuthAction.ProcExec("orders", "shipOrder", readOnly = false))   // gate 1: may this principal run this proc?
+val def = registry.get("orders", "shipOrder") ?: throw ProcException.NotFound(...)
+val result = procedureRuntime.invoke(principal, "orders", "shipOrder", parsedArgs, ProcLimits.DEFAULT)
+→ WireMessage.ProcResult(valueJson = """{"ok":true,"id":"ord-42"}""", logs = ["shipped ord-42; 3 orders still pending"])
+```
+
+**Step 4 — what happens inside `invoke` (gate 2, per operation):**
+
+```
+GraalProcedureRuntime.invoke(principal, "orders", "shipOrder", args, limits)
+  1. open a fresh sandboxed Context (HostAccess.EXPLICIT, no IO/net/process, ResourceLimits from `limits`)
+  2. bind `kdb` = HostBindings(principal, namespace="orders", txn=<new implicit tx>, budget=limits.maxHostCalls)
+  3. bind `args` = parsed JSON args
+  4. compile + call main(args), under a `withTimeout(limits.wallClockMillis)`
+
+  inside the script:
+    kdb.get("ord-42")
+      → HostBindings.get: authorize(principal, AuthAction.SqlExec("orders", readOnly=true)) [or a doc-level read action]
+      → HybridQueryEngine read, snapshot-consistent for the invocation
+    kdb.put({...})
+      → HostBindings.put: authorize(principal, AuthAction.SqlExec("orders", readOnly=false))
+      → staged into the implicit transaction, not yet committed
+    kdb.query("SELECT count(*)...", [...])
+      → HostBindings.query: authorize(principal, AuthAction.SqlExec("orders", readOnly=true))
+      → HybridQueryEngine.execute (parameterized — args never concatenated into SQL text)
+    kdb.log(...)
+      → appended to ProcResult.logs, capped at limits.maxLogBytes
+
+  5. main() returns normally → commit the implicit transaction (§6)
+  6. return ProcResult(value, logs) to the wire host
+```
+
+If the same principal were authorized for `ProcExec("orders", "shipOrder")` but *not* for writes to `orders` (e.g. a read-only role), step 4's `kdb.put` call would fail its own `authorize(...)` and raise `ProcException.Denied` — the procedure aborts, the implicit transaction rolls back, and the client gets a `ProcError`. Being allowed to *invoke* the procedure never implies being allowed to *do* what it tries to do.
+
 -----
 
 ## 8. Module layout (proposed)
