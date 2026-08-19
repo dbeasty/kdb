@@ -3,11 +3,18 @@ package dev.kdb.storage.io
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.channels.FileChannel
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
     private val channels = mutableMapOf<String, FileChannel>()
+    // Tracked explicitly rather than re-derived from ch.size() per append:
+    // size() then write(buf, pos) is two separate calls, so two concurrent
+    // appends could both read the same size() before either writes,
+    // landing at the same offset and corrupting the segment. getAndAdd is
+    // the atomic reservation that sequence of calls was missing.
+    private val sizes = mutableMapOf<String, AtomicLong>()
     private val sealed = mutableSetOf<String>()
     private val mutex = Mutex()
 
@@ -29,9 +36,15 @@ internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
             }
         }
 
+    private suspend fun sizeCounter(segmentName: String, channel: FileChannel): AtomicLong =
+        mutex.withLock {
+            sizes.getOrPut(segmentName) { AtomicLong(channel.size()) }
+        }
+
     override suspend fun append(segmentName: String, bytes: ByteArray): Long {
         val ch = channel(segmentName)
-        val pos = ch.size()
+        val counter = sizeCounter(segmentName, ch)
+        val pos = counter.getAndAdd(bytes.size.toLong())
         ch.write(java.nio.ByteBuffer.wrap(bytes), pos)
         return pos + bytes.size
     }
@@ -60,6 +73,7 @@ internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
         mutex.withLock {
             sealed.add(segmentName)
             channels.remove(segmentName)?.close()
+            sizes.remove(segmentName)
         }
     }
 
@@ -84,6 +98,7 @@ internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
     override suspend fun delete(segmentName: String) {
         mutex.withLock {
             channels.remove(segmentName)?.close()
+            sizes.remove(segmentName)
             segmentFile(segmentName).delete()
             sealed.remove(segmentName)
         }

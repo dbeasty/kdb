@@ -15,12 +15,24 @@ import dev.kdb.storage.memtable.MemTableManager
 import dev.kdb.storage.sstable.BlockCache
 import dev.kdb.storage.sstable.LsmBlobStore
 import dev.kdb.storage.wal.DefaultWriteAheadLogFactory
+import dev.kdb.storage.wal.GroupCommitter
 import dev.kdb.storage.wal.WalPutBlob
 import dev.kdb.storage.wal.WalRecord
 import dev.kdb.storage.wal.WalRecordKind
 import dev.kdb.storage.wal.WriteAheadLog
+import dev.kdb.storage.Durability
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.time.TimeSource
 
 public open class ServerStorageEngine(
     override val namespaceId: String,
@@ -37,34 +49,96 @@ public open class ServerStorageEngine(
             indexRetentionDefault = IndexRetention.EVICTABLE,
         )
 
-    private val mutex = Mutex()
-    private val cache = BlockCache(config.globalMemoryBudgetBytes / 4)
+    // docs holds committed (visible) documents, sharded (ShardedDocStore)
+    // rather than guarded by one namespace-wide mutex. putDocument/
+    // deleteDocument stage into pending instead of writing here directly:
+    // writes are not visible via getDocument until commitTree flushes
+    // them, matching the pre-existing InMemoryStorageAdapter contract and
+    // letting a failed transaction's write phase be rolled back via
+    // discardPending without ever having mutated committed state. It is
+    // intentionally separate from writeBlob: WriteAheadLog.append and
+    // MemTableManager.put are each independently thread-safe, so blob
+    // writes never take a lock at all - see Phase 1/2 of
+    // docs/benchmarks/phase0-baseline.md.
+    private val groupCommit = GroupCommitter()
+    private val cache = BlockCache(config.resolvedGlobalMemoryBudgetBytes() / 4)
     private val blobStore = LsmBlobStore(config.ioShim, namespaceId, cache)
     private val memTable = MemTableManager(namespaceId, config.ioShim, blobStore)
-    private val docs = mutableMapOf<KdbUuid, KdbDocument>()
-    private val pendingPuts = mutableMapOf<KdbUuid, KdbDocument>()
-    private val pendingDeletes = mutableSetOf<KdbUuid>()
+    private val docs = ShardedDocStore()
+    private val pending = ShardedPendingStore()
     private val enlistmentStates = mutableMapOf<KdbUuid, EnlistmentEvictionState>()
+
+    // treeMu guards tree, a running DocumentTree updated incrementally
+    // (O(delta) via its persistent trie - see DocumentTreeTrie.kt) as
+    // commitTree flushes staged writes, instead of being rebuilt from a
+    // full docs snapshot each time. Reintroducing staging (recovering a
+    // WIP feature - see docs/benchmarks/phases-1-6-summary.md) put
+    // putDocument/deleteDocument's visibility back behind commitTree; an
+    // earlier pass had them update docs+tree immediately, which was
+    // faster but silently dropped the "not visible until commit"
+    // guarantee transactions depend on for write-phase rollback. The
+    // O(delta) tree update from that pass is preserved; only the "when"
+    // changed.
+    private val treeMu = Mutex()
+    private var tree = DocumentTree.EMPTY
+
+    private val asyncScope: CoroutineScope? =
+        if (wal != null && config.durability == Durability.ASYNC) {
+            CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        } else {
+            null
+        }
+
+    init {
+        asyncScope?.launch {
+            val interval = config.asyncSyncIntervalMillis ?: 5L
+            while (isActive) {
+                delay(interval)
+                wal?.sync()
+            }
+        }
+    }
+
+    /**
+     * Stops the background async-sync loop (if running) and does a final
+     * flush, so an ASYNC-durability namespace doesn't lose writes made
+     * just before shutdown. No-op for other durability modes.
+     */
+    public fun stopAsyncSync() {
+        val scope = asyncScope ?: return
+        scope.cancel()
+        runBlocking { wal?.sync() }
+    }
 
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {
         val hash = KdbHash.fromBytes(kdbSha256(bytes))
-        // No outer engine-wide mutex here: wal.append (own internal mutex, sequences safely),
-        // wal.sync (group-commit -- concurrent callers batch onto one fsync), and memTable.put
-        // (own internal mutex) are each independently safe for concurrent callers. An earlier
-        // attempt to remove this mutex was reverted after appearing to cause kdb-jdbc's
-        // FilePersistenceTest to fail; a repeated-run comparison later showed that test fails at
-        // the same ~50% rate with or without this mutex (pre-existing flake, unrelated -- see
-        // DefaultIndexWriter.applyCommit's silent `?: continue` on a getDocument miss), so the
-        // mutex was removed again since it never was the cause and bought no correctness.
-        wal?.append(
-            WalRecord(
-                0,
-                KdbTimestamp.now(),
-                WalRecordKind.PutBlob,
-                WalPutBlob(hash, bytes).encode(),
-            ),
-        )
-        wal?.sync()
+        val w = wal
+        if (w != null) {
+            val result =
+                w.append(
+                    WalRecord(
+                        0,
+                        KdbTimestamp.now(),
+                        WalRecordKind.PutBlob,
+                        WalPutBlob(hash, bytes).encode(),
+                    ),
+                )
+            when (config.durability) {
+                Durability.SYNC -> {
+                    val fsyncStart = TimeSource.Monotonic.markNow()
+                    groupCommit.syncTo(result.sequence) { w.sync() }
+                    StageRecorder.Default.record(StorageStage.FSYNC_WAIT, fsyncStart.elapsedNow())
+                }
+                Durability.ASYNC -> {
+                    // Acknowledged once appended; the background loop
+                    // above syncs periodically instead of per-write. A
+                    // crash can lose up to one sync interval of writes.
+                }
+                Durability.MEMORY_ONLY -> {
+                    // Never synced by this engine; caller owns any checkpointing.
+                }
+            }
+        }
         memTable.put(hash, bytes)
         return hash
     }
@@ -80,24 +154,20 @@ public open class ServerStorageEngine(
             if (payload.size < 32) return@recover
             val hash = KdbHash.fromBytes(payload.copyOfRange(0, 32))
             val bytes = payload.copyOfRange(32, payload.size)
-            mutex.withLock {
-                memTable.put(hash, bytes)
-            }
+            memTable.put(hash, bytes)
         }
     }
 
+    /** Stages document; it is not visible via getDocument until commitTree flushes staged writes. */
     override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
-        mutex.withLock {
-            pendingDeletes.remove(document.id)
-            pendingPuts[document.id] = document
-        }
+        pending.put(document)
     }
 
     override suspend fun getDocument(
         namespaceId: String,
         docId: KdbUuid,
         atCommit: KdbHash,
-    ): KdbDocument? = mutex.withLock { docs[docId] }
+    ): KdbDocument? = docs.get(docId)
 
     override suspend fun getDocumentOrThrow(
         namespaceId: String,
@@ -119,42 +189,50 @@ public open class ServerStorageEngine(
         batchSize: Int,
         onBatch: suspend (List<KdbDocument>) -> Unit,
     ) {
-        mutex.withLock {
-            docs.values.chunked(batchSize).forEach { onBatch(it) }
-        }
+        docs.snapshot().chunked(batchSize).forEach { onBatch(it) }
     }
 
+    /** Stages a deletion; it is not applied via getDocument until commitTree flushes staged writes. */
     override suspend fun deleteDocument(namespaceId: String, docId: KdbUuid) {
-        mutex.withLock {
-            pendingPuts.remove(docId)
-            pendingDeletes.add(docId)
-        }
+        pending.delete(docId)
     }
 
-    override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
-        val entries =
-            mutex.withLock {
-                for (id in pendingDeletes) docs.remove(id)
-                for ((id, doc) in pendingPuts) docs[id] = doc
-                pendingPuts.clear()
-                pendingDeletes.clear()
-                docs.mapValues { (_, d) -> d.contentHash }
-            }
-        return DocumentTree.build(entries)
-    }
-
+    /**
+     * Drops any putDocument/deleteDocument calls made since the last
+     * commitTree, restoring the last-committed visible state. Used to
+     * roll back a transaction whose write phase failed partway through.
+     */
     override suspend fun discardPending(namespaceId: String) {
-        mutex.withLock {
-            pendingPuts.clear()
-            pendingDeletes.clear()
+        pending.discardAll()
+    }
+
+    /**
+     * Flushes staged puts/deletes into docs (committed, sharded) and
+     * applies them to the running tree incrementally (O(delta) per
+     * changed doc via its persistent trie - DocumentTreeTrie.kt), then
+     * returns it. parentTreeHash is ignored, matching the pre-existing
+     * behavior this preserves: ServerStorageEngine has always reflected
+     * current live (now: current committed) state rather than tracking
+     * per-branch history.
+     */
+    override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
+        val (puts, deletes) = pending.takeAllAndClear()
+        return treeMu.withLock {
+            for (id in deletes) {
+                docs.delete(id)
+                tree = tree.without(id)
+            }
+            for (doc in puts) {
+                docs.put(doc)
+                tree = tree.with(doc.id, doc.contentHash)
+            }
+            tree
         }
     }
 
     override suspend fun flush(namespaceId: String) {
-        mutex.withLock {
-            memTable.flush()
-            wal?.sync()
-        }
+        memTable.flush()
+        wal?.sync()
     }
 
     override suspend fun ingestDeltaSegment(segment: DeltaSegmentRef) {}
@@ -207,7 +285,9 @@ private class DefaultStorageEngineHandle(
     override val deltaWriter: DeltaSegmentWriter?,
     override val deltaReader: DeltaSegmentReader?,
 ) : StorageEngineHandle {
-    override fun close() {}
+    override fun close() {
+        (adapter as? ServerStorageEngine)?.stopAsyncSync()
+    }
 }
 
 public class BrowserStorageEngine(

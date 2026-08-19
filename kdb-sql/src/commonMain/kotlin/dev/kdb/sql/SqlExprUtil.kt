@@ -54,6 +54,12 @@ public fun statementParameterCount(stmt: SqlStatement): Int {
             is SqlStatement.CreateTable,
             is SqlStatement.AlterTableAddColumn,
             is SqlStatement.DropTable,
+            is SqlStatement.CreateRole,
+            is SqlStatement.DropRole,
+            is SqlStatement.Grant,
+            is SqlStatement.Revoke,
+            is SqlStatement.CreateUser,
+            is SqlStatement.DropUser,
             -> emptyList()
         }
     val maxIdx = exprs.maxOfOrNull { maxParameterIndex(it) } ?: -1
@@ -89,3 +95,14 @@ public fun isDdlStatement(stmt: SqlStatement): Boolean =
         stmt is SqlStatement.CreateTable ||
         stmt is SqlStatement.AlterTableAddColumn ||
         stmt is SqlStatement.DropTable
+
+/** `CREATE ROLE`/`DROP ROLE`/`GRANT`/`REVOKE`/`CREATE USER`/`DROP USER` — handled by the wire
+ * host against `UserStore`/`RoleStore` (see docs/kdb-rbac-plan.md phase 4), gated behind the
+ * `admin` permission kind rather than the ordinary `write` check other DDL uses. */
+public fun isAdminStatement(stmt: SqlStatement): Boolean =
+    stmt is SqlStatement.CreateRole ||
+        stmt is SqlStatement.DropRole ||
+        stmt is SqlStatement.Grant ||
+        stmt is SqlStatement.Revoke ||
+        stmt is SqlStatement.CreateUser ||
+        stmt is SqlStatement.DropUser

@@ -10,6 +10,15 @@ import (
 type DocumentTree struct {
 	TreeHash codec.Hash
 	Entries  map[codec.UUID]codec.Hash
+
+	// trieRoot backs incremental With/Without updates (see
+	// document_tree_trie.go): when present, TreeHash for a derived tree
+	// is computed in O(delta) instead of O(len(Entries)). Trees built
+	// via BuildDocumentTree from a flat map (e.g. wire decode) don't
+	// carry one - With/Without fall back to a one-time O(n) trieBuild
+	// in that case, then are incremental from then on. Always correct
+	// either way; only the constant differs.
+	trieRoot *trieNode
 }
 
 func (t DocumentTree) Size() int { return len(t.Entries) }
@@ -30,7 +39,9 @@ func (t DocumentTree) With(docID codec.UUID, contentHash codec.Hash) (DocumentTr
 		entries[k] = v
 	}
 	entries[docID] = contentHash
-	return BuildDocumentTree(entries)
+	root := t.trieRootOrBuild()
+	root = trieInsert(root, docID, contentHash)
+	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
 }
 
 func (t DocumentTree) Without(docID codec.UUID) (DocumentTree, error) {
@@ -40,7 +51,20 @@ func (t DocumentTree) Without(docID codec.UUID) (DocumentTree, error) {
 			entries[k] = v
 		}
 	}
-	return BuildDocumentTree(entries)
+	root := t.trieRootOrBuild()
+	root = trieDelete(root, docID)
+	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
+}
+
+// trieRootOrBuild returns t's trie root, building one from t.Entries (O(n))
+// if t doesn't already carry one - e.g. a tree decoded from the wire via
+// BuildDocumentTree/DocumentTreeFromValue. One-time cost; every
+// subsequent With/Without on the result is O(delta).
+func (t DocumentTree) trieRootOrBuild() *trieNode {
+	if t.trieRoot != nil || len(t.Entries) == 0 {
+		return t.trieRoot
+	}
+	return trieBuild(t.Entries)
 }
 
 var emptyTree DocumentTree
@@ -56,37 +80,43 @@ func init() {
 // EmptyDocumentTree is the canonical empty tree.
 func EmptyDocumentTree() DocumentTree { return emptyTree }
 
-// BuildDocumentTree constructs a tree with content-addressed tree hash.
+// BuildDocumentTree constructs a tree with content-addressed tree hash,
+// building a full trie from entries (O(n) - see trieBuild). Used for
+// trees not derived incrementally via With/Without (e.g. wire decode);
+// the resulting tree still carries a trie, so any subsequent With/Without
+// on it is O(delta).
 func BuildDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) {
-	treeVal := entriesToArrayValue(entries)
-	reg := WireRegistry()
-	bytes, err := codec.EncodeBytes(treeVal, DocumentTreeType, reg)
-	if err != nil {
-		return DocumentTree{}, err
-	}
-	h, err := codec.HashFromBytes(SHA256Digest(bytes))
-	if err != nil {
-		return DocumentTree{}, err
-	}
 	if entries == nil {
 		entries = map[codec.UUID]codec.Hash{}
 	}
-	return DocumentTree{TreeHash: h, Entries: entries}, nil
+	root := trieBuild(entries)
+	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
 }
 
 func entriesToArrayValue(entries map[codec.UUID]codec.Hash) codec.Value {
-	ids := make([]codec.UUID, 0, len(entries))
-	for id := range entries {
-		ids = append(ids, id)
+	// Sort keys are computed once per entry (O(n) String() calls) rather
+	// than inside the comparator (O(n log n) calls, ~2x per comparison):
+	// at 2000 entries this step alone was ~12ms, over 95% of
+	// BuildDocumentTree's total cost and two orders of magnitude more
+	// than the actual SHA256/wire-encode work - see the Phase 3 note in
+	// docs/benchmarks/phase0-baseline.md. Sort order (and therefore the
+	// resulting hash) is unchanged: same comparator, same strings.
+	type keyed struct {
+		id  codec.UUID
+		key string
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		return ids[i].String() < ids[j].String()
+	sorted := make([]keyed, 0, len(entries))
+	for id := range entries {
+		sorted = append(sorted, keyed{id: id, key: id.String()})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].key < sorted[j].key
 	})
-	els := make([]codec.Value, len(ids))
-	for i, id := range ids {
+	els := make([]codec.Value, len(sorted))
+	for i, k := range sorted {
 		els[i] = codec.RecordValue{Fields: map[int]codec.Value{
-			1: uuidVal(id),
-			2: hashVal(entries[id]),
+			1: uuidVal(k.id),
+			2: hashVal(entries[k.id]),
 		}}
 	}
 	return codec.ArrayValue{Elements: els}

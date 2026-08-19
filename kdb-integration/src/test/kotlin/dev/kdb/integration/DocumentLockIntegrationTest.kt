@@ -297,4 +297,74 @@ class DocumentLockIntegrationTest {
                 server.documentLocks.releaseAll("writer")
             }
         }
+
+    @Test
+    fun multiDocTransactionRejectedAtomicallyWhenOneDocIsLockedViaWireSession() =
+        runTest {
+            val ns = "demo/users"
+            val runtime = openMemoryRuntime("demo", ns)
+            val freeDocId = KdbUuid.fromString(putJson(runtime, ns, """{"userId":"u1","name":"Alice"}"""))
+            val lockedDocId = KdbUuid.fromString(putJson(runtime, ns, """{"userId":"u2","name":"Bob"}"""))
+            val wire = defaultWireCodec()
+            val server = KdbServerRuntime(runtime)
+            val host = SqlWireHost(wire, server, ns)
+
+            suspend fun sessionBegin(id: String, corr: Int): WireMessage.SessionBeginAck {
+                val frame =
+                    wire.encode(
+                        WireMessage.SessionBegin(
+                            WireHeader(WireMessageType.SESSION_BEGIN, KDB_WIRE_PROTOCOL_VERSION, corr, 0),
+                            namespace = ns,
+                            sessionId = id,
+                            readConsistency = ReadConsistency.READ_COMMITTED.name,
+                            baseVersionHex = null,
+                        ),
+                    )
+                return wire.decode(host.handleFrame(frame)!!) as WireMessage.SessionBeginAck
+            }
+
+            val other = sessionBegin("other-holder", 10)
+            val writer = sessionBegin("multi-doc-writer", 11)
+
+            // Another session already holds lockedDocId.
+            server.documentLocks.tryAcquire(ns, lockedDocId, other.sessionId)
+            try {
+                val parent = runtime.dag.head()
+                val tx =
+                    KdbTransaction(
+                        id = KdbUuid.random(),
+                        baseVersion = parent,
+                        operations =
+                            listOf(
+                                KdbOp.Write(freeDocId, """{"userId":"u1","name":"Alice2"}"""),
+                                KdbOp.Write(lockedDocId, """{"userId":"u2","name":"Bob2"}"""),
+                            ),
+                        timestamp = KdbTimestamp.now(),
+                        authorNodeId = KdbUuid.random(),
+                    )
+                val rejected =
+                    wire.decode(
+                        host.handleFrame(
+                            wire.encode(
+                                WireMessage.TxCommit(
+                                    WireHeader(WireMessageType.TX_COMMIT, KDB_WIRE_PROTOCOL_VERSION, 12, 0),
+                                    namespace = ns,
+                                    sessionId = writer.sessionId,
+                                    transactionBytes = TransactionWireCodec.encode(tx),
+                                ),
+                            ),
+                        )!!,
+                    ) as WireMessage.SqlResult
+                assertNotNull(rejected.error)
+                assertTrue(rejected.error!!.contains("locked"))
+
+                // The whole transaction was rejected atomically: freeDocId must not still be
+                // locked by "multi-doc-writer" - a third session can acquire it immediately.
+                server.documentLocks.tryAcquire(ns, freeDocId, "third-session")
+                server.documentLocks.releaseAll("third-session")
+            } finally {
+                server.documentLocks.releaseAll(other.sessionId)
+                server.documentLocks.releaseAll(writer.sessionId)
+            }
+        }
 }

@@ -11,7 +11,11 @@ import dev.kdb.embed.runStreamOverWebSocketListen
 import dev.kdb.stream.StreamBroadcastHub
 import dev.kdb.stream.publishedCommitFrom
 import dev.kdb.auth.AllowAllAuth
+import dev.kdb.auth.AuthEngine
 import dev.kdb.auth.static.staticAuthEngineFromFile
+import dev.kdb.auth.store.RegistryAuthStore
+import dev.kdb.auth.store.dynamicAuthEngine
+import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.server.runSqlWireListen
 import dev.kdb.server.sqlWireHostFactory
 import dev.kdb.jdbc.file.openFileRuntime
@@ -31,7 +35,24 @@ public fun main(args: Array<String>) {
     val wire = defaultWireCodec()
     val serverRuntime = KdbServerRuntime(runtime)
     val product = config.productConfig
-    val auth = product.authConfigPath?.let { staticAuthEngineFromFile(it) } ?: AllowAllAuth
+    // Registry auth (--auth-registry) takes precedence over --auth-config: it's the durable,
+    // runtime-editable user/role store (docs/kdb-rbac-plan.md phases 2-4), backed by the same
+    // storage adapter the runtime already uses. It's checked first so a deployment migrating
+    // off the static file doesn't need to also drop --auth-config from its launch command.
+    val registryAuthStore =
+        if (config.authRegistry) {
+            RegistryAuthStore(
+                userDag = inMemoryCommitDag(RegistryAuthStore.USERS_NAMESPACE),
+                roleDag = inMemoryCommitDag(RegistryAuthStore.ROLES_NAMESPACE),
+                storage = runtime.storage,
+            )
+        } else {
+            null
+        }
+    val auth: AuthEngine =
+        registryAuthStore?.let { dynamicAuthEngine(it) }
+            ?: product.authConfigPath?.let { staticAuthEngineFromFile(it) }
+            ?: AllowAllAuth
     val peerListenUri = KdbFeatures.peerListenUri(product.features)
     val streamListenUri = KdbFeatures.streamListenUri(product.features)
     val sqlListenUri = KdbFeatures.sqlListenUri(product.features)
@@ -52,7 +73,15 @@ public fun main(args: Array<String>) {
             },
         )
     val peerHostFactory = peerSyncHostFactory(wire, runtime.dag, runtime.storage, peerHostConfig, auth)
-    val sqlHostFactory = sqlWireHostFactory(wire, serverRuntime, config.namespace, auth)
+    val sqlHostFactory =
+        sqlWireHostFactory(
+            wire,
+            serverRuntime,
+            config.namespace,
+            auth,
+            userStore = registryAuthStore,
+            roleStore = registryAuthStore,
+        )
     val transportOptions = transportOptionsForProduct(product.tls)
     val transport = defaultWebSocketWireTransport()
     val peerStatus = peerListenUri ?: "disabled"
@@ -105,6 +134,9 @@ internal data class ServiceConfig(
     val namespace: String,
     val schema: KdbSchema,
     val productConfig: KdbProductConfig,
+    /** --auth-registry: use a [dev.kdb.auth.store.RegistryAuthStore] (runtime-editable
+     * users/roles, see docs/kdb-rbac-plan.md) instead of the static --auth-config file. */
+    val authRegistry: Boolean = false,
 ) {
     companion object {
         fun parse(args: Array<String>): ServiceConfig {
@@ -115,6 +147,7 @@ internal data class ServiceConfig(
             var listenWs: String? = null
             var listenSqlWs: String? = null
             var authConfigPath: String? = null
+            var authRegistry = false
             var peerSyncEnabled: Boolean? = null
             var sqlWireEnabled: Boolean? = null
             var tlsEnabled: Boolean? = null
@@ -131,6 +164,7 @@ internal data class ServiceConfig(
                     "--listen-ws" -> listenWs = args.getOrNull(++i)
                     "--listen-sql-ws" -> listenSqlWs = args.getOrNull(++i)
                     "--auth-config" -> authConfigPath = args.getOrNull(++i)
+                    "--auth-registry" -> authRegistry = true
                     "--peer-sync" -> peerSyncEnabled = true
                     "--no-peer-sync" -> peerSyncEnabled = false
                     "--tls" -> tlsEnabled = true
@@ -168,7 +202,7 @@ internal data class ServiceConfig(
                     tlsTrustStorePathOverride = tlsTrustStore,
                     tlsRequireClientAuthOverride = tlsRequireClientAuth,
                 )
-            return ServiceConfig(dataDir, namespace, KdbSchema.NONE, productConfig)
+            return ServiceConfig(dataDir, namespace, KdbSchema.NONE, productConfig, authRegistry)
         }
     }
 }

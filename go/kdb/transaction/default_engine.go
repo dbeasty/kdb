@@ -254,6 +254,10 @@ func (e *defaultEngine) finalizeTransaction(
 		}
 		return nil
 	}(); abortErr != nil {
+		// The write phase failed after validation/conflict checks passed -
+		// roll back whatever was staged rather than leaving a half-applied
+		// transaction, and report it distinctly from a hard error so
+		// callers can retry cleanly.
 		_ = store.DiscardPending(d.NamespaceID)
 		return ResultAborted{Cause: abortErr}, nil
 	}

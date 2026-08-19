@@ -85,7 +85,7 @@ object BenchmarkFixture {
             val commit = dag.appendCommit(tx, parent, tree, null)
             manager.writer.applyCommit(commit, manager.registryFor(namespaceId), storage, usersSchema)
         }
-        return firstId!!.toString()
+        return firstId?.toString() ?: ""
     }
 
     @OptIn(ExperimentalPathApi::class)

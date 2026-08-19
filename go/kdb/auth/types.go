@@ -52,3 +52,36 @@ func (TxCommitAction) isAction() {}
 type PeerSyncAction struct{ Namespace string }
 
 func (PeerSyncAction) isAction() {}
+
+// DocumentWriteAction is a per-document write/delete check, resolved at document > collection >
+// database grant specificity. Raised by the Transaction Engine for each op in a transaction, not
+// just at the wire layer.
+type DocumentWriteAction struct {
+	Namespace string
+	DocID     string
+}
+
+func (DocumentWriteAction) isAction() {}
+
+type DocumentDeleteAction struct {
+	Namespace string
+	DocID     string
+}
+
+func (DocumentDeleteAction) isAction() {}
+
+type DocumentReadAction struct {
+	Namespace string
+	DocID     string
+}
+
+func (DocumentReadAction) isAction() {}
+
+// AdminAction is the RBAC admin surface: CREATE/DROP ROLE, GRANT/REVOKE, CREATE/DROP USER.
+// Gated behind the "admin" permission kind, separate from "write".
+type AdminAction struct {
+	// Scope defaults to the reserved system namespace when empty; see engine wiring.
+	Scope string
+}
+
+func (AdminAction) isAction() {}

@@ -21,7 +21,13 @@ import java.io.PrintStream
  */
 @State(Scope.Benchmark)
 open class CliWriteBenchmark {
-    @Param("100", "1000", "10000")
+    // Phase 0 baseline note (docs/benchmarks/phase0-baseline.md): docCount=10000 is
+    // intentionally excluded here. commitTree currently rebuilds the full document
+    // tree on every commit (O(namespace size) per write), so cliPut_batch's cost is
+    // O(docCount^2) total, not O(docCount) - at 10000 that is tens of millions of
+    // rebuild operations and the benchmark does not finish in practical time. This
+    // quadratic blowup is itself Phase 0 evidence for the commitTree bottleneck.
+    @Param("100", "1000")
     var docCount: Int = 100
 
     private lateinit var seeded: BenchmarkFixture.SeededFile

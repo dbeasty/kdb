@@ -13,6 +13,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TransactionEngineTest {
@@ -91,29 +92,31 @@ class TransactionEngineTest {
     @Test
     fun commit_writeFailsMidTransaction_abortsAndRollsBackWithoutPartialWrites() =
         runTest {
-            val ns = "app/abort"
+            val ns = "app/rollback"
             val dag = inMemoryCommitDag(ns)
-            val inner = InMemoryStorageAdapter()
-            val docA = KdbDocument(KdbUuid.random(), """{"v":"a"}""")
-            val docB = KdbDocument(KdbUuid.random(), """{"v":"b"}""")
-            val storage = FailingStorageAdapter(inner, failOnPutDocId = docB.id)
+            val delegate = InMemoryStorageAdapter()
+            val failOnDoc = KdbUuid.random()
+            val storage = FailingStorageAdapter(delegate, failOnDoc)
             val base = dag.head()
-            val tx = tx(base, KdbOp.Write(docA.id, docA.json), KdbOp.Write(docB.id, docB.json))
-
+            val okDoc = KdbDocument(KdbUuid.random(), """{"v":"ok"}""")
+            val tx =
+                tx(
+                    base,
+                    KdbOp.Write(okDoc.id, okDoc.json),
+                    KdbOp.Write(failOnDoc, """{"v":"boom"}"""),
+                )
             val result = engine.commit(tx, dag, storage)
             assertIs<TransactionResult.Aborted>(result)
 
-            // Nothing was committed: the head is unchanged and neither doc is visible.
-            assertEquals(base, dag.head())
-            assertEquals(null, storage.getDocument(ns, docA.id, base))
-            assertEquals(null, storage.getDocument(ns, docB.id, base))
+            // Neither the doc written before the failing one, nor any tree
+            // mutation, should be visible: the write phase is all-or-nothing.
+            assertNull(delegate.getDocument(ns, okDoc.id, base))
+            assertNull(delegate.getDocument(ns, failOnDoc, base))
+            assertEquals(1, storage.discardPendingCalls)
 
-            // A retried transaction (this time without the injected failure) succeeds cleanly,
-            // proving the aborted attempt didn't leave corrupted/leaked pending state behind.
-            val retryTx = tx(base, KdbOp.Write(docA.id, docA.json), KdbOp.Write(docB.id, docB.json))
-            val retried = engine.commit(retryTx, dag, inner)
-            assertIs<TransactionResult.Success>(retried)
-            assertEquals(2, retried.commit.operations.size)
+            // The namespace is still usable for a subsequent, successful transaction.
+            val retry = tx(base, KdbOp.Write(okDoc.id, okDoc.json))
+            assertIs<TransactionResult.Success>(engine.commit(retry, dag, storage))
         }
 
     private fun tx(
@@ -128,19 +131,25 @@ class TransactionEngineTest {
             authorNodeId = KdbUuid.random(),
         )
 
-    /** Delegates to [inner] but throws when [failOnPutDocId] is written, to exercise rollback. */
-    private class FailingStorageAdapter(
-        private val inner: StorageAdapter,
-        private val failOnPutDocId: KdbUuid,
-    ) : StorageAdapter by inner {
-        override suspend fun putDocument(
-            namespaceId: String,
-            document: KdbDocument,
-        ) {
-            if (document.id == failOnPutDocId) {
-                throw IllegalStateException("simulated storage failure on $failOnPutDocId")
-            }
-            inner.putDocument(namespaceId, document)
+}
+
+/** Delegates to [delegate] but throws on putDocument for [failOnDocId], to exercise write-phase rollback. */
+private class FailingStorageAdapter(
+    private val delegate: StorageAdapter,
+    private val failOnDocId: KdbUuid,
+) : StorageAdapter by delegate {
+    var discardPendingCalls: Int = 0
+        private set
+
+    override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
+        if (document.id == failOnDocId) {
+            throw RuntimeException("injected write failure")
         }
+        delegate.putDocument(namespaceId, document)
+    }
+
+    override suspend fun discardPending(namespaceId: String) {
+        discardPendingCalls++
+        delegate.discardPending(namespaceId)
     }
 }

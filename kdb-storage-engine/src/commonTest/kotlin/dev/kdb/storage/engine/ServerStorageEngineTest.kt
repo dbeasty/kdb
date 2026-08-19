@@ -1,7 +1,7 @@
 package dev.kdb.storage.engine
 
+import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbUuid
-import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbDocument
 import dev.kdb.storage.StorageEngineConfig
 import dev.kdb.storage.mem.InMemoryPlatformIoShim
@@ -26,39 +26,40 @@ class ServerStorageEngineTest {
 
     @Test
     fun putDocument_notVisibleUntilCommitTree() = runTest {
-        val ns = "test"
         val shim = InMemoryPlatformIoShim()
         val config = StorageEngineConfig(globalMemoryBudgetBytes = 8_000_000, ioShim = shim)
-        val handle = DefaultStorageEngineFactory(StorageEngineTarget.IN_MEMORY).open(ns, config)
-        val doc = KdbDocument(KdbUuid.random(), """{"v":"a"}""")
+        val handle = DefaultStorageEngineFactory(StorageEngineTarget.IN_MEMORY).open("test", config)
+        val adapter = handle.adapter
+        val doc = KdbDocument(KdbUuid.random(), """{"v":1}""")
 
-        handle.adapter.putDocument(ns, doc)
-        assertNull(handle.adapter.getDocument(ns, doc.id, DocumentTree.EMPTY.treeHash))
+        adapter.putDocument("test", doc)
+        assertNull(adapter.getDocument("test", doc.id, KdbHash.fromBytes(ByteArray(32))))
 
-        handle.adapter.commitTree(ns, DocumentTree.EMPTY.treeHash)
-        assertEquals(doc.json, handle.adapter.getDocument(ns, doc.id, DocumentTree.EMPTY.treeHash)?.json)
+        val tree = adapter.commitTree("test", KdbHash.fromBytes(ByteArray(32)))
+        assertEquals(doc, adapter.getDocument("test", doc.id, KdbHash.fromBytes(ByteArray(32))))
+        assertEquals(doc.contentHash, tree.hashFor(doc.id))
     }
 
     @Test
-    fun discardPending_dropsStagedWritesWithoutAffectingCommittedState() = runTest {
-        val ns = "test"
+    fun discardPending_rollsBackStagedWrites() = runTest {
         val shim = InMemoryPlatformIoShim()
         val config = StorageEngineConfig(globalMemoryBudgetBytes = 8_000_000, ioShim = shim)
-        val handle = DefaultStorageEngineFactory(StorageEngineTarget.IN_MEMORY).open(ns, config)
+        val handle = DefaultStorageEngineFactory(StorageEngineTarget.IN_MEMORY).open("test", config)
+        val adapter = handle.adapter
         val committed = KdbDocument(KdbUuid.random(), """{"v":"committed"}""")
-        val abandoned = KdbDocument(KdbUuid.random(), """{"v":"abandoned"}""")
+        adapter.putDocument("test", committed)
+        adapter.commitTree("test", KdbHash.fromBytes(ByteArray(32)))
 
-        handle.adapter.putDocument(ns, committed)
-        handle.adapter.commitTree(ns, DocumentTree.EMPTY.treeHash)
+        val staged = KdbDocument(KdbUuid.random(), """{"v":"staged"}""")
+        adapter.putDocument("test", staged)
+        adapter.deleteDocument("test", committed.id)
+        adapter.discardPending("test")
 
-        handle.adapter.putDocument(ns, abandoned)
-        handle.adapter.discardPending(ns)
+        assertNull(adapter.getDocument("test", staged.id, KdbHash.fromBytes(ByteArray(32))))
+        assertEquals(committed, adapter.getDocument("test", committed.id, KdbHash.fromBytes(ByteArray(32))))
 
-        assertEquals(committed.json, handle.adapter.getDocument(ns, committed.id, DocumentTree.EMPTY.treeHash)?.json)
-        assertNull(handle.adapter.getDocument(ns, abandoned.id, DocumentTree.EMPTY.treeHash))
-
-        // A subsequent commit produces a tree containing only the previously-committed doc.
-        val tree = handle.adapter.commitTree(ns, DocumentTree.EMPTY.treeHash)
-        assertEquals(setOf(committed.id), tree.entries.keys)
+        val tree = adapter.commitTree("test", KdbHash.fromBytes(ByteArray(32)))
+        assertNull(tree.hashFor(staged.id))
+        assertEquals(committed.contentHash, tree.hashFor(committed.id))
     }
 }
