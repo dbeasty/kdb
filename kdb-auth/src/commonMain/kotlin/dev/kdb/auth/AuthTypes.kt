@@ -41,4 +41,14 @@ public sealed class AuthAction {
     public data class TxCommit(val namespace: String) : AuthAction()
 
     public data class PeerSync(val namespace: String) : AuthAction()
+
+    /** May this principal invoke the named stored procedure at all (Layer 11 Component 32)? */
+    public data class ProcExec(
+        val namespace: String,
+        val procName: String,
+        val readOnly: Boolean,
+    ) : AuthAction()
+
+    /** May this principal define/update/delete a stored procedure in this namespace? */
+    public data class ProcManage(val namespace: String) : AuthAction()
 }

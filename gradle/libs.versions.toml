@@ -10,8 +10,11 @@ jmh-plugin = "0.7.3"
 hikari = "6.2.1"
 hibernate = "6.4.4.Final"
 flyway = "10.10.0"
+graalvm-js = "24.1.1"
 
 [libraries]
+graalvm-polyglot = { module = "org.graalvm.polyglot:polyglot", version.ref = "graalvm-js" }
+graalvm-js = { module = "org.graalvm.js:js", version.ref = "graalvm-js" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
 kotlinx-io-core = { module = "org.jetbrains.kotlinx:kotlinx-io-core", version.ref = "kotlinx-io" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }

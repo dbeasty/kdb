@@ -4,10 +4,10 @@
 
 **File:** `kdb-spec-layer11-component32-stored-procedures.md`
 **Layer:** 11 — Server-Side Scripting (new; follows Layer 10 Tooling)
-**Status:** Draft / proposal — not yet implementation-ready
-**Gradle module (proposed):** `:kdb-script` (interfaces, host API, procedure registry) + `:kdb-script-graal` (JVM engine actual, lives under `kdb-server`)
-**Depends on:** Layer 3 (`TransactionEngine`, `AuthEngine`/`AuthAction`), Layer 6 (`HybridQueryEngine`), `kdb-auth`, `kdb-server` (wire host)
-**Runs on:** JVM backend only (server / `kdb-server`), by design — see §1.2
+**Status:** Phases 1–4 implemented and tested (registry, sandboxed GraalVM runtime, host API with per-call authorization, implicit-transaction commit); Phase 5 (wire protocol / `SqlWireHost` integration), Phase 6 (audit logging, CLI) not yet started. See §11.
+**Gradle module:** `:kdb-script` — interfaces, registry, host API, and the GraalVM runtime all live in one JVM-only module (a pragmatic simplification of the original two-module `:kdb-script` + `:kdb-script-graal` split; nothing here depends on `kdb-server`, so the split can still happen later at no cost).
+**Depends on:** Layer 3 (`TransactionEngine`, `AuthEngine`/`AuthAction`), Layer 5 (`kdb-sql`, `kdb-index`), Layer 6 (`HybridQueryEngine`), `kdb-auth`
+**Runs on:** JVM backend only, by design — see §1.2
 
 -----
 
@@ -170,6 +170,8 @@ Host API surface (v1):
 | `kdb.log(msg)` | appends to `ProcResult.logs`, capped by `ProcLimits.maxLogBytes` | no external sink; not `console.log` writing to server stdout |
 
 Every one of these is a thin wrapper that (a) increments the call's `maxHostCalls` budget, (b) calls `Authorizer.authorize(principal, action)` before doing anything, (c) delegates to the existing engine. No host function bypasses the authorizer, including the one calling itself via `callProc`.
+
+**`kdb_id` round-tripping (implementation note).** `kdb_id` is a SQL pseudo-column (Component 15) — it is not part of a document's own JSON body, so `SELECT _doc FROM ns WHERE kdb_id = ?` never returns it embedded in the result. `kdb.get(id)` merges it in (`{...doc, kdb_id: id}`) purely so that `kdb.put(doc)` can tell, by the presence of that field, whether to `UPDATE ... WHERE kdb_id = ?` or `INSERT`; `kdb.put` strips it back out of the body before writing `_doc` so stored content isn't polluted by the injected field. A script that constructs a brand-new object (rather than spreading a `kdb.get` result) simply gets an `INSERT`, exactly as documented in §7.1.
 
 -----
 
@@ -368,3 +370,16 @@ Each phase should ship with tests before the next starts, per the project's exis
 - Do we want a `dry-run`/`explain` mode for `ProcExec` (mirrors `HybridQueryEngine.explain`) so operators can see what a procedure *would* touch before granting broader `ProcExec` grants?
 - Is per-procedure rate limiting (calls/sec per principal) needed at the wire layer, or is `ProcLimits` per-invocation enough?
 - Native/embedded execution of procedures (QuickJS actual) — worth doing, or keep this permanently server-only?
+
+-----
+
+## 11. Implementation status
+
+Phases 1–4 are implemented in `:kdb-script`, with tests (`ProcedureRegistryTest`, `GraalProcedureRuntimeTest`) exercising registry versioning, the full define→execute flow against real (in-memory) engines, sandbox escape resistance (`Java.type(...)` fails), wall-clock timeout interruption of a busy loop, and — the load-bearing case — a principal authorized to *invoke* a procedure but not to *write* getting denied mid-script with the transaction left uncommitted.
+
+Two real findings surfaced while wiring this to the actual engines, both fixed:
+
+1. **`kdb-sql`'s `DmlExecutor.evalDocAssignment` never handled a bound parameter** — `UPDATE ns SET _doc = ? WHERE kdb_id = ?` silently left the document unchanged (it only handled `SqlExpr.Literal`/`SqlExpr.FunctionCall`, falling through to `currentJson` for `SqlExpr.Parameter`). This blocked exactly the parameterized-write pattern §5.3 requires (`kdb.put` must never string-build SQL), so it's fixed at the source in `kdb-sql`, not worked around in `kdb-script`. Any other caller doing a parameterized `_doc` update gets the same fix.
+2. **`kdb_id` isn't part of a document's JSON body** — see the implementation note in §4. `kdb.get` embeds it, `kdb.put` strips it back out.
+
+Remaining before this is callable over the wire: Phase 5 (`WireMessage.ProcExec`/`ProcDefine`, `SqlWireHost`/`ProcWireHost` integration) and Phase 6 (audit logging, `kdb-cli proc` subcommand). The `HybridScriptDataAccess`/`GraalProcedureRuntime` pair is wire-protocol-agnostic, so Phase 5 is additive — no changes anticipated to the code landed so far.

@@ -115,6 +115,15 @@ internal class DmlExecutor(
                     is SqlCell.StringVal -> cell.value
                     else -> currentJson
                 }
+            // Bound parameter, e.g. `UPDATE ns SET _doc = ? WHERE kdb_id = ?` - the parameterized
+            // form callers must use to avoid building SQL by string concatenation of document
+            // JSON (see Component 32 spec §5.3: kdb.put never string-builds SQL text).
+            is SqlExpr.Parameter ->
+                when (val cell = SqlPredicate.evalCell(expr, doc, context.schema, context.parameters)) {
+                    is SqlCell.JsonVal -> cell.json
+                    is SqlCell.StringVal -> cell.value
+                    else -> currentJson
+                }
             else -> currentJson
         }
 

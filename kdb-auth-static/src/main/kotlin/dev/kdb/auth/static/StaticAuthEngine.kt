@@ -80,6 +80,10 @@ private class StaticAuthorizer(
                     "write" to action.namespace
                 is AuthAction.PeerSync ->
                     "sync" to action.namespace
+                is AuthAction.ProcExec ->
+                    (if (action.readOnly) "proc-read" else "proc-write") to action.namespace
+                is AuthAction.ProcManage ->
+                    "proc-manage" to action.namespace
             }
         if (!principalHasPermission(principal, roles, kind, namespace)) {
             throw KdbAuthorizationException(

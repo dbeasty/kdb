@@ -42,4 +42,19 @@ public enum class KdbErrorCode(public val numericCode: Int) {
 
     AUTHENTICATION_FAILED(6301),
     AUTHORIZATION_FAILED(6302),
+
+    /** Layer 11 Component 32: no procedure registered under that namespace/name. */
+    SCRIPT_NOT_FOUND(8001),
+
+    /** Layer 11 Component 32: restricted-JS source failed to compile/parse. */
+    SCRIPT_COMPILE_ERROR(8002),
+
+    /** Layer 11 Component 32: procedure exceeded its wall-clock budget and was interrupted. */
+    SCRIPT_TIMEOUT(8003),
+
+    /** Layer 11 Component 32: procedure exceeded a call-count/log-size/heap budget. */
+    SCRIPT_RESOURCE_LIMIT(8004),
+
+    /** Layer 11 Component 32: uncaught exception thrown by the script body itself. */
+    SCRIPT_RUNTIME_ERROR(8005),
 }
