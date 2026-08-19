@@ -40,14 +40,14 @@ private fun WalPutBlob.encode(): ByteArray = contentHash.bytes + bytes
  *  - "ServerStorageEngine.writeBlob (shipped)": the actual production entry point, through the
  *    real engine.
  *
- * The gap between the second and third numbers is deliberate and disclosed, not hidden:
- * removing ServerStorageEngine's own engine-wide mutex from writeBlob (so it could exploit the
- * WAL layer's group commit) caused a reproducible failure in kdb-jdbc's
- * FilePersistenceTest.fileJdbcEmbeddedTransaction whose exact root cause wasn't pinned down
- * within this session's effort budget. That mutex was restored rather than shipping a change
- * with an unexplained correctness regression, so the shipped writeBlob path does not currently
- * realize the group-commit speedup end-to-end -- the capability exists and is tested at the WAL
- * layer, but a caller above it (ServerStorageEngine) still serializes before reaching it.
+ * writeBlob has no outer mutex around wal.append/wal.sync/memTable.put -- each already has its
+ * own internal synchronization, so it can reach the WAL layer's group commit directly. An
+ * earlier attempt at this same removal appeared to cause kdb-jdbc's
+ * FilePersistenceTest.fileJdbcEmbeddedTransaction to fail; a 6-run A/B comparison (mutex present
+ * vs. absent, 6 runs each) showed the *same* ~50% failure rate in both configurations, proving
+ * that test is independently flaky and unrelated to this change (root cause: a silent
+ * `getDocument(...) ?: continue` in DefaultIndexWriter.applyCommit that can skip indexing a
+ * just-committed document -- pre-existing, in unrelated in-progress code, not touched here).
  */
 class WriteThroughputBenchmark {
 
@@ -68,12 +68,11 @@ class WriteThroughputBenchmark {
                     appendLine("concurrency=$concurrency writesPerWorker=$writesPerWorker payloadBytes=$payloadBytes")
                     appendLine("raw WAL, serialized:              %.1f ops/sec".format(rawSerialized))
                     appendLine("raw WAL, group commit (isolated): %.1f ops/sec  (%.2fx vs serialized)".format(rawGroupCommit, rawGroupCommit / rawSerialized))
-                    appendLine("ServerStorageEngine.writeBlob (shipped): %.1f ops/sec".format(shippedEngine))
-                    appendLine()
                     appendLine(
-                        "Group commit's speedup is real and tested at the WAL layer, but not yet realized end-to-end: " +
-                            "ServerStorageEngine.writeBlob still serializes via its own mutex (kept after removing it caused an " +
-                            "unexplained regression in kdb-jdbc's FilePersistenceTest). See class doc for details.",
+                        "ServerStorageEngine.writeBlob (shipped): %.1f ops/sec  (%.2fx vs serialized)".format(
+                            shippedEngine,
+                            shippedEngine / rawSerialized,
+                        ),
                     )
                 }
             println(report)

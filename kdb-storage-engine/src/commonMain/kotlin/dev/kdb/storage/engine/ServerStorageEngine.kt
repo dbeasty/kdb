@@ -46,18 +46,24 @@ public open class ServerStorageEngine(
 
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {
         val hash = KdbHash.fromBytes(kdbSha256(bytes))
-        mutex.withLock {
-            wal?.append(
-                WalRecord(
-                    0,
-                    KdbTimestamp.now(),
-                    WalRecordKind.PutBlob,
-                    WalPutBlob(hash, bytes).encode(),
-                ),
-            )
-            wal?.sync()
-            memTable.put(hash, bytes)
-        }
+        // No outer engine-wide mutex here: wal.append (own internal mutex, sequences safely),
+        // wal.sync (group-commit -- concurrent callers batch onto one fsync), and memTable.put
+        // (own internal mutex) are each independently safe for concurrent callers. An earlier
+        // attempt to remove this mutex was reverted after appearing to cause kdb-jdbc's
+        // FilePersistenceTest to fail; a repeated-run comparison later showed that test fails at
+        // the same ~50% rate with or without this mutex (pre-existing flake, unrelated -- see
+        // DefaultIndexWriter.applyCommit's silent `?: continue` on a getDocument miss), so the
+        // mutex was removed again since it never was the cause and bought no correctness.
+        wal?.append(
+            WalRecord(
+                0,
+                KdbTimestamp.now(),
+                WalRecordKind.PutBlob,
+                WalPutBlob(hash, bytes).encode(),
+            ),
+        )
+        wal?.sync()
+        memTable.put(hash, bytes)
         return hash
     }
 
