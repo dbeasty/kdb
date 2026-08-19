@@ -41,4 +41,13 @@ public sealed class AuthAction {
     public data class TxCommit(val namespace: String) : AuthAction()
 
     public data class PeerSync(val namespace: String) : AuthAction()
+
+    /** Per-document write/delete check, resolved at document > collection > database grant
+     * specificity. Raised by the Transaction Engine for each op in a transaction, not just at
+     * the wire layer, so a grant scoped below the namespace can actually be enforced. */
+    public data class DocumentWrite(val namespace: String, val docId: String) : AuthAction()
+
+    public data class DocumentDelete(val namespace: String, val docId: String) : AuthAction()
+
+    public data class DocumentRead(val namespace: String, val docId: String) : AuthAction()
 }
