@@ -30,6 +30,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.time.TimeSource
 
 public open class ServerStorageEngine(
@@ -60,6 +62,18 @@ public open class ServerStorageEngine(
     private val memTable = MemTableManager(namespaceId, config.ioShim, blobStore)
     private val docs = ShardedDocStore()
     private val enlistmentStates = mutableMapOf<KdbUuid, EnlistmentEvictionState>()
+
+    // treeMu guards tree, a running DocumentTree updated incrementally
+    // (O(delta) via its persistent trie - see DocumentTreeTrie.kt) on
+    // every putDocument/deleteDocument instead of being rebuilt from a
+    // full docs snapshot in commitTree, which is what it did before this
+    // gap fix (mirrors Go's ServerEngine - see
+    // docs/benchmarks/phases-1-6-summary.md). This reintroduces a single
+    // lock on the put/delete path, but the work done under it is now
+    // O(delta) (one trie insert/delete) rather than commitTree's old
+    // O(namespace size) snapshot-and-rebuild.
+    private val treeMu = Mutex()
+    private var tree = DocumentTree.EMPTY
 
     private val asyncScope: CoroutineScope? =
         if (wal != null && config.durability == Durability.ASYNC) {
@@ -139,6 +153,7 @@ public open class ServerStorageEngine(
 
     override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
         docs.put(document)
+        treeMu.withLock { tree = tree.with(document.id, document.contentHash) }
     }
 
     override suspend fun getDocument(
@@ -172,18 +187,18 @@ public open class ServerStorageEngine(
 
     override suspend fun deleteDocument(namespaceId: String, docId: KdbUuid) {
         docs.delete(docId)
+        treeMu.withLock { tree = tree.without(docId) }
     }
 
-    override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
-        val lockWaitStart = TimeSource.Monotonic.markNow()
-        val snapshot = docs.snapshot()
-        StageRecorder.Default.record(StorageStage.LOCK_WAIT, lockWaitStart.elapsedNow())
-        val entries = snapshot.associate { it.id to it.contentHash }
-        val rebuildStart = TimeSource.Monotonic.markNow()
-        val tree = DocumentTree.build(entries)
-        StageRecorder.Default.record(StorageStage.TREE_REBUILD, rebuildStart.elapsedNow())
-        return tree
-    }
+    /**
+     * Returns the running tree maintained incrementally by
+     * putDocument/deleteDocument (parentTreeHash is ignored, matching the
+     * pre-existing behavior this preserves: ServerStorageEngine has
+     * always reflected current live state rather than tracking
+     * per-branch history).
+     */
+    override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree =
+        treeMu.withLock { tree }
 
     override suspend fun flush(namespaceId: String) {
         memTable.flush()

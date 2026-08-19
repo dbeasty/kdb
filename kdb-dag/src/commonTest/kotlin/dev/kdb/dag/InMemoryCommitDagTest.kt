@@ -14,13 +14,19 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class InMemoryCommitDagTest {
-    /** Matches Go `dag.NewInMemoryCommitDag("app/t")` genesis after RFC-6234 SHA-256 alignment. */
+    /**
+     * Matches Go `dag.NewInMemoryCommitDag("app/t")` genesis. Regenerated
+     * after the DocumentTree hash algorithm changed to the trie-based
+     * scheme (see the gap-fix note in docs/benchmarks/phases-1-6-summary.md)
+     * - both sides were computed independently and agree, which is itself
+     * a cross-language interop check for the empty tree's hash.
+     */
     @Test
     fun genesisCommitHash_matchesGoForNamespaceAppSlashT() =
         runTest {
             val dag = inMemoryCommitDag("app/t")
             assertEquals(
-                "5ed3ef44f65fc2f179890bbeb3e5fb05fa0ed5972e3c8cb9bac045f1fe6602d8",
+                "136e831b1bb7a2ed3949e5264b17233117d0868627030f9ccea4a601559ec0ab",
                 dag.head().toHex(),
             )
         }
