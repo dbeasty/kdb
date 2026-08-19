@@ -210,6 +210,8 @@ public class RegistryAuthStore(
                 throw IllegalStateException("registry write conflict: ${result.report.conflicts.size} operation(s)")
             is TransactionResult.SchemaError ->
                 throw IllegalStateException("registry write rejected: ${result.violations.size} violation(s)")
+            is TransactionResult.Aborted ->
+                throw IllegalStateException("registry write aborted: ${result.cause.message}", result.cause)
         }
     }
 
