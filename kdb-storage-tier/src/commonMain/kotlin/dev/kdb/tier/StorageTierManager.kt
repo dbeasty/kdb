@@ -1,6 +1,7 @@
 package dev.kdb.tier
 
-import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbTimestamp
+import dev.kdb.codec.KdbUuid
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.document.DocumentTree
@@ -11,7 +12,9 @@ import dev.kdb.error.ArchiveRestoreException
 import dev.kdb.error.VersionNotFoundException
 import dev.kdb.policy.NamespacePolicy
 import dev.kdb.schema.KdbSchema
+import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.StorageAdapter
+import dev.kdb.storage.mem.InMemoryPlatformIoShim
 import dev.kdb.storage.manager.tier.DeltaLogTierRegistry
 import dev.kdb.storage.manager.tier.SegmentTier
 import kotlinx.coroutines.CoroutineScope
@@ -24,11 +27,24 @@ import kotlinx.coroutines.sync.withLock
 
 public interface StorageTierManager {
     public fun start()
+
     public fun stop()
+
+    /** Walks HOT/WARM segments for [namespaceId] against policy age bands and demotes any that are due. */
     public suspend fun runCycle(namespaceId: String): TierCycleResult
+
     public suspend fun archiveCommit(request: ArchiveRequest): ArchiveResult
+
     public suspend fun restoreArchive(request: RestoreRequest): RestoreResult
+
+    /** Moves one segment's bytes to [SegmentMoveRequest.toTier] regardless of age — explicit/manual path. */
     public suspend fun moveSegment(request: SegmentMoveRequest): SegmentMoveResult
+
+    /** Reads a segment's bytes from wherever it currently lives (HOT/WARM/COLD). Throws for ICE — archived segments require [restoreArchive]. */
+    public suspend fun readSegmentBytes(
+        namespaceId: String,
+        segmentId: KdbUuid,
+    ): ByteArray
 }
 
 public fun storageTierManager(
@@ -38,8 +54,10 @@ public fun storageTierManager(
     policyProvider: suspend (String) -> NamespacePolicy,
     backends: TierBackendRegistry = inMemoryTierBackendRegistry(),
     bundleWriter: IceBundleWriter = DefaultIceBundleWriter(),
+    ioShim: PlatformIoShim = InMemoryPlatformIoShim(),
+    clockMillis: () -> Long = { KdbTimestamp.now().epochMillis },
 ): StorageTierManager =
-    DefaultStorageTierManager(dag, storage, tierRegistry, policyProvider, backends, bundleWriter)
+    DefaultStorageTierManager(dag, storage, tierRegistry, policyProvider, backends, bundleWriter, ioShim, clockMillis)
 
 internal class DefaultStorageTierManager(
     private val dag: CommitDag,
@@ -48,21 +66,23 @@ internal class DefaultStorageTierManager(
     private val policyProvider: suspend (String) -> NamespacePolicy,
     private val backends: TierBackendRegistry,
     private val bundleWriter: IceBundleWriter,
+    private val ioShim: PlatformIoShim,
+    private val clockMillis: () -> Long,
 ) : StorageTierManager {
     private var scope: CoroutineScope? = null
     private var signalJob: Job? = null
     private val mutex = Mutex()
+
+    /** Where a segment's bytes currently live once it has left HOT (HOT is derived from namespace+id instead). */
+    private val segmentLocations = mutableMapOf<KdbUuid, String>()
 
     override fun start() {
         val sc = CoroutineScope(kotlinx.coroutines.Dispatchers.Default + Job())
         scope = sc
         signalJob =
             tierRegistry.tierSignals
-                .onEach { signal ->
-                    if (signal.to == SegmentTier.COLD) {
-                        // v1: logical cold mark only for in-memory registry
-                    }
-                }.launchIn(sc)
+                .onEach { }
+                .launchIn(sc)
     }
 
     override fun stop() {
@@ -74,12 +94,38 @@ internal class DefaultStorageTierManager(
 
     override suspend fun runCycle(namespaceId: String): TierCycleResult =
         mutex.withLock {
-            try {
-                policyProvider(namespaceId)
-            } catch (_: Throwable) {
-                return TierCycleResult(0, 0, listOf(TierJobError("policy missing", false)))
+            val policy =
+                try {
+                    policyProvider(namespaceId)
+                } catch (_: Throwable) {
+                    return TierCycleResult(0, 0, listOf(TierJobError("policy missing", false)))
+                }
+            val now = clockMillis()
+            var moved = 0
+            val errors = mutableListOf<TierJobError>()
+
+            suspend fun demoteDueSegments(
+                fromTier: SegmentTier,
+                toTier: SegmentTier,
+                maxAgeMillis: Long,
+            ) {
+                for (segmentId in tierRegistry.segmentsInTier(namespaceId, fromTier)) {
+                    val sealedAt = tierRegistry.sealedAtMillis(segmentId) ?: continue
+                    if (now - sealedAt >= maxAgeMillis) {
+                        try {
+                            moveSegmentLocked(namespaceId, segmentId, toTier)
+                            moved++
+                        } catch (e: Throwable) {
+                            errors += TierJobError(e.message ?: "move failed", retryable = true)
+                        }
+                    }
+                }
             }
-            TierCycleResult(segmentsMoved = 0, archivesStarted = 0, errors = emptyList())
+
+            demoteDueSegments(SegmentTier.HOT, SegmentTier.WARM, policy.tiers.hot.maxAgeMillis)
+            demoteDueSegments(SegmentTier.WARM, SegmentTier.COLD, policy.tiers.warm.maxAgeMillis)
+
+            TierCycleResult(segmentsMoved = moved, archivesStarted = 0, errors = errors)
         }
 
     override suspend fun archiveCommit(request: ArchiveRequest): ArchiveResult =
@@ -132,11 +178,69 @@ internal class DefaultStorageTierManager(
         )
     }
 
-    override suspend fun moveSegment(request: SegmentMoveRequest): SegmentMoveResult {
-        val current = tierRegistry.tierOf(request.segmentId)
-        if (current == request.toTier) {
-            return SegmentMoveResult(0, null, null)
+    override suspend fun moveSegment(request: SegmentMoveRequest): SegmentMoveResult =
+        mutex.withLock { moveSegmentLocked(request.namespaceId, request.segmentId, request.toTier) }
+
+    override suspend fun readSegmentBytes(
+        namespaceId: String,
+        segmentId: KdbUuid,
+    ): ByteArray =
+        mutex.withLock {
+            when (val tier = tierRegistry.tierOf(segmentId) ?: throw TierJobSkippedException(namespaceId, "unknown segment $segmentId")) {
+                SegmentTier.HOT -> {
+                    val ref = tierRegistry.refOf(segmentId) ?: throw TierJobSkippedException(namespaceId, "no ref for $segmentId")
+                    HotSegmentAccess.readBytes(ioShim, namespaceId, ref)
+                }
+                SegmentTier.ICE ->
+                    throw TierJobSkippedException(namespaceId, "segment $segmentId archived to ice; call restoreArchive")
+                else -> {
+                    val loc = segmentLocations[segmentId] ?: throw TierJobSkippedException(namespaceId, "no location for $segmentId")
+                    backends.get(backendIdFor(tier)).get(loc)
+                }
+            }
         }
-        return SegmentMoveResult(0, null, "mem://${request.segmentId}")
+
+    /** Caller must hold [mutex]. */
+    private suspend fun moveSegmentLocked(
+        namespaceId: String,
+        segmentId: KdbUuid,
+        toTier: SegmentTier,
+    ): SegmentMoveResult {
+        val currentTier =
+            tierRegistry.tierOf(segmentId) ?: throw TierJobSkippedException(namespaceId, "unknown segment $segmentId")
+        if (currentTier == toTier) return SegmentMoveResult(0, null, null)
+        val ref = tierRegistry.refOf(segmentId) ?: throw TierJobSkippedException(namespaceId, "no segment ref for $segmentId")
+
+        val bytes: ByteArray
+        val sourcePath: String
+        if (currentTier == SegmentTier.HOT) {
+            bytes = HotSegmentAccess.readBytes(ioShim, namespaceId, ref)
+            sourcePath = "hot://$namespaceId/$segmentId"
+        } else {
+            val loc = segmentLocations[segmentId] ?: throw TierJobSkippedException(namespaceId, "no location for $segmentId")
+            bytes = backends.get(backendIdFor(currentTier)).get(loc)
+            sourcePath = loc
+        }
+
+        val destBackend = backends.get(backendIdFor(toTier))
+        val destLocation = destBackend.put("$namespaceId/$segmentId.seg", bytes)
+
+        if (currentTier == SegmentTier.HOT) {
+            HotSegmentAccess.delete(ioShim, namespaceId, segmentId)
+        } else {
+            backends.get(backendIdFor(currentTier)).delete(segmentLocations.getValue(segmentId))
+        }
+        segmentLocations[segmentId] = destLocation
+        tierRegistry.setTier(segmentId, toTier)
+
+        return SegmentMoveResult(bytes.size.toLong(), sourcePath, destLocation)
     }
+
+    private fun backendIdFor(tier: SegmentTier): String =
+        when (tier) {
+            SegmentTier.WARM -> "default-warm"
+            SegmentTier.COLD -> "default-cold"
+            SegmentTier.ICE -> "default-ice"
+            SegmentTier.HOT -> error("HOT segments have no backend; read via ioShim directly")
+        }
 }

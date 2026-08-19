@@ -29,6 +29,7 @@ kotlin {
             implementation(project(":kdb-namespace-policy"))
             implementation(project(":kdb-schema"))
             implementation(project(":kdb-storage"))
+            implementation(project(":kdb-storage-io"))
             implementation(project(":kdb-storage-manager"))
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
@@ -36,6 +37,7 @@ kotlin {
         commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
+            implementation(project(":kdb-transaction"))
         }
     }
 }
