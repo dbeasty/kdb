@@ -20,8 +20,6 @@ import dev.kdb.storage.wal.WalPutBlob
 import dev.kdb.storage.wal.WalRecord
 import dev.kdb.storage.wal.WalRecordKind
 import dev.kdb.storage.wal.WriteAheadLog
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlin.time.TimeSource
 
 public open class ServerStorageEngine(
@@ -39,17 +37,18 @@ public open class ServerStorageEngine(
             indexRetentionDefault = IndexRetention.EVICTABLE,
         )
 
-    // docsMu guards the document map only. It is intentionally separate
-    // from writeBlob: WriteAheadLog.append and MemTableManager.put are
-    // each independently thread-safe (their own internal Mutex), so blob
-    // writes never take a namespace-wide lock at all - mirrors the Go
-    // ServerEngine change; see docs/benchmarks/phase0-baseline.md Phase 1.
-    private val docsMu = Mutex()
+    // docs is sharded (ShardedDocStore) rather than guarded by one
+    // namespace-wide mutex: put/get/delete for different documents now
+    // proceed in parallel as long as they land in different shards. It
+    // is intentionally separate from writeBlob: WriteAheadLog.append and
+    // MemTableManager.put are each independently thread-safe, so blob
+    // writes never take a lock at all - see Phase 1/2 of
+    // docs/benchmarks/phase0-baseline.md.
     private val groupCommit = GroupCommitter()
     private val cache = BlockCache(config.globalMemoryBudgetBytes / 4)
     private val blobStore = LsmBlobStore(config.ioShim, namespaceId, cache)
     private val memTable = MemTableManager(namespaceId, config.ioShim, blobStore)
-    private val docs = mutableMapOf<KdbUuid, KdbDocument>()
+    private val docs = ShardedDocStore()
     private val enlistmentStates = mutableMapOf<KdbUuid, EnlistmentEvictionState>()
 
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {
@@ -84,21 +83,19 @@ public open class ServerStorageEngine(
             if (payload.size < 32) return@recover
             val hash = KdbHash.fromBytes(payload.copyOfRange(0, 32))
             val bytes = payload.copyOfRange(32, payload.size)
-            docsMu.withLock {
-                memTable.put(hash, bytes)
-            }
+            memTable.put(hash, bytes)
         }
     }
 
     override suspend fun putDocument(namespaceId: String, document: KdbDocument) {
-        docsMu.withLock { docs[document.id] = document }
+        docs.put(document)
     }
 
     override suspend fun getDocument(
         namespaceId: String,
         docId: KdbUuid,
         atCommit: KdbHash,
-    ): KdbDocument? = docsMu.withLock { docs[docId] }
+    ): KdbDocument? = docs.get(docId)
 
     override suspend fun getDocumentOrThrow(
         namespaceId: String,
@@ -120,21 +117,18 @@ public open class ServerStorageEngine(
         batchSize: Int,
         onBatch: suspend (List<KdbDocument>) -> Unit,
     ) {
-        docsMu.withLock {
-            docs.values.chunked(batchSize).forEach { onBatch(it) }
-        }
+        docs.snapshot().chunked(batchSize).forEach { onBatch(it) }
     }
 
     override suspend fun deleteDocument(namespaceId: String, docId: KdbUuid) {
-        docsMu.withLock { docs.remove(docId) }
+        docs.delete(docId)
     }
 
     override suspend fun commitTree(namespaceId: String, parentTreeHash: KdbHash): DocumentTree {
         val lockWaitStart = TimeSource.Monotonic.markNow()
-        val entries = docsMu.withLock {
-            StageRecorder.Default.record(StorageStage.LOCK_WAIT, lockWaitStart.elapsedNow())
-            docs.mapValues { (_, d) -> d.contentHash }
-        }
+        val snapshot = docs.snapshot()
+        StageRecorder.Default.record(StorageStage.LOCK_WAIT, lockWaitStart.elapsedNow())
+        val entries = snapshot.associate { it.id to it.contentHash }
         val rebuildStart = TimeSource.Monotonic.markNow()
         val tree = DocumentTree.build(entries)
         StageRecorder.Default.record(StorageStage.TREE_REBUILD, rebuildStart.elapsedNow())
@@ -142,10 +136,8 @@ public open class ServerStorageEngine(
     }
 
     override suspend fun flush(namespaceId: String) {
-        docsMu.withLock {
-            memTable.flush()
-            wal?.sync()
-        }
+        memTable.flush()
+        wal?.sync()
     }
 
     override suspend fun ingestDeltaSegment(segment: DeltaSegmentRef) {}

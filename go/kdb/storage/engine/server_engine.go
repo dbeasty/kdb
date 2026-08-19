@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"sync"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -21,16 +20,17 @@ type ServerEngine struct {
 	wal         wal.WriteAheadLog
 	groupCommit *wal.GroupCommitter
 
-	// docsMu guards the document map only. It is intentionally separate
-	// from the blob write path (WriteBlob): WAL.Append and memTable.Put
-	// are each independently thread-safe, so blob writes never take a
-	// namespace-wide lock at all - see WriteBlob and Phase 1/2 of
-	// docs/benchmarks/phase0-baseline.md for why that mattered.
-	docsMu            sync.Mutex
-	cap               storage.CapabilitySet
-	memTable          *memtable.Manager
-	docs              map[codec.UUID]document.Document
-	enlistmentStates  map[codec.UUID]storage.EnlistmentEvictionState
+	// docs is sharded (see doc_shard.go) rather than guarded by one
+	// namespace-wide mutex: PutDocument/GetDocument/DeleteDocument for
+	// different documents now proceed in parallel as long as they land
+	// in different shards. It is intentionally separate from the blob
+	// write path (WriteBlob): WAL.Append and memTable.Put are each
+	// independently thread-safe, so blob writes never take a lock at
+	// all - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
+	cap              storage.CapabilitySet
+	memTable         *memtable.Manager
+	docs             *shardedDocStore
+	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
 	asyncStop chan struct{}
 	asyncDone chan struct{}
@@ -54,7 +54,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		groupCommit:      wal.NewGroupCommitter(),
 		cap:              cap,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
-		docs:             make(map[codec.UUID]document.Document),
+		docs:             newShardedDocStore(),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
 	}
 	if w != nil && config.Durability == storage.DurabilityAsync {
@@ -169,26 +169,19 @@ func (e *ServerEngine) RecoverBlobsFromWal() error {
 			return err
 		}
 		bytes := append([]byte(nil), payload[32:]...)
-		e.docsMu.Lock()
 		e.memTable.Put(h, bytes)
-		e.docsMu.Unlock()
 		return nil
 	})
 	return err
 }
 
 func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) error {
-	e.docsMu.Lock()
-	defer e.docsMu.Unlock()
-	cp := doc
-	e.docs[doc.ID] = cp
+	e.docs.Put(doc)
 	return nil
 }
 
 func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
-	e.docsMu.Lock()
-	defer e.docsMu.Unlock()
-	d, ok := e.docs[docID]
+	d, ok := e.docs.Get(docID)
 	if !ok {
 		return nil, nil
 	}
@@ -224,12 +217,7 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	if batchSize <= 0 {
 		batchSize = 256
 	}
-	e.docsMu.Lock()
-	vals := make([]document.Document, 0, len(e.docs))
-	for _, d := range e.docs {
-		vals = append(vals, d)
-	}
-	e.docsMu.Unlock()
+	vals := e.docs.Snapshot()
 	for i := 0; i < len(vals); i += batchSize {
 		end := i + batchSize
 		if end > len(vals) {
@@ -243,29 +231,24 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 }
 
 func (e *ServerEngine) DeleteDocument(namespaceID string, docID codec.UUID) error {
-	e.docsMu.Lock()
-	defer e.docsMu.Unlock()
-	delete(e.docs, docID)
+	e.docs.Delete(docID)
 	return nil
 }
 
 func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
-	e.docsMu.Lock()
-	defer e.docsMu.Unlock()
-	entries := make(map[codec.UUID]codec.Hash, len(e.docs))
-	for id, d := range e.docs {
+	vals := e.docs.Snapshot()
+	entries := make(map[codec.UUID]codec.Hash, len(vals))
+	for _, d := range vals {
 		h, err := d.ContentHash()
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
-		entries[id] = h
+		entries[d.ID] = h
 	}
 	return document.BuildDocumentTree(entries)
 }
 
 func (e *ServerEngine) Flush(namespaceID string) error {
-	e.docsMu.Lock()
-	defer e.docsMu.Unlock()
 	_, err := e.memTable.Flush(0)
 	if err != nil {
 		return err
