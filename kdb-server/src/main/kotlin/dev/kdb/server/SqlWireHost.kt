@@ -307,6 +307,7 @@ public class SqlWireHost(
                     session.namespaceId,
                     effective,
                     sessionId = session.id.value,
+                    authorizer = sqlAuth.writeAuthorizerFor(session.principal),
                 )
             finishCommittedSession(session, commit.hash, effective.operations.size)
             WireMessage.SqlResult(
@@ -349,6 +350,7 @@ public class SqlWireHost(
                     session.namespaceId,
                     effective,
                     sessionId = session.id.value,
+                    authorizer = sqlAuth.writeAuthorizerFor(session.principal),
                 )
             finishCommittedSession(session, commit.hash, effective.operations.size)
             WireMessage.SqlResult(
@@ -454,7 +456,8 @@ public class SqlWireHost(
         }
         val tx = TransactionWireCodec.decode(msg.transactionBytes)
         val replayTarget = server.runtime.dag.head()
-        return when (val result = server.replay(msg.namespace, tx, replayTarget)) {
+        val authorizer = sqlAuth.writeAuthorizerFor(sqlAuth.connectionPrincipal)
+        return when (val result = server.replay(msg.namespace, tx, replayTarget, authorizer = authorizer)) {
             is TransactionResult.Success ->
                 WireMessage.SqlResult(
                     header(msg.header.correlationId, WireMessageType.SQL_RESULT),

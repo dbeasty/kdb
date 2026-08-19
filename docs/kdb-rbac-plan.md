@@ -1,7 +1,8 @@
 # KDB User Management & Resource-Scoped RBAC — Plan
 
-Status: proposal (not yet a numbered spec component). Author context: written after auditing
-current `kdb-auth`/`kdb-auth-static` state, 2026-08-19.
+Status: phases 1-3 implemented (2026-08-19); phase 4 (SQL DDL surface) and Go-side store/
+enforcement not yet done. Not a numbered spec component. See "Implementation status" at the
+bottom for what actually landed vs. what's still open.
 
 ## Current state (as of this writing)
 
@@ -163,6 +164,54 @@ Two ways in, both driving the same `UserStore`/`RoleStore`:
 5. **Migration**: document how existing `StaticAuthConfig` deployments migrate users/roles into
    the system-collection store (one-shot import command), then treat the static provider as
    dev-only going forward.
+
+## Implementation status (2026-08-19)
+
+**Phase 1 — done.** `ResourcePath` (`kdb-auth/.../ResourcePath.kt`, `go/kdb/auth/resource_path.go`),
+generalized `principalHasPermission`/`permissionMatchesPath` with most-specific-first resolution,
+and `AuthAction.DocumentWrite`/`DocumentDelete`/`DocumentRead` variants. Backward compatible:
+existing namespace-string grants and the namespace-only `principalHasPermission` overload still
+work; a bare `kind:database` grant now additionally covers everything under that database (it
+previously matched only the literal namespace string) — this is the intended hierarchy upgrade,
+not a regression. Covered by tests in both languages.
+
+**Phase 2 — done, Kotlin only.** New `kdb-auth-store` module: `UserStore`/`RoleStore` interfaces,
+`RegistryAuthStore` (persists `UserRecord`/`RoleRecord` as documents in reserved
+`_system/users`/`_system/roles` namespaces via the real `TransactionEngine`/`CommitDag`/
+`StorageAdapter` path — not a static file), `PasswordHasher` (PBKDF2-HMAC-SHA256, replacing the
+static provider's plaintext `secret` field), and `dynamicAuthEngine()` which re-reads the store on
+every authenticate/authorize call. **Caveat found during implementation:** this repo currently has
+no persistent `CommitDag` implementation at all (only `inMemoryCommitDag`), so today
+`RegistryAuthStore` is durable only within a process's lifetime, same as every other in-memory
+runtime in this codebase — wiring it to a real deployment needs either a persistent `CommitDag`
+(doesn't exist yet, out of scope here) or reuse of whatever `(dag, storage)` pair the hosting
+server process already holds. Not yet wired into `SqlWireListen`/server startup config — a
+running server still defaults to `AllowAllAuth` unless something explicitly constructs a
+`DynamicAuthEngine` and passes it to `SqlWireHost`. No Go equivalent of the store exists (there
+was no existing `go/kdb/server` auth integration to extend — that package doesn't call
+`go/kdb/auth` at all yet).
+
+**Phase 3 — done, Kotlin only.** `authorizingTransactionEngine()` (`kdb-transaction/.../
+AuthorizingTransactionEngine.kt`) wraps any `TransactionEngine` to check every `KdbOp` in a
+transaction via a `WriteAuthorizer` before committing/replaying — this is the actual fix for the
+spec's flagged "rights validation boundary" gap, since it runs regardless of which caller invokes
+`TransactionEngine.commit`, not just requests that went through `SqlWireHost`'s wire-layer check.
+Wired into `KdbServerRuntime.commit`/`replay` (optional `authorizer` param, wraps the cached
+per-namespace engine per call rather than caching the wrapped instance) and both `SqlWireHost`
+commit/replay call sites via `SqlAuthSupport.writeAuthorizerFor(principal)`
+(`kdb-server/.../WriteAuthorization.kt`), which maps `KdbOp.Write`/`Delete` to
+`AuthAction.DocumentWrite`/`DocumentDelete` and leaves `FileWrite`/`SchemaMigration` to the
+existing namespace-level check (they aren't document-scoped). Unit-tested at the
+`AuthorizingTransactionEngine` level; **no end-to-end wire-protocol test exists** because
+`kdb-server` has no test source set at all yet (nothing to extend) — a good next addition once
+the module gets one.
+
+**Phase 4 — not started.** `CREATE ROLE`/`GRANT`/`REVOKE`/`CREATE USER` SQL DDL and the embedded
+admin API. Needs `kdb-sql` grammar/AST work.
+
+**Not started:** Go-side `UserStore`/`RoleStore` and transaction-boundary enforcement (`go/kdb/
+server` has zero existing auth wiring to build on — this is new work, not an extension), and the
+migration tooling from `StaticAuthConfig` to the registry store.
 
 ## Open questions to resolve before implementation
 
