@@ -21,27 +21,33 @@ type ServerEngine struct {
 	wal         wal.WriteAheadLog
 	groupCommit *wal.GroupCommitter
 
-	// docs is sharded (see doc_shard.go) rather than guarded by one
-	// namespace-wide mutex: PutDocument/GetDocument/DeleteDocument for
-	// different documents now proceed in parallel as long as they land
-	// in different shards. It is intentionally separate from the blob
-	// write path (WriteBlob): WAL.Append and memTable.Put are each
-	// independently thread-safe, so blob writes never take a lock at
-	// all - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
+	// docs holds committed (visible) documents, sharded (see doc_shard.go)
+	// rather than guarded by one namespace-wide mutex. PutDocument/
+	// DeleteDocument stage into pending instead of writing here directly:
+	// writes are not visible via GetDocument until CommitTree flushes
+	// them, matching the pre-existing InMemoryStorageAdapter contract
+	// (see the "reintroduce staging" note below) and letting a failed
+	// transaction's write phase be rolled back via DiscardPending without
+	// ever having mutated committed state. It is intentionally separate
+	// from the blob write path (WriteBlob): WAL.Append and memTable.Put
+	// are each independently thread-safe, so blob writes never take a
+	// lock at all - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
 	cap              storage.CapabilitySet
 	memTable         *memtable.Manager
 	docs             *shardedDocStore
+	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
 	// treeMu guards tree, a running DocumentTree updated incrementally
 	// (O(delta) via its persistent trie - see
-	// document/document_tree_trie.go) on every PutDocument/DeleteDocument
-	// instead of being rebuilt from a full docs snapshot in CommitTree,
-	// which is what it did before this gap fix. This reintroduces a
-	// single lock on the put/delete path, but the work done under it is
-	// now O(delta) (one trie insert/delete) rather than CommitTree's old
-	// O(namespace size) snapshot-and-rebuild, so it's a net win even
-	// though Phase 2 sharded the docs map itself for lock-free access.
+	// document/document_tree_trie.go) as CommitTree flushes staged
+	// writes, instead of being rebuilt from a full docs snapshot each
+	// time. Reintroducing staging (this commit) put PutDocument/
+	// DeleteDocument's visibility back behind CommitTree - an earlier
+	// pass had them update docs+tree immediately, which was faster but
+	// silently dropped the "not visible until commit" guarantee
+	// transactions depend on for write-phase rollback. The O(delta) tree
+	// update from that pass is preserved; only the "when" changed.
 	treeMu sync.Mutex
 	tree   document.DocumentTree
 
@@ -68,6 +74,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		cap:              cap,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
 		docs:             newShardedDocStore(),
+		pending:          newShardedPendingStore(),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
 		tree:             document.EmptyDocumentTree(),
 	}
@@ -189,16 +196,11 @@ func (e *ServerEngine) RecoverBlobsFromWal() error {
 	return err
 }
 
+// PutDocument stages doc; it is not visible via GetDocument until
+// CommitTree flushes staged writes.
 func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) error {
-	e.docs.Put(doc)
-	h, err := doc.ContentHash()
-	if err != nil {
-		return err
-	}
-	e.treeMu.Lock()
-	e.tree, err = e.tree.With(doc.ID, h)
-	e.treeMu.Unlock()
-	return err
+	e.pending.Put(doc)
+	return nil
 }
 
 func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
@@ -251,22 +253,53 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	return nil
 }
 
+// DeleteDocument stages a deletion; it is not applied via GetDocument
+// until CommitTree flushes staged writes.
 func (e *ServerEngine) DeleteDocument(namespaceID string, docID codec.UUID) error {
-	e.docs.Delete(docID)
-	var err error
-	e.treeMu.Lock()
-	e.tree, err = e.tree.Without(docID)
-	e.treeMu.Unlock()
-	return err
+	e.pending.Delete(docID)
+	return nil
 }
 
-// CommitTree returns the running tree maintained incrementally by
-// PutDocument/DeleteDocument (parentTreeHash is ignored, matching the
-// pre-existing behavior this preserves: ServerEngine has always reflected
-// current live state rather than tracking per-branch history).
+// DiscardPending drops any PutDocument/DeleteDocument calls made since
+// the last CommitTree, restoring the last-committed visible state.
+// Used to roll back a transaction whose write phase failed partway
+// through.
+func (e *ServerEngine) DiscardPending(namespaceID string) error {
+	e.pending.DiscardAll()
+	return nil
+}
+
+// CommitTree flushes staged puts/deletes into docs (committed, sharded)
+// and applies them to the running tree incrementally (O(delta) per
+// changed doc via its persistent trie - document/document_tree_trie.go),
+// then returns it. parentTreeHash is ignored, matching the pre-existing
+// behavior this preserves: ServerEngine has always reflected current
+// live (now: current committed) state rather than tracking per-branch
+// history.
 func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
+	puts, deletes := e.pending.TakeAllAndClear()
+
 	e.treeMu.Lock()
 	defer e.treeMu.Unlock()
+	for _, id := range deletes {
+		e.docs.Delete(id)
+		var err error
+		e.tree, err = e.tree.Without(id)
+		if err != nil {
+			return document.DocumentTree{}, err
+		}
+	}
+	for _, doc := range puts {
+		e.docs.Put(doc)
+		h, err := doc.ContentHash()
+		if err != nil {
+			return document.DocumentTree{}, err
+		}
+		e.tree, err = e.tree.With(doc.ID, h)
+		if err != nil {
+			return document.DocumentTree{}, err
+		}
+	}
 	return e.tree, nil
 }
 

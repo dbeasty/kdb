@@ -48,6 +48,13 @@ public interface StorageAdapter {
         docId: KdbUuid,
     )
 
+    /**
+     * Drops any [putDocument]/[deleteDocument] calls made since the last [commitTree] for
+     * this namespace, restoring the last-committed visible state. Used to roll back a
+     * transaction whose write phase failed partway through.
+     */
+    public suspend fun discardPending(namespaceId: String)
+
     public suspend fun commitTree(
         namespaceId: String,
         parentTreeHash: KdbHash,

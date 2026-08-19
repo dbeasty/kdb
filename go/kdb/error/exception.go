@@ -100,6 +100,23 @@ func NewConflictError(msg string, report ConflictReport) *ConflictError {
 	return &ConflictError{base: &base{code: Conflict, msg: msg}, Report: report}
 }
 
+// DocumentLockedError indicates a document is held by another session's transaction.
+type DocumentLockedError struct {
+	*base
+	NamespaceName string
+	DocID         string
+	Owner         string
+}
+
+func NewDocumentLockedError(msg, ns, docID, owner string) *DocumentLockedError {
+	return &DocumentLockedError{
+		base:          &base{code: DocumentLocked, msg: msg},
+		NamespaceName: ns,
+		DocID:         docID,
+		Owner:         owner,
+	}
+}
+
 // NamespaceNotFoundError indicates a missing namespace.
 type NamespaceNotFoundError struct {
 	*base

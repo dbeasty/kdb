@@ -76,4 +76,37 @@ class DocumentLockManagerTest {
         locks.releaseAll("sess-a")
         assertEquals(2, documentIdsIn(tx).size)
       }
+
+  @Test
+  fun acquireAllForTransactionReleasesPartialAcquisitionOnFailure() =
+      runTest {
+        val doc2 = KdbUuid.random()
+        // doc2 is already held by sess-b; doc sorts before doc2 in at least one
+        // ordering, so sess-a's acquireAllForTransaction should grant the lock
+        // on doc before failing on doc2 - the point of this test is that the
+        // doc grant is rolled back rather than left dangling.
+        locks.tryAcquire(ns, doc2, "sess-b")
+        val tx =
+            KdbTransaction(
+                id = KdbUuid.random(),
+                baseVersion =
+                    KdbHash.fromHex(
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                    ),
+                operations =
+                    listOf(
+                        KdbOp.Write(doc, """{"id":"${doc.toString()}"}"""),
+                        KdbOp.Write(doc2, """{"id":"${doc2.toString()}"}"""),
+                    ),
+                timestamp = KdbTimestamp.now(),
+                authorNodeId = KdbUuid.random(),
+            )
+        assertFailsWith<DocumentLockedException> {
+          locks.acquireAllForTransaction(ns, "sess-a", tx)
+        }
+        // doc must not still be held by sess-a: a fresh acquire from another session succeeds.
+        locks.tryAcquire(ns, doc, "sess-c")
+        // doc2's original owner (sess-b) is untouched.
+        assertFailsWith<DocumentLockedException> { locks.tryAcquire(ns, doc2, "sess-c") }
+      }
 }

@@ -28,3 +28,11 @@ public class MergeBaseNotFoundException(
 ) : KdbException(message) {
     override val code: KdbErrorCode get() = KdbErrorCode.VERSION_NOT_FOUND
 }
+
+/** Thrown when a transaction's write phase fails after validation and its staged writes are rolled back. */
+public class TransactionAbortedException(
+    message: String,
+    cause: Throwable,
+) : KdbException(message, cause) {
+    override val code: KdbErrorCode get() = KdbErrorCode.TRANSACTION_ABORTED
+}

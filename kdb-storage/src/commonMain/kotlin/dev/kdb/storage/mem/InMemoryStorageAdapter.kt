@@ -104,6 +104,13 @@ public class InMemoryStorageAdapter(
         }
     }
 
+    override suspend fun discardPending(namespaceId: String) {
+        mutex.withLock {
+            pendingPuts.remove(namespaceId)
+            pendingDeletes.remove(namespaceId)
+        }
+    }
+
     override suspend fun commitTree(
         namespaceId: String,
         parentTreeHash: KdbHash,

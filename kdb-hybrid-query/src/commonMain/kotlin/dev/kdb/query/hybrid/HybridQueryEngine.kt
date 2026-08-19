@@ -20,9 +20,9 @@ import dev.kdb.sql.defaultSqlParser
 import dev.kdb.sql.isDmlStatement
 import dev.kdb.sql.statementParameterCount
 import dev.kdb.storage.StorageAdapter
+import dev.kdb.transaction.TransactionAbortedException
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
-import dev.kdb.transaction.documentIdsIn
 import dev.kdb.transaction.transactionEngine
 
 public interface HybridQueryEngine {
@@ -179,9 +179,7 @@ internal class DefaultHybridQueryEngine(
         val locks = request.documentLocks
         val sessionId = request.writeSessionId
         if (locks != null && sessionId != null) {
-            for (docId in documentIdsIn(operations)) {
-                locks.tryAcquire(request.namespaceId, docId, sessionId)
-            }
+            locks.acquireAllForTransaction(request.namespaceId, sessionId, tx)
         }
         return try {
             when (val result = txEngine.commit(tx, dag, storage, request.schema)) {
@@ -205,6 +203,11 @@ internal class DefaultHybridQueryEngine(
                     throw dev.kdb.sql.SqlPlanningException(
                         "schema rejection: ${result.violations.size} violation(s)",
                         "",
+                    )
+                is TransactionResult.Aborted ->
+                    throw TransactionAbortedException(
+                        "transaction aborted: ${result.cause.message ?: result.cause.toString()}",
+                        result.cause,
                     )
             }
         } finally {
