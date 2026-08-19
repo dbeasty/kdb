@@ -144,7 +144,7 @@ public open class ServerStorageEngine(
     override suspend fun rebuildIndex(enlistmentId: KdbUuid, fromDocuments: StorageAdapter) {}
 
     override fun evictionState(enlistmentId: KdbUuid): EnlistmentEvictionState =
-        enlistmentStates.getOrDefault(enlistmentId, EnlistmentEvictionState.FULL)
+        enlistmentStates[enlistmentId] ?: EnlistmentEvictionState.FULL
 }
 
 private fun WalPutBlob.encode(): ByteArray = contentHash.bytes + bytes

@@ -28,7 +28,6 @@ kotlin {
             implementation(project(":kdb-storage"))
             implementation(project(":kdb-stream"))
             implementation(project(":kdb-transport-core"))
-            implementation(project(":kdb-transport-ws"))
             implementation(project(":kdb-transaction"))
             implementation(project(":kdb-wire"))
             implementation(libs.kotlinx.coroutines.core)

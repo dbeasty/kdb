@@ -16,13 +16,21 @@ public interface SsTableReader {
     public suspend fun get(key: KdbHash): ByteArray?
 }
 
+/**
+ * LRU-bounded block cache. Java's access-order `LinkedHashMap(capacity, loadFactor, true)`
+ * constructor is JVM-only, so recency is tracked manually here (remove + re-insert on hit)
+ * over a plain insertion-order [LinkedHashMap] — portable to JVM/JS/Native alike.
+ */
 public class BlockCache(private val capacityBytes: Long) {
-    private val map = LinkedHashMap<Pair<KdbHash, Long>, ByteArray>(16, 0.75f, true)
+    private val map = LinkedHashMap<Pair<KdbHash, Long>, ByteArray>()
     private var used = 0L
 
     public suspend fun get(key: KdbHash, offset: Long, loader: suspend () -> ByteArray): ByteArray {
         val k = key to offset
-        map[k]?.let { return it }
+        map.remove(k)?.let { hit ->
+            map[k] = hit
+            return hit
+        }
         val v = loader()
         put(k, v)
         return v
@@ -32,9 +40,9 @@ public class BlockCache(private val capacityBytes: Long) {
         used += v.size
         map[k] = v
         while (used > capacityBytes && map.isNotEmpty()) {
-            val eldest = map.entries.first()
-            map.remove(eldest.key)
-            used -= eldest.value.size
+            val eldestKey = map.keys.first()
+            val eldestVal = map.remove(eldestKey)
+            if (eldestVal != null) used -= eldestVal.size
         }
     }
 }

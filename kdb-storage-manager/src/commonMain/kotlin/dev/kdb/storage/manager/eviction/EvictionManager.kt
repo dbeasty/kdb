@@ -18,5 +18,5 @@ public class DefaultEvictionManager(
     }
 
     override fun evictionState(enlistmentId: KdbUuid): EnlistmentEvictionState =
-        states.getOrDefault(enlistmentId, EnlistmentEvictionState.FULL)
+        states[enlistmentId] ?: EnlistmentEvictionState.FULL
 }
