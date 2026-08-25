@@ -26,12 +26,21 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 		if pv == 0 {
 			pv = KdbWireProtocolVersion
 		}
+		localHeads := m.Request.LocalHeads
+		if localHeads == nil {
+			// Kotlin's HandshakeDto.localHeads is a non-nullable Map<String, String> with no
+			// default - a Go SQL client (which never populates this peer-sync/stream-only
+			// field) marshals a nil map as JSON null, which the JVM's strict kotlinx.serialization
+			// decoder rejects outright (crashes the connection with no response at all, not a
+			// clean rejection). {} round-trips as an empty map on both sides.
+			localHeads = map[string]string{}
+		}
 		return payloadEnvelope{
 			Kind: "handshake",
 			Handshake: &handshakeDto{
 				NodeID:                    m.Request.NodeID,
 				Namespaces:                m.Request.Namespaces,
-				LocalHeads:                m.Request.LocalHeads,
+				LocalHeads:                localHeads,
 				SupportsZstd:              caps.SupportsZstd,
 				SupportsIndexHints:        caps.SupportsIndexHints,
 				SupportsDirectDeltaIngest: caps.SupportsDirectDeltaIngest,

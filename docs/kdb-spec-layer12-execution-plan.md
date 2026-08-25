@@ -6,9 +6,12 @@ Component 39 (peer-sync conflict detection), Component 40 (Go Client SDK), Compo
 cleanup, write-back mode fix) implemented and tested. Phase 0's spike is now fully resolved: both
 Android and iOS bind `go/kdb/embed` successfully via `gomobile bind` (iOS needed one rename,
 `EmbeddedKdbRuntime.Release()`→`Close()`, now shipped) - see Phase 0 checklist entry. Per the
-gate's own stated consequence, Components 42/43 are very likely unnecessary. Remaining:
-master-spec housekeeping (Phase 8's second item), the Go↔JVM interop test, and the Lightsail load
-test. See checklist below.
+gate's own stated consequence, Components 42/43 are very likely unnecessary. Master-spec
+housekeeping (Phase 8's second item) and the Go↔JVM cross-implementation interop test are both
+done - the latter required implementing a real Go WebSocket client (`go/kdb/transport/ws` was
+previously a stub) and fixing a real cross-implementation wire bug it surfaced (a Go SQL
+handshake's `null` `localHeads` crashing the JVM decoder). Remaining: the Lightsail load test
+(needs real cloud infrastructure - out of scope for this environment). See checklist below.
 **Master spec:** `docs/kdb-spec-layer12-zolik-gap-analysis.md` (Layer 12 lives here, not yet in
 `docs/kdb-spec.md` §16.1 — that table still only covers Layers 0–10; fold Layer 12 in per Phase 6
 below once it ships)
@@ -546,9 +549,40 @@ plus unbounded iOS toolchain setup time) if they end up needed after all.
     Verified both catch the regression: temporarily reverted `NewKdbServerRuntime` to the old
     direct type assertion and confirmed both tests fail with the original error message, then
     restored the fix. Full suite green after, including `-race` on `server`/`embed`/`peersync`.
-- [ ] Cross-implementation interop test: Go client ↔ Go server AND Go client ↔ JVM server, both
-      passing (component 38 spec §7 test 2 / component 40 spec §7 tests 1–2) - Go↔Go done above
-      (test 2); Go↔JVM (test 1) not attempted, needs a JVM `kdb-server` process in the test loop.
-- [ ] `docs/kdb-spec.md` §0/§16.1/§17 updated to include Layers 11–12 (Phase 8)
+- [x] Cross-implementation interop test: Go client ↔ Go server AND Go client ↔ JVM server, both
+      passing (component 38 spec §7 test 2 / component 40 spec §7 tests 1–2). Go↔Go was already
+      covered (`go/kdb/client`'s own tests). Go↔JVM needed a real JVM `kdb-server` process in the
+      loop, which surfaced a gap bigger than "test not written": `go/kdb/transport/ws`'s client
+      was an unimplemented stub (`Connect` always returned "not implemented"), and the JVM server
+      only ever listens for SQL wire over WebSocket - Go's real client only ever spoke raw TCP, so
+      there was no transport that could reach a JVM server at all. Asked the user how to close
+      that gap (add a JVM-side raw-TCP listener vs. implement a real Go WS client); they chose the
+      Go WS client.
+  - Implemented a real RFC 6455 client in `go/kdb/transport/ws/transport.go` (net/http-free, hand-
+    rolled to match `kdb-transport-ws`'s own hand-rolled JVM implementation exactly:
+    `WebSocketFraming.kt`/`JvmRawSocketWebSocketConnection.kt`) - HTTP upgrade handshake
+    (`Sec-WebSocket-Key`/`-Accept`, SHA-1 + the RFC magic GUID), masked client frames / unmasked
+    server frames (matching what the JVM side actually does on each side), 7/16/64-bit payload
+    length encoding, ping answered with a masked pong. `Listen` (a Go-side WS *server*) stays a
+    stub - out of scope, the client was what blocked this test.
+  - **Real interop bug found via this test, not a synthetic one**: the JVM handshake decoder
+    (`kotlinx.serialization`, `HandshakeDto.localHeads: Map<String, String>`, non-nullable, no
+    default) throws and silently drops the connection - no response frame at all - on a Go SQL
+    client's handshake, because `go/kdb/client`/`go/kdb/peersync` never populate `LocalHeads` (a
+    peer-sync/stream-only field), so it marshals as JSON `null`. Every real Go SQL client hitting
+    a real JVM server was affected; Go↔Go never exercised this because Go's own decoder tolerates
+    `null` for a map. Fixed by normalizing `LocalHeads` to `{}` at encode time
+    (`go/kdb/wire/payload_mapper.go`), verified against the same live JVM server that first
+    reproduced it.
+  - Tests: `go/kdb/transport/ws/transport_test.go` (5 cases, incl. a large->64-bit-length-path
+    payload and an independent from-scratch fake WS server so the client's read and write sides
+    can't share a bug that cancels itself out) - `go/kdb/transport/ws` had zero tests before this.
+    `go/kdb/interop/jvm_server_interop_test.go` (build-tag `interop`, skipped by default like the
+    Lightsail load test since it needs an external JVM process - env-var-gated
+    `KDB_JVM_SQL_WS_URI`) drives Handshake → SessionBegin → INSERT → SELECT against a real,
+    separately-started `kdb-service` process; verified manually end to end (handshake accept,
+    session begin, INSERT `rowsAffected=1`, SELECT returns the just-inserted row) against a live
+    `./gradlew :kdb-service:runService` instance before committing.
+- [x] `docs/kdb-spec.md` §0/§16.1/§17 updated to include Layers 11–12 (Phase 8)
 - [ ] Lightsail load test on the target tier (component 38 spec §7 test 8) — the number that
       actually answers "how much does this save"
