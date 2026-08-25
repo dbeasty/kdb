@@ -207,6 +207,217 @@ func TestJSONEncodingRoundtrip(t *testing.T) {
 	}
 }
 
+func strPtr(s string) *string { return &s }
+
+func TestFrameRoundtripSqlClientHandshake(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.HandshakeMessage{
+		H: testHeader(20, wire.MsgHandshake),
+		Request: wire.HandshakePayload{
+			NodeID:     "sql-client-1",
+			Namespaces: []string{"app/data"},
+			ClientMode: wire.ClientSQL,
+		},
+	}
+	back := decodedAs[wire.HandshakeMessage](t, c, msg)
+	if back.Request.ClientMode != wire.ClientSQL {
+		t.Fatalf("clientMode: %v", back.Request.ClientMode)
+	}
+}
+
+func TestFrameRoundtripSessionBegin(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.SessionBeginMessage{
+		H:               testHeader(21, wire.MsgSessionBegin),
+		Namespace:       "app/data",
+		SessionID:       strPtr("sess-1"),
+		ReadConsistency: "SNAPSHOT",
+		BaseVersionHex:  strPtr(repeatHex(0).Hex()),
+	}
+	back := decodedAs[wire.SessionBeginMessage](t, c, msg)
+	if back.Namespace != "app/data" || back.ReadConsistency != "SNAPSHOT" {
+		t.Fatalf("session begin: %+v", back)
+	}
+	if back.SessionID == nil || *back.SessionID != "sess-1" {
+		t.Fatalf("sessionId: %+v", back.SessionID)
+	}
+}
+
+func TestFrameRoundtripSessionBeginAck(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.SessionBeginAckMessage{
+		H:               testHeader(22, wire.MsgSessionBeginAck),
+		Namespace:       "app/data",
+		SessionID:       "sess-1",
+		HeadHex:         repeatHex(0).Hex(),
+		ReadConsistency: "SNAPSHOT",
+	}
+	back := decodedAs[wire.SessionBeginAckMessage](t, c, msg)
+	if back.SessionID != "sess-1" || back.HeadHex != repeatHex(0).Hex() {
+		t.Fatalf("session begin ack: %+v", back)
+	}
+}
+
+func TestFrameRoundtripSqlExec(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.SqlExecMessage{
+		H:              testHeader(23, wire.MsgSqlExec),
+		Namespace:      "app/data",
+		SessionID:      "sess-1",
+		SQL:            "SELECT * FROM users",
+		ParametersJSON: strPtr(`{"1":"x"}`),
+	}
+	back := decodedAs[wire.SqlExecMessage](t, c, msg)
+	if back.SQL != "SELECT * FROM users" || back.SessionID != "sess-1" {
+		t.Fatalf("sql exec: %+v", back)
+	}
+	if back.ParametersJSON == nil || *back.ParametersJSON != `{"1":"x"}` {
+		t.Fatalf("parametersJson: %+v", back.ParametersJSON)
+	}
+}
+
+func TestFrameRoundtripSqlResult(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.SqlResultMessage{
+		H:                 testHeader(24, wire.MsgSqlResult),
+		Namespace:         "app/data",
+		SessionID:         "sess-1",
+		Columns:           []string{"id", "name"},
+		Rows:              [][]string{{"1", "alice"}},
+		RowsAffected:      1,
+		ResolvedCommitHex: repeatHex(0xaa).Hex(),
+		ReadOnly:          false,
+		GeneratedIDs:      []string{"g1"},
+	}
+	back := decodedAs[wire.SqlResultMessage](t, c, msg)
+	if len(back.Columns) != 2 || back.Columns[1] != "name" {
+		t.Fatalf("columns: %+v", back.Columns)
+	}
+	if len(back.Rows) != 1 || back.Rows[0][1] != "alice" {
+		t.Fatalf("rows: %+v", back.Rows)
+	}
+	if back.Error != nil {
+		t.Fatalf("expected no error, got %v", *back.Error)
+	}
+}
+
+func TestFrameRoundtripSqlResultError(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.SqlResultMessage{
+		H:         testHeader(25, wire.MsgSqlResult),
+		Namespace: "app/data",
+		SessionID: "sess-1",
+		ReadOnly:  true,
+		Error:     strPtr("kdb server: commit/query not yet implemented in Go port"),
+	}
+	back := decodedAs[wire.SqlResultMessage](t, c, msg)
+	if back.Error == nil || *back.Error != "kdb server: commit/query not yet implemented in Go port" {
+		t.Fatalf("error: %+v", back.Error)
+	}
+}
+
+func TestFrameRoundtripTxCommit(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.TxCommitMessage{
+		H:                testHeader(26, wire.MsgTxCommit),
+		Namespace:        "app/data",
+		SessionID:        "sess-1",
+		TransactionBytes: []byte{1, 2, 3, 4},
+	}
+	back := decodedAs[wire.TxCommitMessage](t, c, msg)
+	if len(back.TransactionBytes) != 4 || back.TransactionBytes[2] != 3 {
+		t.Fatalf("transactionBytes: %+v", back.TransactionBytes)
+	}
+}
+
+func TestFrameRoundtripTxRollback(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.TxRollbackMessage{
+		H:         testHeader(27, wire.MsgTxRollback),
+		Namespace: "app/data",
+		SessionID: "sess-1",
+	}
+	back := decodedAs[wire.TxRollbackMessage](t, c, msg)
+	if back.SessionID != "sess-1" {
+		t.Fatalf("rollback: %+v", back)
+	}
+}
+
+func TestFrameRoundtripDocumentGet(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.DocumentGetMessage{
+		H:         testHeader(30, wire.MsgDocumentGet),
+		Namespace: "app/data",
+		DocID:     "11111111-1111-4111-8111-111111111111",
+	}
+	back := decodedAs[wire.DocumentGetMessage](t, c, msg)
+	if back.DocID != msg.DocID || back.Namespace != msg.Namespace {
+		t.Fatalf("document get: %+v", back)
+	}
+}
+
+func TestFrameRoundtripDocumentGetResult(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.DocumentGetResultMessage{
+		H:         testHeader(31, wire.MsgDocumentGetResult),
+		Namespace: "app/data",
+		DocID:     "11111111-1111-4111-8111-111111111111",
+		JSON:      strPtr(`{"v":"x"}`),
+		CommitHex: repeatHex(0xcc).Hex(),
+	}
+	back := decodedAs[wire.DocumentGetResultMessage](t, c, msg)
+	if back.JSON == nil || *back.JSON != `{"v":"x"}` {
+		t.Fatalf("document get result json: %+v", back.JSON)
+	}
+	if back.CommitHex != msg.CommitHex {
+		t.Fatalf("commitHex: %+v", back)
+	}
+	if back.Error != nil {
+		t.Fatalf("expected no error, got %v", *back.Error)
+	}
+}
+
+func TestFrameRoundtripDocumentGetResultNotFound(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.DocumentGetResultMessage{
+		H:         testHeader(32, wire.MsgDocumentGetResult),
+		Namespace: "app/data",
+		DocID:     "11111111-1111-4111-8111-111111111111",
+		CommitHex: repeatHex(0xcc).Hex(),
+	}
+	back := decodedAs[wire.DocumentGetResultMessage](t, c, msg)
+	if back.JSON != nil {
+		t.Fatalf("expected nil json for not-found, got %v", *back.JSON)
+	}
+}
+
+func TestFrameRoundtripUpsert(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.UpsertMessage{
+		H:         testHeader(33, wire.MsgUpsert),
+		Namespace: "app/data",
+		DocID:     "11111111-1111-4111-8111-111111111111",
+		JSON:      `{"v":"upserted"}`,
+	}
+	back := decodedAs[wire.UpsertMessage](t, c, msg)
+	if back.JSON != msg.JSON || back.DocID != msg.DocID {
+		t.Fatalf("upsert: %+v", back)
+	}
+}
+
+func TestFrameRoundtripUpsertResult(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	msg := wire.UpsertResultMessage{
+		H:         testHeader(34, wire.MsgUpsertResult),
+		Namespace: "app/data",
+		CommitHex: repeatHex(0xdd).Hex(),
+	}
+	back := decodedAs[wire.UpsertResultMessage](t, c, msg)
+	if back.CommitHex != msg.CommitHex {
+		t.Fatalf("upsert result: %+v", back)
+	}
+}
+
 func mustEncode(t *testing.T, c *wire.DefaultCodec, msg wire.Message) []byte {
 	t.Helper()
 	b, err := c.Encode(msg)

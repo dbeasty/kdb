@@ -47,6 +47,17 @@ const (
 	MsgTxRollback MessageType = 0x12
 	MsgSessionBeginAck MessageType = 0x13
 
+	// Component 40 (Go Client SDK) additions: direct document get/upsert, bypassing SQL - the
+	// SQL_EXEC/INSERT path has no way to read or write one document by its own id (INSERT
+	// always mints a fresh UUID; there's no point-lookup-by-id predicate), so PutJSON/GetJSON/
+	// Upsert need their own wire messages rather than being expressed as SQL. Go-only for now;
+	// no Kotlin counterpart exists yet, per component 38 spec's note that extending go/kdb/wire
+	// itself is the right move when the existing message set can't express something.
+	MsgDocumentGet       MessageType = 0x14
+	MsgDocumentGetResult MessageType = 0x15
+	MsgUpsert            MessageType = 0x16
+	MsgUpsertResult      MessageType = 0x17
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -92,6 +103,14 @@ func (t MessageType) String() string {
 		return "TX_ROLLBACK"
 	case MsgSessionBeginAck:
 		return "SESSION_BEGIN_ACK"
+	case MsgDocumentGet:
+		return "DOCUMENT_GET"
+	case MsgDocumentGetResult:
+		return "DOCUMENT_GET_RESULT"
+	case MsgUpsert:
+		return "UPSERT"
+	case MsgUpsertResult:
+		return "UPSERT_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -137,6 +156,14 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgTxRollback, true
 	case 0x13:
 		return MsgSessionBeginAck, true
+	case 0x14:
+		return MsgDocumentGet, true
+	case 0x15:
+		return MsgDocumentGetResult, true
+	case 0x16:
+		return MsgUpsert, true
+	case 0x17:
+		return MsgUpsertResult, true
 	default:
 		return 0, false
 	}
@@ -219,6 +246,14 @@ type HandshakePayload struct {
 	PreferredEncodings []PayloadEncoding
 	ClientMode         ClientMode
 	ProtocolVersion    int
+	// Credentials, all optional. TCP has no side channel for connection-level auth context
+	// (unlike WebSocket's HTTP headers, which the Kotlin server's ConnectionContext reads) -
+	// this is the only place a SQL_CLIENT handshake can carry them for the Go-native server
+	// (component 38 §4, sub-phase C). User+Password is the common case; Token is an
+	// alternative "user:secret" combined form, matching auth.Credentials.
+	User     *string
+	Password *string
+	Token    *string
 }
 
 type HandshakeAckPayload struct {

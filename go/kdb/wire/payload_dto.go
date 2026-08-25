@@ -22,6 +22,12 @@ type payloadEnvelope struct {
 	SqlResult          *sqlResultDto        `json:"sqlResult,omitempty"`
 	TxCommit           *txCommitDto         `json:"txCommit,omitempty"`
 	TxRollback         *txRollbackDto       `json:"txRollback,omitempty"`
+
+	// Component 40 additions - see document_ops.go.
+	DocumentGet       *documentGetDto       `json:"documentGet,omitempty"`
+	DocumentGetResult *documentGetResultDto `json:"documentGetResult,omitempty"`
+	Upsert            *upsertDto            `json:"upsert,omitempty"`
+	UpsertResult      *upsertResultDto      `json:"upsertResult,omitempty"`
 }
 
 type handshakeDto struct {
@@ -35,6 +41,9 @@ type handshakeDto struct {
 	PreferredEncodings        []string          `json:"preferredEncodings"`
 	ClientMode                string            `json:"clientMode"`
 	ProtocolVersion           int               `json:"protocolVersion"`
+	User                      *string           `json:"user,omitempty"`
+	Password                  *string           `json:"password,omitempty"`
+	Token                     *string           `json:"token,omitempty"`
 }
 
 type handshakeAckDto struct {

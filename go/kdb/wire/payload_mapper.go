@@ -39,6 +39,9 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				PreferredEncodings:        encNames,
 				ClientMode:                m.Request.ClientMode.String(),
 				ProtocolVersion:           pv,
+				User:                      m.Request.User,
+				Password:                  m.Request.Password,
+				Token:                     m.Request.Token,
 			},
 		}, nil
 	case HandshakeAckMessage:
@@ -247,6 +250,9 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 			},
 		}, nil
 	default:
+		if env, ok, err := encodeDocumentOpMessage(msg); ok || err != nil {
+			return env, err
+		}
 		return payloadEnvelope{}, fmt.Errorf("unsupported message type")
 	}
 }
@@ -277,6 +283,9 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 				PreferredEncodings: encs,
 				ClientMode:         ClientModeFromName(h.ClientMode),
 				ProtocolVersion:    h.ProtocolVersion,
+				User:               h.User,
+				Password:           h.Password,
+				Token:              h.Token,
 			},
 		}, nil
 	case "handshakeAck":
@@ -521,6 +530,9 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 		}
 		return TxRollbackMessage{H: header, Namespace: r.Namespace, SessionID: r.SessionID}, nil
 	default:
+		if msg, ok, err := decodeDocumentOpMessage(header, env); ok || err != nil {
+			return msg, err
+		}
 		return nil, newDecodeError("unknown payload kind: " + env.Kind)
 	}
 }

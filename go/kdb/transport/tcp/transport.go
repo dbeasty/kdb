@@ -17,6 +17,15 @@ import (
 type Transport interface {
 	stream.Transport
 	Listen(ctx context.Context, uri string, handler func(stream.ConnectionHandle)) error
+
+	// ListenBound resolves uri and binds synchronously, so a caller can learn the bound
+	// address (e.g. when uri's port is 0) before frames start flowing. Pair with Serve to
+	// run the accept loop once bound. Listen itself is ListenBound+Serve for callers that
+	// don't need the address ahead of time.
+	ListenBound(uri string) (net.Listener, error)
+	// Serve runs the accept loop over an already-bound listener (from ListenBound) until
+	// ctx is canceled or Accept fails; it closes ln before returning.
+	Serve(ctx context.Context, ln net.Listener, handler func(stream.ConnectionHandle)) error
 }
 
 type defaultTransport struct {
@@ -51,17 +60,25 @@ func (t *defaultTransport) Connect(uri string) (stream.ConnectionHandle, error) 
 }
 
 func (t *defaultTransport) Listen(ctx context.Context, uri string, handler func(stream.ConnectionHandle)) error {
+	ln, err := t.ListenBound(uri)
+	if err != nil {
+		return err
+	}
+	return t.Serve(ctx, ln, handler)
+}
+
+func (t *defaultTransport) ListenBound(uri string) (net.Listener, error) {
 	parsed, err := ParseURI(uri)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !parsed.Bind {
-		return fmt.Errorf("listen URI requires bind=true: %s", uri)
+		return nil, fmt.Errorf("listen URI requires bind=true: %s", uri)
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port)))
-	if err != nil {
-		return err
-	}
+	return net.Listen("tcp", net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port)))
+}
+
+func (t *defaultTransport) Serve(ctx context.Context, ln net.Listener, handler func(stream.ConnectionHandle)) error {
 	defer ln.Close()
 	go func() {
 		<-ctx.Done()

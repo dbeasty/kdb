@@ -5,7 +5,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // ReadConsistency mirrors dev.kdb.query.hybrid.ReadConsistency.
@@ -29,8 +31,8 @@ type KdbSession struct {
 	BaseVersion     codec.Hash
 	ReadPin         *codec.Hash
 	ReadConsistency ReadConsistency
-	Pending         any // *transaction.Builder when ported
-	Principal       any
+	Pending         *transaction.Builder
+	Principal       auth.Principal
 }
 
 // SessionManager tracks active sessions for a server runtime.
@@ -55,6 +57,7 @@ func (m *SessionManager) Begin(
 	readConsistency ReadConsistency,
 	baseVersionHex string,
 	sessionID string,
+	principal auth.Principal,
 ) (*KdbSession, error) {
 	head, err := m.server.Runtime.DAG.Head()
 	if err != nil {
@@ -84,6 +87,7 @@ func (m *SessionManager) Begin(
 		BaseVersion:     head,
 		ReadPin:         readPin,
 		ReadConsistency: readConsistency,
+		Principal:       principal,
 	}
 	m.mu.Lock()
 	m.sessions[id] = sess
@@ -109,4 +113,42 @@ func (m *SessionManager) End(sessionID string) {
 // ClearPending clears in-flight transaction builder state.
 func (m *SessionManager) ClearPending(sess *KdbSession) {
 	sess.Pending = nil
+}
+
+// parseReadConsistency maps a wire ReadConsistency name to its enum value, matching Kotlin's
+// dev.kdb.query.hybrid.ReadConsistency.valueOf naming (defaults to ReadCommitted for an
+// unrecognized/empty name rather than erroring, since it only affects read-pin behavior).
+func parseReadConsistency(name string) ReadConsistency {
+	switch name {
+	case "SNAPSHOT":
+		return Snapshot
+	case "READ_YOUR_WRITES":
+		return ReadYourWrites
+	default:
+		return ReadCommitted
+	}
+}
+
+func (c ReadConsistency) String() string {
+	switch c {
+	case Snapshot:
+		return "SNAPSHOT"
+	case ReadYourWrites:
+		return "READ_YOUR_WRITES"
+	default:
+		return "READ_COMMITTED"
+	}
+}
+
+// PendingBuilder returns sess's in-flight transaction builder, creating one anchored at the
+// session's base version if this is the first buffered write.
+func (m *SessionManager) PendingBuilder(sess *KdbSession) *transaction.Builder {
+	if sess.Pending == nil {
+		sess.Pending = &transaction.Builder{
+			NamespaceID: sess.NamespaceID,
+			BaseVersion: sess.BaseVersion,
+			Schema:      m.server.Schema(),
+		}
+	}
+	return sess.Pending
 }

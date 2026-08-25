@@ -3,6 +3,7 @@ package server
 import (
 	"testing"
 
+	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/schema"
 )
@@ -14,7 +15,7 @@ func TestSessionManagerBegin(t *testing.T) {
 	}
 	srv := NewKdbServerRuntime(rt)
 	mgr := NewSessionManager(srv)
-	sess, err := mgr.Begin("demo/users", Snapshot, "", "")
+	sess, err := mgr.Begin("demo/users", Snapshot, "", "", auth.Principal{})
 	if err != nil {
 		t.Fatal(err)
 	}
