@@ -3,7 +3,7 @@ package dev.kdb.auth
 import dev.kdb.error.KdbErrorCode
 import dev.kdb.error.KdbException
 
-public class KdbAuthenticationException(
+public open class KdbAuthenticationException(
     message: String,
     cause: Throwable? = null,
 ) : KdbException(message, cause) {

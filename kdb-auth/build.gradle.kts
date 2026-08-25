@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.kotlin.plugin.serialization)
 }
 
 kotlin {
@@ -23,6 +24,12 @@ kotlin {
             implementation(project(":kdb-error"))
             implementation(project(":kdb-stream"))
             implementation(project(":kdb-transport-core"))
+            // Component 41 (Layer 12): TokenAuthEngine/SessionIssuer read/write session
+            // documents (KdbDocument) keyed by KdbUuid tokens and KdbTimestamp expiry.
+            implementation(project(":kdb-codec"))
+            implementation(project(":kdb-document"))
+            implementation(libs.kotlinx.serialization.json)
+            implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)
