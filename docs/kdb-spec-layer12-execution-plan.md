@@ -10,10 +10,12 @@ gate's own stated consequence, Components 42/43 are very likely unnecessary. Mas
 housekeeping (Phase 8's second item) and the Go↔JVM cross-implementation interop test are both
 done - the latter required implementing a real Go WebSocket client (`go/kdb/transport/ws` was
 previously a stub) and fixing a real cross-implementation wire bug it surfaced (a Go SQL
-handshake's `null` `localHeads` crashing the JVM decoder). Remaining: the real Lightsail load test
-still needs actual x86_64 cloud hardware, but a local Docker approximation of it now exists
-(`docs/benchmarks/lightsail-sim/`) and surfaced a real open risk worth resolving before that run -
-see the checklist's Lightsail entry. See checklist below.
+handshake's `null` `localHeads` crashing the JVM decoder). The local Lightsail approximation
+(`docs/benchmarks/lightsail-sim/`) surfaced a real OOM under sustained write load, which has since
+been root-caused (two allocation bugs, both fixed in Go and Kotlin) and hardened against (memory-
+pressure backpressure) - see the checklist's Lightsail entry and the README's "The fix" section.
+Remaining: the real Lightsail load test still needs actual x86_64 cloud hardware to make the cost
+claim billable. See checklist below.
 **Master spec:** `docs/kdb-spec-layer12-zolik-gap-analysis.md` (Layer 12's original source; folded
 into `docs/kdb-spec.md` §0/§16.1/§17 as of Phase 8's master-spec-housekeeping item)
 **Depends on:** the existing Go engine port (`go/kdb/...`, real per the maturity audit) for
@@ -589,13 +591,27 @@ plus unbounded iOS toolchain setup time) if they end up needed after all.
       needs actual x86_64 Lightsail hardware (out of reach in this environment), but a local
       Docker-based approximation of the $7/mo tier (1GB RAM, 2 vCPU, via cgroup limits) is now in
       `docs/benchmarks/lightsail-sim/` (`run.sh` + `go/cmd/kdb-loadtest`), and running it surfaced
-      a real, significant finding, not just a placeholder result: **`kdb-service --memory` gets
-      OOM-killed under moderate write load once the namespace's distinct document count passes
-      roughly a few hundred**, regardless of total operation volume or concurrency (100 docs
-      survived 5,787 writes cleanly at 2,376 ops/sec; 500 and 2,000 docs both died within a few
-      thousand writes, `docker stats`'s 1s sampling never showing memory anywhere near the 1GB
-      ceiling beforehand - a sharp spike between samples, not a visible climb). This needs a real
-      `pprof` heap-profiling investigation to root-cause before the "$7/mo tier" cost claim itself
-      can be trusted - see `docs/benchmarks/lightsail-sim/README.md`'s Finding 1 and its
-      follow-ups list for the detail and next steps. Not marked done: the claim this test exists
-      to validate isn't validated yet, it's now a known open risk instead of an unknown one.
+      a real OOM (`kdb-service --memory` getting SIGKILLed under moderate write load once distinct
+      document count passed a few hundred) that has since been root-caused and fixed - see
+      `docs/benchmarks/lightsail-sim/README.md`'s "The fix" section for the full detail. Two real
+      allocation bugs found via local `pprof` profiling (both ported to Kotlin too, since it
+      shared the pattern): `findExistingCommit`'s idempotent-retry check walked up to 8192 commits
+      of history on every single commit (~88% of all allocation; fixed with an O(1) DAG
+      transaction-id index), and `DocumentTree.With`/`Without` eagerly copied its full entries map
+      on every write (~11%; fixed with a lazy, trie-backed map). Together these eliminated all
+      per-commit scaling with history/document size (`BenchmarkCommitScalingWithHistorySize`,
+      `go/kdb/transaction`, confirms flat ~21µs/commit at both 10 and 8,000 commits of history,
+      vs. up to 234.8µs/commit before). That alone still isn't sufficient in principle - an
+      in-memory, uncompacted commit DAG grows without bound by design - so also added
+      `go/kdb/server.MemoryGuard`: background-sampled backpressure (on `Sys`, not `HeapAlloc` -
+      see the README for why that distinction mattered empirically) that rejects new writes with
+      a clear `*MemoryPressureError` once memory nears a configured budget
+      (`kdb-service --memory-limit-mb`), instead of risking an OS OOM-kill with no warning to the
+      client. Verified end to end: the same 2000-document pool that reliably OOM-killed the server
+      within seconds now survives 5.7 million operations over 3.5 minutes at a safe configuration
+      (`--memory-limit-mb` set to ~60% of the container's actual limit - the README documents why
+      that's the right fraction, found empirically, not the more intuitive 80-90%), with memory
+      usage plateauing at 67% instead of climbing to the hard limit. Still `[~]` rather than `[x]`:
+      the underlying "$7/mo tier" cost claim itself still needs the real Lightsail hardware run
+      to be billable - this harness now confirms the server can run unattended under sustained
+      load with a proper memory-limit configuration, which it previously could not do at all.

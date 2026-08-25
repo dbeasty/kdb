@@ -5,10 +5,11 @@ gap analysis identified (`docs/kdb-spec-layer12-component38-go-native-server.md`
 Docker resource limits, and drives sustained small-message read/write load against Component 38's
 Go-native `kdb-service` over its real wire protocol.
 
-**This is an approximation, not the real thing.** Component 38 spec §7 test 8 explicitly calls for
-running "on hardware/VM specs matching the proposed $7/mo tier, not a developer laptop" — Docker's
-`--memory`/`--cpus` flags give a real cgroup-enforced ceiling (the OOM kill below is a genuine
-kernel action, not simulated), but:
+**Status: the OOM this harness first surfaced is fixed and hardened against** (2026-08-25). See
+"The fix" below for the root causes and the resolution; "Original findings" is kept for the
+record of what was found and how. **This is still an approximation, not the real thing** —
+Component 38 spec §7 test 8 explicitly calls for running "on hardware/VM specs matching the
+proposed $7/mo tier, not a developer laptop":
 - This machine is Apple Silicon (arm64); real Lightsail instances are x86_64. Absolute throughput
   numbers are not directly comparable.
 - Local SSD/APFS I/O characteristics differ from Lightsail's underlying storage.
@@ -16,10 +17,10 @@ kernel action, not simulated), but:
   number below.
 - Docker Desktop's own VM overhead on macOS adds some unknown tax vs. bare Linux.
 
-Treat every number here as "does this even survive the resource envelope, and roughly what does
-degradation look like" — not as an authoritative capacity-planning figure. The real test 8 still
-needs to run on actual Lightsail hardware before the "$7/mo tier" claim is something to bill
-against.
+Docker's `--memory`/`--cpus` flags do give a real cgroup-enforced ceiling (every OOM kill below is
+a genuine kernel action, not simulated), so the *shape* of what was found here is trustworthy even
+though the absolute numbers aren't a capacity-planning figure. The real test 8 still needs to run
+on actual Lightsail hardware before the "$7/mo tier" claim is something to bill against.
 
 ## What's here
 
@@ -39,8 +40,7 @@ against.
 
 Bounded document pool, not an ever-growing insert stream, deliberately: `go/kdb/client`'s own
 package doc comment describes Zolik's actual usage as a repository pattern ("read or write one
-document by id"), not unbounded inserts. See **Finding 1** below for why the pool being bounded
-turned out to matter a great deal.
+document by id"), not unbounded inserts.
 
 ## Running it
 
@@ -63,12 +63,140 @@ control, e.g.:
 go run ./go/cmd/kdb-loadtest -addr 127.0.0.1:19090 -doc-pool 300 -concurrency 4 -duration 15s
 ```
 
-## Results (2026-08-25, Apple M-series arm64, Docker Desktop 4.75, macOS)
+To exercise the memory-pressure hardening (see below), pass `--memory-limit-mb` to `kdb-service`
+when starting the container, e.g. `--memory-limit-mb 600` for a 1GB container.
 
-### Finding 1 — the 1GB tier OOM-kills under moderate write load once the dataset passes roughly a few hundred documents, well before hitting the traffic volumes that would make the cost claim interesting
+## The fix (2026-08-25)
 
-This is the headline result, not a footnote. Every run below used `--memory` mode (in-memory
-runtime, the simplest case — no disk I/O involved at all).
+The original run (see "Original findings" below) found `kdb-service --memory` getting
+OOM-killed under moderate write load once the namespace passed roughly a few hundred documents,
+regardless of total operation volume or concurrency. Root-caused with local `pprof` profiling
+(no Docker needed for this part - see `go tool pprof -alloc_space`) against a small
+in-process repro, then verified end to end back in this harness. Two real, independent
+allocation bugs, plus hardening once both were fixed still couldn't make the OOM impossible in
+principle:
+
+**1. `findExistingCommit`'s idempotent-retry check walked history on every single commit (~88%
+of all allocation in the profiled run).** Both the Go (`go/kdb/transaction/default_engine.go`)
+and Kotlin (`kdb-transaction/DefaultTransactionEngine.kt`) transaction engines call
+`findExistingCommit` before every `Commit`/`Replay`, to detect "this exact transaction was
+already committed, return that result instead of creating a duplicate" (needed for safe retries
+after e.g. a dropped response). It did this by walking up to 8192 commits of DAG history and
+copying each one's full record (including patch JSON) into a fresh slice, on *every* call,
+whether or not a retry was actually happening. Cost scaled with total commit history, and it also
+had a latent correctness bug: a retry of a transaction more than 8192 commits old would silently
+stop being recognized, creating a duplicate commit instead of the idempotent no-op it should be.
+
+  Fixed by adding a transaction-id index to the commit DAG itself
+  (`InMemoryCommitDag.GetCommitByTransactionID` / `getCommitByTransactionId`, populated
+  incrementally as commits land) so the lookup is O(1) and correct regardless of history length.
+  Ported to both Go and Kotlin, since both shared the identical pattern.
+
+**2. `DocumentTree.With`/`Without` eagerly copied the full flat entries map on every write
+(~11% of allocation, but the *only* remaining scaling factor once (1) was fixed).** This was a
+known, previously-accepted tradeoff (see `document_tree_trie.go`'s own comment and
+`docs/benchmarks/phases-1-6-summary.md`'s Phase 3 notes) - the tree hash itself was already
+O(delta) via a persistent trie, but the flat `map[UUID]Hash` used for fast lookups was still
+copied in full and permanently retained (never evicted) on every single commit, so cost and
+retained memory both grew with total document count.
+
+  Fixed by making `Entries` lazy: `With`/`Without` now return a trie-backed tree with `Entries ==
+  nil`; `Contains`/`HashFor`/`Size` all work directly against the trie (a new O(1) `trieGet`,
+  plus incremental size tracking) without ever materializing the map. A new
+  `MaterializedEntries()` method builds the full map on demand for the few genuinely-full-scan
+  callers that need it (DAG diff, namespace scans) - never on the per-write hot path.
+
+  `BenchmarkCommitScalingWithHistorySize` (`go/kdb/transaction`) guards this directly: commit
+  latency at a 10-commit history vs. an 8,000-commit history, same document pool.
+
+  | | before either fix | after fix 1 only | after both fixes |
+  |---|---:|---:|---:|
+  | history=10 | 23.8µs/op | 23.8µs/op | 30.4µs/op |
+  | history=1000 | (not measured) | 51.3µs/op | 22.1µs/op |
+  | history=8000 | 234.8µs/op | 234.8µs/op | 21.2µs/op |
+
+  (history=10 and 8000 pre-fix numbers from the same benchmark; the 234.8µs value is what an
+  unfixed 8000-deep history costs per commit - a ~10x scaling factor that both fixes together
+  eliminate entirely, leaving commit cost flat regardless of history size.)
+
+**3. Hardening: memory-pressure backpressure, because (1) and (2) narrow the problem but cannot
+eliminate it in principle.** An in-memory, uncompacted commit DAG grows without bound *by
+design* - every write is a permanent new commit, nothing evicts history. Confirmed empirically:
+even with both allocation fixes, an unthrottled 1GB container under sustained 16-way write/read
+load for 60s still eventually got OOM-killed (212,535 ops survived first, a ~18x improvement
+over the original ~1,800–3,700, but still eventually killed).
+
+  Added `go/kdb/server.MemoryGuard`: a background sampler (every 200ms) that trips a cheap,
+  lock-free flag once process memory crosses a configured fraction of a configured budget: new
+  `Commit`/`Upsert` calls are then rejected immediately with a clear `*MemoryPressureError`
+  ("server is near its configured memory budget, retry later") instead of being accepted and
+  risking the process getting SIGKILLed with no warning to the client. Reads are **not** gated -
+  the server keeps serving existing data even while shedding write load. Wired into
+  `KdbServerRuntime.SetMemoryLimit(limitBytes, rejectFraction)`, exposed via `kdb-service`'s new
+  `--memory-limit-mb` flag.
+
+  **Important tuning note, found empirically, not assumed**: the guard samples `runtime.Sys`, not
+  `HeapAlloc` - `HeapAlloc` (live heap) can drop back to near zero within one GC cycle, but Go
+  does not eagerly return freed pages to the OS, so the process's actual OS/cgroup-visible
+  footprint tracks `Sys`, which stays elevated far longer. Gating on `HeapAlloc` was tried first
+  and measured to let the process keep accepting writes for a long stretch after `Sys` had
+  already climbed past the real container limit - it still got OOM-killed with the "fix" in
+  place. Even gating on `Sys`, sustained heavy *read* traffic alone (never blocked by this guard)
+  can push usage a meaningful amount past the configured reject threshold before it plateaus - an
+  80-90%-of-container-limit configuration left the process climbing to 93%+ over several minutes
+  under an extreme, unrealistic stress load (millions of ops in 3.5 minutes); a 60%-of-limit
+  configuration plateaued safely at 67% under the identical load. **Recommendation: set
+  `--memory-limit-mb` to roughly 60% of the container's actual `--memory` limit**, not 80-90% as
+  might seem intuitive - the flag's own help text carries this guidance.
+
+### Verification
+
+Same 2000-document pool, same 16-way concurrency, same 1GB/2-vCPU container that reliably
+OOM-killed the server within seconds before any of this:
+
+| configuration | duration | total ops | outcome |
+|---|---:|---:|---|
+| pre-fix | 30s | ~1,800–3,700 (varies by concurrency) | **OOM-killed** every time |
+| both algorithmic fixes, no memory limit | 60s | 212,535 | **OOM-killed** (eventually) |
+| both fixes + `--memory-limit-mb 800` (80% of container) | 90s | 350,022 | **OOM-killed** (eventually, 93%+ climb) |
+| both fixes + `--memory-limit-mb 600` (60% of container) | 210s | 5,741,150 | **survived**, plateaued at 67% memory |
+
+At the safe configuration: 5.7 million operations (24,688 writes actually landed, 2,424,515
+writes cleanly rejected under pressure, 5,716,462 reads served throughout) over 3.5 minutes,
+process still running, `OOMKilled=false`, memory usage stable at 690.7MiB/1GiB.
+
+### Zero JVM processes, still true
+
+```
+PID   USER     TIME  COMMAND
+    1 kdb       0:00 /usr/local/bin/kdb-service --memory --sql-addr tcp://0.0.0.0:9090?bind=true ...
+```
+
+One process, the Go binary itself - the literal claim Component 38 exists to make true (test 10
+in the component spec).
+
+## Remaining follow-ups
+
+1. Re-run against **file-backed** (`--data-dir`) mode - the fixes above apply equally (same
+   `InMemoryCommitDag`/`DocumentTree` underneath), but not yet explicitly re-verified there.
+2. `insertHex`'s O(n) slice-shift per commit (`go/kdb/dag/in_memory_commit_dag.go`, backing hash
+   prefix lookup) is a real, still-unfixed O(n) *CPU* cost per commit - it did not show up as a
+   significant *allocation* contributor in profiling (unlike the two fixes above), so it wasn't
+   prioritized, but it will make commit latency creep up with history size on long-lived
+   deployments. Worth a follow-up if that becomes measurable.
+3. An insert-heavy, ever-growing-document-count workload (as opposed to this harness's bounded
+   repository-pattern pool) is a different question from what got fixed here - DAG compaction
+   (Component 19) exists but isn't wired into `kdb-service` automatically. Not exercised by this
+   harness; worth its own pass if Zolik's real workload shape turns out to be insert-heavy.
+4. The real Lightsail run (component 38 spec §7 test 8) still needs to happen on real x86_64
+   Lightsail hardware before the cost claim is billable - this harness narrows what to expect and
+   confirms the server can now run unattended under sustained load without a proper memory-limit
+   configuration, but it doesn't replace that run.
+
+## Original findings (2026-08-25, before the fix above)
+
+Kept for the record. Every run below used `--memory` mode (in-memory runtime, no disk I/O
+involved at all), on Apple M-series arm64 / Docker Desktop 4.75 / macOS.
 
 | doc pool | concurrency | writes completed before death | measured throughput before death | outcome |
 |---:|---:|---:|---:|---|
@@ -78,66 +206,10 @@ runtime, the simplest case — no disk I/O involved at all).
 | 500  | 4  | 5,748 | 1,938 ops/sec (mixed) | **OOM-killed** (right at the end of a 10s window) |
 | 100  | 2  | 5,787 | 2,376 ops/sec (mixed) | survived cleanly, 27% memory used |
 
-Reading this: it is **not** simply "total write volume" that predicts the crash — the 100-document
-run completed *more* total writes than any of the crashed runs without dying. It correlates with
-**how many distinct documents exist in the namespace**, not how many times they're updated or how
-many workers are hammering it concurrently (concurrency 1, 8, and 16 all died at a similar
-document-pool size). `docker stats`' 1-second sampling never showed memory anywhere near the 1GB
-ceiling before each kill (typically 140–340MiB on the last sample), meaning the actual growth is a
-sharp spike between samples, not a visible slow climb — consistent with some per-commit or
-per-document operation whose cost scales with total document count rather than being truly
-incremental, despite `docs/benchmarks/phases-1-6-summary.md`'s existing notes about `DocumentTree`
-being an O(delta) persistent trie. This needs a real heap-profiling investigation (`pprof` inside
-the container) to root-cause - not attempted here, flagged as a follow-up.
-
-**Practical read**: as shipped today, the Go-native server's `--memory` mode cannot be trusted to
-run unattended on a 1GB instance for any workload that grows past a small number of distinct
-documents, regardless of traffic volume. This doesn't necessarily kill the "$7/mo tier" cost claim
-(file-backed mode, or a periodic-restart/compaction strategy, might behave differently - not yet
-tested), but it means the claim isn't validated yet either, and the failure mode is silent
-process death (`SIGKILL`, `exitCode=137`) rather than a graceful degradation - it looks in the logs
-like the process simply vanished mid-request, not like it warned it was running low.
-
-### Finding 2 — sustained latency and throughput, below the OOM threshold
-
-The one clean (non-crashed) run, for a rough sense of shape: 100-document pool, concurrency 2,
-8-second measured window, 70/30 read/write mix.
-
-```
-total ops: 19,063 (writes=5,787 reads=13,276 errors=0)
-throughput: 2,376.0 ops/sec
-write latency: p50=1.50ms p95=4.03ms p99=6.21ms max=23.42ms
-read latency:  p50=0.18ms p95=0.58ms p99=1.49ms max=17.92ms
-```
-
-Reads are roughly 8x cheaper than writes at p50, as expected (writes commit through the full
-transaction/DAG-append path; reads are a point lookup at the current head). This single data point
-is not enough to characterize scaling behavior (need to sweep concurrency and confirm the number
-holds under longer runs once Finding 1 is resolved) - reported here as a baseline, not a ceiling.
-
-### Confirmed: zero JVM processes
-
-```
-PID   USER     TIME  COMMAND
-    1 kdb       0:00 /usr/local/bin/kdb-service --memory --sql-addr tcp://0.0.0.0:9090?bind=true ...
-```
-
-One process, the Go binary itself - the literal claim Component 38 exists to make true (test 10 in
-the component spec).
-
-## Suggested follow-ups
-
-1. **Root-cause Finding 1** with `pprof` heap profiling inside the container (add
-   `net/http/pprof` behind a flag, or use `go tool pprof` against a core dump captured right
-   before an engineered near-OOM). Prime suspects given the "scales with document count, not
-   operation count" shape: something in the index layer or `DocumentTree` build path that isn't
-   as incremental as intended once the tree is large enough, or an unbounded cache/registry keyed
-   by document id.
-2. Re-run this same harness against **file-backed** (`--data-dir`) mode once (1) is understood -
-   might behave differently (or might not, if the growth is in an in-memory structure the delta
-   log doesn't relieve).
-3. Once (1) is fixed, re-run at realistic Zolik traffic volumes/durations (minutes, not seconds)
-   to get an actual capacity number for the $7/mo tier claim.
-4. The real Lightsail run (component 38 spec §7 test 8) still needs to happen on real x86_64
-   Lightsail hardware before the cost claim is billable - this harness narrows what to expect,
-   it doesn't replace that run.
+It was not simply "total write volume" that predicted the crash — the 100-document run completed
+*more* total writes than any of the crashed runs without dying. It correlated with how many
+distinct documents existed in the namespace, not how many times they were updated or how many
+workers were hammering it concurrently — matching root cause #2 above (`DocumentTree`'s per-write
+cost scaled with document count) compounding with root cause #1 (cost scaled with total commit
+history, which also grows with document count in a bounded-pool workload once every document has
+been touched at least once).
