@@ -26,6 +26,12 @@ public interface CommitDag {
 
     public suspend fun getCommitOrThrow(hash: KdbHash): KdbCommit
 
+    /** Returns the commit produced by transaction id [txId], if any - O(1), used by
+     * DefaultTransactionEngine's idempotent-retry detection (a caller resubmitting the same
+     * transaction after e.g. a network timeout should see the original result, not create a
+     * duplicate) instead of walking history on every commit. */
+    public suspend fun getCommitByTransactionId(txId: KdbUuid): KdbCommit?
+
     public suspend fun getStub(hash: KdbHash): CommitStub?
 
     public suspend fun hasCommit(hash: KdbHash): Boolean

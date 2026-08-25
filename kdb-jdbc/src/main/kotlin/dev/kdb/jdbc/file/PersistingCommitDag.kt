@@ -27,6 +27,9 @@ internal class PersistingCommitDag(
 
     override suspend fun getCommitOrThrow(hash: KdbHash): KdbCommit = delegate.getCommitOrThrow(hash)
 
+    override suspend fun getCommitByTransactionId(txId: dev.kdb.codec.KdbUuid): KdbCommit? =
+        delegate.getCommitByTransactionId(txId)
+
     override suspend fun getStub(hash: KdbHash): CommitStub? = delegate.getStub(hash)
 
     override suspend fun hasCommit(hash: KdbHash): Boolean = delegate.hasCommit(hash)

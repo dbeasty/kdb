@@ -2,6 +2,7 @@ package transaction_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -196,6 +197,66 @@ func TestReplayIdempotent(t *testing.T) {
 	f2 := second.(transaction.ResultSuccess)
 	if f1.Commit.Hash != f2.Commit.Hash {
 		t.Fatalf("replay not idempotent: %s vs %s", f1.Commit.Hash.Hex(), f2.Commit.Hash.Hex())
+	}
+}
+
+// TestCommitIdempotentAcrossInterveningHistory guards the fix that replaced findExistingCommit's
+// walk of up to 8192 commits of history with an O(1) dag.GetCommitByTransactionID lookup (see
+// that method's doc comment - it was the dominant cost behind kdb-service getting OOM-killed
+// under sustained write load, docs/benchmarks/lightsail-sim/README.md). The walk-based version
+// also had a latent correctness bug this test would have caught: a retry of a transaction whose
+// original commit had fallen more than 8192 commits behind the current head would silently stop
+// being recognized as a retry and create a duplicate commit instead - unbounded by history length
+// is the actually-correct semantic for "was this exact transaction already committed."
+func TestReplayIdempotentAcrossInterveningHistory(t *testing.T) {
+	ns := "app/idempotent-long-history"
+	d, _ := dag.NewInMemoryCommitDag(ns)
+	store := mem.NewInMemoryStorageAdapter()
+	engine := transaction.NewEngine(transaction.ConflictPolicyStrict, nil)
+
+	base, _ := d.Head()
+	doc, _ := document.FromJSON(`{"v":"original"}`)
+	tx := newTx(base, document.WriteOp{DocID: doc.ID, Patch: doc.JSON})
+	original := mustCommit(t, engine, tx, d, store).(transaction.ResultSuccess)
+
+	// Many unrelated intervening commits, simulating a retry that arrives long after the
+	// original attempt - not the "immediately again" shape TestReplayIdempotent already covers.
+	// A real caller replaying against a pinned target (e.g. a client resending a write-back
+	// transaction after a dropped response - Component 46's shape) passes that same target
+	// explicitly regardless of how much else has happened since, which is exactly what Replay's
+	// signature is for (unlike Commit, which always re-derives the current head).
+	head := original.Commit.Hash
+	for i := 0; i < 50; i++ {
+		otherDoc, _ := document.FromJSON(fmt.Sprintf(`{"v":"filler-%d"}`, i))
+		otherTx := newTx(head, document.WriteOp{DocID: otherDoc.ID, Patch: otherDoc.JSON})
+		res := mustCommit(t, engine, otherTx, d, store).(transaction.ResultSuccess)
+		head = res.Commit.Hash
+	}
+
+	// Retrying the exact same transaction against its original target, long after 50 unrelated
+	// commits landed in between, must find the original commit via findExistingCommit's
+	// idempotency check - not attempt (and potentially conflict on) a fresh replay.
+	retryResult, err := engine.Replay(tx, d, store, schema.None(), original.Commit.ParentHashes[0], "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	success, ok := retryResult.(transaction.ResultSuccess)
+	if !ok {
+		t.Fatalf("expected idempotent retry to succeed, got %T: %+v", retryResult, retryResult)
+	}
+	if success.Commit.Hash != original.Commit.Hash {
+		t.Fatalf("retry produced a different commit (%s) than the original (%s) - idempotency broken",
+			success.Commit.Hash.Hex(), original.Commit.Hash.Hex())
+	}
+
+	// And the DAG must not have forked: main still points at the last of the 50 filler commits,
+	// not somewhere the retry left it.
+	finalHead, err := d.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalHead != head {
+		t.Fatalf("main moved during an idempotent retry: got %s, want %s", finalHead.Hex(), head.Hex())
 	}
 }
 

@@ -488,20 +488,24 @@ internal class DefaultTransactionEngine(
         return MutableSchemaOutcome(rolling, violations, writes)
     }
 
+    /** Detects an idempotent retry: the same transaction id already produced a commit with
+     * these exact parents, so the caller should see that original result rather than attempt a
+     * duplicate commit. O(1) via [CommitDag.getCommitByTransactionId] - this used to walk up to
+     * 8192 commits of history on every single commit/replay call regardless of whether a retry
+     * was actually happening, which measured as the dominant cost (~88% of all allocation in a
+     * profiled Go-side run - both implementations share this exact pattern) behind
+     * kdb-service getting OOM-killed under sustained write load once history grew past a few
+     * thousand commits (docs/benchmarks/lightsail-sim/README.md). [anchorCommit] is unused now
+     * that the lookup is keyed by transaction id rather than a history walk from it, but stays
+     * in the signature to avoid touching call sites. */
     private suspend fun findExistingCommit(
         transaction: KdbTransaction,
         dag: CommitDag,
         anchorCommit: KdbHash,
         parents: List<KdbHash>,
     ): KdbCommit? {
-        for (entry in dag.walk(from = anchorCommit, limit = 8192)) {
-            if (entry !is TraversalEntry.Full) continue
-            val commit = entry.commit
-            if (commit.transactionId == transaction.id && commit.parentHashes == parents) {
-                return commit
-            }
-        }
-        return null
+        val commit = dag.getCommitByTransactionId(transaction.id) ?: return null
+        return commit.takeIf { it.parentHashes == parents }
     }
 
     private fun toReport(

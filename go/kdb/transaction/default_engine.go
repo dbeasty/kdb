@@ -443,25 +443,27 @@ func runSchemaPhase(
 	return schemaOutcome{rollingSchema: rolling, violations: violations, writesByOpIndex: writes}
 }
 
+// findExistingCommit detects an idempotent retry: the same transaction id already produced a
+// commit with these exact parents, so the caller should see that original result rather than
+// attempt a duplicate commit. O(1) via the DAG's transaction index (GetCommitByTransactionID) -
+// this used to walk up to 8192 commits of history on every single Commit/Replay call regardless
+// of whether a retry was actually happening, which measured as ~88% of all allocation in a
+// profiled run and was the dominant cause of kdb-service getting OOM-killed under sustained
+// write load once history grew past a few thousand commits (docs/benchmarks/lightsail-sim/
+// README.md). anchorCommit is unused now that the lookup is keyed by transaction id rather than
+// a history walk from it, but stays in the signature to avoid touching call sites.
 func (e *defaultEngine) findExistingCommit(
 	tx document.Transaction,
 	d *dag.InMemoryCommitDag,
 	anchorCommit codec.Hash,
 	parents []codec.Hash,
 ) *document.Commit {
-	entries := d.Walk(anchorCommit, nil, 8192)
-	for _, entry := range entries {
-		full, ok := entry.(dag.FullEntry)
-		if !ok {
-			continue
-		}
-		commit := full.Commit
-		if commit.TransactionID == tx.ID && parentHashesEqual(commit.ParentHashes, parents) {
-			cp := commit
-			return &cp
-		}
+	_ = anchorCommit
+	commit, ok := d.GetCommitByTransactionID(tx.ID)
+	if !ok || !parentHashesEqual(commit.ParentHashes, parents) {
+		return nil
 	}
-	return nil
+	return &commit
 }
 
 func toReport(tx document.Transaction, anchor codec.Hash, conflicts []OperationConflict) kdberr.ConflictReport {

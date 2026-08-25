@@ -89,6 +89,38 @@ class TransactionEngineTest {
             assertEquals(first.commit.hash, second.commit.hash)
         }
 
+    // Guards the fix that replaced findExistingCommit's walk of up to 8192 commits of history
+    // with an O(1) CommitDag.getCommitByTransactionId lookup (see that method's doc comment -
+    // this was the dominant cost behind kdb-service getting OOM-killed under sustained write
+    // load, docs/benchmarks/lightsail-sim/README.md; both implementations shared this exact
+    // pattern). replay_idempotent above only covers "immediately again" with nothing in between;
+    // a real caller replaying against a pinned target (e.g. resending a write-back transaction
+    // after a dropped response) may do so long after other, unrelated commits landed.
+    @Test
+    fun replay_idempotent_acrossInterveningHistory() =
+        runTest {
+            val ns = "app/idempotent-long-history"
+            val dag = inMemoryCommitDag(ns)
+            val storage = InMemoryStorageAdapter()
+            val base = dag.head()
+            val doc = KdbDocument(KdbUuid.random(), """{"v":"original"}""")
+            val originalTx = tx(base, KdbOp.Write(doc.id, doc.json))
+            val original = engine.commit(originalTx, dag, storage) as TransactionResult.Success
+
+            var head = original.commit.hash
+            repeat(50) { i ->
+                val fillerDoc = KdbDocument(KdbUuid.random(), """{"v":"filler-$i"}""")
+                val fillerTx = tx(head, KdbOp.Write(fillerDoc.id, fillerDoc.json))
+                val res = engine.commit(fillerTx, dag, storage) as TransactionResult.Success
+                head = res.commit.hash
+            }
+
+            val retry = engine.replay(originalTx, dag, storage, replayTarget = original.commit.parentHashes.single())
+            assertIs<TransactionResult.Success>(retry)
+            assertEquals(original.commit.hash, retry.commit.hash, "idempotent retry produced a different commit than the original")
+            assertEquals(head, dag.head(), "main moved during an idempotent retry")
+        }
+
     @Test
     fun commit_writeFailsMidTransaction_abortsAndRollsBackWithoutPartialWrites() =
         runTest {

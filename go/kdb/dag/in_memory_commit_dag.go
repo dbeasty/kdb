@@ -23,6 +23,11 @@ type InMemoryCommitDag struct {
 	branches map[string]document.Branch
 	tags     map[string]document.Tag
 	hexSorted []string
+	// txIndex maps a transaction id to the commit it produced, so idempotent-retry detection
+	// (GetCommitByTransactionID, used by transaction.Engine's findExistingCommit) is O(1)
+	// instead of walking history. See GetCommitByTransactionID's own doc comment for why this
+	// exists.
+	txIndex map[codec.UUID]codec.Hash
 }
 
 // NewInMemoryCommitDag creates a DAG with genesis commit and main branch.
@@ -34,6 +39,7 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 		trees:       make(map[codec.Hash]document.DocumentTree),
 		branches:    make(map[string]document.Branch),
 		tags:        make(map[string]document.Tag),
+		txIndex:     make(map[codec.UUID]codec.Hash),
 	}
 	empty := document.EmptyDocumentTree()
 	d.trees[empty.TreeHash] = empty
@@ -50,6 +56,7 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	}
 	d.commits[genesis.Hash] = genesis
 	d.insertHex(genesis.Hash.Hex())
+	d.txIndex[genesis.TransactionID] = genesis.Hash
 	now := codec.TimestampNow()
 	d.branches[mainBranch] = document.Branch{
 		Name: mainBranch, NamespaceID: namespaceID,
@@ -166,7 +173,33 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	}
 	d.commits[commit.Hash] = commit
 	d.insertHex(commit.Hash.Hex())
+	// Only the first commit for a given transaction id is indexed - a caller retrying the same
+	// transaction always expects to find that original result, not a later, unrelated commit
+	// that happens to reuse the id (which should never legitimately happen, since ids are random
+	// UUIDs minted fresh per transaction attempt, but "first wins" is the safer tie-break if it
+	// ever did).
+	if _, exists := d.txIndex[commit.TransactionID]; !exists {
+		d.txIndex[commit.TransactionID] = commit.Hash
+	}
 	return nil
+}
+
+// GetCommitByTransactionID returns the commit produced by transaction id, if any - an O(1)
+// lookup used by transaction.Engine's idempotent-retry detection (a caller resubmitting the same
+// transaction after e.g. a network timeout should see the original result, not create a
+// duplicate). Before this existed, that check walked up to 8192 commits of history on every
+// single Commit/Replay call regardless of whether a retry was actually happening, which measured
+// as the dominant cost (~88% of all allocation in a profiled run) behind kdb-service getting
+// OOM-killed under sustained write load once a namespace's commit history grew past a few
+// thousand entries - see docs/benchmarks/lightsail-sim/README.md.
+func (d *InMemoryCommitDag) GetCommitByTransactionID(txID codec.UUID) (document.Commit, bool) {
+	d.mu.RLock()
+	hash, ok := d.txIndex[txID]
+	d.mu.RUnlock()
+	if !ok {
+		return document.Commit{}, false
+	}
+	return d.GetCommit(hash)
 }
 
 // StubCommit archives a commit in place.
@@ -370,16 +403,22 @@ func (d *InMemoryCommitDag) Diff(fromHash, toHash codec.Hash) (CommitDiff, error
 	if !ok {
 		return CommitDiff{}, kdberr.NewVersionNotFoundError("to tree missing", d.NamespaceID, tc.DocumentTreeHash.Hex())
 	}
+	// MaterializedEntries, not the .Entries field directly: With/Without-derived trees don't
+	// eagerly populate it (see DocumentTree's own doc comment) - Diff is the kind of full-scan
+	// operation that genuinely needs the flat map, unlike the per-write hot path that used to
+	// force this same materialization on every single commit.
+	toEntries := toTree.MaterializedEntries()
+	fromEntries := fromTree.MaterializedEntries()
 	var entries []DiffEntry
-	for id, h := range toTree.Entries {
-		if oh, ok := fromTree.Entries[id]; !ok {
+	for id, h := range toEntries {
+		if oh, ok := fromEntries[id]; !ok {
 			entries = append(entries, DiffAdded{DocID: id, ContentHash: h})
 		} else if oh != h {
 			entries = append(entries, DiffModified{DocID: id, FromContentHash: oh, ToContentHash: h})
 		}
 	}
-	for id, h := range fromTree.Entries {
-		if _, ok := toTree.Entries[id]; !ok {
+	for id, h := range fromEntries {
+		if _, ok := toEntries[id]; !ok {
 			entries = append(entries, DiffRemoved{DocID: id, ContentHash: h})
 		}
 	}

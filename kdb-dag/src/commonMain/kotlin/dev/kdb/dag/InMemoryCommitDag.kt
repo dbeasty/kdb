@@ -29,6 +29,10 @@ internal class InMemoryCommitDag(
     private val tags = LinkedHashMap<String, KdbTag>()
     /** Sorted lowercase full hex strings for prefix scans. */
     private val hexSorted = mutableListOf<String>()
+    /** Maps a transaction id to the commit it produced, so idempotent-retry detection
+     * (getCommitByTransactionId, used by DefaultTransactionEngine.findExistingCommit) is O(1)
+     * instead of walking history - see getCommitByTransactionId's own doc comment. */
+    private val txIndex = LinkedHashMap<KdbUuid, KdbHash>()
 
     init {
         trees[DocumentTree.EMPTY.treeHash] = DocumentTree.EMPTY
@@ -49,6 +53,7 @@ internal class InMemoryCommitDag(
             )
         commits[genesis.hash] = genesis
         insertHex(genesis.hash.toHex())
+        txIndex[genesisTx] = genesis.hash
         val now = KdbTimestamp.now()
         branches[MAIN_BRANCH] =
             KdbBranch(
@@ -139,7 +144,17 @@ internal class InMemoryCommitDag(
         }
         commits[commit.hash] = commit
         insertHex(commit.hash.toHex())
+        // First commit for a given transaction id wins - a caller retrying the same transaction
+        // always expects to find that original result, not a later, unrelated commit that
+        // happens to reuse the id (which shouldn't legitimately happen, since ids are random
+        // UUIDs minted fresh per transaction attempt, but "first wins" is the safer tie-break).
+        txIndex.putIfAbsent(commit.transactionId, commit.hash)
     }
+
+    override suspend fun getCommitByTransactionId(txId: KdbUuid): KdbCommit? =
+        mutex.withLock {
+            txIndex[txId]?.let { commits[it] }
+        }
 
     override suspend fun stubCommit(
         hash: KdbHash,
