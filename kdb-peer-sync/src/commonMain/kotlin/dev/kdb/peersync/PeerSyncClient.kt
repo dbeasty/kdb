@@ -8,6 +8,7 @@ import dev.kdb.auth.toHttpHeaders
 import dev.kdb.stream.WireConnection
 import dev.kdb.transport.core.OptionAwareWireTransport
 import dev.kdb.transport.core.TransportConnectOptions
+import dev.kdb.transaction.ConflictPolicy
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.wire.*
 import kotlinx.coroutines.delay
@@ -39,7 +40,7 @@ internal class DefaultPeerSyncClient(
     private val wire: WireCodec,
     private val transport: dev.kdb.stream.WireTransport,
     private val dag: CommitDag,
-    @Suppress("UNUSED_PARAMETER") private val storage: StorageAdapter,
+    private val storage: StorageAdapter,
     @Suppress("UNUSED_PARAMETER") private val transactionEngine: TransactionEngine?,
 ) : PeerSyncClient {
     private var connection: WireConnection? = null
@@ -80,7 +81,7 @@ internal class DefaultPeerSyncClient(
             ack.response.remoteHeads[config.namespaceId]
                 ?: throw PeerSyncException("remote head missing for ${config.namespaceId}")
         val remoteHead = KdbHash.fromHex(remoteHex)
-        return DefaultPeerSession(this, dag, config.namespaceId, remoteHead, conn)
+        return DefaultPeerSession(this, dag, storage, config.namespaceId, remoteHead, conn, config.conflictPolicy)
     }
 
     override suspend fun disconnect() {
@@ -152,9 +153,11 @@ internal class DefaultPeerSyncClient(
 internal class DefaultPeerSession(
     private val client: DefaultPeerSyncClient,
     private val dag: CommitDag,
+    private val storage: StorageAdapter,
     override val namespaceId: String,
     override val remoteHead: KdbHash,
     private val conn: WireConnection,
+    private val conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
 ) : PeerSession {
 
     override suspend fun pullMissing(): PeerSyncResult {
@@ -162,6 +165,8 @@ internal class DefaultPeerSession(
         if (localHead == remoteHead) {
             return PeerSyncResult(0, 0, localHead, computeSyncPlan(dag, localHead, remoteHead))
         }
+        // putCommit always stores every fetched commit, same as the push-receiving side
+        // (component 39 spec §5) - only the branch-pointer decision below is gated.
         val fetched = client.fetchRemote(conn, namespaceId, sinceHash = localHead)
         var applied = 0
         for (commit in fetched) {
@@ -169,12 +174,15 @@ internal class DefaultPeerSession(
             dag.putCommit(commit, requireParents = true)
             applied++
         }
-        if (fetched.isNotEmpty()) {
-            dag.setHead("main", fetched.last().hash)
-        }
+        val incomingHead = fetched.lastOrNull()?.hash ?: remoteHead
+        // Same resolveDivergence call as the push-receiving side (§5's symmetry contract: one
+        // shared decision function, not two that can drift) - this is the fix for pullMissing's
+        // half of the original blind dag.setHead("main", fetched.last().hash) bug.
+        val outcome = resolveDivergence(dag, storage, namespaceId, localHead, incomingHead, conflictPolicy)
+        val conflictReport = (outcome as? CommitPushOutcome.Conflict)?.report
         val finalHead = dag.head()
         val plan = computeSyncPlan(dag, finalHead, remoteHead)
-        return PeerSyncResult(applied, 0, finalHead, plan)
+        return PeerSyncResult(applied, 0, finalHead, plan, conflict = conflictReport)
     }
 
     override suspend fun pushCommits(commits: List<KdbCommit>): Int = client.pushToRemote(conn, namespaceId, commits)

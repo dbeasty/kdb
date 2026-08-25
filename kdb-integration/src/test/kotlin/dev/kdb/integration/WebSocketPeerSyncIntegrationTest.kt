@@ -33,6 +33,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -290,6 +291,68 @@ class WebSocketPeerSyncIntegrationTest {
                 clientAConn2.disconnect()
                 val docJson = getJson(clientA, ns, b1DocId)
                 assertTrue(docJson.contains("b1"), docJson)
+            }
+        }
+
+    /**
+     * Component 39 spec §7 test 9's new genuinely-concurrent variant, required alongside
+     * [wsPeerSyncBidirectionalAfterPush] above (which is deliberately sequential - A pushes and
+     * disconnects *before* B ever writes - so it cannot and does not exercise this component's
+     * actual fix). Here, both clients write before either syncs, then push at the same time over
+     * two real network connections, racing the server's divergence resolution for real.
+     */
+    @Test
+    fun wsPeerSyncBidirectionalGenuinelyConcurrent() =
+        runBlocking {
+            val ns = "integration/ws-bidir-concurrent"
+            val schema =
+                KdbSchema.build(
+                    listOf(
+                        SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
+                    ),
+                )
+            val serverRuntime = openMemoryRuntimeBlocking("it", ns, schema)
+            withNetworkPeerHost(serverRuntime, ns) { _, port ->
+                val peerUri = "kdb-ws://127.0.0.1:$port/kdb"
+                val transport = transport()
+
+                val clientA = openMemoryRuntimeBlocking("it", ns, schema)
+                val clientB = openMemoryRuntimeBlocking("it", ns, schema)
+                val aDocId = putJson(clientA, ns, """{"userId":"a1","name":"Alice"}""", schema)
+                val bDocId = putJson(clientB, ns, """{"userId":"b1","name":"Bob"}""", schema)
+
+                val connA = peerSyncClient(wire, transport, clientA.dag, clientA.storage)
+                val sessionA = connA.connect(PeerClientConfig(ns, "client-a", peerUri))
+                val connB = peerSyncClient(wire, transport, clientB.dag, clientB.storage)
+                val sessionB = connB.connect(PeerClientConfig(ns, "client-b", peerUri))
+
+                // Genuinely concurrent: both requests are in flight against the server at once,
+                // racing resolveDivergence's namespace lock (PeerSyncConflictDetection.kt).
+                coroutineScope {
+                    launch { pushCommitsSinceRemoteHead(sessionA, clientA.dag, sessionA.remoteHead) }
+                    launch { pushCommitsSinceRemoteHead(sessionB, clientB.dag, sessionB.remoteHead) }
+                }
+                connA.disconnect()
+                connB.disconnect()
+                delay(150)
+
+                // Both commits touched disjoint documents, so per §5/test 3 the server
+                // auto-merges rather than reporting a conflict - both documents must end up
+                // reachable, not just whichever push happened to land last (the exact bug this
+                // component fixes: the pre-fix code would have silently overwritten main with
+                // whichever CommitPush's handler ran second).
+                val clientC = openMemoryRuntimeBlocking("it", ns, schema)
+                val connC = peerSyncClient(wire, transport, clientC.dag, clientC.storage)
+                val sessionC = connC.connect(PeerClientConfig(ns, "client-c", peerUri))
+                val pull = sessionC.pullMissing()
+                materializeCommitHistory(clientC, ns, schema)
+                syncEmbedSchema(clientC, ns, schema)
+                assertTrue(pull.conflict == null, "expected disjoint-document auto-merge, got conflict: ${pull.conflict}")
+                val aJson = getJson(clientC, ns, aDocId)
+                val bJson = getJson(clientC, ns, bDocId)
+                assertTrue(aJson.contains("a1"), aJson)
+                assertTrue(bJson.contains("b1"), bJson)
+                connC.disconnect()
             }
         }
 

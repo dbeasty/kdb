@@ -9,13 +9,14 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.TraversalEntry
 import dev.kdb.document.KdbCommit
+import dev.kdb.error.ConflictReport
 import dev.kdb.storage.StorageAdapter
 import dev.kdb.wire.*
 
 internal class PeerSyncFrameHandler(
     private val wire: WireCodec,
     private val dag: CommitDag,
-  @Suppress("UNUSED_PARAMETER") private val storage: StorageAdapter,
+    private val storage: StorageAdapter,
     private val cfg: PeerHostConfig,
     auth: AuthEngine = AllowAllAuth,
     connectionContext: ConnectionContext = ConnectionContext.EMPTY,
@@ -91,6 +92,8 @@ internal class PeerSyncFrameHandler(
     private suspend fun handleCommitPush(msg: WireMessage.CommitPush): ByteArray {
         requireNamespace(msg.namespace)
         authorizePeerSync()
+        // putCommit always stores, regardless of what happens to "main" below (component 39
+        // spec §5: history must never be lost, only the branch-pointer decision is gated).
         for (commit in msg.commits) {
             if (dag.hasCommit(commit.hash)) continue
             try {
@@ -100,8 +103,26 @@ internal class PeerSyncFrameHandler(
                 throw PeerSyncException("failed to apply commit ${commit.hash.toHex()}", e)
             }
         }
-        if (msg.commits.isNotEmpty()) {
-            dag.setHead("main", msg.commits.last().hash)
+        val incomingHead = msg.commits.lastOrNull()?.hash
+        if (incomingHead != null) {
+            val localHead = dag.head()
+            val outcome = resolveDivergence(dag, storage, cfg.namespaceId, localHead, incomingHead, cfg.conflictPolicy)
+            if (outcome is CommitPushOutcome.Conflict) {
+                val conflictMsg =
+                    WireMessage.ConflictReport(
+                        WireHeader(
+                            WireMessageType.CONFLICT_REPORT,
+                            KDB_WIRE_PROTOCOL_VERSION,
+                            msg.header.correlationId,
+                            0,
+                        ),
+                        msg.namespace,
+                        encodeConflictReport(outcome.report),
+                    )
+                return wire.encode(conflictMsg)
+            }
+            // NoOp/FastForwarded/Merged all succeed - fall through to the ordinary ack below,
+            // same shape the (buggy) unconditional-setHead version always returned.
         }
         val ack =
             WireMessage.CommitPush(
@@ -115,6 +136,19 @@ internal class PeerSyncFrameHandler(
                 emptyList(),
             )
         return wire.encode(ack)
+    }
+
+    private fun encodeConflictReport(report: ConflictReport): ByteArray {
+        val items =
+            report.conflicts.joinToString(",") { item ->
+                val local = item.localDoc ?: "null"
+                val incoming = item.incomingDoc ?: "null"
+                """{"documentId":"${item.documentId}","operationType":"${item.operationType}","localDoc":$local,"incomingDoc":$incoming}"""
+            }
+        return (
+            """{"transactionId":"${report.transactionId}","baseHash":"${report.baseHash}",""" +
+                """"targetHash":"${report.targetHash}","conflicts":[$items]}"""
+        ).encodeToByteArray()
     }
 
     private suspend fun authorizePeerSync() {

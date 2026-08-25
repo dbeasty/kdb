@@ -5,6 +5,8 @@ import dev.kdb.transport.core.TransportTlsSettings
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.TraversalEntry
 import dev.kdb.document.KdbCommit
+import dev.kdb.error.ConflictReport
+import dev.kdb.transaction.ConflictPolicy
 
 public typealias CommitMaterializer = suspend (KdbCommit) -> Unit
 
@@ -13,6 +15,10 @@ public data class PeerHostConfig(
     val nodeId: String,
     val transportHub: String,
     val materializeCommit: CommitMaterializer? = null,
+    /** How a genuine divergence (component 39) resolves for this namespace on receiving a push.
+     * Disjoint-document divergence always auto-merges regardless of this value (see
+     * [resolveDivergence]'s doc comment); this only affects the same-document-conflict case. */
+    val conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
 )
 
 public data class PeerClientConfig(
@@ -21,6 +27,8 @@ public data class PeerClientConfig(
     val peerUri: String,
     val connectionContext: dev.kdb.auth.ConnectionContext = dev.kdb.auth.ConnectionContext.EMPTY,
     val tls: TransportTlsSettings? = null,
+    /** Same as [PeerHostConfig.conflictPolicy], applied when this side is the one pulling. */
+    val conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
 )
 
 public data class DagSyncPlan(
@@ -34,6 +42,10 @@ public data class PeerSyncResult(
     val pushedCommits: Int,
     val finalHead: KdbHash,
     val plan: DagSyncPlan?,
+    /** Non-null when pullMissing/syncBidirectional hit a genuine same-document divergence
+     * (component 39, §7 test 2/3): finalHead was deliberately left unmoved from what it was
+     * before the pull - the caller must resolve this before retrying, not just ignore it. */
+    val conflict: ConflictReport? = null,
 )
 
 public suspend fun computeSyncPlan(
