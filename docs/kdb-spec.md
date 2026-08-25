@@ -77,6 +77,19 @@ Layer 10 — Tooling            [IMPLEMENTED — first Kotlin cut]
   [x] 31. Inspect / Debug Tooling — `:kdb-inspect`; spec `kdb-spec-layer10-component31-inspect-tooling.md`
   [x] 29. CLI                     — `:kdb-cli`; spec `kdb-spec-layer10-component29-cli.md`
   [x] 30. Integration Test Suite  — `:kdb-integration`; spec `kdb-spec-layer10-component30-integration-test-suite.md`
+
+Layer 11 — RBAC + Stored Procedures [IMPLEMENTED — Kotlin/JVM, Go-side partial]
+  [x] —.  User Mgmt & Resource-Scoped RBAC (not a numbered component) — `:kdb-auth`, `:kdb-auth-store`; plan `kdb-rbac-plan.md`; phases 1–4 done, Kotlin/JVM only
+  [x] 32. Stored Procedure Engine — `:kdb-script`; spec `kdb-spec-layer11-component32-stored-procedures.md`; library-level API only, no wire frame/CLI yet
+
+Layer 12 — Go-Native Server + Peer-Sync Hardening [IMPLEMENTED — P0/P1; 42/43 deferred]
+  [x] 38. Go-Native Server              — `go/kdb/server`; spec `kdb-spec-layer12-component38-go-native-server.md`
+  [x] 39. Peer-Sync Conflict Detection  — `:kdb-peer-sync` + `go/kdb/peersync`; spec `kdb-spec-layer12-component39-peersync-conflict-detection.md`
+  [x] 40. Go Client SDK                 — `go/kdb/client`; spec `kdb-spec-layer12-component40-go-client-sdk.md`
+  [x] 41. Auth Session/Token Issuance   — `:kdb-auth` (`dev.kdb.auth.token`); spec `kdb-spec-layer12-component41-auth-tokens.md`
+  [x] 44–46. Minor fixes — commit notification bridge, connection-disconnect lock cleanup, stream write-back mode fix; spec'd inline, gap analysis §5
+  [ ] 42. Native TCP Transport (embed)   — deferred pending Phase 0 spike; spec `kdb-spec-layer12-component42-native-transport.md`
+  [ ] 43. Embed Durable + Mobile Storage — deferred pending Phase 0 spike; spec `kdb-spec-layer12-component43-embed-durable-storage.md`
 ```
 
 ### What Has Been Done
@@ -108,10 +121,15 @@ Layer 10 — Tooling            [IMPLEMENTED — first Kotlin cut]
 - Layer 9 implemented (first Kotlin cut): `:kdb-transport-core`, `:kdb-transport-tcp`, `:kdb-transport-ws`, `:kdb-compute`, `:kdb-compute-jvm`, `:kdb-compute-webgpu`. TCP loopback + peer sync integration; CPU compute fallback for WebGPU/CUDA.
 - Layer 10 component specs generated: Components 29–30 — CLI, integration test suite. Execution plan: `kdb-spec-layer10-execution-plan.md`.
 - Layer 10 implemented (first Kotlin cut): `:kdb-cli` (init/put/get/query/log/status/sync), `:kdb-integration` (cross-layer scenarios). Component 31 inspect landed earlier.
+- Layer 11 implemented: user management & resource-scoped RBAC (`:kdb-auth`, `:kdb-auth-store` — `RegistryAuthStore`, `PasswordHasher` PBKDF2-HMAC-SHA256, `RegistryAuthEngine`; phases 1–4 of `kdb-rbac-plan.md`, Kotlin/JVM only — Go-side store/enforcement landed later as part of Layer 12 Component 38); Component 32 Stored Procedure Engine (`:kdb-script` — `ProcedureRegistry` + sandboxed GraalVM JS runtime, host-authorized `kdb` API; library-level only, no wire protocol frame or CLI subcommand yet).
+- Layer 12 component specs generated: master spec `kdb-spec-layer12-zolik-gap-analysis.md` (driven by a Lightsail hosting-cost calculation and a peer-sync correctness audit), Components 38–43. Execution plan: `kdb-spec-layer12-execution-plan.md`.
+- Layer 12 implemented (P0/P1): Component 38 Go-Native Server (`go/kdb/server` — wire listener, `KdbServerRuntime.Commit`/`Upsert` against the real `TransactionEngine`, RBAC port with cross-verified PBKDF2 hashing; a Go deployment now runs the wire-compatible server with zero JVM processes); Component 39 Peer-Sync Conflict Detection (`resolveHeadUpdate`/`resolveDivergence` in both `:kdb-peer-sync` and `go/kdb/peersync` — fast-forward/already-ancestor/diverged classification replacing an unconditional `setHead`, auto-merge via a real two-parent commit for disjoint writes, explicit conflict report otherwise); Component 40 Go Client SDK (`go/kdb/client` — `Connect`/`PutJSON`/`GetJSON`/`Upsert`/`Commit`/`Query`/`Exec`); Component 41 Auth Session/Token Issuance (`dev.kdb.auth.token` — `TokenAuthEngine`, `CompositeAuthEngine`, `SessionIssuer`); Components 44–46 (SQL-write commits now notify Mode 1 stream subscribers, not just peer-sync-arrived ones; a disconnected connection releases its document locks instead of leaking them; Mode 2 write-back actually awaits and applies a replay instead of returning immediately). Components 42/43 (Kotlin/Native mobile storage/transport) deferred: the Phase 0 spike found `go/kdb/embed` binds directly via `gomobile` on both Android and iOS with no dedicated Kotlin/Native target needed.
 
 ### What To Do Next
 
-**All planned layers (0–10) have a first Kotlin implementation.** Follow-on work: browser snapshot persistence, CUDA/Vulkan real backends, GraalVM CLI binary, Hibernate file-mode integration tests, TLS on transport, WAL-backed document recovery on SERVER open, **file attachments** (Component 3b — ingest, CLI `file put`/`get`, blob GC reachability, peer blob sync).
+**All planned layers (0–12) have at least a first implementation; Layer 12's P0/P1 scope is done.** Remaining Layer 12 items: a Go↔JVM cross-implementation interop test (component 38 spec §7 test 1 / component 40 spec §7 test 1), a Lightsail load test measuring the actual cost savings (component 38 spec §7 test 8), and Components 42/43 only if a future mobile-storage need can't be met by binding `go/kdb/embed` directly.
+
+Other follow-on work: browser snapshot persistence, CUDA/Vulkan real backends, GraalVM CLI binary, Hibernate file-mode integration tests, TLS on transport, WAL-backed document recovery on SERVER open, **file attachments** (Component 3b — ingest, CLI `file put`/`get`, blob GC reachability, peer blob sync), RBAC admin SQL surface + Go-side store, stored procedures' wire protocol frame/CLI subcommand.
 
 Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kdb-transaction`, `:kdb-index`, and in-memory `:kdb-storage` per Layer 3 specs.
 
@@ -132,6 +150,8 @@ Optional parallel work: Layer 3 hardening — add `commonTest` coverage for `:kd
 - Layer 7 depends on Layer 6 — implement **21 → 22 → 20** (wire before stream; tier manager subscribes to 11e). Component 22 is Mode 1/2 only; Mode 3 peer sync is Layer 8 Component 23. Transport sockets are Layer 9 (25–26).
 - Layer 8 depends on Layer 7 — implement **23 → 24** (peer sync before JDBC; JDBC delegates to `HybridQueryEngine`). Network JDBC requires Layer 9 transport.
 - Layer 9 depends on Layer 7–8 — implement **transport-core → 26 → 25 → `:kdb-compute` API → 28 (CPU first) → 27** (TCP before WebSocket for backend; compute CPU path before CUDA/WebGPU). Transport implements `WireTransport` from Component 22; compute implements `ComputeAdapter` for `GpuStorageEngine` and vector index.
+- Layer 11 depends on Layer 10 (RBAC needs the full engine surface to enforce against; stored procedures need `HybridQueryEngine`/`TransactionEngine` as the only privileged path in). RBAC and Component 32 are independent of each other.
+- Layer 12 depends on Layer 7–8 (wire protocol, peer sync) and Layer 11 (Component 38's RBAC port needs the Kotlin RBAC reference to cross-verify against). Components 38 and 39 are independent (different languages, different modules) and may run in parallel; 40 and 41 are each independent of everything else in the layer; 44–46 are minor fixes, opportunistic. Components 42/43 are gated on the Phase 0 spike's answer (whether `go/kdb/embed` already binds via `gomobile`) before starting at all.
 - Component 15 DML paths delegate writes to Component 7 (`TransactionEngine`) — do not duplicate commit logic; Component 17 routes hybrid `_doc` DML through the same engine
 - Never mix spec generation and implementation in the same session
 - Always save component spec output as `.md` files for download (see Section 16.4)
@@ -1383,6 +1403,35 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 **Layer 10 implementation order (normative):** 31 (inspect, early) → **29 CLI** → **30 integration suite**. Detailed plan: `docs/kdb-spec-layer10-execution-plan.md`.
 
 **Estimated NBNC (Layer 10 production + tests):** ~4,200 lines (31: ~1,000; 29: ~1,800; 30: ~1,400).
+
+#### LAYER 11 — RBAC + Stored Procedures (depends on Layer 10)
+
+```
+[x] —.  User Mgmt & Resource-Scoped RBAC  — `:kdb-auth`, `:kdb-auth-store`; not a numbered component; plan `kdb-rbac-plan.md`
+[x] 32. Stored Procedure Engine           — `:kdb-script`; spec `kdb-spec-layer11-component32-stored-procedures.md`
+```
+
+**Layer 11 implementation order (normative):** RBAC and Component 32 have no dependency on each other and may run in parallel. RBAC's phases 1–4 (resource hierarchy, registry store, PBKDF2 password hashing, wire-layer enforcement) are done; a Go-side store/enforcement port and an admin SQL surface are still open (see `kdb-rbac-plan.md`'s own status). Component 32 is a single embedding (GraalVM Polyglot on the JVM inside `kdb-server`); the script never touches storage directly, only the same authorized `HybridQueryEngine`/`TransactionEngine` entry points ordinary SQL/document requests use — no new privileged path into storage. A wire protocol frame and CLI subcommand are not yet built (library-level API only).
+
+**Detailed plan:** `docs/kdb-rbac-plan.md` (RBAC), `docs/kdb-spec-layer11-component32-stored-procedures.md` (Component 32, see its own §9/§11 for implementation phases/status).
+
+#### LAYER 12 — Go-Native Server + Peer-Sync Hardening (depends on Layer 7–8, 11)
+
+```
+[x] 38.    Go-Native Server               — `go/kdb/server`; spec `kdb-spec-layer12-component38-go-native-server.md`
+[x] 39.    Peer-Sync Conflict Detection   — `:kdb-peer-sync` + `go/kdb/peersync`; spec `kdb-spec-layer12-component39-peersync-conflict-detection.md`
+[x] 40.    Go Client SDK                  — `go/kdb/client`; spec `kdb-spec-layer12-component40-go-client-sdk.md`
+[x] 41.    Auth Session/Token Issuance    — `:kdb-auth`; spec `kdb-spec-layer12-component41-auth-tokens.md`
+[x] 44–46. Minor fixes (notification bridge, disconnect cleanup, write-back mode) — spec'd inline, gap analysis §5
+[ ] 42.    Native TCP Transport (embed)   — deferred; spec `kdb-spec-layer12-component42-native-transport.md`
+[ ] 43.    Embed Durable + Mobile Storage — deferred; spec `kdb-spec-layer12-component43-embed-durable-storage.md`
+```
+
+**Layer 12 implementation order (normative):** a Phase 0 spike answers the Component 42/43 question first (does `go/kdb/embed` cross-compile under `gomobile bind` today, with enough feature coverage for on-device needs? — answered yes, for both Android and iOS, once `EmbeddedKdbRuntime.Release()` was renamed to `Close()` to clear an Objective-C ARC selector collision), which makes 42/43 very likely unnecessary. **38 and 39 have no dependency on each other** (different languages, different modules — `go/kdb/server` vs. `kdb-peer-sync`/`go/kdb/peersync`) and ran in parallel; **40** built against Component 38's wire shapes once confirmed; **41** is independent of everything else in the layer; **44–46** are minor, opportunistic fixes found while hardening 38/39 (a Go peer-sync client blind-head-move bug matching 39's own fix, and a file-backed `KdbServerRuntime` commit/persistence bug, were both found and fixed as follow-ons, not part of the original plan).
+
+**Detailed execution plan:** `docs/kdb-spec-layer12-execution-plan.md`. **Master spec:** `docs/kdb-spec-layer12-zolik-gap-analysis.md`.
+
+**Estimated NBNC (Layer 12 P0/P1, excl. deferred 42/43):** ~3,850–6,300 lines (38: ~1,800–2,800; 39: ~400–700; 40: ~600–1,000; 41: ~450–750; 44–46: ~600–1,050).
 
 ### 16.2 Component Spec Structure
 
@@ -3033,4 +3082,282 @@ fun interface DeltaDebugHook {
 
 fun deltaDebugHookOrNoOp(config: DebugSidecarConfig?): DeltaDebugHook
 fun wireDebugHookOrNoOp(config: DebugSidecarConfig?, namespaceId: String): WireDebugHook
+```
+
+### Layer 11 Interfaces
+
+#### RBAC — `dev.kdb.auth.store` (not a numbered component)
+
+```kotlin
+package dev.kdb.auth.store
+
+data class UserRecord(val id: String, val passwordHash: String, val passwordSalt: String, val roles: Set<String> = emptySet())
+data class RoleRecord(val name: String, val grants: Set<String> = emptySet())
+
+interface UserStore {
+    suspend fun createUser(id: String, password: String, roles: Set<String> = emptySet())
+    suspend fun getUser(id: String): UserRecord?
+    suspend fun listUsers(): List<UserRecord>
+    suspend fun updateCredentials(id: String, newPassword: String)
+    suspend fun deleteUser(id: String)
+    suspend fun assignRole(id: String, role: String)
+    suspend fun revokeRole(id: String, role: String)
+    suspend fun verifyPassword(id: String, password: String): Boolean  // false for unknown users too
+}
+
+interface RoleStore {
+    suspend fun createRole(name: String, grants: Set<String> = emptySet())
+    suspend fun getRole(name: String): RoleRecord?
+    suspend fun listRoles(): List<RoleRecord>
+    suspend fun updateGrants(name: String, grants: Set<String>)
+    suspend fun deleteRole(name: String)
+}
+
+/** Slow password hashing (PBKDF2-HMAC-SHA256, 120k iterations, 256-bit key) - cross-verified
+ * against the Go port (go/kdb/auth) for hash portability between implementations. */
+object PasswordHasher {
+    fun hash(password: String, salt: ByteArray = randomSalt()): Pair<String, String>  // (hashHex, saltHex)
+    fun verify(password: String, expectedHashHex: String, saltHex: String): Boolean
+}
+
+/** UserStore/RoleStore persisted as documents inside KDB itself, through the normal commit path
+ * (TransactionEngine/CommitDag/StorageAdapter) - not a static file, so roles/users can be
+ * added/removed at runtime and it durably survives a restart (given a durable CommitDag). */
+class RegistryAuthStore(
+    userDag: CommitDag,
+    roleDag: CommitDag,
+    storage: StorageAdapter,
+    authorNodeId: KdbUuid = KdbUuid.random(),
+    engine: TransactionEngine = transactionEngine(ConflictPolicy.LAST_WRITE),
+) : UserStore, RoleStore
+
+fun dynamicAuthEngine(store: RegistryAuthStore): AuthEngine
+```
+
+#### 32. Stored Procedure Engine — `dev.kdb.script`
+
+```kotlin
+package dev.kdb.script
+
+data class ProcedureDefinition(
+    val namespaceId: String, val name: String, val source: String,
+    val requiredPermission: String? = null, val revision: Long = 1L,
+    val createdBy: String = "", val createdAt: Long = 0L,
+)
+data class ProcResult(val value: String, val logs: List<String>)
+data class ProcLimits(
+    val wallClockMillis: Long = 5_000, val maxHostCalls: Int = 1_000,
+    val maxLogBytes: Int = 64 * 1024, val maxStatements: Long = 1_000_000,
+) { companion object { val DEFAULT: ProcLimits } }
+
+sealed class ProcException(message: String, cause: Throwable? = null) : KdbException(message, cause) {
+    class NotFound(namespace: String, name: String) : ProcException
+    class CompileError(detail: String, cause: Throwable? = null) : ProcException
+    class Timeout(millis: Long) : ProcException
+    class ResourceLimitExceeded(detail: String) : ProcException
+    class ScriptRuntimeError(detail: String, cause: Throwable? = null) : ProcException
+    /** Authorization failure for a specific kdb.* call made *inside* a running script. */
+    class Denied(detail: String) : ProcException
+}
+
+/** Keyed by (namespaceId, name); defining/redefining requires AuthAction.ProcManage - the
+ * caller (wire host) authorizes, this registry does not. */
+interface ProcedureRegistry {
+    suspend fun put(def: ProcedureDefinition): ProcedureDefinition
+    suspend fun get(namespaceId: String, name: String): ProcedureDefinition?
+    suspend fun list(namespaceId: String): List<String>
+    suspend fun delete(namespaceId: String, name: String): Boolean
+}
+fun inMemoryProcedureRegistry(): ProcedureRegistry
+fun procedureRegistry(storage: StorageAdapter): ProcedureRegistry  // content-addressed blob backup
+
+interface ProcedureRuntime {
+    suspend fun invoke(
+        principal: Principal, namespaceId: String, name: String,
+        argsJson: String, limits: ProcLimits = ProcLimits.DEFAULT,
+    ): ProcResult
+}
+
+/** The only embedding needed: GraalVM Polyglot (org.graalvm.js:js) on the JVM, running inside
+ * kdb-server. The script never talks to storage directly - only the same authorized
+ * HybridQueryEngine/TransactionEngine entry points ordinary SQL/document requests use. */
+fun graalProcedureRuntime(
+    registry: ProcedureRegistry, hybrid: HybridQueryEngine, dag: CommitDag,
+    storage: StorageAdapter, schema: KdbSchema, txEngine: TransactionEngine,
+    indexManager: IndexManager, authorizer: Authorizer, maxCallDepth: Int = 3,
+): ProcedureRuntime
+```
+
+### Layer 12 Interfaces
+
+#### 38. Go-Native Server — `go/kdb/server`
+
+```go
+package server
+
+// KdbServerRuntime wraps an embedded runtime with write coordination - one instance serves one
+// namespace, matching the Kotlin KdbServerRuntime's per-namespace TransactionEngine cache.
+type KdbServerRuntime struct {
+    Runtime           *embed.EmbeddedKdbRuntime
+    TransactionEngine transaction.Engine // ConflictPolicyStrict
+    UpsertEngine      transaction.Engine // ConflictPolicyLastWrite
+    SQLEngine         sql.Engine
+    DocumentLocks     *transaction.LockManager
+    AuthEngine        auth.Engine // defaults to auth.AllowAll
+}
+
+func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime
+func (s *KdbServerRuntime) Commit(namespaceID string, tx document.Transaction, sessionID string, principal auth.Principal) (document.Commit, error)
+func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody string, principal auth.Principal) (document.Commit, error)
+func (s *KdbServerRuntime) GetDocument(namespaceID string, docID codec.UUID) (json, commitHex string, found bool, err error)
+func (s *KdbServerRuntime) Retain()
+func (s *KdbServerRuntime) Release()
+
+type Listener struct{ /* ... */ }
+func ListenSqlWire(addr string, runtime *KdbServerRuntime) (*Listener, error)
+func (l *Listener) Addr() net.Addr
+func (l *Listener) Close() error
+
+// ServerRuntimeRegistry holds shared server runtimes by key (multi-namespace deployments).
+type ServerRuntimeRegistry struct{ /* ... */ }
+func NewServerRuntimeRegistry() *ServerRuntimeRegistry
+func (r *ServerRuntimeRegistry) GetOrOpen(key string, open func() (*KdbServerRuntime, error)) (*KdbServerRuntime, error)
+func (r *ServerRuntimeRegistry) Release(key string)
+```
+
+```go
+package auth // go/kdb/auth - PBKDF2-HMAC-SHA256, cross-verified against the Kotlin PasswordHasher
+
+func HashPassword(password string, salt []byte) (hashHex, saltHex string)
+func VerifyPassword(password, expectedHashHex, saltHex string) bool
+
+type RegistryAuthStore struct{ /* ... */ } // implements UserStore + RoleStore over a CommitDAG
+func NewRegistryAuthStore(userDag, roleDag dag.CommitDAG, storage storage.Adapter) (*RegistryAuthStore, error)
+
+type RegistryAuthEngine struct{ /* ... */ } // implements auth.Engine
+func NewRegistryAuthEngine(store *RegistryAuthStore) *RegistryAuthEngine
+```
+
+#### 39. Peer-Sync Conflict Detection — `dev.kdb.peersync` + `go/kdb/peersync`
+
+```kotlin
+package dev.kdb.peersync
+
+sealed class HeadUpdate {
+    object FastForward : HeadUpdate()      // incomingHead is a descendant of localHead
+    object AlreadyAncestor : HeadUpdate()  // localHead already at or ahead of incomingHead
+    object Diverged : HeadUpdate()         // neither is an ancestor of the other
+}
+suspend fun resolveHeadUpdate(dag: CommitDag, localHead: KdbHash, incomingHead: KdbHash): HeadUpdate
+
+sealed class CommitPushOutcome {
+    object NoOp : CommitPushOutcome()
+    object FastForwarded : CommitPushOutcome()
+    data class Merged(val mergeCommit: KdbCommit) : CommitPushOutcome()      // disjoint writes, auto-merged
+    data class Conflict(val report: ConflictReport) : CommitPushOutcome()   // same-doc divergence, main untouched
+}
+
+/** Serialized per namespace (a Mutex-guarded lock map) - shared by both the push-receiving side
+ * (PeerSyncFrameHandler.handleCommitPush) and the pull side (PeerSession.pullMissing), so
+ * there's one decision function, not two independently maintained copies. */
+suspend fun resolveDivergence(
+    dag: CommitDag, storage: StorageAdapter, namespaceId: String,
+    localHead: KdbHash, incomingHead: KdbHash, conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
+): CommitPushOutcome
+```
+
+```go
+package peersync // go/kdb/peersync - ports the above field-for-field
+
+type HeadUpdate int
+const (HeadFastForward HeadUpdate = iota; HeadAlreadyAncestor; HeadDiverged)
+func ResolveHeadUpdate(d *dag.InMemoryCommitDag, localHead, incomingHead codec.Hash) HeadUpdate
+
+type CommitPushOutcomeKind int
+const (OutcomeNoOp CommitPushOutcomeKind = iota; OutcomeFastForwarded; OutcomeMerged; OutcomeConflict)
+type CommitPushOutcome struct {
+    Kind        CommitPushOutcomeKind
+    MergeCommit *document.Commit
+    Report      *kdberr.ConflictReport
+}
+func ResolveDivergence(d *dag.InMemoryCommitDag, store storage.Adapter, namespaceID string, localHead, incomingHead codec.Hash) (CommitPushOutcome, error)
+
+// Result.Conflict is non-nil only on a genuine same-document divergence; FinalHead is then
+// deliberately left unmoved from what it was before the pull.
+type Result struct {
+    AppliedCommits, PushedCommits int
+    FinalHead                     codec.Hash
+    Plan                          *DagSyncPlan
+    Conflict                      *kdberr.ConflictReport
+}
+```
+
+#### 40. Go Client SDK — `go/kdb/client`
+
+```go
+package client
+
+func Connect(ctx context.Context, addr string, token string) (*Client, error)
+func (c *Client) Close() error
+func (c *Client) PutJSON(ctx context.Context, ns, docID string, jsonBody []byte) (commitHex string, err error)
+func (c *Client) GetJSON(ctx context.Context, ns, docID string) (jsonBody []byte, commitHex string, err error)
+func (c *Client) Upsert(ctx context.Context, ns, docID string, jsonBody []byte) (commitHex string, err error)
+func (c *Client) Commit(ctx context.Context, tx Transaction) (commitHex string, err error)
+func (c *Client) Query(ctx context.Context, ns, sqlText string, args []any, dest any) error
+func (c *Client) Exec(ctx context.Context, ns, sqlText string, args []any) error
+func (c *Client) AppendEvent(ctx context.Context, ns, docID string, jsonBody []byte) error
+
+var ErrConflict = errors.New(...)
+type ConflictError struct{ Report kdberr.ConflictReport }
+var ErrNotFound = errors.New(...)
+var ErrUnauthenticated = errors.New(...)
+```
+
+#### 41. Auth Session/Token Issuance — `dev.kdb.auth.token`
+
+```kotlin
+package dev.kdb.auth.token
+
+data class TokenAuthConfig(val documentReader: DocumentReader, val now: () -> KdbTimestamp = { KdbTimestamp.now() })
+enum class RejectReason { TOKEN_NOT_FOUND, TOKEN_EXPIRED, MALFORMED_CREDENTIALS }
+class TokenAuthRejectedException(val reason: RejectReason, message: String) : KdbAuthenticationException(message)
+
+/** Validates a session token against a stored session document - implements the real
+ * Authenticator interface (throws on failure), not the spec's illustrative AuthResult shape. */
+class TokenAuthEngine(config: TokenAuthConfig) : Authenticator
+
+/** Tries multiple Authenticators in order; first success wins, last rejection rethrown if all fail. */
+class CompositeAuthEngine(authenticators: List<Authenticator>) : Authenticator
+
+data class SessionToken(val token: String, val principal: Principal, val expiresAt: KdbTimestamp)
+
+/** Mints/revokes session documents via a narrow DocumentWriter, independent of TokenAuthEngine's
+ * DocumentReader - revoke derives the same deterministic doc id (SHA-256 of the token value)
+ * issue used, so it needs no read-then-delete lookup. */
+class SessionIssuer(documentWriter: DocumentWriter) {
+    suspend fun issue(principal: Principal, ttl: Duration): SessionToken
+    suspend fun revoke(token: String)
+}
+```
+
+#### 44–46. Minor fixes — spec'd inline, gap analysis §5
+
+```kotlin
+// Component 44: kdb-embed's EmbeddedKdbRuntime — commit notification bridge
+class EmbeddedKdbRuntime {
+    suspend fun addCommitListener(listener: suspend (namespaceId: String, commit: KdbCommit) -> Unit)
+}
+
+// Component 45: kdb-server's SqlWireHost/SessionManager — disconnect releases locks
+class SqlWireHost { suspend fun endSession() }
+class SessionManager { suspend fun endAll() }
+
+// Component 46: kdb-stream's StreamBroadcastHub — Mode 2 write-back replay routing
+class StreamBroadcastHub(
+    wire: WireCodec, namespaceId: String, headProvider: suspend () -> KdbHash,
+    transactionReplayer: (suspend (WireMessage.TransactionReplay) -> WireMessage)? = null,
+)
+// StreamConnection.submitTransaction (StreamSubscriber.kt) now encodes the real transaction via
+// TransactionWireCodec and awaits a correlated response (10s timeout) instead of returning
+// immediately without ever encoding more than the transaction's id.
 ```
