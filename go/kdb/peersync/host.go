@@ -1,10 +1,13 @@
 package peersync
 
 import (
+	"encoding/json"
+
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -19,22 +22,25 @@ type Host interface {
 type defaultHost struct {
 	wire    wire.Codec
 	dag     *dag.InMemoryCommitDag
+	storage storage.Adapter
 	auth    auth.Engine
 	handler *frameHandler
 	config  *HostConfig
 }
 
-// NewHost creates an in-memory peer sync host.
-func NewHost(w wire.Codec, dagInst *dag.InMemoryCommitDag, engine auth.Engine, ctx auth.ConnectionContext) Host {
+// NewHost creates an in-memory peer sync host. store is used for the document-level writes/
+// deletes a non-conflicting auto-merge (see ResolveDivergence) stages when an incoming push
+// diverges from local history - required, not optional, since a real push can hit that path.
+func NewHost(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage.Adapter, engine auth.Engine, ctx auth.ConnectionContext) Host {
 	if engine == nil {
 		engine = auth.AllowAll
 	}
-	return &defaultHost{wire: w, dag: dagInst, auth: engine}
+	return &defaultHost{wire: w, dag: dagInst, storage: store, auth: engine}
 }
 
 func (h *defaultHost) Start(config HostConfig) error {
 	h.config = &config
-	h.handler = newFrameHandler(h.wire, h.dag, config, h.auth, auth.EmptyContext)
+	h.handler = newFrameHandler(h.wire, h.dag, h.storage, config, h.auth, auth.EmptyContext)
 	hub := stream.HubFor(config.TransportHub)
 	hub.ServerHandler = func(frame []byte) {
 		if response, err := h.handler.handleFrame(frame); err == nil && response != nil {
@@ -67,11 +73,11 @@ type ConnectionHost struct {
 }
 
 // NewConnectionHost builds a host for one connection context.
-func NewConnectionHost(w wire.Codec, dagInst *dag.InMemoryCommitDag, config HostConfig, engine auth.Engine, ctx auth.ConnectionContext) *ConnectionHost {
+func NewConnectionHost(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage.Adapter, config HostConfig, engine auth.Engine, ctx auth.ConnectionContext) *ConnectionHost {
 	if engine == nil {
 		engine = auth.AllowAll
 	}
-	return &ConnectionHost{handler: newFrameHandler(w, dagInst, config, engine, ctx)}
+	return &ConnectionHost{handler: newFrameHandler(w, dagInst, store, config, engine, ctx)}
 }
 
 func (h *ConnectionHost) Start(HostConfig) error {
@@ -85,15 +91,16 @@ func (h *ConnectionHost) HandleFrame(frame []byte) ([]byte, error) {
 }
 
 type frameHandler struct {
-	wire   wire.Codec
-	dag    *dag.InMemoryCommitDag
-	cfg    HostConfig
-	auth   auth.Engine
-	ctx    auth.ConnectionContext
+	wire    wire.Codec
+	dag     *dag.InMemoryCommitDag
+	storage storage.Adapter
+	cfg     HostConfig
+	auth    auth.Engine
+	ctx     auth.ConnectionContext
 }
 
-func newFrameHandler(w wire.Codec, dagInst *dag.InMemoryCommitDag, cfg HostConfig, engine auth.Engine, ctx auth.ConnectionContext) *frameHandler {
-	return &frameHandler{wire: w, dag: dagInst, cfg: cfg, auth: engine, ctx: ctx}
+func newFrameHandler(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage.Adapter, cfg HostConfig, engine auth.Engine, ctx auth.ConnectionContext) *frameHandler {
+	return &frameHandler{wire: w, dag: dagInst, storage: store, cfg: cfg, auth: engine, ctx: ctx}
 }
 
 func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
@@ -134,13 +141,48 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 		}
 		return h.wire.Encode(push)
 	case wire.CommitPushMessage:
+		// putCommit always stores, regardless of what happens to "main" below (component 39
+		// spec §5: history must never be lost, only the branch-pointer decision is gated).
 		for _, commit := range m.Commits {
+			if h.dag.HasCommit(commit.Hash) {
+				continue
+			}
 			if err := h.dag.PutCommit(commit, true); err != nil {
 				return nil, err
 			}
 			if h.cfg.MaterializeCommit != nil {
 				_ = h.cfg.MaterializeCommit(commit)
 			}
+		}
+		if len(m.Commits) > 0 {
+			incomingHead := m.Commits[len(m.Commits)-1].Hash
+			localHead, err := h.dag.Head()
+			if err != nil {
+				return nil, err
+			}
+			// Component 39-equivalent fix: an incoming push is not automatically "ahead" of
+			// main just because it was pushed - this host's own history may have diverged
+			// (e.g. local writes since the last sync). Same shared decision function as the
+			// client's PullMissing, not two independently maintained copies - that's exactly
+			// how the original blind dag.SetHead("main", ...) bug went unnoticed on one side
+			// while looking "fine" on the other.
+			outcome, err := ResolveDivergence(h.dag, h.storage, m.Namespace, localHead, incomingHead)
+			if err != nil {
+				return nil, err
+			}
+			if outcome.Kind == OutcomeConflict {
+				reportBytes, err := json.Marshal(outcome.Report)
+				if err != nil {
+					return nil, err
+				}
+				return h.wire.Encode(wire.ConflictReportMessage{
+					H:           wire.Header{MessageType: wire.MsgConflictReport, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: m.H.CorrelationID},
+					Namespace:   m.Namespace,
+					ReportBytes: reportBytes,
+				})
+			}
+			// NoOp/FastForwarded/Merged all succeed - fall through to the ordinary ack below,
+			// same shape the (buggy) unconditional-SetHead version always returned.
 		}
 		return nil, nil
 	default:

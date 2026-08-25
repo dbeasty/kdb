@@ -7,6 +7,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/ws"
@@ -33,14 +34,17 @@ type defaultClient struct {
 	wire        wire.Codec
 	transport   stream.Transport
 	dag         *dag.InMemoryCommitDag
+	storage     storage.Adapter
 	correlation int
 	conn        stream.ConnectionHandle
 	mu          sync.Mutex
 }
 
-// NewClient creates a peer sync client skeleton.
-func NewClient(w wire.Codec, transport stream.Transport, dagInst *dag.InMemoryCommitDag) Client {
-	return &defaultClient{wire: w, transport: transport, dag: dagInst, correlation: 2000}
+// NewClient creates a peer sync client. store is used for the document-level writes/deletes a
+// non-conflicting auto-merge (see ResolveDivergence) stages when local and remote history has
+// diverged - required, not optional, since PullMissing can hit that path on any real sync.
+func NewClient(w wire.Codec, transport stream.Transport, dagInst *dag.InMemoryCommitDag, store storage.Adapter) Client {
+	return &defaultClient{wire: w, transport: transport, dag: dagInst, storage: store, correlation: 2000}
 }
 
 func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
@@ -99,7 +103,7 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &defaultSession{client: c, dag: c.dag, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn}, nil
+	return &defaultSession{client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn}, nil
 }
 
 func (c *defaultClient) Disconnect() error {
@@ -189,6 +193,7 @@ func (c *defaultClient) pushToRemote(conn stream.ConnectionHandle, namespaceID s
 type defaultSession struct {
 	client      *defaultClient
 	dag         *dag.InMemoryCommitDag
+	storage     storage.Adapter
 	namespaceID string
 	remoteHead  codec.Hash
 	conn        stream.ConnectionHandle
@@ -210,6 +215,8 @@ func (s *defaultSession) PullMissing() (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	// putCommit always stores every fetched commit, same as the push-receiving side - only the
+	// branch-pointer decision below is gated.
 	applied := 0
 	for _, commit := range fetched {
 		if _, ok := s.dag.GetCommit(commit.Hash); ok {
@@ -220,15 +227,29 @@ func (s *defaultSession) PullMissing() (Result, error) {
 		}
 		applied++
 	}
+	incomingHead := s.remoteHead
 	if len(fetched) > 0 {
-		_ = s.dag.SetHead("main", fetched[len(fetched)-1].Hash)
+		incomingHead = fetched[len(fetched)-1].Hash
+	}
+	// Component 39-equivalent fix: the remote head is not automatically "ahead" just because we
+	// fetched commits leading to it - local history may have diverged from remote since the last
+	// sync (see ResolveDivergence's own doc comment). Blindly moving main to the last fetched
+	// commit here would silently orphan any local-only commits from main, exactly the bug fixed
+	// on the Kotlin side for Component 39 - same shared decision function as the host's
+	// CommitPush handler, not two independently maintained copies.
+	outcome, err := ResolveDivergence(s.dag, s.storage, s.namespaceID, localHead, incomingHead)
+	if err != nil {
+		return Result{}, err
 	}
 	finalHead, err := s.dag.Head()
 	if err != nil {
 		return Result{}, err
 	}
 	plan, _ := ComputeSyncPlan(s.dag, finalHead, s.remoteHead)
-	return Result{AppliedCommits: applied, FinalHead: finalHead, Plan: plan}, nil
+	// Non-nil only on a genuine same-document divergence (§7 test 2/3 equivalent): finalHead was
+	// deliberately left unmoved from what it was before the pull - the caller must resolve this
+	// before retrying, not just ignore it.
+	return Result{AppliedCommits: applied, FinalHead: finalHead, Plan: plan, Conflict: outcome.Report}, nil
 }
 
 func (s *defaultSession) PushCommits(commits []document.Commit) (int, error) {

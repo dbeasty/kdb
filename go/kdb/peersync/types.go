@@ -4,6 +4,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 )
 
@@ -37,4 +38,8 @@ type Result struct {
 	PushedCommits  int
 	FinalHead      codec.Hash
 	Plan           *DagSyncPlan
+	// Conflict is non-nil only on a genuine same-document divergence (see ResolveDivergence):
+	// FinalHead was deliberately left unmoved from what it was before the pull - the caller must
+	// resolve this before retrying, not just ignore it.
+	Conflict *kdberr.ConflictReport
 }
