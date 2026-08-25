@@ -148,6 +148,69 @@ func trieBuild(entries map[codec.UUID]codec.Hash) *trieNode {
 	return root
 }
 
+// trieGet looks up id's content hash. O(trieDepth) = O(1) - the read counterpart to
+// trieInsert/trieDelete, letting DocumentTree.Contains/HashFor avoid needing a full flat map.
+func trieGet(root *trieNode, id codec.UUID) (codec.Hash, bool) {
+	if root == nil {
+		return codec.Hash{}, false
+	}
+	uuidBytes := id.Bytes()
+	n := root
+	for depth := 0; depth < trieDepth; depth++ {
+		if n == nil {
+			return codec.Hash{}, false
+		}
+		if n.leaf != nil {
+			if n.leaf.uuid == id {
+				return n.leaf.hash, true
+			}
+			return codec.Hash{}, false
+		}
+		if n.children == nil {
+			return codec.Hash{}, false
+		}
+		n = n.children[nibbleAt(uuidBytes, depth)]
+	}
+	if n != nil && n.leaf != nil && n.leaf.uuid == id {
+		return n.leaf.hash, true
+	}
+	return codec.Hash{}, false
+}
+
+// trieEntries materializes every (id, hash) pair into a flat map - O(n), used only where a full
+// map is genuinely needed (wire/storage serialization, DAG diff, full scans), never on the
+// per-write With/Without hot path.
+func trieEntries(root *trieNode) map[codec.UUID]codec.Hash {
+	out := make(map[codec.UUID]codec.Hash)
+	trieWalk(root, func(id codec.UUID, h codec.Hash) { out[id] = h })
+	return out
+}
+
+func trieWalk(n *trieNode, visit func(codec.UUID, codec.Hash)) {
+	if n == nil {
+		return
+	}
+	if n.leaf != nil {
+		visit(n.leaf.uuid, n.leaf.hash)
+		return
+	}
+	if n.children == nil {
+		return
+	}
+	for _, c := range n.children {
+		trieWalk(c, visit)
+	}
+}
+
+// trieCount returns the number of leaves reachable from root - O(n), used only to back
+// DocumentTree.Size when no cheaper count is already tracked (e.g. a tree built from a flat map
+// via BuildDocumentTree, which already knows len(entries) directly).
+func trieCount(root *trieNode) int {
+	n := 0
+	trieWalk(root, func(codec.UUID, codec.Hash) { n++ })
+	return n
+}
+
 func trieTreeHash(root *trieNode) codec.Hash {
 	return codec.Hash{Bytes: nodeHash(root)}
 }

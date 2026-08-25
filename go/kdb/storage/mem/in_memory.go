@@ -99,7 +99,11 @@ func (a *InMemoryStorageAdapter) ScanDocuments(namespaceID string, atCommit code
 		return nil
 	}
 	buf := make([]document.Document, 0, batchSize)
-	for _, h := range tree.Entries {
+	// MaterializedEntries, not the .Entries field directly: a full scan is exactly the case
+	// that genuinely needs the flat map (see DocumentTree's own doc comment) - unlike the
+	// per-write hot path (CommitTree below) that used to force this same materialization on
+	// every single commit regardless of whether anything ever scanned it.
+	for _, h := range tree.MaterializedEntries() {
 		d, ok := a.blobStore.GetDocByBlob(h)
 		if !ok {
 			continue

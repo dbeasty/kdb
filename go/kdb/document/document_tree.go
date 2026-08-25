@@ -6,10 +6,28 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 )
 
-// DocumentTree is the materialised doc id → content hash map at a commit.
+// DocumentTree is the doc id → content hash map at a commit.
+//
+// Entries is nil for a tree produced by With/Without - those are backed incrementally by
+// trieRoot alone (see document_tree_trie.go) and deliberately do NOT eagerly materialize a flat
+// map, which used to be copied in full on every single call (O(current document count), not
+// O(delta)) and was found to be a major contributor to kdb-service getting OOM-killed under
+// sustained write load once a namespace grew past a few hundred documents (see
+// docs/benchmarks/lightsail-sim/README.md and go/kdb/transaction's
+// BenchmarkCommitScalingWithHistorySize). Contains/HashFor/Size all work correctly regardless of
+// whether Entries is populated (trieRoot-backed when it isn't); call MaterializedEntries()
+// explicitly for the rare cases that genuinely need the full flat map (wire/storage
+// serialization, DAG diff, full scans) - see its own doc comment.
+//
+// Entries is still populated for trees built directly from a flat map (BuildDocumentTree, e.g.
+// wire decode) - no regression there, since that map already existed in full before construction.
 type DocumentTree struct {
 	TreeHash codec.Hash
 	Entries  map[codec.UUID]codec.Hash
+
+	// size backs Size() when Entries is nil (trie-backed tree) - tracked incrementally in
+	// With/Without so Size() stays O(1) without needing a full trie walk.
+	size int
 
 	// trieRoot backs incremental With/Without updates (see
 	// document_tree_trie.go): when present, TreeHash for a derived tree
@@ -21,39 +39,61 @@ type DocumentTree struct {
 	trieRoot *trieNode
 }
 
-func (t DocumentTree) Size() int { return len(t.Entries) }
+func (t DocumentTree) Size() int {
+	if t.Entries != nil {
+		return len(t.Entries)
+	}
+	return t.size
+}
 
 func (t DocumentTree) Contains(docID codec.UUID) bool {
-	_, ok := t.Entries[docID]
+	if t.Entries != nil {
+		_, ok := t.Entries[docID]
+		return ok
+	}
+	_, ok := trieGet(t.trieRoot, docID)
 	return ok
 }
 
 func (t DocumentTree) HashFor(docID codec.UUID) (codec.Hash, bool) {
-	h, ok := t.Entries[docID]
-	return h, ok
+	if t.Entries != nil {
+		h, ok := t.Entries[docID]
+		return h, ok
+	}
+	return trieGet(t.trieRoot, docID)
+}
+
+// MaterializedEntries returns the full doc id → content hash map, building it from the trie
+// (O(n)) if this tree doesn't already carry one. Only call this where a full map is genuinely
+// needed (wire/storage serialization, DAG diff, full namespace scans) - never on a per-write
+// hot path, which is exactly the mistake With/Without used to make on every single call.
+func (t DocumentTree) MaterializedEntries() map[codec.UUID]codec.Hash {
+	if t.Entries != nil {
+		return t.Entries
+	}
+	return trieEntries(t.trieRoot)
 }
 
 func (t DocumentTree) With(docID codec.UUID, contentHash codec.Hash) (DocumentTree, error) {
-	entries := make(map[codec.UUID]codec.Hash, len(t.Entries)+1)
-	for k, v := range t.Entries {
-		entries[k] = v
-	}
-	entries[docID] = contentHash
 	root := t.trieRootOrBuild()
-	root = trieInsert(root, docID, contentHash)
-	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
+	_, existed := trieGet(root, docID)
+	newRoot := trieInsert(root, docID, contentHash)
+	newSize := t.Size()
+	if !existed {
+		newSize++
+	}
+	return DocumentTree{TreeHash: trieTreeHash(newRoot), size: newSize, trieRoot: newRoot}, nil
 }
 
 func (t DocumentTree) Without(docID codec.UUID) (DocumentTree, error) {
-	entries := make(map[codec.UUID]codec.Hash, len(t.Entries))
-	for k, v := range t.Entries {
-		if k != docID {
-			entries[k] = v
-		}
-	}
 	root := t.trieRootOrBuild()
-	root = trieDelete(root, docID)
-	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
+	_, existed := trieGet(root, docID)
+	newRoot := trieDelete(root, docID)
+	newSize := t.Size()
+	if existed {
+		newSize--
+	}
+	return DocumentTree{TreeHash: trieTreeHash(newRoot), size: newSize, trieRoot: newRoot}, nil
 }
 
 // trieRootOrBuild returns t's trie root, building one from t.Entries (O(n))
@@ -61,7 +101,7 @@ func (t DocumentTree) Without(docID codec.UUID) (DocumentTree, error) {
 // BuildDocumentTree/DocumentTreeFromValue. One-time cost; every
 // subsequent With/Without on the result is O(delta).
 func (t DocumentTree) trieRootOrBuild() *trieNode {
-	if t.trieRoot != nil || len(t.Entries) == 0 {
+	if t.trieRoot != nil || t.Entries == nil || len(t.Entries) == 0 {
 		return t.trieRoot
 	}
 	return trieBuild(t.Entries)
