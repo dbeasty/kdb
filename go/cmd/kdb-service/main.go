@@ -25,11 +25,13 @@ func main() {
 	)
 	var sqlAddr string
 	var rbac bool
+	var memoryLimitMB int
 	fs.StringVar(&dataDir, "data-dir", "", "filesystem data root")
 	fs.BoolVar(&memory, "memory", false, "use in-memory runtime")
 	fs.StringVar(&namespace, "namespace", "demo/users", "default namespace")
 	fs.StringVar(&sqlAddr, "sql-addr", "tcp://127.0.0.1:9090?bind=true", "SQL wire listen address (empty to disable)")
 	fs.BoolVar(&rbac, "rbac", false, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
+	fs.IntVar(&memoryLimitMB, "memory-limit-mb", 0, "reject new writes (rather than risk an OS OOM-kill under sustained load) once process memory nears this budget; rejection triggers at 85% of this value, but sustained read traffic alone can still push usage a fair bit past that before it plateaus, so set this to roughly 60% of the container's actual --memory limit, not 80-90% - see docs/benchmarks/lightsail-sim/README.md for the numbers behind that guidance. 0 disables (default)")
 	_ = fs.Parse(os.Args[1:])
 
 	if dataDir == "" && !memory {
@@ -57,6 +59,13 @@ func main() {
 	}
 
 	srv := server.NewKdbServerRuntime(rt)
+
+	memoryLimitStatus := "disabled"
+	if memoryLimitMB > 0 {
+		limitBytes := uint64(memoryLimitMB) * 1024 * 1024
+		srv.SetMemoryLimit(limitBytes, 0.85)
+		memoryLimitStatus = fmt.Sprintf("%dMB (reject at 85%%)", memoryLimitMB)
+	}
 
 	rbacStatus := "disabled"
 	if rbac {
@@ -96,7 +105,7 @@ func main() {
 		defer sqlListener.Close()
 		sqlStatus = fmt.Sprintf("enabled (%s)", sqlListener.Addr())
 	}
-	fmt.Printf("KDB service peer=%s stream=%s sql=%s rbac=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, rbacStatus, namespace)
+	fmt.Printf("KDB service peer=%s stream=%s sql=%s rbac=%s memory-limit=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, rbacStatus, memoryLimitStatus, namespace)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

@@ -75,6 +75,13 @@ type KdbServerRuntime struct {
 	// "commit requires an InMemoryCommitDag" - the native Go server's --data-dir mode was
 	// entirely unable to write.
 	persister *embed.PersistingCommitDAG
+
+	// memGuard is nil by default (no memory limit configured, never rejects) - opt in via
+	// SetMemoryLimit. See MemoryGuard's own doc comment for why this exists: an uncompacted
+	// in-memory commit DAG grows without bound by design, so a constrained deployment needs to
+	// reject new writes gracefully once it nears its budget, not get OOM-killed with no signal
+	// to the client.
+	memGuard *MemoryGuard
 }
 
 // NewKdbServerRuntime creates a server runtime with ref-count 1, wiring the transaction and SQL
@@ -136,6 +143,17 @@ func (s *KdbServerRuntime) Release() {
 	if s.refCount.Load() > 0 {
 		return
 	}
+	s.memGuard.Stop()
+}
+
+// SetMemoryLimit opts this runtime into memory-pressure backpressure: once heap usage crosses
+// rejectFraction of limitBytes, new writes (Commit/Upsert) are rejected with a *MemoryPressureError
+// instead of being accepted - see MemoryGuard's own doc comment for why. Pass limitBytes == 0 (the
+// default, if this is never called) to disable. Typically set once at startup to the deployment's
+// known memory budget (e.g. a container's --memory limit); safe to call again to change it.
+func (s *KdbServerRuntime) SetMemoryLimit(limitBytes uint64, rejectFraction float64) {
+	s.memGuard.Stop()
+	s.memGuard = NewMemoryGuard(limitBytes, rejectFraction)
 }
 
 // Commit authorizes every operation in tx against principal, then commits it via the
@@ -179,6 +197,12 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 }
 
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
+	// Checked first, before authorization or taking commitMu: a server under memory pressure
+	// should shed load as cheaply as possible, not do more work per rejected request than
+	// necessary.
+	if s.memGuard.ShouldReject() {
+		return document.Commit{}, &MemoryPressureError{}
+	}
 	if err := s.authorizeOperations(tx, principal); err != nil {
 		return document.Commit{}, err
 	}
