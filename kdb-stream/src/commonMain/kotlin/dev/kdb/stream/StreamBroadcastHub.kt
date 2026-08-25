@@ -14,6 +14,20 @@ public class StreamBroadcastHub(
     private val wire: WireCodec,
     private val namespaceId: String,
     private val headProvider: suspend () -> KdbHash,
+    /**
+     * Component 46: routes an incoming [WireMessage.TransactionReplay] to the same
+     * TransactionEngine/commit path the SQL host uses, returning the wire response to send back
+     * (a [WireMessage.SqlResult] on success/error or [WireMessage.ConflictReport] on conflict,
+     * matching kdb-server's SqlWireHost.handleTransactionReplay exactly - reused shapes, no new
+     * wire type). Null (the default) means Mode 2 write-back isn't wired up for this hub;
+     * TransactionReplay is then rejected explicitly rather than silently dropped, which is still
+     * strictly better than today's silent fall-through.
+     *
+     * A plain callback rather than a direct KdbServerRuntime dependency, since kdb-server already
+     * depends on kdb-stream - kdb-stream depending back on kdb-server would be circular. Whoever
+     * wires both together (kdb-service's KdbServiceMain.kt) supplies the closure.
+     */
+    private val transactionReplayer: (suspend (WireMessage.TransactionReplay) -> WireMessage)? = null,
 ) {
     private val mutex = Mutex()
     private val subscribers = mutableListOf<RegisteredSubscriber>()
@@ -34,6 +48,30 @@ public class StreamBroadcastHub(
             is WireMessage.PositionAck -> {
                 updateLastAck(connection, msg.commitHash)
                 null
+            }
+            is WireMessage.TransactionReplay -> {
+                if (msg.namespace != namespaceId) {
+                    null
+                } else {
+                    val replayer = transactionReplayer
+                    val response =
+                        if (replayer != null) {
+                            replayer(msg)
+                        } else {
+                            WireMessage.SqlResult(
+                                WireHeader(WireMessageType.SQL_RESULT, KDB_WIRE_PROTOCOL_VERSION, msg.header.correlationId, 0),
+                                namespace = msg.namespace,
+                                sessionId = "",
+                                columns = emptyList(),
+                                rows = emptyList(),
+                                rowsAffected = 0,
+                                resolvedCommitHex = "",
+                                readOnly = false,
+                                error = "write-back replay is not enabled on this stream host",
+                            )
+                        }
+                    wire.encode(response)
+                }
             }
             else -> null
         }
@@ -156,10 +194,16 @@ public class StreamBroadcastHub(
         )
 }
 
+/** Sentinel used when a commit has no parent (a namespace's root commit) - DeltaCommitPayload's
+ * wire-level parentHash is non-nullable, so there's no "null" to send instead; an all-zero hash
+ * is the common DAG convention for "no parent" and lets a root commit publish without crashing
+ * (it used to `error(...)` here - only reachable once Component 44 started calling this for real
+ * SQL-write commits, since peer-sync's own use of it never happened to hit a namespace's very
+ * first commit in practice). */
+private val ZERO_PARENT_HASH: KdbHash = KdbHash.fromHex("00".repeat(32))
+
 public fun publishedCommitFrom(commit: KdbCommit): PublishedCommit {
-    val parent =
-        commit.parentHashes.firstOrNull()
-            ?: error("commit ${commit.hash.toHex()} has no parent")
+    val parent = commit.parentHashes.firstOrNull() ?: ZERO_PARENT_HASH
     return PublishedCommit(
         commitHash = commit.hash,
         parentHash = parent,

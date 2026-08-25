@@ -56,6 +56,20 @@ public class SessionManager(
         }
     }
 
+    /**
+     * Ends every session this manager currently holds, releasing each one's document locks.
+     * Component 45: one [SessionManager] is 1:1 with one connection ([SqlWireHost] is created
+     * per connection by [sqlWireHostFactory]), and a connection can hold more than one session
+     * (a client may open several via [WireMessage.SessionBegin]) - so connection teardown needs
+     * "end all", not a single [end] call for one guessed session id.
+     */
+    public suspend fun endAll() {
+        val ids = mutex.withLock { sessions.keys.toList() }
+        for (id in ids) {
+            end(id)
+        }
+    }
+
     public suspend fun pendingBuilder(session: KdbSession): LockingTransactionBuilder {
         if (session.pending == null) {
             val inner =

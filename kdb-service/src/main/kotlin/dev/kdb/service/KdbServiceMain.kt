@@ -10,6 +10,12 @@ import dev.kdb.embed.runPeerSyncOverWebSocketListen
 import dev.kdb.embed.runStreamOverWebSocketListen
 import dev.kdb.stream.StreamBroadcastHub
 import dev.kdb.stream.publishedCommitFrom
+import dev.kdb.transaction.TransactionResult
+import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
+import dev.kdb.wire.TransactionWireCodec
+import dev.kdb.wire.WireHeader
+import dev.kdb.wire.WireMessage
+import dev.kdb.wire.WireMessageType
 import dev.kdb.auth.AllowAllAuth
 import dev.kdb.auth.AuthEngine
 import dev.kdb.auth.static.staticAuthEngineFromFile
@@ -61,7 +67,66 @@ public fun main(args: Array<String>) {
             wire = wire,
             namespaceId = config.namespace,
             headProvider = { runtime.dag.head() },
+            // Component 46: route an incoming Mode 2 write-back TransactionReplay into the
+            // same TransactionEngine/commit path SqlWireHost.handleTransactionReplay uses -
+            // this stream host has no per-connection auth/principal concept today (its
+            // Handshake doesn't check credentials either), so this matches that existing scope
+            // rather than introducing a new authorization dimension as a side effect.
+            transactionReplayer = { msg ->
+                val tx = TransactionWireCodec.decode(msg.transactionBytes)
+                val replayTarget = runtime.dag.head()
+                when (val result = serverRuntime.replay(msg.namespace, tx, replayTarget)) {
+                    is TransactionResult.Success ->
+                        WireMessage.SqlResult(
+                            WireHeader(WireMessageType.SQL_RESULT, KDB_WIRE_PROTOCOL_VERSION, msg.header.correlationId, 0),
+                            namespace = msg.namespace,
+                            sessionId = "",
+                            columns = emptyList(),
+                            rows = emptyList(),
+                            rowsAffected = tx.operations.size,
+                            resolvedCommitHex = result.commit.hash.toHex(),
+                            readOnly = false,
+                        )
+                    is TransactionResult.Conflict ->
+                        WireMessage.ConflictReport(
+                            WireHeader(WireMessageType.CONFLICT_REPORT, KDB_WIRE_PROTOCOL_VERSION, msg.header.correlationId, 0),
+                            namespace = msg.namespace,
+                            reportBytes = encodeConflictReportBytes(result.report),
+                        )
+                    is TransactionResult.SchemaError ->
+                        WireMessage.SqlResult(
+                            WireHeader(WireMessageType.SQL_RESULT, KDB_WIRE_PROTOCOL_VERSION, msg.header.correlationId, 0),
+                            namespace = msg.namespace,
+                            sessionId = "",
+                            columns = emptyList(),
+                            rows = emptyList(),
+                            rowsAffected = 0,
+                            resolvedCommitHex = "",
+                            readOnly = false,
+                            error = "schema rejection",
+                        )
+                    is TransactionResult.Aborted ->
+                        WireMessage.SqlResult(
+                            WireHeader(WireMessageType.SQL_RESULT, KDB_WIRE_PROTOCOL_VERSION, msg.header.correlationId, 0),
+                            namespace = msg.namespace,
+                            sessionId = "",
+                            columns = emptyList(),
+                            rows = emptyList(),
+                            rowsAffected = 0,
+                            resolvedCommitHex = "",
+                            readOnly = false,
+                            error = "transaction aborted: ${result.cause.message ?: result.cause.toString()}",
+                        )
+                }
+            },
         )
+    // Component 44: fires for every commit through EmbedWrites.commitViaEngine (the SQL wire
+    // path via serverRuntime.commit(), and any embedded/local write sharing this same
+    // `runtime`) - not just peer-sync's own materializeCommit below, which is the only place
+    // this ever published from before.
+    runBlocking {
+        runtime.addCommitListener { _, commit -> streamHub.publish(publishedCommitFrom(commit)) }
+    }
     val peerHostConfig =
         PeerHostConfig(
             namespaceId = config.namespace,
@@ -116,6 +181,15 @@ public fun main(args: Array<String>) {
         }
     }
 }
+
+/** Matches SqlWireHost's own (private) encodeConflictReport exactly - kept in sync manually
+ * since the two live in different modules (kdb-server can't expose it without widening its
+ * visibility for one caller, and kdb-stream can't depend on kdb-error's full serialization
+ * story - see StreamSubscriber.decodeConflictReport's matching hand-rolled parser). */
+private fun encodeConflictReportBytes(report: dev.kdb.error.ConflictReport): ByteArray =
+    (
+        """{"transactionId":"${report.transactionId}","baseHash":"${report.baseHash}","targetHash":"${report.targetHash}"}"""
+    ).encodeToByteArray()
 
 private fun openRuntime(config: ServiceConfig): EmbeddedKdbRuntime =
     when {

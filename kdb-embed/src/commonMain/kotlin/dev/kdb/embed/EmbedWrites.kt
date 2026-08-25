@@ -40,6 +40,9 @@ public suspend fun commitViaEngine(
                     schema,
                 )
             }
+            // Component 44: the one place every commit path (SQL wire, embedded JDBC, any
+            // future caller) converges, so notifying here is what actually covers all of them.
+            runtime.notifyCommit(namespaceId, result.commit)
             result.commit
         }
         is TransactionResult.Conflict ->

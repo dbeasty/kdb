@@ -3,15 +3,27 @@ package dev.kdb.stream
 import dev.kdb.codec.KdbHash
 import dev.kdb.document.KdbTransaction
 import dev.kdb.error.CompactionBoundaryException
+import dev.kdb.error.ConflictReport
 import dev.kdb.index.IndexManager
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.wire.*
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
+
+/** How long [DefaultStreamSubscriber.submitTransaction] waits for a correlated response before
+ * treating the replay as rejected - component 46's fix must actually await *something*, and an
+ * unbounded wait would hang forever if the coordinator never responds (e.g. it doesn't understand
+ * TransactionReplay at all, the exact bug being fixed). */
+private const val REPLAY_TIMEOUT_MILLIS = 10_000L
 
 public interface StreamSubscriber {
     public suspend fun connect(config: StreamSubscriberConfig): StreamConnection
@@ -42,6 +54,12 @@ internal class DefaultStreamSubscriber(
     private var position: KdbHash? = null
     private var config: StreamSubscriberConfig? = null
     private var correlation = 1
+
+    // Component 46: correlation id -> the caller awaiting submitTransaction's response.
+    // Guarded by a mutex since handleFrame (the dedicated reader coroutine) and
+    // submitTransaction (called from any caller coroutine) both touch this map concurrently.
+    private val pendingReplaysMutex = Mutex()
+    private val pendingReplays = mutableMapOf<Int, CompletableDeferred<ReplayResult>>()
 
     override suspend fun connect(cfg: StreamSubscriberConfig): StreamConnection {
         if (cfg.mode == StreamClientMode.WRITE_BACK && transactionEngine == null) {
@@ -88,6 +106,10 @@ internal class DefaultStreamSubscriber(
         scope?.cancel()
         connection = null
         scope = null
+        // Don't leave any in-flight submitTransaction call hanging until its timeout - the
+        // connection it was waiting on is gone.
+        val stale = pendingReplaysMutex.withLock { val s = pendingReplays.toMap(); pendingReplays.clear(); s }
+        stale.values.forEach { it.complete(ReplayResult.Rejected("disconnected while awaiting replay response")) }
         _events.emit(StreamEvent.Disconnected(null))
     }
 
@@ -146,7 +168,29 @@ internal class DefaultStreamSubscriber(
                 }
 
                 is WireMessage.ConflictReport -> {
-                    _events.emit(StreamEvent.Error(IllegalStateException("conflict reported")))
+                    val deferred = pendingReplaysMutex.withLock { pendingReplays.remove(msg.header.correlationId) }
+                    if (deferred != null) {
+                        deferred.complete(ReplayResult.Conflict(decodeConflictReport(msg.reportBytes)))
+                    } else {
+                        // Not a reply to a pending submitTransaction call (e.g. delivered
+                        // out-of-band by some other flow) - preserve the prior behavior.
+                        _events.emit(StreamEvent.Error(IllegalStateException("conflict reported")))
+                    }
+                }
+
+                is WireMessage.SqlResult -> {
+                    // Component 46: this is the response shape SqlWireHost.handleTransactionReplay
+                    // actually sends back for TransactionReplay (see kdb-server's SqlWireHost.kt) -
+                    // not a dedicated ack type, so this subscriber must recognize it as one.
+                    val deferred = pendingReplaysMutex.withLock { pendingReplays.remove(msg.header.correlationId) }
+                    if (deferred != null) {
+                        val error = msg.error
+                        if (error != null) {
+                            deferred.complete(ReplayResult.Rejected(error))
+                        } else {
+                            deferred.complete(ReplayResult.Applied(KdbHash.fromHex(msg.resolvedCommitHex)))
+                        }
+                    }
                 }
 
                 else -> {}
@@ -160,17 +204,50 @@ internal class DefaultStreamSubscriber(
         cfg: StreamSubscriberConfig,
         tx: KdbTransaction,
     ): ReplayResult {
-        if (connection == null) throw StreamNotConnectedException()
+        val conn = connection ?: throw StreamNotConnectedException()
         val base = position ?: tx.baseVersion
+        val correlationId = correlation++
         val payload =
             WireMessage.TransactionReplay(
-                WireHeader(WireMessageType.TRANSACTION_REPLAY, KDB_WIRE_PROTOCOL_VERSION, correlation++, 0),
+                WireHeader(WireMessageType.TRANSACTION_REPLAY, KDB_WIRE_PROTOCOL_VERSION, correlationId, 0),
                 cfg.namespaceId,
                 base,
-                tx.id.toString().encodeToByteArray(),
+                // Component 46 fix: the actual transaction, not just its id - a UUID string alone
+                // gives the coordinator nothing to replay. TransactionWireCodec is the same codec
+                // the SQL wire client/server already use for TxCommit's transactionBytes.
+                TransactionWireCodec.encode(tx),
             )
-        connection?.send(wire.encode(payload))
-        return ReplayResult.Rejected("async replay not awaited in v1")
+        val deferred = CompletableDeferred<ReplayResult>()
+        pendingReplaysMutex.withLock { pendingReplays[correlationId] = deferred }
+        conn.send(wire.encode(payload))
+        return try {
+            withTimeout(REPLAY_TIMEOUT_MILLIS) { deferred.await() }
+        } catch (e: TimeoutCancellationException) {
+            pendingReplaysMutex.withLock { pendingReplays.remove(correlationId) }
+            ReplayResult.Rejected("timed out waiting for replay response")
+        }
+    }
+
+    /** Mirrors SqlWireHost.encodeConflictReport's wire shape exactly (kdb-server) - that encoder
+     * only writes transactionId/baseHash/targetHash, no conflicts array, so this only reads
+     * those three fields. Hand-rolled rather than kotlinx.serialization since kdb-stream has no
+     * JSON library dependency today and ConflictReport itself isn't @Serializable. */
+    private fun decodeConflictReport(reportBytes: ByteArray): ConflictReport {
+        val text = reportBytes.decodeToString()
+        fun field(name: String): String {
+            val marker = "\"$name\":\""
+            val start = text.indexOf(marker)
+            if (start < 0) return ""
+            val from = start + marker.length
+            val end = text.indexOf('"', from)
+            return if (end < 0) "" else text.substring(from, end)
+        }
+        return ConflictReport(
+            transactionId = field("transactionId"),
+            baseHash = field("baseHash"),
+            targetHash = field("targetHash"),
+            conflicts = emptyList(),
+        )
     }
 
     /** v1: lexicographic compare on full hash bytes as stand-in for DAG ancestry. */

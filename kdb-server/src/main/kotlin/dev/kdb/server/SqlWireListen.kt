@@ -37,18 +37,29 @@ public fun sqlWireHostFactory(
  * serialized here via sendMutex since WireConnection doesn't guarantee
  * concurrent-call safety and interleaved partial frames would corrupt
  * the stream.
+ *
+ * Component 45: [host.endSession] runs in a `finally` around the whole read loop, so it fires
+ * whether `conn.incoming()`'s Flow completes normally (transport-level close), throws, or this
+ * coroutine is cancelled - covering every case that used to leak the connection's sessions and
+ * document locks forever. Both transports (WebSocket and TCP) route through this same function
+ * (see the two `runSqlWireListen` overloads below and their TCP-transport equivalent), so fixing
+ * it here covers both rather than duplicating the hook per transport.
  */
 public suspend fun pipelinedPerConnection(conn: WireConnection, host: SqlWireHost) {
     val sendMutex = Mutex()
-    coroutineScope {
-        conn.incoming().collect { frame ->
-            launch {
-                val response = host.handleFrame(frame)
-                if (response != null) {
-                    sendMutex.withLock { conn.send(response) }
+    try {
+        coroutineScope {
+            conn.incoming().collect { frame ->
+                launch {
+                    val response = host.handleFrame(frame)
+                    if (response != null) {
+                        sendMutex.withLock { conn.send(response) }
+                    }
                 }
             }
         }
+    } finally {
+        host.endSession()
     }
 }
 

@@ -57,6 +57,13 @@ public class SqlWireHost(
     private val sqlAuth = SqlAuthSupport(auth, connectionContext)
     private var correlation = 1
 
+    /** Component 45: releases every session (and its document locks) this connection's
+     * SqlWireHost holds - called from the connection's teardown path (pipelinedPerConnection's
+     * finally), not from any wire message. Idempotent (a second call just ends zero sessions). */
+    public suspend fun endSession() {
+        sessions.endAll()
+    }
+
     // Per-session ordering lock: SqlExec/TxCommit/TxRollback for the same
     // sessionId must still execute one at a time (transaction semantics
     // depend on it - e.g. a Commit must see the effects of every prior
