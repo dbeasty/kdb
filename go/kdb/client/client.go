@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -162,16 +163,13 @@ func Connect(ctx context.Context, addr string, token string) (*Client, error) {
 	return c, nil
 }
 
+// hasScheme reports whether uri already names a transport scheme (e.g. "tcp://host:port") as
+// opposed to a bare "host:port" or "host:port?query" Connect is also documented to accept.
+// Looking only for the first ':' is not enough: a bare IPv4 host:port (e.g. "127.0.0.1:9090")
+// or an IPv6 literal both contain a ':' before any '/', which would otherwise be misread as a
+// scheme separator and left unprefixed - matching "://" is what a scheme actually looks like.
 func hasScheme(uri string) bool {
-	for i := 0; i < len(uri); i++ {
-		switch uri[i] {
-		case ':':
-			return i > 0
-		case '/', '?':
-			return false
-		}
-	}
-	return false
+	return strings.Contains(uri, "://")
 }
 
 // Close closes the underlying connection. Safe to call more than once.

@@ -10,11 +10,12 @@ gate's own stated consequence, Components 42/43 are very likely unnecessary. Mas
 housekeeping (Phase 8's second item) and the Go↔JVM cross-implementation interop test are both
 done - the latter required implementing a real Go WebSocket client (`go/kdb/transport/ws` was
 previously a stub) and fixing a real cross-implementation wire bug it surfaced (a Go SQL
-handshake's `null` `localHeads` crashing the JVM decoder). Remaining: the Lightsail load test
-(needs real cloud infrastructure - out of scope for this environment). See checklist below.
-**Master spec:** `docs/kdb-spec-layer12-zolik-gap-analysis.md` (Layer 12 lives here, not yet in
-`docs/kdb-spec.md` §16.1 — that table still only covers Layers 0–10; fold Layer 12 in per Phase 6
-below once it ships)
+handshake's `null` `localHeads` crashing the JVM decoder). Remaining: the real Lightsail load test
+still needs actual x86_64 cloud hardware, but a local Docker approximation of it now exists
+(`docs/benchmarks/lightsail-sim/`) and surfaced a real open risk worth resolving before that run -
+see the checklist's Lightsail entry. See checklist below.
+**Master spec:** `docs/kdb-spec-layer12-zolik-gap-analysis.md` (Layer 12's original source; folded
+into `docs/kdb-spec.md` §0/§16.1/§17 as of Phase 8's master-spec-housekeeping item)
 **Depends on:** the existing Go engine port (`go/kdb/...`, real per the maturity audit) for
 Components 38/40; `kdb-dag`/`kdb-transaction` (Layers 2–3, complete) for Component 39;
 `kdb-auth`/`kdb-auth-store` (Layer 11, real) for Component 41.
@@ -584,5 +585,17 @@ plus unbounded iOS toolchain setup time) if they end up needed after all.
     session begin, INSERT `rowsAffected=1`, SELECT returns the just-inserted row) against a live
     `./gradlew :kdb-service:runService` instance before committing.
 - [x] `docs/kdb-spec.md` §0/§16.1/§17 updated to include Layers 11–12 (Phase 8)
-- [ ] Lightsail load test on the target tier (component 38 spec §7 test 8) — the number that
-      actually answers "how much does this save"
+- [~] Lightsail load test on the target tier (component 38 spec §7 test 8) — the real run still
+      needs actual x86_64 Lightsail hardware (out of reach in this environment), but a local
+      Docker-based approximation of the $7/mo tier (1GB RAM, 2 vCPU, via cgroup limits) is now in
+      `docs/benchmarks/lightsail-sim/` (`run.sh` + `go/cmd/kdb-loadtest`), and running it surfaced
+      a real, significant finding, not just a placeholder result: **`kdb-service --memory` gets
+      OOM-killed under moderate write load once the namespace's distinct document count passes
+      roughly a few hundred**, regardless of total operation volume or concurrency (100 docs
+      survived 5,787 writes cleanly at 2,376 ops/sec; 500 and 2,000 docs both died within a few
+      thousand writes, `docker stats`'s 1s sampling never showing memory anywhere near the 1GB
+      ceiling beforehand - a sharp spike between samples, not a visible climb). This needs a real
+      `pprof` heap-profiling investigation to root-cause before the "$7/mo tier" cost claim itself
+      can be trusted - see `docs/benchmarks/lightsail-sim/README.md`'s Finding 1 and its
+      follow-ups list for the detail and next steps. Not marked done: the claim this test exists
+      to validate isn't validated yet, it's now a known open risk instead of an unknown one.

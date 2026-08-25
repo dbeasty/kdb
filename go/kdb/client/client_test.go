@@ -53,6 +53,35 @@ func connectTestClient(t *testing.T, addr string) *client.Client {
 	return c
 }
 
+// TestConnectAcceptsBareHostPortWithoutScheme is a regression test for Connect's own doc
+// comment's promise ("dials addr (host:port, or a tcp://... wire URI)"): hasScheme used to look
+// only for the first ':' before any '/', which misreads any bare "host:port" whose host is a
+// numeric IPv4/IPv6 literal (e.g. "127.0.0.1:9090" - by far the most common shape for a
+// same-host or container-published address) as if "127.0.0.1" were itself a URL scheme, leaving
+// the required "tcp://" prefix un-added and the connect failing outright. Found while running
+// docs/benchmarks/lightsail-sim's load generator against a Docker-published port. Every other
+// test in this file happens to pass an already-prefixed "tcp://..." address, so this path went
+// untested until now.
+func TestConnectAcceptsBareHostPortWithoutScheme(t *testing.T) {
+	addr, _ := startTestServer(t)
+	bareAddr := strings.TrimPrefix(addr, "tcp://")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := client.Connect(ctx, bareAddr, "")
+	if err != nil {
+		t.Fatalf("Connect(%q) should accept a bare host:port, got: %v", bareAddr, err)
+	}
+	defer c.Close()
+
+	docID, err := randomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.PutJSON(ctx, "app/data", docID, []byte(`{"ok":true}`)); err != nil {
+		t.Fatalf("PutJSON over a bare-host:port connection failed: %v", err)
+	}
+}
+
 // TestConnectPutJSONGetJSONRoundTrip is component 40 spec §7 test 2: connect, PutJSON, GetJSON
 // round trip against Component 38's Go-native server, end to end, not mocked.
 func TestConnectPutJSONGetJSONRoundTrip(t *testing.T) {
