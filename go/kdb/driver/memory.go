@@ -94,7 +94,7 @@ func openRuntime(parsed ParsedURL) (*embed.EmbeddedKdbRuntime, func(), error) {
 		}
 		return rt, func() {
 			if rt != nil {
-				rt.Release()
+				rt.Close()
 			}
 		}, nil
 	default:

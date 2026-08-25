@@ -20,8 +20,12 @@ type EmbeddedKdbRuntime struct {
 	release  func()
 }
 
-// Release frees any file-runtime resources (e.g. directory lock).
-func (r *EmbeddedKdbRuntime) Release() {
+// Close frees any file-runtime resources (e.g. directory lock).
+//
+// Named Close rather than Release: gomobile's iOS binding generates an Objective-C class per
+// exported type, and Release collides with Objective-C ARC's reserved -release selector, which
+// breaks the iOS bind entirely (see docs/kdb-spec-layer12-execution-plan.md's Phase 0 spike).
+func (r *EmbeddedKdbRuntime) Close() {
 	if r == nil {
 		return
 	}
