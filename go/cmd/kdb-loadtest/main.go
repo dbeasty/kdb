@@ -157,6 +157,13 @@ func main() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		// A single timer firing once at drainStart+duration, not time.After(20ms) re-armed
+		// every loop iteration: under sustained throughput the results channel is ready on
+		// nearly every iteration, so a freshly-created 20ms timer never wins the select before
+		// being replaced - the loop would then run until the caller's outer context timeout
+		// instead of *duration.
+		deadline := time.NewTimer(*duration)
+		defer deadline.Stop()
 		for {
 			select {
 			case s := <-results:
@@ -165,10 +172,8 @@ func main() {
 				} else {
 					writeLatencies = append(writeLatencies, s.ns)
 				}
-			case <-time.After(20 * time.Millisecond):
-				if time.Since(drainStart) >= *duration {
-					return
-				}
+			case <-deadline.C:
+				return
 			}
 		}
 	}()
