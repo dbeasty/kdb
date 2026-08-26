@@ -9,6 +9,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 const mainBranch = "main"
@@ -67,6 +68,28 @@ type CommitPushOutcome struct {
 	Report      *kdberr.ConflictReport
 }
 
+// ResolutionOptions controls how resolveDivergedLocked handles a genuine same-document conflict
+// during divergence resolution. The zero value preserves the original behavior - always report,
+// never resolve - so any existing caller that doesn't set this sees no change.
+type ResolutionOptions struct {
+	// Policy selects how an overlapping (same-document) conflict is resolved.
+	// ConflictPolicyStrict (or the zero value, ConflictPolicyAppendOnly - divergence resolution
+	// only reaches this switch for a genuine overlap, which an APPEND_ONLY namespace never
+	// produces by construction) means "report, don't resolve", unchanged from before this option
+	// existed. ConflictPolicyLastWrite means the incoming/remote side's write always wins for a
+	// conflicting document - this is transaction.ConflictPolicyLastWrite's existing "the
+	// transaction being applied always overwrites what's there" semantics
+	// (default_engine.go's finalizeTransaction), read in peer sync's own replay direction: spec
+	// kdb-spec.md §8.3 step 3 is "replay B's [the remote/incoming side's] transactions onto A's
+	// [local's] HEAD", so "the transaction being applied" is the remote side.
+	// ConflictPolicyCustom consults Resolver once per conflicting document.
+	Policy transaction.ConflictPolicy
+	// Resolver is consulted when Policy is ConflictPolicyCustom. A nil Resolver, or a
+	// resolution failure/nil result for any document, falls back to reporting the conflict
+	// rather than guessing - matching transaction.Engine's own CUSTOM fallback.
+	Resolver transaction.ConflictResolver
+}
+
 var (
 	divergenceLocksGuard sync.Mutex
 	divergenceLocks      = map[string]*sync.Mutex{}
@@ -100,11 +123,12 @@ func ResolveDivergence(
 	store storage.Adapter,
 	namespaceID string,
 	localHead, incomingHead codec.Hash,
+	opts ResolutionOptions,
 ) (CommitPushOutcome, error) {
 	lock := divergenceLockFor(namespaceID)
 	lock.Lock()
 	defer lock.Unlock()
-	return resolveDivergenceLocked(d, store, namespaceID, localHead, incomingHead)
+	return resolveDivergenceLocked(d, store, namespaceID, localHead, incomingHead, opts)
 }
 
 func resolveDivergenceLocked(
@@ -112,6 +136,7 @@ func resolveDivergenceLocked(
 	store storage.Adapter,
 	namespaceID string,
 	localHead, incomingHead codec.Hash,
+	opts ResolutionOptions,
 ) (CommitPushOutcome, error) {
 	switch ResolveHeadUpdate(d, localHead, incomingHead) {
 	case HeadFastForward:
@@ -122,7 +147,7 @@ func resolveDivergenceLocked(
 	case HeadAlreadyAncestor:
 		return CommitPushOutcome{Kind: OutcomeNoOp}, nil
 	default: // HeadDiverged
-		return resolveDivergedLocked(d, store, namespaceID, localHead, incomingHead)
+		return resolveDivergedLocked(d, store, namespaceID, localHead, incomingHead, opts)
 	}
 }
 
@@ -137,6 +162,7 @@ func resolveDivergedLocked(
 	store storage.Adapter,
 	namespaceID string,
 	localHead, incomingHead codec.Hash,
+	opts ResolutionOptions,
 ) (CommitPushOutcome, error) {
 	plan, err := ComputeSyncPlan(d, localHead, incomingHead)
 	if err != nil {
@@ -167,6 +193,44 @@ func resolveDivergedLocked(
 			return CommitPushOutcome{}, err
 		}
 		return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, nil
+	}
+
+	// A genuine same-document conflict. Real "replay per conflict policy" (kdb-spec.md §8.3 step
+	// 3): STRICT/unset always reports (unchanged); LAST_WRITE and CUSTOM resolve it into the
+	// same single-merge-commit auto-merge path used for the disjoint case above, by first
+	// deciding what the overlapping documents' *effective* remote-side write should be.
+	switch opts.Policy {
+	case transaction.ConflictPolicyLastWrite:
+		// The transaction being "replayed" (applied) always wins - matches
+		// transaction.ConflictPolicyLastWrite's own finalizeTransaction semantics exactly, read
+		// in peer sync's replay direction (remote onto local). remoteTouched already carries the
+		// remote side's writes for every touched document, overlapping included, so no extra
+		// resolution step is needed - mergeNonConflicting already implements "remote wins".
+		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, remoteTouched)
+		if err != nil {
+			return CommitPushOutcome{}, err
+		}
+		return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, nil
+	case transaction.ConflictPolicyCustom:
+		ancestorCommit, err := d.GetCommitOrThrow(ancestor)
+		if err != nil {
+			return CommitPushOutcome{}, err
+		}
+		resolvedWrites, resolved, err := resolveCustomConflicts(
+			store, namespaceID, ancestorCommit.DocumentTreeHash, overlapping, localTouched, remoteTouched, opts.Resolver,
+		)
+		if err != nil {
+			return CommitPushOutcome{}, err
+		}
+		if resolved {
+			mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, resolvedWrites)
+			if err != nil {
+				return CommitPushOutcome{}, err
+			}
+			return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, nil
+		}
+		// Falls through to reporting below - matches finalizeTransaction's own CUSTOM fallback
+		// when there is no resolver, or it declines/fails on any document.
 	}
 
 	report := buildConflictReport(localHead, incomingHead, overlapping, localTouched, remoteTouched)
@@ -282,6 +346,77 @@ func sortedDocIDs(m map[codec.UUID]document.Op) []codec.UUID {
 	return out
 }
 
+// classifyConflictOp derives the kdberr.ConflictOperationType for one overlapping document from
+// what each side did to it - shared by buildConflictReport and resolveCustomConflicts so both
+// describe the same conflict the same way.
+func classifyConflictOp(localOp, remoteOp document.Op) kdberr.ConflictOperationType {
+	_, localIsDelete := localOp.(document.DeleteOp)
+	_, remoteIsWrite := remoteOp.(document.WriteOp)
+	_, localIsWrite := localOp.(document.WriteOp)
+	_, remoteIsDelete := remoteOp.(document.DeleteOp)
+	switch {
+	case localIsDelete && remoteIsWrite:
+		return kdberr.DeleteWrite
+	case localIsWrite && remoteIsDelete:
+		return kdberr.WriteDelete
+	default:
+		return kdberr.ConcurrentWrite
+	}
+}
+
+// documentFromOp reconstructs the document.Document a WriteOp produced, straight from the
+// commit-carried patch JSON (no storage lookup needed) - nil for a DeleteOp or a nil op.
+func documentFromOp(docID codec.UUID, op document.Op) *document.Document {
+	if w, ok := op.(document.WriteOp); ok {
+		return &document.Document{ID: docID, JSON: w.Patch}
+	}
+	return nil
+}
+
+// resolveCustomConflicts consults resolver once per overlapping document (ConflictPolicyCustom),
+// mirroring finalizeTransaction's own CUSTOM handling: ExistingDoc is local's side, IncomingDoc
+// is remote's, BaseDoc is the common ancestor's (a storage lookup, since - unlike the touched-doc
+// operations themselves - the ancestor's content isn't carried on either divergent commit).
+// Returns resolved=false (not an error) if resolver is nil, or it fails/declines (returns a nil
+// document) for any single document - the caller falls back to reporting the conflict rather
+// than guessing, exactly like finalizeTransaction does.
+func resolveCustomConflicts(
+	store storage.Adapter,
+	namespaceID string,
+	ancestorTreeHash codec.Hash,
+	overlapping []codec.UUID,
+	localTouched, remoteTouched map[codec.UUID]document.Op,
+	resolver transaction.ConflictResolver,
+) (map[codec.UUID]document.Op, bool, error) {
+	if resolver == nil {
+		return nil, false, nil
+	}
+	resolved := make(map[codec.UUID]document.Op, len(remoteTouched))
+	for k, v := range remoteTouched {
+		resolved[k] = v
+	}
+	for _, docID := range overlapping {
+		localOp := localTouched[docID]
+		remoteOp := remoteTouched[docID]
+		baseDoc, err := store.GetDocument(namespaceID, docID, ancestorTreeHash)
+		if err != nil {
+			return nil, false, err
+		}
+		outcome, err := resolver.Resolve(transaction.DocumentConflict{
+			DocID:         docID,
+			OperationType: classifyConflictOp(localOp, remoteOp),
+			ExistingDoc:   documentFromOp(docID, localOp),
+			IncomingDoc:   documentFromOp(docID, remoteOp),
+			BaseDoc:       baseDoc,
+		})
+		if err != nil || outcome == nil {
+			return nil, false, nil
+		}
+		resolved[docID] = document.WriteOp{DocID: docID, Patch: outcome.JSON}
+	}
+	return resolved, true, nil
+}
+
 func buildConflictReport(
 	localHead, incomingHead codec.Hash,
 	overlapping []codec.UUID,
@@ -291,17 +426,7 @@ func buildConflictReport(
 	for _, docID := range overlapping {
 		localOp := localTouched[docID]
 		remoteOp := remoteTouched[docID]
-		_, localIsDelete := localOp.(document.DeleteOp)
-		_, remoteIsWrite := remoteOp.(document.WriteOp)
-		_, localIsWrite := localOp.(document.WriteOp)
-		_, remoteIsDelete := remoteOp.(document.DeleteOp)
-		opType := kdberr.ConcurrentWrite
-		switch {
-		case localIsDelete && remoteIsWrite:
-			opType = kdberr.DeleteWrite
-		case localIsWrite && remoteIsDelete:
-			opType = kdberr.WriteDelete
-		}
+		opType := classifyConflictOp(localOp, remoteOp)
 		var localDoc, incomingDoc *string
 		if w, ok := localOp.(document.WriteOp); ok {
 			p := w.Patch

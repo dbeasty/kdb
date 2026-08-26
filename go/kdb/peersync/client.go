@@ -11,6 +11,7 @@ import (
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/ws"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -105,7 +106,11 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &defaultSession{client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn, materialize: config.MaterializeCommit, persist: config.Persist}, nil
+	return &defaultSession{
+		client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn,
+		materialize: config.MaterializeCommit, persist: config.Persist,
+		conflictPolicy: config.ConflictPolicy, conflictResolver: config.ConflictResolver,
+	}, nil
 }
 
 func (c *defaultClient) Disconnect() error {
@@ -223,6 +228,9 @@ type defaultSession struct {
 	// comment. May be nil (peer sync then has no local durability of its own, matching the
 	// behavior before this field existed).
 	persist func(document.Commit) error
+	// conflictPolicy/conflictResolver - see ClientConfig's doc comment.
+	conflictPolicy   transaction.ConflictPolicy
+	conflictResolver transaction.ConflictResolver
 }
 
 func (s *defaultSession) NamespaceID() string    { return s.namespaceID }
@@ -279,7 +287,10 @@ func (s *defaultSession) PullMissing() (Result, error) {
 	// commit here would silently orphan any local-only commits from main, exactly the bug fixed
 	// on the Kotlin side for Component 39 - same shared decision function as the host's
 	// CommitPush handler, not two independently maintained copies.
-	outcome, err := ResolveDivergence(s.dag, s.storage, s.namespaceID, localHead, incomingHead)
+	outcome, err := ResolveDivergence(s.dag, s.storage, s.namespaceID, localHead, incomingHead, ResolutionOptions{
+		Policy:   s.conflictPolicy,
+		Resolver: s.conflictResolver,
+	})
 	if err != nil {
 		return Result{}, err
 	}

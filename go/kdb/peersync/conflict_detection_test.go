@@ -9,6 +9,7 @@ import (
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/storage"
 	mem "github.com/limidus/kdb/go/kdb/storage/mem"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // side is one independent DAG+storage pair - forkTwoSides gives each test two sides that share
@@ -172,7 +173,7 @@ func TestResolveDivergenceMergesNonConflictingDisjointWrites(t *testing.T) {
 	remoteC := writeDoc(t, remote, ns, genesis, remoteDoc, `{"v":"remote"}`)
 	mergeInto(t, local, ns, remoteC)
 
-	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash)
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash, ResolutionOptions{})
 	if err != nil {
 		t.Fatalf("ResolveDivergence: %v", err)
 	}
@@ -212,7 +213,7 @@ func TestResolveDivergenceReportsConflictOnSameDocumentWrite(t *testing.T) {
 	remoteC := writeDoc(t, remote, ns, genesis, sharedDoc, `{"v":"remote"}`)
 	mergeInto(t, local, ns, remoteC)
 
-	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash)
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash, ResolutionOptions{})
 	if err != nil {
 		t.Fatalf("ResolveDivergence: %v", err)
 	}
@@ -233,6 +234,133 @@ func TestResolveDivergenceReportsConflictOnSameDocumentWrite(t *testing.T) {
 	if head != localC.Hash {
 		t.Fatalf("expected main to stay at localC on conflict, got %s (wanted %s)", head.Hex(), localC.Hash.Hex())
 	}
+}
+
+// Same same-document setup as TestResolveDivergenceReportsConflictOnSameDocumentWrite, but with
+// ConflictPolicyLastWrite: real "replay per conflict policy" (kdb-spec.md §8.3 step 3) means this
+// now auto-merges instead of reporting - the remote/incoming side's write wins, matching
+// transaction.ConflictPolicyLastWrite's own "the transaction being applied always wins" semantics
+// read in peer sync's replay direction.
+func TestResolveDivergenceLastWritePolicyAutoMergesSameDocumentConflict(t *testing.T) {
+	ns := "app/conflict-last-write"
+	local, remote := forkTwoSides(t, ns)
+	genesis, _ := local.dag.Head()
+	sharedDoc := newUUID(t)
+	localC := writeDoc(t, local, ns, genesis, sharedDoc, `{"v":"local"}`)
+	remoteC := writeDoc(t, remote, ns, genesis, sharedDoc, `{"v":"remote"}`)
+	mergeInto(t, local, ns, remoteC)
+
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash, ResolutionOptions{
+		Policy: transaction.ConflictPolicyLastWrite,
+	})
+	if err != nil {
+		t.Fatalf("ResolveDivergence: %v", err)
+	}
+	if outcome.Kind != OutcomeMerged {
+		t.Fatalf("expected OutcomeMerged under LAST_WRITE, got %v (report=%+v)", outcome.Kind, outcome.Report)
+	}
+	head, _ := local.dag.Head()
+	if head != outcome.MergeCommit.Hash {
+		t.Fatalf("expected main to point at the merge commit, got %s", head.Hex())
+	}
+	doc, err := local.storage.GetDocument(ns, sharedDoc, outcome.MergeCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc == nil || doc.JSON != `{"v":"remote"}` {
+		t.Fatalf("expected LAST_WRITE to keep the remote/incoming side's write, got %+v", doc)
+	}
+}
+
+// CUSTOM policy: the resolver decides the winning content per conflicting document - here it
+// synthesizes a merged value, proving the resolved content (not either side's raw write) is what
+// ends up in the final tree.
+func TestResolveDivergenceCustomPolicyResolvesViaResolver(t *testing.T) {
+	ns := "app/conflict-custom"
+	local, remote := forkTwoSides(t, ns)
+	genesis, _ := local.dag.Head()
+	sharedDoc := newUUID(t)
+	localC := writeDoc(t, local, ns, genesis, sharedDoc, `{"v":"local"}`)
+	remoteC := writeDoc(t, remote, ns, genesis, sharedDoc, `{"v":"remote"}`)
+	mergeInto(t, local, ns, remoteC)
+
+	resolverCalls := 0
+	resolver := customResolverFunc(func(c transaction.DocumentConflict) (*document.Document, error) {
+		resolverCalls++
+		if c.DocID != sharedDoc {
+			t.Fatalf("resolver invoked for unexpected doc %s", c.DocID)
+		}
+		if c.OperationType != kdberr.ConcurrentWrite {
+			t.Fatalf("expected CONCURRENT_WRITE, got %v", c.OperationType)
+		}
+		if c.ExistingDoc == nil || c.ExistingDoc.JSON != `{"v":"local"}` {
+			t.Fatalf("expected ExistingDoc to be local's write, got %+v", c.ExistingDoc)
+		}
+		if c.IncomingDoc == nil || c.IncomingDoc.JSON != `{"v":"remote"}` {
+			t.Fatalf("expected IncomingDoc to be remote's write, got %+v", c.IncomingDoc)
+		}
+		return &document.Document{ID: c.DocID, JSON: `{"v":"resolved"}`}, nil
+	})
+
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash, ResolutionOptions{
+		Policy:   transaction.ConflictPolicyCustom,
+		Resolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("ResolveDivergence: %v", err)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("expected resolver called exactly once, got %d", resolverCalls)
+	}
+	if outcome.Kind != OutcomeMerged {
+		t.Fatalf("expected OutcomeMerged under CUSTOM, got %v (report=%+v)", outcome.Kind, outcome.Report)
+	}
+	doc, err := local.storage.GetDocument(ns, sharedDoc, outcome.MergeCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc == nil || doc.JSON != `{"v":"resolved"}` {
+		t.Fatalf("expected the resolver's output in the merged tree, got %+v", doc)
+	}
+}
+
+// A resolver that declines (returns nil) falls back to reporting, exactly like
+// finalizeTransaction's own CUSTOM fallback - CUSTOM must never guess.
+func TestResolveDivergenceCustomPolicyFallsBackToReportWhenResolverDeclines(t *testing.T) {
+	ns := "app/conflict-custom-decline"
+	local, remote := forkTwoSides(t, ns)
+	genesis, _ := local.dag.Head()
+	sharedDoc := newUUID(t)
+	localC := writeDoc(t, local, ns, genesis, sharedDoc, `{"v":"local"}`)
+	remoteC := writeDoc(t, remote, ns, genesis, sharedDoc, `{"v":"remote"}`)
+	mergeInto(t, local, ns, remoteC)
+
+	resolver := customResolverFunc(func(transaction.DocumentConflict) (*document.Document, error) {
+		return nil, nil
+	})
+
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash, ResolutionOptions{
+		Policy:   transaction.ConflictPolicyCustom,
+		Resolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("ResolveDivergence: %v", err)
+	}
+	if outcome.Kind != OutcomeConflict {
+		t.Fatalf("expected OutcomeConflict when the resolver declines, got %v", outcome.Kind)
+	}
+	head, _ := local.dag.Head()
+	if head != localC.Hash {
+		t.Fatalf("expected main to stay at localC, got %s", head.Hex())
+	}
+}
+
+// customResolverFunc adapts a plain func to transaction.ConflictResolver, test-local (mirrors the
+// stdlib http.HandlerFunc pattern) rather than a hand-rolled struct per test.
+type customResolverFunc func(transaction.DocumentConflict) (*document.Document, error)
+
+func (f customResolverFunc) Resolve(c transaction.DocumentConflict) (*document.Document, error) {
+	return f(c)
 }
 
 func TestResolveDivergenceClassifiesDeleteWriteConflict(t *testing.T) {
@@ -267,7 +395,7 @@ func TestResolveDivergenceClassifiesDeleteWriteConflict(t *testing.T) {
 	remoteC := writeDoc(t, remote, ns, seedC.Hash, sharedDoc, `{"v":"remote-write"}`)
 	mergeInto(t, local, ns, remoteC)
 
-	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash)
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localC.Hash, remoteC.Hash, ResolutionOptions{})
 	if err != nil {
 		t.Fatalf("ResolveDivergence: %v", err)
 	}
@@ -286,7 +414,7 @@ func TestResolveDivergenceNoOpWhenLocalAlreadyAhead(t *testing.T) {
 	docID := newUUID(t)
 	c1 := writeDoc(t, local, ns, genesis, docID, `{"v":1}`)
 
-	outcome, err := ResolveDivergence(local.dag, local.storage, ns, c1.Hash, genesis)
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, c1.Hash, genesis, ResolutionOptions{})
 	if err != nil {
 		t.Fatalf("ResolveDivergence: %v", err)
 	}

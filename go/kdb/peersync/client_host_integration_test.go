@@ -13,6 +13,7 @@ import (
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	mem "github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -219,6 +220,80 @@ func TestHostCommitPushReturnsConflictReportOnSameDocumentDivergence(t *testing.
 	}
 	if !hostDag.HasCommit(incomingCommit.Hash) {
 		t.Fatal("incoming commit should still be stored even though main didn't move onto it")
+	}
+}
+
+// Same same-document push as the conflict test above, but with HostConfig.ConflictPolicy set to
+// LAST_WRITE: proves the policy actually reaches ResolveDivergence through the real wire path
+// (CommitPushMessage -> ConnectionHost.HandleFrame -> frameHandler), not just via a direct
+// ResolveDivergence call - the incoming push now acks with a real merge instead of reporting.
+func TestHostCommitPushAutoResolvesSameDocumentConflictUnderLastWritePolicy(t *testing.T) {
+	ns := "app/host-push-last-write"
+
+	hostDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("host dag: %v", err)
+	}
+	incomingDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("incoming dag: %v", err)
+	}
+	genesis, _ := hostDag.Head()
+
+	hostStorage := mem.NewInMemoryStorageAdapter()
+	incomingStorage := mem.NewInMemoryStorageAdapter()
+	hostSide := side{dag: hostDag, storage: hostStorage}
+	incomingSide := side{dag: incomingDag, storage: incomingStorage}
+
+	sharedDoc := newUUID(t)
+	writeDoc(t, hostSide, ns, genesis, sharedDoc, `{"v":"host"}`)
+	incomingCommit := writeDoc(t, incomingSide, ns, genesis, sharedDoc, `{"v":"incoming"}`)
+
+	w := wire.NewCodec(wire.EncodingJSON)
+	connHost := NewConnectionHost(w, hostDag, hostStorage, HostConfig{
+		NamespaceID:    ns,
+		NodeID:         "host",
+		ConflictPolicy: transaction.ConflictPolicyLastWrite,
+	}, auth.AllowAll, auth.EmptyContext)
+
+	push := wire.CommitPushMessage{
+		H:         wire.Header{MessageType: wire.MsgCommitPush, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: 1},
+		Namespace: ns,
+		Commits:   []document.Commit{incomingCommit},
+	}
+	frame, err := w.Encode(push)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	respFrame, err := connHost.HandleFrame(frame)
+	if err != nil {
+		t.Fatalf("handleFrame: %v", err)
+	}
+	respMsg, err := w.Decode(respFrame)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	ackMsg, ok := respMsg.(wire.CommitPushAckMessage)
+	if !ok {
+		t.Fatalf("expected CommitPushAckMessage under LAST_WRITE, got %T", respMsg)
+	}
+	head, _ := hostDag.Head()
+	if ackMsg.HeadHex != head.Hex() {
+		t.Fatalf("ack head %s does not match dag head %s", ackMsg.HeadHex, head.Hex())
+	}
+	headCommit, err := hostDag.GetCommitOrThrow(head)
+	if err != nil {
+		t.Fatalf("getCommitOrThrow(head): %v", err)
+	}
+	if len(headCommit.ParentHashes) != 2 {
+		t.Fatalf("expected main to land on a two-parent merge commit, got %d parents", len(headCommit.ParentHashes))
+	}
+	doc, err := hostStorage.GetDocument(ns, sharedDoc, headCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc == nil || doc.JSON != `{"v":"incoming"}` {
+		t.Fatalf("expected LAST_WRITE to keep the incoming push's write, got %+v", doc)
 	}
 }
 

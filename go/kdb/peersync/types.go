@@ -5,6 +5,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 )
 
@@ -24,6 +25,12 @@ type HostConfig struct {
 	// existed: not durable at all. A caller wiring peer sync into a file-backed runtime must set
 	// this to get commits from peers to survive a restart.
 	Persist func(document.Commit) error
+	// ConflictPolicy/ConflictResolver control how a genuine same-document divergence is resolved
+	// - see ResolutionOptions' doc comment (conflict_detection.go) for the full contract. The
+	// zero value (ConflictPolicyAppendOnly) means "report, don't resolve", unchanged from before
+	// these fields existed.
+	ConflictPolicy   transaction.ConflictPolicy
+	ConflictResolver transaction.ConflictResolver
 }
 
 // ClientConfig configures a peer sync client connection.
@@ -42,6 +49,9 @@ type ClientConfig struct {
 	// Persist durably logs a commit pulled from a peer - see HostConfig.Persist's doc comment;
 	// same contract, client side.
 	Persist func(document.Commit) error
+	// ConflictPolicy/ConflictResolver - see HostConfig's doc comment; same contract, client side.
+	ConflictPolicy   transaction.ConflictPolicy
+	ConflictResolver transaction.ConflictResolver
 }
 
 // DagSyncPlan describes commits unique to each side of a sync.

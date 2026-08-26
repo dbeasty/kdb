@@ -178,7 +178,10 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 			// client's PullMissing, not two independently maintained copies - that's exactly
 			// how the original blind dag.SetHead("main", ...) bug went unnoticed on one side
 			// while looking "fine" on the other.
-			outcome, err := ResolveDivergence(h.dag, h.storage, m.Namespace, localHead, incomingHead)
+			outcome, err := ResolveDivergence(h.dag, h.storage, m.Namespace, localHead, incomingHead, ResolutionOptions{
+				Policy:   h.cfg.ConflictPolicy,
+				Resolver: h.cfg.ConflictResolver,
+			})
 			if err != nil {
 				return nil, err
 			}
