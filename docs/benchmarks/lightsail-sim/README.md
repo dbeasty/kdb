@@ -135,19 +135,20 @@ over the original ~1,800–3,700, but still eventually killed).
   `KdbServerRuntime.SetMemoryLimit(limitBytes, rejectFraction)`, exposed via `kdb-service`'s new
   `--memory-limit-mb` flag.
 
-  **Important tuning note, found empirically, not assumed**: the guard samples `runtime.Sys`, not
-  `HeapAlloc` - `HeapAlloc` (live heap) can drop back to near zero within one GC cycle, but Go
-  does not eagerly return freed pages to the OS, so the process's actual OS/cgroup-visible
-  footprint tracks `Sys`, which stays elevated far longer. Gating on `HeapAlloc` was tried first
-  and measured to let the process keep accepting writes for a long stretch after `Sys` had
-  already climbed past the real container limit - it still got OOM-killed with the "fix" in
-  place. Even gating on `Sys`, sustained heavy *read* traffic alone (never blocked by this guard)
-  can push usage a meaningful amount past the configured reject threshold before it plateaus - an
-  80-90%-of-container-limit configuration left the process climbing to 93%+ over several minutes
-  under an extreme, unrealistic stress load (millions of ops in 3.5 minutes); a 60%-of-limit
-  configuration plateaued safely at 67% under the identical load. **Recommendation: set
-  `--memory-limit-mb` to roughly 60% of the container's actual `--memory` limit**, not 80-90% as
-  might seem intuitive - the flag's own help text carries this guidance.
+  **Important tuning note, found empirically, not assumed**: the guard originally sampled
+  `runtime.Sys`, not `HeapAlloc` - `HeapAlloc` (live heap) can drop back to near zero within one
+  GC cycle, but Go does not eagerly return freed pages to the OS, so the process's actual
+  OS/cgroup-visible footprint tracked `Sys`, which stayed elevated far longer. Gating on
+  `HeapAlloc` was tried first and measured to let the process keep accepting writes for a long
+  stretch after `Sys` had already climbed past the real container limit - it still got OOM-killed
+  with the "fix" in place. Even gating on `Sys`, sustained heavy *read* traffic alone (never
+  blocked by this guard) could push usage a meaningful amount past the configured reject
+  threshold before it plateaued - an 80-90%-of-container-limit configuration left the process
+  climbing to 93%+ over several minutes under an extreme, unrealistic stress load (millions of
+  ops in 3.5 minutes); a 60%-of-limit configuration plateaued safely at 67% under the identical
+  load. **This is superseded below** - `Sys` turned out to have a second, worse problem (it never
+  decreases, so the guard latched permanently once tripped), fixed in kdb-spec-layer13 Component
+  48; see "Update" for the current guidance.
 
 ### Verification
 
@@ -164,6 +165,73 @@ OOM-killed the server within seconds before any of this:
 At the safe configuration: 5.7 million operations (24,688 writes actually landed, 2,424,515
 writes cleanly rejected under pressure, 5,716,462 reads served throughout) over 3.5 minutes,
 process still running, `OOMKilled=false`, memory usage stable at 690.7MiB/1GiB.
+
+## Update (2026-08-25): re-verified after kdb-spec-layer13 Component 48's accounting fix
+
+The `MemoryGuard` used above sampled `runtime.MemStats.Sys`, which **never decreases** - Go
+returns freed pages to the OS but keeps counting them in `Sys` (they move into `HeapReleased`
+instead). Once a real workload tripped the guard, it stayed tripped for the rest of the process's
+life even after GC freed everything that had pushed it over: a zombie that kept answering reads
+while permanently refusing writes. That latch, not read traffic alone, is the real reason 60%
+was the only safe number found above - see `docs/kdb-spec-layer13-resource-governance.md` §2.5.
+
+Commit `7ad882a` fixed this: the guard now measures the Linux cgroup's own `memory.current` (the
+exact figure `--memory` is enforced against) where available, falling back to
+`runtime/metrics`'s `/memory/classes/total:bytes` minus `/memory/classes/heap/released:bytes` -
+both actually decrease when memory is freed - plus real hysteresis (a separate, lower clear
+threshold), so pressure that genuinely subsides releases the latch instead of requiring a
+`--memory-limit-mb 0` reconfigure.
+
+Re-ran the same 2000-document pool / 16-way concurrency / 1GB / 2-vCPU container against the
+fixed guard, sweeping `--memory-limit-mb` from 60% up through 95% of the container's 1GB limit
+(the reject threshold itself is still a fixed 85% of whatever budget is configured - see
+`SetMemoryLimit(limitBytes, 0.85)` in `go/cmd/kdb-service/main.go`):
+
+| `--memory-limit-mb` (% of 1GB) | duration | total ops | throughput | outcome | peak memory |
+|---:|---:|---:|---:|---|---:|
+| 614 (60%) | 60s | 1,203,989 | 20,066 ops/sec | **survived** | 67.4% |
+| 819 (80%) | 60s | 1,204,022 | 20,067 ops/sec | **survived** | 92.9% |
+| 922 (90%) | 60s | 144,628 | 2,410 ops/sec | **OOM-killed** | - |
+| 973 (95%) | 60s | 154,857 | 2,581 ops/sec | **OOM-killed** | - |
+
+(the loadtest client's "duration" is now a real wall-clock deadline regardless of server health -
+see the `kdb-loadtest` duration-tracking fix below - so a 60s row with a low op count means the
+server stopped making progress well before the window closed and stayed down, not that the test
+ended early. The 90%/95% throughput, ~8x lower than the healthy configs' ~20,066 ops/sec, is
+consistent with dying within the first several seconds and staying dead for the rest of the
+window, though the exact death time wasn't captured directly.)
+
+**80% is now genuinely safe** - previously this same configuration climbed to 93%+ and
+eventually died (see the pre-fix table above); it now plateaus at 92.9% and runs the full
+duration at throughput identical to the 60% configuration. The accounting + hysteresis fix raised
+the safe ceiling from ~60% to ~80% of the container's actual limit, with no throughput cost.
+
+**90% and 95% still OOM-kill, and now die fast** - within the first few seconds rather than near
+the end of a long run. With the reject threshold pinned at 85% of the configured budget, a
+90%/95% budget puts the trip point (~78-83% of the container) close enough to the real 100%
+ceiling that a burst of already-admitted in-flight writes between the guard's 200ms samples - or
+just the process's
+baseline overhead (connections, goroutine stacks, the DAG itself) - is enough to blow past it
+before the next sample can react. This is the gap kdb-spec-layer13 Component 48's admission
+model (reserve memory *before* admitting work, rather than reject *after* usage crosses a
+threshold) and its graduated Normal/Elevated/High/Critical zones are designed to close; a single
+fixed trip fraction is not the end state.
+
+**Updated recommendation: set `--memory-limit-mb` to 60-80% of the container's actual `--memory`
+limit.** 80% is now the better default where every byte of capacity matters (identical
+throughput to 60%, more write budget before backpressure kicks in); 60% remains the safer choice
+if you'd rather have more margin than a fixed 85%-of-budget trip fraction can guarantee. Do not
+configure above 80% until Component 48's full admission control (reserve-before-admit, graduated
+zones) lands.
+
+This re-verification also caught and fixed an unrelated bug in the load generator itself:
+`go/cmd/kdb-loadtest`'s drain loop recreated a 20ms idle timer every iteration to poll for the
+requested `-duration` elapsing, so under sustained high throughput (the results channel almost
+always has something waiting) that timer never won the select before being replaced - a healthy
+server would run for however long the outer safety-margin timeout allowed instead of the
+requested duration. Fixed by using a single timer armed once at the start of the measured window
+(commit `984d429`); verified a requested `-duration 15s` run against a busy server now measures
+exactly 15s.
 
 ### Zero JVM processes, still true
 
