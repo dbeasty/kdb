@@ -50,6 +50,16 @@ type KdbServerRuntime struct {
 	// (component 38 spec §4, sub-phase C).
 	AuthEngine auth.Engine
 
+	// CommitListener, if set, is invoked with namespaceID and the new commit after every
+	// successful Commit/Upsert/Replay - the cross-write notification bridge a stream hub's
+	// Publish needs to fan a live write out to Mode 1/2 subscribers without polling (Kotlin's
+	// Component 44: EmbeddedKdbRuntime.addCommitListener/notifyCommit, wired to
+	// streamHub.publish(...) in KdbServiceMain.kt). Called synchronously, after persistence, from
+	// inside runTransaction's success path - keep it fast and non-blocking (e.g. StreamHub.Publish
+	// itself only does a best-effort non-blocking fan-out). nil (the default) means no
+	// notification; existing callers see no behavior change.
+	CommitListener func(namespaceID string, commit document.Commit)
+
 	refCount atomic.Int32
 	closeMu  sync.Mutex
 
@@ -328,6 +338,9 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 			if err := s.persister.Persist(r.Commit); err != nil {
 				return document.Commit{}, err
 			}
+		}
+		if s.CommitListener != nil {
+			s.CommitListener(s.Runtime.DefaultNamespace, r.Commit)
 		}
 		return r.Commit, nil
 	case transaction.ResultConflict:

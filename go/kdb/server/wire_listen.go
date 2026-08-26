@@ -440,15 +440,25 @@ func (h *sqlWireConnHandler) handleTransactionReplay(msg wire.TransactionReplayM
 	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), h.principal, action); err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, "", (&AuthorizationError{Cause: err}).Error())
 	}
+	return replayTransaction(h.runtime, h.principal, msg)
+}
+
+// replayTransaction is handleTransactionReplay's shared core, reused by both entry points that
+// can reach TransactionReplay: SQL_CLIENT connections (above) and StreamHub's write-back
+// subscribers (stream_listen.go) - identical response shaping either way, only auth differs
+// (StreamHub has no per-connection authenticated principal the way a SQL_CLIENT handshake
+// establishes one, matching Kotlin's StreamBroadcastHub.handleHandshake, which never
+// authenticates stream connections at all).
+func replayTransaction(runtime *KdbServerRuntime, principal auth.Principal, msg wire.TransactionReplayMessage) wire.Message {
 	tx, err := wire.DecodeTransaction(msg.TransactionBytes)
 	if err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, "", "invalid transactionBytes: "+err.Error())
 	}
-	head, err := h.runtime.Runtime.DAG.Head()
+	head, err := runtime.Runtime.DAG.Head()
 	if err != nil {
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, "", err)
 	}
-	commit, err := h.runtime.Replay(msg.Namespace, tx, head, h.principal)
+	commit, err := runtime.Replay(msg.Namespace, tx, head, principal)
 	if err != nil {
 		var conflictErr *ConflictError
 		if asError(err, &conflictErr) {
