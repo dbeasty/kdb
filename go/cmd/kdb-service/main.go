@@ -26,6 +26,7 @@ func main() {
 		namespace string
 	)
 	var sqlAddr string
+	var peerAddr string
 	var rbac bool
 	var memoryLimitMB int
 	var abortAfter time.Duration
@@ -33,6 +34,7 @@ func main() {
 	fs.BoolVar(&memory, "memory", false, "use in-memory runtime")
 	fs.StringVar(&namespace, "namespace", "demo/users", "default namespace")
 	fs.StringVar(&sqlAddr, "sql-addr", "tcp://127.0.0.1:9090?bind=true", "SQL wire listen address (empty to disable)")
+	fs.StringVar(&peerAddr, "peer-addr", "tcp://127.0.0.1:9091?bind=true", "peer sync (Mode 3 full-peer) wire listen address (empty to disable)")
 	fs.BoolVar(&rbac, "rbac", false, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
 	fs.IntVar(&memoryLimitMB, "memory-limit-mb", 0, "reject new writes (rather than risk an OS OOM-kill under sustained load) once process memory nears this budget; rejection triggers at 85% of this value, so set this to 60-80% of the container's actual --memory limit - 80% carries no throughput cost over 60% but do not go above 80% until kdb-spec-layer13 Component 48's full admission control lands, since a burst of already-admitted writes between the guard's periodic samples can still outrun a trip point that close to the real ceiling - see docs/benchmarks/lightsail-sim/README.md for the numbers behind that guidance. 0 disables (default)")
 	fs.DurationVar(&abortAfter, "abort-after", 0, "if memory pressure (see --memory-limit-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
@@ -109,12 +111,29 @@ func main() {
 		defer sqlListener.Close()
 		sqlStatus = fmt.Sprintf("enabled (%s)", sqlListener.Addr())
 	}
+	var peerListener *server.Listener
+	if peerAddr != "" {
+		peerListener, err = server.ListenPeerSync(peerAddr, srv, namespace)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: peer sync listen: %v\n", err)
+			os.Exit(1)
+		}
+		defer peerListener.Close()
+		peerStatus = fmt.Sprintf("enabled (%s)", peerListener.Addr())
+	}
 	abortStatus := "disabled"
 	var watchdog *server.AbortWatchdog
 	if abortAfter > 0 {
-		var listenerCloser io.Closer
+		var closers multiCloser
 		if sqlListener != nil {
-			listenerCloser = sqlListener
+			closers = append(closers, sqlListener)
+		}
+		if peerListener != nil {
+			closers = append(closers, peerListener)
+		}
+		var listenerCloser io.Closer
+		if len(closers) > 0 {
+			listenerCloser = closers
 		}
 		watchdog = server.NewAbortWatchdog(srv, listenerCloser, abortAfter)
 		watchdog.Start()
@@ -130,4 +149,19 @@ func main() {
 	// first so it doesn't race this deliberate exit (see AbortWatchdog.Stop's own doc comment).
 	watchdog.Stop()
 	srv.Release()
+}
+
+// multiCloser closes every listener in order, returning the first error encountered (closing
+// the rest regardless) - AbortWatchdog takes a single io.Closer, but an abort must stop accepting
+// on every listener that's actually running, not just whichever one happened to be wired first.
+type multiCloser []io.Closer
+
+func (m multiCloser) Close() error {
+	var first error
+	for _, c := range m {
+		if err := c.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
