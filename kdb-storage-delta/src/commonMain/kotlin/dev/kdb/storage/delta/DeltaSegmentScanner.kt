@@ -1,6 +1,7 @@
 package dev.kdb.storage.delta
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.compression.Crc32
 import dev.kdb.document.KdbCommit
 import dev.kdb.storage.CompressionCodec
 
@@ -21,6 +22,28 @@ public object DeltaSegmentScanner {
         val frameOffset: Int,
     )
 
+    /**
+     * A frame whose stored CRC32 (written by [DeltaPageCodec.frame]) does
+     * not match its actual body bytes, or whose body fails to parse
+     * despite fitting entirely within the scanned range - i.e. not simply
+     * truncated (a short/missing tail, the expected shape of an unclean
+     * shutdown, is handled silently by [scanSegmentBytes] itself and
+     * never reaches here). [partialCommits] holds every commit scanned
+     * successfully before this one - callers that want torn-tail-tolerant
+     * behavior (kdb-spec-layer13 Component 47 §4.3) use that instead of
+     * discarding it.
+     */
+    public class CorruptFrameException(
+        public val offset: Int,
+        public val reason: String,
+        public val partialCommits: List<ScannedCommit>,
+    ) : Exception("delta segment: corrupt frame at offset $offset: $reason")
+
+    /**
+     * @throws CorruptFrameException if a frame's stored CRC doesn't match
+     *   its body, or its body fails to parse - see that exception's doc
+     *   comment for why this is not simply treated as a truncated tail.
+     */
     public fun scanSegmentBytes(
         bytes: ByteArray,
         compression: CompressionCodec,
@@ -30,11 +53,26 @@ public object DeltaSegmentScanner {
         while (offset + FRAME_HEADER_SIZE <= bytes.size) {
             if (!isKdbpFrame(bytes, offset)) break
             val compressedSize = readIntBe(bytes, offset + 4)
+            if (compressedSize < 0) break
             val frameEnd = offset + FRAME_HEADER_SIZE + compressedSize
             if (frameEnd > bytes.size) break
             val frame = bytes.copyOfRange(offset, frameEnd)
-            val payload = DeltaPageCodec.parse(frame, compression)
-            val commit = KdbCommit.fromPayloadBytes(payload)
+            val storedCrc = readIntBe(frame, 12)
+            val actualCrc = Crc32.of(frame, FRAME_HEADER_SIZE, frame.size - FRAME_HEADER_SIZE)
+            if (actualCrc != storedCrc) {
+                throw CorruptFrameException(
+                    offset,
+                    "crc mismatch: stored=${storedCrc.toUInt().toString(16)} actual=${actualCrc.toUInt().toString(16)}",
+                    out,
+                )
+            }
+            val commit =
+                try {
+                    val payload = DeltaPageCodec.parse(frame, compression)
+                    KdbCommit.fromPayloadBytes(payload)
+                } catch (e: Exception) {
+                    throw CorruptFrameException(offset, e.message ?: e.toString(), out)
+                }
             out.add(ScannedCommit(commit.hash, commit, offset))
             offset = frameEnd
         }

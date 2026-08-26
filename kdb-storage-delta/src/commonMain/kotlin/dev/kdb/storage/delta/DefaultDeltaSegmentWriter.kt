@@ -21,12 +21,21 @@ import kotlinx.coroutines.sync.withLock
 public class DefaultDeltaSegmentWriter(
     override val namespaceId: String,
     override val segmentId: KdbUuid,
+    /**
+     * This segment's position in namespace-wide commit order - see
+     * [DeltaSegmentRef.sequenceNumber]'s doc comment. Determines the
+     * segment's file name (and therefore its replay order), not
+     * [segmentId]. Callers should obtain this from
+     * [DeltaSegmentFactory.openWriter], which assigns it by scanning
+     * existing segments for this namespace.
+     */
+    private val sequenceNumber: Long,
     private val ioShim: PlatformIoShim,
     private val config: StorageEngineConfig,
     private val debugHook: DeltaDebugHook = NoOpDeltaDebugHook,
 ) : DeltaSegmentWriter {
     private val mutex = Mutex()
-    private val segmentName = SegmentNameBuilder.delta(namespaceId, segmentId.toString())
+    private val segmentName = SegmentNameBuilder.deltaSequenced(namespaceId, sequenceNumber)
     private var sizeBytes = 0L
     private var sealed = false
     private var firstCommit: KdbHash? = null
@@ -66,6 +75,7 @@ public class DefaultDeltaSegmentWriter(
             lastCommitHash = lastCommit ?: zero,
             sizeBytes = sizeBytes,
             compressionCodec = config.compressionCodec,
+            sequenceNumber = sequenceNumber,
         )
     }
 }
@@ -104,30 +114,52 @@ internal object DeltaPageCodec {
             ((a[o + 2].toInt() and 0xFF) shl 8) or (a[o + 3].toInt() and 0xFF)
 }
 
+/**
+ * A data directory whose delta segments include at least one pre-Layer-13
+ * random-name segment. Sorting those by name is not sorting by commit
+ * order, which is exactly the bug that made a multi-segment namespace
+ * permanently unopenable (kdb-spec-layer13 Component 47 §4.1, §2.1) -
+ * rather than guess at their true order, this is thrown so the caller can
+ * run the repair path instead.
+ */
+public class LegacySegmentFormatException(
+    public val namespaceId: String,
+    public val names: List<String>,
+) : Exception(
+        "kdb: namespace '$namespaceId' has ${names.size} delta segment(s) in the pre-Layer-13 " +
+            "random-name format, whose on-disk order cannot be trusted as commit order - migrate this " +
+            "namespace before opening it (see kdb-spec-layer13-resource-governance.md §4.1)",
+    )
+
 public class DefaultDeltaSegmentReader(
     override val namespaceId: String,
     private val ioShim: PlatformIoShim,
     private val config: StorageEngineConfig,
 ) : DeltaSegmentReader {
     override suspend fun readAll(segment: DeltaSegmentRef): List<DeltaRecord> {
-        val segmentName = SegmentNameBuilder.delta(segment.namespaceId, segment.segmentId.toString())
+        val segmentName = SegmentNameBuilder.deltaSequenced(segment.namespaceId, segment.sequenceNumber)
         val bytes = readFullSegment(segmentName, segment.sizeBytes)
-        return DeltaSegmentScanner.scanSegmentBytes(bytes, segment.compressionCodec).map { scanned ->
-            DeltaRecord(
-                commitHash = scanned.commitHash,
-                namespaceId = segment.namespaceId,
-                authorship =
-                    DeltaAuthorshipEnvelope(
-                        principal = "unknown",
-                        timestamp = scanned.commit.timestamp,
-                        rightsToken = "",
-                        clientContext = "",
-                    ),
-                commitPayload = scanned.commit.toPayloadBytes(),
-                documentPatches = emptyList(),
-            )
-        }
+        // A CorruptFrameException propagates as-is (with partialCommits already populated) -
+        // the caller (embed-level replay) decides torn-tail tolerance from it; this method has
+        // no context (is this the most recently written segment?) to make that call itself.
+        val scanned = DeltaSegmentScanner.scanSegmentBytes(bytes, segment.compressionCodec)
+        return scanned.map { scannedToRecord(it, segment) }
     }
+
+    private fun scannedToRecord(scanned: DeltaSegmentScanner.ScannedCommit, segment: DeltaSegmentRef) =
+        DeltaRecord(
+            commitHash = scanned.commitHash,
+            namespaceId = segment.namespaceId,
+            authorship =
+                DeltaAuthorshipEnvelope(
+                    principal = "unknown",
+                    timestamp = scanned.commit.timestamp,
+                    rightsToken = "",
+                    clientContext = "",
+                ),
+            commitPayload = scanned.commit.toPayloadBytes(),
+            documentPatches = emptyList(),
+        )
 
     override suspend fun readRange(
         segment: DeltaSegmentRef,
@@ -142,12 +174,35 @@ public class DefaultDeltaSegmentReader(
         }
     }
 
+    /**
+     * Returns this namespace's delta segments **in sequence (commit)
+     * order** - the names shim.listSegments gives back already sort that
+     * way, because delta segment file names are zero-padded decimal
+     * sequence numbers (see SegmentNameBuilder.deltaSequenced), which
+     * sort lexicographically the same as numerically. Callers (see
+     * DeltaNamespaceReplayer) must preserve this order rather than
+     * re-sorting by segmentId - that was exactly the bug Component 47
+     * fixes (kdb-spec-layer13 §4.1).
+     *
+     * @throws LegacySegmentFormatException if a pre-Layer-13 random-name
+     *   segment is present.
+     */
     override suspend fun listSegments(): List<DeltaSegmentRef> {
-        val names =
-            ioShim.listSegments(namespaceId).filter {
-                it.startsWith(SegmentNameBuilder.namespacePrefix(namespaceId) + "delta/")
+        val prefix = SegmentNameBuilder.namespacePrefix(namespaceId) + "delta/"
+        val names = ioShim.listSegments(namespaceId).filter { it.startsWith(prefix) }
+        val legacy = mutableListOf<String>()
+        val out = mutableListOf<DeltaSegmentRef>()
+        for (name in names) {
+            val fileName = name.removePrefix(prefix)
+            val seq = SegmentNameBuilder.parseDeltaSequencedFileName(fileName)
+            if (seq == null) {
+                legacy += name
+                continue
             }
-        return names.mapNotNull { name -> scanSegmentRef(name) }
+            scanSegmentRef(name, seq)?.let { out += it }
+        }
+        if (legacy.isNotEmpty()) throw LegacySegmentFormatException(namespaceId, legacy)
+        return out
     }
 
     private suspend fun readFullSegment(segmentName: String, sizeBytes: Long): ByteArray {
@@ -156,39 +211,43 @@ public class DefaultDeltaSegmentReader(
         return ioShim.readFromSegment(segmentName, 0, len)
     }
 
-    private suspend fun scanSegmentRef(segmentName: String): DeltaSegmentRef? {
-        val segmentIdStr = segmentName.substringAfterLast('/')
-        val segmentId =
-            try {
-                KdbUuid.fromString(segmentIdStr)
-            } catch (_: Exception) {
-                return null
-            }
+    private suspend fun scanSegmentRef(segmentName: String, seq: Long): DeltaSegmentRef? {
         val bytes =
             try {
                 readEntireSegment(segmentName)
             } catch (_: Exception) {
                 return null
             }
-        val scanned = DeltaSegmentScanner.scanSegmentBytes(bytes, config.compressionCodec)
+        val scanned =
+            try {
+                DeltaSegmentScanner.scanSegmentBytes(bytes, config.compressionCodec)
+            } catch (e: DeltaSegmentScanner.CorruptFrameException) {
+                // Building a ref only needs first/last commit hash - a torn tail just means the
+                // last commit is whatever scanned cleanly, same as a fully-clean scan would see
+                // if the corrupt frame simply wasn't there yet. The actual torn-tail-vs-real-
+                // corruption decision belongs to the replayer, not this ref-listing helper.
+                e.partialCommits
+            }
         val zero = KdbHash.fromBytes(ByteArray(32))
         if (scanned.isEmpty()) {
             return DeltaSegmentRef(
-                segmentId = segmentId,
+                segmentId = KdbUuid.random(),
                 namespaceId = namespaceId,
                 firstCommitHash = zero,
                 lastCommitHash = zero,
                 sizeBytes = bytes.size.toLong(),
                 compressionCodec = config.compressionCodec,
+                sequenceNumber = seq,
             )
         }
         return DeltaSegmentRef(
-            segmentId = segmentId,
+            segmentId = KdbUuid.random(),
             namespaceId = namespaceId,
             firstCommitHash = scanned.first().commitHash,
             lastCommitHash = scanned.last().commitHash,
             sizeBytes = bytes.size.toLong(),
             compressionCodec = config.compressionCodec,
+            sequenceNumber = seq,
         )
     }
 
@@ -200,9 +259,39 @@ public class DeltaSegmentFactory(
     private val config: StorageEngineConfig,
     private val debugHook: DeltaDebugHook = NoOpDeltaDebugHook,
 ) {
-    public fun openWriter(namespaceId: String): DefaultDeltaSegmentWriter =
-        DefaultDeltaSegmentWriter(namespaceId, KdbUuid.random(), config.ioShim, config, debugHook)
+    /**
+     * Opens a writer for namespaceId's next delta segment: the sequence
+     * number one past the highest existing sequenced segment (0 if none
+     * exist yet). Always starts a *new* segment rather than resuming a
+     * previous run's last (possibly unsealed) one - see the Go side's
+     * Factory.OpenWriter doc comment for why (kdb-spec-layer13 §4.1).
+     *
+     * @throws LegacySegmentFormatException, without opening anything, if
+     *   any pre-Layer-13 random-name segment is present.
+     */
+    public suspend fun openWriter(namespaceId: String): DefaultDeltaSegmentWriter {
+        val (nextSeq, legacy) = scanExistingDeltaSequence(namespaceId)
+        if (legacy.isNotEmpty()) throw LegacySegmentFormatException(namespaceId, legacy)
+        return DefaultDeltaSegmentWriter(namespaceId, KdbUuid.random(), nextSeq, config.ioShim, config, debugHook)
+    }
 
     public fun openReader(namespaceId: String): DefaultDeltaSegmentReader =
         DefaultDeltaSegmentReader(namespaceId, config.ioShim, config)
+
+    private suspend fun scanExistingDeltaSequence(namespaceId: String): Pair<Long, List<String>> {
+        val prefix = SegmentNameBuilder.namespacePrefix(namespaceId) + "delta/"
+        val names = config.ioShim.listSegments(namespaceId).filter { it.startsWith(prefix) }
+        var maxSeq = -1L
+        val legacy = mutableListOf<String>()
+        for (name in names) {
+            val fileName = name.removePrefix(prefix)
+            val seq = SegmentNameBuilder.parseDeltaSequencedFileName(fileName)
+            if (seq == null) {
+                legacy += name
+            } else if (seq > maxSeq) {
+                maxSeq = seq
+            }
+        }
+        return Pair(maxSeq + 1, legacy)
+    }
 }

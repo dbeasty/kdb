@@ -61,4 +61,16 @@ public data class DeltaSegmentRef(
     val lastCommitHash: KdbHash,
     val sizeBytes: Long,
     val compressionCodec: CompressionCodec,
+    /**
+     * This segment's position in namespace-wide commit order, assigned
+     * monotonically at open time and encoded directly in the segment's
+     * file name (see SegmentNameBuilder.deltaSequenced). This - not
+     * segmentId, which is only a display identity - is what replay sorts
+     * and reasons about: see kdb-spec-layer13 Component 47 for why
+     * sorting by a random UUID made a multi-segment namespace
+     * permanently unopenable after enough restarts. Defaults to 0 so
+     * existing test fixtures that don't care about ordering still
+     * compile.
+     */
+    val sequenceNumber: Long = 0,
 )
