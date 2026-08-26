@@ -105,7 +105,7 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &defaultSession{client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn, persist: config.Persist}, nil
+	return &defaultSession{client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn, materialize: config.MaterializeCommit, persist: config.Persist}, nil
 }
 
 func (c *defaultClient) Disconnect() error {
@@ -214,6 +214,11 @@ type defaultSession struct {
 	namespaceID string
 	remoteHead  codec.Hash
 	conn        stream.ConnectionHandle
+	// materialize replays a fetched commit's document ops into local storage - see
+	// ClientConfig.MaterializeCommit's doc comment. May be nil (a pulled commit is then reachable
+	// from the DAG but invisible to any query that reads through storage, matching the behavior
+	// before this field existed).
+	materialize func(document.Commit) error
 	// persist durably logs a commit pulled from a peer - see ClientConfig.Persist's doc
 	// comment. May be nil (peer sync then has no local durability of its own, matching the
 	// behavior before this field existed).
@@ -245,6 +250,15 @@ func (s *defaultSession) PullMissing() (Result, error) {
 		}
 		if err := s.dag.PutCommit(commit, true); err != nil {
 			return Result{}, err
+		}
+		// Without this, a commit pulled from a peer was reachable from the DAG (PutCommit above)
+		// but invisible to SqlExec/Query/GetDocument, since PutCommit only ever updates DAG
+		// bookkeeping, never storage - same gap host.go's CommitPush handling had before its own
+		// MaterializeCommit wiring, mirrored here for the pull direction.
+		if s.materialize != nil {
+			if err := s.materialize(commit); err != nil {
+				return Result{}, err
+			}
 		}
 		// Fixes kdb-spec-layer13 §2.2 client-side: without this, a commit pulled from a peer
 		// lived only in memory and vanished on restart of a file-backed node.

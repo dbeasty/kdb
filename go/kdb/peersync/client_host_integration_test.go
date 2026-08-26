@@ -9,6 +9,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	mem "github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
@@ -449,5 +450,87 @@ func TestPushCommitsSurfacesConflictInsteadOfReportingSuccess(t *testing.T) {
 	}
 	if !remoteDag.HasCommit(localCommit.Hash) {
 		t.Fatal("pushed commit should still be stored even though main didn't move onto it")
+	}
+}
+
+// TestPullMissingMaterializesFetchedCommitIntoLocalStorage is the client-side mirror of the
+// front door's own fix (go/kdb/server's ListenPeerSync wiring embed.MaterializeCommit into
+// HostConfig): dag.PutCommit only updates DAG bookkeeping, so a commit fetched via PullMissing
+// was previously reachable from the local DAG but invisible to anything that reads through
+// storage.Adapter (e.g. a locally embedded runtime's SqlExec/Query/GetDocument) until this
+// commit's ops were replayed into it. Uses the real production embed.MaterializeCommit as the
+// callback, not a test-local reimplementation, so this proves the actual wiring works end to
+// end, the same way TestListenPeerSyncPushIsVisibleToServerQueries does for the push direction.
+func TestPullMissingMaterializesFetchedCommitIntoLocalStorage(t *testing.T) {
+	ns := "app/pull-materialize"
+	hubName := "hub-pull-materialize"
+
+	localDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("local dag: %v", err)
+	}
+	remoteDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("remote dag: %v", err)
+	}
+	genesis, _ := localDag.Head()
+
+	localStorage := mem.NewInMemoryStorageAdapter()
+	remoteStorage := mem.NewInMemoryStorageAdapter()
+	remoteSide := side{dag: remoteDag, storage: remoteStorage}
+
+	docID := newUUID(t)
+	docJSON := `{"v":"remote"}`
+	remoteCommit := writeDoc(t, remoteSide, ns, genesis, docID, docJSON)
+
+	w := wire.NewCodec(wire.EncodingJSON)
+	host := NewHost(w, remoteDag, remoteStorage, auth.AllowAll, auth.EmptyContext)
+	if err := host.Start(HostConfig{NamespaceID: ns, NodeID: "host", TransportHub: hubName}); err != nil {
+		t.Fatalf("host start: %v", err)
+	}
+	defer host.Stop()
+
+	transport := stream.NewInMemoryTransport()
+	client := NewClient(w, transport, localDag, localStorage)
+	materializedCalls := 0
+	session, err := client.Connect(ClientConfig{
+		NamespaceID: ns,
+		NodeID:      "client",
+		PeerURI:     "memory://" + hubName,
+		MaterializeCommit: func(commit document.Commit) error {
+			materializedCalls++
+			return embed.MaterializeCommit(localStorage, localDag, ns, commit)
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if session.RemoteHead() != remoteCommit.Hash {
+		t.Fatalf("expected handshake to report remote head %s, got %s", remoteCommit.Hash.Hex(), session.RemoteHead().Hex())
+	}
+
+	result, err := session.PullMissing()
+	if err != nil {
+		t.Fatalf("pullMissing: %v", err)
+	}
+	if result.Conflict != nil {
+		t.Fatalf("expected a clean fast-forward pull, got a conflict: %+v", result.Conflict)
+	}
+	if result.FinalHead != remoteCommit.Hash {
+		t.Fatalf("expected local head to fast-forward to %s, got %s", remoteCommit.Hash.Hex(), result.FinalHead.Hex())
+	}
+	if materializedCalls != 1 {
+		t.Fatalf("expected MaterializeCommit called exactly once, got %d", materializedCalls)
+	}
+
+	doc, err := localStorage.GetDocument(ns, docID, remoteCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc == nil {
+		t.Fatal("pulled document not visible in local storage - MaterializeCommit was not wired into PullMissing")
+	}
+	if doc.JSON != docJSON {
+		t.Fatalf("expected JSON %q, got %q", docJSON, doc.JSON)
 	}
 }

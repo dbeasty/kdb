@@ -33,6 +33,12 @@ type ClientConfig struct {
 	PeerURI           string
 	ConnectionContext auth.ConnectionContext
 	TLS               *core.TransportTlsSettings
+	// MaterializeCommit replays a commit fetched from the remote peer into local storage - see
+	// HostConfig.MaterializeCommit's doc comment; same contract, client side. Only needed for
+	// commits fetched over the wire (PutMissing's CommitFetch results): a ResolveDivergence
+	// auto-merge commit already writes its own documents into storage as it builds the merge
+	// tree (see mergeNonConflicting), so it is deliberately not passed through this callback.
+	MaterializeCommit func(document.Commit) error
 	// Persist durably logs a commit pulled from a peer - see HostConfig.Persist's doc comment;
 	// same contract, client side.
 	Persist func(document.Commit) error
