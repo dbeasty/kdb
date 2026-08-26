@@ -58,6 +58,13 @@ const (
 	MsgUpsert            MessageType = 0x16
 	MsgUpsertResult      MessageType = 0x17
 
+	// The CommitPush response required by kdb-spec-layer8-component23 §5 ("Idempotent putCommit;
+	// returns ack frame with applied count") - specified from the start but never actually
+	// built, so a non-conflicting push had no frame to reply with at all and left its client
+	// blocked on a correlated response that never came. CONFLICT_REPORT is still the reply for
+	// the conflicting case; this covers every other outcome. Go-only for now, like 0x14-0x17.
+	MsgCommitPushAck MessageType = 0x18
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -111,6 +118,8 @@ func (t MessageType) String() string {
 		return "UPSERT"
 	case MsgUpsertResult:
 		return "UPSERT_RESULT"
+	case MsgCommitPushAck:
+		return "COMMIT_PUSH_ACK"
 	default:
 		return "UNKNOWN"
 	}
@@ -164,6 +173,8 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgUpsert, true
 	case 0x17:
 		return MsgUpsertResult, true
+	case 0x18:
+		return MsgCommitPushAck, true
 	default:
 		return 0, false
 	}
@@ -331,6 +342,20 @@ type CommitPushMessage struct {
 }
 
 func (m CommitPushMessage) Header() Header { return m.H }
+
+// CommitPushAckMessage acknowledges a CommitPush that did not conflict. AppliedCommits counts
+// only the commits this push actually added (a re-push of history the peer already has is a
+// legitimate zero), and HeadHex is the peer's branch head once the push was resolved - which is
+// not necessarily the pushed commit, since a divergent-but-non-conflicting push lands on a
+// freshly created two-parent merge commit instead.
+type CommitPushAckMessage struct {
+	H              Header
+	Namespace      string
+	AppliedCommits int
+	HeadHex        string
+}
+
+func (m CommitPushAckMessage) Header() Header { return m.H }
 
 type DagDiffMessage struct {
 	H          Header

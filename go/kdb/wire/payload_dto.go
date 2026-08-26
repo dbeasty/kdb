@@ -7,6 +7,7 @@ type payloadEnvelope struct {
 	DeltaCommit       *deltaCommitDto       `json:"deltaCommit,omitempty"`
 	CommitFetch       *commitFetchDto       `json:"commitFetch,omitempty"`
 	CommitPush        *commitPushDto        `json:"commitPush,omitempty"`
+	CommitPushAck     *commitPushAckDto     `json:"commitPushAck,omitempty"`
 	DagDiff           *dagDiffDto           `json:"dagDiff,omitempty"`
 	TransactionReplay *transactionReplayDto `json:"transactionReplay,omitempty"`
 	ConflictReport    *conflictReportDto    `json:"conflictReport,omitempty"`
@@ -73,6 +74,12 @@ type commitFetchDto struct {
 type commitPushDto struct {
 	Namespace      string `json:"namespace"`
 	CommitsPayload []byte `json:"commitsPayload"`
+}
+
+type commitPushAckDto struct {
+	Namespace      string `json:"namespace"`
+	AppliedCommits int    `json:"appliedCommits"`
+	HeadHex        string `json:"headHex"`
 }
 
 type dagDiffDto struct {

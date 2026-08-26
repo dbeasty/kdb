@@ -2,6 +2,7 @@ package peersync
 
 import (
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -96,12 +97,7 @@ func TestCommitPushCallsPersistForBothOrdinaryAndMergeCommits(t *testing.T) {
 		t.Fatalf("expected second client Persist call for the new local head (the merge commit) "+
 			"%s, got %s", head.Hex(), clientPersisted[1].Hex())
 	}
-	// Now push a fresh commit at the (now-merged) head back to the host, driven directly through
-	// HandleFrame rather than session.PushCommits - matching
-	// TestHostCommitPushAutoMergesDisjointWritesWithSilentAck's own approach, since a clean
-	// (non-conflicting) CommitPush deliberately gets a silent (nil) ack per that test, and
-	// session.PushCommits waiting on a correlated response for that case is a separate,
-	// pre-existing gap unrelated to this fix (worth its own follow-up, not chased down here).
+	// Now push a fresh commit at the (now-merged) head back to the host.
 	mergeCommit, err := localDag.GetCommitOrThrow(head)
 	if err != nil {
 		t.Fatalf("expected merge commit to exist locally: %v", err)
@@ -111,17 +107,8 @@ func TestCommitPushCallsPersistForBothOrdinaryAndMergeCommits(t *testing.T) {
 	// The host never saw the client's original commit or the client-side merge commit (only
 	// ever pushed to, never pushed from, the host) - include both ancestors so freshCommit's
 	// parent chain is fully resolvable on arrival.
-	push := wire.CommitPushMessage{
-		H:         wire.Header{MessageType: wire.MsgCommitPush, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: 99},
-		Namespace: ns,
-		Commits:   []document.Commit{localCommit, mergeCommit, freshCommit},
-	}
-	frame, err := w.Encode(push)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	if _, err := host.HandleFrame(frame); err != nil {
-		t.Fatalf("handleFrame: %v", err)
+	if _, err := pushWithin(t, session, []document.Commit{localCommit, mergeCommit, freshCommit}, 3*time.Second); err != nil {
+		t.Fatalf("pushCommits: %v", err)
 	}
 	found := false
 	for _, h := range hostPersisted {

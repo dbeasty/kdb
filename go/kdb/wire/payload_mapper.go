@@ -111,6 +111,15 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				CommitsPayload: payload,
 			},
 		}, nil
+	case CommitPushAckMessage:
+		return payloadEnvelope{
+			Kind: "commitPushAck",
+			CommitPushAck: &commitPushAckDto{
+				Namespace:      m.Namespace,
+				AppliedCommits: m.AppliedCommits,
+				HeadHex:        m.HeadHex,
+			},
+		}, nil
 	case DagDiffMessage:
 		return payloadEnvelope{
 			Kind: "dagDiff",
@@ -379,6 +388,14 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			return nil, err
 		}
 		return CommitPushMessage{H: header, Namespace: c.Namespace, Commits: commits}, nil
+	case "commitPushAck":
+		a := env.CommitPushAck
+		if a == nil {
+			return nil, newDecodeError("missing commitPushAck body")
+		}
+		return CommitPushAckMessage{
+			H: header, Namespace: a.Namespace, AppliedCommits: a.AppliedCommits, HeadHex: a.HeadHex,
+		}, nil
 	case "dagDiff":
 		d := env.DagDiff
 		if d == nil {

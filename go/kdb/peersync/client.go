@@ -1,12 +1,14 @@
 package peersync
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
+	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -184,10 +186,25 @@ func (c *defaultClient) pushToRemote(conn stream.ConnectionHandle, namespaceID s
 		Namespace: namespaceID,
 		Commits:   commits,
 	}
-	if _, err := c.request(conn, push); err != nil {
+	resp, err := c.request(conn, push)
+	if err != nil {
 		return 0, err
 	}
-	return len(commits), nil
+	switch r := resp.(type) {
+	case wire.CommitPushAckMessage:
+		return r.AppliedCommits, nil
+	case wire.ConflictReportMessage:
+		// Previously the response went unread, so a peer that rejected the push for a genuine
+		// same-document divergence still reported len(commits) pushed - the caller had no way to
+		// learn its commits were stored but never adopted as the peer's head.
+		var report kdberr.ConflictReport
+		if err := json.Unmarshal(r.ReportBytes, &report); err != nil {
+			return 0, NewError("peer reported a push conflict with an undecodable report", err)
+		}
+		return 0, kdberr.NewConflictError("peer rejected push: divergent history in "+r.Namespace, report)
+	default:
+		return 0, NewError("expected CommitPushAck response to CommitPush", nil)
+	}
 }
 
 type defaultSession struct {

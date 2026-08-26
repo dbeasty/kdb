@@ -2,7 +2,9 @@ package peersync
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -219,10 +221,11 @@ func TestHostCommitPushReturnsConflictReportOnSameDocumentDivergence(t *testing.
 	}
 }
 
-// The non-conflicting counterpart: a disjoint-document push must auto-merge silently (ordinary
-// ack, nil response), landing main on a real two-parent merge commit - not the pushed commit's
-// hash directly (that would be the bug: blindly adopting whatever was pushed).
-func TestHostCommitPushAutoMergesDisjointWritesWithSilentAck(t *testing.T) {
+// The non-conflicting counterpart: a disjoint-document push must auto-merge and ack, landing
+// main on a real two-parent merge commit - not the pushed commit's hash directly (that would be
+// the bug: blindly adopting whatever was pushed). The ack reports that merge commit as the new
+// head, not the hash the client pushed.
+func TestHostCommitPushAutoMergesDisjointWritesAndAcks(t *testing.T) {
 	ns := "app/host-push-merge"
 
 	hostDag, err := dag.NewInMemoryCommitDag(ns)
@@ -261,11 +264,28 @@ func TestHostCommitPushAutoMergesDisjointWritesWithSilentAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleFrame: %v", err)
 	}
-	if respFrame != nil {
-		t.Fatalf("expected a silent ack (nil) for a clean auto-merge, got a response frame")
+	if respFrame == nil {
+		t.Fatal("expected a CommitPushAck for a clean auto-merge, got no response frame")
+	}
+	respMsg, err := w.Decode(respFrame)
+	if err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	ack, ok := respMsg.(wire.CommitPushAckMessage)
+	if !ok {
+		t.Fatalf("expected CommitPushAckMessage, got %T", respMsg)
+	}
+	if ack.H.CorrelationID != 2 {
+		t.Fatalf("ack must echo the push's correlation id 2, got %d", ack.H.CorrelationID)
+	}
+	if ack.AppliedCommits != 1 {
+		t.Fatalf("expected 1 applied commit, got %d", ack.AppliedCommits)
 	}
 
 	head, _ := hostDag.Head()
+	if ack.HeadHex != head.Hex() {
+		t.Fatalf("ack head %s does not match the host's actual head %s", ack.HeadHex, head.Hex())
+	}
 	if head == incomingCommit.Hash {
 		t.Fatal("main was blindly moved to the pushed commit - exactly the bug this test guards against")
 	}
@@ -275,5 +295,159 @@ func TestHostCommitPushAutoMergesDisjointWritesWithSilentAck(t *testing.T) {
 	}
 	if len(merged.ParentHashes) != 2 || merged.ParentHashes[0] != hostCommit.Hash || merged.ParentHashes[1] != incomingCommit.Hash {
 		t.Fatalf("expected a two-parent auto-merge [host, incoming], got %v", merged.ParentHashes)
+	}
+}
+
+// pushWithin runs PushCommits off the test goroutine so a host that never replies fails the test
+// in seconds instead of blocking for the full correlation wait in defaultClient.request.
+func pushWithin(t *testing.T, session Session, commits []document.Commit, within time.Duration) (int, error) {
+	t.Helper()
+	type outcome struct {
+		applied int
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		applied, err := session.PushCommits(commits)
+		done <- outcome{applied, err}
+	}()
+	select {
+	case o := <-done:
+		return o.applied, o.err
+	case <-time.After(within):
+		t.Fatalf("PushCommits did not return within %s - the host owes a clean push an ack and never sent one", within)
+		return 0, nil
+	}
+}
+
+// The push counterpart to the PullMissing tests above, and the regression test for the flagged
+// bug: a clean (non-conflicting) push driven through the real client - not connHost.HandleFrame -
+// must come back. CommitPush is a request/response pair (component 23 spec §5: "returns ack frame
+// with applied count"), but the host used to answer every non-conflicting outcome with no frame
+// at all, so PushCommits sat in its correlation wait for ~20s and then failed with "no response
+// for correlation" - which also took SyncBidirectional down with it whenever there was anything
+// to push. Every earlier push test dodged this by calling the frame handler directly.
+func TestPushCommitsReturnsAckInsteadOfHangingOnCleanPush(t *testing.T) {
+	ns := "app/push-ack"
+	hubName := "hub-push-ack"
+
+	localDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("local dag: %v", err)
+	}
+	remoteDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("remote dag: %v", err)
+	}
+	genesis, _ := localDag.Head()
+
+	localStorage := mem.NewInMemoryStorageAdapter()
+	remoteStorage := mem.NewInMemoryStorageAdapter()
+	localSide := side{dag: localDag, storage: localStorage}
+
+	// Only the client has written - the host is still at genesis, so this push fast-forwards.
+	// The plainest possible success case, and the one that used to hang.
+	localCommit := writeDoc(t, localSide, ns, genesis, newUUID(t), `{"v":"local"}`)
+
+	w := wire.NewCodec(wire.EncodingJSON)
+	host := NewHost(w, remoteDag, remoteStorage, auth.AllowAll, auth.EmptyContext)
+	if err := host.Start(HostConfig{NamespaceID: ns, NodeID: "host", TransportHub: hubName}); err != nil {
+		t.Fatalf("host start: %v", err)
+	}
+	defer host.Stop()
+
+	transport := stream.NewInMemoryTransport()
+	client := NewClient(w, transport, localDag, localStorage)
+	session, err := client.Connect(ClientConfig{NamespaceID: ns, NodeID: "client", PeerURI: "memory://" + hubName})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	applied, err := pushWithin(t, session, []document.Commit{localCommit}, 3*time.Second)
+	if err != nil {
+		t.Fatalf("pushCommits: %v", err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected 1 applied commit, got %d", applied)
+	}
+	remoteHead, _ := remoteDag.Head()
+	if remoteHead != localCommit.Hash {
+		t.Fatalf("expected host to fast-forward to %s, got %s", localCommit.Hash.Hex(), remoteHead.Hex())
+	}
+
+	// The ack carries an applied count, not an echo of what was sent (component 23 spec §5 calls
+	// CommitPush idempotent): re-pushing history the host already has is a no-op worth zero.
+	reapplied, err := pushWithin(t, session, []document.Commit{localCommit}, 3*time.Second)
+	if err != nil {
+		t.Fatalf("idempotent re-push: %v", err)
+	}
+	if reapplied != 0 {
+		t.Fatalf("expected a re-push of known history to apply 0 commits, got %d", reapplied)
+	}
+}
+
+// The conflicting counterpart: the host answers a same-document divergence with a
+// ConflictReport, which the client used to send and never read - so a rejected push still
+// reported every commit as pushed. The caller has to be able to tell the two apart.
+func TestPushCommitsSurfacesConflictInsteadOfReportingSuccess(t *testing.T) {
+	ns := "app/push-conflict"
+	hubName := "hub-push-conflict"
+
+	localDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("local dag: %v", err)
+	}
+	remoteDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("remote dag: %v", err)
+	}
+	genesis, _ := localDag.Head()
+
+	localStorage := mem.NewInMemoryStorageAdapter()
+	remoteStorage := mem.NewInMemoryStorageAdapter()
+	localSide := side{dag: localDag, storage: localStorage}
+	remoteSide := side{dag: remoteDag, storage: remoteStorage}
+
+	sharedDoc := newUUID(t)
+	localCommit := writeDoc(t, localSide, ns, genesis, sharedDoc, `{"v":"local"}`)
+	remoteCommit := writeDoc(t, remoteSide, ns, genesis, sharedDoc, `{"v":"remote"}`)
+
+	w := wire.NewCodec(wire.EncodingJSON)
+	host := NewHost(w, remoteDag, remoteStorage, auth.AllowAll, auth.EmptyContext)
+	if err := host.Start(HostConfig{NamespaceID: ns, NodeID: "host", TransportHub: hubName}); err != nil {
+		t.Fatalf("host start: %v", err)
+	}
+	defer host.Stop()
+
+	transport := stream.NewInMemoryTransport()
+	client := NewClient(w, transport, localDag, localStorage)
+	session, err := client.Connect(ClientConfig{NamespaceID: ns, NodeID: "client", PeerURI: "memory://" + hubName})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	applied, err := pushWithin(t, session, []document.Commit{localCommit}, 3*time.Second)
+	if err == nil {
+		t.Fatalf("expected a conflicting push to fail, got %d commits reported pushed", applied)
+	}
+	if applied != 0 {
+		t.Fatalf("expected 0 applied commits on a rejected push, got %d", applied)
+	}
+	var conflictErr *kdberr.ConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("expected a ConflictError carrying the peer's report, got %T: %v", err, err)
+	}
+	if len(conflictErr.Report.Conflicts) != 1 || conflictErr.Report.Conflicts[0].DocumentID != sharedDoc.String() {
+		t.Fatalf("expected exactly one conflict on %s, got %+v", sharedDoc.String(), conflictErr.Report.Conflicts)
+	}
+
+	// The host keeps the pushed commit but must not adopt it as main - the client's own view of
+	// that (a plain error) is only trustworthy if the host really did leave the head alone.
+	remoteHead, _ := remoteDag.Head()
+	if remoteHead != remoteCommit.Hash {
+		t.Fatalf("expected host main to stay at %s, got %s", remoteCommit.Hash.Hex(), remoteHead.Hex())
+	}
+	if !remoteDag.HasCommit(localCommit.Hash) {
+		t.Fatal("pushed commit should still be stored even though main didn't move onto it")
 	}
 }

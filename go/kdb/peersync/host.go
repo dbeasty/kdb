@@ -143,6 +143,7 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 	case wire.CommitPushMessage:
 		// putCommit always stores, regardless of what happens to "main" below (component 39
 		// spec §5: history must never be lost, only the branch-pointer decision is gated).
+		applied := 0
 		for _, commit := range m.Commits {
 			if h.dag.HasCommit(commit.Hash) {
 				continue
@@ -163,6 +164,7 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 					return nil, err
 				}
 			}
+			applied++
 		}
 		if len(m.Commits) > 0 {
 			incomingHead := m.Commits[len(m.Commits)-1].Hash
@@ -200,10 +202,22 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 					ReportBytes: reportBytes,
 				})
 			}
-			// NoOp/FastForwarded/Merged all succeed - fall through to the ordinary ack below,
-			// same shape the (buggy) unconditional-SetHead version always returned.
+			// NoOp/FastForwarded/Merged all succeed - fall through to the ack below.
 		}
-		return nil, nil
+		// CommitPush is a request/response pair, not fire-and-forget (component 23 spec §5): the
+		// client blocks on a correlated reply, so every non-conflicting outcome owes it one.
+		// Returning nil here instead left a clean push with no reply at all and hung the caller
+		// until its correlation wait expired.
+		head, err := h.dag.Head()
+		if err != nil {
+			return nil, err
+		}
+		return h.wire.Encode(wire.CommitPushAckMessage{
+			H:              wire.Header{MessageType: wire.MsgCommitPushAck, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: m.H.CorrelationID},
+			Namespace:      m.Namespace,
+			AppliedCommits: applied,
+			HeadHex:        head.Hex(),
+		})
 	default:
 		return nil, nil
 	}

@@ -193,6 +193,18 @@ func TestPositionAckRoundtrip(t *testing.T) {
 	}
 }
 
+func TestCommitPushAckRoundtrip(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingKdbBinary)
+	head := repeatHex(0xab)
+	msg := wire.CommitPushAckMessage{
+		H: testHeader(7, wire.MsgCommitPushAck), Namespace: "app/data", AppliedCommits: 3, HeadHex: head.Hex(),
+	}
+	back := decodedAs[wire.CommitPushAckMessage](t, c, msg)
+	if back.AppliedCommits != 3 || back.HeadHex != head.Hex() || back.Namespace != "app/data" {
+		t.Fatalf("commitPushAck mismatch: %+v", back)
+	}
+}
+
 func TestJSONEncodingRoundtrip(t *testing.T) {
 	c := wire.NewCodec(wire.EncodingJSON)
 	msg := wire.HandshakeMessage{
