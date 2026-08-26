@@ -22,6 +22,12 @@ func run(args []string) error {
 	switch args[0] {
 	case "dump-wire":
 		return dumpWire(args[1:])
+	case "verify":
+		return verifyCmd(args[1:])
+	case "repair-segments":
+		return repairSegmentsCmd(args[1:])
+	case "restore":
+		return restoreCmd(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", args[0])
 		printUsage()
@@ -63,8 +69,26 @@ func argValue(args []string, name string) string {
 }
 
 func printUsage() {
-	fmt.Println(`kdb-inspect — debug JSON views (non-authoritative)
+	fmt.Println(`kdb-inspect — debug JSON views and data-directory maintenance (kdb-spec-layer15)
 
 Usage:
-  kdb-inspect dump-wire --file FRAME.bin [--compact]`)
+  kdb-inspect dump-wire --file FRAME.bin [--compact]
+
+  kdb-inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--codec zstd|none] [--json]
+      Walk the delta log and report corruption without changing anything.
+
+  kdb-inspect repair-segments --data-dir DIR --namespace NS [--codec zstd|none] [--dry-run]
+      Truncate torn tails and quarantine corrupt frames where provably safe.
+      Refuses (naming the missing commits) when a repair would drop history
+      still referenced by later segments - run restore instead in that case.
+
+  kdb-inspect restore --namespace NS --out DIR --source LABEL=PATH [--source LABEL=PATH ...] [--codec zstd|none]
+      Rebuild a namespace's delta log into DIR from the verified union of one
+      or more sources (a damaged local data directory, a backup directory, or
+      both for a hybrid restore).
+
+Stop kdb-service (or your embedded runtime) before running verify,
+repair-segments, or restore against its data directory - none of these
+commands take the directory lock embed.OpenFileRuntime does, so running
+them concurrently with a live writer is not safe.`)
 }
