@@ -14,6 +14,16 @@ type HostConfig struct {
 	NodeID            string
 	TransportHub      string
 	MaterializeCommit func(document.Commit) error
+	// Persist durably logs a commit ingested from a peer (via CommitPush, or a
+	// ResolveDivergence-created auto-merge commit) - separate from MaterializeCommit, which is
+	// about tree reconstruction, not durability. dag.PutCommit only ever mutates the in-memory
+	// DAG; without Persist wired to the runtime's actual delta-log writer (e.g.
+	// embed.PersistingCommitDAG.Persist), a commit received from a peer lives only in memory and
+	// is silently lost on restart - see kdb-spec-layer13 Component 47 §2.2/Component 52 §9.2.
+	// Left nil (the default), peer sync is exactly as durable as it was before this field
+	// existed: not durable at all. A caller wiring peer sync into a file-backed runtime must set
+	// this to get commits from peers to survive a restart.
+	Persist func(document.Commit) error
 }
 
 // ClientConfig configures a peer sync client connection.
@@ -23,6 +33,9 @@ type ClientConfig struct {
 	PeerURI           string
 	ConnectionContext auth.ConnectionContext
 	TLS               *core.TransportTlsSettings
+	// Persist durably logs a commit pulled from a peer - see HostConfig.Persist's doc comment;
+	// same contract, client side.
+	Persist func(document.Commit) error
 }
 
 // DagSyncPlan describes commits unique to each side of a sync.

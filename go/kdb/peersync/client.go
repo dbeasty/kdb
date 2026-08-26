@@ -103,7 +103,7 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &defaultSession{client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn}, nil
+	return &defaultSession{client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn, persist: config.Persist}, nil
 }
 
 func (c *defaultClient) Disconnect() error {
@@ -197,9 +197,13 @@ type defaultSession struct {
 	namespaceID string
 	remoteHead  codec.Hash
 	conn        stream.ConnectionHandle
+	// persist durably logs a commit pulled from a peer - see ClientConfig.Persist's doc
+	// comment. May be nil (peer sync then has no local durability of its own, matching the
+	// behavior before this field existed).
+	persist func(document.Commit) error
 }
 
-func (s *defaultSession) NamespaceID() string  { return s.namespaceID }
+func (s *defaultSession) NamespaceID() string    { return s.namespaceID }
 func (s *defaultSession) RemoteHead() codec.Hash { return s.remoteHead }
 
 func (s *defaultSession) PullMissing() (Result, error) {
@@ -225,6 +229,13 @@ func (s *defaultSession) PullMissing() (Result, error) {
 		if err := s.dag.PutCommit(commit, true); err != nil {
 			return Result{}, err
 		}
+		// Fixes kdb-spec-layer13 §2.2 client-side: without this, a commit pulled from a peer
+		// lived only in memory and vanished on restart of a file-backed node.
+		if s.persist != nil {
+			if err := s.persist(commit); err != nil {
+				return Result{}, err
+			}
+		}
 		applied++
 	}
 	incomingHead := s.remoteHead
@@ -240,6 +251,14 @@ func (s *defaultSession) PullMissing() (Result, error) {
 	outcome, err := ResolveDivergence(s.dag, s.storage, s.namespaceID, localHead, incomingHead)
 	if err != nil {
 		return Result{}, err
+	}
+	// See host.go's identical comment: the auto-merge case creates a brand new commit that
+	// exists nowhere but this node and needs the same persistence as anything pulled over the
+	// wire above (kdb-spec-layer13 §2.2).
+	if outcome.MergeCommit != nil && s.persist != nil {
+		if err := s.persist(*outcome.MergeCommit); err != nil {
+			return Result{}, err
+		}
 	}
 	finalHead, err := s.dag.Head()
 	if err != nil {

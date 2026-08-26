@@ -153,6 +153,16 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 			if h.cfg.MaterializeCommit != nil {
 				_ = h.cfg.MaterializeCommit(commit)
 			}
+			// Fixes kdb-spec-layer13 §2.2: dag.PutCommit only mutates the in-memory DAG - without
+			// this, a commit received from a peer lived only in memory and vanished on restart of
+			// a file-backed node, even though the node re-fetching it from peers on next connect
+			// would eventually paper over it cluster-wide (this is about *this* node's local
+			// durability, not data loss overall).
+			if h.cfg.Persist != nil {
+				if err := h.cfg.Persist(commit); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if len(m.Commits) > 0 {
 			incomingHead := m.Commits[len(m.Commits)-1].Hash
@@ -169,6 +179,15 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 			outcome, err := ResolveDivergence(h.dag, h.storage, m.Namespace, localHead, incomingHead)
 			if err != nil {
 				return nil, err
+			}
+			// The auto-merge case (OutcomeMerged) creates a brand new commit (via
+			// AppendMergeCommit) that exists nowhere but this node - it needs the same
+			// persistence as any other newly-created commit, not just the commits that arrived
+			// over the wire above (kdb-spec-layer13 §2.2).
+			if outcome.MergeCommit != nil && h.cfg.Persist != nil {
+				if err := h.cfg.Persist(*outcome.MergeCommit); err != nil {
+					return nil, err
+				}
 			}
 			if outcome.Kind == OutcomeConflict {
 				reportBytes, err := json.Marshal(outcome.Report)
