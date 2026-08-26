@@ -3,9 +3,10 @@
 // write one document by id, commit a transaction with optimistic-concurrency semantics, upsert
 // unconditionally, and run the occasional SQL statement - not a general database/sql driver.
 //
-// One *Client is one TCP connection, one KDB session per namespace touched. Reuses
-// go/kdb/wire and go/kdb/transport/tcp directly per the component spec's explicit reuse
-// decision - this package is request/response semantics and ergonomics on top of them, not a
+// One *Client is one wire connection, one KDB session per namespace touched. Reuses go/kdb/wire
+// directly, plus go/kdb/transport/tcp (the component spec's original reuse target) or
+// go/kdb/transport/ws (component 25's WebSocket transport, chosen by addr's scheme - see
+// Connect) - this package is request/response semantics and ergonomics on top of them, not a
 // second wire implementation.
 package client
 
@@ -23,6 +24,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
+	"github.com/limidus/kdb/go/kdb/transport/ws"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -185,7 +187,10 @@ func Connect(ctx context.Context, addr string, token string) (*Client, error) {
 	if !hasScheme(uri) {
 		uri = "tcp://" + uri
 	}
-	transport := tcp.NewTransport(core.DefaultConnectOptions())
+	transport, err := dialTransport(uri)
+	if err != nil {
+		return nil, err
+	}
 	conn, err := transport.Connect(uri)
 	if err != nil {
 		return nil, &TransportError{Cause: err}
@@ -238,6 +243,27 @@ func Connect(ctx context.Context, addr string, token string) (*Client, error) {
 // scheme separator and left unprefixed - matching "://" is what a scheme actually looks like.
 func hasScheme(uri string) bool {
 	return strings.Contains(uri, "://")
+}
+
+// dialTransport picks the wire transport implementation by uri's scheme: tcp:// (the component
+// spec's original reuse target, and Connect's default for a bare host:port) or ws:// (component
+// 25's WebSocket transport - already real, already proven cross-language by go/kdb/interop's
+// Go-WS-client-against-JVM-server interop test, just not previously exposed as a choice here).
+// wss:// is deliberately rejected here rather than silently downgraded or attempted: neither
+// go/kdb/transport/ws nor go/kdb/transport/tcp implement TLS yet (ws.Transport.Connect already
+// returns its own explicit "wss:// not yet implemented" error for the scheme itself - this
+// covers the same scheme choice at the client-selection point, before a connection attempt).
+func dialTransport(uri string) (stream.Transport, error) {
+	switch {
+	case strings.HasPrefix(uri, "tcp://"):
+		return tcp.NewTransport(core.DefaultConnectOptions()), nil
+	case strings.HasPrefix(uri, "ws://"):
+		return ws.NewTransport(core.DefaultConnectOptions()), nil
+	case strings.HasPrefix(uri, "wss://"):
+		return nil, fmt.Errorf("kdb: wss:// is not yet implemented (no transport in this codebase does TLS yet) - use ws:// or tcp://")
+	default:
+		return nil, fmt.Errorf("kdb: unsupported scheme in %q (expected tcp://, ws://, or a bare host:port)", uri)
+	}
 }
 
 // Close closes the underlying connection. Safe to call more than once.

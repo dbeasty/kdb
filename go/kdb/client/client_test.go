@@ -494,3 +494,48 @@ func TestUpsertReturnsErrBusyOverRealWireWhenWriteQueueIsFull(t *testing.T) {
 	release() // frees running - unblocks the goroutine's queued acquire, which then releases itself
 	<-blockedDone
 }
+
+// TestConnectDialsOverWebSocketTransport is a regression test for dialTransport's scheme
+// dispatch: a ws:// URI must select go/kdb/transport/ws rather than the tcp:// default. There is
+// no in-process Go WebSocket server to round-trip against (go/kdb/transport/ws's server side is
+// deliberately JVM-only - see that package's NewTransport doc comment; TestConnectAgainstRealJvm
+// ServerOverWebSocket in jvm_ws_interop_test.go is the real round-trip proof, gated on a live JVM
+// server), so this only proves dialTransport picks ws.Transport and reaches an actual dial
+// attempt (a connection *refused* error, not a scheme-parsing error) - the wiring this component
+// didn't have before.
+func TestConnectDialsOverWebSocketTransport(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.Connect(ctx, "ws://127.0.0.1:1/kdb", "")
+	if err == nil {
+		t.Fatal("expected a dial error connecting to a port nothing listens on")
+	}
+	var transportErr *client.TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("expected a *client.TransportError (a real dial attempt, not a scheme-parsing rejection), got %T: %v", err, err)
+	}
+}
+
+// TestConnectRejectsWssScheme documents the honest current boundary: wss:// is refused outright
+// rather than silently downgraded to plaintext or attempted and failing confusingly deep inside
+// the TLS handshake - neither go/kdb/transport/ws nor go/kdb/transport/tcp implement TLS yet.
+func TestConnectRejectsWssScheme(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.Connect(ctx, "wss://127.0.0.1:1/kdb", "")
+	if err == nil {
+		t.Fatal("expected wss:// to be rejected")
+	}
+	if !strings.Contains(err.Error(), "wss://") {
+		t.Fatalf("expected an explicit wss:// rejection message, got: %v", err)
+	}
+}
+
+func TestConnectRejectsUnsupportedScheme(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.Connect(ctx, "ftp://127.0.0.1:1", "")
+	if err == nil {
+		t.Fatal("expected an unsupported scheme to be rejected")
+	}
+}
