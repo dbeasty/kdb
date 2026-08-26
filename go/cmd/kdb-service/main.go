@@ -3,9 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -26,12 +28,14 @@ func main() {
 	var sqlAddr string
 	var rbac bool
 	var memoryLimitMB int
+	var abortAfter time.Duration
 	fs.StringVar(&dataDir, "data-dir", "", "filesystem data root")
 	fs.BoolVar(&memory, "memory", false, "use in-memory runtime")
 	fs.StringVar(&namespace, "namespace", "demo/users", "default namespace")
 	fs.StringVar(&sqlAddr, "sql-addr", "tcp://127.0.0.1:9090?bind=true", "SQL wire listen address (empty to disable)")
 	fs.BoolVar(&rbac, "rbac", false, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
 	fs.IntVar(&memoryLimitMB, "memory-limit-mb", 0, "reject new writes (rather than risk an OS OOM-kill under sustained load) once process memory nears this budget; rejection triggers at 85% of this value, but sustained read traffic alone can still push usage a fair bit past that before it plateaus, so set this to roughly 60% of the container's actual --memory limit, not 80-90% - see docs/benchmarks/lightsail-sim/README.md for the numbers behind that guidance. 0 disables (default)")
+	fs.DurationVar(&abortAfter, "abort-after", 0, "if memory pressure (see --memory-limit-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
 	_ = fs.Parse(os.Args[1:])
 
 	if dataDir == "" && !memory {
@@ -105,10 +109,25 @@ func main() {
 		defer sqlListener.Close()
 		sqlStatus = fmt.Sprintf("enabled (%s)", sqlListener.Addr())
 	}
-	fmt.Printf("KDB service peer=%s stream=%s sql=%s rbac=%s memory-limit=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, rbacStatus, memoryLimitStatus, namespace)
+	abortStatus := "disabled"
+	var watchdog *server.AbortWatchdog
+	if abortAfter > 0 {
+		var listenerCloser io.Closer
+		if sqlListener != nil {
+			listenerCloser = sqlListener
+		}
+		watchdog = server.NewAbortWatchdog(srv, listenerCloser, abortAfter)
+		watchdog.Start()
+		abortStatus = abortAfter.String()
+	}
+
+	fmt.Printf("KDB service peer=%s stream=%s sql=%s rbac=%s memory-limit=%s abort-after=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, rbacStatus, memoryLimitStatus, abortStatus, namespace)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	// An ordinary signal-driven shutdown, not a pressure-triggered abort: stop the watchdog
+	// first so it doesn't race this deliberate exit (see AbortWatchdog.Stop's own doc comment).
+	watchdog.Stop()
 	srv.Release()
 }
