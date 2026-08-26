@@ -2,6 +2,7 @@ package io
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -34,6 +35,50 @@ type segmentNameBuilder struct{}
 
 func (segmentNameBuilder) Delta(namespaceID, segmentID string) string {
 	return path(namespaceID, SegmentKindDelta, segmentID)
+}
+
+// DeltaSequencedFileName returns just the file-name component (no
+// namespace/kind prefix) a sequenced delta segment uses: a 20-digit
+// zero-padded decimal sequence number plus ".seg". Zero-padded so that
+// lexicographic sort (what ListSegments and every SegmentByteStore
+// implementation give you for free) equals commit order - see
+// DeltaSequenced.
+func DeltaSequencedFileName(seq int64) string {
+	return fmt.Sprintf("%020d.seg", seq)
+}
+
+// ParseDeltaSequencedFileName parses a file-name component produced by
+// DeltaSequencedFileName back into its sequence number. ok is false for
+// anything else, including the pre-Layer-13 random-UUID segment names
+// (see kdb-spec-layer13 Component 47 §4.1) - callers use that to detect a
+// legacy data directory and refuse to guess at its order.
+func ParseDeltaSequencedFileName(fileName string) (seq int64, ok bool) {
+	const suffix = ".seg"
+	if !strings.HasSuffix(fileName, suffix) {
+		return 0, false
+	}
+	digits := strings.TrimSuffix(fileName, suffix)
+	if len(digits) != 20 {
+		return 0, false
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// DeltaSequenced builds the full segment path for a sequenced delta
+// segment - the naming scheme Component 47 replaces random-UUID delta
+// segment names with, so that segment file order is commit order by
+// construction (see kdb-spec-layer13-resource-governance.md §4.1).
+func (segmentNameBuilder) DeltaSequenced(namespaceID string, seq int64) string {
+	return path(namespaceID, SegmentKindDelta, DeltaSequencedFileName(seq))
 }
 
 func (segmentNameBuilder) WAL(namespaceID, walID string) string {

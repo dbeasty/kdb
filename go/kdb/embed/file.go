@@ -94,6 +94,27 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		}
 	}
 	rt.release = lock.Release
+	// storageClose is what makes Close() an orderly shutdown rather than a no-op that only
+	// releases the directory lock (kdb-spec-layer13 Component 47 §2.4/§4.5) - previously nothing
+	// retained handle past this function returning, so even a clean process exit never flushed
+	// the delta writer, sealed its segment, or reached ServerEngine.Close()'s final WAL sync.
+	rt.storageClose = func() error {
+		var firstErr error
+		if w := handle.DeltaWriter(); w != nil {
+			if err := w.Flush(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if !w.IsSealed() {
+				if _, err := w.Seal(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+		if err := handle.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
+	}
 	return rt, nil
 }
 
