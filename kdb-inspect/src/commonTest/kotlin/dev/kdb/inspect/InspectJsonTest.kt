@@ -53,7 +53,7 @@ class InspectJsonTest {
                     ioShim = shim,
                     compressionCodec = CompressionCodec.NONE,
                 )
-            val writer = DefaultDeltaSegmentWriter("app/test", KdbUuid.random(), shim, config)
+            val writer = DefaultDeltaSegmentWriter("app/test", KdbUuid.random(), 0L, shim, config)
             val commits = mutableListOf<KdbCommit>()
             repeat(3) { i ->
                 val commit =
