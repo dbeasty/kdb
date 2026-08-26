@@ -52,7 +52,7 @@ func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any
 		return decodeConflictError(r.ReportBytes)
 	case wire.SqlResultMessage:
 		if r.Error != nil {
-			return fmt.Errorf("kdb: %s", *r.Error)
+			return classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
 		}
 		return nil
 	default:
@@ -96,7 +96,7 @@ func (c *Client) execSql(ctx context.Context, ns string, sqlText string, args []
 		return sqlExecResult{}, fmt.Errorf("kdb: expected SqlResult, got %T", reply)
 	}
 	if result.Error != nil {
-		return sqlExecResult{}, fmt.Errorf("kdb: %s", *result.Error)
+		return sqlExecResult{}, classifiedError(*result.Error, result.ErrorCode, result.RetryAfterMs)
 	}
 	return sqlExecResult{Columns: result.Columns, Rows: result.Rows, needsCommit: !result.ReadOnly}, nil
 }

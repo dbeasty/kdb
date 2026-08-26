@@ -1,27 +1,27 @@
 package wire
 
 type payloadEnvelope struct {
-	Kind               string               `json:"kind"`
-	Handshake          *handshakeDto        `json:"handshake,omitempty"`
-	HandshakeAck       *handshakeAckDto     `json:"handshakeAck,omitempty"`
-	DeltaCommit        *deltaCommitDto      `json:"deltaCommit,omitempty"`
-	CommitFetch        *commitFetchDto      `json:"commitFetch,omitempty"`
-	CommitPush         *commitPushDto       `json:"commitPush,omitempty"`
-	DagDiff            *dagDiffDto          `json:"dagDiff,omitempty"`
-	TransactionReplay  *transactionReplayDto `json:"transactionReplay,omitempty"`
-	ConflictReport     *conflictReportDto   `json:"conflictReport,omitempty"`
-	CompactionNotice   *compactionNoticeDto `json:"compactionNotice,omitempty"`
-	IceArchiveNotice   *iceArchiveNoticeDto `json:"iceArchiveNotice,omitempty"`
-	SnapshotRequest    *snapshotRequestDto  `json:"snapshotRequest,omitempty"`
-	SnapshotResponse   *snapshotResponseDto `json:"snapshotResponse,omitempty"`
-	PositionAck        *positionAckDto      `json:"positionAck,omitempty"`
-	SchemaPush         *schemaPushDto       `json:"schemaPush,omitempty"`
-	SessionBegin       *sessionBeginDto     `json:"sessionBegin,omitempty"`
-	SessionBeginAck    *sessionBeginAckDto  `json:"sessionBeginAck,omitempty"`
-	SqlExec            *sqlExecDto          `json:"sqlExec,omitempty"`
-	SqlResult          *sqlResultDto        `json:"sqlResult,omitempty"`
-	TxCommit           *txCommitDto         `json:"txCommit,omitempty"`
-	TxRollback         *txRollbackDto       `json:"txRollback,omitempty"`
+	Kind              string                `json:"kind"`
+	Handshake         *handshakeDto         `json:"handshake,omitempty"`
+	HandshakeAck      *handshakeAckDto      `json:"handshakeAck,omitempty"`
+	DeltaCommit       *deltaCommitDto       `json:"deltaCommit,omitempty"`
+	CommitFetch       *commitFetchDto       `json:"commitFetch,omitempty"`
+	CommitPush        *commitPushDto        `json:"commitPush,omitempty"`
+	DagDiff           *dagDiffDto           `json:"dagDiff,omitempty"`
+	TransactionReplay *transactionReplayDto `json:"transactionReplay,omitempty"`
+	ConflictReport    *conflictReportDto    `json:"conflictReport,omitempty"`
+	CompactionNotice  *compactionNoticeDto  `json:"compactionNotice,omitempty"`
+	IceArchiveNotice  *iceArchiveNoticeDto  `json:"iceArchiveNotice,omitempty"`
+	SnapshotRequest   *snapshotRequestDto   `json:"snapshotRequest,omitempty"`
+	SnapshotResponse  *snapshotResponseDto  `json:"snapshotResponse,omitempty"`
+	PositionAck       *positionAckDto       `json:"positionAck,omitempty"`
+	SchemaPush        *schemaPushDto        `json:"schemaPush,omitempty"`
+	SessionBegin      *sessionBeginDto      `json:"sessionBegin,omitempty"`
+	SessionBeginAck   *sessionBeginAckDto   `json:"sessionBeginAck,omitempty"`
+	SqlExec           *sqlExecDto           `json:"sqlExec,omitempty"`
+	SqlResult         *sqlResultDto         `json:"sqlResult,omitempty"`
+	TxCommit          *txCommitDto          `json:"txCommit,omitempty"`
+	TxRollback        *txRollbackDto        `json:"txRollback,omitempty"`
 
 	// Component 40 additions - see document_ops.go.
 	DocumentGet       *documentGetDto       `json:"documentGet,omitempty"`
@@ -159,6 +159,10 @@ type sqlResultDto struct {
 	ReadOnly          bool       `json:"readOnly"`
 	Error             *string    `json:"error"`
 	GeneratedIDs      []string   `json:"generatedIds"`
+	// ErrorCode/RetryAfterMs are additive to Error - see SqlResultMessage's identical fields'
+	// doc comment (kdb-spec-layer13 Component 51 §8.1).
+	ErrorCode    *ErrorCode `json:"errorCode,omitempty"`
+	RetryAfterMs *int       `json:"retryAfterMs,omitempty"`
 }
 
 type txCommitDto struct {
@@ -173,13 +177,13 @@ type txRollbackDto struct {
 }
 
 type opDto struct {
-	Kind              string  `json:"kind"`
-	DocID             *string `json:"docId,omitempty"`
-	Patch             *string `json:"patch,omitempty"`
-	Path              *string `json:"path,omitempty"`
-	BlobHashHex       *string `json:"blobHashHex,omitempty"`
-	MigrationID       *string `json:"migrationId,omitempty"`
-	MigrationPayload  *string `json:"migrationPayload,omitempty"`
+	Kind             string  `json:"kind"`
+	DocID            *string `json:"docId,omitempty"`
+	Patch            *string `json:"patch,omitempty"`
+	Path             *string `json:"path,omitempty"`
+	BlobHashHex      *string `json:"blobHashHex,omitempty"`
+	MigrationID      *string `json:"migrationId,omitempty"`
+	MigrationPayload *string `json:"migrationPayload,omitempty"`
 }
 
 type indexHintDto struct {

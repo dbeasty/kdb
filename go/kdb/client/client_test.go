@@ -446,3 +446,51 @@ func (denyAllEngine) Authenticate(_ context.Context, _ auth.Credentials) (auth.P
 func (denyAllEngine) Authorize(_ context.Context, _ auth.Principal, _ auth.Action) error {
 	return fmt.Errorf("denied")
 }
+
+// TestUpsertReturnsErrBusyOverRealWireWhenWriteQueueIsFull is an end-to-end regression test for
+// kdb-spec-layer13 Component 51 §8.1: a real client, over the real TCP wire protocol, must be
+// able to distinguish "busy, retry later" from a fatal error via errors.Is(err, client.ErrBusy) -
+// not by parsing the error string. Drives the server's write queue to capacity directly (rather
+// than raced concurrent commits, which would be nondeterministic about which one lands first)
+// to make the BUSY response deterministic.
+func TestUpsertReturnsErrBusyOverRealWireWhenWriteQueueIsFull(t *testing.T) {
+	addr, rt := startTestServer(t)
+	c := connectTestClient(t, addr)
+
+	rt.SetWriteQueueCapacityForTest(1)
+	release, err := rt.AcquireWriteSlotForTest() // occupies the single running slot
+	if err != nil {
+		t.Fatalf("expected to fill the running slot: %v", err)
+	}
+
+	blockedDone := make(chan struct{})
+	go func() {
+		// Occupies the single queued slot, blocked waiting for running to free up - bounded so
+		// this goroutine can never outlive the test even if something above is wrong.
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel2()
+		if r2, err := rt.AcquireWriteSlotWithContextForTest(ctx2); err == nil {
+			r2()
+		}
+		close(blockedDone)
+	}()
+	time.Sleep(200 * time.Millisecond) // let the goroutine actually occupy the queued slot
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	docID, err := randomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Upsert(ctx, "app/data", docID, []byte(`{"v":1}`))
+	if !errors.Is(err, client.ErrBusy) {
+		t.Fatalf("expected errors.Is(err, client.ErrBusy) while the write queue is full, got %T: %v", err, err)
+	}
+	var busyErr *client.BusyError
+	if !errors.As(err, &busyErr) {
+		t.Fatalf("expected a *client.BusyError, got %T", err)
+	}
+
+	release() // frees running - unblocks the goroutine's queued acquire, which then releases itself
+	<-blockedDone
+}

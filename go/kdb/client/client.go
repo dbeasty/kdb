@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -29,6 +30,73 @@ import (
 // first - the direct analogue of Zolik's match.ErrVersionConflict. Use errors.Is; unwrap a
 // *ConflictError from it with errors.As for detail.
 var ErrConflict = errors.New("kdb: version conflict")
+
+// ErrBusy is returned when the server cannot admit the request right now (a full write queue or
+// memory pressure - kdb-spec-layer13 Component 51 §8.1's BUSY code) but expects the same request
+// to succeed later. Use errors.Is; unwrap a *BusyError from it with errors.As for RetryAfter.
+var ErrBusy = errors.New("kdb: server busy")
+
+// ErrUnavailable is returned when the server is shutting down and cannot accept new work at all
+// right now (kdb-spec-layer13 Component 50's orderly abort, or a plain shutdown). Retry after
+// reconnecting - likely to a different, just-restarted server instance.
+var ErrUnavailable = errors.New("kdb: server unavailable")
+
+// ErrDeadlineExceeded is returned when the caller's own deadline passed before the server could
+// admit the request. Unlike ErrBusy, retrying with the same deadline is unlikely to help.
+var ErrDeadlineExceeded = errors.New("kdb: deadline exceeded")
+
+// BusyError wraps ErrBusy with the server's suggested retry delay. errors.Is(err, ErrBusy)
+// still works via Unwrap.
+type BusyError struct {
+	Message      string
+	RetryAfterMs int
+}
+
+func (e *BusyError) Error() string { return "kdb: " + e.Message }
+func (e *BusyError) Unwrap() error { return ErrBusy }
+
+// RetryAfter returns how long to wait before retrying, as a time.Duration.
+func (e *BusyError) RetryAfter() time.Duration {
+	return time.Duration(e.RetryAfterMs) * time.Millisecond
+}
+
+// UnavailableError wraps ErrUnavailable. errors.Is(err, ErrUnavailable) still works via Unwrap.
+type UnavailableError struct{ Message string }
+
+func (e *UnavailableError) Error() string { return "kdb: " + e.Message }
+func (e *UnavailableError) Unwrap() error { return ErrUnavailable }
+
+// DeadlineExceededError wraps ErrDeadlineExceeded. errors.Is(err, ErrDeadlineExceeded) still
+// works via Unwrap.
+type DeadlineExceededError struct{ Message string }
+
+func (e *DeadlineExceededError) Error() string { return "kdb: " + e.Message }
+func (e *DeadlineExceededError) Unwrap() error { return ErrDeadlineExceeded }
+
+// classifiedError builds the sentinel-wrapping error type matching code, so callers can use
+// errors.Is(err, client.ErrBusy) etc. rather than parsing errMsg's prose - kdb-spec-layer13
+// Component 51 §8.1. Falls back to a plain error carrying errMsg for a code this client version
+// doesn't recognize (e.g. an older client talking to a newer server) or when code is nil (an
+// older server that only ever sets Error).
+func classifiedError(errMsg string, code *wire.ErrorCode, retryAfterMs *int) error {
+	if code == nil {
+		return fmt.Errorf("kdb: %s", errMsg)
+	}
+	switch *code {
+	case wire.ErrorCodeBusy:
+		ms := 0
+		if retryAfterMs != nil {
+			ms = *retryAfterMs
+		}
+		return &BusyError{Message: errMsg, RetryAfterMs: ms}
+	case wire.ErrorCodeUnavailable:
+		return &UnavailableError{Message: errMsg}
+	case wire.ErrorCodeDeadlineExceeded:
+		return &DeadlineExceededError{Message: errMsg}
+	default:
+		return fmt.Errorf("kdb: %s", errMsg)
+	}
+}
 
 // ErrNotFound is returned by GetJSON when no document exists at the given id.
 var ErrNotFound = errors.New("kdb: not found")
@@ -371,7 +439,7 @@ func (c *Client) Upsert(ctx context.Context, ns string, docID string, jsonBody [
 		return "", fmt.Errorf("kdb: expected UpsertResult, got %T", reply)
 	}
 	if result.Error != nil {
-		return "", fmt.Errorf("kdb: %s", *result.Error)
+		return "", classifiedError(*result.Error, result.ErrorCode, result.RetryAfterMs)
 	}
 	return result.CommitHex, nil
 }
@@ -437,7 +505,7 @@ func (c *Client) commitTransaction(ctx context.Context, ns string, st *namespace
 		return "", decodeConflictError(r.ReportBytes)
 	case wire.SqlResultMessage:
 		if r.Error != nil {
-			return "", fmt.Errorf("kdb: %s", *r.Error)
+			return "", classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
 		}
 		newHead, err := codec.HashFromHex(r.ResolvedCommitHex)
 		if err != nil {

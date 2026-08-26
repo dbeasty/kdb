@@ -239,6 +239,8 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				ReadOnly:          m.ReadOnly,
 				Error:             m.Error,
 				GeneratedIDs:      m.GeneratedIDs,
+				ErrorCode:         m.ErrorCode,
+				RetryAfterMs:      m.RetryAfterMs,
 			},
 		}, nil
 	case TxCommitMessage:
@@ -523,6 +525,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			Columns: s.Columns, Rows: s.Rows, RowsAffected: s.RowsAffected,
 			ResolvedCommitHex: s.ResolvedCommitHex, ReadOnly: s.ReadOnly,
 			Error: s.Error, GeneratedIDs: s.GeneratedIDs,
+			ErrorCode: s.ErrorCode, RetryAfterMs: s.RetryAfterMs,
 		}, nil
 	case "txCommit":
 		c := env.TxCommit

@@ -27,25 +27,25 @@ type Header struct {
 type MessageType uint16
 
 const (
-	MsgHandshake MessageType = 0x01
-	MsgDeltaCommit MessageType = 0x02
-	MsgCommitFetch MessageType = 0x03
-	MsgCommitPush MessageType = 0x04
-	MsgDagDiff MessageType = 0x05
+	MsgHandshake         MessageType = 0x01
+	MsgDeltaCommit       MessageType = 0x02
+	MsgCommitFetch       MessageType = 0x03
+	MsgCommitPush        MessageType = 0x04
+	MsgDagDiff           MessageType = 0x05
 	MsgTransactionReplay MessageType = 0x06
-	MsgConflictReport MessageType = 0x07
-	MsgCompactionNotice MessageType = 0x08
-	MsgIceArchiveNotice MessageType = 0x09
-	MsgSnapshotRequest MessageType = 0x0A
-	MsgSnapshotResponse MessageType = 0x0B
-	MsgPositionAck MessageType = 0x0C
-	MsgSchemaPush MessageType = 0x0D
-	MsgSessionBegin MessageType = 0x0E
-	MsgSqlExec MessageType = 0x0F
-	MsgSqlResult MessageType = 0x10
-	MsgTxCommit MessageType = 0x11
-	MsgTxRollback MessageType = 0x12
-	MsgSessionBeginAck MessageType = 0x13
+	MsgConflictReport    MessageType = 0x07
+	MsgCompactionNotice  MessageType = 0x08
+	MsgIceArchiveNotice  MessageType = 0x09
+	MsgSnapshotRequest   MessageType = 0x0A
+	MsgSnapshotResponse  MessageType = 0x0B
+	MsgPositionAck       MessageType = 0x0C
+	MsgSchemaPush        MessageType = 0x0D
+	MsgSessionBegin      MessageType = 0x0E
+	MsgSqlExec           MessageType = 0x0F
+	MsgSqlResult         MessageType = 0x10
+	MsgTxCommit          MessageType = 0x11
+	MsgTxRollback        MessageType = 0x12
+	MsgSessionBeginAck   MessageType = 0x13
 
 	// Component 40 (Go Client SDK) additions: direct document get/upsert, bypassing SQL - the
 	// SQL_EXEC/INSERT path has no way to read or write one document by its own id (INSERT
@@ -451,6 +451,11 @@ type SqlResultMessage struct {
 	ReadOnly          bool
 	Error             *string
 	GeneratedIDs      []string
+	// ErrorCode and RetryAfterMs are additive to Error (kdb-spec-layer13 Component 51 §8.1): nil
+	// on any message an old server or a success response produces. Set only alongside a non-nil
+	// Error, to let a client decide whether/when to retry without parsing Error's prose.
+	ErrorCode    *ErrorCode
+	RetryAfterMs *int
 }
 
 func (m SqlResultMessage) Header() Header { return m.H }

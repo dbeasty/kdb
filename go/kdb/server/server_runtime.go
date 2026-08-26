@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -16,6 +17,15 @@ import (
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
+
+// DefaultWriteTimeout bounds how long a commit may wait queued behind other commits before
+// giving up with a *DeadlineExceededError - see writeGate. Deliberately short: a client that
+// hasn't heard back this long has likely already moved on (kdb-spec-layer13 Component 49 §6.2).
+const DefaultWriteTimeout = 5 * time.Second
+
+// DefaultMaxQueuedWrites bounds how many commits may be waiting at once before new ones are
+// rejected outright with *BusyError instead of joining an unbounded queue - see writeGate.
+const DefaultMaxQueuedWrites = 64
 
 // KdbServerRuntime wraps an embedded runtime with write coordination. One instance serves one
 // namespace (matching the Kotlin KdbServerRuntime's per-namespace TransactionEngine cache
@@ -48,18 +58,25 @@ type KdbServerRuntime struct {
 	// connections. Use Schema()/SetSchema() rather than touching Runtime.Schema directly.
 	schemaMu sync.RWMutex
 
-	// commitMu serializes calls into TransactionEngine.Commit. This is load-bearing, not
-	// just a convenience lock: transaction.Engine.Commit reads the DAG head, runs
-	// conflict detection against it, and only then appends the new commit - and
+	// writeGate serializes calls into TransactionEngine.Commit - the same load-bearing
+	// exclusion a bare sync.Mutex would give (transaction.Engine.Commit reads the DAG head,
+	// runs conflict detection against it, and only then appends the new commit -
 	// InMemoryCommitDag.AppendCommit advances the branch head unconditionally, with no
-	// compare-and-swap against the anchor it was given. Two goroutines that both read the
-	// same stale head concurrently would each append a commit parented on it, and the
-	// branch would silently end up pointing at whichever one finished last, orphaning the
-	// other from "main" instead of surfacing a conflict. Serializing Commit here closes
-	// that race for this server; any other caller that invokes Engine.Commit concurrently
-	// on a shared *InMemoryCommitDag without equivalent serialization has the same
-	// exposure (worth a follow-up in the transaction/dag packages themselves).
-	commitMu sync.Mutex
+	// compare-and-swap against the anchor it was given, so two goroutines racing on the same
+	// stale head would silently orphan one of them from "main" instead of surfacing a conflict),
+	// plus a bounded queue and a per-caller deadline a bare mutex can't express (see writeGate's
+	// own doc comment, kdb-spec-layer13 Component 49 §6.2 - "start only what we can finish"
+	// applied to time). Any other caller that invokes Engine.Commit concurrently on a shared
+	// *InMemoryCommitDag without equivalent serialization has the same exposure (worth a
+	// follow-up in the transaction/dag packages themselves).
+	writeGate *writeGate
+	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
+	// Defaults to DefaultWriteTimeout; safe to change at any time.
+	WriteTimeout time.Duration
+	// draining is set by an orderly shutdown (kdb-spec-layer13 Component 50) to reject every
+	// new write immediately with *UnavailableError, ahead of even the memory-pressure check -
+	// once draining, there is no budget left to spend on partial work.
+	draining atomic.Bool
 
 	// dag is the concrete DAG transaction.Engine's Commit/Replay/Merge/Validate require -
 	// unwrapped once here from Runtime.DAG, whether that's a bare *dag.InMemoryCommitDag (memory
@@ -108,6 +125,8 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		AuthEngine:        auth.AllowAll,
 		dag:               d,
 		persister:         persister,
+		writeGate:         newWriteGate(DefaultMaxQueuedWrites),
+		WriteTimeout:      DefaultWriteTimeout,
 	}
 	s.refCount.Store(1)
 	return s
@@ -128,12 +147,53 @@ func (s *KdbServerRuntime) SetSchema(sch schema.KdbSchema) {
 	s.Runtime.Schema = sch
 }
 
+// SetWriteQueueCapacityForTest replaces the write gate with one of the given queue capacity -
+// exported only for other packages' tests (e.g. go/kdb/client's end-to-end BUSY test) that need
+// to deterministically fill the queue over a real wire connection; production code should use
+// the constructor-provided default (DefaultMaxQueuedWrites) or set it via a future config surface
+// rather than calling this directly.
+func (s *KdbServerRuntime) SetWriteQueueCapacityForTest(maxQueued int) {
+	s.writeGate = newWriteGate(maxQueued)
+}
+
+// AcquireWriteSlotForTest occupies one write-gate slot (queue or running) exactly as commitWith
+// would, returning a release func - exported only for other packages' tests that need to drive
+// the gate to capacity from outside this package. Blocks (respecting no deadline) until a queue
+// slot is available; use a background goroutine plus a short sleep to occupy the running slot
+// first if the test needs a queued (not just running) waiter.
+func (s *KdbServerRuntime) AcquireWriteSlotForTest() (release func(), err error) {
+	return s.writeGate.acquire(context.Background())
+}
+
+// AcquireWriteSlotWithContextForTest is AcquireWriteSlotForTest with a caller-supplied context,
+// for tests that need a bounded wait instead of blocking forever.
+func (s *KdbServerRuntime) AcquireWriteSlotWithContextForTest(ctx context.Context) (release func(), err error) {
+	return s.writeGate.acquire(ctx)
+}
+
+// BeginDraining rejects every subsequent write immediately with *UnavailableError - the first
+// step of an orderly shutdown (kdb-spec-layer13 Component 50): stop admitting new work before
+// doing anything else, so nothing new can start while draining, flushing, and closing happen.
+// Idempotent; does not affect reads, and does not itself wait for in-flight writes to finish -
+// callers that need that should wait on their own tracking of outstanding commitWith calls, or
+// rely on WriteTimeout to bound how long any of them can still be running.
+func (s *KdbServerRuntime) BeginDraining() {
+	s.draining.Store(true)
+}
+
 // Retain increments the reference count.
 func (s *KdbServerRuntime) Retain() {
 	s.refCount.Add(1)
 }
 
-// Release decrements the reference count; v1 does not tear down storage.
+// Release decrements the reference count; once it reaches zero, stops the memory guard and
+// closes the underlying embedded runtime - flushing and sealing the active delta segment (see
+// EmbeddedKdbRuntime.Close, kdb-spec-layer13 Component 47 §4.5). This is what makes an ordinary
+// process shutdown (a service's SIGTERM handler calling Release, not just an orderly abort - see
+// AbortWatchdog) actually reach that flush/seal path, rather than the process exiting with
+// in-memory state never given the chance to leave the log in its cleanest, fastest-to-replay
+// shape (still safe to skip entirely - a kill -9 relies on the same replay path succeeding
+// without any of this having run - just slower on the next open).
 func (s *KdbServerRuntime) Release() {
 	if s.refCount.Add(-1) > 0 {
 		return
@@ -144,6 +204,9 @@ func (s *KdbServerRuntime) Release() {
 		return
 	}
 	s.memGuard.Stop()
+	if s.Runtime != nil {
+		s.Runtime.Close()
+	}
 }
 
 // SetMemoryLimit opts this runtime into memory-pressure backpressure: once heap usage crosses
@@ -197,9 +260,12 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 }
 
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
-	// Checked first, before authorization or taking commitMu: a server under memory pressure
-	// should shed load as cheaply as possible, not do more work per rejected request than
-	// necessary.
+	// Checked in cheapest-first order, before authorization or taking the write gate: a server
+	// shedding load should do as little work per rejected request as possible, and a rejection
+	// reason "closer to the front" (shutting down entirely) makes every later check moot anyway.
+	if s.draining.Load() {
+		return document.Commit{}, &UnavailableError{Reason: "server is shutting down"}
+	}
 	if s.memGuard.ShouldReject() {
 		return document.Commit{}, &MemoryPressureError{}
 	}
@@ -209,8 +275,17 @@ func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Tra
 	if s.dag == nil {
 		return document.Commit{}, fmt.Errorf("kdb server: commit requires an InMemoryCommitDag (or a wrapper exposing one), got %T", s.Runtime.DAG)
 	}
-	s.commitMu.Lock()
-	defer s.commitMu.Unlock()
+	timeout := s.WriteTimeout
+	if timeout <= 0 {
+		timeout = DefaultWriteTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	release, err := s.writeGate.acquire(ctx)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	defer release()
 	result, err := engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
 	if err != nil {
 		return document.Commit{}, err

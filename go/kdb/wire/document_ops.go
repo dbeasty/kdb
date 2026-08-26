@@ -41,6 +41,10 @@ type UpsertResultMessage struct {
 	Namespace string
 	CommitHex string
 	Error     *string
+	// ErrorCode and RetryAfterMs are additive to Error - see SqlResultMessage's identical fields'
+	// doc comment (kdb-spec-layer13 Component 51 §8.1).
+	ErrorCode    *ErrorCode
+	RetryAfterMs *int
 }
 
 func (m UpsertResultMessage) Header() Header { return m.H }
@@ -65,9 +69,11 @@ type upsertDto struct {
 }
 
 type upsertResultDto struct {
-	Namespace string  `json:"namespace"`
-	CommitHex string  `json:"commitHex"`
-	Error     *string `json:"error,omitempty"`
+	Namespace    string     `json:"namespace"`
+	CommitHex    string     `json:"commitHex"`
+	Error        *string    `json:"error,omitempty"`
+	ErrorCode    *ErrorCode `json:"errorCode,omitempty"`
+	RetryAfterMs *int       `json:"retryAfterMs,omitempty"`
 }
 
 func encodeDocumentOpMessage(msg Message) (payloadEnvelope, bool, error) {
@@ -87,6 +93,7 @@ func encodeDocumentOpMessage(msg Message) (payloadEnvelope, bool, error) {
 	case UpsertResultMessage:
 		return payloadEnvelope{Kind: "upsertResult", UpsertResult: &upsertResultDto{
 			Namespace: m.Namespace, CommitHex: m.CommitHex, Error: m.Error,
+			ErrorCode: m.ErrorCode, RetryAfterMs: m.RetryAfterMs,
 		}}, true, nil
 	default:
 		return payloadEnvelope{}, false, nil
@@ -120,7 +127,10 @@ func decodeDocumentOpMessage(header Header, env payloadEnvelope) (Message, bool,
 		if d == nil {
 			return nil, true, newDecodeError("missing upsertResult body")
 		}
-		return UpsertResultMessage{H: header, Namespace: d.Namespace, CommitHex: d.CommitHex, Error: d.Error}, true, nil
+		return UpsertResultMessage{
+			H: header, Namespace: d.Namespace, CommitHex: d.CommitHex, Error: d.Error,
+			ErrorCode: d.ErrorCode, RetryAfterMs: d.RetryAfterMs,
+		}, true, nil
 	default:
 		return nil, false, nil
 	}

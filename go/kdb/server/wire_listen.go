@@ -296,7 +296,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		Namespace:         msg.Namespace,
 		SessionID:         msg.SessionID,
 		Columns:           columnNames(result.Columns),
-		Rows:               rowsToStrings(result.Rows),
+		Rows:              rowsToStrings(result.Rows),
 		RowsAffected:      result.RowsAffected,
 		ResolvedCommitHex: head.Hex(),
 		ReadOnly:          true,
@@ -381,7 +381,7 @@ func (h *sqlWireConnHandler) handleTxCommit(msg wire.TxCommitMessage) wire.Messa
 				ReportBytes: reportBytes,
 			}
 		}
-		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
 	sess.BaseVersion = commit.Hash
 	return wire.SqlResultMessage{
@@ -479,7 +479,7 @@ func (h *sqlWireConnHandler) handleUpsert(msg wire.UpsertMessage) wire.Message {
 	}
 	commit, err := h.runtime.Upsert(msg.Namespace, docID, msg.JSON, h.principal)
 	if err != nil {
-		return upsertError(msg, err.Error())
+		return upsertErrorClassified(msg, err)
 	}
 	return wire.UpsertResultMessage{
 		H:         header(msg.H.CorrelationID, wire.MsgUpsertResult),
@@ -496,6 +496,23 @@ func upsertError(msg wire.UpsertMessage, errMsg string) wire.Message {
 	}
 }
 
+// upsertErrorClassified builds the same error response as upsertError, additionally populating
+// ErrorCode/RetryAfterMs from err's concrete type via classifyError - see that function's doc
+// comment (kdb-spec-layer13 Component 51 §8.1). Used at the one call site where err is a real
+// error value from KdbServerRuntime.Upsert, as opposed to the plain-string cases elsewhere in
+// this file (invalid docId, not authenticated) that have no typed error to classify.
+func upsertErrorClassified(msg wire.UpsertMessage, err error) wire.Message {
+	errMsg := err.Error()
+	code, retryAfterMs := classifyError(err)
+	return wire.UpsertResultMessage{
+		H:            header(msg.H.CorrelationID, wire.MsgUpsertResult),
+		Namespace:    msg.Namespace,
+		Error:        &errMsg,
+		ErrorCode:    &code,
+		RetryAfterMs: retryAfterMs,
+	}
+}
+
 func header(correlationID int, msgType wire.MessageType) wire.Header {
 	return wire.Header{MessageType: msgType, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: correlationID}
 }
@@ -507,6 +524,23 @@ func sqlResultError(correlationID int, namespace, sessionID, errMsg string) wire
 		SessionID: sessionID,
 		ReadOnly:  true,
 		Error:     &errMsg,
+	}
+}
+
+// sqlResultErrorClassified builds the same error response as sqlResultError, additionally
+// populating ErrorCode/RetryAfterMs from err's concrete type - see upsertErrorClassified's doc
+// comment; same reasoning, TxCommit's call site instead of Upsert's.
+func sqlResultErrorClassified(correlationID int, namespace, sessionID string, err error) wire.Message {
+	errMsg := err.Error()
+	code, retryAfterMs := classifyError(err)
+	return wire.SqlResultMessage{
+		H:            header(correlationID, wire.MsgSqlResult),
+		Namespace:    namespace,
+		SessionID:    sessionID,
+		ReadOnly:     true,
+		Error:        &errMsg,
+		ErrorCode:    &code,
+		RetryAfterMs: retryAfterMs,
 	}
 }
 

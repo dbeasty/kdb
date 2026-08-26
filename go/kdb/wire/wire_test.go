@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
-	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/document"
+	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
