@@ -137,6 +137,8 @@ func (h *sqlWireConnHandler) dispatch(message wire.Message) wire.Message {
 		return h.handleDocumentGet(msg)
 	case wire.UpsertMessage:
 		return h.handleUpsert(msg)
+	case wire.TransactionReplayMessage:
+		return h.handleTransactionReplay(msg)
 	default:
 		return nil
 	}
@@ -417,6 +419,53 @@ func (h *sqlWireConnHandler) handleTxRollback(msg wire.TxRollbackMessage) wire.M
 		Namespace:         msg.Namespace,
 		SessionID:         msg.SessionID,
 		ResolvedCommitHex: headHex,
+		ReadOnly:          false,
+	}
+}
+
+// handleTransactionReplay applies a Mode 2 (write-back stream) client's already-built
+// transaction directly onto the current head - the wire counterpart to
+// KdbServerRuntime.Replay, mirroring Kotlin's SqlWireHost.handleTransactionReplay exactly
+// (including ignoring msg.BaseVersion server-side and computing replayTarget independently from
+// this node's own current head - the Kotlin reference never reads that field either). No
+// session: unlike TxCommit, this isn't building on a session's pending statement builder, it's
+// one self-contained transaction the caller already fully built (go/kdb/stream's write-back
+// subscriber, once wired - component 40's Go client SDK doesn't need this path, it always has a
+// real BaseVersion and uses Commit/TxCommit instead).
+func (h *sqlWireConnHandler) handleTransactionReplay(msg wire.TransactionReplayMessage) wire.Message {
+	if !h.authenticated {
+		return sqlResultError(msg.H.CorrelationID, msg.Namespace, "", "not authenticated")
+	}
+	action := auth.TxCommitAction{Namespace: msg.Namespace}
+	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), h.principal, action); err != nil {
+		return sqlResultError(msg.H.CorrelationID, msg.Namespace, "", (&AuthorizationError{Cause: err}).Error())
+	}
+	tx, err := wire.DecodeTransaction(msg.TransactionBytes)
+	if err != nil {
+		return sqlResultError(msg.H.CorrelationID, msg.Namespace, "", "invalid transactionBytes: "+err.Error())
+	}
+	head, err := h.runtime.Runtime.DAG.Head()
+	if err != nil {
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, "", err)
+	}
+	commit, err := h.runtime.Replay(msg.Namespace, tx, head, h.principal)
+	if err != nil {
+		var conflictErr *ConflictError
+		if asError(err, &conflictErr) {
+			reportBytes, _ := json.Marshal(conflictErr.Report)
+			return wire.ConflictReportMessage{
+				H:           header(msg.H.CorrelationID, wire.MsgConflictReport),
+				Namespace:   msg.Namespace,
+				ReportBytes: reportBytes,
+			}
+		}
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, "", err)
+	}
+	return wire.SqlResultMessage{
+		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
+		Namespace:         msg.Namespace,
+		RowsAffected:      len(tx.Operations),
+		ResolvedCommitHex: commit.Hash.Hex(),
 		ReadOnly:          false,
 	}
 }

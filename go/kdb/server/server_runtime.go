@@ -259,7 +259,37 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 	return s.commitWith(s.UpsertEngine, tx, principal)
 }
 
+// Replay applies tx directly on top of the current head, ignoring tx.BaseVersion - the Mode 2
+// (write-back stream) counterpart to Commit, backing TransactionReplay (kdb-spec.md §8.5/§8.1's
+// Mode 2 definition). A write-back client has no independent local DAG to anchor optimistic
+// concurrency on, so unlike Commit there is no "did anything change since I read?" check -
+// matches transaction.Engine.Replay's own base==baseline==target==replayTarget shape (Kotlin's
+// DefaultTransactionEngine.replay is identical), and mirrors Kotlin's own
+// SqlWireHost.handleTransactionReplay/KdbServerRuntime.replay, which always replays onto
+// whatever the current head is at call time, computed by the caller (see wire_listen.go's
+// handleTransactionReplay) rather than trusting a client-supplied target.
+func (s *KdbServerRuntime) Replay(namespaceID string, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
+	_ = namespaceID
+	return s.replayWith(s.TransactionEngine, tx, replayTarget, principal)
+}
+
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
+	return s.runTransaction(tx, principal, func() (transaction.TransactionResult, error) {
+		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
+	})
+}
+
+func (s *KdbServerRuntime) replayWith(engine transaction.Engine, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
+	return s.runTransaction(tx, principal, func() (transaction.TransactionResult, error) {
+		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, "")
+	})
+}
+
+// runTransaction holds every cross-cutting concern Commit/Upsert/Replay share (draining,
+// memory-pressure rejection, authorization, the writeGate's serialization+timeout+backpressure,
+// and persisting a successful result) - call does only the one thing that differs between them:
+// which transaction.Engine method to invoke and with what target.
+func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal auth.Principal, call func() (transaction.TransactionResult, error)) (document.Commit, error) {
 	// Checked in cheapest-first order, before authorization or taking the write gate: a server
 	// shedding load should do as little work per rejected request as possible, and a rejection
 	// reason "closer to the front" (shutting down entirely) makes every later check moot anyway.
@@ -286,7 +316,7 @@ func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Tra
 		return document.Commit{}, err
 	}
 	defer release()
-	result, err := engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
+	result, err := call()
 	if err != nil {
 		return document.Commit{}, err
 	}

@@ -45,13 +45,18 @@ type Connection struct {
 	NamespaceID string
 	Mode        ClientMode
 	Position    func() *codec.Hash
+	// SubmitTransaction sends tx as a TransactionReplay frame and blocks until the coordinator
+	// responds or replayTimeout elapses - Mode 2 (write-back stream)'s write path (kdb-spec.md
+	// §8.1). Only meaningful when Mode is ClientWriteBack; a ClientReadOnly connection's
+	// coordinator has no obligation to accept a submitted transaction.
+	SubmitTransaction func(document.Transaction) ReplayResult
 }
 
 // ReplayResult is the outcome of submitting a transaction for replay.
 type ReplayResult struct {
-	Applied     *codec.Hash
-	Conflict    *kdberr.ConflictReport
-	Rejected    *string
+	Applied  *codec.Hash
+	Conflict *kdberr.ConflictReport
+	Rejected *string
 }
 
 // EventKind classifies stream subscriber events.
@@ -69,14 +74,14 @@ const (
 
 // Event is one subscriber lifecycle notification.
 type Event struct {
-	Kind          EventKind
-	Encoding      wire.PayloadEncoding
-	CommitHash    codec.Hash
-	HintCount     int
-	Boundary      codec.Hash
-	ArchiveLoc    string
-	OriginalHash  codec.Hash
-	Cause         error
+	Kind         EventKind
+	Encoding     wire.PayloadEncoding
+	CommitHash   codec.Hash
+	HintCount    int
+	Boundary     codec.Hash
+	ArchiveLoc   string
+	OriginalHash codec.Hash
+	Cause        error
 }
 
 // SubscriberState tracks one connected subscriber.
