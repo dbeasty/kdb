@@ -191,6 +191,30 @@ func (s *KdbServerRuntime) BeginDraining() {
 	s.draining.Store(true)
 }
 
+// IsDraining reports whether BeginDraining has been called - consulted by the admin endpoint's
+// /readyz so load balancers stop routing to a server that is refusing new writes.
+func (s *KdbServerRuntime) IsDraining() bool {
+	return s.draining.Load()
+}
+
+// WaitForWritesToDrain blocks until every already-admitted write has finished (the write gate
+// is empty) or timeout elapses, returning true if the gate quiesced in time. Call BeginDraining
+// first - without it, new writes keep being admitted and this can never settle. Polling (10ms)
+// rather than a broadcast keeps writeGate's acquire/release fast path untouched for the one
+// call site that only runs once per process shutdown.
+func (s *KdbServerRuntime) WaitForWritesToDrain(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.writeGate.quiesced() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // Retain increments the reference count.
 func (s *KdbServerRuntime) Retain() {
 	s.refCount.Add(1)

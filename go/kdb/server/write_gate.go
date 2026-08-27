@@ -55,6 +55,13 @@ func (g *writeGate) acquire(ctx context.Context) (release func(), err error) {
 	}
 }
 
+// quiesced reports whether no caller currently holds a queued or running slot - i.e. every
+// admitted write has finished. Only meaningful once new admissions are being rejected (see
+// KdbServerRuntime.BeginDraining), otherwise a new caller can arrive right after the check.
+func (g *writeGate) quiesced() bool {
+	return len(g.queued) == 0 && len(g.running) == 0
+}
+
 // BusyError means the server cannot admit this operation *right now*, but the same request is
 // expected to succeed later - retry after RetryAfterMs (kdb-spec-layer13 Component 51 §8.1's
 // BUSY code). Distinct from DeadlineExceededError: this is about the server's current state

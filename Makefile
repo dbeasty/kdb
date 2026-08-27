@@ -1,5 +1,9 @@
 .PHONY: test-go test-kotlin test-cross build-go build-kotlin
 
+# Single version source (see go/kdb/version). Release tags override: make build-go VERSION=v1.2.3
+VERSION ?= $(shell cat VERSION)
+GO_LDFLAGS := -X github.com/limidus/kdb/go/kdb/version.Version=$(VERSION)
+
 test-go:
 	cd go && go test -race ./...
 
@@ -15,9 +19,9 @@ test-cross: test-kotlin test-go
 	cd go && go test ./kdb/interop/... -v
 
 build-go:
-	cd go && go build -o bin/kdb ./cmd/kdb
-	cd go && go build -o bin/kdb-service ./cmd/kdb-service
-	cd go && go build -o bin/kdb-inspect ./cmd/kdb-inspect
+	cd go && go build -ldflags "$(GO_LDFLAGS)" -o bin/kdb ./cmd/kdb
+	cd go && go build -ldflags "$(GO_LDFLAGS)" -o bin/kdb-service ./cmd/kdb-service
+	cd go && go build -ldflags "$(GO_LDFLAGS)" -o bin/kdb-inspect ./cmd/kdb-inspect
 
 build-kotlin:
 	./gradlew build --no-daemon

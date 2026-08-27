@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/limidus/kdb/go/kdb/inspect"
+	"github.com/limidus/kdb/go/kdb/version"
 )
 
 func main() {
@@ -20,6 +21,9 @@ func main() {
 
 func run(args []string) error {
 	switch args[0] {
+	case "version", "--version":
+		fmt.Println(version.Version)
+		return nil
 	case "dump-wire":
 		return dumpWire(args[1:])
 	case "verify":

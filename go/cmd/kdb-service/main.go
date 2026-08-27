@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
+	"github.com/limidus/kdb/go/kdb/version"
 )
 
 // KdbServiceMain is a skeleton service entrypoint mirroring dev.kdb.service.KdbServiceMain.
@@ -38,6 +40,10 @@ func main() {
 	var abortAfter time.Duration
 	var tlsCert, tlsKey, tlsCA string
 	var tlsClientAuth bool
+	var adminAddr string
+	var drainTimeout time.Duration
+	var logLevel, logFormat string
+	var showVersion bool
 	fs.StringVar(&dataDir, "data-dir", "", "filesystem data root")
 	fs.BoolVar(&memory, "memory", false, "use in-memory runtime")
 	fs.StringVar(&namespace, "namespace", "demo/users", "default namespace")
@@ -51,7 +57,24 @@ func main() {
 	fs.StringVar(&tlsKey, "tls-key", "", "PEM private key file, paired with --tls-cert")
 	fs.StringVar(&tlsCA, "tls-ca", "", "PEM CA bundle to verify client certificates against - required by --tls-client-auth, optional (accept-but-don't-require) otherwise")
 	fs.BoolVar(&tlsClientAuth, "tls-client-auth", false, "require and verify a client certificate on every TLS connection (mTLS) - requires --tls-ca")
+	fs.StringVar(&adminAddr, "admin-addr", "", "operational HTTP endpoint (host:port) serving /healthz, /readyz, /metrics (Prometheus), /debug/vars, /debug/pprof - plain HTTP with no auth, so bind it to localhost or a private interface, never the public network (empty to disable)")
+	fs.DurationVar(&drainTimeout, "drain-timeout", 30*time.Second, "on SIGTERM/SIGINT, how long to wait for already-admitted writes to finish before closing storage anyway - new writes are rejected immediately either way, and storage stays crash-consistent even when the deadline is hit (the WAL/delta replay path covers whatever didn't get flushed)")
+	fs.StringVar(&logLevel, "log-level", "info", "minimum log level: debug, info, warn, error")
+	fs.StringVar(&logFormat, "log-format", "text", "log output format: text or json")
+	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
+
+	if showVersion {
+		fmt.Println(version.Version)
+		return
+	}
+
+	logger, err := buildLogger(logLevel, logFormat)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	slog.SetDefault(logger)
 
 	if dataDir == "" && !memory {
 		memory = true
@@ -190,6 +213,18 @@ func main() {
 		abortStatus = abortAfter.String()
 	}
 
+	var admin *server.AdminServer
+	adminStatus := "disabled"
+	if adminAddr != "" {
+		admin, err = server.NewAdminServer(adminAddr, srv)
+		if err != nil {
+			slog.Error("admin listen failed", "error", err)
+			os.Exit(1)
+		}
+		defer admin.Close()
+		adminStatus = fmt.Sprintf("enabled (%s)", admin.Addr())
+	}
+
 	tlsStatus := "disabled (plaintext)"
 	if tlsSettings != nil {
 		tlsStatus = "enabled"
@@ -197,15 +232,85 @@ func main() {
 			tlsStatus = "enabled (mTLS: client cert required)"
 		}
 	}
-	fmt.Printf("KDB service peer=%s stream=%s sql=%s tls=%s rbac=%s memory-limit=%s abort-after=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, tlsStatus, rbacStatus, memoryLimitStatus, abortStatus, namespace)
+	slog.Info("KDB service started",
+		"version", version.Version,
+		"peer", peerStatus,
+		"stream", streamStatus,
+		"sql", sqlStatus,
+		"admin", adminStatus,
+		"tls", tlsStatus,
+		"rbac", rbacStatus,
+		"memory_limit", memoryLimitStatus,
+		"abort_after", abortStatus,
+		"namespace", namespace,
+	)
+	if admin != nil {
+		admin.SetReady(true, "")
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	// An ordinary signal-driven shutdown, not a pressure-triggered abort: stop the watchdog
-	// first so it doesn't race this deliberate exit (see AbortWatchdog.Stop's own doc comment).
+	received := <-sig
+	slog.Info("shutdown signal received, draining", "signal", received.String(), "drain_timeout", drainTimeout.String())
+
+	// Orderly shutdown (kdb-finish-up-plan Phase 2.4), in this order:
+	// 1. Flip /readyz to 503 so load balancers stop sending new connections.
+	// 2. Stop the abort watchdog so it doesn't race this deliberate exit (see
+	//    AbortWatchdog.Stop's own doc comment).
+	// 3. BeginDraining - every new write is rejected immediately with *UnavailableError.
+	// 4. Close the data-plane listeners - no new connections at all.
+	// 5. Wait (bounded by --drain-timeout) for already-admitted writes to finish.
+	// 6. Release - flush and seal the delta segment, close storage.
+	// Storage stays crash-consistent even if step 5 times out: replay covers the rest.
+	if admin != nil {
+		admin.SetReady(false, "draining")
+	}
 	watchdog.Stop()
+	srv.BeginDraining()
+	if sqlListener != nil {
+		_ = sqlListener.Close()
+	}
+	if peerListener != nil {
+		_ = peerListener.Close()
+	}
+	if streamListener != nil {
+		_ = streamListener.Close()
+	}
+	if srv.WaitForWritesToDrain(drainTimeout) {
+		slog.Info("drain complete, closing storage")
+	} else {
+		slog.Warn("drain timeout hit with writes still in flight, closing storage anyway", "drain_timeout", drainTimeout.String())
+	}
 	srv.Release()
+	slog.Info("shutdown complete")
+}
+
+// buildLogger constructs the process-wide slog.Logger from --log-level/--log-format
+// (kdb-finish-up-plan Phase 2.5). Text is the default for a human watching a terminal; json for
+// log pipelines.
+func buildLogger(level, format string) (*slog.Logger, error) {
+	var lvl slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		return nil, fmt.Errorf("unknown --log-level %q (want debug, info, warn, or error)", level)
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	switch strings.ToLower(format) {
+	case "text":
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), nil
+	default:
+		return nil, fmt.Errorf("unknown --log-format %q (want text or json)", format)
+	}
 }
 
 // tlsSettingsFromFlags turns --tls-cert/--tls-key/--tls-ca/--tls-client-auth into

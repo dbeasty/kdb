@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/limidus/kdb/go/kdb/version"
 )
 
 // Config holds global CLI flags.
@@ -16,6 +18,10 @@ type Config struct {
 
 // Run is the kdb CLI entrypoint (mirrors dev.kdb.cli.KdbCli).
 func Run(args []string) int {
+	if len(args) == 1 && (args[0] == "version" || args[0] == "--version") {
+		fmt.Println(version.Version)
+		return 0
+	}
 	cfg, cmd, err := parseArgs(args)
 	if err != nil {
 		printUsage(os.Stderr)
