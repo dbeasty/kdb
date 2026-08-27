@@ -23,6 +23,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -97,12 +98,13 @@ func run(cmd string, args []string) error {
 	fs := flag.NewFlagSet("kdb-e2e-helper "+cmd, flag.ExitOnError)
 	var cf commonFlags
 	cf.register(fs)
-	var docID, jsonBody, sqlText, servers string
+	var docID, jsonBody, sqlText, servers, conflictPolicy string
 	var rounds int
 	fs.StringVar(&docID, "doc-id", "", "document id (32 hex chars)")
 	fs.StringVar(&jsonBody, "json", "", "document JSON body")
 	fs.StringVar(&sqlText, "sql", "", "SQL text")
 	fs.StringVar(&servers, "servers", "", "comma-separated server URIs for relay")
+	fs.StringVar(&conflictPolicy, "conflict-policy", "strict", "relay-side divergence policy: strict or last-write")
 	fs.IntVar(&rounds, "rounds", 1, "relay rounds over the server list")
 	_ = fs.Parse(args)
 
@@ -153,7 +155,7 @@ func run(cmd string, args []string) error {
 		}
 		return nil
 	case "relay":
-		return relay(cf, servers, rounds)
+		return relay(cf, servers, rounds, conflictPolicy)
 	case "load":
 		return load(ctx, cf, rounds)
 	case "tx-drop":
@@ -272,7 +274,15 @@ func txDrop(cf commonFlags, docID, jsonBody string) error {
 // relay acts as one full peer that connects to each listed server in order, running a
 // bidirectional sync with each - after enough rounds, every server converges on the union of
 // all servers' histories (transitive propagation through this peer's local in-memory replica).
-func relay(cf commonFlags, servers string, rounds int) error {
+func relay(cf commonFlags, servers string, rounds int, conflictPolicy string) error {
+	var policy transaction.ConflictPolicy
+	switch conflictPolicy {
+	case "", "strict":
+	case "last-write":
+		policy = transaction.ConflictPolicyLastWrite
+	default:
+		return fmt.Errorf("unknown --conflict-policy %q", conflictPolicy)
+	}
 	if cf.namespace == "" || servers == "" {
 		return fmt.Errorf("--namespace and --servers are required")
 	}
@@ -309,6 +319,7 @@ func relay(cf commonFlags, servers string, rounds int) error {
 				PeerURI:           uri,
 				ConnectionContext: connCtx,
 				TLS:               cf.tls(),
+				ConflictPolicy:    policy,
 				MaterializeCommit: func(commit document.Commit) error {
 					return embed.MaterializeCommit(rt.Storage, localDag, cf.namespace, commit)
 				},

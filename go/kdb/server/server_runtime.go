@@ -83,6 +83,14 @@ type KdbServerRuntime struct {
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.
 	WriteTimeout time.Duration
+	// PeerSyncConflictPolicy selects how the peer-sync listener resolves a same-document
+	// divergence pushed by a peer (see peersync.ResolutionOptions.Policy). Zero value
+	// (ConflictPolicyAppendOnly) keeps the safe default: disjoint-document histories
+	// auto-merge, same-document divergence returns a ConflictReport for the operator to
+	// resolve. Set ConflictPolicyLastWrite for symmetric later-timestamp-wins convergence
+	// (kdb-service's --peer-conflict-policy last-write).
+	PeerSyncConflictPolicy transaction.ConflictPolicy
+
 	// draining is set by an orderly shutdown (kdb-spec-layer13 Component 50) to reject every
 	// new write immediately with *UnavailableError, ahead of even the memory-pressure check -
 	// once draining, there is no budget left to spend on partial work.

@@ -257,23 +257,19 @@ func (s *defaultSession) PullMissing() (Result, error) {
 		return Result{}, err
 	}
 	// putCommit always stores every fetched commit, same as the push-receiving side - only the
-	// branch-pointer decision below is gated.
+	// branch-pointer decision below is gated. Materialization into live document storage is
+	// deferred until after that decision, exactly as in host.go's CommitPush handler: with no
+	// MVCC in the storage layer, materializing a fetched side branch immediately would mutate
+	// this node's visible documents even when the pull then resolves as a conflict (head
+	// unmoved) or as local-wins.
 	applied := 0
+	var fresh []document.Commit
 	for _, commit := range fetched {
 		if _, ok := s.dag.GetCommit(commit.Hash); ok {
 			continue
 		}
 		if err := s.dag.PutCommit(commit, true); err != nil {
 			return Result{}, err
-		}
-		// Without this, a commit pulled from a peer was reachable from the DAG (PutCommit above)
-		// but invisible to SqlExec/Query/GetDocument, since PutCommit only ever updates DAG
-		// bookkeeping, never storage - same gap host.go's CommitPush handling had before its own
-		// MaterializeCommit wiring, mirrored here for the pull direction.
-		if s.materialize != nil {
-			if err := s.materialize(commit); err != nil {
-				return Result{}, err
-			}
 		}
 		// Fixes kdb-spec-layer13 §2.2 client-side: without this, a commit pulled from a peer
 		// lived only in memory and vanished on restart of a file-backed node.
@@ -282,6 +278,7 @@ func (s *defaultSession) PullMissing() (Result, error) {
 				return Result{}, err
 			}
 		}
+		fresh = append(fresh, commit)
 		applied++
 	}
 	incomingHead := s.remoteHead
@@ -307,6 +304,17 @@ func (s *defaultSession) PullMissing() (Result, error) {
 	if outcome.MergeCommit != nil && s.persist != nil {
 		if err := s.persist(*outcome.MergeCommit); err != nil {
 			return Result{}, err
+		}
+	}
+	// Deferred materialization, mirroring host.go: FastForwarded applies the fetched commits
+	// oldest-first; Merged already wrote every remote-touched document's winning state inside
+	// mergeNonConflicting; NoOp/Conflict leave live storage untouched alongside the unmoved
+	// head.
+	if outcome.Kind == OutcomeFastForwarded && s.materialize != nil {
+		for _, commit := range fresh {
+			if err := s.materialize(commit); err != nil {
+				return Result{}, err
+			}
 		}
 	}
 	finalHead, err := s.dag.Head()

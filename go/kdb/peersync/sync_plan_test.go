@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // TestCommitsToPushIncludesMergeCommitsBothParents is the regression test for the
@@ -63,5 +65,44 @@ func TestCommitsToPushIncludesMergeCommitsBothParents(t *testing.T) {
 	}
 	if _, hasGenesis := byHash[genesis]; hasGenesis {
 		t.Fatal("push includes the shared genesis commit")
+	}
+}
+
+// TestLastWriteMergeCommitCarriesTheWinningWrite: when the LOCAL side wins a LAST_WRITE
+// divergence, the auto-merge commit must still carry the winning write as one of its own
+// operations. Omitting it (the previous behavior) was self-consistent on the node creating the
+// merge but not on peers: they materialize the pushed commits oldest-first, so the losing raw
+// commit lands after the winner and a no-op merge leaves them on the loser's content - observed
+// live as direction-dependent winners in the e2e same-document conflict scenario.
+func TestLastWriteMergeCommitCarriesTheWinningWrite(t *testing.T) {
+	const ns = "lw/ns"
+	local, _ := forkTwoSides(t, ns)
+	genesis, _ := local.dag.Head()
+
+	docID, _ := codec.RandomUUID()
+	// Local write is LATER (wins); remote write earlier (loses).
+	localTip := writeDocAt(t, local, ns, genesis, docID, `{"winner":"local"}`, codec.TimestampFromEpochMicros(2_000))
+	remoteTip := writeDocAt(t, local, ns, genesis, docID, `{"winner":"remote"}`, codec.TimestampFromEpochMicros(1_000))
+
+	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localTip.Hash, remoteTip.Hash, ResolutionOptions{
+		Policy: transaction.ConflictPolicyLastWrite,
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if outcome.Kind != OutcomeMerged || outcome.MergeCommit == nil {
+		t.Fatalf("expected merged outcome, got %+v", outcome)
+	}
+	var found bool
+	for _, op := range outcome.MergeCommit.Operations {
+		if w, ok := op.(document.WriteOp); ok && w.DocID == docID {
+			found = true
+			if w.Patch != `{"winner":"local"}` {
+				t.Fatalf("merge op carries the losing write: %s", w.Patch)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("merge commit carries no operation for the conflicted document - peers materializing it keep the loser's content")
 	}
 }

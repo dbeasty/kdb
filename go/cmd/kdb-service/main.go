@@ -20,6 +20,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/version"
 )
@@ -34,6 +35,8 @@ func main() {
 	flagVals := config.DefaultServiceSettings()
 	var configPath string
 	var showVersion bool
+	var peerConflictPolicy string
+	fs.StringVar(&peerConflictPolicy, "peer-conflict-policy", "strict", "how the peer-sync listener resolves a same-document divergence pushed by a peer: strict (report a conflict, never silently resolve - default) or last-write (later timestamp wins symmetrically on every node)")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
 	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
 	fs.BoolVar(&flagVals.Memory, "memory", flagVals.Memory, "use in-memory runtime")
@@ -123,6 +126,16 @@ func main() {
 	}
 
 	srv := server.NewKdbServerRuntime(rt)
+
+	switch peerConflictPolicy {
+	case "", "strict":
+		// default: report same-document divergence, never silently resolve
+	case "last-write":
+		srv.PeerSyncConflictPolicy = transaction.ConflictPolicyLastWrite
+	default:
+		fmt.Fprintf(os.Stderr, "Error: unknown --peer-conflict-policy %q (want strict or last-write)\n", peerConflictPolicy)
+		os.Exit(2)
+	}
 
 	memoryLimitStatus := "disabled"
 	if memoryLimitMB > 0 {

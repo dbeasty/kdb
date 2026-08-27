@@ -78,8 +78,9 @@ type peerSyncConnHandler struct {
 
 func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespaceID string) *peerSyncConnHandler {
 	cfg := peersync.HostConfig{
-		NamespaceID: namespaceID,
-		NodeID:      "kdb-service-go",
+		NamespaceID:    namespaceID,
+		NodeID:         "kdb-service-go",
+		ConflictPolicy: runtime.PeerSyncConflictPolicy,
 		MaterializeCommit: func(commit document.Commit) error {
 			return embed.MaterializeCommit(runtime.Runtime.Storage, runtime.dag, namespaceID, commit)
 		},
