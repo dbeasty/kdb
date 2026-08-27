@@ -2,6 +2,7 @@ package tcp
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/url"
@@ -48,6 +49,24 @@ func (t *defaultTransport) Connect(uri string) (stream.ConnectionHandle, error) 
 	if parsed.Bind {
 		return nil, fmt.Errorf("connect URI must not use bind=true: %s", uri)
 	}
+	// Validated before dialing, not after: a tcps:// caller with no usable TLS settings should
+	// get the same clear "TLS settings required" error every time, not one that depends on
+	// whether the target host happened to be reachable - dialing first, then finding out TLS
+	// was never actually configured, means the error message an operator sees is whichever of
+	// the two failures the network happened to hit first.
+	var tlsCfg *tls.Config
+	if parsed.Secure {
+		tlsCfg, err = t.options.TLS.BuildTLSConfig(false)
+		if err != nil {
+			return nil, err
+		}
+		if tlsCfg == nil {
+			return nil, fmt.Errorf("kdb: tcps:// connect requires TLS settings (enabled, with at least a CA or InsecureSkipVerify) - refusing to fall back to plaintext")
+		}
+		if tlsCfg.ServerName == "" {
+			tlsCfg.ServerName = parsed.Host
+		}
+	}
 	dialer := net.Dialer{Timeout: timeoutFromMs(t.options.ConnectTimeoutMs)}
 	conn, err := dialer.Dial("tcp", net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port)))
 	if err != nil {
@@ -56,7 +75,28 @@ func (t *defaultTransport) Connect(uri string) (stream.ConnectionHandle, error) 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
+	if parsed.Secure {
+		tlsConn, err := tlsClientHandshake(conn, tlsCfg)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		conn = tlsConn
+	}
 	return newSocketConnection(conn, t.options), nil
+}
+
+// tlsClientHandshake wraps conn (already TCP-connected) in a TLS client handshake using cfg -
+// conn is dialed raw first, not via tls.DialWithDialer, so SetNoDelay above still applies to the
+// underlying socket before the handshake starts. Explicitly calling HandshakeContext (rather
+// than letting the first Read/Write trigger it lazily) fails fast: a Connect call should report
+// a bad cert/CA immediately, not on the first unrelated read.
+func tlsClientHandshake(conn net.Conn, cfg *tls.Config) (net.Conn, error) {
+	tlsConn := tls.Client(conn, cfg)
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+	return tlsConn, nil
 }
 
 func (t *defaultTransport) Listen(ctx context.Context, uri string, handler func(stream.ConnectionHandle)) error {
@@ -75,7 +115,23 @@ func (t *defaultTransport) ListenBound(uri string) (net.Listener, error) {
 	if !parsed.Bind {
 		return nil, fmt.Errorf("listen URI requires bind=true: %s", uri)
 	}
-	return net.Listen("tcp", net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port)))
+	ln, err := net.Listen("tcp", net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port)))
+	if err != nil {
+		return nil, err
+	}
+	if !parsed.Secure {
+		return ln, nil
+	}
+	cfg, err := t.options.TLS.BuildTLSConfig(true)
+	if err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
+	if cfg == nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("kdb: tcps:// listen requires TLS settings (enabled, with CertFile/KeyFile) - refusing to fall back to plaintext: %s", uri)
+	}
+	return tls.NewListener(ln, cfg), nil
 }
 
 func (t *defaultTransport) Serve(ctx context.Context, ln net.Listener, handler func(stream.ConnectionHandle)) error {
@@ -94,10 +150,22 @@ func (t *defaultTransport) Serve(ctx context.Context, ln net.Listener, handler f
 				return err
 			}
 		}
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-		}
+		setNoDelay(conn)
 		go handler(newSocketConnection(conn, t.options))
+	}
+}
+
+// setNoDelay reaches through a *tls.Conn (via NetConn, Go 1.21+) to the raw *net.TCPConn
+// underneath when conn is TLS-wrapped, so a TLS listener's accepted connections get the same
+// TCP_NODELAY treatment as a plaintext one - tls.NewListener's Accept returns *tls.Conn, which
+// isn't itself a *net.TCPConn, so the naive type assertion silently no-ops for every TLS
+// connection otherwise.
+func setNoDelay(conn net.Conn) {
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		conn = tlsConn.NetConn()
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
 	}
 }
 
@@ -208,13 +276,19 @@ func timeoutFromMs(ms int64) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-// ParseURI parses tcp://host:port?bind=true wire transport URIs.
+// ParseURI parses tcp://host:port?bind=true (or tcps://... for TLS) wire transport URIs. The
+// scheme is the sole, authoritative source of whether a connection is secured - mirroring
+// kdb/transport/ws's ws://+wss:// split - so a caller can never end up silently downgraded to
+// plaintext by a misconfigured or ignored options field: a tcps:// URI without usable TLS
+// settings is a hard connect/listen error (see Transport.Connect/ListenBound), never a silent
+// fallback.
 func ParseURI(raw string) (TransportURI, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return TransportURI{}, err
 	}
-	if u.Scheme != "tcp" && u.Scheme != "kdb+tcp" {
+	secure := u.Scheme == "tcps" || u.Scheme == "kdb+tcps"
+	if u.Scheme != "tcp" && u.Scheme != "kdb+tcp" && !secure {
 		return TransportURI{}, fmt.Errorf("unsupported scheme: %s", u.Scheme)
 	}
 	host := u.Hostname()
@@ -229,12 +303,13 @@ func ParseURI(raw string) (TransportURI, error) {
 		}
 	}
 	bind := u.Query().Get("bind") == "true"
-	return TransportURI{Host: host, Port: port, Bind: bind}, nil
+	return TransportURI{Host: host, Port: port, Bind: bind, Secure: secure}, nil
 }
 
 // TransportURI is a parsed TCP transport URI.
 type TransportURI struct {
-	Host string
-	Port int
-	Bind bool
+	Host   string
+	Port   int
+	Bind   bool
+	Secure bool
 }

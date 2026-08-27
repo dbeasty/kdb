@@ -27,7 +27,15 @@ import (
 // for every connected subscriber - wire it via KdbServerRuntime.CommitListener (see that field's
 // doc comment) to fire automatically on every write, the way go/cmd/kdb-service does.
 func ListenStream(addr string, runtime *KdbServerRuntime, namespaceID string) (*StreamHub, *Listener, error) {
-	transport := tcp.NewTransport(core.DefaultConnectOptions())
+	return ListenStreamTLS(addr, runtime, namespaceID, nil)
+}
+
+// ListenStreamTLS is ListenStream with TLS settings for a tcps:// addr - see
+// core.TransportTlsSettings. Pass nil for plaintext (equivalent to ListenStream).
+func ListenStreamTLS(addr string, runtime *KdbServerRuntime, namespaceID string, tlsSettings *core.TransportTlsSettings) (*StreamHub, *Listener, error) {
+	opts := core.DefaultConnectOptions()
+	opts.TLS = tlsSettings
+	transport := tcp.NewTransport(opts)
 	ln, err := transport.ListenBound(addr)
 	if err != nil {
 		return nil, nil, err

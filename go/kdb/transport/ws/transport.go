@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -58,11 +59,25 @@ func (t *defaultTransport) ConnectWithOptions(uri string, options core.Transport
 	if err != nil {
 		return nil, err
 	}
-	if parsed.Secure {
-		return nil, fmt.Errorf("websocket connect: wss:// not yet implemented for %s:%d", parsed.Host, parsed.Port)
-	}
 	if options.MaxFrameBytes == 0 {
 		options = core.DefaultConnectOptions()
+	}
+	// Validated before dialing, not after: a wss:// caller with no usable TLS settings should
+	// get the same clear "TLS settings required" error every time, not one that depends on
+	// whether the target host happened to be reachable (see kdb/transport/tcp.Connect's
+	// identical ordering, and its doc comment, for the full reasoning).
+	var tlsCfg *tls.Config
+	if parsed.Secure {
+		tlsCfg, err = options.TLS.BuildTLSConfig(false)
+		if err != nil {
+			return nil, err
+		}
+		if tlsCfg == nil {
+			return nil, fmt.Errorf("kdb: wss:// connect requires TLS settings (enabled, with at least a CA or InsecureSkipVerify) - refusing to fall back to plaintext")
+		}
+		if tlsCfg.ServerName == "" {
+			tlsCfg.ServerName = parsed.Host
+		}
 	}
 	addr := netJoin(parsed.Host, parsed.Port)
 	rawConn, err := net.DialTimeout("tcp", addr, timeoutFromMs(options.ConnectTimeoutMs))
@@ -72,12 +87,33 @@ func (t *defaultTransport) ConnectWithOptions(uri string, options core.Transport
 	if tc, ok := rawConn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
-	conn, err := performClientHandshake(rawConn, parsed.Host, parsed.Port, parsed.Path, options)
+	var handshakeConn net.Conn = rawConn
+	if parsed.Secure {
+		tlsConn, err := tlsClientHandshake(rawConn, tlsCfg)
+		if err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
+		handshakeConn = tlsConn
+	}
+	conn, err := performClientHandshake(handshakeConn, parsed.Host, parsed.Port, parsed.Path, options)
 	if err != nil {
-		_ = rawConn.Close()
+		_ = handshakeConn.Close()
 		return nil, err
 	}
 	return conn, nil
+}
+
+// tlsClientHandshake wraps rawConn (already TCP-connected) in a TLS client handshake using cfg,
+// for wss://. Explicitly calling HandshakeContext (rather than letting the first Read/Write
+// trigger it lazily inside performClientHandshake) fails fast on a bad cert/CA, before any HTTP
+// upgrade bytes are sent.
+func tlsClientHandshake(rawConn net.Conn, cfg *tls.Config) (net.Conn, error) {
+	tlsConn := tls.Client(rawConn, cfg)
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+	return tlsConn, nil
 }
 
 func (t *defaultTransport) Listen(ctx context.Context, uri string, options core.TransportConnectOptions, handler func(stream.ConnectionHandle)) error {

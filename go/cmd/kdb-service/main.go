@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transport/core"
 )
 
 // KdbServiceMain is a skeleton service entrypoint mirroring dev.kdb.service.KdbServiceMain.
@@ -34,6 +36,8 @@ func main() {
 	var rbac bool
 	var memoryLimitMB int
 	var abortAfter time.Duration
+	var tlsCert, tlsKey, tlsCA string
+	var tlsClientAuth bool
 	fs.StringVar(&dataDir, "data-dir", "", "filesystem data root")
 	fs.BoolVar(&memory, "memory", false, "use in-memory runtime")
 	fs.StringVar(&namespace, "namespace", "demo/users", "default namespace")
@@ -43,6 +47,10 @@ func main() {
 	fs.BoolVar(&rbac, "rbac", false, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
 	fs.IntVar(&memoryLimitMB, "memory-limit-mb", 0, "reject new writes (rather than risk an OS OOM-kill under sustained load) once process memory nears this budget; rejection triggers at 85% of this value, so set this to 60-80% of the container's actual --memory limit - 80% carries no throughput cost over 60% but do not go above 80% until kdb-spec-layer13 Component 48's full admission control lands, since a burst of already-admitted writes between the guard's periodic samples can still outrun a trip point that close to the real ceiling - see docs/benchmarks/lightsail-sim/README.md for the numbers behind that guidance. 0 disables (default)")
 	fs.DurationVar(&abortAfter, "abort-after", 0, "if memory pressure (see --memory-limit-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
+	fs.StringVar(&tlsCert, "tls-cert", "", "PEM certificate file - set together with --tls-key to require TLS on the SQL/peer-sync/stream listeners (each --*-addr's scheme is upgraded from tcp:// to tcps:// automatically)")
+	fs.StringVar(&tlsKey, "tls-key", "", "PEM private key file, paired with --tls-cert")
+	fs.StringVar(&tlsCA, "tls-ca", "", "PEM CA bundle to verify client certificates against - required by --tls-client-auth, optional (accept-but-don't-require) otherwise")
+	fs.BoolVar(&tlsClientAuth, "tls-client-auth", false, "require and verify a client certificate on every TLS connection (mTLS) - requires --tls-ca")
 	_ = fs.Parse(os.Args[1:])
 
 	if dataDir == "" && !memory {
@@ -53,10 +61,18 @@ func main() {
 		os.Exit(2)
 	}
 
-	var (
-		rt  *embed.EmbeddedKdbRuntime
-		err error
-	)
+	tlsSettings, err := tlsSettingsFromFlags(tlsCert, tlsKey, tlsCA, tlsClientAuth)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	if tlsSettings != nil {
+		sqlAddr = secureScheme(sqlAddr)
+		peerAddr = secureScheme(peerAddr)
+		streamAddr = secureScheme(streamAddr)
+	}
+
+	var rt *embed.EmbeddedKdbRuntime
 	if memory {
 		catalog := embed.CatalogFromNamespace(namespace)
 		rt, err = embed.OpenMemoryRuntime(catalog, namespace, schema.None())
@@ -108,7 +124,7 @@ func main() {
 	sqlStatus := "disabled"
 	var sqlListener *server.Listener
 	if sqlAddr != "" {
-		sqlListener, err = server.ListenSqlWire(sqlAddr, srv)
+		sqlListener, err = server.ListenSqlWireTLS(sqlAddr, srv, tlsSettings)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: sql wire listen: %v\n", err)
 			os.Exit(1)
@@ -118,7 +134,7 @@ func main() {
 	}
 	var peerListener *server.Listener
 	if peerAddr != "" {
-		peerListener, err = server.ListenPeerSync(peerAddr, srv, namespace)
+		peerListener, err = server.ListenPeerSyncTLS(peerAddr, srv, namespace, tlsSettings)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: peer sync listen: %v\n", err)
 			os.Exit(1)
@@ -129,7 +145,7 @@ func main() {
 	var streamListener *server.Listener
 	if streamAddr != "" {
 		var hub *server.StreamHub
-		hub, streamListener, err = server.ListenStream(streamAddr, srv, namespace)
+		hub, streamListener, err = server.ListenStreamTLS(streamAddr, srv, namespace, tlsSettings)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: stream listen: %v\n", err)
 			os.Exit(1)
@@ -174,7 +190,14 @@ func main() {
 		abortStatus = abortAfter.String()
 	}
 
-	fmt.Printf("KDB service peer=%s stream=%s sql=%s rbac=%s memory-limit=%s abort-after=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, rbacStatus, memoryLimitStatus, abortStatus, namespace)
+	tlsStatus := "disabled (plaintext)"
+	if tlsSettings != nil {
+		tlsStatus = "enabled"
+		if tlsSettings.RequireClientAuth {
+			tlsStatus = "enabled (mTLS: client cert required)"
+		}
+	}
+	fmt.Printf("KDB service peer=%s stream=%s sql=%s tls=%s rbac=%s memory-limit=%s abort-after=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, tlsStatus, rbacStatus, memoryLimitStatus, abortStatus, namespace)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -183,6 +206,47 @@ func main() {
 	// first so it doesn't race this deliberate exit (see AbortWatchdog.Stop's own doc comment).
 	watchdog.Stop()
 	srv.Release()
+}
+
+// tlsSettingsFromFlags turns --tls-cert/--tls-key/--tls-ca/--tls-client-auth into
+// *core.TransportTlsSettings, or nil if TLS wasn't requested at all (--tls-cert and --tls-key
+// both empty). It only validates the flag combination here - BuildTLSConfig (called from inside
+// ListenSqlWireTLS/etc.) is what actually loads and validates the cert/key/CA files themselves,
+// so a bad path surfaces as a listen error naming which listener failed, not a generic startup
+// error before anything else has even been attempted.
+func tlsSettingsFromFlags(certFile, keyFile, caFile string, requireClientAuth bool) (*core.TransportTlsSettings, error) {
+	if certFile == "" && keyFile == "" && caFile == "" && !requireClientAuth {
+		return nil, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("--tls-cert and --tls-key must both be set to enable TLS")
+	}
+	if requireClientAuth && caFile == "" {
+		return nil, fmt.Errorf("--tls-client-auth requires --tls-ca, to verify a presented client certificate against")
+	}
+	return &core.TransportTlsSettings{
+		Enabled:           true,
+		CertFile:          certFile,
+		KeyFile:           keyFile,
+		CAFile:            caFile,
+		RequireClientAuth: requireClientAuth,
+	}, nil
+}
+
+// secureScheme upgrades a tcp://... or kdb+tcp://... listen URI to tcps://.../kdb+tcps://...
+// so operators don't have to remember to change --sql-addr/--peer-addr/--stream-addr's scheme
+// themselves whenever --tls-cert is set - the URI's scheme is still what
+// tcp.Transport.ListenBound actually checks (see kdb/transport/tcp's ParseURI), this just keeps
+// that in sync with the flags automatically instead of leaving a plaintext-by-typo footgun.
+func secureScheme(addr string) string {
+	switch {
+	case strings.HasPrefix(addr, "kdb+tcp://"):
+		return "kdb+tcps://" + strings.TrimPrefix(addr, "kdb+tcp://")
+	case strings.HasPrefix(addr, "tcp://"):
+		return "tcps://" + strings.TrimPrefix(addr, "tcp://")
+	default:
+		return addr
+	}
 }
 
 // multiCloser closes every listener in order, returning the first error encountered (closing

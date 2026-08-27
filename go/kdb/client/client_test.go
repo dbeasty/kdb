@@ -522,20 +522,11 @@ func TestConnectDialsOverWebSocketTransport(t *testing.T) {
 	}
 }
 
-// TestConnectRejectsWssScheme documents the honest current boundary: wss:// is refused outright
-// rather than silently downgraded to plaintext or attempted and failing confusingly deep inside
-// the TLS handshake - neither go/kdb/transport/ws nor go/kdb/transport/tcp implement TLS yet.
-func TestConnectRejectsWssScheme(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_, err := client.Connect(ctx, "wss://127.0.0.1:1/kdb", "")
-	if err == nil {
-		t.Fatal("expected wss:// to be rejected")
-	}
-	if !strings.Contains(err.Error(), "wss://") {
-		t.Fatalf("expected an explicit wss:// rejection message, got: %v", err)
-	}
-}
+// TestConnectRejectsWssScheme and TestConnectRejectsTcpsSchemeWithoutTLSOptions moved to
+// client_tls_test.go, now that wss:// (and tcps://) are real schemes with TLS options plumbed
+// through ConnectWithOptions (docs/kdb-finish-up-plan.md 2.1) - both still document that plain
+// Connect (no TLS options) against either secure scheme is a clear, immediate rejection, never a
+// confusing dial-time error or a silent plaintext fallback.
 
 func TestConnectRejectsUnsupportedScheme(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

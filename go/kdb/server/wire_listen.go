@@ -36,7 +36,15 @@ import (
 // ROLE/USER, GRANT/REVOKE) - go/kdb/sql's parser doesn't parse those statements yet, so
 // RegistryAuthStore's CRUD is Go-API-only for now, not reachable over SqlExec.
 func ListenSqlWire(addr string, runtime *KdbServerRuntime) (*Listener, error) {
-	transport := tcp.NewTransport(core.DefaultConnectOptions())
+	return ListenSqlWireTLS(addr, runtime, nil)
+}
+
+// ListenSqlWireTLS is ListenSqlWire with TLS settings for a tcps:// addr - see
+// core.TransportTlsSettings. Pass nil for plaintext (equivalent to ListenSqlWire).
+func ListenSqlWireTLS(addr string, runtime *KdbServerRuntime, tlsSettings *core.TransportTlsSettings) (*Listener, error) {
+	opts := core.DefaultConnectOptions()
+	opts.TLS = tlsSettings
+	transport := tcp.NewTransport(opts)
 	ln, err := transport.ListenBound(addr)
 	if err != nil {
 		return nil, err

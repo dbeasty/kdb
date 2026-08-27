@@ -38,10 +38,18 @@ import (
 // was updated (any TCP peer could CommitFetch/CommitPush the whole namespace), which the Kotlin
 // side had already closed. See docs/kdb-finish-up-plan.md's 1-G9.
 func ListenPeerSync(addr string, runtime *KdbServerRuntime, namespaceID string) (*Listener, error) {
+	return ListenPeerSyncTLS(addr, runtime, namespaceID, nil)
+}
+
+// ListenPeerSyncTLS is ListenPeerSync with TLS settings for a tcps:// addr - see
+// core.TransportTlsSettings. Pass nil for plaintext (equivalent to ListenPeerSync).
+func ListenPeerSyncTLS(addr string, runtime *KdbServerRuntime, namespaceID string, tlsSettings *core.TransportTlsSettings) (*Listener, error) {
 	if runtime.dag == nil {
 		return nil, fmt.Errorf("kdb server: peer sync requires an InMemoryCommitDag (or a wrapper exposing one), got %T", runtime.Runtime.DAG)
 	}
-	transport := tcp.NewTransport(core.DefaultConnectOptions())
+	opts := core.DefaultConnectOptions()
+	opts.TLS = tlsSettings
+	transport := tcp.NewTransport(opts)
 	ln, err := transport.ListenBound(addr)
 	if err != nil {
 		return nil, err

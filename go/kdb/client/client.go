@@ -178,16 +178,29 @@ type namespaceState struct {
 	head      codec.Hash
 }
 
+// ConnectOptions extends Connect with transport-level settings that don't belong in addr/token -
+// currently just TLS, for tcps:// and wss:// (see dialTransport's scheme table).
+type ConnectOptions struct {
+	TLS *core.TransportTlsSettings
+}
+
 // Connect dials addr (host:port, or a tcp://... wire URI) and performs the wire handshake.
 // token, if non-empty, authenticates as "user:secret" (matching wire.HandshakePayload.Token) -
 // pass "" against a server with no RBAC configured (auth.AllowAll). Blocks until the handshake
-// completes or ctx is cancelled.
+// completes or ctx is cancelled. Equivalent to ConnectWithOptions with a zero ConnectOptions
+// (plaintext only - see ConnectWithOptions for tcps:///wss://).
 func Connect(ctx context.Context, addr string, token string) (*Client, error) {
+	return ConnectWithOptions(ctx, addr, token, ConnectOptions{})
+}
+
+// ConnectWithOptions is Connect plus transport options (currently: TLS settings, required for a
+// tcps:// or wss:// addr - see dialTransport).
+func ConnectWithOptions(ctx context.Context, addr string, token string, opts ConnectOptions) (*Client, error) {
 	uri := addr
 	if !hasScheme(uri) {
 		uri = "tcp://" + uri
 	}
-	transport, err := dialTransport(uri)
+	transport, err := dialTransport(uri, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -246,23 +259,26 @@ func hasScheme(uri string) bool {
 }
 
 // dialTransport picks the wire transport implementation by uri's scheme: tcp:// (the component
-// spec's original reuse target, and Connect's default for a bare host:port) or ws:// (component
-// 25's WebSocket transport - already real, already proven cross-language by go/kdb/interop's
-// Go-WS-client-against-JVM-server interop test, just not previously exposed as a choice here).
-// wss:// is deliberately rejected here rather than silently downgraded or attempted: neither
-// go/kdb/transport/ws nor go/kdb/transport/tcp implement TLS yet (ws.Transport.Connect already
-// returns its own explicit "wss:// not yet implemented" error for the scheme itself - this
-// covers the same scheme choice at the client-selection point, before a connection attempt).
-func dialTransport(uri string) (stream.Transport, error) {
+// spec's original reuse target, and Connect's default for a bare host:port), tcps:// (the same,
+// over TLS), ws:// (component 25's WebSocket transport - already real, already proven
+// cross-language by go/kdb/interop's Go-WS-client-against-JVM-server interop test), or wss://
+// (WebSocket over TLS). opts.TLS is only consulted for the two secure schemes - each transport's
+// own Connect refuses a tcps:///wss:// URI outright if it turns out unset or disabled, rather
+// than silently downgrading to plaintext.
+func dialTransport(uri string, opts ConnectOptions) (stream.Transport, error) {
+	connectOpts := core.DefaultConnectOptions()
+	connectOpts.TLS = opts.TLS
 	switch {
+	case strings.HasPrefix(uri, "tcps://"):
+		return tcp.NewTransport(connectOpts), nil
 	case strings.HasPrefix(uri, "tcp://"):
-		return tcp.NewTransport(core.DefaultConnectOptions()), nil
-	case strings.HasPrefix(uri, "ws://"):
-		return ws.NewTransport(core.DefaultConnectOptions()), nil
+		return tcp.NewTransport(connectOpts), nil
 	case strings.HasPrefix(uri, "wss://"):
-		return nil, fmt.Errorf("kdb: wss:// is not yet implemented (no transport in this codebase does TLS yet) - use ws:// or tcp://")
+		return ws.NewTransport(connectOpts), nil
+	case strings.HasPrefix(uri, "ws://"):
+		return ws.NewTransport(connectOpts), nil
 	default:
-		return nil, fmt.Errorf("kdb: unsupported scheme in %q (expected tcp://, ws://, or a bare host:port)", uri)
+		return nil, fmt.Errorf("kdb: unsupported scheme in %q (expected tcp://, tcps://, ws://, wss://, or a bare host:port)", uri)
 	}
 }
 
