@@ -29,7 +29,12 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Run full Kotlin test suite
-        run: ./gradlew test --no-daemon
+        # `test` alone only covers plain-kotlin.jvm-plugin modules - Kotlin Multiplatform
+        # modules (most of them) have jvmTest/jsTest/linuxX64Test instead, aggregated as
+        # allTests, which Gradle's `test` invocation never reaches (see the "MPP test-CI gap"
+        # finding in docs/kdb-finish-up-plan.md). macosArm64's tests only run on a macOS host,
+        # so they're implicitly skipped here (ubuntu-latest) rather than failing.
+        run: ./gradlew test allTests --no-daemon
 
   go-test:
     runs-on: ubuntu-latest

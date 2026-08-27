@@ -92,9 +92,20 @@ internal class NativeSegmentByteStore(private val root: Path) : SegmentByteStore
     }
 
     override suspend fun list(prefix: String): List<String> {
-        if (!fs.exists(root)) return emptyList()
+        // append() only writes into buffers (see above) - a real file only exists once
+        // flush()/markSealed() persists it - so a directory scan alone misses anything
+        // appended-to but not yet flushed. Union with the in-memory keys so a segment is listed
+        // as soon as it's been written to, matching JvmSegmentByteStore (whose append() writes
+        // straight through to a real file, so its own directory-scan-based list() doesn't need
+        // this - the two stores' listing had drifted out of sync with each other purely from
+        // this timing difference, not from any deliberate design decision).
         val out = mutableListOf<String>()
-        collect(root, "", prefix, out)
+        if (fs.exists(root)) collect(root, "", prefix, out)
+        mutex.withLock {
+            for (name in buffers.keys) {
+                if (name.startsWith(prefix) && name !in out) out.add(name)
+            }
+        }
         return out
     }
 

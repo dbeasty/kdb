@@ -8,15 +8,17 @@ import dev.kdb.storage.wal.WalAppendResult
 import dev.kdb.storage.wal.WalRecord
 import dev.kdb.storage.wal.WalRecoverySummary
 import dev.kdb.storage.wal.WriteAheadLog
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-/** Counts sync() calls without doing real I/O, so durability-mode tests assert on behavior directly. */
-private class FakeWal : WriteAheadLog {
+/**
+ * Counts sync() calls without doing real I/O, so durability-mode tests assert on behavior
+ * directly. internal, not private: shared with AsyncDurabilityJvmTest (jvmTest) - see that
+ * file's doc comment for why the ASYNC-durability cases live there instead of here.
+ */
+internal class FakeWal : WriteAheadLog {
     override val walId: KdbUuid = KdbUuid.random()
     override val partitionKey: String = "fake"
     override val lastSequence: Long get() = seq
@@ -77,37 +79,9 @@ class DurabilityTest {
             assertEquals("check", engine.readBlob(hash)?.decodeToString())
         }
 
-    // Uses runBlocking rather than runTest's virtual clock: the
-    // background sync loop runs on a real Dispatchers.Default thread
-    // with real delay(), so this test needs wall-clock time to actually
-    // pass for it to fire.
-    @Test
-    fun asyncDurability_syncsOnTimerNotPerWrite() =
-        runBlocking {
-            val wal = FakeWal()
-            val engine = ServerStorageEngine("ns", config(Durability.ASYNC, asyncIntervalMs = 20), wal)
-            repeat(50) { engine.writeBlob(byteArrayOf(it.toByte())) }
-            assertEquals(0, wal.syncCalls, "async writes must not sync inline")
-
-            delay(80)
-            assertTrue(wal.syncCalls > 0, "expected at least one background sync after waiting")
-            assertTrue(wal.syncCalls < 50, "expected batching, not one sync per write")
-            engine.stopAsyncSync()
-        }
-
-    @Test
-    fun stopAsyncSync_flushesOnShutdown() =
-        runBlocking {
-            val wal = FakeWal()
-            val engine =
-                ServerStorageEngine(
-                    "ns",
-                    config(Durability.ASYNC, asyncIntervalMs = 60_000), // effectively never fires on its own
-                    wal,
-                )
-            engine.writeBlob("x".encodeToByteArray())
-            assertEquals(0, wal.syncCalls)
-            engine.stopAsyncSync()
-            assertTrue(wal.syncCalls > 0, "expected a final flush on stopAsyncSync")
-        }
+    // The ASYNC-durability cases (background timer actually firing, stopAsyncSync's final
+    // flush) moved to AsyncDurabilityJvmTest in jvmTest: they need real wall-clock delay() on a
+    // real Dispatchers.Default thread to observe the background sync loop fire, which runTest's
+    // virtual clock can't drive (that loop runs on its own independent CoroutineScope, not
+    // runTest's), and runBlocking - the natural fit here - has no JS implementation at all.
 }
