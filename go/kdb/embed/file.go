@@ -126,6 +126,18 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	return rt, nil
 }
 
+// LockDataDir takes dataRoot's exclusive directory lock - the same lock OpenFileRuntime holds -
+// and returns its release func. For maintenance tooling (kdb-inspect verify/repair/restore/
+// backup) that must not run concurrently with a live writer: holding this proves no service or
+// embedded runtime has the directory open, and blocks one from starting mid-operation.
+func LockDataDir(dataRoot string) (release func(), err error) {
+	lock, err := acquireDirLock(dataRoot)
+	if err != nil {
+		return nil, err
+	}
+	return lock.Release, nil
+}
+
 func ensureNamespaceDirs(dataRoot, namespaceID string) error {
 	nsDir := filepath.Join(dataRoot, "ns", namespaceID)
 	for _, sub := range []string{"", "delta", "meta"} {

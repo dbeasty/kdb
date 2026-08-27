@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/limidus/kdb/go/kdb/backup"
+	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/recovery"
 )
 
@@ -24,10 +27,17 @@ func restoreCmd(args []string) error {
 	namespace := argValue(args, "--namespace")
 	outDir := argValue(args, "--out")
 	sourceArgs := argValues(args, "--source")
-	if namespace == "" || outDir == "" || len(sourceArgs) == 0 {
-		return fmt.Errorf("usage: kdb-inspect restore --namespace NS --out DIR --source LABEL=PATH [--source LABEL=PATH ...] [--codec zstd|none]\n" +
+	fromBackup := argValue(args, "--from-backup")
+	backupID := argValue(args, "--backup-id")
+	if namespace == "" || outDir == "" || (len(sourceArgs) == 0 && fromBackup == "") {
+		return fmt.Errorf("usage: kdb-inspect restore --namespace NS --out DIR [--source LABEL=PATH ...] [--from-backup DIR|s3 --backup-id ID] [--codec zstd|none]\n" +
 			"  Sources are read in the order given; a damaged local data directory and a\n" +
-			"  backup directory are both just paths - list both to hybrid-restore.")
+			"  backup directory are both just paths - list both to hybrid-restore.\n" +
+			"  --from-backup fetches a manifest-verified backup (see kdb-inspect backup) and\n" +
+			"  adds it as a source; combine with --source local=... for a hybrid restore.")
+	}
+	if (fromBackup == "") != (backupID == "") {
+		return fmt.Errorf("--from-backup and --backup-id must be given together")
 	}
 	comp, err := parseCompression(argValue(args, "--codec"))
 	if err != nil {
@@ -47,6 +57,34 @@ func restoreCmd(args []string) error {
 		sources = append(sources, recovery.Source{Label: label, Shim: shim})
 	}
 
+	if fromBackup != "" {
+		store, err := backupStore(fromBackup)
+		if err != nil {
+			return err
+		}
+		fetchDir, err := os.MkdirTemp("", "kdb-backup-fetch-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(fetchDir)
+		m, err := backup.FetchToDir(store, namespace, backupID, fetchDir)
+		if err != nil {
+			return fmt.Errorf("fetching backup %s: %w", backupID, err)
+		}
+		fmt.Printf("fetched backup %s (%d commits) as restore source\n", m.BackupID, m.CommitCount)
+		shim, err := openDirShim(fetchDir)
+		if err != nil {
+			return err
+		}
+		sources = append(sources, recovery.Source{Label: "backup:" + backupID, Shim: shim})
+	}
+
+	// Hold the out dir's lock while writing into it, so a service can't open it mid-restore.
+	release, err := embed.LockDataDir(outDir)
+	if err != nil {
+		return fmt.Errorf("locking %s: %w", outDir, err)
+	}
+	defer release()
 	outShim, err := openDirShim(outDir)
 	if err != nil {
 		return err

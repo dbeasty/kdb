@@ -54,6 +54,69 @@ func (r *ReplicaSink) DeleteSnapshot(key string) error {
 	return r.blobs.Delete(context.Background(), r.snapshotKey(key))
 }
 
+// GetSegment reads a previously-mirrored segment back from S3 - the read-back half that makes
+// the sink a restorable backup target rather than a write-only mirror (kdb-finish-up-plan
+// Phase 2.11).
+func (r *ReplicaSink) GetSegment(segmentName string) ([]byte, error) {
+	return r.blobs.Get(context.Background(), r.segmentKey(segmentName))
+}
+
+// ListSegments lists mirrored segment keys under namePrefix (relative to the sink's own
+// prefix), returning them with the sink prefix stripped so they match the names PutSegment took.
+func (r *ReplicaSink) ListSegments(namePrefix string) ([]string, error) {
+	keys, err := r.blobs.List(context.Background(), r.prefix+namePrefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, strings.TrimPrefix(k, r.prefix))
+	}
+	return out, nil
+}
+
+// ReadSnapshot reads a previously-written snapshot back.
+func (r *ReplicaSink) ReadSnapshot(key string) ([]byte, error) {
+	return r.blobs.Get(context.Background(), r.snapshotKey(key))
+}
+
+// Objects exposes the sink's bucket+prefix as a plain object store (Put/Get/Delete/List with
+// the sink prefix applied) - the shape kdb/backup's ObjectStore expects, so `kdb-inspect
+// backup` can target the same bucket the replica sink mirrors into.
+func (r *ReplicaSink) Objects() *PrefixedStore {
+	return &PrefixedStore{blobs: r.blobs, prefix: r.prefix}
+}
+
+// PrefixedStore is a BlobStore view with a fixed key prefix.
+type PrefixedStore struct {
+	blobs  BlobStore
+	prefix string
+}
+
+func (p *PrefixedStore) Put(ctx context.Context, key string, data []byte) error {
+	return p.blobs.Put(ctx, p.prefix+key, data)
+}
+
+func (p *PrefixedStore) Get(ctx context.Context, key string) ([]byte, error) {
+	return p.blobs.Get(ctx, p.prefix+key)
+}
+
+func (p *PrefixedStore) Delete(ctx context.Context, key string) error {
+	return p.blobs.Delete(ctx, p.prefix+key)
+}
+
+func (p *PrefixedStore) List(ctx context.Context, prefix string) ([]string, error) {
+	keys, err := p.blobs.List(ctx, p.prefix+prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, strings.TrimPrefix(k, p.prefix))
+	}
+	return out, nil
+}
+
 // MemoryBlobStore is an in-memory BlobStore for tests.
 type MemoryBlobStore struct {
 	mu   sync.Mutex
