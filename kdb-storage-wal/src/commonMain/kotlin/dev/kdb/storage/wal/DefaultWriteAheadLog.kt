@@ -121,17 +121,21 @@ public class DefaultWriteAheadLog internal constructor(
 
     override suspend fun recover(handler: suspend (WalRecord) -> Unit): WalRecoverySummary {
         val bytes = readFullSegment()
-        val records = WalCodec.decodeRecords(bytes, partitionKey, segmentName, skipCorrupt)
+        val decoded = WalCodec.decodeRecords(bytes, partitionKey, segmentName, skipCorrupt)
         var replayed = 0L
         var maxSeq = 0L
-        for (r in records.sortedBy { it.sequence }) {
+        for (r in decoded.records.sortedBy { it.sequence }) {
             handler(r)
             replayed++
             if (r.sequence > maxSeq) maxSeq = r.sequence
         }
-        sequenceCounter = maxSeq
-        segmentSize = bytes.size.toLong()
-        return WalRecoverySummary(replayed, 0, maxSeq, 1)
+        // sequenceCounter/segmentSize are also touched by append()/truncate() under [mutex] -
+        // mutate them under the same lock rather than racing a concurrent caller of those.
+        mutex.withLock {
+            sequenceCounter = maxSeq
+            segmentSize = bytes.size.toLong()
+        }
+        return WalRecoverySummary(replayed, decoded.skippedCorrupt, maxSeq, 1)
     }
 
     override suspend fun truncate(truncateThroughSequence: Long) {
@@ -139,7 +143,26 @@ public class DefaultWriteAheadLog internal constructor(
             if (truncateThroughSequence >= sequenceCounter) {
                 ioShim.deleteSegment(segmentName)
                 segmentSize = 0
+                return@withLock
             }
+            if (truncateThroughSequence <= 0) return@withLock
+            // Partial truncate: the segment is append-only with no in-place trim, so rewrite it
+            // from scratch keeping only records past the requested sequence. Previously this
+            // branch didn't exist at all - any partial truncateThroughSequence silently did
+            // nothing, so the WAL never shrank until every last record was superseded.
+            val bytes = readFullSegment()
+            val decoded = WalCodec.decodeRecords(bytes, partitionKey, segmentName, skipCorrupt)
+            val kept = decoded.records.filter { it.sequence > truncateThroughSequence }
+            val encoded = kept.map { WalCodec.encodeRecord(it) }
+            val rewritten = ByteArray(encoded.sumOf { it.size })
+            var pos = 0
+            for (e in encoded) {
+                e.copyInto(rewritten, pos)
+                pos += e.size
+            }
+            ioShim.deleteSegment(segmentName)
+            if (rewritten.isNotEmpty()) ioShim.appendToSegment(segmentName, rewritten)
+            segmentSize = rewritten.size.toLong()
         }
     }
 

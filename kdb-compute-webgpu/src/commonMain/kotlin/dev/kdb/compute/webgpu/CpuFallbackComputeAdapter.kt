@@ -71,7 +71,7 @@ internal class CpuFallbackComputeAdapter : ComputeAdapter {
                 var nb = 0f
                 for (i in query.indices) {
                     dot += query[i] * vector[i]
-                    na += query[i] * vector[i]
+                    na += query[i] * query[i]
                     nb += vector[i] * vector[i]
                 }
                 val d = sqrt(na) * sqrt(nb)

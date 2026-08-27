@@ -201,9 +201,18 @@ public class SqlWireHost(
             return sqlError(msg, "DDL not allowed inside a transaction")
         }
         try {
+            // Authorize against session.namespaceId, not msg.namespace: msg.namespace is
+            // client-supplied and unvalidated, while execution below always runs against
+            // session.namespaceId (fixed at SessionBegin, when it was actually authorized). A
+            // client whose session was legitimately opened against namespace A but who only
+            // holds an exec/write grant on namespace B could otherwise pass B in msg.namespace
+            // and have this check wrongly authorize a statement that actually executes against
+            // A - not every write op gets a secondary per-document check (writeAuthorizerFor
+            // treats KdbOp.SchemaMigration as unauthorizable-here, so DDL like CREATE TABLE in
+            // autocommit mode has no other gate at all).
             sqlAuth.authorize(
                 session.principal,
-                AuthAction.SqlExec(msg.namespace, readOnly = !sqlRequiresWrite(parsed)),
+                AuthAction.SqlExec(session.namespaceId, readOnly = !sqlRequiresWrite(parsed)),
             )
         } catch (e: Throwable) {
             return sqlError(msg, sqlAuth.authFailureMessage(e))
@@ -383,7 +392,9 @@ public class SqlWireHost(
             sessions.get(msg.sessionId)
                 ?: return sqlError(msg, "unknown session: ${msg.sessionId}")
         try {
-            sqlAuth.authorize(session.principal, AuthAction.TxCommit(msg.namespace))
+            // Same reasoning as handleSqlExec above: authorize the namespace actually being
+            // committed to (session.namespaceId), not the client-supplied msg.namespace.
+            sqlAuth.authorize(session.principal, AuthAction.TxCommit(session.namespaceId))
         } catch (e: Throwable) {
             return sqlError(msg, sqlAuth.authFailureMessage(e))
         }

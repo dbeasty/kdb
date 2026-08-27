@@ -229,9 +229,10 @@ public class DefaultDeltaSegmentReader(
                 e.partialCommits
             }
         val zero = KdbHash.fromBytes(ByteArray(32))
+        val segmentId = deterministicSegmentId(namespaceId, seq)
         if (scanned.isEmpty()) {
             return DeltaSegmentRef(
-                segmentId = KdbUuid.random(),
+                segmentId = segmentId,
                 namespaceId = namespaceId,
                 firstCommitHash = zero,
                 lastCommitHash = zero,
@@ -241,7 +242,7 @@ public class DefaultDeltaSegmentReader(
             )
         }
         return DeltaSegmentRef(
-            segmentId = KdbUuid.random(),
+            segmentId = segmentId,
             namespaceId = namespaceId,
             firstCommitHash = scanned.first().commitHash,
             lastCommitHash = scanned.last().commitHash,
@@ -251,8 +252,25 @@ public class DefaultDeltaSegmentReader(
         )
     }
 
+    /**
+     * The segment's true identity - the random [KdbUuid] a [DefaultDeltaSegmentWriter] picks at
+     * creation time - is never persisted to the segment file itself, so a later scan (e.g. after
+     * a process restart) has no way to recover it. Previously this minted a fresh
+     * [KdbUuid.random] on every single scan instead, which - since consumers like
+     * `DeltaLogTierRegistry` key their state by `segmentId` - silently discarded that state on
+     * every rescan. [sequenceNumber] *is* stable across scans (it's parsed straight from the
+     * file name) and already unique within a namespace, so derive a deterministic id from it
+     * instead: same (namespaceId, sequenceNumber) always maps to the same id, and different
+     * sequence numbers within one namespace never collide (namespaceId only needs to keep
+     * different namespaces' identically-numbered segments apart, so a checksum of it is enough).
+     */
+    private fun deterministicSegmentId(namespaceId: String, sequenceNumber: Long): KdbUuid {
+        val namespaceCrc = Crc32.of(namespaceId.encodeToByteArray()).toLong() and 0xFFFFFFFFL
+        return KdbUuid(msb = namespaceCrc, lsb = sequenceNumber)
+    }
+
     private suspend fun readEntireSegment(segmentName: String): ByteArray =
-        ioShim.readFromSegment(segmentName, 0, Int.MAX_VALUE / 4)
+        ioShim.readFromSegment(segmentName, 0, 1 shl 28)
 }
 
 public class DeltaSegmentFactory(

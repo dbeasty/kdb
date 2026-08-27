@@ -21,6 +21,25 @@ public fun staticAuthEngineFromJson(json: String): AuthEngine =
 public fun staticAuthEngineFromFile(path: String): AuthEngine =
     staticAuthEngineFromJson(java.nio.file.Files.readString(java.nio.file.Path.of(path)))
 
+/**
+ * `!=` on two Strings short-circuits at the first differing character, so response time leaks
+ * how many leading characters of a guess matched - enough of a side channel to brute-force a
+ * static-config secret character-by-character over a network round trip (docs/kdb-finish-up-plan.md
+ * 1-K8). Compares every character regardless of where the two strings first diverge, and (like a
+ * proper MAC compare) still walks the longer string's full length even when the lengths differ,
+ * instead of returning early on a length mismatch.
+ */
+internal fun constantTimeEquals(a: String, b: String): Boolean {
+    val longer = if (a.length >= b.length) a else b
+    var diff = a.length xor b.length
+    for (i in longer.indices) {
+        val ca = if (i < a.length) a[i].code else 0
+        val cb = if (i < b.length) b[i].code else 0
+        diff = diff or (ca xor cb)
+    }
+    return diff == 0
+}
+
 private class StaticAuthEngine(
     config: StaticAuthConfig,
 ) : AuthEngine {
@@ -43,7 +62,7 @@ private class StaticAuthenticator(
         val entry =
             users[user]
                 ?: throw KdbAuthenticationException("unknown user: $user")
-        if (secret != entry.secret) {
+        if (!constantTimeEquals(secret, entry.secret)) {
             throw KdbAuthenticationException("invalid credentials for user: $user")
         }
         return Principal(id = user, roles = entry.roles.toSet())

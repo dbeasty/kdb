@@ -22,7 +22,9 @@ public class KdbServerRuntime(
     public val writeCoordinator: WriteCoordinator = WriteCoordinator(),
     public val documentLocks: DocumentLockManager = DocumentLockManager(),
 ) {
-    private val refCount = AtomicInteger(1)
+    // internal (not private): ServerRuntimeRegistry.release, in the same module, needs to read
+    // the post-release count to decide whether to evict its map entry - see its doc comment.
+    internal val refCount = AtomicInteger(1)
     private val closeMutex = Mutex()
     private val engineMutex = Mutex()
     private val engines = mutableMapOf<String, TransactionEngine>()
@@ -93,18 +95,37 @@ public object ServerRuntimeRegistry {
     private val mutex = Mutex()
     private val runtimes = mutableMapOf<String, KdbServerRuntime>()
 
+    /** Returns an existing runtime or opens a new one, retaining a reference for the caller
+     * either way - every successful call must be balanced by exactly one [release] of the same
+     * key. */
     public suspend fun getOrOpen(key: String, open: suspend () -> KdbServerRuntime): KdbServerRuntime =
         mutex.withLock {
-            runtimes.getOrPut(key) {
-                open().also { it.retain() }
-            }.also { it.retain() }
+            val existing = runtimes[key]
+            if (existing != null) {
+                existing.retain()
+                return@withLock existing
+            }
+            val rt = open()
+            // KdbServerRuntime already starts refCount at 1 - that implicit reference is this
+            // first caller's own, so no additional retain() belongs here. This used to retain an
+            // extra time on top of it (refCount 3 for the first caller, 2 for every later
+            // cache-hit caller, since the outer .also{it.retain()} applied unconditionally to
+            // both the hit and miss paths), so release() could never actually bring a fresh
+            // runtime's refCount down to zero.
+            runtimes[key] = rt
+            rt
         }
 
+    /** Releases one reference obtained from [getOrOpen]. Once the last outstanding reference is
+     * released (refCount reaches zero - see [KdbServerRuntime.release]), the entry is removed
+     * from the registry so a later [getOrOpen] for the same key reopens fresh rather than
+     * reusing an already-released, zero-refCount instance. */
     public suspend fun release(key: String) {
         mutex.withLock {
-            runtimes[key]?.release()
-            if (runtimes[key]?.let { true } == true) {
-                // keep entry until refCount zero — simplified v1: never evict
+            val rt = runtimes[key] ?: return@withLock
+            rt.release()
+            if (rt.refCount.get() <= 0) {
+                runtimes.remove(key)
             }
         }
     }

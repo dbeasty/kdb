@@ -8,6 +8,7 @@ import dev.kdb.auth.store.UserStore
 import dev.kdb.stream.WireConnection
 import dev.kdb.transport.core.TransportConnectOptions
 import dev.kdb.transport.ws.WebSocketWireTransport
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -44,6 +45,16 @@ public fun sqlWireHostFactory(
  * document locks forever. Both transports (WebSocket and TCP) route through this same function
  * (see the two `runSqlWireListen` overloads below and their TCP-transport equivalent), so fixing
  * it here covers both rather than duplicating the hook per transport.
+ *
+ * Each frame's [host.handleFrame] call is isolated: an uncaught exception there (a malformed
+ * frame `wire.decode` can't parse, an invalid enum string, a `require()` inside session setup,
+ * ...) is caught here rather than left to propagate out of its `launch`. Structured concurrency
+ * means an exception escaping a `launch` child cancels every *other* in-flight child under the
+ * same [coroutineScope] too - since different sessions pipeline concurrently on one connection
+ * (see the paragraph above), one malformed frame used to silently kill every other in-flight
+ * request on the same connection, not just its own. [CancellationException] is deliberately
+ * re-thrown rather than swallowed here: that's real cancellation (the scope shutting down, the
+ * connection closing), not a per-frame failure, and must still propagate normally.
  */
 public suspend fun pipelinedPerConnection(conn: WireConnection, host: SqlWireHost) {
     val sendMutex = Mutex()
@@ -51,7 +62,14 @@ public suspend fun pipelinedPerConnection(conn: WireConnection, host: SqlWireHos
         coroutineScope {
             conn.incoming().collect { frame ->
                 launch {
-                    val response = host.handleFrame(frame)
+                    val response =
+                        try {
+                            host.handleFrame(frame)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            null
+                        }
                     if (response != null) {
                         sendMutex.withLock { conn.send(response) }
                     }
