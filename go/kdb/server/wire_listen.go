@@ -165,6 +165,14 @@ func (h *sqlWireConnHandler) handleHandshake(msg wire.HandshakeMessage) wire.Mes
 		return handshakeAck(msg, false, "", &reason)
 	}
 	ns := defaultNamespaceFrom(msg.Request.Namespaces)
+	if ns == "" {
+		// A client with no single target namespace at handshake time (e.g. client.Connect,
+		// which opens per-namespace sessions lazily) is authorized against the server's
+		// default namespace - matching Kotlin's SqlWireHost.handleHandshake, and closing the
+		// hole where the check ran against the namespace "" (which no real grant names).
+		// Per-namespace authorization still happens at every SessionBegin.
+		ns = h.runtime.Runtime.DefaultNamespace
+	}
 	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.SessionBeginAction{Namespace: ns}); err != nil {
 		reason := err.Error()
 		return handshakeAck(msg, false, "", &reason)
@@ -177,6 +185,19 @@ func (h *sqlWireConnHandler) handleHandshake(msg wire.HandshakeMessage) wire.Mes
 	h.principal = principal
 	h.authenticated = true
 	return handshakeAck(msg, true, head.Hex(), nil)
+}
+
+// sessionBeginError is a rejected SessionBeginAck (empty SessionID) carrying an explicit error
+// string - Phase 2.7's explicit auth-failure frame, mirroring Kotlin's sessionBeginAuthError.
+func sessionBeginError(msg wire.SessionBeginMessage, errText string) wire.SessionBeginAckMessage {
+	return wire.SessionBeginAckMessage{
+		H:               header(msg.H.CorrelationID, wire.MsgSessionBeginAck),
+		Namespace:       msg.Namespace,
+		SessionID:       "",
+		HeadHex:         "",
+		ReadConsistency: msg.ReadConsistency,
+		Error:           &errText,
+	}
 }
 
 func defaultNamespaceFrom(namespaces []string) string {
@@ -210,22 +231,10 @@ func handshakeAck(msg wire.HandshakeMessage, accepted bool, headHex string, reje
 
 func (h *sqlWireConnHandler) handleSessionBegin(msg wire.SessionBeginMessage) wire.Message {
 	if !h.authenticated {
-		return wire.SessionBeginAckMessage{
-			H:               header(msg.H.CorrelationID, wire.MsgSessionBeginAck),
-			Namespace:       msg.Namespace,
-			SessionID:       "",
-			HeadHex:         "",
-			ReadConsistency: msg.ReadConsistency,
-		}
+		return sessionBeginError(msg, "not authenticated: handshake required before session begin")
 	}
 	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), h.principal, auth.SessionBeginAction{Namespace: msg.Namespace}); err != nil {
-		return wire.SessionBeginAckMessage{
-			H:               header(msg.H.CorrelationID, wire.MsgSessionBeginAck),
-			Namespace:       msg.Namespace,
-			SessionID:       "",
-			HeadHex:         "",
-			ReadConsistency: msg.ReadConsistency,
-		}
+		return sessionBeginError(msg, err.Error())
 	}
 	sessionID := ""
 	if msg.SessionID != nil {

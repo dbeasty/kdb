@@ -194,6 +194,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         sessionId = sessionId,
                         headHex = headHex,
                         readConsistency = readConsistency,
+                        error = error,
                     ),
             )
 
@@ -415,6 +416,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                 s.sessionId,
                 s.headHex,
                 s.readConsistency,
+                s.error,
             )
         }
 

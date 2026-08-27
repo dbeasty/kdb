@@ -261,6 +261,10 @@ public sealed class WireMessage {
         val sessionId: String,
         val headHex: String,
         val readConsistency: String,
+        // Set (with sessionId empty) when the session begin was rejected - the authentication
+        // or authorization failure a client should surface. Null on success and on frames from
+        // peers that predate the field.
+        val error: String? = null,
     ) : WireMessage()
 
     public data class SqlExec(

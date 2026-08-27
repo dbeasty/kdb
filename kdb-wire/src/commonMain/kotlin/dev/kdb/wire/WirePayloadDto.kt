@@ -150,6 +150,10 @@ internal data class SessionBeginAckDto(
     val sessionId: String,
     val headHex: String,
     val readConsistency: String,
+    // Explains a rejected session begin (empty sessionId). Nullable/defaulted so frames from
+    // peers that predate the field still decode; Go's sessionBeginAckDto carries the same
+    // optional field (coordinated change - kdb-finish-up-plan Phase 2.7).
+    val error: String? = null,
 )
 
 @Serializable

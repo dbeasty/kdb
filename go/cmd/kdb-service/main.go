@@ -26,6 +26,10 @@ import (
 
 // KdbServiceMain is a skeleton service entrypoint mirroring dev.kdb.service.KdbServiceMain.
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "user" {
+		os.Exit(runUserCommand(os.Args[2:]))
+	}
+
 	fs := flag.NewFlagSet("kdb-service", flag.ExitOnError)
 	flagVals := config.DefaultServiceSettings()
 	var configPath string
@@ -129,27 +133,38 @@ func main() {
 
 	rbacStatus := "disabled"
 	if rbac {
-		// In-memory registry only for now: file-backed durability (component 38 spec §7 test
-		// 9) is proven directly against RegistryAuthStore in go/kdb/auth's own tests, but
-		// wiring OpenFileRuntime's delta-log persistence into this CLI flag specifically is
-		// left as follow-on plumbing rather than rushed in here.
-		usersDag, err := dag.NewInMemoryCommitDag(auth.UsersNamespace)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: rbac users dag: %v\n", err)
-			os.Exit(1)
+		if dataDir != "" {
+			// Durable registry (Phase 2.7): users/roles live in the reserved _system/users and
+			// _system/roles namespaces under --data-dir, persisted through the same delta-log
+			// machinery as data namespaces. Bootstrap users with `kdb-service user create`
+			// (service stopped - the data-dir lock enforces that) before first start.
+			reg, err := embed.OpenFileAuthRegistry(dataDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac registry: %v\n", err)
+				os.Exit(1)
+			}
+			defer reg.Close()
+			srv.AuthEngine = auth.NewRegistryAuthEngine(reg.Store)
+			rbacStatus = "enabled (durable registry under --data-dir; bootstrap via `kdb-service user create`)"
+		} else {
+			usersDag, err := dag.NewInMemoryCommitDag(auth.UsersNamespace)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac users dag: %v\n", err)
+				os.Exit(1)
+			}
+			rolesDag, err := dag.NewInMemoryCommitDag(auth.RolesNamespace)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac roles dag: %v\n", err)
+				os.Exit(1)
+			}
+			store, err := auth.NewRegistryAuthStore(usersDag, rolesDag, mem.NewInMemoryStorageAdapter())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac registry: %v\n", err)
+				os.Exit(1)
+			}
+			srv.AuthEngine = auth.NewRegistryAuthEngine(store)
+			rbacStatus = "enabled (in-memory registry - users vanish on restart; use --data-dir for durability)"
 		}
-		rolesDag, err := dag.NewInMemoryCommitDag(auth.RolesNamespace)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: rbac roles dag: %v\n", err)
-			os.Exit(1)
-		}
-		store, err := auth.NewRegistryAuthStore(usersDag, rolesDag, mem.NewInMemoryStorageAdapter())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: rbac registry: %v\n", err)
-			os.Exit(1)
-		}
-		srv.AuthEngine = auth.NewRegistryAuthEngine(store)
-		rbacStatus = "enabled (in-memory registry, no users yet - use the Go API to create one)"
 	}
 
 	peerStatus := "disabled"

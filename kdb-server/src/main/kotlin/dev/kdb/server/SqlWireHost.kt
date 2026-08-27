@@ -670,7 +670,7 @@ public class SqlWireHost(
 
     private fun sessionBeginAuthError(
         msg: WireMessage.SessionBegin,
-        @Suppress("UNUSED_PARAMETER") error: String,
+        error: String,
     ): WireMessage.SessionBeginAck =
         WireMessage.SessionBeginAck(
             header(msg.header.correlationId, WireMessageType.SESSION_BEGIN_ACK),
@@ -678,5 +678,6 @@ public class SqlWireHost(
             sessionId = "",
             headHex = "",
             readConsistency = msg.readConsistency,
+            error = error,
         )
 }
