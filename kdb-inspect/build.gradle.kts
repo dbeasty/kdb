@@ -32,6 +32,8 @@ kotlin {
             implementation(project(":kdb-wire"))
             implementation(project(":kdb-compaction"))
             implementation(project(":kdb-index"))
+            implementation(project(":kdb-integrity"))
+            implementation(project(":kdb-recovery"))
             implementation(libs.kotlinx.serialization.json)
             implementation(libs.kotlinx.coroutines.core)
         }
