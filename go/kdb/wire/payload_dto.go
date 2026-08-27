@@ -1,5 +1,43 @@
 package wire
 
+import "encoding/json"
+
+// jsonByteArray is []byte with JSON marshaling overridden to match Kotlin's default
+// kotlinx.serialization behavior for a plain ByteArray field: a JSON array of numbers
+// (e.g. [1,2,3]), not Go's encoding/json default of a base64 string for []byte. Every DTO
+// field that crosses the wire to/from a Kotlin ByteArray (none of them carry a custom
+// @Serializable(with = ...) on the Kotlin side) must use this type instead of []byte, or a
+// real cross-language exchange fails outright: the JVM's strict decoder throws
+// JsonDecodingException on the unexpected string token and the connection is torn down
+// (see kdb/interop and kdb/client's *_interop_test.go, which caught this against a live JVM
+// server - go test ./... with no build tags never exercises real cross-language JSON, so
+// nothing else would have caught it).
+type jsonByteArray []byte
+
+func (b jsonByteArray) MarshalJSON() ([]byte, error) {
+	if len(b) == 0 {
+		return []byte("[]"), nil
+	}
+	ints := make([]int, len(b))
+	for i, v := range b {
+		ints[i] = int(v)
+	}
+	return json.Marshal(ints)
+}
+
+func (b *jsonByteArray) UnmarshalJSON(data []byte) error {
+	var ints []int
+	if err := json.Unmarshal(data, &ints); err != nil {
+		return err
+	}
+	out := make([]byte, len(ints))
+	for i, v := range ints {
+		out[i] = byte(v)
+	}
+	*b = out
+	return nil
+}
+
 type payloadEnvelope struct {
 	Kind              string                `json:"kind"`
 	Handshake         *handshakeDto         `json:"handshake,omitempty"`
@@ -62,7 +100,7 @@ type deltaCommitDto struct {
 	TimestampMicros  int64          `json:"timestampMicros"`
 	Operations       []opDto        `json:"operations"`
 	IndexHints       []indexHintDto `json:"indexHints"`
-	SchemaDeltaBytes []byte         `json:"schemaDeltaBytes,omitempty"`
+	SchemaDeltaBytes jsonByteArray  `json:"schemaDeltaBytes,omitempty"`
 }
 
 type commitFetchDto struct {
@@ -72,8 +110,8 @@ type commitFetchDto struct {
 }
 
 type commitPushDto struct {
-	Namespace      string `json:"namespace"`
-	CommitsPayload []byte `json:"commitsPayload"`
+	Namespace      string        `json:"namespace"`
+	CommitsPayload jsonByteArray `json:"commitsPayload"`
 }
 
 type commitPushAckDto struct {
@@ -89,14 +127,14 @@ type dagDiffDto struct {
 }
 
 type transactionReplayDto struct {
-	Namespace        string `json:"namespace"`
-	BaseVersionHex   string `json:"baseVersionHex"`
-	TransactionBytes []byte `json:"transactionBytes"`
+	Namespace        string        `json:"namespace"`
+	BaseVersionHex   string        `json:"baseVersionHex"`
+	TransactionBytes jsonByteArray `json:"transactionBytes"`
 }
 
 type conflictReportDto struct {
-	Namespace   string `json:"namespace"`
-	ReportBytes []byte `json:"reportBytes"`
+	Namespace   string        `json:"namespace"`
+	ReportBytes jsonByteArray `json:"reportBytes"`
 }
 
 type compactionNoticeDto struct {
@@ -118,10 +156,10 @@ type snapshotRequestDto struct {
 }
 
 type snapshotResponseDto struct {
-	Namespace     string `json:"namespace"`
-	AnchorHashHex string `json:"anchorHashHex"`
-	SnapshotBytes []byte `json:"snapshotBytes"`
-	Compressed    bool   `json:"compressed"`
+	Namespace     string        `json:"namespace"`
+	AnchorHashHex string        `json:"anchorHashHex"`
+	SnapshotBytes jsonByteArray `json:"snapshotBytes"`
+	Compressed    bool          `json:"compressed"`
 }
 
 type positionAckDto struct {
@@ -130,9 +168,9 @@ type positionAckDto struct {
 }
 
 type schemaPushDto struct {
-	Namespace   string `json:"namespace"`
-	SchemaBytes []byte `json:"schemaBytes"`
-	Revision    int64  `json:"revision"`
+	Namespace   string        `json:"namespace"`
+	SchemaBytes jsonByteArray `json:"schemaBytes"`
+	Revision    int64         `json:"revision"`
 }
 
 type sessionBeginDto struct {
@@ -173,9 +211,9 @@ type sqlResultDto struct {
 }
 
 type txCommitDto struct {
-	Namespace        string `json:"namespace"`
-	SessionID        string `json:"sessionId"`
-	TransactionBytes []byte `json:"transactionBytes"`
+	Namespace        string        `json:"namespace"`
+	SessionID        string        `json:"sessionId"`
+	TransactionBytes jsonByteArray `json:"transactionBytes"`
 }
 
 type txRollbackDto struct {

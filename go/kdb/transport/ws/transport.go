@@ -144,6 +144,7 @@ func performClientHandshake(conn net.Conn, host string, port int, path string, o
 		reader:        reader,
 		maxFrameBytes: maxFrameBytes,
 		incoming:      make(chan []byte, 32),
+		done:          make(chan struct{}),
 	}
 	go c.readLoop()
 	return c, nil
@@ -195,12 +196,23 @@ type wsConnection struct {
 	reader        *bufio.Reader
 	maxFrameBytes int
 	incoming      chan []byte
-	closed        bool
-	mu            sync.Mutex
-	writeMu       sync.Mutex
+	// done is closed exactly once, by Close, to unblock readLoop if it's currently blocked
+	// trying to deliver a frame on incoming (see readLoop's doc comment - same fix, same reason,
+	// as kdb/transport/tcp's socketConnection).
+	done    chan struct{}
+	closed  bool
+	mu      sync.Mutex
+	writeMu sync.Mutex
 }
 
+// readLoop is incoming's only sender and its only closer - see kdb/transport/tcp's
+// socketConnection.readLoop doc comment for the full reasoning (kdb-finish-up-plan.md's 1-G12/
+// 1-G13): a non-blocking `select ... default` send here silently dropped frames whenever a
+// consumer fell behind the 32-slot buffer, and Close closing incoming directly while this
+// goroutine could still be sending on it was a "send on closed channel" panic race. Blocking
+// on the send (interruptible via done) fixes both.
 func (c *wsConnection) readLoop() {
+	defer close(c.incoming)
 	for {
 		payload, err := c.readFrame()
 		if err != nil {
@@ -209,7 +221,8 @@ func (c *wsConnection) readLoop() {
 		}
 		select {
 		case c.incoming <- payload:
-		default:
+		case <-c.done:
+			return
 		}
 	}
 }
@@ -363,7 +376,7 @@ func (c *wsConnection) Close() error {
 		return nil
 	}
 	c.closed = true
-	close(c.incoming)
+	close(c.done)
 	return c.conn.Close()
 }
 

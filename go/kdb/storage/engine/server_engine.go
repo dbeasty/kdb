@@ -399,10 +399,10 @@ type defaultHandle struct {
 	deltaReader storage.DeltaSegmentReader
 }
 
-func (h *defaultHandle) NamespaceID() string                      { return h.namespaceID }
-func (h *defaultHandle) Adapter() storage.EvictableAdapter        { return h.adapter }
-func (h *defaultHandle) DeltaWriter() storage.DeltaSegmentWriter  { return h.deltaWriter }
-func (h *defaultHandle) DeltaReader() storage.DeltaSegmentReader  { return h.deltaReader }
+func (h *defaultHandle) NamespaceID() string                     { return h.namespaceID }
+func (h *defaultHandle) Adapter() storage.EvictableAdapter       { return h.adapter }
+func (h *defaultHandle) DeltaWriter() storage.DeltaSegmentWriter { return h.deltaWriter }
+func (h *defaultHandle) DeltaReader() storage.DeltaSegmentReader { return h.deltaReader }
 func (h *defaultHandle) Close() error {
 	if closer, ok := h.adapter.(interface{ Close() error }); ok {
 		return closer.Close()

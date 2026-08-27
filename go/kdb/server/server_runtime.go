@@ -440,7 +440,8 @@ func NewServerRuntimeRegistry() *ServerRuntimeRegistry {
 	return &ServerRuntimeRegistry{runtimes: make(map[string]*KdbServerRuntime)}
 }
 
-// GetOrOpen returns an existing runtime or opens a new one.
+// GetOrOpen returns an existing runtime or opens a new one, retaining a reference for the
+// caller either way - every successful call must be balanced by exactly one Release(key).
 func (r *ServerRuntimeRegistry) GetOrOpen(key string, open func() (*KdbServerRuntime, error)) (*KdbServerRuntime, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -452,17 +453,27 @@ func (r *ServerRuntimeRegistry) GetOrOpen(key string, open func() (*KdbServerRun
 	if err != nil {
 		return nil, err
 	}
-	rt.Retain()
+	// NewKdbServerRuntime already starts refCount at 1 - that single implicit reference is this
+	// first caller's own, so no additional Retain() belongs here. The previous code retained
+	// twice on top of it (refCount 3 for the first caller, 2 for every later cache-hit caller),
+	// so Release could never actually bring a runtime's refCount to zero.
 	r.runtimes[key] = rt
-	rt.Retain()
 	return rt, nil
 }
 
-// Release releases a registry entry reference.
+// Release releases a registry entry reference. Once the last outstanding reference is released
+// (refCount reaches zero - see KdbServerRuntime.Release, which also closes the underlying
+// runtime at that point), the entry is removed from the registry so a later GetOrOpen for the
+// same key reopens fresh rather than reusing an already-closed, zero-refCount instance.
 func (r *ServerRuntimeRegistry) Release(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if rt, ok := r.runtimes[key]; ok {
-		rt.Release()
+	rt, ok := r.runtimes[key]
+	if !ok {
+		return
+	}
+	rt.Release()
+	if rt.refCount.Load() <= 0 {
+		delete(r.runtimes, key)
 	}
 }

@@ -4,8 +4,8 @@ import (
 	"math"
 	"sort"
 
-	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/codec/schema"
+	kdberr "github.com/limidus/kdb/go/kdb/error"
 )
 
 func wireEncode(v Value, typ schema.Type, reg *schema.Registry) ([]byte, error) {

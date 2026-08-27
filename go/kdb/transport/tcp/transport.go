@@ -106,8 +106,11 @@ type socketConnection struct {
 	maxFrameBytes int
 	reader        *core.FrameStreamReader
 	incoming      chan []byte
-	closed        bool
-	mu            sync.Mutex
+	// done is closed exactly once, by Close, to unblock readLoop if it's currently blocked
+	// trying to deliver a frame on incoming (see readLoop's doc comment).
+	done   chan struct{}
+	closed bool
+	mu     sync.Mutex
 }
 
 func newSocketConnection(conn net.Conn, options core.TransportConnectOptions) *socketConnection {
@@ -120,12 +123,25 @@ func newSocketConnection(conn net.Conn, options core.TransportConnectOptions) *s
 		maxFrameBytes: max,
 		reader:        core.NewFrameStreamReader(max),
 		incoming:      make(chan []byte, 32),
+		done:          make(chan struct{}),
 	}
 	go c.readLoop()
 	return c
 }
 
+// readLoop is incoming's only sender and its only closer - both previous bugs here traced back
+// to that not being true. It used to send with `select { case incoming <- frame: default: }`,
+// silently dropping a frame whenever a consumer fell behind the 32-slot buffer (a lost request
+// on the server side, a lost reply on the client side - the caller then just blocks until its
+// own timeout). Blocking here instead applies real backpressure, but a blocking send needed a
+// way to be interrupted by Close() (called from another goroutine, or from readLoop's own error
+// paths below) without racing it - `done` is that: Close closes it once, this select then
+// returns instead of sending. incoming itself is only ever closed here, via the deferred call,
+// once this loop has permanently stopped trying to send on it - Close used to close incoming
+// directly while a concurrent send from this goroutine held no such guarantee, which could panic
+// with "send on closed channel".
 func (c *socketConnection) readLoop() {
+	defer close(c.incoming)
 	buf := make([]byte, 4096)
 	for {
 		n, err := c.conn.Read(buf)
@@ -138,7 +154,8 @@ func (c *socketConnection) readLoop() {
 			for _, frame := range frames {
 				select {
 				case c.incoming <- frame:
-				default:
+				case <-c.done:
+					return
 				}
 			}
 		}
@@ -171,7 +188,7 @@ func (c *socketConnection) Close() error {
 		return nil
 	}
 	c.closed = true
-	close(c.incoming)
+	close(c.done)
 	return c.conn.Close()
 }
 

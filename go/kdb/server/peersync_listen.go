@@ -31,9 +31,12 @@ import (
 // when the runtime is file-backed, matching ListenSqlWire's own durability contract
 // (kdb-spec-layer13 §2.2).
 //
-// RBAC is not enforced on this listener, matching the Kotlin reference: component 39 spec's own
-// Non-Goals defer "RBAC interaction" (its test 8) as a separate fix, not something this front
-// door needs to close.
+// RBAC IS enforced on this listener (peersync.frameHandler.authorizePeerSync, gated on
+// auth.PeerSyncAction), matching the Kotlin reference's PeerSyncFrameHandler. Component 39
+// spec's own Non-Goals once deferred "RBAC interaction" (its test 8) as a possibly-separate fix
+// - it wasn't: this front door had zero auth enforcement regardless of --rbac until this comment
+// was updated (any TCP peer could CommitFetch/CommitPush the whole namespace), which the Kotlin
+// side had already closed. See docs/kdb-finish-up-plan.md's 1-G9.
 func ListenPeerSync(addr string, runtime *KdbServerRuntime, namespaceID string) (*Listener, error) {
 	if runtime.dag == nil {
 		return nil, fmt.Errorf("kdb server: peer sync requires an InMemoryCommitDag (or a wrapper exposing one), got %T", runtime.Runtime.DAG)

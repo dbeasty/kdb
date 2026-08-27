@@ -188,7 +188,13 @@ func TestConcurrentCommitsRacingSameBaseVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base, err := c.PutJSON(ctx, "app/data", docID, []byte(`{"v":0}`))
+	// Seed with a value none of the racers below ever write (they write {"v":0}..{"v":7}) -
+	// KDB's conflict detection is content-addressed (kdb-spec.md: "the document is always the
+	// truth"), so a racer whose write happens to reproduce the seed's exact content is
+	// indistinguishable from a no-op and correctly slips through as "no conflict", which then
+	// masks the very race this test exists to prove. Seeding with -1 keeps every racer's write a
+	// real content change from the base.
+	base, err := c.PutJSON(ctx, "app/data", docID, []byte(`{"v":-1}`))
 	if err != nil {
 		t.Fatal(err)
 	}

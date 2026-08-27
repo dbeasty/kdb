@@ -37,8 +37,8 @@ func TestKotlinGoldenDocInt32(t *testing.T) {
 func TestKotlinGoldenPrimitives(t *testing.T) {
 	reg := schema.BuiltinRegistry()
 	cases := []struct {
-		file string
-		typ  schema.Type
+		file  string
+		typ   schema.Type
 		check func(codec.Value) bool
 	}{
 		{"codec/int32_min.hex", schema.Prim(schema.PhysicalInt32), func(v codec.Value) bool {

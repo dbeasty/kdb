@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -260,7 +261,12 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
 	}
 	_, isInsert := stmt.(sql.StmtInsert)
-	action := auth.SqlExecAction{Namespace: msg.Namespace, ReadOnly: !isInsert}
+	// ReadOnly must be false for anything that isn't actually a read, not just "isn't an
+	// INSERT" - CREATE TABLE (sql.StmtCreateTable) is neither StmtInsert nor StmtSelect, so
+	// !isInsert alone let a read-only principal rewrite the namespace's schema via execRead's
+	// h.runtime.SetSchema call below (kdb-finish-up-plan.md's 1-G6).
+	_, isSelect := stmt.(sql.StmtSelect)
+	action := auth.SqlExecAction{Namespace: msg.Namespace, ReadOnly: isSelect}
 	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), sess.Principal, action); err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, (&AuthorizationError{Cause: err}).Error())
 	}
@@ -275,14 +281,23 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 }
 
 func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession, params []sql.Parameter) wire.Message {
-	head, err := h.runtime.Runtime.DAG.Head()
-	if err != nil {
-		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+	// sess.ReadPin (set at SessionBegin/Handshake for SNAPSHOT consistency, see
+	// SessionManager.Begin) used to be computed and then never read anywhere - every read
+	// always ran against the live head regardless of what consistency the session's ack claimed
+	// it got (kdb-finish-up-plan.md's 1-G8). READ_COMMITTED/READ_YOUR_WRITES have no pin and
+	// correctly keep reading the live head here.
+	head := sess.ReadPin
+	if head == nil {
+		liveHead, err := h.runtime.Runtime.DAG.Head()
+		if err != nil {
+			return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+		}
+		head = &liveHead
 	}
 	ctx := sql.QueryContext{
 		NamespaceID: sess.NamespaceID,
 		Schema:      h.runtime.Schema(),
-		AtCommit:    &head,
+		AtCommit:    head,
 		Parameters:  params,
 		MaxRows:     10_000,
 	}
@@ -604,16 +619,16 @@ func sqlResultErrorClassified(correlationID int, namespace, sessionID string, er
 }
 
 // asError reports whether err (or something in its chain) is a *T, setting target if so - a
-// small stand-in for errors.As so callers don't need to import "errors" just for this one check.
+// thin generic wrapper around errors.As (which can't be called directly with a type parameter
+// as its target type). Previously this did a plain err.(T) type assertion with no chain
+// unwrapping, contradicting its own doc comment: any *ConflictError wrapped in the future (e.g.
+// via fmt.Errorf("%w", ...)) would have been silently reclassified as a generic SQL error at
+// every call site instead of surfacing as a ConflictReportMessage (kdb-finish-up-plan.md's 1-G7).
 func asError[T error](err error, target *T) bool {
 	if err == nil {
 		return false
 	}
-	if e, ok := err.(T); ok {
-		*target = e
-		return true
-	}
-	return false
+	return errors.As(err, target)
 }
 
 func columnNames(cols []sql.ResultColumn) []string {

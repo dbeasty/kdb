@@ -46,7 +46,10 @@ func TestConnectAgainstRealJvmServerOverWebSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitHash, err := c.PutJSON(ctx, namespace, docID, []byte(`{"marker":"go-ws-interop"}`))
+	// Unique per run: the SELECT below (deliberately unfiltered, see its comment) has to pick
+	// this write out from whatever other rows a long-lived shared server has accumulated.
+	marker := "go-ws-interop-" + docID
+	commitHash, err := c.PutJSON(ctx, namespace, docID, []byte(`{"marker":"`+marker+`"}`))
 	if err != nil {
 		t.Fatalf("PutJSON over ws:// against a real JVM server: %v", err)
 	}
@@ -54,14 +57,39 @@ func TestConnectAgainstRealJvmServerOverWebSocket(t *testing.T) {
 		t.Fatal("expected a non-empty commit hash")
 	}
 
-	jsonBody, gotCommitHash, err := c.GetJSON(ctx, namespace, docID)
-	if err != nil {
-		t.Fatalf("GetJSON over ws:// against a real JVM server: %v", err)
+	// Not GetJSON: it sends wire.MsgDocumentGet (component 40's direct-document-get message),
+	// which the Kotlin server has no counterpart for - kdb-wire's WireMessageType tops out at
+	// SESSION_BEGIN_ACK(0x13), never adding DOCUMENT_GET/DOCUMENT_GET_RESULT/UPSERT/
+	// UPSERT_RESULT (0x14-0x17), and SqlWireHost.dispatch has no case for them either. Sending
+	// one today doesn't get a clean rejection: the JVM's decodeHeader throws
+	// WireDecodeException("unknown message type"), which SqlWireListen.kt's per-frame
+	// coroutineScope propagates uncaught, tearing down the whole connection (see
+	// docs/kdb-finish-up-plan.md's Kotlin frame-isolation finding - the same failure mode, a
+	// different unhandled-decode trigger). Verify the write via SqlExec's `_doc` column instead,
+	// which Kotlin does support end-to-end (proven by kdb/interop's
+	// TestGoClientAgainstRealJvmServer) - this still exercises the thing this test exists to
+	// prove, Connect's ws:// dial path against a real JVM server, without depending on
+	// unimplemented Kotlin functionality.
+	//
+	// No WHERE/parameter binding: decodeRows matches result columns to struct fields by
+	// case-insensitive NAME only (no struct-tag support), so a literal `_doc` column can never
+	// match an exported Go field (Go requires an exported field to start with an uppercase
+	// letter) - `AS doc` sidesteps that. `id = ?` was also tried against this same server and
+	// came back "invalid parameter wire object", so this scans the table and matches by content
+	// instead - namespace `demo/interop` is small enough (interop-test scale, not production
+	// data) for that to be cheap.
+	var rows []struct{ Doc string }
+	if err := c.Query(ctx, namespace, "SELECT _doc AS doc FROM users", nil, &rows); err != nil {
+		t.Fatalf("SqlExec SELECT over ws:// against a real JVM server: %v", err)
 	}
-	if gotCommitHash != commitHash {
-		t.Fatalf("expected commit hash %s, got %s", commitHash, gotCommitHash)
+	found := false
+	for _, r := range rows {
+		if r.Doc == `{"marker":"`+marker+`"}` {
+			found = true
+			break
+		}
 	}
-	if string(jsonBody) == "" {
-		t.Fatal("expected a non-empty document body")
+	if !found {
+		t.Fatalf("expected a row containing marker %q among %d rows", marker, len(rows))
 	}
 }

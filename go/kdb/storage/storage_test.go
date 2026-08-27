@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
-	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/dag"
+	"github.com/limidus/kdb/go/kdb/document"
 	storagemem "github.com/limidus/kdb/go/kdb/storage/mem"
 )
 

@@ -1,6 +1,7 @@
 package peersync
 
 import (
+	"math"
 	"sort"
 	"sync"
 
@@ -177,18 +178,18 @@ func resolveDivergedLocked(
 	}
 	ancestor := *plan.CommonAncestor
 
-	localTouched, err := touchedDocsForRange(d, plan.LocalOnly)
+	localTouched, err := touchedDocsForRange(d, localHead, ancestor)
 	if err != nil {
 		return CommitPushOutcome{}, err
 	}
-	remoteTouched, err := touchedDocsForRange(d, plan.RemoteOnly)
+	remoteTouched, err := touchedDocsForRange(d, incomingHead, ancestor)
 	if err != nil {
 		return CommitPushOutcome{}, err
 	}
 	overlapping := intersectDocIDs(localTouched, remoteTouched)
 
 	if len(overlapping) == 0 {
-		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, remoteTouched)
+		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, opsOnly(remoteTouched))
 		if err != nil {
 			return CommitPushOutcome{}, err
 		}
@@ -201,12 +202,21 @@ func resolveDivergedLocked(
 	// deciding what the overlapping documents' *effective* remote-side write should be.
 	switch opts.Policy {
 	case transaction.ConflictPolicyLastWrite:
-		// The transaction being "replayed" (applied) always wins - matches
-		// transaction.ConflictPolicyLastWrite's own finalizeTransaction semantics exactly, read
-		// in peer sync's replay direction (remote onto local). remoteTouched already carries the
-		// remote side's writes for every touched document, overlapping included, so no extra
-		// resolution step is needed - mergeNonConflicting already implements "remote wins".
-		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, remoteTouched)
+		// Whichever write actually happened later wins - NOT "whichever side is being applied"
+		// (the previous behavior: unconditionally remote, i.e. direction-dependent). That made
+		// LAST_WRITE non-commutative: node A pulling from B and node B receiving A's push both
+		// resolve the *same* conflicting document, but "remote" means B on A and A on B, so they
+		// picked opposite winners and permanently diverged on exactly the document LAST_WRITE
+		// exists to reconcile (kdb-finish-up-plan.md's 1-G11). resolveLastWriteWinners compares
+		// each overlapping document's two candidate writes directly, so every node computing this
+		// same resolution reaches the same answer regardless of which side it's running on.
+		effectiveRemoteWrites := opsOnly(remoteTouched)
+		for _, docID := range overlapping {
+			if localWriteWins(localTouched[docID], remoteTouched[docID]) {
+				delete(effectiveRemoteWrites, docID)
+			}
+		}
+		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, effectiveRemoteWrites)
 		if err != nil {
 			return CommitPushOutcome{}, err
 		}
@@ -235,6 +245,21 @@ func resolveDivergedLocked(
 
 	report := buildConflictReport(localHead, incomingHead, overlapping, localTouched, remoteTouched)
 	return CommitPushOutcome{Kind: OutcomeConflict, Report: &report}, nil
+}
+
+// localWriteWins compares two candidate writes for the same document - local's own final write
+// in this divergence range, and remote's - and reports whether local's should be kept instead of
+// remote's, for ConflictPolicyLastWrite. Later Timestamp wins; an exact tie (routine within one
+// batch, since codec.TimestampNow() is microsecond-granularity) is broken by comparing commit
+// hash lexicographically - arbitrary, but identical on every node computing this same
+// resolution, so both sides still converge to the same document instead of each keeping "their
+// own" arbitrarily.
+func localWriteWins(local, remote touchedDoc) bool {
+	lt, rt := local.Timestamp.EpochMicros(), remote.Timestamp.EpochMicros()
+	if lt != rt {
+		return lt > rt
+	}
+	return local.CommitHash.Hex() > remote.CommitHash.Hex()
 }
 
 // mergeNonConflicting stages the remote side's writes/deletes into storage, then lets
@@ -294,39 +319,68 @@ func mergeNonConflicting(
 	return d.AppendMergeCommit(mergeTx, localHead, incomingHead, mergedTree, nil, "peer-sync auto-merge (non-conflicting)")
 }
 
-// touchedDocsForRange replays each commit's operations, oldest first, to determine what each
-// document in this commit range ended up as on this side - last-write-wins per document within
-// the range, same as applying them for real would produce. Two sides landing different Op for
-// the same docID (including one writing while the other deletes) is always treated as a genuine
-// conflict: this does not attempt to prove two independently-produced writes are "actually"
-// identical, and does not perform field-level 3-way merging.
-func touchedDocsForRange(d *dag.InMemoryCommitDag, hashes []codec.Hash) (map[codec.UUID]document.Op, error) {
-	commits := make([]document.Commit, 0, len(hashes))
-	for _, h := range hashes {
-		c, err := d.GetCommitOrThrow(h)
-		if err != nil {
-			return nil, err
-		}
-		commits = append(commits, c)
+// touchedDocsForRange replays every commit strictly between ancestor and head, oldest first, to
+// determine what each document touched in that range ended up as on this side - last-write-wins
+// per document within the range, same as applying them for real would produce. Two sides landing
+// different Op for the same docID (including one writing while the other deletes) is always
+// treated as a genuine conflict: this does not attempt to prove two independently-produced writes
+// are "actually" identical, and does not perform field-level 3-way merging.
+//
+// Walks the DAG directly from head back to ancestor (same shape as CommitsToPush) rather than
+// consuming a pre-fetched, already-unordered commit list: ComputeSyncPlan's LocalOnly/RemoteOnly
+// come from CommitsSince, which sorts by hash purely to make its own output deterministic and
+// carries no causal meaning, and this function used to additionally re-sort that by wall-clock
+// Timestamp - vulnerable to cross-node clock skew, and to sort.Slice's lack of a stability
+// guarantee for the exact-tie case (routine for a batch pushed together, since
+// codec.TimestampNow() is microsecond-granularity). Two peers resolving the same divergence, or
+// one peer resolving it twice on retry, could disagree on which write was "last" and converge on
+// different merge content. d.Walk's traversal only ever dequeues a commit's parents after the
+// commit itself has been dequeued, so the reversed result below is a genuine topological order
+// (every commit strictly after all of its own descendants in the range) - deterministic
+// regardless of timestamps, immune to clock skew entirely.
+// touchedDoc is one document's final state within a divergence range, plus the provenance
+// (originating commit's timestamp and hash) localWriteWins needs to compare it against the other
+// side's candidate for the same document.
+type touchedDoc struct {
+	Op         document.Op
+	Timestamp  codec.Timestamp
+	CommitHash codec.Hash
+}
+
+func touchedDocsForRange(d *dag.InMemoryCommitDag, head, ancestor codec.Hash) (map[codec.UUID]touchedDoc, error) {
+	if head == ancestor {
+		return map[codec.UUID]touchedDoc{}, nil
 	}
-	sort.Slice(commits, func(i, j int) bool {
-		return commits[i].Timestamp.EpochMicros() < commits[j].Timestamp.EpochMicros()
-	})
-	out := make(map[codec.UUID]document.Op)
-	for _, c := range commits {
-		for _, op := range c.Operations {
+	walked := d.Walk(head, &ancestor, math.MaxInt)
+	out := make(map[codec.UUID]touchedDoc)
+	for i := len(walked) - 1; i >= 0; i-- {
+		full, ok := walked[i].(dag.FullEntry)
+		if !ok {
+			continue
+		}
+		for _, op := range full.Commit.Operations {
 			switch o := op.(type) {
 			case document.WriteOp:
-				out[o.DocID] = o
+				out[o.DocID] = touchedDoc{Op: o, Timestamp: full.Commit.Timestamp, CommitHash: full.Commit.Hash}
 			case document.DeleteOp:
-				out[o.DocID] = o
+				out[o.DocID] = touchedDoc{Op: o, Timestamp: full.Commit.Timestamp, CommitHash: full.Commit.Hash}
 			}
 		}
 	}
 	return out, nil
 }
 
-func intersectDocIDs(a, b map[codec.UUID]document.Op) []codec.UUID {
+// opsOnly discards touchedDoc's provenance, keeping just each document's resulting Op - the
+// shape mergeNonConflicting (and, by extension, storage.CommitTree) actually needs.
+func opsOnly(m map[codec.UUID]touchedDoc) map[codec.UUID]document.Op {
+	out := make(map[codec.UUID]document.Op, len(m))
+	for k, v := range m {
+		out[k] = v.Op
+	}
+	return out
+}
+
+func intersectDocIDs[T any](a, b map[codec.UUID]T) []codec.UUID {
 	var out []codec.UUID
 	for k := range a {
 		if _, ok := b[k]; ok {
@@ -385,19 +439,16 @@ func resolveCustomConflicts(
 	namespaceID string,
 	ancestorTreeHash codec.Hash,
 	overlapping []codec.UUID,
-	localTouched, remoteTouched map[codec.UUID]document.Op,
+	localTouched, remoteTouched map[codec.UUID]touchedDoc,
 	resolver transaction.ConflictResolver,
 ) (map[codec.UUID]document.Op, bool, error) {
 	if resolver == nil {
 		return nil, false, nil
 	}
-	resolved := make(map[codec.UUID]document.Op, len(remoteTouched))
-	for k, v := range remoteTouched {
-		resolved[k] = v
-	}
+	resolved := opsOnly(remoteTouched)
 	for _, docID := range overlapping {
-		localOp := localTouched[docID]
-		remoteOp := remoteTouched[docID]
+		localOp := localTouched[docID].Op
+		remoteOp := remoteTouched[docID].Op
 		baseDoc, err := store.GetDocument(namespaceID, docID, ancestorTreeHash)
 		if err != nil {
 			return nil, false, err
@@ -420,12 +471,12 @@ func resolveCustomConflicts(
 func buildConflictReport(
 	localHead, incomingHead codec.Hash,
 	overlapping []codec.UUID,
-	localTouched, remoteTouched map[codec.UUID]document.Op,
+	localTouched, remoteTouched map[codec.UUID]touchedDoc,
 ) kdberr.ConflictReport {
 	items := make([]kdberr.ConflictItem, 0, len(overlapping))
 	for _, docID := range overlapping {
-		localOp := localTouched[docID]
-		remoteOp := remoteTouched[docID]
+		localOp := localTouched[docID].Op
+		remoteOp := remoteTouched[docID].Op
 		opType := classifyConflictOp(localOp, remoteOp)
 		var localDoc, incomingDoc *string
 		if w, ok := localOp.(document.WriteOp); ok {

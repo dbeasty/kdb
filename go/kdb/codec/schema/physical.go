@@ -4,22 +4,22 @@ package schema
 type PhysicalKind byte
 
 const (
-	PhysicalNull PhysicalKind = 0x00
-	PhysicalBool PhysicalKind = 0x01
-	PhysicalInt8 PhysicalKind = 0x02
-	PhysicalInt16 PhysicalKind = 0x03
-	PhysicalInt32 PhysicalKind = 0x04
-	PhysicalInt64 PhysicalKind = 0x05
+	PhysicalNull    PhysicalKind = 0x00
+	PhysicalBool    PhysicalKind = 0x01
+	PhysicalInt8    PhysicalKind = 0x02
+	PhysicalInt16   PhysicalKind = 0x03
+	PhysicalInt32   PhysicalKind = 0x04
+	PhysicalInt64   PhysicalKind = 0x05
 	PhysicalFloat32 PhysicalKind = 0x06
 	PhysicalFloat64 PhysicalKind = 0x07
-	PhysicalBytes PhysicalKind = 0x08
-	PhysicalString PhysicalKind = 0x09
-	PhysicalArray PhysicalKind = 0x0A
-	PhysicalMap PhysicalKind = 0x0B
-	PhysicalRecord PhysicalKind = 0x0C
-	PhysicalEnum PhysicalKind = 0x0D
-	PhysicalUnion PhysicalKind = 0x0E
-	PhysicalFixed PhysicalKind = 0x0F
+	PhysicalBytes   PhysicalKind = 0x08
+	PhysicalString  PhysicalKind = 0x09
+	PhysicalArray   PhysicalKind = 0x0A
+	PhysicalMap     PhysicalKind = 0x0B
+	PhysicalRecord  PhysicalKind = 0x0C
+	PhysicalEnum    PhysicalKind = 0x0D
+	PhysicalUnion   PhysicalKind = 0x0E
+	PhysicalFixed   PhysicalKind = 0x0F
 )
 
 var byTag = map[byte]PhysicalKind{

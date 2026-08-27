@@ -1,10 +1,27 @@
 package embed
 
 import (
+	"fmt"
+
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 )
+
+// TreeHashMismatchError means MaterializeCommit built a document tree from commit's operations
+// that doesn't match commit's own declared DocumentTreeHash - i.e. the commit is either corrupt
+// or was tampered with in transit. Detect with errors.As.
+type TreeHashMismatchError struct {
+	CommitHash codec.Hash
+	Declared   codec.Hash
+	Built      codec.Hash
+}
+
+func (e *TreeHashMismatchError) Error() string {
+	return fmt.Sprintf("kdb: commit %s declares document tree %s but materializing its operations built %s",
+		e.CommitHash.Hex(), e.Declared.Hex(), e.Built.Hex())
+}
 
 // MaterializeCommit replays one commit's document operations into store, so the commit's
 // documents become visible to SqlExec/Query/GetDocument immediately - mirrors Kotlin's
@@ -38,6 +55,12 @@ func MaterializeCommit(store storage.Adapter, d *dag.InMemoryCommitDag, namespac
 			}
 		}
 	}
-	_, err = store.CommitTree(namespaceID, parent.DocumentTreeHash)
-	return err
+	built, err := store.CommitTree(namespaceID, parent.DocumentTreeHash)
+	if err != nil {
+		return err
+	}
+	if built.TreeHash != commit.DocumentTreeHash {
+		return &TreeHashMismatchError{CommitHash: commit.Hash, Declared: commit.DocumentTreeHash, Built: built.TreeHash}
+	}
+	return nil
 }

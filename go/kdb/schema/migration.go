@@ -13,13 +13,28 @@ type (
 	AddFieldStep    struct{ Field Field }
 	DropFieldStep   struct{ FieldName string }
 	RenameFieldStep struct{ OldName, NewName string }
-	ChangeTypeStep  struct{ FieldName string; NewType FieldType }
+	ChangeTypeStep  struct {
+		FieldName string
+		NewType   FieldType
+	}
 	AddIndexStep    struct{ FieldName string }
 	DropIndexStep   struct{ FieldName string }
-	SetRequiredStep struct{ FieldName string; Required bool }
-	SetUniqueStep   struct{ FieldName string; Unique bool }
-	WidenEnumStep   struct{ FieldName string; AddValues map[string]struct{} }
-	NarrowEnumStep  struct{ FieldName string; RemoveValues map[string]struct{} }
+	SetRequiredStep struct {
+		FieldName string
+		Required  bool
+	}
+	SetUniqueStep struct {
+		FieldName string
+		Unique    bool
+	}
+	WidenEnumStep struct {
+		FieldName string
+		AddValues map[string]struct{}
+	}
+	NarrowEnumStep struct {
+		FieldName    string
+		RemoveValues map[string]struct{}
+	}
 )
 
 func (AddFieldStep) isMigrationStep()    {}
@@ -27,9 +42,9 @@ func (DropFieldStep) isMigrationStep()   {}
 func (RenameFieldStep) isMigrationStep() {}
 func (ChangeTypeStep) isMigrationStep()  {}
 func (AddIndexStep) isMigrationStep()    {}
-func (DropIndexStep) isMigrationStep()    {}
+func (DropIndexStep) isMigrationStep()   {}
 func (SetRequiredStep) isMigrationStep() {}
-func (SetUniqueStep) isMigrationStep()    {}
+func (SetUniqueStep) isMigrationStep()   {}
 func (WidenEnumStep) isMigrationStep()   {}
 func (NarrowEnumStep) isMigrationStep()  {}
 

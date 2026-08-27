@@ -12,11 +12,11 @@ import (
 )
 
 type conn struct {
-	parsed   ParsedURL
-	runtime  *embed.EmbeddedKdbRuntime
-	release  func()
-	closed   bool
-	mu       sync.Mutex
+	parsed  ParsedURL
+	runtime *embed.EmbeddedKdbRuntime
+	release func()
+	closed  bool
+	mu      sync.Mutex
 }
 
 func openConn(parsed ParsedURL) (*conn, error) {

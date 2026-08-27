@@ -59,10 +59,10 @@ type FieldChange interface {
 }
 
 type (
-	TypeChanged      struct{ From, To FieldType }
-	RequiredChanged  struct{ From, To bool }
-	IndexedChanged   struct{ From, To bool }
-	UniqueChanged    struct{ From, To bool }
+	TypeChanged       struct{ From, To FieldType }
+	RequiredChanged   struct{ From, To bool }
+	IndexedChanged    struct{ From, To bool }
+	UniqueChanged     struct{ From, To bool }
 	EnumValuesChanged struct {
 		Added, Removed map[string]struct{}
 	}

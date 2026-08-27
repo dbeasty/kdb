@@ -97,11 +97,11 @@ type RecoverySummary struct {
 
 // CorruptionError indicates a corrupt WAL frame.
 type CorruptionError struct {
-	Message     string
+	Message      string
 	PartitionKey string
-	SegmentName string
-	Offset      int64
-	Cause       error
+	SegmentName  string
+	Offset       int64
+	Cause        error
 }
 
 func (e *CorruptionError) Error() string { return e.Message }

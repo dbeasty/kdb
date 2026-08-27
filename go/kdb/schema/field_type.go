@@ -8,15 +8,15 @@ type FieldType interface {
 }
 
 type (
-	StringType   struct{}
-	Int32Type    struct{}
-	Int64Type    struct{}
-	Float64Type  struct{}
-	BoolType     struct{}
+	StringType    struct{}
+	Int32Type     struct{}
+	Int64Type     struct{}
+	Float64Type   struct{}
+	BoolType      struct{}
 	TimestampType struct{}
-	UUIDType     struct{}
-	ObjectType   struct{}
-	ArrayType    struct{}
+	UUIDType      struct{}
+	ObjectType    struct{}
+	ArrayType     struct{}
 )
 
 func (StringType) isFieldType()    {}
@@ -54,9 +54,9 @@ type EnumType struct {
 	Values map[string]struct{}
 }
 
-func (EnumType) isFieldType() {}
-func (e EnumType) SQLTypeName() string     { return "TEXT" }
-func (e EnumType) CodecTypeLabel() string  { return "ENUM_AS_STRING" }
+func (EnumType) isFieldType()             {}
+func (e EnumType) SQLTypeName() string    { return "TEXT" }
+func (e EnumType) CodecTypeLabel() string { return "ENUM_AS_STRING" }
 
 // NewEnumType builds an enum with at least one value.
 func NewEnumType(values ...string) EnumType {

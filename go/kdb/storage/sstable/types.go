@@ -9,9 +9,9 @@ import (
 
 // BlockHandle points at a compressed block in a segment.
 type BlockHandle struct {
-	Offset            int64
-	CompressedSize    int
-	UncompressedSize  int
+	Offset           int64
+	CompressedSize   int
+	UncompressedSize int
 }
 
 // Handle references a sealed SSTable file.

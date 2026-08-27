@@ -81,6 +81,13 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 			Namespaces: []string{config.NamespaceID},
 			LocalHeads: map[string]string{config.NamespaceID: localHead.Hex()},
 			ClientMode: wire.ClientFullPeer,
+			// config.ConnectionContext was accepted but never actually used here - every peer
+			// handshake went out with no credentials regardless of what a caller configured,
+			// which would have made the host's new PeerSyncAction enforcement (host.go) reject
+			// every real client outright, not just an unauthenticated one.
+			User:     config.ConnectionContext.User,
+			Password: config.ConnectionContext.Password,
+			Token:    config.ConnectionContext.Token,
 		},
 	}
 	ackMsg, err := c.request(conn, hs)

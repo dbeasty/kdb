@@ -40,11 +40,11 @@ func None() KdbSchema {
 			panic(err)
 		}
 		noneVal = KdbSchema{
-			SchemaHash:  h,
-			Fields:      nil,
-			Version:     0,
-			CreatedAt:   ts,
-			Description: "",
+			SchemaHash:   h,
+			Fields:       nil,
+			Version:      0,
+			CreatedAt:    ts,
+			Description:  "",
 			fieldsByName: map[string]Field{},
 		}
 	})

@@ -17,6 +17,11 @@ import (
 // giving up with ReplayResult.Rejected - matches Kotlin's REPLAY_TIMEOUT_MILLIS.
 const replayTimeout = 30 * time.Second
 
+// handshakeTimeout bounds how long Connect waits for the coordinator's HandshakeAck before
+// giving up - mirrors go/kdb/client's Connect, which likewise blocks on its handshake request()
+// call rather than returning before the server has registered the connection.
+const handshakeTimeout = 10 * time.Second
+
 // Subscriber connects to a stream coordinator and receives delta commits.
 type Subscriber interface {
 	Connect(cfg SubscriberConfig) (*Connection, error)
@@ -42,6 +47,11 @@ type defaultSubscriber struct {
 	// per-DefaultStreamSubscriber-instance, but this Go subscriber is reused across reconnects,
 	// so a stale entry from a prior connection must not linger).
 	pendingReplays map[int]chan wire.Message
+	// handshakeAck receives the HandshakeAckMessage for the in-flight Connect call, if any -
+	// Connect blocks on it (with handshakeTimeout) so it never returns before the coordinator has
+	// actually registered this subscriber. Without this, a write issued immediately after Connect
+	// can race the coordinator's own handshake processing and never reach this subscriber at all.
+	handshakeAck chan wire.Message
 }
 
 // NewSubscriber creates a stream subscriber.
@@ -65,12 +75,14 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 	if err != nil {
 		return nil, err
 	}
+	ackCh := make(chan wire.Message, 1)
 	s.mu.Lock()
 	s.conn = conn
 	s.config = &cfg
 	s.position = cfg.ResumeFrom
 	s.stopIncoming = make(chan struct{})
 	s.pendingReplays = make(map[int]chan wire.Message)
+	s.handshakeAck = ackCh
 	s.mu.Unlock()
 
 	wireMode := wire.ClientStreamReadOnly
@@ -102,6 +114,27 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 	if err := conn.Send(frame); err != nil {
 		return nil, err
 	}
+
+	select {
+	case msg, ok := <-ackCh:
+		if !ok {
+			return nil, errors.New("stream: disconnected before handshake ack")
+		}
+		ack, ok := msg.(wire.HandshakeAckMessage)
+		if !ok {
+			return nil, fmt.Errorf("stream: expected HandshakeAck, got %T", msg)
+		}
+		if !ack.Response.Accepted {
+			reason := "handshake rejected"
+			if ack.Response.RejectionReason != nil {
+				reason = *ack.Response.RejectionReason
+			}
+			return nil, errors.New(reason)
+		}
+	case <-time.After(handshakeTimeout):
+		return nil, errors.New("stream: timed out waiting for handshake ack")
+	}
+
 	return &Connection{
 		NamespaceID: cfg.NamespaceID,
 		Mode:        cfg.Mode,
@@ -119,6 +152,8 @@ func (s *defaultSubscriber) Disconnect() error {
 	s.conn = nil
 	stale := s.pendingReplays
 	s.pendingReplays = nil
+	ackCh := s.handshakeAck
+	s.handshakeAck = nil
 	s.mu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
@@ -132,6 +167,10 @@ func (s *defaultSubscriber) Disconnect() error {
 	for _, ch := range stale {
 		close(ch)
 	}
+	// Same reasoning for a Connect call still blocked waiting on the handshake ack.
+	if ackCh != nil {
+		close(ackCh)
+	}
 	s.emit(Event{Kind: EventDisconnected})
 	return nil
 }
@@ -144,10 +183,24 @@ func (s *defaultSubscriber) readLoop(conn ConnectionHandle) {
 			return
 		case frame, ok := <-incoming:
 			if !ok {
+				s.abortPendingHandshake()
 				return
 			}
 			s.handleFrame(frame)
 		}
+	}
+}
+
+// abortPendingHandshake unblocks a Connect call still waiting on the handshake ack when the
+// connection drops before any ack arrives (e.g. the transport closes underneath readLoop).
+// Without this, Connect would hang until handshakeTimeout instead of failing immediately.
+func (s *defaultSubscriber) abortPendingHandshake() {
+	s.mu.Lock()
+	ackCh := s.handshakeAck
+	s.handshakeAck = nil
+	s.mu.Unlock()
+	if ackCh != nil {
+		close(ackCh)
 	}
 }
 
@@ -166,6 +219,18 @@ func (s *defaultSubscriber) handleFrame(frame []byte) {
 	}
 	switch m := msg.(type) {
 	case wire.HandshakeAckMessage:
+		s.mu.Lock()
+		ackCh := s.handshakeAck
+		s.handshakeAck = nil
+		s.mu.Unlock()
+		if ackCh != nil {
+			// Connect is waiting on this; let it translate accept/reject into its return value
+			// rather than duplicating that logic here.
+			ackCh <- m
+			return
+		}
+		// No Connect call is waiting (e.g. a duplicate/late ack) - fall back to the event-only
+		// behavior so a caller that only watches Events() isn't left silent.
 		if !m.Response.Accepted {
 			reason := "handshake rejected"
 			if m.Response.RejectionReason != nil {
