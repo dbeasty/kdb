@@ -73,3 +73,32 @@ func TestPutJSONDocument_preservesExplicitID(t *testing.T) {
 		t.Fatalf("doc id %+v", result.DocID)
 	}
 }
+
+// TestPutJSONDocument_rejectsNonStringID is the regression test for the finding recorded in
+// docs/kdb-finish-up-plan.md as 1-G3: a document whose "id" field is present but isn't a JSON
+// string used to be silently accepted anyway, writing under a fresh random id the caller never
+// asked for and had no way to learn about (`kdb put` reported success under an id the user never
+// specified). It must now be a clear error instead.
+func TestPutJSONDocument_rejectsNonStringID(t *testing.T) {
+	ns := "demo/users"
+	rt, err := embed.OpenMemoryRuntime("demo", ns, schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := embed.PutJSONDocument(rt, ns, `{"id":12345,"v":1}`); err == nil {
+		t.Fatal("expected an error for a numeric \"id\" field, got none")
+	}
+}
+
+// TestPutJSONDocument_rejectsEmptyID is 1-G3's other half: an explicitly empty "id" field is
+// also a caller mistake worth surfacing, not a silent fresh-random-id substitution.
+func TestPutJSONDocument_rejectsEmptyID(t *testing.T) {
+	ns := "demo/users"
+	rt, err := embed.OpenMemoryRuntime("demo", ns, schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := embed.PutJSONDocument(rt, ns, `{"id":"","v":1}`); err == nil {
+		t.Fatal("expected an error for an empty \"id\" field, got none")
+	}
+}

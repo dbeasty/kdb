@@ -141,12 +141,12 @@ type PooledRealizedHandle struct {
 	refCount     int
 }
 
-func (h *PooledRealizedHandle) NamespaceID() string   { return h.namespaceID }
-func (h *PooledRealizedHandle) CommitHash() codec.Hash  { return h.commitHash }
-func (h *PooledRealizedHandle) EnlistmentID() codec.UUID { return h.enlistmentID }
-func (h *PooledRealizedHandle) IsReady() bool           { return true }
+func (h *PooledRealizedHandle) NamespaceID() string                            { return h.namespaceID }
+func (h *PooledRealizedHandle) CommitHash() codec.Hash                         { return h.commitHash }
+func (h *PooledRealizedHandle) EnlistmentID() codec.UUID                       { return h.enlistmentID }
+func (h *PooledRealizedHandle) IsReady() bool                                  { return true }
 func (h *PooledRealizedHandle) AwaitReady(storage.RebuildBlockingPolicy) error { return nil }
-func (h *PooledRealizedHandle) Storage() storage.Adapter { return h.storage }
+func (h *PooledRealizedHandle) Storage() storage.Adapter                       { return h.storage }
 
 func (h *PooledRealizedHandle) Close() {
 	h.refCount--

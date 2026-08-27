@@ -19,6 +19,14 @@
 *.tar.gz
 *.rar
 
+# ...except the Gradle wrapper jar itself: it's a checked-in bootstrap binary (what makes
+# ./gradlew self-contained with no system Gradle install required), not build output - the blanket
+# *.jar rule above was silently catching it too, so it was never actually committed and every CI
+# job that runs ./gradlew (kotlin-test, integration, and go-test's Kotlin-interop smoke test) has
+# been failing with "Could not find or load main class org.gradle.wrapper.GradleWrapperMain" since
+# Phase 0 re-enabled the push/pull_request triggers that would have caught it.
+!gradle/wrapper/gradle-wrapper.jar
+
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*

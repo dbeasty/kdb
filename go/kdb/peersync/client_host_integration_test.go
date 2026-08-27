@@ -9,9 +9,11 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	mem "github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -218,6 +220,80 @@ func TestHostCommitPushReturnsConflictReportOnSameDocumentDivergence(t *testing.
 	}
 	if !hostDag.HasCommit(incomingCommit.Hash) {
 		t.Fatal("incoming commit should still be stored even though main didn't move onto it")
+	}
+}
+
+// Same same-document push as the conflict test above, but with HostConfig.ConflictPolicy set to
+// LAST_WRITE: proves the policy actually reaches ResolveDivergence through the real wire path
+// (CommitPushMessage -> ConnectionHost.HandleFrame -> frameHandler), not just via a direct
+// ResolveDivergence call - the incoming push now acks with a real merge instead of reporting.
+func TestHostCommitPushAutoResolvesSameDocumentConflictUnderLastWritePolicy(t *testing.T) {
+	ns := "app/host-push-last-write"
+
+	hostDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("host dag: %v", err)
+	}
+	incomingDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("incoming dag: %v", err)
+	}
+	genesis, _ := hostDag.Head()
+
+	hostStorage := mem.NewInMemoryStorageAdapter()
+	incomingStorage := mem.NewInMemoryStorageAdapter()
+	hostSide := side{dag: hostDag, storage: hostStorage}
+	incomingSide := side{dag: incomingDag, storage: incomingStorage}
+
+	sharedDoc := newUUID(t)
+	writeDoc(t, hostSide, ns, genesis, sharedDoc, `{"v":"host"}`)
+	incomingCommit := writeDoc(t, incomingSide, ns, genesis, sharedDoc, `{"v":"incoming"}`)
+
+	w := wire.NewCodec(wire.EncodingJSON)
+	connHost := NewConnectionHost(w, hostDag, hostStorage, HostConfig{
+		NamespaceID:    ns,
+		NodeID:         "host",
+		ConflictPolicy: transaction.ConflictPolicyLastWrite,
+	}, auth.AllowAll, auth.EmptyContext)
+
+	push := wire.CommitPushMessage{
+		H:         wire.Header{MessageType: wire.MsgCommitPush, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: 1},
+		Namespace: ns,
+		Commits:   []document.Commit{incomingCommit},
+	}
+	frame, err := w.Encode(push)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	respFrame, err := connHost.HandleFrame(frame)
+	if err != nil {
+		t.Fatalf("handleFrame: %v", err)
+	}
+	respMsg, err := w.Decode(respFrame)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	ackMsg, ok := respMsg.(wire.CommitPushAckMessage)
+	if !ok {
+		t.Fatalf("expected CommitPushAckMessage under LAST_WRITE, got %T", respMsg)
+	}
+	head, _ := hostDag.Head()
+	if ackMsg.HeadHex != head.Hex() {
+		t.Fatalf("ack head %s does not match dag head %s", ackMsg.HeadHex, head.Hex())
+	}
+	headCommit, err := hostDag.GetCommitOrThrow(head)
+	if err != nil {
+		t.Fatalf("getCommitOrThrow(head): %v", err)
+	}
+	if len(headCommit.ParentHashes) != 2 {
+		t.Fatalf("expected main to land on a two-parent merge commit, got %d parents", len(headCommit.ParentHashes))
+	}
+	doc, err := hostStorage.GetDocument(ns, sharedDoc, headCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc == nil || doc.JSON != `{"v":"incoming"}` {
+		t.Fatalf("expected LAST_WRITE to keep the incoming push's write, got %+v", doc)
 	}
 }
 
@@ -449,5 +525,87 @@ func TestPushCommitsSurfacesConflictInsteadOfReportingSuccess(t *testing.T) {
 	}
 	if !remoteDag.HasCommit(localCommit.Hash) {
 		t.Fatal("pushed commit should still be stored even though main didn't move onto it")
+	}
+}
+
+// TestPullMissingMaterializesFetchedCommitIntoLocalStorage is the client-side mirror of the
+// front door's own fix (go/kdb/server's ListenPeerSync wiring embed.MaterializeCommit into
+// HostConfig): dag.PutCommit only updates DAG bookkeeping, so a commit fetched via PullMissing
+// was previously reachable from the local DAG but invisible to anything that reads through
+// storage.Adapter (e.g. a locally embedded runtime's SqlExec/Query/GetDocument) until this
+// commit's ops were replayed into it. Uses the real production embed.MaterializeCommit as the
+// callback, not a test-local reimplementation, so this proves the actual wiring works end to
+// end, the same way TestListenPeerSyncPushIsVisibleToServerQueries does for the push direction.
+func TestPullMissingMaterializesFetchedCommitIntoLocalStorage(t *testing.T) {
+	ns := "app/pull-materialize"
+	hubName := "hub-pull-materialize"
+
+	localDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("local dag: %v", err)
+	}
+	remoteDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		t.Fatalf("remote dag: %v", err)
+	}
+	genesis, _ := localDag.Head()
+
+	localStorage := mem.NewInMemoryStorageAdapter()
+	remoteStorage := mem.NewInMemoryStorageAdapter()
+	remoteSide := side{dag: remoteDag, storage: remoteStorage}
+
+	docID := newUUID(t)
+	docJSON := `{"v":"remote"}`
+	remoteCommit := writeDoc(t, remoteSide, ns, genesis, docID, docJSON)
+
+	w := wire.NewCodec(wire.EncodingJSON)
+	host := NewHost(w, remoteDag, remoteStorage, auth.AllowAll, auth.EmptyContext)
+	if err := host.Start(HostConfig{NamespaceID: ns, NodeID: "host", TransportHub: hubName}); err != nil {
+		t.Fatalf("host start: %v", err)
+	}
+	defer host.Stop()
+
+	transport := stream.NewInMemoryTransport()
+	client := NewClient(w, transport, localDag, localStorage)
+	materializedCalls := 0
+	session, err := client.Connect(ClientConfig{
+		NamespaceID: ns,
+		NodeID:      "client",
+		PeerURI:     "memory://" + hubName,
+		MaterializeCommit: func(commit document.Commit) error {
+			materializedCalls++
+			return embed.MaterializeCommit(localStorage, localDag, ns, commit)
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if session.RemoteHead() != remoteCommit.Hash {
+		t.Fatalf("expected handshake to report remote head %s, got %s", remoteCommit.Hash.Hex(), session.RemoteHead().Hex())
+	}
+
+	result, err := session.PullMissing()
+	if err != nil {
+		t.Fatalf("pullMissing: %v", err)
+	}
+	if result.Conflict != nil {
+		t.Fatalf("expected a clean fast-forward pull, got a conflict: %+v", result.Conflict)
+	}
+	if result.FinalHead != remoteCommit.Hash {
+		t.Fatalf("expected local head to fast-forward to %s, got %s", remoteCommit.Hash.Hex(), result.FinalHead.Hex())
+	}
+	if materializedCalls != 1 {
+		t.Fatalf("expected MaterializeCommit called exactly once, got %d", materializedCalls)
+	}
+
+	doc, err := localStorage.GetDocument(ns, docID, remoteCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc == nil {
+		t.Fatal("pulled document not visible in local storage - MaterializeCommit was not wired into PullMissing")
+	}
+	if doc.JSON != docJSON {
+		t.Fatalf("expected JSON %q, got %q", docJSON, doc.JSON)
 	}
 }

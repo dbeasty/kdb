@@ -60,7 +60,7 @@ func TestNestedRecordArrayRoundtrip(t *testing.T) {
 	}
 	root := &schema.RecordSchema{
 		Name: "Root", Namespace: "t",
-		Fields: []schema.FieldSchema{{ID: 2, Name: "a", Type: schema.Array{Element: schema.Ref{"t.Inner"}}}},
+		Fields: []schema.FieldSchema{{ID: 2, Name: "a", Type: schema.Array{Element: schema.Ref{FullyQualifiedName: "t.Inner"}}}},
 	}
 	reg := schema.NewRegistry()
 	reg.RegisterRecord(inner)
@@ -69,7 +69,7 @@ func TestNestedRecordArrayRoundtrip(t *testing.T) {
 
 	innerVal := RecordValue{Fields: map[int]Value{1: Int32Value{V: 7}}}
 	outer := RecordValue{Fields: map[int]Value{2: ArrayValue{Elements: []Value{innerVal}}}}
-	got := roundtrip(t, reg, outer, schema.Ref{"t.Root"})
+	got := roundtrip(t, reg, outer, schema.Ref{FullyQualifiedName: "t.Root"})
 	ogr := got.(RecordValue)
 	if len(ogr.Fields[2].(ArrayValue).Elements) != 1 {
 		t.Fatal("array len")
@@ -90,11 +90,11 @@ func TestEncodedSizeEqualsBytes(t *testing.T) {
 		fv[i+1] = StringValue{V: "payload"}
 	}
 	rv := RecordValue{Fields: fv}
-	blob, err := EncodeBytes(rv, schema.Ref{"t.Wide"}, reg)
+	blob, err := EncodeBytes(rv, schema.Ref{FullyQualifiedName: "t.Wide"}, reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := EncodedSize(rv, schema.Ref{"t.Wide"}, reg)
+	n, err := EncodedSize(rv, schema.Ref{FullyQualifiedName: "t.Wide"}, reg)
 	if err != nil || n != len(blob) {
 		t.Fatalf("size %d blob %d", n, len(blob))
 	}
@@ -102,7 +102,7 @@ func TestEncodedSizeEqualsBytes(t *testing.T) {
 
 func TestTruncatedPayloadThrows(t *testing.T) {
 	reg := mkDocReg(t, []fieldPair{{"n", pInt32}})
-	typ := schema.Ref{"demo.Doc"}
+	typ := schema.Ref{FullyQualifiedName: "demo.Doc"}
 	blob, err := EncodeBytes(RecordValue{Fields: map[int]Value{1: Int32Value{V: -3}}}, typ, reg)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestTruncatedPayloadThrows(t *testing.T) {
 
 func TestSourceReadsFirstValueBoundary(t *testing.T) {
 	reg := mkDocReg(t, []fieldPair{{"n", pInt32}})
-	typ := schema.Ref{"demo.Doc"}
+	typ := schema.Ref{FullyQualifiedName: "demo.Doc"}
 	mk := func(n int32) []byte {
 		b, err := EncodeBytes(RecordValue{Fields: map[int]Value{1: Int32Value{V: n}}}, typ, reg)
 		if err != nil {

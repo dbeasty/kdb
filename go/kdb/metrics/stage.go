@@ -79,12 +79,12 @@ func (r *Recorder) Track(stage string) func() {
 
 // StageSnapshot is a point-in-time summary of one stage's samples.
 type StageSnapshot struct {
-	Stage  string
-	Count  int64
-	Mean   time.Duration
-	P50    time.Duration
-	P99    time.Duration
-	Max    time.Duration
+	Stage string
+	Count int64
+	Mean  time.Duration
+	P50   time.Duration
+	P99   time.Duration
+	Max   time.Duration
 }
 
 // Snapshot returns a summary for every stage recorded so far, sorted by

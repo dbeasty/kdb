@@ -1,10 +1,9 @@
 name: CI
 
-# Manual only — re-enable push/pull_request when CI is stable again.
 on:
   workflow_dispatch:
-#  push:
-#  pull_request:
+  push:
+  pull_request:
 
 jobs:
   integration:
@@ -15,24 +14,53 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+          cache: gradle
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Run integration tests
         run: ./gradlew :kdb-integration:test :kdb-integration:e2ePython --no-daemon
 
+  kotlin-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Run full Kotlin test suite
+        # `test` alone only covers plain-kotlin.jvm-plugin modules - Kotlin Multiplatform
+        # modules (most of them) have jvmTest/jsTest/linuxX64Test instead, aggregated as
+        # allTests, which Gradle's `test` invocation never reaches (see the "MPP test-CI gap"
+        # finding in docs/kdb-finish-up-plan.md). macosArm64's tests only run on a macOS host,
+        # so they're implicitly skipped here (ubuntu-latest) rather than failing.
+        run: ./gradlew test allTests --no-daemon
+
   go-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go/go.mod
+      - name: Go vet
+        run: go vet ./...
+      - name: Go format check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
       - name: Go test
-        working-directory: go
         run: go test -race ./...
       - name: Go WASM build
-        working-directory: go
         run: GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
 
   go-interop:
@@ -44,9 +72,57 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+          cache: gradle
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go/go.mod
+      - name: Start JVM kdb-service (SQL wire over WebSocket)
+        run: |
+          ./gradlew :kdb-service:runService --no-daemon \
+            --args="--listen-sql-ws kdb-ws://127.0.0.1:17444/kdb?bind=true --namespace demo/interop" \
+            > /tmp/kdb-service.log 2>&1 &
+          echo $! > /tmp/kdb-service.pid
+      - name: Wait for kdb-service to accept connections
+        # :kdb-service:runService has to configure and compile its whole dependency graph (50+
+        # modules, several with JS/Native source sets Gradle still evaluates at configuration
+        # time even though this task only needs the JVM target) before the service process even
+        # starts - on a cold runner with no prior Gradle cache, that alone can take several
+        # minutes, well past what a short fixed wait assumes. 90s here previously produced a
+        # false failure: the log this step printed on timeout showed the build still mid-compile
+        # (last task ~:kdb-config:jar), nowhere near actually running the service yet.
+        run: |
+          for i in $(seq 1 480); do
+            if (exec 3<>/dev/tcp/127.0.0.1/17444) 2>/dev/null; then
+              exec 3<&- 3>&-
+              echo "kdb-service is accepting connections on 17444 (after ${i}s)"
+              exit 0
+            fi
+            if [ $((i % 30)) -eq 0 ]; then
+              echo "still waiting for kdb-service to open port 17444 (${i}s elapsed)..."
+            fi
+            sleep 1
+          done
+          echo "kdb-service never opened port 17444 after 480s - server log follows:"
+          cat /tmp/kdb-service.log || true
+          exit 1
       - name: Cross-language interop tests
         working-directory: go
-        run: go test ./kdb/interop/... -v
+        env:
+          KDB_JVM_SQL_WS_URI: ws://127.0.0.1:17444/kdb
+        run: |
+          set -o pipefail
+          go test -tags interop ./kdb/interop/... ./kdb/client/... -v | tee /tmp/interop.log
+          if grep -q '^--- SKIP' /tmp/interop.log; then
+            echo "interop test(s) reported SKIP - KDB_JVM_SQL_WS_URI wasn't honored, failing the job"
+            exit 1
+          fi
+      - name: Stop kdb-service
+        if: always()
+        run: kill "$(cat /tmp/kdb-service.pid)" 2>/dev/null || true
+      - name: Upload kdb-service log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdb-service-interop-log
+          path: /tmp/kdb-service.log
+          if-no-files-found: ignore

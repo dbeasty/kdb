@@ -12,12 +12,12 @@ import (
 
 // DefaultWriteAheadLog is a mutex-protected WAL over one active segment.
 type DefaultWriteAheadLog struct {
-	walID             codec.UUID
-	partitionKey      string
-	segmentName       string
-	io                storage.PlatformIOShim
+	walID              codec.UUID
+	partitionKey       string
+	segmentName        string
+	io                 storage.PlatformIOShim
 	walMaxSegmentBytes int64
-	skipCorrupt       bool
+	skipCorrupt        bool
 
 	mu              sync.Mutex
 	sequenceCounter int64
@@ -87,10 +87,10 @@ func (f *DefaultFactory) ActiveSegmentName(partitionKey string, walID codec.UUID
 	return io.SegmentNameBuilder.WAL(partitionKey, walID.String())
 }
 
-func (w *DefaultWriteAheadLog) WalID() codec.UUID              { return w.walID }
-func (w *DefaultWriteAheadLog) PartitionKey() string           { return w.partitionKey }
-func (w *DefaultWriteAheadLog) LastSequence() int64            { return w.sequenceCounter }
-func (w *DefaultWriteAheadLog) ActiveSegmentSizeBytes() int64  { return w.segmentSize }
+func (w *DefaultWriteAheadLog) WalID() codec.UUID             { return w.walID }
+func (w *DefaultWriteAheadLog) PartitionKey() string          { return w.partitionKey }
+func (w *DefaultWriteAheadLog) LastSequence() int64           { return w.sequenceCounter }
+func (w *DefaultWriteAheadLog) ActiveSegmentSizeBytes() int64 { return w.segmentSize }
 
 func (w *DefaultWriteAheadLog) Append(record Record) (AppendResult, error) {
 	w.mu.Lock()

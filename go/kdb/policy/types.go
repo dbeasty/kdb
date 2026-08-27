@@ -57,10 +57,10 @@ type RetainRule struct {
 
 // CompactionPolicy configures DAG compaction behavior.
 type CompactionPolicy struct {
-	KeepTagged         bool
-	KeepBranchPoints   bool
-	SquashAfter        SquashMode
-	RetainGranularity  []RetainRule
+	KeepTagged        bool
+	KeepBranchPoints  bool
+	SquashAfter       SquashMode
+	RetainGranularity []RetainRule
 }
 
 // TierBand is one hot/warm/cold band.
@@ -84,16 +84,16 @@ type TierPolicy struct {
 
 // GpuPromotionPolicyRef references GPU promotion thresholds.
 type GpuPromotionPolicyRef struct {
-	MinSegmentAgeMillis      int64
-	MinSegmentSizeBytes      int64
-	MaxChangeRatePerMinute   float64
+	MinSegmentAgeMillis    int64
+	MinSegmentSizeBytes    int64
+	MaxChangeRatePerMinute float64
 }
 
 // VectorIndexPolicy configures vector index defaults.
 type VectorIndexPolicy struct {
-	HnswM               int
-	HnswEfConstruction    int
-	DefaultDimensions     int
+	HnswM              int
+	HnswEfConstruction int
+	DefaultDimensions  int
 }
 
 // NamespacePolicy is the full policy for one namespace.

@@ -12,53 +12,78 @@ type Value interface {
 }
 
 type NullValue struct{}
+
 func (NullValue) isValue() {}
 
 type BoolValue struct{ V bool }
+
 func (BoolValue) isValue() {}
 
 type Int32Value struct{ V int32 }
+
 func (Int32Value) isValue() {}
 
 type Int64Value struct{ V int64 }
+
 func (Int64Value) isValue() {}
 
 type Float64Value struct{ V float64 }
+
 func (Float64Value) isValue() {}
 
 type StringValue struct{ V string }
+
 func (StringValue) isValue() {}
 
 type BytesValue struct{ V []byte }
+
 func (BytesValue) isValue() {}
 
 type ArrayValue struct{ Elements []Value }
+
 func (ArrayValue) isValue() {}
 
 type MapValue struct{ Entries []MapEntry }
+
 func (MapValue) isValue() {}
 
 type MapEntry struct{ Key, Val Value }
 
 type RecordValue struct{ Fields map[int]Value }
+
 func (RecordValue) isValue() {}
 
-type EnumValue struct{ Ordinal int; Symbol string }
+type EnumValue struct {
+	Ordinal int
+	Symbol  string
+}
+
 func (EnumValue) isValue() {}
 
-type UnionValue struct{ Branch int; Inner Value }
+type UnionValue struct {
+	Branch int
+	Inner  Value
+}
+
 func (UnionValue) isValue() {}
 
 type FixedValue struct{ V []byte }
+
 func (FixedValue) isValue() {}
 
 type DateValue struct{ DaysSinceEpoch int32 }
+
 func (DateValue) isValue() {}
 
-type TimestampValue struct{ EpochMicros int64; TZ *string }
+type TimestampValue struct {
+	EpochMicros int64
+	TZ          *string
+}
+
 func (TimestampValue) isValue() {}
 
 type UUIDValue struct{ MSB, LSB int64 }
+
 func (UUIDValue) isValue() {}
 
 var Null = NullValue{}

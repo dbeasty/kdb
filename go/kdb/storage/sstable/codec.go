@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	kdberr "github.com/limidus/kdb/go/kdb/error"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/compression"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -13,6 +15,11 @@ import (
 )
 
 const footerMagic = 0x4B444253
+
+// footerTrailerSize is the fixed-size trailer buildFooter appends after fileHash: a copy of
+// indexLen, duplicated here specifically so a reader can find it (and, from it, the footer's
+// start) using only its fixed offset from the end of the file. See buildFooter's doc comment.
+const footerTrailerSize = 4
 
 func encodeBlock(payload []byte, compress bool) ([]byte, error) {
 	var body []byte
@@ -33,27 +40,52 @@ func encodeBlock(payload []byte, compress bool) ([]byte, error) {
 	return out, nil
 }
 
+// decodeBlock verifies body against the CRC32 encodeBlock wrote at offset 8 before decoding it -
+// previously ignored entirely (kdb-finish-up-plan.md's 1-G1), so a corrupted or truncated block
+// was silently decompressed (or returned as-is) instead of failing loudly.
 func decodeBlock(block []byte) ([]byte, error) {
+	if len(block) < 12 {
+		return nil, kdberr.NewDecodeError("sstable block shorter than its 12-byte header", 0, nil)
+	}
 	compSize := readInt(block, 0)
 	uncompSize := readInt(block, 4)
+	wantCRC := uint32(readInt(block, 8))
 	body := block[12:]
+	if gotCRC := compression.CRC32All(body); gotCRC != wantCRC {
+		return nil, kdberr.NewDecodeError(
+			fmt.Sprintf("sstable block CRC mismatch: block is corrupt (want %08x, got %08x)", wantCRC, gotCRC),
+			0, nil)
+	}
 	if compSize == uncompSize {
 		return append([]byte(nil), body...), nil
 	}
 	return compression.Decompress(body, uncompSize+1024)
 }
 
+// buildFooter lays out magic(4) indexLen(4) indexBytes(indexLen) fileHash(32), then appends a
+// fixed 4-byte trailer duplicating indexLen at the very end of the footer (and, since the footer
+// is always the last thing written to a segment, at the very end of the file). That trailer is
+// what makes the footer locatable at all: parseFooter/DefaultReader.Get need indexLen to know
+// where the footer *starts*, relative to the end of the file, but indexLen itself was previously
+// only ever written *inside* the footer at a variable offset that depends on knowing where the
+// footer starts - an unsolvable bootstrap the old format never actually provided a way out of.
+// DefaultReader.Get could never locate a real footer (proven by round-tripping a single value:
+// it always failed with a read past EOF or garbage), which is presumably why this package had
+// zero tests before this fix. Mirrors the equivalent fix in kdb-storage-sstable's SsTableCodec.kt
+// (Kotlin was missing this trailer too) - the two must stay byte-for-byte identical; see
+// go/testdata/golden/codec's regenerated fixtures.
 func buildFooter(index map[codec.Hash]BlockHandle, fileHash codec.Hash) []byte {
 	var lines []string
 	for k, bh := range index {
 		lines = append(lines, fmt.Sprintf("%s:%d:%d", k.Hex(), bh.Offset, bh.CompressedSize))
 	}
 	indexBytes := []byte(strings.Join(lines, "\n"))
-	footer := make([]byte, 8+len(indexBytes)+32)
+	footer := make([]byte, 8+len(indexBytes)+32+footerTrailerSize)
 	writeInt(footer, 0, footerMagic)
 	writeInt(footer, 4, len(indexBytes))
 	copy(footer[8:], indexBytes)
-	copy(footer[len(footer)-32:], fileHash.Bytes[:])
+	copy(footer[8+len(indexBytes):8+len(indexBytes)+32], fileHash.Bytes[:])
+	writeInt(footer, len(footer)-footerTrailerSize, len(indexBytes))
 	return footer
 }
 
@@ -125,7 +157,12 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		if err != nil {
 			return Handle{}, err
 		}
-		blocks[e.key] = BlockHandle{Offset: offset, CompressedSize: len(block)}
+		// CompressedSize is the compressed body's own length - excluding encodeBlock's 12-byte
+		// header (compSize/uncompSize/crc) - matching what Get() expects when it later reads
+		// bh.CompressedSize+12 bytes starting at Offset. This used to store len(block) (the full
+		// 12+body length) instead, over-reading 12 bytes into whatever followed - the next block,
+		// or the footer for the last one - on every single Get().
+		blocks[e.key] = BlockHandle{Offset: offset, CompressedSize: len(block) - 12}
 		offset = newSize
 	}
 	var concat []byte
@@ -163,14 +200,19 @@ func (r *DefaultReader) Get(key codec.Hash) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if size < 40 {
+	if size < 40+footerTrailerSize {
 		return nil, nil
 	}
-	footerLen, err := r.readFooterIndexLen(size)
+	indexLen, err := r.readFooterIndexLen(size)
 	if err != nil {
 		return nil, err
 	}
-	footer, err := r.io.ReadFromSegment(r.handle.SegmentName, size-int64(footerLen)-32, footerLen+40)
+	// The footer body (everything buildFooter writes except its own trailing indexLen copy) is
+	// magic(4) + indexLen(4) + indexBytes(indexLen) + fileHash(32) = 40+indexLen bytes, sitting
+	// immediately before the footerTrailerSize-byte trailer at the true end of the file.
+	bodyLen := 40 + indexLen
+	footerStart := size - int64(bodyLen) - footerTrailerSize
+	footer, err := r.io.ReadFromSegment(r.handle.SegmentName, footerStart, bodyLen)
 	if err != nil {
 		return nil, err
 	}
@@ -207,12 +249,16 @@ func (r *DefaultReader) segmentSize() (int64, error) {
 	}
 }
 
+// readFooterIndexLen reads buildFooter's trailing indexLen copy - the last footerTrailerSize
+// bytes of the file. Previously read the last 8 bytes and took bytes [4:8] of that as indexLen,
+// which (with no trailer in the old format) was actually the tail 4 bytes of the 32-byte
+// fileHash - never a real length, and the reason Get() could never locate a real footer at all.
 func (r *DefaultReader) readFooterIndexLen(size int64) (int, error) {
-	tail, err := r.io.ReadFromSegment(r.handle.SegmentName, size-8, 8)
+	tail, err := r.io.ReadFromSegment(r.handle.SegmentName, size-footerTrailerSize, footerTrailerSize)
 	if err != nil {
 		return 0, err
 	}
-	return readInt(tail, 4), nil
+	return readInt(tail, 0), nil
 }
 
 func writeInt(arr []byte, off, v int) {

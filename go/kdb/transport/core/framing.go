@@ -1,7 +1,11 @@
 package core
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"fmt"
+	"os"
 
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -29,6 +33,66 @@ type TransportTlsSettings struct {
 	CertFile           string
 	KeyFile            string
 	ServerName         string
+	// RequireClientAuth, server-side only, turns on mTLS: the peer must present a certificate
+	// signed by CAFile, or the handshake fails. Requires CAFile to be set - there would
+	// otherwise be nothing to verify a presented client certificate against.
+	RequireClientAuth bool
+}
+
+// BuildTLSConfig turns s into a *tls.Config for either a server or a client role. Returns (nil,
+// nil) when s is nil or s.Enabled is false - the transport-package caller decides what "no TLS
+// configured" means for its own scheme (typically: fine for a plaintext URI, a hard error for a
+// secure one - never a silent downgrade to plaintext when the caller asked for TLS).
+func (s *TransportTlsSettings) BuildTLSConfig(server bool) (*tls.Config, error) {
+	if s == nil || !s.Enabled {
+		return nil, nil
+	}
+	cfg := &tls.Config{
+		ServerName:         s.ServerName,
+		InsecureSkipVerify: s.InsecureSkipVerify,
+	}
+	if s.CertFile != "" || s.KeyFile != "" {
+		if s.CertFile == "" || s.KeyFile == "" {
+			return nil, fmt.Errorf("tls: CertFile and KeyFile must both be set (or both empty)")
+		}
+		cert, err := tls.LoadX509KeyPair(s.CertFile, s.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls: load cert/key pair: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	} else if server {
+		return nil, fmt.Errorf("tls: server requires CertFile and KeyFile")
+	}
+	if s.CAFile != "" {
+		pemBytes, err := os.ReadFile(s.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls: read CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			return nil, fmt.Errorf("tls: no certificates found in %s", s.CAFile)
+		}
+		if server {
+			cfg.ClientCAs = pool
+		} else {
+			cfg.RootCAs = pool
+		}
+	}
+	if server {
+		if s.RequireClientAuth {
+			if s.CAFile == "" {
+				return nil, fmt.Errorf("tls: RequireClientAuth requires CAFile, to verify a presented client certificate against")
+			}
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		} else if s.CAFile != "" {
+			// A CAFile was given but client auth wasn't required - accept a client cert if
+			// offered and verify it, but don't demand one (useful for a server that wants to
+			// log/authorize by client identity when present without breaking clients that have
+			// none).
+			cfg.ClientAuth = tls.VerifyClientCertIfGiven
+		}
+	}
+	return cfg, nil
 }
 
 // FrameStreamReader reassembles length-prefixed wire frames from a byte stream.

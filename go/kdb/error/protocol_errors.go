@@ -5,7 +5,7 @@ import "fmt"
 // UnsupportedProtocolVersionError indicates an incompatible wire protocol version.
 type UnsupportedProtocolVersionError struct {
 	*base
-	PeerVersion     int
+	PeerVersion      int
 	SupportedVersion int
 }
 

@@ -7,29 +7,25 @@ import dev.kdb.document.KdbDocument
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.hours
 
 /** Trivial in-memory fake per component 41 spec §9: TokenAuthEngine is tested with no
  * password/RBAC machinery involved at all. */
 class FakeDocumentStore : DocumentReader, DocumentWriter {
     private val docs = mutableMapOf<String, MutableMap<String, KdbDocument>>()
 
-    override suspend fun findByField(
+    override suspend fun getById(
         namespace: String,
-        field: String,
-        value: String,
-    ): KdbDocument? {
-        val ns = docs[namespace] ?: return null
-        return ns.values.firstOrNull { doc ->
-            val json = Json.parseToJsonElement(doc.json).jsonObject
-            (json[field] as? JsonPrimitive)?.content == value
-        }
-    }
+        docId: String,
+    ): KdbDocument? = docs[namespace]?.get(docId)
 
     override suspend fun upsert(
         namespace: String,
@@ -46,11 +42,15 @@ class FakeDocumentStore : DocumentReader, DocumentWriter {
         docs[namespace]?.remove(docId)
     }
 
-    fun putRaw(
+    /** Writes a session document at the same derived id [TokenAuthEngine.authenticate] will look
+     * it up by (see [sessionDocId]) - matching what [SessionIssuer.issue] does in production,
+     * now that lookup is id-based rather than a scan for a matching token field. */
+    fun putSession(
         namespace: String,
-        docId: String,
+        token: String,
         json: String,
     ) {
+        val docId = sessionDocId(token)
         docs.getOrPut(namespace) { mutableMapOf() }[docId] = KdbDocument(KdbUuid.fromString(docId), json)
     }
 }
@@ -60,14 +60,14 @@ class TokenAuthEngineTest {
     private val config = TokenAuthConfig(sessionsNamespace = ns)
 
     private fun sessionJson(
-        token: String,
         expiresAtMicros: Long?,
         userId: String? = "user-1",
+        roles: List<String>? = null,
     ): String =
         buildJsonObject {
-            put("token", JsonPrimitive(token))
             if (expiresAtMicros != null) put("expiresAt", JsonPrimitive(expiresAtMicros))
             if (userId != null) put("userId", JsonPrimitive(userId))
+            if (roles != null) put("roles", buildJsonArray { roles.forEach { add(JsonPrimitive(it)) } })
         }.toString()
 
     private fun futureMicros(deltaMicros: Long = 3_600_000_000L): Long = KdbTimestamp.now().toEpochMicros() + deltaMicros
@@ -79,7 +79,7 @@ class TokenAuthEngineTest {
     fun validUnexpiredTokenAuthenticates() =
         runTest {
             val store = FakeDocumentStore()
-            store.putRaw(ns, KdbUuid.random().toString(), sessionJson("tok-1", futureMicros(), "user-42"))
+            store.putSession(ns, "tok-1", sessionJson(futureMicros(), "user-42"))
             val engine = TokenAuthEngine(config, store)
             val principal = engine.authenticate(AuthCredentials(token = "tok-1"))
             assertEquals("user-42", principal.id)
@@ -99,7 +99,7 @@ class TokenAuthEngineTest {
     fun expiredTokenRejectedWithTokenExpired() =
         runTest {
             val store = FakeDocumentStore()
-            store.putRaw(ns, KdbUuid.random().toString(), sessionJson("tok-expired", pastMicros()))
+            store.putSession(ns, "tok-expired", sessionJson(pastMicros()))
             val engine = TokenAuthEngine(config, store)
             val e = assertFailsWith<TokenAuthRejectedException> { engine.authenticate(AuthCredentials(token = "tok-expired")) }
             assertEquals(RejectReason.TOKEN_EXPIRED, e.reason)
@@ -111,7 +111,7 @@ class TokenAuthEngineTest {
         runTest {
             val store = FakeDocumentStore()
             val now = KdbTimestamp.now().toEpochMicros()
-            store.putRaw(ns, KdbUuid.random().toString(), sessionJson("tok-boundary", now))
+            store.putSession(ns, "tok-boundary", sessionJson(now))
             val engine = TokenAuthEngine(config, store)
             val e = assertFailsWith<TokenAuthRejectedException> { engine.authenticate(AuthCredentials(token = "tok-boundary")) }
             assertEquals(RejectReason.TOKEN_EXPIRED, e.reason)
@@ -122,8 +122,7 @@ class TokenAuthEngineTest {
     fun guestSessionWithoutPrincipalIdStillAuthenticates() =
         runTest {
             val store = FakeDocumentStore()
-            val docId = KdbUuid.random().toString()
-            store.putRaw(ns, docId, sessionJson("tok-guest", futureMicros(), userId = null))
+            store.putSession(ns, "tok-guest", sessionJson(futureMicros(), userId = null))
             val engine = TokenAuthEngine(config, store)
             val principal = engine.authenticate(AuthCredentials(token = "tok-guest"))
             assertTrue(principal.id.isNotEmpty(), "guest principal must still have some id")
@@ -142,8 +141,7 @@ class TokenAuthEngineTest {
     @Test
     fun storageFailurePropagatesAsException() =
         runTest {
-            val failing =
-                DocumentReader { _, _, _ -> throw IllegalStateException("storage outage") }
+            val failing = DocumentReader { _, _ -> throw IllegalStateException("storage outage") }
             val engine = TokenAuthEngine(config, failing)
             assertFailsWith<IllegalStateException> { engine.authenticate(AuthCredentials(token = "whatever")) }
         }
@@ -153,9 +151,64 @@ class TokenAuthEngineTest {
     fun sessionDocumentWithMissingExpiresAtTreatedAsInvalid() =
         runTest {
             val store = FakeDocumentStore()
-            store.putRaw(ns, KdbUuid.random().toString(), sessionJson("tok-no-expiry", expiresAtMicros = null))
+            store.putSession(ns, "tok-no-expiry", sessionJson(expiresAtMicros = null))
             val engine = TokenAuthEngine(config, store)
             val e = assertFailsWith<TokenAuthRejectedException> { engine.authenticate(AuthCredentials(token = "tok-no-expiry")) }
             assertEquals(RejectReason.TOKEN_EXPIRED, e.reason)
+        }
+
+    /**
+     * Regression test for docs/kdb-finish-up-plan.md's 1-K9: the token-authenticated Principal
+     * used to always get an empty role set (SessionIssuer.issue never persisted the roles it was
+     * given, and TokenAuthEngine never read any back), so any RBAC authorizer denied a
+     * token-authenticated principal everything regardless of what its original login actually
+     * granted.
+     */
+    @Test
+    fun rolesFromTheSessionDocumentSurviveOntoTheAuthenticatedPrincipal() =
+        runTest {
+            val store = FakeDocumentStore()
+            store.putSession(ns, "tok-roles", sessionJson(futureMicros(), "user-7", roles = listOf("reader", "writer")))
+            val engine = TokenAuthEngine(config, store)
+            val principal = engine.authenticate(AuthCredentials(token = "tok-roles"))
+            assertEquals(setOf("reader", "writer"), principal.roles)
+        }
+
+    @Test
+    fun sessionWithNoRolesFieldAuthenticatesWithEmptyRoles() =
+        runTest {
+            val store = FakeDocumentStore()
+            store.putSession(ns, "tok-noroles", sessionJson(futureMicros(), "user-7"))
+            val engine = TokenAuthEngine(config, store)
+            val principal = engine.authenticate(AuthCredentials(token = "tok-noroles"))
+            assertEquals(emptySet(), principal.roles)
+        }
+
+    /**
+     * Regression test for the other half of 1-K9: SessionIssuer.issue used to write the raw
+     * bearer token into the session document's own body (needed for the old O(n) field-scan
+     * lookup) - a cleartext copy of the credential sitting in whatever storage backs the sessions
+     * namespace. Lookup is id-derived now (see sessionDocId), so the token must not appear in the
+     * document at all.
+     */
+    @Test
+    fun issuedSessionDocumentDoesNotContainTheRawToken() =
+        runTest {
+            val writes = mutableMapOf<String, String>()
+            val writer =
+                object : DocumentWriter {
+                    override suspend fun upsert(namespace: String, docId: String, json: String) {
+                        writes[docId] = json
+                    }
+
+                    override suspend fun delete(namespace: String, docId: String) = Unit
+                }
+            val issuer = SessionIssuer(config, writer)
+            val token = issuer.issue(dev.kdb.auth.Principal(id = "user-1"), 1.hours).token
+
+            val storedJson = writes.getValue(sessionDocId(token))
+            val fields = Json.parseToJsonElement(storedJson).jsonObject.keys
+            assertFalse(fields.any { it.contains("token", ignoreCase = true) }, "session document must not carry a token-shaped field: $fields")
+            assertFalse(storedJson.contains(token), "session document body must not contain the raw token value at all")
         }
 }

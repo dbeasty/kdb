@@ -57,21 +57,29 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		lock.Release()
 		return nil, err
 	}
+	// Every return between here and the success path below used to call lock.Release() alone,
+	// leaking handle's open file descriptors and unsealed WAL on any post-open failure (schema
+	// sync, delta replay, ...). handleClosed tracks whether the success path already took over
+	// responsibility for handle - the deferred cleanup only fires on an early return.
+	handleClosed := false
+	defer func() {
+		if !handleClosed {
+			_ = handle.Close()
+			lock.Release()
+		}
+	}()
 
 	d, err := dag.NewInMemoryCommitDag(namespaceID)
 	if err != nil {
-		lock.Release()
 		return nil, err
 	}
 
 	store := handle.Adapter()
 	if store == nil {
-		lock.Release()
 		return nil, fmt.Errorf("file runtime missing storage adapter")
 	}
 
 	if err := replayDeltaNamespace(d, store, handle.DeltaReader()); err != nil {
-		lock.Release()
 		return nil, err
 	}
 	dagOut := dag.CommitDAG(d)
@@ -89,10 +97,10 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	}
 	if !sch.IsNone() {
 		if err := syncEmbedSchema(rt, namespaceID, sch); err != nil {
-			lock.Release()
 			return nil, err
 		}
 	}
+	handleClosed = true
 	rt.release = lock.Release
 	// storageClose is what makes Close() an orderly shutdown rather than a no-op that only
 	// releases the directory lock (kdb-spec-layer13 Component 47 §2.4/§4.5) - previously nothing

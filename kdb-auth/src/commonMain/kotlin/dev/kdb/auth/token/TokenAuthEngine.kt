@@ -7,6 +7,7 @@ import dev.kdb.auth.Principal
 import dev.kdb.codec.KdbTimestamp
 import dev.kdb.document.KdbDocument
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -20,18 +21,21 @@ import kotlinx.serialization.json.longOrNull
  */
 public data class TokenAuthConfig(
     val sessionsNamespace: String,
-    val tokenField: String = "token",
     val expiresAtField: String = "expiresAt",
     val principalIdField: String = "userId",
+    val rolesField: String = "roles",
 )
 
 /** Narrow, read-only capability [TokenAuthEngine] needs - not a full EmbedRuntime/StorageAdapter,
- * so this can be unit-tested with a trivial in-memory fake (component 41 spec §9). */
+ * so this can be unit-tested with a trivial in-memory fake (component 41 spec §9). Looks up a
+ * session document by its id directly (see [sessionDocId]) rather than scanning for one whose
+ * token field matches - an O(1) lookup instead of an O(n) collection scan, and it means the
+ * session document itself never needs to hold the bearer token in the clear (see
+ * [SessionIssuer.issue]'s doc comment). */
 public fun interface DocumentReader {
-    public suspend fun findByField(
+    public suspend fun getById(
         namespace: String,
-        field: String,
-        value: String,
+        docId: String,
     ): KdbDocument?
 }
 
@@ -67,7 +71,7 @@ public class TokenAuthEngine(
             credentials.token
                 ?: throw TokenAuthRejectedException(RejectReason.MALFORMED_CREDENTIALS, "missing bearer token")
         val doc =
-            documentReader.findByField(config.sessionsNamespace, config.tokenField, token)
+            documentReader.getById(config.sessionsNamespace, sessionDocId(token))
                 ?: throw TokenAuthRejectedException(RejectReason.TOKEN_NOT_FOUND, "no session for token")
         return principalFromSessionDocument(doc)
     }
@@ -89,9 +93,18 @@ public class TokenAuthEngine(
         }
         val principalId =
             (json[config.principalIdField] as? JsonPrimitive)?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() }
+        // Roles the principal held at issue() time (see SessionIssuer.issue), not looked up
+        // fresh here - previously omitted entirely, so every token-authenticated Principal had
+        // an empty role set and any RBAC authorizer denied it everything regardless of what the
+        // original login actually granted.
+        val roles =
+            (json[config.rolesField] as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.content }
+                ?.toSet()
+                ?: emptySet()
         // Guest session (no/blank principalIdField, spec §7 test 5): identify by the session
         // document's own id rather than leaving Principal.id empty.
-        return Principal(id = principalId ?: doc.id.toString())
+        return Principal(id = principalId ?: doc.id.toString(), roles = roles)
     }
 }
 

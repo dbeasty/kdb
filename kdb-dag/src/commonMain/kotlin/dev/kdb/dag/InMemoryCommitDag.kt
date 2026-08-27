@@ -148,7 +148,13 @@ internal class InMemoryCommitDag(
         // always expects to find that original result, not a later, unrelated commit that
         // happens to reuse the id (which shouldn't legitimately happen, since ids are random
         // UUIDs minted fresh per transaction attempt, but "first wins" is the safer tie-break).
-        txIndex.putIfAbsent(commit.transactionId, commit.hash)
+        // MutableMap.putIfAbsent is a JVM-only extension (backed by java.util.Map), not part of
+        // Kotlin's common MutableMap - this whole function already runs under mutex.withLock
+        // (see putCommit above), so a plain containsKey-then-set is just as atomic here and
+        // compiles on every target.
+        if (!txIndex.containsKey(commit.transactionId)) {
+            txIndex[commit.transactionId] = commit.hash
+        }
     }
 
     override suspend fun getCommitByTransactionId(txId: KdbUuid): KdbCommit? =

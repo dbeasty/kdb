@@ -29,10 +29,19 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.time.TimeSource
+
+/**
+ * Best-effort final flush from non-suspend code (see [ServerStorageEngine.stopAsyncSync]).
+ * `kotlinx.coroutines.runBlocking` has no JS implementation - a single-threaded event loop can't
+ * synchronously wait for a suspend function the way JVM/Native can - so this can't be one
+ * `commonMain` function. JVM and Native actually block until [wal]'s sync completes; JS starts
+ * the sync and returns immediately without waiting for it (see the `jsMain` actual's doc comment
+ * for why that's the honest option here, not a shortcut).
+ */
+internal expect fun blockingFinalSync(wal: WriteAheadLog?)
 
 public open class ServerStorageEngine(
     override val namespaceId: String,
@@ -103,11 +112,17 @@ public open class ServerStorageEngine(
      * Stops the background async-sync loop (if running) and does a final
      * flush, so an ASYNC-durability namespace doesn't lose writes made
      * just before shutdown. No-op for other durability modes.
+     *
+     * Not `suspend`: this overrides [StorageEngineHandle.close] via
+     * [kotlin.AutoCloseable], whose contract is synchronous, so the final
+     * flush has to be triggered from ordinary (non-suspend) code - see
+     * [blockingFinalSync]'s platform-specific implementations for how each
+     * target reconciles that with [WriteAheadLog.sync] being `suspend`.
      */
     public fun stopAsyncSync() {
         val scope = asyncScope ?: return
         scope.cancel()
-        runBlocking { wal?.sync() }
+        blockingFinalSync(wal)
     }
 
     override suspend fun writeBlob(bytes: ByteArray): KdbHash {

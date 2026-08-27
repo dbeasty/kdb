@@ -8,6 +8,8 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class StaticAuthEngineTest {
     private val engine =
@@ -69,5 +71,47 @@ class StaticAuthEngineTest {
                 )
             val p = syncEngine.authenticator.authenticate(AuthCredentials(user = "syncer", password = "s-secret"))
             syncEngine.authorizer.authorize(p, AuthAction.PeerSync("demo/users"))
+        }
+
+    /**
+     * Regression tests for docs/kdb-finish-up-plan.md's 1-K8: authenticate() used to compare
+     * secrets with plain String `!=`, which short-circuits at the first differing character - a
+     * measurable timing side channel an attacker could use to brute-force a static-config secret
+     * character-by-character. [constantTimeEquals] must be functionally equivalent to `==` for
+     * every case `!=` already handled correctly (equal strings, unequal strings, different
+     * lengths, empty strings) - a true timing-channel difference isn't practically provable in a
+     * unit test, so this verifies the replacement introduces no functional regression.
+     */
+    @Test
+    fun constantTimeEquals_matchesRegularEqualityForEqualStrings() {
+        assertTrue(constantTimeEquals("same-secret", "same-secret"))
+        assertTrue(constantTimeEquals("", ""))
+    }
+
+    @Test
+    fun constantTimeEquals_matchesRegularEqualityForUnequalStrings() {
+        assertFalse(constantTimeEquals("secret", "secreu")) // differs in the last character
+        assertFalse(constantTimeEquals("secret", "aecret")) // differs in the first character
+        assertFalse(constantTimeEquals("secret", "SECRET"))
+    }
+
+    @Test
+    fun constantTimeEquals_handlesDifferentLengthsWithoutShortCircuiting() {
+        assertFalse(constantTimeEquals("short", "much-longer-secret"))
+        assertFalse(constantTimeEquals("much-longer-secret", "short"))
+        assertFalse(constantTimeEquals("", "nonempty"))
+        assertFalse(constantTimeEquals("nonempty", ""))
+        // A common length-mismatch pitfall: the shorter string is a strict prefix of the longer
+        // one, so a naive char-by-char loop bounded by the shorter length would see no
+        // differences at all.
+        assertFalse(constantTimeEquals("secret", "secretplus"))
+    }
+
+    @Test
+    fun authenticate_rejectsSecretsOfDifferentLength() =
+        runTest {
+            assertFailsWith<KdbAuthenticationException> {
+                engine.authenticator.authenticate(AuthCredentials(user = "reader", password = "r-secret-but-longer"))
+            }
         }
 }

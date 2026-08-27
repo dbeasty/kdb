@@ -3,9 +3,10 @@
 // write one document by id, commit a transaction with optimistic-concurrency semantics, upsert
 // unconditionally, and run the occasional SQL statement - not a general database/sql driver.
 //
-// One *Client is one TCP connection, one KDB session per namespace touched. Reuses
-// go/kdb/wire and go/kdb/transport/tcp directly per the component spec's explicit reuse
-// decision - this package is request/response semantics and ergonomics on top of them, not a
+// One *Client is one wire connection, one KDB session per namespace touched. Reuses go/kdb/wire
+// directly, plus go/kdb/transport/tcp (the component spec's original reuse target) or
+// go/kdb/transport/ws (component 25's WebSocket transport, chosen by addr's scheme - see
+// Connect) - this package is request/response semantics and ergonomics on top of them, not a
 // second wire implementation.
 package client
 
@@ -23,6 +24,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
+	"github.com/limidus/kdb/go/kdb/transport/ws"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -176,16 +178,32 @@ type namespaceState struct {
 	head      codec.Hash
 }
 
+// ConnectOptions extends Connect with transport-level settings that don't belong in addr/token -
+// currently just TLS, for tcps:// and wss:// (see dialTransport's scheme table).
+type ConnectOptions struct {
+	TLS *core.TransportTlsSettings
+}
+
 // Connect dials addr (host:port, or a tcp://... wire URI) and performs the wire handshake.
 // token, if non-empty, authenticates as "user:secret" (matching wire.HandshakePayload.Token) -
 // pass "" against a server with no RBAC configured (auth.AllowAll). Blocks until the handshake
-// completes or ctx is cancelled.
+// completes or ctx is cancelled. Equivalent to ConnectWithOptions with a zero ConnectOptions
+// (plaintext only - see ConnectWithOptions for tcps:///wss://).
 func Connect(ctx context.Context, addr string, token string) (*Client, error) {
+	return ConnectWithOptions(ctx, addr, token, ConnectOptions{})
+}
+
+// ConnectWithOptions is Connect plus transport options (currently: TLS settings, required for a
+// tcps:// or wss:// addr - see dialTransport).
+func ConnectWithOptions(ctx context.Context, addr string, token string, opts ConnectOptions) (*Client, error) {
 	uri := addr
 	if !hasScheme(uri) {
 		uri = "tcp://" + uri
 	}
-	transport := tcp.NewTransport(core.DefaultConnectOptions())
+	transport, err := dialTransport(uri, opts)
+	if err != nil {
+		return nil, err
+	}
 	conn, err := transport.Connect(uri)
 	if err != nil {
 		return nil, &TransportError{Cause: err}
@@ -238,6 +256,30 @@ func Connect(ctx context.Context, addr string, token string) (*Client, error) {
 // scheme separator and left unprefixed - matching "://" is what a scheme actually looks like.
 func hasScheme(uri string) bool {
 	return strings.Contains(uri, "://")
+}
+
+// dialTransport picks the wire transport implementation by uri's scheme: tcp:// (the component
+// spec's original reuse target, and Connect's default for a bare host:port), tcps:// (the same,
+// over TLS), ws:// (component 25's WebSocket transport - already real, already proven
+// cross-language by go/kdb/interop's Go-WS-client-against-JVM-server interop test), or wss://
+// (WebSocket over TLS). opts.TLS is only consulted for the two secure schemes - each transport's
+// own Connect refuses a tcps:///wss:// URI outright if it turns out unset or disabled, rather
+// than silently downgrading to plaintext.
+func dialTransport(uri string, opts ConnectOptions) (stream.Transport, error) {
+	connectOpts := core.DefaultConnectOptions()
+	connectOpts.TLS = opts.TLS
+	switch {
+	case strings.HasPrefix(uri, "tcps://"):
+		return tcp.NewTransport(connectOpts), nil
+	case strings.HasPrefix(uri, "tcp://"):
+		return tcp.NewTransport(connectOpts), nil
+	case strings.HasPrefix(uri, "wss://"):
+		return ws.NewTransport(connectOpts), nil
+	case strings.HasPrefix(uri, "ws://"):
+		return ws.NewTransport(connectOpts), nil
+	default:
+		return nil, fmt.Errorf("kdb: unsupported scheme in %q (expected tcp://, tcps://, ws://, wss://, or a bare host:port)", uri)
+	}
 }
 
 // Close closes the underlying connection. Safe to call more than once.

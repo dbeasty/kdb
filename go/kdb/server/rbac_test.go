@@ -207,4 +207,38 @@ func TestListenSqlWireRbacEndToEnd(t *testing.T) {
 	}
 }
 
+// TestListenSqlWireDeniesCreateTableForReadOnlyPrincipal is the regression test for the finding
+// recorded in docs/kdb-finish-up-plan.md as 1-G6: handleSqlExec authorized any non-INSERT
+// statement as ReadOnly:true, so CREATE TABLE - which is neither StmtInsert nor StmtSelect - was
+// checked as a read and a principal with only a read grant could rewrite the namespace's schema.
+func TestListenSqlWireDeniesCreateTableForReadOnlyPrincipal(t *testing.T) {
+	rt := newTestRuntime(t)
+	engine, store := newTestRegistryAuthEngine(t)
+	rt.AuthEngine = engine
+	if err := store.CreateRole("reader", []string{"read:app/data"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser("reader-user", "reader-pw", []string{"reader"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := ListenSqlWire("tcp://127.0.0.1:0?bind=true", rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := fmt.Sprintf("tcp://%s", ln.Addr().String())
+
+	reader := dialRawWireClient(t, addr)
+	readerAck := reader.handshakeWithCredentials(t, "reader-user", "reader-pw")
+	if !readerAck.Response.Accepted {
+		t.Fatalf("reader handshake rejected: %+v", readerAck.Response.RejectionReason)
+	}
+	readerSess := reader.sessionBegin(t, "app/data", "READ_COMMITTED")
+	result := reader.sqlExec(t, "app/data", readerSess.SessionID, `CREATE TABLE t (id VARCHAR NOT NULL)`)
+	if result.Error == nil {
+		t.Fatal("expected CREATE TABLE to be denied for a principal with only a read grant")
+	}
+}
+
 func ptr(s string) *string { return &s }

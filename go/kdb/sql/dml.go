@@ -4,10 +4,10 @@ import (
 	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/codec"
-	kdbjson "github.com/limidus/kdb/go/kdb/json"
 	"github.com/limidus/kdb/go/kdb/document"
-	"github.com/limidus/kdb/go/kdb/schema"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
+	kdbjson "github.com/limidus/kdb/go/kdb/json"
+	"github.com/limidus/kdb/go/kdb/schema"
 )
 
 // DMLExecutor builds document operations for INSERT.

@@ -1,6 +1,7 @@
 package stream
 
 import "github.com/limidus/kdb/go/kdb/wire"
+
 type IndexHintApplier interface {
 	Apply(namespaceID string, hints []wire.IndexHint)
 }

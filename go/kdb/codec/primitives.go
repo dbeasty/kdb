@@ -98,8 +98,8 @@ func (h Hash) Hex() string { return hex.EncodeToString(h.Bytes[:]) }
 
 // Timestamp is a logical instant with microsecond resolution within a millisecond.
 type Timestamp struct {
-	EpochMillis     int64
-	MicroRemainder  int
+	EpochMillis    int64
+	MicroRemainder int
 }
 
 func (t Timestamp) EpochMicros() int64 { return t.EpochMillis*1000 + int64(t.MicroRemainder) }

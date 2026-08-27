@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
+	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/stream"
@@ -490,6 +492,110 @@ func TestListenSqlWireCloseStopsAccepting(t *testing.T) {
 	transport := tcp.NewTransport(core.DefaultConnectOptions())
 	if _, err := transport.Connect(addr); err == nil {
 		t.Fatal("expected connect to fail after Close")
+	}
+}
+
+// TestListenSqlWireTransactionReplayAppliesAndIsQueryable exercises handleTransactionReplay via
+// a real SQL_CLIENT wire connection - the entry point this gets reached through independent of
+// go/kdb/stream's write-back coordinator (see kdb/stream/write_back_test.go for that path). No
+// session is used, matching handleTransactionReplay's own contract: it's one self-contained
+// transaction, not built up against a session's pending statement builder.
+func TestListenSqlWireTransactionReplayAppliesAndIsQueryable(t *testing.T) {
+	rt := newTestRuntime(t)
+	ln, err := ListenSqlWire("tcp://127.0.0.1:0?bind=true", rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := fmt.Sprintf("tcp://%s", ln.Addr().String())
+
+	client := dialRawWireClient(t, addr)
+	client.handshake(t, wire.ClientSQL, "app/data")
+
+	docID, err := codec.RandomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	txID, err := codec.RandomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := document.Transaction{
+		ID:         txID,
+		Operations: []document.Op{document.WriteOp{DocID: docID, Patch: `{"v":"replayed"}`}},
+		Timestamp:  codec.TimestampNow(),
+	}
+	txBytes, err := wire.EncodeTransaction(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayMsg := wire.TransactionReplayMessage{
+		H:                wire.Header{MessageType: wire.MsgTransactionReplay, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: client.nextCorrelation()},
+		Namespace:        "app/data",
+		TransactionBytes: txBytes,
+	}
+	reply := client.request(t, replayMsg)
+	result, ok := reply.(wire.SqlResultMessage)
+	if !ok {
+		t.Fatalf("expected SqlResultMessage, got %T", reply)
+	}
+	if result.Error != nil {
+		t.Fatalf("replay: %s", *result.Error)
+	}
+	if result.ResolvedCommitHex == "" {
+		t.Fatal("expected a resolved commit hash")
+	}
+
+	// It's a real commit on main, immediately visible - not a buffered-but-uncommitted change
+	// the way a SqlExec INSERT is before TxCommit.
+	jsonBody, commitHex, found, err := rt.GetDocument("app/data", docID)
+	if err != nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if !found {
+		t.Fatal("expected the replayed document to be visible via GetDocument")
+	}
+	if jsonBody != `{"v":"replayed"}` {
+		t.Fatalf("expected the replayed JSON, got %q", jsonBody)
+	}
+	if commitHex != result.ResolvedCommitHex {
+		t.Fatalf("expected GetDocument's commit %s to match the replay response %s", commitHex, result.ResolvedCommitHex)
+	}
+}
+
+// TestListenSqlWireTransactionReplayRequiresAuthentication mirrors the other write paths'
+// (handleUpsert, handleTxCommit) auth gating - a TransactionReplay before a successful
+// handshake must be rejected, not silently applied.
+func TestListenSqlWireTransactionReplayRequiresAuthentication(t *testing.T) {
+	rt := newTestRuntime(t)
+	ln, err := ListenSqlWire("tcp://127.0.0.1:0?bind=true", rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := fmt.Sprintf("tcp://%s", ln.Addr().String())
+
+	client := dialRawWireClient(t, addr)
+	txID, err := codec.RandomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	txBytes, err := wire.EncodeTransaction(document.Transaction{ID: txID, Timestamp: codec.TimestampNow()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayMsg := wire.TransactionReplayMessage{
+		H:                wire.Header{MessageType: wire.MsgTransactionReplay, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: client.nextCorrelation()},
+		Namespace:        "app/data",
+		TransactionBytes: txBytes,
+	}
+	reply := client.request(t, replayMsg)
+	result, ok := reply.(wire.SqlResultMessage)
+	if !ok {
+		t.Fatalf("expected SqlResultMessage, got %T", reply)
+	}
+	if result.Error == nil {
+		t.Fatal("expected an error before handshake")
 	}
 }
 

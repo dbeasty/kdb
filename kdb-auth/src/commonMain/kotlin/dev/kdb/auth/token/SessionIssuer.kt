@@ -5,6 +5,7 @@ import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
 import dev.kdb.document.kdbSha256
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlin.time.Duration
 
@@ -13,6 +14,15 @@ public data class SessionToken(
     val token: String,
     val expiresAt: KdbTimestamp,
 )
+
+/** Deterministic doc id from the token value alone, matching
+ * [dev.kdb.auth.store.RegistryAuthStore]'s own deterministicId convention - lets both
+ * [SessionIssuer] ([issue]/[SessionIssuer.revoke]) and [TokenAuthEngine.authenticate] compute the
+ * same id from the token without a separate lookup or a stored copy of the token itself. */
+internal fun sessionDocId(token: String): String {
+    val digest = kdbSha256(token.encodeToByteArray())
+    return KdbUuid.fromBytes(digest.copyOfRange(0, 16)).toString()
+}
 
 /** Narrow write capability [SessionIssuer] needs - symmetric to [DocumentReader], so this can be
  * unit-tested with a trivial in-memory fake. Writes are unconditional (Upsert-shaped, per
@@ -52,10 +62,19 @@ public class SessionIssuer(
         val expiresAt = KdbTimestamp.fromEpochMicros(KdbTimestamp.now().toEpochMicros() + ttl.inWholeMicroseconds)
         val json =
             buildJsonObject {
-                put(config.tokenField, JsonPrimitive(token))
+                // The token itself is never stored: TokenAuthEngine.authenticate looks a session
+                // up by sessionDocId(token) directly rather than scanning for a matching token
+                // field, so mere possession of a token that hashes to this document's id already
+                // is the proof of validity - keeping a second, cleartext copy of the bearer
+                // secret inside the document body it unlocks would only add exposure (readable
+                // by anyone who can browse the sessions namespace, or in an unencrypted backup)
+                // for no benefit.
                 put(config.expiresAtField, JsonPrimitive(expiresAt.toEpochMicros()))
                 if (principal.id.isNotEmpty()) {
                     put(config.principalIdField, JsonPrimitive(principal.id))
+                }
+                if (principal.roles.isNotEmpty()) {
+                    put(config.rolesField, buildJsonArray { principal.roles.forEach { add(JsonPrimitive(it)) } })
                 }
             }
         documentWriter.upsert(config.sessionsNamespace, sessionDocId(token), json.toString())
@@ -66,13 +85,5 @@ public class SessionIssuer(
      * call with this token returns [RejectReason.TOKEN_NOT_FOUND], not a stale success. */
     public suspend fun revoke(token: String) {
         documentWriter.delete(config.sessionsNamespace, sessionDocId(token))
-    }
-
-    /** Deterministic doc id from the token value alone, matching
-     * [dev.kdb.auth.store.RegistryAuthStore]'s own deterministicId convention - lets [revoke]
-     * compute the same id [issue] used without a lookup. */
-    private fun sessionDocId(token: String): String {
-        val digest = kdbSha256(token.encodeToByteArray())
-        return KdbUuid.fromBytes(digest.copyOfRange(0, 16)).toString()
     }
 }

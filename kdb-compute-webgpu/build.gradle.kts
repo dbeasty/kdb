@@ -24,7 +24,7 @@ kotlin {
             implementation(libs.kotlinx.coroutines.core)
         }
         jsMain.dependencies {}
-        jsTest.dependencies {
+        commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
         }

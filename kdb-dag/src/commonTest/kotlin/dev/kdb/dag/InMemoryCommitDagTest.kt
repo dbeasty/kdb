@@ -50,6 +50,37 @@ class InMemoryCommitDagTest {
             assertNotNull(dag.getCommit(c.hash))
         }
 
+    /**
+     * Regression test for a MutableMap.putIfAbsent JVM-only-extension compile bug found while
+     * chasing docs/kdb-finish-up-plan.md's 1-K10 (this file is unrelated to that finding, but
+     * fixing the compile break here - putCommitLocked's txIndex bookkeeping didn't compile for
+     * Kotlin/JS at all - is what made ./gradlew allTests reach every other module in the first
+     * place). Verifies the "first commit for a transaction id wins" semantic the JVM-only
+     * putIfAbsent used to implement is preserved by its portable containsKey-then-set
+     * replacement: appending two different commits that (illegally, but that's exactly the
+     * defensive case) share one transaction id must keep resolving that id to the first commit.
+     */
+    @Test
+    fun getCommitByTransactionId_firstCommitForATransactionIdWins() =
+        runTest {
+            val dag = inMemoryCommitDag("ns")
+            val root = dag.head()
+            val tx =
+                KdbTransaction(
+                    id = KdbUuid.random(),
+                    baseVersion = root,
+                    operations = emptyList(),
+                    timestamp = KdbTimestamp.now(),
+                    authorNodeId = KdbUuid.random(),
+                )
+            val tree = DocumentTree.EMPTY
+            val first = dag.appendCommit(tx, root, tree, schemaHash = null, message = "first")
+            val second = dag.appendCommit(tx, first.hash, tree, schemaHash = null, message = "second")
+
+            assertTrue(first.hash != second.hash, "test setup: the two commits must actually be distinct")
+            assertEquals(first.hash, dag.getCommitByTransactionId(tx.id)?.hash, "the first commit for this transaction id must still win")
+        }
+
     @Test
     fun tc02_putCommitIdempotent() =
         runTest {

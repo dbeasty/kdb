@@ -108,8 +108,8 @@ type ExprParameter struct{ Index int }
 func (ExprParameter) isExpr() {}
 
 type ExprBinary struct {
-	Op             BinaryOp
-	Left, Right    Expr
+	Op          BinaryOp
+	Left, Right Expr
 }
 
 func (ExprBinary) isExpr() {}
@@ -233,9 +233,9 @@ type QueryRow struct {
 
 // ResultColumn describes a column in the result.
 type ResultColumn struct {
-	Name   string
+	Name    string
 	SQLType string
-	Source ColumnSource
+	Source  ColumnSource
 }
 
 // ColumnSource classifies result column origin.

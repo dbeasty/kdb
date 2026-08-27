@@ -47,8 +47,14 @@ func PutJSONDocument(rt *EmbeddedKdbRuntime, namespaceID, jsonText string) (PutR
 	if err != nil {
 		return PutResult{}, err
 	}
-	txID, _ := codec.RandomUUID()
-	author, _ := codec.RandomUUID()
+	txID, err := codec.RandomUUID()
+	if err != nil {
+		return PutResult{}, err
+	}
+	author, err := codec.RandomUUID()
+	if err != nil {
+		return PutResult{}, err
+	}
 	tx := document.Transaction{
 		ID:           txID,
 		BaseVersion:  head,
@@ -66,13 +72,17 @@ func PutJSONDocument(rt *EmbeddedKdbRuntime, namespaceID, jsonText string) (PutR
 func resolveDocID(root map[string]json.RawMessage) (codec.UUID, error) {
 	idRaw, ok := root["id"]
 	if !ok {
-		id, err := codec.RandomUUID()
-		return id, err
+		return codec.RandomUUID()
 	}
 	var idStr string
-	if err := json.Unmarshal(idRaw, &idStr); err != nil || idStr == "" {
-		id, err := codec.RandomUUID()
-		return id, err
+	if err := json.Unmarshal(idRaw, &idStr); err != nil {
+		// A caller-supplied "id" that isn't a JSON string (a number, an object, ...) is a
+		// mistake worth surfacing, not silently overwritten with a fresh random id the caller
+		// never asked for and won't be expecting.
+		return codec.UUID{}, fmt.Errorf("kdb: \"id\" field must be a string, got %s: %w", idRaw, err)
+	}
+	if idStr == "" {
+		return codec.UUID{}, fmt.Errorf("kdb: \"id\" field must not be empty")
 	}
 	return codec.ParseUUID(idStr)
 }

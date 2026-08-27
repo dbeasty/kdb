@@ -33,8 +33,8 @@ func TestPublishDeliversDeltaToSubscriber(t *testing.T) {
 
 	coordinator := stream.NewCoordinator(w, transport)
 	if err := coordinator.Start(stream.SessionConfig{
-		NamespaceID: ns,
-		NodeID:      "coord",
+		NamespaceID:  ns,
+		NodeID:       "coord",
 		HeadProvider: func() (codec.Hash, error) { return parent, nil },
 	}); err != nil {
 		t.Fatal(err)

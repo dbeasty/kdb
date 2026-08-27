@@ -6,8 +6,25 @@ kotlin {
     jvm()
 
     js(IR) {
-        browser()
-        nodejs()
+        // ingestRevisions_dedupNearDuplicates_thenGcAfterHistoryPrune does real content-defined
+        // chunking (rolling hash) over ~12MB of random data across three blobs plus a GC sweep -
+        // legitimately CPU-heavy work, appropriate for what it's testing (dedup/GC correctness
+        // over realistic-sized input), but Kotlin/JS's default Mocha test timeout (2000ms) can be
+        // too tight for it on a slower/shared CI runner even though it finishes well within time
+        // on a fast local machine - confirmed failing consistently in CI (both js,node and
+        // js,browser targets) while never reproducing locally. Raised generously rather than
+        // shrinking the test's input size, which would weaken what it actually verifies.
+        val jsTestTimeout = "60s"
+        browser {
+            testTask {
+                useMocha { timeout = jsTestTimeout }
+            }
+        }
+        nodejs {
+            testTask {
+                useMocha { timeout = jsTestTimeout }
+            }
+        }
     }
 
     linuxX64()

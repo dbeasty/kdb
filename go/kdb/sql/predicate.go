@@ -3,8 +3,8 @@ package sql
 import (
 	"strings"
 
-	kdbjson "github.com/limidus/kdb/go/kdb/json"
 	"github.com/limidus/kdb/go/kdb/document"
+	kdbjson "github.com/limidus/kdb/go/kdb/json"
 	"github.com/limidus/kdb/go/kdb/schema"
 )
 

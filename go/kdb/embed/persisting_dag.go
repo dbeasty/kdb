@@ -40,8 +40,10 @@ func (d *PersistingCommitDAG) Head() (codec.Hash, error) { return d.delegate.Hea
 func (d *PersistingCommitDAG) SetHead(branchName string, hash codec.Hash) error {
 	return d.delegate.SetHead(branchName, hash)
 }
-func (d *PersistingCommitDAG) GetBranch(name string) (document.Branch, bool) { return d.delegate.GetBranch(name) }
-func (d *PersistingCommitDAG) ListBranches() []document.Branch              { return d.delegate.ListBranches() }
+func (d *PersistingCommitDAG) GetBranch(name string) (document.Branch, bool) {
+	return d.delegate.GetBranch(name)
+}
+func (d *PersistingCommitDAG) ListBranches() []document.Branch { return d.delegate.ListBranches() }
 func (d *PersistingCommitDAG) CreateBranch(name string, fromHash codec.Hash) (document.Branch, error) {
 	return d.delegate.CreateBranch(name, fromHash)
 }
@@ -104,4 +106,3 @@ func (d *PersistingCommitDAG) Persist(c document.Commit) error {
 func (d *PersistingCommitDAG) Delegate() *dag.InMemoryCommitDag { return d.delegate }
 
 var _ dag.CommitDAG = (*PersistingCommitDAG)(nil)
-

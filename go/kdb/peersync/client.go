@@ -11,6 +11,7 @@ import (
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/ws"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -80,6 +81,13 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 			Namespaces: []string{config.NamespaceID},
 			LocalHeads: map[string]string{config.NamespaceID: localHead.Hex()},
 			ClientMode: wire.ClientFullPeer,
+			// config.ConnectionContext was accepted but never actually used here - every peer
+			// handshake went out with no credentials regardless of what a caller configured,
+			// which would have made the host's new PeerSyncAction enforcement (host.go) reject
+			// every real client outright, not just an unauthenticated one.
+			User:     config.ConnectionContext.User,
+			Password: config.ConnectionContext.Password,
+			Token:    config.ConnectionContext.Token,
 		},
 	}
 	ackMsg, err := c.request(conn, hs)
@@ -105,7 +113,11 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &defaultSession{client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn, persist: config.Persist}, nil
+	return &defaultSession{
+		client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn,
+		materialize: config.MaterializeCommit, persist: config.Persist,
+		conflictPolicy: config.ConflictPolicy, conflictResolver: config.ConflictResolver,
+	}, nil
 }
 
 func (c *defaultClient) Disconnect() error {
@@ -214,10 +226,18 @@ type defaultSession struct {
 	namespaceID string
 	remoteHead  codec.Hash
 	conn        stream.ConnectionHandle
+	// materialize replays a fetched commit's document ops into local storage - see
+	// ClientConfig.MaterializeCommit's doc comment. May be nil (a pulled commit is then reachable
+	// from the DAG but invisible to any query that reads through storage, matching the behavior
+	// before this field existed).
+	materialize func(document.Commit) error
 	// persist durably logs a commit pulled from a peer - see ClientConfig.Persist's doc
 	// comment. May be nil (peer sync then has no local durability of its own, matching the
 	// behavior before this field existed).
 	persist func(document.Commit) error
+	// conflictPolicy/conflictResolver - see ClientConfig's doc comment.
+	conflictPolicy   transaction.ConflictPolicy
+	conflictResolver transaction.ConflictResolver
 }
 
 func (s *defaultSession) NamespaceID() string    { return s.namespaceID }
@@ -246,6 +266,15 @@ func (s *defaultSession) PullMissing() (Result, error) {
 		if err := s.dag.PutCommit(commit, true); err != nil {
 			return Result{}, err
 		}
+		// Without this, a commit pulled from a peer was reachable from the DAG (PutCommit above)
+		// but invisible to SqlExec/Query/GetDocument, since PutCommit only ever updates DAG
+		// bookkeeping, never storage - same gap host.go's CommitPush handling had before its own
+		// MaterializeCommit wiring, mirrored here for the pull direction.
+		if s.materialize != nil {
+			if err := s.materialize(commit); err != nil {
+				return Result{}, err
+			}
+		}
 		// Fixes kdb-spec-layer13 §2.2 client-side: without this, a commit pulled from a peer
 		// lived only in memory and vanished on restart of a file-backed node.
 		if s.persist != nil {
@@ -265,7 +294,10 @@ func (s *defaultSession) PullMissing() (Result, error) {
 	// commit here would silently orphan any local-only commits from main, exactly the bug fixed
 	// on the Kotlin side for Component 39 - same shared decision function as the host's
 	// CommitPush handler, not two independently maintained copies.
-	outcome, err := ResolveDivergence(s.dag, s.storage, s.namespaceID, localHead, incomingHead)
+	outcome, err := ResolveDivergence(s.dag, s.storage, s.namespaceID, localHead, incomingHead, ResolutionOptions{
+		Policy:   s.conflictPolicy,
+		Resolver: s.conflictResolver,
+	})
 	if err != nil {
 		return Result{}, err
 	}

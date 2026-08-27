@@ -1,6 +1,7 @@
 package peersync
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -24,6 +25,7 @@ type defaultHost struct {
 	dag     *dag.InMemoryCommitDag
 	storage storage.Adapter
 	auth    auth.Engine
+	connCtx auth.ConnectionContext
 	handler *frameHandler
 	config  *HostConfig
 }
@@ -35,12 +37,12 @@ func NewHost(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage.Adapter
 	if engine == nil {
 		engine = auth.AllowAll
 	}
-	return &defaultHost{wire: w, dag: dagInst, storage: store, auth: engine}
+	return &defaultHost{wire: w, dag: dagInst, storage: store, auth: engine, connCtx: ctx}
 }
 
 func (h *defaultHost) Start(config HostConfig) error {
 	h.config = &config
-	h.handler = newFrameHandler(h.wire, h.dag, h.storage, config, h.auth, auth.EmptyContext)
+	h.handler = newFrameHandler(h.wire, h.dag, h.storage, config, h.auth, h.connCtx)
 	hub := stream.HubFor(config.TransportHub)
 	hub.ServerHandler = func(frame []byte) {
 		if response, err := h.handler.handleFrame(frame); err == nil && response != nil {
@@ -97,10 +99,39 @@ type frameHandler struct {
 	cfg     HostConfig
 	auth    auth.Engine
 	ctx     auth.ConnectionContext
+
+	// principal is the identity established by a successful Handshake (FULL_PEER mode,
+	// authenticated, authorized for PeerSyncAction) - reused by every later CommitFetch/
+	// CommitPush on this connection. Mirrors Kotlin's ConnectionAuthSupport.connectionPrincipal:
+	// authenticated tracks whether it's actually been populated yet (Principal's zero value is
+	// itself a valid-looking, if empty, value, so a bool is needed to distinguish "not yet
+	// authenticated" from "authenticated as an anonymous/empty principal").
+	principal     auth.Principal
+	authenticated bool
 }
 
 func newFrameHandler(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage.Adapter, cfg HostConfig, engine auth.Engine, ctx auth.ConnectionContext) *frameHandler {
 	return &frameHandler{wire: w, dag: dagInst, storage: store, cfg: cfg, auth: engine, ctx: ctx}
+}
+
+// authorizePeerSync authorizes this connection's principal for PeerSyncAction on h.cfg.
+// NamespaceID before honoring a CommitFetch/CommitPush - required on every such frame (not just
+// cached from Handshake) so a grant revoked mid-connection takes effect immediately, matching
+// Kotlin's PeerSyncFrameHandler.authorizePeerSync. If no Handshake has authenticated this
+// connection yet (e.g. a peer sends CommitFetch/CommitPush first), authenticates now using h.ctx
+// - the transport-provided connection context, empty for TCP the same way SqlWireHost's own
+// Handshake-credentials-only model is (see wire_listen.go's principal field doc comment) - rather
+// than treating an un-handshaken connection as implicitly trusted.
+func (h *frameHandler) authorizePeerSync() error {
+	if !h.authenticated {
+		principal, err := h.auth.Authenticator().Authenticate(context.Background(), h.ctx.ToCredentials())
+		if err != nil {
+			return err
+		}
+		h.principal = principal
+		h.authenticated = true
+	}
+	return h.auth.Authorizer().Authorize(context.Background(), h.principal, auth.PeerSyncAction{Namespace: h.cfg.NamespaceID})
 }
 
 func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
@@ -110,22 +141,28 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 	}
 	switch m := msg.(type) {
 	case wire.HandshakeMessage:
-		ack := wire.HandshakeAckPayload{
-			Accepted:           true,
-			NegotiatedEncoding: wire.EncodingKdbBinary,
-			ProtocolVersion:    wire.KdbWireProtocolVersion,
-			RemoteHeads:        map[string]string{h.cfg.NamespaceID: mustHeadHex(h.dag)},
+		if m.Request.ClientMode != wire.ClientFullPeer {
+			reason := "FULL_PEER mode required"
+			return h.wire.Encode(peerHandshakeAck(m, false, nil, &reason))
 		}
-		ackMsg := wire.HandshakeAckMessage{
-			H: wire.Header{
-				MessageType:     wire.MsgHandshake,
-				ProtocolVersion: wire.KdbWireProtocolVersion,
-				CorrelationID:   m.H.CorrelationID,
-			},
-			Response: ack,
+		creds := auth.Credentials{User: m.Request.User, Password: m.Request.Password, Token: m.Request.Token}
+		principal, err := h.auth.Authenticator().Authenticate(context.Background(), creds)
+		if err != nil {
+			reason := err.Error()
+			return h.wire.Encode(peerHandshakeAck(m, false, nil, &reason))
 		}
-		return h.wire.Encode(ackMsg)
+		if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.PeerSyncAction{Namespace: h.cfg.NamespaceID}); err != nil {
+			reason := err.Error()
+			return h.wire.Encode(peerHandshakeAck(m, false, nil, &reason))
+		}
+		h.principal = principal
+		h.authenticated = true
+		heads := map[string]string{h.cfg.NamespaceID: mustHeadHex(h.dag)}
+		return h.wire.Encode(peerHandshakeAck(m, true, heads, nil))
 	case wire.CommitFetchMessage:
+		if err := h.authorizePeerSync(); err != nil {
+			return nil, err
+		}
 		commits, err := h.fetchCommits(m.SinceHash, m.MaxCommits)
 		if err != nil {
 			return nil, err
@@ -141,6 +178,9 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 		}
 		return h.wire.Encode(push)
 	case wire.CommitPushMessage:
+		if err := h.authorizePeerSync(); err != nil {
+			return nil, err
+		}
 		// putCommit always stores, regardless of what happens to "main" below (component 39
 		// spec §5: history must never be lost, only the branch-pointer decision is gated).
 		applied := 0
@@ -178,7 +218,10 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 			// client's PullMissing, not two independently maintained copies - that's exactly
 			// how the original blind dag.SetHead("main", ...) bug went unnoticed on one side
 			// while looking "fine" on the other.
-			outcome, err := ResolveDivergence(h.dag, h.storage, m.Namespace, localHead, incomingHead)
+			outcome, err := ResolveDivergence(h.dag, h.storage, m.Namespace, localHead, incomingHead, ResolutionOptions{
+				Policy:   h.cfg.ConflictPolicy,
+				Resolver: h.cfg.ConflictResolver,
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -247,4 +290,24 @@ func mustHeadHex(d *dag.InMemoryCommitDag) string {
 		return ""
 	}
 	return head.Hex()
+}
+
+func peerHandshakeAck(msg wire.HandshakeMessage, accepted bool, remoteHeads map[string]string, rejectionReason *string) wire.HandshakeAckMessage {
+	if remoteHeads == nil {
+		remoteHeads = map[string]string{}
+	}
+	return wire.HandshakeAckMessage{
+		H: wire.Header{
+			MessageType:     wire.MsgHandshake,
+			ProtocolVersion: wire.KdbWireProtocolVersion,
+			CorrelationID:   msg.H.CorrelationID,
+		},
+		Response: wire.HandshakeAckPayload{
+			Accepted:           accepted,
+			NegotiatedEncoding: wire.EncodingKdbBinary,
+			ProtocolVersion:    wire.KdbWireProtocolVersion,
+			RemoteHeads:        remoteHeads,
+			RejectionReason:    rejectionReason,
+		},
+	}
 }

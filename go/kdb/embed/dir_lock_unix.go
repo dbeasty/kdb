@@ -1,3 +1,5 @@
+//go:build unix
+
 package embed
 
 import (
@@ -40,4 +42,3 @@ func (l *dirLock) Release() {
 	_ = l.f.Close()
 	l.f = nil
 }
-

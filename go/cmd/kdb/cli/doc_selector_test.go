@@ -56,4 +56,3 @@ func TestResolveDocSelector_prefixAmbiguous(t *testing.T) {
 		t.Fatal("expected ambiguity error")
 	}
 }
-

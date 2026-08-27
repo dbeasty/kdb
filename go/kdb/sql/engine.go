@@ -13,11 +13,11 @@ type Engine interface {
 }
 
 type defaultEngine struct {
-	parser    Parser
-	planner   Planner
-	executor  *Executor
-	dml       *DMLExecutor
-	ddl       DDLExecutor
+	parser   Parser
+	planner  Planner
+	executor *Executor
+	dml      *DMLExecutor
+	ddl      DDLExecutor
 }
 
 // NewEngine wires parser, planner, and executors.

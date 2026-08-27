@@ -188,7 +188,13 @@ func TestConcurrentCommitsRacingSameBaseVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base, err := c.PutJSON(ctx, "app/data", docID, []byte(`{"v":0}`))
+	// Seed with a value none of the racers below ever write (they write {"v":0}..{"v":7}) -
+	// KDB's conflict detection is content-addressed (kdb-spec.md: "the document is always the
+	// truth"), so a racer whose write happens to reproduce the seed's exact content is
+	// indistinguishable from a no-op and correctly slips through as "no conflict", which then
+	// masks the very race this test exists to prove. Seeding with -1 keeps every racer's write a
+	// real content change from the base.
+	base, err := c.PutJSON(ctx, "app/data", docID, []byte(`{"v":-1}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,4 +499,40 @@ func TestUpsertReturnsErrBusyOverRealWireWhenWriteQueueIsFull(t *testing.T) {
 
 	release() // frees running - unblocks the goroutine's queued acquire, which then releases itself
 	<-blockedDone
+}
+
+// TestConnectDialsOverWebSocketTransport is a regression test for dialTransport's scheme
+// dispatch: a ws:// URI must select go/kdb/transport/ws rather than the tcp:// default. There is
+// no in-process Go WebSocket server to round-trip against (go/kdb/transport/ws's server side is
+// deliberately JVM-only - see that package's NewTransport doc comment; TestConnectAgainstRealJvm
+// ServerOverWebSocket in jvm_ws_interop_test.go is the real round-trip proof, gated on a live JVM
+// server), so this only proves dialTransport picks ws.Transport and reaches an actual dial
+// attempt (a connection *refused* error, not a scheme-parsing error) - the wiring this component
+// didn't have before.
+func TestConnectDialsOverWebSocketTransport(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.Connect(ctx, "ws://127.0.0.1:1/kdb", "")
+	if err == nil {
+		t.Fatal("expected a dial error connecting to a port nothing listens on")
+	}
+	var transportErr *client.TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("expected a *client.TransportError (a real dial attempt, not a scheme-parsing rejection), got %T: %v", err, err)
+	}
+}
+
+// TestConnectRejectsWssScheme and TestConnectRejectsTcpsSchemeWithoutTLSOptions moved to
+// client_tls_test.go, now that wss:// (and tcps://) are real schemes with TLS options plumbed
+// through ConnectWithOptions (docs/kdb-finish-up-plan.md 2.1) - both still document that plain
+// Connect (no TLS options) against either secure scheme is a clear, immediate rejection, never a
+// confusing dial-time error or a silent plaintext fallback.
+
+func TestConnectRejectsUnsupportedScheme(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.Connect(ctx, "ftp://127.0.0.1:1", "")
+	if err == nil {
+		t.Fatal("expected an unsupported scheme to be rejected")
+	}
 }

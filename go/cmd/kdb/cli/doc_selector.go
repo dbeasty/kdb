@@ -71,4 +71,3 @@ func resolveDocSelector(namespaceID string, store storage.Adapter, atTreeHash co
 func ResolveDocSelectorForTest(namespaceID string, store storage.Adapter, atTreeHash codec.Hash, input string) (codec.UUID, error) {
 	return resolveDocSelector(namespaceID, store, atTreeHash, input)
 }
-

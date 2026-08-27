@@ -7,12 +7,27 @@ import (
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
+// TransactionReplayer handles an incoming TransactionReplay frame from a Mode 2 (write-back
+// stream) subscriber, returning the wire response to send back - a wire.SqlResultMessage on
+// success or error, a wire.ConflictReportMessage on a genuine conflict (kdb-spec.md §8.1's Mode
+// 2 definition; §8.5's TransactionReplay/ConflictReport message types). Mirrors Kotlin's
+// StreamBroadcastHub transactionReplayer callback: a plain function rather than a direct
+// KdbServerRuntime dependency, since kdb-stream must not depend on kdb-server (kdb-server already
+// depends on kdb-stream) - whoever wires both together (go/cmd/kdb-service) supplies the closure,
+// typically calling KdbServerRuntime.Replay.
+type TransactionReplayer func(wire.TransactionReplayMessage) wire.Message
+
 // Coordinator publishes commits and tracks subscribers.
 type Coordinator interface {
 	Start(session SessionConfig) error
 	Stop() error
 	Publish(commit PublishedCommit) error
 	Subscribers() <-chan SubscriberState
+	// SetTransactionReplayer wires (or clears, with nil) the handler for Mode 2 write-back
+	// TransactionReplay frames - see TransactionReplayer's doc comment. Unset (nil) is the
+	// default: TransactionReplay is then rejected with an explicit error response rather than
+	// silently dropped.
+	SetTransactionReplayer(replayer TransactionReplayer)
 }
 
 type defaultCoordinator struct {
@@ -22,6 +37,7 @@ type defaultCoordinator struct {
 	session     *SessionConfig
 	subscribers chan SubscriberState
 	lastSub     *SubscriberState
+	replayer    TransactionReplayer
 	mu          sync.Mutex
 }
 
@@ -36,6 +52,12 @@ func NewCoordinator(w wire.Codec, transport Transport) Coordinator {
 }
 
 func (c *defaultCoordinator) Subscribers() <-chan SubscriberState { return c.subscribers }
+
+func (c *defaultCoordinator) SetTransactionReplayer(replayer TransactionReplayer) {
+	c.mu.Lock()
+	c.replayer = replayer
+	c.mu.Unlock()
+}
 
 func (c *defaultCoordinator) Start(session SessionConfig) error {
 	c.mu.Lock()
@@ -137,6 +159,27 @@ func (c *defaultCoordinator) handleServerFrame(session SessionConfig, frame []by
 		if existing != nil {
 			hash := msg.CommitHash
 			c.updateSubscriber(existing.NodeID, existing.Mode, &hash)
+		}
+	case wire.TransactionReplayMessage:
+		if msg.Namespace != session.NamespaceID {
+			return
+		}
+		c.mu.Lock()
+		replayer := c.replayer
+		c.mu.Unlock()
+		var response wire.Message
+		if replayer != nil {
+			response = replayer(msg)
+		} else {
+			errMsg := "write-back replay is not enabled on this stream host"
+			response = wire.SqlResultMessage{
+				H:         wire.Header{MessageType: wire.MsgSqlResult, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: msg.H.CorrelationID},
+				Namespace: msg.Namespace,
+				Error:     &errMsg,
+			}
+		}
+		if frame, err := c.wire.Encode(response); err == nil {
+			hub.ServerSend(frame)
 		}
 	}
 }

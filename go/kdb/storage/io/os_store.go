@@ -239,4 +239,3 @@ func (s *OSByteStore) DeleteSnapshot(key string) error {
 	}
 	return nil
 }
-

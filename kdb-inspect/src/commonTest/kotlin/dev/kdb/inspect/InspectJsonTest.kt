@@ -9,9 +9,7 @@ import dev.kdb.storage.CompressionCodec
 import dev.kdb.storage.DeltaAuthorshipEnvelope
 import dev.kdb.storage.DeltaRecord
 import dev.kdb.storage.DocumentPatch
-import dev.kdb.storage.delta.DefaultDeltaSegmentWriter
-import dev.kdb.storage.delta.DeltaSegmentScanner
-import dev.kdb.storage.io.SegmentNameBuilder
+import dev.kdb.storage.delta.DeltaSegmentFactory
 import dev.kdb.storage.mem.InMemoryPlatformIoShim
 import dev.kdb.storage.StorageEngineConfig
 import dev.kdb.wire.WireHeader
@@ -53,7 +51,13 @@ class InspectJsonTest {
                     ioShim = shim,
                     compressionCodec = CompressionCodec.NONE,
                 )
-            val writer = DefaultDeltaSegmentWriter("app/test", KdbUuid.random(), shim, config)
+            // DeltaSegmentFactory, not DefaultDeltaSegmentWriter's constructor directly: the
+            // writer's segmentName is derived from a sequence number the factory assigns by
+            // scanning existing segments (kdb-spec-layer13 Component 47 - see 643f15d), not from
+            // segmentId, so hand-rolling the writer here would both fight its constructor and
+            // read the wrong on-disk path back below.
+            val factory = DeltaSegmentFactory(config)
+            val writer = factory.openWriter("app/test")
             val commits = mutableListOf<KdbCommit>()
             repeat(3) { i ->
                 val commit =
@@ -85,11 +89,9 @@ class InspectJsonTest {
                 )
             }
             val ref = writer.seal()
-            val segmentName = SegmentNameBuilder.delta("app/test", ref.segmentId.toString())
-            val bytes = shim.readFromSegment(segmentName, 0, ref.sizeBytes.toInt())
-            val scanned = DeltaSegmentScanner.scanSegmentBytes(bytes, CompressionCodec.NONE)
-            assertEquals(3, scanned.size)
-            assertEquals(commits[0].hash, scanned[0].commitHash)
+            val records = factory.openReader("app/test").readAll(ref)
+            assertEquals(3, records.size)
+            assertEquals(commits[0].hash, records[0].commitHash)
         }
 
     @Test

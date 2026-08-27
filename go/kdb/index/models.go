@@ -36,9 +36,9 @@ type Descriptor struct {
 
 // Entry is one index row at a commit.
 type Entry struct {
-	DocID       codec.UUID
-	Key         Key
-	CommitHash  codec.Hash
+	DocID      codec.UUID
+	Key        Key
+	CommitHash codec.Hash
 }
 
 // RankedResult is a vector search hit.

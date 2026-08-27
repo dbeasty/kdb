@@ -52,10 +52,10 @@ type Request struct {
 
 // Result wraps SQL results with resolved commit metadata.
 type Result struct {
-	QueryResult     sql.QueryResult
-	ResolvedCommit  codec.Hash
-	ReadOnly        bool
-	AppliedSchema   *schema.KdbSchema
+	QueryResult    sql.QueryResult
+	ResolvedCommit codec.Hash
+	ReadOnly       bool
+	AppliedSchema  *schema.KdbSchema
 }
 
 // CheckoutHandle pins a session checkout commit.

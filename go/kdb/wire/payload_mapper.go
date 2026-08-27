@@ -35,11 +35,19 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 			// clean rejection). {} round-trips as an empty map on both sides.
 			localHeads = map[string]string{}
 		}
+		namespaces := m.Request.Namespaces
+		if namespaces == nil {
+			// Same class of bug as localHeads above, same fix: Kotlin's HandshakeDto.namespaces
+			// is a non-nullable List<String>, so a Go SQL client that never sets this field (e.g.
+			// go/kdb/client's Connect, which legitimately has no single target namespace yet at
+			// handshake time) must not let it marshal as JSON null.
+			namespaces = []string{}
+		}
 		return payloadEnvelope{
 			Kind: "handshake",
 			Handshake: &handshakeDto{
 				NodeID:                    m.Request.NodeID,
-				Namespaces:                m.Request.Namespaces,
+				Namespaces:                namespaces,
 				LocalHeads:                localHeads,
 				SupportsZstd:              caps.SupportsZstd,
 				SupportsIndexHints:        caps.SupportsIndexHints,

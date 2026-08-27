@@ -6,8 +6,8 @@ import (
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
-	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/document"
+	kdberr "github.com/limidus/kdb/go/kdb/error"
 )
 
 const mainBranch = "main"
@@ -16,12 +16,12 @@ const mainBranch = "main"
 type InMemoryCommitDag struct {
 	NamespaceID string
 
-	mu       sync.RWMutex
-	commits  map[codec.Hash]document.Commit
-	stubs    map[codec.Hash]document.CommitStub
-	trees    map[codec.Hash]document.DocumentTree
-	branches map[string]document.Branch
-	tags     map[string]document.Tag
+	mu        sync.RWMutex
+	commits   map[codec.Hash]document.Commit
+	stubs     map[codec.Hash]document.CommitStub
+	trees     map[codec.Hash]document.DocumentTree
+	branches  map[string]document.Branch
+	tags      map[string]document.Tag
 	hexSorted []string
 	// txIndex maps a transaction id to the commit it produced, so idempotent-retry detection
 	// (GetCommitByTransactionID, used by transaction.Engine's findExistingCommit) is O(1)

@@ -33,10 +33,10 @@ type ConflictReport struct {
 
 // ConflictItem is one conflicting document operation.
 type ConflictItem struct {
-	DocumentID    string                 `json:"documentId"`
-	OperationType ConflictOperationType  `json:"operationType"`
-	LocalDoc      *string                `json:"localDoc,omitempty"`
-	IncomingDoc   *string                `json:"incomingDoc,omitempty"`
+	DocumentID    string                `json:"documentId"`
+	OperationType ConflictOperationType `json:"operationType"`
+	LocalDoc      *string               `json:"localDoc,omitempty"`
+	IncomingDoc   *string               `json:"incomingDoc,omitempty"`
 }
 
 // ConflictOperationType classifies conflict kinds.

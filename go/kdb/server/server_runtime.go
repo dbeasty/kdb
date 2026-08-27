@@ -50,6 +50,16 @@ type KdbServerRuntime struct {
 	// (component 38 spec §4, sub-phase C).
 	AuthEngine auth.Engine
 
+	// CommitListener, if set, is invoked with namespaceID and the new commit after every
+	// successful Commit/Upsert/Replay - the cross-write notification bridge a stream hub's
+	// Publish needs to fan a live write out to Mode 1/2 subscribers without polling (Kotlin's
+	// Component 44: EmbeddedKdbRuntime.addCommitListener/notifyCommit, wired to
+	// streamHub.publish(...) in KdbServiceMain.kt). Called synchronously, after persistence, from
+	// inside runTransaction's success path - keep it fast and non-blocking (e.g. StreamHub.Publish
+	// itself only does a best-effort non-blocking fan-out). nil (the default) means no
+	// notification; existing callers see no behavior change.
+	CommitListener func(namespaceID string, commit document.Commit)
+
 	refCount atomic.Int32
 	closeMu  sync.Mutex
 
@@ -259,7 +269,37 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 	return s.commitWith(s.UpsertEngine, tx, principal)
 }
 
+// Replay applies tx directly on top of the current head, ignoring tx.BaseVersion - the Mode 2
+// (write-back stream) counterpart to Commit, backing TransactionReplay (kdb-spec.md §8.5/§8.1's
+// Mode 2 definition). A write-back client has no independent local DAG to anchor optimistic
+// concurrency on, so unlike Commit there is no "did anything change since I read?" check -
+// matches transaction.Engine.Replay's own base==baseline==target==replayTarget shape (Kotlin's
+// DefaultTransactionEngine.replay is identical), and mirrors Kotlin's own
+// SqlWireHost.handleTransactionReplay/KdbServerRuntime.replay, which always replays onto
+// whatever the current head is at call time, computed by the caller (see wire_listen.go's
+// handleTransactionReplay) rather than trusting a client-supplied target.
+func (s *KdbServerRuntime) Replay(namespaceID string, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
+	_ = namespaceID
+	return s.replayWith(s.TransactionEngine, tx, replayTarget, principal)
+}
+
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
+	return s.runTransaction(tx, principal, func() (transaction.TransactionResult, error) {
+		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
+	})
+}
+
+func (s *KdbServerRuntime) replayWith(engine transaction.Engine, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
+	return s.runTransaction(tx, principal, func() (transaction.TransactionResult, error) {
+		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, "")
+	})
+}
+
+// runTransaction holds every cross-cutting concern Commit/Upsert/Replay share (draining,
+// memory-pressure rejection, authorization, the writeGate's serialization+timeout+backpressure,
+// and persisting a successful result) - call does only the one thing that differs between them:
+// which transaction.Engine method to invoke and with what target.
+func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal auth.Principal, call func() (transaction.TransactionResult, error)) (document.Commit, error) {
 	// Checked in cheapest-first order, before authorization or taking the write gate: a server
 	// shedding load should do as little work per rejected request as possible, and a rejection
 	// reason "closer to the front" (shutting down entirely) makes every later check moot anyway.
@@ -286,7 +326,7 @@ func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Tra
 		return document.Commit{}, err
 	}
 	defer release()
-	result, err := engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
+	result, err := call()
 	if err != nil {
 		return document.Commit{}, err
 	}
@@ -298,6 +338,9 @@ func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Tra
 			if err := s.persister.Persist(r.Commit); err != nil {
 				return document.Commit{}, err
 			}
+		}
+		if s.CommitListener != nil {
+			s.CommitListener(s.Runtime.DefaultNamespace, r.Commit)
 		}
 		return r.Commit, nil
 	case transaction.ResultConflict:
@@ -397,7 +440,8 @@ func NewServerRuntimeRegistry() *ServerRuntimeRegistry {
 	return &ServerRuntimeRegistry{runtimes: make(map[string]*KdbServerRuntime)}
 }
 
-// GetOrOpen returns an existing runtime or opens a new one.
+// GetOrOpen returns an existing runtime or opens a new one, retaining a reference for the
+// caller either way - every successful call must be balanced by exactly one Release(key).
 func (r *ServerRuntimeRegistry) GetOrOpen(key string, open func() (*KdbServerRuntime, error)) (*KdbServerRuntime, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -409,17 +453,27 @@ func (r *ServerRuntimeRegistry) GetOrOpen(key string, open func() (*KdbServerRun
 	if err != nil {
 		return nil, err
 	}
-	rt.Retain()
+	// NewKdbServerRuntime already starts refCount at 1 - that single implicit reference is this
+	// first caller's own, so no additional Retain() belongs here. The previous code retained
+	// twice on top of it (refCount 3 for the first caller, 2 for every later cache-hit caller),
+	// so Release could never actually bring a runtime's refCount to zero.
 	r.runtimes[key] = rt
-	rt.Retain()
 	return rt, nil
 }
 
-// Release releases a registry entry reference.
+// Release releases a registry entry reference. Once the last outstanding reference is released
+// (refCount reaches zero - see KdbServerRuntime.Release, which also closes the underlying
+// runtime at that point), the entry is removed from the registry so a later GetOrOpen for the
+// same key reopens fresh rather than reusing an already-closed, zero-refCount instance.
 func (r *ServerRuntimeRegistry) Release(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if rt, ok := r.runtimes[key]; ok {
-		rt.Release()
+	rt, ok := r.runtimes[key]
+	if !ok {
+		return
+	}
+	rt.Release()
+	if rt.refCount.Load() <= 0 {
+		delete(r.runtimes, key)
 	}
 }

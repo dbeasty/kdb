@@ -13,11 +13,25 @@ import (
 )
 
 func execute(cfg Config, cmd Command) int {
+	// unlock must never open a runtime: opening one means acquiring the very directory lock
+	// this command exists to clear, so if the lock actually is held, unlock could never reach
+	// its own body (openRuntime would fail first) - and if it isn't held, opening one anyway
+	// created bogus ns//delta, ns//meta dirs and a meta.json under the empty ("") namespace
+	// namespaceFor returns for UnlockCmd, purely as a side effect of a command that should just
+	// remove a file.
+	if _, ok := cmd.(UnlockCmd); ok {
+		return cmdUnlock(cfg)
+	}
 	rt, err := openRuntime(cfg, namespaceFor(cmd))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
+	// Every other command path used to return without ever calling rt.Close() - no CLI
+	// invocation flushed or sealed its delta segment, relying entirely on process exit (and
+	// WAL/delta replay on the next open) to make a write durable-and-clean rather than just
+	// durable.
+	defer rt.Close()
 	switch c := cmd.(type) {
 	case InitCmd:
 		return cmdInit(cfg, rt, c.Namespace)
@@ -37,8 +51,6 @@ func execute(cfg Config, cmd Command) int {
 		return cmdBranchCreate(cfg, rt, c)
 	case BranchCheckoutCmd:
 		return cmdBranchCheckout(cfg, rt, c)
-	case UnlockCmd:
-		return cmdUnlock(cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unsupported command\n")
 		return 2
