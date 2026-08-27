@@ -1,6 +1,8 @@
 package peersync
 
 import (
+	"math"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -24,7 +26,11 @@ func ComputeSyncPlan(d *dag.InMemoryCommitDag, localHead, remoteHead codec.Hash)
 	return &DagSyncPlan{CommonAncestor: ancestor, LocalOnly: localOnly, RemoteOnly: remoteOnly}, nil
 }
 
-// CommitsToPush returns commits on the local branch not yet on the remote side.
+// CommitsToPush returns the commits reachable from localHead but not from remoteHead - the
+// true set difference, in parent-before-child order, capped at limit. A single
+// Walk(localHead, &remoteHead) is NOT that set: pruning only at the exact remoteHead hash
+// still visits shared history reachable around it (e.g. through a merge commit's other
+// parent), so everything reachable from remoteHead is excluded explicitly instead.
 func CommitsToPush(d *dag.InMemoryCommitDag, localHead, remoteHead codec.Hash, limit int) ([]document.Commit, error) {
 	if localHead == remoteHead {
 		return nil, nil
@@ -32,11 +38,29 @@ func CommitsToPush(d *dag.InMemoryCommitDag, localHead, remoteHead codec.Hash, l
 	if !d.HasCommit(remoteHead) {
 		return nil, nil
 	}
-	walked := d.Walk(localHead, &remoteHead, limit)
+	remoteReach := make(map[codec.Hash]struct{})
+	for _, e := range d.Walk(remoteHead, nil, math.MaxInt) {
+		switch entry := e.(type) {
+		case dag.FullEntry:
+			remoteReach[entry.Commit.Hash] = struct{}{}
+		case dag.StubbedEntry:
+			remoteReach[entry.Stub.OriginalHash] = struct{}{}
+		}
+	}
+	walked := d.Walk(localHead, nil, math.MaxInt)
 	out := make([]document.Commit, 0, len(walked))
+	// Walk returns newest-first; reverse so parents land before children on the remote.
 	for i := len(walked) - 1; i >= 0; i-- {
-		if full, ok := walked[i].(dag.FullEntry); ok {
-			out = append(out, full.Commit)
+		full, ok := walked[i].(dag.FullEntry)
+		if !ok {
+			continue
+		}
+		if _, shared := remoteReach[full.Commit.Hash]; shared {
+			continue
+		}
+		out = append(out, full.Commit)
+		if len(out) >= limit {
+			break
 		}
 	}
 	return out, nil

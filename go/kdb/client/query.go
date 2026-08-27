@@ -22,6 +22,18 @@ func (c *Client) Query(ctx context.Context, ns string, sqlText string, args []an
 	return decodeRows(result.Columns, result.Rows, dest)
 }
 
+// QueryRaw runs one SQL SELECT and returns the raw column names and string-typed rows, for
+// callers (CLIs, test tooling) that don't have a struct shape to decode into - columns like
+// "_doc" can't map to an exported struct field name, so Query's reflection path can't reach
+// them.
+func (c *Client) QueryRaw(ctx context.Context, ns string, sqlText string, args []any) (columns []string, rows [][]string, err error) {
+	result, err := c.execSql(ctx, ns, sqlText, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result.Columns, result.Rows, nil
+}
+
 // Exec runs one non-SELECT SQL statement (schema/DDL). Most of Zolik's write paths should
 // prefer PutJSON/Upsert/Commit; Exec exists for DDL and the occasional write better expressed as
 // SQL. An INSERT is auto-committed immediately (this call is one client-visible unit of work,

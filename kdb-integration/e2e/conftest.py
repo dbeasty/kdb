@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from server_fixtures import cluster, server, tls_material  # noqa: F401  (pytest fixtures)
+
 KDB_CLI_MAIN = "dev.kdb.cli.KdbCliKt"
 
 
@@ -26,10 +28,15 @@ def _java_executable() -> str:
 
 
 def _read_classpath() -> str:
+    if os.environ.get("KDB_CLI_BIN"):
+        # Go CLI runs don't need the JVM classpath at all - run_kdb never consults it when
+        # KDB_CLI_BIN is set, so don't fail fixture setup over its absence.
+        return ""
     path = os.environ.get("KDB_CLI_CLASSPATH_FILE")
     if not path:
         raise RuntimeError(
-            "KDB_CLI_CLASSPATH_FILE is not set; run via ./gradlew :kdb-integration:e2ePython",
+            "KDB_CLI_CLASSPATH_FILE is not set; run via ./gradlew :kdb-integration:e2ePython"
+            " (or set KDB_CLI_BIN to the Go CLI binary)",
         )
     classpath_file = Path(path)
     if not classpath_file.is_file():

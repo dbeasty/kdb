@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -96,7 +97,17 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 func (h *peerSyncConnHandler) run(conn stream.ConnectionHandle) {
 	for frame := range conn.Incoming() {
 		response, err := h.host.HandleFrame(frame)
-		if err != nil || response == nil {
+		if err != nil {
+			// A handler error used to be silently swallowed with no reply at all - the peer
+			// blocked on its request timeout with zero diagnostics (kdb-finish-up-plan 4.H's
+			// "clients hang" finding). The peer-sync wire has no generic error frame yet, so
+			// the honest options are limited: log it and drop the connection, which the peer
+			// sees immediately as a closed socket instead of a 30s silence.
+			slog.Warn("peer-sync frame handler failed, dropping connection", "error", err)
+			_ = conn.Close()
+			return
+		}
+		if response == nil {
 			continue
 		}
 		if err := conn.Send(response); err != nil {
