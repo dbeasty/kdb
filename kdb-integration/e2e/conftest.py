@@ -34,10 +34,15 @@ def _read_classpath() -> str:
         return ""
     path = os.environ.get("KDB_CLI_CLASSPATH_FILE")
     if not path:
-        raise RuntimeError(
-            "KDB_CLI_CLASSPATH_FILE is not set; run via ./gradlew :kdb-integration:e2ePython"
-            " (or set KDB_CLI_BIN to the Go CLI binary)",
-        )
+        # Fall back to the Go CLI if it's built - the CLI test suite is CLI-agnostic. Only
+        # skip when neither CLI is available at all.
+        go_cli = Path(__file__).resolve().parents[2] / "go" / "bin" / "kdb"
+        if go_cli.is_file():
+            os.environ["KDB_CLI_BIN"] = str(go_cli)
+            return ""
+        pytest.skip(
+            "no CLI available: set KDB_CLI_CLASSPATH_FILE (JVM, via "
+            "./gradlew :kdb-integration:e2ePython) or KDB_CLI_BIN / make build-go (Go)")
     classpath_file = Path(path)
     if not classpath_file.is_file():
         raise RuntimeError(f"classpath file missing: {classpath_file}")

@@ -1,0 +1,51 @@
+# Nightly long-running e2e: slow load/compaction/large-history scenarios plus (when secrets are
+# configured) the LocalStack S3 backup variant (kdb-finish-up-plan Phase 3.2 CI wiring).
+name: E2E Nightly
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  e2e-slow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build Go binaries
+        run: |
+          make build-go
+          cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
+      - name: Install pytest
+        run: pip install -q -r kdb-integration/e2e/requirements.txt
+      - name: Run slow + destructive scenarios
+        working-directory: kdb-integration/e2e
+        run: python -m pytest -v -m "slow or destructive"
+
+  s3-integration:
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:3
+        ports: ["4566:4566"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - name: Run S3 integration tests against LocalStack
+        working-directory: go
+        env:
+          KDB_S3_BUCKET: kdb-ci
+          KDB_S3_ENDPOINT: http://127.0.0.1:4566
+          KDB_S3_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        # EnsureBucket in the test config creates the bucket itself.
+        run: go test -tags s3integration ./kdb/storage/io/s3/... -v

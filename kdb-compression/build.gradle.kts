@@ -20,5 +20,6 @@ kotlin {
     compilerOptions { freeCompilerArgs.add("-Xexpect-actual-classes") }
     sourceSets {
         jvmMain.dependencies { implementation(libs.zstd.jni) }
+        jvmTest.dependencies { implementation(libs.zstd.jni) }
     }
 }

@@ -311,7 +311,9 @@ func relay(cf commonFlags, servers string, rounds int, conflictPolicy string) er
 		for _, uri := range uris {
 			uri = strings.TrimSpace(uri)
 			w := wire.NewCodec(wire.EncodingJSON)
-			var transport stream.Transport = tcp.NewTransport(core.DefaultConnectOptions())
+			connOpts := core.DefaultConnectOptions()
+			connOpts.TLS = cf.tls()
+			var transport stream.Transport = tcp.NewTransport(connOpts)
 			pc := peersync.NewClient(w, transport, localDag, rt.Storage)
 			session, err := pc.Connect(peersync.ClientConfig{
 				NamespaceID:       cf.namespace,

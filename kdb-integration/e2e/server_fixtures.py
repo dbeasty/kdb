@@ -108,9 +108,15 @@ class KdbServer:
     proc: subprocess.Popen | None = None
     log_path: str = ""
 
+    _bootstrapped: bool = False
+
     def start(self) -> "KdbServer":
         if not self.data_dir:
             self.data_dir = tempfile.mkdtemp(prefix="kdb-e2e-srv-")
+        if self._bootstrapped:
+            # restart() over an existing data dir: users/roles are already in the durable
+            # registry (re-running `user create` would rightly fail on the duplicate).
+            return self._launch()
         for role, grants in self.bootstrap_roles:
             subprocess.run(
                 [service_bin(), "user", "role", "--data-dir", self.data_dir,
@@ -121,7 +127,10 @@ class KdbServer:
                 [service_bin(), "user", "create", "--data-dir", self.data_dir,
                  "--user", user, "--password", password, "--roles", roles],
                 check=True, capture_output=True, text=True)
+        self._bootstrapped = True
+        return self._launch()
 
+    def _launch(self) -> "KdbServer":
         self.sql_port = free_port()
         self.peer_port = free_port()
         self.stream_port = free_port()
