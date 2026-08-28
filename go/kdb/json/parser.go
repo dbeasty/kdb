@@ -254,7 +254,21 @@ func (p *parser) parseStringLit() (string, error) {
 			if err != nil {
 				return "", err
 			}
+			// A \u escape carries one UTF-16 code unit, so a character outside the BMP - every
+			// emoji, and a great deal of CJK - can only be written as a surrogate pair. Encoding
+			// each half on its own hands utf8.EncodeRune a lone surrogate, which is not a valid
+			// rune: it substitutes U+FFFD, so "😀" used to arrive as two replacement
+			// characters instead of one emoji. That is silent corruption of any document from a
+			// client that escapes non-ASCII, which many JSON writers do by default.
+			if isHighSurrogate(ch) {
+				if low, ok := p.peekUnicodeEscape(); ok && isLowSurrogate(low) {
+					p.i += 6 // consume the \uXXXX we only peeked at
+					ch = combineSurrogates(ch, low)
+				}
+			}
 			var buf [utf8.UTFMax]byte
+			// An unpaired surrogate is still invalid on its own; EncodeRune substitutes U+FFFD
+			// for it, which is what encoding/json does with the same input.
 			n := utf8.EncodeRune(buf[:], ch)
 			sb = append(sb, buf[:n]...)
 		default:
@@ -262,6 +276,38 @@ func (p *parser) parseStringLit() (string, error) {
 		}
 	}
 	return "", kdberr.NewJsonPathError("unclosed string", "$", nil)
+}
+
+// UTF-16 surrogate ranges, as used by JSON's \u escapes for characters outside the BMP.
+const (
+	highSurrogateMin = 0xD800
+	highSurrogateMax = 0xDBFF
+	lowSurrogateMin  = 0xDC00
+	lowSurrogateMax  = 0xDFFF
+)
+
+func isHighSurrogate(r rune) bool { return r >= highSurrogateMin && r <= highSurrogateMax }
+func isLowSurrogate(r rune) bool  { return r >= lowSurrogateMin && r <= lowSurrogateMax }
+
+// combineSurrogates rebuilds the code point a surrogate pair encodes.
+func combineSurrogates(high, low rune) rune {
+	return 0x10000 + (high-highSurrogateMin)<<10 + (low - lowSurrogateMin)
+}
+
+// peekUnicodeEscape reads a following \uXXXX without consuming it, so a high surrogate that
+// turns out not to be followed by a low one is left exactly as it was for the caller to handle.
+func (p *parser) peekUnicodeEscape() (rune, bool) {
+	if p.i+6 > len(p.s) || p.s[p.i] != '\\' || p.s[p.i+1] != 'u' {
+		return 0, false
+	}
+	saved := p.i
+	p.i += 2
+	r, err := p.parseHex4()
+	p.i = saved
+	if err != nil {
+		return 0, false
+	}
+	return r, true
 }
 
 func (p *parser) parseHex4() (rune, error) {
