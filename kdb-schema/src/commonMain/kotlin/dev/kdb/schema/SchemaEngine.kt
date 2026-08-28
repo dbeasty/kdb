@@ -124,15 +124,19 @@ public object SchemaEngine {
     ): SchemaDiff {
         val fa = from.fields.associateBy { it.name }
         val fb = to.fields.associateBy { it.name }
-        val added = fb.keys.filterNot { it in fa }.map { fb.getValue(it) }
-        val removed = fa.keys.filterNot { it in fb }.map { fa.getValue(it) }
+        // Sorted by field name, matching Go's DiffSchemas. Kotlin's associateBy keeps declaration
+        // order, so this side was already deterministic - but the two implementations returned
+        // the same diff in different orders, which anything rendering or comparing a diff across
+        // them would see as a difference that is not one.
+        val added = fb.keys.filterNot { it in fa }.map { fb.getValue(it) }.sortedBy { it.name }
+        val removed = fa.keys.filterNot { it in fb }.map { fa.getValue(it) }.sortedBy { it.name }
         val modified =
             fa.keys.intersect(fb.keys).mapNotNull { name ->
                 val a = fa.getValue(name)
                 val b = fb.getValue(name)
                 val changes = diffSingleField(a, b)
                 if (changes.isEmpty()) null else FieldDiff(name, changes)
-            }
+            }.sortedBy { it.fieldName }
         return SchemaDiff(added, removed, modified, from.version, to.version)
     }
 
@@ -164,9 +168,25 @@ public object SchemaEngine {
 
             KdbFieldType.Int64Type ->
                 when (value) {
+                    // A JInt is already a Long, so it is in range by construction.
                     is JsonValue.JInt -> null
                     is JsonValue.JNumber ->
-                        if (isIntegralDouble(value.value)) null else typeMismatch(field.name, "expected int64")
+                        // Bounded explicitly, like Int32Type just above. isIntegralDouble happens
+                        // to reject most out-of-range doubles as a side effect of Double.toLong()
+                        // saturating at Long.MAX_VALUE, but not exactly 2^63: that saturates to
+                        // Long.MAX_VALUE, whose Double form is 2^63 again, so the difference is
+                        // zero and the value passed - one past the largest Long there is. Double
+                        // cannot represent Long.MAX_VALUE at all, so the upper bound is a strict
+                        // "less than 2^63" rather than a "<= Long.MAX_VALUE" that would round up
+                        // to 2^63 and admit it. Go's checkFieldValue enforces the same bound.
+                        if (isIntegralDouble(value.value) &&
+                            value.value >= LONG_MIN_AS_DOUBLE &&
+                            value.value < TWO_TO_THE_63
+                        ) {
+                            null
+                        } else {
+                            typeMismatch(field.name, "expected int64")
+                        }
                     else -> typeMismatch(field.name, "expected int64")
                 }
 
@@ -224,6 +244,12 @@ public object SchemaEngine {
         field: String,
         detail: String,
     ): FieldViolation = FieldViolation(field, ViolationType.TYPE_MISMATCH, detail)
+
+    /** One past Long.MAX_VALUE, which Double cannot represent exactly. */
+    private const val TWO_TO_THE_63: Double = 9.223372036854775808E18
+
+    /** Long.MIN_VALUE is exactly -2^63 and does have an exact Double form. */
+    private const val LONG_MIN_AS_DOUBLE: Double = -9.223372036854775808E18
 
     private fun isIntegralDouble(d: Double): Boolean = abs(d - d.toLong()) < 1e-9
 
