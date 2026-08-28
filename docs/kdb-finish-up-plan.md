@@ -521,7 +521,54 @@ Also in that commit, closing a gap recorded back in the Phase 0 log: **Component
 
 Also closed a cross-language divergence found on the way: Kotlin's `validateFrameLength` floor was 8 while `FRAME_HEADER_SIZE` has always been 12, so Kotlin accepted four declared lengths Go rejects. The only thing depending on it was a WS TLS test fixture whose "minimal valid frame" was shorter than the header it claimed to be. Every new test was confirmed to fail against unfixed source rather than taken on trust.
 
-**Still open in 3.1** (current `go test -cover ./...`, all green): raise `kdb/error` 17.5%, `storage/io` 24.1%, `cmd/kdb/cli` 35.2%, `kdb/schema` 37.4%, `kdb/transaction` 42.4%, `storage` 44.6%, `kdb/sql` 45.7%, `kdb/dag` 46.7%, `kdb/json` 49.9%, `kdb/index` 51.4%, `kdb/codec` 57.8% (encode paths remain thin). Zero-test Go packages that remain are all orphans slated for 4.H (`compaction`, `file`, `metrics`, `policy`, `query/hybrid`, `storage/manager`, `tier`, `compute/webgpu`) — wire them up or delete them there rather than testing them in place. Kotlin zero-test modules still outstanding: `kdb-index` (1622 LOC), `kdb-index-btree`, `kdb-storage-compaction`, `kdb-service`.
+### Phase 3.1 — COMPLETE (2026-08-27)
+
+Every package and module the plan named is now covered. Final Go coverage, all green under `-race`:
+
+| package | before | after |
+|---|---|---|
+| `kdb/wire` | 48.6% | **86.2%** |
+| `kdb/error` | 17.5% | **75.0%** |
+| `kdb/storage/io` | 23.6% | **69.9%** |
+| `kdb/transaction` | 40.8% | **70.0%** |
+| `kdb/dag` | 46.7% | **64.3%** |
+| `kdb/sql` | 45.7% | **63.5%** |
+| `cmd/kdb/cli` | 24.6% | **62.1%** |
+| `kdb/codec` | 39.3% | **57.8%** |
+| `kdb/schema` | 37.4% | **57.5%** |
+| `kdb/json` | 49.9% | **56.3%** |
+| `kdb/index` | 39.1% | **53.3%** |
+
+(plus, from the first pass: `transport/core` 96.4%, `codec/schema` 100%, `storage/delta` 89.1%, `storage/memtable` 98.8%, `transport/tcp` 79.4%.)
+
+Kotlin: `kdb-index` (1622 LOC), `kdb-index-btree` and `kdb-storage-compaction` all had **no test source set at all** and now have one; `kdb-storage-sstable` and `kdb-storage-memtable` were covered in Phase 1; `kdb-service` already had `ServiceConfigTest`; `kdb-compression` got its first tests during 3.2.
+
+**Not raised, deliberately:** `kdb/storage` stays at 44.6%. What is uncovered there is `deltaRecordEqual`/`documentEqual`/`hashPtrEqual` — unexported, with **no callers anywhere in the tree** — plus error constructors. Testing dead code would move the number without testing anything; deleting it belongs to 4.H's cleanup sweep. The rest of the package is exercised through its many consumers. The zero-coverage Go packages that remain (`compaction`, `file`, `metrics`, `policy`, `query/hybrid`, `storage/manager`, `tier`, `compute/webgpu`) are all orphans slated for 4.H — wire them up or delete them there rather than testing them in place.
+
+**Bugs the coverage work found.** Every one was confirmed by a test that fails against the unfixed source, and every cross-language one landed in both implementations together:
+
+*Remotely reachable, process-fatal:*
+1. **A frame declaring more bytes than it carries panicked the process** — no `recover()` on any frame-handling path, and WebSocket delivers a message whole without checking it against its own length prefix, so twenty bytes from an unauthenticated peer killed any Go component speaking WS. Fixed in `DecodeHeader` and at the transport.
+2. **A `CommitPush` commit count was used as a slice capacity** — four bytes declaring `0xFFFFFFFF` commits reserved ~800 GiB (measured). A remote kill under any memory limit.
+3. **Array/map lengths in the value codec, same class** — nine LEB128 bytes ask for 2^60 elements: a `makeslice` panic on Go, an OOM on Kotlin. This is the decoder behind every peer commit payload and every delta page and SSTable block read from disk.
+
+*Silent data corruption / loss:*
+4. **Go's JSON parser corrupted every non-BMP character** — a `\uXXXX` escape carries one UTF-16 code unit, so an emoji can only be written as a surrogate pair; encoding each half separately substituted U+FFFD, so `{"name":"😀"}` arrived as two replacement characters. Kotlin was correct by construction (its String is UTF-16), so the two implementations disagreed on the same input.
+5. **Reading a missing segment returned `(nil, nil)` from the file-backed shim** — a lost or deleted segment file was indistinguishable from an empty one, so recovery silently skipped it. Now an error; the full Go suite and all 30 e2e scenarios pass with the stricter semantic.
+6. **Kotlin's index snapshot could never be restored** — the writer interpolated a `KdbHash`, which has no `toString()` override, so it wrote an object identity where a hex hash belonged and the parser rejected it. Every snapshot the module ever produced was unreadable.
+
+*Wrong answers that look plausible:*
+7. **LIMIT was applied before ORDER BY** (both languages) — `SELECT ... ORDER BY name DESC LIMIT 2` returned the wrong two rows. Easy to miss: with a fixture whose insertion order already matches the requested order, both behaviours agree, which is exactly the shape Kotlin's existing `orderByLimit` test had.
+8. **LIMIT truncated an aggregate's input** (both languages) — `SELECT COUNT(*) FROM t LIMIT 1` answered 1 however many rows the table held.
+9. **A limited index range query returned different documents every call** — 30 identical calls gave 9 distinct answers, so paging could show a document twice or skip it.
+10. **An `int64` schema field accepted values outside int64** (both languages) — `Int32Type` had always bounds-checked; `Int64Type` had not.
+11. **A schema diff came back in a different order every time** (Go) — and in a different order from Kotlin's.
+
+*Contract violations in the test double:* the in-memory `PlatformIOShim` stands in for the file-backed one throughout the suite, and was **more permissive than the real thing in two ways** — `SealSegment` was a no-op (so a write to a sealed segment, the exact bug sealing exists to catch, passed every test using the double) and `ListSegments` ranged a map (segment names are zero-padded precisely so lexicographic order is sequence order, and delta replay only tolerates a torn tail in the *last* segment). A new conformance suite now runs one set of tests against both implementations; that is how these and finding 5 all surfaced.
+
+*Latent:* `IsException`/`CodeOf` used a plain type assertion, so a wrapped exception stopped being recognized and a client received a generic failure instead of its typed reason — the same bug 1-G7 had already fixed once in the wire layer.
+
+*Unimplemented and dangerous:* `kdb-storage-compaction`'s `runSstableCompaction` walked its input segment ids without reading a byte from any of them, wrote the resulting empty SSTable, and **deleted every input**. Nothing calls it, which is the only reason that never happened. It now throws before touching any I/O; implementing it for real is tracked as **4.G0**.
 
 ### Out-of-plan work that landed alongside Phase 3 (2026-08-27)
 
@@ -538,7 +585,7 @@ Also closed a cross-language divergence found on the way: Kotlin's `validateFram
 Phases 0, 1, 2 and 3.2 are complete. Phase 3.1 is partially done. Phase 4 has not started, except for its 4.E CLI-`query` item (done) and the 4.C/4.G prerequisites already flagged.
 
 **Open follow-ups carried forward, in priority order:**
-1. Finish 3.1 (Go thin packages above; Kotlin `kdb-index`, `kdb-index-btree`, `kdb-storage-compaction`, `kdb-service`).
+1. ~~Finish 3.1~~ — **done 2026-08-27**, see the Phase 3.1 section above. **Phase 3 is now complete.**
 2. SSTable tombstone persistence — cross-language format change, Kotlin originates (see above).
 3. Cross-language SSTable fixture test (a segment written by one language's writer read by the other's reader) — flagged since 1-G1/1-K1, still missing.
 4. Real JS/Native zstd (Kotlin's non-JVM `ZstdCompression` is an identity passthrough) — blocks the explicit-compression-flag block-format refinement deferred from 1-G1/1-K1.
