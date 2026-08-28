@@ -37,6 +37,17 @@ func DecodeHeader(frame []byte) (Header, error) {
 	if err := ValidateFrameLength(frameLength, DefaultMaxFrameBytes); err != nil {
 		return Header{}, err
 	}
+	// The declared length has to be checked against the buffer we were actually handed, not
+	// just against the protocol maximum. PayloadLength is derived from frameLength and every
+	// caller slices the payload out with it, so a frame whose prefix claims more bytes than it
+	// carries used to panic with a slice-bounds error rather than return a decode error. The
+	// TCP/stream framing reader never produces such a buffer (it only emits a frame once
+	// frameLength bytes have arrived), but a WebSocket message is delivered whole and
+	// unvalidated, and captured frames fed to kdb-inspect can be truncated by whatever wrote
+	// them - both reach here with an attacker- or corruption-controlled prefix.
+	if len(frame) < frameLength {
+		return Header{}, newDecodeError("frame shorter than its declared length")
+	}
 	typeCode := uint16(readInt16LE(frame, 4))
 	msgType, ok := MessageTypeFromCode(typeCode)
 	if !ok {

@@ -336,6 +336,9 @@ func decodeValue(c *cursor, typ schema.Type, reg *schema.Registry) (Value, error
 		if err != nil {
 			return nil, err
 		}
+		if err := c.checkElementCount(n, "array"); err != nil {
+			return nil, err
+		}
 		list := make([]Value, 0, n)
 		for i := uint64(0); i < n; i++ {
 			el, err := decodeValue(c, t.Element, reg)
@@ -348,6 +351,9 @@ func decodeValue(c *cursor, typ schema.Type, reg *schema.Registry) (Value, error
 	case schema.Map:
 		n, err := c.leb()
 		if err != nil {
+			return nil, err
+		}
+		if err := c.checkElementCount(n, "map"); err != nil {
 			return nil, err
 		}
 		entries := make([]MapEntry, 0, n)

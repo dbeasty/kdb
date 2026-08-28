@@ -141,6 +141,17 @@ func (r *FrameStreamReader) drainCompleteFrames() ([][]byte, error) {
 	return out, nil
 }
 
+// ValidateInboundFrame checks that a frame received whole from a message-oriented transport
+// really is one complete frame: its length prefix must be in bounds and must equal the buffer
+// it arrived in. The stream transports get this invariant for free from FrameStreamReader,
+// which only emits a buffer once exactly frameLength bytes have arrived; WebSocket delivers a
+// whole message with no such guarantee, so a peer can hand over a buffer whose prefix disagrees
+// with its size. That mismatch has to be rejected at the transport, before the decoder is asked
+// to slice a payload that isn't there.
+func ValidateInboundFrame(frame []byte, maxFrameBytes int) error {
+	return ValidateOutgoingFrame(frame, maxFrameBytes)
+}
+
 // ValidateOutgoingFrame checks a complete outgoing frame length prefix.
 func ValidateOutgoingFrame(frame []byte, maxFrameBytes int) error {
 	if len(frame) < 4 {

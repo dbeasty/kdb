@@ -17,9 +17,17 @@ class WebSocketTlsTest {
     private fun newTransport(): JvmWebSocketWireTransport =
         defaultWebSocketWireTransport() as JvmWebSocketWireTransport
 
-    /** Minimal valid KDB wire frame (total length 8 per [validateFrameLength]). */
+    /**
+     * Minimal valid KDB wire frame: the 12-byte header (little-endian total length, message
+     * type, protocol version, correlation id) plus one payload byte, so 13 in total.
+     *
+     * This used to build an 8-byte buffer, on the strength of [validateFrameLength] accepting a
+     * declared length of 8 - but the frame header alone is 12 bytes, so no such frame can exist;
+     * Go's ValidateFrameLength has always rejected it. The floor was the bug, and this fixture
+     * was the only thing depending on it.
+     */
     private fun minimalFrame(payload: Byte = 42): ByteArray =
-        byteArrayOf(8, 0, 0, 0, payload, 0, 0, 0)
+        byteArrayOf(13, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, payload)
 
     @Test
     fun wssRequiresTls_settingsMissing() {

@@ -48,6 +48,36 @@ object WireCodec {
         fun u8(): Byte
         fun raw(n: Int): ByteArray
         fun leb(): Long
+
+        /**
+         * Bytes still available to this cursor, or -1 when that is not knowable (a streaming
+         * source, which finds out by hitting the end). Used to reject an array/map length the
+         * input cannot possibly back before it is used to size an allocation - see
+         * [checkElementCount].
+         */
+        fun remaining(): Int
+    }
+
+    /**
+     * Rejects an array/map length that the remaining input cannot back. The count is a varint
+     * straight off the wire (a peer's commit payload) or off disk (a delta page, an SSTable
+     * block), so nine bytes are enough to ask for a list of 2^60 elements: `ArrayList(n)` then
+     * either throws on a negative truncated capacity or tries to allocate a multi-gigabyte
+     * backing array, neither of which is a decode error the caller can handle.
+     *
+     * Every element costs at least one byte, so a count above the bytes remaining is malformed
+     * by construction - true for every type in this codebase's schemas, since the schema comes
+     * from the caller and never from the wire. This mirrors the identical bound in Go's
+     * cursor.checkElementCount (go/kdb/codec/wire_numbers.go); the two decoders read the same
+     * bytes and have to reject the same inputs.
+     */
+    private fun checkElementCount(c: Cursor, n: Long, kind: String): Int {
+        val remaining = c.remaining()
+        if (n < 0 || (remaining >= 0 && n > remaining)) {
+            throw KdbDecodeException("$kind length exceeds remaining input", c.mark())
+        }
+        // Even within the bound, only pre-size by what a streaming source has actually shown us.
+        return if (remaining >= 0) n.toInt() else 0
     }
 
     private class BytesCursor(private val bytes: ByteArray, private val pos: Pos, private val limit: Int) : Cursor {
@@ -69,6 +99,8 @@ object WireCodec {
             if (pos.i > limit) throw KdbDecodeException("leb past limit", mark())
             return v
         }
+
+        override fun remaining(): Int = limit - pos.i
     }
 
     private class SourceCursor(private val pull: SourcePull) : Cursor {
@@ -76,6 +108,10 @@ object WireCodec {
         override fun u8(): Byte = pull.readExact(1)[0]
         override fun raw(n: Int): ByteArray = pull.readExact(n)
         override fun leb(): Long = pull.readLeb128U64()
+
+        // A pull source does not know how much is left; -1 means "unknown", and the length
+        // bound is skipped in favour of finding out by reading (which ends in an EOF error).
+        override fun remaining(): Int = -1
     }
 
     // --- encode -----------------------------------------------------------------------------
@@ -276,15 +312,17 @@ object WireCodec {
 
             is KdbType.Primitive -> decodePrim(c, type.physical, type.logical, reg)
             is KdbType.Array -> {
-                val n = c.leb().toInt()
-                val list = ArrayList<KdbValue>(n)
+                val raw = c.leb()
+                val list = ArrayList<KdbValue>(checkElementCount(c, raw, "array"))
+                val n = raw.toInt()
                 repeat(n) { list += decodeValue(c, type.element, reg) }
                 KdbValue.ArrayVal(list)
             }
 
             is KdbType.Map -> {
-                val n = c.leb().toInt()
-                val pairs = ArrayList<Pair<KdbValue, KdbValue>>(n)
+                val raw = c.leb()
+                val pairs = ArrayList<Pair<KdbValue, KdbValue>>(checkElementCount(c, raw, "map"))
+                val n = raw.toInt()
                 repeat(n) {
                     val k = decodeValue(c, type.key, reg)
                     val v = decodeValue(c, type.value, reg)

@@ -40,6 +40,16 @@ func DecodeCommits(bytes []byte) ([]document.Commit, error) {
 	o := 0
 	count := int(binary.LittleEndian.Uint32(bytes[o:]))
 	o += 4
+	// The count comes from a peer, so it cannot be used to size the allocation on its own: every
+	// commit costs at least its own 4-byte length prefix, so a payload of len(bytes) can back at
+	// most (len(bytes)-4)/4 of them. Without this bound a four-byte CommitPush declaring
+	// 0xFFFFFFFF commits made this reserve ~800 GiB before discovering, one iteration later,
+	// that there were no commit bodies at all - fatal under any memory limit (which is to say,
+	// under the container and systemd deployments), and reachable by any peer that can send a
+	// commitPush frame.
+	if maxPossible := (len(bytes) - 4) / 4; count > maxPossible {
+		return nil, fmt.Errorf("commit push declares %d commits, payload can hold at most %d", count, maxPossible)
+	}
 	result := make([]document.Commit, 0, count)
 	for i := 0; i < count; i++ {
 		if o+4 > len(bytes) {

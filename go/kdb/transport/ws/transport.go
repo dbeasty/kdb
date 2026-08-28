@@ -255,6 +255,14 @@ func (c *wsConnection) readLoop() {
 			_ = c.Close()
 			return
 		}
+		// A WebSocket message arrives whole, so unlike the stream transports nothing has yet
+		// checked that this buffer is one complete kdb frame. Handing a buffer whose length
+		// prefix disagrees with its size to the decoder is how a peer gets it to slice past the
+		// end of what it was given; drop the connection instead of forwarding it.
+		if err := core.ValidateInboundFrame(payload, c.maxFrameBytes); err != nil {
+			_ = c.Close()
+			return
+		}
 		select {
 		case c.incoming <- payload:
 		case <-c.done:

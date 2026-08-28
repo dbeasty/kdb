@@ -28,6 +28,18 @@ public object CommitPushCodec {
         var o = 0
         val count = readIntLe(bytes, o)
         o += 4
+        // The count comes from a peer, so it cannot size the allocation on its own: every commit
+        // costs at least its own 4-byte length prefix, so a payload of bytes.size can back at
+        // most (bytes.size - 4) / 4 of them. Without this bound a four-byte CommitPush declaring
+        // Int.MAX_VALUE commits asked ArrayList for a two-billion-element backing array before
+        // discovering, one iteration later, that there were no commit bodies at all - an
+        // OutOfMemoryError rather than a decode error, reachable by any peer that can send a
+        // commitPush frame. A negative count (a length prefix with the high bit set) took out
+        // ArrayList's own argument check instead. Go's DecodeCommits enforces the same bound.
+        val maxPossible = (bytes.size - 4) / 4
+        require(count in 0..maxPossible) {
+            "commit push declares $count commits, payload can hold at most $maxPossible"
+        }
         val result = ArrayList<KdbCommit>(count)
         repeat(count) {
             require(o + 4 <= bytes.size) { "truncated commit push payload" }

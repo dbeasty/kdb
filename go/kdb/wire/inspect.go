@@ -12,6 +12,12 @@ func DecodePayloadEnvelope(frame []byte, header Header) (PayloadEnvelope, error)
 	if len(frame) < payloadOffset+1 {
 		return PayloadEnvelope{}, newDecodeError("frame too short for payload")
 	}
+	// header is supplied by the caller rather than re-derived here, so it is not necessarily
+	// consistent with frame - re-check the bound DecodeHeader would have enforced before
+	// slicing, or a mismatched pair panics instead of erroring.
+	if header.PayloadLength < 1 || payloadOffset+header.PayloadLength > len(frame) {
+		return PayloadEnvelope{}, newDecodeError("payload length does not fit the frame")
+	}
 	body := frame[payloadOffset+1 : payloadOffset+header.PayloadLength]
 	var env PayloadEnvelope
 	if err := unmarshalJSON(body, &env); err != nil {
