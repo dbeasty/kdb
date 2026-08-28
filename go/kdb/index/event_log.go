@@ -201,11 +201,10 @@ func (l *eventLog) lookup(key Key, cutoffHash codec.Hash) []codec.UUID {
 	if !ok {
 		return nil
 	}
-	out := make([]codec.UUID, 0, len(ids))
-	for id := range ids {
-		out = append(out, id)
-	}
-	return out
+	// Stable order, for the same reason rangeScan needs one: a bucket is a map, and a caller
+	// that compares two lookups - or hands the result straight on as query rows - should not see
+	// the order change between identical calls.
+	return sortedBucketIDs(ids)
 }
 
 // rangeScan returns the doc ids whose keys fall within [from, to] at cutoffHash, in key
@@ -229,7 +228,12 @@ func (l *eventLog) rangeScan(from, to Key, cutoffHash codec.Hash, limit int, asc
 	seen := make(map[codec.UUID]struct{})
 	var out []codec.UUID
 	for _, k := range keys {
-		for id := range buckets[k] {
+		// A bucket is a map, so ranging it directly gave a different order on every call. That
+		// is invisible without a limit - the same set comes back, just shuffled - but with one
+		// it changes *which* documents are returned, so a limited range query answered
+		// differently each time it ran, and paging through an index could show a document twice
+		// or never. Sorted by id: an arbitrary order, but the same arbitrary order every time.
+		for _, id := range sortedBucketIDs(buckets[k]) {
 			if _, ok := seen[id]; ok {
 				continue
 			}
@@ -241,6 +245,21 @@ func (l *eventLog) rangeScan(from, to Key, cutoffHash codec.Hash, limit int, asc
 		}
 	}
 	return out
+}
+
+// sortedBucketIDs returns a bucket's document ids in a stable order.
+func sortedBucketIDs(bucket map[codec.UUID]struct{}) []codec.UUID {
+	ids := make([]codec.UUID, 0, len(bucket))
+	for id := range bucket {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		if ids[i].MSB != ids[j].MSB {
+			return uint64(ids[i].MSB) < uint64(ids[j].MSB)
+		}
+		return uint64(ids[i].LSB) < uint64(ids[j].LSB)
+	})
+	return ids
 }
 
 func sortKeys(keys []Key, ascending bool) {
