@@ -92,7 +92,12 @@ type LsmBlobStore struct {
 	io          storage.PlatformIOShim
 	namespaceID string
 	cache       *BlockCache
-	tables      []Handle
+
+	// mu guards tables: AddTable runs on the flush path while Get runs on the read path, and
+	// nothing above serializes the two - appending to the slice under a concurrent read was a
+	// straight data race.
+	mu     sync.Mutex
+	tables []Handle
 }
 
 // NewLsmBlobStore returns an LSM blob store.
@@ -102,8 +107,11 @@ func NewLsmBlobStore(io storage.PlatformIOShim, namespaceID string, cache *Block
 
 // Get searches tables newest-first.
 func (s *LsmBlobStore) Get(key codec.Hash) []byte {
-	for i := len(s.tables) - 1; i >= 0; i-- {
-		reader := NewDefaultReader(s.io, s.tables[i])
+	s.mu.Lock()
+	tables := s.tables
+	s.mu.Unlock()
+	for i := len(tables) - 1; i >= 0; i-- {
+		reader := NewDefaultReader(s.io, tables[i])
 		if v, err := reader.Get(key); err == nil && v != nil {
 			return v
 		}
@@ -113,5 +121,9 @@ func (s *LsmBlobStore) Get(key codec.Hash) []byte {
 
 // AddTable registers a flushed table.
 func (s *LsmBlobStore) AddTable(handle Handle) {
-	s.tables = append(s.tables, handle)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Copy rather than append in place so a Get holding the old slice header keeps reading a
+	// stable backing array.
+	s.tables = append(append([]Handle(nil), s.tables...), handle)
 }

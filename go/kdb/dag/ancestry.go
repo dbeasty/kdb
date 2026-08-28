@@ -63,6 +63,15 @@ func (d *InMemoryCommitDag) IsAncestor(ancestor, descendant codec.Hash) bool {
 	return ok
 }
 
+// AncestorSet returns the ancestor closure of hash (including hash itself). Callers testing
+// many candidate ancestors against one descendant should walk the graph once with this rather
+// than calling IsAncestor per candidate, which rebuilds the same closure every time.
+func (d *InMemoryCommitDag) AncestorSet(hash codec.Hash) map[codec.Hash]struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.ancestorClosureLocked(hash)
+}
+
 // AppendMergeCommit appends a merge commit with two parents.
 func (d *InMemoryCommitDag) AppendMergeCommit(
 	tx document.Transaction,

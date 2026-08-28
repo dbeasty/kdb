@@ -93,12 +93,7 @@ func TestSortedTableGetReturnsCopy(t *testing.T) {
 // TestSortedTableSizeOverwriteNetsOut mirrors the Kotlin twin's
 // SortedMemTableSizeTest.overwriteNetsOutThePreviousValuesSize (kdb-finish-up-plan.md 1-K2):
 // overwriting a key must net out the replaced value's size, not just add the new one.
-//
-// SKIPPED: the 1-K2 size-accounting fix was applied to Kotlin's SortedMemTable but has not
-// been ported here - Put unconditionally does bytes += len(value), so overwriting a 100-byte
-// value with a 40-byte one reports 140, not 40. Un-skip when the fix is ported.
 func TestSortedTableSizeOverwriteNetsOut(t *testing.T) {
-	t.Skip("known bug (1-K2, unported from Kotlin): SortedTable.Put does not net out the replaced value's size")
 	table := NewSortedTable()
 	key := testKey(t, "k")
 
@@ -115,11 +110,7 @@ func TestSortedTableSizeOverwriteNetsOut(t *testing.T) {
 // TestSortedTableSizeDeleteSubtracts mirrors the Kotlin twin's
 // SortedMemTableSizeTest.deleteSubtractsTheDeletedValuesSize (1-K2): deleting the only entry
 // must return SizeBytes to zero.
-//
-// SKIPPED: same unported 1-K2 fix as TestSortedTableSizeOverwriteNetsOut - Delete nils the
-// value but never subtracts its size, so SizeBytes stays at 100. Un-skip with the fix.
 func TestSortedTableSizeDeleteSubtracts(t *testing.T) {
-	t.Skip("known bug (1-K2, unported from Kotlin): SortedTable.Delete does not subtract the deleted value's size")
 	table := NewSortedTable()
 	key := testKey(t, "k")
 
@@ -131,15 +122,9 @@ func TestSortedTableSizeDeleteSubtracts(t *testing.T) {
 }
 
 // TestSortedTableDeleteThenPutIsFlushed covers the delete-before-put ordering: Delete on a
-// never-written key records a nil map entry, and a later Put of that same key must still land
-// in the flush snapshot (snapshotEntries iterates insertion order).
-//
-// SKIPPED: Delete creates a nil-valued map entry, so the later Put sees the key as "already
-// present" and never appends it to the order slice - the value is visible to Get but silently
-// missing from snapshotEntries, i.e. dropped on flush. Un-skip when Put/Delete track order
-// membership correctly (e.g. Delete removing the map entry, or Put checking order membership).
+// never-written key records a tombstone, and a later Put of that same key must still land in
+// the flush snapshot (snapshotEntries iterates insertion order).
 func TestSortedTableDeleteThenPutIsFlushed(t *testing.T) {
-	t.Skip("known bug: Delete-then-Put leaves the key out of the flush snapshot, losing the write on flush")
 	table := NewSortedTable()
 	key := testKey(t, "resurrect")
 
@@ -244,7 +229,7 @@ func TestManagerFlushEmptyReturnsZeroHandle(t *testing.T) {
 	// A put that was deleted again before the flush must not produce a table either.
 	key := testKey(t, "gone")
 	mgr.Put(key, []byte("temp"))
-	mgr.active.Delete(key)
+	mgr.Delete(key)
 	handle, err = mgr.Flush(0)
 	if err != nil {
 		t.Fatalf("Flush of deleted-only memtable: %v", err)
@@ -265,15 +250,7 @@ func TestManagerFlushEmptyReturnsZeroHandle(t *testing.T) {
 // flushFailureStillLeavesDataVisibleViaPendingFlush (kdb-finish-up-plan.md 1-K2): when
 // writer.Finish fails (here at SealSegment, the final durability step), the flushed generation
 // must remain visible via pendingFlush - it was never actually lost, just not yet durable.
-//
-// SKIPPED: the 1-K2 fix was applied to Kotlin's MemTableManager.flush but has not been ported
-// here - Manager.Flush clears pendingFlush BEFORE writer.Finish() runs (memtable.go), so a
-// Finish failure leaves the flushed generation reachable from neither active (already swapped),
-// pendingFlush (already cleared), nor the blob store (AddTable never called): Get reports every
-// write of that generation as absent. Un-skip when the fix is ported (clear pendingFlush only
-// after Finish succeeds, and restore visibility on failure).
 func TestManagerFlushFailureKeepsDataVisible(t *testing.T) {
-	t.Skip("known bug (1-K2, unported from Kotlin): Manager.Flush clears pendingFlush before Finish, losing visibility on flush failure")
 	shim := &sealFailingShim{PlatformIOShim: io.NewInMemoryPlatformIO()}
 	mgr := newManager(shim)
 
@@ -288,5 +265,81 @@ func TestManagerFlushFailureKeepsDataVisible(t *testing.T) {
 
 	if got := mgr.Get(key); string(got) != string(value) {
 		t.Fatalf("write lost after failed flush: got %q, want %q", got, value)
+	}
+}
+
+// TestSortedTableLookupDistinguishesTombstoneFromAbsent pins the distinction Get cannot make:
+// a tombstoned key is found-and-deleted, a never-written key is simply not found. Everything
+// that merges generations (Manager.Get) depends on telling those apart.
+func TestSortedTableLookupDistinguishesTombstoneFromAbsent(t *testing.T) {
+	table := NewSortedTable()
+	key := testKey(t, "tomb")
+
+	if _, _, found := table.Lookup(key); found {
+		t.Fatal("a never-written key must report found=false")
+	}
+
+	table.Put(key, []byte("v"))
+	value, deleted, found := table.Lookup(key)
+	if !found || deleted || string(value) != "v" {
+		t.Fatalf("Lookup of a live key: got (%q, deleted=%v, found=%v), want (\"v\", false, true)", value, deleted, found)
+	}
+
+	table.Delete(key)
+	value, deleted, found = table.Lookup(key)
+	if !found || !deleted || value != nil {
+		t.Fatalf("Lookup of a tombstone: got (%q, deleted=%v, found=%v), want (nil, true, true)", value, deleted, found)
+	}
+}
+
+// TestManagerDeleteShadowsFlushedValue is the correctness bug this Lookup plumbing exists for:
+// a delete of a key that was already flushed to an SSTable must hide it. Manager.Get used to
+// read the memtable with Get, see nil for the tombstone, treat that as "not here", and fall
+// through to the blob store - handing back the deleted value.
+func TestManagerDeleteShadowsFlushedValue(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	mgr := newManager(shim)
+	key := testKey(t, "deleted-after-flush")
+
+	mgr.Put(key, []byte("flushed"))
+	if _, err := mgr.Flush(0); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := mgr.Get(key); string(got) != "flushed" {
+		t.Fatalf("sanity: Get after flush: got %q, want %q", got, "flushed")
+	}
+
+	mgr.Delete(key)
+	if got := mgr.Get(key); got != nil {
+		t.Fatalf("delete did not shadow the flushed value: got %q, want nil", got)
+	}
+
+	// And a re-put after the delete is visible again.
+	mgr.Put(key, []byte("rewritten"))
+	if got := mgr.Get(key); string(got) != "rewritten" {
+		t.Fatalf("Get after delete-then-put: got %q, want %q", got, "rewritten")
+	}
+}
+
+// TestManagerDeleteShadowsPendingFlush covers the same shadowing one generation in: a
+// tombstone in the active table must hide a value still sitting in the generation being
+// flushed.
+func TestManagerDeleteShadowsPendingFlush(t *testing.T) {
+	shim := &sealFailingShim{PlatformIOShim: io.NewInMemoryPlatformIO()}
+	mgr := newManager(shim)
+	key := testKey(t, "pending")
+
+	mgr.Put(key, []byte("in-flight"))
+	shim.failNextSeal = true
+	if _, err := mgr.Flush(0); err == nil {
+		t.Fatal("expected Flush to fail when SealSegment fails")
+	}
+	if got := mgr.Get(key); string(got) != "in-flight" {
+		t.Fatalf("sanity: value should still be visible via pendingFlush: got %q", got)
+	}
+
+	mgr.Delete(key)
+	if got := mgr.Get(key); got != nil {
+		t.Fatalf("delete did not shadow the pending-flush value: got %q, want nil", got)
 	}
 }

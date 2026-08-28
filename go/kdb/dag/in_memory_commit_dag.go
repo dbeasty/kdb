@@ -28,6 +28,20 @@ type InMemoryCommitDag struct {
 	// instead of walking history. See GetCommitByTransactionID's own doc comment for why this
 	// exists.
 	txIndex map[codec.UUID]codec.Hash
+	// ancestryVersion is bumped by every mutation that can change what IsAncestor /
+	// AncestorSet answer for an already-known commit: a commit appearing (putCommitLocked) or
+	// disappearing (Squash, StubCommit). Readers that memoize ancestry-derived state - see
+	// index.eventLog's bucket cache - key their memo on it so they don't have to recompute
+	// against a DAG that has not moved.
+	ancestryVersion uint64
+}
+
+// AncestryVersion returns a counter that changes whenever the commit graph changes shape.
+// Callers may cache anything derived from ancestry for as long as this value is unchanged.
+func (d *InMemoryCommitDag) AncestryVersion() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.ancestryVersion
 }
 
 // NewInMemoryCommitDag creates a DAG with genesis commit and main branch.
@@ -182,6 +196,7 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	}
 	d.commits[commit.Hash] = commit
 	d.insertHex(commit.Hash.Hex())
+	d.ancestryVersion++
 	// Only the first commit for a given transaction id is indexed - a caller retrying the same
 	// transaction always expects to find that original result, not a later, unrelated commit
 	// that happens to reuse the id (which should never legitimately happen, since ids are random
@@ -220,6 +235,7 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	}
 	delete(d.commits, hash)
 	d.removeHex(hash.Hex())
+	d.ancestryVersion++
 	stub := document.CommitStub{
 		OriginalHash: hash, ArchiveLocation: archiveLocation, StubbedAt: codec.TimestampNow(),
 	}
@@ -541,6 +557,7 @@ func (d *InMemoryCommitDag) Squash(
 	}
 	d.commits[synthetic.Hash] = synthetic
 	d.insertHex(synthetic.Hash.Hex())
+	d.ancestryVersion++
 	return synthetic, nil
 }
 
