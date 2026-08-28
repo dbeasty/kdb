@@ -359,7 +359,14 @@ func (d *InMemoryCommitDag) Walk(from codec.Hash, until *codec.Hash, limit int) 
 		frontier = append(frontier[:best], frontier[best+1:]...)
 		h := item.hash
 		if until != nil && h == *until {
-			break
+			// Prune this branch only - do NOT abort the whole traversal. On a DAG with merge
+			// commits, `until` can surface from the frontier while a sibling branch is still
+			// pending; a plain break here silently dropped that entire branch (peer-sync's
+			// CommitsToPush/CommitFetch then omitted commits, and a pushed merge commit
+			// arrived at the peer before its other parent - "missing parent" rejections
+			// observed live in the 3-node e2e scenario).
+			visited[h] = struct{}{}
+			continue
 		}
 		if _, ok := visited[h]; ok {
 			continue

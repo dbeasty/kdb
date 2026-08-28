@@ -1,0 +1,37 @@
+# KDB service systemd unit (kdb-finish-up-plan Phase 2.9).
+#
+# Install:
+#   sudo cp kdb-service.service /etc/systemd/system/
+#   sudo useradd --system --home /var/lib/kdb kdb
+#   sudo mkdir -p /var/lib/kdb /etc/kdb && sudo chown kdb:kdb /var/lib/kdb
+#   sudo systemctl daemon-reload && sudo systemctl enable --now kdb-service
+#
+# Restart=on-failure is load-bearing, not boilerplate: a memory-pressure orderly abort exits 75
+# (kdb-spec-layer13 Component 50) and relies on the supervisor to restart the process; a clean
+# SIGTERM drain exits 0 and is not restarted.
+
+[Unit]
+Description=KDB database service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kdb
+Group=kdb
+ExecStart=/usr/local/bin/kdb-service --config /etc/kdb/kdb-service.json
+Restart=on-failure
+RestartSec=2
+# SIGTERM triggers the service's own graceful drain (--drain-timeout, default 30s); give it
+# headroom before systemd escalates to SIGKILL.
+TimeoutStopSec=45
+# Storage lives here; the service also takes its directory lock under this path.
+StateDirectory=kdb
+ReadWritePaths=/var/lib/kdb
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

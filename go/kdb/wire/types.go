@@ -451,6 +451,10 @@ type SessionBeginAckMessage struct {
 	SessionID       string
 	HeadHex         string
 	ReadConsistency string
+	// Error is set (with SessionID empty) when the session begin was rejected - an
+	// authentication or authorization failure the client should surface rather than a bare
+	// "rejected". nil on success and on frames from peers that predate the field.
+	Error *string
 }
 
 func (m SessionBeginAckMessage) Header() Header { return m.H }

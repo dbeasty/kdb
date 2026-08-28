@@ -1,0 +1,82 @@
+# Tag-triggered release pipeline (kdb-finish-up-plan Phase 2.10): test gate, cross-compiled
+# binaries with checksums as a GitHub release, and a container image pushed to GHCR.
+#
+# Cut a release with:
+#   git tag v0.1.0 && git push origin v0.1.0
+# The tag (minus the leading "v") becomes the version injected into every binary
+# (go/kdb/version.Version) and the image tag.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: Go tests (race)
+        run: cd go && go test -race ./...
+      - name: Go vet + gofmt
+        run: cd go && go vet ./... && test -z "$(gofmt -l .)"
+
+  binaries:
+    needs: test-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: Cross-compile
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          LDFLAGS="-X github.com/limidus/kdb/go/kdb/version.Version=${VERSION}"
+          mkdir -p dist
+          cd go
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            GOOS="${target%/*}"; GOARCH="${target#*/}"
+            for bin in kdb kdb-service kdb-inspect; do
+              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+                go build -ldflags "$LDFLAGS" -o "../dist/${bin}-${GOOS}-${GOARCH}" "./cmd/${bin}"
+            done
+          done
+          cd ../dist && sha256sum * > SHA256SUMS
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  image:
+    needs: test-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: |
+            ghcr.io/${{ github.repository }}/kdb-service:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}/kdb-service:latest

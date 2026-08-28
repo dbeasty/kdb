@@ -83,6 +83,14 @@ type KdbServerRuntime struct {
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.
 	WriteTimeout time.Duration
+	// PeerSyncConflictPolicy selects how the peer-sync listener resolves a same-document
+	// divergence pushed by a peer (see peersync.ResolutionOptions.Policy). Zero value
+	// (ConflictPolicyAppendOnly) keeps the safe default: disjoint-document histories
+	// auto-merge, same-document divergence returns a ConflictReport for the operator to
+	// resolve. Set ConflictPolicyLastWrite for symmetric later-timestamp-wins convergence
+	// (kdb-service's --peer-conflict-policy last-write).
+	PeerSyncConflictPolicy transaction.ConflictPolicy
+
 	// draining is set by an orderly shutdown (kdb-spec-layer13 Component 50) to reject every
 	// new write immediately with *UnavailableError, ahead of even the memory-pressure check -
 	// once draining, there is no budget left to spend on partial work.
@@ -189,6 +197,30 @@ func (s *KdbServerRuntime) AcquireWriteSlotWithContextForTest(ctx context.Contex
 // rely on WriteTimeout to bound how long any of them can still be running.
 func (s *KdbServerRuntime) BeginDraining() {
 	s.draining.Store(true)
+}
+
+// IsDraining reports whether BeginDraining has been called - consulted by the admin endpoint's
+// /readyz so load balancers stop routing to a server that is refusing new writes.
+func (s *KdbServerRuntime) IsDraining() bool {
+	return s.draining.Load()
+}
+
+// WaitForWritesToDrain blocks until every already-admitted write has finished (the write gate
+// is empty) or timeout elapses, returning true if the gate quiesced in time. Call BeginDraining
+// first - without it, new writes keep being admitted and this can never settle. Polling (10ms)
+// rather than a broadcast keeps writeGate's acquire/release fast path untouched for the one
+// call site that only runs once per process shutdown.
+func (s *KdbServerRuntime) WaitForWritesToDrain(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if s.writeGate.quiesced() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Retain increments the reference count.

@@ -185,6 +185,11 @@ type sessionBeginAckDto struct {
 	SessionID       string `json:"sessionId"`
 	HeadHex         string `json:"headHex"`
 	ReadConsistency string `json:"readConsistency"`
+	// Error explains a rejected session begin (empty SessionID) - authentication or
+	// authorization failure - instead of leaving the client to guess. Optional so older peers'
+	// frames (which never send it) still decode; Kotlin's SessionBeginAckDto carries the same
+	// nullable field (coordinated change - see kdb-finish-up-plan Phase 2.7).
+	Error *string `json:"error,omitempty"`
 }
 
 type sqlExecDto struct {

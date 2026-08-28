@@ -10,6 +10,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/sql"
 )
 
 func execute(cfg Config, cmd Command) int {
@@ -40,7 +41,7 @@ func execute(cfg Config, cmd Command) int {
 	case GetCmd:
 		return cmdGet(cfg, rt, c)
 	case QueryCmd:
-		return cmdQuery(cfg, c)
+		return cmdQuery(cfg, rt, c)
 	case LogCmd:
 		return cmdLog(cfg, rt)
 	case StatusCmd:
@@ -171,10 +172,76 @@ func cmdGet(cfg Config, rt *embed.EmbeddedKdbRuntime, c GetCmd) int {
 	return 0
 }
 
-func cmdQuery(cfg Config, c QueryCmd) int {
+// cmdQuery runs a SELECT against the local data directory via the real go/kdb/sql engine
+// (kdb-finish-up-plan 4.E - this was a hard "not yet ported" stub). Read-only: DML/DDL over
+// the CLI still goes through put / the wire server, matching the Kotlin CLI's local query
+// semantics. Output is tab-separated: a header row of column names, then one row per result.
+func cmdQuery(cfg Config, rt *embed.EmbeddedKdbRuntime, c QueryCmd) int {
 	_ = cfg
-	fmt.Fprintf(os.Stderr, "Error: SQL query engine not yet ported to Go (namespace=%s sql=%q)\n", c.Namespace, c.SQL)
-	return 1
+	d := concreteDag(rt)
+	if d == nil {
+		fmt.Fprintf(os.Stderr, "Error: query requires an InMemoryCommitDag-backed runtime, got %T\n", rt.DAG)
+		return 1
+	}
+	head, err := rt.DAG.Head()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	engine := sql.NewEngine(rt.Storage, d)
+	result, err := engine.Execute(strings.TrimSpace(c.SQL), sql.QueryContext{
+		NamespaceID: c.Namespace,
+		Schema:      rt.Schema,
+		AtCommit:    &head,
+		MaxRows:     10_000,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	names := make([]string, len(result.Columns))
+	for i, col := range result.Columns {
+		names[i] = col.Name
+	}
+	fmt.Println(strings.Join(names, "\t"))
+	for _, row := range result.Rows {
+		cells := make([]string, len(row.Values))
+		for i, cell := range row.Values {
+			cells[i] = cellString(cell)
+		}
+		fmt.Println(strings.Join(cells, "\t"))
+	}
+	return 0
+}
+
+// concreteDag unwraps rt.DAG to the *dag.InMemoryCommitDag the SQL engine requires, whether
+// the runtime is memory-backed (bare) or file-backed (PersistingCommitDAG).
+func concreteDag(rt *embed.EmbeddedKdbRuntime) *dag.InMemoryCommitDag {
+	switch d := rt.DAG.(type) {
+	case *dag.InMemoryCommitDag:
+		return d
+	case *embed.PersistingCommitDAG:
+		return d.Delegate()
+	default:
+		return nil
+	}
+}
+
+func cellString(cell sql.Cell) string {
+	switch v := cell.(type) {
+	case sql.CellNull:
+		return ""
+	case sql.CellString:
+		return v.Value
+	case sql.CellLong:
+		return fmt.Sprintf("%d", v.Value)
+	case sql.CellDouble:
+		return fmt.Sprintf("%g", v.Value)
+	case sql.CellJSON:
+		return v.JSON
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 func cmdLog(cfg Config, rt *embed.EmbeddedKdbRuntime) int {

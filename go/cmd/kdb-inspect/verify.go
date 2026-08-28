@@ -5,18 +5,16 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/integrity"
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
-// openDirShim opens a plain, unlocked, OS-backed segment shim rooted at
-// dataDir - no S3 replication, no directory lock. These maintenance
-// commands are meant to be run against a data directory whose owning
-// process (kdb-service, an embedded runtime) is stopped; unlike
-// embed.OpenFileRuntime they do not enforce that themselves, matching the
-// existing kdb-inspect dump-* commands' precedent of operating directly
-// on bytes on disk.
+// openDirShim opens a plain, unlocked, OS-backed segment shim rooted at dataDir - no S3
+// replication. Commands that operate on a live data directory (verify, repair-segments, backup,
+// restore's --out) take embed.LockDataDir first, so they cannot race a running kdb-service or
+// embedded runtime (kdb-finish-up-plan Phase 2.11 closed the earlier no-locking gap).
 func openDirShim(dataDir string) (storage.PlatformIOShim, error) {
 	root := dataDir
 	store, err := storio.NewOSByteStore(storio.PlatformIOConfig{RootDirectory: &root})
@@ -64,6 +62,11 @@ func verifyCmd(args []string) error {
 	}
 	asJSON := hasFlag(args, "--json")
 
+	release, err := embed.LockDataDir(dataDir)
+	if err != nil {
+		return fmt.Errorf("locking %s (stop kdb-service / the embedded runtime first): %w", dataDir, err)
+	}
+	defer release()
 	shim, err := openDirShim(dataDir)
 	if err != nil {
 		return err
@@ -115,6 +118,11 @@ func repairSegmentsCmd(args []string) error {
 	}
 	dryRun := hasFlag(args, "--dry-run")
 
+	release, err := embed.LockDataDir(dataDir)
+	if err != nil {
+		return fmt.Errorf("locking %s (stop kdb-service / the embedded runtime first): %w", dataDir, err)
+	}
+	defer release()
 	shim, err := openDirShim(dataDir)
 	if err != nil {
 		return err

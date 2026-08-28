@@ -4,14 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/config"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
@@ -19,39 +20,78 @@ import (
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
+	"github.com/limidus/kdb/go/kdb/version"
 )
 
 // KdbServiceMain is a skeleton service entrypoint mirroring dev.kdb.service.KdbServiceMain.
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "user" {
+		os.Exit(runUserCommand(os.Args[2:]))
+	}
+
 	fs := flag.NewFlagSet("kdb-service", flag.ExitOnError)
-	var (
-		dataDir   string
-		memory    bool
-		namespace string
-	)
-	var sqlAddr string
-	var peerAddr string
-	var streamAddr string
-	var rbac bool
-	var memoryLimitMB int
-	var abortAfter time.Duration
-	var tlsCert, tlsKey, tlsCA string
-	var tlsClientAuth bool
-	fs.StringVar(&dataDir, "data-dir", "", "filesystem data root")
-	fs.BoolVar(&memory, "memory", false, "use in-memory runtime")
-	fs.StringVar(&namespace, "namespace", "demo/users", "default namespace")
-	fs.StringVar(&sqlAddr, "sql-addr", "tcp://127.0.0.1:9090?bind=true", "SQL wire listen address (empty to disable)")
-	fs.StringVar(&peerAddr, "peer-addr", "tcp://127.0.0.1:9091?bind=true", "peer sync (Mode 3 full-peer) wire listen address (empty to disable)")
-	fs.StringVar(&streamAddr, "stream-addr", "tcp://127.0.0.1:9092?bind=true", "stream (Mode 1 read-only / Mode 2 write-back) wire listen address (empty to disable)")
-	fs.BoolVar(&rbac, "rbac", false, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
-	fs.IntVar(&memoryLimitMB, "memory-limit-mb", 0, "reject new writes (rather than risk an OS OOM-kill under sustained load) once process memory nears this budget; rejection triggers at 85% of this value, so set this to 60-80% of the container's actual --memory limit - 80% carries no throughput cost over 60% but do not go above 80% until kdb-spec-layer13 Component 48's full admission control lands, since a burst of already-admitted writes between the guard's periodic samples can still outrun a trip point that close to the real ceiling - see docs/benchmarks/lightsail-sim/README.md for the numbers behind that guidance. 0 disables (default)")
-	fs.DurationVar(&abortAfter, "abort-after", 0, "if memory pressure (see --memory-limit-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
-	fs.StringVar(&tlsCert, "tls-cert", "", "PEM certificate file - set together with --tls-key to require TLS on the SQL/peer-sync/stream listeners (each --*-addr's scheme is upgraded from tcp:// to tcps:// automatically)")
-	fs.StringVar(&tlsKey, "tls-key", "", "PEM private key file, paired with --tls-cert")
-	fs.StringVar(&tlsCA, "tls-ca", "", "PEM CA bundle to verify client certificates against - required by --tls-client-auth, optional (accept-but-don't-require) otherwise")
-	fs.BoolVar(&tlsClientAuth, "tls-client-auth", false, "require and verify a client certificate on every TLS connection (mTLS) - requires --tls-ca")
+	flagVals := config.DefaultServiceSettings()
+	var configPath string
+	var showVersion bool
+	var peerConflictPolicy string
+	fs.StringVar(&peerConflictPolicy, "peer-conflict-policy", "strict", "how the peer-sync listener resolves a same-document divergence pushed by a peer: strict (report a conflict, never silently resolve - default) or last-write (later timestamp wins symmetrically on every node)")
+	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
+	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
+	fs.BoolVar(&flagVals.Memory, "memory", flagVals.Memory, "use in-memory runtime")
+	fs.StringVar(&flagVals.Namespace, "namespace", flagVals.Namespace, "default namespace")
+	fs.StringVar(&flagVals.SQLAddr, "sql-addr", flagVals.SQLAddr, "SQL wire listen address (empty to disable)")
+	fs.StringVar(&flagVals.PeerAddr, "peer-addr", flagVals.PeerAddr, "peer sync (Mode 3 full-peer) wire listen address (empty to disable)")
+	fs.StringVar(&flagVals.StreamAddr, "stream-addr", flagVals.StreamAddr, "stream (Mode 1 read-only / Mode 2 write-back) wire listen address (empty to disable)")
+	fs.BoolVar(&flagVals.RBAC, "rbac", flagVals.RBAC, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
+	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "reject new writes (rather than risk an OS OOM-kill under sustained load) once process memory nears this budget; rejection triggers at 85% of this value, so set this to 60-80% of the container's actual --memory limit - 80% carries no throughput cost over 60% but do not go above 80% until kdb-spec-layer13 Component 48's full admission control lands, since a burst of already-admitted writes between the guard's periodic samples can still outrun a trip point that close to the real ceiling - see docs/benchmarks/lightsail-sim/README.md for the numbers behind that guidance. 0 disables (default)")
+	fs.DurationVar(&flagVals.AbortAfter, "abort-after", flagVals.AbortAfter, "if memory pressure (see --memory-limit-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
+	fs.StringVar(&flagVals.TLSCert, "tls-cert", flagVals.TLSCert, "PEM certificate file - set together with --tls-key to require TLS on the SQL/peer-sync/stream listeners (each --*-addr's scheme is upgraded from tcp:// to tcps:// automatically)")
+	fs.StringVar(&flagVals.TLSKey, "tls-key", flagVals.TLSKey, "PEM private key file, paired with --tls-cert")
+	fs.StringVar(&flagVals.TLSCA, "tls-ca", flagVals.TLSCA, "PEM CA bundle to verify client certificates against - required by --tls-client-auth, optional (accept-but-don't-require) otherwise")
+	fs.BoolVar(&flagVals.TLSClientAuth, "tls-client-auth", flagVals.TLSClientAuth, "require and verify a client certificate on every TLS connection (mTLS) - requires --tls-ca")
+	fs.StringVar(&flagVals.AdminAddr, "admin-addr", flagVals.AdminAddr, "operational HTTP endpoint (host:port) serving /healthz, /readyz, /metrics (Prometheus), /debug/vars, /debug/pprof - plain HTTP with no auth, so bind it to localhost or a private interface, never the public network (empty to disable)")
+	fs.DurationVar(&flagVals.DrainTimeout, "drain-timeout", flagVals.DrainTimeout, "on SIGTERM/SIGINT, how long to wait for already-admitted writes to finish before closing storage anyway - new writes are rejected immediately either way, and storage stays crash-consistent even when the deadline is hit (the WAL/delta replay path covers whatever didn't get flushed)")
+	fs.StringVar(&flagVals.LogLevel, "log-level", flagVals.LogLevel, "minimum log level: debug, info, warn, error")
+	fs.StringVar(&flagVals.LogFormat, "log-format", flagVals.LogFormat, "log output format: text or json")
+	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
+
+	if showVersion {
+		fmt.Println(version.Version)
+		return
+	}
+
+	// Phase 2.6: file < env < flags. Flag values only win where the operator actually typed
+	// them - fs.Visit only sees explicitly-set flags, so untouched flag defaults can't mask the
+	// config file or environment.
+	var fileCfg *config.ServiceFile
+	var err error
+	if configPath != "" {
+		fileCfg, err = config.LoadServiceFile(configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(2)
+		}
+	}
+	explicitFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicitFlags[f.Name] = true })
+	cfg, err := config.ResolveService(fileCfg, os.LookupEnv, func(name string) bool { return explicitFlags[name] }, flagVals)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	dataDir, memory, namespace := cfg.DataDir, cfg.Memory, cfg.Namespace
+	sqlAddr, peerAddr, streamAddr, adminAddr := cfg.SQLAddr, cfg.PeerAddr, cfg.StreamAddr, cfg.AdminAddr
+	rbac, memoryLimitMB, abortAfter, drainTimeout := cfg.RBAC, cfg.MemoryLimitMB, cfg.AbortAfter, cfg.DrainTimeout
+
+	logger, err := buildLogger(cfg.LogLevel, cfg.LogFormat)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	slog.SetDefault(logger)
 
 	if dataDir == "" && !memory {
 		memory = true
@@ -61,7 +101,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	tlsSettings, err := tlsSettingsFromFlags(tlsCert, tlsKey, tlsCA, tlsClientAuth)
+	tlsSettings, err := tlsSettingsFromFlags(cfg.TLSCert, cfg.TLSKey, cfg.TLSCA, cfg.TLSClientAuth)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
@@ -87,6 +127,16 @@ func main() {
 
 	srv := server.NewKdbServerRuntime(rt)
 
+	switch peerConflictPolicy {
+	case "", "strict":
+		// default: report same-document divergence, never silently resolve
+	case "last-write":
+		srv.PeerSyncConflictPolicy = transaction.ConflictPolicyLastWrite
+	default:
+		fmt.Fprintf(os.Stderr, "Error: unknown --peer-conflict-policy %q (want strict or last-write)\n", peerConflictPolicy)
+		os.Exit(2)
+	}
+
 	memoryLimitStatus := "disabled"
 	if memoryLimitMB > 0 {
 		limitBytes := uint64(memoryLimitMB) * 1024 * 1024
@@ -96,27 +146,38 @@ func main() {
 
 	rbacStatus := "disabled"
 	if rbac {
-		// In-memory registry only for now: file-backed durability (component 38 spec §7 test
-		// 9) is proven directly against RegistryAuthStore in go/kdb/auth's own tests, but
-		// wiring OpenFileRuntime's delta-log persistence into this CLI flag specifically is
-		// left as follow-on plumbing rather than rushed in here.
-		usersDag, err := dag.NewInMemoryCommitDag(auth.UsersNamespace)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: rbac users dag: %v\n", err)
-			os.Exit(1)
+		if dataDir != "" {
+			// Durable registry (Phase 2.7): users/roles live in the reserved _system/users and
+			// _system/roles namespaces under --data-dir, persisted through the same delta-log
+			// machinery as data namespaces. Bootstrap users with `kdb-service user create`
+			// (service stopped - the data-dir lock enforces that) before first start.
+			reg, err := embed.OpenFileAuthRegistry(dataDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac registry: %v\n", err)
+				os.Exit(1)
+			}
+			defer reg.Close()
+			srv.AuthEngine = auth.NewRegistryAuthEngine(reg.Store)
+			rbacStatus = "enabled (durable registry under --data-dir; bootstrap via `kdb-service user create`)"
+		} else {
+			usersDag, err := dag.NewInMemoryCommitDag(auth.UsersNamespace)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac users dag: %v\n", err)
+				os.Exit(1)
+			}
+			rolesDag, err := dag.NewInMemoryCommitDag(auth.RolesNamespace)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac roles dag: %v\n", err)
+				os.Exit(1)
+			}
+			store, err := auth.NewRegistryAuthStore(usersDag, rolesDag, mem.NewInMemoryStorageAdapter())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: rbac registry: %v\n", err)
+				os.Exit(1)
+			}
+			srv.AuthEngine = auth.NewRegistryAuthEngine(store)
+			rbacStatus = "enabled (in-memory registry - users vanish on restart; use --data-dir for durability)"
 		}
-		rolesDag, err := dag.NewInMemoryCommitDag(auth.RolesNamespace)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: rbac roles dag: %v\n", err)
-			os.Exit(1)
-		}
-		store, err := auth.NewRegistryAuthStore(usersDag, rolesDag, mem.NewInMemoryStorageAdapter())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: rbac registry: %v\n", err)
-			os.Exit(1)
-		}
-		srv.AuthEngine = auth.NewRegistryAuthEngine(store)
-		rbacStatus = "enabled (in-memory registry, no users yet - use the Go API to create one)"
 	}
 
 	peerStatus := "disabled"
@@ -190,6 +251,18 @@ func main() {
 		abortStatus = abortAfter.String()
 	}
 
+	var admin *server.AdminServer
+	adminStatus := "disabled"
+	if adminAddr != "" {
+		admin, err = server.NewAdminServer(adminAddr, srv)
+		if err != nil {
+			slog.Error("admin listen failed", "error", err)
+			os.Exit(1)
+		}
+		defer admin.Close()
+		adminStatus = fmt.Sprintf("enabled (%s)", admin.Addr())
+	}
+
 	tlsStatus := "disabled (plaintext)"
 	if tlsSettings != nil {
 		tlsStatus = "enabled"
@@ -197,15 +270,85 @@ func main() {
 			tlsStatus = "enabled (mTLS: client cert required)"
 		}
 	}
-	fmt.Printf("KDB service peer=%s stream=%s sql=%s tls=%s rbac=%s memory-limit=%s abort-after=%s namespace=%s\n", peerStatus, streamStatus, sqlStatus, tlsStatus, rbacStatus, memoryLimitStatus, abortStatus, namespace)
+	slog.Info("KDB service started",
+		"version", version.Version,
+		"peer", peerStatus,
+		"stream", streamStatus,
+		"sql", sqlStatus,
+		"admin", adminStatus,
+		"tls", tlsStatus,
+		"rbac", rbacStatus,
+		"memory_limit", memoryLimitStatus,
+		"abort_after", abortStatus,
+		"namespace", namespace,
+	)
+	if admin != nil {
+		admin.SetReady(true, "")
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	// An ordinary signal-driven shutdown, not a pressure-triggered abort: stop the watchdog
-	// first so it doesn't race this deliberate exit (see AbortWatchdog.Stop's own doc comment).
+	received := <-sig
+	slog.Info("shutdown signal received, draining", "signal", received.String(), "drain_timeout", drainTimeout.String())
+
+	// Orderly shutdown (kdb-finish-up-plan Phase 2.4), in this order:
+	// 1. Flip /readyz to 503 so load balancers stop sending new connections.
+	// 2. Stop the abort watchdog so it doesn't race this deliberate exit (see
+	//    AbortWatchdog.Stop's own doc comment).
+	// 3. BeginDraining - every new write is rejected immediately with *UnavailableError.
+	// 4. Close the data-plane listeners - no new connections at all.
+	// 5. Wait (bounded by --drain-timeout) for already-admitted writes to finish.
+	// 6. Release - flush and seal the delta segment, close storage.
+	// Storage stays crash-consistent even if step 5 times out: replay covers the rest.
+	if admin != nil {
+		admin.SetReady(false, "draining")
+	}
 	watchdog.Stop()
+	srv.BeginDraining()
+	if sqlListener != nil {
+		_ = sqlListener.Close()
+	}
+	if peerListener != nil {
+		_ = peerListener.Close()
+	}
+	if streamListener != nil {
+		_ = streamListener.Close()
+	}
+	if srv.WaitForWritesToDrain(drainTimeout) {
+		slog.Info("drain complete, closing storage")
+	} else {
+		slog.Warn("drain timeout hit with writes still in flight, closing storage anyway", "drain_timeout", drainTimeout.String())
+	}
 	srv.Release()
+	slog.Info("shutdown complete")
+}
+
+// buildLogger constructs the process-wide slog.Logger from --log-level/--log-format
+// (kdb-finish-up-plan Phase 2.5). Text is the default for a human watching a terminal; json for
+// log pipelines.
+func buildLogger(level, format string) (*slog.Logger, error) {
+	var lvl slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		return nil, fmt.Errorf("unknown --log-level %q (want debug, info, warn, or error)", level)
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	switch strings.ToLower(format) {
+	case "text":
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), nil
+	default:
+		return nil, fmt.Errorf("unknown --log-format %q (want text or json)", format)
+	}
 }
 
 // tlsSettingsFromFlags turns --tls-cert/--tls-key/--tls-ca/--tls-client-auth into

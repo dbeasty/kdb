@@ -1,12 +1,16 @@
 package dev.kdb.server
 
+import dev.kdb.codec.KdbTimestamp
+import dev.kdb.codec.KdbUuid
 import dev.kdb.document.KdbCommit
+import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
 import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.embed.commitViaEngine
 import dev.kdb.error.ConflictException
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
+import dev.kdb.transaction.ConflictPolicy
 import dev.kdb.transaction.DocumentLockManager
 import dev.kdb.transaction.TransactionEngine
 import dev.kdb.transaction.TransactionResult
@@ -77,6 +81,59 @@ public class KdbServerRuntime(
         val engine = engineFor(namespaceId)
         return if (authorizer != null) authorizingTransactionEngine(engine, namespaceId, authorizer) else engine
     }
+
+    /**
+     * Direct point lookup by document id at the current head (component 40's GetJSON) -
+     * mirrors Go's KdbServerRuntime.GetDocument exactly: returns (json-or-null, headHex).
+     */
+    public suspend fun getDocument(
+        namespaceId: String,
+        docId: KdbUuid,
+    ): Pair<String?, String> {
+        val head = runtime.dag.head()
+        val commit = runtime.dag.getCommitOrThrow(head)
+        val doc = runtime.storage.getDocument(namespaceId, docId, commit.documentTreeHash)
+        return doc?.json to head.toHex()
+    }
+
+    /**
+     * Writes [json] at [docId] unconditionally - create if absent, replace if present - with a
+     * LAST_WRITE-policy engine anchored on the current head (component 40 spec §3/§5: "Upsert
+     * never conflicts and never needs a BaseVersion"). Mirrors Go's KdbServerRuntime.Upsert.
+     */
+    public suspend fun upsert(
+        namespaceId: String,
+        docId: KdbUuid,
+        json: String,
+        authorizer: WriteAuthorizer? = null,
+    ): KdbCommit =
+        writeCoordinator.run {
+            val head = runtime.dag.head()
+            val tx =
+                KdbTransaction(
+                    KdbUuid.random(),
+                    head,
+                    listOf(KdbOp.Write(docId, json)),
+                    KdbTimestamp.now(),
+                    KdbUuid.random(),
+                )
+            var engine: TransactionEngine = upsertEngine
+            if (authorizer != null) {
+                engine = authorizingTransactionEngine(engine, namespaceId, authorizer)
+            }
+            commitViaEngine(
+                runtime,
+                namespaceId,
+                tx,
+                runtime.schema,
+                engine,
+                documentLocks = documentLocks,
+            )
+        }
+
+    // A separate LAST_WRITE engine instance rather than a per-call policy override, because the
+    // engine bakes its conflict policy in at construction - same shape as Go's UpsertEngine.
+    private val upsertEngine: TransactionEngine = transactionEngine(ConflictPolicy.LAST_WRITE)
 
     public fun retain() {
         refCount.incrementAndGet()

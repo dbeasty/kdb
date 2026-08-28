@@ -194,6 +194,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         sessionId = sessionId,
                         headHex = headHex,
                         readConsistency = readConsistency,
+                        error = error,
                     ),
             )
 
@@ -244,6 +245,44 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                     TxRollbackDto(
                         namespace = namespace,
                         sessionId = sessionId,
+                    ),
+            )
+
+        is WireMessage.DocumentGet ->
+            WirePayloadEnvelope(
+                kind = "documentGet",
+                documentGet = DocumentGetDto(namespace = namespace, docId = docId),
+            )
+
+        is WireMessage.DocumentGetResult ->
+            WirePayloadEnvelope(
+                kind = "documentGetResult",
+                documentGetResult =
+                    DocumentGetResultDto(
+                        namespace = namespace,
+                        docId = docId,
+                        json = json,
+                        commitHex = commitHex,
+                        error = error,
+                    ),
+            )
+
+        is WireMessage.Upsert ->
+            WirePayloadEnvelope(
+                kind = "upsert",
+                upsert = UpsertDto(namespace = namespace, docId = docId, json = json),
+            )
+
+        is WireMessage.UpsertResult ->
+            WirePayloadEnvelope(
+                kind = "upsertResult",
+                upsertResult =
+                    UpsertResultDto(
+                        namespace = namespace,
+                        commitHex = commitHex,
+                        error = error,
+                        errorCode = errorCode,
+                        retryAfterMs = retryAfterMs,
                     ),
             )
     }
@@ -415,6 +454,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                 s.sessionId,
                 s.headHex,
                 s.readConsistency,
+                s.error,
             )
         }
 
@@ -447,6 +487,26 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
         "txRollback" -> {
             val r = txRollback ?: throw WireDecodeException("missing txRollback body")
             WireMessage.TxRollback(header, r.namespace, r.sessionId)
+        }
+
+        "documentGet" -> {
+            val d = documentGet ?: throw WireDecodeException("missing documentGet body")
+            WireMessage.DocumentGet(header, d.namespace, d.docId)
+        }
+
+        "documentGetResult" -> {
+            val d = documentGetResult ?: throw WireDecodeException("missing documentGetResult body")
+            WireMessage.DocumentGetResult(header, d.namespace, d.docId, d.json, d.commitHex, d.error)
+        }
+
+        "upsert" -> {
+            val d = upsert ?: throw WireDecodeException("missing upsert body")
+            WireMessage.Upsert(header, d.namespace, d.docId, d.json)
+        }
+
+        "upsertResult" -> {
+            val d = upsertResult ?: throw WireDecodeException("missing upsertResult body")
+            WireMessage.UpsertResult(header, d.namespace, d.commitHex, d.error, d.errorCode, d.retryAfterMs)
         }
 
         else -> throw WireDecodeException("unknown payload kind: $kind")

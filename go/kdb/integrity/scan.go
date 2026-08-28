@@ -5,6 +5,25 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
+// ListSequencedSegments returns namespaceID's delta segment sequence numbers in ascending
+// (commit) order - the exported face of listSequencedSegments, for tooling (backup) that needs
+// the same legacy-name refusal semantics as verify/restore.
+func ListSequencedSegments(shim storage.PlatformIOShim, namespaceID string) ([]int64, error) {
+	return listSequencedSegments(shim, namespaceID)
+}
+
+// VerifiedSegmentPrefix reads segment seq and returns only its L1 CRC-verified prefix: every
+// byte up to the end of the last frame that scanned clean, never the tail past it (which may be
+// a torn in-progress write - kdb-spec-layer15 Component 60 §6.5 test 4). Also returns how many
+// commits that prefix holds.
+func VerifiedSegmentPrefix(shim storage.PlatformIOShim, namespaceID string, seq int64, comp storage.CompressionCodec) ([]byte, int, error) {
+	ss, err := readAndScanSegment(shim, namespaceID, seq, comp)
+	if err != nil {
+		return nil, 0, err
+	}
+	return ss.raw[:ss.consumedBytes], len(ss.commits), nil
+}
+
 // ScanVerifiedCommits returns every commit whose frame passed L1 CRC
 // verification, across every segment of namespaceID, keyed by hex hash.
 // Commits at or after the first corrupt or short frame in any given

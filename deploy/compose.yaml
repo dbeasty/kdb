@@ -1,0 +1,65 @@
+# KDB docker compose examples (kdb-finish-up-plan Phase 2.9).
+#
+#   docker compose -f deploy/compose.yaml up kdb                 # single node, plaintext
+#   docker compose -f deploy/compose.yaml --profile cluster up   # 3 peer nodes
+#
+# TLS: generate a CA + per-node certs (e.g. with openssl), place them under deploy/certs/, and
+# uncomment the tls volume + command flags below. The service upgrades its listener schemes to
+# tcps:// automatically when --tls-cert/--tls-key are set.
+#
+# Peer-sync topology note: each node LISTENS for peer-sync on :9091; synchronization sessions
+# are initiated by peersync clients (mode 3 full-peer), e.g. the Go peersync.Client or the e2e
+# harness - nodes do not dial each other unattended yet. The cluster profile therefore gives you
+# three independically addressable peers to sync across, not an autonomous mesh.
+
+services:
+  kdb:
+    build:
+      context: ..
+    image: kdb-service:latest
+    restart: on-failure   # exit 75 = orderly pressure abort, relies on this restart
+    ports:
+      - "9090:9090"   # SQL wire
+      - "9091:9091"   # peer sync
+      - "9092:9092"   # stream
+      - "127.0.0.1:9093:9093"   # admin (healthz/readyz/metrics/pprof) - keep off public interfaces
+    volumes:
+      - kdb-data:/var/lib/kdb
+      # - ./certs:/etc/kdb/certs:ro
+    # command: [
+    #   "--data-dir", "/var/lib/kdb", "--admin-addr", "0.0.0.0:9093",
+    #   "--sql-addr", "tcp://0.0.0.0:9090?bind=true",
+    #   "--peer-addr", "tcp://0.0.0.0:9091?bind=true",
+    #   "--stream-addr", "tcp://0.0.0.0:9092?bind=true",
+    #   "--tls-cert", "/etc/kdb/certs/node.crt", "--tls-key", "/etc/kdb/certs/node.key",
+    #   "--tls-ca", "/etc/kdb/certs/ca.crt",
+    #   "--rbac",
+    # ]
+
+  kdb-a:
+    profiles: ["cluster"]
+    image: kdb-service:latest
+    build: {context: ..}
+    restart: on-failure
+    ports: ["19090:9090", "19091:9091", "19093:9093"]
+    volumes: [kdb-a-data:/var/lib/kdb]
+
+  kdb-b:
+    profiles: ["cluster"]
+    image: kdb-service:latest
+    restart: on-failure
+    ports: ["29090:9090", "29091:9091", "29093:9093"]
+    volumes: [kdb-b-data:/var/lib/kdb]
+
+  kdb-c:
+    profiles: ["cluster"]
+    image: kdb-service:latest
+    restart: on-failure
+    ports: ["39090:9090", "39091:9091", "39093:9093"]
+    volumes: [kdb-c-data:/var/lib/kdb]
+
+volumes:
+  kdb-data:
+  kdb-a-data:
+  kdb-b-data:
+  kdb-c-data:

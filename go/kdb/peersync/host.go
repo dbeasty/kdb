@@ -183,16 +183,21 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 		}
 		// putCommit always stores, regardless of what happens to "main" below (component 39
 		// spec §5: history must never be lost, only the branch-pointer decision is gated).
+		// Materialization into live document storage is deliberately DEFERRED until after the
+		// divergence decision below: this storage layer has no MVCC (GetDocument ignores
+		// atCommit), so materializing a pushed side branch immediately mutated the peer's
+		// visible documents even when the push was then rejected with a ConflictReport and the
+		// head never moved - a strict-policy peer served the pushed content while its own head
+		// still pointed at its own write (caught live by the e2e same-document conflict
+		// scenario).
 		applied := 0
+		var fresh []document.Commit
 		for _, commit := range m.Commits {
 			if h.dag.HasCommit(commit.Hash) {
 				continue
 			}
 			if err := h.dag.PutCommit(commit, true); err != nil {
 				return nil, err
-			}
-			if h.cfg.MaterializeCommit != nil {
-				_ = h.cfg.MaterializeCommit(commit)
 			}
 			// Fixes kdb-spec-layer13 §2.2: dag.PutCommit only mutates the in-memory DAG - without
 			// this, a commit received from a peer lived only in memory and vanished on restart of
@@ -204,6 +209,7 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 					return nil, err
 				}
 			}
+			fresh = append(fresh, commit)
 			applied++
 		}
 		if len(m.Commits) > 0 {
@@ -245,7 +251,21 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 					ReportBytes: reportBytes,
 				})
 			}
-			// NoOp/FastForwarded/Merged all succeed - fall through to the ack below.
+			// Deferred materialization (see the loop above): only now that the head decision is
+			// made do the pushed commits' operations reach live document storage.
+			// FastForwarded: the pushed branch IS the new head - apply its commits oldest-first.
+			// Merged: mergeNonConflicting already wrote every remote-touched document's winning
+			// final state into storage itself (the merge commit is self-contained), so applying
+			// the raw commits' intermediate states first is unnecessary - and, for a document
+			// the local side won, would be wrong (the remote raw commit's op is the LOSER and
+			// must not overwrite the winner). NoOp: incoming was already-known history; nothing
+			// to apply. Conflict returned above: live storage stays untouched, matching the
+			// unmoved head.
+			if outcome.Kind == OutcomeFastForwarded && h.cfg.MaterializeCommit != nil {
+				for _, commit := range fresh {
+					_ = h.cfg.MaterializeCommit(commit)
+				}
+			}
 		}
 		// CommitPush is a request/response pair, not fire-and-forget (component 23 spec §5): the
 		// client blocks on a correlated reply, so every non-conflicting outcome owes it one.

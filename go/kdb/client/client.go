@@ -182,6 +182,11 @@ type namespaceState struct {
 // currently just TLS, for tcps:// and wss:// (see dialTransport's scheme table).
 type ConnectOptions struct {
 	TLS *core.TransportTlsSettings
+	// Namespaces, if set, is sent in the handshake's Namespaces field so the server authorizes
+	// the connection against the first entry (instead of its own default namespace). Purely an
+	// authorization-scoping hint: per-namespace sessions are still opened lazily and
+	// re-authorized on SessionBegin regardless.
+	Namespaces []string
 }
 
 // Connect dials addr (host:port, or a tcp://... wire URI) and performs the wire handshake.
@@ -223,7 +228,7 @@ func ConnectWithOptions(ctx context.Context, addr string, token string, opts Con
 	}
 	go c.readLoop()
 
-	req := wire.HandshakePayload{NodeID: "kdb-client-go", ClientMode: wire.ClientSQL}
+	req := wire.HandshakePayload{NodeID: "kdb-client-go", ClientMode: wire.ClientSQL, Namespaces: opts.Namespaces}
 	if token != "" {
 		req.Token = &token
 	}
@@ -395,6 +400,9 @@ func (c *Client) ensureNamespace(ctx context.Context, ns string) (*namespaceStat
 		return nil, fmt.Errorf("kdb: expected SessionBeginAck, got %T", reply)
 	}
 	if ack.SessionID == "" {
+		if ack.Error != nil && *ack.Error != "" {
+			return nil, fmt.Errorf("%w: session begin rejected for namespace %s: %s", ErrUnauthenticated, ns, *ack.Error)
+		}
 		return nil, fmt.Errorf("kdb: session begin rejected for namespace %s", ns)
 	}
 	head, err := codec.HashFromHex(ack.HeadHex)

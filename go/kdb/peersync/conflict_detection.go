@@ -213,7 +213,18 @@ func resolveDivergedLocked(
 		effectiveRemoteWrites := opsOnly(remoteTouched)
 		for _, docID := range overlapping {
 			if localWriteWins(localTouched[docID], remoteTouched[docID]) {
-				delete(effectiveRemoteWrites, docID)
+				// The winning write must ride IN the merge commit's own operations, not be
+				// omitted. Deleting the entry (the previous fix's shape) was right for the node
+				// creating the merge - its storage already holds local's write - but the merge
+				// commit travels: a peer whose own state is the LOSING side materializes the
+				// pushed commits oldest-first, so the losing raw commit lands after the winning
+				// one, and a merge commit carrying no op for the document leaves that peer on
+				// the loser's content forever (observed live in the e2e
+				// direction-reversed-relay scenario: A converged to the winner, B to the
+				// loser). Substituting local's own op makes the merge self-contained: applying
+				// it is a no-op where local already won, and imposes the winner everywhere
+				// else.
+				effectiveRemoteWrites[docID] = localTouched[docID].Op
 			}
 		}
 		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, effectiveRemoteWrites)

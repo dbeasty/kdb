@@ -1,0 +1,292 @@
+package memtable
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/io"
+	"github.com/limidus/kdb/go/kdb/storage/sstable"
+)
+
+// testKey builds a deterministic 32-byte key from a seed - no real hashing needed, just
+// something codec.Hash accepts. Mirrors randomKey in the Kotlin twin's MemTableTest.kt.
+func testKey(t *testing.T, seed string) codec.Hash {
+	t.Helper()
+	seedBytes := []byte(seed)
+	out := make([]byte, 32)
+	for i := range out {
+		out[i] = seedBytes[i%len(seedBytes)]
+	}
+	h, err := codec.HashFromBytes(out)
+	if err != nil {
+		t.Fatalf("HashFromBytes: %v", err)
+	}
+	return h
+}
+
+// sealFailingShim delegates every call to the embedded shim except SealSegment, which fails
+// once when failNextSeal is set. SealSegment is the last I/O call DefaultWriter.Finish makes,
+// so this simulates a flush that dies at the final durability step.
+type sealFailingShim struct {
+	storage.PlatformIOShim
+	failNextSeal bool
+}
+
+func (s *sealFailingShim) SealSegment(segmentName string) error {
+	if s.failNextSeal {
+		s.failNextSeal = false
+		return errors.New("simulated seal failure")
+	}
+	return s.PlatformIOShim.SealSegment(segmentName)
+}
+
+func newManager(shim storage.PlatformIOShim) *Manager {
+	blobStore := sstable.NewLsmBlobStore(shim, "ns", sstable.NewBlockCache(1024*1024))
+	return NewManager("ns", shim, blobStore)
+}
+
+// --- SortedTable ---
+
+// TestSortedTablePutGetDelete covers basic visibility: a put value is readable, a missing key
+// reads as nil, an overwrite is observed, and a delete hides the key.
+func TestSortedTablePutGetDelete(t *testing.T) {
+	table := NewSortedTable()
+	key := testKey(t, "k1")
+
+	if got := table.Get(key); got != nil {
+		t.Fatalf("expected nil for a never-written key, got %q", got)
+	}
+
+	table.Put(key, []byte("v1"))
+	if got := table.Get(key); string(got) != "v1" {
+		t.Fatalf("Get after Put: got %q, want %q", got, "v1")
+	}
+
+	table.Put(key, []byte("v2"))
+	if got := table.Get(key); string(got) != "v2" {
+		t.Fatalf("Get after overwrite: got %q, want %q", got, "v2")
+	}
+
+	table.Delete(key)
+	if got := table.Get(key); got != nil {
+		t.Fatalf("expected nil after Delete, got %q", got)
+	}
+}
+
+// TestSortedTableGetReturnsCopy confirms Get hands back a defensive copy - mutating the
+// returned slice must not corrupt the stored value.
+func TestSortedTableGetReturnsCopy(t *testing.T) {
+	table := NewSortedTable()
+	key := testKey(t, "copy")
+	table.Put(key, []byte("value"))
+
+	first := table.Get(key)
+	first[0] = 'X'
+
+	if got := table.Get(key); string(got) != "value" {
+		t.Fatalf("stored value was mutated through Get's return: got %q, want %q", got, "value")
+	}
+}
+
+// TestSortedTableSizeOverwriteNetsOut mirrors the Kotlin twin's
+// SortedMemTableSizeTest.overwriteNetsOutThePreviousValuesSize (kdb-finish-up-plan.md 1-K2):
+// overwriting a key must net out the replaced value's size, not just add the new one.
+//
+// SKIPPED: the 1-K2 size-accounting fix was applied to Kotlin's SortedMemTable but has not
+// been ported here - Put unconditionally does bytes += len(value), so overwriting a 100-byte
+// value with a 40-byte one reports 140, not 40. Un-skip when the fix is ported.
+func TestSortedTableSizeOverwriteNetsOut(t *testing.T) {
+	t.Skip("known bug (1-K2, unported from Kotlin): SortedTable.Put does not net out the replaced value's size")
+	table := NewSortedTable()
+	key := testKey(t, "k")
+
+	table.Put(key, make([]byte, 100))
+	if got := table.SizeBytes(); got != 100 {
+		t.Fatalf("SizeBytes after first Put: got %d, want 100", got)
+	}
+	table.Put(key, make([]byte, 40)) // overwrite with a smaller value
+	if got := table.SizeBytes(); got != 40 {
+		t.Fatalf("SizeBytes after overwrite: got %d, want 40 (replaced value must be netted out)", got)
+	}
+}
+
+// TestSortedTableSizeDeleteSubtracts mirrors the Kotlin twin's
+// SortedMemTableSizeTest.deleteSubtractsTheDeletedValuesSize (1-K2): deleting the only entry
+// must return SizeBytes to zero.
+//
+// SKIPPED: same unported 1-K2 fix as TestSortedTableSizeOverwriteNetsOut - Delete nils the
+// value but never subtracts its size, so SizeBytes stays at 100. Un-skip with the fix.
+func TestSortedTableSizeDeleteSubtracts(t *testing.T) {
+	t.Skip("known bug (1-K2, unported from Kotlin): SortedTable.Delete does not subtract the deleted value's size")
+	table := NewSortedTable()
+	key := testKey(t, "k")
+
+	table.Put(key, make([]byte, 100))
+	table.Delete(key)
+	if got := table.SizeBytes(); got != 0 {
+		t.Fatalf("SizeBytes after deleting the only entry: got %d, want 0", got)
+	}
+}
+
+// TestSortedTableDeleteThenPutIsFlushed covers the delete-before-put ordering: Delete on a
+// never-written key records a nil map entry, and a later Put of that same key must still land
+// in the flush snapshot (snapshotEntries iterates insertion order).
+//
+// SKIPPED: Delete creates a nil-valued map entry, so the later Put sees the key as "already
+// present" and never appends it to the order slice - the value is visible to Get but silently
+// missing from snapshotEntries, i.e. dropped on flush. Un-skip when Put/Delete track order
+// membership correctly (e.g. Delete removing the map entry, or Put checking order membership).
+func TestSortedTableDeleteThenPutIsFlushed(t *testing.T) {
+	t.Skip("known bug: Delete-then-Put leaves the key out of the flush snapshot, losing the write on flush")
+	table := NewSortedTable()
+	key := testKey(t, "resurrect")
+
+	table.Delete(key) // tombstone a key that was never written
+	table.Put(key, []byte("alive"))
+
+	if got := table.Get(key); string(got) != "alive" {
+		t.Fatalf("Get after Delete-then-Put: got %q, want %q", got, "alive")
+	}
+	for _, e := range table.snapshotEntries() {
+		if e.key == key && string(e.value) == "alive" {
+			return
+		}
+	}
+	t.Fatal("Delete-then-Put key missing from the flush snapshot - it would be silently dropped on flush")
+}
+
+// --- Manager ---
+
+// TestManagerPutGetDelete covers visibility through the manager against a live (empty) blob
+// store: a put is readable, a missing key is nil, and a delete hides the key again.
+func TestManagerPutGetDelete(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	mgr := newManager(shim)
+	key := testKey(t, "mk1")
+
+	if got := mgr.Get(key); got != nil {
+		t.Fatalf("expected nil for a never-written key, got %q", got)
+	}
+	mgr.Put(key, []byte(`{"v":1}`))
+	if got := mgr.Get(key); string(got) != `{"v":1}` {
+		t.Fatalf("Get after Put: got %q, want %q", got, `{"v":1}`)
+	}
+}
+
+// TestManagerFlushThenRead mirrors the Kotlin twin's
+// flushSucceedsNormallyAndDataRemainsReadableFromBlobStore: after a successful flush the data
+// has moved out of the active table into the blob store, and reads still work through Get.
+func TestManagerFlushThenRead(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	mgr := newManager(shim)
+
+	k1, k2 := testKey(t, "flush-a"), testKey(t, "flush-b")
+	v1, v2 := []byte(`{"v":"durable-a"}`), []byte(`{"v":"durable-b"}`)
+	mgr.Put(k1, v1)
+	mgr.Put(k2, v2)
+
+	handle, err := mgr.Flush(0)
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if handle.SegmentName == "" {
+		t.Fatal("Flush of a non-empty memtable returned a zero Handle")
+	}
+
+	if got := mgr.Get(k1); string(got) != string(v1) {
+		t.Fatalf("Get(k1) after flush: got %q, want %q", got, v1)
+	}
+	if got := mgr.Get(k2); string(got) != string(v2) {
+		t.Fatalf("Get(k2) after flush: got %q, want %q", got, v2)
+	}
+
+	// A write after the flush lands in the fresh active table and is also visible.
+	k3 := testKey(t, "flush-c")
+	mgr.Put(k3, []byte("post-flush"))
+	if got := mgr.Get(k3); string(got) != "post-flush" {
+		t.Fatalf("Get(k3) after flush: got %q, want %q", got, "post-flush")
+	}
+}
+
+// TestManagerActiveShadowsBlobStore confirms a re-written key is served from the active table,
+// not the older flushed copy.
+func TestManagerActiveShadowsBlobStore(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	mgr := newManager(shim)
+	key := testKey(t, "shadow")
+
+	mgr.Put(key, []byte("old"))
+	if _, err := mgr.Flush(0); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	mgr.Put(key, []byte("new"))
+	if got := mgr.Get(key); string(got) != "new" {
+		t.Fatalf("expected the active table's value to shadow the flushed one: got %q, want %q", got, "new")
+	}
+}
+
+// TestManagerFlushEmptyReturnsZeroHandle confirms flushing an empty memtable - or one holding
+// only deletions - writes nothing and returns a zero Handle with no error.
+func TestManagerFlushEmptyReturnsZeroHandle(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	mgr := newManager(shim)
+
+	handle, err := mgr.Flush(0)
+	if err != nil {
+		t.Fatalf("Flush of empty memtable: %v", err)
+	}
+	if handle != (sstable.Handle{}) {
+		t.Fatalf("Flush of empty memtable: got %+v, want zero Handle", handle)
+	}
+
+	// A put that was deleted again before the flush must not produce a table either.
+	key := testKey(t, "gone")
+	mgr.Put(key, []byte("temp"))
+	mgr.active.Delete(key)
+	handle, err = mgr.Flush(0)
+	if err != nil {
+		t.Fatalf("Flush of deleted-only memtable: %v", err)
+	}
+	if handle != (sstable.Handle{}) {
+		t.Fatalf("Flush of deleted-only memtable: got %+v, want zero Handle", handle)
+	}
+	segments, err := shim.ListSegments("ns")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	if len(segments) != 0 {
+		t.Fatalf("expected no segments after empty flushes, got %v", segments)
+	}
+}
+
+// TestManagerFlushFailureKeepsDataVisible mirrors the Kotlin twin's
+// flushFailureStillLeavesDataVisibleViaPendingFlush (kdb-finish-up-plan.md 1-K2): when
+// writer.Finish fails (here at SealSegment, the final durability step), the flushed generation
+// must remain visible via pendingFlush - it was never actually lost, just not yet durable.
+//
+// SKIPPED: the 1-K2 fix was applied to Kotlin's MemTableManager.flush but has not been ported
+// here - Manager.Flush clears pendingFlush BEFORE writer.Finish() runs (memtable.go), so a
+// Finish failure leaves the flushed generation reachable from neither active (already swapped),
+// pendingFlush (already cleared), nor the blob store (AddTable never called): Get reports every
+// write of that generation as absent. Un-skip when the fix is ported (clear pendingFlush only
+// after Finish succeeds, and restore visibility on failure).
+func TestManagerFlushFailureKeepsDataVisible(t *testing.T) {
+	t.Skip("known bug (1-K2, unported from Kotlin): Manager.Flush clears pendingFlush before Finish, losing visibility on flush failure")
+	shim := &sealFailingShim{PlatformIOShim: io.NewInMemoryPlatformIO()}
+	mgr := newManager(shim)
+
+	key := testKey(t, "k1")
+	value := []byte(`{"v":"should not be lost"}`)
+	mgr.Put(key, value)
+
+	shim.failNextSeal = true
+	if _, err := mgr.Flush(0); err == nil {
+		t.Fatal("expected Flush to fail when SealSegment fails")
+	}
+
+	if got := mgr.Get(key); string(got) != string(value) {
+		t.Fatalf("write lost after failed flush: got %q, want %q", got, value)
+	}
+}

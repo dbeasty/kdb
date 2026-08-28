@@ -231,6 +231,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				SessionID:       m.SessionID,
 				HeadHex:         m.HeadHex,
 				ReadConsistency: m.ReadConsistency,
+				Error:           m.Error,
 			},
 		}, nil
 	case SqlExecMessage:
@@ -529,7 +530,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 		}
 		return SessionBeginAckMessage{
 			H: header, Namespace: s.Namespace, SessionID: s.SessionID,
-			HeadHex: s.HeadHex, ReadConsistency: s.ReadConsistency,
+			HeadHex: s.HeadHex, ReadConsistency: s.ReadConsistency, Error: s.Error,
 		}, nil
 	case "sqlExec":
 		s := env.SqlExec
