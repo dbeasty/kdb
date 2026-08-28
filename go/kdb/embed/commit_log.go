@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/metrics"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -14,6 +15,11 @@ import (
 // loop appending indefinitely while the callers already queued behind it wait
 // for a flush that keeps getting deferred.
 const maxLogBatch = 256
+
+// defaultAsyncFlushInterval is the physical flush period under DurabilityAsync
+// when the caller didn't configure one - matching the engine's blob-WAL
+// background sync default (storage/engine.startAsyncSync).
+const defaultAsyncFlushInterval = 5 * time.Millisecond
 
 // ErrCommitLogClosed is returned to callers that enqueue after Close.
 var ErrCommitLogClosed = errors.New("kdb: commit log writer is closed")
@@ -39,6 +45,10 @@ var ErrCommitLogClosed = errors.New("kdb: commit log writer is closed")
 type commitLogWriter struct {
 	writer     storage.DeltaSegmentWriter
 	durability storage.Durability
+	// flushInterval is how often appended-but-unflushed records are physically
+	// flushed under DurabilityAsync. Sync mode ignores it (every batch flushes
+	// before its callers are acked). See runAsync.
+	flushInterval time.Duration
 
 	reqs chan *logRequest
 	done chan struct{}
@@ -64,10 +74,14 @@ type logRequest struct {
 	ack chan error
 }
 
-func newCommitLogWriter(w storage.DeltaSegmentWriter, durability storage.Durability) *commitLogWriter {
+func newCommitLogWriter(w storage.DeltaSegmentWriter, durability storage.Durability, asyncFlushInterval time.Duration) *commitLogWriter {
+	if asyncFlushInterval <= 0 {
+		asyncFlushInterval = defaultAsyncFlushInterval
+	}
 	c := &commitLogWriter{
-		writer:     w,
-		durability: durability,
+		writer:        w,
+		durability:    durability,
+		flushInterval: asyncFlushInterval,
 		// Buffered so an async caller hands off without waiting for the drain
 		// goroutine to be scheduled; sync callers block on their ack anyway.
 		reqs:   make(chan *logRequest, maxLogBatch),
@@ -143,6 +157,10 @@ func (c *commitLogWriter) latch(err error) {
 
 func (c *commitLogWriter) run() {
 	defer close(c.done)
+	if c.durability == storage.DurabilityAsync {
+		c.runAsync()
+		return
+	}
 	for {
 		first, ok := <-c.reqs
 		if !ok {
@@ -157,6 +175,71 @@ func (c *commitLogWriter) run() {
 			if r.ack != nil {
 				r.ack <- err
 			}
+		}
+	}
+}
+
+// runAsync is the DurabilityAsync drain loop: records are appended as soon as
+// they arrive (into the OS page cache, so an acknowledged write survives a
+// process crash), but the physical flush runs at most once per flushInterval -
+// the same journaling model MongoDB's default write concern uses. Before this
+// existed, async mode flushed after every drained batch just like sync mode
+// (callers merely didn't wait for it), so a single sustained writer still
+// drove one physical fsync per commit in the background. The crash-loss
+// window is unchanged in kind - "whatever had not been flushed" - and now
+// bounded by flushInterval instead of by batch timing.
+func (c *commitLogWriter) runAsync() {
+	timer := time.NewTimer(c.flushInterval)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	// dirty tracks "appended since the last flush"; the timer is armed exactly
+	// when dirty is set and its channel is drained whenever dirty is cleared,
+	// so Reset is always safe.
+	dirty := false
+	flush := func() {
+		stop := metrics.Default.Track(metrics.StageFsyncWait)
+		if err := c.writer.Flush(); err != nil {
+			c.latch(err)
+		}
+		stop()
+		dirty = false
+	}
+	for {
+		var first *logRequest
+		var ok bool
+		if dirty {
+			select {
+			case first, ok = <-c.reqs:
+			case <-timer.C:
+				flush()
+				continue
+			}
+		} else {
+			first, ok = <-c.reqs
+		}
+		if !ok {
+			if dirty {
+				if !timer.Stop() {
+					<-timer.C
+				}
+				flush()
+			}
+			return
+		}
+		batch := c.drain(first)
+		err := c.appendBatch(batch)
+		if err != nil {
+			c.latch(err)
+		}
+		for _, r := range batch {
+			if r.ack != nil {
+				r.ack <- err
+			}
+		}
+		if !dirty {
+			dirty = true
+			timer.Reset(c.flushInterval)
 		}
 	}
 }
@@ -181,11 +264,19 @@ func (c *commitLogWriter) drain(first *logRequest) []*logRequest {
 	return batch
 }
 
-func (c *commitLogWriter) writeBatch(batch []*logRequest) error {
+// appendBatch writes each record to the segment without flushing.
+func (c *commitLogWriter) appendBatch(batch []*logRequest) error {
 	for _, r := range batch {
 		if _, err := c.writer.Append(r.rec); err != nil {
 			return fmt.Errorf("appending commit %s to the delta log: %w", r.rec.CommitHash.Hex(), err)
 		}
+	}
+	return nil
+}
+
+func (c *commitLogWriter) writeBatch(batch []*logRequest) error {
+	if err := c.appendBatch(batch); err != nil {
+		return err
 	}
 	// One flush for the whole batch - the point of the exercise. Recorded under
 	// the same stage name the blob path uses, so /metrics and the benchmarks

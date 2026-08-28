@@ -36,6 +36,11 @@ type StorageOptions struct {
 	// AsyncSyncIntervalMillis is the background sync period under
 	// storage.DurabilityAsync. Zero uses the engine default.
 	AsyncSyncIntervalMillis int64
+	// SyncMode selects the physical sync primitive every flush uses. The zero
+	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous
+	// hardcoded behavior; storio.SyncModeFast trades power-loss protection for
+	// an order-of-magnitude cheaper sync (see the SyncMode docs).
+	SyncMode storio.SyncMode
 }
 
 // FileRuntimeOptionsFromEnv returns options with S3 config from KDB_S3_* env vars.

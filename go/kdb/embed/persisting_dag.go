@@ -1,6 +1,8 @@
 package embed
 
 import (
+	"time"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -28,9 +30,22 @@ func NewPersistingCommitDAGWithDurability(
 	writer storage.DeltaSegmentWriter,
 	durability storage.Durability,
 ) *PersistingCommitDAG {
+	return NewPersistingCommitDAGWithAsyncInterval(delegate, writer, durability, 0)
+}
+
+// NewPersistingCommitDAGWithAsyncInterval additionally sets how often the
+// commit log is physically flushed under storage.DurabilityAsync; a
+// non-positive interval uses the default. Ignored under the other
+// durabilities - see commitLogWriter.runAsync.
+func NewPersistingCommitDAGWithAsyncInterval(
+	delegate *dag.InMemoryCommitDag,
+	writer storage.DeltaSegmentWriter,
+	durability storage.Durability,
+	asyncFlushInterval time.Duration,
+) *PersistingCommitDAG {
 	d := &PersistingCommitDAG{delegate: delegate, writer: writer}
 	if writer != nil && durability != storage.DurabilityMemoryOnly {
-		d.log = newCommitLogWriter(writer, durability)
+		d.log = newCommitLogWriter(writer, durability, asyncFlushInterval)
 	}
 	return d
 }

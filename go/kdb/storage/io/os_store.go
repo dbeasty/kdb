@@ -23,7 +23,8 @@ import (
 // per segment, so the handle cache itself only needs to guard the map,
 // not each write.
 type OSByteStore struct {
-	root string
+	root     string
+	syncMode SyncMode
 
 	mu      sync.Mutex
 	handles map[string]*openSegment
@@ -38,7 +39,11 @@ func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 	if config.RootDirectory == nil || *config.RootDirectory == "" {
 		return nil, fmt.Errorf("os byte store requires root directory")
 	}
-	return &OSByteStore{root: *config.RootDirectory, handles: make(map[string]*openSegment)}, nil
+	return &OSByteStore{
+		root:     *config.RootDirectory,
+		syncMode: config.SyncMode,
+		handles:  make(map[string]*openSegment),
+	}, nil
 }
 
 func (s *OSByteStore) pathFor(segmentName string) string {
@@ -141,7 +146,7 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 	seg, ok := s.handles[segmentName]
 	s.mu.Unlock()
 	if ok {
-		return seg.file.Sync()
+		return syncFile(seg.file, s.syncMode)
 	}
 	// No open handle yet (e.g. Flush called before any Append in this
 	// process): fall back to a one-off open, matching prior behavior.
@@ -154,7 +159,7 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 		return err
 	}
 	defer f.Close()
-	return f.Sync()
+	return syncFile(f, s.syncMode)
 }
 
 // Close releases all cached file handles. Safe to call multiple times.

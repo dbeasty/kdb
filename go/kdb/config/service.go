@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/storage"
+	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
 // ServiceSettings is kdb-service's fully-resolved effective configuration - one field per
@@ -42,6 +43,7 @@ type ServiceSettings struct {
 	Durability          string
 	AsyncSyncIntervalMS int
 	Compression         string
+	SyncMode            string
 }
 
 // DefaultServiceSettings mirrors the flag defaults declared in cmd/kdb-service.
@@ -60,6 +62,10 @@ func DefaultServiceSettings() ServiceSettings {
 		Durability:          "sync",
 		AsyncSyncIntervalMS: 5,
 		Compression:         "zstd",
+		// full: every physical sync forces the drive cache to media
+		// (F_FULLFSYNC on darwin). "fast" keeps process/OS-crash durability at
+		// a fraction of the cost - see storage/io.SyncMode.
+		SyncMode: "full",
 	}
 }
 
@@ -87,6 +93,7 @@ type ServiceFile struct {
 	Durability          *string `json:"durability"`
 	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
 	Compression         *string `json:"compression"`
+	SyncMode            *string `json:"syncMode"`
 }
 
 // ServiceTLSFile is ServiceFile's nested TLS block, matching the --tls-* flags.
@@ -152,6 +159,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.Durability, file.Durability)
 		setIf(&s.AsyncSyncIntervalMS, file.AsyncSyncIntervalMS)
 		setIf(&s.Compression, file.Compression)
+		setIf(&s.SyncMode, file.SyncMode)
 	}
 
 	// Layer 3: environment.
@@ -233,6 +241,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		return s, err
 	}
 	envString("KDB_COMPRESSION", &s.Compression)
+	envString("KDB_SYNC_MODE", &s.SyncMode)
 
 	// Layer 4: explicitly-set flags.
 	flagOverrides := []struct {
@@ -259,6 +268,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"durability", func() { s.Durability = flags.Durability }},
 		{"async-sync-interval-ms", func() { s.AsyncSyncIntervalMS = flags.AsyncSyncIntervalMS }},
 		{"compression", func() { s.Compression = flags.Compression }},
+		{"sync-mode", func() { s.SyncMode = flags.SyncMode }},
 	}
 	for _, o := range flagOverrides {
 		if flagWasSet(o.name) {
@@ -272,6 +282,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		return s, err
 	}
 	if _, err := ParseCompression(s.Compression); err != nil {
+		return s, err
+	}
+	if _, err := ParseSyncMode(s.SyncMode); err != nil {
 		return s, err
 	}
 	return s, nil
@@ -309,6 +322,25 @@ func ParseCompression(name string) (storage.CompressionCodec, error) {
 		return storage.CompressionNone, nil
 	default:
 		return 0, fmt.Errorf("unknown compression codec %q (want zstd or none)", name)
+	}
+}
+
+// ParseSyncMode maps a configured sync-mode name onto the IO layer's enum.
+//
+//   - full: a physical sync forces data to media (F_FULLFSYNC on darwin) -
+//     survives power loss. ~4ms per sync on Apple SSDs.
+//   - fast: a physical sync reaches the storage device but not necessarily
+//     media (F_BARRIERFSYNC on darwin, fdatasync on linux) - survives process
+//     and OS crashes; power loss can lose what the drive cache held. The
+//     tradeoff SQLite and PostgreSQL default to on macOS.
+func ParseSyncMode(name string) (storio.SyncMode, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "full":
+		return storio.SyncModeFull, nil
+	case "fast", "barrier":
+		return storio.SyncModeFast, nil
+	default:
+		return 0, fmt.Errorf("unknown sync mode %q (want full or fast)", name)
 	}
 }
 
