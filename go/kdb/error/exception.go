@@ -1,6 +1,9 @@
 package error
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Exception is the base typed error for KDB.
 type Exception interface {
@@ -134,16 +137,33 @@ func NewTransportErr(msg string, cause error) *TransportErr {
 	return &TransportErr{base: &base{code: TransportError, msg: msg, cause: cause}}
 }
 
-// IsException reports whether err is a KDB Exception.
+// IsException reports whether err is, or wraps, a KDB Exception.
+//
+// Unwrapping matters: an exception that has passed through a `fmt.Errorf("...: %w", err)`
+// anywhere on its way up is still the same failure, and a plain type assertion stops seeing it
+// the moment any layer adds context. That is how CodeOf below started answering 0 - "no code" -
+// for errors that carry a perfectly good one, which reaches a client as a generic failure
+// instead of the typed one it should be able to act on. Same reasoning, same fix as the wire
+// layer's asError.
 func IsException(err error) bool {
-	_, ok := err.(Exception)
-	return ok
+	var e Exception
+	return errors.As(err, &e)
 }
 
-// CodeOf returns the error code or zero.
+// CodeOf returns the code of err or of the first Exception it wraps, or zero if there is none.
 func CodeOf(err error) Code {
-	if e, ok := err.(Exception); ok {
+	var e Exception
+	if errors.As(err, &e) {
 		return e.Code()
 	}
 	return 0
+}
+
+// AsException returns the first Exception in err's chain, if any.
+func AsException(err error) (Exception, bool) {
+	var e Exception
+	if errors.As(err, &e) {
+		return e, true
+	}
+	return nil, false
 }
