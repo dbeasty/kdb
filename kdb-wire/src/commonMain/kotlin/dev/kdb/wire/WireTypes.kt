@@ -39,6 +39,13 @@ public enum class WireMessageType(public val code: Short) {
     TX_COMMIT(0x11),
     TX_ROLLBACK(0x12),
     SESSION_BEGIN_ACK(0x13),
+
+    // Component 40 direct-document ops (codes reserved by the Go implementation - see
+    // go/kdb/wire/types.go MsgDocumentGet..MsgUpsertResult; they must match exactly).
+    DOCUMENT_GET(0x14),
+    DOCUMENT_GET_RESULT(0x15),
+    UPSERT(0x16),
+    UPSERT_RESULT(0x17),
     ;
 
     public companion object {
@@ -265,6 +272,43 @@ public sealed class WireMessage {
         // or authorization failure a client should surface. Null on success and on frames from
         // peers that predate the field.
         val error: String? = null,
+    ) : WireMessage()
+
+    // Component 40 direct-document ops, ported from the Go implementation (see
+    // go/kdb/wire/document_ops.go - field shapes must match its DTOs exactly).
+    public data class DocumentGet(
+        override val header: WireHeader,
+        val namespace: String,
+        val docId: String,
+    ) : WireMessage()
+
+    public data class DocumentGetResult(
+        override val header: WireHeader,
+        val namespace: String,
+        val docId: String,
+        // Null if the document doesn't exist at commitHex (or on error).
+        val json: String?,
+        val commitHex: String,
+        val error: String? = null,
+    ) : WireMessage()
+
+    // Upsert writes json at docId unconditionally - create if absent, replace if present, no
+    // BaseVersion, no conflict possible (component 40 spec §5).
+    public data class Upsert(
+        override val header: WireHeader,
+        val namespace: String,
+        val docId: String,
+        val json: String,
+    ) : WireMessage()
+
+    public data class UpsertResult(
+        override val header: WireHeader,
+        val namespace: String,
+        val commitHex: String,
+        val error: String? = null,
+        // Additive to error - kdb-spec-layer13 Component 51 §8.1's typed backpressure codes.
+        val errorCode: String? = null,
+        val retryAfterMs: Int? = null,
     ) : WireMessage()
 
     public data class SqlExec(

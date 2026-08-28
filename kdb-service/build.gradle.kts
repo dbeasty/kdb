@@ -22,6 +22,7 @@ dependencies {
     implementation(project(":kdb-transport-ws"))
     implementation(project(":kdb-wire"))
     implementation(libs.kotlinx.coroutines.core)
+    testImplementation(libs.kotlin.test)
 }
 
 tasks.register<JavaExec>("runService") {

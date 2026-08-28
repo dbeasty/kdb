@@ -25,6 +25,42 @@ internal data class WirePayloadEnvelope(
     val sqlResult: SqlResultDto? = null,
     val txCommit: TxCommitDto? = null,
     val txRollback: TxRollbackDto? = null,
+    val documentGet: DocumentGetDto? = null,
+    val documentGetResult: DocumentGetResultDto? = null,
+    val upsert: UpsertDto? = null,
+    val upsertResult: UpsertResultDto? = null,
+)
+
+// Component 40 direct-document ops - shapes mirror go/kdb/wire/document_ops.go's DTOs exactly.
+@Serializable
+internal data class DocumentGetDto(
+    val namespace: String,
+    val docId: String,
+)
+
+@Serializable
+internal data class DocumentGetResultDto(
+    val namespace: String,
+    val docId: String,
+    val json: String? = null,
+    val commitHex: String,
+    val error: String? = null,
+)
+
+@Serializable
+internal data class UpsertDto(
+    val namespace: String,
+    val docId: String,
+    val json: String,
+)
+
+@Serializable
+internal data class UpsertResultDto(
+    val namespace: String,
+    val commitHex: String,
+    val error: String? = null,
+    val errorCode: String? = null,
+    val retryAfterMs: Int? = null,
 )
 
 @Serializable

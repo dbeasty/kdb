@@ -109,8 +109,100 @@ public class SqlWireHost(
             is WireMessage.TxCommit -> handleTxCommit(message)
             is WireMessage.TxRollback -> handleTxRollback(message)
             is WireMessage.TransactionReplay -> handleTransactionReplay(message)
+            is WireMessage.DocumentGet -> handleDocumentGet(message)
+            is WireMessage.Upsert -> handleUpsert(message)
             else -> null
         }
+
+    /**
+     * Component 40 direct point lookup by document id - no session, no read-consistency
+     * tracking, matching Go's handleDocumentGet exactly (wire codes 0x14/0x15 are the Go
+     * side's; this is the Kotlin half of the coordinated port).
+     */
+    private suspend fun handleDocumentGet(msg: WireMessage.DocumentGet): WireMessage.DocumentGetResult {
+        val principal =
+            try {
+                sqlAuth.authenticateConnection()
+            } catch (e: Throwable) {
+                return documentGetError(msg, sqlAuth.authFailureMessage(e))
+            }
+        val docId =
+            try {
+                KdbUuid.fromString(msg.docId)
+            } catch (e: IllegalArgumentException) {
+                return documentGetError(msg, "invalid docId: ${e.message}")
+            }
+        try {
+            sqlAuth.authorize(principal, AuthAction.DocumentRead(msg.namespace, msg.docId))
+        } catch (e: Throwable) {
+            return documentGetError(msg, sqlAuth.authFailureMessage(e))
+        }
+        val (json, headHex) = server.getDocument(msg.namespace, docId)
+        return WireMessage.DocumentGetResult(
+            header(msg.header.correlationId, WireMessageType.DOCUMENT_GET_RESULT),
+            namespace = msg.namespace,
+            docId = msg.docId,
+            json = json,
+            commitHex = headHex,
+        )
+    }
+
+    private fun documentGetError(
+        msg: WireMessage.DocumentGet,
+        error: String,
+    ): WireMessage.DocumentGetResult =
+        WireMessage.DocumentGetResult(
+            header(msg.header.correlationId, WireMessageType.DOCUMENT_GET_RESULT),
+            namespace = msg.namespace,
+            docId = msg.docId,
+            json = null,
+            commitHex = "",
+            error = error,
+        )
+
+    /** Component 40 unconditional upsert - Go's handleUpsert, ported (wire codes 0x16/0x17). */
+    private suspend fun handleUpsert(msg: WireMessage.Upsert): WireMessage.UpsertResult {
+        val principal =
+            try {
+                sqlAuth.authenticateConnection()
+            } catch (e: Throwable) {
+                return upsertError(msg, sqlAuth.authFailureMessage(e))
+            }
+        val docId =
+            try {
+                KdbUuid.fromString(msg.docId)
+            } catch (e: IllegalArgumentException) {
+                return upsertError(msg, "invalid docId: ${e.message}")
+            }
+        try {
+            sqlAuth.authorize(principal, AuthAction.DocumentWrite(msg.namespace, msg.docId))
+        } catch (e: Throwable) {
+            return upsertError(msg, sqlAuth.authFailureMessage(e))
+        }
+        val commit =
+            try {
+                server.upsert(msg.namespace, docId, msg.json, sqlAuth.writeAuthorizerFor(principal))
+            } catch (e: Throwable) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                return upsertError(msg, e.message ?: e.toString())
+            }
+        return WireMessage.UpsertResult(
+            header(msg.header.correlationId, WireMessageType.UPSERT_RESULT),
+            namespace = msg.namespace,
+            commitHex = commit.hash.toHex(),
+        )
+    }
+
+    private fun upsertError(
+        msg: WireMessage.Upsert,
+        error: String,
+    ): WireMessage.UpsertResult =
+        WireMessage.UpsertResult(
+            header(msg.header.correlationId, WireMessageType.UPSERT_RESULT),
+            namespace = msg.namespace,
+            commitHex = "",
+            error = error,
+        )
 
     private suspend fun handleHandshake(msg: WireMessage.Handshake): WireMessage.HandshakeAck {
         val modeOk = msg.request.clientMode == dev.kdb.wire.WireClientMode.SQL_CLIENT
