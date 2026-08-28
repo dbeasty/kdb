@@ -55,6 +55,9 @@ func main() {
 	fs.DurationVar(&flagVals.DrainTimeout, "drain-timeout", flagVals.DrainTimeout, "on SIGTERM/SIGINT, how long to wait for already-admitted writes to finish before closing storage anyway - new writes are rejected immediately either way, and storage stays crash-consistent even when the deadline is hit (the WAL/delta replay path covers whatever didn't get flushed)")
 	fs.StringVar(&flagVals.LogLevel, "log-level", flagVals.LogLevel, "minimum log level: debug, info, warn, error")
 	fs.StringVar(&flagVals.LogFormat, "log-format", flagVals.LogFormat, "log output format: text or json")
+	fs.StringVar(&flagVals.Durability, "durability", flagVals.Durability, "how much of the write-out a commit waits for: sync (default - an acknowledged write is fsynced; concurrent commits share the fsync via group commit, so this is no longer a physical sync per write), async (acknowledged once queued in memory - a crash can lose whatever had not been flushed), or memory (nothing is written to the delta log at all; everything is lost on restart - tests and throwaway workloads only)")
+	fs.IntVar(&flagVals.AsyncSyncIntervalMS, "async-sync-interval-ms", flagVals.AsyncSyncIntervalMS, "background sync period under --durability=async; ignored otherwise")
+	fs.StringVar(&flagVals.Compression, "compression", flagVals.Compression, "codec for newly-written delta frames and SSTable blocks: zstd (default) or none. Each frame records its own codec, so changing this leaves already-written segments readable")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	_ = fs.Parse(os.Args[1:])
 
@@ -118,7 +121,16 @@ func main() {
 		rt, err = embed.OpenMemoryRuntime(catalog, namespace, schema.None())
 	} else {
 		catalog := embed.CatalogFromNamespace(namespace)
-		rt, err = embed.OpenFileRuntime(dataDir, catalog, namespace, schema.None())
+		// ResolveService already validated both names, so these cannot fail here.
+		durability, _ := config.ParseDurability(cfg.Durability)
+		compression, _ := config.ParseCompression(cfg.Compression)
+		opts := embed.FileRuntimeOptionsFromEnv()
+		opts.Storage = embed.StorageOptions{
+			Durability:              durability,
+			Compression:             &compression,
+			AsyncSyncIntervalMillis: int64(cfg.AsyncSyncIntervalMS),
+		}
+		rt, err = embed.OpenFileRuntimeWithOptions(dataDir, catalog, namespace, schema.None(), opts)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

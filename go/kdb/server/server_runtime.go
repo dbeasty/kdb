@@ -357,17 +357,37 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	if err != nil {
 		return document.Commit{}, err
 	}
-	defer release()
+	// The gate is released explicitly on the success path, as soon as this
+	// commit's position in the delta log is fixed - see below. releaseOnce
+	// keeps the deferred release (which covers every other path) from
+	// double-releasing the gate's semaphore.
+	var releaseOnce sync.Once
+	releaseNow := func() { releaseOnce.Do(release) }
+	defer releaseNow()
+
 	result, err := call()
 	if err != nil {
 		return document.Commit{}, err
 	}
 	switch r := result.(type) {
 	case transaction.ResultSuccess:
-		// commitMu-serialized here, same as the append above: two commits racing to persist in
-		// the wrong order would desync the delta log from the DAG's actual commit order.
+		// Queueing happens under the gate because queue order is delta-log
+		// order, and two commits racing to enqueue would desync the log from
+		// the DAG's actual commit order. Waiting for the write to reach disk
+		// does not: once queued, this commit's position is fixed, so the gate
+		// can go to the next writer while this one's fsync is still in flight.
+		// That is what lets concurrent commits share a single fsync instead of
+		// each paying a full physical sync in strict sequence.
+		var waitDurable func() error
 		if s.persister != nil {
-			if err := s.persister.Persist(r.Commit); err != nil {
+			waitDurable, err = s.persister.PersistAsync(r.Commit)
+			if err != nil {
+				return document.Commit{}, err
+			}
+		}
+		releaseNow()
+		if waitDurable != nil {
+			if err := waitDurable(); err != nil {
 				return document.Commit{}, err
 			}
 		}

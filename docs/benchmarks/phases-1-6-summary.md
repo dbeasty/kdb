@@ -1,5 +1,11 @@
 # Phases 1-6 summary — reengineering for 1M writes/sec
 
+**Superseded in part by `write-path-allocation-fix.md`** (2026-08-27), which
+covers the real file-backed *server* write path this document never benchmarked
+- and where a ~21MB-per-commit allocation and an unbatched per-commit fsync were
+still hiding. Group commit as described below covered blobs only; document
+durability rides on the delta log, which bypassed it.
+
 Companion to `phase0-baseline.md` (the starting-point measurements and
 bottleneck list). This documents what actually got built for each phase,
 the measured before/after, and what was deliberately cut from the
