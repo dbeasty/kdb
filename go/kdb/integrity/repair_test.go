@@ -3,7 +3,6 @@ package integrity
 import (
 	"testing"
 
-	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -15,7 +14,7 @@ func TestRepairTornTailTruncatesAndQuarantines(t *testing.T) {
 	torn := rawFrame(t, commits[1])[:10]
 	appendSegment(t, shim, ns, 0, full, torn)
 
-	opts := Options{Level: L1, Compression: storage.CompressionNone}
+	opts := Options{Level: L1}
 	report, err := Verify(shim, ns, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +56,7 @@ func TestRepairIsIdempotent(t *testing.T) {
 	commits := buildChain(t, 2, ns)
 	appendSegment(t, shim, ns, 0, rawFrame(t, commits[0]), rawFrame(t, commits[1])[:10])
 
-	opts := Options{Level: L1, Compression: storage.CompressionNone}
+	opts := Options{Level: L1}
 	report, err := Verify(shim, ns, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +90,7 @@ func TestRepairMidLogRemovesOnlyProvenSafeFrame(t *testing.T) {
 	appendSegment(t, shim, ns, 1, rawFrame(t, c1), flippedFrame(t, c1b))
 	appendSegment(t, shim, ns, 2, rawFrame(t, c2))
 
-	opts := Options{Level: L1, Compression: storage.CompressionNone}
+	opts := Options{Level: L1}
 	report, err := Verify(shim, ns, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +107,7 @@ func TestRepairMidLogRemovesOnlyProvenSafeFrame(t *testing.T) {
 		t.Fatalf("expected one prefix-rewrite step, got %+v", result.Steps)
 	}
 
-	report2, err := Verify(shim, ns, Options{Level: L2, Compression: storage.CompressionNone})
+	report2, err := Verify(shim, ns, Options{Level: L2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +127,7 @@ func TestRepairRefusesWhenClosureBreaks(t *testing.T) {
 	appendSegment(t, shim, ns, 1, flippedFrame(t, c1))
 	appendSegment(t, shim, ns, 2, rawFrame(t, c2))
 
-	opts := Options{Level: L1, Compression: storage.CompressionNone}
+	opts := Options{Level: L1}
 	report, err := Verify(shim, ns, opts)
 	if err != nil {
 		t.Fatal(err)

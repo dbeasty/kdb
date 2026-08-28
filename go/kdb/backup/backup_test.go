@@ -122,7 +122,7 @@ func TestBackupManifestNamesConsistentSet(t *testing.T) {
 	appendSegment(t, shim, 1, commits[3], commits[4])
 
 	store := &DirStore{Root: t.TempDir()}
-	m, err := Create(shim, ns, storage.CompressionNone, store, "")
+	m, err := Create(shim, ns, store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,13 +154,13 @@ func TestIncrementalOmitsUnchangedSegments(t *testing.T) {
 	appendSegment(t, shim, 1, commits[2], commits[3])
 
 	store := &countingStore{DirStore: &DirStore{Root: t.TempDir()}}
-	first, err := Create(shim, ns, storage.CompressionNone, store, "")
+	first, err := Create(shim, ns, store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	store.segmentPuts, store.manifestPuts, store.prefixPuts = 0, 0, 0
 
-	second, err := Create(shim, ns, storage.CompressionNone, store, first.BackupID)
+	second, err := Create(shim, ns, store, first.BackupID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestIncrementalIncludesOnlyNewSealedSegments(t *testing.T) {
 	appendSegment(t, shim, 1, commits[2], commits[3])
 
 	store := &countingStore{DirStore: &DirStore{Root: t.TempDir()}}
-	first, err := Create(shim, ns, storage.CompressionNone, store, "")
+	first, err := Create(shim, ns, store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestIncrementalIncludesOnlyNewSealedSegments(t *testing.T) {
 	appendSegment(t, shim, 2, commits[4], commits[5])
 	store.segmentPuts, store.manifestPuts, store.prefixPuts = 0, 0, 0
 
-	second, err := Create(shim, ns, storage.CompressionNone, store, first.BackupID)
+	second, err := Create(shim, ns, store, first.BackupID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestBackupExcludesUnflushedTail(t *testing.T) {
 	}
 
 	store := &DirStore{Root: t.TempDir()}
-	m, err := Create(shim, ns, storage.CompressionNone, store, "")
+	m, err := Create(shim, ns, store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestBackupVerifyDetectsTruncatedUpload(t *testing.T) {
 	appendSegment(t, shim, 1, commits[2], commits[3])
 
 	store := &DirStore{Root: t.TempDir()}
-	m, err := Create(shim, ns, storage.CompressionNone, store, "")
+	m, err := Create(shim, ns, store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,13 +294,13 @@ func TestBackupWipeRestoreRoundTrip(t *testing.T) {
 	appendSegment(t, shim, 0, commits[0], commits[1], commits[2])
 	appendSegment(t, shim, 1, commits[3], commits[4])
 
-	originalCommits, err := integrity.ScanVerifiedCommits(shim, ns, storage.CompressionNone)
+	originalCommits, err := integrity.ScanVerifiedCommits(shim, ns)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	store := &DirStore{Root: t.TempDir()}
-	m, err := Create(shim, ns, storage.CompressionNone, store, "")
+	m, err := Create(shim, ns, store, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestBackupWipeRestoreRoundTrip(t *testing.T) {
 		t.Fatalf("restore reported missing commits: %v", result.MissingHashes)
 	}
 
-	restored, err := integrity.ScanVerifiedCommits(outShim, ns, storage.CompressionNone)
+	restored, err := integrity.ScanVerifiedCommits(outShim, ns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestBackupWipeRestoreRoundTrip(t *testing.T) {
 			t.Fatalf("commit %s lost through backup+restore", h)
 		}
 	}
-	if report, err := integrity.Verify(outShim, ns, integrity.Options{Level: integrity.L2, Compression: storage.CompressionNone}); err != nil || !report.Clean() {
+	if report, err := integrity.Verify(outShim, ns, integrity.Options{Level: integrity.L2}); err != nil || !report.Clean() {
 		t.Fatalf("restored directory fails verify: err=%v findings=%+v", err, report)
 	}
 }

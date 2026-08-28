@@ -44,6 +44,13 @@ type StorageEngineConfig struct {
 	// AsyncSyncIntervalMillis is the background fsync period used when
 	// Durability is DurabilityAsync. Zero uses a built-in default.
 	AsyncSyncIntervalMillis int64
+	// WalMaxSegmentBytes caps the active WAL segment; a write that would
+	// exceed it rotates to a new segment first. Zero uses the spec
+	// default (64 MiB). See docs/kdb-spec-layer4a-component10a-wal.md.
+	WalMaxSegmentBytes int64
+	// WalSkipCorruptRecords makes recovery skip records that fail their
+	// checksum instead of failing the whole replay. Default false.
+	WalSkipCorruptRecords bool
 }
 
 // ResolvedGlobalMemoryBudgetBytes returns GlobalMemoryBudgetBytes if set,

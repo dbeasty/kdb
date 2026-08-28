@@ -1,4 +1,4 @@
-.PHONY: test-go test-kotlin test-cross build-go build-kotlin
+.PHONY: test-go test-kotlin test-cross build-go build-kotlin bench bench-write
 
 # Single version source (see go/kdb/version). Release tags override: make build-go VERSION=v1.2.3
 VERSION ?= $(shell cat VERSION)
@@ -17,6 +17,20 @@ test-kotlin:
 
 test-cross: test-kotlin test-go
 	cd go && go test ./kdb/interop/... -v
+
+# Always -benchmem: the engine's single largest allocation (a throwaway zstd
+# encoder per commit, ~21MB) survived for as long as it did because no benchmark
+# reported B/op and none covered the real file-backed write path. ns/op alone
+# would not have caught it - the allocation barely moved the latency.
+bench:
+	cd go && go test ./... -run '^$$' -bench . -benchmem
+
+# The write path specifically, which is what regressions here tend to hit.
+# BenchmarkFileBackedUpsert goes through the real disk-backed runtime end to end
+# (schema, staging, commit trie, DAG, delta log, fsync).
+bench-write:
+	cd go && go test ./kdb/server/ ./kdb/transaction/ ./kdb/storage/engine/ ./kdb/compression/ \
+		-run '^$$' -bench . -benchmem -benchtime 1000x
 
 build-go:
 	cd go && go build -ldflags "$(GO_LDFLAGS)" -o bin/kdb ./cmd/kdb

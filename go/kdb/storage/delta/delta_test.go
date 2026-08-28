@@ -306,7 +306,7 @@ func TestScanSegmentBytesTornTail(t *testing.T) {
 	// but the body never fully made it to disk.
 	seg = append(seg, third[:frameHeaderSize+3]...)
 
-	scanned, err := ScanSegmentBytes(seg, storage.CompressionNone)
+	scanned, err := ScanSegmentBytes(seg)
 	if err != nil {
 		t.Fatalf("torn tail must not be an error, got: %v", err)
 	}
@@ -326,7 +326,7 @@ func TestScanSegmentBytesShortHeaderTail(t *testing.T) {
 	c := buildCommit(t, nil)
 	frame := rawFrame(t, c, storage.CompressionNone)
 	seg := append(append([]byte(nil), frame...), frame[:7]...)
-	scanned, err := ScanSegmentBytes(seg, storage.CompressionNone)
+	scanned, err := ScanSegmentBytes(seg)
 	if err != nil {
 		t.Fatalf("short header tail must not be an error, got: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestScanSegmentBytesCorruptCRC(t *testing.T) {
 	bad[frameHeaderSize+2] ^= 0xFF
 	seg := append(append([]byte(nil), good...), bad...)
 
-	scanned, err := ScanSegmentBytes(seg, storage.CompressionNone)
+	scanned, err := ScanSegmentBytes(seg)
 	var corrupt *CorruptFrameError
 	if !errors.As(err, &corrupt) {
 		t.Fatalf("err = %v, want *CorruptFrameError", err)
@@ -381,7 +381,7 @@ func TestScanSegmentBytesUnparsableBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scanned, scanErr := ScanSegmentBytes(frame, storage.CompressionNone)
+	scanned, scanErr := ScanSegmentBytes(frame)
 	var corrupt *CorruptFrameError
 	if !errors.As(scanErr, &corrupt) {
 		t.Fatalf("err = %v, want *CorruptFrameError", scanErr)
@@ -400,7 +400,7 @@ func TestScanSegmentBytesUnparsableBody(t *testing.T) {
 func TestScanSegmentBytesBadMagic(t *testing.T) {
 	c := buildCommit(t, nil)
 	seg := append(rawFrame(t, c, storage.CompressionNone), []byte("XXXXXXXXXXXXXXXXXXXX")...)
-	scanned, err := ScanSegmentBytes(seg, storage.CompressionNone)
+	scanned, err := ScanSegmentBytes(seg)
 	if err != nil {
 		t.Fatalf("bad-magic tail must not be an error, got: %v", err)
 	}
@@ -414,7 +414,7 @@ func TestScanSegmentBytesBadMagic(t *testing.T) {
 // like.
 func TestScanSegmentBytesEmpty(t *testing.T) {
 	for _, seg := range [][]byte{nil, {}, {0x4B, 0x44, 0x42}} {
-		scanned, err := ScanSegmentBytes(seg, storage.CompressionNone)
+		scanned, err := ScanSegmentBytes(seg)
 		if err != nil {
 			t.Errorf("ScanSegmentBytes(%d bytes) err = %v, want nil", len(seg), err)
 		}
@@ -636,9 +636,9 @@ func TestReadRange(t *testing.T) {
 	}
 }
 
-// TestPageCodecFrameLayout pins the on-disk frame format itself - magic,
-// big-endian compressed/uncompressed lengths, CRC of the body - since
-// the Kotlin side must produce and consume identical bytes.
+// TestPageCodecFrameLayout pins the on-disk v2 frame format itself - magic,
+// version, codec id, big-endian compressed/uncompressed lengths, CRC of the
+// body - since the Kotlin side must produce and consume identical bytes.
 func TestPageCodecFrameLayout(t *testing.T) {
 	payload := []byte("frame layout payload")
 	frame, err := (PageCodec{}).Frame(payload, storage.CompressionNone)
@@ -648,13 +648,22 @@ func TestPageCodecFrameLayout(t *testing.T) {
 	if string(frame[:4]) != "KDBP" {
 		t.Errorf("magic = %q, want KDBP", frame[:4])
 	}
-	if got := readIntBE(frame, 4); got != len(payload) {
-		t.Errorf("compressed-size field = %d, want %d (uncompressed body under CompressionNone)", got, len(payload))
+	if frame[4] != PageFormatVersion {
+		t.Errorf("version = %d, want %d", frame[4], PageFormatVersion)
+	}
+	if frame[5] != pageCodecNone {
+		t.Errorf("codec id = %d, want %d (none)", frame[5], pageCodecNone)
+	}
+	if frame[6] != 0 || frame[7] != 0 {
+		t.Errorf("reserved bytes = %d,%d, want 0,0", frame[6], frame[7])
 	}
 	if got := readIntBE(frame, 8); got != len(payload) {
+		t.Errorf("compressed-size field = %d, want %d (uncompressed body under CompressionNone)", got, len(payload))
+	}
+	if got := readIntBE(frame, 12); got != len(payload) {
 		t.Errorf("uncompressed-size field = %d, want %d", got, len(payload))
 	}
-	if got := uint32(readIntBE(frame, 12)); got != compression.CRC32All(payload) {
+	if got := uint32(readIntBE(frame, 16)); got != compression.CRC32All(payload) {
 		t.Errorf("crc field = %08x, want %08x", got, compression.CRC32All(payload))
 	}
 	if string(frame[frameHeaderSize:]) != string(payload) {
@@ -667,10 +676,13 @@ func TestPageCodecFrameLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := readIntBE(zframe, 8); got != len(payload) {
+	if zframe[5] != pageCodecZSTD {
+		t.Errorf("zstd codec id = %d, want %d", zframe[5], pageCodecZSTD)
+	}
+	if got := readIntBE(zframe, 12); got != len(payload) {
 		t.Errorf("zstd uncompressed-size field = %d, want %d", got, len(payload))
 	}
-	back, err := (PageCodec{}).Parse(zframe, storage.CompressionZSTD)
+	back, err := (PageCodec{}).Parse(zframe)
 	if err != nil {
 		t.Fatalf("Parse(zstd frame): %v", err)
 	}
@@ -679,23 +691,112 @@ func TestPageCodecFrameLayout(t *testing.T) {
 	}
 }
 
-// TestPageCodecUnknownCodecFallsBackToCompression pins the current
-// behavior for codec values this build doesn't know: Frame compresses
-// (same as zstd) and Parse decompresses, so the two stay symmetric even
-// for a future codec id round-tripping through an older binary's default
-// branch.
-func TestPageCodecUnknownCodecFallsBackToCompression(t *testing.T) {
-	payload := []byte("payload under an unknown codec id")
-	unknown := storage.CompressionCodec(99)
-	frame, err := (PageCodec{}).Frame(payload, unknown)
+// TestPageCodecMixedCodecsInOneSegment is the point of recording the codec per
+// frame: a segment written before a config change and appended to after it must
+// still scan end to end. Under v1 this was unreadable - the reader was told one
+// codec out of band and applied it to every frame.
+func TestPageCodecMixedCodecsInOneSegment(t *testing.T) {
+	pc := PageCodec{}
+	plain, err := pc.Frame([]byte("written while compression was off"), storage.CompressionNone)
 	if err != nil {
 		t.Fatal(err)
 	}
-	back, err := (PageCodec{}).Parse(frame, unknown)
+	zipped, err := pc.Frame([]byte("written after compression was turned on"), storage.CompressionZSTD)
 	if err != nil {
-		t.Fatalf("Parse: %v", err)
+		t.Fatal(err)
 	}
-	if string(back) != string(payload) {
-		t.Errorf("round trip = %q, want %q", back, payload)
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+		want  string
+	}{
+		{"none", plain, "written while compression was off"},
+		{"zstd", zipped, "written after compression was turned on"},
+	} {
+		got, err := pc.Parse(tc.frame)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", tc.name, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("Parse(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestPageCodecRejectsUnknownCodec: a codec value this build doesn't know is
+// now refused at Frame time rather than silently compressed. The old fallback
+// wrote zstd bytes while labelling them with a codec nothing could describe -
+// harmless only because the reader was told the codec out of band and guessed
+// the same way. With the codec recorded in the frame there is nothing sensible
+// to write, so writing is the wrong place to be lenient.
+func TestPageCodecRejectsUnknownCodec(t *testing.T) {
+	unknown := storage.CompressionCodec(99)
+	if _, err := (PageCodec{}).Frame([]byte("payload"), unknown); err == nil {
+		t.Fatal("Frame with an unknown codec should fail, got nil error")
+	}
+}
+
+// TestPageCodecRejectsUnknownFrameCodec is the read-side counterpart: a frame
+// carrying a codec id from some future build must fail loudly, not be guessed at.
+func TestPageCodecRejectsUnknownFrameCodec(t *testing.T) {
+	frame, err := (PageCodec{}).Frame([]byte("payload"), storage.CompressionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame[5] = 0x7F
+	if _, err := (PageCodec{}).Parse(frame); err == nil {
+		t.Fatal("Parse of a frame with an unknown codec id should fail, got nil error")
+	}
+}
+
+// TestPageCodecRejectsUnknownVersion guards the same for the version byte, which
+// is what makes a future v3 layout safe to introduce: a v2 reader must refuse it
+// rather than read v3 fields at v2 offsets.
+func TestPageCodecRejectsUnknownVersion(t *testing.T) {
+	frame, err := (PageCodec{}).Frame([]byte("payload"), storage.CompressionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame[4] = PageFormatVersion + 1
+	if _, err := (PageCodec{}).Parse(frame); err == nil {
+		t.Fatal("Parse of a future frame version should fail, got nil error")
+	}
+}
+
+// TestReaderIgnoresConfiguredCodec is the end-to-end payoff of recording the
+// codec per frame (see PageCodec): a segment written under one setting stays
+// readable after the deployment's configured codec changes. Under the v1
+// format the reader applied its *configured* codec to every frame, so flipping
+// `compression` in config silently made every existing segment unreadable -
+// and integrity.Verify could not distinguish that from real corruption.
+func TestReaderIgnoresConfiguredCodec(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		writtenWith  storage.CompressionCodec
+		readerThinks storage.CompressionCodec
+	}{
+		{"written none, reader configured zstd", storage.CompressionNone, storage.CompressionZSTD},
+		{"written zstd, reader configured none", storage.CompressionZSTD, storage.CompressionNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shim := newTestShim(t)
+			c0 := buildCommit(t, nil)
+			c1 := buildCommit(t, &c0.Hash)
+			ref := writeSealedSegment(t, newConfig(shim, tc.writtenWith), 0, c0, c1)
+
+			// A reader built from a *different* codec setting than the writer used.
+			reader := NewDefaultReader(testNS, shim, newConfig(shim, tc.readerThinks))
+			records, err := reader.ReadAll(ref)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			if len(records) != 2 {
+				t.Fatalf("read %d records, want 2", len(records))
+			}
+			if records[0].CommitHash != c0.Hash || records[1].CommitHash != c1.Hash {
+				t.Errorf("read commits %v,%v, want %v,%v",
+					records[0].CommitHash, records[1].CommitHash, c0.Hash, c1.Hash)
+			}
+		})
 	}
 }

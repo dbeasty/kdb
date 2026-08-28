@@ -8,15 +8,14 @@ import (
 	"strings"
 
 	"github.com/limidus/kdb/go/kdb/document"
-	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/delta"
 )
 
 // scanSegmentBytes decodes a verified segment prefix's commits, keyed by hex hash. The prefix
 // came from integrity.VerifiedSegmentPrefix, so a scan error here is a real bug, not expected
 // corruption.
-func scanSegmentBytes(raw []byte, comp storage.CompressionCodec) (map[string]document.Commit, error) {
-	commits, err := delta.ScanSegmentBytes(raw, comp)
+func scanSegmentBytes(raw []byte) (map[string]document.Commit, error) {
+	commits, err := delta.ScanSegmentBytes(raw)
 	if err != nil {
 		return nil, err
 	}

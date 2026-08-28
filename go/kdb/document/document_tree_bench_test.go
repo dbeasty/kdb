@@ -27,6 +27,7 @@ func makeEntries(n int) map[codec.UUID]codec.Hash {
 
 func BenchmarkBuildDocumentTree(b *testing.B) {
 	base := makeEntries(2000)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := BuildDocumentTree(base); err != nil {

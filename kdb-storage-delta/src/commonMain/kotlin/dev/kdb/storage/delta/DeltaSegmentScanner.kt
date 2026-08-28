@@ -3,14 +3,15 @@ package dev.kdb.storage.delta
 import dev.kdb.codec.KdbHash
 import dev.kdb.compression.Crc32
 import dev.kdb.document.KdbCommit
-import dev.kdb.storage.CompressionCodec
 
 /**
- * Scans v1 delta segment bytes: sequential KDBP-framed commit payloads.
+ * Scans delta segment bytes: sequential KDBP-framed commit payloads. Each
+ * frame records its own codec (see DeltaPageCodec), so no codec argument is
+ * needed or accepted - a segment may even mix codecs.
  * Full 10d page layout may extend this scanner later.
  */
 public object DeltaSegmentScanner {
-    private const val FRAME_HEADER_SIZE: Int = 16
+    private const val FRAME_HEADER_SIZE: Int = DeltaPageCodec.FRAME_HEADER_SIZE
     private const val MAGIC_K: Int = 0x4B
     private const val MAGIC_D: Int = 0x44
     private const val MAGIC_B: Int = 0x42
@@ -44,20 +45,17 @@ public object DeltaSegmentScanner {
      *   its body, or its body fails to parse - see that exception's doc
      *   comment for why this is not simply treated as a truncated tail.
      */
-    public fun scanSegmentBytes(
-        bytes: ByteArray,
-        compression: CompressionCodec,
-    ): List<ScannedCommit> {
+    public fun scanSegmentBytes(bytes: ByteArray): List<ScannedCommit> {
         val out = mutableListOf<ScannedCommit>()
         var offset = 0
         while (offset + FRAME_HEADER_SIZE <= bytes.size) {
             if (!isKdbpFrame(bytes, offset)) break
-            val compressedSize = readIntBe(bytes, offset + 4)
+            val compressedSize = readIntBe(bytes, offset + 8)
             if (compressedSize < 0) break
             val frameEnd = offset + FRAME_HEADER_SIZE + compressedSize
             if (frameEnd > bytes.size) break
             val frame = bytes.copyOfRange(offset, frameEnd)
-            val storedCrc = readIntBe(frame, 12)
+            val storedCrc = readIntBe(frame, 16)
             val actualCrc = Crc32.of(frame, FRAME_HEADER_SIZE, frame.size - FRAME_HEADER_SIZE)
             if (actualCrc != storedCrc) {
                 throw CorruptFrameException(
@@ -68,7 +66,7 @@ public object DeltaSegmentScanner {
             }
             val commit =
                 try {
-                    val payload = DeltaPageCodec.parse(frame, compression)
+                    val payload = DeltaPageCodec.parse(frame)
                     KdbCommit.fromPayloadBytes(payload)
                 } catch (e: Exception) {
                     throw CorruptFrameException(offset, e.message ?: e.toString(), out)

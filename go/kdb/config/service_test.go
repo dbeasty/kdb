@@ -146,3 +146,63 @@ func TestLoadServiceFileRoundTrip(t *testing.T) {
 		t.Fatalf("round trip lost fields: %+v", s)
 	}
 }
+
+// TestResolveServiceStorageTunables covers the settings added so the storage
+// engine's Durability/CompressionCodec - which the engine already honored but
+// nothing could reach, since embed/file.go hardcoded them - are configurable
+// through the same defaults < file < env < flags chain as everything else.
+func TestResolveServiceStorageTunables(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		s, err := ResolveService(nil, noEnv, noFlags, ServiceSettings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Durability != "sync" {
+			t.Errorf("Durability = %q, want sync (an acknowledged write must be durable by default)", s.Durability)
+		}
+		if s.Compression != "zstd" {
+			t.Errorf("Compression = %q, want zstd", s.Compression)
+		}
+		if s.AsyncSyncIntervalMS != 5 {
+			t.Errorf("AsyncSyncIntervalMS = %d, want 5", s.AsyncSyncIntervalMS)
+		}
+	})
+
+	t.Run("env beats file, flag beats env", func(t *testing.T) {
+		fileDur, fileComp := "async", "none"
+		file := &ServiceFile{Durability: &fileDur, Compression: &fileComp}
+		env := map[string]string{"KDB_DURABILITY": "memory"}
+		lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+
+		s, err := ResolveService(file, lookup, noFlags, ServiceSettings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Durability != "memory" {
+			t.Errorf("Durability = %q, want memory (env overrides file)", s.Durability)
+		}
+		if s.Compression != "none" {
+			t.Errorf("Compression = %q, want none (file applies where env is absent)", s.Compression)
+		}
+
+		setFlags := func(name string) bool { return name == "durability" }
+		s, err = ResolveService(file, lookup, setFlags, ServiceSettings{Durability: "sync"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Durability != "sync" {
+			t.Errorf("Durability = %q, want sync (an explicitly-set flag overrides env)", s.Durability)
+		}
+	})
+
+	t.Run("a bad name fails at startup", func(t *testing.T) {
+		bad := "eventually"
+		if _, err := ResolveService(&ServiceFile{Durability: &bad}, noEnv, noFlags, ServiceSettings{}); err == nil {
+			t.Fatal("an unknown durability should fail resolution, not silently fall back to a default")
+		}
+		badComp := "gzip"
+		if _, err := ResolveService(&ServiceFile{Compression: &badComp}, noEnv, noFlags, ServiceSettings{}); err == nil {
+			t.Fatal("an unknown compression codec should fail resolution")
+		}
+	})
+}

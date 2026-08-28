@@ -4,7 +4,6 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.inspect.BlobInspector
 import dev.kdb.inspect.DeltaSegmentDump
 import dev.kdb.inspect.WireFrameInspector
-import dev.kdb.storage.CompressionCodec
 import dev.kdb.wire.defaultWireCodec
 import java.nio.file.Files
 import java.nio.file.Path
@@ -42,7 +41,6 @@ private fun dumpDelta(args: List<String>) {
     val dataDir = argValue(args, "--data-dir") ?: error("--data-dir required")
     val namespace = argValue(args, "--namespace") ?: error("--namespace required")
     val segment = argValue(args, "--segment")
-    val codec = argValue(args, "--codec")?.let { CompressionCodec.valueOf(it.uppercase()) } ?: CompressionCodec.ZSTD
     val pretty = !args.contains("--compact")
     val nsDir = Path.of(dataDir, "ns", namespace, "delta")
     if (!Files.isDirectory(nsDir)) {
@@ -57,7 +55,7 @@ private fun dumpDelta(args: List<String>) {
   for (file in files) {
         println("=== ${file.fileName} ===")
         val bytes = file.readBytes()
-        println(DeltaSegmentDump.dumpSegmentBytes(bytes, codec, pretty))
+        println(DeltaSegmentDump.dumpSegmentBytes(bytes, pretty))
     }
 }
 
@@ -98,15 +96,15 @@ private fun printUsage() {
         kdb inspect — debug JSON views and data-directory maintenance (kdb-spec-layer15)
 
         Usage:
-          inspect dump-delta  --data-dir DIR --namespace NS [--segment SEG] [--codec zstd|none]
+          inspect dump-delta  --data-dir DIR --namespace NS [--segment SEG]
           inspect dump-wire   --file FRAME.bin [--compact]
           inspect dump-commit --file PAYLOAD.bin
           inspect dump-blob   --data-dir DIR --hash HEX
 
-          inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--codec zstd|none] [--json]
+          inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--json]
               Walk the delta log and report corruption without changing anything.
 
-          inspect repair-segments --data-dir DIR --namespace NS [--codec zstd|none] [--dry-run]
+          inspect repair-segments --data-dir DIR --namespace NS [--dry-run]
               Truncate torn tails and quarantine corrupt frames where provably safe.
               Refuses (naming the missing commits) when a repair would drop history
               still referenced by later segments - run restore instead in that case.

@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/limidus/kdb/go/kdb/storage"
 )
 
 // ServiceSettings is kdb-service's fully-resolved effective configuration - one field per
@@ -30,6 +33,15 @@ type ServiceSettings struct {
 	TLSClientAuth bool
 	LogLevel      string
 	LogFormat     string
+
+	// Storage-engine tunables. These reach storage.StorageEngineConfig via
+	// embed.FileRuntimeOptions; before they existed the engine's Durability and
+	// CompressionCodec were hardcoded at embed/file.go's construction site and
+	// unreachable from any config surface, despite the engine already honoring
+	// them.
+	Durability          string
+	AsyncSyncIntervalMS int
+	Compression         string
 }
 
 // DefaultServiceSettings mirrors the flag defaults declared in cmd/kdb-service.
@@ -42,6 +54,12 @@ func DefaultServiceSettings() ServiceSettings {
 		DrainTimeout: 30 * time.Second,
 		LogLevel:     "info",
 		LogFormat:    "text",
+		// sync: an acknowledged write is on disk. Group commit (see
+		// embed.commitLogWriter) amortizes the fsync across concurrent writers,
+		// so this is the safe default without being the slow one it used to be.
+		Durability:          "sync",
+		AsyncSyncIntervalMS: 5,
+		Compression:         "zstd",
 	}
 }
 
@@ -65,6 +83,10 @@ type ServiceFile struct {
 	TLS           *ServiceTLSFile `json:"tls"`
 	LogLevel      *string         `json:"logLevel"`
 	LogFormat     *string         `json:"logFormat"`
+
+	Durability          *string `json:"durability"`
+	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
+	Compression         *string `json:"compression"`
 }
 
 // ServiceTLSFile is ServiceFile's nested TLS block, matching the --tls-* flags.
@@ -127,6 +149,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		}
 		setIf(&s.LogLevel, file.LogLevel)
 		setIf(&s.LogFormat, file.LogFormat)
+		setIf(&s.Durability, file.Durability)
+		setIf(&s.AsyncSyncIntervalMS, file.AsyncSyncIntervalMS)
+		setIf(&s.Compression, file.Compression)
 	}
 
 	// Layer 3: environment.
@@ -203,6 +228,11 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	}
 	envString("KDB_LOG_LEVEL", &s.LogLevel)
 	envString("KDB_LOG_FORMAT", &s.LogFormat)
+	envString("KDB_DURABILITY", &s.Durability)
+	if err := envInt("KDB_ASYNC_SYNC_INTERVAL_MS", &s.AsyncSyncIntervalMS); err != nil {
+		return s, err
+	}
+	envString("KDB_COMPRESSION", &s.Compression)
 
 	// Layer 4: explicitly-set flags.
 	flagOverrides := []struct {
@@ -226,13 +256,60 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"tls-client-auth", func() { s.TLSClientAuth = flags.TLSClientAuth }},
 		{"log-level", func() { s.LogLevel = flags.LogLevel }},
 		{"log-format", func() { s.LogFormat = flags.LogFormat }},
+		{"durability", func() { s.Durability = flags.Durability }},
+		{"async-sync-interval-ms", func() { s.AsyncSyncIntervalMS = flags.AsyncSyncIntervalMS }},
+		{"compression", func() { s.Compression = flags.Compression }},
 	}
 	for _, o := range flagOverrides {
 		if flagWasSet(o.name) {
 			o.apply()
 		}
 	}
+	// Validated once, here, rather than at the point of use: a typo in a
+	// durability or compression name should fail at startup with the name it
+	// saw, not silently fall back to a default the operator didn't ask for.
+	if _, err := ParseDurability(s.Durability); err != nil {
+		return s, err
+	}
+	if _, err := ParseCompression(s.Compression); err != nil {
+		return s, err
+	}
 	return s, nil
+}
+
+// ParseDurability maps a configured durability name onto the engine's enum.
+//
+//   - sync:   an acknowledged write is fsynced. Concurrent commits share the
+//     fsync via group commit, so this no longer costs a physical sync per write.
+//   - async:  acknowledged once the record is in memory and queued; a crash can
+//     lose whatever had not been flushed yet.
+//   - memory: nothing is written to the delta log at all. Everything is lost on
+//     restart - for tests and throwaway workloads only.
+func ParseDurability(name string) (storage.Durability, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "sync":
+		return storage.DurabilitySync, nil
+	case "async":
+		return storage.DurabilityAsync, nil
+	case "memory", "memory-only", "memory_only":
+		return storage.DurabilityMemoryOnly, nil
+	default:
+		return 0, fmt.Errorf("unknown durability %q (want sync, async, or memory)", name)
+	}
+}
+
+// ParseCompression maps a configured codec name onto the engine's enum. Since
+// the v2 KDBP page format records the codec per frame, changing this affects
+// only newly-written frames - previously-written segments stay readable.
+func ParseCompression(name string) (storage.CompressionCodec, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "zstd":
+		return storage.CompressionZSTD, nil
+	case "none", "off":
+		return storage.CompressionNone, nil
+	default:
+		return 0, fmt.Errorf("unknown compression codec %q (want zstd or none)", name)
+	}
 }
 
 func setIf[T any](dst *T, src *T) {

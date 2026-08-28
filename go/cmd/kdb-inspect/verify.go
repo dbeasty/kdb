@@ -50,11 +50,7 @@ func verifyCmd(args []string) error {
 	dataDir := argValue(args, "--data-dir")
 	namespace := argValue(args, "--namespace")
 	if dataDir == "" || namespace == "" {
-		return fmt.Errorf("usage: kdb-inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--codec zstd|none] [--json]")
-	}
-	comp, err := parseCompression(argValue(args, "--codec"))
-	if err != nil {
-		return err
+		return fmt.Errorf("usage: kdb-inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--json]")
 	}
 	level, err := parseLevel(argValue(args, "--level"))
 	if err != nil {
@@ -71,7 +67,7 @@ func verifyCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	report, err := integrity.Verify(shim, namespace, integrity.Options{Level: level, Compression: comp})
+	report, err := integrity.Verify(shim, namespace, integrity.Options{Level: level})
 	if err != nil {
 		return err
 	}
@@ -110,11 +106,7 @@ func repairSegmentsCmd(args []string) error {
 	dataDir := argValue(args, "--data-dir")
 	namespace := argValue(args, "--namespace")
 	if dataDir == "" || namespace == "" {
-		return fmt.Errorf("usage: kdb-inspect repair-segments --data-dir DIR --namespace NS [--codec zstd|none] [--dry-run]")
-	}
-	comp, err := parseCompression(argValue(args, "--codec"))
-	if err != nil {
-		return err
+		return fmt.Errorf("usage: kdb-inspect repair-segments --data-dir DIR --namespace NS [--dry-run]")
 	}
 	dryRun := hasFlag(args, "--dry-run")
 
@@ -127,7 +119,7 @@ func repairSegmentsCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	opts := integrity.Options{Level: integrity.L1, Compression: comp}
+	opts := integrity.Options{Level: integrity.L1}
 	report, err := integrity.Verify(shim, namespace, opts)
 	if err != nil {
 		return err

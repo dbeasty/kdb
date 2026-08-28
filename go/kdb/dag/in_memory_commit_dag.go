@@ -28,6 +28,20 @@ type InMemoryCommitDag struct {
 	// instead of walking history. See GetCommitByTransactionID's own doc comment for why this
 	// exists.
 	txIndex map[codec.UUID]codec.Hash
+	// ancestryVersion is bumped by every mutation that can change what IsAncestor /
+	// AncestorSet answer for an already-known commit: a commit appearing (putCommitLocked) or
+	// disappearing (Squash, StubCommit). Readers that memoize ancestry-derived state - see
+	// index.eventLog's bucket cache - key their memo on it so they don't have to recompute
+	// against a DAG that has not moved.
+	ancestryVersion uint64
+}
+
+// AncestryVersion returns a counter that changes whenever the commit graph changes shape.
+// Callers may cache anything derived from ancestry for as long as this value is unchanged.
+func (d *InMemoryCommitDag) AncestryVersion() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.ancestryVersion
 }
 
 // NewInMemoryCommitDag creates a DAG with genesis commit and main branch.
@@ -148,19 +162,28 @@ func (d *InMemoryCommitDag) HasStub(hash codec.Hash) bool {
 func (d *InMemoryCommitDag) PutCommit(commit document.Commit, requireParents bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.putCommitLocked(commit, requireParents)
+	// verifyHash: a commit arriving through the public PutCommit came from
+	// somewhere else (delta replay, a peer sync push), so its claimed hash is
+	// not to be trusted.
+	return d.putCommitLocked(commit, requireParents, true)
 }
 
-func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParents bool) error {
+func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParents, verifyHash bool) error {
 	if _, ok := d.commits[commit.Hash]; ok {
 		return nil
 	}
-	recomputed, err := document.ComputeCommitHash(commit)
-	if err != nil {
-		return err
-	}
-	if recomputed != commit.Hash {
-		return NewConsistencyError("commit hash mismatch", d.NamespaceID, &commit.Hash)
+	// Re-deriving the hash means encoding the whole commit payload and running
+	// SHA-256 over it again. Worth it for a commit from an untrusted source;
+	// pure waste for one document.BuildCommit produced from these exact fields
+	// microseconds earlier, which is the per-write hot path (appendCommitLocked).
+	if verifyHash {
+		recomputed, err := document.ComputeCommitHash(commit)
+		if err != nil {
+			return err
+		}
+		if recomputed != commit.Hash {
+			return NewConsistencyError("commit hash mismatch", d.NamespaceID, &commit.Hash)
+		}
 	}
 	if requireParents && len(commit.ParentHashes) > 0 {
 		for _, p := range commit.ParentHashes {
@@ -173,6 +196,7 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	}
 	d.commits[commit.Hash] = commit
 	d.insertHex(commit.Hash.Hex())
+	d.ancestryVersion++
 	// Only the first commit for a given transaction id is indexed - a caller retrying the same
 	// transaction always expects to find that original result, not a later, unrelated commit
 	// that happens to reuse the id (which should never legitimately happen, since ids are random
@@ -211,6 +235,7 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	}
 	delete(d.commits, hash)
 	d.removeHex(hash.Hex())
+	d.ancestryVersion++
 	stub := document.CommitStub{
 		OriginalHash: hash, ArchiveLocation: archiveLocation, StubbedAt: codec.TimestampNow(),
 	}
@@ -465,7 +490,9 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	if err != nil {
 		return document.Commit{}, err
 	}
-	if err := d.putCommitLocked(commit, true); err != nil {
+	// BuildCommit derived commit.Hash from these fields just now, so there is
+	// nothing an immediate recompute could catch - see putCommitLocked.
+	if err := d.putCommitLocked(commit, true, false); err != nil {
 		return document.Commit{}, err
 	}
 	b, ok := d.branches[branchToAdvance]
@@ -530,6 +557,7 @@ func (d *InMemoryCommitDag) Squash(
 	}
 	d.commits[synthetic.Hash] = synthetic
 	d.insertHex(synthetic.Hash.Hex())
+	d.ancestryVersion++
 	return synthetic, nil
 }
 

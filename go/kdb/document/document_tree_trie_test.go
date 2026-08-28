@@ -220,6 +220,7 @@ func BenchmarkIncrementalWith_vs_FullRebuild(b *testing.B) {
 	}
 
 	b.Run("incremental_With_singleEntry", func(b *testing.B) {
+		b.ReportAllocs()
 		tree := base
 		for i := 0; i < b.N; i++ {
 			id, _ := codec.RandomUUID()
@@ -232,6 +233,7 @@ func BenchmarkIncrementalWith_vs_FullRebuild(b *testing.B) {
 	})
 
 	b.Run("fullRebuild_5000Entries", func(b *testing.B) {
+		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			if _, err := BuildDocumentTree(entries); err != nil {
 				b.Fatal(err)

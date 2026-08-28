@@ -80,27 +80,78 @@ public class DefaultDeltaSegmentWriter(
     }
 }
 
+/**
+ * KDBP page frame, v2 - must stay byte-identical to Go's
+ * `go/kdb/storage/delta/page_codec.go`:
+ *
+ * ```
+ *  0..3   magic 'KDBP'
+ *  4      version   u8  (= PAGE_FORMAT_VERSION)
+ *  5      codec     u8  (CODEC_NONE | CODEC_ZSTD)
+ *  6..7   reserved  u16 (zero)
+ *  8..11  compressed length   u32 (big-endian, body only)
+ * 12..15  uncompressed length u32 (big-endian)
+ * 16..19  crc32 of body       u32 (big-endian)
+ * ```
+ *
+ * v1 was 16 bytes and carried no codec, so a reader had to be told out of band
+ * which codec a segment was written with: changing the configured codec made
+ * existing segments unreadable, and verification could not tell a codec
+ * mismatch from real corruption.
+ */
 internal object DeltaPageCodec {
+    const val FRAME_HEADER_SIZE: Int = 20
+    const val PAGE_FORMAT_VERSION: Byte = 2
+    const val CODEC_NONE: Byte = 0
+    const val CODEC_ZSTD: Byte = 1
+
+    /**
+     * The stable on-disk id for [codec]. Spelled out rather than derived from
+     * the enum's ordinal so the enum can be reordered or extended without
+     * changing what already-written segments mean.
+     */
+    private fun codecId(codec: CompressionCodec): Byte =
+        when (codec) {
+            CompressionCodec.NONE -> CODEC_NONE
+            CompressionCodec.ZSTD -> CODEC_ZSTD
+        }
+
     fun frame(payload: ByteArray, codec: CompressionCodec): ByteArray {
+        val id = codecId(codec)
         val body =
-            when (codec) {
-                CompressionCodec.NONE -> payload
-                CompressionCodec.ZSTD -> ZstdCompression.compress(payload)
+            when (id) {
+                CODEC_NONE -> payload
+                else -> ZstdCompression.compress(payload)
             }
-        val out = ByteArray(16 + body.size)
+        val out = ByteArray(FRAME_HEADER_SIZE + body.size)
         out[0] = 0x4B; out[1] = 0x44; out[2] = 0x42; out[3] = 0x50
-        writeInt(out, 4, body.size)
-        writeInt(out, 8, payload.size)
-        writeInt(out, 12, Crc32.of(body))
-        body.copyInto(out, 16)
+        out[4] = PAGE_FORMAT_VERSION
+        out[5] = id
+        out[6] = 0; out[7] = 0
+        writeInt(out, 8, body.size)
+        writeInt(out, 12, payload.size)
+        writeInt(out, 16, Crc32.of(body))
+        body.copyInto(out, FRAME_HEADER_SIZE)
         return out
     }
 
-    fun parse(frame: ByteArray, codec: CompressionCodec): ByteArray {
-        val body = frame.copyOfRange(16, frame.size)
-        return when (codec) {
-            CompressionCodec.NONE -> body
-            CompressionCodec.ZSTD -> ZstdCompression.decompress(body, readInt(frame, 8) + 1024)
+    /** Decodes one whole frame using the codec the frame itself records. */
+    fun parse(frame: ByteArray): ByteArray {
+        require(frame.size >= FRAME_HEADER_SIZE) {
+            "delta page: frame shorter than its $FRAME_HEADER_SIZE-byte header"
+        }
+        val version = frame[4]
+        require(version == PAGE_FORMAT_VERSION) {
+            "delta page: unsupported frame version $version (this build writes and reads v$PAGE_FORMAT_VERSION)"
+        }
+        val body = frame.copyOfRange(FRAME_HEADER_SIZE, frame.size)
+        // Exactly the recorded size, not a padded bound: the header says how
+        // many bytes this frame decodes to, so anything else is corruption.
+        val uncompressed = readInt(frame, 12)
+        return when (frame[5]) {
+            CODEC_NONE -> body
+            CODEC_ZSTD -> ZstdCompression.decompress(body, uncompressed)
+            else -> throw IllegalArgumentException("delta page: unknown codec id ${frame[5]} in frame")
         }
     }
 
@@ -142,7 +193,7 @@ public class DefaultDeltaSegmentReader(
         // A CorruptFrameException propagates as-is (with partialCommits already populated) -
         // the caller (embed-level replay) decides torn-tail tolerance from it; this method has
         // no context (is this the most recently written segment?) to make that call itself.
-        val scanned = DeltaSegmentScanner.scanSegmentBytes(bytes, segment.compressionCodec)
+        val scanned = DeltaSegmentScanner.scanSegmentBytes(bytes)
         return scanned.map { scannedToRecord(it, segment) }
     }
 
@@ -220,7 +271,7 @@ public class DefaultDeltaSegmentReader(
             }
         val scanned =
             try {
-                DeltaSegmentScanner.scanSegmentBytes(bytes, config.compressionCodec)
+                DeltaSegmentScanner.scanSegmentBytes(bytes)
             } catch (e: DeltaSegmentScanner.CorruptFrameException) {
                 // Building a ref only needs first/last commit hash - a torn tail just means the
                 // last commit is whatever scanned cleanly, same as a fully-clean scan would see

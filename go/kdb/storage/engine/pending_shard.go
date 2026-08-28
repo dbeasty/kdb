@@ -68,6 +68,14 @@ func (s *shardedPendingStore) TakeAllAndClear() ([]document.Document, []codec.UU
 	var deletes []codec.UUID
 	for _, sh := range s.shards {
 		sh.mu.Lock()
+		// Skip shards nothing was staged in. A typical commit touches one
+		// document, so 63 of 64 shards are empty - reallocating both maps
+		// unconditionally meant 128 fresh map headers per commit to move a
+		// single record.
+		if len(sh.puts) == 0 && len(sh.deletes) == 0 {
+			sh.mu.Unlock()
+			continue
+		}
 		for _, d := range sh.puts {
 			puts = append(puts, d)
 		}
@@ -86,8 +94,12 @@ func (s *shardedPendingStore) TakeAllAndClear() ([]document.Document, []codec.UU
 func (s *shardedPendingStore) DiscardAll() {
 	for _, sh := range s.shards {
 		sh.mu.Lock()
-		sh.puts = make(map[codec.UUID]document.Document)
-		sh.deletes = make(map[codec.UUID]struct{})
+		if len(sh.puts) > 0 {
+			sh.puts = make(map[codec.UUID]document.Document)
+		}
+		if len(sh.deletes) > 0 {
+			sh.deletes = make(map[codec.UUID]struct{})
+		}
 		sh.mu.Unlock()
 	}
 }
