@@ -57,25 +57,33 @@ func nibbleAt(uuidBytes []byte, depth int) int {
 	return int(b & 0x0f)
 }
 
+// Both hashers build their preimage in a fixed-size array rather than a
+// make()d slice. The buffer never escapes past sha256.Sum256, so it stays on
+// the stack - which matters because internalHash runs once per trie level and
+// the trie is trieDepth (32) levels deep, so a heap buffer here cost ~16KB of
+// garbage per single-document put or delete.
+
 func leafHash(uuidBytes []byte, contentHash codec.Hash) [32]byte {
-	buf := make([]byte, 0, 1+16+32)
-	buf = append(buf, 0x00)
-	buf = append(buf, uuidBytes...)
-	buf = append(buf, contentHash.Bytes[:]...)
-	return sha256.Sum256(buf)
+	var buf [1 + 16 + 32]byte
+	buf[0] = 0x00
+	copy(buf[1:], uuidBytes)
+	copy(buf[1+16:], contentHash.Bytes[:])
+	return sha256.Sum256(buf[:])
 }
 
 func internalHash(children *[16]*trieNode) [32]byte {
-	buf := make([]byte, 0, 1+16*32)
-	buf = append(buf, 0x01)
+	var buf [1 + 16*32]byte
+	buf[0] = 0x01
+	off := 1
 	for _, c := range children {
 		if c == nil {
-			buf = append(buf, trieZero[:]...)
+			copy(buf[off:], trieZero[:])
 		} else {
-			buf = append(buf, c.hash[:]...)
+			copy(buf[off:], c.hash[:])
 		}
+		off += 32
 	}
-	return sha256.Sum256(buf)
+	return sha256.Sum256(buf[:])
 }
 
 func nodeHash(n *trieNode) [32]byte {

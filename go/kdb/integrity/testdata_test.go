@@ -94,10 +94,14 @@ func rawFrame(t *testing.T, c document.Commit) []byte {
 func flippedFrame(t *testing.T, c document.Commit) []byte {
 	t.Helper()
 	f := append([]byte(nil), rawFrame(t, c)...)
-	if len(f) < 20 {
+	// Must land past the header: flipping a header byte would change the
+	// frame's declared length, codec, or stored CRC instead of corrupting its
+	// body, which is a different failure than the one this fixture produces.
+	at := delta.PageFrameHeaderSize + 3
+	if len(f) <= at {
 		t.Fatalf("frame too short to flip a body byte: %d bytes", len(f))
 	}
-	f[19] ^= 0xFF
+	f[at] ^= 0xFF
 	return f
 }
 

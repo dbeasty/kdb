@@ -108,6 +108,20 @@ func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte
 			return nil, err
 		}
 	}
+	// Clamp to what the file actually holds before allocating. Callers that want
+	// "the whole segment" pass a length that is an upper bound rather than a real
+	// size - delta.DefaultReader.scanSegmentRef passes 1<<28 - and allocating that
+	// literally meant a 256MiB make([]byte) per segment scanned, of which the
+	// returned buf[:n] then retained the entire backing array for as long as the
+	// caller held the result. ListSegments does this once per segment, so opening
+	// a namespace with 20 segments transiently reserved ~5GiB.
+	if st, err := f.Stat(); err == nil {
+		if remaining := st.Size() - offset; remaining <= 0 {
+			return []byte{}, nil
+		} else if int64(length) > remaining {
+			length = int(remaining)
+		}
+	}
 	buf := make([]byte, length)
 	n, err := io.ReadFull(f, buf)
 	if err == io.ErrUnexpectedEOF || err == io.EOF {

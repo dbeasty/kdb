@@ -135,7 +135,7 @@ func (r *DefaultReader) ReadAll(segment storage.DeltaSegmentRef) ([]storage.Delt
 	if err != nil {
 		return nil, err
 	}
-	scanned, scanErr := ScanSegmentBytes(raw, segment.Compression)
+	scanned, scanErr := ScanSegmentBytes(raw)
 	out := make([]storage.DeltaRecord, 0, len(scanned))
 	for _, s := range scanned {
 		payload, err := s.Commit.ToPayloadBytes()
@@ -219,12 +219,26 @@ func (r *DefaultReader) readFullSegment(segmentName string, sizeBytes int64) ([]
 	return r.shim.ReadFromSegment(segmentName, 0, int(sizeBytes))
 }
 
+// maxScannedSegmentBytes bounds a single scanSegmentRef read. PlatformIOShim
+// exposes no segment-size call, so "read the whole segment" has to be expressed
+// as an upper bound; the byte stores clamp the request down to the file's real
+// size, so this is a ceiling rather than an allocation. Segments are sealed well
+// below this (wal/delta segment sizing is measured in tens of MiB), so hitting
+// it means something is wrong - reported rather than silently truncated, since a
+// truncated scan would yield a wrong LastCommitHash for the segment.
+const maxScannedSegmentBytes = 1 << 28 // 256MiB
+
 func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.DeltaSegmentRef, error) {
-	raw, err := r.shim.ReadFromSegment(segmentName, 0, 1<<28)
+	raw, err := r.shim.ReadFromSegment(segmentName, 0, maxScannedSegmentBytes)
 	if err != nil {
 		return nil, err
 	}
-	scanned, scanErr := ScanSegmentBytes(raw, r.config.CompressionCodec)
+	if len(raw) >= maxScannedSegmentBytes {
+		return nil, fmt.Errorf(
+			"delta segment %s is at or beyond the %d-byte scan ceiling; refusing to report a possibly-truncated segment range",
+			segmentName, maxScannedSegmentBytes)
+	}
+	scanned, scanErr := ScanSegmentBytes(raw)
 	var corrupt *CorruptFrameError
 	if scanErr != nil && !errors.As(scanErr, &corrupt) {
 		return nil, scanErr

@@ -38,10 +38,6 @@ func backupCmd(args []string) error {
 	if dataDir == "" || namespace == "" {
 		return fmt.Errorf("usage: kdb-inspect backup --data-dir DIR --namespace NS --to DIR|s3 [--base-backup-id ID] [--codec zstd|none]")
 	}
-	comp, err := parseCompression(argValue(args, "--codec"))
-	if err != nil {
-		return err
-	}
 	store, err := backupStore(to)
 	if err != nil {
 		return err
@@ -55,7 +51,7 @@ func backupCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := backup.Create(shim, namespace, comp, store, base)
+	m, err := backup.Create(shim, namespace, store, base)
 	if err != nil {
 		return err
 	}

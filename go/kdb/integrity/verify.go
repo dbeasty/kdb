@@ -142,13 +142,13 @@ func listSequencedSegments(shim storage.PlatformIOShim, namespaceID string) ([]i
 	return seqs, nil
 }
 
-func readAndScanSegment(shim storage.PlatformIOShim, namespaceID string, seq int64, comp storage.CompressionCodec) (scannedSegment, error) {
+func readAndScanSegment(shim storage.PlatformIOShim, namespaceID string, seq int64) (scannedSegment, error) {
 	name := storio.SegmentNameBuilder.DeltaSequenced(namespaceID, seq)
 	raw, err := shim.ReadFromSegment(name, 0, 1<<30)
 	if err != nil {
 		return scannedSegment{}, err
 	}
-	commits, scanErr := delta.ScanSegmentBytes(raw, comp)
+	commits, scanErr := delta.ScanSegmentBytes(raw)
 	ss := scannedSegment{sequence: seq, raw: raw, commits: commits}
 	var corrupt *delta.CorruptFrameError
 	if scanErr != nil {
@@ -168,24 +168,25 @@ func readAndScanSegment(shim storage.PlatformIOShim, namespaceID string, seq int
 	return ss, nil
 }
 
-const frameHeaderSize = 16
+const frameHeaderSize = delta.PageFrameHeaderSize
 
-// frameLen reads the 16-byte frame header's compressed-body-length field
+// frameLen reads the frame header's compressed-body-length field
 // (the same layout delta.ScanSegmentBytes parses) to compute the full
 // on-disk size of the frame starting at offset, so verify can tell
 // whether a clean scan actually consumed every byte of the segment.
 func frameLen(raw []byte, offset int) int {
-	b := raw[offset+4 : offset+8]
+	b := raw[offset+8 : offset+12]
 	return frameHeaderSize + (int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3]))
 }
 
-// Options configures a verification run. Compression must name the codec
-// the namespace was written with - it is never recorded in a frame (see
-// kdb-spec-layer15 §2 background), so a mismatch here cannot be detected
-// from the bytes alone and Verify will not guess.
+// Options configures a verification run.
+//
+// There is deliberately no compression setting: since the v2 KDBP frame
+// (delta.PageCodec) records its codec per frame, verification reads whatever a
+// segment was actually written with. Previously the caller had to supply it,
+// and a wrong answer was indistinguishable from real corruption.
 type Options struct {
-	Level       Level
-	Compression storage.CompressionCodec
+	Level Level
 }
 
 // Verify walks namespaceID's delta log at the requested level and reports
@@ -207,7 +208,7 @@ func Verify(shim storage.PlatformIOShim, namespaceID string, opts Options) (*Rep
 				Detail:         fmt.Sprintf("sequence jumps from %d to %d - a segment is missing", seqs[i-1], seq),
 			})
 		}
-		ss, err := readAndScanSegment(shim, namespaceID, seq, opts.Compression)
+		ss, err := readAndScanSegment(shim, namespaceID, seq)
 		if err != nil {
 			return nil, fmt.Errorf("reading segment %d: %w", seq, err)
 		}

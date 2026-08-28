@@ -1,7 +1,6 @@
 package dev.kdb.integrity
 
 import dev.kdb.document.KdbCommit
-import dev.kdb.storage.CompressionCodec
 import dev.kdb.storage.PlatformIoShim
 
 /**
@@ -12,11 +11,11 @@ import dev.kdb.storage.PlatformIoShim
  * uses this so a source with any unrepaired corruption still contributes
  * everything it safely can, and nothing it can't.
  */
-public suspend fun scanVerifiedCommits(shim: PlatformIoShim, namespaceId: String, compression: CompressionCodec): Map<String, KdbCommit> {
+public suspend fun scanVerifiedCommits(shim: PlatformIoShim, namespaceId: String): Map<String, KdbCommit> {
     val seqs = listSequencedSegments(shim, namespaceId)
     val out = mutableMapOf<String, KdbCommit>()
     for (seq in seqs) {
-        val ss = readAndScanSegment(shim, namespaceId, seq, compression)
+        val ss = readAndScanSegment(shim, namespaceId, seq)
         for (c in ss.commits) out[c.commitHash.toHex()] = c.commit
     }
     return out

@@ -6,10 +6,9 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/compression"
 	"github.com/limidus/kdb/go/kdb/document"
-	"github.com/limidus/kdb/go/kdb/storage"
 )
 
-const frameHeaderSize = 16
+const frameHeaderSize = PageFrameHeaderSize
 
 // ScannedCommit is one commit frame in a delta segment.
 type ScannedCommit struct {
@@ -40,13 +39,15 @@ func (e *CorruptFrameError) Error() string {
 	return fmt.Sprintf("delta segment: corrupt frame at offset %d: %s", e.Offset, e.Reason)
 }
 
-// ScanSegmentBytes scans v1 delta segment bytes (sequential KDBP frames).
+// ScanSegmentBytes scans delta segment bytes (sequential KDBP frames). Each
+// frame records its own codec (see PageCodec), so no codec argument is needed
+// or accepted - a segment may even mix codecs.
 //
 // On a CorruptFrameError, the returned slice still holds every commit
 // scanned successfully *before* the corrupt frame - callers that want
 // torn-tail-tolerant behavior (see CorruptFrameError's doc comment) use
 // that partial result rather than discarding it.
-func ScanSegmentBytes(bytes []byte, comp storage.CompressionCodec) ([]ScannedCommit, error) {
+func ScanSegmentBytes(bytes []byte) ([]ScannedCommit, error) {
 	var out []ScannedCommit
 	var codec PageCodec
 	offset := 0
@@ -54,7 +55,7 @@ func ScanSegmentBytes(bytes []byte, comp storage.CompressionCodec) ([]ScannedCom
 		if !isKdbpFrame(bytes, offset) {
 			break
 		}
-		compressedSize := readIntBE(bytes, offset+4)
+		compressedSize := readIntBE(bytes, offset+8)
 		if compressedSize < 0 {
 			// A negative length can only come from a garbled/torn header -
 			// there is no valid frame here or after it in this segment.
@@ -69,7 +70,7 @@ func ScanSegmentBytes(bytes []byte, comp storage.CompressionCodec) ([]ScannedCom
 			break
 		}
 		frame := bytes[offset:frameEnd]
-		storedCRC := uint32(readIntBE(frame, 12))
+		storedCRC := uint32(readIntBE(frame, 16))
 		actualCRC := compression.CRC32All(frame[frameHeaderSize:])
 		if actualCRC != storedCRC {
 			return out, &CorruptFrameError{
@@ -77,7 +78,7 @@ func ScanSegmentBytes(bytes []byte, comp storage.CompressionCodec) ([]ScannedCom
 				Reason: fmt.Sprintf("crc mismatch: stored=%08x actual=%08x", storedCRC, actualCRC),
 			}
 		}
-		payload, err := codec.Parse(frame, comp)
+		payload, err := codec.Parse(frame)
 		if err != nil {
 			return out, &CorruptFrameError{Offset: offset, Reason: err.Error()}
 		}

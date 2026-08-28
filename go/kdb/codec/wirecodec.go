@@ -63,7 +63,7 @@ func encodeValue(buf *[]byte, v Value, typ schema.Type, reg *schema.Registry) er
 		if !ok {
 			return kdberr.NewEncodeError("ArrayVal expected", nil)
 		}
-		*buf = append(*buf, encodeLeb128U32(uint32(len(a.Elements)))...)
+		*buf = appendLeb128U32(*buf, uint32(len(a.Elements)))
 		for _, e := range a.Elements {
 			if err := encodeValue(buf, e, t.Element, reg); err != nil {
 				return err
@@ -75,7 +75,7 @@ func encodeValue(buf *[]byte, v Value, typ schema.Type, reg *schema.Registry) er
 		if !ok {
 			return kdberr.NewEncodeError("MapVal expected", nil)
 		}
-		*buf = append(*buf, encodeLeb128U32(uint32(len(m.Entries)))...)
+		*buf = appendLeb128U32(*buf, uint32(len(m.Entries)))
 		for _, e := range m.Entries {
 			if err := encodeValue(buf, e.Key, t.Key, reg); err != nil {
 				return err
@@ -131,9 +131,18 @@ func encodeNamed(buf *[]byte, v Value, ref schema.Ref, reg *schema.Registry) err
 
 func encodeRecord(buf *[]byte, rec RecordValue, sch *schema.RecordSchema, reg *schema.Registry) error {
 	var body []byte
-	fields := make([]schema.FieldSchema, len(sch.Fields))
-	copy(fields, sch.Fields)
-	sort.Slice(fields, func(i, j int) bool { return fields[i].ID < fields[j].ID })
+	// Field order must be by id, but a schema's Fields are declared in id order
+	// in practice, so check before copying: sorting a copy on every single
+	// record encode cost an allocation plus an O(n log n) sort to reproduce the
+	// order the slice was already in. sch.Fields is frozen (see Registry.Freeze),
+	// so it is never sorted in place here.
+	fields := sch.Fields
+	byID := func(i, j int) bool { return fields[i].ID < fields[j].ID }
+	if !sort.SliceIsSorted(fields, byID) {
+		fields = make([]schema.FieldSchema, len(sch.Fields))
+		copy(fields, sch.Fields)
+		sort.Slice(fields, func(i, j int) bool { return fields[i].ID < fields[j].ID })
+	}
 	for _, f := range fields {
 		cur, ok := rec.Fields[f.ID]
 		if !ok {
@@ -145,13 +154,13 @@ func encodeRecord(buf *[]byte, rec RecordValue, sch *schema.RecordSchema, reg *s
 		if omitField(cur, f.Default) {
 			continue
 		}
-		body = append(body, encodeLeb128U32(uint32(f.ID))...)
+		body = appendLeb128U32(body, uint32(f.ID))
 		body = append(body, physicalTag(f.Type, reg).Tag())
 		if err := encodeValue(&body, cur, f.Type, reg); err != nil {
 			return err
 		}
 	}
-	*buf = append(*buf, encodeLeb128U32(uint32(len(body)))...)
+	*buf = appendLeb128U32(*buf, uint32(len(body)))
 	*buf = append(*buf, body...)
 	return nil
 }
@@ -264,9 +273,9 @@ func encodePhysicalOnly(buf *[]byte, v Value, phy schema.PhysicalKind) error {
 		}
 		*buf = append(*buf, putFloat64(d)...)
 	case schema.PhysicalString:
-		*buf = append(*buf, lebPrefix([]byte(v.(StringValue).V))...)
+		*buf = appendLebString(*buf, v.(StringValue).V)
 	case schema.PhysicalBytes:
-		*buf = append(*buf, lebPrefix(v.(BytesValue).V)...)
+		*buf = appendLebBytes(*buf, v.(BytesValue).V)
 	default:
 		return kdberr.NewEncodeError("composite needs structural type", nil)
 	}

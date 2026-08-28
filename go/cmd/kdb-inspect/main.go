@@ -86,10 +86,10 @@ func printUsage() {
 Usage:
   kdb-inspect dump-wire --file FRAME.bin [--compact]
 
-  kdb-inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--codec zstd|none] [--json]
+  kdb-inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--json]
       Walk the delta log and report corruption without changing anything.
 
-  kdb-inspect repair-segments --data-dir DIR --namespace NS [--codec zstd|none] [--dry-run]
+  kdb-inspect repair-segments --data-dir DIR --namespace NS [--dry-run]
       Truncate torn tails and quarantine corrupt frames where provably safe.
       Refuses (naming the missing commits) when a repair would drop history
       still referenced by later segments - run restore instead in that case.
@@ -99,7 +99,7 @@ Usage:
       or more sources (a damaged local data directory, a fetched backup, or
       both for a hybrid restore).
 
-  kdb-inspect backup --data-dir DIR --namespace NS --to DIR|s3 [--base-backup-id ID] [--codec zstd|none]
+  kdb-inspect backup --data-dir DIR --namespace NS --to DIR|s3 [--base-backup-id ID]
       Write a manifest-defined, verifiable backup (sealed segments in full,
       the active segment as its CRC-verified prefix) to a directory or S3
       (--to s3 uses KDB_S3_* env config). With --base-backup-id, incremental.

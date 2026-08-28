@@ -148,19 +148,28 @@ func (d *InMemoryCommitDag) HasStub(hash codec.Hash) bool {
 func (d *InMemoryCommitDag) PutCommit(commit document.Commit, requireParents bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.putCommitLocked(commit, requireParents)
+	// verifyHash: a commit arriving through the public PutCommit came from
+	// somewhere else (delta replay, a peer sync push), so its claimed hash is
+	// not to be trusted.
+	return d.putCommitLocked(commit, requireParents, true)
 }
 
-func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParents bool) error {
+func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParents, verifyHash bool) error {
 	if _, ok := d.commits[commit.Hash]; ok {
 		return nil
 	}
-	recomputed, err := document.ComputeCommitHash(commit)
-	if err != nil {
-		return err
-	}
-	if recomputed != commit.Hash {
-		return NewConsistencyError("commit hash mismatch", d.NamespaceID, &commit.Hash)
+	// Re-deriving the hash means encoding the whole commit payload and running
+	// SHA-256 over it again. Worth it for a commit from an untrusted source;
+	// pure waste for one document.BuildCommit produced from these exact fields
+	// microseconds earlier, which is the per-write hot path (appendCommitLocked).
+	if verifyHash {
+		recomputed, err := document.ComputeCommitHash(commit)
+		if err != nil {
+			return err
+		}
+		if recomputed != commit.Hash {
+			return NewConsistencyError("commit hash mismatch", d.NamespaceID, &commit.Hash)
+		}
 	}
 	if requireParents && len(commit.ParentHashes) > 0 {
 		for _, p := range commit.ParentHashes {
@@ -465,7 +474,9 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	if err != nil {
 		return document.Commit{}, err
 	}
-	if err := d.putCommitLocked(commit, true); err != nil {
+	// BuildCommit derived commit.Hash from these fields just now, so there is
+	// nothing an immediate recompute could catch - see putCommitLocked.
+	if err := d.putCommitLocked(commit, true, false); err != nil {
 		return document.Commit{}, err
 	}
 	b, ok := d.branches[branchToAdvance]

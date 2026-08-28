@@ -122,7 +122,7 @@ func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f F
 	allCommits := make(map[string]struct{})
 	prefixCommits := make(map[string]struct{})
 	for _, seq := range seqs {
-		ss, err := readAndScanSegment(shim, namespaceID, seq, opts.Compression)
+		ss, err := readAndScanSegment(shim, namespaceID, seq)
 		if err != nil {
 			return RepairStep{}, err
 		}
@@ -153,7 +153,7 @@ func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f F
 		if seq <= f.Segment {
 			continue
 		}
-		ss, err := readAndScanSegment(shim, namespaceID, seq, opts.Compression)
+		ss, err := readAndScanSegment(shim, namespaceID, seq)
 		if err != nil {
 			return RepairStep{}, err
 		}

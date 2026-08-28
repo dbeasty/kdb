@@ -16,7 +16,6 @@
 package dev.kdb.integrity
 
 import dev.kdb.document.KdbCommit
-import dev.kdb.storage.CompressionCodec
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.delta.DeltaSegmentScanner
 import dev.kdb.storage.delta.LegacySegmentFormatException
@@ -81,17 +80,18 @@ public data class Report(
 }
 
 /**
- * Configures a verification run. compression must name the codec the
- * namespace was written with - it is never recorded in a frame, so a
- * mismatch here cannot be detected from the bytes alone and [verify]
- * will not guess.
+ * Configures a verification run.
+ *
+ * There is deliberately no compression setting: since the v2 KDBP frame
+ * (DeltaPageCodec) records its codec per frame, verification reads whatever a
+ * segment was actually written with. Previously the caller had to supply it,
+ * and a wrong answer was indistinguishable from real corruption.
  */
 public data class Options(
     val level: Level,
-    val compression: CompressionCodec,
 )
 
-internal const val FRAME_HEADER_SIZE = 16
+internal const val FRAME_HEADER_SIZE = 20
 
 /**
  * One segment's independently-scanned bytes and result.
@@ -141,12 +141,11 @@ internal suspend fun readAndScanSegment(
     shim: PlatformIoShim,
     namespaceId: String,
     seq: Long,
-    compression: CompressionCodec,
 ): ScannedSegment {
     val name = SegmentNameBuilder.deltaSequenced(namespaceId, seq)
     val raw = shim.readFromSegment(name, 0, Int.MAX_VALUE / 4)
     return try {
-        val commits = DeltaSegmentScanner.scanSegmentBytes(raw, compression)
+        val commits = DeltaSegmentScanner.scanSegmentBytes(raw)
         val consumed =
             if (commits.isEmpty()) {
                 0
@@ -161,16 +160,16 @@ internal suspend fun readAndScanSegment(
 }
 
 /**
- * Reads the 16-byte frame header's compressed-body-length field (the
+ * Reads the frame header's compressed-body-length field (the
  * same layout DeltaSegmentScanner parses) to compute the full on-disk
  * size of the frame starting at offset, so verify can tell whether a
  * clean scan actually consumed every byte of the segment.
  */
 internal fun frameLen(raw: ByteArray, offset: Int): Int {
-    val b0 = raw[offset + 4].toInt() and 0xFF
-    val b1 = raw[offset + 5].toInt() and 0xFF
-    val b2 = raw[offset + 6].toInt() and 0xFF
-    val b3 = raw[offset + 7].toInt() and 0xFF
+    val b0 = raw[offset + 8].toInt() and 0xFF
+    val b1 = raw[offset + 9].toInt() and 0xFF
+    val b2 = raw[offset + 10].toInt() and 0xFF
+    val b3 = raw[offset + 11].toInt() and 0xFF
     return FRAME_HEADER_SIZE + ((b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3)
 }
 
@@ -190,7 +189,7 @@ public suspend fun verify(shim: PlatformIoShim, namespaceId: String, opts: Optio
                     detail = "sequence jumps from ${seqs[i - 1]} to $seq - a segment is missing",
                 )
         }
-        val ss = readAndScanSegment(shim, namespaceId, seq, opts.compression)
+        val ss = readAndScanSegment(shim, namespaceId, seq)
         segments += SegmentSummary(seq, ss.raw.size.toLong(), ss.commits.size)
         val isLastSegment = i == seqs.lastIndex
 
