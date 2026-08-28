@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
@@ -40,7 +41,11 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		NewStore: func(config storio.PlatformIOConfig) (storio.SegmentByteStore, error) {
 			return buildSegmentByteStore(config, s3Cfg, policy)
 		},
-	}).Open(storio.PlatformIOConfig{RootDirectory: &dataRoot, FsyncOnFlush: true})
+	}).Open(storio.PlatformIOConfig{
+		RootDirectory: &dataRoot,
+		FsyncOnFlush:  true,
+		SyncMode:      opts.Storage.SyncMode,
+	})
 	if err != nil {
 		lock.Release()
 		return nil, err
@@ -91,7 +96,10 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	dagOut := dag.CommitDAG(d)
 	var persisting *PersistingCommitDAG
 	if w := handle.DeltaWriter(); w != nil {
-		persisting = NewPersistingCommitDAGWithDurability(d, w, cfg.Durability)
+		persisting = NewPersistingCommitDAGWithAsyncInterval(
+			d, w, cfg.Durability,
+			time.Duration(cfg.AsyncSyncIntervalMillis)*time.Millisecond,
+		)
 		dagOut = persisting
 	}
 

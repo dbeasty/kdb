@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -78,7 +79,7 @@ func rec(payload string) storage.DeltaRecord {
 // order they were queued even though the write happens on another goroutine.
 func TestCommitLogPreservesEnqueueOrder(t *testing.T) {
 	w := &fakeSegmentWriter{}
-	c := newCommitLogWriter(w, storage.DurabilitySync)
+	c := newCommitLogWriter(w, storage.DurabilitySync, 0)
 	defer c.Close()
 
 	const n = 200
@@ -102,7 +103,7 @@ func TestCommitLogPreservesEnqueueOrder(t *testing.T) {
 // the record is on disk, not merely queued.
 func TestCommitLogSyncWaitsForFlush(t *testing.T) {
 	w := &fakeSegmentWriter{}
-	c := newCommitLogWriter(w, storage.DurabilitySync)
+	c := newCommitLogWriter(w, storage.DurabilitySync, 0)
 	defer c.Close()
 
 	if err := c.Enqueue(rec("durable")); err != nil {
@@ -132,7 +133,7 @@ func TestCommitLogGroupsConcurrentCommits(t *testing.T) {
 	w := &fakeSegmentWriter{beforeAppend: func() {
 		once.Do(func() { <-release })
 	}}
-	c := newCommitLogWriter(w, storage.DurabilitySync)
+	c := newCommitLogWriter(w, storage.DurabilitySync, 0)
 	defer c.Close()
 
 	var wg sync.WaitGroup
@@ -172,7 +173,7 @@ func TestCommitLogGroupsConcurrentCommits(t *testing.T) {
 // the record is queued. Close must still get it to disk.
 func TestCommitLogAsyncDoesNotWait(t *testing.T) {
 	w := &fakeSegmentWriter{}
-	c := newCommitLogWriter(w, storage.DurabilityAsync)
+	c := newCommitLogWriter(w, storage.DurabilityAsync, 0)
 	for i := 0; i < 10; i++ {
 		if err := c.Enqueue(rec(fmt.Sprintf("a%d", i))); err != nil {
 			t.Fatal(err)
@@ -195,7 +196,7 @@ func TestCommitLogAsyncDoesNotWait(t *testing.T) {
 func TestCommitLogLatchesFailure(t *testing.T) {
 	boom := errors.New("disk is gone")
 	w := &fakeSegmentWriter{appendErr: boom}
-	c := newCommitLogWriter(w, storage.DurabilitySync)
+	c := newCommitLogWriter(w, storage.DurabilitySync, 0)
 	defer c.Close()
 
 	if err := c.Enqueue(rec("first")); !errors.Is(err, boom) {
@@ -211,7 +212,7 @@ func TestCommitLogLatchesFailure(t *testing.T) {
 // than panic on a send to a closed channel.
 func TestCommitLogEnqueueAfterCloseFails(t *testing.T) {
 	w := &fakeSegmentWriter{}
-	c := newCommitLogWriter(w, storage.DurabilitySync)
+	c := newCommitLogWriter(w, storage.DurabilitySync, 0)
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +229,7 @@ func TestCommitLogEnqueueAfterCloseFails(t *testing.T) {
 // ErrCommitLogClosed, and none may panic.
 func TestCommitLogConcurrentEnqueueAndClose(t *testing.T) {
 	w := &fakeSegmentWriter{}
-	c := newCommitLogWriter(w, storage.DurabilitySync)
+	c := newCommitLogWriter(w, storage.DurabilitySync, 0)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
@@ -245,4 +246,91 @@ func TestCommitLogConcurrentEnqueueAndClose(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 	wg.Wait()
+}
+
+// TestCommitLogAsyncAppendsPromptlyFlushesOnInterval: under DurabilityAsync
+// records must reach the writer (the OS page cache in production) as soon as
+// the drain goroutine gets to them, but the physical flush must wait for the
+// flush interval - not run once per drained batch, which is what async mode
+// did before the interval existed and which cost one background fsync per
+// commit for any single sustained writer.
+func TestCommitLogAsyncAppendsPromptlyFlushesOnInterval(t *testing.T) {
+	w := &fakeSegmentWriter{}
+	// An interval far longer than the test: any flush before Close is a bug.
+	c := newCommitLogWriter(w, storage.DurabilityAsync, time.Hour)
+	for i := 0; i < 20; i++ {
+		if err := c.Enqueue(rec(fmt.Sprintf("a%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Appends happen on the drain goroutine; wait for them, checking that no
+	// flush sneaks in while records are landing.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, flushes := w.snapshot()
+		if flushes != 0 {
+			t.Fatalf("flushes = %d before the interval elapsed and before Close", flushes)
+		}
+		if len(got) == 20 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/20 records appended - async appends must not wait for the flush interval", len(got))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, flushes := w.snapshot(); flushes != 1 {
+		t.Fatalf("flushes = %d after Close, want exactly 1 (the tail flush)", flushes)
+	}
+}
+
+// TestCommitLogAsyncTailIsFlushedWithoutMoreWrites: a lone record must not sit
+// unflushed forever waiting for another write to come along - the interval
+// timer alone has to get it to disk.
+func TestCommitLogAsyncTailIsFlushedWithoutMoreWrites(t *testing.T) {
+	w := &fakeSegmentWriter{}
+	c := newCommitLogWriter(w, storage.DurabilityAsync, 5*time.Millisecond)
+	defer c.Close()
+	if err := c.Enqueue(rec("lonely")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, flushes := w.snapshot(); flushes >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("record never flushed: the interval timer did not fire a tail flush")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestCommitLogAsyncFlushErrorLatches: async callers never see a flush error
+// directly (there is no ack to deliver it on), so the failure latch is the
+// only thing standing between a broken log and silently acknowledging writes
+// into it forever.
+func TestCommitLogAsyncFlushErrorLatches(t *testing.T) {
+	boom := errors.New("disk is gone")
+	w := &fakeSegmentWriter{flushErr: boom}
+	c := newCommitLogWriter(w, storage.DurabilityAsync, time.Millisecond)
+	if err := c.Enqueue(rec("doomed")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := c.Enqueue(rec("after")); errors.Is(err, boom) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("flush failure never latched")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := c.Close(); !errors.Is(err, boom) {
+		t.Fatalf("Close = %v, want the latched flush error", err)
+	}
 }

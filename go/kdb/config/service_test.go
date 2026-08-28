@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
 func noEnv(string) (string, bool) { return "", false }
@@ -203,6 +205,64 @@ func TestResolveServiceStorageTunables(t *testing.T) {
 		badComp := "gzip"
 		if _, err := ResolveService(&ServiceFile{Compression: &badComp}, noEnv, noFlags, ServiceSettings{}); err == nil {
 			t.Fatal("an unknown compression codec should fail resolution")
+		}
+	})
+}
+
+// TestResolveServiceSyncMode covers the sync-mode setting the same way: full by
+// default (an acknowledged sync survives power loss unless the operator chose
+// otherwise), resolvable through the file/env/flag chain, and validated at
+// startup.
+func TestResolveServiceSyncMode(t *testing.T) {
+	t.Run("defaults to full", func(t *testing.T) {
+		s, err := ResolveService(nil, noEnv, noFlags, ServiceSettings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.SyncMode != "full" {
+			t.Errorf("SyncMode = %q, want full", s.SyncMode)
+		}
+		if m, err := ParseSyncMode(s.SyncMode); err != nil || m != storio.SyncModeFull {
+			t.Errorf("ParseSyncMode(%q) = %v, %v; want SyncModeFull", s.SyncMode, m, err)
+		}
+	})
+
+	t.Run("resolution chain", func(t *testing.T) {
+		fileMode := "fast"
+		file := &ServiceFile{SyncMode: &fileMode}
+		s, err := ResolveService(file, noEnv, noFlags, ServiceSettings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.SyncMode != "fast" {
+			t.Errorf("SyncMode = %q, want fast (from file)", s.SyncMode)
+		}
+		s, err = ResolveService(file, envOf(map[string]string{"KDB_SYNC_MODE": "full"}), noFlags, ServiceSettings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.SyncMode != "full" {
+			t.Errorf("SyncMode = %q, want full (env overrides file)", s.SyncMode)
+		}
+		s, err = ResolveService(file, noEnv, flagsOf("sync-mode"), ServiceSettings{SyncMode: "fast"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.SyncMode != "fast" {
+			t.Errorf("SyncMode = %q, want fast (explicitly-set flag)", s.SyncMode)
+		}
+	})
+
+	t.Run("names", func(t *testing.T) {
+		if m, err := ParseSyncMode("barrier"); err != nil || m != storio.SyncModeFast {
+			t.Errorf("ParseSyncMode(barrier) = %v, %v; want SyncModeFast (alias)", m, err)
+		}
+		if _, err := ParseSyncMode("turbo"); err == nil {
+			t.Error("an unknown sync mode must fail")
+		}
+		bad := "turbo"
+		if _, err := ResolveService(&ServiceFile{SyncMode: &bad}, noEnv, noFlags, ServiceSettings{}); err == nil {
+			t.Fatal("an unknown sync mode should fail resolution at startup")
 		}
 	})
 }
