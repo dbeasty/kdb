@@ -6,6 +6,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
+	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
 // TestDurabilityModesEndToEnd exercises the whole newly-connected path -
@@ -21,16 +22,28 @@ func TestDurabilityModesEndToEnd(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		durability    storage.Durability
+		syncMode      storio.SyncMode
+		intervalMS    int64
 		wantPersisted bool
 	}{
-		{"sync", storage.DurabilitySync, true},
-		{"async survives a clean close", storage.DurabilityAsync, true},
-		{"memory-only keeps nothing", storage.DurabilityMemoryOnly, false},
+		{"sync", storage.DurabilitySync, storio.SyncModeFull, 0, true},
+		{"sync + fast sync mode", storage.DurabilitySync, storio.SyncModeFast, 0, true},
+		{"async survives a clean close", storage.DurabilityAsync, storio.SyncModeFull, 0, true},
+		{"async + fast sync mode + 100ms interval", storage.DurabilityAsync, storio.SyncModeFast, 100, true},
+		// An interval far longer than the test proves Close's drain-and-flush
+		// stands on its own - durability on a clean shutdown must never depend
+		// on the interval timer having happened to fire.
+		{"async hour-long interval still drains on close", storage.DurabilityAsync, storio.SyncModeFast, 3_600_000, true},
+		{"memory-only keeps nothing", storage.DurabilityMemoryOnly, storio.SyncModeFull, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dataDir := t.TempDir()
 			ns := "app/data"
-			opts := FileRuntimeOptions{Storage: StorageOptions{Durability: tc.durability}}
+			opts := FileRuntimeOptions{Storage: StorageOptions{
+				Durability:              tc.durability,
+				SyncMode:                tc.syncMode,
+				AsyncSyncIntervalMillis: tc.intervalMS,
+			}}
 
 			rt, err := OpenFileRuntimeWithOptions(dataDir, "app", ns, schema.None(), opts)
 			if err != nil {
