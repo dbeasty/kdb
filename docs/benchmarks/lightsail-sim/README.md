@@ -5,11 +5,13 @@ gap analysis identified (`docs/kdb-spec-layer12-component38-go-native-server.md`
 Docker resource limits, and drives sustained small-message read/write load against Component 38's
 Go-native `kdb-service` over its real wire protocol.
 
-**Status: the OOM this harness first surfaced is fixed and hardened against** (2026-08-25). See
-"The fix" below for the root causes and the resolution; "Original findings" is kept for the
-record of what was found and how. **This is still an approximation, not the real thing** —
-Component 38 spec §7 test 8 explicitly calls for running "on hardware/VM specs matching the
-proposed $7/mo tier, not a developer laptop":
+**Status: the OOM this harness first surfaced is fixed and hardened against** (2026-08-25;
+re-verified 2026-08-27 after group commit, and extended to file-backed mode). See "The fix" below
+for the root causes and the resolution, the 2026-08-27 update for the current sweep in both
+storage modes, and "Original findings" for the record of what was found and how.
+**This is still an approximation, not the real thing** — Component 38 spec §7 test 8 explicitly
+calls for running "on hardware/VM specs matching the proposed $7/mo tier, not a developer
+laptop":
 - This machine is Apple Silicon (arm64); real Lightsail instances are x86_64. Absolute throughput
   numbers are not directly comparable.
 - Local SSD/APFS I/O characteristics differ from Lightsail's underlying storage.
@@ -32,6 +34,10 @@ on actual Lightsail hardware before the "$7/mo tier" claim is something to bill 
   competing with the server for the same limited CPU/memory budget), samples `docker stats` every
   second during the run, and reports the container's exit status (including OOM-kill detection)
   and last-N log lines regardless of whether the server survived.
+- `mem-sweep.sh` — sweeps `--memory-limit-mb` across a list of percentages in both storage
+  modes (`--memory` and `--data-dir`), scoring each run on whether the kernel OOM-killed it.
+  `run.sh` cannot do this: it always passes `--memory` and takes no `--memory-limit-mb`. This is
+  what produced the 2026-08-27 table below.
 - `go/cmd/kdb-loadtest` (lives in the Go module proper, not here, since it needs to import
   `go/kdb/client`) — pre-populates a fixed pool of documents, then has every worker repeatedly
   `GetJSON`/`Upsert` a random document from that pool over real TCP connections
@@ -65,6 +71,23 @@ go run ./go/cmd/kdb-loadtest -addr 127.0.0.1:19090 -doc-pool 300 -concurrency 4 
 
 To exercise the memory-pressure hardening (see below), pass `--memory-limit-mb` to `kdb-service`
 when starting the container, e.g. `--memory-limit-mb 600` for a 1GB container.
+
+To sweep that setting rather than pick one, use `mem-sweep.sh`, which reproduces the
+2026-08-27 table below:
+
+```bash
+./docs/benchmarks/lightsail-sim/mem-sweep.sh
+```
+
+```bash
+MODES=file PERCENTS="60 80 90 95" DURATION=120s REPEATS=3 \
+  ./docs/benchmarks/lightsail-sim/mem-sweep.sh
+```
+
+Note that `MODES=mem` (the default `run.sh` behavior) exercises the memory guard against commit
+DAG growth but never touches the delta log or group commit; `MODES=file` is the one that commits
+through the real write path. The 2026-08-27 update explains why that distinction matters when
+reading any number in this file.
 
 ## The fix (2026-08-25)
 
@@ -245,8 +268,10 @@ in the component spec).
 
 ## Remaining follow-ups
 
-1. Re-run against **file-backed** (`--data-dir`) mode - the fixes above apply equally (same
-   `InMemoryCommitDag`/`DocumentTree` underneath), but not yet explicitly re-verified there.
+1. ~~Re-run against **file-backed** (`--data-dir`) mode~~ - **done 2026-08-27**, see the update
+   below. Worth reading before trusting the numbers above as general: the `--memory` mode every
+   table above uses never touches the delta log, so those rows measure the memory guard, not the
+   write path.
 2. `insertHex`'s O(n) slice-shift per commit (`go/kdb/dag/in_memory_commit_dag.go`, backing hash
    prefix lookup) is a real, still-unfixed O(n) *CPU* cost per commit - it did not show up as a
    significant *allocation* contributor in profiling (unlike the two fixes above), so it wasn't
@@ -260,6 +285,93 @@ in the component spec).
    Lightsail hardware before the cost claim is billable - this harness narrows what to expect and
    confirms the server can now run unattended under sustained load without a proper memory-limit
    configuration, but it doesn't replace that run.
+
+## Update (2026-08-27): re-verified after group commit, and a file-backed column
+
+Re-ran the sweep above against `e2bbc82` (which includes `456c673`'s encoder-allocation fix,
+`8fe306d`'s delta-log group commit, and `01d0654`'s storage-correctness follow-ups) to check
+whether the write-path work moved the safe ceiling.
+
+**It did not, and the reason is worth writing down: the sweep above never exercised the write
+path that changed.** `run.sh` starts the container with `--memory`, which builds the runtime from
+`NewInMemoryCommitDag` + `InMemoryStorageAdapter` (`go/kdb/embed/memory.go`). That path never
+reaches `PersistingCommitDAG`, the delta log, or the group committer at all. Every number in the
+2026-08-25 table is measuring the memory guard against unbounded DAG growth, not the write path.
+So the sweep is repeated below in both modes: `mem` for continuity with the recorded numbers, and
+`file` (`--data-dir`, no `--memory`) for the configuration that actually commits through the
+delta log.
+
+Same 2000-document pool / 16-way concurrency / 0.5 read ratio / 1GB / 2-vCPU container / 60s.
+Each row was run twice, on separately built images ~40 minutes apart; both values are shown where
+they differ.
+
+| mode | `--memory-limit-mb` (% of 1GB) | total ops | throughput | outcome | peak memory |
+|---|---:|---:|---:|---|---:|
+| mem | 819 (80%) | 1,050,595 / 1,034,494 | 17,510 / 17,242 ops/sec | **survived** | 92.6% / 90.0% |
+| mem | 922 (90%) | 147,356 / 142,596 | 2,456 / 2,377 ops/sec | **OOM-killed** (`exitCode=137`) | 88.7% / 98.3% (last sample before the kill) |
+| file | 819 (80%) | 949,546 / 1,044,982 | 15,826 / 17,416 ops/sec | **survived** | 86.1% / 83.6% |
+| file | 922 (90%) | 1,017,602 / 939,456 | 16,960 / 15,658 ops/sec | survived | 98.7% / 98.4% |
+
+**The `mem` rows reproduce the 2026-08-25 outcome.** 80% survives; 90% still OOM-kills, at
+2,377-2,456 ops/sec against the recorded 2,410 - the same ~7x-degraded throughput signature of
+dying early and staying dead. The boundary has not moved, which is the expected outcome given
+none of the write-path commits touch that code path. (Healthy-run throughput is ~14% below the
+recorded 20,067 ops/sec - 17,242-17,510 here - because this machine was not idle; the
+methodology note at the end of this section applies. The survive/die outcome is unaffected.)
+
+**The `file` rows are new, and 90% surviving there is not evidence of a raised ceiling.** Peak
+memory lands at 98.4-98.7% of the container - margin-of-noise from the real ceiling, not
+headroom. Three additional file-backed runs at 90% all survived but show how thin that margin is:
+
+| run | total ops | throughput | peak memory |
+|---:|---:|---:|---:|
+| 1 | 897,719 | 14,962 ops/sec | 95.9% |
+| 2 | 830,018 | 13,833 ops/sec | 91.4% |
+| 3 | 330,980 | 5,516 ops/sec | 99.4% |
+
+Run 3 lost ~63% of its throughput while sitting at 99.4%. That is the same pre-death shape the
+`mem` 90% rows show, caught just short of the kill. **The 60-80% recommendation above stands
+unchanged for both modes**; do not read the file-backed 90% rows as permission to configure
+above 80%.
+
+### Group commit is what makes the file-backed path able to reach pressure at all
+
+The same file-backed 90% configuration run against `29300d5` (the commit before the encoder fix
+and group commit) survives too - but for the opposite reason:
+
+| build | total ops | throughput | peak memory | why it survived |
+|---|---:|---:|---:|---|
+| `29300d5` (pre-group-commit) | 36,280 / 39,535 / 2,682 | 603 / 658 / 44 ops/sec | 39.0% / 41.2% / 7.1% | too slow to accumulate |
+| `e2bbc82` (current) | 897,719 / 830,018 / 330,980 | 14,962 / 13,833 / 5,516 ops/sec | 95.9% / 91.4% / 99.4% | guard held it |
+
+At one physical fsync per commit the old build manages ~600 ops/sec and never gets within 60% of
+the container limit in a 60-second window - there is no memory pressure to survive. Group commit
+raises file-backed throughput by roughly 20-25x, which is precisely what puts this configuration
+in contact with the memory ceiling for the first time. The write-path work did not weaken the guard; it made
+the file-backed path fast enough for the guard to matter.
+
+### Write-path benchmark re-verification
+
+`BenchmarkFileBackedUpsert` (`go/kdb/server/write_path_bench_test.go`), interleaved A/B against
+`8eaaf1d` (the write-path merge, before the storage-correctness follow-ups), 3 alternating rounds
+of `-benchtime=3s` on one machine, to confirm `01d0654` cost nothing on the write path:
+
+| parallelism | `e2bbc82` (current) | `8eaaf1d` (before follow-ups) |
+|---:|---|---|
+| 1 | 531 / 702 / 664 µs | 666 / 703 / 667 µs |
+| 8 | 83 / 109 / 97 µs | 130 / 101 / 101 µs |
+| 64 | 34.8 / 39.0 / 35.2 µs | 39.2 / 53.0 / 34.9 µs |
+
+Equivalent within run-to-run variance, and `192 allocs/op` / ~15KB `B/op` held in every single
+run on both builds. On an otherwise-idle machine the same benchmark reports 506 µs / 75 µs /
+34 µs, matching the figures in `docs/benchmarks/write-path-allocation-fix.md`.
+
+**Methodology note for whoever re-runs this.** These benchmarks are extremely sensitive to
+competing load. An early pass in this session, taken while an unrelated Go benchmark was running
+on the same machine (load average ~14), reported parallel-8 at 7-11 ms/op - a ~100x apparent
+regression that does not exist, and that briefly looked like a real finding. The inflated
+`B/op` (24-69KB against a true ~15KB) was the tell. Interleave the two builds in the same session
+and check `allocs/op` for stability before believing any ns/op delta here.
 
 ## Original findings (2026-08-25, before the fix above)
 

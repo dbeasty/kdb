@@ -174,18 +174,39 @@ To re-derive the original 21MB figure, revert `Compress` to constructing a
 
 ## Still open
 
-Deliberately not addressed here, all pre-existing:
+Deliberately not addressed by this work, all pre-existing.
 
-- `storage/memtable`'s `Delete` writes a `nil` tombstone but `Get` treats `nil`
+The first four items below were **closed by `01d0654`** ("Fix the storage-layer
+correctness issues left open by the write-path work"), which also fixed an
+`LsmBlobStore` data race and a `Manager.Flush` ordering bug found while doing
+them. They are kept here, struck through, so this document still reads as the
+record of what the write-path PR knowingly deferred:
+
+- ~~`storage/memtable`'s `Delete` writes a `nil` tombstone but `Get` treats `nil`
   as absent and falls through to the SSTable, so a delete does not shadow an
-  older entry. **Correctness bug.**
-- `SortedTable.SizeBytes` only ever increases; overwrites and deletes never
-  subtract, so the flush trigger's accounting drifts upward permanently.
-- WAL segment rotation never fires - `walMaxSegmentBytes` is stored but never
-  compared against `segmentSize`.
-- `index`'s `replayBuckets` rebuilds the whole index from the event log on every
-  lookup, calling `dag.IsAncestor` (itself a full ancestor-closure build) per
-  event. Read path, and byte-for-byte duplicated in two files.
+  older entry.~~ **Correctness bug.** Fixed: the table stores an explicit
+  `{value, deleted}` slot and exposes `Lookup`. The tombstone still does not
+  survive a flush - that needs an SSTable format change originating on the
+  Kotlin side.
+- ~~`SortedTable.SizeBytes` only ever increases; overwrites and deletes never
+  subtract, so the flush trigger's accounting drifts upward permanently.~~
+  Fixed: both `Put` and `Delete` net out against the previous slot.
+- ~~WAL segment rotation never fires - `walMaxSegmentBytes` is stored but never
+  compared against `segmentSize`.~~ Fixed: the WAL is now a chain of segments
+  that seals and rotates at the cap.
+- ~~`index`'s `replayBuckets` rebuilds the whole index from the event log on
+  every lookup, calling `dag.IsAncestor` (itself a full ancestor-closure build)
+  per event. Read path, and byte-for-byte duplicated in two files.~~ Fixed: both
+  copies replaced by a shared memoizing `eventLog`, walking the closure once per
+  replay via `dag.AncestorSet`.
+
+Confirmed not to have cost anything on the write path: an interleaved A/B of
+`BenchmarkFileBackedUpsert` across `01d0654` measures equivalent within
+run-to-run variance at every parallelism, with `192 allocs/op` held throughout.
+See `docs/benchmarks/lightsail-sim/README.md`'s 2026-08-27 update.
+
+Still genuinely open:
+
 - The write gate is still capacity-1. Its exclusive section no longer covers disk
   I/O, but making it genuinely concurrent needs per-transaction staging in
   `storage.Adapter` rather than `ServerEngine`'s single shared `pending` store -
