@@ -16,7 +16,7 @@ class VerifyTest {
             val commits = buildChain(3, ns)
             appendSegment(shim, ns, 0, rawFrame(commits[0]), rawFrame(commits[1]), rawFrame(commits[2]))
 
-            val report = verify(shim, ns, Options(Level.L2, CompressionCodec.NONE))
+            val report = verify(shim, ns, Options(Level.L2))
             assertTrue(report.isClean, "expected clean report, got ${report.findings}")
             assertEquals(1, report.segments.size)
             assertEquals(3, report.segments[0].frameCount)
@@ -31,7 +31,7 @@ class VerifyTest {
             appendSegment(shim, ns, 0, rawFrame(commits[0]), flippedFrame(commits[1]))
             appendSegment(shim, ns, 1, rawFrame(commits[2]))
 
-            val report = verify(shim, ns, Options(Level.L2, CompressionCodec.NONE))
+            val report = verify(shim, ns, Options(Level.L2))
             assertFalse(report.isClean)
             assertTrue(hasFinding(report, Classification.MID_LOG_CORRUPTION, 0), "expected mid_log_corruption at segment 0, got ${report.findings}")
             assertTrue(
@@ -51,7 +51,7 @@ class VerifyTest {
             // failed, not just outright truncation.
             appendSegment(shim, ns, 0, rawFrame(commits[0]), flippedFrame(commits[1]))
 
-            val report = verify(shim, ns, Options(Level.L1, CompressionCodec.NONE))
+            val report = verify(shim, ns, Options(Level.L1))
             assertEquals(1, report.findings.size)
             assertEquals(Classification.TORN_TAIL, report.findings[0].classification)
         }
@@ -66,7 +66,7 @@ class VerifyTest {
             val torn = rawFrame(commits[1]).copyOfRange(0, 5) // cut short: declared length no longer fits
             appendSegment(shim, ns, 0, full, torn)
 
-            val report = verify(shim, ns, Options(Level.L2, CompressionCodec.NONE))
+            val report = verify(shim, ns, Options(Level.L2))
             assertEquals(1, report.findings.size)
             val f = report.findings[0]
             assertEquals(Classification.TORN_TAIL, f.classification)
@@ -83,7 +83,7 @@ class VerifyTest {
             appendSegment(shim, ns, 0, rawFrame(commits[0]))
             appendSegment(shim, ns, 2, rawFrame(commits[1])) // sequence 1 is missing
 
-            val report = verify(shim, ns, Options(Level.L1, CompressionCodec.NONE))
+            val report = verify(shim, ns, Options(Level.L1))
             assertTrue(hasFinding(report, Classification.SEQUENCE_GAP, 2), "expected sequence_gap at segment 2, got ${report.findings}")
         }
 
@@ -97,7 +97,7 @@ class VerifyTest {
 
             val name = "ns/$ns/delta/00000000000000000000.seg"
             val before = shim.readFromSegment(name, 0, 1 shl 20)
-            verify(shim, ns, Options(Level.L2, CompressionCodec.NONE))
+            verify(shim, ns, Options(Level.L2))
             val after = shim.readFromSegment(name, 0, 1 shl 20)
             assertTrue(before.contentEquals(after), "verify must not mutate segment bytes")
         }

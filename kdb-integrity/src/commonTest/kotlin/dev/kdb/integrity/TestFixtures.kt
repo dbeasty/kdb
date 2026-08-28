@@ -48,14 +48,20 @@ internal fun buildChain(n: Int, ns: String): List<KdbCommit> {
  */
 internal fun rawFrame(c: KdbCommit): ByteArray {
     val payload = c.toPayloadBytes()
-    val out = ByteArray(16 + payload.size)
+    val out = ByteArray(RAW_FRAME_HEADER_SIZE + payload.size)
     out[0] = 0x4B; out[1] = 0x44; out[2] = 0x42; out[3] = 0x50
-    writeIntBe(out, 4, payload.size)
+    out[4] = 2 // PAGE_FORMAT_VERSION
+    out[5] = 0 // CODEC_NONE
+    out[6] = 0; out[7] = 0
     writeIntBe(out, 8, payload.size)
-    writeIntBe(out, 12, Crc32.of(payload))
-    payload.copyInto(out, 16)
+    writeIntBe(out, 12, payload.size)
+    writeIntBe(out, 16, Crc32.of(payload))
+    payload.copyInto(out, RAW_FRAME_HEADER_SIZE)
     return out
 }
+
+/** Mirrors DeltaPageCodec.FRAME_HEADER_SIZE, which is internal to kdb-storage-delta. */
+internal const val RAW_FRAME_HEADER_SIZE: Int = 20
 
 private fun writeIntBe(a: ByteArray, o: Int, v: Int) {
     a[o] = (v ushr 24).toByte(); a[o + 1] = (v ushr 16).toByte()
@@ -70,8 +76,12 @@ private fun writeIntBe(a: ByteArray, o: Int, v: Int) {
  */
 internal fun flippedFrame(c: KdbCommit): ByteArray {
     val f = rawFrame(c).copyOf()
-    check(f.size >= 20) { "frame too short to flip a body byte: ${f.size} bytes" }
-    f[19] = (f[19].toInt() xor 0xFF).toByte()
+    // Must land past the header: flipping a header byte would change the frame's
+    // declared length or codec instead of corrupting its body, which is a
+    // different failure than the one this fixture exists to produce.
+    val at = RAW_FRAME_HEADER_SIZE + 3
+    check(f.size > at) { "frame too short to flip a body byte: ${f.size} bytes" }
+    f[at] = (f[at].toInt() xor 0xFF).toByte()
     return f
 }
 

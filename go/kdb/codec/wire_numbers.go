@@ -4,19 +4,26 @@ import (
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 )
 
-func encodeLeb128U32(v uint32) []byte {
-	var out []byte
+// appendLeb128U32 writes v's varint encoding straight onto dst. Every record
+// field emits at least one varint (its field id), plus one per array/map length
+// and one per string, so returning a freshly-allocated slice per varint - which
+// encodeLeb128U32 does - put an allocation on each of them.
+func appendLeb128U32(dst []byte, v uint32) []byte {
 	cur := v
 	for {
 		chunk := byte(cur & 0x7F)
 		cur >>= 7
 		if cur == 0 {
-			out = append(out, chunk)
-			break
+			return append(dst, chunk)
 		}
-		out = append(out, chunk|0x80)
+		dst = append(dst, chunk|0x80)
 	}
-	return out
+}
+
+// encodeLeb128U32 is appendLeb128U32 for the few callers that genuinely want a
+// standalone slice. Prefer appendLeb128U32 on any encode path.
+func encodeLeb128U32(v uint32) []byte {
+	return appendLeb128U32(nil, v)
 }
 
 func readLeb128U64(raw []byte, pos *int) (uint64, error) {
@@ -90,9 +97,23 @@ func readLe16(b []byte) int16 {
 	return int16(uint16(b[0]) | uint16(b[1])<<8)
 }
 
+// appendLebBytes writes raw length-prefixed straight onto dst - one append
+// instead of lebPrefix's two allocations (the varint, then the joined result).
+func appendLebBytes(dst []byte, raw []byte) []byte {
+	dst = appendLeb128U32(dst, uint32(len(raw)))
+	return append(dst, raw...)
+}
+
+// appendLebString is appendLebBytes for a string, avoiding the []byte(s)
+// conversion's full copy - which, for a document body carried as a string, is a
+// copy of the entire document on every encode.
+func appendLebString(dst []byte, s string) []byte {
+	dst = appendLeb128U32(dst, uint32(len(s)))
+	return append(dst, s...)
+}
+
 func lebPrefix(raw []byte) []byte {
-	p := encodeLeb128U32(uint32(len(raw)))
-	return append(p, raw...)
+	return appendLebBytes(nil, raw)
 }
 
 func readLebBytes(c *cursor) ([]byte, error) {

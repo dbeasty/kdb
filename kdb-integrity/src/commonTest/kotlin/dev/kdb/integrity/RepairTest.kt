@@ -17,7 +17,7 @@ class RepairTest {
             val torn = rawFrame(commits[1]).copyOfRange(0, 10)
             appendSegment(shim, ns, 0, full, torn)
 
-            val opts = Options(Level.L1, CompressionCodec.NONE)
+            val opts = Options(Level.L1)
             val report = verify(shim, ns, opts)
             val result = repair(shim, report, opts)
             assertEquals(1, result.steps.size)
@@ -40,7 +40,7 @@ class RepairTest {
             val commits = buildChain(2, ns)
             appendSegment(shim, ns, 0, rawFrame(commits[0]), rawFrame(commits[1]).copyOfRange(0, 10))
 
-            val opts = Options(Level.L1, CompressionCodec.NONE)
+            val opts = Options(Level.L1)
             repair(shim, verify(shim, ns, opts), opts)
 
             val result2 = repair(shim, verify(shim, ns, opts), opts)
@@ -61,7 +61,7 @@ class RepairTest {
             appendSegment(shim, ns, 1, rawFrame(c1), flippedFrame(c1b))
             appendSegment(shim, ns, 2, rawFrame(c2))
 
-            val opts = Options(Level.L1, CompressionCodec.NONE)
+            val opts = Options(Level.L1)
             val report = verify(shim, ns, opts)
             assertTrue(hasFinding(report, Classification.MID_LOG_CORRUPTION, 1), "expected mid_log_corruption at segment 1, got ${report.findings}")
 
@@ -69,7 +69,7 @@ class RepairTest {
             assertEquals(1, result.steps.size)
             assertEquals(Action.REWROTE_SEGMENT_PREFIX, result.steps[0].action)
 
-            val report2 = verify(shim, ns, Options(Level.L2, CompressionCodec.NONE))
+            val report2 = verify(shim, ns, Options(Level.L2))
             assertTrue(report2.isClean, "expected clean report after safe repair, got ${report2.findings}")
         }
 
@@ -86,7 +86,7 @@ class RepairTest {
             appendSegment(shim, ns, 1, flippedFrame(c1))
             appendSegment(shim, ns, 2, rawFrame(c2))
 
-            val opts = Options(Level.L1, CompressionCodec.NONE)
+            val opts = Options(Level.L1)
             val report = verify(shim, ns, opts)
 
             val name = "ns/$ns/delta/00000000000000000001.seg"

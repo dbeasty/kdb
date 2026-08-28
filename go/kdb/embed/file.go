@@ -46,11 +46,17 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		return nil, err
 	}
 
+	compression := storage.CompressionZSTD
+	if opts.Storage.Compression != nil {
+		compression = *opts.Storage.Compression
+	}
 	cfg := storage.StorageEngineConfig{
 		GlobalMemoryBudgetBytes: 64 * 1024 * 1024,
-		CompressionCodec:        storage.CompressionZSTD,
+		CompressionCodec:        compression,
 		DefaultIndexRetention:   storage.IndexRetentionEvictable,
 		IOShim:                  io,
+		Durability:              opts.Storage.Durability,
+		AsyncSyncIntervalMillis: opts.Storage.AsyncSyncIntervalMillis,
 	}
 	handle, err := engine.DefaultFactory{EngineTarget: engine.TargetServer}.Open(namespaceID, cfg)
 	if err != nil {
@@ -83,8 +89,10 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		return nil, err
 	}
 	dagOut := dag.CommitDAG(d)
+	var persisting *PersistingCommitDAG
 	if w := handle.DeltaWriter(); w != nil {
-		dagOut = NewPersistingCommitDAG(d, w)
+		persisting = NewPersistingCommitDAGWithDurability(d, w, cfg.Durability)
+		dagOut = persisting
 	}
 
 	rt := &EmbeddedKdbRuntime{
@@ -108,6 +116,14 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	// the delta writer, sealed its segment, or reached ServerEngine.Close()'s final WAL sync.
 	rt.storageClose = func() error {
 		var firstErr error
+		// Drain the commit log first: under DurabilityAsync there can be
+		// records queued but not yet written, and sealing the segment out from
+		// under them would drop acknowledged commits on a clean shutdown.
+		if persisting != nil {
+			if err := persisting.Close(); err != nil {
+				firstErr = err
+			}
+		}
 		if w := handle.DeltaWriter(); w != nil {
 			if err := w.Flush(); err != nil && firstErr == nil {
 				firstErr = err

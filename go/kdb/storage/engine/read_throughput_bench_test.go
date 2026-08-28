@@ -29,6 +29,7 @@ func BenchmarkReadBlobConcurrent(b *testing.B) {
 			}
 
 			b.SetParallelism(parallelism)
+			b.ReportAllocs()
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				i := 0
@@ -66,6 +67,7 @@ func BenchmarkGetDocumentConcurrent(b *testing.B) {
 			}
 
 			b.SetParallelism(parallelism)
+			b.ReportAllocs()
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				i := 0

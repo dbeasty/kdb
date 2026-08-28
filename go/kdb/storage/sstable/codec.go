@@ -21,10 +21,33 @@ const footerMagic = 0x4B444253
 // start) using only its fixed offset from the end of the file. See buildFooter's doc comment.
 const footerTrailerSize = 4
 
+// SSTable block header, v2:
+//
+//	 0      version   u8  (= blockFormatVersion)
+//	 1      codec     u8  (blockCodecNone | blockCodecZSTD)
+//	 2..3   reserved  u16 (zero)
+//	 4..7   compressed length   u32 (big-endian, body only)
+//	 8..11  uncompressed length u32 (big-endian)
+//	12..15  crc32 of body       u32 (big-endian)
+//
+// v1 was 12 bytes with no codec, and decodeBlock inferred "was this compressed?"
+// from compSize == uncompSize - which is wrong for any payload whose compressed
+// form happens to be exactly its original size, and gave no way to change the
+// configured codec without making existing files unreadable.
+const (
+	blockHeaderSize    = 16
+	blockFormatVersion = 2
+
+	blockCodecNone byte = 0
+	blockCodecZSTD byte = 1
+)
+
 func encodeBlock(payload []byte, compress bool) ([]byte, error) {
 	var body []byte
 	var err error
+	id := blockCodecNone
 	if compress {
+		id = blockCodecZSTD
 		body, err = compression.Compress(payload, 3)
 		if err != nil {
 			return nil, err
@@ -32,11 +55,14 @@ func encodeBlock(payload []byte, compress bool) ([]byte, error) {
 	} else {
 		body = payload
 	}
-	out := make([]byte, 12+len(body))
-	writeInt(out, 0, len(body))
-	writeInt(out, 4, len(payload))
-	writeInt(out, 8, int(compression.CRC32All(body)))
-	copy(out[12:], body)
+	out := make([]byte, blockHeaderSize+len(body))
+	out[0] = blockFormatVersion
+	out[1] = id
+	out[2], out[3] = 0, 0
+	writeInt(out, 4, len(body))
+	writeInt(out, 8, len(payload))
+	writeInt(out, 12, int(compression.CRC32All(body)))
+	copy(out[blockHeaderSize:], body)
 	return out, nil
 }
 
@@ -44,22 +70,31 @@ func encodeBlock(payload []byte, compress bool) ([]byte, error) {
 // previously ignored entirely (kdb-finish-up-plan.md's 1-G1), so a corrupted or truncated block
 // was silently decompressed (or returned as-is) instead of failing loudly.
 func decodeBlock(block []byte) ([]byte, error) {
-	if len(block) < 12 {
-		return nil, kdberr.NewDecodeError("sstable block shorter than its 12-byte header", 0, nil)
+	if len(block) < blockHeaderSize {
+		return nil, kdberr.NewDecodeError(
+			fmt.Sprintf("sstable block shorter than its %d-byte header", blockHeaderSize), 0, nil)
 	}
-	compSize := readInt(block, 0)
-	uncompSize := readInt(block, 4)
-	wantCRC := uint32(readInt(block, 8))
-	body := block[12:]
+	if v := block[0]; v != blockFormatVersion {
+		return nil, kdberr.NewDecodeError(
+			fmt.Sprintf("unsupported sstable block version %d (this build writes and reads v%d)", v, blockFormatVersion), 0, nil)
+	}
+	uncompSize := readInt(block, 8)
+	wantCRC := uint32(readInt(block, 12))
+	body := block[blockHeaderSize:]
 	if gotCRC := compression.CRC32All(body); gotCRC != wantCRC {
 		return nil, kdberr.NewDecodeError(
 			fmt.Sprintf("sstable block CRC mismatch: block is corrupt (want %08x, got %08x)", wantCRC, gotCRC),
 			0, nil)
 	}
-	if compSize == uncompSize {
+	switch block[1] {
+	case blockCodecNone:
 		return append([]byte(nil), body...), nil
+	case blockCodecZSTD:
+		return compression.Decompress(body, uncompSize)
+	default:
+		return nil, kdberr.NewDecodeError(
+			fmt.Sprintf("unknown sstable block codec id %d", block[1]), 0, nil)
 	}
-	return compression.Decompress(body, uncompSize+1024)
 }
 
 // buildFooter lays out magic(4) indexLen(4) indexBytes(indexLen) fileHash(32), then appends a
@@ -157,12 +192,13 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		if err != nil {
 			return Handle{}, err
 		}
-		// CompressedSize is the compressed body's own length - excluding encodeBlock's 12-byte
+		// CompressedSize is the compressed body's own length - excluding encodeBlock's
 		// header (compSize/uncompSize/crc) - matching what Get() expects when it later reads
-		// bh.CompressedSize+12 bytes starting at Offset. This used to store len(block) (the full
-		// 12+body length) instead, over-reading 12 bytes into whatever followed - the next block,
+		// bh.CompressedSize+blockHeaderSize bytes starting at Offset. This used to store
+		// len(block) (the full header+body length) instead, over-reading a header's worth of
+		// bytes into whatever followed - the next block,
 		// or the footer for the last one - on every single Get().
-		blocks[e.key] = BlockHandle{Offset: offset, CompressedSize: len(block) - 12}
+		blocks[e.key] = BlockHandle{Offset: offset, CompressedSize: len(block) - blockHeaderSize}
 		offset = newSize
 	}
 	var concat []byte
@@ -224,7 +260,7 @@ func (r *DefaultReader) Get(key codec.Hash) ([]byte, error) {
 	if !ok {
 		return nil, nil
 	}
-	block, err := r.io.ReadFromSegment(r.handle.SegmentName, bh.Offset, bh.CompressedSize+12)
+	block, err := r.io.ReadFromSegment(r.handle.SegmentName, bh.Offset, bh.CompressedSize+blockHeaderSize)
 	if err != nil {
 		return nil, err
 	}

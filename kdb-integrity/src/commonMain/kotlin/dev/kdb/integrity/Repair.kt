@@ -93,7 +93,7 @@ private suspend fun repairMidLogCorruption(shim: PlatformIoShim, namespaceId: St
     val allCommits = mutableSetOf<String>()
     var prefixCount = 0
     for (seq in seqs) {
-        val ss = readAndScanSegment(shim, namespaceId, seq, opts.compression)
+        val ss = readAndScanSegment(shim, namespaceId, seq)
         if (seq == f.segment) {
             goodPrefixLen = f.offset
             for (c in ss.commits) {
@@ -112,7 +112,7 @@ private suspend fun repairMidLogCorruption(shim: PlatformIoShim, namespaceId: St
     val missing = mutableListOf<String>()
     for (seq in seqs) {
         if (seq <= f.segment) continue
-        val ss = readAndScanSegment(shim, namespaceId, seq, opts.compression)
+        val ss = readAndScanSegment(shim, namespaceId, seq)
         for (c in ss.commits) {
             for (p in c.commit.parentHashes) {
                 if (p == genesis) continue // never persisted, by design - see genesisCommitHash

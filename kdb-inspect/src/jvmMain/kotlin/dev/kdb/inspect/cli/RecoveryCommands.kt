@@ -73,14 +73,13 @@ private fun Report.toDto(): ReportDto =
 
 internal fun verifyCmd(args: List<String>) =
     runBlocking {
-        val dataDir = argValue(args, "--data-dir") ?: error("usage: inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--codec zstd|none] [--json]")
+        val dataDir = argValue(args, "--data-dir") ?: error("usage: inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--json]")
         val namespace = argValue(args, "--namespace") ?: error("--namespace required")
-        val compression = parseCompression(argValue(args, "--codec"))
         val level = parseLevel(argValue(args, "--level"))
         val asJson = args.contains("--json")
 
         val shim = openDirShim(dataDir)
-        val report = verify(shim, namespace, Options(level, compression))
+        val report = verify(shim, namespace, Options(level))
 
         if (asJson) {
             println(json.encodeToString(report.toDto()))
@@ -107,13 +106,12 @@ private fun printReport(report: Report) {
 
 internal fun repairSegmentsCmd(args: List<String>) =
     runBlocking {
-        val dataDir = argValue(args, "--data-dir") ?: error("usage: inspect repair-segments --data-dir DIR --namespace NS [--codec zstd|none] [--dry-run]")
+        val dataDir = argValue(args, "--data-dir") ?: error("usage: inspect repair-segments --data-dir DIR --namespace NS [--dry-run]")
         val namespace = argValue(args, "--namespace") ?: error("--namespace required")
-        val compression = parseCompression(argValue(args, "--codec"))
         val dryRun = args.contains("--dry-run")
 
         val shim = openDirShim(dataDir)
-        val opts = Options(Level.L1, compression)
+        val opts = Options(Level.L1)
         val report = verify(shim, namespace, opts)
         if (report.isClean) {
             println("clean: no repair needed")

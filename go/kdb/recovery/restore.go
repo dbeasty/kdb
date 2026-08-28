@@ -51,11 +51,13 @@ type Result struct {
 // Result.MissingHashes instead of being applied out of dependency order,
 // which is the same "erroring only if a genuine parent is missing" rule
 // kdb-spec-layer13 Component 47 §4.2 already uses for ordinary replay.
+// comp selects the codec the restored segments are *written* with; sources are
+// read using whatever codec each frame records (see delta.PageCodec).
 func HybridRestore(sources []Source, namespaceID string, comp storage.CompressionCodec, out storage.PlatformIOShim) (*Result, error) {
 	union := make(map[string]document.Commit)
 	var used []string
 	for _, src := range sources {
-		commits, err := integrity.ScanVerifiedCommits(src.Shim, namespaceID, comp)
+		commits, err := integrity.ScanVerifiedCommits(src.Shim, namespaceID)
 		if err != nil {
 			return nil, fmt.Errorf("scanning restore source %q: %w", src.Label, err)
 		}

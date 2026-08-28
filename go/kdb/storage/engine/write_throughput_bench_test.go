@@ -55,6 +55,7 @@ func BenchmarkWriteBlobConcurrent_DiskWAL(b *testing.B) {
 			e := newDiskBackedServerEngine(b)
 			metrics.Default.Reset()
 			b.SetParallelism(parallelism)
+			b.ReportAllocs()
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				payload := make([]byte, 128)

@@ -16,31 +16,62 @@ internal object SsTableCodec {
     // exists at all.
     const val FOOTER_TRAILER_SIZE: Int = 4
 
+    // SSTable block header, v2 - must stay byte-identical to Go's
+    // go/kdb/storage/sstable/codec.go:
+    //
+    //   0      version   u8  (= BLOCK_FORMAT_VERSION)
+    //   1      codec     u8  (BLOCK_CODEC_NONE | BLOCK_CODEC_ZSTD)
+    //   2..3   reserved  u16 (zero)
+    //   4..7   compressed length   u32 (big-endian, body only)
+    //   8..11  uncompressed length u32 (big-endian)
+    //  12..15  crc32 of body       u32 (big-endian)
+    //
+    // v1 was 12 bytes with no codec, and decodeBlock inferred "was this compressed?" from
+    // compSize == uncompSize - wrong for any payload whose compressed form happens to be exactly
+    // its original size, and no way to change the configured codec without orphaning old files.
+    const val BLOCK_HEADER_SIZE: Int = 16
+    const val BLOCK_FORMAT_VERSION: Byte = 2
+    const val BLOCK_CODEC_NONE: Byte = 0
+    const val BLOCK_CODEC_ZSTD: Byte = 1
+
     fun encodeBlock(payload: ByteArray, compress: Boolean): ByteArray {
+        val id = if (compress) BLOCK_CODEC_ZSTD else BLOCK_CODEC_NONE
         val body = if (compress) ZstdCompression.compress(payload) else payload
-        val out = ByteArray(12 + body.size)
-        writeInt(out, 0, body.size)
-        writeInt(out, 4, payload.size)
-        writeInt(out, 8, Crc32.of(body))
-        body.copyInto(out, 12)
+        val out = ByteArray(BLOCK_HEADER_SIZE + body.size)
+        out[0] = BLOCK_FORMAT_VERSION
+        out[1] = id
+        out[2] = 0; out[3] = 0
+        writeInt(out, 4, body.size)
+        writeInt(out, 8, payload.size)
+        writeInt(out, 12, Crc32.of(body))
+        body.copyInto(out, BLOCK_HEADER_SIZE)
         return out
     }
 
-    // decodeBlock verifies body against the CRC32 encodeBlock always wrote at offset 8 before
-    // decoding it - previously ignored entirely (kdb-finish-up-plan.md's 1-K1), so a corrupted or
-    // truncated block was silently decompressed (or returned as-is) instead of failing loudly.
+    // decodeBlock verifies body against the CRC32 encodeBlock always wrote before decoding it -
+    // previously ignored entirely (kdb-finish-up-plan.md's 1-K1), so a corrupted or truncated
+    // block was silently decompressed (or returned as-is) instead of failing loudly.
     fun decodeBlock(block: ByteArray): ByteArray {
-        require(block.size >= 12) { "sstable block shorter than its 12-byte header" }
-        val compSize = readInt(block, 0)
-        val uncompSize = readInt(block, 4)
-        val wantCrc = readInt(block, 8)
-        val body = block.copyOfRange(12, block.size)
+        require(block.size >= BLOCK_HEADER_SIZE) {
+            "sstable block shorter than its $BLOCK_HEADER_SIZE-byte header"
+        }
+        val version = block[0]
+        require(version == BLOCK_FORMAT_VERSION) {
+            "unsupported sstable block version $version (this build writes and reads v$BLOCK_FORMAT_VERSION)"
+        }
+        val uncompSize = readInt(block, 8)
+        val wantCrc = readInt(block, 12)
+        val body = block.copyOfRange(BLOCK_HEADER_SIZE, block.size)
         val gotCrc = Crc32.of(body)
         check(gotCrc == wantCrc) {
             "sstable block CRC mismatch: block is corrupt (want ${wantCrc.toUInt().toString(16)}, " +
                 "got ${gotCrc.toUInt().toString(16)})"
         }
-        return if (compSize == uncompSize) body else ZstdCompression.decompress(body, uncompSize + 1024)
+        return when (block[1]) {
+            BLOCK_CODEC_NONE -> body
+            BLOCK_CODEC_ZSTD -> ZstdCompression.decompress(body, uncompSize)
+            else -> throw IllegalArgumentException("unknown sstable block codec id ${block[1]}")
+        }
     }
 
     // Layout: magic(4) indexLen(4) indexBytes(indexLen) fileHash(32), then a fixed
@@ -115,11 +146,11 @@ public class DefaultSsTableWriter(
             val block = SsTableCodec.encodeBlock(v, compress = true)
             ioShim.appendToSegment(segmentName, block)
             // compressedSize is the compressed body's own length - excluding encodeBlock's
-            // 12-byte header (compSize/uncompSize/crc) - matching what get() expects when it
-            // later reads bh.compressedSize+12 bytes starting at offset. This used to store
-            // block.size (the full 12+body length) instead, over-reading 12 bytes into whatever
-            // followed - the next block, or the footer for the last one - on every get().
-            blocks[k] = BlockHandle(offset, block.size - 12, v.size)
+            // header - matching what get() expects when it later reads
+            // bh.compressedSize+BLOCK_HEADER_SIZE bytes starting at offset. This used to store
+            // block.size (the full header+body length) instead, over-reading a header's worth of
+            // bytes into whatever followed - the next block, or the footer for the last one.
+            blocks[k] = BlockHandle(offset, block.size - SsTableCodec.BLOCK_HEADER_SIZE, v.size)
             offset += block.size
         }
         val concat =
@@ -154,7 +185,7 @@ public class DefaultSsTableReader(
         val footer = ioShim.readFromSegment(handle.segmentName, footerStart, bodyLen)
         val index = SsTableCodec.parseFooter(footer)
         val bh = index[key] ?: return null
-        val block = ioShim.readFromSegment(handle.segmentName, bh.offset, bh.compressedSize + 12)
+        val block = ioShim.readFromSegment(handle.segmentName, bh.offset, bh.compressedSize + SsTableCodec.BLOCK_HEADER_SIZE)
         return SsTableCodec.decodeBlock(block)
     }
 

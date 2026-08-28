@@ -42,6 +42,7 @@ func BenchmarkCommitConcurrent_DisjointDocs(b *testing.B) {
 			metrics.Default.Reset()
 			var counter int64
 			b.SetParallelism(parallelism)
+			b.ReportAllocs()
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
@@ -123,6 +124,7 @@ func BenchmarkCommitScalingWithHistorySize(b *testing.B) {
 				head = success.Commit.Hash
 			}
 
+			b.ReportAllocs()
 			b.ResetTimer()
 			for n := 0; n < b.N; n++ {
 				docID := mustUUID()

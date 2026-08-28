@@ -11,10 +11,28 @@ import (
 type PersistingCommitDAG struct {
 	delegate *dag.InMemoryCommitDag
 	writer   storage.DeltaSegmentWriter
+	log      *commitLogWriter
 }
 
+// NewPersistingCommitDAG persists commits with DurabilitySync - every Persist
+// returns only once the commit is fsynced. See NewPersistingCommitDAGWithDurability
+// for the other modes.
 func NewPersistingCommitDAG(delegate *dag.InMemoryCommitDag, writer storage.DeltaSegmentWriter) *PersistingCommitDAG {
-	return &PersistingCommitDAG{delegate: delegate, writer: writer}
+	return NewPersistingCommitDAGWithDurability(delegate, writer, storage.DurabilitySync)
+}
+
+// NewPersistingCommitDAGWithDurability chooses how much of the write-out a
+// Persist call waits for - see commitLogWriter.Enqueue and storage.Durability.
+func NewPersistingCommitDAGWithDurability(
+	delegate *dag.InMemoryCommitDag,
+	writer storage.DeltaSegmentWriter,
+	durability storage.Durability,
+) *PersistingCommitDAG {
+	d := &PersistingCommitDAG{delegate: delegate, writer: writer}
+	if writer != nil && durability != storage.DurabilityMemoryOnly {
+		d.log = newCommitLogWriter(writer, durability)
+	}
+	return d
 }
 
 func (d *PersistingCommitDAG) GetCommit(hash codec.Hash) (document.Commit, bool) {
@@ -77,14 +95,30 @@ func (d *PersistingCommitDAG) AppendCommit(
 // and therefore this persistence - entirely unless the caller invokes Persist itself afterward
 // (see KdbServerRuntime.commitWith in go/kdb/server).
 func (d *PersistingCommitDAG) Persist(c document.Commit) error {
-	if d.writer == nil {
-		return nil
-	}
-	payload, err := c.ToPayloadBytes()
+	wait, err := d.PersistAsync(c)
 	if err != nil {
 		return err
 	}
-	if _, err := d.writer.Append(storage.DeltaRecord{
+	return wait()
+}
+
+// PersistAsync queues c for the delta log and returns a func that waits for it
+// to be durable. Callers that hold a lock fixing commit order (server's
+// writeGate) should queue under it and release before calling wait, so the next
+// commit's work overlaps this one's disk write and the two share an fsync.
+//
+// Framing, compression, the segment write and the fsync all happen on the log
+// writer's own goroutine either way - see commitLogWriter.
+func (d *PersistingCommitDAG) PersistAsync(c document.Commit) (wait func() error, err error) {
+	// No writer at all, or DurabilityMemoryOnly: nothing is written down.
+	if d.log == nil {
+		return func() error { return nil }, nil
+	}
+	payload, err := c.ToPayloadBytes()
+	if err != nil {
+		return nil, err
+	}
+	return d.log.EnqueueAsync(storage.DeltaRecord{
 		CommitHash:  c.Hash,
 		NamespaceID: c.NamespaceID,
 		Authorship: storage.DeltaAuthorshipEnvelope{
@@ -94,10 +128,16 @@ func (d *PersistingCommitDAG) Persist(c document.Commit) error {
 			ClientContext: "",
 		},
 		CommitPayload: payload,
-	}); err != nil {
-		return err
+	})
+}
+
+// Close drains and flushes everything still queued, then stops the log writer.
+// Must run before the underlying segment writer is sealed or closed.
+func (d *PersistingCommitDAG) Close() error {
+	if d.log == nil {
+		return nil
 	}
-	return d.writer.Flush()
+	return d.log.Close()
 }
 
 // Delegate returns the concrete in-memory DAG this wrapper persists on top of - for callers that

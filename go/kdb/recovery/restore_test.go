@@ -87,7 +87,7 @@ func TestRestoreFromBackupOnlyRebuildsCleanly(t *testing.T) {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 
-	restored, err := integrity.ScanVerifiedCommits(out, ns, storage.CompressionNone)
+	restored, err := integrity.ScanVerifiedCommits(out, ns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestHybridRestoreLocalAheadOfBackup(t *testing.T) {
 		t.Fatalf("expected no missing hashes, got %v", result.MissingHashes)
 	}
 
-	restored, err := integrity.ScanVerifiedCommits(out, ns, storage.CompressionNone)
+	restored, err := integrity.ScanVerifiedCommits(out, ns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestRestoreNeverTrustsUnverifiedLocalFrames(t *testing.T) {
 	if result.AppliedCount != 1 {
 		t.Fatalf("expected only the verified commit c0 to be restored, got %+v", result)
 	}
-	restored, err := integrity.ScanVerifiedCommits(out, ns, storage.CompressionNone)
+	restored, err := integrity.ScanVerifiedCommits(out, ns)
 	if err != nil {
 		t.Fatal(err)
 	}

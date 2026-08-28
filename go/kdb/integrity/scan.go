@@ -16,8 +16,8 @@ func ListSequencedSegments(shim storage.PlatformIOShim, namespaceID string) ([]i
 // byte up to the end of the last frame that scanned clean, never the tail past it (which may be
 // a torn in-progress write - kdb-spec-layer15 Component 60 §6.5 test 4). Also returns how many
 // commits that prefix holds.
-func VerifiedSegmentPrefix(shim storage.PlatformIOShim, namespaceID string, seq int64, comp storage.CompressionCodec) ([]byte, int, error) {
-	ss, err := readAndScanSegment(shim, namespaceID, seq, comp)
+func VerifiedSegmentPrefix(shim storage.PlatformIOShim, namespaceID string, seq int64) ([]byte, int, error) {
+	ss, err := readAndScanSegment(shim, namespaceID, seq)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -30,14 +30,14 @@ func VerifiedSegmentPrefix(shim storage.PlatformIOShim, namespaceID string, seq 
 // segment are excluded from that segment's contribution - restore (see
 // package recovery) uses this so a source with any unrepaired corruption
 // still contributes everything it safely can, and nothing it can't.
-func ScanVerifiedCommits(shim storage.PlatformIOShim, namespaceID string, comp storage.CompressionCodec) (map[string]document.Commit, error) {
+func ScanVerifiedCommits(shim storage.PlatformIOShim, namespaceID string) (map[string]document.Commit, error) {
 	seqs, err := listSequencedSegments(shim, namespaceID)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]document.Commit)
 	for _, seq := range seqs {
-		ss, err := readAndScanSegment(shim, namespaceID, seq, comp)
+		ss, err := readAndScanSegment(shim, namespaceID, seq)
 		if err != nil {
 			return nil, err
 		}

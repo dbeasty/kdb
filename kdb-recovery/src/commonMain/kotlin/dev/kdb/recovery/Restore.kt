@@ -67,7 +67,7 @@ public suspend fun hybridRestore(
     val union = mutableMapOf<String, KdbCommit>()
     val used = mutableListOf<String>()
     for (src in sources) {
-        val commits = scanVerifiedCommits(src.shim, namespaceId, compression)
+        val commits = scanVerifiedCommits(src.shim, namespaceId)
         if (commits.isNotEmpty()) used += src.label
         for ((hex, c) in commits) {
             if (!union.containsKey(hex)) union[hex] = c

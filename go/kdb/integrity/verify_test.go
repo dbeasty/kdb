@@ -2,8 +2,6 @@ package integrity
 
 import (
 	"testing"
-
-	"github.com/limidus/kdb/go/kdb/storage"
 )
 
 func TestVerifyCleanLogPassesAllLevels(t *testing.T) {
@@ -12,7 +10,7 @@ func TestVerifyCleanLogPassesAllLevels(t *testing.T) {
 	commits := buildChain(t, 3, ns)
 	appendSegment(t, shim, ns, 0, rawFrame(t, commits[0]), rawFrame(t, commits[1]), rawFrame(t, commits[2]))
 
-	report, err := Verify(shim, ns, Options{Level: L2, Compression: storage.CompressionNone})
+	report, err := Verify(shim, ns, Options{Level: L2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +29,7 @@ func TestVerifyDetectsMidLogCorruption(t *testing.T) {
 	appendSegment(t, shim, ns, 0, rawFrame(t, commits[0]), flippedFrame(t, commits[1]))
 	appendSegment(t, shim, ns, 1, rawFrame(t, commits[2]))
 
-	report, err := Verify(shim, ns, Options{Level: L2, Compression: storage.CompressionNone})
+	report, err := Verify(shim, ns, Options{Level: L2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +53,7 @@ func TestVerifyCrcMismatchOnLastSegmentIsTornTail(t *testing.T) {
 	// regardless of *why* the CRC failed, not just outright truncation.
 	appendSegment(t, shim, ns, 0, rawFrame(t, commits[0]), flippedFrame(t, commits[1]))
 
-	report, err := Verify(shim, ns, Options{Level: L1, Compression: storage.CompressionNone})
+	report, err := Verify(shim, ns, Options{Level: L1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +71,7 @@ func TestVerifyDetectsTornTail(t *testing.T) {
 	torn = torn[:len(torn)-5] // cut short: declared length no longer fits
 	appendSegment(t, shim, ns, 0, full, torn)
 
-	report, err := Verify(shim, ns, Options{Level: L2, Compression: storage.CompressionNone})
+	report, err := Verify(shim, ns, Options{Level: L2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +94,7 @@ func TestVerifyDetectsSequenceGap(t *testing.T) {
 	appendSegment(t, shim, ns, 0, rawFrame(t, commits[0]))
 	appendSegment(t, shim, ns, 2, rawFrame(t, commits[1])) // sequence 1 is missing
 
-	report, err := Verify(shim, ns, Options{Level: L1, Compression: storage.CompressionNone})
+	report, err := Verify(shim, ns, Options{Level: L1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +113,7 @@ func TestVerifyNeverMutatesOnDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Verify(shim, ns, Options{Level: L2, Compression: storage.CompressionNone}); err != nil {
+	if _, err := Verify(shim, ns, Options{Level: L2}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := shim.ReadFromSegment("ns/"+ns+"/delta/00000000000000000000.seg", 0, 1<<20)

@@ -75,7 +75,7 @@ func activePrefixKey(namespaceID, backupID string, seq int64) string {
 // incremental backup: segments already named (same sequence, same hash, full - not prefix) by
 // the base manifest are referenced, not re-uploaded. Returns the new manifest (already
 // uploaded, last).
-func Create(shim storage.PlatformIOShim, namespaceID string, comp storage.CompressionCodec, store ObjectStore, baseBackupID string) (*Manifest, error) {
+func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, baseBackupID string) (*Manifest, error) {
 	ctx := context.Background()
 	seqs, err := integrity.ListSequencedSegments(shim, namespaceID)
 	if err != nil {
@@ -124,11 +124,11 @@ func Create(shim storage.PlatformIOShim, namespaceID string, comp storage.Compre
 	allCommits := map[string]document.Commit{}
 	for i, seq := range seqs {
 		activeCandidate := i == len(seqs)-1
-		prefix, _, err := integrity.VerifiedSegmentPrefix(shim, namespaceID, seq, comp)
+		prefix, _, err := integrity.VerifiedSegmentPrefix(shim, namespaceID, seq)
 		if err != nil {
 			return nil, fmt.Errorf("backup: segment %d: %w", seq, err)
 		}
-		commits, err := commitsIn(prefix, comp)
+		commits, err := commitsIn(prefix)
 		if err != nil {
 			return nil, fmt.Errorf("backup: segment %d: %w", seq, err)
 		}
@@ -289,12 +289,12 @@ func ListBackups(store ObjectStore, namespaceID string) ([]string, error) {
 }
 
 // commitsIn scans a verified segment prefix's frames into commits keyed by hex hash.
-func commitsIn(prefix []byte, comp storage.CompressionCodec) (map[string]document.Commit, error) {
+func commitsIn(prefix []byte) (map[string]document.Commit, error) {
 	out := map[string]document.Commit{}
 	if len(prefix) == 0 {
 		return out, nil
 	}
-	scanned, err := scanSegmentBytes(prefix, comp)
+	scanned, err := scanSegmentBytes(prefix)
 	if err != nil {
 		return nil, err
 	}
