@@ -6,6 +6,10 @@ real low-memory **and** low-CPU Docker resource limits, over the real wire proto
 (`go/kdb/client`). Complements `docs/benchmarks/lightsail-sim`, which measures throughput; this
 harness checks *behavior under pressure*, not throughput.
 
+**Last verified 2026-08-27** against `e2bbc82` (post-group-commit): all three scenarios pass.
+Scenario 1 reported `recovered=false` on that run — expected and deliberately not asserted, see
+the comment in `run.sh` for why that ratio is workload- and hardware-dependent.
+
 ## What's here
 
 - `Dockerfile` — same build as `lightsail-sim`'s, reused rather than duplicated.
