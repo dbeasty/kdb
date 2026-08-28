@@ -85,7 +85,12 @@ func (a *AdminServer) Close() error { return a.httpSrv.Close() }
 
 func (a *AdminServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprintf(w, "ok\nversion=%s\n", version.Version)
+	// key=value lines, one per line, so operators and scrapers can pin a live process to the
+	// exact source it was built from without shelling into the container. commit is the full
+	// SHA deliberately - the short form is for humans reading a banner, not for lookups.
+	b := version.Get()
+	fmt.Fprintf(w, "ok\nversion=%s\ncommit=%s\ncommit_dirty=%t\nbuild_date=%s\n",
+		b.Version, b.Commit, b.Dirty, b.BuildDate)
 }
 
 func (a *AdminServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
@@ -112,6 +117,15 @@ func (a *AdminServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 func (a *AdminServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	var b strings.Builder
+
+	// The standard build-info pattern: a constant 1 whose labels carry the identity, so a
+	// dashboard or alert can group by the commit a series came from and a rollout shows up as
+	// two label sets rather than an unexplained step in some other metric.
+	bi := version.Get()
+	b.WriteString("# HELP kdb_build_info Build identity of the running binary; always 1.\n")
+	b.WriteString("# TYPE kdb_build_info gauge\n")
+	fmt.Fprintf(&b, "kdb_build_info{version=%q,commit=%q,dirty=\"%t\",build_date=%q,go_version=%q} 1\n",
+		bi.Version, bi.Commit, bi.Dirty, bi.BuildDate, bi.GoVersion)
 
 	snaps := metrics.Default.Snapshot()
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Stage < snaps[j].Stage })

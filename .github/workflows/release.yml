@@ -4,7 +4,9 @@
 # Cut a release with:
 #   git tag v0.1.0 && git push origin v0.1.0
 # The tag (minus the leading "v") becomes the version injected into every binary
-# (go/kdb/version.Version) and the image tag.
+# (go/kdb/version.Version) and the image tag. The tagged commit is injected alongside it, so
+# `kdb --version`, the service banner, /healthz and the kdb_build_info metric all name the exact
+# source a released artifact was built from.
 
 name: Release
 
@@ -42,7 +44,10 @@ jobs:
       - name: Cross-compile
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          LDFLAGS="-X github.com/limidus/kdb/go/kdb/version.Version=${VERSION}"
+          VP=github.com/limidus/kdb/go/kdb/version
+          # A tag build is a clean checkout by definition, hence Dirty=false.
+          LDFLAGS="-X $VP.Version=${VERSION} -X $VP.Commit=${GITHUB_SHA} -X $VP.Dirty=false"
+          LDFLAGS="$LDFLAGS -X $VP.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           mkdir -p dist
           cd go
           for target in linux/amd64 linux/arm64 darwin/arm64; do
@@ -77,6 +82,8 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ github.ref_name }}
+            GIT_COMMIT=${{ github.sha }}
+            GIT_DIRTY=false
           tags: |
             ghcr.io/${{ github.repository }}/kdb-service:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}/kdb-service:latest
