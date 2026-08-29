@@ -21,6 +21,16 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	if QueryHasAggregates(query) {
 		return e.executeAggregateSelect(query, ctx)
 	}
+	// ORDER BY has to run before LIMIT/OFFSET: "the first three rows in sorted order", not
+	// "three arbitrary rows, sorted among themselves". The planner puts PlanLimit outermost and
+	// resolveDocIDs applies it while resolving ids - before any document has been read, let
+	// alone sorted - so an ordered query used to answer from whichever rows the scan reached
+	// first. Strip the limit here and apply it below, once the rows are in order.
+	var limit, offset int
+	deferLimit := len(query.OrderBy) > 0
+	if deferLimit {
+		plan, limit, offset, deferLimit = stripLimit(plan)
+	}
 	ids, err := e.resolveDocIDs(plan, residual, ctx)
 	if err != nil {
 		return QueryResult{}, err
@@ -66,6 +76,9 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 			return false
 		})
 	}
+	if deferLimit {
+		pairs = applyLimitOffset(pairs, limit, offset)
+	}
 	rows := make([]QueryRow, 0, len(pairs))
 	for _, p := range pairs {
 		rows = append(rows, QueryRow{Values: projectRow(query.Projections, p.doc, ctx)})
@@ -73,8 +86,36 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows}, nil
 }
 
+// stripLimit peels the planner's outermost PlanLimit off a plan, returning the inner plan along
+// with the limit and offset it carried, so the caller can apply them at the right point instead.
+// Reports false (and leaves the plan alone) when there is no PlanLimit to peel.
+func stripLimit(plan PhysicalPlan) (inner PhysicalPlan, limit, offset int, found bool) {
+	if p, ok := plan.(PlanLimit); ok {
+		return p.Input, p.Limit, p.Offset, true
+	}
+	return plan, 0, 0, false
+}
+
+// applyLimitOffset slices an already-ordered result. Generic over the element type so the same
+// bounds logic serves rows and ids rather than being written twice with one of them subtly off.
+func applyLimitOffset[T any](items []T, limit, offset int) []T {
+	if offset >= len(items) {
+		return nil
+	}
+	end := offset + limit
+	if end > len(items) || end < offset { // end < offset catches an overflowing limit
+		end = len(items)
+	}
+	return items[offset:end]
+}
+
 func (e *Executor) executeAggregateSelect(query SelectQuery, ctx QueryContext) (QueryResult, error) {
 	plan, residual := DefaultPlanner{}.PlanSelect(query, ctx.Schema)
+	// An aggregate consumes every matching row and produces one; LIMIT bounds that output, not
+	// the input. Leaving the planner's PlanLimit in place made it truncate the rows being
+	// aggregated instead, so `SELECT COUNT(*) FROM t LIMIT 1` answered 1 however many rows the
+	// table held.
+	plan, _, _, _ = stripLimit(plan)
 	ids, err := e.resolveDocIDs(plan, residual, ctx)
 	if err != nil {
 		return QueryResult{}, err
@@ -120,14 +161,7 @@ func (e *Executor) resolveDocIDs(plan PhysicalPlan, residual Expr, ctx QueryCont
 		if err != nil {
 			return nil, err
 		}
-		if p.Offset >= len(inner) {
-			return nil, nil
-		}
-		end := p.Offset + p.Limit
-		if end > len(inner) {
-			end = len(inner)
-		}
-		return inner[p.Offset:end], nil
+		return applyLimitOffset(inner, p.Limit, p.Offset), nil
 	case PlanFilter:
 		return e.resolveDocIDs(p.Input, p.Predicate, ctx)
 	case PlanFullScan:

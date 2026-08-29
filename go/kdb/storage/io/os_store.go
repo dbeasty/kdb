@@ -103,7 +103,7 @@ func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte
 	f, err := os.Open(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, &PlatformIOError{Message: "segment does not exist", SegmentName: segmentName, Cause: err}
 		}
 		return nil, err
 	}

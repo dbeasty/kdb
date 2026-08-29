@@ -38,6 +38,8 @@ kotlin {
 
         commonTest.dependencies {
             implementation(libs.kotlin.test)
+            // The engine's whole API is suspending, so its tests need runTest.
+            implementation(libs.kotlinx.coroutines.test)
         }
     }
 }

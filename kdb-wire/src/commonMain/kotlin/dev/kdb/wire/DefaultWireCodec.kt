@@ -24,6 +24,11 @@ internal class DefaultWireCodec(override val encoding: PayloadEncoding) : WireCo
         if (frame.size < payloadOffset + 1) {
             throw WireDecodeException("frame too short for payload")
         }
+        // A frame declaring an empty payload while carrying trailing bytes gets past the check
+        // above and would ask copyOfRange for a range whose start is past its end.
+        if (header.payloadLength < 1) {
+            throw WireDecodeException("frame declares an empty payload")
+        }
         val tag = frame[payloadOffset].toInt()
         val body = frame.copyOfRange(payloadOffset + 1, payloadOffset + header.payloadLength)
         // v1: KDB_BINARY (0) and JSON (1) both use UTF-8 JSON envelope for debug/interop.
@@ -52,6 +57,17 @@ internal class DefaultWireCodec(override val encoding: PayloadEncoding) : WireCo
         }
         val frameLength = readInt32Le(frame, 0)
         validateFrameLength(frameLength, DEFAULT_MAX_FRAME_BYTES)
+        // The declared length has to be checked against the buffer we were actually handed, not
+        // only against the protocol maximum. payloadLength is derived from frameLength and
+        // decode() slices the payload out with it, so a frame whose prefix claims more bytes
+        // than it carries threw IndexOutOfBoundsException out of copyOfRange instead of a
+        // WireDecodeException the caller can handle. The stream framing reader never produces
+        // such a buffer (it only emits a frame once frameLength bytes have arrived), but a
+        // WebSocket message is delivered whole and unvalidated, and a captured frame read from a
+        // file can be truncated by whatever wrote it. Go's DecodeHeader enforces the same bound.
+        if (frame.size < frameLength) {
+            throw WireDecodeException("frame shorter than its declared length")
+        }
         val typeCode = readInt16Le(frame, 4).toShort()
         val messageType =
             WireMessageType.fromCode(typeCode)

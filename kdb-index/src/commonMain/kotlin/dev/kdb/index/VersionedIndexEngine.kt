@@ -89,12 +89,17 @@ public class VersionedIndexEngine(
             } else {
                 filtered.sortedWith { a, b -> compareIndexKeys(b, a) }
             }
+        // limit <= 0 means "no limit", matching Go's rangeScan. Taken literally, `out.size >=
+        // limit` was already true after the first document, so a limit of 0 - which a caller
+        // means as "unbounded" or "none" - returned exactly one row on this side and everything
+        // on Go's.
+        val effectiveLimit = if (limit <= 0) Int.MAX_VALUE else limit
         val out = LinkedHashSet<KdbUuid>()
         outer@
         for (k in sorted) {
             for (doc in buckets[k] ?: continue) {
                 out.add(doc)
-                if (out.size >= limit) break@outer
+                if (out.size >= effectiveLimit) break@outer
             }
         }
         return out.toList()
@@ -169,10 +174,13 @@ private object VersionedIndexSnapshot {
     fun lines(log: List<VersionedEvent>): List<String> =
         log.sortedBy { it.seq }.map { evt ->
             when (evt) {
+                // toHex(), not string interpolation: KdbHash has no toString() override, so
+                // interpolating it wrote an object identity like KdbHash@1a2b3c, which parse's
+                // KdbHash.fromHex then rejected outright. A snapshot has never been restorable.
                 is VersionedPut ->
-                    "P|${evt.entry.docId}|${evt.entry.commitHash}|${IndexKeyLine.encode(evt.entry.key)}"
+                    "P|${evt.entry.docId}|${evt.entry.commitHash.toHex()}|${IndexKeyLine.encode(evt.entry.key)}"
                 is VersionedDelete ->
-                    "D|${evt.docId}|${evt.atCommit}"
+                    "D|${evt.docId}|${evt.atCommit.toHex()}"
             }
         }
 

@@ -25,7 +25,15 @@ internal class SqlExecutor(
         if (query.groupBy.isNotEmpty() || SqlAggregates.queryHasAggregates(query)) {
             return executeAggregateSelect(query, plan, context)
         }
-        val docIds = resolveDocIds(plan, context)
+        // ORDER BY has to run before LIMIT/OFFSET: "the first three rows in sorted order", not
+        // "three arbitrary rows, sorted among themselves". The planner puts Limit outermost and
+        // resolveDocIds applies it while resolving ids - before any document has been read, let
+        // alone sorted - so an ordered query answered from whichever rows the scan reached
+        // first. Strip the limit here and apply it once the rows are in order. Go's
+        // ExecuteSelect does the same, and had the same bug.
+        val deferLimit = query.orderBy.isNotEmpty()
+        val stripped = if (deferLimit) stripLimit(plan) else null
+        val docIds = resolveDocIds(stripped?.inner ?: plan, context)
         val atCommit = context.atCommit ?: dag.head()
         val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
         var pairs =
@@ -34,6 +42,9 @@ internal class SqlExecutor(
             }
         if (query.orderBy.isNotEmpty()) {
             pairs = sortPairs(pairs, query.orderBy, context)
+        }
+        if (stripped != null) {
+            pairs = pairs.drop(stripped.offset).take(stripped.limit)
         }
         var rows = pairs.map { (_, doc) -> QueryRow(projectRow(query.projections, doc, context)) }
         if (query.distinct) {
@@ -47,7 +58,11 @@ internal class SqlExecutor(
         plan: PhysicalPlan,
         context: QueryContext,
     ): QueryResult {
-        val docIds = resolveDocIds(plan, context)
+        // An aggregate consumes every matching row and produces one (or one per group); LIMIT
+        // bounds that output, not the input. Leaving the planner's Limit in place made it
+        // truncate the rows being aggregated, so `SELECT COUNT(*) FROM t LIMIT 1` answered 1
+        // however many rows the table held.
+        val docIds = resolveDocIds(stripLimit(plan)?.inner ?: plan, context)
         val atCommit = context.atCommit ?: dag.head()
         val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
         val docs =
@@ -175,6 +190,16 @@ internal class SqlExecutor(
             }
             0
         }
+
+    /** The limit and offset peeled off a plan by [stripLimit], with the plan underneath them. */
+    private data class StrippedLimit(val inner: PhysicalPlan, val limit: Int, val offset: Int)
+
+    /**
+     * Peels the planner's outermost [PhysicalPlan.Limit] off a plan so the caller can apply it at
+     * the right point instead. Returns null when there is no Limit to peel.
+     */
+    private fun stripLimit(plan: PhysicalPlan): StrippedLimit? =
+        (plan as? PhysicalPlan.Limit)?.let { StrippedLimit(it.input, it.limit, it.offset) }
 
     private suspend fun resolveDocIds(
         plan: PhysicalPlan,

@@ -76,6 +76,23 @@ func (c *cursor) leb() (uint64, error) {
 	return readLeb128U64(c.raw, &c.pos)
 }
 
+// checkElementCount rejects an array/map length that the remaining input cannot possibly back,
+// before it is used to size an allocation. The count is a varint straight off the wire (or off
+// disk), so nine bytes used to be enough to ask for a slice of 2^60 elements: that is a
+// makeslice panic on a 64-bit build - and with no recover() on any frame-handling path, a panic
+// is a dead process, reachable by any peer that can get a commit payload decoded.
+//
+// Every element costs at least one byte, so a count above the bytes remaining is malformed by
+// construction. That holds for every type in this codebase's schemas (the schema comes from the
+// caller, never from the wire, and none of them has a zero-width element); it also turns what
+// would otherwise be a 2^60-iteration spin into an immediate error.
+func (c *cursor) checkElementCount(n uint64, kind string) error {
+	if remaining := c.limit - c.pos; remaining < 0 || n > uint64(remaining) {
+		return kdberr.NewDecodeError(kind+" length exceeds remaining input", c.pos, nil)
+	}
+	return nil
+}
+
 func putLe16(v int16) []byte {
 	i := uint16(v)
 	return []byte{byte(i), byte(i >> 8)}

@@ -30,6 +30,12 @@ kotlin {
         commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(project(":kdb-dag"))
+            // The store's API is suspending, and its tests need an in-memory storage adapter.
+            implementation(libs.kotlinx.coroutines.test)
+            implementation(project(":kdb-storage"))
+            implementation(project(":kdb-index"))
+            implementation(project(":kdb-codec"))
+            implementation(project(":kdb-error"))
         }
     }
 }

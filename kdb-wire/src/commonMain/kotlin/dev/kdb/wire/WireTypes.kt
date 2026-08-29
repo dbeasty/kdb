@@ -374,7 +374,11 @@ public interface HandshakeNegotiator {
 public fun defaultHandshakeNegotiator(): HandshakeNegotiator = DefaultHandshakeNegotiator()
 
 public fun validateFrameLength(length: Int, maxFrameBytes: Int = DEFAULT_MAX_FRAME_BYTES) {
-    if (length < 8 || length > maxFrameBytes) {
+    // The floor is the frame header's own size: a frame cannot declare fewer bytes than the
+    // header it must begin with. This read 8 while FRAME_HEADER_SIZE has been 12, so Kotlin
+    // accepted three declared lengths (8, 9, 10, 11) that Go's ValidateFrameLength rejects -
+    // a divergence in what the two implementations consider a valid frame at all.
+    if (length < FRAME_HEADER_SIZE || length > maxFrameBytes) {
         throw FrameTooLargeException(length, maxFrameBytes)
     }
 }

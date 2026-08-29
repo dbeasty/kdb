@@ -3,6 +3,7 @@ package schema
 import (
 	"fmt"
 	"math"
+	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -114,6 +115,10 @@ func DiffSchemas(from, to KdbSchema) Diff {
 	for _, f := range to.Fields {
 		fb[f.Name] = f
 	}
+	// Each of the three lists is built by ranging a map, so each is sorted by field name before
+	// returning. Without that the order varied run to run, and a Diff is exactly the kind of
+	// thing that gets rendered for a human, serialized, or compared against another Diff to
+	// decide whether two schema versions agree - all of which a shuffling order breaks.
 	var added, removed []Field
 	for name, f := range fb {
 		if _, ok := fa[name]; !ok {
@@ -135,6 +140,9 @@ func DiffSchemas(from, to KdbSchema) Diff {
 			modified = append(modified, FieldDiff{FieldName: name, Changes: changes})
 		}
 	}
+	sort.Slice(added, func(i, j int) bool { return added[i].Name < added[j].Name })
+	sort.Slice(removed, func(i, j int) bool { return removed[i].Name < removed[j].Name })
+	sort.Slice(modified, func(i, j int) bool { return modified[i].FieldName < modified[j].FieldName })
 	return Diff{
 		AddedFields: added, RemovedFields: removed, ModifiedFields: modified,
 		FromVersion: from.Version, ToVersion: to.Version,
@@ -162,7 +170,12 @@ func checkFieldValue(field Field, value any) *kdberr.FieldViolation {
 		}
 		return typeMismatch(field.Name, "expected int32")
 	case Int64Type:
-		if v, ok := value.(float64); ok && isIntegralFloat(v) {
+		// Bounded like Int32Type above, which it was not: an integral float64 outside int64's
+		// range (1e30, say) passed validation and then could not be stored as the int64 the
+		// field declares. float64 cannot represent math.MaxInt64 exactly - the nearest value is
+		// 2^63, one past it - so the upper bound is a strict "less than 2^63" rather than a
+		// "<= MaxInt64" that would silently admit 2^63 itself.
+		if v, ok := value.(float64); ok && isIntegralFloat(v) && v >= math.MinInt64 && v < twoToThe63 {
 			return nil
 		}
 		return typeMismatch(field.Name, "expected int64")
@@ -225,6 +238,10 @@ func checkFieldValue(field Field, value any) *kdberr.FieldViolation {
 func typeMismatch(field, detail string) *kdberr.FieldViolation {
 	return &kdberr.FieldViolation{FieldName: field, ViolationType: kdberr.TypeMismatch, Detail: detail}
 }
+
+// twoToThe63 is one past math.MaxInt64. math.MaxInt64 itself has no exact float64
+// representation, so comparing against it would round up to this value and admit it.
+const twoToThe63 = float64(1 << 63)
 
 func isIntegralFloat(d float64) bool {
 	return math.Abs(d-math.Round(d)) < 1e-9

@@ -64,6 +64,98 @@ class Layer5SqlIntegrationTest {
             assertEquals("u1", (desc.rows.first().values[0] as SqlCell.StringVal).value)
         }
 
+    /**
+     * LIMIT has to be applied after ORDER BY: "the first N rows in sorted order", not "N
+     * arbitrary rows, sorted among themselves". The planner puts its Limit outermost and
+     * resolveDocIds applied it before any document had been read, let alone sorted, so an
+     * ordered query answered from whichever rows the scan reached first.
+     *
+     * orderByLimit above cannot catch this: with two documents whose insertion order already
+     * matches the requested order, both behaviours give the same answer. This seeds five rows in
+     * an order that shares no prefix with the sorted one. Go's ExecuteSelect had the same bug.
+     */
+    @Test
+    fun orderByIsAppliedBeforeLimit() =
+        runTest {
+            val fx = rankedFixture()
+
+            val descTwo =
+                fx.engine.execute(
+                    "SELECT userId FROM users ORDER BY rank DESC LIMIT 2",
+                    QueryContext(namespaceId = fx.ns, schema = fx.schema),
+                )
+            assertEquals(listOf("e", "d"), descTwo.rows.map { (it.values[0] as SqlCell.StringVal).value })
+
+            val ascThree =
+                fx.engine.execute(
+                    "SELECT userId FROM users ORDER BY rank ASC LIMIT 3",
+                    QueryContext(namespaceId = fx.ns, schema = fx.schema),
+                )
+            assertEquals(listOf("a", "b", "c"), ascThree.rows.map { (it.values[0] as SqlCell.StringVal).value })
+        }
+
+    @Test
+    fun orderByIsAppliedBeforeOffset() =
+        runTest {
+            val fx = rankedFixture()
+            val result =
+                fx.engine.execute(
+                    "SELECT userId FROM users ORDER BY rank DESC LIMIT 2 OFFSET 1",
+                    QueryContext(namespaceId = fx.ns, schema = fx.schema),
+                )
+            assertEquals(listOf("d", "c"), result.rows.map { (it.values[0] as SqlCell.StringVal).value })
+        }
+
+    /**
+     * An aggregate consumes every matching row and produces one; LIMIT bounds that output row,
+     * not the input. The planner's Limit used to truncate the rows being aggregated, so COUNT(*)
+     * reported the limit rather than the count.
+     */
+    @Test
+    fun aggregateIgnoresLimitOnItsInput() =
+        runTest {
+            val fx = rankedFixture()
+            val ctx = QueryContext(namespaceId = fx.ns, schema = fx.schema)
+
+            val unlimited = fx.engine.execute("SELECT COUNT(*) FROM users", ctx)
+            assertEquals(5L, (unlimited.rows.first().values[0] as SqlCell.LongVal).value)
+
+            for (query in listOf(
+                "SELECT COUNT(*) FROM users LIMIT 1",
+                "SELECT COUNT(*) FROM users LIMIT 2",
+                "SELECT COUNT(*) FROM users LIMIT 3 OFFSET 1",
+            )) {
+                val limited = fx.engine.execute(query, ctx)
+                assertEquals(
+                    5L,
+                    (limited.rows.first().values[0] as SqlCell.LongVal).value,
+                    "$query truncated the aggregate's input",
+                )
+            }
+        }
+
+    /**
+     * Five rows seeded in an order that shares no prefix with their sorted order, so "the first
+     * N scanned" and "the first N sorted" differ for every N.
+     */
+    private suspend fun rankedFixture(): SqlFixture {
+        val fx =
+            seededFixture(
+                initialJson = """{"userId":"d","status":"active","rank":4}""",
+                fields =
+                    listOf(
+                        SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
+                        SchemaField("status", KdbFieldType.StringType, required = true, indexed = true),
+                        SchemaField("rank", KdbFieldType.Int64Type, required = true, indexed = true),
+                    ),
+            )
+        fx.commitDoc("""{"userId":"a","status":"active","rank":1}""")
+        fx.commitDoc("""{"userId":"e","status":"active","rank":5}""")
+        fx.commitDoc("""{"userId":"b","status":"active","rank":2}""")
+        fx.commitDoc("""{"userId":"c","status":"active","rank":3}""")
+        return fx
+    }
+
     @Test
     fun betweenPredicate() =
         runTest {

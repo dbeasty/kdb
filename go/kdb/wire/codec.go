@@ -49,6 +49,12 @@ func (c *DefaultCodec) Decode(frame []byte) (Message, error) {
 	if len(frame) < payloadOffset+1 {
 		return nil, newDecodeError("frame too short for payload")
 	}
+	// A frame declaring an empty payload while carrying trailing bytes passes the check above
+	// but would slice frame[13:12] - low greater than high, which panics just as surely as an
+	// out-of-range high bound does.
+	if header.PayloadLength < 1 {
+		return nil, newDecodeError("frame declares an empty payload")
+	}
 	tag := frame[payloadOffset]
 	body := frame[payloadOffset+1 : payloadOffset+header.PayloadLength]
 	if tag != 0 && tag != 1 {
