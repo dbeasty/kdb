@@ -1,7 +1,9 @@
 # KDB product image: the Go-native kdb-service plus the kdb CLI and kdb-inspect tooling.
 # Promoted from docs/benchmarks/lightsail-sim/Dockerfile (kdb-finish-up-plan Phase 2.9).
 #
-# Build:  docker build -t kdb-service --build-arg VERSION=$(cat VERSION) .
+# Build:  docker build -t kdb-service \
+#           --build-arg VERSION=$(cat VERSION) \
+#           --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 # Run:    docker run -v kdb-data:/var/lib/kdb -p 9090-9093:9090-9093 kdb-service \
 #           --data-dir /var/lib/kdb --admin-addr 0.0.0.0:9093
 #
@@ -10,13 +12,22 @@
 
 FROM golang:1.26-alpine AS build
 ARG VERSION=0.0.0-docker
+# Only go/ is copied into the build stage, so there is no .git here for the Go toolchain to
+# stamp the commit from automatically - it has to be passed in, or the image ships binaries that
+# can't be traced back to their source. GIT_DIRTY guards against releasing an image built from a
+# tree with uncommitted changes without that being visible in --version.
+ARG GIT_COMMIT=unknown
+ARG GIT_DIRTY=false
+ARG BUILD_DATE
 WORKDIR /src
 COPY go/go.mod go/go.sum ./
 RUN go mod download
 COPY go/ ./
-RUN CGO_ENABLED=0 go build -ldflags "-X github.com/limidus/kdb/go/kdb/version.Version=${VERSION}" -o /out/kdb-service ./cmd/kdb-service \
-    && CGO_ENABLED=0 go build -ldflags "-X github.com/limidus/kdb/go/kdb/version.Version=${VERSION}" -o /out/kdb ./cmd/kdb \
-    && CGO_ENABLED=0 go build -ldflags "-X github.com/limidus/kdb/go/kdb/version.Version=${VERSION}" -o /out/kdb-inspect ./cmd/kdb-inspect
+RUN VP=github.com/limidus/kdb/go/kdb/version; \
+    LDFLAGS="-X $VP.Version=${VERSION} -X $VP.Commit=${GIT_COMMIT} -X $VP.Dirty=${GIT_DIRTY} -X $VP.BuildDate=${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+    for bin in kdb-service kdb kdb-inspect; do \
+      CGO_ENABLED=0 go build -ldflags "$LDFLAGS" -o "/out/$bin" "./cmd/$bin" || exit 1; \
+    done
 
 FROM alpine:3.20
 RUN adduser -D -u 10001 kdb && mkdir -p /var/lib/kdb && chown kdb:kdb /var/lib/kdb

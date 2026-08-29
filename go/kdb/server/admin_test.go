@@ -50,8 +50,15 @@ func TestAdminHealthzAlwaysOK(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("healthz = %d, want 200", code)
 	}
-	if !strings.Contains(body, "version=") {
-		t.Fatalf("healthz body missing version: %q", body)
+	// The whole point of the commit line is tracing a live process back to its source, so an
+	// empty value is as much of a failure as a missing key.
+	for _, key := range []string{"version=", "commit=", "commit_dirty=", "build_date="} {
+		if !strings.Contains(body, key) {
+			t.Fatalf("healthz body missing %q: %q", key, body)
+		}
+		if strings.Contains(body, key+"\n") {
+			t.Fatalf("healthz %s has an empty value: %q", key, body)
+		}
 	}
 }
 
@@ -92,6 +99,8 @@ func TestAdminMetricsExposition(t *testing.T) {
 		`kdb_stage_latency_seconds{stage="fsync_wait",stat="p99"}`,
 		"kdb_go_goroutines",
 		"kdb_draining 0",
+		"# TYPE kdb_build_info gauge",
+		`kdb_build_info{version=`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)

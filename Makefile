@@ -1,8 +1,18 @@
-.PHONY: test-go test-kotlin test-cross build-go build-kotlin bench bench-write
+.PHONY: test-go test-kotlin test-cross build-go build-kotlin bench bench-write print-version
 
 # Single version source (see go/kdb/version). Release tags override: make build-go VERSION=v1.2.3
 VERSION ?= $(shell cat VERSION)
-GO_LDFLAGS := -X github.com/limidus/kdb/go/kdb/version.Version=$(VERSION)
+# The commit the binary is built from, so any shipped binary can be traced back to its source.
+# Full SHA, not the short form - short SHAs stop being unique as a repo grows. GIT_DIRTY records
+# whether the tree had uncommitted changes, because then the commit alone doesn't identify it.
+VERSION_PKG := github.com/limidus/kdb/go/kdb/version
+GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY ?= $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+GO_LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) \
+              -X $(VERSION_PKG).Commit=$(GIT_COMMIT) \
+              -X $(VERSION_PKG).Dirty=$(GIT_DIRTY) \
+              -X $(VERSION_PKG).BuildDate=$(BUILD_DATE)
 
 test-go:
 	cd go && go test -race ./...
@@ -39,3 +49,10 @@ build-go:
 
 build-kotlin:
 	./gradlew build --no-daemon
+
+# What the binaries in bin/ will claim to be. Handy for checking the injection before a release.
+print-version:
+	@echo "version:    $(VERSION)"
+	@echo "commit:     $(GIT_COMMIT)"
+	@echo "dirty:      $(GIT_DIRTY)"
+	@echo "build date: $(BUILD_DATE)"

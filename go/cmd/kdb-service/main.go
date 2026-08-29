@@ -67,7 +67,7 @@ func main() {
 	_ = fs.Parse(os.Args[1:])
 
 	if showVersion {
-		fmt.Println(version.Version)
+		fmt.Println(version.String())
 		return
 	}
 
@@ -309,8 +309,14 @@ func main() {
 			tlsStatus = "enabled (mTLS: client cert required)"
 		}
 	}
+	build := version.Get()
 	slog.Info("KDB service started",
-		"version", version.Version,
+		"version", build.Version,
+		// Full SHA, not the short form: this line is how a running service is traced back to
+		// the exact source it was built from.
+		"commit", build.Commit,
+		"commit_dirty", build.Dirty,
+		"build_date", build.BuildDate,
 		"peer", peerStatus,
 		"stream", streamStatus,
 		"sql", sqlStatus,

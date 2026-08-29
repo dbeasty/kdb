@@ -94,6 +94,24 @@ import (
 db, _ := sql.Open("kdb", "kdb://memory:///demo/users?unique=true")
 ```
 
+### Build identity
+
+Every binary reports the release version and the exact git commit it was built from, so a
+running or shipped artifact can always be traced back to its source:
+
+```bash
+./go/bin/kdb --version
+# 0.1.0 (commit 8fe306d, built 2026-08-27T09:41:02Z, go1.26.3 linux/amd64)
+```
+
+The version comes from the repo's `VERSION` file — the single source both the Go binaries and the
+Kotlin artifacts read. `make print-version` shows what a build will stamp; a build from a tree with
+uncommitted changes is marked `-dirty`, because then the commit alone doesn't identify the source.
+The same identity is on the service startup log line, on `GET /healthz` from `--admin-addr`
+(`version=`, `commit=`, `commit_dirty=`, `build_date=`), and as the `kdb_build_info` gauge on
+`/metrics`. Kotlin jars carry it in their manifest (`Implementation-Version`,
+`Implementation-Commit`).
+
 ---
 
 ## Specification

@@ -592,3 +592,48 @@ Phases 0, 1, 2 and 3.2 are complete. Phase 3.1 is partially done. Phase 4 has no
 5. Go WS **server** side (`Listen` 501s every request, including genuine upgrades) and PKCS12↔PEM fixture generation — both prerequisites for the `test_tls.py` cross-language interop halves, currently interop-marked pending.
 6. `MultiClientSqlIntegrationTest.twoSessions_snapshotRead_sameData` — genuinely intermittent, never reproduced locally; needs many repeated CI runs to characterize, not a quick local repro.
 7. Phase 4 in full.
+
+### Build identity: git commit in the version string (2026-08-27)
+
+Phase 2.8 gave the three Go binaries a `--version` from a single `VERSION` file, but nothing tied a
+built artifact to the source it came from — `0.1.0` names a release, not a tree, and a hotfix build,
+a release build and a developer's local build of the same version are indistinguishable once
+shipped. `go/kdb/version` now carries the full build identity: `Version`, `Commit` (full SHA — short
+SHAs stop being unique as a repo grows), `BuildDate`, and `Dirty`, resolved through `version.Get()`
+into an `Info` and rendered by `version.String()` as
+`0.1.0 (commit 8fe306d, built 2026-08-27T09:41:02Z, go1.26.3 darwin/arm64)`.
+
+- **Nothing has to be injected for the commit to be right.** Anything left empty falls back to the
+  VCS stamp the Go toolchain already embeds in binaries built inside a git work tree
+  (`debug.ReadBuildInfo`'s `vcs.revision`/`vcs.time`/`vcs.modified`), so a plain
+  `go build ./cmd/kdb` reports the real commit and dirty state. Link-time injection exists only for
+  the builds where that stamp is unavailable — the Docker build copies `go/` into the image without
+  `.git`, and would otherwise ship untraceable binaries. A field that is neither injected nor
+  stamped reads `unknown`, never empty: an empty `--version` field looks like a formatting bug
+  rather than a missing provenance.
+- **Surfaces**: `--version`/`version` on all three binaries; the service startup log line
+  (`commit`, `commit_dirty`, `build_date` alongside `version`, full SHA — that line is how a running
+  service gets traced); `GET /healthz` as `key=value` lines so a scraper can read it without
+  shelling into the container; and a new `kdb_build_info{version,commit,dirty,build_date,go_version}
+  1` gauge on `/metrics` — the standard Prometheus build-info pattern, which makes a rollout show up
+  as two label sets rather than an unexplained step in some other series.
+- **Injection plumbing**: `Makefile` derives `GIT_COMMIT`/`GIT_DIRTY`/`BUILD_DATE` (plus a
+  `print-version` target to see what a build will stamp); the `Dockerfile` takes them as build args
+  and defaults `GIT_COMMIT=unknown` rather than pretending; `release.yml` passes `GITHUB_SHA` to both
+  the cross-compile matrix and the image build, with `Dirty=false` since a tag build is a clean
+  checkout by definition.
+- **Kotlin side**: root `build.gradle.kts` now reads the same `VERSION` file into every project's
+  `version` (they were all `unspecified`) and stamps `Implementation-Version`/`Implementation-Commit`
+  /`Implementation-Commit-Dirty` into every jar manifest. Deliberately no build timestamp there — it
+  would change on every build and invalidate every jar task's up-to-date check for traceability the
+  commit already provides.
+
+**Not done**: the Kotlin CLI/service still has no `--version` command — the manifest carries the
+identity, but nothing reads it back out. That needs a generated `BuildInfo` in a `commonMain` source
+set to work across the KMP targets, and the deploy target is Go, so it was left out rather than
+half-built. The handshake banner remains skipped for the reason 2.8 originally gave (shared
+cross-language wire format).
+
+**Verification**: `go vet ./...` and `gofmt` clean; `go test -race ./...` green; `make build-go` then
+`--version` on all three binaries; a plain `go build` with no ldflags confirmed to recover the commit
+and dirty flag from the VCS stamp.
