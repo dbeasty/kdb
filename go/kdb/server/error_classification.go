@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 
+	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -28,11 +29,33 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 	}
 	var pressure *MemoryPressureError
 	if errors.As(err, &pressure) {
-		// Memory pressure is the same "retry later" shape as BUSY, just from a different gate -
-		// no fixed retry-after is meaningful here (it clears whenever the sampler next observes
-		// usage back under the clear threshold, not on a schedule the server can promise), so
-		// RetryAfterMs is left nil rather than inventing a number.
+		// Memory pressure is the same "retry later" shape as BUSY, just from a different gate.
+		// Component 48 gives it a real retry-after: the zone it was shed in implies how long a
+		// caller should wait (deeper zones, longer backoff - see retryAfterMsForZone). Before
+		// the zones existed there was no honest number to put here, since the old boolean guard
+		// cleared whenever the sampler happened to next see usage under the threshold.
+		if pressure.RetryAfterMs > 0 {
+			ms := pressure.RetryAfterMs
+			return wire.ErrorCodeBusy, &ms
+		}
 		return wire.ErrorCodeBusy, nil
+	}
+	var exhausted *ResourceExhaustedError
+	if errors.As(err, &exhausted) {
+		// Deliberately *not* BUSY: this operation is larger than the node's entire grant
+		// capacity, so "retry later" would be a lie - no amount of waiting makes it admissible.
+		// The client's only useful move is to resubmit smaller, which is exactly what
+		// RESOURCE_EXHAUSTED tells it (Component 51 §8.1). Before Component 48's cost model
+		// existed there was nothing that could make this judgment, which is why this code had
+		// no producer.
+		return wire.ErrorCodeResourceExhausted, nil
+	}
+	var rowBudget *sql.ScanRowBudgetExceededError
+	if errors.As(err, &rowBudget) {
+		// Same reasoning as ResourceExhaustedError above: the query as written costs more than
+		// this node will spend on it, so "retry later" would be misleading - it will cost exactly
+		// as much next time.
+		return wire.ErrorCodeResourceExhausted, nil
 	}
 	var auth *AuthorizationError
 	if errors.As(err, &auth) {

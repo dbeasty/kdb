@@ -117,6 +117,14 @@ type KdbServerRuntime struct {
 	// reject new writes gracefully once it nears its budget, not get OOM-killed with no signal
 	// to the client.
 	memGuard *MemoryGuard
+	// admission is nil by default, and non-nil exactly when memGuard has a configured budget -
+	// see SetMemoryBudget. It is what turns the guard from a periodic sampler into real
+	// admission control: work reserves the memory it is expected to hold before it starts,
+	// rather than being waved through on the strength of a reading up to one poll interval old.
+	admission *Admission
+	// MaxConnections caps concurrently-accepted connections on listeners this runtime serves
+	// (kdb-spec-layer13 Component 49 §6.5); 0 means unlimited. Set before calling ListenSqlWire.
+	MaxConnections int
 }
 
 // NewKdbServerRuntime creates a server runtime with ref-count 1, wiring the transaction and SQL
@@ -251,15 +259,39 @@ func (s *KdbServerRuntime) Release() {
 	}
 }
 
-// SetMemoryLimit opts this runtime into memory-pressure backpressure: once heap usage crosses
-// rejectFraction of limitBytes, new writes (Commit/Upsert) are rejected with a *MemoryPressureError
-// instead of being accepted - see MemoryGuard's own doc comment for why. Pass limitBytes == 0 (the
-// default, if this is never called) to disable. Typically set once at startup to the deployment's
-// known memory budget (e.g. a container's --memory limit); safe to call again to change it.
+// SetMemoryLimit opts this runtime into memory-pressure backpressure with the default rescue
+// reserve and scan row budget. Retained as the narrow form of SetMemoryBudget, which is what
+// kdb-service calls.
 func (s *KdbServerRuntime) SetMemoryLimit(limitBytes uint64, rejectFraction float64) {
+	s.SetMemoryBudget(limitBytes, rejectFraction, DefaultRescueReserveBytes, DefaultScanRowBudget)
+}
+
+// SetMemoryBudget opts this runtime into kdb-spec-layer13 Component 48's memory admission: an
+// operation reserves the bytes it is estimated to hold before it runs, and is rejected with a
+// typed, actionable error if that reservation cannot be met. Pass limitBytes == 0 (the default,
+// if this is never called) to disable entirely, restoring the pre-Component-48 behavior of
+// admitting everything.
+//
+// rejectFraction is the fraction of limitBytes at which writes start being shed (the entry point
+// of ZoneHigh; the other zones are positioned relative to it - see zoneFractionOfReject).
+// reserveBytes is the rescue reserve held back for the abort sequence (§5.6), and scanRowBudget
+// caps rows *examined* per scan (§5.2).
+//
+// Typically called once at startup with the deployment's known memory budget; safe to call again
+// to change it, and safe to call concurrently with in-flight work - grants already issued against
+// the previous Admission release against that same instance, since a Grant holds its own
+// reference to the Admission that issued it.
+func (s *KdbServerRuntime) SetMemoryBudget(limitBytes uint64, rejectFraction float64, reserveBytes int64, scanRowBudget int64) {
 	s.memGuard.Stop()
 	s.memGuard = NewMemoryGuard(limitBytes, rejectFraction)
+	s.admission = NewAdmission(s.memGuard, reserveBytes, scanRowBudget)
 }
+
+// Admission exposes the grant system, for metrics and tests. Nil when no budget is configured.
+func (s *KdbServerRuntime) Admission() *Admission { return s.admission }
+
+// MemoryZone reports the current pressure zone - ZoneNormal when no budget is configured.
+func (s *KdbServerRuntime) MemoryZone() Zone { return s.memGuard.CurrentZone() }
 
 // Commit authorizes every operation in tx against principal, then commits it via the
 // transaction engine, serialized against concurrent commits to the same runtime (see commitMu).
@@ -338,9 +370,6 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	if s.draining.Load() {
 		return document.Commit{}, &UnavailableError{Reason: "server is shutting down"}
 	}
-	if s.memGuard.ShouldReject() {
-		return document.Commit{}, &MemoryPressureError{}
-	}
 	if err := s.authorizeOperations(tx, principal); err != nil {
 		return document.Commit{}, err
 	}
@@ -353,6 +382,18 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
+	// Reserve the memory this commit is estimated to hold, for as long as it holds it. Held
+	// across the whole of runTransaction - including PersistAsync's durability wait - because
+	// that is genuinely how long the commit occupies memory; releasing at the write gate instead
+	// would let the next writer be admitted against capacity this one has not actually given
+	// back yet, which is the exact over-admission the grant system exists to prevent.
+	grant, err := s.admission.Acquire(ctx, ClassWrite, transactionPayloadBytes(tx))
+	if err != nil {
+		return document.Commit{}, err
+	}
+	defer grant.Release()
+
 	release, err := s.writeGate.acquire(ctx)
 	if err != nil {
 		return document.Commit{}, err
