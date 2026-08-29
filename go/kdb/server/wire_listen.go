@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -296,10 +297,15 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 	if isInsert {
 		return h.execInsert(msg, sess, params)
 	}
-	return h.execRead(msg, sess, params)
+	return h.execRead(msg, sess, params, stmt)
 }
 
-func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession, params []sql.Parameter) wire.Message {
+// readAcquireTimeout bounds how long a read waits for grant capacity before being told Busy.
+// Short on purpose: a read queued behind a full grant table is a read the client is still
+// synchronously waiting on, and a fast typed Busy beats a slow success at the tail.
+const readAcquireTimeout = 2 * time.Second
+
+func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession, params []sql.Parameter, stmt sql.Statement) wire.Message {
 	// sess.ReadPin (set at SessionBegin/Handshake for SNAPSHOT consistency, see
 	// SessionManager.Begin) used to be computed and then never read anywhere - every read
 	// always ran against the live head regardless of what consistency the session's ack claimed
@@ -313,6 +319,38 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		}
 		head = &liveHead
 	}
+
+	// A SELECT reserves the memory it is expected to materialize before it runs - sized from
+	// the namespace's O(1) cardinality at the read head, the observed document sizes, and the
+	// query's shape, not from the SQL string's length, which predicts nothing (kdb-spec-layer13
+	// Component 48 §5.2's "hard case"). Non-SELECT statements reaching this path (CREATE TABLE)
+	// materialize nothing worth reserving for.
+	var (
+		scanIn   ScanEstimateInput
+		estimate int64
+		grant    *Grant
+	)
+	adm := h.runtime.admission
+	if sel, ok := stmt.(sql.StmtSelect); ok && adm != nil {
+		scanIn = ScanEstimateInput{
+			Namespace: sess.NamespaceID,
+			Shape:     sql.ShapeOfSelect(sel.Query),
+			TreeSize:  h.runtime.treeSizeAt(*head),
+			MaxRows:   10_000,
+			RowBudget: int(adm.ScanRowBudget()),
+		}
+		estimate = adm.Costs().EstimateScan(scanIn)
+		actx, cancel := context.WithTimeout(context.Background(), readAcquireTimeout)
+		g, err := adm.AcquireBytes(actx, ClassScan, estimate)
+		cancel()
+		if err != nil {
+			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+		}
+		grant = g
+		defer grant.Release()
+	}
+
+	stats := &sql.ExecStats{}
 	ctx := sql.QueryContext{
 		NamespaceID: sess.NamespaceID,
 		Schema:      h.runtime.Schema(),
@@ -323,6 +361,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		// that reads the whole namespace to return nothing is otherwise unbounded work no
 		// admission decision can see coming (kdb-spec-layer13 §2.8).
 		RowBudget: int(h.runtime.admission.ScanRowBudget()),
+		Stats:     stats,
 	}
 	result, err := h.runtime.SQLEngine.Execute(msg.SQL, ctx)
 	if err != nil {
@@ -334,17 +373,39 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 	if result.AppliedSchema != nil {
 		h.runtime.SetSchema(*result.AppliedSchema)
 	}
+	rows := rowsToStrings(result.Rows)
+	if grant != nil {
+		// Feed back what the query really cost: the executor's exactly-attributed retained
+		// bytes plus the wire copy built above. This is the P2 loop ("cost is estimated, then
+		// measured") running on real numbers instead of a process-wide allocation counter.
+		actual := stats.RetainedBytes + stringsBytes(rows)
+		adm.Costs().ObserveScanActual(scanIn, estimate, actual)
+		if stats.DocsRead > 0 {
+			adm.Costs().ObserveDocSize(sess.NamespaceID, int(stats.DocBytesRead/int64(stats.DocsRead)))
+		}
+	}
 	return wire.SqlResultMessage{
 		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
 		Namespace:         msg.Namespace,
 		SessionID:         msg.SessionID,
 		Columns:           columnNames(result.Columns),
-		Rows:              rowsToStrings(result.Rows),
+		Rows:              rows,
 		RowsAffected:      result.RowsAffected,
 		ResolvedCommitHex: head.Hex(),
 		ReadOnly:          true,
 		GeneratedIDs:      result.GeneratedIDs,
 	}
+}
+
+// stringsBytes sizes the wire row copy: cell content plus per-string header overhead.
+func stringsBytes(rows [][]string) int64 {
+	total := int64(0)
+	for _, row := range rows {
+		for _, cell := range row {
+			total += int64(len(cell)) + 16
+		}
+	}
+	return total
 }
 
 func (h *sqlWireConnHandler) execInsert(msg wire.SqlExecMessage, sess *KdbSession, params []sql.Parameter) wire.Message {
@@ -540,9 +601,34 @@ func (h *sqlWireConnHandler) handleDocumentGet(msg wire.DocumentGetMessage) wire
 	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), h.principal, action); err != nil {
 		return documentGetError(msg, (&AuthorizationError{Cause: err}).Error())
 	}
+	// Point reads take a small grant too - not because one is dangerous, but because a flood
+	// of them against a namespace of large documents is real memory the sampler would otherwise
+	// meet only after the fact. Estimated from observed document sizes; the class is never
+	// zone-shed (admitInZone admits point reads everywhere), so this only queues when grant
+	// capacity is genuinely exhausted.
+	var (
+		grant    *Grant
+		estimate int64
+	)
+	if adm := h.runtime.admission; adm != nil {
+		estimate = adm.Costs().EstimatePointRead(msg.Namespace)
+		actx, cancel := context.WithTimeout(context.Background(), readAcquireTimeout)
+		g, err := adm.AcquireBytes(actx, ClassPointRead, estimate)
+		cancel()
+		if err != nil {
+			return documentGetError(msg, err.Error())
+		}
+		grant = g
+		defer grant.Release()
+	}
 	jsonBody, commitHex, found, err := h.runtime.GetDocument(msg.Namespace, docID)
 	if err != nil {
 		return documentGetError(msg, err.Error())
+	}
+	if adm := h.runtime.admission; adm != nil && found {
+		adm.Costs().ObserveDocSize(msg.Namespace, len(jsonBody))
+		// Actual: the document plus its response copy - the same two terms the estimate models.
+		adm.Costs().ObservePointReadActual(msg.Namespace, estimate, int64(len(jsonBody))*2)
 	}
 	if !found {
 		return wire.DocumentGetResultMessage{

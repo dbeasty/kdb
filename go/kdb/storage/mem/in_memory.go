@@ -99,22 +99,29 @@ func (a *InMemoryStorageAdapter) ScanDocuments(namespaceID string, atCommit code
 		return nil
 	}
 	buf := make([]document.Document, 0, batchSize)
-	// MaterializedEntries, not the .Entries field directly: a full scan is exactly the case
-	// that genuinely needs the flat map (see DocumentTree's own doc comment) - unlike the
-	// per-write hot path (CommitTree below) that used to force this same materialization on
-	// every single commit regardless of whether anything ever scanned it.
-	for _, h := range tree.MaterializedEntries() {
+	// Walk, not MaterializedEntries: materializing built the entire namespace's flat
+	// map[UUID]Hash before the first batch was emitted - an O(namespace) allocation that no
+	// LIMIT, row budget, or admission grant could see or bound, because it happened inside the
+	// adapter before the executor's first callback. Streaming the trie keeps a bounded scan's
+	// memory proportional to what it keeps (the batch buffer) rather than to what exists.
+	var walkErr error
+	tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
 		d, ok := a.blobStore.GetDocByBlob(h)
 		if !ok {
-			continue
+			return true
 		}
 		buf = append(buf, d)
 		if len(buf) >= batchSize {
 			if err := onBatch(append([]document.Document(nil), buf...)); err != nil {
-				return err
+				walkErr = err
+				return false
 			}
 			buf = buf[:0]
 		}
+		return true
+	})
+	if walkErr != nil {
+		return walkErr
 	}
 	if len(buf) > 0 {
 		return onBatch(buf)

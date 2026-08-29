@@ -218,6 +218,52 @@ type QueryContext struct {
 	// decide that. Bounding the result bounds what the client sees; only bounding the work
 	// bounds what the server spends.
 	RowBudget int
+	// Stats, when non-nil, is filled by the executor with what the query actually cost - rows
+	// examined and bytes materialized. This is the measured "actual" that admission control's
+	// cost model learns from (kdb-spec-layer13 Component 48 §5.2, P2 "cost is estimated, then
+	// measured"): unlike a process-wide allocation counter, it is exact and attributable to
+	// this query alone, so it stays meaningful under concurrency.
+	Stats *ExecStats
+}
+
+// ExecStats records what a query actually cost while it ran. All counters are additive across
+// the executor's phases (id resolution, predicate evaluation, materialization, projection).
+type ExecStats struct {
+	// RowsExamined is how many rows the query looked at - the quantity RowBudget bounds -
+	// including rows a predicate then discarded.
+	RowsExamined int
+	// DocsRead is how many document fetches DocBytesRead spans - DocBytesRead/DocsRead is the
+	// query's mean observed document size.
+	DocsRead int
+	// DocBytesRead is the total document JSON bytes fetched from storage, including transient
+	// reads made only to evaluate a predicate.
+	DocBytesRead int64
+	// RetainedBytes is the executor's peak simultaneously-held materialization: result
+	// documents plus projected row cells. This is the number an admission grant should have
+	// reserved (before response encoding, which the server accounts for separately).
+	RetainedBytes int64
+}
+
+// addExamined counts one examined row. Nil-safe so call sites need no guard.
+func (s *ExecStats) addExamined(n int) {
+	if s != nil {
+		s.RowsExamined += n
+	}
+}
+
+// addDocRead counts one document fetch of n bytes. Nil-safe.
+func (s *ExecStats) addDocRead(n int) {
+	if s != nil {
+		s.DocsRead++
+		s.DocBytesRead += int64(n)
+	}
+}
+
+// addRetained counts n bytes materialized into the result being built. Nil-safe.
+func (s *ExecStats) addRetained(n int64) {
+	if s != nil {
+		s.RetainedBytes += n
+	}
 }
 
 // QueryResult is a SELECT or DDL result set.

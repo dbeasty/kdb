@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"runtime"
+	gometrics "runtime/metrics"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -129,12 +130,19 @@ func (a *AdminServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&b, "kdb_stage_latency_seconds{stage=%q,stat=\"max\"} %g\n", s.Stage, s.Max.Seconds())
 	}
 
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
+	// runtime/metrics, not runtime.ReadMemStats: ReadMemStats stops every goroutine for the
+	// read - the exact stop-the-world cost the memory guard was rewritten to avoid
+	// (kdb-spec-layer13 §2.6) - and a scrape every few seconds was reintroducing it.
+	rms := []gometrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/memory/classes/total:bytes"},
+		{Name: "/gc/cycles/total:gc-cycles"},
+	}
+	gometrics.Read(rms)
 	fmt.Fprintf(&b, "# HELP kdb_go_goroutines Current goroutine count.\n# TYPE kdb_go_goroutines gauge\nkdb_go_goroutines %d\n", runtime.NumGoroutine())
-	fmt.Fprintf(&b, "# HELP kdb_go_heap_alloc_bytes Bytes of allocated heap objects.\n# TYPE kdb_go_heap_alloc_bytes gauge\nkdb_go_heap_alloc_bytes %d\n", ms.HeapAlloc)
-	fmt.Fprintf(&b, "# HELP kdb_go_heap_sys_bytes Bytes of heap obtained from the OS.\n# TYPE kdb_go_heap_sys_bytes gauge\nkdb_go_heap_sys_bytes %d\n", ms.HeapSys)
-	fmt.Fprintf(&b, "# HELP kdb_go_gc_total Completed GC cycles.\n# TYPE kdb_go_gc_total counter\nkdb_go_gc_total %d\n", ms.NumGC)
+	fmt.Fprintf(&b, "# HELP kdb_go_heap_alloc_bytes Bytes of allocated heap objects.\n# TYPE kdb_go_heap_alloc_bytes gauge\nkdb_go_heap_alloc_bytes %d\n", sampleUint64(rms[0]))
+	fmt.Fprintf(&b, "# HELP kdb_go_mem_total_bytes Total bytes of memory mapped by the Go runtime.\n# TYPE kdb_go_mem_total_bytes gauge\nkdb_go_mem_total_bytes %d\n", sampleUint64(rms[1]))
+	fmt.Fprintf(&b, "# HELP kdb_go_gc_total Completed GC cycles.\n# TYPE kdb_go_gc_total counter\nkdb_go_gc_total %d\n", sampleUint64(rms[2]))
 
 	draining := 0
 	if a.runtime != nil && a.runtime.IsDraining() {
@@ -142,5 +150,49 @@ func (a *AdminServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	fmt.Fprintf(&b, "# HELP kdb_draining Whether the runtime is refusing new writes for shutdown.\n# TYPE kdb_draining gauge\nkdb_draining %d\n", draining)
 
+	a.writeGovernanceMetrics(&b)
+
 	_, _ = w.Write([]byte(b.String()))
+}
+
+// writeGovernanceMetrics exposes the admission-control counters. §13: "a shedding server that
+// cannot be observed shedding is indistinguishable from a broken one" - and §2.5's latching bug
+// went unnoticed for exactly that reason. Until now none of these numbers left the process.
+func (a *AdminServer) writeGovernanceMetrics(b *strings.Builder) {
+	if a.runtime == nil {
+		return
+	}
+	fmt.Fprintf(b, "# HELP kdb_memory_zone Current pressure zone (0=normal 1=elevated 2=high 3=critical).\n# TYPE kdb_memory_zone gauge\nkdb_memory_zone %d\n", int(a.runtime.MemoryZone()))
+	adm := a.runtime.Admission()
+	if adm == nil {
+		return
+	}
+	stats := adm.Stats()
+	b.WriteString("# HELP kdb_admission_granted_total Grants issued per operation class.\n# TYPE kdb_admission_granted_total counter\n")
+	for c := OpClass(0); c < numOpClasses; c++ {
+		fmt.Fprintf(b, "kdb_admission_granted_total{class=%q} %d\n", c, stats.Granted[c].Load())
+	}
+	b.WriteString("# HELP kdb_admission_denied_total Admissions denied, per class and reason.\n# TYPE kdb_admission_denied_total counter\n")
+	for c := OpClass(0); c < numOpClasses; c++ {
+		fmt.Fprintf(b, "kdb_admission_denied_total{class=%q,reason=\"zone\"} %d\n", c, stats.DeniedZone[c].Load())
+		fmt.Fprintf(b, "kdb_admission_denied_total{class=%q,reason=\"capacity\"} %d\n", c, stats.DeniedCapacity[c].Load())
+		fmt.Fprintf(b, "kdb_admission_denied_total{class=%q,reason=\"too_large\"} %d\n", c, stats.DeniedTooLarge[c].Load())
+	}
+	fmt.Fprintf(b, "# HELP kdb_admission_outstanding_bytes Bytes currently reserved by live grants.\n# TYPE kdb_admission_outstanding_bytes gauge\nkdb_admission_outstanding_bytes %d\n", adm.OutstandingBytes())
+	fmt.Fprintf(b, "# HELP kdb_admission_floor_bytes Capacity withheld as the non-granted floor.\n# TYPE kdb_admission_floor_bytes gauge\nkdb_admission_floor_bytes %d\n", adm.FloorHeldBytes())
+	fmt.Fprintf(b, "# HELP kdb_admission_scan_row_budget Current per-scan rows-examined budget.\n# TYPE kdb_admission_scan_row_budget gauge\nkdb_admission_scan_row_budget %d\n", adm.ScanRowBudget())
+	fmt.Fprintf(b, "# HELP kdb_admission_zone_changes_total Pressure-zone transitions.\n# TYPE kdb_admission_zone_changes_total counter\nkdb_admission_zone_changes_total %d\n", stats.ZoneChanges.Load())
+	fmt.Fprintf(b, "# HELP kdb_admission_critical_enters_total Entries into the critical zone.\n# TYPE kdb_admission_critical_enters_total counter\nkdb_admission_critical_enters_total %d\n", stats.CriticalEnters.Load())
+
+	costs := adm.Costs()
+	if costs == nil {
+		return
+	}
+	b.WriteString("# HELP kdb_cost_estimate_accuracy_p95 p95 of actual/estimate per class; >1 means under-estimation at the tail.\n# TYPE kdb_cost_estimate_accuracy_p95 gauge\n")
+	b.WriteString("# HELP kdb_cost_safety_multiplier Estimate scale-up applied while a class under-estimates.\n# TYPE kdb_cost_safety_multiplier gauge\n")
+	for _, c := range []OpClass{ClassPointRead, ClassScan} {
+		fmt.Fprintf(b, "kdb_cost_estimate_accuracy_p95{class=%q} %g\n", c, costs.AccuracyP95(c))
+		fmt.Fprintf(b, "kdb_cost_safety_multiplier{class=%q} %g\n", c, costs.SafetyMultiplier(c))
+	}
+	fmt.Fprintf(b, "# HELP kdb_cost_learned_cells Learned shape cells currently held.\n# TYPE kdb_cost_learned_cells gauge\nkdb_cost_learned_cells %d\n", costs.LearnedCells())
 }

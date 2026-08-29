@@ -56,6 +56,8 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 			return QueryResult{}, err
 		}
 		if doc != nil {
+			ctx.Stats.addDocRead(len(doc.JSON))
+			ctx.Stats.addRetained(int64(len(doc.JSON)) + retainedRowOverheadBytes)
 			pairs = append(pairs, struct {
 				id  codec.UUID
 				doc document.Document
@@ -83,9 +85,32 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	}
 	rows := make([]QueryRow, 0, len(pairs))
 	for _, p := range pairs {
-		rows = append(rows, QueryRow{Values: projectRow(query.Projections, p.doc, ctx)})
+		row := QueryRow{Values: projectRow(query.Projections, p.doc, ctx)}
+		ctx.Stats.addRetained(rowBytes(row))
+		rows = append(rows, row)
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows}, nil
+}
+
+// retainedRowOverheadBytes is the per-row fixed cost charged on top of document content when
+// accounting materialized results: the pair struct, slice headers, and map/interface overhead
+// around each held document. A deliberate round overestimate - admission's safe direction.
+const retainedRowOverheadBytes = 128
+
+// rowBytes sizes one projected row's cells - the string/JSON content plus a fixed per-cell
+// overhead for the Cell interface value itself.
+func rowBytes(r QueryRow) int64 {
+	total := int64(0)
+	for _, c := range r.Values {
+		switch v := c.(type) {
+		case CellString:
+			total += int64(len(v.Value))
+		case CellJSON:
+			total += int64(len(v.JSON))
+		}
+		total += 32 // interface header + small-value cells
+	}
+	return total
 }
 
 // stripLimit peels the planner's outermost PlanLimit off a plan, returning the inner plan along
@@ -138,6 +163,8 @@ func (e *Executor) executeAggregateSelect(query SelectQuery, ctx QueryContext) (
 			return QueryResult{}, err
 		}
 		if doc != nil {
+			ctx.Stats.addDocRead(len(doc.JSON))
+			ctx.Stats.addRetained(int64(len(doc.JSON)) + retainedRowOverheadBytes)
 			docs = append(docs, *doc)
 		}
 	}
@@ -199,6 +226,7 @@ func (e *Executor) fullScan(ctx QueryContext) ([]codec.UUID, error) {
 	err = e.Storage.ScanDocuments(ctx.NamespaceID, treeHash, 256, func(batch []document.Document) error {
 		for _, d := range batch {
 			examined++
+			ctx.Stats.addExamined(1)
 			if ctx.RowBudget > 0 && examined > ctx.RowBudget {
 				return &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
 			}
@@ -256,6 +284,10 @@ func (e *Executor) filterIDs(ids []codec.UUID, predicate Expr, ctx QueryContext)
 		doc, err := e.Storage.GetDocument(ctx.NamespaceID, id, treeHash)
 		if err != nil {
 			return nil, err
+		}
+		ctx.Stats.addExamined(1)
+		if doc != nil {
+			ctx.Stats.addDocRead(len(doc.JSON))
 		}
 		if doc == nil {
 			continue
