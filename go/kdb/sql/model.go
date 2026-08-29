@@ -208,6 +208,16 @@ type QueryContext struct {
 	AtCommit    *codec.Hash
 	Parameters  []Parameter
 	MaxRows     int
+	// RowBudget caps how many rows a scan may *examine*, as opposed to MaxRows which caps how
+	// many it returns - kdb-spec-layer13 Component 48 §5.2, closing §2.8's "no bound on scan
+	// work" gap. 0 means unlimited.
+	//
+	// The distinction is the whole point: a `SELECT ... WHERE <selective predicate>` over a
+	// namespace of ten million documents returns almost nothing and so respects any MaxRows
+	// comfortably, while still reading every one of those ten million documents into memory to
+	// decide that. Bounding the result bounds what the client sees; only bounding the work
+	// bounds what the server spends.
+	RowBudget int
 }
 
 // QueryResult is a SELECT or DDL result set.
