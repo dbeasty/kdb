@@ -136,6 +136,44 @@ func TestOversizedOperationIsResourceExhaustedNotBusy(t *testing.T) {
 	}
 }
 
+// The governance sim runs scenarios with 15-26MB budgets; the default 48MB reserve, unclamped,
+// left those nodes with a 1-byte grant capacity that refused every operation - reads included -
+// as too-large, forever, and the reserve's touched pages alone overflowed the container.
+func TestReserveClampedToQuarterOfBudget(t *testing.T) {
+	const budget = 16 << 20
+	a := newTestAdmission(t, budget, DefaultRescueReserveBytes)
+	if got, want := a.RescueReserveBytes(), int64(budget)/4; got != want {
+		t.Errorf("reserve should clamp to a quarter of the budget, got %d want %d", got, want)
+	}
+	if a.capacity != budget-budget/4 {
+		t.Errorf("capacity should be budget minus the clamped reserve, got %d", a.capacity)
+	}
+	// The clamp is what keeps ordinary work admissible under a tiny budget.
+	grant, err := a.Acquire(context.Background(), ClassWrite, 2000)
+	if err != nil {
+		t.Fatalf("a 2KB write must be admissible under a 16MB budget, got %v", err)
+	}
+	grant.Release()
+}
+
+// A point read has no smaller form to resubmit, so ResourceExhausted is meaningless for it -
+// reads degrade last (P7). An estimate above capacity is clamped to capacity instead.
+func TestPointReadNeverRefusedAsTooLarge(t *testing.T) {
+	a := newTestAdmission(t, 64<<10, 0)
+	grant, err := a.AcquireBytes(context.Background(), ClassPointRead, 10<<20)
+	if err != nil {
+		t.Fatalf("an oversized point-read estimate must clamp, not refuse, got %v", err)
+	}
+	if grant.CostBytes() != a.capacity {
+		t.Errorf("clamped point read should hold the whole capacity, got %d want %d",
+			grant.CostBytes(), a.capacity)
+	}
+	grant.Release()
+	if got := a.stats.DeniedTooLarge[ClassPointRead].Load(); got != 0 {
+		t.Errorf("no too-large denial should be counted for point reads, got %d", got)
+	}
+}
+
 func TestZonePolicyShedsByClass(t *testing.T) {
 	a := newTestAdmission(t, 1<<30, 0)
 	for _, tc := range []struct {

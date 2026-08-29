@@ -85,6 +85,15 @@ type AdmissionStats struct {
 // partway through for want of a few megabytes.
 const DefaultRescueReserveBytes int64 = 48 << 20
 
+// maxReserveFractionOfBudget caps the rescue reserve at a quarter of the budget. The default
+// 48MB reserve was sized for the ~1GB deployments the spec targets; against a deliberately tiny
+// budget (the governance sim runs scenarios at 15-26MB) an unclamped reserve exceeds the whole
+// budget, which inverts its purpose twice over: grant capacity degenerates to the 1-byte floor,
+// so every operation is refused as too-large forever - reads included - and the reserve's
+// touched pages alone can overflow the container the budget was meant to protect. A reserve
+// exists to buy the abort path headroom, not to be the reason the abort path runs.
+const maxReserveFractionOfBudget = 4
+
 // DefaultScanRowBudget bounds rows *examined* per scan, not merely rows returned (§5.2, closing
 // §2.8's "no bound on scan work" gap). A scan that exceeds it is aborted with a typed
 // ResourceExhausted rather than being allowed to consume the node.
@@ -101,15 +110,16 @@ func NewAdmission(guard *MemoryGuard, reserveBytes int64, scanRowBudget int64) *
 	if reserveBytes < 0 {
 		reserveBytes = 0
 	}
+	if maxReserve := int64(limit) / maxReserveFractionOfBudget; reserveBytes > maxReserve {
+		reserveBytes = maxReserve
+	}
 	if scanRowBudget <= 0 {
 		scanRowBudget = DefaultScanRowBudget
 	}
 	capacity := int64(limit) - reserveBytes
 	if capacity < 1 {
-		// A budget smaller than the reserve is a misconfiguration, but it must not produce a
-		// zero-capacity semaphore that deadlocks every caller forever. Leave a token capacity so
-		// the system still functions (and still rejects, loudly, via the zone policy) rather
-		// than wedging.
+		// Unreachable given the reserve clamp above, but a zero-capacity semaphore would
+		// deadlock every caller forever, so keep the floor as defense in depth.
 		capacity = 1
 	}
 	a := &Admission{
@@ -149,6 +159,15 @@ func (a *Admission) ScanRowBudget() int64 {
 		return 0
 	}
 	return a.scanRowBudget.Load()
+}
+
+// RescueReserveBytes is the effective rescue reserve size after clamping to the budget -
+// what the startup banner should report, which the configured value no longer guarantees.
+func (a *Admission) RescueReserveBytes() int64 {
+	if a == nil {
+		return 0
+	}
+	return a.reserve.size
 }
 
 // ReserveLost reports whether the rescue reserve could not be re-allocated (§5.6).
@@ -325,6 +344,13 @@ func (a *Admission) AcquireBytes(ctx context.Context, class OpClass, cost int64)
 
 	if cost < a.costs.baseFor(class) {
 		cost = a.costs.baseFor(class)
+	}
+	if cost > a.capacity && class == ClassPointRead {
+		// ResourceExhausted means "resubmit smaller", and a point read has no smaller form -
+		// refusing it permanently is the read-refusing zombie P7 exists to rule out. Charge
+		// everything the node has instead: the read still waits its turn for real capacity,
+		// and reads remain the last class standing however degenerate the configuration.
+		cost = a.capacity
 	}
 	if cost > a.capacity {
 		a.stats.DeniedTooLarge[classIndex(class)].Add(1)

@@ -180,10 +180,9 @@ func TestPressureRecoversAfterDwell(t *testing.T) {
 // Component 51 defined but nothing produced until the cost model existed to make the judgment.
 func TestCommitRejectedWhenLargerThanCapacity(t *testing.T) {
 	srv := newTestRuntime(t)
-	// A budget barely above the rescue reserve leaves a tiny grant capacity, so an ordinary
-	// commit exceeds it - the same condition a genuinely enormous transaction would create
-	// against a realistic budget, without needing to build one.
-	srv.SetMemoryBudget(uint64(DefaultRescueReserveBytes+4096), 0.85, DefaultRescueReserveBytes, DefaultScanRowBudget)
+	// A small budget (the reserve clamps to a quarter of it, leaving 96KB of capacity) against
+	// a document whose write estimate is ~1.5MB: too large to ever fit, however long it waits.
+	srv.SetMemoryBudget(128<<10, 0.85, DefaultRescueReserveBytes, DefaultScanRowBudget)
 	defer srv.memGuard.Stop()
 	srv.memGuard.Stop()
 	srv.memGuard.observe(1) // stay in ZoneNormal, so the zone policy is not what rejects
@@ -192,7 +191,11 @@ func TestCommitRejectedWhenLargerThanCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = srv.Upsert("app/data", docID, `{"v":1}`, auth.Principal{})
+	huge := make([]byte, 1<<20)
+	for i := range huge {
+		huge[i] = 'a'
+	}
+	_, err = srv.Upsert("app/data", docID, `{"v":"`+string(huge)+`"}`, auth.Principal{})
 	var exhausted *ResourceExhaustedError
 	if !asError(err, &exhausted) {
 		t.Fatalf("expected *ResourceExhaustedError, got %T: %v", err, err)

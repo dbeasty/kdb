@@ -188,8 +188,10 @@ func main() {
 			// Make the GC spend CPU before admission has to start refusing work - the first
 			// response to a rising heap should be collecting harder, not shedding requests.
 			goMemLimit := server.ApplyGoMemoryLimit(budgetBytes)
+			// Report the reserve the admission system actually holds, not the configured
+			// value - NewAdmission clamps it to a quarter of the budget.
 			memoryLimitStatus = fmt.Sprintf("%dMB %s (zones at 70/85/93%%, reserve %dMB, GOMEMLIMIT %dMB)",
-				budgetBytes/(1024*1024), source, reserveBytes/(1024*1024), goMemLimit/(1024*1024))
+				budgetBytes/(1024*1024), source, srv.Admission().RescueReserveBytes()/(1024*1024), goMemLimit/(1024*1024))
 		}
 	}
 	srv.MaxConnections = cfg.MaxConnections
