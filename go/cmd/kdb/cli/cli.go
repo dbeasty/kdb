@@ -19,7 +19,7 @@ type Config struct {
 // Run is the kdb CLI entrypoint (mirrors dev.kdb.cli.KdbCli).
 func Run(args []string) int {
 	if len(args) == 1 && (args[0] == "version" || args[0] == "--version") {
-		fmt.Println(version.Version)
+		fmt.Println(version.String())
 		return 0
 	}
 	cfg, cmd, err := parseArgs(args)

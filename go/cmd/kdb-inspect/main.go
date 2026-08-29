@@ -22,7 +22,7 @@ func main() {
 func run(args []string) error {
 	switch args[0] {
 	case "version", "--version":
-		fmt.Println(version.Version)
+		fmt.Println(version.String())
 		return nil
 	case "dump-wire":
 		return dumpWire(args[1:])

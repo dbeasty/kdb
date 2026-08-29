@@ -573,11 +573,17 @@ Kotlin: `kdb-index` (1622 LOC), `kdb-index-btree` and `kdb-storage-compaction` a
 ### Out-of-plan work that landed alongside Phase 3 (2026-08-27)
 
 - **Write-path performance** (`456c673`, `8fe306d`): fixed a ~21MB-per-commit allocation; made delta/SSTable pages self-describing; group-commit for the delta log; durability and compression made configurable.
-- **Storage-layer correctness follow-ups** (`01d0654`) — closed the four problems the write-path PR had documented as out of scope:
+- **Storage-layer correctness follow-ups** (`01d0654`) — closed the four problems the write-path PR had documented as out of scope, plus three smaller ones found in the code those fixes touched:
   - **Deletes did not shadow flushed data.** `SortedTable.Delete` stored a nil value as a tombstone but `Get` read nil as "no entry" and fell through to the pending-flush generation and then the SSTable, so deleting an already-flushed key returned the old value. The table now stores an explicit `{value, deleted}` slot and exposes `Lookup`, distinguishing "tombstoned here" from "never seen here"; `Manager.Get` stops at a tombstone, and `Manager` gained a `Delete` that reaches the active memtable at all. **Known remaining limitation, deliberately not papered over**: the tombstone does not survive a flush — the SSTable format has no deleted marker, so a delete of an already-flushed key holds only while the tombstone lives in memory. Persisting it needs an SSTable format change, which per `docs/go-porting.md` must originate on the Kotlin side; called out in `Manager.Delete`'s doc comment. **Tracked as a Phase 4 cross-language format item.**
   - **`SizeBytes` only ever grew** (the Go half of 1-K2) — `Put` added the new value's length without subtracting the replaced one and `Delete` added nothing while removing a value, so the flush trigger drifted upward permanently and eventually flushed on every write. Both now net out.
   - **WAL segments never rotated** — `walMaxSegmentBytes` was stored and never compared against `segmentSize`, so one segment grew without bound (the Go twin of 1-K3's deferred item). The WAL is now a chain: an append that would exceed the cap seals the active segment and starts a new one named with the sequence its records begin at, so the chain sorts by name into sequence order; `Recover` walks the whole chain, `Truncate` drops only fully-covered segments, and a batch stays within one segment. Reopening now also reads the active segment's real size up front — previously only a `recover()` pass set it, leaving every offset and size check wrong on a reopened WAL until one happened. `walMaxSegmentBytes`/`walSkipCorruptRecords` are now honored from `StorageEngineConfig`, which `OpenOrCreate` had been ignoring entirely.
-  - **The index rebuilt itself from the full event log on every lookup** — `replayBuckets` existed byte-for-byte in both `memory_store.go` and `versioned_engine.go`, each call re-sorting the whole event log and building fresh buckets.
+  - **The index rebuilt itself from the full event log on every lookup** — `replayBuckets` existed byte-for-byte in both `memory_store.go` and `versioned_engine.go`, each call re-sorting the whole event log and building fresh buckets, then calling `dag.IsAncestor` per event — which walks the cutoff's entire ancestor closure from scratch every time. Both now delegate to a shared `eventLog` (`go/kdb/index/event_log.go`) rather than duplicating the replay: ancestry resolves against **one** closure (new `dag.AncestorSet`), the two already-sorted event slices are merged instead of sorting a copy, and the result is memoized.
+    - The memo key is `(cutoff, event count, dag.AncestryVersion())` — a counter on `InMemoryCommitDag` bumped wherever a commit appears or disappears (`putCommitLocked`, `Squash`, `StubCommit`). **There is no explicit invalidation to forget to call**: anything that could change the answer changes the key. The DAG term is load-bearing rather than defensive — `TestLookupReflectsAncestryChange` (squash a commit out from under a cached cutoff) fails without it. The cache holds `bucketCacheEntries` = 8 bucket sets, so "head plus a few historical reads" stays covered without growing without bound.
+    - Measured on `BenchmarkVersionedEngineLookup` (2000 events, 200 commits of history, repeated head lookup; Apple M3 Max), comparing the same code with the memo disabled: **194 µs → 1.5 µs per lookup, 255 KB/803 allocs → 600 B/4 allocs**.
+  - **Three smaller fixes from the same commit, in code the flush path touches**:
+    - `Manager.Flush` cleared `pendingFlush` *before* `writer.Finish()` — the Go twin of the Kotlin 1-K2 flush-failure bug documented above, which had been fixed on the Kotlin side only. A failed flush lost the generation from all three of `active`, `pendingFlush` and the blob store. `clearPending` now runs after `Finish()`/`AddTable` succeed, and only if the pending generation is still the one that flush staged. Un-skips `TestManagerFlushFailureKeepsDataVisible`.
+    - `LsmBlobStore.tables` was appended to by `AddTable` on the flush path and read by `Get` on the read path with nothing serializing them — a plain data race, not a hypothetical one. Now mutex-guarded, with `AddTable` copying rather than appending in place so an in-flight `Get` keeps a stable backing array.
+    - **WAL segment naming deviates from the spec deliberately.** The spec's sealed name `{walId}.{firstSeq}-{lastSeq}.log.sealed` identifies a segment by the range it ended up covering, which can only be assigned once the segment is full — i.e. it needs a rename, and `PlatformIOShim` has no rename (nor a copy that wouldn't rewrite the whole segment). Segments are named `{walId}.{firstSequence}`, zero-padded so lexicographic order equals sequence order (the convention `DeltaSequencedFileName` already uses). Same ordering and truncation information: a sealed segment's last sequence is its successor's first minus one. A WAL's first segment keeps the plain `{walId}` name, so pre-rotation directories reopen unchanged. Recorded here because it is the kind of deviation someone later "fixes" without knowing why it exists.
 - **`integration` CI job could never have passed** (`41cf11c`): `:kdb-integration:e2ePython` drives the same pytest harness the `e2e` job runs, and that harness launches the real Go service — but the job set up Java and Python and never Go, and never built the binaries, so every run failed with `KDB_SERVICE_BIN not set`. Predates the write-path work; the job was already failing on the commit before it. Now mirrors `e2e`'s `make build-go` + helper build + pip install.
 
 ### Current status summary (2026-08-27)
@@ -592,3 +598,48 @@ Phases 0, 1, 2 and 3.2 are complete. Phase 3.1 is partially done. Phase 4 has no
 5. Go WS **server** side (`Listen` 501s every request, including genuine upgrades) and PKCS12↔PEM fixture generation — both prerequisites for the `test_tls.py` cross-language interop halves, currently interop-marked pending.
 6. `MultiClientSqlIntegrationTest.twoSessions_snapshotRead_sameData` — genuinely intermittent, never reproduced locally; needs many repeated CI runs to characterize, not a quick local repro.
 7. Phase 4 in full.
+
+### Build identity: git commit in the version string (2026-08-27)
+
+Phase 2.8 gave the three Go binaries a `--version` from a single `VERSION` file, but nothing tied a
+built artifact to the source it came from — `0.1.0` names a release, not a tree, and a hotfix build,
+a release build and a developer's local build of the same version are indistinguishable once
+shipped. `go/kdb/version` now carries the full build identity: `Version`, `Commit` (full SHA — short
+SHAs stop being unique as a repo grows), `BuildDate`, and `Dirty`, resolved through `version.Get()`
+into an `Info` and rendered by `version.String()` as
+`0.1.0 (commit 8fe306d, built 2026-08-27T09:41:02Z, go1.26.3 darwin/arm64)`.
+
+- **Nothing has to be injected for the commit to be right.** Anything left empty falls back to the
+  VCS stamp the Go toolchain already embeds in binaries built inside a git work tree
+  (`debug.ReadBuildInfo`'s `vcs.revision`/`vcs.time`/`vcs.modified`), so a plain
+  `go build ./cmd/kdb` reports the real commit and dirty state. Link-time injection exists only for
+  the builds where that stamp is unavailable — the Docker build copies `go/` into the image without
+  `.git`, and would otherwise ship untraceable binaries. A field that is neither injected nor
+  stamped reads `unknown`, never empty: an empty `--version` field looks like a formatting bug
+  rather than a missing provenance.
+- **Surfaces**: `--version`/`version` on all three binaries; the service startup log line
+  (`commit`, `commit_dirty`, `build_date` alongside `version`, full SHA — that line is how a running
+  service gets traced); `GET /healthz` as `key=value` lines so a scraper can read it without
+  shelling into the container; and a new `kdb_build_info{version,commit,dirty,build_date,go_version}
+  1` gauge on `/metrics` — the standard Prometheus build-info pattern, which makes a rollout show up
+  as two label sets rather than an unexplained step in some other series.
+- **Injection plumbing**: `Makefile` derives `GIT_COMMIT`/`GIT_DIRTY`/`BUILD_DATE` (plus a
+  `print-version` target to see what a build will stamp); the `Dockerfile` takes them as build args
+  and defaults `GIT_COMMIT=unknown` rather than pretending; `release.yml` passes `GITHUB_SHA` to both
+  the cross-compile matrix and the image build, with `Dirty=false` since a tag build is a clean
+  checkout by definition.
+- **Kotlin side**: root `build.gradle.kts` now reads the same `VERSION` file into every project's
+  `version` (they were all `unspecified`) and stamps `Implementation-Version`/`Implementation-Commit`
+  /`Implementation-Commit-Dirty` into every jar manifest. Deliberately no build timestamp there — it
+  would change on every build and invalidate every jar task's up-to-date check for traceability the
+  commit already provides.
+
+**Not done**: the Kotlin CLI/service still has no `--version` command — the manifest carries the
+identity, but nothing reads it back out. That needs a generated `BuildInfo` in a `commonMain` source
+set to work across the KMP targets, and the deploy target is Go, so it was left out rather than
+half-built. The handshake banner remains skipped for the reason 2.8 originally gave (shared
+cross-language wire format).
+
+**Verification**: `go vet ./...` and `gofmt` clean; `go test -race ./...` green; `make build-go` then
+`--version` on all three binaries; a plain `go build` with no ldflags confirmed to recover the commit
+and dirty flag from the VCS stamp.
