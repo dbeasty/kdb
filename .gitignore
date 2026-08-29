@@ -43,6 +43,8 @@ kotlin-js-store/
 
 # Go
 go/bin/
+go/kdb-service
+go/kdb-client
 go/**/*.wasm
 go/**/wasm_exec.js
 
