@@ -198,3 +198,64 @@ func scanInputForTest(t *testing.T, srv *KdbServerRuntime, namespace, sqlText st
 		RowBudget: int(srv.admission.ScanRowBudget()),
 	}
 }
+
+// The marquee behavioral difference from the flat 1 MiB scan grant: a scan whose structural
+// cost exceeds the node's entire grant capacity is refused up front with a typed
+// RESOURCE_EXHAUSTED - "resubmit smaller, retrying cannot help" - instead of being admitted
+// against a token reservation and discovering the truth as an OOM.
+func TestOversizedScanRefusedResourceExhausted(t *testing.T) {
+	srv := newTestRuntime(t)
+	// Seed a namespace of large documents first, while admission is still permissive.
+	srv.SetMemoryLimit(testBudget, 0.85)
+	filler := make([]byte, 32<<10)
+	for i := range filler {
+		filler[i] = 'x'
+	}
+	for i := 0; i < 300; i++ {
+		docID, err := codec.RandomUUID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := srv.Upsert("app/data", docID, fmt.Sprintf(`{"v":%q}`, string(filler)), auth.Principal{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Now shrink the budget so 300 x 32KiB x copies dwarfs grant capacity (16MB budget minus
+	// the 8MB reserve leaves 8MB; the structural estimate for SELECT * here is ~19-29MB).
+	srv.SetMemoryBudget(16<<20, 0.85, 8<<20, DefaultScanRowBudget)
+	t.Cleanup(func() { srv.memGuard.Stop() })
+
+	ln, err := ListenSqlWire("tcp://127.0.0.1:0?bind=true", srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	client := dialRawWireClient(t, "tcp://"+ln.Addr().String())
+	client.handshake(t, wire.ClientSQL, "app/data")
+	ack := client.sessionBegin(t, "app/data", "READ_COMMITTED")
+
+	// A bounded query first: cheap, admitted, and it teaches the estimator this namespace's
+	// real document size (the fresh model would otherwise price first contact at the 2KiB
+	// default and let one oversized scan through before the accuracy loop catches it).
+	bounded := client.sqlExec(t, "app/data", ack.SessionID, "SELECT * FROM t LIMIT 3")
+	if bounded.Error != nil {
+		t.Fatalf("bounded query should be admitted: %s", *bounded.Error)
+	}
+	if len(bounded.Rows) != 3 {
+		t.Fatalf("bounded query returned %d rows, want 3", len(bounded.Rows))
+	}
+
+	result := client.sqlExec(t, "app/data", ack.SessionID, "SELECT * FROM t")
+	if result.Error == nil {
+		t.Fatal("a scan estimated above total grant capacity must be refused")
+	}
+	if result.ErrorCode == nil || *result.ErrorCode != wire.ErrorCodeResourceExhausted {
+		t.Fatalf("want RESOURCE_EXHAUSTED (resubmit smaller), got code=%v err=%s", result.ErrorCode, *result.Error)
+	}
+	// The refusal is about that query's cost, not the namespace or the node: bounded queries
+	// keep working.
+	again := client.sqlExec(t, "app/data", ack.SessionID, "SELECT kdb_id FROM t LIMIT 3")
+	if again.Error != nil {
+		t.Fatalf("bounded query should still be admitted after the refusal: %s", *again.Error)
+	}
+}
