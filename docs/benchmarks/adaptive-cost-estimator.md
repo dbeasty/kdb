@@ -61,3 +61,25 @@ Reading:
   costs more than it protects.)
 - The A/B above is loopback and in-memory-runtime; the governance sim
   (docs/benchmarks/resource-governance-sim) is the behavioral gate under real cgroup limits.
+
+## Governance sim (2026-08-29): branch passes all three scenarios; main fails two
+
+Running the sim surfaced a defect that predates this branch: the sim's last recorded pass
+(2026-08-27, `e2bbc82`) was against the pre-admission build, and PR #12's 48MB rescue reserve is
+never clamped to the budget. Against the sim's deliberately tiny budgets (15-26MB) capacity
+degenerates to the 1-byte floor - every operation is refused as `RESOURCE_EXHAUSTED` forever -
+and the reserve's touched pages alone overflow scenario 1's 40MB container.
+
+Same harness, same machine, run back-to-back:
+
+| | main `5a2b408` | this branch |
+|---|---|---|
+| 1: 40m no-zombie | **FAIL** - 0 writes land, 64 unclassified errors, no BUSY, container **OOM-killed** | PASS - 863 writes, 20 typed BUSY, no OOM |
+| 2: abort + restart | **FAIL** - no code-75 abort observed; pre-abort document unreadable after restart | PASS - orderly abort, restart, document intact |
+| 3: 0.25 vCPU | PASS | PASS |
+
+Fixed on this branch (`de25615`) by clamping the reserve to a quarter of the budget, and by
+clamping - not refusing - a point read whose estimate exceeds capacity: `RESOURCE_EXHAUSTED`
+means "resubmit smaller", and a point read has no smaller form (reads degrade last, P7).
+Scenario 2's read-back failure was the branch's read governance making main's latent defect
+visible; the root cause is main's.
