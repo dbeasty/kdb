@@ -44,3 +44,30 @@ func readUintFile(path string) (uint64, bool) {
 	}
 	return v, true
 }
+
+// cgroupMemoryLimitBytes reads the memory ceiling this process is actually subject to - the
+// number a container's --memory is enforced as, and so the right default for the server's memory
+// budget (kdb-spec-layer13 §13: "Default: cgroup limit if detectable"). Returns ok=false when
+// there is no cgroup memory controller, or when there is one but it imposes no limit: cgroup v2
+// spells that "max", and cgroup v1 spells it as a sentinel so large it is indistinguishable from
+// "unlimited" in practice. Treating either as a real budget would size the guard against a number
+// that has nothing to do with the memory available.
+func cgroupMemoryLimitBytes() (uint64, bool) {
+	if b, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil { // cgroup v2
+		text := strings.TrimSpace(string(b))
+		if text == "max" {
+			return 0, false
+		}
+		if v, err := strconv.ParseUint(text, 10, 64); err == nil && v > 0 {
+			return v, true
+		}
+	}
+	if v, ok := readUintFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); ok { // cgroup v1
+		// v1's "no limit" is PAGE_COUNTER_MAX scaled by page size - astronomically larger than
+		// any real machine. Anything at or above an exbibyte is that sentinel, not a budget.
+		if v > 0 && v < (1<<60) {
+			return v, true
+		}
+	}
+	return 0, false
+}

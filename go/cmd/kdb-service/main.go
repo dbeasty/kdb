@@ -45,8 +45,12 @@ func main() {
 	fs.StringVar(&flagVals.PeerAddr, "peer-addr", flagVals.PeerAddr, "peer sync (Mode 3 full-peer) wire listen address (empty to disable)")
 	fs.StringVar(&flagVals.StreamAddr, "stream-addr", flagVals.StreamAddr, "stream (Mode 1 read-only / Mode 2 write-back) wire listen address (empty to disable)")
 	fs.BoolVar(&flagVals.RBAC, "rbac", flagVals.RBAC, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
-	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "reject new writes (rather than risk an OS OOM-kill under sustained load) once process memory nears this budget; rejection triggers at 85% of this value, so set this to 60-80% of the container's actual --memory limit - 80% carries no throughput cost over 60% but do not go above 80% until kdb-spec-layer13 Component 48's full admission control lands, since a burst of already-admitted writes between the guard's periodic samples can still outrun a trip point that close to the real ceiling - see docs/benchmarks/lightsail-sim/README.md for the numbers behind that guidance. 0 disables (default)")
-	fs.DurationVar(&flagVals.AbortAfter, "abort-after", flagVals.AbortAfter, "if memory pressure (see --memory-limit-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
+	fs.IntVar(&flagVals.MemoryBudgetMB, "memory-budget-mb", flagVals.MemoryBudgetMB, "memory budget that admission control governs against: operations reserve their estimated memory cost before running, and are refused with a typed, retryable error once the budget is committed, rather than the process being OOM-killed with no signal to the client. 0 (default) auto-detects - the cgroup/container memory limit where there is one, else 75% of host RAM - so governance is on by default; -1 disables it entirely; a positive value is an explicit budget in MiB. With Component 48's accounting this can be set at the container's real --memory limit, unlike the deprecated --memory-limit-mb it replaces")
+	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "DEPRECATED alias for --memory-budget-mb, retained for existing configs. Its old meaning is preserved: an explicit 0 disables governance (whereas --memory-budget-mb 0 auto-detects). The old guidance to set this to only 60-80% of the container limit no longer applies - it was a workaround for the reactive sampler this replaces")
+	fs.IntVar(&flagVals.MemoryReserveMB, "memory-reserve-mb", flagVals.MemoryReserveMB, "rescue reserve held back from the grant system and released on entry to the Critical pressure zone, so in-flight commits can finish, storage can be flushed, and typed rejections can be written instead of the process dying partway through (kdb-spec-layer13 Component 48 §5.6)")
+	fs.IntVar(&flagVals.MaxConnections, "max-connections", flagVals.MaxConnections, "cap on concurrently-accepted connections per listener; connections past the cap are closed at accept time. Each accepted connection costs a goroutine stack and a frame buffer whether or not it sends anything, none of which admission control can see - 0 means unlimited (kdb-spec-layer13 Component 49 §6.5)")
+	fs.IntVar(&flagVals.ScanRowBudget, "scan-row-budget", flagVals.ScanRowBudget, "maximum rows a single scan may examine (not merely return) before it is aborted with RESOURCE_EXHAUSTED; shrinks automatically as memory pressure rises. 0 means unlimited (kdb-spec-layer13 Component 48 §5.2)")
+	fs.DurationVar(&flagVals.AbortAfter, "abort-after", flagVals.AbortAfter, "if memory pressure (see --memory-budget-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
 	fs.StringVar(&flagVals.TLSCert, "tls-cert", flagVals.TLSCert, "PEM certificate file - set together with --tls-key to require TLS on the SQL/peer-sync/stream listeners (each --*-addr's scheme is upgraded from tcp:// to tcps:// automatically)")
 	fs.StringVar(&flagVals.TLSKey, "tls-key", flagVals.TLSKey, "PEM private key file, paired with --tls-cert")
 	fs.StringVar(&flagVals.TLSCA, "tls-ca", flagVals.TLSCA, "PEM CA bundle to verify client certificates against - required by --tls-client-auth, optional (accept-but-don't-require) otherwise")
@@ -88,7 +92,7 @@ func main() {
 	}
 	dataDir, memory, namespace := cfg.DataDir, cfg.Memory, cfg.Namespace
 	sqlAddr, peerAddr, streamAddr, adminAddr := cfg.SQLAddr, cfg.PeerAddr, cfg.StreamAddr, cfg.AdminAddr
-	rbac, memoryLimitMB, abortAfter, drainTimeout := cfg.RBAC, cfg.MemoryLimitMB, cfg.AbortAfter, cfg.DrainTimeout
+	rbac, abortAfter, drainTimeout := cfg.RBAC, cfg.AbortAfter, cfg.DrainTimeout
 
 	logger, err := buildLogger(cfg.LogLevel, cfg.LogFormat)
 	if err != nil {
@@ -152,12 +156,32 @@ func main() {
 		os.Exit(2)
 	}
 
-	memoryLimitStatus := "disabled"
-	if memoryLimitMB > 0 {
-		limitBytes := uint64(memoryLimitMB) * 1024 * 1024
-		srv.SetMemoryLimit(limitBytes, 0.85)
-		memoryLimitStatus = fmt.Sprintf("%dMB (reject at 85%%)", memoryLimitMB)
+	// Resource governance. Unlike every previous release this is on unless explicitly turned
+	// off: the mechanism that keeps sustained write load from ending in an OOM kill was
+	// previously inert in every deployment that did not know to ask for it by name.
+	memoryLimitStatus := "disabled (--memory-budget-mb=-1)"
+	if cfg.MemoryBudgetMB >= 0 {
+		var budgetBytes uint64
+		source := "explicit"
+		if cfg.MemoryBudgetMB == 0 {
+			budgetBytes = server.DetectMemoryBudgetBytes()
+			source = "auto-detected"
+		} else {
+			budgetBytes = uint64(cfg.MemoryBudgetMB) * 1024 * 1024
+		}
+		if budgetBytes == 0 {
+			memoryLimitStatus = "disabled (no cgroup limit and no readable host memory to auto-detect from)"
+		} else {
+			reserveBytes := int64(cfg.MemoryReserveMB) * 1024 * 1024
+			srv.SetMemoryBudget(budgetBytes, 0.85, reserveBytes, int64(cfg.ScanRowBudget))
+			// Make the GC spend CPU before admission has to start refusing work - the first
+			// response to a rising heap should be collecting harder, not shedding requests.
+			goMemLimit := server.ApplyGoMemoryLimit(budgetBytes)
+			memoryLimitStatus = fmt.Sprintf("%dMB %s (zones at 70/85/93%%, reserve %dMB, GOMEMLIMIT %dMB)",
+				budgetBytes/(1024*1024), source, reserveBytes/(1024*1024), goMemLimit/(1024*1024))
+		}
 	}
+	srv.MaxConnections = cfg.MaxConnections
 
 	rbacStatus := "disabled"
 	if rbac {
