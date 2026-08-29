@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -174,11 +176,22 @@ func main() {
 		} else {
 			reserveBytes := int64(cfg.MemoryReserveMB) * 1024 * 1024
 			srv.SetMemoryBudget(budgetBytes, 0.85, reserveBytes, int64(cfg.ScanRowBudget))
+			// Warm the cost estimator with what a previous run learned. The value is for rare,
+			// expensive scan shapes (executed once an hour, they would otherwise relearn from
+			// scratch after every restart); write costs are compiled-in calibration and hot
+			// shapes relearn in milliseconds regardless. Restore treats the file as a
+			// discounted prior and silently ignores anything malformed or stale - a bad cost
+			// file must never stop the server (P4, crash-only).
+			if dataDir != "" {
+				loadCostModelState(srv, filepath.Join(dataDir, costModelStateFile))
+			}
 			// Make the GC spend CPU before admission has to start refusing work - the first
 			// response to a rising heap should be collecting harder, not shedding requests.
 			goMemLimit := server.ApplyGoMemoryLimit(budgetBytes)
+			// Report the reserve the admission system actually holds, not the configured
+			// value - NewAdmission clamps it to a quarter of the budget.
 			memoryLimitStatus = fmt.Sprintf("%dMB %s (zones at 70/85/93%%, reserve %dMB, GOMEMLIMIT %dMB)",
-				budgetBytes/(1024*1024), source, reserveBytes/(1024*1024), goMemLimit/(1024*1024))
+				budgetBytes/(1024*1024), source, srv.Admission().RescueReserveBytes()/(1024*1024), goMemLimit/(1024*1024))
 		}
 	}
 	srv.MaxConnections = cfg.MaxConnections
@@ -364,8 +377,62 @@ func main() {
 	} else {
 		slog.Warn("drain timeout hit with writes still in flight, closing storage anyway", "drain_timeout", drainTimeout.String())
 	}
+	if dataDir != "" {
+		saveCostModelState(srv, filepath.Join(dataDir, costModelStateFile))
+	}
 	srv.Release()
 	slog.Info("shutdown complete")
+}
+
+// costModelStateFile is where the learned cost-estimator state lives under --data-dir. It is a
+// cache, not data: deleting it is always safe and merely costs relearning.
+const costModelStateFile = "costmodel.json"
+
+// costModelStateMaxAge caps how old a persisted cost state may be before it is ignored: a file
+// from last month describes a workload and namespace scale that may no longer exist, and the
+// structural estimator is a safer starting point than confidently-stale cells.
+const costModelStateMaxAge = 7 * 24 * time.Hour
+
+func loadCostModelState(srv *server.KdbServerRuntime, path string) {
+	adm := srv.Admission()
+	if adm == nil || adm.Costs() == nil {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return // no prior state - the common first-boot case
+	}
+	if time.Since(info.ModTime()) > costModelStateMaxAge {
+		slog.Info("ignoring stale cost model state", "path", path, "age", time.Since(info.ModTime()).String())
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	adm.Costs().RestoreState(data)
+	slog.Info("cost model state restored", "path", path, "learned_cells", adm.Costs().LearnedCells())
+}
+
+func saveCostModelState(srv *server.KdbServerRuntime, path string) {
+	adm := srv.Admission()
+	if adm == nil || adm.Costs() == nil {
+		return
+	}
+	data, err := adm.Costs().SnapshotState()
+	if err != nil {
+		return
+	}
+	// Write-then-rename so a crash mid-write leaves either the old state or none - never a
+	// torn file (which RestoreState would discard anyway, but why make it).
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return
+	}
+	slog.Info("cost model state saved", "path", path, "learned_cells", adm.Costs().LearnedCells())
 }
 
 // buildLogger constructs the process-wide slog.Logger from --log-level/--log-format

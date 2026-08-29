@@ -74,6 +74,24 @@ func (t DocumentTree) MaterializedEntries() map[codec.UUID]codec.Hash {
 	return trieEntries(t.trieRoot)
 }
 
+// Walk streams every (doc id, content hash) entry to visit, stopping early when visit returns
+// false. This is the scan-shaped access path: unlike MaterializedEntries it allocates nothing
+// proportional to the namespace, so a bounded scan (LIMIT, row budget) over a large namespace
+// costs memory proportional to what it keeps, not to what exists. Iteration order is trie order
+// (effectively arbitrary but stable for a given tree), matching MaterializedEntries' map
+// iteration in being unordered.
+func (t DocumentTree) Walk(visit func(codec.UUID, codec.Hash) bool) {
+	if t.Entries != nil {
+		for id, h := range t.Entries {
+			if !visit(id, h) {
+				return
+			}
+		}
+		return
+	}
+	trieWalkUntil(t.trieRoot, visit)
+}
+
 func (t DocumentTree) With(docID codec.UUID, contentHash codec.Hash) (DocumentTree, error) {
 	root := t.trieRootOrBuild()
 	_, existed := trieGet(root, docID)

@@ -240,15 +240,27 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	if batchSize <= 0 {
 		batchSize = 256
 	}
-	vals := e.docs.Snapshot()
-	for i := 0; i < len(vals); i += batchSize {
-		end := i + batchSize
-		if end > len(vals) {
-			end = len(vals)
+	// Range, not Snapshot: Snapshot copied every document in the namespace into one slice
+	// before the first batch was emitted - an O(namespace) allocation invisible to any LIMIT,
+	// row budget, or admission grant. Streaming keeps peak memory at one shard plus one batch.
+	buf := make([]document.Document, 0, batchSize)
+	var scanErr error
+	e.docs.Range(func(d document.Document) bool {
+		buf = append(buf, d)
+		if len(buf) >= batchSize {
+			if err := onBatch(append([]document.Document(nil), buf...)); err != nil {
+				scanErr = err
+				return false
+			}
+			buf = buf[:0]
 		}
-		if err := onBatch(vals[i:end]); err != nil {
-			return err
-		}
+		return true
+	})
+	if scanErr != nil {
+		return scanErr
+	}
+	if len(buf) > 0 {
+		return onBatch(buf)
 	}
 	return nil
 }

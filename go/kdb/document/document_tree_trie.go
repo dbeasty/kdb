@@ -195,19 +195,32 @@ func trieEntries(root *trieNode) map[codec.UUID]codec.Hash {
 }
 
 func trieWalk(n *trieNode, visit func(codec.UUID, codec.Hash)) {
+	trieWalkUntil(n, func(id codec.UUID, h codec.Hash) bool {
+		visit(id, h)
+		return true
+	})
+}
+
+// trieWalkUntil visits leaves until visit returns false; reports whether the walk ran to
+// completion. The early-stop variant exists for streaming scans (DocumentTree.Walk): a scan
+// that has already collected everything it can return, or exhausted its row budget, stops
+// walking instead of visiting the rest of the namespace to ignore it.
+func trieWalkUntil(n *trieNode, visit func(codec.UUID, codec.Hash) bool) bool {
 	if n == nil {
-		return
+		return true
 	}
 	if n.leaf != nil {
-		visit(n.leaf.uuid, n.leaf.hash)
-		return
+		return visit(n.leaf.uuid, n.leaf.hash)
 	}
 	if n.children == nil {
-		return
+		return true
 	}
 	for _, c := range n.children {
-		trieWalk(c, visit)
+		if !trieWalkUntil(c, visit) {
+			return false
+		}
 	}
+	return true
 }
 
 // trieCount returns the number of leaves reachable from root - O(n), used only to back

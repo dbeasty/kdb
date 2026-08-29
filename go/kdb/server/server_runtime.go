@@ -450,6 +450,22 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 // GetDocument reads docID's current JSON at the DAG's current head, or (nil, false, nil) if it
 // doesn't exist. Backs component 40's GetJSON - a direct point lookup, not expressible as SQL
 // today (no WHERE-by-document-identity predicate; see wire_listen.go's handleDocumentGet).
+// treeSizeAt returns the namespace document count at the given commit - O(1) via the document
+// tree's tracked size. This is the single strongest pre-execution predictor of a scan's cost,
+// and it is already resolved on every read path; 0 when the commit or tree is missing (the
+// query itself will surface that as a real error).
+func (s *KdbServerRuntime) treeSizeAt(head codec.Hash) int {
+	commit, ok := s.Runtime.DAG.GetCommit(head)
+	if !ok {
+		return 0
+	}
+	tree, ok := s.Runtime.DAG.GetDocumentTree(commit.DocumentTreeHash)
+	if !ok {
+		return 0
+	}
+	return tree.Size()
+}
+
 func (s *KdbServerRuntime) GetDocument(namespaceID string, docID codec.UUID) (json string, commitHex string, found bool, err error) {
 	head, err := s.Runtime.DAG.Head()
 	if err != nil {

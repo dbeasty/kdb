@@ -66,8 +66,30 @@ func (s *shardedDocStore) Delete(id codec.UUID) {
 	sh.mu.Unlock()
 }
 
+// Range streams every document to visit, shard by shard, stopping early when visit returns
+// false. Each shard's documents are copied out under its own lock and visited unlocked, so
+// visit may be arbitrarily slow (it typically runs a scan batch callback) without stalling
+// writers for longer than one shard copy. Consistency is the same as Snapshot's - each shard
+// is a point-in-time copy, shards are taken sequentially - but peak memory is one shard's
+// documents rather than the whole namespace's.
+func (s *shardedDocStore) Range(visit func(document.Document) bool) {
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		batch := make([]document.Document, 0, len(sh.docs))
+		for _, d := range sh.docs {
+			batch = append(batch, d)
+		}
+		sh.mu.Unlock()
+		for _, d := range batch {
+			if !visit(d) {
+				return
+			}
+		}
+	}
+}
+
 // Snapshot returns a copy of every document across all shards. Used by
-// CommitTree/ScanDocuments, which need a consistent-enough full view;
+// CommitTree, which needs a consistent-enough full view;
 // each shard is locked only for the duration of copying its own
 // entries, not the whole snapshot.
 func (s *shardedDocStore) Snapshot() []document.Document {

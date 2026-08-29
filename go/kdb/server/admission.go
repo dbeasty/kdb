@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/debug"
-	"runtime/metrics"
 	"sync"
 	"sync/atomic"
 
@@ -86,6 +85,15 @@ type AdmissionStats struct {
 // partway through for want of a few megabytes.
 const DefaultRescueReserveBytes int64 = 48 << 20
 
+// maxReserveFractionOfBudget caps the rescue reserve at a quarter of the budget. The default
+// 48MB reserve was sized for the ~1GB deployments the spec targets; against a deliberately tiny
+// budget (the governance sim runs scenarios at 15-26MB) an unclamped reserve exceeds the whole
+// budget, which inverts its purpose twice over: grant capacity degenerates to the 1-byte floor,
+// so every operation is refused as too-large forever - reads included - and the reserve's
+// touched pages alone can overflow the container the budget was meant to protect. A reserve
+// exists to buy the abort path headroom, not to be the reason the abort path runs.
+const maxReserveFractionOfBudget = 4
+
 // DefaultScanRowBudget bounds rows *examined* per scan, not merely rows returned (§5.2, closing
 // §2.8's "no bound on scan work" gap). A scan that exceeds it is aborted with a typed
 // ResourceExhausted rather than being allowed to consume the node.
@@ -102,15 +110,16 @@ func NewAdmission(guard *MemoryGuard, reserveBytes int64, scanRowBudget int64) *
 	if reserveBytes < 0 {
 		reserveBytes = 0
 	}
+	if maxReserve := int64(limit) / maxReserveFractionOfBudget; reserveBytes > maxReserve {
+		reserveBytes = maxReserve
+	}
 	if scanRowBudget <= 0 {
 		scanRowBudget = DefaultScanRowBudget
 	}
 	capacity := int64(limit) - reserveBytes
 	if capacity < 1 {
-		// A budget smaller than the reserve is a misconfiguration, but it must not produce a
-		// zero-capacity semaphore that deadlocks every caller forever. Leave a token capacity so
-		// the system still functions (and still rejects, loudly, via the zone policy) rather
-		// than wedging.
+		// Unreachable given the reserve clamp above, but a zero-capacity semaphore would
+		// deadlock every caller forever, so keep the floor as defense in depth.
 		capacity = 1
 	}
 	a := &Admission{
@@ -150,6 +159,15 @@ func (a *Admission) ScanRowBudget() int64 {
 		return 0
 	}
 	return a.scanRowBudget.Load()
+}
+
+// RescueReserveBytes is the effective rescue reserve size after clamping to the budget -
+// what the startup banner should report, which the configured value no longer guarantees.
+func (a *Admission) RescueReserveBytes() int64 {
+	if a == nil {
+		return 0
+	}
+	return a.reserve.size
 }
 
 // ReserveLost reports whether the rescue reserve could not be re-allocated (§5.6).
@@ -303,6 +321,17 @@ func (a *Admission) Acquire(ctx context.Context, class OpClass, payloadBytes int
 	if a == nil {
 		return &Grant{}, nil
 	}
+	return a.AcquireBytes(ctx, class, a.costs.Estimate(class, payloadBytes))
+}
+
+// AcquireBytes is Acquire for callers that computed their own byte estimate - the scan and
+// point-read paths, whose cost the payload size cannot predict (kdb-spec-layer13 §5.2's "the
+// hard case"). The estimate typically comes from CostModel.EstimateScan/EstimatePointRead,
+// which see namespace cardinality and query shape rather than request bytes.
+func (a *Admission) AcquireBytes(ctx context.Context, class OpClass, cost int64) (*Grant, error) {
+	if a == nil {
+		return &Grant{}, nil
+	}
 	zone := a.guard.CurrentZone()
 	if !admitInZone(zone, class) {
 		a.stats.DeniedZone[classIndex(class)].Add(1)
@@ -313,11 +342,20 @@ func (a *Admission) Acquire(ctx context.Context, class OpClass, payloadBytes int
 		}
 	}
 
-	cost := a.costs.Estimate(class, payloadBytes)
+	if cost < a.costs.baseFor(class) {
+		cost = a.costs.baseFor(class)
+	}
+	if cost > a.capacity && class == ClassPointRead {
+		// ResourceExhausted means "resubmit smaller", and a point read has no smaller form -
+		// refusing it permanently is the read-refusing zombie P7 exists to rule out. Charge
+		// everything the node has instead: the read still waits its turn for real capacity,
+		// and reads remain the last class standing however degenerate the configuration.
+		cost = a.capacity
+	}
 	if cost > a.capacity {
 		a.stats.DeniedTooLarge[classIndex(class)].Add(1)
 		return nil, &ResourceExhaustedError{
-			Reason:        fmt.Sprintf("%s of %d bytes needs an estimated %d bytes, more than the node's entire %d byte grant capacity", class, payloadBytes, cost, a.capacity),
+			Reason:        fmt.Sprintf("%s needs an estimated %d bytes, more than the node's entire %d byte grant capacity", class, cost, a.capacity),
 			EstimateBytes: cost,
 			CapacityBytes: a.capacity,
 		}
@@ -339,12 +377,9 @@ func (a *Admission) Acquire(ctx context.Context, class OpClass, payloadBytes int
 	a.outstandingOps.Add(1)
 	a.stats.Granted[classIndex(class)].Add(1)
 	return &Grant{
-		adm:          a,
-		class:        class,
-		cost:         cost,
-		payloadBytes: payloadBytes,
-		startAllocs:  heapAllocsBytes(),
-		soleInFlight: a.outstandingOps.Load() == 1,
+		adm:   a,
+		class: class,
+		cost:  cost,
 	}, nil
 }
 
@@ -356,30 +391,27 @@ func classIndex(c OpClass) int {
 }
 
 // Grant is a live memory reservation. Release returns it; releasing twice is a no-op.
+//
+// A grant no longer measures anything itself. The earlier design sampled the process-wide
+// cumulative-allocation counter around each operation and fed the delta back as that
+// operation's "actual" - but only when it was the sole operation in flight (any concurrency
+// made the delta unattributable), and the delta measured allocated-including-garbage while the
+// model was calibrated on retained bytes. The two flaws compounded: the loop almost never
+// fired, and when it did it taught the model a systematically inflated number. Actuals now
+// come from the operation itself (sql.ExecStats for scans, response sizes for point reads),
+// which are exact, attributable under any concurrency, and free of the two metrics.Read calls
+// this path used to make per operation.
 type Grant struct {
-	adm          *Admission
-	class        OpClass
-	cost         int64
-	payloadBytes int
-	startAllocs  uint64
-	soleInFlight bool
-	released     atomic.Bool
+	adm      *Admission
+	class    OpClass
+	cost     int64
+	released atomic.Bool
 }
 
-// Release returns the reservation and, when the measurement is attributable, feeds the operation's
-// real cost back into the model (§5.2's P2 loop). Idempotent.
+// Release returns the reservation. Idempotent.
 func (g *Grant) Release() {
 	if g == nil || g.adm == nil || !g.released.CompareAndSwap(false, true) {
 		return
-	}
-	// Only record actuals when this grant was the *only* operation in flight for its whole
-	// lifetime - otherwise the allocation delta includes concurrent work and would teach the
-	// model a cost that belongs to somebody else. Under the write gate (which runs one commit at
-	// a time) this is the common case for writes, which is the class whose estimate matters most.
-	if g.soleInFlight && g.adm.outstandingOps.Load() == 1 {
-		if allocated := heapAllocsBytes(); allocated > g.startAllocs {
-			g.adm.costs.Observe(g.class, g.payloadBytes, int64(allocated-g.startAllocs))
-		}
 	}
 	g.adm.outstandingBytes.Add(-g.cost)
 	g.adm.outstandingOps.Add(-1)
@@ -392,16 +424,6 @@ func (g *Grant) CostBytes() int64 {
 		return 0
 	}
 	return g.cost
-}
-
-// heapAllocsBytes reads the process's cumulative allocated-bytes counter. Unlike
-// runtime.ReadMemStats this does not stop the world (§2.6), which matters because it is read on
-// every admitted operation. Cumulative-allocated over an operation is an *upper* bound on what
-// that operation retains - the safe direction to be wrong in, per §5.2's "bias high".
-func heapAllocsBytes() uint64 {
-	s := []metrics.Sample{{Name: "/gc/heap/allocs:bytes"}}
-	metrics.Read(s)
-	return sampleUint64(s[0])
 }
 
 // rescueReserve is §5.6's held-back headroom. It is a real allocation that is really touched -
