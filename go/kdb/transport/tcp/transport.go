@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/stream"
@@ -83,7 +84,7 @@ func (t *defaultTransport) Connect(uri string) (stream.ConnectionHandle, error) 
 		}
 		conn = tlsConn
 	}
-	return newSocketConnection(conn, t.options), nil
+	return newSocketConnection(conn, t.options, nil), nil
 }
 
 // tlsClientHandshake wraps conn (already TCP-connected) in a TLS client handshake using cfg -
@@ -140,6 +141,7 @@ func (t *defaultTransport) Serve(ctx context.Context, ln net.Listener, handler f
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	var active atomic.Int64
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -150,8 +152,25 @@ func (t *defaultTransport) Serve(ctx context.Context, ln net.Listener, handler f
 				return err
 			}
 		}
+		// kdb-spec-layer13 Component 49 §6.5: cap concurrent connections and refuse past the cap
+		// at accept time. A goroutine-per-connection model with no cap is a memory commitment
+		// nothing accounts for - each accepted connection costs a goroutine stack and a frame
+		// buffer regardless of whether it ever sends anything, so an unbounded accept loop can
+		// exhaust the budget without a single request being admitted.
+		//
+		// Closing immediately, rather than accepting and then failing the request, is the point:
+		// a connection that is never established costs nothing to refuse, which is the property
+		// that matters when the reason for refusing is that resources are already short.
+		if max := t.options.MaxConnections; max > 0 && active.Load() >= int64(max) {
+			_ = conn.Close()
+			continue
+		}
+		active.Add(1)
 		setNoDelay(conn)
-		go handler(newSocketConnection(conn, t.options))
+		// onClose is passed to the constructor rather than assigned afterward: the constructor
+		// starts readLoop, which can reach Close on its own, so a later assignment would race
+		// with that read.
+		go handler(newSocketConnection(conn, t.options, func() { active.Add(-1) }))
 	}
 }
 
@@ -174,6 +193,9 @@ type socketConnection struct {
 	maxFrameBytes int
 	reader        *core.FrameStreamReader
 	incoming      chan []byte
+	// onClose, if set, runs exactly once when this connection closes - how Serve's connection
+	// cap learns that a slot has freed.
+	onClose func()
 	// done is closed exactly once, by Close, to unblock readLoop if it's currently blocked
 	// trying to deliver a frame on incoming (see readLoop's doc comment).
 	done   chan struct{}
@@ -181,16 +203,21 @@ type socketConnection struct {
 	mu     sync.Mutex
 }
 
-func newSocketConnection(conn net.Conn, options core.TransportConnectOptions) *socketConnection {
+func newSocketConnection(conn net.Conn, options core.TransportConnectOptions, onClose func()) *socketConnection {
 	max := options.MaxFrameBytes
 	if max == 0 {
 		max = core.DefaultConnectOptions().MaxFrameBytes
 	}
+	queue := options.IncomingQueueFrames
+	if queue <= 0 {
+		queue = core.DefaultIncomingQueueFrames
+	}
 	c := &socketConnection{
 		conn:          conn,
+		onClose:       onClose,
 		maxFrameBytes: max,
-		reader:        core.NewFrameStreamReader(max),
-		incoming:      make(chan []byte, 32),
+		reader:        core.NewAdmittingFrameStreamReader(max, options.Admitter),
+		incoming:      make(chan []byte, queue),
 		done:          make(chan struct{}),
 	}
 	go c.readLoop()
@@ -215,6 +242,16 @@ func (c *socketConnection) readLoop() {
 		n, err := c.conn.Read(buf)
 		if n > 0 {
 			frames, ferr := c.reader.Feed(buf[:n])
+			// Rejections are written before the admitted frames are dispatched, and directly
+			// from this loop rather than through the incoming queue: the whole value of shedding
+			// at the header is that a refusal does not have to queue behind the very work the
+			// server has already decided it cannot do.
+			for _, rejection := range c.reader.TakeRejections() {
+				if sendErr := c.Send(rejection); sendErr != nil {
+					_ = c.Close()
+					return
+				}
+			}
 			if ferr != nil {
 				_ = c.Close()
 				return
@@ -257,6 +294,10 @@ func (c *socketConnection) Close() error {
 	}
 	c.closed = true
 	close(c.done)
+	if c.onClose != nil {
+		c.onClose()
+		c.onClose = nil // Close is idempotent above, but never let the cap be decremented twice
+	}
 	return c.conn.Close()
 }
 

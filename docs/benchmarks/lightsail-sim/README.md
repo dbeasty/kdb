@@ -373,6 +373,67 @@ regression that does not exist, and that briefly looked like a real finding. The
 `B/op` (24-69KB against a true ~15KB) was the tell. Interleave the two builds in the same session
 and check `allocs/op` for stability before believing any ns/op delta here.
 
+## Update (2026-08-28): admission control lands, and 90%/95% stop dying
+
+The 2026-08-27 guidance was to keep `--memory-limit-mb` at 60-80% of the container limit, because
+90% and 95% were still OOM-killed *with the memory guard enabled*. That guidance is now obsolete:
+the guard was a 200ms sampler that flipped a boolean, so a burst admitted between two samples could
+carry the process past the ceiling before the next sample ran. kdb-spec-layer13 Component 48's
+grant system replaces it — work reserves its estimated memory cost before it starts, so capacity
+handed to in-flight work is capacity the next caller cannot also be given, with no sampling
+interval in the loop at all.
+
+Same harness, same tier (1GB / 2 vCPU), same load (16 clients, 60s, read_ratio 0.5, 2000-doc pool):
+
+| mode | budget | outcome | peak mem | throughput | reads served | writes shed |
+|---|---:|---|---:|---:|---:|---:|
+| mem  | 90% (921MB) | **survived** | 78.60% | 15,150 ops/sec | 863,348 | 819,375 |
+| mem  | 95% (972MB) | **survived** | 82.85% | 14,030 ops/sec | 784,943 | 728,684 |
+| file | 90% (921MB) | **survived** | 78.15% | 15,393 ops/sec | 864,730 | 806,105 |
+| file | 95% (972MB) | **survived** | 80.42% | 15,293 ops/sec | 858,987 | 798,889 |
+
+Both storage modes, at both budgets that previously died. Note the peak column: these are not runs
+that squeaked past at 98%. Memory tops out in the high 70s/low 80s and *stays* there, because the
+non-granted floor shrinks grant capacity as the DAG grows rather than letting the process discover
+the ceiling by hitting it. That is the difference between surviving and being governed.
+
+### The control run: the mechanism is what's doing it
+
+Identical container and load, governance explicitly disabled (`--memory-budget-mb=-1`):
+
+```
+total ops: 127173 (writes=63442 reads=63731 errors=16)
+first error seen: kdb: connection closed
+CONTROL RESULT: governance=disabled oom=true exit=137
+```
+
+OOM-killed, and the only signal the client ever got was the connection dying — the exact failure
+this layer exists to eliminate. Run it yourself with `--memory-budget-mb -1` against the same
+image if you want to see it.
+
+### Reads are served throughout; only writes are shed
+
+The `errors` column above is large and that is the design working, not a problem. At
+`read_ratio=0.5`, writes attempted = successes + errors = 45,655 + 819,375 = **865,030**, against
+**863,348** reads — essentially identical, as the ratio demands. So every error is a shed write and
+reads succeeded at ~100%. Clients saw:
+
+```
+kdb: kdb server: rejecting write - memory pressure zone high (retry after 100ms)
+```
+
+A typed `BUSY` with a retry-after, not prose and not a dead socket. A server that cannot answer a
+point read is indistinguishable from one that is down, so point reads are never shed — they are
+also what an operator uses to diagnose the pressure in the first place.
+
+### What to set now
+
+`--memory-budget-mb` **defaults to auto-detect** (the cgroup limit where there is one, else 75% of
+host RAM), so governance is on without being asked for. The previous default was off, which meant
+the one mechanism standing between sustained write load and an OOM kill was inert in every
+deployment that did not already know to name it. Setting it explicitly at the container's real
+`--memory` limit is now supported; the 60-80% guidance was a workaround for the sampler.
+
 ## Original findings (2026-08-25, before the fix above)
 
 Kept for the record. Every run below used `--memory` mode (in-memory runtime, no disk I/O

@@ -58,3 +58,9 @@ func ValidateHotTierMemoryConfig(cfg HotTierMemoryConfig) error {
 	}
 	return nil
 }
+
+// TotalSystemMemoryBytes reports the host's total physical memory, or an error if this platform
+// has no implementation (see system_memory_*.go). Exported so callers outside this package -
+// notably server.DetectMemoryBudgetBytes, which needs a sane default memory budget on a host
+// with no cgroup limit to read - do not have to duplicate the per-platform detection.
+func TotalSystemMemoryBytes() (int64, error) { return totalSystemMemoryBytes() }

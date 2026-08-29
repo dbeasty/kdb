@@ -42,14 +42,16 @@ func ListenSqlWire(addr string, runtime *KdbServerRuntime) (*Listener, error) {
 // ListenSqlWireTLS is ListenSqlWire with TLS settings for a tcps:// addr - see
 // core.TransportTlsSettings. Pass nil for plaintext (equivalent to ListenSqlWire).
 func ListenSqlWireTLS(addr string, runtime *KdbServerRuntime, tlsSettings *core.TransportTlsSettings) (*Listener, error) {
+	codec := wire.NewCodec(wire.EncodingJSON)
 	opts := core.DefaultConnectOptions()
 	opts.TLS = tlsSettings
+	opts.MaxConnections = runtime.MaxConnections
+	opts.Admitter = runtime.frameAdmitter(codec)
 	transport := tcp.NewTransport(opts)
 	ln, err := transport.ListenBound(addr)
 	if err != nil {
 		return nil, err
 	}
-	codec := wire.NewCodec(wire.EncodingJSON)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	l := &Listener{ln: ln, cancel: cancel, done: done}
@@ -317,10 +319,17 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		AtCommit:    head,
 		Parameters:  params,
 		MaxRows:     10_000,
+		// Bounds rows *examined*, and shrinks automatically as memory pressure rises - a scan
+		// that reads the whole namespace to return nothing is otherwise unbounded work no
+		// admission decision can see coming (kdb-spec-layer13 §2.8).
+		RowBudget: int(h.runtime.admission.ScanRowBudget()),
 	}
 	result, err := h.runtime.SQLEngine.Execute(msg.SQL, ctx)
 	if err != nil {
-		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+		// Classified, not a bare string: a scan aborted for exceeding its row budget has to reach
+		// the client as RESOURCE_EXHAUSTED, or the one signal telling them to narrow the query
+		// is lost in prose.
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
 	if result.AppliedSchema != nil {
 		h.runtime.SetSchema(*result.AppliedSchema)
@@ -343,10 +352,13 @@ func (h *sqlWireConnHandler) execInsert(msg wire.SqlExecMessage, sess *KdbSessio
 		NamespaceID: sess.NamespaceID,
 		Schema:      h.runtime.Schema(),
 		Parameters:  params,
+		// UPDATE/DELETE resolve their target rows by scanning too, so the same bound applies -
+		// an unbounded DML predicate is unbounded work for exactly the same reason a SELECT's is.
+		RowBudget: int(h.runtime.admission.ScanRowBudget()),
 	}
 	dmlResult, err := h.runtime.SQLEngine.ExecuteDML(msg.SQL, ctx)
 	if err != nil {
-		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
 	builder := h.sessions.PendingBuilder(sess)
 	for _, op := range dmlResult.Operations {

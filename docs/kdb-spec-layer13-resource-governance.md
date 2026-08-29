@@ -4,7 +4,7 @@
 
 **File:** `kdb-spec-layer13-resource-governance.md`
 **Layer:** 13 — Runtime Resource Governance
-**Status:** Design — implementation-ready per component
+**Status:** Components 48–49 (memory admission, connection/scan bounds) implemented; 47, 50–52 partially landed — see §2 for which findings are closed
 **Modules:** `go/kdb/server`, `go/kdb/storage/{delta,io,engine}`, `go/kdb/embed`, `go/kdb/wire`, `go/kdb/client`, `go/kdb/peersync` (+ Kotlin ports where noted)
 **Depends on:** Layer 4a (WAL, delta writer, platform IO), Layer 7 (wire), Layer 8 (peer sync), Layer 12 (Component 38 Go-native server)
 
@@ -135,25 +135,55 @@ every 200ms for the lifetime of the process (`memory_guard.go:45-54`). On a 2-vC
 instance under load this is a recurring, self-inflicted latency source in the exact conditions the
 guard is meant to improve. `runtime/metrics.Read` provides the same numbers without the pause.
 
-### 2.7 GAP: rejection happens after the expensive part
+### 2.7 ~~GAP~~ CLOSED: rejection happens after the expensive part
 
-The check sits at the top of `commitWith` (`server_runtime.go:203`), by which point the frame has
+**Closed.** Admission is now consulted at the frame boundary, from the 12-byte header alone,
+before the body is buffered or decoded (`transport/core.FrameAdmitter`,
+`server.frameAdmitter`) — a shed request costs a header read and a small typed reply. A shed
+frame's body is consumed and discarded without ever being assembled, and the stream resynchronizes
+at the next frame boundary, so shedding a request does not cost the connection. The per-connection
+`incoming` queue is down from 32 frames to 4 (`core.DefaultIncomingQueueFrames`), and connections
+are capped at accept time (`--max-connections`, default 256), so the "32 × 16MB × connections"
+commitment is now bounded on both factors.
+
+Scope note: the frame-boundary check applies the *zone policy* only; the operation's memory grant
+is still taken in `runTransaction`, where its lifetime is bounded by the operation it belongs to.
+Moving grant ownership into the transport would require the transport to know when each request
+completed in order to release it.
+
+Original finding: the check sat at the top of `commitWith` (`server_runtime.go:203`), by which point the frame has
 been read off the socket, JSON-decoded into a `wire.Message`, dispatched, and parsed. A server
 shedding load still pays nearly the full per-request cost of everything it rejects. Each connection
 additionally buffers up to 32 undecoded frames (`transport/tcp`'s `incoming` channel), an
 unaccounted queue of raw payloads whose size is bounded only by `MaxFrameBytes` (16MB) × 32 ×
 connections.
 
-### 2.8 GAP: no CPU governance of any kind
+### 2.8 PARTIALLY CLOSED: no CPU governance of any kind
 
-Goroutine-per-connection with no connection cap (`transport/tcp.Serve`); no request deadlines
+**Closed:** the connection cap now exists (`--max-connections`), and scan work is bounded by rows
+*examined* rather than only rows returned (`sql.QueryContext.RowBudget`, `--scan-row-budget`,
+default 1,000,000, shrinking automatically as pressure rises). A scan exceeding it aborts with
+`RESOURCE_EXHAUSTED`. `fullScan` also now stops the underlying iteration once it has all the rows
+it can return, instead of reading the rest of the namespace to discard it.
+
+**Still open:** request deadlines are still not threaded end to end from the client, CPU tokens and
+PSI stall signals are unimplemented, and `GOMAXPROCS` is still left to Go's own cgroup-aware
+default rather than being asserted at startup.
+
+Original finding: goroutine-per-connection with no connection cap (`transport/tcp.Serve`); no request deadlines
 anywhere (`context.Background()` at every call site); no bound on scan work — `MaxRows: 10_000`
 caps the **result set**, not the rows examined (`wire_listen.go:285`); no distinction between a
 point read and a full namespace scan; `GOMAXPROCS` not reconciled with the container's CPU quota.
 
-### 2.9 GAP: `GOMEMLIMIT` is unused
+### 2.9 ~~GAP~~ CLOSED: `GOMEMLIMIT` is unused
 
-Go's soft memory limit (`runtime/debug.SetMemoryLimit`, Go 1.19+) makes the GC progressively more
+**Closed.** `server.ApplyGoMemoryLimit` sets it to 90% of the resolved budget at startup. It sits
+deliberately between the two zone boundaries that matter: writes begin shedding at ZoneHigh (85%),
+the GC escalates at 90%, and ZoneCritical (93%) drops the rescue reserve. Refusing work is cheap
+and reversible so it goes first; making the collector burn CPU degrades every request, so it goes
+second.
+
+Original finding: Go's soft memory limit (`runtime/debug.SetMemoryLimit`, Go 1.19+) makes the GC progressively more
 aggressive as the heap approaches a target, trading CPU to avoid growth. It is the runtime's own
 mechanism for "run right up to the memory ceiling without dying," and nothing in the repo sets it.
 

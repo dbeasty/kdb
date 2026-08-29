@@ -8,3 +8,8 @@ package server
 func cgroupMemoryCurrentBytes() (uint64, bool) {
 	return 0, false
 }
+
+// cgroupMemoryLimitBytes has no implementation outside Linux - see the Linux build's version.
+func cgroupMemoryLimitBytes() (uint64, bool) {
+	return 0, false
+}

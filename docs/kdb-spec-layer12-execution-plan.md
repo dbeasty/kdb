@@ -611,7 +611,12 @@ plus unbounded iOS toolchain setup time) if they end up needed after all.
       within seconds now survives 5.7 million operations over 3.5 minutes at a safe configuration
       (`--memory-limit-mb` set to ~60% of the container's actual limit - the README documents why
       that's the right fraction, found empirically, not the more intuitive 80-90%), with memory
-      usage plateauing at 67% instead of climbing to the hard limit. Still `[~]` rather than `[x]`:
+      usage plateauing at 67% instead of climbing to the hard limit. **Superseded 2026-08-28:**
+      that 60% figure was a workaround for this guard being a periodic sampler, which a burst
+      admitted between two samples could outrun. kdb-spec-layer13 Component 48's grant system
+      replaced it with reserve-before-admit; the flag is now `--memory-budget-mb`, it defaults to
+      auto-detecting the cgroup limit rather than to off, and 90%/95% of the container limit both
+      survive where they previously OOM-killed. Still `[~]` rather than `[x]`:
       the underlying "$7/mo tier" cost claim itself still needs the real Lightsail hardware run
       to be billable - this harness now confirms the server can run unattended under sustained
       load with a proper memory-limit configuration, which it previously could not do at all.

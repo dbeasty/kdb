@@ -85,3 +85,34 @@ func encodingTag(enc PayloadEncoding) byte {
 	}
 	return 0
 }
+
+// PeekHeader decodes the fixed header from a buffer that holds *at least* the header but not
+// necessarily the whole frame - the case DecodeHeader deliberately rejects, since every one of
+// its callers goes on to slice a payload out of the same buffer.
+//
+// This exists for kdb-spec-layer13 Component 48 §5.4's "admit early": a server under memory
+// pressure should decide whether it will serve a request from the frame header alone, before
+// buffering the body, so a shed request costs a header read rather than a full read plus a JSON
+// decode. ok=false means "not enough bytes yet, ask again once more have arrived" and is a normal
+// control-flow outcome, not an error; a returned error means the prefix itself is invalid and the
+// connection cannot be resynchronized.
+func PeekHeader(buf []byte, maxFrameBytes int) (Header, bool, error) {
+	if len(buf) < FrameHeaderSize {
+		return Header{}, false, nil
+	}
+	frameLength := int(readInt32LE(buf, 0))
+	if err := ValidateFrameLength(frameLength, maxFrameBytes); err != nil {
+		return Header{}, false, err
+	}
+	typeCode := uint16(readInt16LE(buf, 4))
+	msgType, ok := MessageTypeFromCode(typeCode)
+	if !ok {
+		return Header{}, false, newDecodeError("unknown message type")
+	}
+	return Header{
+		MessageType:     msgType,
+		ProtocolVersion: int(readInt16LE(buf, 6)),
+		CorrelationID:   int(readInt32LE(buf, 8)),
+		PayloadLength:   frameLength - FrameHeaderSize,
+	}, true, nil
+}

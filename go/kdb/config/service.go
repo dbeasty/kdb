@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
@@ -17,15 +18,34 @@ import (
 // command-line flag. Zero value is not meaningful on its own; start from DefaultServiceSettings
 // and overlay via ResolveService.
 type ServiceSettings struct {
-	DataDir       string
-	Memory        bool
-	Namespace     string
-	SQLAddr       string
-	PeerAddr      string
-	StreamAddr    string
-	AdminAddr     string
-	RBAC          bool
+	DataDir    string
+	Memory     bool
+	Namespace  string
+	SQLAddr    string
+	PeerAddr   string
+	StreamAddr string
+	AdminAddr  string
+	RBAC       bool
+	// MemoryBudgetMB is the memory budget the pressure zones and grant capacity are computed
+	// against. Three-valued on purpose: -1 disables resource governance entirely, 0 (the
+	// default) auto-detects via server.DetectMemoryBudgetBytes, and any positive value is an
+	// explicit budget in MiB.
+	//
+	// Auto-detect is the default because the previous default - off - meant the one mechanism
+	// standing between sustained write load and an OOM kill was inert unless an operator already
+	// knew to ask for it. Nothing in the Dockerfile, the systemd unit, or these defaults turned
+	// it on.
+	MemoryBudgetMB int
+	// MemoryLimitMB is the deprecated alias for MemoryBudgetMB (kdb-spec-layer13 §13). Retained
+	// so existing configs keep working; when set, it supplies the budget, and its old "0 means
+	// disabled" meaning is preserved by mapping an explicit 0 to -1.
 	MemoryLimitMB int
+	// MemoryReserveMB is the rescue reserve held back for the abort sequence (§5.6).
+	MemoryReserveMB int
+	// MaxConnections caps concurrently-accepted connections per listener (§6.5); 0 is unlimited.
+	MaxConnections int
+	// ScanRowBudget caps rows examined per scan (§5.2), not merely rows returned.
+	ScanRowBudget int
 	AbortAfter    time.Duration
 	DrainTimeout  time.Duration
 	TLSCert       string
@@ -56,6 +76,11 @@ func DefaultServiceSettings() ServiceSettings {
 		DrainTimeout: 30 * time.Second,
 		LogLevel:     "info",
 		LogFormat:    "text",
+		// 0 = auto-detect the budget rather than run ungoverned - see MemoryBudgetMB.
+		MemoryBudgetMB:  0,
+		MemoryReserveMB: int(server.DefaultRescueReserveBytes >> 20),
+		MaxConnections:  server.DefaultMaxConnections,
+		ScanRowBudget:   int(server.DefaultScanRowBudget),
 		// sync: an acknowledged write is on disk. Group commit (see
 		// embed.commitLogWriter) amortizes the fsync across concurrent writers,
 		// so this is the safe default without being the slow one it used to be.
@@ -75,20 +100,24 @@ func DefaultServiceSettings() ServiceSettings {
 // duration strings ("30s", "2m"). Unknown fields are rejected, so a typo fails loudly at
 // startup instead of silently configuring nothing.
 type ServiceFile struct {
-	DataDir       *string         `json:"dataDir"`
-	Memory        *bool           `json:"memory"`
-	Namespace     *string         `json:"namespace"`
-	SQLAddr       *string         `json:"sqlAddr"`
-	PeerAddr      *string         `json:"peerAddr"`
-	StreamAddr    *string         `json:"streamAddr"`
-	AdminAddr     *string         `json:"adminAddr"`
-	RBAC          *bool           `json:"rbac"`
-	MemoryLimitMB *int            `json:"memoryLimitMb"`
-	AbortAfter    *string         `json:"abortAfter"`
-	DrainTimeout  *string         `json:"drainTimeout"`
-	TLS           *ServiceTLSFile `json:"tls"`
-	LogLevel      *string         `json:"logLevel"`
-	LogFormat     *string         `json:"logFormat"`
+	DataDir         *string         `json:"dataDir"`
+	Memory          *bool           `json:"memory"`
+	Namespace       *string         `json:"namespace"`
+	SQLAddr         *string         `json:"sqlAddr"`
+	PeerAddr        *string         `json:"peerAddr"`
+	StreamAddr      *string         `json:"streamAddr"`
+	AdminAddr       *string         `json:"adminAddr"`
+	RBAC            *bool           `json:"rbac"`
+	MemoryBudgetMB  *int            `json:"memoryBudgetMb"`
+	MemoryLimitMB   *int            `json:"memoryLimitMb"`
+	MemoryReserveMB *int            `json:"memoryReserveMb"`
+	MaxConnections  *int            `json:"maxConnections"`
+	ScanRowBudget   *int            `json:"scanRowBudget"`
+	AbortAfter      *string         `json:"abortAfter"`
+	DrainTimeout    *string         `json:"drainTimeout"`
+	TLS             *ServiceTLSFile `json:"tls"`
+	LogLevel        *string         `json:"logLevel"`
+	LogFormat       *string         `json:"logFormat"`
 
 	Durability          *string `json:"durability"`
 	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
@@ -130,6 +159,11 @@ func LoadServiceFile(path string) (*ServiceFile, error) {
 // which is the standard trap this signature exists to avoid.
 func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), flagWasSet func(string) bool, flags ServiceSettings) (ServiceSettings, error) {
 	s := DefaultServiceSettings()
+	// Tracks whether the budget was named explicitly, and by which spelling. The deprecated
+	// --memory-limit-mb only folds into the budget when the modern key was not also given, and
+	// its historical "0 means disabled" reading has to survive the fold - see the reconciliation
+	// after the flag layer below.
+	var budgetSet, limitSet bool
 
 	// Layer 2: config file.
 	if file != nil {
@@ -141,7 +175,13 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.StreamAddr, file.StreamAddr)
 		setIf(&s.AdminAddr, file.AdminAddr)
 		setIf(&s.RBAC, file.RBAC)
+		setIf(&s.MemoryBudgetMB, file.MemoryBudgetMB)
 		setIf(&s.MemoryLimitMB, file.MemoryLimitMB)
+		setIf(&s.MemoryReserveMB, file.MemoryReserveMB)
+		setIf(&s.MaxConnections, file.MaxConnections)
+		setIf(&s.ScanRowBudget, file.ScanRowBudget)
+		budgetSet = budgetSet || file.MemoryBudgetMB != nil
+		limitSet = limitSet || file.MemoryLimitMB != nil
 		if err := setDurationIf(&s.AbortAfter, file.AbortAfter, "abortAfter"); err != nil {
 			return s, err
 		}
@@ -219,7 +259,25 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envBool("KDB_RBAC", &s.RBAC); err != nil {
 		return s, err
 	}
+	if err := envInt("KDB_MEMORY_BUDGET_MB", &s.MemoryBudgetMB); err != nil {
+		return s, err
+	}
+	if _, ok := lookupEnv("KDB_MEMORY_BUDGET_MB"); ok {
+		budgetSet = true
+	}
 	if err := envInt("KDB_MEMORY_LIMIT_MB", &s.MemoryLimitMB); err != nil {
+		return s, err
+	}
+	if _, ok := lookupEnv("KDB_MEMORY_LIMIT_MB"); ok {
+		limitSet = true
+	}
+	if err := envInt("KDB_MEMORY_RESERVE_MB", &s.MemoryReserveMB); err != nil {
+		return s, err
+	}
+	if err := envInt("KDB_MAX_CONNECTIONS", &s.MaxConnections); err != nil {
+		return s, err
+	}
+	if err := envInt("KDB_SCAN_ROW_BUDGET", &s.ScanRowBudget); err != nil {
 		return s, err
 	}
 	if err := envDuration("KDB_ABORT_AFTER", &s.AbortAfter); err != nil {
@@ -256,7 +314,11 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"stream-addr", func() { s.StreamAddr = flags.StreamAddr }},
 		{"admin-addr", func() { s.AdminAddr = flags.AdminAddr }},
 		{"rbac", func() { s.RBAC = flags.RBAC }},
-		{"memory-limit-mb", func() { s.MemoryLimitMB = flags.MemoryLimitMB }},
+		{"memory-budget-mb", func() { s.MemoryBudgetMB = flags.MemoryBudgetMB; budgetSet = true }},
+		{"memory-limit-mb", func() { s.MemoryLimitMB = flags.MemoryLimitMB; limitSet = true }},
+		{"memory-reserve-mb", func() { s.MemoryReserveMB = flags.MemoryReserveMB }},
+		{"max-connections", func() { s.MaxConnections = flags.MaxConnections }},
+		{"scan-row-budget", func() { s.ScanRowBudget = flags.ScanRowBudget }},
 		{"abort-after", func() { s.AbortAfter = flags.AbortAfter }},
 		{"drain-timeout", func() { s.DrainTimeout = flags.DrainTimeout }},
 		{"tls-cert", func() { s.TLSCert = flags.TLSCert }},
@@ -275,6 +337,32 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 			o.apply()
 		}
 	}
+	// Reconcile the deprecated --memory-limit-mb with --memory-budget-mb. The modern key wins
+	// when both are given; otherwise the old one supplies the budget, and its historical meaning
+	// is preserved exactly: under the old flag 0 meant "no governance", so an explicit 0 folds to
+	// -1 (disabled) rather than to the new 0, which now means "auto-detect". Someone who wrote 0
+	// meant off, and a silent upgrade to "on, with a budget we picked" would be the kind of
+	// surprise a deprecation alias exists to prevent.
+	if limitSet && !budgetSet {
+		if s.MemoryLimitMB <= 0 {
+			s.MemoryBudgetMB = -1
+		} else {
+			s.MemoryBudgetMB = s.MemoryLimitMB
+		}
+	}
+	if s.MemoryBudgetMB < -1 {
+		return s, fmt.Errorf("memory-budget-mb must be -1 (disabled), 0 (auto-detect), or a positive size in MiB, got %d", s.MemoryBudgetMB)
+	}
+	if s.MemoryReserveMB < 0 {
+		return s, fmt.Errorf("memory-reserve-mb must be >= 0, got %d", s.MemoryReserveMB)
+	}
+	if s.MaxConnections < 0 {
+		return s, fmt.Errorf("max-connections must be >= 0 (0 means unlimited), got %d", s.MaxConnections)
+	}
+	if s.ScanRowBudget < 0 {
+		return s, fmt.Errorf("scan-row-budget must be >= 0 (0 means unlimited), got %d", s.ScanRowBudget)
+	}
+
 	// Validated once, here, rather than at the point of use: a typo in a
 	// durability or compression name should fail at startup with the name it
 	// saw, not silently fall back to a default the operator didn't ask for.

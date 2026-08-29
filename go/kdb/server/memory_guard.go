@@ -1,15 +1,53 @@
 package server
 
 import (
+	"fmt"
 	"runtime/metrics"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// MemoryGuard periodically samples process memory usage and exposes a cheap, lock-free "are we
-// under memory pressure" check, so commitWith can reject new writes with a clear, actionable error
-// instead of the process silently accumulating garbage until the OS SIGKILLs it for exceeding a
-// container's memory limit.
+// Zone is the graduated pressure level kdb-spec-layer13 Component 48 §5.5 defines. Policy is
+// attached to zones rather than to a single boolean, because "reject everything" and "admit
+// everything" are not the only two useful responses to memory pressure - and because a server
+// that only ever does one or the other gives an operator no warning before it starts shedding.
+type Zone int
+
+const (
+	// ZoneNormal: admit every class.
+	ZoneNormal Zone = iota
+	// ZoneElevated: still admitting every class, but scans get smaller row budgets and
+	// replication concurrency is halved - shed the most deferrable work first, while the node
+	// is still healthy enough that shedding it costs nothing a client will notice.
+	ZoneElevated
+	// ZoneHigh: reject ClassWrite and ClassScan with Busy+retryAfterMs; keep admitting point
+	// reads and the replication drain. This is the zone the old boolean ShouldReject meant.
+	ZoneHigh
+	// ZoneCritical: reject everything but point reads, release the rescue reserve, and start
+	// the abort timer. Entering this zone is a logged event and a metric, never silent.
+	ZoneCritical
+)
+
+func (z Zone) String() string {
+	switch z {
+	case ZoneNormal:
+		return "normal"
+	case ZoneElevated:
+		return "elevated"
+	case ZoneHigh:
+		return "high"
+	case ZoneCritical:
+		return "critical"
+	default:
+		return "unknown"
+	}
+}
+
+// MemoryGuard periodically samples process memory usage and exposes a cheap, lock-free view of
+// which pressure Zone the server is in, so admission can reject new work with a clear, actionable
+// error instead of the process silently accumulating garbage until the OS SIGKILLs it for
+// exceeding a container's memory limit.
 //
 // This exists because fixing the known O(n)-per-commit allocation bugs (see
 // go/kdb/dag.GetCommitByTransactionID and document.DocumentTree's lazy Entries) narrows the
@@ -38,38 +76,94 @@ import (
 //     latency source in precisely the high-load conditions the guard exists to help with.
 //     runtime/metrics.Read provides the same category of number without the stop-the-world pause.
 //
-// It also adds real hysteresis (kdb-spec-layer13 design principle P3, "no one-way doors"): a
-// separate, lower clear threshold, so pressure that was real and has genuinely subsided lets
-// writes resume - not just the escape hatch of reconfiguring the limit via SetMemoryLimit(0, ...),
-// which was the only way to un-stick the original guard even after the underlying memory was
-// long gone.
+// Two further §5.1/§5.5 requirements are met here rather than in Admission, because both are
+// properties of *measurement* rather than of policy:
+//
+//   - Decisions are driven off a short moving average over a ring of recent samples, not off the
+//     single latest reading, so one allocation spike between two GC cycles cannot trip the whole
+//     server into shedding.
+//   - Zone transitions require the condition to hold for a minimum dwell time, and downward
+//     transitions use lower thresholds than upward ones (design principle P3, "no one-way
+//     doors"). Together these give real hysteresis: pressure that was genuine and has genuinely
+//     subsided lets work resume, without the flag flickering on every sample near a boundary.
 type MemoryGuard struct {
 	limitBytes uint64
-	tripBytes  float64
-	clearBytes float64
-	pressure   atomic.Bool
-	stop       chan struct{}
+	// upper[z] is the smoothed usage at or above which the guard enters zone z; lower[z] is the
+	// level it must fall back below to leave it. lower < upper is the hysteresis band.
+	upper [4]float64
+	lower [4]float64
+
+	zone     atomic.Int32 // current Zone, lock-free for ShouldReject/CurrentZone
+	pressure atomic.Bool  // cached (zone >= ZoneHigh)
+
+	mu          sync.Mutex
+	ring        []float64 // recent raw samples, newest at ringNext-1
+	ringNext    int
+	candidate   Zone      // zone the samples currently argue for
+	candidateAt time.Time // when candidate last changed - dwell is measured from here
+
+	dwell        time.Duration
+	pollInterval time.Duration
+	now          func() time.Time // overridable in tests
+
+	// observer, if set, is called after every sample with the smoothed usage and the current
+	// zone. Admission uses this to resize grant capacity (the nonGrantedFloor of §5.3) and to
+	// drop/restore the rescue reserve on Critical transitions.
+	observerMu sync.RWMutex
+	observer   func(smoothedUsed float64, zone Zone)
+
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
-// clearRatio is how far below tripBytes usage must fall before pressure clears - see the type
-// doc's hysteresis note. 0.9 means: trip at rejectFraction of the budget, clear at 90% of that
-// trip point (e.g. trip at 85%, clear at 76.5%) - a deliberately modest gap, wide enough that
-// normal sampling noise near the boundary doesn't flicker the flag on every sample, without
-// leaving so much slack that a server sits needlessly throttled long after real pressure passed.
+// clearRatio is how far below a zone's entry threshold smoothed usage must fall before the guard
+// leaves that zone - see the type doc's hysteresis note. 0.9 means: enter High at 85% of the
+// budget, fall back out of it at 76.5%. A deliberately modest gap: wide enough that normal
+// sampling noise near a boundary doesn't flicker the zone on every sample, without leaving so
+// much slack that a server sits needlessly throttled long after real pressure passed.
 const clearRatio = 0.9
+
+// zoneDwell is how long the samples must agree on a new zone before the guard actually moves
+// there (§5.5: "every zone transition requires the condition to hold for a minimum dwell time").
+// At the default 200ms poll this is three consecutive agreeing samples.
+const zoneDwell = 600 * time.Millisecond
+
+// sampleWindow is how many raw samples the moving average covers - 1 second at the default 200ms
+// poll interval. Long enough to absorb a single spike, short enough that the guard still reacts
+// well inside the time it takes a burst to exhaust the headroom the zones leave.
+const sampleWindow = 5
+
+// zoneFractionOfReject positions the four zones relative to the caller's rejectFraction, which
+// stays the knob that means "where writes start being refused" - i.e. it is the entry point of
+// ZoneHigh. §5.5 specifies the zones at 70/85/93% of the budget; expressing the other three as
+// ratios of the 85% case preserves those defaults exactly at rejectFraction=0.85 while keeping a
+// single, meaningful operator knob rather than four independent ones that can be set into
+// nonsensical orders relative to each other.
+var zoneFractionOfReject = [4]float64{
+	ZoneNormal:   0,
+	ZoneElevated: 70.0 / 85.0,
+	ZoneHigh:     1.0,
+	ZoneCritical: 93.0 / 85.0,
+}
 
 // NewMemoryGuard starts a background sampler polling every 200ms. limitBytes is the deployment's
 // known memory budget (e.g. a container's --memory limit); pass 0 to disable (ShouldReject always
-// returns false, no goroutine started). rejectFraction is what fraction of limitBytes triggers
-// rejection - e.g. 0.85 starts rejecting new writes once usage crosses 85% of the budget, leaving
-// headroom for commits already in flight and for GC to actually reclaim memory before the hard
-// limit is hit.
+// returns false, CurrentZone is always ZoneNormal, no goroutine started). rejectFraction is what
+// fraction of limitBytes puts the server into ZoneHigh and so starts rejecting writes - e.g. 0.85
+// leaves headroom for commits already in flight and for GC to actually reclaim memory before the
+// hard limit is hit.
 func NewMemoryGuard(limitBytes uint64, rejectFraction float64) *MemoryGuard {
 	g := &MemoryGuard{
-		limitBytes: limitBytes,
-		tripBytes:  float64(limitBytes) * rejectFraction,
-		clearBytes: float64(limitBytes) * rejectFraction * clearRatio,
-		stop:       make(chan struct{}),
+		limitBytes:   limitBytes,
+		dwell:        zoneDwell,
+		pollInterval: 200 * time.Millisecond,
+		now:          time.Now,
+		stop:         make(chan struct{}),
+	}
+	for z := ZoneNormal; z <= ZoneCritical; z++ {
+		entry := float64(limitBytes) * rejectFraction * zoneFractionOfReject[z]
+		g.upper[z] = entry
+		g.lower[z] = entry * clearRatio
 	}
 	if limitBytes == 0 {
 		return g
@@ -78,8 +172,27 @@ func NewMemoryGuard(limitBytes uint64, rejectFraction float64) *MemoryGuard {
 	return g
 }
 
+// SetObserver registers a callback invoked after every sample with the smoothed usage and the
+// current zone. Replaces any previous observer; pass nil to clear.
+func (g *MemoryGuard) SetObserver(fn func(smoothedUsed float64, zone Zone)) {
+	if g == nil {
+		return
+	}
+	g.observerMu.Lock()
+	g.observer = fn
+	g.observerMu.Unlock()
+}
+
+// LimitBytes reports the configured budget, or 0 when the guard is disabled.
+func (g *MemoryGuard) LimitBytes() uint64 {
+	if g == nil {
+		return 0
+	}
+	return g.limitBytes
+}
+
 func (g *MemoryGuard) sampleLoop() {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(g.pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -92,16 +205,68 @@ func (g *MemoryGuard) sampleLoop() {
 }
 
 func (g *MemoryGuard) sampleOnce() {
-	used := currentMemoryUsageBytes()
-	switch {
-	case used >= g.tripBytes:
-		g.pressure.Store(true)
-	case used <= g.clearBytes:
-		g.pressure.Store(false)
-	default:
-		// Between the two thresholds: hold whatever state we were already in (the hysteresis
-		// band itself) - neither a fresh trip nor a clear.
+	g.observe(currentMemoryUsageBytes())
+}
+
+// observe feeds one raw reading through the moving average and the dwell-gated zone state
+// machine. Split out from sampleOnce so tests can drive an exact sequence of readings without
+// waiting on a real ticker or trying to provoke real allocation.
+func (g *MemoryGuard) observe(used float64) {
+	g.mu.Lock()
+	if len(g.ring) < sampleWindow {
+		g.ring = append(g.ring, used)
+	} else {
+		g.ring[g.ringNext] = used
+		g.ringNext = (g.ringNext + 1) % sampleWindow
 	}
+	var sum float64
+	for _, v := range g.ring {
+		sum += v
+	}
+	smoothed := sum / float64(len(g.ring))
+
+	current := Zone(g.zone.Load())
+	want := g.zoneFor(smoothed, current)
+	now := g.now()
+	if want != g.candidate {
+		g.candidate, g.candidateAt = want, now
+	}
+	// Moving *up* a zone happens immediately: the dwell time exists to stop the server flapping
+	// back down out of a zone (and to stop one spike dragging it up), but delaying an escalation
+	// that the smoothed average already supports would spend the very headroom the zones exist
+	// to protect. Coming back down is what waits for the dwell to elapse.
+	if want > current || now.Sub(g.candidateAt) >= g.dwell {
+		if want != current {
+			g.zone.Store(int32(want))
+			g.pressure.Store(want >= ZoneHigh)
+			current = want
+		}
+	}
+	g.mu.Unlock()
+
+	g.observerMu.RLock()
+	obs := g.observer
+	g.observerMu.RUnlock()
+	if obs != nil {
+		obs(smoothed, current)
+	}
+}
+
+// zoneFor maps smoothed usage to a zone, using the upper thresholds to move up and the lower
+// ones to move down (the hysteresis band). from is the zone currently in effect.
+func (g *MemoryGuard) zoneFor(used float64, from Zone) Zone {
+	for z := ZoneCritical; z >= ZoneElevated; z-- {
+		threshold := g.upper[z]
+		if z <= from {
+			// Already at or above this zone: it takes a fall below the *lower* threshold to
+			// leave, not merely dropping back under the entry point.
+			threshold = g.lower[z]
+		}
+		if used >= threshold {
+			return z
+		}
+	}
+	return ZoneNormal
 }
 
 // currentMemoryUsageBytes reports process memory usage, preferring the Linux cgroup's own
@@ -142,9 +307,18 @@ func sampleUint64(s metrics.Sample) uint64 {
 	return s.Value.Uint64()
 }
 
-// ShouldReject reports whether a new write should be rejected right now due to memory pressure.
-// O(1), lock-free - cheap enough to call on every commit. Nil-safe: a nil *MemoryGuard (no limit
-// configured) never rejects.
+// CurrentZone reports the pressure zone in effect right now. O(1), lock-free. Nil-safe: a nil
+// *MemoryGuard (no limit configured) is always ZoneNormal.
+func (g *MemoryGuard) CurrentZone() Zone {
+	if g == nil {
+		return ZoneNormal
+	}
+	return Zone(g.zone.Load())
+}
+
+// ShouldReject reports whether a new *write* should be rejected right now due to memory pressure -
+// i.e. whether the guard is in ZoneHigh or above. O(1), lock-free - cheap enough to call on every
+// commit. Nil-safe: a nil *MemoryGuard (no limit configured) never rejects.
 func (g *MemoryGuard) ShouldReject() bool {
 	if g == nil {
 		return false
@@ -152,21 +326,46 @@ func (g *MemoryGuard) ShouldReject() bool {
 	return g.pressure.Load()
 }
 
-// Stop halts the background sampler. Safe to call on a disabled (limitBytes == 0) guard, or a
-// nil one.
+// Stop halts the background sampler. Safe to call on a disabled (limitBytes == 0) guard, a nil
+// one, or more than once.
 func (g *MemoryGuard) Stop() {
 	if g == nil || g.limitBytes == 0 {
 		return
 	}
-	close(g.stop)
+	g.stopOnce.Do(func() { close(g.stop) })
 }
 
-// MemoryPressureError is returned instead of committing when the server is near its configured
-// memory budget - a clean, actionable rejection (throttling the input, per the component's own
-// hardening goal) instead of continuing to accumulate garbage until the OS kills the process
-// outright with no signal to the client beyond the connection dying.
-type MemoryPressureError struct{}
+// MemoryPressureError is returned instead of admitting work when the server's pressure Zone sheds
+// that operation's class - a clean, actionable rejection (throttling the input, per the
+// component's own hardening goal) instead of continuing to accumulate garbage until the OS kills
+// the process outright with no signal to the client beyond the connection dying.
+//
+// Distinct from BusyError, which means the node is *contended* (a full write queue, or grant
+// capacity momentarily held by other in-flight work) rather than near its memory budget. Both
+// map to the wire's BUSY code, because the client's move is the same either way - back off and
+// retry - but they are different conditions, and an operator reading a log or a metric needs to
+// be able to tell "we are running out of memory" from "we are running out of concurrency".
+type MemoryPressureError struct {
+	// Zone is the pressure zone in effect when the operation was shed.
+	Zone Zone
+	// Class is the operation class that was shed. Point reads are never shed, so this is never
+	// ClassPointRead.
+	Class OpClass
+	// RetryAfterMs is how long the caller should wait before retrying - longer in deeper zones,
+	// where an immediate retry is both less likely to succeed and actively harmful, since it
+	// spends the headroom the abort sequence may be about to need.
+	RetryAfterMs int
+}
 
 func (e *MemoryPressureError) Error() string {
-	return "kdb server: rejecting write - server is near its configured memory budget, retry later"
+	if e.Zone == ZoneNormal && e.RetryAfterMs == 0 {
+		return "kdb server: rejecting write - server is near its configured memory budget, retry later"
+	}
+	return fmt.Sprintf("kdb server: rejecting %s - memory pressure zone %s (retry after %dms)",
+		e.Class, e.Zone, e.RetryAfterMs)
+}
+
+// RetryAfter returns how long a caller should wait before retrying.
+func (e *MemoryPressureError) RetryAfter() time.Duration {
+	return time.Duration(e.RetryAfterMs) * time.Millisecond
 }

@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -193,16 +195,47 @@ func (e *Executor) fullScan(ctx QueryContext) ([]codec.UUID, error) {
 		max = 10000
 	}
 	var ids []codec.UUID
+	examined := 0
 	err = e.Storage.ScanDocuments(ctx.NamespaceID, treeHash, 256, func(batch []document.Document) error {
 		for _, d := range batch {
+			examined++
+			if ctx.RowBudget > 0 && examined > ctx.RowBudget {
+				return &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
+			}
 			ids = append(ids, d.ID)
 			if len(ids) >= max {
-				return nil
+				// Stop the scan outright rather than merely stopping appending. Returning nil
+				// here only ended the current batch: ScanDocuments went straight on to the next
+				// one, so a query that had already collected everything it could return still
+				// read the rest of the namespace into memory to throw it away.
+				return errScanComplete
 			}
 		}
 		return nil
 	})
-	return ids, err
+	if err != nil {
+		if errors.Is(err, errScanComplete) {
+			return ids, nil
+		}
+		return nil, err
+	}
+	return ids, nil
+}
+
+// errScanComplete unwinds ScanDocuments once a scan has all the rows it can return. A sentinel
+// rather than a nil return because the adapter contract treats a nil error as "keep going".
+var errScanComplete = errors.New("kdb sql: scan complete")
+
+// ScanRowBudgetExceededError reports a scan aborted for examining more rows than its budget
+// allowed (kdb-spec-layer13 Component 48 §5.2). Surfaced to clients as RESOURCE_EXHAUSTED: the
+// query is too expensive for this node as written, so narrowing it is the fix - retrying it
+// unchanged is not.
+type ScanRowBudgetExceededError struct {
+	Budget int
+}
+
+func (e *ScanRowBudgetExceededError) Error() string {
+	return fmt.Sprintf("kdb sql: scan examined more than its budget of %d rows - narrow the query (add a more selective predicate, or an indexed one)", e.Budget)
 }
 
 func (e *Executor) filterIDs(ids []codec.UUID, predicate Expr, ctx QueryContext) ([]codec.UUID, error) {
@@ -216,7 +249,10 @@ func (e *Executor) filterIDs(ids []codec.UUID, predicate Expr, ctx QueryContext)
 	}
 	treeHash := commit.DocumentTreeHash
 	var out []codec.UUID
-	for _, id := range ids {
+	for i, id := range ids {
+		if ctx.RowBudget > 0 && i >= ctx.RowBudget {
+			return nil, &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
+		}
 		doc, err := e.Storage.GetDocument(ctx.NamespaceID, id, treeHash)
 		if err != nil {
 			return nil, err
