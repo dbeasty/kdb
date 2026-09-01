@@ -389,6 +389,33 @@ func TestFrameRoundtripDocumentGetResult(t *testing.T) {
 	}
 }
 
+// A point read shed under load carries the same "whether and when to retry" answer a write
+// does. Writes have had it since Component 51; reads only gained it alongside the conflict
+// pacing work, so the encoding is newer than the rest of this message.
+func TestFrameRoundtripDocumentGetResultClassifiedError(t *testing.T) {
+	c := wire.NewCodec(wire.EncodingJSON)
+	code := wire.ErrorCodeBusy
+	retry := 50
+	msg := wire.DocumentGetResultMessage{
+		H:            testHeader(33, wire.MsgDocumentGetResult),
+		Namespace:    "app/data",
+		DocID:        "11111111-1111-4111-8111-111111111111",
+		Error:        strPtr("kdb server: busy (retry after 50ms): write queue is full"),
+		ErrorCode:    &code,
+		RetryAfterMs: &retry,
+	}
+	back := decodedAs[wire.DocumentGetResultMessage](t, c, msg)
+	if back.ErrorCode == nil || *back.ErrorCode != wire.ErrorCodeBusy {
+		t.Fatalf("errorCode: %v", back.ErrorCode)
+	}
+	if back.RetryAfterMs == nil || *back.RetryAfterMs != retry {
+		t.Fatalf("retryAfterMs: %v", back.RetryAfterMs)
+	}
+	if back.Error == nil || *back.Error != *msg.Error {
+		t.Fatalf("prose error must survive for a client that only reads it: %v", back.Error)
+	}
+}
+
 func TestFrameRoundtripDocumentGetResultNotFound(t *testing.T) {
 	c := wire.NewCodec(wire.EncodingJSON)
 	msg := wire.DocumentGetResultMessage{

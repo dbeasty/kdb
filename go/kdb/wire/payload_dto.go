@@ -139,8 +139,10 @@ type transactionReplayDto struct {
 }
 
 type conflictReportDto struct {
-	Namespace   string        `json:"namespace"`
-	ReportBytes jsonByteArray `json:"reportBytes"`
+	Namespace    string        `json:"namespace"`
+	ReportBytes  jsonByteArray `json:"reportBytes"`
+	ErrorCode    *ErrorCode    `json:"errorCode,omitempty"`
+	RetryAfterMs *int          `json:"retryAfterMs,omitempty"`
 }
 
 type compactionNoticeDto struct {

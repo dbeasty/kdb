@@ -19,10 +19,23 @@ const testBudget = 1 << 30 // 1 GiB
 // pinZone stops srv's background sampler and drives the guard directly to the zone implied by
 // usedFraction of the budget, so a test can put the server under a specific, exact pressure
 // without allocating gigabytes or waiting on a 200ms ticker.
+//
+// Stop alone is not enough to guarantee the explicit observe below is the only thing driving the
+// zone: it guarantees no *more* background samples land after it returns (see its own doc
+// comment), but says nothing about one that already landed before Stop was even called - which a
+// slow-to-schedule caller (a loaded CI runner, worse under -race, can genuinely delay the two
+// statements before this one by 200ms+, long enough for the sampler's own poll interval to have
+// ticked at least once for real) can leave sitting in the ring. That real, low ambient-usage
+// sample then gets averaged in alongside the explicit one and can pull the computed zone back
+// under threshold - intermittent, CI-only failures that looked like a race in the test but were
+// really stale, pre-Stop state. reset drops whatever is already there, deterministically, so this
+// helper's own comment ("no background sampler racing the value we are about to set") is
+// actually true regardless of scheduling luck.
 func pinZone(t *testing.T, srv *KdbServerRuntime, usedFraction float64) {
 	t.Helper()
 	g := srv.memGuard
 	g.Stop() // no background sampler racing the value we are about to set
+	g.reset()
 	g.observe(float64(testBudget) * usedFraction)
 }
 
@@ -141,6 +154,10 @@ func TestPressureRecoversAfterDwell(t *testing.T) {
 	defer srv.memGuard.Stop()
 	g := srv.memGuard
 	g.Stop()
+	// See pinZone's doc comment: Stop alone does not guarantee the ring is empty, only that
+	// nothing more will land in it - a real sample can already be sitting there from before Stop
+	// was called. reset makes the observe calls below the sole input to the zone, regardless.
+	g.reset()
 
 	// A controllable clock, so the dwell is exercised exactly rather than slept through.
 	now := time.Now()
@@ -185,6 +202,7 @@ func TestCommitRejectedWhenLargerThanCapacity(t *testing.T) {
 	srv.SetMemoryBudget(128<<10, 0.85, DefaultRescueReserveBytes, DefaultScanRowBudget)
 	defer srv.memGuard.Stop()
 	srv.memGuard.Stop()
+	srv.memGuard.reset()    // see pinZone's doc comment - Stop alone does not guarantee an empty ring
 	srv.memGuard.observe(1) // stay in ZoneNormal, so the zone policy is not what rejects
 
 	docID, err := codec.RandomUUID()

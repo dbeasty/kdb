@@ -104,6 +104,8 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                     ConflictReportDto(
                         namespace = namespace,
                         reportBytes = reportBytes,
+                        errorCode = errorCode,
+                        retryAfterMs = retryAfterMs,
                     ),
             )
 
@@ -264,6 +266,8 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         json = json,
                         commitHex = commitHex,
                         error = error,
+                        errorCode = errorCode,
+                        retryAfterMs = retryAfterMs,
                     ),
             )
 
@@ -379,7 +383,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
 
         "conflictReport" -> {
             val c = conflictReport ?: throw WireDecodeException("missing conflictReport body")
-            WireMessage.ConflictReport(header, c.namespace, c.reportBytes)
+            WireMessage.ConflictReport(header, c.namespace, c.reportBytes, c.errorCode, c.retryAfterMs)
         }
 
         "compactionNotice" -> {
@@ -496,7 +500,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
 
         "documentGetResult" -> {
             val d = documentGetResult ?: throw WireDecodeException("missing documentGetResult body")
-            WireMessage.DocumentGetResult(header, d.namespace, d.docId, d.json, d.commitHex, d.error)
+            WireMessage.DocumentGetResult(header, d.namespace, d.docId, d.json, d.commitHex, d.error, d.errorCode, d.retryAfterMs)
         }
 
         "upsert" -> {

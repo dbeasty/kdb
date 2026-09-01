@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,7 +25,20 @@ import (
 type writeGate struct {
 	queued  chan struct{} // bounds how many callers may be waiting at all
 	running chan struct{} // capacity 1: the actual single-active-commit serialization
+	// serviceNanos is an exponentially-weighted mean of how long one commit holds the running
+	// slot. It exists to put an honest number behind the retry-after hint the server sends a
+	// client whose transaction lost a race (see KdbServerRuntime.conflictRetryAfterMs): "wait
+	// for the writers ahead of you to drain" is only actionable if the server can say how long
+	// draining one writer actually takes on this node, under this durability mode, right now.
+	// Written only by the goroutine releasing the gate - i.e. serialized with itself - so a
+	// plain load/store pair needs no further synchronization.
+	serviceNanos atomic.Int64
 }
+
+// serviceEWMAShift sets the smoothing: each sample moves the mean by 1/8 of the gap. Slow
+// enough that one unusually long fsync does not spike every client's backoff, fast enough to
+// track a real change in durability mode or disk behavior within a few dozen commits.
+const serviceEWMAShift = 3
 
 func newWriteGate(maxQueued int) *writeGate {
 	if maxQueued <= 0 {
@@ -49,11 +63,48 @@ func (g *writeGate) acquire(ctx context.Context) (release func(), err error) {
 
 	select {
 	case g.running <- struct{}{}:
-		return func() { <-g.running }, nil
+		start := time.Now()
+		return func() {
+			g.observeService(time.Since(start))
+			<-g.running
+		}, nil
 	case <-ctx.Done():
 		return nil, &DeadlineExceededError{Reason: "timed out waiting for an earlier write to finish"}
 	}
 }
+
+// observeService folds one commit's gate occupancy into the running mean.
+func (g *writeGate) observeService(d time.Duration) {
+	sample := d.Nanoseconds()
+	if sample < 0 {
+		return
+	}
+	prev := g.serviceNanos.Load()
+	if prev == 0 {
+		g.serviceNanos.Store(sample)
+		return
+	}
+	g.serviceNanos.Store(prev + (sample-prev)>>serviceEWMAShift)
+}
+
+// meanServiceTime returns how long one commit currently takes to pass through the gate, or 0
+// before any commit has completed.
+func (g *writeGate) meanServiceTime() time.Duration {
+	return time.Duration(g.serviceNanos.Load())
+}
+
+// queueDepth returns how many callers are waiting plus the one running right now. This is the
+// number that says how stale a queued writer's base version is about to be: every commit that
+// drains ahead of it advances the head it was anchored on.
+//
+// len(g.queued) alone undercounts by one while a commit is actually running: acquire's queued
+// slot is released by its own deferred func the instant acquire *returns*, which for the
+// success path happens as soon as the caller enters running - well before its commit, and the
+// release that would decrement g.running, has happened. So a caller holding the running slot no
+// longer holds a queued slot at all, and len(g.queued) alone reports only the callers still
+// waiting behind it. len(g.running) is 0 or 1 by construction (capacity-1 channel) and adds
+// exactly the one queueDepth's own doc comment always claimed to include.
+func (g *writeGate) queueDepth() int { return len(g.queued) + len(g.running) }
 
 // quiesced reports whether no caller currently holds a queued or running slot - i.e. every
 // admitted write has finished. Only meaningful once new admissions are being rejected (see

@@ -53,6 +53,13 @@ including heavy-multi-user/overlapping (~1024 goroutines cycling through a
 correct, contention-free optimistic concurrency; it's an unrelated bug
 that means conflicts can never be detected at all on this code path.
 
+⚠️ The parenthetical is also wrong, independently of Finding 1: the
+benchmark was not cycling ~1024 goroutines through a 256-document pool,
+it was pointing all of them at one document at a time. See **Finding 3**,
+which is retracted for that reason. Current transaction numbers are in
+that section; the four Transaction rows above are preserved as the
+historical `e8f07bd` measurement.
+
 ## Reading this
 
 - **Read throughput regresses under concurrency.** Single-threaded
@@ -76,11 +83,13 @@ that means conflicts can never be detected at all on this code path.
   concurrent commits share fsyncs via WAL group commit
   (`docs/benchmarks/phase0-baseline.md`). Non-overlapping *update* is the
   outlier at only 17,141 ops/sec vs. 32,218 for overlapping update — with a
-  4096-document pool spread thin across ~1024 goroutines under
-  `nonOverlappingBuckets = 128` partitioning, more distinct documents are
-  touched per unit time, which likely pushes more of `commitTree`'s
-  O(namespace-size) rebuild cost into the measured window; not fully
-  isolated from partitioning-bucket effects here.
+  4096-document pool spread thin across ~1024 goroutines, more distinct
+  documents are touched per unit time, which likely pushes more of
+  `commitTree`'s O(namespace-size) rebuild cost into the measured window;
+  not fully isolated from partitioning effects here. The fixed-128-bucket
+  partitioning this originally blamed is gone — `keyFor` now sizes
+  partitions from the actual goroutine count — so this row is worth
+  re-measuring before drawing anything from it.
 - **Mixed read/write is far slower per-op than pure read or pure
   write/update at single-user** (893µs/op vs. 130-140ns read / ~4.2ms
   write) because it's dominated by whichever the write component costs —
@@ -90,7 +99,11 @@ that means conflicts can never be detected at all on this code path.
   read, mixed, or transaction workloads (well within run-to-run noise) —
   expected for read/mixed since nothing here creates lock contention keyed
   by document identity, and *expected but for the wrong reason* for
-  transaction, per Finding 1.
+  transaction, per Finding 1. ⚠️ There was a second wrong reason: both
+  modes were assigning keys in worker-lockstep, so neither was measuring
+  the keyspace it named. With both fixed, the transaction rows do now
+  differ — 2.94–2.96 conflicts/op overlapping against a genuine 0
+  non-overlapping. See **Finding 3**.
 
 ## Durability mode: does async/memory-only actually make writes faster?
 
@@ -406,35 +419,141 @@ ready (it retains every tree by hash and every document version by content
 hash), so the missing piece is an explicit snapshot handle. Adopt it when
 snapshot isolation is specified; do not adopt it expecting throughput.
 
-## Finding 3 (regression, pre-existing): contended transactions collapse now that conflicts are actually detected
+## Finding 3 (RETRACTED — benchmark defect): "contended transactions collapse"
 
-Not caused by the Finding 2 work — it reproduces identically before and
-after — but it surfaced while measuring, and it is not recorded anywhere
-above.
+**This finding was wrong, and the numbers behind it were an artifact of the
+benchmark's key selection, not a property of the server.** The original
+text is preserved below the correction, because the retraction is the
+useful part: it is the reason the matrix's worst cell was never real.
 
-The results table says "All conflicts/op columns read 0," which Finding 1
-explains as a bug. With that bug fixed, `Transaction/heavy-multi-user/overlapping`
-now reports **176–289 conflicts per operation** and throughput of
-**449–821 ops/sec**, against the 31,933 ops/sec in the table. That is a
-~40x collapse, and it is the honest cost of detecting conflicts that were
-previously being silently lost — the old number measured last-write-wins
-with the conflict check disabled.
+### What the finding claimed
 
-Two things worth following up, neither of them concurrency-control
-mechanism choices:
+That with Finding 1 fixed, `Transaction/heavy-multi-user/overlapping`
+reported **176–289 conflicts per operation** at **449–821 ops/sec** — a
+~40x collapse against the 31,933 ops/sec in the table — and that this was
+"the honest cost of detecting conflicts that were previously being
+silently lost." It attributed the conflict rate to "~1024 goroutines
+contending over a 256-document pool with no backoff."
 
-- **176–289 conflicts per operation** is not a conflict rate, it is a retry
-  storm: ~1024 goroutines contending over a 256-document pool with no
-  backoff. Whatever retry policy sits above `ConflictPolicyStrict` is
-  amplifying, not absorbing, contention.
-- The run-to-run spread (449 → 821 ops/sec across three samples of the
-  same binary) is far wider than any other row in the matrix, which is
-  itself a symptom of the same instability.
+### What was actually happening
 
-This is the workload the table most understated, and it is now the
-worst-performing cell in the matrix by two orders of magnitude.
+The benchmark was not contending over a 256-document pool. `keyFor` chose
+`ids[i%len(ids)]`, where `i` is each worker's *own* iteration counter and
+every worker starts at 0 — so all ~1024 goroutines targeted the same
+document at the same time. Worse, `commitWithRetry` only advances `i` on
+success, so a worker that lost a round stayed parked on the key the
+winners had just moved off. The workload degenerated into an N-way barrier
+sweeping one document at a time, which costs ~N²/2 attempts per N
+successes: conflicts/op ≈ N/2, entirely independent of pool size.
 
-### What shipped
+The model predicted the control row too. `non-overlapping` bucketed 1024
+workers into 128 partitions, so ~8 workers shared each key in the same
+lockstep — predicting ~3.5 conflicts/op against the 3.0 measured.
+
+Offsetting the key sequence by `workerID` (one expression) settles it, on
+the same binary and machine (M3 Max, 16 cores, `-benchtime 2s`):
+
+| overlapping, ~1024 goroutines / 256 docs | conflicts/op | ops/sec |
+|---|---:|---:|
+| lockstep (as originally measured) | 178.4 | 703 |
+| keys spread across the pool | **2.91** | **17,703** |
+
+61x fewer conflicts and 25x the throughput, with no server change. The
+"~40x collapse" does not exist, and this was never the worst cell in the
+matrix.
+
+### What the numbers are now
+
+The benchmark was fixed in two steps: decorrelating the key sequence by
+`workerID` in both modes, and sizing the non-overlapping pool to one
+document per worker so the zero-contention control can actually reach
+zero (at 256 documents and ~1024 goroutines, four workers shared every
+document by construction, which is why both modes previously reported the
+same ~2.95). Three samples, `-benchtime 2s`:
+
+| Transaction / heavy-multi-user | conflicts/op | ops/sec |
+|---|---:|---:|
+| overlapping (256 docs, real contention) | 2.94–2.96 | 13,854–17,364 |
+| non-overlapping (one doc per worker) | **0** | 18,608–28,856 |
+
+So the genuine cost of 1024 writers contending over 256 documents is
+~2.95 wasted attempts per success and roughly 25–40% of throughput — a
+real cost, worth reducing, and nothing like a two-orders-of-magnitude
+collapse.
+
+### The one real thing underneath it
+
+The residual ~2.95 is not lockstep; it survived every key-assignment
+change and tracks the number of writers per document. It is the
+**staleness window**: `tx.BaseVersion` is resolved by the caller *before*
+it queues at the write gate, while the target head is resolved inside the
+gate (`transaction/default_engine.go`, `Commit`). A writer's base
+therefore ages by one commit for every writer that drains ahead of it, so
+the conflict rate scales with queue-depth ÷ keyspace rather than with
+client think time. With ~1024 writers over 256 documents that is ~4
+writers per document, and ~3 conflicts per success is what falls out.
+
+### What shipped in response
+
+Not a concurrency-control change — the retry *pacing* the original finding
+correctly noticed was missing, and could not have existed:
+
+- `wire.ConflictReportMessage` now carries `ErrorCode`/`RetryAfterMs`.
+  `ErrorCodeConflict` had been defined since Component 51 with a doc
+  comment promising it accompanied this message, and had **zero
+  producers**, because the message had nowhere to put it. A client that
+  lost a race was told it lost and nothing else, so retrying instantly was
+  its only option — and N clients retrying instantly re-collide.
+- The server sizes that hint from its own live write-gate queue depth
+  times a measured mean commit service time (`writeGate.meanServiceTime`,
+  an EWMA), and applies **full jitter** per response
+  (`server/backoff.go`). Jittering server-side is deliberate: it is the
+  only point that can see the whole herd, and it works for a client too
+  simple to jitter for itself.
+- `client.CompareAndSwap` honors the hint, and falls back to capped
+  exponential backoff with full jitter when talking to a server that
+  sends none. It previously retried with no pause at all, capped at 5
+  attempts — under contention it burned all five and failed the caller.
+- `wire.DocumentGetResultMessage` gained the same two fields. Point reads
+  take an admission grant and can be shed under load exactly like writes,
+  but the response could only carry prose, so a reading client had nothing
+  to pace on. Writes have had this since Component 51; reads were the gap.
+
+`commitWithRetry` in the benchmark deliberately still retries with no
+backoff: it measures what the server does under contention, so the client
+side is held at its worst case and conflicts/op stays readable as a
+conflict rate rather than as a sleep schedule.
+
+### Original text (retracted)
+
+> The results table says "All conflicts/op columns read 0," which Finding 1
+> explains as a bug. With that bug fixed, `Transaction/heavy-multi-user/overlapping`
+> now reports **176–289 conflicts per operation** and throughput of
+> **449–821 ops/sec**, against the 31,933 ops/sec in the table. That is a
+> ~40x collapse, and it is the honest cost of detecting conflicts that were
+> previously being silently lost — the old number measured last-write-wins
+> with the conflict check disabled.
+>
+> Two things worth following up, neither of them concurrency-control
+> mechanism choices:
+>
+> - **176–289 conflicts per operation** is not a conflict rate, it is a retry
+>   storm: ~1024 goroutines contending over a 256-document pool with no
+>   backoff. Whatever retry policy sits above `ConflictPolicyStrict` is
+>   amplifying, not absorbing, contention.
+> - The run-to-run spread (449 → 821 ops/sec across three samples of the
+>   same binary) is far wider than any other row in the matrix, which is
+>   itself a symptom of the same instability.
+>
+> This is the workload the table most understated, and it is now the
+> worst-performing cell in the matrix by two orders of magnitude.
+
+The run-to-run spread the original flagged as "a symptom of the same
+instability" was real, and had the same cause: a barrier sweep's
+completion time depends on goroutine scheduling order, which varies far
+more than steady-state throughput does. It is gone with the barrier.
+
+## What shipped for Finding 2 (read path): RCU-style snapshot publication
 
 RCU-style immutable snapshot publication (option C) in two places, since
 removing only the first mutex just exposed the second:

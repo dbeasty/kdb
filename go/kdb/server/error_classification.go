@@ -57,6 +57,18 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 		// as much next time.
 		return wire.ErrorCodeResourceExhausted, nil
 	}
+	var conflict *ConflictError
+	if errors.As(err, &conflict) {
+		// Retryable, but only after re-reading: the transaction as submitted is anchored on a
+		// base version that has moved, so resubmitting it byte-for-byte fails identically. The
+		// remedy CONFLICT names is "re-read, recompute, retry after RetryAfterMs" - distinct
+		// from BUSY, where the same bytes would have succeeded.
+		if conflict.RetryAfterMs > 0 {
+			ms := conflict.RetryAfterMs
+			return wire.ErrorCodeConflict, &ms
+		}
+		return wire.ErrorCodeConflict, nil
+	}
 	var auth *AuthorizationError
 	if errors.As(err, &auth) {
 		return wire.ErrorCodeUnauthorized, nil

@@ -136,6 +136,38 @@ public interface CommitDag {
         peerHeads: Set<KdbHash>,
     ): List<KdbHash>
 
+    /**
+     * Marks [hash] as in use by something that will still need to resolve it later, returning
+     * the release to invoke once it no longer will. Pins are this DAG's retention roots for
+     * *readers*, alongside the two it already had for *writers* - branch heads and tags -
+     * which [squash] and [stubCommit] both consult.
+     *
+     * This is the reader-table problem every MVCC store has to solve (LMDB's reader table,
+     * Postgres's xmin horizon): a reader resolves a version, then does work against it, and
+     * nothing about holding that hash stops a concurrent compaction reclaiming it out from
+     * under that work. Two callers in this codebase need it: a SNAPSHOT session's read pin
+     * (server.KdbSession.readPin), held for the length of one client transaction, which can be
+     * arbitrarily long; and an in-flight commit's transaction.baseVersion
+     * (server.KdbServerRuntime.commit/upsert), captured before the writer queues at the
+     * server's write coordinator and not consulted until the commit runs.
+     *
+     * Pins are counted, not boolean: the same commit is routinely pinned by several readers at
+     * once, and one of them finishing must not drop the others' protection. The returned release
+     * is idempotent, so it is safe to invoke from a `finally` block and also explicitly.
+     *
+     * A pin is a *refusal* to reclaim, not a reservation: pinning a commit that compaction then
+     * wants makes compaction fail loudly ([CompactionSafetyException]) rather than silently
+     * strand a reader - the same bargain the existing branch-head check already makes.
+     */
+    public suspend fun pin(hash: KdbHash): suspend () -> Unit
+
+    /** Reports whether [hash] currently has at least one live pin. */
+    public suspend fun isPinned(hash: KdbHash): Boolean
+
+    /** How many distinct commits are pinned right now - for tests and observability; a number
+     * that only ever grows is a leaked release. */
+    public suspend fun pinnedCount(): Int
+
     public suspend fun squash(
         squashHashes: List<KdbHash>,
         boundary: KdbHash,

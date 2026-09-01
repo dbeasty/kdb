@@ -150,8 +150,10 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 		return payloadEnvelope{
 			Kind: "conflictReport",
 			ConflictReport: &conflictReportDto{
-				Namespace:   m.Namespace,
-				ReportBytes: m.ReportBytes,
+				Namespace:    m.Namespace,
+				ReportBytes:  m.ReportBytes,
+				ErrorCode:    m.ErrorCode,
+				RetryAfterMs: m.RetryAfterMs,
 			},
 		}, nil
 	case CompactionNoticeMessage:
@@ -439,7 +441,10 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 		if c == nil {
 			return nil, newDecodeError("missing conflictReport body")
 		}
-		return ConflictReportMessage{H: header, Namespace: c.Namespace, ReportBytes: c.ReportBytes}, nil
+		return ConflictReportMessage{
+			H: header, Namespace: c.Namespace, ReportBytes: c.ReportBytes,
+			ErrorCode: c.ErrorCode, RetryAfterMs: c.RetryAfterMs,
+		}, nil
 	case "compactionNotice":
 		c := env.CompactionNotice
 		if c == nil {

@@ -124,10 +124,22 @@ type ConflictError struct {
 	BaseHash      string
 	TargetHash    string
 	Conflicts     []ConflictDetail
+	// RetryAfterMs is the server's suggestion for how long to wait before re-reading and
+	// retrying, sized from its live write-queue pressure and jittered per response so that N
+	// clients losing the same round do not all come back at the same instant. Zero when the
+	// server did not send one (an older server, or one that predates the field), in which case
+	// a caller should back off on its own - see CompareAndSwap, which does.
+	RetryAfterMs int
 }
 
 func (e *ConflictError) Error() string {
 	return fmt.Sprintf("kdb: version conflict (%d document(s))", len(e.Conflicts))
+}
+
+// RetryAfter returns how long to wait before retrying, or 0 if the server gave no hint. Mirrors
+// BusyError.RetryAfter.
+func (e *ConflictError) RetryAfter() time.Duration {
+	return time.Duration(e.RetryAfterMs) * time.Millisecond
 }
 
 func (e *ConflictError) Unwrap() error { return ErrConflict }
@@ -462,7 +474,10 @@ func (c *Client) GetJSON(ctx context.Context, ns string, docID string) ([]byte, 
 		return nil, "", fmt.Errorf("kdb: expected DocumentGetResult, got %T", reply)
 	}
 	if result.Error != nil {
-		return nil, "", fmt.Errorf("kdb: %s", *result.Error)
+		// Classified, not bare prose: a point read can be shed under load exactly like a write,
+		// and BusyError carries the server's retry-after so a caller can wait rather than
+		// hammer. Falls back to a plain error against a server that sends no code.
+		return nil, "", classifiedError(*result.Error, result.ErrorCode, result.RetryAfterMs)
 	}
 	if result.JSON == nil {
 		return nil, result.CommitHex, ErrNotFound
@@ -559,7 +574,7 @@ func (c *Client) commitTransaction(ctx context.Context, ns string, st *namespace
 	}
 	switch r := reply.(type) {
 	case wire.ConflictReportMessage:
-		return "", decodeConflictError(r.ReportBytes)
+		return "", decodeConflictError(r.ReportBytes, r.RetryAfterMs)
 	case wire.SqlResultMessage:
 		if r.Error != nil {
 			return "", classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
@@ -577,7 +592,7 @@ func (c *Client) commitTransaction(ctx context.Context, ns string, st *namespace
 	}
 }
 
-func decodeConflictError(reportBytes []byte) error {
+func decodeConflictError(reportBytes []byte, retryAfterMs *int) error {
 	var raw struct {
 		TransactionID string `json:"transactionId"`
 		BaseHash      string `json:"baseHash"`
@@ -595,16 +610,23 @@ func decodeConflictError(reportBytes []byte) error {
 	// different to the caller, so it is surfaced as its own error type rather than folded into
 	// ConflictError. Reported first: if any operation's explicit assertion failed, that is the
 	// reason the transaction was refused, whatever else the report also lists.
+	hint := 0
+	if retryAfterMs != nil {
+		hint = *retryAfterMs
+	}
 	for _, c := range raw.Conflicts {
 		if c.OperationType == "PRECONDITION_FAILED" {
-			return &PreconditionError{DocumentID: c.DocumentID, ActualHash: c.ActualContentHash}
+			return &PreconditionError{DocumentID: c.DocumentID, ActualHash: c.ActualContentHash, RetryAfterMs: hint}
 		}
 	}
 	details := make([]ConflictDetail, len(raw.Conflicts))
 	for i, c := range raw.Conflicts {
 		details[i] = ConflictDetail{DocumentID: c.DocumentID, OperationType: c.OperationType}
 	}
-	return &ConflictError{TransactionID: raw.TransactionID, BaseHash: raw.BaseHash, TargetHash: raw.TargetHash, Conflicts: details}
+	return &ConflictError{
+		TransactionID: raw.TransactionID, BaseHash: raw.BaseHash, TargetHash: raw.TargetHash,
+		Conflicts: details, RetryAfterMs: hint,
+	}
 }
 
 // GetJSONWithHash reads one document plus the content hash of what it read - the token

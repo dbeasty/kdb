@@ -20,6 +20,14 @@ type DocumentGetResultMessage struct {
 	JSON      *string
 	CommitHex string
 	Error     *string
+	// ErrorCode and RetryAfterMs are additive to Error, exactly as on UpsertResultMessage above
+	// (kdb-spec-layer13 Component 51 §8.1). A point read can be refused for reasons that are
+	// purely about server load - the admission grant it takes can come back BUSY or
+	// RESOURCE_EXHAUSTED - and until these existed that arrived as bare prose, leaving a reading
+	// client with no way to tell "wait 50ms" from "never retry this" without parsing the string.
+	// Writes have carried this since Component 51; reads were the gap.
+	ErrorCode    *ErrorCode
+	RetryAfterMs *int
 }
 
 func (m DocumentGetResultMessage) Header() Header { return m.H }
@@ -62,11 +70,13 @@ type documentGetDto struct {
 }
 
 type documentGetResultDto struct {
-	Namespace string  `json:"namespace"`
-	DocID     string  `json:"docId"`
-	JSON      *string `json:"json,omitempty"`
-	CommitHex string  `json:"commitHex"`
-	Error     *string `json:"error,omitempty"`
+	Namespace    string     `json:"namespace"`
+	DocID        string     `json:"docId"`
+	JSON         *string    `json:"json,omitempty"`
+	CommitHex    string     `json:"commitHex"`
+	Error        *string    `json:"error,omitempty"`
+	ErrorCode    *ErrorCode `json:"errorCode,omitempty"`
+	RetryAfterMs *int       `json:"retryAfterMs,omitempty"`
 }
 
 type upsertDto struct {
@@ -93,6 +103,7 @@ func encodeDocumentOpMessage(msg Message) (payloadEnvelope, bool, error) {
 	case DocumentGetResultMessage:
 		return payloadEnvelope{Kind: "documentGetResult", DocumentGetResult: &documentGetResultDto{
 			Namespace: m.Namespace, DocID: m.DocID, JSON: m.JSON, CommitHex: m.CommitHex, Error: m.Error,
+			ErrorCode: m.ErrorCode, RetryAfterMs: m.RetryAfterMs,
 		}}, true, nil
 	case UpsertMessage:
 		return payloadEnvelope{Kind: "upsert", Upsert: &upsertDto{
@@ -123,6 +134,7 @@ func decodeDocumentOpMessage(header Header, env payloadEnvelope) (Message, bool,
 		}
 		return DocumentGetResultMessage{
 			H: header, Namespace: d.Namespace, DocID: d.DocID, JSON: d.JSON, CommitHex: d.CommitHex, Error: d.Error,
+			ErrorCode: d.ErrorCode, RetryAfterMs: d.RetryAfterMs,
 		}, true, nil
 	case "upsert":
 		d := env.Upsert
