@@ -1,18 +1,34 @@
 # KDB User Guide
 
-This guide is for developers who want to **run**, **inspect**, or **embed** KDB in an application. It describes what works in this repository today and what is still planned.
+This guide is for developers who want to **run**, **inspect**, **embed**, or **operate** KDB. It
+describes what works in this repository today and what is still planned.
 
-For architecture and protocol details, see the [architecture specification](kdb-spec.md).
+| If you want… | Read |
+|--------------|------|
+| what KDB is and why it is built this way | [High-level architecture](kdb-architecture.md) |
+| how it works internally (types, flows, locks, byte formats) | [Low-level design](kdb-lld.md) |
+| the exact SQL you can write | [KDB-SQL reference](kdb-lld-query.md) |
+| wire protocol, error codes, governance | [Protocol & operations](kdb-lld-protocol.md) |
+| the normative design and roadmap | [Architecture specification](kdb-spec.md) |
 
 ---
 
 ## Status
 
-KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md §0](kdb-spec.md#0-session-state--read-this-first)).
+KDB has two implementations that share one specification, one on-disk format, and one wire
+protocol: a **Kotlin Multiplatform** tree (browser / JVM / native) and a **Go** tree (`go/`) used
+for native servers, the CLI, `database/sql`, WASM, and mobile bindings.
 
 | Capability | Status |
 |------------|--------|
 | Core engine (codec, storage, SQL, indexes, wire, peer sync, …) | Implemented; unit and integration tests |
+| **Go native server** (`kdb-service`) — SQL wire, peer sync, stream, admin HTTP, TLS, RBAC | Implemented |
+| **Go client SDK** (`go/kdb/client`) — connect, put/get/upsert/commit/query/exec, typed errors | Implemented |
+| **Go `database/sql` driver** (`kdb://memory:` / `kdb://file:`) | Implemented (embedded only) |
+| **Go CLI** (`kdb`) — `init`, `put`, `get`, `query`, `log`, `status`, `branch`, `unlock` | Implemented |
+| **Resource governance** — memory admission, scan budgets, typed backpressure, abort watchdog | Implemented (Go) |
+| **Integrity & recovery** — `verify`, `repair-segments`, `backup`, `restore` | Implemented (Go, `kdb-inspect`) |
+| Encryption at rest | Specified only ([Layer 14](kdb-spec-layer14-encryption-at-rest.md)) |
 | **Product CLI** (`:kdb-cli`) — `init`, `put`, `get`, `query`, `log`, `status`, `sync`, `shell` | Implemented via Gradle `runCli` |
 | **Inspect CLI** (`:kdb-inspect`) — `dump-delta`, `dump-wire`, … | Implemented via Gradle `inspectCli` |
 | **JDBC driver** — `jdbc:kdb:memory://…`, `jdbc:kdb:file://…` | Embedded SELECT, metadata, prepared statements; file mode persists under `dataRoot/ns/{namespaceId}/` |
@@ -28,10 +44,39 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 
 ---
 
+## Choosing a setup
+
+| You want to… | Use | Section |
+|--------------|-----|---------|
+| store data inside one Go process | `database/sql` driver or the embedded runtime | [Go embedded](#go--embedded-databasesql) |
+| store data inside one JVM process | JDBC embedded (`jdbc:kdb:memory://` / `file://`) | [JDBC](#jdbc-java--what-you-can-do-today) |
+| share one database between processes or hosts | run `kdb-service`, connect with the Go client SDK or JDBC network | [Running a server](#running-a-server-kdb-service) |
+| script or inspect a workspace from a shell | the `kdb` CLI (Go) or `:kdb-cli` (Kotlin) | [Command-line usage](#command-line-usage) |
+| push live changes to browsers or caches | `kdb-service --stream-addr`, Mode 1 / Mode 2 subscribers | [Stream modes](#stream-subscribe-over-websocket) |
+| keep independent replicas that merge later | `kdb-service --peer-addr` peer sync | [Peer sync](#peer-sync) |
+| back up, verify, or repair a data directory | `kdb-inspect` | [Operations](#operations--durability-backup-and-recovery) |
+
+**One writer per data directory.** File mode takes an exclusive lock on `{dataDir}/.kdb.lock`.
+A second process opening the same directory fails immediately with a clear error. Use a server
+when more than one process needs to write.
+
+---
+
 ## Prerequisites
 
-- **JDK 17+** (JVM targets, CLIs, JDBC)
-- **Gradle 8.x** — use the included wrapper: `./gradlew`
+**Go tree** (`go/`) — native server, CLI, `database/sql`, client SDK:
+
+- **Go 1.26+**
+
+```bash
+cd go && go test ./...
+make build-go            # → go/bin/kdb, go/bin/kdb-service, go/bin/kdb-inspect
+./go/bin/kdb --version   # 0.1.0 (commit …, built …, go1.26 …)
+```
+
+**Kotlin tree** — JVM, browser, JDBC, Gradle CLIs:
+
+- **JDK 17+**, **Gradle 8.x** (use the wrapper `./gradlew`)
 - For **JavaScript / browser** embedding: Kotlin Multiplatform with `js(IR) { browser() }`
 
 ```bash
@@ -43,11 +88,253 @@ KDB has a **first Kotlin implementation** across Layers 0–10 (see [kdb-spec.md
 
 ---
 
+## Go quick start
+
+### CLI
+
+```bash
+./go/bin/kdb --data-dir /tmp/kdb-data init myapp/users
+OUT=$(./go/bin/kdb --data-dir /tmp/kdb-data put myapp/users '{"name":"Ada"}')
+# {"docId":"<uuid>","docIdShort":"<8-hex>","commit":"<64-hex>"}
+./go/bin/kdb --data-dir /tmp/kdb-data get myapp/users "$(echo "$OUT" | jq -r .docId)"
+./go/bin/kdb --data-dir /tmp/kdb-data query myapp/users "SELECT _doc FROM users"
+./go/bin/kdb --data-dir /tmp/kdb-data log myapp/users
+./go/bin/kdb --data-dir /tmp/kdb-data status myapp/users
+```
+
+| Command | Usage |
+|---------|-------|
+| `init` | `init <namespace>` |
+| `put` | `put <namespace> <file\|json>` — prints `{"docId","docIdShort","commit"}` |
+| `get` | `get <namespace> <docId>` — full UUID, 32 hex, or an unambiguous 8+ hex prefix |
+| `query` | `query <namespace> <sql>` — tab-separated rows |
+| `log` / `status` | commit history / head hash and document count |
+| `branch` | `branch list\|create\|checkout <namespace> …` |
+| `unlock` | remove a stale `.kdb.lock` when the holder process is gone |
+
+Global flags: `--data-dir DIR` (default `~/.kdb`), `--quiet`, `--version`.
+
+### Go — embedded (`database/sql`)
+
+```go
+import (
+    "database/sql"
+    _ "github.com/limidus/kdb/go/kdb/driver"
+)
+
+db, err := sql.Open("kdb", "kdb://file:///var/lib/kdb/myapp/users")
+// or in-memory:  kdb://memory:///demo/users?unique=true&dropOnClose=true
+
+rows, err := db.Query("SELECT kdb_id, _doc FROM users WHERE age > ?", 30)
+```
+
+| DSN | Meaning |
+|-----|---------|
+| `kdb://memory:///catalog/namespace` | shared in-process database per URL |
+| `…?unique=true` | fresh isolated database per connect (tests) |
+| `…?isolate=name` | named shared instance |
+| `…?dropOnClose=true` | dropped when the last connection closes |
+| `kdb://file:///path/to/data/catalog/namespace` | file-backed under `path/to/data/ns/…` |
+| `…?readOnly=true` | reject writes |
+
+The Go driver is **embedded only** — for network access use the client SDK below.
+
+### Go — client SDK (network)
+
+```go
+import "github.com/limidus/kdb/go/kdb/client"
+
+c, err := client.Connect(ctx, "tcp://127.0.0.1:9090", "alice:secret") // "" when RBAC is off
+defer c.Close()
+
+commit, err := c.PutJSON(ctx, "myapp/users", docID, []byte(`{"name":"Ada"}`))
+body, at, err := c.GetJSON(ctx, "myapp/users", docID)
+commit, err  = c.Upsert(ctx, "myapp/users", docID, []byte(`{"name":"Ada Lovelace"}`))
+
+var users []struct{ KdbID, Name string }
+err = c.Query(ctx, "myapp/users", "SELECT kdb_id, name FROM users WHERE age > ?", []any{30}, &users)
+
+cols, rows, err := c.QueryRaw(ctx, "myapp/users", "SELECT _doc FROM users LIMIT 10", nil)
+err = c.Exec(ctx, "myapp/users", "CREATE TABLE users (name VARCHAR NOT NULL, age INT)", nil)
+```
+
+Optimistic concurrency (compare-and-set against a base version):
+
+```go
+_, err := c.Commit(ctx, client.Transaction{
+    Namespace:   "myapp/users",
+    BaseVersion: commit,                    // the commit you read at
+    Writes:      []client.DocWrite{{DocID: docID, JSON: updated}},
+})
+if errors.Is(err, client.ErrConflict) {
+    var ce *client.ConflictError
+    errors.As(err, &ce)   // per-document local vs incoming detail
+    // re-read, rebase, retry
+}
+```
+
+TLS:
+
+```go
+c, err := client.ConnectWithOptions(ctx, "tcps://db.internal:9090", token, client.ConnectOptions{
+    TLS: &core.TransportTlsSettings{Enabled: true, CAFile: "/etc/kdb/ca.pem"},
+})
+```
+
+Schemes accepted: `tcp://`, `tcps://`, `ws://`, `wss://`, or a bare `host:port` (treated as
+`tcp://`). One `*Client` is safe for concurrent use.
+
+**Error handling** — every failure is typed, so retry logic never parses prose:
+
+| Test | Meaning | What to do |
+|------|---------|-----------|
+| `errors.Is(err, client.ErrConflict)` | someone else committed against your base version | re-read, rebase, retry |
+| `errors.Is(err, client.ErrBusy)` | server queue full or under memory pressure | wait `(*BusyError).RetryAfter()`, retry |
+| `errors.Is(err, client.ErrDeadlineExceeded)` | your deadline passed while queued | retry with a longer deadline |
+| `errors.Is(err, client.ErrUnavailable)` | server is shutting down | reconnect (likely to a restarted instance) |
+| `errors.Is(err, client.ErrNotFound)` | no such document | — |
+| `errors.Is(err, client.ErrUnauthenticated)` | handshake auth failed | fix credentials |
+| `RESOURCE_EXHAUSTED` in the message | too large / scan budget exceeded | resubmit smaller, or narrow the query |
+
+---
+
+## Running a server (`kdb-service`)
+
+```bash
+./go/bin/kdb-service \
+  --data-dir /var/lib/kdb \
+  --namespace myapp/users \
+  --sql-addr    "tcp://0.0.0.0:9090?bind=true" \
+  --admin-addr  "127.0.0.1:9099"
+```
+
+The startup log line reports the resolved status of every subsystem (listeners, TLS, RBAC,
+memory budget, durability, abort watchdog) plus the exact build identity.
+
+### Flags
+
+**Storage and identity**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--data-dir DIR` | — | filesystem data root (takes the exclusive directory lock) |
+| `--memory` | on when no `--data-dir` | in-memory runtime (nothing survives restart) |
+| `--namespace NS` | `demo/users` | the namespace this process serves |
+| `--durability sync\|async\|memory` | `sync` | how much of the write-out a commit waits for |
+| `--async-sync-interval-ms N` | 5 | background flush period under `async` |
+| `--compression zstd\|none` | `zstd` | codec for new delta frames and SSTable blocks (recorded per frame) |
+| `--sync-mode full\|fast` | `full` | physical sync primitive (`fast` survives OS crash but not power loss) |
+| `--version` | — | print version and exit |
+
+**Listeners** — each is enabled by default on loopback; pass an empty value to disable one.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--sql-addr` | `tcp://127.0.0.1:9090?bind=true` | SQL wire listener (client SDK, JDBC network) |
+| `--peer-addr` | `tcp://127.0.0.1:9091?bind=true` | peer-sync (Mode 3) listener |
+| `--stream-addr` | `tcp://127.0.0.1:9092?bind=true` | stream (Mode 1 read-only / Mode 2 write-back) listener |
+| `--admin-addr` | disabled | operational HTTP: `/healthz`, `/readyz`, `/metrics`, `/debug/pprof` — **no auth; bind privately** |
+| `--max-connections N` | 256 | cap on concurrently accepted connections per listener (0 = unlimited) |
+
+**Security**
+
+| Flag | Meaning |
+|------|---------|
+| `--tls-cert` / `--tls-key` | enable TLS; every listener's scheme is upgraded `tcp://` → `tcps://` |
+| `--tls-ca` | CA bundle for verifying client certificates |
+| `--tls-client-auth` | require and verify client certificates (mTLS); needs `--tls-ca` |
+| `--rbac` | enable the user/role registry (durable under `--data-dir`, in-memory otherwise) |
+
+**Resource governance** — see [the governance model](kdb-lld-protocol.md#5-resource-governance)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--memory-budget-mb N` | `0` = auto-detect | budget admission control governs against: cgroup limit if present, else 75 % of host RAM; `-1` disables |
+| `--memory-reserve-mb N` | 48 | rescue reserve released on entry to the Critical zone (clamped to ¼ of the budget) |
+| `--scan-row-budget N` | 1 000 000 | maximum rows a single scan may **examine**; shrinks automatically as pressure rises |
+| `--abort-after DUR` | 0 (off) | after sustained pressure, drain and exit 75 so a supervisor restarts clean |
+| `--drain-timeout DUR` | 30s | on SIGTERM, how long to wait for admitted writes before closing storage anyway |
+| `--memory-limit-mb N` | — | **deprecated** alias for `--memory-budget-mb` (an explicit `0` disables) |
+
+**Peer and logging**
+
+| Flag | Meaning |
+|------|---------|
+| `--peer-conflict-policy strict\|last-write` | how a same-document divergence pushed by a peer is resolved |
+| `--log-level debug\|info\|warn\|error`, `--log-format text\|json` | structured logging |
+| `--config FILE` | JSON config file |
+
+### Configuration precedence
+
+```
+defaults  <  --config file  <  KDB_* environment  <  explicitly-set flags
+```
+
+Unknown keys in the config file are rejected, so a typo fails at startup instead of silently
+configuring nothing.
+
+### RBAC bootstrap
+
+With `--data-dir`, users and roles are durable (stored as versioned documents in the reserved
+`_system/users` and `_system/roles` namespaces). Create them while the service is **stopped** —
+the data-directory lock enforces that:
+
+```bash
+# define a role and its grants (create or update)
+./go/bin/kdb-service user role   --data-dir /var/lib/kdb \
+    --role app-writer --grants 'read:myapp/*,write:myapp/users'
+# create a user holding it
+./go/bin/kdb-service user create --data-dir /var/lib/kdb \
+    --user alice --password 's3cret' --roles app-writer
+# later: assign another role, or list what exists
+./go/bin/kdb-service user assign --data-dir /var/lib/kdb --user alice --role app-reader
+./go/bin/kdb-service user list   --data-dir /var/lib/kdb
+```
+
+Grants are `<kind>:<pattern>` over `namespace/collection/document`; a trailing `/*` is a prefix
+wildcard that also matches the prefix itself. Matching runs document → collection → database, so
+a database-level grant covers everything beneath it and a collection grant never leaks to a
+sibling.
+
+| Kind | Allows |
+|------|--------|
+| `read` | opening a session, `SELECT`, reading a document |
+| `write` | non-`SELECT` SQL (including `CREATE TABLE`), committing a transaction, writing or deleting a document |
+| `sync` | peer-sync fetch/push on the peer listener |
+| `admin` | the RBAC admin surface (create/drop user and role, grant/revoke) |
+
+Clients authenticate with a `"user:secret"` token or user/password at handshake:
+`client.Connect(ctx, addr, "alice:s3cret")`.
+
+### Health, readiness, metrics
+
+```bash
+curl -s localhost:9099/healthz   # ok + version/commit/build_date
+curl -s localhost:9099/readyz    # ready | 503 "not ready: starting|draining"
+curl -s localhost:9099/metrics   # Prometheus text
+```
+
+Key metrics to alert on: `kdb_memory_zone` (0–3), `kdb_admission_denied_total`
+(by class and reason), `kdb_stage_latency_seconds{stage="fsync_wait"}`, `kdb_draining`.
+Full list: [Protocol & operations §8](kdb-lld-protocol.md#8-observability).
+
+### Shutdown
+
+`SIGTERM`/`SIGINT` → readiness flips to `draining` (load balancers stop routing) → new writes are
+refused with `UNAVAILABLE` → admitted writes finish (up to `--drain-timeout`) → listeners close →
+storage is flushed and sealed → exit 0. Skipping all of this (`kill -9`) is safe: the same replay
+path runs on the next start.
+
+---
+
 ## Command-line usage
 
-KDB ships two command-line entry points.
+The Kotlin tree ships two Gradle-launched command-line entry points. (For the Go binaries, see
+[Go quick start](#go-quick-start) above and
+[Operations](#operations--durability-backup-and-recovery) below — both trees read and write the
+same on-disk format, so either CLI can open a workspace written by the other.)
 
-### Product CLI (`kdb`)
+### Product CLI (`kdb`, Kotlin)
 
 Git-style namespace commands for documents, queries, history, and peer sync.
 
@@ -153,6 +440,60 @@ Non-authoritative JSON views of binary on-disk or captured wire data. Does not m
 ```bash
 ./gradlew :kdb-inspect:inspectCli --args="dump-delta --data-dir ./data --namespace myapp/users"
 ```
+
+---
+
+## SQL reference (KDB-SQL)
+
+KDB's query language is **KDB-SQL**: SQL over documents, where the schema is an optional typed
+lens and the whole document is always reachable. Complete grammar, semantics, and limits:
+[KDB-SQL reference](kdb-lld-query.md).
+
+Every namespace behaves as one table with this column shape:
+
+| Column | Meaning |
+|--------|---------|
+| `kdb_id` | the document UUID (always present) |
+| *schema fields* | one typed column per declared schema field |
+| `_doc` | the entire document JSON (always present) |
+
+```sql
+SELECT kdb_id, name, _doc FROM users WHERE age >= 21 ORDER BY name LIMIT 50;
+SELECT COUNT(*) AS n FROM users WHERE status = 'active';
+SELECT name FROM users WHERE age > ? AND status = ?;      -- positional parameters
+SELECT kdb_id FROM users WHERE email IS NULL;
+CREATE TABLE users (name VARCHAR NOT NULL, age INT, status VARCHAR);
+INSERT INTO users (name, age) VALUES ('Ada', 36);          -- ids are generated
+SELECT * FROM users AT TIME '2026-08-01T00:00:00Z';        -- versioned read
+```
+
+**Supported surface by implementation** — the *server* parses the SQL, so a JVM client talking to
+a Go server gets the Go grammar:
+
+| Feature | Go engine | Kotlin engine |
+|---------|-----------|---------------|
+| `SELECT` + `WHERE` + `ORDER BY` + `LIMIT`/`OFFSET` | ✅ | ✅ |
+| `COUNT(*)` / `COUNT(col)` | ✅ | ✅ |
+| `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY` | ✖ | ✅ |
+| `INNER JOIN`, `LIKE`, `IN`, `BETWEEN`, `DISTINCT` applied | ✖ | ✅ |
+| `INSERT` | ✅ | ✅ |
+| `UPDATE` / `DELETE` | ✖ (use `Upsert` or a delete transaction) | ✅ |
+| `CREATE TABLE` | ✅ | ✅ |
+| `CREATE INDEX` / `VIRTUAL VIEW` / `ALTER TABLE` | ✖ | ✅ |
+| `CREATE USER/ROLE`, `GRANT`/`REVOKE` | ✖ (Go API only) | ✅ |
+| `BEGIN` / `COMMIT` / `ROLLBACK` in SQL | ✖ (wire `TX_COMMIT`/`TX_ROLLBACK`) | ✅ |
+| `AT VERSION` / `AT COMMIT` / `AT TIME` | ✅ | ✅ |
+
+Things that commonly surprise people (full list in
+[Part 5 §7](kdb-lld-query.md#7-semantics-limits-and-gotchas)):
+
+- `INSERT` always mints a new document id — write at a chosen id with `PutJSON`/`Upsert`.
+- The Go planner does **full scans only**; bound them with `LIMIT` and a `--scan-row-budget`.
+- `NULL = NULL` is true in the Go comparator; use `IS NULL` for standard semantics.
+- Comparing a string column with a number (or vice versa) compares as "equal" rather than
+  coercing — compare like with like.
+- Reads resolve a commit, but documents are materialised from current committed state; exact
+  point-in-time document reconstruction is a known gap.
 
 ---
 
@@ -603,21 +944,166 @@ Tune sandbox limits per call with `ProcLimits(wallClockMillis, maxHostCalls, max
 
 ---
 
+## Peer sync
+
+Peers are fully independent replicas. Each keeps its own history, may accept writes while
+disconnected, and reconciles on contact — fast-forwarding when one side is simply ahead,
+auto-merging when both sides changed *different* documents, and reporting a structured conflict
+when both changed the *same* document.
+
+```bash
+# node A
+./go/bin/kdb-service --data-dir /var/lib/kdb-a --namespace myapp/users \
+  --sql-addr "tcp://0.0.0.0:9090?bind=true" --peer-addr "tcp://0.0.0.0:9091?bind=true"
+
+# node B, pointed at A
+./go/bin/kdb-service --data-dir /var/lib/kdb-b --namespace myapp/users \
+  --sql-addr "tcp://0.0.0.0:9190?bind=true" --peer-addr "tcp://0.0.0.0:9191?bind=true"
+```
+
+| Setting | Effect |
+|---------|--------|
+| `--peer-conflict-policy strict` (default) | same-document divergence returns a conflict report; the branch head is left untouched for you to resolve |
+| `--peer-conflict-policy last-write` | later timestamp wins, symmetrically on every node |
+
+Peer connections are authenticated and authorized when `--rbac` is on (`PeerSyncAction`), and can
+be TLS/mTLS-protected like any other listener. The Kotlin CLI's `sync <namespace> <peer-uri>`
+performs a one-shot bidirectional sync.
+
+What to expect operationally: divergence is *normal*, merges create real two-parent commits, and
+nothing is ever silently overwritten under the default policy. The classification rules are in
+[Flows §12](kdb-lld-flows.md#12-peer-sync-mode-3).
+
+---
+
+## Operations — durability, backup, and recovery
+
+### Durability choices
+
+| `--durability` | Acknowledged when | Loss window |
+|----------------|-------------------|-------------|
+| `sync` (default) | the commit is fsynced | none for acknowledged writes |
+| `async` | the commit is queued in memory | up to one flush interval / in-flight batch |
+| `memory` | never written | everything on restart |
+
+`--sync-mode fast` (F_BARRIERFSYNC / fdatasync) is an order of magnitude cheaper than `full` and
+still survives process and OS crashes — but not power loss.
+
+Concurrent commits share one physical fsync (group commit), so `sync` does **not** mean one disk
+sync per write under load.
+
+### `kdb-inspect`
+
+All of `verify`, `repair-segments`, `backup`, and `restore --out` take the same exclusive
+data-directory lock a live service holds, so they refuse to run against a directory that is open.
+
+```bash
+# 1. Check a data directory (L1 = per-frame CRC, L2 = parent closure across segments)
+./go/bin/kdb-inspect verify --data-dir /var/lib/kdb --namespace myapp/users --level L2 [--json]
+
+# 2. Repair what is provably safe: truncate a torn tail, quarantine a corrupt frame
+./go/bin/kdb-inspect repair-segments --data-dir /var/lib/kdb --namespace myapp/users [--dry-run]
+
+# 3. Back up (directory or S3; add --base-backup-id for an incremental backup)
+./go/bin/kdb-inspect backup --data-dir /var/lib/kdb --namespace myapp/users --to /backups
+./go/bin/kdb-inspect backup-list   --namespace myapp/users --to /backups
+./go/bin/kdb-inspect backup-verify --namespace myapp/users --to /backups --backup-id <id>
+./go/bin/kdb-inspect backup-fetch  --namespace myapp/users --to /backups --backup-id <id> --out /tmp/fetched
+
+# 4. Rebuild from the verified union of one or more sources
+./go/bin/kdb-inspect restore --namespace myapp/users --out /var/lib/kdb-restored \
+    --source live=/var/lib/kdb --from-backup /backups --backup-id <id>
+
+# 5. Decode a captured wire frame
+./go/bin/kdb-inspect dump-wire --file ./frame.bin
+```
+
+**`--to s3`** uses the `KDB_S3_*` environment configuration below.
+
+### What each failure looks like
+
+| Symptom | Meaning | Action |
+|---------|---------|--------|
+| service starts normally after `kill -9` | a torn tail on the newest segment was tolerated | nothing — this is the designed path |
+| open fails naming `repair-segments` | corruption in a segment that is **not** the newest | `verify`, then `repair-segments`; if it refuses, `restore` |
+| `repair-segments` refuses and names commits | repairing would drop history later segments still reference | `restore` from a backup and/or the damaged directory |
+| open fails with "legacy segment format" | a pre-Layer-13 data directory | `repair-segments` migrates it |
+| `data directory locked` | another process holds the workspace | stop it, or use a server; `kdb unlock` removes a stale lock file only when the recorded PID is gone |
+
+### Replicating to object storage
+
+Set these before starting a file-backed runtime or service; sealed segments and snapshots are
+mirrored to an S3-compatible target:
+
+| Variable | Meaning |
+|----------|---------|
+| `KDB_S3_BUCKET` | bucket name — **unset disables S3 entirely** |
+| `KDB_S3_REGION` | region (default `us-east-1`) |
+| `KDB_S3_ENDPOINT` | custom endpoint (LocalStack / MinIO); implies path-style |
+| `KDB_S3_PREFIX` | key prefix |
+| `KDB_S3_PATH_STYLE`, `KDB_S3_ENSURE_BUCKET` | addressing style, create-if-missing |
+
+### Capacity and memory
+
+Governance is **on by default**: with no `--memory-budget-mb`, the service governs against the
+container's cgroup limit, or 75 % of host RAM. Because operations reserve their estimated memory
+before running, the budget can be set at the container's real limit rather than 60–80 % of it.
+
+| Signal | Meaning |
+|--------|---------|
+| `kdb_memory_zone` 1 (Elevated) | scan row budgets halved; nothing client-visible yet |
+| `kdb_memory_zone` 2 (High) | writes and scans refused with `BUSY`; point reads still served |
+| `kdb_memory_zone` 3 (Critical) | only point reads; rescue reserve released; abort timer running |
+| rising `kdb_admission_denied_total{reason="capacity"}` | the budget is too small for the offered load |
+| rising `…{reason="too_large"}` | individual operations exceed the whole budget — resubmit smaller |
+| exit code **75** | the abort watchdog performed an orderly shutdown; a supervisor should restart the process |
+
+Because the commit DAG grows monotonically, a long-lived busy namespace will eventually throttle:
+that is the designed degradation, and the levers are a larger budget, DAG compaction, or splitting
+the namespace.
+
+---
+
+## Troubleshooting
+
+| Message / symptom | Cause | Fix |
+|-------------------|-------|-----|
+| `data directory locked: …/.kdb.lock` | another CLI, JDBC file connection, or service holds the workspace | stop the holder, or run a server; `kdb unlock` for a stale file |
+| `BUSY` / `errors.Is(err, ErrBusy)` | write queue full or memory pressure | honour `RetryAfter()`; check `kdb_memory_zone` |
+| `DEADLINE_EXCEEDED` | your call's deadline passed while queued | raise the deadline; check write latency (`kdb_stage_latency_seconds`) |
+| `RESOURCE_EXHAUSTED` | operation larger than the whole grant capacity, or scan row budget exceeded | resubmit smaller / narrow the query / raise `--scan-row-budget` |
+| `CONFLICT` | optimistic concurrency | re-read at the reported head and retry, or use `Upsert` |
+| `UNAUTHORIZED` | RBAC denial | check the principal's grants |
+| `SCHEMA_VIOLATION` | the document does not satisfy the declared schema | fix the payload or migrate the schema |
+| handshake rejected with a reason | wrong client mode, bad credentials, or namespace not authorized | check the listener you connected to and the token |
+| `unsupported protocol version` | client and server wire versions differ | align versions |
+| readiness stuck at `not ready: starting` | a listener failed to bind | check the startup log |
+| `readyz` reports `draining` | shutdown or abort in progress | expected during deploys |
+
+---
+
 ## Data layout (for inspect CLI)
 
-File-backed storage on the JVM typically uses:
+Both implementations write the same tree:
 
 ```
-data-dir/
-  ns/
-    <namespace-id>/
-      delta/
-    blobs/
-      <aa>/
-        <full-hash>
+<dataRoot>/
+├── .kdb.lock                       exclusive lock while the workspace is open
+├── costmodel.json                  learned scan-cost priors (kdb-service; a cache — safe to delete)
+└── ns/
+    └── <namespaceId>/
+        ├── meta.json
+        ├── delta/00000000000000000000.seg   the commit log — sequence order is commit order
+        ├── wal/<walId>[.<firstSeq>]         blob write-ahead log
+        ├── sstable/L0/<fileId>              flushed blob generations
+        └── quarantine/                      only after `repair-segments`
 ```
 
-Use `dump-delta` and `dump-blob` against this tree for debugging.
+The **delta log alone** can rebuild a namespace, which is why backup, verify, and restore all
+operate on it. Byte-level formats: [Storage, Part 4](kdb-lld-storage.md#3-byte-formats).
+
+Use `kdb-inspect dump-wire` (Go) or `dump-delta` / `dump-blob` (Kotlin) against this tree for
+debugging.
 
 ---
 
@@ -653,16 +1139,41 @@ One-shot CLI commands reopen the file runtime on every invocation; compare `cliP
 
 | Topic | Document |
 |-------|----------|
-| Architecture, roadmap, JDBC design | [kdb-spec.md](kdb-spec.md) |
+| What KDB is, decisions, quality attributes, risks | [High-level architecture](kdb-architecture.md) |
+| How it works internally (index + data model) | [Low-level design, Part 0](kdb-lld.md) |
+| Every package and type | [Part 1 — Components](kdb-lld-components.md) |
+| End-to-end sequences | [Part 2 — Flows](kdb-lld-flows.md) |
+| Threads, locks, backpressure | [Part 3 — Concurrency](kdb-lld-concurrency.md) |
+| On-disk and in-memory formats | [Part 4 — Storage](kdb-lld-storage.md) |
+| Complete SQL reference | [Part 5 — KDB-SQL](kdb-lld-query.md) |
+| Wire protocol, error codes, governance, metrics | [Part 6 — Protocol & operations](kdb-lld-protocol.md) |
+| Normative spec, roadmap, JDBC design | [kdb-spec.md](kdb-spec.md) |
+| Go module layout, interop rules | [go-porting.md](go-porting.md) |
 | JDBC driver spec | [kdb-spec-layer8-component24-jdbc-driver.md](kdb-spec-layer8-component24-jdbc-driver.md) |
 | Product CLI spec | [kdb-spec-layer10-component29-cli.md](kdb-spec-layer10-component29-cli.md) |
 | Inspect tooling spec | [kdb-spec-layer10-component31-inspect-tooling.md](kdb-spec-layer10-component31-inspect-tooling.md) |
 | Stream / browser modes | [kdb-spec-layer7-component22-stream-mode.md](kdb-spec-layer7-component22-stream-mode.md) |
+| Resource governance | [kdb-spec-layer13-resource-governance.md](kdb-spec-layer13-resource-governance.md) |
+| Integrity, backup, recovery | [kdb-spec-layer15-integrity-backup-recovery.md](kdb-spec-layer15-integrity-backup-recovery.md) |
 | Stored procedures | [kdb-spec-layer11-component32-stored-procedures.md](kdb-spec-layer11-component32-stored-procedures.md) |
 
 ---
 
 ## Quick reference
+
+**Go**
+
+```bash
+cd go && go test ./...
+make build-go
+./go/bin/kdb --data-dir /tmp/kdb-data init myapp/users
+./go/bin/kdb-service --data-dir /var/lib/kdb --namespace myapp/users \
+  --sql-addr "tcp://0.0.0.0:9090?bind=true" --admin-addr 127.0.0.1:9099
+./go/bin/kdb-inspect verify --data-dir /var/lib/kdb --namespace myapp/users --level L2
+./go/bin/kdb-inspect backup --data-dir /var/lib/kdb --namespace myapp/users --to /backups
+```
+
+**Kotlin**
 
 ```bash
 ./gradlew build

@@ -55,7 +55,9 @@ Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-d
 
 | Document | Audience |
 |----------|----------|
-| [**User guide**](docs/kdb-user-guide.md) | Run the inspect CLI, embed via JDBC (Java), or Kotlin/JS (browser) |
+| [**High-level architecture**](docs/kdb-architecture.md) | What KDB is, the container view, key decisions and rationale, quality attributes, risks — **start here** |
+| [**User guide**](docs/kdb-user-guide.md) | Run the CLI or server, embed via `database/sql`/JDBC/Kotlin-JS, operate (backup, verify, restore, governance) |
+| [**Low-level design**](docs/kdb-lld.md) | Implementation reference in seven parts: [components](docs/kdb-lld-components.md), [flows](docs/kdb-lld-flows.md), [concurrency](docs/kdb-lld-concurrency.md), [storage](docs/kdb-lld-storage.md), [KDB-SQL](docs/kdb-lld-query.md), [protocol & operations](docs/kdb-lld-protocol.md) |
 | [**Go porting guide**](docs/go-porting.md) | Go module layout, build tags, interop tests |
 | [**Architecture specification**](docs/kdb-spec.md) | Full system design, protocols, and layer specs |
 
