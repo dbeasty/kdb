@@ -6,6 +6,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
@@ -45,6 +46,17 @@ type KdbSession struct {
 	// snapshot: holding one pin forever means a session cannot observe its own committed
 	// writes, which is neither useful nor what SNAPSHOT means.
 	readPin *codec.Hash
+	// pinRelease drops the DAG retention pin taken for readPin, and is guarded by versionMu
+	// alongside it. Holding the hash in readPin is not by itself protection: nothing stopped a
+	// compaction reclaiming that commit while a session read at it, because a read pin is not a
+	// branch head and there was no registry to look one up in (dag.Pin's doc comment). Nil
+	// whenever readPin is - a non-SNAPSHOT session reads the live head, which is a branch head
+	// and therefore already a retention root.
+	pinRelease func()
+	// dag is the concrete DAG this session pins against, nil for a runtime that has none (see
+	// KdbServerRuntime.dag). Pinning is skipped entirely when nil - the same degradation the
+	// commit path already accepts there.
+	dag *dag.InMemoryCommitDag
 
 	// leaseMu guards leases. Frames on one connection are dispatched concurrently (see
 	// SqlWireListen's pipelining), so a client can have a LockAcquire and a TxCommit in flight
@@ -92,12 +104,35 @@ func (s *KdbSession) startTransactionAt(head codec.Hash) {
 	s.versionMu.Lock()
 	defer s.versionMu.Unlock()
 	s.baseVersion = head
+	s.releasePinLocked()
 	if s.ReadConsistency == Snapshot {
 		pinned := head
 		s.readPin = &pinned
-	} else {
-		s.readPin = nil
+		if s.dag != nil {
+			s.pinRelease = s.dag.Pin(head)
+		}
 	}
+}
+
+// releasePinLocked drops the current transaction's read pin, if any, and clears it. Must be
+// called with versionMu held exclusively. Every path that ends a transaction goes through here:
+// starting the next one (above) and ending the session (EndTransaction).
+func (s *KdbSession) releasePinLocked() {
+	if s.pinRelease != nil {
+		s.pinRelease()
+		s.pinRelease = nil
+	}
+	s.readPin = nil
+}
+
+// EndTransaction drops this session's read pin without opening another - what session teardown
+// needs, as distinct from the transaction boundaries that immediately re-pin. A session whose
+// connection dropped mid-transaction must not go on holding a commit against compaction
+// forever, which is the read-side twin of the document leases closeAllSessions already releases.
+func (s *KdbSession) EndTransaction() {
+	s.versionMu.Lock()
+	defer s.versionMu.Unlock()
+	s.releasePinLocked()
 }
 
 // TrackLease records an explicitly acquired lease on the session.
@@ -192,6 +227,7 @@ func (m *SessionManager) Begin(
 		NamespaceID:     namespaceID,
 		ReadConsistency: readConsistency,
 		Principal:       principal,
+		dag:             m.server.dag,
 	}
 	// The session's first transaction starts here, at the version it was opened against.
 	sess.startTransactionAt(head)
@@ -222,11 +258,22 @@ func (m *SessionManager) Get(sessionID string) (*KdbSession, bool) {
 	return s, ok
 }
 
-// End removes a session.
+// End removes a session and drops the read pin it was holding - without this a session whose
+// connection dropped would hold a commit against compaction for the process lifetime, the
+// read-side twin of the document locks closeAllSessions releases.
+//
+// The release happens after the map delete and outside m.mu, deliberately: it takes the DAG's
+// lock, and holding the session map's lock across that would nest SessionManager.mu inside
+// dag.mu for no reason. The delete-then-release order is safe because the delete is what claims
+// the right to release - a concurrent End finds nothing and releases nothing.
 func (m *SessionManager) End(sessionID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	sess, ok := m.sessions[sessionID]
 	delete(m.sessions, sessionID)
+	m.mu.Unlock()
+	if ok {
+		sess.EndTransaction()
+	}
 }
 
 // ClearPending clears in-flight transaction builder state.

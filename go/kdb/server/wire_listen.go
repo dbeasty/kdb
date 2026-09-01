@@ -514,12 +514,7 @@ func (h *sqlWireConnHandler) handleTxCommit(msg wire.TxCommitMessage) wire.Messa
 	if err != nil {
 		var conflictErr *ConflictError
 		if asError(err, &conflictErr) {
-			reportBytes, _ := json.Marshal(conflictErr.Report)
-			return wire.ConflictReportMessage{
-				H:           header(msg.H.CorrelationID, wire.MsgConflictReport),
-				Namespace:   msg.Namespace,
-				ReportBytes: reportBytes,
-			}
+			return conflictReport(msg.H.CorrelationID, msg.Namespace, conflictErr)
 		}
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
@@ -612,12 +607,7 @@ func replayTransaction(runtime *KdbServerRuntime, principal auth.Principal, msg 
 	if err != nil {
 		var conflictErr *ConflictError
 		if asError(err, &conflictErr) {
-			reportBytes, _ := json.Marshal(conflictErr.Report)
-			return wire.ConflictReportMessage{
-				H:           header(msg.H.CorrelationID, wire.MsgConflictReport),
-				Namespace:   msg.Namespace,
-				ReportBytes: reportBytes,
-			}
+			return conflictReport(msg.H.CorrelationID, msg.Namespace, conflictErr)
 		}
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, "", err)
 	}
@@ -661,14 +651,14 @@ func (h *sqlWireConnHandler) handleDocumentGet(msg wire.DocumentGetMessage) wire
 		g, err := adm.AcquireBytes(actx, ClassPointRead, estimate)
 		cancel()
 		if err != nil {
-			return documentGetError(msg, err.Error())
+			return documentGetErrorClassified(msg, err)
 		}
 		grant = g
 		defer grant.Release()
 	}
 	jsonBody, commitHex, found, err := h.runtime.GetDocument(msg.Namespace, docID)
 	if err != nil {
-		return documentGetError(msg, err.Error())
+		return documentGetErrorClassified(msg, err)
 	}
 	if adm := h.runtime.admission; adm != nil && found {
 		adm.Costs().ObserveDocSize(msg.Namespace, len(jsonBody))
@@ -692,12 +682,49 @@ func (h *sqlWireConnHandler) handleDocumentGet(msg wire.DocumentGetMessage) wire
 	}
 }
 
+// conflictReport shapes a lost optimistic-concurrency race, carrying the structured report the
+// client needs to decide *what* to do and the code/retry-after it needs to decide *when*. Before
+// these fields existed a conflict was the one refusal the server could not pace: BUSY and
+// memory-pressure sheds have carried a retry-after since Component 51, but a conflict - the
+// refusal a contended workload produces by far the most of - arrived with nothing, so every
+// client retried instantly and collided again. See KdbServerRuntime.conflictRetryAfterMs.
+func conflictReport(correlationID int, namespace string, conflictErr *ConflictError) wire.Message {
+	reportBytes, _ := json.Marshal(conflictErr.Report)
+	code, retryAfterMs := classifyError(conflictErr)
+	return wire.ConflictReportMessage{
+		H:            header(correlationID, wire.MsgConflictReport),
+		Namespace:    namespace,
+		ReportBytes:  reportBytes,
+		ErrorCode:    &code,
+		RetryAfterMs: retryAfterMs,
+	}
+}
+
 func documentGetError(msg wire.DocumentGetMessage, errMsg string) wire.Message {
 	return wire.DocumentGetResultMessage{
 		H:         header(msg.H.CorrelationID, wire.MsgDocumentGetResult),
 		Namespace: msg.Namespace,
 		DocID:     msg.DocID,
 		Error:     &errMsg,
+	}
+}
+
+// documentGetErrorClassified is documentGetError plus ErrorCode/RetryAfterMs from err's concrete
+// type - see upsertErrorClassified's doc comment. Used at the two call sites carrying a real
+// typed error: the admission grant (which refuses with BusyError or ResourceExhaustedError under
+// load) and the read itself. Reads reaching for a grant can be shed exactly like writes, so a
+// reading client needs the same "whether and when to retry" answer a writing one already got;
+// until DocumentGetResultMessage carried these fields it got prose.
+func documentGetErrorClassified(msg wire.DocumentGetMessage, err error) wire.Message {
+	errMsg := err.Error()
+	code, retryAfterMs := classifyError(err)
+	return wire.DocumentGetResultMessage{
+		H:            header(msg.H.CorrelationID, wire.MsgDocumentGetResult),
+		Namespace:    msg.Namespace,
+		DocID:        msg.DocID,
+		Error:        &errMsg,
+		ErrorCode:    &code,
+		RetryAfterMs: retryAfterMs,
 	}
 }
 

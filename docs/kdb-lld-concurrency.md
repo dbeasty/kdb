@@ -132,7 +132,9 @@ takes them in any other order.
 1.  Admission.sem              (bytes; blocking, but only on a context with a deadline)
 2.  writeGate.queued → running (bounded; deadline-aware)
 3.  peersync per-namespace lock (peer paths only)
+3b. SessionManager.mu            (the per-connection session map; released before touching a session)
 4.  KdbSession.leaseMu           (read the session's tracked leases; released before the next step)
+4b. KdbSession.versionMu         (baseVersion + readPin; nests dag.mu when a SNAPSHOT transaction takes or drops its retention pin)
 5.  transaction.LockManager.mu   (documents, in sorted id order)
 6.  transaction.UniqueKeyRegistry.mu
 7.  dag.mu
@@ -155,6 +157,11 @@ Rules the code follows, each of which is load-bearing:
   `AssertUnheldByOthers` both sort by id string), so two transactions touching overlapping document
   sets can never deadlock; on failure, only the locks *this call* newly granted are released
   (`ReleaseLeases` filters on `GrantedNow`), never a lease the client took explicitly.
+- **Session teardown releases outside the map lock.** `SessionManager.End` deletes from the
+  session map, drops `mu`, and only then releases the session's DAG retention pin — the delete is
+  what claims the right to release, so a concurrent `End` finds nothing and does nothing. Holding
+  the map lock across `dag.Pin`'s release would nest `SessionManager.mu` inside `dag.mu` for no
+  reason.
 - **Per-shard, not per-store.** Document reads and writes to different shards never contend.
 - **Scan copies a shard, then releases.** `shardedDocStore.Range` copies one shard's documents
   under its lock and visits them unlocked, so a slow batch callback never stalls writers.
@@ -204,6 +211,14 @@ unbounded blocked goroutines with no way to distinguish a healthy wait from a ho
 
 `quiesced()` reports an empty gate, which is how `WaitForWritesToDrain` knows an orderly shutdown
 may proceed — meaningful only after `BeginDraining` stops new admissions.
+
+**The gate is also the server's contention sensor.** `queueDepth()` is how many writers are
+waiting, and `meanServiceTime()` is an EWMA of how long one commit occupies the running slot.
+Their product is the expected time for the writers currently ahead to drain, which is what sizes
+the retry-after hint on a conflict response (`server/backoff.go`). This matters because the
+staleness window that *causes* conflicts is the queue itself: `tx.BaseVersion` is resolved before
+a writer queues, while the target head is resolved inside the gate, so a base ages by one commit
+for every writer that drains ahead of it. The gate is the only thing that can measure that.
 
 > ⚠️ **Embedded callers get no gate.** `embed.PutJSONDocument` and direct
 > `transaction.Engine.Commit` calls against a shared `*InMemoryCommitDag` are **not** internally
@@ -381,7 +396,8 @@ relative to the write gate: peer-sync commits that go through `KdbServerRuntime`
 | `KdbSession.Pending` builder | one session | assumed single-threaded per session — a client pipelining two `INSERT`s on the same session id must not do so concurrently |
 | document locks | server-wide, keyed by session id | released on `TX_ROLLBACK` and on disconnect (`closeAllSessions` → `ReleaseAll`), so a dropped connection cannot leak locks. Session ids are **runtime-scoped**, not per-connection — see §13 |
 | explicit leases | one session, mirrored in `LockManager` | taken by `LOCK_ACQUIRE`, expire on their own, survive a commit (only implicit locks are released), and are validated by fence at commit time |
-| `ReadPin` | one session | set at begin under SNAPSHOT; immutable afterwards |
+| `KdbSession.readPin` | one session | set under SNAPSHOT and re-taken at **every** transaction boundary (begin, commit, rollback) — that is what makes it snapshot isolation rather than a session-lifetime snapshot; guarded by `versionMu` alongside `baseVersion`, since frames on one connection are dispatched concurrently |
+| read-pin DAG retention (`dag.Pin`) | server-wide, ref-counted | a read pin also takes a retention pin on the DAG, released at the next transaction boundary and on session end (`SessionManager.End`). Without it the commit a SNAPSHOT session reads at could be reclaimed underneath it — see §13 |
 
 -----
 
@@ -402,6 +418,8 @@ relative to the write gate: peer-sync commits that go through `KdbServerRuntime`
 | Unique enforcement blind spot | an engine built with `NewEngine` (zero `EngineOptions`) enforces **nothing** — `unique=true` is inert and preconditions are ignored | the server always wires `EngineOptions{UniqueKeys, Preconditions: true}`; embedded callers constructing their own engine must do the same, or a transaction carrying preconditions commits as if it had none |
 | Registry incomplete after a failed rebuild | data already on disk violates a declared constraint | recorded in `UniqueKeyRebuildError` and surfaced, never swallowed; the runtime still opens so an operator has the tools to fix it, and writes that would compound the violation are still refused |
 | A reader's view going stale | `OpenReadOnlyFileRuntime` | a reader is a snapshot as of its open; `Refresh()` advances it, and freshness is an explicit part of the caller's contract rather than an accident of timing |
+| **A pinned version reclaimed under a live reader** (fixed) | `Squash`/`StubCommit` refused only when a **branch head** was in the window. A SNAPSHOT session's read pin is not a branch head, and an in-flight commit's `tx.BaseVersion` — resolved before the writer queues at the write gate, not consulted until it reaches the front — is not either. Neither was registered anywhere a compaction could look: each connection owns its own `SessionManager`, so there was no global view of who was reading what. Latent only because `compaction.Engine` is still a skeleton with no production caller | `dag.Pin` (`dag/retention.go`): a ref-counted, server-wide retention root that `Squash` and `StubCommit` consult alongside branch heads and tags, refusing with `CompactionSafetyError` rather than reclaiming. Sessions pin at each transaction boundary; `runTransaction` pins `tx.BaseVersion` for the length of the commit. This is the reader-table problem (LMDB's reader table, Postgres's xmin horizon) in its minimal form — it makes compaction fail loudly instead of corrupting a reader, and does not yet let compaction *wait* for a pin to clear |
+| **A conflict storm with no way to pace it** (fixed) | a lost optimistic-concurrency race returned `ConflictReportMessage`, which carried a report and nothing else — no error code, no retry-after — so a client's only move was to retry instantly, and N clients retrying instantly re-collide every round. `ErrorCodeConflict` existed with a doc comment promising it accompanied this message, and had zero producers | the message now carries `ErrorCode`/`RetryAfterMs`; the server sizes the hint from live `writeGate` queue depth × measured mean commit service time and applies **full jitter per response** (`server/backoff.go`), which is the only point that can see the whole herd. `client.CompareAndSwap` honors it and otherwise backs off itself. `DocumentGetResultMessage` gained the same fields — point reads take an admission grant and can be shed under load exactly like writes |
 
 -----
 

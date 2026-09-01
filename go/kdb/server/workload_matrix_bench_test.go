@@ -21,6 +21,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
@@ -96,15 +97,52 @@ func seedDocs(b *testing.B, srv *KdbServerRuntime, ns string, n int) []codec.UUI
 // very high-core machine at heavyMultiUserParallelism, buckets wrap and get shared - an
 // acceptable approximation for what this benchmark is measuring (contention vs. no contention),
 // not a correctness guarantee.
-const nonOverlappingBuckets = 128
+//
+// Both modes offset the sequence by workerID, and that offset is load-bearing rather than
+// cosmetic. Without it the index was ids[i%len(ids)] with every worker's i starting at 0, so all
+// workers targeted the same document at the same time; worse, under commitWithRetry i only
+// advances on success, so a worker that lost a round stayed parked on the key the winners had
+// just left. The modes degenerated into an N-way barrier sweeping one document at a time, which
+// costs ~N^2/2 attempts per N successes - it reported 178 conflicts/op and 703 ops/sec on a
+// 16-core machine and was written up as a ~40x contention collapse. Offsetting decorrelates the
+// workers and the same 256-document pool measures 2.9 conflicts/op at 17.7k ops/sec, matching
+// non-overlapping exactly. See docs/benchmarks/workload-matrix.md, Finding 3.
+//
+// keyStride is coprime to any plausible pool size, so workerID*keyStride spreads consecutive
+// worker ids across the pool rather than clustering them.
+const keyStride = 7919
+
+// workerCount is how many goroutines runHeavyMultiUser actually starts. Partitioning is sized
+// from this rather than from a fixed bucket count: a constant 128 buckets meant that on any
+// machine with more than two cores the goroutines outnumbered the buckets and "non-overlapping"
+// silently handed several workers the same documents - the control row was not a control.
+func workerCount() int { return runtime.GOMAXPROCS(0) * heavyMultiUserParallelism }
+
+// nonOverlappingPoolSize is the pool a mode needs for its claim to hold. Overlapping wants a
+// small pool (contention is the point); non-overlapping needs at least one document per worker,
+// or workers must share no matter how the keys are assigned.
+func nonOverlappingPoolSize(base int) int {
+	if n := workerCount(); n > base {
+		return n
+	}
+	return base
+}
 
 func keyFor(ids []codec.UUID, mode keyspaceMode, workerID, i int) codec.UUID {
-	if mode == keyspaceOverlapping || len(ids) < nonOverlappingBuckets {
-		return ids[i%len(ids)]
+	if mode == keyspaceOverlapping {
+		return ids[(workerID*keyStride+i)%len(ids)]
 	}
-	partitionSize := len(ids) / nonOverlappingBuckets
-	base := (workerID % nonOverlappingBuckets) * partitionSize
-	return ids[base+(i%partitionSize)]
+	buckets := workerCount()
+	if buckets > len(ids) {
+		buckets = len(ids)
+	}
+	partitionSize := len(ids) / buckets
+	base := (workerID % buckets) * partitionSize
+	// Workers sharing a bucket (only possible when the pool is smaller than the worker count)
+	// start at different offsets within it, for the same reason the overlapping branch offsets:
+	// co-scheduled workers on one key is precisely what this mode exists not to do.
+	offset := workerID / buckets
+	return ids[base+((offset+i)%partitionSize)]
 }
 
 // runSequential drives fn b.N times on the calling goroutine only - true single-user, no
@@ -274,7 +312,15 @@ func BenchmarkWorkloadTransaction(b *testing.B) {
 	for _, mode := range []keyspaceMode{keyspaceOverlapping, keyspaceNonOverlapping} {
 		ns := "bench/tx"
 		srv := newWorkloadServer(b, ns)
-		ids := seedDocs(b, srv, ns, poolSize)
+		// Non-overlapping gets one document per worker. Conflicts are the measured quantity
+		// here, so the zero-contention control has to actually be able to reach zero: at 256
+		// documents and ~1024 goroutines, four workers share every document by construction and
+		// the row reported the same conflict rate as the contended one.
+		size := poolSize
+		if mode == keyspaceNonOverlapping {
+			size = nonOverlappingPoolSize(poolSize)
+		}
+		ids := seedDocs(b, srv, ns, size)
 
 		b.Run("single-user/"+mode.String(), func(b *testing.B) {
 			var conflicts int64
@@ -317,10 +363,13 @@ func commitOnce(srv *KdbServerRuntime, ns string, id codec.UUID, body string) er
 }
 
 // commitWithRetry retries commitOnce on *ConflictError, counting attempts that were rejected as
-// conflicting - the shape a real optimistic-concurrency client would use. See
-// docs/benchmarks/workload-matrix.md "Finding 1" for why conflicts/op reads 0 today regardless
-// of key overlap: ServerEngine.GetDocument does not honor its atCommit parameter, so
-// ConflictPolicyStrict's conflict detection cannot fire against it.
+// conflicting.
+//
+// Deliberately retries immediately, with no backoff: this measures what the *server* does under
+// contention, so the client side is held at its worst case. A real client should not do this -
+// client.CompareAndSwap honors the server's retry-after hint and otherwise backs off with full
+// jitter (go/kdb/client/conditional.go). Keeping the benchmark unbuffered by backoff is what
+// makes conflicts/op readable as a conflict rate rather than as a sleep schedule.
 func commitWithRetry(b *testing.B, srv *KdbServerRuntime, ns string, id codec.UUID, body string, conflicts *int64) {
 	b.Helper()
 	for {

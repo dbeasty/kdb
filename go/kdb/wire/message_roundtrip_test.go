@@ -358,6 +358,32 @@ func TestRoundTripConflictReport(t *testing.T) {
 	if !bytes.Equal(back.ReportBytes, msg.ReportBytes) {
 		t.Fatalf("reportBytes: %v", back.ReportBytes)
 	}
+	// An older server sends no code at all, and that has to stay decodable as "no hint" rather
+	// than as a zero-valued one - the difference between "retry whenever" and "retry now".
+	if back.ErrorCode != nil || back.RetryAfterMs != nil {
+		t.Fatalf("expected absent code/retry-after to stay absent, got %v/%v", back.ErrorCode, back.RetryAfterMs)
+	}
+}
+
+// The pacing fields are what let a client that lost a race wait instead of colliding again, so
+// they have to survive the wire, not just exist on the struct.
+func TestRoundTripConflictReportCarriesRetryAfter(t *testing.T) {
+	code := wire.ErrorCodeConflict
+	retry := 37
+	msg := wire.ConflictReportMessage{
+		H:            testHeader(16, wire.MsgConflictReport),
+		Namespace:    "app/data",
+		ReportBytes:  []byte{0x01, 0x00, 0xfe},
+		ErrorCode:    &code,
+		RetryAfterMs: &retry,
+	}
+	back := roundTrip(t, msg).(wire.ConflictReportMessage)
+	if back.ErrorCode == nil || *back.ErrorCode != wire.ErrorCodeConflict {
+		t.Fatalf("errorCode: %v", back.ErrorCode)
+	}
+	if back.RetryAfterMs == nil || *back.RetryAfterMs != retry {
+		t.Fatalf("retryAfterMs: %v", back.RetryAfterMs)
+	}
 }
 
 func TestRoundTripIceArchiveNotice(t *testing.T) {

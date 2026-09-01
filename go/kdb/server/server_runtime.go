@@ -470,6 +470,13 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	if s.dag == nil {
 		return document.Commit{}, fmt.Errorf("kdb server: commit requires an InMemoryCommitDag (or a wrapper exposing one), got %T", s.Runtime.DAG)
 	}
+	// The base version has to survive the queue, not just the commit. It was resolved by the
+	// caller before this call and is not consulted until transaction.Engine.Commit runs at the
+	// front of the write gate, which can be a long way behind up to DefaultMaxQueuedWrites other
+	// writers - and Commit hard-fails with BaseNotFoundError if it has been reclaimed by then.
+	// Nothing else roots it: a base version is not a branch head. (Replay needs no equivalent -
+	// it ignores tx.BaseVersion and targets the live head, which is a branch head already.)
+	defer s.dag.Pin(tx.BaseVersion)()
 	timeout := s.WriteTimeout
 	if timeout <= 0 {
 		timeout = DefaultWriteTimeout
@@ -531,7 +538,10 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 		}
 		return r.Commit, nil
 	case transaction.ResultConflict:
-		return document.Commit{}, &ConflictError{Report: r.Report}
+		// Sampled here, at the moment of failure, rather than when the response is shaped: the
+		// queue depth that made this transaction's base version stale is the one standing right
+		// now, and it can have changed by the time the frame is written.
+		return document.Commit{}, &ConflictError{Report: r.Report, RetryAfterMs: s.conflictRetryAfterMs()}
 	case transaction.ResultSchemaError:
 		return document.Commit{}, &SchemaError{Violations: r.Violations}
 	case transaction.ResultAborted:
@@ -619,6 +629,13 @@ func (e *AuthorizationError) Unwrap() error { return e.Cause }
 // ConflictReport message type (component 38 spec §6).
 type ConflictError struct {
 	Report kdberr.ConflictReport
+	// RetryAfterMs is how long the server suggests waiting before re-reading and retrying,
+	// computed at the moment of failure from live write-gate pressure and jittered per response
+	// (conflictRetryAfterMs). It travels with the error so that every path which turns a
+	// conflict into a wire response - classifyError, and the two ConflictReportMessage call
+	// sites in wire_listen.go - reports the same number from one source rather than each
+	// inventing its own.
+	RetryAfterMs int
 }
 
 func (e *ConflictError) Error() string {

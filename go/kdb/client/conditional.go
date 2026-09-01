@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -21,6 +23,10 @@ var ErrPreconditionFailed = errors.New("kdb: precondition failed")
 type PreconditionError struct {
 	DocumentID string
 	ActualHash string
+	// RetryAfterMs is the server's backoff suggestion, carried on the same response as an
+	// ordinary conflict - a failed compare-and-set under contention is the same herd problem
+	// and takes the same remedy. Zero when the server sent no hint. See ConflictError.
+	RetryAfterMs int
 }
 
 func (e *PreconditionError) Error() string {
@@ -107,6 +113,14 @@ func (c *Client) conditionalPut(
 // body from update means "leave it alone", and CompareAndSwap returns ErrAborted without
 // writing. Every retry re-reads: a caller that recomputes from a stale value is exactly the lost
 // update this exists to prevent, so the read cannot be hoisted out of the loop.
+//
+// Retries wait before re-reading, preferring the server's own retry-after hint (see
+// ConflictError.RetryAfterMs) and falling back to capped exponential backoff with full jitter.
+// Retrying instantly, which is what this did before, is the pathological move under contention:
+// every client that lost a round comes back at the same moment and collides again, so a
+// contended document degrades into a herd that burns maxAttempts without anyone making
+// progress. Waiting is not politeness here - it is what lets the losers arrive spread out
+// enough to actually succeed.
 func (c *Client) CompareAndSwap(
 	ctx context.Context,
 	ns string,
@@ -155,8 +169,73 @@ func (c *Client) CompareAndSwap(
 			return "", err
 		}
 		lastErr = err
+		// Not after the final attempt: there is nothing left to wait for.
+		if attempt < maxAttempts-1 {
+			if werr := waitBackoff(ctx, attempt, err); werr != nil {
+				return "", werr
+			}
+		}
 	}
 	return "", fmt.Errorf("kdb: compare-and-swap on %s gave up after %d attempts: %w", docID, maxAttempts, lastErr)
+}
+
+// Backoff bounds for a retry the server gave no hint for. The cap matters more than the base:
+// it bounds how long a caller can be parked, while the jitter below is what actually breaks up
+// the herd.
+const (
+	backoffBaseMs = 2
+	backoffCapMs  = 250
+)
+
+// retryHint extracts the server's suggested delay from a conflict or precondition failure, or 0
+// if it sent none.
+func retryHint(err error) time.Duration {
+	var conflict *ConflictError
+	if errors.As(err, &conflict) {
+		return conflict.RetryAfter()
+	}
+	var pre *PreconditionError
+	if errors.As(err, &pre) {
+		return time.Duration(pre.RetryAfterMs) * time.Millisecond
+	}
+	return 0
+}
+
+// backoffDelay decides how long to wait before the next attempt. It uses the server's hint when
+// there is one - the server can see the whole queue and has already jittered it per response,
+// which no client can do for itself - and otherwise draws uniformly from
+// [0, min(base*2^attempt, cap)]: full jitter, per AWS's "Exponential Backoff and Jitter". Full
+// jitter rather than exponential-plus-a-little-noise because only the former fully decorrelates
+// clients that started together, which under a lockstep workload is all of them.
+//
+// Separate from waitBackoff so the schedule can be tested without sleeping through it.
+func backoffDelay(attempt int, err error) time.Duration {
+	if hint := retryHint(err); hint > 0 {
+		return hint
+	}
+	capMs := backoffCapMs
+	if attempt < 24 { // guard the shift; anything above the cap is the cap anyway
+		if scaled := backoffBaseMs << uint(attempt); scaled < capMs {
+			capMs = scaled
+		}
+	}
+	return time.Duration(rand.IntN(capMs+1)) * time.Millisecond
+}
+
+// waitBackoff pauses for backoffDelay, honoring ctx.
+func waitBackoff(ctx context.Context, attempt int, err error) error {
+	delay := backoffDelay(attempt, err)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // ErrAborted reports that a CompareAndSwap update function chose not to write.

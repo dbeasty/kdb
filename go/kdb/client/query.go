@@ -61,7 +61,7 @@ func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any
 	}
 	switch r := reply.(type) {
 	case wire.ConflictReportMessage:
-		return decodeConflictError(r.ReportBytes)
+		return decodeConflictError(r.ReportBytes, r.RetryAfterMs)
 	case wire.SqlResultMessage:
 		if r.Error != nil {
 			return classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)

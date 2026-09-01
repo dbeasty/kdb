@@ -402,6 +402,20 @@ type ConflictReportMessage struct {
 	H           Header
 	Namespace   string
 	ReportBytes []byte
+	// ErrorCode and RetryAfterMs are additive to ReportBytes, the same way they are additive to
+	// Error on SqlResultMessage (kdb-spec-layer13 Component 51 §8.1). ErrorCodeConflict names
+	// this message's own condition - it was defined with a doc comment promising exactly that
+	// and had no producer until these fields existed, because there was nowhere on a conflict
+	// response to put it.
+	//
+	// RetryAfterMs is what makes an optimistic-concurrency client behave under contention. The
+	// report says the transaction lost a race; it never said when to try again, so every client
+	// retried immediately, and N clients retrying immediately against one document is a herd
+	// that re-collides every round. The server sets this from its own live queue depth and
+	// jitters it per response, which is the one place the spread can actually be chosen
+	// independently for each loser (see server.conflictRetryAfterMs).
+	ErrorCode    *ErrorCode
+	RetryAfterMs *int
 }
 
 func (m ConflictReportMessage) Header() Header { return m.H }

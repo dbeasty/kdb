@@ -71,6 +71,10 @@ type InMemoryCommitDag struct {
 	// instead of walking history. See GetCommitByTransactionID's own doc comment for why this
 	// exists.
 	txIndex map[codec.UUID]codec.Hash
+	// pins counts the live readers holding each commit, keyed by hash - the DAG's retention
+	// roots for readers, next to branches/tags for writers. Squash and StubCommit refuse to
+	// reclaim a pinned commit. See Pin in retention.go for what pins and why.
+	pins map[codec.Hash]int
 	// ancestryVersion is bumped by every mutation that can change what IsAncestor /
 	// AncestorSet answer for an already-known commit: a commit appearing (putCommitLocked) or
 	// disappearing (Squash, StubCommit). Readers that memoize ancestry-derived state - see
@@ -146,6 +150,7 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 		branches:    make(map[string]document.Branch),
 		tags:        make(map[string]document.Tag),
 		txIndex:     make(map[codec.UUID]codec.Hash),
+		pins:        make(map[codec.Hash]int),
 	}
 	empty := document.EmptyDocumentTree()
 	d.trees[empty.TreeHash] = empty
@@ -338,6 +343,11 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	defer d.mu.Unlock()
 	if _, ok := d.commits[hash]; !ok {
 		return document.CommitStub{}, NewConsistencyError("cannot stub unknown commit", d.NamespaceID, &hash)
+	}
+	// Archiving is a reclamation like squashing: a stub satisfies requireCommitPresentLocked but
+	// not GetCommitOrThrow, so a reader pinned here would start failing. Same refusal.
+	if err := d.assertUnpinnedLocked(hash, "archive requested"); err != nil {
+		return document.CommitStub{}, err
 	}
 	delete(d.commits, hash)
 	d.removeHex(hash.Hex())
@@ -703,6 +713,15 @@ func (d *InMemoryCommitDag) Squash(
 			return document.Commit{}, NewCompactionSafetyError(
 				"branch head inside squash window", d.NamespaceID, b.HeadHash, "branch="+b.Name,
 			)
+		}
+	}
+	// Readers are a retention root too. A branch head is the only pin the window check used to
+	// know about, which left every open SNAPSHOT read and every queued commit's base version
+	// free to be squashed out from under it - they are not branch heads, and until Pin existed
+	// there was nowhere to look them up. See Pin in retention.go.
+	for _, h := range squashHashes {
+		if err := d.assertUnpinnedLocked(h, "inside squash window"); err != nil {
+			return document.Commit{}, err
 		}
 	}
 	syntheticTx, _ := codec.UUIDFromString("00000000-0000-4000-8000-000000000003")
