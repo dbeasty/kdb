@@ -25,6 +25,12 @@ const (
 	ErrorCodeConflict ErrorCode = "CONFLICT"
 	// ErrorCodeSchemaViolation: the transaction itself is invalid - never retry unmodified.
 	ErrorCodeSchemaViolation ErrorCode = "SCHEMA_VIOLATION"
+	// ErrorCodeUniqueViolation: the write collided with a unique-declared field value another
+	// document already holds. Non-retryable like SCHEMA_VIOLATION, but a distinct remedy: the
+	// transaction is well-formed, the *value* is taken. A client creating an account needs to
+	// tell "that email is in use" from "your payload is malformed" - both would otherwise arrive
+	// as SCHEMA_VIOLATION and be indistinguishable without parsing prose.
+	ErrorCodeUniqueViolation ErrorCode = "UNIQUE_VIOLATION"
 	// ErrorCodeUnauthorized: RBAC denied the operation - never retry unmodified.
 	ErrorCodeUnauthorized ErrorCode = "UNAUTHORIZED"
 	// ErrorCodeInternal: unclassified - the fallback when no more specific code applies.

@@ -15,6 +15,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -110,6 +111,10 @@ func newSqlWireConnHandler(codec wire.Codec, runtime *KdbServerRuntime) *sqlWire
 }
 
 func (h *sqlWireConnHandler) run(conn stream.ConnectionHandle) {
+	// Every session on this connection dies with it. Without this, a client that dropped
+	// mid-transaction left its document locks held forever (nothing else released them) and its
+	// session in the manager's map for the process lifetime - the map only ever grew.
+	defer h.closeAllSessions()
 	for frame := range conn.Incoming() {
 		response, err := h.handleFrame(frame)
 		if err != nil || response == nil {
@@ -118,6 +123,16 @@ func (h *sqlWireConnHandler) run(conn stream.ConnectionHandle) {
 		if err := conn.Send(response); err != nil {
 			return
 		}
+	}
+}
+
+// closeAllSessions releases every lock and drops every session belonging to this connection.
+// Safe to call more than once; a second call finds nothing left to do.
+func (h *sqlWireConnHandler) closeAllSessions() {
+	for _, sess := range h.sessions.All() {
+		h.runtime.DocumentLocks.ReleaseAll(sess.ID.Value)
+		sess.ClearLeases()
+		h.sessions.End(sess.ID.Value)
 	}
 }
 
@@ -151,6 +166,12 @@ func (h *sqlWireConnHandler) dispatch(message wire.Message) wire.Message {
 		return h.handleUpsert(msg)
 	case wire.TransactionReplayMessage:
 		return h.handleTransactionReplay(msg)
+	case wire.LockAcquireMessage:
+		return h.handleLockAcquire(msg)
+	case wire.LockRenewMessage:
+		return h.handleLockRenew(msg)
+	case wire.LockReleaseMessage:
+		return h.handleLockRelease(msg)
 	default:
 		return nil
 	}
@@ -371,7 +392,12 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
 	if result.AppliedSchema != nil {
-		h.runtime.SetSchema(*result.AppliedSchema)
+		// Checked, not blind: a schema that turns a field unique must be rejected outright when
+		// the data already there violates it, rather than applied and left permanently at odds
+		// with its own namespace.
+		if err := h.runtime.SetSchemaChecked(*result.AppliedSchema); err != nil {
+			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+		}
 	}
 	rows := rowsToStrings(result.Rows)
 	if grant != nil {
@@ -472,11 +498,22 @@ func (h *sqlWireConnHandler) handleTxCommit(msg wire.TxCommitMessage) wire.Messa
 		}
 		tx = built
 	}
-	if err := h.runtime.DocumentLocks.AcquireAllForTransaction(sess.NamespaceID, sess.ID.Value, tx); err != nil {
-		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+	// Any lease this session took explicitly must still be current before the commit runs.
+	// Acquiring below would happily re-grant a document whose lease had lapsed and been picked
+	// up by nobody - under a brand-new fence token - which would let a writer that had already
+	// lost its claim land the write anyway. Checking the fences first is what closes that.
+	held := sess.LeasesFor(transaction.DocumentIDsIn(tx.Operations))
+	if err := h.runtime.DocumentLocks.ValidateFences(held); err != nil {
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+	}
+	// Refuse only what someone else is actually holding. The commit does not take locks of its
+	// own: writes into a runtime are already serialized by the write gate, and taking fail-fast
+	// locks on top of that meant a writer waiting its turn in the gate refused every other
+	// writer to the same document instead of letting them queue behind it.
+	if err := h.runtime.DocumentLocks.AssertUnheldByOthers(sess.NamespaceID, sess.ID.Value, tx); err != nil {
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
 	commit, err := h.runtime.Commit(sess.NamespaceID, tx, sess.ID.Value, sess.Principal)
-	h.runtime.DocumentLocks.ReleaseAll(sess.ID.Value)
 	h.sessions.ClearPending(sess)
 	if err != nil {
 		var conflictErr *ConflictError
@@ -517,7 +554,11 @@ func (h *sqlWireConnHandler) handleTxRollback(msg wire.TxRollbackMessage) wire.M
 			ReadOnly:          false,
 		}
 	}
+	// Rollback abandons this session's write state wholesale, explicitly-held leases included -
+	// a client that rolled back is done with the work those leases were protecting. Clearing the
+	// session's own tracking keeps its view from outliving the manager's.
 	h.runtime.DocumentLocks.ReleaseAll(sess.ID.Value)
+	sess.ClearLeases()
 	h.sessions.ClearPending(sess)
 	return wire.SqlResultMessage{
 		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
@@ -665,6 +706,13 @@ func (h *sqlWireConnHandler) handleUpsert(msg wire.UpsertMessage) wire.Message {
 	docID, err := codec.UUIDFromString(msg.DocID)
 	if err != nil {
 		return upsertError(msg, "invalid docId: "+err.Error())
+	}
+	// A lease binds every write path, not only TxCommit. Upsert is the one that most needs
+	// saying so: it is the unconditional verb, so a client holding a document while it edits
+	// would otherwise watch a stranger's Upsert land on top of it.
+	leaseCheck := document.Transaction{Operations: []document.Op{document.WriteOp{DocID: docID}}}
+	if err := h.runtime.DocumentLocks.AssertUnheldByOthers(msg.Namespace, msg.SessionID, leaseCheck); err != nil {
+		return upsertErrorClassified(msg, err)
 	}
 	commit, err := h.runtime.Upsert(msg.Namespace, docID, msg.JSON, h.principal)
 	if err != nil {

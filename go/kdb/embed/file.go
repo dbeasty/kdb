@@ -20,15 +20,37 @@ func OpenFileRuntime(dataRoot, catalog, namespaceID string, sch schema.KdbSchema
 	return OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID, sch, FileRuntimeOptionsFromEnv())
 }
 
+// OpenReadOnlyFileRuntime opens a data directory for reading only, under a shared directory
+// lock. Several of these may be open at once, in this process or others, but never while a
+// writer holds the directory exclusively - and a writer cannot start while any of them is open.
+//
+// The view is a snapshot as of the open; call EmbeddedKdbRuntime.Refresh to advance it. Unix
+// only: the shared lock needs flock(2).
+func OpenReadOnlyFileRuntime(dataRoot, catalog, namespaceID string, sch schema.KdbSchema) (*EmbeddedKdbRuntime, error) {
+	opts := FileRuntimeOptionsFromEnv()
+	opts.ReadOnly = true
+	return OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID, sch, opts)
+}
+
 // OpenFileRuntimeWithOptions opens a file runtime with explicit storage options.
 func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schema.KdbSchema, opts FileRuntimeOptions) (*EmbeddedKdbRuntime, error) {
-	lock, err := acquireDirLock(dataRoot)
+	acquire := acquireDirLock
+	if opts.ReadOnly {
+		acquire = acquireDirLockShared
+	}
+	lock, err := acquire(dataRoot)
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureNamespaceDirs(dataRoot, namespaceID); err != nil {
-		lock.Release()
-		return nil, err
+	// A read-only open creates nothing: the directory belongs to the writer, and a reader that
+	// materialized missing namespace directories or a meta.json would be writing to the very
+	// thing it promised not to touch. A namespace that is not there yet simply has nothing to
+	// read, which the delta replay below reports on its own.
+	if !opts.ReadOnly {
+		if err := ensureNamespaceDirs(dataRoot, namespaceID); err != nil {
+			lock.Release()
+			return nil, err
+		}
 	}
 
 	s3Cfg := opts.S3
@@ -43,7 +65,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		},
 	}).Open(storio.PlatformIOConfig{
 		RootDirectory: &dataRoot,
-		FsyncOnFlush:  true,
+		FsyncOnFlush:  !opts.ReadOnly,
 		SyncMode:      opts.Storage.SyncMode,
 	})
 	if err != nil {
@@ -55,15 +77,25 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	if opts.Storage.Compression != nil {
 		compression = *opts.Storage.Compression
 	}
+	memoryBudget := int64(64 * 1024 * 1024)
+	if opts.Storage.MemoryBudgetBytes > 0 {
+		memoryBudget = opts.Storage.MemoryBudgetBytes
+	}
 	cfg := storage.StorageEngineConfig{
-		GlobalMemoryBudgetBytes: 64 * 1024 * 1024,
+		GlobalMemoryBudgetBytes: memoryBudget,
 		CompressionCodec:        compression,
 		DefaultIndexRetention:   storage.IndexRetentionEvictable,
 		IOShim:                  io,
 		Durability:              opts.Storage.Durability,
 		AsyncSyncIntervalMillis: opts.Storage.AsyncSyncIntervalMillis,
 	}
-	handle, err := engine.DefaultFactory{EngineTarget: engine.TargetServer}.Open(namespaceID, cfg)
+	target := engine.TargetServer
+	if opts.ReadOnly {
+		// TargetReadOnly skips both the WAL and the delta writer, so nothing in this process
+		// opens a file the writer also has open for appending.
+		target = engine.TargetReadOnly
+	}
+	handle, err := engine.DefaultFactory{EngineTarget: target}.Open(namespaceID, cfg)
 	if err != nil {
 		lock.Release()
 		return nil, err
@@ -95,7 +127,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	}
 	dagOut := dag.CommitDAG(d)
 	var persisting *PersistingCommitDAG
-	if w := handle.DeltaWriter(); w != nil {
+	if w := handle.DeltaWriter(); w != nil && !opts.ReadOnly {
 		persisting = NewPersistingCommitDAGWithAsyncInterval(
 			d, w, cfg.Durability,
 			time.Duration(cfg.AsyncSyncIntervalMillis)*time.Millisecond,
@@ -110,10 +142,22 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		Schema:           sch,
 		DefaultNamespace: namespaceID,
 		DataRoot:         dataRoot,
+		ReadOnly:         opts.ReadOnly,
 	}
-	if !sch.IsNone() {
+	if !sch.IsNone() && !opts.ReadOnly {
+		// syncEmbedSchema commits a schema migration when the stored schema differs - a write,
+		// and therefore not something a read-only runtime may do. It reads whatever schema the
+		// writer has already persisted instead.
 		if err := syncEmbedSchema(rt, namespaceID, sch); err != nil {
 			return nil, err
+		}
+	}
+	if opts.ReadOnly {
+		// Refresh re-reads the writer's delta log onto this runtime's DAG. Held as a closure
+		// because the reader needs the same handle and namespace the open resolved, and nothing
+		// else in EmbeddedKdbRuntime carries them.
+		rt.refresh = func() error {
+			return replayDeltaNamespace(d, store, handle.DeltaReader())
 		}
 	}
 	handleClosed = true
@@ -150,12 +194,14 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	return rt, nil
 }
 
-// LockDataDir takes dataRoot's exclusive directory lock - the same lock OpenFileRuntime holds -
-// and returns its release func. For maintenance tooling (kdb-inspect verify/repair/restore/
-// backup) that must not run concurrently with a live writer: holding this proves no service or
-// embedded runtime has the directory open, and blocks one from starting mid-operation.
+// LockDataDir takes dataRoot's attach lock exclusively and returns its release func. For
+// maintenance tooling (kdb-inspect verify/repair/restore/backup) that must not run concurrently
+// with any live runtime: holding this proves no service, embedded runtime, or read-only replica
+// has the directory open, and blocks one from starting mid-operation. Stronger than what a
+// writable runtime holds, which is a *shared* attach plus the exclusive writer lock - a writer
+// excludes other writers, this excludes everybody.
 func LockDataDir(dataRoot string) (release func(), err error) {
-	lock, err := acquireDirLock(dataRoot)
+	lock, err := acquireDirLockExclusive(dataRoot)
 	if err != nil {
 		return nil, err
 	}

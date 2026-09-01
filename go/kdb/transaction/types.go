@@ -71,6 +71,10 @@ type OperationConflict struct {
 	ExistingDoc *document.Document
 	IncomingDoc *document.Document
 	BaseDoc     *document.Document
+	// ActualContentHash is the hash actually found at the document, set only for
+	// kdberr.PreconditionFailed. A compare-and-set client needs the value that beat it, not just
+	// the fact that something did.
+	ActualContentHash *codec.Hash
 }
 
 // OperationViolation describes schema or preflight failure for one op.

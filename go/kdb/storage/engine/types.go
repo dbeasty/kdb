@@ -12,7 +12,16 @@ const (
 	TargetBrowser
 	TargetInMemory
 	TargetGPU
+	// TargetReadOnly opens a namespace for reading only: no write-ahead log is created or
+	// recovered, and no delta segment writer is opened, so the process touches nothing another
+	// process may be writing. The delta *reader* is still opened - that is how a read-only
+	// replica sees the writer's committed history at all. Appended last: these are iota-based
+	// and TargetServer's zero value is load-bearing (an unset Target must stay "server").
+	TargetReadOnly
 )
+
+// IsReadOnly reports whether this target may write to the data directory.
+func (t Target) IsReadOnly() bool { return t == TargetReadOnly }
 
 // Factory opens namespace storage engines.
 type Factory interface {

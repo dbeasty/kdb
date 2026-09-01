@@ -13,6 +13,23 @@ const (
 	CustomConstraint
 )
 
+func (t ViolationType) String() string {
+	switch t {
+	case RequiredFieldMissing:
+		return "REQUIRED_FIELD_MISSING"
+	case TypeMismatch:
+		return "TYPE_MISMATCH"
+	case UniqueConstraint:
+		return "UNIQUE_CONSTRAINT"
+	case EnumValueNotDeclared:
+		return "ENUM_VALUE_NOT_DECLARED"
+	case CustomConstraint:
+		return "CUSTOM_CONSTRAINT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // FieldViolation describes one schema field problem.
 type FieldViolation struct {
 	FieldName     string
@@ -37,6 +54,11 @@ type ConflictItem struct {
 	OperationType ConflictOperationType `json:"operationType"`
 	LocalDoc      *string               `json:"localDoc,omitempty"`
 	IncomingDoc   *string               `json:"incomingDoc,omitempty"`
+	// ActualContentHash is the content hash actually found at DocumentID, populated for
+	// PreconditionFailed. It is what lets a compare-and-set caller retry against the value that
+	// beat it rather than re-reading blind. Omitted (and ignored) for every other conflict kind,
+	// so the JSON shape stays compatible with readers that predate preconditions.
+	ActualContentHash *string `json:"actualContentHash,omitempty"`
 }
 
 // ConflictOperationType classifies conflict kinds.
@@ -47,6 +69,11 @@ const (
 	WriteDelete
 	DeleteWrite
 	SchemaIncompatible
+	// PreconditionFailed: the operation declared a precondition (compare-and-set,
+	// insert-if-absent) that did not hold against the tree the transaction landed on. Appended
+	// last deliberately - these constants are iota-based and their ordinals are wire-visible
+	// through peer sync, so inserting one anywhere else would renumber the rest.
+	PreconditionFailed
 )
 
 func (t ConflictOperationType) String() string {
@@ -59,6 +86,8 @@ func (t ConflictOperationType) String() string {
 		return "DELETE_WRITE"
 	case SchemaIncompatible:
 		return "SCHEMA_INCOMPATIBLE"
+	case PreconditionFailed:
+		return "PRECONDITION_FAILED"
 	default:
 		return "UNKNOWN"
 	}
@@ -87,6 +116,8 @@ func (t *ConflictOperationType) UnmarshalJSON(data []byte) error {
 		*t = DeleteWrite
 	case "SCHEMA_INCOMPATIBLE":
 		*t = SchemaIncompatible
+	case "PRECONDITION_FAILED":
+		*t = PreconditionFailed
 	default:
 		*t = ConcurrentWrite
 	}

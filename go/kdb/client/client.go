@@ -474,11 +474,18 @@ func (c *Client) GetJSON(ctx context.Context, ns string, docID string) ([]byte, 
 // does, no BaseVersion, no conflict possible. Targets a namespace whose server-side conflict
 // policy is LAST_WRITE (component 40 spec §5) - the server enforces this, not the client.
 func (c *Client) Upsert(ctx context.Context, ns string, docID string, jsonBody []byte) (string, error) {
+	// Resolved even though Upsert needs no session state of its own: the session id is what lets
+	// the server tell a lease holder's own upsert from a stranger's.
+	st, err := c.ensureNamespace(ctx, ns)
+	if err != nil {
+		return "", err
+	}
 	msg := wire.UpsertMessage{
 		H:         wire.Header{MessageType: wire.MsgUpsert, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
 		Namespace: ns,
 		DocID:     docID,
 		JSON:      string(jsonBody),
+		SessionID: st.sessionID,
 	}
 	reply, err := c.request(ctx, msg)
 	if err != nil {
@@ -576,18 +583,52 @@ func decodeConflictError(reportBytes []byte) error {
 		BaseHash      string `json:"baseHash"`
 		TargetHash    string `json:"targetHash"`
 		Conflicts     []struct {
-			DocumentID    string `json:"documentId"`
-			OperationType string `json:"operationType"`
+			DocumentID        string `json:"documentId"`
+			OperationType     string `json:"operationType"`
+			ActualContentHash string `json:"actualContentHash"`
 		} `json:"conflicts"`
 	}
 	if err := json.Unmarshal(reportBytes, &raw); err != nil {
 		return ErrConflict
+	}
+	// A failed precondition arrives on the same wire as an ordinary conflict but means something
+	// different to the caller, so it is surfaced as its own error type rather than folded into
+	// ConflictError. Reported first: if any operation's explicit assertion failed, that is the
+	// reason the transaction was refused, whatever else the report also lists.
+	for _, c := range raw.Conflicts {
+		if c.OperationType == "PRECONDITION_FAILED" {
+			return &PreconditionError{DocumentID: c.DocumentID, ActualHash: c.ActualContentHash}
+		}
 	}
 	details := make([]ConflictDetail, len(raw.Conflicts))
 	for i, c := range raw.Conflicts {
 		details[i] = ConflictDetail{DocumentID: c.DocumentID, OperationType: c.OperationType}
 	}
 	return &ConflictError{TransactionID: raw.TransactionID, BaseHash: raw.BaseHash, TargetHash: raw.TargetHash, Conflicts: details}
+}
+
+// GetJSONWithHash reads one document plus the content hash of what it read - the token
+// ReplaceIf compares against. The hash is computed locally from the returned body rather than
+// carried on the wire: it is defined as a pure function of (document id, JSON), so recomputing
+// it here yields exactly what the server will compare against, with no extra round trip and no
+// new message to keep in sync.
+//
+// Returns ErrNotFound and an empty hash when the document does not exist, which is the signal
+// CompareAndSwap uses to switch from ReplaceIf to PutIfAbsent.
+func (c *Client) GetJSONWithHash(ctx context.Context, ns string, docID string) ([]byte, string, error) {
+	body, _, err := c.GetJSON(ctx, ns, docID)
+	if err != nil {
+		return nil, "", err
+	}
+	id, err := codec.UUIDFromString(docID)
+	if err != nil {
+		return nil, "", fmt.Errorf("kdb: invalid docID: %w", err)
+	}
+	hash, err := document.Document{ID: id, JSON: string(body)}.ContentHash()
+	if err != nil {
+		return nil, "", err
+	}
+	return body, hash.Hex(), nil
 }
 
 // AppendEvent writes one entry to an APPEND_ONLY namespace - always succeeds under that

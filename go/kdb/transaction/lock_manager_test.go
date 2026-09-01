@@ -54,7 +54,7 @@ func TestLockManagerAcquireAllForTransactionReleasesPartialAcquisitionOnFailure(
 		document.WriteOp{DocID: doc, Patch: `{}`},
 		document.DeleteOp{DocID: doc2},
 	)
-	err := locks.AcquireAllForTransaction(ns, "sess-a", tx)
+	_, err := locks.AcquireAllForTransaction(ns, "sess-a", tx, 0)
 	var locked *kdberr.DocumentLockedError
 	if !errors.As(err, &locked) {
 		t.Fatalf("expected DocumentLockedError, got %v", err)
@@ -85,7 +85,7 @@ func TestLockManagerAcquireAllForTransactionLeavesPreexistingLocksHeldOnFailure(
 		document.WriteOp{DocID: doc, Patch: `{}`},
 		document.DeleteOp{DocID: doc2},
 	)
-	err := locks.AcquireAllForTransaction(ns, "sess-a", tx)
+	_, err := locks.AcquireAllForTransaction(ns, "sess-a", tx, 0)
 	var locked *kdberr.DocumentLockedError
 	if !errors.As(err, &locked) {
 		t.Fatalf("expected DocumentLockedError, got %v", err)

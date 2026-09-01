@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,11 @@ type KdbServerRuntime struct {
 
 	refCount atomic.Int32
 	closeMu  sync.Mutex
+
+	// sessionSeq mints session ids that are unique across every connection this runtime serves.
+	// It lives here rather than on SessionManager because a manager is per-connection while the
+	// document lock manager, which keys ownership by session id, is per-runtime.
+	sessionSeq atomic.Int64
 
 	// schemaMu guards Runtime.Schema: CREATE TABLE (executed via SqlExec) updates it after
 	// construction, and that update must not race with concurrent readers on other
@@ -125,6 +131,15 @@ type KdbServerRuntime struct {
 	// MaxConnections caps concurrently-accepted connections on listeners this runtime serves
 	// (kdb-spec-layer13 Component 49 §6.5); 0 means unlimited. Set before calling ListenSqlWire.
 	MaxConnections int
+
+	// UniqueKeys enforces unique-declared schema fields across every writer on this runtime.
+	// Shared by TransactionEngine and UpsertEngine - see NewKdbServerRuntime.
+	UniqueKeys *transaction.UniqueKeyRegistry
+	// UniqueKeyRebuildError records a failed registry rebuild (data already violating a declared
+	// constraint, or an unreadable document). Non-nil means the registry may be incomplete, so
+	// enforcement is best-effort until an operator resolves it; surfaced rather than swallowed
+	// because silently degrading a correctness guarantee is worse than the violation itself.
+	UniqueKeyRebuildError error
 }
 
 // NewKdbServerRuntime creates a server runtime with ref-count 1, wiring the transaction and SQL
@@ -142,12 +157,18 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		d = concrete.Delegate()
 		persister = concrete
 	}
+	// One registry, shared by both engines. Commit and Upsert write documents into the same
+	// namespace, so two registries would each be blind to the other's claims and neither would
+	// be authoritative - a client could take an email through Upsert that Commit believed free.
+	uniqueKeys := transaction.NewUniqueKeyRegistry()
+	engineOpts := transaction.EngineOptions{UniqueKeys: uniqueKeys, Preconditions: true}
 	s := &KdbServerRuntime{
 		Runtime:           rt,
-		TransactionEngine: transaction.NewEngine(transaction.ConflictPolicyStrict, nil),
-		UpsertEngine:      transaction.NewEngine(transaction.ConflictPolicyLastWrite, nil),
+		TransactionEngine: transaction.NewEngineWithOptions(transaction.ConflictPolicyStrict, nil, engineOpts),
+		UpsertEngine:      transaction.NewEngineWithOptions(transaction.ConflictPolicyLastWrite, nil, engineOpts),
 		SQLEngine:         sql.NewEngine(rt.Storage, d),
 		DocumentLocks:     transaction.NewLockManager(),
+		UniqueKeys:        uniqueKeys,
 		AuthEngine:        auth.AllowAll,
 		dag:               d,
 		persister:         persister,
@@ -155,8 +176,41 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		WriteTimeout:      DefaultWriteTimeout,
 	}
 	s.refCount.Store(1)
+	// Populate the registry from what is already on disk. A failure here is reported by
+	// RebuildUniqueKeys' own caller, not swallowed - but it must not prevent the runtime from
+	// being constructed: a namespace whose stored data already violates a unique constraint is
+	// an operator problem to see and fix, and refusing to open the runtime at all would remove
+	// every tool for fixing it. Writes that would compound the violation are still rejected,
+	// because a duplicate present in the rebuild is a claimed key like any other.
+	if err := s.RebuildUniqueKeys(); err != nil {
+		s.UniqueKeyRebuildError = err
+	}
 	return s
 }
+
+// RebuildUniqueKeys repopulates the unique-key registry from the namespace's documents at the
+// current head. Called at construction and again whenever the schema changes, since a migration
+// that turns a field unique has to be validated against data written before the constraint
+// existed.
+func (s *KdbServerRuntime) RebuildUniqueKeys() error {
+	if s.UniqueKeys == nil {
+		return nil
+	}
+	head, err := s.Runtime.DAG.Head()
+	if err != nil {
+		return err
+	}
+	commit, ok := s.Runtime.DAG.GetCommit(head)
+	if !ok {
+		return nil
+	}
+	return s.UniqueKeys.Rebuild(
+		s.Runtime.DefaultNamespace, s.Runtime.Storage, commit.DocumentTreeHash, s.Schema(),
+	)
+}
+
+// nextSessionOrdinal returns the next runtime-unique session ordinal.
+func (s *KdbServerRuntime) nextSessionOrdinal() int64 { return s.sessionSeq.Add(1) }
 
 // Schema returns the runtime's current schema (safe for concurrent use with SetSchema).
 func (s *KdbServerRuntime) Schema() schema.KdbSchema {
@@ -169,8 +223,39 @@ func (s *KdbServerRuntime) Schema() schema.KdbSchema {
 // with Schema).
 func (s *KdbServerRuntime) SetSchema(sch schema.KdbSchema) {
 	s.schemaMu.Lock()
-	defer s.schemaMu.Unlock()
 	s.Runtime.Schema = sch
+	s.schemaMu.Unlock()
+	// The new schema may declare a field unique that was not before. The registry is keyed by
+	// the schema's unique fields, so it has to be rebuilt against the new one - otherwise the
+	// constraint would only bind documents written from now on, and every pre-existing duplicate
+	// would stay invisible.
+	if err := s.RebuildUniqueKeys(); err != nil {
+		s.UniqueKeyRebuildError = err
+	}
+}
+
+// SetSchemaChecked is SetSchema that refuses a schema whose unique constraints the existing data
+// already violates, leaving the previous schema in place. This is the migration path: turning a
+// field unique when two documents already share a value is a change that cannot be honored, and
+// applying it anyway would leave the namespace permanently inconsistent with its own schema.
+func (s *KdbServerRuntime) SetSchemaChecked(sch schema.KdbSchema) error {
+	previous := s.Schema()
+	s.schemaMu.Lock()
+	s.Runtime.Schema = sch
+	s.schemaMu.Unlock()
+	if err := s.RebuildUniqueKeys(); err != nil {
+		s.schemaMu.Lock()
+		s.Runtime.Schema = previous
+		s.schemaMu.Unlock()
+		// Restore the registry to match the schema we just rolled back to, so a rejected
+		// migration leaves no trace.
+		if rebuildErr := s.RebuildUniqueKeys(); rebuildErr != nil {
+			s.UniqueKeyRebuildError = rebuildErr
+		}
+		return err
+	}
+	s.UniqueKeyRebuildError = nil
+	return nil
 }
 
 // SetWriteQueueCapacityForTest replaces the write gate with one of the given queue capacity -
@@ -370,6 +455,12 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	if s.draining.Load() {
 		return document.Commit{}, &UnavailableError{Reason: "server is shutting down"}
 	}
+	// A read-only runtime has no WAL and no delta writer at all, so a write that got this far
+	// would fail deep in the storage engine with an error naming a missing component rather than
+	// the actual reason. Refused at the front, in the same cheapest-first spirit as draining.
+	if err := s.Runtime.AssertWritable(); err != nil {
+		return document.Commit{}, err
+	}
 	if err := s.authorizeOperations(tx, principal); err != nil {
 		return document.Commit{}, err
 	}
@@ -535,7 +626,39 @@ func (e *SchemaError) Error() string {
 	if len(e.Violations) == 0 {
 		return "schema violation"
 	}
-	return fmt.Sprintf("schema violation: %d operation(s) rejected", len(e.Violations))
+	// Name what actually failed. "3 operation(s) rejected" tells a client nothing it can act on -
+	// a unique-value collision and a malformed payload need entirely different responses, and
+	// both used to arrive as the same sentence.
+	var parts []string
+	for _, v := range e.Violations {
+		for _, fv := range v.Violations {
+			detail := fv.ViolationType.String()
+			if fv.FieldName != "" {
+				detail = fv.FieldName + ": " + detail
+			}
+			if fv.Detail != "" {
+				detail += " (" + fv.Detail + ")"
+			}
+			parts = append(parts, fmt.Sprintf("op %d: %s", v.OpIndex, detail))
+		}
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("schema violation: %d operation(s) rejected", len(e.Violations))
+	}
+	return "schema violation: " + strings.Join(parts, "; ")
+}
+
+// HasUniqueViolation reports whether any rejected operation collided with a unique constraint,
+// which callers classify differently from an ordinary schema problem.
+func (e *SchemaError) HasUniqueViolation() bool {
+	for _, v := range e.Violations {
+		for _, fv := range v.Violations {
+			if fv.ViolationType == kdberr.UniqueConstraint {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ServerRuntimeRegistry holds shared server runtimes by key.

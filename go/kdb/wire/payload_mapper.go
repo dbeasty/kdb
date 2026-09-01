@@ -282,6 +282,9 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 		if env, ok, err := encodeDocumentOpMessage(msg); ok || err != nil {
 			return env, err
 		}
+		if env, ok, err := encodeLockOpMessage(msg); ok || err != nil {
+			return env, err
+		}
 		return payloadEnvelope{}, fmt.Errorf("unsupported message type")
 	}
 }
@@ -569,6 +572,9 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 		return TxRollbackMessage{H: header, Namespace: r.Namespace, SessionID: r.SessionID}, nil
 	default:
 		if msg, ok, err := decodeDocumentOpMessage(header, env); ok || err != nil {
+			return msg, err
+		}
+		if msg, ok, err := decodeLockOpMessage(header, env); ok || err != nil {
 			return msg, err
 		}
 		return nil, newDecodeError("unknown payload kind: " + env.Kind)

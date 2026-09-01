@@ -18,13 +18,29 @@ type FileRuntimeOptions struct {
 	// the previous hardcoded behavior (DurabilitySync, CompressionZSTD), so
 	// callers that don't care can leave it alone.
 	Storage StorageOptions
+
+	// ReadOnly opens the data directory for reading only, under a *shared* directory lock, so
+	// several reader processes can attach at once alongside (but never during) a single writer's
+	// exclusive hold. The runtime creates no WAL and no delta segment writer, and every write
+	// path on it returns ErrReadOnly rather than failing somewhere deeper.
+	//
+	// Requires flock(2), so unix only - see acquireDirLockShared. A read-only runtime observes
+	// the writer's commits as of the moment it opened; call Refresh to pick up newer ones.
+	ReadOnly bool
 }
 
 // StorageOptions carries the storage-engine settings a caller may override.
 // Kept separate from the engine's own storage.StorageEngineConfig because that
-// struct also holds wiring (the IO shim, memory budgets) that OpenFileRuntime
-// owns and callers must not set.
+// struct also holds wiring (the IO shim) that OpenFileRuntime owns and callers
+// must not set.
 type StorageOptions struct {
+	// MemoryBudgetBytes caps the hot tier this runtime may hold in memory.
+	// Zero keeps the historical default of 64 MiB — fine for one runtime,
+	// but an application that opens several runtimes in one process is
+	// multiplying that default by each open, and needs to hand each runtime
+	// its slice of the real limit instead.
+	MemoryBudgetBytes int64
+
 	// Durability decides how much of the write-out a commit waits for. Zero
 	// value is storage.DurabilitySync.
 	Durability storage.Durability

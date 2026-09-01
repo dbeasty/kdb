@@ -375,7 +375,7 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 	switch f.EngineTarget {
 	case TargetServer, TargetBrowser:
 		eng = NewServerEngine(namespaceID, config, w)
-	case TargetInMemory, TargetGPU:
+	case TargetInMemory, TargetGPU, TargetReadOnly:
 		eng = NewServerEngine(namespaceID, config, nil)
 	default:
 		eng = NewServerEngine(namespaceID, config, nil)

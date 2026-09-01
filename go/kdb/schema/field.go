@@ -35,3 +35,26 @@ func MustField(name string, typ FieldType, required, indexed, unique bool) Field
 	}
 	return f
 }
+
+// UniqueFields returns the fields declared unique, in declaration order. Empty for the None
+// schema, which by construction has no fields at all.
+func (s KdbSchema) UniqueFields() []Field {
+	var out []Field
+	for _, f := range s.Fields {
+		if f.Unique {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// HasUniqueFields is UniqueFields' allocation-free predicate, for the hot path that only needs
+// to know whether unique enforcement has anything to do at all.
+func (s KdbSchema) HasUniqueFields() bool {
+	for _, f := range s.Fields {
+		if f.Unique {
+			return true
+		}
+	}
+	return false
+}
