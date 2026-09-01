@@ -282,7 +282,7 @@ func (h *sqlWireConnHandler) handleSessionBegin(msg wire.SessionBeginMessage) wi
 		H:               header(msg.H.CorrelationID, wire.MsgSessionBeginAck),
 		Namespace:       msg.Namespace,
 		SessionID:       sess.ID.Value,
-		HeadHex:         sess.BaseVersion.Hex(),
+		HeadHex:         sess.BaseVersion().Hex(),
 		ReadConsistency: sess.ReadConsistency.String(),
 	}
 }
@@ -327,19 +327,15 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 const readAcquireTimeout = 2 * time.Second
 
 func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession, params []sql.Parameter, stmt sql.Statement) wire.Message {
-	// sess.ReadPin (set at SessionBegin/Handshake for SNAPSHOT consistency, see
-	// SessionManager.Begin) used to be computed and then never read anywhere - every read
-	// always ran against the live head regardless of what consistency the session's ack claimed
-	// it got (kdb-finish-up-plan.md's 1-G8). READ_COMMITTED/READ_YOUR_WRITES have no pin and
-	// correctly keep reading the live head here.
-	head := sess.ReadPin
-	if head == nil {
-		liveHead, err := h.runtime.Runtime.DAG.Head()
-		if err != nil {
-			return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
-		}
-		head = &liveHead
+	// A SNAPSHOT session reads at the pin its current transaction started from;
+	// READ_COMMITTED/READ_YOUR_WRITES follow the live head. See KdbSession.ReadHead for the
+	// two bugs this has had - a pin that was computed and never read, then a pin that was read
+	// but never advanced.
+	resolved, err := sess.ReadHead(h.runtime.Runtime.DAG.Head)
+	if err != nil {
+		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
 	}
+	head := &resolved
 
 	// A SELECT reserves the memory it is expected to materialize before it runs - sized from
 	// the namespace's O(1) cardinality at the read head, the observed document sizes, and the
@@ -461,7 +457,7 @@ func (h *sqlWireConnHandler) execInsert(msg wire.SqlExecMessage, sess *KdbSessio
 		Namespace:         msg.Namespace,
 		SessionID:         msg.SessionID,
 		RowsAffected:      dmlResult.RowsAffected,
-		ResolvedCommitHex: sess.BaseVersion.Hex(),
+		ResolvedCommitHex: sess.BaseVersion().Hex(),
 		ReadOnly:          false,
 		GeneratedIDs:      dmlResult.GeneratedIDs,
 	}
@@ -527,7 +523,10 @@ func (h *sqlWireConnHandler) handleTxCommit(msg wire.TxCommitMessage) wire.Messa
 		}
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
-	sess.BaseVersion = commit.Hash
+	// The transaction is over: the next one anchors on - and, for a SNAPSHOT session, reads at -
+	// the commit just produced. Without re-pinning here a SNAPSHOT session kept reading at the
+	// version it opened with and could not see its own committed writes.
+	sess.startTransactionAt(commit.Hash)
 	return wire.SqlResultMessage{
 		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
 		Namespace:         msg.Namespace,
@@ -560,6 +559,11 @@ func (h *sqlWireConnHandler) handleTxRollback(msg wire.TxRollbackMessage) wire.M
 	h.runtime.DocumentLocks.ReleaseAll(sess.ID.Value)
 	sess.ClearLeases()
 	h.sessions.ClearPending(sess)
+	// Rollback ends the transaction too, so the next one starts from the current head rather
+	// than from the abandoned transaction's snapshot.
+	if headErr == nil {
+		sess.startTransactionAt(head)
+	}
 	return wire.SqlResultMessage{
 		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
 		Namespace:         msg.Namespace,

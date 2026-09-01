@@ -59,7 +59,12 @@ that means conflicts can never be detected at all on this code path.
   sequential reads (7.1-7.7M ops/sec) *beat* the 1024-goroutine
   heavy-multi-user case (3.2-3.3M ops/sec) — concurrent reads are ~2.3x
   *slower in aggregate* than one thread with no concurrency overhead at
-  all. See **Finding 2**.
+  all. See **Finding 2**. ⚠️ **Both halves of this have since changed:**
+  the Finding 1 fix cut single-user reads to ~2.0-2.3M (correct resolution
+  of `atCommit` costs real work), and the Finding 2 fix raised
+  heavy-multi-user to 14.3-19.9M. Current figures are in Finding 2; the
+  four Read rows in the table above are preserved as the historical
+  `e8f07bd` measurement.
 - **Write/update/transaction single-user numbers are all ~220-260 ops/sec**
   (~4ms/op) regardless of workload shape or key overlap. This matches
   `docs/benchmarks/phase0-baseline.md`'s finding that the write path is
@@ -200,20 +205,278 @@ test:
 pre-fix code with the same "committed two transactions with the same
 stale `BaseVersion`" repro described above).
 
-## Finding 2 (scalability): read throughput is worse at heavy concurrency than single-threaded
+## Finding 2 (scalability): the DAG's RWMutex was the read-path bottleneck — confirmed by profiling, and fixed
 
-`KdbServerRuntime.GetDocument` calls `s.Runtime.DAG.Head()` and
-`s.Runtime.DAG.GetCommit(head)` on every single read, even though nothing
-is being mutated. Both take `InMemoryCommitDag`'s shared `sync.RWMutex` (as
-`RLock`) — see `dag/in_memory_commit_dag.go`. Go's `RWMutex` read side is
-known to scale poorly at high core counts because every `RLock`/`RUnlock`
-does an atomic increment/decrement of one shared reader-count word, which
-bounces across cache lines as more cores contend for it — consistent with
-what was measured here (3.2-3.3M ops/sec aggregate across 1024 goroutines
-on 16 cores vs. 7.1-7.7M ops/sec on a single goroutine with zero locking
-overhead at all). Not confirmed via profiling in this pass — flagged as
-the most likely explanation given the DAG mutex's known role
-(`docs/benchmarks/phase0-baseline.md` bottleneck #3, previously measured
-only on the write path) and worth a `pprof` pass before attempting a fix
-(e.g., caching the head hash behind an atomic pointer for pure reads that
-don't need the full DAG lock).
+**Status: confirmed, fixed, and re-measured.** The hypothesis below was
+right about the mechanism. Two things had to be corrected along the way:
+the read numbers in the table above were already stale when they were
+written, and the fix suggested here ("cache the head hash") turns out to
+recover only about a third of the available win.
+
+### The hypothesis, and the profile that confirmed it
+
+`KdbServerRuntime.GetDocument` called `DAG.Head()` and
+`DAG.GetCommit(head)` on every read, each taking `InMemoryCommitDag`'s
+shared `sync.RWMutex` as `RLock` — four atomic read-modify-writes on one
+shared word per read, for a read that mutates nothing.
+
+`go tool pprof` over `BenchmarkWorkloadRead/heavy-multi-user` (1024
+goroutines, 16 cores, 65.3s of samples) put this beyond doubt:
+
+| Symbol | Share |
+|---|---|
+| `sync/atomic.(*Int32).Add` (RWMutex reader-count) | **40.04% flat** |
+| `sync.RWMutex.RLock` + `RUnlock` | ~42% cum |
+| `InMemoryCommitDag.Head` | 25.03% cum |
+| `InMemoryCommitDag.GetCommit` | 19.15% cum |
+
+`pprof -list` on both DAG methods showed the `RLock`/deferred `RUnlock`
+pair absorbing nearly all of each function's cost; the actual map lookups
+(`d.branches[mainBranch]`, `d.commits[hash]`) were noise by comparison.
+This is the textbook `sync.RWMutex` read-side scaling failure: the whole
+lock is 24 bytes on one cache line, so every `RLock` from a different core
+needs exclusive ownership of that line, and throughput falls as cores are
+added.
+
+### Correction: the single-user numbers in the table above are stale
+
+The table's read rows were measured at `e8f07bd`, which is *before*
+`6e9b32f` fixed Finding 1. That fix made `ServerEngine.GetDocument`
+actually resolve `atCommit` (through `treesByHash` and the by-content-hash
+document store) instead of returning current state, which is correct but
+roughly tripled the cost of a read. Re-measuring both commits on one
+machine:
+
+| | `e8f07bd` (pre-Finding-1-fix) | `7be4735` (current `main`) |
+|---|---:|---:|
+| single-user / overlapping | 6.72–6.84M | 2.01M |
+| single-user / non-overlapping | 7.59–7.68M | 2.26M |
+| heavy-multi-user / overlapping | 3.39–3.42M | 3.37M |
+| heavy-multi-user / non-overlapping | 3.26–3.29M | 3.32M |
+
+So **"concurrent reads are 2.3x slower than single-threaded" was true when
+written and is no longer true on `main`** — the correctness fix slowed
+single-threaded reads until they fell *below* the concurrent case. The
+underlying defect was the same either way: 16 cores were buying 1.6x, not
+the ~2.3x regression the original framing described. Concurrency was
+never actually making reads slower on current `main`; it was failing to
+make them meaningfully faster.
+
+### What was measured before choosing a fix
+
+Rather than assume the obvious fix, all the standard mechanisms for
+read-mostly access to a version pointer were prototyped against this exact
+access pattern (`Head()` then `GetCommit(head)`, real `codec.Hash` /
+`document.Commit` types) and measured. The harness is kept runnable at
+`go/kdb/dag/head_read_strategy_bench_test.go`:
+
+| Option | 1 goroutine | 1024 goroutines | 1024 + hot writer |
+|---|---:|---:|---:|
+| **A** baseline: one shared `RWMutex` | 82.3M | 3.91M | 2.78M |
+| **B** atomic head hash only, `GetCommit` still locked | 90.3M | 6.10M | 3.95M |
+| **C** RCU: immutable snapshot behind `atomic.Pointer` | **461M** | **5.59B** | **5.63B** |
+| **D** seqlock | *ruled out — unsound* | 7.65M | 5.22M |
+| **E** sharded/padded per-core `RWMutex` | 91.2M | 442M | 129M |
+| **F** `sync.Map` + atomic head | 67.6M | 827M | 638M |
+| **G** MVCC pinned snapshot handle | 320M | 3.79B | 3.83B |
+
+Four things this settles that an argument from first principles would not
+have:
+
+- **The fix proposed in the original Finding 2 is not sufficient.** Option
+  B — cache the head hash behind an atomic pointer — takes 3.91M to 6.10M
+  and stops there, because `GetCommit`'s `RLock` costs exactly as much as
+  `Head`'s did. The cost is *per `RLock`*, so every one of them on the
+  path has to go, not just the first.
+- **Sharding (E) and `sync.Map` (F) scale but don't win**, and both
+  degrade sharply once a writer is active (442M→129M, 827M→638M). C is
+  unaffected by writers (5.59B→5.63B) because its readers never touch a
+  line a writer dirties.
+- **Seqlocks (D) are not soundly implementable in Go.** A seqlock reads
+  data while a writer may be mutating it, which is a data race regardless
+  of the retry loop; `go test -race` duly reported `WARNING: DATA RACE`
+  between the reader's `h = v.head` and the writer's `v.head = c.Hash`.
+  For a payload with pointers (`Commit` has two slices and two strings) a
+  torn read is memory-unsafe, not merely stale. Ruled out on correctness,
+  and it was slower than E and F anyway.
+- **C is also the fastest single-threaded option** (461M vs 82.3M), so
+  there is no concurrency-vs-latency trade to make here.
+
+### MVCC vs RCU — related, but answering different questions
+
+These are often conflated; they differ in *when* the version is resolved,
+not in how it is published. RCU (C) resolves the latest version on every
+operation: always fresh, but nothing ties two reads together. MVCC (G)
+hands the caller a version it pins *across* operations, so N reads cost
+one acquisition and all N see the same instant. They compose rather than
+compete — LMDB is exactly this shape, with a lock-free atomically
+published meta page (RCU) being what a read transaction pins (MVCC).
+
+Measuring the one axis that separates them, reads/sec by group size:
+
+| reads per snapshot | RCU (load per op) | MVCC (pinned) |
+|---:|---:|---:|
+| 1 | 8.84B | 11.57B |
+| 8 | 18.18B | 26.37B |
+| 64 | 22.20B | 30.41B |
+
+MVCC's amortization is real (+31–45%) but does not survive contact with a
+full operation: after the fix a `GetDocument` costs ~51–71ns, of which head
+resolution is now well under a nanosecond. And a pinned view cannot see a
+write committed after it was acquired, so using one for a bare point read
+would give up read-your-writes. RCU is the right choice for the
+per-operation `GetDocument` path.
+
+### Does MVCC help the write and transaction paths?
+
+The read path is the weakest case for MVCC, so the obvious objection is
+that the comparison above is unfair: transactions are where a pinned
+snapshot should pay off. `detectConflicts` does two lookups per operation —
+one against the transaction's **base** version and one against the current
+head — and the base names a *historical* tree, which misses the shipped RCU
+fast path and falls back to the mutex once per operation. Pinning the base
+for the life of the transaction removes exactly that.
+
+`go/kdb/dag/version_strategy_bench_test.go` measures it, running all three
+strategies across read, write, transaction and mixed workloads with
+identical real work per operation. (The MVCC view pins only the base; the
+head stays live, because conflict detection must observe writes committed
+after the transaction started or it would miss the conflicts it exists to
+find.) At 16 cores, 1024 goroutines:
+
+| Workload | baseline RWMutex | RCU | MVCC |
+|---|---:|---:|---:|
+| Read, concurrent | 7.64M ops/s | 38.6M | 42.8M |
+| Write (commit) | 65.3k ops/s | 65.3k | 64.8k |
+| Transaction, 1 op | 60.4k txn/s | 65.7k | 65.5k |
+| Transaction, 4 ops | 18.5k txn/s | 19.4k | 19.3k |
+| Transaction, 16 ops | 5.18k txn/s | 5.55k | 5.60k |
+| Mixed (80 read / 20 txn) | 90.1k ops/s | 96.5k | 96.0k |
+
+**MVCC and RCU are indistinguishable on every write-bearing workload** —
+under 1% apart at every transaction size, in both directions. The reason is
+in the allocation counts, not the lock: a 16-operation transaction costs
+**1,122 allocations and 93 KB** for the persistent-trie rebuild and commit.
+Sixteen mutex acquisitions are a rounding error against ~180µs of commit
+work. The thing MVCC removes is real, and it is not what these workloads
+are spending their time on.
+
+Publishing a snapshot costs the writer **one allocation per commit** (69
+allocs/op vs the baseline's 68) and no measurable throughput.
+
+### The same conclusion end-to-end, with real fsyncs
+
+The mechanism benchmark has no WAL. Running the full workload matrix
+against the real `KdbServerRuntime` — real disk-backed WAL, real
+`F_FULLFSYNC` — makes the point more strongly, because a real commit costs
+~4ms rather than ~15µs. `-benchtime 1s -count=3`, before vs. after:
+
+| Workload | before | after |
+|---|---:|---:|
+| Read / heavy-multi-user / overlapping | 3.437M | **13.669M** |
+| Read / heavy-multi-user / non-overlapping | 3.400M | **18.572M** |
+| Read / single-user / overlapping | 1.894M | 1.873M |
+| Read / single-user / non-overlapping | 2.243M | 2.483M |
+| Write insert / single-user | 234.9 | 235.0 |
+| Write insert / heavy-multi-user | 33.72k | 33.95k |
+| Update / heavy-multi-user / overlapping | 28.18k | 28.00k |
+| Update / heavy-multi-user / non-overlapping | 29.87k | 29.54k |
+| Mixed / heavy-multi-user / overlapping | 117.5k | 117.0k |
+| Mixed / heavy-multi-user / non-overlapping | 117.2k | 125.3k |
+| Transaction / heavy-multi-user / non-overlapping | 16.33k | 16.44k |
+
+(`benchstat` reports every row as "~" because three samples is below its
+threshold for declaring significance — it needs ≥4. The read rows are 4–5x
+with non-overlapping ranges across all three samples; the write rows are
+genuinely flat.)
+
+**Writes, updates, mixed and transactions are unchanged**, which is the
+expected result: they are bounded by WAL fsync and the `commitTree`
+rebuild, exactly as `phase0-baseline.md` found. No version-resolution
+mechanism — RCU, MVCC or otherwise — can move a number that is waiting on
+a disk. The lever for write throughput is durability mode and group commit
+(see the durability section above), not concurrency control.
+
+**So: RCU for the read path, and MVCC is not worth adopting for
+performance.** It remains the right answer to a correctness question this
+codebase has not yet asked — a multi-statement transaction or long scan
+needing one consistent view across many reads, which today's per-operation
+head resolution cannot promise. The storage layer is already structurally
+ready (it retains every tree by hash and every document version by content
+hash), so the missing piece is an explicit snapshot handle. Adopt it when
+snapshot isolation is specified; do not adopt it expecting throughput.
+
+## Finding 3 (regression, pre-existing): contended transactions collapse now that conflicts are actually detected
+
+Not caused by the Finding 2 work — it reproduces identically before and
+after — but it surfaced while measuring, and it is not recorded anywhere
+above.
+
+The results table says "All conflicts/op columns read 0," which Finding 1
+explains as a bug. With that bug fixed, `Transaction/heavy-multi-user/overlapping`
+now reports **176–289 conflicts per operation** and throughput of
+**449–821 ops/sec**, against the 31,933 ops/sec in the table. That is a
+~40x collapse, and it is the honest cost of detecting conflicts that were
+previously being silently lost — the old number measured last-write-wins
+with the conflict check disabled.
+
+Two things worth following up, neither of them concurrency-control
+mechanism choices:
+
+- **176–289 conflicts per operation** is not a conflict rate, it is a retry
+  storm: ~1024 goroutines contending over a 256-document pool with no
+  backoff. Whatever retry policy sits above `ConflictPolicyStrict` is
+  amplifying, not absorbing, contention.
+- The run-to-run spread (449 → 821 ops/sec across three samples of the
+  same binary) is far wider than any other row in the matrix, which is
+  itself a symptom of the same instability.
+
+This is the workload the table most understated, and it is now the
+worst-performing cell in the matrix by two orders of magnitude.
+
+### What shipped
+
+RCU-style immutable snapshot publication (option C) in two places, since
+removing only the first mutex just exposed the second:
+
+1. `InMemoryCommitDag.head` (`go/kdb/dag/in_memory_commit_dag.go`) — an
+   `atomic.Pointer[headSnapshot]` holding the default branch's head hash
+   *and* the commit it names, rebuilt and republished by
+   `publishHeadLocked` on every mutation of `branches`/`commits`. The new
+   `HeadCommit()` serves both from one atomic load, so `GetDocument` went
+   from four atomic RMWs plus two map lookups to a single pointer load —
+   and, as a side benefit, the hash and commit it returns are now
+   guaranteed to describe the same instant, which `Head()` followed by
+   `GetCommit()` never promised.
+2. `ServerEngine.latestTree` (`go/kdb/storage/engine/server_engine.go`) —
+   the same treatment for `treesByHash`, which after step 1 became the
+   single largest remaining cost (a re-profile attributed 100% of the
+   remaining `RWMutex` traffic to `ServerEngine.GetDocument`). Reads
+   almost always want the newest tree, so `treeAt` answers that case from
+   an atomic pointer and falls back to the map for genuine historical
+   lookups.
+
+Both follow the one rule that makes this correct: published state is
+immutable, every writer builds a fresh snapshot, and publication happens
+under the existing write lock — so readers stay linearizable (each read
+linearizes at its atomic load) while writers serialize exactly as before.
+Go's GC provides the reclamation that an RCU implementation in a
+non-managed language would need epochs or hazard pointers for.
+
+Result on `BenchmarkWorkloadRead`, `-benchtime 2s -count=5`, benchstat vs.
+current `main`:
+
+| | before | after | |
+|---|---:|---:|---|
+| single-user / overlapping | 2.005M | 2.076M | ~ (p=0.421) |
+| single-user / non-overlapping | 2.263M | 2.394M | **+5.79%** |
+| heavy-multi-user / overlapping | 3.365M | 14.311M | **+325%** |
+| heavy-multi-user / non-overlapping | 3.323M | 19.862M | **+498%** |
+
+Reads now scale ~7-8x from one core to sixteen instead of ~1.5x, with no
+single-threaded regression. The re-profile shows
+`sync/atomic.(*Int32).Add` gone from the top of the profile entirely
+(from 40.04%); what remains is goroutine scheduling from oversubscribing
+16 cores with 1024 goroutines (`runtime.usleep`, 44%) and real work
+(`document.trieGet`, 8.5%). The next real target is the read path's 4
+allocations / 176 B per op, not locking.

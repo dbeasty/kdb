@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -65,9 +66,45 @@ type ServerEngine struct {
 	// that writer lock.
 	treesMu     sync.RWMutex
 	treesByHash map[codec.Hash]document.DocumentTree
+	// latestTree republishes the most recent entry of treesByHash behind an atomic pointer.
+	// Reads overwhelmingly ask for the current head's tree, and taking treesMu for that was
+	// two atomic read-modify-writes on one shared cache line per read - the same contention
+	// the DAG's head snapshot removes one layer up (see InMemoryCommitDag.head), and after
+	// that fix landed this was the single largest remaining cost in a 1024-reader profile.
+	// A DocumentTree is a persistent trie, immutable once published, so handing the same
+	// value to any number of concurrent readers is safe.
+	//
+	// INVARIANT: published together with every write to treesByHash, under treesMu.
+	latestTree atomic.Pointer[treeSnapshot]
+	_          [128 - 8]byte // keep it off treesMu's cache line
 
 	asyncStop chan struct{}
 	asyncDone chan struct{}
+}
+
+// treeSnapshot is an immutable pairing of a tree hash with its tree, published whole.
+type treeSnapshot struct {
+	hash codec.Hash
+	tree document.DocumentTree
+}
+
+// treeAt resolves atCommit to its DocumentTree, answering the common case - the most
+// recently committed tree - without touching treesMu at all.
+func (e *ServerEngine) treeAt(atCommit codec.Hash) (document.DocumentTree, bool) {
+	if s := e.latestTree.Load(); s != nil && s.hash == atCommit {
+		return s.tree, true
+	}
+	e.treesMu.RLock()
+	tree, ok := e.treesByHash[atCommit]
+	e.treesMu.RUnlock()
+	return tree, ok
+}
+
+// publishTreeLocked records tree under its hash and republishes it as the latest. Must be
+// called with treesMu held exclusively.
+func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree) {
+	e.treesByHash[tree.TreeHash] = tree
+	e.latestTree.Store(&treeSnapshot{hash: tree.TreeHash, tree: tree})
 }
 
 // NewServerEngine constructs a server engine; wal may be nil for in-memory targets.
@@ -95,6 +132,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		tree:             emptyTree,
 		treesByHash:      map[codec.Hash]document.DocumentTree{emptyTree.TreeHash: emptyTree},
 	}
+	e.latestTree.Store(&treeSnapshot{hash: emptyTree.TreeHash, tree: emptyTree})
 	if w != nil && config.Durability == storage.DurabilityAsync {
 		e.startAsyncSync()
 	}
@@ -221,9 +259,7 @@ func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) er
 }
 
 func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
-	e.treesMu.RLock()
-	tree, ok := e.treesByHash[atCommit]
-	e.treesMu.RUnlock()
+	tree, ok := e.treeAt(atCommit)
 	if !ok {
 		return nil, nil
 	}
@@ -267,9 +303,7 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	if batchSize <= 0 {
 		batchSize = 256
 	}
-	e.treesMu.RLock()
-	tree, ok := e.treesByHash[atCommit]
-	e.treesMu.RUnlock()
+	tree, ok := e.treeAt(atCommit)
 	if !ok {
 		return nil
 	}
@@ -351,7 +385,7 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 		}
 	}
 	e.treesMu.Lock()
-	e.treesByHash[e.tree.TreeHash] = e.tree
+	e.publishTreeLocked(e.tree)
 	e.treesMu.Unlock()
 	return e.tree, nil
 }

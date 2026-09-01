@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -12,9 +13,51 @@ import (
 
 const mainBranch = "main"
 
+// cacheLinePadBytes pads the published head snapshot pointer out to its own cache line.
+// 128 rather than 64: Apple silicon's L2 line and Intel's adjacent-line prefetcher both make
+// 64 too small to reliably isolate a line, and the cost is 120 bytes per namespace.
+const cacheLinePadBytes = 128 - 8
+
+// headSnapshot is an immutable view of the default branch's tip: the head hash and the
+// commit it names. publishHeadLocked builds one and stores it whole; nothing mutates a
+// snapshot after it is published, so a reader may hold one for as long as it likes and
+// still see a coherent (if momentarily stale) instant. Go's GC is the reclamation
+// mechanism here - the part an RCU implementation in a non-managed language has to build
+// by hand as epochs or hazard pointers.
+type headSnapshot struct {
+	// hasBranch is false only when the default branch is missing, which the readers below
+	// surface as a consistency error rather than a zero hash.
+	hasBranch bool
+	hash      codec.Hash
+	// hasCommit is false when the head names a commit that is not resident - an archived
+	// stub, or a head pointed at a stub by SetHead.
+	hasCommit bool
+	commit    document.Commit
+}
+
 // InMemoryCommitDag is an in-memory commit DAG for one namespace.
 type InMemoryCommitDag struct {
 	NamespaceID string
+
+	// head is the read path's fast lane. Every point read resolves the current head and
+	// then that head's commit; taking mu for both meant four atomic read-modify-writes on
+	// sync.RWMutex's single shared readerCount word per read, which does not scale with
+	// core count - a CPU profile of 1024 concurrent readers on 16 cores put 40% of all
+	// samples in sync/atomic.(*Int32).Add and measured aggregate read throughput *below* a
+	// single-threaded loop doing the same work (docs/benchmarks/workload-matrix.md,
+	// Finding 2). Reading through this pointer instead is one atomic load and no writes to
+	// shared memory at all, so the line stays Shared in every core's cache rather than
+	// being invalidated on each read.
+	//
+	// INVARIANT: every mutation of d.branches or d.commits must call publishHeadLocked
+	// before releasing mu. The two locked cores (putCommitLocked, appendCommitLocked) and
+	// each direct mutator below do; a new mutator must too, or readers will serve a stale
+	// head indefinitely.
+	head atomic.Pointer[headSnapshot]
+	// Keep head off mu's cache line. Readers load head continuously while writers dirty mu
+	// and the maps that follow it; sharing a line would reintroduce exactly the
+	// invalidation traffic this is here to remove.
+	_ [cacheLinePadBytes]byte
 
 	mu        sync.RWMutex
 	commits   map[codec.Hash]document.Commit
@@ -34,6 +77,55 @@ type InMemoryCommitDag struct {
 	// index.eventLog's bucket cache - key their memo on it so they don't have to recompute
 	// against a DAG that has not moved.
 	ancestryVersion uint64
+}
+
+// publishHeadLocked recomputes the head snapshot from the maps and publishes it. Must be
+// called with mu held exclusively, on every path that changes d.branches or d.commits.
+//
+// It recomputes from scratch rather than patching the previous snapshot: that keeps the
+// invariant checkable by inspection at each call site, and mutations are rare next to reads
+// (hundreds to tens of thousands per second against millions), so neither the extra map
+// lookup nor the one small allocation is worth optimizing away.
+func (d *InMemoryCommitDag) publishHeadLocked() {
+	snap := &headSnapshot{}
+	if b, ok := d.branches[mainBranch]; ok {
+		snap.hasBranch = true
+		snap.hash = b.HeadHash
+		if c, ok := d.commits[b.HeadHash]; ok {
+			snap.hasCommit = true
+			snap.commit = c
+		}
+	}
+	d.head.Store(snap)
+}
+
+// HeadCommit returns the default branch's head hash together with the commit it names, both
+// taken from a single atomic snapshot load. Unlike Head followed by GetCommit, the two are
+// guaranteed to describe the same instant, and the pair costs one atomic load instead of
+// four atomic read-modify-writes on a contended word - this is the lane every point read
+// takes (see KdbServerRuntime.GetDocument).
+//
+// The bool reports whether the head's commit is resident; false means the head names an
+// archived stub. The error reports a missing default branch.
+func (d *InMemoryCommitDag) HeadCommit() (codec.Hash, document.Commit, bool, error) {
+	if s := d.head.Load(); s != nil {
+		if !s.hasBranch {
+			return codec.Hash{}, document.Commit{}, false,
+				NewConsistencyError("missing default branch", d.NamespaceID, nil)
+		}
+		return s.hash, s.commit, s.hasCommit, nil
+	}
+	// No snapshot published: a zero-value InMemoryCommitDag that never went through
+	// NewInMemoryCommitDag. Answer from the maps rather than reporting nonsense.
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	b, ok := d.branches[mainBranch]
+	if !ok {
+		return codec.Hash{}, document.Commit{}, false,
+			NewConsistencyError("missing default branch", d.NamespaceID, nil)
+	}
+	c, hasCommit := d.commits[b.HeadHash]
+	return b.HeadHash, c, hasCommit, nil
 }
 
 // AncestryVersion returns a counter that changes whenever the commit graph changes shape.
@@ -76,6 +168,9 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 		Name: mainBranch, NamespaceID: namespaceID,
 		HeadHash: genesis.Hash, CreatedAt: now, UpdatedAt: now,
 	}
+	// d is not shared yet, but publish through the same helper so there is exactly one
+	// place that builds a snapshot.
+	d.publishHeadLocked()
 	return d, nil
 }
 
@@ -114,6 +209,14 @@ func (d *InMemoryCommitDag) LookupHashPrefix(hexPrefixLower string) []codec.Hash
 }
 
 func (d *InMemoryCommitDag) GetCommit(hash codec.Hash) (document.Commit, bool) {
+	// Fast path: "the commit at the current head" is the lookup every point read performs,
+	// and the published snapshot already holds it - no lock, no map, no rehash. Any other
+	// hash (history walks, ancestry, sync) falls through to the map, which is the rare case
+	// on the read path. Callers wanting head and commit together should prefer HeadCommit,
+	// which also guarantees the two agree.
+	if s := d.head.Load(); s != nil && s.hasCommit && s.hash == hash {
+		return s.commit, true
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	c, ok := d.commits[hash]
@@ -205,6 +308,9 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	if _, exists := d.txIndex[commit.TransactionID]; !exists {
 		d.txIndex[commit.TransactionID] = commit.Hash
 	}
+	// A commit arriving here can be the one the head already names (delta replay onto a
+	// head pointed at a not-yet-resident hash), so the snapshot has to be rebuilt.
+	d.publishHeadLocked()
 	return nil
 }
 
@@ -240,6 +346,8 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 		OriginalHash: hash, ArchiveLocation: archiveLocation, StubbedAt: codec.TimestampNow(),
 	}
 	d.stubs[hash] = stub
+	// Archiving the commit the head names flips the snapshot's hasCommit to false.
+	d.publishHeadLocked()
 	return stub, nil
 }
 
@@ -269,13 +377,8 @@ func (d *InMemoryCommitDag) PutDocumentTree(tree document.DocumentTree) {
 }
 
 func (d *InMemoryCommitDag) Head() (codec.Hash, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	b, ok := d.branches[mainBranch]
-	if !ok {
-		return codec.Hash{}, NewConsistencyError("missing default branch", d.NamespaceID, nil)
-	}
-	return b.HeadHash, nil
+	hash, _, _, err := d.HeadCommit()
+	return hash, err
 }
 
 func (d *InMemoryCommitDag) SetHead(branchName string, hash codec.Hash) error {
@@ -292,6 +395,7 @@ func (d *InMemoryCommitDag) SetHead(branchName string, hash codec.Hash) error {
 	b.HeadHash = hash
 	b.UpdatedAt = now
 	d.branches[branchName] = b
+	d.publishHeadLocked()
 	return nil
 }
 
@@ -337,6 +441,10 @@ func (d *InMemoryCommitDag) CreateBranch(name string, fromHash codec.Hash) (docu
 		HeadHash: fromHash, CreatedAt: now, UpdatedAt: now,
 	}
 	d.branches[name] = b
+	// Cannot currently touch mainBranch (it always exists, so this returns "branch exists"
+	// first), but publish anyway so the invariant holds by construction rather than by
+	// depending on that argument staying true.
+	d.publishHeadLocked()
 	return b, nil
 }
 
@@ -350,6 +458,9 @@ func (d *InMemoryCommitDag) DeleteBranch(name string) error {
 		return NewBranchNotFoundError("branch not found", d.NamespaceID, name)
 	}
 	delete(d.branches, name)
+	// Refuses mainBranch above, so this cannot invalidate the snapshot today; published for
+	// the same reason as CreateBranch.
+	d.publishHeadLocked()
 	return nil
 }
 
@@ -507,10 +618,8 @@ func (d *InMemoryCommitDag) AppendCommitDetached(
 // the need for AppendCommit's compare-and-swap (the branch can still move immediately after
 // this returns), it just lets an already-lost writer stop before staging anything.
 func (d *InMemoryCommitDag) HeadIs(hash codec.Hash) bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	b, ok := d.branches[mainBranch]
-	return ok && b.HeadHash == hash
+	h, err := d.Head()
+	return err == nil && h == hash
 }
 
 func (d *InMemoryCommitDag) appendCommitLocked(
@@ -562,6 +671,9 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	b.HeadHash = commit.Hash
 	b.UpdatedAt = now
 	d.branches[branchToAdvance] = b
+	// The head just moved: republish so readers see the new commit. Covers every caller of
+	// this core - AppendCommit, AppendCommitDetached and AppendMergeCommitOnto.
+	d.publishHeadLocked()
 	return commit, nil
 }
 
@@ -617,6 +729,10 @@ func (d *InMemoryCommitDag) Squash(
 	d.commits[synthetic.Hash] = synthetic
 	d.insertHex(synthetic.Hash.Hex())
 	d.ancestryVersion++
+	// Squash refuses to run with a branch head inside the window, so the head's commit
+	// survives; republish regardless, since the check above is the only thing guaranteeing
+	// that and it is checked against branches this call does not otherwise touch.
+	d.publishHeadLocked()
 	return synthetic, nil
 }
 
