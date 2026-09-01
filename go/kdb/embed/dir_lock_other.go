@@ -23,6 +23,21 @@ type dirLock struct {
 	path string
 }
 
+// acquireDirLockShared has no shared mode to offer on these platforms: the O_EXCL fallback below
+// is a single-holder primitive with no reader/writer distinction to express. It returns an error
+// rather than silently degrading to an exclusive lock (which would make a "read-only replica"
+// exclude the writer it is replicating from) or to no lock at all (which would let a reader
+// attach to a directory being mutated underneath it).
+func acquireDirLockShared(dataRoot string) (*dirLock, error) {
+	return nil, fmt.Errorf("read-only data directory access requires flock(2), unavailable on this platform: %s", dataRoot)
+}
+
+// acquireDirLockExclusive is acquireDirLock here: with only one lock mode available, the
+// single-holder create-as-lock already excludes everyone.
+func acquireDirLockExclusive(dataRoot string) (*dirLock, error) {
+	return acquireDirLock(dataRoot)
+}
+
 func acquireDirLock(dataRoot string) (*dirLock, error) {
 	lockPath := filepath.Join(dataRoot, ".kdb.lock")
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {

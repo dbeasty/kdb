@@ -32,6 +32,13 @@ type UpsertMessage struct {
 	Namespace string
 	DocID     string
 	JSON      string
+	// SessionID is optional and additive: Upsert itself needs no session (it has no BaseVersion
+	// and cannot conflict), but a document under a client-held lease must not be written by
+	// anyone else, and without a session id on the message there is no way to tell the lease
+	// holder's own upsert from a stranger's. An empty value is treated as "not the holder", so
+	// an older client's upsert is refused while a lease is out rather than quietly allowed
+	// through.
+	SessionID string
 }
 
 func (m UpsertMessage) Header() Header { return m.H }
@@ -66,6 +73,7 @@ type upsertDto struct {
 	Namespace string `json:"namespace"`
 	DocID     string `json:"docId"`
 	JSON      string `json:"json"`
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 type upsertResultDto struct {
@@ -88,7 +96,7 @@ func encodeDocumentOpMessage(msg Message) (payloadEnvelope, bool, error) {
 		}}, true, nil
 	case UpsertMessage:
 		return payloadEnvelope{Kind: "upsert", Upsert: &upsertDto{
-			Namespace: m.Namespace, DocID: m.DocID, JSON: m.JSON,
+			Namespace: m.Namespace, DocID: m.DocID, JSON: m.JSON, SessionID: m.SessionID,
 		}}, true, nil
 	case UpsertResultMessage:
 		return payloadEnvelope{Kind: "upsertResult", UpsertResult: &upsertResultDto{
@@ -121,7 +129,9 @@ func decodeDocumentOpMessage(header Header, env payloadEnvelope) (Message, bool,
 		if d == nil {
 			return nil, true, newDecodeError("missing upsert body")
 		}
-		return UpsertMessage{H: header, Namespace: d.Namespace, DocID: d.DocID, JSON: d.JSON}, true, nil
+		return UpsertMessage{
+			H: header, Namespace: d.Namespace, DocID: d.DocID, JSON: d.JSON, SessionID: d.SessionID,
+		}, true, nil
 	case "upsertResult":
 		d := env.UpsertResult
 		if d == nil {

@@ -10,4 +10,10 @@ type Transaction struct {
 	Timestamp     codec.Timestamp
 	AuthorNodeID  codec.UUID
 	ResultVersion *codec.Hash
+
+	// Preconditions are per-operation assertions about the state each write lands on, evaluated
+	// against the target tree inside the server's write serialization. Empty means "no
+	// assertions", which is every transaction built before preconditions existed. Not part of
+	// the commit: see the Precondition doc comment.
+	Preconditions []Precondition
 }

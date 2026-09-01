@@ -63,6 +63,9 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 	}
 	var schemaErr *SchemaError
 	if errors.As(err, &schemaErr) {
+		if schemaErr.HasUniqueViolation() {
+			return wire.ErrorCodeUniqueViolation, nil
+		}
 		return wire.ErrorCodeSchemaViolation, nil
 	}
 	return wire.ErrorCodeInternal, nil

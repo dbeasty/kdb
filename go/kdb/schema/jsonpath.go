@@ -41,3 +41,13 @@ func isJSONNull(v any) bool {
 	}
 	return false
 }
+
+// FieldValue extracts one top-level field's decoded JSON value from a document body. It is
+// jsonGet's exported, single-segment form, for callers outside this package that need a field's
+// value rather than a full validation pass (go/kdb/transaction's unique-constraint enforcement).
+// A missing field and an explicit JSON null are indistinguishable here - both return (nil, nil) -
+// which is exactly the distinction unique enforcement does not want to draw either (see
+// UniqueKeysFor).
+func FieldValue(docJSON, fieldName string) (any, error) {
+	return jsonGet(docJSON, "$."+fieldName)
+}

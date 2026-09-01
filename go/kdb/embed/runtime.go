@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"errors"
 	"log"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -19,7 +20,13 @@ type EmbeddedKdbRuntime struct {
 	WriteBaseVersion *codec.Hash
 	// DataRoot is set for file-backed runtimes (empty for pure memory).
 	DataRoot string
-	release  func()
+	// ReadOnly marks a runtime opened under a shared directory lock alongside a writer in
+	// another process. Every write path checks it; see AssertWritable.
+	ReadOnly bool
+	// refresh re-reads the writer's committed history onto this runtime's DAG. Non-nil only for
+	// read-only runtimes, which are the only ones whose view can fall behind reality.
+	refresh func() error
+	release func()
 	// storageClose flushes and seals the active delta segment and closes
 	// the underlying storage engine handle (WAL final sync included) -
 	// nil for a pure in-memory runtime. Deliberately best-effort and
@@ -30,6 +37,35 @@ type EmbeddedKdbRuntime struct {
 	// extra topological-replay pass instead of a fast sequential one, and
 	// leaves one extra small segment on disk.
 	storageClose func() error
+}
+
+// ErrReadOnly is returned by every write path on a runtime opened with ReadOnly.
+var ErrReadOnly = errors.New("kdb: runtime is open read-only")
+
+// AssertWritable returns ErrReadOnly if this runtime may not be written to. Write paths call it
+// at their entry point rather than relying on the storage engine to fail: a read-only runtime
+// has no WAL and no delta writer, so a write that got past this would fail somewhere deep with
+// an error that describes a missing component instead of the actual reason.
+func (r *EmbeddedKdbRuntime) AssertWritable() error {
+	if r != nil && r.ReadOnly {
+		return ErrReadOnly
+	}
+	return nil
+}
+
+// Refresh re-reads the writer's committed history, advancing a read-only runtime's view to
+// whatever has been made durable since it last looked. A no-op on a writable runtime, whose own
+// commits keep it current by construction.
+//
+// A reader's view is always a snapshot of some past moment - there is no way to be continuously
+// current with another process - so callers that need a freshness bound should Refresh on their
+// own cadence and treat "how stale may this be" as an explicit part of their contract rather
+// than an accident of timing.
+func (r *EmbeddedKdbRuntime) Refresh() error {
+	if r == nil || r.refresh == nil {
+		return nil
+	}
+	return r.refresh()
 }
 
 // Close performs an orderly shutdown: flush and seal the active delta

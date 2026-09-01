@@ -65,6 +65,13 @@ const (
 	// the conflicting case; this covers every other outcome. Go-only for now, like 0x14-0x17.
 	MsgCommitPushAck MessageType = 0x18
 
+	// Document-lease messages (see lock_ops.go): a client-held, expiring, fenced lock on one
+	// document, for holds that span round trips. Go-only for now, like 0x14-0x18.
+	MsgLockAcquire MessageType = 0x19
+	MsgLockRenew   MessageType = 0x1A
+	MsgLockRelease MessageType = 0x1B
+	MsgLockResult  MessageType = 0x1C
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -120,6 +127,14 @@ func (t MessageType) String() string {
 		return "UPSERT_RESULT"
 	case MsgCommitPushAck:
 		return "COMMIT_PUSH_ACK"
+	case MsgLockAcquire:
+		return "LOCK_ACQUIRE"
+	case MsgLockRenew:
+		return "LOCK_RENEW"
+	case MsgLockRelease:
+		return "LOCK_RELEASE"
+	case MsgLockResult:
+		return "LOCK_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -175,6 +190,14 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgUpsertResult, true
 	case 0x18:
 		return MsgCommitPushAck, true
+	case 0x19:
+		return MsgLockAcquire, true
+	case 0x1A:
+		return MsgLockRenew, true
+	case 0x1B:
+		return MsgLockRelease, true
+	case 0x1C:
+		return MsgLockResult, true
 	default:
 		return 0, false
 	}

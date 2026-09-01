@@ -15,6 +15,10 @@ import (
 type defaultEngine struct {
 	conflictPolicy ConflictPolicy
 	customResolver ConflictResolver
+	// uniqueKeys is nil when unique-constraint enforcement is disabled; see EngineOptions.
+	uniqueKeys *UniqueKeyRegistry
+	// preconditions gates per-operation precondition evaluation; see EngineOptions.
+	preconditions bool
 }
 
 func (e *defaultEngine) ConflictPolicy() ConflictPolicy { return e.conflictPolicy }
@@ -192,12 +196,30 @@ func (e *defaultEngine) finalizeTransaction(
 	}
 	writes := schemaFrame.writesByOpIndex
 
+	// Preconditions are evaluated before - and independently of - the conflict policy. A client
+	// that said "only if absent" or "only if the hash is still X" asked a question the policy has
+	// no standing to answer for it: ConflictPolicyLastWrite exists to make ordinary writes
+	// converge, not to wave through an assertion the client explicitly asked to be checked.
+	// That matters most for the Upsert path, which runs on LastWrite and is exactly where
+	// insert-if-absent is used.
+	guarded := map[int]struct{}{}
+	if e.preconditions && len(tx.Preconditions) > 0 {
+		preFailures, preViolations := evaluatePreconditions(tx, d.NamespaceID, store, targetDocTreeHash)
+		if len(preViolations) > 0 {
+			return ResultSchemaError{Violations: preViolations}, nil
+		}
+		if len(preFailures) > 0 {
+			return ResultConflict{Report: toReport(tx, anchorCommit, preFailures), ConflictingOps: preFailures}, nil
+		}
+		guarded = guardedOpIndexes(tx)
+	}
+
 	var conflicts []OperationConflict
 	switch e.conflictPolicy {
 	case ConflictPolicyAppendOnly, ConflictPolicyLastWrite:
 		conflicts = nil
 	default:
-		conflicts = detectConflicts(tx, d.NamespaceID, store, baseDocTreeHash, targetDocTreeHash, writes)
+		conflicts = detectConflicts(tx, d.NamespaceID, store, baseDocTreeHash, targetDocTreeHash, writes, guarded)
 	}
 
 	if len(conflicts) > 0 && e.conflictPolicy == ConflictPolicyStrict {
@@ -235,6 +257,17 @@ func (e *defaultEngine) finalizeTransaction(
 			}
 			writes[c.OpIndex], _ = vr.Value()
 		}
+	}
+
+	// Unique-constraint enforcement runs after conflict resolution, so a custom resolver's
+	// rewritten document is the one checked, and before any write is staged, so a violation
+	// costs nothing to unwind. It is evaluated against targetDocTreeHash - what this transaction
+	// is actually landing on - not the base it was built against.
+	uPlan, uniqueViolations := planUniqueKeys(
+		tx, d.NamespaceID, store, targetDocTreeHash, schemaFrame.rollingSchema, e.uniqueKeys, writes,
+	)
+	if len(uniqueViolations) > 0 {
+		return ResultSchemaError{Violations: uniqueViolations}, nil
 	}
 
 	if abortErr := func() error {
@@ -279,7 +312,28 @@ func (e *defaultEngine) finalizeTransaction(
 	if err != nil {
 		return nil, err
 	}
+	// The registry moves only once the commit is in the DAG. Applying earlier would leave a
+	// phantom claim behind if AppendCommit failed; applying later - after the caller's durability
+	// wait - would open a window in which the next writer, already serialized behind this one at
+	// the write gate, sees a key this commit has taken as still free. Erring toward "claimed
+	// slightly too early" costs at most a spurious rejection of a write that raced a failing
+	// commit; erring the other way costs a duplicate that the constraint exists to prevent.
+	if !uPlan.empty() {
+		e.uniqueKeys.Apply(uPlan.retract, uPlan.claim)
+	}
 	return ResultSuccess{Commit: commit, NewTreeHash: commit.DocumentTreeHash}, nil
+}
+
+// guardedOpIndexes returns the operations carrying a real (non-ExpectAny) precondition. Those
+// operations are exempt from base-version conflict detection - see detectConflicts.
+func guardedOpIndexes(tx document.Transaction) map[int]struct{} {
+	out := make(map[int]struct{}, len(tx.Preconditions))
+	for _, p := range tx.Preconditions {
+		if p.Kind != document.ExpectAny {
+			out[p.OpIndex] = struct{}{}
+		}
+	}
+	return out
 }
 
 func detectConflicts(
@@ -288,9 +342,21 @@ func detectConflicts(
 	store storage.Adapter,
 	baseTreeHash, targetTreeHash codec.Hash,
 	projectedWrites map[int]document.Document,
+	guarded map[int]struct{},
 ) []OperationConflict {
 	var out []OperationConflict
 	for index, op := range tx.Operations {
+		// An operation with an explicit precondition has already been checked against the tree
+		// this transaction is landing on, and it passed. Re-checking it against the transaction's
+		// *base* version would answer a question the caller did not ask and does not care about:
+		// "has this document changed since the version my client last happened to commit". For a
+		// compare-and-set that check is not merely redundant, it is fatal - a client whose cached
+		// base version is stale (which, under contention, is every client that just lost a round)
+		// would be refused for a conflict its precondition already ruled out, and no amount of
+		// retrying would help, because losing a round is exactly what makes the base stale.
+		if _, exempt := guarded[index]; exempt {
+			continue
+		}
 		switch o := op.(type) {
 		case document.WriteOp:
 			baseDoc, _ := store.GetDocument(namespaceID, o.DocID, baseTreeHash)
@@ -486,8 +552,14 @@ func toReport(tx document.Transaction, anchor codec.Hash, conflicts []OperationC
 			s := c.ExistingDoc.JSON
 			local = &s
 		}
+		var actual *string
+		if c.ActualContentHash != nil {
+			s := c.ActualContentHash.Hex()
+			actual = &s
+		}
 		items = append(items, kdberr.ConflictItem{
 			DocumentID: docID, OperationType: c.Type, LocalDoc: local, IncomingDoc: incoming,
+			ActualContentHash: actual,
 		})
 	}
 	return kdberr.ConflictReport{

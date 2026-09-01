@@ -67,6 +67,12 @@ type payloadEnvelope struct {
 	DocumentGetResult *documentGetResultDto `json:"documentGetResult,omitempty"`
 	Upsert            *upsertDto            `json:"upsert,omitempty"`
 	UpsertResult      *upsertResultDto      `json:"upsertResult,omitempty"`
+
+	// Document-lease additions - see lock_ops.go.
+	LockAcquire *lockAcquireDto `json:"lockAcquire,omitempty"`
+	LockRenew   *lockRenewDto   `json:"lockRenew,omitempty"`
+	LockRelease *lockReleaseDto `json:"lockRelease,omitempty"`
+	LockResult  *lockResultDto  `json:"lockResult,omitempty"`
 }
 
 type handshakeDto struct {

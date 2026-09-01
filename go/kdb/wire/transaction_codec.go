@@ -2,6 +2,7 @@ package wire
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -16,6 +17,21 @@ type transactionDto struct {
 	TimestampMicros int64   `json:"timestampMicros"`
 	AuthorNodeID    string  `json:"authorNodeId"`
 	Operations      []opDto `json:"operations"`
+	// Preconditions is additive and omitempty: a transaction with no preconditions encodes
+	// byte-for-byte as it did before this field existed, so an older JVM peer decoding a new
+	// Go-produced transaction sees exactly what it saw before, and a new decoder reading an old
+	// producer's bytes gets a nil slice - the "assert nothing" default. That keeps the Component
+	// 40 wire-compatibility contract intact in both directions without a version negotiation.
+	Preconditions []preconditionDto `json:"preconditions,omitempty"`
+}
+
+// preconditionDto is one entry of transactionDto.Preconditions. Kind travels as its name rather
+// than its ordinal, matching the convention ConflictOperationType already established for
+// enums crossing this wire (kotlinx.serialization emits enum constant names).
+type preconditionDto struct {
+	OpIndex        int    `json:"opIndex"`
+	Kind           string `json:"kind"`
+	ContentHashHex string `json:"contentHashHex,omitempty"`
 }
 
 // EncodeTransaction serializes tx for TxCommitMessage.TransactionBytes, matching Kotlin's
@@ -27,12 +43,21 @@ func EncodeTransaction(tx document.Transaction) ([]byte, error) {
 	for i, op := range tx.Operations {
 		ops[i] = opToDto(op)
 	}
+	var pres []preconditionDto
+	for _, p := range tx.Preconditions {
+		d := preconditionDto{OpIndex: p.OpIndex, Kind: p.Kind.String()}
+		if p.Kind == document.ExpectContentHash {
+			d.ContentHashHex = p.ContentHash.Hex()
+		}
+		pres = append(pres, d)
+	}
 	dto := transactionDto{
 		ID:              tx.ID.String(),
 		BaseVersionHex:  tx.BaseVersion.Hex(),
 		TimestampMicros: tx.Timestamp.EpochMicros(),
 		AuthorNodeID:    tx.AuthorNodeID.String(),
 		Operations:      ops,
+		Preconditions:   pres,
 	}
 	return json.Marshal(dto)
 }
@@ -63,11 +88,47 @@ func DecodeTransaction(bytes []byte) (document.Transaction, error) {
 		}
 		ops[i] = op
 	}
+	var pres []document.Precondition
+	for _, pd := range dto.Preconditions {
+		kind, err := preconditionKindFromName(pd.Kind)
+		if err != nil {
+			return document.Transaction{}, err
+		}
+		p := document.Precondition{OpIndex: pd.OpIndex, Kind: kind}
+		if kind == document.ExpectContentHash {
+			h, err := codec.HashFromHex(pd.ContentHashHex)
+			if err != nil {
+				return document.Transaction{}, err
+			}
+			p.ContentHash = h
+		}
+		pres = append(pres, p)
+	}
 	return document.Transaction{
-		ID:           id,
-		BaseVersion:  baseVersion,
-		Operations:   ops,
-		Timestamp:    codec.TimestampFromEpochMicros(dto.TimestampMicros),
-		AuthorNodeID: authorNodeID,
+		ID:            id,
+		BaseVersion:   baseVersion,
+		Operations:    ops,
+		Timestamp:     codec.TimestampFromEpochMicros(dto.TimestampMicros),
+		AuthorNodeID:  authorNodeID,
+		Preconditions: pres,
 	}, nil
+}
+
+// preconditionKindFromName is the strict inverse of PreconditionKind.String. An unrecognized
+// name is an error rather than a silent fall back to ExpectAny: a peer asserting a precondition
+// this build does not understand must not have that assertion quietly dropped and its write
+// committed anyway - that is precisely the lost update the precondition was preventing.
+func preconditionKindFromName(name string) (document.PreconditionKind, error) {
+	switch name {
+	case "EXPECT_ANY":
+		return document.ExpectAny, nil
+	case "EXPECT_ABSENT":
+		return document.ExpectAbsent, nil
+	case "EXPECT_PRESENT":
+		return document.ExpectPresent, nil
+	case "EXPECT_CONTENT_HASH":
+		return document.ExpectContentHash, nil
+	default:
+		return document.ExpectAny, fmt.Errorf("kdb wire: unrecognized precondition kind %q", name)
+	}
 }
