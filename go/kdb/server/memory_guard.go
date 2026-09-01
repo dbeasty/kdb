@@ -114,6 +114,9 @@ type MemoryGuard struct {
 
 	stop     chan struct{}
 	stopOnce sync.Once
+	// done is closed by sampleLoop right before it returns. Stop waits on it, which is what
+	// makes Stop actually synchronous - see Stop's doc comment for why that matters.
+	done chan struct{}
 }
 
 // clearRatio is how far below a zone's entry threshold smoothed usage must fall before the guard
@@ -159,6 +162,7 @@ func NewMemoryGuard(limitBytes uint64, rejectFraction float64) *MemoryGuard {
 		pollInterval: 200 * time.Millisecond,
 		now:          time.Now,
 		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 	for z := ZoneNormal; z <= ZoneCritical; z++ {
 		entry := float64(limitBytes) * rejectFraction * zoneFractionOfReject[z]
@@ -194,6 +198,7 @@ func (g *MemoryGuard) LimitBytes() uint64 {
 func (g *MemoryGuard) sampleLoop() {
 	ticker := time.NewTicker(g.pollInterval)
 	defer ticker.Stop()
+	defer close(g.done)
 	for {
 		select {
 		case <-g.stop:
@@ -326,13 +331,28 @@ func (g *MemoryGuard) ShouldReject() bool {
 	return g.pressure.Load()
 }
 
-// Stop halts the background sampler. Safe to call on a disabled (limitBytes == 0) guard, a nil
-// one, or more than once.
+// Stop halts the background sampler and, unlike a bare "signal and return", does not return
+// until sampleLoop has actually exited. Safe to call on a disabled (limitBytes == 0) guard, a
+// nil one, or more than once.
+//
+// Synchronous on purpose: a caller that stops the guard specifically to drive it with its own
+// observe() calls (see the test helper pinZone) needs the guarantee that no straggler background
+// sample can land after Stop returns. Before this waited on g.done, it only closed g.stop and
+// returned immediately - select does not preempt an already-fired ticker case, so a sample could
+// still be in flight, and under real scheduling delay (heavier on a loaded CI runner, worse still
+// under -race) a tick could fire for the first time in the gap between NewMemoryGuard and the
+// very next line calling Stop. That sample's real, low process-RSS reading would land in the
+// ring buffer either just before or concurrently with the caller's own explicit observe(), and
+// being averaged into the moving window would pull the zone back under threshold - intermittent,
+// unrelated-looking failures with the exact shape "expected ZoneHigh, got ZoneNormal" or "the
+// write was not shed", on a schedule (present under load, absent on a quiet machine) that looked
+// like a race in the test rather than in what it was testing.
 func (g *MemoryGuard) Stop() {
 	if g == nil || g.limitBytes == 0 {
 		return
 	}
 	g.stopOnce.Do(func() { close(g.stop) })
+	<-g.done
 }
 
 // MemoryPressureError is returned instead of admitting work when the server's pressure Zone sheds
