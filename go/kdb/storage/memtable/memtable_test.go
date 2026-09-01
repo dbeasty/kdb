@@ -212,8 +212,14 @@ func TestManagerActiveShadowsBlobStore(t *testing.T) {
 	}
 }
 
-// TestManagerFlushEmptyReturnsZeroHandle confirms flushing an empty memtable - or one holding
-// only deletions - writes nothing and returns a zero Handle with no error.
+// TestManagerFlushEmptyReturnsZeroHandle confirms flushing an empty memtable writes nothing and
+// returns a zero Handle with no error.
+//
+// A memtable holding only deletions is NOT empty and does produce a table: its tombstones are the
+// only record that those keys were deleted, and the keys may well exist in an SSTable flushed
+// earlier. This test used to assert the opposite - that a deletion-only flush wrote nothing -
+// which is precisely the behavior that let a delete of an already-flushed key un-delete itself.
+// See TestDeleteSurvivesAFlush.
 func TestManagerFlushEmptyReturnsZeroHandle(t *testing.T) {
 	shim := io.NewInMemoryPlatformIO()
 	mgr := newManager(shim)
@@ -225,24 +231,67 @@ func TestManagerFlushEmptyReturnsZeroHandle(t *testing.T) {
 	if handle != (sstable.Handle{}) {
 		t.Fatalf("Flush of empty memtable: got %+v, want zero Handle", handle)
 	}
-
-	// A put that was deleted again before the flush must not produce a table either.
-	key := testKey(t, "gone")
-	mgr.Put(key, []byte("temp"))
-	mgr.Delete(key)
-	handle, err = mgr.Flush(0)
-	if err != nil {
-		t.Fatalf("Flush of deleted-only memtable: %v", err)
-	}
-	if handle != (sstable.Handle{}) {
-		t.Fatalf("Flush of deleted-only memtable: got %+v, want zero Handle", handle)
-	}
 	segments, err := shim.ListSegments("ns")
 	if err != nil {
 		t.Fatalf("ListSegments: %v", err)
 	}
 	if len(segments) != 0 {
-		t.Fatalf("expected no segments after empty flushes, got %v", segments)
+		t.Fatalf("expected no segments after an empty flush, got %v", segments)
+	}
+}
+
+// TestDeleteSurvivesAFlush is the regression test for the lost-tombstone hazard: a key written
+// and flushed, then deleted and flushed again, must stay deleted. The tombstone used to be
+// skipped at flush time (the SSTable format had no delete marker), so the second flush erased the
+// only record of the delete and the first flush's value came straight back.
+func TestDeleteSurvivesAFlush(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	mgr := newManager(shim)
+
+	key := testKey(t, "resurrect-me")
+	mgr.Put(key, []byte("original"))
+	if _, err := mgr.Flush(0); err != nil {
+		t.Fatalf("first flush: %v", err)
+	}
+	if got := mgr.Get(key); string(got) != "original" {
+		t.Fatalf("after the first flush Get = %q, want %q", got, "original")
+	}
+
+	mgr.Delete(key)
+	if got := mgr.Get(key); got != nil {
+		t.Fatalf("Get right after Delete = %q, want nil", got)
+	}
+	if _, err := mgr.Flush(0); err != nil {
+		t.Fatalf("second flush: %v", err)
+	}
+
+	if got := mgr.Get(key); got != nil {
+		t.Fatalf("the delete did not survive the flush: Get = %q, want nil", got)
+	}
+}
+
+// TestDeleteThenRewriteSurvivesAFlush: a tombstone must shadow older tables, but it must not
+// shadow a value written after it.
+func TestDeleteThenRewriteSurvivesAFlush(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	mgr := newManager(shim)
+
+	key := testKey(t, "revived")
+	mgr.Put(key, []byte("v1"))
+	if _, err := mgr.Flush(0); err != nil {
+		t.Fatalf("flush v1: %v", err)
+	}
+	mgr.Delete(key)
+	if _, err := mgr.Flush(0); err != nil {
+		t.Fatalf("flush tombstone: %v", err)
+	}
+	mgr.Put(key, []byte("v2"))
+	if _, err := mgr.Flush(0); err != nil {
+		t.Fatalf("flush v2: %v", err)
+	}
+
+	if got := mgr.Get(key); string(got) != "v2" {
+		t.Fatalf("Get = %q, want %q - the tombstone shadowed a newer write", got, "v2")
 	}
 }
 

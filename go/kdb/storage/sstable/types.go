@@ -7,11 +7,17 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
-// BlockHandle points at a compressed block in a segment.
+// BlockHandle points at a compressed block in a segment, or - when Deleted is set - records that
+// the key was deleted and no block exists for it at all.
 type BlockHandle struct {
 	Offset           int64
 	CompressedSize   int
 	UncompressedSize int
+	// Deleted marks a tombstone: this table says the key is gone, and older tables must not be
+	// consulted for it. Before the format carried this, a delete of a key that had already been
+	// flushed held only for as long as its tombstone lived in the memtable - the next flush
+	// dropped it, and the value came back from the SSTable underneath.
+	Deleted bool
 }
 
 // Handle references a sealed SSTable file.
@@ -24,12 +30,20 @@ type Handle struct {
 // Writer builds an SSTable segment.
 type Writer interface {
 	Put(key codec.Hash, value []byte)
+	// Delete records a tombstone for key: this table asserts the key is gone, shadowing whatever
+	// older tables hold for it.
+	Delete(key codec.Hash)
 	Finish() (Handle, error)
 }
 
 // Reader reads keys from an SSTable.
 type Reader interface {
 	Get(key codec.Hash) ([]byte, error)
+	// Lookup reports what this table knows about key. found=false means the table has never seen
+	// it and the caller should keep searching older tables; found=true with deleted=true is a
+	// tombstone, and the search must stop there. Get cannot express the difference - it returns
+	// nil for both - which is exactly how a delete used to fall through to an older generation.
+	Lookup(key codec.Hash) (value []byte, deleted, found bool, err error)
 }
 
 // BlockCache is an LRU-ish block cache keyed by hash and offset.
@@ -105,18 +119,35 @@ func NewLsmBlobStore(io storage.PlatformIOShim, namespaceID string, cache *Block
 	return &LsmBlobStore{io: io, namespaceID: namespaceID, cache: cache}
 }
 
-// Get searches tables newest-first.
+// Get searches tables newest-first, stopping at the first table that has an opinion about key -
+// including a tombstone, which means the key is gone and the older tables underneath must not be
+// consulted. Reading through a tombstone (which is what searching for the first non-nil value
+// did) is how a flushed delete used to resurrect the value it deleted.
 func (s *LsmBlobStore) Get(key codec.Hash) []byte {
+	value, _, _ := s.Lookup(key)
+	return value
+}
+
+// Lookup is Get with the distinction Get cannot express: whether the key is absent from every
+// table, or present as a tombstone.
+func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool) {
 	s.mu.Lock()
 	tables := s.tables
 	s.mu.Unlock()
 	for i := len(tables) - 1; i >= 0; i-- {
 		reader := NewDefaultReader(s.io, tables[i])
-		if v, err := reader.Get(key); err == nil && v != nil {
-			return v
+		v, del, ok, err := reader.Lookup(key)
+		if err != nil || !ok {
+			// A read error is treated the way it always has been - as "this table cannot answer" -
+			// so one damaged segment does not make the whole store unreadable.
+			continue
 		}
+		if del {
+			return nil, true, true
+		}
+		return v, false, true
 	}
-	return nil
+	return nil, false, false
 }
 
 // AddTable registers a flushed table.

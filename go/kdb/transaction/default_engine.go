@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
@@ -155,7 +156,10 @@ func (e *defaultEngine) Merge(
 		Timestamp:    codec.TimestampNow(),
 		AuthorNodeID: mergedCommit.AuthorNodeID,
 	}
-	mergeCommit, err := d.AppendMergeCommit(mergeMarker, primaryHead, mergedHead, mergedTree, tipSchema, message)
+	// AppendMergeCommitOnto, not AppendMergeCommit: the replay loop above walked the branch head
+	// forward through a chain of scratch commits, and the marker deliberately roots back at
+	// primaryHead. head - the tip of that replay chain - is what must not have moved under us.
+	mergeCommit, err := d.AppendMergeCommitOnto(&head, mergeMarker, primaryHead, mergedHead, mergedTree, tipSchema, message)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +191,14 @@ func (e *defaultEngine) finalizeTransaction(
 	anchorCommit, baseDocTreeHash, baselineDocTreeHash, targetDocTreeHash codec.Hash,
 	message string,
 ) (TransactionResult, error) {
+	// Whether this transaction extends the branch tip or deliberately forks off an older commit
+	// is decided here, before any work is staged, because that is when the caller's intent is
+	// still legible. If the anchor is the tip right now, the append must still find it there
+	// (AppendCommit's compare-and-swap) - anything else means another writer advanced the branch
+	// while this transaction was being planned, and appending anyway would leave this commit
+	// stored but unreachable. If the anchor was already behind the tip, the caller asked for a
+	// fork (Replay onto a named target) and the branch head is not this transaction's business.
+	extendingTip := d.HeadIs(anchorCommit)
 	if fileViolations := preflightFileWrites(tx, store); len(fileViolations) > 0 {
 		return ResultSchemaError{Violations: fileViolations}, nil
 	}
@@ -308,8 +320,19 @@ func (e *defaultEngine) finalizeTransaction(
 		h := schemaFrame.rollingSchema.SchemaHash
 		schemaHashWire = &h
 	}
-	commit, err := d.AppendCommit(tx, anchorCommit, newTree, schemaHashWire, message)
+	appendFn := d.AppendCommitDetached
+	if extendingTip {
+		appendFn = d.AppendCommit
+	}
+	commit, err := appendFn(tx, anchorCommit, newTree, schemaHashWire, message)
 	if err != nil {
+		// A lost compare-and-swap leaves this transaction's staged writes behind on the adapter,
+		// where the next transaction to call CommitTree would silently absorb them. Drop them -
+		// same rollback the write phase does when it fails partway.
+		var headConflict *dag.HeadConflictError
+		if errors.As(err, &headConflict) {
+			_ = store.DiscardPending(d.NamespaceID)
+		}
 		return nil, err
 	}
 	// The registry moves only once the commit is in the DAG. Applying earlier would leave a

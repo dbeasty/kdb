@@ -1,6 +1,7 @@
 package server
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,4 +207,101 @@ func TestListenStreamRejectsSqlClientHandshake(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("no handshake response received")
+}
+
+// stuckConn is a ConnectionHandle whose Send blocks until it is released - what a real TCP
+// subscriber looks like once its receive window has filled and the socket write can no longer
+// make progress.
+type stuckConn struct {
+	release chan struct{}
+	sent    atomic.Int64
+}
+
+func newStuckConn() *stuckConn { return &stuckConn{release: make(chan struct{})} }
+
+func (c *stuckConn) Send(frame []byte) error {
+	<-c.release
+	c.sent.Add(1)
+	return nil
+}
+func (c *stuckConn) Incoming() <-chan []byte { return nil }
+func (c *stuckConn) Close() error            { return nil }
+func (c *stuckConn) TryPoll() []byte         { return nil }
+
+// TestPublishDoesNotBlockOnAStuckSubscriber is the regression test for the fan-out hazard.
+// Publish used to call conn.Send inline for every subscriber, and socketConnection.Send does a
+// blocking socket write - so one subscriber that had stopped reading stalled the whole fan-out
+// and, behind it, the goroutine that had just committed (Publish is called from
+// KdbServerRuntime.CommitListener on the commit path). Every subscriber now has its own queue
+// and its own sender goroutine, so Publish returns regardless.
+func TestPublishDoesNotBlockOnAStuckSubscriber(t *testing.T) {
+	const ns = "app/data"
+	rt := newTestRuntime(t)
+	hub := NewStreamHub(wire.NewCodec(wire.EncodingJSON), ns, rt)
+
+	stuck := newStuckConn()
+	defer close(stuck.release)
+	handshakeStreamSubscriber(t, hub, stuck, ns)
+
+	// One more frame than the queue can hold: the first fills it (the sender goroutine is parked
+	// inside the blocked Send), the rest are dropped. None of it may block Publish.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < subscriberQueueDepth+8; i++ {
+			hub.Publish(stream.PublishedCommit{TimestampMicros: int64(i)})
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Publish blocked on a subscriber that stopped reading")
+	}
+
+	if dropped := hub.DroppedFrames(); dropped == 0 {
+		t.Fatal("expected the overflowing frames to be counted as dropped, got 0")
+	}
+}
+
+// TestPublishReachesAHealthySubscriberBesideAStuckOne: the fan-out is per-subscriber, so a
+// subscriber that stopped reading must not cost the others their frames either.
+func TestPublishReachesAHealthySubscriberBesideAStuckOne(t *testing.T) {
+	const ns = "app/data"
+	rt := newTestRuntime(t)
+	hub := NewStreamHub(wire.NewCodec(wire.EncodingJSON), ns, rt)
+
+	stuck := newStuckConn()
+	defer close(stuck.release)
+	handshakeStreamSubscriber(t, hub, stuck, ns)
+
+	healthy := newStuckConn()
+	close(healthy.release) // never blocks
+	handshakeStreamSubscriber(t, hub, healthy, ns)
+
+	hub.Publish(stream.PublishedCommit{TimestampMicros: 1})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for healthy.sent.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("healthy subscriber never received the frame behind a stuck one")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// handshakeStreamSubscriber registers conn as a Mode 1 subscriber through the hub's real
+// handshake path, so the test exercises the same registration Publish fans out to.
+func handshakeStreamSubscriber(t *testing.T, hub *StreamHub, conn stream.ConnectionHandle, ns string) {
+	t.Helper()
+	frame := hub.handleHandshake(conn, wire.HandshakeMessage{
+		H: wire.Header{MessageType: wire.MsgHandshake, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: 1},
+		Request: wire.HandshakePayload{
+			NodeID:     "sub",
+			Namespaces: []string{ns},
+			ClientMode: wire.ClientStreamReadOnly,
+		},
+	})
+	if frame == nil {
+		t.Fatal("handshake produced no ack frame")
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -123,4 +124,86 @@ func randomKey(t *testing.T) codec.Hash {
 		t.Fatal(err)
 	}
 	return h
+}
+
+// testHash derives a stable 32-byte key from a label, so a failure names the key it was about.
+func testHash(t *testing.T, label string) codec.Hash {
+	t.Helper()
+	h, err := codec.HashFromBytes(document.SHA256Digest([]byte(label)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// TestTombstoneRoundTrips: a deleted key must come back as "present, deleted" - distinguishable
+// from a key the table never held, which is the distinction Get alone cannot make and the reason
+// a flushed delete used to fall through to an older table.
+func TestTombstoneRoundTrips(t *testing.T) {
+	shim := io.NewInMemoryPlatformIO()
+	writer := NewDefaultWriter(shim, "ns", 0)
+	kept := testHash(t, "kept")
+	gone := testHash(t, "gone")
+	writer.Put(kept, []byte("still here"))
+	writer.Delete(gone)
+	handle, err := writer.Finish()
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+
+	reader := NewDefaultReader(shim, handle)
+
+	value, deleted, found, err := reader.Lookup(kept)
+	if err != nil || !found || deleted || string(value) != "still here" {
+		t.Fatalf("Lookup(kept) = (%q, %v, %v, %v)", value, deleted, found, err)
+	}
+
+	value, deleted, found, err = reader.Lookup(gone)
+	if err != nil {
+		t.Fatalf("Lookup(gone): %v", err)
+	}
+	if !found || !deleted || value != nil {
+		t.Fatalf("Lookup(gone) = (%q, deleted=%v, found=%v), want a tombstone", value, deleted, found)
+	}
+
+	never, _, found, err := reader.Lookup(testHash(t, "never written"))
+	if err != nil || found || never != nil {
+		t.Fatalf("Lookup(absent) = (%q, found=%v, %v), want not found", never, found, err)
+	}
+}
+
+// TestFooterWithNoTombstonesIsUnchanged pins the compatibility claim in tombstoneFlag's doc
+// comment: the fourth field is written only for tombstones, so a table without any produces
+// exactly the bytes the three-field format did. The golden fixtures depend on this.
+func TestFooterWithNoTombstonesIsUnchanged(t *testing.T) {
+	h := testHash(t, "k")
+	fileHash := testHash(t, "file")
+	footer := buildFooter(map[codec.Hash]BlockHandle{h: {Offset: 7, CompressedSize: 11}}, fileHash)
+	line := string(footer[8 : 8+readInt(footer, 4)])
+	if want := h.Hex() + ":7:11"; line != want {
+		t.Fatalf("index line = %q, want %q", line, want)
+	}
+}
+
+// TestParseFooterAcceptsThreeFieldLines: segments written before tombstones existed have no
+// fourth field, and must still parse as ordinary (non-deleted) entries.
+func TestParseFooterAcceptsThreeFieldLines(t *testing.T) {
+	h := testHash(t, "legacy")
+	index := h.Hex() + ":7:11"
+	footer := make([]byte, 8+len(index)+32+footerTrailerSize)
+	writeInt(footer, 0, footerMagic)
+	writeInt(footer, 4, len(index))
+	copy(footer[8:], index)
+
+	parsed, err := parseFooter(footer)
+	if err != nil {
+		t.Fatalf("parseFooter: %v", err)
+	}
+	bh, ok := parsed[h]
+	if !ok {
+		t.Fatal("legacy three-field line did not parse")
+	}
+	if bh.Deleted || bh.Offset != 7 || bh.CompressedSize != 11 {
+		t.Fatalf("parsed %+v, want {Offset:7 CompressedSize:11 Deleted:false}", bh)
+	}
 }

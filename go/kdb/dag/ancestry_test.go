@@ -65,9 +65,13 @@ func (b *dagBuilder) tx(parent codec.Hash) document.Transaction {
 }
 
 // commit appends a single-parent commit and records it under name for readable failures.
+// Detached: these tests build graphs of an explicit shape - diamonds, side branches, commits
+// hung off a fork point long after the branch moved past it - so "the parent is not the current
+// head" is the fixture, not a lost race. AppendCommit's compare-and-swap belongs to callers
+// extending the tip.
 func (b *dagBuilder) commit(name string, parent codec.Hash) codec.Hash {
 	b.t.Helper()
-	c, err := b.dag.AppendCommit(b.tx(parent), parent, document.EmptyDocumentTree(), nil, name)
+	c, err := b.dag.AppendCommitDetached(b.tx(parent), parent, document.EmptyDocumentTree(), nil, name)
 	if err != nil {
 		b.t.Fatalf("commit %s: %v", name, err)
 	}
@@ -78,8 +82,8 @@ func (b *dagBuilder) commit(name string, parent codec.Hash) codec.Hash {
 // merge appends a two-parent commit.
 func (b *dagBuilder) merge(name string, primary, merged codec.Hash) codec.Hash {
 	b.t.Helper()
-	c, err := b.dag.AppendMergeCommit(
-		b.tx(primary), primary, merged, document.EmptyDocumentTree(), nil, name)
+	c, err := b.dag.AppendMergeCommitOnto(
+		nil, b.tx(primary), primary, merged, document.EmptyDocumentTree(), nil, name)
 	if err != nil {
 		b.t.Fatalf("merge %s: %v", name, err)
 	}

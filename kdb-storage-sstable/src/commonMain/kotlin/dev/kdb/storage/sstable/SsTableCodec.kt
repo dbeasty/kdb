@@ -86,8 +86,24 @@ internal object SsTableCodec {
     // failing round trip on ordinary write-then-read) - this package had no round-trip test
     // before this fix either. The two languages' formats must stay byte-for-byte identical; see
     // go/testdata/golden/codec's regenerated fixtures.
+    // The optional fourth field of a footer index line: "<hex>:<offset>:<size>:1" means the key
+    // was deleted in this table and no block was written for it. Written only for tombstones, so a
+    // table containing none is byte-for-byte what the three-field format produced - existing
+    // segments and go/testdata/golden/codec's fixtures are unaffected, and Go's identical
+    // tombstoneFlag keeps the two languages' formats the same.
+    //
+    // A reader predating this field takes the first three parts and ignores the rest, so it sees a
+    // tombstone as a zero-length block, fails its CRC check, and skips the table - falling through
+    // to older tables exactly as it does today. Wrong, but no more wrong than the behavior this
+    // replaces, and never silently wrong in a new way.
+    const val TOMBSTONE_FLAG: String = "1"
+
     fun buildFooter(index: Map<KdbHash, BlockHandle>, fileHash: KdbHash): ByteArray {
-        val entries = index.entries.joinToString("\n") { "${it.key.toHex()}:${it.value.offset}:${it.value.compressedSize}" }
+        val entries =
+            index.entries.joinToString("\n") {
+                val line = "${it.key.toHex()}:${it.value.offset}:${it.value.compressedSize}"
+                if (it.value.deleted) "$line:$TOMBSTONE_FLAG" else line
+            }
         val indexBytes = entries.encodeToByteArray()
         val footer = ByteArray(8 + indexBytes.size + 32 + FOOTER_TRAILER_SIZE)
         writeInt(footer, 0, FOOTER_MAGIC)
@@ -108,7 +124,8 @@ internal object SsTableCodec {
             val hash = KdbHash.fromHex(parts[0])
             val off = parts[1].toLong()
             val cs = parts[2].toInt()
-            hash to BlockHandle(off, cs, 0)
+            val deleted = parts.size > 3 && parts[3] == TOMBSTONE_FLAG
+            hash to BlockHandle(off, cs, 0, deleted)
         }
     }
 
@@ -131,10 +148,20 @@ public class DefaultSsTableWriter(
     private val namespaceId: String,
     private val level: Int,
 ) : SsTableWriter {
-    private val entries = linkedMapOf<KdbHash, ByteArray>()
+    // A null value is a tombstone - deliberately distinguishable from "no entry at all", which is
+    // what a missing key in this map means.
+    private val entries = linkedMapOf<KdbHash, ByteArray?>()
 
     override suspend fun put(key: KdbHash, value: ByteArray) {
         entries[key] = value
+    }
+
+    /**
+     * Records a tombstone for [key]. No block is written - the footer index entry alone carries
+     * the fact - so a table of nothing but deletes costs one index line per key.
+     */
+    override suspend fun delete(key: KdbHash) {
+        entries[key] = null
     }
 
     override suspend fun finish(): SsTableHandle {
@@ -143,6 +170,10 @@ public class DefaultSsTableWriter(
         val segmentName = SegmentNameBuilder.sstable(namespaceId, level, fileId)
         var offset = 0L
         for ((k, v) in entries) {
+            if (v == null) {
+                blocks[k] = BlockHandle(0L, 0, 0, deleted = true)
+                continue
+            }
             val block = SsTableCodec.encodeBlock(v, compress = true)
             ioShim.appendToSegment(segmentName, block)
             // compressedSize is the compressed body's own length - excluding encodeBlock's
@@ -157,7 +188,14 @@ public class DefaultSsTableWriter(
             buildList {
                 for ((k, v) in entries) {
                     addAll(k.bytes.toList())
-                    addAll(v.toList())
+                    if (v == null) {
+                        // A marker byte, so "deleted K" and "wrote K with an empty value" hash
+                        // differently. Safe to introduce: no segment written before tombstones
+                        // existed contains one. Matches Go's DefaultWriter.Finish.
+                        add(0xFF.toByte())
+                    } else {
+                        addAll(v.toList())
+                    }
                 }
             }.toByteArray()
         val fileHash = KdbHash.fromBytes(kdbSha256(concat))
@@ -172,7 +210,14 @@ public class DefaultSsTableReader(
     private val ioShim: PlatformIoShim,
     private val handle: SsTableHandle,
 ) : SsTableReader {
-    override suspend fun get(key: KdbHash): ByteArray? {
+    /**
+     * Returns the value stored for [key], or `null` if this table has never seen it *or* holds a
+     * tombstone for it. Callers that would otherwise fall through to an older table must use
+     * [lookup].
+     */
+    override suspend fun get(key: KdbHash): ByteArray? = lookup(key)?.takeUnless { it.deleted }?.value
+
+    override suspend fun lookup(key: KdbHash): SsTableEntry? {
         val size = segmentSize()
         if (size < 40 + SsTableCodec.FOOTER_TRAILER_SIZE) return null
         val indexLen = readFooterIndexLen(size)
@@ -185,8 +230,9 @@ public class DefaultSsTableReader(
         val footer = ioShim.readFromSegment(handle.segmentName, footerStart, bodyLen)
         val index = SsTableCodec.parseFooter(footer)
         val bh = index[key] ?: return null
+        if (bh.deleted) return SsTableEntry(value = null, deleted = true)
         val block = ioShim.readFromSegment(handle.segmentName, bh.offset, bh.compressedSize + SsTableCodec.BLOCK_HEADER_SIZE)
-        return SsTableCodec.decodeBlock(block)
+        return SsTableEntry(SsTableCodec.decodeBlock(block), deleted = false)
     }
 
     private suspend fun segmentSize(): Long {

@@ -9,6 +9,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertNull
 
 /** A deterministic 32-byte key for tests - no real hashing needed, just something KdbHash accepts. */
 private fun randomKey(seed: String): KdbHash {
@@ -76,6 +77,59 @@ class MemTableTest {
 
             val got = manager.get(key)
             assertEquals(value.decodeToString(), got?.decodeToString())
+        }
+
+    /**
+     * Regression test for the lost-tombstone hazard: a key written and flushed, then deleted and
+     * flushed again, must stay deleted. Tombstones used to be skipped at flush time (the SSTable
+     * format had no delete marker), so the second flush erased the only record of the delete and
+     * the first flush's value came straight back. Mirrors Go's TestDeleteSurvivesAFlush.
+     */
+    @Test
+    fun deleteSurvivesAFlush() =
+        runTest {
+            val shim = InMemoryPlatformIoShim()
+            val blobStore = LsmBlobStore(shim, "ns", BlockCache(1024 * 1024))
+            val manager = MemTableManager("ns", shim, blobStore)
+
+            val key = randomKey("resurrect")
+            manager.put(key, """{"v":"original"}""".encodeToByteArray())
+            requireNotNull(manager.flush())
+            assertEquals("""{"v":"original"}""", manager.get(key)?.decodeToString())
+
+            manager.delete(key)
+            assertNull(manager.get(key), "the tombstone must hide the flushed value while it is in memory")
+            requireNotNull(manager.flush()) { "a memtable holding only tombstones must still produce a table" }
+
+            assertNull(manager.get(key), "the delete did not survive the flush")
+        }
+
+    /** A tombstone must shadow older tables, but must not shadow a value written after it. */
+    @Test
+    fun deleteThenRewriteSurvivesAFlush() =
+        runTest {
+            val shim = InMemoryPlatformIoShim()
+            val blobStore = LsmBlobStore(shim, "ns", BlockCache(1024 * 1024))
+            val manager = MemTableManager("ns", shim, blobStore)
+
+            val key = randomKey("revived")
+            manager.put(key, "v1".encodeToByteArray())
+            requireNotNull(manager.flush())
+            manager.delete(key)
+            requireNotNull(manager.flush())
+            manager.put(key, "v2".encodeToByteArray())
+            requireNotNull(manager.flush())
+
+            assertEquals("v2", manager.get(key)?.decodeToString(), "the tombstone shadowed a newer write")
+        }
+
+    /** An genuinely empty memtable still writes nothing - only tombstones changed. */
+    @Test
+    fun flushingAnEmptyMemTableWritesNothing() =
+        runTest {
+            val shim = InMemoryPlatformIoShim()
+            val blobStore = LsmBlobStore(shim, "ns", BlockCache(1024 * 1024))
+            assertNull(MemTableManager("ns", shim, blobStore).flush())
         }
 }
 

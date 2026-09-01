@@ -97,6 +97,17 @@ func decodeBlock(block []byte) ([]byte, error) {
 	}
 }
 
+// tombstoneFlag is the optional fourth field of a footer index line: "<hex>:<offset>:<size>:1"
+// means the key was deleted in this table and no block was written for it. It is written only for
+// tombstones, so a table containing none is byte-for-byte what the three-field format produced -
+// existing segments and the golden fixtures in go/testdata/golden/codec are unaffected.
+//
+// A reader predating this field takes the first three parts and ignores the rest, so it sees a
+// tombstone as a zero-length block, fails its CRC check, and skips the table - falling through to
+// older tables exactly as it does today. Wrong, but no more wrong than the behavior this replaces,
+// and never silently wrong in a new way.
+const tombstoneFlag = "1"
+
 // buildFooter lays out magic(4) indexLen(4) indexBytes(indexLen) fileHash(32), then appends a
 // fixed 4-byte trailer duplicating indexLen at the very end of the footer (and, since the footer
 // is always the last thing written to a segment, at the very end of the file). That trailer is
@@ -112,7 +123,11 @@ func decodeBlock(block []byte) ([]byte, error) {
 func buildFooter(index map[codec.Hash]BlockHandle, fileHash codec.Hash) []byte {
 	var lines []string
 	for k, bh := range index {
-		lines = append(lines, fmt.Sprintf("%s:%d:%d", k.Hex(), bh.Offset, bh.CompressedSize))
+		line := fmt.Sprintf("%s:%d:%d", k.Hex(), bh.Offset, bh.CompressedSize)
+		if bh.Deleted {
+			line += ":" + tombstoneFlag
+		}
+		lines = append(lines, line)
 	}
 	indexBytes := []byte(strings.Join(lines, "\n"))
 	footer := make([]byte, 8+len(indexBytes)+32+footerTrailerSize)
@@ -148,7 +163,8 @@ func parseFooter(footer []byte) (map[codec.Hash]BlockHandle, error) {
 		}
 		off, _ := strconv.ParseInt(parts[1], 10, 64)
 		cs, _ := strconv.Atoi(parts[2])
-		out[hash] = BlockHandle{Offset: off, CompressedSize: cs}
+		deleted := len(parts) > 3 && parts[3] == tombstoneFlag
+		out[hash] = BlockHandle{Offset: off, CompressedSize: cs, Deleted: deleted}
 	}
 	return out, nil
 }
@@ -162,8 +178,9 @@ type DefaultWriter struct {
 }
 
 type kv struct {
-	key   codec.Hash
-	value []byte
+	key     codec.Hash
+	value   []byte
+	deleted bool
 }
 
 // NewDefaultWriter creates an SSTable writer.
@@ -175,6 +192,12 @@ func (w *DefaultWriter) Put(key codec.Hash, value []byte) {
 	w.entries = append(w.entries, kv{key: key, value: append([]byte(nil), value...)})
 }
 
+// Delete records a tombstone for key. No block is written - the footer index entry alone carries
+// the fact - so a table of nothing but deletes costs one index line per key.
+func (w *DefaultWriter) Delete(key codec.Hash) {
+	w.entries = append(w.entries, kv{key: key, deleted: true})
+}
+
 func (w *DefaultWriter) Finish() (Handle, error) {
 	blocks := make(map[codec.Hash]BlockHandle)
 	fileID, err := codec.RandomUUID()
@@ -184,6 +207,10 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 	segmentName := io.SegmentNameBuilder.SSTable(w.namespaceID, w.level, fileID.String())
 	var offset int64
 	for _, e := range w.entries {
+		if e.deleted {
+			blocks[e.key] = BlockHandle{Deleted: true}
+			continue
+		}
 		block, err := encodeBlock(e.value, true)
 		if err != nil {
 			return Handle{}, err
@@ -204,6 +231,12 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 	var concat []byte
 	for _, e := range w.entries {
 		concat = append(concat, e.key.Bytes[:]...)
+		if e.deleted {
+			// A marker byte, so "deleted K" and "wrote K with an empty value" hash differently.
+			// Safe to introduce: no segment written before tombstones existed contains one.
+			concat = append(concat, 0xFF)
+			continue
+		}
 		concat = append(concat, e.value...)
 	}
 	fileHash, err := codec.HashFromBytes(document.SHA256Digest(concat))
@@ -231,17 +264,25 @@ func NewDefaultReader(io storage.PlatformIOShim, handle Handle) *DefaultReader {
 	return &DefaultReader{io: io, handle: handle}
 }
 
+// Get returns the value stored for key, or nil if this table has never seen it *or* holds a
+// tombstone for it. Callers that would otherwise fall through to an older table must use Lookup.
 func (r *DefaultReader) Get(key codec.Hash) ([]byte, error) {
+	value, _, _, err := r.Lookup(key)
+	return value, err
+}
+
+// Lookup reports what this table knows about key - see Reader.Lookup.
+func (r *DefaultReader) Lookup(key codec.Hash) ([]byte, bool, bool, error) {
 	size, err := r.segmentSize()
 	if err != nil {
-		return nil, err
+		return nil, false, false, err
 	}
 	if size < 40+footerTrailerSize {
-		return nil, nil
+		return nil, false, false, nil
 	}
 	indexLen, err := r.readFooterIndexLen(size)
 	if err != nil {
-		return nil, err
+		return nil, false, false, err
 	}
 	// The footer body (everything buildFooter writes except its own trailing indexLen copy) is
 	// magic(4) + indexLen(4) + indexBytes(indexLen) + fileHash(32) = 40+indexLen bytes, sitting
@@ -250,21 +291,28 @@ func (r *DefaultReader) Get(key codec.Hash) ([]byte, error) {
 	footerStart := size - int64(bodyLen) - footerTrailerSize
 	footer, err := r.io.ReadFromSegment(r.handle.SegmentName, footerStart, bodyLen)
 	if err != nil {
-		return nil, err
+		return nil, false, false, err
 	}
 	index, err := parseFooter(footer)
 	if err != nil {
-		return nil, err
+		return nil, false, false, err
 	}
 	bh, ok := index[key]
 	if !ok {
-		return nil, nil
+		return nil, false, false, nil
+	}
+	if bh.Deleted {
+		return nil, true, true, nil
 	}
 	block, err := r.io.ReadFromSegment(r.handle.SegmentName, bh.Offset, bh.CompressedSize+blockHeaderSize)
 	if err != nil {
-		return nil, err
+		return nil, false, false, err
 	}
-	return decodeBlock(block)
+	value, err := decodeBlock(block)
+	if err != nil {
+		return nil, false, false, err
+	}
+	return value, false, true, nil
 }
 
 func (r *DefaultReader) segmentSize() (int64, error) {

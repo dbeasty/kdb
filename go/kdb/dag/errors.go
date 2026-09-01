@@ -71,3 +71,32 @@ func (e *CompactionSafetyError) Code() kdberr.Code {
 func NewCompactionSafetyError(msg, ns string, blocker codec.Hash, reason string) *CompactionSafetyError {
 	return &CompactionSafetyError{msg: msg, Namespace: ns, Blocker: blocker, Reason: reason}
 }
+
+// HeadConflictError reports that a branch head moved between the moment a writer read it and
+// the moment that writer tried to append onto it - the compare-and-swap AppendCommit performs
+// against the parent it was handed.
+//
+// Before this existed, the append simply succeeded and overwrote the branch head: two writers
+// racing on the same stale head each produced a valid commit, but only the later one stayed
+// reachable from the branch. The earlier writer was told its commit succeeded while its commit
+// was silently orphaned - no error anywhere, and the data only "missing" on the next read.
+// A conflict a client can see and retry is strictly better than a lost write it cannot.
+type HeadConflictError struct {
+	Namespace string
+	Branch    string
+	// Expected is the head the writer planned against; Actual is where the branch had already
+	// moved to by the time the append ran.
+	Expected codec.Hash
+	Actual   codec.Hash
+}
+
+func (e *HeadConflictError) Error() string {
+	return "branch " + e.Branch + " moved from " + e.Expected.Hex() + " to " + e.Actual.Hex() +
+		" while the commit was being prepared"
+}
+
+func (e *HeadConflictError) Code() kdberr.Code { return kdberr.Conflict }
+
+func NewHeadConflictError(ns, branch string, expected, actual codec.Hash) *HeadConflictError {
+	return &HeadConflictError{Namespace: ns, Branch: branch, Expected: expected, Actual: actual}
+}
