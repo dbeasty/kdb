@@ -4,6 +4,14 @@
 
 Document version: **v0.9**
 
+> **Companion documents.** This file is the *normative* design and roadmap. For what the code
+> actually does today, read the [high-level architecture](kdb-architecture.md) (system shape,
+> decisions, quality attributes) and the [low-level design](kdb-lld.md) —
+> [components](kdb-lld-components.md), [flows](kdb-lld-flows.md),
+> [concurrency](kdb-lld-concurrency.md), [storage formats](kdb-lld-storage.md),
+> [KDB-SQL](kdb-lld-query.md), [protocol and operations](kdb-lld-protocol.md). Usage lives in the
+> [user guide](kdb-user-guide.md).
+
 -----
 
 ## 0. Session State — Read This First
