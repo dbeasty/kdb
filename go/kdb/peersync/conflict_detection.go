@@ -112,6 +112,11 @@ func divergenceLockFor(namespaceID string) *sync.Mutex {
 // from either side into d before calling this ("putCommit always stores" - history is never
 // lost, only the branch-pointer decision is gated).
 //
+// localHead must be where "main" actually points - both real callers pass d.Head(). The
+// auto-merge path compare-and-swaps against it (AppendMergeCommit), so a stale localHead is
+// refused with a *dag.HeadConflictError rather than quietly re-pointing main off whatever landed
+// in the meantime.
+//
 // Serialized per namespace: this function reads the head, decides, and only then mutates the DAG
 // across several non-atomic calls. Two concurrent callers sharing one dag (two connections
 // pushing to the same host, or a push racing a pull) could otherwise both read the same stale

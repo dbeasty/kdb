@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -51,10 +52,66 @@ func ListenStreamTLS(addr string, runtime *KdbServerRuntime, namespaceID string,
 	return hub, l, nil
 }
 
+// subscriberQueueDepth is how many DeltaCommit frames one subscriber may fall behind before
+// Publish starts dropping them. Sized to absorb a normal burst of commits (a batch import, a
+// compaction's worth of deltas) without ever letting one connection's socket backpressure reach
+// the writer that produced the commit.
+const subscriberQueueDepth = 256
+
 type registeredSubscriber struct {
 	nodeID  string
 	conn    stream.ConnectionHandle
 	lastAck *codec.Hash
+
+	// outbound is this subscriber's own queue, drained by its own goroutine (sendLoop). Publish
+	// only ever hands frames to this channel, never to conn.Send: socketConnection.Send does a
+	// blocking write on the TCP socket while holding that connection's mutex, so fanning out
+	// inline meant one subscriber whose receive window had filled up stalled the whole fan-out -
+	// and with it the goroutine that had just committed, which calls Publish through
+	// KdbServerRuntime.CommitListener while still holding its admission grant. "Best-effort,
+	// non-blocking" was the documented contract; this is what actually makes it true.
+	outbound chan []byte
+	// stop is closed exactly once, when this subscriber is unregistered, to retire sendLoop.
+	stop     chan struct{}
+	stopOnce sync.Once
+	// dropped counts frames Publish could not queue because outbound was full. A subscriber that
+	// cannot keep up misses frames by design - but silently missing them is not the same as
+	// missing them visibly, and this is the only signal that a client's view has a hole in it
+	// that it needs to resync (reconnect with LocalHeads) to close.
+	dropped atomic.Int64
+}
+
+// enqueue hands frame to this subscriber's sender goroutine without ever blocking. A full queue
+// means the subscriber is not keeping up: the frame is dropped and counted rather than allowed
+// to hold up every other subscriber and the committing writer behind it.
+func (s *registeredSubscriber) enqueue(frame []byte) {
+	select {
+	case <-s.stop:
+	case s.outbound <- frame:
+	default:
+		s.dropped.Add(1)
+	}
+}
+
+func (s *registeredSubscriber) retire() {
+	s.stopOnce.Do(func() { close(s.stop) })
+}
+
+// sendLoop is one goroutine per subscriber, and the only place conn.Send is called for fan-out
+// frames. A send that fails means the connection is gone: unregister it (which retires this
+// loop) rather than spinning on a dead socket.
+func (h *StreamHub) sendLoop(sub *registeredSubscriber) {
+	for {
+		select {
+		case <-sub.stop:
+			return
+		case frame := <-sub.outbound:
+			if err := sub.conn.Send(frame); err != nil {
+				h.unregister(sub.conn)
+				return
+			}
+		}
+	}
 }
 
 // StreamHub fans out DeltaCommit frames to every currently-connected Mode 1/2 subscriber for one
@@ -80,9 +137,11 @@ func NewStreamHub(w wire.Codec, namespaceID string, runtime *KdbServerRuntime) *
 	return &StreamHub{wire: w, namespaceID: namespaceID, runtime: runtime, correlation: 5000}
 }
 
-// Publish broadcasts commit as a DeltaCommit frame to every currently-registered subscriber,
-// unregistering any connection whose Send fails - a slow or dead subscriber must not block or
-// crash the publisher, matching StreamBroadcastHub.publish's own best-effort fan-out.
+// Publish broadcasts commit as a DeltaCommit frame to every currently-registered subscriber and
+// returns without waiting for any of them - a slow or dead subscriber must not block or crash the
+// publisher, matching StreamBroadcastHub.publish's own best-effort fan-out. Each subscriber has
+// its own bounded queue and its own sender goroutine; a subscriber that cannot drain fast enough
+// loses frames (counted in DroppedFrames) instead of applying backpressure to the writer.
 func (h *StreamHub) Publish(commit stream.PublishedCommit) {
 	h.mu.Lock()
 	cid := h.correlation
@@ -106,10 +165,21 @@ func (h *StreamHub) Publish(commit stream.PublishedCommit) {
 		return
 	}
 	for _, sub := range targets {
-		if err := sub.conn.Send(frame); err != nil {
-			h.unregister(sub.conn)
-		}
+		sub.enqueue(frame)
 	}
+}
+
+// DroppedFrames reports how many DeltaCommit frames have been dropped across all subscribers
+// currently registered, because they could not keep up with the fan-out. Non-zero means at least
+// one client's view has a gap in it and needs to reconnect (with its LocalHeads) to resync.
+func (h *StreamHub) DroppedFrames() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var total int64
+	for _, sub := range h.subscribers {
+		total += sub.dropped.Load()
+	}
+	return total
 }
 
 func (h *StreamHub) run(conn stream.ConnectionHandle) {
@@ -161,10 +231,18 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 			resume = &parsed
 		}
 	}
+	sub := &registeredSubscriber{
+		nodeID:   msg.Request.NodeID,
+		conn:     conn,
+		lastAck:  resume,
+		outbound: make(chan []byte, subscriberQueueDepth),
+		stop:     make(chan struct{}),
+	}
 	h.mu.Lock()
 	h.removeConnLocked(conn)
-	h.subscribers = append(h.subscribers, &registeredSubscriber{nodeID: msg.Request.NodeID, conn: conn, lastAck: resume})
+	h.subscribers = append(h.subscribers, sub)
 	h.mu.Unlock()
+	go h.sendLoop(sub)
 
 	ack := wire.HandshakeAckMessage{
 		H: wire.Header{MessageType: wire.MsgHandshake, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: msg.H.CorrelationID},
@@ -245,7 +323,12 @@ func (h *StreamHub) removeConnLocked(conn stream.ConnectionHandle) {
 	for _, sub := range h.subscribers {
 		if sub.conn != conn {
 			kept = append(kept, sub)
+			continue
 		}
+		// Retire the sender goroutine along with the registration, or a re-handshake on the same
+		// connection (removeConnLocked's other caller) would leave the old one running and two
+		// goroutines writing interleaved frames to the same socket.
+		sub.retire()
 	}
 	h.subscribers = kept
 }

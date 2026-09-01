@@ -6,14 +6,12 @@ import dev.kdb.query.hybrid.ReadConsistency
 import dev.kdb.transaction.TransactionBuilder
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.util.concurrent.atomic.AtomicInteger
 
 public class SessionManager(
     private val server: KdbServerRuntime,
 ) {
     private val mutex = Mutex()
     private val sessions = mutableMapOf<String, KdbSession>()
-    private val idSeq = AtomicInteger()
 
     public suspend fun begin(
         namespaceId: String,
@@ -26,7 +24,14 @@ public class SessionManager(
             baseVersionHex?.let { KdbHash.fromHex(it) }
                 ?: server.runtime.dag.head()
         require(server.runtime.dag.hasCommit(head)) { "unknown base version: $baseVersionHex" }
-        val id = SessionId(sessionId ?: "sess-${idSeq.incrementAndGet()}")
+        // Minted from the *runtime's* counter, not this manager's. Each connection gets its own
+        // SessionManager, so a per-manager counter handed every connection its own "sess-1" -
+        // harmless while session ids were only ever looked up within their own connection, but
+        // documentLocks is runtime-global and keys ownership by session id. Two connections both
+        // calling themselves "sess-1" were therefore treated as one holder: each could take locks
+        // the other held, and either could release the other's. Ports the same fix Go's
+        // SessionManager.Begin already carries (KdbServerRuntime.nextSessionOrdinal).
+        val id = SessionId(sessionId ?: "sess-${server.nextSessionOrdinal()}")
         val readPin =
             when (readConsistency) {
                 ReadConsistency.SNAPSHOT -> head

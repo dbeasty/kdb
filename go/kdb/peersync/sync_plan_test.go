@@ -28,6 +28,13 @@ func TestCommitsToPushIncludesMergeCommitsBothParents(t *testing.T) {
 	localTip := writeDocAt(t, local, ns, genesis, docA, `{"origin":"local"}`, codec.TimestampFromEpochMicros(1_000))
 	remoteTip := writeDocAt(t, local, ns, genesis, docB, `{"origin":"remote"}`, codec.TimestampFromEpochMicros(2_000))
 
+	// Both tips were appended detached, so main is wherever the last one landed. Point it at
+	// the local tip, which is what "localHead" means to ResolveDivergence's real callers - they
+	// pass d.Head(), and the auto-merge compare-and-swaps against it.
+	if err := local.dag.SetHead("main", localTip.Hash); err != nil {
+		t.Fatalf("set head to local tip: %v", err)
+	}
+
 	// The merge commit a divergence resolution would create: parents = both tips.
 	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localTip.Hash, remoteTip.Hash, ResolutionOptions{})
 	if err != nil {
@@ -83,6 +90,10 @@ func TestLastWriteMergeCommitCarriesTheWinningWrite(t *testing.T) {
 	// Local write is LATER (wins); remote write earlier (loses).
 	localTip := writeDocAt(t, local, ns, genesis, docID, `{"winner":"local"}`, codec.TimestampFromEpochMicros(2_000))
 	remoteTip := writeDocAt(t, local, ns, genesis, docID, `{"winner":"remote"}`, codec.TimestampFromEpochMicros(1_000))
+
+	if err := local.dag.SetHead("main", localTip.Hash); err != nil {
+		t.Fatalf("set head to local tip: %v", err)
+	}
 
 	outcome, err := ResolveDivergence(local.dag, local.storage, ns, localTip.Hash, remoteTip.Hash, ResolutionOptions{
 		Policy: transaction.ConflictPolicyLastWrite,

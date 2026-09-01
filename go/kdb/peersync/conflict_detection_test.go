@@ -39,6 +39,10 @@ func forkTwoSides(t *testing.T, ns string) (side, side) {
 	return side{dag: d1, storage: mem.NewInMemoryStorageAdapter()}, side{dag: d2, storage: mem.NewInMemoryStorageAdapter()}
 }
 
+// writeDoc appends a write commit onto parent. Detached: divergence is the whole subject here -
+// two sides writing from the same shared parent, a delete and a write racing off one seed commit -
+// so appending onto something that is not the branch tip is the fixture being built, not the lost
+// compare-and-swap AppendCommit exists to catch.
 func writeDoc(t *testing.T, s side, ns string, parent codec.Hash, docID codec.UUID, json string) document.Commit {
 	t.Helper()
 	if err := s.storage.PutDocument(ns, document.Document{ID: docID, JSON: json}); err != nil {
@@ -60,7 +64,7 @@ func writeDoc(t *testing.T, s side, ns string, parent codec.Hash, docID codec.UU
 		Timestamp:    codec.TimestampNow(),
 		AuthorNodeID: authorID,
 	}
-	commit, err := s.dag.AppendCommit(tx, parent, tree, nil, "test write")
+	commit, err := s.dag.AppendCommitDetached(tx, parent, tree, nil, "test write")
 	if err != nil {
 		t.Fatalf("appendCommit: %v", err)
 	}
@@ -91,7 +95,7 @@ func writeDocAt(t *testing.T, s side, ns string, parent codec.Hash, docID codec.
 		Timestamp:    ts,
 		AuthorNodeID: authorID,
 	}
-	commit, err := s.dag.AppendCommit(tx, parent, tree, nil, "test write")
+	commit, err := s.dag.AppendCommitDetached(tx, parent, tree, nil, "test write")
 	if err != nil {
 		t.Fatalf("appendCommit: %v", err)
 	}
@@ -522,7 +526,7 @@ func TestResolveDivergenceClassifiesDeleteWriteConflict(t *testing.T) {
 		Timestamp:    codec.TimestampNow(),
 		AuthorNodeID: authorID,
 	}
-	localC, err := local.dag.AppendCommit(deleteTx, seedC.Hash, tree, nil, "test delete")
+	localC, err := local.dag.AppendCommitDetached(deleteTx, seedC.Hash, tree, nil, "test delete")
 	if err != nil {
 		t.Fatalf("appendCommit(delete): %v", err)
 	}

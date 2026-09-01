@@ -38,7 +38,20 @@ public object InMemoryWireTransportHub {
         return h.createConnection()
     }
 
-    internal suspend fun dispatchToServer(hubName: String, frame: ByteArray) {
+    /**
+     * Hands [frame] to [hubName]'s server handler, as though a client had sent it. The in-process
+     * counterpart of a server receiving a frame off a socket, and the entry point a host without
+     * its own transport drives this hub through.
+     *
+     * Public, not `internal`, and it has to be: Kotlin/JS mangles internal names with a per-module
+     * salt, and `commonTest` compiles as its own module even though associate-compilation makes
+     * internals *visible* to it. A call from a test therefore emitted a mangled name that does not
+     * exist in the main module's JS output, and only blew up at runtime -
+     * `dispatchToServer_2szq8w_k$ is not a function` on both `js, node` and `js, browser`, while
+     * every JVM target passed. [hub] and [serverSend], the other two members a caller outside this
+     * file touches, were already public; this one was the odd one out.
+     */
+    public suspend fun dispatchToServer(hubName: String, frame: ByteArray) {
         hub(hubName).serverHandler?.invoke(frame)
     }
 

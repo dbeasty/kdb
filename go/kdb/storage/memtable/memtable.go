@@ -142,11 +142,11 @@ func (mgr *Manager) Put(key codec.Hash, value []byte) {
 	mgr.active.Put(key, value)
 }
 
-// Delete tombstones key in the active memtable. The tombstone hides any value in the
-// generation being flushed and in the blob store, but is dropped at the next flush: the
-// SSTable format has no deleted marker, so a delete of a key that is already in an SSTable
-// only holds for as long as the tombstone lives in memory. Persisting tombstones needs an
-// SSTable format change, which per docs/go-porting.md has to originate on the Kotlin side.
+// Delete tombstones key in the active memtable. The tombstone hides any value in the generation
+// being flushed and in the blob store, and survives the flush: Flush writes it into the SSTable
+// as a real delete marker (see sstable.BlockHandle.Deleted), so a delete of an already-flushed
+// key stays deleted. It used to hold only for as long as the tombstone lived in memory - the
+// flush dropped it and the value came straight back from the SSTable underneath.
 func (mgr *Manager) Delete(key codec.Hash) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
@@ -172,7 +172,10 @@ func (mgr *Manager) Get(key codec.Hash) []byte {
 			return v
 		}
 	}
-	return mgr.blobStore.Get(key)
+	// LsmBlobStore.Lookup stops at the newest table with an opinion, tombstone included, rather
+	// than searching for the first non-nil value.
+	v, _, _ := mgr.blobStore.Lookup(key)
+	return v
 }
 
 // Flush writes the active memtable out as an SSTable and starts a fresh one. pendingFlush is
@@ -193,10 +196,15 @@ func (mgr *Manager) Flush(level int) (sstable.Handle, error) {
 	writer := sstable.NewDefaultWriter(mgr.io, mgr.namespaceID, level)
 	count := 0
 	for _, e := range snap.snapshotEntries() {
+		// Tombstones are written, not skipped. Skipping them is what made a delete of an
+		// already-flushed key temporary: the tombstone lived only in the memtable, so the next
+		// flush erased the only record that the key had been deleted, and the value reappeared
+		// from the SSTable it had been flushed into earlier.
 		if e.deleted {
-			continue
+			writer.Delete(e.key)
+		} else {
+			writer.Put(e.key, e.value)
 		}
-		writer.Put(e.key, e.value)
 		count++
 	}
 	if count == 0 {

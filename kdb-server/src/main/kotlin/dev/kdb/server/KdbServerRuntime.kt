@@ -29,6 +29,19 @@ public class KdbServerRuntime(
     // internal (not private): ServerRuntimeRegistry.release, in the same module, needs to read
     // the post-release count to decide whether to evict its map entry - see its doc comment.
     internal val refCount = AtomicInteger(1)
+
+    /**
+     * Mints session identities unique across every connection this runtime serves. It has to live
+     * here rather than on [SessionManager] because a SessionManager is created per connection
+     * (see `sqlWireHostFactory`) while [documentLocks] is runtime-global and keys lock ownership
+     * by session identity: a per-manager counter handed every connection's first session the same
+     * `sess-1`, so two unrelated connections were one lock holder - each able to take locks the
+     * other already held, and each `releaseAll` dropping the other's mid-transaction. Mirrors Go's
+     * KdbServerRuntime.sessionSeq / nextSessionOrdinal.
+     */
+    private val sessionOrdinal = AtomicInteger()
+
+    internal fun nextSessionOrdinal(): Int = sessionOrdinal.incrementAndGet()
     private val closeMutex = Mutex()
     private val engineMutex = Mutex()
     private val engines = mutableMapOf<String, TransactionEngine>()

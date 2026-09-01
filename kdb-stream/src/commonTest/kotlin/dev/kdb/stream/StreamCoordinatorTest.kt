@@ -6,12 +6,14 @@ import dev.kdb.index.indexManager
 import dev.kdb.index.memoryIndexStoreFactory
 import dev.kdb.storage.mem.InMemoryStorageAdapter
 import dev.kdb.wire.defaultWireCodec
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class StreamCoordinatorTest {
     @Test
     fun publishDeliversDeltaToSubscriber() =

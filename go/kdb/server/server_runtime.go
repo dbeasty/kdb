@@ -75,16 +75,19 @@ type KdbServerRuntime struct {
 	schemaMu sync.RWMutex
 
 	// writeGate serializes calls into TransactionEngine.Commit - the same load-bearing
-	// exclusion a bare sync.Mutex would give (transaction.Engine.Commit reads the DAG head,
-	// runs conflict detection against it, and only then appends the new commit -
-	// InMemoryCommitDag.AppendCommit advances the branch head unconditionally, with no
-	// compare-and-swap against the anchor it was given, so two goroutines racing on the same
-	// stale head would silently orphan one of them from "main" instead of surfacing a conflict),
-	// plus a bounded queue and a per-caller deadline a bare mutex can't express (see writeGate's
-	// own doc comment, kdb-spec-layer13 Component 49 §6.2 - "start only what we can finish"
-	// applied to time). Any other caller that invokes Engine.Commit concurrently on a shared
-	// *InMemoryCommitDag without equivalent serialization has the same exposure (worth a
-	// follow-up in the transaction/dag packages themselves).
+	// exclusion a bare sync.Mutex would give (transaction.Engine.Commit reads the DAG head, runs
+	// conflict detection against it, and only then appends the new commit, none of it holding
+	// the DAG lock), plus a bounded queue and a per-caller deadline a bare mutex can't express
+	// (see writeGate's own doc comment, kdb-spec-layer13 Component 49 §6.2 - "start only what we
+	// can finish" applied to time).
+	//
+	// It is no longer the only thing standing between two racing writers and a lost write:
+	// InMemoryCommitDag.AppendCommit now compare-and-swaps the branch head against the anchor it
+	// was given, so a writer that lost the race gets a *dag.HeadConflictError instead of an
+	// acknowledged-but-orphaned commit. The gate is still what keeps that from being the normal
+	// outcome under load - it makes writers queue rather than collide - and it is what an
+	// embedded caller driving Engine.Commit on a shared *InMemoryCommitDag still wants for
+	// throughput, but the correctness floor is in the DAG itself now.
 	writeGate *writeGate
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.

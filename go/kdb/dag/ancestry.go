@@ -72,8 +72,36 @@ func (d *InMemoryCommitDag) AncestorSet(hash codec.Hash) map[codec.Hash]struct{}
 	return d.ancestorClosureLocked(hash)
 }
 
-// AppendMergeCommit appends a merge commit with two parents.
+// AppendMergeCommit appends a merge commit with two parents, advancing the default branch to it
+// only if the branch is still at primaryParent - the same compare-and-swap AppendCommit performs,
+// and for the same reason: a merge is planned against a head that is read well before this call
+// (peer-sync resolves an incoming push against the local head, then appends), so an unconditional
+// advance here loses whatever landed in between.
+//
+// Use AppendMergeCommitOnto when the branch is deliberately somewhere other than primaryParent,
+// or when there is no head to swap against at all.
 func (d *InMemoryCommitDag) AppendMergeCommit(
+	tx document.Transaction,
+	primaryParent, mergedParent codec.Hash,
+	newDocumentTree document.DocumentTree,
+	schemaHash *codec.Hash,
+	message string,
+) (document.Commit, error) {
+	return d.AppendMergeCommitOnto(&primaryParent, tx, primaryParent, mergedParent, newDocumentTree, schemaHash, message)
+}
+
+// AppendMergeCommitOnto is AppendMergeCommit for a merge whose primary parent is deliberately not
+// where the branch currently points, so the compare-and-swap is made against expectedHead instead.
+// transaction.Engine.Merge is the case this exists for: it replays each branch commit onto the
+// tip first (which walks the branch head forward through a chain of scratch commits) and then
+// caps the result with a two-parent marker rooted back at the original primary head. The branch
+// head it must not have lost is the tip of that replay chain, not the marker's own parent.
+//
+// A nil expectedHead skips the compare-and-swap entirely, for a caller assembling a commit graph
+// of an explicit shape (test fixtures, a restore replaying recorded history) where "the branch is
+// not where this merge starts" is the point rather than a race.
+func (d *InMemoryCommitDag) AppendMergeCommitOnto(
+	expectedHead *codec.Hash,
 	tx document.Transaction,
 	primaryParent, mergedParent codec.Hash,
 	newDocumentTree document.DocumentTree,
@@ -82,7 +110,7 @@ func (d *InMemoryCommitDag) AppendMergeCommit(
 ) (document.Commit, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.appendCommitLocked(tx, []codec.Hash{primaryParent, mergedParent}, newDocumentTree, schemaHash, message, mainBranch)
+	return d.appendCommitLocked(tx, []codec.Hash{primaryParent, mergedParent}, newDocumentTree, schemaHash, message, mainBranch, expectedHead)
 }
 
 func (d *InMemoryCommitDag) expandParentsLocked(hash codec.Hash) []codec.Hash {

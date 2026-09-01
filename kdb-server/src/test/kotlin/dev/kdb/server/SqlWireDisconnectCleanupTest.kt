@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -84,10 +85,67 @@ class SqlWireDisconnectCleanupTest {
             loopB.join()
         }
 
+    /**
+     * Two connections that both let the server name their session used to end up as the same lock
+     * holder: the id counter lived on [SessionManager], which is created per connection, so every
+     * connection's first session was `sess-1` - while [KdbServerRuntime.documentLocks] is
+     * runtime-global and keys ownership by that string. Connection B could therefore walk straight
+     * through a lock connection A was holding (the manager saw `owner == sessionId` and granted
+     * it), and either side's `releaseAll` dropped the other's locks mid-transaction. Ids now come
+     * from [KdbServerRuntime.nextSessionOrdinal] - the same fix Go's SessionManager already
+     * carries, ported here.
+     */
+    @Test
+    fun twoConnectionsLettingTheServerNameTheirSessionAreNotOneLockHolder() =
+        runTest {
+            val ns = "demo/users"
+            val schema =
+                KdbSchema.build(
+                    listOf(
+                        SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true),
+                        SchemaField("name", KdbFieldType.StringType, required = true, indexed = false),
+                    ),
+                )
+            val runtime = openMemoryRuntime("demo", ns, schema)
+            putJson(runtime, ns, """{"userId":"u1","name":"Alice"}""")
+            val server = KdbServerRuntime(runtime)
+            val hostFactory = sqlWireHostFactory(wire, server, ns)
+
+            val hostA = hostFactory(ConnectionContext.EMPTY)
+            val connA = FakeWireConnection()
+            val loopA = launch { pipelinedPerConnection(connA, hostA) }
+            val sessionA = sessionBegin(connA, ns, null, 1)
+
+            val hostB = hostFactory(ConnectionContext.EMPTY)
+            val connB = FakeWireConnection()
+            val loopB = launch { pipelinedPerConnection(connB, hostB) }
+            val sessionB = sessionBegin(connB, ns, null, 10)
+
+            // The visible symptom of the old bug, before anything else happens.
+            assertNotEquals(
+                sessionA.sessionId,
+                sessionB.sessionId,
+                "two connections were handed the same session id",
+            )
+
+            execSql(connA, ns, sessionA.sessionId, 2, "BEGIN")
+            execSql(connA, ns, sessionA.sessionId, 3, "UPDATE users SET name = 'Held' WHERE userId = 'u1'")
+
+            execSql(connB, ns, sessionB.sessionId, 11, "BEGIN")
+            val blocked = execSql(connB, ns, sessionB.sessionId, 12, "UPDATE users SET name = 'Other' WHERE userId = 'u1'")
+            assertNotNull(blocked.error, "connection B wrote through a lock connection A holds")
+            assertTrue(blocked.error!!.contains("locked", ignoreCase = true), "unexpected error: ${blocked.error}")
+
+            connA.close()
+            loopA.join()
+            connB.close()
+            loopB.join()
+        }
+
     private suspend fun sessionBegin(
         conn: FakeWireConnection,
         ns: String,
-        sessionId: String,
+        sessionId: String?,
         corr: Int,
     ): WireMessage.SessionBeginAck {
         val frame =

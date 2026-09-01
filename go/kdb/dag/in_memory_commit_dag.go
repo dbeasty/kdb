@@ -457,6 +457,21 @@ func (d *InMemoryCommitDag) Diff(fromHash, toHash codec.Hash) (CommitDiff, error
 	return CommitDiff{FromHash: fromHash, ToHash: toHash, Entries: entries}, nil
 }
 
+// AppendCommit appends a commit onto parentHash and advances the default branch to it, but only
+// if the branch is still at parentHash - the compare-and-swap this used to lack.
+//
+// Every caller reaches here the same way: read Head, plan a transaction against it (conflict
+// detection, schema validation, staging writes), then append with that head as the parent. None
+// of that planning holds the DAG lock, so between the read and this call another writer can
+// advance the branch. Advancing unconditionally then meant the loser's commit was stored but
+// unreachable from the branch - an acknowledged write that had silently vanished. Refusing with
+// a *HeadConflictError instead turns that into something the caller can see and retry against
+// the new head. The server serializes writers through its writeGate so this should not fire
+// there; it is the guarantee for everyone else (embedded callers, peer sync, direct API use)
+// who has no such gate.
+//
+// Use AppendCommitDetached for the deliberate exception: re-pointing the branch at a commit
+// built somewhere other than its current tip.
 func (d *InMemoryCommitDag) AppendCommit(
 	tx document.Transaction,
 	parentHash codec.Hash,
@@ -466,7 +481,36 @@ func (d *InMemoryCommitDag) AppendCommit(
 ) (document.Commit, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.appendCommitLocked(tx, []codec.Hash{parentHash}, newDocumentTree, schemaHash, message, mainBranch)
+	return d.appendCommitLocked(tx, []codec.Hash{parentHash}, newDocumentTree, schemaHash, message, mainBranch, &parentHash)
+}
+
+// AppendCommitDetached is AppendCommit without the head compare-and-swap: it appends onto
+// parentHash and re-points the default branch there regardless of where the branch currently is.
+// This is for the operations that are deliberately non-linear - replaying a transaction onto an
+// explicitly named target commit, rewinding a branch onto a rebuilt history - where "the parent
+// is not the current head" is the request, not a race. Anything that means "extend the tip"
+// wants AppendCommit.
+func (d *InMemoryCommitDag) AppendCommitDetached(
+	tx document.Transaction,
+	parentHash codec.Hash,
+	newDocumentTree document.DocumentTree,
+	schemaHash *codec.Hash,
+	message string,
+) (document.Commit, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.appendCommitLocked(tx, []codec.Hash{parentHash}, newDocumentTree, schemaHash, message, mainBranch, nil)
+}
+
+// HeadIs reports whether the default branch is currently at hash. A cheap pre-flight for a
+// caller about to do expensive planning work against a head it just read: it does not remove
+// the need for AppendCommit's compare-and-swap (the branch can still move immediately after
+// this returns), it just lets an already-lost writer stop before staging anything.
+func (d *InMemoryCommitDag) HeadIs(hash codec.Hash) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	b, ok := d.branches[mainBranch]
+	return ok && b.HeadHash == hash
 }
 
 func (d *InMemoryCommitDag) appendCommitLocked(
@@ -476,10 +520,25 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	schemaHash *codec.Hash,
 	message string,
 	branchToAdvance string,
+	expectedHead *codec.Hash,
 ) (document.Commit, error) {
 	for _, p := range parents {
 		if err := d.requireCommitPresentLocked(p); err != nil {
 			return document.Commit{}, err
+		}
+	}
+	// The compare-and-swap, checked before anything is written: a caller that planned against a
+	// head the branch has since moved off gets a conflict, not a silently orphaned commit. nil
+	// means the caller is deliberately re-pointing the branch (see AppendCommitDetached).
+	if expectedHead != nil {
+		current, ok := d.branches[branchToAdvance]
+		if !ok {
+			return document.Commit{}, NewBranchNotFoundError("branch not found", d.NamespaceID, branchToAdvance)
+		}
+		if current.HeadHash != *expectedHead {
+			return document.Commit{}, NewHeadConflictError(
+				d.NamespaceID, branchToAdvance, *expectedHead, current.HeadHash,
+			)
 		}
 	}
 	d.trees[newDocumentTree.TreeHash] = newDocumentTree
