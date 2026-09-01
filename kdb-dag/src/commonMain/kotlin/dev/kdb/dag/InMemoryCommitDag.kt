@@ -33,6 +33,8 @@ internal class InMemoryCommitDag(
      * (getCommitByTransactionId, used by DefaultTransactionEngine.findExistingCommit) is O(1)
      * instead of walking history - see getCommitByTransactionId's own doc comment. */
     private val txIndex = LinkedHashMap<KdbUuid, KdbHash>()
+    /** Live retention pins, keyed by commit hash, ref-counted. See [CommitDag.pin]. */
+    private val pins = LinkedHashMap<KdbHash, Int>()
 
     init {
         trees[DocumentTree.EMPTY.treeHash] = DocumentTree.EMPTY
@@ -167,13 +169,13 @@ internal class InMemoryCommitDag(
         archiveLocation: String,
     ): CommitStub =
         mutex.withLock {
-            val commit =
-                commits.remove(hash)
-                    ?: throw DagConsistencyException(
-                        "cannot stub unknown commit",
-                        namespaceId,
-                        hash,
-                    )
+            if (hash !in commits) {
+                throw DagConsistencyException("cannot stub unknown commit", namespaceId, hash)
+            }
+            // Archiving is a reclamation like squashing: a stub satisfies requireCommitPresentLocked
+            // but not getCommitOrThrow, so a reader pinned here would start failing. Same refusal.
+            assertUnpinnedLocked(hash, "archive requested")
+            val commit = commits.remove(hash)!!
             removeHex(hash.toHex())
             val stub =
                 CommitStub(
@@ -184,6 +186,32 @@ internal class InMemoryCommitDag(
             stubs[hash] = stub
             stub
         }
+
+    override suspend fun pin(hash: KdbHash): suspend () -> Unit {
+        mutex.withLock { pins[hash] = (pins[hash] ?: 0) + 1 }
+        // released is only ever touched while holding mutex (below), so - like the pins map
+        // itself - it needs no separate synchronization of its own.
+        var released = false
+        return {
+            mutex.withLock {
+                if (!released) {
+                    released = true
+                    val n = pins[hash] ?: 0
+                    if (n <= 1) pins.remove(hash) else pins[hash] = n - 1
+                }
+            }
+        }
+    }
+
+    override suspend fun isPinned(hash: KdbHash): Boolean = mutex.withLock { pins.containsKey(hash) }
+
+    override suspend fun pinnedCount(): Int = mutex.withLock { pins.size }
+
+    /** Refuses a reclamation that would strand a live reader. Caller must hold [mutex]. */
+    private fun assertUnpinnedLocked(hash: KdbHash, detail: String) {
+        if (hash !in pins) return
+        throw CompactionSafetyException("commit is pinned by a live reader", namespaceId, hash, detail)
+    }
 
     override suspend fun getDocumentTree(treeHash: KdbHash): DocumentTree? = mutex.withLock { trees[treeHash] }
 
@@ -593,6 +621,13 @@ internal class InMemoryCommitDag(
                         "branch=${b.name}",
                     )
                 }
+            }
+            // Readers are a retention root too. A branch head is the only pin the window check
+            // used to know about, which left every open SNAPSHOT read and every queued commit's
+            // base version free to be squashed out from under it - they are not branch heads,
+            // and until pin() existed there was nowhere to look them up. See CommitDag.pin.
+            for (h in squashHashes) {
+                assertUnpinnedLocked(h, "inside squash window")
             }
             val syntheticTx = KdbUuid.fromString("00000000-0000-4000-8000-000000000003")
             val syntheticAuthor = KdbUuid.fromString("00000000-0000-4000-8000-000000000004")

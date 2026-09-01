@@ -45,6 +45,8 @@ internal data class DocumentGetResultDto(
     val json: String? = null,
     val commitHex: String,
     val error: String? = null,
+    val errorCode: String? = null,
+    val retryAfterMs: Int? = null,
 )
 
 @Serializable
@@ -128,6 +130,8 @@ internal data class TransactionReplayDto(
 internal data class ConflictReportDto(
     val namespace: String,
     val reportBytes: ByteArray,
+    val errorCode: String? = null,
+    val retryAfterMs: Int? = null,
 )
 
 @Serializable

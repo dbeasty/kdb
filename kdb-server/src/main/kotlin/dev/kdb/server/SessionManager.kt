@@ -37,6 +37,9 @@ public class SessionManager(
                 ReadConsistency.SNAPSHOT -> head
                 ReadConsistency.READ_COMMITTED, ReadConsistency.READ_YOUR_WRITES -> null
             }
+        // Pin before publishing the session: an unpinned readPin is a window in which the
+        // commit it names could be reclaimed before anything protects it. See CommitDag.pin.
+        val pinRelease = readPin?.let { server.runtime.dag.pin(it) }
         val session =
             KdbSession(
                 id = id,
@@ -46,6 +49,7 @@ public class SessionManager(
                 readConsistency = readConsistency,
                 pending = null,
                 principal = principal,
+                pinRelease = pinRelease,
             )
         mutex.withLock { sessions[id.value] = session }
         return session
@@ -54,10 +58,17 @@ public class SessionManager(
     public suspend fun get(sessionId: String): KdbSession? = mutex.withLock { sessions[sessionId] }
 
     public suspend fun end(sessionId: String) {
-        mutex.withLock {
-            sessions.remove(sessionId)?.let {
-                server.documentLocks.releaseAll(sessionId)
-            }
+        val removed = mutex.withLock { sessions.remove(sessionId) }
+        if (removed != null) {
+            server.documentLocks.releaseAll(sessionId)
+            // Outside mutex, deliberately - dag.pin's release takes the DAG's own lock, and
+            // holding the session map's lock across that would nest one lock inside the other
+            // for no reason. Safe unordered: the map remove above is what claims the right to
+            // release, so a concurrent end() for the same id finds nothing and releases nothing.
+            // Without this a session whose connection dropped mid-transaction would hold a
+            // commit against compaction for the process lifetime - the read-side twin of the
+            // document locks released just above.
+            removed.pinRelease?.invoke()
         }
     }
 

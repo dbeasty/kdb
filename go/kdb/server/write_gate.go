@@ -93,10 +93,18 @@ func (g *writeGate) meanServiceTime() time.Duration {
 	return time.Duration(g.serviceNanos.Load())
 }
 
-// queueDepth returns how many callers hold a queued slot right now - waiters plus the one
-// running. This is the number that says how stale a queued writer's base version is about to
-// be: every commit that drains ahead of it advances the head it was anchored on.
-func (g *writeGate) queueDepth() int { return len(g.queued) }
+// queueDepth returns how many callers are waiting plus the one running right now. This is the
+// number that says how stale a queued writer's base version is about to be: every commit that
+// drains ahead of it advances the head it was anchored on.
+//
+// len(g.queued) alone undercounts by one while a commit is actually running: acquire's queued
+// slot is released by its own deferred func the instant acquire *returns*, which for the
+// success path happens as soon as the caller enters running - well before its commit, and the
+// release that would decrement g.running, has happened. So a caller holding the running slot no
+// longer holds a queued slot at all, and len(g.queued) alone reports only the callers still
+// waiting behind it. len(g.running) is 0 or 1 by construction (capacity-1 channel) and adds
+// exactly the one queueDepth's own doc comment always claimed to include.
+func (g *writeGate) queueDepth() int { return len(g.queued) + len(g.running) }
 
 // quiesced reports whether no caller currently holds a queued or running slot - i.e. every
 // admitted write has finished. Only meaningful once new admissions are being rejected (see

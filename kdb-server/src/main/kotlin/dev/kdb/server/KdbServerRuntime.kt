@@ -59,18 +59,31 @@ public class KdbServerRuntime(
         schema: KdbSchema = runtime.schema,
         sessionId: String? = null,
         authorizer: WriteAuthorizer? = null,
-    ): KdbCommit =
-        writeCoordinator.run {
-            commitViaEngine(
-                runtime,
-                namespaceId,
-                transaction,
-                schema,
-                effectiveEngine(namespaceId, authorizer),
-                documentLocks = documentLocks,
-                sessionId = sessionId,
-            )
+    ): KdbCommit {
+        // The base version has to survive the queue, not just the commit. It was resolved by the
+        // caller before this call and is not consulted until the engine's commit runs at the
+        // front of writeCoordinator, which can be a long way behind other callers - and commit
+        // throws if it has been reclaimed by then. Nothing else roots it: a base version is not
+        // a branch head. Pinned before entering the coordinator, mirroring Go's runTransaction
+        // (replay needs no equivalent - it ignores the transaction's base version and targets
+        // the live head, which is a branch head already).
+        val release = runtime.dag.pin(transaction.baseVersion)
+        try {
+            return writeCoordinator.run {
+                commitViaEngine(
+                    runtime,
+                    namespaceId,
+                    transaction,
+                    schema,
+                    effectiveEngine(namespaceId, authorizer),
+                    documentLocks = documentLocks,
+                    sessionId = sessionId,
+                )
+            }
+        } finally {
+            release()
         }
+    }
 
     public suspend fun replay(
         namespaceId: String,
@@ -119,30 +132,38 @@ public class KdbServerRuntime(
         docId: KdbUuid,
         json: String,
         authorizer: WriteAuthorizer? = null,
-    ): KdbCommit =
-        writeCoordinator.run {
-            val head = runtime.dag.head()
-            val tx =
-                KdbTransaction(
-                    KdbUuid.random(),
-                    head,
-                    listOf(KdbOp.Write(docId, json)),
-                    KdbTimestamp.now(),
-                    KdbUuid.random(),
-                )
-            var engine: TransactionEngine = upsertEngine
-            if (authorizer != null) {
-                engine = authorizingTransactionEngine(engine, namespaceId, authorizer)
-            }
-            commitViaEngine(
-                runtime,
-                namespaceId,
-                tx,
-                runtime.schema,
-                engine,
-                documentLocks = documentLocks,
+    ): KdbCommit {
+        val head = runtime.dag.head()
+        val tx =
+            KdbTransaction(
+                KdbUuid.random(),
+                head,
+                listOf(KdbOp.Write(docId, json)),
+                KdbTimestamp.now(),
+                KdbUuid.random(),
             )
+        // See commit()'s pin comment - resolved outside the coordinator here too, since head is
+        // this call's own base version and must stay resolvable for the same reason.
+        val release = runtime.dag.pin(head)
+        try {
+            return writeCoordinator.run {
+                var engine: TransactionEngine = upsertEngine
+                if (authorizer != null) {
+                    engine = authorizingTransactionEngine(engine, namespaceId, authorizer)
+                }
+                commitViaEngine(
+                    runtime,
+                    namespaceId,
+                    tx,
+                    runtime.schema,
+                    engine,
+                    documentLocks = documentLocks,
+                )
+            }
+        } finally {
+            release()
         }
+    }
 
     // A separate LAST_WRITE engine instance rather than a per-call policy override, because the
     // engine bakes its conflict policy in at construction - same shape as Go's UpsertEngine.

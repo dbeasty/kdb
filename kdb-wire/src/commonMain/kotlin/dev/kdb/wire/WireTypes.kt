@@ -182,14 +182,25 @@ public sealed class WireMessage {
         override val header: WireHeader,
         val namespace: String,
         val reportBytes: ByteArray,
+        // Additive to reportBytes, mirroring UpsertResult's errorCode/retryAfterMs below -
+        // kdb-spec-layer13 Component 51 §8.1. A lost optimistic-concurrency race is the refusal
+        // a contended workload produces the most of, and it used to be the one the server could
+        // not pace: there was nowhere on this message to say when to retry, so a client's only
+        // move was to retry instantly and re-collide. See KdbServerRuntime.conflictRetryAfterMs.
+        val errorCode: String? = null,
+        val retryAfterMs: Int? = null,
     ) : WireMessage() {
         override fun equals(other: Any?): Boolean =
             other is ConflictReport &&
                 header == other.header &&
                 namespace == other.namespace &&
-                reportBytes.contentEquals(other.reportBytes)
+                reportBytes.contentEquals(other.reportBytes) &&
+                errorCode == other.errorCode &&
+                retryAfterMs == other.retryAfterMs
 
-        override fun hashCode(): Int = header.hashCode() xor namespace.hashCode() xor reportBytes.contentHashCode()
+        override fun hashCode(): Int =
+            header.hashCode() xor namespace.hashCode() xor reportBytes.contentHashCode() xor
+                errorCode.hashCode() xor retryAfterMs.hashCode()
     }
 
     public data class CompactionNotice(
@@ -290,6 +301,14 @@ public sealed class WireMessage {
         val json: String?,
         val commitHex: String,
         val error: String? = null,
+        // Additive to error, exactly like UpsertResult's fields above - a point read can be
+        // refused for reasons purely about server load, and until these existed that arrived as
+        // bare prose. Writes have carried this since Component 51; reads were the gap. No
+        // Kotlin path populates these yet (the server has no admission/cost-model layer to
+        // classify against, mirroring UpsertResult's own errorCode - present on the wire for a
+        // Go peer, unpopulated here); decodable now so interop is ready when one is added.
+        val errorCode: String? = null,
+        val retryAfterMs: Int? = null,
     ) : WireMessage()
 
     // Upsert writes json at docId unconditionally - create if absent, replace if present, no

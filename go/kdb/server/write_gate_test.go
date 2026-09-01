@@ -49,6 +49,50 @@ func TestWriteGateRejectsWhenQueueFull(t *testing.T) {
 	<-blockedDone
 }
 
+// TestWriteGateQueueDepthCountsTheRunningCaller proves queueDepth includes the one currently
+// holding the running slot, not just callers still waiting behind it - acquire's own queued
+// slot is released the instant acquire returns (its deferred release), which for a caller that
+// got in happens well before its commit or its eventual release() call, so len(g.queued) alone
+// undercounts by exactly one while any commit is in flight.
+func TestWriteGateQueueDepthCountsTheRunningCaller(t *testing.T) {
+	g := newWriteGate(4)
+	if got := g.queueDepth(); got != 0 {
+		t.Fatalf("expected 0 before anyone acquires, got %d", got)
+	}
+
+	release, err := g.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("expected the first acquire to succeed: %v", err)
+	}
+	if got := g.queueDepth(); got != 1 {
+		t.Fatalf("expected 1 while the sole caller is running (no one waiting behind it), got %d", got)
+	}
+
+	waiterQueued := make(chan struct{})
+	waiterDone := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		close(waiterQueued)
+		if rel, err := g.acquire(ctx); err == nil {
+			rel()
+		}
+		close(waiterDone)
+	}()
+	<-waiterQueued
+	// Give the waiter time to actually reach the blocked <-running select.
+	time.Sleep(50 * time.Millisecond)
+	if got := g.queueDepth(); got != 2 {
+		t.Fatalf("expected 2 (the running caller plus the one waiting behind it), got %d", got)
+	}
+
+	release()
+	<-waiterDone
+	if got := g.queueDepth(); got != 0 {
+		t.Fatalf("expected 0 once both have released, got %d", got)
+	}
+}
+
 // TestWriteGateRejectsOnDeadlineExceeded proves the second outcome: a caller that queues
 // successfully but whose own deadline passes before its turn arrives gets
 // *DeadlineExceededError, not an eventual (likely useless, by then) success.

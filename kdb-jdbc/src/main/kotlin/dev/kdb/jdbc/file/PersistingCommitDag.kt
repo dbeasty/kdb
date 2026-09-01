@@ -52,6 +52,12 @@ internal class PersistingCommitDag(
         archiveLocation: String,
     ): CommitStub = delegate.stubCommit(hash, archiveLocation)
 
+    override suspend fun pin(hash: KdbHash): suspend () -> Unit = delegate.pin(hash)
+
+    override suspend fun isPinned(hash: KdbHash): Boolean = delegate.isPinned(hash)
+
+    override suspend fun pinnedCount(): Int = delegate.pinnedCount()
+
     override suspend fun getDocumentTree(treeHash: KdbHash): DocumentTree? =
         delegate.getDocumentTree(treeHash)
 

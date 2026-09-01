@@ -85,6 +85,31 @@ class DocumentOpsWireTest {
         assertNull(back.json)
     }
 
+    // A point read can be shed under load exactly like a write - it takes an admission grant in
+    // the Go server and can come back BUSY/RESOURCE_EXHAUSTED there - but this message could
+    // only ever carry prose until now. Writes have had errorCode/retryAfterMs since Component
+    // 51; reads were the gap. No Kotlin path populates these yet (this server has no
+    // admission/cost-model layer to classify against), but they must already be decodable so
+    // interop with a Go peer that does set them works today.
+    @Test
+    fun documentGetResultRoundTripsClassifiedError() {
+        val msg =
+            WireMessage.DocumentGetResult(
+                header(9, WireMessageType.DOCUMENT_GET_RESULT),
+                namespace = "app/data",
+                docId = "bad-id",
+                json = null,
+                commitHex = "",
+                error = "kdb server: busy (retry after 50ms): write queue is full",
+                errorCode = "BUSY",
+                retryAfterMs = 50,
+            )
+        val back = codec.decode(codec.encode(msg)) as WireMessage.DocumentGetResult
+        assertEquals("BUSY", back.errorCode)
+        assertEquals(50, back.retryAfterMs)
+        assertEquals(msg.error, back.error)
+    }
+
     @Test
     fun upsertRoundTrips() {
         val msg =

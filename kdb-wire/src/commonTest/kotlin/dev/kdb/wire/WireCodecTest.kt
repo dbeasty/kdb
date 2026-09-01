@@ -7,8 +7,10 @@ import dev.kdb.document.KdbOp
 import dev.kdb.error.EncodingNegotiationFailureException
 import dev.kdb.error.UnsupportedProtocolVersionException
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class WireCodecTest {
@@ -142,6 +144,40 @@ class WireCodecTest {
         assertFailsWith<UnsupportedProtocolVersionException> {
             negotiator.negotiate(local, remote)
         }
+    }
+
+    @Test
+    fun conflictReportRoundtrip() {
+        val msg =
+            WireMessage.ConflictReport(
+                header(3, WireMessageType.CONFLICT_REPORT),
+                namespace = "app/data",
+                reportBytes = byteArrayOf(0x01, 0x00, 0xfe.toByte()),
+            )
+        val back = codec.decode(codec.encode(msg)) as WireMessage.ConflictReport
+        assertContentEquals(byteArrayOf(0x01, 0x00, 0xfe.toByte()), back.reportBytes)
+        // An older peer sends no code at all, and that has to stay decodable as "no hint" rather
+        // than as a zero-valued one - the difference between "retry whenever" and "retry now".
+        assertNull(back.errorCode)
+        assertNull(back.retryAfterMs)
+    }
+
+    // The pacing fields are what let a client that lost a race wait instead of colliding again
+    // (see KdbServerRuntime.conflictRetryAfterMs), so they have to survive the wire, not just
+    // exist on the data class - mirrors go/kdb/wire TestRoundTripConflictReportCarriesRetryAfter.
+    @Test
+    fun conflictReportRoundtripCarriesRetryAfter() {
+        val msg =
+            WireMessage.ConflictReport(
+                header(3, WireMessageType.CONFLICT_REPORT),
+                namespace = "app/data",
+                reportBytes = byteArrayOf(0x01, 0x00, 0xfe.toByte()),
+                errorCode = "CONFLICT",
+                retryAfterMs = 37,
+            )
+        val back = codec.decode(codec.encode(msg)) as WireMessage.ConflictReport
+        assertEquals("CONFLICT", back.errorCode)
+        assertEquals(37, back.retryAfterMs)
     }
 
     @Test

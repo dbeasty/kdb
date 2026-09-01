@@ -532,11 +532,7 @@ public class SqlWireHost(
             )
         } catch (e: ConflictException) {
             abortSessionAfterFailedCommit(session)
-            WireMessage.ConflictReport(
-                header(msg.header.correlationId, WireMessageType.CONFLICT_REPORT),
-                namespace = msg.namespace,
-                reportBytes = encodeConflictReport(e.report),
-            )
+            conflictReport(msg.header.correlationId, msg.namespace, e.report)
         } catch (e: DocumentLockedException) {
             abortSessionAfterFailedCommit(session)
             sqlError(msg, e.message ?: "document locked")
@@ -575,11 +571,7 @@ public class SqlWireHost(
             )
         } catch (e: ConflictException) {
             abortSessionAfterFailedCommit(session)
-            WireMessage.ConflictReport(
-                header(correlationId, WireMessageType.CONFLICT_REPORT),
-                namespace = namespace,
-                reportBytes = encodeConflictReport(e.report),
-            )
+            conflictReport(correlationId, namespace, e.report)
         } catch (e: DocumentLockedException) {
             abortSessionAfterFailedCommit(session)
             onError(e.message ?: "document locked")
@@ -596,8 +588,15 @@ public class SqlWireHost(
         sessions.clearPending(session)
         server.documentLocks.releaseAll(session.id.value)
         session.baseVersion = commitHash
+        // The transaction is over: the next one anchors on - and, for a SNAPSHOT session, reads
+        // at - the commit just produced. The old pin (if any) has to be released here, not left
+        // for session end: without this, a long-lived SNAPSHOT session accumulates one pin per
+        // commit and compaction never reclaims anything it ever read at. See CommitDag.pin.
+        session.pinRelease?.invoke()
+        session.pinRelease = null
         if (session.readConsistency == ReadConsistency.SNAPSHOT) {
             session.readPin = commitHash
+            session.pinRelease = server.runtime.dag.pin(commitHash)
         }
     }
 
@@ -680,11 +679,7 @@ public class SqlWireHost(
                     readOnly = false,
                 )
             is TransactionResult.Conflict ->
-                WireMessage.ConflictReport(
-                    header(msg.header.correlationId, WireMessageType.CONFLICT_REPORT),
-                    namespace = msg.namespace,
-                    reportBytes = encodeConflictReport(result.report),
-                )
+                conflictReport(msg.header.correlationId, msg.namespace, result.report)
             is TransactionResult.SchemaError ->
                 WireMessage.SqlResult(
                     header(msg.header.correlationId, WireMessageType.SQL_RESULT),
@@ -759,6 +754,26 @@ public class SqlWireHost(
         (
             """{"transactionId":"${report.transactionId}","baseHash":"${report.baseHash}","targetHash":"${report.targetHash}"}"""
         ).encodeToByteArray()
+
+    /**
+     * Shapes a lost optimistic-concurrency race, carrying the structured report a client needs
+     * to decide *what* to do and the code/retry-after it needs to decide *when* - mirrors Go's
+     * conflictReport (server/wire_listen.go). Before these fields existed a conflict was the one
+     * refusal the server could not pace: the message carried a report and nothing else, so a
+     * client's only option was to retry instantly and collide again. See conflictRetryAfterMs.
+     */
+    private fun conflictReport(
+        correlationId: Int,
+        namespace: String,
+        report: ConflictReport,
+    ): WireMessage.ConflictReport =
+        WireMessage.ConflictReport(
+            header(correlationId, WireMessageType.CONFLICT_REPORT),
+            namespace = namespace,
+            reportBytes = encodeConflictReport(report),
+            errorCode = "CONFLICT",
+            retryAfterMs = server.conflictRetryAfterMs(),
+        )
 
     private fun sessionBeginAuthError(
         msg: WireMessage.SessionBegin,
