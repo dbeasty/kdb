@@ -137,7 +137,10 @@ func applyLimitOffset[T any](items []T, limit, offset int) []T {
 }
 
 func (e *Executor) executeAggregateSelect(query SelectQuery, ctx QueryContext) (QueryResult, error) {
-	plan, residual := DefaultPlanner{}.PlanSelect(query, ctx.Schema)
+	plan, residual, err := DefaultPlanner{}.PlanSelect(query, ctx.Schema)
+	if err != nil {
+		return QueryResult{}, err
+	}
 	// An aggregate consumes every matching row and produces one; LIMIT bounds that output, not
 	// the input. Leaving the planner's PlanLimit in place made it truncate the rows being
 	// aggregated instead, so `SELECT COUNT(*) FROM t LIMIT 1` answered 1 however many rows the
@@ -179,7 +182,10 @@ func (e *Executor) ResolveDocIDsForWhere(where Expr, sch schema.KdbSchema, ctx Q
 		From:        TableRef{Name: "t"},
 		Where:       where,
 	}
-	plan, residual := DefaultPlanner{}.PlanSelect(q, sch)
+	plan, residual, err := DefaultPlanner{}.PlanSelect(q, sch)
+	if err != nil {
+		return nil, err
+	}
 	return e.resolveDocIDs(plan, residual, ctx)
 }
 

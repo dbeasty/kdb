@@ -38,7 +38,10 @@ func (e *defaultEngine) Execute(sqlText string, ctx QueryContext) (QueryResult, 
 	}
 	switch s := stmt.(type) {
 	case StmtSelect:
-		plan, residual := e.planner.PlanSelect(s.Query, ctx.Schema)
+		plan, residual, err := e.planner.PlanSelect(s.Query, ctx.Schema)
+		if err != nil {
+			return QueryResult{}, err
+		}
 		return e.executor.ExecuteSelect(s.Query, plan, residual, ctx)
 	case StmtCreateTable:
 		sch, err := e.ddl.ExecuteCreateTable(s.DDL, ctx)

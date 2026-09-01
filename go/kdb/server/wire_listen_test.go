@@ -342,6 +342,41 @@ func TestListenSqlWireCreateInsertSelectCommit(t *testing.T) {
 	}
 }
 
+// TestListenSqlWireSqlExecUnknownColumnDoesNotCrashServer is the reported repro: a SELECT on an
+// unknown column used to panic inside DefaultPlanner.PlanSelect with no recover between it and
+// the connection's read loop, killing the whole process - every other connection, not just this
+// one query, went down with it. The client should instead get a normal error reply, and the
+// server (and this same connection) must still work afterward.
+func TestListenSqlWireSqlExecUnknownColumnDoesNotCrashServer(t *testing.T) {
+	rt := newTestRuntime(t)
+	ln, err := ListenSqlWire("tcp://127.0.0.1:0?bind=true", rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := fmt.Sprintf("tcp://%s", ln.Addr().String())
+
+	client := dialRawWireClient(t, addr)
+	client.handshake(t, wire.ClientSQL, "app/data")
+	sess := client.sessionBegin(t, "app/data", "READ_COMMITTED")
+
+	created := client.sqlExec(t, "app/data", sess.SessionID, `CREATE TABLE t (id VARCHAR NOT NULL)`)
+	if created.Error != nil {
+		t.Fatalf("create table: %s", *created.Error)
+	}
+
+	bad := client.sqlExec(t, "app/data", sess.SessionID, `SELECT nosuchcolumn FROM t`)
+	if bad.Error == nil || *bad.Error == "" {
+		t.Fatal("expected an error for an unknown column, got none")
+	}
+
+	// The server (and this connection) must still be alive and usable.
+	ok := client.sqlExec(t, "app/data", sess.SessionID, `SELECT COUNT(*) AS n FROM t`)
+	if ok.Error != nil {
+		t.Fatalf("select after unknown-column error: %s", *ok.Error)
+	}
+}
+
 // TestListenSqlWireTxRollbackDiscardsPending proves TxRollback actually discards buffered
 // writes rather than leaving them to leak into the next commit.
 func TestListenSqlWireTxRollbackDiscardsPending(t *testing.T) {

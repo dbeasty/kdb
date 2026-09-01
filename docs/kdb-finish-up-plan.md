@@ -643,3 +643,39 @@ cross-language wire format).
 **Verification**: `go vet ./...` and `gofmt` clean; `go test -race ./...` green; `make build-go` then
 `--version` on all three binaries; a plain `go build` with no ldflags confirmed to recover the commit
 and dirty flag from the VCS stamp.
+
+### `SELECT` on an unknown column crashed the whole server (2026-08-31)
+
+`DefaultPlanner.PlanSelect` (`go/kdb/sql/planner.go`) reported an unknown projected column by
+calling `panic(NewPlanningError(...))` instead of returning an error, even though `PlanningError`
+is otherwise always a normal returned `error` elsewhere in this package (`engine.go`, `ddl.go`,
+`dml.go`). `PlanSelect` runs synchronously inside the connection goroutine that
+`tcp.Transport.Serve` spawns per accepted connection (`go/kdb/server/wire_listen.go`'s
+`sqlWireConnHandler.run` → `handleSqlExec` → `execRead` → `SQLEngine.Execute`), and nothing between
+there and `PlanSelect` recovered — an unrecovered panic in any goroutine takes down the entire Go
+process, so one client sending `SELECT nosuchcolumn FROM t` killed the server for every other
+connection, not just its own request.
+
+**Fix**: changed the `Planner` interface and `DefaultPlanner.PlanSelect`'s signature to
+`(PhysicalPlan, Expr, error)` and replaced the `panic` with a normal `return nil, nil,
+NewPlanningError(...)`. Propagated the new error return through its three call sites —
+`engine.go`'s `Execute` (the `StmtSelect` case), and `executor.go`'s `executeAggregateSelect` and
+`ResolveDocIDsForWhere` — all of which already returned `error` and needed no further signature
+change. `execRead` already turns any `error` from `SQLEngine.Execute` into a classified
+`SqlResultMessage.Error` reply (`sqlResultErrorClassified`) rather than crashing, so no change was
+needed on that side; the fix removes the only path that bypassed it. `DefaultPlanner` was the only
+implementation of `Planner` in the tree, so nothing else needed updating.
+
+Deliberately no `recover()` was added in `sqlWireConnHandler.run`/`handleFrame` — the root cause was
+a planner using `panic` for expected-input validation, not a genuinely unexpected fault, and the
+codebase's existing convention (`PlanningError` as a returned `error`, matching `ParseError` and
+every other SQL exception type in `exceptions.go`) already had the right shape for this. A blanket
+recover in the connection handler would have masked the actual bug and any future one like it
+behind a generic "internal error" instead of the specific `PlanningError` clients get today.
+
+**Tests**: `go/kdb/sql/sql_test.go`'s `TestSelectUnknownColumnReturnsError` (unit-level, asserts
+`errors.As` finds a `*sql.PlanningError`) and `go/kdb/server/wire_listen_test.go`'s
+`TestListenSqlWireSqlExecUnknownColumnDoesNotCrashServer` (real TCP socket end-to-end: sends
+`SELECT nosuchcolumn FROM t`, asserts a normal error reply, then sends a second valid query on the
+same connection to prove the server — and that connection — are still alive). Both fail with a
+panic/process crash against the pre-fix code.
