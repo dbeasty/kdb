@@ -128,7 +128,8 @@ flowchart TB
 | Topology | Who uses it | Durability | Concurrency ceiling |
 |----------|-------------|-----------|---------------------|
 | Embedded memory | tests, browser demo, `jdbc:kdb:memory://`, `kdb://memory:///` | none (process lifetime) | one process; internal locks only |
-| Embedded file | `kdb --data-dir`, `jdbc:kdb:file://`, `kdb://file://` | delta log + WAL, fsync per commit by default | **one process at a time** — enforced by an exclusive `{dataRoot}/.kdb.lock` |
+| Embedded file | `kdb --data-dir`, `jdbc:kdb:file://`, `kdb://file://` | delta log + WAL, fsync per commit by default | **one writer**, plus any number of read-only attachments — a two-file lock (`.kdb.lock` shared, `.kdb.write.lock` exclusive) |
+| Embedded file, read-only | `embed.OpenReadOnlyFileRuntime` | none (reads a live writer's log) | many, alongside the writer; unix only |
 | Server | `kdb-service` + `kdb/client`, JDBC network, `kdb-cli sync` | same as embedded file | many connections; one commit at a time per namespace (write gate) |
 | Peer mesh | `kdb-service --peer-addr`, `kdb-peer-sync` | per peer | peers are fully independent; divergence resolved on contact |
 
@@ -509,8 +510,11 @@ specific place in the code, named here.
 | R9 | Work is admitted only if its estimated memory is available and reserved | `server.Admission.Acquire` |
 | R10 | Every failure reaches the client as a typed, actionable code | `wire.ErrorCode` + `classifyError` |
 | R11 | Point reads are never shed | `admitInZone` |
-| R12 | One writer per data directory | `embed.acquireDirLock` (`flock` on `.kdb.lock`) |
+| R12 | One writer per data directory; many readers may attach alongside it | `embed` two-file lock: `.kdb.lock` shared (attach) + `.kdb.write.lock` exclusive (writer) |
 | R13 | On-disk and on-wire formats are byte-identical across Kotlin and Go | golden fixtures in `go/testdata/golden`, `go/kdb/interop` |
+| R14 | A `unique` schema field admits at most one document per value | `transaction.UniqueKeyRegistry`, checked and applied inside the write gate |
+| R15 | A declared precondition is evaluated against the tree the transaction actually lands on | `transaction.evaluatePreconditions`, inside the write gate |
+| R16 | A lease holder that stalls past its deadline cannot land a write | monotonic fence tokens + `LockManager.ValidateFences` at commit |
 
 -----
 

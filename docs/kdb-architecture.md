@@ -220,6 +220,14 @@ Each decision, the alternative it displaced, and why.
 | D13 | **Per-frame codec recording** in the delta and SSTable formats | a global compression setting | changing compression never invalidates existing data, and verification can tell a codec mismatch from corruption |
 | D14 | **One writer per data directory**, enforced by an exclusive lock file | multi-process coordination | an embedded engine has no cross-process concurrency protocol; the lock makes the constraint explicit and immediate |
 | D15 | **Go as the deployment target**, Kotlin as the multiplatform reference | one implementation | a Go service removes the JVM from the deployment (a decisive cost factor on small instances); Kotlin keeps browser/JVM/native reach; golden tests keep them identical |
+| D16 | **Unique keys enforced by a registry in the commit path**, not by the index layer | wire the index layer into commits first | uniqueness is a correctness primitive and the index layer is a performance track; the registry is narrow, lives where the check must happen anyway, and becomes the index's backing store later rather than being thrown away |
+| D17 | The unique registry is **derived state**, rebuilt on open | persist it beside the data | a derived structure with its own persistence path is a second source of truth and a second recovery bug; rebuilding costs one scan per open |
+| D18 | **Preconditions ride on the transaction envelope**, not inside `Op` | put them in the op | an op is committed history and is hashed into the commit; a precondition is a request-time assertion about state that no longer exists once the commit lands. In the op it would change every commit hash to record something that is not a fact about the data |
+| D19 | `ExpectContentHash` **compares literally**, diverging from content-addressed no-op semantics | inherit conflict detection's "identical content passes" | a compare-and-set asserts that the state is still the one the caller read, not that its own write would change anything |
+| D20 | **Leases carry monotonic fence tokens** | TTL alone | an expiry without a fence hands the document to a new holder while the original still believes it owns it — two writers, each convinced it is exclusive. Worse than no locking |
+| D21 | The commit path **asserts nothing is held by others** instead of taking locks | keep the take-all-then-release | writes are already serialized by the gate, so the locks bought nothing — but failing fast meant a writer waiting in the gate refused every other writer to the same document, turning contention into a storm of unclearable failures |
+| D22 | **Two lock files** — attach (shared) and writer (exclusive) | one lock, readers take `LOCK_SH` | with one lock a read replica could attach only to a directory whose writer had stopped, i.e. it required the thing it replicates to be down |
+| D23 | **Group commit measured, then deliberately not built** | batch transactions behind the gate | the gate costs 0.65 µs against a 19.7 µs commit, and durability grouping already exists (`PersistAsync` releases the gate once log position is fixed): file-backed commits run 528 µs/op in parallel vs 4022 µs/op serial. A batching layer would add cross-transaction complexity on the exact path correctness depends on, for a few percent |
 
 -----
 
@@ -244,7 +252,11 @@ process/OS crash but not power loss) trade the guarantee for an order of magnitu
 |----------|-----------|
 | Within a namespace | serialized commits; a transaction is all-or-nothing |
 | Optimistic concurrency | conflicts detected per document by content hash; the loser gets a structured report, never a silent overwrite |
+| Application invariants | `unique` schema fields are enforced on every write path against a registry checked inside the write serialization — two clients cannot both take one natural key |
+| Conditional writes | insert-if-absent and compare-and-set as first-class primitives, with a retry helper that re-reads every attempt |
+| Pessimistic holds | expiring, fenced document leases for work that spans round trips; a holder that stalls past its deadline is refused at commit rather than overwriting whoever took the document next |
 | Read isolation | `SNAPSHOT` sessions pin a commit; `READ_COMMITTED` reads the live head; scans are not snapshots |
+| Cross-process readers | read-only runtimes attach alongside a live writer and see a snapshot as of their open (or last `Refresh`) |
 | Across namespaces | none — one runtime serves one namespace; there are no cross-namespace transactions |
 | Across peers | eventual, application-controlled: peers converge when they choose to sync, and conflicts are surfaced |
 
@@ -274,7 +286,21 @@ server that is down — and reads are how an operator diagnoses the pressure.
 
 Measured calibration (Apple M3 Max): ~6.9 KiB retained per commit at small payloads, scaling as
 `base + 1.25 × payload`; the cost model rounds that up deliberately, because under-estimating is
-the dangerous direction. Benchmarks: `docs/benchmarks/`.
+the dangerous direction.
+
+Write-path measurements on the same machine (`server/write_gate_profile_test.go`):
+
+| | serial | parallel (16) |
+|---|---|---|
+| in-memory commit | 19.7 µs/op | 23.2 µs/op |
+| file-backed commit | 4022 µs/op | **528 µs/op** |
+| write gate primitive alone | — | 0.65 µs/op |
+
+The gate costs ~3 % of a commit, and concurrency makes file-backed writes **7.6× faster** than
+serial — because durability grouping already happens (`PersistAsync` releases the gate as soon as
+a commit's log position is fixed, so concurrent commits share one physical sync). That is why a
+batching group-commit layer was measured and then deliberately not built (D23). Benchmarks:
+`docs/benchmarks/`.
 
 ### 7.5 Security
 
@@ -322,8 +348,8 @@ flowchart LR
 
 | Topology | Use it when | Constraint |
 |----------|-------------|------------|
-| Embedded | single-process apps, CLIs, tests, mobile, browser | one process per data directory |
-| Single service | shared access, RBAC, TLS, remote SQL | one namespace per runtime; writes serialize |
+| Embedded | single-process apps, CLIs, tests, mobile, browser | one **writer** per data directory; read-only attachments may run alongside it (unix) |
+| Single service | shared access, RBAC, TLS, remote SQL, concurrent application instances | one namespace per runtime; writes serialize, but unique keys, CAS, and leases make concurrent writers safe |
 | Stream fan-out | live read models, browser clients, caches | subscribers may lag and resync from their last ack |
 | Peer mesh | offline-first, edge, multi-site | convergence is explicit; conflicts are the application's to resolve |
 
@@ -350,6 +376,8 @@ flowchart LR
 | Durability, crash recovery, integrity, backup/restore | implemented (Go), spec-backed (Layer 13/15) |
 | Resource governance | implemented (Go) |
 | Go-native server, client SDK, RBAC, TLS | implemented |
+| Multi-writer safety — unique keys, compare-and-set, leases with fencing | implemented (Go) |
+| Cross-process read-only replicas | implemented (Go, unix) |
 | KDB-SQL | Go: `SELECT` / `INSERT` / `CREATE TABLE`, full scan only. Kotlin: joins, group-by, DML, DDL, views, GRANT/REVOKE |
 | Index layer | versioned engine implemented; **not yet consulted by the Go planner** |
 | Historical reads | commit resolution implemented; document materialisation at an arbitrary commit is a known gap |
@@ -368,6 +396,10 @@ Known limitations are listed exhaustively in [LLD Part 5 §7](kdb-lld-query.md) 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | The in-memory commit DAG grows monotonically | memory exhaustion under sustained writes | admission control's non-granted floor throttles smoothly; DAG squash and the ice tier reclaim; the abort watchdog restarts clean rather than lingering degraded |
+| Unique enforcement is off unless the engine is constructed with it | an embedded caller using `transaction.NewEngine` gets no enforcement and silently ignores preconditions | the server always wires both; embedded callers must pass `EngineOptions` |
+| The unique registry rebuilds by scanning on open | open cost grows with namespace size | measured per open; a snapshot with `IsValid`-style validation is the documented follow-up if it becomes unacceptable |
+| Composite (multi-field) uniqueness is not implemented | a two-column natural key cannot be declared | single-field only today, matching `schema.Field.Unique` |
+| Read replicas are unix-only | no shared lock mode elsewhere | the non-`flock` fallback refuses rather than silently degrading |
 | No index usage in the Go planner | full scans on large namespaces | scan row budgets bound the damage and return `RESOURCE_EXHAUSTED`; use the Kotlin engine or keep namespaces small until the planner consults indexes |
 | Historical reads return current documents | point-in-time queries can mislead | documented; use commit-scoped tooling and peer/backup snapshots where exactness matters |
 | One writer per data directory | no multi-process embedded writes | enforced immediately by lock, with a clear error; use the server for shared access |

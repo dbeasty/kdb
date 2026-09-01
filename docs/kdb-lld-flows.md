@@ -32,8 +32,12 @@ involved so the diagram can be walked in the source.
 | 15 | Orderly shutdown and abort | SIGTERM path / `AbortWatchdog` |
 | 16 | Verify and repair | `integrity.Verify` → `integrity.Repair` |
 | 17 | Backup and restore | `backup.Create` → `recovery.HybridRestore` |
-| 18 | Schema DDL and migration | `DDLExecutor` / `schema.ApplyMigration` |
+| 18 | Schema DDL and migration | `DDLExecutor` / `SetSchemaChecked` |
 | 19 | RBAC enforcement points | `auth.Engine` at four layers |
+| 20 | Unique-key enforcement | `planUniqueKeys` → `UniqueKeyRegistry.Apply` |
+| 21 | Compare-and-set and insert-if-absent | `evaluatePreconditions` / `client.CompareAndSwap` |
+| 22 | Document leases and fencing | `LOCK_ACQUIRE` → `ValidateFences` |
+| 23 | Read-only replicas | `embed.OpenReadOnlyFileRuntime` |
 
 -----
 
@@ -47,7 +51,7 @@ sequenceDiagram
     autonumber
     participant C as Caller (CLI / driver / service)
     participant E as embed.OpenFileRuntimeWithOptions
-    participant L as dirLock (.kdb.lock)
+    participant L as dirLock (.kdb.lock + .kdb.write.lock)
     participant IO as FileBackedPlatformIO / OSByteStore
     participant F as engine.DefaultFactory
     participant R as replayDeltaNamespace
@@ -55,10 +59,11 @@ sequenceDiagram
     participant S as ServerEngine
 
     C->>E: dataRoot, catalog, namespace, schema, opts
-    E->>L: acquireDirLock(dataRoot)  (flock, exclusive)
-    alt lock held by another process
+    E->>L: acquireDirLock — attach SHARED, then writer EXCLUSIVE
+    alt maintenance holds the attach lock, or another writer holds the writer lock
         L-->>C: DataDirectoryLocked (4102)
     end
+    Note over L: a read-only open takes only the shared attach lock (flow 23)
     E->>E: ensureNamespaceDirs — ns/[namespace]/delta, /meta, meta.json
     E->>IO: open store (OS, + S3 replicas if KDB_S3_* set)
     E->>F: Open(namespace, StorageEngineConfig)
@@ -154,21 +159,40 @@ flowchart TD
     E2 --> E3[SchemaMigrationOp advances the rolling schema]
     E3 --> F{violations?}
     F -- yes --> F1[ResultSchemaError with FieldViolations]
-    F -- no --> G{conflict policy}
-    G -- AppendOnly / LastWrite --> J[write phase]
-    G -- Strict / Custom --> H[detectConflicts:<br/>content hash at base tree vs target tree]
+    F -- no --> P[evaluatePreconditions against the TARGET tree]
+    P -- malformed set --> F1
+    P -- assertion failed --> P1[ResultConflict · PreconditionFailed<br/>carries the actual content hash]
+    P -- held / none declared --> G{conflict policy}
+    G -- AppendOnly / LastWrite --> U
+    G -- Strict / Custom --> H[detectConflicts:<br/>content hash at base tree vs target tree<br/>guarded ops exempt]
     H --> I{conflicts?}
-    I -- no --> J
+    I -- no --> U
     I -- yes, Strict --> I1[ResultConflict + ConflictReport]
     I -- yes, Custom --> I2[resolver per WriteOp, re-validate]
     I2 -- unresolved --> I1
-    I2 -- resolved --> J
+    I2 -- resolved --> U
+    U[planUniqueKeys:<br/>resolve retractions + claims, mutate nothing] --> U1{unique violation?}
+    U1 -- yes --> U2[ResultSchemaError · UniqueConstraint<br/>names the owning document]
+    U1 -- no --> J
     J[PutDocument / DeleteDocument per op] --> K{write error?}
     K -- yes --> K1[DiscardPending → ResultAborted]
     K -- no --> L[CommitTree anchor.DocumentTreeHash]
     L --> M[AppendCommit tx, anchor, tree, schemaHash]
-    M --> N[ResultSuccess commit, newTreeHash]
+    M --> M1[UniqueKeyRegistry.Apply retract then claim]
+    M1 --> N[ResultSuccess commit, newTreeHash]
 ```
+
+Two ordering choices in that diagram are load-bearing:
+
+- **Preconditions run before, and independently of, the conflict policy.** A client that said
+  "only if absent" asked a question the policy has no standing to answer for it — which matters
+  most on the `Upsert` path, which runs `LastWrite` and is exactly where insert-if-absent is used.
+- **The registry moves only after `AppendCommit` succeeds.** Applying earlier would leave a phantom
+  claim if the append failed; applying later — after the caller's durability wait — would let the
+  next writer, already queued behind this one at the gate, see a key this commit has taken as still
+  free. Erring toward "claimed slightly too early" costs at most a spurious rejection of a write
+  that raced a *failing* commit; erring the other way costs the duplicate the constraint exists to
+  prevent.
 
 **Conflict classification** (`detectConflicts`) compares, per touched document, the content hash
 at the transaction's *base* tree against the hash at the *target* (current head) tree:
@@ -389,13 +413,17 @@ sequenceDiagram
     else
         H->>B: Build(timestamp) → document.Transaction
     end
-    H->>LM: AcquireAllForTransaction(ns, sessionId, tx)   [sorted order; all-or-nothing]
-    alt a document is locked by another session
-        LM-->>CL: SQL_RESULT {error: document locked}
+    H->>LM: ValidateFences(session's explicit leases on these documents)
+    alt a lease lapsed and was re-taken
+        LM-->>CL: SQL_RESULT {error: lease no longer valid}
+    end
+    H->>LM: AssertUnheldByOthers(ns, sessionId, tx)
+    alt a document is leased by another session
+        LM-->>CL: SQL_RESULT {error: document locked, naming the holder}
     end
     H->>RT: Commit(ns, tx, sessionId, principal)   ← flow 3
-    H->>LM: ReleaseAll(sessionId)
     H->>H: ClearPending
+    Note over H,LM: no locks are taken or released here — the commit path<br/>asserts, it does not acquire; explicit leases survive the commit
     alt conflict
         H-->>CL: CONFLICT_REPORT {reportBytes}
     else success
@@ -404,8 +432,9 @@ sequenceDiagram
     end
 ```
 
-`TX_ROLLBACK` releases the session's locks and clears the pending builder; it never touches the
-DAG.
+`TX_ROLLBACK` releases the session's locks (including explicit leases — a client that rolled back
+is done with the work they were protecting), clears its tracked leases and the pending builder, and
+never touches the DAG.
 
 -----
 
@@ -666,7 +695,7 @@ sequenceDiagram
     participant R as integrity.Repair
 
     OP->>I: kdb-inspect verify --data-dir D --namespace NS --level L2
-    I->>L: LockDataDir (refuses while a service holds it)
+    I->>L: LockDataDir — attach lock EXCLUSIVE (excludes the writer AND every reader)
     I->>V: walk segments
     V->>V: L1 — per-frame magic, length, CRC, decode
     V->>V: L2 — parent closure across segments (genesis exempt)
@@ -764,6 +793,185 @@ flowchart LR
   so a Go caller reaching the runtime directly is still enforced.
 - Grants are wildcard-aware over `namespace/collection/document`; a database-level grant covers
   every collection beneath it, and a collection grant never leaks to a sibling.
+
+-----
+
+## 20. Unique-key enforcement
+
+Ordinary conflict detection answers *"did this document change under me"*, which two clients
+creating two **different** documents that claim the same email never trips. The registry answers
+the other question: *"is this value already spoken for"*.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as client A
+    participant B as client B
+    participant WG as writeGate
+    participant P as planUniqueKeys
+    participant R as UniqueKeyRegistry
+    participant D as DAG
+
+    Note over R: rebuilt from the document tree at open,<br/>and again on every schema change
+    A->>WG: commit {email: "ada@example.com"}
+    B->>WG: commit {email: "ada@example.com"}   [queues]
+    WG->>P: A admitted
+    P->>P: pass 1 — keys this tx releases (from current state)
+    P->>P: pass 2 — keys it claims, vs registry, vs releases, vs its own ops
+    P->>R: Owner(email=ada@…) → free
+    P-->>WG: plan{claim: email → docA}
+    WG->>D: AppendCommit
+    WG->>R: Apply(retract, claim)
+    WG-->>A: commit hash
+    WG->>P: B admitted
+    P->>R: Owner(email=ada@…) → docA
+    P-->>B: ResultSchemaError · UNIQUE_CONSTRAINT<br/>"value already held by document docA"
+```
+
+A claim is legal in exactly three cases — nobody holds the key, this document already holds it, or
+the holder releases it **in this same transaction**. Absent and null values claim nothing (SQL
+semantics), values canonicalise through `encoding/json` so `1` and `1.0` collide, and strings stay
+byte-wise (case-insensitive uniqueness is a schema decision, not a default).
+
+**Rebuild on open and on schema change:**
+
+```mermaid
+flowchart TD
+    A[runtime construction] --> B[RebuildUniqueKeys: scan the tree at head]
+    B -- clean --> C[registry populated, enforcement live]
+    B -- duplicate found --> D["UniqueKeyRebuildError recorded — runtime still opens"]
+    D --> D1["an operator can see and fix it —<br/>refusing to open would remove every tool for fixing it"]
+    E["CREATE TABLE / migration → SetSchemaChecked"] --> F[apply schema, rebuild]
+    F -- clean --> G[schema takes effect]
+    F -- existing data violates the new constraint --> H[roll the schema back,<br/>rebuild against the old one,<br/>return the error]
+```
+
+-----
+
+## 21. Compare-and-set and insert-if-absent
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant S as server
+    participant E as evaluatePreconditions
+    participant ST as storage
+
+    C->>S: GetJSONWithHash(docID) → body, hash H0
+    C->>C: compute next value from body
+    C->>S: TX_COMMIT {write docID, precondition: ExpectContentHash(H0)}
+    S->>E: evaluate against the TARGET tree, inside the write gate
+    E->>ST: GetDocument(docID)
+    alt stored hash == H0
+        E-->>S: holds → commit proceeds (base-version conflict check skipped for this op)
+        S-->>C: commit hash
+    else stored hash == H1
+        E-->>S: fails
+        S-->>C: CONFLICT_REPORT · PRECONDITION_FAILED · actualContentHash = H1
+        C->>C: errors.Is(err, ErrPreconditionFailed) → re-read and retry
+    end
+```
+
+`client.CompareAndSwap(ctx, ns, docID, maxAttempts, update)` is that loop:
+
+```mermaid
+flowchart LR
+    A[read + hash] --> B[update current]
+    B -- returns nil --> B1[ErrAborted, nothing written]
+    B --> C{document existed?}
+    C -- no --> D[PutIfAbsent]
+    C -- yes --> E[ReplaceIf expected hash]
+    D & E --> F{result}
+    F -- ok --> G[commit hash]
+    F -- lost race --> A
+    F -- schema / unique / transport error --> H[return immediately]
+```
+
+Every attempt **re-reads**: a caller recomputing from a stale value is precisely the lost update
+this exists to prevent, so the read cannot be hoisted out of the loop. Only a lost race is retried
+— a schema violation or a unique collision fails identically next time and would just burn the
+attempt budget and the server's write gate.
+
+**Why `ExpectContentHash` is literal:** conflict detection treats a write whose content already
+equals what is stored as a passing no-op. A compare-and-set cannot inherit that — the caller is
+asserting that the state is still the one it read, not that its own write would change anything.
+A stale expected hash therefore fails even when the incoming bytes are identical.
+
+-----
+
+## 22. Document leases and fencing
+
+For work that spans round trips — a human with an edit form open — where optimistic retry is the
+wrong shape.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as client A
+    participant B as client B
+    participant H as lock handlers
+    participant LM as LockManager
+    participant S as session
+
+    A->>H: LOCK_ACQUIRE {docID, ttlMillis}  [clamped: default 30s, max 5min]
+    H->>LM: TryAcquireLease → fence F1
+    H->>S: TrackLease
+    H-->>A: LOCK_RESULT {granted, fence F1, expiresAt}
+    B->>H: LOCK_ACQUIRE {same docID}
+    H-->>B: LOCK_RESULT {granted=false, holderSessionId=A}
+    B->>H: UPSERT {same docID}
+    H->>LM: AssertUnheldByOthers → held by A
+    H-->>B: UPSERT_RESULT {error: document locked}
+
+    Note over A: A stalls — GC pause, descheduled container
+    Note over LM: lease lapses; expiry is evaluated lazily on the next lookup
+    B->>H: LOCK_ACQUIRE {same docID}
+    H->>LM: TryAcquireLease → new fence F2
+    H-->>B: granted
+    A->>H: TX_COMMIT {write docID}   [A still believes it holds the lease]
+    H->>LM: ValidateFences([{A, F1}])
+    LM-->>H: stale — current holder is B at F2
+    H-->>A: DocumentLocked — the write never lands
+```
+
+| Property | Rule |
+|----------|------|
+| Expiry | evaluated **lazily on every lookup**, so correctness never depends on the sweeper having run; `Sweep` is map hygiene only |
+| Fence | monotonic per document, outliving the lock itself. A renewal keeps its fence; a change of holder mints a new one, so a client that sees its fence change across a renew knows the lease was lost and re-taken rather than extended |
+| Scope | leases bind **every** write path, not just `TX_COMMIT` — `UPSERT` carries a `sessionId` so the holder's own upsert can be told from a stranger's |
+| Commit path | takes no locks of its own; it calls `AssertUnheldByOthers`. The old take-all-then-release refused every other writer to the same document while one writer sat in the gate, turning ordinary contention into a storm of unclearable failures |
+| Disconnect | `closeAllSessions` releases every lock and ends every session on connection close |
+| Release on commit | `ReleaseLeases` drops only what *that call* granted (`GrantedNow`), so committing never revokes a lease the client took explicitly and still expects to hold |
+
+-----
+
+## 23. Read-only replicas
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as writer process
+    participant R1 as reader process 1
+    participant R2 as reader process 2
+    participant M as kdb-inspect
+    participant FS as data directory
+
+    W->>FS: .kdb.lock SHARED + .kdb.write.lock EXCLUSIVE
+    R1->>FS: .kdb.lock SHARED           [coexists with the live writer]
+    R2->>FS: .kdb.lock SHARED
+    Note over R1,R2: TargetReadOnly — no WAL, no delta writer,<br/>delta reader only; creates no files
+    W->>FS: commits append to the delta log
+    R1->>R1: Refresh() → replay new segments onto its DAG
+    R1->>R1: writes refused up front by AssertWritable
+    M->>FS: LockDataDir → .kdb.lock EXCLUSIVE
+    Note over M: blocked until every reader and the writer detach —<br/>which is what "no live runtime" means
+```
+
+A reader's view is a snapshot as of its open; `Refresh()` advances it. There is no way to be
+continuously current with another process, so a caller that needs a freshness bound refreshes on
+its own cadence and treats staleness as an explicit part of its contract. Unix only — the shared
+lock needs `flock(2)`.
 
 -----
 

@@ -56,7 +56,8 @@ overflow, empty input is rejected, and trailing bytes after a complete value are
 | `Code` | stable numeric codes; **values never change once published** (1001 decode, 3001 schema violation, 4001 conflict, 4002 document locked, 4102 data directory locked, 6001 unsupported protocol, 6301/6302 auth …) |
 | `Result[T]` | success/failure carrier used by schema validation and migration |
 | `FieldViolation` | `{FieldName, ViolationType, Detail}` |
-| `ConflictReport` / `ConflictItem` | structured conflict payload sent over the wire: transaction id, base hash, target hash, per-document local/incoming JSON, `ConflictOperationType` (`ConcurrentWrite`, `DeleteWrite`, `WriteDelete`) |
+| `ConflictReport` / `ConflictItem` | structured conflict payload sent over the wire: transaction id, base hash, target hash, per-document local/incoming JSON, `ConflictOperationType` (`ConcurrentWrite`, `DeleteWrite`, `WriteDelete`, `PreconditionFailed`), and `ActualContentHash` (set for `PreconditionFailed`, so a compare-and-set caller can retry against the value that beat it; `omitempty`, so the JSON shape stays compatible with readers that predate preconditions) |
+| `ViolationType` | `RequiredFieldMissing`, `TypeMismatch`, `UniqueConstraint`, `EnumValueNotDeclared`, `CustomConstraint`, each with a `String()` that names it in error text |
 | typed errors | `VersionNotFoundError`, `DocumentLockedError`, `IceStorageError`, `SchemaViolationError`, `UnsupportedProtocolVersionError`, `EncodingNegotiationFailureError`, … each exposing `Code()` |
 
 The full code table and the wire-level `ErrorCode` mapping are in
@@ -93,7 +94,8 @@ erroring (get semantics) while writes error (set semantics).
 | `trieNode` / `trieLeaf` (internal) | 16-way radix nodes over UUID nibbles; `leafHash`, `internalHash`, `trieInsert/Delete/Build/Get/Walk/TreeHash` |
 | `Commit` | see [Part 0 §5.5]; `BuildCommit`, `ComputeCommitHash`, `ToPayloadBytes`, `FromPayloadBytes` |
 | `Op` union | `WriteOp`, `DeleteOp`, `FileWriteOp`, `SchemaMigrationOp`, plus `OpFromValue` |
-| `Transaction{ID, BaseVersion, Operations, Timestamp, AuthorNodeID}` | the unit submitted to the transaction engine |
+| `Transaction{ID, BaseVersion, Operations, Preconditions, Timestamp, AuthorNodeID}` | the unit submitted to the transaction engine |
+| `Precondition{OpIndex, Kind, ContentHash}` + `PreconditionsByOpIndex` | per-operation assertions on the envelope; a duplicate op index is an error, not last-wins — two contradictory assertions about one operation have no defensible resolution |
 | `Branch`, `Tag`, `CommitStub` | version pointers and archive stubs |
 | `EnsureIDInJSON` | injects/validates the `id` field |
 | `SHA256Digest`, `WireRegistry()` | hashing and the `dev.kdb.document` codec schemas |
@@ -162,15 +164,23 @@ Blob-backed file records: a `FileWriteOp` references a blob already written via
 | Type | Role |
 |------|------|
 | `Engine` (interface) | `Commit`, `Replay`, `Merge`, `Validate`, `ConflictPolicy()`, `CustomResolver()` |
-| `defaultEngine` | the only implementation; stateless apart from its policy and resolver |
+| `defaultEngine` | the only implementation; state is its policy, resolver, unique-key registry, and precondition switch |
+| `EngineOptions` | `{UniqueKeys *UniqueKeyRegistry, Preconditions bool}`; `NewEngineWithOptions(policy, resolver, opts)`. `NewEngine` is the zero-options form — **no unique enforcement, no precondition evaluation** |
 | `ConflictPolicy` | `AppendOnly`, `LastWrite`, `Strict`, `Custom` |
 | `ConflictResolver` | `Resolve(DocumentConflict) (*Document, error)` — consulted under `Custom` |
 | `TransactionResult` union | `ResultSuccess{Commit, NewTreeHash}`, `ResultConflict{Report, ConflictingOps}`, `ResultSchemaError{Violations}`, `ResultAborted{Cause}` |
-| `OperationConflict` / `OperationViolation` | per-op diagnostics carrying base/existing/incoming documents |
+| `OperationConflict` / `OperationViolation` | per-op diagnostics carrying base/existing/incoming documents; `OperationConflict.ActualContentHash` is set for a failed precondition |
 | `Builder` | accumulates `Write`/`Delete` ops against a base version, `Build(timestamp)` → `Transaction`; `NewBuilder` anchors at the DAG head |
-| `LockManager` | per-`(namespace, docID)` exclusive locks owned by a session id |
+| `UniqueKeyRegistry` | the authoritative `(namespace, field, value) → docID` owner map — see §1.9.1 |
+| `LockManager` | per-`(namespace, docID)` exclusive locks, with leases and fence tokens — see §1.9.3 |
+| `Lease` | `{NamespaceID, DocID, SessionID, Fence, ExpiresAt, GrantedNow}` |
 | `DocumentIDsIn(ops)` | distinct document ids referenced by a transaction |
 | `DecodeMigration` | decodes a `SchemaMigrationOp` payload |
+
+Two engines share one runtime's state: `KdbServerRuntime` constructs `TransactionEngine`
+(`Strict`) and `UpsertEngine` (`LastWrite`) with the **same** `EngineOptions`, because both write
+into the same namespace — two registries would each be blind to the other's claims and neither
+would be authoritative.
 
 **`defaultEngine.Commit` in phases** (full sequence in [Part 2 §3](kdb-lld-flows.md)):
 
@@ -180,19 +190,117 @@ Blob-backed file records: a `FileWriteOp` references a blob already written via
 3. **Schema phase** — `runSchemaPhase` merges each `WriteOp` patch onto its base document,
    validates against the rolling schema, applies `SchemaMigrationOp`s, and collects
    `writesByOpIndex`.
-4. **Conflict detection** — under `Strict`/`Custom`, `detectConflicts` compares each touched
+4. **Preconditions** — `evaluatePreconditions` checks every declared assertion against the
+   *target* tree. Runs **before and independently of** the conflict policy, so
+   insert-if-absent works on the `LastWrite` upsert engine too. A failure is a
+   `ResultConflict` of type `PreconditionFailed`; a malformed set (duplicate or out-of-range
+   op index, a precondition on an op that names no document) is a `ResultSchemaError`.
+5. **Conflict detection** — under `Strict`/`Custom`, `detectConflicts` compares each touched
    document's content hash at *base tree* vs *target tree*; equal hashes are not conflicts.
-   `AppendOnly` and `LastWrite` skip detection entirely.
-5. **Resolution** — `Custom` calls the resolver per conflicting `WriteOp` and re-validates the
+   `AppendOnly` and `LastWrite` skip detection entirely. **Operations carrying a precondition
+   are exempt** (`guardedOpIndexes`) — see §1.9.2.
+6. **Resolution** — `Custom` calls the resolver per conflicting `WriteOp` and re-validates the
    resolved document; anything else, or a nil result, degrades to reporting the conflict.
-6. **Write phase** — staged `PutDocument`/`DeleteDocument` calls; **any error triggers
+7. **Unique constraints** — `planUniqueKeys` resolves the transaction's whole net effect on the
+   registry and reports violations, mutating nothing. Runs *after* resolution (so a custom
+   resolver's rewritten document is what gets checked) and *before* any write is staged (so a
+   violation costs nothing to unwind).
+8. **Write phase** — staged `PutDocument`/`DeleteDocument` calls; **any error triggers
    `DiscardPending` and returns `ResultAborted`**.
-7. **Publish** — `CommitTree(parentTreeHash)` then `AppendCommit`, returning `ResultSuccess`.
+9. **Publish** — `CommitTree(parentTreeHash)` then `AppendCommit`, then `UniqueKeyRegistry.Apply`
+   — the registry moves only once the commit is in the DAG.
 
 `Replay` is `Commit` with base = baseline = target = the replay target (no optimistic check):
 the Mode 2 write-back and merge-step path. `Merge` finds the common ancestor, topologically
 sorts the merged branch's commits (`topoSort`, Kahn's algorithm with deterministic hex-ordered
 tie-breaks), replays each onto the primary head, then appends a real two-parent merge commit.
+
+#### 1.9.1 `UniqueKeyRegistry` — enforcing `unique=true`
+
+`schema.Field.Unique` was metadata no write path consulted; this is what makes it binding.
+
+| Member | Role |
+|--------|------|
+| `UniqueKey{NamespaceID, FieldName, Value}` | one claimed value; `Value` is a **canonical** JSON rendering, so `{"n":1}` and `{"n":1.0}` collide |
+| `Owner(key)`, `Len()` | current holder / claim count |
+| `Apply(retract, claim)` | retract-then-claim as one atomic step, so a value moving between documents never transiently frees the key. A retraction whose key is owned by a *different* document is ignored |
+| `Rebuild(ns, store, treeHash, schema)` | repopulates from every document at a tree; a duplicate found during the scan is an **error**, not a silently-kept first winner |
+| `Reset()` | drops every claim, before a rebuild |
+| `UniqueKeysFor(ns, schema, doc)` | the keys a document claims |
+| `UniqueConstraintError{Key, OwnerDocID, DocID}` | carries *who already holds it* — the one thing a client needs |
+| `planUniqueKeys(...)` | two passes: everything the transaction releases, then everything it claims |
+
+Semantics worth knowing:
+
+- **Absent and null claim nothing** (SQL semantics — many rows may omit an optional unique field).
+- **Strings compare byte-wise.** Case-insensitive uniqueness is a schema decision, not a default
+  this layer imposes.
+- A claim is legal in exactly three cases: nobody holds the key; this document already holds it;
+  or the current holder releases it **in the same transaction** (a swap, or delete-then-recreate).
+- Two operations in one transaction claiming the same key is a violation — atomicity is not a
+  laundering mechanism.
+- The registry is **derived state**, rebuilt from the document tree on open and on schema change,
+  never persisted separately: a derived structure with its own persistence path is a second source
+  of truth and a second recovery bug.
+- Composite (multi-field) uniqueness is **not** implemented; single-field only, matching
+  `schema.Field.Unique`.
+
+#### 1.9.2 Preconditions — compare-and-set
+
+Defined in `document` (`precondition.go`), evaluated in `transaction` (`preconditions.go`).
+
+| Kind | Assertion |
+|------|-----------|
+| `ExpectAny` | nothing (the zero value — an op with no precondition behaves exactly as before) |
+| `ExpectAbsent` | no document exists at the id → insert-if-not-exists |
+| `ExpectPresent` | some document exists, whatever its content |
+| `ExpectContentHash` | the document exists with exactly this content hash → compare-and-set |
+
+`Precondition{OpIndex, Kind, ContentHash}` rides on `Transaction.Preconditions` — the **envelope**,
+never inside an `Op`. An op is committed history and is hashed into the commit; a precondition is
+a request-time assertion about state that no longer exists once the commit lands. Putting it in
+the op would change every op's canonical encoding, and therefore commit hashes, to record
+something that is not a fact about the data.
+
+Two behaviours that look like bugs and are not:
+
+- **`ExpectContentHash` compares literally.** Ordinary conflict detection is content-addressed and
+  treats a write whose content equals what is stored as a passing no-op. A compare-and-set cannot
+  inherit that: the caller is asserting that the state is still the one it read, not that its own
+  write would change anything. A stale expected hash fails even when the incoming bytes match.
+- **A guarded operation is exempt from base-version conflict detection.** Without the exemption, a
+  client that lost one CAS round has a stale cached base version and is then refused for a conflict
+  its precondition already ruled out — permanently, because losing a round is exactly what makes
+  the base stale. This was found by test, not by design; CAS was unusable under contention until it
+  landed.
+
+#### 1.9.3 `LockManager` — leases and fencing
+
+| Method | Role |
+|--------|------|
+| `TryAcquire(ns, docID, sessionID)` | non-expiring lock (the historical form) |
+| `TryAcquireLease(ns, docID, sessionID, ttl)` | lock with a deadline → `Lease` |
+| `Renew(ns, docID, sessionID, ttl)` | extends a lease **keeping its fence**; fails if the session no longer holds it |
+| `Release`, `ReleaseAll(sessionID)`, `ReleaseLeases(leases)` | drop one, all-for-a-session, or only what *this call* granted (`GrantedNow`) |
+| `AssertHeld` | this session holds an unexpired lock |
+| `AssertUnheldByOthers(ns, sessionID, tx)` | **what the commit path uses** |
+| `ValidateFences(leases)` | same session, same fence, not expired — the check that makes leases safe |
+| `Sweep()`, `HeldCount()` | hygiene and metrics |
+| `AcquireAllForTransaction(ns, sessionID, tx, ttl)` | sorted-order all-or-nothing acquire, returning leases |
+| `NewLockManagerWithClock(now)` | injectable clock, so expiry tests are deterministic |
+
+- **Expiry is evaluated lazily** on every lookup (`liveHolderLocked`), so correctness never depends
+  on the sweeper having run. `Sweep` only keeps the map from retaining dead entries.
+- **Fence tokens are monotonic per document** and outlive the lock, so a released-and-re-acquired
+  key never reissues a token a previous holder still has. A renewal keeps its fence; a change of
+  holder mints a new one. Without a fence, a lease is only a hint: expiry hands the document to
+  someone else while the original holder still believes it owns it — worse than no locking at all.
+- **The commit path no longer takes locks of its own.** It calls `AssertUnheldByOthers`. The old
+  take-all-then-release was not merely redundant against the write gate, it was harmful: while one
+  writer sat in the gate holding locks, every other writer to the same document was refused
+  outright instead of queueing, turning contention into a storm of unclearable failures. What the
+  locks were genuinely for — a document under a *client-held* lease must not be written by anyone
+  else — is exactly what the new check enforces.
 
 ### 1.10 `index`
 
@@ -428,11 +536,12 @@ implementation is a skeleton with the policy gate and structure in place, the Ko
 | `Codec` / `DefaultCodec` | `Encode(Message)`, `Decode(frame)`, `EncodeFrameOnly`, `DecodeHeader` |
 | `DecodeHeader` / `PeekHeader` | strict decode (whole frame present) vs. header-only peek used by early admission |
 | `MessageType` | 0x01–0x18, see [Part 6 §2](kdb-lld-protocol.md) |
-| message structs | `HandshakeMessage`, `HandshakeAckMessage`, `SessionBeginMessage/Ack`, `SqlExecMessage`, `SqlResultMessage`, `TxCommitMessage`, `TxRollbackMessage`, `DocumentGetMessage/Result`, `UpsertMessage/Result`, `TransactionReplayMessage`, `ConflictReportMessage`, `DeltaCommitMessage`, `CommitFetchMessage`, `CommitPushMessage`, `CommitPushAckMessage`, `DagDiffMessage`, `CompactionNoticeMessage`, `IceArchiveNoticeMessage`, `SnapshotRequest/Response`, `PositionAckMessage`, `SchemaPushMessage` |
+| message structs | `HandshakeMessage`, `HandshakeAckMessage`, `SessionBeginMessage/Ack`, `SqlExecMessage`, `SqlResultMessage`, `TxCommitMessage`, `TxRollbackMessage`, `DocumentGetMessage/Result`, `UpsertMessage/Result`, `TransactionReplayMessage`, `ConflictReportMessage`, `DeltaCommitMessage`, `CommitFetchMessage`, `CommitPushMessage`, `CommitPushAckMessage`, `DagDiffMessage`, `CompactionNoticeMessage`, `IceArchiveNoticeMessage`, `SnapshotRequest/Response`, `PositionAckMessage`, `SchemaPushMessage`, `LockAcquire/Renew/Release/ResultMessage` |
+| `lock_ops.go` | the lease verbs (0x19–0x1C). `LockAcquire/Renew` carry `TTLMillis` (zero = the server's default, **not** a lease that never expires); `LockResult` returns `Granted`, `Fence`, `ExpiresAtMillis`, and `HolderSessionID` so a blocked client can report *who* it is waiting on |
 | `HandshakeNegotiator` | version and encoding negotiation; rejects out-of-range protocol versions and empty encoding intersections |
 | `PayloadEncoding` | `KdbBinary`, `JSON` (the JSON envelope is what ships today) |
-| `EncodeTransaction` / `DecodeTransaction` | client-built transaction payloads for `TX_COMMIT` |
-| `ErrorCode` | `BUSY`, `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `CONFLICT`, `SCHEMA_VIOLATION`, `UNAUTHORIZED`, `INTERNAL` |
+| `EncodeTransaction` / `DecodeTransaction` | client-built transaction payloads for `TX_COMMIT`, including an additive `preconditions` field (`omitempty`, so a transaction without them encodes exactly as before). An **unrecognised precondition kind is a decode error**, never a silent downgrade to `ExpectAny` — a server that quietly ignored an assertion it did not understand would report success for a write the client believed was guarded |
+| `ErrorCode` | `BUSY`, `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `CONFLICT`, `SCHEMA_VIOLATION`, `UNIQUE_VIOLATION`, `UNAUTHORIZED`, `INTERNAL` |
 | `IndexHint` | replicated index update carried on delta frames |
 
 ### 1.26 `stream`
@@ -487,10 +596,16 @@ hard error — never a silent downgrade.
 
 | Type | Role |
 |------|------|
-| `KdbServerRuntime` | the server-side façade over an embedded runtime: transaction engines (strict + last-write for upsert), SQL engine, `LockManager`, `AuthEngine`, `CommitListener`, write gate, memory guard/admission, draining state, schema RW lock, ref counting |
+| `KdbServerRuntime` | the server-side façade over an embedded runtime: transaction engines (strict + last-write for upsert, sharing one `EngineOptions`), SQL engine, `LockManager`, `UniqueKeys` registry, `AuthEngine`, `CommitListener`, write gate, memory guard/admission, draining state, schema RW lock, runtime-scoped session counter, ref counting |
+| `KdbServerRuntime.RebuildUniqueKeys()` | repopulates the registry from the namespace at the current head — at construction, and again on every schema change. A failure is recorded in `UniqueKeyRebuildError` rather than swallowed, and does **not** prevent the runtime from opening (a namespace whose stored data already violates a constraint is an operator problem, and refusing to open would remove every tool for fixing it) |
+| `KdbServerRuntime.SetSchemaChecked(sch)` | the migration path: applies the schema, rebuilds, and **rolls back** if the existing data already violates a newly declared unique constraint |
+| `KdbServerRuntime.nextSessionOrdinal()` | runtime-scoped session ids. `SessionManager.idSeq` was per-*connection*, so every connection's first session called itself `sess-1` — and since `DocumentLocks` is runtime-global and keys ownership by session id, two connections were treated as one holder, each able to take and release the other's locks |
 | `ServerRuntimeRegistry` | key → runtime with `GetOrOpen`/`Release` ref counting |
 | `writeGate` | `queued` (bounded, default 64) + `running` (capacity 1) channels; `acquire(ctx)` returns `*BusyError` when the queue is full and `*DeadlineExceededError` when the caller's deadline passes; `quiesced()` for drain |
-| `SessionManager` / `KdbSession` | per-connection sessions: id, namespace, `BaseVersion`, `ReadPin` (SNAPSHOT), read consistency, pending `transaction.Builder`, principal |
+| `SessionManager` / `KdbSession` | per-connection sessions: id (runtime-unique), namespace, `BaseVersion`, `ReadPin` (SNAPSHOT), read consistency, pending `transaction.Builder`, principal, and tracked leases |
+| `KdbSession.TrackLease` / `UntrackLease` / `ClearLeases` / `LeasesFor(docIDs)` | the session's own view of the leases it took **explicitly** through `LOCK_ACQUIRE`, guarded by `leaseMu` because frames on one connection dispatch concurrently. Tracked here as well as in the `LockManager` so a commit can tell a client-held lease from the implicit locks a commit takes and drops — releasing by session id would silently revoke the former |
+| `handleLockAcquire` / `handleLockRenew` / `handleLockRelease` (`lock_listen.go`) | the `LOCK_*` verbs; `DefaultLeaseTTL` = 30 s, `MaxLeaseTTL` = 5 min, `clampLeaseTTL` applies both. Authorized as a **write** capability (`TxCommitAction`) — locking exists to exclude other writers. Releasing something not held is not an error |
+| `closeAllSessions` | on connection close: `ReleaseAll` locks, `ClearLeases`, `End` every session. Previously nothing did this, so a dropped client held its locks forever and its session for the process lifetime |
 | `ReadConsistency` | `ReadCommitted`, `ReadYourWrites`, `Snapshot` |
 | `MemoryGuard` | 200 ms sampler over cgroup `memory.current` (or `runtime/metrics` total−released), 5-sample moving average, four `Zone`s with hysteresis and dwell, observer callback |
 | `Zone` | `Normal`, `Elevated`, `High`, `Critical` |
@@ -521,9 +636,32 @@ hard error — never a silent downgrade.
 | `Exec(ctx, ns, sql, args)` | DDL and INSERT (auto-committed as one unit of work) |
 | `Close()` | idempotent |
 
-Sentinel errors: `ErrConflict`, `ErrBusy`, `ErrUnavailable`, `ErrDeadlineExceeded`,
-`ErrNotFound`, `ErrUnauthenticated`, `ErrClosed`, plus `TransportError`. One connection is safe
-for concurrent use (every request carries a correlation id and the read loop demultiplexes).
+**Conditional writes** (`conditional.go`):
+
+| Method | Semantics |
+|--------|-----------|
+| `GetJSONWithHash(ctx, ns, docID)` | `(body, contentHash)` — the hash a later CAS passes back |
+| `PutIfAbsent(ctx, ns, docID, body)` | create exactly once; `*PreconditionError` if it already exists |
+| `ReplaceIf(ctx, ns, docID, body, expectedContentHash)` | compare-and-set |
+| `ReplaceIfPresent(ctx, ns, docID, body)` | update that refuses to create |
+| `CompareAndSwap(ctx, ns, docID, maxAttempts, update)` | read → apply → write loop. **Re-reads every attempt** (a caller recomputing from a stale value is the lost update this exists to prevent), seeds with `nil` when absent, returns `ErrAborted` if `update` returns nil, and retries **only** on a lost race — a schema violation or unique collision fails identically next time |
+
+**Leases** (`lease.go`):
+
+| Method | Semantics |
+|--------|-----------|
+| `AcquireLock(ctx, ns, docID, ttl) → Lease` | exclusive lease for work spanning round trips |
+| `RenewLock(ctx, ns, docID, ttl) → Lease` | extends it; **a changed `Fence` means the lease was lost and re-taken, not extended** |
+| `ReleaseLock(ctx, ns, docID)` | early release; releasing one not held is not an error |
+| `Lease{Namespace, DocumentID, Fence, ExpiresAt}` + `Expired()` | `Expired()` is advisory — the server's clock decides, and the commit-time fence check is what makes the answer safe |
+
+Sentinel errors: `ErrConflict`, `ErrPreconditionFailed`, `ErrLockUnavailable`, `ErrBusy`,
+`ErrUnavailable`, `ErrDeadlineExceeded`, `ErrNotFound`, `ErrUnauthenticated`, `ErrClosed`,
+`ErrAborted`, plus `TransportError`, `*PreconditionError{DocumentID, ActualHash}` and
+`*LockError{holder}`. `ErrPreconditionFailed` is deliberately distinct from `ErrConflict`: a plain
+conflict means "re-read and retry", while a failed precondition may mean the caller's whole
+premise was wrong. One connection is safe for concurrent use (every request carries a correlation
+id and the read loop demultiplexes).
 
 ### 1.31 `driver` — `database/sql`
 
@@ -540,19 +678,47 @@ The Go driver is **embedded-only**; network SQL goes through `client` (or JDBC o
 
 | Type / function | Role |
 |-----------------|------|
-| `EmbeddedKdbRuntime` | `{Catalog, DAG, Storage, Schema, DefaultNamespace, WriteBaseVersion, DataRoot}` plus `release` and `storageClose`; `Close()` flushes/seals then releases the directory lock |
+| `EmbeddedKdbRuntime` | `{Catalog, DAG, Storage, Schema, DefaultNamespace, WriteBaseVersion, DataRoot, ReadOnly}` plus `refresh`, `release` and `storageClose`; `Close()` flushes/seals then releases the directory lock |
+| `AssertWritable()` / `ErrReadOnly` | every write path checks at its entry point — a read-only runtime has no WAL and no delta writer, so a write that got further would fail deep in the engine naming a missing component instead of the actual reason |
+| `Refresh()` | re-reads the writer's committed history onto a read-only runtime's DAG. A reader's view is always a snapshot of some past moment; callers needing a freshness bound refresh on their own cadence and treat staleness as an explicit part of their contract |
 | `OpenMemoryRuntime(catalog, ns, schema)` | in-memory DAG + `storage/mem` adapter |
 | `OpenFileRuntime` / `OpenFileRuntimeWithOptions` | directory lock → namespace dirs → platform IO (with optional S3 replica) → `ServerEngine` handle → **delta replay** → `PersistingCommitDAG` |
-| `FileRuntimeOptions` / `StorageOptions` | S3 config, replication policy, durability, compression, async interval, sync mode |
+| `OpenReadOnlyFileRuntime(...)` | shared-attach open alongside a live writer: `engine.TargetReadOnly` (no WAL, no delta writer, delta **reader** only), creates no directories or `meta.json`, skips schema sync, and wires `Refresh`. Unix only — the shared lock needs `flock(2)` |
+| `FileRuntimeOptions` / `StorageOptions` | S3 config, replication policy, `ReadOnly`, durability, compression, async interval, sync mode, memory budget |
 | `PersistingCommitDAG` | `dag.CommitDAG` wrapper that persists every appended commit; `Persist`, `PersistAsync` (queue under a lock, wait after releasing it), `Delegate()`, `Close()` |
 | `commitLogWriter` | single drain goroutine, batch ≤ 256, coalesced flush, **fail-stop latch** on any append/flush error |
 | `replayDeltaNamespace` | reads every segment in sequence order, tolerates a torn tail **only on the most recent segment**, then applies commits **topologically** |
 | `applyCommitsTopologically` | round-based: a commit applies only once all parents are present; no progress in a round = the log is missing data (named error) |
 | `MaterializeCommit` | replays one commit's ops into storage and verifies the rebuilt tree hash matches the commit's declared hash (`TreeHashMismatchError`) |
 | `PutJSONDocument` | the simple embedded write path used by the CLI |
-| `acquireDirLock` / `LockDataDir` | exclusive `flock` on `{dataRoot}/.kdb.lock` (unix) with a portable fallback |
+| `acquireDirLock` / `acquireDirLockShared` / `acquireDirLockExclusive` / `LockDataDir` | the **two-file** lock scheme — see §1.32.1 |
 | `OpenFileAuthRegistry` | durable RBAC registry under `_system/users`, `_system/roles` |
 | `buildSegmentByteStore` | OS store, optionally wrapped with S3 replicas |
+
+#### 1.32.1 The two-file directory lock
+
+"Who may open this directory" and "who may write to it" are different questions, and collapsing
+them into one lock made read replicas impossible.
+
+| Holder | `.kdb.lock` (attach) | `.kdb.write.lock` |
+|--------|----------------------|-------------------|
+| writable runtime | **shared** | **exclusive** |
+| read-only runtime | **shared** | — |
+| maintenance (`LockDataDir`, `kdb-inspect`) | **exclusive** | — |
+
+That yields all four relationships that matter: many readers coexist, at most one writer exists,
+readers coexist with a *live* writer, and maintenance excludes everyone. Keeping one lock and
+merely giving readers `LOCK_SH` would have meant a replica could attach only to a directory whose
+writer had stopped — a read replica that requires the thing it replicates to be down.
+
+**Mixed versions stay safe by construction:** an older binary takes `.kdb.lock` exclusively to
+write, which blocks every new-style shared attach. The worst case of running old and new together
+is refusing to open, never two writers.
+
+Non-unix platforms have no shared mode (the fallback is a single-holder `O_EXCL` create), so
+`acquireDirLockShared` returns an error there rather than silently degrading to an exclusive lock
+(which would make a "read-only replica" exclude the writer) or to no lock at all (which would let
+a reader attach to a directory being mutated underneath it).
 
 -----
 

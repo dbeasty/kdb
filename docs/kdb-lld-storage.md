@@ -54,7 +54,9 @@ from the delta log alone — which is why backup, verify, and restore all operat
 
 ```
 <dataRoot>/
-├── .kdb.lock                       exclusive flock; holds "pid=…\nruntime=…"
+├── .kdb.lock                       ATTACH lock — shared by every runtime, exclusive for maintenance
+├── .kdb.write.lock                 WRITER lock — exclusive, held only by a writable runtime;
+│                                   holds "pid=…\nruntime=…"
 ├── costmodel.json                  learned scan-cost priors (kdb-service; a cache — safe to delete)
 └── ns/
     └── <namespaceId>/              e.g. myapp/users → ns/myapp/users/
@@ -83,6 +85,26 @@ Rules the naming scheme encodes:
 | WAL rotation appends `.{firstSequence}` (zero-padded) | a sealed WAL segment's last sequence is its successor's `firstSequence − 1`, which is all truncation needs |
 | Every segment path must start with `ns/` and must not contain `..` | `ValidateSegmentName`, enforced on every shim call |
 | Quarantined bytes live **outside** `delta/` | a quarantine file inside `delta/` would parse as a legacy segment and make the namespace unopenable |
+| Two lock files, not one | "who may open this directory" and "who may write to it" are different questions — see below |
+
+### 2.1 The two-file lock
+
+| Holder | `.kdb.lock` (attach) | `.kdb.write.lock` |
+|--------|----------------------|-------------------|
+| writable runtime | shared | **exclusive** |
+| read-only runtime | shared | — |
+| maintenance (`LockDataDir`, `kdb-inspect`) | **exclusive** | — |
+
+Many readers coexist; at most one writer exists; readers coexist with a *live* writer; maintenance
+excludes everyone. A single lock with `LOCK_SH` for readers could not express the third: a replica
+would attach only to a directory whose writer had stopped. Mixed versions stay safe because an
+older binary takes the attach lock exclusively to write — the worst case is refusing to open, never
+two writers. Non-unix platforms have no shared mode and say so rather than degrading.
+
+A read-only runtime opens with `engine.TargetReadOnly`: **no WAL, no delta writer, delta reader
+only**, and it creates nothing — no namespace directories, no `meta.json` — because the directory
+belongs to the writer. Its view is a snapshot as of the open; `Refresh()` replays whatever the
+writer has since made durable.
 
 -----
 

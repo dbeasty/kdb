@@ -168,7 +168,9 @@ INSERT INTO users (name, age) VALUES ('Ada', 36), ('Grace', 45);
 ```
 
 - Each row mints a **fresh random UUID** — `INSERT` cannot target a caller-chosen document id.
-  Use `client.PutJSON` / `Upsert` (or the embedded API) for that.
+  Use `client.PutJSON` / `Upsert` / `PutIfAbsent` (or the embedded API) for that.
+- A `unique`-declared field is enforced at commit: a colliding row fails with `UNIQUE_VIOLATION`
+  naming the field and the document that already holds the value (see §2.8).
 - Column values are written into an empty JSON object via JSONPath `$.<column>`, so an INSERT
   produces a document containing exactly the named columns.
 - The resulting document is schema-validated before the operation is produced; a violation is a
@@ -184,6 +186,9 @@ CREATE TABLE users (name VARCHAR NOT NULL, age INT, email VARCHAR);
 
 - Builds a `KdbSchema` with `Version = 1`; every column is `Indexed = true`, `NOT NULL` maps to
   `Required`.
+- Applied through `SetSchemaChecked`: if the new schema declares a `unique` field that the data
+  already violates, the migration is **rejected and rolled back** rather than left permanently at
+  odds with its own namespace.
 - Fails if the namespace already has a schema (there is no `ALTER TABLE` in the Go parser; schema
   evolution goes through `schema.MigrationBuilder`).
 - On the server the applied schema is stored under the runtime's schema lock and takes effect for
@@ -191,7 +196,32 @@ CREATE TABLE users (name VARCHAR NOT NULL, age INT, email VARCHAR);
 - `CREATE TABLE` is **not** a read: `SqlExecAction.ReadOnly` is false for it, so a read-only
   principal cannot use it to rewrite the namespace schema.
 
-### 2.7 Versioned reads (the hybrid layer)
+### 2.7 Unique constraints and conditional writes
+
+`unique` on a schema field is enforced by the commit path, not by SQL. `SELECT` is unaffected;
+every write — `INSERT`, `Upsert`, `Commit`, `PutIfAbsent` — is checked against a registry of
+`(namespace, field, value) → docID` inside the write gate:
+
+| Situation | Result |
+|-----------|--------|
+| the value is free | claimed |
+| this document already holds it | allowed (rewriting without changing the field) |
+| the holder releases it in the same transaction | allowed (a swap, or delete-then-recreate) |
+| two operations in one transaction claim it | violation — atomicity is not a laundering mechanism |
+| another document holds it | `UNIQUE_VIOLATION`, naming the owner |
+
+Absent and JSON-null values claim nothing (SQL semantics — an optional unique field would
+otherwise admit exactly one document that omits it). Values canonicalise through `encoding/json`,
+so `1` and `1.0` collide; strings compare byte-wise, so case-insensitive uniqueness is something a
+schema must express rather than something the engine assumes.
+
+**Conditional writes are not SQL.** There is no `INSERT … ON CONFLICT` and no `UPDATE … WHERE
+version = ?`; compare-and-set lives on the client API (`PutIfAbsent`, `ReplaceIf`,
+`ReplaceIfPresent`, `CompareAndSwap`), because a precondition is an assertion about a document's
+identity of state, which the SQL surface has no way to name. See
+[Part 2 §21](kdb-lld-flows.md#21-compare-and-set-and-insert-if-absent).
+
+### 2.8 Versioned reads (the hybrid layer)
 
 `query/hybrid` accepts a trailing version clause and strips it before the base parser runs:
 
@@ -383,8 +413,10 @@ Documented precisely because each of these will surprise someone:
 | 10 | **`INSERT` always mints a new UUID** | write at a chosen id via `PutJSON`/`Upsert`/the embedded API |
 | 11 | **Only top-level schema fields are addressable as columns** | nested access is via `_doc` plus JSON functions in the host language |
 | 12 | **No `UPDATE`/`DELETE` in the Go parser** | delete via a `DeleteOp` transaction; update via `Upsert` or a read-modify-`Commit` |
-| 13 | **`CREATE TABLE` is once per namespace** | evolve with `schema.MigrationBuilder` + a `SchemaMigrationOp` |
+| 13 | **`CREATE TABLE` is once per namespace** | evolve with `schema.MigrationBuilder` + a `SchemaMigrationOp`; a migration that turns a field `unique` is rejected if existing data already violates it |
 | 14 | **Statement text must not carry a trailing `;`** | there is no statement terminator in the grammar |
+| 15 | **No `INSERT … ON CONFLICT` / conditional UPDATE** | conditional writes are a client-API primitive, not SQL — see §2.7 |
+| 16 | **`unique` is enforced at commit, not by the planner** | it costs a registry lookup per write, and does *not* make reads index-accelerated |
 
 -----
 
@@ -402,6 +434,9 @@ The Kotlin `:kdb-sql` module implements a substantially larger grammar, and JDBC
 | `COUNT` | ✅ | ✅ |
 | `SUM`/`AVG`/`MIN`/`MAX` | ✖ | ✅ |
 | `ORDER BY SIMILARITY(col, 'text')` (vector) | ✖ | ✅ |
+| `unique` constraint enforced on write | ✅ | ✖ (metadata only) |
+| Conditional writes / compare-and-set | ✅ (client API) | ✖ |
+| Document leases with fencing | ✅ (client API) | ✖ (server-side implicit locks only) |
 | `INSERT` | ✅ | ✅ |
 | `UPDATE` / `DELETE` | ✖ | ✅ |
 | `CREATE/DROP TABLE` | create only | ✅ |

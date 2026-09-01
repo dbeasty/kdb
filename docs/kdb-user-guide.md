@@ -27,6 +27,8 @@ for native servers, the CLI, `database/sql`, WASM, and mobile bindings.
 | **Go `database/sql` driver** (`kdb://memory:` / `kdb://file:`) | Implemented (embedded only) |
 | **Go CLI** (`kdb`) — `init`, `put`, `get`, `query`, `log`, `status`, `branch`, `unlock` | Implemented |
 | **Resource governance** — memory admission, scan budgets, typed backpressure, abort watchdog | Implemented (Go) |
+| **Multi-writer safety** — `unique` constraints enforced on write, compare-and-set / insert-if-absent, document leases with fencing | Implemented (Go); Kotlin has none of the three |
+| **Read-only replicas** — several reader processes alongside one live writer | Implemented (Go, unix only) |
 | **Integrity & recovery** — `verify`, `repair-segments`, `backup`, `restore` | Implemented (Go, `kdb-inspect`) |
 | Encryption at rest | Specified only ([Layer 14](kdb-spec-layer14-encryption-at-rest.md)) |
 | **Product CLI** (`:kdb-cli`) — `init`, `put`, `get`, `query`, `log`, `status`, `sync`, `shell` | Implemented via Gradle `runCli` |
@@ -51,14 +53,17 @@ for native servers, the CLI, `database/sql`, WASM, and mobile bindings.
 | store data inside one Go process | `database/sql` driver or the embedded runtime | [Go embedded](#go--embedded-databasesql) |
 | store data inside one JVM process | JDBC embedded (`jdbc:kdb:memory://` / `file://`) | [JDBC](#jdbc-java--what-you-can-do-today) |
 | share one database between processes or hosts | run `kdb-service`, connect with the Go client SDK or JDBC network | [Running a server](#running-a-server-kdb-service) |
+| write from several application instances at once | unique constraints, compare-and-set, or leases | [Concurrent writers and readers](#concurrent-writers-and-readers) |
+| read from several processes on one data directory | read-only runtimes alongside the writer | [Read-only replicas](#4-read-only-replicas-unix) |
 | script or inspect a workspace from a shell | the `kdb` CLI (Go) or `:kdb-cli` (Kotlin) | [Command-line usage](#command-line-usage) |
 | push live changes to browsers or caches | `kdb-service --stream-addr`, Mode 1 / Mode 2 subscribers | [Stream modes](#stream-subscribe-over-websocket) |
 | keep independent replicas that merge later | `kdb-service --peer-addr` peer sync | [Peer sync](#peer-sync) |
 | back up, verify, or repair a data directory | `kdb-inspect` | [Operations](#operations--durability-backup-and-recovery) |
 
-**One writer per data directory.** File mode takes an exclusive lock on `{dataDir}/.kdb.lock`.
-A second process opening the same directory fails immediately with a clear error. Use a server
-when more than one process needs to write.
+**One writer per data directory.** A writable runtime holds `{dataDir}/.kdb.write.lock`
+exclusively; a second writer fails immediately with a clear error. **Readers are different:**
+read-only runtimes attach under a shared `{dataDir}/.kdb.lock` and coexist with a live writer
+(unix). Use a server when more than one process needs to *write*.
 
 ---
 
@@ -189,6 +194,9 @@ Schemes accepted: `tcp://`, `tcps://`, `ws://`, `wss://`, or a bare `host:port` 
 | Test | Meaning | What to do |
 |------|---------|-----------|
 | `errors.Is(err, client.ErrConflict)` | someone else committed against your base version | re-read, rebase, retry |
+| `errors.Is(err, client.ErrPreconditionFailed)` | your `PutIfAbsent`/`ReplaceIf` assertion did not hold | re-read and re-derive — **do not blind-retry**; `*PreconditionError.ActualHash` is what beat you |
+| `errors.Is(err, client.ErrLockUnavailable)` | another session holds a lease on the document | wait, or report the holder from `*LockError` |
+| unique collision (`UNIQUE_VIOLATION` in the message) | another document already holds that value | change the value; retrying is pointless |
 | `errors.Is(err, client.ErrBusy)` | server queue full or under memory pressure | wait `(*BusyError).RetryAfter()`, retry |
 | `errors.Is(err, client.ErrDeadlineExceeded)` | your deadline passed while queued | retry with a longer deadline |
 | `errors.Is(err, client.ErrUnavailable)` | server is shutting down | reconnect (likely to a restarted instance) |
@@ -483,6 +491,7 @@ a Go server gets the Go grammar:
 | `CREATE USER/ROLE`, `GRANT`/`REVOKE` | ✖ (Go API only) | ✅ |
 | `BEGIN` / `COMMIT` / `ROLLBACK` in SQL | ✖ (wire `TX_COMMIT`/`TX_ROLLBACK`) | ✅ |
 | `AT VERSION` / `AT COMMIT` / `AT TIME` | ✅ | ✅ |
+| `unique` field enforced on write | ✅ | ✖ (metadata only) |
 
 Things that commonly surprise people (full list in
 [Part 5 §7](kdb-lld-query.md#7-semantics-limits-and-gotchas)):
@@ -944,6 +953,116 @@ Tune sandbox limits per call with `ProcLimits(wallClockMillis, maxHostCalls, max
 
 ---
 
+## Concurrent writers and readers
+
+Several application instances can write through one `kdb-service` safely. Three primitives cover
+it, in the order you should reach for them.
+
+### 1. Unique constraints — "this natural key belongs to one document"
+
+Declare a field `unique` in the schema; the commit path enforces it on **every** write verb
+(`INSERT`, `Upsert`, `Commit`, `PutIfAbsent`). Two clients racing to claim the same email produce
+exactly one winner; the loser gets `UNIQUE_VIOLATION` naming the document that already holds it.
+
+| Rule | Behaviour |
+|------|-----------|
+| absent or `null` values | claim nothing — many documents may omit an optional unique field (SQL semantics) |
+| number spelling | `1` and `1.0` collide (values canonicalise before comparison) |
+| string case | compared **byte-wise** — case-insensitive uniqueness is something your schema must express, not a default |
+| same document rewriting its own value | allowed |
+| a swap or delete-then-recreate inside one transaction | allowed |
+| two rows in one transaction claiming the same value | rejected |
+| composite (multi-field) uniqueness | **not supported** — single-field only |
+
+Turning an existing field unique is validated: if the stored data already contains duplicates the
+migration is **rejected and rolled back**, so the schema and the namespace never disagree. On
+startup the registry is rebuilt by scanning the namespace; a pre-existing duplicate is reported
+(the service still starts, so you have the tools to fix it) and further writes that would compound
+it are refused.
+
+### 2. Conditional writes — insert-if-absent and compare-and-set
+
+```go
+// create exactly once
+commit, err := c.PutIfAbsent(ctx, "myapp/users", docID, body)
+if errors.Is(err, client.ErrPreconditionFailed) { /* someone else created it */ }
+
+// compare-and-set against the value you read
+body, hash, _ := c.GetJSONWithHash(ctx, "myapp/users", docID)
+commit, err = c.ReplaceIf(ctx, "myapp/users", docID, updated, hash)
+
+// or let the SDK run the read-modify-write loop
+commit, err = c.CompareAndSwap(ctx, "myapp/counters", docID, 5, func(current []byte) ([]byte, error) {
+    if current == nil {
+        return []byte(`{"n":1}`), nil     // seed when absent
+    }
+    return bumped(current), nil            // return nil to abort with ErrAborted
+})
+```
+
+`CompareAndSwap` **re-reads on every attempt** (recomputing from a stale value is the lost update
+it exists to prevent) and retries only a lost race — a schema violation or unique collision is
+returned immediately rather than burning attempts.
+
+One behaviour to know: `ReplaceIf` compares the expected hash **literally**. A write whose content
+is byte-identical to what is stored still fails if the hash you passed is stale — a compare-and-set
+asserts that the state is still the one you read, not that your write would change anything.
+
+### 3. Document leases — holding a document across round trips
+
+For "a human has this record open in a form", where optimistic retry is the wrong shape:
+
+```go
+lease, err := c.AcquireLock(ctx, "myapp/users", docID, 60*time.Second)
+if errors.Is(err, client.ErrLockUnavailable) {
+    var le *client.LockError
+    errors.As(err, &le)      // names the current holder
+}
+defer c.ReleaseLock(ctx, "myapp/users", docID)
+
+lease, err = c.RenewLock(ctx, "myapp/users", docID, 60*time.Second)
+// a CHANGED lease.Fence means the lease lapsed and was re-taken — your edit is stale
+```
+
+| Property | Value |
+|----------|-------|
+| default TTL | 30 s (asking for `0` means "the default", never "forever") |
+| maximum TTL | 5 min |
+| enforcement | every write path — including `Upsert` — refuses a document another session holds |
+| stalled holder | a lease that expires is re-grantable; the original holder's commit is refused by a **fence check** rather than silently overwriting the new holder |
+| disconnect | dropping the connection releases every lock and ends every session |
+| your own commits | do **not** release a lease you took explicitly — only the implicit locks a commit takes |
+
+Leases are advisory in one specific sense: they exclude *other sessions*, not your own subsequent
+writes, and the server's clock decides expiry. The fence check at commit time is what makes the
+answer safe.
+
+### 4. Read-only replicas (unix)
+
+Several processes may read one data directory while a writer is live:
+
+```go
+rt, err := embed.OpenReadOnlyFileRuntime("/var/lib/kdb", "myapp", "myapp/users", schema.None())
+defer rt.Close()
+
+// ... read ...
+err = rt.Refresh()   // advance the view to whatever the writer has since made durable
+```
+
+| Holder | `.kdb.lock` (attach) | `.kdb.write.lock` |
+|--------|----------------------|-------------------|
+| writable runtime / service | shared | **exclusive** |
+| read-only runtime | shared | — |
+| `kdb-inspect` maintenance | **exclusive** | — |
+
+So: many readers coexist, at most one writer exists, readers coexist with a *live* writer, and
+maintenance (verify/repair/backup/restore) excludes everyone. A read-only runtime refuses every
+write with `ErrReadOnly`, creates no files, and sees a **snapshot as of its open** — call
+`Refresh()` on whatever cadence your freshness requirement demands, and treat staleness as an
+explicit part of your contract. Unix only: the shared lock needs `flock(2)`.
+
+---
+
 ## Peer sync
 
 Peers are fully independent replicas. Each keeps its own history, may accept writes while
@@ -1073,6 +1192,11 @@ the namespace.
 | `DEADLINE_EXCEEDED` | your call's deadline passed while queued | raise the deadline; check write latency (`kdb_stage_latency_seconds`) |
 | `RESOURCE_EXHAUSTED` | operation larger than the whole grant capacity, or scan row budget exceeded | resubmit smaller / narrow the query / raise `--scan-row-budget` |
 | `CONFLICT` | optimistic concurrency | re-read at the reported head and retry, or use `Upsert` |
+| `UNIQUE_VIOLATION` | another document already holds that value of a `unique` field | change the value — retrying is pointless. The message names the owning document |
+| `PRECONDITION_FAILED` in a conflict report | your `PutIfAbsent`/`ReplaceIf` assertion did not hold | re-read and re-derive; `actualContentHash` is the value that beat you |
+| `document ... is locked by session ...` | another session holds a lease | wait for expiry (default 30 s), or coordinate with the holder |
+| `kdb: runtime is open read-only` | a write against a replica | write through the writer process or the service |
+| `read-only data directory access requires flock(2)` | read-only open on a non-unix platform | not supported there |
 | `UNAUTHORIZED` | RBAC denial | check the principal's grants |
 | `SCHEMA_VIOLATION` | the document does not satisfy the declared schema | fix the payload or migrate the schema |
 | handshake rejected with a reason | wrong client mode, bad credentials, or namespace not authorized | check the listener you connected to and the token |

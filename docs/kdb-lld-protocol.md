@@ -71,10 +71,17 @@ binary encoding is negotiated-capable and used for golden-test parity.
 | `0x14`/`0x15` | `DOCUMENT_GET` / `DOCUMENT_GET_RESULT` | client ⇄ server | point read by document id |
 | `0x16`/`0x17` | `UPSERT` / `UPSERT_RESULT` | client ⇄ server | unconditional write by document id |
 | `0x18` | `COMMIT_PUSH_ACK` | peer → peer | applied count + resulting head for a non-conflicting push |
+| `0x19` | `LOCK_ACQUIRE` | client → server | take an exclusive, expiring, fenced lease on one document |
+| `0x1A` | `LOCK_RENEW` | client → server | extend a lease, keeping its fence |
+| `0x1B` | `LOCK_RELEASE` | client → server | drop a lease early |
+| `0x1C` | `LOCK_RESULT` | server → client | reply to all three lock verbs |
 
 `0x14`–`0x18` are Go-side additions (Component 40 and the missing push ack): the SQL path cannot
 express a read or write **at a caller-chosen document id**, because `INSERT` always mints a fresh
-UUID and there is no identity predicate.
+UUID and there is no identity predicate. `0x19`–`0x1C` are likewise Go-only: pessimistic locking
+that spans client round trips cannot be expressed through the existing set, because the server's
+implicit locks are taken and dropped inside one `TX_COMMIT` — the right shape for a transaction,
+useless for a client holding a document while a human edits it.
 
 ### 2.1 Key payload shapes
 
@@ -95,7 +102,15 @@ SqlResultMessage{ Namespace, SessionID, Columns []string, Rows [][]string,
                   Error *string, ErrorCode *ErrorCode, RetryAfterMs *int }
 
 TxCommitMessage{ Namespace, SessionID, TransactionBytes []byte }
-DocumentGetMessage{ Namespace, DocID }        UpsertMessage{ Namespace, DocID, JSON }
+DocumentGetMessage{ Namespace, DocID }
+UpsertMessage{ Namespace, DocID, JSON, SessionID }   // SessionID is additive: it tells the
+                                                    // lease holder's own upsert from a stranger's
+
+LockAcquireMessage{ Namespace, SessionID, DocID, TTLMillis }   // 0 = the server's default,
+LockRenewMessage{   Namespace, SessionID, DocID, TTLMillis }   // never "never expires"
+LockReleaseMessage{ Namespace, SessionID, DocID }
+LockResultMessage{  Namespace, SessionID, DocID, Granted, Fence, ExpiresAtMillis,
+                    HolderSessionID *string, Error *string, ErrorCode *ErrorCode }
 DeltaCommitPayload{ Namespace, CommitHash, ParentHash, TimestampMicros,
                     Operations, IndexHints, SchemaDeltaBytes }
 ```
@@ -159,21 +174,43 @@ stateDiagram-v2
     Authenticated --> SessionOpen: SESSION_BEGIN_ACK with sessionId
     SessionOpen --> SessionOpen: SQL_EXEC (SELECT executes; INSERT buffers)
     SessionOpen --> SessionOpen: DOCUMENT_GET / UPSERT
+    SessionOpen --> SessionOpen: LOCK_ACQUIRE / LOCK_RENEW / LOCK_RELEASE
     SessionOpen --> Committing: TX_COMMIT
     Committing --> SessionOpen: SQL_RESULT (base version advances)
     Committing --> SessionOpen: CONFLICT_REPORT (nothing written)
     SessionOpen --> SessionOpen: TX_ROLLBACK (locks released, buffer cleared)
-    SessionOpen --> [*]: disconnect (all document locks released)
+    SessionOpen --> [*]: disconnect (every lock released, every session ended)
 ```
 
 | Property | Rule |
 |----------|------|
 | Authentication | once per **connection**, at handshake; the principal is bound for the connection's life (TCP has no per-request auth side channel) |
 | Authorization | at handshake, at every `SESSION_BEGIN`, at every `SQL_EXEC`, and per operation at commit |
-| Session id | client-supplied or server-generated (`sess-N`) |
+| Session id | client-supplied, or server-generated from a **runtime-scoped** counter — it must be unique across connections, because document-lock ownership is keyed by it |
 | Read consistency | `SNAPSHOT` pins `ReadPin` at begin; `READ_COMMITTED` / `READ_YOUR_WRITES` read the live head |
 | Base version | the session's anchor for buffered writes; advances on each successful commit |
-| Document locks | held by session id from `TX_COMMIT`'s acquire until commit completes; also released on rollback and on disconnect |
+| Document locks | the commit path takes none of its own; it refuses only what another session holds. Explicit leases (`LOCK_ACQUIRE`) are held by session id until released, renewed past, or expired, and survive the holder's own commits |
+| Leases | default TTL 30 s, capped at 5 min; validated by fence at commit time; released on `TX_ROLLBACK` and on disconnect |
+
+-----
+
+## 4a. Concurrency control on the wire
+
+Three write-safety mechanisms are visible to a client. They compose: preconditions and unique keys
+are optimistic and need no liveness tracking; leases are the pessimistic escape hatch for holds
+that span round trips.
+
+| Mechanism | Client surface | Server refusal |
+|-----------|----------------|----------------|
+| **Unique keys** | none — declare `unique` on a schema field | `SQL_RESULT`/`UPSERT_RESULT` with `UNIQUE_VIOLATION`, naming the field and the owning document |
+| **Preconditions** | `preconditions` on the transaction envelope (`PutIfAbsent`, `ReplaceIf`, `ReplaceIfPresent`, `CompareAndSwap`) | `CONFLICT_REPORT` with operation type `PRECONDITION_FAILED` and `actualContentHash` |
+| **Leases** | `LOCK_ACQUIRE` / `LOCK_RENEW` / `LOCK_RELEASE` | `LOCK_RESULT{granted:false, holderSessionId}`, or `DocumentLocked` on a write into someone else's lease |
+
+Wire compatibility: `preconditions` is an additive, `omitempty` field on the transaction DTO, so a
+transaction without them encodes byte-for-byte as before. An **unrecognised precondition kind is a
+decode error**, never a silent downgrade to `ExpectAny` — a server that quietly ignored an
+assertion it did not understand would report success for a write the client believed was guarded.
+`ConflictItem.actualContentHash` and `UpsertMessage.sessionId` are additive in the same way.
 
 -----
 
@@ -267,6 +304,7 @@ back to Normal is itself latched as a signal (`ReserveLost`).
 | `RESOURCE_EXHAUSTED` | this operation can never be admitted as written (too large, or scan budget exceeded) | resubmit smaller / narrow the query |
 | `CONFLICT` | optimistic-concurrency conflict | rebase on the new head and retry |
 | `SCHEMA_VIOLATION` | the transaction is invalid | never retry unmodified |
+| `UNIQUE_VIOLATION` | a unique-declared field value is already held by another document | the transaction is well-formed and the *value* is taken — change the value, do not retry as-is |
 | `UNAUTHORIZED` | RBAC denial | never retry unmodified |
 | `INTERNAL` | unclassified | investigate |
 
@@ -274,7 +312,12 @@ Mapping from internal errors (`classifyError`): `BusyError`/`MemoryPressureError
 (with a retry-after derived from the zone), `UnavailableError` → `UNAVAILABLE`,
 `DeadlineExceededError` → `DEADLINE_EXCEEDED`, `ResourceExhaustedError` and
 `sql.ScanRowBudgetExceededError` → `RESOURCE_EXHAUSTED`, `AuthorizationError` → `UNAUTHORIZED`,
-`SchemaError` → `SCHEMA_VIOLATION`, everything else → `INTERNAL`.
+`SchemaError` → `SCHEMA_VIOLATION`, or `UNIQUE_VIOLATION` when `SchemaError.HasUniqueViolation()`
+reports that at least one violation is a `UniqueConstraint`; everything else → `INTERNAL`.
+
+A failed precondition is **not** an error code but a `CONFLICT_REPORT` whose operation type is
+`PRECONDITION_FAILED`, carrying `actualContentHash` — the value that beat the caller, which is
+what a compare-and-set needs in order to re-derive rather than re-read blind.
 
 ### 6.2 Client SDK sentinels
 
@@ -447,7 +490,8 @@ Complete flag reference: [User guide](kdb-user-guide.md).
 |---------|------|
 | Wire protocol version | `1`; a peer outside `[Min, Current]` is rejected at handshake |
 | Message additions | new types are additive; unknown types are a decode error, so a new client must not send them to an old server |
-| Field additions | additive and optional (`ErrorCode`, `RetryAfterMs`, `SessionBeginAck.Error`) — an old reader ignores them |
+| Field additions | additive and optional (`ErrorCode`, `RetryAfterMs`, `SessionBeginAck.Error`, `transaction.preconditions`, `ConflictItem.actualContentHash`, `UpsertMessage.sessionId`) — an old reader ignores them |
+| Enum additions | `ViolationType` and `ConflictOperationType` are iota-based and their ordinals are wire-visible through peer sync, so new members (`UniqueConstraint`, `PreconditionFailed`) are **appended**, never inserted |
 | Delta frame format | v2; the codec is recorded per frame, so compression settings may change freely |
 | SSTable block format | v2; a v1 block is rejected with a clear error rather than mis-decoded |
 | Segment naming | pre-Layer-13 names are refused with a repair instruction, never guessed at |

@@ -73,7 +73,9 @@ sampler, and no watchdog.
 | Lock | Type | Protects | Held during |
 |------|------|----------|-------------|
 | `dag.InMemoryCommitDag.mu` | `RWMutex` | commits, stubs, trees, branches, tags, `hexSorted`, `txIndex`, `ancestryVersion` | map access, hash verification on `PutCommit`, ancestry closure walks |
-| `transaction.LockManager.mu` | `Mutex` | `map[(namespace,docID)]sessionID` | one map operation |
+| `transaction.LockManager.mu` | `Mutex` | `map[(namespace,docID)]lockRecord{sessionID, fence, expiresAt}` plus the per-document monotonic fence counter | one map operation; lazy expiry evicts as a side effect of any lookup |
+| `transaction.UniqueKeyRegistry.mu` | `Mutex` | `map[UniqueKey]docID` | one lookup, or one retract-then-claim `Apply` |
+| `KdbSession.leaseMu` | `Mutex` | the session's tracked explicit leases | one map operation — frames on a connection dispatch concurrently, so a `LOCK_ACQUIRE` and a `TX_COMMIT` can be in flight at once on one session |
 | `ServerEngine.treeMu` | `Mutex` | the running `DocumentTree` | the whole of `CommitTree` |
 | `shardedDocStore.shards[i].mu` ×64 | `Mutex` | committed documents in shard *i* | one map op, or one shard copy in `Range` |
 | `shardedPendingStore.shards[i].mu` ×64 | `Mutex` | staged puts/deletes in shard *i* | one map op |
@@ -130,13 +132,15 @@ takes them in any other order.
 1.  Admission.sem              (bytes; blocking, but only on a context with a deadline)
 2.  writeGate.queued → running (bounded; deadline-aware)
 3.  peersync per-namespace lock (peer paths only)
-4.  transaction.LockManager.mu  (documents, acquired in sorted id order)
-5.  dag.mu
-6.  ServerEngine.treeMu
-7.  shardedDocStore / shardedPendingStore shard mutexes
-8.  memtable.Manager.mu → SortedTable.mu → LsmBlobStore.mu → BlockCache.mu
-9.  wal.mu → FileBackedPlatformIO per-segment mutex → OSByteStore.mu
-10. FileBackedPlatformIO.globalMu   (leaf: always released before doing I/O)
+4.  KdbSession.leaseMu           (read the session's tracked leases; released before the next step)
+5.  transaction.LockManager.mu   (documents, in sorted id order)
+6.  transaction.UniqueKeyRegistry.mu
+7.  dag.mu
+8.  ServerEngine.treeMu
+9.  shardedDocStore / shardedPendingStore shard mutexes
+10. memtable.Manager.mu → SortedTable.mu → LsmBlobStore.mu → BlockCache.mu
+11. wal.mu → FileBackedPlatformIO per-segment mutex → OSByteStore.mu
+12. FileBackedPlatformIO.globalMu   (leaf: always released before doing I/O)
 ```
 
 Rules the code follows, each of which is load-bearing:
@@ -147,9 +151,10 @@ Rules the code follows, each of which is load-bearing:
 - **No blocking acquisition under a lock.** `Admission.applyFloor` runs on the sampler goroutine
   and uses `sem.TryAcquire` only — a blocking acquire there would stop the very measurements that
   decide when to give capacity back.
-- **Document locks are taken in sorted order** (`AcquireAllForTransaction` sorts by id string), so
-  two transactions touching overlapping document sets can never deadlock; on failure, only the
-  locks *this call* newly granted are released.
+- **Document locks are taken in sorted order** (`AcquireAllForTransaction` and
+  `AssertUnheldByOthers` both sort by id string), so two transactions touching overlapping document
+  sets can never deadlock; on failure, only the locks *this call* newly granted are released
+  (`ReleaseLeases` filters on `GrantedNow`), never a lease the client took explicitly.
 - **Per-shard, not per-store.** Document reads and writes to different shards never contend.
 - **Scan copies a shard, then releases.** `shardedDocStore.Range` copies one shard's documents
   under its lock and visits them unlocked, so a slow batch callback never stalls writers.
@@ -326,6 +331,33 @@ than reconstructing the historical tree, which is a documented limitation (see
 
 -----
 
+## 10a. Multi-writer safety primitives
+
+The write gate makes commits *serial*; it does not make concurrent application instances *safe*.
+Three primitives close that gap, and all three are checked and mutated **inside the gate**, which
+is the only place where "read current state, decide, append" is atomic. Any of them evaluated
+outside it is a time-of-check-to-time-of-use bug.
+
+| Primitive | Guards against | Concurrency-relevant property |
+|-----------|----------------|-------------------------------|
+| **Unique-key registry** | two clients creating *different* documents that claim the same natural key — invisible to content-addressed conflict detection | one registry per runtime, shared by the commit and upsert engines; claims applied only after `AppendCommit` succeeds |
+| **Preconditions** (CAS / insert-if-absent) | lost updates, and double-creates that per-document OCC cannot see | evaluated against the *target* tree inside the gate; a guarded op is exempt from base-version conflict detection, which is what makes CAS usable under contention |
+| **Leases + fences** | a holder that stalls past its deadline overwriting whoever took the document next | expiry is lazy (never depends on a sweeper); the fence is monotonic per document and validated at commit time |
+
+**Why a fence is not optional.** An expiring lock without one is strictly worse than no lock: the
+expiry hands the document to a new holder while the original still believes it owns it, so two
+writers proceed simultaneously, each convinced it is exclusive. `ValidateFences` at commit time is
+what converts "your lease expired" from a race into a refusal.
+
+**Why the commit path stopped taking locks.** Writes into one runtime are already serialized by
+the gate, so the old take-all-then-release bought no exclusion — but because it failed fast, a
+writer waiting in the gate refused every other writer to the same document instead of letting them
+queue. Under real contention (several clients doing CAS on one counter) that turned an ordinary
+queue into a storm of failures no retry could clear. `AssertUnheldByOthers` keeps only the
+exclusion the gate genuinely cannot express: a document a *client* holds a lease on.
+
+-----
+
 ## 11. Peer sync serialization
 
 `ResolveDivergence` reads the head, decides, and then mutates the DAG across several non-atomic
@@ -347,7 +379,8 @@ relative to the write gate: peer-sync commits that go through `KdbServerRuntime`
 | authenticated principal | one connection | written once at handshake; read-only thereafter |
 | `SessionManager` map | one connection | mutex-guarded; sessions are per-connection, matching the Kotlin `SqlWireHost` per-`ConnectionContext` model |
 | `KdbSession.Pending` builder | one session | assumed single-threaded per session — a client pipelining two `INSERT`s on the same session id must not do so concurrently |
-| document locks | server-wide, keyed by session id | released on `TX_COMMIT`, `TX_ROLLBACK`, and on disconnect (`ReleaseAll`), so a dropped connection cannot leak locks |
+| document locks | server-wide, keyed by session id | released on `TX_ROLLBACK` and on disconnect (`closeAllSessions` → `ReleaseAll`), so a dropped connection cannot leak locks. Session ids are **runtime-scoped**, not per-connection — see §13 |
+| explicit leases | one session, mirrored in `LockManager` | taken by `LOCK_ACQUIRE`, expire on their own, survive a commit (only implicit locks are released), and are validated by fence at commit time |
 | `ReadPin` | one session | set at begin under SNAPSHOT; immutable afterwards |
 
 -----
@@ -364,6 +397,11 @@ relative to the write gate: peer-sync commits that go through `KdbServerRuntime`
 | Write gate released twice | success path releases early, `defer` releases otherwise | `sync.Once` (`releaseOnce`) |
 | Sealed-segment races | `FileBackedPlatformIO` | seal is idempotent; a sealed segment rejects further appends with a typed error |
 | Registry ref-count leak | `ServerRuntimeRegistry` | `NewKdbServerRuntime` starts at 1 (the first caller's own reference); the entry is removed when the count reaches zero |
+| **Session ids colliding across connections** (fixed) | `SessionManager.idSeq` was per-connection, so every connection's first session was `sess-1` — and `DocumentLocks` is runtime-global and keys ownership by session id, so two connections were one holder: each could take locks the other held and release the other's | ids now come from `KdbServerRuntime.nextSessionOrdinal`, a runtime-scoped counter |
+| **Locks and sessions leaked on disconnect** (fixed) | nothing released either when a connection dropped; the session map only ever grew | `closeAllSessions` on read-loop exit |
+| Unique enforcement blind spot | an engine built with `NewEngine` (zero `EngineOptions`) enforces **nothing** — `unique=true` is inert and preconditions are ignored | the server always wires `EngineOptions{UniqueKeys, Preconditions: true}`; embedded callers constructing their own engine must do the same, or a transaction carrying preconditions commits as if it had none |
+| Registry incomplete after a failed rebuild | data already on disk violates a declared constraint | recorded in `UniqueKeyRebuildError` and surfaced, never swallowed; the runtime still opens so an operator has the tools to fix it, and writes that would compound the violation are still refused |
+| A reader's view going stale | `OpenReadOnlyFileRuntime` | a reader is a snapshot as of its open; `Refresh()` advances it, and freshness is an explicit part of the caller's contract rather than an accident of timing |
 
 -----
 
@@ -379,7 +417,19 @@ The properties above are covered by targeted tests rather than by inspection:
 | DAG mutation under concurrent readers | `dag/concurrency_test.go` |
 | Group commit coalesces without losing durability | `wal` group-commit tests, `transaction/commit_throughput_bench_test.go` |
 | Close does not leak file handles or lose queued commits | `embed/file_leak_test.go`, `embed/close_seals_test.go`, `embed/durability_test.go` |
-| Locks are released on disconnect | wire listener tests |
+| N clients racing one natural key → exactly one winner, classified `UNIQUE_VIOLATION` | `server.TestConcurrentUniqueKeyRace` |
+| A unique violation leaves no partial state; two ops in one transaction cannot share a key | `server.TestUniqueViolationLeavesNoPartialState`, `TestTwoOpsInOneTransactionCannotShareAKey` |
+| The constraint survives a restart; a dirty migration is rejected and rolled back | `server.TestUniqueConstraintSurvivesRestart`, `TestSetSchemaCheckedRejectsDirtyMigration` |
+| NULLs do not collide; canonicalisation ignores spelling | `server.TestUniqueNullsDoNotCollide`, `transaction.TestUniqueKeyCanonicalizationIgnoresSpelling` |
+| N clients incrementing one counter through CAS → final value exactly N | `client.TestCompareAndSwapNoLostUpdates` |
+| A stale-hash write whose content matches what is stored is still refused | `client.TestReplaceIfFailsOnIdenticalContent` |
+| CAS retries only a lost race, never a schema or unique failure | `client.TestCompareAndSwapDoesNotRetryNonRaceErrors` |
+| Lease expiry fences a stalled writer; a renewal keeps its fence; expiry is lazy | `transaction.TestLeaseExpiryFencesStaleWriter`, `TestRenewKeepsFenceAndExtendsDeadline`, `TestExpiryIsLazyNotSweeperDependent` |
+| An explicit lease blocks another session's commit, and survives the holder's own commit | `server.TestExplicitLeaseBlocksAnotherSessionsCommit`, `transaction.TestReleaseLeasesLeavesPreexistingHolds` |
+| Locks and sessions are reclaimed on disconnect | `server.TestSessionsAndLocksReclaimedOnDisconnect` |
+| Writers to distinct documents all succeed (no false contention) | `server.TestConcurrentWritersToDistinctDocumentsAllSucceed` |
+| Several readers attach alongside a live writer; a second writer is still excluded; maintenance excludes everyone | `embed.TestSeveralReadersMayAttachAtOnce`, `TestSecondWriterStillExcluded`, `TestMaintenanceLockExcludesEveryone`, `TestMaintenanceLockBlockedByALiveReader` |
+| A read-only runtime refuses writes and sees the writer's commits after `Refresh` | `embed.TestReadOnlyRuntimeRefusesWritesAndSeesCommittedData`, `TestReaderRefreshPicksUpNewCommits` |
 
 Run the race detector over the whole tree:
 
