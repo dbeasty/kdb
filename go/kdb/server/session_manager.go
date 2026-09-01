@@ -27,11 +27,24 @@ type SessionID struct {
 type KdbSession struct {
 	ID              SessionID
 	NamespaceID     string
-	BaseVersion     codec.Hash
-	ReadPin         *codec.Hash
 	ReadConsistency ReadConsistency
 	Pending         *transaction.Builder
 	Principal       auth.Principal
+
+	// versionMu guards baseVersion and readPin. Both move at a transaction boundary while
+	// reads on the same session may be in flight: frames on one connection are dispatched
+	// concurrently (see SqlWireListen's pipelining), so a TxCommit advancing the session's
+	// version genuinely races a SELECT resolving the version to read at.
+	versionMu sync.RWMutex
+	// baseVersion is the commit this session's next write anchors on.
+	baseVersion codec.Hash
+	// readPin is the snapshot the session's current transaction reads at, and is set only for
+	// Snapshot consistency - ReadCommitted and ReadYourWrites deliberately follow the live
+	// head. It is re-taken at every transaction boundary (session begin, commit, rollback),
+	// which is what makes this snapshot isolation rather than a single session-lifetime
+	// snapshot: holding one pin forever means a session cannot observe its own committed
+	// writes, which is neither useful nor what SNAPSHOT means.
+	readPin *codec.Hash
 
 	// leaseMu guards leases. Frames on one connection are dispatched concurrently (see
 	// SqlWireListen's pipelining), so a client can have a LockAcquire and a TxCommit in flight
@@ -42,6 +55,49 @@ type KdbSession struct {
 	// tell the leases a client is holding across round trips from the implicit locks the commit
 	// itself takes and drops: releasing by session id would silently revoke the former.
 	leases map[codec.UUID]transaction.Lease
+}
+
+// BaseVersion returns the commit this session's next write anchors on.
+func (s *KdbSession) BaseVersion() codec.Hash {
+	s.versionMu.RLock()
+	defer s.versionMu.RUnlock()
+	return s.baseVersion
+}
+
+// ReadHead resolves the commit this session's reads must run at. Snapshot sessions read at
+// the pin taken when their current transaction started; every other consistency reads the
+// live head, which liveHead supplies.
+//
+// Before this existed, SessionManager.Begin computed a pin that execRead never consulted, so
+// a SNAPSHOT session's reads silently behaved as READ_COMMITTED (kdb-finish-up-plan.md 1-G8).
+// Reading the pin fixed that but introduced the opposite failure: the pin was taken once and
+// never moved, so a session could commit a write and then not see it. Both are covered by
+// tests in read_consistency_test.go.
+func (s *KdbSession) ReadHead(liveHead func() (codec.Hash, error)) (codec.Hash, error) {
+	if s.ReadConsistency == Snapshot {
+		s.versionMu.RLock()
+		pin := s.readPin
+		s.versionMu.RUnlock()
+		if pin != nil {
+			return *pin, nil
+		}
+	}
+	return liveHead()
+}
+
+// startTransactionAt opens the session's next transaction at head: writes anchor there, and a
+// Snapshot session's reads are pinned there until the transaction ends. Called at session
+// begin and again at every commit and rollback.
+func (s *KdbSession) startTransactionAt(head codec.Hash) {
+	s.versionMu.Lock()
+	defer s.versionMu.Unlock()
+	s.baseVersion = head
+	if s.ReadConsistency == Snapshot {
+		pinned := head
+		s.readPin = &pinned
+	} else {
+		s.readPin = nil
+	}
 }
 
 // TrackLease records an explicitly acquired lease on the session.
@@ -121,10 +177,6 @@ func (m *SessionManager) Begin(
 		}
 		head = h
 	}
-	var readPin *codec.Hash
-	if readConsistency == Snapshot {
-		readPin = &head
-	}
 	id := sessionID
 	if id == "" {
 		// Minted from the *runtime's* counter, not this manager's. Each connection gets its own
@@ -138,11 +190,11 @@ func (m *SessionManager) Begin(
 	sess := &KdbSession{
 		ID:              SessionID{Value: id},
 		NamespaceID:     namespaceID,
-		BaseVersion:     head,
-		ReadPin:         readPin,
 		ReadConsistency: readConsistency,
 		Principal:       principal,
 	}
+	// The session's first transaction starts here, at the version it was opened against.
+	sess.startTransactionAt(head)
 	m.mu.Lock()
 	m.sessions[id] = sess
 	m.mu.Unlock()
@@ -213,7 +265,7 @@ func (m *SessionManager) PendingBuilder(sess *KdbSession) *transaction.Builder {
 	if sess.Pending == nil {
 		sess.Pending = &transaction.Builder{
 			NamespaceID: sess.NamespaceID,
-			BaseVersion: sess.BaseVersion,
+			BaseVersion: sess.BaseVersion(),
 			Schema:      m.server.Schema(),
 		}
 	}
