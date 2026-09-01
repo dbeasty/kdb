@@ -21,20 +21,21 @@ type ServerEngine struct {
 	wal         wal.WriteAheadLog
 	groupCommit *wal.GroupCommitter
 
-	// docs holds committed (visible) documents, sharded (see doc_shard.go)
-	// rather than guarded by one namespace-wide mutex. PutDocument/
-	// DeleteDocument stage into pending instead of writing here directly:
-	// writes are not visible via GetDocument until CommitTree flushes
-	// them, matching the pre-existing InMemoryStorageAdapter contract
-	// (see the "reintroduce staging" note below) and letting a failed
-	// transaction's write phase be rolled back via DiscardPending without
-	// ever having mutated committed state. It is intentionally separate
-	// from the blob write path (WriteBlob): WAL.Append and memTable.Put
-	// are each independently thread-safe, so blob writes never take a
-	// lock at all - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
+	// docsByHash holds every document version ever committed, keyed by
+	// content hash (see doc_hash_shard.go) rather than guarded by one
+	// namespace-wide mutex. PutDocument/DeleteDocument stage into pending
+	// instead of writing here directly: writes are not visible via
+	// GetDocument until CommitTree flushes them, matching the
+	// pre-existing InMemoryStorageAdapter contract (see the "reintroduce
+	// staging" note below) and letting a failed transaction's write phase
+	// be rolled back via DiscardPending without ever having mutated
+	// committed state. It is intentionally separate from the blob write
+	// path (WriteBlob): WAL.Append and memTable.Put are each
+	// independently thread-safe, so blob writes never take a lock at all
+	// - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
 	cap              storage.CapabilitySet
 	memTable         *memtable.Manager
-	docs             *shardedDocStore
+	docsByHash       *shardedDocByHashStore
 	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
@@ -51,6 +52,20 @@ type ServerEngine struct {
 	treeMu sync.Mutex
 	tree   document.DocumentTree
 
+	// treesMu guards treesByHash, every DocumentTree CommitTree has ever
+	// produced, keyed by TreeHash - mirrors InMemoryStorageAdapter.trees.
+	// Without this, GetDocument/ScanDocuments had no way to resolve a
+	// specific atCommit and silently always answered from current state
+	// (tree, not treesMu/treesByHash), which made ConflictPolicyStrict's
+	// base-vs-head comparison always compare identical content and never
+	// detect a real concurrent conflict. Kept as its own RWMutex rather
+	// than reusing treeMu: treeMu only ever needs to be held by the single
+	// in-flight CommitTree writer, while treesByHash is read on every
+	// GetDocument/ScanDocuments call and must not serialize reads behind
+	// that writer lock.
+	treesMu     sync.RWMutex
+	treesByHash map[codec.Hash]document.DocumentTree
+
 	asyncStop chan struct{}
 	asyncDone chan struct{}
 }
@@ -66,6 +81,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		SupportsDirectDeltaIngest: false,
 		IndexRetentionDefault:     storage.IndexRetentionEvictable,
 	}
+	emptyTree := document.EmptyDocumentTree()
 	e := &ServerEngine{
 		namespaceID:      namespaceID,
 		config:           config,
@@ -73,10 +89,11 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		groupCommit:      wal.NewGroupCommitter(),
 		cap:              cap,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
-		docs:             newShardedDocStore(),
+		docsByHash:       newShardedDocByHashStore(),
 		pending:          newShardedPendingStore(),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
-		tree:             document.EmptyDocumentTree(),
+		tree:             emptyTree,
+		treesByHash:      map[codec.Hash]document.DocumentTree{emptyTree.TreeHash: emptyTree},
 	}
 	if w != nil && config.Durability == storage.DurabilityAsync {
 		e.startAsyncSync()
@@ -204,7 +221,17 @@ func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) er
 }
 
 func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
-	d, ok := e.docs.Get(docID)
+	e.treesMu.RLock()
+	tree, ok := e.treesByHash[atCommit]
+	e.treesMu.RUnlock()
+	if !ok {
+		return nil, nil
+	}
+	h, ok := tree.HashFor(docID)
+	if !ok {
+		return nil, nil
+	}
+	d, ok := e.docsByHash.Get(h)
 	if !ok {
 		return nil, nil
 	}
@@ -240,12 +267,24 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	if batchSize <= 0 {
 		batchSize = 256
 	}
-	// Range, not Snapshot: Snapshot copied every document in the namespace into one slice
-	// before the first batch was emitted - an O(namespace) allocation invisible to any LIMIT,
-	// row budget, or admission grant. Streaming keeps peak memory at one shard plus one batch.
+	e.treesMu.RLock()
+	tree, ok := e.treesByHash[atCommit]
+	e.treesMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	// Walk, not MaterializedEntries: materializing built the entire namespace's flat
+	// map[UUID]Hash before the first batch was emitted - an O(namespace) allocation that no
+	// LIMIT, row budget, or admission grant could see or bound, because it happened inside the
+	// adapter before the executor's first callback. Streaming the trie keeps a bounded scan's
+	// memory proportional to what it keeps (the batch buffer) rather than to what exists.
 	buf := make([]document.Document, 0, batchSize)
 	var scanErr error
-	e.docs.Range(func(d document.Document) bool {
+	tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
+		d, ok := e.docsByHash.Get(h)
+		if !ok {
+			return true
+		}
 		buf = append(buf, d)
 		if len(buf) >= batchSize {
 			if err := onBatch(append([]document.Document(nil), buf...)); err != nil {
@@ -294,7 +333,6 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 	e.treeMu.Lock()
 	defer e.treeMu.Unlock()
 	for _, id := range deletes {
-		e.docs.Delete(id)
 		var err error
 		e.tree, err = e.tree.Without(id)
 		if err != nil {
@@ -302,16 +340,19 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 		}
 	}
 	for _, doc := range puts {
-		e.docs.Put(doc)
 		h, err := doc.ContentHash()
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
+		e.docsByHash.Put(h, doc)
 		e.tree, err = e.tree.With(doc.ID, h)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
 	}
+	e.treesMu.Lock()
+	e.treesByHash[e.tree.TreeHash] = e.tree
+	e.treesMu.Unlock()
 	return e.tree, nil
 }
 

@@ -184,12 +184,13 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 		// putCommit always stores, regardless of what happens to "main" below (component 39
 		// spec §5: history must never be lost, only the branch-pointer decision is gated).
 		// Materialization into live document storage is deliberately DEFERRED until after the
-		// divergence decision below: this storage layer has no MVCC (GetDocument ignores
-		// atCommit), so materializing a pushed side branch immediately mutated the peer's
-		// visible documents even when the push was then rejected with a ConflictReport and the
-		// head never moved - a strict-policy peer served the pushed content while its own head
-		// still pointed at its own write (caught live by the e2e same-document conflict
-		// scenario).
+		// divergence decision below: ServerEngine/InMemoryStorageAdapter's CommitTree has no
+		// branch tracking (parentTreeHash is ignored - it always extends the one current tree,
+		// see storage/engine/server_engine.go), so materializing a pushed side branch immediately
+		// mutated the peer's visible documents even when the push was then rejected with a
+		// ConflictReport and the head never moved - a strict-policy peer served the pushed
+		// content while its own head still pointed at its own write (caught live by the e2e
+		// same-document conflict scenario).
 		applied := 0
 		var fresh []document.Commit
 		for _, commit := range m.Commits {

@@ -77,6 +77,94 @@ func TestKdbServerRuntimeCommitsAndPersistsAgainstFileBackedRuntime(t *testing.T
 	}
 }
 
+// Regression test for ServerEngine.GetDocument silently ignoring its atCommit parameter and
+// always answering from current state: detectConflicts (backing ConflictPolicyStrict, which
+// NewKdbServerRuntime wires up for TransactionEngine) resolves "document at the transaction's
+// BaseVersion" vs "document at current head" via GetDocument(..., atCommit) to decide whether a
+// commit raced a concurrent write to the same document. Against the file-backed ServerEngine
+// (the only engine this scenario is a regression for - mem.InMemoryStorageAdapter already
+// resolved atCommit correctly), both lookups used to return identical (current) content
+// regardless of which tree hash was asked for, so contentHashEqual was always true and a real
+// same-document conflict was never detected - ConflictPolicyStrict silently behaved like
+// ConflictPolicyLastWrite and a second writer anchored on the same stale base silently
+// overwrote the first instead of being rejected.
+func TestKdbServerRuntimeStrictConflictDetectionAgainstFileBackedRuntime(t *testing.T) {
+	dataDir := t.TempDir()
+	ns := "app/data"
+
+	rt, err := embed.OpenFileRuntime(dataDir, "app", ns, schema.None())
+	if err != nil {
+		t.Fatalf("OpenFileRuntime: %v", err)
+	}
+	defer rt.Close()
+	srv := NewKdbServerRuntime(rt)
+
+	docID, err := codec.RandomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := rt.DAG.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTx := document.Transaction{
+		ID:          mustRandomUUID(t),
+		BaseVersion: base,
+		Operations:  []document.Op{document.WriteOp{DocID: docID, Patch: `{"v":"base"}`}},
+		Timestamp:   codec.TimestampNow(),
+	}
+	baseCommit, err := srv.Commit(ns, baseTx, "setup", auth.Principal{})
+	if err != nil {
+		t.Fatalf("base commit should succeed, got: %v", err)
+	}
+
+	// Two transactions both anchored on baseCommit (the same now-stale BaseVersion), writing
+	// different content to the same document - a genuine concurrent read-modify-write conflict,
+	// not a merely-sequential write.
+	tx1 := document.Transaction{
+		ID:          mustRandomUUID(t),
+		BaseVersion: baseCommit.Hash,
+		Operations:  []document.Op{document.WriteOp{DocID: docID, Patch: `{"v":"writer-1"}`}},
+		Timestamp:   codec.TimestampNow(),
+	}
+	if _, err := srv.Commit(ns, tx1, "writer-1", auth.Principal{}); err != nil {
+		t.Fatalf("first commit against the stale base should succeed, got: %v", err)
+	}
+
+	tx2 := document.Transaction{
+		ID:          mustRandomUUID(t),
+		BaseVersion: baseCommit.Hash,
+		Operations:  []document.Op{document.WriteOp{DocID: docID, Patch: `{"v":"writer-2"}`}},
+		Timestamp:   codec.TimestampNow(),
+	}
+	_, err = srv.Commit(ns, tx2, "writer-2", auth.Principal{})
+	if err == nil {
+		t.Fatal("expected the second commit against the same stale base to be rejected as a conflict, but it silently succeeded")
+	}
+	var conflictErr *ConflictError
+	if !asError(err, &conflictErr) {
+		t.Fatalf("expected *ConflictError, got %T: %v", err, err)
+	}
+
+	// The winning writer's content must be exactly what's visible at head - not corrupted, not
+	// silently overwritten by the write that should have been rejected.
+	head, err := rt.DAG.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	headCommit, ok := rt.DAG.GetCommit(head)
+	if !ok {
+		t.Fatalf("head %s not present in DAG", head.Hex())
+	}
+	doc, err := rt.Storage.GetDocumentOrThrow(ns, docID, headCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.JSON != `{"v":"writer-1"}` {
+		t.Fatalf("expected the winning writer's content to survive, got %q", doc.JSON)
+	}
+}
+
 // The same regression, via Upsert - the other write path that funnels through commitWith.
 func TestKdbServerRuntimeUpsertsAgainstFileBackedRuntime(t *testing.T) {
 	dataDir := t.TempDir()

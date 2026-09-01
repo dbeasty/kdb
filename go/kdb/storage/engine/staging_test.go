@@ -35,10 +35,11 @@ func TestServerEnginePutDocument_NotVisibleUntilCommitTree(t *testing.T) {
 		t.Fatalf("expected doc not visible before CommitTree, got %+v", got)
 	}
 
-	if _, err := e.CommitTree("ns", document.EmptyDocumentTree().TreeHash); err != nil {
+	tree, err := e.CommitTree("ns", document.EmptyDocumentTree().TreeHash)
+	if err != nil {
 		t.Fatal(err)
 	}
-	got, err = e.GetDocument("ns", doc.ID, document.EmptyDocumentTree().TreeHash)
+	got, err = e.GetDocument("ns", doc.ID, tree.TreeHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,8 @@ func TestServerEngineDiscardPending_RollsBackStagedWrites(t *testing.T) {
 	if err := e.PutDocument("ns", existing); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.CommitTree("ns", document.EmptyDocumentTree().TreeHash); err != nil {
+	committed, err := e.CommitTree("ns", document.EmptyDocumentTree().TreeHash)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -78,14 +80,14 @@ func TestServerEngineDiscardPending_RollsBackStagedWrites(t *testing.T) {
 
 	// The staged put must not be visible, and the staged delete must not have applied -
 	// discarding restores exactly the last-committed state.
-	got, err := e.GetDocument("ns", staged.ID, document.EmptyDocumentTree().TreeHash)
+	got, err := e.GetDocument("ns", staged.ID, committed.TreeHash)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != nil {
 		t.Fatalf("expected discarded staged put to stay invisible, got %+v", got)
 	}
-	got, err = e.GetDocument("ns", existing.ID, document.EmptyDocumentTree().TreeHash)
+	got, err = e.GetDocument("ns", existing.ID, committed.TreeHash)
 	if err != nil {
 		t.Fatal(err)
 	}
