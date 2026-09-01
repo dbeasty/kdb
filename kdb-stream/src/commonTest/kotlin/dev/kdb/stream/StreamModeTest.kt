@@ -11,6 +11,7 @@ import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.defaultWireCodec
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -18,6 +19,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class StreamModeTest {
     private val wire = defaultWireCodec()
     private val transport = InMemoryWireTransport()
