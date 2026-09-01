@@ -320,22 +320,119 @@ Measuring the one axis that separates them, reads/sec by group size:
 | 8 | 18.18B | 26.37B |
 | 64 | 22.20B | 30.41B |
 
-MVCC's amortization is real (+31–45%) and **worth nothing here**: after
-the fix a full `GetDocument` costs ~51–71ns, of which head resolution is
-now well under a nanosecond. Amortizing that away would save a fraction of
-a percent while giving up read-your-writes — a pinned snapshot cannot see
-a write committed after it was acquired, so a caller that reads back its
-own preceding `Commit` would miss it. RCU is the right choice for the
+MVCC's amortization is real (+31–45%) but does not survive contact with a
+full operation: after the fix a `GetDocument` costs ~51–71ns, of which head
+resolution is now well under a nanosecond. And a pinned view cannot see a
+write committed after it was acquired, so using one for a bare point read
+would give up read-your-writes. RCU is the right choice for the
 per-operation `GetDocument` path.
 
-MVCC is still the right answer to a *different* question this codebase has
-not yet asked: a multi-statement transaction or a long scan that needs one
-consistent view across many reads. The storage layer is already
-structurally ready for it — after the Finding 1 fix it retains every tree
-by hash and every document version by content hash — so the missing piece
-is an explicit snapshot handle, not a new storage design. Worth doing when
-snapshot isolation is actually specified; not worth doing to speed up a
-point read.
+### Does MVCC help the write and transaction paths?
+
+The read path is the weakest case for MVCC, so the obvious objection is
+that the comparison above is unfair: transactions are where a pinned
+snapshot should pay off. `detectConflicts` does two lookups per operation —
+one against the transaction's **base** version and one against the current
+head — and the base names a *historical* tree, which misses the shipped RCU
+fast path and falls back to the mutex once per operation. Pinning the base
+for the life of the transaction removes exactly that.
+
+`go/kdb/dag/version_strategy_bench_test.go` measures it, running all three
+strategies across read, write, transaction and mixed workloads with
+identical real work per operation. (The MVCC view pins only the base; the
+head stays live, because conflict detection must observe writes committed
+after the transaction started or it would miss the conflicts it exists to
+find.) At 16 cores, 1024 goroutines:
+
+| Workload | baseline RWMutex | RCU | MVCC |
+|---|---:|---:|---:|
+| Read, concurrent | 7.64M ops/s | 38.6M | 42.8M |
+| Write (commit) | 65.3k ops/s | 65.3k | 64.8k |
+| Transaction, 1 op | 60.4k txn/s | 65.7k | 65.5k |
+| Transaction, 4 ops | 18.5k txn/s | 19.4k | 19.3k |
+| Transaction, 16 ops | 5.18k txn/s | 5.55k | 5.60k |
+| Mixed (80 read / 20 txn) | 90.1k ops/s | 96.5k | 96.0k |
+
+**MVCC and RCU are indistinguishable on every write-bearing workload** —
+under 1% apart at every transaction size, in both directions. The reason is
+in the allocation counts, not the lock: a 16-operation transaction costs
+**1,122 allocations and 93 KB** for the persistent-trie rebuild and commit.
+Sixteen mutex acquisitions are a rounding error against ~180µs of commit
+work. The thing MVCC removes is real, and it is not what these workloads
+are spending their time on.
+
+Publishing a snapshot costs the writer **one allocation per commit** (69
+allocs/op vs the baseline's 68) and no measurable throughput.
+
+### The same conclusion end-to-end, with real fsyncs
+
+The mechanism benchmark has no WAL. Running the full workload matrix
+against the real `KdbServerRuntime` — real disk-backed WAL, real
+`F_FULLFSYNC` — makes the point more strongly, because a real commit costs
+~4ms rather than ~15µs. `-benchtime 1s -count=3`, before vs. after:
+
+| Workload | before | after |
+|---|---:|---:|
+| Read / heavy-multi-user / overlapping | 3.437M | **13.669M** |
+| Read / heavy-multi-user / non-overlapping | 3.400M | **18.572M** |
+| Read / single-user / overlapping | 1.894M | 1.873M |
+| Read / single-user / non-overlapping | 2.243M | 2.483M |
+| Write insert / single-user | 234.9 | 235.0 |
+| Write insert / heavy-multi-user | 33.72k | 33.95k |
+| Update / heavy-multi-user / overlapping | 28.18k | 28.00k |
+| Update / heavy-multi-user / non-overlapping | 29.87k | 29.54k |
+| Mixed / heavy-multi-user / overlapping | 117.5k | 117.0k |
+| Mixed / heavy-multi-user / non-overlapping | 117.2k | 125.3k |
+| Transaction / heavy-multi-user / non-overlapping | 16.33k | 16.44k |
+
+(`benchstat` reports every row as "~" because three samples is below its
+threshold for declaring significance — it needs ≥4. The read rows are 4–5x
+with non-overlapping ranges across all three samples; the write rows are
+genuinely flat.)
+
+**Writes, updates, mixed and transactions are unchanged**, which is the
+expected result: they are bounded by WAL fsync and the `commitTree`
+rebuild, exactly as `phase0-baseline.md` found. No version-resolution
+mechanism — RCU, MVCC or otherwise — can move a number that is waiting on
+a disk. The lever for write throughput is durability mode and group commit
+(see the durability section above), not concurrency control.
+
+**So: RCU for the read path, and MVCC is not worth adopting for
+performance.** It remains the right answer to a correctness question this
+codebase has not yet asked — a multi-statement transaction or long scan
+needing one consistent view across many reads, which today's per-operation
+head resolution cannot promise. The storage layer is already structurally
+ready (it retains every tree by hash and every document version by content
+hash), so the missing piece is an explicit snapshot handle. Adopt it when
+snapshot isolation is specified; do not adopt it expecting throughput.
+
+## Finding 3 (regression, pre-existing): contended transactions collapse now that conflicts are actually detected
+
+Not caused by the Finding 2 work — it reproduces identically before and
+after — but it surfaced while measuring, and it is not recorded anywhere
+above.
+
+The results table says "All conflicts/op columns read 0," which Finding 1
+explains as a bug. With that bug fixed, `Transaction/heavy-multi-user/overlapping`
+now reports **176–289 conflicts per operation** and throughput of
+**449–821 ops/sec**, against the 31,933 ops/sec in the table. That is a
+~40x collapse, and it is the honest cost of detecting conflicts that were
+previously being silently lost — the old number measured last-write-wins
+with the conflict check disabled.
+
+Two things worth following up, neither of them concurrency-control
+mechanism choices:
+
+- **176–289 conflicts per operation** is not a conflict rate, it is a retry
+  storm: ~1024 goroutines contending over a 256-document pool with no
+  backoff. Whatever retry policy sits above `ConflictPolicyStrict` is
+  amplifying, not absorbing, contention.
+- The run-to-run spread (449 → 821 ops/sec across three samples of the
+  same binary) is far wider than any other row in the matrix, which is
+  itself a symptom of the same instability.
+
+This is the workload the table most understated, and it is now the
+worst-performing cell in the matrix by two orders of magnitude.
 
 ### What shipped
 
