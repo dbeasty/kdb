@@ -188,11 +188,17 @@ conflicting write was lost. This is a correctness issue independent of
 performance, uncovered only because the workload matrix specifically
 tested overlapping-key transactions, which no prior benchmark did.
 
-**Fix scope**: `ServerEngine` needs real point-in-time document retrieval
-(materializing/looking up a document as of an arbitrary historical tree
-hash, not just current state) — likely a non-trivial change to how
-`e.docs` is organized, not a one-line fix. Flagged as follow-up work
-rather than fixed here.
+**Fixed**: `ServerEngine` now tracks every `DocumentTree` `CommitTree` has
+produced, keyed by `TreeHash` (`treesByHash`), and keeps every committed
+document version keyed by content hash (`doc_hash_shard.go`'s
+`shardedDocByHashStore`) rather than only the current one. `GetDocument`
+and `ScanDocuments` resolve `atCommit` through that map before looking up
+content, matching `InMemoryStorageAdapter`'s existing behavior. Regression
+test:
+`TestKdbServerRuntimeStrictConflictDetectionAgainstFileBackedRuntime` in
+`go/kdb/server/file_backed_runtime_test.go` (verified to fail against the
+pre-fix code with the same "committed two transactions with the same
+stale `BaseVersion`" repro described above).
 
 ## Finding 2 (scalability): read throughput is worse at heavy concurrency than single-threaded
 
