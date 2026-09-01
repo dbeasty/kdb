@@ -561,11 +561,16 @@ func (s *KdbServerRuntime) treeSizeAt(head codec.Hash) int {
 }
 
 func (s *KdbServerRuntime) GetDocument(namespaceID string, docID codec.UUID) (json string, commitHex string, found bool, err error) {
-	head, err := s.Runtime.DAG.Head()
+	// One HeadCommit rather than Head + GetCommit: those were two RLock/RUnlock pairs on the
+	// DAG's shared RWMutex, i.e. four atomic read-modify-writes on one cache line for a read
+	// that mutates nothing - measured at 40% of all CPU samples under 1024 concurrent
+	// readers, and the reason aggregate read throughput was *below* single-threaded
+	// (docs/benchmarks/workload-matrix.md, Finding 2). HeadCommit is one atomic load, and it
+	// additionally guarantees head and commit describe the same instant.
+	head, commit, ok, err := s.Runtime.DAG.HeadCommit()
 	if err != nil {
 		return "", "", false, err
 	}
-	commit, ok := s.Runtime.DAG.GetCommit(head)
 	if !ok {
 		return "", "", false, fmt.Errorf("kdb server: head commit %s missing", head.Hex())
 	}

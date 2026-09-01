@@ -70,6 +70,9 @@ func (d *PersistingCommitDAG) PutDocumentTree(tree document.DocumentTree) {
 	d.delegate.PutDocumentTree(tree)
 }
 func (d *PersistingCommitDAG) Head() (codec.Hash, error) { return d.delegate.Head() }
+func (d *PersistingCommitDAG) HeadCommit() (codec.Hash, document.Commit, bool, error) {
+	return d.delegate.HeadCommit()
+}
 func (d *PersistingCommitDAG) SetHead(branchName string, hash codec.Hash) error {
 	return d.delegate.SetHead(branchName, hash)
 }
