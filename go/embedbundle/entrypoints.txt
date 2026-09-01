@@ -1,0 +1,10 @@
+# Entry points for the embeddable Go source bundle (docs/kdb-release-plan.md §2.2).
+# One import path per line, relative to the module root (github.com/limidus/kdb/go).
+# The bundle is the transitive closure of `go list -deps` over these, unioned across every
+# GOOS/GOARCH in embedbundle's platform matrix. Comments and blank lines are ignored.
+
+kdb/embed         # embedded runtime: open, put, commit, materialize
+kdb/driver        # database/sql driver over that runtime
+kdb/sql           # KDB-SQL parser, planner, executor
+kdb/query/hybrid  # hybrid query engine
+kdb/index         # index core

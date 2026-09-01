@@ -59,6 +59,7 @@ Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-d
 | [**User guide**](docs/kdb-user-guide.md) | Run the CLI or server, embed via `database/sql`/JDBC/Kotlin-JS, operate (backup, verify, restore, governance) |
 | [**Low-level design**](docs/kdb-lld.md) | Implementation reference in seven parts: [components](docs/kdb-lld-components.md), [flows](docs/kdb-lld-flows.md), [concurrency](docs/kdb-lld-concurrency.md), [storage](docs/kdb-lld-storage.md), [KDB-SQL](docs/kdb-lld-query.md), [protocol & operations](docs/kdb-lld-protocol.md) |
 | [**Go porting guide**](docs/go-porting.md) | Go module layout, build tags, interop tests |
+| [**Release plan**](docs/kdb-release-plan.md) | How releases are cut and verified: binaries, the embeddable Go source bundle, jars, reproducibility |
 | [**Architecture specification**](docs/kdb-spec.md) | Full system design, protocols, and layer specs |
 
 ### Quick start (Kotlin)
@@ -95,6 +96,19 @@ import (
 )
 db, _ := sql.Open("kdb", "kdb://memory:///demo/users?unique=true")
 ```
+
+### Releases
+
+```bash
+make release          # Go binaries + an embeddable Go source zip (default)
+make release-kotlin    # Kotlin jars
+make release-all       # everything, plus one SHA256SUMS
+```
+
+Everything lands in `dist/`. The embeddable zip is only the packages an in-process Go embedder
+needs (`kdb/embed`, `database/sql` driver, KDB-SQL, index) — no server, no wire protocol —
+importable via `go mod edit -replace`. See the [release plan](docs/kdb-release-plan.md) for the
+full artifact list and how a release reproduces byte-for-byte from its tag.
 
 ### Build identity
 
