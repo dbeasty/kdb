@@ -13,13 +13,14 @@ import (
 // runUserCommand implements the RBAC bootstrap CLI (kdb-finish-up-plan Phase 2.7):
 //
 //	kdb-service user create --data-dir DIR --user NAME --password PW [--roles r1,r2]
-//	kdb-service user role   --data-dir DIR --role NAME --grants "sql:app/*,sync:app/*"
+//	kdb-service user role   --data-dir DIR --role NAME --grants "read:app/*,write:app/*"
 //	kdb-service user assign --data-dir DIR --user NAME --role NAME
 //	kdb-service user list   --data-dir DIR
 //
 // All subcommands open the durable registry exclusively (taking the data-dir lock), so they
 // refuse to run while the service is up - stop the service first. Grants are "kind:pattern"
-// strings, e.g. "sql:app/*" (see kdb/auth's PermissionMatchesPath for the pattern rules).
+// strings whose kind is one of read, write, sync, admin - the only kinds actionToResource ever
+// checks - e.g. "read:app/*" (see kdb/auth's PermissionMatchesPath for the pattern rules).
 func runUserCommand(args []string) int {
 	if len(args) == 0 {
 		printUserUsage()
@@ -34,7 +35,7 @@ func runUserCommand(args []string) int {
 	fs.StringVar(&password, "password", "", "user password (hashed with PBKDF2 before storage)")
 	fs.StringVar(&roles, "roles", "", "comma-separated role names for the new user")
 	fs.StringVar(&role, "role", "", "role name")
-	fs.StringVar(&grants, "grants", "", "comma-separated kind:pattern grants, e.g. sql:app/*,sync:app/*")
+	fs.StringVar(&grants, "grants", "", "comma-separated kind:pattern grants (kind is read, write, sync or admin), e.g. read:app/*,write:app/*")
 	_ = fs.Parse(rest)
 
 	if dataDir == "" {
@@ -72,7 +73,7 @@ func runUserCommand(args []string) int {
 		grantList := splitTrimmed(grants)
 		for _, g := range grantList {
 			if auth.PermissionKind(g) == "" {
-				fmt.Fprintf(os.Stderr, "Error: malformed grant %q (want kind:pattern, e.g. sql:app/*)\n", g)
+				fmt.Fprintf(os.Stderr, "Error: malformed grant %q (want kind:pattern where kind is read, write, sync or admin, e.g. read:app/*)\n", g)
 				return 2
 			}
 		}
@@ -137,7 +138,8 @@ func printUserUsage() {
 
 Subcommands:
   create --data-dir DIR --user NAME --password PW [--roles r1,r2]
-  role   --data-dir DIR --role NAME --grants "sql:app/*,sync:app/*"   (create or update)
+  role   --data-dir DIR --role NAME --grants "read:app/*,write:app/*"   (create or update)
+         grant kinds: read, write, sync, admin
   assign --data-dir DIR --user NAME --role NAME
   list   --data-dir DIR`)
 }

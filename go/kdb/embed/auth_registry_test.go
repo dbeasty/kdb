@@ -16,7 +16,7 @@ func TestFileAuthRegistrySurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := reg1.Store.CreateRole("admin", []string{"sql:app/*", "sync:app/*"}); err != nil {
+	if err := reg1.Store.CreateRole("admin", []string{"read:app/*", "sync:app/*"}); err != nil {
 		t.Fatalf("create role: %v", err)
 	}
 	if err := reg1.Store.CreateUser("alice", "s3cret", []string{"admin"}); err != nil {
