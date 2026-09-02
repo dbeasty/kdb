@@ -138,9 +138,14 @@ The current architecture specification is [`docs/kdb-spec.md`](docs/kdb-spec.md)
 
 ## License
 
-Copyright © 2026 Limidus Corp. All rights reserved.
+Copyright © 2026 Limidus Corp.
 
-Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+KDB is dual-licensed:
+
+- **[GNU Affero General Public License v3.0](LICENSE)** — free. Derivative works you distribute, and modified versions you offer over a network (AGPL §13), must be released under AGPL-3.0 with complete corresponding source.
+- **Commercial license** — for embedding KDB in a closed-source product or hosted service without those obligations. Contact `davja@limidus.com`.
+
+See [`LICENSING.md`](LICENSING.md) for which one applies to you and for contribution terms.
 
 ---
 
