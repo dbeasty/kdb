@@ -1,5 +1,6 @@
-# Tag-triggered release pipeline (kdb-finish-up-plan Phase 2.10): test gate, cross-compiled
-# binaries with checksums as a GitHub release, and a container image pushed to GHCR.
+# Tag-triggered release pipeline (docs/kdb-release-plan.md): test gate, cross-compiled binaries,
+# the embeddable Go source bundle, Kotlin jars, checksums as a GitHub release, and a container
+# image pushed to GHCR.
 #
 # Cut a release with:
 #   git tag v0.1.0 && git push origin v0.1.0
@@ -7,6 +8,11 @@
 # (go/kdb/version.Version) and the image tag. The tagged commit is injected alongside it, so
 # `kdb --version`, the service banner, /healthz and the kdb_build_info metric all name the exact
 # source a released artifact was built from.
+#
+# Every build step below is a single `make` target (see the root Makefile) - there is no build
+# logic here that a developer can't run identically on a laptop. That's what makes
+# `make release-verify TAG=v0.1.0` (or `./scripts/release-verify.sh v0.1.0`) a real reproduction
+# of this workflow's output rather than a separate, possibly-diverging path.
 
 name: Release
 
@@ -19,7 +25,22 @@ permissions:
   packages: write
 
 jobs:
+  # Fails fast if a tag doesn't agree with the repo's own version file - otherwise binaries and
+  # jars would silently disagree about what version they claim to be.
+  version-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match VERSION
+        run: |
+          want="v$(cat VERSION)"
+          if [ "$want" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match VERSION file (expected $want) - bump VERSION and retag" >&2
+            exit 1
+          fi
+
   test-gate:
+    needs: version-guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +53,7 @@ jobs:
       - name: Go vet + gofmt
         run: cd go && go vet ./... && test -z "$(gofmt -l .)"
 
-  binaries:
+  artifacts:
     needs: test-gate
     runs-on: ubuntu-latest
     steps:
@@ -41,27 +62,30 @@ jobs:
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
-      - name: Cross-compile
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Build binaries, embeddable source bundle, jars and checksums
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          VP=github.com/limidus/kdb/go/kdb/version
-          # A tag build is a clean checkout by definition, hence Dirty=false.
-          LDFLAGS="-X $VP.Version=${VERSION} -X $VP.Commit=${GITHUB_SHA} -X $VP.Dirty=false"
-          LDFLAGS="$LDFLAGS -X $VP.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          mkdir -p dist
-          cd go
-          for target in linux/amd64 linux/arm64 darwin/arm64; do
-            GOOS="${target%/*}"; GOARCH="${target#*/}"
-            for bin in kdb kdb-service kdb-inspect; do
-              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-                go build -ldflags "$LDFLAGS" -o "../dist/${bin}-${GOOS}-${GOARCH}" "./cmd/${bin}"
-            done
-          done
-          cd ../dist && sha256sum * > SHA256SUMS
+          # A tag build is a clean checkout by definition, hence GIT_DIRTY=false. RELEASE_DATE
+          # comes from the tagged commit's own timestamp, not "now" - see docs/kdb-release-plan.md
+          # §3 on why that's required for a rebuild of this same tag to reproduce byte-for-byte.
+          make release-all \
+            VERSION="$VERSION" GIT_COMMIT="$GITHUB_SHA" GIT_DIRTY=false \
+            RELEASE_DATE="$(git log -1 --format=%cI "$GITHUB_SHA")"
+      - name: Verify the embeddable bundle builds standalone
+        run: ./scripts/verify-bundle.sh dist/bundle/kdb-go-embed-*.zip
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/bin/*
+            dist/bundle/*.zip
+            dist/jars/*
+            dist/SHA256SUMS
           generate_release_notes: true
 
   image:

@@ -2,6 +2,14 @@ module github.com/limidus/kdb/go
 
 go 1.26.0
 
+// Pinned so a release built today and one built a year from now use the exact same compiler -
+// otherwise `go-version-file: go/go.mod` in CI (and any local `go build`) floats to whatever the
+// latest 1.26.x patch happens to be on the day it runs, and reproducibility (docs/kdb-release-plan.md
+// §3) breaks on the toolchain alone even with identical source and identical -ldflags. `go`
+// auto-downloads this exact patch (GOTOOLCHAIN=auto, the default) if a machine has an older one
+// installed. Bump deliberately, not automatically.
+toolchain go1.26.3
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.18

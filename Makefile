@@ -1,4 +1,6 @@
-.PHONY: test-go test-kotlin test-cross build-go build-kotlin bench bench-write print-version
+.PHONY: test-go test-kotlin test-cross build-go build-kotlin bench bench-write print-version \
+        release release-go release-bundle bundle-verify release-binaries release-kotlin \
+        release-checksums release-all release-verify release-clean
 
 # Single version source (see go/kdb/version). Release tags override: make build-go VERSION=v1.2.3
 VERSION ?= $(shell cat VERSION)
@@ -13,6 +15,26 @@ GO_LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) \
               -X $(VERSION_PKG).Commit=$(GIT_COMMIT) \
               -X $(VERSION_PKG).Dirty=$(GIT_DIRTY) \
               -X $(VERSION_PKG).BuildDate=$(BUILD_DATE)
+
+# --- Release (docs/kdb-release-plan.md) -------------------------------------------------------
+#
+# `make release`         Go artifacts only: binaries + the embeddable source bundle (default).
+# `make release-kotlin`  Kotlin jars only.
+# `make release-all`     everything, plus one SHA256SUMS covering all of it.
+# `make release-verify`  proves the Go side rebuilds byte-for-byte (optionally: TAG=vX.Y.Z).
+#
+# Every artifact lands in dist/. RELEASE_DATE defaults to the target commit's own timestamp
+# (not "now", unlike BUILD_DATE above) - a release build must be reproducible, so its declared
+# build date has to be a property of the commit, not of when someone happened to run `make`.
+DIST := dist
+RELEASE_DATE ?= $(shell git log -1 --format=%cI $(GIT_COMMIT) 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+RELEASE_LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) \
+                    -X $(VERSION_PKG).Commit=$(GIT_COMMIT) \
+                    -X $(VERSION_PKG).Dirty=$(GIT_DIRTY) \
+                    -X $(VERSION_PKG).BuildDate=$(RELEASE_DATE) \
+                    -buildid=
+RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
+SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
 
 test-go:
 	cd go && go test -race ./...
@@ -56,3 +78,69 @@ print-version:
 	@echo "commit:     $(GIT_COMMIT)"
 	@echo "dirty:      $(GIT_DIRTY)"
 	@echo "build date: $(BUILD_DATE)"
+
+release-clean:
+	rm -rf $(DIST)
+
+# Default release target: Go only. Most consumers of a release want the binaries and/or the
+# embeddable source, not the Kotlin jars - `make release-kotlin` is separate and additive.
+release: release-go
+
+# release-checksums runs via a recursive $(MAKE) call, not as a plain prerequisite: Make only
+# remakes each phony target once per invocation, so if it were a prerequisite here *and* listed
+# again under release-all below, the second reference would silently no-op and dist/SHA256SUMS
+# would miss whatever release-kotlin added. A sub-make always actually runs.
+release-go: release-bundle release-binaries
+	$(MAKE) release-checksums
+
+# The embeddable Go source bundle (docs/kdb-release-plan.md §2): the transitive dependency
+# closure of kdb/embed, kdb/driver, kdb/sql, kdb/query/hybrid and kdb/index
+# (go/embedbundle/entrypoints.txt), zipped deterministically so the archive itself reproduces
+# byte-for-byte (see release-verify below).
+release-bundle:
+	cd go && go run ./embedbundle \
+		-version "$(VERSION)" -commit "$(GIT_COMMIT)" -date "$(RELEASE_DATE)" \
+		-out "../$(DIST)/bundle"
+
+# The bundle's own acceptance gate: unzips it and builds/vets/tests/cross-compiles it standalone,
+# with nothing but what's inside the zip (docs/kdb-release-plan.md §2.5/R2).
+bundle-verify: release-bundle
+	./scripts/verify-bundle.sh $(DIST)/bundle/kdb-go-embed-$(VERSION).zip
+
+# Cross-compiled binaries for every RELEASE_PLATFORMS entry. -trimpath strips the builder's
+# absolute source paths out of the binary; -buildid= (in RELEASE_LDFLAGS) strips the path-derived
+# build ID Go embeds by default. Without both, two builds of the identical commit differ by
+# whatever directory each one happened to run in, even with everything else pinned.
+release-binaries:
+	mkdir -p $(DIST)/bin
+	cd go && for target in $(RELEASE_PLATFORMS); do \
+		GOOS=$${target%/*}; GOARCH=$${target#*/}; \
+		for bin in kdb kdb-service kdb-inspect; do \
+			CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH \
+				go build -trimpath -ldflags "$(RELEASE_LDFLAGS)" \
+				-o "../$(DIST)/bin/$${bin}-$${GOOS}-$${GOARCH}" "./cmd/$${bin}" || exit 1; \
+		done; \
+	done
+
+# Kotlin jars, one per Gradle module, collected by scripts/collect-kotlin-jars.sh. Deliberately
+# depends on the `jar` task directly, not `build` - `./gradlew build` is broken on a clean
+# checkout (docs/kdb-finish-up-plan.md); `jar` alone is green and is all a release needs.
+release-kotlin:
+	./gradlew jar --no-daemon
+	./scripts/collect-kotlin-jars.sh "$(VERSION)" "$(DIST)/jars"
+
+# Checksums over whatever has been built into dist/ so far - release-go alone, or release-go +
+# release-kotlin under release-all. Re-run any time after adding an artifact; it always reflects
+# the full current contents of dist/.
+release-checksums:
+	cd $(DIST) && find . -type f ! -name SHA256SUMS | sort | sed 's|^\./||' | xargs $(SHA256) > SHA256SUMS
+	@echo "wrote $(DIST)/SHA256SUMS ($$(wc -l < $(DIST)/SHA256SUMS | tr -d ' ') files)"
+
+release-all: release-go release-kotlin
+	$(MAKE) release-checksums
+
+# Proves the Go side of dist/ is reproducible: rebuilds it from two independent clean copies of
+# the source and diffs the checksums. Pass TAG=vX.Y.Z to check a pushed tag via `git archive`;
+# without one, checks the current working tree instead (see scripts/release-verify.sh).
+release-verify:
+	./scripts/release-verify.sh $(TAG)
