@@ -105,10 +105,12 @@ make release-kotlin    # Kotlin jars
 make release-all       # everything, plus one SHA256SUMS
 ```
 
-Everything lands in `dist/`. The embeddable zip is only the packages an in-process Go embedder
-needs (`kdb/embed`, `database/sql` driver, KDB-SQL, index) — no server, no wire protocol —
-importable via `go mod edit -replace`. See the [release plan](docs/kdb-release-plan.md) for the
-full artifact list and how a release reproduces byte-for-byte from its tag.
+Everything lands in `dist/`. The embeddable zip carries only the packages a downstream Go project
+actually reaches — the in-process `kdb/embed`/`database/sql`/KDB-SQL/index surface, and the
+`kdb/server` native server engine (wire protocol, transport, peer sync) for a project building
+its own server binary/image around it — importable via `go mod edit -replace`. See the
+[release plan](docs/kdb-release-plan.md) for the full artifact list, exact package closure, and
+how a release reproduces byte-for-byte from its tag.
 
 ### Build identity
 

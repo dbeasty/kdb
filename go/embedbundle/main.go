@@ -337,10 +337,10 @@ func writeEmbedding(stageRoot, version string, entryPoints, pkgs []string) error
 	}
 	content := fmt.Sprintf(`# Embedding KDB (Go)
 
-This is a self-contained copy of the KDB Go engine — the subset of
-github.com/limidus/kdb/go that an in-process consumer can reach. See
-docs/kdb-release-plan.md in the main repository for how this bundle is built and how to
-reproduce it from a release tag.
+This is a self-contained copy of the KDB Go engine — the subset of github.com/limidus/kdb/go
+reachable from the entry points below, for a project that wants to link against KDB source
+directly rather than run this repo's own binaries or Docker image. See docs/kdb-release-plan.md
+in the main repository for how this bundle is built and how to reproduce it from a release tag.
 
 Bundle version %s. See bundle.json for the exact commit, build date and per-file checksums,
 and bundleinfo.go for the same identity as importable Go constants (import the module root as
@@ -375,9 +375,10 @@ js/wasm so no platform-specific file is silently dropped.
 %s
 ## What's excluded
 
-Everything only reachable from the server, native transport, wire protocol, CLI, peer sync,
-backup/recovery/integrity tooling, or the kdb-inspect/kdb-interop test harnesses — none of it is
-importable by an embedder of kdb/embed, kdb/driver, kdb/sql, kdb/query/hybrid or kdb/index.
+Everything not reachable from the entry points above: the CLI, backup/recovery/integrity
+tooling, the kdb-inspect/kdb-interop test harnesses, and the client SDK for talking to a
+*remote* kdb-service (kdb/client — the opposite direction from kdb/server, if that's one of this
+bundle's entry points).
 `, version, version, version, version, epList.String(), len(pkgs), pkgList.String())
 	if err := os.WriteFile(filepath.Join(stageRoot, "EMBEDDING.md"), []byte(content), 0o644); err != nil {
 		return err
