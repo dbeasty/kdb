@@ -34,7 +34,7 @@ publishing your own source. The commercial license grants the same code under
 terms that carry no copyleft or network-disclosure obligation, and can include
 warranty and support terms that the AGPL explicitly disclaims.
 
-Contact **licensing@limidus.com** to arrange one.
+Contact **davja@limidus.com** to arrange one.
 
 ---
 
