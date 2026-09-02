@@ -8,3 +8,7 @@ kdb/driver        # database/sql driver over that runtime
 kdb/sql           # KDB-SQL parser, planner, executor
 kdb/query/hybrid  # hybrid query engine
 kdb/index         # index core
+kdb/server        # native server engine (wire protocol, transport, peer sync) - a downstream
+                  # project that imports kdb/server directly (e.g. to build its own server
+                  # binary/image around it) needs this in the bundle too, not just the pure
+                  # in-process kdb/embed surface above
