@@ -25,6 +25,11 @@ public data class IndexDescriptor(
     val unique: Boolean,
     val schemaVersion: Int,
     val createdAtHash: KdbHash,
+    /**
+     * Layer 16 index options: "index_name", "weights" ("title=3,description=1"), "dimensions",
+     * "metric" (cosine|l2|inner_product), "m", "ef_construction", "ef_search".
+     */
+    val options: Map<String, String> = emptyMap(),
 )
 
 public data class IndexEntry(

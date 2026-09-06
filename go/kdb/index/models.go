@@ -32,6 +32,10 @@ type Descriptor struct {
 	Unique        bool
 	SchemaVersion int
 	CreatedAtHash codec.Hash
+	// Options carries Layer 16 index options: "index_name", "weights"
+	// ("title=3,description=1"), "dimensions", "metric" (cosine|l2|inner_product), "m",
+	// "ef_construction", "ef_search".
+	Options map[string]string
 }
 
 // Entry is one index row at a commit.
