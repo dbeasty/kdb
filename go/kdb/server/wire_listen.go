@@ -153,18 +153,18 @@ func (h *sqlWireConnHandler) handleFrame(frame []byte) ([]byte, error) {
 // dispatchRecovering is dispatch with a panic backstop: a panic costs one request, not the
 // process, and the client gets a typed INTERNAL error rather than silence.
 //
-// This is not hypothetical hardening. `SELECT 1` panics the SQL parser today
-// (kdb/sql/parser.go:475 - readIdentifier, reached for a projection that is a literal rather
-// than an identifier). With nothing recovering on the frame-handling path, that panic unwinds
-// out of the connection goroutine and takes the whole server down: every other connection,
-// every other namespace, every other client. Any client able to run a query can do it by
-// accident, and a browser-reachable listener widens who "any client" is.
+// This was added for a concrete bug, not as speculative hardening. `SELECT 1` used to panic the
+// SQL parser (readIdentifier, reached for a projection that is a literal rather than an
+// identifier), and with nothing recovering on this path the panic unwound out of the connection
+// goroutine and took the whole server down - every other connection, every other namespace.
+// Any client able to run a query could do it by accident, and a browser-reachable listener
+// widens who "any client" is.
 //
-// The real fix is the parser returning an error the way its other failure paths already do -
-// handleSqlExec is written expecting exactly that, and turns a parse error into a clean
-// sqlResultError. That is tracked separately. This is the backstop that keeps one client's
-// malformed statement from being everyone else's outage, and it is the contract a Go network
-// server is expected to honour: net/http recovers per request for the same reason.
+// That parser bug is now fixed at the source: readIdentifier returns an error, and
+// handleSqlExec turns it into a clean sqlResultError the way it always intended to. This
+// backstop stays anyway, because the property worth having is not "that one statement is safe"
+// but "no single request can end the process" - which is the contract a Go network server is
+// expected to honour, and the reason net/http recovers per request.
 //
 // Answering rather than dropping matters as much as not crashing. The finish-up plan's item
 // 4.H records that a request the server declines to answer leaves the caller hanging until its

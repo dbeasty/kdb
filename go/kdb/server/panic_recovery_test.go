@@ -13,18 +13,20 @@ import (
 	"github.com/limidus/kdb/go/kdb/server"
 )
 
-// TestPanickingStatementDoesNotKillTheServer covers the backstop in dispatchRecovering.
+// TestMalformedStatementIsAnErrorNotAnOutage covers the bug that motivated all of this:
+// `SELECT 1` - a projection that is a literal rather than an identifier, and a standard
+// connectivity probe - used to panic the SQL parser, and with nothing recovering on the
+// frame-handling path it killed the entire server process, taking every other connection and
+// namespace with it.
 //
-// `SELECT 1` panics the SQL parser (kdb/sql/parser.go:475 - readIdentifier, reached for a
-// projection that is a literal rather than an identifier). Before the recover, that panic
-// unwound out of the connection goroutine and took the entire process with it: every other
-// connection, every other namespace. Any client able to run a query could do it by accident,
-// and the WebSocket listener widens who that is.
+// Two properties are asserted, and they are different claims:
 //
-// The parser returning an error, the way handleSqlExec already expects it to, is the real fix
-// and is tracked separately. This test pins the property that matters regardless of when that
-// lands: one client's malformed statement is not everyone else's outage.
-func TestPanickingStatementDoesNotKillTheServer(t *testing.T) {
+//  1. The client gets a descriptive parse error - not "internal server error", which is what
+//     the panic backstop produced while the parser was still panicking, and not silence, which
+//     leaves a caller hanging until its own deadline.
+//  2. Everyone else's connection is unaffected. That is the part that made this severe rather
+//     than merely annoying.
+func TestMalformedStatementIsAnErrorNotAnOutage(t *testing.T) {
 	runtime, err := embed.OpenMemoryRuntime("demo", "app/data", schema.None())
 	if err != nil {
 		t.Fatal(err)
@@ -52,34 +54,80 @@ func TestPanickingStatementDoesNotKillTheServer(t *testing.T) {
 	}
 	defer bystander.Close()
 
-	// A typed error, promptly - not a panic, and not silence. A dropped reply would leave the
-	// caller waiting out its own deadline with no way to tell a wedged server from a slow one
-	// (the failure mode finish-up plan item 4.H names).
 	_, _, err = victim.QueryRaw(ctx, "app/data", "SELECT 1", nil)
 	if err == nil {
-		t.Fatal("expected an error from a statement that panics the parser")
+		t.Fatal("expected an error from a malformed statement")
 	}
-	if !strings.Contains(err.Error(), "internal server error") {
-		t.Fatalf("expected a typed internal error, got: %v", err)
+	// The parser's own message, naming what it found - not the backstop's generic reply.
+	if !strings.Contains(err.Error(), "expected identifier") {
+		t.Fatalf("expected a descriptive parse error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "internal server error") {
+		t.Fatalf("statement reached the panic backstop instead of being parsed cleanly: %v", err)
 	}
 
-	// The connection that triggered it is still usable...
+	// The connection that sent it is still usable...
 	if _, _, err := victim.QueryRaw(ctx, "app/data", "SELECT 1", nil); err == nil {
 		t.Fatal("expected the same error on a second attempt")
 	}
 
-	// ...and, the actual point, so is everyone else's. If the process had died, this would fail
-	// on a closed connection rather than returning a clean per-statement error.
+	// ...and so is everyone else's. Had the process died, this would fail on a closed
+	// connection rather than returning a clean per-statement error.
 	if _, _, err := bystander.QueryRaw(ctx, "app/data", "SELECT 1", nil); err == nil {
 		t.Fatal("expected an error for the bystander too")
-	} else if !strings.Contains(err.Error(), "internal server error") {
+	} else if !strings.Contains(err.Error(), "expected identifier") {
 		t.Fatalf("bystander connection did not survive: %v", err)
 	}
 
-	// A well-formed statement on the bystander connection still works, proving the server is
-	// serving rather than merely still running.
+	// A well-formed statement still works, proving the server is serving rather than merely
+	// still running.
 	if err := bystander.Exec(ctx, "app/data",
 		`CREATE TABLE players (name VARCHAR NOT NULL, level VARCHAR NOT NULL)`, nil); err != nil {
 		t.Fatalf("server no longer serving valid statements: %v", err)
+	}
+}
+
+// TestMalformedStatementVariantsAllReturnErrors sweeps the shapes most likely to reach a
+// parser edge from a real client - a probe, a truncated statement, a typo - and asserts every
+// one comes back as an error on a connection that stays usable.
+func TestMalformedStatementVariantsAllReturnErrors(t *testing.T) {
+	runtime, err := embed.OpenMemoryRuntime("demo", "app/data", schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := server.ListenSqlWire("tcp://127.0.0.1:0?bind=true", server.NewKdbServerRuntime(runtime))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := client.Connect(ctx, fmt.Sprintf("tcp://%s", ln.Addr().String()), "")
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Close()
+
+	for _, sql := range []string{
+		"SELECT 1",
+		"SELECT",
+		"SELECT * FROM",
+		"SELECT a FROM 1",
+		"",
+		"DROP TABLE players",
+		"INSERT INTO",
+		"CREATE TABLE",
+		"SELECT a FROM t WHERE b = 1.2.3",
+	} {
+		if _, _, err := c.QueryRaw(ctx, "app/data", sql, nil); err == nil {
+			t.Errorf("QueryRaw(%q) unexpectedly succeeded", sql)
+		}
+	}
+
+	// One connection, every malformed statement above, still serving afterwards.
+	if _, _, err := c.QueryRaw(ctx, "app/data", "SELECT name FROM players", nil); err != nil &&
+		strings.Contains(err.Error(), "connection") {
+		t.Fatalf("connection did not survive the sweep: %v", err)
 	}
 }

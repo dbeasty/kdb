@@ -205,8 +205,8 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
   });
 
   it("runs SQL over the same connection", async () => {
-    // Real statements against a real table: KDB's SQL needs a FROM, and `SELECT 1` currently
-    // panics the server's parser (recovered per request, but not a useful smoke test).
+    // Real statements against a real table: KDB's SQL requires a FROM clause, so `SELECT 1` is
+    // not a usable smoke test here (see the next case for what it does do).
     await client.exec(NS, "CREATE TABLE players (name VARCHAR NOT NULL, level VARCHAR NOT NULL)");
     await client.exec(NS, "INSERT INTO players (name, level) VALUES ('Alice', '7')");
     await client.exec(NS, "INSERT INTO players (name, level) VALUES ('Bob', '3')");
@@ -222,15 +222,29 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
     assert.equal(typeof byName["Alice"], "string");
   });
 
-  it("survives a statement that panics the server's parser", async () => {
-    // The server recovers per request rather than dying, so the client sees a typed error and
-    // the connection stays usable. Before that backstop this killed the whole process - which
-    // a browser-reachable listener makes considerably easier to trigger.
-    await assert.rejects(client.queryRaw(NS, "SELECT 1"), /internal server error/);
+  it("reports a malformed statement as a parse error, not an outage", async () => {
+    // `SELECT 1` used to panic the server's parser and kill the whole process - every
+    // connection, every namespace - which a browser-reachable listener makes considerably
+    // easier to trigger by accident. It is now a descriptive parse error naming the offending
+    // token, and the connection carries on.
+    await assert.rejects(client.queryRaw(NS, "SELECT 1"), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /expected identifier/);
+      assert.match(error.message, /found "1"/);
+      return true;
+    });
 
     // Same connection, still serving. (Asserted with SQL rather than a document write because
     // the previous test's CREATE TABLE installs a schema on this shared namespace, so an
     // arbitrary document would now be refused - correctly - for missing required fields.)
+    const rows = await client.query<{ name: string }>(NS, "SELECT name FROM players");
+    assert.ok(rows.length >= 2);
+  });
+
+  it("keeps serving after a sweep of malformed statements", async () => {
+    for (const sql of ["SELECT 1", "SELECT", "SELECT * FROM", "", "DROP TABLE players"]) {
+      await assert.rejects(client.queryRaw(NS, sql), `expected ${JSON.stringify(sql)} to fail`);
+    }
     const rows = await client.query<{ name: string }>(NS, "SELECT name FROM players");
     assert.ok(rows.length >= 2);
   });
