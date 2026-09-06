@@ -83,7 +83,7 @@ func ApplyMigration(current KdbSchema, migration SchemaMigration) kdberr.Result[
 
 // ComputeSchemaHash recomputes the schema content hash.
 func ComputeSchemaHash(sch KdbSchema) (codec.Hash, error) {
-	body := schemaBodyValue(sch.Fields, sch.Version, sch.CreatedAt, sch.Description)
+	body := schemaBodyValue(sch.Fields, sch.UniqueConstraints, sch.Version, sch.CreatedAt, sch.Description)
 	bytes, err := codec.EncodeBytes(body, BodyWireType(), WireRegistry())
 	if err != nil {
 		return codec.Hash{}, err

@@ -263,7 +263,7 @@ internal class SqlExecutor(
                     spec.query,
                     context.atCommit,
                     context.maxRows,
-                )
+                ).map { it.docId }
 
             is IndexLookupSpec.VectorAnn ->
                 reader.lookupVector(

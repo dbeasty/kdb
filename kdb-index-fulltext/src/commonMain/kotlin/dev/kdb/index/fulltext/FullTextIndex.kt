@@ -160,7 +160,7 @@ public class DefaultFullTextIndexStore(
         query: String,
         atCommit: KdbHash?,
         limit: Int,
-    ): List<KdbUuid> {
+    ): List<RankedResult> {
         val parsed = parseFullTextQuery(query)
         val cutoff = atCommit ?: dag.head()
         val termSets =
@@ -187,7 +187,7 @@ public class DefaultFullTextIndexStore(
                     if (parsed.phrase == null) return@filter true
                     tokenizer.tokenize(posting.text).joinToString(" ").contains(parsed.phrase.lowercase())
                 }
-        return filtered.take(limit).map { it.docId }
+        return filtered.take(limit).map { RankedResult(it.docId, 1.0f) }
     }
 
     override suspend fun nearestNeighbours(

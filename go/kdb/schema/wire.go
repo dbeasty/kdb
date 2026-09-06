@@ -15,6 +15,7 @@ var (
 	fqnHash32       = wireNS + ".Hash32"
 	fqnSchemaField  = wireNS + ".SchemaFieldWire"
 	fqnSchemaBody   = wireNS + ".KdbSchemaBody"
+	fqnUniqueConstr = wireNS + ".UniqueConstraintWire"
 	fqnSchemaMigr   = wireNS + ".SchemaMigrationWire"
 	fqnEnumPayload  = wireNS + ".EnumValuesPayload"
 	fqnFKString     = wireNS + ".FieldKindString"
@@ -87,12 +88,21 @@ func WireRegistry() *schema.Registry {
 			},
 		})
 		r.RegisterRecord(&schema.RecordSchema{
+			Name: "UniqueConstraintWire", Namespace: wireNS,
+			Fields: []schema.FieldSchema{
+				{ID: 1, Name: "fields", Type: schema.Array{Element: schema.Prim(schema.PhysicalString)}},
+			},
+		})
+		r.RegisterRecord(&schema.RecordSchema{
 			Name: "KdbSchemaBody", Namespace: wireNS,
 			Fields: []schema.FieldSchema{
 				{ID: 1, Name: "fields", Type: schema.Array{Element: schema.Ref{FullyQualifiedName: fqnSchemaField}}},
 				{ID: 2, Name: "version", Type: schema.Prim(schema.PhysicalInt32)},
 				{ID: 3, Name: "createdAt", Type: tsPrim},
 				{ID: 4, Name: "description", Type: schema.Prim(schema.PhysicalString)},
+				// Layer 16 / Component 72. Defaulted to an empty array and omitted by the
+				// writer when empty, so pre-Layer-16 bytes (and hashes) are unchanged.
+				{ID: 5, Name: "uniqueConstraints", Type: schema.Array{Element: schema.Ref{FullyQualifiedName: fqnUniqueConstr}}, Default: codec.ArrayValue{Elements: []codec.Value{}}},
 			},
 		})
 		registerMigrationRecords(r, fieldTypeUnion)
@@ -169,17 +179,63 @@ func BodyWireType() schema.Ref { return schema.Ref{FullyQualifiedName: fqnSchema
 // MigrationWireType is the wire type for SchemaMigration.
 func MigrationWireType() schema.Ref { return schema.Ref{FullyQualifiedName: fqnSchemaMigr} }
 
-func schemaBodyValue(fields []Field, version int, createdAt codec.Timestamp, description string) codec.RecordValue {
+func schemaBodyValue(fields []Field, constraints []UniqueConstraint, version int, createdAt codec.Timestamp, description string) codec.RecordValue {
 	els := make([]codec.Value, len(fields))
 	for i, f := range fields {
 		els[i] = schemaFieldWireRecord(f)
 	}
-	return codec.RecordValue{Fields: map[int]codec.Value{
+	rec := codec.RecordValue{Fields: map[int]codec.Value{
 		1: codec.ArrayValue{Elements: els},
 		2: codec.Int32Value{V: int32(version)},
 		3: codec.TimestampValue{EpochMicros: createdAt.EpochMicros()},
 		4: codec.StringValue{V: description},
 	}}
+	if len(constraints) > 0 {
+		cs := make([]codec.Value, len(constraints))
+		for i, c := range constraints {
+			names := make([]codec.Value, len(c.Fields))
+			for j, n := range c.Fields {
+				names[j] = codec.StringValue{V: n}
+			}
+			cs[i] = codec.RecordValue{Fields: map[int]codec.Value{1: codec.ArrayValue{Elements: names}}}
+		}
+		rec.Fields[5] = codec.ArrayValue{Elements: cs}
+	}
+	return rec
+}
+
+func parseUniqueConstraintsWire(v codec.Value) ([]UniqueConstraint, error) {
+	if v == nil {
+		return nil, nil
+	}
+	arr, ok := v.(codec.ArrayValue)
+	if !ok {
+		return nil, newDecodeError("uniqueConstraints array", nil)
+	}
+	if len(arr.Elements) == 0 {
+		return nil, nil
+	}
+	out := make([]UniqueConstraint, 0, len(arr.Elements))
+	for _, el := range arr.Elements {
+		rec, ok := el.(codec.RecordValue)
+		if !ok {
+			return nil, newDecodeError("uniqueConstraint record", nil)
+		}
+		names, ok := rec.Fields[1].(codec.ArrayValue)
+		if !ok {
+			return nil, newDecodeError("uniqueConstraint fields", nil)
+		}
+		c := UniqueConstraint{Fields: make([]string, 0, len(names.Elements))}
+		for _, n := range names.Elements {
+			sv, ok := n.(codec.StringValue)
+			if !ok {
+				return nil, newDecodeError("uniqueConstraint field name", nil)
+			}
+			c.Fields = append(c.Fields, sv.V)
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }
 
 func schemaFieldWireRecord(f Field) codec.RecordValue {
@@ -316,8 +372,15 @@ func parseSchemaBodyRecord(rec codec.RecordValue) (KdbSchema, error) {
 		return KdbSchema{}, newDecodeError("createdAt", nil)
 	}
 	desc, _ := rec.Fields[4].(codec.StringValue)
+	constraints, err := parseUniqueConstraintsWire(rec.Fields[5])
+	if err != nil {
+		return KdbSchema{}, err
+	}
+	if err := validateUniqueConstraints(fields, constraints); err != nil {
+		return KdbSchema{}, newDecodeError(err.Error(), nil)
+	}
 	createdAt := codec.TimestampFromEpochMicros(ts.EpochMicros)
-	body := schemaBodyValue(fields, int(ver.V), createdAt, desc.V)
+	body := schemaBodyValue(fields, constraints, int(ver.V), createdAt, desc.V)
 	bytes, err := codec.EncodeBytes(body, BodyWireType(), WireRegistry())
 	if err != nil {
 		return KdbSchema{}, err
@@ -332,12 +395,13 @@ func parseSchemaBodyRecord(rec codec.RecordValue) (KdbSchema, error) {
 		byName[f.Name] = f
 	}
 	return KdbSchema{
-		SchemaHash:   h,
-		Fields:       fields,
-		Version:      int(ver.V),
-		CreatedAt:    createdAt,
-		Description:  desc.V,
-		fieldsByName: byName,
+		SchemaHash:        h,
+		Fields:            fields,
+		Version:           int(ver.V),
+		CreatedAt:         createdAt,
+		Description:       desc.V,
+		UniqueConstraints: constraints,
+		fieldsByName:      byName,
 	}, nil
 }
 

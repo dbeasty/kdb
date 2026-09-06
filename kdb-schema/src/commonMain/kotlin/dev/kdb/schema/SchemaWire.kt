@@ -34,6 +34,7 @@ internal object SchemaFqn {
 
     const val SCHEMA_FIELD = "$NS.SchemaFieldWire"
     const val SCHEMA_BODY = "$NS.KdbSchemaBody"
+    const val UNIQUE_CONSTRAINT = "$NS.UniqueConstraintWire"
 
     const val MS_ADD_FIELD = "$NS.MigrationAddField"
     const val MS_DROP_FIELD = "$NS.MigrationDropField"
@@ -119,6 +120,14 @@ private fun buildRegistry(): KdbTypeRegistry {
         )
     reg.registerRecord(schemaFieldWire)
 
+    val uniqueConstraintWire =
+        RecordSchema(
+            name = "UniqueConstraintWire",
+            namespace = SchemaFqn.NS,
+            fields = listOf(FieldSchema(1, "fields", KdbType.Array(KdbType.Primitive(PhysicalKind.STRING)))),
+        )
+    reg.registerRecord(uniqueConstraintWire)
+
     val schemaBodyWire =
         RecordSchema(
             name = "KdbSchemaBody",
@@ -129,6 +138,14 @@ private fun buildRegistry(): KdbTypeRegistry {
                     FieldSchema(2, "version", KdbType.Primitive(PhysicalKind.INT32)),
                     FieldSchema(3, "createdAt", timestampPrim),
                     FieldSchema(4, "description", KdbType.Primitive(PhysicalKind.STRING)),
+                    // Layer 16 / Component 72. Empty default, omitted when empty: pre-Layer-16
+                    // bytes and hashes are unchanged.
+                    FieldSchema(
+                        5,
+                        "uniqueConstraints",
+                        KdbType.Array(KdbType.Ref(SchemaFqn.UNIQUE_CONSTRAINT)),
+                        default = KdbValue.ArrayVal(emptyList()),
+                    ),
                 ),
         )
     reg.registerRecord(schemaBodyWire)
@@ -348,18 +365,38 @@ internal fun parseSchemaFieldWire(rec: KdbValue.RecordVal): SchemaField {
 
 internal fun schemaBodyToValue(
     fields: List<SchemaField>,
+    uniqueConstraints: List<UniqueConstraint>,
     version: Int,
     createdAt: KdbTimestamp,
     description: String,
 ): KdbValue.RecordVal =
     KdbValue.RecordVal(
-        mapOf(
-            1 to KdbValue.ArrayVal(fields.map { schemaFieldToWireRecord(it) }),
-            2 to KdbValue.Int32Val(version),
-            3 to createdAt.toTimestampVal(null),
-            4 to KdbValue.StringVal(description),
-        ),
+        buildMap {
+            put(1, KdbValue.ArrayVal(fields.map { schemaFieldToWireRecord(it) }))
+            put(2, KdbValue.Int32Val(version))
+            put(3, createdAt.toTimestampVal(null))
+            put(4, KdbValue.StringVal(description))
+            // Always present: the codec omits a field whose value equals its declared default
+            // (an empty array here), which keeps pre-Layer-16 bytes and hashes unchanged.
+            put(
+                5,
+                KdbValue.ArrayVal(
+                    uniqueConstraints.map { c ->
+                        KdbValue.RecordVal(mapOf(1 to KdbValue.ArrayVal(c.fields.map { KdbValue.StringVal(it) })))
+                    },
+                ),
+            )
+        },
     )
+
+private fun parseUniqueConstraintsWire(v: KdbValue?): List<UniqueConstraint> {
+    if (v == null) return emptyList()
+    val arr = v as? KdbValue.ArrayVal ?: throw SchemaDecodeException("uniqueConstraints array")
+    return arr.elements.map { el ->
+        val rec = el as? KdbValue.RecordVal ?: throw SchemaDecodeException("uniqueConstraint record")
+        UniqueConstraint(readStringArray(rec.fields[1], "uniqueConstraint fields"))
+    }
+}
 
 internal fun parseSchemaBodyRecord(rec: KdbValue.RecordVal): KdbSchema {
     val fa = rec.fields[1] as? KdbValue.ArrayVal ?: throw SchemaDecodeException("schema fields array")
@@ -375,11 +412,14 @@ internal fun parseSchemaBodyRecord(rec: KdbValue.RecordVal): KdbSchema {
     val desc =
         (rec.fields[4] as? KdbValue.StringVal)?.v ?: throw SchemaDecodeException("description")
     require(fields.distinctBy { it.name }.size == fields.size) { "duplicate schema field names" }
+    val constraints = parseUniqueConstraintsWire(rec.fields[5])
+    KdbSchema.validateUniqueConstraints(fields, constraints)
     val hash =
         dev.kdb.document.kdbSha256(
-            schemaBodyToValue(fields, version, ts, desc).encodeToBytes(SchemaBodyWireType, KdbSchemaWireRegistry()),
+            schemaBodyToValue(fields, constraints, version, ts, desc)
+                .encodeToBytes(SchemaBodyWireType, KdbSchemaWireRegistry()),
         )
-    return KdbSchema(KdbHash.fromBytes(hash), fields, version, ts, desc)
+    return KdbSchema(KdbHash.fromBytes(hash), fields, version, ts, desc, constraints)
 }
 
 internal fun migrationStepToWire(step: MigrationStep): KdbValue.UnionVal =

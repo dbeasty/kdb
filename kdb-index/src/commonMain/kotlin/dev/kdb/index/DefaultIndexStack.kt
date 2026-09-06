@@ -368,7 +368,7 @@ internal class DefaultIndexReader(
         query: String,
         atCommit: KdbHash?,
         limit: Int,
-    ): List<KdbUuid> {
+    ): List<RankedResult> {
         val store =
             registry.get(fieldName, IndexType.FULLTEXT)
                 ?: throw IndexNotFoundException("FULLTEXT missing", registry.namespaceId, fieldName, IndexType.FULLTEXT)

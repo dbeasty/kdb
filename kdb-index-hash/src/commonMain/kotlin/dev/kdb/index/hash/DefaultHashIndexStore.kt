@@ -74,7 +74,7 @@ public class DefaultHashIndexStore(
         query: String,
         atCommit: KdbHash?,
         limit: Int,
-    ): List<KdbUuid> =
+    ): List<RankedResult> =
         throw IndexTypeMismatchException(
             "SEARCH not supported on HASH",
             descriptor.fieldName,

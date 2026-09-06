@@ -29,11 +29,16 @@ public interface IndexStore {
         ascending: Boolean = true,
     ): List<KdbUuid>
 
+    /**
+     * Ranked full-text search. Results are ordered by descending [RankedResult.score], ties broken by
+     * ascending document id, so two implementations over the same corpus return the same list
+     * (Layer 16, Component 63).
+     */
     public suspend fun search(
         query: String,
         atCommit: KdbHash? = null,
         limit: Int = Int.MAX_VALUE,
-    ): List<KdbUuid>
+    ): List<RankedResult>
 
     public suspend fun nearestNeighbours(
         queryVector: FloatArray,

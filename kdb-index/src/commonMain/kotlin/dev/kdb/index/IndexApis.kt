@@ -97,7 +97,7 @@ public interface IndexReader {
         query: String,
         atCommit: KdbHash? = null,
         limit: Int = Int.MAX_VALUE,
-    ): List<KdbUuid>
+    ): List<RankedResult>
 
     public suspend fun lookupVector(
         registry: IndexRegistry,

@@ -133,7 +133,7 @@ public class DefaultVectorIndexStore(
         query: String,
         atCommit: KdbHash?,
         limit: Int,
-    ): List<KdbUuid> =
+    ): List<RankedResult> =
         throw IndexTypeMismatchException(
             "search not on VECTOR",
             descriptor.fieldName,
