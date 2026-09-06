@@ -1,0 +1,35 @@
+{
+  "name": "@kdb/client",
+  "version": "0.1.0",
+  "description": "TypeScript client for KDB - wire codec, transports and the document/SQL/lease operation set.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tcp": {
+      "types": "./dist/transport/tcp.d.ts",
+      "import": "./dist/transport/tcp.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "fixtures": "go run ./tools/genfixtures"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.2"
+  }
+}
