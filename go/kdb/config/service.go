@@ -24,8 +24,13 @@ type ServiceSettings struct {
 	SQLAddr    string
 	PeerAddr   string
 	StreamAddr string
-	AdminAddr  string
-	RBAC       bool
+	// WSAddr is the WebSocket SQL-wire listen address (ws:// or wss://). Empty disables it.
+	//
+	// Separate from SQLAddr rather than a scheme variant of it because a deployment commonly
+	// wants both at once: native clients on raw TCP, browsers on WebSocket, same server.
+	WSAddr    string
+	AdminAddr string
+	RBAC      bool
 	// MemoryBudgetMB is the memory budget the pressure zones and grant capacity are computed
 	// against. Three-valued on purpose: -1 disables resource governance entirely, 0 (the
 	// default) auto-detects via server.DetectMemoryBudgetBytes, and any positive value is an
@@ -69,10 +74,13 @@ type ServiceSettings struct {
 // DefaultServiceSettings mirrors the flag defaults declared in cmd/kdb-service.
 func DefaultServiceSettings() ServiceSettings {
 	return ServiceSettings{
-		Namespace:    "demo/users",
-		SQLAddr:      "tcp://127.0.0.1:9090?bind=true",
-		PeerAddr:     "tcp://127.0.0.1:9091?bind=true",
-		StreamAddr:   "tcp://127.0.0.1:9092?bind=true",
+		Namespace:  "demo/users",
+		SQLAddr:    "tcp://127.0.0.1:9090?bind=true",
+		PeerAddr:   "tcp://127.0.0.1:9091?bind=true",
+		StreamAddr: "tcp://127.0.0.1:9092?bind=true",
+		// Off by default: a browser-reachable port is a deliberate exposure decision, not
+		// something an operator should discover already listening.
+		WSAddr:       "",
 		DrainTimeout: 30 * time.Second,
 		LogLevel:     "info",
 		LogFormat:    "text",
@@ -106,6 +114,7 @@ type ServiceFile struct {
 	SQLAddr         *string         `json:"sqlAddr"`
 	PeerAddr        *string         `json:"peerAddr"`
 	StreamAddr      *string         `json:"streamAddr"`
+	WSAddr          *string         `json:"wsAddr"`
 	AdminAddr       *string         `json:"adminAddr"`
 	RBAC            *bool           `json:"rbac"`
 	MemoryBudgetMB  *int            `json:"memoryBudgetMb"`
@@ -173,6 +182,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.SQLAddr, file.SQLAddr)
 		setIf(&s.PeerAddr, file.PeerAddr)
 		setIf(&s.StreamAddr, file.StreamAddr)
+		setIf(&s.WSAddr, file.WSAddr)
 		setIf(&s.AdminAddr, file.AdminAddr)
 		setIf(&s.RBAC, file.RBAC)
 		setIf(&s.MemoryBudgetMB, file.MemoryBudgetMB)
@@ -255,6 +265,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	envString("KDB_SQL_ADDR", &s.SQLAddr)
 	envString("KDB_PEER_ADDR", &s.PeerAddr)
 	envString("KDB_STREAM_ADDR", &s.StreamAddr)
+	envString("KDB_WS_ADDR", &s.WSAddr)
 	envString("KDB_ADMIN_ADDR", &s.AdminAddr)
 	if err := envBool("KDB_RBAC", &s.RBAC); err != nil {
 		return s, err
@@ -312,6 +323,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"sql-addr", func() { s.SQLAddr = flags.SQLAddr }},
 		{"peer-addr", func() { s.PeerAddr = flags.PeerAddr }},
 		{"stream-addr", func() { s.StreamAddr = flags.StreamAddr }},
+		{"ws-addr", func() { s.WSAddr = flags.WSAddr }},
 		{"admin-addr", func() { s.AdminAddr = flags.AdminAddr }},
 		{"rbac", func() { s.RBAC = flags.RBAC }},
 		{"memory-budget-mb", func() { s.MemoryBudgetMB = flags.MemoryBudgetMB; budgetSet = true }},

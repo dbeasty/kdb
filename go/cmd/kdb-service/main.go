@@ -46,6 +46,7 @@ func main() {
 	fs.StringVar(&flagVals.SQLAddr, "sql-addr", flagVals.SQLAddr, "SQL wire listen address (empty to disable)")
 	fs.StringVar(&flagVals.PeerAddr, "peer-addr", flagVals.PeerAddr, "peer sync (Mode 3 full-peer) wire listen address (empty to disable)")
 	fs.StringVar(&flagVals.StreamAddr, "stream-addr", flagVals.StreamAddr, "stream (Mode 1 read-only / Mode 2 write-back) wire listen address (empty to disable)")
+	fs.StringVar(&flagVals.WSAddr, "ws-addr", flagVals.WSAddr, "WebSocket SQL-wire listen address, ws:// or wss:// (empty to disable) - the only transport a browser can open")
 	fs.BoolVar(&flagVals.RBAC, "rbac", flagVals.RBAC, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
 	fs.IntVar(&flagVals.MemoryBudgetMB, "memory-budget-mb", flagVals.MemoryBudgetMB, "memory budget that admission control governs against: operations reserve their estimated memory cost before running, and are refused with a typed, retryable error once the budget is committed, rather than the process being OOM-killed with no signal to the client. 0 (default) auto-detects - the cgroup/container memory limit where there is one, else 75% of host RAM - so governance is on by default; -1 disables it entirely; a positive value is an explicit budget in MiB. With Component 48's accounting this can be set at the container's real --memory limit, unlike the deprecated --memory-limit-mb it replaces")
 	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "DEPRECATED alias for --memory-budget-mb, retained for existing configs. Its old meaning is preserved: an explicit 0 disables governance (whereas --memory-budget-mb 0 auto-detects). The old guidance to set this to only 60-80% of the container limit no longer applies - it was a workaround for the reactive sampler this replaces")
@@ -94,6 +95,7 @@ func main() {
 	}
 	dataDir, memory, namespace := cfg.DataDir, cfg.Memory, cfg.Namespace
 	sqlAddr, peerAddr, streamAddr, adminAddr := cfg.SQLAddr, cfg.PeerAddr, cfg.StreamAddr, cfg.AdminAddr
+	wsAddr := cfg.WSAddr
 	rbac, abortAfter, drainTimeout := cfg.RBAC, cfg.AbortAfter, cfg.DrainTimeout
 
 	logger, err := buildLogger(cfg.LogLevel, cfg.LogFormat)
@@ -120,6 +122,7 @@ func main() {
 		sqlAddr = secureScheme(sqlAddr)
 		peerAddr = secureScheme(peerAddr)
 		streamAddr = secureScheme(streamAddr)
+		wsAddr = secureScheme(wsAddr)
 	}
 
 	var rt *embed.EmbeddedKdbRuntime
@@ -245,6 +248,20 @@ func main() {
 		defer sqlListener.Close()
 		sqlStatus = fmt.Sprintf("enabled (%s)", sqlListener.Addr())
 	}
+	// The browser-reachable listener. Started alongside the TCP one rather than instead of it:
+	// a deployment commonly serves native clients on raw TCP and browsers on WebSocket at the
+	// same time, and both paths run the identical connection handler above the transport.
+	wsStatus := "disabled"
+	var wsListener *server.Listener
+	if wsAddr != "" {
+		wsListener, err = server.ListenSqlWireWSTLS(wsAddr, srv, tlsSettings)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: websocket listen: %v\n", err)
+			os.Exit(1)
+		}
+		defer wsListener.Close()
+		wsStatus = fmt.Sprintf("enabled (%s)", wsListener.Addr())
+	}
 	var peerListener *server.Listener
 	if peerAddr != "" {
 		peerListener, err = server.ListenPeerSyncTLS(peerAddr, srv, namespace, tlsSettings)
@@ -333,6 +350,7 @@ func main() {
 		"peer", peerStatus,
 		"stream", streamStatus,
 		"sql", sqlStatus,
+		"ws", wsStatus,
 		"admin", adminStatus,
 		"tls", tlsStatus,
 		"rbac", rbacStatus,
@@ -499,6 +517,8 @@ func secureScheme(addr string) string {
 		return "kdb+tcps://" + strings.TrimPrefix(addr, "kdb+tcp://")
 	case strings.HasPrefix(addr, "tcp://"):
 		return "tcps://" + strings.TrimPrefix(addr, "tcp://")
+	case strings.HasPrefix(addr, "ws://"):
+		return "wss://" + strings.TrimPrefix(addr, "ws://")
 	default:
 		return addr
 	}
