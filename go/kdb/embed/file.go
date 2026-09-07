@@ -168,6 +168,11 @@ func (h *Host) openNamespace(
 			time.Duration(cfg.AsyncSyncIntervalMillis)*time.Millisecond,
 		)
 		dagOut = persisting
+		if eng, ok := store.(*engine.ServerEngine); ok {
+			// Told where each commit landed, so the versions it wrote can
+			// be found again by position instead of by scanning.
+			persisting.SetPersistListener(eng.RecordCommitLocation)
+		}
 		if replayedInFull {
 			checkpointAfterFullReplay(d, store, handle.DeltaReader(), w, io, namespaceID, opts.Storage.DisableCheckpoints)
 		}

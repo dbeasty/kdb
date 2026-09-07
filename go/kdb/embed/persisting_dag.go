@@ -146,7 +146,7 @@ func (d *PersistingCommitDAG) PersistAsync(c document.Commit) (wait func() error
 			ClientContext: "",
 		},
 		CommitPayload: payload,
-	})
+	}, c.DocumentTreeHash)
 }
 
 // Close drains and flushes everything still queued, then stops the log writer.
@@ -171,4 +171,18 @@ var _ dag.CommitDAG = (*PersistingCommitDAG)(nil)
 // operations off plain Walk's result is a mistake.
 func (p *PersistingCommitDAG) WalkWithOperations(from codec.Hash, until *codec.Hash, limit int) ([]dag.TraversalEntry, error) {
 	return p.delegate.WalkWithOperations(from, until, limit)
+}
+
+// SetPersistListener installs a callback told where each commit landed in
+// the delta log, once the append knows.
+//
+// The position is not knowable before the append - a batch writes several
+// records and only the append says where each went - so anything keyed by
+// it has to be filed afterwards. See engine.RecordCommitLocation, the one
+// caller, which uses it to record where the versions a commit wrote can be
+// found without keeping a second copy of them.
+func (d *PersistingCommitDAG) SetPersistListener(fn func(treeHash codec.Hash, segmentSeq, frameOffset int64)) {
+	if d.log != nil {
+		d.log.onPersisted = fn
+	}
 }

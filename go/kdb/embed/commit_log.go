@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/metrics"
 	"github.com/limidus/kdb/go/kdb/storage"
 )
@@ -66,10 +67,19 @@ type commitLogWriter struct {
 	sendMu    sync.RWMutex
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	// onPersisted is told where each record landed, once the append knows.
+	// Set before the writer is used and not changed after, so it needs no
+	// lock of its own.
+	onPersisted func(treeHash codec.Hash, segmentSeq, frameOffset int64)
 }
 
 type logRequest struct {
 	rec storage.DeltaRecord
+	// treeHash names the document tree the commit produced, so whatever is
+	// waiting on this record's log position can be found once the append
+	// reports one. Zero when the caller has nothing waiting.
+	treeHash codec.Hash
 	// ack is nil for records whose caller does not wait (DurabilityAsync).
 	ack chan error
 }
@@ -104,7 +114,7 @@ func newCommitLogWriter(w storage.DeltaSegmentWriter, durability storage.Durabil
 // later caller: a commit log with a hole in it is not something to keep
 // appending to, since replay would silently stop at the hole.
 func (c *commitLogWriter) Enqueue(rec storage.DeltaRecord) error {
-	wait, err := c.EnqueueAsync(rec)
+	wait, err := c.EnqueueAsync(rec, codec.Hash{})
 	if err != nil {
 		return err
 	}
@@ -117,11 +127,11 @@ func (c *commitLogWriter) Enqueue(rec storage.DeltaRecord) error {
 // depends on it - while the returned wait is safe, and meant, to be called
 // after releasing it. wait is never nil on a nil error, and is a no-op under
 // DurabilityAsync.
-func (c *commitLogWriter) EnqueueAsync(rec storage.DeltaRecord) (wait func() error, err error) {
+func (c *commitLogWriter) EnqueueAsync(rec storage.DeltaRecord, treeHash codec.Hash) (wait func() error, err error) {
 	if err := c.latched(); err != nil {
 		return nil, err
 	}
-	req := &logRequest{rec: rec}
+	req := &logRequest{rec: rec, treeHash: treeHash}
 	if c.durability == storage.DurabilitySync {
 		req.ack = make(chan error, 1)
 	}
@@ -266,9 +276,20 @@ func (c *commitLogWriter) drain(first *logRequest) []*logRequest {
 
 // appendBatch writes each record to the segment without flushing.
 func (c *commitLogWriter) appendBatch(batch []*logRequest) error {
+	seq, hasSeq := int64(0), false
+	if s, ok := c.writer.(storage.DeltaSegmentSequencer); ok {
+		seq, hasSeq = s.SequenceNumber(), true
+	}
 	for _, r := range batch {
-		if _, err := c.writer.Append(r.rec); err != nil {
+		offset, err := c.writer.Append(r.rec)
+		if err != nil {
 			return fmt.Errorf("appending commit %s to the delta log: %w", r.rec.CommitHash.Hex(), err)
+		}
+		// Reported after the append rather than before it, because the
+		// offset is not knowable until then: a batch appends several
+		// records and only Append says where each one went.
+		if c.onPersisted != nil && hasSeq && r.treeHash != (codec.Hash{}) {
+			c.onPersisted(r.treeHash, seq, offset)
 		}
 	}
 	return nil

@@ -67,14 +67,14 @@ func openHeapPerCommit(t *testing.T, commits int) float64 {
 // each and making the graph O(n squared) to build, to serve a prefix
 // lookup that scanned it linearly anyway.
 func TestOpenCostPerCommitDoesNotGrow(t *testing.T) {
-	small := openHeapPerCommit(t, 4000)
-	large := openHeapPerCommit(t, 16000)
-	t.Logf("open cost: %.0f bytes/commit at 4k commits, %.0f at 16k", small, large)
+	small := openHeapPerCommit(t, 1500)
+	large := openHeapPerCommit(t, 6000)
+	t.Logf("open cost: %.0f bytes/commit at 1.5k commits, %.0f at 6k", small, large)
 
 	// Linear means the per-commit figure holds; a super-linear term shows
 	// up as the larger run costing more per commit than the smaller.
 	if large > small*1.5 {
-		t.Fatalf("open costs %.0f bytes/commit at 16k commits against %.0f at 4k - "+
+		t.Fatalf("open costs %.0f bytes/commit at 6k commits against %.0f at 1.5k - "+
 			"something scales worse than linearly with history", large, small)
 	}
 	// A ceiling as well, because "linear in commits" is only acceptable

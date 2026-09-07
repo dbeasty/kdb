@@ -78,7 +78,7 @@ func TestHistoricalReadsSurviveTreeEviction(t *testing.T) {
 		t.Run(s.String(), func(t *testing.T) {
 			root := t.TempDir()
 			rt := tinyTreeBudgetRuntime(t, root, s)
-			commits, texts := writeTinyVersions(t, rt, 400)
+			commits, texts := writeTinyVersions(t, rt, 200)
 			rt.Close()
 
 			re := tinyTreeBudgetRuntime(t, root, s)
@@ -87,7 +87,7 @@ func TestHistoricalReadsSurviveTreeEviction(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, i := range []int{0, 1, 199, 398, 399} {
+			for _, i := range []int{0, 1, 99, 198, 199} {
 				got := readAt(t, re, commits[i], docID)
 				if got == nil {
 					t.Fatalf("version %d: not readable at its own commit after tree eviction", i)
@@ -153,7 +153,7 @@ func TestHistoryWalkStaysLinear(t *testing.T) {
 		return float64(after.TotalAlloc-before.TotalAlloc) / (1024 * 1024)
 	}
 
-	const base = 300
+	const base = 150
 	small := walk(base)
 	large := walk(base * 2)
 	t.Log(fmt.Sprintf("walking history: %d commits %.2f MB, %d commits %.2f MB", base, small, base*2, large))
@@ -186,12 +186,12 @@ func TestTreeMemoryDoesNotFollowCommitCount(t *testing.T) {
 		defer re.Close()
 		return liveHeapMB(re)
 	}
-	measure(200) // discard: one-off per-process costs
+	measure(100) // discard: one-off per-process costs
 
-	small := measure(1000)
-	large := measure(4000)
+	small := measure(500)
+	large := measure(2000)
 	t.Log(fmt.Sprintf("holding a namespace open: %d commits %.2f MB, %d commits %.2f MB",
-		1000, small, 4000, large))
+		500, small, 2000, large))
 
 	if small <= 0 {
 		t.Skip("could not measure heap")

@@ -142,7 +142,7 @@ func TestCommitLogGroupsConcurrentCommits(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			wait, err := c.EnqueueAsync(rec(fmt.Sprintf("c%02d", i)))
+			wait, err := c.EnqueueAsync(rec(fmt.Sprintf("c%02d", i)), codec.Hash{})
 			queued.Done()
 			if err != nil {
 				atomic.AddInt64(&failures, 1)

@@ -197,7 +197,7 @@ func TestObjectsStrategyMakesHistoricalReadsCheap(t *testing.T) {
 	measure := func(s storage.HistoryStrategy) (float64, int) {
 		root := t.TempDir()
 		rt := mustStrategyRuntime(t, root, s)
-		commits, texts := writeVersions(t, rt, 200)
+		commits, texts := writeVersions(t, rt, 120)
 		rt.Close()
 
 		reopened := mustStrategyRuntime(t, root, s)

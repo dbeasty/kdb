@@ -2,6 +2,7 @@ package embed
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -159,7 +160,9 @@ func applyCommitToTree(tree document.DocumentTree, c document.Commit) (document.
 //
 // Uses the same tree-folding code the rebuild path uses, so the trees it
 // records are the ones the write path would have produced; anything else
-// would file objects under hashes no commit names.
+// would file objects under hashes no commit names. Document versions are
+// recorded as positions in the log, not copies of their text - see
+// engine.putDocumentLocation.
 func recordTreeObjectsForHistory(eng *engine.ServerEngine, r storage.DeltaSegmentReader) error {
 	if r == nil {
 		return nil
@@ -168,9 +171,15 @@ func recordTreeObjectsForHistory(eng *engine.ServerEngine, r storage.DeltaSegmen
 	if err != nil {
 		return err
 	}
+	streamer, ok := r.(storage.DeltaCommitStreamer)
+	if !ok {
+		return fmt.Errorf("kdb: migrate: this delta reader cannot report frame positions, " +
+			"so document locations cannot be recorded")
+	}
 	tree := document.EmptyDocumentTree()
 	for _, seg := range segments {
-		streamErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
+		segment := seg
+		streamErr := streamer.StreamCommits(segment, func(c document.Commit, frameOffset int64) error {
 			next, puts, deletes, err := applyCommitToTree(tree, c)
 			if err != nil {
 				return err
@@ -178,19 +187,11 @@ func recordTreeObjectsForHistory(eng *engine.ServerEngine, r storage.DeltaSegmen
 			if len(puts) > 0 || len(deletes) > 0 {
 				eng.RecordTreeObject(tree, next, puts, deletes)
 			}
-			// The versions themselves, too: a tree object gets a read as
-			// far as a content hash, and something has to hold the bytes.
-			for _, op := range c.Operations {
-				w, isWrite := op.(document.WriteOp)
-				if !isWrite {
-					continue
-				}
-				doc := documentFromPatch(w.DocID, w.Patch)
-				h, err := doc.ContentHash()
-				if err != nil {
-					continue
-				}
-				eng.RecordDocumentObject(h, doc)
+			// Where each version this commit wrote can be found, rather
+			// than a second copy of it: the commit is already in the log at
+			// this offset, and that is the copy everything else reads.
+			for _, p := range puts {
+				eng.RecordDocumentLocation(p.ContentHash, segment.SequenceNumber, frameOffset)
 			}
 			tree = next
 			return nil

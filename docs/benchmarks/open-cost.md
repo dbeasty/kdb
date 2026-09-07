@@ -305,9 +305,8 @@ bounded map would evict the rebuild's own output as it produced it. Making
 that path re-runnable, or leaving `replay` unbounded and saying so, is a
 decision the fix has to make rather than inherit.
 
-**Under `objects`, a version's text is on disk twice**, in the delta log
-and in the object store. Making the log prunable once its objects are
-written is the change that would remove that, and is not attempted here.
+*(Resolved: under `objects` the object store now holds a seventeen-byte
+pointer into the log rather than a copy of the version. See below.)*
 
 ## A correction on the storage side
 
@@ -331,3 +330,47 @@ delta-encoding between versions remain real gaps — kdb stores each version
 whole where git deltas it against its neighbours — but on top of zstd the
 incremental win is modest, and it was never the reason a small document
 exhausted a 1 GB container. Memory was.
+
+## Fourth pass: the journal as the only copy
+
+The objects strategy stored each version's text under its content hash, so
+a historical read could find it by lookup. That worked, and it meant the
+same bytes were on disk twice - in the delta log and again in the object
+store. The log is the journal: it is what a repair reads, what a peer
+receives, and the thing any other copy would have to be reconciled
+against. A second copy is a second thing to keep true.
+
+What is stored under the content hash now is where in the log the version
+is - a tag, a segment sequence and a frame offset, seventeen bytes - and a
+read follows it to the frame. Same workload as everything above, 463
+rewrites of one document:
+
+| | data directory | overhead vs `replay` |
+|---|---:|---:|
+| `replay` | 1.93 MB | — |
+| `objects`, storing the versions | 2.50 MB | +29.5% |
+| `objects`, storing their positions | **2.07 MB** | **+7.3%** |
+
+The 7.3% left is per-entry overhead in the SSTable holding the tree objects
+and the location records, not the versions. Historical reads are unchanged
+in kind - a lookup, then one frame read: 1.38 MB of allocation against
+`replay`'s 2858 MB full scan on the same read.
+
+### Why the position is recorded after the append
+
+A frame's offset is not knowable until it has been written - a batch
+appends several records and only the append reports where each went. So
+the engine holds the content hashes a commit tree produced, keyed by that
+tree's hash, and the commit log tells it where the commit naming that tree
+landed. That hand-off is bounded: a commit whose position never arrives -
+memory-only durability, a failed batch, a process that dies between the
+two - drops off the end of a small queue.
+
+Nothing in this is load-bearing. A location that is missing, dropped, or
+unreadable costs a scan through the existing loader, never an answer, and
+the index is fully derivable from the log - which is what makes "repair
+the journal" the whole recovery story rather than one of two.
+
+Records written by the earlier scheme are still read as documents, so a
+namespace built before this keeps resolving at full speed instead of
+falling back to scanning.
