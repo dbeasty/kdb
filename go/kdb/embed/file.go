@@ -58,12 +58,16 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 }
 
 // openNamespace opens one namespace under an already-locked host, using the host's shared I/O
-// shim. It returns the runtime and the func that shuts its storage down; wiring those into
-// EmbeddedKdbRuntime.Close is the host's job, because on the multi-namespace path the lock
-// outlives any one namespace.
+// shim. It returns the host's entry for the namespace - the runtime plus the func that shuts its
+// storage down - and this namespace's side of the host's memory pool. Wiring all three up is the
+// host's job, because on the multi-namespace path both the lock and the pool outlive any one
+// namespace.
+//
+// The participant is nil for a namespace with no ServerEngine behind it, which is the honest
+// answer: there is nothing there whose budget could be re-cut.
 func (h *Host) openNamespace(
 	catalog, namespaceID string, sch schema.KdbSchema, opts FileRuntimeOptions,
-) (*EmbeddedKdbRuntime, func() error, error) {
+) (*namespaceEntry, storage.BudgetParticipant, error) {
 	dataRoot, io := h.dataRoot, h.io
 
 	// A read-only open creates nothing: the directory belongs to the writer, and a reader that
@@ -137,7 +141,8 @@ func (h *Host) openNamespace(
 		return nil, nil, fmt.Errorf("file runtime missing storage adapter")
 	}
 
-	if eng, ok := store.(*engine.ServerEngine); ok {
+	eng, _ := store.(*engine.ServerEngine)
+	if eng != nil {
 		// One owner for trees. The engine already keeps every tree it
 		// commits; leaving the DAG's own map in place would mean two
 		// structures holding the same values under the same keys, and a
@@ -230,7 +235,15 @@ func (h *Host) openNamespace(
 	// Closing the runtime closes this namespace through the host, which is what owns the
 	// shutdown sequence now that a lock can outlive any one namespace under it.
 	rt.storageClose = func() error { return h.CloseNamespace(namespaceID) }
-	return rt, storageClose, nil
+
+	// This namespace's side of the host's memory pool. Registered by the caller, after the
+	// entry is in the host's map, so a rebalance can never reach a namespace the host does not
+	// yet consider open.
+	var budget storage.BudgetParticipant
+	if eng != nil {
+		budget = namespaceBudget{eng: eng, dag: d, pinnedOps: opts.Storage.CommitOpsBytes > 0}
+	}
+	return &namespaceEntry{rt: rt, close: storageClose}, budget, nil
 }
 
 // LockDataDir takes dataRoot's attach lock exclusively and returns its release func. For

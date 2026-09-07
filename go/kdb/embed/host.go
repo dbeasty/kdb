@@ -5,8 +5,10 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/engine"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 	s3io "github.com/limidus/kdb/go/kdb/storage/io/s3"
 )
@@ -38,10 +40,57 @@ type Host struct {
 	lock     *dirLock
 	io       storage.PlatformIOShim
 
+	arbiter *storage.BudgetArbiter
+
 	mu     sync.Mutex
-	nss    map[string]*EmbeddedKdbRuntime
-	closes map[string]func() error
+	nss    map[string]*namespaceEntry
 	closed bool
+}
+
+// namespaceEntry is everything the host holds on behalf of one open namespace.
+type namespaceEntry struct {
+	rt *EmbeddedKdbRuntime
+	// close flushes and seals this namespace's storage. Held here rather than on the runtime
+	// because on the multi-namespace path the directory lock outlives any one namespace.
+	close func() error
+}
+
+// DefaultHostMemoryBudgetBytes is the pool a host divides across its namespaces when the caller
+// names no total. Exactly the per-runtime default the single-namespace open path has always
+// used, so a host with one namespace under it is proportioned byte for byte the way that
+// namespace would have been on its own.
+//
+// It does mean a host with nine namespaces divides the same 64 MiB nine ways rather than handing
+// out 64 MiB nine times. That is the point - see docs/kdb-spec-layer17-multi-namespace-runtime.md
+// §1.1 - but it also means a multi-namespace deployment should set a real total rather than
+// inherit a default sized for one namespace.
+const DefaultHostMemoryBudgetBytes int64 = 64 << 20
+
+// namespaceBudget is one namespace's side of the host's memory pool: the storage engine holds
+// document versions, historical trees and the memtable, and the commit DAG holds operations, so
+// a share has to be split across both and demand summed from both.
+type namespaceBudget struct {
+	eng *engine.ServerEngine
+	dag *dag.InMemoryCommitDag
+	// pinnedOps records that the caller set StorageOptions.CommitOpsBytes explicitly, so the
+	// share must not be re-derived over it. The engine makes the same check for its own three
+	// sub-budgets from its config; the DAG has no config to consult, so the fact is carried
+	// here instead. See ServerEngine.SetMemoryBudgetBytes.
+	pinnedOps bool
+}
+
+func (n namespaceBudget) SetBudgetBytes(b int64) {
+	n.eng.SetMemoryBudgetBytes(b)
+	if n.pinnedOps {
+		return
+	}
+	// The same fraction ResolvedCommitOpsBytes applies at open, so an arbitrated namespace and a
+	// standalone one are proportioned identically and only the total differs.
+	n.dag.SetOperationsBudget(int64(float64(b) * storage.DefaultCommitOpsFraction))
+}
+
+func (n namespaceBudget) DemandBytes() int64 {
+	return n.eng.MemoryDemandBytes() + n.dag.OperationsResidentBytes()
 }
 
 // OpenFileHost takes dataRoot's directory lock and builds the shared platform I/O shim, and
@@ -101,15 +150,24 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 		return nil, err
 	}
 
+	pool := opts.Storage.MemoryBudgetBytes
+	if pool <= 0 {
+		pool = DefaultHostMemoryBudgetBytes
+	}
 	return &Host{
 		dataRoot: dataRoot,
 		opts:     opts,
 		lock:     lock,
 		io:       io,
-		nss:      make(map[string]*EmbeddedKdbRuntime),
-		closes:   make(map[string]func() error),
+		arbiter:  storage.NewBudgetArbiter(pool, storage.DefaultBudgetRebalanceInterval),
+		nss:      make(map[string]*namespaceEntry),
 	}, nil
 }
+
+// MemoryArbiter is the pool this host divides across its namespaces. Exposed so a caller can
+// change the floor, pin one namespace's share with Reserve, or read the current allocation for
+// metrics.
+func (h *Host) MemoryArbiter() *storage.BudgetArbiter { return h.arbiter }
 
 // DataRoot is the directory this host holds the lock on.
 func (h *Host) DataRoot() string { return h.dataRoot }
@@ -121,7 +179,16 @@ func (h *Host) ReadOnly() bool { return h.opts.ReadOnly }
 // Namespace opens namespaceID under this host with the host's default storage options, or
 // returns the already-open runtime for it.
 func (h *Host) Namespace(catalog, namespaceID string, sch schema.KdbSchema) (*EmbeddedKdbRuntime, error) {
-	return h.NamespaceWithOptions(catalog, namespaceID, sch, h.opts.Storage)
+	sopts := h.opts.Storage
+	// StorageOptions.MemoryBudgetBytes means two different things at the two levels, and passing
+	// the host's through unchanged conflates them: on the host it is the *pool* every namespace
+	// draws from, while on a namespace it is that namespace's fixed, non-arbitrated share. Left
+	// in, every namespace opened here would be pinned at the size of the whole pool - so a host
+	// given an explicit 256 MiB total handed 256 MiB to each of nine namespaces, which is the
+	// exact arithmetic this component exists to remove. Zeroed here so the default is what the
+	// caller meant: draw from the pool.
+	sopts.MemoryBudgetBytes = 0
+	return h.NamespaceWithOptions(catalog, namespaceID, sch, sopts)
 }
 
 // NamespaceWithOptions is Namespace with per-namespace storage tuning - a hot namespace and a
@@ -132,12 +199,13 @@ func (h *Host) Namespace(catalog, namespaceID string, sch schema.KdbSchema) (*Em
 // is not something this can do behind its callers' backs.
 func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbSchema, sopts StorageOptions) (*EmbeddedKdbRuntime, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed {
+		h.mu.Unlock()
 		return nil, fmt.Errorf("kdb: host for %s is closed", h.dataRoot)
 	}
-	if rt, ok := h.nss[namespaceID]; ok {
-		return rt, nil
+	if e, ok := h.nss[namespaceID]; ok {
+		h.mu.Unlock()
+		return e.rt, nil
 	}
 	opts := h.opts
 	opts.Storage = sopts
@@ -145,14 +213,49 @@ func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbS
 	// disagreeing with the lock actually held over it.
 	opts.ReadOnly = h.opts.ReadOnly
 	opts.Storage.SyncMode = h.opts.Storage.SyncMode
+	// Open at roughly the share this namespace is about to be given, not at the whole pool.
+	// Replay happens inside openNamespace, so a namespace that replays against the pool and is
+	// only cut down to its share afterwards has already held the difference - which is precisely
+	// the transient spike the pool exists to prevent. The arbiter refines this a moment later.
+	fixed := sopts.MemoryBudgetBytes > 0
+	if !fixed {
+		opts.Storage.MemoryBudgetBytes = h.arbiter.TotalBytes() / int64(len(h.nss)+1)
+	}
+	h.mu.Unlock()
 
-	rt, storageClose, err := h.openNamespace(catalog, namespaceID, sch, opts)
+	entry, budget, err := h.openNamespace(catalog, namespaceID, sch, opts)
 	if err != nil {
 		return nil, err
 	}
-	h.nss[namespaceID] = rt
-	h.closes[namespaceID] = storageClose
-	return rt, nil
+
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		_ = entry.close()
+		return nil, fmt.Errorf("kdb: host for %s is closed", h.dataRoot)
+	}
+	// Lost a race to another goroutine opening the same namespace: keep theirs, close ours.
+	// Two engines over one namespace's files is what the writer lock exists to prevent, and the
+	// lock cannot see this one because both are inside the process that holds it.
+	if e, ok := h.nss[namespaceID]; ok {
+		h.mu.Unlock()
+		_ = entry.close()
+		return e.rt, nil
+	}
+	h.nss[namespaceID] = entry
+	h.mu.Unlock()
+
+	// Outside the host lock: registering rebalances, which evicts inside the engines' own locks,
+	// and none of that should block another namespace from being opened or closed.
+	if budget != nil {
+		if fixed {
+			// An explicit per-namespace budget opts out of the pool: carved off the top and left
+			// alone, so a caller who has decided what one namespace needs keeps that decision.
+			h.arbiter.Reserve(namespaceID, sopts.MemoryBudgetBytes)
+		}
+		h.arbiter.Register(namespaceID, budget)
+	}
+	return entry.rt, nil
 }
 
 // Namespaces lists the namespaces currently open under this host, sorted.
@@ -173,14 +276,16 @@ func (h *Host) Namespaces() []string {
 // this is safe to call more than once.
 func (h *Host) CloseNamespace(namespaceID string) error {
 	h.mu.Lock()
-	closeFn, ok := h.closes[namespaceID]
-	delete(h.closes, namespaceID)
+	entry, ok := h.nss[namespaceID]
 	delete(h.nss, namespaceID)
 	h.mu.Unlock()
-	if !ok || closeFn == nil {
+	if !ok || entry == nil || entry.close == nil {
 		return nil
 	}
-	return closeFn()
+	// Before the storage close, so the namespaces that are staying get the room back at the
+	// moment it stops being used rather than at the next tick.
+	h.arbiter.Unregister(namespaceID)
+	return entry.close()
 }
 
 // Close shuts every namespace down and then releases the directory lock, in that order - a
@@ -196,22 +301,25 @@ func (h *Host) Close() error {
 		return nil
 	}
 	h.closed = true
-	ids := make([]string, 0, len(h.closes))
-	for id := range h.closes {
+	ids := make([]string, 0, len(h.nss))
+	for id := range h.nss {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	closes := h.closes
-	h.closes = make(map[string]func() error)
-	h.nss = make(map[string]*EmbeddedKdbRuntime)
+	entries := h.nss
+	h.nss = make(map[string]*namespaceEntry)
 	lock := h.lock
 	h.lock = nil
 	h.mu.Unlock()
 
+	// Stop rebalancing before anything is torn down, so no tick lands on a namespace that is
+	// mid-close. Namespaces keep whatever ceiling they last had; see BudgetArbiter.Close.
+	h.arbiter.Close()
+
 	var firstErr error
 	for _, id := range ids {
-		if fn := closes[id]; fn != nil {
-			if err := fn(); err != nil && firstErr == nil {
+		if e := entries[id]; e != nil && e.close != nil {
+			if err := e.close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
