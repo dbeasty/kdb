@@ -260,11 +260,50 @@ so the shape cannot come back.
 
 
 
-**`treesByHash` is still unbounded.** Every `DocumentTree` produced in a
-session is retained. Trees are small - 3 MB against 329 MB in the heap
-profile above, because the persistent trie shares structure between
-versions - so this is not the binding constraint, but it has the same shape
-and no bound.
+### Document trees are still unbounded, and are now the binding constraint
+
+Every `DocumentTree` a session produces is retained. In the first profile
+this looked negligible - 3 MB against 329 MB - but that was only true while
+document text dominated. With the text bounded, trees are what is left, and
+they grow with the number of commits rather than with the size of the data.
+
+Measured on a ~70 byte document, so nothing else can dominate:
+
+| commits | live heap | per commit |
+|---:|---:|---:|
+| 500 | 7.59 MB | 15.9 KB |
+| 2,000 | 19.03 MB | 10.0 KB |
+| 8,000 | 65.79 MB | 8.6 KB |
+
+A heap profile at 8,000 commits puts **50.5 MB of 75 MB in
+`document.trieInsertAt`** - the trie nodes themselves - with the commit
+graph's own metadata a distant second at about 10 MB. So roughly 6.3 KB of
+trie per commit and 1.25 KB of graph, for a document of 70 bytes, holding
+linearly for as long as the namespace stays open. A million commits would
+be several gigabytes of tree.
+
+The per-commit cost is that high because the trie is fixed-depth 32 with no
+path compression: rewriting one document rebuilds all 32 nodes on its path,
+and successive versions of the same document share none of them, since
+every node's hash changes when the leaf does.
+
+Two things make this trickier than it looks, both already paid for once in
+this document:
+
+**There are two maps, not one.** `dag.InMemoryCommitDag.trees` and
+`engine.ServerEngine.treesByHash` hold the *same* `DocumentTree` values, so
+they reference the same trie nodes. Bounding either alone frees nothing -
+exactly the trap that made the original two document retainers each look
+innocent.
+
+**Eviction is only safe under one of the two history strategies.** Under
+`objects` a missing tree is recovered by `treeFromObjects`, a cheap
+repeatable lookup, so bounding is straightforward. Under `replay` the
+recovery path is `rebuildTreesOnce`, which is once-per-process by
+construction: once it has run, an evicted tree can never be rebuilt, and a
+bounded map would evict the rebuild's own output as it produced it. Making
+that path re-runnable, or leaving `replay` unbounded and saying so, is a
+decision the fix has to make rather than inherit.
 
 **Under `objects`, a version's text is on disk twice**, in the delta log
 and in the object store. Making the log prunable once its objects are
