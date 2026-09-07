@@ -136,3 +136,29 @@ func ResolvedMemtableFlushBytes(cfg StorageEngineConfig) int64 {
 	}
 	return budget
 }
+
+// DefaultHistoryTreeFraction is the share of the hot-tier budget that
+// historical document trees may hold.
+const DefaultHistoryTreeFraction = 0.25
+
+// ResolvedHistoryTreeBytes is how many bytes of historical document trees
+// stay resident before the least recently used are evicted and obtained
+// again on demand.
+//
+// The *current* tree is not subject to this: the engine serves it from an
+// atomic snapshot outside the store, so cache pressure can never slow a
+// normal read or evict what the write path is building on. What this
+// bounds is history, which before it was bounded was every tree the
+// namespace had ever produced - about 8.6KB per commit whatever the size
+// of the documents, because the document trie is fixed-depth 32 and
+// successive versions share none of the nodes on the path they change.
+func ResolvedHistoryTreeBytes(cfg StorageEngineConfig) int64 {
+	if cfg.HistoryTreeCacheBytes > 0 {
+		return cfg.HistoryTreeCacheBytes
+	}
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultHistoryTreeFraction)
+	if budget <= 0 {
+		return DefaultHotTierBytes / 4
+	}
+	return budget
+}

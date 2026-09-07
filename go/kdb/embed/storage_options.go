@@ -85,6 +85,11 @@ type StorageOptions struct {
 	// CommitOpsBytes caps how many bytes of commit operations the DAG
 	// keeps resident. Zero takes a quarter of the hot-tier budget.
 	CommitOpsBytes int64
+	// HistoryTreeCacheBytes caps how many bytes of historical document
+	// trees stay resident before the least recently used are evicted and
+	// obtained again on demand. Zero takes a quarter of the hot-tier
+	// budget. The current tree is not subject to it.
+	HistoryTreeCacheBytes int64
 	// TreeChainLimit is how many delta tree objects may stack up before a
 	// full one is written, under the objects history strategy. Zero uses
 	// the built-in default of 32.
@@ -136,6 +141,7 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	}
 	opts.Storage.DocumentCacheBytes = envBytes("KDB_DOCUMENT_CACHE_BYTES")
 	opts.Storage.CommitOpsBytes = envBytes("KDB_COMMIT_OPS_BYTES")
+	opts.Storage.HistoryTreeCacheBytes = envBytes("KDB_HISTORY_TREE_CACHE_BYTES")
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("KDB_CHECKPOINTS"))) {
 	case "off", "false", "0":
 		opts.Storage.DisableCheckpoints = true

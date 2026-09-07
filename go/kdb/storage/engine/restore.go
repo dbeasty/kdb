@@ -1,15 +1,13 @@
 package engine
 
 import (
-	"sync"
-
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 )
 
-// treeRebuilder repopulates the historical document trees a checkpoint
-// restore deliberately left out. See SetTreeRebuilder.
-type treeRebuilder func() error
+// treeRebuilder reconstructs one historical document tree, named by its
+// hash. See SetTreeRebuilder.
+type treeRebuilder func(want codec.Hash) (document.DocumentTree, bool, error)
 
 // RestoreLiveTree installs tree as this namespace's current committed
 // state, in place of replaying the commits that built it.
@@ -34,11 +32,22 @@ func (e *ServerEngine) RestoreLiveTree(namespaceID string, tree document.Documen
 }
 
 // RegisterHistoricalTree records a tree that was not restored as the live
-// one, so a read at that tree's hash can resolve. Used by the rebuilder.
+// one, so a read at that tree's hash can resolve.
 func (e *ServerEngine) RegisterHistoricalTree(tree document.DocumentTree) {
-	e.treesMu.Lock()
-	e.treesByHash[tree.TreeHash] = tree
-	e.treesMu.Unlock()
+	e.treesByHash.Put(tree)
+}
+
+// CachedTree reports whether a tree is currently resident, without
+// counting as a use of it.
+//
+// The rebuild path needs this to find the nearest ancestor it can fold
+// forward from; going through Get would promote every tree it probed to
+// most-recently-used and evict the ones it is walking towards.
+func (e *ServerEngine) CachedTree(h codec.Hash) (document.DocumentTree, bool) {
+	if s := e.latestTree.Load(); s != nil && s.hash == h {
+		return s.tree, true
+	}
+	return e.treesByHash.Peek(h)
 }
 
 // SetTreeRebuilder installs the fallback that reconstructs historical
@@ -58,24 +67,25 @@ func (e *ServerEngine) RegisterHistoricalTree(tree document.DocumentTree) {
 func (e *ServerEngine) SetTreeRebuilder(fn treeRebuilder) {
 	e.treeRebuildMu.Lock()
 	e.treeRebuild = fn
-	e.treeRebuildOnce = &sync.Once{}
 	e.treeRebuildMu.Unlock()
 }
 
-// rebuildTreesOnce runs the tree rebuilder at most once and reports
-// whether anything ran. A rebuilder that fails is not retried; the error
-// is remembered and returned to every subsequent caller, because a second
-// full scan of the log is unlikely to produce a different answer and very
-// likely to be expensive.
-func (e *ServerEngine) rebuildTreesOnce() error {
+// rebuildTree reconstructs the tree named by want, if a rebuilder is
+// installed.
+//
+// Runs on every miss rather than once per process. The once-per-process
+// version could not coexist with a bounded store: after it had run, an
+// evicted tree had no way back at all, and while it ran it produced every
+// tree in history into a store that could hold only some of them -
+// evicting its own output before the caller ever saw it.
+func (e *ServerEngine) rebuildTree(want codec.Hash) (document.DocumentTree, bool, error) {
 	e.treeRebuildMu.Lock()
-	fn, once := e.treeRebuild, e.treeRebuildOnce
+	fn := e.treeRebuild
 	e.treeRebuildMu.Unlock()
-	if fn == nil || once == nil {
-		return nil
+	if fn == nil {
+		return document.DocumentTree{}, false, nil
 	}
-	once.Do(func() { e.treeRebuildErr = fn() })
-	return e.treeRebuildErr
+	return fn(want)
 }
 
 // LiveTree returns the current committed document tree - what a checkpoint
@@ -88,3 +98,23 @@ func (e *ServerEngine) LiveTree() document.DocumentTree {
 	defer e.treeMu.Unlock()
 	return e.tree
 }
+
+// GetTree implements dag.DocumentTreeStore. The current tree answers from
+// the atomic snapshot, so the DAG asking for it never touches the bounded
+// store or promotes anything in it.
+func (e *ServerEngine) GetTree(hash codec.Hash) (document.DocumentTree, bool) {
+	if s := e.latestTree.Load(); s != nil && s.hash == hash {
+		return s.tree, true
+	}
+	return e.treesByHash.Get(hash)
+}
+
+// PutTree implements dag.DocumentTreeStore.
+func (e *ServerEngine) PutTree(tree document.DocumentTree) { e.treesByHash.Put(tree) }
+
+// HistoryTreesResidentBytes is what the historical tree store currently
+// holds. For tests and reporting.
+func (e *ServerEngine) HistoryTreesResidentBytes() int64 { return e.treesByHash.ResidentBytes() }
+
+// HistoryTreesResident is how many historical trees are held. For tests.
+func (e *ServerEngine) HistoryTreesResident() int { return e.treesByHash.Len() }

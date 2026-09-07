@@ -3,6 +3,7 @@ package embed
 import (
 	"log"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -72,11 +73,11 @@ func restoreNamespace(
 	// a historical commit - see engine.SetTreeRebuilder.
 	if eng.HistoryStrategy() == storage.HistoryStrategyReplay {
 		// Under the replay strategy nothing wrote tree objects, so the only
-		// way back to a historical tree is the log. Under the objects
-		// strategy this is deliberately left unset: falling back to a scan
-		// there would quietly reintroduce the cost the strategy was chosen
-		// to avoid, at the moment an operator least expects it.
-		eng.SetTreeRebuilder(func() error { return rebuildHistoricalTrees(eng, r) })
+		// way back to a historical tree is to fold it out of the log. Under
+		// the objects strategy this is deliberately left unset: falling
+		// back to folding there would quietly reintroduce the cost the
+		// strategy was chosen to avoid.
+		installTreeRebuilder(d, eng)
 	}
 
 	// Branch-head operations come out of the checkpoint itself rather than
@@ -213,4 +214,17 @@ func checkpointOnClose(
 	if err := saveCheckpoint(d, store, r, shim, namespaceID, highestSegmentSequence(r), disabled); err != nil {
 		log.Printf("kdb: namespace %s: could not write a checkpoint on close (%v) - the next open will replay the log", namespaceID, err)
 	}
+}
+
+// installTreeRebuilder wires the replay strategy's on-demand tree fold and
+// hands the engine ownership of the DAG's trees.
+//
+// The two go together. Bounding the engine's tree store only reclaims
+// memory if nothing else is holding the same trees, and the DAG held a
+// second map of exactly them - so the store has to become the single owner
+// at the same moment it becomes able to evict.
+func installTreeRebuilder(d *dag.InMemoryCommitDag, eng *engine.ServerEngine) {
+	eng.SetTreeRebuilder(func(want codec.Hash) (document.DocumentTree, bool, error) {
+		return rebuildTreeByFolding(d, eng, want)
+	})
 }
