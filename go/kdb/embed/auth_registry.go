@@ -2,9 +2,7 @@ package embed
 
 import (
 	"github.com/limidus/kdb/go/kdb/auth"
-	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
-	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
@@ -71,10 +69,14 @@ func openFileAuthRegistry(dataRoot string, lock *dirLock) (*FileAuthRegistry, er
 		_ = reg.closeWithoutLock()
 		return nil, err
 	}
-	store, err := auth.NewRegistryAuthStore(usersDag, rolesDag, &routingAdapter{routes: map[string]storage.Adapter{
-		auth.UsersNamespace: usersAdapter,
-		auth.RolesNamespace: rolesAdapter,
-	}})
+	// RegistryAuthStore takes one Adapter, but ServerEngine is single-namespace, so the
+	// registry's two namespaces need two engines behind it. That is exactly what
+	// engine.MultiplexAdapter is for - it used to be a private copy of it right here, which
+	// panicked on an unknown namespace and misrouted delta segments; see its doc comment.
+	routes := engine.NewMultiplexAdapter()
+	routes.Register(auth.UsersNamespace, usersAdapter)
+	routes.Register(auth.RolesNamespace, rolesAdapter)
+	store, err := auth.NewRegistryAuthStore(usersDag, rolesDag, routes)
 	if err != nil {
 		_ = reg.closeWithoutLock()
 		return nil, err
@@ -154,78 +156,4 @@ func openAuthNamespace(reg *FileAuthRegistry, dataRoot, namespaceID string) (dag
 		dagOut = NewPersistingCommitDAG(d, w)
 	}
 	return dagOut, adapter, nil
-}
-
-// routingAdapter fans a storage.Adapter's namespace-parameterized calls out to the per-namespace
-// engine that actually owns each namespace - ServerEngine is single-namespace (it ignores its
-// namespaceID parameters), so the registry's two namespaces need two engines behind the one
-// Adapter RegistryAuthStore takes. Blob and segment methods route to any engine (the registry
-// never uses them); an unknown namespace fails loudly rather than silently writing to the wrong
-// engine.
-type routingAdapter struct {
-	routes map[string]storage.Adapter
-}
-
-func (r *routingAdapter) route(namespaceID string) storage.Adapter {
-	if a, ok := r.routes[namespaceID]; ok {
-		return a
-	}
-	panic("routingAdapter: unknown namespace " + namespaceID)
-}
-
-func (r *routingAdapter) any() storage.Adapter {
-	for _, a := range r.routes {
-		return a
-	}
-	panic("routingAdapter: no routes")
-}
-
-func (r *routingAdapter) Capabilities() storage.CapabilitySet { return r.any().Capabilities() }
-
-func (r *routingAdapter) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
-	return r.route(namespaceID).GetDocument(namespaceID, docID, atCommit)
-}
-
-func (r *routingAdapter) GetDocumentOrThrow(namespaceID string, docID codec.UUID, atCommit codec.Hash) (document.Document, error) {
-	return r.route(namespaceID).GetDocumentOrThrow(namespaceID, docID, atCommit)
-}
-
-func (r *routingAdapter) GetDocuments(namespaceID string, docIDs []codec.UUID, atCommit codec.Hash) ([]*document.Document, error) {
-	return r.route(namespaceID).GetDocuments(namespaceID, docIDs, atCommit)
-}
-
-func (r *routingAdapter) ScanDocuments(namespaceID string, atCommit codec.Hash, batchSize int, onBatch func([]document.Document) error) error {
-	return r.route(namespaceID).ScanDocuments(namespaceID, atCommit, batchSize, onBatch)
-}
-
-func (r *routingAdapter) PutDocument(namespaceID string, doc document.Document) error {
-	return r.route(namespaceID).PutDocument(namespaceID, doc)
-}
-
-func (r *routingAdapter) DeleteDocument(namespaceID string, docID codec.UUID) error {
-	return r.route(namespaceID).DeleteDocument(namespaceID, docID)
-}
-
-func (r *routingAdapter) DiscardPending(namespaceID string) error {
-	return r.route(namespaceID).DiscardPending(namespaceID)
-}
-
-func (r *routingAdapter) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
-	return r.route(namespaceID).CommitTree(namespaceID, parentTreeHash)
-}
-
-func (r *routingAdapter) Flush(namespaceID string) error {
-	return r.route(namespaceID).Flush(namespaceID)
-}
-
-func (r *routingAdapter) ReadBlob(contentHash codec.Hash) ([]byte, error) {
-	return r.any().ReadBlob(contentHash)
-}
-
-func (r *routingAdapter) WriteBlob(bytes []byte) (codec.Hash, error) {
-	return r.any().WriteBlob(bytes)
-}
-
-func (r *routingAdapter) IngestDeltaSegment(segment storage.DeltaSegmentRef) error {
-	return r.any().IngestDeltaSegment(segment)
 }

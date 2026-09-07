@@ -1,6 +1,6 @@
 # Layer 17 — One Runtime, Many Spaces + gRPC Transport
 
-## Status: Component 65 and Phases A/C IMPLEMENTED; Phases B, D, E PROPOSED
+## Status: Component 65 and Phases A-D IMPLEMENTED; Phase E PROPOSED
 
 Two asks, one document, because the second one only gets cheap once the first one lands:
 
@@ -8,9 +8,9 @@ Two asks, one document, because the second one only gets cheap once the first on
 Layer 17 — Multi-Namespace Runtime + gRPC
   [~] 64. Multi-namespace embedded runtime (one host, N spaces)
         [x] A. Split the open path                 - go/kdb/embed/host.go
-        [ ] B. Routing adapter
+        [x] B. Routing adapter                     - go/kdb/storage/engine/multiplex.go
         [x] C. One budget, arbitrated              - go/kdb/storage/budget_arbiter.go
-        [ ] D. Whole-database maintenance
+        [x] D. Whole-database maintenance          - go/kdb/backup/database.go
         [ ] E. Cross-namespace transactions
   [x] 65. gRPC transport hooks (frame service over HTTP/2) - go/grpc/ (separate module)
 ```
@@ -292,7 +292,61 @@ each other — the same shape as before, one level up. The same is true of
 `KdbServerRuntime`'s `MemoryGuard`, which is still per server runtime. Worth a process-wide
 parent pool eventually; not worth inventing before something needs it.
 
-### 2.4 Migration
+### 2.4 What Phase B settled
+
+**It already existed, privately.** `go/kdb/embed/auth_registry.go` had a `routingAdapter` doing
+exactly this — fanning `storage.Adapter`'s namespace-parameterised calls out to per-namespace
+engines — because the auth registry's two namespaces needed two engines behind the one Adapter
+`RegistryAuthStore` takes. The same shape as a `Host`, arrived at independently and for the same
+reason. So Phase B was a promotion, not a build: it is now `engine.MultiplexAdapter`, and the
+registry uses it instead of its own copy.
+
+Two defects came with the promotion, both harmless where it was but not in a general type:
+
+- **It panicked on an unknown namespace.** Defensible in a two-namespace registry built once at
+  startup; not in a type whose routes change while a server is running, where a panic on a
+  storage call takes down every other connection too. Now `*ErrUnknownNamespace`. It is still
+  never a fallback — routing an unknown namespace to some other engine would write one
+  namespace's documents into another's files, silently and permanently.
+- **`IngestDeltaSegment` routed to an arbitrary member** even though `DeltaSegmentRef` carries its
+  own `NamespaceID`. Safe only because the registry never ingests anything; it would otherwise
+  fold one namespace's commits into another's history. It now routes on the segment.
+
+`Capabilities` is the conservative intersection rather than any member's answer. In practice every
+namespace under one host comes from the same factory so it is unanimous — but the one
+configuration where it would matter is exactly the one where picking arbitrarily would be wrong.
+`WriteBlob` is the single place `storage.Adapter` genuinely has no namespace to route on; it goes
+to the first registered member, and `ReadBlob` tries each, so a blob written through a multiplexer
+is always findable through it again.
+
+`Host.Adapter()` exposes one over a host's open namespaces, tracking them as they open and close.
+
+### 2.5 What Phase D settled
+
+With one root and one lock, maintenance can finally act on the database instead of on whichever
+namespace it was told about. `embed.ListNamespaces` walks `dataRoot/ns` for the `meta.json`
+marker, and `--namespace` became optional on `kdb-inspect verify`, `backup` and `backup-list`.
+
+**The part that is not just plumbing is the manifest.** Before namespaces could share a root, "the
+database" and "the namespace" were the same thing, so a backup of one was a backup of everything
+and there was nothing to group. Now that nine sit under one lock, backing them up one command at a
+time gives nine manifests from nine different instants — each internally consistent, none
+consistent with the others, and no record of which nine belong together.
+`backup.DatabaseManifest` is that record: the set, and the instant. The consistency it claims is
+exactly the lock's — `CreateDatabase` runs inside one `LockDataDir` hold, so no writer can advance
+any namespace while it goes.
+
+It is written last, and only if every namespace succeeded: a half-written database backup that
+still produced a manifest would be indistinguishable from a complete one at restore time. A
+failure part-way leaves the per-namespace backups that did complete — individually valid, and
+cheap to leave — but nothing claiming they are a database.
+
+`kdb-inspect restore --database-backup-id ID` is the mirror: every namespace back into one root,
+under one lock. Round-tripped end to end by `TestDatabaseBackupAndRestoreRoundTripsEveryNamespace`,
+which backs up three namespaces, restores into a fresh root, reopens it as a `Host`, and reads
+every document back.
+
+### 2.6 Migration
 
 The layout changes from `<path>/<name>/ns/zolik/<name>/` to `<path>/ns/zolik/<name>/`. A
 consumer with existing data needs a move, not a rewrite — the per-namespace directory contents
@@ -449,9 +503,11 @@ of CI unless swept explicitly. `test-go` and `build-go` now have a second line e
 recurring tax on the decision in §3.2 and it is worth naming: anything that enumerates packages or
 binaries has to learn about `go/grpc`.
 
-**Left open, deliberately.** `kdb-service-grpc` is built by `build-go` but is *not* in
-`release-binaries`' artifact list — adding a published release artifact is a distribution
-decision, not a build one, and belongs to whoever owns the release matrix.
+**Released.** `kdb-service-grpc` ships alongside `kdb-service` for every `RELEASE_PLATFORMS`
+entry, not instead of it: the two are the same service, and which one a deployment wants depends
+on whether it speaks gRPC. It needs its own loop in `release-binaries` rather than another name in
+the existing one, because `cd go` cannot build a package outside the core module — the same tax as
+the test sweep.
 
 ---
 
@@ -460,8 +516,9 @@ decision, not a build one, and belongs to whoever owns the release matrix.
 1. ~~**64 Phase A** (split the open path)~~ — **done**. See §2.2.
 2. ~~**65** (gRPC over the frame seam)~~ — **done**. See §3.5.
 3. ~~**64 Phase C** (shared budget)~~ — **done**. See §2.3.
-4. **64 Phases B and D** — as demand appears.
-5. **64 Phase E** (cross-namespace transactions) — only on a concrete requirement.
+4. ~~**64 Phases B and D**~~ — **done**. See §2.4 and §2.5.
+5. **64 Phase E** (cross-namespace transactions) — only on a concrete requirement. Still the one
+   phase that touches correctness of existing data, and still not worth starting without one.
 
 Phases A and C together are what turn "nine engines because the lock says so" into "one database
 with nine spaces sharing one budget". Both are in. B, D and E are follow-ons, not prerequisites,

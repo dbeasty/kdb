@@ -49,8 +49,9 @@ func parseLevel(s string) (integrity.Level, error) {
 func verifyCmd(args []string) error {
 	dataDir := argValue(args, "--data-dir")
 	namespace := argValue(args, "--namespace")
-	if dataDir == "" || namespace == "" {
-		return fmt.Errorf("usage: kdb-inspect verify --data-dir DIR --namespace NS [--level L1|L2] [--json]")
+	if dataDir == "" {
+		return fmt.Errorf("usage: kdb-inspect verify --data-dir DIR [--namespace NS] [--level L1|L2] [--json]\n" +
+			"  --namespace may be omitted to verify every namespace under the data root")
 	}
 	level, err := parseLevel(argValue(args, "--level"))
 	if err != nil {
@@ -67,22 +68,53 @@ func verifyCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	report, err := integrity.Verify(shim, namespace, integrity.Options{Level: level})
-	if err != nil {
-		return err
+
+	// One namespace when asked for one, every namespace under the root otherwise. The lock above
+	// already covers the whole root - it always did - so verifying the database is not a weaker
+	// operation than verifying one namespace, just a wider one.
+	namespaces := []string{namespace}
+	if namespace == "" {
+		namespaces, err = embed.ListNamespaces(dataDir)
+		if err != nil {
+			return err
+		}
+		if len(namespaces) == 0 {
+			return fmt.Errorf("no namespaces found under %s", dataDir)
+		}
+	}
+
+	reports := make([]*integrity.Report, 0, len(namespaces))
+	for _, ns := range namespaces {
+		report, err := integrity.Verify(shim, ns, integrity.Options{Level: level})
+		if err != nil {
+			return fmt.Errorf("verifying %s: %w", ns, err)
+		}
+		reports = append(reports, report)
 	}
 
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(report); err != nil {
+		// A single namespace still encodes as one report, so existing callers parsing this see
+		// exactly what they always did; the array form is only for the database-wide mode.
+		var payload any = reports
+		if namespace != "" {
+			payload = reports[0]
+		}
+		if err := enc.Encode(payload); err != nil {
 			return err
 		}
 	} else {
-		printReport(report)
+		for _, r := range reports {
+			printReport(r)
+		}
 	}
-	if !report.Clean() {
-		os.Exit(1)
+
+	// Unclean if any namespace is: a database is only as intact as its worst namespace.
+	for _, r := range reports {
+		if !r.Clean() {
+			os.Exit(1)
+		}
 	}
 	return nil
 }

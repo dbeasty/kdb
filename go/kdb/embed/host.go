@@ -41,6 +41,9 @@ type Host struct {
 	io       storage.PlatformIOShim
 
 	arbiter *storage.BudgetArbiter
+	// adapter presents every open namespace under this host as one storage.Adapter, kept in step
+	// with nss as namespaces open and close.
+	adapter *engine.MultiplexAdapter
 
 	mu     sync.Mutex
 	nss    map[string]*namespaceEntry
@@ -160,9 +163,19 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 		lock:     lock,
 		io:       io,
 		arbiter:  storage.NewBudgetArbiter(pool, storage.DefaultBudgetRebalanceInterval),
+		adapter:  engine.NewMultiplexAdapter(),
 		nss:      make(map[string]*namespaceEntry),
 	}, nil
 }
+
+// Adapter presents every namespace open under this host as a single storage.Adapter, dispatching
+// on the namespaceID each of its methods already carries.
+//
+// For a caller that spans namespaces - a query over several spaces, or a transaction touching
+// more than one. A caller working within one namespace should use that runtime's own Storage,
+// which is the same engine without the indirection. The returned adapter tracks the host: a
+// namespace opened later becomes routable through it, and one closed stops being.
+func (h *Host) Adapter() storage.Adapter { return h.adapter }
 
 // MemoryArbiter is the pool this host divides across its namespaces. Exposed so a caller can
 // change the floor, pin one namespace's share with Reserve, or read the current allocation for
@@ -245,6 +258,10 @@ func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbS
 	h.nss[namespaceID] = entry
 	h.mu.Unlock()
 
+	if entry.rt.Storage != nil {
+		h.adapter.Register(namespaceID, entry.rt.Storage)
+	}
+
 	// Outside the host lock: registering rebalances, which evicts inside the engines' own locks,
 	// and none of that should block another namespace from being opened or closed.
 	if budget != nil {
@@ -279,6 +296,9 @@ func (h *Host) CloseNamespace(namespaceID string) error {
 	entry, ok := h.nss[namespaceID]
 	delete(h.nss, namespaceID)
 	h.mu.Unlock()
+	// Unrouted before anything is torn down: a call naming this namespace must fail with
+	// ErrUnknownNamespace rather than reach an engine that is being closed underneath it.
+	h.adapter.Unregister(namespaceID)
 	if !ok || entry == nil || entry.close == nil {
 		return nil
 	}
@@ -308,6 +328,9 @@ func (h *Host) Close() error {
 	sort.Strings(ids)
 	entries := h.nss
 	h.nss = make(map[string]*namespaceEntry)
+	for _, id := range ids {
+		h.adapter.Unregister(id)
+	}
 	lock := h.lock
 	h.lock = nil
 	h.mu.Unlock()

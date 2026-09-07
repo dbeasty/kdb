@@ -147,6 +147,18 @@ release-binaries:
 				-o "../$(DIST)/bin/$${bin}-$${GOOS}-$${GOARCH}" "./cmd/$${bin}" || exit 1; \
 		done; \
 	done
+	# kdb-service-grpc lives in the go/grpc module, so it needs its own loop rather than another
+	# name in the one above - `cd go` cannot build a package outside the core module. Released
+	# alongside kdb-service rather than instead of it: the two are the same service, and which
+	# one a deployment wants depends on whether it speaks gRPC. See
+	# docs/kdb-spec-layer17-multi-namespace-runtime.md §3.2 for why the split is at the module
+	# boundary.
+	cd go/grpc && for target in $(RELEASE_PLATFORMS); do \
+		GOOS=$${target%/*}; GOARCH=$${target#*/}; \
+		CGO_ENABLED=0 GOOS=$$GOOS GOARCH=$$GOARCH \
+			go build -trimpath -ldflags "$(RELEASE_LDFLAGS)" \
+			-o "../../$(DIST)/bin/kdb-service-grpc-$${GOOS}-$${GOARCH}" ./cmd/kdb-service-grpc || exit 1; \
+	done
 
 # Kotlin jars, one per Gradle module, collected by scripts/collect-kotlin-jars.sh. Deliberately
 # depends on the `jar` task directly, not `build` - `./gradlew build` is broken on a clean
