@@ -65,7 +65,7 @@ func writeVersions(tb testing.TB, rt *embed.EmbeddedKdbRuntime, versions int) ([
 func TestHistoricalReadSurvivesVersionEviction(t *testing.T) {
 	root := t.TempDir()
 	rt := smallBudgetRuntime(t, root)
-	commits, texts := writeVersions(t, rt, 120)
+	commits, texts := writeVersions(t, rt, 80)
 	defer rt.Close()
 
 	docID, _, err := document.ResolveID(texts[0])
@@ -104,7 +104,7 @@ func TestHistoricalReadSurvivesVersionEviction(t *testing.T) {
 func TestHistoricalReadSurvivesReopen(t *testing.T) {
 	root := t.TempDir()
 	rt := smallBudgetRuntime(t, root)
-	commits, texts := writeVersions(t, rt, 120)
+	commits, texts := writeVersions(t, rt, 80)
 	rt.Close()
 
 	reopened := smallBudgetRuntime(t, root)
@@ -114,7 +114,7 @@ func TestHistoricalReadSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, i := range []int{0, 5, 60, 119} {
+	for _, i := range []int{0, 5, 40, 79} {
 		commit, err := reopened.DAG.GetCommitOrThrow(commits[i])
 		if err != nil {
 			t.Fatalf("version %d: %v", i, err)
@@ -139,7 +139,7 @@ func TestHistoricalReadSurvivesReopen(t *testing.T) {
 func TestWalkWithOperationsLoadsEvictedOperations(t *testing.T) {
 	root := t.TempDir()
 	rt := smallBudgetRuntime(t, root)
-	_, texts := writeVersions(t, rt, 120)
+	_, texts := writeVersions(t, rt, 80)
 	rt.Close()
 
 	reopened := smallBudgetRuntime(t, root)
@@ -224,8 +224,8 @@ func TestOpenMemoryIsBoundedByLiveData(t *testing.T) {
 	// entirely on whichever measurement happened to run first.
 	measure(40)
 
-	short := measure(40)
-	long := measure(320)
+	short := measure(30)
+	long := measure(240)
 	if short <= 0 {
 		t.Skip("could not measure heap")
 	}

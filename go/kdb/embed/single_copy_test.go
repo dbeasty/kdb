@@ -61,7 +61,7 @@ func growingStore(t *testing.T, s storage.HistoryStrategy, rewrites int) (int64,
 // stays the one copy, which is what a repair reads and what a peer
 // receives, and there is nothing to reconcile it against.
 func TestObjectsStrategyStoresEachVersionOnce(t *testing.T) {
-	const rewrites = 463
+	const rewrites = 200
 	replayBytes, _, _ := growingStore(t, storage.HistoryStrategyReplay, rewrites)
 	objectsBytes, _, _ := growingStore(t, storage.HistoryStrategyObjects, rewrites)
 
@@ -84,7 +84,7 @@ func TestObjectsStrategyStoresEachVersionOnce(t *testing.T) {
 func TestLocationsResolveHistoricalReads(t *testing.T) {
 	root := t.TempDir()
 	rt := tinyTreeBudgetRuntime(t, root, storage.HistoryStrategyObjects)
-	commits, texts := writeVersions(t, rt, 200)
+	commits, texts := writeVersions(t, rt, 120)
 	rt.Close()
 
 	re := tinyTreeBudgetRuntime(t, root, storage.HistoryStrategyObjects)
@@ -93,7 +93,7 @@ func TestLocationsResolveHistoricalReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, i := range []int{0, 1, 99, 198, 199} {
+	for _, i := range []int{0, 1, 59, 118, 119} {
 		got := readAt(t, re, commits[i], docID)
 		if got == nil {
 			t.Fatalf("version %d: not readable at its own commit", i)

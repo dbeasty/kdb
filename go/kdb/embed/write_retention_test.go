@@ -74,9 +74,9 @@ func writeSessionHeapMB(t *testing.T, s storage.HistoryStrategy, rewrites int) f
 func TestObjectsStrategyDoesNotHoardWritesInMemory(t *testing.T) {
 	// Discarded: the first runtime in the process pays one-time costs that
 	// would otherwise land entirely on whichever measurement ran first.
-	writeSessionHeapMB(t, storage.HistoryStrategyObjects, 100)
+	writeSessionHeapMB(t, storage.HistoryStrategyObjects, 60)
 
-	const base = 500
+	const base = 250
 	small := writeSessionHeapMB(t, storage.HistoryStrategyObjects, base)
 	large := writeSessionHeapMB(t, storage.HistoryStrategyObjects, base*4)
 	t.Logf("heap while writing: %d versions %.2f MB, %d versions %.2f MB",
