@@ -10,8 +10,6 @@ import (
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
-	storio "github.com/limidus/kdb/go/kdb/storage/io"
-	s3io "github.com/limidus/kdb/go/kdb/storage/io/s3"
 )
 
 // OpenFileRuntime opens an embedded runtime backed by a data directory.
@@ -33,20 +31,41 @@ func OpenReadOnlyFileRuntime(dataRoot, catalog, namespaceID string, sch schema.K
 }
 
 // OpenFileRuntimeWithOptions opens a file runtime with explicit storage options.
+//
+// This is the single-namespace shape, and it stays exactly what it has always been: one
+// namespace, owning the data root for as long as it is open, closing the whole thing on Close.
+// It is now expressed as what it always was underneath - a Host with one namespace under it -
+// so that a caller who wants several namespaces in one process can open the Host directly and
+// share the lock, the I/O shim and (Phase C) the memory budget between them, instead of needing
+// a data root per namespace. See OpenFileHost and
+// docs/kdb-spec-layer17-multi-namespace-runtime.md.
 func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schema.KdbSchema, opts FileRuntimeOptions) (*EmbeddedKdbRuntime, error) {
-	acquire := acquireDirLock
-	if opts.ReadOnly {
-		acquire = acquireDirLockShared
-	}
-	if opts.alreadyLocked {
-		// The caller holds the directory exclusively and is excluding
-		// everyone else on this runtime's behalf; releasing is theirs too.
-		acquire = func(string) (*dirLock, error) { return &dirLock{}, nil }
-	}
-	lock, err := acquire(dataRoot)
+	host, err := OpenFileHost(dataRoot, opts)
 	if err != nil {
 		return nil, err
 	}
+	rt, err := host.NamespaceWithOptions(catalog, namespaceID, sch, opts.Storage)
+	if err != nil {
+		_ = host.Close()
+		return nil, err
+	}
+	// This runtime owns the host it was opened under, so closing it closes the host and
+	// releases the directory lock - the contract every existing caller was written against.
+	// A runtime obtained from a Host the caller opened itself leaves release nil: the lock is
+	// the host's to drop, not one namespace's.
+	rt.release = func() { _ = host.Close() }
+	return rt, nil
+}
+
+// openNamespace opens one namespace under an already-locked host, using the host's shared I/O
+// shim. It returns the runtime and the func that shuts its storage down; wiring those into
+// EmbeddedKdbRuntime.Close is the host's job, because on the multi-namespace path the lock
+// outlives any one namespace.
+func (h *Host) openNamespace(
+	catalog, namespaceID string, sch schema.KdbSchema, opts FileRuntimeOptions,
+) (*EmbeddedKdbRuntime, func() error, error) {
+	dataRoot, io := h.dataRoot, h.io
+
 	// A read-only open creates nothing: the directory belongs to the writer, and a reader that
 	// materialized missing namespace directories or a meta.json would be writing to the very
 	// thing it promised not to touch. A namespace that is not there yet simply has nothing to
@@ -56,35 +75,13 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	namespaceIsNew := !namespaceDirExists(dataRoot, namespaceID)
 	if !opts.ReadOnly {
 		if err := ensureNamespaceDirs(dataRoot, namespaceID); err != nil {
-			lock.Release()
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	historyStrategy, err := resolveHistoryStrategy(
 		dataRoot, namespaceID, opts.Storage.HistoryStrategy, namespaceIsNew, opts.ReadOnly, opts.forceHistoryStrategy)
 	if err != nil {
-		lock.Release()
-		return nil, err
-	}
-
-	s3Cfg := opts.S3
-	if s3Cfg == nil {
-		s3Cfg = s3io.ConfigFromEnv()
-	}
-	policy := opts.ReplicationPolicy
-
-	io, err := (&storio.FileBackedPlatformIOFactory{
-		NewStore: func(config storio.PlatformIOConfig) (storio.SegmentByteStore, error) {
-			return buildSegmentByteStore(config, s3Cfg, policy)
-		},
-	}).Open(storio.PlatformIOConfig{
-		RootDirectory: &dataRoot,
-		FsyncOnFlush:  !opts.ReadOnly,
-		SyncMode:      opts.Storage.SyncMode,
-	})
-	if err != nil {
-		lock.Release()
-		return nil, err
+		return nil, nil, err
 	}
 
 	compression := storage.CompressionZSTD
@@ -117,8 +114,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	}
 	handle, err := engine.DefaultFactory{EngineTarget: target}.Open(namespaceID, cfg)
 	if err != nil {
-		lock.Release()
-		return nil, err
+		return nil, nil, err
 	}
 	// Every return between here and the success path below used to call lock.Release() alone,
 	// leaking handle's open file descriptors and unsealed WAL on any post-open failure (schema
@@ -128,18 +124,17 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	defer func() {
 		if !handleClosed {
 			_ = handle.Close()
-			lock.Release()
 		}
 	}()
 
 	d, err := dag.NewInMemoryCommitDag(namespaceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	store := handle.Adapter()
 	if store == nil {
-		return nil, fmt.Errorf("file runtime missing storage adapter")
+		return nil, nil, fmt.Errorf("file runtime missing storage adapter")
 	}
 
 	if eng, ok := store.(*engine.ServerEngine); ok {
@@ -158,7 +153,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	}
 	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	dagOut := dag.CommitDAG(d)
 	var persisting *PersistingCommitDAG
@@ -188,7 +183,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		// and therefore not something a read-only runtime may do. It reads whatever schema the
 		// writer has already persisted instead.
 		if err := syncEmbedSchema(rt, namespaceID, sch); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	if opts.ReadOnly {
@@ -200,12 +195,11 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		}
 	}
 	handleClosed = true
-	rt.release = lock.Release
 	// storageClose is what makes Close() an orderly shutdown rather than a no-op that only
 	// releases the directory lock (kdb-spec-layer13 Component 47 §2.4/§4.5) - previously nothing
 	// retained handle past this function returning, so even a clean process exit never flushed
 	// the delta writer, sealed its segment, or reached ServerEngine.Close()'s final WAL sync.
-	rt.storageClose = func() error {
+	storageClose := func() error {
 		var firstErr error
 		// Drain the commit log first: under DurabilityAsync there can be
 		// records queued but not yet written, and sealing the segment out from
@@ -233,7 +227,10 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		}
 		return firstErr
 	}
-	return rt, nil
+	// Closing the runtime closes this namespace through the host, which is what owns the
+	// shutdown sequence now that a lock can outlive any one namespace under it.
+	rt.storageClose = func() error { return h.CloseNamespace(namespaceID) }
+	return rt, storageClose, nil
 }
 
 // LockDataDir takes dataRoot's attach lock exclusively and returns its release func. For

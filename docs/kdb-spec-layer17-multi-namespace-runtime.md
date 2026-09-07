@@ -1,12 +1,17 @@
 # Layer 17 — One Runtime, Many Spaces + gRPC Transport
 
-## Status: PROPOSED (investigation complete, nothing implemented)
+## Status: Phase A IMPLEMENTED; everything else PROPOSED
 
 Two asks, one document, because the second one only gets cheap once the first one lands:
 
 ```
-Layer 17 — Multi-Namespace Runtime + gRPC   [PROPOSED]
-  [ ] 64. Multi-namespace embedded runtime (one host, N spaces)
+Layer 17 — Multi-Namespace Runtime + gRPC
+  [~] 64. Multi-namespace embedded runtime (one host, N spaces)
+        [x] A. Split the open path                 - go/kdb/embed/host.go
+        [ ] B. Routing adapter
+        [ ] C. One budget, arbitrated
+        [ ] D. Whole-database maintenance
+        [ ] E. Cross-namespace transactions
   [ ] 65. gRPC transport hooks (frame service over HTTP/2)
 ```
 
@@ -124,18 +129,24 @@ N per-namespace engine sets underneath it. Not one engine internally — one eng
 ```go
 // go/kdb/embed
 
-// OpenFileHost takes dataRoot's locks once and opens nothing else.
-func OpenFileHost(dataRoot string, opts HostOptions) (*Host, error)
+// OpenFileHost takes dataRoot's lock and builds the shared I/O shim, and opens
+// no namespace at all.
+func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error)
 
-type Host struct { /* dirLock, storio shim, s3 client, *BudgetArbiter */ }
+type Host struct { /* dataRoot, dirLock, storio shim, (Phase C) *BudgetArbiter */ }
 
-// Namespace opens (or returns) one namespace under this host. Repeated calls for the
-// same id return the same runtime, refcounted, the way ServerRuntimeRegistry already
-// does for KdbServerRuntime (server_runtime.go:834).
+// Namespace opens namespaceID under this host, or returns the already-open runtime
+// for it. Idempotent: two engines over one namespace's files is exactly what the
+// writer lock exists to prevent.
 func (h *Host) Namespace(catalog, namespaceID string, sch schema.KdbSchema) (*EmbeddedKdbRuntime, error)
 
+// NamespaceWithOptions is Namespace with per-namespace storage tuning - a hot
+// namespace and a nearly-empty one rarely want the same budgets or durability.
+func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbSchema, sopts StorageOptions) (*EmbeddedKdbRuntime, error)
+
 func (h *Host) Namespaces() []string
-func (h *Host) Close() error   // closes every namespace, then releases the lock
+func (h *Host) CloseNamespace(namespaceID string) error  // one namespace; host keeps its lock
+func (h *Host) Close() error                             // every namespace, then the lock
 ```
 
 `EmbeddedKdbRuntime` keeps its current shape and its current single-namespace meaning — it is
@@ -199,7 +210,26 @@ needs a commit protocol across N DAGs and is the only phase that touches correct
 existing data. Nothing else here depends on it, and Zolik's per-namespace mutex works without
 it. Do not bundle it into A–D.
 
-### 2.2 Migration
+### 2.2 What Phase A settled
+
+Landed in `go/kdb/embed/host.go`, with `OpenFileRuntimeWithOptions` reduced to a host with one
+namespace under it. Its signature, behaviour and every existing caller are unchanged, and the
+regression is pinned by `TestTwoNamespacesShareOneHost` and `TestNineNamespacesOneRoot`.
+
+Two decisions worth recording, both narrower than the first draft assumed:
+
+- **Namespace lifetime is the host's, not reference-counted** — see the note above.
+- **The I/O shim is per host, so SyncMode, the S3 replica tier and the replication policy are
+  host-wide.** Nothing observable changes today, because setting two of any of them under one
+  root required two runtimes over it, which the lock refused. But it bounds one future
+  consolidation: `FileAuthRegistry` already opens several namespaces under one root with the
+  caller holding the lock — the same shape as a `Host`, arrived at independently — while
+  deliberately building a *local-only* shim, so that auth writes don't go to S3 while the data
+  namespaces beside them do. Folding it onto a `Host` needs the shim, not just the budget, to
+  become per-namespace. One shim per host is the cheaper arrangement until something actually
+  needs that, and it is what makes one S3 client serve nine namespaces instead of nine.
+
+### 2.3 Migration
 
 The layout changes from `<path>/<name>/ns/zolik/<name>/` to `<path>/ns/zolik/<name>/`. A
 consumer with existing data needs a move, not a rewrite — the per-namespace directory contents
@@ -247,19 +277,58 @@ that actually need them once there is a client asking. For reference, Zolik's en
 embed API today is five entry points — `srv.Commit`, `srv.GetDocument`, `rt.DAG`, `rt.Storage`,
 `rt.Close`.
 
-### 3.2 The dependency question, which is the real decision
+### 3.2 Separate module, decided
 
 `go/go.mod` currently has one non-trivial dependency tree (the AWS SDK, for the S3 tier) and a
 `gobind` tool dependency — the module is built for gomobile and for `embedbundle`. Adding
 `google.golang.org/grpc` + `google.golang.org/protobuf` to it puts gRPC's transitive tree into
 every embedded and mobile build that will never open a socket.
 
-**Put it in a separate module** — `go/grpc/` with its own `go.mod`, importing
-`github.com/limidus/kdb/go` — so the embed and mobile paths never see it. The exported
-`FrameHandler` seam from §3.1 is what makes that possible without an import cycle, and it is
-the main reason to do the seam extraction properly rather than inlining the adapter.
+**Decided: gRPC lives in its own module.** `go/grpc/` with its own `go.mod`, importing
+`github.com/limidus/kdb/go`. Never the reverse — the core module must not gain a gRPC
+dependency in any build configuration, including a test-only or tool-only one. The exported
+`FrameHandler` seam from §3.1 is what makes that possible without an import cycle, and it is the
+main reason to do the seam extraction properly rather than inlining the adapter.
 
-Two things to settle before writing code, both consequences of HTTP/2 rather than of KDB:
+A build tag inside the core module is **not** an acceptable substitute. Build tags gate
+compilation, not the module graph: `google.golang.org/grpc` would still land in the core
+`go.mod` and `go.sum`, and every consumer of the embed API would inherit it whether or not they
+build the tag. The separation has to be at the module boundary to mean anything.
+
+### 3.3 Off unless a flag turns it on
+
+**Decided: the gRPC listener is opt-in by configuration, never on by default.** There is already
+a precedent to follow exactly — `ServiceConfig.WSAddr`, whose doc comment reads "Empty disables
+it" (`go/kdb/config/service.go:27`). gRPC gets the same shape:
+
+```go
+// GRPCAddr is the gRPC listen address (grpc:// or grpcs://). Empty — the
+// default — disables it, and a build without the gRPC module linked in
+// refuses a non-empty value rather than ignoring it. See §3.3.
+GRPCAddr string
+```
+
+So: `--grpc-addr` / `grpcAddr` in the config file / `KDB_GRPC_ADDR`, defaulting to empty, and no
+listener started unless it is set. Nothing about an existing deployment changes.
+
+The field lives in the **core** `ServiceConfig` even though the listener does not. Config is
+data, a string costs nothing, and one config schema across both binaries is worth more than the
+purity of splitting it. What that buys is the important half of the design:
+
+- **`kdb-service` (core module) never links gRPC.** If it is handed a non-empty `grpcAddr` it
+  exits with a clear error — "this build has no gRPC listener linked; run kdb-service-grpc" —
+  rather than silently ignoring the setting. A flag that quietly does nothing is worse than no
+  flag.
+- **`go/grpc/cmd/kdb-service-grpc`** composes the same server runtime and the same listeners,
+  plus the gRPC one when `grpcAddr` is set. It is the only artifact that carries the dependency.
+
+This is what makes "we may migrate to that model" safe to explore: the gRPC path can be built,
+deployed and benchmarked against a real workload without the default binary, the embedded API,
+or a mobile build changing at all.
+
+### 3.4 Two things to settle before writing code
+
+Both are consequences of HTTP/2 rather than of KDB:
 
 - **Ordering.** The TCP listener answers frames on one connection in order, and sessions assume
   it. A single bidi stream preserves that; multiple concurrent streams do not. One stream per
