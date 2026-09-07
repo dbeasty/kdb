@@ -66,6 +66,15 @@ type ServerEngine struct {
 	// stops at the first full object it finds.
 	treeChainMu sync.Mutex
 	treeChain   map[codec.Hash]int
+	// memtableFlushOverride, when > 0, replaces the config-derived flush
+	// threshold. Set by SetMemoryBudgetBytes when a BudgetArbiter re-cuts
+	// this namespace's share. Atomic rather than a write to config, which
+	// is a value field read without synchronisation from several paths.
+	memtableFlushOverride atomic.Int64
+	// lastColdLoads is what coldLoads read at the previous DemandBytes
+	// call, so demand can tell "at its ceiling and coping" from "at its
+	// ceiling and missing" - the only difference that should move a budget.
+	lastColdLoads atomic.Int64
 	// replaying is set while this engine is being rebuilt from the delta
 	// log rather than taking new writes - see SetReplaying.
 	replaying atomic.Bool
@@ -562,7 +571,7 @@ func (e *ServerEngine) maybeFlushMemtable() {
 	if e.memTable == nil || e.config.IOShim == nil {
 		return
 	}
-	if e.memTable.SizeBytes() < storage.ResolvedMemtableFlushBytes(e.config) {
+	if e.memTable.SizeBytes() < e.memtableFlushBytes() {
 		return
 	}
 	_, _ = e.memTable.Flush(0)

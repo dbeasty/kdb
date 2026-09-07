@@ -239,3 +239,36 @@ func (d *InMemoryCommitDag) WalkWithOperations(from codec.Hash, until *codec.Has
 	}
 	return entries, nil
 }
+
+// SetOperationsBudget re-cuts how many bytes of commit operations this DAG may keep resident,
+// leaving the loader alone. The resize half of SetOperationsLoader, for a BudgetArbiter re-cutting
+// a namespace's share while it is running.
+//
+// A no-op unless a loader is already installed. That is the same rule SetOperationsLoader states
+// - both together or neither - and it matters more here, because this is called on a timer by
+// something that has no way to know whether the namespace behind it has a delta log to re-read
+// from. Bounding a DAG that cannot fetch operations back would silently turn history into
+// commits that wrote nothing.
+//
+// Safe to call while the DAG is being read and written; it evicts under the same lock every
+// other retention path takes.
+func (d *InMemoryCommitDag) SetOperationsBudget(budgetBytes int64) {
+	if d == nil || budgetBytes <= 0 || d.opsLoader.Load() == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.opsBudget = budgetBytes
+	d.evictOpsLocked(codec.Hash{})
+}
+
+// OperationsResidentBytes is what this DAG's tracked commit operations currently cost. For the
+// budget arbiter's demand signal, and for tests; not on any hot path.
+func (d *InMemoryCommitDag) OperationsResidentBytes() int64 {
+	if d == nil {
+		return 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.opsResident
+}
