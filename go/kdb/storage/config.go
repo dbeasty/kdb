@@ -68,6 +68,10 @@ type StorageEngineConfig struct {
 	// DefaultTreeChainLimit. Lower means cheaper historical reads and more
 	// bytes written; higher, the reverse.
 	TreeChainLimit int
+	// MemtableFlushBytes is how large the in-memory blob generation may
+	// grow before it is written out as an SSTable. Zero derives it from
+	// the hot-tier budget; see ResolvedMemtableFlushBytes.
+	MemtableFlushBytes int64
 	// DisableCheckpoints stops this namespace writing the checkpoint that
 	// lets the next open skip the delta log. Off by default. Worth turning
 	// on to measure or debug the replay path, or where the checkpoint's

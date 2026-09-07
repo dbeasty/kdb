@@ -64,8 +64,11 @@ type ServerEngine struct {
 	// on restart, which only means the first tree written in a new process
 	// starts a fresh chain - never a correctness issue, since resolution
 	// stops at the first full object it finds.
-	treeChainMu      sync.Mutex
-	treeChain        map[codec.Hash]int
+	treeChainMu sync.Mutex
+	treeChain   map[codec.Hash]int
+	// replaying is set while this engine is being rebuilt from the delta
+	// log rather than taking new writes - see SetReplaying.
+	replaying        atomic.Bool
 	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
@@ -522,6 +525,42 @@ func (e *ServerEngine) DiscardPending(namespaceID string) error {
 // live (now: current committed) state rather than tracking per-branch
 // history.
 func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
+	tree, err := e.commitTreeLocked(namespaceID, parentTreeHash)
+	if err != nil {
+		return tree, err
+	}
+	// After the tree locks are released: a flush writes an SSTable, and
+	// holding treeMu across that would put every concurrent commit behind
+	// a disk write.
+	e.maybeFlushMemtable()
+	return tree, nil
+}
+
+// maybeFlushMemtable writes the in-memory blob generation out once it
+// reaches its budget.
+//
+// The memtable has no bound of its own - it grows on every Put and shrinks
+// only when flushed - and under the objects history strategy every
+// document version written passes through it. Without this a writing
+// session held every version it had written until close: 350MB for one
+// document rewritten 463 times, against 41MB with objects turned off,
+// which is the same unbounded retention this tier's budgets exist to
+// prevent, arriving by a different door.
+//
+// Best-effort: a failed flush leaves the generation reachable through
+// pendingFlush, so nothing written is lost, and the next commit tries
+// again.
+func (e *ServerEngine) maybeFlushMemtable() {
+	if e.memTable == nil || e.config.IOShim == nil {
+		return
+	}
+	if e.memTable.SizeBytes() < storage.ResolvedMemtableFlushBytes(e.config) {
+		return
+	}
+	_, _ = e.memTable.Flush(0)
+}
+
+func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec.Hash) (document.DocumentTree, error) {
 	puts, deletes := e.pending.TakeAllAndClear()
 
 	e.treeMu.Lock()

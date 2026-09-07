@@ -112,3 +112,27 @@ func ResolvedCommitOpsBytes(cfg StorageEngineConfig) int64 {
 	}
 	return budget
 }
+
+// DefaultMemtableFraction is the share of the hot-tier budget the
+// in-memory blob generation may reach before being flushed to an SSTable.
+const DefaultMemtableFraction = 0.25
+
+// ResolvedMemtableFlushBytes is how large the memtable may grow before it
+// is written out.
+//
+// It needs a bound at all because the memtable has none of its own: it
+// grows on every Put and shrinks only when something calls Flush. Under
+// the objects history strategy every document version written goes through
+// it, so without this a writing session held every version it had written
+// in memory until close - the exact shape of unbounded retention this
+// tier's budgets exist to prevent.
+func ResolvedMemtableFlushBytes(cfg StorageEngineConfig) int64 {
+	if cfg.MemtableFlushBytes > 0 {
+		return cfg.MemtableFlushBytes
+	}
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultMemtableFraction)
+	if budget <= 0 {
+		return DefaultHotTierBytes / 4
+	}
+	return budget
+}

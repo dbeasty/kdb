@@ -28,6 +28,10 @@ func restoreNamespace(
 	disabled bool,
 ) (replayedInFull bool, err error) {
 	eng, _ := store.(*engine.ServerEngine)
+	if eng != nil {
+		eng.SetReplaying(true)
+		defer eng.SetReplaying(false)
+	}
 	if disabled {
 		// Not just "do not write one": a namespace with checkpoints turned
 		// off must not read a stale one left from when they were on.

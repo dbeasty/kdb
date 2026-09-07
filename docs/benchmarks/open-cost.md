@@ -205,13 +205,58 @@ built-in behaviour, on `embed.FileRuntimeOptions.Storage`:
 | `DocumentCacheBytes` | `KDB_DOCUMENT_CACHE_BYTES` | half the hot-tier budget | resident memory against cold reads |
 | `CommitOpsBytes` | `KDB_COMMIT_OPS_BYTES` | a quarter of it | the same, for commit operations |
 | `TreeChainLimit` | — | 32 | bytes written against how far a historical read walks back |
+| `MemtableFlushBytes` | — | a quarter of the hot-tier budget | write amplification against memory held between flushes |
 | `DisableCheckpoints` | `KDB_CHECKPOINTS=off` | off (checkpoints on) | open cost against not writing one |
 
 `DisableCheckpoints` also stops a checkpoint being *read*, not just
 written: a namespace with the setting off must actually open from the log,
 or turning it off would change nothing until the next write.
 
+## What the flags can and cannot get you back
+
+Measured across the flag space, same workload (one document rewritten 463
+times to 1.4 MB):
+
+| flags | heap while writing | reopen churn | live heap |
+|---|---:|---:|---:|
+| defaults | 50.6 MB | 36.8 MB | 6.5 MB |
+| `HistoryStrategy=replay` | 42.8 MB | 36.7 MB | 6.5 MB |
+| `DisableCheckpoints` | 54.7 MB | 4663 MB | 23.5 MB |
+| 8 GB memory budget | 649.8 MB | 36.8 MB | 6.8 MB |
+| all three at once | 356.3 MB | 3799 MB | 321.8 MB |
+
+**The original 7,708 MB is not reachable under any setting.** Half of it
+was the decode-re-encode-re-decode round trip replay used to perform, and
+removing that is unconditional - there is no flag that puts it back. The
+worst combination reaches ~3,800 MB, and only by turning checkpoints off,
+which is what that setting means.
+
+Two things worth reading off the table. The retention budgets do nothing
+until history is actually loaded - an 8 GB budget with checkpoints on still
+opens in 36.8 MB, because open never touches history to begin with. And
+`HistoryStrategy` costs about 8 MB more while writing and nothing at open,
+because it changes what a *historical read* does, not what open does.
+
+### A default that was not reasonable
+
+The first version of the objects strategy held 350 MB while writing that
+same workload, against 41 MB with the strategy off - and it was the
+default. Every version written is stored as an object, objects go into the
+memtable, and the memtable had no bound of its own: it grew on every put
+and shrank only when something called Flush, which only Close did. So a
+writing session accumulated every version it had written. The same
+unbounded retention this whole document is about, arriving through the
+write path instead of the read path.
+
+The memtable is now flushed once it reaches `MemtableFlushBytes` (a quarter
+of the hot-tier budget by default), and replay skips writing an object that
+is already stored rather than rewriting the whole history it just read.
+`TestObjectsStrategyDoesNotHoardWritesInMemory` compares the two strategies
+so the shape cannot come back.
+
 ## What this still does not fix
+
+
 
 
 

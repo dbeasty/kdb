@@ -188,6 +188,9 @@ func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document
 	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
 		return
 	}
+	if e.skipExistingObject(result.TreeHash) {
+		return
+	}
 	chain := e.treeChainLen(base.TreeHash) + 1
 	o := treeObject{
 		kind:     treeObjectKindDiff,
@@ -235,8 +238,33 @@ func (e *ServerEngine) putDocumentObject(contentHash codec.Hash, doc document.Do
 	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
 		return
 	}
+	if e.skipExistingObject(contentHash) {
+		return
+	}
 	e.memTable.Put(contentHash, []byte(doc.JSON))
 }
+
+// skipExistingObject reports an object that is already stored and need not
+// be written again.
+//
+// Only consulted while replaying. Replay re-derives every version the log
+// holds, and on a namespace whose objects were already written that is all
+// of them - rewriting each one costs a flush cycle to store bytes that are
+// already there. On the ordinary write path the answer would always be no
+// (the content hash is new), so the lookup would be a guaranteed miss
+// walking every table's index on the hot path, which is why this is not
+// asked there.
+func (e *ServerEngine) skipExistingObject(h codec.Hash) bool {
+	if !e.replaying.Load() {
+		return false
+	}
+	return e.memTable.Get(h) != nil
+}
+
+// SetReplaying marks the window in which this engine is being rebuilt from
+// the delta log rather than taking new writes. Replay is single-threaded
+// and happens at open, before the runtime is handed to anyone.
+func (e *ServerEngine) SetReplaying(v bool) { e.replaying.Store(v) }
 
 // documentFromObject returns a version's bytes from the object store.
 func (e *ServerEngine) documentFromObject(docID codec.UUID, contentHash codec.Hash) (document.Document, bool) {
