@@ -23,27 +23,23 @@ func TestParseRejectsMalformedInputWithoutPanicking(t *testing.T) {
 		sql     string
 		wantMsg string
 	}{
-		// The original reproducer, and the reason this suite exists.
-		{"select literal", "SELECT 1", `found "1"`},
-		{"select literal with from", "SELECT 1 FROM players", `found "1"`},
-		{"select string literal", "SELECT 'x' FROM players", `found "'x'"`},
+		// `SELECT 1` itself is now a supported statement - see
+		// TestParseAcceptsTablelessSelect. What remains invalid is everything genuinely
+		// malformed.
 		{"select nothing", "SELECT", "found end of statement"},
 		{"select star from nothing", "SELECT * FROM", "found end of statement"},
 		{"select from a literal", "SELECT a FROM 1", `found "1"`},
 		{"trailing AS at end", "SELECT a AS", "found end of statement"},
 
-		// These three land on "expected FROM" rather than an identifier error, because the
-		// lexer has no notion of reserved words: `FROM` is a perfectly good identifier, so it
-		// is consumed as the projection name (or the alias), and the failure surfaces one token
-		// later when the real FROM clause turns out to be missing.
-		//
-		// That is a pre-existing limitation of the parser, not something this change
-		// introduced, and it is a merely confusing message rather than a crash or a wrong
-		// answer. Pinned here so it is visible and so a future fix for reserved words has a
-		// test that will notice.
-		{"select from nothing", "SELECT FROM", "expected FROM"},
-		{"select comma dangling", "SELECT a, FROM players", "expected FROM"},
-		{"trailing AS with no alias", "SELECT a AS FROM players", "expected FROM"},
+		// A clause keyword is not an identifier. Before reserved words existed, `FROM` was read
+		// as a perfectly good column name; that was merely confusing while FROM was mandatory
+		// (the failure surfaced one token later as "expected FROM"), but became genuinely
+		// wrong once FROM turned optional, since there was then no later keyword check to fail.
+		{"select from nothing", "SELECT FROM", `reserved word "FROM"`},
+		{"select comma dangling", "SELECT a, FROM players", `reserved word "FROM"`},
+		{"trailing AS with no alias", "SELECT a AS FROM players", `reserved word "FROM"`},
+		{"reserved word as a column name", "CREATE TABLE t (from VARCHAR)", `reserved word "from"`},
+		{"reserved word as a table name", "SELECT a FROM select", `reserved word "select"`},
 
 		{"insert into nothing", "INSERT INTO", "found end of statement"},
 		{"insert into a literal", "INSERT INTO 5 (a) VALUES (1)", `found "5"`},
@@ -99,7 +95,7 @@ func TestParseRejectsMalformedInputWithoutPanicking(t *testing.T) {
 // TestParseErrorCarriesPosition checks the part of ParseError a caller can act on: where in the
 // statement the problem is. Without it "expected identifier" is untraceable in a long query.
 func TestParseErrorCarriesPosition(t *testing.T) {
-	const query = "SELECT a, 1 FROM players"
+	const query = "SELECT a, FROM players"
 	_, err := DefaultParser{}.Parse(query)
 	if err == nil {
 		t.Fatal("expected a parse error")
@@ -111,9 +107,81 @@ func TestParseErrorCarriesPosition(t *testing.T) {
 	if parseErr.SQL != query {
 		t.Fatalf("ParseError.SQL = %q, want the original statement", parseErr.SQL)
 	}
-	// The offending token is the "1" at index 10.
-	if parseErr.Pos != strings.Index(query, "1") {
-		t.Fatalf("ParseError.Pos = %d, want %d (the offending token)", parseErr.Pos, strings.Index(query, "1"))
+	// Points at the offending FROM, not past it - readIdentifier rewinds before reporting a
+	// reserved word precisely so the position stays useful.
+	if parseErr.Pos != strings.Index(query, "FROM") {
+		t.Fatalf("ParseError.Pos = %d, want %d (the offending token)", parseErr.Pos, strings.Index(query, "FROM"))
+	}
+}
+
+// TestParseAcceptsTablelessSelect covers the FROM-less form: `SELECT 1` is what SQL tools and
+// connection pools send to check a connection is alive, and it is the statement that used to
+// panic this parser and kill the server.
+func TestParseAcceptsTablelessSelect(t *testing.T) {
+	cases := []struct {
+		sql       string
+		wantAlias string
+	}{
+		{"SELECT 1", ""},
+		{"SELECT 1 AS one", "one"},
+		{"SELECT 'ok'", ""},
+		{"SELECT ?", ""},
+		{"SELECT 1.5", ""},
+		{"SELECT NULL", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			stmt, err := DefaultParser{}.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) failed: %v", tc.sql, err)
+			}
+			sel, ok := stmt.(StmtSelect)
+			if !ok {
+				t.Fatalf("got %T, want StmtSelect", stmt)
+			}
+			if sel.Query.HasFrom() {
+				t.Fatalf("Parse(%q) invented a FROM clause: %+v", tc.sql, sel.Query.From)
+			}
+			if len(sel.Query.Projections) != 1 {
+				t.Fatalf("want one projection, got %d", len(sel.Query.Projections))
+			}
+			proj, ok := sel.Query.Projections[0].(ProjExpression)
+			if !ok {
+				t.Fatalf("got %T, want ProjExpression", sel.Query.Projections[0])
+			}
+			if proj.Alias != tc.wantAlias {
+				t.Fatalf("alias = %q, want %q", proj.Alias, tc.wantAlias)
+			}
+		})
+	}
+}
+
+// TestParseLiteralProjectionWithTable checks the other half of making projections general
+// expressions: a literal alongside a real table is now a valid projection too.
+func TestParseLiteralProjectionWithTable(t *testing.T) {
+	stmt, err := DefaultParser{}.Parse("SELECT 1 AS n, name FROM players")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	sel := stmt.(StmtSelect)
+	if !sel.Query.HasFrom() || sel.Query.From.Name != "players" {
+		t.Fatalf("From = %+v, want players", sel.Query.From)
+	}
+	if len(sel.Query.Projections) != 2 {
+		t.Fatalf("want two projections, got %d", len(sel.Query.Projections))
+	}
+	if _, ok := sel.Query.Projections[0].(ProjExpression); !ok {
+		t.Fatalf("first projection is %T, want ProjExpression", sel.Query.Projections[0])
+	}
+	// A bare column reference must still be a ProjColumn, so the planner can check it against
+	// the schema and columnsFor can report the field's real SQL type.
+	col, ok := sel.Query.Projections[1].(ProjColumn)
+	if !ok {
+		t.Fatalf("second projection is %T, want ProjColumn", sel.Query.Projections[1])
+	}
+	if col.Name != "name" {
+		t.Fatalf("column = %q, want name", col.Name)
 	}
 }
 

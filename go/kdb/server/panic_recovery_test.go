@@ -54,7 +54,12 @@ func TestMalformedStatementIsAnErrorNotAnOutage(t *testing.T) {
 	}
 	defer bystander.Close()
 
-	_, _, err = victim.QueryRaw(ctx, "app/data", "SELECT 1", nil)
+	// `SELECT 1` is now a supported statement rather than a crash - see
+	// TestSelectOneProbeAnswersOverTheWire below for the full probe behaviour. What this test
+	// needs is a statement the parser still rejects.
+	const malformed = "SELECT a FROM 1"
+
+	_, _, err = victim.QueryRaw(ctx, "app/data", malformed, nil)
 	if err == nil {
 		t.Fatal("expected an error from a malformed statement")
 	}
@@ -67,13 +72,13 @@ func TestMalformedStatementIsAnErrorNotAnOutage(t *testing.T) {
 	}
 
 	// The connection that sent it is still usable...
-	if _, _, err := victim.QueryRaw(ctx, "app/data", "SELECT 1", nil); err == nil {
+	if _, _, err := victim.QueryRaw(ctx, "app/data", malformed, nil); err == nil {
 		t.Fatal("expected the same error on a second attempt")
 	}
 
 	// ...and so is everyone else's. Had the process died, this would fail on a closed
 	// connection rather than returning a clean per-statement error.
-	if _, _, err := bystander.QueryRaw(ctx, "app/data", "SELECT 1", nil); err == nil {
+	if _, _, err := bystander.QueryRaw(ctx, "app/data", malformed, nil); err == nil {
 		t.Fatal("expected an error for the bystander too")
 	} else if !strings.Contains(err.Error(), "expected identifier") {
 		t.Fatalf("bystander connection did not survive: %v", err)
@@ -110,15 +115,16 @@ func TestMalformedStatementVariantsAllReturnErrors(t *testing.T) {
 	defer c.Close()
 
 	for _, sql := range []string{
-		"SELECT 1",
 		"SELECT",
 		"SELECT * FROM",
 		"SELECT a FROM 1",
+		"SELECT FROM players",
 		"",
 		"DROP TABLE players",
 		"INSERT INTO",
 		"CREATE TABLE",
 		"SELECT a FROM t WHERE b = 1.2.3",
+		"SELECT 1 GARBAGE",
 	} {
 		if _, _, err := c.QueryRaw(ctx, "app/data", sql, nil); err == nil {
 			t.Errorf("QueryRaw(%q) unexpectedly succeeded", sql)
@@ -129,5 +135,55 @@ func TestMalformedStatementVariantsAllReturnErrors(t *testing.T) {
 	if _, _, err := c.QueryRaw(ctx, "app/data", "SELECT name FROM players", nil); err != nil &&
 		strings.Contains(err.Error(), "connection") {
 		t.Fatalf("connection did not survive the sweep: %v", err)
+	}
+}
+
+// TestSelectOneProbeAnswersOverTheWire is the point of the whole exercise: `SELECT 1` - what
+// every SQL tool and connection pool sends to check a connection is alive - now returns a row
+// over the real wire path, on a namespace with no commits and no schema.
+//
+// The empty namespace matters. A probe that only worked after the first write would be useless
+// exactly when a caller most wants a plain answer, which is why the executor short-circuits
+// before resolving a commit.
+func TestSelectOneProbeAnswersOverTheWire(t *testing.T) {
+	runtime, err := embed.OpenMemoryRuntime("demo", "app/data", schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := server.ListenSqlWire("tcp://127.0.0.1:0?bind=true", server.NewKdbServerRuntime(runtime))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	c, err := client.Connect(ctx, fmt.Sprintf("tcp://%s", ln.Addr().String()), "")
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Close()
+
+	columns, rows, err := c.QueryRaw(ctx, "app/data", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("SELECT 1 failed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want exactly 1", len(rows))
+	}
+	if len(rows[0]) != 1 || rows[0][0] != "1" {
+		t.Fatalf("row = %v, want [1]", rows[0])
+	}
+	if len(columns) != 1 {
+		t.Fatalf("got %d columns, want 1", len(columns))
+	}
+
+	// The aliased form, which is how several pools write the probe.
+	_, aliased, err := c.QueryRaw(ctx, "app/data", "SELECT 1 AS ping", nil)
+	if err != nil {
+		t.Fatalf("SELECT 1 AS ping failed: %v", err)
+	}
+	if len(aliased) != 1 || aliased[0][0] != "1" {
+		t.Fatalf("aliased probe returned %v", aliased)
 	}
 }

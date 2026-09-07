@@ -19,19 +19,20 @@ type DefaultParser struct{}
 func (DefaultParser) Parse(sql string) (Statement, error) {
 	p := &rdParser{input: strings.TrimSpace(sql)}
 	p.skipWS()
+	var stmt Statement
 	switch {
 	case p.matchKeyword("SELECT"):
 		q, err := p.parseSelectQuery()
 		if err != nil {
 			return nil, err
 		}
-		return StmtSelect{Query: q}, nil
+		stmt = StmtSelect{Query: q}
 	case p.matchKeyword("INSERT"):
 		ins, err := p.parseInsert()
 		if err != nil {
 			return nil, err
 		}
-		return StmtInsert{Insert: ins}, nil
+		stmt = StmtInsert{Insert: ins}
 	case p.matchKeyword("CREATE"):
 		if !p.matchKeyword("TABLE") {
 			return nil, p.parseError("expected TABLE")
@@ -40,10 +41,35 @@ func (DefaultParser) Parse(sql string) (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		return StmtCreateTable{DDL: ddl}, nil
+		stmt = StmtCreateTable{DDL: ddl}
 	default:
 		return nil, p.parseError("expected SELECT, INSERT, or CREATE TABLE")
 	}
+	if err := p.expectEnd(); err != nil {
+		return nil, err
+	}
+	return stmt, nil
+}
+
+// expectEnd rejects anything left over after a complete statement.
+//
+// Nothing used to check this, so text the parser did not understand was simply dropped:
+// `SELECT 1 + name` parsed as `SELECT 1` and returned a row, because there is no arithmetic
+// operator to consume `+ name` and no one looked at what remained. A statement that quietly
+// means something narrower than what was written is worse than a rejected one - the caller gets
+// an answer and no reason to doubt it.
+//
+// A single trailing semicolon is allowed, since every SQL console and script appends one.
+func (p *rdParser) expectEnd() error {
+	p.skipWS()
+	if p.peek() == ';' {
+		p.consume()
+		p.skipWS()
+	}
+	if p.pos < len(p.input) {
+		return p.parseError("unexpected trailing input" + p.foundSuffix())
+	}
+	return nil
 }
 
 type rdParser struct {
@@ -192,14 +218,17 @@ func (p *rdParser) parseSelectQuery() (SelectQuery, error) {
 	if err != nil {
 		return SelectQuery{}, err
 	}
-	if err := p.expectKeyword("FROM"); err != nil {
-		return SelectQuery{}, err
+	// FROM is optional: a SELECT with no table evaluates its projections once against a single
+	// synthetic row. That is what makes `SELECT 1` work - the connectivity probe every SQL tool
+	// and connection pool issues, and previously the statement that panicked this parser.
+	var table TableRef
+	if p.matchKeyword("FROM") {
+		tableName, err := p.readIdentifier()
+		if err != nil {
+			return SelectQuery{}, err
+		}
+		table = TableRef{Name: tableName}
 	}
-	tableName, err := p.readIdentifier()
-	if err != nil {
-		return SelectQuery{}, err
-	}
-	table := TableRef{Name: tableName}
 	var where Expr
 	if p.matchKeyword("WHERE") {
 		where, err = p.parseExpr()
@@ -283,7 +312,12 @@ func (p *rdParser) parseProjections() ([]Projection, error) {
 			}
 			out = append(out, ProjExpression{Expr: ExprFunctionCall{Name: "count", Args: []Expr{arg}}, Alias: alias})
 		} else {
-			name, err := p.readIdentifier()
+			// A projection is a general expression, not only a column name. A bare column
+			// reference is still emitted as ProjColumn so the planner can check it against the
+			// schema and columnsFor can report the field's real SQL type; anything else -
+			// `SELECT 1`, `SELECT ?`, `SELECT upper(name)` - becomes a ProjExpression, which
+			// projectRow and columnsFor already knew how to handle.
+			expr, err := p.parseExpr()
 			if err != nil {
 				return nil, err
 			}
@@ -291,7 +325,11 @@ func (p *rdParser) parseProjections() ([]Projection, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, ProjColumn{Name: name, Alias: alias})
+			if col, ok := expr.(ExprColumnRef); ok {
+				out = append(out, ProjColumn{Name: col.Name, Alias: alias})
+			} else {
+				out = append(out, ProjExpression{Expr: expr, Alias: alias})
+			}
 		}
 		if !p.matchChar(',') {
 			break
@@ -463,7 +501,7 @@ func (p *rdParser) parsePrimary() (Expr, error) {
 		}
 		return e, nil
 	default:
-		return nil, p.parseError("expected expression")
+		return nil, p.parseError("expected expression" + p.foundSuffix())
 	}
 }
 
@@ -532,7 +570,44 @@ func (p *rdParser) readIdentifier() (string, error) {
 	if start == p.pos {
 		return "", p.parseError("expected identifier" + p.foundSuffix())
 	}
-	return p.input[start:p.pos], nil
+	word := p.input[start:p.pos]
+
+	// A clause keyword is not an identifier. Without this the lexer happily reads FROM as a
+	// column name, and `SELECT FROM players` parses as "select the column named FROM" - which
+	// mattered much more once FROM became optional, because there is then no later
+	// expectKeyword("FROM") to fail and turn the misparse back into an error. The result would
+	// have been a confusing planning error, or worse a query that quietly did something else.
+	if _, reserved := reservedWords[strings.ToUpper(word)]; reserved {
+		// Rewound so the caller's own matchKeyword can still see the word, and so the error
+		// position points at the keyword rather than past it.
+		p.pos = start
+		return "", p.parseError("expected identifier, found reserved word " + strconv.Quote(word))
+	}
+	return word, nil
+}
+
+// reservedWords are the keywords that end or introduce a clause, and so can never be an
+// identifier in this dialect (which has no quoted-identifier syntax to escape them with).
+//
+// Deliberately not the full SQL reserved list: only words whose accidental consumption as an
+// identifier changes how a statement parses. NOT, NULL, AND, OR, ASC and DESC are absent
+// because parseExpr matches them as keywords before ever reaching readIdentifier, and reserving
+// them would forbid ordinary column names for no benefit.
+var reservedWords = map[string]struct{}{
+	"SELECT":   {},
+	"FROM":     {},
+	"WHERE":    {},
+	"ORDER":    {},
+	"BY":       {},
+	"LIMIT":    {},
+	"OFFSET":   {},
+	"AS":       {},
+	"INSERT":   {},
+	"INTO":     {},
+	"VALUES":   {},
+	"CREATE":   {},
+	"TABLE":    {},
+	"DISTINCT": {},
 }
 
 // foundSuffix describes what is actually at the cursor, for an error message that says what went
