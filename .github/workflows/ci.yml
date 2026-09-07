@@ -77,6 +77,45 @@ jobs:
       - name: Go WASM build
         run: GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
 
+  ts-client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/kdb-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Go is needed for two things: regenerating the golden fixtures to prove they still match
+      # the real encoder, and the live interop suite, which starts an actual Go server and
+      # drives it from the TypeScript client over a real WebSocket.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Check golden fixtures are current
+        # A drifted fixture is the failure this whole package guards against: the TS codec would
+        # still agree with a stale snapshot of the Go encoder while disagreeing with a live
+        # server. Regenerating and diffing catches a wire-format change on the Go side that
+        # nobody thought to mirror here.
+        run: |
+          cd ../../go && go run ./cmd/kdb-tsfixtures
+          cd ../packages/kdb-client
+          if ! git diff --quiet -- test/golden; then
+            echo "Golden fixtures are out of date - the Go wire format changed."
+            echo "Run: cd go && go run ./cmd/kdb-tsfixtures"
+            git diff -- test/golden
+            exit 1
+          fi
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+
   go-interop:
     runs-on: ubuntu-latest
     needs: [integration, go-test]
