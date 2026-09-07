@@ -183,4 +183,3 @@ func TestSnapshotSessionStillConflictsOnStaleBase(t *testing.T) {
 	}
 	commitConflicted(t, snap.txCommit(t, "app/data", snapSess.SessionID), "snapshot session committing over a change it cannot see")
 }
-
