@@ -8,6 +8,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/backup"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/recovery"
+	"github.com/limidus/kdb/go/kdb/storage"
 )
 
 // argValues returns every value passed for a repeatable flag, e.g.
@@ -29,8 +30,20 @@ func restoreCmd(args []string) error {
 	sourceArgs := argValues(args, "--source")
 	fromBackup := argValue(args, "--from-backup")
 	backupID := argValue(args, "--backup-id")
+	databaseID := argValue(args, "--database-backup-id")
+	if databaseID != "" {
+		comp, err := parseCompression(argValue(args, "--codec"))
+		if err != nil {
+			return err
+		}
+		if fromBackup == "" || outDir == "" {
+			return fmt.Errorf("usage: kdb-inspect restore --database-backup-id ID --from-backup DIR|s3 --out DIR [--codec zstd|none]")
+		}
+		return restoreDatabase(fromBackup, databaseID, outDir, comp)
+	}
 	if namespace == "" || outDir == "" || (len(sourceArgs) == 0 && fromBackup == "") {
 		return fmt.Errorf("usage: kdb-inspect restore --namespace NS --out DIR [--source LABEL=PATH ...] [--from-backup DIR|s3 --backup-id ID] [--codec zstd|none]\n" +
+			"  --database-backup-id ID restores every namespace in a database backup instead.\n" +
 			"  Sources are read in the order given; a damaged local data directory and a\n" +
 			"  backup directory are both just paths - list both to hybrid-restore.\n" +
 			"  --from-backup fetches a manifest-verified backup (see kdb-inspect backup) and\n" +
@@ -105,5 +118,60 @@ func restoreCmd(args []string) error {
 		}
 		fmt.Println("  add another --source (a peer, an older backup) that has them, or accept this as a partial restore")
 	}
+	return nil
+}
+
+// restoreDatabase restores every namespace a database backup names into one out directory.
+//
+// One lock over the out directory for the whole pass, and the namespaces go into the same root -
+// which is what makes the result a database rather than a pile of separately-restored
+// namespaces. It is the mirror of CreateDatabase: that captured them under one lock, this puts
+// them back under one.
+func restoreDatabase(fromBackup, databaseID, outDir string, comp storage.CompressionCodec) error {
+	store, err := backupStore(fromBackup)
+	if err != nil {
+		return err
+	}
+	m, err := backup.LoadDatabaseManifest(store, databaseID)
+	if err != nil {
+		return fmt.Errorf("loading database manifest %s: %w", databaseID, err)
+	}
+
+	release, err := embed.LockDataDir(outDir)
+	if err != nil {
+		return fmt.Errorf("locking %s: %w", outDir, err)
+	}
+	defer release()
+	outShim, err := openDirShim(outDir)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("restoring database backup %s (taken %s, %d namespaces)\n", m.BackupID, m.CreatedAt, len(m.Entries))
+	for _, e := range m.Entries {
+		fetchDir, err := os.MkdirTemp("", "kdb-backup-fetch-*")
+		if err != nil {
+			return err
+		}
+		nsManifest, err := backup.FetchToDir(store, e.NamespaceID, e.BackupID, fetchDir)
+		if err != nil {
+			os.RemoveAll(fetchDir)
+			return fmt.Errorf("fetching %s backup %s: %w", e.NamespaceID, e.BackupID, err)
+		}
+		shim, err := openDirShim(fetchDir)
+		if err != nil {
+			os.RemoveAll(fetchDir)
+			return err
+		}
+		sources := []recovery.Source{{Label: "backup:" + e.BackupID, Shim: shim}}
+		result, err := recovery.HybridRestore(sources, e.NamespaceID, comp, outShim)
+		os.RemoveAll(fetchDir)
+		if err != nil {
+			return fmt.Errorf("restoring %s: %w", e.NamespaceID, err)
+		}
+		fmt.Printf("  %s: %d commit(s) applied (backup had %d)\n",
+			e.NamespaceID, result.AppliedCount, nsManifest.CommitCount)
+	}
+	fmt.Printf("database restored to %s\n", outDir)
 	return nil
 }

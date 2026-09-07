@@ -35,8 +35,9 @@ func backupCmd(args []string) error {
 	namespace := argValue(args, "--namespace")
 	to := argValue(args, "--to")
 	base := argValue(args, "--base-backup-id")
-	if dataDir == "" || namespace == "" {
-		return fmt.Errorf("usage: kdb-inspect backup --data-dir DIR --namespace NS --to DIR|s3 [--base-backup-id ID] [--codec zstd|none]")
+	if dataDir == "" {
+		return fmt.Errorf("usage: kdb-inspect backup --data-dir DIR [--namespace NS] --to DIR|s3 [--base-backup-id ID] [--codec zstd|none]\n" +
+			"  --namespace may be omitted to back up every namespace under the data root as one database backup")
 	}
 	store, err := backupStore(to)
 	if err != nil {
@@ -51,6 +52,30 @@ func backupCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	// No --namespace means the whole database: every namespace under the root, captured inside
+	// the single lock taken above. That one lock is the entire point - backing the namespaces up
+	// one command at a time would give N manifests from N different instants, each internally
+	// consistent and none consistent with the others.
+	if namespace == "" {
+		namespaces, err := embed.ListNamespaces(dataDir)
+		if err != nil {
+			return err
+		}
+		if len(namespaces) == 0 {
+			return fmt.Errorf("no namespaces found under %s", dataDir)
+		}
+		dm, err := backup.CreateDatabase(shim, namespaces, store, dataDir, nil)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("database backup complete\n  backupId: %s\n  namespaces: %d\n", dm.BackupID, len(dm.Entries))
+		for _, e := range dm.Entries {
+			fmt.Printf("  %s -> %s\n", e.NamespaceID, e.BackupID)
+		}
+		fmt.Printf("restore with: kdb-inspect restore --database-backup-id %s --from-backup %s --out DIR\n", dm.BackupID, to)
+		return nil
+	}
+
 	m, err := backup.Create(shim, namespace, store, base)
 	if err != nil {
 		return err
@@ -94,12 +119,29 @@ func backupVerifyCmd(args []string) error {
 func backupListCmd(args []string) error {
 	namespace := argValue(args, "--namespace")
 	to := argValue(args, "--to")
-	if namespace == "" {
-		return fmt.Errorf("usage: kdb-inspect backup-list --namespace NS --to DIR|s3")
-	}
 	store, err := backupStore(to)
 	if err != nil {
 		return err
+	}
+	// No --namespace lists database backups rather than one namespace's.
+	if namespace == "" {
+		ids, err := backup.ListDatabaseBackups(store)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			fmt.Println("no database backups")
+			return nil
+		}
+		for _, id := range ids {
+			m, err := backup.LoadDatabaseManifest(store, id)
+			if err != nil {
+				fmt.Printf("%s  (manifest unreadable: %v)\n", id, err)
+				continue
+			}
+			fmt.Printf("%s  created=%s namespaces=%d\n", id, m.CreatedAt, len(m.Entries))
+		}
+		return nil
 	}
 	ids, err := backup.ListBackups(store, namespace)
 	if err != nil {
