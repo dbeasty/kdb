@@ -76,7 +76,7 @@ class AuthSqlIntegrationTest {
                 doSqlExec(
                     host,
                     begin.sessionId,
-                    "INSERT INTO users (_doc) VALUES ('{\"userId\":\"u2\",\"name\":\"Bob\"}')",
+                    "INSERT INTO users (userId, name) VALUES ('u2', 'Bob')",
                 )
             assertNotNull(result.error)
             assertTrue(result.error!!.contains("forbidden", ignoreCase = true))

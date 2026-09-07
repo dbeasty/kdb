@@ -9,7 +9,7 @@ import dev.kdb.schema.KdbSchema
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
-import dev.kdb.document.ensureIdInJson
+import dev.kdb.document.resolveDocumentId
 import dev.kdb.error.DataDirectoryLockedException
 import dev.kdb.error.KdbException
 import dev.kdb.jdbc.file.StaleLockReleaseResult
@@ -20,9 +20,6 @@ import dev.kdb.peersync.peerSyncClient
 import dev.kdb.transport.tcp.defaultTcpWireTransport
 import dev.kdb.wire.defaultWireCodec
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import java.nio.file.Path
 
 internal object CliCommands {
@@ -148,12 +145,11 @@ internal object CliCommands {
 
     internal suspend fun executePut(session: CliSession, payload: String) {
         val json = readPayload(payload)
-        val element = Json.parseToJsonElement(json).jsonObject
-        val docId =
-            element["id"]?.jsonPrimitive?.content?.let { KdbUuid.fromString(it) }
-                ?: KdbUuid.random()
-        val storedJson = ensureIdInJson(json, docId)
-        val doc = KdbDocument(docId, storedJson)
+        // Layer 16 §9.4: the body is stored exactly as provided - no `id` is injected and no key is
+        // reordered. A supplied top-level `id` is the identity (a UUID directly; any other non-empty
+        // string through the derived id); without one a random id is minted and reported below.
+        val docId = resolveDocumentId(json).id
+        val doc = KdbDocument(docId, json)
         val ns = session.namespaceId
         session.runtime.embedded.storage.putDocument(ns, doc)
         val parent = session.runtime.embedded.dag.head()

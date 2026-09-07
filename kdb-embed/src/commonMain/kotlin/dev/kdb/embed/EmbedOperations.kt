@@ -8,6 +8,7 @@ import dev.kdb.dag.TraversalEntry
 import dev.kdb.document.KdbDocument
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.document.resolveDocumentId
 import dev.kdb.index.IndexManager
 import dev.kdb.index.compositeIndexStoreFactory
 import dev.kdb.query.hybrid.HybridQueryRequest
@@ -21,8 +22,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 public suspend fun syncEmbedSchema(
     runtime: EmbeddedKdbRuntime,
@@ -51,7 +50,9 @@ internal suspend fun syncEmbedSchema(
     indexManager.registryFor(namespaceId).syncSchema(
         KdbSchema.NONE,
         schema,
-        compositeIndexStoreFactory(dag, storage),
+        // The runtime's own factory when there is one: every store must share the runtime's single
+        // IndexBlobStore, or snapshots land somewhere the catalog reload will never look.
+        runtime?.indexStoreFactory ?: compositeIndexStoreFactory(dag, storage),
         dag,
         storage,
     )
@@ -114,14 +115,13 @@ private suspend fun materializeSingleCommit(
         }
     }
     runtime.storage.commitTree(namespaceId, parentTree)
-    if (!schema.isNone) {
-        runtime.indexManager.writer.applyCommit(
-            commit,
-            runtime.indexManager.registryFor(namespaceId),
-            runtime.storage,
-            schema,
-        )
-    }
+    // See commitViaEngine: document indexes exist on schemaless namespaces too (§9.2).
+    runtime.indexManager.writer.applyCommit(
+        commit,
+        runtime.indexManager.registryFor(namespaceId),
+        runtime.storage,
+        schema,
+    )
 }
 
 public suspend fun putJson(
@@ -130,10 +130,9 @@ public suspend fun putJson(
     json: String,
     schema: KdbSchema = runtime.schema,
 ): String {
-    val element = Json.parseToJsonElement(json).jsonObject
-    val docId =
-        element["id"]?.jsonPrimitive?.content?.let { KdbUuid.fromString(it) }
-            ?: KdbUuid.random()
+    // Layer 16 §9.4: the body is stored byte-exact; a supplied top-level `id` is the identity (UUID
+    // directly, any other non-empty string via the derived id), otherwise a random one is minted.
+    val docId = resolveDocumentId(json).id
     val doc = KdbDocument(docId, json)
     val parent = runtime.writeBaseVersion ?: runtime.dag.head()
     val parentCommit = runtime.dag.getCommitOrThrow(parent)

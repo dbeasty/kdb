@@ -11,8 +11,17 @@ import dev.kdb.auth.store.UserAlreadyExistsException
 import dev.kdb.auth.store.UserNotFoundException
 import dev.kdb.auth.store.UserStore
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
+import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.error.ViolationType
+import dev.kdb.index.IndexDescriptor
+import dev.kdb.index.IndexType
+import dev.kdb.index.RankedResult
+import dev.kdb.index.fusion.FusionArm
+import dev.kdb.index.fusion.FusionMode
+import dev.kdb.index.fusion.fuseRankings
 import dev.kdb.embed.toQueryResultJson
 import dev.kdb.error.ConflictException
 import dev.kdb.error.ConflictReport
@@ -25,10 +34,12 @@ import dev.kdb.sql.decodeSqlParameters
 import dev.kdb.sql.defaultSqlParser
 import dev.kdb.sql.isAdminStatement
 import dev.kdb.sql.isDdlStatement
+import dev.kdb.sql.isDmlStatement
 import dev.kdb.sql.isTransactionControlStatement
 import dev.kdb.sql.SqlStatement
 import dev.kdb.transaction.TransactionBuilder
 import dev.kdb.transaction.TransactionResult
+import dev.kdb.transaction.UniqueConstraintViolationException
 import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
 import dev.kdb.wire.TransactionWireCodec
 import dev.kdb.wire.WireCodec
@@ -56,6 +67,12 @@ public class SqlWireHost(
     private val sessions = SessionManager(server)
     private val sqlAuth = SqlAuthSupport(auth, connectionContext)
     private var correlation = 1
+
+    /** Test-only seam (Component 73 §12): invoked with the session id at the start of every SqlExec,
+     * inside the per-session lock, so a test can hold one session's statement open and prove that
+     * sessionless frames (DocumentGet, Search) and other sessions on the same connection still
+     * complete, while a second statement on the same session waits its turn. */
+    internal var sqlExecHook: (suspend (sessionId: String) -> Unit)? = null
 
     /** Component 45: releases every session (and its document locks) this connection's
      * SqlWireHost holds - called from the connection's teardown path (pipelinedPerConnection's
@@ -111,6 +128,7 @@ public class SqlWireHost(
             is WireMessage.TransactionReplay -> handleTransactionReplay(message)
             is WireMessage.DocumentGet -> handleDocumentGet(message)
             is WireMessage.Upsert -> handleUpsert(message)
+            is WireMessage.Search -> handleSearch(message)
             else -> null
         }
 
@@ -184,7 +202,7 @@ public class SqlWireHost(
                 server.upsert(msg.namespace, docId, msg.json, sqlAuth.writeAuthorizerFor(principal))
             } catch (e: Throwable) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
-                return upsertError(msg, e.message ?: e.toString())
+                return upsertError(msg, e.message ?: e.toString(), errorCodeFor(e))
             }
         return WireMessage.UpsertResult(
             header(msg.header.correlationId, WireMessageType.UPSERT_RESULT),
@@ -196,13 +214,30 @@ public class SqlWireHost(
     private fun upsertError(
         msg: WireMessage.Upsert,
         error: String,
+        errorCode: String? = null,
     ): WireMessage.UpsertResult =
         WireMessage.UpsertResult(
             header(msg.header.correlationId, WireMessageType.UPSERT_RESULT),
             namespace = msg.namespace,
             commitHex = "",
             error = error,
+            errorCode = errorCode,
         )
+
+    /**
+     * Maps a failed write to the wire's typed error code where the Go server does the same
+     * (go/kdb/server/error_classification.go): UNIQUE_VIOLATION for a unique-constraint collision
+     * (Layer 16 §9.6), SCHEMA_VIOLATION for any other schema rejection. Null for everything else -
+     * the message alone, as before.
+     */
+    private fun errorCodeFor(e: Throwable): String? =
+        when {
+            e is UniqueConstraintViolationException -> "UNIQUE_VIOLATION"
+            e is dev.kdb.transaction.TransactionSchemaException -> "SCHEMA_VIOLATION"
+            e is dev.kdb.error.SchemaViolationException -> "SCHEMA_VIOLATION"
+            e is IllegalArgumentException && e.message?.startsWith("schema rejection") == true -> "SCHEMA_VIOLATION"
+            else -> null
+        }
 
     private suspend fun handleHandshake(msg: WireMessage.Handshake): WireMessage.HandshakeAck {
         val modeOk = msg.request.clientMode == dev.kdb.wire.WireClientMode.SQL_CLIENT
@@ -282,6 +317,7 @@ public class SqlWireHost(
         val session =
             sessions.get(msg.sessionId)
                 ?: return sqlError(msg, "unknown session: ${msg.sessionId}")
+        sqlExecHook?.invoke(msg.sessionId)
         val parsed = defaultSqlParser().parse(msg.sql.trim())
         if (isTransactionControlStatement(parsed)) {
             return handleTransactionControlSql(msg, session, parsed)
@@ -311,9 +347,16 @@ public class SqlWireHost(
         }
         return try {
             val deferCommit = !session.autoCommit
+            // Autocommit DML is lowered to ops by the hybrid engine but committed here through
+            // server.commit rather than the engine's own private commit path, so it goes through
+            // the namespace's write coordinator and the engine that enforces unique constraints
+            // (Layer 16 §9.6) exactly like TxCommit and Upsert do. The hybrid engine's deferred
+            // mode already exposes the ops for this.
+            val autocommitDml = session.autoCommit && isDmlStatement(parsed)
+            val collectedOps = mutableListOf<KdbOp>()
             val parameters = decodeSqlParameters(msg.parametersJson)
             val result =
-                server.runtime.hybrid.execute(
+                server.hybridFor(session.namespaceId).execute(
                     msg.sql,
                     HybridQueryRequest(
                         namespaceId = session.namespaceId,
@@ -324,19 +367,42 @@ public class SqlWireHost(
                         sessionCheckout = session.sessionCheckout,
                         writeSessionId = session.id.value,
                         documentLocks = server.documentLocks,
-                        deferCommit = deferCommit,
+                        deferCommit = deferCommit || autocommitDml,
                         transactionBase = if (deferCommit) session.baseVersion else null,
                         bufferOps =
-                            if (deferCommit) {
-                                { ops ->
-                                    appendPendingOps(sessions.pendingBuilder(session), ops)
-                                }
-                            } else {
-                                null
+                            when {
+                                deferCommit -> { ops -> appendPendingOps(sessions.pendingBuilder(session), ops) }
+                                autocommitDml -> { ops -> collectedOps += ops }
+                                else -> null
                             },
                     ),
                 )
             val json = result.toQueryResultJson()
+            var resolvedCommitHex = json.resolvedCommit
+            if (autocommitDml) {
+                resolvedCommitHex =
+                    if (collectedOps.isEmpty()) {
+                        server.runtime.dag.head().toHex()
+                    } else {
+                        val tx =
+                            KdbTransaction(
+                                KdbUuid.random(),
+                                server.runtime.dag.head(),
+                                collectedOps.toList(),
+                                KdbTimestamp.now(),
+                                KdbUuid.random(),
+                            )
+                        val commit =
+                            server.commit(
+                                session.namespaceId,
+                                tx,
+                                sessionId = session.id.value,
+                                authorizer = sqlAuth.writeAuthorizerFor(session.principal),
+                            )
+                        session.baseVersion = commit.hash
+                        commit.hash.toHex()
+                    }
+            }
             WireMessage.SqlResult(
                 header(msg.header.correlationId, WireMessageType.SQL_RESULT),
                 namespace = msg.namespace,
@@ -344,13 +410,16 @@ public class SqlWireHost(
                 columns = json.columns,
                 rows = json.rows.map { row -> row.map { cellToString(it) } },
                 rowsAffected = result.result.rowsAffected,
-                resolvedCommitHex = json.resolvedCommit,
+                resolvedCommitHex = resolvedCommitHex,
                 readOnly = json.readOnly,
                 error = null,
                 generatedIds = result.result.generatedIds,
             )
+        } catch (e: ConflictException) {
+            conflictReport(msg.header.correlationId, session.namespaceId, e.report, msg.namespace)
         } catch (e: Throwable) {
-            sqlError(msg, e.message ?: e.toString())
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            sqlError(msg, e.message ?: e.toString(), errorCodeFor(e))
         }
     }
 
@@ -467,7 +536,7 @@ public class SqlWireHost(
                     correlationId = msg.header.correlationId,
                     namespace = msg.namespace,
                     session = session,
-                ) { err -> sqlError(msg, err) }
+                ) { err, code -> sqlError(msg, err, code) }
             SqlStatement.Rollback -> {
                 rollbackSession(session)
                 sqlSuccess(
@@ -497,7 +566,7 @@ public class SqlWireHost(
             correlationId = msg.header.correlationId,
             namespace = msg.namespace,
             session = session,
-        ) { err -> sqlError(msg, err) }
+        ) { err, code -> sqlError(msg, err, code) }
     }
 
     private suspend fun commitEncodedTransaction(
@@ -532,25 +601,25 @@ public class SqlWireHost(
             )
         } catch (e: ConflictException) {
             abortSessionAfterFailedCommit(session)
-            conflictReport(msg.header.correlationId, msg.namespace, e.report)
+            conflictReport(msg.header.correlationId, session.namespaceId, e.report, msg.namespace)
         } catch (e: DocumentLockedException) {
             abortSessionAfterFailedCommit(session)
             sqlError(msg, e.message ?: "document locked")
         } catch (e: Throwable) {
             abortSessionAfterFailedCommit(session)
-            sqlError(msg, e.message ?: e.toString())
+            sqlError(msg, e.message ?: e.toString(), errorCodeFor(e))
         }
 
     private suspend fun commitSession(
         correlationId: Int,
         namespace: String,
         session: KdbSession,
-        onError: (String) -> WireMessage,
+        onError: (String, String?) -> WireMessage,
     ): WireMessage =
         try {
             val effective =
                 session.pending?.build()
-                    ?: return onError("no pending transaction to commit")
+                    ?: return onError("no pending transaction to commit", null)
             val commit =
                 server.commit(
                     session.namespaceId,
@@ -571,13 +640,13 @@ public class SqlWireHost(
             )
         } catch (e: ConflictException) {
             abortSessionAfterFailedCommit(session)
-            conflictReport(correlationId, namespace, e.report)
+            conflictReport(correlationId, session.namespaceId, e.report, namespace)
         } catch (e: DocumentLockedException) {
             abortSessionAfterFailedCommit(session)
-            onError(e.message ?: "document locked")
+            onError(e.message ?: "document locked", null)
         } catch (e: Throwable) {
             abortSessionAfterFailedCommit(session)
-            onError(e.message ?: e.toString())
+            onError(e.message ?: e.toString(), errorCodeFor(e))
         }
 
     private suspend fun finishCommittedSession(
@@ -691,6 +760,12 @@ public class SqlWireHost(
                     resolvedCommitHex = replayTarget.toHex(),
                     readOnly = false,
                     error = "schema rejection",
+                    errorCode =
+                        if (result.violations.any { v -> v.violations.any { it.violationType == ViolationType.UNIQUE_CONSTRAINT } }) {
+                            "UNIQUE_VIOLATION"
+                        } else {
+                            "SCHEMA_VIOLATION"
+                        },
                 )
             is TransactionResult.Aborted ->
                 WireMessage.SqlResult(
@@ -710,6 +785,7 @@ public class SqlWireHost(
     private fun sqlError(
         msg: WireMessage.SqlExec,
         error: String,
+        errorCode: String? = null,
     ): WireMessage.SqlResult =
         WireMessage.SqlResult(
             header(msg.header.correlationId, WireMessageType.SQL_RESULT),
@@ -721,11 +797,13 @@ public class SqlWireHost(
             resolvedCommitHex = "",
             readOnly = true,
             error = error,
+            errorCode = errorCode,
         )
 
     private fun sqlError(
         msg: WireMessage.TxCommit,
         error: String,
+        errorCode: String? = null,
     ): WireMessage.SqlResult =
         WireMessage.SqlResult(
             header(msg.header.correlationId, WireMessageType.SQL_RESULT),
@@ -737,6 +815,7 @@ public class SqlWireHost(
             resolvedCommitHex = "",
             readOnly = false,
             error = error,
+            errorCode = errorCode,
         )
 
     private fun header(
@@ -766,13 +845,155 @@ public class SqlWireHost(
         correlationId: Int,
         namespace: String,
         report: ConflictReport,
+        /** Namespace echoed on the wire when it differs from the one whose gate paced the hint. */
+        replyNamespace: String = namespace,
     ): WireMessage.ConflictReport =
         WireMessage.ConflictReport(
             header(correlationId, WireMessageType.CONFLICT_REPORT),
-            namespace = namespace,
+            namespace = replyNamespace,
             reportBytes = encodeConflictReport(report),
             errorCode = "CONFLICT",
-            retryAfterMs = server.conflictRetryAfterMs(),
+            // Component 73: paced by the namespace's own write gate, not a runtime-wide one.
+            retryAfterMs = server.conflictRetryAfterMs(namespace),
+        )
+
+    // ---- Layer 16 Component 68 (§11): SEARCH over the wire ------------------------------------
+
+    /**
+     * Sessionless like DocumentGet, authorized as DocumentRead on the namespace. Each present arm
+     * runs through the runtime's IndexManager for the namespace - `index` resolves to a FULLTEXT /
+     * VECTOR index by its SQL name (`options["index_name"]`) or by its first field. One arm returns
+     * that arm's ranking (after its own minScore/depth); both arms are fused per §8 (`rrf` default,
+     * `weighted`). Expired documents (§9.5) are dropped from head results; `includeJson` fetches
+     * bodies at the resolved commit and drops hits whose document is gone at that commit.
+     */
+    private suspend fun handleSearch(msg: WireMessage.Search): WireMessage.SearchResult {
+        val principal =
+            try {
+                sqlAuth.authenticateConnection()
+            } catch (e: Throwable) {
+                return searchError(msg, sqlAuth.authFailureMessage(e), "UNAUTHORIZED")
+            }
+        try {
+            sqlAuth.authorize(principal, AuthAction.DocumentRead(msg.namespace, ""))
+        } catch (e: Throwable) {
+            return searchError(msg, sqlAuth.authFailureMessage(e), "UNAUTHORIZED")
+        }
+        if (msg.text == null && msg.vector == null) {
+            return searchError(msg, "search needs a text and/or a vector arm", "SCHEMA_VIOLATION")
+        }
+        if (msg.limit <= 0) {
+            return searchError(msg, "limit must be > 0", "SCHEMA_VIOLATION")
+        }
+        val mode =
+            when (msg.fusion?.lowercase()) {
+                null, "", "rrf" -> FusionMode.RRF
+                "weighted" -> FusionMode.WEIGHTED_SUM
+                else -> return searchError(msg, "unknown fusion mode: ${msg.fusion}", "SCHEMA_VIOLATION")
+            }
+        val head = server.runtime.dag.head()
+        val requestedCommitHex = msg.atCommitHex
+        val resolved =
+            if (requestedCommitHex.isNullOrEmpty()) {
+                head
+            } else {
+                val h = runCatching { KdbHash.fromHex(requestedCommitHex) }.getOrNull()
+                if (h == null || !server.runtime.dag.hasCommit(h)) {
+                    return searchError(msg, "unknown commit: $requestedCommitHex", "SCHEMA_VIOLATION")
+                }
+                h
+            }
+        val atHead = resolved == head
+        val registry = server.runtime.indexManager.registryFor(msg.namespace)
+        val reader = server.runtime.indexManager.reader
+        val fused = msg.text != null && msg.vector != null
+
+        val arms = mutableListOf<FusionArm>()
+        try {
+            msg.text?.let { arm ->
+                resolveIndex(registry.indexes.map { it.descriptor }, IndexType.FULLTEXT, arm.index)
+                    ?: return searchError(msg, "no FULLTEXT index for ${arm.index}", "SCHEMA_VIOLATION")
+                val depth = arm.depth ?: 0
+                val fetch = if (depth > 0) depth else if (fused) Int.MAX_VALUE else msg.limit
+                // The reader resolves an index by SQL name as well as by field, so the client's own
+                // spelling goes through unchanged; the descriptor lookup above exists to turn "no
+                // such index" into a message naming what was asked for rather than an exception.
+                val results = reader.lookupFullText(registry, arm.index, arm.query, resolved, fetch)
+                arms += FusionArm(results, arm.weight ?: 1.0, depth, arm.minScore)
+            }
+            msg.vector?.let { arm ->
+                resolveIndex(registry.indexes.map { it.descriptor }, IndexType.VECTOR, arm.index)
+                    ?: return searchError(msg, "no VECTOR index for ${arm.index}", "SCHEMA_VIOLATION")
+                val depth = arm.depth ?: 0
+                val k = if (depth > 0) depth else if (fused) Int.MAX_VALUE else msg.limit
+                val query = FloatArray(arm.vector.size) { arm.vector[it].toFloat() }
+                val results = reader.lookupVector(registry, arm.index, query, k, resolved)
+                arms += FusionArm(results, arm.weight ?: 1.0, depth, arm.minScore)
+            }
+        } catch (e: Throwable) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            return searchError(msg, e.message ?: e.toString(), "INTERNAL")
+        }
+
+        val ranked: List<RankedResult> =
+            if (fused) {
+                fuseRankings(arms, mode, Int.MAX_VALUE)
+            } else {
+                val arm = arms.single()
+                var list = arm.results
+                arm.minScore?.let { floor -> list = list.filter { it.score >= floor } }
+                if (arm.depth > 0 && list.size > arm.depth) list = list.take(arm.depth)
+                list
+            }
+
+        // Materialise bodies when asked for, or when expiry must be applied at head (§9.5); a hit
+        // whose document is absent at the resolved commit is dropped either way.
+        val expiry = if (atHead) server.expiryPolicyFor(msg.namespace) else null
+        val tree = server.runtime.dag.getCommitOrThrow(resolved).documentTreeHash
+        val hits = ArrayList<WireMessage.SearchHit>(minOf(ranked.size, msg.limit))
+        val needBody = msg.includeJson || expiry != null
+        val now = server.nowMillis()
+        for (r in ranked) {
+            if (hits.size >= msg.limit) break
+            if (!needBody) {
+                hits += WireMessage.SearchHit(r.docId.toString(), r.score)
+                continue
+            }
+            val doc = server.runtime.storage.getDocument(msg.namespace, r.docId, tree) ?: continue
+            if (expiry != null && isDocumentExpired(doc.json, expiry, now)) continue
+            hits += WireMessage.SearchHit(r.docId.toString(), r.score, if (msg.includeJson) doc.json else null)
+        }
+        return WireMessage.SearchResult(
+            header(msg.header.correlationId, WireMessageType.SEARCH_RESULT),
+            namespace = msg.namespace,
+            hits = hits,
+            resolvedCommitHex = resolved.toHex(),
+        )
+    }
+
+    /** `index` is a SQL index name (descriptor option `index_name`) or the index's first field. */
+    private fun resolveIndex(
+        descriptors: List<IndexDescriptor>,
+        type: IndexType,
+        nameOrField: String,
+    ): IndexDescriptor? {
+        val ofType = descriptors.filter { it.type == type }
+        return ofType.firstOrNull { it.options["index_name"] == nameOrField }
+            ?: ofType.firstOrNull { it.fieldName == nameOrField }
+    }
+
+    private fun searchError(
+        msg: WireMessage.Search,
+        error: String,
+        errorCode: String?,
+    ): WireMessage.SearchResult =
+        WireMessage.SearchResult(
+            header(msg.header.correlationId, WireMessageType.SEARCH_RESULT),
+            namespace = msg.namespace,
+            hits = emptyList(),
+            resolvedCommitHex = "",
+            error = error,
+            errorCode = errorCode,
         )
 
     private fun sessionBeginAuthError(

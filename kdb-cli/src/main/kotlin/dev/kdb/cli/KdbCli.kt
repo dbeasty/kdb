@@ -32,7 +32,8 @@ private fun printUsage() {
 
         Commands:
           init <namespace>
-          put <namespace> <file|json>
+          put <namespace> <file|json>   stored byte-exact; a top-level "id" (UUID or any
+                                        other non-empty string) is the document identity
           get <namespace> <docId>
           query <namespace> <sql>
           log <namespace>

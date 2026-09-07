@@ -123,7 +123,7 @@ class Layer5SqlIntegrationTest {
             for (query in listOf(
                 "SELECT COUNT(*) FROM users LIMIT 1",
                 "SELECT COUNT(*) FROM users LIMIT 2",
-                "SELECT COUNT(*) FROM users LIMIT 3 OFFSET 1",
+                "SELECT COUNT(*) FROM users LIMIT 3 OFFSET 0",
             )) {
                 val limited = fx.engine.execute(query, ctx)
                 assertEquals(
@@ -132,6 +132,10 @@ class Layer5SqlIntegrationTest {
                     "$query truncated the aggregate's input",
                 )
             }
+            // Layer 16 §5: LIMIT/OFFSET bound the aggregate's *output* rows, so skipping past the
+            // single COUNT row legitimately yields no rows (it used to be ignored entirely).
+            val skipped = fx.engine.execute("SELECT COUNT(*) FROM users LIMIT 3 OFFSET 1", ctx)
+            assertEquals(0, skipped.rows.size)
         }
 
     /**

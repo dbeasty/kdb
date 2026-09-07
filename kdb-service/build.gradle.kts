@@ -12,6 +12,7 @@ dependencies {
     implementation(project(":kdb-embed"))
     implementation(project(":kdb-server"))
     implementation(project(":kdb-jdbc"))
+    implementation(project(":kdb-namespace-policy"))
     implementation(project(":kdb-peer-sync"))
     implementation(project(":kdb-stream"))
     implementation(project(":kdb-dag"))

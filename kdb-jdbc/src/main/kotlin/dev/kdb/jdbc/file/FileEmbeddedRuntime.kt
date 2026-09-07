@@ -2,8 +2,10 @@ package dev.kdb.jdbc.file
 
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.inMemoryCommitDag
+import dev.kdb.index.IndexCatalog
 import dev.kdb.index.compositeIndexStoreFactory
 import dev.kdb.index.productionIndexManager
+import dev.kdb.index.storageAdapterIndexBlobStore
 import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.policy.inMemoryNamespacePolicyRegistry
 import dev.kdb.query.hybrid.hybridQueryEngine
@@ -64,28 +66,42 @@ public fun openFileRuntime(
             DeltaCommitPersistence(namespaceId, deltaWriter),
         )
     val storage = handle.adapter
-    val indexManager = productionIndexManager(dag, storage)
+    // Layer 16 §6.5/§9.2: one blob store shared by the manager (catalog) and the store factory
+    // (snapshots), with pointers that survive a restart - otherwise the snapshot bytes are on disk
+    // under a name nothing can resolve, and every index is silently rebuilt by scan on each open.
+    val blobs =
+        storageAdapterIndexBlobStore(
+            storage,
+            FileIndexBlobPointers(NamespacePaths.indexPointersFile(dataRoot, namespaceId)),
+        )
+    val storeFactory = compositeIndexStoreFactory(dag, storage, blobs = blobs)
+    val indexManager = productionIndexManager(dag, storage, blobs = blobs)
     runBlocking {
         indexManager.bindNamespace(namespaceId, dag)
+        val registry = indexManager.registryFor(namespaceId)
+        // Recreate the indexes this namespace had before the restart, then restore each snapshot -
+        // a missing or stale one rebuilds from a scan at head (§6.5, §10).
+        IndexCatalog.load(blobs, namespaceId)?.let { registry.loadCatalog(it, storeFactory) }
+        registry.restoreOrRebuild(dag, storage)
         if (!schema.isNone) {
-            indexManager.registryFor(namespaceId).syncSchema(
+            registry.syncSchema(
                 KdbSchema.NONE,
                 schema,
-                compositeIndexStoreFactory(dag, storage),
+                storeFactory,
                 dag,
                 storage,
             )
             indexManager.writer.rebuildAll(
                 dag.head(),
                 dag,
-                indexManager.registryFor(namespaceId),
+                registry,
                 storage,
                 schema,
             )
         }
     }
     val policies = inMemoryNamespacePolicyRegistry()
-    val sql = sqlEngine(indexManager, storage, dag)
+    val sql = sqlEngine(indexManager, storage, dag, indexStoreFactory = storeFactory)
     val hybrid = hybridQueryEngine(sql, dag, policies, indexManager, storage)
     return EmbeddedKdbRuntime(
         catalog = catalog,
@@ -96,5 +112,7 @@ public fun openFileRuntime(
         schema = schema,
         defaultNamespace = namespaceId,
         policyRegistry = policies,
+        indexBlobs = blobs,
+        indexStoreFactory = storeFactory,
     )
 }

@@ -45,10 +45,17 @@ public interface TransactionEngine {
     ): List<OperationViolation>
 }
 
+/**
+ * [uniqueKeys] (Layer 16 §9.6): when non-null, every commit/replay plans its unique-constraint effect
+ * against this registry and rejects violations as [TransactionResult.SchemaError] with
+ * [dev.kdb.error.ViolationType.UNIQUE_CONSTRAINT]; the registry is updated only once the commit is in
+ * the DAG, and rebuilt when a commit changes the schema. Null keeps the pre-Layer-16 behaviour.
+ */
 public fun transactionEngine(
     conflictPolicy: ConflictPolicy,
     customResolver: ConflictResolver? = null,
-): TransactionEngine = DefaultTransactionEngine(conflictPolicy, customResolver)
+    uniqueKeys: UniqueKeyRegistry? = null,
+): TransactionEngine = DefaultTransactionEngine(conflictPolicy, customResolver, uniqueKeys)
 
 public suspend fun transactionBuilder(
     namespaceId: String,

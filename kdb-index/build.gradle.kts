@@ -40,6 +40,10 @@ kotlin {
             implementation(libs.kotlin.test)
             // The engine's whole API is suspending, so its tests need runTest.
             implementation(libs.kotlinx.coroutines.test)
+            implementation(project(":kdb-json"))
+            implementation(project(":kdb-document"))
+            implementation(project(":kdb-storage"))
+            implementation(project(":kdb-dag"))
         }
     }
 }

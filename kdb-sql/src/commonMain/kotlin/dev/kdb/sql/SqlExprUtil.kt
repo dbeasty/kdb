@@ -6,10 +6,12 @@ internal fun maxParameterIndex(expr: SqlExpr?): Int {
         is SqlExpr.Parameter -> expr.index
         is SqlExpr.Literal,
         is SqlExpr.ColumnRef,
-        is SqlExpr.Match,
+        is SqlExpr.VectorLiteral,
         -> -1
+        is SqlExpr.Match -> maxParameterIndex(expr.query)
         is SqlExpr.Between -> maxOf(maxParameterIndex(expr.low), maxParameterIndex(expr.high))
-        is SqlExpr.Similarity -> -1
+        is SqlExpr.Similarity -> maxParameterIndex(expr.vector)
+        is SqlExpr.Fuse -> expr.arms.maxOfOrNull { maxParameterIndex(it) } ?: -1
         is SqlExpr.InList -> expr.values.maxOfOrNull { maxParameterIndex(it) } ?: -1
         is SqlExpr.QualifiedColumn -> -1
         is SqlExpr.Binary ->

@@ -15,7 +15,7 @@ private const val MAX_CONFLICT_RETRY_MS = 250
  *
  * An optimistic-concurrency conflict means some other writer landed on the same document between
  * the time this caller resolved its base version and the time its commit reached the front of
- * [KdbServerRuntime.writeCoordinator]. Two facts about that are the server's alone to know, and
+ * [KdbServerRuntime.writeCoordinatorFor] (Component 73: one gate per namespace, so a busy namespace never inflates another's hint). Two facts about that are the server's alone to know, and
  * neither is available to the client:
  *
  * - How many writers are queued ([WriteCoordinator.queueDepth]). This is the staleness window: a
@@ -34,9 +34,10 @@ private const val MAX_CONFLICT_RETRY_MS = 250
  * the floor: a small, jittered, non-zero pause - still strictly better than the immediate retry
  * that was the only option before this existed.
  */
-public fun KdbServerRuntime.conflictRetryAfterMs(): Int {
-    val depth = writeCoordinator.queueDepth().coerceAtLeast(1)
-    val drainMs = depth * writeCoordinator.meanServiceTime().inWholeMilliseconds
+public fun KdbServerRuntime.conflictRetryAfterMs(namespaceId: String = runtime.defaultNamespace): Int {
+    val coordinator = writeCoordinatorFor(namespaceId)
+    val depth = coordinator.queueDepth().coerceAtLeast(1)
+    val drainMs = depth * coordinator.meanServiceTime().inWholeMilliseconds
     var ceiling = drainMs.coerceAtMost(MAX_CONFLICT_RETRY_MS.toLong()).toInt()
     if (ceiling <= MIN_CONFLICT_RETRY_MS) ceiling = MIN_CONFLICT_RETRY_MS
     return MIN_CONFLICT_RETRY_MS + Random.nextInt(ceiling - MIN_CONFLICT_RETRY_MS + 1)

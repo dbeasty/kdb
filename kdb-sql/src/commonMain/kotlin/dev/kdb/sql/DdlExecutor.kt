@@ -5,6 +5,7 @@ import dev.kdb.index.IndexManager
 import dev.kdb.index.IndexStoreFactory
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.SchemaField
+import dev.kdb.schema.UniqueConstraint
 import dev.kdb.schema.isNone
 import dev.kdb.storage.StorageAdapter
 
@@ -27,10 +28,17 @@ internal class DdlExecutor(
                     name = col.name,
                     type = col.type,
                     required = col.required,
-                    indexed = col.indexed,
+                    indexed = col.indexed || col.unique,
+                    unique = col.unique,
                 )
             }
-        return applySchema(context.namespaceId, KdbSchema.NONE, KdbSchema.build(fields))
+        val schema =
+            try {
+                KdbSchema.build(fields, uniqueConstraints = ddl.uniqueConstraints.map { UniqueConstraint(it) })
+            } catch (e: IllegalArgumentException) {
+                throw SqlPlanningException("CREATE TABLE: ${e.message}", ddl.table.name)
+            }
+        return applySchema(context.namespaceId, KdbSchema.NONE, schema)
     }
 
     suspend fun executeAlterTableAddColumn(
@@ -49,12 +57,17 @@ internal class DdlExecutor(
                     name = ddl.column.name,
                     type = ddl.column.type,
                     required = ddl.column.required,
-                    indexed = ddl.column.indexed,
+                    indexed = ddl.column.indexed || ddl.column.unique,
+                    unique = ddl.column.unique,
                 )
         return applySchema(
             context.namespaceId,
             context.schema,
-            KdbSchema.build(fields, version = context.schema.version + 1),
+            KdbSchema.build(
+                fields,
+                version = context.schema.version + 1,
+                uniqueConstraints = context.schema.uniqueConstraints,
+            ),
         )
     }
 

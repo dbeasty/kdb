@@ -46,6 +46,10 @@ public enum class WireMessageType(public val code: Short) {
     DOCUMENT_GET_RESULT(0x15),
     UPSERT(0x16),
     UPSERT_RESULT(0x17),
+
+    // Layer 16 Component 68 hybrid search (0x18..0x1C are Go's CommitPushAck and lock ops).
+    SEARCH(0x1D),
+    SEARCH_RESULT(0x1E),
     ;
 
     public companion object {
@@ -349,6 +353,60 @@ public sealed class WireMessage {
         val readOnly: Boolean,
         val error: String? = null,
         val generatedIds: List<String> = emptyList(),
+        // Additive to error, like UpsertResult/DocumentGetResult - Go's SqlResultMessage has carried
+        // these since Component 51. Layer 16 §9.6 populates UNIQUE_VIOLATION / SCHEMA_VIOLATION here.
+        val errorCode: String? = null,
+        val retryAfterMs: Int? = null,
+    ) : WireMessage()
+
+    /** One lexical arm of a SEARCH (Layer 16 §11): [index] is a FULLTEXT index name or the first field
+     * of one. [depth] 0/null = every hit; [minScore]/[weight] feed rank fusion (§8). */
+    public data class SearchTextArm(
+        val index: String,
+        val query: String,
+        val depth: Int? = null,
+        val minScore: Float? = null,
+        val weight: Double? = null,
+    )
+
+    /** One vector arm of a SEARCH: [index] is a VECTOR index name or its field. */
+    public data class SearchVectorArm(
+        val index: String,
+        val vector: List<Double>,
+        val depth: Int? = null,
+        val minScore: Float? = null,
+        val weight: Double? = null,
+    )
+
+    // Layer 16 Component 68 (§11): sessionless like DocumentGet, authorized as DocumentRead on the
+    // namespace. With one arm the result is that arm's ranking; with both, the fused ranking.
+    public data class Search(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String? = null,
+        val text: SearchTextArm? = null,
+        val vector: SearchVectorArm? = null,
+        /** "rrf" (default) or "weighted". */
+        val fusion: String? = null,
+        val limit: Int,
+        val includeJson: Boolean = false,
+        val atCommitHex: String? = null,
+    ) : WireMessage()
+
+    public data class SearchHit(
+        val docId: String,
+        val score: Float,
+        val json: String? = null,
+    )
+
+    public data class SearchResult(
+        override val header: WireHeader,
+        val namespace: String,
+        val hits: List<SearchHit>,
+        val resolvedCommitHex: String,
+        val error: String? = null,
+        val errorCode: String? = null,
+        val retryAfterMs: Int? = null,
     ) : WireMessage()
 
     public data class TxCommit(

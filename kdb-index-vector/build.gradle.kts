@@ -25,11 +25,18 @@ kotlin {
             implementation(project(":kdb-dag"))
             implementation(project(":kdb-storage"))
             implementation(project(":kdb-error"))
+            implementation(project(":kdb-json"))
+            implementation(project(":kdb-document"))
             implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(project(":kdb-dag"))
+            implementation(project(":kdb-storage"))
+            implementation(project(":kdb-json"))
+            implementation(project(":kdb-document"))
+            // The store's API is suspending; fixture parity tests need an in-memory storage adapter.
+            implementation(libs.kotlinx.coroutines.test)
         }
     }
 }

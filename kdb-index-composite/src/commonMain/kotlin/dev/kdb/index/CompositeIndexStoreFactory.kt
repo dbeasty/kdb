@@ -9,6 +9,11 @@ import dev.kdb.storage.StorageAdapter
 
 /**
  * Production [IndexStoreFactory] wiring Layer 5 index implementations (Component 12–14).
+ *
+ * [vectorDimensions] is only the fallback: a VECTOR descriptor's `dimensions` / `metric` / `m` /
+ * `ef_construction` / `ef_search` options override it (Layer 16 §7, §9.2). FULLTEXT and VECTOR
+ * stores persist their snapshots through [blobs]; share one [IndexBlobStore] between this
+ * factory and [indexManager] so the catalog and the snapshots land in the same place.
  */
 public class CompositeIndexStoreFactory(
     dag: CommitDag,
@@ -16,8 +21,9 @@ public class CompositeIndexStoreFactory(
     private val vectorDimensions: Int = 128,
     private val hashFactory: IndexStoreFactory = hashIndexStoreFactory(dag, storage),
     private val btreeFactory: IndexStoreFactory = btreeIndexStoreFactory(dag, storage),
-    private val fullTextFactory: IndexStoreFactory = fullTextIndexStoreFactory(dag, storage),
-    private val vectorFactory: IndexStoreFactory = vectorIndexStoreFactory(dag, storage, vectorDimensions),
+    blobs: IndexBlobStore = storageAdapterIndexBlobStore(storage),
+    private val fullTextFactory: IndexStoreFactory = fullTextIndexStoreFactory(dag, storage, blobs),
+    private val vectorFactory: IndexStoreFactory = vectorIndexStoreFactory(dag, storage, vectorDimensions, blobs = blobs),
 ) : IndexStoreFactory {
 
     override fun create(descriptor: IndexDescriptor): IndexStore =
@@ -33,4 +39,5 @@ public fun compositeIndexStoreFactory(
     dag: CommitDag,
     storage: StorageAdapter,
     vectorDimensions: Int = 128,
-): IndexStoreFactory = CompositeIndexStoreFactory(dag, storage, vectorDimensions)
+    blobs: IndexBlobStore = storageAdapterIndexBlobStore(storage),
+): IndexStoreFactory = CompositeIndexStoreFactory(dag, storage, vectorDimensions, blobs = blobs)

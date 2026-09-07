@@ -23,6 +23,10 @@ public data class FusionArm(
     val minScore: Float? = null,
 )
 
+/**
+ * Fuses [arms] under [mode] (§8). Per arm: drop results below [FusionArm.minScore], truncate to
+ * [FusionArm.depth], then contribute. A [limit] of 0 or less returns every fused result.
+ */
 public fun fuseRankings(
     arms: List<FusionArm>,
     mode: FusionMode = FusionMode.RRF,
@@ -46,8 +50,16 @@ public fun fuseRankings(
                 if (list.isEmpty()) continue
                 val lo = list.minOf { it.score }
                 val hi = list.maxOf { it.score }
+                // Normalise in Double from the Float inputs, rounding to Float once at the very
+                // end: subtracting in Float and widening afterwards loses exactly the precision
+                // the fixtures' 1e-9 tolerance needs.
                 for (r in list) {
-                    val norm = if (hi > lo) (r.score - lo).toDouble() / (hi - lo).toDouble() else 1.0
+                    val norm =
+                        if (hi > lo) {
+                            (r.score.toDouble() - lo.toDouble()) / (hi.toDouble() - lo.toDouble())
+                        } else {
+                            1.0
+                        }
                     bump(r.docId, w * norm)
                 }
             }
@@ -56,5 +68,7 @@ public fun fuseRankings(
     return scores.entries
         .map { RankedResult(it.key, it.value.toFloat()) }
         .sortedWith(compareByDescending<RankedResult> { it.score }.thenBy { it.docId.toString() })
-        .let { if (it.size > limit) it.take(limit) else it }
+        // limit <= 0 means "every result", matching Go's Fuse; taken literally, take(0) returned
+        // nothing at all for the caller who meant "unbounded".
+        .let { if (limit > 0 && it.size > limit) it.take(limit) else it }
 }
