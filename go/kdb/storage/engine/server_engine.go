@@ -68,7 +68,16 @@ type ServerEngine struct {
 	treeChain   map[codec.Hash]int
 	// replaying is set while this engine is being rebuilt from the delta
 	// log rather than taking new writes - see SetReplaying.
-	replaying        atomic.Bool
+	replaying atomic.Bool
+	// frameReader follows a document location record back into the delta
+	// log. Read on the cold path only, hence atomic rather than a lock.
+	frameReader atomic.Pointer[commitFrameReader]
+	// pendingLocations holds the content hashes a commit tree produced,
+	// keyed by that tree's hash, waiting for the log to report where the
+	// commit naming it landed. See RecordCommitLocation.
+	pendingMu        sync.Mutex
+	pendingLocations map[codec.Hash][]TreeChange
+	pendingOrder     []codec.Hash
 	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
@@ -586,7 +595,6 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 			return document.DocumentTree{}, err
 		}
 		changed = append(changed, TreeChange{DocID: doc.ID, ContentHash: h})
-		e.putDocumentObject(h, doc)
 		prev, hadPrev := e.tree.HashFor(doc.ID)
 		// Pin before Put, never after: Put evicts to stay within budget as
 		// part of the insert, so a version pinned afterwards can already be
@@ -615,6 +623,9 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 	if len(changed) > 0 || len(deletes) > 0 {
 		e.putTreeObject(baseTree, e.tree, changed, deletes)
 	}
+	// Hold the content hashes until the log says where the commit that
+	// names this tree landed; only then is there a location to record.
+	e.stashPendingLocations(e.tree.TreeHash, changed)
 	e.treesMu.Lock()
 	e.publishTreeLocked(e.tree)
 	e.treesMu.Unlock()
@@ -702,6 +713,16 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 		// unbounded, because for them memory is the only tier there is.
 		loader := newDeltaColdLoader(reader)
 		eng.SetColdLoader(loader.load, storage.ResolvedDocumentCacheBytes(config))
+		// The fast path for an evicted version: a location record says
+		// which frame holds it, and this reads that frame. The scanning
+		// loader above stays as the fallback for versions with no location
+		// recorded - written before this existed, or by a process that died
+		// between appending the commit and filing the position.
+		eng.SetCommitFrameReader(func(seq, offset int64) (document.Commit, error) {
+			return reader.ReadCommitAt(storage.DeltaSegmentRef{
+				NamespaceID: namespaceID, SequenceNumber: seq,
+			}, offset)
+		})
 	}
 	return &defaultHandle{
 		namespaceID: namespaceID,

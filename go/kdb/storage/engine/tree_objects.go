@@ -48,6 +48,17 @@ func (e *ServerEngine) HistoryStrategy() storage.HistoryStrategy {
 // would cost more than rewriting it. Resolution walks back to the nearest
 // full object and applies forward, bounded by treeChainLimit.
 
+// documentLocationTag marks an object-store record as a pointer into the
+// delta log rather than a tree object. Both are keyed by a hash and share
+// the store, so the first byte says which is which; a tree object's first
+// byte is treeObjectVersion, and decodeTreeObject rejects anything else.
+const documentLocationTag = 2
+
+// documentLocationBytes is the whole record: tag, segment sequence, frame
+// offset. Seventeen bytes to locate a document version, against a second
+// copy of the version's text, which is the entire point of it.
+const documentLocationBytes = 1 + 8 + 8
+
 const (
 	treeObjectVersion  = 1
 	treeObjectKindFull = 0
@@ -221,27 +232,48 @@ func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document
 	e.treeChainMu.Unlock()
 }
 
-// putDocumentObject stores one document version under its content hash,
-// making it addressable the way a git blob is.
+// putDocumentLocation records where in the delta log a document version
+// lives, under that version's content hash.
 //
-// Only under the objects strategy, and it is the other half of what that
-// strategy buys. Resolving a historical read through tree objects gets as
-// far as "this commit's tree says document D had content hash H" and then
-// has to find H's bytes; without an object for H the only place they exist
-// is the delta log, and finding them there means scanning it - the same
-// full pass the tree objects were meant to remove, one level down.
+// This is the other half of what the objects strategy buys. Resolving a
+// historical read through tree objects gets as far as "this commit's tree
+// says document D had content hash H", and then has to find H's bytes.
+// Without something addressed by H the only place they exist is the delta
+// log, and finding them there means scanning it - the same full pass the
+// tree objects were meant to remove, one level down.
 //
-// The cost is that a version's text is on disk twice, in the log and here.
-// That is the trade the objects strategy makes, and the reason replay
-// still exists for deployments that would rather not make it.
-func (e *ServerEngine) putDocumentObject(contentHash codec.Hash, doc document.Document) {
+// What is stored is a pointer, not the bytes. Storing the bytes worked and
+// was what this did first, but it put every version's text on disk twice,
+// in the log and here. The log is the journal: it is what a repair reads,
+// what a peer receives, and the thing every other copy would have to be
+// reconciled against. So the version stays there once, and this says where
+// - seventeen bytes against a duplicate of the document.
+//
+// Nothing here is load-bearing for correctness. A missing or unreadable
+// location costs a scan (see ServerEngine.loadCold), never an answer.
+func (e *ServerEngine) putDocumentLocation(contentHash codec.Hash, segmentSeq, frameOffset int64) {
 	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
 		return
 	}
 	if e.skipExistingObject(contentHash) {
 		return
 	}
-	e.memTable.Put(contentHash, []byte(doc.JSON))
+	e.memTable.Put(contentHash, encodeDocumentLocation(segmentSeq, frameOffset))
+}
+
+func encodeDocumentLocation(segmentSeq, frameOffset int64) []byte {
+	b := make([]byte, documentLocationBytes)
+	b[0] = documentLocationTag
+	binary.BigEndian.PutUint64(b[1:], uint64(segmentSeq))
+	binary.BigEndian.PutUint64(b[9:], uint64(frameOffset))
+	return b
+}
+
+func decodeDocumentLocation(b []byte) (segmentSeq, frameOffset int64, ok bool) {
+	if len(b) != documentLocationBytes || b[0] != documentLocationTag {
+		return 0, 0, false
+	}
+	return int64(binary.BigEndian.Uint64(b[1:])), int64(binary.BigEndian.Uint64(b[9:])), true
 }
 
 // skipExistingObject reports an object that is already stored and need not
@@ -266,7 +298,17 @@ func (e *ServerEngine) skipExistingObject(h codec.Hash) bool {
 // and happens at open, before the runtime is handed to anyone.
 func (e *ServerEngine) SetReplaying(v bool) { e.replaying.Store(v) }
 
-// documentFromObject returns a version's bytes from the object store.
+// documentFromObject resolves a version through the object store.
+//
+// Two record shapes are accepted. A location record points into the delta
+// log and is read from there. Anything else is treated as the version's own
+// text, which is what this store held before locations replaced them - a
+// namespace written by an earlier build keeps resolving at full speed
+// instead of falling back to a scan.
+//
+// Either way the result is checked against the content hash it was filed
+// under. Content addressing makes that exact, and it is what lets every
+// failure here be a miss rather than a wrong answer.
 func (e *ServerEngine) documentFromObject(docID codec.UUID, contentHash codec.Hash) (document.Document, bool) {
 	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
 		return document.Document{}, false
@@ -275,21 +317,66 @@ func (e *ServerEngine) documentFromObject(docID codec.UUID, contentHash codec.Ha
 	if raw == nil {
 		return document.Document{}, false
 	}
-	doc := documentFromPatch(docID, string(raw))
-	// Content-addressed, so this is exact: bytes that do not hash to the
-	// key they were filed under are not the version being asked for.
+	if seq, offset, ok := decodeDocumentLocation(raw); ok {
+		return e.documentFromLog(docID, contentHash, seq, offset)
+	}
+	return verifiedDocument(docID, string(raw), contentHash)
+}
+
+// documentFromLog reads the frame a location record points at and picks
+// the version out of it.
+func (e *ServerEngine) documentFromLog(docID codec.UUID, contentHash codec.Hash, segmentSeq, frameOffset int64) (document.Document, bool) {
+	reader := e.frameReader.Load()
+	if reader == nil {
+		return document.Document{}, false
+	}
+	commit, err := (*reader)(segmentSeq, frameOffset)
+	if err != nil {
+		return document.Document{}, false
+	}
+	for _, op := range commit.Operations {
+		w, isWrite := op.(document.WriteOp)
+		if !isWrite || w.DocID != docID {
+			continue
+		}
+		// A frame holds a whole commit, which can write the same document
+		// more than once and several documents besides; only the operation
+		// whose content actually matches is the version being asked for.
+		if doc, ok := verifiedDocument(docID, w.Patch, contentHash); ok {
+			return doc, true
+		}
+	}
+	return document.Document{}, false
+}
+
+func verifiedDocument(docID codec.UUID, text string, want codec.Hash) (document.Document, bool) {
+	doc := documentFromPatch(docID, text)
 	h, err := doc.ContentHash()
-	if err != nil || h != contentHash {
+	if err != nil || h != want {
 		return document.Document{}, false
 	}
 	return doc, true
 }
 
-// RecordDocumentObject stores one historical version as an object - the
-// migration's counterpart to putDocumentObject, for versions written
+// commitFrameReader reads the commit framed at one place in the delta log.
+type commitFrameReader func(segmentSeq, frameOffset int64) (document.Commit, error)
+
+// SetCommitFrameReader installs the reader that follows a document
+// location record back to the journal. Without one, location records
+// resolve to nothing and reads fall through to the scanning loader.
+func (e *ServerEngine) SetCommitFrameReader(fn commitFrameReader) {
+	if fn == nil {
+		e.frameReader.Store(nil)
+		return
+	}
+	e.frameReader.Store(&fn)
+}
+
+// RecordDocumentLocation records where a historical version lives - the
+// migration's counterpart to putDocumentLocation, for versions written
 // before the namespace used this strategy.
-func (e *ServerEngine) RecordDocumentObject(contentHash codec.Hash, doc document.Document) {
-	e.putDocumentObject(contentHash, doc)
+func (e *ServerEngine) RecordDocumentLocation(contentHash codec.Hash, segmentSeq, frameOffset int64) {
+	e.putDocumentLocation(contentHash, segmentSeq, frameOffset)
 }
 
 // RecordTreeObject records the tree that results from applying puts and
@@ -372,4 +459,66 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 		return document.DocumentTree{}, false
 	}
 	return tree, true
+}
+
+// maxPendingLocationTrees bounds how many commits' worth of content hashes
+// wait for their log position.
+//
+// Ordinarily one: a commit is appended to the log immediately after its
+// tree is built, and the batch that writes it reports back. The bound is
+// for the cases where that never happens - memory-only durability, a
+// namespace whose writes are never persisted, a batch that fails - where
+// without it this would grow with every write. Dropping the oldest costs
+// a scan on a later cold read, never an answer.
+const maxPendingLocationTrees = 256
+
+func (e *ServerEngine) stashPendingLocations(treeHash codec.Hash, changed []TreeChange) {
+	if e.config.HistoryStrategy != storage.HistoryStrategyObjects || len(changed) == 0 {
+		return
+	}
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	if e.pendingLocations == nil {
+		e.pendingLocations = make(map[codec.Hash][]TreeChange)
+	}
+	if _, seen := e.pendingLocations[treeHash]; !seen {
+		e.pendingOrder = append(e.pendingOrder, treeHash)
+	}
+	e.pendingLocations[treeHash] = changed
+	for len(e.pendingOrder) > maxPendingLocationTrees {
+		delete(e.pendingLocations, e.pendingOrder[0])
+		e.pendingOrder = e.pendingOrder[1:]
+	}
+}
+
+// RecordCommitLocation is told where in the delta log the commit naming
+// treeHash was written, and files that position under the content hash of
+// every version the commit wrote.
+//
+// Called after the append, because that is when there is a position to
+// record. A commit whose stashed hashes have already been dropped, or that
+// was never stashed, records nothing - the index is an optimisation, and
+// its absence costs a scan rather than an answer.
+func (e *ServerEngine) RecordCommitLocation(treeHash codec.Hash, segmentSeq, frameOffset int64) {
+	if e.config.HistoryStrategy != storage.HistoryStrategyObjects {
+		return
+	}
+	e.pendingMu.Lock()
+	changed, ok := e.pendingLocations[treeHash]
+	if ok {
+		delete(e.pendingLocations, treeHash)
+		for i, h := range e.pendingOrder {
+			if h == treeHash {
+				e.pendingOrder = append(e.pendingOrder[:i], e.pendingOrder[i+1:]...)
+				break
+			}
+		}
+	}
+	e.pendingMu.Unlock()
+	if !ok {
+		return
+	}
+	for _, c := range changed {
+		e.putDocumentLocation(c.ContentHash, segmentSeq, frameOffset)
+	}
 }
