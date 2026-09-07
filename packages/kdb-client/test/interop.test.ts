@@ -256,7 +256,10 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
       "SELECT FROM players",
       "",
       "DROP TABLE players",
-      "SELECT 1 GARBAGE",
+      // Was "SELECT 1 GARBAGE", which Layer 16 made legal: the server's parser gained implicit
+      // aliases, so that reads as `SELECT 1 AS GARBAGE`, exactly as Postgres and MySQL parse
+      // it. Replaced with input that is still genuinely malformed.
+      "SELECT 1 GARBAGE GARBAGE",
     ]) {
       await assert.rejects(client.queryRaw(NS, sql), `expected ${JSON.stringify(sql)} to fail`);
     }
