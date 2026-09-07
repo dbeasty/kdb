@@ -62,13 +62,11 @@ type InMemoryCommitDag struct {
 
 	mu      sync.RWMutex
 	commits map[codec.Hash]document.Commit
-	// treeToCommit answers "which commit produced this tree", which the
-	// replay strategy's tree rebuild needs as its starting point. Keyed the
-	// other way round from everything else here, and small next to the
-	// commits themselves - two hashes per commit against the commit's own
-	// operations and metadata.
-	treeToCommit map[codec.Hash]codec.Hash
-	stubs        map[codec.Hash]document.CommitStub
+	// treeIndex answers "which commit produced this tree". Nil until the
+	// first CommitForTree call builds it, and maintained from then on - see
+	// CommitForTree for why it is not maintained from the start.
+	treeIndex map[codec.Hash]codec.Hash
+	stubs     map[codec.Hash]document.CommitStub
 	// trees is this DAG's own tree store, used only when no external one
 	// has been installed - see SetTreeStore. In the assembled engine there
 	// is always an external one and this map stays empty.
@@ -81,7 +79,6 @@ type InMemoryCommitDag struct {
 	treeStore DocumentTreeStore
 	branches  map[string]document.Branch
 	tags      map[string]document.Tag
-	hexSorted []string
 	// txIndex maps a transaction id to the commit it produced, so idempotent-retry detection
 	// (GetCommitByTransactionID, used by transaction.Engine's findExistingCommit) is O(1)
 	// instead of walking history. See GetCommitByTransactionID's own doc comment for why this
@@ -173,15 +170,14 @@ func (d *InMemoryCommitDag) AncestryVersion() uint64 {
 // NewInMemoryCommitDag creates a DAG with genesis commit and main branch.
 func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	d := &InMemoryCommitDag{
-		NamespaceID:  namespaceID,
-		commits:      make(map[codec.Hash]document.Commit),
-		stubs:        make(map[codec.Hash]document.CommitStub),
-		treeToCommit: make(map[codec.Hash]codec.Hash),
-		trees:        make(map[codec.Hash]document.DocumentTree),
-		branches:     make(map[string]document.Branch),
-		tags:         make(map[string]document.Tag),
-		txIndex:      make(map[codec.UUID]codec.Hash),
-		pins:         make(map[codec.Hash]int),
+		NamespaceID: namespaceID,
+		commits:     make(map[codec.Hash]document.Commit),
+		stubs:       make(map[codec.Hash]document.CommitStub),
+		trees:       make(map[codec.Hash]document.DocumentTree),
+		branches:    make(map[string]document.Branch),
+		tags:        make(map[string]document.Tag),
+		txIndex:     make(map[codec.UUID]codec.Hash),
+		pins:        make(map[codec.Hash]int),
 	}
 	empty := document.EmptyDocumentTree()
 	d.trees[empty.TreeHash] = empty
@@ -197,7 +193,6 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 		return nil, err
 	}
 	d.commits[genesis.Hash] = genesis
-	d.insertHex(genesis.Hash.Hex())
 	d.txIndex[genesis.TransactionID] = genesis.Hash
 	now := codec.TimestampNow()
 	d.branches[mainBranch] = document.Branch{
@@ -210,37 +205,26 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	return d, nil
 }
 
-func (d *InMemoryCommitDag) insertHex(hexLower string) {
-	hex := strings.ToLower(hexLower)
-	i := sort.SearchStrings(d.hexSorted, hex)
-	if i < len(d.hexSorted) && d.hexSorted[i] == hex {
-		return
-	}
-	d.hexSorted = append(d.hexSorted, hex)
-	copy(d.hexSorted[i+1:], d.hexSorted[i:])
-	d.hexSorted[i] = hex
-}
-
-func (d *InMemoryCommitDag) removeHex(hexLower string) {
-	hex := strings.ToLower(hexLower)
-	i := sort.SearchStrings(d.hexSorted, hex)
-	if i < len(d.hexSorted) && d.hexSorted[i] == hex {
-		d.hexSorted = append(d.hexSorted[:i], d.hexSorted[i+1:]...)
-	}
-}
-
 // LookupHashPrefix returns hashes whose hex starts with prefix (lowercase).
+//
+// Scans the graph. It used to read a sorted []string of every commit's hex
+// maintained alongside the commits themselves, which cost about 96 bytes
+// per commit to hold and, because each insert placed its entry with a
+// copy, made building a graph of n commits O(n²). The sort bought nothing
+// even so: this scanned that slice linearly rather than searching it. A
+// prefix lookup is a human typing a short hash at a CLI, so it can afford
+// to walk what is already here.
 func (d *InMemoryCommitDag) LookupHashPrefix(hexPrefixLower string) []codec.Hash {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	p := strings.ToLower(hexPrefixLower)
 	var out []codec.Hash
-	for _, h := range d.hexSorted {
-		if strings.HasPrefix(h, p) {
-			hash, _ := codec.HashFromHex(h)
-			out = append(out, hash)
+	for h := range d.commits {
+		if strings.HasPrefix(h.Hex(), p) {
+			out = append(out, h)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Hex() < out[j].Hex() })
 	return out
 }
 
@@ -343,17 +327,14 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 		}
 	}
 	d.commits[commit.Hash] = commit
-	if d.treeToCommit == nil {
-		d.treeToCommit = make(map[codec.Hash]codec.Hash)
-	}
-	// First writer wins: several commits can name the same tree (a commit
-	// that changes nothing, a revert back to an earlier state), and any of
-	// them reconstructs it, so there is no reason to prefer a later one.
-	if _, seen := d.treeToCommit[commit.DocumentTreeHash]; !seen {
-		d.treeToCommit[commit.DocumentTreeHash] = commit.Hash
+	if d.treeIndex != nil {
+		// Only once something has asked. First writer wins: several commits
+		// can name the same tree and any of them reconstructs it.
+		if _, seen := d.treeIndex[commit.DocumentTreeHash]; !seen {
+			d.treeIndex[commit.DocumentTreeHash] = commit.Hash
+		}
 	}
 	d.trackOpsLocked(commit)
-	d.insertHex(commit.Hash.Hex())
 	d.ancestryVersion++
 	// Only the first commit for a given transaction id is indexed - a caller retrying the same
 	// transaction always expects to find that original result, not a later, unrelated commit
@@ -400,7 +381,6 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 		return document.CommitStub{}, err
 	}
 	delete(d.commits, hash)
-	d.removeHex(hash.Hex())
 	d.ancestryVersion++
 	stub := document.CommitStub{
 		OriginalHash: hash, ArchiveLocation: archiveLocation, StubbedAt: codec.TimestampNow(),
@@ -793,10 +773,8 @@ func (d *InMemoryCommitDag) Squash(
 	for _, h := range squashHashes {
 		delete(d.commits, h)
 		delete(d.stubs, h)
-		d.removeHex(h.Hex())
 	}
 	d.commits[synthetic.Hash] = synthetic
-	d.insertHex(synthetic.Hash.Hex())
 	d.ancestryVersion++
 	// Squash refuses to run with a branch head inside the window, so the head's commit
 	// survives; republish regardless, since the check above is the only thing guaranteeing
@@ -818,12 +796,31 @@ func (d *InMemoryCommitDag) requireCommitPresentLocked(hash codec.Hash) error {
 //
 // The tree rebuild path needs somewhere to start: given a tree hash it has
 // to find the commit that made it before it can walk that commit's
-// ancestry. Several commits may name the same tree; any of them
-// reconstructs it, so the first one recorded is returned.
+// ancestry. Several commits may name the same tree - a commit that changed
+// nothing, a revert back to an earlier state - and any of them
+// reconstructs it, so any match will do.
+//
+// The index behind it is built on first use and maintained from then on,
+// never before. Maintained from the start it cost 81 bytes per commit for
+// the life of every namespace, to serve a lookup that only the replay
+// strategy's rebuild path ever makes - so a namespace on the objects
+// strategy, which is the default, paid for it and never asked it anything.
+//
+// Built rather than scanned per call because the caller is a history walk:
+// scanning would be O(commits) per miss and O(commits squared) across the
+// walk, which is the exact shape the rebuild path was rewritten to avoid.
 func (d *InMemoryCommitDag) CommitForTree(treeHash codec.Hash) (codec.Hash, bool) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	h, ok := d.treeToCommit[treeHash]
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.treeIndex == nil {
+		d.treeIndex = make(map[codec.Hash]codec.Hash, len(d.commits))
+		for h, c := range d.commits {
+			if _, seen := d.treeIndex[c.DocumentTreeHash]; !seen {
+				d.treeIndex[c.DocumentTreeHash] = h
+			}
+		}
+	}
+	h, ok := d.treeIndex[treeHash]
 	return h, ok
 }
 

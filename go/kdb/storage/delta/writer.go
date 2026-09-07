@@ -234,39 +234,115 @@ func (r *DefaultReader) readFullSegment(segmentName string, sizeBytes int64) ([]
 // truncated scan would yield a wrong LastCommitHash for the segment.
 const maxScannedSegmentBytes = 1 << 28 // 256MiB
 
+// segmentScanWindowBytes bounds how much of a segment is held in memory
+// while its ends are located. A window, not the whole file: this runs once
+// per segment on every ListSegments, and ListSegments runs several times
+// during a single open, so reading each segment whole meant opening a
+// namespace allocated - and, measurably, retained - a full copy of its
+// delta log. On a 20,000-commit namespace that was 9.17MB of a 21.11MB
+// heap, the single largest thing in it, and proportional to the log rather
+// than to anything live.
+const segmentScanWindowBytes = 1 << 20
+
 func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.DeltaSegmentRef, error) {
-	raw, err := r.shim.ReadFromSegment(segmentName, 0, maxScannedSegmentBytes)
-	if err != nil {
-		return nil, err
+	// Locate the ends by walking frame headers a window at a time, then
+	// decode only the two frames that turn out to matter. A ref needs two
+	// commit hashes; it never needed the segment in memory.
+	var (
+		firstOffset = int64(-1)
+		lastOffset  = int64(-1)
+		total       int64
+		pos         int64
+		window      = int64(segmentScanWindowBytes)
+	)
+	for {
+		raw, err := r.shim.ReadFromSegment(segmentName, pos, int(window))
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) == 0 {
+			break
+		}
+		walk, walkErr := WalkFrames(raw, pos)
+		var corrupt *CorruptFrameError
+		if walkErr != nil && !errors.As(walkErr, &corrupt) {
+			return nil, walkErr
+		}
+		if walk.FirstOffset >= 0 && firstOffset < 0 {
+			firstOffset = walk.FirstOffset
+		}
+		if walk.LastOffset >= 0 {
+			lastOffset = walk.LastOffset
+		}
+		if walkErr != nil {
+			// A corrupt frame ends the scan here, exactly as a whole-segment
+			// scan would: the ends reported are what was readable before it.
+			total = walk.ConsumedEnd
+			break
+		}
+		if walk.ConsumedEnd == pos {
+			// Nothing complete in this window. Either the segment ends here
+			// or one frame is larger than the window; grow and retry so a
+			// large frame cannot stall the scan.
+			if int64(len(raw)) < window {
+				total = pos
+				break
+			}
+			window *= 2
+			continue
+		}
+		total = walk.ConsumedEnd
+		if int64(len(raw)) < window {
+			// Short read: the file ended inside this window.
+			break
+		}
+		pos = walk.ConsumedEnd
+		window = int64(segmentScanWindowBytes)
 	}
-	if len(raw) >= maxScannedSegmentBytes {
-		return nil, fmt.Errorf(
-			"delta segment %s is at or beyond the %d-byte scan ceiling; refusing to report a possibly-truncated segment range",
-			segmentName, maxScannedSegmentBytes)
-	}
-	// Bounds-only: a ref needs the two end commits, not every commit in the
-	// segment, and listing runs over every segment the namespace has. See
-	// ScanSegmentBounds for what that gives up and why it is safe here.
-	bounds, scanErr := ScanSegmentBounds(raw)
-	var corrupt *CorruptFrameError
-	if scanErr != nil && !errors.As(scanErr, &corrupt) {
-		return nil, scanErr
-	}
+
 	zero, _ := codec.HashFromBytes(make([]byte, 32))
-	if bounds.FrameCount == 0 {
+	if firstOffset < 0 {
 		return &storage.DeltaSegmentRef{
 			NamespaceID: r.namespaceID, SequenceNumber: seq,
 			FirstCommitHash: zero, LastCommitHash: zero,
-			SizeBytes: int64(len(raw)), Compression: r.config.CompressionCodec,
+			SizeBytes: total, Compression: r.config.CompressionCodec,
 		}, nil
+	}
+	first, err := r.commitAtOffset(segmentName, firstOffset)
+	if err != nil {
+		return nil, err
+	}
+	last := first
+	if lastOffset != firstOffset {
+		last, err = r.commitAtOffset(segmentName, lastOffset)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &storage.DeltaSegmentRef{
 		NamespaceID: r.namespaceID, SequenceNumber: seq,
-		FirstCommitHash: bounds.First.Hash,
-		LastCommitHash:  bounds.Last.Hash,
-		SizeBytes:       int64(len(raw)),
+		FirstCommitHash: first.Hash,
+		LastCommitHash:  last.Hash,
+		SizeBytes:       total,
 		Compression:     r.config.CompressionCodec,
 	}, nil
+}
+
+// commitAtOffset decodes the single frame starting at offset, reading only
+// that frame's bytes.
+func (r *DefaultReader) commitAtOffset(segmentName string, offset int64) (document.Commit, error) {
+	header, err := r.shim.ReadFromSegment(segmentName, offset, PageFrameHeaderSize)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	if len(header) < PageFrameHeaderSize {
+		return document.Commit{}, &CorruptFrameError{Offset: int(offset), Reason: "segment ends inside the frame header"}
+	}
+	raw, err := r.shim.ReadFromSegment(segmentName, offset, PageFrameHeaderSize+readIntBE(header, 8))
+	if err != nil {
+		return document.Commit{}, err
+	}
+	return DecodeFrame(raw, int(offset))
 }
 
 // StreamCommits implements storage.DeltaCommitStreamer: it hands segment's

@@ -161,6 +161,49 @@ func readIntBE(bytes []byte, offset int) int {
 		int(bytes[offset+3])&0xFF
 }
 
+// FrameWalk reports the frames in a byte window without decoding any of
+// them: how far the walk got, and where the first and last complete frames
+// in the window start. offsetBase is added to the reported offsets so a
+// caller scanning a segment in windows can report positions in the segment
+// rather than in the window.
+//
+// Every frame's CRC is checked, which is what makes a windowed scan as
+// strict as a whole-segment one; it costs a pass over the compressed bytes
+// and allocates nothing.
+type FrameWalk struct {
+	FirstOffset int64
+	LastOffset  int64
+	Count       int
+	// ConsumedEnd is the offset just past the last complete frame, which is
+	// where the next window must start. A window that ends mid-frame leaves
+	// this at the start of that frame rather than skipping it.
+	ConsumedEnd int64
+}
+
+// WalkFrames scans window for complete frames, verifying each one's CRC.
+// Torn or garbled frames stop the walk cleanly, as everywhere else.
+func WalkFrames(window []byte, offsetBase int64) (FrameWalk, error) {
+	w := FrameWalk{FirstOffset: -1, LastOffset: -1, ConsumedEnd: offsetBase}
+	offset := 0
+	for offset+frameHeaderSize <= len(window) {
+		frameEnd, ok := frameBounds(window, offset)
+		if !ok {
+			break
+		}
+		if err := verifyFrameCRC(window[offset:frameEnd], int(offsetBase)+offset); err != nil {
+			return w, err
+		}
+		if w.FirstOffset < 0 {
+			w.FirstOffset = offsetBase + int64(offset)
+		}
+		w.LastOffset = offsetBase + int64(offset)
+		w.Count++
+		offset = frameEnd
+		w.ConsumedEnd = offsetBase + int64(offset)
+	}
+	return w, nil
+}
+
 // SegmentBounds is what a DeltaSegmentRef needs to know about a segment:
 // its first and last commit, and how many bytes of it are real frames.
 type SegmentBounds struct {
