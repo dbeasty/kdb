@@ -119,10 +119,22 @@ UPDATE t [alias] SET path = expr {, path = expr} [WHERE expr]
 DELETE FROM t [alias] [WHERE expr]
 ```
 
-- `SET _doc = '<json>'` replaces the whole document; any other target is a JSON path set
+- `SET _doc = '<json>'` supplies a whole-document body; any other target is a JSON path set
   (`SET status = 'done'`, `SET meta.reviewed = true`). `expr` is a literal, parameter, or column
   reference evaluated against the pre-update document. After assignment the document is
   validated against the schema; a violation fails the statement.
+- **Known limitation, both trees, deliberate:** a `WriteOp` body is applied by the transaction
+  engine as a shallow root-level *merge* against the existing document, so neither `SET _doc` nor
+  wire `UPSERT` can remove a top-level key — keys absent from the new body survive. This is
+  pre-existing engine behaviour, not new here; true replacement needs a replace-capable document
+  op, which is a wire-format change deferred to its own layer. Both trees must merge identically
+  and both carry a test pinning it.
+- **Three-valued logic is not implemented.** `NOT` is two-valued over the §2 comparison rules, so
+  `NOT BETWEEN` / `NOT IN` / `NOT LIKE` over a NULL or absent path return the row (the inner
+  comparison is false, `NOT` negates it). Standard SQL would exclude it. Both trees behave this
+  way and both carry a test pinning it.
+- **Score widening.** A float32 score becomes a double through the shortest 32-bit round-trip
+  (`0.9f` → `0.9`, never `0.8999999761581421`), so Go and Kotlin print identical score cells.
 - Both lower to `WriteOp`/`DeleteOp` and follow the same commit path as `INSERT` (Go: appended to
   the session's pending transaction and committed by `TxCommit`, or committed immediately when the
   session is in autocommit; Kotlin: `HybridQueryEngine` DML path). `rowsAffected` is the number of

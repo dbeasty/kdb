@@ -18,7 +18,8 @@ Primary storage is JSON. Binary storage uses the KDB binary codec — a schema-d
 
 - Full engine runs on every target: browser (JS), JVM backend, native binary
 - Single Kotlin codebase compiled to all targets via Kotlin Multiplatform
-- Documents are stored and retrieved as whole JSON — always, exactly as provided
+- Documents are stored and retrieved as whole JSON — always, exactly as provided (see
+  [Document identity](#document-identity))
 - Schema is an optional typed lens over document fields, not a constraint on document shape
 - SQL and raw JSON access work together in the same query via the `_doc` column
 - JDBC driver for full compatibility with Java ORMs, SQL IDEs, and BI tools — highest priority
@@ -95,6 +96,25 @@ import (
 )
 db, _ := sql.Open("kdb", "kdb://memory:///demo/users?unique=true")
 ```
+
+### Document identity
+
+A document body round-trips **byte-exact**: nothing is injected into it and its keys are never
+reordered, on any write path (`kdb put`, the embedded `PutJSONDocument`, the wire `UPSERT`, SQL
+`INSERT`). Writing over a document that already exists still merges rather than replaces — the
+wire `UPSERT` and SQL's `SET _doc` apply the supplied body as a shallow root-level merge, so a
+key the new body omits keeps its stored value — but neither the merge nor storage adds, drops, or
+reorders anything else. Identity is decided from an optional top-level `id`:
+
+- no `id` — the engine mints a random UUID and reports it (`docId` above, `PutResult.DocID`,
+  the `kdb_id` column); the body is stored untouched, without the id in it;
+- `id` is a UUID string — that UUID is the document's identity;
+- `id` is any other non-empty string `s` (a natural key, a Mongo ObjectId, ...) — the identity is
+  the derived UUID `uuid8(sha256(KDB_DOC_ID_NAMESPACE ‖ utf8(s)))`, with
+  `KDB_DOC_ID_NAMESPACE = 6f5b9a1c-2d3e-4f70-8a9b-1c2d3e4f5a6b`. The mapping is deterministic and
+  identical in the Go and Kotlin engines (`go/testdata/golden/search/derived_id_vectors.json`), so
+  writing `{"id":"order-1", ...}` twice updates one document;
+- `id` that is not a string, or is `""`, is rejected.
 
 ### Build identity
 

@@ -2,6 +2,7 @@ package policy
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -61,12 +62,27 @@ func (p *DefaultParser) ParseJSON(jsonStr string, sch *schema.KdbSchema) (Namesp
 			squash = SquashModeNever
 		}
 	}
+	var expiry *DocumentExpiryPolicy
+	if raw, ok := raw["documentExpiry"].(map[string]any); ok {
+		field, _ := raw["fieldPath"].(string)
+		if field == "" {
+			return NamespacePolicy{}, fmt.Errorf("policy: documentExpiry.fieldPath is required")
+		}
+		expiry = &DocumentExpiryPolicy{FieldPath: field, SweepIntervalMillis: DefaultSweepIntervalMillis}
+		if v, ok := raw["graceMillis"].(float64); ok {
+			expiry.GraceMillis = int64(v)
+		}
+		if v, ok := raw["sweepIntervalMillis"].(float64); ok && v > 0 {
+			expiry.SweepIntervalMillis = int64(v)
+		}
+	}
 	return NamespacePolicy{
-		NamespaceID: ns,
-		Schema:      sch,
-		Mode:        mode,
-		History:     history,
-		Conflict:    conflict,
+		NamespaceID:    ns,
+		DocumentExpiry: expiry,
+		Schema:         sch,
+		Mode:           mode,
+		History:        history,
+		Conflict:       conflict,
 		Compaction: CompactionPolicy{
 			KeepTagged:        true,
 			KeepBranchPoints:  true,

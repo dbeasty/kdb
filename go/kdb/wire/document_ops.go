@@ -32,9 +32,11 @@ type DocumentGetResultMessage struct {
 
 func (m DocumentGetResultMessage) Header() Header { return m.H }
 
-// UpsertMessage writes JSON at DocID unconditionally - create if absent, replace if present, no
-// BaseVersion, no conflict possible (component 40 spec §5: "Upsert never conflicts and never
-// needs a BaseVersion").
+// UpsertMessage writes JSON at DocID unconditionally - create if absent, and if present apply
+// JSON as a shallow root-level merge onto the stored body (a key the new body omits keeps its
+// stored value; a key it names replaces it wholesale, nested objects included). No BaseVersion,
+// no conflict possible (component 40 spec §5: "Upsert never conflicts and never needs a
+// BaseVersion"). To drop a key, read the document and commit the body you want.
 type UpsertMessage struct {
 	H         Header
 	Namespace string

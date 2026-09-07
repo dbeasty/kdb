@@ -73,6 +73,12 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 	if errors.As(err, &auth) {
 		return wire.ErrorCodeUnauthorized, nil
 	}
+	var unsupported *UnsupportedError
+	if errors.As(err, &unsupported) {
+		// Not INTERNAL: nothing went wrong, the server simply has no provider for this request
+		// (a SEARCH before any index is configured). Retrying cannot help; configuration can.
+		return wire.ErrorCodeUnsupported, nil
+	}
 	var schemaErr *SchemaError
 	if errors.As(err, &schemaErr) {
 		if schemaErr.HasUniqueViolation() {

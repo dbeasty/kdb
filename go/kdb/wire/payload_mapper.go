@@ -287,6 +287,9 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 		if env, ok, err := encodeLockOpMessage(msg); ok || err != nil {
 			return env, err
 		}
+		if env, ok, err := encodeSearchMessage(msg); ok || err != nil {
+			return env, err
+		}
 		return payloadEnvelope{}, fmt.Errorf("unsupported message type")
 	}
 }
@@ -580,6 +583,9 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			return msg, err
 		}
 		if msg, ok, err := decodeLockOpMessage(header, env); ok || err != nil {
+			return msg, err
+		}
+		if msg, ok, err := decodeSearchMessage(header, env); ok || err != nil {
 			return msg, err
 		}
 		return nil, newDecodeError("unknown payload kind: " + env.Kind)

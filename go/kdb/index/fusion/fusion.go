@@ -76,10 +76,13 @@ func Fuse(arms []Arm, mode Mode, limit int) []index.RankedResult {
 					hi = r.Score
 				}
 			}
+			// Normalise in float64 from the float32 inputs (and round to float32 only once, at the
+			// end): both trees do the same, so fused scores are bit-identical, which the fixture
+			// tolerance of 1e-9 needs at float32 precision.
 			for _, r := range list {
 				norm := 1.0
 				if hi > lo {
-					norm = float64(r.Score-lo) / float64(hi-lo)
+					norm = (float64(r.Score) - float64(lo)) / (float64(hi) - float64(lo))
 				}
 				bump(r.DocID, w*norm)
 			}

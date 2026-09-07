@@ -33,6 +33,10 @@ const (
 	ErrorCodeUniqueViolation ErrorCode = "UNIQUE_VIOLATION"
 	// ErrorCodeUnauthorized: RBAC denied the operation - never retry unmodified.
 	ErrorCodeUnauthorized ErrorCode = "UNAUTHORIZED"
+	// ErrorCodeUnsupported: the server understood the request but has nothing configured to
+	// serve it - a SEARCH against a runtime with no search index provider, for instance. Never
+	// retry unmodified; the remedy is operator-side configuration, not a client-side change.
+	ErrorCodeUnsupported ErrorCode = "UNSUPPORTED"
 	// ErrorCodeInternal: unclassified - the fallback when no more specific code applies.
 	ErrorCodeInternal ErrorCode = "INTERNAL"
 )

@@ -1,0 +1,272 @@
+{
+  "index": {
+    "fields": [
+      {
+        "path": "title",
+        "weight": 3
+      },
+      {
+        "path": "description",
+        "weight": 1
+      },
+      {
+        "path": "tags",
+        "weight": 2
+      }
+    ]
+  },
+  "documents": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "json": "{\"title\":\"Deploy staging environment\",\"description\":\"Deploy the new build to the staging cluster and verify health checks\",\"tags\":[\"deploy\",\"ops\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "json": "{\"title\":\"Fix login bug\",\"description\":\"Users cannot log in after the password reset flow changed\",\"tags\":[\"bug\",\"auth\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "json": "{\"title\":\"Write release notes\",\"description\":\"Summarise the changes shipped in the deploy of version 2.4\",\"tags\":[\"docs\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "json": "{\"title\":\"Staging database migration\",\"description\":\"Run the migration scripts against staging before production\",\"tags\":[\"database\",\"ops\",\"staging\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "json": "{\"title\":\"Production deploy checklist\",\"description\":\"Checklist for deploying to production: backups, alerts, rollback plan\",\"tags\":[\"deploy\",\"staging\",\"production\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "json": "{\"title\":\"Rotate API keys\",\"description\":\"Rotate the third-party API keys and update the secrets store\",\"tags\":[\"security\",\"ops\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000007",
+      "json": "{\"title\":\"Investigate slow queries\",\"description\":\"The reporting dashboard times out; profile the database queries\",\"tags\":[\"database\",\"performance\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000008",
+      "json": "{\"title\":\"Onboard new engineer\",\"description\":\"Set up accounts, laptop and access for the new hire\"}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000009",
+      "json": "{\"title\":\"Deploy deploy deploy\",\"description\":\"Repeated word test document for term frequency saturation\",\"tags\":[]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000010",
+      "json": "{\"title\":\"Verify health checks\",\"description\":\"The staging health checks flap after deploy; investigate the load balancer\",\"tags\":[\"ops\",\"staging\",\"deploy\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "json": "{\"title\":\"Password reset emails\",\"description\":\"Reset emails are delayed; check the mail queue and retry policy\",\"tags\":[\"auth\",\"email\"]}"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000012",
+      "json": "{\"title\":\"Empty tags document\",\"description\":\"This document has tags that are not strings\",\"tags\":[1,2,true]}"
+    }
+  ],
+  "queries": [
+    {
+      "query": "database",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000004",
+          7.430256
+        ],
+        [
+          "00000000-0000-4000-8000-000000000007",
+          4.7201886
+        ]
+      ]
+    },
+    {
+      "query": "deploy",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000001",
+          4.9961677
+        ],
+        [
+          "00000000-0000-4000-8000-000000000005",
+          4.7493067
+        ],
+        [
+          "00000000-0000-4000-8000-000000000009",
+          4.0552344
+        ],
+        [
+          "00000000-0000-4000-8000-000000000010",
+          2.0790873
+        ],
+        [
+          "00000000-0000-4000-8000-000000000003",
+          0.8725094
+        ]
+      ]
+    },
+    {
+      "query": "staging deploy",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000001",
+          9.196583
+        ],
+        [
+          "00000000-0000-4000-8000-000000000005",
+          6.347881
+        ],
+        [
+          "00000000-0000-4000-8000-000000000004",
+          5.8572416
+        ],
+        [
+          "00000000-0000-4000-8000-000000000010",
+          4.6431913
+        ],
+        [
+          "00000000-0000-4000-8000-000000000009",
+          4.0552344
+        ],
+        [
+          "00000000-0000-4000-8000-000000000003",
+          0.8725094
+        ]
+      ]
+    },
+    {
+      "query": "\"deploy staging\"",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000001",
+          9.196583
+        ]
+      ]
+    },
+    {
+      "query": "the and of to",
+      "expected": []
+    },
+    {
+      "query": "health checks",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000010",
+          11.577284
+        ],
+        [
+          "00000000-0000-4000-8000-000000000001",
+          2.8406303
+        ],
+        [
+          "00000000-0000-4000-8000-000000000011",
+          1.2589097
+        ]
+      ]
+    },
+    {
+      "query": "password reset flow",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000011",
+          11.473672
+        ],
+        [
+          "00000000-0000-4000-8000-000000000002",
+          5.235247
+        ]
+      ]
+    },
+    {
+      "query": "Deploying STAGING!",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000001",
+          9.196583
+        ],
+        [
+          "00000000-0000-4000-8000-000000000005",
+          6.347881
+        ],
+        [
+          "00000000-0000-4000-8000-000000000004",
+          5.8572416
+        ],
+        [
+          "00000000-0000-4000-8000-000000000010",
+          4.6431913
+        ],
+        [
+          "00000000-0000-4000-8000-000000000009",
+          4.0552344
+        ],
+        [
+          "00000000-0000-4000-8000-000000000003",
+          0.8725094
+        ]
+      ]
+    },
+    {
+      "query": "xyzzy plugh",
+      "expected": []
+    },
+    {
+      "query": "\"health checks\" staging",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000010",
+          14.141388
+        ],
+        [
+          "00000000-0000-4000-8000-000000000001",
+          7.041045
+        ]
+      ]
+    },
+    {
+      "query": "ops",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000001",
+          1.9612759
+        ],
+        [
+          "00000000-0000-4000-8000-000000000006",
+          1.9612759
+        ],
+        [
+          "00000000-0000-4000-8000-000000000004",
+          1.5985742
+        ],
+        [
+          "00000000-0000-4000-8000-000000000010",
+          1.5985742
+        ]
+      ]
+    },
+    {
+      "query": "\"the deploy\"",
+      "expected": [
+        [
+          "00000000-0000-4000-8000-000000000001",
+          4.9961677
+        ],
+        [
+          "00000000-0000-4000-8000-000000000005",
+          4.7493067
+        ],
+        [
+          "00000000-0000-4000-8000-000000000009",
+          4.0552344
+        ],
+        [
+          "00000000-0000-4000-8000-000000000010",
+          2.0790873
+        ],
+        [
+          "00000000-0000-4000-8000-000000000003",
+          0.8725094
+        ]
+      ]
+    }
+  ]
+}

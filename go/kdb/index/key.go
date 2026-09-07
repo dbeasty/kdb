@@ -1,6 +1,9 @@
 package index
 
 import (
+	"strconv"
+	"strings"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 )
 
@@ -57,11 +60,20 @@ func (v VectorKey) AsFloat32() []float32 {
 	return cp
 }
 
+// Dimensions returns the vector's length.
+func (v VectorKey) Dimensions() int { return len(v.embedding) }
+
 func (VectorKey) isKey() {}
 
 type CompositeKey struct{ Parts []Key }
 
 func (CompositeKey) isKey() {}
+
+// KeyString returns a canonical, injective string form of a key. Two keys are equal exactly
+// when their KeyStrings are equal, which is what lets the event log bucket by key: CompositeKey
+// and VectorKey hold slices and so cannot themselves be Go map keys (hashing one panics).
+// The encoding is the snapshot line encoding, so it is also what persists.
+func KeyString(k Key) string { return encodeKeyLine(k) }
 
 // CompareKeys provides lexicographic ordering for in-memory btree replay.
 func CompareKeys(a, b Key) int {
@@ -128,12 +140,27 @@ func CompareKeys(a, b Key) int {
 		return 0
 	case UUIDKey:
 		kb := b.(UUIDKey)
-		as := ka.ID.String()
-		bs := kb.ID.String()
-		if as < bs {
+		return strings.Compare(ka.ID.String(), kb.ID.String())
+	case VectorKey:
+		// Element-wise, then by length: the same rule CompositeKey uses, so a vector key sorts
+		// deterministically even though nothing ranges over vectors.
+		kb := b.(VectorKey)
+		n := len(ka.embedding)
+		if len(kb.embedding) < n {
+			n = len(kb.embedding)
+		}
+		for i := 0; i < n; i++ {
+			if ka.embedding[i] < kb.embedding[i] {
+				return -1
+			}
+			if ka.embedding[i] > kb.embedding[i] {
+				return 1
+			}
+		}
+		if len(ka.embedding) < len(kb.embedding) {
 			return -1
 		}
-		if as > bs {
+		if len(ka.embedding) > len(kb.embedding) {
 			return 1
 		}
 		return 0
@@ -186,3 +213,5 @@ func keyTag(k Key) int {
 		return -1
 	}
 }
+
+func formatFloat32(f float32) string { return strconv.FormatFloat(float64(f), 'g', -1, 32) }

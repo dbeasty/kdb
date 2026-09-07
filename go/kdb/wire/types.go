@@ -72,6 +72,11 @@ const (
 	MsgLockRelease MessageType = 0x1B
 	MsgLockResult  MessageType = 0x1C
 
+	// Search over the wire (see search_ops.go), kdb-spec-layer16 §11 / Component 68.
+	// Layer 16 — implemented in both trees.
+	MsgSearch       MessageType = 0x1D
+	MsgSearchResult MessageType = 0x1E
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -135,6 +140,10 @@ func (t MessageType) String() string {
 		return "LOCK_RELEASE"
 	case MsgLockResult:
 		return "LOCK_RESULT"
+	case MsgSearch:
+		return "SEARCH"
+	case MsgSearchResult:
+		return "SEARCH_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -198,6 +207,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgLockRelease, true
 	case 0x1C:
 		return MsgLockResult, true
+	case 0x1D:
+		return MsgSearch, true
+	case 0x1E:
+		return MsgSearchResult, true
 	default:
 		return 0, false
 	}

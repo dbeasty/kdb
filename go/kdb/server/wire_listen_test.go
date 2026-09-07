@@ -96,6 +96,24 @@ func (c *rawWireClient) sessionBegin(t *testing.T, namespace, readConsistency st
 	return ack
 }
 
+// sessionBeginAt is sessionBegin with an explicit base version - what a test needs to read at a
+// historical commit rather than at the live head.
+func (c *rawWireClient) sessionBeginAt(t *testing.T, namespace, readConsistency, baseVersionHex string) wire.SessionBeginAckMessage {
+	t.Helper()
+	msg := wire.SessionBeginMessage{
+		H:               wire.Header{MessageType: wire.MsgSessionBegin, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
+		Namespace:       namespace,
+		ReadConsistency: readConsistency,
+		BaseVersionHex:  &baseVersionHex,
+	}
+	reply := c.request(t, msg)
+	ack, ok := reply.(wire.SessionBeginAckMessage)
+	if !ok {
+		t.Fatalf("expected SessionBeginAckMessage, got %T", reply)
+	}
+	return ack
+}
+
 func (c *rawWireClient) sqlExec(t *testing.T, namespace, sessionID, sqlText string) wire.SqlResultMessage {
 	t.Helper()
 	msg := wire.SqlExecMessage{

@@ -509,6 +509,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgLockRenew, "LOCK_RENEW"},
 		{wire.MsgLockRelease, "LOCK_RELEASE"},
 		{wire.MsgLockResult, "LOCK_RESULT"},
+		{wire.MsgSearch, "SEARCH"},
+		{wire.MsgSearchResult, "SEARCH_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -525,11 +527,11 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 	if _, ok := wire.MessageTypeFromCode(0x00); ok {
 		t.Error("code 0x00 should not be a known message type")
 	}
-	if _, ok := wire.MessageTypeFromCode(0x1D); ok {
-		t.Error("code 0x1D is unassigned and should not be recognized")
+	if _, ok := wire.MessageTypeFromCode(0x1F); ok {
+		t.Error("code 0x1F is unassigned and should not be recognized")
 	}
-	if wire.MessageType(0x1D).String() != "UNKNOWN" {
-		t.Errorf("unassigned type names itself %q", wire.MessageType(0x1D).String())
+	if wire.MessageType(0x1F).String() != "UNKNOWN" {
+		t.Errorf("unassigned type names itself %q", wire.MessageType(0x1F).String())
 	}
 }
 

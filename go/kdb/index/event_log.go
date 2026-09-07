@@ -24,6 +24,15 @@ type bucketCacheKey struct {
 	ancestryVersion uint64
 }
 
+// bucket is one key's document set. Buckets are stored by KeyString rather than by Key
+// because CompositeKey and VectorKey contain slices and are not hashable.
+type bucket struct {
+	key Key
+	ids map[codec.UUID]struct{}
+}
+
+type bucketMap map[string]*bucket
+
 // eventLog is the chronological put/delete log both index implementations replay, together
 // with a memo of the bucket sets already derived from it.
 //
@@ -43,7 +52,7 @@ type eventLog struct {
 	deletes    []deleteEvent
 	seqCounter int64
 
-	cache      map[bucketCacheKey]map[Key]map[codec.UUID]struct{}
+	cache      map[bucketCacheKey]bucketMap
 	cacheOrder []bucketCacheKey
 }
 
@@ -110,7 +119,7 @@ func (l *eventLog) cutoff(atCommit *codec.Hash) (codec.Hash, error) {
 
 // buckets returns the key → doc-id map visible at cutoffHash. The returned map is shared with
 // the memo and with other callers: treat it as read-only. Use bucketsCopy to hand it out.
-func (l *eventLog) buckets(cutoffHash codec.Hash) map[Key]map[codec.UUID]struct{} {
+func (l *eventLog) buckets(cutoffHash codec.Hash) bucketMap {
 	version := l.dag.AncestryVersion()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -120,7 +129,7 @@ func (l *eventLog) buckets(cutoffHash codec.Hash) map[Key]map[codec.UUID]struct{
 	}
 	built := l.replayLocked(cutoffHash)
 	if l.cache == nil {
-		l.cache = make(map[bucketCacheKey]map[Key]map[codec.UUID]struct{}, bucketCacheEntries)
+		l.cache = make(map[bucketCacheKey]bucketMap, bucketCacheEntries)
 	}
 	l.cache[key] = built
 	l.cacheOrder = append(l.cacheOrder, key)
@@ -131,25 +140,28 @@ func (l *eventLog) buckets(cutoffHash codec.Hash) map[Key]map[codec.UUID]struct{
 	return built
 }
 
-// bucketsCopy returns a deep copy safe for a caller to mutate.
-func (l *eventLog) bucketsCopy(cutoffHash codec.Hash) map[Key]map[codec.UUID]struct{} {
+// KeyBucket is one key together with the documents filed under it.
+type KeyBucket struct {
+	Key    Key
+	DocIDs []codec.UUID
+}
+
+// bucketsCopy returns the buckets at cutoffHash as a caller-owned, key-ordered slice.
+func (l *eventLog) bucketsCopy(cutoffHash codec.Hash) []KeyBucket {
 	shared := l.buckets(cutoffHash)
-	out := make(map[Key]map[codec.UUID]struct{}, len(shared))
-	for k, ids := range shared {
-		copied := make(map[codec.UUID]struct{}, len(ids))
-		for id := range ids {
-			copied[id] = struct{}{}
-		}
-		out[k] = copied
+	out := make([]KeyBucket, 0, len(shared))
+	for _, b := range shared {
+		out = append(out, KeyBucket{Key: b.key, DocIDs: sortedBucketIDs(b.ids)})
 	}
+	sort.Slice(out, func(i, j int) bool { return CompareKeys(out[i].Key, out[j].Key) < 0 })
 	return out
 }
 
 // replayLocked rebuilds the bucket map at cutoffHash by merging the two event slices in
 // sequence order. Both are appended to in increasing seq, so they are already sorted.
-func (l *eventLog) replayLocked(cutoffHash codec.Hash) map[Key]map[codec.UUID]struct{} {
+func (l *eventLog) replayLocked(cutoffHash codec.Hash) bucketMap {
 	ancestors := l.dag.AncestorSet(cutoffHash)
-	buckets := make(map[Key]map[codec.UUID]struct{})
+	buckets := make(bucketMap)
 	p, d := 0, 0
 	for p < len(l.puts) || d < len(l.deletes) {
 		if d >= len(l.deletes) || (p < len(l.puts) && l.puts[p].seq < l.deletes[d].seq) {
@@ -158,12 +170,13 @@ func (l *eventLog) replayLocked(cutoffHash codec.Hash) map[Key]map[codec.UUID]st
 			if _, ok := ancestors[entry.CommitHash]; !ok {
 				continue
 			}
-			ids := buckets[entry.Key]
-			if ids == nil {
-				ids = make(map[codec.UUID]struct{})
-				buckets[entry.Key] = ids
+			ks := KeyString(entry.Key)
+			b := buckets[ks]
+			if b == nil {
+				b = &bucket{key: entry.Key, ids: make(map[codec.UUID]struct{})}
+				buckets[ks] = b
 			}
-			ids[entry.DocID] = struct{}{}
+			b.ids[entry.DocID] = struct{}{}
 			continue
 		}
 		evt := l.deletes[d]
@@ -174,6 +187,19 @@ func (l *eventLog) replayLocked(cutoffHash codec.Hash) map[Key]map[codec.UUID]st
 		pruneDoc(buckets, evt.docID)
 	}
 	return buckets
+}
+
+func pruneDoc(buckets bucketMap, docID codec.UUID) {
+	var dead []string
+	for ks, b := range buckets {
+		delete(b.ids, docID)
+		if len(b.ids) == 0 {
+			dead = append(dead, ks)
+		}
+	}
+	for _, ks := range dead {
+		delete(buckets, ks)
+	}
 }
 
 func (l *eventLog) appendPutLocked(entry Entry) {
@@ -197,14 +223,14 @@ func (l *eventLog) clearLocked() {
 // lookup returns the doc ids filed under key at cutoffHash.
 func (l *eventLog) lookup(key Key, cutoffHash codec.Hash) []codec.UUID {
 	buckets := l.buckets(cutoffHash)
-	ids, ok := buckets[key]
+	b, ok := buckets[KeyString(key)]
 	if !ok {
 		return nil
 	}
 	// Stable order, for the same reason rangeScan needs one: a bucket is a map, and a caller
 	// that compares two lookups - or hands the result straight on as query rows - should not see
 	// the order change between identical calls.
-	return sortedBucketIDs(ids)
+	return sortedBucketIDs(b.ids)
 }
 
 // rangeScan returns the doc ids whose keys fall within [from, to] at cutoffHash, in key
@@ -214,26 +240,32 @@ func (l *eventLog) rangeScan(from, to Key, cutoffHash codec.Hash, limit int, asc
 		limit = 1<<31 - 1
 	}
 	buckets := l.buckets(cutoffHash)
-	keys := make([]Key, 0, len(buckets))
-	for k := range buckets {
-		if from != nil && CompareKeys(k, from) < 0 {
+	matched := make([]*bucket, 0, len(buckets))
+	for _, b := range buckets {
+		if from != nil && CompareKeys(b.key, from) < 0 {
 			continue
 		}
-		if to != nil && CompareKeys(k, to) > 0 {
+		if to != nil && CompareKeys(b.key, to) > 0 {
 			continue
 		}
-		keys = append(keys, k)
+		matched = append(matched, b)
 	}
-	sortKeys(keys, ascending)
+	sort.Slice(matched, func(i, j int) bool {
+		c := CompareKeys(matched[i].key, matched[j].key)
+		if !ascending {
+			return c > 0
+		}
+		return c < 0
+	})
 	seen := make(map[codec.UUID]struct{})
 	var out []codec.UUID
-	for _, k := range keys {
+	for _, b := range matched {
 		// A bucket is a map, so ranging it directly gave a different order on every call. That
 		// is invisible without a limit - the same set comes back, just shuffled - but with one
 		// it changes *which* documents are returned, so a limited range query answered
 		// differently each time it ran, and paging through an index could show a document twice
 		// or never. Sorted by id: an arbitrary order, but the same arbitrary order every time.
-		for _, id := range sortedBucketIDs(buckets[k]) {
+		for _, id := range sortedBucketIDs(b.ids) {
 			if _, ok := seen[id]; ok {
 				continue
 			}
@@ -260,14 +292,4 @@ func sortedBucketIDs(bucket map[codec.UUID]struct{}) []codec.UUID {
 		return uint64(ids[i].LSB) < uint64(ids[j].LSB)
 	})
 	return ids
-}
-
-func sortKeys(keys []Key, ascending bool) {
-	sort.Slice(keys, func(i, j int) bool {
-		c := CompareKeys(keys[i], keys[j])
-		if !ascending {
-			return c > 0
-		}
-		return c < 0
-	})
 }

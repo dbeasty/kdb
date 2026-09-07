@@ -18,6 +18,8 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/policy"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
@@ -38,6 +40,11 @@ func main() {
 	var configPath string
 	var showVersion bool
 	var peerConflictPolicy string
+	var expireField string
+	var expireGrace, expireInterval time.Duration
+	fs.StringVar(&expireField, "expire-field", "", "document expiry (kdb-spec-layer16 §9.5): the top-level field (or dotted path) holding each document's expiry timestamp as an RFC 3339 string or epoch milliseconds. Documents whose timestamp has passed are hidden from reads at head and deleted by a periodic sweep; empty (default) disables expiry")
+	fs.DurationVar(&expireGrace, "expire-grace", 0, "how long a document stays readable past its --expire-field timestamp before it counts as expired")
+	fs.DurationVar(&expireInterval, "expire-interval", time.Duration(policy.DefaultSweepIntervalMillis)*time.Millisecond, "how often the expiry sweeper scans head and deletes expired documents (batches of at most 500 per commit, message \"expiry sweep\")")
 	fs.StringVar(&peerConflictPolicy, "peer-conflict-policy", "strict", "how the peer-sync listener resolves a same-document divergence pushed by a peer: strict (report a conflict, never silently resolve - default) or last-write (later timestamp wins symmetrically on every node)")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
 	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
@@ -196,6 +203,27 @@ func main() {
 	}
 	srv.MaxConnections = cfg.MaxConnections
 
+	if expireField != "" {
+		if expireGrace < 0 || expireInterval <= 0 {
+			fmt.Fprintln(os.Stderr, "Error: --expire-grace must be >= 0 and --expire-interval > 0")
+			os.Exit(2)
+		}
+		srv.SetDocumentExpiry(&policy.DocumentExpiryPolicy{
+			FieldPath:           expireField,
+			GraceMillis:         expireGrace.Milliseconds(),
+			SweepIntervalMillis: expireInterval.Milliseconds(),
+		})
+	}
+
+	// Index registry (kdb-spec-layer16 Components 66/67/68): loads any persisted full-text,
+	// vector, hash and btree indexes, rebuilds stale ones, and wires them to the SQL planner
+	// and to SEARCH. Without this the server still answers every query by full scan, so a
+	// failure here is fatal rather than silent - a half-indexed server returns wrong answers.
+	if _, err := srv.OpenIndexes(stores.Options{}); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: opening indexes: %v\n", err)
+		os.Exit(1)
+	}
+
 	rbacStatus := "disabled"
 	if rbac {
 		if dataDir != "" {
@@ -338,6 +366,7 @@ func main() {
 		"rbac", rbacStatus,
 		"memory_limit", memoryLimitStatus,
 		"abort_after", abortStatus,
+		"document_expiry", srv.ExpirySummary(),
 		"namespace", namespace,
 	)
 	if admin != nil {

@@ -51,9 +51,10 @@ func (e *VersionedEngine) Range(from, to Key, atCommit *codec.Hash, limit int, a
 	return e.log.rangeScan(from, to, cutoff, limit, ascending), nil
 }
 
-// HeadBuckets returns the bucket map at DAG head. The caller gets its own copy: the replayed
-// map itself is memoized and shared between lookups.
-func (e *VersionedEngine) HeadBuckets() (map[Key]map[codec.UUID]struct{}, error) {
+// HeadBuckets returns every key visible at DAG head with its documents, in key order. The
+// caller gets its own copy: the replayed bucket map itself is memoized and shared between
+// lookups.
+func (e *VersionedEngine) HeadBuckets() ([]KeyBucket, error) {
 	cutoff, err := e.log.cutoff(nil)
 	if err != nil {
 		return nil, err

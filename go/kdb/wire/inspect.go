@@ -44,6 +44,12 @@ func (env PayloadEnvelope) Summary() string {
 		return "commitPush"
 	case "positionAck":
 		return "positionAck"
+	case "search":
+		if env.Search != nil {
+			return "search ns=" + env.Search.Namespace
+		}
+	case "searchResult":
+		return "searchResult"
 	default:
 		return env.Kind
 	}

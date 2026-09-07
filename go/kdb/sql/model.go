@@ -23,6 +23,65 @@ type StmtCreateTable struct{ DDL CreateTableStatement }
 
 func (StmtCreateTable) isStatement() {}
 
+// StmtUpdate is UPDATE t SET ... [WHERE ...] (kdb-spec-layer16 §5).
+type StmtUpdate struct{ Update UpdateStatement }
+
+func (StmtUpdate) isStatement() {}
+
+// StmtDelete is DELETE FROM t [WHERE ...] (kdb-spec-layer16 §5).
+type StmtDelete struct{ Delete DeleteStatement }
+
+func (StmtDelete) isStatement() {}
+
+// StmtCreateIndex is CREATE [UNIQUE] INDEX name ON t (fields) [USING kind] [WITH (...)]
+// (kdb-spec-layer16 §9.2). Using is the upper-cased kind ("HASH", "BTREE", "FULLTEXT",
+// "VECTOR") or "" when absent; With holds the option list with lower-cased keys.
+type StmtCreateIndex struct {
+	Name   string
+	Table  string
+	Fields []IndexField
+	Using  string
+	Unique bool
+	With   map[string]string
+}
+
+func (StmtCreateIndex) isStatement() {}
+
+// IndexField is one indexed path with its FULLTEXT weight (1 when not given).
+type IndexField struct {
+	Path   string
+	Weight float64
+}
+
+// StmtDropIndex is DROP INDEX name ON t.
+type StmtDropIndex struct {
+	Name  string
+	Table string
+}
+
+func (StmtDropIndex) isStatement() {}
+
+// UpdateStatement is the body of an UPDATE. Assignment targets are dotted JSON paths (the
+// reserved target "_doc" replaces the whole document); values are evaluated against the
+// pre-update document.
+type UpdateStatement struct {
+	Table       TableRef
+	Assignments []Assignment
+	Where       Expr
+}
+
+// Assignment is one SET target = value pair.
+type Assignment struct {
+	Path  string
+	Value Expr
+}
+
+// DeleteStatement is the body of a DELETE.
+type DeleteStatement struct {
+	Table TableRef
+	Where Expr
+}
+
 // InsertStatement is INSERT INTO ... VALUES ...
 type InsertStatement struct {
 	Table   TableRef
@@ -34,6 +93,8 @@ type InsertStatement struct {
 type CreateTableStatement struct {
 	Table   TableRef
 	Columns []ColumnDefinition
+	// UniqueConstraints are the table-level UNIQUE (a, b, ...) tuples (kdb-spec-layer16 §9.6).
+	UniqueConstraints [][]string
 }
 
 // ColumnDefinition is one CREATE TABLE column.
@@ -42,6 +103,7 @@ type ColumnDefinition struct {
 	Type     schema.FieldType
 	Required bool
 	Indexed  bool
+	Unique   bool
 }
 
 // TableRef names a table (catalog binding is external).
@@ -56,6 +118,7 @@ type SelectQuery struct {
 	Projections []Projection
 	From        TableRef
 	Where       Expr
+	GroupBy     []Expr
 	OrderBy     []OrderItem
 	Limit       *int
 	Offset      int
@@ -128,6 +191,49 @@ type ExprFunctionCall struct {
 
 func (ExprFunctionCall) isExpr() {}
 
+// ExprIn is `expr [NOT] IN (v1, v2, ...)`; the NOT form is ExprUnary{UnaryOpNot, ExprIn}.
+type ExprIn struct {
+	Expr   Expr
+	Values []Expr
+}
+
+func (ExprIn) isExpr() {}
+
+// ExprBetween is `expr BETWEEN low AND high` (inclusive); NOT BETWEEN wraps it in UnaryOpNot.
+type ExprBetween struct {
+	Expr      Expr
+	Low, High Expr
+}
+
+func (ExprBetween) isExpr() {}
+
+// ExprMatch is MATCH(index_or_field, query) - a full-text predicate (true for hits) or a score
+// projection (BM25, 0 for non-hits). Requires a FULLTEXT index (kdb-spec-layer16 §9.1).
+type ExprMatch struct {
+	IndexOrField string
+	Query        Expr
+}
+
+func (ExprMatch) isExpr() {}
+
+// ExprSimilarity is SIMILARITY(field, vector) - the vector-index metric score for a document.
+// Vector is a vector literal (ExprLiteral{CellJSON}) or a ParamVector parameter.
+type ExprSimilarity struct {
+	Field  string
+	Vector Expr
+}
+
+func (ExprSimilarity) isExpr() {}
+
+// ExprFuse is FUSE(arm1, arm2[, 'rrf' | 'weighted']): rank fusion over MATCH/SIMILARITY arms.
+// Mode is "rrf" (default) or "weighted".
+type ExprFuse struct {
+	Arms []Expr
+	Mode string
+}
+
+func (ExprFuse) isExpr() {}
+
 // BinaryOp is a binary operator.
 type BinaryOp int
 
@@ -141,6 +247,7 @@ const (
 	BinaryOpAnd
 	BinaryOpOr
 	BinaryOpLike
+	BinaryOpILike
 )
 
 // UnaryOp is a unary operator.
@@ -176,6 +283,13 @@ type CellJSON struct{ JSON string }
 
 func (CellJSON) isCell() {}
 
+// CellBool is a boolean value. It is produced by TRUE/FALSE literals and ParamBool parameters
+// (so DML writes JSON booleans, not 0/1); a document's boolean field still projects as CellLong
+// 0/1 for wire compatibility. Comparisons treat CellBool and CellLong 0/1 as the same type.
+type CellBool struct{ Value bool }
+
+func (CellBool) isCell() {}
+
 // Parameter is a bound query parameter.
 type Parameter interface {
 	isParameter()
@@ -200,6 +314,12 @@ func (ParamBool) isParameter() {}
 type ParamNull struct{}
 
 func (ParamNull) isParameter() {}
+
+// ParamVector is the vector parameter type (kdb-spec-layer16 §9.1): a JSON array of numbers on
+// the wire, bound as the query vector of SIMILARITY(field, ?).
+type ParamVector struct{ Value []float32 }
+
+func (ParamVector) isParameter() {}
 
 // QueryContext carries execution state.
 type QueryContext struct {
@@ -273,6 +393,10 @@ type QueryResult struct {
 	RowsAffected  int
 	GeneratedIDs  []string
 	AppliedSchema *schema.KdbSchema
+	// Plan names the access path the executor chose (kdb-spec-layer16 §9.3): "fullscan",
+	// "index:eq(field)", "index:range(field)", "index:in(field)", "fulltext(name)",
+	// "vector(field)", "fuse(...)". Tests assert on it to prove an index was used.
+	Plan string
 }
 
 // DMLResult is the outcome of INSERT (operations for commit).
@@ -326,3 +450,28 @@ type PlanLimit struct {
 }
 
 func (PlanLimit) isPhysicalPlan() {}
+
+// PlanIndexLookup resolves ids through the executor's IndexProvider (kdb-spec-layer16 §9.3).
+// Kind is "eq", "range", or "in"; the executor falls back to a full scan when the provider
+// reports no usable index. Every WHERE conjunct, including the indexed one, is re-checked by the
+// residual filter, so a provider that returns a superset is still correct.
+type PlanIndexLookup struct {
+	Kind          string
+	Field         string
+	Value         Expr   // eq
+	Values        []Expr // in
+	Low, High     Expr   // range (nil = unbounded)
+	LowInclusive  bool
+	HighInclusive bool
+	Input         PhysicalPlan // the fallback when the index is unavailable
+}
+
+func (PlanIndexLookup) isPhysicalPlan() {}
+
+// PlanSearch resolves ids from a MATCH / SIMILARITY / FUSE expression, in rank order.
+type PlanSearch struct {
+	Expr  Expr
+	Label string
+}
+
+func (PlanSearch) isPhysicalPlan() {}

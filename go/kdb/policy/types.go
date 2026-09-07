@@ -96,6 +96,24 @@ type VectorIndexPolicy struct {
 	DefaultDimensions  int
 }
 
+// DocumentExpiryPolicy configures time-to-live for a namespace's documents (kdb-spec-layer16
+// §9.5). A document is expired when the value at `$.<FieldPath>` is a timestamp - an RFC 3339
+// string or a number of epoch milliseconds - at or before now − GraceMillis. Any other value
+// (absent, null, a non-timestamp string, an object) means "never expires". Reads at head hide
+// expired documents between sweeps; the sweeper deletes them every SweepIntervalMillis.
+type DocumentExpiryPolicy struct {
+	// FieldPath is a top-level field name or a dotted path ("meta.expiresAt") into the body.
+	FieldPath string
+	// GraceMillis keeps a document readable for this long past its timestamp. Default 0.
+	GraceMillis int64
+	// SweepIntervalMillis is how often the server runtime's sweeper deletes expired documents.
+	// Default DefaultSweepIntervalMillis (60 s); zero or negative selects the default.
+	SweepIntervalMillis int64
+}
+
+// DefaultSweepIntervalMillis is DocumentExpiryPolicy.SweepIntervalMillis's default (§9.5).
+const DefaultSweepIntervalMillis int64 = 60_000
+
 // NamespacePolicy is the full policy for one namespace.
 type NamespacePolicy struct {
 	NamespaceID           string
@@ -108,7 +126,9 @@ type NamespacePolicy struct {
 	IndexRetentionDefault storage.IndexRetention
 	GpuPromotion          *GpuPromotionPolicyRef
 	VectorIndex           VectorIndexPolicy
-	Revision              int64
+	// DocumentExpiry is nil when the namespace's documents never expire (the default).
+	DocumentExpiry *DocumentExpiryPolicy
+	Revision       int64
 }
 
 // DefaultRetainGranularity returns the default retain rules.

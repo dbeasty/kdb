@@ -53,7 +53,7 @@ func TestUniqueKeysForSkipsAbsentAndNull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(keys) != 1 || keys[0].FieldName != "email" {
+	if len(keys) != 1 || keys[0].FieldName() != "email" {
 		t.Fatalf("expected one email key, got %v", keys)
 	}
 }
@@ -89,7 +89,7 @@ func TestUniqueKeyCanonicalizationIgnoresSpelling(t *testing.T) {
 // that no longer owns the key must not free somebody else's claim.
 func TestRegistryApplyRetractsThenClaims(t *testing.T) {
 	r := transaction.NewUniqueKeyRegistry()
-	key := transaction.UniqueKey{NamespaceID: uniqueNS, FieldName: "email", Value: `"a@b.c"`}
+	key := transaction.NewUniqueKey(uniqueNS, []string{"email"}, `["a@b.c"]`)
 	first, _ := codec.RandomUUID()
 	second, _ := codec.RandomUUID()
 
@@ -135,7 +135,7 @@ func TestRegistryRebuildReportsExistingDuplicates(t *testing.T) {
 	if !errors.As(err, &dup) {
 		t.Fatalf("expected a UniqueConstraintError from a dirty rebuild, got %v", err)
 	}
-	if dup.Key.FieldName != "email" {
+	if dup.Key.FieldName() != "email" {
 		t.Fatalf("expected the duplicate to name the email field, got %+v", dup)
 	}
 }

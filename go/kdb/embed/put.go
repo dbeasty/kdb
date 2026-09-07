@@ -1,9 +1,6 @@
 package embed
 
 import (
-	"encoding/json"
-	"fmt"
-
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 )
@@ -15,20 +12,23 @@ type PutResult struct {
 }
 
 // PutJSONDocument stores a JSON object as a document and appends a commit on main.
+//
+// The body is stored byte-exact (kdb-spec-layer16 §9.4): no "id" is injected and no key is
+// reordered. A top-level "id" in the body is honoured as the document's identity - a UUID string
+// directly, any other non-empty string through codec.DerivedUUID - and when there is none the
+// engine mints a random UUID and reports it in PutResult.DocID; see document.ResolveID.
 func PutJSONDocument(rt *EmbeddedKdbRuntime, namespaceID, jsonText string) (PutResult, error) {
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(jsonText), &root); err != nil {
-		return PutResult{}, fmt.Errorf("invalid json: %w", err)
-	}
-	docID, err := resolveDocID(root)
+	docID, supplied, err := document.ResolveID(jsonText)
 	if err != nil {
 		return PutResult{}, err
 	}
-	stored, err := document.EnsureIDInJSON(jsonText, docID)
-	if err != nil {
-		return PutResult{}, err
+	if !supplied {
+		docID, err = codec.RandomUUID()
+		if err != nil {
+			return PutResult{}, err
+		}
 	}
-	doc, err := document.FromJSONWithID(docID, stored)
+	doc, err := document.FromJSONWithID(docID, jsonText)
 	if err != nil {
 		return PutResult{}, err
 	}
@@ -67,22 +67,4 @@ func PutJSONDocument(rt *EmbeddedKdbRuntime, namespaceID, jsonText string) (PutR
 		return PutResult{}, err
 	}
 	return PutResult{DocID: doc.ID, Commit: c.Hash}, nil
-}
-
-func resolveDocID(root map[string]json.RawMessage) (codec.UUID, error) {
-	idRaw, ok := root["id"]
-	if !ok {
-		return codec.RandomUUID()
-	}
-	var idStr string
-	if err := json.Unmarshal(idRaw, &idStr); err != nil {
-		// A caller-supplied "id" that isn't a JSON string (a number, an object, ...) is a
-		// mistake worth surfacing, not silently overwritten with a fresh random id the caller
-		// never asked for and won't be expecting.
-		return codec.UUID{}, fmt.Errorf("kdb: \"id\" field must be a string, got %s: %w", idRaw, err)
-	}
-	if idStr == "" {
-		return codec.UUID{}, fmt.Errorf("kdb: \"id\" field must not be empty")
-	}
-	return codec.ParseUUID(idStr)
 }
