@@ -127,27 +127,84 @@ everywhere else here too.
   below the one the writer has open, so commits written after it come back
   from the log (`TestCheckpointReplaysTheTail`).
 
+## Third pass: two history strategies, chosen per namespace
+
+A checkpoint carries the live tree, not the tree every past commit had.
+Recovering those is its own problem, and it has two reasonable answers with
+opposite cost shapes - so both exist, and a namespace records which one it
+was built with (`storage.HistoryStrategy`, `KDB_HISTORY_STRATEGY`).
+
+**`replay`** writes nothing extra. The first read at a historical commit
+replays the delta log and re-hashes every document to recover the mapping.
+Free on the write path, expensive once on a read that touches history,
+nothing at all for a namespace only ever read at its head.
+
+**`objects`** is git's answer: each commit's tree is recorded under that
+tree's own hash, and each document version under its content hash, so a
+historical read is commit → tree → document, three lookups. The default for
+new namespaces.
+
+First read at the oldest of 200 commits, same workload, same machine:
+
+| strategy | allocation for that read |
+|---|---:|
+| replay | 200.95 MB |
+| objects | **0.85 MB** |
+
+The disk it costs, 463 rewrites of one document:
+
+| final document | replay | objects |
+|---:|---:|---:|
+| 9.9 KB | 0.32 MB | 0.58 MB |
+| 1.37 MB | 1.93 MB | 2.50 MB |
+
+Cheaper than it looks because SSTable blocks are compressed and successive
+versions of one document compress well against themselves.
+
+### Why a tree object is a delta, not a tree
+
+A KDB document tree is flat - every document hangs off the root - so a
+whole-tree object costs O(documents) per commit. Git avoids that by nesting
+trees per directory; there are no directories here. Persisting the
+in-memory Merkle trie's nodes instead is worse for the common case: that
+trie is fixed-depth 32 with no path compression, so touching one document
+creates 32 internal nodes of 513 bytes - about 16.5 KB per write whatever
+the document's size.
+
+So a tree object records the entries that changed, against the previous
+tree, with a full object every 32 commits to bound how far a read walks
+back. Resolution is checked against the hash it was looked up under, which
+is exact for content-addressed data: a truncated chain or an encoding bug
+produces a miss and a fall back to the log, never a wrong answer.
+
+### The two are not interchangeable on one directory
+
+A namespace built under `objects` has tree and document objects nothing
+else writes; one built under `replay` has none. Opening either as the other
+is refused with `HistoryStrategyMismatchError`, which names the conversion:
+
+```
+kdb-inspect migrate-history --data-dir DIR --namespace NS --to objects|replay
+```
+
+That runs offline under the data directory's exclusive maintenance lock,
+because it rewrites both what the namespace claims about itself and the
+objects backing that claim - a writer appending commits through the middle
+would leave the two disagreeing. A namespace with no marker at all predates
+the setting and is `replay`, whatever the caller asks for, because that is
+what its bytes actually support.
+
 ## What this still does not fix
-
-**Historical trees are rebuilt by scanning.** A checkpoint carries the live
-tree only. Reading at a historical commit therefore replays the whole log
-once, hashing every document, to recover the docID-to-content-hash mapping
-each commit had. It is lazy (a namespace only ever read at its head never
-pays it) and it happens once per process - but it is a full scan.
-
-Git does not have this problem, because git *stores* trees: a tree object
-is content-addressed, on disk, and shared by hash between commits, so
-reading at an old commit is commit then tree then blob. KDB's delta log
-records commits with full document text but no tree objects, so the mapping
-exists only in memory and can only be re-derived by re-hashing everything.
-Persisting trees as objects removes the rebuild entirely, and is the next
-piece of work.
 
 **`treesByHash` is still unbounded.** Every `DocumentTree` produced in a
 session is retained. Trees are small - 3 MB against 329 MB in the heap
 profile above, because the persistent trie shares structure between
 versions - so this is not the binding constraint, but it has the same shape
 and no bound.
+
+**Under `objects`, a version's text is on disk twice**, in the delta log
+and in the object store. Making the log prunable once its objects are
+written is the change that would remove that, and is not attempted here.
 
 ## A correction on the storage side
 

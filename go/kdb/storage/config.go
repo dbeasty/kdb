@@ -51,6 +51,10 @@ type StorageEngineConfig struct {
 	// WalSkipCorruptRecords makes recovery skip records that fail their
 	// checksum instead of failing the whole replay. Default false.
 	WalSkipCorruptRecords bool
+	// HistoryStrategy decides how reads at historical commits are served
+	// after a restart - see HistoryStrategy. Resolved from the namespace's
+	// own marker at open, so the zero value here is normal.
+	HistoryStrategy HistoryStrategy
 }
 
 // ResolvedGlobalMemoryBudgetBytes returns GlobalMemoryBudgetBytes if set,

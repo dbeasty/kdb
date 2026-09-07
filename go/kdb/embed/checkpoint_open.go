@@ -60,7 +60,14 @@ func restoreNamespace(
 	// Historical trees are the one thing a checkpoint does not carry. They
 	// stay derivable from the log and are built only if something reads at
 	// a historical commit - see engine.SetTreeRebuilder.
-	eng.SetTreeRebuilder(func() error { return rebuildHistoricalTrees(eng, r) })
+	if eng.HistoryStrategy() == storage.HistoryStrategyReplay {
+		// Under the replay strategy nothing wrote tree objects, so the only
+		// way back to a historical tree is the log. Under the objects
+		// strategy this is deliberately left unset: falling back to a scan
+		// there would quietly reintroduce the cost the strategy was chosen
+		// to avoid, at the moment an operator least expects it.
+		eng.SetTreeRebuilder(func() error { return rebuildHistoricalTrees(eng, r) })
+	}
 
 	// Branch-head operations come out of the checkpoint itself rather than
 	// out of the log: reading them from the log would mean indexing every

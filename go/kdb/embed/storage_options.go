@@ -1,6 +1,9 @@
 package embed
 
 import (
+	"os"
+	"strings"
+
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 	s3io "github.com/limidus/kdb/go/kdb/storage/io/s3"
@@ -27,6 +30,19 @@ type FileRuntimeOptions struct {
 	// Requires flock(2), so unix only - see acquireDirLockShared. A read-only runtime observes
 	// the writer's commits as of the moment it opened; call Refresh to pick up newer ones.
 	ReadOnly bool
+
+	// forceHistoryStrategy skips the check that a namespace is being
+	// opened as what it was built as. Reserved for
+	// MigrateHistoryStrategy, which holds the exclusive maintenance lock
+	// and is in the middle of making the marker true.
+	forceHistoryStrategy bool
+
+	// alreadyLocked says the caller already holds this data directory's
+	// exclusive maintenance lock, so this open must not try to take it
+	// again - flock would refuse a second acquisition, even from the
+	// process holding it. Reserved for MigrateHistoryStrategy, which locks
+	// the directory and then needs a runtime inside that lock.
+	alreadyLocked bool
 }
 
 // StorageOptions carries the storage-engine settings a caller may override.
@@ -52,6 +68,14 @@ type StorageOptions struct {
 	// AsyncSyncIntervalMillis is the background sync period under
 	// storage.DurabilityAsync. Zero uses the engine default.
 	AsyncSyncIntervalMillis int64
+	// HistoryStrategy selects how this namespace serves reads at
+	// historical commits - see storage.HistoryStrategy. The zero value
+	// means "whatever this namespace already is", which is what any
+	// caller that does not care should pass; a value that disagrees with
+	// the namespace's recorded strategy is refused at open rather than
+	// silently ignored, because the two leave different things on disk.
+	HistoryStrategy storage.HistoryStrategy
+
 	// SyncMode selects the physical sync primitive every flush uses. The zero
 	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous
 	// hardcoded behavior; storio.SyncModeFast trades power-loss protection for
@@ -59,7 +83,21 @@ type StorageOptions struct {
 	SyncMode storio.SyncMode
 }
 
-// FileRuntimeOptionsFromEnv returns options with S3 config from KDB_S3_* env vars.
+// FileRuntimeOptionsFromEnv returns options with S3 config from KDB_S3_* env
+// vars and the history strategy from KDB_HISTORY_STRATEGY.
+//
+// An unrecognized KDB_HISTORY_STRATEGY is ignored rather than fatal here,
+// because this returns no error and a typo must not silently become "open
+// this namespace as something else": leaving it unset means "whatever the
+// namespace already is", which is the safe reading. Callers that want a
+// typo reported should parse it themselves with
+// storage.ParseHistoryStrategy.
 func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
-	return FileRuntimeOptions{S3: s3io.ConfigFromEnv()}
+	opts := FileRuntimeOptions{S3: s3io.ConfigFromEnv()}
+	if raw := strings.ToLower(strings.TrimSpace(os.Getenv("KDB_HISTORY_STRATEGY"))); raw != "" {
+		if s, err := storage.ParseHistoryStrategy(raw); err == nil {
+			opts.Storage.HistoryStrategy = s
+		}
+	}
+	return opts
 }

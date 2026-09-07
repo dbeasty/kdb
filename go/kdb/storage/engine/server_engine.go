@@ -43,19 +43,29 @@ type ServerEngine struct {
 	// Read on the miss path only, so an atomic load rather than a lock.
 	coldLoader atomic.Pointer[coldDocLoader]
 	// coldLoads counts versions re-read from durable storage because the
-	// version store had evicted them. A number that climbs steadily under
-	// ordinary reads means the budget is too small for the live working
-	// set, which is the one way this design degrades quietly rather than
-	// loudly - so it is worth being able to see.
+	// version store had evicted them - from the object store or, failing
+	// that, the delta log; both are the same event from a caller's point of
+	// view. A number that climbs steadily under ordinary reads means the
+	// budget is too small for the live working set, which is the one way
+	// this design degrades quietly rather than loudly - so it is worth
+	// being able to see.
 	coldLoads atomic.Int64
 
 	// Historical document trees are not restored by a checkpoint; they are
 	// rebuilt from the delta log on the first read that needs one. See
 	// SetTreeRebuilder.
-	treeRebuildMu    sync.Mutex
-	treeRebuild      treeRebuilder
-	treeRebuildOnce  *sync.Once
-	treeRebuildErr   error
+	treeRebuildMu   sync.Mutex
+	treeRebuild     treeRebuilder
+	treeRebuildOnce *sync.Once
+	treeRebuildErr  error
+
+	// treeChain remembers how many delta tree objects stand behind each
+	// tree, so putTreeObject knows when to write a full one instead. Lost
+	// on restart, which only means the first tree written in a new process
+	// starts a fresh chain - never a correctness issue, since resolution
+	// stops at the first full object it finds.
+	treeChainMu      sync.Mutex
+	treeChain        map[codec.Hash]int
 	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
@@ -124,6 +134,16 @@ func (e *ServerEngine) treeAt(atCommit codec.Hash) (document.DocumentTree, bool,
 	if ok {
 		return tree, true, nil
 	}
+	// Addressed lookup first: the tree object store answers directly from
+	// this tree's hash. Only if it cannot - a store written before tree
+	// objects existed, or one whose objects have not survived - does the
+	// expensive rebuild run.
+	if tree, ok := e.treeFromObjects(atCommit); ok {
+		e.treesMu.Lock()
+		e.treesByHash[atCommit] = tree
+		e.treesMu.Unlock()
+		return tree, true, nil
+	}
 	if err := e.rebuildTreesOnce(); err != nil {
 		return document.DocumentTree{}, false, err
 	}
@@ -144,6 +164,12 @@ func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree) {
 func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w wal.WriteAheadLog) *ServerEngine {
 	cache := sstable.NewBlockCache(config.ResolvedGlobalMemoryBudgetBytes() / 4)
 	blobStore := sstable.NewLsmBlobStore(config.IOShim, namespaceID, cache)
+	if config.IOShim != nil {
+		// Pick up tables written by previous runs. Without this the store
+		// starts empty every process and everything ever flushed - tree
+		// objects included - is invisible after a restart.
+		_ = blobStore.DiscoverTables()
+	}
 	cap := storage.CapabilitySet{
 		PersistsDeltaLog:          true,
 		PersistsAcrossReload:      w != nil,
@@ -198,12 +224,25 @@ func (e *ServerEngine) startAsyncSync() {
 // Close stops the background async-sync ticker, if one is running. Safe
 // to call on engines without one (no-op).
 func (e *ServerEngine) Close() error {
+	// Flush before stopping anything: whatever is still only in the
+	// memtable is not on disk yet, and for tree objects that is the
+	// difference between a historical read resolving by address next time
+	// and having to replay the log to rebuild what it needed.
+	var firstErr error
+	// Only where there is somewhere to flush to: an engine built without an
+	// IO shim (in-memory targets, and much of the test suite) has a
+	// memtable whose writer would dereference a nil store.
+	if e.memTable != nil && e.config.IOShim != nil {
+		if _, err := e.memTable.Flush(0); err != nil {
+			firstErr = err
+		}
+	}
 	if e.asyncStop == nil {
-		return nil
+		return firstErr
 	}
 	close(e.asyncStop)
 	<-e.asyncDone
-	return nil
+	return firstErr
 }
 
 func (e *ServerEngine) NamespaceID() string { return e.namespaceID }
@@ -305,6 +344,14 @@ func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommi
 	}
 	d, ok := e.docsByHash.Get(h)
 	if !ok {
+		// The object store first: under the objects strategy this is a
+		// direct fetch by content hash, where loadCold's fallback has to
+		// index the delta log to find the same bytes.
+		if obj, found := e.documentFromObject(docID, h); found {
+			e.coldLoads.Add(1)
+			e.docsByHash.Put(h, obj)
+			return &obj, nil
+		}
 		loaded, found, err := e.loadCold(docID, h)
 		if err != nil || !found {
 			return nil, err
@@ -408,6 +455,20 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 			// skipping here would silently drop rows from a scan at an
 			// older atCommit. A version the loader also cannot find is
 			// skipped, which is what a miss has always meant.
+			if obj, found := e.documentFromObject(id, h); found {
+				e.coldLoads.Add(1)
+				e.docsByHash.Put(h, obj)
+				d = obj
+				buf = append(buf, d)
+				if len(buf) >= batchSize {
+					if err := onBatch(append([]document.Document(nil), buf...)); err != nil {
+						scanErr = err
+						return false
+					}
+					buf = buf[:0]
+				}
+				return true
+			}
 			loaded, found, err := e.loadCold(id, h)
 			if err != nil {
 				scanErr = err
@@ -479,11 +540,15 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 			return document.DocumentTree{}, err
 		}
 	}
+	baseTree := e.tree
+	changed := make([]TreeChange, 0, len(puts))
 	for _, doc := range puts {
 		h, err := doc.ContentHash()
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
+		changed = append(changed, TreeChange{DocID: doc.ID, ContentHash: h})
+		e.putDocumentObject(h, doc)
 		prev, hadPrev := e.tree.HashFor(doc.ID)
 		// Pin before Put, never after: Put evicts to stay within budget as
 		// part of the insert, so a version pinned afterwards can already be
@@ -505,6 +570,12 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
+	}
+	// Record what this commit's tree looks like, addressed by its own
+	// hash, so a later read at this commit resolves by lookup instead of
+	// by replaying the log. See tree_objects.go.
+	if len(changed) > 0 || len(deletes) > 0 {
+		e.putTreeObject(baseTree, e.tree, changed, deletes)
 	}
 	e.treesMu.Lock()
 	e.publishTreeLocked(e.tree)

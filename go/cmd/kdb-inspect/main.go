@@ -30,6 +30,8 @@ func run(args []string) error {
 		return verifyCmd(args[1:])
 	case "repair-segments":
 		return repairSegmentsCmd(args[1:])
+	case "migrate-history":
+		return migrateHistoryCmd(args[1:])
 	case "restore":
 		return restoreCmd(args[1:])
 	case "backup":
@@ -93,6 +95,15 @@ Usage:
       Truncate torn tails and quarantine corrupt frames where provably safe.
       Refuses (naming the missing commits) when a repair would drop history
       still referenced by later segments - run restore instead in that case.
+
+  kdb-inspect migrate-history --data-dir DIR --namespace NS --to replay|objects
+      Convert a namespace between the two history strategies, offline. "objects"
+      records each commit's document tree under that tree's hash, so a read at a
+      historical commit resolves by lookup; "replay" keeps nothing extra and
+      rebuilds trees by re-reading the delta log on the first such read. A
+      namespace opened under the strategy it was not built with is refused, and
+      this is the conversion that error points at. Takes the data directory's
+      exclusive lock, so no service may be running against it.
 
   kdb-inspect restore --namespace NS --out DIR [--source LABEL=PATH ...] [--from-backup DIR|s3 --backup-id ID] [--codec zstd|none]
       Rebuild a namespace's delta log into DIR from the verified union of one

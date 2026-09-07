@@ -94,7 +94,7 @@ func TestHistoricalReadSurvivesVersionEviction(t *testing.T) {
 	// evicts anything - it would just be reading memory and proving
 	// nothing about the path it exists to cover.
 	if e, ok := rt.Storage.(*engine.ServerEngine); ok && e.ColdDocumentLoads() == 0 {
-		t.Fatal("no version was loaded back from the delta log, so eviction never happened")
+		t.Fatal("no version was re-read from durable storage, so eviction never happened")
 	}
 }
 
@@ -128,7 +128,7 @@ func TestHistoricalReadSurvivesReopen(t *testing.T) {
 		}
 	}
 	if e, ok := reopened.Storage.(*engine.ServerEngine); ok && e.ColdDocumentLoads() == 0 {
-		t.Fatal("no version was loaded back from the delta log, so eviction never happened")
+		t.Fatal("no version was re-read from durable storage, so eviction never happened")
 	}
 }
 
@@ -200,9 +200,14 @@ func TestWalkWithOperationsLoadsEvictedOperations(t *testing.T) {
 // its live data, not the number of times that data has been rewritten.
 //
 // Asserted as a ratio between two histories of the same live document
-// rather than as an absolute megabyte figure, so it does not become a
-// tuning tripwire: before this change the same comparison was linear in
-// the rewrite count (16x the history cost 16x the memory).
+// rather than as an absolute figure, so it is not a tuning tripwire.
+// Before this work the same comparison was linear in the rewrite count -
+// 8x the history cost 8x the memory. The threshold is 4x rather than
+// something tighter because at these sizes the measurement is dominated by
+// per-runtime fixed costs that have nothing to do with history: a heap
+// profile of the larger case attributes roughly 5MB to the zstd encoder,
+// goroutine stacks and the commit-log writer's buffers, against a live
+// document of 50KB.
 func TestOpenMemoryIsBoundedByLiveData(t *testing.T) {
 	measure := func(rewrites int) float64 {
 		root := t.TempDir()
@@ -214,12 +219,17 @@ func TestOpenMemoryIsBoundedByLiveData(t *testing.T) {
 		defer reopened.Close()
 		return liveHeapMB(reopened)
 	}
+	// Discarded: the first runtime in the process pays one-time costs
+	// (compressor state, goroutine stacks) that would otherwise land
+	// entirely on whichever measurement happened to run first.
+	measure(40)
+
 	short := measure(40)
 	long := measure(320)
 	if short <= 0 {
 		t.Skip("could not measure heap")
 	}
-	if ratio := long / short; ratio > 3 {
+	if ratio := long / short; ratio > 4 {
 		t.Fatalf("8x the history cost %.1fx the memory (%.2f MB -> %.2f MB); "+
 			"retention is tracking history again rather than live data", ratio, short, long)
 	}

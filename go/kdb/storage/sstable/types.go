@@ -1,10 +1,13 @@
 package sstable
 
 import (
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
+	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
 // BlockHandle points at a compressed block in a segment, or - when Deleted is set - records that
@@ -157,4 +160,41 @@ func (s *LsmBlobStore) AddTable(handle Handle) {
 	// Copy rather than append in place so a Get holding the old slice header keeps reading a
 	// stable backing array.
 	s.tables = append(append([]Handle(nil), s.tables...), handle)
+}
+
+// DiscoverTables registers every SSTable already on disk for this
+// namespace, so a process that did not write them can still read them.
+//
+// Without this the table list starts empty on every open and everything
+// previously flushed is invisible - which made the blob store durable in
+// name only, since a value survived being written but not being reopened.
+// That is fine for a pure cache and fatal for the tree objects that let a
+// historical read resolve by address (see engine/tree_objects.go).
+//
+// Registration order is file-listing order, not write order, which for
+// this store is not the problem it would be for a general LSM: every key
+// here is the hash of the value stored under it, so two tables holding the
+// same key hold identical bytes and "which is newer" cannot change an
+// answer. Tombstones would break that, and nothing tombstones a
+// content-addressed object.
+func (s *LsmBlobStore) DiscoverTables() error {
+	names, err := s.io.ListSegments(s.namespaceID)
+	if err != nil {
+		return err
+	}
+	prefix := storio.SegmentNameBuilder.NamespacePrefix(s.namespaceID) + "sstable/"
+	for _, name := range names {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		level := 0
+		rest := name[len(prefix):]
+		if slash := strings.IndexByte(rest, '/'); slash > 1 && rest[0] == 'L' {
+			if n, convErr := strconv.Atoi(rest[1:slash]); convErr == nil {
+				level = n
+			}
+		}
+		s.AddTable(Handle{Level: level, SegmentName: name})
+	}
+	return nil
 }

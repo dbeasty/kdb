@@ -38,7 +38,7 @@ func rebuildHistoricalTrees(eng *engine.ServerEngine, r storage.DeltaSegmentRead
 	tree := document.EmptyDocumentTree()
 	for _, seg := range segments {
 		streamErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
-			next, err := applyCommitToTree(tree, c)
+			next, _, _, err := applyCommitToTree(tree, c)
 			if err != nil {
 				return err
 			}
@@ -58,7 +58,7 @@ func rebuildHistoricalTrees(eng *engine.ServerEngine, r storage.DeltaSegmentRead
 // the staging semantics the write path used. Documents are hashed from
 // their text, which is the reason this is expensive: the content hash a
 // tree stores cannot be recovered from the log any other way.
-func applyCommitToTree(tree document.DocumentTree, c document.Commit) (document.DocumentTree, error) {
+func applyCommitToTree(tree document.DocumentTree, c document.Commit) (document.DocumentTree, []engine.TreeChange, []codec.UUID, error) {
 	puts := make(map[codec.UUID]document.Document)
 	deletes := make(map[codec.UUID]struct{})
 	for _, op := range c.Operations {
@@ -77,19 +77,85 @@ func applyCommitToTree(tree document.DocumentTree, c document.Commit) (document.
 	}
 	out := tree
 	var err error
+	removed := make([]codec.UUID, 0, len(deletes))
 	for id := range deletes {
+		removed = append(removed, id)
 		if out, err = out.Without(id); err != nil {
-			return document.DocumentTree{}, err
+			return document.DocumentTree{}, nil, nil, err
 		}
 	}
+	changed := make([]engine.TreeChange, 0, len(puts))
 	for _, doc := range puts {
 		h, err := doc.ContentHash()
 		if err != nil {
-			return document.DocumentTree{}, err
+			return document.DocumentTree{}, nil, nil, err
 		}
+		changed = append(changed, engine.TreeChange{DocID: doc.ID, ContentHash: h})
 		if out, err = out.With(doc.ID, h); err != nil {
-			return document.DocumentTree{}, err
+			return document.DocumentTree{}, nil, nil, err
 		}
 	}
-	return out, nil
+	return out, changed, removed, nil
+}
+
+// recordTreeObjectsForHistory walks the whole delta log and records a tree
+// object for every commit in it - the conversion behind
+// MigrateHistoryStrategy's move to the objects strategy.
+//
+// Uses the same tree-folding code the rebuild path uses, so the trees it
+// records are the ones the write path would have produced; anything else
+// would file objects under hashes no commit names.
+func recordTreeObjectsForHistory(eng *engine.ServerEngine, r storage.DeltaSegmentReader) error {
+	if r == nil {
+		return nil
+	}
+	segments, err := r.ListSegments()
+	if err != nil {
+		return err
+	}
+	tree := document.EmptyDocumentTree()
+	for _, seg := range segments {
+		streamErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
+			next, puts, deletes, err := applyCommitToTree(tree, c)
+			if err != nil {
+				return err
+			}
+			if len(puts) > 0 || len(deletes) > 0 {
+				eng.RecordTreeObject(tree, next, puts, deletes)
+			}
+			// The versions themselves, too: a tree object gets a read as
+			// far as a content hash, and something has to hold the bytes.
+			for _, op := range c.Operations {
+				w, isWrite := op.(document.WriteOp)
+				if !isWrite {
+					continue
+				}
+				doc := documentFromPatch(w.DocID, w.Patch)
+				h, err := doc.ContentHash()
+				if err != nil {
+					continue
+				}
+				eng.RecordDocumentObject(h, doc)
+			}
+			tree = next
+			return nil
+		})
+		var corrupt *delta.CorruptFrameError
+		if streamErr != nil && !errors.As(streamErr, &corrupt) {
+			return streamErr
+		}
+	}
+	return nil
+}
+
+// documentFromPatch mirrors how replay turns a WriteOp back into a
+// document (see applyReplayedCommit): a patch that will not parse is still
+// the document's bytes and is kept as-is, so the content hash computed
+// from it matches the one the write path recorded.
+func documentFromPatch(docID codec.UUID, patch string) document.Document {
+	doc, err := document.FromJSONWithID(docID, patch)
+	if err != nil {
+		return document.Document{ID: docID, JSON: patch}
+	}
+	return doc
 }
