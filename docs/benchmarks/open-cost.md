@@ -194,7 +194,26 @@ would leave the two disagreeing. A namespace with no marker at all predates
 the setting and is `replay`, whatever the caller asks for, because that is
 what its bytes actually support.
 
+## The settings
+
+Everything above is a per-namespace initialization setting rather than a
+built-in behaviour, on `embed.FileRuntimeOptions.Storage`:
+
+| setting | env | default | what it trades |
+|---|---|---|---|
+| `HistoryStrategy` | `KDB_HISTORY_STRATEGY` | `objects` for new namespaces | write cost against historical-read cost |
+| `DocumentCacheBytes` | `KDB_DOCUMENT_CACHE_BYTES` | half the hot-tier budget | resident memory against cold reads |
+| `CommitOpsBytes` | `KDB_COMMIT_OPS_BYTES` | a quarter of it | the same, for commit operations |
+| `TreeChainLimit` | — | 32 | bytes written against how far a historical read walks back |
+| `DisableCheckpoints` | `KDB_CHECKPOINTS=off` | off (checkpoints on) | open cost against not writing one |
+
+`DisableCheckpoints` also stops a checkpoint being *read*, not just
+written: a namespace with the setting off must actually open from the log,
+or turning it off would change nothing until the next write.
+
 ## What this still does not fix
+
+
 
 **`treesByHash` is still unbounded.** Every `DocumentTree` produced in a
 session is retained. Trees are small - 3 MB against 329 MB in the heap

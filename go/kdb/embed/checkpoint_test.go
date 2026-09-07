@@ -11,6 +11,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
 
 // openChurnMB is how much a single open allocates, which is the number the
@@ -258,5 +259,91 @@ func removeCheckpoints(t *testing.T, root string) {
 	}
 	if !found {
 		t.Fatal("no checkpoint was written, so this test is not comparing what it claims to")
+	}
+}
+
+// TestCheckpointsCanBeTurnedOff covers the setting, and the part of it
+// that is easy to get wrong: a namespace with checkpoints disabled must
+// also not *read* one left behind from when they were enabled, or turning
+// the setting off would not actually put the open back on the log.
+func TestCheckpointsCanBeTurnedOff(t *testing.T) {
+	root := t.TempDir()
+	rt := smallBudgetRuntime(t, root)
+	commits, texts := writeVersions(t, rt, 60)
+	rt.Close()
+
+	if len(checkpointPaths(t, root)) == 0 {
+		t.Fatal("expected a checkpoint from the first session")
+	}
+
+	opts := embed.FileRuntimeOptions{}
+	opts.Storage.MemoryBudgetBytes = 1 << 20
+	opts.Storage.DisableCheckpoints = true
+	reopened, err := embed.OpenFileRuntimeWithOptions(root, "bench", "bench/matches", schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	// Replayed from the log rather than restored, and therefore complete:
+	// every version still readable at the commit that wrote it.
+	docID, _, err := document.ResolveID(texts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range []int{0, 30, 59} {
+		commit, err := reopened.DAG.GetCommitOrThrow(commits[i])
+		if err != nil {
+			t.Fatalf("version %d: %v", i, err)
+		}
+		got, err := reopened.Storage.GetDocument("bench/matches", docID, commit.DocumentTreeHash)
+		if err != nil {
+			t.Fatalf("version %d: %v", i, err)
+		}
+		if got == nil || got.JSON != texts[i] {
+			t.Fatalf("version %d: wrong content with checkpoints disabled", i)
+		}
+	}
+}
+
+// TestExplicitRetentionBudgetsAreHonoured checks the budget settings reach
+// the engine rather than being quietly replaced by the derived defaults.
+func TestExplicitRetentionBudgetsAreHonoured(t *testing.T) {
+	root := t.TempDir()
+	opts := embed.FileRuntimeOptions{}
+	// A hot-tier budget large enough that the derived defaults would keep
+	// everything, with explicit budgets small enough that they cannot.
+	opts.Storage.MemoryBudgetBytes = 512 << 20
+	opts.Storage.DocumentCacheBytes = 1 << 20
+	opts.Storage.CommitOpsBytes = 1 << 20
+	rt, err := embed.OpenFileRuntimeWithOptions(root, "bench", "bench/matches", schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commits, texts := writeVersions(t, rt, 120)
+	defer rt.Close()
+
+	e, ok := rt.Storage.(*engine.ServerEngine)
+	if !ok {
+		t.Skip("not the server engine")
+	}
+	docID, _, err := document.ResolveID(texts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := rt.DAG.GetCommitOrThrow(commits[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := rt.Storage.GetDocument("bench/matches", docID, commit.DocumentTreeHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.JSON != texts[0] {
+		t.Fatal("the oldest version was not readable")
+	}
+	if e.ColdDocumentLoads() == 0 {
+		t.Fatal("nothing was evicted under a 1MB document budget, so the explicit setting was ignored " +
+			"in favour of the budget derived from MemoryBudgetBytes")
 	}
 }

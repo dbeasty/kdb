@@ -25,8 +25,14 @@ func restoreNamespace(
 	r storage.DeltaSegmentReader,
 	shim storage.PlatformIOShim,
 	namespaceID string,
+	disabled bool,
 ) (replayedInFull bool, err error) {
 	eng, _ := store.(*engine.ServerEngine)
+	if disabled {
+		// Not just "do not write one": a namespace with checkpoints turned
+		// off must not read a stale one left from when they were on.
+		return true, replayDeltaNamespace(d, store, r)
+	}
 	cp, ok := readCheckpoint(shim, namespaceID)
 	if !ok || eng == nil || r == nil {
 		return true, replayDeltaNamespace(d, store, r)
@@ -121,7 +127,11 @@ func saveCheckpoint(
 	shim storage.PlatformIOShim,
 	namespaceID string,
 	through int64,
+	disabled bool,
 ) error {
+	if disabled {
+		return nil
+	}
 	eng, ok := store.(*engine.ServerEngine)
 	if !ok || shim == nil || through < 0 {
 		return nil
@@ -170,6 +180,7 @@ func checkpointAfterFullReplay(
 	w storage.DeltaSegmentWriter,
 	shim storage.PlatformIOShim,
 	namespaceID string,
+	disabled bool,
 ) {
 	seq, ok := w.(storage.DeltaSegmentSequencer)
 	if !ok {
@@ -177,7 +188,7 @@ func checkpointAfterFullReplay(
 	}
 	// Strictly below the writer's own segment: that one is open for
 	// appends for the rest of this session.
-	if err := saveCheckpoint(d, store, r, shim, namespaceID, seq.SequenceNumber()-1); err != nil {
+	if err := saveCheckpoint(d, store, r, shim, namespaceID, seq.SequenceNumber()-1, disabled); err != nil {
 		log.Printf("kdb: namespace %s: could not write a checkpoint after replay (%v) - the next open will replay the log again", namespaceID, err)
 	}
 }
@@ -190,11 +201,12 @@ func checkpointOnClose(
 	r storage.DeltaSegmentReader,
 	shim storage.PlatformIOShim,
 	namespaceID string,
+	disabled bool,
 ) {
 	if r == nil {
 		return
 	}
-	if err := saveCheckpoint(d, store, r, shim, namespaceID, highestSegmentSequence(r)); err != nil {
+	if err := saveCheckpoint(d, store, r, shim, namespaceID, highestSegmentSequence(r), disabled); err != nil {
 		log.Printf("kdb: namespace %s: could not write a checkpoint on close (%v) - the next open will replay the log", namespaceID, err)
 	}
 }

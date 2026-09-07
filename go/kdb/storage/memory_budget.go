@@ -82,6 +82,9 @@ const DefaultDocumentCacheFraction = 0.5
 // number. What the budget actually bounds is how much *history* is kept in
 // memory, which before it was bounded was everything, forever.
 func ResolvedDocumentCacheBytes(cfg StorageEngineConfig) int64 {
+	if cfg.DocumentCacheBytes > 0 {
+		return cfg.DocumentCacheBytes
+	}
 	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultDocumentCacheFraction)
 	if budget < 0 {
 		return 0
@@ -100,6 +103,9 @@ const DefaultCommitOpsFraction = 0.25
 // may keep resident before it starts dropping the oldest and re-reading
 // them from the delta log on demand. See dag.SetOperationsLoader.
 func ResolvedCommitOpsBytes(cfg StorageEngineConfig) int64 {
+	if cfg.CommitOpsBytes > 0 {
+		return cfg.CommitOpsBytes
+	}
 	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultCommitOpsFraction)
 	if budget < 0 {
 		return 0

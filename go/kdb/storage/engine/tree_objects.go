@@ -53,13 +53,22 @@ const (
 	treeObjectKindFull = 0
 	treeObjectKindDiff = 1
 
-	// treeChainLimit bounds how many delta objects may stack up before a
-	// full one is written. It is the direct trade between write cost
-	// (a full object is O(documents)) and historical-read cost (a chain is
-	// walked one fetch at a time). 32 keeps a historical read to at most 32
-	// small fetches while amortizing the full object across 32 commits.
-	treeChainLimit = 32
+	// defaultTreeChainLimit bounds how many delta objects may stack up
+	// before a full one is written, when nothing configures it. It is the
+	// direct trade between write cost (a full object is O(documents)) and
+	// historical-read cost (a chain is walked one fetch at a time). 32
+	// keeps a historical read to at most 32 small fetches while amortizing
+	// the full object across 32 commits.
+	defaultTreeChainLimit = 32
 )
+
+// treeChainLimit is the configured bound, or the default.
+func (e *ServerEngine) treeChainLimit() int {
+	if e.config.TreeChainLimit > 0 {
+		return e.config.TreeChainLimit
+	}
+	return defaultTreeChainLimit
+}
 
 // treeObject is one tree recorded relative to the one before it.
 type treeObject struct {
@@ -187,7 +196,7 @@ func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document
 		puts:     puts,
 		deletes:  deletes,
 	}
-	if chain >= treeChainLimit {
+	if chain >= e.treeChainLimit() {
 		o.kind = treeObjectKindFull
 		o.chainLen = 0
 		o.baseHash = document.EmptyDocumentTree().TreeHash
@@ -290,7 +299,8 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 	var chain []treeObject
 	current := hash
 	grounded := false
-	for i := 0; i <= treeChainLimit; i++ {
+	limit := e.treeChainLimit()
+	for i := 0; i <= limit; i++ {
 		if current == emptyHash {
 			grounded = true
 			break

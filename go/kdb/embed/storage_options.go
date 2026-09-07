@@ -2,6 +2,7 @@ package embed
 
 import (
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -76,11 +77,45 @@ type StorageOptions struct {
 	// silently ignored, because the two leave different things on disk.
 	HistoryStrategy storage.HistoryStrategy
 
+	// DocumentCacheBytes caps how many bytes of document versions stay
+	// resident before the oldest are evicted and re-read on demand. Zero
+	// takes half the hot-tier budget. Raising it trades memory for fewer
+	// cold reads; lowering it, the reverse.
+	DocumentCacheBytes int64
+	// CommitOpsBytes caps how many bytes of commit operations the DAG
+	// keeps resident. Zero takes a quarter of the hot-tier budget.
+	CommitOpsBytes int64
+	// TreeChainLimit is how many delta tree objects may stack up before a
+	// full one is written, under the objects history strategy. Zero uses
+	// the built-in default of 32.
+	TreeChainLimit int
+	// DisableCheckpoints stops this namespace writing the checkpoint that
+	// lets the next open skip the delta log; every open then replays it in
+	// full. Off by default.
+	DisableCheckpoints bool
+
 	// SyncMode selects the physical sync primitive every flush uses. The zero
 	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous
 	// hardcoded behavior; storio.SyncModeFast trades power-loss protection for
 	// an order-of-magnitude cheaper sync (see the SyncMode docs).
 	SyncMode storio.SyncMode
+}
+
+// envBytes reads a non-negative byte count, or zero when the variable is
+// unset or unparseable. Unparseable is zero rather than an error for the
+// same reason KDB_HISTORY_STRATEGY ignores a typo here: this function
+// returns no error, and zero means "use the default", which is the safe
+// reading of a value nobody can interpret.
+func envBytes(name string) int64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // FileRuntimeOptionsFromEnv returns options with S3 config from KDB_S3_* env
@@ -98,6 +133,12 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 		if s, err := storage.ParseHistoryStrategy(raw); err == nil {
 			opts.Storage.HistoryStrategy = s
 		}
+	}
+	opts.Storage.DocumentCacheBytes = envBytes("KDB_DOCUMENT_CACHE_BYTES")
+	opts.Storage.CommitOpsBytes = envBytes("KDB_COMMIT_OPS_BYTES")
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("KDB_CHECKPOINTS"))) {
+	case "off", "false", "0":
+		opts.Storage.DisableCheckpoints = true
 	}
 	return opts
 }

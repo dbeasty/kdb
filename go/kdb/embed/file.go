@@ -103,6 +103,10 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		Durability:              opts.Storage.Durability,
 		AsyncSyncIntervalMillis: opts.Storage.AsyncSyncIntervalMillis,
 		HistoryStrategy:         historyStrategy,
+		DocumentCacheBytes:      opts.Storage.DocumentCacheBytes,
+		CommitOpsBytes:          opts.Storage.CommitOpsBytes,
+		TreeChainLimit:          opts.Storage.TreeChainLimit,
+		DisableCheckpoints:      opts.Storage.DisableCheckpoints,
 	}
 	target := engine.TargetServer
 	if opts.ReadOnly {
@@ -144,7 +148,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		// the sum of its whole history (docs/benchmarks/open-cost.md).
 		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
 	}
-	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID)
+	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +161,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		)
 		dagOut = persisting
 		if replayedInFull {
-			checkpointAfterFullReplay(d, store, handle.DeltaReader(), w, io, namespaceID)
+			checkpointAfterFullReplay(d, store, handle.DeltaReader(), w, io, namespaceID, opts.Storage.DisableCheckpoints)
 		}
 	}
 
@@ -214,7 +218,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 			}
 			// After the seal, so no segment can gain another commit and the
 			// checkpoint can claim the newest one - see checkpointOnClose.
-			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID)
+			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints)
 		}
 		if err := handle.Close(); err != nil && firstErr == nil {
 			firstErr = err
