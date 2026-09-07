@@ -114,7 +114,7 @@ func (f *DefaultFactory) ActiveSegmentName(partitionKey string, walID codec.UUID
 	return io.SegmentNameBuilder.WAL(partitionKey, walID.String())
 }
 
-// rotatedSegmentName names the segment that starts at firstSequence. The sequence is
+// RotatedSegmentName names the segment that starts at firstSequence. The sequence is
 // zero-padded so that lexicographic order (all ListSegments implementations sort that way)
 // equals numeric order, matching the convention DeltaSequencedFileName already uses.
 //
@@ -123,7 +123,7 @@ func (f *DefaultFactory) ActiveSegmentName(partitionKey string, walID codec.UUID
 // and PlatformIOShim has no rename (nor a copy that wouldn't rewrite the whole segment).
 // Naming by start sequence carries the same ordering and truncation information: a sealed
 // segment's last sequence is its successor's firstSequence - 1.
-func rotatedSegmentName(partitionKey string, walID codec.UUID, firstSequence int64) string {
+func RotatedSegmentName(partitionKey string, walID codec.UUID, firstSequence int64) string {
 	return io.SegmentNameBuilder.WAL(partitionKey, fmt.Sprintf("%s.%020d", walID.String(), firstSequence))
 }
 
@@ -137,7 +137,7 @@ func latestWalChain(segmentNames []string) ([]walSegment, string) {
 			continue
 		}
 		fileName := name[strings.LastIndex(name, "/")+1:]
-		walID, firstSeq, ok := parseWalFileName(fileName)
+		walID, firstSeq, ok := ParseWalFileName(fileName)
 		if !ok {
 			continue
 		}
@@ -154,10 +154,14 @@ func latestWalChain(segmentNames []string) ([]walSegment, string) {
 	return chain, newest
 }
 
-// parseWalFileName splits a WAL segment file name into its walID and the sequence its records
+// ParseWalFileName splits a WAL segment file name into its walID and the sequence its records
 // start at. A name with no sequence suffix is a WAL's first segment (and is also what every
 // pre-rotation WAL wrote), so it starts at sequence 1.
-func parseWalFileName(fileName string) (walID string, firstSequence int64, ok bool) {
+//
+// Exported because the name format is part of the cross-language on-disk contract, not an
+// implementation detail: Kotlin's parseWalFileName must accept exactly the same names, and the
+// physical-layer conformance suite pins that from outside this package.
+func ParseWalFileName(fileName string) (walID string, firstSequence int64, ok bool) {
 	id, suffix, hasSuffix := strings.Cut(fileName, ".")
 	if id == "" {
 		return "", 0, false
@@ -279,7 +283,7 @@ func (w *DefaultWriteAheadLog) rotateIfFullLocked(incomingBytes, firstSequence i
 		return nil
 	}
 	previous := w.segmentName
-	name := rotatedSegmentName(w.partitionKey, w.walID, firstSequence)
+	name := RotatedSegmentName(w.partitionKey, w.walID, firstSequence)
 	if _, err := w.io.AppendToSegment(name, nil); err != nil {
 		return err
 	}
@@ -311,7 +315,7 @@ func (w *DefaultWriteAheadLog) Recover(handler func(Record) error) (RecoverySumm
 	segments := append([]walSegment(nil), w.segments...)
 	w.mu.Unlock()
 
-	var replayed, maxSeq int64
+	var replayed, skipped, maxSeq int64
 	var activeSize int64
 	scanned := 0
 	for i, seg := range segments {
@@ -323,10 +327,12 @@ func (w *DefaultWriteAheadLog) Recover(handler func(Record) error) (RecoverySumm
 			activeSize = int64(len(bytes))
 		}
 		scanned++
-		records, err := DecodeRecords(bytes, w.partitionKey, seg.name, w.skipCorrupt)
+		decoded, err := DecodeRecords(bytes, w.partitionKey, seg.name, w.skipCorrupt)
 		if err != nil {
 			return RecoverySummary{}, err
 		}
+		skipped += decoded.SkippedCorrupt
+		records := decoded.Records
 		sort.Slice(records, func(a, b int) bool { return records[a].Sequence < records[b].Sequence })
 		for _, r := range records {
 			if err := handler(r); err != nil {
@@ -346,15 +352,25 @@ func (w *DefaultWriteAheadLog) Recover(handler func(Record) error) (RecoverySumm
 	w.mu.Unlock()
 	return RecoverySummary{
 		RecordsReplayed: replayed,
-		LastSequence:    maxSeq,
-		SegmentsScanned: scanned,
+		// Reported rather than dropped: DecodeRecords now returns how many frames it skipped,
+		// so a caller can tell a clean recovery from one that silently lost records. This field
+		// was previously never assigned and so always read zero.
+		RecordsSkippedCorrupt: skipped,
+		LastSequence:          maxSeq,
+		SegmentsScanned:       scanned,
 	}, nil
 }
 
 // Truncate drops WAL bytes already reflected elsewhere: every sealed segment whose records all
-// fall at or below truncateThroughSequence is deleted, and the active segment is emptied when
-// it too is fully covered. The sequence counter is preserved either way, so appends continue
-// where they left off.
+// fall at or below truncateThroughSequence is deleted, and the active segment is emptied when it
+// too is fully covered. When the cut falls *inside* the active segment, that segment is rewritten
+// keeping only the records past the cut - the log is append-only with no in-place trim, so a
+// rewrite is the only way to reclaim anything, and without it a partial truncate silently did
+// nothing until every last record was superseded. The sequence counter is preserved in all three
+// cases, so appends continue where they left off.
+//
+// Kotlin's DefaultWriteAheadLog.truncate implements the same three cases; the two must agree, or
+// a partition truncated by one runtime looks like it still owes records to the other.
 func (w *DefaultWriteAheadLog) Truncate(truncateThroughSequence int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -373,7 +389,8 @@ func (w *DefaultWriteAheadLog) Truncate(truncateThroughSequence int64) error {
 		kept = append(kept, w.segments[i])
 	}
 	active := w.segments[len(w.segments)-1]
-	if truncateThroughSequence >= w.sequenceCounter {
+	switch {
+	case truncateThroughSequence >= w.sequenceCounter:
 		if err := w.io.DeleteSegment(active.name); err != nil {
 			return err
 		}
@@ -382,8 +399,32 @@ func (w *DefaultWriteAheadLog) Truncate(truncateThroughSequence int64) error {
 		}
 		active.firstSequence = w.sequenceCounter + 1
 		w.segmentSize = 0
+	case truncateThroughSequence >= active.firstSequence:
+		bytes, err := readSegment(w.io, active.name)
+		if err != nil {
+			return err
+		}
+		decoded, err := DecodeRecords(bytes, w.partitionKey, active.name, w.skipCorrupt)
+		if err != nil {
+			return err
+		}
+		var rewritten []byte
+		for _, r := range decoded.Records {
+			if r.Sequence > truncateThroughSequence {
+				rewritten = append(rewritten, EncodeRecord(r)...)
+			}
+		}
+		if err := w.io.DeleteSegment(active.name); err != nil {
+			return err
+		}
+		if _, err := w.io.AppendToSegment(active.name, rewritten); err != nil {
+			return err
+		}
+		active.firstSequence = truncateThroughSequence + 1
+		w.segmentSize = int64(len(rewritten))
 	}
 	w.segments = append(kept, active)
+	w.segmentName = active.name
 	return nil
 }
 

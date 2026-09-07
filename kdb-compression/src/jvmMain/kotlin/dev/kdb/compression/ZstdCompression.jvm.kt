@@ -6,6 +6,13 @@ public actual object ZstdCompression {
     public actual fun compress(input: ByteArray, level: Int): ByteArray = Zstd.compress(input, level)
 
     public actual fun decompress(input: ByteArray, maxOutputSize: Int): ByteArray {
+        // An empty body decodes to empty output - there is no frame to inspect. Not a
+        // hypothetical: Go's klauspost EncodeAll returns zero bytes for a zero-length input
+        // (upstream libzstd emits a 9-byte empty frame instead), so every SSTable block and
+        // delta page holding an empty value that Go wrote arrives here as an empty slice.
+        // Zstd.decompressedSize throws ArrayIndexOutOfBoundsException on it, which surfaced as
+        // the JVM crashing while reading an ordinary Go-written segment.
+        if (input.isEmpty()) return ByteArray(0)
         val size = Zstd.decompressedSize(input).toInt()
         if (size > 0) {
             require(size <= maxOutputSize) { "decompressed size $size exceeds max $maxOutputSize" }

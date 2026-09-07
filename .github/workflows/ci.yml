@@ -231,6 +231,10 @@ jobs:
           KDB_CLI_CLASSPATH_FILE: ${{ github.workspace }}/kdb-cli/build/cli-classpath.txt
         run: python -m pytest -v -m interop
 
+  # Both toolchains, because the golden fixtures now run in both directions: Kotlin exports the
+  # ones Go checks, Go exports the ones Kotlin checks. Either encoder drifting is a physical
+  # format change, and a physical format change that nobody noticed is exactly what breaks a
+  # mixed Go/JVM deployment. See docs/kdb-physical-layer-compat-test-plan.md.
   golden-freshness:
     runs-on: ubuntu-latest
     steps:
@@ -240,12 +244,24 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: gradle
-      - name: Regenerate golden fixtures from the Kotlin encoder (source of truth)
-        run: ./gradlew :kdb-integration:test --tests "dev.kdb.integration.ExportGoldenTest" --no-daemon
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: Regenerate the Kotlin-side fixtures
+        run: |
+          ./gradlew :kdb-integration:test --tests "dev.kdb.integration.ExportGoldenTest" \
+                    :kdb-storage-wal:jvmTest :kdb-storage-sstable:jvmTest \
+                    :kdb-storage-delta:jvmTest --rerun-tasks --no-daemon
+      # This both regenerates the Go-side fixtures and verifies each side against the other's,
+      # so a genuine incompatibility fails here as a test failure rather than only as drift.
+      - name: Regenerate the Go-side fixtures and run the conformance suite
+        run: cd go && go test ./kdb/interop/... -count=1 -v
       - name: Fail on drift
         run: |
           if ! git diff --exit-code go/testdata/golden/; then
-            echo "go/testdata/golden/ is stale: the Kotlin encoder now produces different bytes."
-            echo "Regenerate with: ./gradlew :kdb-integration:test --tests dev.kdb.integration.ExportGoldenTest"
+            echo "go/testdata/golden/ is stale: one side's encoder now produces different bytes."
+            echo "If the format change is deliberate, review the diff and commit the fixtures."
+            echo "Regenerate locally with: make test-physical-golden"
             exit 1
           fi

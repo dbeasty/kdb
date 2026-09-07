@@ -178,7 +178,7 @@ func TestTombstoneRoundTrips(t *testing.T) {
 func TestFooterWithNoTombstonesIsUnchanged(t *testing.T) {
 	h := testHash(t, "k")
 	fileHash := testHash(t, "file")
-	footer := buildFooter(map[codec.Hash]BlockHandle{h: {Offset: 7, CompressedSize: 11}}, fileHash)
+	footer := buildFooter([]indexEntry{{key: h, handle: BlockHandle{Offset: 7, CompressedSize: 11}}}, fileHash)
 	line := string(footer[8 : 8+readInt(footer, 4)])
 	if want := h.Hex() + ":7:11"; line != want {
 		t.Fatalf("index line = %q, want %q", line, want)
