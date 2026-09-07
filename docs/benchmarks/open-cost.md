@@ -81,21 +81,73 @@ not documents — an index holding the text would reintroduce exactly the
 retention being removed — and lazily, so a namespace nobody reads history
 of pays nothing.
 
-## Two things this does not fix
+## Second pass: a checkpoint, so open stops reading history at all
 
-**Open still decodes the whole log.** Churn is down from 7.7 GB to 3.9 GB
-(replay no longer decodes each commit, re-encodes it into a record, and
-decodes it again), but it is still proportional to total history, because
-replay still reads every commit ever written to reconstruct current state.
-Fixing that needs a checkpoint plus a ref, so opening reads a snapshot and
-only the delta tail. That is the remaining half of the startup problem and
-is not addressed here.
+Bounding memory fixed what a namespace *held*; it did not change the fact
+that open reconstructed current state by decoding every commit ever
+written. A checkpoint - the commit graph, the refs, the live tree, and the
+branch heads' own operations - is now written at clean close and
+immediately after any open that had to replay in full, and read in place of
+the log on the next open.
 
-**`treesByHash` is still unbounded.** Every `DocumentTree` ever produced is
-retained. Trees are small — 3 MB against 329 MB in the heap profile above,
-because the persistent trie shares structure between versions — so this is
-not currently the binding constraint, but it has the same shape and no
-bound.
+Same workload, measured across the three states:
+
+| final document | churn: original | after bounding | after checkpoint | live heap now |
+|---:|---:|---:|---:|---:|
+| 41.7 KB | 310 MB | 182 MB | **4.7 MB** | 2.6 MB |
+| 132 KB | 838 MB | 451 MB | **7.0 MB** | 3.1 MB |
+| 403 KB | 2299 MB | 1181 MB | **13.8 MB** | 4.0 MB |
+| 1.40 MB | 7708 MB | 3890 MB | **38.6 MB** | 7.3 MB |
+
+200x less allocation to open than where this started, and 382 MB resident
+became 7.3 MB. A direct A/B on the same store with only the checkpoint file
+removed (`TestCheckpointMakesOpenSkipTheLog`) reads 3.08 MB against
+135.91 MB.
+
+The checkpoint costs disk: it carries the head commits' payloads, so the
+data directory for the 1.4 MB case grew from 0.88 MB to 2.31 MB. That is
+proportional to live data, not to history, which is the trade being made
+everywhere else here too.
+
+### What keeps it honest
+
+- **The log is still the authority.** Anything wrong with a checkpoint -
+  absent, corrupt, wrong format version, wrong namespace - falls back to a
+  full replay. It is a cache and nothing else.
+- **It cannot mask damage.** A checkpoint fingerprints every segment it
+  claims to cover (sequence, size, last commit). If the log no longer
+  matches, the checkpoint is discarded and the log is replayed, which is
+  what surfaces the damage. Without this, truncating a sealed segment
+  produced a clean open and silently missing history.
+- **A crash still costs nothing.** Writing a checkpoint immediately after
+  a full replay means a process that is killed - the ordinary end of a
+  container - still leaves one behind, so the expensive open pays for the
+  next one rather than repeating forever.
+- **The tail is always replayed.** A checkpoint only ever claims segments
+  below the one the writer has open, so commits written after it come back
+  from the log (`TestCheckpointReplaysTheTail`).
+
+## What this still does not fix
+
+**Historical trees are rebuilt by scanning.** A checkpoint carries the live
+tree only. Reading at a historical commit therefore replays the whole log
+once, hashing every document, to recover the docID-to-content-hash mapping
+each commit had. It is lazy (a namespace only ever read at its head never
+pays it) and it happens once per process - but it is a full scan.
+
+Git does not have this problem, because git *stores* trees: a tree object
+is content-addressed, on disk, and shared by hash between commits, so
+reading at an old commit is commit then tree then blob. KDB's delta log
+records commits with full document text but no tree objects, so the mapping
+exists only in memory and can only be re-derived by re-hashing everything.
+Persisting trees as objects removes the rebuild entirely, and is the next
+piece of work.
+
+**`treesByHash` is still unbounded.** Every `DocumentTree` produced in a
+session is retained. Trees are small - 3 MB against 329 MB in the heap
+profile above, because the persistent trie shares structure between
+versions - so this is not the binding constraint, but it has the same shape
+and no bound.
 
 ## A correction on the storage side
 

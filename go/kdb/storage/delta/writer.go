@@ -51,7 +51,12 @@ func NewDefaultWriter(namespaceID string, segmentID codec.UUID, seq int64, shim 
 func (w *DefaultWriter) NamespaceID() string     { return w.namespaceID }
 func (w *DefaultWriter) SegmentID() codec.UUID   { return w.segmentID }
 func (w *DefaultWriter) CurrentSizeBytes() int64 { return w.sizeBytes }
-func (w *DefaultWriter) IsSealed() bool          { return w.sealed }
+
+// SequenceNumber implements storage.DeltaSegmentSequencer: it reports the
+// segment this writer appends to, which is fixed for the writer's life
+// (OpenWriter always starts a fresh segment rather than resuming one).
+func (w *DefaultWriter) SequenceNumber() int64 { return w.sequence }
+func (w *DefaultWriter) IsSealed() bool        { return w.sealed }
 
 func (w *DefaultWriter) Append(record storage.DeltaRecord) (int64, error) {
 	w.mu.Lock()

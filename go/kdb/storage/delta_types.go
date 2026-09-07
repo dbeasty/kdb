@@ -61,6 +61,14 @@ type DeltaCommitStreamer interface {
 	ReadCommitAt(segment DeltaSegmentRef, frameOffset int64) (document.Commit, error)
 }
 
+// DeltaSegmentSequencer reports the sequence number of the segment a
+// writer is currently appending to. Everything below it is sealed and can
+// never gain another commit, which is what lets a checkpoint say "segments
+// up to here are fully accounted for" - see embed.saveCheckpoint.
+type DeltaSegmentSequencer interface {
+	SequenceNumber() int64
+}
+
 // DeltaSegmentReader reads sealed delta segments.
 type DeltaSegmentReader interface {
 	NamespaceID() string

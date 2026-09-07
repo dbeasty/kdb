@@ -36,12 +36,40 @@ import (
 // segments in commit order, which Component 47 §4.1 guarantees - that set
 // is empty.
 func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r storage.DeltaSegmentReader) error {
+	return replayDeltaNamespaceFrom(d, store, r, -1)
+}
+
+// replayDeltaNamespaceFrom is replayDeltaNamespace restricted to segments
+// newer than afterSequence, which is how a checkpointed namespace opens:
+// the checkpoint already accounts for everything up to and including that
+// sequence, so only the tail has to be read. Pass -1 to replay everything.
+//
+// Segment granularity is the right unit here, and it is sound because
+// delta.Factory.OpenWriter always starts a fresh segment rather than
+// resuming the previous run's last one - so a segment that existed when a
+// checkpoint was taken is never appended to afterwards, and "this sequence
+// is fully accounted for" cannot go stale.
+func replayDeltaNamespaceFrom(
+	d *dag.InMemoryCommitDag,
+	store storage.Adapter,
+	r storage.DeltaSegmentReader,
+	afterSequence int64,
+) error {
 	if r == nil {
 		return nil
 	}
-	segments, err := r.ListSegments()
+	all, err := r.ListSegments()
 	if err != nil {
 		return err
+	}
+	segments := all
+	if afterSequence >= 0 {
+		segments = make([]storage.DeltaSegmentRef, 0, len(all))
+		for _, seg := range all {
+			if seg.SequenceNumber > afterSequence {
+				segments = append(segments, seg)
+			}
+		}
 	}
 
 	// deferred holds only commits whose parents had not been applied when

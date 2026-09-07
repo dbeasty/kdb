@@ -47,7 +47,15 @@ type ServerEngine struct {
 	// ordinary reads means the budget is too small for the live working
 	// set, which is the one way this design degrades quietly rather than
 	// loudly - so it is worth being able to see.
-	coldLoads        atomic.Int64
+	coldLoads atomic.Int64
+
+	// Historical document trees are not restored by a checkpoint; they are
+	// rebuilt from the delta log on the first read that needs one. See
+	// SetTreeRebuilder.
+	treeRebuildMu    sync.Mutex
+	treeRebuild      treeRebuilder
+	treeRebuildOnce  *sync.Once
+	treeRebuildErr   error
 	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
@@ -101,14 +109,28 @@ type treeSnapshot struct {
 
 // treeAt resolves atCommit to its DocumentTree, answering the common case - the most
 // recently committed tree - without touching treesMu at all.
-func (e *ServerEngine) treeAt(atCommit codec.Hash) (document.DocumentTree, bool) {
+// treeAt resolves the document tree named by atCommit. A miss triggers the
+// historical-tree rebuild (see SetTreeRebuilder) once, because after a
+// checkpoint restore the only trees resident are the live one and whatever
+// the delta tail produced - every older tree is derivable from the log but
+// not yet built.
+func (e *ServerEngine) treeAt(atCommit codec.Hash) (document.DocumentTree, bool, error) {
 	if s := e.latestTree.Load(); s != nil && s.hash == atCommit {
-		return s.tree, true
+		return s.tree, true, nil
 	}
 	e.treesMu.RLock()
 	tree, ok := e.treesByHash[atCommit]
 	e.treesMu.RUnlock()
-	return tree, ok
+	if ok {
+		return tree, true, nil
+	}
+	if err := e.rebuildTreesOnce(); err != nil {
+		return document.DocumentTree{}, false, err
+	}
+	e.treesMu.RLock()
+	tree, ok = e.treesByHash[atCommit]
+	e.treesMu.RUnlock()
+	return tree, ok, nil
 }
 
 // publishTreeLocked records tree under its hash and republishes it as the latest. Must be
@@ -270,7 +292,10 @@ func (e *ServerEngine) PutDocument(namespaceID string, doc document.Document) er
 }
 
 func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
-	tree, ok := e.treeAt(atCommit)
+	tree, ok, err := e.treeAt(atCommit)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, nil
 	}
@@ -362,7 +387,10 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	if batchSize <= 0 {
 		batchSize = 256
 	}
-	tree, ok := e.treeAt(atCommit)
+	tree, ok, err := e.treeAt(atCommit)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return nil
 	}

@@ -129,7 +129,8 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		// the sum of its whole history (docs/benchmarks/open-cost.md).
 		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
 	}
-	if err := replayDeltaNamespace(d, store, handle.DeltaReader()); err != nil {
+	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID)
+	if err != nil {
 		return nil, err
 	}
 	dagOut := dag.CommitDAG(d)
@@ -140,6 +141,9 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 			time.Duration(cfg.AsyncSyncIntervalMillis)*time.Millisecond,
 		)
 		dagOut = persisting
+		if replayedInFull {
+			checkpointAfterFullReplay(d, store, handle.DeltaReader(), w, io, namespaceID)
+		}
 	}
 
 	rt := &EmbeddedKdbRuntime{
@@ -192,6 +196,9 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 					firstErr = err
 				}
 			}
+			// After the seal, so no segment can gain another commit and the
+			// checkpoint can claim the newest one - see checkpointOnClose.
+			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID)
 		}
 		if err := handle.Close(); err != nil && firstErr == nil {
 			firstErr = err

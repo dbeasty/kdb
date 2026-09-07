@@ -66,9 +66,20 @@ func (d *InMemoryCommitDag) trackOpsLocked(c document.Commit) {
 	if d.opsBudget <= 0 || len(c.Operations) == 0 {
 		return
 	}
+	// Initialized individually, never as a group: opsEvicted can already
+	// hold entries while opsElem is still nil - that is exactly the state
+	// RestoreCheckpoint leaves behind, having marked every restored commit
+	// as needing a load without any of them holding operations to track.
+	// Creating all three together on the first tracked commit wiped those
+	// markings, and the whole restored history then read as commits that
+	// wrote nothing.
 	if d.opsElem == nil {
 		d.opsElem = make(map[codec.Hash]*list.Element)
+	}
+	if d.opsEvicted == nil {
 		d.opsEvicted = make(map[codec.Hash]struct{})
+	}
+	if d.opsLRU == nil {
 		d.opsLRU = list.New()
 	}
 	if _, ok := d.opsElem[c.Hash]; ok {
