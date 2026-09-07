@@ -1,6 +1,6 @@
 # Layer 17 — One Runtime, Many Spaces + gRPC Transport
 
-## Status: Phase A IMPLEMENTED; everything else PROPOSED
+## Status: Component 65 and Phases A/C IMPLEMENTED; Phases B, D, E PROPOSED
 
 Two asks, one document, because the second one only gets cheap once the first one lands:
 
@@ -9,10 +9,10 @@ Layer 17 — Multi-Namespace Runtime + gRPC
   [~] 64. Multi-namespace embedded runtime (one host, N spaces)
         [x] A. Split the open path                 - go/kdb/embed/host.go
         [ ] B. Routing adapter
-        [ ] C. One budget, arbitrated
+        [x] C. One budget, arbitrated              - go/kdb/storage/budget_arbiter.go
         [ ] D. Whole-database maintenance
         [ ] E. Cross-namespace transactions
-  [ ] 65. gRPC transport hooks (frame service over HTTP/2)
+  [x] 65. gRPC transport hooks (frame service over HTTP/2) - go/grpc/ (separate module)
 ```
 
 Every claim below was checked against source at `aeb56ca` and, where it was checkable by
@@ -182,23 +182,21 @@ by callers that want one adapter across namespaces (SQL over multiple spaces, cr
 transactions); Phase A alone does not require it. Keep it in `engine`, next to the thing it
 routes to.
 
-**Phase C — one budget, arbitrated.** This is the phase that pays for the whole component.
+**Phase C — one budget, arbitrated.** The phase that pays for the whole component. *Shipped;
+see §2.4 for what it actually does.*
 
 ```go
 // go/kdb/storage
-type BudgetArbiter struct{ /* total int64, per-namespace claims + demand signals */ }
+type BudgetArbiter struct{ /* total, per-namespace participants + reservations */ }
+
+// One namespace's side of the pool.
+type BudgetParticipant interface {
+	DemandBytes() int64
+	SetBudgetBytes(int64)
+}
 ```
 
-The host holds one; each namespace's `StorageEngineConfig` gets its share from it instead of a
-hardcoded 64 MiB. Start deliberately dumb — proportional-to-demand reallocation on a slow
-timer, floor per namespace so a cold space can still serve a read, hysteresis so a burst
-doesn't thrash — and measure before making it clever. The existing eviction machinery does not
-change; only the number it evicts against becomes dynamic.
-
-Two properties to preserve, both already true per-namespace and both easy to lose here:
-versions reachable from the current tree are pinned and do not answer to the budget (see
-`ResolvedDocumentCacheBytes`' doc comment), and a shrinking budget must evict lazily rather
-than synchronously on the resize path.
+The host holds one; each namespace's budget is cut from it instead of a hardcoded 64 MiB.
 
 **Phase D — whole-database maintenance.** With one root, `LockDataDir` already covers every
 namespace, so `kdb-inspect verify/backup/restore` gain a real database-wide mode and a
@@ -229,7 +227,72 @@ Two decisions worth recording, both narrower than the first draft assumed:
   become per-namespace. One shim per host is the cheaper arrangement until something actually
   needs that, and it is what makes one S3 client serve nine namespaces instead of nine.
 
-### 2.3 Migration
+### 2.3 What Phase C settled
+
+Landed as `go/kdb/storage/budget_arbiter.go`, plus the resize and demand surfaces it needs
+underneath. The policy is deliberately dumb and should stay that way until something measured
+says otherwise: **floor, then proportional to demand, then damped.**
+
+Every namespace gets `DefaultNamespaceFloorBytes` (4 MiB) so a quiet one stays able to serve a
+read — slower, not broken. What is left is split in proportion to demand. A share is only
+applied when it has moved more than 12.5% from what is installed, because shrinking a share
+evicts. Rebalance runs every 10s, and also immediately whenever membership changes, so a new
+namespace never runs unbounded until the first tick and a closing one hands its room back at the
+moment it stops using it.
+
+**Demand is not residency.** Reporting what a namespace currently holds would be a feedback loop
+with the wrong sign: a namespace squeezed to its floor holds little, would therefore report
+little demand, and would stay at its floor forever. So a namespace that has taken cold loads
+since it was last measured — versions re-read from the delta log, the engine's existing signal
+that the working set did not fit — asks for 1.5× what it holds. That is what lets a starved
+namespace climb back over successive passes.
+
+Measured, with a 64 MiB pool and the nine-namespace zolik shape:
+
+| | hot namespace | idle namespace |
+|---|---|---|
+| Nine independent runtimes (before) | 80 MiB ceiling | 80 MiB ceiling, 720 MiB total |
+| Static ninth of one pool | 7.5 MiB | 7.5 MiB |
+| **Arbitrated** | **30.4 MiB** | **4 MiB floor** |
+
+Four times what dividing by hand gives the namespace that needs it, and the total is bounded.
+
+**What resizes, and what deliberately does not.** `shardedDocByHashStore` and `boundedTreeStore`
+already had `SetBudget`; the memtable threshold was read from the open-time config on every
+flush check, so it gained an atomic override rather than a mutation of a struct several paths
+read without synchronisation. The commit DAG gained `SetOperationsBudget`, the resize half of
+`SetOperationsLoader`.
+
+The version store is the one piece the arbiter will not touch without a cold loader installed.
+Its budget is what lets it drop versions, and dropping a version nothing can re-read is data
+loss, not eviction — which is exactly why `SetColdLoader` installs the loader and the budget
+together. An engine with no delta log behind it keeps an unbounded version store whatever the
+arbiter says, and only its trees and memtable move. `SetOperationsBudget` refuses on the same
+grounds: bounding a DAG that cannot fetch operations back would silently turn history into
+commits that wrote nothing.
+
+**Two bugs the tests caught, both worth recording.**
+
+The first was mine and structural: `StorageOptions.MemoryBudgetBytes` means two different things
+at the two levels — on a host it is the *pool*, on a namespace it is that namespace's fixed,
+non-arbitrated share. `Host.Namespace` passed the host's straight through, so a host given an
+explicit 256 MiB total handed 256 MiB to *each* of nine namespaces: the exact arithmetic this
+component exists to remove, reintroduced by the API that was supposed to fix it.
+
+The second was subtler and is now a property test. Hysteresis can suppress one namespace's
+*decrease* while letting another's increase through, and the installed total then drifts above
+the pool — 2.8% over, with nine namespaces registering one at a time. That is not a reporting
+artifact; those are real ceilings on real caches. The damping is now explicitly a comfort and
+never a licence to exceed the pool: when honouring it would over-commit, the pass forgoes it
+entirely, since the computed plan sums to the pool by construction.
+
+**Not done here, deliberately.** The pool is per host, so it bounds the namespaces under one data
+root and not the process. A process opening several hosts is back to ceilings that cannot see
+each other — the same shape as before, one level up. The same is true of
+`KdbServerRuntime`'s `MemoryGuard`, which is still per server runtime. Worth a process-wide
+parent pool eventually; not worth inventing before something needs it.
+
+### 2.4 Migration
 
 The layout changes from `<path>/<name>/ns/zolik/<name>/` to `<path>/ns/zolik/<name>/`. A
 consumer with existing data needs a move, not a rewrite — the per-namespace directory contents
@@ -326,7 +389,7 @@ This is what makes "we may migrate to that model" safe to explore: the gRPC path
 deployed and benchmarked against a real workload without the default binary, the embedded API,
 or a mobile build changing at all.
 
-### 3.4 Two things to settle before writing code
+### 3.4 Two HTTP/2 details, settled before writing code
 
 Both are consequences of HTTP/2 rather than of KDB:
 
@@ -340,18 +403,66 @@ Both are consequences of HTTP/2 rather than of KDB:
 The existing spec (`docs/kdb-spec-layer7-component21-wire-protocol-framing.md:350`) says
 "gRPC / HTTP/2 — out of scope". That line needs updating, with a pointer here, when this lands.
 
+### 3.5 What Component 65 settled
+
+Shipped as the `go/grpc` module, `go/kdb/server/frame_host.go`, and `GRPCAddr` in the core
+`ServiceConfig`.
+
+**The seam turned out to be smaller and better than §3.1 described.** `FrameHost` takes a
+`FrameConn` — a channel of inbound frames and a `Send` — which `stream.ConnectionHandle` already
+satisfied, so the TCP and WebSocket listeners needed no change at all. The gRPC transport is
+about 200 lines that adapt one bidirectional stream to that interface. Handshake auth, RBAC,
+sessions, SQL, shedding and the panic backstop are reached, not reimplemented.
+
+**A correction to §3.1.** It claimed "the TCP listener answers frames on one connection in order,
+and sessions assume it". That is not what the code does. Frames are dispatched *concurrently*,
+bounded by `MaxInFlightFrames`, with ordering guaranteed **per session** by `sessionTicket` —
+tickets taken on the reader goroutine, so two frames naming the same session run in the order
+they were sent while frames on different sessions may not. Serializing everything, as the
+original design note implied, would have been a throughput regression against the TCP path for
+no correctness gain. Reusing the existing handler gets the real semantics for free, which is the
+argument for the seam rather than a bespoke gRPC dispatch loop.
+
+**Admission is inherited, not skipped.** The byte-stream transports install the memory-pressure
+gate in their frame reader, where a shed request's body is never read. gRPC delivers whole
+messages, so there is no I/O left to save — but the *behaviour* still has to match, or a server
+under pressure would refuse a TCP client and serve an identical request from a gRPC one. That is
+the divergence `ListenSqlWireWSTLS`'s doc comment already warns about, so `FrameHost.Admit`
+applies the same gate to a complete frame.
+
+**Frame size was a real bug, now a regression test.** gRPC defaults to a 4 MiB receive limit and
+a KDB frame may be 16 MiB, so a large scan or snapshot would have been refused by the transport
+with a failure that looked like a KDB error. `Listen` raises both directions to the protocol's
+own bound; `TestFrameLargerThanTheGrpcDefaultIsCarried` sends 6 MiB through and reads it back.
+
+**The service split.** Making `--grpc-addr` do something required a binary that links the
+listener, and that required `kdb-service`'s `main` to be reusable. It moved verbatim to
+`kdb/service.Main` — no control-flow changes, `os.Exit` calls untouched — leaving
+`cmd/kdb-service` a three-line shim. `service.RegisterGRPCListener` is the hook; the gRPC module
+registers through `go/grpc/register`, and `go/grpc/cmd/kdb-service-grpc` is the same service with
+that package linked. Verified end to end: `kdb-service --grpc-addr ...` exits 2 with the
+remediation, `kdb-service-grpc` logs `grpc="enabled (127.0.0.1:19099)"`.
+
+**The cost of the split, paid in the Makefile.** `cd go && go test -race ./...` does not reach a
+separate module, so the same boundary that keeps gRPC out of the gomobile build also keeps it out
+of CI unless swept explicitly. `test-go` and `build-go` now have a second line each. This is the
+recurring tax on the decision in §3.2 and it is worth naming: anything that enumerates packages or
+binaries has to learn about `go/grpc`.
+
+**Left open, deliberately.** `kdb-service-grpc` is built by `build-go` but is *not* in
+`release-binaries`' artifact list — adding a published release artifact is a distribution
+decision, not a build one, and belongs to whoever owns the release matrix.
+
 ---
 
 ## 4. Recommended order
 
-1. **64 Phase A** (split the open path) — no behaviour change, unblocks everything, smallest
-   reviewable unit. Nothing else here should start before it merges.
-2. **65** (gRPC over the frame seam) — independent of A, and the seam extraction is worth
-   having regardless. Can run in parallel.
-3. **64 Phase C** (shared budget) — the phase that actually pays; needs A.
+1. ~~**64 Phase A** (split the open path)~~ — **done**. See §2.2.
+2. ~~**65** (gRPC over the frame seam)~~ — **done**. See §3.5.
+3. ~~**64 Phase C** (shared budget)~~ — **done**. See §2.3.
 4. **64 Phases B and D** — as demand appears.
 5. **64 Phase E** (cross-namespace transactions) — only on a concrete requirement.
 
-Phases A and C together are what turn "nine engines because the lock says so" into "one
-database with nine spaces sharing one budget". That is the whole point; B, D and E are
-follow-ons, not prerequisites.
+Phases A and C together are what turn "nine engines because the lock says so" into "one database
+with nine spaces sharing one budget". Both are in. B, D and E are follow-ons, not prerequisites,
+and Component 65 is independent of all of them.

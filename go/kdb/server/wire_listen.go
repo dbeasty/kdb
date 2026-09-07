@@ -151,7 +151,7 @@ func (h *sqlWireConnHandler) isAuthenticated() bool {
 	return ok
 }
 
-func (h *sqlWireConnHandler) run(conn stream.ConnectionHandle) {
+func (h *sqlWireConnHandler) run(conn FrameConn) {
 	// Every session on this connection dies with it. Without this, a client that dropped
 	// mid-transaction left its document locks held forever (nothing else released them) and its
 	// session in the manager's map for the process lifetime - the map only ever grew. Deferred
@@ -187,7 +187,7 @@ func (h *sqlWireConnHandler) run(conn stream.ConnectionHandle) {
 }
 
 // dispatchAndSend dispatches one decoded frame and writes its reply under sendMu.
-func (h *sqlWireConnHandler) dispatchAndSend(conn stream.ConnectionHandle, message wire.Message) {
+func (h *sqlWireConnHandler) dispatchAndSend(conn FrameConn, message wire.Message) {
 	reply := h.dispatch(message)
 	if reply == nil {
 		return

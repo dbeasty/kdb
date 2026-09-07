@@ -38,6 +38,10 @@ SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo
 
 test-go:
 	cd go && go test -race ./...
+	# The gRPC transport is a separate Go module, so `./...` above does not reach it - the module
+	# split that keeps grpc out of the embed and gomobile builds also puts it outside the core
+	# module's test sweep, and it has to be swept explicitly or it is simply never run in CI.
+	cd go/grpc && go test -race ./...
 
 test-kotlin:
 	# `test` only runs plain-kotlin.jvm-plugin modules' test tasks - Kotlin Multiplatform
@@ -87,6 +91,9 @@ build-go:
 	cd go && go build -ldflags "$(GO_LDFLAGS)" -o bin/kdb ./cmd/kdb
 	cd go && go build -ldflags "$(GO_LDFLAGS)" -o bin/kdb-service ./cmd/kdb-service
 	cd go && go build -ldflags "$(GO_LDFLAGS)" -o bin/kdb-inspect ./cmd/kdb-inspect
+	# Separate module, so a separate build line: kdb-service with the gRPC listener linked in.
+	# The default kdb-service above deliberately does not link it.
+	cd go/grpc && go build -ldflags "$(GO_LDFLAGS)" -o ../bin/kdb-service-grpc ./cmd/kdb-service-grpc
 
 build-kotlin:
 	./gradlew build --no-daemon

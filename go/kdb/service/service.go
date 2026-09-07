@@ -1,4 +1,4 @@
-package main
+package service
 
 import (
 	"flag"
@@ -30,7 +30,11 @@ import (
 )
 
 // KdbServiceMain is a skeleton service entrypoint mirroring dev.kdb.service.KdbServiceMain.
-func main() {
+// Main is the kdb-service entrypoint, moved here verbatim from package main so that a build
+// which links an out-of-tree transport - see RegisterGRPCListener - can reuse the whole service
+// rather than reimplement its configuration, governance and drain handling. It exits the process
+// on failure exactly as it always did.
+func Main() {
 	if len(os.Args) > 1 && os.Args[1] == "user" {
 		os.Exit(runUserCommand(os.Args[2:]))
 	}
@@ -54,6 +58,7 @@ func main() {
 	fs.StringVar(&flagVals.PeerAddr, "peer-addr", flagVals.PeerAddr, "peer sync (Mode 3 full-peer) wire listen address (empty to disable)")
 	fs.StringVar(&flagVals.StreamAddr, "stream-addr", flagVals.StreamAddr, "stream (Mode 1 read-only / Mode 2 write-back) wire listen address (empty to disable)")
 	fs.StringVar(&flagVals.WSAddr, "ws-addr", flagVals.WSAddr, "WebSocket SQL-wire listen address, ws:// or wss:// (empty to disable) - the only transport a browser can open")
+	fs.StringVar(&flagVals.GRPCAddr, "grpc-addr", flagVals.GRPCAddr, "gRPC SQL-wire listen address, grpc:// or grpcs:// (empty to disable) - requires the kdb-service-grpc build")
 	fs.BoolVar(&flagVals.RBAC, "rbac", flagVals.RBAC, "enable RBAC (in-memory user/role registry - create users via the Go API; no admin SQL surface yet)")
 	fs.IntVar(&flagVals.MemoryBudgetMB, "memory-budget-mb", flagVals.MemoryBudgetMB, "memory budget that admission control governs against: operations reserve their estimated memory cost before running, and are refused with a typed, retryable error once the budget is committed, rather than the process being OOM-killed with no signal to the client. 0 (default) auto-detects - the cgroup/container memory limit where there is one, else 75% of host RAM - so governance is on by default; -1 disables it entirely; a positive value is an explicit budget in MiB. With Component 48's accounting this can be set at the container's real --memory limit, unlike the deprecated --memory-limit-mb it replaces")
 	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "DEPRECATED alias for --memory-budget-mb, retained for existing configs. Its old meaning is preserved: an explicit 0 disables governance (whereas --memory-budget-mb 0 auto-detects). The old guidance to set this to only 60-80% of the container limit no longer applies - it was a workaround for the reactive sampler this replaces")
@@ -100,8 +105,22 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
 	}
+	// This binary does not link the gRPC listener, and must not pretend otherwise. gRPC lives in
+	// its own module so its dependencies stay out of the embedded and gomobile builds
+	// (docs/kdb-spec-layer17-multi-namespace-runtime.md §3.2), which means the only honest
+	// response to being asked for a listener that is not compiled in is to refuse. Ignoring the
+	// setting would leave an operator believing a port was open that never was.
+	if cfg.GRPCAddr != "" && !GRPCLinked() {
+		fmt.Fprintf(os.Stderr,
+			"Error: --grpc-addr=%s: this build has no gRPC listener linked in.\n"+
+				"Run kdb-service-grpc, which is the same service with the gRPC transport compiled in.\n",
+			cfg.GRPCAddr)
+		os.Exit(2)
+	}
+
 	dataDir, memory, namespace := cfg.DataDir, cfg.Memory, cfg.Namespace
 	sqlAddr, peerAddr, streamAddr, adminAddr := cfg.SQLAddr, cfg.PeerAddr, cfg.StreamAddr, cfg.AdminAddr
+	grpcAddr := cfg.GRPCAddr
 	wsAddr := cfg.WSAddr
 	rbac, abortAfter, drainTimeout := cfg.RBAC, cfg.AbortAfter, cfg.DrainTimeout
 
@@ -290,6 +309,20 @@ func main() {
 		defer wsListener.Close()
 		wsStatus = fmt.Sprintf("enabled (%s)", wsListener.Addr())
 	}
+	// The gRPC listener, when this build linked one in. Started and closed exactly like the
+	// others: a gRPC deployment is not a different shape of service, only a different transport
+	// under the same connection handling.
+	grpcStatus := "disabled"
+	var grpcListener GRPCListener
+	if grpcAddr != "" {
+		grpcListener, err = grpcListenerFactory(grpcAddr, srv, tlsSettings)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: grpc listen: %v\n", err)
+			os.Exit(1)
+		}
+		defer grpcListener.Close()
+		grpcStatus = fmt.Sprintf("enabled (%s)", grpcListener.Addr())
+	}
 	var peerListener *server.Listener
 	if peerAddr != "" {
 		peerListener, err = server.ListenPeerSyncTLS(peerAddr, srv, namespace, tlsSettings)
@@ -379,6 +412,7 @@ func main() {
 		"stream", streamStatus,
 		"sql", sqlStatus,
 		"ws", wsStatus,
+		"grpc", grpcStatus,
 		"admin", adminStatus,
 		"tls", tlsStatus,
 		"rbac", rbacStatus,

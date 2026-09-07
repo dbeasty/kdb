@@ -28,7 +28,20 @@ type ServiceSettings struct {
 	//
 	// Separate from SQLAddr rather than a scheme variant of it because a deployment commonly
 	// wants both at once: native clients on raw TCP, browsers on WebSocket, same server.
-	WSAddr    string
+	WSAddr string
+	// GRPCAddr is the gRPC SQL-wire listen address (grpc:// or grpcs://). Empty - the default -
+	// disables it, exactly as WSAddr does.
+	//
+	// The listener itself is NOT in this module. gRPC lives in its own Go module
+	// (github.com/limidus/kdb/go/grpc) so that its transitive dependencies never reach the
+	// embedded and gomobile builds, which will never open a socket - see
+	// docs/kdb-spec-layer17-multi-namespace-runtime.md §3.2. The field lives here anyway because
+	// config is data, a string costs nothing, and one config schema across both binaries is
+	// worth more than the purity of splitting it.
+	//
+	// A binary with no gRPC listener linked in must REFUSE a non-empty value rather than ignore
+	// it: a flag that quietly does nothing is worse than no flag. See kdb-service's main.
+	GRPCAddr  string
 	AdminAddr string
 	RBAC      bool
 	// MemoryBudgetMB is the memory budget the pressure zones and grant capacity are computed
@@ -81,6 +94,7 @@ func DefaultServiceSettings() ServiceSettings {
 		// Off by default: a browser-reachable port is a deliberate exposure decision, not
 		// something an operator should discover already listening.
 		WSAddr:       "",
+		GRPCAddr:     "",
 		DrainTimeout: 30 * time.Second,
 		LogLevel:     "info",
 		LogFormat:    "text",
@@ -115,6 +129,7 @@ type ServiceFile struct {
 	PeerAddr        *string         `json:"peerAddr"`
 	StreamAddr      *string         `json:"streamAddr"`
 	WSAddr          *string         `json:"wsAddr"`
+	GRPCAddr        *string         `json:"grpcAddr"`
 	AdminAddr       *string         `json:"adminAddr"`
 	RBAC            *bool           `json:"rbac"`
 	MemoryBudgetMB  *int            `json:"memoryBudgetMb"`
@@ -183,6 +198,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.PeerAddr, file.PeerAddr)
 		setIf(&s.StreamAddr, file.StreamAddr)
 		setIf(&s.WSAddr, file.WSAddr)
+		setIf(&s.GRPCAddr, file.GRPCAddr)
 		setIf(&s.AdminAddr, file.AdminAddr)
 		setIf(&s.RBAC, file.RBAC)
 		setIf(&s.MemoryBudgetMB, file.MemoryBudgetMB)
@@ -266,6 +282,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	envString("KDB_PEER_ADDR", &s.PeerAddr)
 	envString("KDB_STREAM_ADDR", &s.StreamAddr)
 	envString("KDB_WS_ADDR", &s.WSAddr)
+	envString("KDB_GRPC_ADDR", &s.GRPCAddr)
 	envString("KDB_ADMIN_ADDR", &s.AdminAddr)
 	if err := envBool("KDB_RBAC", &s.RBAC); err != nil {
 		return s, err
@@ -324,6 +341,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"peer-addr", func() { s.PeerAddr = flags.PeerAddr }},
 		{"stream-addr", func() { s.StreamAddr = flags.StreamAddr }},
 		{"ws-addr", func() { s.WSAddr = flags.WSAddr }},
+		{"grpc-addr", func() { s.GRPCAddr = flags.GRPCAddr }},
 		{"admin-addr", func() { s.AdminAddr = flags.AdminAddr }},
 		{"rbac", func() { s.RBAC = flags.RBAC }},
 		{"memory-budget-mb", func() { s.MemoryBudgetMB = flags.MemoryBudgetMB; budgetSet = true }},
