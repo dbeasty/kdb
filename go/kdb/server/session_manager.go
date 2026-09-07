@@ -114,6 +114,24 @@ func (s *KdbSession) startTransactionAt(head codec.Hash) {
 	}
 }
 
+// anchorWritesAt moves the session's write base to head without touching the read pin. It is
+// deliberately not startTransactionAt: that one also re-pins, which is exactly what a Snapshot
+// session must not do in the middle of a transaction.
+//
+// This closes the gap between where a non-Snapshot session reads and where it writes. Its reads
+// resolve at the live head (see ReadHead) while baseVersion stayed frozen at the last
+// transaction boundary - session begin, or the previous commit/rollback - so any commit landing
+// in between left the session writing against a version older than the one its own statement
+// had just read. Conflict detection is per-document and content-addressed, so it then reported
+// a conflict against a change that statement had already seen. In the case that motivated this,
+// that change was the client's own: an Upsert commits outside any session and advances the
+// head, so an Upsert followed by SQL DML on the same session conflicted with itself.
+func (s *KdbSession) anchorWritesAt(head codec.Hash) {
+	s.versionMu.Lock()
+	defer s.versionMu.Unlock()
+	s.baseVersion = head
+}
+
 // releasePinLocked drops the current transaction's read pin, if any, and clears it. Must be
 // called with versionMu held exclusively. Every path that ends a transaction goes through here:
 // starting the next one (above) and ending the session (EndTransaction).
@@ -308,8 +326,27 @@ func (c ReadConsistency) String() string {
 
 // PendingBuilder returns sess's in-flight transaction builder, creating one anchored at the
 // session's base version if this is the first buffered write.
+//
+// Opening that transaction is also where a non-Snapshot session re-anchors its write base to
+// the live head (anchorWritesAt), because this - not session begin - is the moment its
+// transaction actually starts. Anchoring here rather than at the previous boundary is what
+// stops a commit made in between (another connection's, or this client's own sessionless
+// Upsert) from being reported as a conflict against a statement that had already read it.
+//
+// Only the *first* buffered write re-anchors. Every later statement in the same transaction
+// keeps that anchor, so a genuinely concurrent writer arriving mid-transaction still conflicts,
+// which is the whole point of the base version. A Snapshot session never re-anchors: its writes
+// stay pinned to the snapshot its reads see, and a conflict there is real by definition.
 func (m *SessionManager) PendingBuilder(sess *KdbSession) *transaction.Builder {
 	if sess.Pending == nil {
+		if sess.ReadConsistency != Snapshot {
+			// A DAG that cannot report a head leaves the session on its existing base rather
+			// than failing the statement: that is the behaviour this call has always had, and
+			// the commit still validates against reality.
+			if head, err := m.server.Runtime.DAG.Head(); err == nil {
+				sess.anchorWritesAt(head)
+			}
+		}
 		sess.Pending = &transaction.Builder{
 			NamespaceID: sess.NamespaceID,
 			BaseVersion: sess.BaseVersion(),

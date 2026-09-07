@@ -86,8 +86,32 @@ public class SessionManager(
         }
     }
 
+    /**
+     * Returns the session's in-flight transaction builder, opening one anchored at the session's
+     * base version if this is the first buffered write.
+     *
+     * Opening that transaction is also where a non-SNAPSHOT session re-anchors its write base to
+     * the live head, because this - not session begin - is the moment its transaction actually
+     * starts. READ_COMMITTED and READ_YOUR_WRITES sessions take no read pin, so their statements
+     * read at the live head while [KdbSession.baseVersion] stayed frozen at the last transaction
+     * boundary; any commit landing in between left the session writing against a version older
+     * than the one its own statement had just read, and conflict detection - per-document and
+     * content-addressed - then reported a conflict against a change that statement had already
+     * seen.
+     *
+     * Only the *first* buffered write re-anchors. Every later statement in the same transaction
+     * keeps that anchor, so a genuinely concurrent writer arriving mid-transaction still
+     * conflicts, which is the whole point of the base version. A SNAPSHOT session never
+     * re-anchors: its writes stay pinned to the snapshot its reads see, and a conflict there is
+     * real by definition.
+     *
+     * Mirrors Go's SessionManager.PendingBuilder, which carries the same rule.
+     */
     public suspend fun pendingBuilder(session: KdbSession): LockingTransactionBuilder {
         if (session.pending == null) {
+            if (session.readConsistency != ReadConsistency.SNAPSHOT) {
+                session.baseVersion = server.runtime.dag.head()
+            }
             val inner =
                 TransactionBuilder(
                     namespaceId = session.namespaceId,
