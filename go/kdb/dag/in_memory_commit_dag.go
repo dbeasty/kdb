@@ -60,10 +60,25 @@ type InMemoryCommitDag struct {
 	// invalidation traffic this is here to remove.
 	_ [cacheLinePadBytes]byte
 
-	mu        sync.RWMutex
-	commits   map[codec.Hash]document.Commit
-	stubs     map[codec.Hash]document.CommitStub
-	trees     map[codec.Hash]document.DocumentTree
+	mu      sync.RWMutex
+	commits map[codec.Hash]document.Commit
+	// treeToCommit answers "which commit produced this tree", which the
+	// replay strategy's tree rebuild needs as its starting point. Keyed the
+	// other way round from everything else here, and small next to the
+	// commits themselves - two hashes per commit against the commit's own
+	// operations and metadata.
+	treeToCommit map[codec.Hash]codec.Hash
+	stubs        map[codec.Hash]document.CommitStub
+	// trees is this DAG's own tree store, used only when no external one
+	// has been installed - see SetTreeStore. In the assembled engine there
+	// is always an external one and this map stays empty.
+	trees map[codec.Hash]document.DocumentTree
+	// treeStore, when set, is where trees actually live. The storage engine
+	// already keeps every tree it commits; without this the DAG kept a
+	// second map holding the *same* values under the *same* keys, so
+	// neither could be bounded to any effect - evicting from one freed
+	// nothing while the other still referenced the same trie nodes.
+	treeStore DocumentTreeStore
 	branches  map[string]document.Branch
 	tags      map[string]document.Tag
 	hexSorted []string
@@ -158,14 +173,15 @@ func (d *InMemoryCommitDag) AncestryVersion() uint64 {
 // NewInMemoryCommitDag creates a DAG with genesis commit and main branch.
 func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	d := &InMemoryCommitDag{
-		NamespaceID: namespaceID,
-		commits:     make(map[codec.Hash]document.Commit),
-		stubs:       make(map[codec.Hash]document.CommitStub),
-		trees:       make(map[codec.Hash]document.DocumentTree),
-		branches:    make(map[string]document.Branch),
-		tags:        make(map[string]document.Tag),
-		txIndex:     make(map[codec.UUID]codec.Hash),
-		pins:        make(map[codec.Hash]int),
+		NamespaceID:  namespaceID,
+		commits:      make(map[codec.Hash]document.Commit),
+		stubs:        make(map[codec.Hash]document.CommitStub),
+		treeToCommit: make(map[codec.Hash]codec.Hash),
+		trees:        make(map[codec.Hash]document.DocumentTree),
+		branches:     make(map[string]document.Branch),
+		tags:         make(map[string]document.Tag),
+		txIndex:      make(map[codec.UUID]codec.Hash),
+		pins:         make(map[codec.Hash]int),
 	}
 	empty := document.EmptyDocumentTree()
 	d.trees[empty.TreeHash] = empty
@@ -327,6 +343,15 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 		}
 	}
 	d.commits[commit.Hash] = commit
+	if d.treeToCommit == nil {
+		d.treeToCommit = make(map[codec.Hash]codec.Hash)
+	}
+	// First writer wins: several commits can name the same tree (a commit
+	// that changes nothing, a revert back to an earlier state), and any of
+	// them reconstructs it, so there is no reason to prefer a later one.
+	if _, seen := d.treeToCommit[commit.DocumentTreeHash]; !seen {
+		d.treeToCommit[commit.DocumentTreeHash] = commit.Hash
+	}
 	d.trackOpsLocked(commit)
 	d.insertHex(commit.Hash.Hex())
 	d.ancestryVersion++
@@ -408,7 +433,7 @@ func (d *InMemoryCommitDag) GetDocumentTreeOrThrow(treeHash codec.Hash) (documen
 func (d *InMemoryCommitDag) PutDocumentTree(tree document.DocumentTree) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.trees[tree.TreeHash] = tree
+	d.putTreeLocked(tree)
 }
 
 func (d *InMemoryCommitDag) Head() (codec.Hash, error) {
@@ -573,11 +598,11 @@ func (d *InMemoryCommitDag) Diff(fromHash, toHash codec.Hash) (CommitDiff, error
 	if !ok {
 		return CommitDiff{}, kdberr.NewVersionNotFoundError("to commit missing", d.NamespaceID, toHash.Hex())
 	}
-	fromTree, ok := d.trees[fc.DocumentTreeHash]
+	fromTree, ok := d.getTreeLocked(fc.DocumentTreeHash)
 	if !ok {
 		return CommitDiff{}, kdberr.NewVersionNotFoundError("from tree missing", d.NamespaceID, fc.DocumentTreeHash.Hex())
 	}
-	toTree, ok := d.trees[tc.DocumentTreeHash]
+	toTree, ok := d.getTreeLocked(tc.DocumentTreeHash)
 	if !ok {
 		return CommitDiff{}, kdberr.NewVersionNotFoundError("to tree missing", d.NamespaceID, tc.DocumentTreeHash.Hex())
 	}
@@ -685,7 +710,7 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 			)
 		}
 	}
-	d.trees[newDocumentTree.TreeHash] = newDocumentTree
+	d.putTreeLocked(newDocumentTree)
 	commit, err := document.BuildCommit(
 		parents, d.NamespaceID, tx.ID, tx.Timestamp, tx.AuthorNodeID,
 		tx.Operations, newDocumentTree.TreeHash, schemaHash, message,
@@ -751,7 +776,7 @@ func (d *InMemoryCommitDag) Squash(
 	}
 	syntheticTx, _ := codec.UUIDFromString("00000000-0000-4000-8000-000000000003")
 	syntheticAuthor, _ := codec.UUIDFromString("00000000-0000-4000-8000-000000000004")
-	d.trees[syntheticTree.TreeHash] = syntheticTree
+	d.putTreeLocked(syntheticTree)
 	synthetic, err := document.BuildCommit(
 		nil, d.NamespaceID, syntheticTx, codec.TimestampNow(), syntheticAuthor,
 		nil, syntheticTree.TreeHash, syntheticSchemaHash, message,
@@ -787,4 +812,70 @@ func (d *InMemoryCommitDag) requireCommitPresentLocked(hash codec.Hash) error {
 		}
 	}
 	return nil
+}
+
+// CommitForTree returns a commit that produced the given document tree.
+//
+// The tree rebuild path needs somewhere to start: given a tree hash it has
+// to find the commit that made it before it can walk that commit's
+// ancestry. Several commits may name the same tree; any of them
+// reconstructs it, so the first one recorded is returned.
+func (d *InMemoryCommitDag) CommitForTree(treeHash codec.Hash) (codec.Hash, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	h, ok := d.treeToCommit[treeHash]
+	return h, ok
+}
+
+// DocumentTreeStore is where document trees are kept. The storage engine
+// implements it; see SetTreeStore for why the DAG defers to it rather than
+// keeping its own copies.
+type DocumentTreeStore interface {
+	GetTree(hash codec.Hash) (document.DocumentTree, bool)
+	PutTree(tree document.DocumentTree)
+}
+
+// SetTreeStore hands tree storage to an external owner, so there is
+// exactly one place holding trees and one budget bounding them.
+//
+// Before this, the DAG and the storage engine each kept a map from tree
+// hash to tree, holding the identical values. That is not two caches, it
+// is one cache maintained twice: memory came back only when both dropped
+// the same entry, so bounding either alone reclaimed nothing and two
+// budgets each meant nothing. Whichever of the two is going to evict has
+// to be the only one holding.
+//
+// Nil restores the DAG's own map, which is what a DAG used without a
+// storage engine - the dag package's own tests, a pure in-memory runtime -
+// still needs.
+func (d *InMemoryCommitDag) SetTreeStore(s DocumentTreeStore) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if s != nil {
+		// Hand over anything already held, so installing a store mid-life
+		// does not strand the trees put before it arrived.
+		for _, t := range d.trees {
+			s.PutTree(t)
+		}
+		d.trees = map[codec.Hash]document.DocumentTree{}
+	}
+	d.treeStore = s
+}
+
+// putTreeLocked stores a tree wherever trees live. Must hold mu.
+func (d *InMemoryCommitDag) putTreeLocked(tree document.DocumentTree) {
+	if d.treeStore != nil {
+		d.treeStore.PutTree(tree)
+		return
+	}
+	d.trees[tree.TreeHash] = tree
+}
+
+// getTreeLocked resolves a tree from wherever trees live. Must hold mu.
+func (d *InMemoryCommitDag) getTreeLocked(hash codec.Hash) (document.DocumentTree, bool) {
+	if d.treeStore != nil {
+		return d.treeStore.GetTree(hash)
+	}
+	t, ok := d.trees[hash]
+	return t, ok
 }

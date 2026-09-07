@@ -85,7 +85,12 @@ type ServerEngine struct {
 	treeMu sync.Mutex
 	tree   document.DocumentTree
 
-	// treesMu guards treesByHash, every DocumentTree CommitTree has ever
+	// treesMu orders the pair of writes below - the tree store and the
+	// published snapshot - so a reader can never see a latestTree that the
+	// store has not been told about. The store has its own lock for its own
+	// contents; this one exists purely for that pairing.
+	//
+	// Historical note, still worth keeping: treesByHash holds the trees
 	// produced, keyed by TreeHash - mirrors InMemoryStorageAdapter.trees.
 	// Without this, GetDocument/ScanDocuments had no way to resolve a
 	// specific atCommit and silently always answered from current state
@@ -97,7 +102,7 @@ type ServerEngine struct {
 	// GetDocument/ScanDocuments call and must not serialize reads behind
 	// that writer lock.
 	treesMu     sync.RWMutex
-	treesByHash map[codec.Hash]document.DocumentTree
+	treesByHash *boundedTreeStore
 	// latestTree republishes the most recent entry of treesByHash behind an atomic pointer.
 	// Reads overwhelmingly ask for the current head's tree, and taking treesMu for that was
 	// two atomic read-modify-writes on one shared cache line per read - the same contention
@@ -131,35 +136,29 @@ func (e *ServerEngine) treeAt(atCommit codec.Hash) (document.DocumentTree, bool,
 	if s := e.latestTree.Load(); s != nil && s.hash == atCommit {
 		return s.tree, true, nil
 	}
-	e.treesMu.RLock()
-	tree, ok := e.treesByHash[atCommit]
-	e.treesMu.RUnlock()
-	if ok {
+	if tree, ok := e.treesByHash.Get(atCommit); ok {
 		return tree, true, nil
 	}
 	// Addressed lookup first: the tree object store answers directly from
-	// this tree's hash. Only if it cannot - a store written before tree
-	// objects existed, or one whose objects have not survived - does the
-	// expensive rebuild run.
+	// this tree's hash. Only if it cannot - a store written under the
+	// replay strategy, or one whose objects have not survived - is the
+	// tree folded back out of the log.
 	if tree, ok := e.treeFromObjects(atCommit); ok {
-		e.treesMu.Lock()
-		e.treesByHash[atCommit] = tree
-		e.treesMu.Unlock()
+		e.treesByHash.Put(tree)
 		return tree, true, nil
 	}
-	if err := e.rebuildTreesOnce(); err != nil {
+	tree, found, err := e.rebuildTree(atCommit)
+	if err != nil || !found {
 		return document.DocumentTree{}, false, err
 	}
-	e.treesMu.RLock()
-	tree, ok = e.treesByHash[atCommit]
-	e.treesMu.RUnlock()
-	return tree, ok, nil
+	e.treesByHash.Put(tree)
+	return tree, true, nil
 }
 
 // publishTreeLocked records tree under its hash and republishes it as the latest. Must be
 // called with treesMu held exclusively.
 func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree) {
-	e.treesByHash[tree.TreeHash] = tree
+	e.treesByHash.Put(tree)
 	e.latestTree.Store(&treeSnapshot{hash: tree.TreeHash, tree: tree})
 }
 
@@ -192,7 +191,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		pending:          newShardedPendingStore(),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
 		tree:             emptyTree,
-		treesByHash:      map[codec.Hash]document.DocumentTree{emptyTree.TreeHash: emptyTree},
+		treesByHash:      newBoundedTreeStore(storage.ResolvedHistoryTreeBytes(config)),
 	}
 	e.latestTree.Store(&treeSnapshot{hash: emptyTree.TreeHash, tree: emptyTree})
 	if w != nil && config.Durability == storage.DurabilityAsync {

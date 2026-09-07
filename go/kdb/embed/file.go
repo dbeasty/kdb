@@ -106,6 +106,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		DocumentCacheBytes:      opts.Storage.DocumentCacheBytes,
 		CommitOpsBytes:          opts.Storage.CommitOpsBytes,
 		TreeChainLimit:          opts.Storage.TreeChainLimit,
+		HistoryTreeCacheBytes:   opts.Storage.HistoryTreeCacheBytes,
 		DisableCheckpoints:      opts.Storage.DisableCheckpoints,
 	}
 	target := engine.TargetServer
@@ -141,6 +142,13 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		return nil, fmt.Errorf("file runtime missing storage adapter")
 	}
 
+	if eng, ok := store.(*engine.ServerEngine); ok {
+		// One owner for trees. The engine already keeps every tree it
+		// commits; leaving the DAG's own map in place would mean two
+		// structures holding the same values under the same keys, and a
+		// budget on either would reclaim nothing while the other held on.
+		d.SetTreeStore(eng)
+	}
 	if r := handle.DeltaReader(); r != nil {
 		// Installed before replay, so replay's own commits are subject to
 		// the budget as they arrive rather than all landing resident first

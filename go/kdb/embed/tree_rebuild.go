@@ -4,54 +4,109 @@ import (
 	"errors"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/delta"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
 
-// rebuildHistoricalTrees replays the whole delta log for its *tree* state
-// alone - which document each commit pointed at, by content hash - and
-// registers every tree it passes through, so a read at a historical commit
-// can resolve after a checkpoint restore left only the live tree resident.
+// maxTreeFoldDepth bounds how far back a rebuild walks looking for an
+// ancestor tree it can fold forward from.
 //
-// This is the expensive path the checkpoint exists to avoid, and it is
-// deliberately still here: it runs at most once per process, only when
-// something actually reads at a historical commit, and a namespace only
-// ever read at its head never runs it at all. Trading a rare slow read for
-// an open that does not touch history is the whole point.
+// A ceiling, not a tuning knob: without one, asking for a tree near the
+// beginning of a long history with nothing cached would walk the entire
+// commit graph before doing any work. Hitting it reports a miss, which is
+// the truthful answer - the alternative is an unbounded stall.
+const maxTreeFoldDepth = 100_000
+
+// rebuildTreeByFolding reconstructs one historical document tree, named by
+// its hash, for namespaces on the replay strategy where there are no tree
+// objects to look it up in.
 //
-// The tree it builds has to match what the engine built commit by commit,
-// or the tree hashes will not match the ones commits name and the lookup
-// will miss. Two details carry that: within one commit, deletes are
-// applied before puts, and a document written and deleted in the same
-// commit resolves last-operation-wins - both mirroring
-// shardedPendingStore's staging and CommitTree's flush order.
-func rebuildHistoricalTrees(eng *engine.ServerEngine, r storage.DeltaSegmentReader) error {
-	if r == nil {
-		return nil
+// It folds forward from the nearest *cached* ancestor rather than from the
+// empty tree, and that single choice decides what reading history costs.
+// Restarting from genesis makes a tree at position k cost O(k), so walking
+// a history of H commits costs 1 + 2 + ... + H - quadratic. Folding from
+// the nearest cached ancestor makes the ordinary pattern, walking oldest to
+// newest, cost O(1) per step: the tree built for the previous commit is
+// still resident, one commit behind. Random access costs the distance to
+// whatever is cached.
+//
+// What it cannot avoid is that the commits' operations may themselves have
+// been evicted, and getting them back needs the commit-hash-to-frame index,
+// built by one pass over the log. That happens once per process on the
+// first historical read, not once per miss. Under the objects strategy none
+// of this runs at all - the tree is a lookup.
+//
+// The tree this produces has to match what the engine built commit by
+// commit or its hash will not be the one any commit names, which is what
+// applyCommitToTree's staging order is for. The result is checked against
+// the requested hash before being returned, so a mismatch is a miss rather
+// than a wrong answer.
+func rebuildTreeByFolding(
+	d *dag.InMemoryCommitDag,
+	eng *engine.ServerEngine,
+	want codec.Hash,
+) (document.DocumentTree, bool, error) {
+	commitHash, ok := d.CommitForTree(want)
+	if !ok {
+		// No commit claims this tree. Not an error - it is what asking for
+		// a tree this namespace never produced should look like.
+		return document.DocumentTree{}, false, nil
 	}
-	segments, err := r.ListSegments()
-	if err != nil {
-		return err
-	}
-	tree := document.EmptyDocumentTree()
-	for _, seg := range segments {
-		streamErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
-			next, _, _, err := applyCommitToTree(tree, c)
-			if err != nil {
-				return err
-			}
-			tree = next
-			eng.RegisterHistoricalTree(tree)
-			return nil
-		})
-		var corrupt *delta.CorruptFrameError
-		if streamErr != nil && !errors.As(streamErr, &corrupt) {
-			return streamErr
+
+	// Back to the nearest ancestor whose tree is resident, collecting the
+	// commits to fold forward. A root commit grounds the walk on the empty
+	// tree, so a namespace with nothing cached still terminates.
+	var path []codec.Hash
+	base := document.EmptyDocumentTree()
+	grounded := false
+	cursor := commitHash
+	for depth := 0; depth < maxTreeFoldDepth; depth++ {
+		commit, err := d.GetCommitOrThrow(cursor)
+		if err != nil {
+			return document.DocumentTree{}, false, err
 		}
+		if commit.DocumentTreeHash != want {
+			// CachedTree, not the engine's ordinary lookup: probing must
+			// not promote every tree it passes to most-recently-used, or
+			// the walk would evict the ones it is walking towards.
+			if cached, ok := eng.CachedTree(commit.DocumentTreeHash); ok {
+				base = cached
+				grounded = true
+				break
+			}
+		}
+		path = append(path, cursor)
+		if len(commit.ParentHashes) == 0 {
+			grounded = true
+			break
+		}
+		cursor = commit.ParentHashes[0]
 	}
-	return nil
+	if !grounded {
+		return document.DocumentTree{}, false, nil
+	}
+
+	// path runs from the target back towards the base, so fold it in
+	// reverse.
+	tree := base
+	for i := len(path) - 1; i >= 0; i-- {
+		commit, err := d.GetCommitOrThrow(path[i])
+		if err != nil {
+			return document.DocumentTree{}, false, err
+		}
+		next, _, _, err := applyCommitToTree(tree, commit)
+		if err != nil {
+			return document.DocumentTree{}, false, err
+		}
+		tree = next
+	}
+	if tree.TreeHash != want {
+		return document.DocumentTree{}, false, nil
+	}
+	return tree, true, nil
 }
 
 // applyCommitToTree folds one commit's operations into tree, reproducing

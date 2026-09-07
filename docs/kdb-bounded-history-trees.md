@@ -1,5 +1,8 @@
 # Bound Memory Usage for Historical Trees
 
+> **Status: implemented.** All four phases landed. Measured results at the
+> bottom.
+
 ## Problem
 
 DocumentTrees are unbounded in memory: every tree produced by any commit stays resident for the lifetime of the namespace, growing linearly with commit count.
@@ -153,3 +156,35 @@ Bounding trees leaves this as the next ceiling. It should be scoped into this wo
 ## Non-goal
 
 This is not about compacting commits or removing history. The delta log stays authoritative and nothing is pruned. This governs only what is cached in memory.
+
+## Results
+
+Implemented as described. One small document, measured on the same machine
+as the numbers at the top of this document.
+
+**Trees no longer follow commit count.** Six trees resident (0.03 MB) at
+every scale tested, against a store that previously held one per commit:
+
+| commits | before: one historical read | after: five historical reads |
+|---:|---:|---:|
+| 1,000 | 7.91 MB | 1.85 MB |
+| 4,000 | 29.31 MB | 5.08 MB |
+| 16,000 | **114.74 MB** | **17.77 MB** |
+
+**History walks are linear.** Walking every commit oldest to newest,
+measured as allocation:
+
+| | 300 commits | 600 commits | ratio |
+|---|---:|---:|---:|
+| folding from genesis | 850.18 MB | 3399.88 MB | 4.00x — quadratic |
+| folding from the nearest cached ancestor | 10.92 MB | 21.91 MB | **2.01x — linear** |
+
+The first row is not hypothetical: it is this implementation with the
+nearest-ancestor lookup disabled, which is what `TestHistoryWalkStaysLinear`
+asserts against. Doubling the history quadruples the work if that lookup
+ever regresses, and the test notices.
+
+**What still grows** is the commit graph, as flagged above: roughly 1.1 KB
+per commit, resident at open under both strategies, untouched by this work.
+It is what remains of the 4x-commits-to-2.8x-memory ratio in
+`TestTreeMemoryDoesNotFollowCommitCount`.

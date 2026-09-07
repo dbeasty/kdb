@@ -12,28 +12,31 @@ import (
 )
 
 // writeSessionHeapMB is the heap still held part-way through a writing
-// session, with the runtime open - what a long-running writer actually
-// costs, as opposed to what reopening one costs.
+// session, with the runtime open - what a long-running writer costs, as
+// opposed to what reopening one costs. The document is a constant size, so
+// what is measured is per-commit accumulation rather than document bytes.
 func writeSessionHeapMB(t *testing.T, s storage.HistoryStrategy, rewrites int) float64 {
 	t.Helper()
 	root := t.TempDir()
 	opts := embed.FileRuntimeOptions{}
 	opts.Storage.HistoryStrategy = s
+	// A small budget so every cache is already saturated at the smaller of
+	// the two write counts. Without it the comparison mostly measures
+	// caches filling towards their budgets, which is bounded growth but
+	// growth all the same, and it muddies what is being asserted:
+	// accumulation *beyond* what the budgets allow.
+	opts.Storage.MemoryBudgetBytes = 1 << 20
 	rt, err := embed.OpenFileRuntimeWithOptions(root, "bench", "bench/matches", schema.None(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rt.Close()
 
-	type doc struct {
-		ID     string           `json:"id"`
-		Events []map[string]any `json:"events"`
-	}
-	d := doc{ID: "11111111-1111-4111-8111-111111111111"}
-	blob := strings.Repeat("x", 3000)
+	blob := strings.Repeat("x", 10_000)
 	for i := 0; i < rewrites; i++ {
-		d.Events = append(d.Events, map[string]any{"seq": i, "blob": blob})
-		b, err := json.Marshal(d)
+		b, err := json.Marshal(map[string]any{
+			"id": retentionDocID, "rev": i, "blob": blob,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -48,32 +51,42 @@ func writeSessionHeapMB(t *testing.T, s storage.HistoryStrategy, rewrites int) f
 	return float64(m.HeapAlloc) / (1024 * 1024)
 }
 
-// TestObjectsStrategyDoesNotHoardWritesInMemory guards a regression that
-// the objects strategy introduced and that the defaults would otherwise
-// carry.
+// TestObjectsStrategyDoesNotHoardWritesInMemory guards a regression the
+// objects strategy introduced and shipped as the default.
 //
 // Every document version written under that strategy is stored as an
-// object, and objects go into the memtable, which has no bound of its own:
-// it grows on every put and shrinks only when flushed. Nothing flushed it
-// on size, so a writing session held every version it had written until
-// close - 350MB for the workload below, against 41MB with the strategy
-// off. That is the same unbounded retention the rest of this work removes,
-// arriving through the write path instead of the read path.
+// object, objects go into the memtable, and the memtable had no bound of
+// its own: it grew on every put and shrank only when flushed, which only
+// Close did. A writing session therefore held every version it had ever
+// written - 350MB for this workload, against 41MB with the strategy off.
+// The same unbounded retention the rest of this work removes, arriving
+// through the write path instead of the read path.
 //
-// Compared against the replay strategy rather than an absolute figure, so
-// what is asserted is "storing objects does not change the shape of what a
-// writer holds", which is the actual requirement.
+// Asserted by writing four times as much, under a budget small enough
+// that every cache is already full at the smaller count, and requiring the
+// heap not to follow: accumulation is linear in commits, so 4x the commits
+// would be close to 4x the memory, while a bounded writer barely moves.
+// What is left growing is the commit graph, which is separately unbounded
+// and not what this test is about.
+// Deliberately not a ratio against the replay strategy - the two have
+// legitimately different budgets, and pinning one against the other made
+// this test fail the moment an unrelated improvement lowered the baseline.
 func TestObjectsStrategyDoesNotHoardWritesInMemory(t *testing.T) {
 	// Discarded: the first runtime in the process pays one-time costs that
-	// would otherwise land entirely on whichever strategy ran first.
-	writeSessionHeapMB(t, storage.HistoryStrategyReplay, 40)
+	// would otherwise land entirely on whichever measurement ran first.
+	writeSessionHeapMB(t, storage.HistoryStrategyObjects, 100)
 
-	replayMB := writeSessionHeapMB(t, storage.HistoryStrategyReplay, 463)
-	objectsMB := writeSessionHeapMB(t, storage.HistoryStrategyObjects, 463)
-	t.Logf("heap while writing 463 versions: replay %.2f MB, objects %.2f MB", replayMB, objectsMB)
+	const base = 500
+	small := writeSessionHeapMB(t, storage.HistoryStrategyObjects, base)
+	large := writeSessionHeapMB(t, storage.HistoryStrategyObjects, base*4)
+	t.Logf("heap while writing: %d versions %.2f MB, %d versions %.2f MB",
+		base, small, base*4, large)
 
-	if objectsMB > replayMB*2 {
-		t.Fatalf("the objects strategy held %.2f MB while writing against replay's %.2f MB - "+
-			"versions are accumulating in the memtable instead of being flushed", objectsMB, replayMB)
+	if small <= 0 {
+		t.Skip("could not measure heap")
+	}
+	if ratio := large / small; ratio > 1.6 {
+		t.Fatalf("4x the writes cost %.1fx the memory (%.2f MB -> %.2f MB); "+
+			"versions are accumulating in the memtable instead of being flushed", ratio, small, large)
 	}
 }

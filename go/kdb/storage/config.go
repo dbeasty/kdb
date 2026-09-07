@@ -72,6 +72,11 @@ type StorageEngineConfig struct {
 	// grow before it is written out as an SSTable. Zero derives it from
 	// the hot-tier budget; see ResolvedMemtableFlushBytes.
 	MemtableFlushBytes int64
+	// HistoryTreeCacheBytes caps how many bytes of historical document
+	// trees stay resident before the least recently used are evicted and
+	// obtained again on demand. Zero derives it from the hot-tier budget;
+	// see ResolvedHistoryTreeBytes.
+	HistoryTreeCacheBytes int64
 	// DisableCheckpoints stops this namespace writing the checkpoint that
 	// lets the next open skip the delta log. Off by default. Worth turning
 	// on to measure or debug the replay path, or where the checkpoint's
