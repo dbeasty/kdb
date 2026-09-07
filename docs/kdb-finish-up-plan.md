@@ -679,3 +679,37 @@ behind a generic "internal error" instead of the specific `PlanningError` client
 `SELECT nosuchcolumn FROM t`, asserts a normal error reply, then sends a second valid query on the
 same connection to prove the server — and that connection — are still alive). Both fail with a
 panic/process crash against the pre-fix code.
+
+### Layer 16 — hybrid search and the qtask gaps (2026-09-06)
+
+A gap analysis of what KDB needs before an application built on MongoDB (qtask) can move onto it
+produced eleven components, specified in `docs/kdb-spec-layer16-qtask-gaps.md` and implemented in
+both trees on `feat/layer16-qtask-gaps`.
+
+**The three findings that led.** A `WHERE` on a field the schema did not declare returned zero
+rows and no error; an `ORDER BY` on that same field was ignored; `DISTINCT` was parsed and thrown
+away. All three were silent wrong answers, so they were fixed first — every other test in the
+layer would have been untrustworthy until they were.
+
+**What the layer adds.** Scored full-text search (Porter stemming, the 33-word stopword list,
+BM25F-lite over weighted multi-field indexes), a vector index with an HNSW graph kept behind an
+exact brute-force oracle, reciprocal-rank and weighted fusion, `MATCH` / `SIMILARITY` / `FUSE` in
+SQL with planner index selection, index maintenance on the commit path, a `SEARCH` wire pair
+(0x1D/0x1E), document predicates that reach into nested and array paths, `UPDATE` / `DELETE` and
+the full aggregate set, document expiry, compound unique constraints, byte-exact document
+round-trip with derived ids, per-namespace write gates and concurrent frame handling.
+
+**Parity is enforced by fixtures, not by review.** `go/testdata/golden/search/` holds the
+analyzer, Porter, BM25, vector and fusion vectors; both test suites read the same files. The
+Kotlin implementation matched all five on its first run against them.
+
+**Bugs found along the way**, each a silent wrong answer rather than a crash: index snapshots
+emitted all puts before all deletes, so a re-indexed document lost its entry on restore; fusion
+normalised in `Float` before widening, losing the precision cross-tree comparison needs; a
+`limit` of 0 meant "no limit" to every caller but returned nothing in Kotlin.
+
+**Known limitation, recorded rather than hidden.** A `WriteOp` body is applied as a shallow
+root-level merge, so neither `SET _doc` nor wire `UPSERT` can remove a top-level key. That is
+pre-existing engine behaviour; true replacement needs a replace-capable document op and a wire
+format change, deferred to its own layer. Both trees merge identically and both pin it with a
+test.
