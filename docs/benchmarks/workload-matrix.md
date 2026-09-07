@@ -24,6 +24,23 @@ partitions the pool so workers rarely touch the same document.
 
 Reproduce: `cd go && go test ./kdb/server/ -run '^$' -bench BenchmarkWorkload -benchtime 2s -v`
 
+> ⚠️ **Every read number in this file predates `a9c8186`'s `keyFor` rewrite and
+> is not comparable to a run taken after it.** The two versions measure
+> different working sets — old non-overlapping kept ~128 documents hot, the
+> current one spreads across all 4096 — which is worth ~3.2x on
+> heavy-multi-user reads by itself. An A/B at one commit with only `keyFor`
+> reverted reproduces the 19.862M below on today's code. Likewise, the
+> update/transaction heavy-multi-user rows drift ~2x downward across samples
+> within a single `go test` process, so they are only comparable at equal
+> `-count` and equal position in the run.
+>
+> **The current workload baseline is
+> [`2026-09-06-suite-rerun.md`](2026-09-06-suite-rerun.md)** (commit `6d2b4bb`),
+> which supersedes the ops/sec tables below and records a real 37%
+> heavy-multi-user read regression from Layer 16's document expiry. The
+> *findings* in this file — RCU vs. MVCC, the durability analysis, Findings 1-3
+> — all still stand.
+
 ## Results
 
 | Workload | Concurrency | Keyspace | ops/sec | ns/op |
