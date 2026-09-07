@@ -9,7 +9,7 @@ import (
 )
 
 func TestShardedDocByHashStore_ConcurrentPutGet(t *testing.T) {
-	s := newShardedDocByHashStore()
+	s := newShardedDocByHashStore(0)
 	const n = 2000
 	hashes := make([]codec.Hash, n)
 	docs := make([]document.Document, n)

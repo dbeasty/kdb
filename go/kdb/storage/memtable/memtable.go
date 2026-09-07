@@ -142,6 +142,15 @@ func (mgr *Manager) Put(key codec.Hash, value []byte) {
 	mgr.active.Put(key, value)
 }
 
+// SizeBytes is how much the active generation is holding. The memtable
+// grows without bound until something flushes it, so a writer that keeps
+// putting has to watch this - see engine.ServerEngine.maybeFlushMemtable.
+func (mgr *Manager) SizeBytes() int64 {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return mgr.active.SizeBytes()
+}
+
 // Delete tombstones key in the active memtable. The tombstone hides any value in the generation
 // being flushed and in the blob store, and survives the flush: Flush writes it into the SSTable
 // as a real delete marker (see sstable.BlockHandle.Deleted), so a delete of an already-flushed

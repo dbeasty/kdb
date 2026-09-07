@@ -295,7 +295,13 @@ func (h *frameHandler) fetchCommits(sinceHash *codec.Hash, maxCommits int) ([]do
 	if sinceHash != nil && *sinceHash == head {
 		return nil, nil
 	}
-	walked := h.dag.Walk(head, sinceHash, maxCommits)
+	// WalkWithOperations, not Walk: these commits are sent to a peer whole,
+	// and a commit whose operations the retention budget evicted would go
+	// out looking like it wrote nothing.
+	walked, err := h.dag.WalkWithOperations(head, sinceHash, maxCommits)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]document.Commit, 0, len(walked))
 	for i := len(walked) - 1; i >= 0; i-- {
 		if full, ok := walked[i].(dag.FullEntry); ok {

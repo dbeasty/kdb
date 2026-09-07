@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
@@ -50,7 +51,12 @@ func NewDefaultWriter(namespaceID string, segmentID codec.UUID, seq int64, shim 
 func (w *DefaultWriter) NamespaceID() string     { return w.namespaceID }
 func (w *DefaultWriter) SegmentID() codec.UUID   { return w.segmentID }
 func (w *DefaultWriter) CurrentSizeBytes() int64 { return w.sizeBytes }
-func (w *DefaultWriter) IsSealed() bool          { return w.sealed }
+
+// SequenceNumber implements storage.DeltaSegmentSequencer: it reports the
+// segment this writer appends to, which is fixed for the writer's life
+// (OpenWriter always starts a fresh segment rather than resuming one).
+func (w *DefaultWriter) SequenceNumber() int64 { return w.sequence }
+func (w *DefaultWriter) IsSealed() bool        { return w.sealed }
 
 func (w *DefaultWriter) Append(record storage.DeltaRecord) (int64, error) {
 	w.mu.Lock()
@@ -238,13 +244,16 @@ func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.
 			"delta segment %s is at or beyond the %d-byte scan ceiling; refusing to report a possibly-truncated segment range",
 			segmentName, maxScannedSegmentBytes)
 	}
-	scanned, scanErr := ScanSegmentBytes(raw)
+	// Bounds-only: a ref needs the two end commits, not every commit in the
+	// segment, and listing runs over every segment the namespace has. See
+	// ScanSegmentBounds for what that gives up and why it is safe here.
+	bounds, scanErr := ScanSegmentBounds(raw)
 	var corrupt *CorruptFrameError
 	if scanErr != nil && !errors.As(scanErr, &corrupt) {
 		return nil, scanErr
 	}
 	zero, _ := codec.HashFromBytes(make([]byte, 32))
-	if len(scanned) == 0 {
+	if bounds.FrameCount == 0 {
 		return &storage.DeltaSegmentRef{
 			NamespaceID: r.namespaceID, SequenceNumber: seq,
 			FirstCommitHash: zero, LastCommitHash: zero,
@@ -253,11 +262,59 @@ func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.
 	}
 	return &storage.DeltaSegmentRef{
 		NamespaceID: r.namespaceID, SequenceNumber: seq,
-		FirstCommitHash: scanned[0].CommitHash,
-		LastCommitHash:  scanned[len(scanned)-1].CommitHash,
+		FirstCommitHash: bounds.First.Hash,
+		LastCommitHash:  bounds.Last.Hash,
 		SizeBytes:       int64(len(raw)),
 		Compression:     r.config.CompressionCodec,
 	}, nil
+}
+
+// StreamCommits implements storage.DeltaCommitStreamer: it hands segment's
+// commits to fn one at a time as they are decoded, so nothing holds the
+// whole segment's worth of documents at once.
+//
+// This is ReadAll without the round-trip. ReadAll has to return
+// storage.DeltaRecords, which carry the commit as encoded payload bytes,
+// so a caller that wants commits back - replay is the only one - pays a
+// decode here, an encode into the record, and a decode again at the far
+// end, three full materializations of every version in the segment. Here
+// the commit that ScanSegmentFrames already decoded goes straight to fn.
+//
+// Torn-tail semantics are ReadAll's: on *CorruptFrameError every commit
+// before the fault has already reached fn, and the caller decides whether
+// a fault in this particular segment is an expected unclean shutdown.
+func (r *DefaultReader) StreamCommits(segment storage.DeltaSegmentRef, fn func(document.Commit, int64) error) error {
+	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
+	raw, err := r.readFullSegment(segmentName, segment.SizeBytes)
+	if err != nil {
+		return err
+	}
+	return ScanSegmentFrames(raw, func(s ScannedCommit) error {
+		return fn(s.Commit, int64(s.FrameOffset))
+	})
+}
+
+// ReadCommitAt implements storage.DeltaCommitStreamer: it decodes just the
+// commit framed at frameOffset. Reads only that frame's bytes - its length
+// is in its own header - so recovering one commit out of a large segment
+// costs one commit, not the segment.
+func (r *DefaultReader) ReadCommitAt(segment storage.DeltaSegmentRef, frameOffset int64) (document.Commit, error) {
+	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
+	header, err := r.shim.ReadFromSegment(segmentName, frameOffset, PageFrameHeaderSize)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	if len(header) < PageFrameHeaderSize {
+		return document.Commit{}, &CorruptFrameError{
+			Offset: int(frameOffset), Reason: "segment ends inside the frame header",
+		}
+	}
+	frameLen := PageFrameHeaderSize + readIntBE(header, 8)
+	raw, err := r.shim.ReadFromSegment(segmentName, frameOffset, frameLen)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	return DecodeFrame(raw, int(frameOffset))
 }
 
 // LegacySegmentFormatError reports a data directory containing delta

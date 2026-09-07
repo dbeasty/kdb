@@ -367,7 +367,13 @@ func touchedDocsForRange(d *dag.InMemoryCommitDag, head, ancestor codec.Hash) (m
 	if head == ancestor {
 		return map[codec.UUID]touchedDoc{}, nil
 	}
-	walked := d.Walk(head, &ancestor, math.MaxInt)
+	// Reads each commit's operations to decide what each side touched, so
+	// evicted operations must be loaded back first - see
+	// WalkWithOperations.
+	walked, err := d.WalkWithOperations(head, &ancestor, math.MaxInt)
+	if err != nil {
+		return nil, err
+	}
 	out := make(map[codec.UUID]touchedDoc)
 	for i := len(walked) - 1; i >= 0; i-- {
 		full, ok := walked[i].(dag.FullEntry)

@@ -23,6 +23,10 @@ type EmbeddedKdbRuntime struct {
 	// ReadOnly marks a runtime opened under a shared directory lock alongside a writer in
 	// another process. Every write path checks it; see AssertWritable.
 	ReadOnly bool
+	// deltaReader is this runtime's view of the durable commit log. Held so
+	// maintenance paths (see MigrateHistoryStrategy) can walk the log
+	// without reopening the storage handle behind the runtime's back.
+	deltaReader storage.DeltaSegmentReader
 	// refresh re-reads the writer's committed history onto this runtime's DAG. Non-nil only for
 	// read-only runtimes, which are the only ones whose view can fall behind reality.
 	refresh func() error

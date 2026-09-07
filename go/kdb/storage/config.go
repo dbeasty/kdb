@@ -51,6 +51,33 @@ type StorageEngineConfig struct {
 	// WalSkipCorruptRecords makes recovery skip records that fail their
 	// checksum instead of failing the whole replay. Default false.
 	WalSkipCorruptRecords bool
+	// HistoryStrategy decides how reads at historical commits are served
+	// after a restart - see HistoryStrategy. Resolved from the namespace's
+	// own marker at open, so the zero value here is normal.
+	HistoryStrategy HistoryStrategy
+	// DocumentCacheBytes caps how many bytes of document versions stay
+	// resident before the oldest are evicted and re-read on demand. Zero
+	// derives it from the hot-tier budget; see ResolvedDocumentCacheBytes.
+	DocumentCacheBytes int64
+	// CommitOpsBytes caps how many bytes of commit operations the DAG
+	// keeps resident. Zero derives it from the hot-tier budget; see
+	// ResolvedCommitOpsBytes.
+	CommitOpsBytes int64
+	// TreeChainLimit is how many delta tree objects may stack up before a
+	// full one is written, under the objects history strategy. Zero uses
+	// DefaultTreeChainLimit. Lower means cheaper historical reads and more
+	// bytes written; higher, the reverse.
+	TreeChainLimit int
+	// MemtableFlushBytes is how large the in-memory blob generation may
+	// grow before it is written out as an SSTable. Zero derives it from
+	// the hot-tier budget; see ResolvedMemtableFlushBytes.
+	MemtableFlushBytes int64
+	// DisableCheckpoints stops this namespace writing the checkpoint that
+	// lets the next open skip the delta log. Off by default. Worth turning
+	// on to measure or debug the replay path, or where the checkpoint's
+	// own write is not wanted; the cost is that every open replays the log
+	// in full.
+	DisableCheckpoints bool
 }
 
 // ResolvedGlobalMemoryBudgetBytes returns GlobalMemoryBudgetBytes if set,

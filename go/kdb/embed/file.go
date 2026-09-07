@@ -38,6 +38,11 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	if opts.ReadOnly {
 		acquire = acquireDirLockShared
 	}
+	if opts.alreadyLocked {
+		// The caller holds the directory exclusively and is excluding
+		// everyone else on this runtime's behalf; releasing is theirs too.
+		acquire = func(string) (*dirLock, error) { return &dirLock{}, nil }
+	}
 	lock, err := acquire(dataRoot)
 	if err != nil {
 		return nil, err
@@ -46,11 +51,20 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 	// materialized missing namespace directories or a meta.json would be writing to the very
 	// thing it promised not to touch. A namespace that is not there yet simply has nothing to
 	// read, which the delta replay below reports on its own.
+	// Before ensureNamespaceDirs, which creates the marker file that
+	// decides whether this namespace counts as pre-existing.
+	namespaceIsNew := !namespaceDirExists(dataRoot, namespaceID)
 	if !opts.ReadOnly {
 		if err := ensureNamespaceDirs(dataRoot, namespaceID); err != nil {
 			lock.Release()
 			return nil, err
 		}
+	}
+	historyStrategy, err := resolveHistoryStrategy(
+		dataRoot, namespaceID, opts.Storage.HistoryStrategy, namespaceIsNew, opts.ReadOnly, opts.forceHistoryStrategy)
+	if err != nil {
+		lock.Release()
+		return nil, err
 	}
 
 	s3Cfg := opts.S3
@@ -88,6 +102,11 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		IOShim:                  io,
 		Durability:              opts.Storage.Durability,
 		AsyncSyncIntervalMillis: opts.Storage.AsyncSyncIntervalMillis,
+		HistoryStrategy:         historyStrategy,
+		DocumentCacheBytes:      opts.Storage.DocumentCacheBytes,
+		CommitOpsBytes:          opts.Storage.CommitOpsBytes,
+		TreeChainLimit:          opts.Storage.TreeChainLimit,
+		DisableCheckpoints:      opts.Storage.DisableCheckpoints,
 	}
 	target := engine.TargetServer
 	if opts.ReadOnly {
@@ -122,7 +141,15 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		return nil, fmt.Errorf("file runtime missing storage adapter")
 	}
 
-	if err := replayDeltaNamespace(d, store, handle.DeltaReader()); err != nil {
+	if r := handle.DeltaReader(); r != nil {
+		// Installed before replay, so replay's own commits are subject to
+		// the budget as they arrive rather than all landing resident first
+		// - which is the case that made opening a long-lived namespace cost
+		// the sum of its whole history (docs/benchmarks/open-cost.md).
+		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
+	}
+	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints)
+	if err != nil {
 		return nil, err
 	}
 	dagOut := dag.CommitDAG(d)
@@ -133,6 +160,9 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 			time.Duration(cfg.AsyncSyncIntervalMillis)*time.Millisecond,
 		)
 		dagOut = persisting
+		if replayedInFull {
+			checkpointAfterFullReplay(d, store, handle.DeltaReader(), w, io, namespaceID, opts.Storage.DisableCheckpoints)
+		}
 	}
 
 	rt := &EmbeddedKdbRuntime{
@@ -143,6 +173,7 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		DefaultNamespace: namespaceID,
 		DataRoot:         dataRoot,
 		ReadOnly:         opts.ReadOnly,
+		deltaReader:      handle.DeltaReader(),
 	}
 	if !sch.IsNone() && !opts.ReadOnly {
 		// syncEmbedSchema commits a schema migration when the stored schema differs - a write,
@@ -185,6 +216,9 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 					firstErr = err
 				}
 			}
+			// After the seal, so no segment can gain another commit and the
+			// checkpoint can claim the newest one - see checkpointOnClose.
+			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints)
 		}
 		if err := handle.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -226,6 +260,11 @@ func ensureNamespaceDirs(dataRoot, namespaceID string) error {
 		}
 	}
 	return nil
+}
+
+func namespaceDirExists(dataRoot, namespaceID string) bool {
+	_, err := os.Stat(filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID)))
+	return err == nil
 }
 
 // CatalogFromNamespace returns the catalog segment of a namespace id (before '/').

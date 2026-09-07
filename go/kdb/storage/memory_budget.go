@@ -64,3 +64,75 @@ func ValidateHotTierMemoryConfig(cfg HotTierMemoryConfig) error {
 // notably server.DetectMemoryBudgetBytes, which needs a sane default memory budget on a host
 // with no cgroup limit to read - do not have to duplicate the per-platform detection.
 func TotalSystemMemoryBytes() (int64, error) { return totalSystemMemoryBytes() }
+
+// DefaultDocumentCacheFraction is the share of the hot-tier budget the
+// in-memory document version store may hold. The rest of the budget is
+// already spoken for by the block cache and the memtable, and the version
+// store is the one of the three whose miss path is merely slower rather
+// than incorrect - so it is the one that gives ground first.
+const DefaultDocumentCacheFraction = 0.5
+
+// ResolvedDocumentCacheBytes is how many bytes of document versions the
+// storage engine may hold resident before it starts evicting the oldest
+// and re-reading them from the delta log on demand.
+//
+// Versions reachable from the current tree are pinned and do not answer to
+// this budget (see shardedDocByHashStore), so a namespace whose live data
+// exceeds it stays correct and stays fast - it simply holds more than this
+// number. What the budget actually bounds is how much *history* is kept in
+// memory, which before it was bounded was everything, forever.
+func ResolvedDocumentCacheBytes(cfg StorageEngineConfig) int64 {
+	if cfg.DocumentCacheBytes > 0 {
+		return cfg.DocumentCacheBytes
+	}
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultDocumentCacheFraction)
+	if budget < 0 {
+		return 0
+	}
+	return budget
+}
+
+// DefaultCommitOpsFraction is the share of the hot-tier budget the commit
+// DAG may hold in commit operations. Smaller than the document version
+// store's share because the two hold the same bytes for different readers
+// - the version store answers ordinary document reads, while these answer
+// history walks, which are rarer and already tolerate I/O.
+const DefaultCommitOpsFraction = 0.25
+
+// ResolvedCommitOpsBytes is how many bytes of commit operations the DAG
+// may keep resident before it starts dropping the oldest and re-reading
+// them from the delta log on demand. See dag.SetOperationsLoader.
+func ResolvedCommitOpsBytes(cfg StorageEngineConfig) int64 {
+	if cfg.CommitOpsBytes > 0 {
+		return cfg.CommitOpsBytes
+	}
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultCommitOpsFraction)
+	if budget < 0 {
+		return 0
+	}
+	return budget
+}
+
+// DefaultMemtableFraction is the share of the hot-tier budget the
+// in-memory blob generation may reach before being flushed to an SSTable.
+const DefaultMemtableFraction = 0.25
+
+// ResolvedMemtableFlushBytes is how large the memtable may grow before it
+// is written out.
+//
+// It needs a bound at all because the memtable has none of its own: it
+// grows on every Put and shrinks only when something calls Flush. Under
+// the objects history strategy every document version written goes through
+// it, so without this a writing session held every version it had written
+// in memory until close - the exact shape of unbounded retention this
+// tier's budgets exist to prevent.
+func ResolvedMemtableFlushBytes(cfg StorageEngineConfig) int64 {
+	if cfg.MemtableFlushBytes > 0 {
+		return cfg.MemtableFlushBytes
+	}
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultMemtableFraction)
+	if budget <= 0 {
+		return DefaultHotTierBytes / 4
+	}
+	return budget
+}
