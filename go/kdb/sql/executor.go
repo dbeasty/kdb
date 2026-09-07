@@ -27,6 +27,15 @@ type Executor struct {
 // pushed down to id resolution only when nothing before it (ORDER BY, DISTINCT, grouping)
 // depends on seeing every row.
 func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual Expr, ctx QueryContext) (QueryResult, error) {
+	// A table-less SELECT is answered before anything touches the DAG or storage. That
+	// ordering is the point, not an optimization: `SELECT 1` is what a connection pool sends to
+	// check liveness, and resolving a commit for it would make the probe fail on an empty
+	// namespace that has no commits yet - exactly when a caller most wants a plain answer.
+	if !query.HasFrom() {
+		return e.executeSingleRowSelect(query, ctx)
+	}
+	// Aggregates are no longer dispatched to a separate path here: grouped and ungrouped
+	// queries share the pipeline below, which is what lets a GROUP BY key be projected.
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, query.From)
 	env.aliases = projectionAliases(query)
 	if err := e.resolveSearches(query, env, ctx); err != nil {
@@ -216,6 +225,39 @@ func distinctRows(rows []QueryRow) []QueryRow {
 		out = append(out, r)
 	}
 	return out
+}
+
+// executeSingleRowSelect answers a SELECT with no FROM clause by evaluating its projections
+// once against a single synthetic row.
+//
+// The synthetic row is an empty document, which is safe precisely because the planner has
+// already refused every construct that would need a real one - column references, `*`, and
+// aggregates (see validateTablelessSelect). What remains is literals, parameters and operators
+// over them, none of which read the document.
+func (e *Executor) executeSingleRowSelect(query SelectQuery, ctx QueryContext) (QueryResult, error) {
+	row := emptyDoc
+	env := newEvalEnv(ctx.Schema, ctx.Parameters, query.From)
+	env.aliases = projectionAliases(query)
+	doc := newEvalDoc(row)
+
+	// WHERE still applies, over that one row: `SELECT 1 WHERE ?` is a legitimate way to ask
+	// whether a parameter is true, and answering zero rows is the honest result.
+	if query.Where != nil && !env.predicate(query.Where, doc) {
+		return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: nil}, nil
+	}
+
+	rows := []QueryRow{{Values: projectRow(query.Projections, env, doc)}}
+	// ORDER BY over one row is a no-op, but LIMIT and OFFSET are not: `LIMIT 0` genuinely means
+	// no rows, and an OFFSET past the single row means the same.
+	limit := 1
+	if query.Limit != nil {
+		limit = *query.Limit
+	}
+	rows = applyLimitOffset(rows, limit, query.Offset)
+	for _, r := range rows {
+		ctx.Stats.addRetained(rowBytes(r))
+	}
+	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows}, nil
 }
 
 // retainedRowOverheadBytes is the per-row fixed cost charged on top of document content when

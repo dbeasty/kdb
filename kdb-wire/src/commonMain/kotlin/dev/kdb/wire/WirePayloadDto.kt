@@ -33,7 +33,7 @@ internal data class WirePayloadEnvelope(
     val searchResult: SearchResultDto? = null,
 )
 
-// Layer 16 Component 68 - shapes follow the §11 body table (camelCase, optional fields omitted).
+// Layer 16 Component 69 - shapes follow the §11 body table (camelCase, optional fields omitted).
 @Serializable
 internal data class SearchTextArmDto(
     val index: String,

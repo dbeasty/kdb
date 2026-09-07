@@ -12,7 +12,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/sql"
 )
 
-// SQL half of Component 66: the planner's index selection (kdb-spec-layer16 §9.1, §9.3)
+// SQL half of Component 67: the planner's index selection (kdb-spec-layer16 §9.1, §9.3)
 // against a fake IndexProvider. The fake records every call so tests can assert both that an
 // index was consulted and with what strictness.
 

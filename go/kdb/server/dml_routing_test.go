@@ -9,7 +9,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
-// TestSqlExecRoutesUpdateAndDeleteThroughDML is the routing guarantee (Component 71's wire side):
+// TestSqlExecRoutesUpdateAndDeleteThroughDML is the routing guarantee (Component 72's wire side):
 // handleSqlExec used to send only INSERT down the DML path, so an UPDATE or DELETE fell through
 // to the read path and was rejected as "DML must be executed via ExecuteDML". Every statement
 // that is neither a SELECT nor DDL is now buffered as document ops on the session.

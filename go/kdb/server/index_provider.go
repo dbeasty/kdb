@@ -16,7 +16,7 @@ import (
 )
 
 // RegistryIndexProvider bridges an index.Registry to the three consumers that need it
-// (kdb-spec-layer16 Components 66 and 68): sql.IndexProvider for index-backed access paths,
+// (kdb-spec-layer16 Components 67 and 69): sql.IndexProvider for index-backed access paths,
 // sql.IndexDDLExecutor for CREATE/DROP INDEX, and SearchProvider for SEARCH frames.
 //
 // It is deliberately the only place that knows about all three interfaces at once. The index

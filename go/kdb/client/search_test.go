@@ -29,7 +29,7 @@ func (p *stubSearchProvider) Search(_ context.Context, req wire.SearchMessage) (
 	return p.hits, p.resolved, nil
 }
 
-// TestSearchRoundTripsAgainstAListener is Component 68's client half: a SearchRequest crosses the
+// TestSearchRoundTripsAgainstAListener is Component 69's client half: a SearchRequest crosses the
 // wire, reaches the server's provider with both arms and every option intact, and the ranked hits
 // come back with their bodies.
 func TestSearchRoundTripsAgainstAListener(t *testing.T) {

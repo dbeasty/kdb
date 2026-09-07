@@ -100,7 +100,7 @@ func WireRegistry() *schema.Registry {
 				{ID: 2, Name: "version", Type: schema.Prim(schema.PhysicalInt32)},
 				{ID: 3, Name: "createdAt", Type: tsPrim},
 				{ID: 4, Name: "description", Type: schema.Prim(schema.PhysicalString)},
-				// Layer 16 / Component 72. Defaulted to an empty array and omitted by the
+				// Layer 16 / Component 73. Defaulted to an empty array and omitted by the
 				// writer when empty, so pre-Layer-16 bytes (and hashes) are unchanged.
 				{ID: 5, Name: "uniqueConstraints", Type: schema.Array{Element: schema.Ref{FullyQualifiedName: fqnUniqueConstr}}, Default: codec.ArrayValue{Elements: []codec.Value{}}},
 			},

@@ -2,12 +2,17 @@ package transaction_test
 
 // Phase 0 baseline benchmark for the transaction commit path (see
 // docs/benchmarks/phase0-baseline.md). Each goroutine commits writes to
-// disjoint document IDs, so the optimistic conflict detector never
-// rejects a commit here — this isolates the cost of the InMemoryCommitDag
-// mutex and InMemoryStorageAdapter.CommitTree's full-tree rebuild
-// (in_memory.go) from conflict-policy overhead.
+// disjoint document IDs, so the data-level optimistic conflict detector
+// never rejects a commit here. Every commit still lands on the same branch
+// tip, though, so AppendCommit's head compare-and-swap (dag.HeadConflictError)
+// legitimately fires whenever another goroutine's commit lands first - that
+// is real contention on the single-writer branch, not a data conflict, and
+// is absorbed by retrying against the fresh head. This isolates the cost of
+// the InMemoryCommitDag mutex and InMemoryStorageAdapter.CommitTree's
+// full-tree rebuild (in_memory.go) from conflict-policy overhead.
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -33,14 +38,10 @@ func BenchmarkCommitConcurrent_DisjointDocs(b *testing.B) {
 				b.Fatal(err)
 			}
 			store := mem.NewInMemoryStorageAdapter()
-			base, err := d.Head()
-			if err != nil {
-				b.Fatal(err)
-			}
 			eng := transaction.NewEngine(transaction.ConflictPolicyStrict, nil)
 
 			metrics.Default.Reset()
-			var counter int64
+			var counter, headConflicts int64
 			b.SetParallelism(parallelism)
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -48,24 +49,38 @@ func BenchmarkCommitConcurrent_DisjointDocs(b *testing.B) {
 				for pb.Next() {
 					n := atomic.AddInt64(&counter, 1)
 					docID, _ := codec.RandomUUID()
-					tx := document.Transaction{
-						ID:          mustUUID(),
-						BaseVersion: base,
-						Operations: []document.Op{document.WriteOp{
-							DocID: docID,
-							Patch: fmt.Sprintf(`{"v":%d}`, n),
-						}},
-						Timestamp: codec.TimestampNow(),
-					}
-					res, err := eng.Commit(tx, d, store, schema.None(), nil, "")
-					if err != nil {
-						b.Fatal(err)
-					}
-					if _, ok := res.(transaction.ResultSuccess); !ok {
-						b.Fatalf("unexpected result %T for disjoint-doc commit", res)
+					txID := mustUUID()
+					for {
+						base, err := d.Head()
+						if err != nil {
+							b.Fatal(err)
+						}
+						tx := document.Transaction{
+							ID:          txID,
+							BaseVersion: base,
+							Operations: []document.Op{document.WriteOp{
+								DocID: docID,
+								Patch: fmt.Sprintf(`{"v":%d}`, n),
+							}},
+							Timestamp: codec.TimestampNow(),
+						}
+						res, err := eng.Commit(tx, d, store, schema.None(), nil, "")
+						if err != nil {
+							var headConflict *dag.HeadConflictError
+							if errors.As(err, &headConflict) {
+								atomic.AddInt64(&headConflicts, 1)
+								continue
+							}
+							b.Fatal(err)
+						}
+						if _, ok := res.(transaction.ResultSuccess); !ok {
+							b.Fatalf("unexpected result %T for disjoint-doc commit", res)
+						}
+						break
 					}
 				}
 			})
+			b.ReportMetric(float64(atomic.LoadInt64(&headConflicts))/float64(b.N), "head_conflicts/op")
 			b.StopTimer()
 			for _, s := range metrics.Default.Snapshot() {
 				b.Logf("stage=%-14s count=%-8d mean=%-12s p50=%-12s p99=%-12s max=%s",

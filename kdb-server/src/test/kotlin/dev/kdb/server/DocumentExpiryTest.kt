@@ -13,7 +13,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Layer 16 §9.5 (Component 72): documents whose expiry field is a timestamp in the past are hidden
+ * Layer 16 §9.5 (Component 73): documents whose expiry field is a timestamp in the past are hidden
  * from head reads between sweeps, and deleted by the sweeper.
  */
 class DocumentExpiryTest {

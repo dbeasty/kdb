@@ -39,7 +39,7 @@ func (DefaultParser) Parse(sql string) (stmt Statement, err error) {
 	p.matchChar(';')
 	p.skipWS()
 	if p.pos < len(p.input) {
-		return nil, p.parseError("unexpected input after statement")
+		return nil, p.parseError("unexpected trailing input" + p.foundSuffix())
 	}
 	return stmt, nil
 }
@@ -443,12 +443,15 @@ func (p *rdParser) parseSelectQuery() (SelectQuery, error) {
 	if err != nil {
 		return SelectQuery{}, err
 	}
-	if err := p.expectKeyword("FROM"); err != nil {
-		return SelectQuery{}, err
-	}
-	table, err := p.parseTableRef()
-	if err != nil {
-		return SelectQuery{}, err
+	// FROM is optional: a SELECT with no table evaluates its projections once against a single
+	// synthetic row. That is what makes `SELECT 1` work - the connectivity probe every SQL tool
+	// and connection pool issues.
+	var table TableRef
+	if p.matchKeyword("FROM") {
+		table, err = p.parseTableRef()
+		if err != nil {
+			return SelectQuery{}, err
+		}
 	}
 	var where Expr
 	if p.matchKeyword("WHERE") {
@@ -783,7 +786,7 @@ func (p *rdParser) parsePrimary() (Expr, error) {
 	case c == '_' || unicode.IsLetter(rune(c)):
 		return p.parseIdentifierExpr()
 	default:
-		return nil, p.parseError("expected expression")
+		return nil, p.parseError("expected expression" + p.foundSuffix())
 	}
 }
 
@@ -802,7 +805,7 @@ func (p *rdParser) parseNumberLiteral() (Expr, error) {
 	if strings.ContainsAny(num, ".eE") {
 		f, err := strconv.ParseFloat(num, 64)
 		if err != nil {
-			return nil, p.parseError("invalid number: " + num)
+			return nil, p.parseError("invalid numeric literal " + strconv.Quote(num))
 		}
 		if neg {
 			f = -f
@@ -811,7 +814,7 @@ func (p *rdParser) parseNumberLiteral() (Expr, error) {
 	}
 	n, err := strconv.ParseInt(num, 10, 64)
 	if err != nil {
-		return nil, p.parseError("invalid integer: " + num)
+		return nil, p.parseError("invalid integer literal " + strconv.Quote(num))
 	}
 	if neg {
 		n = -n
@@ -996,7 +999,9 @@ func (p *rdParser) readNumber() string {
 	for p.pos < len(p.input) && unicode.IsDigit(rune(p.input[p.pos])) {
 		p.pos++
 	}
-	if p.pos < len(p.input) && p.input[p.pos] == '.' {
+	// Every further `.digits` run is swallowed too, so "1.2.3" is rejected as one malformed
+	// literal rather than parsed as 1.2 with ".3" left to surface as confusing trailing input.
+	for p.pos < len(p.input) && p.input[p.pos] == '.' {
 		p.pos++
 		for p.pos < len(p.input) && unicode.IsDigit(rune(p.input[p.pos])) {
 			p.pos++
@@ -1058,7 +1063,22 @@ func (p *rdParser) readIdentifier() (string, error) {
 		}
 		if p.pos == segStart {
 			p.pos = start
-			return "", p.parseError("expected identifier")
+			return "", p.parseError("expected identifier" + p.foundSuffix())
+		}
+		// A clause keyword is not an identifier. Without this the lexer happily reads FROM as a
+		// column name, and `SELECT FROM players` parses as "select the column named FROM" -
+		// which matters more now FROM is optional, because there is then no later
+		// expectKeyword("FROM") to fail and turn the misparse back into an error. Only the
+		// first segment is checked: `steps.text` is a path, and a reserved word can never
+		// start one.
+		if segStart == start {
+			if _, reserved := reservedWords[strings.ToUpper(p.input[start:p.pos])]; reserved {
+				// Rewound so the caller's own matchKeyword can still see the word, and so the
+				// error position points at the keyword rather than past it.
+				word := p.input[start:p.pos]
+				p.pos = start
+				return "", p.parseError("expected identifier, found reserved word " + strconv.Quote(word))
+			}
 		}
 		if p.pos < len(p.input) && p.input[p.pos] == '.' {
 			p.pos++
@@ -1067,6 +1087,34 @@ func (p *rdParser) readIdentifier() (string, error) {
 		break
 	}
 	return p.input[start:p.pos], nil
+}
+
+// reservedWords are the keywords that end or introduce a clause, and so can never be an
+// identifier on their own.
+var reservedWords = map[string]struct{}{
+	"SELECT": {}, "FROM": {}, "WHERE": {}, "ORDER": {}, "BY": {},
+	"LIMIT": {}, "OFFSET": {}, "AS": {}, "INSERT": {}, "INTO": {},
+	"VALUES": {}, "CREATE": {}, "TABLE": {}, "DISTINCT": {},
+	"UPDATE": {}, "DELETE": {}, "SET": {}, "GROUP": {}, "DROP": {}, "INDEX": {},
+}
+
+// foundSuffix describes what is actually at the cursor, for an error message that says what went
+// wrong rather than only what was wanted. "expected identifier" alone leaves a caller staring at
+// a statement with no idea which token offended; ParseError already carries the position, but the
+// offending text is what a human reads first.
+func (p *rdParser) foundSuffix() string {
+	p.skipWS()
+	if p.pos >= len(p.input) {
+		return ", found end of statement"
+	}
+	end := p.pos
+	for end < len(p.input) && !unicode.IsSpace(rune(p.input[end])) && end-p.pos < 16 {
+		end++
+	}
+	if end == p.pos {
+		end = p.pos + 1
+	}
+	return ", found " + strconv.Quote(p.input[p.pos:end])
 }
 
 func (p *rdParser) expectKeyword(kw string) error {

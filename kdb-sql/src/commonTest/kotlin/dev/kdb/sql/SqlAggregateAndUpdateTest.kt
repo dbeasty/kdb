@@ -9,7 +9,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/** Component 71 — aggregates, group keys and mutating SQL (Layer 16 §5). */
+/** Component 72 — aggregates, group keys and mutating SQL (Layer 16 §5). */
 class SqlAggregateAndUpdateTest {
     private suspend fun scored(): SqlTestRuntime {
         val fx = schemalessRuntime()

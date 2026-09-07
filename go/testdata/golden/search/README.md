@@ -1,6 +1,6 @@
 # Layer 16 search fixtures
 
-Shared golden fixtures for the hybrid-search components (Layer 16, components 63–65). Both
+Shared golden fixtures for the hybrid-search components (Layer 16, components 64–66). Both
 trees read these same files: Go from `go/kdb/index/**`, Kotlin from its index modules. They are
 the parity gate — Go and Kotlin must agree on every value here, and neither tree may edit a
 fixture to make its own tests pass.
@@ -20,7 +20,7 @@ and those derivations are written out in the test comments that assert them
 hand after any deliberate scoring change; do not regenerate a fixture to paper over a
 regression.
 
-`derived_id_vectors.json` belongs to component 72 (§9.3) and is documented by that work, not
+`derived_id_vectors.json` belongs to component 73 (§9.3) and is documented by that work, not
 here.
 
 ## analyzer_vectors.json

@@ -50,7 +50,7 @@ func searchRequest(t *testing.T, c *rawWireClient, namespace, query string, incl
 	return result
 }
 
-// TestSearchWithoutProviderIsUnsupported is Component 68's default state: until the runtime's
+// TestSearchWithoutProviderIsUnsupported is Component 69's default state: until the runtime's
 // index layer is wired, a SEARCH gets a typed UNSUPPORTED refusal naming what is missing, rather
 // than an INTERNAL error or an empty result that would read as "nothing matched".
 func TestSearchWithoutProviderIsUnsupported(t *testing.T) {

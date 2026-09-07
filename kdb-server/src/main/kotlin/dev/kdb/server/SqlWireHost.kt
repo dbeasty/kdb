@@ -68,7 +68,7 @@ public class SqlWireHost(
     private val sqlAuth = SqlAuthSupport(auth, connectionContext)
     private var correlation = 1
 
-    /** Test-only seam (Component 73 §12): invoked with the session id at the start of every SqlExec,
+    /** Test-only seam (Component 74 §12): invoked with the session id at the start of every SqlExec,
      * inside the per-session lock, so a test can hold one session's statement open and prove that
      * sessionless frames (DocumentGet, Search) and other sessions on the same connection still
      * complete, while a second statement on the same session waits its turn. */
@@ -853,11 +853,11 @@ public class SqlWireHost(
             namespace = replyNamespace,
             reportBytes = encodeConflictReport(report),
             errorCode = "CONFLICT",
-            // Component 73: paced by the namespace's own write gate, not a runtime-wide one.
+            // Component 74: paced by the namespace's own write gate, not a runtime-wide one.
             retryAfterMs = server.conflictRetryAfterMs(namespace),
         )
 
-    // ---- Layer 16 Component 68 (§11): SEARCH over the wire ------------------------------------
+    // ---- Layer 16 Component 69 (§11): SEARCH over the wire ------------------------------------
 
     /**
      * Sessionless like DocumentGet, authorized as DocumentRead on the namespace. Each present arm

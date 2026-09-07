@@ -47,7 +47,7 @@ public enum class WireMessageType(public val code: Short) {
     UPSERT(0x16),
     UPSERT_RESULT(0x17),
 
-    // Layer 16 Component 68 hybrid search (0x18..0x1C are Go's CommitPushAck and lock ops).
+    // Layer 16 Component 69 hybrid search (0x18..0x1C are Go's CommitPushAck and lock ops).
     SEARCH(0x1D),
     SEARCH_RESULT(0x1E),
     ;
@@ -378,7 +378,7 @@ public sealed class WireMessage {
         val weight: Double? = null,
     )
 
-    // Layer 16 Component 68 (§11): sessionless like DocumentGet, authorized as DocumentRead on the
+    // Layer 16 Component 69 (§11): sessionless like DocumentGet, authorized as DocumentRead on the
     // namespace. With one arm the result is that arm's ranking; with both, the fused ranking.
     public data class Search(
         override val header: WireHeader,

@@ -4,7 +4,7 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.index.RankedResult
 
 /**
- * Rank fusion (Layer 16, Component 65). Both modes read only positions or per-arm normalised
+ * Rank fusion (Layer 16, Component 66). Both modes read only positions or per-arm normalised
  * scores, never raw cross-arm scores, and the output order is deterministic (fused score
  * descending, then document id ascending) so Kotlin and Go agree on the same corpus.
  */

@@ -15,7 +15,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
-// Document expiry (kdb-spec-layer16 §9.5, Component 72).
+// Document expiry (kdb-spec-layer16 §9.5, Component 73).
 //
 // Two halves. The read side hides expired documents at head - GetDocument, and every read the
 // SQL engine makes through the expiryHidingAdapter it is constructed with - so a document is

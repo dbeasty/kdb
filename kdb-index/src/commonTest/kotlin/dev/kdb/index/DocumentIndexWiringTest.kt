@@ -20,7 +20,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * The commit path and registry wiring for document-level indexes (Components 63/64 through §10):
+ * The commit path and registry wiring for document-level indexes (Components 64/65 through §10):
  * FULLTEXT and VECTOR stores are fed whole documents, validated before anything is mutated, and
  * restored or rebuilt at bind time.
  */

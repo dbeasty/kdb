@@ -116,13 +116,22 @@ type TableRef struct {
 type SelectQuery struct {
 	Distinct    bool
 	Projections []Projection
-	From        TableRef
-	Where       Expr
-	GroupBy     []Expr
-	OrderBy     []OrderItem
-	Limit       *int
-	Offset      int
+	// From is the zero TableRef for a table-less SELECT (`SELECT 1`), which evaluates its
+	// projections once against a single synthetic row. Use HasFrom rather than comparing Name
+	// directly.
+	From    TableRef
+	Where   Expr
+	GroupBy []Expr
+	OrderBy []OrderItem
+	Limit   *int
+	Offset  int
 }
+
+// HasFrom reports whether the query names a table.
+//
+// An empty name is unambiguous: readIdentifier never yields one, so a blank From can only come
+// from a query that had no FROM clause at all.
+func (q SelectQuery) HasFrom() bool { return q.From.Name != "" }
 
 // Projection is SELECT list element.
 type Projection interface {
@@ -436,6 +445,12 @@ type PhysicalPlan interface {
 type PlanFullScan struct{ Label string }
 
 func (PlanFullScan) isPhysicalPlan() {}
+
+// PlanSingleRow produces exactly one synthetic row and reads no storage - the plan for a
+// table-less SELECT such as `SELECT 1`.
+type PlanSingleRow struct{}
+
+func (PlanSingleRow) isPhysicalPlan() {}
 
 type PlanFilter struct {
 	Predicate Expr

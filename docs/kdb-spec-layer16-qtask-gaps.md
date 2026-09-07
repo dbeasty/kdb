@@ -1,6 +1,11 @@
 # KDB Component Spec — Layer 16
 ## Hybrid Search, Query Semantics, Document Predicates, Mutating SQL, Lifecycle, Throughput
-### Components 63–73
+### Components 64–74
+
+**On the numbers**: component ids are allocated sequentially across the whole spec, not per layer.
+Layer 15 ended at 62 and Component 63 is Layer 12's TypeScript client SDK, which landed first, so
+this layer takes 64–74. An earlier draft of this document used 63–73; if you find that numbering
+in a branch or review comment, subtract one.
 
 **Depends on:** Layer 3 (transaction engine, index layer core), Layer 5 (SQL), Layer 12 (Go-native
 server, document ops 0x14–0x17), Layer 13 (resource governance / admission).
@@ -26,7 +31,7 @@ The analysis asked four questions. The answers below are fixed for this layer.
 
 -----
 
-## 2. Column resolution (Components 69, 70 — both trees)
+## 2. Column resolution (Components 70, 71 — both trees)
 
 A *column reference* is a dotted identifier path `a.b.c`. If the first segment names the FROM
 table or its alias it is stripped. The remaining path is the JSON path `$.a.b.c` into the
@@ -60,7 +65,7 @@ comparator is total: `NULL` sorts before every value (so first in `ASC`, last in
 
 -----
 
-## 3. Component 69 — Query Semantics Hardening (Phase 0)
+## 3. Component 70 — Query Semantics Hardening (Phase 0)
 
 1. Unknown column in `WHERE` → planning error (Rule 1). Was: matches nothing (`=`) or everything (`<>`).
 2. Unknown column in `ORDER BY` → planning error. Was: sort silently ignored (Go) / inconsistent comparator (Kotlin).
@@ -76,7 +81,7 @@ comparator is total: `NULL` sorts before every value (so first in `ASC`, last in
 
 -----
 
-## 4. Component 70 — Predicate Coverage over Documents
+## 4. Component 71 — Predicate Coverage over Documents
 
 Syntax (both parsers):
 
@@ -112,7 +117,7 @@ case-sensitive `LIKE` (previously ignore-case). Go gains all of it.
 
 -----
 
-## 5. Component 71 — Mutating SQL and Aggregates
+## 5. Component 72 — Mutating SQL and Aggregates
 
 ```
 UPDATE t [alias] SET path = expr {, path = expr} [WHERE expr]
@@ -148,7 +153,7 @@ DELETE FROM t [alias] [WHERE expr]
 
 -----
 
-## 6. Component 63 — Scored Full-Text Index
+## 6. Component 64 — Scored Full-Text Index
 
 ### 6.1 Analyzer (identical in both trees)
 
@@ -234,7 +239,7 @@ after every `flushEvery` commits (default 64). On open, a missing or stale snaps
 
 -----
 
-## 7. Component 64 — Vector Index
+## 7. Component 65 — Vector Index
 
 - Metrics: `cosine` (score = dot / (‖a‖‖b‖), 0 when either norm is 0), `l2` (score =
   1 / (1 + ‖a − b‖)), `inner_product` (score = dot). Higher is always better.
@@ -261,7 +266,7 @@ per metric, expected exact `[docId, score]` (tolerance 1e-5).
 
 -----
 
-## 8. Component 65 — Rank Fusion
+## 8. Component 66 — Rank Fusion
 
 Pure functions over per-arm ranked lists (`docId`, `score`), each list already sorted by score
 desc / docId asc.
@@ -282,7 +287,7 @@ minScore, weights, disjoint/overlapping arms, and exact ties. Expected scores to
 
 -----
 
-## 9. SQL surface, planner, DDL (Component 66) and lifecycle (Component 72)
+## 9. SQL surface, planner, DDL (Component 67) and lifecycle (Component 73)
 
 ### 9.1 Search in SQL
 
@@ -335,7 +340,7 @@ unioned; `MATCH` → full-text scan. Every remaining conjunct is the residual fi
 (Kotlin) and `QueryResult.Plan` (Go, new field) name the chosen access path so tests can assert
 an index was used.
 
-### 9.4 Document identity and round-trip (Component 72)
+### 9.4 Document identity and round-trip (Component 73)
 
 - Documents are stored and returned **byte-exact**. No key is injected, no key is reordered, on
   any write path (`kdb put`, embed `PutJSONDocument`/`putJson`, wire `UPSERT`, SQL `INSERT`).
@@ -350,7 +355,7 @@ an index was used.
   `kdb_id`); the body is still stored untouched.
 - README's "exactly as provided" promise becomes true; the README documents `id`.
 
-### 9.5 Document expiry (Component 72)
+### 9.5 Document expiry (Component 73)
 
 ```
 NamespacePolicy.DocumentExpiry / documentExpiry:
@@ -370,7 +375,7 @@ Accepted forms: an RFC 3339 string, or a number of epoch milliseconds. Any other
 - `kdb-service` flags (both): `--expire-field <path>`, `--expire-grace <duration>`,
   `--expire-interval <duration>`.
 
-### 9.6 Compound unique (Component 72)
+### 9.6 Compound unique (Component 73)
 
 `UNIQUE (a, b)` table constraints (schema `UniqueConstraints` / `uniqueConstraints`, already on
 the schema body as wire field 5). Enforcement at commit, in the transaction engine, through a
@@ -383,7 +388,7 @@ post-commit); Go generalises its existing one.
 
 -----
 
-## 10. Component 67 — Index Maintenance on the Commit Path
+## 10. Component 68 — Index Maintenance on the Commit Path
 
 - Before the DAG append, the engine derives **index hints** from the transaction's ops against
   every registered index: `WriteOp` → `PUT` with the extracted key / analyzed text / vector;
@@ -396,7 +401,7 @@ post-commit); Go generalises its existing one.
 
 -----
 
-## 11. Component 68 — Search over the Wire
+## 11. Component 69 — Search over the Wire
 
 New message pair, both trees, JSON body like every other frame:
 
@@ -411,7 +416,7 @@ namespace, sessionless like `DOCUMENT_GET`. The Go client SDK gains `Search(ctx,
 
 -----
 
-## 12. Component 73 — Write and Connection Throughput
+## 12. Component 74 — Write and Connection Throughput
 
 - **Per-namespace write gates.** Kotlin's `WriteCoordinator` becomes one coordinator per
   namespace inside a runtime; Go's gate is already per runtime (= per namespace) and gets a test

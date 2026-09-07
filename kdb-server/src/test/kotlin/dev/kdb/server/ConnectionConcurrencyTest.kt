@@ -28,7 +28,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Component 73 (§12), connection half: frames on one connection are handled concurrently, so a slow
+ * Component 74 (§12), connection half: frames on one connection are handled concurrently, so a slow
  * statement on one session cannot delay a sessionless DocumentGet on the same connection - while two
  * statements on the *same* session are still processed strictly in order.
  *

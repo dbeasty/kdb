@@ -8,7 +8,7 @@ import dev.kdb.storage.StorageAdapter
 
 /**
  * An index fed whole documents rather than extracted keys (FULLTEXT and VECTOR, Layer 16
- * Components 63/64). The registry and writer recognise stores by this interface: on every commit
+ * Components 64/65). The registry and writer recognise stores by this interface: on every commit
  * a `WriteOp` becomes [putDocument] and a `DeleteOp` becomes a tombstone via [IndexStore.delete].
  */
 public interface DocumentIndexStore : IndexStore {

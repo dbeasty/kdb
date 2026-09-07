@@ -6,7 +6,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/sql"
 )
 
-// Component 70 - predicates over nested and array paths (kdb-spec-layer16 §2, §4).
+// Component 71 - predicates over nested and array paths (kdb-spec-layer16 §2, §4).
 
 func TestPredicateDottedPathsWithImplicitArrayTraversal(t *testing.T) {
 	f := newCorpusFixture(t, "app/pred-paths")

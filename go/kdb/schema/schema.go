@@ -16,7 +16,7 @@ type KdbSchema struct {
 	CreatedAt   codec.Timestamp
 	Description string
 	// UniqueConstraints are the compound (multi-field) unique constraints declared on the
-	// schema (Layer 16, Component 72). Single-field uniqueness is still expressed through
+	// schema (Layer 16, Component 73). Single-field uniqueness is still expressed through
 	// Field.Unique; UniqueTuples merges both views. Encoded as wire field 5 of KdbSchemaBody
 	// with an empty default, so a schema without compound constraints hashes exactly as it
 	// did before the field existed.
@@ -139,7 +139,7 @@ func Build(fields []Field, version int, createdAt codec.Timestamp, description s
 	return BuildWithConstraints(fields, nil, version, createdAt, description)
 }
 
-// BuildWithConstraints is Build plus compound unique constraints (Component 72).
+// BuildWithConstraints is Build plus compound unique constraints (Component 73).
 func BuildWithConstraints(fields []Field, constraints []UniqueConstraint, version int, createdAt codec.Timestamp, description string) (KdbSchema, error) {
 	if version < 1 {
 		return KdbSchema{}, fmt.Errorf("schema version must be >= 1")

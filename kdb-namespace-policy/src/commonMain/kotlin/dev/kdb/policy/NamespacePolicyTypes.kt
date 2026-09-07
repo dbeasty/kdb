@@ -73,7 +73,7 @@ public data class VectorIndexPolicy(
 )
 
 /**
- * Document expiry (Layer 16 §9.5, Component 72). A document is expired when the value at
+ * Document expiry (Layer 16 §9.5, Component 73). A document is expired when the value at
  * `$.<fieldPath>` is a timestamp `<= now - graceMillis`: an RFC 3339 string or a number of epoch
  * milliseconds; any other value means "never expires". Head reads hide expired documents between
  * sweeps; the server's sweeper deletes them every [sweepIntervalMillis].

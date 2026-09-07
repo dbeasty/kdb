@@ -17,7 +17,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Component 73 (§12): the write gate is per namespace inside a runtime, not one gate per runtime, so
+ * Component 74 (§12): the write gate is per namespace inside a runtime, not one gate per runtime, so
  * a commit stuck behind namespace A's gate does not hold up namespace B.
  *
  * Real threads (runBlocking + Dispatchers.Default), not runTest's virtual clock: the property under

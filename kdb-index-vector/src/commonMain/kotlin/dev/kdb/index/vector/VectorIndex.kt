@@ -142,7 +142,7 @@ internal class VecEvent(
 )
 
 /**
- * Vector index (Layer 16, Component 64): exact brute-force search — the oracle — up to
+ * Vector index (Layer 16, Component 65): exact brute-force search — the oracle — up to
  * [exactThreshold] live vectors, HNSW above it. A negative threshold forces HNSW at every size,
  * which is how the recall test drives the graph.
  *

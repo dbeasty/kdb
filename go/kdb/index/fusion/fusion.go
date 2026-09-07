@@ -1,4 +1,4 @@
-// Package fusion merges per-arm ranked lists into one ranking (Layer 16, Component 65).
+// Package fusion merges per-arm ranked lists into one ranking (Layer 16, Component 66).
 //
 // Both fusion modes read only positions or per-arm normalised scores, never raw cross-arm
 // scores: BM25 is unbounded and cosine sits in [-1, 1], so adding them would mean recalibrating

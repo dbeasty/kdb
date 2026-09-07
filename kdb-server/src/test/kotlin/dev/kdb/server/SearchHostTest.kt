@@ -31,7 +31,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Layer 16 Component 68 (§11): the SEARCH/SEARCH_RESULT pair against the real wire host.
+ * Layer 16 Component 69 (§11): the SEARCH/SEARCH_RESULT pair against the real wire host.
  *
  * The index stores are fakes returning canned [RankedResult]s: the real FULLTEXT/VECTOR stores are
  * a separate component, and what is under test here is the host's index resolution, arm handling,

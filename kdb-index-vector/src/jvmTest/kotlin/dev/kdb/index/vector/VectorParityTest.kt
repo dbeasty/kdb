@@ -14,7 +14,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Parity gate for Component 64: over the shared corpus, Kotlin's exact (brute-force) search must
+ * Parity gate for Component 65: over the shared corpus, Kotlin's exact (brute-force) search must
  * return the same documents and scores as Go, within 1e-5, for every metric.
  */
 class VectorParityTest {

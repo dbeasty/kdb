@@ -280,7 +280,7 @@ func (s *KdbServerRuntime) rebuildSQLEngine() {
 }
 
 // SetSearchProvider installs (or, with nil, removes) the provider that serves SEARCH frames -
-// kdb-spec-layer16 §11, Component 68. Safe to call at any time, including while connections are
+// kdb-spec-layer16 §11, Component 69. Safe to call at any time, including while connections are
 // live: the next SEARCH uses the new provider. Until one is set every search is refused with
 // ErrSearchNotConfigured (wire.ErrorCodeUnsupported).
 func (s *KdbServerRuntime) SetSearchProvider(provider SearchProvider) {
@@ -630,7 +630,7 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	releaseNow := func() { releaseOnce.Do(release) }
 	defer releaseNow()
 
-	// Index extraction and validation happen before the commit lands (Component 67): a value
+	// Index extraction and validation happen before the commit lands (Component 68): a value
 	// the indexes cannot accept rejects the transaction here, rather than leaving index state
 	// disagreeing with the documents it describes.
 	preparedIndexes, indexProvider, err := s.prepareIndexes(tx)

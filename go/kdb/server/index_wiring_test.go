@@ -29,7 +29,7 @@ func putDoc(t *testing.T, srv *KdbServerRuntime, body string) codec.UUID {
 
 // TestOpenIndexesWiresBothProviders guards the wiring itself: after OpenIndexes the runtime
 // serves SQL index lookups and SEARCH frames from the same registry, where before it had
-// neither. This is the join between the index layer and the server that Components 66 and 68
+// neither. This is the join between the index layer and the server that Components 67 and 69
 // both depend on, and nothing else in the tree exercises it.
 func TestOpenIndexesWiresBothProviders(t *testing.T) {
 	srv := newTestRuntime(t)
@@ -52,7 +52,7 @@ func TestOpenIndexesWiresBothProviders(t *testing.T) {
 	}
 }
 
-// TestCreateIndexThenSearchOverTheWireShape covers the whole Component 63/66/67/68 path in one
+// TestCreateIndexThenSearchOverTheWireShape covers the whole Component 64/67/68/69 path in one
 // go: CREATE INDEX registers and backfills a full-text index from documents that already
 // existed, later writes keep it current through the commit hook, and a SEARCH frame returns
 // them ranked. A regression anywhere in that chain - DDL, backfill, commit maintenance, or

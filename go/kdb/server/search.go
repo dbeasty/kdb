@@ -17,7 +17,7 @@ type SearchHit struct {
 	JSON  string
 }
 
-// SearchProvider answers SEARCH frames (kdb-spec-layer16 §11, Component 68) once the runtime's
+// SearchProvider answers SEARCH frames (kdb-spec-layer16 §11, Component 69) once the runtime's
 // fulltext/vector indexes are wired: given the decoded request it returns the ranked hits and
 // the commit the search resolved at (head, or req.AtCommitHex when set). Authorization and
 // admission have already happened by the time it is called. Implementations must be safe for

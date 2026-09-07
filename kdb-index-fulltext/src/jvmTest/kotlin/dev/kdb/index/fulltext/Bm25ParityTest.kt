@@ -14,7 +14,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Parity gate for Component 63: over the shared corpus, Kotlin must return the same BM25F-lite
+ * Parity gate for Component 64: over the shared corpus, Kotlin must return the same BM25F-lite
  * ranking as Go, with scores within a relative tolerance of 1e-4.
  */
 class Bm25ParityTest {

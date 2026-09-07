@@ -138,7 +138,7 @@ private fun buildRegistry(): KdbTypeRegistry {
                     FieldSchema(2, "version", KdbType.Primitive(PhysicalKind.INT32)),
                     FieldSchema(3, "createdAt", timestampPrim),
                     FieldSchema(4, "description", KdbType.Primitive(PhysicalKind.STRING)),
-                    // Layer 16 / Component 72. Empty default, omitted when empty: pre-Layer-16
+                    // Layer 16 / Component 73. Empty default, omitted when empty: pre-Layer-16
                     // bytes and hashes are unchanged.
                     FieldSchema(
                         5,

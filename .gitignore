@@ -41,6 +41,9 @@ kdb-integration/e2e/.venv/
 kotlin-js-store/
 **/node_modules/
 
+# Release output (see docs/kdb-release-plan.md)
+/dist/
+
 # Go
 go/bin/
 go/kdb-service

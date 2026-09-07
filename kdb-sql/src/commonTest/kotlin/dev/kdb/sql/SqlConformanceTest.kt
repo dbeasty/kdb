@@ -11,7 +11,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * Component 69 §3.5 — conformance suite: one test per clause the parser accepts, asserting the
+ * Component 70 §3.5 — conformance suite: one test per clause the parser accepts, asserting the
  * clause either takes effect or errors, against an in-memory runtime over a fixed corpus. The Go
  * tree runs the same corpus, so the two trees can be compared clause by clause.
  */

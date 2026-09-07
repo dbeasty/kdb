@@ -15,7 +15,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
- * SQL half of Component 66 — search in SQL and its DDL (Layer 16 §9.1–§9.3). Rankings come from
+ * SQL half of Component 67 — search in SQL and its DDL (Layer 16 §9.1–§9.3). Rankings come from
  * [FakeSearchStore] so the assertions prove the executor consulted the index rather than the
  * documents.
  */

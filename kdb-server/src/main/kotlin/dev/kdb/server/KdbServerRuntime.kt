@@ -73,7 +73,7 @@ public class KdbServerRuntime(
     private val engines = mutableMapOf<String, TransactionEngine>()
     private val upsertEngines = mutableMapOf<String, TransactionEngine>()
 
-    // ---- Component 73 (§12): one write gate per namespace, not one per runtime -------------------
+    // ---- Component 74 (§12): one write gate per namespace, not one per runtime -------------------
 
     private val writeCoordinators = ConcurrentHashMap<String, WriteCoordinator>()
 
@@ -91,7 +91,7 @@ public class KdbServerRuntime(
     public val writeCoordinator: WriteCoordinator
         get() = writeCoordinatorFor(runtime.defaultNamespace)
 
-    // ---- Component 72 (§9.6): unique-key registry per namespace --------------------------------
+    // ---- Component 73 (§9.6): unique-key registry per namespace --------------------------------
 
     private val uniqueRegistries = mutableMapOf<String, UniqueKeyRegistry>()
 
@@ -209,7 +209,7 @@ public class KdbServerRuntime(
         return if (authorizer != null) authorizingTransactionEngine(engine, namespaceId, authorizer) else engine
     }
 
-    // ---- Component 72 (§9.5): document expiry -------------------------------------------------
+    // ---- Component 73 (§9.5): document expiry -------------------------------------------------
 
     public suspend fun expiryPolicyFor(namespaceId: String): DocumentExpiryPolicy? =
         runtime.policyRegistry.get(namespaceId).documentExpiry

@@ -16,7 +16,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Parity gate for Component 65: every case in `fusion_cases.json` must fuse to the same ranking
+ * Parity gate for Component 66: every case in `fusion_cases.json` must fuse to the same ranking
  * and the same scores (to 1e-9) as the Go implementation.
  */
 class FusionParityTest {

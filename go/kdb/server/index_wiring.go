@@ -10,7 +10,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/index/stores"
 )
 
-// Index wiring (kdb-spec-layer16 Components 66, 67 and 68): opening a namespace's index
+// Index wiring (kdb-spec-layer16 Components 67, 68 and 69): opening a namespace's index
 // registry, keeping it current on the commit path, and persisting it.
 //
 // The registry lives behind a RegistryIndexProvider rather than on the runtime struct, so a
@@ -146,7 +146,7 @@ func (p *RegistryIndexProvider) save() error {
 }
 
 // prepareCommitForIndexes extracts and validates every indexed value the transaction would
-// write, without mutating any store (Component 67, spec §10). It runs before the DAG append, so
+// write, without mutating any store (Component 68, spec §10). It runs before the DAG append, so
 // a document the indexes cannot accept - a vector of the wrong length - rejects the whole commit
 // rather than leaving the indexes half-applied.
 func (p *RegistryIndexProvider) prepareCommitForIndexes(ops []document.Op) ([]*index.PreparedWrite, error) {
@@ -194,7 +194,7 @@ func (p *RegistryIndexProvider) commitToIndexes(prepared []*index.PreparedWrite,
 	return hints, nil
 }
 
-// prepareIndexes is the runtime-side entry point for the pre-append half of Component 67. It
+// prepareIndexes is the runtime-side entry point for the pre-append half of Component 68. It
 // returns nil when no index provider is configured, which is the no-index fast path.
 func (s *KdbServerRuntime) prepareIndexes(tx document.Transaction) ([]*index.PreparedWrite, *RegistryIndexProvider, error) {
 	p, ok := s.SQLIndexProvider().(*RegistryIndexProvider)

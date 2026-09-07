@@ -9,7 +9,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/sql"
 )
 
-// Component 71 - UPDATE / DELETE lowering (kdb-spec-layer16 §5).
+// Component 72 - UPDATE / DELETE lowering (kdb-spec-layer16 §5).
 
 func TestUpdateSetsPathsAndCountsRows(t *testing.T) {
 	f := newCorpusFixture(t, "app/dml-update")

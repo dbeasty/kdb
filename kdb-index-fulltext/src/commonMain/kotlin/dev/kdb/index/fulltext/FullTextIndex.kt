@@ -181,7 +181,7 @@ internal class SearchView(
 }
 
 /**
- * Scored, multi-field full-text index (Layer 16, Component 63).
+ * Scored, multi-field full-text index (Layer 16, Component 64).
  *
  * Every [putDocument] appends a version event and every [delete] a tombstone, both tagged with
  * their commit. A read `atCommit` resolves, per document, the last event whose commit is an

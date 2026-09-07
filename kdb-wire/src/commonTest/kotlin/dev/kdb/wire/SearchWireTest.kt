@@ -5,7 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
 /**
- * Layer 16 Component 68 (§11): the SEARCH / SEARCH_RESULT pair. Codes 0x1D/0x1E are shared with the Go
+ * Layer 16 Component 69 (§11): the SEARCH / SEARCH_RESULT pair. Codes 0x1D/0x1E are shared with the Go
  * tree and must match exactly, or the two implementations disagree about what a frame is.
  */
 class SearchWireTest {

@@ -7,7 +7,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** Component 72 identity rules (kdb-spec-layer16 §9.4). The cross-tree fixture parity check lives in
+/** Component 73 identity rules (kdb-spec-layer16 §9.4). The cross-tree fixture parity check lives in
  * kdb-integration's DerivedIdVectorsTest; these pin the rules themselves. */
 class DocumentIdentityTest {
 

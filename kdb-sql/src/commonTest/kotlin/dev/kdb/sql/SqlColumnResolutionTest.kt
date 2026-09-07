@@ -8,7 +8,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/** Component 69 — column resolution and the total comparator (Layer 16 §2, §3). */
+/** Component 70 — column resolution and the total comparator (Layer 16 §2, §3). */
 class SqlColumnResolutionTest {
     private val fields =
         listOf(

@@ -72,7 +72,7 @@ const (
 	MsgLockRelease MessageType = 0x1B
 	MsgLockResult  MessageType = 0x1C
 
-	// Search over the wire (see search_ops.go), kdb-spec-layer16 §11 / Component 68.
+	// Search over the wire (see search_ops.go), kdb-spec-layer16 §11 / Component 69.
 	// Layer 16 — implemented in both trees.
 	MsgSearch       MessageType = 0x1D
 	MsgSearchResult MessageType = 0x1E

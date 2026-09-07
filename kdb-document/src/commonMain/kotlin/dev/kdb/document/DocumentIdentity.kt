@@ -6,7 +6,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 /**
- * Document identity per kdb-spec-layer16 §9.4 (Component 72). Bodies round-trip byte-exact: nothing
+ * Document identity per kdb-spec-layer16 §9.4 (Component 73). Bodies round-trip byte-exact: nothing
  * is injected and nothing is reordered on any write path. A supplied top-level `id` is the identity -
  * a UUID string directly, any other non-empty string through [derivedDocumentId].
  */

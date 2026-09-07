@@ -32,7 +32,7 @@ public interface IndexStore {
     /**
      * Ranked full-text search. Results are ordered by descending [RankedResult.score], ties broken by
      * ascending document id, so two implementations over the same corpus return the same list
-     * (Layer 16, Component 63).
+     * (Layer 16, Component 64).
      */
     public suspend fun search(
         query: String,

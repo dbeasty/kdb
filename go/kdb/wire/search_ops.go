@@ -1,6 +1,6 @@
 package wire
 
-// Search wire messages (SEARCH 0x1D / SEARCH_RESULT 0x1E) - kdb-spec-layer16 §11, Component 68.
+// Search wire messages (SEARCH 0x1D / SEARCH_RESULT 0x1E) - kdb-spec-layer16 §11, Component 69.
 //
 // Layer 16 — implemented in both trees: unlike 0x14-0x1C these have a Kotlin counterpart and
 // identical JSON bodies, so a Go client can search a Kotlin server and vice versa. Sessionless

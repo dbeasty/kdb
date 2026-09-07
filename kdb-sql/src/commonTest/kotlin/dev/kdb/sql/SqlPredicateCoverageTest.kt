@@ -7,7 +7,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * Component 70 — predicate coverage over documents (Layer 16 §4): dotted paths with implicit
+ * Component 71 — predicate coverage over documents (Layer 16 §4): dotted paths with implicit
  * array traversal, the LIKE family, NOT forms, the ARRAY_* functions, and bare boolean columns.
  */
 class SqlPredicateCoverageTest {

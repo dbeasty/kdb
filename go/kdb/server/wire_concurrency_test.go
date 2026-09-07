@@ -148,7 +148,7 @@ func (c *pipelinedClient) sendDocumentGet(t *testing.T, namespace, docID string)
 	})
 }
 
-// TestConcurrentFramesSlowSqlExecDoesNotDelayDocumentGet is Component 73's headline guarantee
+// TestConcurrentFramesSlowSqlExecDoesNotDelayDocumentGet is Component 74's headline guarantee
 // (kdb-spec-layer16 §12): a statement that takes a long time on one session must not hold up
 // the rest of the connection. Before per-frame dispatch, run() handled frames strictly one at a
 // time, so the DocumentGet below could not be answered until the blocked SqlExec returned.

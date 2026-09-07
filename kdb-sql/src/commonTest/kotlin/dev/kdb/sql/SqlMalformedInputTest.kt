@@ -8,7 +8,7 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Component 69 §3 item 4: a parser that panics on malformed input is a bug. Nothing but
+ * Component 70 §3 item 4: a parser that panics on malformed input is a bug. Nothing but
  * [SqlParseException] / [SqlPlanningException] may escape parsing or planning, however broken the
  * statement is.
  */

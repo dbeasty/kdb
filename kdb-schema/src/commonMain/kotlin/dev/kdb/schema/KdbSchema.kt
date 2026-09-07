@@ -16,7 +16,7 @@ public data class KdbSchema(
     val createdAt: KdbTimestamp,
     val description: String = "",
     /**
-     * Compound (multi-field) unique constraints (Layer 16, Component 72). Single-field uniqueness is
+     * Compound (multi-field) unique constraints (Layer 16, Component 73). Single-field uniqueness is
      * still [SchemaField.unique]; [uniqueTuples] merges both views. Wire field 5 of KdbSchemaBody with
      * an empty default, so a schema without compound constraints hashes exactly as before.
      */
