@@ -164,3 +164,11 @@ func (d *PersistingCommitDAG) Close() error {
 func (d *PersistingCommitDAG) Delegate() *dag.InMemoryCommitDag { return d.delegate }
 
 var _ dag.CommitDAG = (*PersistingCommitDAG)(nil)
+
+// WalkWithOperations delegates to the in-memory DAG, so a caller holding
+// the persisting wrapper does not have to unwrap it to walk history
+// safely. See dag.InMemoryCommitDag.WalkWithOperations for why reading
+// operations off plain Walk's result is a mistake.
+func (p *PersistingCommitDAG) WalkWithOperations(from codec.Hash, until *codec.Hash, limit int) ([]dag.TraversalEntry, error) {
+	return p.delegate.WalkWithOperations(from, until, limit)
+}

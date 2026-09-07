@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"container/list"
 	"sort"
 	"strings"
 	"sync"
@@ -81,6 +82,20 @@ type InMemoryCommitDag struct {
 	// index.eventLog's bucket cache - key their memo on it so they don't have to recompute
 	// against a DAG that has not moved.
 	ancestryVersion uint64
+
+	// Commit operation retention. A commit's operations carry the full
+	// text of every document it wrote, so holding them for all of history
+	// makes resident memory the sum of every version ever written. These
+	// bound that; see ops_retention.go, which owns all of them, and
+	// SetOperationsLoader for why the bound is only safe with a loader.
+	// opsLoader is read on the (cold) load path only, hence atomic rather
+	// than mu; every other field here is guarded by mu.
+	opsLoader   atomic.Pointer[CommitOperationsLoader]
+	opsBudget   int64
+	opsResident int64
+	opsLRU      *list.List
+	opsElem     map[codec.Hash]*list.Element
+	opsEvicted  map[codec.Hash]struct{}
 }
 
 // publishHeadLocked recomputes the head snapshot from the maps and publishes it. Must be
@@ -230,19 +245,28 @@ func (d *InMemoryCommitDag) GetCommit(hash codec.Hash) (document.Commit, bool) {
 
 func (d *InMemoryCommitDag) GetCommitOrThrow(hash codec.Hash) (document.Commit, error) {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if stub, ok := d.stubs[hash]; ok {
+	stub, isStub := d.stubs[hash]
+	c, ok := d.commits[hash]
+	evicted := d.opsEvictedFor(hash)
+	d.mu.RUnlock()
+	if isStub {
 		return document.Commit{}, kdberr.NewIceStorageError(
 			"commit archived", d.NamespaceID, hash.Hex(), stub.ArchiveLocation,
 		)
 	}
-	c, ok := d.commits[hash]
 	if !ok {
 		return document.Commit{}, kdberr.NewVersionNotFoundError(
 			"commit not found", d.NamespaceID, hash.Hex(),
 		)
 	}
-	return c, nil
+	if !evicted {
+		return c, nil
+	}
+	// Operations were evicted under the retention budget. This method has
+	// an error return, so unlike GetCommit it can load them back and say so
+	// if that fails - which is why every caller that reads Operations off a
+	// commit should come through here (or WalkWithOperations).
+	return d.hydrate(c)
 }
 
 func (d *InMemoryCommitDag) GetStub(hash codec.Hash) (document.CommitStub, bool) {
@@ -303,6 +327,7 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 		}
 	}
 	d.commits[commit.Hash] = commit
+	d.trackOpsLocked(commit)
 	d.insertHex(commit.Hash.Hex())
 	d.ancestryVersion++
 	// Only the first commit for a given transaction id is indexed - a caller retrying the same

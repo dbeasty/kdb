@@ -47,7 +47,13 @@ func CommitsToPush(d *dag.InMemoryCommitDag, localHead, remoteHead codec.Hash, l
 			remoteReach[entry.Stub.OriginalHash] = struct{}{}
 		}
 	}
-	walked := d.Walk(localHead, nil, math.MaxInt)
+	// These commits are handed to the remote whole, so their operations
+	// have to be present - see WalkWithOperations. The reachability walk
+	// above only reads hashes and stays on plain Walk.
+	walked, err := d.WalkWithOperations(localHead, nil, math.MaxInt)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]document.Commit, 0, len(walked))
 	// Walk returns newest-first; reverse so parents land before children on the remote.
 	for i := len(walked) - 1; i >= 0; i-- {

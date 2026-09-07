@@ -25,6 +25,16 @@ import (
 //     namespace - which is exactly the failure this replaces (§2.1).
 //  2. Corruption in the most recently written segment is tolerated as an
 //     expected torn tail; corruption anywhere else is not (§4.3).
+//
+// Commits are applied as they are read rather than collected first. The
+// collect-then-apply version held every commit in the namespace's history
+// in one slice, so opening a store cost memory proportional to the sum of
+// every version of every document it had ever held, not to the data that
+// was actually live: one 1.4MB document rewritten 463 times opened with
+// 382MB resident (docs/benchmarks/open-cost.md). Only commits that arrive
+// before their parents are held back now, and in the ordinary case -
+// segments in commit order, which Component 47 §4.1 guarantees - that set
+// is empty.
 func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r storage.DeltaSegmentReader) error {
 	if r == nil {
 		return nil
@@ -34,17 +44,39 @@ func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r sto
 		return err
 	}
 
-	var allCommits []document.Commit
+	// deferred holds only commits whose parents had not been applied when
+	// they were read - see applyCommitsTopologically, which drains it.
+	var deferred []document.Commit
 	for i, seg := range segments {
-		records, readErr := r.ReadAll(seg)
+		read := 0
+		readErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
+			read++
+			applied, err := applyIfParentsReady(d, store, c)
+			if err != nil {
+				return &replayApplyError{err: err}
+			}
+			if !applied {
+				deferred = append(deferred, c)
+			}
+			return nil
+		})
 		var corrupt *delta.CorruptFrameError
+		var applyFailed *replayApplyError
+		if errors.As(readErr, &applyFailed) {
+			// Applying a commit failed - a storage or DAG fault, nothing to
+			// do with the bytes on disk. Surfaced as itself rather than
+			// being run through the torn-tail classification below, which
+			// would report a healthy segment as corrupt and send the
+			// operator to repair-segments for a problem it cannot fix.
+			return applyFailed.err
+		}
 		if readErr != nil {
 			isMostRecent := i == len(segments)-1
 			if errors.As(readErr, &corrupt) && isMostRecent {
 				// Torn tail on the most recently written segment: the
 				// expected shape of an unclean shutdown (the last frame's
 				// write never completed, or completed but wasn't fsynced
-				// before the process died). Keep every commit scanned
+				// before the process died). Keep every commit applied
 				// before it, log it, and continue - this segment is never
 				// appended to again (OpenWriter always starts a fresh one),
 				// so this decision is stable across future restarts too.
@@ -52,7 +84,7 @@ func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r sto
 					"kdb: namespace %s: delta segment (sequence %d) has a torn tail at byte offset %d (%s) - "+
 						"treating as an incomplete write from an unclean shutdown and continuing with the %d "+
 						"commit(s) read cleanly before it",
-					d.NamespaceID, seg.SequenceNumber, corrupt.Offset, corrupt.Reason, len(records))
+					d.NamespaceID, seg.SequenceNumber, corrupt.Offset, corrupt.Reason, read)
 			} else {
 				return fmt.Errorf(
 					"kdb: namespace %s: delta segment (sequence %d) is corrupt and is not the most recently "+
@@ -61,16 +93,63 @@ func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r sto
 					d.NamespaceID, seg.SequenceNumber, readErr)
 			}
 		}
-		for _, rec := range records {
-			c, err := document.FromPayloadBytes(rec.CommitPayload)
-			if err != nil {
-				return err
-			}
-			allCommits = append(allCommits, c)
-		}
 	}
 
-	return applyCommitsTopologically(d, store, allCommits)
+	return applyCommitsTopologically(d, store, deferred)
+}
+
+// replayApplyError distinguishes "applying this commit failed" from
+// "reading this segment failed" as they travel back out through the
+// streaming callback, which can only return a plain error. Only the latter
+// is a candidate for torn-tail tolerance.
+type replayApplyError struct{ err error }
+
+func (e *replayApplyError) Error() string { return e.err.Error() }
+func (e *replayApplyError) Unwrap() error { return e.err }
+
+// streamSegmentCommits hands seg's commits to fn one at a time, using the
+// reader's own streaming path when it has one (see
+// storage.DeltaCommitStreamer for why that is so much cheaper) and falling
+// back to ReadAll otherwise, so a reader that cannot stream still replays.
+//
+// The fallback keeps ReadAll's partial-result contract: on a
+// *CorruptFrameError the records read before the fault are returned
+// alongside the error, and those still reach fn before it is reported.
+func streamSegmentCommits(r storage.DeltaSegmentReader, seg storage.DeltaSegmentRef, fn func(document.Commit) error) error {
+	if streamer, ok := r.(storage.DeltaCommitStreamer); ok {
+		return streamer.StreamCommits(seg, func(c document.Commit, _ int64) error { return fn(c) })
+	}
+	records, readErr := r.ReadAll(seg)
+	for _, rec := range records {
+		c, err := document.FromPayloadBytes(rec.CommitPayload)
+		if err != nil {
+			return err
+		}
+		if err := fn(c); err != nil {
+			return err
+		}
+	}
+	return readErr
+}
+
+// applyIfParentsReady applies c when every parent it names is already in
+// d, and reports whether it did. A false is not an error: it means c
+// arrived before an ancestor did, and the caller should hold it for
+// applyCommitsTopologically to place once the rest of the log has been
+// read. A commit already present in d counts as applied.
+func applyIfParentsReady(d *dag.InMemoryCommitDag, store storage.Adapter, c document.Commit) (bool, error) {
+	if d.HasCommit(c.Hash) {
+		return true, nil
+	}
+	for _, p := range c.ParentHashes {
+		if !d.HasCommit(p) {
+			return false, nil
+		}
+	}
+	if err := applyReplayedCommit(d, store, c); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // applyCommitsTopologically applies commits in dependency order: a commit

@@ -122,6 +122,13 @@ func OpenFileRuntimeWithOptions(dataRoot, catalog, namespaceID string, sch schem
 		return nil, fmt.Errorf("file runtime missing storage adapter")
 	}
 
+	if r := handle.DeltaReader(); r != nil {
+		// Installed before replay, so replay's own commits are subject to
+		// the budget as they arrive rather than all landing resident first
+		// - which is the case that made opening a long-lived namespace cost
+		// the sum of its whole history (docs/benchmarks/open-cost.md).
+		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
+	}
 	if err := replayDeltaNamespace(d, store, handle.DeltaReader()); err != nil {
 		return nil, err
 	}

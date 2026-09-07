@@ -34,9 +34,20 @@ type ServerEngine struct {
 	// path (WriteBlob): WAL.Append and memTable.Put are each
 	// independently thread-safe, so blob writes never take a lock at all
 	// - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
-	cap              storage.CapabilitySet
-	memTable         *memtable.Manager
-	docsByHash       *shardedDocByHashStore
+	cap        storage.CapabilitySet
+	memTable   *memtable.Manager
+	docsByHash *shardedDocByHashStore
+	// coldLoader re-reads a document version that docsByHash has evicted,
+	// from wherever it is durable. Nil means nothing can serve an evicted
+	// version, and docsByHash is left unbounded - see SetColdLoader.
+	// Read on the miss path only, so an atomic load rather than a lock.
+	coldLoader atomic.Pointer[coldDocLoader]
+	// coldLoads counts versions re-read from durable storage because the
+	// version store had evicted them. A number that climbs steadily under
+	// ordinary reads means the budget is too small for the live working
+	// set, which is the one way this design degrades quietly rather than
+	// loudly - so it is worth being able to see.
+	coldLoads        atomic.Int64
 	pending          *shardedPendingStore
 	enlistmentStates map[codec.UUID]storage.EnlistmentEvictionState
 
@@ -126,7 +137,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		groupCommit:      wal.NewGroupCommitter(),
 		cap:              cap,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
-		docsByHash:       newShardedDocByHashStore(),
+		docsByHash:       newShardedDocByHashStore(0),
 		pending:          newShardedPendingStore(),
 		enlistmentStates: make(map[codec.UUID]storage.EnlistmentEvictionState),
 		tree:             emptyTree,
@@ -269,10 +280,58 @@ func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommi
 	}
 	d, ok := e.docsByHash.Get(h)
 	if !ok {
-		return nil, nil
+		loaded, found, err := e.loadCold(docID, h)
+		if err != nil || !found {
+			return nil, err
+		}
+		d = loaded
 	}
 	cp := d
 	return &cp, nil
+}
+
+// loadCold re-reads a version docsByHash no longer holds, and re-admits it
+// so a run of reads over the same history pays for it once. A nil loader
+// or a version the loader cannot find reports "not found" rather than an
+// error, matching what a miss meant when this store never evicted.
+func (e *ServerEngine) loadCold(docID codec.UUID, contentHash codec.Hash) (document.Document, bool, error) {
+	loader := e.coldLoader.Load()
+	if loader == nil {
+		return document.Document{}, false, nil
+	}
+	doc, found, err := (*loader)(docID, contentHash)
+	if err != nil || !found {
+		return document.Document{}, false, err
+	}
+	e.coldLoads.Add(1)
+	e.docsByHash.Put(contentHash, doc)
+	return doc, true, nil
+}
+
+// ColdDocumentLoads reports how many document versions have been re-read
+// from durable storage after being evicted from the in-memory version
+// store. Zero on a namespace whose history has never been read.
+func (e *ServerEngine) ColdDocumentLoads() int64 { return e.coldLoads.Load() }
+
+// coldDocLoader finds one document version by the content hash a
+// DocumentTree recorded for it. See SetColdLoader.
+type coldDocLoader func(docID codec.UUID, contentHash codec.Hash) (document.Document, bool, error)
+
+// SetColdLoader installs the fallback that serves document versions
+// docsByHash has evicted, and with it the byte budget that lets eviction
+// happen at all. Both together, never one without the other: bounding the
+// store without a loader would silently lose history, and a loader without
+// a budget would never be consulted.
+//
+// budgetBytes <= 0 leaves the store unbounded even with a loader present.
+func (e *ServerEngine) SetColdLoader(loader coldDocLoader, budgetBytes int64) {
+	if loader == nil {
+		e.coldLoader.Store(nil)
+		e.docsByHash.SetBudget(0)
+		return
+	}
+	e.coldLoader.Store(&loader)
+	e.docsByHash.SetBudget(budgetBytes)
 }
 
 func (e *ServerEngine) GetDocumentOrThrow(namespaceID string, docID codec.UUID, atCommit codec.Hash) (document.Document, error) {
@@ -314,10 +373,22 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	// memory proportional to what it keeps (the batch buffer) rather than to what exists.
 	buf := make([]document.Document, 0, batchSize)
 	var scanErr error
-	tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
+	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
 		d, ok := e.docsByHash.Get(h)
 		if !ok {
-			return true
+			// Evicted history rather than a genuinely absent document:
+			// skipping here would silently drop rows from a scan at an
+			// older atCommit. A version the loader also cannot find is
+			// skipped, which is what a miss has always meant.
+			loaded, found, err := e.loadCold(id, h)
+			if err != nil {
+				scanErr = err
+				return false
+			}
+			if !found {
+				return true
+			}
+			d = loaded
 		}
 		buf = append(buf, d)
 		if len(buf) >= batchSize {
@@ -366,7 +437,14 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 
 	e.treeMu.Lock()
 	defer e.treeMu.Unlock()
+	// Pins follow the live tree exactly: whatever the tree points at now is
+	// un-evictable, and a version the tree stops pointing at becomes a
+	// candidate. That is the invariant shardedDocByHashStore's bound rests
+	// on - see its type doc for why anything looser is unsafe.
 	for _, id := range deletes {
+		if prev, ok := e.tree.HashFor(id); ok {
+			e.docsByHash.Unpin(prev)
+		}
 		var err error
 		e.tree, err = e.tree.Without(id)
 		if err != nil {
@@ -378,7 +456,23 @@ func (e *ServerEngine) CommitTree(namespaceID string, parentTreeHash codec.Hash)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
+		prev, hadPrev := e.tree.HashFor(doc.ID)
+		// Pin before Put, never after: Put evicts to stay within budget as
+		// part of the insert, so a version pinned afterwards can already be
+		// gone - and for a document larger than one shard's share of the
+		// budget it always was, which made every read of live data take the
+		// cold path.
+		//
+		// Rewriting a document with byte-identical content leaves the tree
+		// pointing at the same hash, so the pin it already holds is the
+		// right one and taking a second would never be released.
+		if !hadPrev || prev != h {
+			e.docsByHash.Pin(h)
+		}
 		e.docsByHash.Put(h, doc)
+		if hadPrev && prev != h {
+			e.docsByHash.Unpin(prev)
+		}
 		e.tree, err = e.tree.With(doc.ID, h)
 		if err != nil {
 			return document.DocumentTree{}, err
@@ -465,6 +559,13 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 		writer = wr
 	}
 	reader := deltaFactory.OpenReader(namespaceID)
+	if f.EngineTarget == TargetServer || f.EngineTarget == TargetReadOnly {
+		// Only these two have a delta log behind them to re-read an evicted
+		// version from. Every other target keeps the version store
+		// unbounded, because for them memory is the only tier there is.
+		loader := newDeltaColdLoader(reader)
+		eng.SetColdLoader(loader.load, storage.ResolvedDocumentCacheBytes(config))
+	}
 	return &defaultHandle{
 		namespaceID: namespaceID,
 		adapter:     eng,
