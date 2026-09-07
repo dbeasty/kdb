@@ -85,7 +85,15 @@ func TestObjectsStrategyDoesNotHoardWritesInMemory(t *testing.T) {
 	if small <= 0 {
 		t.Skip("could not measure heap")
 	}
-	if ratio := large / small; ratio > 1.6 {
+	// 2.5, not something tighter. Linear accumulation - the bug - is 4x for
+	// 4x the writes, and the original was 8.5x. What is left growing is the
+	// commit graph, plus per-allocation overhead that the race detector
+	// inflates enough to matter at these sizes: the same comparison
+	// measures anywhere from 1.1x to 1.7x run to run under -race. A
+	// threshold that splits 1.7 from 4 separates a bounded writer from an
+	// accumulating one; one that splits 1.4 from 1.7 just fails on
+	// Tuesdays.
+	if ratio := large / small; ratio > 2.5 {
 		t.Fatalf("4x the writes cost %.1fx the memory (%.2f MB -> %.2f MB); "+
 			"versions are accumulating in the memtable instead of being flushed", ratio, small, large)
 	}
