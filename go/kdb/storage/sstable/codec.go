@@ -108,6 +108,16 @@ func decodeBlock(block []byte) ([]byte, error) {
 // and never silently wrong in a new way.
 const tombstoneFlag = "1"
 
+// indexEntry is one footer index line's worth of state, in the order the writer intends to emit
+// it. buildFooter takes a slice rather than a map because ranging a Go map yields a *randomized*
+// order: the same table produced a different footer on every single run, and never the order
+// Kotlin's insertion-ordered index produces, so no two writes of the same content ever agreed
+// byte-for-byte within Go, let alone across the two languages.
+type indexEntry struct {
+	key    codec.Hash
+	handle BlockHandle
+}
+
 // buildFooter lays out magic(4) indexLen(4) indexBytes(indexLen) fileHash(32), then appends a
 // fixed 4-byte trailer duplicating indexLen at the very end of the footer (and, since the footer
 // is always the last thing written to a segment, at the very end of the file). That trailer is
@@ -120,10 +130,11 @@ const tombstoneFlag = "1"
 // zero tests before this fix. Mirrors the equivalent fix in kdb-storage-sstable's SsTableCodec.kt
 // (Kotlin was missing this trailer too) - the two must stay byte-for-byte identical; see
 // go/testdata/golden/codec's regenerated fixtures.
-func buildFooter(index map[codec.Hash]BlockHandle, fileHash codec.Hash) []byte {
-	var lines []string
-	for k, bh := range index {
-		line := fmt.Sprintf("%s:%d:%d", k.Hex(), bh.Offset, bh.CompressedSize)
+func buildFooter(index []indexEntry, fileHash codec.Hash) []byte {
+	lines := make([]string, 0, len(index))
+	for _, e := range index {
+		bh := e.handle
+		line := fmt.Sprintf("%s:%d:%d", e.key.Hex(), bh.Offset, bh.CompressedSize)
 		if bh.Deleted {
 			line += ":" + tombstoneFlag
 		}
@@ -174,7 +185,13 @@ type DefaultWriter struct {
 	io          storage.PlatformIOShim
 	namespaceID string
 	level       int
-	entries     []kv
+	// entries holds one kv per distinct key, in the order that key was *first* written -
+	// exactly the semantics of Kotlin's linkedMapOf-backed writer, which pos below reproduces.
+	// Appending blindly instead let a re-written key occupy two slots, so the same put sequence
+	// wrote two blocks (one unreachable), and fed both values into the fileHash preimage:
+	// identical logical tables got different content hashes in the two languages.
+	entries []kv
+	pos     map[codec.Hash]int
 }
 
 type kv struct {
@@ -189,17 +206,32 @@ func NewDefaultWriter(io storage.PlatformIOShim, namespaceID string, level int) 
 }
 
 func (w *DefaultWriter) Put(key codec.Hash, value []byte) {
-	w.entries = append(w.entries, kv{key: key, value: append([]byte(nil), value...)})
+	w.set(kv{key: key, value: append([]byte(nil), value...)})
 }
 
 // Delete records a tombstone for key. No block is written - the footer index entry alone carries
 // the fact - so a table of nothing but deletes costs one index line per key.
 func (w *DefaultWriter) Delete(key codec.Hash) {
-	w.entries = append(w.entries, kv{key: key, deleted: true})
+	w.set(kv{key: key, deleted: true})
+}
+
+// set records e as the writer's final word on e.key: last value wins, first insertion position
+// is kept. A later Delete of an already-Put key therefore replaces it with a tombstone in place
+// rather than leaving a stale block ahead of it, and vice versa.
+func (w *DefaultWriter) set(e kv) {
+	if i, ok := w.pos[e.key]; ok {
+		w.entries[i] = e
+		return
+	}
+	if w.pos == nil {
+		w.pos = make(map[codec.Hash]int)
+	}
+	w.pos[e.key] = len(w.entries)
+	w.entries = append(w.entries, e)
 }
 
 func (w *DefaultWriter) Finish() (Handle, error) {
-	blocks := make(map[codec.Hash]BlockHandle)
+	blocks := make([]indexEntry, 0, len(w.entries))
 	fileID, err := codec.RandomUUID()
 	if err != nil {
 		return Handle{}, err
@@ -208,7 +240,7 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 	var offset int64
 	for _, e := range w.entries {
 		if e.deleted {
-			blocks[e.key] = BlockHandle{Deleted: true}
+			blocks = append(blocks, indexEntry{key: e.key, handle: BlockHandle{Deleted: true}})
 			continue
 		}
 		block, err := encodeBlock(e.value, true)
@@ -225,7 +257,10 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		// len(block) (the full header+body length) instead, over-reading a header's worth of
 		// bytes into whatever followed - the next block,
 		// or the footer for the last one - on every single Get().
-		blocks[e.key] = BlockHandle{Offset: offset, CompressedSize: len(block) - blockHeaderSize}
+		blocks = append(blocks, indexEntry{
+			key:    e.key,
+			handle: BlockHandle{Offset: offset, CompressedSize: len(block) - blockHeaderSize},
+		})
 		offset = newSize
 	}
 	var concat []byte

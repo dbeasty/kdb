@@ -231,8 +231,18 @@ func (s *OSByteStore) AvailableBytes() (int64, error) {
 	return 0, nil
 }
 
+// snapPathFor is where an enlistment snapshot lives on disk. Both the directory name and the
+// key sanitization must match Kotlin's JvmSegmentByteStore.snapFile: this used to write to
+// "snapshots/" with the raw key, so (a) a snapshot written by one runtime was invisible to the
+// other, and (b) the raw key - SnapshotKeyBuilder.Enlistment produces "kdb:snap:<id>" - put a
+// colon in the file name, which is not a portable path character.
+func (s *OSByteStore) snapPathFor(key string) string {
+	safeKey := strings.ReplaceAll(key, ":", "_")
+	return filepath.Join(s.root, "snap", filepath.FromSlash(safeKey))
+}
+
 func (s *OSByteStore) ReadSnapshot(key string) ([]byte, error) {
-	p := filepath.Join(s.root, "snapshots", key)
+	p := s.snapPathFor(key)
 	b, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -244,7 +254,7 @@ func (s *OSByteStore) ReadSnapshot(key string) ([]byte, error) {
 }
 
 func (s *OSByteStore) WriteSnapshot(key string, data []byte) error {
-	p := filepath.Join(s.root, "snapshots", key)
+	p := s.snapPathFor(key)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
@@ -252,7 +262,7 @@ func (s *OSByteStore) WriteSnapshot(key string, data []byte) error {
 }
 
 func (s *OSByteStore) DeleteSnapshot(key string) error {
-	p := filepath.Join(s.root, "snapshots", key)
+	p := s.snapPathFor(key)
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err
 	}

@@ -1,4 +1,4 @@
-.PHONY: test-go test-kotlin test-cross build-go build-kotlin bench bench-write print-version \
+.PHONY: test-go test-kotlin test-cross test-physical-golden build-go build-kotlin bench bench-write print-version \
         release release-go release-bundle bundle-verify release-binaries release-kotlin \
         release-checksums release-all release-verify release-clean
 
@@ -49,6 +49,25 @@ test-kotlin:
 
 test-cross: test-kotlin test-go
 	cd go && go test ./kdb/interop/... -v
+
+# Regenerates every cross-language golden fixture, then fails if any of them moved.
+#
+# The fixtures are committed, so the ordinary test runs above need neither language's toolchain
+# to exercise the other's bytes. This target is what turns an *accidental* format change into a
+# build failure: both exporters are idempotent, so a dirty tree afterwards means one side's
+# encoder now produces different bytes than the committed fixture - which is exactly the change
+# that silently breaks a mixed Go/JVM deployment. See
+# docs/kdb-physical-layer-compat-test-plan.md §3.
+#
+# Run it after any deliberate format change too: it is how you regenerate the fixtures.
+test-physical-golden:
+	./gradlew :kdb-integration:test --tests "dev.kdb.integration.ExportGoldenTest" \
+	          :kdb-storage-wal:jvmTest :kdb-storage-sstable:jvmTest :kdb-storage-delta:jvmTest \
+	          --rerun-tasks --no-daemon
+	cd go && go test ./kdb/interop/... -count=1
+	@git diff --exit-code -- go/testdata/golden \
+	  || (echo "\nERROR: golden fixtures changed - a physical format changed on one side." \
+	          "Review the diff above and commit it only if the change is deliberate." >&2; exit 1)
 
 # Always -benchmem: the engine's single largest allocation (a throwaway zstd
 # encoder per commit, ~21MB) survived for as long as it did because no benchmark

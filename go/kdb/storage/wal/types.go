@@ -6,8 +6,12 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
+// Magic was bumped from 0x4B444257 when the record format grew an 8-byte timestamp field
+// (previously unwritten - replay fabricated a fresh timestamp for every record). A stream
+// encoded under the old format now fails the magic check on its first record instead of being
+// silently misparsed with the wrong field layout. Must stay equal to Kotlin's WalCodec.MAGIC.
 const (
-	Magic      = 0x4B444257
+	Magic      = 0x4B444358
 	BatchMagic = 0x4B444242
 )
 
