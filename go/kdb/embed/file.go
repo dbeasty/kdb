@@ -135,6 +135,12 @@ func (h *Host) openNamespace(
 	if err != nil {
 		return nil, nil, err
 	}
+	// Before restore, not after: the generation numbers the pruned ancestry
+	// walks read are derived as commits are admitted, and a checkpoint
+	// admits its commits in map order - so the DAG has to already know
+	// whether it is deriving them by the time restoreNamespace starts
+	// putting commits in.
+	d.SetGraphSettings(opts.Storage.Graph)
 
 	store := handle.Adapter()
 	if store == nil {
