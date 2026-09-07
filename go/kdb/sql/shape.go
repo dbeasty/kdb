@@ -66,6 +66,16 @@ func ShapeOfSelect(q SelectQuery) QueryShape {
 		b.WriteString(" where ")
 		writeExprSkeleton(&b, q.Where)
 	}
+	if len(q.GroupBy) > 0 {
+		b.WriteString(" group[")
+		for i, g := range q.GroupBy {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			writeExprSkeleton(&b, g)
+		}
+		b.WriteByte(']')
+	}
 	if len(q.OrderBy) > 0 {
 		b.WriteString(" order[")
 		for i, o := range q.OrderBy {
@@ -117,6 +127,27 @@ func writeExprSkeleton(b *strings.Builder, e Expr) {
 			writeExprSkeleton(b, a)
 		}
 		b.WriteByte(')')
+	case ExprIn:
+		b.WriteByte('(')
+		writeExprSkeleton(b, ex.Expr)
+		fmt.Fprintf(b, " in[%d])", len(ex.Values))
+	case ExprBetween:
+		b.WriteByte('(')
+		writeExprSkeleton(b, ex.Expr)
+		b.WriteString(" between ? and ?)")
+	case ExprMatch:
+		fmt.Fprintf(b, "match(%s,?)", ex.IndexOrField)
+	case ExprSimilarity:
+		fmt.Fprintf(b, "similarity(%s,?)", ex.Field)
+	case ExprFuse:
+		fmt.Fprintf(b, "fuse[%s](", ex.Mode)
+		for i, a := range ex.Arms {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			writeExprSkeleton(b, a)
+		}
+		b.WriteByte(')')
 	default:
 		b.WriteByte('?')
 	}
@@ -142,6 +173,8 @@ func binaryOpToken(op BinaryOp) string {
 		return "or"
 	case BinaryOpLike:
 		return "like"
+	case BinaryOpILike:
+		return "ilike"
 	default:
 		return "?op"
 	}

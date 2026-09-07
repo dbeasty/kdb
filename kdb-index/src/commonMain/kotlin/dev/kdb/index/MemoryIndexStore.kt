@@ -109,7 +109,7 @@ public class MemoryIndexStore(
         query: String,
         atCommit: KdbHash?,
         limit: Int,
-    ): List<KdbUuid> {
+    ): List<RankedResult> {
         if (descriptor.type != IndexType.FULLTEXT) {
             throw IndexTypeMismatchException(descriptor.fieldName, descriptor.fieldName, IndexType.FULLTEXT, descriptor.type)
         }

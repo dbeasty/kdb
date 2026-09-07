@@ -101,7 +101,7 @@ public object SchemaEngine {
 
     public fun computeSchemaHash(schema: KdbSchema): KdbHash {
         val bytes =
-            schemaBodyToValue(schema.fields, schema.version, schema.createdAt, schema.description).encodeToBytes(
+            schemaBodyToValue(schema.fields, schema.uniqueConstraints, schema.version, schema.createdAt, schema.description).encodeToBytes(
                 SchemaBodyWireType,
                 KdbSchemaWireRegistry(),
             )

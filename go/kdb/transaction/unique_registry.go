@@ -3,6 +3,7 @@ package transaction
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -12,22 +13,53 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
-// UniqueKey identifies one claimed value of one unique-declared field in one namespace.
-// Value is a canonical JSON encoding of the field's decoded value (see canonicalValue), so that
-// two documents whose field decodes to the same value collide regardless of how the JSON that
-// produced it was spelled - `{"n": 1}` and `{"n": 1.0}` claim the same key.
+// UniqueKey identifies one claimed value tuple of one unique constraint in one namespace
+// (kdb-spec-layer16 §9.6). Fields is the constraint's ordered field names joined by
+// FieldSeparator - a single-field UNIQUE is the 1-tuple case, so its key is just the field name -
+// and Value is a canonical JSON array of the parts (see canonicalTuple), so two documents whose
+// parts decode to the same values collide regardless of how the JSON that produced them was
+// spelled: `{"n": 1}` and `{"n": 1.0}` claim the same key.
 type UniqueKey struct {
 	NamespaceID string
-	FieldName   string
+	Fields      string
 	Value       string
 }
 
-func (k UniqueKey) String() string {
-	return k.NamespaceID + "." + k.FieldName + "=" + k.Value
+// FieldSeparator joins a constraint's field names into UniqueKey.Fields. ASCII unit separator:
+// it cannot appear in a schema field name (see schema.NewField's identifier rule), so the joined
+// form is unambiguous.
+const FieldSeparator = "\x1f"
+
+// NewUniqueKey builds the key for one constraint tuple and its canonical value.
+func NewUniqueKey(namespaceID string, fields []string, value string) UniqueKey {
+	return UniqueKey{NamespaceID: namespaceID, Fields: strings.Join(fields, FieldSeparator), Value: value}
 }
 
-// UniqueKeyRegistry is the authoritative owner map for every unique-declared field value in a
-// runtime: (namespace, field, value) -> the single document id holding it.
+// FieldNames returns the constraint's field names, in order.
+func (k UniqueKey) FieldNames() []string {
+	if k.Fields == "" {
+		return nil
+	}
+	return strings.Split(k.Fields, FieldSeparator)
+}
+
+// FieldName is the human-readable constraint name: the field for a single-field constraint,
+// "(a, b)" for a compound one. This is what violations and error messages show.
+func (k UniqueKey) FieldName() string {
+	names := k.FieldNames()
+	if len(names) == 1 {
+		return names[0]
+	}
+	return "(" + strings.Join(names, ", ") + ")"
+}
+
+func (k UniqueKey) String() string {
+	return k.NamespaceID + "." + k.FieldName() + "=" + k.Value
+}
+
+// UniqueKeyRegistry is the authoritative owner map for every unique constraint's claimed value
+// tuple in a runtime: (namespace, fields tuple, canonical value tuple) -> the single document id
+// holding it.
 //
 // It is what makes concurrent writers safe on a natural key. KDB's ordinary conflict detection
 // is content-addressed and per-document (detectConflicts in default_engine.go): it answers "did
@@ -120,7 +152,7 @@ func (r *UniqueKeyRegistry) Rebuild(
 		return nil
 	}
 	fresh := make(map[UniqueKey]codec.UUID)
-	if !sch.HasUniqueFields() {
+	if !sch.HasUniqueConstraints() {
 		r.mu.Lock()
 		r.owners = fresh
 		r.mu.Unlock()
@@ -159,9 +191,9 @@ func (r *UniqueKeyRegistry) Rebuild(
 	return nil
 }
 
-// UniqueConstraintError reports two documents claiming one unique field value. It carries both
-// document ids because "who already has it" is the one thing a client needs to act on and the
-// one thing a bare violation message never tells them.
+// UniqueConstraintError reports two documents claiming one unique value tuple. It names the
+// constraint's fields and carries both document ids, because "who already has it" is the one
+// thing a client needs to act on and the one thing a bare violation message never tells them.
 type UniqueConstraintError struct {
 	Key        UniqueKey
 	OwnerDocID codec.UUID
@@ -175,40 +207,53 @@ func (e *UniqueConstraintError) Error() string {
 	)
 }
 
-// UniqueKeysFor returns the unique-field keys doc claims under sch.
+// UniqueKeysFor returns the keys doc claims under every unique constraint in sch - one per
+// tuple from sch.UniqueTuples(): the single-field UNIQUE flags first, then the compound
+// constraints.
 //
-// A field whose value is absent or JSON null claims nothing - matching SQL, where NULLs do not
-// collide with each other. This is a deliberate choice, not an oversight: a schema with an
-// optional unique field would otherwise let exactly one document omit it.
+// Sparse semantics (§9.6): a tuple in which *any* part is absent or JSON null claims nothing -
+// matching SQL, where NULLs do not collide with each other. This is a deliberate choice, not an
+// oversight: a schema with an optional unique field would otherwise let exactly one document
+// omit it, and a compound constraint would otherwise treat "(a, missing)" as a value.
 func UniqueKeysFor(namespaceID string, sch schema.KdbSchema, doc document.Document) ([]UniqueKey, error) {
-	if !sch.HasUniqueFields() {
+	if !sch.HasUniqueConstraints() {
 		return nil, nil
 	}
 	var out []UniqueKey
-	for _, field := range sch.UniqueFields() {
-		raw, err := schema.FieldValue(doc.JSON, field.Name)
-		if err != nil {
-			return nil, err
+	for _, fields := range sch.UniqueTuples() {
+		parts := make([]any, 0, len(fields))
+		complete := true
+		for _, name := range fields {
+			raw, err := schema.FieldValue(doc.JSON, name)
+			if err != nil {
+				return nil, err
+			}
+			if raw == nil {
+				complete = false
+				break
+			}
+			parts = append(parts, raw)
 		}
-		if raw == nil {
+		if !complete {
 			continue
 		}
-		canonical, err := canonicalValue(raw)
+		canonical, err := canonicalTuple(parts)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, UniqueKey{NamespaceID: namespaceID, FieldName: field.Name, Value: canonical})
+		out = append(out, NewUniqueKey(namespaceID, fields, canonical))
 	}
 	return out, nil
 }
 
-// canonicalValue renders a decoded JSON value as the registry's comparison key. encoding/json
-// sorts object keys and normalizes number formatting on re-marshal, so equal values always
-// render identically regardless of their original spelling. String comparison stays byte-wise:
-// a case-insensitive unique index is a schema decision the schema layer would have to express,
-// not a default this layer is entitled to impose.
-func canonicalValue(v any) (string, error) {
-	b, err := json.Marshal(v)
+// canonicalTuple renders the decoded parts of one constraint tuple as the registry's comparison
+// key: a JSON array, so a 1-tuple's key is `["a@b.c"]` and a 2-tuple's `["a@b.c",1]`.
+// encoding/json sorts object keys and normalizes number formatting on re-marshal, so equal
+// values always render identically regardless of their original spelling. String comparison
+// stays byte-wise: a case-insensitive unique index is a schema decision the schema layer would
+// have to express, not a default this layer is entitled to impose.
+func canonicalTuple(parts []any) (string, error) {
+	b, err := json.Marshal(parts)
 	if err != nil {
 		return "", err
 	}
@@ -250,7 +295,7 @@ func planUniqueKeys(
 		retract: make(map[UniqueKey]codec.UUID),
 		claim:   make(map[UniqueKey]codec.UUID),
 	}
-	if registry == nil || !sch.HasUniqueFields() {
+	if registry == nil || !sch.HasUniqueConstraints() {
 		return plan, nil
 	}
 
@@ -340,7 +385,7 @@ func uniqueViolation(index int, op document.Op, key UniqueKey, owner codec.UUID)
 		OpIndex: index,
 		Op:      op,
 		Violations: []kdberr.FieldViolation{{
-			FieldName:     key.FieldName,
+			FieldName:     key.FieldName(),
 			ViolationType: kdberr.UniqueConstraint,
 			Detail:        "value already held by document " + owner.String(),
 		}},

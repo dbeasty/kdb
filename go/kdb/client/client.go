@@ -95,10 +95,23 @@ func classifiedError(errMsg string, code *wire.ErrorCode, retryAfterMs *int) err
 		return &UnavailableError{Message: errMsg}
 	case wire.ErrorCodeDeadlineExceeded:
 		return &DeadlineExceededError{Message: errMsg}
+	case wire.ErrorCodeUnsupported:
+		return &UnsupportedError{Message: errMsg}
 	default:
 		return fmt.Errorf("kdb: %s", errMsg)
 	}
 }
+
+// ErrUnsupported is the sentinel every UnsupportedError unwraps to: the server has nothing
+// configured to serve this request (a Search against a server with no search index). Never
+// retry unmodified.
+var ErrUnsupported = errors.New("kdb: unsupported")
+
+// UnsupportedError carries the server's explanation for an ErrUnsupported refusal.
+type UnsupportedError struct{ Message string }
+
+func (e *UnsupportedError) Error() string { return "kdb: " + e.Message }
+func (e *UnsupportedError) Unwrap() error { return ErrUnsupported }
 
 // ErrNotFound is returned by GetJSON when no document exists at the given id.
 var ErrNotFound = errors.New("kdb: not found")
@@ -485,8 +498,9 @@ func (c *Client) GetJSON(ctx context.Context, ns string, docID string) ([]byte, 
 	return []byte(*result.JSON), result.CommitHex, nil
 }
 
-// Upsert writes a document unconditionally - create it if it doesn't exist, replace it if it
-// does, no BaseVersion, no conflict possible. Targets a namespace whose server-side conflict
+// Upsert writes a document unconditionally - create it if it doesn't exist, and if it does,
+// merge jsonBody onto the stored body at the root level (a key jsonBody omits keeps its stored
+// value; use Commit to write a body that drops keys). No BaseVersion, no conflict possible. Targets a namespace whose server-side conflict
 // policy is LAST_WRITE (component 40 spec §5) - the server enforces this, not the client.
 func (c *Client) Upsert(ctx context.Context, ns string, docID string, jsonBody []byte) (string, error) {
 	// Resolved even though Upsert needs no session state of its own: the session id is what lets

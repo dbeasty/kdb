@@ -79,7 +79,7 @@ func (h *sqlWireConnHandler) handleLockRelease(msg wire.LockReleaseMessage) wire
 func (h *sqlWireConnHandler) lockPreamble(
 	correlationID int, namespace, sessionID, docIDHex string,
 ) (*KdbSession, codec.UUID, wire.Message) {
-	if !h.authenticated {
+	if !h.isAuthenticated() {
 		return nil, codec.UUID{}, lockError(correlationID, namespace, sessionID, docIDHex, "not authenticated", nil)
 	}
 	sess, ok := h.sessions.Get(sessionID)

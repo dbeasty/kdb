@@ -17,6 +17,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/transaction"
+	"github.com/limidus/kdb/go/kdb/wire"
 )
 
 // DefaultWriteTimeout bounds how long a commit may wait queued behind other commits before
@@ -41,8 +42,26 @@ type KdbServerRuntime struct {
 	// STRICT/CAS semantics. A separate transaction.Engine instance, not a per-call policy
 	// override, because Engine bakes its conflict policy in at construction.
 	UpsertEngine  transaction.Engine
-	SQLEngine     sql.Engine
 	DocumentLocks *transaction.LockManager
+
+	// sqlEngineMu guards sqlEngine and sqlIndexProvider: SetSQLIndexProvider rebuilds the engine
+	// while connections may be executing statements against the previous one.
+	sqlEngineMu sync.RWMutex
+	// sqlEngine reads through an expiryHidingAdapter (see expiry.go): head reads never return an
+	// expired document, historical reads are untouched. Built by rebuildSQLEngine.
+	sqlEngine sql.Engine
+	// sqlIndexProvider backs MATCH/SIMILARITY/FUSE and indexed lookups, and - when it also
+	// implements sql.IndexDDLExecutor - CREATE INDEX / DROP INDEX. nil (the default) means no
+	// indexes: every query is a full scan and index DDL is refused, which is exactly the
+	// behaviour before Layer 16. See SetSQLIndexProvider.
+	sqlIndexProvider sql.IndexProvider
+
+	// searchProvider serves SEARCH frames (kdb-spec-layer16 §11); see SetSearchProvider. nil -
+	// the default - answers every search with an UNSUPPORTED "no index configured for search"
+	// error. Behind an accessor rather than an exported field because the wiring that owns the
+	// fulltext/vector indexes may install it after listeners are already accepting.
+	searchProviderMu sync.RWMutex
+	searchProvider   SearchProvider
 
 	// AuthEngine authenticates/authorizes both at the wire layer (handshake/session-begin, see
 	// wire_listen.go) and at commit time (see Commit) - one engine for both, so RBAC changes
@@ -143,6 +162,31 @@ type KdbServerRuntime struct {
 	// enforcement is best-effort until an operator resolves it; surfaced rather than swallowed
 	// because silently degrading a correctness guarantee is worse than the violation itself.
 	UniqueKeyRebuildError error
+
+	// sweeperState holds document-expiry configuration and the sweeper goroutine (expiry.go).
+	sweeperState
+
+	// hookMu guards beforeSqlExec, which a test may set while the listener is already running.
+	hookMu sync.RWMutex
+	// beforeSqlExec, when set by a test, runs at the top of every SqlExec dispatch - the way a
+	// test blocks one session's statement to prove other frames on the connection keep flowing
+	// (kdb-spec-layer16 §12). Never set in production.
+	beforeSqlExec func(msg wire.SqlExecMessage)
+}
+
+// SetBeforeSqlExecHookForTest installs a hook run at the top of every SqlExec dispatch, for
+// tests that need to hold one statement open while other frames arrive on the same connection.
+// Exported for tests in this package's own suite; never called in production.
+func (s *KdbServerRuntime) SetBeforeSqlExecHookForTest(hook func(msg wire.SqlExecMessage)) {
+	s.hookMu.Lock()
+	s.beforeSqlExec = hook
+	s.hookMu.Unlock()
+}
+
+func (s *KdbServerRuntime) beforeSqlExecHook() func(msg wire.SqlExecMessage) {
+	s.hookMu.RLock()
+	defer s.hookMu.RUnlock()
+	return s.beforeSqlExec
 }
 
 // NewKdbServerRuntime creates a server runtime with ref-count 1, wiring the transaction and SQL
@@ -169,7 +213,6 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		Runtime:           rt,
 		TransactionEngine: transaction.NewEngineWithOptions(transaction.ConflictPolicyStrict, nil, engineOpts),
 		UpsertEngine:      transaction.NewEngineWithOptions(transaction.ConflictPolicyLastWrite, nil, engineOpts),
-		SQLEngine:         sql.NewEngine(rt.Storage, d),
 		DocumentLocks:     transaction.NewLockManager(),
 		UniqueKeys:        uniqueKeys,
 		AuthEngine:        auth.AllowAll,
@@ -178,6 +221,9 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		writeGate:         newWriteGate(DefaultMaxQueuedWrites),
 		WriteTimeout:      DefaultWriteTimeout,
 	}
+	// The SQL engine reads through the expiry filter, not the raw adapter - this is the one place
+	// the read side of §9.5 is applied to SQL, since go/kdb/sql knows nothing about expiry.
+	s.rebuildSQLEngine()
 	s.refCount.Store(1)
 	// Populate the registry from what is already on disk. A failure here is reported by
 	// RebuildUniqueKeys' own caller, not swallowed - but it must not prevent the runtime from
@@ -189,6 +235,65 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		s.UniqueKeyRebuildError = err
 	}
 	return s
+}
+
+// SQLEngine returns the engine SQL statements execute against. Safe for concurrent use with
+// SetSQLIndexProvider.
+func (s *KdbServerRuntime) SQLEngine() sql.Engine {
+	s.sqlEngineMu.RLock()
+	defer s.sqlEngineMu.RUnlock()
+	return s.sqlEngine
+}
+
+// SetSQLIndexProvider installs (or, with nil, removes) the index provider the SQL engine plans
+// and executes against - kdb-spec-layer16 §9.1/§9.3: MATCH, SIMILARITY and FUSE, indexed exact
+// and range lookups, and, when the provider also implements sql.IndexDDLExecutor, CREATE INDEX /
+// DROP INDEX. The engine is rebuilt around it, so this is safe to call while connections are
+// live: statements already executing finish against the previous engine, the next one uses this.
+func (s *KdbServerRuntime) SetSQLIndexProvider(provider sql.IndexProvider) {
+	s.sqlEngineMu.Lock()
+	s.sqlIndexProvider = provider
+	s.sqlEngineMu.Unlock()
+	s.rebuildSQLEngine()
+}
+
+// SQLIndexProvider returns the configured index provider, or nil when queries are full scans.
+func (s *KdbServerRuntime) SQLIndexProvider() sql.IndexProvider {
+	s.sqlEngineMu.RLock()
+	defer s.sqlEngineMu.RUnlock()
+	return s.sqlIndexProvider
+}
+
+// rebuildSQLEngine constructs the SQL engine over the expiry-filtering storage view and the
+// current index provider.
+func (s *KdbServerRuntime) rebuildSQLEngine() {
+	s.sqlEngineMu.Lock()
+	defer s.sqlEngineMu.Unlock()
+	store := &expiryHidingAdapter{Adapter: s.Runtime.Storage, runtime: s}
+	if s.sqlIndexProvider == nil {
+		// Deliberately NewEngine, not NewEngineWithIndexes(.., nil): a nil provider stored in a
+		// non-nil interface would make the engine believe it has one.
+		s.sqlEngine = sql.NewEngine(store, s.dag)
+		return
+	}
+	s.sqlEngine = sql.NewEngineWithIndexes(store, s.dag, s.sqlIndexProvider)
+}
+
+// SetSearchProvider installs (or, with nil, removes) the provider that serves SEARCH frames -
+// kdb-spec-layer16 §11, Component 69. Safe to call at any time, including while connections are
+// live: the next SEARCH uses the new provider. Until one is set every search is refused with
+// ErrSearchNotConfigured (wire.ErrorCodeUnsupported).
+func (s *KdbServerRuntime) SetSearchProvider(provider SearchProvider) {
+	s.searchProviderMu.Lock()
+	s.searchProvider = provider
+	s.searchProviderMu.Unlock()
+}
+
+// SearchProvider returns the provider serving SEARCH frames, or nil when none is configured.
+func (s *KdbServerRuntime) SearchProvider() SearchProvider {
+	s.searchProviderMu.RLock()
+	defer s.searchProviderMu.RUnlock()
+	return s.searchProvider
 }
 
 // RebuildUniqueKeys repopulates the unique-key registry from the namespace's documents at the
@@ -341,6 +446,8 @@ func (s *KdbServerRuntime) Release() {
 	if s.refCount.Load() > 0 {
 		return
 	}
+	// The sweeper commits through this runtime; it has to be gone before storage closes.
+	s.stopSweeper()
 	s.memGuard.Stop()
 	if s.Runtime != nil {
 		s.Runtime.Close()
@@ -399,9 +506,11 @@ func (s *KdbServerRuntime) Commit(namespaceID string, tx document.Transaction, s
 	return s.commitWith(s.TransactionEngine, tx, principal)
 }
 
-// Upsert writes docID unconditionally in namespaceID - create if absent, replace if present -
-// via UpsertEngine (ConflictPolicyLastWrite), matching component 40 spec §3/§5's Upsert
-// contract: no BaseVersion, never conflicts. Always anchors on the current head internally,
+// Upsert writes docID unconditionally in namespaceID via UpsertEngine (ConflictPolicyLastWrite),
+// matching component 40 spec §3/§5's Upsert contract: no BaseVersion, never conflicts. A new
+// document is stored exactly as supplied; an existing one is updated by a shallow root-level
+// merge of jsonBody onto the stored body (document.Document.Merge), so a key jsonBody omits
+// keeps its stored value. Always anchors on the current head internally,
 // since callers of Upsert by definition don't have (and don't want) one.
 func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody string, principal auth.Principal) (document.Commit, error) {
 	head, err := s.Runtime.DAG.Head()
@@ -436,22 +545,34 @@ func (s *KdbServerRuntime) Replay(namespaceID string, tx document.Transaction, r
 }
 
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
-	return s.runTransaction(tx, principal, func() (transaction.TransactionResult, error) {
+	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
 		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
 	})
 }
 
 func (s *KdbServerRuntime) replayWith(engine transaction.Engine, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
-	return s.runTransaction(tx, principal, func() (transaction.TransactionResult, error) {
+	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
 		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, "")
 	})
+}
+
+type transactionResult = transaction.TransactionResult
+
+// txOptions are the per-call knobs runTransaction's three public callers do not need but the
+// runtime's own internal commits (the expiry sweeper) do.
+type txOptions struct {
+	// system marks a commit the runtime makes on its own behalf; RBAC is not consulted, because
+	// there is no grant that could describe "the server enforcing its own policy". Only set from
+	// inside this package, never from a principal a client presented. The commit message travels
+	// with the engine call the caller builds, not here.
+	system bool
 }
 
 // runTransaction holds every cross-cutting concern Commit/Upsert/Replay share (draining,
 // memory-pressure rejection, authorization, the writeGate's serialization+timeout+backpressure,
 // and persisting a successful result) - call does only the one thing that differs between them:
 // which transaction.Engine method to invoke and with what target.
-func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal auth.Principal, call func() (transaction.TransactionResult, error)) (document.Commit, error) {
+func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal auth.Principal, opts txOptions, call func() (transactionResult, error)) (document.Commit, error) {
 	// Checked in cheapest-first order, before authorization or taking the write gate: a server
 	// shedding load should do as little work per rejected request as possible, and a rejection
 	// reason "closer to the front" (shutting down entirely) makes every later check moot anyway.
@@ -464,8 +585,10 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	if err := s.Runtime.AssertWritable(); err != nil {
 		return document.Commit{}, err
 	}
-	if err := s.authorizeOperations(tx, principal); err != nil {
-		return document.Commit{}, err
+	if !opts.system {
+		if err := s.authorizeOperations(tx, principal); err != nil {
+			return document.Commit{}, err
+		}
 	}
 	if s.dag == nil {
 		return document.Commit{}, fmt.Errorf("kdb server: commit requires an InMemoryCommitDag (or a wrapper exposing one), got %T", s.Runtime.DAG)
@@ -507,12 +630,29 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	releaseNow := func() { releaseOnce.Do(release) }
 	defer releaseNow()
 
+	// Index extraction and validation happen before the commit lands (Component 68): a value
+	// the indexes cannot accept rejects the transaction here, rather than leaving index state
+	// disagreeing with the documents it describes.
+	preparedIndexes, indexProvider, err := s.prepareIndexes(tx)
+	if err != nil {
+		return document.Commit{}, err
+	}
+
 	result, err := call()
 	if err != nil {
 		return document.Commit{}, err
 	}
 	switch r := result.(type) {
 	case transaction.ResultSuccess:
+		// Applied under the gate so index state advances in commit order. The hints ride along
+		// on the commit for replication.
+		if indexProvider != nil {
+			hints, err := indexProvider.commitToIndexes(preparedIndexes, r.Commit.Hash)
+			if err != nil {
+				return document.Commit{}, err
+			}
+			_ = hints
+		}
 		// Queueing happens under the gate because queue order is delta-log
 		// order, and two commits racing to enqueue would desync the log from
 		// the DAG's actual commit order. Waiting for the write to reach disk
@@ -589,6 +729,11 @@ func (s *KdbServerRuntime) GetDocument(namespaceID string, docID codec.UUID) (js
 		return "", "", false, err
 	}
 	if doc == nil {
+		return "", head.Hex(), false, nil
+	}
+	// Reads at head honour document expiry between sweeps (kdb-spec-layer16 §9.5): an expired
+	// document is reported absent exactly as if the sweeper had already deleted it.
+	if s.isExpiredAtHead(doc.JSON) {
 		return "", head.Hex(), false, nil
 	}
 	return doc.JSON, head.Hex(), true, nil

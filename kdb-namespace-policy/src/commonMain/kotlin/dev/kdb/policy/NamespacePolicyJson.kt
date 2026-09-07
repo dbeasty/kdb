@@ -18,6 +18,14 @@ internal data class NamespacePolicyJson(
     val gpuPromotion: GpuPromotionPolicyJson? = null,
     val vectorIndex: VectorIndexPolicyJson = VectorIndexPolicyJson(),
     val revision: Long = 1L,
+    val documentExpiry: DocumentExpiryJson? = null,
+)
+
+@Serializable
+internal data class DocumentExpiryJson(
+    val fieldPath: String,
+    val graceMillis: Long = 0,
+    val sweepIntervalMillis: Long = 60_000,
 )
 
 @Serializable
@@ -104,6 +112,8 @@ internal fun NamespacePolicyJson.toModel(schema: dev.kdb.schema.KdbSchema?): Nam
                 vectorIndex.defaultDimensions,
             ),
         revision = revision,
+        documentExpiry =
+            documentExpiry?.let { DocumentExpiryPolicy(it.fieldPath, it.graceMillis, it.sweepIntervalMillis) },
     )
 
 internal fun NamespacePolicy.toJson(): NamespacePolicyJson =
@@ -144,6 +154,8 @@ internal fun NamespacePolicy.toJson(): NamespacePolicyJson =
                 vectorIndex.defaultDimensions,
             ),
         revision = revision,
+        documentExpiry =
+            documentExpiry?.let { DocumentExpiryJson(it.fieldPath, it.graceMillis, it.sweepIntervalMillis) },
     )
 
 internal fun encodePolicy(policy: NamespacePolicy): ByteArray =

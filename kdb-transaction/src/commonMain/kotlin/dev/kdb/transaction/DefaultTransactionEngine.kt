@@ -15,6 +15,7 @@ import dev.kdb.storage.StorageAdapter
 internal class DefaultTransactionEngine(
     override val conflictPolicy: ConflictPolicy,
     override val customResolver: ConflictResolver?,
+    private val uniqueKeys: UniqueKeyRegistry? = null,
 ) : TransactionEngine {
 
     override suspend fun commit(
@@ -257,6 +258,51 @@ internal class DefaultTransactionEngine(
             }
         }
 
+        // Layer 16 §9.6: unique constraints are planned against the target tree before anything is
+        // staged, and applied to the registry only after the commit is in the DAG. When this
+        // transaction changes the schema (a migration adding a unique constraint), the registry is
+        // rebuilt from the target tree under the new schema first - a pre-existing duplicate then
+        // rejects the migration rather than silently surviving it.
+        var effectiveRegistry = uniqueKeys
+        var rebuiltRegistry: UniqueKeyRegistry? = null
+        if (uniqueKeys != null && schemaFrame.rollingSchema.schemaHash != incomingSchema.schemaHash) {
+            val fresh = UniqueKeyRegistry()
+            try {
+                fresh.rebuild(dag.namespaceId, storage, targetDocTreeHash, schemaFrame.rollingSchema)
+            } catch (e: UniqueConstraintViolationException) {
+                return TransactionResult.SchemaError(
+                    listOf(
+                        OperationViolation(
+                            0,
+                            transaction.operations.first(),
+                            listOf(
+                                FieldViolation(
+                                    e.fields.joinToString(","),
+                                    ViolationType.UNIQUE_CONSTRAINT,
+                                    "value [${e.values.joinToString(",")}] already held by document ${e.ownerDocId}",
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            }
+            effectiveRegistry = fresh
+            rebuiltRegistry = fresh
+        }
+        val (uniquePlan, uniqueViolations) =
+            planUniqueKeys(
+                transaction,
+                dag.namespaceId,
+                storage,
+                targetDocTreeHash,
+                schemaFrame.rollingSchema,
+                effectiveRegistry,
+                writes,
+            )
+        if (uniqueViolations.isNotEmpty()) {
+            return TransactionResult.SchemaError(uniqueViolations)
+        }
+
         try {
             for ((idx, op) in transaction.operations.withIndex()) {
                 when (op) {
@@ -293,6 +339,11 @@ internal class DefaultTransactionEngine(
                 schemaHashWire,
                 message,
             )
+
+        if (uniqueKeys != null) {
+            if (rebuiltRegistry != null) uniqueKeys.replaceWith(rebuiltRegistry)
+            uniqueKeys.apply(uniquePlan.retract, uniquePlan.claim)
+        }
 
         return TransactionResult.Success(commit, commit.documentTreeHash)
     }

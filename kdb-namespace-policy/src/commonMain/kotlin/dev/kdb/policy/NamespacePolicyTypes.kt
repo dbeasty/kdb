@@ -72,6 +72,18 @@ public data class VectorIndexPolicy(
     val defaultDimensions: Int = 128,
 )
 
+/**
+ * Document expiry (Layer 16 §9.5, Component 73). A document is expired when the value at
+ * `$.<fieldPath>` is a timestamp `<= now - graceMillis`: an RFC 3339 string or a number of epoch
+ * milliseconds; any other value means "never expires". Head reads hide expired documents between
+ * sweeps; the server's sweeper deletes them every [sweepIntervalMillis].
+ */
+public data class DocumentExpiryPolicy(
+    val fieldPath: String,
+    val graceMillis: Long = 0,
+    val sweepIntervalMillis: Long = 60_000,
+)
+
 public data class NamespacePolicy(
     val namespaceId: String,
     val schema: KdbSchema?,
@@ -84,6 +96,7 @@ public data class NamespacePolicy(
     val gpuPromotion: GpuPromotionPolicyRef? = null,
     val vectorIndex: VectorIndexPolicy = VectorIndexPolicy(),
     val revision: Long = 1L,
+    val documentExpiry: DocumentExpiryPolicy? = null,
 )
 
 public fun defaultRetainGranularity(): List<RetainRule> =

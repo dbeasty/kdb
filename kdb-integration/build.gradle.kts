@@ -25,6 +25,7 @@ dependencies {
     testImplementation(project(":kdb-embed"))
     testImplementation(project(":kdb-server"))
     testImplementation(project(":kdb-wire"))
+    testImplementation(libs.kotlinx.serialization.json)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
 }

@@ -18,7 +18,7 @@ func opClassForMessage(t wire.MessageType) (OpClass, bool) {
 	switch t {
 	case wire.MsgDocumentGet:
 		return ClassPointRead, true
-	case wire.MsgSqlExec:
+	case wire.MsgSqlExec, wire.MsgSearch:
 		return ClassScan, true
 	case wire.MsgTxCommit, wire.MsgUpsert, wire.MsgTransactionReplay:
 		return ClassWrite, true
@@ -92,6 +92,8 @@ func rejectionMessage(h wire.Header, err error) (wire.Message, bool) {
 			ErrorCode:    &code,
 			RetryAfterMs: retryAfterMs,
 		}, true
+	case wire.MsgSearch:
+		return searchErrorClassified(wire.SearchMessage{H: h}, err.Error(), err), true
 	default:
 		return nil, false
 	}

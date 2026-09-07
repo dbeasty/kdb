@@ -1,7 +1,6 @@
 package embed_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -9,7 +8,10 @@ import (
 	"github.com/limidus/kdb/go/kdb/schema"
 )
 
-func TestPutJSONDocument_injectsIDAndCommits(t *testing.T) {
+// TestPutJSONDocument_storesBodyByteExactAndCommits pins kdb-spec-layer16 §9.4: a body without an
+// "id" is stored exactly as given - nothing injected, nothing reordered - and the minted identity
+// is reported only through PutResult.DocID.
+func TestPutJSONDocument_storesBodyByteExactAndCommits(t *testing.T) {
 	ns := "demo/users"
 	rt, err := embed.OpenMemoryRuntime("demo", ns, schema.None())
 	if err != nil {
@@ -19,7 +21,8 @@ func TestPutJSONDocument_injectsIDAndCommits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := embed.PutJSONDocument(rt, ns, `{"name":"Ada"}`)
+	const body = `{"zeta":1,"name":"Ada","alpha":{"b":2,"a":1}}`
+	result, err := embed.PutJSONDocument(rt, ns, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,11 +50,43 @@ func TestPutJSONDocument_injectsIDAndCommits(t *testing.T) {
 	if doc == nil {
 		t.Fatal("document not found")
 	}
-	if !strings.Contains(doc.JSON, `"id":`) {
-		t.Fatalf("json %q", doc.JSON)
+	if doc.JSON != body {
+		t.Fatalf("stored body was rewritten:\n got %s\nwant %s", doc.JSON, body)
 	}
-	if !strings.Contains(doc.JSON, `"name":"Ada"`) {
-		t.Fatalf("json %q", doc.JSON)
+}
+
+// TestPutJSONDocument_derivesIDFromNonUUIDString: a natural-key "id" is accepted (it used to be
+// rejected as "invalid uuid") and maps to the spec's derived UUID, with the body kept verbatim.
+func TestPutJSONDocument_derivesIDFromNonUUIDString(t *testing.T) {
+	ns := "demo/users"
+	rt, err := embed.OpenMemoryRuntime("demo", ns, schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = `{"id":"order-1","total":42}`
+	result, err := embed.PutJSONDocument(rt, ns, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := codec.DerivedUUID("order-1"); result.DocID != want {
+		t.Fatalf("doc id %s, want derived %s", result.DocID, want)
+	}
+	head, _ := rt.DAG.Head()
+	commit, _ := rt.DAG.GetCommitOrThrow(head)
+	doc, err := rt.Storage.GetDocument(ns, result.DocID, commit.DocumentTreeHash)
+	if err != nil || doc == nil {
+		t.Fatalf("doc=%v err=%v", doc, err)
+	}
+	if doc.JSON != body {
+		t.Fatalf("stored body was rewritten: %s", doc.JSON)
+	}
+	// A second put under the same natural key lands on the same document.
+	again, err := embed.PutJSONDocument(rt, ns, `{"id":"order-1","total":43}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.DocID != result.DocID {
+		t.Fatalf("same natural key resolved to different ids: %s vs %s", again.DocID, result.DocID)
 	}
 }
 

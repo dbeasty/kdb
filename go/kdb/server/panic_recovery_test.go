@@ -124,7 +124,10 @@ func TestMalformedStatementVariantsAllReturnErrors(t *testing.T) {
 		"INSERT INTO",
 		"CREATE TABLE",
 		"SELECT a FROM t WHERE b = 1.2.3",
-		"SELECT 1 GARBAGE",
+		// Was "SELECT 1 GARBAGE", which Layer 16 made legal: the parser gained implicit
+		// aliases, so that reads as `SELECT 1 AS GARBAGE`, exactly as Postgres and MySQL
+		// parse it. Replaced with input that is still genuinely malformed.
+		"SELECT 1 GARBAGE GARBAGE",
 	} {
 		if _, _, err := c.QueryRaw(ctx, "app/data", sql, nil); err == nil {
 			t.Errorf("QueryRaw(%q) unexpectedly succeeded", sql)

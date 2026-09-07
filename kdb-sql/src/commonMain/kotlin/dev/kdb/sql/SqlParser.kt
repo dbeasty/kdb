@@ -16,6 +16,25 @@ internal class RecursiveDescentSqlParser : SqlParser {
         pos = 0
         nextParamIndex = 0
         skipWs()
+        // Malformed input must surface as SqlParseException, never as an IndexOutOfBounds /
+        // NumberFormat / IllegalState from inside the descent (Layer 16 §3 item 4).
+        val stmt =
+            try {
+                parseStatement()
+            } catch (e: SqlParseException) {
+                throw e
+            } catch (e: SqlPlanningException) {
+                throw e
+            } catch (e: Exception) {
+                throw SqlParseException(e.message ?: "malformed SQL", input, pos)
+            }
+        skipWs()
+        if (matchChar(';')) skipWs()
+        if (pos < input.length) throw parseError("unexpected input after statement")
+        return stmt
+    }
+
+    private fun parseStatement(): SqlStatement {
         return when {
             matchKeyword("BEGIN") -> parseBegin()
             matchKeyword("START") -> parseStartTransaction()
@@ -63,11 +82,15 @@ internal class RecursiveDescentSqlParser : SqlParser {
                 expectKeyword("SELECT")
                 SqlStatement.CreateVirtualView(name, parseSelectQuery())
             }
-            matchKeyword("INDEX") -> SqlStatement.CreateIndex(parseCreateIndexBody())
+            matchKeyword("UNIQUE") -> {
+                expectKeyword("INDEX")
+                SqlStatement.CreateIndex(parseCreateIndexBody(uniquePrefix = true))
+            }
+            matchKeyword("INDEX") -> SqlStatement.CreateIndex(parseCreateIndexBody(uniquePrefix = false))
             matchKeyword("TABLE") -> SqlStatement.CreateTable(parseCreateTableBody())
             matchKeyword("ROLE") -> SqlStatement.CreateRole(readIdentifier())
             matchKeyword("USER") -> parseCreateUserBody()
-            else -> throw parseError("expected VIRTUAL VIEW, INDEX, TABLE, ROLE, or USER")
+            else -> throw parseError("expected VIRTUAL VIEW, [UNIQUE] INDEX, TABLE, ROLE, or USER")
         }
     }
 
@@ -133,22 +156,41 @@ internal class RecursiveDescentSqlParser : SqlParser {
         val table = TableRef(readIdentifier())
         expectChar('(')
         val columns = mutableListOf<ColumnDefinition>()
+        val constraints = mutableListOf<List<String>>()
         do {
-            columns += parseColumnDefinition()
+            if (matchKeyword("UNIQUE")) {
+                expectChar('(')
+                val fields = mutableListOf<String>()
+                do {
+                    fields += readIdentifier()
+                } while (matchChar(','))
+                expectChar(')')
+                constraints += fields
+            } else {
+                columns += parseColumnDefinition()
+            }
         } while (matchChar(','))
         expectChar(')')
-        return CreateTableStatement(table, columns)
+        if (columns.isEmpty()) throw parseError("CREATE TABLE needs at least one column")
+        return CreateTableStatement(table, columns, constraints)
     }
 
     private fun parseColumnDefinition(): ColumnDefinition {
         val name = readIdentifier()
         val type = parseColumnType()
         var required = false
-        if (matchKeyword("NOT")) {
-            expectKeyword("NULL")
-            required = true
+        var unique = false
+        while (true) {
+            when {
+                matchKeyword("NOT") -> {
+                    expectKeyword("NULL")
+                    required = true
+                }
+                matchKeyword("UNIQUE") -> unique = true
+                else -> break
+            }
         }
-        return ColumnDefinition(name, type, required, indexed = true)
+        return ColumnDefinition(name, type, required, indexed = true, unique = unique)
     }
 
     private fun parseColumnType(): dev.kdb.schema.KdbFieldType {
@@ -170,14 +212,26 @@ internal class RecursiveDescentSqlParser : SqlParser {
         }
     }
 
-    private fun parseCreateIndexBody(): CreateIndexStatement {
+    /**
+     * `name ON t (f1 [WEIGHT n] {, f2 [WEIGHT n]}) [USING HASH|BTREE|FULLTEXT|VECTOR]
+     * [WITH (k = v {, k = v})] [UNIQUE]` (Layer 16 §9.2). Fields are dotted JSON paths.
+     */
+    private fun parseCreateIndexBody(uniquePrefix: Boolean): CreateIndexStatement {
         val indexName = readIdentifier()
         expectKeyword("ON")
         val table = readIdentifier()
         expectChar('(')
         val fields = mutableListOf<String>()
+        val weights = LinkedHashMap<String, Int>()
         do {
-            fields += readIdentifier()
+            val field = readDottedIdentifier()
+            if (field in fields) throw parseError("duplicate index field: $field")
+            fields += field
+            if (matchKeyword("WEIGHT")) {
+                val w = readInt()
+                if (w < 1) throw parseError("WEIGHT must be >= 1")
+                weights[field] = w
+            }
         } while (matchChar(','))
         expectChar(')')
         var type = dev.kdb.index.IndexType.BTREE
@@ -191,8 +245,29 @@ internal class RecursiveDescentSqlParser : SqlParser {
                     else -> throw parseError("unknown index type")
                 }
         }
-        val unique = matchKeyword("UNIQUE")
-        return CreateIndexStatement(indexName, table, fields, type, unique)
+        val options = LinkedHashMap<String, String>()
+        if (matchKeyword("WITH")) {
+            expectChar('(')
+            do {
+                val key = readIdentifier().lowercase()
+                expectChar('=')
+                skipWs()
+                val value =
+                    when {
+                        peek() == '\'' -> readStringLiteral()
+                        peek().isDigit() || peek() == '-' -> readNumber()
+                        else -> readIdentifier()
+                    }
+                if (key in options) throw parseError("duplicate option: $key")
+                options[key] = value
+            } while (matchChar(','))
+            expectChar(')')
+        }
+        val unique = matchKeyword("UNIQUE") || uniquePrefix
+        if (weights.isNotEmpty() && type != dev.kdb.index.IndexType.FULLTEXT) {
+            throw parseError("WEIGHT is only valid for FULLTEXT indexes")
+        }
+        return CreateIndexStatement(indexName, table, fields, type, unique, weights, options)
     }
 
     private fun parseDropIndexBody(): DropIndexStatement {
@@ -230,7 +305,7 @@ internal class RecursiveDescentSqlParser : SqlParser {
         expectKeyword("SET")
         val assignments = mutableListOf<Assignment>()
         do {
-            val col = readIdentifier()
+            val col = readDottedIdentifier()
             expectChar('=')
             assignments += Assignment(col, parseExpr())
         } while (matchChar(','))
@@ -325,20 +400,7 @@ internal class RecursiveDescentSqlParser : SqlParser {
         return SelectQuery(distinct, projections, table, joins, where, groupBy, orderBy, limit, offset)
     }
 
-    private fun parseOrderExpr(): SqlExpr {
-        if (matchKeyword("SIMILARITY")) {
-            expectChar('(')
-            val col = readIdentifier()
-            expectChar(',')
-            if (peek() != '\'') {
-                throw parseError("similarity text query requires embedding (not yet available)")
-            }
-            val q = readStringLiteral()
-            expectChar(')')
-            return SqlExpr.Similarity(col, q, null)
-        }
-        return parseExpr()
-    }
+    private fun parseOrderExpr(): SqlExpr = parseExpr()
 
     private fun parseOptionalTableAlias(): String? {
         skipWs()
@@ -382,6 +444,9 @@ internal class RecursiveDescentSqlParser : SqlParser {
             id.equals("INNER", ignoreCase = true) ||
             id.equals("JOIN", ignoreCase = true) ||
             id.equals("IN", ignoreCase = true) ||
+            id.equals("LIKE", ignoreCase = true) ||
+            id.equals("ILIKE", ignoreCase = true) ||
+            id.equals("WITH", ignoreCase = true) ||
             id.equals("HAVING", ignoreCase = true)
 
     private fun parseProjections(): List<SelectProjection> {
@@ -403,7 +468,7 @@ internal class RecursiveDescentSqlParser : SqlParser {
                     }
                 expectChar(')')
                 out += SelectProjection.Expression(SqlExpr.FunctionCall("count", listOf(arg)), parseOptionalAlias())
-            } else if (peekKeyword("kdb_json_") || peekKeyword("MATCH")) {
+            } else if (peekKeyword("kdb_json_")) {
                 val expr = parseExpr()
                 val alias = parseOptionalAlias()
                 out += SelectProjection.Expression(expr, alias)
@@ -412,8 +477,8 @@ internal class RecursiveDescentSqlParser : SqlParser {
                 val name = readIdentifier()
                 if (peek() == '.') {
                     expectChar('.')
-                    val field = readIdentifier()
-                    out += SelectProjection.Expression(SqlExpr.QualifiedColumn(name, field), parseOptionalAlias())
+                    val rest = readDottedIdentifier()
+                    out += SelectProjection.Expression(SqlExpr.QualifiedColumn(name, rest), parseOptionalAlias())
                 } else if (peek() == '(') {
                     pos = mark
                     val expr = parseExpr()
@@ -453,21 +518,20 @@ internal class RecursiveDescentSqlParser : SqlParser {
         return left
     }
 
+    /**
+     * `cmp := operand ( ( = | <> | != | < | <= | > | >= ) operand | [NOT] LIKE s | [NOT] ILIKE s
+     * | [NOT] IN (…) | [NOT] BETWEEN a AND b | IS [NOT] NULL )?` (Layer 16 §4).
+     */
     private fun parseComparison(): SqlExpr {
         if (matchKeyword("NOT")) {
             return SqlExpr.Unary(UnaryOp.NOT, parseComparison())
         }
-        if (matchKeyword("MATCH")) {
-            expectChar('(')
-            val col = readIdentifier()
-            expectChar(',')
-            val q = readStringLiteral()
-            expectChar(')')
-            return SqlExpr.Match(col, q)
-        }
-        var left = parsePrimary()
+        val left = parsePrimary()
         skipWs()
-        if (left is SqlExpr.ColumnRef && matchKeyword("IN")) {
+        val negated = matchKeyword("NOT")
+        val columnPath = columnPathOf(left)
+        if (matchKeyword("IN")) {
+            if (columnPath == null) throw parseError("IN requires a column on the left")
             expectChar('(')
             if (matchKeyword("SELECT")) {
                 throw parseError("subquery IN is not supported in v1")
@@ -477,14 +541,22 @@ internal class RecursiveDescentSqlParser : SqlParser {
                 values += parseExpr()
             } while (matchChar(','))
             expectChar(')')
-            return SqlExpr.InList(left.name, values)
+            return SqlExpr.InList(columnPath, values, negated)
         }
-        if (left is SqlExpr.ColumnRef && matchKeyword("BETWEEN")) {
+        if (matchKeyword("BETWEEN")) {
+            if (columnPath == null) throw parseError("BETWEEN requires a column on the left")
             val low = parsePrimary()
             expectKeyword("AND")
             val high = parsePrimary()
-            return SqlExpr.Between(left.name, low, high)
+            return SqlExpr.Between(columnPath, low, high, negated)
         }
+        if (matchKeyword("LIKE")) {
+            return SqlExpr.Binary(if (negated) BinaryOp.NOT_LIKE else BinaryOp.LIKE, left, parsePrimary())
+        }
+        if (matchKeyword("ILIKE")) {
+            return SqlExpr.Binary(if (negated) BinaryOp.NOT_ILIKE else BinaryOp.ILIKE, left, parsePrimary())
+        }
+        if (negated) throw parseError("expected LIKE, ILIKE, IN, or BETWEEN after NOT")
         if (matchKeyword("IS")) {
             if (matchKeyword("NOT")) {
                 expectKeyword("NULL")
@@ -501,12 +573,19 @@ internal class RecursiveDescentSqlParser : SqlParser {
                 matchOp(">=") -> BinaryOp.GE
                 matchOp("<") -> BinaryOp.LT
                 matchOp(">") -> BinaryOp.GT
-                matchKeyword("LIKE") -> BinaryOp.LIKE
                 else -> return left
             }
         val right = parsePrimary()
         return SqlExpr.Binary(op, left, right)
     }
+
+    /** The dotted path of a column operand (`a` or `t.a.b`), or null for any other expression. */
+    private fun columnPathOf(expr: SqlExpr): String? =
+        when (expr) {
+            is SqlExpr.ColumnRef -> expr.name
+            is SqlExpr.QualifiedColumn -> "${expr.qualifier}.${expr.name}"
+            else -> null
+        }
 
     private fun parsePrimary(): SqlExpr {
         skipWs()
@@ -516,32 +595,40 @@ internal class RecursiveDescentSqlParser : SqlParser {
                 consume()
                 return SqlExpr.Parameter(nextParamIndex++)
             }
-            peek().isDigit() -> {
-                val num = readNumber()
-                return if (num.contains('.')) {
-                    SqlExpr.Literal(SqlCell.DoubleVal(num.toDouble()))
-                } else {
-                    SqlExpr.Literal(SqlCell.LongVal(num.toLong()))
-                }
-            }
+            peek().isDigit() || (peek() == '-' && peekAt(1).isDigit()) -> return SqlExpr.Literal(numberLiteral(readNumber()))
+            peek() == '[' -> return parseVectorLiteral()
             matchKeyword("NULL") -> return SqlExpr.Literal(SqlCell.Null)
+            matchKeyword("TRUE") -> return SqlExpr.Literal(SqlCell.BoolVal(true))
+            matchKeyword("FALSE") -> return SqlExpr.Literal(SqlCell.BoolVal(false))
             peek().isLetter() || peek() == '_' -> {
                 val name = readIdentifier()
-                if (peek() == '.') {
-                    expectChar('.')
-                    val field = readIdentifier()
-                    return SqlExpr.QualifiedColumn(name, field)
-                }
                 if (peek() == '(') {
+                    when (name.uppercase()) {
+                        "MATCH" -> return parseMatchCall()
+                        "SIMILARITY" -> return parseSimilarityCall()
+                        "FUSE" -> return parseFuseCall()
+                    }
                     expectChar('(')
                     val args = mutableListOf<SqlExpr>()
+                    skipWs()
                     if (peek() != ')') {
                         do {
-                            args += parseExpr()
+                            skipWs()
+                            if (peek() == '*' && name.equals("count", ignoreCase = true)) {
+                                consume()
+                                args += SqlExpr.ColumnRef("*")
+                            } else {
+                                args += parseExpr()
+                            }
                         } while (matchChar(','))
                     }
                     expectChar(')')
                     return SqlExpr.FunctionCall(name.lowercase(), args)
+                }
+                if (peek() == '.') {
+                    expectChar('.')
+                    val rest = readDottedIdentifier()
+                    return SqlExpr.QualifiedColumn(name, rest)
                 }
                 return SqlExpr.ColumnRef(name)
             }
@@ -555,6 +642,81 @@ internal class RecursiveDescentSqlParser : SqlParser {
         }
     }
 
+    /** `MATCH(index_or_field, 'query' | ?)` (Layer 16 §9.1). */
+    private fun parseMatchCall(): SqlExpr {
+        expectChar('(')
+        val target = readDottedIdentifier()
+        expectChar(',')
+        val query = parsePrimary()
+        if (query !is SqlExpr.Parameter && !(query is SqlExpr.Literal && query.cell is SqlCell.StringVal)) {
+            throw parseError("MATCH query must be a string literal or a parameter")
+        }
+        expectChar(')')
+        return SqlExpr.Match(target, query)
+    }
+
+    /** `SIMILARITY(field, ? | [v1, v2, …])` (Layer 16 §9.1). */
+    private fun parseSimilarityCall(): SqlExpr {
+        expectChar('(')
+        val field = readDottedIdentifier()
+        expectChar(',')
+        val vector = parsePrimary()
+        if (vector !is SqlExpr.Parameter && vector !is SqlExpr.VectorLiteral) {
+            throw parseError("SIMILARITY vector must be a parameter or a vector literal")
+        }
+        expectChar(')')
+        return SqlExpr.Similarity(field, vector)
+    }
+
+    /** `FUSE(arm, arm {, arm} [, 'rrf' | 'weighted'])` (Layer 16 §9.1). */
+    private fun parseFuseCall(): SqlExpr {
+        expectChar('(')
+        val arms = mutableListOf<SqlExpr>()
+        var mode = "rrf"
+        do {
+            skipWs()
+            if (peek() == '\'') {
+                mode = readStringLiteral()
+                if (matchChar(',')) throw parseError("FUSE mode must be the last argument")
+                break
+            }
+            val arm = parsePrimary()
+            if (arm !is SqlExpr.Match && arm !is SqlExpr.Similarity) {
+                throw parseError("FUSE arms must be MATCH or SIMILARITY calls")
+            }
+            arms += arm
+        } while (matchChar(','))
+        expectChar(')')
+        if (arms.size < 2) throw parseError("FUSE needs at least two arms")
+        return SqlExpr.Fuse(arms, mode.lowercase())
+    }
+
+    private fun parseVectorLiteral(): SqlExpr {
+        expectChar('[')
+        val values = mutableListOf<Double>()
+        skipWs()
+        if (peek() != ']') {
+            do {
+                skipWs()
+                if (!(peek().isDigit() || (peek() == '-' && peekAt(1).isDigit()))) {
+                    throw parseError("expected number in vector literal")
+                }
+                values += readNumber().toDouble()
+            } while (matchChar(','))
+        }
+        expectChar(']')
+        if (values.isEmpty()) throw parseError("vector literal must not be empty")
+        return SqlExpr.VectorLiteral(values)
+    }
+
+    private fun numberLiteral(text: String): SqlCell {
+        val isDouble = text.any { it == '.' || it == 'e' || it == 'E' }
+        if (!isDouble) {
+            text.toLongOrNull()?.let { return SqlCell.LongVal(it) }
+        }
+        return SqlCell.DoubleVal(text.toDoubleOrNull() ?: throw parseError("malformed number: $text"))
+    }
+
     private fun readStringLiteral(): String {
         expectChar('\'')
         val sb = StringBuilder()
@@ -565,26 +727,52 @@ internal class RecursiveDescentSqlParser : SqlParser {
                     sb.append('\'')
                     pos++
                 } else {
-                    break
+                    return sb.toString()
                 }
             } else {
                 sb.append(c)
             }
         }
-        return sb.toString()
+        throw parseError("unterminated string literal")
     }
 
+    /** `[-]digits[.digits][(e|E)[+-]digits]`; the caller decides integer vs double. */
     private fun readNumber(): String {
         skipWs()
         val start = pos
-        while (pos < input.length && (input[pos].isDigit() || input[pos] == '.')) pos++
+        if (peek() == '-') pos++
+        val intStart = pos
+        while (pos < input.length && input[pos].isDigit()) pos++
+        if (pos == intStart) throw parseError("expected number")
+        if (peek() == '.' && peekAt(1).isDigit()) {
+            pos++
+            while (pos < input.length && input[pos].isDigit()) pos++
+        } else if (peek() == '.') {
+            throw parseError("malformed number")
+        }
+        if (peek() == 'e' || peek() == 'E') {
+            pos++
+            if (peek() == '+' || peek() == '-') pos++
+            val expStart = pos
+            while (pos < input.length && input[pos].isDigit()) pos++
+            if (pos == expStart) throw parseError("malformed exponent")
+        }
         return input.substring(start, pos)
     }
 
     private fun readInt(): Int {
         val n = readNumber()
-        if (n.isEmpty()) throw parseError("expected integer")
-        return n.toInt()
+        return n.toIntOrNull() ?: throw parseError("expected integer, got $n")
+    }
+
+    /** `a` or `a.b.c` — a column path (Layer 16 §2) or a dotted index field. */
+    private fun readDottedIdentifier(): String {
+        val sb = StringBuilder(readIdentifier())
+        while (peek() == '.') {
+            pos++
+            sb.append('.').append(readIdentifier())
+        }
+        return sb.toString()
     }
 
     private fun readIdentifier(): String {
@@ -632,6 +820,8 @@ internal class RecursiveDescentSqlParser : SqlParser {
     }
 
     private fun peek(): Char = if (pos < input.length) input[pos] else '\u0000'
+
+    private fun peekAt(offset: Int): Char = if (pos + offset < input.length) input[pos + offset] else '\u0000'
 
     private fun consume() {
         pos++

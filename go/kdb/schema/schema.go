@@ -15,8 +15,64 @@ type KdbSchema struct {
 	Version     int
 	CreatedAt   codec.Timestamp
 	Description string
+	// UniqueConstraints are the compound (multi-field) unique constraints declared on the
+	// schema (Layer 16, Component 73). Single-field uniqueness is still expressed through
+	// Field.Unique; UniqueTuples merges both views. Encoded as wire field 5 of KdbSchemaBody
+	// with an empty default, so a schema without compound constraints hashes exactly as it
+	// did before the field existed.
+	UniqueConstraints []UniqueConstraint
 
 	fieldsByName map[string]Field
+}
+
+// UniqueConstraint is one compound unique constraint: the ordered tuple of field names whose
+// combined values must be unique across live documents. A document in which any part is
+// absent or JSON null claims nothing (sparse semantics).
+type UniqueConstraint struct {
+	Fields []string
+}
+
+// UniqueTuples returns every unique constraint as an ordered field tuple: one 1-tuple per
+// Field.Unique declaration (in declaration order) followed by the compound constraints.
+func (s KdbSchema) UniqueTuples() [][]string {
+	var out [][]string
+	for _, f := range s.Fields {
+		if f.Unique {
+			out = append(out, []string{f.Name})
+		}
+	}
+	for _, c := range s.UniqueConstraints {
+		out = append(out, append([]string(nil), c.Fields...))
+	}
+	return out
+}
+
+// HasUniqueConstraints reports whether any single-field or compound unique constraint exists.
+func (s KdbSchema) HasUniqueConstraints() bool {
+	return s.HasUniqueFields() || len(s.UniqueConstraints) > 0
+}
+
+func validateUniqueConstraints(fields []Field, constraints []UniqueConstraint) error {
+	names := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		names[f.Name] = struct{}{}
+	}
+	for _, c := range constraints {
+		if len(c.Fields) == 0 {
+			return fmt.Errorf("unique constraint must name at least one field")
+		}
+		seen := make(map[string]struct{}, len(c.Fields))
+		for _, name := range c.Fields {
+			if _, ok := names[name]; !ok {
+				return fmt.Errorf("unique constraint references unknown field: %s", name)
+			}
+			if _, dup := seen[name]; dup {
+				return fmt.Errorf("unique constraint repeats field: %s", name)
+			}
+			seen[name] = struct{}{}
+		}
+	}
+	return nil
 }
 
 var (
@@ -29,7 +85,7 @@ func None() KdbSchema {
 	noneOnce.Do(func() {
 		ts := codec.Timestamp{EpochMillis: 0, MicroRemainder: 0}
 		reg := WireRegistry()
-		body := schemaBodyValue(nil, 0, ts, "")
+		body := schemaBodyValue(nil, nil, 0, ts, "")
 		bytes, err := codec.EncodeBytes(body, BodyWireType(), reg)
 		if err != nil {
 			panic(err)
@@ -80,6 +136,11 @@ func (s KdbSchema) Field(name string) (Field, bool) {
 
 // Build constructs a schema with a content-addressed hash.
 func Build(fields []Field, version int, createdAt codec.Timestamp, description string) (KdbSchema, error) {
+	return BuildWithConstraints(fields, nil, version, createdAt, description)
+}
+
+// BuildWithConstraints is Build plus compound unique constraints (Component 73).
+func BuildWithConstraints(fields []Field, constraints []UniqueConstraint, version int, createdAt codec.Timestamp, description string) (KdbSchema, error) {
 	if version < 1 {
 		return KdbSchema{}, fmt.Errorf("schema version must be >= 1")
 	}
@@ -90,8 +151,11 @@ func Build(fields []Field, version int, createdAt codec.Timestamp, description s
 		}
 		seen[f.Name] = struct{}{}
 	}
+	if err := validateUniqueConstraints(fields, constraints); err != nil {
+		return KdbSchema{}, err
+	}
 	reg := WireRegistry()
-	body := schemaBodyValue(fields, version, createdAt, description)
+	body := schemaBodyValue(fields, constraints, version, createdAt, description)
 	bytes, err := codec.EncodeBytes(body, BodyWireType(), reg)
 	if err != nil {
 		return KdbSchema{}, err
@@ -106,18 +170,30 @@ func Build(fields []Field, version int, createdAt codec.Timestamp, description s
 		byName[f.Name] = f
 	}
 	return KdbSchema{
-		SchemaHash:   h,
-		Fields:       append([]Field(nil), fields...),
-		Version:      version,
-		CreatedAt:    createdAt,
-		Description:  description,
-		fieldsByName: byName,
+		SchemaHash:        h,
+		Fields:            append([]Field(nil), fields...),
+		Version:           version,
+		CreatedAt:         createdAt,
+		Description:       description,
+		UniqueConstraints: cloneConstraints(constraints),
+		fieldsByName:      byName,
 	}, nil
+}
+
+func cloneConstraints(in []UniqueConstraint) []UniqueConstraint {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]UniqueConstraint, len(in))
+	for i, c := range in {
+		out[i] = UniqueConstraint{Fields: append([]string(nil), c.Fields...)}
+	}
+	return out
 }
 
 // ToBytes returns canonical typed-binary encoding.
 func (s KdbSchema) ToBytes() ([]byte, error) {
-	v := schemaBodyValue(s.Fields, s.Version, s.CreatedAt, s.Description)
+	v := schemaBodyValue(s.Fields, s.UniqueConstraints, s.Version, s.CreatedAt, s.Description)
 	return codec.EncodeBytes(v, BodyWireType(), WireRegistry())
 }
 

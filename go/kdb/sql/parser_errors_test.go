@@ -52,10 +52,13 @@ func TestParseRejectsMalformedInputWithoutPanicking(t *testing.T) {
 		{"create table dangling column", "CREATE TABLE t (a VARCHAR, )", `found ")"`},
 		{"create table missing type", "CREATE TABLE t (a)", `found ")"`},
 
-		{"empty statement", "", "expected SELECT, INSERT, or CREATE TABLE"},
-		{"whitespace only", "   \t\n ", "expected SELECT, INSERT, or CREATE TABLE"},
-		{"not a statement", "DROP TABLE players", "expected SELECT, INSERT, or CREATE TABLE"},
-		{"create without table", "CREATE INDEX x", "expected TABLE"},
+		// These four moved when Layer 16 widened the grammar with UPDATE, DELETE, CREATE INDEX
+		// and DROP INDEX. Each input is still rejected; only the message changed, because the
+		// parser now gets further before it runs out of statement it understands.
+		{"empty statement", "", "expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP"},
+		{"whitespace only", "   \t\n ", "expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP"},
+		{"drop table is not supported", "DROP TABLE players", "expected INDEX"},
+		{"create index without ON", "CREATE INDEX x", "expected ON"},
 
 		// The two silently-discarded strconv errors: readNumber accepts these, strconv does
 		// not, and the value used to become 0 rather than an error.

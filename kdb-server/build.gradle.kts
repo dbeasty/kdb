@@ -12,6 +12,8 @@ dependencies {
     implementation(project(":kdb-embed"))
     implementation(project(":kdb-error"))
     implementation(project(":kdb-hybrid-query"))
+    implementation(project(":kdb-index"))
+    implementation(project(":kdb-json"))
     implementation(project(":kdb-namespace-policy"))
     implementation(project(":kdb-schema"))
     implementation(project(":kdb-sql"))

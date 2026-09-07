@@ -29,6 +29,56 @@ internal data class WirePayloadEnvelope(
     val documentGetResult: DocumentGetResultDto? = null,
     val upsert: UpsertDto? = null,
     val upsertResult: UpsertResultDto? = null,
+    val search: SearchDto? = null,
+    val searchResult: SearchResultDto? = null,
+)
+
+// Layer 16 Component 69 - shapes follow the §11 body table (camelCase, optional fields omitted).
+@Serializable
+internal data class SearchTextArmDto(
+    val index: String,
+    val query: String,
+    val depth: Int? = null,
+    val minScore: Float? = null,
+    val weight: Double? = null,
+)
+
+@Serializable
+internal data class SearchVectorArmDto(
+    val index: String,
+    val vector: List<Double>,
+    val depth: Int? = null,
+    val minScore: Float? = null,
+    val weight: Double? = null,
+)
+
+@Serializable
+internal data class SearchDto(
+    val namespace: String,
+    val sessionId: String? = null,
+    val text: SearchTextArmDto? = null,
+    val vector: SearchVectorArmDto? = null,
+    val fusion: String? = null,
+    val limit: Int,
+    val includeJson: Boolean = false,
+    val atCommitHex: String? = null,
+)
+
+@Serializable
+internal data class SearchHitDto(
+    val docId: String,
+    val score: Float,
+    val json: String? = null,
+)
+
+@Serializable
+internal data class SearchResultDto(
+    val namespace: String,
+    val hits: List<SearchHitDto> = emptyList(),
+    val resolvedCommitHex: String,
+    val error: String? = null,
+    val errorCode: String? = null,
+    val retryAfterMs: Int? = null,
 )
 
 // Component 40 direct-document ops - shapes mirror go/kdb/wire/document_ops.go's DTOs exactly.
@@ -215,6 +265,8 @@ internal data class SqlResultDto(
     val readOnly: Boolean = true,
     val error: String? = null,
     val generatedIds: List<String> = emptyList(),
+    val errorCode: String? = null,
+    val retryAfterMs: Int? = null,
 )
 
 @Serializable

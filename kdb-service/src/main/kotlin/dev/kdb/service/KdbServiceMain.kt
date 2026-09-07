@@ -29,8 +29,10 @@ import dev.kdb.peersync.PeerHostConfig
 import dev.kdb.peersync.peerSyncHostFactory
 import dev.kdb.server.KdbServerRuntime
 import dev.kdb.transport.ws.defaultWebSocketWireTransport
+import dev.kdb.policy.DocumentExpiryPolicy
 import dev.kdb.schema.KdbSchema
 import dev.kdb.wire.defaultWireCodec
+import kotlin.time.Duration
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.nio.file.Path
@@ -40,6 +42,15 @@ public fun main(args: Array<String>) {
     val runtime = openRuntime(config)
     val wire = defaultWireCodec()
     val serverRuntime = KdbServerRuntime(runtime)
+    // Layer 16 §9.5: --expire-* installs a documentExpiry policy on the served namespace; start()
+    // rebuilds the unique-key registry (§9.6) and launches the expiry sweeper when configured.
+    runBlocking {
+        config.expiry?.let { expiry ->
+            val current = runtime.policyRegistry.get(config.namespace)
+            runtime.policyRegistry.put(current.copy(namespaceId = config.namespace, documentExpiry = expiry))
+        }
+        serverRuntime.start(config.namespace)
+    }
     val product = config.productConfig
     // Registry auth (--auth-registry) takes precedence over --auth-config: it's the durable,
     // runtime-editable user/role store (docs/kdb-rbac-plan.md phases 2-4), backed by the same
@@ -211,8 +222,18 @@ internal data class ServiceConfig(
     /** --auth-registry: use a [dev.kdb.auth.store.RegistryAuthStore] (runtime-editable
      * users/roles, see docs/kdb-rbac-plan.md) instead of the static --auth-config file. */
     val authRegistry: Boolean = false,
+    /** Layer 16 §9.5: `--expire-field <path>` [`--expire-grace <duration>`] [`--expire-interval <duration>`]. */
+    val expiry: DocumentExpiryPolicy? = null,
 ) {
     companion object {
+        /** Accepts Go-style `30s`/`5m`/`1h30m`, ISO-8601 `PT30S`, or a bare number of milliseconds. */
+        internal fun parseDurationMillis(flag: String, raw: String?): Long {
+            require(!raw.isNullOrBlank()) { "$flag requires a duration" }
+            raw.toLongOrNull()?.let { return it }
+            val d = runCatching { Duration.parse(raw) }.getOrElse { error("$flag: invalid duration '$raw'") }
+            return d.inWholeMilliseconds
+        }
+
         fun parse(args: Array<String>): ServiceConfig {
             var dataDir: String? = null
             var memory = false
@@ -228,6 +249,9 @@ internal data class ServiceConfig(
             var tlsKeyStore: String? = null
             var tlsTrustStore: String? = null
             var tlsRequireClientAuth: Boolean? = null
+            var expireField: String? = null
+            var expireGraceMillis = 0L
+            var expireIntervalMillis = 60_000L
             var i = 0
             while (i < args.size) {
                 when (args[i]) {
@@ -246,6 +270,9 @@ internal data class ServiceConfig(
                     "--tls-key-store" -> tlsKeyStore = args.getOrNull(++i)
                     "--tls-trust-store" -> tlsTrustStore = args.getOrNull(++i)
                     "--tls-require-client-auth" -> tlsRequireClientAuth = true
+                    "--expire-field" -> expireField = args.getOrNull(++i) ?: error("--expire-field requires a path")
+                    "--expire-grace" -> expireGraceMillis = parseDurationMillis("--expire-grace", args.getOrNull(++i))
+                    "--expire-interval" -> expireIntervalMillis = parseDurationMillis("--expire-interval", args.getOrNull(++i))
                     "--auth" -> {
                         when (args.getOrNull(++i)) {
                             "none" -> authConfigPath = null
@@ -276,7 +303,13 @@ internal data class ServiceConfig(
                     tlsTrustStorePathOverride = tlsTrustStore,
                     tlsRequireClientAuthOverride = tlsRequireClientAuth,
                 )
-            return ServiceConfig(dataDir, namespace, KdbSchema.NONE, productConfig, authRegistry)
+            val expiry =
+                expireField?.let {
+                    require(it.isNotBlank()) { "--expire-field must not be blank" }
+                    require(expireIntervalMillis > 0) { "--expire-interval must be > 0" }
+                    DocumentExpiryPolicy(it, expireGraceMillis, expireIntervalMillis)
+                }
+            return ServiceConfig(dataDir, namespace, KdbSchema.NONE, productConfig, authRegistry, expiry)
         }
     }
 }

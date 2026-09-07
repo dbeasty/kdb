@@ -1,0 +1,19 @@
+{
+  "namespace": "6f5b9a1c-2d3e-4f70-8a9b-1c2d3e4f5a6b",
+  "algorithm": "uuid8(sha256(namespaceBytes || utf8(id))): first 16 digest bytes, byte6 = (byte6 & 0x0f) | 0x80, byte8 = (byte8 & 0x3f) | 0x80",
+  "vectors": [
+    {"id": "order-1", "uuid": "54d100db-b8d0-8b38-8755-264670b3fc47"},
+    {"id": "a", "uuid": "84994230-081b-8414-9065-14f4f0cf226e"},
+    {"id": "hello world", "uuid": "9a539ef2-89c8-8c13-ad83-8a44424f7dda"},
+    {"id": "user:42", "uuid": "90ff6416-7b03-8f19-ab16-3d8167ec2cc6"},
+    {"id": "507f1f77bcf86cd799439011", "uuid": "0d1e2439-fbff-8391-845e-5bb63ef7e6b5"},
+    {"id": "Ünïcödé", "uuid": "2faa54b4-91c2-80cb-a16c-3b9f7f01431f"},
+    {"id": "日本語テキスト", "uuid": "18a35407-4e5f-83ff-9421-66d96363d501"},
+    {"id": "emoji 🚀", "uuid": "1719cecc-b441-8314-9582-fb3080b08e50"},
+    {"id": "12345678-1234-4123-8123-12345678901Z", "uuid": "dd7c3151-db95-890a-add3-8405c4a3b209"},
+    {"id": "not-a-uuid-but-32-hex-chars-longg", "uuid": "d5b9c948-8700-86ca-aa15-70943b61fd2a"},
+    {"id": "with\ttab\nnewline", "uuid": "c33dfd02-9c8c-818d-91fb-0e08564b3613"},
+    {"id": " leading-space", "uuid": "2b41c2d3-8aad-8994-9f55-c09c07752b94"},
+    {"id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "uuid": "8f367b7e-1545-8863-a6fa-b267e3ba21b8"}
+  ]
+}

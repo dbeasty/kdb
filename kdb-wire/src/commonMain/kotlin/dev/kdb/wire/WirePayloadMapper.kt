@@ -226,6 +226,38 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         readOnly = readOnly,
                         error = error,
                         generatedIds = generatedIds,
+                        errorCode = errorCode,
+                        retryAfterMs = retryAfterMs,
+                    ),
+            )
+
+        is WireMessage.Search ->
+            WirePayloadEnvelope(
+                kind = "search",
+                search =
+                    SearchDto(
+                        namespace = namespace,
+                        sessionId = sessionId,
+                        text = text?.let { SearchTextArmDto(it.index, it.query, it.depth, it.minScore, it.weight) },
+                        vector = vector?.let { SearchVectorArmDto(it.index, it.vector, it.depth, it.minScore, it.weight) },
+                        fusion = fusion,
+                        limit = limit,
+                        includeJson = includeJson,
+                        atCommitHex = atCommitHex,
+                    ),
+            )
+
+        is WireMessage.SearchResult ->
+            WirePayloadEnvelope(
+                kind = "searchResult",
+                searchResult =
+                    SearchResultDto(
+                        namespace = namespace,
+                        hits = hits.map { SearchHitDto(it.docId, it.score, it.json) },
+                        resolvedCommitHex = resolvedCommitHex,
+                        error = error,
+                        errorCode = errorCode,
+                        retryAfterMs = retryAfterMs,
                     ),
             )
 
@@ -480,6 +512,36 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                 s.readOnly,
                 s.error,
                 s.generatedIds,
+                s.errorCode,
+                s.retryAfterMs,
+            )
+        }
+
+        "search" -> {
+            val d = search ?: throw WireDecodeException("missing search body")
+            WireMessage.Search(
+                header,
+                namespace = d.namespace,
+                sessionId = d.sessionId,
+                text = d.text?.let { WireMessage.SearchTextArm(it.index, it.query, it.depth, it.minScore, it.weight) },
+                vector = d.vector?.let { WireMessage.SearchVectorArm(it.index, it.vector, it.depth, it.minScore, it.weight) },
+                fusion = d.fusion,
+                limit = d.limit,
+                includeJson = d.includeJson,
+                atCommitHex = d.atCommitHex,
+            )
+        }
+
+        "searchResult" -> {
+            val d = searchResult ?: throw WireDecodeException("missing searchResult body")
+            WireMessage.SearchResult(
+                header,
+                namespace = d.namespace,
+                hits = d.hits.map { WireMessage.SearchHit(it.docId, it.score, it.json) },
+                resolvedCommitHex = d.resolvedCommitHex,
+                error = d.error,
+                errorCode = d.errorCode,
+                retryAfterMs = d.retryAfterMs,
             )
         }
 

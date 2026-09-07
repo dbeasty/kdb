@@ -67,7 +67,7 @@ public class DefaultBtreeIndexStore(
         query: String,
         atCommit: KdbHash?,
         limit: Int,
-    ): List<KdbUuid> =
+    ): List<RankedResult> =
         throw IndexTypeMismatchException(
             "SEARCH not supported on BTREE",
             descriptor.fieldName,

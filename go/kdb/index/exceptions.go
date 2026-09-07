@@ -1,6 +1,8 @@
 package index
 
 import (
+	"fmt"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 )
@@ -47,4 +49,45 @@ type UniqueViolationError struct {
 	Key           Key
 	ExistingDocID codec.UUID
 	IncomingDocID codec.UUID
+}
+
+// DimensionMismatchError is the VectorDimensionMismatch of Layer 16 §7: a document's vector
+// has the wrong length for its index. It is a schema violation, so the commit path rejects the
+// commit rather than half-applying it.
+type DimensionMismatchError struct {
+	*kdberr.SchemaViolationError
+	FieldName string
+	Expected  int
+	Actual    int
+}
+
+func NewDimensionMismatchError(field string, expected, actual int) *DimensionMismatchError {
+	msg := fmt.Sprintf("VectorDimensionMismatch: field %s expects %d dimensions, got %d", field, expected, actual)
+	return &DimensionMismatchError{
+		SchemaViolationError: kdberr.NewSchemaViolationError(msg, []kdberr.FieldViolation{{
+			FieldName:     field,
+			ViolationType: kdberr.TypeMismatch,
+			Detail:        msg,
+		}}),
+		FieldName: field,
+		Expected:  expected,
+		Actual:    actual,
+	}
+}
+
+// NewUniqueViolationError reports a unique index conflict between two documents.
+func NewUniqueViolationError(ns, field string, key Key, existing, incoming codec.UUID) *UniqueViolationError {
+	msg := fmt.Sprintf("unique index violation on %s: documents %s and %s share key %s", field, existing, incoming, KeyString(key))
+	return &UniqueViolationError{
+		SchemaViolationError: kdberr.NewSchemaViolationError(msg, []kdberr.FieldViolation{{
+			FieldName:     field,
+			ViolationType: kdberr.UniqueConstraint,
+			Detail:        msg,
+		}}),
+		NamespaceID:   ns,
+		FieldName:     field,
+		Key:           key,
+		ExistingDocID: existing,
+		IncomingDocID: incoming,
+	}
 }

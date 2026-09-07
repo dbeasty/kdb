@@ -1,0 +1,177 @@
+[
+  {
+    "text": "The quick brown fox jumps over the lazy dog",
+    "tokens": [
+      "quick",
+      "brown",
+      "fox",
+      "jump",
+      "over",
+      "lazi",
+      "dog"
+    ]
+  },
+  {
+    "text": "Deploy staging environment",
+    "tokens": [
+      "deploi",
+      "stage",
+      "environ"
+    ]
+  },
+  {
+    "text": "Users cannot log in after the password reset flow changed",
+    "tokens": [
+      "user",
+      "cannot",
+      "log",
+      "after",
+      "password",
+      "reset",
+      "flow",
+      "chang"
+    ]
+  },
+  {
+    "text": "  multiple   spaces\tand\nnewlines ",
+    "tokens": [
+      "multipl",
+      "space",
+      "newlin"
+    ]
+  },
+  {
+    "text": "Hyphenated-words and under_scores split",
+    "tokens": [
+      "hyphen",
+      "word",
+      "under",
+      "score",
+      "split"
+    ]
+  },
+  {
+    "text": "version 2.4 released 2024-09-05",
+    "tokens": [
+      "version",
+      "2",
+      "4",
+      "releas",
+      "2024",
+      "09",
+      "05"
+    ]
+  },
+  {
+    "text": "ALL CAPS SHOUTING",
+    "tokens": [
+      "all",
+      "cap",
+      "shout"
+    ]
+  },
+  {
+    "text": "Ünïcödé naïve café résumé",
+    "tokens": [
+      "ünïcödé",
+      "naïve",
+      "café",
+      "résumé"
+    ]
+  },
+  {
+    "text": "日本語 テキスト and English words",
+    "tokens": [
+      "日本語",
+      "テキスト",
+      "english",
+      "word"
+    ]
+  },
+  {
+    "text": "",
+    "tokens": []
+  },
+  {
+    "text": "the and of to",
+    "tokens": []
+  },
+  {
+    "text": "mp3s utf8s x86",
+    "tokens": [
+      "mp3",
+      "utf8",
+      "x86"
+    ]
+  },
+  {
+    "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa short bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tokens": [
+      "short",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ]
+  },
+  {
+    "text": "email@example.com sent at 10:30am",
+    "tokens": [
+      "email",
+      "exampl",
+      "com",
+      "sent",
+      "10",
+      "30am"
+    ]
+  },
+  {
+    "text": "it's not a bug, it's a feature!",
+    "tokens": [
+      "s",
+      "bug",
+      "s",
+      "featur"
+    ]
+  },
+  {
+    "text": "Tags: deploy, ops; staging/production",
+    "tokens": [
+      "tag",
+      "deploi",
+      "op",
+      "stage",
+      "product"
+    ]
+  },
+  {
+    "text": "the deploy of the staging",
+    "tokens": [
+      "deploi",
+      "stage"
+    ]
+  },
+  {
+    "text": "Relational conditional rational operators",
+    "tokens": [
+      "relat",
+      "condit",
+      "ration",
+      "oper"
+    ]
+  },
+  {
+    "text": "hopping hoped hopes hopefully",
+    "tokens": [
+      "hop",
+      "hope",
+      "hope",
+      "hopefulli"
+    ]
+  },
+  {
+    "text": "CamelCaseWords are one token",
+    "tokens": [
+      "camelcaseword",
+      "on",
+      "token"
+    ]
+  }
+]

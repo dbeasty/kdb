@@ -57,7 +57,7 @@ class SqlWirePipeliningIntegrationTest {
                                 ns,
                                 session.sessionId,
                                 100 + i,
-                                "INSERT INTO users (_doc) VALUES ('{\"userId\":\"u$i\"}')",
+                                "INSERT INTO users (userId) VALUES ('u$i')",
                             )
                         }
                     }

@@ -145,7 +145,7 @@ class RbacAdminSqlIntegrationTest {
                 doSqlExec(
                     aliceHost,
                     aliceSession.sessionId,
-                    "INSERT INTO invoices (_doc) VALUES ('{\"invoiceId\":\"i1\"}')",
+                    "INSERT INTO invoices (invoiceId) VALUES ('i1')",
                 )
             assertNull(insert.error)
         }

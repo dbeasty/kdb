@@ -25,6 +25,15 @@ public class CliRuntime(
     private val lockLease: DataDirectoryLockLease,
 ) : AutoCloseable {
     override fun close() {
+        // Layer 16 §6.5: flush index snapshots before releasing the directory, so the next open
+        // restores them instead of rebuilding every FULLTEXT/VECTOR index by scan.
+        try {
+            kotlinx.coroutines.runBlocking {
+                embedded.indexManager.registryFor(namespaceId).flushAll()
+            }
+        } catch (_: Exception) {
+            // A failed flush costs a rebuild on the next open; it must not fail the command.
+        }
         lockLease.close()
     }
 

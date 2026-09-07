@@ -5,7 +5,8 @@ import dev.kdb.json.JsonValue
 /**
  * JSON wire form for prepared-statement parameters (network JDBC / SQL server).
  *
- * Each element: `{"t":"s|i|d|b|n","v":...}` (`v` omitted for null).
+ * Each element: `{"t":"s|i|d|b|n|v","v":...}` (`v` omitted for null; a JSON number array for
+ * the vector type `v`, Layer 16 §9.1).
  */
 public fun encodeSqlParameters(parameters: List<SqlParameter>): String? {
     if (parameters.isEmpty()) return null
@@ -38,6 +39,10 @@ private fun SqlParameter.toWireJson(): JsonValue {
         is SqlParameter.BoolParam -> {
             fields["t"] = JsonValue.JString("b")
             fields["v"] = JsonValue.JBool(value)
+        }
+        is SqlParameter.VectorParam -> {
+            fields["t"] = JsonValue.JString("v")
+            fields["v"] = JsonValue.JArray(asFloatArray().map { JsonValue.JNumber(it.toDouble()) })
         }
     }
     return JsonValue.JObject(fields)
@@ -74,6 +79,18 @@ private fun wireJsonToParameter(element: JsonValue): SqlParameter {
                 (obj.fields["v"] as? JsonValue.JBool)?.value
                     ?: throw SqlPlanningException("bool parameter missing value", ""),
             )
+        "v" -> {
+            val arr = obj.fields["v"] as? JsonValue.JArray ?: throw SqlPlanningException("vector parameter missing value", "")
+            val values =
+                FloatArray(arr.elements.size) { i ->
+                    when (val e = arr.elements[i]) {
+                        is JsonValue.JNumber -> e.value.toFloat()
+                        is JsonValue.JInt -> e.value.toFloat()
+                        else -> throw SqlPlanningException("vector parameter element $i is not a number", "")
+                    }
+                }
+            SqlParameter.VectorParam(values)
+        }
         else -> throw SqlPlanningException("unknown parameter type: $type", "")
     }
 }

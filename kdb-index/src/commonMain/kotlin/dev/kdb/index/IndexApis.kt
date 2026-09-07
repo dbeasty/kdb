@@ -51,6 +51,34 @@ public interface IndexRegistry {
         namespaceId: String,
         sqlIndexName: String,
     ): Boolean
+
+    /** The store registered under a `CREATE INDEX` name, or null. */
+    public fun getBySqlName(sqlIndexName: String): IndexStore?
+
+    /** Every live descriptor (with SQL names) as a persistable catalog (Layer 16 §9.2). */
+    public fun catalog(): IndexCatalog
+
+    /**
+     * Recreates the stores described by [catalog] (empty; call [restoreOrRebuild] afterwards).
+     * Entries already registered under the same id are left alone. Returns the descriptors created.
+     */
+    public suspend fun loadCatalog(
+        catalog: IndexCatalog,
+        storeFactory: IndexStoreFactory,
+    ): List<IndexDescriptor>
+
+    /**
+     * For every [DocumentIndexStore]: restore its snapshot, rebuilding from a scan at the DAG head
+     * when the snapshot is missing or stale (§6.5, §10). HASH/BTREE stores are not touched — they
+     * are rebuilt from the schema by [IndexWriter.rebuildAll].
+     */
+    public suspend fun restoreOrRebuild(
+        dag: CommitDag,
+        storage: StorageAdapter,
+    ): List<IndexRestoreReport>
+
+    /** Flushes every [DocumentIndexStore] snapshot (call on close). */
+    public suspend fun flushAll()
 }
 
 public interface IndexWriter {
@@ -97,7 +125,7 @@ public interface IndexReader {
         query: String,
         atCommit: KdbHash? = null,
         limit: Int = Int.MAX_VALUE,
-    ): List<KdbUuid>
+    ): List<RankedResult>
 
     public suspend fun lookupVector(
         registry: IndexRegistry,
@@ -123,5 +151,13 @@ public interface IndexManager {
     public suspend fun releaseRegistry(namespaceId: String)
 }
 
-public fun indexManager(storeFactory: IndexStoreFactory): IndexManager =
-    DefaultIndexManager(storeFactory)
+/**
+ * @param blobs where registries persist their catalog and where FULLTEXT/VECTOR stores created
+ * through [storeFactory] should persist their snapshots; null means "never persist" (memory
+ * runtimes). The catalog is saved after every [IndexRegistry.registerSqlIndex],
+ * [IndexRegistry.dropSqlIndex] and [IndexRegistry.syncSchema].
+ */
+public fun indexManager(
+    storeFactory: IndexStoreFactory,
+    blobs: IndexBlobStore? = null,
+): IndexManager = DefaultIndexManager(storeFactory, blobs)

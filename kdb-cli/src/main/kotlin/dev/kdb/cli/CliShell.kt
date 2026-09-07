@@ -154,7 +154,8 @@ private fun printShellHelp() {
     println(
         """
         Shell commands (namespace is ${"fixed at start; use 'use' to switch"}):
-          put <file|json>     write document + commit
+          put <file|json>     write document + commit (body stored byte-exact; a top-level
+                              "id" is the identity, otherwise one is minted and printed)
           file put <path> [--id UUID] [--zip]   store opaque file (metadata + blob)
           file get --id <UUID> [-o path]      fetch file bytes
           file meta --id <UUID>               print kdb.file JSON metadata

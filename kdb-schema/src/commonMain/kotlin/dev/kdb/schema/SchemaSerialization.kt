@@ -5,7 +5,7 @@ import dev.kdb.codec.encodeToBytes
 
 /** Wire projection for hashing / interchange ([Layer 2 §3]). Excludes redundant hash field on disk. */
 public fun KdbSchema.toKdbValue(): KdbValue =
-    schemaBodyToValue(fields, version, createdAt, description)
+    schemaBodyToValue(fields, uniqueConstraints, version, createdAt, description)
 
 public fun KdbSchema.Companion.fromKdbValue(value: KdbValue): KdbSchema {
     val rec = value as? KdbValue.RecordVal ?: throw SchemaDecodeException("schema body: expected record")

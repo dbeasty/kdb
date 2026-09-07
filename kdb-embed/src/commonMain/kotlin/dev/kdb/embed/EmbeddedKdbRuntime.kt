@@ -4,8 +4,13 @@ import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.document.KdbCommit
+import dev.kdb.index.InMemoryIndexBlobStore
+import dev.kdb.index.IndexBlobStore
 import dev.kdb.index.IndexManager
+import dev.kdb.index.IndexStoreFactory
+import dev.kdb.index.compositeIndexStoreFactory
 import dev.kdb.index.productionIndexManager
+import dev.kdb.index.storageAdapterIndexBlobStore
 import dev.kdb.policy.NamespacePolicyRegistry
 import dev.kdb.policy.inMemoryNamespacePolicyRegistry
 import dev.kdb.query.hybrid.HybridQueryEngine
@@ -30,6 +35,17 @@ public class EmbeddedKdbRuntime(
     public val policyRegistry: NamespacePolicyRegistry,
     /** When set, [putJson] commits from this parent instead of [CommitDag.head]. */
     public var writeBaseVersion: KdbHash? = null,
+    /**
+     * The one keyed blob store this runtime's index snapshots and index catalog live in (Layer 16
+     * §6.5/§9.2). It must be the same instance the [indexManager] and [indexStoreFactory] were built
+     * with, or a snapshot written by a store would be invisible to the catalog that reopens it -
+     * which is why it is held here rather than re-derived per caller. A memory runtime passes an
+     * in-memory store; a file runtime passes one whose key→hash pointers are durable.
+     */
+    public val indexBlobs: IndexBlobStore = storageAdapterIndexBlobStore(storage),
+    /** The factory every index-creating path in this runtime must use (schema sync, SQL
+     * `CREATE INDEX`, catalog reload), so every store shares [indexBlobs]. */
+    public val indexStoreFactory: IndexStoreFactory = compositeIndexStoreFactory(dag, storage, blobs = indexBlobs),
 ) {
     // Component 44 (Layer 12): a single hook point every commit path shares -
     // EmbedWrites.commitViaEngine notifies through this after every successful commit,
@@ -74,10 +90,15 @@ public suspend fun openMemoryRuntime(
 ): EmbeddedKdbRuntime {
     val dag = inMemoryCommitDag(namespaceId)
     val storage = InMemoryStorageAdapter()
-    val indexManager = productionIndexManager(dag, storage)
+    // Memory runtimes never persist (§6.5), so the snapshot/catalog store is purely in-memory -
+    // but it is still one shared instance, so a snapshot written by a store is the one the
+    // catalog reload path would read.
+    val blobs: IndexBlobStore = InMemoryIndexBlobStore()
+    val storeFactory = compositeIndexStoreFactory(dag, storage, blobs = blobs)
+    val indexManager = productionIndexManager(dag, storage, blobs = blobs)
     indexManager.bindNamespace(namespaceId, dag)
     val policies = inMemoryNamespacePolicyRegistry()
-    val sql: SqlEngine = sqlEngine(indexManager, storage, dag)
+    val sql: SqlEngine = sqlEngine(indexManager, storage, dag, indexStoreFactory = storeFactory)
     val hybrid = hybridQueryEngine(sql, dag, policies, indexManager, storage)
     val runtime =
         EmbeddedKdbRuntime(
@@ -89,6 +110,8 @@ public suspend fun openMemoryRuntime(
             schema = schema,
             defaultNamespace = namespaceId,
             policyRegistry = policies,
+            indexBlobs = blobs,
+            indexStoreFactory = storeFactory,
         )
     if (!schema.isNone) {
         syncEmbedSchema(runtime, namespaceId, schema)

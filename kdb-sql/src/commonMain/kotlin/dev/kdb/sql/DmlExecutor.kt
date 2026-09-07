@@ -7,14 +7,17 @@ import dev.kdb.document.KdbOp
 import dev.kdb.error.KdbResult
 import dev.kdb.error.SchemaViolationException
 import dev.kdb.json.JsonValue
-import dev.kdb.json.KdbJsonFunctionRegistry
-import dev.kdb.json.kdbJsonGet
 import dev.kdb.json.kdbJsonSet
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.SchemaEngine
 import dev.kdb.schema.isNone
 import dev.kdb.storage.StorageAdapter
 
+/**
+ * `UPDATE` / `INSERT` / `DELETE` → [KdbOp]s (Layer 16 §5). Assignment expressions are evaluated
+ * against the pre-update document; `SET _doc = …` replaces the whole document, any other target
+ * is a JSON-path set (`SET meta.reviewed = true`). The result is validated against the schema.
+ */
 internal class DmlExecutor(
     private val sqlExecutor: SqlExecutor,
     private val storage: StorageAdapter,
@@ -25,7 +28,16 @@ internal class DmlExecutor(
         update: UpdateStatement,
         context: QueryContext,
     ): List<KdbOp> {
-        val targetIds = resolveTargetIds(update.where, context)
+        val env = EvalEnv(context.schema, context.parameters, tableQualifiersOf(update.table))
+        for (assignment in update.assignments) {
+            val target = env.resolvePath(assignment.column)
+            if (target != SqlPredicate.DOC) {
+                if (target == SqlPredicate.KDB_ID) throw SqlPlanningException("cannot assign kdb_id", "")
+                SqlColumnValidation.checkColumn(assignment.column, env, allowAlias = false)
+            }
+            SqlColumnValidation.checkExpr(assignment.expr, env, allowAlias = false)
+        }
+        val targetIds = sqlExecutor.resolveDocIdsForWhere(update.where, update.table, context, planner)
         val atCommit = context.atCommit ?: dag.head()
         val treeHash = dag.getCommitOrThrow(atCommit).documentTreeHash
         val ops = mutableListOf<KdbOp>()
@@ -33,10 +45,13 @@ internal class DmlExecutor(
             val doc = storage.getDocument(context.namespaceId, id, treeHash) ?: continue
             var json = doc.json
             for (assignment in update.assignments) {
+                val target = env.resolvePath(assignment.column)
                 json =
-                    when (assignment.column) {
-                        "_doc" -> evalDocAssignment(assignment.expr, doc, context, json)
-                        else -> patchSchemaField(json, assignment, context)
+                    if (target == SqlPredicate.DOC) {
+                        evalDocAssignment(assignment.expr, doc, env)
+                    } else {
+                        val cell = SqlPredicate.evalCell(assignment.expr, doc, env)
+                        setPath(json, target, SqlPaths.toJson(cell))
                     }
             }
             validateJson(id, json, context.schema)
@@ -50,16 +65,35 @@ internal class DmlExecutor(
         context: QueryContext,
     ): List<KdbOp> {
         val fields = insert.columns
+        val env = EvalEnv(context.schema, context.parameters, tableQualifiersOf(insert.table))
+        for (f in fields) {
+            // kdb_id is minted by the engine and cannot be assigned. _doc CAN be: it supplies the
+            // whole body, which is how a schemaless namespace inserts a document and what the Go
+            // executor does with the same statement - rejecting it here would diverge the trees.
+            if (env.resolvePath(f) == SqlPredicate.KDB_ID) {
+                throw SqlPlanningException("cannot insert into reserved column $f", "")
+            }
+            if (env.resolvePath(f) != SqlPredicate.DOC) {
+                SqlColumnValidation.checkColumn(f, env, allowAlias = false)
+            }
+        }
         val ops = mutableListOf<KdbOp>()
         for (values in insert.rows) {
             if (fields.size != values.size) {
                 throw SqlPlanningException("column count does not match value count", "")
             }
             val id = KdbUuid.random()
+            val blank = KdbDocument(id, "{}")
             var json = "{}"
             for (i in fields.indices) {
-                val cell = evalValueExpr(values[i], null, context) ?: SqlCell.Null
-                json = kdbJsonSet(json, "$.${fields[i]}", cellToJsonValue(cell))
+                val target = env.resolvePath(fields[i])
+                json =
+                    if (target == SqlPredicate.DOC) {
+                        evalDocAssignment(values[i], blank, env)
+                    } else {
+                        val cell = SqlPredicate.evalCell(values[i], blank, env)
+                        setPath(json, target, SqlPaths.toJson(cell))
+                    }
             }
             validateJson(id, json, context.schema)
             ops += KdbOp.Write(id, json)
@@ -71,14 +105,22 @@ internal class DmlExecutor(
         delete: DeleteStatement,
         context: QueryContext,
     ): List<KdbOp> {
-        val targetIds = resolveTargetIds(delete.where, context)
+        val targetIds = sqlExecutor.resolveDocIdsForWhere(delete.where, delete.table, context, planner)
         return targetIds.map { KdbOp.Delete(it) }
     }
 
-    private suspend fun resolveTargetIds(
-        where: SqlExpr?,
-        context: QueryContext,
-    ): List<KdbUuid> = sqlExecutor.resolveDocIdsForWhere(where, context.schema, context, planner)
+    private fun setPath(
+        json: String,
+        path: String,
+        value: JsonValue,
+    ): String =
+        try {
+            kdbJsonSet(json, "$.$path", value)
+        } catch (e: SqlPlanningException) {
+            throw e
+        } catch (e: Exception) {
+            throw SqlPlanningException("cannot set $path: ${e.message}", "")
+        }
 
     private fun validateJson(
         id: KdbUuid,
@@ -101,96 +143,25 @@ internal class DmlExecutor(
         }
     }
 
+    /** `SET _doc = '<json>' | ? | kdb_json_set(_doc, …)` - the value must be a JSON object text. */
     private fun evalDocAssignment(
         expr: SqlExpr,
         doc: KdbDocument,
-        context: QueryContext,
-        currentJson: String,
-    ): String =
-        when (expr) {
-            is SqlExpr.FunctionCall -> evalFunction(expr, doc, context) ?: currentJson
-            is SqlExpr.Literal ->
-                when (val cell = expr.cell) {
-                    is SqlCell.JsonVal -> cell.json
-                    is SqlCell.StringVal -> cell.value
-                    else -> currentJson
-                }
-            // Bound parameter, e.g. `UPDATE ns SET _doc = ? WHERE kdb_id = ?` - the parameterized
-            // form callers must use to avoid building SQL by string concatenation of document
-            // JSON (see Component 32 spec §5.3: kdb.put never string-builds SQL text).
-            is SqlExpr.Parameter ->
-                when (val cell = SqlPredicate.evalCell(expr, doc, context.schema, context.parameters)) {
-                    is SqlCell.JsonVal -> cell.json
-                    is SqlCell.StringVal -> cell.value
-                    else -> currentJson
-                }
-            else -> currentJson
-        }
-
-    private fun patchSchemaField(
-        json: String,
-        assignment: Assignment,
-        context: QueryContext,
+        env: EvalEnv,
     ): String {
-        val cell = evalValueExpr(assignment.expr, null, context) ?: SqlCell.Null
-        return kdbJsonSet(json, "$.${assignment.column}", cellToJsonValue(cell))
-    }
-
-    private fun evalValueExpr(
-        expr: SqlExpr,
-        doc: KdbDocument?,
-        context: QueryContext,
-    ): SqlCell? =
-        when (expr) {
-            is SqlExpr.Literal -> expr.cell
-            is SqlExpr.Parameter ->
-                SqlPredicate.evalCell(
-                    expr,
-                    doc ?: KdbDocument(KdbUuid.random(), "{}"),
-                    context.schema,
-                    context.parameters,
-                )
-            is SqlExpr.FunctionCall ->
-                doc?.let { evalFunction(expr, it, context) }?.let { SqlCell.JsonVal(it) }
-            is SqlExpr.ColumnRef -> doc?.let { SqlPredicate.cellForColumn(expr.name, it, context.schema) }
-            else -> null
-        }
-
-    private fun evalFunction(
-        call: SqlExpr.FunctionCall,
-        doc: KdbDocument,
-        context: QueryContext,
-    ): String? {
-        val desc = KdbJsonFunctionRegistry.get(call.name) ?: return null
-        val jsonArgs =
-            call.args.map { arg ->
-                when (arg) {
-                    is SqlExpr.Literal -> cellToJsonValue(arg.cell)
-                    is SqlExpr.ColumnRef ->
-                        if (arg.name == "_doc") {
-                            JsonValue.JString(doc.json)
-                        } else {
-                            kdbJsonGet(doc.json, "$.${arg.name}")
-                        }
-                    is SqlExpr.Parameter -> {
-                        val cell =
-                            SqlPredicate.evalCell(arg, doc, context.schema, context.parameters)
-                        cellToJsonValue(cell ?: SqlCell.Null)
-                    }
-                    else -> null
-                }
+        val text =
+            when (val cell = SqlPredicate.evalCell(expr, doc, env)) {
+                is SqlCell.JsonVal -> cell.json
+                is SqlCell.StringVal -> cell.value
+                else -> throw SqlPlanningException("SET _doc requires a JSON document value", "")
             }
-        if (jsonArgs.any { it == null }) return null
-        return desc.evaluate(jsonArgs.filterNotNull())?.toJsonString()
+        val parsed =
+            try {
+                JsonValue.fromJsonString(text)
+            } catch (e: Exception) {
+                throw SqlPlanningException("SET _doc value is not valid JSON: ${e.message}", "")
+            }
+        if (parsed !is JsonValue.JObject) throw SqlPlanningException("SET _doc value must be a JSON object", "")
+        return text
     }
-
-    private fun cellToJsonValue(cell: SqlCell): JsonValue =
-        when (cell) {
-            SqlCell.Null -> JsonValue.JNull
-            is SqlCell.StringVal -> JsonValue.JString(cell.value)
-            is SqlCell.LongVal -> JsonValue.JInt(cell.value)
-            is SqlCell.DoubleVal -> JsonValue.JNumber(cell.value)
-            is SqlCell.BoolVal -> JsonValue.JBool(cell.value)
-            is SqlCell.JsonVal -> JsonValue.JString(cell.json)
-        }
 }

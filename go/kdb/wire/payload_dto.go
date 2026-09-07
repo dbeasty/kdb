@@ -73,6 +73,10 @@ type payloadEnvelope struct {
 	LockRenew   *lockRenewDto   `json:"lockRenew,omitempty"`
 	LockRelease *lockReleaseDto `json:"lockRelease,omitempty"`
 	LockResult  *lockResultDto  `json:"lockResult,omitempty"`
+
+	// Search additions (Layer 16, both trees) - see search_ops.go.
+	Search       *searchDto       `json:"search,omitempty"`
+	SearchResult *searchResultDto `json:"searchResult,omitempty"`
 }
 
 type handshakeDto struct {

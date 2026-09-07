@@ -163,21 +163,6 @@ class KdbDocumentModelTest {
         }
     }
 
-    @Test
-    fun ensureIdInJson_injectsWhenMissing() {
-        val id = KdbUuid.fromString("12345678-1234-4123-8123-123456789012")
-        val out = ensureIdInJson("""{"name":"Ada"}""", id)
-        assertTrue(out.contains("\"id\":\"12345678-1234-4123-8123-123456789012\""))
-        assertTrue(out.contains("\"name\":\"Ada\""))
-    }
-
-    @Test
-    fun ensureIdInJson_unchangedWhenPresent() {
-        val id = KdbUuid.fromString("12345678-1234-4123-8123-123456789012")
-        val orig = """{"id":"00000000-0000-0000-0000-000000000001","name":"Ada"}"""
-        assertEquals(orig, ensureIdInJson(orig, id))
-    }
-
     private fun sampleCommit(treeHash: KdbHash): KdbCommit {
         val base =
             KdbCommit(

@@ -44,7 +44,7 @@ class KdbCliTest {
     }
 
     @Test
-    fun put_withoutId_printsDocIdAndInjectsId() {
+    fun put_withoutId_printsDocIdAndStoresTheBodyByteExact() {
         val dir = createTempDirectory("kdb-cli").toString()
         assertEquals(0, KdbCli.run(arrayOf("--data-dir", dir, "init", "app/t")))
         val out =
@@ -64,8 +64,9 @@ class KdbCliTest {
             val head = rt.dag.head()
             val doc = rt.storage.getDocument("app/t", KdbUuid.fromString(docId), head)
             assertNotNull(doc)
-            assertTrue(doc!!.json.contains("\"id\":"))
-            assertTrue(doc.json.contains("\"name\":\"Ada\""))
+            // Layer 16 §9.4: the body round-trips byte-exact - the minted id is reported on stdout
+            // (asserted above) and is NOT injected into the document, which used to be the behaviour.
+            assertEquals("""{"name":"Ada"}""", doc!!.json)
         }
     }
 
@@ -91,6 +92,37 @@ class KdbCliTest {
             }
         val parsed = Json.parseToJsonElement(out.trim()).jsonObject
         assertEquals(docId, parsed["docId"]!!.jsonPrimitive.content)
+    }
+
+    /** Layer 16 §9.4: a natural-key `id` ("order-1") is accepted and becomes the derived document id,
+     * with the body still stored exactly as provided. */
+    @Test
+    fun put_withNaturalKeyId_usesTheDerivedIdAndKeepsTheBodyByteExact() {
+        val dir = createTempDirectory("kdb-cli").toString()
+        assertEquals(0, KdbCli.run(arrayOf("--data-dir", dir, "init", "app/t")))
+        val body = """{"id":"order-1","v":1}"""
+        val out =
+            captureStdout {
+                assertEquals(0, KdbCli.run(arrayOf("--data-dir", dir, "put", "app/t", body)))
+            }
+        val reported = Json.parseToJsonElement(out.trim()).jsonObject["docId"]!!.jsonPrimitive.content
+        assertEquals(dev.kdb.document.derivedDocumentId("order-1").toString(), reported)
+        runBlocking {
+            val rt = openFileRuntime(dir, "app", "app/t")
+            val doc = rt.storage.getDocument("app/t", KdbUuid.fromString(reported), rt.dag.head())
+            assertNotNull(doc)
+            assertEquals(body, doc!!.json)
+        }
+    }
+
+    /** Layer 16 §9.4: a non-string or empty `id` is rejected rather than silently replaced. */
+    @Test
+    fun put_withNonStringOrEmptyId_isRejected() {
+        val dir = createTempDirectory("kdb-cli").toString()
+        assertEquals(0, KdbCli.run(arrayOf("--data-dir", dir, "init", "app/t")))
+        // The CLI turns a KdbException into a non-zero exit rather than a stack trace.
+        assertEquals(1, KdbCli.run(arrayOf("--data-dir", dir, "put", "app/t", """{"id":42}""")))
+        assertEquals(1, KdbCli.run(arrayOf("--data-dir", dir, "put", "app/t", """{"id":""}""")))
     }
 
     @Test

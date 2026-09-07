@@ -4,6 +4,7 @@ public sealed class PolicyValidationError {
     public data class InvalidRetainOrdering(val message: String) : PolicyValidationError()
     public data class SchemaRequired(val field: String) : PolicyValidationError()
     public data class UnsupportedMode(val detail: String) : PolicyValidationError()
+    public data class InvalidExpiry(val detail: String) : PolicyValidationError()
 }
 
 public data class PolicyValidationResult(
@@ -41,6 +42,17 @@ public object DefaultPolicyValidator : PolicyValidator {
                 PolicyValidationError.UnsupportedMode(
                     "APPEND_ONLY namespaces should use conflict=APPEND_ONLY",
                 )
+        }
+        policy.documentExpiry?.let { expiry ->
+            if (expiry.fieldPath.isBlank()) {
+                errors += PolicyValidationError.InvalidExpiry("documentExpiry.fieldPath must not be blank")
+            }
+            if (expiry.graceMillis < 0) {
+                errors += PolicyValidationError.InvalidExpiry("documentExpiry.graceMillis must be >= 0")
+            }
+            if (expiry.sweepIntervalMillis <= 0) {
+                errors += PolicyValidationError.InvalidExpiry("documentExpiry.sweepIntervalMillis must be > 0")
+            }
         }
         return PolicyValidationResult(errors.isEmpty(), errors)
     }

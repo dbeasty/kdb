@@ -4,7 +4,9 @@ import dev.kdb.dag.CommitDag
 import dev.kdb.document.KdbOp
 import dev.kdb.index.IndexManager
 import dev.kdb.index.IndexStoreFactory
+import dev.kdb.index.IndexType
 import dev.kdb.index.compositeIndexStoreFactory
+import dev.kdb.schema.isNone
 import dev.kdb.sql.view.DefaultVirtualViewEngine
 import dev.kdb.sql.view.VirtualViewEngine
 import dev.kdb.sql.view.VirtualViewRegistry
@@ -84,10 +86,22 @@ internal class DefaultSqlEngine(
     private val dmlExecutor = DmlExecutor(executor, storage, dag, planner)
     private val ddlExecutor = DdlExecutor(indexManager, dag, storage, indexStoreFactory)
 
+    /**
+     * Gives the planner the namespace's live index descriptors (Layer 16 §9.3) unless the caller
+     * supplied a catalog. A namespace that is not bound to the index manager planning-wise simply
+     * has no indexes.
+     */
+    private fun withCatalog(context: QueryContext): QueryContext {
+        if (context.indexCatalog != null) return context
+        val catalog = runCatching { registryIndexCatalog(indexManager.registryFor(context.namespaceId)) }.getOrNull()
+        return context.copy(indexCatalog = catalog)
+    }
+
     override suspend fun execute(
         sql: String,
-        context: QueryContext,
+        rawContext: QueryContext,
     ): QueryResult {
+        val context = withCatalog(rawContext)
         val stmt = parser.parse(sql)
         return when (stmt) {
             is SqlStatement.CreateVirtualView -> {
@@ -143,8 +157,9 @@ internal class DefaultSqlEngine(
 
     override suspend fun executeDml(
         sql: String,
-        context: QueryContext,
+        rawContext: QueryContext,
     ): DmlResult {
+        val context = withCatalog(rawContext)
         val stmt = parser.parse(sql)
         val ops =
             when (stmt) {
@@ -160,8 +175,9 @@ internal class DefaultSqlEngine(
 
     override suspend fun explain(
         sql: String,
-        context: QueryContext,
+        rawContext: QueryContext,
     ): ExplainResult {
+        val context = withCatalog(rawContext)
         val stmt = parser.parse(sql)
         val plan =
             when (stmt) {
@@ -179,39 +195,98 @@ internal class DefaultSqlEngine(
         context: QueryContext,
     ): PreparedQuery = DefaultPreparedQuery(this, sql, context, statementParameterCount(parser.parse(sql)))
 
+    /**
+     * `CREATE [UNIQUE] INDEX` (Layer 16 §9.2). HASH/BTREE need one declared schema field;
+     * FULLTEXT takes one or more JSON paths, VECTOR one, and both are allowed on schemaless
+     * namespaces. The descriptor's [dev.kdb.index.IndexDescriptor.options] carry `index_name`,
+     * FULLTEXT `weights` (`f1=3,f2=1`), and the VECTOR `WITH` options so the store factory can
+     * configure the index.
+     */
     private suspend fun executeCreateIndex(
         ddl: CreateIndexStatement,
         context: QueryContext,
     ) {
-        if (ddl.fields.size != 1) {
-            throw SqlPlanningException("v1 CREATE INDEX supports single field only", ddl.indexName)
+        val sql = ddl.indexName
+        if (ddl.fields.isEmpty()) throw SqlPlanningException("CREATE INDEX needs at least one field", sql)
+        val options = LinkedHashMap<String, String>()
+        options[INDEX_OPTION_NAME] = ddl.indexName
+        when (ddl.type) {
+            IndexType.HASH, IndexType.BTREE -> {
+                if (ddl.fields.size != 1) {
+                    throw SqlPlanningException("${ddl.type} indexes support a single field", sql)
+                }
+                if (ddl.options.isNotEmpty()) throw SqlPlanningException("${ddl.type} indexes take no WITH options", sql)
+                val fieldName = ddl.fields.single()
+                if (context.schema.isNone || fieldName !in context.schema.fieldsByName) {
+                    throw SqlPlanningException("unknown schema field: $fieldName", sql)
+                }
+            }
+            IndexType.FULLTEXT -> {
+                if (ddl.options.isNotEmpty()) throw SqlPlanningException("FULLTEXT indexes take no WITH options", sql)
+                ddl.fields.forEach { requireRootField(it, context, sql) }
+                options[INDEX_OPTION_WEIGHTS] = ddl.fields.joinToString(",") { "$it=${ddl.weights[it] ?: 1}" }
+            }
+            IndexType.VECTOR -> {
+                if (ddl.fields.size != 1) throw SqlPlanningException("VECTOR indexes support a single field", sql)
+                requireRootField(ddl.fields.single(), context, sql)
+                val allowed = setOf("dimensions", "metric", "m", "ef_construction", "ef_search")
+                for ((k, v) in ddl.options) {
+                    if (k !in allowed) throw SqlPlanningException("unknown VECTOR index option: $k", sql)
+                    if (k == "metric") {
+                        if (v.lowercase() !in setOf("cosine", "l2", "inner_product")) {
+                            throw SqlPlanningException("unknown vector metric: $v", sql)
+                        }
+                        options[k] = v.lowercase()
+                    } else {
+                        val n = v.toIntOrNull()
+                        if (n == null || n <= 0) throw SqlPlanningException("VECTOR option $k must be a positive integer", sql)
+                        options[k] = n.toString()
+                    }
+                }
+                if ("dimensions" !in options) throw SqlPlanningException("VECTOR index requires WITH (dimensions = n)", sql)
+            }
         }
-        val fieldName = ddl.fields.single()
-        val field =
-            context.schema.fieldsByName[fieldName]
-                ?: throw SqlPlanningException("unknown schema field: $fieldName", ddl.indexName)
+        if (ddl.unique && ddl.type != IndexType.HASH && ddl.type != IndexType.BTREE) {
+            throw SqlPlanningException("UNIQUE is only valid for HASH/BTREE indexes", sql)
+        }
         val head = dag.head()
         val descriptor =
             dev.kdb.index.IndexDescriptor(
                 indexId = dev.kdb.codec.KdbUuid.random(),
                 namespaceId = context.namespaceId,
-                fieldName = fieldName,
+                fieldName = ddl.fields.first(),
                 fields = ddl.fields,
                 type = ddl.type,
                 unique = ddl.unique,
                 schemaVersion = context.schema.version,
                 createdAtHash = head,
+                options = options,
             )
         val registry = indexManager.registryFor(context.namespaceId)
-        registry.registerSqlIndex(
-            descriptor,
-            indexStoreFactory,
-            dag,
-            storage,
-            context.schema,
-            ddl.indexName,
-            rebuild = true,
-        )
+        try {
+            registry.registerSqlIndex(
+                descriptor,
+                indexStoreFactory,
+                dag,
+                storage,
+                context.schema,
+                ddl.indexName,
+                rebuild = true,
+            )
+        } catch (e: IllegalArgumentException) {
+            throw SqlPlanningException(e.message ?: "cannot create index", sql)
+        }
+    }
+
+    /** With a declared schema the root of an indexed JSON path must be a schema field (Rule 1). */
+    private fun requireRootField(
+        path: String,
+        context: QueryContext,
+        sql: String,
+    ) {
+        if (context.schema.isNone) return
+        val root = path.substringBefore('.')
+        if (root !in context.schema.fieldsByName) throw SqlPlanningException("unknown schema field: $root", sql)
     }
 
     private suspend fun executeDropIndex(
