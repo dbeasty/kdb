@@ -15,10 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
+	"github.com/limidus/kdb/go/kdb/wire"
 )
 
 // websocketGUID is RFC 6455's fixed handshake magic value.
@@ -29,14 +31,22 @@ type Transport interface {
 	stream.Transport
 	ConnectWithOptions(uri string, options core.TransportConnectOptions) (stream.ConnectionHandle, error)
 	Listen(ctx context.Context, uri string, options core.TransportConnectOptions, handler func(stream.ConnectionHandle)) error
+	// ListenBound binds the listening socket and returns it without serving, so a caller can
+	// learn the actual address before anything is accepted - which is what makes a ":0" test
+	// listener usable, and mirrors tcp.Transport's identically-named method.
+	ListenBound(uri string, options core.TransportConnectOptions) (net.Listener, error)
+	// Serve runs the accept loop over an already-bound listener, upgrading each connection and
+	// handing the result to handler.
+	Serve(ctx context.Context, ln net.Listener, options core.TransportConnectOptions, handler func(stream.ConnectionHandle)) error
 }
 
 type defaultTransport struct {
 	options core.TransportConnectOptions
 }
 
-// NewTransport returns a WebSocket wire transport (client-side; Listen remains unimplemented -
-// this repo's WebSocket server side is JVM-only, see kdb-transport-ws).
+// NewTransport returns a WebSocket wire transport, both halves: ConnectWithOptions dials and
+// Listen/Serve accept. The two share this file's handshake helpers deliberately, so the client
+// and server sides of the upgrade cannot drift apart unnoticed.
 func NewTransport(options core.TransportConnectOptions) Transport {
 	if options.MaxFrameBytes == 0 {
 		options = core.DefaultConnectOptions()
@@ -116,23 +126,237 @@ func tlsClientHandshake(rawConn net.Conn, cfg *tls.Config) (net.Conn, error) {
 	return tlsConn, nil
 }
 
+// Listen binds uri and serves WebSocket connections until ctx is cancelled.
 func (t *defaultTransport) Listen(ctx context.Context, uri string, options core.TransportConnectOptions, handler func(stream.ConnectionHandle)) error {
-	parsed, err := ParseURI(uri)
+	ln, err := t.ListenBound(uri, options)
 	if err != nil {
 		return err
 	}
-	_ = handler
-	srv := &http.Server{
-		Addr: netJoin(parsed.Host, parsed.Port),
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "websocket upgrade not implemented", http.StatusNotImplemented)
-		}),
+	return t.Serve(ctx, ln, options, handler)
+}
+
+// ListenBound binds the listening socket for uri, wrapping it in TLS for wss://.
+func (t *defaultTransport) ListenBound(uri string, options core.TransportConnectOptions) (net.Listener, error) {
+	parsed, err := ParseURI(uri)
+	if err != nil {
+		return nil, err
+	}
+	if options.MaxFrameBytes == 0 {
+		options = core.DefaultConnectOptions()
+	}
+	ln, err := net.Listen("tcp", netJoin(parsed.Host, parsed.Port))
+	if err != nil {
+		return nil, err
+	}
+	if !parsed.Secure {
+		return ln, nil
+	}
+	cfg, err := options.TLS.BuildTLSConfig(true)
+	if err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
+	if cfg == nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("kdb: wss:// listen requires TLS settings (enabled, with CertFile/KeyFile) - refusing to fall back to plaintext: %s", uri)
+	}
+	return tls.NewListener(ln, cfg), nil
+}
+
+// Serve accepts connections on ln, performs the RFC 6455 server handshake on each, and hands
+// every successfully upgraded connection to handler on its own goroutine.
+//
+// The upgrade is done by hand rather than through net/http's Hijacker for one reason: this
+// package already contains the client half of exactly the same hand-rolled handshake, and the
+// JVM server it has to interoperate with (JvmNetworkWebSocketServer.acceptWebSocket) is written
+// the same way. Sharing one readHTTPHeaders/websocketAccept pair between the two halves keeps
+// the two sides of the handshake provably symmetric - a mismatch shows up as a failing test in
+// this package rather than as a browser-only bug nothing here can reproduce.
+func (t *defaultTransport) Serve(ctx context.Context, ln net.Listener, options core.TransportConnectOptions, handler func(stream.ConnectionHandle)) error {
+	defer ln.Close()
+	if options.MaxFrameBytes == 0 {
+		options = core.DefaultConnectOptions()
 	}
 	go func() {
 		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+		_ = ln.Close()
 	}()
-	return srv.ListenAndServe()
+
+	var active atomic.Int64
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return err
+			}
+		}
+		// Same connection cap, and the same reasoning, as tcp.Serve: refusing a connection that
+		// was never established costs nothing, which is the property that matters precisely when
+		// the reason to refuse is that resources are already short.
+		if max := options.MaxConnections; max > 0 && active.Load() >= int64(max) {
+			_ = conn.Close()
+			continue
+		}
+		active.Add(1)
+		setNoDelay(conn)
+		go func(raw net.Conn) {
+			// onClose is passed to the constructor rather than assigned to the returned
+			// connection: performServerHandshake starts readLoop before it returns, and
+			// readLoop can reach Close on its own, so a later assignment races with that read.
+			// Same shape, same reason, as tcp's newSocketConnection.
+			released := &sync.Once{}
+			release := func() { released.Do(func() { active.Add(-1) }) }
+			wsConn, err := performServerHandshake(raw, options, release)
+			if err != nil {
+				// The handshake writes its own HTTP error response before failing, so there is
+				// nothing to send here - just release the slot.
+				_ = raw.Close()
+				release()
+				return
+			}
+			handler(wsConn)
+		}(conn)
+	}
+}
+
+// setNoDelay reaches through a *tls.Conn to the raw *net.TCPConn underneath, so a wss://
+// listener's accepted connections get the same treatment as a ws:// one - tls.NewListener's
+// Accept returns *tls.Conn, which is not itself a *net.TCPConn, so a naive type assertion
+// silently no-ops for every TLS connection. Same fix as kdb/transport/tcp's setNoDelay.
+func setNoDelay(conn net.Conn) {
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		conn = tlsConn.NetConn()
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+}
+
+// handshakeTimeout bounds how long a connection may sit mid-upgrade. Without it a peer that
+// opens a socket and sends nothing holds a goroutine, a connection slot and a buffer
+// indefinitely - the cheapest possible way to exhaust a server that otherwise caps everything.
+const handshakeTimeout = 10 * time.Second
+
+// performServerHandshake reads the client's upgrade request and answers it.
+//
+// Validation is deliberately stricter than the JVM server's, which checks only the path and the
+// presence of a key. Everything added here is required by RFC 6455 §4.2.1 and is free to check,
+// and each rejection writes a real HTTP response rather than dropping the socket, so a
+// misconfigured client sees why it was refused instead of an unexplained disconnect.
+func performServerHandshake(
+	conn net.Conn,
+	options core.TransportConnectOptions,
+	onClose func(),
+) (*wsConnection, error) {
+	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return nil, err
+	}
+
+	reader := bufio.NewReader(conn)
+	requestLine, headers, err := readHTTPHeaders(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	parts := strings.Fields(requestLine)
+	if len(parts) < 3 || parts[0] != http.MethodGet {
+		return nil, respondHandshakeError(conn, http.StatusMethodNotAllowed, "websocket upgrade requires GET")
+	}
+
+	if !headerHasToken(headers["connection"], "upgrade") ||
+		!strings.EqualFold(strings.TrimSpace(headers["upgrade"]), "websocket") {
+		return nil, respondHandshakeError(conn, http.StatusBadRequest, "not a websocket upgrade request")
+	}
+	if version := strings.TrimSpace(headers["sec-websocket-version"]); version != "13" {
+		// RFC 6455 §4.2.2 asks for the supported version in the failure response, so a client
+		// speaking an older draft learns what to speak rather than merely that it failed.
+		return nil, respondHandshakeErrorWith(
+			conn,
+			http.StatusUpgradeRequired,
+			"unsupported Sec-WebSocket-Version: "+version,
+			"Sec-WebSocket-Version: 13\r\n",
+		)
+	}
+	key := strings.TrimSpace(headers["sec-websocket-key"])
+	if !validWebSocketKey(key) {
+		return nil, respondHandshakeError(conn, http.StatusBadRequest, "missing or malformed Sec-WebSocket-Key")
+	}
+
+	response := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + websocketAccept(key) + "\r\n\r\n"
+	if _, err := conn.Write([]byte(response)); err != nil {
+		return nil, err
+	}
+
+	// The upgrade is done; the connection is now long-lived and must not inherit the handshake
+	// deadline, or every established connection would die ten seconds later.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+
+	maxFrameBytes := options.MaxFrameBytes
+	if maxFrameBytes == 0 {
+		maxFrameBytes = core.DefaultConnectOptions().MaxFrameBytes
+	}
+	queue := options.IncomingQueueFrames
+	if queue <= 0 {
+		queue = core.DefaultIncomingQueueFrames
+	}
+	c := &wsConnection{
+		conn:          conn,
+		reader:        reader,
+		maxFrameBytes: maxFrameBytes,
+		incoming:      make(chan []byte, queue),
+		done:          make(chan struct{}),
+		// Server side, the mirror image of the client's: never mask outbound, require inbound.
+		maskOutbound:       false,
+		requireInboundMask: true,
+		admit:              options.Admitter,
+		onClose:            onClose,
+	}
+	go c.readLoop()
+	return c, nil
+}
+
+// headerHasToken reports whether a comma-separated header value contains token. `Connection` is
+// a list header, and a browser routinely sends "keep-alive, Upgrade" - an equality check against
+// "Upgrade" rejects those, which is the classic way a hand-rolled server works against curl and
+// fails against a real browser.
+func headerHasToken(value, token string) bool {
+	for _, part := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// validWebSocketKey checks that the key is base64 of exactly 16 bytes, per RFC 6455 §4.1.
+func validWebSocketKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(key)
+	return err == nil && len(decoded) == 16
+}
+
+func respondHandshakeError(conn net.Conn, status int, reason string) error {
+	return respondHandshakeErrorWith(conn, status, reason, "")
+}
+
+func respondHandshakeErrorWith(conn net.Conn, status int, reason, extraHeaders string) error {
+	body := reason + "\n"
+	response := fmt.Sprintf(
+		"HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n%s\r\n%s",
+		status, http.StatusText(status), len(body), extraHeaders, body,
+	)
+	_, _ = conn.Write([]byte(response))
+	return fmt.Errorf("websocket handshake rejected (%d): %s", status, reason)
 }
 
 func performClientHandshake(conn net.Conn, host string, port int, path string, options core.TransportConnectOptions) (*wsConnection, error) {
@@ -181,6 +405,8 @@ func performClientHandshake(conn net.Conn, host string, port int, path string, o
 		maxFrameBytes: maxFrameBytes,
 		incoming:      make(chan []byte, 32),
 		done:          make(chan struct{}),
+		// Client side: mask everything sent, accept the server's unmasked frames.
+		maskOutbound: true,
 	}
 	go c.readLoop()
 	return c, nil
@@ -232,6 +458,22 @@ type wsConnection struct {
 	reader        *bufio.Reader
 	maxFrameBytes int
 	incoming      chan []byte
+	// maskOutbound is RFC 6455 §5.1's asymmetry, and it is not cosmetic: a client MUST mask
+	// every frame it sends and a server MUST NOT mask any. Browsers enforce both directions, so
+	// a server that masked its replies would be closed by every browser it served.
+	maskOutbound bool
+	// requireInboundMask is the same rule read from the other side: a server MUST reject an
+	// unmasked client frame. Only set server-side - a client accepts its peer's unmasked frames,
+	// which is exactly what it should be receiving.
+	requireInboundMask bool
+	// admit, when set, is consulted with each inbound message's frame header before the message
+	// is queued. Unlike the stream transports there is no partial-body saving to be had here (a
+	// WebSocket message arrives whole), but the rejection reply still matters: a shed request
+	// gets a typed answer instead of vanishing.
+	admit core.FrameAdmitter
+	// onClose, if set, runs exactly once when this connection closes - how Serve's connection
+	// cap learns that a slot has freed.
+	onClose func()
 	// done is closed exactly once, by Close, to unblock readLoop if it's currently blocked
 	// trying to deliver a frame on incoming (see readLoop's doc comment - same fix, same reason,
 	// as kdb/transport/tcp's socketConnection).
@@ -263,6 +505,23 @@ func (c *wsConnection) readLoop() {
 			_ = c.Close()
 			return
 		}
+		// Load shedding, server-side. The frame is already fully read - a WebSocket message
+		// arrives whole, so there is no body-read to save the way the stream reader saves one -
+		// but the answer still is: a shed request gets a typed rejection back rather than
+		// silently vanishing, and the connection stays usable, since a message boundary is
+		// necessarily a frame boundary here.
+		if c.admit != nil {
+			header, headerErr := wire.DecodeHeader(payload)
+			if headerErr == nil {
+				rejection, admitErr := c.admit(header)
+				if admitErr != nil {
+					if len(rejection) > 0 {
+						_ = c.writeFrame(0x2, rejection, c.maskOutbound)
+					}
+					continue
+				}
+			}
+		}
 		select {
 		case c.incoming <- payload:
 		case <-c.done:
@@ -289,6 +548,14 @@ func (c *wsConnection) readFrame() ([]byte, error) {
 			return nil, err
 		}
 		masked := b1&0x80 != 0
+		// RFC 6455 §5.1: "The server MUST close the connection upon receiving a frame that is
+		// not masked." Every real client masks - browsers, this repo's Go client, and the JVM
+		// client (WebSocketFraming.writeBinaryFrame with maskOutbound = true) - so enforcing it
+		// costs no interoperability, and not enforcing it would let an unmasked frame through
+		// to be XORed against a key that was never read.
+		if c.requireInboundMask && !masked {
+			return nil, fmt.Errorf("websocket: client frame is not masked")
+		}
 		length := int64(b1 & 0x7F)
 		switch length {
 		case 126:
@@ -329,7 +596,7 @@ func (c *wsConnection) readFrame() ([]byte, error) {
 		case 0x2:
 			return data, nil
 		case 0x9: // ping
-			if err := c.writeFrame(0xA, data, true); err != nil {
+			if err := c.writeFrame(0xA, data, c.maskOutbound); err != nil {
 				return nil, err
 			}
 		case 0xA: // pong
@@ -350,7 +617,7 @@ func (c *wsConnection) Send(frame []byte) error {
 	if closed {
 		return stream.NewNotConnectedError()
 	}
-	return c.writeFrame(0x2, frame, true)
+	return c.writeFrame(0x2, frame, c.maskOutbound)
 }
 
 // writeFrame writes one unfragmented frame. mask must be true for every client->server frame
@@ -421,6 +688,9 @@ func (c *wsConnection) Close() error {
 	}
 	c.closed = true
 	close(c.done)
+	if c.onClose != nil {
+		c.onClose()
+	}
 	return c.conn.Close()
 }
 

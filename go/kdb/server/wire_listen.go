@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -141,11 +143,77 @@ func (h *sqlWireConnHandler) handleFrame(frame []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	reply := h.dispatch(message)
+	reply := h.dispatchRecovering(message)
 	if reply == nil {
 		return nil, nil
 	}
 	return h.codec.Encode(reply)
+}
+
+// dispatchRecovering is dispatch with a panic backstop: a panic costs one request, not the
+// process, and the client gets a typed INTERNAL error rather than silence.
+//
+// This was added for a concrete bug, not as speculative hardening. `SELECT 1` used to panic the
+// SQL parser (readIdentifier, reached for a projection that is a literal rather than an
+// identifier), and with nothing recovering on this path the panic unwound out of the connection
+// goroutine and took the whole server down - every other connection, every other namespace.
+// Any client able to run a query could do it by accident, and a browser-reachable listener
+// widens who "any client" is.
+//
+// That parser bug is now fixed at the source: readIdentifier returns an error, and
+// handleSqlExec turns it into a clean sqlResultError the way it always intended to. This
+// backstop stays anyway, because the property worth having is not "that one statement is safe"
+// but "no single request can end the process" - which is the contract a Go network server is
+// expected to honour, and the reason net/http recovers per request.
+//
+// Answering rather than dropping matters as much as not crashing. The finish-up plan's item
+// 4.H records that a request the server declines to answer leaves the caller hanging until its
+// own deadline - the failure mode where the client cannot tell a wedged server from a slow one.
+func (h *sqlWireConnHandler) dispatchRecovering(message wire.Message) (reply wire.Message) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		// Log with the stack: a recovered panic that leaves no trace is a bug that never gets
+		// found, and this backstop exists precisely because such a bug is already present.
+		slog.Error("kdb: recovered panic while handling frame",
+			"panic", fmt.Sprint(r),
+			"message_type", message.Header().MessageType.String(),
+			"stack", string(debug.Stack()),
+		)
+		reply = internalErrorReply(message)
+	}()
+	return h.dispatch(message)
+}
+
+// internalErrorReply builds the response for a request whose handler panicked, preserving the
+// correlation id so the client can match it to the call it is waiting on - without that, the
+// reply is indistinguishable from an unrelated frame and the caller still hangs.
+func internalErrorReply(message wire.Message) wire.Message {
+	const msg = "internal server error"
+	correlationID := message.Header().CorrelationID
+	namespace, sessionID := "", ""
+	switch m := message.(type) {
+	case wire.SqlExecMessage:
+		namespace, sessionID = m.Namespace, m.SessionID
+	case wire.TxCommitMessage:
+		namespace, sessionID = m.Namespace, m.SessionID
+	case wire.UpsertMessage:
+		namespace, sessionID = m.Namespace, m.SessionID
+	case wire.DocumentGetMessage:
+		namespace = m.Namespace
+	}
+	errMsg := msg
+	code := wire.ErrorCodeInternal
+	return wire.SqlResultMessage{
+		H:         header(correlationID, wire.MsgSqlResult),
+		Namespace: namespace,
+		SessionID: sessionID,
+		ReadOnly:  true,
+		Error:     &errMsg,
+		ErrorCode: &code,
+	}
 }
 
 func (h *sqlWireConnHandler) dispatch(message wire.Message) wire.Message {
