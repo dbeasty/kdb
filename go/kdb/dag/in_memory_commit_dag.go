@@ -36,6 +36,24 @@ type headSnapshot struct {
 	commit    document.Commit
 }
 
+// commitNode is one resident commit plus the graph metadata the DAG
+// derives for it.
+//
+// generation is the length of the longest path from this commit back to a
+// root, one more than the highest of its parents' - git's commit-graph
+// generation number, and used the same way: an ancestry walk looking for a
+// commit of generation g may stop descending any branch that has already
+// dropped below g, because nothing below it can be that commit. Zero means
+// "not computed", which is what every node carries while
+// GraphSettings.AncestryPruning is off, and is why the pruned walks check
+// the setting rather than checking for a zero generation - a real root
+// commit's generation is 1, so zero is unambiguous, but only if nothing
+// treats it as a number.
+type commitNode struct {
+	commit     document.Commit
+	generation uint32
+}
+
 // InMemoryCommitDag is an in-memory commit DAG for one namespace.
 type InMemoryCommitDag struct {
 	NamespaceID string
@@ -60,8 +78,14 @@ type InMemoryCommitDag struct {
 	// invalidation traffic this is here to remove.
 	_ [cacheLinePadBytes]byte
 
-	mu      sync.RWMutex
-	commits map[codec.Hash]document.Commit
+	mu sync.RWMutex
+	// nodes holds every resident commit together with the small amount of
+	// graph metadata that is not part of the commit itself. It is a map of
+	// structs rather than a map of commits plus a parallel map of
+	// metadata: a second map keyed by codec.Hash costs roughly 50 bytes
+	// per commit in buckets and key copies, against 8 for widening the
+	// value that is already here, and the two could drift.
+	nodes map[codec.Hash]commitNode
 	// treeIndex answers "which commit produced this tree". Nil until the
 	// first CommitForTree call builds it, and maintained from then on - see
 	// CommitForTree for why it is not maintained from the start.
@@ -108,7 +132,28 @@ type InMemoryCommitDag struct {
 	opsLRU      *list.List
 	opsElem     map[codec.Hash]*list.Element
 	opsEvicted  map[codec.Hash]struct{}
+
+	// graph is which of the on-disk commit graph features this namespace
+	// is running with. Zero value is the behaviour that predates all of
+	// them; see GraphSettings.
+	graph GraphSettings
+	// genStale records that some commit was admitted before one of its
+	// parents, so the generation numbers no longer satisfy
+	// generation(parent) < generation(child) and must be rebuilt before
+	// anything prunes with them. See storeCommitLocked.
+	genStale bool
+	// graphFile is the mapped graph, once there is one. Always nil today -
+	// the format is not implemented - and read through GraphFileActive,
+	// which is what tells a status report or a fallback test the
+	// difference between "asked for" and "in use".
+	graphFile *graphFile
 }
+
+// graphFile is a placeholder for the mapped on-disk commit graph
+// (docs/kdb-commit-graph-on-disk.md, Phase 2). It exists now so that
+// GraphFileActive has something honest to report and so the settings that
+// gate it can be plumbed and tested before the format lands.
+type graphFile struct{}
 
 // publishHeadLocked recomputes the head snapshot from the maps and publishes it. Must be
 // called with mu held exclusively, on every path that changes d.branches or d.commits.
@@ -122,7 +167,7 @@ func (d *InMemoryCommitDag) publishHeadLocked() {
 	if b, ok := d.branches[mainBranch]; ok {
 		snap.hasBranch = true
 		snap.hash = b.HeadHash
-		if c, ok := d.commits[b.HeadHash]; ok {
+		if c, ok := d.commitLocked(b.HeadHash); ok {
 			snap.hasCommit = true
 			snap.commit = c
 		}
@@ -155,7 +200,7 @@ func (d *InMemoryCommitDag) HeadCommit() (codec.Hash, document.Commit, bool, err
 		return codec.Hash{}, document.Commit{}, false,
 			NewConsistencyError("missing default branch", d.NamespaceID, nil)
 	}
-	c, hasCommit := d.commits[b.HeadHash]
+	c, hasCommit := d.commitLocked(b.HeadHash)
 	return b.HeadHash, c, hasCommit, nil
 }
 
@@ -171,7 +216,7 @@ func (d *InMemoryCommitDag) AncestryVersion() uint64 {
 func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	d := &InMemoryCommitDag{
 		NamespaceID: namespaceID,
-		commits:     make(map[codec.Hash]document.Commit),
+		nodes:       make(map[codec.Hash]commitNode),
 		stubs:       make(map[codec.Hash]document.CommitStub),
 		trees:       make(map[codec.Hash]document.DocumentTree),
 		branches:    make(map[string]document.Branch),
@@ -192,7 +237,7 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	if err != nil {
 		return nil, err
 	}
-	d.commits[genesis.Hash] = genesis
+	d.storeCommitLocked(genesis)
 	d.txIndex[genesis.TransactionID] = genesis.Hash
 	now := codec.TimestampNow()
 	d.branches[mainBranch] = document.Branch{
@@ -219,7 +264,7 @@ func (d *InMemoryCommitDag) LookupHashPrefix(hexPrefixLower string) []codec.Hash
 	defer d.mu.RUnlock()
 	p := strings.ToLower(hexPrefixLower)
 	var out []codec.Hash
-	for h := range d.commits {
+	for h := range d.nodes {
 		if strings.HasPrefix(h.Hex(), p) {
 			out = append(out, h)
 		}
@@ -239,14 +284,13 @@ func (d *InMemoryCommitDag) GetCommit(hash codec.Hash) (document.Commit, bool) {
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	c, ok := d.commits[hash]
-	return c, ok
+	return d.commitLocked(hash)
 }
 
 func (d *InMemoryCommitDag) GetCommitOrThrow(hash codec.Hash) (document.Commit, error) {
 	d.mu.RLock()
 	stub, isStub := d.stubs[hash]
-	c, ok := d.commits[hash]
+	c, ok := d.commitLocked(hash)
 	evicted := d.opsEvictedFor(hash)
 	d.mu.RUnlock()
 	if isStub {
@@ -279,8 +323,7 @@ func (d *InMemoryCommitDag) GetStub(hash codec.Hash) (document.CommitStub, bool)
 func (d *InMemoryCommitDag) HasCommit(hash codec.Hash) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	_, ok := d.commits[hash]
-	return ok
+	return d.isResidentLocked(hash)
 }
 
 func (d *InMemoryCommitDag) HasStub(hash codec.Hash) bool {
@@ -301,7 +344,7 @@ func (d *InMemoryCommitDag) PutCommit(commit document.Commit, requireParents boo
 }
 
 func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParents, verifyHash bool) error {
-	if _, ok := d.commits[commit.Hash]; ok {
+	if d.isResidentLocked(commit.Hash) {
 		return nil
 	}
 	// Re-deriving the hash means encoding the whole commit payload and running
@@ -319,14 +362,14 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	}
 	if requireParents && len(commit.ParentHashes) > 0 {
 		for _, p := range commit.ParentHashes {
-			if _, ok := d.commits[p]; !ok {
+			if !d.isResidentLocked(p) {
 				if _, ok2 := d.stubs[p]; !ok2 {
 					return NewConsistencyError("missing parent "+p.Hex(), d.NamespaceID, &commit.Hash)
 				}
 			}
 		}
 	}
-	d.commits[commit.Hash] = commit
+	d.storeCommitLocked(commit)
 	if d.treeIndex != nil {
 		// Only once something has asked. First writer wins: several commits
 		// can name the same tree and any of them reconstructs it.
@@ -372,7 +415,7 @@ func (d *InMemoryCommitDag) GetCommitByTransactionID(txID codec.UUID) (document.
 func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) (document.CommitStub, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.commits[hash]; !ok {
+	if !d.isResidentLocked(hash) {
 		return document.CommitStub{}, NewConsistencyError("cannot stub unknown commit", d.NamespaceID, &hash)
 	}
 	// Archiving is a reclamation like squashing: a stub satisfies requireCommitPresentLocked but
@@ -380,7 +423,7 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	if err := d.assertUnpinnedLocked(hash, "archive requested"); err != nil {
 		return document.CommitStub{}, err
 	}
-	delete(d.commits, hash)
+	delete(d.nodes, hash)
 	d.ancestryVersion++
 	stub := document.CommitStub{
 		OriginalHash: hash, ArchiveLocation: archiveLocation, StubbedAt: codec.TimestampNow(),
@@ -514,7 +557,7 @@ func (d *InMemoryCommitDag) Walk(from codec.Hash, until *codec.Hash, limit int) 
 	var frontier []frontierItem
 	enqueue := func(h codec.Hash) {
 		ts := codec.Timestamp{}
-		if c, ok := d.commits[h]; ok {
+		if c, ok := d.commitLocked(h); ok {
 			ts = c.Timestamp
 		} else if s, ok := d.stubs[h]; ok {
 			ts = s.StubbedAt
@@ -552,7 +595,7 @@ func (d *InMemoryCommitDag) Walk(from codec.Hash, until *codec.Hash, limit int) 
 			out = append(out, StubbedEntry{Stub: stub})
 			continue
 		}
-		c, ok := d.commits[h]
+		c, ok := d.commitLocked(h)
 		if !ok {
 			continue
 		}
@@ -570,11 +613,11 @@ func (d *InMemoryCommitDag) Diff(fromHash, toHash codec.Hash) (CommitDiff, error
 	if fromHash == toHash {
 		return CommitDiff{FromHash: fromHash, ToHash: toHash}, nil
 	}
-	fc, ok := d.commits[fromHash]
+	fc, ok := d.commitLocked(fromHash)
 	if !ok {
 		return CommitDiff{}, kdberr.NewVersionNotFoundError("from commit missing", d.NamespaceID, fromHash.Hex())
 	}
-	tc, ok := d.commits[toHash]
+	tc, ok := d.commitLocked(toHash)
 	if !ok {
 		return CommitDiff{}, kdberr.NewVersionNotFoundError("to commit missing", d.NamespaceID, toHash.Hex())
 	}
@@ -730,11 +773,11 @@ func (d *InMemoryCommitDag) Squash(
 	for _, h := range squashHashes {
 		squashSet[h] = struct{}{}
 	}
-	if _, ok := d.commits[boundary]; !ok {
+	if !d.isResidentLocked(boundary) {
 		return document.Commit{}, kdberr.NewVersionNotFoundError("boundary missing", d.NamespaceID, boundary.Hex())
 	}
 	for _, h := range squashHashes {
-		if _, ok := d.commits[h]; !ok {
+		if !d.isResidentLocked(h) {
 			return document.Commit{}, NewConsistencyError("squash target missing", d.NamespaceID, &h)
 		}
 	}
@@ -771,10 +814,10 @@ func (d *InMemoryCommitDag) Squash(
 		}
 	}
 	for _, h := range squashHashes {
-		delete(d.commits, h)
+		delete(d.nodes, h)
 		delete(d.stubs, h)
 	}
-	d.commits[synthetic.Hash] = synthetic
+	d.storeCommitLocked(synthetic)
 	d.ancestryVersion++
 	// Squash refuses to run with a branch head inside the window, so the head's commit
 	// survives; republish regardless, since the check above is the only thing guaranteeing
@@ -784,7 +827,7 @@ func (d *InMemoryCommitDag) Squash(
 }
 
 func (d *InMemoryCommitDag) requireCommitPresentLocked(hash codec.Hash) error {
-	if _, ok := d.commits[hash]; !ok {
+	if !d.isResidentLocked(hash) {
 		if _, ok2 := d.stubs[hash]; !ok2 {
 			return NewConsistencyError("missing commit "+hash.Hex(), d.NamespaceID, &hash)
 		}
@@ -813,10 +856,10 @@ func (d *InMemoryCommitDag) CommitForTree(treeHash codec.Hash) (codec.Hash, bool
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.treeIndex == nil {
-		d.treeIndex = make(map[codec.Hash]codec.Hash, len(d.commits))
-		for h, c := range d.commits {
-			if _, seen := d.treeIndex[c.DocumentTreeHash]; !seen {
-				d.treeIndex[c.DocumentTreeHash] = h
+		d.treeIndex = make(map[codec.Hash]codec.Hash, len(d.nodes))
+		for h, n := range d.nodes {
+			if _, seen := d.treeIndex[n.commit.DocumentTreeHash]; !seen {
+				d.treeIndex[n.commit.DocumentTreeHash] = h
 			}
 		}
 	}

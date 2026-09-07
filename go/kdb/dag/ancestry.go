@@ -8,6 +8,12 @@ import (
 )
 
 // CommitsSince returns commits reachable from from but not from exclude ancestors.
+//
+// Still builds full closures, with or without AncestryPruning. Unlike
+// IsAncestor this is a set difference, so it needs the sets it is
+// differencing; generation numbers would only let it skip re-descending
+// shared history, which is a smaller and more delicate win. Left for when
+// a measurement asks for it - see docs/kdb-commit-graph-on-disk.md.
 func (d *InMemoryCommitDag) CommitsSince(from codec.Hash, exclude map[codec.Hash]struct{}) []codec.Hash {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -55,12 +61,75 @@ func (d *InMemoryCommitDag) CommonAncestor(hashA, hashB codec.Hash) *codec.Hash 
 }
 
 // IsAncestor reports whether ancestor is on the path to descendant.
+//
+// Two implementations, selected by GraphSettings.AncestryPruning, and they
+// are required to agree on every input - TestIsAncestorAgreesWithAncestorSet
+// and TestPrunedAncestryAgreesWithTheClosure are what hold them to it.
+//
+// The unpruned one materializes descendant's entire ancestor closure and
+// then tests a single membership, so one call allocates a map proportional
+// to the whole history and a caller testing many candidates against one
+// descendant rebuilds it every time. At the sizes this codebase is now
+// aiming at, that is the cost that bites first - before residency, and for
+// a reason unrelated to it.
+//
+// The pruned one walks from descendant and stops descending any branch
+// whose generation has fallen to or below the ancestor's. Sound because
+// generation strictly increases from parent to child (see
+// deriveGenerationLocked): every path from descendant down to ancestor has
+// strictly decreasing generations, so a commit that is already at or below
+// the ancestor's generation cannot have it below. It visits only what it
+// has to and allocates a visited set proportional to that, not to history.
 func (d *InMemoryCommitDag) IsAncestor(ancestor, descendant codec.Hash) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	closure := d.ancestorClosureLocked(descendant)
-	_, ok := closure[ancestor]
-	return ok
+	if !d.ensureGenerationsLocked() {
+		closure := d.ancestorClosureLocked(descendant)
+		_, ok := closure[ancestor]
+		return ok
+	}
+	return d.isAncestorPrunedLocked(ancestor, descendant)
+}
+
+// isAncestorPrunedLocked answers IsAncestor using generation numbers. Must
+// hold mu exclusively, and must be called only once ensureGenerationsLocked
+// has reported the generations usable.
+func (d *InMemoryCommitDag) isAncestorPrunedLocked(ancestor, descendant codec.Hash) bool {
+	// The closure the unpruned path builds always contains its own start,
+	// whether or not that hash names a resident commit, so a hash is its
+	// own ancestor even when the DAG has never heard of it. Keep that.
+	if ancestor == descendant {
+		return true
+	}
+	// A target that is not a resident commit has generation 0 - a stubbed
+	// or absent parent hash that some commit still names. Nothing can be
+	// pruned against 0, so this degenerates to the plain walk rather than
+	// to a wrong answer.
+	floor := d.generationLocked(ancestor)
+
+	visited := make(map[codec.Hash]struct{})
+	queue := []codec.Hash{descendant}
+	for len(queue) > 0 {
+		h := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		if _, seen := visited[h]; seen {
+			continue
+		}
+		visited[h] = struct{}{}
+		if h == ancestor {
+			return true
+		}
+		if floor > 0 && d.generationLocked(h) <= floor {
+			// Everything below h is at a strictly lower generation than h
+			// is, so none of it can be the ancestor. Note this also
+			// discards h when h is not resident (generation 0), which is
+			// right: expandParentsLocked has nothing to descend into
+			// there anyway.
+			continue
+		}
+		queue = append(queue, d.expandParentsLocked(h)...)
+	}
+	return false
 }
 
 // AncestorSet returns the ancestor closure of hash (including hash itself). Callers testing
@@ -117,7 +186,7 @@ func (d *InMemoryCommitDag) expandParentsLocked(hash codec.Hash) []codec.Hash {
 	if _, ok := d.stubs[hash]; ok {
 		return nil
 	}
-	c, ok := d.commits[hash]
+	c, ok := d.commitLocked(hash)
 	if !ok {
 		return nil
 	}

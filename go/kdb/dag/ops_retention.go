@@ -139,10 +139,10 @@ func (d *InMemoryCommitDag) evictOpsLocked(protect codec.Hash) {
 		prev := el.Prev()
 		h := el.Value.(codec.Hash)
 		if h != protect && !d.opsPinnedLocked(h) {
-			if c, ok := d.commits[h]; ok {
+			if c, ok := d.commitLocked(h); ok {
 				d.opsResident -= commitOpsBytes(c)
 				c.Operations = nil
-				d.commits[h] = c
+				d.replaceCommitLocked(c)
 				d.opsEvicted[h] = struct{}{}
 			}
 			d.opsLRU.Remove(el)
