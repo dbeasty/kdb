@@ -15,6 +15,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/config"
+	"github.com/limidus/kdb/go/kdb/control"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
@@ -72,6 +73,9 @@ func Main() {
 	fs.BoolVar(&flagVals.TLSClientAuth, "tls-client-auth", flagVals.TLSClientAuth, "require and verify a client certificate on every TLS connection (mTLS) - requires --tls-ca")
 	fs.StringVar(&flagVals.AdminAddr, "admin-addr", flagVals.AdminAddr, "operational HTTP endpoint (host:port) serving /healthz, /readyz, /metrics (Prometheus), /debug/vars, /debug/pprof - plain HTTP with no auth, so bind it to localhost or a private interface, never the public network (empty to disable)")
 	fs.DurationVar(&flagVals.DrainTimeout, "drain-timeout", flagVals.DrainTimeout, "on SIGTERM/SIGINT, how long to wait for already-admitted writes to finish before closing storage anyway - new writes are rejected immediately either way, and storage stays crash-consistent even when the deadline is hit (the WAL/delta replay path covers whatever didn't get flushed)")
+	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
+	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
+	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
 	fs.StringVar(&flagVals.LogLevel, "log-level", flagVals.LogLevel, "minimum log level: debug, info, warn, error")
 	fs.StringVar(&flagVals.LogFormat, "log-format", flagVals.LogFormat, "log output format: text or json")
 	fs.StringVar(&flagVals.Durability, "durability", flagVals.Durability, "how much of the write-out a commit waits for: sync (default - an acknowledged write is fsynced; concurrent commits share the fsync via group commit, so this is no longer a physical sync per write), async (acknowledged once queued in memory - a crash can lose whatever had not been flushed), or memory (nothing is written to the delta log at all; everything is lost on restart - tests and throwaway workloads only)")
@@ -123,6 +127,7 @@ func Main() {
 	grpcAddr := cfg.GRPCAddr
 	wsAddr := cfg.WSAddr
 	rbac, abortAfter, drainTimeout := cfg.RBAC, cfg.AbortAfter, cfg.DrainTimeout
+	controlAddr := cfg.ControlAddr
 
 	logger, err := buildLogger(cfg.LogLevel, cfg.LogFormat)
 	if err != nil {
@@ -191,6 +196,11 @@ func Main() {
 	// off: the mechanism that keeps sustained write load from ending in an OOM kill was
 	// previously inert in every deployment that did not know to ask for it by name.
 	memoryLimitStatus := "disabled (--memory-budget-mb=-1)"
+	// Kept beyond the block below so the control plane can report the budget actually in force,
+	// and say whether the process detected it or an operator named it. Zero means governance is
+	// off, which is a different thing from a budget of zero.
+	effectiveBudgetBytes := uint64(0)
+	budgetSource := ""
 	if cfg.MemoryBudgetMB >= 0 {
 		var budgetBytes uint64
 		source := "explicit"
@@ -221,6 +231,7 @@ func Main() {
 			// value - NewAdmission clamps it to a quarter of the budget.
 			memoryLimitStatus = fmt.Sprintf("%dMB %s (zones at 70/85/93%%, reserve %dMB, GOMEMLIMIT %dMB)",
 				budgetBytes/(1024*1024), source, srv.Admission().RescueReserveBytes()/(1024*1024), goMemLimit/(1024*1024))
+			effectiveBudgetBytes, budgetSource = budgetBytes, source
 		}
 	}
 	srv.MaxConnections = cfg.MaxConnections
@@ -393,6 +404,53 @@ func Main() {
 		adminStatus = fmt.Sprintf("enabled (%s)", admin.Addr())
 	}
 
+	var controlSrv *control.Server
+	controlStatus := "disabled"
+	if controlAddr != "" {
+		// Describe re-runs the same precedence decision ResolveService just made, over the same
+		// inputs, and keeps the provenance it discards - so the settings the control plane reports
+		// are the ones this process is actually running on, attributed to the layer that set them.
+		descriptors := config.Describe(fileCfg, os.LookupEnv, func(name string) bool { return explicitFlags[name] }, cfg)
+		if effectiveBudgetBytes > 0 && budgetSource == "auto-detected" {
+			// The budget is the one setting the process derives rather than reads. Reporting an
+			// auto-detected budget as "default" would tell an operator nothing about the number
+			// actually in force; MarkAutoDetected leaves an explicitly-named value alone.
+			config.MarkAutoDetected(descriptors, "memory.budgetMB",
+				int(effectiveBudgetBytes>>20), "detected from the cgroup or host memory limit")
+		}
+		descriptors = append(descriptors, config.EnvOnlyDescriptors(os.LookupEnv)...)
+
+		controlSrv, err = control.New(control.Options{
+			Addr:        controlAddr,
+			Runtime:     srv,
+			Namespace:   namespace,
+			Settings:    descriptors,
+			AllowWrites: cfg.ControlWrite,
+			Version:     version.Get().Version,
+			ServeUI:     cfg.ControlUI,
+		})
+		if err != nil {
+			slog.Error("control listen failed", "error", err)
+			os.Exit(1)
+		}
+		defer controlSrv.Close()
+
+		// Chain rather than replace: the stream listener may already own CommitListener, and
+		// stealing it would silently stop Mode 1/2 subscribers receiving anything.
+		previous := srv.CommitListener
+		srv.CommitListener = func(ns string, commit document.Commit) {
+			if previous != nil {
+				previous(ns, commit)
+			}
+			controlSrv.PublishCommit(ns, commit)
+		}
+		mode := "read-only"
+		if cfg.ControlWrite {
+			mode = "writes enabled"
+		}
+		controlStatus = fmt.Sprintf("enabled (%s, %s)", controlSrv.Addr(), mode)
+	}
+
 	tlsStatus := "disabled (plaintext)"
 	if tlsSettings != nil {
 		tlsStatus = "enabled"
@@ -414,6 +472,7 @@ func Main() {
 		"ws", wsStatus,
 		"grpc", grpcStatus,
 		"admin", adminStatus,
+		"control", controlStatus,
 		"tls", tlsStatus,
 		"rbac", rbacStatus,
 		"memory_limit", memoryLimitStatus,

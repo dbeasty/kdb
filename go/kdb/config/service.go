@@ -66,6 +66,22 @@ type ServiceSettings struct {
 	ScanRowBudget int
 	AbortAfter    time.Duration
 	DrainTimeout  time.Duration
+	// ControlAddr is the control-plane HTTP listen address (host:port). Empty - the default -
+	// disables it, like every other listener here.
+	//
+	// Off by default and, when on, intended for a private interface: unlike AdminAddr it
+	// authenticates every request, but the auth it authenticates against is still the static
+	// "user:pass" bearer of kdb-auth-static until Component 41 lands. See
+	// docs/kdb-control-ui-plan.md §10.
+	ControlAddr string
+	// ControlWrite opts the control plane into mutating endpoints. Read-only by default so that
+	// enabling the control plane is not, by itself, a decision to let a browser write to the
+	// database.
+	ControlWrite bool
+	// ControlUI serves the embedded single-page UI on the control listener. On by default, since
+	// a control plane with no UI is only useful to a script, but separable for a deployment that
+	// wants the API alone.
+	ControlUI     bool
 	TLSCert       string
 	TLSKey        string
 	TLSCA         string
@@ -96,6 +112,11 @@ func DefaultServiceSettings() ServiceSettings {
 		WSAddr:       "",
 		GRPCAddr:     "",
 		DrainTimeout: 30 * time.Second,
+		// Off by default: a browser-reachable control plane is a deliberate exposure decision,
+		// exactly as WSAddr is.
+		ControlAddr:  "",
+		ControlWrite: false,
+		ControlUI:    true,
 		LogLevel:     "info",
 		LogFormat:    "text",
 		// 0 = auto-detect the budget rather than run ungoverned - see MemoryBudgetMB.
@@ -142,6 +163,9 @@ type ServiceFile struct {
 	TLS             *ServiceTLSFile `json:"tls"`
 	LogLevel        *string         `json:"logLevel"`
 	LogFormat       *string         `json:"logFormat"`
+	ControlAddr     *string         `json:"controlAddr"`
+	ControlWrite    *bool           `json:"controlWrite"`
+	ControlUI       *bool           `json:"controlUi"`
 
 	Durability          *string `json:"durability"`
 	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
@@ -222,6 +246,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		}
 		setIf(&s.LogLevel, file.LogLevel)
 		setIf(&s.LogFormat, file.LogFormat)
+		setIf(&s.ControlAddr, file.ControlAddr)
+		setIf(&s.ControlWrite, file.ControlWrite)
+		setIf(&s.ControlUI, file.ControlUI)
 		setIf(&s.Durability, file.Durability)
 		setIf(&s.AsyncSyncIntervalMS, file.AsyncSyncIntervalMS)
 		setIf(&s.Compression, file.Compression)
@@ -322,6 +349,13 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	}
 	envString("KDB_LOG_LEVEL", &s.LogLevel)
 	envString("KDB_LOG_FORMAT", &s.LogFormat)
+	envString("KDB_CONTROL_ADDR", &s.ControlAddr)
+	if err := envBool("KDB_CONTROL_WRITE", &s.ControlWrite); err != nil {
+		return s, err
+	}
+	if err := envBool("KDB_CONTROL_UI", &s.ControlUI); err != nil {
+		return s, err
+	}
 	envString("KDB_DURABILITY", &s.Durability)
 	if err := envInt("KDB_ASYNC_SYNC_INTERVAL_MS", &s.AsyncSyncIntervalMS); err != nil {
 		return s, err
@@ -355,6 +389,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"tls-key", func() { s.TLSKey = flags.TLSKey }},
 		{"tls-ca", func() { s.TLSCA = flags.TLSCA }},
 		{"tls-client-auth", func() { s.TLSClientAuth = flags.TLSClientAuth }},
+		{"control-addr", func() { s.ControlAddr = flags.ControlAddr }},
+		{"control-write", func() { s.ControlWrite = flags.ControlWrite }},
+		{"control-ui", func() { s.ControlUI = flags.ControlUI }},
 		{"log-level", func() { s.LogLevel = flags.LogLevel }},
 		{"log-format", func() { s.LogFormat = flags.LogFormat }},
 		{"durability", func() { s.Durability = flags.Durability }},
