@@ -307,6 +307,25 @@ func (e *defaultEngine) finalizeTransaction(
 		return ResultAborted{Cause: abortErr}, nil
 	}
 
+	// Record what was stored, not what was asked for.
+	//
+	// A WriteOp's patch is merged over the existing document on the way in (baseDoc.Merge above),
+	// but replay reads the same op as the whole document (embed/delta_replay.go) and so does the
+	// historical-tree fold (embed.applyCommitToTree). Committing the request rather than the
+	// result made those disagree: a merge patch naming fewer keys than the stored document
+	// reconstructed as a *smaller* document, which hashes differently, which means the tree replay
+	// rebuilds is not the tree this commit records - and every later read at that commit resolves
+	// a tree nothing ever wrote. The namespace comes back empty rather than failing loudly.
+	//
+	// Substituting the staged document closes that by construction: there is exactly one reading
+	// of the op left, and it is the one the write actually produced. It also matches the engine's
+	// own principle that the document is the truth - a commit should record a fact about the data,
+	// not the request that produced it.
+	//
+	// See the regression tests: server.TestUpsertMergeSurvivesRestart drives the documented public
+	// merge path, and control.TestEngineWriteAndReplayAgree drives it over HTTP.
+	tx.Operations = operationsAsStored(tx.Operations, writes)
+
 	anchor, err := d.GetCommitOrThrow(anchorCommit)
 	if err != nil {
 		return nil, err
@@ -674,6 +693,30 @@ func topoSort(d *dag.InMemoryCommitDag, hashes map[codec.Hash]struct{}) []codec.
 		}
 		sort.Slice(hexes, func(i, j int) bool { return hexes[i].Hex() < hexes[j].Hex() })
 		return hexes
+	}
+	return out
+}
+
+// operationsAsStored replaces each WriteOp's patch with the document that was actually staged for
+// it, leaving every other operation untouched.
+//
+// A new slice rather than an in-place edit: Operations is the caller's slice, and a transaction
+// that was rejected further down should not come back mutated.
+func operationsAsStored(ops []document.Op, writes map[int]document.Document) []document.Op {
+	if len(writes) == 0 {
+		return ops
+	}
+	out := make([]document.Op, len(ops))
+	copy(out, ops)
+	for index, doc := range writes {
+		if index < 0 || index >= len(out) {
+			continue
+		}
+		w, ok := out[index].(document.WriteOp)
+		if !ok {
+			continue
+		}
+		out[index] = document.WriteOp{DocID: w.DocID, Patch: doc.JSON}
 	}
 	return out
 }

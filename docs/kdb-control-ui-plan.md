@@ -23,7 +23,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M0 | Foundations | **done** — control plane, auth, SSE hub, embedded UI, and the multi-namespace host: the service opens the data root through `embed.Host` and the control plane serves every namespace it finds |
 | M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, and a read-only SQL console |
 | M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
-| M3 | Writes | **partial** — DML and DDL through the SQL console, autocommitted through the ordinary write path; no per-document CRUD endpoints yet |
+| M3 | Writes | **done** — DML and DDL through the SQL console, and per-document edit and delete with compare-and-set on the content hash |
 | M4 | Rollback | **partial** — plan/apply with `expectHead` are done; per-document history and the document timeline are not |
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
@@ -38,8 +38,10 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 `POST /v1/ns/{ns}/revert/plan`, `/revert/apply`. `?at=` is honoured on every document read.
 
 `POST /v1/ns/{ns}/sql` serves all three statement kinds, with permission decided per statement.
+`PUT`/`DELETE /v1/ns/{ns}/docs/{id}` take an optional `ifContentHash` (or `ifAbsent`) and answer 409
+with the hash that beat them.
 
-**Declared, answering 501:** `PUT`/`DELETE /v1/ns/{ns}/docs/{id}`, `PATCH /v1/settings`.
+**Declared, answering 501:** `PATCH /v1/settings`.
 
 **Not started:** the document list (`/docs`), per-document history, per-document diff
 (`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/settings/{key}`,
@@ -53,7 +55,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 
 | | Screen | State |
 |---|---|---|
-| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, and readable at any revision |
+| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, editing with compare-and-set, delete, and readable at any revision |
 | 2 | SQL console | **built** — SELECT reports the access path and rows examined; DML and DDL are gated on `--control-write` *and* a write grant, and report the commit they produced |
 | 3 | Commit graph | **partial** — a flat, paged list with parent and ref badges. There is no lane assignment, so it is a log, not a graph; a merge is flagged with a chip rather than drawn |
 | 4 | Document timeline | **not built** |
@@ -67,16 +69,17 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 
 ### What to do next, in order
 
-1. **Per-document editing (M3's other half).** The console can write; editing one document in a
-   panel is what an operator reaches for next, and `ReplaceIf` already gives optimistic
-   concurrency for free.
-2. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime, and the
+1. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime, and the
    read view that makes them legible is done.
-3. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece
+2. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece
    and is mostly composition of things that already exist.
-4. **The document timeline (M4's missing half).** Per-document history, now that
+3. **The document timeline (M4's missing half).** Per-document history, now that
    `dag.ListCommits` exists to build it on.
-5. **A real commit graph (§9 screen 3).** Lane assignment, so the log becomes a graph.
+4. **A real commit graph (§9 screen 3).** Lane assignment, so the log becomes a graph.
+5. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
+   commit: a `WriteOp` is merged on the way in, and a `DeleteOp` in the same transaction does not
+   help because staging reads every operation against the baseline tree rather than against each
+   other. The editor tells the operator which keys a save will keep; it cannot yet drop one.
 
 ## 1. What this is
 
@@ -506,12 +509,13 @@ Three things make this safe and cheap:
   (`in_memory_commit_dag.go:610`).
 - Bodies at the target come from the existing `getDocumentAt(ns, docID, targetTreeHash)`
   (`index_wiring.go:95`).
-- At the transaction layer, `WriteOp.Patch` is treated as the **whole document body**, not a
-  merge patch — `documentFromPatch` parses it as the document
-  (`go/kdb/storage/engine/cold_loader.go:143`). Shallow-merge semantics live above, in
-  UPSERT/`SET _doc`. So a revert can restore a body that *removes* keys added later. **Verify this
-  with a test as step one of M4** — if any write path re-merges, revert needs an explicit
-  replace-op and that is a wire/spec change.
+- `WriteOp.Patch` is read two ways, and this was got wrong here originally. The *write* path merges
+  it over the stored document (`transaction/default_engine.go`, `baseDoc.Merge`); *replay* and the
+  historical-tree fold read it as the whole document. Committing the request rather than the merged
+  result made those disagree, which lost data across a restart - see issue #48, fixed by recording
+  the staged document as the operation. Revert sidesteps the question entirely: `embed.RevertTo`
+  writes through the storage adapter directly rather than through the transaction engine, so it
+  genuinely replaces.
 
 Scopes: whole namespace, a document set (from the UI's checkbox selection), or a
 schema-collection filter. Same code path; only the entry filter differs.

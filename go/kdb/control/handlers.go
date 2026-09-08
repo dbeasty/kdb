@@ -340,6 +340,9 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 		writeJSON(w, http.StatusOK, map[string]any{
 			"namespace": ns, "docId": docID.String(), "commit": commitHex,
 			"body": rawJSON(body), "atHead": true,
+			// The hash a conditional write should assert on. Returned with the read so an editor
+			// holds the version it is editing without a second request.
+			"contentHash": contentHashOf(docID, body),
 		})
 		return
 	}
@@ -373,6 +376,7 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 	writeJSON(w, http.StatusOK, map[string]any{
 		"namespace": ns, "docId": docID.String(), "commit": commitHash.Hex(),
 		"body": rawJSON(doc.JSON), "atHead": false,
+		"contentHash": contentHashOf(docID, doc.JSON),
 		// Stated rather than implied: a historical read is a read, and nothing written through
 		// this control plane can land anywhere but head.
 		"readOnly": true,

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1272,4 +1274,361 @@ func TestMultipleNamespacesAreServedIndependently(t *testing.T) {
 	if len(b["documents"].([]any)) != 3 {
 		t.Errorf("demo/orders has three documents: %v", b["documents"])
 	}
+}
+
+func sendJSON(t *testing.T, method, base, path, body string) (*http.Response, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(method, base+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer alice:secret")
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	t.Cleanup(func() { _ = res.Body.Close() })
+	raw, _ := io.ReadAll(res.Body)
+	var parsed map[string]any
+	_ = json.Unmarshal(raw, &parsed)
+	return res, parsed
+}
+
+func TestDocumentEditRoundTrip(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a","name":"ada","score":1}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	// A read hands back the hash the next write should assert on.
+	_, read := get(t, base, path)
+	hash, _ := read["contentHash"].(string)
+	if hash == "" {
+		t.Fatal("a document read must carry its content hash, or an editor cannot write conditionally")
+	}
+
+	res, saved := sendJSON(t, http.MethodPut, base, path,
+		`{"body":{"id":"a","name":"ada","score":2},"ifContentHash":"`+hash+`"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("conditional save: %d (%v)", res.StatusCode, saved)
+	}
+	if saved["commit"] == nil || saved["contentHash"] == nil {
+		t.Errorf("a save should report its commit and the new hash: %v", saved)
+	}
+
+	_, after := get(t, base, path)
+	if after["body"].(map[string]any)["score"].(float64) != 2 {
+		t.Errorf("the edit did not land: %v", after["body"])
+	}
+	if after["contentHash"] == hash {
+		t.Error("the content changed, so its hash must have changed too")
+	}
+}
+
+// TestConditionalSaveRefusesAStaleEdit is the whole point of the content hash: a browser holds a
+// document on screen while other clients keep writing.
+func TestConditionalSaveRefusesAStaleEdit(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a","name":"ada","score":1}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	_, read := get(t, base, path)
+	stale := read["contentHash"].(string)
+
+	// Someone else writes first.
+	if _, err := embed.PutJSONDocument(cs.opts.Runtime.Runtime, "demo/users",
+		`{"id":"a","name":"ada","score":99}`); err != nil {
+		t.Fatal(err)
+	}
+
+	res, body := sendJSON(t, http.MethodPut, base, path,
+		`{"body":{"id":"a","name":"ada","score":2},"ifContentHash":"`+stale+`"}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("a stale conditional save must be refused, got %d (%v)", res.StatusCode, body)
+	}
+	if body["error"].(map[string]any)["code"] != "precondition_failed" {
+		t.Errorf("a failed compare-and-set is not a plain conflict: %v", body["error"])
+	}
+	// The hash that beat it, so the client can re-read and merge rather than retry blind.
+	conflicts, _ := body["conflicts"].([]any)
+	if len(conflicts) == 0 || conflicts[0].(map[string]any)["actualContentHash"] == nil {
+		t.Errorf("the refusal must carry the content hash that won: %v", body["conflicts"])
+	}
+
+	// And the other writer's value is intact - the refused save changed nothing.
+	_, after := get(t, base, path)
+	if after["body"].(map[string]any)["score"].(float64) != 99 {
+		t.Errorf("a refused save must not have partially applied: %v", after["body"])
+	}
+}
+
+func TestUnconditionalSaveOverwrites(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a","score":1}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	res, _ := sendJSON(t, http.MethodPut, base, path, `{"body":{"id":"a","score":7}}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("an unconditional save should apply, got %d", res.StatusCode)
+	}
+	_, after := get(t, base, path)
+	if after["body"].(map[string]any)["score"].(float64) != 7 {
+		t.Errorf("unexpected body: %v", after["body"])
+	}
+}
+
+// TestSaveMergesAndSaysWhatItKept records the semantics an editor has to live with, and the reason
+// the response is not silent about them.
+//
+// Every write path in this engine is a shallow root-level merge, so a key the body omits keeps its
+// stored value. An operator deleting a line in a text box and pressing save would otherwise have no
+// way to know the key is still there. There is no replace primitive to reach for - a WriteOp is
+// merged on the way in, and a DeleteOp in the same transaction does not help, because staging reads
+// every operation against the baseline tree rather than against each other.
+func TestSaveMergesAndSaysWhatItKept(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a","keep":1,"remove":2}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	res, saved := sendJSON(t, http.MethodPut, base, path, `{"body":{"id":"a","keep":9}}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("save: %d (%v)", res.StatusCode, saved)
+	}
+	retained, _ := saved["retainedKeys"].([]any)
+	if len(retained) != 1 || retained[0] != "remove" {
+		t.Fatalf("the save must name the key it kept, or the operator learns about it later: %v", saved)
+	}
+	if saved["note"] == nil {
+		t.Error("a kept key needs an explanation, not just a list")
+	}
+
+	_, after := get(t, base, path)
+	body := after["body"].(map[string]any)
+	if body["keep"].(float64) != 9 {
+		t.Errorf("the edited value should be current: %v", body)
+	}
+	if _, still := body["remove"]; !still {
+		t.Error("this engine merges; the omitted key is expected to survive")
+	}
+
+	// The returned hash must describe what is stored, not what was sent - a client using it for
+	// its next conditional write would otherwise be refused every time.
+	if saved["contentHash"] != after["contentHash"] {
+		t.Errorf("the save reported hash %v but the document reads %v",
+			saved["contentHash"], after["contentHash"])
+	}
+}
+
+// TestSavedHashIsUsableForTheNextSave is the practical consequence: edit twice in a row without
+// re-reading in between.
+func TestSavedHashIsUsableForTheNextSave(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a","n":1}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	_, read := get(t, base, path)
+	_, first := sendJSON(t, http.MethodPut, base, path,
+		`{"body":{"id":"a","n":2},"ifContentHash":"`+read["contentHash"].(string)+`"}`)
+	hash, ok := first["contentHash"].(string)
+	if !ok || hash == "" {
+		t.Fatalf("a save must report the resulting hash: %v", first)
+	}
+	res, second := sendJSON(t, http.MethodPut, base, path,
+		`{"body":{"id":"a","n":3},"ifContentHash":"`+hash+`"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the hash from the previous save should still be current: %d (%v)",
+			res.StatusCode, second)
+	}
+}
+
+func TestIfAbsentCreatesOnlyOnce(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a"}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	res, body := sendJSON(t, http.MethodPut, base, path, `{"body":{"id":"a","v":2},"ifAbsent":true}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("ifAbsent against an existing document must be refused, got %d (%v)", res.StatusCode, body)
+	}
+}
+
+func TestContradictoryPreconditionsAreRefused(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a"}`)[0]
+	res, body := sendJSON(t, http.MethodPut, base,
+		"/v1/ns/demo%2Fusers/docs/"+put.DocID.String(),
+		`{"body":{"id":"a"},"ifAbsent":true,"ifContentHash":"`+strings.Repeat("a", 64)+`"}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("asserting both absence and a content hash is incoherent: got %d (%v)",
+			res.StatusCode, body)
+	}
+}
+
+func TestDocumentDelete(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a"}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	res, body := sendJSON(t, http.MethodDelete, base, path, `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("delete: %d (%v)", res.StatusCode, body)
+	}
+	res, _ = get(t, base, path)
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("the document should be gone from head, got %d", res.StatusCode)
+	}
+	// But still readable in history: a delete is a commit, not an erasure.
+	_, logBody := get(t, base, "/v1/ns/demo%2Fusers/log")
+	commits, _ := logBody["commits"].([]any)
+	prior := commits[1].(map[string]any)["hash"].(string)
+	res, _ = get(t, base, path+"?at="+prior)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("a deleted document must still be readable at a commit before the delete, got %d",
+			res.StatusCode)
+	}
+}
+
+func TestConditionalDeleteRefusesAStaleHash(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a","v":1}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+	_, read := get(t, base, path)
+	stale := read["contentHash"].(string)
+
+	if _, err := embed.PutJSONDocument(cs.opts.Runtime.Runtime, "demo/users", `{"id":"a","v":2}`); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := sendJSON(t, http.MethodDelete, base, path, `{"ifContentHash":"`+stale+`"}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("a conditional delete against a stale hash must be refused, got %d", res.StatusCode)
+	}
+	res, _ = get(t, base, path)
+	if res.StatusCode != http.StatusOK {
+		t.Error("the refused delete must not have removed anything")
+	}
+}
+
+func TestDocumentWritesRefusedWhileReadOnly(t *testing.T) {
+	cs, base := newFixture(t)
+	put := seed(t, cs, `{"id":"a"}`)[0]
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	for _, m := range []string{http.MethodPut, http.MethodDelete} {
+		res, body := sendJSON(t, m, base, path, `{"body":{"id":"a"}}`)
+		if res.StatusCode != http.StatusForbidden {
+			t.Errorf("%s on a read-only control plane: got %d (%v)", m, res.StatusCode, body)
+		}
+	}
+}
+
+func TestInvalidDocumentBodyIsRefused(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a"}`)[0]
+	res, _ := sendJSON(t, http.MethodPut, base,
+		"/v1/ns/demo%2Fusers/docs/"+put.DocID.String(), `{"body":"not an object"}`)
+	// A string is valid JSON but not a document; the engine is the authority on that, and the
+	// point of the test is that it is refused rather than stored.
+	if res.StatusCode == http.StatusOK {
+		t.Error("a non-object body should not be stored as a document")
+	}
+}
+
+// TestEngineWriteAndReplayAgree checks the write path this control plane actually uses against the
+// one that reconstructs it after a restart.
+//
+// They read the same WriteOp differently. The transaction engine merges the patch over whatever is
+// stored (transaction/default_engine.go: baseDoc.Merge), while replay treats the patch as the whole
+// document (embed/delta_replay.go: FromJSONWithID then PutDocument). A commit records the operation
+// it was given, not the merged result - so a write naming fewer keys than the document already has
+// is a case where the two readings could disagree, and a document could come back smaller after a
+// restart than it was when the write was acknowledged.
+//
+// This drives a real HTTP save over a file-backed namespace, closes it, reopens, and compares.
+func TestEngineWriteAndReplayAgree(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "data")
+	rt, err := embed.OpenFileRuntime(root, "demo", "demo/users", schema.None())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	srv := server.NewKdbServerRuntime(rt)
+	cs, err := New(Options{
+		Addr: "127.0.0.1:0", Runtime: srv, Namespace: "demo/users",
+		Version: "test", AllowWrites: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://" + cs.Addr().String()
+
+	put, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a","x":1}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	// A save naming only y - fewer keys than the stored document has.
+	if res, body := sendJSON(t, http.MethodPut, base, path, `{"body":{"id":"a","y":2}}`); res.StatusCode != http.StatusOK {
+		t.Fatalf("save: %d (%v)", res.StatusCode, body)
+	}
+	_, live := get(t, base, path)
+	liveKeys := keysOf(live["body"])
+	_, liveStatus := get(t, base, "/v1/ns/demo%2Fusers/status")
+	t.Logf("live head tree: %v", liveStatus["headCommit"].(map[string]any)["treeHash"])
+
+	_ = cs.Close()
+	rt.Close()
+
+	reopened, err := embed.OpenFileRuntime(root, "demo", "demo/users", schema.None())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	srv2 := server.NewKdbServerRuntime(reopened)
+	cs2, err := New(Options{
+		Addr: "127.0.0.1:0", Runtime: srv2, Namespace: "demo/users", Version: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs2.Close() })
+
+	base2 := "http://" + cs2.Addr().String()
+	res2, after := get(t, base2, path)
+	t.Logf("after restart: HTTP %d body=%v", res2.StatusCode, after)
+	_, list := get(t, base2, "/v1/ns/demo%2Fusers/docs")
+	t.Logf("documents after restart: %v", list["documents"])
+	if hc, ok := func() (map[string]any, bool) {
+		_, st := get(t, base2, "/v1/ns/demo%2Fusers/status")
+		m, ok := st["headCommit"].(map[string]any)
+		return m, ok
+	}(); ok {
+		t.Logf("restarted head tree: %v", hc["treeHash"])
+	}
+	_, lg := get(t, base2, "/v1/ns/demo%2Fusers/log")
+	if cs, ok := lg["commits"].([]any); ok {
+		t.Logf("commits after restart: %d", len(cs))
+	}
+	replayedKeys := keysOf(after["body"])
+
+	if liveKeys != replayedKeys {
+		t.Fatalf(
+			"the document reads differently before and after a restart.\n"+
+				"  live (transaction engine merged the patch): %s\n"+
+				"  after restart (replay took it whole):       %s\n"+
+				"A commit records the operation it was given, so a partial write is reconstructed "+
+				"as a smaller document than the one that was acknowledged.", liveKeys, replayedKeys)
+	}
+}
+
+func keysOf(body any) string {
+	m, ok := body.(map[string]any)
+	if !ok {
+		return "<absent>"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return "{" + strings.Join(keys, ",") + "}"
 }

@@ -211,14 +211,15 @@ func (s *Server) routes() http.Handler {
 	// Revert. Planning is a read - it computes a diff and writes nothing - so it is available
 	// whatever the write setting, and an operator can always see what a revert *would* do. Only
 	// applying is gated.
+	mux.Handle("PUT /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handlePutDocument))
+	mux.Handle("DELETE /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handleDeleteDocument))
+
 	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
 	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))
 
 	// Still specified but not built. Declared rather than omitted so the API's shape is honest
 	// about what is coming and a client gets 501 rather than 404.
 	for _, route := range []string{
-		"PUT /v1/ns/{ns}/docs/{id}",
-		"DELETE /v1/ns/{ns}/docs/{id}",
 		"PATCH /v1/settings",
 	} {
 		mux.Handle(route, s.notImplemented())

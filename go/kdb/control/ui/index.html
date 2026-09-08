@@ -91,6 +91,9 @@
   td.cell { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   pre.doc { margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 12px;
             white-space: pre-wrap; overflow-wrap: anywhere; }
+  textarea.doc { width: 100%; min-height: 200px; font-family: var(--mono); font-size: 12px;
+                 padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+                 background: var(--bg); color: var(--text); resize: vertical; }
   /* Time travel is a mode, not a filter: it has to be impossible to miss that what is on screen
      is not current. Hence a full-width bar rather than a subtle badge. */
   .timebar { display: flex; align-items: center; gap: 10px; padding: 8px 16px; font-size: 13px;
@@ -164,7 +167,7 @@ let token = sessionStorage.getItem(TOKEN_KEY) || "";
 // filter, so it lives here and every fetch consults it.
 let state = { ns: null, namespaces: [], tab: "data", commits: [], selected: null, hasMore: false,
               es: null, at: null, canWrite: false,
-              docs: [], docCursor: null, docsMore: false, openDoc: null,
+              docs: [], docCursor: null, docsMore: false, openDoc: null, editing: null,
               sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null };
 
 async function api(path, opts = {}) {
@@ -362,16 +365,101 @@ async function openDocument(docId) {
 }
 
 function drawDocument(doc) {
+  const editing = state.editing;
+  const canEdit = state.canWrite && doc.atHead !== false;
+
+  const meta = el("dl", { class: "kv" },
+    el("dt", { text: "Id" }), el("dd", {}, el("code", { text: doc.docId })),
+    el("dt", { text: "Commit" }), el("dd", {}, el("code", { text: (doc.commit || "").slice(0, 16) })),
+    el("dt", { text: "Read at" }),
+    el("dd", { text: doc.atHead === false ? "a past revision (read-only)" : "head" }));
+
+  if (!editing) {
+    $("docpanel").replaceChildren(
+      el("h2", { text: doc.docId.slice(0, 8) + "…" }),
+      el("div", { class: "body" }, meta,
+        el("div", { style: "margin-top:10px;display:flex;gap:8px" },
+          canEdit
+            ? el("button", { class: "act", text: "Edit", onclick: () => { state.editing = { text: JSON.stringify(doc.body, null, 2) }; drawDocument(doc); } })
+            : null,
+          canEdit
+            ? el("button", { class: "act danger", text: "Delete", onclick: () => deleteDocument(doc) })
+            : null,
+          !state.canWrite ? el("span", { class: "muted", style: "font-size:12px",
+              text: "read-only control plane" }) : null)),
+      el("pre", { class: "doc", text: JSON.stringify(doc.body, null, 2) }));
+    return;
+  }
+
+  const editor = el("textarea", { class: "doc", spellcheck: "false" });
+  editor.value = editing.text;
+  // Which keys the save would keep, computed as you type rather than reported afterwards. A write
+  // is a shallow merge in this engine, so a key deleted in the editor survives - that is worth
+  // knowing before pressing save, not after.
+  const warn = el("div", {});
+  const recheck = () => {
+    warn.replaceChildren();
+    let parsed;
+    try { parsed = JSON.parse(editor.value); } catch (e) {
+      warn.replaceChildren(el("div", { class: "err", text: "Not valid JSON: " + e.message }));
+      return null;
+    }
+    const kept = Object.keys(doc.body || {}).filter((k) => !(k in parsed));
+    if (kept.length) {
+      warn.replaceChildren(el("div", { class: "warn" },
+        "A write merges over the stored document, so ", el("code", { text: kept.join(", ") }),
+        " would be kept. To remove a key, delete the document and recreate it."));
+    }
+    return parsed;
+  };
+  editor.addEventListener("input", recheck);
+
+  const save = async () => {
+    const parsed = recheck();
+    if (!parsed) return;
+    try {
+      const saved = await api(nsPath("/docs/" + encodeURIComponent(doc.docId)), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: parsed, ifContentHash: doc.contentHash }),
+      });
+      state.editing = null;
+      await openDocument(doc.docId);
+      await renderData();
+      flash("Saved as commit " + (saved.commit || "").slice(0, 8) + ".");
+    } catch (e) {
+      warn.replaceChildren(el("div", { class: "err", text: e.message }));
+    }
+  };
+
   $("docpanel").replaceChildren(
-    el("h2", { text: doc.docId.slice(0, 8) + "…" }),
-    el("div", { class: "body" },
-      el("dl", { class: "kv" },
-        el("dt", { text: "Id" }), el("dd", {}, el("code", { text: doc.docId })),
-        el("dt", { text: "Commit" }), el("dd", {}, el("code", { text: (doc.commit || "").slice(0, 16) })),
-        el("dt", { text: "Read at" }), el("dd", { text: doc.atHead ? "head" : "a past revision (read-only)" }))),
-    // The body is shown exactly as stored: the engine round-trips a document byte-for-byte, and
-    // pretty-printing it here would show the operator something the database does not hold.
-    el("pre", { class: "doc", text: JSON.stringify(doc.body, null, 2) }));
+    el("h2", { text: "Editing " + doc.docId.slice(0, 8) + "…" }),
+    el("div", { class: "body" }, meta,
+      el("div", { style: "margin-top:10px" }, editor),
+      warn,
+      el("div", { style: "margin-top:8px;display:flex;gap:8px;align-items:center" },
+        el("button", { class: "act", text: "Save", onclick: save }),
+        el("button", { class: "act", text: "Cancel",
+                       onclick: () => { state.editing = null; drawDocument(doc); } }),
+        el("span", { class: "muted", style: "font-size:12px",
+          text: "saved only if the document has not changed since it was read" }))));
+  recheck();
+}
+
+async function deleteDocument(doc) {
+  if (!confirm("Delete this document?\n\nIt stays readable in history, and the delete is a commit "
+      + "that can be reverted.")) return;
+  try {
+    await api(nsPath("/docs/" + encodeURIComponent(doc.docId)), {
+      method: "DELETE", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ifContentHash: doc.contentHash }),
+    });
+    state.openDoc = null;
+    state.editing = null;
+    await renderData();
+    flash("Deleted. The document is still readable at any earlier commit.");
+  } catch (e) {
+    $("docpanel").replaceChildren(el("h2", { text: "Document" }), el("div", { class: "err", text: e.message }));
+  }
 }
 
 function formatBytes(n) {
@@ -819,6 +907,7 @@ $("nspick").addEventListener("change", (e) => {
   // A namespace switch resets everything view-shaped: a cursor, a selected commit or an open
   // document from the previous namespace means nothing in this one.
   Object.assign(state, { commits: [], selected: null, docs: [], docCursor: null, openDoc: null,
+                         editing: null,
                          sqlResult: null, sqlError: null });
   selectTab(state.tab);
 });

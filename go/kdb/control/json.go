@@ -40,6 +40,19 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, body)
 }
 
+// writeErrorWithDetail is writeError plus machine-readable specifics alongside the prose - the
+// conflicting documents and the content hash that beat a compare-and-set, which a client needs in
+// order to do anything better than retry blindly.
+func writeErrorWithDetail(w http.ResponseWriter, status int, code, message string, detail map[string]any) {
+	body := map[string]any{
+		"error": map[string]any{"code": code, "message": message},
+	}
+	for k, v := range detail {
+		body[k] = v
+	}
+	writeJSON(w, status, body)
+}
+
 // intParam reads a bounded integer query parameter. A value that will not parse is an error
 // rather than a silent fallback: a caller who asked for limit=abc has a bug, and answering with
 // the default hides it.
