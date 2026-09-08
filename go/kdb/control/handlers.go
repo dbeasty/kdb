@@ -2,6 +2,7 @@ package control
 
 import (
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -388,13 +389,25 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, _ auth.P
 	if descriptors == nil {
 		descriptors = []config.SettingDescriptor{}
 	}
+	// Which keys can actually move, so a client does not have to guess from the mutability class
+	// alone - a setting can be class "live" and still not be changeable here if this process did
+	// not hand over what the setter needs (the log level holder, for instance).
+	live := liveSettings()
+	mutable := make([]string, 0, len(live))
+	for key := range live {
+		if _, known := s.descriptor(key); known {
+			mutable = append(mutable, key)
+		}
+	}
+	sort.Strings(mutable)
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"settings": descriptors,
-		// Stated rather than implied: everything here is read-only in this build, and an operator
-		// should not have to discover that by trying.
-		"mutable": false,
-		"note": "settings are reported with provenance but cannot be changed through this build; " +
-			"see docs/kdb-control-ui-plan.md §7.3 for the knobs that are live-mutable in the engine",
+		"settings":    descriptors,
+		"revision":    s.SettingsRevision(),
+		"mutableKeys": mutable,
+		"canChange":   s.opts.AllowWrites,
+		"canPersist":  s.opts.AllowSettingsPersist,
+		"drift":       s.driftKeys(),
 	})
 }
 

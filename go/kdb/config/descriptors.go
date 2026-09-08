@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -293,6 +294,13 @@ func serviceSpecs() []settingSpec {
 			help:   "serve the embedded single-page control UI on the control listener",
 			value:  yn(func(s ServiceSettings) bool { return s.ControlUI }),
 			inFile: func(f *ServiceFile) bool { return f.ControlUI != nil },
+		},
+		{
+			key: "control.settingsPersist", flag: "control-settings-persist", env: "KDB_CONTROL_SETTINGS_PERSIST",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "allow a setting changed through the control plane to be written back to the config file. Off by default: that file belongs to whoever deploys, not to the server",
+			value:  yn(func(s ServiceSettings) bool { return s.ControlSettingsPersist }),
+			inFile: func(f *ServiceFile) bool { return f.ControlSettingsPersist != nil },
 		},
 		{
 			key: "log.level", flag: "log-level", env: "KDB_LOG_LEVEL",
@@ -600,4 +608,23 @@ func (d SettingDescriptor) Redact() SettingDescriptor {
 		d.Value = "********"
 	}
 	return d
+}
+
+// ParseLogLevel maps a log-level name onto slog's levels.
+//
+// Exported so the control plane validates a level change exactly as startup validates the flag -
+// one parser, so "warn" cannot be accepted in one place and rejected in the other.
+func ParseLogLevel(name string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("unknown log level %q (want debug, info, warn, or error)", name)
+	}
 }

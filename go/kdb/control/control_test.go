@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -361,8 +362,11 @@ func TestSettingsReportProvenance(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("settings: %d", res.StatusCode)
 	}
-	if body["mutable"] != false {
-		t.Error("this build cannot change settings and must say so rather than implying it can")
+	if body["revision"] == nil {
+		t.Error("the settings listing must carry the revision a patch compares against")
+	}
+	if body["canChange"] != false {
+		t.Error("a read-only control plane cannot change settings and must say so")
 	}
 	settings, _ := body["settings"].([]any)
 	var sawEnv, sawWarning bool
@@ -423,23 +427,10 @@ func TestMutatingEndpointsAreRefusedWhileReadOnly(t *testing.T) {
 	}
 }
 
-// TestWriteEnabledStillReportsUnbuiltEndpoints keeps "the server said no" and "the server cannot"
-// distinguishable, which are different operator problems.
-func TestWriteEnabledStillReportsUnbuiltEndpoints(t *testing.T) {
-	_, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
-	// Live settings mutation is specified in the plan (§7.4) and not built. Revert and the SQL
-	// console, which each stood in here in turn, are built now.
-	req, _ := http.NewRequest(http.MethodPatch, base+"/v1/settings", strings.NewReader("{}"))
-	req.Header.Set("Authorization", "Bearer alice:secret")
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("want 501 for an endpoint that is specified but not built, got %d", res.StatusCode)
-	}
-}
+// Every endpoint this control plane declares is now implemented, so the "declared but answers 501"
+// pattern has no remaining instance to test. An endpoint from the plan that is not built - the
+// recovery surface, §8 - is simply not registered and answers 404, which is what an unimplemented
+// route should look like once there is no half-built one left to distinguish it from.
 
 func TestUIIsServedOnlyWhenEnabled(t *testing.T) {
 	t.Run("off by default in these options", func(t *testing.T) {
@@ -1631,4 +1622,254 @@ func keysOf(body any) string {
 	}
 	sort.Strings(keys)
 	return "{" + strings.Join(keys, ",") + "}"
+}
+
+// withSettings builds a fixture whose descriptors are the real service defaults, plus a live log
+// level holder, so the settings endpoints have something true to report and change.
+func withSettings(level *slog.LevelVar, persist bool) func(*Options) {
+	return func(o *Options) {
+		o.AllowWrites = true
+		o.AllowSettingsPersist = persist
+		o.LogLevel = level
+		o.Settings = append(
+			config.Describe(nil, noEnvLookup, noFlagSet, config.DefaultServiceSettings()),
+			config.EnvOnlyDescriptors(noEnvLookup)...)
+	}
+}
+
+func noEnvLookup(string) (string, bool) { return "", false }
+func noFlagSet(string) bool             { return false }
+
+func TestLiveSettingChangeApplies(t *testing.T) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+	_, base := newFixture(t, withSettings(level, false))
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"changes":[{"key":"log.level","value":"debug"}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("patch: %d (%v)", res.StatusCode, body)
+	}
+	outcomes := body["changes"].([]any)
+	if outcomes[0].(map[string]any)["applied"] != true {
+		t.Fatalf("log.level is live-mutable and should have applied: %v", outcomes[0])
+	}
+	// The process's actual logger, not just the reported value.
+	if level.Level() != slog.LevelDebug {
+		t.Errorf("the running log level is still %v", level.Level())
+	}
+
+	// And the reported settings now say what is in force, and who changed it.
+	_, listed := get(t, base, "/v1/settings")
+	for _, raw := range listed["settings"].([]any) {
+		d := raw.(map[string]any)
+		if d["key"] != "log.level" {
+			continue
+		}
+		if d["value"] != "debug" {
+			t.Errorf("the listing should report the running value: %v", d["value"])
+		}
+		if d["source"] != "runtime" {
+			t.Errorf("a changed setting is sourced from the runtime, not its original layer: %v", d["source"])
+		}
+		if !strings.Contains(fmt.Sprint(d["sourceDetail"]), "changed at") {
+			t.Errorf("the change should be attributed: %v", d["sourceDetail"])
+		}
+	}
+}
+
+// TestRestartOnlySettingIsRefusedWithItsClass: "cannot change that" sends an operator looking. The
+// mutability class tells them what would work.
+func TestRestartOnlySettingIsRefusedWithItsClass(t *testing.T) {
+	_, base := newFixture(t, withSettings(new(slog.LevelVar), false))
+
+	for _, tc := range []struct{ key, value, wants string }{
+		{"listener.sqlAddr", `"tcp://127.0.0.1:1"`, "startup"},
+		{"governance.maxConnections", `99`, "listener or connection is created"},
+		{"cache.documentBytes", `1024`, "namespace"},
+		{"history.strategy", `"objects"`, "migration"},
+	} {
+		res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+			fmt.Sprintf(`{"changes":[{"key":%q,"value":%s}]}`, tc.key, tc.value))
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: want 400 when nothing applied, got %d (%v)", tc.key, res.StatusCode, body)
+			continue
+		}
+		outcome := body["changes"].([]any)[0].(map[string]any)
+		if outcome["applied"] == true {
+			t.Errorf("%s must not be changeable at runtime", tc.key)
+		}
+		if !strings.Contains(fmt.Sprint(outcome["refused"]), tc.wants) {
+			t.Errorf("%s: the refusal should explain what would work; got %q", tc.key, outcome["refused"])
+		}
+	}
+}
+
+func TestUnknownSettingIsRefused(t *testing.T) {
+	_, base := newFixture(t, withSettings(new(slog.LevelVar), false))
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"changes":[{"key":"not.a.setting","value":1}]}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (%v)", res.StatusCode, body)
+	}
+	if body["changes"].([]any)[0].(map[string]any)["refused"] != "no such setting" {
+		t.Errorf("unexpected refusal: %v", body["changes"])
+	}
+}
+
+func TestInvalidValueIsRefusedBeforeAnythingChanges(t *testing.T) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+	_, base := newFixture(t, withSettings(level, false))
+
+	res, _ := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"changes":[{"key":"log.level","value":"chatty"}]}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for an unknown level, got %d", res.StatusCode)
+	}
+	if level.Level() != slog.LevelInfo {
+		t.Error("a rejected value must not have been installed")
+	}
+}
+
+// TestDryRunChangesNothing: the review step before applying has to be exact, which means it runs
+// the same validation and then stops.
+func TestDryRunChangesNothing(t *testing.T) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelWarn)
+	_, base := newFixture(t, withSettings(level, false))
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"dryRun":true,"changes":[{"key":"log.level","value":"debug"}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("dry run: %d (%v)", res.StatusCode, body)
+	}
+	if body["dryRun"] != true {
+		t.Error("the response should say it was a dry run")
+	}
+	if level.Level() != slog.LevelWarn {
+		t.Error("a dry run must not change the running level")
+	}
+	// And an invalid value is still caught by a dry run - that is the point of it.
+	res, _ = sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"dryRun":true,"changes":[{"key":"log.level","value":"nonsense"}]}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Errorf("a dry run should surface an invalid value, got %d", res.StatusCode)
+	}
+}
+
+func TestSettingsRevisionGuardsAgainstOverwriting(t *testing.T) {
+	_, base := newFixture(t, withSettings(new(slog.LevelVar), false))
+
+	_, first := get(t, base, "/v1/settings")
+	rev := int64(first["revision"].(float64))
+
+	if res, _ := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		fmt.Sprintf(`{"expectRevision":%d,"changes":[{"key":"log.level","value":"debug"}]}`, rev)); res.StatusCode != http.StatusOK {
+		t.Fatalf("a patch at the current revision should apply, got %d", res.StatusCode)
+	}
+	// The same revision is now stale - someone else (this test) moved it.
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		fmt.Sprintf(`{"expectRevision":%d,"changes":[{"key":"log.level","value":"warn"}]}`, rev))
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("a stale revision must be refused, got %d (%v)", res.StatusCode, body)
+	}
+}
+
+// TestDriftReportsWhatARestartWouldUndo: a live change that silently vanishes on restart is a trap.
+func TestDriftReportsWhatARestartWouldUndo(t *testing.T) {
+	_, base := newFixture(t, withSettings(new(slog.LevelVar), false))
+
+	_, clean := get(t, base, "/v1/settings/drift")
+	if len(clean["drift"].([]any)) != 0 {
+		t.Fatalf("a freshly started process has no drift: %v", clean["drift"])
+	}
+
+	sendJSON(t, http.MethodPatch, base, "/v1/settings", `{"changes":[{"key":"log.level","value":"error"}]}`)
+
+	_, drifted := get(t, base, "/v1/settings/drift")
+	items := drifted["drift"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("the applied change should show as drift: %v", items)
+	}
+	item := items[0].(map[string]any)
+	if item["key"] != "log.level" || item["running"] != "error" || item["atStartup"] != "info" {
+		t.Errorf("drift should say running vs startup: %v", item)
+	}
+}
+
+func TestPersistIsRefusedWhenTheDeploymentForbidsIt(t *testing.T) {
+	_, base := newFixture(t, withSettings(new(slog.LevelVar), false))
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"debug"}]}`)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("want 403 when persistence is off, got %d (%v)", res.StatusCode, body)
+	}
+	if body["error"].(map[string]any)["code"] != "persist_disabled" {
+		t.Errorf("the refusal should name the reason: %v", body["error"])
+	}
+	// And it must point at the alternative rather than just refusing.
+	if !strings.Contains(fmt.Sprint(body["error"].(map[string]any)["message"]), "drift") {
+		t.Error("the refusal should say the change can still be applied and will show as drift")
+	}
+}
+
+func TestSettingsCannotChangeOnAReadOnlyControlPlane(t *testing.T) {
+	_, base := newFixture(t, func(o *Options) {
+		o.LogLevel = new(slog.LevelVar)
+		o.Settings = append(
+			config.Describe(nil, noEnvLookup, noFlagSet, config.DefaultServiceSettings()),
+			config.EnvOnlyDescriptors(noEnvLookup)...)
+	})
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"changes":[{"key":"log.level","value":"debug"}]}`)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("want 403, got %d (%v)", res.StatusCode, body)
+	}
+}
+
+func TestSingleSettingLookup(t *testing.T) {
+	_, base := newFixture(t, withSettings(new(slog.LevelVar), false))
+
+	res, body := get(t, base, "/v1/settings/log.level")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("lookup: %d (%v)", res.StatusCode, body)
+	}
+	if body["liveMutable"] != true {
+		t.Error("log.level is live-mutable and should say so")
+	}
+	d := body["setting"].(map[string]any)
+	if d["help"] == nil || d["help"] == "" {
+		t.Error("a single-setting lookup is where the full help text belongs")
+	}
+
+	res, body = get(t, base, "/v1/settings/listener.sqlAddr")
+	if body["liveMutable"] != false || body["refusal"] == nil {
+		t.Errorf("a restart-only setting should say so and explain: %v", body)
+	}
+
+	res, _ = get(t, base, "/v1/settings/nope")
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("an unknown key is 404, got %d", res.StatusCode)
+	}
+}
+
+// TestMemoryBudgetChangeReachesAdmission: the memory trio share one setter, so a change to one has
+// to carry the other two forward rather than resetting them.
+func TestMemoryBudgetChangeReachesAdmission(t *testing.T) {
+	cs, base := newFixture(t, withSettings(new(slog.LevelVar), false))
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"changes":[{"key":"memory.budgetMB","value":512}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("patch: %d (%v)", res.StatusCode, body)
+	}
+	if cs.opts.Runtime.Admission() == nil {
+		t.Fatal("setting a budget should have installed admission control")
+	}
+	// The reserve came from the defaults, not from zero: changing the budget must not silently
+	// discard the rest of the tuple the setter takes.
+	if got := cs.opts.Runtime.Admission().RescueReserveBytes(); got == 0 {
+		t.Error("the rescue reserve was reset to zero by a budget change")
+	}
 }

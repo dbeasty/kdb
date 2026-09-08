@@ -27,7 +27,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M4 | Rollback | **partial** — plan/apply with `expectHead` are done; per-document history and the document timeline are not |
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
-| M6b | Settings (mutation) | **not started** — `PATCH /v1/settings` answers 501; no live setters wired, no persistence, no drift |
+| M6b | Settings (mutation) | **partial** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting; writing back to the config file is not implemented |
 | M7 | Recovery | **not started** — nothing from §8 exists |
 
 ### API surface (§5)
@@ -39,9 +39,12 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 
 `POST /v1/ns/{ns}/sql` serves all three statement kinds, with permission decided per statement.
 `PUT`/`DELETE /v1/ns/{ns}/docs/{id}` take an optional `ifContentHash` (or `ifAbsent`) and answer 409
-with the hash that beat them.
+with the hash that beat them. `POST /v1/settings/validate` is folded into `PATCH` as `dryRun`
+rather than being a second endpoint that could drift from it.
 
-**Declared, answering 501:** `PATCH /v1/settings`.
+`PATCH /v1/settings` applies changes with per-key outcomes; `/v1/settings/{key}` and
+`/v1/settings/drift` are implemented. Nothing is declared-but-unbuilt any more: an endpoint from §8
+that does not exist simply answers 404.
 
 **Not started:** the document list (`/docs`), per-document history, per-document diff
 (`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/settings/{key}`,
@@ -64,12 +67,12 @@ with the hash that beat them.
 | 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
 | 8 | Schema & indexes | **partial** — schema only |
 | 9 | Operations dashboard | **partial** — process and admission state; no sessions, leases or peers |
-| 10 | Settings | **built** (read-only), including the ignored-configuration panel |
+| 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a drift banner, and the ignored-configuration panel |
 | 11 | Recovery | **not built** |
 
 ### What to do next, in order
 
-1. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime, and the
+1. **Persisting a setting (M6b's other half).** The six knobs §7.3 names are already safe to change at runtime, and the
    read view that makes them legible is done.
 2. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece
    and is mostly composition of things that already exist.
@@ -631,10 +634,13 @@ where a mid-flight change has to be reasoned about against group commit and the 
 
 A live change that vanishes on restart is a trap. Two rules:
 
-- `PATCH /v1/settings` takes `persist: bool`. With `persist:true` and a `--config` file in use, the
-  change is written back to the `ServiceFile` JSON (which already has pointer fields distinguishing
-  "absent" from zero, so a partial file is its natural shape) and applied. Without a config file,
-  `persist:true` is refused with an explanation rather than silently ignored.
+- `PATCH /v1/settings` takes `persist: bool`, and the open decision on it is settled by making it
+  opt-in at the deployment level: `--control-settings-persist`, **off by default**. In a
+  GitOps-managed deployment the config file belongs to a deployment tool, and a server rewriting it
+  is a surprise rather than a feature - so a deployment has to say it wants that before the API will
+  entertain it. Asking to persist without it is refused with an explanation that names the
+  alternative (apply live, and read the change back off `/v1/settings/drift`) rather than just
+  saying no. The write-back itself is not implemented yet.
 - `GET /v1/settings/drift` reports every running value that differs from what the config file and
   environment would produce on a restart. The settings screen shows a persistent banner while
   drift is non-empty. An operator should never be surprised by a restart.
@@ -972,10 +978,10 @@ saved queries and dashboards.
 3. Confirm v1 is Go-only with no Kotlin counterpart obligation.
 4. Confirm rollback is forward-revert-only, with no history rewriting in the product ever
    (recommended — it is what makes peers safe).
-5. Confirm that live settings changes may be persisted back into the `--config` file by the
-   server (§7.4). The alternative — apply-only, never write config — is defensible in a
-   GitOps-managed deployment where the file is owned by a deployment tool, and if that is the house
-   style, `persist` should be refused rather than merely optional.
+5. ~~Confirm that live settings changes may be persisted back into the `--config` file by the
+   server (§7.4).~~ **Settled**: opt-in per deployment via `--control-settings-persist`, off by
+   default, and refused with an explanation otherwise. A GitOps deployment simply never enables it,
+   and drift reporting means an apply-only change is never silently lost.
 6. Confirm the offline recovery boundary (§8.4): the control plane never mutates a live data
    directory, and `repair-segments` / `migrate-history` / in-place restore stay operator-run
    commands. The alternative is building a maintenance-mode supervisor contract, which is a

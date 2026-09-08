@@ -30,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"log/slog"
+
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/config"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -70,6 +72,14 @@ type Options struct {
 	// ServeUI serves the embedded single-page UI at /. Off leaves the API alone on this
 	// listener.
 	ServeUI bool
+	// LogLevel is the process's live log level, when the caller holds one. Without it the log
+	// level is reported but cannot be changed, and the refusal says so.
+	LogLevel *slog.LevelVar
+	// AllowSettingsPersist lets an applied setting also be written back to the config file. Off by
+	// default: in a GitOps-managed deployment that file belongs to a deployment tool, and a server
+	// rewriting it is a surprise rather than a feature. A change applied without it is still
+	// reported as drift, so nothing is silently lost.
+	AllowSettingsPersist bool
 	// Now is the clock, for tests. nil uses time.Now.
 	Now func() time.Time
 }
@@ -83,9 +93,19 @@ type Server struct {
 	started time.Time
 
 	mu sync.RWMutex
-	// settings is Options.Settings, held under mu so a later milestone that applies a live
-	// setting change can update the reported set without racing readers.
+	// settings is what this process is currently running on: Options.Settings at startup, updated
+	// in place as changes are applied.
 	settings []config.SettingDescriptor
+	// startupSettings is the same set as it was when the process started, kept so drift can be
+	// reported as "what a restart would undo". Comparing against a re-resolution of file and
+	// environment would be wrong: flags set on the command line would be set again on a restart.
+	startupSettings []config.SettingDescriptor
+	// revision counts applied changes, for the compare-and-swap on a patch.
+	revision int64
+
+	// applyMu serializes whole patches. Settings that share one engine setter - the memory trio -
+	// would otherwise let two concurrent patches install a combination neither asked for.
+	applyMu sync.Mutex
 }
 
 // New binds Addr and starts serving immediately.
@@ -104,11 +124,15 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("control listen %s: %w", opts.Addr, err)
 	}
 	s := &Server{
-		opts:     opts,
-		ln:       ln,
-		events:   newEventHub(),
-		started:  opts.Now(),
-		settings: opts.Settings,
+		opts:            opts,
+		ln:              ln,
+		events:          newEventHub(),
+		started:         opts.Now(),
+		settings:        append([]config.SettingDescriptor(nil), opts.Settings...),
+		startupSettings: append([]config.SettingDescriptor(nil), opts.Settings...),
+		// Starts at 1, not 0: zero is what a caller sends to mean "do not check the revision", so
+		// a real revision of zero would silently skip the compare-and-swap it asked for.
+		revision: 1,
 	}
 	s.httpSrv = &http.Server{
 		Handler: s.routes(),
@@ -206,6 +230,9 @@ func (s *Server) routes() http.Handler {
 	// existing admin: grant vocabulary (auth.AdminAction -> kind "admin").
 	mux.Handle("GET /v1/health", s.adminRead(s.handleHealth))
 	mux.Handle("GET /v1/settings", s.adminRead(s.handleSettings))
+	mux.Handle("GET /v1/settings/drift", s.adminRead(s.handleSettingsDrift))
+	mux.Handle("GET /v1/settings/{key}", s.adminRead(s.handleSettingByKey))
+	mux.Handle("PATCH /v1/settings", s.adminRead(s.handlePatchSettings))
 	mux.Handle("GET /v1/ops/runtime", s.adminRead(s.handleOpsRuntime))
 
 	// Revert. Planning is a read - it computes a diff and writes nothing - so it is available
@@ -216,14 +243,6 @@ func (s *Server) routes() http.Handler {
 
 	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
 	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))
-
-	// Still specified but not built. Declared rather than omitted so the API's shape is honest
-	// about what is coming and a client gets 501 rather than 404.
-	for _, route := range []string{
-		"PATCH /v1/settings",
-	} {
-		mux.Handle(route, s.notImplemented())
-	}
 
 	if s.opts.ServeUI {
 		mux.Handle("GET /", uiHandler())

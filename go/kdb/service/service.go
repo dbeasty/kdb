@@ -76,6 +76,7 @@ func Main() {
 	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
 	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
+	fs.BoolVar(&flagVals.ControlSettingsPersist, "control-settings-persist", flagVals.ControlSettingsPersist, "let a setting changed through the control plane also be written back to the --config file. Off by default: in a GitOps-managed deployment that file belongs to a deployment tool, and a server rewriting it is a surprise rather than a feature. A change applied without this is still reported under /v1/settings/drift, so nothing is silently lost on the next restart")
 	fs.StringVar(&flagVals.LogLevel, "log-level", flagVals.LogLevel, "minimum log level: debug, info, warn, error")
 	fs.StringVar(&flagVals.LogFormat, "log-format", flagVals.LogFormat, "log output format: text or json")
 	fs.StringVar(&flagVals.Durability, "durability", flagVals.Durability, "how much of the write-out a commit waits for: sync (default - an acknowledged write is fsynced; concurrent commits share the fsync via group commit, so this is no longer a physical sync per write), async (acknowledged once queued in memory - a crash can lose whatever had not been flushed), or memory (nothing is written to the delta log at all; everything is lost on restart - tests and throwaway workloads only)")
@@ -129,7 +130,7 @@ func Main() {
 	rbac, abortAfter, drainTimeout := cfg.RBAC, cfg.AbortAfter, cfg.DrainTimeout
 	controlAddr := cfg.ControlAddr
 
-	logger, err := buildLogger(cfg.LogLevel, cfg.LogFormat)
+	logger, logLevel, err := buildLogger(cfg.LogLevel, cfg.LogFormat)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
@@ -469,6 +470,9 @@ func Main() {
 			AllowWrites: cfg.ControlWrite,
 			Version:     version.Get().Version,
 			ServeUI:     cfg.ControlUI,
+			// The live level holder, so log.level is adjustable without a restart.
+			LogLevel:             logLevel,
+			AllowSettingsPersist: cfg.ControlSettingsPersist,
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)
@@ -620,28 +624,30 @@ func saveCostModelState(srv *server.KdbServerRuntime, path string) {
 // buildLogger constructs the process-wide slog.Logger from --log-level/--log-format
 // (kdb-finish-up-plan Phase 2.5). Text is the default for a human watching a terminal; json for
 // log pipelines.
-func buildLogger(level, format string) (*slog.Logger, error) {
-	var lvl slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "info":
-		lvl = slog.LevelInfo
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		return nil, fmt.Errorf("unknown --log-level %q (want debug, info, warn, or error)", level)
+// buildLogger constructs the process-wide logger and returns the level holder alongside it.
+//
+// The level lives in a *slog.LevelVar rather than being baked into the handler's options, which is
+// what makes it adjustable while the process runs: the handler consults the var on every record.
+// "Turn on debug logging for two minutes" is worth more than its cost, and a restart to get it is
+// exactly when the thing you wanted to see stops happening.
+//
+// The format is not adjustable the same way - a handler is built once around it - which is why
+// log.format is a restart setting and log.level is not.
+func buildLogger(level, format string) (*slog.Logger, *slog.LevelVar, error) {
+	lvl, err := config.ParseLogLevel(level)
+	if err != nil {
+		return nil, nil, err
 	}
-	opts := &slog.HandlerOptions{Level: lvl}
+	holder := new(slog.LevelVar)
+	holder.Set(lvl)
+	opts := &slog.HandlerOptions{Level: holder}
 	switch strings.ToLower(format) {
 	case "text":
-		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), holder, nil
 	case "json":
-		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), nil
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), holder, nil
 	default:
-		return nil, fmt.Errorf("unknown --log-format %q (want text or json)", format)
+		return nil, nil, fmt.Errorf("unknown --log-format %q (want text or json)", format)
 	}
 }
 
