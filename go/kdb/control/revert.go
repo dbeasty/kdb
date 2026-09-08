@@ -44,24 +44,24 @@ func decodeRevertRequest(w http.ResponseWriter, r *http.Request) (revertRequest,
 // handleRevertPlan is the dry run. It computes the diff from head to the target - which is
 // precisely the set of changes applying would make - and returns the head it was computed against,
 // so apply can refuse if the world has moved.
-func (s *Server) handleRevertPlan(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
+func (s *Server) handleRevertPlan(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	req, ok := decodeRevertRequest(w, r)
 	if !ok {
 		return
 	}
-	head, err := s.resolveRevision("head")
+	head, err := s.resolveRevisionFor(rt, "head")
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
 	}
-	target, err := s.resolveRevision(req.To)
+	target, err := s.resolveRevisionFor(rt, req.To)
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
 	}
 
 	// head -> target: the entries here are the writes and deletes a revert would perform.
-	_, _, entries, err := s.diffRevisions(head.Hex(), target.Hex())
+	_, _, entries, err := s.diffRevisions(rt, head.Hex(), target.Hex())
 	if err != nil {
 		if isUnknownRevision(err) {
 			s.writeRevisionError(w, err)
@@ -90,7 +90,7 @@ func (s *Server) handleRevertPlan(w http.ResponseWriter, r *http.Request, _ auth
 }
 
 // handleRevertApply performs the revert, refusing if head has moved since the plan.
-func (s *Server) handleRevertApply(w http.ResponseWriter, r *http.Request, principal auth.Principal, ns string) {
+func (s *Server) handleRevertApply(w http.ResponseWriter, r *http.Request, principal auth.Principal, ns string, rt *serverRuntime) {
 	req, ok := decodeRevertRequest(w, r)
 	if !ok {
 		return
@@ -101,12 +101,12 @@ func (s *Server) handleRevertApply(w http.ResponseWriter, r *http.Request, princ
 				`computed from. Call the plan endpoint first.`)
 		return
 	}
-	expect, err := s.resolveRevision(req.ExpectHead)
+	expect, err := s.resolveRevisionFor(rt, req.ExpectHead)
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
 	}
-	head, err := s.resolveRevision("head")
+	head, err := s.resolveRevisionFor(rt, "head")
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
@@ -120,12 +120,11 @@ func (s *Server) handleRevertApply(w http.ResponseWriter, r *http.Request, princ
 		return
 	}
 
-	rt := s.opts.Runtime.Runtime
-	if rt == nil {
+	if rt.Runtime == nil {
 		writeError(w, http.StatusInternalServerError, "no_runtime", "runtime has no embedded runtime")
 		return
 	}
-	result, err := embed.RevertTo(rt, ns, req.To)
+	result, err := embed.RevertTo(rt.Runtime, ns, req.To)
 	if err != nil {
 		if isUnknownRevision(err) {
 			s.writeRevisionError(w, err)

@@ -26,8 +26,8 @@ import (
 
 // commitDAG unwraps the runtime's DAG to the concrete type, for the branch and tag listings that
 // are not on the navigator interface.
-func (s *Server) commitDAG() (*dag.InMemoryCommitDag, error) {
-	rt := s.opts.Runtime.Runtime
+func (s *Server) commitDAGFor(srt *serverRuntime) (*dag.InMemoryCommitDag, error) {
+	rt := srt.Runtime
 	if rt == nil {
 		return nil, errors.New("runtime has no embedded runtime")
 	}
@@ -42,8 +42,8 @@ func (s *Server) commitDAG() (*dag.InMemoryCommitDag, error) {
 }
 
 // navigator is the history API, from whichever DAG this runtime has.
-func (s *Server) navigator() (dag.HistoryNavigator, error) {
-	rt := s.opts.Runtime.Runtime
+func (s *Server) navigatorFor(srt *serverRuntime) (dag.HistoryNavigator, error) {
+	rt := srt.Runtime
 	if rt == nil {
 		return nil, errors.New("runtime has no embedded runtime")
 	}
@@ -59,8 +59,8 @@ func (s *Server) navigator() (dag.HistoryNavigator, error) {
 // The accepted grammar is the engine's, not this package's: a branch, a tag (tag:v1), a full or
 // abbreviated hash, head, and the ~n / ^ walks - see dag.ParseRevision. An empty spec means head,
 // which is the only thing HTTP adds, because an omitted query parameter should mean "now".
-func (s *Server) resolveRevision(spec string) (codec.Hash, error) {
-	nav, err := s.navigator()
+func (s *Server) resolveRevisionFor(srt *serverRuntime, spec string) (codec.Hash, error) {
+	nav, err := s.navigatorFor(srt)
 	if err != nil {
 		return codec.Hash{}, err
 	}
@@ -77,7 +77,7 @@ func (s *Server) resolveRevision(spec string) (codec.Hash, error) {
 	// spec the engine has already rejected is retried, so branch names, tags and the ~/^ walks
 	// keep their meanings even if one of them happens to look like hex.
 	if prefix, ok := hashPrefix(spec); ok {
-		if h, found := s.resolvePrefix(prefix); found {
+		if h, found := s.resolvePrefix(srt, prefix); found {
 			return h, nil
 		}
 	}
@@ -103,8 +103,8 @@ func hashPrefix(spec string) (string, bool) {
 // resolvePrefix resolves an abbreviated hash, refusing an ambiguous one. Picking arbitrarily among
 // matches is the one outcome worse than refusing: it shows an operator a different commit from the
 // one they named, with nothing to indicate it.
-func (s *Server) resolvePrefix(prefix string) (codec.Hash, bool) {
-	d, err := s.commitDAG()
+func (s *Server) resolvePrefix(srt *serverRuntime, prefix string) (codec.Hash, bool) {
+	d, err := s.commitDAGFor(srt)
 	if err != nil {
 		return codec.Hash{}, false
 	}
@@ -179,8 +179,8 @@ func summarizeCommit(c document.Commit) commitSummary {
 }
 
 // log lists commits back from a revision, newest first.
-func (s *Server) log(from codec.Hash, limit, skip int) ([]commitSummary, bool, error) {
-	nav, err := s.navigator()
+func (s *Server) log(srt *serverRuntime, from codec.Hash, limit, skip int) ([]commitSummary, bool, error) {
+	nav, err := s.navigatorFor(srt)
 	if err != nil {
 		return nil, false, err
 	}
@@ -194,7 +194,7 @@ func (s *Server) log(from codec.Hash, limit, skip int) ([]commitSummary, bool, e
 	if more {
 		infos = infos[:limit]
 	}
-	refs := s.refsByCommit()
+	refs := s.refsByCommit(srt)
 	out := make([]commitSummary, 0, len(infos))
 	for _, info := range infos {
 		sum := summarizeInfo(info)
@@ -205,9 +205,9 @@ func (s *Server) log(from codec.Hash, limit, skip int) ([]commitSummary, bool, e
 }
 
 // refsByCommit indexes branch and tag names by the commit they point at.
-func (s *Server) refsByCommit() map[string][]string {
+func (s *Server) refsByCommit(srt *serverRuntime) map[string][]string {
 	out := map[string][]string{}
-	d, err := s.commitDAG()
+	d, err := s.commitDAGFor(srt)
 	if err != nil {
 		return out
 	}
@@ -238,8 +238,8 @@ type diffEntry struct {
 // the delta log before it can be compared. Going through the adapter rather than through
 // dag.DocumentTreeStore is what keeps that rebuild outside the DAG's own lock; see
 // ServerEngine.TreeAt.
-func (s *Server) diffRevisions(fromSpec, toSpec string) (codec.Hash, codec.Hash, []diffEntry, error) {
-	rt := s.opts.Runtime.Runtime
+func (s *Server) diffRevisions(srt *serverRuntime, fromSpec, toSpec string) (codec.Hash, codec.Hash, []diffEntry, error) {
+	rt := srt.Runtime
 	if rt == nil {
 		return codec.Hash{}, codec.Hash{}, nil, errors.New("runtime has no embedded runtime")
 	}

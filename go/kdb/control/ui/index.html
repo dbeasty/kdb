@@ -79,10 +79,18 @@
   button.act:hover { border-color: var(--accent); }
   .gate { max-width: 460px; margin: 60px auto; }
   .gate p { color: var(--muted); font-size: 13px; }
-  .lane { font-family: var(--mono); color: var(--muted); white-space: pre; }
   .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
   .kv dt { color: var(--muted); }
   .kv dd { margin: 0; overflow-wrap: anywhere; }
+  select.ns { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+              border-radius: 6px; padding: 3px 6px; font-size: 12px; }
+  textarea.sql { width: 100%; min-height: 96px; font-family: var(--mono); font-size: 13px;
+                 padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+                 background: var(--bg); color: var(--text); resize: vertical; }
+  .grid-wrap { overflow-x: auto; }
+  td.cell { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  pre.doc { margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 12px;
+            white-space: pre-wrap; overflow-wrap: anywhere; }
   /* Time travel is a mode, not a filter: it has to be impossible to miss that what is on screen
      is not current. Hence a full-width bar rather than a subtle badge. */
   .timebar { display: flex; align-items: center; gap: 10px; padding: 8px 16px; font-size: 13px;
@@ -103,14 +111,16 @@
 <body>
 <header>
   <h1>KDB Control</h1>
-  <span class="ns" id="ns"></span>
+  <select id="nspick" class="ns" title="Namespace"></select>
   <span class="head-hash muted" id="head"></span>
   <span class="sp"></span>
   <span class="live"><span class="dot" id="livedot"></span><span id="livetext">offline</span></span>
   <button class="act" id="signout" hidden>Sign out</button>
 </header>
 <nav id="tabs" hidden>
-  <button data-tab="commits" aria-selected="true">Commits</button>
+  <button data-tab="data" aria-selected="true">Data</button>
+  <button data-tab="sql" aria-selected="false">SQL</button>
+  <button data-tab="commits" aria-selected="false">Commits</button>
   <button data-tab="refs" aria-selected="false">Refs</button>
   <button data-tab="schema" aria-selected="false">Schema</button>
   <button data-tab="settings" aria-selected="false">Settings</button>
@@ -152,8 +162,10 @@ const TOKEN_KEY = "kdb.control.token";
 let token = sessionStorage.getItem(TOKEN_KEY) || "";
 // `at` is the revision every view reads at: null means head. It is a mode rather than a per-view
 // filter, so it lives here and every fetch consults it.
-let state = { ns: null, tab: "commits", commits: [], selected: null, hasMore: false, es: null,
-              at: null, canWrite: false };
+let state = { ns: null, namespaces: [], tab: "data", commits: [], selected: null, hasMore: false,
+              es: null, at: null, canWrite: false,
+              docs: [], docCursor: null, docsMore: false, openDoc: null,
+              sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -180,7 +192,11 @@ function signOut(why) {
 
 function renderGate(message) {
   $("tabs").hidden = true; $("signout").hidden = true;
-  $("ns").textContent = ""; $("head").textContent = "";
+  // The namespace picker is emptied rather than hidden: an option list left over from a previous
+  // session would offer namespaces this one has not authenticated for.
+  $("nspick").replaceChildren();
+  $("head").textContent = "";
+  $("timebar").hidden = true;
   setLive(false, "offline");
   const input = el("input", { type: "password", id: "tok", placeholder: "user:password or token",
                               style: "width:100%;margin:8px 0", autocomplete: "current-password" });
@@ -228,6 +244,16 @@ function atQuery(sep) {
   return state.at ? sep + "at=" + encodeURIComponent(state.at) : "";
 }
 
+// The namespace picker is a real switch, not a label: one process can serve several, and the whole
+// app follows the selection.
+function renderNamespacePicker() {
+  const sel = $("nspick");
+  sel.replaceChildren(...state.namespaces.map((n) =>
+    el("option", { value: n.id, selected: n.id === state.ns ? "selected" : null }, n.id)));
+  sel.disabled = state.namespaces.length < 2;
+  sel.title = state.namespaces.length < 2 ? "This server serves one namespace" : "Switch namespace";
+}
+
 function setLive(on, text, bad) {
   const dot = $("livedot");
   dot.className = "dot" + (bad ? " err" : on ? " on" : "");
@@ -245,9 +271,10 @@ function connectEvents() {
 async function boot() {
   try {
     const [health, namespaces] = await Promise.all([api("/v1/health"), api("/v1/namespaces")]);
-    state.ns = (namespaces.namespaces[0] || {}).id || health.namespace;
+    state.namespaces = namespaces.namespaces || [];
+    state.ns = namespaces.default || (state.namespaces[0] || {}).id || health.namespace;
     state.canWrite = health.controlWritesEnabled === true;
-    $("ns").textContent = state.ns;
+    renderNamespacePicker();
     $("tabs").hidden = false; $("signout").hidden = false;
     connectEvents();
     await selectTab(state.tab);
@@ -261,7 +288,9 @@ async function selectTab(tab) {
   for (const b of $("tabs").children) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   setMain(el("div", { class: "empty", text: "Loading…" }));
   try {
-    if (tab === "commits") await renderCommits();
+    if (tab === "data") await renderData();
+    else if (tab === "sql") await renderSQL();
+    else if (tab === "commits") await renderCommits();
     else if (tab === "refs") await renderRefs();
     else if (tab === "schema") await renderSchema();
     else if (tab === "settings") await renderSettings();
@@ -272,6 +301,152 @@ async function selectTab(tab) {
 }
 
 const nsPath = (suffix) => "/v1/ns/" + encodeURIComponent(state.ns) + suffix;
+
+// ---- Data browser -------------------------------------------------------------------------
+
+async function renderData(append = false) {
+  const q = new URLSearchParams({ limit: "50" });
+  if (append && state.docCursor) q.set("cursor", state.docCursor);
+  if (state.at) q.set("at", state.at);
+  const page = await api(nsPath("/docs?" + q));
+  state.docs = append ? state.docs.concat(page.documents) : page.documents;
+  state.docCursor = page.nextCursor || null;
+  state.docsMore = page.hasMore === true;
+  drawData();
+}
+
+function drawData() {
+  const rows = state.docs.map((d) => {
+    const tr = el("tr", { class: "pick" + (state.openDoc && state.openDoc.docId === d.docId ? " sel" : "") },
+      el("td", {}, el("code", { text: d.docId })),
+      el("td", { class: "cell" }, el("code", { text: d.preview })),
+      el("td", { class: "muted" }, formatBytes(d.sizeBytes)));
+    tr.addEventListener("click", () => openDocument(d.docId));
+    return tr;
+  });
+
+  const list = el("div", { class: "card" },
+    el("h2", { text: "Documents" + (state.at ? " at " + state.at : "") }),
+    rows.length
+      ? el("div", { class: "grid-wrap" }, el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Document" }), el("th", { text: "Preview" }),
+                              el("th", { text: "Size" }))),
+          el("tbody", {}, rows)))
+      : el("div", { class: "empty", text: "This namespace holds no documents." }),
+    state.docsMore
+      ? el("div", { class: "body" },
+          el("button", { class: "act", text: "Load more", onclick: () => renderData(true) }))
+      : null);
+
+  const panel = el("div", { class: "card", id: "docpanel" },
+    el("h2", { text: "Document" }),
+    el("div", { class: "empty", text: "Select a document." }));
+
+  setMain(el("div", { class: "row" },
+    el("div", { class: "col", style: "flex:2 1 520px" }, list),
+    el("div", { class: "col" }, panel)));
+
+  if (state.openDoc) drawDocument(state.openDoc);
+}
+
+async function openDocument(docId) {
+  const panel = $("docpanel");
+  panel.replaceChildren(el("h2", { text: "Document" }), el("div", { class: "empty", text: "Loading…" }));
+  try {
+    const doc = await api(nsPath("/docs/" + encodeURIComponent(docId)) + atQuery("?"));
+    state.openDoc = doc;
+    drawData();
+  } catch (e) {
+    panel.replaceChildren(el("h2", { text: "Document" }), el("div", { class: "err", text: e.message }));
+  }
+}
+
+function drawDocument(doc) {
+  $("docpanel").replaceChildren(
+    el("h2", { text: doc.docId.slice(0, 8) + "…" }),
+    el("div", { class: "body" },
+      el("dl", { class: "kv" },
+        el("dt", { text: "Id" }), el("dd", {}, el("code", { text: doc.docId })),
+        el("dt", { text: "Commit" }), el("dd", {}, el("code", { text: (doc.commit || "").slice(0, 16) })),
+        el("dt", { text: "Read at" }), el("dd", { text: doc.atHead ? "head" : "a past revision (read-only)" }))),
+    // The body is shown exactly as stored: the engine round-trips a document byte-for-byte, and
+    // pretty-printing it here would show the operator something the database does not hold.
+    el("pre", { class: "doc", text: JSON.stringify(doc.body, null, 2) }));
+}
+
+function formatBytes(n) {
+  if (typeof n !== "number") return "—";
+  return n < 1024 ? n + " B" : (n / 1024).toFixed(1) + " KB";
+}
+
+// ---- SQL console --------------------------------------------------------------------------
+
+async function renderSQL() {
+  const editor = el("textarea", { class: "sql", spellcheck: "false" });
+  editor.value = state.sqlText;
+  const run = async () => {
+    state.sqlText = editor.value;
+    state.sqlError = null;
+    try {
+      state.sqlResult = await api(nsPath("/sql"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sql: state.sqlText, at: state.at || undefined }),
+      });
+    } catch (e) {
+      state.sqlResult = null;
+      state.sqlError = e.message;
+    }
+    drawSQL(editor, run);
+  };
+  // Cmd/Ctrl+Enter runs, which is what every console does; plain Enter stays a newline.
+  editor.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(); }
+  });
+  drawSQL(editor, run);
+}
+
+function drawSQL(editor, run) {
+  const r = state.sqlResult;
+  const results = state.sqlError
+    ? el("div", { class: "err", text: state.sqlError })
+    : r
+      ? el("div", {},
+          el("div", { class: "body muted" },
+            r.rowCount + " row" + (r.rowCount === 1 ? "" : "s"),
+            r.truncated ? el("span", { class: "chip modified", text: "truncated" }) : null,
+            el("span", { class: "chip", title: "the access path the executor chose", text: r.plan || "?" }),
+            typeof r.rowsExamined === "number"
+              ? el("span", { class: "chip", title: "rows examined, not returned", text: r.rowsExamined + " examined" })
+              : null),
+          r.rows.length
+            ? el("div", { class: "grid-wrap" }, el("table", {},
+                el("thead", {}, el("tr", {}, r.columns.map((c) => el("th", { text: c })))),
+                el("tbody", {}, r.rows.map((row) => el("tr", {},
+                  row.map((cell) => el("td", { class: "cell" },
+                    el("code", { text: renderCell(cell) }))))))))
+            : el("div", { class: "empty", text: "No rows." }))
+      : el("div", { class: "empty", text: "Run a query." });
+
+  setMain(
+    el("div", { class: "card" },
+      el("h2", { text: "Query" + (state.at ? " at " + state.at : "") }),
+      el("div", { class: "body" },
+        editor,
+        el("div", { style: "margin-top:8px;display:flex;gap:8px;align-items:center" },
+          el("button", { class: "act", text: "Run", onclick: run }),
+          el("span", { class: "muted", style: "font-size:12px",
+                       text: "⌘/Ctrl + Enter · SELECT only, whatever the write setting" })))),
+    el("div", { style: "height:12px" }),
+    el("div", { class: "card" }, el("h2", { text: "Results" }), results));
+}
+
+// A JSON cell arrives as an object, not a string containing one, so it is stringified for display
+// rather than shown as [object Object].
+function renderCell(cell) {
+  if (cell === null || cell === undefined) return "NULL";
+  if (typeof cell === "object") return JSON.stringify(cell);
+  return String(cell);
+}
 
 async function renderCommits(append = false) {
   const skip = append ? state.commits.length : 0;
@@ -620,6 +795,14 @@ $("tabs").addEventListener("click", (e) => {
 });
 $("signout").addEventListener("click", () => signOut());
 $("exitat").addEventListener("click", exitAt);
+$("nspick").addEventListener("change", (e) => {
+  state.ns = e.target.value;
+  // A namespace switch resets everything view-shaped: a cursor, a selected commit or an open
+  // document from the previous namespace means nothing in this one.
+  Object.assign(state, { commits: [], selected: null, docs: [], docCursor: null, openDoc: null,
+                         sqlResult: null, sqlError: null });
+  selectTab(state.tab);
+});
 $("revertcancel").addEventListener("click", () => $("revertdlg").close());
 
 if (token) boot(); else renderGate();

@@ -7,6 +7,73 @@ control plane).
 Written against `7947cce` (v0.3.2). Every "what exists today" claim below is a file reference that
 was checked in the tree at that commit.
 
+## Status
+
+Last audited against `feat/control-ui-data-browser`. **The control UI is not finished**, but it is
+now a database tool rather than only a history viewer: browse documents, run SELECTs, read at any
+revision, and revert. Writes, live settings and all of recovery are still missing.
+
+Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~28 not started.
+
+### Milestones (§11)
+
+| | Milestone | State |
+|---|---|---|
+| M0 | Foundations | **done** — control plane, auth, SSE hub, embedded UI, and the multi-namespace host: the service opens the data root through `embed.Host` and the control plane serves every namespace it finds |
+| M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, and a read-only SQL console |
+| M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
+| M3 | Writes | **not started** — no document CRUD, no transactions, no DML |
+| M4 | Rollback | **partial** — plan/apply with `expectHead` are done; per-document history and the document timeline are not |
+| M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
+| M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
+| M6b | Settings (mutation) | **not started** — `PATCH /v1/settings` answers 501; no live setters wired, no persistence, no drift |
+| M7 | Recovery | **not started** — nothing from §8 exists |
+
+### API surface (§5)
+
+**Implemented:** `GET /v1/health`, `/v1/namespaces`, `/v1/ns/{ns}/status`, `/schema`, `/log`,
+`/commits/{hash}`, `/commits/{hash}/diff`, `/refs`, `/docs`, `/docs/{id}`, `/events`,
+`GET /v1/settings`, `GET /v1/ops/runtime`, `POST /v1/ns/{ns}/sql` (SELECT only),
+`POST /v1/ns/{ns}/revert/plan`, `/revert/apply`. `?at=` is honoured on every document read.
+
+**Declared, answering 501:** `PUT`/`DELETE /v1/ns/{ns}/docs/{id}`, `PATCH /v1/settings`.
+
+**Not started:** the document list (`/docs`), per-document history, per-document diff
+(`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/settings/{key}`,
+`/settings/drift`, `/settings/validate`, `/policy`, `/indexes`, `/ops/sessions|leases|peers|metrics`,
+`POST /v1/ops/drain`, and every recovery endpoint (`/integrity`, `/backups`, `/restore/staging`,
+`/maintenance/plan`, `/checkpoints`).
+
+`GET /v1/ops/runtime` is an addition, not in §5 as written.
+
+### UI screens (§9)
+
+| | Screen | State |
+|---|---|---|
+| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, and readable at any revision |
+| 2 | SQL console | **built** (read-only) — SELECT only, reporting the access path and rows examined |
+| 3 | Commit graph | **partial** — a flat, paged list with parent and ref badges. There is no lane assignment, so it is a log, not a graph; a merge is flagged with a chip rather than drawn |
+| 4 | Document timeline | **not built** |
+| 5 | Branches & tags | **partial** — lists only; a tag row is a shortcut into time travel |
+| 6 | Time travel | **built** |
+| 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
+| 8 | Schema & indexes | **partial** — schema only |
+| 9 | Operations dashboard | **partial** — process and admission state; no sessions, leases or peers |
+| 10 | Settings | **built** (read-only), including the ignored-configuration panel |
+| 11 | Recovery | **not built** |
+
+### What to do next, in order
+
+1. **Document writes (M3).** The console reads; editing a document is what an operator reaches for
+   next, and `ReplaceIf` already gives optimistic concurrency for free.
+2. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime, and the
+   read view that makes them legible is done.
+3. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece
+   and is mostly composition of things that already exist.
+4. **The document timeline (M4's missing half).** Per-document history, now that
+   `dag.ListCommits` exists to build it on.
+5. **A real commit graph (§9 screen 3).** Lane assignment, so the log becomes a graph.
+
 ## 1. What this is
 
 One web application that gives an operator the two things KDB uniquely has and currently exposes

@@ -157,11 +157,18 @@ func Main() {
 	}
 
 	var rt *embed.EmbeddedKdbRuntime
+	// secondary holds the namespaces this process serves *besides* the primary one. Only the
+	// control plane sees them: the wire, peer-sync and stream listeners are per-namespace by
+	// construction and still serve --namespace alone. Opening them through one embed.Host is what
+	// makes that possible at all - the data root's lock is per-root, so a second OpenFileRuntime
+	// over the same root would simply be refused (docs/kdb-spec-layer17 §1).
+	secondary := map[string]*server.KdbServerRuntime{}
+	var host *embed.Host
+
 	if memory {
 		catalog := embed.CatalogFromNamespace(namespace)
 		rt, err = embed.OpenMemoryRuntime(catalog, namespace, schema.None())
 	} else {
-		catalog := embed.CatalogFromNamespace(namespace)
 		// ResolveService already validated both names, so these cannot fail here.
 		durability, _ := config.ParseDurability(cfg.Durability)
 		compression, _ := config.ParseCompression(cfg.Compression)
@@ -173,11 +180,18 @@ func Main() {
 			AsyncSyncIntervalMillis: int64(cfg.AsyncSyncIntervalMS),
 			SyncMode:                syncMode,
 		}
-		rt, err = embed.OpenFileRuntimeWithOptions(dataDir, catalog, namespace, schema.None(), opts)
+		host, err = embed.OpenFileHost(dataDir, opts)
+		if err == nil {
+			rt, err = host.NamespaceWithOptions(
+				embed.CatalogFromNamespace(namespace), namespace, schema.None(), opts.Storage)
+		}
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	if host != nil {
+		defer host.Close()
 	}
 
 	srv := server.NewKdbServerRuntime(rt)
@@ -407,6 +421,28 @@ func Main() {
 	var controlSrv *control.Server
 	controlStatus := "disabled"
 	if controlAddr != "" {
+		// Every other namespace already under this data root, opened read-through for the control
+		// plane. Discovery rather than configuration: an operator opening the UI wants to see what
+		// the database actually holds, not the one namespace this process was told to listen for.
+		if host != nil {
+			existing, lerr := embed.ListNamespaces(dataDir)
+			if lerr != nil {
+				slog.Warn("could not list namespaces for the control plane", "error", lerr)
+			}
+			for _, id := range existing {
+				if id == namespace {
+					continue
+				}
+				nsRT, nerr := host.Namespace(embed.CatalogFromNamespace(id), id, schema.None())
+				if nerr != nil {
+					// One unopenable namespace must not cost the operator the whole UI; it is
+					// reported and skipped, and the rest are still browsable.
+					slog.Warn("namespace not available to the control plane", "namespace", id, "error", nerr)
+					continue
+				}
+				secondary[id] = server.NewKdbServerRuntime(nsRT)
+			}
+		}
 		// Describe re-runs the same precedence decision ResolveService just made, over the same
 		// inputs, and keeps the provenance it discards - so the settings the control plane reports
 		// are the ones this process is actually running on, attributed to the layer that set them.
@@ -420,10 +456,15 @@ func Main() {
 		}
 		descriptors = append(descriptors, config.EnvOnlyDescriptors(os.LookupEnv)...)
 
+		all := map[string]*server.KdbServerRuntime{namespace: srv}
+		for id, nsRT := range secondary {
+			all[id] = nsRT
+		}
 		controlSrv, err = control.New(control.Options{
 			Addr:        controlAddr,
 			Runtime:     srv,
 			Namespace:   namespace,
+			Namespaces:  control.StaticNamespaces(all),
 			Settings:    descriptors,
 			AllowWrites: cfg.ControlWrite,
 			Version:     version.Get().Version,
@@ -448,7 +489,8 @@ func Main() {
 		if cfg.ControlWrite {
 			mode = "writes enabled"
 		}
-		controlStatus = fmt.Sprintf("enabled (%s, %s)", controlSrv.Addr(), mode)
+		controlStatus = fmt.Sprintf("enabled (%s, %s, %d namespace(s))",
+			controlSrv.Addr(), mode, len(secondary)+1)
 	}
 
 	tlsStatus := "disabled (plaintext)"
