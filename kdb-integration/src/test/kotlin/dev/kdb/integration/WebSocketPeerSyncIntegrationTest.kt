@@ -10,12 +10,12 @@ import dev.kdb.embed.openMemoryRuntimeBlocking
 import dev.kdb.embed.pushCommitsSinceRemoteHead
 import dev.kdb.embed.putJson
 import dev.kdb.embed.querySql
-import dev.kdb.embed.syncEmbeddedWithPeer
 import dev.kdb.embed.syncEmbedSchema
+import dev.kdb.embed.syncEmbeddedWithPeer
 import dev.kdb.peersync.PeerClientConfig
 import dev.kdb.peersync.PeerHostConfig
-import dev.kdb.peersync.peerSyncClient
 import dev.kdb.peersync.PeerSyncHost
+import dev.kdb.peersync.peerSyncClient
 import dev.kdb.peersync.peerSyncHostFactory
 import dev.kdb.schema.KdbFieldType
 import dev.kdb.schema.KdbSchema
@@ -29,20 +29,22 @@ import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.defaultWireCodec
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Before
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertTrue
 
 /**
  * Browser/network embedding checks: WS framing echo + TCP peer sync with SQL query.
@@ -57,9 +59,15 @@ class WebSocketPeerSyncIntegrationTest {
         runBlocking { delay(50) }
     }
 
+    /**
+     * Owns every coroutine these tests launch outside the test body - see the same field on
+     * WebSocketStreamIntegrationTest for why a bare `cancel()` on a throwaway scope was not enough.
+     */
+    private val testScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     @After
-    fun settleWebSocketTransport() {
-        runBlocking { delay(150) }
+    fun stopLaunchedCoroutines() {
+        runBlocking { testScope.coroutineContext.job.cancelAndJoin() }
     }
 
     @Test
@@ -67,7 +75,7 @@ class WebSocketPeerSyncIntegrationTest {
         runBlocking {
             val server = JvmNetworkWebSocketServer()
             val serverJob =
-                CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                testScope.launch {
                     server.start("127.0.0.1", 0, "/kdb") { conn ->
                         conn.incoming().collect { frame -> conn.send(frame) }
                     }
@@ -124,7 +132,7 @@ class WebSocketPeerSyncIntegrationTest {
 
             val server = JvmNetworkWebSocketServer()
             val serverJob =
-                CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                testScope.launch {
                     server.start("127.0.0.1", 0, "/kdb") { conn ->
                         conn.incoming().collect {
                             conn.send(large)
