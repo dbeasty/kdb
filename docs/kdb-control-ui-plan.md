@@ -10,8 +10,9 @@ was checked in the tree at that commit.
 ## Status
 
 Last audited against `feat/control-ui-data-browser`. **The control UI is not finished**, but it is
-now a database tool rather than only a history viewer: browse documents, run SELECTs, read at any
-revision, and revert. Writes, live settings and all of recovery are still missing.
+now a database tool rather than only a history viewer: browse documents, run SQL - reads always,
+writes when the deployment and the principal both allow it - read at any revision, and revert. Live
+settings and all of recovery are still missing, as is editing a document directly.
 
 Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~28 not started.
 
@@ -22,7 +23,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M0 | Foundations | **done** — control plane, auth, SSE hub, embedded UI, and the multi-namespace host: the service opens the data root through `embed.Host` and the control plane serves every namespace it finds |
 | M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, and a read-only SQL console |
 | M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
-| M3 | Writes | **not started** — no document CRUD, no transactions, no DML |
+| M3 | Writes | **partial** — DML and DDL through the SQL console, autocommitted through the ordinary write path; no per-document CRUD endpoints yet |
 | M4 | Rollback | **partial** — plan/apply with `expectHead` are done; per-document history and the document timeline are not |
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
@@ -35,6 +36,8 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 `/commits/{hash}`, `/commits/{hash}/diff`, `/refs`, `/docs`, `/docs/{id}`, `/events`,
 `GET /v1/settings`, `GET /v1/ops/runtime`, `POST /v1/ns/{ns}/sql` (SELECT only),
 `POST /v1/ns/{ns}/revert/plan`, `/revert/apply`. `?at=` is honoured on every document read.
+
+`POST /v1/ns/{ns}/sql` serves all three statement kinds, with permission decided per statement.
 
 **Declared, answering 501:** `PUT`/`DELETE /v1/ns/{ns}/docs/{id}`, `PATCH /v1/settings`.
 
@@ -51,7 +54,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | | Screen | State |
 |---|---|---|
 | 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, and readable at any revision |
-| 2 | SQL console | **built** (read-only) — SELECT only, reporting the access path and rows examined |
+| 2 | SQL console | **built** — SELECT reports the access path and rows examined; DML and DDL are gated on `--control-write` *and* a write grant, and report the commit they produced |
 | 3 | Commit graph | **partial** — a flat, paged list with parent and ref badges. There is no lane assignment, so it is a log, not a graph; a merge is flagged with a chip rather than drawn |
 | 4 | Document timeline | **not built** |
 | 5 | Branches & tags | **partial** — lists only; a tag row is a shortcut into time travel |
@@ -64,8 +67,9 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 
 ### What to do next, in order
 
-1. **Document writes (M3).** The console reads; editing a document is what an operator reaches for
-   next, and `ReplaceIf` already gives optimistic concurrency for free.
+1. **Per-document editing (M3's other half).** The console can write; editing one document in a
+   panel is what an operator reaches for next, and `ReplaceIf` already gives optimistic
+   concurrency for free.
 2. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime, and the
    read view that makes them legible is done.
 3. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece

@@ -1058,10 +1058,11 @@ func TestSQLConsoleRunsSelects(t *testing.T) {
 	}
 }
 
-// TestSQLConsoleRefusesAnythingButSelect is the property that lets this be a read endpoint: it must
-// refuse a mutation even on a control plane that allows writes.
-func TestSQLConsoleRefusesAnythingButSelect(t *testing.T) {
-	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+// TestSQLConsoleRefusesWritesWhenReadOnly: a control plane started read-only runs SELECT and
+// nothing else, and the refusal names the deployment setting rather than looking like an auth
+// failure - they send an operator to look in different places.
+func TestSQLConsoleRefusesWritesWhenReadOnly(t *testing.T) {
+	cs, base := newFixture(t)
 	seed(t, cs, `{"id":"a","name":"ada"}`)
 
 	for _, stmt := range []string{
@@ -1069,22 +1070,137 @@ func TestSQLConsoleRefusesAnythingButSelect(t *testing.T) {
 		`UPDATE users SET name = 'x'`,
 		`INSERT INTO users (name) VALUES ('x')`,
 	} {
-		res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql",
-			fmt.Sprintf(`{"sql":%q}`, stmt))
+		res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", fmt.Sprintf(`{"sql":%q}`, stmt))
 		if res.StatusCode != http.StatusForbidden {
-			t.Errorf("%q: want 403 even with writes enabled, got %d (%v)", stmt, res.StatusCode, body)
+			t.Errorf("%q: want 403 on a read-only control plane, got %d (%v)", stmt, res.StatusCode, body)
 			continue
 		}
-		if body["error"].(map[string]any)["code"] != "read_only_console" {
-			t.Errorf("%q: the refusal should say why: %v", stmt, body["error"])
+		if body["error"].(map[string]any)["code"] != "read_only" {
+			t.Errorf("%q: the refusal should name the deployment setting: %v", stmt, body["error"])
 		}
 	}
 
-	// And the data is untouched.
 	_, after := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"SELECT * FROM users"}`)
 	if after["rowCount"].(float64) != 1 {
 		t.Errorf("a refused statement must not have run: %v", after["rowCount"])
 	}
+}
+
+func TestSQLConsoleWritesWhenAllowed(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a","name":"ada","score":1}`, `{"id":"b","name":"grace","score":2}`)
+
+	t.Run("update commits and reports the commit", func(t *testing.T) {
+		res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql",
+			`{"sql":"UPDATE users SET score = 99"}`)
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("update: %d (%v)", res.StatusCode, body)
+		}
+		if body["committed"] != true {
+			t.Errorf("a statement that changed rows must commit: %v", body)
+		}
+		if body["rowsAffected"].(float64) != 2 {
+			t.Errorf("want two rows affected, got %v", body["rowsAffected"])
+		}
+		if body["commit"] == nil || body["commit"] == "" {
+			t.Error("a write should name the commit it produced - that is the audit trail")
+		}
+	})
+
+	t.Run("the change is visible and is real history", func(t *testing.T) {
+		_, sel := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"SELECT * FROM users"}`)
+		if sel["rowCount"].(float64) != 2 {
+			t.Fatalf("want two rows, got %v", sel["rowCount"])
+		}
+		// The commit the write produced must be in the log, not merely reported.
+		_, logBody := get(t, base, "/v1/ns/demo%2Fusers/log")
+		commits, _ := logBody["commits"].([]any)
+		if len(commits) < 3 {
+			t.Errorf("the update should have added a commit to history: %d commits", len(commits))
+		}
+	})
+
+	t.Run("delete commits", func(t *testing.T) {
+		res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"DELETE FROM users"}`)
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("delete: %d (%v)", res.StatusCode, body)
+		}
+		_, sel := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"SELECT * FROM users"}`)
+		if sel["rowCount"].(float64) != 0 {
+			t.Errorf("everything should be deleted, got %v rows", sel["rowCount"])
+		}
+	})
+}
+
+// TestSQLWriteMatchingNothingDoesNotCommit: an empty commit for a statement that changed nothing is
+// noise in the one place noise is expensive.
+func TestSQLWriteMatchingNothingDoesNotCommit(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a","name":"ada"}`)
+	_, before := get(t, base, "/v1/ns/demo%2Fusers/log")
+	countBefore := len(before["commits"].([]any))
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql",
+		`{"sql":"DELETE FROM users WHERE name = 'nobody'"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d (%v)", res.StatusCode, body)
+	}
+	if body["committed"] != false {
+		t.Errorf("nothing matched, so nothing should have been committed: %v", body)
+	}
+	_, after := get(t, base, "/v1/ns/demo%2Fusers/log")
+	if len(after["commits"].([]any)) != countBefore {
+		t.Error("history grew for a statement that changed nothing")
+	}
+}
+
+// TestSQLWriteAtPastRevisionIsRefused: history moves forward. A statement asking to change the past
+// is a mistake worth naming rather than quietly running against head.
+func TestSQLWriteAtPastRevisionIsRefused(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"a","name":"ada"}`)[0]
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql",
+		fmt.Sprintf(`{"sql":"DELETE FROM users","at":%q}`, first.Commit.Hex()))
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (%v)", res.StatusCode, body)
+	}
+	if body["error"].(map[string]any)["code"] != "not_writable_at_revision" {
+		t.Errorf("the refusal should say why: %v", body["error"])
+	}
+}
+
+// TestSQLWriteNeedsAWriteGrant: --control-write says what the deployment permits; the grant says
+// what this principal may do. Both are asked, and neither substitutes for the other.
+func TestSQLWriteNeedsAWriteGrant(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a","name":"ada"}`)
+	cs.opts.Runtime.AuthEngine = readOnlyEngine{}
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"DELETE FROM users"}`)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("want 403 when the principal has no write grant, got %d (%v)", res.StatusCode, body)
+	}
+	// And a SELECT from the same principal still works: the grant is per-action, not per-endpoint.
+	res, _ = postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"SELECT * FROM users"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("a read grant should still allow SELECT, got %d", res.StatusCode)
+	}
+}
+
+// readOnlyEngine authenticates anyone and authorizes reads only.
+type readOnlyEngine struct{}
+
+func (readOnlyEngine) Authenticator() auth.Authenticator { return readOnlyEngine{} }
+func (readOnlyEngine) Authorizer() auth.Authorizer       { return readOnlyEngine{} }
+func (readOnlyEngine) Authenticate(_ context.Context, _ auth.Credentials) (auth.Principal, error) {
+	return auth.Principal{ID: "reader"}, nil
+}
+func (readOnlyEngine) Authorize(_ context.Context, _ auth.Principal, action auth.Action) error {
+	if a, ok := action.(auth.SqlExecAction); ok && !a.ReadOnly {
+		return fmt.Errorf("principal reader lacks write on %s", a.Namespace)
+	}
+	return nil
 }
 
 func TestSQLConsoleReportsParseErrors(t *testing.T) {

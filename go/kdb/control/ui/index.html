@@ -407,8 +407,21 @@ async function renderSQL() {
 
 function drawSQL(editor, run) {
   const r = state.sqlResult;
+  // A write returns a commit rather than rows, so the two results are rendered differently: the
+  // useful thing about a write is what it changed and where that landed in history.
   const results = state.sqlError
     ? el("div", { class: "err", text: state.sqlError })
+    : r && r.kind === "ddl"
+      ? el("div", { class: "body" }, "Schema change applied.")
+    : r && r.kind === "dml"
+      ? el("div", { class: "body" },
+          r.committed
+            ? el("div", {},
+                el("div", {}, r.rowsAffected + " row" + (r.rowsAffected === 1 ? "" : "s") + " changed."),
+                el("div", { class: "muted", style: "margin-top:6px" },
+                  "Committed as ", el("code", { text: (r.commit || "").slice(0, 12) }),
+                  " — it is ordinary history, and can be reverted from the Commits tab."))
+            : el("div", { class: "muted", text: r.note || "Nothing was committed." }))
     : r
       ? el("div", {},
           el("div", { class: "body muted" },
@@ -435,7 +448,13 @@ function drawSQL(editor, run) {
         el("div", { style: "margin-top:8px;display:flex;gap:8px;align-items:center" },
           el("button", { class: "act", text: "Run", onclick: run }),
           el("span", { class: "muted", style: "font-size:12px",
-                       text: "⌘/Ctrl + Enter · SELECT only, whatever the write setting" })))),
+            text: state.canWrite
+              ? "⌘/Ctrl + Enter · writes are enabled and commit immediately"
+              : "⌘/Ctrl + Enter · this control plane is read-only, so SELECT only" }),
+          state.at
+            ? el("span", { class: "chip modified",
+                           text: "reading at " + state.at + " — writes not allowed here" })
+            : null))),
     el("div", { style: "height:12px" }),
     el("div", { class: "card" }, el("h2", { text: "Results" }), results));
 }
