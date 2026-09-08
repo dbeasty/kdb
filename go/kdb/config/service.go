@@ -206,6 +206,17 @@ func LoadServiceFile(path string) (*ServiceFile, error) {
 // when explicitly set - otherwise a flag's default would always mask the file and environment,
 // which is the standard trap this signature exists to avoid.
 func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), flagWasSet func(string) bool, flags ServiceSettings) (ServiceSettings, error) {
+	// Both callbacks used to be dereferenced unconditionally, so a caller with no environment to
+	// consult or no command line to have parsed - an embedded runtime, a test, anything
+	// constructing settings programmatically - got a nil-pointer panic rather than the defaults it
+	// was obviously asking for. Absent is a meaningful answer for both, and it is this function's
+	// job to say so rather than every caller's to fabricate a no-op closure.
+	if lookupEnv == nil {
+		lookupEnv = func(string) (string, bool) { return "", false }
+	}
+	if flagWasSet == nil {
+		flagWasSet = func(string) bool { return false }
+	}
 	s := DefaultServiceSettings()
 	// Tracks whether the budget was named explicitly, and by which spelling. The deprecated
 	// --memory-limit-mb only folds into the budget when the modern key was not also given, and

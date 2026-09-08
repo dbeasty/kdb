@@ -659,3 +659,92 @@ func (denyAllEngine) Authenticate(_ context.Context, _ auth.Credentials) (auth.P
 func (denyAllEngine) Authorize(_ context.Context, _ auth.Principal, _ auth.Action) error {
 	return fmt.Errorf("denied by test")
 }
+
+// TestBothDiffPathsAgree is the test that would have caught the tree-hash mix-up in
+// diffAgainstParent.
+//
+// The control plane has two ways to compute what a commit changed: the operation-based path
+// (cheap, needs resident operations) and dag.Diff over both document trees (exact, needs both
+// trees resolvable). They must produce the same answer. The bug they guard against is silent -
+// passing a commit hash where the storage adapter wants a document tree hash resolves nothing and
+// reports every modification as an addition, which looks entirely plausible until you compare it
+// with the trees.
+func TestBothDiffPathsAgree(t *testing.T) {
+	cs, base := newFixture(t)
+	// A document written twice, so the second commit is a modification and not an addition, plus
+	// an unrelated document so the trees are not trivially small.
+	seed(t, cs, `{"id":"doc-a","v":1}`)
+	seed(t, cs, `{"id":"doc-b","v":1}`)
+	second := seed(t, cs, `{"id":"doc-a","v":2}`)[0]
+
+	d, err := cs.commitDAG()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, ok := d.GetCommit(second.Commit)
+	if !ok {
+		t.Fatal("commit missing")
+	}
+	parent := commit.ParentHashes[0]
+
+	viaOps, err := cs.diffAgainstParent(commit, parent, "demo/users")
+	if err != nil {
+		t.Fatalf("operation-based diff: %v", err)
+	}
+	viaTrees, err := cs.diffCommits(parent, second.Commit)
+	if err != nil {
+		t.Fatalf("tree-based diff: %v", err)
+	}
+
+	if len(viaOps) != len(viaTrees) {
+		t.Fatalf("the two diff paths disagree on how many documents changed:\n ops:   %v\n trees: %v",
+			viaOps, viaTrees)
+	}
+	for i := range viaOps {
+		if viaOps[i].Change != viaTrees[i].Change || viaOps[i].DocID != viaTrees[i].DocID {
+			t.Errorf("entry %d differs:\n ops:   %+v\n trees: %+v", i, viaOps[i], viaTrees[i])
+		}
+	}
+
+	// And specifically: rewriting an existing document is a modification.
+	if len(viaOps) != 1 || viaOps[0].Change != "modified" {
+		t.Fatalf("rewriting doc-a must read as one modification, got %+v", viaOps)
+	}
+	if viaOps[0].FromContentHash == "" || viaOps[0].ToContentHash == "" {
+		t.Errorf("a modification should carry both content hashes; got %+v", viaOps[0])
+	}
+	if viaOps[0].FromContentHash == viaOps[0].ToContentHash {
+		t.Error("the content actually changed, so the hashes must differ")
+	}
+
+	// The endpoint reports which path produced the answer, so an operator debugging a surprising
+	// diff does not have to guess.
+	_, body := get(t, base, "/v1/ns/demo%2Fusers/commits/"+second.Commit.Hex()+"/diff")
+	if body["basis"] != "operations" {
+		t.Errorf("a first-parent diff should take the cheap path, got basis=%v", body["basis"])
+	}
+}
+
+// TestRewritingIdenticalContentIsNotAChange: the engine accepts a write whose content matches what
+// is already stored. Reporting that as "modified" sends a reader looking for a difference that
+// does not exist.
+func TestRewritingIdenticalContentIsNotAChange(t *testing.T) {
+	cs, _ := newFixture(t)
+	seed(t, cs, `{"id":"doc-a","v":1}`)
+	again := seed(t, cs, `{"id":"doc-a","v":1}`)[0]
+
+	d, _ := cs.commitDAG()
+	commit, ok := d.GetCommit(again.Commit)
+	if !ok {
+		t.Fatal("commit missing")
+	}
+	entries, err := cs.diffAgainstParent(commit, commit.ParentHashes[0], "demo/users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Change == "modified" {
+			t.Errorf("re-writing identical content is not a modification: %+v", e)
+		}
+	}
+}

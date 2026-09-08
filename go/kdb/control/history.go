@@ -215,6 +215,11 @@ type diffEntry struct {
 // diffCommits reports which documents differ between two commits, ordered so a UI renders the same
 // list every time. dag.Diff builds its result by ranging over two maps, so its order is Go's map
 // order - fine for a set comparison, unusable for a view that must not reshuffle on refresh.
+//
+// This resolves both commits' document trees, which on a file-backed namespace means rebuilding
+// whichever of them is no longer resident. That works now; it did not before
+// ServerEngine.GetTree was taught to reach the rebuild, which is why the operation-based path
+// above exists and is still preferred for the first-parent case on cost grounds.
 func (s *Server) diffCommits(from, to codec.Hash) ([]diffEntry, error) {
 	d, err := s.commitDAG()
 	if err != nil {
@@ -279,22 +284,20 @@ func isHex(s string) bool {
 
 // diffAgainstParent computes what one commit changed, without materializing either document tree.
 //
-// This exists because the tree-based dag.Diff is not usable on a file-backed namespace. Historical
-// trees are not kept: a checkpoint restores the live tree only, the rest are derivable from the
-// delta log and rebuilt on demand (storage/engine.SetTreeRebuilder). But the rebuild hangs off the
-// storage read path, and the dag.DocumentTreeStore implementation the DAG calls - ServerEngine.
-// GetTree - answers from the live snapshot and the bounded LRU *without* rebuilding. So dag.Diff
-// on a commit whose parent tree has been evicted fails with "from tree missing", which on a
-// freshly-restarted server is every commit but the newest.
-//
-// A commit already records what it changed, though: its operations are exactly the documents it
-// touched. The one thing they do not say is whether a written document existed beforehand -
-// "added" versus "modified" - and that is a point read at the parent commit, which does go through
-// the rebuilding path. So the diff costs one read per operation instead of materializing two whole
-// trees, which is also strictly cheaper than dag.Diff on any namespace larger than the commit.
+// A commit already records what it touched: its operations name every document it wrote or
+// deleted. The one thing they do not say is whether a written document existed beforehand -
+// "added" versus "modified" - and that is a point read at the parent. So the diff costs one read
+// per operation instead of materializing two whole trees, which is strictly cheaper than dag.Diff
+// on any namespace larger than the commit itself.
 //
 // Operations are evictable in their own right (dag/ops_retention.go), so this can legitimately be
-// unavailable; the caller reports that rather than showing an empty diff.
+// unavailable; the caller falls back to the tree comparison and reports which path ran.
+//
+// Note the hash key space. storage.Adapter's third parameter is named atCommit but is a *document
+// tree* hash - ServerEngine.treeAt matches it against the live tree snapshot and the tree store,
+// both keyed by tree hash. Passing a commit hash there does not error, it simply resolves nothing,
+// which would silently report every modification as an addition. Hence commit.DocumentTreeHash
+// throughout, and the assertion in the control tests that this path and dag.Diff agree.
 func (s *Server) diffAgainstParent(commit document.Commit, parent codec.Hash, namespaceID string) ([]diffEntry, error) {
 	d, err := s.commitDAG()
 	if err != nil {
@@ -304,27 +307,37 @@ func (s *Server) diffAgainstParent(commit document.Commit, parent codec.Hash, na
 	if err != nil {
 		return nil, err
 	}
-	storage := s.opts.Runtime.Runtime.Storage
+	parentCommit, ok := d.GetCommit(parent)
+	if !ok {
+		return nil, fmt.Errorf("parent commit %s is not available", shortHash(parent.Hex()))
+	}
+	beforeTree := parentCommit.DocumentTreeHash
+	afterTree := commit.DocumentTreeHash
+
+	store := s.opts.Runtime.Runtime.Storage
 	out := make([]diffEntry, 0, len(ops))
 	for _, op := range ops {
 		switch o := op.(type) {
 		case document.WriteOp:
-			change := "added"
-			var fromHash string
-			// A read at the parent commit, not at the parent *tree*: the adapter takes a commit
-			// hash and owns the rebuild behind it.
-			if prior, err := storage.GetDocument(namespaceID, o.DocID, parent); err == nil && prior != nil {
-				change = "modified"
-				fromHash = contentHashHex(*prior)
+			entry := diffEntry{Change: "added", DocID: o.DocID.String()}
+			if prior, err := store.GetDocument(namespaceID, o.DocID, beforeTree); err == nil && prior != nil {
+				entry.Change = "modified"
+				entry.FromContentHash = contentHashHex(*prior)
 			}
-			entry := diffEntry{Change: change, DocID: o.DocID.String(), FromContentHash: fromHash}
-			if after, err := storage.GetDocument(namespaceID, o.DocID, commit.Hash); err == nil && after != nil {
+			if after, err := store.GetDocument(namespaceID, o.DocID, afterTree); err == nil && after != nil {
 				entry.ToContentHash = contentHashHex(*after)
+			}
+			// A write whose content is identical to what was already there changes nothing, and
+			// listing it as modified would send a reader looking for a difference that is not
+			// there. The engine allows such a write; the diff should not invent a change.
+			if entry.Change == "modified" && entry.FromContentHash != "" &&
+				entry.FromContentHash == entry.ToContentHash {
+				continue
 			}
 			out = append(out, entry)
 		case document.DeleteOp:
 			entry := diffEntry{Change: "removed", DocID: o.DocID.String()}
-			if prior, err := storage.GetDocument(namespaceID, o.DocID, parent); err == nil && prior != nil {
+			if prior, err := store.GetDocument(namespaceID, o.DocID, beforeTree); err == nil && prior != nil {
 				entry.FromContentHash = contentHashHex(*prior)
 			}
 			out = append(out, entry)

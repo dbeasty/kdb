@@ -296,3 +296,28 @@ func findKey(t *testing.T, ds []SettingDescriptor, key string) SettingDescriptor
 }
 
 func strPtr(s string) *string { return &s }
+
+// TestResolveServiceToleratesNilCallbacks: both callbacks were dereferenced unconditionally, so a
+// caller with no environment and no parsed command line - which is every programmatic caller -
+// panicked instead of getting the defaults.
+func TestResolveServiceToleratesNilCallbacks(t *testing.T) {
+	cases := map[string]struct {
+		env   func(string) (string, bool)
+		flags func(string) bool
+	}{
+		"both nil":        {nil, nil},
+		"nil environment": {nil, noFlags},
+		"nil flag lookup": {noEnv, nil},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := ResolveService(nil, tc.env, tc.flags, ServiceSettings{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != DefaultServiceSettings() {
+				t.Errorf("with nothing to consult, the result must be the defaults; got %+v", got)
+			}
+		})
+	}
+}

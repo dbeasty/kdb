@@ -99,14 +99,39 @@ func (e *ServerEngine) LiveTree() document.DocumentTree {
 	return e.tree
 }
 
-// GetTree implements dag.DocumentTreeStore. The current tree answers from
-// the atomic snapshot, so the DAG asking for it never touches the bounded
-// store or promotes anything in it.
+// GetTree implements dag.DocumentTreeStore, resolving hash through the same
+// chain every other historical read uses: the live snapshot, then the
+// bounded store, then the tree objects, and only then a fold back out of
+// the delta log.
+//
+// It used to stop after the bounded store, and that made the DAG's own
+// history operations fail on any file-backed namespace. A checkpoint
+// restores the live tree and the commit graph, not every tree the
+// namespace has ever had - the rest are derivable from the log and are
+// rebuilt on demand (see SetTreeRebuilder). But the rebuild hung off
+// treeAt, which only the storage read path called, so a caller coming
+// through the DAG got a plain miss for a tree that was merely not resident
+// yet. dag.Diff is the visible casualty: it resolves both commits' trees
+// through here, so after a restart it failed with "from tree missing" for
+// every commit but the newest, which is exactly when someone wants to look
+// at history.
+//
+// The rebuild is not free - it folds commits forward from the nearest
+// resident ancestor - but it is bounded, it caches its result, and a hash
+// no commit claims is refused cheaply before any of it starts
+// (rebuildTreeByFolding's CommitForTree check). The live tree still
+// answers from the atomic snapshot without touching the bounded store, so
+// the hot path is unchanged.
+//
+// The dag.DocumentTreeStore signature has no error to return, so a rebuild
+// that fails reports a miss - the same answer the caller got before, and
+// the callers already treat a missing tree as a real, reportable outcome.
 func (e *ServerEngine) GetTree(hash codec.Hash) (document.DocumentTree, bool) {
-	if s := e.latestTree.Load(); s != nil && s.hash == hash {
-		return s.tree, true
+	tree, ok, err := e.treeAt(hash)
+	if err != nil {
+		return document.DocumentTree{}, false
 	}
-	return e.treesByHash.Get(hash)
+	return tree, ok
 }
 
 // PutTree implements dag.DocumentTreeStore.

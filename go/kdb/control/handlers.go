@@ -247,9 +247,9 @@ func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth
 		from = commit.ParentHashes[0]
 	}
 	// Prefer the operation-based path when this is a commit against its own first parent: it is
-	// the common case, it costs one read per operation rather than materializing two whole trees,
-	// and - decisively - it works on a file-backed namespace, where the tree-based dag.Diff fails
-	// as soon as the parent tree has been evicted. See diffAgainstParent.
+	// the common case, and it costs one read per operation rather than materializing two whole
+	// trees, which on any namespace larger than the commit is the cheaper answer by a wide margin.
+	// dag.Diff is the fallback and is exact; the two are asserted to agree in the tests.
 	var entries []diffEntry
 	var basis string
 	if commit, ok := d.GetCommit(to); ok && len(commit.ParentHashes) > 0 && commit.ParentHashes[0] == from {

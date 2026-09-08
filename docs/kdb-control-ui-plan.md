@@ -948,34 +948,68 @@ Not built, and refused explicitly rather than omitted: every mutating endpoint (
    `auth.SqlExecAction{ReadOnly: true}` (the same question, the same answer) and process-scoped
    reads as `auth.AdminAction{Scope: "control"}`, which already maps to the `admin:` vocabulary.
 
-### What the implementation revealed
+### Defects found and fixed
 
-**`dag.Diff` is unusable on a file-backed namespace, and this is not a control-plane problem.**
-A checkpoint restores the live tree only; historical trees are derivable from the delta log and
-rebuilt on demand (`storage/engine.SetTreeRebuilder`). But the rebuild hangs off the *storage read
-path*, while the `dag.DocumentTreeStore` implementation the DAG itself calls -
-`ServerEngine.GetTree` - answers from the live snapshot and the bounded LRU and **does not
-rebuild**. So `dag.Diff` fails with `from tree missing` for any commit whose parent tree has been
-evicted, which after a restart is every commit but the newest. Verified against a real on-disk
-namespace.
+**`ServerEngine.GetTree` never reached the on-demand tree rebuild.** A checkpoint restores the
+live tree and the commit graph, not every tree the namespace has ever had - the rest are derivable
+from the delta log and rebuilt on demand (`SetTreeRebuilder`). But the rebuild hung off `treeAt`,
+which only the storage read path called, while `GetTree` - the `dag.DocumentTreeStore`
+implementation the DAG itself calls - stopped at the bounded store. So any caller arriving through
+the DAG got a plain miss for a tree that was merely not resident yet.
 
-The control plane works around it by diffing a commit against its first parent from the commit's
-**operations** plus one point read per operation at the parent commit (which does go through the
-rebuilding path) - see `diffAgainstParent`. That is also strictly cheaper than `dag.Diff`, which
-materializes two whole trees regardless of how small the commit is. `dag.Diff` remains the
-fallback for arbitrary commit pairs, and the response says which path produced it (`basis`).
+`dag.Diff` was the visible casualty: it resolves both commits' trees that way, so after a reopen it
+failed with `from tree missing` for every commit but the newest - exactly when someone wants to
+read history. Invisible in memory-backed tests, total on disk.
 
-This is worth fixing at the source: either `GetTree` should rebuild, or `dag.Diff` should take a
-tree resolver that can. It affects anything reading history through the DAG, not just this UI.
+Fixed by routing `GetTree` through the same chain as every other historical read: live snapshot,
+bounded store, tree objects, then the fold. The live tree still answers from the atomic snapshot
+without touching the bounded store, and a hash no commit claims is refused cheaply before any fold
+starts. Regression test: `go/kdb/embed/history_tree_resolution_test.go`, which fails with
+`from tree missing` without the fix. **This was an engine defect, not a control-plane one** - it
+affected anything reading history through the DAG.
 
-**`ResolveService` panics on a nil `lookupEnv` or `flagWasSet`.** Pre-existing; both are
-dereferenced unconditionally. `config.Describe` tolerates nil for both.
+**`storage.Adapter`'s `atCommit` parameter is a document *tree* hash, not a commit hash.** The
+implementation matches it against the live tree snapshot and the tree store, both keyed by tree
+hash. A commit hash passed there does not error - it resolves nothing, and the read reports "no
+such document" for a document that is plainly present. The control plane's own
+operation-based diff had exactly this bug, and it was silent: every modification was reported as an
+addition, with no content hashes, which looks entirely plausible. Fixed, and the interface now
+documents the key space; `TestBothDiffPathsAgree` asserts the operation-based and tree-based diffs
+produce the same answer, which is the check that catches this class of mistake.
+
+**`ResolveService` panicked on a nil `lookupEnv` or `flagWasSet`.** Both were dereferenced
+unconditionally, so any programmatic caller - an embedded runtime, a test, anything not parsing a
+command line - crashed instead of getting the defaults. Both now default to "absent", which is a
+meaningful answer.
+
+**Two UI bugs caught only by running it.** A `display: flex` rule defeated the `hidden` attribute,
+so the tab bar showed on the sign-in screen; and `Node.replaceChildren(null)` renders the literal
+text `null`, unlike the `el()` helper which filters. Neither was reachable from the Go tests.
+
+### Still open
+
+- The operation-based diff is preferred for the first-parent case on cost grounds (one read per
+  operation, versus materializing two whole trees). `dag.Diff` is the fallback and now works
+  everywhere; the response's `basis` field says which ran.
+- `rebuildTreeByFolding` reconstructs a tree from commit *operations*, which are themselves
+  evictable. It verifies `tree.TreeHash == want` before returning, so it degrades to a clean miss
+  rather than a wrong tree - but a namespace that has evicted both its trees and its operations
+  cannot diff that far back at all. That is inherent to the retention design, not a defect.
 
 ### Verified
 
-`go build ./...`, `go vet ./...`, `gofmt` clean. `go test -race` passes for `control`, `config`,
-`server`, `dag`. Beyond unit tests, the binary was run against a seeded on-disk namespace and
+`go build ./...`, `go vet ./...`, `gofmt` clean. The **full** `go test ./...` suite passes, and
+`go test -race` passes for `storage/...`, `embed`, `dag`, `control`, `config` and `server` - the
+`GetTree` change is in the storage engine, so it needs the wide sweep rather than the narrow one. Beyond unit tests, the binary was run against a seeded on-disk namespace and
 driven through a browser: sign-in gate, commit list with ref badges, commit detail with operations
 and document diff, refs, schema, ops, and the settings view - including two deliberately-malformed
 `KDB_*` variables appearing in the "Ignored configuration" panel, which is the case §7.2 exists
-for.
+for. After the fixes above, re-verified on disk that a document written twice reports as one
+*modification* with both content hashes, and that a diff between two arbitrary commits - which
+previously failed outright - resolves through the tree path.
+
+### Merge note
+
+The `GetTree` fix touches `go/kdb/storage/engine/restore.go`, and the parallel history work on
+main has that file modified too. Expect a small conflict there; the change is self-contained (one
+function body plus its doc comment).
