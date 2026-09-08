@@ -18,9 +18,26 @@ const (
 type HistoryMode int
 
 const (
+	// HistoryModeFull keeps every commit forever: versioning, AT VERSION,
+	// and a complete graph.
 	HistoryModeFull HistoryMode = iota
+	// HistoryModeNone keeps the current dataset plus the Retain window.
+	// Inside the window it behaves exactly as Full does; outside it, the
+	// past does not exist and asking for it is an error rather than an
+	// answer from head.
 	HistoryModeNone
 )
+
+// StorageMode maps this policy's history mode onto the storage-layer mode
+// the engine is configured with. They are deliberately separate types -
+// one is policy the operator writes, the other is what a data directory
+// records - and this is the single place the two are related.
+func (h HistoryMode) StorageMode() storage.HistoryMode {
+	if h == HistoryModeNone {
+		return storage.HistoryModeNone
+	}
+	return storage.HistoryModeFull
+}
 
 // SquashMode controls automatic compaction squashing.
 type SquashMode int
@@ -116,10 +133,15 @@ const DefaultSweepIntervalMillis int64 = 60_000
 
 // NamespacePolicy is the full policy for one namespace.
 type NamespacePolicy struct {
-	NamespaceID           string
-	Schema                *schema.KdbSchema
-	Mode                  NamespaceMode
-	History               HistoryMode
+	NamespaceID string
+	Schema      *schema.KdbSchema
+	Mode        NamespaceMode
+	History     HistoryMode
+	// Retain bounds how much of the past HistoryModeNone keeps. Ignored
+	// under HistoryModeFull, which keeps everything forever. The zero
+	// value resolves to storage.DefaultRetentionDuration - see
+	// storage.RetentionWindow for why it is a floor and not a ceiling.
+	Retain                storage.RetentionWindow
 	Conflict              transaction.ConflictPolicy
 	Compaction            CompactionPolicy
 	Tiers                 TierPolicy

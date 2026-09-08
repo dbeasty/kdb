@@ -16,6 +16,21 @@ func (e *ServerEngine) HistoryStrategy() storage.HistoryStrategy {
 	return e.config.HistoryStrategy
 }
 
+// HistoryMode reports how long this namespace keeps the past. Resolved
+// from the namespace's marker at open; see storage.HistoryMode.
+func (e *ServerEngine) HistoryMode() storage.HistoryMode {
+	if e.config.HistoryMode == storage.HistoryModeUnset {
+		return storage.DefaultHistoryMode
+	}
+	return e.config.HistoryMode
+}
+
+// RetentionWindow reports how much of the past this namespace keeps under
+// storage.HistoryModeNone. Meaningless, and ignored, under Full.
+func (e *ServerEngine) RetentionWindow() storage.RetentionWindow {
+	return e.config.Retain.Resolve()
+}
+
 // Tree objects: what a document tree looked like at one commit, stored on
 // disk under that tree's own hash.
 //
@@ -46,7 +61,12 @@ func (e *ServerEngine) HistoryStrategy() storage.HistoryStrategy {
 // that changed, which the commit already knows - with a full object
 // written whenever the chain behind it gets long enough that reading it
 // would cost more than rewriting it. Resolution walks back to the nearest
-// full object and applies forward, bounded by treeChainLimit.
+// full object and applies forward.
+//
+// "Long enough" is measured in entries, not objects - see treeChainFullAt.
+// Measuring it in objects is what made the commit path quadratic in the
+// namespace, because it divided a full object's O(documents) by a constant
+// number of commits rather than by the work that justified it.
 
 // documentLocationTag marks an object-store record as a pointer into the
 // delta log rather than a tree object. Both are keyed by a hash and share
@@ -64,21 +84,77 @@ const (
 	treeObjectKindFull = 0
 	treeObjectKindDiff = 1
 
-	// defaultTreeChainLimit bounds how many delta objects may stack up
-	// before a full one is written, when nothing configures it. It is the
-	// direct trade between write cost (a full object is O(documents)) and
-	// historical-read cost (a chain is walked one fetch at a time). 32
-	// keeps a historical read to at most 32 small fetches while amortizing
-	// the full object across 32 commits.
+	// defaultTreeChainLimit is the shortest chain a namespace will use,
+	// when nothing configures it. It is the direct trade between write
+	// cost (a full object is O(documents)) and historical-read cost (a
+	// chain is walked one fetch at a time).
+	//
+	// It is a floor rather than the bound itself. Held fixed, it makes the
+	// commit path quadratic in the namespace: a full object costs O(n) and
+	// one is written every 32 commits whatever n is, so the amortized cost
+	// per commit grows with the namespace without limit. Measured, that
+	// was 63% of commit CPU at 10,000 documents and still climbing - see
+	// docs/benchmarks/2026-09-07-perf-rerun-7947cce.md. treeChainLimitFor
+	// scales the interval with the tree instead.
 	defaultTreeChainLimit = 32
+
+	// maxTreeChainWalk caps how many objects one resolution may fetch,
+	// however long a chain claims to be. Nothing legitimate reaches it -
+	// it is there so a corrupt chainLen costs a bounded walk and a
+	// fallback rather than an unbounded one.
+	maxTreeChainWalk = 1 << 20
 )
 
-// treeChainLimit is the configured bound, or the default.
+// treeChainLimit is the configured chain floor, or the default.
 func (e *ServerEngine) treeChainLimit() int {
 	if e.config.TreeChainLimit > 0 {
 		return e.config.TreeChainLimit
 	}
 	return defaultTreeChainLimit
+}
+
+// treeChainState is what stands behind a tree in delta objects: how many
+// objects, and how many entries they carry between them.
+//
+// Both are needed and they are not interchangeable. The entry count is
+// what decides when to write a full object, because it is what a
+// resolution actually pays. The object count is what a resolution is
+// allowed to fetch, and it is the number recorded on disk as a chain's
+// length - see treeFromObjects.
+type treeChainState struct {
+	objects int
+	entries int64
+}
+
+// treeChainFullAt is how many entries may accumulate in the delta objects
+// behind a tree of size documents before the next one is written full.
+//
+// The rule is that a full object is written once the chain behind it has
+// cost as much as the full object would: rewrite when the delta exceeds
+// the base. That is what keeps both ends bounded.
+//
+//   - Writes: a full object costs O(size) and is now written only after
+//     size entries have accumulated, so each commit carries about one
+//     entry's worth of it - constant, whatever the namespace has grown to.
+//     Counting objects instead of entries is what made this quadratic: the
+//     full object's O(size) was divided by a fixed 32 commits, so the
+//     amortized cost per commit grew with the namespace forever.
+//   - Reads: resolving a historical tree applies the full object's size
+//     entries plus the chain's, and the chain is held to size of them. So
+//     a resolution costs at most twice its own floor - the tree it is
+//     rebuilding has to be built out of that many entries either way.
+//
+// What it spends is fetches, not work: the chain may be up to size objects
+// long where it was 32, and each object is one memtable lookup paired with
+// an entry this read had to apply regardless.
+//
+// The floor keeps small namespaces on the short chains they have always
+// used, and is the meaning of the TreeChainLimit setting.
+func (e *ServerEngine) treeChainFullAt(size int) int64 {
+	if limit := e.treeChainLimit(); size < limit {
+		return int64(limit)
+	}
+	return int64(size)
 }
 
 // treeObject is one tree recorded relative to the one before it.
@@ -193,8 +269,8 @@ func readUUID(b []byte) codec.UUID {
 // to the tree at baseHash, under the resulting tree's own hash.
 //
 // Called on the commit path, so it stays proportional to what changed
-// except every treeChainLimit-th commit, where it writes the whole tree to
-// cap how long a historical read's chain can get.
+// except on the commits that write the whole tree to cap what resolving a
+// historical read costs - see treeChainFullAt for when that is.
 func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document.DocumentTree, puts []TreeChange, deletes []codec.UUID) {
 	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
 		return
@@ -202,15 +278,20 @@ func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document
 	if e.skipExistingObject(result.TreeHash) {
 		return
 	}
-	chain := e.treeChainLen(base.TreeHash) + 1
+	prev := e.treeChainStateOf(base.TreeHash)
+	chain := treeChainState{
+		objects: prev.objects + 1,
+		entries: prev.entries + int64(len(puts)) + int64(len(deletes)),
+	}
 	o := treeObject{
 		kind:     treeObjectKindDiff,
 		baseHash: base.TreeHash,
-		chainLen: int32(chain),
+		chainLen: int32(chain.objects),
 		puts:     puts,
 		deletes:  deletes,
 	}
-	if chain >= e.treeChainLimit() {
+	if chain.entries >= e.treeChainFullAt(result.Size()) {
+		chain = treeChainState{}
 		o.kind = treeObjectKindFull
 		o.chainLen = 0
 		o.baseHash = document.EmptyDocumentTree().TreeHash
@@ -226,9 +307,9 @@ func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document
 	e.memTable.Put(result.TreeHash, encodeTreeObject(o))
 	e.treeChainMu.Lock()
 	if e.treeChain == nil {
-		e.treeChain = make(map[codec.Hash]int)
+		e.treeChain = make(map[codec.Hash]treeChainState)
 	}
-	e.treeChain[result.TreeHash] = int(o.chainLen)
+	e.treeChain[result.TreeHash] = chain
 	e.treeChainMu.Unlock()
 }
 
@@ -387,7 +468,7 @@ func (e *ServerEngine) RecordTreeObject(base, result document.DocumentTree, puts
 	e.putTreeObject(base, result, puts, deletes)
 }
 
-func (e *ServerEngine) treeChainLen(h codec.Hash) int {
+func (e *ServerEngine) treeChainStateOf(h codec.Hash) treeChainState {
 	e.treeChainMu.Lock()
 	defer e.treeChainMu.Unlock()
 	return e.treeChain[h]
@@ -414,6 +495,13 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 	var chain []treeObject
 	current := hash
 	grounded := false
+	// How far this may walk is set by the chain itself. The writer's
+	// interval scales with the tree (treeChainLimitFor), so this end
+	// cannot know the bound from configuration alone - but the first
+	// object records how many diffs stand behind it, which is exactly it.
+	// The configured floor still applies, so a chain written before the
+	// interval scaled, or one whose counter was reset by a restart, is
+	// walked exactly as it always was.
 	limit := e.treeChainLimit()
 	for i := 0; i <= limit; i++ {
 		if current == emptyHash {
@@ -427,6 +515,12 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 		o, err := decodeTreeObject(raw)
 		if err != nil {
 			return document.DocumentTree{}, false
+		}
+		if i == 0 && int(o.chainLen) >= limit {
+			limit = int(o.chainLen) + 1
+			if limit > maxTreeChainWalk {
+				limit = maxTreeChainWalk
+			}
 		}
 		chain = append(chain, o)
 		if o.kind == treeObjectKindFull {

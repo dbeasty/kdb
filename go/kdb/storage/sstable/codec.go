@@ -308,27 +308,7 @@ func (r *DefaultReader) Get(key codec.Hash) ([]byte, error) {
 
 // Lookup reports what this table knows about key - see Reader.Lookup.
 func (r *DefaultReader) Lookup(key codec.Hash) ([]byte, bool, bool, error) {
-	size, err := r.segmentSize()
-	if err != nil {
-		return nil, false, false, err
-	}
-	if size < 40+footerTrailerSize {
-		return nil, false, false, nil
-	}
-	indexLen, err := r.readFooterIndexLen(size)
-	if err != nil {
-		return nil, false, false, err
-	}
-	// The footer body (everything buildFooter writes except its own trailing indexLen copy) is
-	// magic(4) + indexLen(4) + indexBytes(indexLen) + fileHash(32) = 40+indexLen bytes, sitting
-	// immediately before the footerTrailerSize-byte trailer at the true end of the file.
-	bodyLen := 40 + indexLen
-	footerStart := size - int64(bodyLen) - footerTrailerSize
-	footer, err := r.io.ReadFromSegment(r.handle.SegmentName, footerStart, bodyLen)
-	if err != nil {
-		return nil, false, false, err
-	}
-	index, err := parseFooter(footer)
+	index, err := r.Index()
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -339,15 +319,57 @@ func (r *DefaultReader) Lookup(key codec.Hash) ([]byte, bool, bool, error) {
 	if bh.Deleted {
 		return nil, true, true, nil
 	}
-	block, err := r.io.ReadFromSegment(r.handle.SegmentName, bh.Offset, bh.CompressedSize+blockHeaderSize)
-	if err != nil {
-		return nil, false, false, err
-	}
-	value, err := decodeBlock(block)
+	value, err := r.ReadBlockAt(bh)
 	if err != nil {
 		return nil, false, false, err
 	}
 	return value, false, true, nil
+}
+
+// Index returns everything this table says about every key it holds:
+// where each value lives, or that the key is tombstoned.
+//
+// Split out of Lookup for compaction, which needs to enumerate a table
+// rather than probe it - and, unlike a probe, must read the footer exactly
+// once for the whole table instead of once per key. An empty or truncated
+// segment returns an empty index rather than an error, which is how Lookup
+// has always treated one.
+func (r *DefaultReader) Index() (map[codec.Hash]BlockHandle, error) {
+	size, err := r.segmentSize()
+	if err != nil {
+		return nil, err
+	}
+	if size < 40+footerTrailerSize {
+		return map[codec.Hash]BlockHandle{}, nil
+	}
+	indexLen, err := r.readFooterIndexLen(size)
+	if err != nil {
+		return nil, err
+	}
+	// The footer body (everything buildFooter writes except its own trailing indexLen copy) is
+	// magic(4) + indexLen(4) + indexBytes(indexLen) + fileHash(32) = 40+indexLen bytes, sitting
+	// immediately before the footerTrailerSize-byte trailer at the true end of the file.
+	bodyLen := 40 + indexLen
+	footerStart := size - int64(bodyLen) - footerTrailerSize
+	footer, err := r.io.ReadFromSegment(r.handle.SegmentName, footerStart, bodyLen)
+	if err != nil {
+		return nil, err
+	}
+	return parseFooter(footer)
+}
+
+// ReadBlockAt decodes the value a BlockHandle from this table's Index
+// points at. A tombstone has no block and is a programming error to ask
+// for, so it reports one rather than returning a plausible empty value.
+func (r *DefaultReader) ReadBlockAt(bh BlockHandle) ([]byte, error) {
+	if bh.Deleted {
+		return nil, fmt.Errorf("sstable: a tombstone has no block to read")
+	}
+	block, err := r.io.ReadFromSegment(r.handle.SegmentName, bh.Offset, bh.CompressedSize+blockHeaderSize)
+	if err != nil {
+		return nil, err
+	}
+	return decodeBlock(block)
 }
 
 func (r *DefaultReader) segmentSize() (int64, error) {

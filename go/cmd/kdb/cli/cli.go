@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/limidus/kdb/go/kdb/version"
@@ -44,14 +45,23 @@ Usage:
 Commands:
   init <namespace>
   put <namespace> <file|json>
-  get <namespace> <docId>
+  get <namespace> <docId> [--at REV]
   query <namespace> <sql>
-  log <namespace>
+  log <namespace> [--limit N] [--skip N] [--oneline]
+  show <namespace> <rev>
+  diff <namespace> <rev> <rev>
+  revert <namespace> <rev>
   status <namespace>
   branch list <namespace>
   branch create <namespace> <name> [from-hash]
   branch checkout <namespace> <name>
-  unlock`)
+  tag list <namespace>
+  tag create <namespace> <name> [rev] [message]
+  tag delete <namespace> <name>
+  unlock
+
+A REV is a revision: head, head~10, head^, a commit hash, <hash>~2,
+tag:NAME, branch:NAME, or any of those with ~N appended.`)
 }
 
 // ParseArgsForTest exposes argument parsing for unit tests.
@@ -97,9 +107,21 @@ func parseCommand(rest []string) (Command, error) {
 		return PutCmd{Namespace: rest[1], Payload: rest[2]}, nil
 	case "get":
 		if len(rest) < 3 {
-			return nil, fmt.Errorf("usage: kdb get <namespace> <docId>")
+			return nil, fmt.Errorf("usage: kdb get <namespace> <docId> [--at REV]")
 		}
-		return GetCmd{Namespace: rest[1], DocID: rest[2]}, nil
+		cmd := GetCmd{Namespace: rest[1], DocID: rest[2]}
+		for i := 3; i < len(rest); i++ {
+			if rest[i] == "--at" {
+				i++
+				if i >= len(rest) {
+					return nil, fmt.Errorf("--at requires a revision")
+				}
+				cmd.At = rest[i]
+				continue
+			}
+			return nil, fmt.Errorf("unknown option for get: %s", rest[i])
+		}
+		return cmd, nil
 	case "query":
 		if len(rest) < 3 {
 			return nil, fmt.Errorf("usage: kdb query <namespace> <sql>")
@@ -107,9 +129,50 @@ func parseCommand(rest []string) (Command, error) {
 		return QueryCmd{Namespace: rest[1], SQL: strings.Join(rest[2:], " ")}, nil
 	case "log":
 		if len(rest) < 2 {
-			return nil, fmt.Errorf("usage: kdb log <namespace>")
+			return nil, fmt.Errorf("usage: kdb log <namespace> [--limit N] [--skip N] [--oneline]")
 		}
-		return LogCmd{Namespace: rest[1]}, nil
+		cmd := LogCmd{Namespace: rest[1], Limit: defaultLogLimit}
+		for i := 2; i < len(rest); i++ {
+			switch rest[i] {
+			case "--oneline":
+				cmd.Oneline = true
+			case "--limit", "--skip":
+				flag := rest[i]
+				i++
+				if i >= len(rest) {
+					return nil, fmt.Errorf("%s requires a number", flag)
+				}
+				n, err := strconv.Atoi(rest[i])
+				if err != nil || n < 0 {
+					return nil, fmt.Errorf("%s requires a non-negative number, got %q", flag, rest[i])
+				}
+				if flag == "--limit" {
+					cmd.Limit = n
+				} else {
+					cmd.Skip = n
+				}
+			default:
+				return nil, fmt.Errorf("unknown option for log: %s", rest[i])
+			}
+		}
+		return cmd, nil
+	case "show":
+		if len(rest) < 3 {
+			return nil, fmt.Errorf("usage: kdb show <namespace> <rev>")
+		}
+		return ShowCmd{Namespace: rest[1], Revision: rest[2]}, nil
+	case "diff":
+		if len(rest) < 4 {
+			return nil, fmt.Errorf("usage: kdb diff <namespace> <rev> <rev>")
+		}
+		return DiffCmd{Namespace: rest[1], From: rest[2], To: rest[3]}, nil
+	case "revert":
+		if len(rest) < 3 {
+			return nil, fmt.Errorf("usage: kdb revert <namespace> <rev>")
+		}
+		return RevertCmd{Namespace: rest[1], Revision: rest[2]}, nil
+	case "tag":
+		return parseTagCommand(rest[1:])
 	case "status":
 		if len(rest) < 2 {
 			return nil, fmt.Errorf("usage: kdb status <namespace>")
@@ -124,6 +187,43 @@ func parseCommand(rest []string) (Command, error) {
 		return UnlockCmd{}, nil
 	default:
 		return nil, fmt.Errorf("unknown command: %s", rest[0])
+	}
+}
+
+// defaultLogLimit bounds `kdb log` when the caller does not. A log that
+// walks the whole history by default is a surprise on a namespace with a
+// million commits, and the flag is right there.
+const defaultLogLimit = 50
+
+func parseTagCommand(rest []string) (Command, error) {
+	if len(rest) == 0 {
+		return nil, fmt.Errorf("usage: kdb tag list|create|delete ...")
+	}
+	switch rest[0] {
+	case "list":
+		if len(rest) < 2 {
+			return nil, fmt.Errorf("usage: kdb tag list <namespace>")
+		}
+		return TagListCmd{Namespace: rest[1]}, nil
+	case "create":
+		if len(rest) < 3 {
+			return nil, fmt.Errorf("usage: kdb tag create <namespace> <name> [rev] [message]")
+		}
+		cmd := TagCreateCmd{Namespace: rest[1], Name: rest[2], Revision: "head"}
+		if len(rest) >= 4 {
+			cmd.Revision = rest[3]
+		}
+		if len(rest) >= 5 {
+			cmd.Message = strings.Join(rest[4:], " ")
+		}
+		return cmd, nil
+	case "delete":
+		if len(rest) < 3 {
+			return nil, fmt.Errorf("usage: kdb tag delete <namespace> <name>")
+		}
+		return TagDeleteCmd{Namespace: rest[1], Name: rest[2]}, nil
+	default:
+		return nil, fmt.Errorf("unknown tag command: %s", rest[0])
 	}
 }
 

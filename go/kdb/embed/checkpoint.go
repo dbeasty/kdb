@@ -15,7 +15,7 @@ import (
 // reader misread a newer file. A checkpoint whose version is not exactly
 // this is ignored and the namespace opens by replaying the log, so raising
 // it costs one slow start and never costs correctness.
-const checkpointFormatVersion = 1
+const checkpointFormatVersion = 2
 
 const checkpointNS = "dev.kdb.checkpoint"
 
@@ -127,6 +127,16 @@ func checkpointRegistry() *schema.Registry {
 				// the namespace opens. Stored as payload bytes so decoding
 				// one both reconstructs the commit and re-derives its hash.
 				{ID: 9, Name: "headCommits", Type: schema.Array{Element: schema.Prim(schema.PhysicalBytes)}},
+				// The lowest delta segment sequence still on disk when
+				// this checkpoint was written. Zero for a namespace that
+				// has never truncated, which is every namespace under
+				// history=full.
+				//
+				// This is what lets open tell a deliberately truncated log
+				// from a damaged one. Without it, a missing low segment is
+				// indistinguishable from a deleted file, and the only safe
+				// reading of an ambiguous log is the pessimistic one.
+				{ID: 10, Name: "floorSequence", Type: cpI64},
 			},
 		})
 		r.Freeze()
@@ -143,10 +153,14 @@ var checkpointType = schema.Ref{FullyQualifiedName: fqnCheckpoint}
 type namespaceCheckpoint struct {
 	NamespaceID     string
 	ThroughSequence int64
-	State           dag.CheckpointState
-	LiveTree        document.DocumentTree
-	Segments        []checkpointSegment
-	HeadCommits     [][]byte
+	// FloorSequence is the lowest segment sequence still on disk. Anything
+	// below it was deleted on purpose; anything missing above it is
+	// damage. See checkpointMatchesLog.
+	FloorSequence int64
+	State         dag.CheckpointState
+	LiveTree      document.DocumentTree
+	Segments      []checkpointSegment
+	HeadCommits   [][]byte
 }
 
 // checkpointSegment fingerprints one delta segment a checkpoint covers.
@@ -273,15 +287,16 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 	}
 
 	root := codec.RecordValue{Fields: map[int]codec.Value{
-		1: codec.Int32Value{V: checkpointFormatVersion},
-		2: codec.StringValue{V: cp.NamespaceID},
-		3: codec.Int64Value{V: cp.ThroughSequence},
-		4: codec.ArrayValue{Elements: commits},
-		5: codec.ArrayValue{Elements: branches},
-		6: codec.ArrayValue{Elements: tags},
-		7: codec.ArrayValue{Elements: entries},
-		8: codec.ArrayValue{Elements: segs},
-		9: codec.ArrayValue{Elements: heads},
+		1:  codec.Int32Value{V: checkpointFormatVersion},
+		2:  codec.StringValue{V: cp.NamespaceID},
+		3:  codec.Int64Value{V: cp.ThroughSequence},
+		4:  codec.ArrayValue{Elements: commits},
+		5:  codec.ArrayValue{Elements: branches},
+		6:  codec.ArrayValue{Elements: tags},
+		7:  codec.ArrayValue{Elements: entries},
+		8:  codec.ArrayValue{Elements: segs},
+		9:  codec.ArrayValue{Elements: heads},
+		10: codec.Int64Value{V: cp.FloorSequence},
 	}}
 	return codec.EncodeBytes(root, checkpointType, checkpointRegistry())
 }
@@ -482,6 +497,9 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 		}
 		out.HeadCommits = append(out.HeadCommits, b.V)
 	}
+	if floor, ok := rec.Fields[10].(codec.Int64Value); ok {
+		out.FloorSequence = floor.V
+	}
 	return out, nil
 }
 
@@ -514,6 +532,13 @@ func segmentFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpo
 // to cover is still present and unchanged. A false here means the
 // checkpoint is not trustworthy and the caller must replay the log, which
 // is also what surfaces the underlying damage.
+// A segment below the checkpoint's recorded floor is *expected* to be
+// absent: that is what truncation under history=none does, and the floor
+// is the record of it. A segment missing at or above the floor is damage,
+// and still fails the check. Getting this distinction wrong in either
+// direction is the worst failure available here - too strict and a
+// truncated namespace replays its whole (now incomplete) log on every
+// open, too loose and real damage opens cleanly with data silently gone.
 func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) (bool, string) {
 	current, err := segmentFingerprints(r, cp.ThroughSequence)
 	if err != nil {
@@ -524,6 +549,11 @@ func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) 
 		bySeq[sg.Sequence] = sg
 	}
 	for _, want := range cp.Segments {
+		if want.Sequence < cp.FloorSequence {
+			// Deliberately truncated. Its commits are accounted for by the
+			// checkpoint's own state and its documents by the blob store.
+			continue
+		}
 		got, ok := bySeq[want.Sequence]
 		if !ok {
 			return false, fmt.Sprintf("delta segment %d is missing", want.Sequence)
@@ -566,6 +596,31 @@ func writeCheckpoint(shim storage.PlatformIOShim, cp namespaceCheckpoint) error 
 		return err
 	}
 	return shim.WriteSnapshot(checkpointKey(cp.NamespaceID), raw)
+}
+
+// lowestSegmentSequence reports the oldest delta segment sequence still on
+// disk, or -1 when there are none.
+//
+// Sequences are assigned from zero and never reused
+// (delta.scanExistingDeltaSequence), so a lowest sequence above zero means
+// segments have been deleted - which is the one thing open needs to know
+// before it decides whether replaying "the whole log" would actually be
+// replaying the whole log.
+func lowestSegmentSequence(r storage.DeltaSegmentReader) int64 {
+	if r == nil {
+		return -1
+	}
+	segments, err := r.ListSegments()
+	if err != nil || len(segments) == 0 {
+		return -1
+	}
+	low := segments[0].SequenceNumber
+	for _, s := range segments[1:] {
+		if s.SequenceNumber < low {
+			low = s.SequenceNumber
+		}
+	}
+	return low
 }
 
 // highestSegmentSequence reports the newest delta segment sequence a

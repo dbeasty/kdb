@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
@@ -76,8 +77,13 @@ func (p *DefaultParser) ParseJSON(jsonStr string, sch *schema.KdbSchema) (Namesp
 			expiry.SweepIntervalMillis = int64(v)
 		}
 	}
+	retain, err := parseRetain(raw)
+	if err != nil {
+		return NamespacePolicy{}, err
+	}
 	return NamespacePolicy{
 		NamespaceID:    ns,
+		Retain:         retain,
 		DocumentExpiry: expiry,
 		Schema:         sch,
 		Mode:           mode,
@@ -92,6 +98,41 @@ func (p *DefaultParser) ParseJSON(jsonStr string, sch *schema.KdbSchema) (Namesp
 		Tiers:    DefaultTierPolicy(),
 		Revision: 1,
 	}, nil
+}
+
+// parseRetain reads the retain block that bounds HistoryModeNone's window:
+//
+//	"retain": { "duration": "24h", "commits": 10000 }
+//
+// An absent block is the zero window, which resolves to the default. A
+// present but unparseable one is an error rather than a default, because
+// this setting decides what gets deleted and a typo must never quietly
+// become a shorter window than the operator wrote.
+func parseRetain(raw map[string]any) (storage.RetentionWindow, error) {
+	block, ok := raw["retain"].(map[string]any)
+	if !ok {
+		return storage.RetentionWindow{}, nil
+	}
+	var w storage.RetentionWindow
+	if v, ok := block["duration"]; ok {
+		s, isString := v.(string)
+		if !isString {
+			return storage.RetentionWindow{}, fmt.Errorf("policy: retain.duration must be a string like \"24h\"")
+		}
+		d, err := storage.ParseRetentionDuration(s)
+		if err != nil {
+			return storage.RetentionWindow{}, err
+		}
+		w.Duration = d
+	}
+	if v, ok := block["commits"]; ok {
+		n, isNumber := v.(float64)
+		if !isNumber || n < 0 {
+			return storage.RetentionWindow{}, fmt.Errorf("policy: retain.commits must be a non-negative number")
+		}
+		w.Commits = int64(n)
+	}
+	return w, nil
 }
 
 func dslToJSON(dsl string) string {
@@ -118,5 +159,18 @@ func dslToJSON(dsl string) string {
 	if strings.Contains(strings.ToLower(dsl), "squashafter = never") {
 		squash = "NEVER"
 	}
-	return `{"namespaceId":"` + ns + `","mode":"` + mode + `","history":"` + history + `","conflict":"` + conflict + `","compaction":{"squashAfter":"` + squash + `"}}`
+	retain := ""
+	if m := regexp.MustCompile(`(?is)retain\s*\{[^}]*duration\s*=\s*"([^"]+)"`).FindStringSubmatch(dsl); len(m) > 1 {
+		retain += `"duration":"` + m[1] + `"`
+	}
+	if m := regexp.MustCompile(`(?is)retain\s*\{[^}]*commits\s*=\s*(\d+)`).FindStringSubmatch(dsl); len(m) > 1 {
+		if retain != "" {
+			retain += ","
+		}
+		retain += `"commits":` + m[1]
+	}
+	if retain != "" {
+		retain = `,"retain":{` + retain + `}`
+	}
+	return `{"namespaceId":"` + ns + `","mode":"` + mode + `","history":"` + history + `","conflict":"` + conflict + `","compaction":{"squashAfter":"` + squash + `"}` + retain + `}`
 }

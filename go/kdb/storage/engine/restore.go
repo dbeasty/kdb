@@ -109,6 +109,20 @@ func (e *ServerEngine) GetTree(hash codec.Hash) (document.DocumentTree, bool) {
 	return e.treesByHash.Get(hash)
 }
 
+// TreeAt resolves a document tree by hash, reaching past the cache to the
+// object store or a rebuild when it has to - the full resolution treeAt
+// does for a read, exposed for callers that need a whole historical tree
+// rather than one document out of it.
+//
+// Deliberately not what GetTree does. GetTree implements
+// dag.DocumentTreeStore and is called while the DAG holds its own lock;
+// resolving from there would re-enter the DAG (the rebuild walks commits)
+// and deadlock against any waiting writer. Callers that are not inside
+// that lock use this instead.
+func (e *ServerEngine) TreeAt(treeHash codec.Hash) (document.DocumentTree, bool, error) {
+	return e.treeAt(treeHash)
+}
+
 // PutTree implements dag.DocumentTreeStore.
 func (e *ServerEngine) PutTree(tree document.DocumentTree) { e.treesByHash.Put(tree) }
 

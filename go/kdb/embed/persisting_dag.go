@@ -186,3 +186,32 @@ func (d *PersistingCommitDAG) SetPersistListener(fn func(treeHash codec.Hash, se
 		d.log.onPersisted = fn
 	}
 }
+
+// History navigation, forwarded so a persisting DAG is as browsable as the
+// one it wraps. None of it writes, so none of it needs the log: these read
+// the graph the delegate already holds. See dag.HistoryNavigator.
+func (d *PersistingCommitDAG) ResolveRef(ref dag.CommitRef) (codec.Hash, error) {
+	return d.delegate.ResolveRef(ref)
+}
+func (d *PersistingCommitDAG) ResolveRevision(spec string) (codec.Hash, error) {
+	return d.delegate.ResolveRevision(spec)
+}
+func (d *PersistingCommitDAG) NthAncestor(from codec.Hash, n int) (codec.Hash, error) {
+	return d.delegate.NthAncestor(from, n)
+}
+func (d *PersistingCommitDAG) CommitAtOrBefore(from codec.Hash, ts codec.Timestamp) (codec.Hash, error) {
+	return d.delegate.CommitAtOrBefore(from, ts)
+}
+func (d *PersistingCommitDAG) ListCommits(from codec.Hash, skip, limit int) ([]dag.CommitInfo, error) {
+	return d.delegate.ListCommits(from, skip, limit)
+}
+func (d *PersistingCommitDAG) CreateTag(name string, hash codec.Hash, message string) (document.Tag, error) {
+	return d.delegate.CreateTag(name, hash, message)
+}
+func (d *PersistingCommitDAG) GetTag(name string) (document.Tag, bool) {
+	return d.delegate.GetTag(name)
+}
+func (d *PersistingCommitDAG) ListTags() []document.Tag   { return d.delegate.ListTags() }
+func (d *PersistingCommitDAG) DeleteTag(name string) bool { return d.delegate.DeleteTag(name) }
+
+var _ dag.HistoryNavigator = (*PersistingCommitDAG)(nil)
