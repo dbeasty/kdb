@@ -13,9 +13,6 @@ import (
 // state. Namespace-scoped requests use the namespace itself and need only an ordinary read grant.
 const AdminScope = "control"
 
-// principalKey is the request-context key carrying the authenticated principal.
-type principalKey struct{}
-
 // nsRead wraps a handler that reads one namespace: authenticate, then authorize the request as a
 // read of the namespace in the path.
 //

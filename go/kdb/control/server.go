@@ -49,11 +49,13 @@ type Options struct {
 	// config.Describe. Empty is allowed; the settings endpoint then reports nothing rather than
 	// guessing.
 	Settings []config.SettingDescriptor
-	// AllowWrites opts into mutating endpoints. Nothing mutating is implemented yet, so this
-	// currently only decides whether such a request is answered with 501 (not built) or 403
-	// (built, but this deployment is read-only) - a distinction worth keeping honest from the
-	// start, because "the server said no" and "the server cannot" are different operator
-	// problems.
+	// AllowWrites opts into mutating endpoints. Off by default: turning the control plane on is
+	// not, by itself, a decision to let a browser change the database.
+	//
+	// Revert is the operation this currently gates - and only applying it. Planning a revert is a
+	// read, so it stays available either way and an operator can always see what one would do.
+	// Endpoints that are specified but not built answer 501 rather than 403 whatever this says,
+	// because "the server said no" and "the server cannot" are different operator problems.
 	AllowWrites bool
 	// Version is reported by /v1/health.
 	Version string
