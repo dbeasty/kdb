@@ -41,3 +41,21 @@ type Adapter interface {
 
 	IngestDeltaSegment(segment DeltaSegmentRef) error
 }
+
+// TreePinner is implemented by adapters that cache historical document trees under a budget,
+// and so can be asked to keep one resolvable for as long as a caller still needs it.
+//
+// Optional on purpose. An adapter with an unbounded tree cache - anything memory-backed, where
+// nothing is ever evicted - needs no pins, and an adapter that rebuilds a tree cheaply enough
+// not to care is free not to implement it. Callers probe for it and skip the pin when it is
+// absent; a missing pin costs performance, never correctness.
+//
+// treeHash is a document tree hash, the same key space as Adapter's atCommit parameter.
+//
+// Pins are counted: N calls to PinTree need N calls to UnpinTree. Pinning a tree that is not
+// currently cached is legal and is the common case for a writer whose base version has already
+// been evicted - the pin protects the tree once the rebuild stores it.
+type TreePinner interface {
+	PinTree(treeHash codec.Hash)
+	UnpinTree(treeHash codec.Hash)
+}
