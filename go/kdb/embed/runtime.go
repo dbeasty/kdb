@@ -41,6 +41,34 @@ type EmbeddedKdbRuntime struct {
 	// extra topological-replay pass instead of a fast sequential one, and
 	// leaves one extra small segment on disk.
 	storageClose func() error
+	// maintain writes a checkpoint and, under storage.HistoryModeNone,
+	// reclaims the delta segments that are past both it and the retention
+	// window. Nil for a runtime with nothing to reclaim - a read-only or
+	// pure in-memory one. See Maintain.
+	maintain func() (TruncationResult, error)
+}
+
+// Maintain writes a checkpoint and reclaims what the retention window
+// allows, and reports what it reclaimed.
+//
+// Safe and cheap to call at any time, on either history mode: under
+// storage.HistoryModeFull it writes a checkpoint and deletes nothing,
+// which is exactly what a checkpoint has always been. Under
+// storage.HistoryModeNone it is how a long-running process keeps its
+// footprint bounded rather than waiting for a clean shutdown that may
+// never come - a server should call it on a timer.
+//
+// Errors are real here, unlike the best-effort checkpoint on close: a
+// caller that asked for maintenance explicitly wants to know it did not
+// happen.
+func (rt *EmbeddedKdbRuntime) Maintain() (TruncationResult, error) {
+	if err := rt.AssertWritable(); err != nil {
+		return TruncationResult{}, err
+	}
+	if rt.maintain == nil {
+		return TruncationResult{}, nil
+	}
+	return rt.maintain()
 }
 
 // ErrReadOnly is returned by every write path on a runtime opened with ReadOnly.

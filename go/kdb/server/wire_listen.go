@@ -372,6 +372,10 @@ func (h *sqlWireConnHandler) dispatch(message wire.Message) wire.Message {
 		return h.handleLockRelease(msg)
 	case wire.SearchMessage:
 		return h.handleSearch(msg)
+	case wire.HistoryListMessage:
+		return h.handleHistoryList(msg)
+	case wire.RevertMessage:
+		return h.handleRevert(msg)
 	default:
 		return nil
 	}

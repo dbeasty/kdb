@@ -10,22 +10,23 @@ import (
 	"github.com/limidus/kdb/go/kdb/schema"
 )
 
-// TestDagDiffWorksAfterReopen is the regression test for the defect this file is named after:
-// ServerEngine.GetTree - the dag.DocumentTreeStore implementation the DAG calls to resolve a
-// document tree - stopped at the bounded in-memory store and never reached the on-demand rebuild.
+// Reading history on a *reopened* file-backed namespace is the case these tests exist for, and it
+// is the one that unit tests over a memory runtime can never reach: nothing is ever evicted there,
+// so every tree is still resident and every path looks fine.
 //
-// The rebuild existed, but it hung off treeAt, which only the storage read path called. So a
-// caller arriving through the DAG got a plain miss for a tree that was simply not resident yet,
-// and dag.Diff - which resolves both commits' trees that way - failed with "from tree missing"
-// for every commit but the newest as soon as the namespace was reopened. That is precisely when
-// someone wants to read history, so the failure was invisible in memory-backed tests and total in
-// production.
+// A checkpoint restores the live tree and the commit graph, not every tree the namespace has ever
+// had - the rest are derivable from the delta log and rebuilt on demand. So after a reopen, a
+// caller asking for an older tree is asking for something that has to be reconstructed first.
 //
-// The reopen is the whole point of the test: before it, everything is still resident from having
-// just been written, and the bug cannot reproduce.
-func TestDagDiffWorksAfterReopen(t *testing.T) {
-	dir := t.TempDir()
-	root := filepath.Join(dir, "data")
+// Note which API is under test. Raw dag.Diff resolves trees through dag.DocumentTreeStore, which
+// the DAG calls *while holding its own lock*, so that path deliberately does not rebuild: the
+// rebuild walks commits and would re-enter the DAG, deadlocking against a waiting writer (see
+// ServerEngine.TreeAt's doc comment). embed.DiffCommits is the supported way to diff two points -
+// it resolves both trees outside the lock through the adapter and then compares them with the pure
+// dag.DiffTrees. These tests target that, because that is the contract callers actually have.
+
+func TestHistoryDiffWorksAfterReopen(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "data")
 
 	var commits []codec.Hash
 	func() {
@@ -34,7 +35,6 @@ func TestDagDiffWorksAfterReopen(t *testing.T) {
 			t.Fatalf("open: %v", err)
 		}
 		defer rt.Close()
-		// Enough commits that the oldest trees are well behind the live one.
 		for _, body := range []string{
 			`{"id":"doc-a","v":1}`,
 			`{"id":"doc-b","v":1}`,
@@ -50,58 +50,51 @@ func TestDagDiffWorksAfterReopen(t *testing.T) {
 		}
 	}()
 
+	// The reopen is the whole point: before it, everything is still resident from having just been
+	// written and the interesting path is never taken.
 	rt, err := embed.OpenFileRuntime(root, "demo", "demo/users", schema.None())
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer rt.Close()
 
-	d, ok := rt.DAG.(*embed.PersistingCommitDAG)
-	if !ok {
-		t.Fatalf("expected a persisting DAG on a file-backed runtime, got %T", rt.DAG)
-	}
-	inner := d.Delegate()
-
-	// The oldest pair is the one whose trees are least likely to be resident after a reopen.
-	t.Run("diff across the whole history", func(t *testing.T) {
-		diff, err := inner.Diff(commits[0], commits[len(commits)-1])
+	t.Run("across the whole history", func(t *testing.T) {
+		diff, err := embed.DiffCommits(rt, commits[0].Hex(), commits[len(commits)-1].Hex())
 		if err != nil {
-			t.Fatalf("Diff over reopened history: %v\n"+
-				"This is the regression: both trees are derivable from the delta log, and "+
-				"GetTree must reach the rebuild rather than reporting a miss.", err)
+			t.Fatalf("DiffCommits over reopened history: %v\n"+
+				"Both trees are derivable from the delta log; resolution must reach the rebuild.", err)
 		}
-		// doc-a and doc-b were written twice, doc-c once: three documents exist at the end, and
-		// the first commit already contained doc-a.
 		if len(diff.Entries) == 0 {
-			t.Fatal("a diff across five commits that touched three documents cannot be empty")
+			t.Fatal("a diff across five commits touching three documents cannot be empty")
 		}
 	})
 
-	t.Run("diff each commit against its parent", func(t *testing.T) {
+	t.Run("each commit against its parent", func(t *testing.T) {
 		for i := 1; i < len(commits); i++ {
-			if _, err := inner.Diff(commits[i-1], commits[i]); err != nil {
-				t.Errorf("Diff(%s, %s): %v",
+			if _, err := embed.DiffCommits(rt, commits[i-1].Hex(), commits[i].Hex()); err != nil {
+				t.Errorf("DiffCommits(%s, %s): %v",
 					commits[i-1].Hex()[:8], commits[i].Hex()[:8], err)
 			}
 		}
 	})
 
-	t.Run("a tree no commit claims is still a clean miss", func(t *testing.T) {
-		// The rebuild must not turn an unknown hash into an expensive walk or a spurious hit.
-		var bogus codec.Hash
-		for i := range bogus.Bytes {
-			bogus.Bytes[i] = 0xAB
+	t.Run("by revision specification", func(t *testing.T) {
+		// The specs the history API accepts must survive a reopen too, not just raw hashes.
+		if _, err := embed.DiffCommits(rt, "head~2", "head"); err != nil {
+			t.Errorf("DiffCommits(head~2, head) after reopen: %v", err)
 		}
-		if _, ok := inner.GetDocumentTree(bogus); ok {
-			t.Fatal("a tree hash no commit claims must not resolve")
+	})
+
+	t.Run("a revision that names nothing is refused, not guessed", func(t *testing.T) {
+		if _, err := embed.DiffCommits(rt, "head~999", "head"); err == nil {
+			t.Fatal("walking past the root must be an error rather than silently clamping to it")
 		}
 	})
 }
 
-// TestDiffReportsModificationsNotJustAdditions guards the semantics the control plane's
-// operation-based diff depends on: a document written twice is modified the second time, not
-// added again.
-func TestDiffReportsModificationsNotJustAdditions(t *testing.T) {
+// TestHistoryDiffReportsModifications guards the semantics the control plane's commit view
+// renders: a document written twice is modified the second time, not added again.
+func TestHistoryDiffReportsModifications(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "data")
 	rt, err := embed.OpenFileRuntime(root, "demo", "demo/users", schema.None())
 	if err != nil {
@@ -118,8 +111,7 @@ func TestDiffReportsModificationsNotJustAdditions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	inner := rt.DAG.(*embed.PersistingCommitDAG).Delegate()
-	diff, err := inner.Diff(first.Commit, second.Commit)
+	diff, err := embed.DiffCommits(rt, first.Commit.Hex(), second.Commit.Hex())
 	if err != nil {
 		t.Fatalf("diff: %v", err)
 	}

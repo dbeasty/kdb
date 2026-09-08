@@ -33,8 +33,35 @@ type CheckpointState struct {
 // operations, so this is proportional to the number of commits rather
 // than to the bytes they wrote.
 func (d *InMemoryCommitDag) CheckpointSnapshot() CheckpointState {
+	return d.CheckpointSnapshotRetaining(nil)
+}
+
+// CheckpointSnapshotRetaining is CheckpointSnapshot with a filter: a
+// commit is written out only when keep accepts it, or when a branch or tag
+// names it. A nil keep writes every commit, which is what a namespace that
+// reclaims nothing wants.
+//
+// This is the commit graph's half of a retention window. The delta log's
+// half deletes segments; without this the graph kept every commit those
+// segments ever held, so the checkpoint - the one artifact a
+// history=none namespace must reload in full at open - went on growing
+// with history even as the log stopped. Measured before this filter
+// existed: 1.1 KB after one session, 4.5 KB after eight, on three
+// documents.
+//
+// Branch heads and tags are kept whatever keep says. A ref naming a commit
+// the checkpoint omitted would restore a graph whose own head is missing,
+// which is not a smaller database but a broken one.
+func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commit) bool) CheckpointState {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	pinned := make(map[codec.Hash]struct{}, len(d.branches)+len(d.tags))
+	for _, b := range d.branches {
+		pinned[b.HeadHash] = struct{}{}
+	}
+	for _, t := range d.tags {
+		pinned[t.CommitHash] = struct{}{}
+	}
 	state := CheckpointState{
 		Commits:  make([]CheckpointCommit, 0, len(d.nodes)),
 		Branches: make([]document.Branch, 0, len(d.branches)),
@@ -42,6 +69,11 @@ func (d *InMemoryCommitDag) CheckpointSnapshot() CheckpointState {
 	}
 	for _, n := range d.nodes {
 		c := n.commit
+		if keep != nil && !keep(c) {
+			if _, isRef := pinned[c.Hash]; !isRef {
+				continue
+			}
+		}
 		count := len(c.Operations)
 		if count == 0 && d.opsEvictedFor(c.Hash) {
 			// Already evicted from memory, so len() understates it. The

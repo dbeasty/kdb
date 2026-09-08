@@ -50,6 +50,18 @@ func (env PayloadEnvelope) Summary() string {
 		}
 	case "searchResult":
 		return "searchResult"
+	case "historyList":
+		if env.HistoryList != nil {
+			return "historyList ns=" + env.HistoryList.Namespace
+		}
+	case "historyResult":
+		return "historyResult"
+	case "revert":
+		if env.Revert != nil {
+			return "revert ns=" + env.Revert.Namespace
+		}
+	case "revertResult":
+		return "revertResult"
 	default:
 		return env.Kind
 	}

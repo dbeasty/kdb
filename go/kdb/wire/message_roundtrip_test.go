@@ -511,6 +511,10 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgLockResult, "LOCK_RESULT"},
 		{wire.MsgSearch, "SEARCH"},
 		{wire.MsgSearchResult, "SEARCH_RESULT"},
+		{wire.MsgHistoryList, "HISTORY_LIST"},
+		{wire.MsgHistoryResult, "HISTORY_RESULT"},
+		{wire.MsgRevert, "REVERT"},
+		{wire.MsgRevertResult, "REVERT_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -527,11 +531,12 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 	if _, ok := wire.MessageTypeFromCode(0x00); ok {
 		t.Error("code 0x00 should not be a known message type")
 	}
-	if _, ok := wire.MessageTypeFromCode(0x1F); ok {
-		t.Error("code 0x1F is unassigned and should not be recognized")
+	// 0x1F-0x22 are the history messages; 0x23 is the next free code.
+	if _, ok := wire.MessageTypeFromCode(0x23); ok {
+		t.Error("code 0x23 is unassigned and should not be recognized")
 	}
-	if wire.MessageType(0x1F).String() != "UNKNOWN" {
-		t.Errorf("unassigned type names itself %q", wire.MessageType(0x1F).String())
+	if wire.MessageType(0x23).String() != "UNKNOWN" {
+		t.Errorf("unassigned type names itself %q", wire.MessageType(0x23).String())
 	}
 }
 

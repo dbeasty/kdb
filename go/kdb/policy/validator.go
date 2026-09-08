@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
@@ -56,6 +57,21 @@ func (defaultValidator) Validate(policy NamespacePolicy) ValidationResult {
 		errors = append(errors, ValidationIssue{
 			Kind:    "UnsupportedMode",
 			Message: "history=NONE should use squashAfter=NEVER",
+		})
+	}
+	if policy.History == HistoryModeFull && !policy.Retain.IsZero() {
+		errors = append(errors, ValidationIssue{
+			Kind: "IgnoredSetting",
+			Message: "retain applies to history=NONE only; history=FULL keeps everything forever " +
+				"and would silently ignore this window",
+		})
+	}
+	if (policy.Retain.Duration < 0 && policy.Retain.Duration != storage.RetainNothing) ||
+		policy.Retain.Commits < 0 {
+		errors = append(errors, ValidationIssue{
+			Kind: "InvalidRetainWindow",
+			Message: "retain.duration and retain.commits must not be negative; " +
+				"write retain.duration = \"0\" to keep nothing",
 		})
 	}
 	if policy.Mode == NamespaceModeAppendOnly && policy.Conflict != transaction.ConflictPolicyAppendOnly {

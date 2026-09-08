@@ -1008,8 +1008,29 @@ for. After the fixes above, re-verified on disk that a document written twice re
 *modification* with both content hashes, and that a diff between two arbitrary commits - which
 previously failed outright - resolves through the tree path.
 
-### Merge note
+### After merging the history work (PR #41)
 
-The `GetTree` fix touches `go/kdb/storage/engine/restore.go`, and the parallel history work on
-main has that file modified too. Expect a small conflict there; the change is self-contained (one
-function body plus its doc comment).
+PR #41 landed the retention modes and, with them, the real history API this plan anticipated. The
+control plane now consumes it instead of carrying its own implementations, which is what Appendix A
+predicted would happen.
+
+**Deleted from this branch, in favour of the engine's:** local revision resolution, the local
+tree-based diff, and the operation-based diff that existed because the tree-based one did not work
+on disk. `dag.ResolveRevision`, `dag.ListCommits` and `embed.DiffCommits` replace all of it.
+
+**The `GetTree` fix was withdrawn.** PR #41 reached the same defect and fixed it correctly:
+`GetTree` is called *while the DAG holds its own lock*, and the rebuild walks commits, so resolving
+from there re-enters the DAG and deadlocks against a waiting writer. #41 added
+`ServerEngine.TreeAt` for callers outside that lock and deliberately left `GetTree` alone;
+`embed.DiffCommits` resolves both trees through it and then compares them with the pure
+`dag.DiffTrees`. That is the right shape and this branch now uses it. The regression test survives,
+retargeted at `embed.DiffCommits`, which is the contract callers actually have.
+
+**Now implemented, having been 501 stubs:** reading a document at any past revision, real tags
+(the DAG's tag store is no longer a stub), and revert - plan and apply, gated on `--control-write`,
+with a mandatory `expectHead` so what is applied is what was previewed.
+
+**Abbreviated hashes** are resolved in this package rather than the engine. `dag.ParseRevision`
+takes a full 64-hex hash; a log listing shows eight digits and a person will paste what they see.
+The prefix lookup runs only after the engine has already rejected a spec, so no branch name, tag or
+walk suffix can be shadowed by it.

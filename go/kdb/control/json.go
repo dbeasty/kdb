@@ -63,6 +63,10 @@ func intParam(r *http.Request, name string, def, min, max int) (int, error) {
 	return n, nil
 }
 
+// maxSkip bounds how far a caller may page back in one request. Paging is a traversal, so a deep
+// skip costs the walk it skips; this keeps a single request bounded.
+const maxSkip = 20_000
+
 // shortHash is the display form of a commit hash - the same 8 hex digits the CLI's log uses, and
 // the minimum LookupHashPrefix accepts.
 func shortHash(hex string) string {

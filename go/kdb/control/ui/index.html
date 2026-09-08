@@ -83,6 +83,21 @@
   .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
   .kv dt { color: var(--muted); }
   .kv dd { margin: 0; overflow-wrap: anywhere; }
+  /* Time travel is a mode, not a filter: it has to be impossible to miss that what is on screen
+     is not current. Hence a full-width bar rather than a subtle badge. */
+  .timebar { display: flex; align-items: center; gap: 10px; padding: 8px 16px; font-size: 13px;
+             background: color-mix(in srgb, var(--modified) 22%, var(--panel));
+             border-bottom: 1px solid var(--border); }
+  .timebar strong { font-family: var(--mono); }
+  .danger { border-color: var(--removed); color: var(--removed); }
+  dialog { border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+           color: var(--text); max-width: 560px; width: 92%; padding: 0; }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog h3 { margin: 0; padding: 12px 14px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  dialog .body { padding: 14px; }
+  dialog footer { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 14px;
+                  border-top: 1px solid var(--border); }
+  .scroll { max-height: 220px; overflow: auto; }
 </style>
 </head>
 <body>
@@ -101,7 +116,15 @@
   <button data-tab="settings" aria-selected="false">Settings</button>
   <button data-tab="ops" aria-selected="false">Ops</button>
 </nav>
+<div class="timebar" id="timebar" hidden>
+  <span>Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
+  <span class="sp" style="flex:1"></span>
+  <button class="act" id="exitat">Return to HEAD</button>
+</div>
 <main id="main"></main>
+<dialog id="revertdlg"><h3>Revert</h3><div class="body" id="revertbody"></div>
+  <footer><button class="act" id="revertcancel">Cancel</button>
+  <button class="act danger" id="revertgo">Revert</button></footer></dialog>
 
 <script>
 "use strict";
@@ -127,7 +150,10 @@ const el = (tag, attrs = {}, ...kids) => {
 // the URL, where it would end up in history and logs.
 const TOKEN_KEY = "kdb.control.token";
 let token = sessionStorage.getItem(TOKEN_KEY) || "";
-let state = { ns: null, tab: "commits", commits: [], selected: null, hasMore: false, es: null };
+// `at` is the revision every view reads at: null means head. It is a mode rather than a per-view
+// filter, so it lives here and every fetch consults it.
+let state = { ns: null, tab: "commits", commits: [], selected: null, hasMore: false, es: null,
+              at: null, canWrite: false };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -182,6 +208,26 @@ function setMain(...children) {
   $("main").replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
 }
 
+// enterAt / exitAt switch the whole app between head and a past revision. Everything re-renders,
+// because a screen showing a mix of current and historical data would be worse than either.
+function enterAt(spec, label) {
+  state.at = spec;
+  $("timebar").hidden = false;
+  $("atref").textContent = label || spec;
+  selectTab(state.tab);
+}
+
+function exitAt() {
+  state.at = null;
+  $("timebar").hidden = true;
+  selectTab(state.tab);
+}
+
+// atQuery appends the viewing revision to a URL that supports it.
+function atQuery(sep) {
+  return state.at ? sep + "at=" + encodeURIComponent(state.at) : "";
+}
+
 function setLive(on, text, bad) {
   const dot = $("livedot");
   dot.className = "dot" + (bad ? " err" : on ? " on" : "");
@@ -200,6 +246,7 @@ async function boot() {
   try {
     const [health, namespaces] = await Promise.all([api("/v1/health"), api("/v1/namespaces")]);
     state.ns = (namespaces.namespaces[0] || {}).id || health.namespace;
+    state.canWrite = health.controlWritesEnabled === true;
     $("ns").textContent = state.ns;
     $("tabs").hidden = false; $("signout").hidden = false;
     connectEvents();
@@ -228,7 +275,8 @@ const nsPath = (suffix) => "/v1/ns/" + encodeURIComponent(state.ns) + suffix;
 
 async function renderCommits(append = false) {
   const skip = append ? state.commits.length : 0;
-  const page = await api(nsPath("/log?limit=50&skip=" + skip));
+  const from = state.at ? "&from=" + encodeURIComponent(state.at) : "";
+  const page = await api(nsPath("/log?limit=50&skip=" + skip + from));
   state.commits = append ? state.commits.concat(page.commits) : page.commits;
   state.hasMore = page.hasMore;
   $("head").textContent = page.from ? page.from.slice(0, 8) : "";
@@ -245,7 +293,10 @@ function drawCommits() {
       el("td", {}, c.message || el("span", { class: "muted", text: "(no message)" }),
         ...(c.refs || []).map((r) => el("span", { class: "chip ref", text: r }))),
       el("td", { class: "muted" }, formatTime(c.timestamp)),
-      el("td", { class: "muted" }, String(c.opCount)));
+      // -1 means the operations were evicted under the retention budget and the count is not
+      // knowable without loading them. Showing "0" there would read as "this commit wrote nothing".
+      el("td", { class: "muted", title: c.opCount < 0 ? "operations not retained" : "" },
+        c.opCount < 0 ? "—" : String(c.opCount)));
     tr.addEventListener("click", () => showCommit(c.hash));
     return tr;
   });
@@ -300,7 +351,7 @@ function drawDetail(sel) {
     el("dt", { text: "Author node" }), el("dd", {}, el("code", { text: c.commit.author })),
     el("dt", { text: "Tree" }), el("dd", {}, el("code", { text: c.commit.treeHash.slice(0, 16) })));
 
-  const opsSection = c.operationsAvailable
+  const opsSection = c.operationsAvailable === false ? el("div", { class: "warn", text: c.operationsNote }) : c.operationsAvailable
     ? (c.operations.length
         ? el("table", {},
             el("thead", {}, el("tr", {}, el("th", { text: "Kind" }), el("th", { text: "Document" }), el("th", { text: "Bytes" }))),
@@ -329,9 +380,20 @@ function drawDetail(sel) {
     diffSection = el("div", { class: "empty", text: "No document changes against the first parent." });
   }
 
+  const actions = el("div", { class: "body", style: "display:flex;gap:8px;flex-wrap:wrap" },
+    el("button", { class: "act", text: "View at this commit",
+                   onclick: () => enterAt(c.commit.hash, c.commit.shortHash) }),
+    // Revert is offered whatever the write setting: planning is a read, and the dialog reports the
+    // refusal if applying is not allowed. Hiding it would leave an operator unable to find out
+    // what a revert would even do.
+    el("button", { class: "act danger", text: "Revert to this commit",
+                   title: state.canWrite ? "" : "This control plane is read-only; you can preview the revert but not apply it",
+                   onclick: () => openRevert(c.commit.hash, c.commit.shortHash) }));
+
   $("detail").replaceChildren(
     el("h2", { text: "Commit " + c.commit.shortHash }),
     el("div", { class: "body" }, el("strong", { text: c.commit.message || "(no message)" }), kv),
+    actions,
     el("h2", { text: "Operations" }), opsSection,
     el("h2", { text: "Changed documents" }), diffSection);
 }
@@ -352,9 +414,17 @@ async function renderRefs() {
         : el("div", { class: "empty", text: "No branches." }))),
     el("div", { class: "col" }, el("div", { class: "card" },
       el("h2", { text: "Tags" }),
-      el("div", { class: "empty" },
-        "Tags are a stub in the engine today: the DAG holds a tag map with no create, list or ",
-        "delete methods, so there is nothing to show yet.")))));
+      r.tags.length
+        ? el("table", {},
+            el("thead", {}, el("tr", {}, el("th", { text: "Tag" }), el("th", { text: "Commit" }),
+                                el("th", { text: "Created" }))),
+            el("tbody", {}, r.tags.map((t) => el("tr", { class: "pick",
+                onclick: () => enterAt("tag:" + t.name, "tag:" + t.name) },
+              el("td", {}, t.name,
+                t.message ? el("div", { class: "muted", style: "font-size:12px", text: t.message }) : null),
+              el("td", {}, el("code", { text: t.shortHead })),
+              el("td", { class: "muted" }, formatTime(t.updatedAt))))))
+        : el("div", { class: "empty", text: "No tags." })))));
 }
 
 async function renderSchema() {
@@ -451,6 +521,85 @@ async function renderOps() {
       ops.admission.note ? el("div", { class: "warn", text: ops.admission.note }) : null)))));
 }
 
+// Revert is deliberately three steps: preview, read what will change, then confirm by typing the
+// namespace. The preview is a server-computed plan and the apply is checked against the head that
+// plan was made from, so what is applied is what was shown.
+async function openRevert(spec, label) {
+  const dlg = $("revertdlg");
+  const body = $("revertbody");
+  body.replaceChildren(el("div", { class: "empty", text: "Planning…" }));
+  $("revertgo").disabled = true;
+  dlg.showModal();
+
+  let plan;
+  try {
+    plan = await api(nsPath("/revert/plan"), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: spec }),
+    });
+  } catch (e) {
+    body.replaceChildren(el("div", { class: "err", text: e.message }));
+    return;
+  }
+
+  if (plan.noop) {
+    body.replaceChildren(el("div", { class: "empty",
+      text: "The database is already in that state. Nothing would change." }));
+    return;
+  }
+
+  const confirmField = el("input", { type: "text", placeholder: state.ns,
+                                     style: "width:100%;margin-top:6px" });
+  const arm = () => { $("revertgo").disabled = confirmField.value.trim() !== state.ns; };
+  confirmField.addEventListener("input", arm);
+
+  body.replaceChildren(
+    el("p", { style: "margin-top:0" },
+      "Restore the state at ", el("code", { text: label || spec }), ". This writes a ",
+      el("strong", { text: "new commit" }),
+      " — history is not rewritten, and this revert can itself be reverted."),
+    el("div", {},
+      el("span", { class: "chip modified", text: plan.willRestore + " restored" }), " ",
+      el("span", { class: "chip removed", text: plan.willRemove + " removed" })),
+    el("div", { class: "scroll", style: "margin:10px 0" },
+      el("table", {}, el("tbody", {}, plan.entries.map((e) => el("tr", {},
+        el("td", {}, el("span", { class: "chip " + e.change, text: revertVerb(e.change) })),
+        el("td", {}, el("code", { text: e.docId }))))))),
+    el("p", { class: "muted", style: "margin-bottom:4px" },
+      "Type the namespace to confirm:"),
+    confirmField);
+  arm();
+
+  $("revertgo").onclick = async () => {
+    $("revertgo").disabled = true;
+    try {
+      const done = await api(nsPath("/revert/apply"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: spec, expectHead: plan.expectHead }),
+      });
+      dlg.close();
+      state.selected = null;
+      exitAt();
+      await selectTab("commits");
+      flash("Reverted in commit " + done.commit.slice(0, 8) +
+            " — " + done.restored + " restored, " + done.removed + " removed.");
+    } catch (e) {
+      body.replaceChildren(el("div", { class: "err", text: e.message }));
+    }
+  };
+}
+
+// The diff is expressed head -> target, so an entry "added" there is one the revert restores.
+function revertVerb(change) {
+  return { added: "restore", modified: "restore", removed: "remove" }[change] || change;
+}
+
+function flash(message) {
+  const note = el("div", { class: "card", style: "margin-bottom:12px" },
+    el("div", { class: "body", text: message }));
+  $("main").prepend(note);
+}
+
 function formatValue(v) {
   if (v === null || v === undefined) return "—";
   if (v === "") return "(empty)";
@@ -470,6 +619,8 @@ $("tabs").addEventListener("click", (e) => {
   if (tab) selectTab(tab);
 });
 $("signout").addEventListener("click", () => signOut());
+$("exitat").addEventListener("click", exitAt);
+$("revertcancel").addEventListener("click", () => $("revertdlg").close());
 
 if (token) boot(); else renderGate();
 </script>

@@ -77,6 +77,13 @@ const (
 	MsgSearch       MessageType = 0x1D
 	MsgSearchResult MessageType = 0x1E
 
+	// History over the wire (see history_ops.go): listing commits and
+	// reverting to one. Go-only for now, like 0x14-0x1C.
+	MsgHistoryList   MessageType = 0x1F
+	MsgHistoryResult MessageType = 0x20
+	MsgRevert        MessageType = 0x21
+	MsgRevertResult  MessageType = 0x22
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -144,6 +151,14 @@ func (t MessageType) String() string {
 		return "SEARCH"
 	case MsgSearchResult:
 		return "SEARCH_RESULT"
+	case MsgHistoryList:
+		return "HISTORY_LIST"
+	case MsgHistoryResult:
+		return "HISTORY_RESULT"
+	case MsgRevert:
+		return "REVERT"
+	case MsgRevertResult:
+		return "REVERT_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -211,6 +226,14 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgSearch, true
 	case 0x1E:
 		return MsgSearchResult, true
+	case 0x1F:
+		return MsgHistoryList, true
+	case 0x20:
+		return MsgHistoryResult, true
+	case 0x21:
+		return MsgRevert, true
+	case 0x22:
+		return MsgRevertResult, true
 	default:
 		return 0, false
 	}

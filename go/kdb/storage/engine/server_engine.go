@@ -34,7 +34,11 @@ type ServerEngine struct {
 	// path (WriteBlob): WAL.Append and memTable.Put are each
 	// independently thread-safe, so blob writes never take a lock at all
 	// - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
-	cap        storage.CapabilitySet
+	cap storage.CapabilitySet
+	// blobStore is where flushed memtables land. Held so maintenance can
+	// compact it - see CompactBlobStore. The memtable manager owns the
+	// write path into it; this reference is read-only apart from that.
+	blobStore  *sstable.LsmBlobStore
 	memTable   *memtable.Manager
 	docsByHash *shardedDocByHashStore
 	// coldLoader re-reads a document version that docsByHash has evicted,
@@ -59,13 +63,13 @@ type ServerEngine struct {
 	treeRebuildOnce *sync.Once
 	treeRebuildErr  error
 
-	// treeChain remembers how many delta tree objects stand behind each
-	// tree, so putTreeObject knows when to write a full one instead. Lost
-	// on restart, which only means the first tree written in a new process
-	// starts a fresh chain - never a correctness issue, since resolution
-	// stops at the first full object it finds.
+	// treeChain remembers what stands behind each tree in delta tree
+	// objects, so putTreeObject knows when to write a full one instead.
+	// Lost on restart, which only means the first tree written in a new
+	// process starts a fresh chain - never a correctness issue, since
+	// resolution stops at the first full object it finds.
 	treeChainMu sync.Mutex
-	treeChain   map[codec.Hash]int
+	treeChain   map[codec.Hash]treeChainState
 	// memtableFlushOverride, when > 0, replaces the config-derived flush
 	// threshold. Set by SetMemoryBudgetBytes when a BudgetArbiter re-cuts
 	// this namespace's share. Atomic rather than a write to config, which
@@ -204,6 +208,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		wal:              w,
 		groupCommit:      wal.NewGroupCommitter(),
 		cap:              cap,
+		blobStore:        blobStore,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
 		docsByHash:       newShardedDocByHashStore(0),
 		pending:          newShardedPendingStore(),
@@ -387,6 +392,20 @@ func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommi
 // or a version the loader cannot find reports "not found" rather than an
 // error, matching what a miss meant when this store never evicted.
 func (e *ServerEngine) loadCold(docID codec.UUID, contentHash codec.Hash) (document.Document, bool, error) {
+	// The blob store first, and only under the mode that writes into it:
+	// there the delta log may have been truncated, so it is both the
+	// faster answer and, for anything older than the retained window, the
+	// only one. Under HistoryModeFull nothing is written there and this
+	// would be a wasted lookup on every cold read.
+	if e.HistoryMode() == storage.HistoryModeNone {
+		if doc, found, err := e.loadDocumentBody(docID, contentHash); err != nil {
+			return document.Document{}, false, err
+		} else if found {
+			e.coldLoads.Add(1)
+			e.docsByHash.Put(contentHash, doc)
+			return doc, true, nil
+		}
+	}
 	loader := e.coldLoader.Load()
 	if loader == nil {
 		return document.Document{}, false, nil
@@ -604,6 +623,9 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 			return document.DocumentTree{}, err
 		}
 		changed = append(changed, TreeChange{DocID: doc.ID, ContentHash: h})
+		// Under a mode that deletes delta segments, the log is not a home
+		// this version can rely on. See document_bodies.go.
+		e.putDocumentBody(h, doc)
 		prev, hadPrev := e.tree.HashFor(doc.ID)
 		// Pin before Put, never after: Put evicts to stay within budget as
 		// part of the insert, so a version pinned afterwards can already be

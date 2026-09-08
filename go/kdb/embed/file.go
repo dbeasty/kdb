@@ -82,8 +82,10 @@ func (h *Host) openNamespace(
 			return nil, nil, err
 		}
 	}
-	historyStrategy, err := resolveHistoryStrategy(
-		dataRoot, namespaceID, opts.Storage.HistoryStrategy, namespaceIsNew, opts.ReadOnly, opts.forceHistoryStrategy)
+	historyStrategy, historyMode, err := resolveNamespaceHistory(
+		dataRoot, namespaceID,
+		opts.Storage.HistoryStrategy, opts.Storage.HistoryMode,
+		namespaceIsNew, opts.ReadOnly, opts.forceHistoryStrategy)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,11 +106,19 @@ func (h *Host) openNamespace(
 		Durability:              opts.Storage.Durability,
 		AsyncSyncIntervalMillis: opts.Storage.AsyncSyncIntervalMillis,
 		HistoryStrategy:         historyStrategy,
-		DocumentCacheBytes:      opts.Storage.DocumentCacheBytes,
-		CommitOpsBytes:          opts.Storage.CommitOpsBytes,
-		TreeChainLimit:          opts.Storage.TreeChainLimit,
-		HistoryTreeCacheBytes:   opts.Storage.HistoryTreeCacheBytes,
-		DisableCheckpoints:      opts.Storage.DisableCheckpoints,
+		HistoryMode:             historyMode,
+		// Deliberately *not* resolved here. Resolve turns the
+		// RetainNothing sentinel into a plain zero, and a plain zero means
+		// "unset, take the default" - so resolving on the way in silently
+		// converted "keep nothing" into "keep a day", and only at the
+		// second reader. The config carries what the caller wrote and
+		// every reader resolves at the point of use.
+		Retain:                opts.Storage.Retain,
+		DocumentCacheBytes:    opts.Storage.DocumentCacheBytes,
+		CommitOpsBytes:        opts.Storage.CommitOpsBytes,
+		TreeChainLimit:        opts.Storage.TreeChainLimit,
+		HistoryTreeCacheBytes: opts.Storage.HistoryTreeCacheBytes,
+		DisableCheckpoints:    opts.Storage.DisableCheckpoints,
 	}
 	target := engine.TargetServer
 	if opts.ReadOnly {
@@ -236,7 +246,8 @@ func (h *Host) openNamespace(
 			}
 			// After the seal, so no segment can gain another commit and the
 			// checkpoint can claim the newest one - see checkpointOnClose.
-			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints)
+			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID,
+				opts.Storage.Retain, opts.Storage.DisableCheckpoints)
 		}
 		if err := handle.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -246,6 +257,23 @@ func (h *Host) openNamespace(
 	// Closing the runtime closes this namespace through the host, which is what owns the
 	// shutdown sequence now that a lock can outlive any one namespace under it.
 	rt.storageClose = func() error { return h.CloseNamespace(namespaceID) }
+
+	if r := handle.DeltaReader(); r != nil && !opts.ReadOnly {
+		// through is the newest *sealed* segment: the writer's own is
+		// still taking appends, so a checkpoint cannot claim it and
+		// truncation must not touch it.
+		rt.maintain = func() (TruncationResult, error) {
+			through := highestSegmentSequence(r)
+			if seq, ok := handle.DeltaWriter().(storage.DeltaSegmentSequencer); ok {
+				if open := seq.SequenceNumber(); open-1 < through {
+					through = open - 1
+				}
+			}
+			return checkpointAndTruncate(
+				d, store, r, io, namespaceID, through,
+				opts.Storage.Retain, time.Now(), opts.Storage.DisableCheckpoints)
+		}
+	}
 
 	// This namespace's side of the host's memory pool. Registered by the caller, after the
 	// entry is in the host's map, so a rebalance can never reach a namespace the host does not

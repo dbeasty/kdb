@@ -78,6 +78,17 @@ type StorageOptions struct {
 	// silently ignored, because the two leave different things on disk.
 	HistoryStrategy storage.HistoryStrategy
 
+	// HistoryMode selects how long this namespace keeps the past - see
+	// storage.HistoryMode. The zero value means "whatever this namespace
+	// already is". Like HistoryStrategy, a value that disagrees with the
+	// namespace's recorded mode is refused at open rather than silently
+	// ignored, because the two do not leave the same bytes on disk.
+	HistoryMode storage.HistoryMode
+	// Retain bounds how much of the past storage.HistoryModeNone keeps.
+	// Ignored under HistoryModeFull, which keeps everything. The zero
+	// value resolves to storage.DefaultRetentionDuration.
+	Retain storage.RetentionWindow
+
 	// DocumentCacheBytes caps how many bytes of document versions stay
 	// resident before the oldest are evicted and re-read on demand. Zero
 	// takes half the hot-tier budget. Raising it trades memory for fewer
@@ -150,6 +161,22 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 			opts.Storage.HistoryStrategy = s
 		}
 	}
+	if raw := strings.TrimSpace(os.Getenv("KDB_HISTORY_MODE")); raw != "" {
+		// Unparseable is ignored for the same reason KDB_HISTORY_STRATEGY
+		// ignores a typo: this returns no error, and "whatever the
+		// namespace already is" is the only safe reading of a value
+		// nobody can interpret. It is emphatically the safe reading here,
+		// where the other answer starts deleting segments.
+		if m, err := storage.ParseHistoryMode(raw); err == nil {
+			opts.Storage.HistoryMode = m
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("KDB_RETAIN_DURATION")); raw != "" {
+		if d, err := storage.ParseRetentionDuration(raw); err == nil {
+			opts.Storage.Retain.Duration = d
+		}
+	}
+	opts.Storage.Retain.Commits = envBytes("KDB_RETAIN_COMMITS")
 	opts.Storage.DocumentCacheBytes = envBytes("KDB_DOCUMENT_CACHE_BYTES")
 	opts.Storage.CommitOpsBytes = envBytes("KDB_COMMIT_OPS_BYTES")
 	opts.Storage.HistoryTreeCacheBytes = envBytes("KDB_HISTORY_TREE_CACHE_BYTES")

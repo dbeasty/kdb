@@ -261,15 +261,15 @@ func TestUnknownRevisionIsNotFound(t *testing.T) {
 func TestShortPrefixIsRefusedRatherThanGuessed(t *testing.T) {
 	cs, base := newFixture(t)
 	seed(t, cs, `{"name":"ada"}`)
-	// Under 8 digits is below LookupHashPrefix's floor. Refusing is the point: resolving it
-	// arbitrarily would show an operator a commit they did not ask for.
+	// Under 8 digits is below LookupHashPrefix's floor, so it is not treated as an abbreviated
+	// hash at all. Refusing is the point: resolving it arbitrarily would show an operator a commit
+	// they did not ask for.
 	res, body := get(t, base, "/v1/ns/demo%2Fusers/commits/abc")
 	if res.StatusCode != http.StatusNotFound {
 		t.Fatalf("got %d, want 404", res.StatusCode)
 	}
-	msg := fmt.Sprint(body["error"])
-	if !strings.Contains(msg, "8 hex digits") {
-		t.Errorf("the error should explain the prefix floor: %s", msg)
+	if body["error"] == nil {
+		t.Errorf("a refused revision must carry the standard error body: %v", body)
 	}
 }
 
@@ -309,17 +309,6 @@ func TestRefsReportsBranchesAndHonestlyEmptyTags(t *testing.T) {
 	}
 	if body["tags"] == nil {
 		t.Error("tags must be present and empty rather than absent - the engine's tag support is a stub")
-	}
-}
-
-func TestDocumentReadAtPastCommitIsRefusedNotSilentlyHead(t *testing.T) {
-	cs, base := newFixture(t)
-	put := seed(t, cs, `{"name":"ada"}`)[0]
-	res, body := get(t, base,
-		"/v1/ns/demo%2Fusers/docs/"+put.DocID.String()+"?at="+put.Commit.Hex())
-	if res.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("time travel is not wired into the server read path; answering from head would "+
-			"show the wrong data under a URL that says otherwise. Got %d (%v)", res.StatusCode, body)
 	}
 }
 
@@ -436,7 +425,9 @@ func TestMutatingEndpointsAreRefusedWhileReadOnly(t *testing.T) {
 // distinguishable, which are different operator problems.
 func TestWriteEnabledStillReportsUnbuiltEndpoints(t *testing.T) {
 	_, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
-	req, _ := http.NewRequest(http.MethodPost, base+"/v1/ns/demo%2Fusers/revert/plan", strings.NewReader("{}"))
+	// The SQL console is specified in the plan and not built; revert, which used to stand in here,
+	// is built now.
+	req, _ := http.NewRequest(http.MethodPost, base+"/v1/ns/demo%2Fusers/sql", strings.NewReader("{}"))
 	req.Header.Set("Authorization", "Bearer alice:secret")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -660,19 +651,14 @@ func (denyAllEngine) Authorize(_ context.Context, _ auth.Principal, _ auth.Actio
 	return fmt.Errorf("denied by test")
 }
 
-// TestBothDiffPathsAgree is the test that would have caught the tree-hash mix-up in
-// diffAgainstParent.
+// TestDiffReportsModificationAsModification guards the semantic a commit view lives or dies by: a
+// document written twice is modified the second time, not added again.
 //
-// The control plane has two ways to compute what a commit changed: the operation-based path
-// (cheap, needs resident operations) and dag.Diff over both document trees (exact, needs both
-// trees resolvable). They must produce the same answer. The bug they guard against is silent -
-// passing a commit hash where the storage adapter wants a document tree hash resolves nothing and
-// reports every modification as an addition, which looks entirely plausible until you compare it
-// with the trees.
-func TestBothDiffPathsAgree(t *testing.T) {
+// This used to be a cross-check between two local diff implementations, which is how a key-space
+// mix-up in one of them was caught. There is one implementation now - the engine's
+// embed.DiffCommits - so the check is against the meaning rather than against a second opinion.
+func TestDiffReportsModificationAsModification(t *testing.T) {
 	cs, base := newFixture(t)
-	// A document written twice, so the second commit is a modification and not an addition, plus
-	// an unrelated document so the trees are not trivially small.
 	seed(t, cs, `{"id":"doc-a","v":1}`)
 	seed(t, cs, `{"id":"doc-b","v":1}`)
 	second := seed(t, cs, `{"id":"doc-a","v":2}`)[0]
@@ -685,49 +671,30 @@ func TestBothDiffPathsAgree(t *testing.T) {
 	if !ok {
 		t.Fatal("commit missing")
 	}
-	parent := commit.ParentHashes[0]
-
-	viaOps, err := cs.diffAgainstParent(commit, parent, "demo/users")
+	_, _, entries, err := cs.diffRevisions(commit.ParentHashes[0].Hex(), second.Commit.Hex())
 	if err != nil {
-		t.Fatalf("operation-based diff: %v", err)
+		t.Fatalf("diff: %v", err)
 	}
-	viaTrees, err := cs.diffCommits(parent, second.Commit)
-	if err != nil {
-		t.Fatalf("tree-based diff: %v", err)
+	if len(entries) != 1 || entries[0].Change != "modified" {
+		t.Fatalf("rewriting doc-a must read as one modification, got %+v", entries)
 	}
-
-	if len(viaOps) != len(viaTrees) {
-		t.Fatalf("the two diff paths disagree on how many documents changed:\n ops:   %v\n trees: %v",
-			viaOps, viaTrees)
+	if entries[0].FromContentHash == "" || entries[0].ToContentHash == "" {
+		t.Errorf("a modification should carry both content hashes; got %+v", entries[0])
 	}
-	for i := range viaOps {
-		if viaOps[i].Change != viaTrees[i].Change || viaOps[i].DocID != viaTrees[i].DocID {
-			t.Errorf("entry %d differs:\n ops:   %+v\n trees: %+v", i, viaOps[i], viaTrees[i])
-		}
-	}
-
-	// And specifically: rewriting an existing document is a modification.
-	if len(viaOps) != 1 || viaOps[0].Change != "modified" {
-		t.Fatalf("rewriting doc-a must read as one modification, got %+v", viaOps)
-	}
-	if viaOps[0].FromContentHash == "" || viaOps[0].ToContentHash == "" {
-		t.Errorf("a modification should carry both content hashes; got %+v", viaOps[0])
-	}
-	if viaOps[0].FromContentHash == viaOps[0].ToContentHash {
+	if entries[0].FromContentHash == entries[0].ToContentHash {
 		t.Error("the content actually changed, so the hashes must differ")
 	}
 
-	// The endpoint reports which path produced the answer, so an operator debugging a surprising
-	// diff does not have to guess.
 	_, body := get(t, base, "/v1/ns/demo%2Fusers/commits/"+second.Commit.Hex()+"/diff")
-	if body["basis"] != "operations" {
-		t.Errorf("a first-parent diff should take the cheap path, got basis=%v", body["basis"])
+	counts := body["counts"].(map[string]any)
+	if counts["modified"].(float64) != 1 || counts["added"].(float64) != 0 {
+		t.Errorf("the endpoint should agree with the diff: %v", counts)
 	}
 }
 
 // TestRewritingIdenticalContentIsNotAChange: the engine accepts a write whose content matches what
-// is already stored. Reporting that as "modified" sends a reader looking for a difference that
-// does not exist.
+// is already stored. Content addressing means the tree entry does not move, so the diff must show
+// nothing - reporting it would send a reader looking for a difference that does not exist.
 func TestRewritingIdenticalContentIsNotAChange(t *testing.T) {
 	cs, _ := newFixture(t)
 	seed(t, cs, `{"id":"doc-a","v":1}`)
@@ -738,7 +705,7 @@ func TestRewritingIdenticalContentIsNotAChange(t *testing.T) {
 	if !ok {
 		t.Fatal("commit missing")
 	}
-	entries, err := cs.diffAgainstParent(commit, commit.ParentHashes[0], "demo/users")
+	_, _, entries, err := cs.diffRevisions(commit.ParentHashes[0].Hex(), again.Commit.Hex())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,5 +713,245 @@ func TestRewritingIdenticalContentIsNotAChange(t *testing.T) {
 		if e.Change == "modified" {
 			t.Errorf("re-writing identical content is not a modification: %+v", e)
 		}
+	}
+}
+
+// TestRevisionSpecsAreTheEnginesGrammar: the control plane does not parse revisions itself, so
+// whatever dag.ParseRevision accepts must work over HTTP too.
+func TestRevisionSpecsAreTheEnginesGrammar(t *testing.T) {
+	cs, base := newFixture(t)
+	seed(t, cs, `{"id":"a"}`, `{"id":"b"}`, `{"id":"c"}`)
+
+	// head^ is escaped: "^" is an unsafe character in a URL path segment, so a caller putting a
+	// revision in a path has to encode it. The grammar itself accepts it (dag.ParseRevision).
+	for _, spec := range []string{"head", "head~1", "head%5E", "head~2"} {
+		res, body := get(t, base, "/v1/ns/demo%2Fusers/commits/"+spec)
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("revision %q: got %d (%v)", spec, res.StatusCode, body)
+		}
+	}
+	// And one that walks past the root must be refused rather than clamped.
+	res, _ := get(t, base, "/v1/ns/demo%2Fusers/commits/head~999")
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("head~999 should be 404, got %d", res.StatusCode)
+	}
+}
+
+func TestTagsAppearInRefsAndAsBadges(t *testing.T) {
+	cs, base := newFixture(t)
+	put := seed(t, cs, `{"id":"a"}`)[0]
+	d, err := cs.commitDAG()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CreateTag("v1", put.Commit, "first release"); err != nil {
+		t.Fatalf("create tag: %v", err)
+	}
+
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/refs")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("refs: %d", res.StatusCode)
+	}
+	tags, _ := body["tags"].([]any)
+	if len(tags) != 1 {
+		t.Fatalf("want the tag that was just created, got %v", body["tags"])
+	}
+	tag := tags[0].(map[string]any)
+	if tag["name"] != "v1" || tag["message"] != "first release" {
+		t.Errorf("unexpected tag: %v", tag)
+	}
+
+	// A tag is also a revision, and should badge its commit in the log.
+	_, logBody := get(t, base, "/v1/ns/demo%2Fusers/log")
+	commits, _ := logBody["commits"].([]any)
+	var badged bool
+	for _, c := range commits {
+		// refs is omitted for a commit nothing points at, so this must not assume the key.
+		refs, _ := c.(map[string]any)["refs"].([]any)
+		for _, r := range refs {
+			if r == "tag:v1" {
+				badged = true
+			}
+		}
+	}
+	if !badged {
+		t.Error("a tagged commit should carry its tag as a ref badge")
+	}
+
+	res, _ = get(t, base, "/v1/ns/demo%2Fusers/commits/tag:v1")
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("a tag must resolve as a revision, got %d", res.StatusCode)
+	}
+}
+
+func TestDocumentReadAtPastRevision(t *testing.T) {
+	cs, base := newFixture(t)
+	first := seed(t, cs, `{"id":"doc-a","v":1}`)[0]
+	seed(t, cs, `{"id":"doc-a","v":2}`)
+
+	// At head: the new value.
+	_, head := get(t, base, "/v1/ns/demo%2Fusers/docs/"+first.DocID.String())
+	if head["atHead"] != true {
+		t.Errorf("a read with no ?at= is a head read: %v", head)
+	}
+
+	// At the first commit: the old value, and marked read-only.
+	res, past := get(t, base,
+		"/v1/ns/demo%2Fusers/docs/"+first.DocID.String()+"?at="+first.Commit.Hex())
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("time-travel read: %d (%v)", res.StatusCode, past)
+	}
+	if past["atHead"] != false || past["readOnly"] != true {
+		t.Errorf("a historical read must announce itself as such: %v", past)
+	}
+	body := past["body"].(map[string]any)
+	if body["v"].(float64) != 1 {
+		t.Errorf("reading at the first commit should see v=1, got %v", body)
+	}
+	if head["body"].(map[string]any)["v"].(float64) != 2 {
+		t.Error("the head read should still see v=2")
+	}
+}
+
+func TestDocumentAbsentAtThatRevisionIsNotFound(t *testing.T) {
+	cs, base := newFixture(t)
+	first := seed(t, cs, `{"id":"doc-a"}`)[0]
+	later := seed(t, cs, `{"id":"doc-b"}`)[0]
+
+	// doc-b did not exist at the first commit.
+	res, _ := get(t, base,
+		"/v1/ns/demo%2Fusers/docs/"+later.DocID.String()+"?at="+first.Commit.Hex())
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("a document that did not exist yet must be 404 at that revision, got %d",
+			res.StatusCode)
+	}
+}
+
+func postJSON(t *testing.T, base, path, body string) (*http.Response, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, base+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer alice:secret")
+	req.Header.Set("Content-Type", "application/json")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = res.Body.Close() })
+	raw, _ := io.ReadAll(res.Body)
+	var parsed map[string]any
+	_ = json.Unmarshal(raw, &parsed)
+	return res, parsed
+}
+
+// TestRevertPlanIsReadableWithoutWritePermission: an operator should always be able to see what a
+// revert *would* do. Planning writes nothing, so gating it would only mean deciding blind.
+func TestRevertPlanIsReadableWithoutWritePermission(t *testing.T) {
+	cs, base := newFixture(t)
+	first := seed(t, cs, `{"id":"doc-a","v":1}`)[0]
+	seed(t, cs, `{"id":"doc-b","v":1}`)
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/plan",
+		`{"to":"`+first.Commit.Hex()+`"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("plan on a read-only control plane: %d (%v)", res.StatusCode, body)
+	}
+	// Reverting to the first commit removes doc-b, which did not exist then.
+	if body["willRemove"].(float64) != 1 {
+		t.Errorf("reverting past doc-b's creation should remove it: %v", body)
+	}
+	if body["expectHead"] == nil || body["expectHead"] == "" {
+		t.Error("a plan must name the head it was computed against, so apply can check it")
+	}
+}
+
+func TestRevertApplyIsRefusedWhileReadOnly(t *testing.T) {
+	cs, base := newFixture(t)
+	first := seed(t, cs, `{"id":"doc-a","v":1}`)[0]
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/apply",
+		`{"to":"`+first.Commit.Hex()+`","expectHead":"head"}`)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("want 403 on a read-only control plane, got %d (%v)", res.StatusCode, body)
+	}
+	if body["error"].(map[string]any)["code"] != "read_only" {
+		t.Errorf("the refusal should name the deployment setting, not look like an auth failure: %v",
+			body["error"])
+	}
+}
+
+func TestRevertRestoresStateAsAForwardCommit(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"doc-a","v":1}`)[0]
+	seed(t, cs, `{"id":"doc-a","v":2}`)
+	seed(t, cs, `{"id":"doc-b","v":1}`)
+
+	_, plan := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/plan", `{"to":"`+first.Commit.Hex()+`"}`)
+	expectHead := plan["expectHead"].(string)
+
+	res, applied := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/apply",
+		`{"to":"`+first.Commit.Hex()+`","expectHead":"`+expectHead+`"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("apply: %d (%v)", res.StatusCode, applied)
+	}
+
+	// History moves forward: the revert is a new commit, not a rewind.
+	newCommit := applied["commit"].(string)
+	if newCommit == expectHead || newCommit == first.Commit.Hex() {
+		t.Fatalf("a revert must write a new commit, not move head backwards: got %s", newCommit)
+	}
+	if applied["removed"].(float64) != 1 {
+		t.Errorf("doc-b did not exist at the target and should have been removed: %v", applied)
+	}
+
+	// And the state is genuinely restored: doc-a reads v=1 again at head.
+	_, doc := get(t, base, "/v1/ns/demo%2Fusers/docs/"+first.DocID.String())
+	if doc["body"].(map[string]any)["v"].(float64) != 1 {
+		t.Errorf("the reverted state should be current: %v", doc["body"])
+	}
+
+	// The commit before the revert is still reachable - nothing was destroyed.
+	res, _ = get(t, base, "/v1/ns/demo%2Fusers/commits/"+expectHead)
+	if res.StatusCode != http.StatusOK {
+		t.Error("the pre-revert commit must still be in history; a revert is not a rewrite")
+	}
+}
+
+// TestRevertApplyRefusesWhenHeadMoved: applying a plan computed against a different head would
+// undo a write that never appeared in the preview.
+func TestRevertApplyRefusesWhenHeadMoved(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"doc-a","v":1}`)[0]
+	seed(t, cs, `{"id":"doc-a","v":2}`)
+
+	_, plan := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/plan", `{"to":"`+first.Commit.Hex()+`"}`)
+	staleHead := plan["expectHead"].(string)
+
+	// Someone else commits between the preview and the apply.
+	seed(t, cs, `{"id":"doc-c","v":1}`)
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/apply",
+		`{"to":"`+first.Commit.Hex()+`","expectHead":"`+staleHead+`"}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409 when head moved under the plan, got %d (%v)", res.StatusCode, body)
+	}
+}
+
+func TestRevertApplyRequiresExpectHead(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"doc-a"}`)[0]
+	res, _ := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/apply", `{"to":"`+first.Commit.Hex()+`"}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("apply without expectHead must be refused, got %d", res.StatusCode)
+	}
+}
+
+func TestRevertToUnknownRevisionIsNotFound(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"doc-a"}`)
+	res, _ := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/plan", `{"to":"head~999"}`)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for a revision that names nothing, got %d", res.StatusCode)
 	}
 }

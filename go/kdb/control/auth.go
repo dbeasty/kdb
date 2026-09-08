@@ -134,3 +134,32 @@ func credentialsFrom(r *http.Request) (auth.Credentials, error) {
 		return auth.Credentials{}, errUnsupportedScheme
 	}
 }
+
+// nsWrite wraps a handler that changes one namespace: authenticate, check this deployment allows
+// writes at all, then authorize as a write of that namespace.
+//
+// The order matters. A deployment-level refusal is not an authorization failure, and telling a
+// properly-authorized operator "forbidden" when the real answer is "this server was started
+// read-only" sends them to look at grants that are perfectly fine.
+func (s *Server) nsWrite(h func(http.ResponseWriter, *http.Request, auth.Principal, string)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, ok := s.authenticate(w, r)
+		if !ok {
+			return
+		}
+		if !s.opts.AllowWrites {
+			writeError(w, http.StatusForbidden, "read_only",
+				"this control plane is read-only; start the service with --control-write to enable "+
+					"mutating endpoints")
+			return
+		}
+		ns := r.PathValue("ns")
+		if ns == "" {
+			ns = s.opts.Namespace
+		}
+		if !s.authorize(w, r, principal, auth.SqlExecAction{Namespace: ns, ReadOnly: false}) {
+			return
+		}
+		h(w, r, principal, ns)
+	})
+}

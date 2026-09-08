@@ -14,8 +14,11 @@
 //     DAG behind it. There is no second path into storage here, and no business logic that a
 //     later wire or gRPC exposure would have to reimplement.
 //
-// Everything this package serves today is read-only. Writes, time travel and revert are the
-// milestones after this one; see the plan's §11 and the deliberate 403 in requireWrites.
+// Reads - history, diffs, schema, settings, operational state, and reads at any past revision -
+// need no write permission. Revert is the one mutating operation implemented, and it is gated on
+// --control-write and split into plan and apply so that what is applied is what was previewed.
+// Document CRUD and the SQL console are the next milestone; their routes are declared and answer
+// 501 rather than 404.
 package control
 
 import (
@@ -175,14 +178,18 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/settings", s.adminRead(s.handleSettings))
 	mux.Handle("GET /v1/ops/runtime", s.adminRead(s.handleOpsRuntime))
 
-	// Everything mutating, until the write milestone lands. Declared rather than omitted so the
-	// API's shape is honest about what is coming and a client gets 501 instead of 404.
+	// Revert. Planning is a read - it computes a diff and writes nothing - so it is available
+	// whatever the write setting, and an operator can always see what a revert *would* do. Only
+	// applying is gated.
+	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
+	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))
+
+	// Still specified but not built. Declared rather than omitted so the API's shape is honest
+	// about what is coming and a client gets 501 rather than 404.
 	for _, route := range []string{
 		"PUT /v1/ns/{ns}/docs/{id}",
 		"DELETE /v1/ns/{ns}/docs/{id}",
 		"POST /v1/ns/{ns}/sql",
-		"POST /v1/ns/{ns}/revert/plan",
-		"POST /v1/ns/{ns}/revert/apply",
 		"PATCH /v1/settings",
 	} {
 		mux.Handle(route, s.notImplemented())

@@ -1,7 +1,6 @@
 package control
 
 import (
-	"errors"
 	"net/http"
 	"time"
 
@@ -90,7 +89,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ auth.Pri
 		out.ReadOnly = rt.ReadOnly
 	}
 	if ok {
-		sum := summarize(headCommit)
+		sum := summarizeCommit(headCommit)
 		out.HeadCommit = &sum
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -134,12 +133,12 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	skip, err := intParam(r, "skip", 0, 0, maxWalk)
+	skip, err := intParam(r, "skip", 0, 0, maxSkip)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	from, err := s.resolveRef(r.URL.Query().Get("from"))
+	from, err := s.resolveRevision(r.URL.Query().Get("from"))
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
@@ -161,7 +160,7 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 }
 
 func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
-	hash, err := s.resolveRef(r.PathValue("hash"))
+	hash, err := s.resolveRevision(r.PathValue("hash"))
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
@@ -176,8 +175,8 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Pri
 		writeError(w, http.StatusNotFound, "not_found", "no such commit in this namespace")
 		return
 	}
-	sum := summarize(commit)
-	sum.Refs = branchesByCommit(d)[sum.Hash]
+	sum := summarizeCommit(commit)
+	sum.Refs = s.refsByCommit()[sum.Hash]
 
 	// Operations are fetched for the one commit a caller actually opened - and may legitimately
 	// be absent, because the DAG evicts them under its retention budget. Saying so is better than
@@ -211,29 +210,23 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Pri
 }
 
 func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
-	to, err := s.resolveRef(r.PathValue("hash"))
-	if err != nil {
-		s.writeRevisionError(w, err)
-		return
-	}
-	d, err := s.commitDAG()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
-		return
-	}
-	// Default to the first parent, which is what "what did this commit change" means. A root
-	// commit has none, and diffing it against itself would report nothing changed - so it is
-	// compared against the empty tree by diffing it with itself and reporting every document as
-	// added is wrong too. Instead: no parent means the caller must name a base explicitly.
-	against := r.URL.Query().Get("against")
-	var from codec.Hash
-	if against != "" {
-		from, err = s.resolveRef(against)
+	toSpec := r.PathValue("hash")
+	// Default to the first parent, which is what "what did this commit change" means. head~1 is
+	// not that - on a merge it would follow the wrong side - so the parent is read from the commit
+	// itself. A root commit has none, and a diff against nothing is a question with no answer, so
+	// it is refused rather than silently reported as "no changes".
+	fromSpec := r.URL.Query().Get("against")
+	if fromSpec == "" {
+		to, err := s.resolveRevision(toSpec)
 		if err != nil {
 			s.writeRevisionError(w, err)
 			return
 		}
-	} else {
+		d, err := s.commitDAG()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
+			return
+		}
 		commit, ok := d.GetCommit(to)
 		if !ok {
 			writeError(w, http.StatusNotFound, "not_found", "no such commit in this namespace")
@@ -244,32 +237,20 @@ func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth
 				"this is a root commit and has no parent to diff against; pass ?against=<revision>")
 			return
 		}
-		from = commit.ParentHashes[0]
+		fromSpec = commit.ParentHashes[0].Hex()
+		toSpec = to.Hex()
 	}
-	// Prefer the operation-based path when this is a commit against its own first parent: it is
-	// the common case, and it costs one read per operation rather than materializing two whole
-	// trees, which on any namespace larger than the commit is the cheaper answer by a wide margin.
-	// dag.Diff is the fallback and is exact; the two are asserted to agree in the tests.
-	var entries []diffEntry
-	var basis string
-	if commit, ok := d.GetCommit(to); ok && len(commit.ParentHashes) > 0 && commit.ParentHashes[0] == from {
-		entries, err = s.diffAgainstParent(commit, from, ns)
-		basis = "operations"
-	} else {
-		err = errNotParentDiff
-	}
+
+	from, to, entries, err := s.diffRevisions(fromSpec, toSpec)
 	if err != nil {
-		// Either an arbitrary pair of commits, or a commit whose operations are no longer
-		// resident. Both fall back to comparing document trees, which is exact when the trees can
-		// be resolved and is the only option for two unrelated commits.
-		entries, err = s.diffCommits(from, to)
-		basis = "trees"
-	}
-	if err != nil {
+		if isUnknownRevision(err) {
+			s.writeRevisionError(w, err)
+			return
+		}
+		// A tree that cannot be resolved is the other real failure here: under history=none the
+		// window may simply no longer reach that far back, which is a retention answer, not a bug.
 		writeError(w, http.StatusServiceUnavailable, "diff_unavailable",
-			"this diff could not be computed: "+err.Error()+". A commit's operations are evictable "+
-				"under the DAG's retention budget, and historical document trees are rebuilt on "+
-				"demand rather than kept, so a diff far enough back may be temporarily out of reach.")
+			"this diff could not be computed: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -278,21 +259,7 @@ func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth
 		"to":        to.Hex(),
 		"entries":   entries,
 		"counts":    countChanges(entries),
-		// Which path produced this, because the two have different failure modes and an operator
-		// debugging a surprising diff should not have to guess which one ran.
-		"basis": basis,
 	})
-}
-
-// errNotParentDiff routes an arbitrary commit pair to the tree-based comparison.
-var errNotParentDiff = errors.New("not a first-parent diff")
-
-func countChanges(entries []diffEntry) map[string]int {
-	counts := map[string]int{"added": 0, "modified": 0, "removed": 0}
-	for _, e := range entries {
-		counts[e.Change]++
-	}
-	return counts
 }
 
 func (s *Server) handleRefs(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
@@ -306,6 +273,7 @@ func (s *Server) handleRefs(w http.ResponseWriter, r *http.Request, _ auth.Princ
 		Head      string `json:"head"`
 		ShortHead string `json:"shortHead"`
 		UpdatedAt string `json:"updatedAt,omitempty"`
+		Message   string `json:"message,omitempty"`
 	}
 	branches := make([]ref, 0)
 	for _, b := range d.ListBranches() {
@@ -314,45 +282,84 @@ func (s *Server) handleRefs(w http.ResponseWriter, r *http.Request, _ auth.Princ
 			UpdatedAt: millisToRFC3339(b.UpdatedAt.EpochMillis),
 		})
 	}
+	tags := make([]ref, 0)
+	for _, t := range d.ListTags() {
+		tags = append(tags, ref{
+			Name: t.Name, Head: t.CommitHash.Hex(), ShortHead: shortHash(t.CommitHash.Hex()),
+			UpdatedAt: millisToRFC3339(t.CreatedAt.EpochMillis), Message: t.Message,
+		})
+	}
 	head, _ := d.Head()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"namespace": ns,
 		"head":      head.Hex(),
 		"branches":  branches,
-		// Tags are a stub in the DAG today - a map with no create/list/delete methods - so this is
-		// honestly empty rather than absent, and stays that way until they are finished.
-		"tags": []ref{},
+		"tags":      tags,
 	})
 }
 
+// handleDocument reads one document, at head or at any past revision.
+//
+// Reading at a revision resolves it to a commit and reads that commit's document tree. The tree
+// hash is what the storage adapter wants - its parameter is named atCommit but is a tree hash, and
+// passing a commit hash there resolves nothing rather than erroring, which would look like a
+// missing document.
 func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
-	if at := r.URL.Query().Get("at"); at != "" {
-		// Reading at an arbitrary commit needs the hybrid engine wired into the server read path,
-		// which is its own milestone. Refusing is better than silently answering from head, which
-		// would show an operator the wrong data under a URL that says otherwise.
-		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"reading at a past commit is not wired into the server read path yet; omit ?at= to read head")
-		return
-	}
 	docID, err := codec.UUIDFromString(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "document id must be a UUID")
 		return
 	}
-	body, commitHex, found, err := s.opts.Runtime.GetDocument(ns, docID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "read_failed", err.Error())
+	at := r.URL.Query().Get("at")
+	if at == "" {
+		body, commitHex, found, err := s.opts.Runtime.GetDocument(ns, docID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "read_failed", err.Error())
+			return
+		}
+		if !found {
+			writeError(w, http.StatusNotFound, "not_found", "no such document at head")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"namespace": ns, "docId": docID.String(), "commit": commitHex,
+			"body": rawJSON(body), "atHead": true,
+		})
 		return
 	}
-	if !found {
-		writeError(w, http.StatusNotFound, "not_found", "no such document at head")
+
+	commitHash, err := s.resolveRevision(at)
+	if err != nil {
+		s.writeRevisionError(w, err)
+		return
+	}
+	d, err := s.commitDAG()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
+		return
+	}
+	commit, ok := d.GetCommit(commitHash)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "no such commit in this namespace")
+		return
+	}
+	doc, err := s.opts.Runtime.Runtime.Storage.GetDocument(ns, docID, commit.DocumentTreeHash)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "read_failed",
+			"could not read at that revision: "+err.Error())
+		return
+	}
+	if doc == nil {
+		writeError(w, http.StatusNotFound, "not_found",
+			"that document does not exist at "+shortHash(commitHash.Hex()))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"namespace": ns,
-		"docId":     docID.String(),
-		"commit":    commitHex,
-		"body":      rawJSON(body),
+		"namespace": ns, "docId": docID.String(), "commit": commitHash.Hex(),
+		"body": rawJSON(doc.JSON), "atHead": false,
+		// Stated rather than implied: a historical read is a read, and nothing written through
+		// this control plane can land anywhere but head.
+		"readOnly": true,
 	})
 }
 
@@ -392,10 +399,13 @@ func (s *Server) handleOpsRuntime(w http.ResponseWriter, r *http.Request, _ auth
 	writeJSON(w, http.StatusOK, body)
 }
 
+// writeRevisionError answers a revision that names nothing with 404 rather than 500. The engine's
+// RevisionNotFoundError carries a Reason distinguishing "never existed here" from "reclaimed by
+// the retention window", and only the second is fixed by configuring a longer window - so the
+// message is passed through rather than flattened.
 func (s *Server) writeRevisionError(w http.ResponseWriter, err error) {
-	var re *revisionError
-	if errors.As(err, &re) {
-		writeError(w, http.StatusNotFound, "unknown_revision", re.Error())
+	if isUnknownRevision(err) {
+		writeError(w, http.StatusNotFound, "unknown_revision", err.Error())
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "revision_failed", err.Error())
