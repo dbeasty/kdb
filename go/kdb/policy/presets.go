@@ -54,7 +54,12 @@ func CacheNoHistory(namespaceID string) NamespacePolicy {
 		NamespaceID: namespaceID,
 		Mode:        NamespaceModeMutable,
 		History:     HistoryModeNone,
-		Conflict:    transaction.ConflictPolicyLastWrite,
+		// The default window rather than nothing: the journal holds recent
+		// frames for crash recovery regardless, so a day of retention is
+		// very nearly free, and it turns "no undo at all" into "undo
+		// within a window".
+		Retain:   storage.RetentionWindow{Duration: storage.DefaultRetentionDuration},
+		Conflict: transaction.ConflictPolicyLastWrite,
 		Compaction: CompactionPolicy{
 			SquashAfter:       SquashModeNever,
 			RetainGranularity: nil,

@@ -629,8 +629,21 @@ func (d *InMemoryCommitDag) Diff(fromHash, toHash codec.Hash) (CommitDiff, error
 	if !ok {
 		return CommitDiff{}, kdberr.NewVersionNotFoundError("to tree missing", d.NamespaceID, tc.DocumentTreeHash.Hex())
 	}
+	return DiffTrees(fromHash, toHash, fromTree, toTree), nil
+}
+
+// DiffTrees compares two document trees that the caller has already
+// resolved.
+//
+// Split out of Diff because Diff can only see trees that happen to be
+// cached: it runs under the DAG's own lock, and resolving a historical
+// tree means folding the log or reading tree objects, which re-enters the
+// DAG. A caller outside that lock - see embed.DiffCommits - resolves both
+// trees through the storage engine and calls this instead, which is the
+// only way to diff two arbitrary points in history.
+func DiffTrees(fromHash, toHash codec.Hash, fromTree, toTree document.DocumentTree) CommitDiff {
 	// MaterializedEntries, not the .Entries field directly: With/Without-derived trees don't
-	// eagerly populate it (see DocumentTree's own doc comment) - Diff is the kind of full-scan
+	// eagerly populate it (see DocumentTree's own doc comment) - a diff is the kind of full-scan
 	// operation that genuinely needs the flat map, unlike the per-write hot path that used to
 	// force this same materialization on every single commit.
 	toEntries := toTree.MaterializedEntries()
@@ -648,7 +661,7 @@ func (d *InMemoryCommitDag) Diff(fromHash, toHash codec.Hash) (CommitDiff, error
 			entries = append(entries, DiffRemoved{DocID: id, ContentHash: h})
 		}
 	}
-	return CommitDiff{FromHash: fromHash, ToHash: toHash, Entries: entries}, nil
+	return CommitDiff{FromHash: fromHash, ToHash: toHash, Entries: entries}
 }
 
 // AppendCommit appends a commit onto parentHash and advances the default branch to it, but only

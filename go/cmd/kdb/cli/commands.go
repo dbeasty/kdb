@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
@@ -43,7 +46,19 @@ func execute(cfg Config, cmd Command) int {
 	case QueryCmd:
 		return cmdQuery(cfg, rt, c)
 	case LogCmd:
-		return cmdLog(cfg, rt)
+		return cmdLog(cfg, rt, c)
+	case ShowCmd:
+		return cmdShow(cfg, rt, c)
+	case DiffCmd:
+		return cmdDiff(cfg, rt, c)
+	case RevertCmd:
+		return cmdRevert(cfg, rt, c)
+	case TagListCmd:
+		return cmdTagList(cfg, rt)
+	case TagCreateCmd:
+		return cmdTagCreate(cfg, rt, c)
+	case TagDeleteCmd:
+		return cmdTagDelete(cfg, rt, c)
 	case StatusCmd:
 		return cmdStatus(cfg, rt, c.Namespace)
 	case BranchListCmd:
@@ -69,6 +84,18 @@ func namespaceFor(cmd Command) string {
 	case QueryCmd:
 		return c.Namespace
 	case LogCmd:
+		return c.Namespace
+	case ShowCmd:
+		return c.Namespace
+	case DiffCmd:
+		return c.Namespace
+	case RevertCmd:
+		return c.Namespace
+	case TagListCmd:
+		return c.Namespace
+	case TagCreateCmd:
+		return c.Namespace
+	case TagDeleteCmd:
 		return c.Namespace
 	case StatusCmd:
 		return c.Namespace
@@ -144,12 +171,16 @@ func formatPutStdout(result embed.PutResult) (string, error) {
 }
 
 func cmdGet(cfg Config, rt *embed.EmbeddedKdbRuntime, c GetCmd) int {
-	head, err := rt.DAG.Head()
+	at := c.At
+	if at == "" {
+		at = "head"
+	}
+	target, err := resolveRevision(rt, at)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
-	commit, err := rt.DAG.GetCommitOrThrow(head)
+	commit, err := rt.DAG.GetCommitOrThrow(target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
@@ -244,19 +275,209 @@ func cellString(cell sql.Cell) string {
 	}
 }
 
-func cmdLog(cfg Config, rt *embed.EmbeddedKdbRuntime) int {
+// resolveRevision turns a revision specification into a commit hash. Every
+// history command goes through it, so "head~3" means the same thing
+// everywhere and an unresolvable revision is an error rather than a
+// silent read of current data.
+func resolveRevision(rt *embed.EmbeddedKdbRuntime, spec string) (codec.Hash, error) {
+	nav, ok := rt.DAG.(dag.HistoryNavigator)
+	if !ok {
+		return codec.Hash{}, fmt.Errorf("this runtime's commit graph does not navigate")
+	}
+	return nav.ResolveRevision(spec)
+}
+
+func cmdLog(cfg Config, rt *embed.EmbeddedKdbRuntime, c LogCmd) int {
+	_ = cfg
+	nav, ok := rt.DAG.(dag.HistoryNavigator)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: this runtime's commit graph does not navigate\n")
+		return 1
+	}
 	head, err := rt.DAG.Head()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
-	entries := rt.DAG.Walk(head, nil, 8192)
+	entries, err := nav.ListCommits(head, c.Skip, c.Limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
 	for _, e := range entries {
-		full, ok := e.(dag.FullEntry)
-		if !ok {
+		if c.Oneline {
+			fmt.Printf("%s %s\n", shortHash(e.Hash), e.Message)
 			continue
 		}
-		fmt.Printf("%s\t%s\n", full.Commit.Hash.Hex(), full.Commit.Message)
+		fmt.Printf("commit %s\n", e.Hash.Hex())
+		if len(e.ParentHashes) > 0 {
+			parents := make([]string, len(e.ParentHashes))
+			for i, p := range e.ParentHashes {
+				parents[i] = shortHash(p)
+			}
+			fmt.Printf("parent %s\n", strings.Join(parents, " "))
+		}
+		fmt.Printf("date   %s\n", formatTimestamp(e.Timestamp))
+		if e.OperationCount >= 0 {
+			fmt.Printf("ops    %d\n", e.OperationCount)
+		}
+		if e.Message != "" {
+			fmt.Printf("\n    %s\n", e.Message)
+		}
+		fmt.Println()
+	}
+	return 0
+}
+
+func shortHash(h codec.Hash) string {
+	hex := h.Hex()
+	if len(hex) > 12 {
+		return hex[:12]
+	}
+	return hex
+}
+
+func formatTimestamp(ts codec.Timestamp) string {
+	return time.UnixMicro(ts.EpochMicros()).UTC().Format(time.RFC3339)
+}
+
+func cmdShow(cfg Config, rt *embed.EmbeddedKdbRuntime, c ShowCmd) int {
+	_ = cfg
+	hash, err := resolveRevision(rt, c.Revision)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	commit, err := rt.DAG.GetCommitOrThrow(hash)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	fmt.Printf("commit  %s\n", commit.Hash.Hex())
+	for _, p := range commit.ParentHashes {
+		fmt.Printf("parent  %s\n", p.Hex())
+	}
+	fmt.Printf("tx      %s\n", commit.TransactionID.String())
+	fmt.Printf("date    %s\n", formatTimestamp(commit.Timestamp))
+	fmt.Printf("author  %s\n", commit.AuthorNodeID.String())
+	fmt.Printf("tree    %s\n", commit.DocumentTreeHash.Hex())
+	if commit.Message != "" {
+		fmt.Printf("\n    %s\n", commit.Message)
+	}
+	// Operations are fetched for this one commit rather than carried by
+	// every listing: they are the full text of what it wrote.
+	if d := concreteDag(rt); d != nil {
+		ops, err := d.CommitOperations(hash)
+		if err == nil && len(ops) > 0 {
+			fmt.Printf("\nchanges (%d)\n", len(ops))
+			for _, op := range ops {
+				switch o := op.(type) {
+				case document.WriteOp:
+					fmt.Printf("  write   %s\n", o.DocID.String())
+				case document.DeleteOp:
+					fmt.Printf("  delete  %s\n", o.DocID.String())
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func cmdDiff(cfg Config, rt *embed.EmbeddedKdbRuntime, c DiffCmd) int {
+	_ = cfg
+	diff, err := embed.DiffCommits(rt, c.From, c.To)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if diff.IsEmpty() {
+		fmt.Printf("no document differences between %s and %s\n",
+			shortHash(diff.FromHash), shortHash(diff.ToHash))
+		return 0
+	}
+	for _, e := range diff.Entries {
+		switch v := e.(type) {
+		case dag.DiffAdded:
+			fmt.Printf("+ %s\n", v.DocID.String())
+		case dag.DiffRemoved:
+			fmt.Printf("- %s\n", v.DocID.String())
+		case dag.DiffModified:
+			fmt.Printf("~ %s\n", v.DocID.String())
+		}
+	}
+	return 0
+}
+
+func cmdRevert(cfg Config, rt *embed.EmbeddedKdbRuntime, c RevertCmd) int {
+	res, err := embed.RevertTo(rt, c.Namespace, c.Revision)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if !cfg.Quiet {
+		if res.Restored == 0 && res.Removed == 0 {
+			fmt.Printf("already at %s; nothing to revert\n", shortHash(res.Target))
+			return 0
+		}
+		fmt.Printf("reverted to %s in commit %s (%d restored, %d removed)\n",
+			shortHash(res.Target), shortHash(res.Commit), res.Restored, res.Removed)
+	}
+	return 0
+}
+
+func cmdTagList(cfg Config, rt *embed.EmbeddedKdbRuntime) int {
+	_ = cfg
+	nav, ok := rt.DAG.(dag.HistoryNavigator)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: this runtime's commit graph does not navigate\n")
+		return 1
+	}
+	tags := nav.ListTags()
+	sort.Slice(tags, func(i, j int) bool { return tags[i].Name < tags[j].Name })
+	for _, t := range tags {
+		fmt.Printf("%s\t%s\t%s\n", t.Name, shortHash(t.CommitHash), t.Message)
+	}
+	return 0
+}
+
+func cmdTagCreate(cfg Config, rt *embed.EmbeddedKdbRuntime, c TagCreateCmd) int {
+	if err := rt.AssertRetainsHistory(c.Namespace, "tagging a commit"); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	nav, ok := rt.DAG.(dag.HistoryNavigator)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: this runtime's commit graph does not navigate\n")
+		return 1
+	}
+	hash, err := resolveRevision(rt, c.Revision)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	t, err := nav.CreateTag(c.Name, hash, c.Message)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if !cfg.Quiet {
+		fmt.Printf("tagged %s as %s\n", shortHash(t.CommitHash), t.Name)
+	}
+	return 0
+}
+
+func cmdTagDelete(cfg Config, rt *embed.EmbeddedKdbRuntime, c TagDeleteCmd) int {
+	nav, ok := rt.DAG.(dag.HistoryNavigator)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: this runtime's commit graph does not navigate\n")
+		return 1
+	}
+	if !nav.DeleteTag(c.Name) {
+		fmt.Fprintf(os.Stderr, "Error: no such tag: %s\n", c.Name)
+		return 1
+	}
+	if !cfg.Quiet {
+		fmt.Printf("deleted tag %s\n", c.Name)
 	}
 	return 0
 }
@@ -282,6 +503,10 @@ func cmdBranchList(cfg Config, rt *embed.EmbeddedKdbRuntime) int {
 }
 
 func cmdBranchCreate(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCreateCmd) int {
+	if err := rt.AssertRetainsHistory(c.Namespace, "creating a branch"); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
 	from, err := rt.DAG.Head()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

@@ -55,6 +55,13 @@ type StorageEngineConfig struct {
 	// after a restart - see HistoryStrategy. Resolved from the namespace's
 	// own marker at open, so the zero value here is normal.
 	HistoryStrategy HistoryStrategy
+	// HistoryMode decides how long this namespace keeps the past - see
+	// HistoryMode. Resolved from the namespace's own marker at open, so
+	// the zero value here is normal.
+	HistoryMode HistoryMode
+	// Retain bounds how much of the past HistoryModeNone keeps. Ignored
+	// under HistoryModeFull.
+	Retain RetentionWindow
 	// DocumentCacheBytes caps how many bytes of document versions stay
 	// resident before the oldest are evicted and re-read on demand. Zero
 	// derives it from the hot-tier budget; see ResolvedDocumentCacheBytes.

@@ -77,6 +77,12 @@ type payloadEnvelope struct {
 	// Search additions (Layer 16, both trees) - see search_ops.go.
 	Search       *searchDto       `json:"search,omitempty"`
 	SearchResult *searchResultDto `json:"searchResult,omitempty"`
+
+	// History additions (Go-only) - see history_ops.go.
+	HistoryList   *historyListDto   `json:"historyList,omitempty"`
+	HistoryResult *historyResultDto `json:"historyResult,omitempty"`
+	Revert        *revertDto        `json:"revert,omitempty"`
+	RevertResult  *revertResultDto  `json:"revertResult,omitempty"`
 }
 
 type handshakeDto struct {
