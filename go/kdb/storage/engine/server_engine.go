@@ -34,7 +34,11 @@ type ServerEngine struct {
 	// path (WriteBlob): WAL.Append and memTable.Put are each
 	// independently thread-safe, so blob writes never take a lock at all
 	// - see Phase 1/2 of docs/benchmarks/phase0-baseline.md.
-	cap        storage.CapabilitySet
+	cap storage.CapabilitySet
+	// blobStore is where flushed memtables land. Held so maintenance can
+	// compact it - see CompactBlobStore. The memtable manager owns the
+	// write path into it; this reference is read-only apart from that.
+	blobStore  *sstable.LsmBlobStore
 	memTable   *memtable.Manager
 	docsByHash *shardedDocByHashStore
 	// coldLoader re-reads a document version that docsByHash has evicted,
@@ -204,6 +208,7 @@ func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w w
 		wal:              w,
 		groupCommit:      wal.NewGroupCommitter(),
 		cap:              cap,
+		blobStore:        blobStore,
 		memTable:         memtable.NewManager(namespaceID, config.IOShim, blobStore),
 		docsByHash:       newShardedDocByHashStore(0),
 		pending:          newShardedPendingStore(),

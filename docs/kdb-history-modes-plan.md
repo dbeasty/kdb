@@ -1,9 +1,11 @@
 # Two Retention Modes: `history = FULL` and `history = NONE`
 
 > **Status: implemented (Go), 2026-09-08.** Phases 0-3 have landed in the
-> Go tree and the full suite is green, including under `-race`. What is
-> *not* done is listed under "What did not land" at the end - read that
-> before assuming a claim here is fully backed.
+> Go tree and the full suite is green, including under `-race`. Under
+> `history = none` the on-disk footprint is now a function of the dataset:
+> measured flat (x1.00) across 4x the history, against x4.01 under
+> `history = full`. What is *not* done is listed under "What did not land"
+> at the end - read that before assuming a claim here is fully backed.
 >
 > The axis this document plans already existed as a declared, parsed,
 > validated policy field in both trees (`policy.HistoryMode`,
@@ -597,40 +599,88 @@ missing. Cost is proportional to the dataset, not to history.
 
 | mode | sessions | total bytes | delta log |
 |---|---:|---:|---:|
-| full | 10 | 182,603 | 60,400 |
-| full | 40 | 724,074 | 242,350 |
-| none | 10 | 86,201 | 6,040 |
-| none | 40 | 319,909 | 6,065 |
+| full | 10 | 182,720 | 60,400 |
+| full | 40 | 725,629 | 242,350 |
+| none | 10 | 12,330 | 6,040 |
+| none | 40 | 12,382 | 6,065 |
 
-  The delta log is what this work bounds and it does: `full` grows ×4.01 for
-  4× the history, `none` holds at ×1.00.
+  The dataset is about 13 KB. `full` grows ×4.01 for 4× the history in both
+  columns; `none` holds at ×1.00 in both, with its total at roughly the size
+  of the data.
+
+### The three structures that had to stop growing
+
+Bounding the delta log turned out to be the easy third of it, and the other
+two were only visible once it was done.
+
+1. **The delta log**, bounded by the retention window. This is what the
+   plan above is about.
+2. **The SSTables.** Every memtable flush wrote another table and nothing
+   ever merged them, so the store grew with the number of flushes. The Go
+   tree had no compaction at all (`kdb-storage-compaction` exists only in
+   Kotlin), so `sstable/compaction.go` is new.
+
+   Merging alone was not enough, and this is the part that is easy to get
+   wrong: every document version is a *distinct content hash*, so in a
+   store that keeps rewriting documents nothing is a duplicate and a merged
+   table is exactly as large as its inputs. The store shrinks only because
+   compaction also **drops versions the live tree no longer names**
+   (`engine.reachableBlobKeys`). That is safe under `none` precisely
+   because the blob store there holds nothing else - tree objects and
+   document locations are written only under the `objects` strategy, and
+   `none` forces `replay` - and it is refused under `full`, where every one
+   of those entries exists to serve a read the mode promises to keep
+   serving.
+3. **The checkpoint.** It described every commit the namespace had ever
+   made, so the one artifact a `none` namespace must load in full at open
+   kept growing after the log had stopped. `CheckpointSnapshotRetaining`
+   applies the same window to the graph, keeping branch heads and tags
+   whatever it says - a ref naming an omitted commit would restore a
+   smaller database that is also a broken one.
+
+Two bugs surfaced while building this, both of the silently-wrong kind:
+
+- The first merge implementation dropped a tombstone by *skipping* it,
+  which left an earlier input's value for that key standing - so a full
+  compaction resurrected exactly the keys it was meant to reclaim. The
+  merge is now two passes: decide every key's final owner, then write.
+- `RetentionWindow.Resolve` was not idempotent. It normalized the
+  `RetainNothing` sentinel to a plain zero, and a second `Resolve` read
+  that zero as "unset" and applied the 24 h default - so a namespace
+  configured to keep nothing quietly kept a day, but only when its window
+  passed through two resolvers, which is exactly what happened between
+  `OpenFileRuntime` and the engine.
 
 ## What did not land
 
 Stated plainly, because each of these weakens a claim made above.
 
-1. **Total footprint under `none` is not yet bounded - only the delta log
-   is.** The table shows `none` growing 86 KB → 320 KB. That is not
-   retention failing; it is that every memtable flush writes another SSTable
-   holding the live dataset and **the Go tree has no SSTable compaction**
-   (`kdb-storage-compaction` exists only in Kotlin). So the honest claim
-   today is "the delta log is a function of the window, not of history",
-   not "the whole footprint is a function of the dataset". The footprint
-   test deliberately asserts only the former.
-2. **Kotlin is untouched.** The four new wire messages are Go-only, which
+1. **Kotlin is untouched.** The four new wire messages are Go-only, which
    follows the existing precedent for 0x14-0x1C, and the checkpoint file is
    Go-local so its v2 format is not a cross-tree gate. But a Kotlin client
    cannot list history or revert.
-3. **No periodic maintenance timer.** `Maintain()` exists and close-time
+2. **No periodic maintenance timer.** `Maintain()` exists and close-time
    truncation runs automatically; nothing calls `Maintain()` on a schedule
    yet, so a long-running server reclaims only at shutdown until an operator
    or the service loop calls it.
-4. **The measurement is at 40 sessions, not 100k/1M commits.** The growth
+3. **The measurement is at 40 sessions, not 100k/1M commits.** The growth
    *shape* is clear at this scale; absolute numbers at production history
    lengths are extrapolation.
-5. **`retain.commits` is approximated at segment granularity** (1000 commits
+4. **`retain.commits` is approximated at segment granularity** (1000 commits
    per segment, minimum one). It only ever over-retains, which is the safe
    direction, but it is not exact.
-6. **Bumping the checkpoint to v2 makes every existing namespace replay its
+5. **Bumping the checkpoint to v2 makes every existing namespace replay its
    log once** on first open after upgrade. That is the pre-existing
    behaviour for a format change and is safe, but it is a one-time cost.
+6. **Compaction only ever merges to a single table.** There is no level
+   sizing and no partial merge, so a compaction rewrites the whole store.
+   That is fine at the scale measured and is the wrong shape for a large
+   one; the trigger (`DefaultCompactionTrigger`, 4 tables) is the only
+   control over how often it happens.
+7. **A crash between a compaction's swap and its deletions leaves the
+   merged-away tables on disk.** Harmless for values, since every key is
+   the hash of its own value and two tables cannot disagree about one - but
+   a leftover input *could* shadow a tombstone in the merged output. No
+   production path writes tombstones to an SSTable today
+   (`memtable.Manager.Delete` has no caller), so the window is currently
+   unreachable; anything that starts writing them has to close it.

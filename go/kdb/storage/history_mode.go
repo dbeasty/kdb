@@ -133,15 +133,20 @@ type RetentionWindow struct {
 // IsZero reports whether neither floor was set.
 func (w RetentionWindow) IsZero() bool { return w.Duration == 0 && w.Commits == 0 }
 
-// Resolve fills in DefaultRetentionDuration when nothing was chosen, and
-// normalizes "keep nothing" to a zero duration so callers downstream have
-// one representation of it rather than two.
+// Resolve fills in DefaultRetentionDuration when nothing was chosen.
+//
+// Idempotent, and that is a requirement rather than a nicety. An earlier
+// version normalized RetainNothing to a plain zero, which made resolving
+// twice silently turn "keep nothing" into "keep a day": the second call
+// saw a zero window, read it as unset, and applied the default. The
+// sentinel therefore survives Resolve, and every consumer asks whether
+// Duration is greater than zero rather than whether it is exactly zero.
 func (w RetentionWindow) Resolve() RetentionWindow {
 	if w.IsZero() {
 		return RetentionWindow{Duration: DefaultRetentionDuration}
 	}
 	if w.Duration < 0 {
-		w.Duration = 0
+		w.Duration = RetainNothing
 	}
 	if w.Commits < 0 {
 		w.Commits = 0
@@ -159,6 +164,8 @@ func (w RetentionWindow) String() string {
 		return fmt.Sprintf("%d commits", r.Commits)
 	case r.Duration > 0:
 		return r.Duration.String()
+	case r.Commits == 0:
+		return "nothing beyond the checkpoint"
 	default:
 		return "nothing beyond the checkpoint"
 	}

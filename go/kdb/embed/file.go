@@ -107,12 +107,18 @@ func (h *Host) openNamespace(
 		AsyncSyncIntervalMillis: opts.Storage.AsyncSyncIntervalMillis,
 		HistoryStrategy:         historyStrategy,
 		HistoryMode:             historyMode,
-		Retain:                  opts.Storage.Retain.Resolve(),
-		DocumentCacheBytes:      opts.Storage.DocumentCacheBytes,
-		CommitOpsBytes:          opts.Storage.CommitOpsBytes,
-		TreeChainLimit:          opts.Storage.TreeChainLimit,
-		HistoryTreeCacheBytes:   opts.Storage.HistoryTreeCacheBytes,
-		DisableCheckpoints:      opts.Storage.DisableCheckpoints,
+		// Deliberately *not* resolved here. Resolve turns the
+		// RetainNothing sentinel into a plain zero, and a plain zero means
+		// "unset, take the default" - so resolving on the way in silently
+		// converted "keep nothing" into "keep a day", and only at the
+		// second reader. The config carries what the caller wrote and
+		// every reader resolves at the point of use.
+		Retain:                opts.Storage.Retain,
+		DocumentCacheBytes:    opts.Storage.DocumentCacheBytes,
+		CommitOpsBytes:        opts.Storage.CommitOpsBytes,
+		TreeChainLimit:        opts.Storage.TreeChainLimit,
+		HistoryTreeCacheBytes: opts.Storage.HistoryTreeCacheBytes,
+		DisableCheckpoints:    opts.Storage.DisableCheckpoints,
 	}
 	target := engine.TargetServer
 	if opts.ReadOnly {

@@ -51,6 +51,19 @@ type TruncationResult struct {
 	// RetainedCommits is how many commits remain reachable in the
 	// segments that were kept, as far as the fingerprints can tell.
 	RetainedSegments int
+
+	// TablesMerged and TablesRemoved report the SSTable compaction that
+	// runs in the same pass. Independent of the delta-log figures above,
+	// and independent of the history mode: SSTable duplication is a
+	// function of how many times the memtable has been flushed, not of
+	// how much history is kept, so both modes accumulate it and both
+	// modes reclaim it here.
+	TablesMerged  int
+	TablesRemoved int
+	// VersionsDropped is how many superseded document versions the
+	// compaction reclaimed. Always zero under history=full, which keeps
+	// every version it has ever been given.
+	VersionsDropped int
 }
 
 // truncationInputs is everything a truncation pass needs, gathered so the

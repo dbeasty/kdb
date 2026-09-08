@@ -96,7 +96,7 @@ func (e *defaultEngine) explainResolution(namespaceID, spec string, err error) e
 	if mode != policy.HistoryModeNone {
 		return err
 	}
-	if window.Resolve().Duration == 0 && window.Resolve().Commits == 0 {
+	if r := window.Resolve(); r.Duration <= 0 && r.Commits == 0 {
 		return &HistoryDisabledError{NamespaceID: namespaceID}
 	}
 	return &HistoryNotRetainedError{

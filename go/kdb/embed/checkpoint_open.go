@@ -194,7 +194,7 @@ func saveCheckpoint(
 	if err != nil {
 		return err
 	}
-	state := d.CheckpointSnapshot()
+	state := d.CheckpointSnapshotRetaining(commitRetentionFilter(eng))
 	var headPayloads [][]byte
 	for _, b := range state.Branches {
 		c, err := d.GetCommitOrThrow(b.HeadHash)
@@ -291,6 +291,39 @@ func installTreeRebuilder(d *dag.InMemoryCommitDag, eng *engine.ServerEngine) {
 	})
 }
 
+// commitRetentionFilter decides which commits a checkpoint writes out.
+//
+// nil under history=full, which keeps every commit forever and whose
+// checkpoint must therefore describe every commit.
+//
+// Under history=none it is the retention window, applied to the commit's
+// own timestamp - the same window and the same clock the delta log's
+// truncation uses, so the two halves of "how much past is there" agree.
+// They agree only approximately: truncation works at segment granularity
+// and so over-retains, which means some commits older than the window
+// still have their frames on disk while the graph has forgotten them.
+// That asymmetry is in the safe direction. The promise is "everything
+// inside the window is readable", and this filter keeps exactly that; the
+// extra frames are unreachable rather than missing.
+//
+// A zero window keeps nothing but the refs, which is what "keep nothing
+// beyond the checkpoint" has to mean for the graph as well as the log.
+func commitRetentionFilter(eng *engine.ServerEngine) func(document.Commit) bool {
+	if eng == nil || eng.HistoryMode() != storage.HistoryModeNone {
+		return nil
+	}
+	window := eng.RetentionWindow().Resolve()
+	if window.Duration <= 0 {
+		// Refs only. CheckpointSnapshotRetaining keeps those whatever this
+		// says, so a graph of exactly the branch heads is the result.
+		return func(document.Commit) bool { return false }
+	}
+	cutoff := time.Now().Add(-window.Duration).UnixMicro()
+	return func(c document.Commit) bool {
+		return c.Timestamp.EpochMicros() >= cutoff
+	}
+}
+
 // currentFloor is the floor to record when nothing is being truncated: the
 // oldest segment actually on disk. Zero for a namespace that has never
 // truncated, which keeps the recorded floor honest without any special
@@ -332,10 +365,18 @@ func checkpointAndTruncate(
 		return TruncationResult{}, nil
 	}
 	eng, ok := store.(*engine.ServerEngine)
-	if !ok || eng.HistoryMode() != storage.HistoryModeNone {
-		// history=full: checkpoint only. Nothing is ever reclaimed, so the
-		// floor stays wherever it is.
+	if !ok {
 		return TruncationResult{}, saveCheckpoint(d, store, r, shim, namespaceID, through, currentFloor(r), disabled)
+	}
+	if eng.HistoryMode() != storage.HistoryModeNone {
+		// history=full: checkpoint, and compact the blob store. Nothing in
+		// the delta log is ever reclaimed, so the floor stays where it is -
+		// but SSTable duplication is not a retention question and a
+		// full-history namespace accumulates exactly as much of it.
+		if err := saveCheckpoint(d, store, r, shim, namespaceID, through, currentFloor(r), disabled); err != nil {
+			return TruncationResult{}, err
+		}
+		return withCompaction(TruncationResult{FloorSequence: currentFloor(r)}, eng, namespaceID), nil
 	}
 
 	plan, err := planTruncation(d, store, r, through, window, now)
@@ -346,7 +387,37 @@ func checkpointAndTruncate(
 		return TruncationResult{}, err
 	}
 	if plan.IsEmpty() {
-		return TruncationResult{FloorSequence: plan.Floor}, nil
+		return withCompaction(TruncationResult{FloorSequence: plan.Floor}, eng, namespaceID), nil
 	}
-	return applyTruncation(store, r, shim, namespaceID, plan)
+	res, err := applyTruncation(store, r, shim, namespaceID, plan)
+	if err != nil {
+		return res, err
+	}
+	return withCompaction(res, eng, namespaceID), nil
+}
+
+// withCompaction runs the SSTable merge and folds what it reclaimed into
+// the result.
+//
+// After the delta-log work rather than before it: truncation's own
+// PrepareForTruncation writes the live dataset into the memtable, and
+// compacting before that flush would merge a picture that is about to gain
+// another table anyway.
+//
+// A compaction failure is logged rather than returned. The checkpoint and
+// any truncation have already succeeded and are the operations the caller
+// asked for; failing them because a space optimization did not run would
+// turn a partial success into a reported failure.
+func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID string) TruncationResult {
+	c, err := eng.CompactBlobStore()
+	if err != nil {
+		log.Printf("kdb: namespace %s: could not compact the blob store (%v) - it keeps its current tables", namespaceID, err)
+		return res
+	}
+	res.TablesMerged, res.TablesRemoved, res.VersionsDropped = c.Merged, c.Removed, c.Dropped
+	if c.Removed > 0 {
+		log.Printf("kdb: namespace %s: merged %d sstables into one, removed %d, dropped %d unreachable version(s)",
+			namespaceID, c.Merged, c.Removed, c.Dropped)
+	}
+	return res
 }

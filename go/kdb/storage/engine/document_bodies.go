@@ -6,6 +6,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/sstable"
 )
 
 // Document bodies as content-addressed objects, for namespaces whose delta
@@ -161,4 +162,87 @@ func (e *ServerEngine) LiveBodiesDurable() bool {
 		return true
 	})
 	return ok
+}
+
+// CompactBlobStore merges the SSTables a run of memtable flushes has left
+// behind, and reports what it reclaimed.
+//
+// Every flush writes another table holding whatever was hot at the time,
+// and nothing merged them, so a namespace that rewrote the same documents
+// kept a full copy per flush and its on-disk size grew with the number of
+// flushes rather than with the data. That is the last structure whose size
+// was a function of write history rather than of content - and it is why
+// history=none could bound its delta log and still not bound its
+// footprint.
+//
+// Deliberately not on the write path. Compaction rewrites everything it
+// merges, so doing it inside maybeFlushMemtable would put an O(live data)
+// write behind an ordinary commit. It belongs with the other maintenance -
+// checkpointing, truncation - which is where EmbeddedKdbRuntime.Maintain
+// calls it from, and where it cannot show up in a read or write benchmark.
+//
+// Applies under both history modes: SSTable accumulation is not a
+// retention question, and a full-history namespace pays exactly the same
+// duplication.
+func (e *ServerEngine) CompactBlobStore() (sstable.CompactionResult, error) {
+	if e.blobStore == nil || e.config.IOShim == nil {
+		return sstable.CompactionResult{}, nil
+	}
+	// Anything still in memory first, and the order that follows is the
+	// safety argument for the reachability predicate below.
+	//
+	// Flush swaps the active memtable out and installs a fresh one, so
+	// every version committed *after* this point lands in a table that is
+	// not an input to this compaction and cannot be dropped by it,
+	// whatever the live tree says. Taking the live-tree snapshot after the
+	// flush therefore cannot lose a concurrent write: the only versions
+	// the snapshot can omit are ones that were superseded before it, which
+	// is exactly what should be dropped.
+	if e.memTable != nil {
+		if _, err := e.memTable.Flush(0); err != nil {
+			return sstable.CompactionResult{}, err
+		}
+	}
+	return e.blobStore.Compact(sstable.DefaultCompactionTrigger, e.reachableBlobKeys())
+}
+
+// reachableBlobKeys reports which blob keys are still worth keeping, or
+// nil when everything is.
+//
+// Under HistoryModeNone the blob store holds exactly one thing - document
+// bodies (putTreeObject and putDocumentLocation both write only under the
+// objects strategy, and none forces replay) - so what is reachable is
+// precisely what the live tree names. A version the live tree no longer
+// names is either still in a retained delta segment, where the ordinary
+// cold path finds it, or past the retention window, where it is supposed
+// to be gone. Either way the blob copy has no reader, and the blob copy is
+// the only place a superseded version would otherwise live forever.
+//
+// Under HistoryModeFull the answer is nil, and deliberately so: there the
+// store also holds tree objects and document locations, keyed in the same
+// space, and every one of them exists to serve a read at some historical
+// commit that this mode promises to keep serving. Nothing there is
+// unreachable.
+func (e *ServerEngine) reachableBlobKeys() func(codec.Hash) bool {
+	if e.HistoryMode() != storage.HistoryModeNone {
+		return nil
+	}
+	live := make(map[codec.Hash]struct{})
+	e.LiveTree().Walk(func(_ codec.UUID, h codec.Hash) bool {
+		live[h] = struct{}{}
+		return true
+	})
+	return func(h codec.Hash) bool {
+		_, ok := live[h]
+		return ok
+	}
+}
+
+// BlobTableCount is how many SSTables this namespace currently has
+// registered. For tests and for reporting; not on any hot path.
+func (e *ServerEngine) BlobTableCount() int {
+	if e.blobStore == nil {
+		return 0
+	}
+	return len(e.blobStore.Tables())
 }
