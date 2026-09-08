@@ -75,6 +75,10 @@ type Options struct {
 	// LogLevel is the process's live log level, when the caller holds one. Without it the log
 	// level is reported but cannot be changed, and the refusal says so.
 	LogLevel *slog.LevelVar
+	// BackupDir is where control-plane backups are written. Empty disables them, and the endpoints
+	// say so rather than failing obscurely - a backup with nowhere to go is a configuration
+	// question, not an error.
+	BackupDir string
 	// AllowSettingsPersist lets an applied setting also be written back to the config file. Off by
 	// default: in a GitOps-managed deployment that file belongs to a deployment tool, and a server
 	// rewriting it is a surprise rather than a feature. A change applied without it is still
@@ -103,6 +107,10 @@ type Server struct {
 	// revision counts applied changes, for the compare-and-swap on a patch.
 	revision int64
 
+	// recovery holds cached verification reports, so the UI can show the last result without
+	// re-running a scan that walks the whole log.
+	recovery *recoveryState
+
 	// applyMu serializes whole patches. Settings that share one engine setter - the memory trio -
 	// would otherwise let two concurrent patches install a combination neither asked for.
 	applyMu sync.Mutex
@@ -130,6 +138,7 @@ func New(opts Options) (*Server, error) {
 		started:         opts.Now(),
 		settings:        append([]config.SettingDescriptor(nil), opts.Settings...),
 		startupSettings: append([]config.SettingDescriptor(nil), opts.Settings...),
+		recovery:        newRecoveryState(),
 		// Starts at 1, not 0: zero is what a caller sends to mean "do not check the revision", so
 		// a real revision of zero would silently skip the compare-and-swap it asked for.
 		revision: 1,
@@ -240,6 +249,18 @@ func (s *Server) routes() http.Handler {
 	// applying is gated.
 	mux.Handle("PUT /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handlePutDocument))
 	mux.Handle("DELETE /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handleDeleteDocument))
+
+	// Recovery. Verifying and backing up are reads of the log and need no write permission: an
+	// operator must always be able to find out whether their data is intact and take a copy of it.
+	mux.Handle("GET /v1/ns/{ns}/integrity", s.nsRead(s.handleIntegrity))
+	mux.Handle("POST /v1/ns/{ns}/integrity/verify", s.nsRead(s.handleVerify))
+	mux.Handle("GET /v1/ns/{ns}/checkpoints", s.nsRead(s.handleCheckpoints))
+	mux.Handle("GET /v1/ns/{ns}/maintenance/plan", s.nsRead(s.handleMaintenancePlan))
+	mux.Handle("GET /v1/ns/{ns}/backups", s.nsRead(s.handleListBackups))
+	mux.Handle("POST /v1/ns/{ns}/backups/{id}/verify", s.nsRead(s.handleVerifyBackup))
+	// Creating one writes to the backup directory, so it is gated - not because it touches the
+	// database, but because it consumes disk somewhere an operator did not ask for it to.
+	mux.Handle("POST /v1/ns/{ns}/backups", s.nsWrite(s.handleCreateBackup))
 
 	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
 	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))

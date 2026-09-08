@@ -86,12 +86,14 @@ type ServiceSettings struct {
 	// to the config file. Off by default: that file belongs to whoever deploys, not to the server,
 	// and a change applied without this is still reported as drift so nothing is silently lost.
 	ControlSettingsPersist bool
-	TLSCert                string
-	TLSKey                 string
-	TLSCA                  string
-	TLSClientAuth          bool
-	LogLevel               string
-	LogFormat              string
+	// ControlBackupDir is where the control plane writes backups. Empty disables them.
+	ControlBackupDir string
+	TLSCert          string
+	TLSKey           string
+	TLSCA            string
+	TLSClientAuth    bool
+	LogLevel         string
+	LogFormat        string
 
 	// Storage-engine tunables. These reach storage.StorageEngineConfig via
 	// embed.FileRuntimeOptions; before they existed the engine's Durability and
@@ -173,6 +175,7 @@ type ServiceFile struct {
 	ControlWrite           *bool           `json:"controlWrite"`
 	ControlUI              *bool           `json:"controlUi"`
 	ControlSettingsPersist *bool           `json:"controlSettingsPersist"`
+	ControlBackupDir       *string         `json:"controlBackupDir"`
 
 	Durability          *string `json:"durability"`
 	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
@@ -268,6 +271,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.ControlWrite, file.ControlWrite)
 		setIf(&s.ControlUI, file.ControlUI)
 		setIf(&s.ControlSettingsPersist, file.ControlSettingsPersist)
+		setIf(&s.ControlBackupDir, file.ControlBackupDir)
 		setIf(&s.Durability, file.Durability)
 		setIf(&s.AsyncSyncIntervalMS, file.AsyncSyncIntervalMS)
 		setIf(&s.Compression, file.Compression)
@@ -378,6 +382,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envBool("KDB_CONTROL_SETTINGS_PERSIST", &s.ControlSettingsPersist); err != nil {
 		return s, err
 	}
+	envString("KDB_CONTROL_BACKUP_DIR", &s.ControlBackupDir)
 	envString("KDB_DURABILITY", &s.Durability)
 	if err := envInt("KDB_ASYNC_SYNC_INTERVAL_MS", &s.AsyncSyncIntervalMS); err != nil {
 		return s, err
@@ -415,6 +420,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"control-write", func() { s.ControlWrite = flags.ControlWrite }},
 		{"control-ui", func() { s.ControlUI = flags.ControlUI }},
 		{"control-settings-persist", func() { s.ControlSettingsPersist = flags.ControlSettingsPersist }},
+		{"control-backup-dir", func() { s.ControlBackupDir = flags.ControlBackupDir }},
 		{"log-level", func() { s.LogLevel = flags.LogLevel }},
 		{"log-format", func() { s.LogFormat = flags.LogFormat }},
 		{"durability", func() { s.Durability = flags.Durability }},

@@ -76,6 +76,7 @@ func Main() {
 	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
 	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
+	fs.StringVar(&flagVals.ControlBackupDir, "control-backup-dir", flagVals.ControlBackupDir, "directory the control plane writes backups to (empty disables backups through it). Keep it off the data volume: a backup that shares a disk with the thing it is backing up is not a backup")
 	fs.BoolVar(&flagVals.ControlSettingsPersist, "control-settings-persist", flagVals.ControlSettingsPersist, "let a setting changed through the control plane also be written back to the --config file. Off by default: in a GitOps-managed deployment that file belongs to a deployment tool, and a server rewriting it is a surprise rather than a feature. A change applied without this is still reported under /v1/settings/drift, so nothing is silently lost on the next restart")
 	fs.StringVar(&flagVals.LogLevel, "log-level", flagVals.LogLevel, "minimum log level: debug, info, warn, error")
 	fs.StringVar(&flagVals.LogFormat, "log-format", flagVals.LogFormat, "log output format: text or json")
@@ -473,6 +474,7 @@ func Main() {
 			// The live level holder, so log.level is adjustable without a restart.
 			LogLevel:             logLevel,
 			AllowSettingsPersist: cfg.ControlSettingsPersist,
+			BackupDir:            cfg.ControlBackupDir,
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)

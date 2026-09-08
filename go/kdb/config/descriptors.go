@@ -303,6 +303,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.ControlSettingsPersist != nil },
 		},
 		{
+			key: "control.backupDir", flag: "control-backup-dir", env: "KDB_CONTROL_BACKUP_DIR",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "directory the control plane writes backups to (empty disables them). Keep it off the data volume: a backup sharing a disk with its source is not a backup",
+			value:  str(func(s ServiceSettings) string { return s.ControlBackupDir }),
+			inFile: func(f *ServiceFile) bool { return f.ControlBackupDir != nil },
+		},
+		{
 			key: "log.level", flag: "log-level", env: "KDB_LOG_LEVEL",
 			scope: ScopeProcess, mutability: MutabilityLive,
 			help:   "minimum log level: debug, info, warn, error",

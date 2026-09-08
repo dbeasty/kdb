@@ -1873,3 +1873,259 @@ func TestMemoryBudgetChangeReachesAdmission(t *testing.T) {
 		t.Error("the rescue reserve was reset to zero by a budget change")
 	}
 }
+
+// fileFixture starts a control plane over a file-backed namespace, which recovery needs: an
+// in-memory namespace has no delta log to verify or back up.
+func fileFixture(t *testing.T, opts ...func(*Options)) (*Server, string, *embed.EmbeddedKdbRuntime) {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "data")
+	rt, err := embed.OpenFileRuntime(root, "demo", "demo/users", schema.None())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(rt.Close)
+	srv := server.NewKdbServerRuntime(rt)
+	o := Options{
+		Addr: "127.0.0.1:0", Runtime: srv, Namespace: "demo/users", Version: "test",
+		AllowWrites: true, BackupDir: filepath.Join(t.TempDir(), "backups"),
+	}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	cs, err := New(o)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	return cs, "http://" + cs.Addr().String(), rt
+}
+
+// TestVerifyRunsAgainstALiveNamespace is the property the whole online tier rests on: the server
+// holds the data directory's exclusive lock, so a verification that tried to acquire it would
+// deadlock against itself.
+func TestVerifyRunsAgainstALiveNamespace(t *testing.T) {
+	_, base, rt := fileFixture(t)
+	for i := 0; i < 5; i++ {
+		if _, err := embed.PutJSONDocument(rt, "demo/users", fmt.Sprintf(`{"id":"d%d","n":%d}`, i, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Nothing has run yet, and that is reported rather than looking like a clean result.
+	_, before := get(t, base, "/v1/ns/demo%2Fusers/integrity")
+	if before["everRun"] != false {
+		t.Errorf("a namespace with no verification must not look verified: %v", before)
+	}
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/integrity/verify", `{"level":"L2"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("verify: %d (%v)", res.StatusCode, body)
+	}
+	report := body["report"].(map[string]any)
+	if report["level"] != "L2" {
+		t.Errorf("the report should say which level ran: %v", report["level"])
+	}
+	if len(report["segments"].([]any)) == 0 {
+		t.Error("five commits should have produced at least one segment")
+	}
+	// A live namespace can legitimately report a finding on the segment being appended to; what it
+	// must not do is fail to run.
+	for _, raw := range report["findings"].([]any) {
+		f := raw.(map[string]any)
+		if f["onActiveSegment"] != true {
+			t.Errorf("unexpected finding away from the active segment: %v", f)
+		}
+	}
+
+	// And it is cached, so the UI does not have to re-scan to show the last result.
+	_, after := get(t, base, "/v1/ns/demo%2Fusers/integrity")
+	if after["everRun"] != true || after["report"] == nil {
+		t.Errorf("the report should be cached: %v", after)
+	}
+}
+
+func TestVerifyRejectsAnUnknownLevel(t *testing.T) {
+	_, base, _ := fileFixture(t)
+	res, _ := postJSON(t, base, "/v1/ns/demo%2Fusers/integrity/verify", `{"level":"L9"}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for an unknown level, got %d", res.StatusCode)
+	}
+}
+
+func TestVerifyIsRefusedForAMemoryNamespace(t *testing.T) {
+	_, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/integrity/verify", `{}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("an in-memory namespace has no log to verify: got %d (%v)", res.StatusCode, body)
+	}
+}
+
+// TestVerifyNeedsNoWritePermission: an operator must always be able to find out whether their data
+// is intact, whatever the deployment's write setting.
+func TestVerifyNeedsNoWritePermission(t *testing.T) {
+	_, base, rt := fileFixture(t, func(o *Options) { o.AllowWrites = false })
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/integrity/verify", `{"level":"L1"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("verify on a read-only control plane: %d (%v)", res.StatusCode, body)
+	}
+}
+
+func TestBackupCreateListAndVerify(t *testing.T) {
+	_, base, rt := fileFixture(t)
+	for i := 0; i < 3; i++ {
+		if _, err := embed.PutJSONDocument(rt, "demo/users", fmt.Sprintf(`{"id":"d%d"}`, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res, made := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("backup: %d (%v)", res.StatusCode, made)
+	}
+	id, _ := made["backupId"].(string)
+	if id == "" {
+		t.Fatalf("a backup must report its id: %v", made)
+	}
+	if made["commitCount"].(float64) == 0 {
+		t.Error("a backup of three commits should count them")
+	}
+
+	_, listed := get(t, base, "/v1/ns/demo%2Fusers/backups")
+	backups := listed["backups"].([]any)
+	if len(backups) != 1 || backups[0].(map[string]any)["backupId"] != id {
+		t.Fatalf("the backup should be listed: %v", backups)
+	}
+
+	// Verifying re-reads every object and re-hashes it. An unverified backup is a guess.
+	res, verified := postJSON(t, base, "/v1/ns/demo%2Fusers/backups/"+id+"/verify", `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("backup verify: %d (%v)", res.StatusCode, verified)
+	}
+	if verified["clean"] != true {
+		t.Errorf("a backup taken moments ago should verify clean: %v", verified)
+	}
+}
+
+// TestBackupOfALiveNamespaceRecordsTheActivePrefix: backing up while writes are landing works
+// because Create stores the still-being-written segment's CRC-verified prefix rather than
+// requiring a sealed log. The response says so, because "everything up to when I started" is a
+// different promise from "everything".
+func TestBackupOfALiveNamespaceRecordsTheActivePrefix(t *testing.T) {
+	_, base, rt := fileFixture(t)
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+	_, made := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	if made["verifiedPrefixSegments"] != nil && made["note"] == nil {
+		t.Error("a prefix-only segment needs the caveat spelled out, not just counted")
+	}
+}
+
+func TestIncrementalBackupReferencesItsBase(t *testing.T) {
+	_, base, rt := fileFixture(t)
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+	_, first := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	firstID := first["backupId"].(string)
+
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"b"}`); err != nil {
+		t.Fatal(err)
+	}
+	res, second := postJSON(t, base, "/v1/ns/demo%2Fusers/backups",
+		`{"baseBackupId":"`+firstID+`"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("incremental backup: %d (%v)", res.StatusCode, second)
+	}
+	if second["incremental"] != true || second["baseBackupId"] != firstID {
+		t.Errorf("an incremental backup should name its base: %v", second)
+	}
+}
+
+func TestBackupsRefusedWithoutADirectory(t *testing.T) {
+	_, base, _ := fileFixture(t, func(o *Options) { o.BackupDir = "" })
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/backups")
+	if res.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("want 501 when no backup directory is configured, got %d (%v)", res.StatusCode, body)
+	}
+	if !strings.Contains(fmt.Sprint(body["error"]), "--control-backup-dir") {
+		t.Error("the refusal should name the flag that enables it")
+	}
+}
+
+func TestBackupCreationIsGatedOnWrites(t *testing.T) {
+	_, base, _ := fileFixture(t, func(o *Options) { o.AllowWrites = false })
+	res, _ := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("creating a backup consumes disk and is gated; got %d", res.StatusCode)
+	}
+}
+
+// TestMaintenancePlanNamesTheCommandAndItsPrecondition is the offline tier: the control plane
+// cannot run these, so the value is in getting the operator to the right one with the right flags.
+func TestMaintenancePlanNamesTheCommandAndItsPrecondition(t *testing.T) {
+	_, base, rt := fileFixture(t)
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	res, plan := get(t, base, "/v1/ns/demo%2Fusers/maintenance/plan")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("plan: %d (%v)", res.StatusCode, plan)
+	}
+	ops := plan["operations"].([]any)
+	if len(ops) == 0 {
+		t.Fatal("the plan should list the offline operations")
+	}
+	byName := map[string]map[string]any{}
+	for _, raw := range ops {
+		o := raw.(map[string]any)
+		byName[o["name"].(string)] = o
+	}
+	repair, ok := byName["repair-segments"]
+	if !ok {
+		t.Fatal("repair-segments should be listed")
+	}
+	cmd := repair["command"].([]any)
+	if cmd[0] != "kdb-inspect" {
+		t.Errorf("the command should be runnable as printed: %v", cmd)
+	}
+	if !strings.Contains(fmt.Sprint(cmd), "demo/users") {
+		t.Error("the command should be filled in with this namespace, not a placeholder")
+	}
+	if !strings.Contains(fmt.Sprint(repair["precondition"]), "must not be running") {
+		t.Errorf("the precondition has to be explicit: %v", repair["precondition"])
+	}
+	// With no verification run, applicability is unknown rather than asserted.
+	if repair["applicable"] != false || !strings.Contains(fmt.Sprint(repair["reason"]), "no verification") {
+		t.Errorf("without a verification the plan should say it does not know: %v", repair)
+	}
+
+	// The restore entry is the one that can run while the service is up, and should say so.
+	restore := byName["restore"]
+	if !strings.Contains(fmt.Sprint(restore["precondition"]), "different directory") {
+		t.Errorf("restore locks only its output directory and should say so: %v", restore["precondition"])
+	}
+}
+
+func TestCheckpointStatusReportsReplayCost(t *testing.T) {
+	_, base, rt := fileFixture(t)
+	for i := 0; i < 4; i++ {
+		if _, err := embed.PutJSONDocument(rt, "demo/users", fmt.Sprintf(`{"id":"d%d"}`, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/checkpoints")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("checkpoints: %d (%v)", res.StatusCode, body)
+	}
+	if body["fileBacked"] != true {
+		t.Fatalf("this namespace is file-backed: %v", body)
+	}
+	if body["segments"].(float64) == 0 || body["deltaLogBytes"].(float64) == 0 {
+		t.Errorf("the numbers that predict restart time should be real: %v", body)
+	}
+}

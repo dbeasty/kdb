@@ -128,6 +128,7 @@
   <button data-tab="schema" aria-selected="false">Schema</button>
   <button data-tab="settings" aria-selected="false">Settings</button>
   <button data-tab="ops" aria-selected="false">Ops</button>
+  <button data-tab="recovery" aria-selected="false">Recovery</button>
 </nav>
 <div class="timebar" id="timebar" hidden>
   <span>Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
@@ -304,6 +305,7 @@ async function selectTab(tab) {
     else if (tab === "schema") await renderSchema();
     else if (tab === "settings") await renderSettings();
     else if (tab === "ops") await renderOps();
+    else if (tab === "recovery") await renderRecovery();
   } catch (e) {
     setMain(el("div", { class: "err", text: e.message }));
   }
@@ -997,6 +999,180 @@ function flash(message) {
   const note = el("div", { class: "card", style: "margin-bottom:12px" },
     el("div", { class: "body", text: message }));
   $("main").prepend(note);
+}
+
+// ---- Recovery -----------------------------------------------------------------------------
+
+async function renderRecovery() {
+  const [integrity, checkpoints, plan] = await Promise.all([
+    api(nsPath("/integrity")),
+    api(nsPath("/checkpoints")).catch((e) => ({ error: e.message })),
+    api(nsPath("/maintenance/plan")).catch((e) => ({ error: e.message })),
+  ]);
+  let backups = null;
+  try { backups = await api(nsPath("/backups")); } catch (e) { backups = { unavailable: e.message }; }
+  setMain(
+    integritySection(integrity),
+    el("div", { style: "height:12px" }),
+    backupSection(backups),
+    el("div", { style: "height:12px" }),
+    checkpointSection(checkpoints),
+    el("div", { style: "height:12px" }),
+    maintenanceSection(plan));
+}
+
+function integritySection(data) {
+  const run = async (level) => {
+    setMain(el("div", { class: "empty", text: "Verifying at " + level + "… this walks the delta log." }));
+    try {
+      await api(nsPath("/integrity/verify"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level }),
+      });
+    } catch (e) {
+      flash("Verification failed: " + e.message);
+    }
+    await renderRecovery();
+  };
+
+  const buttons = el("div", { class: "body", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+    el("button", { class: "act", text: "Verify (L1)",
+                   title: "framing and CRC only - cheaper", onclick: () => run("L1") }),
+    el("button", { class: "act", text: "Verify (L2)",
+                   title: "adds commit hashes and the parent closure - reads every commit", onclick: () => run("L2") }),
+    el("span", { class: "muted", style: "font-size:12px",
+                 text: "a verification walks the whole log, so it is on demand" }));
+
+  if (!data.everRun) {
+    return el("div", { class: "card" }, el("h2", { text: "Integrity" }),
+      el("div", { class: "body muted", text: data.note }), buttons);
+  }
+
+  const r = data.report;
+  // Findings on the segment still being written are separated out: under a live server that is the
+  // expected shape of an in-progress append, and mixing it in with real damage would cry wolf.
+  const real = (r.findings || []).filter((f) => !f.onActiveSegment);
+  const active = (r.findings || []).filter((f) => f.onActiveSegment);
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Integrity" }),
+    el("div", { class: "body" },
+      el("div", {},
+        el("span", { class: "chip " + (real.length ? "removed" : "added"),
+                     text: real.length ? real.length + " finding" + (real.length === 1 ? "" : "s") : "clean" }),
+        el("span", { class: "chip", text: r.level }),
+        el("span", { class: "muted", style: "font-size:12px",
+                     text: " ran " + formatTime(r.ranAt) + " in " + r.tookMs + " ms over " +
+                           (r.segments || []).length + " segment(s)" })),
+      active.length ? el("div", { class: "warn", text: r.note }) : null),
+    buttons,
+    real.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Level" }), el("th", { text: "What" }),
+                              el("th", { text: "Segment" }), el("th", { text: "Offset" }),
+                              el("th", { text: "Repairable" }))),
+          el("tbody", {}, real.map((f) => el("tr", {},
+            el("td", {}, el("span", { class: "chip", text: f.level })),
+            el("td", {}, el("code", { text: f.classification }),
+              el("div", { class: "muted", style: "font-size:12px", text: f.detail })),
+            el("td", { class: "muted" }, String(f.segment)),
+            el("td", { class: "muted" }, String(f.offset)),
+            el("td", {}, f.repairable
+              ? el("span", { class: "chip modified", text: "repair" })
+              : el("span", { class: "chip removed", title: "repair cannot fabricate missing data; this needs a restore", text: "restore" }))))))
+      : null);
+}
+
+function backupSection(data) {
+  if (data && data.unavailable) {
+    return el("div", { class: "card" }, el("h2", { text: "Backups" }),
+      el("div", { class: "body muted", text: data.unavailable }));
+  }
+  const create = async (base) => {
+    try {
+      const made = await api(nsPath("/backups"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(base ? { baseBackupId: base } : {}),
+      });
+      await renderRecovery();
+      flash("Backup " + made.backupId.slice(0, 8) + " written" +
+            (made.note ? " — " + made.note : "."));
+    } catch (e) {
+      flash("Backup failed: " + e.message);
+    }
+  };
+  const verify = async (id) => {
+    try {
+      const res = await api(nsPath("/backups/" + encodeURIComponent(id) + "/verify"), { method: "POST" });
+      flash(res.clean
+        ? "Backup " + id.slice(0, 8) + " verified: " + res.objects + " objects re-hashed and intact."
+        : "Backup " + id.slice(0, 8) + " has problems: " + (res.problems || []).join("; "));
+    } catch (e) {
+      flash("Verify failed: " + e.message);
+    }
+  };
+  const rows = (data.backups || []).map((b) => el("tr", {},
+    el("td", {}, el("code", { text: b.backupId.slice(0, 12) }),
+      b.incremental ? el("span", { class: "chip", title: "based on " + b.baseBackupId, text: "incremental" }) : null),
+    el("td", { class: "muted" }, formatTime(b.createdAt)),
+    el("td", { class: "muted" }, String(b.commitCount)),
+    el("td", { class: "muted" }, formatBytes(b.sizeBytes)),
+    el("td", {},
+      el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Verify",
+                     onclick: () => verify(b.backupId) }),
+      el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                     title: "take a new backup that references this one",
+                     text: "Incremental", onclick: () => create(b.backupId) }))));
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Backups" }),
+    el("div", { class: "body", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+      el("button", { class: "act", text: "Back up now", onclick: () => create(null) }),
+      el("span", { class: "muted", style: "font-size:12px", text: data.directory || "" })),
+    rows.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Backup" }), el("th", { text: "Created" }),
+                              el("th", { text: "Commits" }), el("th", { text: "Size" }), el("th", { text: "" }))),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty", text: "No backups yet. An unverified backup is a guess; an absent one is worse." }));
+}
+
+function checkpointSection(data) {
+  if (data.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Restart cost" }),
+      el("div", { class: "body muted", text: data.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Restart cost" }),
+    el("div", { class: "body" },
+      data.fileBacked
+        ? el("dl", { class: "kv" },
+            el("dt", { text: "Delta segments" }), el("dd", { text: String(data.segments) }),
+            el("dt", { text: "Delta log" }), el("dd", { text: formatBytes(data.deltaLogBytes) }),
+            el("dt", { text: "Checkpoint" }),
+            el("dd", { text: data.checkpointPresent ? "present" : "none - every open replays the whole log" }))
+        : null,
+      el("div", { class: "muted", style: "font-size:12px;margin-top:8px", text: data.note })));
+}
+
+function maintenanceSection(data) {
+  if (data.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Offline operations" }),
+      el("div", { class: "body muted", text: data.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Offline operations" }),
+    el("div", { class: "body muted", text: data.note }),
+    el("div", {}, (data.operations || []).map((o) => el("div", { class: "body",
+        style: "border-top:1px solid var(--border)" },
+      el("div", {},
+        el("strong", { text: o.name }),
+        o.applicable
+          ? el("span", { class: "chip modified", text: "indicated" })
+          : el("span", { class: "chip", title: o.reason || "", text: "not indicated" })),
+      el("pre", { class: "doc", style: "margin:8px 0", text: (o.command || []).join(" ") }),
+      el("div", { class: "muted", style: "font-size:12px", text: o.why }),
+      el("div", { class: "warn", style: "font-size:12px", text: o.precondition })))));
 }
 
 function formatValue(v) {

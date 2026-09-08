@@ -36,6 +36,7 @@ var fieldToKey = map[string]string{
 	"ControlWrite":           "control.write",
 	"ControlUI":              "control.ui",
 	"ControlSettingsPersist": "control.settingsPersist",
+	"ControlBackupDir":       "control.backupDir",
 	"LogLevel":               "log.level",
 	"LogFormat":              "log.format",
 	"Durability":             "storage.durability",
