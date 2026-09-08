@@ -59,13 +59,13 @@ type ServerEngine struct {
 	treeRebuildOnce *sync.Once
 	treeRebuildErr  error
 
-	// treeChain remembers how many delta tree objects stand behind each
-	// tree, so putTreeObject knows when to write a full one instead. Lost
-	// on restart, which only means the first tree written in a new process
-	// starts a fresh chain - never a correctness issue, since resolution
-	// stops at the first full object it finds.
+	// treeChain remembers what stands behind each tree in delta tree
+	// objects, so putTreeObject knows when to write a full one instead.
+	// Lost on restart, which only means the first tree written in a new
+	// process starts a fresh chain - never a correctness issue, since
+	// resolution stops at the first full object it finds.
 	treeChainMu sync.Mutex
-	treeChain   map[codec.Hash]int
+	treeChain   map[codec.Hash]treeChainState
 	// memtableFlushOverride, when > 0, replaces the config-derived flush
 	// threshold. Set by SetMemoryBudgetBytes when a BudgetArbiter re-cuts
 	// this namespace's share. Atomic rather than a write to config, which
