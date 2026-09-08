@@ -1,8 +1,16 @@
 # Holding a Million-Commit History Without Holding It in the Heap
 
-> **Status: plan.** Nothing here is implemented. Phase 0 is a measurement
-> that decides whether the rest is worth doing at the sizes we actually
-> care about.
+> **Status: in progress.** Phase 1 (generation numbers and pruned
+> ancestry) and Phase 6's settings have landed, behind flags that are all
+> off by default. Phase 0's measurement at 100k-2M commits has not been
+> run, and Phases 2-5 are not started.
+>
+> Everything is selected by `dag.GraphSettings`, reachable as
+> `StorageOptions.Graph` or through `KDB_ANCESTRY_PRUNING`,
+> `KDB_GRAPH_FILE`, `KDB_GRAPH_REBUILD_COMMITS` and
+> `KDB_HISTORY_ANCHOR_INTERVAL`. The zero value is the behaviour that
+> predates all of it, so an unchanged caller is unaffected - which is what
+> makes the before and after runnable against each other.
 
 ## Where this picks up
 
@@ -253,7 +261,7 @@ both of which would change the plan:
 
 **Files:** `go/kdb/embed/open_graph_test.go`, `go/kdb/embed/open_cost_bench_test.go`
 
-### Phase 1 — generation numbers and allocation-free ancestry
+### Phase 1 — generation numbers and allocation-free ancestry — **landed**
 
 In memory, before any file exists. Add a generation number per commit
 (4 bytes, computed at `putCommitLocked`), and rewrite `IsAncestor`,
@@ -263,8 +271,47 @@ genuinely want the set.
 
 Independently valuable, and it is the piece the file format depends on.
 
-**Files:** `go/kdb/dag/ancestry.go`, `go/kdb/dag/in_memory_commit_dag.go`,
-`go/kdb/dag/ancestry_test.go`
+Landed as `go/kdb/dag/generations.go`, gated on
+`GraphSettings.AncestryPruning`. Two details that were not obvious from
+this plan and are worth carrying forward:
+
+- The generation lives *inside* the commit map, as a `commitNode` struct
+  wrapping the commit, rather than in a second map keyed by hash. A
+  parallel map costs roughly 50 bytes per commit in buckets and key
+  copies against 8 for widening a value that is already there - so the
+  obvious implementation would have *added* more residency than the
+  pruning saves. `commitNode` is also where Phase 2's position field goes.
+- Incremental derivation is not sound on its own. `RestoreCheckpoint`
+  admits commits in map order, so a child routinely arrives before its
+  parent and is given a lower generation than its parent later gets,
+  inverting the invariant the pruning depends on. Out-of-order admission
+  sets a `genStale` flag and the next pruned walk recomputes the whole
+  graph - one O(V+E) pass, which is the same order as the single closure
+  one unpruned `IsAncestor` already builds, so the fallback is never
+  worse than the thing it replaces.
+
+Measured, one `IsAncestor` against a linear history (Apple M3 Max):
+
+| | unpruned | pruned |
+|---|---:|---:|
+| near ancestor, 1,000 commits | 116.6 µs, 192 KB, 1,021 allocs | **104.8 ns, 0 B, 0 allocs** |
+| near ancestor, 10,000 commits | 1.248 ms, 1.63 MB, 10,080 allocs | **100.6 ns, 0 B, 0 allocs** |
+| root ancestor, 10,000 commits | 1.402 ms, 1.63 MB, 10,080 allocs | 1.256 ms, 1.31 MB, 79 allocs |
+
+The first two rows are the point: the unpruned cost is a function of
+history length whatever the answer is, because it materializes the
+closure before testing one membership. The third row is the worst case
+kept honest - an ancestor at the root cannot be pruned towards, and there
+pruning only avoids being worse.
+
+`CommonAncestor` and `CommitsSince` still build closures. `CommitsSince` is
+a set difference and needs the sets; `CommonAncestor` needs git's
+paint-down-to-common-ancestor to prune correctly, which is a larger change
+than it looks and has "prefers the nearest fork" tests behind it. Both
+deferred deliberately.
+
+**Files:** `go/kdb/dag/generations.go`, `go/kdb/dag/ancestry.go`,
+`go/kdb/dag/in_memory_commit_dag.go`, `go/kdb/dag/generations_test.go`
 
 ### Phase 2 — the graph file: writer, reader, and the two-tier DAG
 
@@ -317,32 +364,43 @@ strategy every tree is already an object and anchors are a no-op — this is a
 **Files:** `go/kdb/embed/tree_rebuild.go`,
 `go/kdb/storage/engine/tree_objects.go`, `go/kdb/embed/checkpoint.go`
 
-### Phase 6 — configuration and rebuild policy
+### Phase 6 — configuration and rebuild policy — **settings landed**
+
+Landed as one struct rather than four loose fields, because they turn on
+parts of one feature and one of them implies another:
 
 ```go
-// GraphFileEnabled maps the commit graph from disk instead of holding it in
-// the heap. Off leaves today's behaviour exactly as it is.
-GraphFileEnabled bool
-
-// GraphRebuildCommits is how many commits may accumulate in the resident
-// tail before the graph file is rebuilt in the background. This, not the
-// commit count, is what bounds resident graph memory.
-GraphRebuildCommits int
-
-// HistoryAnchorInterval is how many commits apart materialized trees are
-// written, bounding what a cold historical read has to fold. Zero disables
-// anchors. Ignored under the objects history strategy, where every tree is
-// already an object.
-HistoryAnchorInterval int
+opts.Storage.Graph = dag.GraphSettings{
+    AncestryPruning: true, // Phase 1
+    FileEnabled:     true, // Phase 2 - implies AncestryPruning
+    RebuildCommits:  0,    // 0 -> DefaultGraphRebuildCommits, when the file is on
+    AnchorInterval:  0,    // 0 -> no anchors
+}
 ```
 
-Env vars `KDB_GRAPH_FILE`, `KDB_GRAPH_REBUILD_COMMITS`,
-`KDB_HISTORY_ANCHOR_INTERVAL`, matching `KDB_DOCUMENT_CACHE_BYTES` and the
-rest. Note these are counts, not byte budgets, and that is deliberate: unlike
-document and tree caches, a graph record is fixed-width, so a count *is* a
-byte bound.
+Env vars `KDB_ANCESTRY_PRUNING`, `KDB_GRAPH_FILE`,
+`KDB_GRAPH_REBUILD_COMMITS`, `KDB_HISTORY_ANCHOR_INTERVAL`, read by
+`FileRuntimeOptionsFromEnv` alongside `KDB_DOCUMENT_CACHE_BYTES` and the
+rest, and off or zero for anything unset or unparseable - the same reading
+`envBytes` and `KDB_HISTORY_STRATEGY` already take, since none of them can
+report an error and "what it did before" is the only safe interpretation
+of a value nobody can parse.
 
-**Files:** `go/kdb/embed/storage_options.go`
+The counts are counts and not byte budgets on purpose: unlike the document
+and tree caches, a graph record is fixed width, so a count *is* a byte
+bound and expressing it as bytes would only hide the division.
+
+`GraphSettings.normalized()` is the one place implications are applied, so
+nothing downstream re-derives them and disagrees. `GraphFileActive()`
+reports whether a file is *in use*, as distinct from asked for - the
+difference a fallback test needs, and today always false.
+
+Settings are installed on the DAG *before* `restoreNamespace` runs, because
+generations are derived as commits are admitted and the restore is what
+admits them.
+
+**Files:** `go/kdb/dag/graph_settings.go`, `go/kdb/embed/storage_options.go`,
+`go/kdb/embed/file.go`, `go/kdb/embed/graph_settings_test.go`
 
 ## Testing
 

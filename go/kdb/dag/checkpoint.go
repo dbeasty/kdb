@@ -36,11 +36,12 @@ func (d *InMemoryCommitDag) CheckpointSnapshot() CheckpointState {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	state := CheckpointState{
-		Commits:  make([]CheckpointCommit, 0, len(d.commits)),
+		Commits:  make([]CheckpointCommit, 0, len(d.nodes)),
 		Branches: make([]document.Branch, 0, len(d.branches)),
 		Tags:     make([]document.Tag, 0, len(d.tags)),
 	}
-	for _, c := range d.commits {
+	for _, n := range d.nodes {
+		c := n.commit
 		count := len(c.Operations)
 		if count == 0 && d.opsEvictedFor(c.Hash) {
 			// Already evicted from memory, so len() understates it. The
@@ -124,10 +125,10 @@ func (d *InMemoryCommitDag) RestoreCommitOperations(commits []document.Commit) e
 			return NewConsistencyError(
 				"checkpointed operations do not reproduce their commit's hash", d.NamespaceID, &c.Hash)
 		}
-		if _, ok := d.commits[c.Hash]; !ok {
+		if !d.isResidentLocked(c.Hash) {
 			continue
 		}
-		d.commits[c.Hash] = c
+		d.replaceCommitLocked(c)
 		delete(d.opsEvicted, c.Hash)
 		d.trackOpsLocked(c)
 	}
@@ -160,7 +161,7 @@ func (d *InMemoryCommitDag) HydrateBranchHeads() error {
 
 	for _, h := range heads {
 		d.mu.RLock()
-		c, ok := d.commits[h]
+		c, ok := d.commitLocked(h)
 		d.mu.RUnlock()
 		if !ok {
 			continue
@@ -170,7 +171,7 @@ func (d *InMemoryCommitDag) HydrateBranchHeads() error {
 			return err
 		}
 		d.mu.Lock()
-		d.commits[h] = full
+		d.replaceCommitLocked(full)
 		delete(d.opsEvicted, h)
 		d.trackOpsLocked(full)
 		d.publishHeadLocked()

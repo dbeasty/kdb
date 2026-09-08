@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 	s3io "github.com/limidus/kdb/go/kdb/storage/io/s3"
@@ -99,6 +100,16 @@ type StorageOptions struct {
 	// full. Off by default.
 	DisableCheckpoints bool
 
+	// Graph selects how much of the on-disk commit graph work is active
+	// for this namespace - see docs/kdb-commit-graph-on-disk.md, and
+	// dag.GraphSettings for what each field turns on.
+	//
+	// The zero value is the behaviour that predates all of it, so leaving
+	// this alone changes nothing. Everything in here is off by default on
+	// purpose: it is history and recovery machinery, the database serves
+	// the latest dataset, and none of it may show up in a read benchmark.
+	Graph dag.GraphSettings
+
 	// SyncMode selects the physical sync primitive every flush uses. The zero
 	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous
 	// hardcoded behavior; storio.SyncModeFast trades power-loss protection for
@@ -146,5 +157,46 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	case "off", "false", "0":
 		opts.Storage.DisableCheckpoints = true
 	}
+	opts.Storage.Graph = graphSettingsFromEnv()
 	return opts
+}
+
+// graphSettingsFromEnv reads the commit-graph feature flags.
+//
+// Every one of them defaults off, so an unset or unparseable variable
+// leaves the behaviour that predates this work. Same reading as envBytes
+// and KDB_HISTORY_STRATEGY: this returns no error, and "what it did
+// before" is the only safe interpretation of a value nobody can parse.
+func graphSettingsFromEnv() dag.GraphSettings {
+	return dag.GraphSettings{
+		AncestryPruning: envBool("KDB_ANCESTRY_PRUNING"),
+		FileEnabled:     envBool("KDB_GRAPH_FILE"),
+		RebuildCommits:  envInt("KDB_GRAPH_REBUILD_COMMITS"),
+		AnchorInterval:  envInt("KDB_HISTORY_ANCHOR_INTERVAL"),
+	}
+}
+
+// envBool reads an on/off switch, defaulting to off. "on", "true", "yes"
+// and "1" enable; everything else, including an unparseable value, leaves
+// it off.
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "on", "true", "yes", "1":
+		return true
+	}
+	return false
+}
+
+// envInt reads a non-negative count, or zero when the variable is unset or
+// unparseable - zero meaning "use the default", exactly as in envBytes.
+func envInt(name string) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
