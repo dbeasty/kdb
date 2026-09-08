@@ -54,9 +54,33 @@ def inspect_bin() -> str:
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return free_ports(1)[0]
+
+
+def free_ports(count: int) -> list[int]:
+    """Reserves `count` distinct ephemeral ports.
+
+    Every socket is held open until all of them are bound, then they are all closed. Allocating
+    them one at a time - bind, read the port, close, repeat - lets the kernel hand the same port
+    out again on the next call, because closing returns it to the ephemeral pool immediately. Four
+    sequential calls were four chances to hand the same number to two listeners, which surfaced in
+    CI as `admin listen ...: bind: address already in use` and took the whole e2e job with it.
+
+    This narrows the race rather than closing it: there is still a window between the last close
+    and the service binding, in which anything on the machine could take the port. Nothing short of
+    passing pre-bound sockets to the child can remove that, and the service takes addresses on the
+    command line. `launch_with_retry` covers what remains.
+    """
+    socks = []
+    try:
+        for _ in range(count):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
 
 
 @dataclass
@@ -130,11 +154,32 @@ class KdbServer:
         self._bootstrapped = True
         return self._launch()
 
-    def _launch(self) -> "KdbServer":
-        self.sql_port = free_port()
-        self.peer_port = free_port()
-        self.stream_port = free_port()
-        self.admin_port = free_port()
+    def _launch(self, attempts: int = 4) -> "KdbServer":
+        """Starts the service, retrying a port collision.
+
+        A port this fixture reserved can still be taken between reserving it and the service
+        binding it - most often by a service from an earlier test that was killed with SIGKILL and
+        whose socket the kernel has not finished reclaiming. That is an artefact of how the test
+        harness allocates ports, not something the server did wrong, so it is retried with a fresh
+        set rather than failing the run. Any other early exit is a real failure and is raised.
+        """
+        last: RuntimeError | None = None
+        for attempt in range(attempts):
+            try:
+                return self._launch_once()
+            except RuntimeError as e:
+                if "address already in use" not in str(e):
+                    raise
+                last = e
+                # Give the kernel a moment to reclaim whatever is holding it before trying again.
+                time.sleep(0.2 * (attempt + 1))
+        raise RuntimeError(
+            f"kdb-service could not bind a free port in {attempts} attempts; "
+            f"last failure:\n{last}")
+
+    def _launch_once(self) -> "KdbServer":
+        # One allocation for all four, so the kernel cannot hand the same port to two of them.
+        self.sql_port, self.peer_port, self.stream_port, self.admin_port = free_ports(4)
         self.log_path = os.path.join(self.data_dir, "service.log")
         cmd = [
             service_bin(),

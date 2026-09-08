@@ -6,6 +6,16 @@ import (
 )
 
 // Adapter is the core storage interface for document and tree reads/writes.
+//
+// A note on the atCommit parameters below, because the name is a trap: they take a **document
+// tree hash**, not a commit hash. The implementation matches the value against the live tree
+// snapshot and the tree store, both keyed by tree hash (see engine.ServerEngine.treeAt), so a
+// commit hash passed here does not error - it simply resolves nothing, and the read returns "no
+// such document" for a document that is plainly there. Callers hold a commit and want
+// commit.DocumentTreeHash; KdbServerRuntime.getDocumentAt is the reference for how to do it.
+//
+// The name is kept because it is load-bearing across both language trees and every implementation
+// of this interface; this comment is the cheaper fix.
 type Adapter interface {
 	Capabilities() CapabilitySet
 

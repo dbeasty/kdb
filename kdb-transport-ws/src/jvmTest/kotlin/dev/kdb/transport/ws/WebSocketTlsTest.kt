@@ -66,8 +66,7 @@ class WebSocketTlsTest {
                     } catch (_: CancellationException) {
                     }
                 }
-            delay(300)
-            val port = transport.networkListenPort()
+            val port = awaitListenPort(transport)
             val client =
                 transport.connect(
                     "kdb-wss://localhost:$port/kdb",
@@ -106,8 +105,7 @@ class WebSocketTlsTest {
                     } catch (_: CancellationException) {
                     }
                 }
-            delay(300)
-            val port = transport.networkListenPort()
+            val port = awaitListenPort(transport)
             val client =
                 transport.connect(
                     "kdb-wss://localhost:$port/kdb",
@@ -154,8 +152,7 @@ class WebSocketTlsTest {
                     } catch (_: CancellationException) {
                     }
                 }
-            delay(300)
-            val port = transport.networkListenPort()
+            val port = awaitListenPort(transport)
             assertFailsWith<Exception> {
                 transport.connect(
                     "kdb-wss://localhost:$port/kdb",
@@ -212,8 +209,7 @@ class WebSocketTlsTest {
                     } catch (_: CancellationException) {
                     }
                 }
-            delay(300)
-            val port = transport.networkListenPort()
+            val port = awaitListenPort(transport)
             val failure =
                 runCatching {
                     transport.connect("kdb-ws://localhost:$port/kdb")
@@ -221,4 +217,55 @@ class WebSocketTlsTest {
             assertTrue(failure.isFailure)
             listenJob.cancel()
         }
+
+    /**
+     * Waits for the listener to be bound and accepting, and returns its port.
+     *
+     * This replaces a fixed `delay(300)`. Three hundred milliseconds is enough on an idle
+     * developer machine and is not enough on a loaded CI runner, where the TLS listener can still
+     * be coming up when the client dials - which surfaced as an intermittent
+     * `java.net.ConnectException` from the connect below, on a test that had nothing to do with
+     * whatever change was being built.
+     *
+     * Polling for readiness rather than sleeping for it also makes the common case faster: the
+     * listener is usually up within a few milliseconds, and the old delay paid the full 300 every
+     * time.
+     *
+     * [JvmWebSocketWireTransport.networkListenPort] throws until the server object exists, and the
+     * socket can accept a moment after that, so both are waited on: first the port, then a probe
+     * connection that proves something is listening on it.
+     */
+    private suspend fun awaitListenPort(
+        transport: JvmWebSocketWireTransport,
+        timeoutMillis: Long = 10_000,
+    ): Int {
+        val deadline = System.nanoTime() + timeoutMillis * 1_000_000
+        var lastFailure: Throwable? = null
+        while (System.nanoTime() < deadline) {
+            val port =
+                try {
+                    transport.networkListenPort()
+                } catch (t: IllegalStateException) {
+                    lastFailure = t
+                    delay(5)
+                    continue
+                }
+            if (port > 0 && portAccepts(port)) return port
+            delay(5)
+        }
+        throw AssertionError(
+            "WebSocket listener was not accepting within ${timeoutMillis}ms", lastFailure)
+    }
+
+    /** Probes the port with a plain TCP connect - enough to know the accept loop is running. */
+    private fun portAccepts(port: Int): Boolean =
+        try {
+            java.net.Socket().use { probe ->
+                probe.connect(java.net.InetSocketAddress("localhost", port), 200)
+                true
+            }
+        } catch (_: java.io.IOException) {
+            false
+        }
+
 }

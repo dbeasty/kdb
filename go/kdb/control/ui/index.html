@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KDB Control</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --panel: #fff; --border: #e3e1dd; --text: #1f1e1c; --muted: #6b6862;
+    --accent: #3f6ad8; --added: #2f8a4f; --modified: #b07d1a; --removed: #c0392b;
+    --chip: #f0eeea; --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a; --panel: #1e2023; --border: #32353a; --text: #e6e4e0; --muted: #9a978f;
+      --accent: #7fa0ef; --added: #5cbd7d; --modified: #d8ab4c; --removed: #e0705f;
+      --chip: #2a2d31;
+    }
+  }
+  * { box-sizing: border-box; }
+  /* A display rule on a selector beats the hidden attribute's UA default, so nav and button
+     elements would stay visible while "hidden". Restate it once, decisively. */
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+  header .sp { flex: 1; }
+  .ns { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .head-hash { font-family: var(--mono); font-size: 12px; }
+  .live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--added); }
+  .dot.err { background: var(--removed); }
+  nav { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  nav button {
+    background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted);
+    padding: 9px 12px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  nav button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+  main { padding: 16px; max-width: 1100px; }
+  .row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .col { flex: 1 1 380px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .card h2 { margin: 0; padding: 10px 12px; font-size: 12px; font-weight: 600;
+             text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+             border-bottom: 1px solid var(--border); }
+  .card .body { padding: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  tr.sel td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  tbody tr.pick { cursor: pointer; }
+  tbody tr.pick:hover td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  code, .mono { font-family: var(--mono); font-size: 12px; }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--chip);
+          font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .chip.ref { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--text); }
+  .chip.added { color: var(--added); } .chip.modified { color: var(--modified); } .chip.removed { color: var(--removed); }
+  .warn { border-left: 3px solid var(--modified); background: color-mix(in srgb, var(--modified) 10%, transparent);
+          padding: 8px 10px; border-radius: 4px; margin: 6px 0; font-size: 12px; }
+  .err { border-left: 3px solid var(--removed); background: color-mix(in srgb, var(--removed) 10%, transparent);
+         padding: 8px 10px; border-radius: 4px; margin: 8px 0; font-size: 13px; }
+  .muted { color: var(--muted); }
+  .empty { padding: 20px 12px; color: var(--muted); font-size: 13px; text-align: center; }
+  input, button.act {
+    font: inherit; padding: 6px 9px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text);
+  }
+  button.act { cursor: pointer; background: var(--panel); }
+  button.act:hover { border-color: var(--accent); }
+  .gate { max-width: 460px; margin: 60px auto; }
+  .gate p { color: var(--muted); font-size: 13px; }
+  .lane { font-family: var(--mono); color: var(--muted); white-space: pre; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; overflow-wrap: anywhere; }
+  /* Time travel is a mode, not a filter: it has to be impossible to miss that what is on screen
+     is not current. Hence a full-width bar rather than a subtle badge. */
+  .timebar { display: flex; align-items: center; gap: 10px; padding: 8px 16px; font-size: 13px;
+             background: color-mix(in srgb, var(--modified) 22%, var(--panel));
+             border-bottom: 1px solid var(--border); }
+  .timebar strong { font-family: var(--mono); }
+  .danger { border-color: var(--removed); color: var(--removed); }
+  dialog { border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+           color: var(--text); max-width: 560px; width: 92%; padding: 0; }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog h3 { margin: 0; padding: 12px 14px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  dialog .body { padding: 14px; }
+  dialog footer { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 14px;
+                  border-top: 1px solid var(--border); }
+  .scroll { max-height: 220px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KDB Control</h1>
+  <span class="ns" id="ns"></span>
+  <span class="head-hash muted" id="head"></span>
+  <span class="sp"></span>
+  <span class="live"><span class="dot" id="livedot"></span><span id="livetext">offline</span></span>
+  <button class="act" id="signout" hidden>Sign out</button>
+</header>
+<nav id="tabs" hidden>
+  <button data-tab="commits" aria-selected="true">Commits</button>
+  <button data-tab="refs" aria-selected="false">Refs</button>
+  <button data-tab="schema" aria-selected="false">Schema</button>
+  <button data-tab="settings" aria-selected="false">Settings</button>
+  <button data-tab="ops" aria-selected="false">Ops</button>
+</nav>
+<div class="timebar" id="timebar" hidden>
+  <span>Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
+  <span class="sp" style="flex:1"></span>
+  <button class="act" id="exitat">Return to HEAD</button>
+</div>
+<main id="main"></main>
+<dialog id="revertdlg"><h3>Revert</h3><div class="body" id="revertbody"></div>
+  <footer><button class="act" id="revertcancel">Cancel</button>
+  <button class="act danger" id="revertgo">Revert</button></footer></dialog>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return n;
+};
+
+// The control plane authenticates every request, so the page needs a credential before it can
+// show anything. It is held in sessionStorage - gone when the tab closes - and never written to
+// the URL, where it would end up in history and logs.
+const TOKEN_KEY = "kdb.control.token";
+let token = sessionStorage.getItem(TOKEN_KEY) || "";
+// `at` is the revision every view reads at: null means head. It is a mode rather than a per-view
+// filter, so it lives here and every fetch consults it.
+let state = { ns: null, tab: "commits", commits: [], selected: null, hasMore: false, es: null,
+              at: null, canWrite: false };
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), Authorization: "Bearer " + token },
+  });
+  if (res.status === 401) { signOut("Those credentials were rejected."); throw new Error("unauthenticated"); }
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { /* non-JSON error page */ }
+  if (!res.ok) {
+    const msg = body && body.error ? body.error.message : (text || res.statusText);
+    const err = new Error(msg); err.code = body && body.error ? body.error.code : String(res.status);
+    throw err;
+  }
+  return body;
+}
+
+function signOut(why) {
+  token = ""; sessionStorage.removeItem(TOKEN_KEY);
+  if (state.es) { state.es.close(); state.es = null; }
+  renderGate(why);
+}
+
+function renderGate(message) {
+  $("tabs").hidden = true; $("signout").hidden = true;
+  $("ns").textContent = ""; $("head").textContent = "";
+  setLive(false, "offline");
+  const input = el("input", { type: "password", id: "tok", placeholder: "user:password or token",
+                              style: "width:100%;margin:8px 0", autocomplete: "current-password" });
+  const submit = () => {
+    const v = input.value.trim();
+    if (!v) return;
+    token = v; sessionStorage.setItem(TOKEN_KEY, v); boot();
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  setMain(el("div", { class: "gate" },
+    el("div", { class: "card" },
+      el("h2", { text: "Sign in" }),
+      el("div", { class: "body" },
+        message ? el("div", { class: "err", text: message }) : null,
+        el("p", { text: "This control plane authenticates every request. Credentials are held for this tab only." }),
+        input,
+        el("button", { class: "act", onclick: submit, text: "Connect" })))));
+  input.focus();
+}
+
+// setMain replaces the page body, dropping absent children. Node.replaceChildren stringifies a
+// null into the literal text "null" - el() already filters, and this is its counterpart for the
+// one place children are passed straight to the DOM.
+function setMain(...children) {
+  $("main").replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+}
+
+// enterAt / exitAt switch the whole app between head and a past revision. Everything re-renders,
+// because a screen showing a mix of current and historical data would be worse than either.
+function enterAt(spec, label) {
+  state.at = spec;
+  $("timebar").hidden = false;
+  $("atref").textContent = label || spec;
+  selectTab(state.tab);
+}
+
+function exitAt() {
+  state.at = null;
+  $("timebar").hidden = true;
+  selectTab(state.tab);
+}
+
+// atQuery appends the viewing revision to a URL that supports it.
+function atQuery(sep) {
+  return state.at ? sep + "at=" + encodeURIComponent(state.at) : "";
+}
+
+function setLive(on, text, bad) {
+  const dot = $("livedot");
+  dot.className = "dot" + (bad ? " err" : on ? " on" : "");
+  $("livetext").textContent = text;
+}
+
+function connectEvents() {
+  if (state.es) state.es.close();
+  // EventSource cannot set an Authorization header, so the SSE stream is not reachable from this
+  // page today. Rather than fake a live indicator, say plainly that updates are manual - a status
+  // light that lies is worse than one that admits it is off.
+  setLive(false, "manual refresh");
+}
+
+async function boot() {
+  try {
+    const [health, namespaces] = await Promise.all([api("/v1/health"), api("/v1/namespaces")]);
+    state.ns = (namespaces.namespaces[0] || {}).id || health.namespace;
+    state.canWrite = health.controlWritesEnabled === true;
+    $("ns").textContent = state.ns;
+    $("tabs").hidden = false; $("signout").hidden = false;
+    connectEvents();
+    await selectTab(state.tab);
+  } catch (e) {
+    if (e.message !== "unauthenticated") renderGate("Could not reach the control plane: " + e.message);
+  }
+}
+
+async function selectTab(tab) {
+  state.tab = tab;
+  for (const b of $("tabs").children) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  setMain(el("div", { class: "empty", text: "Loading…" }));
+  try {
+    if (tab === "commits") await renderCommits();
+    else if (tab === "refs") await renderRefs();
+    else if (tab === "schema") await renderSchema();
+    else if (tab === "settings") await renderSettings();
+    else if (tab === "ops") await renderOps();
+  } catch (e) {
+    setMain(el("div", { class: "err", text: e.message }));
+  }
+}
+
+const nsPath = (suffix) => "/v1/ns/" + encodeURIComponent(state.ns) + suffix;
+
+async function renderCommits(append = false) {
+  const skip = append ? state.commits.length : 0;
+  const from = state.at ? "&from=" + encodeURIComponent(state.at) : "";
+  const page = await api(nsPath("/log?limit=50&skip=" + skip + from));
+  state.commits = append ? state.commits.concat(page.commits) : page.commits;
+  state.hasMore = page.hasMore;
+  $("head").textContent = page.from ? page.from.slice(0, 8) : "";
+  drawCommits();
+}
+
+function drawCommits() {
+  const rows = state.commits.map((c) => {
+    const tr = el("tr", { class: "pick" + (state.selected && state.selected.hash === c.hash ? " sel" : "") },
+      el("td", {}, el("code", { text: c.shortHash }),
+        // A merge is the one structural fact a flat list loses, so it is called out explicitly.
+        c.parents && c.parents.length > 1 ? el("span", { class: "chip", text: "merge" }) : null,
+        c.stub ? el("span", { class: "chip", text: "archived" }) : null),
+      el("td", {}, c.message || el("span", { class: "muted", text: "(no message)" }),
+        ...(c.refs || []).map((r) => el("span", { class: "chip ref", text: r }))),
+      el("td", { class: "muted" }, formatTime(c.timestamp)),
+      // -1 means the operations were evicted under the retention budget and the count is not
+      // knowable without loading them. Showing "0" there would read as "this commit wrote nothing".
+      el("td", { class: "muted", title: c.opCount < 0 ? "operations not retained" : "" },
+        c.opCount < 0 ? "—" : String(c.opCount)));
+    tr.addEventListener("click", () => showCommit(c.hash));
+    return tr;
+  });
+  const list = el("div", { class: "card" },
+    el("h2", { text: "Commits" }),
+    rows.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Commit" }), el("th", { text: "Message" }),
+                              el("th", { text: "When" }), el("th", { text: "Ops" }))),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty", text: "No commits yet." }),
+    state.hasMore
+      ? el("div", { class: "body" },
+          el("button", { class: "act", text: "Load more", onclick: () => renderCommits(true) }))
+      : null);
+
+  const detail = el("div", { class: "card", id: "detail" },
+    el("h2", { text: "Commit detail" }),
+    el("div", { class: "empty", text: "Select a commit." }));
+
+  setMain(el("div", { class: "row" },
+    el("div", { class: "col", style: "flex:2 1 520px" }, list),
+    el("div", { class: "col" }, detail)));
+
+  if (state.selected) drawDetail(state.selected);
+}
+
+async function showCommit(hash) {
+  const detail = $("detail");
+  detail.replaceChildren(el("h2", { text: "Commit detail" }), el("div", { class: "empty", text: "Loading…" }));
+  try {
+    const [c, d] = await Promise.all([
+      api(nsPath("/commits/" + hash)),
+      api(nsPath("/commits/" + hash + "/diff")).catch((e) => ({ unavailable: e.message })),
+    ]);
+    state.selected = { hash, commit: c, diff: d };
+    drawCommits();
+  } catch (e) {
+    detail.replaceChildren(el("h2", { text: "Commit detail" }), el("div", { class: "err", text: e.message }));
+  }
+}
+
+function drawDetail(sel) {
+  const c = sel.commit, d = sel.diff;
+  const kv = el("dl", { class: "kv" },
+    el("dt", { text: "Hash" }), el("dd", {}, el("code", { text: c.commit.hash })),
+    el("dt", { text: "Parents" }),
+    el("dd", {}, c.commit.parents.length
+      ? c.commit.parents.map((p) => el("code", { text: p.slice(0, 8) + " " }))
+      : el("span", { class: "muted", text: "none (root commit)" })),
+    el("dt", { text: "When" }), el("dd", { text: formatTime(c.commit.timestamp) }),
+    el("dt", { text: "Author node" }), el("dd", {}, el("code", { text: c.commit.author })),
+    el("dt", { text: "Tree" }), el("dd", {}, el("code", { text: c.commit.treeHash.slice(0, 16) })));
+
+  const opsSection = c.operationsAvailable === false ? el("div", { class: "warn", text: c.operationsNote }) : c.operationsAvailable
+    ? (c.operations.length
+        ? el("table", {},
+            el("thead", {}, el("tr", {}, el("th", { text: "Kind" }), el("th", { text: "Document" }), el("th", { text: "Bytes" }))),
+            el("tbody", {}, c.operations.map((o) => el("tr", {},
+              el("td", {}, el("span", { class: "chip", text: o.kind })),
+              el("td", {}, el("code", { text: o.docId || o.path || "" })),
+              el("td", { class: "muted" }, o.bytes ? String(o.bytes) : "")))))
+        : el("div", { class: "empty", text: "This commit wrote no operations." }))
+    : el("div", { class: "warn", text: c.operationsNote });
+
+  let diffSection;
+  if (d && d.unavailable) {
+    diffSection = el("div", { class: "warn", text: d.unavailable });
+  } else if (d && d.entries && d.entries.length) {
+    diffSection = el("div", {},
+      el("div", { class: "body" },
+        el("span", { class: "chip added", text: "+" + d.counts.added }), " ",
+        el("span", { class: "chip modified", text: "~" + d.counts.modified }), " ",
+        el("span", { class: "chip removed", text: "−" + d.counts.removed })),
+      el("table", {},
+        el("thead", {}, el("tr", {}, el("th", { text: "Change" }), el("th", { text: "Document" }))),
+        el("tbody", {}, d.entries.map((e) => el("tr", {},
+          el("td", {}, el("span", { class: "chip " + e.change, text: e.change })),
+          el("td", {}, el("code", { text: e.docId })))))));
+  } else {
+    diffSection = el("div", { class: "empty", text: "No document changes against the first parent." });
+  }
+
+  const actions = el("div", { class: "body", style: "display:flex;gap:8px;flex-wrap:wrap" },
+    el("button", { class: "act", text: "View at this commit",
+                   onclick: () => enterAt(c.commit.hash, c.commit.shortHash) }),
+    // Revert is offered whatever the write setting: planning is a read, and the dialog reports the
+    // refusal if applying is not allowed. Hiding it would leave an operator unable to find out
+    // what a revert would even do.
+    el("button", { class: "act danger", text: "Revert to this commit",
+                   title: state.canWrite ? "" : "This control plane is read-only; you can preview the revert but not apply it",
+                   onclick: () => openRevert(c.commit.hash, c.commit.shortHash) }));
+
+  $("detail").replaceChildren(
+    el("h2", { text: "Commit " + c.commit.shortHash }),
+    el("div", { class: "body" }, el("strong", { text: c.commit.message || "(no message)" }), kv),
+    actions,
+    el("h2", { text: "Operations" }), opsSection,
+    el("h2", { text: "Changed documents" }), diffSection);
+}
+
+async function renderRefs() {
+  const r = await api(nsPath("/refs"));
+  $("head").textContent = r.head ? r.head.slice(0, 8) : "";
+  setMain(el("div", { class: "row" },
+    el("div", { class: "col" }, el("div", { class: "card" },
+      el("h2", { text: "Branches" }),
+      r.branches.length
+        ? el("table", {},
+            el("thead", {}, el("tr", {}, el("th", { text: "Branch" }), el("th", { text: "Head" }), el("th", { text: "Updated" }))),
+            el("tbody", {}, r.branches.map((b) => el("tr", {},
+              el("td", {}, b.name, b.head === r.head ? el("span", { class: "chip ref", text: "HEAD" }) : null),
+              el("td", {}, el("code", { text: b.shortHead })),
+              el("td", { class: "muted" }, formatTime(b.updatedAt))))))
+        : el("div", { class: "empty", text: "No branches." }))),
+    el("div", { class: "col" }, el("div", { class: "card" },
+      el("h2", { text: "Tags" }),
+      r.tags.length
+        ? el("table", {},
+            el("thead", {}, el("tr", {}, el("th", { text: "Tag" }), el("th", { text: "Commit" }),
+                                el("th", { text: "Created" }))),
+            el("tbody", {}, r.tags.map((t) => el("tr", { class: "pick",
+                onclick: () => enterAt("tag:" + t.name, "tag:" + t.name) },
+              el("td", {}, t.name,
+                t.message ? el("div", { class: "muted", style: "font-size:12px", text: t.message }) : null),
+              el("td", {}, el("code", { text: t.shortHead })),
+              el("td", { class: "muted" }, formatTime(t.updatedAt))))))
+        : el("div", { class: "empty", text: "No tags." })))));
+}
+
+async function renderSchema() {
+  const s = await api(nsPath("/schema"));
+  setMain(el("div", { class: "card" },
+    el("h2", { text: "Schema — the typed lens over documents" }),
+    s.fields.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Field" }), el("th", { text: "Type" }),
+                              el("th", { text: "Required" }), el("th", { text: "Indexed" }), el("th", { text: "Unique" }))),
+          el("tbody", {}, s.fields.map((f) => el("tr", {},
+            el("td", {}, el("code", { text: f.name })),
+            el("td", {}, el("span", { class: "chip", text: f.type })),
+            el("td", { class: "muted" }, f.required ? "yes" : "—"),
+            el("td", { class: "muted" }, f.indexed ? "yes" : "—"),
+            el("td", { class: "muted" }, f.unique ? "yes" : "—")))))
+      : el("div", { class: "empty" },
+          "No schema declared. The document is always the truth; a schema is optional.")));
+}
+
+const SOURCE_HELP = {
+  flag: "set explicitly on the command line",
+  env: "set in the environment",
+  file: "set in the config file",
+  default: "built-in default",
+  auto: "detected by the process at startup",
+  runtime: "changed since startup through the control plane",
+};
+
+async function renderSettings() {
+  const s = await api("/v1/settings");
+  const groups = new Map();
+  for (const d of s.settings) {
+    const g = d.key.split(".")[0];
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(d);
+  }
+  const warnings = s.settings.flatMap((d) => (d.warnings || []).map((w) => ({ key: d.key, w })));
+  const cards = [...groups.entries()].map(([name, items]) => el("div", { class: "card" },
+    el("h2", { text: name }),
+    el("table", {},
+      el("thead", {}, el("tr", {}, el("th", { text: "Setting" }), el("th", { text: "Value" }),
+                          el("th", { text: "Source" }), el("th", { text: "Changeable" }))),
+      el("tbody", {}, items.map((d) => el("tr", {},
+        el("td", {}, el("code", { text: d.key }),
+          d.help ? el("div", { class: "muted", style: "font-size:12px", text: d.help }) : null),
+        el("td", {}, el("code", { text: formatValue(d.value) }), d.unit ? " " + d.unit : "",
+          (d.warnings || []).map((w) => el("div", { class: "warn", text: w }))),
+        el("td", {}, el("span", { class: "chip", title: SOURCE_HELP[d.source] || "", text: d.source }),
+          el("div", { class: "muted", style: "font-size:11px", text: d.sourceDetail || "" })),
+        el("td", {}, el("span", { class: "chip", text: mutabilityLabel(d.mutability) }))))))));
+
+  setMain(
+    warnings.length
+      ? el("div", { class: "card" }, el("h2", { text: "Ignored configuration" }),
+          el("div", { class: "body" },
+            el("p", { class: "muted", style: "margin-top:0",
+                      text: "The engine reads these variables leniently: a value it cannot parse is discarded and the default used, with no error and no log line. They are listed here because that is otherwise invisible." }),
+            warnings.map((x) => el("div", { class: "warn", text: x.w }))))
+      : null,
+    !s.mutable ? el("div", { class: "body muted", style: "padding:0 0 8px", text: s.note }) : null,
+    el("div", {}, cards));
+}
+
+function mutabilityLabel(m) {
+  return {
+    "live": "live",
+    "live-new-connections": "new connections",
+    "namespace-reopen": "needs reopen",
+    "restart": "needs restart",
+    "immutable": "migration only",
+  }[m] || m;
+}
+
+async function renderOps() {
+  const [health, ops, status] = await Promise.all([
+    api("/v1/health"), api("/v1/ops/runtime"), api(nsPath("/status")),
+  ]);
+  const kv = (obj) => el("dl", { class: "kv" },
+    ...Object.entries(obj).flatMap(([k, v]) => [el("dt", { text: k }), el("dd", {}, el("code", { text: formatValue(v) }))]));
+  setMain(el("div", { class: "row" },
+    el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Process" }),
+      el("div", { class: "body" }, kv({
+        version: health.version, namespace: health.namespace, uptimeSeconds: health.uptimeSeconds,
+        draining: health.draining, readOnly: health.readOnly, memoryZone: health.memoryZone,
+        controlWritesEnabled: health.controlWritesEnabled,
+      })))),
+    el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Admission & namespace" }),
+      el("div", { class: "body" }, kv({
+        admissionEnabled: ops.admission.enabled,
+        rescueReserveBytes: ops.admission.rescueReserveBytes ?? "—",
+        documentExpiry: ops.expiry, branches: status.branches, head: (status.head || "").slice(0, 12),
+      }),
+      ops.admission.note ? el("div", { class: "warn", text: ops.admission.note }) : null)))));
+}
+
+// Revert is deliberately three steps: preview, read what will change, then confirm by typing the
+// namespace. The preview is a server-computed plan and the apply is checked against the head that
+// plan was made from, so what is applied is what was shown.
+async function openRevert(spec, label) {
+  const dlg = $("revertdlg");
+  const body = $("revertbody");
+  body.replaceChildren(el("div", { class: "empty", text: "Planning…" }));
+  $("revertgo").disabled = true;
+  dlg.showModal();
+
+  let plan;
+  try {
+    plan = await api(nsPath("/revert/plan"), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: spec }),
+    });
+  } catch (e) {
+    body.replaceChildren(el("div", { class: "err", text: e.message }));
+    return;
+  }
+
+  if (plan.noop) {
+    body.replaceChildren(el("div", { class: "empty",
+      text: "The database is already in that state. Nothing would change." }));
+    return;
+  }
+
+  const confirmField = el("input", { type: "text", placeholder: state.ns,
+                                     style: "width:100%;margin-top:6px" });
+  const arm = () => { $("revertgo").disabled = confirmField.value.trim() !== state.ns; };
+  confirmField.addEventListener("input", arm);
+
+  body.replaceChildren(
+    el("p", { style: "margin-top:0" },
+      "Restore the state at ", el("code", { text: label || spec }), ". This writes a ",
+      el("strong", { text: "new commit" }),
+      " — history is not rewritten, and this revert can itself be reverted."),
+    el("div", {},
+      el("span", { class: "chip modified", text: plan.willRestore + " restored" }), " ",
+      el("span", { class: "chip removed", text: plan.willRemove + " removed" })),
+    el("div", { class: "scroll", style: "margin:10px 0" },
+      el("table", {}, el("tbody", {}, plan.entries.map((e) => el("tr", {},
+        el("td", {}, el("span", { class: "chip " + e.change, text: revertVerb(e.change) })),
+        el("td", {}, el("code", { text: e.docId }))))))),
+    el("p", { class: "muted", style: "margin-bottom:4px" },
+      "Type the namespace to confirm:"),
+    confirmField);
+  arm();
+
+  $("revertgo").onclick = async () => {
+    $("revertgo").disabled = true;
+    try {
+      const done = await api(nsPath("/revert/apply"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: spec, expectHead: plan.expectHead }),
+      });
+      dlg.close();
+      state.selected = null;
+      exitAt();
+      await selectTab("commits");
+      flash("Reverted in commit " + done.commit.slice(0, 8) +
+            " — " + done.restored + " restored, " + done.removed + " removed.");
+    } catch (e) {
+      body.replaceChildren(el("div", { class: "err", text: e.message }));
+    }
+  };
+}
+
+// The diff is expressed head -> target, so an entry "added" there is one the revert restores.
+function revertVerb(change) {
+  return { added: "restore", modified: "restore", removed: "remove" }[change] || change;
+}
+
+function flash(message) {
+  const note = el("div", { class: "card", style: "margin-bottom:12px" },
+    el("div", { class: "body", text: message }));
+  $("main").prepend(note);
+}
+
+function formatValue(v) {
+  if (v === null || v === undefined) return "—";
+  if (v === "") return "(empty)";
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return String(v);
+}
+
+function formatTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString();
+}
+
+$("tabs").addEventListener("click", (e) => {
+  const tab = e.target.dataset && e.target.dataset.tab;
+  if (tab) selectTab(tab);
+});
+$("signout").addEventListener("click", () => signOut());
+$("exitat").addEventListener("click", exitAt);
+$("revertcancel").addEventListener("click", () => $("revertdlg").close());
+
+if (token) boot(); else renderGate();
+</script>
+</body>
+</html>
