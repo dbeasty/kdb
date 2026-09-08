@@ -57,14 +57,17 @@ func (g *GroupCommitter) runRounds(doSync func() error) {
 		g.mu.Lock()
 		batch := g.waiters
 		g.waiters = nil
-		g.mu.Unlock()
-
 		if len(batch) == 0 {
-			g.mu.Lock()
+			// Clearing inFlight has to happen under the *same* lock hold that
+			// found the batch empty. Releasing in between leaves a window where
+			// a SyncTo caller appends a waiter, sees inFlight still true so
+			// declines to start a round, and is then abandoned when this
+			// goroutine returns - blocking that caller forever.
 			g.inFlight = false
 			g.mu.Unlock()
 			return
 		}
+		g.mu.Unlock()
 
 		err := doSync()
 

@@ -95,6 +95,45 @@ type testSyncError struct{}
 
 func (e *testSyncError) Error() string { return "boom" }
 
+// TestGroupCommitter_SequentialWaiterIsNeverAbandoned covers the window
+// between runRounds taking an empty batch and clearing inFlight. A waiter
+// that registers inside it sees inFlight still true, so it declines to
+// start a round of its own - and then runRounds returns, leaving nobody to
+// serve it. The waiter blocks on its channel forever.
+//
+// It needs a *sequential* writer and a fast doSync to reproduce: the other
+// tests here keep several waiters in flight behind a sleeping doSync, which
+// keeps batches non-empty and hides the window entirely.
+func TestGroupCommitter_SequentialWaiterIsNeverAbandoned(t *testing.T) {
+	g := NewGroupCommitter()
+	doSync := func() error { return nil }
+
+	failed := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for seq := int64(1); seq <= 200000; seq++ {
+			if err := g.SyncTo(seq, doSync); err != nil {
+				failed <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+		select {
+		case err := <-failed:
+			t.Fatalf("SyncTo returned an error: %v", err)
+		default:
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("SyncTo blocked forever: a waiter registered after runRounds " +
+			"snapshotted its final empty batch but before it cleared inFlight, " +
+			"so no goroutine was left to deliver its result")
+	}
+}
+
 // TestGroupCommitter_LateJoinerNotFalselyCovered stresses the exact race the
 // implementation exists to avoid: a waiter that registers concurrently with
 // an in-flight round must not be told "synced" by that round's result
