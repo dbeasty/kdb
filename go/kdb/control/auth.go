@@ -21,22 +21,43 @@ const AdminScope = "control"
 // empty resource, which no grant can match - so a new action type would deny every RBAC
 // deployment. Reading a namespace over HTTP is the same authorization question as reading it over
 // the wire, and it should have the same answer.
-func (s *Server) nsRead(h func(http.ResponseWriter, *http.Request, auth.Principal, string)) http.Handler {
+func (s *Server) nsRead(h nsHandler) http.Handler {
+	return s.nsScoped(h, true)
+}
+
+// nsScoped is the shared body of nsRead and nsWrite: authenticate, resolve the namespace in the
+// path to the runtime serving it, authorize against that namespace, and hand the handler both.
+//
+// Resolving before authorizing is deliberate. A namespace this server does not serve is a 404, and
+// answering 403 for it would leak which namespaces exist to someone with no grant on any of them.
+func (s *Server) nsScoped(h nsHandler, readOnly bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := s.authenticate(w, r)
 		if !ok {
 			return
 		}
-		ns := r.PathValue("ns")
-		if ns == "" {
-			// The namespace-less routes (the namespace list) still authorize against the one
-			// namespace this runtime serves - there is nothing else it could disclose.
-			ns = s.opts.Namespace
-		}
-		if !s.authorize(w, r, principal, auth.SqlExecAction{Namespace: ns, ReadOnly: true}) {
+		if !readOnly && !s.opts.AllowWrites {
+			writeError(w, http.StatusForbidden, "read_only",
+				"this control plane is read-only; start the service with --control-write to enable "+
+					"mutating endpoints")
 			return
 		}
-		h(w, r, principal, ns)
+		ns := r.PathValue("ns")
+		if ns == "" {
+			// The namespace-less routes still authorize against something; the default is the one
+			// a single-namespace deployment serves.
+			ns = s.defaultNamespace()
+		}
+		rt, found := s.namespaces().Runtime(ns)
+		if !found {
+			writeError(w, http.StatusNotFound, "unknown_namespace",
+				"this control plane does not serve a namespace called "+ns)
+			return
+		}
+		if !s.authorizeWith(w, r, rt, principal, auth.SqlExecAction{Namespace: ns, ReadOnly: readOnly}) {
+			return
+		}
+		h(w, r, principal, ns, rt)
 	})
 }
 
@@ -54,8 +75,11 @@ func (s *Server) adminRead(h func(http.ResponseWriter, *http.Request, auth.Princ
 	})
 }
 
+// nsHandler is a handler for a request about one namespace, given the runtime serving it.
+type nsHandler func(http.ResponseWriter, *http.Request, auth.Principal, string, *serverRuntime)
+
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
-	engine := s.opts.Runtime.AuthEngine
+	engine := s.authEngine()
 	if engine == nil {
 		// A runtime with no engine configured is auth.AllowAll's situation by another name. Fail
 		// closed rather than guessing: a control plane that authenticates nobody is exactly the
@@ -81,7 +105,21 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (auth.Prin
 }
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, principal auth.Principal, action auth.Action) bool {
-	if err := s.opts.Runtime.AuthEngine.Authorizer().Authorize(r.Context(), principal, action); err != nil {
+	if err := s.authEngine().Authorizer().Authorize(r.Context(), principal, action); err != nil {
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		return false
+	}
+	return true
+}
+
+// authorizeWith authorizes against the runtime that will serve the request, so a per-namespace auth
+// engine is honoured rather than the first one that happened to be registered.
+func (s *Server) authorizeWith(w http.ResponseWriter, r *http.Request, rt *serverRuntime, principal auth.Principal, action auth.Action) bool {
+	engine := rt.AuthEngine
+	if engine == nil {
+		engine = s.authEngine()
+	}
+	if err := engine.Authorizer().Authorize(r.Context(), principal, action); err != nil {
 		writeError(w, http.StatusForbidden, "forbidden", err.Error())
 		return false
 	}
@@ -132,31 +170,11 @@ func credentialsFrom(r *http.Request) (auth.Credentials, error) {
 	}
 }
 
-// nsWrite wraps a handler that changes one namespace: authenticate, check this deployment allows
-// writes at all, then authorize as a write of that namespace.
+// nsWrite wraps a handler that changes one namespace.
 //
-// The order matters. A deployment-level refusal is not an authorization failure, and telling a
-// properly-authorized operator "forbidden" when the real answer is "this server was started
-// read-only" sends them to look at grants that are perfectly fine.
-func (s *Server) nsWrite(h func(http.ResponseWriter, *http.Request, auth.Principal, string)) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		principal, ok := s.authenticate(w, r)
-		if !ok {
-			return
-		}
-		if !s.opts.AllowWrites {
-			writeError(w, http.StatusForbidden, "read_only",
-				"this control plane is read-only; start the service with --control-write to enable "+
-					"mutating endpoints")
-			return
-		}
-		ns := r.PathValue("ns")
-		if ns == "" {
-			ns = s.opts.Namespace
-		}
-		if !s.authorize(w, r, principal, auth.SqlExecAction{Namespace: ns, ReadOnly: false}) {
-			return
-		}
-		h(w, r, principal, ns)
-	})
+// The order inside nsScoped matters for this one: a deployment-level refusal is checked before
+// authorization, because telling a properly-authorized operator "forbidden" when the real answer is
+// "this server was started read-only" sends them to look at grants that are perfectly fine.
+func (s *Server) nsWrite(h nsHandler) http.Handler {
+	return s.nsScoped(h, false)
 }

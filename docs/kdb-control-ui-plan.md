@@ -9,19 +9,19 @@ was checked in the tree at that commit.
 
 ## Status
 
-Last audited against `c16d8ab` (PR #40 merged). **The control UI is not finished.** Roughly a third
-of the specified API exists: the git-viewer read path, the settings view, and revert. The
-SQL-client half and all of recovery are untouched.
+Last audited against `feat/control-ui-data-browser`. **The control UI is not finished**, but it is
+now a database tool rather than only a history viewer: browse documents, run SELECTs, read at any
+revision, and revert. Writes, live settings and all of recovery are still missing.
 
-Counting endpoints from §5: **14 implemented**, 4 declared and answering 501, ~30 not started.
+Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~28 not started.
 
 ### Milestones (§11)
 
 | | Milestone | State |
 |---|---|---|
-| M0 | Foundations | **partial** — control plane, auth, SSE hub and embedded UI are in; the multi-namespace host (§6.1) is **not**, and the plan calls it the thing that blocks everything |
-| M1 | Read-only viewer | **partial** — log, commit detail, tree diff, refs, schema; no data browser and no SQL console |
-| M2 | Time travel | **partial** — `?at=` works on a document read and the UI has the read-only mode; other read endpoints ignore it, and `AT COMMIT` still is not honoured over the wire |
+| M0 | Foundations | **done** — control plane, auth, SSE hub, embedded UI, and the multi-namespace host: the service opens the data root through `embed.Host` and the control plane serves every namespace it finds |
+| M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, and a read-only SQL console |
+| M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
 | M3 | Writes | **not started** — no document CRUD, no transactions, no DML |
 | M4 | Rollback | **partial** — plan/apply with `expectHead` are done; per-document history and the document timeline are not |
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
@@ -32,11 +32,11 @@ Counting endpoints from §5: **14 implemented**, 4 declared and answering 501, ~
 ### API surface (§5)
 
 **Implemented:** `GET /v1/health`, `/v1/namespaces`, `/v1/ns/{ns}/status`, `/schema`, `/log`,
-`/commits/{hash}`, `/commits/{hash}/diff`, `/refs`, `/docs/{id}` (including `?at=`), `/events`,
-`GET /v1/settings`, `GET /v1/ops/runtime`, `POST /v1/ns/{ns}/revert/plan`, `/revert/apply`.
+`/commits/{hash}`, `/commits/{hash}/diff`, `/refs`, `/docs`, `/docs/{id}`, `/events`,
+`GET /v1/settings`, `GET /v1/ops/runtime`, `POST /v1/ns/{ns}/sql` (SELECT only),
+`POST /v1/ns/{ns}/revert/plan`, `/revert/apply`. `?at=` is honoured on every document read.
 
-**Declared, answering 501:** `PUT`/`DELETE /v1/ns/{ns}/docs/{id}`, `POST /v1/ns/{ns}/sql`,
-`PATCH /v1/settings`.
+**Declared, answering 501:** `PUT`/`DELETE /v1/ns/{ns}/docs/{id}`, `PATCH /v1/settings`.
 
 **Not started:** the document list (`/docs`), per-document history, per-document diff
 (`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/settings/{key}`,
@@ -50,8 +50,8 @@ Counting endpoints from §5: **14 implemented**, 4 declared and answering 501, ~
 
 | | Screen | State |
 |---|---|---|
-| 1 | Data browser | **not built** — needs the `/docs` list endpoint first |
-| 2 | SQL console | **not built** |
+| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, and readable at any revision |
+| 2 | SQL console | **built** (read-only) — SELECT only, reporting the access path and rows examined |
 | 3 | Commit graph | **partial** — a flat, paged list with parent and ref badges. There is no lane assignment, so it is a log, not a graph; a merge is flagged with a chip rather than drawn |
 | 4 | Document timeline | **not built** |
 | 5 | Branches & tags | **partial** — lists only; a tag row is a shortcut into time travel |
@@ -64,17 +64,15 @@ Counting endpoints from §5: **14 implemented**, 4 declared and answering 501, ~
 
 ### What to do next, in order
 
-1. **Multi-namespace host (§6.1).** `service.go` still calls `OpenFileRuntimeWithOptions` with one
-   namespace, so the namespace list can only ever have one entry. `embed.Host` already does this;
-   it is wiring, and everything namespace-shaped is stuck behind it.
-2. **The data browser (M1's missing half).** A `/docs` list endpoint plus a grid is what makes this
-   a database tool rather than a history viewer.
-3. **The SQL console (M3).** The single most-asked-for thing in any database UI, and the read half
-   needs no write permission.
-4. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime; the
+1. **Document writes (M3).** The console reads; editing a document is what an operator reaches for
+   next, and `ReplaceIf` already gives optimistic concurrency for free.
+2. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime, and the
    read view that makes them legible is done.
-5. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece
+3. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece
    and is mostly composition of things that already exist.
+4. **The document timeline (M4's missing half).** Per-document history, now that
+   `dag.ListCommits` exists to build it on.
+5. **A real commit graph (§9 screen 3).** Lane assignment, so the log becomes a graph.
 
 ## 1. What this is
 

@@ -30,21 +30,29 @@ import (
 	"sync"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/config"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/server"
 )
 
+// serverRuntime is the per-namespace runtime the control plane reads through.
+type serverRuntime = server.KdbServerRuntime
+
 // Options configures a control-plane server.
 type Options struct {
 	// Addr is the host:port to bind. Port 0 binds an ephemeral port, which Addr reports back.
 	Addr string
-	// Runtime is the server runtime this control plane inspects. Required.
+	// Runtime is a single runtime to serve, for a caller with exactly one. Either this or
+	// Namespaces is required; Namespaces wins when both are set.
 	Runtime *server.KdbServerRuntime
-	// Namespace is the namespace Runtime serves. One runtime is one namespace (see
-	// KdbServerRuntime's own doc comment); the multi-namespace host is a later milestone, and
-	// until it lands this is the only namespace the control plane can see.
+	// Namespace is the namespace Runtime serves, and the namespace a request that names none is
+	// about.
 	Namespace string
+	// Namespaces is where this control plane finds runtimes when it serves more than one. A
+	// service backed by embed.Host passes a source that can see every namespace the host has
+	// opened; see the service's own wiring.
+	Namespaces NamespaceSource
 	// Settings is the resolved, provenance-annotated service configuration - see
 	// config.Describe. Empty is allowed; the settings endpoint then reports nothing rather than
 	// guessing.
@@ -82,8 +90,11 @@ type Server struct {
 
 // New binds Addr and starts serving immediately.
 func New(opts Options) (*Server, error) {
-	if opts.Runtime == nil {
-		return nil, errors.New("control: Runtime is required")
+	if opts.Runtime == nil && opts.Namespaces == nil {
+		return nil, errors.New("control: one of Runtime or Namespaces is required")
+	}
+	if opts.Namespaces == nil && opts.Namespace == "" {
+		return nil, errors.New("control: Namespace is required alongside Runtime")
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -149,6 +160,21 @@ func (s *Server) SetSettings(descriptors []config.SettingDescriptor) {
 	s.settings = descriptors
 }
 
+// authEngine is the engine every request authenticates against. Namespaces may each carry their
+// own; this is the one used before a namespace has been resolved, and as the fallback for a
+// runtime that has none configured.
+func (s *Server) authEngine() auth.Engine {
+	if s.opts.Runtime != nil && s.opts.Runtime.AuthEngine != nil {
+		return s.opts.Runtime.AuthEngine
+	}
+	for _, ns := range s.namespaces().Namespaces() {
+		if rt, ok := s.namespaces().Runtime(ns); ok && rt.AuthEngine != nil {
+			return rt.AuthEngine
+		}
+	}
+	return nil
+}
+
 func (s *Server) settingsSnapshot() []config.SettingDescriptor {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -171,7 +197,9 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}", s.nsRead(s.handleCommit))
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}/diff", s.nsRead(s.handleCommitDiff))
 	mux.Handle("GET /v1/ns/{ns}/refs", s.nsRead(s.handleRefs))
+	mux.Handle("GET /v1/ns/{ns}/docs", s.nsRead(s.handleDocuments))
 	mux.Handle("GET /v1/ns/{ns}/docs/{id}", s.nsRead(s.handleDocument))
+	mux.Handle("POST /v1/ns/{ns}/sql", s.nsRead(s.handleSQL))
 	mux.Handle("GET /v1/ns/{ns}/events", s.nsRead(s.handleEvents))
 
 	// Process-scoped. Authorized as an admin action on the "control" scope, matching the
@@ -191,7 +219,6 @@ func (s *Server) routes() http.Handler {
 	for _, route := range []string{
 		"PUT /v1/ns/{ns}/docs/{id}",
 		"DELETE /v1/ns/{ns}/docs/{id}",
-		"POST /v1/ns/{ns}/sql",
 		"PATCH /v1/settings",
 	} {
 		mux.Handle(route, s.notImplemented())

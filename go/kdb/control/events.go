@@ -92,7 +92,7 @@ func (h *eventHub) subscriberCount() int {
 }
 
 // handleEvents streams commits as they happen (text/event-stream).
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, _ *serverRuntime) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "no_flush",

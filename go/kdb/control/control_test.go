@@ -425,9 +425,9 @@ func TestMutatingEndpointsAreRefusedWhileReadOnly(t *testing.T) {
 // distinguishable, which are different operator problems.
 func TestWriteEnabledStillReportsUnbuiltEndpoints(t *testing.T) {
 	_, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
-	// The SQL console is specified in the plan and not built; revert, which used to stand in here,
-	// is built now.
-	req, _ := http.NewRequest(http.MethodPost, base+"/v1/ns/demo%2Fusers/sql", strings.NewReader("{}"))
+	// Live settings mutation is specified in the plan (§7.4) and not built. Revert and the SQL
+	// console, which each stood in here in turn, are built now.
+	req, _ := http.NewRequest(http.MethodPatch, base+"/v1/settings", strings.NewReader("{}"))
 	req.Header.Set("Authorization", "Bearer alice:secret")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -663,7 +663,7 @@ func TestDiffReportsModificationAsModification(t *testing.T) {
 	seed(t, cs, `{"id":"doc-b","v":1}`)
 	second := seed(t, cs, `{"id":"doc-a","v":2}`)[0]
 
-	d, err := cs.commitDAG()
+	d, err := cs.commitDAGFor(cs.opts.Runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +671,7 @@ func TestDiffReportsModificationAsModification(t *testing.T) {
 	if !ok {
 		t.Fatal("commit missing")
 	}
-	_, _, entries, err := cs.diffRevisions(commit.ParentHashes[0].Hex(), second.Commit.Hex())
+	_, _, entries, err := cs.diffRevisions(cs.opts.Runtime, commit.ParentHashes[0].Hex(), second.Commit.Hex())
 	if err != nil {
 		t.Fatalf("diff: %v", err)
 	}
@@ -700,12 +700,12 @@ func TestRewritingIdenticalContentIsNotAChange(t *testing.T) {
 	seed(t, cs, `{"id":"doc-a","v":1}`)
 	again := seed(t, cs, `{"id":"doc-a","v":1}`)[0]
 
-	d, _ := cs.commitDAG()
+	d, _ := cs.commitDAGFor(cs.opts.Runtime)
 	commit, ok := d.GetCommit(again.Commit)
 	if !ok {
 		t.Fatal("commit missing")
 	}
-	_, _, entries, err := cs.diffRevisions(commit.ParentHashes[0].Hex(), again.Commit.Hex())
+	_, _, entries, err := cs.diffRevisions(cs.opts.Runtime, commit.ParentHashes[0].Hex(), again.Commit.Hex())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +740,7 @@ func TestRevisionSpecsAreTheEnginesGrammar(t *testing.T) {
 func TestTagsAppearInRefsAndAsBadges(t *testing.T) {
 	cs, base := newFixture(t)
 	put := seed(t, cs, `{"id":"a"}`)[0]
-	d, err := cs.commitDAG()
+	d, err := cs.commitDAGFor(cs.opts.Runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -953,5 +953,207 @@ func TestRevertToUnknownRevisionIsNotFound(t *testing.T) {
 	res, _ := postJSON(t, base, "/v1/ns/demo%2Fusers/revert/plan", `{"to":"head~999"}`)
 	if res.StatusCode != http.StatusNotFound {
 		t.Fatalf("want 404 for a revision that names nothing, got %d", res.StatusCode)
+	}
+}
+
+func TestDocumentListPagesAndPreviews(t *testing.T) {
+	cs, base := newFixture(t)
+	for i := 0; i < 7; i++ {
+		seed(t, cs, fmt.Sprintf(`{"id":"doc-%d","n":%d}`, i, i))
+	}
+	// One body long enough that a listing must not carry it whole.
+	seed(t, cs, fmt.Sprintf(`{"id":"big","blob":%q}`, strings.Repeat("x", 500)))
+
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/docs?limit=3")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("docs: %d (%v)", res.StatusCode, body)
+	}
+	docs, _ := body["documents"].([]any)
+	if len(docs) != 3 {
+		t.Fatalf("limit=3 must return three documents, got %d", len(docs))
+	}
+	if body["hasMore"] != true {
+		t.Error("eight documents and a limit of three means more remain")
+	}
+	if body["atHead"] != true {
+		t.Error("a listing with no ?at= is a head read")
+	}
+
+	// The cursor must not repeat what the first page already showed.
+	cursor := body["nextCursor"].(string)
+	_, page2 := get(t, base, "/v1/ns/demo%2Fusers/docs?limit=3&cursor="+cursor)
+	seen := map[string]bool{}
+	for _, d := range docs {
+		seen[d.(map[string]any)["docId"].(string)] = true
+	}
+	rest, _ := page2["documents"].([]any)
+	if len(rest) == 0 {
+		t.Fatal("the second page is empty")
+	}
+	for _, d := range rest {
+		if seen[d.(map[string]any)["docId"].(string)] {
+			t.Error("a cursor page repeated a document from the first page")
+		}
+	}
+}
+
+func TestDocumentListTruncatesLongBodies(t *testing.T) {
+	cs, base := newFixture(t)
+	seed(t, cs, fmt.Sprintf(`{"id":"big","blob":%q}`, strings.Repeat("x", 5000)))
+
+	_, body := get(t, base, "/v1/ns/demo%2Fusers/docs")
+	docs, _ := body["documents"].([]any)
+	if len(docs) != 1 {
+		t.Fatalf("want one document, got %d", len(docs))
+	}
+	d := docs[0].(map[string]any)
+	if d["truncated"] != true {
+		t.Error("a 5KB body must be reported as truncated, not returned whole in a listing")
+	}
+	if len(d["preview"].(string)) > previewBytes {
+		t.Errorf("preview is %d bytes, over the cap", len(d["preview"].(string)))
+	}
+	if d["sizeBytes"].(float64) < 5000 {
+		t.Error("sizeBytes should describe the whole document, not the preview")
+	}
+}
+
+// TestDocumentListAtPastRevision: the browser is as useful looking backwards as forwards, which is
+// most of the argument for having it in this database rather than a generic one.
+func TestDocumentListAtPastRevision(t *testing.T) {
+	cs, base := newFixture(t)
+	first := seed(t, cs, `{"id":"a"}`)[0]
+	seed(t, cs, `{"id":"b"}`)
+
+	_, now := get(t, base, "/v1/ns/demo%2Fusers/docs")
+	if len(now["documents"].([]any)) != 2 {
+		t.Fatalf("head should hold both documents: %v", now["documents"])
+	}
+
+	_, past := get(t, base, "/v1/ns/demo%2Fusers/docs?at="+first.Commit.Hex())
+	if n := len(past["documents"].([]any)); n != 1 {
+		t.Fatalf("only one document existed at the first commit, got %d", n)
+	}
+	if past["atHead"] != false || past["readOnly"] != true {
+		t.Errorf("a historical listing must announce itself as such: %v", past)
+	}
+}
+
+func TestSQLConsoleRunsSelects(t *testing.T) {
+	cs, base := newFixture(t)
+	seed(t, cs, `{"id":"a","name":"ada"}`, `{"id":"b","name":"grace"}`)
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"SELECT * FROM users"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("select: %d (%v)", res.StatusCode, body)
+	}
+	if body["rowCount"].(float64) != 2 {
+		t.Errorf("want two rows, got %v", body["rowCount"])
+	}
+	if body["plan"] == nil {
+		t.Error("the chosen access path should be reported - it is how you learn a query is a full scan")
+	}
+	if body["resolvedCommit"] == "" {
+		t.Error("a query result should name the commit it read at")
+	}
+}
+
+// TestSQLConsoleRefusesAnythingButSelect is the property that lets this be a read endpoint: it must
+// refuse a mutation even on a control plane that allows writes.
+func TestSQLConsoleRefusesAnythingButSelect(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a","name":"ada"}`)
+
+	for _, stmt := range []string{
+		`DELETE FROM users`,
+		`UPDATE users SET name = 'x'`,
+		`INSERT INTO users (name) VALUES ('x')`,
+	} {
+		res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql",
+			fmt.Sprintf(`{"sql":%q}`, stmt))
+		if res.StatusCode != http.StatusForbidden {
+			t.Errorf("%q: want 403 even with writes enabled, got %d (%v)", stmt, res.StatusCode, body)
+			continue
+		}
+		if body["error"].(map[string]any)["code"] != "read_only_console" {
+			t.Errorf("%q: the refusal should say why: %v", stmt, body["error"])
+		}
+	}
+
+	// And the data is untouched.
+	_, after := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"SELECT * FROM users"}`)
+	if after["rowCount"].(float64) != 1 {
+		t.Errorf("a refused statement must not have run: %v", after["rowCount"])
+	}
+}
+
+func TestSQLConsoleReportsParseErrors(t *testing.T) {
+	_, base := newFixture(t)
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql", `{"sql":"SELEKT nonsense"}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for unparseable SQL, got %d (%v)", res.StatusCode, body)
+	}
+	if body["error"].(map[string]any)["code"] != "parse_error" {
+		t.Errorf("a parse failure should be distinguishable from a query failure: %v", body["error"])
+	}
+}
+
+func TestUnknownNamespaceIsNotFound(t *testing.T) {
+	_, base := newFixture(t)
+	// 404 rather than 403: answering "forbidden" for a namespace that does not exist would tell an
+	// unauthorized caller which namespaces do.
+	res, _ := get(t, base, "/v1/ns/no%2Fsuch/log")
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for a namespace this plane does not serve, got %d", res.StatusCode)
+	}
+}
+
+func TestMultipleNamespacesAreServedIndependently(t *testing.T) {
+	rtA, err := embed.OpenMemoryRuntime("demo", "demo/users", schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rtB, err := embed.OpenMemoryRuntime("demo", "demo/orders", schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvA, srvB := server.NewKdbServerRuntime(rtA), server.NewKdbServerRuntime(rtB)
+	cs, err := New(Options{
+		Addr: "127.0.0.1:0", Runtime: srvA, Namespace: "demo/users", Version: "test",
+		Namespaces: StaticNamespaces(map[string]*server.KdbServerRuntime{
+			"demo/users": srvA, "demo/orders": srvB,
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	base := "http://" + cs.Addr().String()
+
+	if _, err := embed.PutJSONDocument(rtA, "demo/users", `{"id":"u1"}`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := embed.PutJSONDocument(rtB, "demo/orders", fmt.Sprintf(`{"id":"o%d"}`, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, list := get(t, base, "/v1/namespaces")
+	if n := len(list["namespaces"].([]any)); n != 2 {
+		t.Fatalf("want both namespaces listed, got %d", n)
+	}
+	if list["default"] != "demo/users" {
+		t.Errorf("the default namespace should be reported: %v", list["default"])
+	}
+
+	// Each namespace must answer about itself, not about whichever runtime was registered first.
+	_, a := get(t, base, "/v1/ns/demo%2Fusers/docs")
+	_, b := get(t, base, "/v1/ns/demo%2Forders/docs")
+	if len(a["documents"].([]any)) != 1 {
+		t.Errorf("demo/users has one document: %v", a["documents"])
+	}
+	if len(b["documents"].([]any)) != 3 {
+		t.Errorf("demo/orders has three documents: %v", b["documents"])
 	}
 }

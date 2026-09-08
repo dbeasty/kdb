@@ -40,26 +40,42 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, _ auth.Pri
 // single namespace. embed.Host already supports N namespaces over one data root (Layer 17
 // Component 64); wiring the service to it is the milestone that turns this into a real list, and
 // the response shape is already the list it will return.
-func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request, _ auth.Principal, _ string) {
+// handleNamespaces lists what this control plane can see.
+//
+// One entry per namespace the process has open, not per namespace on disk: a namespace it could
+// not open is one it cannot answer questions about, and listing it would offer the operator a link
+// that leads nowhere.
+func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request, _ auth.Principal, _ string, _ *serverRuntime) {
 	type entry struct {
 		ID       string `json:"id"`
 		Catalog  string `json:"catalog"`
 		Head     string `json:"head"`
 		ReadOnly bool   `json:"readOnly"`
+		Default  bool   `json:"default,omitempty"`
 	}
-	e := entry{ID: s.opts.Namespace}
-	if rt := s.opts.Runtime.Runtime; rt != nil {
-		e.Catalog = rt.Catalog
-		e.ReadOnly = rt.ReadOnly
-		if head, err := rt.DAG.Head(); err == nil {
-			e.Head = head.Hex()
+	src := s.namespaces()
+	def := s.defaultNamespace()
+	out := make([]entry, 0)
+	for _, id := range src.Namespaces() {
+		rt, ok := src.Runtime(id)
+		if !ok {
+			continue
 		}
+		e := entry{ID: id, Default: id == def}
+		if rt.Runtime != nil {
+			e.Catalog = rt.Runtime.Catalog
+			e.ReadOnly = rt.Runtime.ReadOnly
+			if head, err := rt.Runtime.DAG.Head(); err == nil {
+				e.Head = head.Hex()
+			}
+		}
+		out = append(out, e)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"namespaces": []entry{e}})
+	writeJSON(w, http.StatusOK, map[string]any{"namespaces": out, "default": def})
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
-	d, err := s.commitDAG()
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	d, err := s.commitDAGFor(rt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
 		return
@@ -82,8 +98,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ auth.Pri
 		Namespace:   ns,
 		Head:        head.Hex(),
 		Branches:    len(d.ListBranches()),
-		Draining:    s.opts.Runtime.IsDraining(),
-		ExpiryState: s.opts.Runtime.ExpirySummary(),
+		Draining:    rt.IsDraining(),
+		ExpiryState: rt.ExpirySummary(),
 	}
 	if rt := s.opts.Runtime.Runtime; rt != nil {
 		out.ReadOnly = rt.ReadOnly
@@ -99,8 +115,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ auth.Pri
 //
 // KdbSchema has no notion of tables - Fields is a single list (schema/schema.go) - so this does
 // not invent a table grouping the engine does not have.
-func (s *Server) handleSchema(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
-	sch := s.opts.Runtime.Schema()
+func (s *Server) handleSchema(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	sch := rt.Schema()
 	type fieldView struct {
 		Name     string `json:"name"`
 		Type     string `json:"type"`
@@ -127,7 +143,7 @@ func (s *Server) handleSchema(w http.ResponseWriter, r *http.Request, _ auth.Pri
 	})
 }
 
-func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
+func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	limit, err := intParam(r, "limit", 50, 1, 500)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -138,12 +154,12 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	from, err := s.resolveRevision(r.URL.Query().Get("from"))
+	from, err := s.resolveRevisionFor(rt, r.URL.Query().Get("from"))
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
 	}
-	commits, more, err := s.log(from, limit, skip)
+	commits, more, err := s.log(rt, from, limit, skip)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "walk_failed", err.Error())
 		return
@@ -159,13 +175,13 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 	})
 }
 
-func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
-	hash, err := s.resolveRevision(r.PathValue("hash"))
+func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	hash, err := s.resolveRevisionFor(rt, r.PathValue("hash"))
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
 	}
-	d, err := s.commitDAG()
+	d, err := s.commitDAGFor(rt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
 		return
@@ -176,7 +192,7 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Pri
 		return
 	}
 	sum := summarizeCommit(commit)
-	sum.Refs = s.refsByCommit()[sum.Hash]
+	sum.Refs = s.refsByCommit(rt)[sum.Hash]
 
 	// Operations are fetched for the one commit a caller actually opened - and may legitimately
 	// be absent, because the DAG evicts them under its retention budget. Saying so is better than
@@ -209,7 +225,7 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Pri
 	writeJSON(w, http.StatusOK, body)
 }
 
-func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
+func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	toSpec := r.PathValue("hash")
 	// Default to the first parent, which is what "what did this commit change" means. head~1 is
 	// not that - on a merge it would follow the wrong side - so the parent is read from the commit
@@ -217,12 +233,12 @@ func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth
 	// it is refused rather than silently reported as "no changes".
 	fromSpec := r.URL.Query().Get("against")
 	if fromSpec == "" {
-		to, err := s.resolveRevision(toSpec)
+		to, err := s.resolveRevisionFor(rt, toSpec)
 		if err != nil {
 			s.writeRevisionError(w, err)
 			return
 		}
-		d, err := s.commitDAG()
+		d, err := s.commitDAGFor(rt)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
 			return
@@ -241,7 +257,7 @@ func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth
 		toSpec = to.Hex()
 	}
 
-	from, to, entries, err := s.diffRevisions(fromSpec, toSpec)
+	from, to, entries, err := s.diffRevisions(rt, fromSpec, toSpec)
 	if err != nil {
 		if isUnknownRevision(err) {
 			s.writeRevisionError(w, err)
@@ -262,8 +278,8 @@ func (s *Server) handleCommitDiff(w http.ResponseWriter, r *http.Request, _ auth
 	})
 }
 
-func (s *Server) handleRefs(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
-	d, err := s.commitDAG()
+func (s *Server) handleRefs(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	d, err := s.commitDAGFor(rt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
 		return
@@ -304,7 +320,7 @@ func (s *Server) handleRefs(w http.ResponseWriter, r *http.Request, _ auth.Princ
 // hash is what the storage adapter wants - its parameter is named atCommit but is a tree hash, and
 // passing a commit hash there resolves nothing rather than erroring, which would look like a
 // missing document.
-func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string) {
+func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	docID, err := codec.UUIDFromString(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "document id must be a UUID")
@@ -312,7 +328,7 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 	}
 	at := r.URL.Query().Get("at")
 	if at == "" {
-		body, commitHex, found, err := s.opts.Runtime.GetDocument(ns, docID)
+		body, commitHex, found, err := rt.GetDocument(ns, docID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "read_failed", err.Error())
 			return
@@ -328,12 +344,12 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 		return
 	}
 
-	commitHash, err := s.resolveRevision(at)
+	commitHash, err := s.resolveRevisionFor(rt, at)
 	if err != nil {
 		s.writeRevisionError(w, err)
 		return
 	}
-	d, err := s.commitDAG()
+	d, err := s.commitDAGFor(rt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "no_dag", err.Error())
 		return
@@ -343,7 +359,7 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 		writeError(w, http.StatusNotFound, "not_found", "no such commit in this namespace")
 		return
 	}
-	doc, err := s.opts.Runtime.Runtime.Storage.GetDocument(ns, docID, commit.DocumentTreeHash)
+	doc, err := rt.Runtime.Storage.GetDocument(ns, docID, commit.DocumentTreeHash)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "read_failed",
 			"could not read at that revision: "+err.Error())
