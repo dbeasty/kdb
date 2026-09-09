@@ -16,6 +16,7 @@ import (
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -521,6 +522,13 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 	if err != nil {
 		return document.Commit{}, err
 	}
+	// Pinned here rather than left to runTransaction, and the difference is the whole fix.
+	// Between this Head() and the front of the write gate every other writer commits, each
+	// publishing a newer tree; with the history cache sized in whole trees that is more than
+	// enough to push this one out before runTransaction is even entered. Pinning at the instant
+	// the base is resolved - when it is still the live tree and certain to be resident - is the
+	// only placement that closes that window. See ServerEngine.PinTree.
+	defer s.pinBaseTree(head)()
 	tx := document.Transaction{
 		ID:          txID,
 		BaseVersion: head,
@@ -528,6 +536,31 @@ func (s *KdbServerRuntime) Upsert(namespaceID string, docID codec.UUID, jsonBody
 		Timestamp:   codec.TimestampNow(),
 	}
 	return s.commitWith(s.UpsertEngine, tx, principal)
+}
+
+// pinBaseTree keeps the document tree of commit base resolvable without a rebuild until the
+// returned release runs, and returns a no-op release when it cannot: no DAG, an adapter with no
+// bounded tree cache to pin in (anything memory-backed), or a commit this runtime does not hold.
+// A missing pin costs a rebuild, never correctness - see storage.TreePinner.
+//
+// The release is idempotent, so it is safe to defer and also call explicitly.
+func (s *KdbServerRuntime) pinBaseTree(base codec.Hash) (release func()) {
+	noop := func() {}
+	if s.dag == nil {
+		return noop
+	}
+	pinner, ok := s.Runtime.Storage.(storage.TreePinner)
+	if !ok {
+		return noop
+	}
+	commit, found := s.dag.GetCommit(base)
+	if !found {
+		return noop
+	}
+	treeHash := commit.DocumentTreeHash
+	pinner.PinTree(treeHash)
+	var once sync.Once
+	return func() { once.Do(func() { pinner.UnpinTree(treeHash) }) }
 }
 
 // Replay applies tx directly on top of the current head, ignoring tx.BaseVersion - the Mode 2
@@ -600,6 +633,16 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	// Nothing else roots it: a base version is not a branch head. (Replay needs no equivalent -
 	// it ignores tx.BaseVersion and targets the live head, which is a branch head already.)
 	defer s.dag.Pin(tx.BaseVersion)()
+	// The base version's *tree* has to survive the same window, and for a sharper reason than
+	// the commit does. Keeping the commit only keeps Commit from hard-failing; keeping the tree
+	// is what stops the schema phase rebuilding it, once per operation, on the commit path.
+	//
+	// Best-effort here on purpose: a client-supplied BaseVersion can name a tree that was
+	// evicted long before this call, and no pin can retroactively make it resident. Callers
+	// that resolve their own base - Upsert, which anchors on head - pin it at that moment
+	// instead, which is the only point at which the tree is certain to still be there. This one
+	// then nests harmlessly on top; tree pins are counted.
+	defer s.pinBaseTree(tx.BaseVersion)()
 	timeout := s.WriteTimeout
 	if timeout <= 0 {
 		timeout = DefaultWriteTimeout

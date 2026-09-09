@@ -130,5 +130,8 @@ func (e *ServerEngine) PutTree(tree document.DocumentTree) { e.treesByHash.Put(t
 // holds. For tests and reporting.
 func (e *ServerEngine) HistoryTreesResidentBytes() int64 { return e.treesByHash.ResidentBytes() }
 
+// HistoryTreesPinnedBytes is the part of HistoryTreesResidentBytes held by pinned trees.
+func (e *ServerEngine) HistoryTreesPinnedBytes() int64 { return e.treesByHash.PinnedBytes() }
+
 // HistoryTreesResident is how many historical trees are held. For tests.
 func (e *ServerEngine) HistoryTreesResident() int { return e.treesByHash.Len() }

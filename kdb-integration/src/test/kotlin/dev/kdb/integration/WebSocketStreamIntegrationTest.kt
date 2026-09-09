@@ -3,15 +3,15 @@ package dev.kdb.integration
 import dev.kdb.auth.ConnectionContext
 import dev.kdb.codec.KdbHash
 import dev.kdb.embed.EmbeddedKdbRuntime
-import dev.kdb.embed.syncEmbeddedWithPeer
-import dev.kdb.embed.handleStreamConnection
 import dev.kdb.embed.getJson
+import dev.kdb.embed.handleStreamConnection
 import dev.kdb.embed.materializeCommitHistory
 import dev.kdb.embed.openMemoryRuntimeBlocking
 import dev.kdb.embed.pushCommitsSinceRemoteHead
 import dev.kdb.embed.putJson
 import dev.kdb.embed.querySql
 import dev.kdb.embed.syncEmbedSchema
+import dev.kdb.embed.syncEmbeddedWithPeer
 import dev.kdb.peersync.PeerClientConfig
 import dev.kdb.peersync.PeerHostConfig
 import dev.kdb.peersync.peerSyncClient
@@ -28,30 +28,54 @@ import dev.kdb.stream.streamSubscriber
 import dev.kdb.transport.ws.JvmNetworkWebSocketServer
 import dev.kdb.transport.ws.defaultWebSocketWireTransport
 import dev.kdb.wire.defaultWireCodec
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 
 class WebSocketStreamIntegrationTest {
     private val wire = defaultWireCodec()
+
+    /**
+     * Owns every coroutine these tests launch outside the test body, so teardown can wait for them
+     * to actually finish.
+     *
+     * They used to be launched into throwaway `CoroutineScope(...)` values and stopped with a bare
+     * `cancel()`. Cancellation is asynchronous, so that only *requests* a stop - the coroutine can
+     * still be unwinding after the test method has returned, and an exception it throws on the way
+     * out (a socket closing under a `collect`, most often) has nowhere to go but the next test's
+     * uncaught-exception handler. That surfaced in CI as `UncaughtExceptionsBeforeTest` failing a
+     * completely unrelated test, because the victim is whichever test happens to run next.
+     *
+     * JUnit builds a fresh instance per test method, so one scope per instance is one scope per
+     * test.
+     */
+    private val testScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     @BeforeTest
     fun settleBefore() = runBlocking { delay(100) }
 
     @AfterTest
-    fun settleAfter() = runBlocking { delay(100) }
+    fun stopLaunchedCoroutines() =
+        runBlocking {
+            // cancelAndJoin, not cancel: waiting is the entire point. This replaces a fixed
+            // delay(100) that hoped the strays had settled, which held on an idle machine and
+            // stopped holding on a loaded CI runner.
+            testScope.coroutineContext.job.cancelAndJoin()
+        }
 
     @Test
     fun wsStreamPushNotifiesSubscriber() =
@@ -97,7 +121,7 @@ class WebSocketStreamIntegrationTest {
                 val sub = streamSubscriber(wire, transport, clientB.indexManager)
                 val deltas = mutableListOf<KdbHash>()
                 val collectJob =
-                    CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                    testScope.launch {
                         sub.connect(
                             StreamSubscriberConfig(
                                 namespaceId = ns,
