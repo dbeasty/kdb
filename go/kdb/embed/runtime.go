@@ -8,6 +8,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
 
 // EmbeddedKdbRuntime composes DAG + storage for embedded use.
@@ -69,6 +70,66 @@ func (rt *EmbeddedKdbRuntime) Maintain() (TruncationResult, error) {
 		return TruncationResult{}, nil
 	}
 	return rt.maintain()
+}
+
+// CompactHistory reclaims now, whatever this namespace's reclaim mode says,
+// and reports what it freed.
+//
+// This is the explicit ask that storage.ReclaimManual exists to wait for,
+// and it is the destructive operation in the whole history-mode story - the
+// one-way door. Switching a namespace between history modes moves a marker
+// and destroys nothing; *this* deletes segments, and under history=none
+// what it deletes is gone. A caller offering it to a human should say so
+// here rather than on the mode switch, which is the harmless half.
+//
+// A no-op under history=full, which reclaims no segments by definition; it
+// still writes a checkpoint and compacts the blob store, which is what a
+// full-history namespace's maintenance has always done.
+func (rt *EmbeddedKdbRuntime) CompactHistory() (TruncationResult, error) {
+	if err := rt.AssertWritable(); err != nil {
+		return TruncationResult{}, err
+	}
+	if rt.maintain == nil {
+		return TruncationResult{}, nil
+	}
+	// Force a reclaiming pass by lifting the mode for the duration of it.
+	// Restored afterwards, including on the error path: a compaction that
+	// failed halfway must not leave the namespace quietly reclaiming from
+	// then on, which would be the opposite of what manual was chosen for.
+	eng, ok := rt.Storage.(*engine.ServerEngine)
+	if !ok {
+		return rt.maintain()
+	}
+	previous := eng.ReclaimMode()
+	eng.SetReclaimMode(storage.ReclaimImmediate)
+	defer eng.SetReclaimMode(previous)
+	return rt.maintain()
+}
+
+// ReclaimMode reports how eagerly this namespace reclaims.
+func (rt *EmbeddedKdbRuntime) ReclaimMode() storage.ReclaimMode {
+	eng, ok := rt.Storage.(*engine.ServerEngine)
+	if !ok {
+		return storage.DefaultReclaimMode
+	}
+	return eng.ReclaimMode()
+}
+
+// SetReclaimMode changes how eagerly this namespace reclaims, on a running
+// runtime. In force from the next maintenance pass.
+//
+// Moving to storage.ReclaimManual stops future reclamation; it does not and
+// cannot undo reclamation that has already happened.
+func (rt *EmbeddedKdbRuntime) SetReclaimMode(r storage.ReclaimMode) error {
+	if err := rt.AssertWritable(); err != nil {
+		return err
+	}
+	eng, ok := rt.Storage.(*engine.ServerEngine)
+	if !ok {
+		return errors.New("kdb: this runtime has no engine that reclaims")
+	}
+	eng.SetReclaimMode(r)
+	return nil
 }
 
 // ErrReadOnly is returned by every write path on a runtime opened with ReadOnly.

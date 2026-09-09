@@ -69,6 +69,15 @@ type commitLogWriter struct {
 	closeOnce sync.Once
 	closed    chan struct{}
 
+	// onSealed is told when a rotation has sealed a segment, which is the
+	// moment something new becomes reclaimable - nothing below the open
+	// segment changes until one is. Called from the writer's own goroutine,
+	// so an implementation must not do the reclaiming itself; the
+	// maintenance scheduler's NotifySegmentSealed only wakes its loop.
+	// nil means nobody is listening, which is the case for every runtime
+	// that is not running a seal-triggered reclaim mode.
+	onSealed func()
+
 	// onPersisted is told where each record landed, once the append knows.
 	// Set before the writer is used and not changed after, so it needs no
 	// lock of its own.
@@ -312,6 +321,15 @@ func (c *commitLogWriter) appendBatch(batch []*logRequest) error {
 			log.Printf("kdb: could not rotate the delta segment (%v); continuing on the current one", err)
 		} else if rotated {
 			log.Printf("kdb: rotated to delta segment %d", currentSequence(c.writer))
+			// A segment just became eligible. Tell whoever is listening
+			// rather than reclaiming here: this is the writer's own
+			// goroutine, and putting a checkpoint plus a possible SSTable
+			// rewrite behind the commit that happened to fill the segment
+			// is exactly the latency spike maintenance is arranged to
+			// avoid.
+			if c.onSealed != nil {
+				c.onSealed()
+			}
 		}
 	}
 	seq, hasSeq := int64(0), false

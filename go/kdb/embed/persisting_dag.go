@@ -187,6 +187,20 @@ func (d *PersistingCommitDAG) SetPersistListener(fn func(treeHash codec.Hash, se
 	}
 }
 
+// SetSealListener registers a callback invoked when a rotation seals a delta
+// segment, which is the moment something new becomes reclaimable: nothing
+// below the open segment can be truncated, so until one is sealed there is
+// nothing for maintenance to find.
+//
+// Called from the log writer's own goroutine, so fn must be cheap and must
+// not reclaim inline - MaintenanceScheduler.NotifySegmentSealed, the caller
+// this exists for, only wakes its loop.
+func (d *PersistingCommitDAG) SetSealListener(fn func()) {
+	if d.log != nil {
+		d.log.onSealed = fn
+	}
+}
+
 // History navigation, forwarded so a persisting DAG is as browsable as the
 // one it wraps. None of it writes, so none of it needs the log: these read
 // the graph the delegate already holds. See dag.HistoryNavigator.

@@ -562,6 +562,18 @@ func envOnlySpecs() []envOnlySpec {
 			},
 		},
 		{
+			key: "reclaim.mode", env: "KDB_RECLAIM_MODE",
+			scope: ScopeNamespace, mutability: MutabilityLive,
+			help: "how eagerly this namespace acts on what its retention window has released. manual never reclaims on its own and waits for an explicit compaction - which is what makes switching a namespace to history=none reversible, at the cost of unbounded disk until somebody acts; immediate reclaims as soon as a segment is sealed and does not defer to load; balanced (the default) reclaims every few minutes when there is something to do; lazy trades disk for quiet. Separate from history.mode on purpose: the mode says what may be reclaimed, this says whether anything is",
+			parse: func(raw string) (any, error) {
+				m, err := storage.ParseReclaimMode(strings.ToLower(strings.TrimSpace(raw)))
+				if err != nil {
+					return nil, err
+				}
+				return fmt.Sprint(m), nil
+			},
+		},
+		{
 			key: "retain.duration", env: "KDB_RETAIN_DURATION",
 			scope: ScopeNamespace, mutability: MutabilityLive,
 			help: "how far back a history=none namespace keeps commits (24h, 7d, 0 for nothing). A floor enforced at sealed-segment granularity, never a ceiling, so real retention overshoots by up to one segment. Ignored under history=full. Live via EmbeddedKdbRuntime.SetRetentionWindow - and note that shortening it makes already-written segments eligible on the next pass",

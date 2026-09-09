@@ -23,8 +23,12 @@ type ServerEngine struct {
 	// retention window on the running engine; nil means "whatever this
 	// engine was opened with". Guarded because it is written from the
 	// control plane while passes and reads take it.
-	retainMu    sync.RWMutex
-	retainLive  *storage.RetentionWindow
+	retainMu   sync.RWMutex
+	retainLive *storage.RetentionWindow
+	// reclaimLive is the same idea for how eagerly this namespace reclaims.
+	// Shares retainMu: the two are read together by every maintenance pass
+	// and neither is hot enough to want its own lock.
+	reclaimLive *storage.ReclaimMode
 	wal         wal.WriteAheadLog
 	groupCommit *wal.GroupCommitter
 

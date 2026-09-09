@@ -52,6 +52,21 @@ type TruncationResult struct {
 	// segments that were kept, as far as the fingerprints can tell.
 	RetainedSegments int
 
+	// ReclaimHeld says this pass deliberately reclaimed nothing because the
+	// namespace is on storage.ReclaimManual - as distinct from a pass that
+	// looked and found nothing eligible, which is the same numbers and a
+	// completely different situation. An operator seeing zeroes needs to
+	// know which one they are looking at: one means the namespace is
+	// bounded and quiet, the other means it is growing and waiting to be
+	// told to stop.
+	ReclaimHeld bool
+	// EligibleSegments and EligibleBytes are what a reclamation *would*
+	// free, computed without deleting anything. Filled in on a held pass,
+	// so "armed but not reclaiming" comes with the number that says how
+	// much that is costing.
+	EligibleSegments int
+	EligibleBytes    int64
+
 	// TablesMerged and TablesRemoved report the SSTable compaction that
 	// runs in the same pass. Independent of the delta-log figures above,
 	// and independent of the history mode: SSTable duplication is a

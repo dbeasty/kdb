@@ -160,6 +160,27 @@ func liveSettings() map[string]liveSetting {
 				})
 			},
 		},
+		// The reclaim axis. Applied to the scheduler *and* the namespace: the preset sets the
+		// loop's cadence, and the mode is what the pass itself consults before deleting
+		// anything, so setting only one of the two would leave a namespace whose cadence and
+		// behaviour disagree.
+		"reclaim.mode": {
+			parse: func(v any) (any, error) {
+				text, ok := v.(string)
+				if !ok {
+					return nil, fmt.Errorf("reclaim.mode must be a string: manual, immediate, balanced or lazy")
+				}
+				m, err := storage.ParseReclaimMode(text)
+				if err != nil {
+					return nil, err
+				}
+				if m == storage.ReclaimUnset {
+					return nil, fmt.Errorf("reclaim.mode cannot be set back to unset; name the mode you want")
+				}
+				return m, nil
+			},
+			apply: func(s *Server, v any) error { return s.applyReclaimMode(v.(storage.ReclaimMode)) },
+		},
 		// EmbeddedKdbRuntime.SetRetentionWindow, which refuses a full-history namespace rather
 		// than storing a window that would never be consulted. Unlike the cadence settings this
 		// one changes what is *deleted*, and shortening it makes already-written segments
@@ -262,6 +283,52 @@ func (s *Server) eachScheduler(key string, fn func(*embed.MaintenanceScheduler) 
 	}
 	if applied == 0 {
 		return fmt.Errorf("%s cannot be changed here: no namespace is running a maintenance loop", key)
+	}
+	return nil
+}
+
+// applyReclaimMode sets the reclaim preset on every maintenance loop and the mode on every
+// namespace behind it.
+//
+// Both halves, because they answer different questions and a namespace whose cadence says
+// "immediate" while its mode says "manual" would tick busily and reclaim nothing. The scheduler
+// carries the mode down to the namespace itself (ApplyReclaimMode), so a process running loops
+// needs only the first call; a process running none still sets the mode, which is what a later
+// explicit compaction and any future loop will read.
+func (s *Server) applyReclaimMode(mode storage.ReclaimMode) error {
+	applied := 0
+	if s.opts.Maintenance != nil {
+		for _, sched := range s.opts.Maintenance.Schedulers() {
+			if sched == nil {
+				continue
+			}
+			if err := sched.ApplyReclaimMode(mode); err != nil {
+				return err
+			}
+			applied++
+		}
+	}
+	if applied > 0 {
+		return nil
+	}
+	// No loops: set the mode directly, so the setting still means something on a process that
+	// reclaims only when asked.
+	src := s.namespaces()
+	if src == nil {
+		return fmt.Errorf("this control plane has no namespaces to set a reclaim mode on")
+	}
+	for _, ns := range src.Namespaces() {
+		rt, ok := src.Runtime(ns)
+		if !ok || rt == nil || rt.Runtime == nil {
+			continue
+		}
+		if err := rt.Runtime.SetReclaimMode(mode); err != nil {
+			continue
+		}
+		applied++
+	}
+	if applied == 0 {
+		return fmt.Errorf("no namespace accepted the reclaim mode")
 	}
 	return nil
 }

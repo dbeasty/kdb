@@ -67,6 +67,13 @@ type MaintenanceOptions struct {
 	// header.
 	MaxDefer int
 
+	// Reclaim sets Interval, Sweep, MaxDefer and the load/seal behaviour
+	// from a preset (see storage.ReclaimMode.Cadence). Anything set
+	// explicitly alongside it is overridden by the preset; set the fields
+	// individually, or call ApplyReclaimMode later, to tune from one.
+	// ReclaimUnset leaves the individual fields alone.
+	Reclaim storage.ReclaimMode
+
 	// CompactTables is the number of SSTables that justifies a pass on
 	// its own, independent of whether anything has been committed. Zero
 	// uses sstable.DefaultCompactionTrigger, which is what
@@ -120,6 +127,12 @@ type MaintenanceScheduler struct {
 	interval time.Duration
 	sweep    time.Duration
 	maxDefer int
+	// respectLoad and sealTriggered come from the reclaim preset. The first
+	// is why storage.ReclaimImmediate does not wait for a quiet moment -
+	// "immediate, unless the server is busy" would not be immediate. The
+	// second arms NotifySegmentSealed.
+	respectLoad   bool
+	sealTriggered bool
 	// lastHead is the commit the last pass observed, and lastPassAt when
 	// that pass ran. Together they answer "has anything happened since?"
 	// without touching the disk.
@@ -155,6 +168,60 @@ type MaintenanceStats struct {
 	TablesRemoved   int
 }
 
+// ApplyReclaimMode sets the whole cadence from a reclaim preset, and
+// records the mode on the namespace so the pass itself honours it.
+//
+// The preset writes the individual knobs rather than replacing them, so a
+// caller may still set any of them afterwards and the control plane can
+// report what a preset resolved to rather than only its name. That is the
+// difference between a preset and a mode: this is the former.
+//
+// storage.ReclaimManual is the one that changes the pass rather than the
+// cadence. The loop keeps ticking and keeps checkpointing under it - a
+// checkpoint deletes nothing - and simply reclaims nothing until something
+// calls CompactHistory.
+func (s *MaintenanceScheduler) ApplyReclaimMode(mode storage.ReclaimMode) error {
+	cadence := mode.Cadence()
+	if err := s.SetInterval(cadence.Interval); err != nil {
+		return err
+	}
+	if err := s.SetSweep(cadence.Sweep); err != nil {
+		return err
+	}
+	if cadence.RespectLoad {
+		if err := s.SetMaxDefer(cadence.MaxDefer); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	s.respectLoad = cadence.RespectLoad
+	s.sealTriggered = cadence.SealTriggered
+	s.mu.Unlock()
+	return s.rt.SetReclaimMode(mode)
+}
+
+// NotifySegmentSealed tells the scheduler that a delta segment has just
+// been sealed, which is the moment something new becomes reclaimable:
+// nothing below the open segment changes until one is.
+//
+// Only acted on under storage.ReclaimImmediate, and even then it wakes the
+// loop rather than reclaiming inline - a pass on the writer's own goroutine
+// would put a checkpoint and possibly an SSTable rewrite behind the commit
+// that happened to fill the segment. Ignored under every other mode, which
+// is what makes "immediate" a real distinction rather than a label.
+func (s *MaintenanceScheduler) NotifySegmentSealed() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	armed := s.sealTriggered
+	s.mu.Unlock()
+	if !armed {
+		return
+	}
+	s.signalReconfigured()
+}
+
 // StartMaintenance begins a maintenance loop over rt and returns the
 // scheduler running it. A zero Interval returns nil, having started
 // nothing, so a caller can wire this unconditionally and let
@@ -167,6 +234,14 @@ func StartMaintenance(rt *EmbeddedKdbRuntime, opts MaintenanceOptions) *Maintena
 		return nil
 	}
 	s := newMaintenanceScheduler(rt, opts)
+	// Under a seal-triggered mode the loop wants waking when a segment is
+	// sealed rather than only on its own tick. Registered here rather than
+	// at open because the scheduler is what listens, and it does not exist
+	// until now; a runtime with no scheduler leaves the listener nil and the
+	// log writer skips it entirely.
+	if sealer, ok := rt.DAG.(interface{ SetSealListener(func()) }); ok {
+		sealer.SetSealListener(s.NotifySegmentSealed)
+	}
 	go s.loop()
 	return s
 }
@@ -202,6 +277,18 @@ func newMaintenanceScheduler(rt *EmbeddedKdbRuntime, opts MaintenanceOptions) *M
 		interval:     opts.Interval,
 		sweep:        opts.Sweep,
 		maxDefer:     opts.MaxDefer,
+		// True unless a reclaim preset says otherwise, which keeps the
+		// behaviour of a scheduler constructed without one: Busy is
+		// consulted, bounded by MaxDefer.
+		respectLoad: true,
+	}
+	if opts.Reclaim != storage.ReclaimUnset {
+		cadence := opts.Reclaim.Cadence()
+		s.interval, s.sweep = cadence.Interval, cadence.Sweep
+		s.respectLoad, s.sealTriggered = cadence.RespectLoad, cadence.SealTriggered
+		if cadence.RespectLoad {
+			s.maxDefer = cadence.MaxDefer
+		}
 	}
 	// Seed from the current head rather than the zero hash, so a runtime
 	// that opens with existing history does not read as "something was
@@ -378,7 +465,13 @@ func (s *MaintenanceScheduler) decide(now time.Time) maintenanceDecision {
 	if !s.needsWork(now) {
 		return maintenanceSkip
 	}
-	if s.opts.Busy == nil || !s.opts.Busy() {
+	s.mu.Lock()
+	respectLoad := s.respectLoad
+	s.mu.Unlock()
+	// storage.ReclaimImmediate does not wait for a quiet moment: "immediate,
+	// unless the server is busy" is not immediate, and a caller choosing it
+	// has said which side of that trade they want.
+	if !respectLoad || s.opts.Busy == nil || !s.opts.Busy() {
 		return maintenanceRun
 	}
 	s.mu.Lock()

@@ -272,7 +272,8 @@ func (h *Host) openNamespace(
 			}
 			return checkpointAndTruncate(
 				d, store, r, io, namespaceID, through,
-				liveRetention(store, opts.Storage.Retain), time.Now(), opts.Storage.DisableCheckpoints)
+				liveRetention(store, opts.Storage.Retain), time.Now(), opts.Storage.DisableCheckpoints,
+				liveReclaim(store))
 		}
 	}
 
@@ -300,6 +301,17 @@ func liveRetention(store storage.Adapter, configured storage.RetentionWindow) st
 		return eng.RawRetentionWindow()
 	}
 	return configured
+}
+
+// liveReclaim is how eagerly this store reclaims right now, which the
+// control plane can change on a running engine
+// (ServerEngine.SetReclaimMode). A store that is not the server engine
+// reclaims on the default schedule, having no setter to consult.
+func liveReclaim(store storage.Adapter) storage.ReclaimMode {
+	if eng, ok := store.(*engine.ServerEngine); ok {
+		return eng.ReclaimMode()
+	}
+	return storage.DefaultReclaimMode
 }
 
 // LockDataDir takes dataRoot's attach lock exclusively and returns its release func. For

@@ -50,6 +50,32 @@ func (e *ServerEngine) RawRetentionWindow() storage.RetentionWindow {
 	return e.config.Retain
 }
 
+// ReclaimMode reports how eagerly this namespace reclaims what its
+// retention window has released, resolved. Independent of HistoryMode: the
+// mode says what *may* be reclaimed, this says whether anything is.
+func (e *ServerEngine) ReclaimMode() storage.ReclaimMode {
+	e.retainMu.RLock()
+	defer e.retainMu.RUnlock()
+	if e.reclaimLive != nil {
+		return e.reclaimLive.Resolve()
+	}
+	return e.config.Reclaim.Resolve()
+}
+
+// SetReclaimMode changes how eagerly this namespace reclaims, on a running
+// engine.
+//
+// Safe under load, and in force from the next maintenance pass: nothing
+// caches it across a pass. Moving *to* storage.ReclaimManual takes effect
+// without undoing anything already reclaimed - it stops future deletion, it
+// does not restore past deletion, and nothing about this call pretends
+// otherwise.
+func (e *ServerEngine) SetReclaimMode(r storage.ReclaimMode) {
+	e.retainMu.Lock()
+	defer e.retainMu.Unlock()
+	e.reclaimLive = &r
+}
+
 // SetRetentionWindow changes how much of the past this namespace keeps,
 // on a running engine.
 //
