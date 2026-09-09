@@ -76,7 +76,8 @@ func (e *ServerEngine) MemoryDemandBytes() int64 {
 		resident += e.docsByHash.ResidentBytes()
 	}
 	if e.treesByHash != nil {
-		resident += e.treesByHash.ResidentBytes()
+		// Evictable rather than resident: see boundedTreeStore.EvictableBytes.
+		resident += e.treesByHash.EvictableBytes()
 	}
 	if e.memTable != nil {
 		resident += e.memTable.SizeBytes()

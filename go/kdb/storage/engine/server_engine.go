@@ -75,6 +75,15 @@ type ServerEngine struct {
 	// this namespace's share. Atomic rather than a write to config, which
 	// is a value field read without synchronisation from several paths.
 	memtableFlushOverride atomic.Int64
+	// treeRebuilds counts historical document trees resolved the expensive
+	// way - from tree objects or by folding the delta log - because the
+	// bounded store did not hold them. Unlike coldLoads this is not fed to
+	// the memory arbiter: a rebuild says a tree was missing, not that the
+	// namespace wants more cache, and the trees that matter most are pinned
+	// rather than cached. It exists so a test can assert the commit path is
+	// not rebuilding, which is a property no timing measurement states
+	// reliably. See PinTree.
+	treeRebuilds atomic.Int64
 	// lastColdLoads is what coldLoads read at the previous DemandBytes
 	// call, so demand can tell "at its ceiling and coping" from "at its
 	// ceiling and missing" - the only difference that should move a budget.
@@ -166,6 +175,7 @@ func (e *ServerEngine) treeAt(atCommit codec.Hash) (document.DocumentTree, bool,
 	// replay strategy, or one whose objects have not survived - is the
 	// tree folded back out of the log.
 	if tree, ok := e.treeFromObjects(atCommit); ok {
+		e.treeRebuilds.Add(1)
 		e.treesByHash.Put(tree)
 		return tree, true, nil
 	}
@@ -173,8 +183,40 @@ func (e *ServerEngine) treeAt(atCommit codec.Hash) (document.DocumentTree, bool,
 	if err != nil || !found {
 		return document.DocumentTree{}, false, err
 	}
+	e.treeRebuilds.Add(1)
 	e.treesByHash.Put(tree)
 	return tree, true, nil
+}
+
+// PinTree keeps the tree named by treeHash resolvable without a rebuild until UnpinTree,
+// implementing storage.TreePinner.
+//
+// The caller is a writer that resolved a base version and then queued behind the write gate.
+// By the time it reaches the front, head has advanced - under concurrent writers, by as many
+// commits as there are writers ahead of it - so its base version names a tree that is no
+// longer the live one, misses latestTree, and has usually been evicted from the bounded store
+// by the other writers' trees. It is then rebuilt from scratch, per operation, on the commit
+// path: measured at 40% of commit CPU in BenchmarkWorkloadWriteInsert/heavy-multi-user, which
+// is enough to back the capacity-1 write gate up past DefaultWriteTimeout and fail the write
+// outright.
+//
+// Pinning is the fix rather than a larger budget because the set that has to survive is not
+// "recent trees", it is exactly the base versions of the writers currently in flight - which
+// the queue already bounds, and which no LRU can identify. See
+// docs/benchmarks/2026-09-07-perf-rerun-7947cce.md for the profile.
+func (e *ServerEngine) PinTree(treeHash codec.Hash) {
+	if e == nil || e.treesByHash == nil {
+		return
+	}
+	e.treesByHash.Pin(treeHash)
+}
+
+// UnpinTree releases one pin taken by PinTree.
+func (e *ServerEngine) UnpinTree(treeHash codec.Hash) {
+	if e == nil || e.treesByHash == nil {
+		return
+	}
+	e.treesByHash.Unpin(treeHash)
 }
 
 // publishTreeLocked records tree under its hash and republishes it as the latest. Must be
@@ -423,6 +465,10 @@ func (e *ServerEngine) loadCold(docID codec.UUID, contentHash codec.Hash) (docum
 // from durable storage after being evicted from the in-memory version
 // store. Zero on a namespace whose history has never been read.
 func (e *ServerEngine) ColdDocumentLoads() int64 { return e.coldLoads.Load() }
+
+// HistoryTreeRebuilds is how many times a document tree had to be resolved from tree objects
+// or by folding the delta log, rather than being found resident. For tests and reporting.
+func (e *ServerEngine) HistoryTreeRebuilds() int64 { return e.treeRebuilds.Load() }
 
 // coldDocLoader finds one document version by the content hash a
 // DocumentTree recorded for it. See SetColdLoader.
