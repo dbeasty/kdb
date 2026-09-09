@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -97,13 +98,28 @@ const (
 // Start it with StartMaintenance and stop it with Stop. One scheduler
 // serves one namespace, matching Maintain itself.
 type MaintenanceScheduler struct {
-	rt   *EmbeddedKdbRuntime
+	rt *EmbeddedKdbRuntime
+	// opts holds the parts of the configuration that cannot change after
+	// construction: the Busy predicate, the logger and the test seams. The
+	// three that *can* change live below, under mu - see SetInterval.
 	opts MaintenanceOptions
 
 	stop chan struct{}
 	done chan struct{}
+	// reconfigured wakes the loop when a setter changes the cadence, so a
+	// shortened interval takes effect now rather than after the sleep that
+	// was already pending under the old one. Buffered by one and sent
+	// non-blockingly: several changes before the loop wakes coalesce into
+	// the single recomputation they amount to.
+	reconfigured chan struct{}
 
 	mu sync.Mutex
+	// interval, sweep and maxDefer are the live-changeable cadence. Read
+	// through their accessors, never directly, so a change from the
+	// control plane cannot race the loop reading them.
+	interval time.Duration
+	sweep    time.Duration
+	maxDefer int
 	// lastHead is the commit the last pass observed, and lastPassAt when
 	// that pass ran. Together they answer "has anything happened since?"
 	// without touching the disk.
@@ -178,10 +194,14 @@ func newMaintenanceScheduler(rt *EmbeddedKdbRuntime, opts MaintenanceOptions) *M
 		opts.after = time.After
 	}
 	s := &MaintenanceScheduler{
-		rt:   rt,
-		opts: opts,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		rt:           rt,
+		opts:         opts,
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		reconfigured: make(chan struct{}, 1),
+		interval:     opts.Interval,
+		sweep:        opts.Sweep,
+		maxDefer:     opts.MaxDefer,
 	}
 	// Seed from the current head rather than the zero hash, so a runtime
 	// that opens with existing history does not read as "something was
@@ -226,9 +246,91 @@ func (s *MaintenanceScheduler) loop() {
 		select {
 		case <-s.stop:
 			return
-		case <-s.opts.after(s.opts.Interval):
+		case <-s.reconfigured:
+			// The cadence changed. Fall through to recompute the wait
+			// rather than serving out the old one.
+		case <-s.opts.after(s.Interval()):
 			s.tick()
 		}
+	}
+}
+
+// Interval, Sweep and MaxDefer report the cadence currently in force.
+func (s *MaintenanceScheduler) Interval() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.interval
+}
+
+func (s *MaintenanceScheduler) Sweep() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sweep
+}
+
+func (s *MaintenanceScheduler) MaxDefer() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxDefer
+}
+
+// SetInterval changes how often the scheduler wakes, taking effect
+// immediately rather than after the pending sleep - a caller who shortens
+// the interval because a namespace is growing should not wait out the old
+// one first.
+//
+// Safe to call while the loop is running and while a pass is in flight: it
+// changes when the *next* wake-up happens and never interrupts a pass.
+// A non-positive interval is refused rather than treated as "disable",
+// because a scheduler that has silently stopped looks exactly like one
+// that has nothing to do. Stop it if that is what is wanted.
+func (s *MaintenanceScheduler) SetInterval(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("kdb: maintenance interval must be positive; stop the scheduler to disable it")
+	}
+	s.mu.Lock()
+	s.interval = d
+	s.mu.Unlock()
+	s.signalReconfigured()
+	return nil
+}
+
+// SetSweep changes how long the scheduler may go without a pass while the
+// namespace is idle. Safe under load, and takes effect at the next tick -
+// the sweep is a comparison made inside needsWork, not a timer.
+func (s *MaintenanceScheduler) SetSweep(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("kdb: maintenance sweep must be positive")
+	}
+	s.mu.Lock()
+	s.sweep = d
+	s.mu.Unlock()
+	return nil
+}
+
+// SetMaxDefer changes how many consecutive busy ticks may postpone a due
+// pass before it runs anyway. Safe under load.
+//
+// Zero is rejected rather than silently meaning the default: from the
+// control plane, "0" reads as "never defer", and quietly turning that into
+// "defer six times" would be the opposite of what was asked. Pass a
+// negative value for "never force", which is the genuinely unbounded
+// setting and is documented on MaintenanceOptions as the foot-gun it is.
+func (s *MaintenanceScheduler) SetMaxDefer(n int) error {
+	if n == 0 {
+		return fmt.Errorf("kdb: maintenance maxDefer of 0 is ambiguous; " +
+			"use a positive count to bound deferral, or -1 to never force a pass through load")
+	}
+	s.mu.Lock()
+	s.maxDefer = n
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *MaintenanceScheduler) signalReconfigured() {
+	select {
+	case s.reconfigured <- struct{}{}:
+	default:
 	}
 }
 
@@ -282,7 +384,7 @@ func (s *MaintenanceScheduler) decide(now time.Time) maintenanceDecision {
 	s.mu.Lock()
 	deferred := s.deferrals
 	s.mu.Unlock()
-	if s.opts.MaxDefer >= 0 && deferred >= s.opts.MaxDefer {
+	if maxDefer := s.MaxDefer(); maxDefer >= 0 && deferred >= maxDefer {
 		// Load has held this pass off long enough. A server that is
 		// always busy is the one that most needs its log reclaimed.
 		return maintenanceForce
@@ -316,7 +418,7 @@ func (s *MaintenanceScheduler) needsWork(now time.Time) bool {
 	// 3. The sweep. A duration window expires by the clock alone, so an
 	//    idle namespace still has to look occasionally - and this is also
 	//    what makes the first tick after open a real one.
-	return now.Sub(lastPassAt) >= s.opts.Sweep
+	return now.Sub(lastPassAt) >= s.Sweep()
 }
 
 // runPass calls Maintain and records what it did.

@@ -26,9 +26,47 @@ func (e *ServerEngine) HistoryMode() storage.HistoryMode {
 }
 
 // RetentionWindow reports how much of the past this namespace keeps under
-// storage.HistoryModeNone. Meaningless, and ignored, under Full.
+// storage.HistoryModeNone, resolved. Meaningless, and ignored, under Full.
 func (e *ServerEngine) RetentionWindow() storage.RetentionWindow {
-	return e.config.Retain.Resolve()
+	return e.RawRetentionWindow().Resolve()
+}
+
+// RawRetentionWindow is the window exactly as configured, *unresolved*.
+//
+// Two accessors rather than one because resolving is not free of meaning:
+// Resolve turns the RetainNothing sentinel into a plain zero and a plain
+// zero back into the default, so a value that has been through it can no
+// longer express "keep nothing" to a second reader. The rule this engine
+// follows (see embed/file.go's StorageEngineConfig construction) is that
+// the configured value is carried unresolved and every reader resolves at
+// the point of use - so the truncation planner takes this one, and
+// anything merely reporting takes RetentionWindow.
+func (e *ServerEngine) RawRetentionWindow() storage.RetentionWindow {
+	e.retainMu.RLock()
+	defer e.retainMu.RUnlock()
+	if e.retainLive != nil {
+		return *e.retainLive
+	}
+	return e.config.Retain
+}
+
+// SetRetentionWindow changes how much of the past this namespace keeps,
+// on a running engine.
+//
+// Safe under load: the window is not cached by anything that holds it
+// across a pass - every reader takes it through the accessors above, and
+// the truncation planner reads it once per pass, so a change is in force
+// from the next pass onwards and never mutates one already deciding.
+//
+// It applies to what has *already* been written, not merely to what will
+// be: shortening the window makes segments that were retained under the
+// old one eligible on the very next pass. That is the point of it, and it
+// is also irreversible once the pass runs, so a caller that can offer a
+// preview (see embed's truncation planner) should.
+func (e *ServerEngine) SetRetentionWindow(w storage.RetentionWindow) {
+	e.retainMu.Lock()
+	defer e.retainMu.Unlock()
+	e.retainLive = &w
 }
 
 // Tree objects: what a document tree looked like at one commit, stored on

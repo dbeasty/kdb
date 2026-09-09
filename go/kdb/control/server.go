@@ -35,6 +35,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/config"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/server"
 )
 
@@ -105,8 +106,22 @@ type Options struct {
 	// applied live, but there is nowhere to write it down, and asking to persist says so rather
 	// than inventing a file that nothing would read on the next startup.
 	ConfigPath string
+	// Maintenance is the background maintenance loops this process is running, by namespace, so
+	// their cadence can be changed without a restart. Empty leaves the maintenance settings
+	// reported but refused - which is the honest answer for a process that is not running any.
+	//
+	// A source rather than a map so the service can keep ownership of the schedulers' lifecycle:
+	// the control plane changes their settings, it does not start or stop them.
+	Maintenance MaintenanceSource
 	// Now is the clock, for tests. nil uses time.Now.
 	Now func() time.Time
+}
+
+// MaintenanceSource is where the control plane finds the maintenance loops it may reconfigure.
+type MaintenanceSource interface {
+	// Schedulers returns the running loops by namespace. The control plane treats the result as a
+	// snapshot and does not retain it, so an implementation may rebuild it per call.
+	Schedulers() map[string]*embed.MaintenanceScheduler
 }
 
 // Server is a running control plane.

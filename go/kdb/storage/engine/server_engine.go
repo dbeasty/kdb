@@ -19,6 +19,12 @@ import (
 type ServerEngine struct {
 	namespaceID string
 	config      storage.StorageEngineConfig
+	// retainLive overrides config.Retain once something has set the
+	// retention window on the running engine; nil means "whatever this
+	// engine was opened with". Guarded because it is written from the
+	// control plane while passes and reads take it.
+	retainMu    sync.RWMutex
+	retainLive  *storage.RetentionWindow
 	wal         wal.WriteAheadLog
 	groupCommit *wal.GroupCommitter
 

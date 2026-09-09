@@ -296,14 +296,41 @@ unavailable.
 
 ## Phases
 
-**Phase 1 — make what exists visible and live.** Descriptors for
-`history.mode`, `retain.duration`, `retain.commits`,
-`governance.maintenanceSweep`, `governance.maintenanceMaxDefer` (Gap B).
-Setters on `MaintenanceScheduler` + `liveSettings()` entries for the
-maintenance knobs and `retain.*`. History mode reported, and refused for
-now with the refusal pointing at Phase 4.
-*Exit:* an operator can see every setting that governs reclamation, and
-change the cadence ones from the UI with no restart.
+**Phase 1 — make what exists visible and live. LANDED 2026-09-09.**
+
+| what | where |
+|---|---|
+| `SetInterval` / `SetSweep` / `SetMaxDefer`, plus accessors | `embed/maintenance_loop.go` |
+| `reconfigured` channel so a shortened interval does not serve out the pending sleep | same |
+| `SetRetentionWindow` / `RawRetentionWindow` on the engine; `retainLive` override | `storage/engine/tree_objects.go`, `server_engine.go` |
+| `EmbeddedKdbRuntime.SetRetentionWindow`, refusing `full` and read-only | `embed/history_features.go` |
+| `liveRetention`, so the pass and the close-time checkpoint read the live value | `embed/file.go` |
+| descriptors for `history.mode`, `retain.duration`, `retain.commits` | `config/descriptors.go` |
+| `governance.maintenanceSweep` / `MaxDefer` through the full flag/env/file chain; `maintenanceInterval` reclassified `restart` → `live` | `config/service.go`, `descriptors.go`, `service/service.go` |
+| `liveSettings()` entries for all five, `MaintenanceSource`, `maintenanceRegistry` | `control/settings_apply.go`, `control/server.go`, `service/service.go` |
+
+Three decisions worth keeping:
+
+- **Zero is refused, not interpreted.** A `0` interval reads as "stop
+  maintaining" from a UI and as "use the default" in a struct literal;
+  `maxDefer: 0` reads as "never defer" and means "default 6". Both are
+  refused with a message naming the two readings, because a settings patch
+  is not where a loop's lifecycle gets decided.
+- **`retain.*` is read-modify-write per namespace**, against each
+  namespace's *current* window rather than one rebuilt from the
+  descriptors — `duration` and `commits` are halves of one value and a
+  patch to one must not revert a live change to the other.
+- **A change that reaches no scheduler and no namespace is an error**, not
+  a success. "Applied" against nothing would report a setting as in force
+  while changing nothing.
+
+`history.mode` is described as `immutable` and refused, which is the honest
+class *today* — the marker is checked at open and disagreeing is refused.
+Phase 4 reclassifies it.
+
+*Exit met:* every setting that governs reclamation is visible from
+`/v1/settings`, and the cadence and window settings change on a running
+server.
 
 **Phase 2 — reclaim modes.** `governance.reclaim` as the preset in §2,
 plus the seal-triggered pass for `immediate`. Presets set the underlying

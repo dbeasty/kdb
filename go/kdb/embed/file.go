@@ -247,7 +247,7 @@ func (h *Host) openNamespace(
 			// After the seal, so no segment can gain another commit and the
 			// checkpoint can claim the newest one - see checkpointOnClose.
 			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID,
-				opts.Storage.Retain, opts.Storage.DisableCheckpoints)
+				liveRetention(store, opts.Storage.Retain), opts.Storage.DisableCheckpoints)
 		}
 		if err := handle.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -271,7 +271,7 @@ func (h *Host) openNamespace(
 			}
 			return checkpointAndTruncate(
 				d, store, r, io, namespaceID, through,
-				opts.Storage.Retain, time.Now(), opts.Storage.DisableCheckpoints)
+				liveRetention(store, opts.Storage.Retain), time.Now(), opts.Storage.DisableCheckpoints)
 		}
 	}
 
@@ -283,6 +283,22 @@ func (h *Host) openNamespace(
 		budget = namespaceBudget{eng: eng, dag: d, pinnedOps: opts.Storage.CommitOpsBytes > 0}
 	}
 	return &namespaceEntry{rt: rt, close: storageClose}, budget, nil
+}
+
+// liveRetention is the retention window in force right now, which is not
+// necessarily the one this runtime was opened with: the control plane can
+// change it on a running engine (ServerEngine.SetRetentionWindow), and a
+// maintenance pass has to honour the current value rather than the one its
+// closure captured at open.
+//
+// Unresolved, deliberately - see the note on StorageEngineConfig.Retain
+// above, and RawRetentionWindow. Falls back to the configured value for a
+// store that is not the server engine, which has no live setter to consult.
+func liveRetention(store storage.Adapter, configured storage.RetentionWindow) storage.RetentionWindow {
+	if eng, ok := store.(*engine.ServerEngine); ok {
+		return eng.RawRetentionWindow()
+	}
+	return configured
 }
 
 // LockDataDir takes dataRoot's attach lock exclusively and returns its release func. For

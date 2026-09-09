@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -76,6 +77,8 @@ func Main() {
 	fs.StringVar(&flagVals.AdminAddr, "admin-addr", flagVals.AdminAddr, "operational HTTP endpoint (host:port) serving /healthz, /readyz, /metrics (Prometheus), /debug/vars, /debug/pprof - plain HTTP with no auth, so bind it to localhost or a private interface, never the public network (empty to disable)")
 	fs.DurationVar(&flagVals.DrainTimeout, "drain-timeout", flagVals.DrainTimeout, "on SIGTERM/SIGINT, how long to wait for already-admitted writes to finish before closing storage anyway - new writes are rejected immediately either way, and storage stays crash-consistent even when the deadline is hit (the WAL/delta replay path covers whatever didn't get flushed)")
 	fs.DurationVar(&flagVals.MaintenanceInterval, "maintenance-interval", flagVals.MaintenanceInterval, "how often to consider a background maintenance pass per namespace - checkpoint, reclaim delta segments past the retention window (history=none), compact the blob store. Ticks with nothing to do are cheap, and a pass waits for a moment with no write in flight (bounded, so sustained load cannot starve it). 0 reclaims only at close")
+	fs.DurationVar(&flagVals.MaintenanceSweep, "maintenance-sweep", flagVals.MaintenanceSweep, "how long the maintenance loop may go without a pass while a namespace is idle - retention expires by wall clock with no commit involved, so this is what catches a window that aged out of a namespace nobody is writing to")
+	fs.IntVar(&flagVals.MaintenanceMaxDefer, "maintenance-max-defer", flagVals.MaintenanceMaxDefer, "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway; -1 never forces one through, which risks a busy server never reclaiming")
 	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
 	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
@@ -190,6 +193,10 @@ func Main() {
 			os.Exit(1)
 		}
 	}
+
+	// Held from here because the control plane is handed it at listener construction, well before
+	// the loops themselves are started further down.
+	maintenance := newMaintenanceRegistry()
 
 	var rt *embed.EmbeddedKdbRuntime
 	// secondary holds the namespaces this process serves *besides* the primary one. Only the
@@ -526,6 +533,8 @@ func Main() {
 			ConfigPath: configPath,
 			BackupDir:  cfg.ControlBackupDir,
 			StagingDir: cfg.ControlStagingDir,
+			// The running maintenance loops, so their cadence is adjustable without a restart.
+			Maintenance: maintenance,
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)
@@ -567,21 +576,19 @@ func Main() {
 	// actually contends with is commits, and queueDepth is exactly "is a commit in flight right
 	// now". Deferral is bounded inside the scheduler, so a server under sustained load still
 	// reclaims - see embed.MaintenanceOptions.
-	var schedulers []*embed.MaintenanceScheduler
 	if cfg.MaintenanceInterval > 0 {
-		start := func(r *embed.EmbeddedKdbRuntime, busySrv *server.KdbServerRuntime) {
-			sched := embed.StartMaintenance(r, embed.MaintenanceOptions{
+		start := func(id string, r *embed.EmbeddedKdbRuntime, busySrv *server.KdbServerRuntime) {
+			maintenance.add(id, embed.StartMaintenance(r, embed.MaintenanceOptions{
 				Interval: cfg.MaintenanceInterval,
+				Sweep:    cfg.MaintenanceSweep,
+				MaxDefer: cfg.MaintenanceMaxDefer,
 				Busy:     func() bool { return busySrv.WriteQueueDepth() > 0 },
-			})
-			if sched != nil {
-				schedulers = append(schedulers, sched)
-			}
+			}))
 		}
-		start(rt, srv)
+		start(namespace, rt, srv)
 		for id, nsSrv := range secondary {
 			if nsRT := nsSrv.Runtime; nsRT != nil {
-				start(nsRT, nsSrv)
+				start(id, nsRT, nsSrv)
 			} else {
 				slog.Debug("no maintenance loop for this namespace", "namespace", id)
 			}
@@ -608,7 +615,7 @@ func Main() {
 		"memory_limit", memoryLimitStatus,
 		"abort_after", abortStatus,
 		"document_expiry", srv.ExpirySummary(),
-		"maintenance", maintenanceStatus(cfg.MaintenanceInterval, len(schedulers)),
+		"maintenance", maintenanceStatus(cfg.MaintenanceInterval, len(maintenance.all())),
 		"namespace", namespace,
 	)
 	if admin != nil {
@@ -645,7 +652,7 @@ func Main() {
 	// Before anything else: a pass that is mid-truncation holds the invariant that makes
 	// truncation safe (bodies flushed, checkpoint written, then segments deleted), and Stop waits
 	// for it rather than cutting it short.
-	for _, sched := range schedulers {
+	for _, sched := range maintenance.all() {
 		sched.Stop()
 	}
 	watchdog.Stop()
@@ -680,6 +687,53 @@ func Main() {
 		os.Exit(75)
 	}
 	slog.Info("shutdown complete")
+}
+
+// maintenanceRegistry hands the control plane the maintenance loops this process is running.
+//
+// A registry rather than the map itself because the control listener is bound before the loops
+// are started - the listener needs every namespace open, and the loops want to be the last thing
+// started and the first thing stopped. So the control plane holds this from the beginning and
+// sees the loops appear when they do, and the mutex is what makes that safe: an HTTP handler
+// reads it from its own goroutine while main is still filling it in.
+type maintenanceRegistry struct {
+	mu   sync.Mutex
+	byNS map[string]*embed.MaintenanceScheduler
+}
+
+func newMaintenanceRegistry() *maintenanceRegistry {
+	return &maintenanceRegistry{byNS: map[string]*embed.MaintenanceScheduler{}}
+}
+
+func (m *maintenanceRegistry) add(namespaceID string, sched *embed.MaintenanceScheduler) {
+	if sched == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.byNS[namespaceID] = sched
+}
+
+// Schedulers implements control.MaintenanceSource. It copies, because the caller is another
+// goroutine and the map keeps being written while the process starts up.
+func (m *maintenanceRegistry) Schedulers() map[string]*embed.MaintenanceScheduler {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]*embed.MaintenanceScheduler, len(m.byNS))
+	for ns, sched := range m.byNS {
+		out[ns] = sched
+	}
+	return out
+}
+
+func (m *maintenanceRegistry) all() []*embed.MaintenanceScheduler {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*embed.MaintenanceScheduler, 0, len(m.byNS))
+	for _, sched := range m.byNS {
+		out = append(out, sched)
+	}
+	return out
 }
 
 // maintenanceStatus describes the background maintenance loop for the startup log line, in the

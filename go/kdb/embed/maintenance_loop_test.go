@@ -278,3 +278,90 @@ func TestReadOnlyRuntimeGetsNoScheduler(t *testing.T) {
 		t.Fatal("StartMaintenance returned a scheduler for a zero interval")
 	}
 }
+
+// Changing the retention window on a running runtime must change what the
+// *next* pass reclaims. Without this the setter would be reporting success
+// while the pass carried on consulting the window captured at open, which
+// is the failure mode the whole live-settings story exists to avoid.
+func TestRetentionWindowChangeTakesEffectOnTheNextPass(t *testing.T) {
+	root := t.TempDir()
+	// Several sessions so there are sealed segments, opened under a window
+	// that retains everything: the first pass must reclaim nothing.
+	wide := storage.RetentionWindow{Duration: 24 * time.Hour}
+	for session := 0; session < 3; session++ {
+		opts := embed.FileRuntimeOptions{}
+		opts.Storage.MemoryBudgetBytes = 4 << 20
+		opts.Storage.HistoryMode = storage.HistoryModeNone
+		opts.Storage.Retain = wide
+		rt, err := embed.OpenFileRuntimeWithOptions(root, "app", "app/docs", schema.None(), opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 3; i++ {
+			writeMaintenanceDoc(t, rt, "a", session*10+i)
+		}
+		rt.Close()
+	}
+
+	opts := embed.FileRuntimeOptions{}
+	opts.Storage.MemoryBudgetBytes = 4 << 20
+	opts.Storage.HistoryMode = storage.HistoryModeNone
+	opts.Storage.Retain = wide
+	rt, err := embed.OpenFileRuntimeWithOptions(root, "app", "app/docs", schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	for i := 0; i < 3; i++ {
+		writeMaintenanceDoc(t, rt, "a", 100+i)
+	}
+
+	first, err := rt.Maintain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Removed != 0 {
+		t.Fatalf("a 24h window reclaimed %d segments; nothing here is a day old", first.Removed)
+	}
+
+	// Now shorten it to nothing, which makes everything below the
+	// checkpoint eligible.
+	if err := rt.SetRetentionWindow(storage.RetentionWindow{Duration: storage.RetainNothing}); err != nil {
+		t.Fatal(err)
+	}
+	// RetainNothing survives Resolve as its own sentinel rather than
+	// collapsing to a plain zero - a zero would read back as "unset" and
+	// resolve to the 24h default, which is the bug the sentinel exists to
+	// prevent. So the assertion is that it is still the sentinel.
+	if got := rt.RetentionWindow().Resolve().Duration; got != storage.RetainNothing {
+		t.Fatalf("after setting RetainNothing the window resolves to %v, want the RetainNothing sentinel", got)
+	}
+	writeMaintenanceDoc(t, rt, "a", 200)
+	second, err := rt.Maintain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Removed == 0 {
+		t.Fatal("after shortening the window to nothing, a pass still reclaimed no segments")
+	}
+	// And the data is still correct, which is the only thing a caller cares
+	// about after a reclamation.
+	body, ok := readDoc(t, rt, "a")
+	if !ok || !strings.Contains(body, `"n":200`) {
+		t.Fatalf("after reclaiming, the document reads %q", body)
+	}
+}
+
+// A full-history namespace must refuse a retention window rather than
+// storing one that will never be consulted.
+func TestRetentionWindowRefusedUnderFullMode(t *testing.T) {
+	rt := maintenanceRuntime(t, storage.HistoryModeFull, storage.RetentionWindow{})
+	writeMaintenanceDoc(t, rt, "a", 1)
+	err := rt.SetRetentionWindow(storage.RetentionWindow{Duration: time.Hour})
+	if err == nil {
+		t.Fatal("a full-history namespace accepted a retention window")
+	}
+	if !strings.Contains(err.Error(), "history=none") {
+		t.Fatalf("the refusal does not name the remedy: %v", err)
+	}
+}
