@@ -27,7 +27,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M4 | Rollback | **done** — namespace revert with plan/apply and `expectHead`, plus the per-document timeline with field-level diffs and per-version restore |
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
-| M6b | Settings (mutation) | **partial** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting; writing back to the config file is not implemented |
+| M6b | Settings (mutation) | **done** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting, and `persist:true` writes the change back to the `--config` file atomically, refusing per key when the file cannot hold it or when a flag or environment variable would outrank it |
 | M7 | Recovery | **done** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, restore-to-staging with read-only attach, and generated commands for the offline tier |
 
 ### API surface (§5)
@@ -42,8 +42,10 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 with the hash that beat them. `POST /v1/settings/validate` is folded into `PATCH` as `dryRun`
 rather than being a second endpoint that could drift from it.
 
-`PATCH /v1/settings` applies changes with per-key outcomes; `/v1/settings/{key}` and
-`/v1/settings/drift` are implemented. Nothing is declared-but-unbuilt any more: an endpoint from §8
+`PATCH /v1/settings` applies changes with per-key outcomes and, with `persist:true`, writes them
+back to the `--config` file; `/v1/settings/{key}` and `/v1/settings/drift` are implemented.
+`GET /v1/settings` reports `persistableKeys` and `persistBlocked` so a client can say whether a
+particular change will survive a restart *before* it is made, rather than after. Nothing is declared-but-unbuilt any more: an endpoint from §8
 that does not exist simply answers 404.
 
 **Not started:** per-commit document diff (`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/policy`, `/indexes`,
@@ -80,17 +82,15 @@ consistent point across every namespace, which is its own piece of work.
 | 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
 | 8 | Schema & indexes | **partial** — schema only |
 | 9 | Operations dashboard | **partial** — process and admission state; no sessions, leases or peers |
-| 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a drift banner, and the ignored-configuration panel |
+| 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a per-key "also write it to the config file" choice (with the reason when there isn't one), a drift banner, and the ignored-configuration panel |
 | 11 | Recovery | **built** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, the restore-and-attach flow, and the offline commands filled in |
 
 ### What to do next, in order
 
-1. **Persisting a setting (M6b's other half).** The six knobs §7.3 names are already safe to change at runtime, and the
-   read view that makes them legible is done.
-2. **Promotion.** Swapping a staged copy in for the live data directory needs the process stopped,
+1. **Promotion.** Swapping a staged copy in for the live data directory needs the process stopped,
    so it is a supervised-restart flow (§8.4) rather than an endpoint. The staged copy and the
    generated commands are both in place; what is missing is the drain-and-restart contract.
-3. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
+2. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
    commit: a `WriteOp` is merged on the way in, and a `DeleteOp` in the same transaction does not
    help because staging reads every operation against the baseline tree rather than against each
    other. The editor and the restore-a-version confirmation both tell the operator which keys will
@@ -652,7 +652,32 @@ A live change that vanishes on restart is a trap. Two rules:
   is a surprise rather than a feature - so a deployment has to say it wants that before the API will
   entertain it. Asking to persist without it is refused with an explanation that names the
   alternative (apply live, and read the change back off `/v1/settings/drift`) rather than just
-  saying no. The write-back itself is not implemented yet.
+  saying no.
+
+  The write-back is `config.WriteServiceFile`: the file is re-read from disk first, so a persist
+  merges into whatever is there now rather than reverting an edit made outside this process; only
+  fields that are set are written, because every `ServiceFile` field is a nullable pointer and a
+  naive round-trip would turn a four-line config into thirty lines of nulls; and the replacement is
+  a rename over a temporary file that has already been read back through `LoadServiceFile`. That
+  last check is the one that matters - a config file the next boot cannot parse is not a degraded
+  state, it is a process that exits at startup.
+
+  Persisting is refused per key, not per request, and the reason is the useful part:
+
+  - **No config-file field.** The environment-only surface (`cache.commitOpsBytes` and the rest)
+    has no home in the file; its durable home is a variable this process cannot set for its
+    successor.
+  - **A flag or environment variable outranks the file.** Precedence is file < environment <
+    explicitly-set flag, so writing the file while `--log-level` is on the command line would
+    succeed and change nothing at the next startup. That is worse than refusing: the operator would
+    read "written" and be wrong. The refusal names what to remove.
+  - **There is no `--config` at all.** A process started on flags alone has nowhere durable to put
+    a value, and inventing a file nothing would read is not an improvement.
+
+  In every case the live change still stands - the operator asked for both, and refusing to apply
+  because the file is unwritable would leave them with neither - and the per-key `persisted` note
+  plus a top-level `persistedAll` say exactly what did and did not become durable. A successful
+  write moves the key's startup value, which is what makes the drift banner clear.
 - `GET /v1/settings/drift` reports every running value that differs from what the config file and
   environment would produce on a restart. The settings screen shows a persistent banner while
   drift is non-empty. An operator should never be surprised by a restart.

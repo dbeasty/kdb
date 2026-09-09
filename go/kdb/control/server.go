@@ -87,6 +87,11 @@ type Options struct {
 	// rewriting it is a surprise rather than a feature. A change applied without it is still
 	// reported as drift, so nothing is silently lost.
 	AllowSettingsPersist bool
+	// ConfigPath is the --config file this process resolved its settings from, and the only file a
+	// persisted change is ever written to. Empty means there was none: a change can then still be
+	// applied live, but there is nowhere to write it down, and asking to persist says so rather
+	// than inventing a file that nothing would read on the next startup.
+	ConfigPath string
 	// Now is the clock, for tests. nil uses time.Now.
 	Now func() time.Time
 }

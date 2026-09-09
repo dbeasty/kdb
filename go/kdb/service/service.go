@@ -475,8 +475,12 @@ func Main() {
 			// The live level holder, so log.level is adjustable without a restart.
 			LogLevel:             logLevel,
 			AllowSettingsPersist: cfg.ControlSettingsPersist,
-			BackupDir:            cfg.ControlBackupDir,
-			StagingDir:           cfg.ControlStagingDir,
+			// The file a persisted setting is written back to - the same one this process resolved
+			// its settings from. Empty when no --config was given, which the control plane reports
+			// rather than inventing a file nothing would read on the next startup.
+			ConfigPath: configPath,
+			BackupDir:  cfg.ControlBackupDir,
+			StagingDir: cfg.ControlStagingDir,
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)

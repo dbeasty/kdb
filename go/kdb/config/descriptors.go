@@ -109,6 +109,14 @@ type settingSpec struct {
 	value func(ServiceSettings) any
 	// inFile reports whether a config file set this setting.
 	inFile func(*ServiceFile) bool
+	// setInFile writes this setting's value into a ServiceFile, for a control plane started with
+	// --control-settings-persist.
+	//
+	// Non-nil only for settings that can be changed on a running process: those are the only ones
+	// PATCH /v1/settings accepts, so they are the only ones with anything to persist. A setting
+	// with no writer is refused by SetInFile rather than silently skipped, and
+	// TestEveryLiveSettingCanBePersisted keeps the two sets from drifting apart.
+	setInFile func(*ServiceFile, any) error
 }
 
 // serviceSpecs describes every field of ServiceSettings. Adding a field to ServiceSettings
@@ -200,9 +208,10 @@ func serviceSpecs() []settingSpec {
 		{
 			key: "memory.budgetMB", flag: "memory-budget-mb", env: "KDB_MEMORY_BUDGET_MB",
 			scope: ScopeProcess, mutability: MutabilityLive, unit: "MiB",
-			help:   "memory budget admission control governs against; 0 auto-detects the cgroup/container limit, -1 disables governance",
-			value:  num(func(s ServiceSettings) int { return s.MemoryBudgetMB }),
-			inFile: func(f *ServiceFile) bool { return f.MemoryBudgetMB != nil },
+			help:      "memory budget admission control governs against; 0 auto-detects the cgroup/container limit, -1 disables governance",
+			value:     num(func(s ServiceSettings) int { return s.MemoryBudgetMB }),
+			inFile:    func(f *ServiceFile) bool { return f.MemoryBudgetMB != nil },
+			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.MemoryBudgetMB = &n }, -1),
 		},
 		{
 			key: "memory.limitMB", flag: "memory-limit-mb", env: "KDB_MEMORY_LIMIT_MB",
@@ -210,13 +219,20 @@ func serviceSpecs() []settingSpec {
 			help:   "DEPRECATED alias for memory.budgetMB, retained for existing configs; an explicit 0 disables governance",
 			value:  num(func(s ServiceSettings) int { return s.MemoryLimitMB }),
 			inFile: func(f *ServiceFile) bool { return f.MemoryLimitMB != nil },
+			// Persistable for the same reason it is described at all: it is a real field of real
+			// config files. A patch never reaches this - the control plane has no live setter for a
+			// deprecated alias, and refuses it - but leaving the writer out would make "live and
+			// file-backed implies persistable" an invariant with an exception, and the exception
+			// would be the thing that rots.
+			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.MemoryLimitMB = &n }, 0),
 		},
 		{
 			key: "memory.reserveMB", flag: "memory-reserve-mb", env: "KDB_MEMORY_RESERVE_MB",
 			scope: ScopeProcess, mutability: MutabilityLive, unit: "MiB",
-			help:   "rescue reserve held back from the grant system and released on entry to the Critical pressure zone",
-			value:  num(func(s ServiceSettings) int { return s.MemoryReserveMB }),
-			inFile: func(f *ServiceFile) bool { return f.MemoryReserveMB != nil },
+			help:      "rescue reserve held back from the grant system and released on entry to the Critical pressure zone",
+			value:     num(func(s ServiceSettings) int { return s.MemoryReserveMB }),
+			inFile:    func(f *ServiceFile) bool { return f.MemoryReserveMB != nil },
+			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.MemoryReserveMB = &n }, 0),
 		},
 		{
 			key: "governance.maxConnections", flag: "max-connections", env: "KDB_MAX_CONNECTIONS",
@@ -228,9 +244,10 @@ func serviceSpecs() []settingSpec {
 		{
 			key: "governance.scanRowBudget", flag: "scan-row-budget", env: "KDB_SCAN_ROW_BUDGET",
 			scope: ScopeProcess, mutability: MutabilityLive, unit: "rows",
-			help:   "maximum rows a single scan may examine (not merely return) before RESOURCE_EXHAUSTED; shrinks as memory pressure rises. 0 is unlimited",
-			value:  num(func(s ServiceSettings) int { return s.ScanRowBudget }),
-			inFile: func(f *ServiceFile) bool { return f.ScanRowBudget != nil },
+			help:      "maximum rows a single scan may examine (not merely return) before RESOURCE_EXHAUSTED; shrinks as memory pressure rises. 0 is unlimited",
+			value:     num(func(s ServiceSettings) int { return s.ScanRowBudget }),
+			inFile:    func(f *ServiceFile) bool { return f.ScanRowBudget != nil },
+			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.ScanRowBudget = &n }, 0),
 		},
 		{
 			key: "governance.abortAfter", flag: "abort-after", env: "KDB_ABORT_AFTER",
@@ -322,6 +339,21 @@ func serviceSpecs() []settingSpec {
 			help:   "minimum log level: debug, info, warn, error",
 			value:  str(func(s ServiceSettings) string { return s.LogLevel }),
 			inFile: func(f *ServiceFile) bool { return f.LogLevel != nil },
+			setInFile: func(f *ServiceFile, v any) error {
+				name, ok := v.(string)
+				if !ok {
+					return fmt.Errorf("log.level must be a string, got %T", v)
+				}
+				// Validated on the way in as well as on the way out: what goes in the file has to
+				// be something the next startup will accept, or persisting a setting is how the
+				// server stops booting.
+				if _, err := ParseLogLevel(name); err != nil {
+					return err
+				}
+				name = strings.ToLower(strings.TrimSpace(name))
+				f.LogLevel = &name
+				return nil
+			},
 		},
 		{
 			key: "log.format", flag: "log-format", env: "KDB_LOG_FORMAT",

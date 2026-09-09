@@ -280,6 +280,9 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request, pri
 
 	live := liveSettings()
 	outcomes := make([]changeOutcome, 0, len(req.Changes))
+	// Persisting happens once, after the loop: a patch is one operator action, and rewriting the
+	// config file per key would leave intermediate states on disk that nobody asked for.
+	var toPersist []persistRequest
 	changed := 0
 	for _, change := range req.Changes {
 		out := changeOutcome{Key: change.Key, To: change.Value}
@@ -311,6 +314,12 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request, pri
 			out.To = parsed
 			out.Warnings = "dry run: nothing was changed"
 			changed++
+			if req.Persist {
+				// The persist checks run in a dry run too. Whether a value can be written down is
+				// most of what an operator is reviewing, and finding out afterwards that it could
+				// not defeats the point of reviewing at all.
+				toPersist = append(toPersist, persistRequest{key: change.Key, value: parsed})
+			}
 			outcomes = append(outcomes, out)
 			continue
 		}
@@ -324,10 +333,33 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request, pri
 		out.To = parsed
 		changed++
 		if req.Persist {
-			out.Persist = "not written: persisting to the config file is not implemented yet, so " +
-				"this change is live-only and appears under /v1/settings/drift"
+			toPersist = append(toPersist, persistRequest{key: change.Key, value: parsed})
 		}
 		outcomes = append(outcomes, out)
+	}
+
+	// The live change stands whether or not it could be written down: the operator asked for both,
+	// and refusing to apply because the file is unwritable would leave them with neither. What
+	// they must not be left with is the impression that it was persisted, so every key that asked
+	// carries the answer, and persistedAll says it once for a caller that would rather not walk
+	// the list.
+	persistedAll := len(toPersist) > 0
+	if len(toPersist) > 0 {
+		results := s.persistApplied(toPersist, req.DryRun)
+		for i := range outcomes {
+			result, ok := results[outcomes[i].Key]
+			if !ok {
+				continue
+			}
+			outcomes[i].Persist = result.note
+			if !result.written {
+				persistedAll = false
+				continue
+			}
+			if !req.DryRun {
+				s.recordPersisted(outcomes[i].Key, outcomes[i].To)
+			}
+		}
 	}
 
 	// Partial success stays a 200 with per-key outcomes, because something did happen and the
@@ -337,18 +369,29 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request, pri
 	if changed == 0 {
 		status = http.StatusBadRequest
 	}
-	writeJSON(w, status, map[string]any{
+	body := map[string]any{
 		"revision": s.SettingsRevision(),
 		"changes":  outcomes,
 		"dryRun":   req.DryRun,
 		"drift":    s.driftKeys(),
-	})
+	}
+	if req.Persist {
+		body["persistedAll"] = persistedAll
+		body["configPath"] = s.opts.ConfigPath
+	}
+	writeJSON(w, status, body)
 }
 
 // refusalFor explains what would work instead, from the setting's mutability class. "Cannot change
 // that" on its own sends an operator looking; naming the class tells them where to look.
 func refusalFor(m config.Mutability) string {
 	switch m {
+	case config.MutabilityLive:
+		// Reachable, and the message has to be honest about the mismatch: the setting's class says
+		// the engine could change it under load, but this control plane has no setter wired for it.
+		// memory.limitMB is the one today - a deprecated alias whose live path is memory.budgetMB.
+		return "this setting can be changed on a running server in principle, but this control " +
+			"plane has no setter for it; if it is a deprecated alias, change the setting it aliases"
 	case config.MutabilityNewConnections:
 		return "this setting is read when a listener or connection is created, so it cannot be " +
 			"changed for the ones already running; restart to change it"

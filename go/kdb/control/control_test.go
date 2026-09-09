@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -2596,5 +2597,404 @@ func TestGraphIsRefusedForAPartialWalk(t *testing.T) {
 	}
 	if !strings.Contains(fmt.Sprint(body["error"]), "skip=0") {
 		t.Errorf("the refusal should say what to do instead: %v", body["error"])
+	}
+}
+
+// Persisting a setting - docs/kdb-control-ui-plan.md §7.4's other half.
+//
+// The property under test throughout is not "a file was written" but "a restart would produce the
+// value that is running". That is why every case here checks drift as well: drift is the report an
+// operator trusts to tell them whether a change is durable, and a persist that writes a file
+// without clearing drift - or clears drift without writing a file - is worse than no persist.
+
+// withPersistableConfig builds a fixture whose settings were resolved from a real config file on
+// disk, which is the only situation in which persisting means anything.
+func withPersistableConfig(t *testing.T, level *slog.LevelVar, body string) (func(*Options), string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "kdb.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := config.LoadServiceFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := config.ResolveService(file, noEnvLookup, noFlagSet, config.DefaultServiceSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return func(o *Options) {
+		o.AllowWrites = true
+		o.AllowSettingsPersist = true
+		o.ConfigPath = path
+		o.LogLevel = level
+		o.Settings = append(
+			config.Describe(file, noEnvLookup, noFlagSet, resolved),
+			config.EnvOnlyDescriptors(noEnvLookup)...)
+	}, path
+}
+
+func loadConfig(t *testing.T, path string) *config.ServiceFile {
+	t.Helper()
+	f, err := config.LoadServiceFile(path)
+	if err != nil {
+		t.Fatalf("the config file no longer loads: %v", err)
+	}
+	return f
+}
+
+func outcomeFor(t *testing.T, body map[string]any, key string) map[string]any {
+	t.Helper()
+	for _, raw := range body["changes"].([]any) {
+		out := raw.(map[string]any)
+		if out["key"] == key {
+			return out
+		}
+	}
+	t.Fatalf("no outcome for %s in %v", key, body["changes"])
+	return nil
+}
+
+func TestPersistWritesTheChangeToTheConfigFile(t *testing.T) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+	opt, path := withPersistableConfig(t, level, `{"logLevel":"info","memoryBudgetMb":512}`)
+	_, base := newFixture(t, opt)
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"debug"},{"key":"memory.budgetMB","value":1024}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("patch: %d (%v)", res.StatusCode, body)
+	}
+	if body["persistedAll"] != true {
+		t.Fatalf("both keys are file-backed and should have been written: %v", body)
+	}
+	if body["configPath"] != path {
+		t.Errorf("the response should name the file it wrote: %v", body["configPath"])
+	}
+	for _, key := range []string{"log.level", "memory.budgetMB"} {
+		out := outcomeFor(t, body, key)
+		if out["applied"] != true {
+			t.Errorf("%s should have applied: %v", key, out)
+		}
+		if !strings.Contains(fmt.Sprint(out["persisted"]), path) {
+			t.Errorf("%s should say where it was written: %v", key, out["persisted"])
+		}
+	}
+
+	// The file, not just the report.
+	file := loadConfig(t, path)
+	if file.LogLevel == nil || *file.LogLevel != "debug" {
+		t.Errorf("logLevel in the file: %v", file.LogLevel)
+	}
+	if file.MemoryBudgetMB == nil || *file.MemoryBudgetMB != 1024 {
+		t.Errorf("memoryBudgetMb in the file: %v", file.MemoryBudgetMB)
+	}
+
+	// And the point of all of it: a restart would no longer undo the change, so there is no drift
+	// left to report.
+	_, drift := get(t, base, "/v1/settings/drift")
+	if items := drift["drift"].([]any); len(items) != 0 {
+		t.Errorf("a persisted change is not drift; still reported: %v", items)
+	}
+
+	// The settings table has to say so too. Its source stays "runtime" - that is where the value
+	// came from - but on its own that reads as ephemeral, and this one is not.
+	_, settings := get(t, base, "/v1/settings")
+	for _, raw := range settings["settings"].([]any) {
+		d := raw.(map[string]any)
+		if d["key"] != "log.level" {
+			continue
+		}
+		if !strings.Contains(fmt.Sprint(d["sourceDetail"]), "written to the config file") {
+			t.Errorf("the running descriptor should say the value is durable: %v", d["sourceDetail"])
+		}
+	}
+}
+
+// TestPersistIsRefusedWithoutAConfigFile: a process started on flags alone has nowhere durable to
+// put a value. Inventing a file would be worse than refusing - nothing would read it.
+func TestPersistIsRefusedWithoutAConfigFile(t *testing.T) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+	_, base := newFixture(t, func(o *Options) {
+		withSettings(level, true)(o)
+		o.ConfigPath = ""
+	})
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"debug"}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the live change should still apply: %d (%v)", res.StatusCode, body)
+	}
+	if body["persistedAll"] != false {
+		t.Error("nothing was written, so persistedAll must be false")
+	}
+	out := outcomeFor(t, body, "log.level")
+	if out["applied"] != true {
+		t.Errorf("the live change should stand: %v", out)
+	}
+	note := fmt.Sprint(out["persisted"])
+	if !strings.Contains(note, "--config") || !strings.Contains(note, "drift") {
+		t.Errorf("the note should name what is missing and where the change now shows: %q", note)
+	}
+	if level.Level() != slog.LevelDebug {
+		t.Errorf("the running log level should have changed regardless: %v", level.Level())
+	}
+	_, drift := get(t, base, "/v1/settings/drift")
+	if len(drift["drift"].([]any)) != 1 {
+		t.Errorf("an unpersisted change must remain drift: %v", drift["drift"])
+	}
+}
+
+// TestPersistIsRefusedWhenAFlagOutranksTheFile is the trap this feature could most easily walk
+// into. Precedence is file < environment < explicitly-set flag, so writing a value into the file
+// while the flag is on the command line succeeds and changes nothing on the next startup: the
+// operator would read "written" and be wrong.
+func TestPersistIsRefusedWhenAFlagOutranksTheFile(t *testing.T) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelWarn)
+	path := filepath.Join(t.TempDir(), "kdb.json")
+	if err := os.WriteFile(path, []byte(`{"logLevel":"info"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := config.LoadServiceFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flags := config.DefaultServiceSettings()
+	flags.LogLevel = "warn"
+	onCommandLine := func(name string) bool { return name == "log-level" }
+	resolved, err := config.ResolveService(file, noEnvLookup, onCommandLine, flags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, base := newFixture(t, func(o *Options) {
+		o.AllowWrites = true
+		o.AllowSettingsPersist = true
+		o.ConfigPath = path
+		o.LogLevel = level
+		o.Settings = config.Describe(file, noEnvLookup, onCommandLine, resolved)
+	})
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"debug"}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the live change should still apply: %d (%v)", res.StatusCode, body)
+	}
+	note := fmt.Sprint(outcomeFor(t, body, "log.level")["persisted"])
+	if !strings.Contains(note, "--log-level") {
+		t.Errorf("the refusal must name the flag that would win: %q", note)
+	}
+	if !strings.Contains(note, "command line") {
+		t.Errorf("the refusal must say why writing the file would not help: %q", note)
+	}
+	// Nothing was written, so the file still says what it said.
+	if got := loadConfig(t, path); got.LogLevel == nil || *got.LogLevel != "info" {
+		t.Errorf("the file should be untouched, got %v", got.LogLevel)
+	}
+	if body["persistedAll"] != false {
+		t.Error("persistedAll must be false")
+	}
+}
+
+// The same trap via the environment, which also outranks the file.
+func TestPersistIsRefusedWhenTheEnvironmentOutranksTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kdb.json")
+	if err := os.WriteFile(path, []byte(`{"logLevel":"info"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := config.LoadServiceFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := func(name string) (string, bool) {
+		if name == "KDB_LOG_LEVEL" {
+			return "warn", true
+		}
+		return "", false
+	}
+	resolved, err := config.ResolveService(file, env, noFlagSet, config.DefaultServiceSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, base := newFixture(t, func(o *Options) {
+		o.AllowWrites = true
+		o.AllowSettingsPersist = true
+		o.ConfigPath = path
+		o.LogLevel = new(slog.LevelVar)
+		o.Settings = config.Describe(file, env, noFlagSet, resolved)
+	})
+
+	_, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"debug"}]}`)
+	note := fmt.Sprint(outcomeFor(t, body, "log.level")["persisted"])
+	if !strings.Contains(note, "KDB_LOG_LEVEL") {
+		t.Errorf("the refusal must name the variable that would win: %q", note)
+	}
+}
+
+// TestPersistIsRefusedForAnEnvironmentOnlySetting: cache.commitOpsBytes is live-changeable but has
+// no config-file field at all. Its durable home is a variable this process cannot set for its own
+// successor, and saying so is more use than a generic failure.
+func TestPersistIsRefusedForAnEnvironmentOnlySetting(t *testing.T) {
+	opt, path := withPersistableConfig(t, new(slog.LevelVar), `{"logLevel":"info"}`)
+	_, base := newFixture(t, opt)
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"cache.commitOpsBytes","value":8388608}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the live change should apply: %d (%v)", res.StatusCode, body)
+	}
+	out := outcomeFor(t, body, "cache.commitOpsBytes")
+	if out["applied"] != true {
+		t.Fatalf("cache.commitOpsBytes is live-changeable: %v", out)
+	}
+	note := fmt.Sprint(out["persisted"])
+	if !strings.Contains(note, "no config-file field") || !strings.Contains(note, "environment") {
+		t.Errorf("the note should explain there is nowhere in the file for it: %q", note)
+	}
+	// The file must not have been rewritten for a key that cannot go in it.
+	if got := loadConfig(t, path); got.LogLevel == nil || *got.LogLevel != "info" {
+		t.Errorf("the file should be untouched, got %v", got.LogLevel)
+	}
+}
+
+// A dry run runs the persist checks too. Discovering afterwards that a reviewed change could not
+// be written down defeats the point of reviewing it.
+func TestPersistDryRunSaysWhatWouldBeWrittenWithoutWritingIt(t *testing.T) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+	opt, path := withPersistableConfig(t, level, `{"logLevel":"info"}`)
+	_, base := newFixture(t, opt)
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"dryRun":true,"changes":[{"key":"log.level","value":"debug"}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("patch: %d (%v)", res.StatusCode, body)
+	}
+	note := fmt.Sprint(outcomeFor(t, body, "log.level")["persisted"])
+	if !strings.Contains(note, "would be written") || !strings.Contains(note, path) {
+		t.Errorf("a dry run should say what would happen and where: %q", note)
+	}
+	if got := loadConfig(t, path); got.LogLevel == nil || *got.LogLevel != "info" {
+		t.Errorf("a dry run must not touch the file, got %v", got.LogLevel)
+	}
+	if level.Level() != slog.LevelInfo {
+		t.Errorf("a dry run must not change the running process, got %v", level.Level())
+	}
+}
+
+// TestPersistMergesIntoWhatIsOnDiskNow: something else may have edited the file since startup - a
+// deployment tool, or an operator with an editor. Writing this process's startup copy back would
+// silently revert their change.
+func TestPersistMergesIntoWhatIsOnDiskNow(t *testing.T) {
+	opt, path := withPersistableConfig(t, new(slog.LevelVar), `{"logLevel":"info"}`)
+	_, base := newFixture(t, opt)
+
+	// An edit this process has never seen.
+	if err := os.WriteFile(path, []byte(`{"logLevel":"info","namespace":"other/ns"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"error"}]}`)
+
+	file := loadConfig(t, path)
+	if file.LogLevel == nil || *file.LogLevel != "error" {
+		t.Errorf("the change should be in the file: %v", file.LogLevel)
+	}
+	if file.Namespace == nil || *file.Namespace != "other/ns" {
+		t.Errorf("the edit made outside this process was reverted: %v", file.Namespace)
+	}
+}
+
+// A file deleted since startup is still a place a value can be written; an unreadable one is not,
+// because merging into it means guessing what to keep.
+func TestPersistRecreatesAFileDeletedSinceStartup(t *testing.T) {
+	opt, path := withPersistableConfig(t, new(slog.LevelVar), `{"logLevel":"info"}`)
+	_, base := newFixture(t, opt)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"error"}]}`)
+	if body["persistedAll"] != true {
+		t.Fatalf("an absent file can hold the value: %v", body)
+	}
+	if file := loadConfig(t, path); file.LogLevel == nil || *file.LogLevel != "error" {
+		t.Errorf("logLevel: %v", file.LogLevel)
+	}
+}
+
+func TestPersistIsRefusedWhenTheConfigFileCannotBeRead(t *testing.T) {
+	opt, path := withPersistableConfig(t, new(slog.LevelVar), `{"logLevel":"info"}`)
+	_, base := newFixture(t, opt)
+	if err := os.WriteFile(path, []byte(`{ this is not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[{"key":"log.level","value":"error"}]}`)
+	note := fmt.Sprint(outcomeFor(t, body, "log.level")["persisted"])
+	if !strings.Contains(note, "cannot be read") {
+		t.Errorf("the note should say the file is the problem: %q", note)
+	}
+	// And the damaged file is left exactly as it was rather than being overwritten with a guess.
+	body2, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body2) != `{ this is not json` {
+		t.Errorf("the unreadable file should not have been replaced, got %q", body2)
+	}
+}
+
+// TestPersistPartitionsAPatchByWhatCanBeWritten: a patch mixing a file-backed setting with an
+// environment-only one must write the first and explain the second, not fail as a whole. Refusing
+// everything because one key has no home in the file would make the mixed case unusable, and an
+// operator adjusting memory at 3am should not have to know which keys live where to get the ones
+// that do written down.
+func TestPersistPartitionsAPatchByWhatCanBeWritten(t *testing.T) {
+	opt, path := withPersistableConfig(t, new(slog.LevelVar), `{"logLevel":"info"}`)
+	_, base := newFixture(t, opt)
+
+	res, body := sendJSON(t, http.MethodPatch, base, "/v1/settings",
+		`{"persist":true,"changes":[`+
+			`{"key":"memory.reserveMB","value":64},`+
+			`{"key":"cache.commitOpsBytes","value":4194304}]}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("patch: %d (%v)", res.StatusCode, body)
+	}
+	// Both applied live; only one could be written down.
+	for _, key := range []string{"memory.reserveMB", "cache.commitOpsBytes"} {
+		if out := outcomeFor(t, body, key); out["applied"] != true {
+			t.Errorf("%s should have applied live: %v", key, out)
+		}
+	}
+	if note := fmt.Sprint(outcomeFor(t, body, "memory.reserveMB")["persisted"]); !strings.Contains(note, path) {
+		t.Errorf("the file-backed key should have been written: %q", note)
+	}
+	if note := fmt.Sprint(outcomeFor(t, body, "cache.commitOpsBytes")["persisted"]); !strings.Contains(note, "no config-file field") {
+		t.Errorf("the environment-only key should have been explained: %q", note)
+	}
+	if body["persistedAll"] != false {
+		t.Error("persistedAll must be false when any key could not be written")
+	}
+
+	file := loadConfig(t, path)
+	if file.MemoryReserveMB == nil || *file.MemoryReserveMB != 64 {
+		t.Errorf("memoryReserveMb should be in the file: %v", file.MemoryReserveMB)
+	}
+	if file.LogLevel == nil || *file.LogLevel != "info" {
+		t.Errorf("the rest of the file should survive: %v", file.LogLevel)
+	}
+
+	// Drift now holds exactly the key that could not be persisted - which is the whole point of
+	// reporting it per key rather than per request.
+	_, drift := get(t, base, "/v1/settings/drift")
+	items := drift["drift"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["key"] != "cache.commitOpsBytes" {
+		t.Errorf("drift should be just the unpersisted key: %v", items)
 	}
 }

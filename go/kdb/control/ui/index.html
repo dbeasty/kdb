@@ -1078,7 +1078,11 @@ async function renderSettings() {
               " from what this process started with, so a restart would undo " +
               (drifted.size === 1 ? "it" : "them") + ": ",
               el("code", { text: [...drifted].join(", ") }),
-              s.canPersist ? "" : " — this deployment does not let the server write its config file."),
+              s.canPersist
+                ? " — re-apply one with \u201calso write it to " + (s.configPath || "the config file") +
+                  "\u201d ticked to make it durable."
+                : " — this deployment does not let the server write its config file, so making one " +
+                  "durable means editing that file by hand."),
             el("button", { class: "act", text: "Show detail", onclick: showDrift })))
       : null,
     warnings.length
@@ -1115,6 +1119,11 @@ function settingRow(d, isLive, isDrifted, s) {
     const input = el("input", { type: "text", style: "width:120px" });
     input.value = d.value === null || d.value === undefined ? "" : String(d.value);
     const status = el("span", { class: "muted", style: "font-size:12px" });
+    // Whether this particular setting can be written to the config file. Asked per key rather than
+    // per deployment because the answer differs: a setting with no config-file field, or one set on
+    // the command line, cannot be written down however willing the deployment is - and the operator
+    // needs to know that before they apply, not after.
+    const persist = persistChoiceFor(d, s);
     const commit = async (dryRun) => {
       status.textContent = dryRun ? "checking…" : "applying…";
       try {
@@ -1122,6 +1131,7 @@ function settingRow(d, isLive, isDrifted, s) {
           method: "PATCH", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             dryRun, expectRevision: s.revision,
+            persist: persist.wanted(),
             changes: [{ key: d.key, value: coerce(d, input.value) }],
           }),
         });
@@ -1131,7 +1141,21 @@ function settingRow(d, isLive, isDrifted, s) {
           return;
         }
         if (dryRun) {
-          status.textContent = "would change " + formatValue(outcome.from) + " → " + formatValue(outcome.to);
+          setKids(status,
+            "would change " + formatValue(outcome.from) + " → " + formatValue(outcome.to),
+            outcome.persisted
+              ? el("div", { class: "muted", style: "font-size:12px", text: outcome.persisted })
+              : null);
+          return;
+        }
+        // A change that applied but could not be written down must not vanish into a re-render:
+        // the operator asked for it to be durable and it is not, and drift is the only other place
+        // that says so. It waits for an acknowledgement instead.
+        if (persist.wanted() && res.persistedAll === false) {
+          setKids(status,
+            el("div", { class: "warn", text: "Applied, but " + (outcome.persisted || "not persisted") }),
+            el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Got it",
+                           onclick: renderSettings }));
           return;
         }
         await renderSettings();
@@ -1141,6 +1165,7 @@ function settingRow(d, isLive, isDrifted, s) {
     };
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") commit(false); });
     setKids(valueCell, input,
+      persist.control,
       el("div", { style: "margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
         el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Check",
                        title: "validate without changing anything", onclick: () => commit(true) }),
@@ -1163,6 +1188,35 @@ function settingRow(d, isLive, isDrifted, s) {
       isLive && !s.canChange
         ? el("div", { class: "muted", style: "font-size:11px", text: "read-only plane" })
         : null));
+}
+
+// persistChoiceFor builds the "write this to the config file too" control for one setting, or the
+// reason there is no such choice.
+//
+// The reason is the useful part. "This cannot be persisted" tells an operator nothing; naming the
+// flag that outranks the file, or the environment variable that is the setting's only durable home,
+// tells them what to do about it. The server computes those reasons (persistBlocked) because
+// precedence is its business, not the browser's.
+function persistChoiceFor(d, s) {
+  const note = (text) => ({
+    wanted: () => false,
+    control: el("div", { class: "muted", style: "font-size:11px;margin-top:6px", text: text }),
+  });
+  if (!s.canChange) return note("");
+  if (!s.canPersist) {
+    return note("This change will be live-only: the deployment does not let the server write its " +
+                "config file (--control-settings-persist). It will show under drift.");
+  }
+  const blocked = (s.persistBlocked || {})[d.key];
+  if (blocked) return note(blocked.replace(/^not written: /, ""));
+  if (!(s.persistableKeys || []).includes(d.key)) {
+    return note("This change will be live-only and will show under drift.");
+  }
+  const box = el("input", { type: "checkbox", id: "persist-" + d.key });
+  box.checked = true;
+  const label = el("label", { style: "font-size:12px;display:flex;gap:5px;align-items:center;margin-top:6px" },
+    box, "also write it to ", el("code", { text: s.configPath }));
+  return { wanted: () => box.checked, control: label };
 }
 
 // coerce turns the text in the box into the JSON type the setting expects. A number typed into a

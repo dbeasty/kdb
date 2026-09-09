@@ -420,13 +420,34 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, _ auth.P
 	}
 	sort.Strings(mutable)
 
+	// Which of those could also be written to the config file, and for the rest, why not. "Can
+	// this deployment persist at all" is not the question an operator has - theirs is "will this
+	// particular change survive a restart", and the answer differs per key: a setting with no
+	// config-file field, or one set on the command line, cannot be written down however willing
+	// the deployment is. Computing it here means the UI can say so before the change is made
+	// rather than after.
+	persistable := make([]string, 0, len(mutable))
+	blocked := map[string]string{}
+	if s.opts.AllowSettingsPersist {
+		for _, key := range mutable {
+			if reason := s.persistRefusal(key); reason != "" {
+				blocked[key] = reason
+				continue
+			}
+			persistable = append(persistable, key)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"settings":    descriptors,
-		"revision":    s.SettingsRevision(),
-		"mutableKeys": mutable,
-		"canChange":   s.opts.AllowWrites,
-		"canPersist":  s.opts.AllowSettingsPersist,
-		"drift":       s.driftKeys(),
+		"settings":        descriptors,
+		"revision":        s.SettingsRevision(),
+		"mutableKeys":     mutable,
+		"canChange":       s.opts.AllowWrites,
+		"canPersist":      s.opts.AllowSettingsPersist,
+		"configPath":      s.opts.ConfigPath,
+		"persistableKeys": persistable,
+		"persistBlocked":  blocked,
+		"drift":           s.driftKeys(),
 	})
 }
 
