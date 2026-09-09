@@ -66,6 +66,12 @@ type ServiceSettings struct {
 	ScanRowBudget int
 	AbortAfter    time.Duration
 	DrainTimeout  time.Duration
+	// MaintenanceInterval is how often the background maintenance loop considers a pass over
+	// each open namespace: checkpoint, reclaim delta segments past the retention window
+	// (history=none only), and compact the blob store. 0 disables it, leaving a namespace to
+	// reclaim only at close. The loop skips ticks with nothing to do and prefers moments when
+	// no write is in flight - see embed.MaintenanceOptions.
+	MaintenanceInterval time.Duration
 	// ControlAddr is the control-plane HTTP listen address (host:port). Empty - the default -
 	// disables it, like every other listener here.
 	//
@@ -125,6 +131,9 @@ func DefaultServiceSettings() ServiceSettings {
 		WSAddr:       "",
 		GRPCAddr:     "",
 		DrainTimeout: 30 * time.Second,
+		// On by default: an unbounded delta log is the failure this reclaims, and a namespace
+		// that has nothing to do costs three in-memory probes per tick to establish that.
+		MaintenanceInterval: 5 * time.Minute,
 		// Off by default: a browser-reachable control plane is a deliberate exposure decision,
 		// exactly as WSAddr is.
 		ControlAddr:  "",
@@ -176,6 +185,7 @@ type ServiceFile struct {
 	ScanRowBudget          *int            `json:"scanRowBudget"`
 	AbortAfter             *string         `json:"abortAfter"`
 	DrainTimeout           *string         `json:"drainTimeout"`
+	MaintenanceInterval    *string         `json:"maintenanceInterval"`
 	TLS                    *ServiceTLSFile `json:"tls"`
 	LogLevel               *string         `json:"logLevel"`
 	LogFormat              *string         `json:"logFormat"`
@@ -267,6 +277,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 			return s, err
 		}
 		if err := setDurationIf(&s.DrainTimeout, file.DrainTimeout, "drainTimeout"); err != nil {
+			return s, err
+		}
+		if err := setDurationIf(&s.MaintenanceInterval, file.MaintenanceInterval, "maintenanceInterval"); err != nil {
 			return s, err
 		}
 		if file.TLS != nil {
@@ -376,6 +389,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envDuration("KDB_DRAIN_TIMEOUT", &s.DrainTimeout); err != nil {
 		return s, err
 	}
+	if err := envDuration("KDB_MAINTENANCE_INTERVAL", &s.MaintenanceInterval); err != nil {
+		return s, err
+	}
 	envString("KDB_TLS_CERT", &s.TLSCert)
 	envString("KDB_TLS_KEY", &s.TLSKey)
 	envString("KDB_TLS_CA", &s.TLSCA)
@@ -428,6 +444,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"scan-row-budget", func() { s.ScanRowBudget = flags.ScanRowBudget }},
 		{"abort-after", func() { s.AbortAfter = flags.AbortAfter }},
 		{"drain-timeout", func() { s.DrainTimeout = flags.DrainTimeout }},
+		{"maintenance-interval", func() { s.MaintenanceInterval = flags.MaintenanceInterval }},
 		{"tls-cert", func() { s.TLSCert = flags.TLSCert }},
 		{"tls-key", func() { s.TLSKey = flags.TLSKey }},
 		{"tls-ca", func() { s.TLSCA = flags.TLSCA }},

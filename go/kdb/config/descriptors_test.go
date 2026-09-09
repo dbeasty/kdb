@@ -28,6 +28,7 @@ var fieldToKey = map[string]string{
 	"ScanRowBudget":          "governance.scanRowBudget",
 	"AbortAfter":             "governance.abortAfter",
 	"DrainTimeout":           "governance.drainTimeout",
+	"MaintenanceInterval":    "governance.maintenanceInterval",
 	"TLSCert":                "tls.certFile",
 	"TLSKey":                 "tls.keyFile",
 	"TLSCA":                  "tls.caFile",
@@ -108,7 +109,7 @@ func envProbeValue(key string) string {
 	case "memory.budgetMB", "memory.limitMB", "memory.reserveMB",
 		"governance.maxConnections", "governance.scanRowBudget", "storage.asyncSyncIntervalMS":
 		return "4242"
-	case "governance.abortAfter", "governance.drainTimeout":
+	case "governance.abortAfter", "governance.drainTimeout", "governance.maintenanceInterval":
 		return "7m"
 	case "log.level":
 		return "debug"

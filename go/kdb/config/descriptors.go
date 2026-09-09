@@ -264,6 +264,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.DrainTimeout != nil },
 		},
 		{
+			key: "governance.maintenanceInterval", flag: "maintenance-interval", env: "KDB_MAINTENANCE_INTERVAL",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "how often to consider a background maintenance pass per namespace - checkpoint, reclaim delta segments past the retention window under history=none, and compact the blob store. Ticks with nothing to do cost three in-memory probes; passes wait for a moment with no write in flight, bounded so sustained load cannot starve them. 0 reclaims only at close",
+			value:  dur(func(s ServiceSettings) time.Duration { return s.MaintenanceInterval }),
+			inFile: func(f *ServiceFile) bool { return f.MaintenanceInterval != nil },
+		},
+		{
 			key: "tls.certFile", flag: "tls-cert", env: "KDB_TLS_CERT",
 			scope: ScopeListener, mutability: MutabilityNewConnections,
 			help:   "PEM certificate file - set with tls.keyFile to require TLS on the data-plane listeners",

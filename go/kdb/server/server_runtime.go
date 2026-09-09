@@ -391,6 +391,22 @@ func (s *KdbServerRuntime) AcquireWriteSlotWithContextForTest(ctx context.Contex
 	return s.writeGate.acquire(ctx)
 }
 
+// WriteQueueDepth is how many writers are queued or running on the write gate right now: 0
+// means no write is in flight at all. Exported as a load signal for background work that would
+// rather not contend with commits - the maintenance loop
+// (embed.MaintenanceOptions.Busy) is the caller this exists for.
+//
+// A sample, not a reservation: the depth can change the instant after it is read, so a caller
+// gets "the server was quiet a moment ago", which is the right granularity for deciding whether
+// now is a good time to start a minutes-scale maintenance pass and the wrong one for anything
+// that needs the server to *stay* quiet.
+func (s *KdbServerRuntime) WriteQueueDepth() int {
+	if s == nil || s.writeGate == nil {
+		return 0
+	}
+	return s.writeGate.queueDepth()
+}
+
 // BeginDraining rejects every subsequent write immediately with *UnavailableError - the first
 // step of an orderly shutdown (kdb-spec-layer13 Component 50): stop admitting new work before
 // doing anything else, so nothing new can start while draining, flushing, and closing happen.

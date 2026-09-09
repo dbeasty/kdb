@@ -75,6 +75,7 @@ func Main() {
 	fs.BoolVar(&flagVals.TLSClientAuth, "tls-client-auth", flagVals.TLSClientAuth, "require and verify a client certificate on every TLS connection (mTLS) - requires --tls-ca")
 	fs.StringVar(&flagVals.AdminAddr, "admin-addr", flagVals.AdminAddr, "operational HTTP endpoint (host:port) serving /healthz, /readyz, /metrics (Prometheus), /debug/vars, /debug/pprof - plain HTTP with no auth, so bind it to localhost or a private interface, never the public network (empty to disable)")
 	fs.DurationVar(&flagVals.DrainTimeout, "drain-timeout", flagVals.DrainTimeout, "on SIGTERM/SIGINT, how long to wait for already-admitted writes to finish before closing storage anyway - new writes are rejected immediately either way, and storage stays crash-consistent even when the deadline is hit (the WAL/delta replay path covers whatever didn't get flushed)")
+	fs.DurationVar(&flagVals.MaintenanceInterval, "maintenance-interval", flagVals.MaintenanceInterval, "how often to consider a background maintenance pass per namespace - checkpoint, reclaim delta segments past the retention window (history=none), compact the blob store. Ticks with nothing to do are cheap, and a pass waits for a moment with no write in flight (bounded, so sustained load cannot starve it). 0 reclaims only at close")
 	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
 	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
@@ -556,6 +557,37 @@ func Main() {
 			tlsStatus = "enabled (mTLS: client cert required)"
 		}
 	}
+	// The background maintenance loop, one per open namespace. It is what keeps a long-running
+	// history=none namespace bounded: without it a process reclaims only at close, which a
+	// server that is killed rather than shut down never reaches. Started last, once every
+	// namespace this process serves is open, and stopped first in the shutdown sequence below so
+	// no pass is mid-truncation when storage closes.
+	//
+	// Busy is wired to the write gate rather than to CPU or disk: what a maintenance pass
+	// actually contends with is commits, and queueDepth is exactly "is a commit in flight right
+	// now". Deferral is bounded inside the scheduler, so a server under sustained load still
+	// reclaims - see embed.MaintenanceOptions.
+	var schedulers []*embed.MaintenanceScheduler
+	if cfg.MaintenanceInterval > 0 {
+		start := func(r *embed.EmbeddedKdbRuntime, busySrv *server.KdbServerRuntime) {
+			sched := embed.StartMaintenance(r, embed.MaintenanceOptions{
+				Interval: cfg.MaintenanceInterval,
+				Busy:     func() bool { return busySrv.WriteQueueDepth() > 0 },
+			})
+			if sched != nil {
+				schedulers = append(schedulers, sched)
+			}
+		}
+		start(rt, srv)
+		for id, nsSrv := range secondary {
+			if nsRT := nsSrv.Runtime; nsRT != nil {
+				start(nsRT, nsSrv)
+			} else {
+				slog.Debug("no maintenance loop for this namespace", "namespace", id)
+			}
+		}
+	}
+
 	build := version.Get()
 	slog.Info("KDB service started",
 		"version", build.Version,
@@ -576,6 +608,7 @@ func Main() {
 		"memory_limit", memoryLimitStatus,
 		"abort_after", abortStatus,
 		"document_expiry", srv.ExpirySummary(),
+		"maintenance", maintenanceStatus(cfg.MaintenanceInterval, len(schedulers)),
 		"namespace", namespace,
 	)
 	if admin != nil {
@@ -609,6 +642,12 @@ func Main() {
 	if admin != nil {
 		admin.SetReady(false, "draining")
 	}
+	// Before anything else: a pass that is mid-truncation holds the invariant that makes
+	// truncation safe (bodies flushed, checkpoint written, then segments deleted), and Stop waits
+	// for it rather than cutting it short.
+	for _, sched := range schedulers {
+		sched.Stop()
+	}
 	watchdog.Stop()
 	srv.BeginDraining()
 	if sqlListener != nil {
@@ -641,6 +680,18 @@ func Main() {
 		os.Exit(75)
 	}
 	slog.Info("shutdown complete")
+}
+
+// maintenanceStatus describes the background maintenance loop for the startup log line, in the
+// same "off" / detail form the other subsystems there use.
+func maintenanceStatus(interval time.Duration, started int) string {
+	if interval <= 0 {
+		return "off (namespaces reclaim only at close)"
+	}
+	if started == 0 {
+		return "off (no namespace has anything to maintain)"
+	}
+	return fmt.Sprintf("every %s across %d namespace(s)", interval, started)
 }
 
 // costModelStateFile is where the learned cost-estimator state lives under --data-dir. It is a
