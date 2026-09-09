@@ -270,6 +270,13 @@ func (s *KdbServerRuntime) SQLIndexProvider() sql.IndexProvider {
 func (s *KdbServerRuntime) rebuildSQLEngine() {
 	s.sqlEngineMu.Lock()
 	defer s.sqlEngineMu.Unlock()
+	s.rebuildSQLEngineLocked()
+}
+
+// rebuildSQLEngineLocked is rebuildSQLEngine's body, for callers already holding sqlEngineMu.
+// ReopenWith is the one: it swaps the runtime and the DAG and rebuilds the engine under a single
+// hold, so no query can observe an engine built against the namespace that was just closed.
+func (s *KdbServerRuntime) rebuildSQLEngineLocked() {
 	store := &expiryHidingAdapter{Adapter: s.Runtime.Storage, runtime: s}
 	if s.sqlIndexProvider == nil {
 		// Deliberately NewEngine, not NewEngineWithIndexes(.., nil): a nil provider stored in a

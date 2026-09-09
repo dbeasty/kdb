@@ -175,9 +175,25 @@ func (w *DefaultWriter) sealLocked() (storage.DeltaSegmentRef, error) {
 		return storage.DeltaSegmentRef{}, fmt.Errorf("already sealed")
 	}
 	w.sealed = true
+	// Nothing was ever appended, so there is nothing to seal - and sealing
+	// anyway is actively harmful. The next open picks its sequence from the
+	// segment file names present, so it reuses this number; if the shim has
+	// marked it sealed, that open's first append is refused and the
+	// namespace cannot be written to at all. Reached by opening a namespace,
+	// closing it without writing, and opening it again, which is exactly
+	// what a reopen does when it changes a setting before any traffic
+	// arrives.
+	if w.sizeBytes == 0 {
+		return w.refLocked(), nil
+	}
 	if err := w.shim.SealSegment(w.segmentName); err != nil {
 		return storage.DeltaSegmentRef{}, err
 	}
+	return w.refLocked(), nil
+}
+
+// refLocked describes the segment this writer is on. Callers hold w.mu.
+func (w *DefaultWriter) refLocked() storage.DeltaSegmentRef {
 	zero, _ := codec.HashFromBytes(make([]byte, 32))
 	first, last := zero, zero
 	if w.firstCommit != nil {
@@ -194,7 +210,7 @@ func (w *DefaultWriter) sealLocked() (storage.DeltaSegmentRef, error) {
 		LastCommitHash:  last,
 		SizeBytes:       w.sizeBytes,
 		Compression:     w.config.CompressionCodec,
-	}, nil
+	}
 }
 
 // DefaultReader reads delta segments for a namespace.

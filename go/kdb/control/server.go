@@ -113,8 +113,32 @@ type Options struct {
 	// A source rather than a map so the service can keep ownership of the schedulers' lifecycle:
 	// the control plane changes their settings, it does not start or stop them.
 	Maintenance MaintenanceSource
+	// Reopener lets settings that are read when a namespace opens be changed without restarting
+	// the process, by closing and reopening that namespace. nil leaves them reported and refused,
+	// with the refusal saying a restart is the way - which is the honest answer for a process
+	// that cannot reopen.
+	//
+	// A reopen makes the namespace briefly unavailable, so it is opt-in at this level for the
+	// same reason AllowWrites is: turning the control plane on is not by itself a decision to let
+	// it interrupt service.
+	Reopener NamespaceReopener
 	// Now is the clock, for tests. nil uses time.Now.
 	Now func() time.Time
+}
+
+// NamespaceReopener closes and reopens a namespace under changed storage options, which is what
+// config.MutabilityNamespaceReopen settings need in order to be changeable at all.
+//
+// An interface, and supplied by the process rather than built here, because namespace lifecycle
+// belongs to whoever owns the embed.Host: the control plane decides that a setting should change,
+// it does not decide when a namespace stops being served.
+type NamespaceReopener interface {
+	// ReopenNamespace applies edit to the namespace's current storage options and reopens it,
+	// returning how long the namespace was unavailable. edit is given the options actually in
+	// force, so a change to one setting cannot silently revert the others.
+	ReopenNamespace(namespaceID string, edit func(*embed.StorageOptions)) (time.Duration, error)
+	// ReopenableNamespaces lists what it can do that to.
+	ReopenableNamespaces() []string
 }
 
 // MaintenanceSource is where the control plane finds the maintenance loops it may reconfigure.

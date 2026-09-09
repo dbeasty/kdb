@@ -521,6 +521,22 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request, pri
 
 		setter, mutable := live[change.Key]
 		if !mutable {
+			// Not live, but possibly changeable by reopening the namespace it
+			// belongs to - which is a real operation now rather than the
+			// documented-but-unimplemented class it used to be. Handled on its
+			// own path because it costs availability, so it is reported
+			// differently even when it succeeds.
+			if reopener, ok := reopenSettings()[change.Key]; ok {
+				s.applyReopenChange(&out, change, reopener, req.DryRun)
+				if out.Applied {
+					changed++
+					if req.Persist {
+						toPersist = append(toPersist, persistRequest{key: change.Key, value: out.To})
+					}
+				}
+				outcomes = append(outcomes, out)
+				continue
+			}
 			out.Refused = refusalFor(descriptor.Mutability)
 			outcomes = append(outcomes, out)
 			continue
@@ -620,8 +636,12 @@ func refusalFor(m config.Mutability) string {
 		return "this setting is read when a listener or connection is created, so it cannot be " +
 			"changed for the ones already running; restart to change it"
 	case config.MutabilityNamespaceReopen:
-		return "this setting is read when a namespace is opened; it needs that namespace closed " +
-			"and reopened, which this control plane cannot yet do"
+		// Reached only for a setting in this class that reopenSettings does not map to a storage
+		// option - the class is implemented now, but a setting nobody has wired is still refused
+		// rather than silently doing nothing.
+		return "this setting is read when a namespace is opened, and this control plane has no " +
+			"mapping from it to a storage option, so reopening would not change it; restart to " +
+			"change it"
 	case config.MutabilityImmutable:
 		return "this setting describes what is already on disk and disagreeing with it is refused " +
 			"at open; changing it is a migration (kdb-inspect migrate-history), not a setting"

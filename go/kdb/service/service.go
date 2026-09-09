@@ -197,6 +197,9 @@ func Main() {
 	// Held from here because the control plane is handed it at listener construction, well before
 	// the loops themselves are started further down.
 	maintenance := newMaintenanceRegistry()
+	// Built here for the same reason the maintenance registry is: the control listener is handed
+	// it at construction, before the namespaces it will reopen are all registered.
+	reopener := newNamespaceReopener(nil, cfg.DrainTimeout)
 
 	var rt *embed.EmbeddedKdbRuntime
 	// secondary holds the namespaces this process serves *besides* the primary one. Only the
@@ -535,6 +538,10 @@ func Main() {
 			StagingDir: cfg.ControlStagingDir,
 			// The running maintenance loops, so their cadence is adjustable without a restart.
 			Maintenance: maintenance,
+			// Lets settings that are read at namespace-open be changed without restarting the
+			// process, by reopening the namespace. Costs a brief unavailability, which the
+			// outcome reports.
+			Reopener: reopener,
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)
@@ -576,6 +583,14 @@ func Main() {
 	// actually contends with is commits, and queueDepth is exactly "is a commit in flight right
 	// now". Deferral is bounded inside the scheduler, so a server under sustained load still
 	// reclaims - see embed.MaintenanceOptions.
+	// Every namespace this process serves is open by now, which is what the reopener needs before
+	// it can be asked to close one.
+	reopener.setHost(host)
+	reopener.add(namespace, srv)
+	for id, nsSrv := range secondary {
+		reopener.add(id, nsSrv)
+	}
+
 	if cfg.MaintenanceInterval > 0 {
 		start := func(id string, r *embed.EmbeddedKdbRuntime, busySrv *server.KdbServerRuntime) {
 			maintenance.add(id, embed.StartMaintenance(r, embed.MaintenanceOptions{
