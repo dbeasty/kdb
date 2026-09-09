@@ -143,12 +143,18 @@ func (s *Server) handleStartRestore(w http.ResponseWriter, r *http.Request, prin
 	s.restore.jobs[jobID] = job
 	s.restore.mu.Unlock()
 
+	// The response's copy is taken before the goroutine starts, not after: from the moment
+	// runRestore is launched, that struct belongs to it, and serializing the pointer here would
+	// race the first thing it writes. This is the same trap snapshotJob exists for - the readers
+	// were fixed and this one, which creates the job rather than looking one up, was missed.
+	accepted := copyJob(job)
+
 	// Asynchronous: a restore reads and rewrites every segment, so it is minutes on a real
 	// namespace and must not hold an HTTP request open for it.
 	go s.runRestore(job, ns, req, store, liveRoot)
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"job": job,
+		"job": accepted,
 		"note": "restoring into a staging directory; this does not touch the live namespace. Poll " +
 			"the job for its result, then attach it to look at what came back before trusting it.",
 	})
