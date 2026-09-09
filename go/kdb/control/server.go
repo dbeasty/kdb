@@ -343,15 +343,7 @@ func withRecovery(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) notImplemented() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.opts.AllowWrites {
-			writeError(w, http.StatusForbidden, "read_only",
-				"this control plane is read-only; start the service with --control-write to enable "+
-					"mutating endpoints")
-			return
-		}
-		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"this endpoint is specified in docs/kdb-control-ui-plan.md but not built yet")
-	})
-}
+// A declared-but-unbuilt endpoint used to answer 501 here, so that "the server said no" and "the
+// server cannot" stayed distinguishable while the plan ran ahead of the code. Every endpoint this
+// package declares is now built, so the helper is gone: a route that does not exist answers 404,
+// which is the truth about it.

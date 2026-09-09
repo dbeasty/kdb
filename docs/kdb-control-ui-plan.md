@@ -9,12 +9,29 @@ was checked in the tree at that commit.
 
 ## Status
 
-Last audited against `feat/control-ui-data-browser`. **The control UI is not finished**, but it is
-now a database tool rather than only a history viewer: browse documents, run SQL - reads always,
-writes when the deployment and the principal both allow it - read at any revision, and revert. Live
-settings and all of recovery are still missing, as is editing a document directly.
+Last audited against `feat/control-ui-data-browser`. **Every screen §9 named is built**, and eight
+of the nine milestones are done. What is here is a database tool and a history viewer at once:
+browse and edit documents, run SQL, read at any revision, revert, follow one document's whole
+timeline, draw the commit graph, create and compare refs, change settings on a running server and
+write them back to the config file, verify and back up a live namespace, restore a backup alongside
+production and promote it across a supervised restart.
 
-Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~28 not started.
+Counting endpoints from §5: **47 implemented**, none declared-but-unbuilt. A route that does not
+exist answers 404 rather than 501, because there is no longer anything in that category.
+
+M2 is the one milestone still partial, and not for a reason this UI can fix: `?at=` works
+everywhere in the control plane, but `AT COMMIT` is still not honoured over the **wire**, which is a
+change to the wire protocol and its Kotlin parity fixtures.
+
+Three things were deliberately **not** built, and the API says so where an operator would look for
+them rather than showing an empty answer:
+
+- `/ops/sessions` - a `SessionManager` is created per connection, so there is no runtime-global
+  registry to enumerate. An empty list would read as "nobody is connected".
+- `/ops/peers` - peer sync is a listener, not a tracked set of members. There is no registry.
+- `/commits/{hash}/diff/{docId}` - it would be a second way to read a document at a revision, and
+  two ways to read the same thing can disagree. The commit detail composes the per-document diff
+  from two ordinary `?at=` reads instead.
 
 ### Milestones (§11)
 
