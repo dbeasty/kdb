@@ -29,8 +29,14 @@ type ServerEngine struct {
 	// Shares retainMu: the two are read together by every maintenance pass
 	// and neither is hot enough to want its own lock.
 	reclaimLive *storage.ReclaimMode
-	wal         wal.WriteAheadLog
-	groupCommit *wal.GroupCommitter
+	// modeLive and strategyLive are the history mode and strategy after a
+	// live switch (SetHistoryMode), nil until one happens. Under the same
+	// lock as the two above so a switch that changes both is observed as
+	// one change rather than halfway.
+	modeLive     *storage.HistoryMode
+	strategyLive *storage.HistoryStrategy
+	wal          wal.WriteAheadLog
+	groupCommit  *wal.GroupCommitter
 
 	// docsByHash holds every document version ever committed, keyed by
 	// content hash (see doc_hash_shard.go) rather than guarded by one
