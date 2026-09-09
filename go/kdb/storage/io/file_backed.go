@@ -16,6 +16,18 @@ type FileBackedPlatformIO struct {
 	sealedSegments map[string]struct{}
 }
 
+// HasArchive reports whether the store beneath this shim keeps a copy of what it deletes, which
+// is what decides whether reclaiming a segment is eviction or destruction. Forwarded rather than
+// answered here: this shim adds locking, not replication, and only the store below knows what
+// sinks it has.
+func (f *FileBackedPlatformIO) HasArchive() bool {
+	type archiveAware interface{ HasArchive() bool }
+	if a, ok := f.store.(archiveAware); ok {
+		return a.HasArchive()
+	}
+	return false
+}
+
 // NewFileBackedPlatformIO wraps a SegmentByteStore with shared locking.
 func NewFileBackedPlatformIO(config PlatformIOConfig, store SegmentByteStore) *FileBackedPlatformIO {
 	return &FileBackedPlatformIO{

@@ -332,33 +332,53 @@ Phase 4 reclassifies it.
 `/v1/settings`, and the cadence and window settings change on a running
 server.
 
-**Phase 2 — reclaim modes.** `governance.reclaim` as the preset in §2,
-plus the seal-triggered pass for `immediate`. Presets set the underlying
-knobs, which stay individually settable; the UI shows the preset and what
-it resolved to.
-*Exit:* `immediate` demonstrably holds a smaller footprint than `lazy` on
-the same workload, measured.
+**Phase 2 — reclaim modes. LANDED.** `storage.ReclaimMode`
+(`manual`/`immediate`/`balanced`/`lazy`) as a preset over the scheduler's
+knobs, `reclaim.mode` live from the control plane, `ReclaimHeld` +
+`EligibleSegments`/`EligibleBytes` on a held pass, and `CompactHistory` as
+the explicit ask. `immediate` is driven by a seal notification from the
+commit log rather than a shorter timer, and stops deferring to load.
+*Exit:* met for behaviour (tests assert manual holds, balanced reclaims,
+presets reach the scheduler). The footprint *measurement* comparing
+`immediate` against `lazy` on one workload was not run.
 
-**Phase 3 — namespace reopen.** The drain-swap-report sequence in §4, wired
-to `MutabilityNamespaceReopen` so the whole existing class becomes
-changeable. Replace that refusal string with an implementation.
-*Exit:* `cache.documentBytes` changes on a running server, with the pause
-reported and bounded.
+**Phase 3 — namespace reopen. LANDED.** `Host.ReopenNamespace`,
+`KdbServerRuntime.ReopenWith`, and the service's `namespaceReopener` tying
+them together; five settings in the class are mapped to storage options and
+apply through it. Draining is bounded and giving up is the safe outcome;
+`ResumeAfterDrain` exists because `BeginDraining` is deliberately one-way at
+shutdown. The Host now records each namespace's options so a reopen cannot
+silently revert what it does not name.
+*Exit met:* `cache.documentBytes` changes on a running server, with the
+pause reported in the outcome.
 
-**Phase 4 — history mode switching, non-destructively.** The marker flip
-plus `reclaim=manual` as the landing state, with Gap D resolved. Because
-the switch destroys nothing, this no longer depends on Phase 3's reopen for
-safety — only on the engine observing a mode change consistently.
-*Exit:* a namespace switches `full`→`none` and back from the UI with no
-data change either way, and reports how much would be eligible if compacted.
+**Phase 4 — history mode switching, non-destructively. LANDED.**
+`EmbeddedKdbRuntime.SetHistoryMode` writes the marker, tells the engine, and
+lands on `ReclaimManual` — an unspecified reclaim mode means manual here
+rather than the global default, which is the line that makes the switch
+reversible. `HistoryLost` is read from the segments on disk rather than
+inferred from the mode. Gap D resolved: `historyModeOf` asks the engine
+first and falls back to the policy only for a store that cannot answer.
+*Exit met* at the runtime level; a control-plane endpoint for it is not
+wired, so today the switch is an API call rather than a UI button.
 
-**Phase 5 — `compact history`, and the archive that makes it reversible.**
-The explicit reclaim action, plus splitting local deletion from replica
-deletion so an archive tier survives it (§3). Cold-read fallback to
-`GetSegment`, and a restore that moves the floor back down.
-*Exit:* with an archive tier configured, a compacted range is restorable
-commit-for-commit; without one, `compact history` says plainly that it is
-not.
+**Phase 5 — `compact history`, and the archive. PARTLY LANDED.**
+
+Done: `CompactHistory` (Phase 2). The `SinkRole` split —
+`storio.SinkReplica` follows deletions, `storio.SinkArchive` does not — so a
+compaction no longer destroys the copy that could restore it, which was the
+blocker named in §3. `RestoreSegment` fetches a segment back from an archive
+and writes it to the primary, refusing a write-only archive by name rather
+than failing obscurely. `HasArchive` is plumbed up to `TruncationResult.
+Reversible`, so a compaction can say which of the two operations it is.
+
+Not done, and each weakens the claim: **nothing constructs an archive from
+configuration** — the role exists and is tested, but no flag, env var or
+config field puts a sink in it, so a deployment cannot turn one on yet.
+**The cold-read path does not fall back to the archive**, so a read below
+the floor still fails rather than fetching. **No restore moves the floor
+back down**, which is the operation an operator would actually run; trap 8
+below still applies to whoever writes it.
 
 Phase 3 is the structurally valuable one and is independent of the rest —
 it frees six existing settings on its own. Phases 1, 2 and 4 form the

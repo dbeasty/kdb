@@ -60,6 +60,16 @@ type TruncationResult struct {
 	// bounded and quiet, the other means it is growing and waiting to be
 	// told to stop.
 	ReclaimHeld bool
+	// Reversible says an archive holds what this pass deleted, so the
+	// segments can be brought back (see storio.PrimaryWithReplicas'
+	// RestoreSegment). False means the deletion was final.
+	//
+	// The same operation with two quite different meanings, which is why it
+	// is reported rather than left to configuration knowledge: with an
+	// archive a compaction is eviction from local disk, without one it is
+	// destruction. Anything asking a human to confirm a compaction should
+	// say which of the two they are confirming.
+	Reversible bool
 	// EligibleSegments and EligibleBytes are what a reclamation *would*
 	// free, computed without deleting anything. Filled in on a held pass,
 	// so "armed but not reclaiming" comes with the number that says how
@@ -242,7 +252,7 @@ func applyTruncation(
 	namespaceID string,
 	plan TruncationPlan,
 ) (TruncationResult, error) {
-	result := TruncationResult{FloorSequence: plan.Floor}
+	result := TruncationResult{FloorSequence: plan.Floor, Reversible: shimHasArchive(shim)}
 	if plan.IsEmpty() || shim == nil {
 		return result, nil
 	}
@@ -275,6 +285,21 @@ func applyTruncation(
 		result.RetainedSegments = len(remaining)
 	}
 	return result, nil
+}
+
+// shimHasArchive reports whether this namespace's storage keeps a copy of what it deletes.
+//
+// Asked through an interface rather than a concrete type because the shim is layered - an OS
+// store, possibly wrapped in replication - and only the wrapper knows. A shim that cannot answer
+// has no archive, which is the safe reading: it makes a compaction describe itself as final,
+// and the cost of being wrong in that direction is a warning nobody needed rather than a
+// deletion somebody thought was reversible.
+func shimHasArchive(shim storage.PlatformIOShim) bool {
+	type archiveAware interface{ HasArchive() bool }
+	if a, ok := shim.(archiveAware); ok {
+		return a.HasArchive()
+	}
+	return false
 }
 
 // commitTimeFromDag dates a segment by the commit it ends at.
