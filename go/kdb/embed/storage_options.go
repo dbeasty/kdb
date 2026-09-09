@@ -16,6 +16,22 @@ type FileRuntimeOptions struct {
 	// S3 enables an S3-compatible replica tier (LocalStack, MinIO, or AWS).
 	// When nil, S3 is loaded from environment via s3io.ConfigFromEnv if set.
 	S3 *s3io.Config
+	// S3Archive enables an S3-compatible *archive* tier, which is not the same thing as the
+	// replica above and is configured separately because it does a different job.
+	//
+	// A replica mirrors the primary including its deletions. An archive mirrors writes and never
+	// deletions, so it keeps what the primary reclaims - which is what turns a history=none
+	// compaction from destruction of the commits into eviction from local disk. Point it at a
+	// different bucket or prefix from the replica: they will hold different things by design, and
+	// sharing a location would have the replica's deletions remove what the archive is retaining.
+	//
+	// When nil, loaded from KDB_S3_ARCHIVE_BUCKET and friends via s3io.ArchiveConfigFromEnv.
+	S3Archive *s3io.Config
+	// ArchiveBlobs replaces the object store the archive writes to. A test seam: it lets the
+	// archive be exercised end to end against s3io.NewMemoryBlobStore rather than against a real
+	// bucket, which is the difference between the restore path being tested and being asserted
+	// about. Ignored unless S3Archive is set.
+	ArchiveBlobs s3io.BlobStore
 	// ReplicationPolicy controls whether replica failures fail the operation.
 	ReplicationPolicy storio.ReplicationPolicy
 

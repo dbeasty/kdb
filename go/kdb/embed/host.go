@@ -145,11 +145,18 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 	if s3Cfg == nil {
 		s3Cfg = s3io.ConfigFromEnv()
 	}
+	// The archive is a separate destination from the replica, and separately configured: they
+	// are different jobs (see buildSegmentByteStore), and a deployment that wants a bounded
+	// local footprint with the commits still recoverable needs the archive specifically.
+	archiveCfg := opts.S3Archive
+	if archiveCfg == nil {
+		archiveCfg = s3io.ArchiveConfigFromEnv()
+	}
 	policy := opts.ReplicationPolicy
 
 	io, err := (&storio.FileBackedPlatformIOFactory{
 		NewStore: func(config storio.PlatformIOConfig) (storio.SegmentByteStore, error) {
-			return buildSegmentByteStore(config, s3Cfg, policy)
+			return buildSegmentByteStore(config, s3Cfg, archiveCfg, opts.ArchiveBlobs, policy)
 		},
 	}).Open(storio.PlatformIOConfig{
 		RootDirectory: &dataRoot,

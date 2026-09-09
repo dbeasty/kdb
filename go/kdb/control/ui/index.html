@@ -71,6 +71,8 @@
           padding: 8px 10px; border-radius: 4px; margin: 6px 0; font-size: 12px; }
   .err { border-left: 3px solid var(--removed); background: color-mix(in srgb, var(--removed) 10%, transparent);
          padding: 8px 10px; border-radius: 4px; margin: 8px 0; font-size: 13px; }
+  .ok { border-left: 3px solid var(--added); background: color-mix(in srgb, var(--added) 10%, transparent);
+        padding: 8px 10px; border-radius: 4px; margin: 8px 0; font-size: 13px; }
   .muted { color: var(--muted); }
   .empty { padding: 20px 12px; color: var(--muted); font-size: 13px; text-align: center; }
   input, button.act {
@@ -144,6 +146,7 @@
   <button data-tab="refs" aria-selected="false">Refs</button>
   <button data-tab="schema" aria-selected="false">Schema</button>
   <button data-tab="settings" aria-selected="false">Settings</button>
+  <button data-tab="retention" aria-selected="false">Retention</button>
   <button data-tab="ops" aria-selected="false">Ops</button>
   <button data-tab="recovery" aria-selected="false">Recovery</button>
 </nav>
@@ -372,6 +375,7 @@ async function selectTab(tab) {
     else if (tab === "refs") await renderRefs();
     else if (tab === "schema") await renderSchema();
     else if (tab === "settings") await renderSettings();
+    else if (tab === "retention") await renderRetention();
     else if (tab === "ops") await renderOps();
     else if (tab === "recovery") await renderRecovery();
   } catch (e) {
@@ -1535,6 +1539,243 @@ function mutabilityLabel(m) {
     "restart": "needs restart",
     "immutable": "migration only",
   }[m] || m;
+}
+
+// ---- Retention -------------------------------------------------------------
+//
+// The three operations that decide what a namespace keeps, arranged so that
+// the harmless ones look harmless and the destructive one does not.
+//
+// Switching history mode writes a marker and deletes nothing; changing the
+// reclaim mode decides whether reclamation happens on its own; compacting is
+// the only thing here that destroys data - and only when no archive is
+// configured, in which case it is eviction. The confirmation is therefore on
+// the compaction alone. Putting one on the mode switch as well would train an
+// operator to click through the dialog that does not matter, and then through
+// the one that does.
+
+const RECLAIM_HELP = {
+  manual: "Never reclaims on its own. Nothing is deleted until you ask, which is what keeps a " +
+          "switch to history=none reversible — at the cost of unbounded disk while it waits.",
+  immediate: "Reclaims as soon as a segment is sealed, and does not wait for a quiet moment. " +
+             "The smallest footprint, paid for in continuous background work.",
+  balanced: "Reclaims every few minutes when there is something to do, deferring to write load " +
+            "but never indefinitely.",
+  lazy: "Long intervals and heavy deference to load. Trades disk for quiet.",
+};
+
+// retentionNote is the outcome of the last operation, shown at the top of the view until the
+// next one. The house style here is to re-render and report inline rather than to float a
+// transient message: these operations change what the database keeps, and the sentence saying
+// what happened should still be on screen while the operator reads the numbers under it.
+let retentionNote = null;
+
+async function renderRetention() {
+  const r = await api(nsPath("/retention"));
+  const bytes = (n) => {
+    if (!n) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(i === 0 ? 0 : 1) + " " + units[i];
+  };
+
+  const kv = (obj) => el("dl", { class: "kv" },
+    ...Object.entries(obj).flatMap(([k, v]) => [el("dt", { text: k }), el("dd", {}, el("code", { text: formatValue(v) }))]));
+
+  // The state worth shouting about: allowed to reclaim, choosing not to, and growing.
+  const holdingBanner = r.holding
+    ? el("div", { class: "card" }, el("h2", { text: "Armed but not reclaiming" }),
+        el("div", { class: "body" }, el("div", { class: "warn" },
+          "This namespace is history=none on reclaim=manual, so it may release history but will " +
+          "not until asked. " + r.eligibleSegments + " segment(s) — " + bytes(r.eligibleBytes) +
+          " — are eligible right now, and that will keep growing. Compact when you are ready, or " +
+          "choose a reclaim mode that does it for you.")))
+    : null;
+
+  // Compaction: the only destructive control on this page, and the copy changes entirely
+  // depending on whether an archive can give the data back.
+  const compactCard = el("div", { class: "card" },
+    el("h2", { text: "Compact history" }),
+    el("div", { class: "body" },
+      el("p", { class: r.archiveAvailable ? "muted" : "warn", text: r.archiveAvailable
+        ? "An archive tier is configured, so compacting evicts segments from local disk and they " +
+          "remain restorable. This bounds local footprint without losing the commits."
+        : "No archive tier is configured, so compacting deletes the segments permanently. The " +
+          "current dataset is never affected — what goes is the history behind it." }),
+      el("p", { class: "muted", text: r.eligibleSegments
+        ? "Eligible now: " + r.eligibleSegments + " segment(s), " + bytes(r.eligibleBytes) + "."
+        : "Nothing is eligible right now." }),
+      state.canWrite
+        ? el("button", {
+            class: r.archiveAvailable ? "act" : "act danger",
+            text: r.archiveAvailable ? "Compact (evict to archive)…" : "Compact (permanent)…",
+            disabled: r.eligibleSegments === 0 ? "disabled" : null,
+            onclick: () => compactHistory(r),
+          })
+        : el("span", { class: "muted", text: "Read-only control plane." })));
+
+  // Restore is only meaningful with an archive, and says so rather than offering a button that
+  // can only fail.
+  const restoreCard = el("div", { class: "card" },
+    el("h2", { text: "Restore from archive" }),
+    el("div", { class: "body" },
+      r.archiveAvailable
+        ? el("div", {},
+            el("p", { class: "muted", text:
+              "Fetch reclaimed segments back and lower the read floor to admit them. The floor " +
+              "is currently " + r.floorSequence + "; anything below it has been evicted." }),
+            el("div", { class: "row", style: "gap:8px;align-items:flex-end" },
+              el("label", {}, "From sequence ",
+                el("input", { id: "restore-from", type: "number", min: "0", value: "0", style: "width:90px" })),
+              el("label", {}, "To sequence ",
+                el("input", { id: "restore-to", type: "number", min: "0",
+                              value: String(Math.max(0, r.floorSequence - 1)), style: "width:90px" })),
+              state.canWrite
+                ? el("button", { class: "act", text: "Restore", onclick: restoreFromArchive })
+                : null))
+        : el("p", { class: "muted", text:
+            "No archive tier is configured, so nothing this namespace reclaimed can be brought " +
+            "back. An archive is set up separately from a replica (KDB_S3_ARCHIVE_BUCKET), " +
+            "because a replica follows deletions and does not keep what was reclaimed." })));
+
+  const note = retentionNote
+    ? el("div", { class: "card" }, el("div", { class: "body" },
+        el("div", { class: retentionNote.bad ? "err" : "ok", text: retentionNote.text })))
+    : null;
+
+  setMain(
+    note,
+    holdingBanner,
+    el("div", { class: "row" },
+      el("div", { class: "col" }, el("div", { class: "card" },
+        el("h2", { text: "What this namespace keeps" }),
+        el("div", { class: "body" }, kv({
+          historyMode: r.historyMode,
+          reclaimMode: r.reclaimMode,
+          retainDuration: r.retainDuration || "(default)",
+          retainCommits: r.retainCommits || 0,
+          floorSequence: r.floorSequence,
+          eligibleSegments: r.eligibleSegments,
+          eligibleBytes: bytes(r.eligibleBytes),
+          archiveAvailable: r.archiveAvailable,
+        })))),
+      el("div", { class: "col" }, el("div", { class: "card" },
+        el("h2", { text: "History mode" }),
+        el("div", { class: "body" },
+          el("p", { class: "muted", text:
+            "full keeps every commit forever. none keeps the live dataset plus the retention " +
+            "window and may release the rest. Switching writes a marker and deletes nothing — " +
+            "it is reversible until something compacts." }),
+          state.canWrite
+            ? el("div", { class: "row", style: "gap:8px" },
+                el("button", {
+                  class: "act",
+                  text: r.historyMode === "none" ? "Switch to full" : "Switch to none",
+                  onclick: () => setHistoryMode(r.historyMode === "none" ? "full" : "none", r),
+                }))
+            : el("span", { class: "muted", text: "Read-only control plane." })))),
+    ),
+    el("div", { class: "row" },
+      el("div", { class: "col" }, el("div", { class: "card" },
+        el("h2", { text: "Reclaim mode" }),
+        el("div", { class: "body" },
+          el("p", { class: "muted", text:
+            "How eagerly this namespace acts on what the window has released. Separate from the " +
+            "history mode on purpose: the mode says what may be reclaimed, this says whether " +
+            "anything is." }),
+          ...["manual", "immediate", "balanced", "lazy"].map((mode) =>
+            el("div", { style: "margin:6px 0" },
+              el("button", {
+                class: "act",
+                text: mode === r.reclaimMode ? mode + " (current)" : mode,
+                disabled: !state.canWrite || mode === r.reclaimMode ? "disabled" : null,
+                onclick: () => setReclaimMode(mode),
+              }),
+              el("span", { class: "muted", style: "margin-left:8px;font-size:12px", text: RECLAIM_HELP[mode] })))))),
+      el("div", { class: "col" }, compactCard)),
+    el("div", { class: "row" }, el("div", { class: "col" }, restoreCard)),
+  );
+}
+
+// Switching mode is not destructive, so it applies directly and reports what it did. The one
+// case worth a warning first is none -> full after a compaction, where "full" could be misread
+// as "the history is back".
+async function setHistoryMode(to, current) {
+  try {
+    const res = await api(nsPath("/retention/history-mode"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: to }),
+    });
+    retentionNote = { text: res.note || ("History mode is now " + res.to + ".") };
+    await renderRetention();
+  } catch (e) {
+    retentionNote = { text: "Could not switch history mode: " + e.message, bad: true };
+    await renderRetention();
+  }
+}
+
+async function setReclaimMode(mode) {
+  try {
+    await api("/v1/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ changes: [{ key: "reclaim.mode", value: mode }] }),
+    });
+    retentionNote = { text: "Reclaim mode is now " + mode + "." };
+    await renderRetention();
+  } catch (e) {
+    retentionNote = { text: "Could not change the reclaim mode: " + e.message, bad: true };
+    await renderRetention();
+  }
+}
+
+// The one control on this page that needs confirming, and the wording depends on whether it can
+// be undone.
+async function compactHistory(r) {
+  const permanent = !r.archiveAvailable;
+  const message = permanent
+    ? "Permanently delete " + r.eligibleSegments + " segment(s) of history (" +
+      "this cannot be undone — there is no archive tier configured).\n\n" +
+      "The current dataset is not affected."
+    : "Evict " + r.eligibleSegments + " segment(s) from local disk. They stay in the archive and " +
+      "can be restored.";
+  if (!confirm(message + "\n\nContinue?")) return;
+  try {
+    const res = await api(nsPath("/retention/compact"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    retentionNote = { text: res.note + " (" + res.removed + " segment(s) freed)" };
+    await renderRetention();
+  } catch (e) {
+    retentionNote = { text: "Compaction failed: " + e.message, bad: true };
+    await renderRetention();
+  }
+}
+
+async function restoreFromArchive() {
+  const from = Number($("restore-from").value);
+  const to = Number($("restore-to").value);
+  try {
+    const res = await api(nsPath("/retention/restore"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from, to }),
+    });
+    let msg = "Restored " + res.restored + " segment(s); the read floor is now " + res.floorSequence + ".";
+    if (res.missing && res.missing.length) {
+      msg += " The archive could not produce segment(s) " + res.missing.join(", ") +
+             ", so the floor stops above them.";
+    }
+    retentionNote = { text: msg };
+    await renderRetention();
+  } catch (e) {
+    retentionNote = { text: "Restore failed: " + e.message, bad: true };
+    await renderRetention();
+  }
 }
 
 async function renderOps() {

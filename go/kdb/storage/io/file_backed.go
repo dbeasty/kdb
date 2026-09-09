@@ -1,6 +1,7 @@
 package io
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -26,6 +27,32 @@ func (f *FileBackedPlatformIO) HasArchive() bool {
 		return a.HasArchive()
 	}
 	return false
+}
+
+// RestoreSegment fetches a segment back from the archive beneath this shim and writes it to the
+// primary. Forwarded for the same reason HasArchive is: the store below owns the sinks.
+//
+// Takes this shim's per-segment lock, because a restore writes the segment file and anything
+// reading it concurrently must not see a half-written one.
+func (f *FileBackedPlatformIO) RestoreSegment(segmentName string) error {
+	type archiveAware interface{ RestoreSegment(string) error }
+	store, ok := f.store.(archiveAware)
+	if !ok {
+		return fmt.Errorf("this storage has no archive to restore %s from", segmentName)
+	}
+	mu := f.mutexFor(segmentName)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := store.RestoreSegment(segmentName); err != nil {
+		return err
+	}
+	// A restored segment is sealed by definition - it was sealed before it was evicted, and
+	// nothing appends to it again. Recording that keeps a later writer from treating it as the
+	// open segment and appending into history.
+	f.globalMu.Lock()
+	f.sealedSegments[segmentName] = struct{}{}
+	f.globalMu.Unlock()
+	return nil
 }
 
 // NewFileBackedPlatformIO wraps a SegmentByteStore with shared locking.

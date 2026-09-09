@@ -204,6 +204,7 @@ func (h *Host) openNamespace(
 		DataRoot:         dataRoot,
 		ReadOnly:         opts.ReadOnly,
 		deltaReader:      handle.DeltaReader(),
+		shim:             io,
 	}
 	if !sch.IsNone() && !opts.ReadOnly {
 		// syncEmbedSchema commits a schema migration when the stored schema differs - a write,

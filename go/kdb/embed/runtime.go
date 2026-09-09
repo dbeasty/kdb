@@ -28,6 +28,10 @@ type EmbeddedKdbRuntime struct {
 	// maintenance paths (see MigrateHistoryStrategy) can walk the log
 	// without reopening the storage handle behind the runtime's back.
 	deltaReader storage.DeltaSegmentReader
+	// shim is the platform I/O this namespace's segments live on. Held for
+	// the same reason as deltaReader, and additionally because it is what
+	// knows whether an archive tier exists - see RestoreFromArchive.
+	shim storage.PlatformIOShim
 	// refresh re-reads the writer's committed history onto this runtime's DAG. Non-nil only for
 	// read-only runtimes, which are the only ones whose view can fall behind reality.
 	refresh func() error

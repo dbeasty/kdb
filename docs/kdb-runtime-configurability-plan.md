@@ -362,23 +362,56 @@ first and falls back to the policy only for a store that cannot answer.
 *Exit met* at the runtime level; a control-plane endpoint for it is not
 wired, so today the switch is an API call rather than a UI button.
 
-**Phase 5 — `compact history`, and the archive. PARTLY LANDED.**
+**Phase 5 — `compact history`, and the archive. LANDED.**
 
-Done: `CompactHistory` (Phase 2). The `SinkRole` split —
-`storio.SinkReplica` follows deletions, `storio.SinkArchive` does not — so a
-compaction no longer destroys the copy that could restore it, which was the
-blocker named in §3. `RestoreSegment` fetches a segment back from an archive
-and writes it to the primary, refusing a write-only archive by name rather
-than failing obscurely. `HasArchive` is plumbed up to `TruncationResult.
-Reversible`, so a compaction can say which of the two operations it is.
+| what | where |
+|---|---|
+| `SinkReplica` / `SinkArchive`; deletion fans out to replicas only | `storage/io/primary_replicas.go` |
+| `RestoreSegment`, `HasArchive`, optional `SegmentFetcher` | same, `storage/io/replica.go` |
+| Archive from configuration: `S3Archive`, `KDB_S3_ARCHIVE_BUCKET` | `embed/segment_store.go`, `storage/io/s3/config.go` |
+| `RestoreFromArchive` — fetch a range, then lower the floor | `embed/restore_archive.go` |
+| `Reversible` on the compaction result, so it can say which operation it is | `embed/truncate.go` |
 
-Not done, and each weakens the claim: **nothing constructs an archive from
-configuration** — the role exists and is tested, but no flag, env var or
-config field puts a sink in it, so a deployment cannot turn one on yet.
-**The cold-read path does not fall back to the archive**, so a read below
-the floor still fails rather than fetching. **No restore moves the floor
-back down**, which is the operation an operator would actually run; trap 8
-below still applies to whoever writes it.
+The archive is its own bucket rather than a mode on the replica's, because
+the two hold different things by design: sharing a location would have the
+replica's deletions remove exactly what the archive is retaining.
+
+**The cold-read fallback was deliberately not built, and this is a change
+from the plan above.** The loader indexes segments that are locally present,
+so a version in an evicted segment is not in its index at all — making the
+read path fall back would mean, on every miss, listing the archive and
+pulling whole segments from object storage in the middle of a query, with no
+bound on how much. That turns a read into an unpredictable multi-second
+fetch and hides a large cost behind an ordinary operation. `RestoreFromArchive`
+gets the same data, when an operator asks, at a cost they can see.
+
+The ordering is the mirror of truncation's, and trap 8 is why: truncation
+flushes bodies, claims a higher floor, then deletes; a restore fetches,
+verifies the segments are present, and only then lowers the floor. A restore
+stops at the first sequence the archive cannot produce and lowers the floor
+only to the top of the contiguous run — a floor below a hole would leave the
+namespace expecting a segment nothing can supply.
+
+## The control plane and the UI
+
+Landed alongside, because a capability only reachable from Go is not one an
+operator has.
+
+| endpoint | what |
+|---|---|
+| `GET /v1/ns/{ns}/retention` | mode, reclaim mode, window, floor, what is eligible, whether an archive exists |
+| `PUT /v1/ns/{ns}/retention/history-mode` | switch full↔none; reports `historyLost` |
+| `POST /v1/ns/{ns}/retention/compact` | the destructive one; reports `reversible` |
+| `POST /v1/ns/{ns}/retention/restore` | fetch a range back and lower the floor |
+
+A **Retention tab** in the control UI puts these in front of an operator,
+arranged so the harmless operations look harmless and the destructive one
+does not. The confirmation is on the compaction alone: putting one on the
+mode switch as well would train an operator to click through the dialog that
+does not matter, and then through the one that does. The compact button
+reads "Compact (evict to archive)…" or "Compact (permanent)…" and is styled
+`danger` only in the second case, and an "Armed but not reclaiming" banner
+names the `none`+`manual` state with the number of segments it is sitting on.
 
 Phase 3 is the structurally valuable one and is independent of the rest —
 it frees six existing settings on its own. Phases 1, 2 and 4 form the

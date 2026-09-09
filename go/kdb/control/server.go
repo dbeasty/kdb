@@ -292,6 +292,9 @@ func (s *Server) routes() http.Handler {
 	// are - so an existing "read:orders/*" grant covers them with no new vocabulary.
 	mux.Handle("GET /v1/namespaces", s.nsRead(s.handleNamespaces))
 	mux.Handle("GET /v1/ns/{ns}/status", s.nsRead(s.handleStatus))
+	// Retention: what this namespace keeps, and the three operations that change it. Reading is
+	// a read; all three changes are writes, and compaction is the only one that deletes.
+	mux.Handle("GET /v1/ns/{ns}/retention", s.nsRead(s.handleRetentionStatus))
 	mux.Handle("GET /v1/ns/{ns}/schema", s.nsRead(s.handleSchema))
 	mux.Handle("GET /v1/ns/{ns}/indexes", s.nsRead(s.handleIndexes))
 	mux.Handle("GET /v1/ns/{ns}/log", s.nsRead(s.handleLog))
@@ -325,6 +328,9 @@ func (s *Server) routes() http.Handler {
 	// Revert. Planning is a read - it computes a diff and writes nothing - so it is available
 	// whatever the write setting, and an operator can always see what a revert *would* do. Only
 	// applying is gated.
+	mux.Handle("PUT /v1/ns/{ns}/retention/history-mode", s.nsWrite(s.handleSetHistoryMode))
+	mux.Handle("POST /v1/ns/{ns}/retention/compact", s.nsWrite(s.handleCompactHistory))
+	mux.Handle("POST /v1/ns/{ns}/retention/restore", s.nsWrite(s.handleRestoreFromArchive))
 	mux.Handle("PUT /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handlePutDocument))
 	mux.Handle("DELETE /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handleDeleteDocument))
 	mux.Handle("POST /v1/ns/{ns}/refs/branches", s.nsWrite(s.handleCreateBranch))
