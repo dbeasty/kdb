@@ -74,38 +74,57 @@ successful commits and excludes conflict retries. See the units note in the prev
 Every durability row is at or above baseline, most of them well above. `sync-full/insert/heavy`
 produced **no samples at all** in the previous run and is now 28% above baseline.
 
-## The two rows this table gets wrong, and why
+## The two rows this table got wrong — root-caused and fixed
 
-`BenchmarkWorkloadWriteInsert` reports 124.1 (single-user) and 5,307 (heavy-multi) here, against
-baselines of 242.6 and 30,051. **Both are artifacts of running inside the matrix, not
-regressions.** Re-measured at the same commit, the same `-benchtime 2s -count=5`, alone in the
-process:
+As first published, `BenchmarkWorkloadWriteInsert` reported 124.1 (single-user) and 5,307
+(heavy-multi) here, against baselines of 242.6 and 30,051. Re-measured alone in the process at
+the same commit and flags, the same rows gave 236.9 and 33,027. The corroboration was in this
+table already: `Durability/sync-full/insert/single-user` is the *identical* workload, differing
+only in passing `{DurabilitySync, SyncModeFull}` explicitly where `WriteInsert` takes the
+defaults, and it reported 242.2.
 
-| Row | in the matrix | isolated | baseline |
-|---|---:|---:|---:|
-| `WriteInsert/single-user` | 124.1 | **236.9** | 242.6 |
-| `WriteInsert/heavy-multi` | 5,307 | **33,027** | 30,051 |
+**The cause was the harness, in `newWorkloadServerWithOptions`:**
 
-The corroboration is in this table already: `Durability/sync-full/insert/single-user` is the
-*identical* workload — same operation, same durability, same runner — differing only in that it
-passes `{DurabilitySync, SyncModeFull}` explicitly where `WriteInsert` takes the defaults. It
-reports 242.2. An insert row is not half-speed in one benchmark and full-speed in another
-because of the storage engine.
+```go
+b.Cleanup(func() { rt.Close() })   // inside a function called once per ramp iteration
+```
 
-`WriteInsert` runs second in the file, straight after `BenchmarkWorkloadRead` seeds and hammers
-a 4,096-document pool five times over. Whatever that leaves behind — page cache, background
-flush, heap — it halves an fsync-bound row that measures correctly on its own. Note it did *not*
-show in the 2026-09-08 matrix (240.0 there), so it is sensitive to how much work the preceding
-rows get through, which the fixes changed considerably.
+The framework calls a `b.Run` closure repeatedly as it ramps `b.N` (1, then 100, then ...), but
+cleanups registered on a benchmark do not run until it and all its subtests finish. So every
+earlier iteration's runtime stayed open alongside the one being measured - WAL, background
+flushers, group-commit timers - with its temp directory still on disk.
 
-**Read the `WriteInsert` rows from isolated runs, not from the matrix.** They are the only rows
-in this file that need that caveat, and they are also the two rows every previous write-up used
-as the headline — which is worth remembering before quoting them again.
+Only `BenchmarkWorkloadWriteInsert` and `BenchmarkWorkloadDurability` open servers inside a
+`b.Run` closure; every other benchmark here opens one in parent scope, where `b.Cleanup` is
+exactly right. That is why these two rows were affected and the rest of the table was not.
+
+The helper now returns an idempotent closer that the in-closure sites defer. Re-running the
+whole matrix with that change, on the same machine:
+
+| Row | before | after | isolated | baseline |
+|---|---:|---:|---:|---:|
+| `WriteInsert/single-user` | 124.1 | **231.4** | 236.9 | 242.6 |
+| `WriteInsert/heavy-multi` | 5,307 | **32,235** | 33,027 | 30,051 |
+
+Both now agree with their isolated measurements. Every other row moved by a few percent or not
+at all - `Durability/sync-full/insert` 242.2 -> 241.9 and 38,569 -> 38,199, `Update/heavy-multi`
+26,264 -> 26,893 - which is the check that this fixed a measurement defect rather than changing
+what was measured.
+
+Two things worth carrying forward. First, three separate attempts to reproduce the depression
+outside a full matrix run all came back normal, including one at the exact commit; the defect
+only shows with the whole set running, so "I could not reproduce it" was not evidence of
+absence. Second, one of those attempts was invalid: `go test -bench` splits its regex **per path
+segment**, so `-bench 'BenchmarkWorkloadRead|BenchmarkWorkloadWriteInsert/single-user'` silently
+restricts *Read* to its single-user rows too. It is easy to get wrong in precisely the direction
+that makes an experiment prove nothing.
 
 ## Still open
 
-- **Blob-store compaction fails on large namespaces**: `could not compact the blob store
-  (append size exceeds max ...) — it keeps its current tables`, seen around 108,000 documents.
-  Unrelated to any of this and not investigated.
-- The in-process interference above deserves its own look. It is a benchmark-harness problem
-  rather than a product one, but it silently halved a row for a whole run.
+- ~~**Blob-store compaction fails on large namespaces**~~ — **fixed** by PR #54. The SSTable
+  footer carries a text line per key and was written in a single append, so it outgrew the 16MB
+  per-append ceiling at about 200,000 keys and every compaction failed silently. Worth noting
+  the run below is what surfaced it.
+- ~~The in-process interference above deserves its own look.~~ **Fixed** — see the section
+  above. It was a benchmark-harness problem rather than a product one, but it silently halved
+  one row and cut another to a sixth for a whole run.

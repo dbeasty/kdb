@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -54,12 +55,23 @@ func (m keyspaceMode) String() string {
 // (storage.DurabilitySync + storio.SyncModeFull - real fsync per write), same shape as
 // BenchmarkFileBackedUpsert. Every benchmark in this file except BenchmarkWorkloadDurability
 // runs under this mode; see that benchmark for the sync/async/memory-only comparison.
-func newWorkloadServer(b *testing.B, ns string) *KdbServerRuntime {
+func newWorkloadServer(b *testing.B, ns string) (*KdbServerRuntime, func()) {
 	b.Helper()
 	return newWorkloadServerWithOptions(b, ns, embed.StorageOptions{})
 }
 
-func newWorkloadServerWithOptions(b *testing.B, ns string, opts embed.StorageOptions) *KdbServerRuntime {
+// Returns the runtime and a closer, because b.Cleanup alone is not enough for the callers that
+// open a server *inside* a b.Run closure. The framework calls that closure once per ramp
+// iteration (N=1, then 100, then ...), while cleanups registered on a benchmark do not run until
+// it and all its subtests finish - so every earlier iteration's runtime stayed open alongside
+// the one being measured, WAL, background flushers and all, with its temp directory still on
+// disk. Only BenchmarkWorkloadWriteInsert and BenchmarkWorkloadDurability open servers that way,
+// and they are the rows whose numbers did not survive being moved out of the matrix: single-user
+// insert measured 124 ops/sec inside a full run and 237 on its own.
+//
+// The closer is idempotent, so callers defer it and the registered cleanup stays as a backstop
+// for the paths that return early.
+func newWorkloadServerWithOptions(b *testing.B, ns string, opts embed.StorageOptions) (*KdbServerRuntime, func()) {
 	b.Helper()
 	rt, err := embed.OpenFileRuntimeWithOptions(
 		b.TempDir(), "bench", ns, schema.None(),
@@ -68,10 +80,12 @@ func newWorkloadServerWithOptions(b *testing.B, ns string, opts embed.StorageOpt
 	if err != nil {
 		b.Fatalf("OpenFileRuntimeWithOptions: %v", err)
 	}
-	b.Cleanup(func() { rt.Close() })
+	var once sync.Once
+	closeRuntime := func() { once.Do(rt.Close) }
+	b.Cleanup(closeRuntime)
 	srv := NewKdbServerRuntime(rt)
 	srv.SetWriteQueueCapacityForTest(4096)
-	return srv
+	return srv, closeRuntime
 }
 
 // seedDocs pre-populates n documents via Upsert (LastWrite, never conflicts) and returns their IDs.
@@ -184,7 +198,7 @@ func BenchmarkWorkloadRead(b *testing.B) {
 	const poolSize = 4096
 	for _, mode := range []keyspaceMode{keyspaceOverlapping, keyspaceNonOverlapping} {
 		ns := "bench/read"
-		srv := newWorkloadServer(b, ns)
+		srv, _ := newWorkloadServer(b, ns)
 		ids := seedDocs(b, srv, ns, poolSize)
 
 		b.Run("single-user/"+mode.String(), func(b *testing.B) {
@@ -213,7 +227,8 @@ func BenchmarkWorkloadWriteInsert(b *testing.B) {
 	ns := "bench/insert"
 
 	b.Run("single-user", func(b *testing.B) {
-		srv := newWorkloadServer(b, ns)
+		srv, closeSrv := newWorkloadServer(b, ns)
+		defer closeSrv()
 		runSequential(b, func(i int) {
 			id, err := codec.RandomUUID()
 			if err != nil {
@@ -225,7 +240,8 @@ func BenchmarkWorkloadWriteInsert(b *testing.B) {
 		})
 	})
 	b.Run("heavy-multi-user", func(b *testing.B) {
-		srv := newWorkloadServer(b, ns)
+		srv, closeSrv := newWorkloadServer(b, ns)
+		defer closeSrv()
 		runHeavyMultiUser(b, func(workerID, i int) {
 			id, err := codec.RandomUUID()
 			if err != nil {
@@ -245,7 +261,7 @@ func BenchmarkWorkloadUpdate(b *testing.B) {
 	const poolSize = 4096
 	for _, mode := range []keyspaceMode{keyspaceOverlapping, keyspaceNonOverlapping} {
 		ns := "bench/update"
-		srv := newWorkloadServer(b, ns)
+		srv, _ := newWorkloadServer(b, ns)
 		ids := seedDocs(b, srv, ns, poolSize)
 
 		b.Run("single-user/"+mode.String(), func(b *testing.B) {
@@ -275,7 +291,7 @@ func BenchmarkWorkloadMixedReadWrite(b *testing.B) {
 	const writeEveryNth = 5 // 1-in-5 == 20% writes, 80% reads
 	for _, mode := range []keyspaceMode{keyspaceOverlapping, keyspaceNonOverlapping} {
 		ns := "bench/mixed"
-		srv := newWorkloadServer(b, ns)
+		srv, _ := newWorkloadServer(b, ns)
 		ids := seedDocs(b, srv, ns, poolSize)
 
 		op := func(workerID, i int) {
@@ -311,7 +327,7 @@ func BenchmarkWorkloadTransaction(b *testing.B) {
 	const poolSize = 256 // small on purpose for "overlapping": guarantees real contention
 	for _, mode := range []keyspaceMode{keyspaceOverlapping, keyspaceNonOverlapping} {
 		ns := "bench/tx"
-		srv := newWorkloadServer(b, ns)
+		srv, _ := newWorkloadServer(b, ns)
 		// Non-overlapping gets one document per worker. Conflicts are the measured quantity
 		// here, so the zero-contention control has to actually be able to reach zero: at 256
 		// documents and ~1024 goroutines, four workers share every document by construction and
@@ -417,7 +433,8 @@ func BenchmarkWorkloadDurability(b *testing.B) {
 		ns := "bench/durability-" + mode.name
 
 		b.Run(mode.name+"/insert/single-user", func(b *testing.B) {
-			srv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			srv, closeSrv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			defer closeSrv()
 			runSequential(b, func(i int) {
 				id, err := codec.RandomUUID()
 				if err != nil {
@@ -429,7 +446,8 @@ func BenchmarkWorkloadDurability(b *testing.B) {
 			})
 		})
 		b.Run(mode.name+"/insert/heavy-multi-user", func(b *testing.B) {
-			srv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			srv, closeSrv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			defer closeSrv()
 			runHeavyMultiUser(b, func(workerID, i int) {
 				id, err := codec.RandomUUID()
 				if err != nil {
@@ -443,7 +461,8 @@ func BenchmarkWorkloadDurability(b *testing.B) {
 
 		const updatePoolSize = 4096
 		b.Run(mode.name+"/update/single-user", func(b *testing.B) {
-			srv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			srv, closeSrv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			defer closeSrv()
 			ids := seedDocs(b, srv, ns, updatePoolSize)
 			runSequential(b, func(i int) {
 				id := keyFor(ids, keyspaceNonOverlapping, 0, i)
@@ -453,7 +472,8 @@ func BenchmarkWorkloadDurability(b *testing.B) {
 			})
 		})
 		b.Run(mode.name+"/update/heavy-multi-user", func(b *testing.B) {
-			srv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			srv, closeSrv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			defer closeSrv()
 			ids := seedDocs(b, srv, ns, updatePoolSize)
 			runHeavyMultiUser(b, func(workerID, i int) {
 				id := keyFor(ids, keyspaceNonOverlapping, workerID, i)
@@ -465,7 +485,8 @@ func BenchmarkWorkloadDurability(b *testing.B) {
 
 		const txPoolSize = 256
 		b.Run(mode.name+"/transaction/single-user", func(b *testing.B) {
-			srv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			srv, closeSrv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			defer closeSrv()
 			ids := seedDocs(b, srv, ns, txPoolSize)
 			var conflicts int64
 			runSequential(b, func(i int) {
@@ -474,7 +495,8 @@ func BenchmarkWorkloadDurability(b *testing.B) {
 			})
 		})
 		b.Run(mode.name+"/transaction/heavy-multi-user", func(b *testing.B) {
-			srv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			srv, closeSrv := newWorkloadServerWithOptions(b, ns, mode.opts)
+			defer closeSrv()
 			ids := seedDocs(b, srv, ns, txPoolSize)
 			var conflicts int64
 			runHeavyMultiUser(b, func(workerID, i int) {
