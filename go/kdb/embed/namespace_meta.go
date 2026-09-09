@@ -300,3 +300,27 @@ func resolveModeLocked(
 	}
 	return resolved, nil
 }
+
+// NamespaceMarker reports what a namespace's on-disk marker says: the history strategy and mode it
+// was built with, and whether there is a marker at all.
+//
+// Exported for tooling that has to reason about a namespace directory without opening it - the
+// control plane's promotion path, which must decide what marker a restored copy should carry before
+// anything is allowed to open it. An absent marker is not an error: it means the namespace predates
+// the settings, which is read everywhere as replay and full.
+func NamespaceMarker(dataRoot, namespaceID string) (strategy, mode string, found bool) {
+	m, ok := readNamespaceMeta(dataRoot, namespaceID)
+	if !ok {
+		return "", "", false
+	}
+	return m.HistoryStrategy, m.HistoryMode, true
+}
+
+// EncodeNamespaceMarker builds a marker file's contents. Callers writing a namespace directory that
+// no runtime has opened yet - a restore about to be promoted - need the same bytes this package
+// would write, not their own approximation of them.
+func EncodeNamespaceMarker(namespaceID, strategy, mode string) ([]byte, error) {
+	return json.Marshal(namespaceMeta{
+		NamespaceID: namespaceID, HistoryStrategy: strategy, HistoryMode: mode,
+	})
+}

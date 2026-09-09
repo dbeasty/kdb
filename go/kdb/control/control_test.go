@@ -2998,3 +2998,353 @@ func TestPersistPartitionsAPatchByWhatCanBeWritten(t *testing.T) {
 		t.Errorf("drift should be just the unpersisted key: %v", items)
 	}
 }
+
+// Promotion - docs/kdb-control-ui-plan.md §8.4's supervised flow.
+//
+// The endpoints do three things: stage a copy inside the live data root, record the intent, and
+// ask the process to restart. The install itself is recovery.ApplyPromotion's job at the next
+// startup and is tested there. What is tested here is the part an operator interacts with: that
+// the plan tells the truth about what will happen and what stands in the way, that nothing
+// irreversible happens without the confirmation, and that a request can still be taken back.
+
+// promoteFixture is a staging fixture with promotion enabled and a restart callback that records
+// the request instead of ending the test process.
+func promoteFixture(t *testing.T) (*Server, string, *embed.EmbeddedKdbRuntime, *[]string) {
+	t.Helper()
+	restarts := &[]string{}
+	staging := filepath.Join(t.TempDir(), "staging")
+	cs, base, rt := fileFixture(t, func(o *Options) {
+		o.StagingDir = staging
+		o.AllowPromotion = true
+		o.RequestRestart = func(reason string) error {
+			*restarts = append(*restarts, reason)
+			return nil
+		}
+	})
+	return cs, base, rt, restarts
+}
+
+// stagedRestoreJob seeds documents, backs them up, writes once more, and restores the backup into
+// staging - so the staged copy and the live namespace differ in a way a promotion would show.
+func stagedRestoreJob(t *testing.T, base string, rt *embed.EmbeddedKdbRuntime) string {
+	t.Helper()
+	for i := 0; i < 4; i++ {
+		if _, err := embed.PutJSONDocument(rt, "demo/users", fmt.Sprintf(`{"id":"d%d"}`, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, made := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	backupID, _ := made["backupId"].(string)
+	if backupID == "" {
+		t.Fatalf("no backup to restore from: %v", made)
+	}
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"after-backup"}`); err != nil {
+		t.Fatal(err)
+	}
+	res, started := postJSON(t, base, "/v1/ns/demo%2Fusers/restore/staging",
+		`{"backupId":"`+backupID+`"}`)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("start restore: %d (%v)", res.StatusCode, started)
+	}
+	jobID := started["job"].(map[string]any)["id"].(string)
+	if job := awaitRestore(t, base, jobID); job["state"] != "complete" {
+		t.Fatalf("restore did not complete: %v", job)
+	}
+	return jobID
+}
+
+func TestPromotionPlanSaysWhatItWillDo(t *testing.T) {
+	_, base, rt, _ := promoteFixture(t)
+	jobID := stagedRestoreJob(t, base, rt)
+
+	res, plan := get(t, base, "/v1/restore/staging/"+jobID+"/promote/plan")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("plan: %d (%v)", res.StatusCode, plan)
+	}
+	if blockers, _ := plan["blockers"].([]any); len(blockers) != 0 {
+		t.Fatalf("nothing should stand in the way here: %v", blockers)
+	}
+	if plan["confirmWith"] != "demo/users" {
+		t.Errorf("the plan should name the confirmation string: %v", plan["confirmWith"])
+	}
+	steps := fmt.Sprint(plan["steps"])
+	// The three facts an operator has to know before agreeing to this.
+	if !strings.Contains(steps, "next startup") {
+		t.Errorf("the plan must say the install happens on the next startup: %v", steps)
+	}
+	if !strings.Contains(fmt.Sprint(plan["restart"]), "cannot restart itself") {
+		t.Errorf("the plan must say the process cannot restart itself: %v", plan["restart"])
+	}
+	if !strings.Contains(fmt.Sprint(plan["rollback"]), "not deleted") {
+		t.Errorf("the plan must say the old namespace is kept: %v", plan["rollback"])
+	}
+	// And it is a read: asking has changed nothing.
+	_, status := get(t, base, "/v1/promotion")
+	if status["pending"] != nil {
+		t.Errorf("reading the plan must not stage anything: %v", status["pending"])
+	}
+}
+
+// The confirmation is server-side because this request ends with the process exiting. A stray POST
+// must not be able to take the service down.
+func TestPromotionNeedsATypedConfirmation(t *testing.T) {
+	_, base, rt, restarts := promoteFixture(t)
+	jobID := stagedRestoreJob(t, base, rt)
+
+	res, body := postJSON(t, base, "/v1/restore/staging/"+jobID+"/promote", `{}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 without a confirmation, got %d (%v)", res.StatusCode, body)
+	}
+	if !strings.Contains(fmt.Sprint(body["error"]), "demo/users") {
+		t.Errorf("the refusal should say what to send: %v", body["error"])
+	}
+	res, body = postJSON(t, base, "/v1/restore/staging/"+jobID+"/promote", `{"confirm":"wrong/ns"}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for the wrong confirmation, got %d (%v)", res.StatusCode, body)
+	}
+	if len(*restarts) != 0 {
+		t.Errorf("nothing should have been restarted: %v", *restarts)
+	}
+	_, status := get(t, base, "/v1/promotion")
+	if status["pending"] != nil {
+		t.Errorf("nothing should have been staged: %v", status["pending"])
+	}
+}
+
+func TestPromotionStagesTheCopyAndAsksForARestart(t *testing.T) {
+	cs, base, rt, restarts := promoteFixture(t)
+	jobID := stagedRestoreJob(t, base, rt)
+	root := cs.opts.Runtime.Runtime.DataRoot
+
+	// The live namespace before: it has the write that landed after the backup.
+	_, before := get(t, base, "/v1/ns/demo%2Fusers/docs?limit=100")
+	if !strings.Contains(fmt.Sprint(before["documents"]), "after-backup") {
+		t.Fatal("the fixture should have a write the staged copy does not")
+	}
+
+	res, body := postJSON(t, base, "/v1/restore/staging/"+jobID+"/promote",
+		`{"confirm":"demo/users"}`)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("promote: %d (%v)", res.StatusCode, body)
+	}
+	if body["staged"] != true || body["restarting"] != true {
+		t.Errorf("the response should say what it did: %v", body)
+	}
+	if body["commits"].(float64) == 0 {
+		t.Errorf("the intent should record the staged commit count: %v", body["commits"])
+	}
+	if len(*restarts) != 1 || !strings.Contains((*restarts)[0], "demo/users") {
+		t.Fatalf("a restart should have been requested once, naming the namespace: %v", *restarts)
+	}
+
+	// Staged, recorded, and the live namespace untouched: the install is the next startup's job,
+	// which is what makes this cancellable right up to the restart.
+	_, status := get(t, base, "/v1/promotion")
+	pending, _ := status["pending"].(map[string]any)
+	if pending == nil || pending["namespace"] != "demo/users" {
+		t.Fatalf("the promotion should be pending: %v", status)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".kdb.promote")); err != nil {
+		t.Errorf("the copy should be staged inside the data root: %v", err)
+	}
+	_, after := get(t, base, "/v1/ns/demo%2Fusers/docs?limit=100")
+	if !strings.Contains(fmt.Sprint(after["documents"]), "after-backup") {
+		t.Error("the live namespace must not change until the restart")
+	}
+}
+
+// Cancelling is the reason nothing irreversible happens before the restart.
+func TestPromotionCanBeAbandonedBeforeTheRestart(t *testing.T) {
+	cs, base, rt, _ := promoteFixture(t)
+	jobID := stagedRestoreJob(t, base, rt)
+	root := cs.opts.Runtime.Runtime.DataRoot
+
+	postJSON(t, base, "/v1/restore/staging/"+jobID+"/promote", `{"confirm":"demo/users"}`)
+
+	res, body := sendJSON(t, http.MethodDelete, base, "/v1/promotion", `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("abandon: %d (%v)", res.StatusCode, body)
+	}
+	if body["abandoned"] != true {
+		t.Errorf("it should say it cancelled something: %v", body)
+	}
+	_, status := get(t, base, "/v1/promotion")
+	if status["pending"] != nil {
+		t.Errorf("nothing should be pending: %v", status["pending"])
+	}
+	if _, err := os.Stat(filepath.Join(root, ".kdb.promote")); !os.IsNotExist(err) {
+		t.Errorf("the staged copy should be gone: %v", err)
+	}
+
+	// Cancelling nothing says so rather than failing.
+	res, body = sendJSON(t, http.MethodDelete, base, "/v1/promotion", `{}`)
+	if res.StatusCode != http.StatusOK || body["abandoned"] != false {
+		t.Errorf("abandoning nothing should be quiet: %d (%v)", res.StatusCode, body)
+	}
+}
+
+// TestPromotionIsRefusedWhenTheDeploymentDidNotAskForIt: the plan is still readable, because an
+// operator should be able to see what promoting *would* do on a server that will not do it. That
+// is the difference between a documented capability and a mystery.
+func TestPromotionIsRefusedWhenTheDeploymentDidNotAskForIt(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), "staging")
+	_, base, rt := fileFixture(t, func(o *Options) { o.StagingDir = staging })
+	jobID := stagedRestoreJob(t, base, rt)
+
+	res, plan := get(t, base, "/v1/restore/staging/"+jobID+"/promote/plan")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("the plan should still be readable: %d (%v)", res.StatusCode, plan)
+	}
+	blockers := fmt.Sprint(plan["blockers"])
+	if !strings.Contains(blockers, "--control-promote") {
+		t.Errorf("the blocker should name the flag: %v", blockers)
+	}
+
+	res, body := postJSON(t, base, "/v1/restore/staging/"+jobID+"/promote",
+		`{"confirm":"demo/users"}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409, got %d (%v)", res.StatusCode, body)
+	}
+	if !strings.Contains(fmt.Sprint(body["blockers"]), "--control-promote") {
+		t.Errorf("the refusal should carry the blockers: %v", body["blockers"])
+	}
+}
+
+// Without a way to shut down, staging a promotion would leave an intent nobody asked for waiting
+// on disk for a restart that may never come.
+func TestPromotionIsRefusedWithoutAWayToRestart(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), "staging")
+	_, base, rt := fileFixture(t, func(o *Options) {
+		o.StagingDir = staging
+		o.AllowPromotion = true
+	})
+	jobID := stagedRestoreJob(t, base, rt)
+
+	_, plan := get(t, base, "/v1/restore/staging/"+jobID+"/promote/plan")
+	if !strings.Contains(fmt.Sprint(plan["blockers"]), "shut itself down") {
+		t.Errorf("the blocker should say what is missing: %v", plan["blockers"])
+	}
+}
+
+// An attached copy is being read from. Moving it while a runtime holds its files open is not
+// something to do quietly.
+func TestPromotionIsRefusedWhileTheCopyIsAttached(t *testing.T) {
+	_, base, rt, _ := promoteFixture(t)
+	jobID := stagedRestoreJob(t, base, rt)
+
+	if res, body := postJSON(t, base, "/v1/restore/staging/"+jobID+"/attach", `{}`); res.StatusCode != http.StatusOK {
+		t.Fatalf("attach: %d (%v)", res.StatusCode, body)
+	}
+	_, plan := get(t, base, "/v1/restore/staging/"+jobID+"/promote/plan")
+	if !strings.Contains(fmt.Sprint(plan["blockers"]), "detach it first") {
+		t.Errorf("an attached copy should block promotion: %v", plan["blockers"])
+	}
+
+	// Detaching clears it.
+	if res, body := postJSON(t, base, "/v1/restore/staging/"+jobID+"/detach", `{}`); res.StatusCode != http.StatusOK {
+		t.Fatalf("detach: %d (%v)", res.StatusCode, body)
+	}
+	_, plan = get(t, base, "/v1/restore/staging/"+jobID+"/promote/plan")
+	if blockers, _ := plan["blockers"].([]any); len(blockers) != 0 {
+		t.Errorf("after detaching there should be nothing in the way: %v", blockers)
+	}
+}
+
+// A second promotion staged while one waits would leave two intents disagreeing about one payload.
+func TestASecondPromotionIsRefusedWhileOneIsPending(t *testing.T) {
+	_, base, rt, _ := promoteFixture(t)
+	first := stagedRestoreJob(t, base, rt)
+	postJSON(t, base, "/v1/restore/staging/"+first+"/promote", `{"confirm":"demo/users"}`)
+
+	second := stagedRestoreJob(t, base, rt)
+	res, body := postJSON(t, base, "/v1/restore/staging/"+second+"/promote",
+		`{"confirm":"demo/users"}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409, got %d (%v)", res.StatusCode, body)
+	}
+	if !strings.Contains(fmt.Sprint(body["blockers"]), "already staged") {
+		t.Errorf("the refusal should say one is already waiting: %v", body["blockers"])
+	}
+}
+
+// A restore that is still running, or that failed, is not something to promote.
+func TestAnIncompleteRestoreCannotBePromoted(t *testing.T) {
+	cs, base, _, _ := promoteFixture(t)
+	cs.restore.mu.Lock()
+	cs.restore.jobs["job-running"] = &restoreJob{
+		ID: "job-running", Namespace: "demo/users", State: "running",
+		Dir: filepath.Join(cs.opts.StagingDir, "job-running"),
+	}
+	cs.restore.mu.Unlock()
+
+	_, plan := get(t, base, "/v1/restore/staging/job-running/promote/plan")
+	if !strings.Contains(fmt.Sprint(plan["blockers"]), "only a completed restore") {
+		t.Errorf("a running restore should block promotion: %v", plan["blockers"])
+	}
+}
+
+func TestPromotionPlanIsNotFoundForAnUnknownJob(t *testing.T) {
+	_, base, _, _ := promoteFixture(t)
+	res, body := get(t, base, "/v1/restore/staging/no-such-job/promote/plan")
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d (%v)", res.StatusCode, body)
+	}
+}
+
+// TestPromotionWarnsAboutAShortfall: a restore missing commits can still be promoted - sometimes
+// an incomplete history is the best available - but making that the live history is a decision,
+// and a decision needs to be presented as one.
+func TestPromotionWarnsAboutAShortfall(t *testing.T) {
+	cs, base, rt, _ := promoteFixture(t)
+	jobID := stagedRestoreJob(t, base, rt)
+	cs.restore.mu.Lock()
+	cs.restore.jobs[jobID].Missing = []string{"deadbeef"}
+	cs.restore.mu.Unlock()
+
+	_, plan := get(t, base, "/v1/restore/staging/"+jobID+"/promote/plan")
+	if !strings.Contains(fmt.Sprint(plan["warnings"]), "shortfall") {
+		t.Errorf("a missing commit should be warned about: %v", plan["warnings"])
+	}
+	if blockers, _ := plan["blockers"].([]any); len(blockers) != 0 {
+		t.Errorf("a shortfall is a warning, not a blocker: %v", blockers)
+	}
+}
+
+// TestJobSnapshotsDoNotAliasTheLiveJob: a restore writes its own job struct from its own goroutine
+// while handlers read it. Handing a reader the pointer - which every one of them used to do - races
+// that writer, and can serialize a torn job ("complete" beside an applied-count not yet written).
+// The fix is a copy, and a copy that shared its slices would only move the problem.
+func TestJobSnapshotsDoNotAliasTheLiveJob(t *testing.T) {
+	cs, _, _ := fileFixture(t, func(o *Options) {
+		o.StagingDir = filepath.Join(t.TempDir(), "staging")
+	})
+	cs.restore.mu.Lock()
+	cs.restore.jobs["j1"] = &restoreJob{
+		ID: "j1", Namespace: "demo/users", State: "complete",
+		Sources: []string{"backup:one"}, Missing: []string{"deadbeef"},
+	}
+	cs.restore.mu.Unlock()
+
+	snap, ok := cs.snapshotJob("j1")
+	if !ok {
+		t.Fatal("the job should be found")
+	}
+	snap.State = "tampered"
+	snap.Sources[0] = "tampered"
+	snap.Missing[0] = "tampered"
+
+	cs.restore.mu.Lock()
+	live := cs.restore.jobs["j1"]
+	cs.restore.mu.Unlock()
+	if live.State != "complete" {
+		t.Errorf("the live job's state was changed through the snapshot: %q", live.State)
+	}
+	if live.Sources[0] != "backup:one" || live.Missing[0] != "deadbeef" {
+		t.Errorf("the snapshot shares its slices with the live job: %v / %v",
+			live.Sources, live.Missing)
+	}
+
+	if _, ok := cs.snapshotJob("no-such-job"); ok {
+		t.Error("an unknown job should report absent rather than an empty one")
+	}
+}

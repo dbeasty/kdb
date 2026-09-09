@@ -156,6 +156,9 @@
 <dialog id="revertdlg"><h3>Revert</h3><div class="body" id="revertbody"></div>
   <footer><button class="act" id="revertcancel">Cancel</button>
   <button class="act danger" id="revertgo">Revert</button></footer></dialog>
+<dialog id="promotedlg"><h3>Promote a restored copy</h3><div class="body" id="promotebody"></div>
+  <footer><button class="act" id="promotecancel">Cancel</button>
+  <button class="act danger" id="promotego">Promote and restart</button></footer></dialog>
 
 <script>
 "use strict";
@@ -1280,6 +1283,84 @@ async function renderOps() {
       ops.admission.note ? el("div", { class: "warn", text: ops.admission.note }) : null)))));
 }
 
+// reviewPromotion shows the server's plan and asks for the namespace to be typed.
+//
+// The plan is rendered, not summarised. Everything about this operation that could surprise
+// someone - that the install happens on a restart, that this process cannot restart itself, where
+// the replaced namespace goes - is in the plan the server built, and paraphrasing it here is how
+// the UI and the server would come to disagree about what the button does.
+async function reviewPromotion(jobId) {
+  const dlg = $("promotedlg");
+  const body = $("promotebody");
+  setKids(body, el("div", { class: "empty", text: "Building the plan…" }));
+  $("promotego").disabled = true;
+  dlg.showModal();
+
+  let plan;
+  try {
+    plan = await api("/v1/restore/staging/" + encodeURIComponent(jobId) + "/promote/plan");
+  } catch (e) {
+    setKids(body, el("div", { class: "err", text: e.message }));
+    return;
+  }
+
+  const blockers = plan.blockers || [];
+  if (blockers.length) {
+    setKids(body,
+      el("p", { style: "margin-top:0" },
+        "This promotion cannot proceed:"),
+      ...blockers.map((b) => el("div", { class: "err", text: b })),
+      el("p", { class: "muted", style: "font-size:12px;margin-bottom:0" },
+        "The plan is shown on a server that will not carry it out, so what promoting would do is " +
+        "still readable."),
+      promotionPlanBody(plan));
+    return;
+  }
+
+  const confirmField = el("input", { type: "text", placeholder: plan.confirmWith,
+                                     style: "width:100%;margin-top:6px" });
+  const arm = () => { $("promotego").disabled = confirmField.value.trim() !== plan.confirmWith; };
+  confirmField.addEventListener("input", arm);
+
+  setKids(body,
+    el("p", { style: "margin-top:0" },
+      "Replace the live ", el("code", { text: plan.namespace }),
+      " with this restored copy. This ends with the service ",
+      el("strong", { text: "shutting down" }), " so a supervisor restarts it."),
+    ...(plan.warnings || []).map((wv) => el("div", { class: "warn", text: wv })),
+    promotionPlanBody(plan),
+    el("p", { class: "muted", style: "margin-bottom:4px" },
+      "Type the namespace to confirm:"),
+    confirmField);
+  arm();
+
+  $("promotego").onclick = async () => {
+    $("promotego").disabled = true;
+    try {
+      const done = await api("/v1/restore/staging/" + encodeURIComponent(jobId) + "/promote", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: confirmField.value.trim() }),
+      });
+      dlg.close();
+      flash("Staged " + done.commits + " commits of " + done.namespace + " and asked this service " +
+            "to restart. It will be installed on the way back up; reload this page once the " +
+            "service is back and the Recovery tab will report the outcome.");
+      await renderRecovery();
+    } catch (e) {
+      setKids(body, el("div", { class: "err", text: e.message }));
+    }
+  };
+}
+
+// promotionPlanBody renders the server's own words: the steps, the restart contract, the rollback.
+function promotionPlanBody(plan) {
+  return el("div", {},
+    el("ol", { class: "muted", style: "font-size:12px;padding-left:18px;margin:10px 0" },
+      ...(plan.steps || []).map((s) => el("li", { style: "margin-bottom:4px", text: s }))),
+    el("div", { class: "warn", text: plan.restart }),
+    el("div", { class: "body muted", style: "font-size:12px;padding:6px 0" }, plan.rollback));
+}
+
 // Revert is deliberately three steps: preview, read what will change, then confirm by typing the
 // namespace. The preview is a server-computed plan and the apply is checked against the head that
 // plan was made from, so what is applied is what was shown.
@@ -1371,7 +1452,12 @@ async function renderRecovery() {
   ]);
   let backups = null;
   try { backups = await api(nsPath("/backups")); } catch (e) { backups = { unavailable: e.message }; }
+  let promotion = null;
+  try { promotion = await api("/v1/promotion"); } catch (e) { promotion = { unavailable: e.message }; }
   setMain(
+    // A promotion waiting for a restart, or the result of one, goes first: it is the most
+    // consequential state this screen can be in and the operator should not have to scroll to it.
+    promotionSection(promotion),
     integritySection(integrity),
     el("div", { style: "height:12px" }),
     backupSection(backups),
@@ -1381,6 +1467,55 @@ async function renderRecovery() {
     restoreSection(jobs, backups),
     el("div", { style: "height:12px" }),
     maintenanceSection(plan));
+}
+
+// promotionSection shows a promotion waiting for a restart, and the outcome of the last one.
+//
+// The second half is not a nicety: the request was made to a process that no longer exists, so
+// after the restart this is the only place its result can be read.
+function promotionSection(p) {
+  if (!p || p.unavailable || (!p.pending && !p.last)) return null;
+  const kids = [];
+  if (p.pending) {
+    kids.push(el("div", { class: "warn" },
+      el("div", {}, el("strong", { text: "A promotion of " + p.pending.namespace +
+        " is staged and waiting for a restart." })),
+      el("div", { style: "margin-top:4px" },
+        "The copy is inside the data directory; the live namespace has not been touched and will " +
+        "be replaced the next time this service starts. Requested " +
+        formatTime(p.pending.requestedAt) +
+        (p.pending.requestedBy ? " by " + p.pending.requestedBy : "") + "."),
+      el("button", { class: "act danger", style: "margin-top:8px;padding:2px 8px;font-size:12px",
+        text: "Cancel the promotion", onclick: abandonPromotion })));
+  }
+  if (p.last) {
+    const ok = p.last.state === "promoted";
+    kids.push(el("div", { class: ok ? "body" : "err", style: ok ? "padding:8px 0 0" : "" },
+      el("div", {}, ok
+        ? "Last promotion: " + p.last.namespace + " was replaced at " + formatTime(p.last.appliedAt) +
+          " (" + p.last.commits + " commits, requested by " + (p.last.requestedBy || "unknown") + ")."
+        : "The last promotion of " + p.last.namespace + " failed: " + p.last.error),
+      ok && p.last.superseded
+        ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
+            "The namespace it replaced is kept at ", el("code", { text: p.last.superseded }),
+            " inside the data directory. Nothing removes it but you.")
+        : null));
+  }
+  return el("div", {},
+    el("div", { class: "card" }, el("h2", { text: "Promotion" }),
+      el("div", { class: "body" }, ...kids)),
+    el("div", { style: "height:12px" }));
+}
+
+async function abandonPromotion() {
+  try {
+    const res = await api("/v1/promotion", { method: "DELETE" });
+    flash(res.abandoned ? "Promotion cancelled. The live namespace was never touched."
+                        : "There was no promotion waiting.");
+  } catch (e) {
+    flash("Could not cancel: " + e.message);
+  }
+  await renderRecovery();
 }
 
 // A staged restore is the answer to "is this backup any good" - the only honest way to answer it is
@@ -1458,6 +1593,11 @@ function restoreSection(jobs, backups) {
             el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
               text: "Detach", onclick: () => act(j.id, "detach") }))
         : null,
+      j.state === "complete"
+        ? el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+            title: "replace the live namespace with this copy, on the next restart",
+            text: "Promote…", onclick: () => reviewPromotion(j.id) })
+        : null,
       j.state !== "running"
         ? el("button", { class: "act danger", style: "padding:2px 8px;font-size:12px;margin-left:6px",
             title: "detach and delete the staging directory",
@@ -1469,7 +1609,8 @@ function restoreSection(jobs, backups) {
     el("div", { class: "body muted", style: "padding-bottom:0" },
       "A restore into a scratch directory, which the live namespace never notices. Attaching one " +
       "opens it read-only alongside production, so the restored data can be checked with these " +
-      "same views before it is trusted. Promoting it needs the service stopped."),
+      "same views before it is trusted. Promoting one replaces the live namespace, and takes a " +
+      "restart to do it \u2014 read the plan before you agree to it."),
     controls,
     rows.length
       ? el("table", {},
@@ -1656,6 +1797,7 @@ $("signout").addEventListener("click", () => signOut());
 $("exitat").addEventListener("click", exitAt);
 $("nspick").addEventListener("change", (e) => { switchNamespace(e.target.value); });
 $("revertcancel").addEventListener("click", () => $("revertdlg").close());
+$("promotecancel").addEventListener("click", () => $("promotedlg").close());
 
 if (token) boot(); else renderGate();
 </script>

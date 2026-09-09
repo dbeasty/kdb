@@ -320,6 +320,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.ControlSettingsPersist != nil },
 		},
 		{
+			key: "control.promote", flag: "control-promote", env: "KDB_CONTROL_PROMOTE",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "let the control plane promote a staged restore over the live namespace. It ends with this process exiting 75 for a supervisor to restart it, which is why it is asked for separately from control.write",
+			value:  yn(func(s ServiceSettings) bool { return s.ControlPromote }),
+			inFile: func(f *ServiceFile) bool { return f.ControlPromote != nil },
+		},
+		{
 			key: "control.backupDir", flag: "control-backup-dir", env: "KDB_CONTROL_BACKUP_DIR",
 			scope: ScopeProcess, mutability: MutabilityRestart,
 			help:   "directory the control plane writes backups to (empty disables them). Keep it off the data volume: a backup sharing a disk with its source is not a backup",

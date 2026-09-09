@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/index/stores"
 	"github.com/limidus/kdb/go/kdb/policy"
+	"github.com/limidus/kdb/go/kdb/recovery"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
@@ -78,6 +80,7 @@ func Main() {
 	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
 	fs.StringVar(&flagVals.ControlBackupDir, "control-backup-dir", flagVals.ControlBackupDir, "directory the control plane writes backups to (empty disables backups through it). Keep it off the data volume: a backup that shares a disk with the thing it is backing up is not a backup")
 	fs.StringVar(&flagVals.ControlStagingDir, "control-staging-dir", flagVals.ControlStagingDir, "directory the control plane restores backups into for inspection (empty disables staged restores). A staged copy is opened read-only alongside the live namespace so it can be browsed before it is trusted; keep this off the data volume, since a restore is most needed exactly when that volume is the problem")
+	fs.BoolVar(&flagVals.ControlPromote, "control-promote", flagVals.ControlPromote, "let the control plane promote a staged restore over the live namespace. Off by default, and separately from --control-write, because it is the one control-plane operation that ends with this process exiting: the restored copy is staged inside the data directory, the intent is recorded, and the next startup installs it before opening the data root. Exit 75 is the supervisor contract (Docker --restart=on-failure, systemd Restart=on-failure) - without a supervisor the service stays down until someone starts it. The namespace being replaced is moved aside under superseded/, never deleted")
 	fs.BoolVar(&flagVals.ControlSettingsPersist, "control-settings-persist", flagVals.ControlSettingsPersist, "let a setting changed through the control plane also be written back to the --config file. Off by default: in a GitOps-managed deployment that file belongs to a deployment tool, and a server rewriting it is a surprise rather than a feature. A change applied without this is still reported under /v1/settings/drift, so nothing is silently lost on the next restart")
 	fs.StringVar(&flagVals.LogLevel, "log-level", flagVals.LogLevel, "minimum log level: debug, info, warn, error")
 	fs.StringVar(&flagVals.LogFormat, "log-format", flagVals.LogFormat, "log output format: text or json")
@@ -157,6 +160,34 @@ func Main() {
 		peerAddr = secureScheme(peerAddr)
 		streamAddr = secureScheme(streamAddr)
 		wsAddr = secureScheme(wsAddr)
+	}
+
+	// restartRequested carries a control-plane request to shut down and be restarted, which today
+	// only promotion makes. Buffered by one: a second request while the first is in flight is
+	// refused rather than queued, since the process is already on its way out.
+	restartRequested := make(chan string, 1)
+
+	// A promotion staged by a previous run of this process is applied here: before the data root
+	// is opened, which is the only moment nothing holds its lock. See recovery/promote.go - the
+	// live namespace is moved aside rather than deleted, and a failure is recorded and cleared
+	// rather than retried, so a bad request cannot turn into a boot loop.
+	if dataDir != "" {
+		if outcome, perr := recovery.ApplyPromotion(dataDir, nil); outcome != nil {
+			if perr != nil || outcome.State != "promoted" {
+				slog.Error("the staged promotion was not applied; the live namespace is unchanged",
+					"namespace", outcome.Namespace, "error", outcome.Error, "detail", perr)
+			} else {
+				slog.Warn("promoted a restored namespace over the live one",
+					"namespace", outcome.Namespace, "commits", outcome.Commits,
+					"superseded", outcome.Superseded, "requested_by", outcome.RequestedBy,
+					"note", "the replaced namespace is kept under "+recovery.SupersededDir+
+						"/ until it is removed by hand")
+			}
+		} else if perr != nil {
+			// An unreadable intent must not be ignored: the operator is expecting a promotion.
+			fmt.Fprintf(os.Stderr, "Error: %v\n", perr)
+			os.Exit(1)
+		}
 	}
 
 	var rt *embed.EmbeddedKdbRuntime
@@ -475,6 +506,19 @@ func Main() {
 			// The live level holder, so log.level is adjustable without a restart.
 			LogLevel:             logLevel,
 			AllowSettingsPersist: cfg.ControlSettingsPersist,
+			AllowPromotion:       cfg.ControlPromote,
+			// Process lifecycle stays here rather than in the control package: a library that
+			// called os.Exit could not be used from a test or an embedded host. The channel hands
+			// the request to the shutdown path below, which is the same sequence a SIGTERM takes -
+			// readiness off, drain, flush and seal - and then exits 75 for the supervisor.
+			RequestRestart: func(reason string) error {
+				select {
+				case restartRequested <- reason:
+					return nil
+				default:
+					return errors.New("a shutdown is already under way")
+				}
+			},
 			// The file a persisted setting is written back to - the same one this process resolved
 			// its settings from. Empty when no --config was given, which the control plane reports
 			// rather than inventing a file nothing would read on the next startup.
@@ -540,8 +584,18 @@ func Main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	received := <-sig
-	slog.Info("shutdown signal received, draining", "signal", received.String(), "drain_timeout", drainTimeout.String())
+
+	// Two ways out, one shutdown sequence. A promotion asks to be restarted, which is the same
+	// orderly shutdown a SIGTERM takes plus an exit code the supervisor acts on.
+	var restartReason string
+	select {
+	case received := <-sig:
+		slog.Info("shutdown signal received, draining",
+			"signal", received.String(), "drain_timeout", drainTimeout.String())
+	case restartReason = <-restartRequested:
+		slog.Warn("restart requested, draining",
+			"reason", restartReason, "drain_timeout", drainTimeout.String())
+	}
 
 	// Orderly shutdown (kdb-finish-up-plan Phase 2.4), in this order:
 	// 1. Flip /readyz to 503 so load balancers stop sending new connections.
@@ -575,6 +629,17 @@ func Main() {
 		saveCostModelState(srv, filepath.Join(dataDir, costModelStateFile))
 	}
 	srv.Release()
+	if host != nil {
+		// Closed before exiting rather than left to the deferred close, which os.Exit skips: the
+		// data root's lock has to be released before the restarted process tries to take it.
+		_ = host.Close()
+	}
+	if restartReason != "" {
+		slog.Warn("exiting 75 so the supervisor restarts this process", "reason", restartReason,
+			"note", "without a supervisor (Docker --restart=on-failure, systemd "+
+				"Restart=on-failure) this service stays down until it is started again")
+		os.Exit(75)
+	}
 	slog.Info("shutdown complete")
 }
 

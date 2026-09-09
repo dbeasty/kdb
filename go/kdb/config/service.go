@@ -86,6 +86,10 @@ type ServiceSettings struct {
 	// to the config file. Off by default: that file belongs to whoever deploys, not to the server,
 	// and a change applied without this is still reported as drift so nothing is silently lost.
 	ControlSettingsPersist bool
+	// ControlPromote lets the control plane promote a staged restore over the live namespace. Off
+	// by default and separate from ControlWrite: it is the one control-plane operation that ends
+	// with the process exiting for a supervisor to restart, so a deployment has to say it has one.
+	ControlPromote bool
 	// ControlBackupDir is where the control plane writes backups. Empty disables them.
 	ControlBackupDir string
 	// ControlStagingDir is where the control plane restores backups for inspection. Empty disables
@@ -128,6 +132,7 @@ func DefaultServiceSettings() ServiceSettings {
 		ControlUI:    true,
 		// Off: the config file belongs to whoever deploys, not to the server.
 		ControlSettingsPersist: false,
+		ControlPromote:         false,
 		LogLevel:               "info",
 		LogFormat:              "text",
 		// 0 = auto-detect the budget rather than run ungoverned - see MemoryBudgetMB.
@@ -178,6 +183,7 @@ type ServiceFile struct {
 	ControlWrite           *bool           `json:"controlWrite"`
 	ControlUI              *bool           `json:"controlUi"`
 	ControlSettingsPersist *bool           `json:"controlSettingsPersist"`
+	ControlPromote         *bool           `json:"controlPromote"`
 	ControlBackupDir       *string         `json:"controlBackupDir"`
 	ControlStagingDir      *string         `json:"controlStagingDir"`
 
@@ -275,6 +281,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.ControlWrite, file.ControlWrite)
 		setIf(&s.ControlUI, file.ControlUI)
 		setIf(&s.ControlSettingsPersist, file.ControlSettingsPersist)
+		setIf(&s.ControlPromote, file.ControlPromote)
 		setIf(&s.ControlBackupDir, file.ControlBackupDir)
 		setIf(&s.ControlStagingDir, file.ControlStagingDir)
 		setIf(&s.Durability, file.Durability)
@@ -384,6 +391,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envBool("KDB_CONTROL_UI", &s.ControlUI); err != nil {
 		return s, err
 	}
+	if err := envBool("KDB_CONTROL_PROMOTE", &s.ControlPromote); err != nil {
+		return s, err
+	}
 	if err := envBool("KDB_CONTROL_SETTINGS_PERSIST", &s.ControlSettingsPersist); err != nil {
 		return s, err
 	}
@@ -426,6 +436,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"control-write", func() { s.ControlWrite = flags.ControlWrite }},
 		{"control-ui", func() { s.ControlUI = flags.ControlUI }},
 		{"control-settings-persist", func() { s.ControlSettingsPersist = flags.ControlSettingsPersist }},
+		{"control-promote", func() { s.ControlPromote = flags.ControlPromote }},
 		{"control-backup-dir", func() { s.ControlBackupDir = flags.ControlBackupDir }},
 		{"control-staging-dir", func() { s.ControlStagingDir = flags.ControlStagingDir }},
 		{"log-level", func() { s.LogLevel = flags.LogLevel }},

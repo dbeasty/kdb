@@ -226,9 +226,14 @@ func (s *OSByteStore) Delete(segmentName string) error {
 	return nil
 }
 
+// AvailableBytes reports the free space on the filesystem holding the data root.
+//
+// It used to return a 0 sentinel, which no caller could tell apart from a full disk. Nothing read
+// it then; something does now (the control plane asks whether a promotion's copy will fit), and a
+// wrong answer to "is there room" is worse than no answer - so where the platform cannot say, this
+// returns an error rather than a number.
 func (s *OSByteStore) AvailableBytes() (int64, error) {
-	// v1: not used for correctness; return sentinel.
-	return 0, nil
+	return availableBytes(s.root)
 }
 
 // snapPathFor is where an enlistment snapshot lives on disk. Both the directory name and the

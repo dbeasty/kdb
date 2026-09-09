@@ -87,6 +87,19 @@ type Options struct {
 	// rewriting it is a surprise rather than a feature. A change applied without it is still
 	// reported as drift, so nothing is silently lost.
 	AllowSettingsPersist bool
+	// AllowPromotion opts into promoting a staged restore over the live namespace. Off by default,
+	// and separately from AllowWrites, because it is the one control-plane operation that ends with
+	// this process exiting: it stages the copy, records the intent, and asks to be restarted so the
+	// next startup can install it. A deployment without a supervisor would simply stop.
+	AllowPromotion bool
+	// RequestRestart asks the process to shut down orderly and exit 75, the supervisor contract
+	// --abort-after already uses. Without it promotion is refused, because staging a promotion this
+	// process cannot then act on would leave an intent nobody asked for waiting on disk.
+	//
+	// It is a callback rather than something this package does itself: process lifecycle belongs to
+	// the service that owns main, and a library that called os.Exit would be unusable from a test
+	// or an embedded host.
+	RequestRestart func(reason string) error
 	// ConfigPath is the --config file this process resolved its settings from, and the only file a
 	// persisted change is ever written to. Empty means there was none: a change can then still be
 	// applied live, but there is nowhere to write it down, and asking to persist says so rather
@@ -285,6 +298,13 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/restore/staging/{jobId}", s.adminRead(s.handleRestoreJob))
 	mux.Handle("POST /v1/restore/staging/{jobId}/attach", s.adminRead(s.handleAttachRestore))
 	mux.Handle("POST /v1/restore/staging/{jobId}/detach", s.adminRead(s.handleDetachRestore))
+
+	// Promotion. The plan is a read - an operator should always be able to see what promoting
+	// would do, and what stands in the way, on a control plane that would refuse to do it.
+	mux.Handle("GET /v1/restore/staging/{jobId}/promote/plan", s.adminRead(s.handlePromotionPlan))
+	mux.Handle("POST /v1/restore/staging/{jobId}/promote", s.adminRead(s.handlePromote))
+	mux.Handle("GET /v1/promotion", s.adminRead(s.handlePromotionStatus))
+	mux.Handle("DELETE /v1/promotion", s.adminRead(s.handleAbandonPromotion))
 
 	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
 	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))

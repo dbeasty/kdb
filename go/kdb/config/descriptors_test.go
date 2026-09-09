@@ -36,6 +36,7 @@ var fieldToKey = map[string]string{
 	"ControlWrite":           "control.write",
 	"ControlUI":              "control.ui",
 	"ControlSettingsPersist": "control.settingsPersist",
+	"ControlPromote":         "control.promote",
 	"ControlBackupDir":       "control.backupDir",
 	"ControlStagingDir":      "control.stagingDir",
 	"LogLevel":               "log.level",
@@ -99,7 +100,7 @@ func envProbeValue(key string) string {
 	switch key {
 	case "storage.memory", "auth.rbac", "tls.clientAuth", "control.write":
 		return "true"
-	case "control.settingsPersist":
+	case "control.settingsPersist", "control.promote":
 		return "true"
 	case "control.ui":
 		// Defaults to on, so "true" would be indistinguishable from nothing happening.

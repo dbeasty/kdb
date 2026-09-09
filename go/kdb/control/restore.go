@@ -234,26 +234,59 @@ func (s *Server) runRestore(job *restoreJob, ns string, req startRestoreRequest,
 	}
 }
 
-func (s *Server) handleRestoreJob(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
-	id := r.PathValue("jobId")
+// snapshotJob copies one job's state under the lock, or reports that there is no such job.
+//
+// The copy is the point. A restore runs on its own goroutine and writes these fields as it
+// progresses, so handing a reader the *pointer* - which is what this used to do - races the writer
+// and, before the race detector ever sees it, can serialize a torn job: "complete" beside an
+// applied-count that had not been written yet. Every reader takes a copy instead.
+func (s *Server) snapshotJob(id string) (restoreJob, bool) {
 	s.restore.mu.Lock()
-	job := s.restore.jobs[id]
+	defer s.restore.mu.Unlock()
+	job, ok := s.restore.jobs[id]
+	if !ok || job == nil {
+		return restoreJob{}, false
+	}
+	return copyJob(job), true
+}
+
+// snapshotJobs copies every job, newest first.
+func (s *Server) snapshotJobs() []restoreJob {
+	s.restore.mu.Lock()
+	out := make([]restoreJob, 0, len(s.restore.jobs))
+	for _, j := range s.restore.jobs {
+		out = append(out, copyJob(j))
+	}
 	s.restore.mu.Unlock()
-	if job == nil {
-		writeError(w, http.StatusNotFound, "not_found", "no restore job called "+id)
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	return out
+}
+
+// copyJob deep-copies the slices as well as the struct: the writer replaces them wholesale, so a
+// shared backing array would outlive the lock that made reading it safe.
+func copyJob(j *restoreJob) restoreJob {
+	out := *j
+	out.Sources = append([]string(nil), j.Sources...)
+	out.Missing = append([]string(nil), j.Missing...)
+	if j.EndedAt != nil {
+		ended := *j.EndedAt
+		out.EndedAt = &ended
+	}
+	return out
+}
+
+func (s *Server) handleRestoreJob(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
+	job, ok := s.snapshotJob(r.PathValue("jobId"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found",
+			"no restore job called "+r.PathValue("jobId"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
 func (s *Server) handleListRestoreJobs(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
-	s.restore.mu.Lock()
-	jobs := make([]*restoreJob, 0, len(s.restore.jobs))
-	for _, j := range s.restore.jobs {
-		jobs = append(jobs, j)
-	}
-	s.restore.mu.Unlock()
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].StartedAt.After(jobs[j].StartedAt) })
+	jobs := s.snapshotJobs()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"jobs": jobs,
 		"note": "a staged restore is a copy in a scratch directory. Attaching one makes it " +
@@ -269,18 +302,12 @@ func (s *Server) handleListRestoreJobs(w http.ResponseWriter, r *http.Request, _
 // have a second view of a database open in the same process.
 func (s *Server) handleAttachRestore(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
 	id := r.PathValue("jobId")
-	s.restore.mu.Lock()
-	job := s.restore.jobs[id]
-	already := ""
-	if job != nil {
-		already = job.Attached
-	}
-	s.restore.mu.Unlock()
-
-	if job == nil {
+	job, ok := s.snapshotJob(id)
+	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "no restore job called "+id)
 		return
 	}
+	already := job.Attached
 	if job.State != "complete" {
 		writeError(w, http.StatusConflict, "not_complete",
 			"this restore is "+job.State+"; there is nothing to attach yet")
@@ -309,8 +336,11 @@ func (s *Server) handleAttachRestore(w http.ResponseWriter, r *http.Request, _ a
 	s.restore.mu.Lock()
 	s.restore.attached[alias] = srt
 	s.restore.closers[alias] = func() { rt.Close() }
-	job.Attached = alias
+	if live := s.restore.jobs[id]; live != nil {
+		live.Attached = alias
+	}
 	s.restore.mu.Unlock()
+	job, _ = s.snapshotJob(id)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"attachedAs": alias,

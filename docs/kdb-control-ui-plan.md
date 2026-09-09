@@ -28,7 +28,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
 | M6b | Settings (mutation) | **done** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting, and `persist:true` writes the change back to the `--config` file atomically, refusing per key when the file cannot hold it or when a flag or environment variable would outrank it |
-| M7 | Recovery | **done** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, restore-to-staging with read-only attach, and generated commands for the offline tier |
+| M7 | Recovery | **done** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, restore-to-staging with read-only attach, promotion of a staged restore across a supervised restart, and generated commands for the offline tier |
 
 ### API surface (§5)
 
@@ -50,6 +50,11 @@ that does not exist simply answers 404.
 
 **Not started:** per-commit document diff (`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/policy`, `/indexes`,
 `/ops/sessions|leases|peers|metrics` and `POST /v1/ops/drain`.
+
+Promotion adds `GET /v1/restore/staging/{jobId}/promote/plan`,
+`POST /v1/restore/staging/{jobId}/promote`, and `GET|DELETE /v1/promotion`. The plan is a read on
+purpose: an operator should be able to see what promoting would do, and every reason it cannot, on
+a control plane that would refuse to do it.
 
 Recovery adds `GET /v1/ns/{ns}/integrity`, `POST /v1/ns/{ns}/integrity/verify`,
 `GET /v1/ns/{ns}/checkpoints`, `GET /v1/ns/{ns}/maintenance/plan`, `GET /v1/ns/{ns}/backups`,
@@ -83,18 +88,26 @@ consistent point across every namespace, which is its own piece of work.
 | 8 | Schema & indexes | **partial** — schema only |
 | 9 | Operations dashboard | **partial** — process and admission state; no sessions, leases or peers |
 | 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a per-key "also write it to the config file" choice (with the reason when there isn't one), a drift banner, and the ignored-configuration panel |
-| 11 | Recovery | **built** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, the restore-and-attach flow, and the offline commands filled in |
+| 11 | Recovery | **built** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, the restore-and-attach flow, promotion with the server's own plan rendered verbatim behind a typed confirmation, a banner for a promotion awaiting restart and for the outcome of the last one, and the offline commands filled in |
 
 ### What to do next, in order
 
-1. **Promotion.** Swapping a staged copy in for the live data directory needs the process stopped,
-   so it is a supervised-restart flow (§8.4) rather than an endpoint. The staged copy and the
-   generated commands are both in place; what is missing is the drain-and-restart contract.
-2. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
+1. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
    commit: a `WriteOp` is merged on the way in, and a `DeleteOp` in the same transaction does not
    help because staging reads every operation against the baseline tree rather than against each
    other. The editor and the restore-a-version confirmation both tell the operator which keys will
-   be kept; neither can yet drop one.
+   be kept; neither can yet drop one. This is the only *correctness* gap left in what is built, so
+   it goes first.
+2. **Refs, properly (M5, §9 screen 5).** Create and delete a branch or tag, and `/compare` between
+   two revisions. The lists are there; nothing can be created from the UI, and comparing two points
+   is the one git-viewer question the commit graph cannot answer.
+3. **The operations dashboard (§9 screen 9).** Sessions, leases, peers and metrics, plus
+   `POST /v1/ops/drain`. One endpoint reports process and admission state today.
+4. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
+   documents a commit touched; opening one still means reading it at two revisions by hand.
+5. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
+6. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
+   protocol still ignores it - which is outside this UI's scope and is the reason M2 is partial.
 
 ## 1. What this is
 
@@ -772,12 +785,59 @@ something it cannot. It does three honest things instead:
    copy-pasteable, with its preconditions stated ("stop kdb-service first"). `GET
    /v1/ns/{ns}/maintenance/plan` returns it as structured data so the UI can also show what it will
    do and what it will quarantine.
-3. **Offer a supervised maintenance flow** where a supervisor exists. The pieces are already there:
-   `BeginDraining` / `WaitForWritesToDrain`, `/readyz` flipping to 503 with reason `draining`
-   (`admin.go`), and the exit-75 + `Restart=on-failure` contract from Component 50. The flow is:
-   readiness off → drain → close storage and release the lock → run the operation → exit 75 → the
-   supervisor restarts the process → readiness on. The control API can drive steps 1–3 and report
-   the outcome after restart; it cannot restart the process itself, and the UI should say so.
+3. **Offer a supervised maintenance flow** where a supervisor exists. **Built for promotion** -
+   replacing the live namespace with a staged restore - in `recovery/promote.go` and
+   `control/promote.go`.
+
+   The order is not the one sketched here. Doing the swap on the way *down* means mutating a data
+   root whose files were open moments earlier, from an HTTP handler, with no way to report a failure
+   once the response has gone. So the work is split the other way round, and the irreversible half
+   happens on the way *up*:
+
+   - **While the server runs**, `POST /v1/restore/staging/{jobId}/promote` copies the restored
+     namespace into the live data root under `.kdb.promote/` and records an intent file. The live
+     namespace is untouched, and the request can be taken back (`DELETE /v1/promotion`) at any
+     point before the restart. The copy happens here rather than at startup for three reasons: the
+     staging directory is deliberately on another volume so the install cannot be a rename, a
+     failure here costs nothing, and a supervisor's start timeout is not the place to discover a
+     multi-gigabyte copy.
+   - **Then** the control plane asks the process to shut down - readiness off → drain → flush and
+     seal → exit 75, the same sequence a SIGTERM takes, via an `Options.RequestRestart` callback so
+     process lifecycle stays in the service that owns `main`.
+   - **At the next startup, before the data root is opened** and while nothing holds its lock,
+     `recovery.ApplyPromotion` verifies the payload against the commit count recorded when it was
+     staged, moves the live namespace to `superseded/`, and renames the payload into place. Both
+     renames are inside one tree, so each is atomic.
+
+   Every step is recoverable from what is on disk, which is the property that makes this safe to
+   interrupt: the replaced namespace is *moved*, never deleted; `applyPayload` re-derives which
+   step is next from the filesystem rather than from a record that could itself be the thing that
+   was lost, so a crash between the two renames is resumed rather than compounded; the payload is
+   verified before anything irreversible happens, because a copy cut short by a power cut is a
+   truncated namespace and promoting one of those is the worst outcome this path can produce; and a
+   failed apply always clears the intent, because a promotion retried on every boot turns one bad
+   request into a boot loop.
+
+   Two things the plan did not anticipate, both surfaced by building it:
+
+   - A restore rebuilds the delta log and **not** the per-commit tree objects, so a promoted copy is
+     a `replay`-strategy namespace whatever the one it replaces was. The marker is written
+     accordingly and the difference is reported in the plan; if the process is configured with
+     `KDB_HISTORY_STRATEGY=objects` the promotion is *blocked*, because the open would be refused
+     and the service would not come back up.
+   - `OSByteStore.AvailableBytes` was a `0` sentinel no caller could tell from a full disk. "Will
+     the copy fit" is a real question, so it is now a real `statfs`, and an error rather than a
+     number where the platform cannot say.
+   - Every restore-job reader took the job *pointer* under the lock and then serialized it outside
+     it, while the restore goroutine wrote the same struct. That is a data race the promotion plan
+     inherited by following the pattern, and before the race detector sees it, it can serialize a
+     torn job - `"complete"` beside an applied-count that had not been written yet. Readers now
+     take a copy (`snapshotJob`), slices included.
+
+   It is gated on `--control-promote`, separately from `--control-write`: it is the one
+   control-plane operation that ends with the process exiting, and a deployment without a
+   supervisor would simply stop. The plan the operator reads before confirming says that in those
+   words, and the apply requires the namespace typed back.
 
 `repair-segments` also quarantines bytes before mutating anything (`RepairStep.QuarantineName`),
 which the UI should surface prominently — it is the difference between a scary button and a
