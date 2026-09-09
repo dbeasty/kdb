@@ -12,6 +12,8 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/config"
+	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/storage"
 )
 
 // Changing a setting on a running server.
@@ -114,6 +116,97 @@ func liveSettings() map[string]liveSetting {
 				return nil
 			},
 		},
+		// The maintenance cadence. Every one of these goes through a setter on
+		// MaintenanceScheduler whose own doc comment says it is safe to call while the loop is
+		// running and while a pass is in flight - a change lands on the next wake-up and never
+		// interrupts a pass that is already reclaiming.
+		"governance.maintenanceInterval": {
+			parse: parsePositiveDuration("governance.maintenanceInterval"),
+			apply: func(s *Server, v any) error {
+				return s.eachScheduler("governance.maintenanceInterval", func(sched *embed.MaintenanceScheduler) error {
+					return sched.SetInterval(v.(time.Duration))
+				})
+			},
+		},
+		"governance.maintenanceSweep": {
+			parse: parsePositiveDuration("governance.maintenanceSweep"),
+			apply: func(s *Server, v any) error {
+				return s.eachScheduler("governance.maintenanceSweep", func(sched *embed.MaintenanceScheduler) error {
+					return sched.SetSweep(v.(time.Duration))
+				})
+			},
+		},
+		"governance.maintenanceMaxDefer": {
+			parse: func(v any) (any, error) {
+				f, ok := v.(float64)
+				if !ok {
+					return nil, fmt.Errorf("governance.maintenanceMaxDefer must be a number")
+				}
+				if f != float64(int(f)) {
+					return nil, fmt.Errorf("governance.maintenanceMaxDefer must be a whole number")
+				}
+				n := int(f)
+				if n == 0 {
+					return nil, fmt.Errorf(
+						"governance.maintenanceMaxDefer of 0 is ambiguous: use a positive count to " +
+							"bound how long write load may postpone a pass, or -1 to never force one " +
+							"through (which risks a busy server never reclaiming)")
+				}
+				return n, nil
+			},
+			apply: func(s *Server, v any) error {
+				return s.eachScheduler("governance.maintenanceMaxDefer", func(sched *embed.MaintenanceScheduler) error {
+					return sched.SetMaxDefer(v.(int))
+				})
+			},
+		},
+		// The reclaim axis. Applied to the scheduler *and* the namespace: the preset sets the
+		// loop's cadence, and the mode is what the pass itself consults before deleting
+		// anything, so setting only one of the two would leave a namespace whose cadence and
+		// behaviour disagree.
+		"reclaim.mode": {
+			parse: func(v any) (any, error) {
+				text, ok := v.(string)
+				if !ok {
+					return nil, fmt.Errorf("reclaim.mode must be a string: manual, immediate, balanced or lazy")
+				}
+				m, err := storage.ParseReclaimMode(text)
+				if err != nil {
+					return nil, err
+				}
+				if m == storage.ReclaimUnset {
+					return nil, fmt.Errorf("reclaim.mode cannot be set back to unset; name the mode you want")
+				}
+				return m, nil
+			},
+			apply: func(s *Server, v any) error { return s.applyReclaimMode(v.(storage.ReclaimMode)) },
+		},
+		// EmbeddedKdbRuntime.SetRetentionWindow, which refuses a full-history namespace rather
+		// than storing a window that would never be consulted. Unlike the cadence settings this
+		// one changes what is *deleted*, and shortening it makes already-written segments
+		// eligible on the very next pass - see the warning applyRetention attaches.
+		"retain.duration": {
+			parse: func(v any) (any, error) {
+				text, ok := v.(string)
+				if !ok {
+					return nil, fmt.Errorf("retain.duration must be a string such as \"24h\", \"7d\" or \"0\"")
+				}
+				d, err := storage.ParseRetentionDuration(strings.TrimSpace(text))
+				if err != nil {
+					return nil, err
+				}
+				return d, nil
+			},
+			apply: func(s *Server, v any) error {
+				return s.applyRetention(func(w *storage.RetentionWindow) { w.Duration = v.(time.Duration) })
+			},
+		},
+		"retain.commits": {
+			parse: parseNonNegativeInt64("retain.commits"),
+			apply: func(s *Server, v any) error {
+				return s.applyRetention(func(w *storage.RetentionWindow) { w.Commits = v.(int64) })
+			},
+		},
 		// InMemoryCommitDag.SetOperationsBudget: "Safe to call while the DAG is being read and
 		// written; it evicts under the same lock every other retention path takes." It no-ops
 		// without an operations loader installed, which is reported rather than hidden.
@@ -146,6 +239,137 @@ func liveSettings() map[string]liveSetting {
 			},
 		},
 	}
+}
+
+// parsePositiveDuration reads a duration string such as "5m". Zero is refused rather than taken
+// as "disable": from the control plane a 0 cadence reads as "stop maintaining", and stopping a
+// loop is a lifecycle decision that belongs to whoever started it, not to a settings patch.
+func parsePositiveDuration(key string) func(any) (any, error) {
+	return func(v any) (any, error) {
+		text, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s must be a duration string such as \"5m\"", key)
+		}
+		d, err := time.ParseDuration(strings.TrimSpace(text))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("%s must be positive; it cannot be used to turn maintenance off", key)
+		}
+		return d, nil
+	}
+}
+
+// eachScheduler applies fn to every maintenance loop this process is running, and refuses rather
+// than reporting a hollow success when there are none - a setting that "applied" to nothing would
+// show as in force while changing nothing at all.
+func (s *Server) eachScheduler(key string, fn func(*embed.MaintenanceScheduler) error) error {
+	if s.opts.Maintenance == nil {
+		return fmt.Errorf(
+			"%s cannot be changed here: this process is not running any maintenance loops "+
+				"(it was started with maintenance-interval=0, or its control plane was not given them)", key)
+	}
+	scheds := s.opts.Maintenance.Schedulers()
+	applied := 0
+	for _, sched := range scheds {
+		if sched == nil {
+			continue
+		}
+		if err := fn(sched); err != nil {
+			return err
+		}
+		applied++
+	}
+	if applied == 0 {
+		return fmt.Errorf("%s cannot be changed here: no namespace is running a maintenance loop", key)
+	}
+	return nil
+}
+
+// applyReclaimMode sets the reclaim preset on every maintenance loop and the mode on every
+// namespace behind it.
+//
+// Both halves, because they answer different questions and a namespace whose cadence says
+// "immediate" while its mode says "manual" would tick busily and reclaim nothing. The scheduler
+// carries the mode down to the namespace itself (ApplyReclaimMode), so a process running loops
+// needs only the first call; a process running none still sets the mode, which is what a later
+// explicit compaction and any future loop will read.
+func (s *Server) applyReclaimMode(mode storage.ReclaimMode) error {
+	applied := 0
+	if s.opts.Maintenance != nil {
+		for _, sched := range s.opts.Maintenance.Schedulers() {
+			if sched == nil {
+				continue
+			}
+			if err := sched.ApplyReclaimMode(mode); err != nil {
+				return err
+			}
+			applied++
+		}
+	}
+	if applied > 0 {
+		return nil
+	}
+	// No loops: set the mode directly, so the setting still means something on a process that
+	// reclaims only when asked.
+	src := s.namespaces()
+	if src == nil {
+		return fmt.Errorf("this control plane has no namespaces to set a reclaim mode on")
+	}
+	for _, ns := range src.Namespaces() {
+		rt, ok := src.Runtime(ns)
+		if !ok || rt == nil || rt.Runtime == nil {
+			continue
+		}
+		if err := rt.Runtime.SetReclaimMode(mode); err != nil {
+			continue
+		}
+		applied++
+	}
+	if applied == 0 {
+		return fmt.Errorf("no namespace accepted the reclaim mode")
+	}
+	return nil
+}
+
+// applyRetention edits the retention window of every namespace that can hold one.
+//
+// Read-modify-write against each namespace's *current* window rather than against one assembled
+// from the descriptors: retain.duration and retain.commits are two halves of one value, and a
+// namespace whose window has already been changed live must not have that change reverted by a
+// patch to the other half.
+//
+// A namespace that refuses (history=full) is skipped rather than failing the whole patch, but at
+// least one has to accept or this reports failure - see eachScheduler for the same reasoning.
+func (s *Server) applyRetention(edit func(*storage.RetentionWindow)) error {
+	src := s.namespaces()
+	if src == nil {
+		return fmt.Errorf("this control plane has no namespaces to apply a retention window to")
+	}
+	applied, refused := 0, 0
+	var lastRefusal error
+	for _, ns := range src.Namespaces() {
+		rt, ok := src.Runtime(ns)
+		if !ok || rt == nil || rt.Runtime == nil {
+			continue
+		}
+		w := rt.Runtime.RetentionWindow()
+		edit(&w)
+		if err := rt.Runtime.SetRetentionWindow(w); err != nil {
+			refused++
+			lastRefusal = err
+			continue
+		}
+		applied++
+	}
+	if applied == 0 {
+		if lastRefusal != nil {
+			return fmt.Errorf("no namespace accepted the retention window: %w", lastRefusal)
+		}
+		return fmt.Errorf("no namespace accepted the retention window")
+	}
+	return nil
 }
 
 func parseNonNegativeInt(key string, floor int) func(any) (any, error) {
@@ -297,6 +521,22 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request, pri
 
 		setter, mutable := live[change.Key]
 		if !mutable {
+			// Not live, but possibly changeable by reopening the namespace it
+			// belongs to - which is a real operation now rather than the
+			// documented-but-unimplemented class it used to be. Handled on its
+			// own path because it costs availability, so it is reported
+			// differently even when it succeeds.
+			if reopener, ok := reopenSettings()[change.Key]; ok {
+				s.applyReopenChange(&out, change, reopener, req.DryRun)
+				if out.Applied {
+					changed++
+					if req.Persist {
+						toPersist = append(toPersist, persistRequest{key: change.Key, value: out.To})
+					}
+				}
+				outcomes = append(outcomes, out)
+				continue
+			}
 			out.Refused = refusalFor(descriptor.Mutability)
 			outcomes = append(outcomes, out)
 			continue
@@ -396,8 +636,12 @@ func refusalFor(m config.Mutability) string {
 		return "this setting is read when a listener or connection is created, so it cannot be " +
 			"changed for the ones already running; restart to change it"
 	case config.MutabilityNamespaceReopen:
-		return "this setting is read when a namespace is opened; it needs that namespace closed " +
-			"and reopened, which this control plane cannot yet do"
+		// Reached only for a setting in this class that reopenSettings does not map to a storage
+		// option - the class is implemented now, but a setting nobody has wired is still refused
+		// rather than silently doing nothing.
+		return "this setting is read when a namespace is opened, and this control plane has no " +
+			"mapping from it to a storage option, so reopening would not change it; restart to " +
+			"change it"
 	case config.MutabilityImmutable:
 		return "this setting describes what is already on disk and disagreeing with it is refused " +
 			"at open; changing it is a migration (kdb-inspect migrate-history), not a setting"

@@ -267,7 +267,8 @@ func checkpointOnClose(
 	// any truncation will ever get. Under history=full this is a plain
 	// checkpoint and deletes nothing.
 	res, err := checkpointAndTruncate(
-		d, store, r, shim, namespaceID, highestSegmentSequence(r), window, time.Now(), disabled)
+		d, store, r, shim, namespaceID, highestSegmentSequence(r), window, time.Now(), disabled,
+		liveReclaim(store))
 	if err != nil {
 		log.Printf("kdb: namespace %s: could not write a checkpoint on close (%v) - the next open will replay the log", namespaceID, err)
 		return
@@ -360,6 +361,7 @@ func checkpointAndTruncate(
 	window storage.RetentionWindow,
 	now time.Time,
 	disabled bool,
+	reclaim storage.ReclaimMode,
 ) (TruncationResult, error) {
 	if disabled || r == nil || shim == nil || through < 0 {
 		return TruncationResult{}, nil
@@ -367,6 +369,37 @@ func checkpointAndTruncate(
 	eng, ok := store.(*engine.ServerEngine)
 	if !ok {
 		return TruncationResult{}, saveCheckpoint(d, store, r, shim, namespaceID, through, currentFloor(r), disabled)
+	}
+	// storage.ReclaimManual: checkpoint and stop. A checkpoint deletes
+	// nothing and is what keeps the next open from replaying the whole log,
+	// so it stays; the truncation and the SSTable merge below both destroy
+	// something, and under this mode nothing is destroyed until asked.
+	//
+	// This is what makes switching a namespace to history=none reversible.
+	// The mode says what may be reclaimed, this says whether anything is,
+	// and until the two agree the namespace still holds everything it did
+	// before the switch - so switching back costs nothing. See
+	// CompactHistory for the explicit ask, which passes reclaim through as
+	// something else precisely so it can override this.
+	if !reclaim.Reclaims() {
+		floor := currentFloor(r)
+		if err := saveCheckpoint(d, store, r, shim, namespaceID, through, floor, disabled); err != nil {
+			return TruncationResult{}, err
+		}
+		held := TruncationResult{FloorSequence: floor, ReclaimHeld: true}
+		// Say what is being held, not merely that something is. planTruncation
+		// only decides - it deletes nothing - so the number costs one pass over
+		// the segment list and is the difference between "manual" being an
+		// informed choice and being a slow leak nobody is watching.
+		if eng.HistoryMode() == storage.HistoryModeNone {
+			if plan, err := planTruncation(d, store, r, through, window, now); err == nil {
+				held.EligibleSegments = len(plan.Victims)
+				for _, v := range plan.Victims {
+					held.EligibleBytes += v.SizeBytes
+				}
+			}
+		}
+		return held, nil
 	}
 	if eng.HistoryMode() != storage.HistoryModeNone {
 		// history=full: checkpoint, and compact the blob store. Nothing in

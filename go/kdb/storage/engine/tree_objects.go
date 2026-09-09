@@ -13,22 +13,130 @@ import (
 // commits. Resolved from the namespace's own marker at open, never from a
 // caller's preference alone - see embed.resolveHistoryStrategy.
 func (e *ServerEngine) HistoryStrategy() storage.HistoryStrategy {
+	e.retainMu.RLock()
+	defer e.retainMu.RUnlock()
+	if e.strategyLive != nil {
+		return *e.strategyLive
+	}
 	return e.config.HistoryStrategy
 }
 
 // HistoryMode reports how long this namespace keeps the past. Resolved
-// from the namespace's marker at open; see storage.HistoryMode.
+// from the namespace's marker at open, or from a live switch since - see
+// SetHistoryMode.
 func (e *ServerEngine) HistoryMode() storage.HistoryMode {
-	if e.config.HistoryMode == storage.HistoryModeUnset {
+	e.retainMu.RLock()
+	mode := e.config.HistoryMode
+	if e.modeLive != nil {
+		mode = *e.modeLive
+	}
+	e.retainMu.RUnlock()
+	if mode == storage.HistoryModeUnset {
 		return storage.DefaultHistoryMode
 	}
-	return e.config.HistoryMode
+	return mode
+}
+
+// SetHistoryMode changes what this namespace is permitted to reclaim, on a
+// running engine, and couples the history strategy to it.
+//
+// This deletes nothing. Under HistoryModeNone the namespace *may* start
+// reclaiming, but whether it does is storage.ReclaimMode's question, and a
+// caller switching a namespace over should leave it on ReclaimManual so the
+// switch stays reversible - see embed.EmbeddedKdbRuntime.SetHistoryMode,
+// which is the one that does that, updates the on-disk marker, and is what
+// callers should use.
+//
+// The strategy moves with the mode because HistoryModeNone reclaims the
+// commits that tree objects exist to serve, so writing more of them would
+// be work for reads that will not resolve. Objects already written are left
+// alone as dead weight, exactly as the offline MigrateHistoryStrategy
+// leaves them: they are addressed by tree hash, and nothing asks for one it
+// does not have a commit for. Switching back to Full does not resume
+// writing them - the namespace stays on replay, which is a valid strategy
+// for Full and merely slower for historical reads, and recovering objects
+// is a migration rather than a setting.
+//
+// Every reader of both values goes through the accessors above, so a switch
+// is observed consistently rather than partway.
+func (e *ServerEngine) SetHistoryMode(m storage.HistoryMode) {
+	e.retainMu.Lock()
+	defer e.retainMu.Unlock()
+	e.modeLive = &m
+	if m == storage.HistoryModeNone {
+		replay := storage.HistoryStrategyReplay
+		e.strategyLive = &replay
+	}
 }
 
 // RetentionWindow reports how much of the past this namespace keeps under
-// storage.HistoryModeNone. Meaningless, and ignored, under Full.
+// storage.HistoryModeNone, resolved. Meaningless, and ignored, under Full.
 func (e *ServerEngine) RetentionWindow() storage.RetentionWindow {
-	return e.config.Retain.Resolve()
+	return e.RawRetentionWindow().Resolve()
+}
+
+// RawRetentionWindow is the window exactly as configured, *unresolved*.
+//
+// Two accessors rather than one because resolving is not free of meaning:
+// Resolve turns the RetainNothing sentinel into a plain zero and a plain
+// zero back into the default, so a value that has been through it can no
+// longer express "keep nothing" to a second reader. The rule this engine
+// follows (see embed/file.go's StorageEngineConfig construction) is that
+// the configured value is carried unresolved and every reader resolves at
+// the point of use - so the truncation planner takes this one, and
+// anything merely reporting takes RetentionWindow.
+func (e *ServerEngine) RawRetentionWindow() storage.RetentionWindow {
+	e.retainMu.RLock()
+	defer e.retainMu.RUnlock()
+	if e.retainLive != nil {
+		return *e.retainLive
+	}
+	return e.config.Retain
+}
+
+// ReclaimMode reports how eagerly this namespace reclaims what its
+// retention window has released, resolved. Independent of HistoryMode: the
+// mode says what *may* be reclaimed, this says whether anything is.
+func (e *ServerEngine) ReclaimMode() storage.ReclaimMode {
+	e.retainMu.RLock()
+	defer e.retainMu.RUnlock()
+	if e.reclaimLive != nil {
+		return e.reclaimLive.Resolve()
+	}
+	return e.config.Reclaim.Resolve()
+}
+
+// SetReclaimMode changes how eagerly this namespace reclaims, on a running
+// engine.
+//
+// Safe under load, and in force from the next maintenance pass: nothing
+// caches it across a pass. Moving *to* storage.ReclaimManual takes effect
+// without undoing anything already reclaimed - it stops future deletion, it
+// does not restore past deletion, and nothing about this call pretends
+// otherwise.
+func (e *ServerEngine) SetReclaimMode(r storage.ReclaimMode) {
+	e.retainMu.Lock()
+	defer e.retainMu.Unlock()
+	e.reclaimLive = &r
+}
+
+// SetRetentionWindow changes how much of the past this namespace keeps,
+// on a running engine.
+//
+// Safe under load: the window is not cached by anything that holds it
+// across a pass - every reader takes it through the accessors above, and
+// the truncation planner reads it once per pass, so a change is in force
+// from the next pass onwards and never mutates one already deciding.
+//
+// It applies to what has *already* been written, not merely to what will
+// be: shortening the window makes segments that were retained under the
+// old one eligible on the very next pass. That is the point of it, and it
+// is also irreversible once the pass runs, so a caller that can offer a
+// preview (see embed's truncation planner) should.
+func (e *ServerEngine) SetRetentionWindow(w storage.RetentionWindow) {
+	e.retainMu.Lock()
+	defer e.retainMu.Unlock()
+	e.retainLive = &w
 }
 
 // Tree objects: what a document tree looked like at one commit, stored on
@@ -272,7 +380,7 @@ func readUUID(b []byte) codec.UUID {
 // except on the commits that write the whole tree to cap what resolving a
 // historical read costs - see treeChainFullAt for when that is.
 func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document.DocumentTree, puts []TreeChange, deletes []codec.UUID) {
-	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
+	if e.memTable == nil || e.HistoryStrategy() != storage.HistoryStrategyObjects {
 		return
 	}
 	if e.skipExistingObject(result.TreeHash) {
@@ -333,7 +441,7 @@ func (e *ServerEngine) putTreeObject(base document.DocumentTree, result document
 // Nothing here is load-bearing for correctness. A missing or unreadable
 // location costs a scan (see ServerEngine.loadCold), never an answer.
 func (e *ServerEngine) putDocumentLocation(contentHash codec.Hash, segmentSeq, frameOffset int64) {
-	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
+	if e.memTable == nil || e.HistoryStrategy() != storage.HistoryStrategyObjects {
 		return
 	}
 	if e.skipExistingObject(contentHash) {
@@ -391,7 +499,7 @@ func (e *ServerEngine) SetReplaying(v bool) { e.replaying.Store(v) }
 // under. Content addressing makes that exact, and it is what lets every
 // failure here be a miss rather than a wrong answer.
 func (e *ServerEngine) documentFromObject(docID codec.UUID, contentHash codec.Hash) (document.Document, bool) {
-	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
+	if e.memTable == nil || e.HistoryStrategy() != storage.HistoryStrategyObjects {
 		return document.Document{}, false
 	}
 	raw := e.memTable.Get(contentHash)
@@ -495,7 +603,7 @@ func (e *ServerEngine) treeChainStateOf(h codec.Hash) treeChainState {
 // object, or a bug in this file's encoding produces a miss and a fall back
 // to the delta log rather than a wrong answer to a historical read.
 func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, bool) {
-	if e.memTable == nil || e.config.HistoryStrategy != storage.HistoryStrategyObjects {
+	if e.memTable == nil || e.HistoryStrategy() != storage.HistoryStrategyObjects {
 		return document.DocumentTree{}, false
 	}
 	// The walk ends at either a full object or the empty tree. The empty
@@ -603,7 +711,7 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 const maxPendingLocationTrees = 256
 
 func (e *ServerEngine) stashPendingLocations(treeHash codec.Hash, changed []TreeChange) {
-	if e.config.HistoryStrategy != storage.HistoryStrategyObjects || len(changed) == 0 {
+	if e.HistoryStrategy() != storage.HistoryStrategyObjects || len(changed) == 0 {
 		return
 	}
 	e.pendingMu.Lock()
@@ -630,7 +738,7 @@ func (e *ServerEngine) stashPendingLocations(treeHash codec.Hash, changed []Tree
 // was never stashed, records nothing - the index is an optimisation, and
 // its absence costs a scan rather than an answer.
 func (e *ServerEngine) RecordCommitLocation(treeHash codec.Hash, segmentSeq, frameOffset int64) {
-	if e.config.HistoryStrategy != storage.HistoryStrategyObjects {
+	if e.HistoryStrategy() != storage.HistoryStrategyObjects {
 		return
 	}
 	e.pendingMu.Lock()

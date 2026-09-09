@@ -19,8 +19,24 @@ import (
 type ServerEngine struct {
 	namespaceID string
 	config      storage.StorageEngineConfig
-	wal         wal.WriteAheadLog
-	groupCommit *wal.GroupCommitter
+	// retainLive overrides config.Retain once something has set the
+	// retention window on the running engine; nil means "whatever this
+	// engine was opened with". Guarded because it is written from the
+	// control plane while passes and reads take it.
+	retainMu   sync.RWMutex
+	retainLive *storage.RetentionWindow
+	// reclaimLive is the same idea for how eagerly this namespace reclaims.
+	// Shares retainMu: the two are read together by every maintenance pass
+	// and neither is hot enough to want its own lock.
+	reclaimLive *storage.ReclaimMode
+	// modeLive and strategyLive are the history mode and strategy after a
+	// live switch (SetHistoryMode), nil until one happens. Under the same
+	// lock as the two above so a switch that changes both is observed as
+	// one change rather than halfway.
+	modeLive     *storage.HistoryMode
+	strategyLive *storage.HistoryStrategy
+	wal          wal.WriteAheadLog
+	groupCommit  *wal.GroupCommitter
 
 	// docsByHash holds every document version ever committed, keyed by
 	// content hash (see doc_hash_shard.go) rather than guarded by one
@@ -699,8 +715,8 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 		}
 		changed = append(changed, TreeChange{DocID: doc.ID, ContentHash: h})
 		// Under a mode that deletes delta segments, the log is not a home
-		// this version can rely on. See document_bodies.go.
-		e.putDocumentBody(h, doc)
+		// this version can rely on - but that home is filled in lazily, at
+		// PrepareForTruncation time, not here. See document_bodies.go.
 		prev, hadPrev := e.tree.HashFor(doc.ID)
 		// Pin before Put, never after: Put evicts to stay within budget as
 		// part of the insert, so a version pinned afterwards can already be

@@ -35,6 +35,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/config"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/server"
 )
 
@@ -105,8 +106,46 @@ type Options struct {
 	// applied live, but there is nowhere to write it down, and asking to persist says so rather
 	// than inventing a file that nothing would read on the next startup.
 	ConfigPath string
+	// Maintenance is the background maintenance loops this process is running, by namespace, so
+	// their cadence can be changed without a restart. Empty leaves the maintenance settings
+	// reported but refused - which is the honest answer for a process that is not running any.
+	//
+	// A source rather than a map so the service can keep ownership of the schedulers' lifecycle:
+	// the control plane changes their settings, it does not start or stop them.
+	Maintenance MaintenanceSource
+	// Reopener lets settings that are read when a namespace opens be changed without restarting
+	// the process, by closing and reopening that namespace. nil leaves them reported and refused,
+	// with the refusal saying a restart is the way - which is the honest answer for a process
+	// that cannot reopen.
+	//
+	// A reopen makes the namespace briefly unavailable, so it is opt-in at this level for the
+	// same reason AllowWrites is: turning the control plane on is not by itself a decision to let
+	// it interrupt service.
+	Reopener NamespaceReopener
 	// Now is the clock, for tests. nil uses time.Now.
 	Now func() time.Time
+}
+
+// NamespaceReopener closes and reopens a namespace under changed storage options, which is what
+// config.MutabilityNamespaceReopen settings need in order to be changeable at all.
+//
+// An interface, and supplied by the process rather than built here, because namespace lifecycle
+// belongs to whoever owns the embed.Host: the control plane decides that a setting should change,
+// it does not decide when a namespace stops being served.
+type NamespaceReopener interface {
+	// ReopenNamespace applies edit to the namespace's current storage options and reopens it,
+	// returning how long the namespace was unavailable. edit is given the options actually in
+	// force, so a change to one setting cannot silently revert the others.
+	ReopenNamespace(namespaceID string, edit func(*embed.StorageOptions)) (time.Duration, error)
+	// ReopenableNamespaces lists what it can do that to.
+	ReopenableNamespaces() []string
+}
+
+// MaintenanceSource is where the control plane finds the maintenance loops it may reconfigure.
+type MaintenanceSource interface {
+	// Schedulers returns the running loops by namespace. The control plane treats the result as a
+	// snapshot and does not retain it, so an implementation may rebuild it per call.
+	Schedulers() map[string]*embed.MaintenanceScheduler
 }
 
 // Server is a running control plane.
@@ -253,6 +292,9 @@ func (s *Server) routes() http.Handler {
 	// are - so an existing "read:orders/*" grant covers them with no new vocabulary.
 	mux.Handle("GET /v1/namespaces", s.nsRead(s.handleNamespaces))
 	mux.Handle("GET /v1/ns/{ns}/status", s.nsRead(s.handleStatus))
+	// Retention: what this namespace keeps, and the three operations that change it. Reading is
+	// a read; all three changes are writes, and compaction is the only one that deletes.
+	mux.Handle("GET /v1/ns/{ns}/retention", s.nsRead(s.handleRetentionStatus))
 	mux.Handle("GET /v1/ns/{ns}/schema", s.nsRead(s.handleSchema))
 	mux.Handle("GET /v1/ns/{ns}/indexes", s.nsRead(s.handleIndexes))
 	mux.Handle("GET /v1/ns/{ns}/log", s.nsRead(s.handleLog))
@@ -286,6 +328,9 @@ func (s *Server) routes() http.Handler {
 	// Revert. Planning is a read - it computes a diff and writes nothing - so it is available
 	// whatever the write setting, and an operator can always see what a revert *would* do. Only
 	// applying is gated.
+	mux.Handle("PUT /v1/ns/{ns}/retention/history-mode", s.nsWrite(s.handleSetHistoryMode))
+	mux.Handle("POST /v1/ns/{ns}/retention/compact", s.nsWrite(s.handleCompactHistory))
+	mux.Handle("POST /v1/ns/{ns}/retention/restore", s.nsWrite(s.handleRestoreFromArchive))
 	mux.Handle("PUT /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handlePutDocument))
 	mux.Handle("DELETE /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handleDeleteDocument))
 	mux.Handle("POST /v1/ns/{ns}/refs/branches", s.nsWrite(s.handleCreateBranch))

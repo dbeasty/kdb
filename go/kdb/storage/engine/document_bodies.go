@@ -34,17 +34,24 @@ import (
 // delta frame is already durable and already holds these bytes. What the
 // blob copy has to survive is *truncation*, not a crash, and the ordering
 // that guarantees it is a memtable flush before any segment is deleted.
-// See PrepareForTruncation.
-
-// putDocumentBody records one document version's bytes under its content
-// hash, so it can be found again after the delta segment that carried it
-// is deleted. A no-op under any mode that does not truncate.
-func (e *ServerEngine) putDocumentBody(contentHash codec.Hash, doc document.Document) {
-	if e.memTable == nil || e.HistoryMode() != storage.HistoryModeNone {
-		return
-	}
-	e.memTable.Put(contentHash, []byte(doc.JSON))
-}
+//
+// Nothing writes a body on the commit path at all - see PrepareForTruncation
+// below, which is the only writer. A version that was just committed is
+// already durable in this commit's own delta frame, which is sufficient
+// until this namespace next tries to delete a segment; materializing a
+// blob copy before that is work a commit that lands inside the retention
+// window (the common case, since NONE behaves like FULL inside it) never
+// needed done at all. Deferring it to PrepareForTruncation, which runs at
+// checkpoint/truncation cadence rather than per write, also collapses a
+// document rewritten many times within one window to the one blob write
+// its *current* version actually needs, instead of one write per
+// rewrite - the same shape as a periodic checkpoint elsewhere (WiredTiger,
+// for instance) deferring a dirty page's write-back rather than flushing
+// it on every mutation. It is only cheap to defer because of a fact this
+// file does not establish: docsByHash pins everything the live tree names
+// (doc_hash_shard.go), so the walk below finds every version resident in
+// memory and never has to fall back to a log read for the common case of
+// a namespace that has not lost anything to eviction.
 
 // loadDocumentBody reads a version back out of the blob store.
 //
@@ -75,20 +82,27 @@ func (e *ServerEngine) loadDocumentBody(docID codec.UUID, contentHash codec.Hash
 // This is the precondition for deleting a delta segment under
 // HistoryModeNone, and the reason truncation is safe at all.
 //
-// It is not enough to flush whatever happens to be in the memtable.
-// putDocumentBody writes a version's bytes as it is committed, but that is
-// this process's memtable: a version written by an earlier session, or
-// before this namespace was converted to history=none, has no blob copy at
-// all, and its only home is the very segment about to be deleted. So the
-// live tree is walked and every version it names is *checked* - and any
-// that is missing is fetched (from memory, or from the log while the log
-// is still there) and written in.
+// Nothing writes a body before this runs, so every call starts from
+// scratch: the live tree is walked and every version it names is
+// *checked* against the memtable, and any that is missing (which, on an
+// ordinary pass, is all of them - a prior flush empties the memtable, and
+// this file writes nothing between flushes) is fetched and written in.
+// "Fetched" is cheap in the common case: docsByHash pins everything the
+// live tree names, so the fetch is a map lookup, not a log read - the log
+// read (loadCold) is the fallback for a version this process never held,
+// e.g. one written by an earlier session, or before this namespace was
+// converted to history=none.
 //
 // The cost is proportional to the live dataset, not to history, and it is
-// paid at checkpoint cadence rather than per write. That is the right
-// shape: it is the same walk a backup would do, and it is what makes the
-// invariant "everything the live tree names is in the blob store" true by
-// construction rather than by assumption.
+// paid at checkpoint cadence rather than per write - the same walk a
+// backup would do, run as often as truncation runs rather than as often
+// as a document changes. That is what makes the invariant "everything the
+// live tree names is in the blob store" true by construction rather than
+// by assumption, and it is also why deferring every body write to this
+// one pass is safe rather than merely convenient: a version only needs
+// this durability once it is about to lose its place in the log, and
+// nothing before that point can tell whether a given write will still be
+// the live version when that happens.
 func (e *ServerEngine) PrepareForTruncation() error {
 	if e.HistoryMode() != storage.HistoryModeNone {
 		return nil

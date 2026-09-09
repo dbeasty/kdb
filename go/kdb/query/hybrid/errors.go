@@ -71,10 +71,33 @@ func (e *ReadOnlyCheckoutError) Error() string {
 		e.NamespaceID, e.AtCommit)
 }
 
-// historyModeOf reports the history mode a namespace's policy declares,
-// defaulting to full for a namespace with no policy on file - which is
-// most of them, and which must not be read as "keeps nothing".
-func historyModeOf(reg policy.Registry, namespaceID string) (policy.HistoryMode, storage.RetentionWindow) {
+// historyModeOf reports the history mode in force for a namespace, and the
+// window that goes with it.
+//
+// There are two places that claim to know this and only one of them decides:
+// the namespace's marker, which the engine reads at open and enforces, and
+// its policy, which is data an operator can write and which enforces
+// nothing. They can disagree - a policy saying "none" over a full namespace
+// changes no behaviour at all - so the engine is asked first and the policy
+// is the fallback for a store that cannot answer (an in-memory adapter, or a
+// namespace served without one).
+//
+// That ordering is the whole of the fix: before it, the mutable-looking
+// value was the one that did not count, and an operator who set the policy
+// would have seen error messages change while retention did not.
+//
+// Defaults to full for a namespace with neither, which is most of them, and
+// which must not be read as "keeps nothing".
+func historyModeOf(store storage.Adapter, reg policy.Registry, namespaceID string) (policy.HistoryMode, storage.RetentionWindow) {
+	if authority, ok := store.(interface {
+		HistoryMode() storage.HistoryMode
+		RetentionWindow() storage.RetentionWindow
+	}); ok {
+		if authority.HistoryMode() == storage.HistoryModeNone {
+			return policy.HistoryModeNone, authority.RetentionWindow()
+		}
+		return policy.HistoryModeFull, storage.RetentionWindow{}
+	}
 	if reg == nil {
 		return policy.HistoryModeFull, storage.RetentionWindow{}
 	}

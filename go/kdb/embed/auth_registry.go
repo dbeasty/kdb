@@ -109,7 +109,7 @@ func openAuthNamespace(reg *FileAuthRegistry, dataRoot, namespaceID string) (dag
 		// Local disk only - no S3 replication for the auth registry (its writes are rare and
 		// tiny; back it up with the data dir as a whole).
 		NewStore: func(config storio.PlatformIOConfig) (storio.SegmentByteStore, error) {
-			return buildSegmentByteStore(config, nil, storio.ReplicationPolicy{})
+			return buildSegmentByteStore(config, nil, nil, nil, storio.ReplicationPolicy{})
 		},
 	}).Open(storio.PlatformIOConfig{RootDirectory: &dataRoot, FsyncOnFlush: true})
 	if err != nil {

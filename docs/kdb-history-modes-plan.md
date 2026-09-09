@@ -651,6 +651,54 @@ Two bugs surfaced while building this, both of the silently-wrong kind:
   passed through two resolvers, which is exactly what happened between
   `OpenFileRuntime` and the engine.
 
+## The maintenance loop
+
+`Maintain()` on a timer, which is what makes `history=none` bounded in a
+process that runs for weeks rather than one that exits cleanly. Three
+things beyond a bare ticker, in `go/kdb/embed/maintenance_loop.go`:
+
+**It runs only when there is something to do.** A pass walks the live tree,
+writes a checkpoint and may rewrite every SSTable, so a tick over an
+unchanged namespace is pure waste. `needsWork` decides from three probes,
+none of which touches the delta log:
+
+| probe | what it catches | cost |
+|---|---|---|
+| `DAG.Head()` moved since the last pass | new commits to checkpoint/truncate | a mutex |
+| `BlobTableCount() >= CompactTables` | flush backlog, which builds without commits | a slice length |
+| `now - lastPassAt >= Sweep` | a *duration* window expiring by the clock alone | a subtraction |
+
+The three are not redundant: commits drive truncation, flushes drive
+compaction, and the clock drives the window. A namespace can have work
+waiting under any one with the other two quiet - which is why "nothing has
+been written" is not the same as "nothing can be reclaimed", and why the
+sweep (default 30m) exists at all.
+
+**It prefers quiet moments.** Maintenance and commits contend for the same
+engine, so `MaintenanceOptions.Busy` holds a pass off while writes are in
+flight. `kdb-service` wires it to `KdbServerRuntime.WriteQueueDepth() > 0` -
+the write gate, because commits are what a pass actually contends with,
+rather than CPU or disk load which say nothing about this engine.
+
+**But load can never starve it.** `MaxDefer` (default 6 ticks) forces a pass
+through regardless. This is the load-bearing half of the previous point: a
+server under sustained write load is precisely the one whose log is growing
+fastest, and a scheduler that waited politely forever would reintroduce the
+unbounded growth this mode exists to prevent. Load is a reason to wait for a
+better moment, never a reason to skip the work.
+
+Stopped first in the service's shutdown sequence, before draining: `Stop`
+waits for an in-flight pass rather than cutting one short, since a pass
+mid-truncation is holding the ordering (bodies flushed, checkpoint written,
+*then* segments deleted) that makes truncation safe.
+
+| setting | flag | env | default |
+|---|---|---|---|
+| interval | `--maintenance-interval` | `KDB_MAINTENANCE_INTERVAL` | `5m` (0 disables) |
+
+Embedded callers get the same loop through `embed.StartMaintenance`, with
+`Busy` left nil if they have no load signal to offer.
+
 ## What did not land
 
 Stated plainly, because each of these weakens a claim made above.
@@ -659,10 +707,9 @@ Stated plainly, because each of these weakens a claim made above.
    follows the existing precedent for 0x14-0x1C, and the checkpoint file is
    Go-local so its v2 format is not a cross-tree gate. But a Kotlin client
    cannot list history or revert.
-2. **No periodic maintenance timer.** `Maintain()` exists and close-time
-   truncation runs automatically; nothing calls `Maintain()` on a schedule
-   yet, so a long-running server reclaims only at shutdown until an operator
-   or the service loop calls it.
+2. ~~**No periodic maintenance timer.**~~ **Landed** - see "The maintenance
+   loop" below. `kdb-service` runs one `embed.MaintenanceScheduler` per open
+   namespace, on `--maintenance-interval` (default 5m, 0 disables).
 3. **The measurement is at 40 sessions, not 100k/1M commits.** The growth
    *shape* is clear at this scale; absolute numbers at production history
    lengths are extrapolation.

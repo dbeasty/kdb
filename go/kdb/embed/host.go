@@ -56,6 +56,14 @@ type namespaceEntry struct {
 	// close flushes and seals this namespace's storage. Held here rather than on the runtime
 	// because on the multi-namespace path the directory lock outlives any one namespace.
 	close func() error
+	// storage is what this namespace was opened with, kept so a reopen can start from the
+	// options actually in force rather than from a set assembled elsewhere - which would
+	// silently revert every setting the reopening caller did not happen to name. See
+	// Host.StorageOptionsOf.
+	storage StorageOptions
+	// catalog and schema are the other two things reopening needs and nothing else records.
+	catalog string
+	schema  schema.KdbSchema
 }
 
 // DefaultHostMemoryBudgetBytes is the pool a host divides across its namespaces when the caller
@@ -137,11 +145,18 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 	if s3Cfg == nil {
 		s3Cfg = s3io.ConfigFromEnv()
 	}
+	// The archive is a separate destination from the replica, and separately configured: they
+	// are different jobs (see buildSegmentByteStore), and a deployment that wants a bounded
+	// local footprint with the commits still recoverable needs the archive specifically.
+	archiveCfg := opts.S3Archive
+	if archiveCfg == nil {
+		archiveCfg = s3io.ArchiveConfigFromEnv()
+	}
 	policy := opts.ReplicationPolicy
 
 	io, err := (&storio.FileBackedPlatformIOFactory{
 		NewStore: func(config storio.PlatformIOConfig) (storio.SegmentByteStore, error) {
-			return buildSegmentByteStore(config, s3Cfg, policy)
+			return buildSegmentByteStore(config, s3Cfg, archiveCfg, opts.ArchiveBlobs, policy)
 		},
 	}).Open(storio.PlatformIOConfig{
 		RootDirectory: &dataRoot,
@@ -240,6 +255,9 @@ func (h *Host) NamespaceWithOptions(catalog, namespaceID string, sch schema.KdbS
 	if err != nil {
 		return nil, err
 	}
+	// Recorded so a later reopen can start from what this namespace is
+	// actually running on. See Host.StorageOptionsOf.
+	entry.storage, entry.catalog, entry.schema = opts.Storage, catalog, sch
 
 	h.mu.Lock()
 	if h.closed {

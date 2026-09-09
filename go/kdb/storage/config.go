@@ -51,6 +51,22 @@ type StorageEngineConfig struct {
 	// WalSkipCorruptRecords makes recovery skip records that fail their
 	// checksum instead of failing the whole replay. Default false.
 	WalSkipCorruptRecords bool
+	// Reclaim is how eagerly this namespace acts on what its retention
+	// window has released - see ReclaimMode. Zero is ReclaimBalanced.
+	// Separate from HistoryMode on purpose: the mode says what may be
+	// reclaimed, this says whether anything is.
+	Reclaim ReclaimMode
+	// DeltaMaxSegmentBytes caps the active *delta* segment, which is a
+	// different thing from the WAL's cap above and matters for a different
+	// reason: retention can only ever reclaim a sealed segment, never the
+	// one being written to, so without rotation a process that runs for
+	// weeks holds every commit it has made in one open segment that
+	// nothing may delete. Zero uses DefaultDeltaMaxSegmentBytes.
+	//
+	// A floor rather than a ceiling, like the retention window: rotation
+	// is checked at batch boundaries, so a segment may overshoot by the
+	// last batch written into it.
+	DeltaMaxSegmentBytes int64
 	// HistoryStrategy decides how reads at historical commits are served
 	// after a restart - see HistoryStrategy. Resolved from the namespace's
 	// own marker at open, so the zero value here is normal.

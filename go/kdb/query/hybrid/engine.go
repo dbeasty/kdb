@@ -92,7 +92,7 @@ func (e *defaultEngine) Execute(sqlStr string, request Request) (Result, error) 
 // (a longer window) which "no such commit" does not suggest. Under
 // history=FULL the original error is already the whole truth.
 func (e *defaultEngine) explainResolution(namespaceID, spec string, err error) error {
-	mode, window := historyModeOf(e.cfg.PolicyRegistry, namespaceID)
+	mode, window := historyModeOf(e.cfg.Storage, e.cfg.PolicyRegistry, namespaceID)
 	if mode != policy.HistoryModeNone {
 		return err
 	}

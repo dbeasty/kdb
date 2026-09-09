@@ -264,6 +264,28 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.DrainTimeout != nil },
 		},
 		{
+			key: "governance.maintenanceInterval", flag: "maintenance-interval", env: "KDB_MAINTENANCE_INTERVAL",
+			scope: ScopeProcess, mutability: MutabilityLive,
+			help:   "how often to consider a background maintenance pass per namespace - checkpoint, reclaim delta segments past the retention window under history=none, and compact the blob store. Ticks with nothing to do cost three in-memory probes; passes wait for a moment with no write in flight, bounded so sustained load cannot starve them. 0 reclaims only at close",
+			value:  dur(func(s ServiceSettings) time.Duration { return s.MaintenanceInterval }),
+			inFile: func(f *ServiceFile) bool { return f.MaintenanceInterval != nil },
+		},
+		{
+			key: "governance.maintenanceSweep", flag: "maintenance-sweep", env: "KDB_MAINTENANCE_SWEEP",
+			scope: ScopeProcess, mutability: MutabilityLive,
+			help:   "how long the maintenance loop may go without a pass while a namespace is idle. Retention expires by wall clock with no commit involved, so this is what catches a window that aged out of a namespace nobody is writing to",
+			value:  dur(func(s ServiceSettings) time.Duration { return s.MaintenanceSweep }),
+			inFile: func(f *ServiceFile) bool { return f.MaintenanceSweep != nil },
+		},
+		{
+			key: "governance.maintenanceMaxDefer", flag: "maintenance-max-defer", env: "KDB_MAINTENANCE_MAX_DEFER",
+			scope: ScopeProcess, mutability: MutabilityLive, unit: "ticks",
+			help:      "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway. The busiest server is the one whose log grows fastest, so this bound is what stops load starving reclamation; -1 never forces and risks exactly that",
+			value:     num(func(s ServiceSettings) int { return s.MaintenanceMaxDefer }),
+			inFile:    func(f *ServiceFile) bool { return f.MaintenanceMaxDefer != nil },
+			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.MaintenanceMaxDefer = &n }, -1),
+		},
+		{
 			key: "tls.certFile", flag: "tls-cert", env: "KDB_TLS_CERT",
 			scope: ScopeListener, mutability: MutabilityNewConnections,
 			help:   "PEM certificate file - set with tls.keyFile to require TLS on the data-plane listeners",
@@ -526,6 +548,48 @@ func envOnlySpecs() []envOnlySpec {
 				}
 				return fmt.Sprint(s), nil
 			},
+		},
+		{
+			key: "history.mode", env: "KDB_HISTORY_MODE",
+			scope: ScopeNamespace, mutability: MutabilityImmutable,
+			help: "full keeps every commit forever; none keeps the live dataset plus retain.duration/retain.commits and reclaims the rest. Refused at open if it disagrees with what the namespace was built as - today changing it is a migration (kdb-inspect migrate-history --history-mode), not a setting",
+			parse: func(raw string) (any, error) {
+				m, err := storage.ParseHistoryMode(strings.ToLower(strings.TrimSpace(raw)))
+				if err != nil {
+					return nil, err
+				}
+				return fmt.Sprint(m), nil
+			},
+		},
+		{
+			key: "reclaim.mode", env: "KDB_RECLAIM_MODE",
+			scope: ScopeNamespace, mutability: MutabilityLive,
+			help: "how eagerly this namespace acts on what its retention window has released. manual never reclaims on its own and waits for an explicit compaction - which is what makes switching a namespace to history=none reversible, at the cost of unbounded disk until somebody acts; immediate reclaims as soon as a segment is sealed and does not defer to load; balanced (the default) reclaims every few minutes when there is something to do; lazy trades disk for quiet. Separate from history.mode on purpose: the mode says what may be reclaimed, this says whether anything is",
+			parse: func(raw string) (any, error) {
+				m, err := storage.ParseReclaimMode(strings.ToLower(strings.TrimSpace(raw)))
+				if err != nil {
+					return nil, err
+				}
+				return fmt.Sprint(m), nil
+			},
+		},
+		{
+			key: "retain.duration", env: "KDB_RETAIN_DURATION",
+			scope: ScopeNamespace, mutability: MutabilityLive,
+			help: "how far back a history=none namespace keeps commits (24h, 7d, 0 for nothing). A floor enforced at sealed-segment granularity, never a ceiling, so real retention overshoots by up to one segment. Ignored under history=full. Live via EmbeddedKdbRuntime.SetRetentionWindow - and note that shortening it makes already-written segments eligible on the next pass",
+			parse: func(raw string) (any, error) {
+				d, err := storage.ParseRetentionDuration(strings.TrimSpace(raw))
+				if err != nil {
+					return nil, err
+				}
+				return d.String(), nil
+			},
+		},
+		{
+			key: "retain.commits", env: "KDB_RETAIN_COMMITS",
+			scope: ScopeNamespace, mutability: MutabilityLive, unit: "commits",
+			help:  "how many recent commits a history=none namespace keeps regardless of age. Approximated at segment granularity (1000 commits per segment, minimum one), and it only ever over-retains. Ignored under history=full",
+			parse: count,
 		},
 		{
 			key: "cache.documentBytes", env: "KDB_DOCUMENT_CACHE_BYTES",
