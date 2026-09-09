@@ -58,8 +58,20 @@ back to the `--config` file; `/v1/settings/{key}` and `/v1/settings/drift` are i
 particular change will survive a restart *before* it is made, rather than after. Nothing is declared-but-unbuilt any more: an endpoint from §8
 that does not exist simply answers 404.
 
-**Not started:** per-commit document diff (`/commits/{hash}/diff/{docId}`), `/tx`, `/policy`,
-`/indexes`.
+**Not started:** `/tx` and `/policy`.
+
+`GET /v1/ns/{ns}/indexes` reports the registry's descriptors and - the field that matters
+operationally - whether it is at head. Indexes are updated on the commit path, so a commit made
+*through the server runtime* keeps it current; one made straight at the embedded runtime does not,
+and an index that plans queries against documents that have moved is invisible until the results
+are wrong. Both cases are tested.
+
+The per-commit document diff is **built without a new endpoint**. `/commits/{hash}/diff/{docId}`
+would be a second way to read a document at a revision, and §8.3's note about the timeline gives the
+reason not to have one: two ways to read the same thing can disagree. The commit detail's diff rows
+now open a field-level diff composed from two ordinary `?at=` reads - the same call the timeline
+makes - which is what the plan asked for ("opening one still means reading it at two revisions by
+hand") without the redundancy.
 
 **Not buildable here, and the dashboard says so rather than showing an empty table:**
 `/ops/sessions` - a `SessionManager` is created per connection (`server/session_manager.go`), so
@@ -116,23 +128,28 @@ consistent point across every namespace, which is its own piece of work.
 |---|---|---|
 | 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, editing with compare-and-set, an opt-in replace that removes omitted keys, delete, and readable at any revision |
 | 2 | SQL console | **built** — SELECT reports the access path and rows examined; DML and DDL are gated on `--control-write` *and* a write grant, and report the commit they produced |
-| 3 | Commit graph | **built** — lane-assigned DAG drawing: verticals for every branch alive at a row, a curve per extra parent, filled nodes for merges, and a gutter of fixed width so it does not shift while scrolling. Lanes come from the server (`?graph=true`) over one whole walk |
+| 3 | Commit graph | **built** — lane-assigned DAG drawing: verticals for every branch alive at a row, a curve per extra parent, filled nodes for merges, and a gutter of fixed width so it does not shift while scrolling. Lanes come from the server (`?graph=true`) over one whole walk. A diff row opens what that commit did to that one document, field by field |
 | 4 | Document timeline | **built** — every version of one document, a field-level diff between any two, and restore-this-version as a forward write that replaces rather than merges, so the document becomes exactly that version |
 | 5 | Branches & tags | **built** — create and delete a branch or tag from any revision, a compare panel over any two revisions reporting how they are related (same / ahead / behind / diverged), and a tag row is still a shortcut into time travel |
 | 6 | Time travel | **built** |
 | 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
-| 8 | Schema & indexes | **partial** — schema only |
+| 8 | Schema & indexes | **built** — schema plus the index registry: what actually exists (not the schema's `indexed` intent, which can disagree), and how far behind head the registry is, which is the question the descriptors cannot answer |
 | 9 | Operations dashboard | **built** — process and admission state, held locks and leases with the holder named, write-path stage latencies with what each one being slow would mean, a drain button behind a typed confirmation, and a "not available here" panel saying why sessions and peers are absent |
 | 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a per-key "also write it to the config file" choice (with the reason when there isn't one), a drift banner, and the ignored-configuration panel |
 | 11 | Recovery | **built** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, the restore-and-attach flow, promotion with the server's own plan rendered verbatim behind a typed confirmation, a banner for a promotion awaiting restart and for the outcome of the last one, and the offline commands filled in |
 
 ### What to do next, in order
 
-1. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
-   documents a commit touched; opening one still means reading it at two revisions by hand.
-2. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
-3. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
-   protocol still ignores it - which is outside this UI's scope and is the reason M2 is partial.
+Everything §9 named is built. What is left is outside this UI:
+
+1. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
+   protocol still ignores it. That is a change to the wire and its Kotlin parity fixtures, not to
+   this package, and it is the only reason M2 is not marked done.
+2. **`/tx` and `/policy`.** §5 sketched both. `/tx` (an interactive transaction over HTTP) needs a
+   session that outlives a request, which is a real design question rather than a missing handler.
+   `/policy` needs the namespace policy registry wired and persisted first - §2.4(c)'s open item.
+3. **A session registry, if `/ops/sessions` is ever wanted.** A `SessionManager` is per connection
+   today; the dashboard says so rather than showing an empty table.
 
 ## 1. What this is
 

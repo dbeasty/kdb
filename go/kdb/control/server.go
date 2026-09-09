@@ -254,6 +254,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/namespaces", s.nsRead(s.handleNamespaces))
 	mux.Handle("GET /v1/ns/{ns}/status", s.nsRead(s.handleStatus))
 	mux.Handle("GET /v1/ns/{ns}/schema", s.nsRead(s.handleSchema))
+	mux.Handle("GET /v1/ns/{ns}/indexes", s.nsRead(s.handleIndexes))
 	mux.Handle("GET /v1/ns/{ns}/log", s.nsRead(s.handleLog))
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}", s.nsRead(s.handleCommit))
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}/diff", s.nsRead(s.handleCommitDiff))

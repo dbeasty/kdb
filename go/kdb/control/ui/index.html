@@ -159,6 +159,9 @@
 <dialog id="promotedlg"><h3>Promote a restored copy</h3><div class="body" id="promotebody"></div>
   <footer><button class="act" id="promotecancel">Cancel</button>
   <button class="act danger" id="promotego">Promote and restart</button></footer></dialog>
+<dialog id="docdiffdlg"><h3>What this commit did to this document</h3>
+  <div class="body" id="docdiffbody"></div>
+  <footer><button class="act" id="docdiffclose">Close</button></footer></dialog>
 
 <script>
 "use strict";
@@ -684,6 +687,41 @@ function fieldDiff(a, b) {
     el("tbody", {}, rows)));
 }
 
+// openCommitDocDiff shows what one commit did to one document, field by field.
+//
+// The commit's tree diff names which documents moved; this is the "and what changed in it" that
+// otherwise meant reading the document at two revisions by hand. Both sides come from the ordinary
+// document read at a revision - the same call the timeline uses - so there is one way to read a
+// document at a revision rather than two that could drift apart.
+async function openCommitDocDiff(commit, diff, entry) {
+  const dlg = $("docdiffdlg");
+  const body = $("docdiffbody");
+  setKids(body, el("div", { class: "empty", text: "Reading both sides…" }));
+  dlg.showModal();
+
+  const at = async (rev) => {
+    try {
+      const doc = await api(nsPath("/docs/" + encodeURIComponent(entry.docId)) +
+                            "?at=" + encodeURIComponent(rev));
+      return doc.body;
+    } catch (e) {
+      // A document absent at one end is the normal case for an add or a remove, not an error.
+      return null;
+    }
+  };
+  const [before, after] = await Promise.all([at(diff.from), at(diff.to)]);
+  setKids(body,
+    el("div", { class: "kv", style: "margin-bottom:10px" },
+      el("dt", { text: "Document" }), el("dd", {}, el("code", { text: entry.docId })),
+      el("dt", { text: "At commit" }), el("dd", {}, el("code", { text: commit.shortHash }),
+        el("span", { class: "chip " + entry.change, style: "margin-left:6px", text: entry.change })),
+      el("dt", { text: "Compared with" }), el("dd", {}, el("code", { text: (diff.from || "").slice(0, 8) }))),
+    fieldDiff(before, after),
+    el("div", { class: "muted", style: "font-size:12px;margin-top:10px" },
+      "Both sides are read at their revision, so this is the document as it was, not a "
+      + "reconstruction from the commit's operations."));
+}
+
 // restoreVersion writes an old version forward. It is an ordinary save, which means it is a new
 // commit rather than a rewind - and it merges, so the confirmation says which keys will survive.
 async function restoreVersion(version) {
@@ -995,14 +1033,21 @@ function drawDetail(sel) {
   if (d && d.unavailable) {
     diffSection = el("div", { class: "warn", text: d.unavailable });
   } else if (d && d.entries && d.entries.length) {
+    // Each row opens the field-level diff for that one document at this commit. It is composed
+    // from two reads of the document - at this commit and at the one being compared against -
+    // rather than from a per-commit-per-document endpoint, for the reason the plan gives about the
+    // timeline: one way to read a document at a revision cannot disagree with itself.
     diffSection = el("div", {},
       el("div", { class: "body" },
         el("span", { class: "chip added", text: "+" + d.counts.added }), " ",
         el("span", { class: "chip modified", text: "~" + d.counts.modified }), " ",
-        el("span", { class: "chip removed", text: "−" + d.counts.removed })),
+        el("span", { class: "chip removed", text: "−" + d.counts.removed }),
+        el("span", { class: "muted", style: "font-size:12px;margin-left:8px",
+                     text: "a row opens what this commit did to that document" })),
       el("table", {},
         el("thead", {}, el("tr", {}, el("th", { text: "Change" }), el("th", { text: "Document" }))),
-        el("tbody", {}, d.entries.map((e) => el("tr", {},
+        el("tbody", {}, d.entries.map((e) => el("tr", { class: "pick",
+            onclick: () => openCommitDocDiff(c.commit, d, e) },
           el("td", {}, el("span", { class: "chip " + e.change, text: e.change })),
           el("td", {}, el("code", { text: e.docId })))))));
   } else {
@@ -1211,8 +1256,11 @@ async function compareRefs(fromSpec, toSpec) {
 }
 
 async function renderSchema() {
-  const s = await api(nsPath("/schema"));
-  setMain(el("div", { class: "card" },
+  const [s, ix] = await Promise.all([
+    api(nsPath("/schema")),
+    api(nsPath("/indexes")).catch((e) => ({ error: e.message })),
+  ]);
+  setMain(el("div", {}, el("div", { class: "card" },
     el("h2", { text: "Schema — the typed lens over documents" }),
     s.fields.length
       ? el("table", {},
@@ -1225,7 +1273,49 @@ async function renderSchema() {
             el("td", { class: "muted" }, f.indexed ? "yes" : "—"),
             el("td", { class: "muted" }, f.unique ? "yes" : "—")))))
       : el("div", { class: "empty" },
-          "No schema declared. The document is always the truth; a schema is optional.")));
+          "No schema declared. The document is always the truth; a schema is optional.")),
+    el("div", { style: "height:12px" }),
+    indexSection(ix)));
+}
+
+// The schema's "indexed" column is intent; this is what exists. They can disagree - an index
+// created through SQL is not in the schema, and a schema field marked indexed whose store failed
+// to open is not in the registry - which is exactly why both are shown.
+function indexSection(ix) {
+  if (ix.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Indexes" }),
+      el("div", { class: "body muted", text: ix.error }));
+  }
+  const staleness = ix.available && ix.current === false
+    ? el("div", { class: "warn" },
+        "The registry is at ", el("code", { text: ix.indexedThroughShort || "?" }),
+        " and head is ", el("code", { text: (ix.head || "").slice(0, 8) }), ". ", ix.note || "")
+    : null;
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Indexes" }),
+    staleness,
+    (ix.indexes || []).length
+      ? el("div", { class: "grid-wrap" }, el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Index" }), el("th", { text: "Field" }),
+                              el("th", { text: "Type" }), el("th", { text: "Unique" }),
+                              el("th", { text: "Schema v" }), el("th", { text: "Options" }))),
+          el("tbody", {}, ix.indexes.map((i) => el("tr", {},
+            el("td", {}, el("code", { text: i.name })),
+            el("td", {}, el("code", { text: (i.fields || [i.field]).join(", ") })),
+            el("td", {}, el("span", { class: "chip", text: i.type })),
+            el("td", { class: "muted" }, i.unique ? "yes" : "—"),
+            el("td", { class: "muted" }, String(i.schemaVersion)),
+            el("td", { class: "cell muted" },
+              el("code", { text: i.options ? Object.entries(i.options)
+                .filter(([k]) => k !== "index_name")
+                .map(([k, v]) => k + "=" + v).join(" ") : "" })))))))
+      : el("div", { class: "empty", text: ix.note || "No indexes." }),
+    ix.available && (ix.indexes || []).length
+      ? el("div", { class: "body muted", style: "font-size:12px" },
+          "Indexed through ", el("code", { text: ix.indexedThroughShort || "—" }),
+          ix.current ? " — current with head." : "")
+      : null);
 }
 
 const SOURCE_HELP = {
@@ -2091,6 +2181,7 @@ $("exitat").addEventListener("click", exitAt);
 $("nspick").addEventListener("change", (e) => { switchNamespace(e.target.value); });
 $("revertcancel").addEventListener("click", () => $("revertdlg").close());
 $("promotecancel").addEventListener("click", () => $("promotedlg").close());
+$("docdiffclose").addEventListener("click", () => $("docdiffdlg").close());
 
 if (token) boot(); else renderGate();
 </script>

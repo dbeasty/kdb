@@ -17,6 +17,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/config"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/index/stores"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/server"
 )
@@ -3846,5 +3847,109 @@ func TestDrainStopsWritesAndLeavesReadsAlone(t *testing.T) {
 	_, again := postJSON(t, base, "/v1/ops/drain", `{"confirm":"demo/users","waitSeconds":1}`)
 	if again["alreadyWas"] != true {
 		t.Errorf("a second drain should report it was already draining: %v", again)
+	}
+}
+
+// Indexes - the other half of §9 screen 8.
+//
+// The schema view already carries "indexed" and "unique" flags. Those are the schema's intent;
+// this reports what the registry actually holds, which is a different thing and can disagree.
+
+func TestIndexesSaysSoWhenThereIsNoRegistry(t *testing.T) {
+	// The in-memory fixture never calls OpenIndexes, which is the pre-Layer-16 behaviour: every
+	// lookup is a full scan. That is a fact about the runtime, not a failure, and has to read as
+	// one - "no indexes" and "indexes unavailable" would otherwise look the same.
+	_, base := newFixture(t)
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/indexes")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("indexes: %d (%v)", res.StatusCode, body)
+	}
+	if body["available"] != false {
+		t.Errorf("this runtime has no registry: %v", body)
+	}
+	if !strings.Contains(fmt.Sprint(body["note"]), "full scan") {
+		t.Errorf("the note should say what happens instead: %v", body["note"])
+	}
+	if len(body["indexes"].([]any)) != 0 {
+		t.Errorf("and no indexes: %v", body["indexes"])
+	}
+}
+
+func TestIndexesReportsTheRegistryAndHowCurrentItIs(t *testing.T) {
+	cs, base, rt := fileFixture(t)
+	if _, err := cs.opts.Runtime.OpenIndexes(stores.Options{}); err != nil {
+		t.Fatalf("open indexes: %v", err)
+	}
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a","name":"ada"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing defined yet: the answer says so and says what to do about it.
+	_, empty := get(t, base, "/v1/ns/demo%2Fusers/indexes")
+	if empty["available"] != true {
+		t.Fatalf("a file-backed runtime with OpenIndexes has a registry: %v", empty)
+	}
+	if !strings.Contains(fmt.Sprint(empty["note"]), "CREATE INDEX") {
+		t.Errorf("an empty registry should name the way to add one: %v", empty["note"])
+	}
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/sql",
+		`{"sql":"CREATE INDEX name_idx ON users (name)"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("create index: %d (%v)", res.StatusCode, body)
+	}
+
+	_, listed := get(t, base, "/v1/ns/demo%2Fusers/indexes")
+	indexes := listed["indexes"].([]any)
+	if len(indexes) != 1 {
+		t.Fatalf("one index should be listed: %v", indexes)
+	}
+	ix := indexes[0].(map[string]any)
+	if ix["name"] != "name_idx" || ix["field"] != "name" {
+		t.Errorf("the descriptor should come back: %v", ix)
+	}
+	if ix["type"] == "" || ix["indexId"] == "" {
+		t.Errorf("type and id identify the index: %v", ix)
+	}
+
+	// How current the registry is, which is the question the descriptors cannot answer and the one
+	// that matters: a query planned against a stale index is invisible until the results are wrong.
+	if _, ok := listed["indexedThrough"]; !ok {
+		t.Errorf("the answer should say how far the registry has been marked: %v", listed)
+	}
+	if listed["current"] != true {
+		t.Errorf("nothing has been written since, so it should be current: %v", listed)
+	}
+
+	// A write through the server runtime keeps the registry current: indexes are updated on the
+	// commit path rather than lazily.
+	if res, b := postJSON(t, base, "/v1/ns/demo%2Fusers/sql",
+		`{"sql":"INSERT INTO users (id, name) VALUES ('b', 'grace')"}`); res.StatusCode != http.StatusOK {
+		t.Fatalf("insert: %d (%v)", res.StatusCode, b)
+	}
+	_, after := get(t, base, "/v1/ns/demo%2Fusers/indexes")
+	if after["current"] != true {
+		t.Errorf("a write through the server runtime should keep the registry current: %v", after)
+	}
+	if after["indexedThrough"] == listed["indexedThrough"] {
+		t.Errorf("and should have moved it forward: %v", after["indexedThrough"])
+	}
+
+	// A commit that did *not* go through the server runtime - here, straight at the embedded
+	// runtime, which is what an embedded caller or a repair tool does - leaves the registry behind.
+	// That is precisely the situation this field exists to make visible: the index still plans
+	// queries, against documents that have moved.
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"c","name":"katherine"}`); err != nil {
+		t.Fatal(err)
+	}
+	_, behind := get(t, base, "/v1/ns/demo%2Fusers/indexes")
+	if behind["current"] != false {
+		t.Errorf("a commit that bypassed the index path should show as behind: %v", behind)
+	}
+	if !strings.Contains(fmt.Sprint(behind["note"]), "not at head") {
+		t.Errorf("and should say so: %v", behind["note"])
+	}
+	if behind["indexedThrough"] == behind["head"] {
+		t.Errorf("indexedThrough should lag head: %v", behind)
 	}
 }
