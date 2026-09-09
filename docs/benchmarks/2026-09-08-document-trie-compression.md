@@ -94,6 +94,17 @@ Two further reductions are available in the trie itself if it becomes the constr
 
 Neither is worth doing on the current numbers.
 
+## Both implementations
+
+Kotlin carried the identical defect - `trieInsertAt` recursing to `TRIE_DEPTH` and allocating a
+16-element array at every level - and now carries the identical fix. Its `TrieNode` previously
+held only a hash and its children, so a compressed leaf needed the entry's uuid and content hash
+added to it before splitting was expressible at all.
+
+The two implementations must stay in step or they silently compute different tree hashes for the
+same entries, which `DocumentTreeTrieParityTest`'s literal vectors exist to catch. Since neither
+side's hashes changed, those vectors are untouched and passing on both.
+
 ## Tests
 
 `go/kdb/document/document_tree_compression_test.go`:
@@ -104,8 +115,20 @@ Neither is worth doing on the current numbers.
 - `TestCompressedLeafHashesMatchFullDepthSpine` - reconstructs the 32-level fold independently
   and compares, so it cannot pass by both sides sharing a mistake.
 - `TestDeleteRecompressesTheSpine` - a tree emptied down to one entry must hash identically to
-  that entry inserted fresh, and emptied entirely must hash as empty.
+  that entry inserted fresh, and must be made of **one node**.
 
-`go test ./...` and `go test -race ./...` green; `:kdb-document:jvmTest` green, which is the
-cross-language check - `DocumentTreeTrieParityTest` pins literal tree-hash vectors, so any
-change to a digest fails there.
+  The node count is the load-bearing half and was missing from the first version of this test.
+  A compressed leaf hashes *identically* to the spine it replaces - that equivalence is the
+  whole premise - so no assertion about hashes can tell whether compression happened at all.
+  Ablating the re-compression branch leaves one entry spread over 4 nodes with every hash still
+  correct; only counting nodes fails. Without it, the branch could be deleted as dead code and
+  the suite would stay green while memory regressed on any namespace that churns.
+
+`kdb-document/src/commonTest/kotlin/dev/kdb/document/DocumentTreeCompressionTest.kt` mirrors
+those and adds two the Go side does not need: that splitting two keys differing only in their
+last nibble is order-independent, and that deleting an absent key which shares a prefix with a
+present one is a no-op. The second is specific to compression - a leaf above `TRIE_DEPTH` may be
+a different key sharing the prefix, so delete now compares the key instead of trusting the path,
+which the uncompressed version never had to do.
+
+`go test ./...` and `go test -race ./...` green; Gradle `test allTests` green (11m40s).

@@ -97,6 +97,23 @@ func TestCompressedLeafHashesMatchFullDepthSpine(t *testing.T) {
 	}
 }
 
+// trieNodeCount counts allocated nodes. Structural on purpose: a compressed leaf hashes
+// *identically* to the spine it replaces - that equivalence is the whole premise - so no
+// assertion about hashes can tell whether compression actually happened. Only counting nodes
+// can.
+func trieNodeCount(n *trieNode) int {
+	if n == nil {
+		return 0
+	}
+	c := 1
+	if n.children != nil {
+		for _, ch := range n.children {
+			c += trieNodeCount(ch)
+		}
+	}
+	return c
+}
+
 // TestDeleteRecompressesTheSpine covers the half of the invariant that is easy to leave out.
 // Compression on insert alone would let the spines grow back one deletion at a time in a
 // namespace that churns: a subtree collapsing to one entry has to become a leaf again, or the
@@ -137,6 +154,12 @@ func TestDeleteRecompressesTheSpine(t *testing.T) {
 	}
 	if tree.Size() != 1 {
 		t.Fatalf("tree reports %d entries after deleting down to one", tree.Size())
+	}
+	// The hashes above would match even with the spine left in place, so the memory claim needs
+	// its own assertion: one entry means one node.
+	if got := trieNodeCount(tree.trieRoot); got != 1 {
+		t.Fatalf("a tree holding one entry is made of %d nodes, want 1; "+
+			"delete is not re-compressing, so the spines grow back as a namespace churns", got)
 	}
 
 	// And emptying it entirely must return the empty-tree hash, not a husk of internal nodes.
