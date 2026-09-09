@@ -22,6 +22,7 @@ import dev.kdb.wire.defaultWireCodec
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -51,7 +52,13 @@ class TcpWireTransportTest {
     fun listenAccept_twoClients() =
         runBlocking {
             val server = TcpLoopbackServer()
-            val seen = mutableListOf<String>()
+            // Thread-safe on purpose. TcpLoopbackServer launches a coroutine per accepted
+            // connection on Dispatchers.IO, so the two handlers below append from different
+            // threads at the same time. A plain mutableListOf loses one of them when both read
+            // the same size and write the same index, which failed this test about one run in
+            // three as `expected:<[a, b]> but was:<[b]>` - the collection dropping "a", not the
+            // transport losing it.
+            val seen = CopyOnWriteArrayList<String>()
             server.start { conn ->
                 val frame = conn.incoming().first()
                 val msg = wire.decode(frame)
