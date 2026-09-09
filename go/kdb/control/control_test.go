@@ -2341,3 +2341,210 @@ func awaitRestore(t *testing.T, base, jobID string) map[string]any {
 	t.Fatalf("restore job %s did not finish", jobID)
 	return nil
 }
+
+// TestDocumentTimelineListsOnlyRealChanges is the semantic the whole view rests on: a version is a
+// point at which the *content* changed. A commit that rewrote the document with identical bytes did
+// not change it, and listing it would send a reader hunting for a difference that is not there.
+func TestDocumentTimelineListsOnlyRealChanges(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"a","n":1}`)[0]
+	seed(t, cs, `{"id":"a","n":2}`)     // modified
+	seed(t, cs, `{"id":"a","n":2}`)     // identical - not a version
+	seed(t, cs, `{"id":"other","n":1}`) // unrelated document - not a version of this one
+	seed(t, cs, `{"id":"a","n":3}`)     // modified
+
+	path := "/v1/ns/demo%2Fusers/docs/" + first.DocID.String() + "/history"
+	res, body := get(t, base, path)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("history: %d (%v)", res.StatusCode, body)
+	}
+	versions := body["versions"].([]any)
+	kinds := make([]string, 0, len(versions))
+	for _, raw := range versions {
+		kinds = append(kinds, raw.(map[string]any)["change"].(string))
+	}
+	// Newest first: n=3 modified, n=2 modified, created. The identical rewrite and the unrelated
+	// document contribute nothing.
+	want := []string{"modified", "modified", "created"}
+	if len(kinds) != len(want) {
+		t.Fatalf("want %v, got %v (full: %v)", want, kinds, versions)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("want %v, got %v", want, kinds)
+		}
+	}
+
+	// Every version names the commit that produced it and identifies its content.
+	newest := versions[0].(map[string]any)
+	if newest["commit"] == nil || newest["contentHash"] == nil {
+		t.Errorf("a version must name its commit and content: %v", newest)
+	}
+	if newest["shortCommit"] == nil || len(newest["shortCommit"].(string)) != 8 {
+		t.Errorf("the short commit is what the log shows: %v", newest["shortCommit"])
+	}
+}
+
+func TestDocumentTimelineRecordsADeletion(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	put := seed(t, cs, `{"id":"a","n":1}`)[0]
+	docPath := "/v1/ns/demo%2Fusers/docs/" + put.DocID.String()
+
+	if res, body := sendJSON(t, http.MethodDelete, base, docPath, `{}`); res.StatusCode != http.StatusOK {
+		t.Fatalf("delete: %d (%v)", res.StatusCode, body)
+	}
+
+	_, body := get(t, base, docPath+"/history")
+	versions := body["versions"].([]any)
+	if len(versions) != 2 {
+		t.Fatalf("a create and a delete are two versions, got %d: %v", len(versions), versions)
+	}
+	del := versions[0].(map[string]any)
+	if del["change"] != "deleted" {
+		t.Fatalf("the newest version should be the deletion: %v", del)
+	}
+	if del["contentHash"] != nil {
+		t.Error("a deletion has no content, so it should carry no content hash")
+	}
+	if versions[1].(map[string]any)["change"] != "created" {
+		t.Errorf("the older version should be the creation: %v", versions[1])
+	}
+}
+
+// TestDocumentTimelineSurvivesEvictedOperations is why this is built on trees rather than on commit
+// operations. Operations are evictable; the document's history is not allowed to shrink with them.
+func TestDocumentTimelineSurvivesEvictedOperations(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"a","n":1}`)[0]
+	for i := 2; i <= 5; i++ {
+		seed(t, cs, fmt.Sprintf(`{"id":"a","n":%d}`, i))
+	}
+
+	// Squeeze the operations budget as far as it will go. A history built by filtering operations
+	// would come back short here; one built from trees is unaffected.
+	d, err := cs.commitDAGFor(cs.opts.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.SetOperationsBudget(1)
+
+	_, body := get(t, base, "/v1/ns/demo%2Fusers/docs/"+first.DocID.String()+"/history")
+	if n := len(body["versions"].([]any)); n != 5 {
+		t.Fatalf("five distinct versions were written and all five must be listed, got %d: %v",
+			n, body["versions"])
+	}
+}
+
+func TestDocumentTimelinePages(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"a","n":1}`)[0]
+	for i := 2; i <= 6; i++ {
+		seed(t, cs, fmt.Sprintf(`{"id":"a","n":%d}`, i))
+	}
+	path := "/v1/ns/demo%2Fusers/docs/" + first.DocID.String() + "/history"
+
+	_, page1 := get(t, base, path+"?limit=2")
+	v1 := page1["versions"].([]any)
+	if len(v1) != 2 {
+		t.Fatalf("limit=2 must return two versions, got %d", len(v1))
+	}
+	if page1["hasMore"] != true {
+		t.Error("six versions and a limit of two means more remain")
+	}
+
+	_, page2 := get(t, base, path+"?limit=2&skip=2")
+	v2 := page2["versions"].([]any)
+	seen := map[string]bool{}
+	for _, v := range v1 {
+		seen[v.(map[string]any)["commit"].(string)] = true
+	}
+	if len(v2) == 0 {
+		t.Fatal("the second page is empty")
+	}
+	for _, v := range v2 {
+		if seen[v.(map[string]any)["commit"].(string)] {
+			t.Error("a paged version was repeated")
+		}
+	}
+}
+
+// TestDocumentTimelineBodiesAreReadableAtEachVersion: the timeline is only useful if the versions
+// it names can be opened, which is what makes the diff between two of them possible.
+func TestDocumentTimelineBodiesAreReadableAtEachVersion(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"a","n":1}`)[0]
+	seed(t, cs, `{"id":"a","n":2}`)
+	seed(t, cs, `{"id":"a","n":3}`)
+
+	docPath := "/v1/ns/demo%2Fusers/docs/" + first.DocID.String()
+	_, hist := get(t, base, docPath+"/history")
+	versions := hist["versions"].([]any)
+
+	seenValues := map[float64]bool{}
+	for _, raw := range versions {
+		v := raw.(map[string]any)
+		res, body := get(t, base, docPath+"?at="+v["commit"].(string))
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("reading version %v: %d (%v)", v["shortCommit"], res.StatusCode, body)
+		}
+		if body["contentHash"] != v["contentHash"] {
+			t.Errorf("the timeline's hash for %v disagrees with the document read there",
+				v["shortCommit"])
+		}
+		seenValues[body["body"].(map[string]any)["n"].(float64)] = true
+	}
+	for _, want := range []float64{1, 2, 3} {
+		if !seenValues[want] {
+			t.Errorf("version with n=%v was not reachable through the timeline", want)
+		}
+	}
+}
+
+// TestRestoreAVersionThroughTheDocumentEndpoint: "restore this version" needs no new machinery -
+// read the body at that commit and save it, which is an ordinary forward write.
+func TestRestoreAVersionThroughTheDocumentEndpoint(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	first := seed(t, cs, `{"id":"a","n":1}`)[0]
+	seed(t, cs, `{"id":"a","n":2}`)
+	docPath := "/v1/ns/demo%2Fusers/docs/" + first.DocID.String()
+
+	// The oldest version, read back and written forward.
+	_, hist := get(t, base, docPath+"/history")
+	versions := hist["versions"].([]any)
+	oldest := versions[len(versions)-1].(map[string]any)
+	_, old := get(t, base, docPath+"?at="+oldest["commit"].(string))
+	oldBody, err := json.Marshal(old["body"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, current := get(t, base, docPath)
+
+	res, saved := sendJSON(t, http.MethodPut, base, docPath,
+		fmt.Sprintf(`{"body":%s,"ifContentHash":%q}`, oldBody, current["contentHash"]))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("restoring a version: %d (%v)", res.StatusCode, saved)
+	}
+
+	_, after := get(t, base, docPath)
+	if after["body"].(map[string]any)["n"].(float64) != 1 {
+		t.Errorf("the restored version should be current: %v", after["body"])
+	}
+	// And it is a new version rather than a rewind: the timeline grew.
+	_, hist2 := get(t, base, docPath+"/history")
+	if len(hist2["versions"].([]any)) <= len(versions) {
+		t.Error("restoring a version is a forward write and should add to the timeline")
+	}
+}
+
+func TestDocumentTimelineForAnUnknownDocumentIsEmpty(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a"}`)
+	res, body := get(t, base,
+		"/v1/ns/demo%2Fusers/docs/6f9619ff-8b86-d011-b42d-00cf4fc964ff/history")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 with no versions, got %d (%v)", res.StatusCode, body)
+	}
+	if n := len(body["versions"].([]any)); n != 0 {
+		t.Errorf("a document that never existed has no versions, got %d", n)
+	}
+}

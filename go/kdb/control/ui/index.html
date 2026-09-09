@@ -168,7 +168,7 @@ let token = sessionStorage.getItem(TOKEN_KEY) || "";
 // filter, so it lives here and every fetch consults it.
 let state = { ns: null, namespaces: [], tab: "data", commits: [], selected: null, hasMore: false,
               es: null, at: null, canWrite: false,
-              docs: [], docCursor: null, docsMore: false, openDoc: null, editing: null,
+              docs: [], docCursor: null, docsMore: false, openDoc: null, editing: null, timeline: null,
               sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null, settings: null };
 
 async function api(path, opts = {}) {
@@ -296,7 +296,7 @@ async function switchNamespace(id, tab) {
   // Everything view-shaped belongs to the namespace it came from: a cursor, a selected commit or an
   // open document from another one means nothing here.
   Object.assign(state, { commits: [], selected: null, docs: [], docCursor: null, openDoc: null,
-                         editing: null, sqlResult: null, sqlError: null, at: null });
+                         editing: null, timeline: null, sqlResult: null, sqlError: null, at: null });
   await selectTab(tab || state.tab);
 }
 
@@ -427,6 +427,9 @@ function drawDocument(doc) {
           canEdit
             ? el("button", { class: "act", text: "Edit", onclick: () => { state.editing = { text: JSON.stringify(doc.body, null, 2) }; drawDocument(doc); } })
             : null,
+          el("button", { class: "act", text: "History",
+                         title: "every version of this document, with the diff between them",
+                         onclick: () => openTimeline(doc) }),
           canEdit
             ? el("button", { class: "act danger", text: "Delete", onclick: () => deleteDocument(doc) })
             : null,
@@ -504,6 +507,161 @@ async function deleteDocument(doc) {
     flash("Deleted. The document is still readable at any earlier commit.");
   } catch (e) {
     setKids($("docpanel"), el("h2", { text: "Document" }), el("div", { class: "err", text: e.message }));
+  }
+}
+
+// ---- Document timeline --------------------------------------------------------------------
+
+// The timeline is the view that makes a versioned document store worth using directly: every
+// version of one document, the diff between any two, and a way back to an earlier one.
+async function openTimeline(doc) {
+  setKids($("docpanel"), el("h2", { text: "History" }),
+    el("div", { class: "empty", text: "Loading…" }));
+  try {
+    const hist = await api(nsPath("/docs/" + encodeURIComponent(doc.docId) + "/history?limit=50"));
+    state.timeline = { doc, versions: hist.versions || [], note: hist.note, pick: [] };
+    drawTimeline();
+  } catch (e) {
+    setKids($("docpanel"), el("h2", { text: "History" }), el("div", { class: "err", text: e.message }));
+  }
+}
+
+function drawTimeline() {
+  const tl = state.timeline;
+  const rows = tl.versions.map((v, i) => {
+    const chosen = tl.pick.includes(i);
+    const tr = el("tr", { class: "pick" + (chosen ? " sel" : "") },
+      el("td", {}, el("code", { text: v.shortCommit }),
+        chosen ? el("span", { class: "chip ref", text: tl.pick.indexOf(i) === 0 ? "a" : "b" }) : null),
+      el("td", {}, el("span", { class: "chip " + changeChip(v.change), text: v.change }),
+        v.message ? el("div", { class: "muted", style: "font-size:12px", text: v.message }) : null),
+      el("td", { class: "muted" }, formatTime(v.timestamp)),
+      el("td", { class: "muted" }, v.sizeBytes ? formatBytes(v.sizeBytes) : "—"));
+    // Two clicks pick two versions to compare; a third starts over. Comparing arbitrary pairs
+    // matters more than comparing adjacent ones - "what changed since Tuesday" is the real question.
+    tr.addEventListener("click", () => {
+      const at = tl.pick.indexOf(i);
+      if (at >= 0) tl.pick.splice(at, 1);
+      else if (tl.pick.length < 2) tl.pick.push(i);
+      else tl.pick = [i];
+      drawTimeline();
+    });
+    return tr;
+  });
+
+  const actions = el("div", { class: "body", style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center" },
+    el("button", { class: "act", text: "Back to document",
+                   onclick: () => { state.timeline = null; openDocument(tl.doc.docId); } }),
+    tl.pick.length === 2
+      ? el("button", { class: "act", text: "Compare the two", onclick: showVersionDiff })
+      : el("span", { class: "muted", style: "font-size:12px",
+          text: tl.versions.length > 1 ? "pick two versions to compare them" : "" }),
+    tl.pick.length === 1 && state.canWrite && tl.doc.atHead !== false
+      ? el("button", { class: "act danger", text: "Restore this version",
+                       onclick: () => restoreVersion(tl.versions[tl.pick[0]]) })
+      : null);
+
+  setKids($("docpanel"),
+    el("h2", { text: "History of " + tl.doc.docId.slice(0, 8) + "…" }),
+    actions,
+    tl.note ? el("div", { class: "body" }, el("div", { class: "warn", text: tl.note })) : null,
+    tl.versions.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Commit" }), el("th", { text: "Change" }),
+                              el("th", { text: "When" }), el("th", { text: "Size" }))),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty", text: "No versions - this document has never existed here." }),
+    el("div", { id: "versiondiff" }));
+}
+
+function changeChip(change) {
+  return { created: "added", modified: "modified", deleted: "removed" }[change] || "";
+}
+
+// showVersionDiff fetches both bodies and shows the difference key by key. Fetching them rather
+// than carrying every body in the listing keeps the listing the size of the history rather than the
+// size of the data.
+async function showVersionDiff() {
+  const tl = state.timeline;
+  const [i, j] = tl.pick;
+  // Older on the left whichever order they were clicked in: the list is newest-first, so the
+  // larger index is the older version.
+  const older = tl.versions[Math.max(i, j)];
+  const newer = tl.versions[Math.min(i, j)];
+  const target = $("versiondiff");
+  setKids(target, el("div", { class: "empty", text: "Loading both versions…" }));
+  try {
+    const [a, b] = await Promise.all([bodyAt(tl.doc.docId, older), bodyAt(tl.doc.docId, newer)]);
+    setKids(target,
+      el("h2", { text: "Change from " + older.shortCommit + " to " + newer.shortCommit }),
+      el("div", { class: "body" }, fieldDiff(a, b)));
+  } catch (e) {
+    setKids(target, el("div", { class: "err", text: e.message }));
+  }
+}
+
+async function bodyAt(docId, version) {
+  if (version.change === "deleted") return null;
+  const doc = await api(nsPath("/docs/" + encodeURIComponent(docId)) + "?at=" + encodeURIComponent(version.commit));
+  return doc.body;
+}
+
+// fieldDiff compares two document bodies key by key. A whole-text diff would be more general and
+// much less readable for JSON: what an operator wants to know is which fields moved.
+function fieldDiff(a, b) {
+  if (a === null && b === null) return el("div", { class: "muted", text: "absent in both" });
+  if (a === null) return el("div", {}, el("span", { class: "chip added", text: "created" }),
+    el("pre", { class: "doc", text: JSON.stringify(b, null, 2) }));
+  if (b === null) return el("div", {}, el("span", { class: "chip removed", text: "deleted" }),
+    el("pre", { class: "doc", text: JSON.stringify(a, null, 2) }));
+
+  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+  const rows = [];
+  for (const k of keys) {
+    const inA = k in a, inB = k in b;
+    const av = JSON.stringify(a[k]), bv = JSON.stringify(b[k]);
+    if (inA && inB && av === bv) continue;
+    rows.push(el("tr", {},
+      el("td", {}, el("code", { text: k })),
+      el("td", {}, el("span", { class: "chip " + (!inA ? "added" : !inB ? "removed" : "modified"),
+                                text: !inA ? "added" : !inB ? "removed" : "changed" })),
+      el("td", { class: "cell" }, el("code", { text: inA ? av : "—" })),
+      el("td", { class: "cell" }, el("code", { text: inB ? bv : "—" }))));
+  }
+  if (!rows.length) return el("div", { class: "muted", text: "identical" });
+  return el("div", { class: "grid-wrap" }, el("table", {},
+    el("thead", {}, el("tr", {}, el("th", { text: "Field" }), el("th", { text: "" }),
+                        el("th", { text: "Before" }), el("th", { text: "After" }))),
+    el("tbody", {}, rows)));
+}
+
+// restoreVersion writes an old version forward. It is an ordinary save, which means it is a new
+// commit rather than a rewind - and it merges, so the confirmation says which keys will survive.
+async function restoreVersion(version) {
+  const tl = state.timeline;
+  const body = await bodyAt(tl.doc.docId, version);
+  if (body === null) {
+    flash("That version is a deletion; restoring it means deleting the document again.");
+    return;
+  }
+  const current = await api(nsPath("/docs/" + encodeURIComponent(tl.doc.docId)));
+  const kept = Object.keys(current.body || {}).filter((k) => !(k in body));
+  const warning = kept.length
+    ? "\n\nA write merges, so these keys would be kept rather than removed: " + kept.join(", ")
+    : "";
+  if (!confirm("Restore the version at " + version.shortCommit + "?\n\nThis writes a new commit; "
+      + "nothing in history is rewritten." + warning)) return;
+  try {
+    const saved = await api(nsPath("/docs/" + encodeURIComponent(tl.doc.docId)), {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body, ifContentHash: current.contentHash }),
+    });
+    state.timeline = null;
+    await renderData();
+    await openDocument(tl.doc.docId);
+    flash("Restored " + version.shortCommit + " as commit " + (saved.commit || "").slice(0, 8) + ".");
+  } catch (e) {
+    flash("Restore failed: " + e.message);
   }
 }
 

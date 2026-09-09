@@ -242,6 +242,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/ns/{ns}/refs", s.nsRead(s.handleRefs))
 	mux.Handle("GET /v1/ns/{ns}/docs", s.nsRead(s.handleDocuments))
 	mux.Handle("GET /v1/ns/{ns}/docs/{id}", s.nsRead(s.handleDocument))
+	mux.Handle("GET /v1/ns/{ns}/docs/{id}/history", s.nsRead(s.handleDocumentHistory))
 	mux.Handle("POST /v1/ns/{ns}/sql", s.nsRead(s.handleSQL))
 	mux.Handle("GET /v1/ns/{ns}/events", s.nsRead(s.handleEvents))
 
