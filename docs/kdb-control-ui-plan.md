@@ -21,7 +21,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | | Milestone | State |
 |---|---|---|
 | M0 | Foundations | **done** — control plane, auth, SSE hub, embedded UI, and the multi-namespace host: the service opens the data root through `embed.Host` and the control plane serves every namespace it finds |
-| M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, and a read-only SQL console |
+| M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, a read-only SQL console, and the lane-assigned commit graph |
 | M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
 | M3 | Writes | **done** — DML and DDL through the SQL console, and per-document edit and delete with compare-and-set on the content hash |
 | M4 | Rollback | **done** — namespace revert with plan/apply and `expectHead`, plus the per-document timeline with field-level diffs and per-version restore |
@@ -53,6 +53,10 @@ Recovery adds `GET /v1/ns/{ns}/integrity`, `POST /v1/ns/{ns}/integrity/verify`,
 `GET /v1/ns/{ns}/checkpoints`, `GET /v1/ns/{ns}/maintenance/plan`, `GET /v1/ns/{ns}/backups`,
 `POST /v1/ns/{ns}/backups`, `POST /v1/ns/{ns}/backups/{id}/verify`,
 `POST /v1/ns/{ns}/restore/staging`, and `GET|POST /v1/restore/staging[/{jobId}[/attach|/detach]]`.
+`GET /v1/ns/{ns}/log` takes `?graph=true`, which adds a lane per commit. It is refused for a
+partial walk (`skip != 0`): a lane number only means something relative to the head it was walked
+from, so the client widens its window and re-walks rather than appending a separately-laned page.
+
 The timeline adds `GET /v1/ns/{ns}/docs/{id}/history`; the diff between two versions is composed in
 the client from two `?at=` reads rather than a second endpoint, so there is one way to read a
 document at a revision rather than two that could disagree.
@@ -69,7 +73,7 @@ consistent point across every namespace, which is its own piece of work.
 |---|---|---|
 | 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, editing with compare-and-set, delete, and readable at any revision |
 | 2 | SQL console | **built** — SELECT reports the access path and rows examined; DML and DDL are gated on `--control-write` *and* a write grant, and report the commit they produced |
-| 3 | Commit graph | **partial** — a flat, paged list with parent and ref badges. There is no lane assignment, so it is a log, not a graph; a merge is flagged with a chip rather than drawn |
+| 3 | Commit graph | **built** — lane-assigned DAG drawing: verticals for every branch alive at a row, a curve per extra parent, filled nodes for merges, and a gutter of fixed width so it does not shift while scrolling. Lanes come from the server (`?graph=true`) over one whole walk |
 | 4 | Document timeline | **built** — every version of one document, a field-level diff between any two, and restore-this-version as a forward write |
 | 5 | Branches & tags | **partial** — lists only; a tag row is a shortcut into time travel |
 | 6 | Time travel | **built** |
@@ -86,8 +90,7 @@ consistent point across every namespace, which is its own piece of work.
 2. **Promotion.** Swapping a staged copy in for the live data directory needs the process stopped,
    so it is a supervised-restart flow (§8.4) rather than an endpoint. The staged copy and the
    generated commands are both in place; what is missing is the drain-and-restart contract.
-3. **A real commit graph (§9 screen 3).** Lane assignment, so the log becomes a graph.
-4. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
+3. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
    commit: a `WriteOp` is merged on the way in, and a `DeleteOp` in the same transaction does not
    help because staging reads every operation against the baseline tree rather than against each
    other. The editor and the restore-a-version confirmation both tell the operator which keys will
@@ -945,8 +948,11 @@ saved queries and dashboards.
 - **Python e2e** (`kdb-integration/e2e/`, which the finish-up plan already wants extended): launch
   `kdb-service --control-addr`, drive the API end to end, assert the commit log reflects the UI's
   writes. This also finally gives the harness a server lifecycle, which it does not have today.
-- **UI tests**: component tests for the graph lane assignment (pure function, worth unit-testing
-  hard) and diff rendering; one Playwright smoke path — connect, browse, time travel, revert with
+- **UI tests**: lane assignment is a pure Go function tested on shapes rather than pixels
+  (`go/kdb/control/graph_test.go`: linear, merge, converging branches, octopus, disjoint roots,
+  lane reuse, a truncated walk, and a property check over a generated history) — a wrong lane still
+  looks like a graph in a screenshot, so it cannot be verified by eye. Still to do: diff rendering
+  and one Playwright smoke path — connect, browse, time travel, revert with
   preview — run against a real service in CI.
 - **Settings tests**: provenance is asserted for each precedence path (default → file → env →
   flag), a deliberately-typo'd `KDB_*` variable produces a warning rather than silence, every

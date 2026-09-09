@@ -10,6 +10,8 @@
     --bg: #fbfbfa; --panel: #fff; --border: #e3e1dd; --text: #1f1e1c; --muted: #6b6862;
     --accent: #3f6ad8; --added: #2f8a4f; --modified: #b07d1a; --removed: #c0392b;
     --chip: #f0eeea; --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    /* One log row, and so one row of the commit graph. */
+    --row-h: 30px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -88,6 +90,21 @@
                  padding: 8px; border: 1px solid var(--border); border-radius: 6px;
                  background: var(--bg); color: var(--text); resize: vertical; }
   .grid-wrap { overflow-x: auto; }
+  /* The graph gutter has to line up with the rows beside it, so the log table's row height is
+     fixed here and read back by the renderer (--row-h) rather than guessed in two places. A commit
+     is one line: a wrapping message would change a row's height and break the verticals. */
+  table.log tbody tr { height: var(--row-h); }
+  /* No row rules in the log: the border would add a pixel to the row pitch that the gutter's SVG
+     cannot span, leaving a hairline break in every vertical. The graph itself separates the rows. */
+  table.log tbody td { padding-top: 0; padding-bottom: 0; border-bottom: none; }
+  table.log td.msg { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.graph { padding: 0 0 0 10px; vertical-align: middle; width: 1px; white-space: nowrap; }
+  /* Visible overflow so a row's verticals can be drawn slightly past its box and meet the next
+     row's despite sub-pixel row heights - see BLEED. */
+  svg.lanes { display: block; overflow: visible; }
+  svg.lanes .edge { stroke: var(--border); stroke-width: 2; fill: none; }
+  svg.lanes .node { fill: var(--panel); stroke: var(--accent); stroke-width: 2; }
+  svg.lanes .node.merge { fill: var(--accent); }
   td.cell { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   pre.doc { margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 12px;
             white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -166,7 +183,7 @@ const TOKEN_KEY = "kdb.control.token";
 let token = sessionStorage.getItem(TOKEN_KEY) || "";
 // `at` is the revision every view reads at: null means head. It is a mode rather than a per-view
 // filter, so it lives here and every fetch consults it.
-let state = { ns: null, namespaces: [], tab: "data", commits: [], selected: null, hasMore: false,
+let state = { ns: null, namespaces: [], tab: "data", commits: [], graph: [], selected: null, hasMore: false,
               es: null, at: null, canWrite: false,
               docs: [], docCursor: null, docsMore: false, openDoc: null, editing: null, timeline: null,
               sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null, settings: null };
@@ -295,8 +312,9 @@ async function switchNamespace(id, tab) {
   renderNamespacePicker();
   // Everything view-shaped belongs to the namespace it came from: a cursor, a selected commit or an
   // open document from another one means nothing here.
-  Object.assign(state, { commits: [], selected: null, docs: [], docCursor: null, openDoc: null,
-                         editing: null, timeline: null, sqlResult: null, sqlError: null, at: null });
+  Object.assign(state, { commits: [], graph: [], selected: null, docs: [], docCursor: null,
+                         openDoc: null, editing: null, timeline: null, sqlResult: null,
+                         sqlError: null, at: null });
   await selectTab(tab || state.tab);
 }
 
@@ -758,24 +776,31 @@ function renderCell(cell) {
   return String(cell);
 }
 
-async function renderCommits(append = false) {
-  const skip = append ? state.commits.length : 0;
+// Lane numbers only mean something relative to the walk that produced them, so "load more" widens
+// the window and re-walks from the same head rather than fetching an independently-laned page and
+// appending it. Re-walking costs a little; splicing two lane assignments together would draw lines
+// that jump sideways at the seam.
+async function renderCommits(more = false) {
+  const want = Math.min(more ? state.commits.length + COMMIT_PAGE : COMMIT_PAGE, COMMIT_WINDOW_MAX);
   const from = state.at ? "&from=" + encodeURIComponent(state.at) : "";
-  const page = await api(nsPath("/log?limit=50&skip=" + skip + from));
-  state.commits = append ? state.commits.concat(page.commits) : page.commits;
+  const page = await api(nsPath("/log?graph=true&limit=" + want + from));
+  state.commits = page.commits || [];
+  state.graph = page.graph || [];
   state.hasMore = page.hasMore;
   $("head").textContent = page.from ? page.from.slice(0, 8) : "";
   drawCommits();
 }
 
 function drawCommits() {
-  const rows = state.commits.map((c) => {
+  const rows = state.commits.map((c, i) => {
     const tr = el("tr", { class: "pick" + (state.selected && state.selected.hash === c.hash ? " sel" : "") },
+      laneCell(state.graph[i], laneIsLiveAbove(i), (c.parents || []).length > 0),
       el("td", {}, el("code", { text: c.shortHash }),
         // A merge is the one structural fact a flat list loses, so it is called out explicitly.
         c.parents && c.parents.length > 1 ? el("span", { class: "chip", text: "merge" }) : null,
         c.stub ? el("span", { class: "chip", text: "archived" }) : null),
-      el("td", {}, c.message || el("span", { class: "muted", text: "(no message)" }),
+      el("td", { class: "msg", title: c.message || "" },
+        c.message || el("span", { class: "muted", text: "(no message)" }),
         ...(c.refs || []).map((r) => el("span", { class: "chip ref", text: r }))),
       el("td", { class: "muted" }, formatTime(c.timestamp)),
       // -1 means the operations were evicted under the retention budget and the count is not
@@ -788,14 +813,24 @@ function drawCommits() {
   const list = el("div", { class: "card" },
     el("h2", { text: "Commits" }),
     rows.length
-      ? el("table", {},
-          el("thead", {}, el("tr", {}, el("th", { text: "Commit" }), el("th", { text: "Message" }),
+      ? el("table", { class: "log" },
+          el("thead", {}, el("tr", {}, el("th", { text: "" }), el("th", { text: "Commit" }),
+                              el("th", { text: "Message" }),
                               el("th", { text: "When" }), el("th", { text: "Ops" }))),
           el("tbody", {}, rows))
       : el("div", { class: "empty", text: "No commits yet." }),
     state.hasMore
       ? el("div", { class: "body" },
-          el("button", { class: "act", text: "Load more", onclick: () => renderCommits(true) }))
+          state.commits.length < COMMIT_WINDOW_MAX
+            ? el("button", { class: "act", text: "Load more", onclick: () => renderCommits(true) })
+            // At the cap the honest move is to say why the button is gone. Appending a separately
+            // laned page would put a seam in the drawing, so the way further back is to move the
+            // window: read at an older revision and walk from there.
+            : el("span", { class: "muted", style: "font-size:12px",
+                text: "Showing the deepest graph one walk can draw (" + COMMIT_WINDOW_MAX +
+                      " commits). To go further back, read at an older revision — e.g. " +
+                      state.commits[state.commits.length - 1].shortHash +
+                      " — in the revision box above." }))
       : null);
 
   const detail = el("div", { class: "card", id: "detail" },
@@ -807,6 +842,80 @@ function drawCommits() {
     el("div", { class: "col" }, detail)));
 
   if (state.selected) drawDetail(state.selected);
+}
+
+// laneCell draws one row of the graph: the verticals for every branch alive here, a node for this
+// commit, and a line per extra parent leaving it.
+//
+// SVG rather than box-drawing characters because a merge is a diagonal, and because the node has to
+// line up with a table row of arbitrary height. Each row is its own little SVG, so a row can be
+// re-rendered without redrawing the graph.
+const LANE_W = 14, DOT = 4;
+// Read from CSS so the drawing and the table cannot disagree about how tall a row is. A mismatch of
+// even a few pixels leaves a visible break in every vertical line.
+const ROW_H = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--row-h")) || 30;
+// How far past its own row each vertical is drawn. A table row's real height is not exactly --row-h
+// - browsers distribute sub-pixel remainders across rows - and a fraction of a pixel of daylight
+// between two segments reads as a broken line. Overdrawing costs nothing, because what is drawn
+// over is the continuation of the same line.
+const BLEED = 2;
+// How many commits a page asks for, and how much wider each "load more" makes the window.
+const COMMIT_PAGE = 50;
+// The server will walk at most this many commits in one request, and the graph needs one whole walk
+// (see handleLog), so this is also the deepest graph the window can show. Past it the reader moves
+// the window instead of growing it, by reading at an older revision.
+const COMMIT_WINDOW_MAX = 500;
+
+// Whether this row's lane already has a line running into it from the row above. It does if the row
+// above continued into it, passed a line through it, or bent a merge into it.
+//
+// A truncated walk is deliberately not a special case: a commit whose parent is off the page still
+// has parents, so its line continues to the bottom edge and the drawing says "there is more below"
+// rather than "history ends here".
+function laneIsLiveAbove(i) {
+  if (i === 0) return false;
+  const prev = state.graph[i - 1], row = state.graph[i];
+  if (!prev || !row) return false;
+  const above = state.commits[i - 1];
+  if (prev.lane === row.lane && (above.parents || []).length > 0) return true;
+  return (prev.through || []).includes(row.lane) || (prev.merges || []).includes(row.lane);
+}
+
+function laneCell(row, up, down) {
+  if (!row) return el("td", { class: "graph" });
+  const w = Math.max(1, row.width) * LANE_W;
+  const x = (lane) => lane * LANE_W + LANE_W / 2;
+  const mid = ROW_H / 2;
+  const parts = [];
+
+  // Branches that exist here but have nothing to say at this commit: a full-height vertical, so
+  // the line does not break wherever another branch has no commit.
+  for (const lane of row.through || []) {
+    parts.push(`<line class="edge" x1="${x(lane)}" y1="${-BLEED}" x2="${x(lane)}" y2="${ROW_H + BLEED}"/>`);
+  }
+  // This commit's own lane. Both halves are conditional: a tip has nothing entering it from above
+  // (the head, or a branch head no lane was waiting for), and a root has nothing leaving it below.
+  // Drawing them unconditionally leaves lines dangling off the top and bottom of the gutter.
+  if (up) {
+    parts.push(`<line class="edge" x1="${x(row.lane)}" y1="${-BLEED}" x2="${x(row.lane)}" y2="${mid}"/>`);
+  }
+  if (down) {
+    parts.push(`<line class="edge" x1="${x(row.lane)}" y1="${mid}" x2="${x(row.lane)}" y2="${ROW_H + BLEED}"/>`);
+  }
+  // Each extra parent leaves the node and bends down into its own lane.
+  for (const lane of row.merges || []) {
+    parts.push(`<path class="edge" d="M ${x(row.lane)} ${mid} C ${x(row.lane)} ${ROW_H}, ` +
+               `${x(lane)} ${mid}, ${x(lane)} ${ROW_H + BLEED}"/>`);
+  }
+  const merge = (row.merges || []).length > 0;
+  parts.push(`<circle class="node${merge ? " merge" : ""}" cx="${x(row.lane)}" cy="${mid}" r="${DOT}"/>`);
+
+  const td = el("td", { class: "graph" });
+  // Built as markup because it is a fixed set of shapes with no user-supplied text in it - every
+  // value here is a number this function computed.
+  td.innerHTML = `<svg class="lanes" width="${w}" height="${ROW_H}" viewBox="0 0 ${w} ${ROW_H}">` +
+    parts.join("") + `</svg>`;
+  return td;
 }
 
 async function showCommit(hash) {

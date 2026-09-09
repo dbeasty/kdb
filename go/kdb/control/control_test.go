@@ -2548,3 +2548,53 @@ func TestDocumentTimelineForAnUnknownDocumentIsEmpty(t *testing.T) {
 		t.Errorf("a document that never existed has no versions, got %d", n)
 	}
 }
+
+func TestLogServesGraphLanes(t *testing.T) {
+	cs, base := newFixture(t)
+	seed(t, cs, `{"id":"a"}`, `{"id":"b"}`, `{"id":"c"}`)
+
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/log?graph=true")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("log with graph: %d (%v)", res.StatusCode, body)
+	}
+	rows, ok := body["graph"].([]any)
+	if !ok {
+		t.Fatalf("graph=true must return lanes: %v", body["graph"])
+	}
+	commits := body["commits"].([]any)
+	if len(rows) != len(commits) {
+		t.Fatalf("one lane row per commit: %d rows, %d commits", len(rows), len(commits))
+	}
+	// A linear history is one column, and the gutter says so.
+	for i, raw := range rows {
+		r := raw.(map[string]any)
+		if r["lane"].(float64) != 0 {
+			t.Errorf("row %d of a linear history should be lane 0, got %v", i, r["lane"])
+		}
+		if r["width"].(float64) != 1 {
+			t.Errorf("row %d: a linear history needs a gutter of 1, got %v", i, r["width"])
+		}
+	}
+
+	// Without the flag the lanes are absent rather than empty, so a client cannot mistake "not
+	// asked for" for "no graph".
+	_, plain := get(t, base, "/v1/ns/demo%2Fusers/log")
+	if _, present := plain["graph"]; present {
+		t.Error("lanes should only be computed when asked for")
+	}
+}
+
+// TestGraphIsRefusedForAPartialWalk: a lane number means "this branch, relative to this walk", so
+// a page starting partway in would draw columns unrelated to the page above it.
+func TestGraphIsRefusedForAPartialWalk(t *testing.T) {
+	cs, base := newFixture(t)
+	seed(t, cs, `{"id":"a"}`, `{"id":"b"}`, `{"id":"c"}`)
+
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/log?graph=true&skip=1")
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 for lanes on a partial walk, got %d (%v)", res.StatusCode, body)
+	}
+	if !strings.Contains(fmt.Sprint(body["error"]), "skip=0") {
+		t.Errorf("the refusal should say what to do instead: %v", body["error"])
+	}
+}

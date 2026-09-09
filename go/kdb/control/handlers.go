@@ -165,7 +165,7 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		writeError(w, http.StatusInternalServerError, "walk_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"namespace": ns,
 		"from":      from.Hex(),
 		"commits":   commits,
@@ -173,7 +173,26 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		// The next page is expressed as a skip rather than a cursor because the traversal has no
 		// stable ordinal to resume from; see log's own comment.
 		"nextSkip": skip + len(commits),
-	})
+	}
+	// Lanes are only meaningful for a window anchored at the head that was walked: a lane number
+	// says "this branch, relative to this walk". Computing them for a page that starts partway in
+	// would give a drawing whose columns bear no relation to the page above it, so they are offered
+	// only from the start of a walk and the client re-requests a larger window instead of appending.
+	if r.URL.Query().Get("graph") == "true" {
+		if skip != 0 {
+			writeError(w, http.StatusBadRequest, "graph_needs_a_whole_walk",
+				"lanes are computed relative to the head they were walked from, so they can only be "+
+					"produced for a window starting at skip=0. Request a larger limit instead of "+
+					"paging, or drop graph=true.")
+			return
+		}
+		inputs := make([]graphInput, 0, len(commits))
+		for _, c := range commits {
+			inputs = append(inputs, graphInput{Hash: c.Hash, Parents: c.Parents})
+		}
+		body["graph"] = assignLanes(inputs)
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
