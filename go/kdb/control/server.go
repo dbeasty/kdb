@@ -258,6 +258,9 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}", s.nsRead(s.handleCommit))
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}/diff", s.nsRead(s.handleCommitDiff))
 	mux.Handle("GET /v1/ns/{ns}/refs", s.nsRead(s.handleRefs))
+	// Compare is a read: "what is different between these two points" is the one git-viewer
+	// question the commit log cannot answer, and asking it changes nothing.
+	mux.Handle("GET /v1/ns/{ns}/compare", s.nsRead(s.handleCompare))
 	mux.Handle("GET /v1/ns/{ns}/docs", s.nsRead(s.handleDocuments))
 	mux.Handle("GET /v1/ns/{ns}/docs/{id}", s.nsRead(s.handleDocument))
 	mux.Handle("GET /v1/ns/{ns}/docs/{id}/history", s.nsRead(s.handleDocumentHistory))
@@ -278,6 +281,10 @@ func (s *Server) routes() http.Handler {
 	// applying is gated.
 	mux.Handle("PUT /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handlePutDocument))
 	mux.Handle("DELETE /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handleDeleteDocument))
+	mux.Handle("POST /v1/ns/{ns}/refs/branches", s.nsWrite(s.handleCreateBranch))
+	mux.Handle("DELETE /v1/ns/{ns}/refs/branches/{name}", s.nsWrite(s.handleDeleteBranch))
+	mux.Handle("POST /v1/ns/{ns}/refs/tags", s.nsWrite(s.handleCreateTag))
+	mux.Handle("DELETE /v1/ns/{ns}/refs/tags/{name}", s.nsWrite(s.handleDeleteTag))
 
 	// Recovery. Verifying and backing up are reads of the log and need no write permission: an
 	// operator must always be able to find out whether their data is intact and take a copy of it.

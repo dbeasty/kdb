@@ -189,7 +189,8 @@ let token = sessionStorage.getItem(TOKEN_KEY) || "";
 let state = { ns: null, namespaces: [], tab: "data", commits: [], graph: [], selected: null, hasMore: false,
               es: null, at: null, canWrite: false,
               docs: [], docCursor: null, docsMore: false, openDoc: null, editing: null, timeline: null,
-              sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null, settings: null };
+              sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null, settings: null,
+              compare: null };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -261,10 +262,16 @@ function enterAt(spec, label) {
   selectTab(state.tab);
 }
 
+// isStagedNs: a staged restore is a second, read-only view of a database, and three places have to
+// know the difference. Asked once here rather than by comparing prefixes at each of them.
+function isStagedNs(ns) {
+  return typeof ns === "string" && ns.startsWith("staged/");
+}
+
 function exitAt() {
   // On a staged copy the bar's button means "leave the copy"; on a live namespace it means
   // "return to head". One button, because the operator only ever wants out of whatever they are in.
-  if (typeof state.ns === "string" && state.ns.startsWith("staged/")) {
+  if (isStagedNs(state.ns)) {
     const live = (state.namespaces.find((n) => n.default) || state.namespaces[0] || {}).id;
     if (live) { switchNamespace(live); return; }
   }
@@ -292,7 +299,7 @@ function renderNamespacePicker() {
 // revision are different situations - a different database versus a different point in time - and
 // both have to be impossible to miss, so they share the bar but not the wording.
 function drawBanner() {
-  const staged = typeof state.ns === "string" && state.ns.startsWith("staged/");
+  const staged = isStagedNs(state.ns);
   const bar = $("timebar");
   bar.hidden = !staged && !state.at;
   if (bar.hidden) return;
@@ -317,7 +324,7 @@ async function switchNamespace(id, tab) {
   // open document from another one means nothing here.
   Object.assign(state, { commits: [], graph: [], selected: null, docs: [], docCursor: null,
                          openDoc: null, editing: null, timeline: null, sqlResult: null,
-                         sqlError: null, at: null });
+                         sqlError: null, at: null, compare: null });
   await selectTab(tab || state.tab);
 }
 
@@ -1023,30 +1030,184 @@ function drawDetail(sel) {
 async function renderRefs() {
   const r = await api(nsPath("/refs"));
   $("head").textContent = r.head ? r.head.slice(0, 8) : "";
-  setMain(el("div", { class: "row" },
-    el("div", { class: "col" }, el("div", { class: "card" },
-      el("h2", { text: "Branches" }),
-      r.branches.length
-        ? el("table", {},
-            el("thead", {}, el("tr", {}, el("th", { text: "Branch" }), el("th", { text: "Head" }), el("th", { text: "Updated" }))),
-            el("tbody", {}, r.branches.map((b) => el("tr", {},
-              el("td", {}, b.name, b.head === r.head ? el("span", { class: "chip ref", text: "HEAD" }) : null),
-              el("td", {}, el("code", { text: b.shortHead })),
-              el("td", { class: "muted" }, formatTime(b.updatedAt))))))
-        : el("div", { class: "empty", text: "No branches." }))),
-    el("div", { class: "col" }, el("div", { class: "card" },
-      el("h2", { text: "Tags" }),
-      r.tags.length
-        ? el("table", {},
-            el("thead", {}, el("tr", {}, el("th", { text: "Tag" }), el("th", { text: "Commit" }),
-                                el("th", { text: "Created" }))),
-            el("tbody", {}, r.tags.map((t) => el("tr", { class: "pick",
-                onclick: () => enterAt("tag:" + t.name, "tag:" + t.name) },
-              el("td", {}, t.name,
-                t.message ? el("div", { class: "muted", style: "font-size:12px", text: t.message }) : null),
-              el("td", {}, el("code", { text: t.shortHead })),
-              el("td", { class: "muted" }, formatTime(t.updatedAt))))))
-        : el("div", { class: "empty", text: "No tags." })))));
+  const canWrite = state.canWrite && !isStagedNs(state.ns);
+
+  const mutate = async (path, opts, what) => {
+    try {
+      const res = await api(nsPath(path), opts);
+      await renderRefs();
+      flash(what + (res.note ? " — " + res.note : ""));
+    } catch (e) {
+      flash(what.replace(/\.$/, "") + " failed: " + e.message);
+    }
+  };
+
+  const createRow = (kind, placeholder) => {
+    const name = el("input", { type: "text", placeholder: placeholder, style: "width:150px" });
+    const at = el("input", { type: "text", placeholder: state.at || "head",
+                             style: "width:150px", title: "any revision: a hash, head~3, tag:v1" });
+    const go = () => {
+      const body = kind === "tags"
+        ? { name: name.value, at: at.value.trim() || state.at || "" }
+        : { name: name.value, from: at.value.trim() || state.at || "" };
+      mutate("/refs/" + kind, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }, "Created " + (kind === "tags" ? "tag " : "branch ") + name.value + ".");
+    };
+    name.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+    return el("div", { class: "body", style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
+      name, el("span", { class: "muted", style: "font-size:12px", text: "at" }), at,
+      el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Create", onclick: go }));
+  };
+
+  const del = (kind, name, extra) => () => {
+    if (!confirm("Delete " + (kind === "tags" ? "tag " : "branch ") + name + "?\n\n"
+        + "Every commit it points at stays in the log and stays reachable by hash." + (extra || ""))) return;
+    mutate("/refs/" + kind + "/" + encodeURIComponent(name), { method: "DELETE" },
+           "Deleted " + name + ".");
+  };
+
+  const branches = el("div", { class: "card" },
+    el("h2", { text: "Branches" }),
+    r.branches.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Branch" }), el("th", { text: "Head" }),
+                              el("th", { text: "Updated" }), el("th", { text: "" }))),
+          el("tbody", {}, r.branches.map((b) => el("tr", {},
+            el("td", {}, b.name, b.head === r.head ? el("span", { class: "chip ref", text: "HEAD" }) : null),
+            el("td", {}, el("code", { text: b.shortHead })),
+            el("td", { class: "muted" }, formatTime(b.updatedAt)),
+            el("td", {},
+              el("button", { class: "act", style: "padding:2px 8px;font-size:12px",
+                text: "Compare", title: "what is different between this branch and where you are reading",
+                onclick: () => compareRefs(b.name, state.at || "head") }),
+              // main is refused by the graph itself - it is the branch that must always exist -
+              // so it is not offered here either.
+              canWrite && b.name !== "main"
+                ? el("button", { class: "act danger", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                    text: "Delete", onclick: del("branches", b.name) })
+                : null)))))
+      : el("div", { class: "empty", text: "No branches." }),
+    canWrite ? createRow("branches", "new branch name") : null);
+
+  const tags = el("div", { class: "card" },
+    el("h2", { text: "Tags" }),
+    r.tags.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Tag" }), el("th", { text: "Commit" }),
+                              el("th", { text: "Created" }), el("th", { text: "" }))),
+          el("tbody", {}, r.tags.map((t) => el("tr", {},
+            el("td", {}, t.name,
+              t.message ? el("div", { class: "muted", style: "font-size:12px", text: t.message }) : null),
+            el("td", {}, el("code", { text: t.shortHead })),
+            el("td", { class: "muted" }, formatTime(t.updatedAt)),
+            el("td", {},
+              el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Read at",
+                title: "time-travel every view to this tag",
+                onclick: () => enterAt("tag:" + t.name, "tag:" + t.name) }),
+              el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                text: "Compare", onclick: () => compareRefs("tag:" + t.name, state.at || "head") }),
+              canWrite
+                ? el("button", { class: "act danger", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                    text: "Delete",
+                    onclick: del("tags", t.name,
+                      "\n\nA tag is also a retention root: deleting it lets compaction squash the "
+                      + "commit it named, unless something else retains it.") })
+                : null)))))
+      : el("div", { class: "empty", text: "No tags." }),
+    canWrite ? createRow("tags", "new tag name") : null);
+
+  setMain(
+    el("div", { class: "row" },
+      el("div", { class: "col" }, branches),
+      el("div", { class: "col" }, tags)),
+    el("div", { style: "height:12px" }),
+    compareSection(),
+    canWrite
+      ? el("div", { class: "body muted", style: "font-size:12px" },
+          "A ref is not a commit. Branches and tags are recorded in this namespace's checkpoint, " +
+          "written on a clean shutdown and after a full replay — so one created here survives a " +
+          "normal restart, and a kill -9 before the next checkpoint would lose it. The commits " +
+          "they name are in the delta log and cannot be lost.")
+      : null);
+}
+
+// compareSection is the two-revision diff: the git-viewer question the commit log cannot answer.
+function compareSection() {
+  const from = el("input", { type: "text", placeholder: "tag:v1", style: "width:170px" });
+  const to = el("input", { type: "text", placeholder: state.at || "head", style: "width:170px" });
+  const out = el("div", {});
+  if (state.compare) {
+    from.value = state.compare.fromSpec || "";
+    to.value = state.compare.toSpec || "";
+    setKids(out, compareResult(state.compare));
+  }
+  const run = async () => {
+    try {
+      state.compare = await api(nsPath("/compare?from=" + encodeURIComponent(from.value.trim()) +
+                                       "&to=" + encodeURIComponent(to.value.trim() || "head")));
+      setKids(out, compareResult(state.compare));
+    } catch (e) {
+      state.compare = null;
+      setKids(out, el("div", { class: "err", text: e.message }));
+    }
+  };
+  for (const box of [from, to]) {
+    box.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Compare" }),
+    el("div", { class: "body muted", style: "padding-bottom:0;font-size:12px" },
+      "Any two revisions — a hash, a branch, a tag, head~3. This is a document-identity diff " +
+      "between the two points, not the list of commits between them."),
+    el("div", { class: "body", style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
+      from, el("span", { class: "muted", style: "font-size:12px", text: "→" }), to,
+      el("button", { class: "act", text: "Compare", onclick: run })),
+    out);
+}
+
+// RELATIONSHIP_HELP says what the relationship means for the diff being read, because the same
+// entries mean different things depending on it.
+const RELATIONSHIP_HELP = {
+  same: "the same commit — nothing to compare",
+  ahead: "the second point's history contains the first, so this is what has landed since",
+  behind: "the first point's history contains the second, so this is what the second is missing",
+  diverged: "neither contains the other: these are two branches that would need a merge",
+};
+
+function compareResult(c) {
+  const rel = c.relationship;
+  return el("div", {},
+    el("div", { class: "body", style: "padding-top:0" },
+      el("code", { text: (c.from || "").slice(0, 8) }), " → ",
+      el("code", { text: (c.to || "").slice(0, 8) }),
+      rel ? el("span", { class: "chip", style: "margin-left:8px",
+                         title: RELATIONSHIP_HELP[rel] || "", text: rel }) : null,
+      el("div", { class: "muted", style: "font-size:12px;margin-top:4px",
+                  text: RELATIONSHIP_HELP[rel] || "" }),
+      el("div", { style: "margin-top:6px" },
+        el("span", { class: "chip added", text: (c.counts.added || 0) + " added" }), " ",
+        el("span", { class: "chip modified", text: (c.counts.modified || 0) + " modified" }), " ",
+        el("span", { class: "chip removed", text: (c.counts.removed || 0) + " removed" }))),
+    (c.entries || []).length
+      ? el("div", { class: "scroll", style: "max-height:320px" },
+          el("table", {}, el("tbody", {}, c.entries.map((e) => el("tr", { class: "pick",
+              onclick: () => switchNamespace(state.ns, "data").then(() => openDocument(e.docId)) },
+            el("td", {}, el("span", { class: "chip " + e.change, text: e.change })),
+            el("td", {}, el("code", { text: e.docId })))))))
+      : el("div", { class: "empty", text: "These two points hold the same documents." }));
+}
+
+async function compareRefs(fromSpec, toSpec) {
+  try {
+    state.compare = await api(nsPath("/compare?from=" + encodeURIComponent(fromSpec) +
+                                     "&to=" + encodeURIComponent(toSpec)));
+  } catch (e) {
+    flash("Compare failed: " + e.message);
+    return;
+  }
+  await renderRefs();
 }
 
 async function renderSchema() {

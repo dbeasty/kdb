@@ -25,7 +25,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
 | M3 | Writes | **done** — DML and DDL through the SQL console, per-document edit and delete with compare-and-set on the content hash, and `replace` for a write that removes the keys it omits |
 | M4 | Rollback | **done** — namespace revert with plan/apply and `expectHead`, plus the per-document timeline with field-level diffs and per-version restore |
-| M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
+| M5 | Refs and ops | **partial** — branches and tags now create, delete and compare, with the checkpoint-durability caveat stated on every mutation; ops is still one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
 | M6b | Settings (mutation) | **done** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting, and `persist:true` writes the change back to the `--config` file atomically, refusing per key when the file cannot hold it or when a flag or environment variable would outrank it |
 | M7 | Recovery | **done** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, restore-to-staging with read-only attach, promotion of a staged restore across a supervised restart, and generated commands for the offline tier |
@@ -58,8 +58,19 @@ back to the `--config` file; `/v1/settings/{key}` and `/v1/settings/drift` are i
 particular change will survive a restart *before* it is made, rather than after. Nothing is declared-but-unbuilt any more: an endpoint from §8
 that does not exist simply answers 404.
 
-**Not started:** per-commit document diff (`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/policy`, `/indexes`,
-`/ops/sessions|leases|peers|metrics` and `POST /v1/ops/drain`.
+**Not started:** per-commit document diff (`/commits/{hash}/diff/{docId}`), `/tx`, `/policy`,
+`/indexes`, `/ops/sessions|leases|peers|metrics` and `POST /v1/ops/drain`.
+
+Refs add `POST /v1/ns/{ns}/refs/branches`, `DELETE /v1/ns/{ns}/refs/branches/{name}`,
+`POST /v1/ns/{ns}/refs/tags`, `DELETE /v1/ns/{ns}/refs/tags/{name}`, and
+`GET /v1/ns/{ns}/compare?from=&to=`. The DAG had every one of these operations already; what the
+endpoints add is the part that is not a method call - refusing a name the revision syntax would read
+as something else (`head~2`, a 64-hex string), refusing to move a tag rather than moving it
+silently, and **saying that a ref is durable only as far as the next checkpoint**. A commit is in
+the delta log; a branch or tag lives in the namespace's checkpoint, written on a clean shutdown and
+after a full replay. Verified both ways against a running service: a tag survives a SIGTERM restart
+and is lost to a `kill -9` before the next checkpoint. Every mutation's response says so, and the
+Refs screen repeats it.
 
 Promotion adds `GET /v1/restore/staging/{jobId}/promote/plan`,
 `POST /v1/restore/staging/{jobId}/promote`, and `GET|DELETE /v1/promotion`. The plan is a read on
@@ -92,7 +103,7 @@ consistent point across every namespace, which is its own piece of work.
 | 2 | SQL console | **built** — SELECT reports the access path and rows examined; DML and DDL are gated on `--control-write` *and* a write grant, and report the commit they produced |
 | 3 | Commit graph | **built** — lane-assigned DAG drawing: verticals for every branch alive at a row, a curve per extra parent, filled nodes for merges, and a gutter of fixed width so it does not shift while scrolling. Lanes come from the server (`?graph=true`) over one whole walk |
 | 4 | Document timeline | **built** — every version of one document, a field-level diff between any two, and restore-this-version as a forward write that replaces rather than merges, so the document becomes exactly that version |
-| 5 | Branches & tags | **partial** — lists only; a tag row is a shortcut into time travel |
+| 5 | Branches & tags | **built** — create and delete a branch or tag from any revision, a compare panel over any two revisions reporting how they are related (same / ahead / behind / diverged), and a tag row is still a shortcut into time travel |
 | 6 | Time travel | **built** |
 | 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
 | 8 | Schema & indexes | **partial** — schema only |
@@ -102,15 +113,12 @@ consistent point across every namespace, which is its own piece of work.
 
 ### What to do next, in order
 
-1. **Refs, properly (M5, §9 screen 5).** Create and delete a branch or tag, and `/compare` between
-   two revisions. The lists are there; nothing can be created from the UI, and comparing two points
-   is the one git-viewer question the commit graph cannot answer.
-2. **The operations dashboard (§9 screen 9).** Sessions, leases, peers and metrics, plus
+1. **The operations dashboard (§9 screen 9).** Sessions, leases, peers and metrics, plus
    `POST /v1/ops/drain`. One endpoint reports process and admission state today.
-3. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
+2. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
    documents a commit touched; opening one still means reading it at two revisions by hand.
-4. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
-5. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
+3. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
+4. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
    protocol still ignores it - which is outside this UI's scope and is the reason M2 is partial.
 
 ## 1. What this is

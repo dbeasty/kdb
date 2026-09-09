@@ -3449,3 +3449,226 @@ func TestReplaceIsStillReadableAtEveryEarlierCommit(t *testing.T) {
 		t.Errorf("a replace is a modification of the document, got %q", latest["change"])
 	}
 }
+
+// Refs: creating, deleting, and comparing two of them (M5, §9 screen 5).
+//
+// The DAG has always had CreateBranch/DeleteBranch/CreateTag/DeleteTag. What is tested here is what
+// is not a method call: refusing names that would be read as something else, refusing the deletions
+// that would leave the namespace headless or a tag silently moved, and saying out loud that a ref
+// is durable only as far as the next checkpoint.
+
+func TestCreateAndDeleteATag(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a"}`)
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/tags",
+		`{"name":"v1","message":"first release"}`)
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("create tag: %d (%v)", res.StatusCode, body)
+	}
+	tag := body["tag"].(map[string]any)
+	if tag["name"] != "v1" || tag["message"] != "first release" {
+		t.Errorf("the tag should come back as created: %v", tag)
+	}
+	// The durability caveat has to be said: a commit is in the log, a ref is only in the
+	// checkpoint, and an operator tagging a release needs to know which one they are relying on.
+	note := fmt.Sprint(body["note"])
+	if !strings.Contains(note, "checkpoint") || !strings.Contains(note, "kill -9") {
+		t.Errorf("the response should state the durability caveat: %q", note)
+	}
+	if !strings.Contains(note, "retention root") {
+		t.Errorf("a tag is also a retention root and should say so: %q", note)
+	}
+
+	// It is a real ref: revision resolution finds it.
+	if r, b := get(t, base, "/v1/ns/demo%2Fusers/docs?at=tag:v1"); r.StatusCode != http.StatusOK {
+		t.Fatalf("reading at the new tag: %d (%v)", r.StatusCode, b)
+	}
+	_, refs := get(t, base, "/v1/ns/demo%2Fusers/refs")
+	if !strings.Contains(fmt.Sprint(refs["tags"]), "v1") {
+		t.Errorf("the tag should be listed: %v", refs["tags"])
+	}
+
+	res, body = sendJSON(t, http.MethodDelete, base, "/v1/ns/demo%2Fusers/refs/tags/v1", `{}`)
+	if res.StatusCode != http.StatusOK || body["deleted"] != "v1" {
+		t.Fatalf("delete tag: %d (%v)", res.StatusCode, body)
+	}
+	// Deleting the tag must not be read as deleting anything else.
+	if !strings.Contains(fmt.Sprint(body["note"]), "squashable") {
+		t.Errorf("the response should say what deleting a retention root means: %v", body["note"])
+	}
+	if res, _ := sendJSON(t, http.MethodDelete, base, "/v1/ns/demo%2Fusers/refs/tags/v1", `{}`); res.StatusCode != http.StatusNotFound {
+		t.Errorf("deleting it twice should be a 404, got %d", res.StatusCode)
+	}
+}
+
+// Re-tagging is refused rather than silently moved: a tag that moved would make every reference to
+// it - including a retention decision already taken on it - mean something else.
+func TestRetaggingADifferentCommitIsRefused(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a"}`)
+	if res, b := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/tags", `{"name":"v1"}`); res.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d (%v)", res.StatusCode, b)
+	}
+	seed(t, cs, `{"id":"b"}`)
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/tags", `{"name":"v1"}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409 for a moved tag, got %d (%v)", res.StatusCode, body)
+	}
+	// Re-creating it on the *same* commit is idempotent, not an error: that is a retry.
+	_, refs := get(t, base, "/v1/ns/demo%2Fusers/refs")
+	head := refs["tags"].([]any)[0].(map[string]any)["head"].(string)
+	if res, b := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/tags",
+		`{"name":"v1","at":"`+head+`"}`); res.StatusCode != http.StatusCreated {
+		t.Errorf("re-tagging the same commit should be accepted: %d (%v)", res.StatusCode, b)
+	}
+}
+
+func TestCreateAndDeleteABranch(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a"}`, `{"id":"b"}`)
+
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/branches", `{"name":"feature-x"}`)
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("create branch: %d (%v)", res.StatusCode, body)
+	}
+	if body["branch"].(map[string]any)["name"] != "feature-x" {
+		t.Errorf("branch: %v", body["branch"])
+	}
+	// A branch from an older revision starts there, not at head.
+	res, body = postJSON(t, base, "/v1/ns/demo%2Fusers/refs/branches",
+		`{"name":"from-earlier","from":"head~1"}`)
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("create from head~1: %d (%v)", res.StatusCode, body)
+	}
+	_, refs := get(t, base, "/v1/ns/demo%2Fusers/refs")
+	heads := map[string]string{}
+	for _, raw := range refs["branches"].([]any) {
+		b := raw.(map[string]any)
+		heads[b["name"].(string)] = b["head"].(string)
+	}
+	if heads["from-earlier"] == heads["main"] {
+		t.Errorf("a branch from head~1 should not share main's head: %v", heads)
+	}
+
+	if res, _ := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/branches", `{"name":"feature-x"}`); res.StatusCode != http.StatusConflict {
+		t.Errorf("a duplicate branch name should be a 409, got %d", res.StatusCode)
+	}
+
+	res, body = sendJSON(t, http.MethodDelete, base,
+		"/v1/ns/demo%2Fusers/refs/branches/feature-x", `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("delete branch: %d (%v)", res.StatusCode, body)
+	}
+	if !strings.Contains(fmt.Sprint(body["note"]), "still in the log") {
+		t.Errorf("deleting a branch removes a pointer, not commits, and should say so: %v", body["note"])
+	}
+}
+
+// The default branch is the one that must always exist; deleting it would leave the namespace with
+// no head. Refused as a conflict, not a 404, so it does not read as "no such branch".
+func TestTheDefaultBranchCannotBeDeleted(t *testing.T) {
+	_, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	res, body := sendJSON(t, http.MethodDelete, base, "/v1/ns/demo%2Fusers/refs/branches/main", `{}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409, got %d (%v)", res.StatusCode, body)
+	}
+}
+
+// A name that the revision syntax would read as something else is refused at the door. "head~2" as
+// a branch name, or a 64-hex name, would resolve to a commit everywhere it was read back.
+func TestRefNamesThatWouldBeMisreadAreRefused(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seeded := seed(t, cs, `{"id":"a"}`)
+	_ = seeded
+
+	_, refs := get(t, base, "/v1/ns/demo%2Fusers/refs")
+	hashName := refs["head"].(string)
+
+	for _, name := range []string{"", "  ", "head~2", "with space", "a/b", "tag:v1",
+		"-leading", ".leading", "..", hashName} {
+		payload, _ := json.Marshal(map[string]string{"name": name})
+		res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/tags", string(payload))
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("tag name %q should be refused, got %d (%v)", name, res.StatusCode, body)
+		}
+	}
+	// And a name that is merely unusual is fine: this is not a general-purpose name policy.
+	for _, name := range []string{"v1.2.3", "release_2026", "RC-4"} {
+		payload, _ := json.Marshal(map[string]string{"name": name})
+		if res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/refs/tags", string(payload)); res.StatusCode != http.StatusCreated {
+			t.Errorf("tag name %q should be accepted, got %d (%v)", name, res.StatusCode, body)
+		}
+	}
+}
+
+func TestRefMutationNeedsWritePermission(t *testing.T) {
+	_, base := newFixture(t) // read-only control plane
+	for _, path := range []string{"/v1/ns/demo%2Fusers/refs/tags", "/v1/ns/demo%2Fusers/refs/branches"} {
+		if res, body := postJSON(t, base, path, `{"name":"nope"}`); res.StatusCode != http.StatusForbidden {
+			t.Errorf("%s should need --control-write, got %d (%v)", path, res.StatusCode, body)
+		}
+	}
+}
+
+// Compare is the question the commit log cannot answer.
+func TestCompareTwoRevisions(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a"}`)
+	postJSON(t, base, "/v1/ns/demo%2Fusers/refs/tags", `{"name":"v1"}`)
+	seed(t, cs, `{"id":"b"}`, `{"id":"c"}`)
+
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/compare?from=tag:v1&to=head")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("compare: %d (%v)", res.StatusCode, body)
+	}
+	counts := body["counts"].(map[string]any)
+	if counts["added"].(float64) != 2 {
+		t.Errorf("two documents landed after the tag: %v", counts)
+	}
+	// The relationship is what makes the diff readable: the same entries mean something different
+	// between an ancestor and a diverged branch.
+	if body["relationship"] != "ahead" {
+		t.Errorf("head should be ahead of the tag, got %v", body["relationship"])
+	}
+
+	_, reversed := get(t, base, "/v1/ns/demo%2Fusers/compare?from=head&to=tag:v1")
+	if reversed["relationship"] != "behind" {
+		t.Errorf("the reverse should be behind, got %v", reversed["relationship"])
+	}
+	if reversed["counts"].(map[string]any)["removed"].(float64) != 2 {
+		t.Errorf("reversed, the same two documents are removals: %v", reversed["counts"])
+	}
+
+	_, same := get(t, base, "/v1/ns/demo%2Fusers/compare?from=head&to=head")
+	if same["relationship"] != "same" {
+		t.Errorf("a point compared with itself is the same: %v", same["relationship"])
+	}
+	if len(same["entries"].([]any)) != 0 {
+		t.Errorf("nothing differs: %v", same["entries"])
+	}
+}
+
+func TestCompareRequiresBothEnds(t *testing.T) {
+	_, base := newFixture(t)
+	for _, q := range []string{"", "?from=head", "?to=head"} {
+		res, body := get(t, base, "/v1/ns/demo%2Fusers/compare"+q)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("compare%s should be refused, got %d (%v)", q, res.StatusCode, body)
+		}
+	}
+	if res, _ := get(t, base, "/v1/ns/demo%2Fusers/compare?from=no-such-ref&to=head"); res.StatusCode != http.StatusNotFound {
+		t.Errorf("an unknown revision should be a 404, got %d", res.StatusCode)
+	}
+}
+
+// Compare is a read, so it works on a read-only control plane and on a staged copy - which is the
+// point of attaching one: checking a restore against production with the same tools.
+func TestCompareWorksOnAReadOnlyControlPlane(t *testing.T) {
+	cs, base := newFixture(t)
+	seed(t, cs, `{"id":"a"}`)
+	if res, body := get(t, base, "/v1/ns/demo%2Fusers/compare?from=head&to=head"); res.StatusCode != http.StatusOK {
+		t.Fatalf("compare should not need write permission: %d (%v)", res.StatusCode, body)
+	}
+}
