@@ -238,6 +238,12 @@ func (s *Server) writeCommitError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "schema_violation", err.Error())
 		return
 	}
+	// A read-only runtime is a refusal rather than a fault: it means the caller aimed a write at
+	// something that was opened for reading, which is a 403 whatever route it arrived by.
+	if strings.Contains(strings.ToLower(err.Error()), "read-only") {
+		writeError(w, http.StatusForbidden, "read_only_runtime", err.Error())
+		return
+	}
 	writeError(w, http.StatusInternalServerError, "commit_failed", err.Error())
 }
 

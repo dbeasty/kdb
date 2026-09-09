@@ -75,6 +75,9 @@ type Options struct {
 	// LogLevel is the process's live log level, when the caller holds one. Without it the log
 	// level is reported but cannot be changed, and the refusal says so.
 	LogLevel *slog.LevelVar
+	// StagingDir is where staged restores are written. Empty disables them. Keep it off the data
+	// volume: a restore is most needed exactly when the data volume is the problem.
+	StagingDir string
 	// BackupDir is where control-plane backups are written. Empty disables them, and the endpoints
 	// say so rather than failing obscurely - a backup with nowhere to go is a configuration
 	// question, not an error.
@@ -106,6 +109,9 @@ type Server struct {
 	startupSettings []config.SettingDescriptor
 	// revision counts applied changes, for the compare-and-swap on a patch.
 	revision int64
+
+	// restore holds staging restore jobs and the read-only runtimes attached from them.
+	restore *restoreState
 
 	// recovery holds cached verification reports, so the UI can show the last result without
 	// re-running a scan that walks the whole log.
@@ -139,6 +145,7 @@ func New(opts Options) (*Server, error) {
 		settings:        append([]config.SettingDescriptor(nil), opts.Settings...),
 		startupSettings: append([]config.SettingDescriptor(nil), opts.Settings...),
 		recovery:        newRecoveryState(),
+		restore:         newRestoreState(),
 		// Starts at 1, not 0: zero is what a caller sends to mean "do not check the revision", so
 		// a real revision of zero would silently skip the compare-and-swap it asked for.
 		revision: 1,
@@ -159,6 +166,9 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 // Close stops the listener and releases every SSE subscriber. Safe to call more than once.
 func (s *Server) Close() error {
 	s.events.close()
+	// Release any staged copy before the process goes: each holds a shared lock on its own
+	// directory, and leaving them open would outlive the thing that opened them.
+	s.closeAttached()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	err := s.httpSrv.Shutdown(ctx)
@@ -261,6 +271,14 @@ func (s *Server) routes() http.Handler {
 	// Creating one writes to the backup directory, so it is gated - not because it touches the
 	// database, but because it consumes disk somewhere an operator did not ask for it to.
 	mux.Handle("POST /v1/ns/{ns}/backups", s.nsWrite(s.handleCreateBackup))
+
+	// Staged restore. Writing to a scratch directory rather than to the database, but it consumes
+	// disk and opens a second view of the data, so it is gated the same way a backup is.
+	mux.Handle("POST /v1/ns/{ns}/restore/staging", s.nsWrite(s.handleStartRestore))
+	mux.Handle("GET /v1/restore/staging", s.adminRead(s.handleListRestoreJobs))
+	mux.Handle("GET /v1/restore/staging/{jobId}", s.adminRead(s.handleRestoreJob))
+	mux.Handle("POST /v1/restore/staging/{jobId}/attach", s.adminRead(s.handleAttachRestore))
+	mux.Handle("POST /v1/restore/staging/{jobId}/detach", s.adminRead(s.handleDetachRestore))
 
 	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
 	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))

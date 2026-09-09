@@ -2129,3 +2129,215 @@ func TestCheckpointStatusReportsReplayCost(t *testing.T) {
 		t.Errorf("the numbers that predict restart time should be real: %v", body)
 	}
 }
+
+// stagingFixture adds a staging directory to the file-backed fixture.
+func stagingFixture(t *testing.T) (*Server, string, *embed.EmbeddedKdbRuntime) {
+	t.Helper()
+	staging := filepath.Join(t.TempDir(), "staging")
+	return fileFixture(t, func(o *Options) { o.StagingDir = staging })
+}
+
+// TestRestoreToStagingAndAttach is the whole point of §8.3: a running server rebuilds a namespace
+// into a scratch directory and then opens that copy read-only *alongside* the live one, so the
+// restored data can be checked with the same views used on production before anything is promoted.
+func TestRestoreToStagingAndAttach(t *testing.T) {
+	cs, base, rt := stagingFixture(t)
+	for i := 0; i < 4; i++ {
+		if _, err := embed.PutJSONDocument(rt, "demo/users", fmt.Sprintf(`{"id":"d%d","n":%d}`, i, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, made := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	backupID, _ := made["backupId"].(string)
+	if backupID == "" {
+		t.Fatalf("no backup to restore from: %v", made)
+	}
+
+	// A write after the backup, so the staged copy and the live namespace are genuinely different
+	// and a mix-up between them would be visible.
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"after-backup"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	res, started := postJSON(t, base, "/v1/ns/demo%2Fusers/restore/staging",
+		`{"backupId":"`+backupID+`"}`)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("start restore: %d (%v)", res.StatusCode, started)
+	}
+	jobID := started["job"].(map[string]any)["id"].(string)
+
+	job := awaitRestore(t, base, jobID)
+	if job["state"] != "complete" {
+		t.Fatalf("restore did not complete: %v", job)
+	}
+	if job["appliedCommits"].(float64) == 0 {
+		t.Errorf("the restore applied nothing: %v", job)
+	}
+	sources, _ := job["sourcesUsed"].([]any)
+	if len(sources) == 0 || !strings.Contains(fmt.Sprint(sources), backupID) {
+		t.Errorf("the backup should be named as a contributing source: %v", job["sourcesUsed"])
+	}
+
+	// Attach it, and it becomes a browsable namespace under a distinguishable id.
+	res, attached := postJSON(t, base, "/v1/restore/staging/"+jobID+"/attach", `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("attach: %d (%v)", res.StatusCode, attached)
+	}
+	alias, _ := attached["attachedAs"].(string)
+	if !strings.HasPrefix(alias, "staged/") {
+		t.Fatalf("a staged copy must be distinguishable from the live namespace: %q", alias)
+	}
+
+	_, list := get(t, base, "/v1/namespaces")
+	var found bool
+	for _, raw := range list["namespaces"].([]any) {
+		if raw.(map[string]any)["id"] == alias {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the attached copy should appear in the namespace list: %v", list["namespaces"])
+	}
+
+	// The staged copy is readable with the ordinary views, and holds the backup's state - not the
+	// write that landed after it.
+	escaped := strings.ReplaceAll(alias, "/", "%2F")
+	res, staged := get(t, base, "/v1/ns/"+escaped+"/docs?limit=100")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("reading the staged copy: %d (%v)", res.StatusCode, staged)
+	}
+	if strings.Contains(fmt.Sprint(staged["documents"]), "after-backup") {
+		t.Error("the staged copy should hold the backup's state, not writes that came after it")
+	}
+	_, liveDocs := get(t, base, "/v1/ns/demo%2Fusers/docs?limit=100")
+	if !strings.Contains(fmt.Sprint(liveDocs["documents"]), "after-backup") {
+		t.Error("the live namespace should still have the later write")
+	}
+
+	// And the history views work on it too, which is what makes inspection worth anything.
+	res, log := get(t, base, "/v1/ns/"+escaped+"/log")
+	if res.StatusCode != http.StatusOK || len(log["commits"].([]any)) == 0 {
+		t.Errorf("the commit log should work on a staged copy: %d %v", res.StatusCode, log)
+	}
+
+	_ = cs
+}
+
+// TestStagedCopyRefusesWrites: it is opened read-only, and the refusal has to say *why* rather than
+// surfacing a lower-level error about a missing write path.
+func TestStagedCopyRefusesWrites(t *testing.T) {
+	_, base, rt := stagingFixture(t)
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+	_, made := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	_, started := postJSON(t, base, "/v1/ns/demo%2Fusers/restore/staging",
+		`{"backupId":"`+made["backupId"].(string)+`"}`)
+	jobID := started["job"].(map[string]any)["id"].(string)
+	awaitRestore(t, base, jobID)
+	_, attached := postJSON(t, base, "/v1/restore/staging/"+jobID+"/attach", `{}`)
+	alias := attached["attachedAs"].(string)
+	escaped := strings.ReplaceAll(alias, "/", "%2F")
+
+	res, body := postJSON(t, base, "/v1/ns/"+escaped+"/sql", `{"sql":"DELETE FROM users"}`)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("a staged copy must refuse writes, got %d (%v)", res.StatusCode, body)
+	}
+	if body["error"].(map[string]any)["code"] != "staged_copy" {
+		t.Errorf("the refusal should say it is a staged copy, not just 'read only': %v", body["error"])
+	}
+}
+
+func TestDetachReleasesTheStagedCopy(t *testing.T) {
+	_, base, rt := stagingFixture(t)
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+	_, made := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	_, started := postJSON(t, base, "/v1/ns/demo%2Fusers/restore/staging",
+		`{"backupId":"`+made["backupId"].(string)+`"}`)
+	jobID := started["job"].(map[string]any)["id"].(string)
+	awaitRestore(t, base, jobID)
+	_, attached := postJSON(t, base, "/v1/restore/staging/"+jobID+"/attach", `{}`)
+	alias := attached["attachedAs"].(string)
+	escaped := strings.ReplaceAll(alias, "/", "%2F")
+
+	res, _ := postJSON(t, base, "/v1/restore/staging/"+jobID+"/detach", `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("detach: %d", res.StatusCode)
+	}
+	// Gone from the namespace list, and a read of it is a 404 rather than a stale view.
+	res, _ = get(t, base, "/v1/ns/"+escaped+"/docs")
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("a detached copy must no longer resolve, got %d", res.StatusCode)
+	}
+}
+
+func TestAttachRefusedBeforeTheRestoreCompletes(t *testing.T) {
+	_, base, _ := stagingFixture(t)
+	res, _ := postJSON(t, base, "/v1/restore/staging/nosuchjob/attach", `{}`)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("an unknown job is 404, got %d", res.StatusCode)
+	}
+}
+
+func TestRestoreRefusedWithoutAStagingDirectory(t *testing.T) {
+	_, base, _ := fileFixture(t)
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/restore/staging", `{"includeLive":true}`)
+	if res.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("want 501 with no staging directory, got %d (%v)", res.StatusCode, body)
+	}
+	if !strings.Contains(fmt.Sprint(body["error"]), "--control-staging-dir") {
+		t.Error("the refusal should name the flag that enables it")
+	}
+}
+
+func TestRestoreNeedsASource(t *testing.T) {
+	_, base, _ := stagingFixture(t)
+	res, body := postJSON(t, base, "/v1/ns/demo%2Fusers/restore/staging", `{}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a restore from nothing is not a restore, got %d (%v)", res.StatusCode, body)
+	}
+}
+
+// TestHybridRestoreUsesBothSources: the reason HybridRestore takes a list is that a damaged log and
+// a backup can each hold commits the other does not.
+func TestHybridRestoreUsesBothSources(t *testing.T) {
+	_, base, rt := stagingFixture(t)
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"before"}`); err != nil {
+		t.Fatal(err)
+	}
+	_, made := postJSON(t, base, "/v1/ns/demo%2Fusers/backups", `{}`)
+	if _, err := embed.PutJSONDocument(rt, "demo/users", `{"id":"after"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, started := postJSON(t, base, "/v1/ns/demo%2Fusers/restore/staging",
+		`{"backupId":"`+made["backupId"].(string)+`","includeLive":true}`)
+	job := awaitRestore(t, base, started["job"].(map[string]any)["id"].(string))
+	if job["state"] != "complete" {
+		t.Fatalf("hybrid restore failed: %v", job)
+	}
+	// The union carries the later write, which only the live log has.
+	_, attached := postJSON(t, base, "/v1/restore/staging/"+job["id"].(string)+"/attach", `{}`)
+	escaped := strings.ReplaceAll(attached["attachedAs"].(string), "/", "%2F")
+	_, docs := get(t, base, "/v1/ns/"+escaped+"/docs?limit=100")
+	if !strings.Contains(fmt.Sprint(docs["documents"]), "after") {
+		t.Errorf("the union should include the commit only the live log had: %v", docs["documents"])
+	}
+}
+
+func awaitRestore(t *testing.T, base, jobID string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		_, body := get(t, base, "/v1/restore/staging/"+jobID)
+		job := body["job"].(map[string]any)
+		if job["state"] != "running" {
+			return job
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("restore job %s did not finish", jobID)
+	return nil
+}

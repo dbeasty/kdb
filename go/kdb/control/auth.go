@@ -36,6 +36,15 @@ func (s *Server) nsScoped(h nsHandler, readOnly bool) http.Handler {
 		if !ok {
 			return
 		}
+		if !readOnly && isAttached(r.PathValue("ns")) {
+			// The runtime would refuse this anyway - a read-only open creates no WAL and no delta
+			// writer - but "this is a staged copy, not the database" is the answer the operator
+			// needs, not ErrReadOnly from somewhere deeper.
+			writeError(w, http.StatusForbidden, "staged_copy",
+				"this is a staged restore attached for inspection, not a live namespace. It is open "+
+					"read-only and cannot be written to; promoting it needs the service stopped.")
+			return
+		}
 		if !readOnly && !s.opts.AllowWrites {
 			writeError(w, http.StatusForbidden, "read_only",
 				"this control plane is read-only; start the service with --control-write to enable "+

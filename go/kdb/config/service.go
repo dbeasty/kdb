@@ -88,12 +88,15 @@ type ServiceSettings struct {
 	ControlSettingsPersist bool
 	// ControlBackupDir is where the control plane writes backups. Empty disables them.
 	ControlBackupDir string
-	TLSCert          string
-	TLSKey           string
-	TLSCA            string
-	TLSClientAuth    bool
-	LogLevel         string
-	LogFormat        string
+	// ControlStagingDir is where the control plane restores backups for inspection. Empty disables
+	// staged restores.
+	ControlStagingDir string
+	TLSCert           string
+	TLSKey            string
+	TLSCA             string
+	TLSClientAuth     bool
+	LogLevel          string
+	LogFormat         string
 
 	// Storage-engine tunables. These reach storage.StorageEngineConfig via
 	// embed.FileRuntimeOptions; before they existed the engine's Durability and
@@ -176,6 +179,7 @@ type ServiceFile struct {
 	ControlUI              *bool           `json:"controlUi"`
 	ControlSettingsPersist *bool           `json:"controlSettingsPersist"`
 	ControlBackupDir       *string         `json:"controlBackupDir"`
+	ControlStagingDir      *string         `json:"controlStagingDir"`
 
 	Durability          *string `json:"durability"`
 	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
@@ -272,6 +276,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.ControlUI, file.ControlUI)
 		setIf(&s.ControlSettingsPersist, file.ControlSettingsPersist)
 		setIf(&s.ControlBackupDir, file.ControlBackupDir)
+		setIf(&s.ControlStagingDir, file.ControlStagingDir)
 		setIf(&s.Durability, file.Durability)
 		setIf(&s.AsyncSyncIntervalMS, file.AsyncSyncIntervalMS)
 		setIf(&s.Compression, file.Compression)
@@ -383,6 +388,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		return s, err
 	}
 	envString("KDB_CONTROL_BACKUP_DIR", &s.ControlBackupDir)
+	envString("KDB_CONTROL_STAGING_DIR", &s.ControlStagingDir)
 	envString("KDB_DURABILITY", &s.Durability)
 	if err := envInt("KDB_ASYNC_SYNC_INTERVAL_MS", &s.AsyncSyncIntervalMS); err != nil {
 		return s, err
@@ -421,6 +427,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"control-ui", func() { s.ControlUI = flags.ControlUI }},
 		{"control-settings-persist", func() { s.ControlSettingsPersist = flags.ControlSettingsPersist }},
 		{"control-backup-dir", func() { s.ControlBackupDir = flags.ControlBackupDir }},
+		{"control-staging-dir", func() { s.ControlStagingDir = flags.ControlStagingDir }},
 		{"log-level", func() { s.LogLevel = flags.LogLevel }},
 		{"log-format", func() { s.LogFormat = flags.LogFormat }},
 		{"durability", func() { s.Durability = flags.Durability }},

@@ -131,7 +131,7 @@
   <button data-tab="recovery" aria-selected="false">Recovery</button>
 </nav>
 <div class="timebar" id="timebar" hidden>
-  <span>Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
+  <span id="atmsg">Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
   <span class="sp" style="flex:1"></span>
   <button class="act" id="exitat">Return to HEAD</button>
 </div>
@@ -237,15 +237,19 @@ function setMain(...children) { setKids($("main"), ...children); }
 // enterAt / exitAt switch the whole app between head and a past revision. Everything re-renders,
 // because a screen showing a mix of current and historical data would be worse than either.
 function enterAt(spec, label) {
-  state.at = spec;
-  $("timebar").hidden = false;
-  $("atref").textContent = label || spec;
+  state.at = label || spec;
   selectTab(state.tab);
 }
 
 function exitAt() {
+  // On a staged copy the bar's button means "leave the copy"; on a live namespace it means
+  // "return to head". One button, because the operator only ever wants out of whatever they are in.
+  if (typeof state.ns === "string" && state.ns.startsWith("staged/")) {
+    const live = (state.namespaces.find((n) => n.default) || state.namespaces[0] || {}).id;
+    if (live) { switchNamespace(live); return; }
+  }
   state.at = null;
-  $("timebar").hidden = true;
+  drawBanner();
   selectTab(state.tab);
 }
 
@@ -262,6 +266,38 @@ function renderNamespacePicker() {
     el("option", { value: n.id, selected: n.id === state.ns ? "selected" : null }, n.id)));
   sel.disabled = state.namespaces.length < 2;
   sel.title = state.namespaces.length < 2 ? "This server serves one namespace" : "Switch namespace";
+}
+
+// drawBanner is the one place the bar above the content is decided. A staged copy and a past
+// revision are different situations - a different database versus a different point in time - and
+// both have to be impossible to miss, so they share the bar but not the wording.
+function drawBanner() {
+  const staged = typeof state.ns === "string" && state.ns.startsWith("staged/");
+  const bar = $("timebar");
+  bar.hidden = !staged && !state.at;
+  if (bar.hidden) return;
+  if (staged) {
+    setKids($("atmsg"), "Viewing a restored copy, not the live database — ",
+      el("strong", { text: state.ns }), ". It is read-only.");
+    $("exitat").textContent = "Back to the live namespace";
+    return;
+  }
+  setKids($("atmsg"), "Viewing at ", el("strong", { text: state.at }),
+    " — this is a past state, and it is read-only.");
+  $("exitat").textContent = "Return to HEAD";
+}
+
+// switchNamespace is the single path for changing which namespace every view is looking at, used by
+// the picker and by attaching a staged restore. Having two of these is what let them disagree.
+async function switchNamespace(id, tab) {
+  state.ns = id;
+  state.namespaces = (await api("/v1/namespaces")).namespaces || state.namespaces;
+  renderNamespacePicker();
+  // Everything view-shaped belongs to the namespace it came from: a cursor, a selected commit or an
+  // open document from another one means nothing here.
+  Object.assign(state, { commits: [], selected: null, docs: [], docCursor: null, openDoc: null,
+                         editing: null, sqlResult: null, sqlError: null, at: null });
+  await selectTab(tab || state.tab);
 }
 
 function setLive(on, text, bad) {
@@ -295,6 +331,7 @@ async function boot() {
 
 async function selectTab(tab) {
   state.tab = tab;
+  drawBanner();
   for (const b of $("tabs").children) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   setMain(el("div", { class: "empty", text: "Loading…" }));
   try {
@@ -1004,6 +1041,8 @@ function flash(message) {
 // ---- Recovery -----------------------------------------------------------------------------
 
 async function renderRecovery() {
+  let jobs = null;
+  try { jobs = await api("/v1/restore/staging"); } catch (e) { jobs = { unavailable: e.message }; }
   const [integrity, checkpoints, plan] = await Promise.all([
     api(nsPath("/integrity")),
     api(nsPath("/checkpoints")).catch((e) => ({ error: e.message })),
@@ -1018,7 +1057,106 @@ async function renderRecovery() {
     el("div", { style: "height:12px" }),
     checkpointSection(checkpoints),
     el("div", { style: "height:12px" }),
+    restoreSection(jobs, backups),
+    el("div", { style: "height:12px" }),
     maintenanceSection(plan));
+}
+
+// A staged restore is the answer to "is this backup any good" - the only honest way to answer it is
+// to open the thing and look, which is what attaching does.
+function restoreSection(jobs, backups) {
+  const available = backups && !backups.unavailable ? (backups.backups || []) : [];
+
+  const start = async (backupId, includeLive) => {
+    try {
+      const res = await api(nsPath("/restore/staging"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backupId: backupId || undefined, includeLive: !!includeLive }),
+      });
+      flash("Restoring into " + res.job.directory + " — this does not touch the live namespace.");
+      await renderRecovery();
+    } catch (e) {
+      flash("Restore could not start: " + e.message);
+    }
+  };
+  const act = async (id, what, body) => {
+    try {
+      const res = await api("/v1/restore/staging/" + encodeURIComponent(id) + "/" + what, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      if (what === "attach") {
+        await switchNamespace(res.attachedAs, "data");
+        flash("Attached read-only as " + res.attachedAs +
+              ". Every read view is now looking at the restored copy, not the live database.");
+        return;
+      }
+      await renderRecovery();
+    } catch (e) {
+      flash(what + " failed: " + e.message);
+    }
+  };
+
+  if (jobs && jobs.unavailable) {
+    return el("div", { class: "card" }, el("h2", { text: "Restore for inspection" }),
+      el("div", { class: "body muted", text: jobs.unavailable }));
+  }
+
+  const controls = el("div", { class: "body", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+    available.length
+      ? el("select", { class: "ns", id: "restorepick" },
+          available.map((b) => el("option", { value: b.backupId },
+            b.backupId.slice(0, 12) + " · " + formatTime(b.createdAt))))
+      : el("span", { class: "muted", style: "font-size:12px", text: "no backups to restore from" }),
+    available.length
+      ? el("button", { class: "act", text: "Restore for inspection",
+          onclick: () => start($("restorepick").value, false) })
+      : null,
+    available.length
+      ? el("button", { class: "act", title: "union the backup with the live log - salvages commits only one of them has",
+          text: "Restore + live log", onclick: () => start($("restorepick").value, true) })
+      : null);
+
+  const rows = (jobs.jobs || []).map((j) => el("tr", {},
+    el("td", {}, el("code", { text: j.id.slice(-9) }),
+      el("div", { class: "muted", style: "font-size:12px", text: j.namespace })),
+    el("td", {}, el("span", { class: "chip " + (j.state === "complete" ? "added" : j.state === "failed" ? "removed" : ""),
+                              text: j.state }),
+      j.error ? el("div", { class: "err", text: j.error }) : null,
+      j.note ? el("div", { class: "warn", text: j.note }) : null),
+    el("td", { class: "muted" }, String(j.appliedCommits || 0)),
+    el("td", { class: "muted" }, (j.sourcesUsed || []).join(", ")),
+    el("td", {},
+      j.state === "complete" && !j.attachedAs
+        ? el("button", { class: "act", style: "padding:2px 8px;font-size:12px",
+            title: "open it read-only alongside the live namespace",
+            text: "Attach", onclick: () => act(j.id, "attach") })
+        : null,
+      j.attachedAs
+        ? el("span", {}, el("span", { class: "chip ref", text: "attached" }),
+            el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+              text: "Detach", onclick: () => act(j.id, "detach") }))
+        : null,
+      j.state !== "running"
+        ? el("button", { class: "act danger", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+            title: "detach and delete the staging directory",
+            text: "Discard", onclick: () => act(j.id, "detach", { delete: true }) })
+        : null)));
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Restore for inspection" }),
+    el("div", { class: "body muted", style: "padding-bottom:0" },
+      "A restore into a scratch directory, which the live namespace never notices. Attaching one " +
+      "opens it read-only alongside production, so the restored data can be checked with these " +
+      "same views before it is trusted. Promoting it needs the service stopped."),
+    controls,
+    rows.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Job" }), el("th", { text: "State" }),
+                              el("th", { text: "Commits" }), el("th", { text: "Sources" }),
+                              el("th", { text: "" }))),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty", text: "No staged restores." }));
 }
 
 function integritySection(data) {
@@ -1195,15 +1333,7 @@ $("tabs").addEventListener("click", (e) => {
 });
 $("signout").addEventListener("click", () => signOut());
 $("exitat").addEventListener("click", exitAt);
-$("nspick").addEventListener("change", (e) => {
-  state.ns = e.target.value;
-  // A namespace switch resets everything view-shaped: a cursor, a selected commit or an open
-  // document from the previous namespace means nothing in this one.
-  Object.assign(state, { commits: [], selected: null, docs: [], docCursor: null, openDoc: null,
-                         editing: null,
-                         sqlResult: null, sqlError: null });
-  selectTab(state.tab);
-});
+$("nspick").addEventListener("change", (e) => { switchNamespace(e.target.value); });
 $("revertcancel").addEventListener("click", () => $("revertdlg").close());
 
 if (token) boot(); else renderGate();

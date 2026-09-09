@@ -310,6 +310,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.ControlBackupDir != nil },
 		},
 		{
+			key: "control.stagingDir", flag: "control-staging-dir", env: "KDB_CONTROL_STAGING_DIR",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "directory the control plane restores backups into for inspection (empty disables staged restores). Keep it off the data volume: a restore is most needed exactly when that volume is the problem",
+			value:  str(func(s ServiceSettings) string { return s.ControlStagingDir }),
+			inFile: func(f *ServiceFile) bool { return f.ControlStagingDir != nil },
+		},
+		{
 			key: "log.level", flag: "log-level", env: "KDB_LOG_LEVEL",
 			scope: ScopeProcess, mutability: MutabilityLive,
 			help:   "minimum log level: debug, info, warn, error",

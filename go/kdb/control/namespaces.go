@@ -60,13 +60,46 @@ func (s *staticSource) Runtime(namespaceID string) (*server.KdbServerRuntime, bo
 	return rt, ok
 }
 
-// namespaces is the source this server resolves against, falling back to the single-runtime form
-// for a caller that set Runtime and Namespace rather than Namespaces.
+// namespaces is the source this server resolves against: the configured one, plus any staged
+// restores attached for inspection.
+//
+// The overlay is not part of NamespaceSource on purpose. A staged copy is this control plane's
+// business and nobody else's - the service that built the source has no reason to know a restore is
+// being looked at - so it is composed in here rather than pushed back into the service's wiring.
 func (s *Server) namespaces() NamespaceSource {
-	if s.opts.Namespaces != nil {
-		return s.opts.Namespaces
+	base := s.opts.Namespaces
+	if base == nil {
+		base = SingleNamespace(s.opts.Namespace, s.opts.Runtime)
 	}
-	return SingleNamespace(s.opts.Namespace, s.opts.Runtime)
+	attached := s.attachedNamespaces()
+	if len(attached) == 0 {
+		return base
+	}
+	return &overlaySource{base: base, overlay: attached}
+}
+
+// overlaySource is a NamespaceSource with extra namespaces layered on top.
+type overlaySource struct {
+	base    NamespaceSource
+	overlay map[string]*server.KdbServerRuntime
+}
+
+func (o *overlaySource) Namespaces() []string {
+	out := append([]string(nil), o.base.Namespaces()...)
+	for id := range o.overlay {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (o *overlaySource) Runtime(namespaceID string) (*server.KdbServerRuntime, bool) {
+	// The overlay wins. A staged alias cannot collide with a live namespace id - it is prefixed -
+	// so this only ever resolves what the base does not have.
+	if rt, ok := o.overlay[namespaceID]; ok {
+		return rt, true
+	}
+	return o.base.Runtime(namespaceID)
 }
 
 // defaultNamespace is the namespace a request that names none is about. It exists for the

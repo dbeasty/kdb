@@ -77,6 +77,7 @@ func Main() {
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
 	fs.BoolVar(&flagVals.ControlUI, "control-ui", flagVals.ControlUI, "serve the embedded single-page control UI on --control-addr; false leaves the JSON API alone on that listener")
 	fs.StringVar(&flagVals.ControlBackupDir, "control-backup-dir", flagVals.ControlBackupDir, "directory the control plane writes backups to (empty disables backups through it). Keep it off the data volume: a backup that shares a disk with the thing it is backing up is not a backup")
+	fs.StringVar(&flagVals.ControlStagingDir, "control-staging-dir", flagVals.ControlStagingDir, "directory the control plane restores backups into for inspection (empty disables staged restores). A staged copy is opened read-only alongside the live namespace so it can be browsed before it is trusted; keep this off the data volume, since a restore is most needed exactly when that volume is the problem")
 	fs.BoolVar(&flagVals.ControlSettingsPersist, "control-settings-persist", flagVals.ControlSettingsPersist, "let a setting changed through the control plane also be written back to the --config file. Off by default: in a GitOps-managed deployment that file belongs to a deployment tool, and a server rewriting it is a surprise rather than a feature. A change applied without this is still reported under /v1/settings/drift, so nothing is silently lost on the next restart")
 	fs.StringVar(&flagVals.LogLevel, "log-level", flagVals.LogLevel, "minimum log level: debug, info, warn, error")
 	fs.StringVar(&flagVals.LogFormat, "log-format", flagVals.LogFormat, "log output format: text or json")
@@ -475,6 +476,7 @@ func Main() {
 			LogLevel:             logLevel,
 			AllowSettingsPersist: cfg.ControlSettingsPersist,
 			BackupDir:            cfg.ControlBackupDir,
+			StagingDir:           cfg.ControlStagingDir,
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)

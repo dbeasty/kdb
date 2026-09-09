@@ -28,7 +28,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
 | M6b | Settings (mutation) | **partial** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting; writing back to the config file is not implemented |
-| M7 | Recovery | **partial** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, and generated commands for the offline tier. Restore-to-staging and read-only attach (§8.3) are not built |
+| M7 | Recovery | **done** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, restore-to-staging with read-only attach, and generated commands for the offline tier |
 
 ### API surface (§5)
 
@@ -48,12 +48,13 @@ that does not exist simply answers 404.
 
 **Not started:** per-document history, per-document diff (`/commits/{hash}/diff/{docId}`),
 `/compare`, branch and tag mutation, `/tx`, `/policy`, `/indexes`,
-`/ops/sessions|leases|peers|metrics`, `POST /v1/ops/drain`, and the restore half of recovery
-(`/restore/staging`, `/restore/staging/{jobId}/attach`).
+`/ops/sessions|leases|peers|metrics` and `POST /v1/ops/drain`.
 
 Recovery adds `GET /v1/ns/{ns}/integrity`, `POST /v1/ns/{ns}/integrity/verify`,
 `GET /v1/ns/{ns}/checkpoints`, `GET /v1/ns/{ns}/maintenance/plan`, `GET /v1/ns/{ns}/backups`,
-`POST /v1/ns/{ns}/backups` and `POST /v1/ns/{ns}/backups/{id}/verify`. The backup endpoints are
+`POST /v1/ns/{ns}/backups`, `POST /v1/ns/{ns}/backups/{id}/verify`,
+`POST /v1/ns/{ns}/restore/staging`, and `GET|POST /v1/restore/staging[/{jobId}[/attach|/detach]]`.
+The backup endpoints are
 per-namespace rather than the database-wide `/v1/backups?ns=` §5 sketched: one namespace is what a
 `ObjectStore` keyed by namespace actually addresses, and a whole-database backup wants one
 consistent point across every namespace, which is its own piece of work.
@@ -74,16 +75,15 @@ consistent point across every namespace, which is its own piece of work.
 | 8 | Schema & indexes | **partial** — schema only |
 | 9 | Operations dashboard | **partial** — process and admission state; no sessions, leases or peers |
 | 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a drift banner, and the ignored-configuration panel |
-| 11 | Recovery | **partial** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, and the offline commands filled in. No restore wizard yet |
+| 11 | Recovery | **built** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, the restore-and-attach flow, and the offline commands filled in |
 
 ### What to do next, in order
 
 1. **Persisting a setting (M6b's other half).** The six knobs §7.3 names are already safe to change at runtime, and the
    read view that makes them legible is done.
-2. **Restore to staging, then attach read-only (§8.3).** The remaining half of recovery, and the
-   highest-value piece left: `restore --out` locks only its output directory, and
-   `FileRuntimeOptions.ReadOnly` opens under a shared lock, so a restored copy can be browsed with
-   the same views used on production before anything is promoted.
+2. **Promotion.** Swapping a staged copy in for the live data directory needs the process stopped,
+   so it is a supervised-restart flow (§8.4) rather than an endpoint. The staged copy and the
+   generated commands are both in place; what is missing is the drain-and-restart contract.
 3. **The document timeline (M4's missing half).** Per-document history, now that
    `dag.ListCommits` exists to build it on.
 4. **A real commit graph (§9 screen 3).** Lane assignment, so the log becomes a graph.

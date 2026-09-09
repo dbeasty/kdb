@@ -225,6 +225,11 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request, principal aut
 					"history moves forward only. Drop \"at\" to run it against head.")
 			return
 		}
+		// This endpoint is registered as a read and escalates per statement, so the staged-copy
+		// check the write middleware performs does not run for it and has to happen here.
+		if refuseIfStaged(w, ns) {
+			return
+		}
 		if !s.opts.AllowWrites {
 			writeError(w, http.StatusForbidden, "read_only",
 				"this control plane is read-only, so it runs SELECT only; start the service with "+
@@ -414,11 +419,16 @@ func (s *Server) runDML(w http.ResponseWriter, r *http.Request, req sqlRequest, 
 	if err != nil {
 		// A conflict is the expected outcome of two writers racing, not a server fault, and it is
 		// retryable by re-running the statement against the new head.
-		status := http.StatusInternalServerError
-		if strings.Contains(strings.ToLower(err.Error()), "conflict") {
+		status, code := http.StatusInternalServerError, "commit_failed"
+		low := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(low, "conflict"):
 			status = http.StatusConflict
+		case strings.Contains(low, "read-only"):
+			// Aimed at something opened for reading; a refusal, not a fault.
+			status, code = http.StatusForbidden, "read_only_runtime"
 		}
-		writeError(w, status, "commit_failed", err.Error())
+		writeError(w, status, code, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
