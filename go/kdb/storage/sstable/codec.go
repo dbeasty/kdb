@@ -1,6 +1,7 @@
 package sstable
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"strings"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/compression"
-	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/io"
 )
@@ -230,6 +230,44 @@ func (w *DefaultWriter) set(e kv) {
 	w.entries = append(w.entries, e)
 }
 
+// appendLimiter is implemented by platform shims that cap a single append. See
+// io.FileBackedPlatformIO.MaxAppendBytes.
+type appendLimiter interface{ MaxAppendBytes() int }
+
+// appendAll writes b to segmentName in pieces the shim will accept, and returns the segment's
+// size afterwards. The bytes on disk are identical either way - only the number of calls
+// changes - so this is not a format concern.
+//
+// It exists because two of the things a table writes grow with the data rather than being
+// bounded by a block size: the footer's index carries a line per key, and a single value can be
+// arbitrarily large (a full tree object holds every document in the namespace). At the default
+// 16MB ceiling the index alone stopped a table at about 200,000 keys, which a namespace reaches
+// with roughly 108,000 commits once its documents, tree objects and version locations are
+// counted - at which point compaction failed and quietly kept its existing tables. The
+// in-memory shim has no ceiling, which is why no memory-backed test could see it.
+func (w *DefaultWriter) appendAll(segmentName string, b []byte) (int64, error) {
+	limit := 0
+	if l, ok := w.io.(appendLimiter); ok {
+		limit = l.MaxAppendBytes()
+	}
+	if limit <= 0 || len(b) <= limit {
+		return w.io.AppendToSegment(segmentName, b)
+	}
+	var size int64
+	for off := 0; off < len(b); off += limit {
+		end := off + limit
+		if end > len(b) {
+			end = len(b)
+		}
+		n, err := w.io.AppendToSegment(segmentName, b[off:end])
+		if err != nil {
+			return 0, err
+		}
+		size = n
+	}
+	return size, nil
+}
+
 func (w *DefaultWriter) Finish() (Handle, error) {
 	blocks := make([]indexEntry, 0, len(w.entries))
 	fileID, err := codec.RandomUUID()
@@ -247,7 +285,7 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		if err != nil {
 			return Handle{}, err
 		}
-		newSize, err := w.io.AppendToSegment(segmentName, block)
+		newSize, err := w.appendAll(segmentName, block)
 		if err != nil {
 			return Handle{}, err
 		}
@@ -263,23 +301,27 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		})
 		offset = newSize
 	}
-	var concat []byte
+	// Hashed as a stream rather than into one buffer. The preimage is every key and value in
+	// the table, so materialising it doubled the table's bytes in memory at the moment a
+	// compaction was already holding the most - and it bought nothing, since the digest of a
+	// byte sequence does not depend on how it was fed in.
+	h := sha256.New()
 	for _, e := range w.entries {
-		concat = append(concat, e.key.Bytes[:]...)
+		h.Write(e.key.Bytes[:])
 		if e.deleted {
 			// A marker byte, so "deleted K" and "wrote K with an empty value" hash differently.
 			// Safe to introduce: no segment written before tombstones existed contains one.
-			concat = append(concat, 0xFF)
+			h.Write([]byte{0xFF})
 			continue
 		}
-		concat = append(concat, e.value...)
+		h.Write(e.value)
 	}
-	fileHash, err := codec.HashFromBytes(document.SHA256Digest(concat))
+	fileHash, err := codec.HashFromBytes(h.Sum(nil))
 	if err != nil {
 		return Handle{}, err
 	}
 	footer := buildFooter(blocks, fileHash)
-	if _, err := w.io.AppendToSegment(segmentName, footer); err != nil {
+	if _, err := w.appendAll(segmentName, footer); err != nil {
 		return Handle{}, err
 	}
 	if err := w.io.SealSegment(segmentName); err != nil {

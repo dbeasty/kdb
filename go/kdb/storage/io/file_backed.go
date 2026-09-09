@@ -37,6 +37,20 @@ func (f *FileBackedPlatformIO) mutexFor(segmentName string) *sync.Mutex {
 	return m
 }
 
+// MaxAppendBytes is the largest single append this shim will accept. Writers that build a
+// payload whose size grows with the data - an SSTable's index, most obviously - must split it
+// into pieces no larger than this rather than assume one call is enough.
+//
+// Reported through an optional interface rather than added to storage.PlatformIOShim, because a
+// shim with no ceiling (the in-memory one) has nothing to say here and should not be made to
+// answer.
+func (f *FileBackedPlatformIO) MaxAppendBytes() int {
+	if f.config.MaxAppendBytes > 0 {
+		return f.config.MaxAppendBytes
+	}
+	return DefaultPlatformIOConfig().MaxAppendBytes
+}
+
 func (f *FileBackedPlatformIO) AppendToSegment(segmentName string, bytes []byte) (int64, error) {
 	if err := ValidateSegmentName(segmentName); err != nil {
 		return 0, err
