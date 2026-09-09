@@ -25,7 +25,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
 | M3 | Writes | **done** — DML and DDL through the SQL console, per-document edit and delete with compare-and-set on the content hash, and `replace` for a write that removes the keys it omits |
 | M4 | Rollback | **done** — namespace revert with plan/apply and `expectHead`, plus the per-document timeline with field-level diffs and per-version restore |
-| M5 | Refs and ops | **partial** — branches and tags now create, delete and compare, with the checkpoint-durability caveat stated on every mutation; ops is still one endpoint |
+| M5 | Refs and ops | **done** — branches and tags create, delete and compare with the checkpoint-durability caveat stated on every mutation; ops adds held locks and leases, the write-path stage latencies, a one-way drain, and a list of what this server cannot answer |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
 | M6b | Settings (mutation) | **done** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting, and `persist:true` writes the change back to the `--config` file atomically, refusing per key when the file cannot hold it or when a flag or environment variable would outrank it |
 | M7 | Recovery | **done** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, restore-to-staging with read-only attach, promotion of a staged restore across a supervised restart, and generated commands for the offline tier |
@@ -59,7 +59,22 @@ particular change will survive a restart *before* it is made, rather than after.
 that does not exist simply answers 404.
 
 **Not started:** per-commit document diff (`/commits/{hash}/diff/{docId}`), `/tx`, `/policy`,
-`/indexes`, `/ops/sessions|leases|peers|metrics` and `POST /v1/ops/drain`.
+`/indexes`.
+
+**Not buildable here, and the dashboard says so rather than showing an empty table:**
+`/ops/sessions` - a `SessionManager` is created per connection (`server/session_manager.go`), so
+there is no runtime-global registry to enumerate, and an empty list would read as "nobody is
+connected"; `/ops/peers` - peer sync is a listener, not a tracked set of members, so there is no
+registry to read. Both are changes to the server, not to this package.
+
+Ops adds `GET /v1/ops/locks`, `GET /v1/ops/metrics` and `POST /v1/ops/drain`. Locks needed one
+addition to the engine: `LockManager.HeldCount` answered "how many", which is enough for a gauge and
+no use at 3am - `Held()` answers which document is stuck and who holds it, evaluating expiry the way
+every other lookup does so a lock nothing would honour is not reported as held. Metrics were already
+recorded in `metrics.Default` and reachable only through the admin listener's *unauthenticated*
+Prometheus endpoint. Drain is one-way - the runtime has no un-drain, and adding one would mean a
+shutdown already under way could be resumed halfway - so it is gated on `--control-write` plus the
+namespace typed back, and every answer says a restart is the only way out.
 
 Refs add `POST /v1/ns/{ns}/refs/branches`, `DELETE /v1/ns/{ns}/refs/branches/{name}`,
 `POST /v1/ns/{ns}/refs/tags`, `DELETE /v1/ns/{ns}/refs/tags/{name}`, and
@@ -107,18 +122,16 @@ consistent point across every namespace, which is its own piece of work.
 | 6 | Time travel | **built** |
 | 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
 | 8 | Schema & indexes | **partial** — schema only |
-| 9 | Operations dashboard | **partial** — process and admission state; no sessions, leases or peers |
+| 9 | Operations dashboard | **built** — process and admission state, held locks and leases with the holder named, write-path stage latencies with what each one being slow would mean, a drain button behind a typed confirmation, and a "not available here" panel saying why sessions and peers are absent |
 | 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a per-key "also write it to the config file" choice (with the reason when there isn't one), a drift banner, and the ignored-configuration panel |
 | 11 | Recovery | **built** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, the restore-and-attach flow, promotion with the server's own plan rendered verbatim behind a typed confirmation, a banner for a promotion awaiting restart and for the outcome of the last one, and the offline commands filled in |
 
 ### What to do next, in order
 
-1. **The operations dashboard (§9 screen 9).** Sessions, leases, peers and metrics, plus
-   `POST /v1/ops/drain`. One endpoint reports process and admission state today.
-2. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
+1. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
    documents a commit touched; opening one still means reading it at two revisions by hand.
-3. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
-4. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
+2. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
+3. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
    protocol still ignores it - which is outside this UI's scope and is the reason M2 is partial.
 
 ## 1. What this is

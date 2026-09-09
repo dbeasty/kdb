@@ -1448,25 +1448,132 @@ function mutabilityLabel(m) {
 }
 
 async function renderOps() {
-  const [health, ops, status] = await Promise.all([
+  const [health, ops, status, locks, metrics] = await Promise.all([
     api("/v1/health"), api("/v1/ops/runtime"), api(nsPath("/status")),
+    api("/v1/ops/locks").catch((e) => ({ error: e.message })),
+    api("/v1/ops/metrics").catch((e) => ({ error: e.message })),
   ]);
   const kv = (obj) => el("dl", { class: "kv" },
     ...Object.entries(obj).flatMap(([k, v]) => [el("dt", { text: k }), el("dd", {}, el("code", { text: formatValue(v) }))]));
-  setMain(el("div", { class: "row" },
-    el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Process" }),
-      el("div", { class: "body" }, kv({
-        version: health.version, namespace: health.namespace, uptimeSeconds: health.uptimeSeconds,
-        draining: health.draining, readOnly: health.readOnly, memoryZone: health.memoryZone,
-        controlWritesEnabled: health.controlWritesEnabled,
-      })))),
-    el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Admission & namespace" }),
-      el("div", { class: "body" }, kv({
-        admissionEnabled: ops.admission.enabled,
-        rescueReserveBytes: ops.admission.rescueReserveBytes ?? "—",
-        documentExpiry: ops.expiry, branches: status.branches, head: (status.head || "").slice(0, 12),
-      }),
-      ops.admission.note ? el("div", { class: "warn", text: ops.admission.note }) : null)))));
+
+  setMain(
+    health.draining
+      ? el("div", { class: "card" }, el("h2", { text: "Draining" }),
+          el("div", { class: "body" }, el("div", { class: "warn" },
+            "This server is draining: new writes are refused and /readyz answers 503. It cannot " +
+            "be undone without restarting the process. Reads are unaffected.")))
+      : null,
+    el("div", { class: "row" },
+      el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Process" }),
+        el("div", { class: "body" }, kv({
+          version: health.version, namespace: health.namespace, uptimeSeconds: health.uptimeSeconds,
+          draining: health.draining, readOnly: health.readOnly, memoryZone: health.memoryZone,
+          controlWritesEnabled: health.controlWritesEnabled,
+        }),
+        state.canWrite && !health.draining && !isStagedNs(state.ns)
+          ? el("div", { style: "margin-top:10px" },
+              el("button", { class: "act danger", text: "Drain this server…", onclick: drainServer }))
+          : null))),
+      el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Admission & namespace" }),
+        el("div", { class: "body" }, kv({
+          admissionEnabled: ops.admission.enabled,
+          rescueReserveBytes: ops.admission.rescueReserveBytes ?? "—",
+          documentExpiry: ops.expiry, branches: status.branches, head: (status.head || "").slice(0, 12),
+        }),
+        ops.admission.note ? el("div", { class: "warn", text: ops.admission.note }) : null)))),
+    el("div", { style: "height:12px" }),
+    locksSection(locks),
+    el("div", { style: "height:12px" }),
+    metricsSection(metrics),
+    el("div", { style: "height:12px" }),
+    unavailableSection(ops.notAvailable));
+}
+
+// Which document is held, and by whom. A count answers a gauge; this answers the question an
+// operator has when a write will not go through.
+function locksSection(locks) {
+  if (locks.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Locks & leases" }),
+      el("div", { class: "body muted", text: locks.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Locks & leases" }),
+    (locks.locks || []).length
+      ? el("div", { class: "grid-wrap" }, el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Document" }), el("th", { text: "Kind" }),
+                              el("th", { text: "Held by" }), el("th", { text: "Expires" }),
+                              el("th", { text: "Fence" }))),
+          el("tbody", {}, locks.locks.map((l) => el("tr", { class: "pick",
+              onclick: () => switchNamespace(state.ns, "data").then(() => openDocument(l.docId)) },
+            el("td", {}, el("code", { text: l.docId })),
+            el("td", {}, el("span", { class: "chip" + (l.kind === "lease" ? " modified" : ""), text: l.kind })),
+            el("td", {}, el("code", { text: l.sessionId })),
+            el("td", { class: "muted" }, l.expiresIn ? l.expiresIn + " left" : "—"),
+            el("td", { class: "muted" }, String(l.fence)))))))
+      : el("div", { class: "empty", text: "Nothing is locked." }),
+    el("div", { class: "body muted", style: "font-size:12px", text: locks.note || "" }));
+}
+
+// The write-path stage latencies. They have been recorded all along and were reachable only
+// through the admin listener's unauthenticated Prometheus endpoint.
+function metricsSection(m) {
+  if (m.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Write path" }),
+      el("div", { class: "body muted", text: m.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Write path" }),
+    (m.stages || []).length
+      ? el("div", { class: "grid-wrap" }, el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Stage" }), el("th", { text: "Samples" }),
+                              el("th", { text: "Mean" }), el("th", { text: "p50" }),
+                              el("th", { text: "p99" }), el("th", { text: "Max" }))),
+          el("tbody", {}, m.stages.map((s) => el("tr", { title: s.meaning || "" },
+            el("td", {}, el("code", { text: s.stage }),
+              s.meaning ? el("div", { class: "muted", style: "font-size:12px", text: s.meaning }) : null),
+            el("td", { class: "muted" }, String(s.count)),
+            el("td", {}, formatMs(s.meanMs)),
+            el("td", {}, formatMs(s.p50Ms)),
+            el("td", {}, formatMs(s.p99Ms)),
+            el("td", {}, formatMs(s.maxMs)))))))
+      : el("div", { class: "empty",
+          text: "No samples yet. A stage with nothing through it is absent rather than zero." }),
+    el("div", { class: "body muted", style: "font-size:12px", text: m.note || "" }));
+}
+
+function formatMs(v) {
+  if (typeof v !== "number") return "—";
+  return v < 1 ? v.toFixed(3) + " ms" : v.toFixed(1) + " ms";
+}
+
+// What this server cannot answer, and why. An absent section would read as "nothing to show",
+// which is a different claim from "this is not tracked".
+function unavailableSection(items) {
+  if (!items || !items.length) return null;
+  return el("div", { class: "card" },
+    el("h2", { text: "Not available here" }),
+    el("div", { class: "body" }, ...items.map((x) => el("div", { style: "margin-bottom:8px" },
+      el("code", { text: x.what }),
+      el("div", { class: "muted", style: "font-size:12px", text: x.why })))));
+}
+
+async function drainServer() {
+  const ns = state.ns;
+  if (!confirm("Drain this server?\n\nNew writes will be refused from now on and /readyz will "
+      + "answer 503, so a load balancer stops routing here. In-flight writes finish.\n\n"
+      + "This cannot be undone without restarting the process. Reads are unaffected.")) return;
+  try {
+    const res = await api("/v1/ops/drain", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: ns }),
+    });
+    flash(res.writesQuiet
+      ? "Draining. In-flight writes finished."
+      : "Draining. " + (res.warning || "Writes were still in flight when the wait elapsed."));
+  } catch (e) {
+    flash("Drain failed: " + e.message);
+  }
+  await renderOps();
 }
 
 // reviewPromotion shows the server's plan and asks for the namespace to be typed.

@@ -249,6 +249,54 @@ func (m *LockManager) Sweep() int {
 	return removed
 }
 
+// HeldLock is one held lock, as an observer sees it.
+type HeldLock struct {
+	NamespaceID string
+	DocID       codec.UUID
+	SessionID   string
+	Fence       uint64
+	// ExpiresAt is the lease deadline. Zero means the lock does not expire on its own - an
+	// implicit hold taken and dropped inside one call - which is a different situation from a
+	// lease with time left, and worth distinguishing to whoever is looking at it.
+	ExpiresAt time.Time
+}
+
+// Held lists the unexpired locks, newest deadline last.
+//
+// HeldCount has always answered "how many", which is enough for a gauge and no use at all at 3am:
+// the question then is *which document is stuck and who is holding it*. Expiry is evaluated here
+// the same way every lookup evaluates it, so an expired lock the sweeper has not reached yet is
+// not reported as held.
+func (m *LockManager) Held() []HeldLock {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	out := make([]HeldLock, 0, len(m.locks))
+	for key, rec := range m.locks {
+		if !rec.expiresAt.IsZero() && !now.Before(rec.expiresAt) {
+			continue
+		}
+		out = append(out, HeldLock{
+			NamespaceID: key.namespaceID, DocID: key.docID, SessionID: rec.sessionID,
+			Fence: rec.fence, ExpiresAt: rec.expiresAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ExpiresAt.Equal(out[j].ExpiresAt) {
+			return out[i].DocID.String() < out[j].DocID.String()
+		}
+		// A lock with no deadline sorts last: it is not the one about to free itself.
+		if out[i].ExpiresAt.IsZero() {
+			return false
+		}
+		if out[j].ExpiresAt.IsZero() {
+			return true
+		}
+		return out[i].ExpiresAt.Before(out[j].ExpiresAt)
+	})
+	return out
+}
+
 // HeldCount reports how many unexpired locks exist (tests and metrics).
 func (m *LockManager) HeldCount() int {
 	m.mu.Lock()

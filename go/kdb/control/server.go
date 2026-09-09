@@ -275,6 +275,12 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/settings/{key}", s.adminRead(s.handleSettingByKey))
 	mux.Handle("PATCH /v1/settings", s.adminRead(s.handlePatchSettings))
 	mux.Handle("GET /v1/ops/runtime", s.adminRead(s.handleOpsRuntime))
+	mux.Handle("GET /v1/ops/locks", s.adminRead(s.handleOpsLocks))
+	mux.Handle("GET /v1/ops/metrics", s.adminRead(s.handleOpsMetrics))
+	// Draining is one-way and gated on --control-write plus a typed confirmation. It is a read
+	// route only in the sense that every control route authorizes the same way; the handler
+	// refuses without write permission.
+	mux.Handle("POST /v1/ops/drain", s.adminRead(s.handleOpsDrain))
 
 	// Revert. Planning is a read - it computes a diff and writes nothing - so it is available
 	// whatever the write setting, and an operator can always see what a revert *would* do. Only

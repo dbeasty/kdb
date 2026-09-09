@@ -3672,3 +3672,179 @@ func TestCompareWorksOnAReadOnlyControlPlane(t *testing.T) {
 		t.Fatalf("compare should not need write permission: %d (%v)", res.StatusCode, body)
 	}
 }
+
+// The operations dashboard (§9 screen 9).
+//
+// §5 named sessions, leases, peers and metrics here, plus a drain. Two of those can be built from
+// data that exists, one is a real operation, and two cannot be built at all - and the tests care
+// about that last part as much as the first: an empty "Sessions" table would be read as "nobody is
+// connected", which is a different claim from "this server does not track that".
+
+func TestOpsLocksNamesTheHolder(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seeded := seed(t, cs, `{"id":"a"}`)
+	docID := seeded[0].DocID
+
+	// A lease is the case that matters: a client hold spanning round trips, which is the thing an
+	// operator finds in the way of a write that will not go through.
+	lease, err := cs.opts.Runtime.DocumentLocks.TryAcquireLease(
+		"demo/users", docID, "sess-42", 30*time.Second)
+	if err != nil {
+		t.Fatalf("acquire lease: %v", err)
+	}
+
+	res, body := get(t, base, "/v1/ops/locks")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("locks: %d (%v)", res.StatusCode, body)
+	}
+	if body["count"].(float64) != 1 {
+		t.Fatalf("one lock is held: %v", body)
+	}
+	held := body["locks"].([]any)[0].(map[string]any)
+	if held["docId"] != docID.String() {
+		t.Errorf("the lock should name the document: %v", held)
+	}
+	if held["sessionId"] != "sess-42" {
+		t.Errorf("and who holds it: %v", held)
+	}
+	if held["kind"] != "lease" {
+		t.Errorf("a lease should be distinguishable from an implicit hold: %v", held)
+	}
+	if held["expiresIn"] == nil || held["expiresAt"] == nil {
+		t.Errorf("a lease has a deadline and should report it: %v", held)
+	}
+	if held["fence"].(float64) != float64(lease.Fence) {
+		t.Errorf("fence should match the lease: %v vs %d", held["fence"], lease.Fence)
+	}
+
+	// Released, it stops being reported - the list is what is held now, not what was.
+	cs.opts.Runtime.DocumentLocks.Release("demo/users", docID, "sess-42")
+	if _, after := get(t, base, "/v1/ops/locks"); after["count"].(float64) != 0 {
+		t.Errorf("the released lock should be gone: %v", after)
+	}
+}
+
+// An expired lease is not held, whether or not the sweeper has run. Expiry is evaluated on every
+// lookup, and this list has to agree with that rather than report a lock nothing would honour.
+func TestOpsLocksOmitsExpiredLeases(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seeded := seed(t, cs, `{"id":"a"}`)
+
+	if _, err := cs.opts.Runtime.DocumentLocks.TryAcquireLease(
+		"demo/users", seeded[0].DocID, "sess-1", 1*time.Nanosecond); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	_, body := get(t, base, "/v1/ops/locks")
+	if body["count"].(float64) != 0 {
+		t.Errorf("an expired lease is not held: %v", body)
+	}
+}
+
+func TestOpsMetricsReportsTheWritePath(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seed(t, cs, `{"id":"a"}`, `{"id":"b"}`)
+
+	res, body := get(t, base, "/v1/ops/metrics")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("metrics: %d (%v)", res.StatusCode, body)
+	}
+	stages, _ := body["stages"].([]any)
+	// The in-memory fixture may not exercise every stage, so this asserts the shape rather than a
+	// particular stage: whatever is reported must be complete and explained.
+	for _, raw := range stages {
+		s := raw.(map[string]any)
+		for _, field := range []string{"stage", "count", "meanMs", "p50Ms", "p99Ms", "maxMs"} {
+			if _, ok := s[field]; !ok {
+				t.Errorf("stage %v is missing %s", s["stage"], field)
+			}
+		}
+		if s["count"].(float64) <= 0 {
+			t.Errorf("a reported stage should have samples; a stage with none is absent: %v", s)
+		}
+		if s["meaning"] == nil || s["meaning"] == "" {
+			t.Errorf("stage %v has no explanation, so a number here says nothing", s["stage"])
+		}
+	}
+}
+
+// The two sections that cannot be built have to say so where an operator would look for them.
+func TestOpsRuntimeSaysWhatItCannotAnswer(t *testing.T) {
+	_, base := newFixture(t)
+	_, body := get(t, base, "/v1/ops/runtime")
+	items, _ := body["notAvailable"].([]any)
+	if len(items) == 0 {
+		t.Fatal("the unanswerable sections should be listed rather than omitted")
+	}
+	found := map[string]string{}
+	for _, raw := range items {
+		x := raw.(map[string]any)
+		found[fmt.Sprint(x["what"])] = fmt.Sprint(x["why"])
+	}
+	if !strings.Contains(found["sessions"], "per connection") {
+		t.Errorf("sessions should explain there is no global registry: %q", found["sessions"])
+	}
+	if !strings.Contains(found["peers"], "no peer registry") {
+		t.Errorf("peers should explain there is nothing to read: %q", found["peers"])
+	}
+}
+
+// Draining is one-way, so it is gated the way promotion is: --control-write plus the namespace
+// typed back.
+func TestDrainNeedsWritePermissionAndConfirmation(t *testing.T) {
+	_, readOnly := newFixture(t)
+	if res, body := postJSON(t, readOnly, "/v1/ops/drain", `{"confirm":"demo/users"}`); res.StatusCode != http.StatusForbidden {
+		t.Errorf("a read-only plane must not drain: %d (%v)", res.StatusCode, body)
+	}
+
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	for _, payload := range []string{`{}`, `{"confirm":"wrong"}`} {
+		res, body := postJSON(t, base, "/v1/ops/drain", payload)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s should be refused: %d (%v)", payload, res.StatusCode, body)
+		}
+		if !strings.Contains(fmt.Sprint(body["error"]), "cannot be undone") {
+			t.Errorf("the refusal should say it is one-way: %v", body["error"])
+		}
+	}
+	if cs.opts.Runtime.IsDraining() {
+		t.Fatal("a refused drain must not have drained anything")
+	}
+}
+
+// TestDrainStopsWritesAndLeavesReadsAlone is the whole contract, and it is destructive - the
+// fixture is not usable for writes afterwards, which is exactly the property being asserted.
+func TestDrainStopsWritesAndLeavesReadsAlone(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seeded := seed(t, cs, `{"id":"a"}`)
+
+	res, body := postJSON(t, base, "/v1/ops/drain", `{"confirm":"demo/users","waitSeconds":1}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("drain: %d (%v)", res.StatusCode, body)
+	}
+	if body["draining"] != true || body["writesQuiet"] != true {
+		t.Errorf("an idle server should drain immediately: %v", body)
+	}
+	if body["alreadyWas"] != false {
+		t.Errorf("it was not draining before: %v", body)
+	}
+	if !cs.opts.Runtime.IsDraining() {
+		t.Fatal("the runtime should be draining")
+	}
+
+	// Writes are refused from now on.
+	path := "/v1/ns/demo%2Fusers/docs/" + seeded[0].DocID.String()
+	if res, _ := sendJSON(t, http.MethodPut, base, path, `{"body":{"id":"a","n":2}}`); res.StatusCode < 400 {
+		t.Errorf("a write after draining should be refused, got %d", res.StatusCode)
+	}
+	// Reads are not.
+	if res, b := get(t, base, "/v1/ns/demo%2Fusers/docs"); res.StatusCode != http.StatusOK {
+		t.Errorf("reads must be unaffected by draining: %d (%v)", res.StatusCode, b)
+	}
+	// And it is idempotent: draining an already-draining server says so rather than failing.
+	_, again := postJSON(t, base, "/v1/ops/drain", `{"confirm":"demo/users","waitSeconds":1}`)
+	if again["alreadyWas"] != true {
+		t.Errorf("a second drain should report it was already draining: %v", again)
+	}
+}

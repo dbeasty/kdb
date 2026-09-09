@@ -469,6 +469,9 @@ func (s *Server) handleOpsRuntime(w http.ResponseWriter, r *http.Request, _ auth
 			"note":    "no memory budget configured; every operation is admitted",
 		}
 	}
+	// What §5 asked for here and this server cannot answer, with the reason. Reported rather than
+	// omitted: an absent section reads as "nothing to show", which is a different claim.
+	body["notAvailable"] = unavailableOps
 	writeJSON(w, http.StatusOK, body)
 }
 
