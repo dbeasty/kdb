@@ -88,7 +88,9 @@ and asserts the target is absent before starting.
 
 ## Still open
 
-- **Blob-store compaction fails on large namespaces**: `could not compact the blob store
-  (append size exceeds max ...) - it keeps its current tables`, seen at ~108,000 documents.
-  Unrelated to this change and not investigated.
-- The full workload matrix has not been re-run since these fixes; only the insert rows have.
+- ~~**Blob-store compaction fails on large namespaces**~~ — **fixed** by PR #54: the SSTable
+  footer was written in a single append and outgrew the 16MB per-append ceiling at about
+  200,000 keys.
+- ~~The full workload matrix has not been re-run since these fixes~~ — re-run the same day and
+  complete for the first time since the regression, in
+  [`2026-09-09-workload-matrix-complete.md`](2026-09-09-workload-matrix-complete.md).
