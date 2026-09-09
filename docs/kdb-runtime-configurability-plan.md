@@ -1,7 +1,9 @@
 # Runtime configurability: change settings without a restart
 
 **Status:** plan, nothing implemented. Written 2026-09-09 against
-`feat/scheduled-maintenance-loop` (PR #51).
+`feat/scheduled-maintenance-loop` (PR #51). §3 revised the same day after
+review: the mode switch is non-destructive and reclamation is a separate
+explicit act, which is a better design than the one first written here.
 
 The ask, in the order it was given:
 
@@ -120,9 +122,9 @@ The target class for each setting, and what it needs:
 | `governance.maintenanceInterval` | restart | **live** | setter on the scheduler |
 | `governance.maintenanceSweep` | *(absent)* | **live** | descriptor + setter |
 | `governance.maintenanceMaxDefer` | *(absent)* | **live** | descriptor + setter |
-| `governance.reclaimMode` | *(absent)* | **live** | new; see §2 |
-| `retain.duration` / `retain.commits` | *(absent)* | **live** | descriptor + setter; read per pass already |
-| `history.mode` | *(absent)* | **namespace-reopen**, then live for `full`→`none` | §3 |
+| `retain.duration` / `retain.commits` | *(absent)* | **live** | descriptor + setter; see below |
+| `governance.reclaim` | *(absent)* | **live** | new; `manual`/`immediate`/`balanced`/`lazy`, see §2-3 |
+| `history.mode` | *(absent)* | **live** | §3 — the switch writes a marker and destroys nothing |
 | `history.strategy` | immutable | immutable | unchanged — it is a migration |
 
 `retain.*` is the easiest of these, though not free. The window is already
@@ -141,10 +143,15 @@ new trigger for the genuinely-immediate end.
 
 | preset | `Interval` | `Sweep` | `Busy` respected | `MaxDefer` | extra |
 |---|---|---|---|---|---|
+| `manual` | — | — | — | — | **never reclaims**; only an explicit `compact history` does |
 | `immediate` | 10s | 1m | no | 0 | reclaim on segment seal |
-| `balanced` (default) | 5m | 30m | yes | 6 | — |
+| `balanced` | 5m | 30m | yes | 6 | — |
 | `lazy` | 30m | 6h | yes | 24 | — |
 | `off` | — | — | — | — | reclaim only at close |
+
+`manual` is the important addition and is covered in §3: it is what makes a
+mode switch non-destructive, and it is the state a namespace should land in
+when it is switched to `none`.
 
 `immediate` needs one new hook: a callback on segment seal, so reclamation
 is triggered by the event that creates the opportunity rather than by a
@@ -166,44 +173,107 @@ rather than deferring, which is the coherent reading of "immediate".
 
 ### 3. Switching history mode at runtime
 
-The two directions are not symmetric and should not be presented as if they
-were.
+**Revised 2026-09-09 after review.** The earlier version of this section
+treated `full`→`none` as inherently destructive and `none`→`full` as a
+one-way door. That framing was wrong, because it conflated two things that
+should be separate: *which mode a namespace is in* and *whether anything
+has actually been reclaimed yet*.
 
-**`full` → `none` is tractable, and mostly already written.** What
-`MigrateHistoryMode` does offline is: take the lock, run
-`PrepareForTruncation`, set `historyStrategy=replay`, write the marker
-(`embed/migrate_history.go:116`). The expensive step — making every live
-body durable outside the log — is a method the running maintenance loop
-*already calls on a live engine every pass*. The remaining pieces are:
+#### The mode switch itself destroys nothing
 
-- a setter for the engine's mode, with every reader observing the change
-  consistently (today it is read from config at open);
-- stopping tree-object writes mid-flight, which the offline path already
-  declares safe: existing objects become "dead weight, exactly as
-  `MigrateHistoryStrategy` leaves them";
-- marker ordering: bodies durable **then** marker written, so a crash in
-  between leaves `full`, which never deletes anything. Same ordering as the
-  offline path, and safe in the same way.
+Flipping `full`→`none` writes a marker and nothing else. It does not
+delete a segment, does not fold history, does not touch the log. All it
+changes is what the namespace is *permitted* to do later. Flipping back to
+`full` before anything has been reclaimed is therefore completely
+lossless — there is nothing to restore, because nothing was lost.
 
-**`none` → `full` is a one-way door in the other direction and must be
-labelled as one.** Segments are already deleted; nothing can resurrect
-them. The offline path just flips the marker. So the honest description is
-*"stop reclaiming from here on"*, **not** *"restore history"*, and the UI
-must say so before it accepts the change. It also leaves the namespace on
-`replay` — valid for `full`, just slower for historical reads, and
-recovering `objects` is a real migration.
+This makes the mode switch a cheap, reversible, low-stakes operation, which
+is what it should have been: an operator evaluating `none` should be able
+to turn it on, look at what it would reclaim, and turn it off again.
 
-**Recommended staging:** `full`→`none` first, as `MutabilityNamespaceReopen`
-(Gap C), before attempting it live. A reopen gets the correct result with
-the existing, tested offline code path plus a drain, and it is a much
-smaller correctness surface than mutating an open engine's mode. Promote it
-to live only if the reopen pause proves unacceptable.
+#### Reclamation is a separate, explicit act
 
-**Resolve Gap D as part of this.** Either the policy's `HistoryMode`
-becomes a projection of the marker (read-only, reported), or writing it
-becomes the thing that triggers the migration. Two independently-writable
-fields that disagree is the worst of the three options, and is what exists
-today.
+The destructive step is `compact history`, and it is the real one-way door
+— correctly located, and now the only place a confirmation is warranted.
+
+This needs a `reclaim` axis orthogonal to the mode, which folds into the
+preset ladder from §2:
+
+| reclaim | behaviour |
+|---|---|
+| `manual` | **nothing is ever reclaimed automatically.** Only an explicit `compact history` deletes anything |
+| `immediate` | reclaim on segment seal |
+| `balanced` | the PR #51 default: every 5m, when there is something to do and nothing to fight |
+| `lazy` | every 30m, deferring hard to load |
+
+**`manual` should be the default a namespace lands in when it is switched
+to `none`.** Turning on a mode should not, by itself, start deleting data.
+An operator opts into automatic reclamation as a second, separate decision.
+
+This does mean `none` + `manual` gives unbounded disk, which is the thing
+`none` exists to prevent — so the UI has to say plainly that the mode is
+armed but not reclaiming, and how much is currently eligible. `planTruncation`
+computes exactly that without deleting anything, so the number is available.
+
+#### The "special entry that stays" already exists — as the checkpoint
+
+The natural way to express "history collapses to one retained thing" would
+be a synthetic baseline commit standing in for everything below the floor,
+with the oldest retained commit re-parented onto it. **That is not
+available.** `ParentHashes` is inside the hashed commit payload
+(`document/kdb_commit.go:59`), so re-parenting the oldest retained commit
+changes its hash, which changes every descendant's hash, which rewrites the
+entire namespace's identity. A baseline cannot live in the hash chain.
+
+It has to be a side structure the loader knows about — and the checkpoint
+is already exactly that. It survives truncation by construction, it holds
+the complete live tree as (docID, contentHash), and under `none` it is
+already promoted from cache to *authority*. The "special entry that stays"
+is built; it just isn't described that way.
+
+What the checkpoint gives back on a restore is therefore **the state at the
+floor, not the commits that produced it**. That is a real limit and it is
+inherent to collapsing history at all.
+
+#### Full restoration is achievable, and is mostly built
+
+Unless the reclaimed segments are kept somewhere. And they already are:
+`s3.ReplicaSink` mirrors every sealed segment (`PutSegment`), and
+`GetSegment` and `ListSegments` **already exist** on it
+(`storage/io/s3/replica_sink.go:60-66`). A namespace with the S3 tier on
+has a complete copy of every segment truncation is about to delete.
+
+**One thing blocks using it, and it is a two-line problem with a real
+design decision behind it.** `PrimaryWithReplicas.Delete` fans deletion out
+to every replica (`storage/io/primary_replicas.go:58-65`), so compaction
+currently destroys the archive it would have restored from.
+
+Splitting "delete locally" from "delete everywhere" turns `compact history`
+into **evict from local disk** — bounded local disk *and* full
+restorability, including the individual commits, not merely the floor
+state. That is the strongest version of what was asked for, and it needs:
+
+- a replica role that deletion does not reach (an *archive* tier, as
+  distinct from a *replica* whose job is to mirror the primary exactly —
+  these are genuinely different jobs and conflating them is why the fan-out
+  exists);
+- a cold-read path that falls back to `GetSegment` when a segment is below
+  the local floor, which is a natural extension of the existing
+  `deltaColdLoader`;
+- a restore action that pulls a range back to local disk and moves the
+  floor back down.
+
+Without an archive tier configured, `compact history` stays genuinely
+destructive and must say so. With one, it is eviction and is safe.
+
+#### What each direction actually means, restated
+
+| action | with no archive | with an archive tier |
+|---|---|---|
+| `full`→`none`, nothing compacted | reversible, lossless | reversible, lossless |
+| `compact history` | destructive; state survives via the checkpoint, commits do not | eviction; everything restorable |
+| `none`→`full` after compaction | history resumes from the floor; the collapsed range is gone | history resumes; the collapsed range can be pulled back |
+
 
 ### 4. Namespace reopen (Gap C)
 
@@ -230,12 +300,12 @@ unavailable.
 `history.mode`, `retain.duration`, `retain.commits`,
 `governance.maintenanceSweep`, `governance.maintenanceMaxDefer` (Gap B).
 Setters on `MaintenanceScheduler` + `liveSettings()` entries for the
-maintenance knobs and `retain.*`. History mode reported but refused, with
-the refusal naming the migration.
+maintenance knobs and `retain.*`. History mode reported, and refused for
+now with the refusal pointing at Phase 4.
 *Exit:* an operator can see every setting that governs reclamation, and
 change the cadence ones from the UI with no restart.
 
-**Phase 2 — reclaim modes.** `governance.reclaimMode` as the preset in §2,
+**Phase 2 — reclaim modes.** `governance.reclaim` as the preset in §2,
 plus the seal-triggered pass for `immediate`. Presets set the underlying
 knobs, which stay individually settable; the UI shows the preset and what
 it resolved to.
@@ -248,15 +318,27 @@ changeable. Replace that refusal string with an implementation.
 *Exit:* `cache.documentBytes` changes on a running server, with the pause
 reported and bounded.
 
-**Phase 4 — history mode switching.** `full`→`none` via Phase 3's reopen,
-with Gap D resolved. `none`→`full` with the one-way-door warning. Live
-(no-reopen) switching only if Phase 3's pause proves unacceptable in
-practice.
-*Exit:* a namespace converts `full`→`none` from the UI and its next
-maintenance pass reclaims correctly.
+**Phase 4 — history mode switching, non-destructively.** The marker flip
+plus `reclaim=manual` as the landing state, with Gap D resolved. Because
+the switch destroys nothing, this no longer depends on Phase 3's reopen for
+safety — only on the engine observing a mode change consistently.
+*Exit:* a namespace switches `full`→`none` and back from the UI with no
+data change either way, and reports how much would be eligible if compacted.
 
-Phases 1 and 2 are independent of 3 and 4 and deliver most of the day-to-day
-value; 3 is the structural one; 4 depends on 3.
+**Phase 5 — `compact history`, and the archive that makes it reversible.**
+The explicit reclaim action, plus splitting local deletion from replica
+deletion so an archive tier survives it (§3). Cold-read fallback to
+`GetSegment`, and a restore that moves the floor back down.
+*Exit:* with an archive tier configured, a compacted range is restorable
+commit-for-commit; without one, `compact history` says plainly that it is
+not.
+
+Phase 3 is the structurally valuable one and is independent of the rest —
+it frees six existing settings on its own. Phases 1, 2 and 4 form the
+reclamation story and run in order. Phase 5 is the only one that needs new
+storage behaviour rather than new wiring, and is the one to cut if the
+archive turns out not to be wanted: without it, everything above still
+works, and `compact history` is simply honest about being destructive.
 
 ---
 
@@ -281,6 +363,24 @@ value; 3 is the structural one; 4 depends on 3.
    should mean "react to the seal event promptly", not "run a full pass
    every ten seconds regardless" — the gate is what keeps an idle namespace
    free, and it is orthogonal to how eager the cadence is.
-5. **`none`→`full` in the UI needs a confirmation that names the loss.** An
-   operator who reads "full history" as "history is back" has been
-   misinformed by the label, not by the code.
+5. **The confirmation belongs on `compact history`, not on the mode
+   switch.** Putting it on the switch trains operators to click through the
+   dialog that does not matter, so the one that does gets clicked through
+   too.
+6. **`none` + `manual` has unbounded disk**, which is the failure `none`
+   exists to prevent. That is the correct default because it is *safe*, not
+   because it is finished — so the UI has to show that the mode is armed but
+   not reclaiming, and how much is eligible. Do not let a namespace sit in
+   that state silently.
+7. **Replica deletion currently destroys the archive.**
+   `PrimaryWithReplicas.Delete` fans out to every replica, so today
+   truncation deletes the S3 copy along with the local one. Any restore
+   story depends on splitting those two, and the split is a real design
+   decision: a *replica* mirrors the primary exactly (deletions included),
+   an *archive* deliberately does not. Do not quietly make replicas stop
+   honouring deletes — add the second role.
+8. **A restore has to move the floor back down.** The checkpoint's
+   `floorSequence` is what the open guard uses to tell "truncated as
+   designed" from "damaged" - pulling segments back below the floor without
+   lowering it leaves them ignored, and lowering it without the segments
+   actually present turns a clean open into a hard failure.
