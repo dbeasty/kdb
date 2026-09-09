@@ -670,8 +670,8 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 		}
 		changed = append(changed, TreeChange{DocID: doc.ID, ContentHash: h})
 		// Under a mode that deletes delta segments, the log is not a home
-		// this version can rely on. See document_bodies.go.
-		e.putDocumentBody(h, doc)
+		// this version can rely on - but that home is filled in lazily, at
+		// PrepareForTruncation time, not here. See document_bodies.go.
 		prev, hadPrev := e.tree.HashFor(doc.ID)
 		// Pin before Put, never after: Put evicts to stay within budget as
 		// part of the insert, so a version pinned afterwards can already be
