@@ -506,6 +506,18 @@ func (e *ServerEngine) RecordTreeObject(base, result document.DocumentTree, puts
 	e.putTreeObject(base, result, puts, deletes)
 }
 
+// cachedTreeFor answers from what is already in memory, without disturbing it: the live
+// snapshot first, then the bounded store without promoting what it looks at.
+func (e *ServerEngine) cachedTreeFor(h codec.Hash) (document.DocumentTree, bool) {
+	if s := e.latestTree.Load(); s != nil && s.hash == h {
+		return s.tree, true
+	}
+	if e.treesByHash == nil {
+		return document.DocumentTree{}, false
+	}
+	return e.treesByHash.Peek(h)
+}
+
 func (e *ServerEngine) treeChainStateOf(h codec.Hash) treeChainState {
 	e.treeChainMu.Lock()
 	defer e.treeChainMu.Unlock()
@@ -533,6 +545,10 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 	var chain []treeObject
 	current := hash
 	grounded := false
+	// What the forward pass starts from. Empty unless the walk finds an ancestor already in
+	// memory, which is the difference between a rebuild costing the namespace and costing the
+	// commits since that ancestor.
+	base := document.EmptyDocumentTree()
 	// How far this may walk is set by the chain itself. The writer's
 	// interval scales with the tree (treeChainLimitFor), so this end
 	// cannot know the bound from configuration alone - but the first
@@ -545,6 +561,25 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 		if current == emptyHash {
 			grounded = true
 			break
+		}
+		// A resident ancestor ends the walk. Grounding on the last full object instead means
+		// applying the whole namespace forward - treeChainFullAt lets a chain run to size
+		// entries, so a single resolution was O(namespace) however close a usable tree was.
+		// Rare rather than frequent, which is the shape a per-commit average hides: at 108,000
+		// documents a handful of these were 75% of a benchmark's CPU while every other commit
+		// was fine. TestRebuildStopsAtAResidentAncestor measures 869 objects without this and
+		// 5 with it.
+		//
+		// The same move the replay strategy's rebuild already makes (rebuildTreeByFolding folds
+		// from the nearest cached ancestor rather than from genesis); the objects strategy
+		// simply never did it. Peek rather than Get, so probing for an ancestor does not
+		// promote entries and evict the very tree it is walking toward.
+		if i > 0 {
+			if t, ok := e.cachedTreeFor(current); ok {
+				base = t
+				grounded = true
+				break
+			}
 		}
 		raw := e.memTable.Get(current)
 		if raw == nil {
@@ -561,6 +596,7 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 			}
 		}
 		chain = append(chain, o)
+		e.treeChainSteps.Add(1)
 		if o.kind == treeObjectKindFull {
 			grounded = true
 			break
@@ -572,7 +608,7 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 		// this store that does not share this file's rules.
 		return document.DocumentTree{}, false
 	}
-	tree := document.EmptyDocumentTree()
+	tree := base
 	var err error
 	for i := len(chain) - 1; i >= 0; i-- {
 		o := chain[i]

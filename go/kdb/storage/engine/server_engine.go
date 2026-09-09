@@ -90,6 +90,11 @@ type ServerEngine struct {
 	// not rebuilding, which is a property no timing measurement states
 	// reliably. See PinTree.
 	treeRebuilds atomic.Int64
+	// treeChainSteps counts tree objects fetched while rebuilding historical trees. This is
+	// what says whether a rebuild is bounded: grounding on the last full object makes one
+	// resolution cost the whole namespace, while stopping at a resident ancestor costs the
+	// commits between here and there. A duration cannot state that property; this can.
+	treeChainSteps atomic.Int64
 	// lastColdLoads is what coldLoads read at the previous DemandBytes
 	// call, so demand can tell "at its ceiling and coping" from "at its
 	// ceiling and missing" - the only difference that should move a budget.
@@ -215,6 +220,26 @@ func (e *ServerEngine) PinTree(treeHash codec.Hash) {
 		return
 	}
 	e.treesByHash.Pin(treeHash)
+	// Re-seat the tree if it was evicted between the caller resolving it and this pin landing.
+	//
+	// Pinning a hash protects an entry; it cannot conjure one back. On a large namespace the
+	// history cache holds barely one tree, so a writer that reads head and then pins it can be
+	// beaten to the eviction by the writers behind it - measured at 1,242 such pins in a
+	// 110,000-document run. Each one that later resolved its base paid a full chain replay,
+	// which is O(namespace): 78 of them accounted for 75% of the whole benchmark's CPU. Rare
+	// and enormous, rather than frequent and small, which is why it hid behind a per-commit
+	// average.
+	//
+	// latestTree is the atomic snapshot outside the store and is never evicted, so when the
+	// base is head - which it always is for the callers that resolve their own base - the value
+	// is still right here and simply needs putting back. The pin is taken first, so the Put
+	// cannot be undone by the eviction that made it necessary.
+	if _, ok := e.treesByHash.Peek(treeHash); ok {
+		return
+	}
+	if s := e.latestTree.Load(); s != nil && s.hash == treeHash {
+		e.treesByHash.Put(s.tree)
+	}
 }
 
 // UnpinTree releases one pin taken by PinTree.
@@ -475,6 +500,10 @@ func (e *ServerEngine) ColdDocumentLoads() int64 { return e.coldLoads.Load() }
 // HistoryTreeRebuilds is how many times a document tree had to be resolved from tree objects
 // or by folding the delta log, rather than being found resident. For tests and reporting.
 func (e *ServerEngine) HistoryTreeRebuilds() int64 { return e.treeRebuilds.Load() }
+
+// HistoryTreeChainSteps is how many tree objects those rebuilds have fetched in total. For
+// tests and reporting - see treeChainSteps.
+func (e *ServerEngine) HistoryTreeChainSteps() int64 { return e.treeChainSteps.Load() }
 
 // coldDocLoader finds one document version by the content hash a
 // DocumentTree recorded for it. See SetColdLoader.

@@ -112,8 +112,10 @@ signals in the meantime.
 - ~~**The document trie**: path compression or a shallower fan-out.~~ **Done** —
   [`2026-09-08-document-trie-compression.md`](2026-09-08-document-trie-compression.md).
   ~4,900 bytes per document became ~160, with every tree hash preserved, and the insert rows
-  below now complete. What remains on those rows is a *throughput* taper with namespace size,
-  not a memory wall: something else on the write path is still O(namespace).
+  below now complete. What remained on those rows was a *throughput* taper with namespace size,
+  **also fixed** the following day - see
+  [`2026-09-09-bounded-tree-rebuild.md`](2026-09-09-bounded-tree-rebuild.md). The insert row now
+  runs at 32,326 ops/sec at ~108,000 documents, above the 30,051 baseline.
 - The full matrix has not been run to completion since `7947cce`; ten of eighteen
   `BenchmarkWorkloadDurability` rows were not reached before the insert row wedged this run.
   Everything reached is above.
