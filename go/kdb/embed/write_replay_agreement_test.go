@@ -1,12 +1,9 @@
 package embed_test
 
 import (
-	"encoding/json"
-	"errors"
 	"path/filepath"
 	"testing"
 
-	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/schema"
@@ -84,30 +81,8 @@ func TestWriteAndReplayAgreeOnAPartialPatch(t *testing.T) {
 	}
 }
 
-// readDocBody reads one document at head and decodes it.
-func readDocBody(rt *embed.EmbeddedKdbRuntime, docID string) (map[string]any, error) {
-	id, err := codec.UUIDFromString(docID)
-	if err != nil {
-		return nil, err
-	}
-	head, err := rt.DAG.Head()
-	if err != nil {
-		return nil, err
-	}
-	commit, ok := rt.DAG.GetCommit(head)
-	if !ok {
-		return nil, errors.New("head commit missing")
-	}
-	doc, err := rt.Storage.GetDocument("demo/users", id, commit.DocumentTreeHash)
-	if err != nil || doc == nil {
-		return nil, err
-	}
-	var body map[string]any
-	if err := json.Unmarshal([]byte(doc.JSON), &body); err != nil {
-		return nil, err
-	}
-	return body, nil
-}
+// readDocBody lives in crash_truncation_test.go: both tests read a document at head the same way,
+// and one helper in the package is one definition of what "the document at head" means.
 
 func renderKeys(body map[string]any) string {
 	if body == nil {
