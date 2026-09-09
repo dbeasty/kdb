@@ -23,7 +23,7 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 | M0 | Foundations | **done** — control plane, auth, SSE hub, embedded UI, and the multi-namespace host: the service opens the data root through `embed.Host` and the control plane serves every namespace it finds |
 | M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, a read-only SQL console, and the lane-assigned commit graph |
 | M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
-| M3 | Writes | **done** — DML and DDL through the SQL console, and per-document edit and delete with compare-and-set on the content hash |
+| M3 | Writes | **done** — DML and DDL through the SQL console, per-document edit and delete with compare-and-set on the content hash, and `replace` for a write that removes the keys it omits |
 | M4 | Rollback | **done** — namespace revert with plan/apply and `expectHead`, plus the per-document timeline with field-level diffs and per-version restore |
 | M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
@@ -39,7 +39,17 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 
 `POST /v1/ns/{ns}/sql` serves all three statement kinds, with permission decided per statement.
 `PUT`/`DELETE /v1/ns/{ns}/docs/{id}` take an optional `ifContentHash` (or `ifAbsent`) and answer 409
-with the hash that beat them. `POST /v1/settings/validate` is folded into `PATCH` as `dryRun`
+with the hash that beat them. `PUT` also takes `replace: true`, which makes the body the whole
+document rather than a patch over it - the one way to remove a key in a single commit.
+
+That is a delete and a write in one transaction, which is what "replace" has always meant to the
+commit fold (`embed.applyCommitToTree` cancels a delete when a later write names the same document).
+What was missing was in staging: `runSchemaPhase` resolved every operation against the *baseline*
+tree, so a transaction could not see its own earlier operations - the write merged over the document
+the delete was removing, and the old keys survived. It now carries the rolling state, which also
+fixes a second write to one document silently dropping the first one's fields. No new operation
+kind: `document.Op` is a cross-language union with golden fixtures behind it, so a new branch would
+be a format change and this is not. `POST /v1/settings/validate` is folded into `PATCH` as `dryRun`
 rather than being a second endpoint that could drift from it.
 
 `PATCH /v1/settings` applies changes with per-key outcomes and, with `persist:true`, writes them
@@ -78,10 +88,10 @@ consistent point across every namespace, which is its own piece of work.
 
 | | Screen | State |
 |---|---|---|
-| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, editing with compare-and-set, delete, and readable at any revision |
+| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, editing with compare-and-set, an opt-in replace that removes omitted keys, delete, and readable at any revision |
 | 2 | SQL console | **built** — SELECT reports the access path and rows examined; DML and DDL are gated on `--control-write` *and* a write grant, and report the commit they produced |
 | 3 | Commit graph | **built** — lane-assigned DAG drawing: verticals for every branch alive at a row, a curve per extra parent, filled nodes for merges, and a gutter of fixed width so it does not shift while scrolling. Lanes come from the server (`?graph=true`) over one whole walk |
-| 4 | Document timeline | **built** — every version of one document, a field-level diff between any two, and restore-this-version as a forward write |
+| 4 | Document timeline | **built** — every version of one document, a field-level diff between any two, and restore-this-version as a forward write that replaces rather than merges, so the document becomes exactly that version |
 | 5 | Branches & tags | **partial** — lists only; a tag row is a shortcut into time travel |
 | 6 | Time travel | **built** |
 | 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
@@ -92,21 +102,15 @@ consistent point across every namespace, which is its own piece of work.
 
 ### What to do next, in order
 
-1. **A replace primitive.** Every write path merges, and there is no way to remove a key in one
-   commit: a `WriteOp` is merged on the way in, and a `DeleteOp` in the same transaction does not
-   help because staging reads every operation against the baseline tree rather than against each
-   other. The editor and the restore-a-version confirmation both tell the operator which keys will
-   be kept; neither can yet drop one. This is the only *correctness* gap left in what is built, so
-   it goes first.
-2. **Refs, properly (M5, §9 screen 5).** Create and delete a branch or tag, and `/compare` between
+1. **Refs, properly (M5, §9 screen 5).** Create and delete a branch or tag, and `/compare` between
    two revisions. The lists are there; nothing can be created from the UI, and comparing two points
    is the one git-viewer question the commit graph cannot answer.
-3. **The operations dashboard (§9 screen 9).** Sessions, leases, peers and metrics, plus
+2. **The operations dashboard (§9 screen 9).** Sessions, leases, peers and metrics, plus
    `POST /v1/ops/drain`. One endpoint reports process and admission state today.
-4. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
+3. **Per-commit document diff** (`/commits/{hash}/diff/{docId}`). The tree diff names which
    documents a commit touched; opening one still means reading it at two revisions by hand.
-5. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
-6. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
+4. **Indexes (§9 screen 8).** Schema is built; the index side of that screen is not.
+5. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
    protocol still ignores it - which is outside this UI's scope and is the reason M2 is partial.
 
 ## 1. What this is

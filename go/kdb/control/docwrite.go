@@ -38,6 +38,17 @@ type docWriteRequest struct {
 	IfContentHash string `json:"ifContentHash"`
 	// IfAbsent makes the write a create: apply only if no document exists at this id.
 	IfAbsent bool `json:"ifAbsent"`
+	// Replace makes the body the whole document rather than a patch over it, so a key the body
+	// omits is removed.
+	//
+	// It is expressed as a delete and a write in one transaction, which is what "replace" has
+	// always meant to the commit fold - a later write cancels an earlier delete on the same
+	// document (embed.applyCommitToTree) - and now means to staging too, which reads each
+	// operation against the state its predecessors left rather than against the baseline.
+	//
+	// Not the default. Every other write path in this engine merges, and a control plane whose
+	// PUT quietly meant something stronger than the wire's would be the more dangerous surprise.
+	Replace bool `json:"replace"`
 }
 
 type docDeleteRequest struct {
@@ -79,15 +90,25 @@ func (s *Server) handlePutDocument(w http.ResponseWriter, r *http.Request, princ
 	// A write is a shallow root-level merge over the stored document - the engine's documented
 	// behaviour for every write path, not a choice this endpoint makes. So a key the body omits
 	// keeps its stored value, and an operator editing in a text box has to be told that rather
-	// than discovering it: the response names exactly which keys were kept.
+	// than discovering it: the response names exactly which keys were kept. Unless they asked for
+	// a replace, in which case those keys are what they asked to remove.
 	retained := retainedKeys(rt, ns, docID, req.Body)
 
-	s.commitDocumentOps(w, r, principal, ns, rt,
-		[]document.Op{document.WriteOp{DocID: docID, Patch: string(req.Body)}}, pre,
+	ops := []document.Op{document.WriteOp{DocID: docID, Patch: string(req.Body)}}
+	if req.Replace {
+		// Order matters and is the whole mechanism: the delete clears the document, the write in
+		// the same transaction puts back exactly the body. Reversed, the delete would win.
+		ops = []document.Op{
+			document.DeleteOp{DocID: docID},
+			document.WriteOp{DocID: docID, Patch: string(req.Body)},
+		}
+	}
+
+	s.commitDocumentOps(w, r, principal, ns, rt, ops, pre,
 		func(commit document.Commit) map[string]any {
 			out := map[string]any{
 				"namespace": ns, "docId": docID.String(), "commit": commit.Hash.Hex(),
-				"merged": true,
+				"merged": !req.Replace, "replaced": req.Replace,
 			}
 			// The hash of what is now stored, read back rather than computed from the request:
 			// under merge semantics the stored document is not the body that was sent, and a
@@ -96,10 +117,16 @@ func (s *Server) handlePutDocument(w http.ResponseWriter, r *http.Request, princ
 				out["contentHash"] = contentHashOf(docID, stored)
 			}
 			if len(retained) > 0 {
-				out["retainedKeys"] = retained
-				out["note"] = "a write merges over the stored document, so these keys were kept " +
-					"even though the body omitted them. To remove them, delete the document and " +
-					"recreate it."
+				if req.Replace {
+					out["removedKeys"] = retained
+					out["note"] = "this was a replace, so these keys are gone. They remain " +
+						"readable at every earlier commit."
+				} else {
+					out["retainedKeys"] = retained
+					out["note"] = "a write merges over the stored document, so these keys were " +
+						"kept even though the body omitted them. Send \"replace\": true to make " +
+						"the body the whole document instead."
+				}
 			}
 			return out
 		})

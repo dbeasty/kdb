@@ -466,22 +466,38 @@ function drawDocument(doc) {
   // is a shallow merge in this engine, so a key deleted in the editor survives - that is worth
   // knowing before pressing save, not after.
   const warn = el("div", {});
+  // A save merges by default, so a key deleted in the editor survives. Ticking this makes the
+  // body the whole document instead - a delete and a write in one commit. Offered as a choice
+  // rather than as the default because every other write path in this engine merges.
+  const replaceBox = el("input", { type: "checkbox", id: "docreplace" });
+  const replaceLabel = el("label", {
+    style: "display:none;gap:5px;align-items:center;font-size:12px;margin-top:6px" },
+    replaceBox, "remove them: replace the document with exactly what is in the box");
   const recheck = () => {
     setKids(warn, );
     let parsed;
     try { parsed = JSON.parse(editor.value); } catch (e) {
       setKids(warn, el("div", { class: "err", text: "Not valid JSON: " + e.message }));
+      replaceLabel.style.display = "none";
       return null;
     }
     const kept = Object.keys(doc.body || {}).filter((k) => !(k in parsed));
     if (kept.length) {
       setKids(warn, el("div", { class: "warn" },
-        "A write merges over the stored document, so ", el("code", { text: kept.join(", ") }),
-        " would be kept. To remove a key, delete the document and recreate it."));
+        replaceBox.checked
+          ? el("span", {}, el("code", { text: kept.join(", ") }),
+              " will be removed. They stay readable at every earlier commit.")
+          : el("span", {}, "A write merges over the stored document, so ",
+              el("code", { text: kept.join(", ") }), " would be kept.")));
+      replaceLabel.style.display = "flex";
+    } else {
+      // Nothing would be dropped either way, so the choice is noise.
+      replaceLabel.style.display = "none";
     }
     return parsed;
   };
   editor.addEventListener("input", recheck);
+  replaceBox.addEventListener("change", recheck);
 
   const save = async () => {
     const parsed = recheck();
@@ -489,12 +505,16 @@ function drawDocument(doc) {
     try {
       const saved = await api(nsPath("/docs/" + encodeURIComponent(doc.docId)), {
         method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body: parsed, ifContentHash: doc.contentHash }),
+        body: JSON.stringify({ body: parsed, ifContentHash: doc.contentHash,
+                               replace: replaceBox.checked }),
       });
       state.editing = null;
       await openDocument(doc.docId);
       await renderData();
-      flash("Saved as commit " + (saved.commit || "").slice(0, 8) + ".");
+      flash("Saved as commit " + (saved.commit || "").slice(0, 8) +
+            (saved.replaced ? " — replaced" +
+              ((saved.removedKeys || []).length ? ", dropping " + saved.removedKeys.join(", ") : "")
+             : "") + ".");
     } catch (e) {
       setKids(warn, el("div", { class: "err", text: e.message }));
     }
@@ -505,6 +525,7 @@ function drawDocument(doc) {
     el("div", { class: "body" }, meta,
       el("div", { style: "margin-top:10px" }, editor),
       warn,
+      replaceLabel,
       el("div", { style: "margin-top:8px;display:flex;gap:8px;align-items:center" },
         el("button", { class: "act", text: "Save", onclick: save }),
         el("button", { class: "act", text: "Cancel",
@@ -666,16 +687,20 @@ async function restoreVersion(version) {
     return;
   }
   const current = await api(nsPath("/docs/" + encodeURIComponent(tl.doc.docId)));
-  const kept = Object.keys(current.body || {}).filter((k) => !(k in body));
-  const warning = kept.length
-    ? "\n\nA write merges, so these keys would be kept rather than removed: " + kept.join(", ")
+  // Restoring a version means the document becomes exactly that version, so this replaces rather
+  // than merges. It used to merge - the only thing available - which meant "restore" could leave
+  // behind keys the restored version never had, and the confirmation had to warn about it.
+  const dropped = Object.keys(current.body || {}).filter((k) => !(k in body));
+  const warning = dropped.length
+    ? "\n\nThese keys are not in that version and will be removed: " + dropped.join(", ")
     : "";
-  if (!confirm("Restore the version at " + version.shortCommit + "?\n\nThis writes a new commit; "
-      + "nothing in history is rewritten." + warning)) return;
+  if (!confirm("Restore the version at " + version.shortCommit + "?\n\nThe document becomes "
+      + "exactly that version. This writes a new commit; nothing in history is rewritten, and "
+      + "every version stays readable." + warning)) return;
   try {
     const saved = await api(nsPath("/docs/" + encodeURIComponent(tl.doc.docId)), {
       method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ body, ifContentHash: current.contentHash }),
+      body: JSON.stringify({ body, ifContentHash: current.contentHash, replace: true }),
     });
     state.timeline = null;
     await renderData();

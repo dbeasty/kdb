@@ -3348,3 +3348,104 @@ func TestJobSnapshotsDoNotAliasTheLiveJob(t *testing.T) {
 		t.Error("an unknown job should report absent rather than an empty one")
 	}
 }
+
+// Replace, through the document endpoint.
+//
+// Every write path in this engine merges, which left the editor unable to remove a key and made
+// "restore this version" mean "restore this version and keep whatever else is there". A delete and
+// a write in one transaction is the spelling; what was missing was staging reading the second
+// against the first, which transaction/default_engine.go now does.
+
+func TestPutWithReplaceRemovesOmittedKeys(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seeded := seed(t, cs, `{"keep":"yes","drop":"me","also":"gone"}`)
+	docID := seeded[0].DocID.String()
+	path := "/v1/ns/demo%2Fusers/docs/" + docID
+
+	res, body := sendJSON(t, http.MethodPut, base, path,
+		`{"replace":true,"body":{"keep":"yes","fresh":"value"}}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("put: %d (%v)", res.StatusCode, body)
+	}
+	if body["replaced"] != true || body["merged"] != false {
+		t.Errorf("the response should say which semantics applied: %v", body)
+	}
+	removed := fmt.Sprint(body["removedKeys"])
+	if !strings.Contains(removed, "drop") || !strings.Contains(removed, "also") {
+		t.Errorf("the response should name the keys it dropped: %v", body["removedKeys"])
+	}
+
+	_, read := get(t, base, path)
+	stored, _ := read["body"].(map[string]any)
+	if _, still := stored["drop"]; still {
+		t.Errorf("a replace should have removed drop: %v", stored)
+	}
+	if _, still := stored["also"]; still {
+		t.Errorf("a replace should have removed also: %v", stored)
+	}
+	if stored["fresh"] != "value" || stored["keep"] != "yes" {
+		t.Errorf("the replacement's own keys should be there: %v", stored)
+	}
+}
+
+// The default is unchanged. A control plane whose PUT quietly meant something stronger than the
+// wire's would be the more dangerous surprise.
+func TestPutWithoutReplaceStillMerges(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seeded := seed(t, cs, `{"keep":"yes","drop":"me"}`)
+	path := "/v1/ns/demo%2Fusers/docs/" + seeded[0].DocID.String()
+
+	res, body := sendJSON(t, http.MethodPut, base, path, `{"body":{"fresh":"value"}}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("put: %d (%v)", res.StatusCode, body)
+	}
+	if body["merged"] != true || body["replaced"] != false {
+		t.Errorf("a plain put still merges: %v", body)
+	}
+	if !strings.Contains(fmt.Sprint(body["retainedKeys"]), "drop") {
+		t.Errorf("the kept keys should still be reported: %v", body["retainedKeys"])
+	}
+	// And the note should point at the way to remove them, which now exists.
+	if !strings.Contains(fmt.Sprint(body["note"]), "replace") {
+		t.Errorf("the note should name the replace option: %v", body["note"])
+	}
+
+	_, read := get(t, base, path)
+	stored, _ := read["body"].(map[string]any)
+	if stored["drop"] != "me" {
+		t.Errorf("a merge keeps the omitted key: %v", stored)
+	}
+}
+
+// TestReplaceIsStillReadableAtEveryEarlierCommit: replace removes a key from the *head*, not from
+// history. If it did otherwise it would be a rewrite, and this database does not do those.
+func TestReplaceIsStillReadableAtEveryEarlierCommit(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	seeded := seed(t, cs, `{"keep":"yes","drop":"me"}`)
+	docID := seeded[0].DocID.String()
+	path := "/v1/ns/demo%2Fusers/docs/" + docID
+
+	_, before := get(t, base, "/v1/ns/demo%2Fusers/log?limit=1")
+	head := before["commits"].([]any)[0].(map[string]any)["hash"].(string)
+
+	res, body := sendJSON(t, http.MethodPut, base, path, `{"replace":true,"body":{"keep":"yes"}}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("put: %d (%v)", res.StatusCode, body)
+	}
+
+	_, atOld := get(t, base, path+"?at="+head)
+	old, _ := atOld["body"].(map[string]any)
+	if old["drop"] != "me" {
+		t.Errorf("the dropped key must still be readable at the earlier commit: %v", old)
+	}
+
+	// And the document's own timeline shows the replace as a modification, not as a delete.
+	_, history := get(t, base, path+"/history")
+	versions := history["versions"].([]any)
+	if len(versions) < 2 {
+		t.Fatalf("want at least a create and a modify: %v", versions)
+	}
+	if latest := versions[0].(map[string]any); latest["change"] != "modified" {
+		t.Errorf("a replace is a modification of the document, got %q", latest["change"])
+	}
+}
