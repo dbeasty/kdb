@@ -5,8 +5,16 @@ the tag alone.
 
 Implemented and verified end to end (see §5 for what each item is and how it was checked):
 the `go/embedbundle` generator, the `make release*` targets, the reproducibility fixes, and
-`.github/workflows/release.yml` calling those same targets. No tag has ever been pushed
-(`git tag` is empty) — `v0.1.0` will be the first.
+`.github/workflows/release.yml` calling those same targets.
+
+**v0.4.0 is the first release that has ever completed.** `v0.2.0`, `v0.3.1` (twice) and `v0.3.2`
+were all tagged and pushed, and every one of those CI runs failed at the same step: `go mod tidy`
+inside the staged embed bundle, because `go/embedbundle` copied `kdb/embed`'s
+`database_backup_test.go` (it imports `kdb/backup` and `kdb/recovery`, both deliberately outside
+the bundle's closure — see §2.2) without the packages it needs, so `tidy` tried to fetch them as
+remote modules and failed offline. The bug predates `v0.2.0`; nothing published under any of those
+tags. Fixed in the same change that cut `v0.4.0` — see R1 and R6 in §5 for what changed and how it
+was verified.
 
 ---
 
@@ -33,7 +41,7 @@ dist/
 
 `VERSION`, `GIT_COMMIT` and `RELEASE_DATE` all have sane defaults (current `VERSION` file,
 `git rev-parse HEAD`, the commit's own timestamp) and can be overridden, which is how CI pins
-them to the tag: `make release-all VERSION=0.1.0 GIT_COMMIT=$GITHUB_SHA GIT_DIRTY=false
+them to the tag: `make release-all VERSION=0.4.0 GIT_COMMIT=$GITHUB_SHA GIT_DIRTY=false
 RELEASE_DATE=$(git log -1 --format=%cI $GITHUB_SHA)`.
 
 ---
@@ -45,12 +53,12 @@ RELEASE_DATE=$(git log -1 --format=%cI $GITHUB_SHA)`.
 | Go binaries | `kdb`, `kdb-service`, `kdb-inspect` × `linux/amd64`, `linux/arm64`, `darwin/arm64` | `make release-binaries` |
 | **Embeddable Go source** | `kdb-go-embed-<version>.zip` | `make release-bundle` |
 | Kotlin jars | one per Gradle module, `<module>-<version>.jar` | `make release-kotlin` |
-| Container image | `ghcr.io/limidus/kdb/kdb-service:<tag>` | `docker/build-push-action` (unchanged) |
+| Container image | `ghcr.io/dbeasty/kdb/kdb-service:<tag>` (`release.yml` uses `${{ github.repository }}`) | `docker/build-push-action` (unchanged) |
 | Checksums | `dist/SHA256SUMS` over everything built so far | `make release-checksums` |
 
 The governing rule for every one of these: **the workflow contains no build logic.** Each CI step
 in `release.yml` is a single `make` target that a developer runs identically on a laptop — that's
-what makes `make release-verify TAG=v0.1.0` a real reproduction of CI's output, not a separate,
+what makes `make release-verify TAG=v0.4.0` a real reproduction of CI's output, not a separate,
 possibly-diverging path.
 
 Kotlin jars carry only the compiled classes, not `-sources.jar` — no plain-jvm module in this
@@ -83,23 +91,24 @@ kdb/query/hybrid  # hybrid query engine
 kdb/index         # index core
 ```
 
-`go list -deps` over those entry points yields the transitive closure — **26 of the module's 35
-top-level packages**:
+`go list -deps` over those entry points yields the transitive closure — **27 of the module's 37
+top-level `kdb/*` packages**:
 
 ```
 kdb/auth          kdb/codec         kdb/codec/schema  kdb/compression
 kdb/dag           kdb/document      kdb/driver        kdb/embed
-kdb/error         kdb/index         kdb/json          kdb/metrics
-kdb/policy        kdb/query/hybrid  kdb/schema        kdb/sql
-kdb/storage       kdb/storage/delta kdb/storage/engine
+kdb/error         kdb/index         kdb/index/fusion  kdb/json
+kdb/metrics       kdb/policy        kdb/query/hybrid  kdb/schema
+kdb/sql           kdb/storage       kdb/storage/delta kdb/storage/engine
 kdb/storage/io    kdb/storage/io/s3 kdb/storage/mem   kdb/storage/memtable
 kdb/storage/sstable kdb/storage/wal kdb/transaction
 ```
 
 Excluded, because nothing an embedder imports reaches them: `kdb/server`, `kdb/client`,
 `kdb/wire`, `kdb/transport`, `kdb/peersync`, `kdb/backup`, `kdb/recovery`, `kdb/integrity`,
-`kdb/inspect`, `kdb/interop`, `kdb/compaction`, `kdb/file`, `kdb/config`, `kdb/tier`,
-`kdb/version`, and all of `cmd/` and `wasm/`.
+`kdb/inspect`, `kdb/interop`, `kdb/compaction`, `kdb/compute`, `kdb/control`, `kdb/file`,
+`kdb/config`, `kdb/integration`, `kdb/service`, `kdb/stream`, `kdb/tier`, `kdb/version`, and all
+of `cmd/` and `wasm/`.
 
 Two rules the generator follows, both of which a naive implementation gets wrong:
 
@@ -111,10 +120,20 @@ Two rules the generator follows, both of which a naive implementation gets wrong
   `darwin/arm64`, `windows/amd64`, `js/wasm` — `go/embedbundle/main.go`'s `platforms` list), so a
   package imported only on a platform the release host isn't cannot be missed.
 
-`_test.go` files are included. They cost little (229 `.go` files, 1.5 MB unpacked) and they are
-the bundle's own acceptance gate — `make bundle-verify` running `go test ./...` inside the
-extracted bundle is what proves the extraction is complete. No package in the closure reads
-`go/testdata/` (only `kdb/interop` does, and it's excluded), so no test fixtures travel with it.
+`_test.go` files are included — they are the bundle's own acceptance gate, `make bundle-verify`
+running `go test ./...` inside the extracted bundle is what proves the extraction is complete —
+with one exception: a test file is **skipped** if it imports a `kdb/...` package outside the
+closure, rather than copied alongside a `go mod tidy` that can't resolve it. Today that's exactly
+one file, `kdb/embed/database_backup_test.go` (it deliberately exercises `kdb/backup` and
+`kdb/recovery`, both out of scope for an embedder); `testFileNeedsOutOfScopeImport` in
+`go/embedbundle/main.go` detects it generically by parsing the file's imports, so a future test
+added the same way is skipped too rather than silently breaking the bundle build again.
+
+Two closure packages, `kdb/codec` and `kdb/index/fusion`, read golden fixtures from `go/testdata/`
+at test time. `go/embedbundle` copies `go/testdata` into the bundle verbatim (small — see §2.5)
+rather than parsing test sources for which files they open, since a relative path can be built in
+more ways than are worth pattern-matching. `kdb/interop`, the one other package under `go/` that
+reads `testdata/`, stays excluded from the bundle entirely, so its fixtures don't need to travel.
 
 ### 2.3 Bundle contents
 
@@ -128,7 +147,8 @@ kdb-go-embed-<version>/
   bundleinfo.go         # package root: BundleVersion/BundleCommit/BundleBuildDate consts, so a
                          # consumer can report which drop it vendored without parsing bundle.json
   rewrite-module.sh     # optional: re-home the bundle under a different module path
-  kdb/...               # the 26 packages
+  testdata/golden/...   # fixtures kdb/codec and kdb/index/fusion's golden tests read
+  kdb/...               # the 27 packages
 ```
 
 `go.mod` keeps the module path `github.com/limidus/kdb/go`, so **no import path in any copied
@@ -150,8 +170,8 @@ the checksums or the release upload.
 Documented in the generated `EMBEDDING.md`:
 
 ```bash
-unzip kdb-go-embed-0.1.0.zip -d third_party/
-go mod edit -replace github.com/limidus/kdb/go=./third_party/kdb-go-embed-0.1.0
+unzip kdb-go-embed-0.4.0.zip -d third_party/
+go mod edit -replace github.com/limidus/kdb/go=./third_party/kdb-go-embed-0.4.0
 go mod tidy
 ```
 
@@ -168,19 +188,18 @@ convenience, not the supported path — the `replace` directive is.
 
 ### 2.5 Validated, not assumed
 
-`make bundle-verify` runs this for real every time; the checks below were also run manually
-against the generator's first output, from two independent output directories to rule out any
-built-in-path leakage:
+`make bundle-verify` runs this for real every time; the checks below were re-run against the
+`v0.4.0` output, from two independent output directories to rule out any built-in-path leakage:
 
 | Check | Result |
 |---|---|
 | `go build ./...` in the extracted bundle | OK |
 | `go vet ./...` | OK |
-| `go test ./...` (26 packages) | all `ok`, no failures |
+| `go test ./...` (27 packages) | all `ok`, no failures |
 | Cross-compile `linux/amd64`, `linux/arm64`, `darwin/arm64` (release platforms) | OK |
 | Cross-compile `windows/amd64`, `js/wasm` (closure-coverage check) | OK |
 | Two independent runs, different output paths, one second apart | byte-identical zip (see §3) |
-| Size | 229 files, 1.5 MB unpacked, ~390 KB zipped |
+| Size | 351 files, 2.7 MB unpacked, ~708 KB zipped |
 
 ### 2.6 Known wart — the AWS SDK
 
@@ -244,18 +263,29 @@ described in this document, not just planned.
 
 - **R1 — `go/embedbundle` generator. DONE.** `go/embedbundle/main.go` + `entrypoints.txt`: reads
   the entry points, computes the union closure across the five platforms in §2.2, copies whole
-  package directories, writes `go.mod`/`go.sum`/`LICENSE`/`bundleinfo.go`/`bundle.json`/
+  package directories (skipping any `_test.go` file that reaches outside the closure — see §2.2),
+  copies `go/testdata` verbatim, writes `go.mod`/`go.sum`/`LICENSE`/`bundleinfo.go`/`bundle.json`/
   `EMBEDDING.md`/`rewrite-module.sh`, runs `go mod tidy` in the staged tree, zips deterministically,
   then deletes the staging directory. Lives in the main module but is excluded from the bundle's
   own closure (nothing in the closure imports it).
   *Verified:* the checks in §2.5.
+  **Found and fixed in the process:** the test-file-skip and testdata-copy behavior above didn't
+  exist until `v0.4.0` — before that, `go/embedbundle` copied every `_test.go` file in a closure
+  package unconditionally, and copied no fixtures at all. `kdb/embed/database_backup_test.go`
+  (added after this document was first written) imports `kdb/backup` and `kdb/recovery`, both
+  outside the closure by design, so `go mod tidy` inside the staged bundle tried to fetch them as
+  remote modules and failed with no network access. This broke every release from `v0.2.0` through
+  the first `v0.4.0` tag push — see the note at the top of this document.
 
 - **R2 — Bundle acceptance gate. DONE.** `make bundle-verify` → `scripts/verify-bundle.sh`:
   unzips to a temp dir and runs `go build`/`go vet`/`go test`/cross-compile with nothing but
   what's inside the zip — no access to the rest of the repo.
-  *Verified:* ran clean against the current tree (§2.5). Not yet exercised against a
-  deliberately-broken closure (e.g. an import from `kdb/embed` reaching `kdb/server`) to confirm
-  it fails loudly — worth a one-off manual check before the first real tag.
+  *Verified:* ran clean against the `v0.4.0` tree (§2.5). Note on what R1's real breakage exposed:
+  the `go mod tidy` failure happened inside `release-bundle`, a step upstream of `bundle-verify` in
+  both `make release-go`/`release-all` and `release.yml`'s `artifacts` job — so `bundle-verify`
+  never got a chance to catch or miss it. Still not exercised against a deliberately-broken closure
+  that reaches `bundle-verify` itself (e.g. a non-test file in `kdb/embed` importing `kdb/server`)
+  to confirm that later gate also fails loudly — open item, not blocking.
 
 - **R3 — Reproducibility fixes. DONE.** `RELEASE_DATE` from the commit, `-trimpath` +
   `-ldflags -buildid=`, pinned `toolchain go1.26.3` in `go/go.mod`, deterministic zip.
@@ -293,26 +323,36 @@ described in this document, not just planned.
     deferred.
   - **R5c — jar reproducibility.** Not asserted. `release-verify` only covers `release-go`.
 
-- **R6 — `release.yml` rewrite. DONE.** `version-guard` → `test-gate` (`go test -race`, `go vet`,
-  `gofmt`) → `artifacts` (`make release-all` with Go+Java toolchains, `scripts/verify-bundle.sh`,
-  upload `dist/bin/* dist/bundle/*.zip dist/jars/* dist/SHA256SUMS`) → `image` (unchanged, GHCR
-  push). Every artifact-producing step is one `make` call or one script call.
-  *Not yet verified against real CI* — no tag has been pushed. The commands are identical to
-  what was run and verified locally in §2.5/§3, but GitHub Actions' Ubuntu runner, network
-  conditions and Go/Gradle cache state are still an untested variable.
+- **R6 — `release.yml` rewrite. DONE, verified against real CI.** `version-guard` → `test-gate`
+  (`go test -race`, `go vet`, `gofmt`) → `artifacts` (`make release-all` with Go+Java toolchains,
+  `scripts/verify-bundle.sh`, upload `dist/bin/* dist/bundle/*.zip dist/jars/* dist/SHA256SUMS`) →
+  `image` (unchanged, GHCR push). Every artifact-producing step is one `make` call or one script
+  call.
+  *Verified:* `v0.2.0`, `v0.3.1` (twice) and `v0.3.2` all ran on real CI and all failed at the same
+  step (R1's bug); `v0.4.0`'s first push reproduced that failure once more, and its second push —
+  after the fix — passed `version-guard`, `test-gate`, `artifacts` and `image` end to end,
+  publishing the GitHub release at
+  [github.com/dbeasty/kdb/releases/tag/v0.4.0](https://github.com/dbeasty/kdb/releases/tag/v0.4.0)
+  and `ghcr.io/dbeasty/kdb/kdb-service:v0.4.0`.
+  One operational wrinkle worth remembering: `artifacts` and `image` run in parallel off the same
+  `test-gate`, so a broken `artifacts` step doesn't stop `image` from still pushing a container
+  under the tag (and `latest`) for a release whose other assets never shipped. That happened on
+  the first `v0.4.0` push. Recovering meant deleting and re-pushing the tag at the fixed commit,
+  which reran everything and overwrote both image tags with the corrected build — but a
+  same-tag-different-image window like that is a real possibility any time `artifacts` fails
+  after `test-gate` passes, not just for this specific bug.
 
-- **R7 — `scripts/release-verify.sh` / `make release-verify`. DONE.** Two independent clean
-  snapshots (via `git archive $TAG`, or `rsync` of the working tree when no `TAG` is given),
-  `make release-go` in each, diff `dist/SHA256SUMS`.
-  *Verified:* `./scripts/release-verify.sh` (no-tag mode) against this tree → reproducible.
-  *Not yet verified:* tag mode (`TAG=vX.Y.Z`) — untestable without a committed, tagged ref to
-  point `git archive` at; exercise it against the first real tag.
+- **R7 — `scripts/release-verify.sh` / `make release-verify`. DONE, both modes verified.** Two
+  independent clean snapshots (via `git archive $TAG`, or `rsync` of the working tree when no
+  `TAG` is given), `make release-go` in each, diff `dist/SHA256SUMS`.
+  *Verified:* no-tag mode against this tree, and `make release-verify TAG=v0.4.0` against the real
+  pushed tag — both report byte-for-byte reproducible.
   Not wired into a scheduled workflow yet (the plan's original suggestion) — open item, not
   blocking.
 
 - **R8 — Optional: build-tag the S3 backend.** M, not started. Put `kdb/storage/io/s3` behind
   `//go:build kdb_s3` with a no-op fallback, dropping ~100 AWS packages from an embedder's graph.
-  Independent of the release pipeline; do after `v0.1.0` ships.
+  Independent of the release pipeline; `v0.4.0` already shipped without it — do whenever.
 
 - **R9 — Docs.** Partial. This document exists and is current. Still open: a "Releases" pointer
   in `README.md`'s documentation table, and an embedding section in `docs/kdb-user-guide.md`.
@@ -325,24 +365,28 @@ described in this document, not just planned.
 
 ## 6. Exit criteria
 
-- `git tag -a v0.1.0 && git push origin v0.1.0` produces a GitHub release carrying binaries for
-  three platforms, `kdb-go-embed-0.1.0.zip`, the jars, and `SHA256SUMS`. **Not yet exercised** —
-  no tag pushed.
-- `make release-verify TAG=v0.1.0` on a different machine reports the Go side matching. **Not yet
-  exercised** for the same reason; the no-tag mode covering the same code path has been.
+- `git tag -a vX.Y.Z && git push origin vX.Y.Z` produces a GitHub release carrying binaries for
+  three platforms, `kdb-go-embed-<version>.zip`, the jars, and `SHA256SUMS`. **Exercised and met**
+  — `v0.4.0` (github.com/dbeasty/kdb/releases/tag/v0.4.0), after `v0.2.0`/`v0.3.1`/`v0.3.2` and
+  `v0.4.0`'s own first push surfaced and then confirmed the fix for R1's bug (§5).
+- `make release-verify TAG=vX.Y.Z` reports the Go side matching. **Exercised and met** —
+  `make release-verify TAG=v0.4.0` reports byte-for-byte reproducible (§5, R7). Only run on the
+  same machine as the original build so far; a genuinely different machine is still open, not
+  blocking.
 - A scratch Go project consuming only the zip compiles and runs a `database/sql` round-trip
   against a file-backed runtime, with no network access to this repository. **Not yet done** —
   `make bundle-verify` proves the bundle builds/tests/cross-compiles standalone, which is close
   but doesn't drive it through an actual external consumer module.
 - The version guard rejects a tag that disagrees with `VERSION`. **Implemented, not yet exercised
-  against a real mismatched tag push.**
+  against a real mismatched tag push** — every tag pushed so far has matched `VERSION` by
+  construction (bump-then-tag).
 
 ---
 
 ## 7. Open decisions
 
 1. **Bundle scope.** This plan takes the full in-process surface — engine + `database/sql` driver
-   + KDB-SQL + hybrid query + index (26 packages). Dropping `kdb/sql`, `kdb/query/hybrid` and
+   + KDB-SQL + hybrid query + index (27 packages). Dropping `kdb/sql`, `kdb/query/hybrid` and
    `kdb/index` gives a 21-package KV/document-only bundle. Note that `kdb/driver` does **not**
    import `kdb/sql`, so the smaller bundle is coherent — but it is a database whose embedders
    cannot write SQL. Full is the default; editing `go/embedbundle/entrypoints.txt` is the whole
