@@ -35,11 +35,29 @@ const trieDepth = 32 // 128-bit codec.UUID, 4 bits (one hex nibble) per level
 
 var trieZero [32]byte // all-zero sentinel for an absent child/subtree
 
+// A trieNode is either a leaf or an internal node (or neither, for a nil
+// *trieNode representing an empty subtree - callers use nil directly rather
+// than allocating a trieNode for that case).
+//
+// A leaf stands for the whole subtree beneath its position when that subtree
+// holds exactly one entry, at whatever depth that becomes true, rather than
+// only at trieDepth. This is the one thing keeping a namespace's memory
+// sane: without it every entry owned a private spine of 32 internal nodes,
+// each carrying a 16-pointer array, which measured at ~4,900 bytes of live
+// heap per document *regardless of the document's size* - a 200,000-document
+// namespace held a 932MB tree for documents of about 20 bytes each. See
+// docs/benchmarks/2026-09-08-base-tree-pinning.md.
+//
+// The hash is unaffected, and deliberately so. A subtree containing one entry
+// has a determined hash - fold leafHash up through the single-child internal
+// nodes it would have had - so a compressed leaf can carry exactly the hash
+// its 32-node spine would have produced. Every tree hash this package has
+// ever emitted is therefore unchanged, which is what lets this be an internal
+// representation change rather than an on-disk format break: the Kotlin
+// implementation, the golden vectors, and every stored tree object stay valid
+// without touching any of them.
 type trieNode struct {
-	hash [32]byte
-	// Exactly one of these is set (or neither, for a nil *trieNode
-	// representing an empty subtree - callers use nil directly rather
-	// than allocating a trieNode for that case).
+	hash     [32]byte
 	leaf     *trieLeaf
 	children *[16]*trieNode
 }
@@ -86,6 +104,42 @@ func internalHash(children *[16]*trieNode) [32]byte {
 	return sha256.Sum256(buf[:])
 }
 
+// internalHashOfOnlyChild is internalHash for the case that matters to
+// compression: an internal node with one occupied slot. The preimage buffer
+// starts zeroed and trieZero is all-zero, so the absent siblings need no
+// writing at all.
+func internalHashOfOnlyChild(nib int, childHash [32]byte) [32]byte {
+	var buf [1 + 16*32]byte
+	buf[0] = 0x01
+	copy(buf[1+nib*32:], childHash[:])
+	return sha256.Sum256(buf[:])
+}
+
+// foldLeaf is the hash of the subtree rooted at depth that holds exactly the
+// one entry (uuidBytes, contentHash) - the spine that used to be built out of
+// real nodes, evaluated instead. At depth 0 this is 32 rounds on top of the
+// leaf, which is precisely what the uncompressed trie computed for a
+// single-entry tree.
+//
+// Costs the same SHA-256 work the old insert did on its way back up, so
+// compression trades no CPU for the memory it saves; what it removes is the
+// allocation of the nodes, not the hashing of them.
+func foldLeaf(uuidBytes []byte, contentHash codec.Hash, depth int) [32]byte {
+	h := leafHash(uuidBytes, contentHash)
+	for d := trieDepth - 1; d >= depth; d-- {
+		h = internalHashOfOnlyChild(nibbleAt(uuidBytes, d), h)
+	}
+	return h
+}
+
+// newLeafNode builds the compressed leaf standing for one entry at depth.
+func newLeafNode(uuidBytes []byte, id codec.UUID, contentHash codec.Hash, depth int) *trieNode {
+	return &trieNode{
+		hash: foldLeaf(uuidBytes, contentHash, depth),
+		leaf: &trieLeaf{uuid: id, hash: contentHash},
+	}
+}
+
 func nodeHash(n *trieNode) [32]byte {
 	if n == nil {
 		return trieZero
@@ -101,11 +155,22 @@ func trieInsert(root *trieNode, id codec.UUID, contentHash codec.Hash) *trieNode
 }
 
 func trieInsertAt(node *trieNode, uuidBytes []byte, id codec.UUID, contentHash codec.Hash, depth int) *trieNode {
+	// An empty subtree becomes one leaf covering everything below here - the
+	// common case, and the whole saving.
+	if node == nil {
+		return newLeafNode(uuidBytes, id, contentHash, depth)
+	}
+	if node.leaf != nil {
+		if node.leaf.uuid == id {
+			return newLeafNode(uuidBytes, id, contentHash, depth)
+		}
+		return splitLeafAt(node.leaf, uuidBytes, id, contentHash, depth)
+	}
 	if depth == trieDepth {
-		return &trieNode{hash: leafHash(uuidBytes, contentHash), leaf: &trieLeaf{uuid: id, hash: contentHash}}
+		return newLeafNode(uuidBytes, id, contentHash, depth)
 	}
 	var children [16]*trieNode
-	if node != nil && node.children != nil {
+	if node.children != nil {
 		children = *node.children
 	}
 	nib := nibbleAt(uuidBytes, depth)
@@ -113,34 +178,76 @@ func trieInsertAt(node *trieNode, uuidBytes []byte, id codec.UUID, contentHash c
 	return &trieNode{hash: internalHash(&children), children: &children}
 }
 
+// splitLeafAt makes room beneath a compressed leaf for a second entry. Only
+// the levels the two keys genuinely share get real nodes, so what this
+// allocates is set by where the keys diverge rather than by trieDepth - for
+// random UUIDs, a handful of levels at n documents rather than 32 at any n.
+func splitLeafAt(existing *trieLeaf, uuidBytes []byte, id codec.UUID, contentHash codec.Hash, depth int) *trieNode {
+	existingBytes := existing.uuid.Bytes()
+	d := depth
+	for d < trieDepth && nibbleAt(existingBytes, d) == nibbleAt(uuidBytes, d) {
+		d++
+	}
+	if d == trieDepth {
+		// Identical in all 128 bits but unequal as UUIDs is not reachable; treat
+		// it as a replace rather than building a node that could never be read.
+		return newLeafNode(uuidBytes, id, contentHash, depth)
+	}
+	// The level they part on holds both, each compressed again beneath it.
+	var children [16]*trieNode
+	children[nibbleAt(existingBytes, d)] = newLeafNode(existingBytes, existing.uuid, existing.hash, d+1)
+	children[nibbleAt(uuidBytes, d)] = newLeafNode(uuidBytes, id, contentHash, d+1)
+	node := &trieNode{hash: internalHash(&children), children: &children}
+	// Levels depth..d-1 are shared by both keys, so they stay ordinary
+	// single-child internal nodes: more than one entry now lives below them,
+	// and a single entry is the only thing a compressed leaf may stand for.
+	for k := d - 1; k >= depth; k-- {
+		var c [16]*trieNode
+		c[nibbleAt(uuidBytes, k)] = node
+		node = &trieNode{hash: internalHash(&c), children: &c}
+	}
+	return node
+}
+
 // trieDelete returns a new root with id removed (no-op if absent),
 // sharing every subtree not on id's path with the original.
 func trieDelete(root *trieNode, id codec.UUID) *trieNode {
-	return trieDeleteAt(root, id.Bytes(), 0)
+	return trieDeleteAt(root, id.Bytes(), id, 0)
 }
 
-func trieDeleteAt(node *trieNode, uuidBytes []byte, depth int) *trieNode {
+func trieDeleteAt(node *trieNode, uuidBytes []byte, id codec.UUID, depth int) *trieNode {
 	if node == nil {
 		return nil
 	}
-	if depth == trieDepth {
-		return nil
+	if node.leaf != nil {
+		if node.leaf.uuid == id {
+			return nil
+		}
+		return node // a different entry lives here; the key is absent
 	}
-	if node.children == nil {
+	if node.children == nil || depth == trieDepth {
 		return node
 	}
 	children := *node.children
 	nib := nibbleAt(uuidBytes, depth)
-	children[nib] = trieDeleteAt(children[nib], uuidBytes, depth+1)
-	allNil := true
+	children[nib] = trieDeleteAt(children[nib], uuidBytes, id, depth+1)
+	var only *trieNode
+	remaining := 0
 	for _, c := range children {
 		if c != nil {
-			allNil = false
-			break
+			remaining++
+			only = c
 		}
 	}
-	if allNil {
+	if remaining == 0 {
 		return nil
+	}
+	// Re-compress on the way back up. One leaf left below means one entry left
+	// below, which is exactly what a compressed leaf stands for. Skipping this
+	// would let the spines compression removed grow back one deletion at a
+	// time, in a namespace that deletes and reinserts steadily.
+	if remaining == 1 && only.leaf != nil {
+		return newLeafNode(only.leaf.uuid.Bytes(), only.leaf.uuid, only.leaf.hash, depth)
 	}
 	return &trieNode{hash: internalHash(&children), children: &children}
 }

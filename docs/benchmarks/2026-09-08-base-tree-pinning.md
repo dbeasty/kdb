@@ -174,7 +174,10 @@ The previous write-up's "Done when" list is now largely met:
   `BenchmarkWorkloadMixedReadWrite`. The full matrix has not been re-run since `7947cce`, and
   every matrix number in `2026-09-07-perf-rerun-7947cce.md` predates this fix.
 
-**Next:** path compression, or a shallower fan-out, in the document trie. It no longer blocks
+**Next:** path compression, or a shallower fan-out, in the document trie. *(Done the same day
+by leaf compression, with every tree hash preserved — see
+[`2026-09-08-document-trie-compression.md`](2026-09-08-document-trie-compression.md). ~4,900
+bytes per document became ~160, and the `-benchtime 3s` failure below now passes.)* It no longer blocks
 this benchmark, but it does bound how large a namespace can be held open - treat
 documents-per-namespace as the binding memory constraint and size deployments from
 ~5KB/document.

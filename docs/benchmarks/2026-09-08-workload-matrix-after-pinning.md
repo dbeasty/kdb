@@ -109,8 +109,11 @@ signals in the meantime.
 
 ## Still open
 
-- **The document trie**: path compression or a shallower fan-out. It now bounds two benchmark
-  rows, and more importantly it bounds how large a namespace can be held open at all.
+- ~~**The document trie**: path compression or a shallower fan-out.~~ **Done** —
+  [`2026-09-08-document-trie-compression.md`](2026-09-08-document-trie-compression.md).
+  ~4,900 bytes per document became ~160, with every tree hash preserved, and the insert rows
+  below now complete. What remains on those rows is a *throughput* taper with namespace size,
+  not a memory wall: something else on the write path is still O(namespace).
 - The full matrix has not been run to completion since `7947cce`; ten of eighteen
   `BenchmarkWorkloadDurability` rows were not reached before the insert row wedged this run.
   Everything reached is above.
