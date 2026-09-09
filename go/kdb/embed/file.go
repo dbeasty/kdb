@@ -116,6 +116,7 @@ func (h *Host) openNamespace(
 		Retain:                opts.Storage.Retain,
 		DocumentCacheBytes:    opts.Storage.DocumentCacheBytes,
 		CommitOpsBytes:        opts.Storage.CommitOpsBytes,
+		DeltaMaxSegmentBytes:  opts.Storage.DeltaMaxSegmentBytes,
 		TreeChainLimit:        opts.Storage.TreeChainLimit,
 		HistoryTreeCacheBytes: opts.Storage.HistoryTreeCacheBytes,
 		DisableCheckpoints:    opts.Storage.DisableCheckpoints,

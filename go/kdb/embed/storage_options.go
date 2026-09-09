@@ -102,6 +102,14 @@ type StorageOptions struct {
 	// obtained again on demand. Zero takes a quarter of the hot-tier
 	// budget. The current tree is not subject to it.
 	HistoryTreeCacheBytes int64
+	// DeltaMaxSegmentBytes caps the active delta segment, after which the
+	// writer seals it and starts the next one. It matters beyond file
+	// tidiness: retention only ever reclaims *sealed* segments, so without
+	// rotation a process that never restarts holds every commit it has made
+	// in one segment truncation is required to leave alone. Zero uses
+	// delta.DefaultDeltaMaxSegmentBytes (64 MiB).
+	DeltaMaxSegmentBytes int64
+
 	// TreeChainLimit is how many delta tree objects may stack up before a
 	// full one is written, under the objects history strategy. Zero uses
 	// the built-in default of 32.

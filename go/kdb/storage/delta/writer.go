@@ -53,8 +53,11 @@ func (w *DefaultWriter) SegmentID() codec.UUID   { return w.segmentID }
 func (w *DefaultWriter) CurrentSizeBytes() int64 { return w.sizeBytes }
 
 // SequenceNumber implements storage.DeltaSegmentSequencer: it reports the
-// segment this writer appends to, which is fixed for the writer's life
-// (OpenWriter always starts a fresh segment rather than resuming one).
+// segment this writer is appending to *now*. OpenWriter always starts a
+// fresh segment rather than resuming one, but the number is no longer fixed
+// for the writer's life - RotateIfNeeded advances it. Anything pairing this
+// with a frame offset must read it and append with no rotation in between;
+// see RotateIfNeeded.
 func (w *DefaultWriter) SequenceNumber() int64 { return w.sequence }
 func (w *DefaultWriter) IsSealed() bool        { return w.sealed }
 
@@ -87,9 +90,87 @@ func (w *DefaultWriter) Flush() error {
 	return w.shim.FlushSegment(w.segmentName)
 }
 
+// DefaultDeltaMaxSegmentBytes is how large the active delta segment may get
+// before RotateIfNeeded starts a new one. Matches the WAL's own default:
+// large enough that rotation is rare, small enough that one segment is not
+// the entire namespace.
+const DefaultDeltaMaxSegmentBytes = 64 * 1024 * 1024
+
+// RotateIfNeeded seals the active segment and starts the next one once it
+// has grown past its cap, and reports whether it did.
+//
+// This exists because retention can only reclaim a *sealed* segment: the
+// truncation planner refuses to touch the one being written to, on the
+// grounds that its contents are not final. Without rotation that exclusion
+// covers everything the running process has ever written - so a server that
+// stays up for weeks cannot reclaim any of its own commits however often
+// maintenance runs, and can only ever reclaim what earlier sessions sealed
+// on their way out. Rotation is what makes history=none bounded for a
+// process that does not restart.
+//
+// Call this only *between* batches, never inside one. The caller records
+// each commit's location as (segment sequence, frame offset) and reads the
+// sequence once for the batch it is about to write (see the commit log's
+// appendBatch); rotating midway would file the records written after the
+// rotation under the sequence of the segment before it, and a later cold
+// read would look for a frame in a segment that never held it. Checking at
+// the boundary keeps that pairing true by construction, at the cost of
+// overshooting the cap by at most one batch - the same "floor, not ceiling"
+// trade the retention window makes.
+func (w *DefaultWriter) RotateIfNeeded() (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.sealed {
+		return false, nil
+	}
+	max := w.config.DeltaMaxSegmentBytes
+	if max <= 0 {
+		max = DefaultDeltaMaxSegmentBytes
+	}
+	// An empty segment never rotates, whatever the cap. Rotating on size
+	// alone would let a cap smaller than a single frame produce an endless
+	// run of empty segments, each sealed the moment it was created.
+	if w.sizeBytes == 0 || w.sizeBytes < max {
+		return false, nil
+	}
+	// Flush before sealing, for the reason the WAL gives at the same point:
+	// the segment is about to stop being written to, and a shim that treats
+	// sealing as final would otherwise leave its tail unflushed.
+	if err := w.shim.FlushSegment(w.segmentName); err != nil {
+		return false, err
+	}
+	if _, err := w.sealLocked(); err != nil {
+		return false, err
+	}
+	id, err := codec.RandomUUID()
+	if err != nil {
+		// The old segment is already sealed, so this writer can take no
+		// further append. Report it rather than leaving the caller to
+		// discover a sealed writer on its next Append.
+		return false, fmt.Errorf(
+			"delta: sealed segment %d but could not name its successor: %w", w.sequence, err)
+	}
+	w.segmentID = id
+	w.sequence++
+	w.segmentName = storio.SegmentNameBuilder.DeltaSequenced(w.namespaceID, w.sequence)
+	w.sizeBytes = 0
+	w.firstCommit = nil
+	w.lastCommit = nil
+	w.sealed = false
+	return true, nil
+}
+
 func (w *DefaultWriter) Seal() (storage.DeltaSegmentRef, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.sealLocked()
+}
+
+// sealLocked is Seal's body, split out so RotateIfNeeded can seal the
+// segment it is rotating away from without releasing the writer's mutex -
+// a rotation that let go halfway would let another append land in a
+// segment that is on its way to being sealed.
+func (w *DefaultWriter) sealLocked() (storage.DeltaSegmentRef, error) {
 	if w.sealed {
 		return storage.DeltaSegmentRef{}, fmt.Errorf("already sealed")
 	}

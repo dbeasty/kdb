@@ -3,6 +3,7 @@ package embed
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -274,8 +275,45 @@ func (c *commitLogWriter) drain(first *logRequest) []*logRequest {
 	return batch
 }
 
+// deltaSegmentRotator is the part of the delta writer the commit log needs to keep segments from
+// growing without bound. An interface rather than the concrete type because the commit log is
+// written against storage.DeltaSegmentWriter and several tests substitute their own, which simply
+// do not rotate.
+type deltaSegmentRotator interface {
+	RotateIfNeeded() (bool, error)
+}
+
+// currentSequence reports the segment a writer is on, for logging. -1 when the writer does not
+// report one, which is only the case for a test double.
+func currentSequence(w storage.DeltaSegmentWriter) int64 {
+	if s, ok := w.(storage.DeltaSegmentSequencer); ok {
+		return s.SequenceNumber()
+	}
+	return -1
+}
+
 // appendBatch writes each record to the segment without flushing.
 func (c *commitLogWriter) appendBatch(batch []*logRequest) error {
+	// Rotate here, before the sequence is read, and never once the loop
+	// below has started: every record in this batch is reported at the one
+	// sequence read on the next line, so a rotation partway through would
+	// file the later ones under the segment they are not in. Doing it at
+	// the boundary is what keeps (sequence, offset) true for every record -
+	// see DefaultWriter.RotateIfNeeded, which says the same thing from the
+	// other side.
+	//
+	// A rotation failure is not fatal to the batch: the old segment is
+	// either still writable (nothing happened) or already sealed, and in
+	// the sealed case the append below fails with a clear error of its own.
+	// Logging and continuing keeps a full disk from looking like a commit
+	// bug.
+	if rotator, ok := c.writer.(deltaSegmentRotator); ok {
+		if rotated, err := rotator.RotateIfNeeded(); err != nil {
+			log.Printf("kdb: could not rotate the delta segment (%v); continuing on the current one", err)
+		} else if rotated {
+			log.Printf("kdb: rotated to delta segment %d", currentSequence(c.writer))
+		}
+	}
 	seq, hasSeq := int64(0), false
 	if s, ok := c.writer.(storage.DeltaSegmentSequencer); ok {
 		seq, hasSeq = s.SequenceNumber(), true
