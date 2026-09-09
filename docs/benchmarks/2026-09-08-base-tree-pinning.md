@@ -2,8 +2,31 @@
 
 Date: 2026-09-08. Commits: fix at **`5c83152`**, merged as **`bb9459f`** (PR #49), branched
 from **`c16d8ab`**. Machine: Apple M3 Max (16 cores), Go 1.26.3 (`darwin/arm64`). Every
-benchmark below was run with nothing else executing - concurrent load on this box fakes
-regressions large enough to send you after the wrong commit.
+benchmark below was **re-measured on a verified-idle machine**; see the methodology note
+immediately below, which is the most useful thing in this document.
+
+## Methodology: every number here was measured twice, and the first set was wrong
+
+The first pass at these numbers was taken while 32 orphaned `while :; do :; done` shells were
+spinning - a load generator another session had started at 12:45:18 to reproduce a flaky test,
+whose parent died before it could `kill $LOADPIDS`. They ran for 4h53m and consumed roughly
+14.7 of 16 cores; load average reached 258. The first benchmark of this session started 42
+seconds after they did, so **every timing taken before they were killed was contaminated**,
+and contaminated pessimistically:
+
+| Row | contaminated | clean |
+|---|---:|---:|
+| heavy-multi-user, post-fix | 18,123 | **32,431** |
+| single-user, post-fix | 201.3 | **243.8** |
+
+The conclusion drawn from the contaminated set - "the failures are gone but the write path is
+not restored" - was simply false, and it sent an entire section of the original version of this
+document chasing a shortfall that did not exist.
+
+Checking for stray load once at the start of a session is not enough; it has to be checked
+immediately before each measurement. `uptime` costs nothing. What made this expensive to spot
+is that the contaminated numbers were *plausible* - a partial recovery is exactly what a
+half-working fix looks like.
 
 Closes the second of the two defects
 [`2026-09-07-perf-rerun-7947cce.md`](2026-09-07-perf-rerun-7947cce.md) split Finding 1 into.
@@ -11,30 +34,34 @@ That document's forward-looking sections are superseded by this one; its measure
 
 ## Summary
 
-- **The heavy-multi-user write failure is fixed.** `BenchmarkWorkloadWriteInsert` fails
-  outright on `c16d8ab` after 211s; at `bb9459f` the whole benchmark passes in 4.6s.
+- **The heavy-multi-user write failure is fixed, and throughput is fully restored.**
+  `BenchmarkWorkloadWriteInsert` fails on `c16d8ab` with `deadline exceeded`; at `bb9459f` it
+  passes at **32,431 ops/sec against a `6d2b4bb` baseline of 30,051**. Single-user is 243.8
+  against a baseline of 242.6.
 - **The plan in the previous write-up pointed at the wrong place**, and following it exactly
   does not work. Details below, because the wrong version is the one that looks obviously
   right.
-- **Throughput is restored to 18,123 ops/sec against a `6d2b4bb` baseline of 30,051.** The
-  failures are gone; the write path is not fully back, and the remaining gap is not this.
-- **What it is instead: the document trie costs ~4,900 bytes of live heap per document,**
-  linear and independent of document size. That is now the binding constraint, and it is what
-  the previous write-up's "Done when" criteria were unknowingly asking us to beat.
+- **Separately, the document trie costs ~4,900 bytes of live heap per document,** linear and
+  independent of document size. It does not bound this benchmark's throughput, but it does
+  bound how large a namespace can be held open at all, and it is why `-benchtime 3s` on this
+  row still fails.
 
 ## Results
 
 `go test ./kdb/server/ -run '^$' -bench BenchmarkWorkloadWriteInsert -count=1`, default
 benchtime, disk-backed under `DurabilitySync` + `SyncModeFull`.
 
-| Row | `6d2b4bb` baseline | `c16d8ab` | `bb9459f` |
+| Row | `6d2b4bb` baseline | `c16d8ab` (pre-fix) | `bb9459f` (post-fix) |
 |---|---:|---:|---:|
-| single-user | 242.6 | *(no number - benchmark failed)* | 201.3 |
-| heavy-multi-user | 30,051 | **FAIL**, 211.2s | **18,123**, package ok in 4.6s |
+| single-user | 242.6 | — | **243.8** (240.2 / 247.1 / 243.8) |
+| heavy-multi-user | 30,051 | **FAIL**; 596.2 and 1,281 on the samples that reported | **32,431** (32,431 / 24,303 / 32,614), PASS |
 
-`c16d8ab` produced no per-row numbers at all: every heavy-multi sample errored with
-`deadline exceeded: timed out waiting for an earlier write to finish`, so the parent
-benchmark failed before reporting.
+Pre-fix was measured in a detached worktree at `c16d8ab` with the same `-count=3`, on the same
+idle machine. Most of its heavy-multi samples errored out with `deadline exceeded: timed out
+waiting for an earlier write to finish` and reported nothing; the two that finished came in at
+596.2 and 1,281 ops/sec.
+
+So the fix is worth **25-54x on this row**, and returns it to baseline.
 
 ## The defect
 
@@ -75,8 +102,10 @@ rebuilds either way, which is exactly how the wrong version passes review.
 The first implementation left pinned entries in the list and skipped them during the eviction
 sweep. Under a writer burst - every writer pinning its base - that turns into an O(pinned)
 walk under the store mutex on *every commit*, and it cost more than the rebuilds it saved:
-the benchmark went from failing after 211s to failing after **577s**, with `treeFromObjects`
-at 57%. Strictly worse than no fix.
+`treeFromObjects` went *up*, to 57% of CPU, with the pin in place and working. The wall-clock
+figures either side of that comparison were taken under the contaminated conditions described
+above and are not quoted here; the profile share is a within-process ratio and is what the
+conclusion rests on.
 
 Pinned entries now come out of the list on pin and re-enter at the front on release, so
 eviction costs what it frees.
@@ -87,10 +116,12 @@ version is a commit or two behind the live tree and shares nearly every node wit
 
 ## The wall behind it: the document trie
 
-At `-benchtime 3s` the benchmark still wedges - 1.87GB RSS, and it outran its own 15-minute
-test timeout by well over an hour. **This is not a regression from the pinning work.** The
-only reason the benchmark reaches it is that the fix made writes fast enough for Go to ramp
-`b.N` into a namespace far larger than anything that ran before.
+At `-benchtime 3s` this row still fails on an idle machine, in 96s. **This is not a
+regression from the pinning work** - `c16d8ab` fails the same row at default benchtime, and
+the reason the fix reaches this at all is that it makes writes fast enough for Go to ramp
+`b.N` into a namespace far larger than anything that ran before. (Under the contaminated
+conditions the same configuration ran for 1h42m at 1.87GB RSS before being killed; treat that
+duration as an artifact and the 96s as the real figure.)
 
 Measured directly, building a `DocumentTree` and reading `HeapAlloc` after two
 `runtime.GC()` calls:
@@ -131,19 +162,22 @@ paired runs.
 
 ## Still open
 
-The previous write-up's "Done when" list is partly met and partly unreachable as written:
+The previous write-up's "Done when" list is now largely met:
 
-- ~~heavy-multi write-insert back near 30,051~~ - **not reachable by fixing rebuilds.** It sits
-  at 18,123, and the remainder is the trie cost above, not tree resolution.
+- heavy-multi write-insert back near 30,051 - **met**, at 32,431. ✅
 - `go/kdb/embed/tree_retention_test.go` still passes - the memory bounding survived. ✅
 - `go test -race ./...` green. ✅
+- All `kdb/server` benchmarks pass - **at default benchtime.** `-benchtime 3s` on
+  `BenchmarkWorkloadWriteInsert/heavy-multi-user` still fails; see the trie section.
 - Not re-measured this session: `memory-only/insert/single-user` against its 34,052 target,
   `BenchmarkFileBackedUpsertModes/async-100ms/parallel-1`, and
-  `BenchmarkWorkloadMixedReadWrite`. The full matrix has not been re-run since `7947cce`.
+  `BenchmarkWorkloadMixedReadWrite`. The full matrix has not been re-run since `7947cce`, and
+  every matrix number in `2026-09-07-perf-rerun-7947cce.md` predates this fix.
 
-**Next, and it is a bigger piece of work than this was:** path compression, or a shallower
-fan-out, in the document trie. Until then treat documents-per-namespace as the binding memory
-constraint and size deployments from ~5KB/document.
+**Next:** path compression, or a shallower fan-out, in the document trie. It no longer blocks
+this benchmark, but it does bound how large a namespace can be held open - treat
+documents-per-namespace as the binding memory constraint and size deployments from
+~5KB/document.
 
 Do not use `-benchtime 3s` on `BenchmarkWorkloadWriteInsert` to evaluate write-path changes
 until that is addressed; the ramp walks straight into the wall and the wedge will be
