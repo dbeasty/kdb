@@ -9,25 +9,43 @@ was checked in the tree at that commit.
 
 ## Status
 
-Last audited against `feat/control-ui-data-browser`. **The control UI is not finished**, but it is
-now a database tool rather than only a history viewer: browse documents, run SELECTs, read at any
-revision, and revert. Writes, live settings and all of recovery are still missing.
+Last audited against `feat/control-ui-data-browser`. **Every screen §9 named is built**, and eight
+of the nine milestones are done. What is here is a database tool and a history viewer at once:
+browse and edit documents, run SQL, read at any revision, revert, follow one document's whole
+timeline, draw the commit graph, create and compare refs, change settings on a running server and
+write them back to the config file, verify and back up a live namespace, restore a backup alongside
+production and promote it across a supervised restart.
 
-Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~28 not started.
+Counting endpoints from §5: **47 implemented**, none declared-but-unbuilt. A route that does not
+exist answers 404 rather than 501, because there is no longer anything in that category.
+
+M2 is the one milestone still partial, and not for a reason this UI can fix: `?at=` works
+everywhere in the control plane, but `AT COMMIT` is still not honoured over the **wire**, which is a
+change to the wire protocol and its Kotlin parity fixtures.
+
+Three things were deliberately **not** built, and the API says so where an operator would look for
+them rather than showing an empty answer:
+
+- `/ops/sessions` - a `SessionManager` is created per connection, so there is no runtime-global
+  registry to enumerate. An empty list would read as "nobody is connected".
+- `/ops/peers` - peer sync is a listener, not a tracked set of members. There is no registry.
+- `/commits/{hash}/diff/{docId}` - it would be a second way to read a document at a revision, and
+  two ways to read the same thing can disagree. The commit detail composes the per-document diff
+  from two ordinary `?at=` reads instead.
 
 ### Milestones (§11)
 
 | | Milestone | State |
 |---|---|---|
 | M0 | Foundations | **done** — control plane, auth, SSE hub, embedded UI, and the multi-namespace host: the service opens the data root through `embed.Host` and the control plane serves every namespace it finds |
-| M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, and a read-only SQL console |
+| M1 | Read-only viewer | **done** — log, commit detail, tree diff, refs, schema, the document browser, a read-only SQL console, and the lane-assigned commit graph |
 | M2 | Time travel | **partial** — `?at=` works on document reads, the document list and the SQL console, and the UI has the read-only mode; `AT COMMIT` is still not honoured over the *wire* |
-| M3 | Writes | **not started** — no document CRUD, no transactions, no DML |
-| M4 | Rollback | **partial** — plan/apply with `expectHead` are done; per-document history and the document timeline are not |
-| M5 | Refs and ops | **partial** — branches and tags list; no create, delete or compare; ops is one endpoint |
+| M3 | Writes | **done** — DML and DDL through the SQL console, per-document edit and delete with compare-and-set on the content hash, and `replace` for a write that removes the keys it omits |
+| M4 | Rollback | **done** — namespace revert with plan/apply and `expectHead`, plus the per-document timeline with field-level diffs and per-version restore |
+| M5 | Refs and ops | **done** — branches and tags create, delete and compare with the checkpoint-durability caveat stated on every mutation; ops adds held locks and leases, the write-path stage latencies, a one-way drain, and a list of what this server cannot answer |
 | M6a | Settings (read) | **done** — provenance, the env-only surface, ignored-value warnings |
-| M6b | Settings (mutation) | **not started** — `PATCH /v1/settings` answers 501; no live setters wired, no persistence, no drift |
-| M7 | Recovery | **not started** — nothing from §8 exists |
+| M6b | Settings (mutation) | **done** — `PATCH /v1/settings` applies the live knobs with a dry run, a revision compare-and-swap and drift reporting, and `persist:true` writes the change back to the `--config` file atomically, refusing per key when the file cannot hold it or when a flag or environment variable would outrank it |
+| M7 | Recovery | **done** — online verify with cached reports, online backup (create, list, verify, incremental), restart-cost reporting, restore-to-staging with read-only attach, promotion of a staged restore across a supervised restart, and generated commands for the offline tier |
 
 ### API surface (§5)
 
@@ -36,13 +54,88 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 `GET /v1/settings`, `GET /v1/ops/runtime`, `POST /v1/ns/{ns}/sql` (SELECT only),
 `POST /v1/ns/{ns}/revert/plan`, `/revert/apply`. `?at=` is honoured on every document read.
 
-**Declared, answering 501:** `PUT`/`DELETE /v1/ns/{ns}/docs/{id}`, `PATCH /v1/settings`.
+`POST /v1/ns/{ns}/sql` serves all three statement kinds, with permission decided per statement.
+`PUT`/`DELETE /v1/ns/{ns}/docs/{id}` take an optional `ifContentHash` (or `ifAbsent`) and answer 409
+with the hash that beat them. `PUT` also takes `replace: true`, which makes the body the whole
+document rather than a patch over it - the one way to remove a key in a single commit.
 
-**Not started:** the document list (`/docs`), per-document history, per-document diff
-(`/commits/{hash}/diff/{docId}`), `/compare`, branch and tag mutation, `/tx`, `/settings/{key}`,
-`/settings/drift`, `/settings/validate`, `/policy`, `/indexes`, `/ops/sessions|leases|peers|metrics`,
-`POST /v1/ops/drain`, and every recovery endpoint (`/integrity`, `/backups`, `/restore/staging`,
-`/maintenance/plan`, `/checkpoints`).
+That is a delete and a write in one transaction, which is what "replace" has always meant to the
+commit fold (`embed.applyCommitToTree` cancels a delete when a later write names the same document).
+What was missing was in staging: `runSchemaPhase` resolved every operation against the *baseline*
+tree, so a transaction could not see its own earlier operations - the write merged over the document
+the delete was removing, and the old keys survived. It now carries the rolling state, which also
+fixes a second write to one document silently dropping the first one's fields. No new operation
+kind: `document.Op` is a cross-language union with golden fixtures behind it, so a new branch would
+be a format change and this is not. `POST /v1/settings/validate` is folded into `PATCH` as `dryRun`
+rather than being a second endpoint that could drift from it.
+
+`PATCH /v1/settings` applies changes with per-key outcomes and, with `persist:true`, writes them
+back to the `--config` file; `/v1/settings/{key}` and `/v1/settings/drift` are implemented.
+`GET /v1/settings` reports `persistableKeys` and `persistBlocked` so a client can say whether a
+particular change will survive a restart *before* it is made, rather than after. Nothing is declared-but-unbuilt any more: an endpoint from §8
+that does not exist simply answers 404.
+
+**Not started:** `/tx` and `/policy`.
+
+`GET /v1/ns/{ns}/indexes` reports the registry's descriptors and - the field that matters
+operationally - whether it is at head. Indexes are updated on the commit path, so a commit made
+*through the server runtime* keeps it current; one made straight at the embedded runtime does not,
+and an index that plans queries against documents that have moved is invisible until the results
+are wrong. Both cases are tested.
+
+The per-commit document diff is **built without a new endpoint**. `/commits/{hash}/diff/{docId}`
+would be a second way to read a document at a revision, and §8.3's note about the timeline gives the
+reason not to have one: two ways to read the same thing can disagree. The commit detail's diff rows
+now open a field-level diff composed from two ordinary `?at=` reads - the same call the timeline
+makes - which is what the plan asked for ("opening one still means reading it at two revisions by
+hand") without the redundancy.
+
+**Not buildable here, and the dashboard says so rather than showing an empty table:**
+`/ops/sessions` - a `SessionManager` is created per connection (`server/session_manager.go`), so
+there is no runtime-global registry to enumerate, and an empty list would read as "nobody is
+connected"; `/ops/peers` - peer sync is a listener, not a tracked set of members, so there is no
+registry to read. Both are changes to the server, not to this package.
+
+Ops adds `GET /v1/ops/locks`, `GET /v1/ops/metrics` and `POST /v1/ops/drain`. Locks needed one
+addition to the engine: `LockManager.HeldCount` answered "how many", which is enough for a gauge and
+no use at 3am - `Held()` answers which document is stuck and who holds it, evaluating expiry the way
+every other lookup does so a lock nothing would honour is not reported as held. Metrics were already
+recorded in `metrics.Default` and reachable only through the admin listener's *unauthenticated*
+Prometheus endpoint. Drain is one-way - the runtime has no un-drain, and adding one would mean a
+shutdown already under way could be resumed halfway - so it is gated on `--control-write` plus the
+namespace typed back, and every answer says a restart is the only way out.
+
+Refs add `POST /v1/ns/{ns}/refs/branches`, `DELETE /v1/ns/{ns}/refs/branches/{name}`,
+`POST /v1/ns/{ns}/refs/tags`, `DELETE /v1/ns/{ns}/refs/tags/{name}`, and
+`GET /v1/ns/{ns}/compare?from=&to=`. The DAG had every one of these operations already; what the
+endpoints add is the part that is not a method call - refusing a name the revision syntax would read
+as something else (`head~2`, a 64-hex string), refusing to move a tag rather than moving it
+silently, and **saying that a ref is durable only as far as the next checkpoint**. A commit is in
+the delta log; a branch or tag lives in the namespace's checkpoint, written on a clean shutdown and
+after a full replay. Verified both ways against a running service: a tag survives a SIGTERM restart
+and is lost to a `kill -9` before the next checkpoint. Every mutation's response says so, and the
+Refs screen repeats it.
+
+Promotion adds `GET /v1/restore/staging/{jobId}/promote/plan`,
+`POST /v1/restore/staging/{jobId}/promote`, and `GET|DELETE /v1/promotion`. The plan is a read on
+purpose: an operator should be able to see what promoting would do, and every reason it cannot, on
+a control plane that would refuse to do it.
+
+Recovery adds `GET /v1/ns/{ns}/integrity`, `POST /v1/ns/{ns}/integrity/verify`,
+`GET /v1/ns/{ns}/checkpoints`, `GET /v1/ns/{ns}/maintenance/plan`, `GET /v1/ns/{ns}/backups`,
+`POST /v1/ns/{ns}/backups`, `POST /v1/ns/{ns}/backups/{id}/verify`,
+`POST /v1/ns/{ns}/restore/staging`, and `GET|POST /v1/restore/staging[/{jobId}[/attach|/detach]]`.
+`GET /v1/ns/{ns}/log` takes `?graph=true`, which adds a lane per commit. It is refused for a
+partial walk (`skip != 0`): a lane number only means something relative to the head it was walked
+from, so the client widens its window and re-walks rather than appending a separately-laned page.
+
+The timeline adds `GET /v1/ns/{ns}/docs/{id}/history`; the diff between two versions is composed in
+the client from two `?at=` reads rather than a second endpoint, so there is one way to read a
+document at a revision rather than two that could disagree.
+The backup endpoints are
+per-namespace rather than the database-wide `/v1/backups?ns=` §5 sketched: one namespace is what a
+`ObjectStore` keyed by namespace actually addresses, and a whole-database backup wants one
+consistent point across every namespace, which is its own piece of work.
 
 `GET /v1/ops/runtime` is an addition, not in §5 as written.
 
@@ -50,29 +143,30 @@ Counting endpoints from §5: **17 implemented**, 3 declared and answering 501, ~
 
 | | Screen | State |
 |---|---|---|
-| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, and readable at any revision |
-| 2 | SQL console | **built** (read-only) — SELECT only, reporting the access path and rows examined |
-| 3 | Commit graph | **partial** — a flat, paged list with parent and ref badges. There is no lane assignment, so it is a log, not a graph; a merge is flagged with a chip rather than drawn |
-| 4 | Document timeline | **not built** |
-| 5 | Branches & tags | **partial** — lists only; a tag row is a shortcut into time travel |
+| 1 | Data browser | **built** — paged, cursor-based, with previews, a document panel, editing with compare-and-set, an opt-in replace that removes omitted keys, delete, and readable at any revision |
+| 2 | SQL console | **built** — SELECT reports the access path and rows examined; DML and DDL are gated on `--control-write` *and* a write grant, and report the commit they produced |
+| 3 | Commit graph | **built** — lane-assigned DAG drawing: verticals for every branch alive at a row, a curve per extra parent, filled nodes for merges, and a gutter of fixed width so it does not shift while scrolling. Lanes come from the server (`?graph=true`) over one whole walk. A diff row opens what that commit did to that one document, field by field |
+| 4 | Document timeline | **built** — every version of one document, a field-level diff between any two, and restore-this-version as a forward write that replaces rather than merges, so the document becomes exactly that version |
+| 5 | Branches & tags | **built** — create and delete a branch or tag from any revision, a compare panel over any two revisions reporting how they are related (same / ahead / behind / diverged), and a tag row is still a shortcut into time travel |
 | 6 | Time travel | **built** |
 | 7 | Rollback | **built** — preview, typed confirmation, forward-commit semantics explained in the dialog |
-| 8 | Schema & indexes | **partial** — schema only |
-| 9 | Operations dashboard | **partial** — process and admission state; no sessions, leases or peers |
-| 10 | Settings | **built** (read-only), including the ignored-configuration panel |
-| 11 | Recovery | **not built** |
+| 8 | Schema & indexes | **built** — schema plus the index registry: what actually exists (not the schema's `indexed` intent, which can disagree), and how far behind head the registry is, which is the question the descriptors cannot answer |
+| 9 | Operations dashboard | **built** — process and admission state, held locks and leases with the holder named, write-path stage latencies with what each one being slow would mean, a drain button behind a typed confirmation, and a "not available here" panel saying why sessions and peers are absent |
+| 10 | Settings | **built** — inline editors for the live knobs with a check-before-apply step, a per-key "also write it to the config file" choice (with the reason when there isn't one), a drift banner, and the ignored-configuration panel |
+| 11 | Recovery | **built** — integrity findings separated from expected active-segment noise, backups with verify, restart cost, the restore-and-attach flow, promotion with the server's own plan rendered verbatim behind a typed confirmation, a banner for a promotion awaiting restart and for the outcome of the last one, and the offline commands filled in |
 
 ### What to do next, in order
 
-1. **Document writes (M3).** The console reads; editing a document is what an operator reaches for
-   next, and `ReplaceIf` already gives optimistic concurrency for free.
-2. **Live settings (M6b).** The six knobs §7.3 names are already safe to change at runtime, and the
-   read view that makes them legible is done.
-3. **Recovery (M7).** §8.3 - restore to staging, then attach read-only - is the highest-value piece
-   and is mostly composition of things that already exist.
-4. **The document timeline (M4's missing half).** Per-document history, now that
-   `dag.ListCommits` exists to build it on.
-5. **A real commit graph (§9 screen 3).** Lane assignment, so the log becomes a graph.
+Everything §9 named is built. What is left is outside this UI:
+
+1. **`AT COMMIT` over the wire (M2).** `?at=` works throughout the control plane, but the wire
+   protocol still ignores it. That is a change to the wire and its Kotlin parity fixtures, not to
+   this package, and it is the only reason M2 is not marked done.
+2. **`/tx` and `/policy`.** §5 sketched both. `/tx` (an interactive transaction over HTTP) needs a
+   session that outlives a request, which is a real design question rather than a missing handler.
+   `/policy` needs the namespace policy registry wired and persisted first - §2.4(c)'s open item.
+3. **A session registry, if `/ops/sessions` is ever wanted.** A `SessionManager` is per connection
+   today; the dashboard says so rather than showing an empty table.
 
 ## 1. What this is
 
@@ -502,12 +596,13 @@ Three things make this safe and cheap:
   (`in_memory_commit_dag.go:610`).
 - Bodies at the target come from the existing `getDocumentAt(ns, docID, targetTreeHash)`
   (`index_wiring.go:95`).
-- At the transaction layer, `WriteOp.Patch` is treated as the **whole document body**, not a
-  merge patch — `documentFromPatch` parses it as the document
-  (`go/kdb/storage/engine/cold_loader.go:143`). Shallow-merge semantics live above, in
-  UPSERT/`SET _doc`. So a revert can restore a body that *removes* keys added later. **Verify this
-  with a test as step one of M4** — if any write path re-merges, revert needs an explicit
-  replace-op and that is a wire/spec change.
+- `WriteOp.Patch` is read two ways, and this was got wrong here originally. The *write* path merges
+  it over the stored document (`transaction/default_engine.go`, `baseDoc.Merge`); *replay* and the
+  historical-tree fold read it as the whole document. Committing the request rather than the merged
+  result made those disagree, which lost data across a restart - see issue #48, fixed by recording
+  the staged document as the operation. Revert sidesteps the question entirely: `embed.RevertTo`
+  writes through the storage adapter directly rather than through the transaction engine, so it
+  genuinely replaces.
 
 Scopes: whole namespace, a document set (from the UI's checkbox selection), or a
 schema-collection filter. Same code path; only the entry filter differs.
@@ -623,10 +718,38 @@ where a mid-flight change has to be reasoned about against group commit and the 
 
 A live change that vanishes on restart is a trap. Two rules:
 
-- `PATCH /v1/settings` takes `persist: bool`. With `persist:true` and a `--config` file in use, the
-  change is written back to the `ServiceFile` JSON (which already has pointer fields distinguishing
-  "absent" from zero, so a partial file is its natural shape) and applied. Without a config file,
-  `persist:true` is refused with an explanation rather than silently ignored.
+- `PATCH /v1/settings` takes `persist: bool`, and the open decision on it is settled by making it
+  opt-in at the deployment level: `--control-settings-persist`, **off by default**. In a
+  GitOps-managed deployment the config file belongs to a deployment tool, and a server rewriting it
+  is a surprise rather than a feature - so a deployment has to say it wants that before the API will
+  entertain it. Asking to persist without it is refused with an explanation that names the
+  alternative (apply live, and read the change back off `/v1/settings/drift`) rather than just
+  saying no.
+
+  The write-back is `config.WriteServiceFile`: the file is re-read from disk first, so a persist
+  merges into whatever is there now rather than reverting an edit made outside this process; only
+  fields that are set are written, because every `ServiceFile` field is a nullable pointer and a
+  naive round-trip would turn a four-line config into thirty lines of nulls; and the replacement is
+  a rename over a temporary file that has already been read back through `LoadServiceFile`. That
+  last check is the one that matters - a config file the next boot cannot parse is not a degraded
+  state, it is a process that exits at startup.
+
+  Persisting is refused per key, not per request, and the reason is the useful part:
+
+  - **No config-file field.** The environment-only surface (`cache.commitOpsBytes` and the rest)
+    has no home in the file; its durable home is a variable this process cannot set for its
+    successor.
+  - **A flag or environment variable outranks the file.** Precedence is file < environment <
+    explicitly-set flag, so writing the file while `--log-level` is on the command line would
+    succeed and change nothing at the next startup. That is worse than refusing: the operator would
+    read "written" and be wrong. The refusal names what to remove.
+  - **There is no `--config` at all.** A process started on flags alone has nowhere durable to put
+    a value, and inventing a file nothing would read is not an improvement.
+
+  In every case the live change still stands - the operator asked for both, and refusing to apply
+  because the file is unwritable would leave them with neither - and the per-key `persisted` note
+  plus a top-level `persistedAll` say exactly what did and did not become durable. A successful
+  write moves the key's startup value, which is what makes the drift banner clear.
 - `GET /v1/settings/drift` reports every running value that differs from what the config file and
   environment would produce on a restart. The settings screen shows a persistent banner while
   drift is non-empty. An operator should never be surprised by a restart.
@@ -721,12 +844,59 @@ something it cannot. It does three honest things instead:
    copy-pasteable, with its preconditions stated ("stop kdb-service first"). `GET
    /v1/ns/{ns}/maintenance/plan` returns it as structured data so the UI can also show what it will
    do and what it will quarantine.
-3. **Offer a supervised maintenance flow** where a supervisor exists. The pieces are already there:
-   `BeginDraining` / `WaitForWritesToDrain`, `/readyz` flipping to 503 with reason `draining`
-   (`admin.go`), and the exit-75 + `Restart=on-failure` contract from Component 50. The flow is:
-   readiness off → drain → close storage and release the lock → run the operation → exit 75 → the
-   supervisor restarts the process → readiness on. The control API can drive steps 1–3 and report
-   the outcome after restart; it cannot restart the process itself, and the UI should say so.
+3. **Offer a supervised maintenance flow** where a supervisor exists. **Built for promotion** -
+   replacing the live namespace with a staged restore - in `recovery/promote.go` and
+   `control/promote.go`.
+
+   The order is not the one sketched here. Doing the swap on the way *down* means mutating a data
+   root whose files were open moments earlier, from an HTTP handler, with no way to report a failure
+   once the response has gone. So the work is split the other way round, and the irreversible half
+   happens on the way *up*:
+
+   - **While the server runs**, `POST /v1/restore/staging/{jobId}/promote` copies the restored
+     namespace into the live data root under `.kdb.promote/` and records an intent file. The live
+     namespace is untouched, and the request can be taken back (`DELETE /v1/promotion`) at any
+     point before the restart. The copy happens here rather than at startup for three reasons: the
+     staging directory is deliberately on another volume so the install cannot be a rename, a
+     failure here costs nothing, and a supervisor's start timeout is not the place to discover a
+     multi-gigabyte copy.
+   - **Then** the control plane asks the process to shut down - readiness off → drain → flush and
+     seal → exit 75, the same sequence a SIGTERM takes, via an `Options.RequestRestart` callback so
+     process lifecycle stays in the service that owns `main`.
+   - **At the next startup, before the data root is opened** and while nothing holds its lock,
+     `recovery.ApplyPromotion` verifies the payload against the commit count recorded when it was
+     staged, moves the live namespace to `superseded/`, and renames the payload into place. Both
+     renames are inside one tree, so each is atomic.
+
+   Every step is recoverable from what is on disk, which is the property that makes this safe to
+   interrupt: the replaced namespace is *moved*, never deleted; `applyPayload` re-derives which
+   step is next from the filesystem rather than from a record that could itself be the thing that
+   was lost, so a crash between the two renames is resumed rather than compounded; the payload is
+   verified before anything irreversible happens, because a copy cut short by a power cut is a
+   truncated namespace and promoting one of those is the worst outcome this path can produce; and a
+   failed apply always clears the intent, because a promotion retried on every boot turns one bad
+   request into a boot loop.
+
+   Two things the plan did not anticipate, both surfaced by building it:
+
+   - A restore rebuilds the delta log and **not** the per-commit tree objects, so a promoted copy is
+     a `replay`-strategy namespace whatever the one it replaces was. The marker is written
+     accordingly and the difference is reported in the plan; if the process is configured with
+     `KDB_HISTORY_STRATEGY=objects` the promotion is *blocked*, because the open would be refused
+     and the service would not come back up.
+   - `OSByteStore.AvailableBytes` was a `0` sentinel no caller could tell from a full disk. "Will
+     the copy fit" is a real question, so it is now a real `statfs`, and an error rather than a
+     number where the platform cannot say.
+   - Every restore-job reader took the job *pointer* under the lock and then serialized it outside
+     it, while the restore goroutine wrote the same struct. That is a data race the promotion plan
+     inherited by following the pattern, and before the race detector sees it, it can serialize a
+     torn job - `"complete"` beside an applied-count that had not been written yet. Readers now
+     take a copy (`snapshotJob`), slices included.
+
+   It is gated on `--control-promote`, separately from `--control-write`: it is the one
+   control-plane operation that ends with the process exiting, and a deployment without a
+   supervisor would simply stop. The plan the operator reads before confirming says that in those
+   words, and the apply requires the namespace typed back.
 
 `repair-segments` also quarantines bytes before mutating anything (`RepairStep.QuarantineName`),
 which the UI should surface prominently — it is the difference between a scary button and a
@@ -922,8 +1092,11 @@ saved queries and dashboards.
 - **Python e2e** (`kdb-integration/e2e/`, which the finish-up plan already wants extended): launch
   `kdb-service --control-addr`, drive the API end to end, assert the commit log reflects the UI's
   writes. This also finally gives the harness a server lifecycle, which it does not have today.
-- **UI tests**: component tests for the graph lane assignment (pure function, worth unit-testing
-  hard) and diff rendering; one Playwright smoke path — connect, browse, time travel, revert with
+- **UI tests**: lane assignment is a pure Go function tested on shapes rather than pixels
+  (`go/kdb/control/graph_test.go`: linear, merge, converging branches, octopus, disjoint roots,
+  lane reuse, a truncated walk, and a property check over a generated history) — a wrong lane still
+  looks like a graph in a screenshot, so it cannot be verified by eye. Still to do: diff rendering
+  and one Playwright smoke path — connect, browse, time travel, revert with
   preview — run against a real service in CI.
 - **Settings tests**: provenance is asserted for each precedence path (default → file → env →
   flag), a deliberately-typo'd `KDB_*` variable produces a warning rather than silence, every
@@ -964,10 +1137,10 @@ saved queries and dashboards.
 3. Confirm v1 is Go-only with no Kotlin counterpart obligation.
 4. Confirm rollback is forward-revert-only, with no history rewriting in the product ever
    (recommended — it is what makes peers safe).
-5. Confirm that live settings changes may be persisted back into the `--config` file by the
-   server (§7.4). The alternative — apply-only, never write config — is defensible in a
-   GitOps-managed deployment where the file is owned by a deployment tool, and if that is the house
-   style, `persist` should be refused rather than merely optional.
+5. ~~Confirm that live settings changes may be persisted back into the `--config` file by the
+   server (§7.4).~~ **Settled**: opt-in per deployment via `--control-settings-persist`, off by
+   default, and refused with an explanation otherwise. A GitOps deployment simply never enables it,
+   and drift reporting means an apply-only change is never silently lost.
 6. Confirm the offline recovery boundary (§8.4): the control plane never mutates a live data
    directory, and `repair-segments` / `migrate-history` / in-place restore stay operator-run
    commands. The alternative is building a maintenance-mode supervisor contract, which is a

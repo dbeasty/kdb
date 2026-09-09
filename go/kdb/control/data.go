@@ -13,6 +13,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/sql"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // The data-plane reads: list the documents in a namespace, and run a SELECT over them.
@@ -175,14 +176,25 @@ type sqlRequest struct {
 	Limit int `json:"limit"`
 }
 
-// handleSQL runs a read-only query.
+// handleSQL runs a statement.
 //
-// Only SELECT. This is registered as a *read* endpoint on purpose - it needs no write permission
-// and works on a control plane started read-only - so anything that could mutate has to be refused
-// here rather than left to the engine, and refused by classifying the parsed statement rather than
-// by matching on the text. `classifyStatement` in the wire listener treats unknown statement kinds
-// as DML for the same reason: a new mutating statement must not become readable by default.
-func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+// One endpoint, three permission levels, decided from the *parsed statement* rather than from the
+// request:
+//
+//   - SELECT is a read. It needs only the read grant this route already checked, so the console
+//     works on a control plane started read-only.
+//   - CREATE TABLE / CREATE INDEX / DROP INDEX is schema change, applied immediately.
+//   - Everything else is DML, planned and then committed as one transaction.
+//
+// The last two require both --control-write *and* a write grant for the namespace. Those are
+// different questions and both are asked: the flag is what this deployment permits at all, the
+// grant is what this principal may do, and neither substitutes for the other.
+//
+// Classifying rather than matching on text is deliberate, and unknown statement kinds count as
+// writes - the same rule classifyStatement uses at the wire layer. A new mutating statement added
+// to package sql must not become executable-by-anyone by default just because this switch has not
+// learned its name yet.
+func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request, principal auth.Principal, ns string, rt *serverRuntime) {
 	var req sqlRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "could not read request body: "+err.Error())
@@ -192,20 +204,75 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		writeError(w, http.StatusBadRequest, "bad_request", `"sql" is required`)
 		return
 	}
-
 	stmt, err := sql.DefaultParser{}.Parse(req.SQL)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "parse_error", err.Error())
 		return
 	}
-	if _, isSelect := stmt.(sql.StmtSelect); !isSelect {
-		writeError(w, http.StatusForbidden, "read_only_console",
-			"this endpoint runs SELECT only. Statements that change data or schema are not served "+
-				"here even when the control plane allows writes, because the console is a read "+
-				"surface: use the document endpoints for writes.")
+	params, err := bindParams(req.Params)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 
+	kind := classify(stmt)
+	if kind != stmtSelect {
+		if req.At != "" {
+			// The past is not writable, and a statement that says otherwise is a mistake worth
+			// naming rather than quietly running against head.
+			writeError(w, http.StatusBadRequest, "not_writable_at_revision",
+				"a statement that changes data or schema cannot be run at a past revision; "+
+					"history moves forward only. Drop \"at\" to run it against head.")
+			return
+		}
+		// This endpoint is registered as a read and escalates per statement, so the staged-copy
+		// check the write middleware performs does not run for it and has to happen here.
+		if refuseIfStaged(w, ns) {
+			return
+		}
+		if !s.opts.AllowWrites {
+			writeError(w, http.StatusForbidden, "read_only",
+				"this control plane is read-only, so it runs SELECT only; start the service with "+
+					"--control-write to allow statements that change data or schema")
+			return
+		}
+		if !s.authorizeWith(w, r, rt, principal, auth.SqlExecAction{Namespace: ns, ReadOnly: false}) {
+			return
+		}
+	}
+
+	switch kind {
+	case stmtSelect:
+		s.runSelect(w, req, ns, rt)
+	case stmtDDL:
+		s.runDDL(w, req, params, ns, rt)
+	default:
+		s.runDML(w, r, req, params, principal, ns, rt)
+	}
+}
+
+type stmtKind int
+
+const (
+	stmtSelect stmtKind = iota
+	stmtDDL
+	stmtDML
+)
+
+// classify sorts a parsed statement the way the wire listener's classifyStatement does, including
+// its safe default: anything unrecognised is DML.
+func classify(stmt sql.Statement) stmtKind {
+	switch stmt.(type) {
+	case sql.StmtSelect:
+		return stmtSelect
+	case sql.StmtCreateTable, sql.StmtCreateIndex, sql.StmtDropIndex:
+		return stmtDDL
+	default:
+		return stmtDML
+	}
+}
+
+func (s *Server) runSelect(w http.ResponseWriter, req sqlRequest, ns string, rt *serverRuntime) {
 	limit := req.Limit
 	if limit <= 0 || limit > 2000 {
 		limit = 500
@@ -215,7 +282,6 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		s.writeRevisionError(w, err)
 		return
 	}
-
 	params, err := bindParams(req.Params)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -232,8 +298,6 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		Stats:       stats,
 	}
 	if adm := rt.Admission(); adm != nil {
-		// The same bound the wire path applies: rows *examined*, which is the only thing that
-		// bounds a selective query over a large namespace.
 		ctx.RowBudget = int(adm.ScanRowBudget())
 	}
 	result, err := rt.SQLEngine().Execute(req.SQL, ctx)
@@ -252,16 +316,140 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request, _ auth.Princi
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"namespace":      ns,
+		"kind":           "select",
 		"columns":        columns,
 		"rows":           rows,
 		"rowCount":       len(rows),
 		"truncated":      len(rows) >= limit,
 		"resolvedCommit": commitHash.Hex(),
-		// Which access path the executor chose. Surfacing it is most of what makes a console
-		// useful for anything beyond looking: it is how you find out a query is a full scan.
-		"plan":         result.Plan,
-		"rowsExamined": stats.RowsExamined,
+		"plan":           result.Plan,
+		"rowsExamined":   stats.RowsExamined,
 	})
+}
+
+// runDDL applies schema change immediately. DDL is not buffered into a transaction - the engine
+// applies it through Execute, exactly as the wire layer does.
+func (s *Server) runDDL(w http.ResponseWriter, req sqlRequest, params []sql.Parameter, ns string, rt *serverRuntime) {
+	head, err := s.resolveRevisionFor(rt, "")
+	if err != nil {
+		s.writeRevisionError(w, err)
+		return
+	}
+	ctx := sql.QueryContext{
+		NamespaceID: ns,
+		Schema:      rt.Schema(),
+		AtCommit:    &head,
+		Parameters:  params,
+	}
+	if _, err := rt.SQLEngine().Execute(req.SQL, ctx); err != nil {
+		writeError(w, http.StatusBadRequest, "ddl_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"namespace": ns,
+		"kind":      "ddl",
+		"applied":   true,
+	})
+}
+
+// runDML plans the statement's operations and commits them as one transaction.
+//
+// ExecuteDML *plans*: it returns the writes and deletes the statement implies without applying
+// them, which is what lets the wire layer buffer them into a session's transaction. There is no
+// session here, so this is autocommit - one statement, one transaction, one commit - and it goes
+// through KdbServerRuntime.Commit like every other write, which means the write gate, conflict
+// detection against the base version, unique-key enforcement, index maintenance, and a per-op
+// authorization check all still apply.
+func (s *Server) runDML(w http.ResponseWriter, r *http.Request, req sqlRequest, params []sql.Parameter, principal auth.Principal, ns string, rt *serverRuntime) {
+	head, err := s.resolveRevisionFor(rt, "")
+	if err != nil {
+		s.writeRevisionError(w, err)
+		return
+	}
+	ctx := sql.QueryContext{
+		NamespaceID: ns,
+		Schema:      rt.Schema(),
+		AtCommit:    &head,
+		Parameters:  params,
+	}
+	if adm := rt.Admission(); adm != nil {
+		// UPDATE and DELETE resolve their targets by scanning, so the same bound a SELECT gets
+		// applies: an unbounded predicate is unbounded work either way.
+		ctx.RowBudget = int(adm.ScanRowBudget())
+	}
+	planned, err := rt.SQLEngine().ExecuteDML(req.SQL, ctx)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "dml_failed", err.Error())
+		return
+	}
+	if len(planned.Operations) == 0 {
+		// Nothing matched. A commit here would be an empty commit in the history for a statement
+		// that changed nothing, which is noise in the one place noise is expensive.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"namespace": ns, "kind": "dml", "rowsAffected": 0, "committed": false,
+			"note": "no rows matched, so nothing was committed",
+		})
+		return
+	}
+
+	builder := &transaction.Builder{NamespaceID: ns, BaseVersion: head, Schema: rt.Schema()}
+	for _, op := range planned.Operations {
+		switch o := op.(type) {
+		case document.WriteOp:
+			builder.Write(o.DocID, o.Patch)
+		case document.DeleteOp:
+			builder.Delete(o.DocID)
+		}
+	}
+	tx, err := builder.Build(codec.Timestamp{})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "transaction_failed", err.Error())
+		return
+	}
+
+	// A document another client holds a lease on is not this statement's to write. The wire path
+	// makes the same check before committing; skipping it here would let the console step over a
+	// hold that a client explicitly took.
+	if err := rt.DocumentLocks.AssertUnheldByOthers(ns, controlSessionID(principal), tx); err != nil {
+		writeError(w, http.StatusConflict, "document_locked", err.Error())
+		return
+	}
+
+	commit, err := rt.Commit(ns, tx, controlSessionID(principal), principal)
+	if err != nil {
+		// A conflict is the expected outcome of two writers racing, not a server fault, and it is
+		// retryable by re-running the statement against the new head.
+		status, code := http.StatusInternalServerError, "commit_failed"
+		low := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(low, "conflict"):
+			status = http.StatusConflict
+		case strings.Contains(low, "read-only"):
+			// Aimed at something opened for reading; a refusal, not a fault.
+			status, code = http.StatusForbidden, "read_only_runtime"
+		}
+		writeError(w, status, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"namespace":    ns,
+		"kind":         "dml",
+		"rowsAffected": planned.RowsAffected,
+		"generatedIds": planned.GeneratedIDs,
+		"committed":    true,
+		"commit":       commit.Hash.Hex(),
+	})
+}
+
+// controlSessionID names the writer for lock ownership and for the commit's attribution. It is
+// per-principal rather than per-request so that two statements from the same operator do not look
+// like two clients fighting over a document one of them already holds.
+func controlSessionID(principal auth.Principal) string {
+	id := principal.ID
+	if id == "" {
+		id = "anonymous"
+	}
+	return "control:" + id
 }
 
 // cellsOf converts one result row into JSON-friendly values, keeping a JSON cell as raw JSON so a

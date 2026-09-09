@@ -30,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"log/slog"
+
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/config"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -70,6 +72,39 @@ type Options struct {
 	// ServeUI serves the embedded single-page UI at /. Off leaves the API alone on this
 	// listener.
 	ServeUI bool
+	// LogLevel is the process's live log level, when the caller holds one. Without it the log
+	// level is reported but cannot be changed, and the refusal says so.
+	LogLevel *slog.LevelVar
+	// StagingDir is where staged restores are written. Empty disables them. Keep it off the data
+	// volume: a restore is most needed exactly when the data volume is the problem.
+	StagingDir string
+	// BackupDir is where control-plane backups are written. Empty disables them, and the endpoints
+	// say so rather than failing obscurely - a backup with nowhere to go is a configuration
+	// question, not an error.
+	BackupDir string
+	// AllowSettingsPersist lets an applied setting also be written back to the config file. Off by
+	// default: in a GitOps-managed deployment that file belongs to a deployment tool, and a server
+	// rewriting it is a surprise rather than a feature. A change applied without it is still
+	// reported as drift, so nothing is silently lost.
+	AllowSettingsPersist bool
+	// AllowPromotion opts into promoting a staged restore over the live namespace. Off by default,
+	// and separately from AllowWrites, because it is the one control-plane operation that ends with
+	// this process exiting: it stages the copy, records the intent, and asks to be restarted so the
+	// next startup can install it. A deployment without a supervisor would simply stop.
+	AllowPromotion bool
+	// RequestRestart asks the process to shut down orderly and exit 75, the supervisor contract
+	// --abort-after already uses. Without it promotion is refused, because staging a promotion this
+	// process cannot then act on would leave an intent nobody asked for waiting on disk.
+	//
+	// It is a callback rather than something this package does itself: process lifecycle belongs to
+	// the service that owns main, and a library that called os.Exit would be unusable from a test
+	// or an embedded host.
+	RequestRestart func(reason string) error
+	// ConfigPath is the --config file this process resolved its settings from, and the only file a
+	// persisted change is ever written to. Empty means there was none: a change can then still be
+	// applied live, but there is nowhere to write it down, and asking to persist says so rather
+	// than inventing a file that nothing would read on the next startup.
+	ConfigPath string
 	// Now is the clock, for tests. nil uses time.Now.
 	Now func() time.Time
 }
@@ -83,9 +118,26 @@ type Server struct {
 	started time.Time
 
 	mu sync.RWMutex
-	// settings is Options.Settings, held under mu so a later milestone that applies a live
-	// setting change can update the reported set without racing readers.
+	// settings is what this process is currently running on: Options.Settings at startup, updated
+	// in place as changes are applied.
 	settings []config.SettingDescriptor
+	// startupSettings is the same set as it was when the process started, kept so drift can be
+	// reported as "what a restart would undo". Comparing against a re-resolution of file and
+	// environment would be wrong: flags set on the command line would be set again on a restart.
+	startupSettings []config.SettingDescriptor
+	// revision counts applied changes, for the compare-and-swap on a patch.
+	revision int64
+
+	// restore holds staging restore jobs and the read-only runtimes attached from them.
+	restore *restoreState
+
+	// recovery holds cached verification reports, so the UI can show the last result without
+	// re-running a scan that walks the whole log.
+	recovery *recoveryState
+
+	// applyMu serializes whole patches. Settings that share one engine setter - the memory trio -
+	// would otherwise let two concurrent patches install a combination neither asked for.
+	applyMu sync.Mutex
 }
 
 // New binds Addr and starts serving immediately.
@@ -104,11 +156,17 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("control listen %s: %w", opts.Addr, err)
 	}
 	s := &Server{
-		opts:     opts,
-		ln:       ln,
-		events:   newEventHub(),
-		started:  opts.Now(),
-		settings: opts.Settings,
+		opts:            opts,
+		ln:              ln,
+		events:          newEventHub(),
+		started:         opts.Now(),
+		settings:        append([]config.SettingDescriptor(nil), opts.Settings...),
+		startupSettings: append([]config.SettingDescriptor(nil), opts.Settings...),
+		recovery:        newRecoveryState(),
+		restore:         newRestoreState(),
+		// Starts at 1, not 0: zero is what a caller sends to mean "do not check the revision", so
+		// a real revision of zero would silently skip the compare-and-swap it asked for.
+		revision: 1,
 	}
 	s.httpSrv = &http.Server{
 		Handler: s.routes(),
@@ -126,6 +184,9 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 // Close stops the listener and releases every SSE subscriber. Safe to call more than once.
 func (s *Server) Close() error {
 	s.events.close()
+	// Release any staged copy before the process goes: each holds a shared lock on its own
+	// directory, and leaving them open would outlive the thing that opened them.
+	s.closeAttached()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	err := s.httpSrv.Shutdown(ctx)
@@ -193,12 +254,17 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /v1/namespaces", s.nsRead(s.handleNamespaces))
 	mux.Handle("GET /v1/ns/{ns}/status", s.nsRead(s.handleStatus))
 	mux.Handle("GET /v1/ns/{ns}/schema", s.nsRead(s.handleSchema))
+	mux.Handle("GET /v1/ns/{ns}/indexes", s.nsRead(s.handleIndexes))
 	mux.Handle("GET /v1/ns/{ns}/log", s.nsRead(s.handleLog))
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}", s.nsRead(s.handleCommit))
 	mux.Handle("GET /v1/ns/{ns}/commits/{hash}/diff", s.nsRead(s.handleCommitDiff))
 	mux.Handle("GET /v1/ns/{ns}/refs", s.nsRead(s.handleRefs))
+	// Compare is a read: "what is different between these two points" is the one git-viewer
+	// question the commit log cannot answer, and asking it changes nothing.
+	mux.Handle("GET /v1/ns/{ns}/compare", s.nsRead(s.handleCompare))
 	mux.Handle("GET /v1/ns/{ns}/docs", s.nsRead(s.handleDocuments))
 	mux.Handle("GET /v1/ns/{ns}/docs/{id}", s.nsRead(s.handleDocument))
+	mux.Handle("GET /v1/ns/{ns}/docs/{id}/history", s.nsRead(s.handleDocumentHistory))
 	mux.Handle("POST /v1/ns/{ns}/sql", s.nsRead(s.handleSQL))
 	mux.Handle("GET /v1/ns/{ns}/events", s.nsRead(s.handleEvents))
 
@@ -206,23 +272,56 @@ func (s *Server) routes() http.Handler {
 	// existing admin: grant vocabulary (auth.AdminAction -> kind "admin").
 	mux.Handle("GET /v1/health", s.adminRead(s.handleHealth))
 	mux.Handle("GET /v1/settings", s.adminRead(s.handleSettings))
+	mux.Handle("GET /v1/settings/drift", s.adminRead(s.handleSettingsDrift))
+	mux.Handle("GET /v1/settings/{key}", s.adminRead(s.handleSettingByKey))
+	mux.Handle("PATCH /v1/settings", s.adminRead(s.handlePatchSettings))
 	mux.Handle("GET /v1/ops/runtime", s.adminRead(s.handleOpsRuntime))
+	mux.Handle("GET /v1/ops/locks", s.adminRead(s.handleOpsLocks))
+	mux.Handle("GET /v1/ops/metrics", s.adminRead(s.handleOpsMetrics))
+	// Draining is one-way and gated on --control-write plus a typed confirmation. It is a read
+	// route only in the sense that every control route authorizes the same way; the handler
+	// refuses without write permission.
+	mux.Handle("POST /v1/ops/drain", s.adminRead(s.handleOpsDrain))
 
 	// Revert. Planning is a read - it computes a diff and writes nothing - so it is available
 	// whatever the write setting, and an operator can always see what a revert *would* do. Only
 	// applying is gated.
+	mux.Handle("PUT /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handlePutDocument))
+	mux.Handle("DELETE /v1/ns/{ns}/docs/{id}", s.nsWrite(s.handleDeleteDocument))
+	mux.Handle("POST /v1/ns/{ns}/refs/branches", s.nsWrite(s.handleCreateBranch))
+	mux.Handle("DELETE /v1/ns/{ns}/refs/branches/{name}", s.nsWrite(s.handleDeleteBranch))
+	mux.Handle("POST /v1/ns/{ns}/refs/tags", s.nsWrite(s.handleCreateTag))
+	mux.Handle("DELETE /v1/ns/{ns}/refs/tags/{name}", s.nsWrite(s.handleDeleteTag))
+
+	// Recovery. Verifying and backing up are reads of the log and need no write permission: an
+	// operator must always be able to find out whether their data is intact and take a copy of it.
+	mux.Handle("GET /v1/ns/{ns}/integrity", s.nsRead(s.handleIntegrity))
+	mux.Handle("POST /v1/ns/{ns}/integrity/verify", s.nsRead(s.handleVerify))
+	mux.Handle("GET /v1/ns/{ns}/checkpoints", s.nsRead(s.handleCheckpoints))
+	mux.Handle("GET /v1/ns/{ns}/maintenance/plan", s.nsRead(s.handleMaintenancePlan))
+	mux.Handle("GET /v1/ns/{ns}/backups", s.nsRead(s.handleListBackups))
+	mux.Handle("POST /v1/ns/{ns}/backups/{id}/verify", s.nsRead(s.handleVerifyBackup))
+	// Creating one writes to the backup directory, so it is gated - not because it touches the
+	// database, but because it consumes disk somewhere an operator did not ask for it to.
+	mux.Handle("POST /v1/ns/{ns}/backups", s.nsWrite(s.handleCreateBackup))
+
+	// Staged restore. Writing to a scratch directory rather than to the database, but it consumes
+	// disk and opens a second view of the data, so it is gated the same way a backup is.
+	mux.Handle("POST /v1/ns/{ns}/restore/staging", s.nsWrite(s.handleStartRestore))
+	mux.Handle("GET /v1/restore/staging", s.adminRead(s.handleListRestoreJobs))
+	mux.Handle("GET /v1/restore/staging/{jobId}", s.adminRead(s.handleRestoreJob))
+	mux.Handle("POST /v1/restore/staging/{jobId}/attach", s.adminRead(s.handleAttachRestore))
+	mux.Handle("POST /v1/restore/staging/{jobId}/detach", s.adminRead(s.handleDetachRestore))
+
+	// Promotion. The plan is a read - an operator should always be able to see what promoting
+	// would do, and what stands in the way, on a control plane that would refuse to do it.
+	mux.Handle("GET /v1/restore/staging/{jobId}/promote/plan", s.adminRead(s.handlePromotionPlan))
+	mux.Handle("POST /v1/restore/staging/{jobId}/promote", s.adminRead(s.handlePromote))
+	mux.Handle("GET /v1/promotion", s.adminRead(s.handlePromotionStatus))
+	mux.Handle("DELETE /v1/promotion", s.adminRead(s.handleAbandonPromotion))
+
 	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
 	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))
-
-	// Still specified but not built. Declared rather than omitted so the API's shape is honest
-	// about what is coming and a client gets 501 rather than 404.
-	for _, route := range []string{
-		"PUT /v1/ns/{ns}/docs/{id}",
-		"DELETE /v1/ns/{ns}/docs/{id}",
-		"PATCH /v1/settings",
-	} {
-		mux.Handle(route, s.notImplemented())
-	}
 
 	if s.opts.ServeUI {
 		mux.Handle("GET /", uiHandler())
@@ -244,15 +343,7 @@ func withRecovery(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) notImplemented() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.opts.AllowWrites {
-			writeError(w, http.StatusForbidden, "read_only",
-				"this control plane is read-only; start the service with --control-write to enable "+
-					"mutating endpoints")
-			return
-		}
-		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"this endpoint is specified in docs/kdb-control-ui-plan.md but not built yet")
-	})
-}
+// A declared-but-unbuilt endpoint used to answer 501 here, so that "the server said no" and "the
+// server cannot" stayed distinguishable while the plan ran ahead of the code. Every endpoint this
+// package declares is now built, so the helper is gone: a route that does not exist answers 404,
+// which is the truth about it.

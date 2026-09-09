@@ -81,13 +81,26 @@ type ServiceSettings struct {
 	// ControlUI serves the embedded single-page UI on the control listener. On by default, since
 	// a control plane with no UI is only useful to a script, but separable for a deployment that
 	// wants the API alone.
-	ControlUI     bool
-	TLSCert       string
-	TLSKey        string
-	TLSCA         string
-	TLSClientAuth bool
-	LogLevel      string
-	LogFormat     string
+	ControlUI bool
+	// ControlSettingsPersist lets a setting changed through the control plane also be written back
+	// to the config file. Off by default: that file belongs to whoever deploys, not to the server,
+	// and a change applied without this is still reported as drift so nothing is silently lost.
+	ControlSettingsPersist bool
+	// ControlPromote lets the control plane promote a staged restore over the live namespace. Off
+	// by default and separate from ControlWrite: it is the one control-plane operation that ends
+	// with the process exiting for a supervisor to restart, so a deployment has to say it has one.
+	ControlPromote bool
+	// ControlBackupDir is where the control plane writes backups. Empty disables them.
+	ControlBackupDir string
+	// ControlStagingDir is where the control plane restores backups for inspection. Empty disables
+	// staged restores.
+	ControlStagingDir string
+	TLSCert           string
+	TLSKey            string
+	TLSCA             string
+	TLSClientAuth     bool
+	LogLevel          string
+	LogFormat         string
 
 	// Storage-engine tunables. These reach storage.StorageEngineConfig via
 	// embed.FileRuntimeOptions; before they existed the engine's Durability and
@@ -117,8 +130,11 @@ func DefaultServiceSettings() ServiceSettings {
 		ControlAddr:  "",
 		ControlWrite: false,
 		ControlUI:    true,
-		LogLevel:     "info",
-		LogFormat:    "text",
+		// Off: the config file belongs to whoever deploys, not to the server.
+		ControlSettingsPersist: false,
+		ControlPromote:         false,
+		LogLevel:               "info",
+		LogFormat:              "text",
 		// 0 = auto-detect the budget rather than run ungoverned - see MemoryBudgetMB.
 		MemoryBudgetMB:  0,
 		MemoryReserveMB: int(server.DefaultRescueReserveBytes >> 20),
@@ -143,29 +159,33 @@ func DefaultServiceSettings() ServiceSettings {
 // duration strings ("30s", "2m"). Unknown fields are rejected, so a typo fails loudly at
 // startup instead of silently configuring nothing.
 type ServiceFile struct {
-	DataDir         *string         `json:"dataDir"`
-	Memory          *bool           `json:"memory"`
-	Namespace       *string         `json:"namespace"`
-	SQLAddr         *string         `json:"sqlAddr"`
-	PeerAddr        *string         `json:"peerAddr"`
-	StreamAddr      *string         `json:"streamAddr"`
-	WSAddr          *string         `json:"wsAddr"`
-	GRPCAddr        *string         `json:"grpcAddr"`
-	AdminAddr       *string         `json:"adminAddr"`
-	RBAC            *bool           `json:"rbac"`
-	MemoryBudgetMB  *int            `json:"memoryBudgetMb"`
-	MemoryLimitMB   *int            `json:"memoryLimitMb"`
-	MemoryReserveMB *int            `json:"memoryReserveMb"`
-	MaxConnections  *int            `json:"maxConnections"`
-	ScanRowBudget   *int            `json:"scanRowBudget"`
-	AbortAfter      *string         `json:"abortAfter"`
-	DrainTimeout    *string         `json:"drainTimeout"`
-	TLS             *ServiceTLSFile `json:"tls"`
-	LogLevel        *string         `json:"logLevel"`
-	LogFormat       *string         `json:"logFormat"`
-	ControlAddr     *string         `json:"controlAddr"`
-	ControlWrite    *bool           `json:"controlWrite"`
-	ControlUI       *bool           `json:"controlUi"`
+	DataDir                *string         `json:"dataDir"`
+	Memory                 *bool           `json:"memory"`
+	Namespace              *string         `json:"namespace"`
+	SQLAddr                *string         `json:"sqlAddr"`
+	PeerAddr               *string         `json:"peerAddr"`
+	StreamAddr             *string         `json:"streamAddr"`
+	WSAddr                 *string         `json:"wsAddr"`
+	GRPCAddr               *string         `json:"grpcAddr"`
+	AdminAddr              *string         `json:"adminAddr"`
+	RBAC                   *bool           `json:"rbac"`
+	MemoryBudgetMB         *int            `json:"memoryBudgetMb"`
+	MemoryLimitMB          *int            `json:"memoryLimitMb"`
+	MemoryReserveMB        *int            `json:"memoryReserveMb"`
+	MaxConnections         *int            `json:"maxConnections"`
+	ScanRowBudget          *int            `json:"scanRowBudget"`
+	AbortAfter             *string         `json:"abortAfter"`
+	DrainTimeout           *string         `json:"drainTimeout"`
+	TLS                    *ServiceTLSFile `json:"tls"`
+	LogLevel               *string         `json:"logLevel"`
+	LogFormat              *string         `json:"logFormat"`
+	ControlAddr            *string         `json:"controlAddr"`
+	ControlWrite           *bool           `json:"controlWrite"`
+	ControlUI              *bool           `json:"controlUi"`
+	ControlSettingsPersist *bool           `json:"controlSettingsPersist"`
+	ControlPromote         *bool           `json:"controlPromote"`
+	ControlBackupDir       *string         `json:"controlBackupDir"`
+	ControlStagingDir      *string         `json:"controlStagingDir"`
 
 	Durability          *string `json:"durability"`
 	AsyncSyncIntervalMS *int    `json:"asyncSyncIntervalMs"`
@@ -260,6 +280,10 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.ControlAddr, file.ControlAddr)
 		setIf(&s.ControlWrite, file.ControlWrite)
 		setIf(&s.ControlUI, file.ControlUI)
+		setIf(&s.ControlSettingsPersist, file.ControlSettingsPersist)
+		setIf(&s.ControlPromote, file.ControlPromote)
+		setIf(&s.ControlBackupDir, file.ControlBackupDir)
+		setIf(&s.ControlStagingDir, file.ControlStagingDir)
 		setIf(&s.Durability, file.Durability)
 		setIf(&s.AsyncSyncIntervalMS, file.AsyncSyncIntervalMS)
 		setIf(&s.Compression, file.Compression)
@@ -367,6 +391,14 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envBool("KDB_CONTROL_UI", &s.ControlUI); err != nil {
 		return s, err
 	}
+	if err := envBool("KDB_CONTROL_PROMOTE", &s.ControlPromote); err != nil {
+		return s, err
+	}
+	if err := envBool("KDB_CONTROL_SETTINGS_PERSIST", &s.ControlSettingsPersist); err != nil {
+		return s, err
+	}
+	envString("KDB_CONTROL_BACKUP_DIR", &s.ControlBackupDir)
+	envString("KDB_CONTROL_STAGING_DIR", &s.ControlStagingDir)
 	envString("KDB_DURABILITY", &s.Durability)
 	if err := envInt("KDB_ASYNC_SYNC_INTERVAL_MS", &s.AsyncSyncIntervalMS); err != nil {
 		return s, err
@@ -403,6 +435,10 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"control-addr", func() { s.ControlAddr = flags.ControlAddr }},
 		{"control-write", func() { s.ControlWrite = flags.ControlWrite }},
 		{"control-ui", func() { s.ControlUI = flags.ControlUI }},
+		{"control-settings-persist", func() { s.ControlSettingsPersist = flags.ControlSettingsPersist }},
+		{"control-promote", func() { s.ControlPromote = flags.ControlPromote }},
+		{"control-backup-dir", func() { s.ControlBackupDir = flags.ControlBackupDir }},
+		{"control-staging-dir", func() { s.ControlStagingDir = flags.ControlStagingDir }},
 		{"log-level", func() { s.LogLevel = flags.LogLevel }},
 		{"log-format", func() { s.LogFormat = flags.LogFormat }},
 		{"durability", func() { s.Durability = flags.Durability }},

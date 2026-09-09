@@ -10,6 +10,8 @@
     --bg: #fbfbfa; --panel: #fff; --border: #e3e1dd; --text: #1f1e1c; --muted: #6b6862;
     --accent: #3f6ad8; --added: #2f8a4f; --modified: #b07d1a; --removed: #c0392b;
     --chip: #f0eeea; --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    /* One log row, and so one row of the commit graph. */
+    --row-h: 30px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -88,9 +90,27 @@
                  padding: 8px; border: 1px solid var(--border); border-radius: 6px;
                  background: var(--bg); color: var(--text); resize: vertical; }
   .grid-wrap { overflow-x: auto; }
+  /* The graph gutter has to line up with the rows beside it, so the log table's row height is
+     fixed here and read back by the renderer (--row-h) rather than guessed in two places. A commit
+     is one line: a wrapping message would change a row's height and break the verticals. */
+  table.log tbody tr { height: var(--row-h); }
+  /* No row rules in the log: the border would add a pixel to the row pitch that the gutter's SVG
+     cannot span, leaving a hairline break in every vertical. The graph itself separates the rows. */
+  table.log tbody td { padding-top: 0; padding-bottom: 0; border-bottom: none; }
+  table.log td.msg { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.graph { padding: 0 0 0 10px; vertical-align: middle; width: 1px; white-space: nowrap; }
+  /* Visible overflow so a row's verticals can be drawn slightly past its box and meet the next
+     row's despite sub-pixel row heights - see BLEED. */
+  svg.lanes { display: block; overflow: visible; }
+  svg.lanes .edge { stroke: var(--border); stroke-width: 2; fill: none; }
+  svg.lanes .node { fill: var(--panel); stroke: var(--accent); stroke-width: 2; }
+  svg.lanes .node.merge { fill: var(--accent); }
   td.cell { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   pre.doc { margin: 0; padding: 10px 12px; font-family: var(--mono); font-size: 12px;
             white-space: pre-wrap; overflow-wrap: anywhere; }
+  textarea.doc { width: 100%; min-height: 200px; font-family: var(--mono); font-size: 12px;
+                 padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+                 background: var(--bg); color: var(--text); resize: vertical; }
   /* Time travel is a mode, not a filter: it has to be impossible to miss that what is on screen
      is not current. Hence a full-width bar rather than a subtle badge. */
   .timebar { display: flex; align-items: center; gap: 10px; padding: 8px 16px; font-size: 13px;
@@ -125,9 +145,10 @@
   <button data-tab="schema" aria-selected="false">Schema</button>
   <button data-tab="settings" aria-selected="false">Settings</button>
   <button data-tab="ops" aria-selected="false">Ops</button>
+  <button data-tab="recovery" aria-selected="false">Recovery</button>
 </nav>
 <div class="timebar" id="timebar" hidden>
-  <span>Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
+  <span id="atmsg">Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
   <span class="sp" style="flex:1"></span>
   <button class="act" id="exitat">Return to HEAD</button>
 </div>
@@ -135,6 +156,12 @@
 <dialog id="revertdlg"><h3>Revert</h3><div class="body" id="revertbody"></div>
   <footer><button class="act" id="revertcancel">Cancel</button>
   <button class="act danger" id="revertgo">Revert</button></footer></dialog>
+<dialog id="promotedlg"><h3>Promote a restored copy</h3><div class="body" id="promotebody"></div>
+  <footer><button class="act" id="promotecancel">Cancel</button>
+  <button class="act danger" id="promotego">Promote and restart</button></footer></dialog>
+<dialog id="docdiffdlg"><h3>What this commit did to this document</h3>
+  <div class="body" id="docdiffbody"></div>
+  <footer><button class="act" id="docdiffclose">Close</button></footer></dialog>
 
 <script>
 "use strict";
@@ -162,10 +189,11 @@ const TOKEN_KEY = "kdb.control.token";
 let token = sessionStorage.getItem(TOKEN_KEY) || "";
 // `at` is the revision every view reads at: null means head. It is a mode rather than a per-view
 // filter, so it lives here and every fetch consults it.
-let state = { ns: null, namespaces: [], tab: "data", commits: [], selected: null, hasMore: false,
+let state = { ns: null, namespaces: [], tab: "data", commits: [], graph: [], selected: null, hasMore: false,
               es: null, at: null, canWrite: false,
-              docs: [], docCursor: null, docsMore: false, openDoc: null,
-              sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null };
+              docs: [], docCursor: null, docsMore: false, openDoc: null, editing: null, timeline: null,
+              sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null, settings: null,
+              compare: null };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -194,7 +222,7 @@ function renderGate(message) {
   $("tabs").hidden = true; $("signout").hidden = true;
   // The namespace picker is emptied rather than hidden: an option list left over from a previous
   // session would offer namespaces this one has not authenticated for.
-  $("nspick").replaceChildren();
+  setKids($("nspick"), );
   $("head").textContent = "";
   $("timebar").hidden = true;
   setLive(false, "offline");
@@ -217,25 +245,41 @@ function renderGate(message) {
   input.focus();
 }
 
-// setMain replaces the page body, dropping absent children. Node.replaceChildren stringifies a
-// null into the literal text "null" - el() already filters, and this is its counterpart for the
-// one place children are passed straight to the DOM.
-function setMain(...children) {
-  $("main").replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+// setKids replaces a node's children, dropping absent ones.
+//
+// Node.replaceChildren renders a conditional null as the literal text "null". el() has always
+// filtered its children; every direct call to replaceChildren has to as well, and forgetting has
+// now produced that bug three separate times. So there are no direct calls left: this is the only
+// way children are handed to the DOM.
+function setKids(node, ...children) {
+  node.replaceChildren(...children.flat()
+    .filter((c) => c !== null && c !== undefined && c !== false && c !== ""));
 }
+
+function setMain(...children) { setKids($("main"), ...children); }
 
 // enterAt / exitAt switch the whole app between head and a past revision. Everything re-renders,
 // because a screen showing a mix of current and historical data would be worse than either.
 function enterAt(spec, label) {
-  state.at = spec;
-  $("timebar").hidden = false;
-  $("atref").textContent = label || spec;
+  state.at = label || spec;
   selectTab(state.tab);
 }
 
+// isStagedNs: a staged restore is a second, read-only view of a database, and three places have to
+// know the difference. Asked once here rather than by comparing prefixes at each of them.
+function isStagedNs(ns) {
+  return typeof ns === "string" && ns.startsWith("staged/");
+}
+
 function exitAt() {
+  // On a staged copy the bar's button means "leave the copy"; on a live namespace it means
+  // "return to head". One button, because the operator only ever wants out of whatever they are in.
+  if (isStagedNs(state.ns)) {
+    const live = (state.namespaces.find((n) => n.default) || state.namespaces[0] || {}).id;
+    if (live) { switchNamespace(live); return; }
+  }
   state.at = null;
-  $("timebar").hidden = true;
+  drawBanner();
   selectTab(state.tab);
 }
 
@@ -248,10 +292,43 @@ function atQuery(sep) {
 // app follows the selection.
 function renderNamespacePicker() {
   const sel = $("nspick");
-  sel.replaceChildren(...state.namespaces.map((n) =>
+  setKids(sel, ...state.namespaces.map((n) =>
     el("option", { value: n.id, selected: n.id === state.ns ? "selected" : null }, n.id)));
   sel.disabled = state.namespaces.length < 2;
   sel.title = state.namespaces.length < 2 ? "This server serves one namespace" : "Switch namespace";
+}
+
+// drawBanner is the one place the bar above the content is decided. A staged copy and a past
+// revision are different situations - a different database versus a different point in time - and
+// both have to be impossible to miss, so they share the bar but not the wording.
+function drawBanner() {
+  const staged = isStagedNs(state.ns);
+  const bar = $("timebar");
+  bar.hidden = !staged && !state.at;
+  if (bar.hidden) return;
+  if (staged) {
+    setKids($("atmsg"), "Viewing a restored copy, not the live database — ",
+      el("strong", { text: state.ns }), ". It is read-only.");
+    $("exitat").textContent = "Back to the live namespace";
+    return;
+  }
+  setKids($("atmsg"), "Viewing at ", el("strong", { text: state.at }),
+    " — this is a past state, and it is read-only.");
+  $("exitat").textContent = "Return to HEAD";
+}
+
+// switchNamespace is the single path for changing which namespace every view is looking at, used by
+// the picker and by attaching a staged restore. Having two of these is what let them disagree.
+async function switchNamespace(id, tab) {
+  state.ns = id;
+  state.namespaces = (await api("/v1/namespaces")).namespaces || state.namespaces;
+  renderNamespacePicker();
+  // Everything view-shaped belongs to the namespace it came from: a cursor, a selected commit or an
+  // open document from another one means nothing here.
+  Object.assign(state, { commits: [], graph: [], selected: null, docs: [], docCursor: null,
+                         openDoc: null, editing: null, timeline: null, sqlResult: null,
+                         sqlError: null, at: null, compare: null });
+  await selectTab(tab || state.tab);
 }
 
 function setLive(on, text, bad) {
@@ -285,6 +362,7 @@ async function boot() {
 
 async function selectTab(tab) {
   state.tab = tab;
+  drawBanner();
   for (const b of $("tabs").children) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   setMain(el("div", { class: "empty", text: "Loading…" }));
   try {
@@ -295,6 +373,7 @@ async function selectTab(tab) {
     else if (tab === "schema") await renderSchema();
     else if (tab === "settings") await renderSettings();
     else if (tab === "ops") await renderOps();
+    else if (tab === "recovery") await renderRecovery();
   } catch (e) {
     setMain(el("div", { class: "err", text: e.message }));
   }
@@ -351,27 +430,330 @@ function drawData() {
 
 async function openDocument(docId) {
   const panel = $("docpanel");
-  panel.replaceChildren(el("h2", { text: "Document" }), el("div", { class: "empty", text: "Loading…" }));
+  setKids(panel, el("h2", { text: "Document" }), el("div", { class: "empty", text: "Loading…" }));
   try {
     const doc = await api(nsPath("/docs/" + encodeURIComponent(docId)) + atQuery("?"));
     state.openDoc = doc;
     drawData();
   } catch (e) {
-    panel.replaceChildren(el("h2", { text: "Document" }), el("div", { class: "err", text: e.message }));
+    setKids(panel, el("h2", { text: "Document" }), el("div", { class: "err", text: e.message }));
   }
 }
 
 function drawDocument(doc) {
-  $("docpanel").replaceChildren(
-    el("h2", { text: doc.docId.slice(0, 8) + "…" }),
-    el("div", { class: "body" },
-      el("dl", { class: "kv" },
-        el("dt", { text: "Id" }), el("dd", {}, el("code", { text: doc.docId })),
-        el("dt", { text: "Commit" }), el("dd", {}, el("code", { text: (doc.commit || "").slice(0, 16) })),
-        el("dt", { text: "Read at" }), el("dd", { text: doc.atHead ? "head" : "a past revision (read-only)" }))),
-    // The body is shown exactly as stored: the engine round-trips a document byte-for-byte, and
-    // pretty-printing it here would show the operator something the database does not hold.
-    el("pre", { class: "doc", text: JSON.stringify(doc.body, null, 2) }));
+  const editing = state.editing;
+  const canEdit = state.canWrite && doc.atHead !== false;
+
+  const meta = el("dl", { class: "kv" },
+    el("dt", { text: "Id" }), el("dd", {}, el("code", { text: doc.docId })),
+    el("dt", { text: "Commit" }), el("dd", {}, el("code", { text: (doc.commit || "").slice(0, 16) })),
+    el("dt", { text: "Read at" }),
+    el("dd", { text: doc.atHead === false ? "a past revision (read-only)" : "head" }));
+
+  if (!editing) {
+    setKids($("docpanel"), 
+      el("h2", { text: doc.docId.slice(0, 8) + "…" }),
+      el("div", { class: "body" }, meta,
+        el("div", { style: "margin-top:10px;display:flex;gap:8px" },
+          canEdit
+            ? el("button", { class: "act", text: "Edit", onclick: () => { state.editing = { text: JSON.stringify(doc.body, null, 2) }; drawDocument(doc); } })
+            : null,
+          el("button", { class: "act", text: "History",
+                         title: "every version of this document, with the diff between them",
+                         onclick: () => openTimeline(doc) }),
+          canEdit
+            ? el("button", { class: "act danger", text: "Delete", onclick: () => deleteDocument(doc) })
+            : null,
+          !state.canWrite ? el("span", { class: "muted", style: "font-size:12px",
+              text: "read-only control plane" }) : null)),
+      el("pre", { class: "doc", text: JSON.stringify(doc.body, null, 2) }));
+    return;
+  }
+
+  const editor = el("textarea", { class: "doc", spellcheck: "false" });
+  editor.value = editing.text;
+  // Which keys the save would keep, computed as you type rather than reported afterwards. A write
+  // is a shallow merge in this engine, so a key deleted in the editor survives - that is worth
+  // knowing before pressing save, not after.
+  const warn = el("div", {});
+  // A save merges by default, so a key deleted in the editor survives. Ticking this makes the
+  // body the whole document instead - a delete and a write in one commit. Offered as a choice
+  // rather than as the default because every other write path in this engine merges.
+  const replaceBox = el("input", { type: "checkbox", id: "docreplace" });
+  const replaceLabel = el("label", {
+    style: "display:none;gap:5px;align-items:center;font-size:12px;margin-top:6px" },
+    replaceBox, "remove them: replace the document with exactly what is in the box");
+  const recheck = () => {
+    setKids(warn, );
+    let parsed;
+    try { parsed = JSON.parse(editor.value); } catch (e) {
+      setKids(warn, el("div", { class: "err", text: "Not valid JSON: " + e.message }));
+      replaceLabel.style.display = "none";
+      return null;
+    }
+    const kept = Object.keys(doc.body || {}).filter((k) => !(k in parsed));
+    if (kept.length) {
+      setKids(warn, el("div", { class: "warn" },
+        replaceBox.checked
+          ? el("span", {}, el("code", { text: kept.join(", ") }),
+              " will be removed. They stay readable at every earlier commit.")
+          : el("span", {}, "A write merges over the stored document, so ",
+              el("code", { text: kept.join(", ") }), " would be kept.")));
+      replaceLabel.style.display = "flex";
+    } else {
+      // Nothing would be dropped either way, so the choice is noise.
+      replaceLabel.style.display = "none";
+    }
+    return parsed;
+  };
+  editor.addEventListener("input", recheck);
+  replaceBox.addEventListener("change", recheck);
+
+  const save = async () => {
+    const parsed = recheck();
+    if (!parsed) return;
+    try {
+      const saved = await api(nsPath("/docs/" + encodeURIComponent(doc.docId)), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: parsed, ifContentHash: doc.contentHash,
+                               replace: replaceBox.checked }),
+      });
+      state.editing = null;
+      await openDocument(doc.docId);
+      await renderData();
+      flash("Saved as commit " + (saved.commit || "").slice(0, 8) +
+            (saved.replaced ? " — replaced" +
+              ((saved.removedKeys || []).length ? ", dropping " + saved.removedKeys.join(", ") : "")
+             : "") + ".");
+    } catch (e) {
+      setKids(warn, el("div", { class: "err", text: e.message }));
+    }
+  };
+
+  setKids($("docpanel"), 
+    el("h2", { text: "Editing " + doc.docId.slice(0, 8) + "…" }),
+    el("div", { class: "body" }, meta,
+      el("div", { style: "margin-top:10px" }, editor),
+      warn,
+      replaceLabel,
+      el("div", { style: "margin-top:8px;display:flex;gap:8px;align-items:center" },
+        el("button", { class: "act", text: "Save", onclick: save }),
+        el("button", { class: "act", text: "Cancel",
+                       onclick: () => { state.editing = null; drawDocument(doc); } }),
+        el("span", { class: "muted", style: "font-size:12px",
+          text: "saved only if the document has not changed since it was read" }))));
+  recheck();
+}
+
+async function deleteDocument(doc) {
+  if (!confirm("Delete this document?\n\nIt stays readable in history, and the delete is a commit "
+      + "that can be reverted.")) return;
+  try {
+    await api(nsPath("/docs/" + encodeURIComponent(doc.docId)), {
+      method: "DELETE", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ifContentHash: doc.contentHash }),
+    });
+    state.openDoc = null;
+    state.editing = null;
+    await renderData();
+    flash("Deleted. The document is still readable at any earlier commit.");
+  } catch (e) {
+    setKids($("docpanel"), el("h2", { text: "Document" }), el("div", { class: "err", text: e.message }));
+  }
+}
+
+// ---- Document timeline --------------------------------------------------------------------
+
+// The timeline is the view that makes a versioned document store worth using directly: every
+// version of one document, the diff between any two, and a way back to an earlier one.
+async function openTimeline(doc) {
+  setKids($("docpanel"), el("h2", { text: "History" }),
+    el("div", { class: "empty", text: "Loading…" }));
+  try {
+    const hist = await api(nsPath("/docs/" + encodeURIComponent(doc.docId) + "/history?limit=50"));
+    state.timeline = { doc, versions: hist.versions || [], note: hist.note, pick: [] };
+    drawTimeline();
+  } catch (e) {
+    setKids($("docpanel"), el("h2", { text: "History" }), el("div", { class: "err", text: e.message }));
+  }
+}
+
+function drawTimeline() {
+  const tl = state.timeline;
+  const rows = tl.versions.map((v, i) => {
+    const chosen = tl.pick.includes(i);
+    const tr = el("tr", { class: "pick" + (chosen ? " sel" : "") },
+      el("td", {}, el("code", { text: v.shortCommit }),
+        chosen ? el("span", { class: "chip ref", text: tl.pick.indexOf(i) === 0 ? "a" : "b" }) : null),
+      el("td", {}, el("span", { class: "chip " + changeChip(v.change), text: v.change }),
+        v.message ? el("div", { class: "muted", style: "font-size:12px", text: v.message }) : null),
+      el("td", { class: "muted" }, formatTime(v.timestamp)),
+      el("td", { class: "muted" }, v.sizeBytes ? formatBytes(v.sizeBytes) : "—"));
+    // Two clicks pick two versions to compare; a third starts over. Comparing arbitrary pairs
+    // matters more than comparing adjacent ones - "what changed since Tuesday" is the real question.
+    tr.addEventListener("click", () => {
+      const at = tl.pick.indexOf(i);
+      if (at >= 0) tl.pick.splice(at, 1);
+      else if (tl.pick.length < 2) tl.pick.push(i);
+      else tl.pick = [i];
+      drawTimeline();
+    });
+    return tr;
+  });
+
+  const actions = el("div", { class: "body", style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center" },
+    el("button", { class: "act", text: "Back to document",
+                   onclick: () => { state.timeline = null; openDocument(tl.doc.docId); } }),
+    tl.pick.length === 2
+      ? el("button", { class: "act", text: "Compare the two", onclick: showVersionDiff })
+      : el("span", { class: "muted", style: "font-size:12px",
+          text: tl.versions.length > 1 ? "pick two versions to compare them" : "" }),
+    tl.pick.length === 1 && state.canWrite && tl.doc.atHead !== false
+      ? el("button", { class: "act danger", text: "Restore this version",
+                       onclick: () => restoreVersion(tl.versions[tl.pick[0]]) })
+      : null);
+
+  setKids($("docpanel"),
+    el("h2", { text: "History of " + tl.doc.docId.slice(0, 8) + "…" }),
+    actions,
+    tl.note ? el("div", { class: "body" }, el("div", { class: "warn", text: tl.note })) : null,
+    tl.versions.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Commit" }), el("th", { text: "Change" }),
+                              el("th", { text: "When" }), el("th", { text: "Size" }))),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty", text: "No versions - this document has never existed here." }),
+    el("div", { id: "versiondiff" }));
+}
+
+function changeChip(change) {
+  return { created: "added", modified: "modified", deleted: "removed" }[change] || "";
+}
+
+// showVersionDiff fetches both bodies and shows the difference key by key. Fetching them rather
+// than carrying every body in the listing keeps the listing the size of the history rather than the
+// size of the data.
+async function showVersionDiff() {
+  const tl = state.timeline;
+  const [i, j] = tl.pick;
+  // Older on the left whichever order they were clicked in: the list is newest-first, so the
+  // larger index is the older version.
+  const older = tl.versions[Math.max(i, j)];
+  const newer = tl.versions[Math.min(i, j)];
+  const target = $("versiondiff");
+  setKids(target, el("div", { class: "empty", text: "Loading both versions…" }));
+  try {
+    const [a, b] = await Promise.all([bodyAt(tl.doc.docId, older), bodyAt(tl.doc.docId, newer)]);
+    setKids(target,
+      el("h2", { text: "Change from " + older.shortCommit + " to " + newer.shortCommit }),
+      el("div", { class: "body" }, fieldDiff(a, b)));
+  } catch (e) {
+    setKids(target, el("div", { class: "err", text: e.message }));
+  }
+}
+
+async function bodyAt(docId, version) {
+  if (version.change === "deleted") return null;
+  const doc = await api(nsPath("/docs/" + encodeURIComponent(docId)) + "?at=" + encodeURIComponent(version.commit));
+  return doc.body;
+}
+
+// fieldDiff compares two document bodies key by key. A whole-text diff would be more general and
+// much less readable for JSON: what an operator wants to know is which fields moved.
+function fieldDiff(a, b) {
+  if (a === null && b === null) return el("div", { class: "muted", text: "absent in both" });
+  if (a === null) return el("div", {}, el("span", { class: "chip added", text: "created" }),
+    el("pre", { class: "doc", text: JSON.stringify(b, null, 2) }));
+  if (b === null) return el("div", {}, el("span", { class: "chip removed", text: "deleted" }),
+    el("pre", { class: "doc", text: JSON.stringify(a, null, 2) }));
+
+  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+  const rows = [];
+  for (const k of keys) {
+    const inA = k in a, inB = k in b;
+    const av = JSON.stringify(a[k]), bv = JSON.stringify(b[k]);
+    if (inA && inB && av === bv) continue;
+    rows.push(el("tr", {},
+      el("td", {}, el("code", { text: k })),
+      el("td", {}, el("span", { class: "chip " + (!inA ? "added" : !inB ? "removed" : "modified"),
+                                text: !inA ? "added" : !inB ? "removed" : "changed" })),
+      el("td", { class: "cell" }, el("code", { text: inA ? av : "—" })),
+      el("td", { class: "cell" }, el("code", { text: inB ? bv : "—" }))));
+  }
+  if (!rows.length) return el("div", { class: "muted", text: "identical" });
+  return el("div", { class: "grid-wrap" }, el("table", {},
+    el("thead", {}, el("tr", {}, el("th", { text: "Field" }), el("th", { text: "" }),
+                        el("th", { text: "Before" }), el("th", { text: "After" }))),
+    el("tbody", {}, rows)));
+}
+
+// openCommitDocDiff shows what one commit did to one document, field by field.
+//
+// The commit's tree diff names which documents moved; this is the "and what changed in it" that
+// otherwise meant reading the document at two revisions by hand. Both sides come from the ordinary
+// document read at a revision - the same call the timeline uses - so there is one way to read a
+// document at a revision rather than two that could drift apart.
+async function openCommitDocDiff(commit, diff, entry) {
+  const dlg = $("docdiffdlg");
+  const body = $("docdiffbody");
+  setKids(body, el("div", { class: "empty", text: "Reading both sides…" }));
+  dlg.showModal();
+
+  const at = async (rev) => {
+    try {
+      const doc = await api(nsPath("/docs/" + encodeURIComponent(entry.docId)) +
+                            "?at=" + encodeURIComponent(rev));
+      return doc.body;
+    } catch (e) {
+      // A document absent at one end is the normal case for an add or a remove, not an error.
+      return null;
+    }
+  };
+  const [before, after] = await Promise.all([at(diff.from), at(diff.to)]);
+  setKids(body,
+    el("div", { class: "kv", style: "margin-bottom:10px" },
+      el("dt", { text: "Document" }), el("dd", {}, el("code", { text: entry.docId })),
+      el("dt", { text: "At commit" }), el("dd", {}, el("code", { text: commit.shortHash }),
+        el("span", { class: "chip " + entry.change, style: "margin-left:6px", text: entry.change })),
+      el("dt", { text: "Compared with" }), el("dd", {}, el("code", { text: (diff.from || "").slice(0, 8) }))),
+    fieldDiff(before, after),
+    el("div", { class: "muted", style: "font-size:12px;margin-top:10px" },
+      "Both sides are read at their revision, so this is the document as it was, not a "
+      + "reconstruction from the commit's operations."));
+}
+
+// restoreVersion writes an old version forward. It is an ordinary save, which means it is a new
+// commit rather than a rewind - and it merges, so the confirmation says which keys will survive.
+async function restoreVersion(version) {
+  const tl = state.timeline;
+  const body = await bodyAt(tl.doc.docId, version);
+  if (body === null) {
+    flash("That version is a deletion; restoring it means deleting the document again.");
+    return;
+  }
+  const current = await api(nsPath("/docs/" + encodeURIComponent(tl.doc.docId)));
+  // Restoring a version means the document becomes exactly that version, so this replaces rather
+  // than merges. It used to merge - the only thing available - which meant "restore" could leave
+  // behind keys the restored version never had, and the confirmation had to warn about it.
+  const dropped = Object.keys(current.body || {}).filter((k) => !(k in body));
+  const warning = dropped.length
+    ? "\n\nThese keys are not in that version and will be removed: " + dropped.join(", ")
+    : "";
+  if (!confirm("Restore the version at " + version.shortCommit + "?\n\nThe document becomes "
+      + "exactly that version. This writes a new commit; nothing in history is rewritten, and "
+      + "every version stays readable." + warning)) return;
+  try {
+    const saved = await api(nsPath("/docs/" + encodeURIComponent(tl.doc.docId)), {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body, ifContentHash: current.contentHash, replace: true }),
+    });
+    state.timeline = null;
+    await renderData();
+    await openDocument(tl.doc.docId);
+    flash("Restored " + version.shortCommit + " as commit " + (saved.commit || "").slice(0, 8) + ".");
+  } catch (e) {
+    flash("Restore failed: " + e.message);
+  }
 }
 
 function formatBytes(n) {
@@ -407,8 +789,21 @@ async function renderSQL() {
 
 function drawSQL(editor, run) {
   const r = state.sqlResult;
+  // A write returns a commit rather than rows, so the two results are rendered differently: the
+  // useful thing about a write is what it changed and where that landed in history.
   const results = state.sqlError
     ? el("div", { class: "err", text: state.sqlError })
+    : r && r.kind === "ddl"
+      ? el("div", { class: "body" }, "Schema change applied.")
+    : r && r.kind === "dml"
+      ? el("div", { class: "body" },
+          r.committed
+            ? el("div", {},
+                el("div", {}, r.rowsAffected + " row" + (r.rowsAffected === 1 ? "" : "s") + " changed."),
+                el("div", { class: "muted", style: "margin-top:6px" },
+                  "Committed as ", el("code", { text: (r.commit || "").slice(0, 12) }),
+                  " — it is ordinary history, and can be reverted from the Commits tab."))
+            : el("div", { class: "muted", text: r.note || "Nothing was committed." }))
     : r
       ? el("div", {},
           el("div", { class: "body muted" },
@@ -435,7 +830,13 @@ function drawSQL(editor, run) {
         el("div", { style: "margin-top:8px;display:flex;gap:8px;align-items:center" },
           el("button", { class: "act", text: "Run", onclick: run }),
           el("span", { class: "muted", style: "font-size:12px",
-                       text: "⌘/Ctrl + Enter · SELECT only, whatever the write setting" })))),
+            text: state.canWrite
+              ? "⌘/Ctrl + Enter · writes are enabled and commit immediately"
+              : "⌘/Ctrl + Enter · this control plane is read-only, so SELECT only" }),
+          state.at
+            ? el("span", { class: "chip modified",
+                           text: "reading at " + state.at + " — writes not allowed here" })
+            : null))),
     el("div", { style: "height:12px" }),
     el("div", { class: "card" }, el("h2", { text: "Results" }), results));
 }
@@ -448,24 +849,31 @@ function renderCell(cell) {
   return String(cell);
 }
 
-async function renderCommits(append = false) {
-  const skip = append ? state.commits.length : 0;
+// Lane numbers only mean something relative to the walk that produced them, so "load more" widens
+// the window and re-walks from the same head rather than fetching an independently-laned page and
+// appending it. Re-walking costs a little; splicing two lane assignments together would draw lines
+// that jump sideways at the seam.
+async function renderCommits(more = false) {
+  const want = Math.min(more ? state.commits.length + COMMIT_PAGE : COMMIT_PAGE, COMMIT_WINDOW_MAX);
   const from = state.at ? "&from=" + encodeURIComponent(state.at) : "";
-  const page = await api(nsPath("/log?limit=50&skip=" + skip + from));
-  state.commits = append ? state.commits.concat(page.commits) : page.commits;
+  const page = await api(nsPath("/log?graph=true&limit=" + want + from));
+  state.commits = page.commits || [];
+  state.graph = page.graph || [];
   state.hasMore = page.hasMore;
   $("head").textContent = page.from ? page.from.slice(0, 8) : "";
   drawCommits();
 }
 
 function drawCommits() {
-  const rows = state.commits.map((c) => {
+  const rows = state.commits.map((c, i) => {
     const tr = el("tr", { class: "pick" + (state.selected && state.selected.hash === c.hash ? " sel" : "") },
+      laneCell(state.graph[i], laneIsLiveAbove(i), (c.parents || []).length > 0),
       el("td", {}, el("code", { text: c.shortHash }),
         // A merge is the one structural fact a flat list loses, so it is called out explicitly.
         c.parents && c.parents.length > 1 ? el("span", { class: "chip", text: "merge" }) : null,
         c.stub ? el("span", { class: "chip", text: "archived" }) : null),
-      el("td", {}, c.message || el("span", { class: "muted", text: "(no message)" }),
+      el("td", { class: "msg", title: c.message || "" },
+        c.message || el("span", { class: "muted", text: "(no message)" }),
         ...(c.refs || []).map((r) => el("span", { class: "chip ref", text: r }))),
       el("td", { class: "muted" }, formatTime(c.timestamp)),
       // -1 means the operations were evicted under the retention budget and the count is not
@@ -478,14 +886,24 @@ function drawCommits() {
   const list = el("div", { class: "card" },
     el("h2", { text: "Commits" }),
     rows.length
-      ? el("table", {},
-          el("thead", {}, el("tr", {}, el("th", { text: "Commit" }), el("th", { text: "Message" }),
+      ? el("table", { class: "log" },
+          el("thead", {}, el("tr", {}, el("th", { text: "" }), el("th", { text: "Commit" }),
+                              el("th", { text: "Message" }),
                               el("th", { text: "When" }), el("th", { text: "Ops" }))),
           el("tbody", {}, rows))
       : el("div", { class: "empty", text: "No commits yet." }),
     state.hasMore
       ? el("div", { class: "body" },
-          el("button", { class: "act", text: "Load more", onclick: () => renderCommits(true) }))
+          state.commits.length < COMMIT_WINDOW_MAX
+            ? el("button", { class: "act", text: "Load more", onclick: () => renderCommits(true) })
+            // At the cap the honest move is to say why the button is gone. Appending a separately
+            // laned page would put a seam in the drawing, so the way further back is to move the
+            // window: read at an older revision and walk from there.
+            : el("span", { class: "muted", style: "font-size:12px",
+                text: "Showing the deepest graph one walk can draw (" + COMMIT_WINDOW_MAX +
+                      " commits). To go further back, read at an older revision — e.g. " +
+                      state.commits[state.commits.length - 1].shortHash +
+                      " — in the revision box above." }))
       : null);
 
   const detail = el("div", { class: "card", id: "detail" },
@@ -499,9 +917,83 @@ function drawCommits() {
   if (state.selected) drawDetail(state.selected);
 }
 
+// laneCell draws one row of the graph: the verticals for every branch alive here, a node for this
+// commit, and a line per extra parent leaving it.
+//
+// SVG rather than box-drawing characters because a merge is a diagonal, and because the node has to
+// line up with a table row of arbitrary height. Each row is its own little SVG, so a row can be
+// re-rendered without redrawing the graph.
+const LANE_W = 14, DOT = 4;
+// Read from CSS so the drawing and the table cannot disagree about how tall a row is. A mismatch of
+// even a few pixels leaves a visible break in every vertical line.
+const ROW_H = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--row-h")) || 30;
+// How far past its own row each vertical is drawn. A table row's real height is not exactly --row-h
+// - browsers distribute sub-pixel remainders across rows - and a fraction of a pixel of daylight
+// between two segments reads as a broken line. Overdrawing costs nothing, because what is drawn
+// over is the continuation of the same line.
+const BLEED = 2;
+// How many commits a page asks for, and how much wider each "load more" makes the window.
+const COMMIT_PAGE = 50;
+// The server will walk at most this many commits in one request, and the graph needs one whole walk
+// (see handleLog), so this is also the deepest graph the window can show. Past it the reader moves
+// the window instead of growing it, by reading at an older revision.
+const COMMIT_WINDOW_MAX = 500;
+
+// Whether this row's lane already has a line running into it from the row above. It does if the row
+// above continued into it, passed a line through it, or bent a merge into it.
+//
+// A truncated walk is deliberately not a special case: a commit whose parent is off the page still
+// has parents, so its line continues to the bottom edge and the drawing says "there is more below"
+// rather than "history ends here".
+function laneIsLiveAbove(i) {
+  if (i === 0) return false;
+  const prev = state.graph[i - 1], row = state.graph[i];
+  if (!prev || !row) return false;
+  const above = state.commits[i - 1];
+  if (prev.lane === row.lane && (above.parents || []).length > 0) return true;
+  return (prev.through || []).includes(row.lane) || (prev.merges || []).includes(row.lane);
+}
+
+function laneCell(row, up, down) {
+  if (!row) return el("td", { class: "graph" });
+  const w = Math.max(1, row.width) * LANE_W;
+  const x = (lane) => lane * LANE_W + LANE_W / 2;
+  const mid = ROW_H / 2;
+  const parts = [];
+
+  // Branches that exist here but have nothing to say at this commit: a full-height vertical, so
+  // the line does not break wherever another branch has no commit.
+  for (const lane of row.through || []) {
+    parts.push(`<line class="edge" x1="${x(lane)}" y1="${-BLEED}" x2="${x(lane)}" y2="${ROW_H + BLEED}"/>`);
+  }
+  // This commit's own lane. Both halves are conditional: a tip has nothing entering it from above
+  // (the head, or a branch head no lane was waiting for), and a root has nothing leaving it below.
+  // Drawing them unconditionally leaves lines dangling off the top and bottom of the gutter.
+  if (up) {
+    parts.push(`<line class="edge" x1="${x(row.lane)}" y1="${-BLEED}" x2="${x(row.lane)}" y2="${mid}"/>`);
+  }
+  if (down) {
+    parts.push(`<line class="edge" x1="${x(row.lane)}" y1="${mid}" x2="${x(row.lane)}" y2="${ROW_H + BLEED}"/>`);
+  }
+  // Each extra parent leaves the node and bends down into its own lane.
+  for (const lane of row.merges || []) {
+    parts.push(`<path class="edge" d="M ${x(row.lane)} ${mid} C ${x(row.lane)} ${ROW_H}, ` +
+               `${x(lane)} ${mid}, ${x(lane)} ${ROW_H + BLEED}"/>`);
+  }
+  const merge = (row.merges || []).length > 0;
+  parts.push(`<circle class="node${merge ? " merge" : ""}" cx="${x(row.lane)}" cy="${mid}" r="${DOT}"/>`);
+
+  const td = el("td", { class: "graph" });
+  // Built as markup because it is a fixed set of shapes with no user-supplied text in it - every
+  // value here is a number this function computed.
+  td.innerHTML = `<svg class="lanes" width="${w}" height="${ROW_H}" viewBox="0 0 ${w} ${ROW_H}">` +
+    parts.join("") + `</svg>`;
+  return td;
+}
+
 async function showCommit(hash) {
   const detail = $("detail");
-  detail.replaceChildren(el("h2", { text: "Commit detail" }), el("div", { class: "empty", text: "Loading…" }));
+  setKids(detail, el("h2", { text: "Commit detail" }), el("div", { class: "empty", text: "Loading…" }));
   try {
     const [c, d] = await Promise.all([
       api(nsPath("/commits/" + hash)),
@@ -510,7 +1002,7 @@ async function showCommit(hash) {
     state.selected = { hash, commit: c, diff: d };
     drawCommits();
   } catch (e) {
-    detail.replaceChildren(el("h2", { text: "Commit detail" }), el("div", { class: "err", text: e.message }));
+    setKids(detail, el("h2", { text: "Commit detail" }), el("div", { class: "err", text: e.message }));
   }
 }
 
@@ -541,14 +1033,21 @@ function drawDetail(sel) {
   if (d && d.unavailable) {
     diffSection = el("div", { class: "warn", text: d.unavailable });
   } else if (d && d.entries && d.entries.length) {
+    // Each row opens the field-level diff for that one document at this commit. It is composed
+    // from two reads of the document - at this commit and at the one being compared against -
+    // rather than from a per-commit-per-document endpoint, for the reason the plan gives about the
+    // timeline: one way to read a document at a revision cannot disagree with itself.
     diffSection = el("div", {},
       el("div", { class: "body" },
         el("span", { class: "chip added", text: "+" + d.counts.added }), " ",
         el("span", { class: "chip modified", text: "~" + d.counts.modified }), " ",
-        el("span", { class: "chip removed", text: "−" + d.counts.removed })),
+        el("span", { class: "chip removed", text: "−" + d.counts.removed }),
+        el("span", { class: "muted", style: "font-size:12px;margin-left:8px",
+                     text: "a row opens what this commit did to that document" })),
       el("table", {},
         el("thead", {}, el("tr", {}, el("th", { text: "Change" }), el("th", { text: "Document" }))),
-        el("tbody", {}, d.entries.map((e) => el("tr", {},
+        el("tbody", {}, d.entries.map((e) => el("tr", { class: "pick",
+            onclick: () => openCommitDocDiff(c.commit, d, e) },
           el("td", {}, el("span", { class: "chip " + e.change, text: e.change })),
           el("td", {}, el("code", { text: e.docId })))))));
   } else {
@@ -565,7 +1064,7 @@ function drawDetail(sel) {
                    title: state.canWrite ? "" : "This control plane is read-only; you can preview the revert but not apply it",
                    onclick: () => openRevert(c.commit.hash, c.commit.shortHash) }));
 
-  $("detail").replaceChildren(
+  setKids($("detail"), 
     el("h2", { text: "Commit " + c.commit.shortHash }),
     el("div", { class: "body" }, el("strong", { text: c.commit.message || "(no message)" }), kv),
     actions,
@@ -576,35 +1075,192 @@ function drawDetail(sel) {
 async function renderRefs() {
   const r = await api(nsPath("/refs"));
   $("head").textContent = r.head ? r.head.slice(0, 8) : "";
-  setMain(el("div", { class: "row" },
-    el("div", { class: "col" }, el("div", { class: "card" },
-      el("h2", { text: "Branches" }),
-      r.branches.length
-        ? el("table", {},
-            el("thead", {}, el("tr", {}, el("th", { text: "Branch" }), el("th", { text: "Head" }), el("th", { text: "Updated" }))),
-            el("tbody", {}, r.branches.map((b) => el("tr", {},
-              el("td", {}, b.name, b.head === r.head ? el("span", { class: "chip ref", text: "HEAD" }) : null),
-              el("td", {}, el("code", { text: b.shortHead })),
-              el("td", { class: "muted" }, formatTime(b.updatedAt))))))
-        : el("div", { class: "empty", text: "No branches." }))),
-    el("div", { class: "col" }, el("div", { class: "card" },
-      el("h2", { text: "Tags" }),
-      r.tags.length
-        ? el("table", {},
-            el("thead", {}, el("tr", {}, el("th", { text: "Tag" }), el("th", { text: "Commit" }),
-                                el("th", { text: "Created" }))),
-            el("tbody", {}, r.tags.map((t) => el("tr", { class: "pick",
-                onclick: () => enterAt("tag:" + t.name, "tag:" + t.name) },
-              el("td", {}, t.name,
-                t.message ? el("div", { class: "muted", style: "font-size:12px", text: t.message }) : null),
-              el("td", {}, el("code", { text: t.shortHead })),
-              el("td", { class: "muted" }, formatTime(t.updatedAt))))))
-        : el("div", { class: "empty", text: "No tags." })))));
+  const canWrite = state.canWrite && !isStagedNs(state.ns);
+
+  const mutate = async (path, opts, what) => {
+    try {
+      const res = await api(nsPath(path), opts);
+      await renderRefs();
+      flash(what + (res.note ? " — " + res.note : ""));
+    } catch (e) {
+      flash(what.replace(/\.$/, "") + " failed: " + e.message);
+    }
+  };
+
+  const createRow = (kind, placeholder) => {
+    const name = el("input", { type: "text", placeholder: placeholder, style: "width:150px" });
+    const at = el("input", { type: "text", placeholder: state.at || "head",
+                             style: "width:150px", title: "any revision: a hash, head~3, tag:v1" });
+    const go = () => {
+      const body = kind === "tags"
+        ? { name: name.value, at: at.value.trim() || state.at || "" }
+        : { name: name.value, from: at.value.trim() || state.at || "" };
+      mutate("/refs/" + kind, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }, "Created " + (kind === "tags" ? "tag " : "branch ") + name.value + ".");
+    };
+    name.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+    return el("div", { class: "body", style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
+      name, el("span", { class: "muted", style: "font-size:12px", text: "at" }), at,
+      el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Create", onclick: go }));
+  };
+
+  const del = (kind, name, extra) => () => {
+    if (!confirm("Delete " + (kind === "tags" ? "tag " : "branch ") + name + "?\n\n"
+        + "Every commit it points at stays in the log and stays reachable by hash." + (extra || ""))) return;
+    mutate("/refs/" + kind + "/" + encodeURIComponent(name), { method: "DELETE" },
+           "Deleted " + name + ".");
+  };
+
+  const branches = el("div", { class: "card" },
+    el("h2", { text: "Branches" }),
+    r.branches.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Branch" }), el("th", { text: "Head" }),
+                              el("th", { text: "Updated" }), el("th", { text: "" }))),
+          el("tbody", {}, r.branches.map((b) => el("tr", {},
+            el("td", {}, b.name, b.head === r.head ? el("span", { class: "chip ref", text: "HEAD" }) : null),
+            el("td", {}, el("code", { text: b.shortHead })),
+            el("td", { class: "muted" }, formatTime(b.updatedAt)),
+            el("td", {},
+              el("button", { class: "act", style: "padding:2px 8px;font-size:12px",
+                text: "Compare", title: "what is different between this branch and where you are reading",
+                onclick: () => compareRefs(b.name, state.at || "head") }),
+              // main is refused by the graph itself - it is the branch that must always exist -
+              // so it is not offered here either.
+              canWrite && b.name !== "main"
+                ? el("button", { class: "act danger", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                    text: "Delete", onclick: del("branches", b.name) })
+                : null)))))
+      : el("div", { class: "empty", text: "No branches." }),
+    canWrite ? createRow("branches", "new branch name") : null);
+
+  const tags = el("div", { class: "card" },
+    el("h2", { text: "Tags" }),
+    r.tags.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Tag" }), el("th", { text: "Commit" }),
+                              el("th", { text: "Created" }), el("th", { text: "" }))),
+          el("tbody", {}, r.tags.map((t) => el("tr", {},
+            el("td", {}, t.name,
+              t.message ? el("div", { class: "muted", style: "font-size:12px", text: t.message }) : null),
+            el("td", {}, el("code", { text: t.shortHead })),
+            el("td", { class: "muted" }, formatTime(t.updatedAt)),
+            el("td", {},
+              el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Read at",
+                title: "time-travel every view to this tag",
+                onclick: () => enterAt("tag:" + t.name, "tag:" + t.name) }),
+              el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                text: "Compare", onclick: () => compareRefs("tag:" + t.name, state.at || "head") }),
+              canWrite
+                ? el("button", { class: "act danger", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                    text: "Delete",
+                    onclick: del("tags", t.name,
+                      "\n\nA tag is also a retention root: deleting it lets compaction squash the "
+                      + "commit it named, unless something else retains it.") })
+                : null)))))
+      : el("div", { class: "empty", text: "No tags." }),
+    canWrite ? createRow("tags", "new tag name") : null);
+
+  setMain(
+    el("div", { class: "row" },
+      el("div", { class: "col" }, branches),
+      el("div", { class: "col" }, tags)),
+    el("div", { style: "height:12px" }),
+    compareSection(),
+    canWrite
+      ? el("div", { class: "body muted", style: "font-size:12px" },
+          "A ref is not a commit. Branches and tags are recorded in this namespace's checkpoint, " +
+          "written on a clean shutdown and after a full replay — so one created here survives a " +
+          "normal restart, and a kill -9 before the next checkpoint would lose it. The commits " +
+          "they name are in the delta log and cannot be lost.")
+      : null);
+}
+
+// compareSection is the two-revision diff: the git-viewer question the commit log cannot answer.
+function compareSection() {
+  const from = el("input", { type: "text", placeholder: "tag:v1", style: "width:170px" });
+  const to = el("input", { type: "text", placeholder: state.at || "head", style: "width:170px" });
+  const out = el("div", {});
+  if (state.compare) {
+    from.value = state.compare.fromSpec || "";
+    to.value = state.compare.toSpec || "";
+    setKids(out, compareResult(state.compare));
+  }
+  const run = async () => {
+    try {
+      state.compare = await api(nsPath("/compare?from=" + encodeURIComponent(from.value.trim()) +
+                                       "&to=" + encodeURIComponent(to.value.trim() || "head")));
+      setKids(out, compareResult(state.compare));
+    } catch (e) {
+      state.compare = null;
+      setKids(out, el("div", { class: "err", text: e.message }));
+    }
+  };
+  for (const box of [from, to]) {
+    box.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Compare" }),
+    el("div", { class: "body muted", style: "padding-bottom:0;font-size:12px" },
+      "Any two revisions — a hash, a branch, a tag, head~3. This is a document-identity diff " +
+      "between the two points, not the list of commits between them."),
+    el("div", { class: "body", style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
+      from, el("span", { class: "muted", style: "font-size:12px", text: "→" }), to,
+      el("button", { class: "act", text: "Compare", onclick: run })),
+    out);
+}
+
+// RELATIONSHIP_HELP says what the relationship means for the diff being read, because the same
+// entries mean different things depending on it.
+const RELATIONSHIP_HELP = {
+  same: "the same commit — nothing to compare",
+  ahead: "the second point's history contains the first, so this is what has landed since",
+  behind: "the first point's history contains the second, so this is what the second is missing",
+  diverged: "neither contains the other: these are two branches that would need a merge",
+};
+
+function compareResult(c) {
+  const rel = c.relationship;
+  return el("div", {},
+    el("div", { class: "body", style: "padding-top:0" },
+      el("code", { text: (c.from || "").slice(0, 8) }), " → ",
+      el("code", { text: (c.to || "").slice(0, 8) }),
+      rel ? el("span", { class: "chip", style: "margin-left:8px",
+                         title: RELATIONSHIP_HELP[rel] || "", text: rel }) : null,
+      el("div", { class: "muted", style: "font-size:12px;margin-top:4px",
+                  text: RELATIONSHIP_HELP[rel] || "" }),
+      el("div", { style: "margin-top:6px" },
+        el("span", { class: "chip added", text: (c.counts.added || 0) + " added" }), " ",
+        el("span", { class: "chip modified", text: (c.counts.modified || 0) + " modified" }), " ",
+        el("span", { class: "chip removed", text: (c.counts.removed || 0) + " removed" }))),
+    (c.entries || []).length
+      ? el("div", { class: "scroll", style: "max-height:320px" },
+          el("table", {}, el("tbody", {}, c.entries.map((e) => el("tr", { class: "pick",
+              onclick: () => switchNamespace(state.ns, "data").then(() => openDocument(e.docId)) },
+            el("td", {}, el("span", { class: "chip " + e.change, text: e.change })),
+            el("td", {}, el("code", { text: e.docId })))))))
+      : el("div", { class: "empty", text: "These two points hold the same documents." }));
+}
+
+async function compareRefs(fromSpec, toSpec) {
+  try {
+    state.compare = await api(nsPath("/compare?from=" + encodeURIComponent(fromSpec) +
+                                     "&to=" + encodeURIComponent(toSpec)));
+  } catch (e) {
+    flash("Compare failed: " + e.message);
+    return;
+  }
+  await renderRefs();
 }
 
 async function renderSchema() {
-  const s = await api(nsPath("/schema"));
-  setMain(el("div", { class: "card" },
+  const [s, ix] = await Promise.all([
+    api(nsPath("/schema")),
+    api(nsPath("/indexes")).catch((e) => ({ error: e.message })),
+  ]);
+  setMain(el("div", {}, el("div", { class: "card" },
     el("h2", { text: "Schema — the typed lens over documents" }),
     s.fields.length
       ? el("table", {},
@@ -617,7 +1273,49 @@ async function renderSchema() {
             el("td", { class: "muted" }, f.indexed ? "yes" : "—"),
             el("td", { class: "muted" }, f.unique ? "yes" : "—")))))
       : el("div", { class: "empty" },
-          "No schema declared. The document is always the truth; a schema is optional.")));
+          "No schema declared. The document is always the truth; a schema is optional.")),
+    el("div", { style: "height:12px" }),
+    indexSection(ix)));
+}
+
+// The schema's "indexed" column is intent; this is what exists. They can disagree - an index
+// created through SQL is not in the schema, and a schema field marked indexed whose store failed
+// to open is not in the registry - which is exactly why both are shown.
+function indexSection(ix) {
+  if (ix.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Indexes" }),
+      el("div", { class: "body muted", text: ix.error }));
+  }
+  const staleness = ix.available && ix.current === false
+    ? el("div", { class: "warn" },
+        "The registry is at ", el("code", { text: ix.indexedThroughShort || "?" }),
+        " and head is ", el("code", { text: (ix.head || "").slice(0, 8) }), ". ", ix.note || "")
+    : null;
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Indexes" }),
+    staleness,
+    (ix.indexes || []).length
+      ? el("div", { class: "grid-wrap" }, el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Index" }), el("th", { text: "Field" }),
+                              el("th", { text: "Type" }), el("th", { text: "Unique" }),
+                              el("th", { text: "Schema v" }), el("th", { text: "Options" }))),
+          el("tbody", {}, ix.indexes.map((i) => el("tr", {},
+            el("td", {}, el("code", { text: i.name })),
+            el("td", {}, el("code", { text: (i.fields || [i.field]).join(", ") })),
+            el("td", {}, el("span", { class: "chip", text: i.type })),
+            el("td", { class: "muted" }, i.unique ? "yes" : "—"),
+            el("td", { class: "muted" }, String(i.schemaVersion)),
+            el("td", { class: "cell muted" },
+              el("code", { text: i.options ? Object.entries(i.options)
+                .filter(([k]) => k !== "index_name")
+                .map(([k, v]) => k + "=" + v).join(" ") : "" })))))))
+      : el("div", { class: "empty", text: ix.note || "No indexes." }),
+    ix.available && (ix.indexes || []).length
+      ? el("div", { class: "body muted", style: "font-size:12px" },
+          "Indexed through ", el("code", { text: ix.indexedThroughShort || "—" }),
+          ix.current ? " — current with head." : "")
+      : null);
 }
 
 const SOURCE_HELP = {
@@ -631,6 +1329,10 @@ const SOURCE_HELP = {
 
 async function renderSettings() {
   const s = await api("/v1/settings");
+  state.settings = s;
+  const live = new Set(s.mutableKeys || []);
+  const drifted = new Set(s.drift || []);
+
   const groups = new Map();
   for (const d of s.settings) {
     const g = d.key.split(".")[0];
@@ -638,21 +1340,30 @@ async function renderSettings() {
     groups.get(g).push(d);
   }
   const warnings = s.settings.flatMap((d) => (d.warnings || []).map((w) => ({ key: d.key, w })));
+
   const cards = [...groups.entries()].map(([name, items]) => el("div", { class: "card" },
     el("h2", { text: name }),
     el("table", {},
       el("thead", {}, el("tr", {}, el("th", { text: "Setting" }), el("th", { text: "Value" }),
                           el("th", { text: "Source" }), el("th", { text: "Changeable" }))),
-      el("tbody", {}, items.map((d) => el("tr", {},
-        el("td", {}, el("code", { text: d.key }),
-          d.help ? el("div", { class: "muted", style: "font-size:12px", text: d.help }) : null),
-        el("td", {}, el("code", { text: formatValue(d.value) }), d.unit ? " " + d.unit : "",
-          (d.warnings || []).map((w) => el("div", { class: "warn", text: w }))),
-        el("td", {}, el("span", { class: "chip", title: SOURCE_HELP[d.source] || "", text: d.source }),
-          el("div", { class: "muted", style: "font-size:11px", text: d.sourceDetail || "" })),
-        el("td", {}, el("span", { class: "chip", text: mutabilityLabel(d.mutability) }))))))));
+      el("tbody", {}, items.map((d) => settingRow(d, live.has(d.key), drifted.has(d.key), s))))));
 
   setMain(
+    drifted.size
+      ? el("div", { class: "card" }, el("h2", { text: "Changed since startup" }),
+          el("div", { class: "body" },
+            el("div", { class: "warn" },
+              drifted.size + " setting" + (drifted.size === 1 ? " differs" : "s differ") +
+              " from what this process started with, so a restart would undo " +
+              (drifted.size === 1 ? "it" : "them") + ": ",
+              el("code", { text: [...drifted].join(", ") }),
+              s.canPersist
+                ? " — re-apply one with \u201calso write it to " + (s.configPath || "the config file") +
+                  "\u201d ticked to make it durable."
+                : " — this deployment does not let the server write its config file, so making one " +
+                  "durable means editing that file by hand."),
+            el("button", { class: "act", text: "Show detail", onclick: showDrift })))
+      : null,
     warnings.length
       ? el("div", { class: "card" }, el("h2", { text: "Ignored configuration" }),
           el("div", { class: "body" },
@@ -660,8 +1371,160 @@ async function renderSettings() {
                       text: "The engine reads these variables leniently: a value it cannot parse is discarded and the default used, with no error and no log line. They are listed here because that is otherwise invisible." }),
             warnings.map((x) => el("div", { class: "warn", text: x.w }))))
       : null,
-    !s.mutable ? el("div", { class: "body muted", style: "padding:0 0 8px", text: s.note }) : null,
+    !s.canChange
+      ? el("div", { class: "body muted", style: "padding:0 0 8px",
+          text: "This control plane is read-only, so nothing here can be changed. Start the service with --control-write to enable it." })
+      : null,
     el("div", {}, cards));
+}
+
+// settingRow renders one setting, with an inline editor when this process can actually change it.
+function settingRow(d, isLive, isDrifted, s) {
+  const valueCell = el("td", {});
+  const editable = isLive && s.canChange;
+
+  const showValue = () => {
+    setKids(valueCell, 
+      el("code", { text: formatValue(d.value) }), d.unit ? " " + d.unit : "",
+      isDrifted ? el("span", { class: "chip modified", text: "changed" }) : null,
+      editable
+        ? el("button", { class: "act", style: "margin-left:8px;padding:2px 8px;font-size:12px",
+                         text: "Change", onclick: startEdit })
+        : null,
+      ...(d.warnings || []).map((w) => el("div", { class: "warn", text: w })));
+  };
+
+  const startEdit = () => {
+    const input = el("input", { type: "text", style: "width:120px" });
+    input.value = d.value === null || d.value === undefined ? "" : String(d.value);
+    const status = el("span", { class: "muted", style: "font-size:12px" });
+    // Whether this particular setting can be written to the config file. Asked per key rather than
+    // per deployment because the answer differs: a setting with no config-file field, or one set on
+    // the command line, cannot be written down however willing the deployment is - and the operator
+    // needs to know that before they apply, not after.
+    const persist = persistChoiceFor(d, s);
+    const commit = async (dryRun) => {
+      status.textContent = dryRun ? "checking…" : "applying…";
+      try {
+        const res = await api("/v1/settings", {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dryRun, expectRevision: s.revision,
+            persist: persist.wanted(),
+            changes: [{ key: d.key, value: coerce(d, input.value) }],
+          }),
+        });
+        const outcome = (res.changes || [])[0] || {};
+        if (!outcome.applied) {
+          setKids(status, el("span", { class: "err", text: outcome.refused || "refused" }));
+          return;
+        }
+        if (dryRun) {
+          setKids(status,
+            "would change " + formatValue(outcome.from) + " → " + formatValue(outcome.to),
+            outcome.persisted
+              ? el("div", { class: "muted", style: "font-size:12px", text: outcome.persisted })
+              : null);
+          return;
+        }
+        // A change that applied but could not be written down must not vanish into a re-render:
+        // the operator asked for it to be durable and it is not, and drift is the only other place
+        // that says so. It waits for an acknowledgement instead.
+        if (persist.wanted() && res.persistedAll === false) {
+          setKids(status,
+            el("div", { class: "warn", text: "Applied, but " + (outcome.persisted || "not persisted") }),
+            el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Got it",
+                           onclick: renderSettings }));
+          return;
+        }
+        await renderSettings();
+      } catch (e) {
+        setKids(status, el("span", { class: "err", text: e.message }));
+      }
+    };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") commit(false); });
+    setKids(valueCell, input,
+      persist.control,
+      el("div", { style: "margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap" },
+        el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Check",
+                       title: "validate without changing anything", onclick: () => commit(true) }),
+        el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Apply",
+                       onclick: () => commit(false) }),
+        el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Cancel",
+                       onclick: showValue }),
+        status));
+    input.focus();
+  };
+
+  showValue();
+  return el("tr", {},
+    el("td", {}, el("code", { text: d.key }),
+      d.help ? el("div", { class: "muted", style: "font-size:12px", text: d.help }) : null),
+    valueCell,
+    el("td", {}, el("span", { class: "chip", title: SOURCE_HELP[d.source] || "", text: d.source }),
+      el("div", { class: "muted", style: "font-size:11px", text: d.sourceDetail || "" })),
+    el("td", {}, el("span", { class: "chip", text: mutabilityLabel(d.mutability) }),
+      isLive && !s.canChange
+        ? el("div", { class: "muted", style: "font-size:11px", text: "read-only plane" })
+        : null));
+}
+
+// persistChoiceFor builds the "write this to the config file too" control for one setting, or the
+// reason there is no such choice.
+//
+// The reason is the useful part. "This cannot be persisted" tells an operator nothing; naming the
+// flag that outranks the file, or the environment variable that is the setting's only durable home,
+// tells them what to do about it. The server computes those reasons (persistBlocked) because
+// precedence is its business, not the browser's.
+function persistChoiceFor(d, s) {
+  const note = (text) => ({
+    wanted: () => false,
+    control: el("div", { class: "muted", style: "font-size:11px;margin-top:6px", text: text }),
+  });
+  if (!s.canChange) return note("");
+  if (!s.canPersist) {
+    return note("This change will be live-only: the deployment does not let the server write its " +
+                "config file (--control-settings-persist). It will show under drift.");
+  }
+  const blocked = (s.persistBlocked || {})[d.key];
+  if (blocked) return note(blocked.replace(/^not written: /, ""));
+  if (!(s.persistableKeys || []).includes(d.key)) {
+    return note("This change will be live-only and will show under drift.");
+  }
+  const box = el("input", { type: "checkbox", id: "persist-" + d.key });
+  box.checked = true;
+  const label = el("label", { style: "font-size:12px;display:flex;gap:5px;align-items:center;margin-top:6px" },
+    box, "also write it to ", el("code", { text: s.configPath }));
+  return { wanted: () => box.checked, control: label };
+}
+
+// coerce turns the text in the box into the JSON type the setting expects. A number typed into a
+// numeric setting must not arrive as a string, or the server refuses it for the wrong reason.
+function coerce(d, text) {
+  const t = text.trim();
+  if (typeof d.value === "number") {
+    const n = Number(t);
+    return Number.isFinite(n) ? n : t;
+  }
+  if (typeof d.value === "boolean") return t === "true";
+  return t;
+}
+
+async function showDrift() {
+  const d = await api("/v1/settings/drift");
+  setMain(el("div", { class: "card" },
+    el("h2", { text: "Changed since startup" }),
+    el("div", { class: "body muted", text: d.note }),
+    el("table", {},
+      el("thead", {}, el("tr", {}, el("th", { text: "Setting" }), el("th", { text: "Running" }),
+                          el("th", { text: "At startup" }), el("th", { text: "Changed" }))),
+      el("tbody", {}, (d.drift || []).map((x) => el("tr", {},
+        el("td", {}, el("code", { text: x.key })),
+        el("td", {}, el("code", { text: formatValue(x.running) })),
+        el("td", {}, el("code", { text: formatValue(x.atStartup) })),
+        el("td", { class: "muted" }, x.changedBy || ""))))),
+    el("div", { class: "body" },
+      el("button", { class: "act", text: "Back to settings", onclick: renderSettings }))));
 }
 
 function mutabilityLabel(m) {
@@ -675,25 +1538,210 @@ function mutabilityLabel(m) {
 }
 
 async function renderOps() {
-  const [health, ops, status] = await Promise.all([
+  const [health, ops, status, locks, metrics] = await Promise.all([
     api("/v1/health"), api("/v1/ops/runtime"), api(nsPath("/status")),
+    api("/v1/ops/locks").catch((e) => ({ error: e.message })),
+    api("/v1/ops/metrics").catch((e) => ({ error: e.message })),
   ]);
   const kv = (obj) => el("dl", { class: "kv" },
     ...Object.entries(obj).flatMap(([k, v]) => [el("dt", { text: k }), el("dd", {}, el("code", { text: formatValue(v) }))]));
-  setMain(el("div", { class: "row" },
-    el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Process" }),
-      el("div", { class: "body" }, kv({
-        version: health.version, namespace: health.namespace, uptimeSeconds: health.uptimeSeconds,
-        draining: health.draining, readOnly: health.readOnly, memoryZone: health.memoryZone,
-        controlWritesEnabled: health.controlWritesEnabled,
-      })))),
-    el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Admission & namespace" }),
-      el("div", { class: "body" }, kv({
-        admissionEnabled: ops.admission.enabled,
-        rescueReserveBytes: ops.admission.rescueReserveBytes ?? "—",
-        documentExpiry: ops.expiry, branches: status.branches, head: (status.head || "").slice(0, 12),
-      }),
-      ops.admission.note ? el("div", { class: "warn", text: ops.admission.note }) : null)))));
+
+  setMain(
+    health.draining
+      ? el("div", { class: "card" }, el("h2", { text: "Draining" }),
+          el("div", { class: "body" }, el("div", { class: "warn" },
+            "This server is draining: new writes are refused and /readyz answers 503. It cannot " +
+            "be undone without restarting the process. Reads are unaffected.")))
+      : null,
+    el("div", { class: "row" },
+      el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Process" }),
+        el("div", { class: "body" }, kv({
+          version: health.version, namespace: health.namespace, uptimeSeconds: health.uptimeSeconds,
+          draining: health.draining, readOnly: health.readOnly, memoryZone: health.memoryZone,
+          controlWritesEnabled: health.controlWritesEnabled,
+        }),
+        state.canWrite && !health.draining && !isStagedNs(state.ns)
+          ? el("div", { style: "margin-top:10px" },
+              el("button", { class: "act danger", text: "Drain this server…", onclick: drainServer }))
+          : null))),
+      el("div", { class: "col" }, el("div", { class: "card" }, el("h2", { text: "Admission & namespace" }),
+        el("div", { class: "body" }, kv({
+          admissionEnabled: ops.admission.enabled,
+          rescueReserveBytes: ops.admission.rescueReserveBytes ?? "—",
+          documentExpiry: ops.expiry, branches: status.branches, head: (status.head || "").slice(0, 12),
+        }),
+        ops.admission.note ? el("div", { class: "warn", text: ops.admission.note }) : null)))),
+    el("div", { style: "height:12px" }),
+    locksSection(locks),
+    el("div", { style: "height:12px" }),
+    metricsSection(metrics),
+    el("div", { style: "height:12px" }),
+    unavailableSection(ops.notAvailable));
+}
+
+// Which document is held, and by whom. A count answers a gauge; this answers the question an
+// operator has when a write will not go through.
+function locksSection(locks) {
+  if (locks.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Locks & leases" }),
+      el("div", { class: "body muted", text: locks.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Locks & leases" }),
+    (locks.locks || []).length
+      ? el("div", { class: "grid-wrap" }, el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Document" }), el("th", { text: "Kind" }),
+                              el("th", { text: "Held by" }), el("th", { text: "Expires" }),
+                              el("th", { text: "Fence" }))),
+          el("tbody", {}, locks.locks.map((l) => el("tr", { class: "pick",
+              onclick: () => switchNamespace(state.ns, "data").then(() => openDocument(l.docId)) },
+            el("td", {}, el("code", { text: l.docId })),
+            el("td", {}, el("span", { class: "chip" + (l.kind === "lease" ? " modified" : ""), text: l.kind })),
+            el("td", {}, el("code", { text: l.sessionId })),
+            el("td", { class: "muted" }, l.expiresIn ? l.expiresIn + " left" : "—"),
+            el("td", { class: "muted" }, String(l.fence)))))))
+      : el("div", { class: "empty", text: "Nothing is locked." }),
+    el("div", { class: "body muted", style: "font-size:12px", text: locks.note || "" }));
+}
+
+// The write-path stage latencies. They have been recorded all along and were reachable only
+// through the admin listener's unauthenticated Prometheus endpoint.
+function metricsSection(m) {
+  if (m.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Write path" }),
+      el("div", { class: "body muted", text: m.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Write path" }),
+    (m.stages || []).length
+      ? el("div", { class: "grid-wrap" }, el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Stage" }), el("th", { text: "Samples" }),
+                              el("th", { text: "Mean" }), el("th", { text: "p50" }),
+                              el("th", { text: "p99" }), el("th", { text: "Max" }))),
+          el("tbody", {}, m.stages.map((s) => el("tr", { title: s.meaning || "" },
+            el("td", {}, el("code", { text: s.stage }),
+              s.meaning ? el("div", { class: "muted", style: "font-size:12px", text: s.meaning }) : null),
+            el("td", { class: "muted" }, String(s.count)),
+            el("td", {}, formatMs(s.meanMs)),
+            el("td", {}, formatMs(s.p50Ms)),
+            el("td", {}, formatMs(s.p99Ms)),
+            el("td", {}, formatMs(s.maxMs)))))))
+      : el("div", { class: "empty",
+          text: "No samples yet. A stage with nothing through it is absent rather than zero." }),
+    el("div", { class: "body muted", style: "font-size:12px", text: m.note || "" }));
+}
+
+function formatMs(v) {
+  if (typeof v !== "number") return "—";
+  return v < 1 ? v.toFixed(3) + " ms" : v.toFixed(1) + " ms";
+}
+
+// What this server cannot answer, and why. An absent section would read as "nothing to show",
+// which is a different claim from "this is not tracked".
+function unavailableSection(items) {
+  if (!items || !items.length) return null;
+  return el("div", { class: "card" },
+    el("h2", { text: "Not available here" }),
+    el("div", { class: "body" }, ...items.map((x) => el("div", { style: "margin-bottom:8px" },
+      el("code", { text: x.what }),
+      el("div", { class: "muted", style: "font-size:12px", text: x.why })))));
+}
+
+async function drainServer() {
+  const ns = state.ns;
+  if (!confirm("Drain this server?\n\nNew writes will be refused from now on and /readyz will "
+      + "answer 503, so a load balancer stops routing here. In-flight writes finish.\n\n"
+      + "This cannot be undone without restarting the process. Reads are unaffected.")) return;
+  try {
+    const res = await api("/v1/ops/drain", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: ns }),
+    });
+    flash(res.writesQuiet
+      ? "Draining. In-flight writes finished."
+      : "Draining. " + (res.warning || "Writes were still in flight when the wait elapsed."));
+  } catch (e) {
+    flash("Drain failed: " + e.message);
+  }
+  await renderOps();
+}
+
+// reviewPromotion shows the server's plan and asks for the namespace to be typed.
+//
+// The plan is rendered, not summarised. Everything about this operation that could surprise
+// someone - that the install happens on a restart, that this process cannot restart itself, where
+// the replaced namespace goes - is in the plan the server built, and paraphrasing it here is how
+// the UI and the server would come to disagree about what the button does.
+async function reviewPromotion(jobId) {
+  const dlg = $("promotedlg");
+  const body = $("promotebody");
+  setKids(body, el("div", { class: "empty", text: "Building the plan…" }));
+  $("promotego").disabled = true;
+  dlg.showModal();
+
+  let plan;
+  try {
+    plan = await api("/v1/restore/staging/" + encodeURIComponent(jobId) + "/promote/plan");
+  } catch (e) {
+    setKids(body, el("div", { class: "err", text: e.message }));
+    return;
+  }
+
+  const blockers = plan.blockers || [];
+  if (blockers.length) {
+    setKids(body,
+      el("p", { style: "margin-top:0" },
+        "This promotion cannot proceed:"),
+      ...blockers.map((b) => el("div", { class: "err", text: b })),
+      el("p", { class: "muted", style: "font-size:12px;margin-bottom:0" },
+        "The plan is shown on a server that will not carry it out, so what promoting would do is " +
+        "still readable."),
+      promotionPlanBody(plan));
+    return;
+  }
+
+  const confirmField = el("input", { type: "text", placeholder: plan.confirmWith,
+                                     style: "width:100%;margin-top:6px" });
+  const arm = () => { $("promotego").disabled = confirmField.value.trim() !== plan.confirmWith; };
+  confirmField.addEventListener("input", arm);
+
+  setKids(body,
+    el("p", { style: "margin-top:0" },
+      "Replace the live ", el("code", { text: plan.namespace }),
+      " with this restored copy. This ends with the service ",
+      el("strong", { text: "shutting down" }), " so a supervisor restarts it."),
+    ...(plan.warnings || []).map((wv) => el("div", { class: "warn", text: wv })),
+    promotionPlanBody(plan),
+    el("p", { class: "muted", style: "margin-bottom:4px" },
+      "Type the namespace to confirm:"),
+    confirmField);
+  arm();
+
+  $("promotego").onclick = async () => {
+    $("promotego").disabled = true;
+    try {
+      const done = await api("/v1/restore/staging/" + encodeURIComponent(jobId) + "/promote", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: confirmField.value.trim() }),
+      });
+      dlg.close();
+      flash("Staged " + done.commits + " commits of " + done.namespace + " and asked this service " +
+            "to restart. It will be installed on the way back up; reload this page once the " +
+            "service is back and the Recovery tab will report the outcome.");
+      await renderRecovery();
+    } catch (e) {
+      setKids(body, el("div", { class: "err", text: e.message }));
+    }
+  };
+}
+
+// promotionPlanBody renders the server's own words: the steps, the restart contract, the rollback.
+function promotionPlanBody(plan) {
+  return el("div", {},
+    el("ol", { class: "muted", style: "font-size:12px;padding-left:18px;margin:10px 0" },
+      ...(plan.steps || []).map((s) => el("li", { style: "margin-bottom:4px", text: s }))),
+    el("div", { class: "warn", text: plan.restart }),
+    el("div", { class: "body muted", style: "font-size:12px;padding:6px 0" }, plan.rollback));
 }
 
 // Revert is deliberately three steps: preview, read what will change, then confirm by typing the
@@ -702,7 +1750,7 @@ async function renderOps() {
 async function openRevert(spec, label) {
   const dlg = $("revertdlg");
   const body = $("revertbody");
-  body.replaceChildren(el("div", { class: "empty", text: "Planning…" }));
+  setKids(body, el("div", { class: "empty", text: "Planning…" }));
   $("revertgo").disabled = true;
   dlg.showModal();
 
@@ -713,12 +1761,12 @@ async function openRevert(spec, label) {
       body: JSON.stringify({ to: spec }),
     });
   } catch (e) {
-    body.replaceChildren(el("div", { class: "err", text: e.message }));
+    setKids(body, el("div", { class: "err", text: e.message }));
     return;
   }
 
   if (plan.noop) {
-    body.replaceChildren(el("div", { class: "empty",
+    setKids(body, el("div", { class: "empty",
       text: "The database is already in that state. Nothing would change." }));
     return;
   }
@@ -728,7 +1776,7 @@ async function openRevert(spec, label) {
   const arm = () => { $("revertgo").disabled = confirmField.value.trim() !== state.ns; };
   confirmField.addEventListener("input", arm);
 
-  body.replaceChildren(
+  setKids(body, 
     el("p", { style: "margin-top:0" },
       "Restore the state at ", el("code", { text: label || spec }), ". This writes a ",
       el("strong", { text: "new commit" }),
@@ -759,7 +1807,7 @@ async function openRevert(spec, label) {
       flash("Reverted in commit " + done.commit.slice(0, 8) +
             " — " + done.restored + " restored, " + done.removed + " removed.");
     } catch (e) {
-      body.replaceChildren(el("div", { class: "err", text: e.message }));
+      setKids(body, el("div", { class: "err", text: e.message }));
     }
   };
 }
@@ -773,6 +1821,341 @@ function flash(message) {
   const note = el("div", { class: "card", style: "margin-bottom:12px" },
     el("div", { class: "body", text: message }));
   $("main").prepend(note);
+}
+
+// ---- Recovery -----------------------------------------------------------------------------
+
+async function renderRecovery() {
+  let jobs = null;
+  try { jobs = await api("/v1/restore/staging"); } catch (e) { jobs = { unavailable: e.message }; }
+  const [integrity, checkpoints, plan] = await Promise.all([
+    api(nsPath("/integrity")),
+    api(nsPath("/checkpoints")).catch((e) => ({ error: e.message })),
+    api(nsPath("/maintenance/plan")).catch((e) => ({ error: e.message })),
+  ]);
+  let backups = null;
+  try { backups = await api(nsPath("/backups")); } catch (e) { backups = { unavailable: e.message }; }
+  let promotion = null;
+  try { promotion = await api("/v1/promotion"); } catch (e) { promotion = { unavailable: e.message }; }
+  setMain(
+    // A promotion waiting for a restart, or the result of one, goes first: it is the most
+    // consequential state this screen can be in and the operator should not have to scroll to it.
+    promotionSection(promotion),
+    integritySection(integrity),
+    el("div", { style: "height:12px" }),
+    backupSection(backups),
+    el("div", { style: "height:12px" }),
+    checkpointSection(checkpoints),
+    el("div", { style: "height:12px" }),
+    restoreSection(jobs, backups),
+    el("div", { style: "height:12px" }),
+    maintenanceSection(plan));
+}
+
+// promotionSection shows a promotion waiting for a restart, and the outcome of the last one.
+//
+// The second half is not a nicety: the request was made to a process that no longer exists, so
+// after the restart this is the only place its result can be read.
+function promotionSection(p) {
+  if (!p || p.unavailable || (!p.pending && !p.last)) return null;
+  const kids = [];
+  if (p.pending) {
+    kids.push(el("div", { class: "warn" },
+      el("div", {}, el("strong", { text: "A promotion of " + p.pending.namespace +
+        " is staged and waiting for a restart." })),
+      el("div", { style: "margin-top:4px" },
+        "The copy is inside the data directory; the live namespace has not been touched and will " +
+        "be replaced the next time this service starts. Requested " +
+        formatTime(p.pending.requestedAt) +
+        (p.pending.requestedBy ? " by " + p.pending.requestedBy : "") + "."),
+      el("button", { class: "act danger", style: "margin-top:8px;padding:2px 8px;font-size:12px",
+        text: "Cancel the promotion", onclick: abandonPromotion })));
+  }
+  if (p.last) {
+    const ok = p.last.state === "promoted";
+    kids.push(el("div", { class: ok ? "body" : "err", style: ok ? "padding:8px 0 0" : "" },
+      el("div", {}, ok
+        ? "Last promotion: " + p.last.namespace + " was replaced at " + formatTime(p.last.appliedAt) +
+          " (" + p.last.commits + " commits, requested by " + (p.last.requestedBy || "unknown") + ")."
+        : "The last promotion of " + p.last.namespace + " failed: " + p.last.error),
+      ok && p.last.superseded
+        ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
+            "The namespace it replaced is kept at ", el("code", { text: p.last.superseded }),
+            " inside the data directory. Nothing removes it but you.")
+        : null));
+  }
+  return el("div", {},
+    el("div", { class: "card" }, el("h2", { text: "Promotion" }),
+      el("div", { class: "body" }, ...kids)),
+    el("div", { style: "height:12px" }));
+}
+
+async function abandonPromotion() {
+  try {
+    const res = await api("/v1/promotion", { method: "DELETE" });
+    flash(res.abandoned ? "Promotion cancelled. The live namespace was never touched."
+                        : "There was no promotion waiting.");
+  } catch (e) {
+    flash("Could not cancel: " + e.message);
+  }
+  await renderRecovery();
+}
+
+// A staged restore is the answer to "is this backup any good" - the only honest way to answer it is
+// to open the thing and look, which is what attaching does.
+function restoreSection(jobs, backups) {
+  const available = backups && !backups.unavailable ? (backups.backups || []) : [];
+
+  const start = async (backupId, includeLive) => {
+    try {
+      const res = await api(nsPath("/restore/staging"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backupId: backupId || undefined, includeLive: !!includeLive }),
+      });
+      flash("Restoring into " + res.job.directory + " — this does not touch the live namespace.");
+      await renderRecovery();
+    } catch (e) {
+      flash("Restore could not start: " + e.message);
+    }
+  };
+  const act = async (id, what, body) => {
+    try {
+      const res = await api("/v1/restore/staging/" + encodeURIComponent(id) + "/" + what, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      if (what === "attach") {
+        await switchNamespace(res.attachedAs, "data");
+        flash("Attached read-only as " + res.attachedAs +
+              ". Every read view is now looking at the restored copy, not the live database.");
+        return;
+      }
+      await renderRecovery();
+    } catch (e) {
+      flash(what + " failed: " + e.message);
+    }
+  };
+
+  if (jobs && jobs.unavailable) {
+    return el("div", { class: "card" }, el("h2", { text: "Restore for inspection" }),
+      el("div", { class: "body muted", text: jobs.unavailable }));
+  }
+
+  const controls = el("div", { class: "body", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+    available.length
+      ? el("select", { class: "ns", id: "restorepick" },
+          available.map((b) => el("option", { value: b.backupId },
+            b.backupId.slice(0, 12) + " · " + formatTime(b.createdAt))))
+      : el("span", { class: "muted", style: "font-size:12px", text: "no backups to restore from" }),
+    available.length
+      ? el("button", { class: "act", text: "Restore for inspection",
+          onclick: () => start($("restorepick").value, false) })
+      : null,
+    available.length
+      ? el("button", { class: "act", title: "union the backup with the live log - salvages commits only one of them has",
+          text: "Restore + live log", onclick: () => start($("restorepick").value, true) })
+      : null);
+
+  const rows = (jobs.jobs || []).map((j) => el("tr", {},
+    el("td", {}, el("code", { text: j.id.slice(-9) }),
+      el("div", { class: "muted", style: "font-size:12px", text: j.namespace })),
+    el("td", {}, el("span", { class: "chip " + (j.state === "complete" ? "added" : j.state === "failed" ? "removed" : ""),
+                              text: j.state }),
+      j.error ? el("div", { class: "err", text: j.error }) : null,
+      j.note ? el("div", { class: "warn", text: j.note }) : null),
+    el("td", { class: "muted" }, String(j.appliedCommits || 0)),
+    el("td", { class: "muted" }, (j.sourcesUsed || []).join(", ")),
+    el("td", {},
+      j.state === "complete" && !j.attachedAs
+        ? el("button", { class: "act", style: "padding:2px 8px;font-size:12px",
+            title: "open it read-only alongside the live namespace",
+            text: "Attach", onclick: () => act(j.id, "attach") })
+        : null,
+      j.attachedAs
+        ? el("span", {}, el("span", { class: "chip ref", text: "attached" }),
+            el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+              text: "Detach", onclick: () => act(j.id, "detach") }))
+        : null,
+      j.state === "complete"
+        ? el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+            title: "replace the live namespace with this copy, on the next restart",
+            text: "Promote…", onclick: () => reviewPromotion(j.id) })
+        : null,
+      j.state !== "running"
+        ? el("button", { class: "act danger", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+            title: "detach and delete the staging directory",
+            text: "Discard", onclick: () => act(j.id, "detach", { delete: true }) })
+        : null)));
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Restore for inspection" }),
+    el("div", { class: "body muted", style: "padding-bottom:0" },
+      "A restore into a scratch directory, which the live namespace never notices. Attaching one " +
+      "opens it read-only alongside production, so the restored data can be checked with these " +
+      "same views before it is trusted. Promoting one replaces the live namespace, and takes a " +
+      "restart to do it \u2014 read the plan before you agree to it."),
+    controls,
+    rows.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Job" }), el("th", { text: "State" }),
+                              el("th", { text: "Commits" }), el("th", { text: "Sources" }),
+                              el("th", { text: "" }))),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty", text: "No staged restores." }));
+}
+
+function integritySection(data) {
+  const run = async (level) => {
+    setMain(el("div", { class: "empty", text: "Verifying at " + level + "… this walks the delta log." }));
+    try {
+      await api(nsPath("/integrity/verify"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level }),
+      });
+    } catch (e) {
+      flash("Verification failed: " + e.message);
+    }
+    await renderRecovery();
+  };
+
+  const buttons = el("div", { class: "body", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+    el("button", { class: "act", text: "Verify (L1)",
+                   title: "framing and CRC only - cheaper", onclick: () => run("L1") }),
+    el("button", { class: "act", text: "Verify (L2)",
+                   title: "adds commit hashes and the parent closure - reads every commit", onclick: () => run("L2") }),
+    el("span", { class: "muted", style: "font-size:12px",
+                 text: "a verification walks the whole log, so it is on demand" }));
+
+  if (!data.everRun) {
+    return el("div", { class: "card" }, el("h2", { text: "Integrity" }),
+      el("div", { class: "body muted", text: data.note }), buttons);
+  }
+
+  const r = data.report;
+  // Findings on the segment still being written are separated out: under a live server that is the
+  // expected shape of an in-progress append, and mixing it in with real damage would cry wolf.
+  const real = (r.findings || []).filter((f) => !f.onActiveSegment);
+  const active = (r.findings || []).filter((f) => f.onActiveSegment);
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Integrity" }),
+    el("div", { class: "body" },
+      el("div", {},
+        el("span", { class: "chip " + (real.length ? "removed" : "added"),
+                     text: real.length ? real.length + " finding" + (real.length === 1 ? "" : "s") : "clean" }),
+        el("span", { class: "chip", text: r.level }),
+        el("span", { class: "muted", style: "font-size:12px",
+                     text: " ran " + formatTime(r.ranAt) + " in " + r.tookMs + " ms over " +
+                           (r.segments || []).length + " segment(s)" })),
+      active.length ? el("div", { class: "warn", text: r.note }) : null),
+    buttons,
+    real.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Level" }), el("th", { text: "What" }),
+                              el("th", { text: "Segment" }), el("th", { text: "Offset" }),
+                              el("th", { text: "Repairable" }))),
+          el("tbody", {}, real.map((f) => el("tr", {},
+            el("td", {}, el("span", { class: "chip", text: f.level })),
+            el("td", {}, el("code", { text: f.classification }),
+              el("div", { class: "muted", style: "font-size:12px", text: f.detail })),
+            el("td", { class: "muted" }, String(f.segment)),
+            el("td", { class: "muted" }, String(f.offset)),
+            el("td", {}, f.repairable
+              ? el("span", { class: "chip modified", text: "repair" })
+              : el("span", { class: "chip removed", title: "repair cannot fabricate missing data; this needs a restore", text: "restore" }))))))
+      : null);
+}
+
+function backupSection(data) {
+  if (data && data.unavailable) {
+    return el("div", { class: "card" }, el("h2", { text: "Backups" }),
+      el("div", { class: "body muted", text: data.unavailable }));
+  }
+  const create = async (base) => {
+    try {
+      const made = await api(nsPath("/backups"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(base ? { baseBackupId: base } : {}),
+      });
+      await renderRecovery();
+      flash("Backup " + made.backupId.slice(0, 8) + " written" +
+            (made.note ? " — " + made.note : "."));
+    } catch (e) {
+      flash("Backup failed: " + e.message);
+    }
+  };
+  const verify = async (id) => {
+    try {
+      const res = await api(nsPath("/backups/" + encodeURIComponent(id) + "/verify"), { method: "POST" });
+      flash(res.clean
+        ? "Backup " + id.slice(0, 8) + " verified: " + res.objects + " objects re-hashed and intact."
+        : "Backup " + id.slice(0, 8) + " has problems: " + (res.problems || []).join("; "));
+    } catch (e) {
+      flash("Verify failed: " + e.message);
+    }
+  };
+  const rows = (data.backups || []).map((b) => el("tr", {},
+    el("td", {}, el("code", { text: b.backupId.slice(0, 12) }),
+      b.incremental ? el("span", { class: "chip", title: "based on " + b.baseBackupId, text: "incremental" }) : null),
+    el("td", { class: "muted" }, formatTime(b.createdAt)),
+    el("td", { class: "muted" }, String(b.commitCount)),
+    el("td", { class: "muted" }, formatBytes(b.sizeBytes)),
+    el("td", {},
+      el("button", { class: "act", style: "padding:2px 8px;font-size:12px", text: "Verify",
+                     onclick: () => verify(b.backupId) }),
+      el("button", { class: "act", style: "padding:2px 8px;font-size:12px;margin-left:6px",
+                     title: "take a new backup that references this one",
+                     text: "Incremental", onclick: () => create(b.backupId) }))));
+
+  return el("div", { class: "card" },
+    el("h2", { text: "Backups" }),
+    el("div", { class: "body", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+      el("button", { class: "act", text: "Back up now", onclick: () => create(null) }),
+      el("span", { class: "muted", style: "font-size:12px", text: data.directory || "" })),
+    rows.length
+      ? el("table", {},
+          el("thead", {}, el("tr", {}, el("th", { text: "Backup" }), el("th", { text: "Created" }),
+                              el("th", { text: "Commits" }), el("th", { text: "Size" }), el("th", { text: "" }))),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty", text: "No backups yet. An unverified backup is a guess; an absent one is worse." }));
+}
+
+function checkpointSection(data) {
+  if (data.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Restart cost" }),
+      el("div", { class: "body muted", text: data.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Restart cost" }),
+    el("div", { class: "body" },
+      data.fileBacked
+        ? el("dl", { class: "kv" },
+            el("dt", { text: "Delta segments" }), el("dd", { text: String(data.segments) }),
+            el("dt", { text: "Delta log" }), el("dd", { text: formatBytes(data.deltaLogBytes) }),
+            el("dt", { text: "Checkpoint" }),
+            el("dd", { text: data.checkpointPresent ? "present" : "none - every open replays the whole log" }))
+        : null,
+      el("div", { class: "muted", style: "font-size:12px;margin-top:8px", text: data.note })));
+}
+
+function maintenanceSection(data) {
+  if (data.error) {
+    return el("div", { class: "card" }, el("h2", { text: "Offline operations" }),
+      el("div", { class: "body muted", text: data.error }));
+  }
+  return el("div", { class: "card" },
+    el("h2", { text: "Offline operations" }),
+    el("div", { class: "body muted", text: data.note }),
+    el("div", {}, (data.operations || []).map((o) => el("div", { class: "body",
+        style: "border-top:1px solid var(--border)" },
+      el("div", {},
+        el("strong", { text: o.name }),
+        o.applicable
+          ? el("span", { class: "chip modified", text: "indicated" })
+          : el("span", { class: "chip", title: o.reason || "", text: "not indicated" })),
+      el("pre", { class: "doc", style: "margin:8px 0", text: (o.command || []).join(" ") }),
+      el("div", { class: "muted", style: "font-size:12px", text: o.why }),
+      el("div", { class: "warn", style: "font-size:12px", text: o.precondition })))));
 }
 
 function formatValue(v) {
@@ -795,15 +2178,10 @@ $("tabs").addEventListener("click", (e) => {
 });
 $("signout").addEventListener("click", () => signOut());
 $("exitat").addEventListener("click", exitAt);
-$("nspick").addEventListener("change", (e) => {
-  state.ns = e.target.value;
-  // A namespace switch resets everything view-shaped: a cursor, a selected commit or an open
-  // document from the previous namespace means nothing in this one.
-  Object.assign(state, { commits: [], selected: null, docs: [], docCursor: null, openDoc: null,
-                         sqlResult: null, sqlError: null });
-  selectTab(state.tab);
-});
+$("nspick").addEventListener("change", (e) => { switchNamespace(e.target.value); });
 $("revertcancel").addEventListener("click", () => $("revertdlg").close());
+$("promotecancel").addEventListener("click", () => $("promotedlg").close());
+$("docdiffclose").addEventListener("click", () => $("docdiffdlg").close());
 
 if (token) boot(); else renderGate();
 </script>

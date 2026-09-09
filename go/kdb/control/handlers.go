@@ -2,6 +2,7 @@ package control
 
 import (
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -164,7 +165,7 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		writeError(w, http.StatusInternalServerError, "walk_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"namespace": ns,
 		"from":      from.Hex(),
 		"commits":   commits,
@@ -172,7 +173,26 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, _ auth.Princi
 		// The next page is expressed as a skip rather than a cursor because the traversal has no
 		// stable ordinal to resume from; see log's own comment.
 		"nextSkip": skip + len(commits),
-	})
+	}
+	// Lanes are only meaningful for a window anchored at the head that was walked: a lane number
+	// says "this branch, relative to this walk". Computing them for a page that starts partway in
+	// would give a drawing whose columns bear no relation to the page above it, so they are offered
+	// only from the start of a walk and the client re-requests a larger window instead of appending.
+	if r.URL.Query().Get("graph") == "true" {
+		if skip != 0 {
+			writeError(w, http.StatusBadRequest, "graph_needs_a_whole_walk",
+				"lanes are computed relative to the head they were walked from, so they can only be "+
+					"produced for a window starting at skip=0. Request a larger limit instead of "+
+					"paging, or drop graph=true.")
+			return
+		}
+		inputs := make([]graphInput, 0, len(commits))
+		for _, c := range commits {
+			inputs = append(inputs, graphInput{Hash: c.Hash, Parents: c.Parents})
+		}
+		body["graph"] = assignLanes(inputs)
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
@@ -340,6 +360,9 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 		writeJSON(w, http.StatusOK, map[string]any{
 			"namespace": ns, "docId": docID.String(), "commit": commitHex,
 			"body": rawJSON(body), "atHead": true,
+			// The hash a conditional write should assert on. Returned with the read so an editor
+			// holds the version it is editing without a second request.
+			"contentHash": contentHashOf(docID, body),
 		})
 		return
 	}
@@ -373,6 +396,7 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 	writeJSON(w, http.StatusOK, map[string]any{
 		"namespace": ns, "docId": docID.String(), "commit": commitHash.Hex(),
 		"body": rawJSON(doc.JSON), "atHead": false,
+		"contentHash": contentHashOf(docID, doc.JSON),
 		// Stated rather than implied: a historical read is a read, and nothing written through
 		// this control plane can land anywhere but head.
 		"readOnly": true,
@@ -384,13 +408,46 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, _ auth.P
 	if descriptors == nil {
 		descriptors = []config.SettingDescriptor{}
 	}
+	// Which keys can actually move, so a client does not have to guess from the mutability class
+	// alone - a setting can be class "live" and still not be changeable here if this process did
+	// not hand over what the setter needs (the log level holder, for instance).
+	live := liveSettings()
+	mutable := make([]string, 0, len(live))
+	for key := range live {
+		if _, known := s.descriptor(key); known {
+			mutable = append(mutable, key)
+		}
+	}
+	sort.Strings(mutable)
+
+	// Which of those could also be written to the config file, and for the rest, why not. "Can
+	// this deployment persist at all" is not the question an operator has - theirs is "will this
+	// particular change survive a restart", and the answer differs per key: a setting with no
+	// config-file field, or one set on the command line, cannot be written down however willing
+	// the deployment is. Computing it here means the UI can say so before the change is made
+	// rather than after.
+	persistable := make([]string, 0, len(mutable))
+	blocked := map[string]string{}
+	if s.opts.AllowSettingsPersist {
+		for _, key := range mutable {
+			if reason := s.persistRefusal(key); reason != "" {
+				blocked[key] = reason
+				continue
+			}
+			persistable = append(persistable, key)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"settings": descriptors,
-		// Stated rather than implied: everything here is read-only in this build, and an operator
-		// should not have to discover that by trying.
-		"mutable": false,
-		"note": "settings are reported with provenance but cannot be changed through this build; " +
-			"see docs/kdb-control-ui-plan.md §7.3 for the knobs that are live-mutable in the engine",
+		"settings":        descriptors,
+		"revision":        s.SettingsRevision(),
+		"mutableKeys":     mutable,
+		"canChange":       s.opts.AllowWrites,
+		"canPersist":      s.opts.AllowSettingsPersist,
+		"configPath":      s.opts.ConfigPath,
+		"persistableKeys": persistable,
+		"persistBlocked":  blocked,
+		"drift":           s.driftKeys(),
 	})
 }
 
@@ -412,6 +469,9 @@ func (s *Server) handleOpsRuntime(w http.ResponseWriter, r *http.Request, _ auth
 			"note":    "no memory budget configured; every operation is admitted",
 		}
 	}
+	// What §5 asked for here and this server cannot answer, with the reason. Reported rather than
+	// omitted: an absent section reads as "nothing to show", which is a different claim.
+	body["notAvailable"] = unavailableOps
 	writeJSON(w, http.StatusOK, body)
 }
 
