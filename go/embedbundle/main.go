@@ -19,11 +19,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -102,6 +105,9 @@ func run() error {
 	}
 
 	if err := copyPackages(moduleDir, stageRoot, pkgs); err != nil {
+		return err
+	}
+	if err := copyTestdata(moduleDir, stageRoot); err != nil {
 		return err
 	}
 	if err := copyModFiles(moduleDir, stageRoot); err != nil {
@@ -215,6 +221,10 @@ func copyPackages(moduleDir, stageRoot string, pkgs []string) error {
 		return err
 	}
 	modulePath = strings.TrimSpace(modulePath)
+	inClosure := make(map[string]bool, len(pkgs))
+	for _, pkg := range pkgs {
+		inClosure[pkg] = true
+	}
 	for _, pkg := range pkgs {
 		rel := strings.TrimPrefix(pkg, modulePath)
 		rel = strings.TrimPrefix(rel, "/")
@@ -223,7 +233,7 @@ func copyPackages(moduleDir, stageRoot string, pkgs []string) error {
 		}
 		src := filepath.Join(moduleDir, filepath.FromSlash(rel))
 		dst := filepath.Join(stageRoot, filepath.FromSlash(rel))
-		if err := copyDir(src, dst); err != nil {
+		if err := copyDir(src, dst, modulePath, inClosure); err != nil {
 			return fmt.Errorf("copying %s: %w", pkg, err)
 		}
 	}
@@ -232,7 +242,14 @@ func copyPackages(moduleDir, stageRoot string, pkgs []string) error {
 
 // copyDir copies the files directly inside src (not subdirectories - those are separate Go
 // packages and, if reachable, are already in the closure with their own copyDir call).
-func copyDir(src, dst string) error {
+//
+// A _test.go file is skipped rather than copied if it imports a modulePath package outside the
+// closure. `go list -deps` (used to compute the closure) ignores test-only imports, so a test
+// exercising something deliberately out of scope for an embedder - e.g. kdb/embed's own tests
+// reaching into kdb/backup/kdb/recovery - would otherwise get copied without the package it
+// imports, and break `go mod tidy` on the staged bundle (it tries to fetch the missing package
+// as a remote module).
+func copyDir(src, dst, modulePath string, inClosure map[string]bool) error {
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return err
@@ -244,11 +261,42 @@ func copyDir(src, dst string) error {
 		if e.IsDir() {
 			continue
 		}
-		if err := copyFile(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+		name := e.Name()
+		srcPath := filepath.Join(src, name)
+		if strings.HasSuffix(name, "_test.go") {
+			skip, err := testFileNeedsOutOfScopeImport(srcPath, modulePath, inClosure)
+			if err != nil {
+				return err
+			}
+			if skip {
+				fmt.Printf("skipping %s from bundle: imports a package outside the embed closure\n", srcPath)
+				continue
+			}
+		}
+		if err := copyFile(srcPath, filepath.Join(dst, name)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// testFileNeedsOutOfScopeImport reports whether a Go source file imports a modulePath package
+// that isn't in the closure.
+func testFileNeedsOutOfScopeImport(filePath, modulePath string, inClosure map[string]bool) (bool, error) {
+	f, err := parser.ParseFile(token.NewFileSet(), filePath, nil, parser.ImportsOnly)
+	if err != nil {
+		return false, fmt.Errorf("parsing imports of %s: %w", filePath, err)
+	}
+	for _, imp := range f.Imports {
+		importPath, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			return false, fmt.Errorf("%s: bad import literal %s: %w", filePath, imp.Path.Value, err)
+		}
+		if (importPath == modulePath || strings.HasPrefix(importPath, modulePath+"/")) && !inClosure[importPath] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func copyFile(src, dst string) error {
@@ -263,6 +311,34 @@ func copyFile(src, dst string) error {
 // directive - it exists to support golang.org/x/mobile bindings for the wasm demo, which the
 // bundle doesn't include, and dragging it along pulls x/mobile, x/mod and x/tools into the
 // bundle's dependency graph for nothing. `go mod tidy` (tidy, called after this) prunes the rest.
+// copyTestdata copies go/testdata into the bundle verbatim, if present. A handful of closure
+// packages (kdb/codec, kdb/index/fusion) read golden fixtures from there by relative path at
+// test time; without it, `go test ./...` on the extracted bundle - the bundle's own acceptance
+// gate - fails with a missing-file error instead of exercising anything. The directory is small
+// (tens of KB) and copied unconditionally rather than by parsing test sources for which files
+// they open, since a relative path can be built in more ways than are worth pattern-matching.
+func copyTestdata(moduleDir, stageRoot string) error {
+	src := filepath.Join(moduleDir, "testdata")
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		return nil
+	}
+	dst := filepath.Join(stageRoot, "testdata")
+	return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		return copyFile(p, target)
+	})
+}
+
 func copyModFiles(moduleDir, stageRoot string) error {
 	modData, err := os.ReadFile(filepath.Join(moduleDir, "go.mod"))
 	if err != nil {
