@@ -150,6 +150,19 @@ type StorageOptions struct {
 	// hardcoded behavior; storio.SyncModeFast trades power-loss protection for
 	// an order-of-magnitude cheaper sync (see the SyncMode docs).
 	SyncMode storio.SyncMode
+
+	// PreallocateBytes creates each new delta segment at this size, extents
+	// allocated and zeroed, instead of growing it one append at a time. Zero -
+	// the default - leaves the previous grow-as-you-go behavior untouched.
+	//
+	// The point is what it does to a sync. A file that is still growing makes
+	// every sync commit its new size, which is metadata, so fdatasync cannot
+	// skip it; a file that never changes size takes data-only syncs. It is a
+	// physical-layout switch, not a format change, and images written with it
+	// on and off are readable by processes with the opposite setting - see
+	// storio.PlatformIOConfig.PreallocateBytes and
+	// docs/kdb-segment-preallocation-plan.md.
+	PreallocateBytes int64
 }
 
 // envBytes reads a non-negative byte count, or zero when the variable is
@@ -204,6 +217,7 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	opts.Storage.DocumentCacheBytes = envBytes("KDB_DOCUMENT_CACHE_BYTES")
 	opts.Storage.CommitOpsBytes = envBytes("KDB_COMMIT_OPS_BYTES")
 	opts.Storage.HistoryTreeCacheBytes = envBytes("KDB_HISTORY_TREE_CACHE_BYTES")
+	opts.Storage.PreallocateBytes = envBytes("KDB_PREALLOCATE_BYTES")
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("KDB_CHECKPOINTS"))) {
 	case "off", "false", "0":
 		opts.Storage.DisableCheckpoints = true

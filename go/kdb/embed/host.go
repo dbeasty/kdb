@@ -159,9 +159,10 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 			return buildSegmentByteStore(config, s3Cfg, archiveCfg, opts.ArchiveBlobs, policy)
 		},
 	}).Open(storio.PlatformIOConfig{
-		RootDirectory: &dataRoot,
-		FsyncOnFlush:  !opts.ReadOnly,
-		SyncMode:      opts.Storage.SyncMode,
+		RootDirectory:    &dataRoot,
+		FsyncOnFlush:     !opts.ReadOnly,
+		SyncMode:         opts.Storage.SyncMode,
+		PreallocateBytes: opts.Storage.PreallocateBytes,
 	})
 	if err != nil {
 		lock.Release()

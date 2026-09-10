@@ -23,6 +23,28 @@ type PlatformIOConfig struct {
 	FsyncOnFlush   bool
 	SyncMode       SyncMode
 	MaxAppendBytes int
+
+	// PreallocateBytes creates each new delta segment at this size, with its
+	// extents allocated and zero-filled, instead of letting it grow one append
+	// at a time. Zero - the default - turns the whole thing off and restores
+	// exactly the previous grow-as-you-go behavior.
+	//
+	// Why it exists: a growing file makes every sync commit the new file size,
+	// which is filesystem metadata, so fdatasync cannot skip it and collapses
+	// into fsync. That is why syncMode=fast measures the same as full on Linux.
+	// A segment that never changes size takes data-only syncs.
+	// See docs/kdb-segment-preallocation-plan.md.
+	//
+	// This is a physical-layout switch, not a format change, and the two
+	// settings interoperate in both directions: a preallocated segment is a
+	// normal frame sequence followed by zeros, and every reader already stops
+	// at the first frame that does not parse (delta.ScanSegmentBytes' torn-tail
+	// handling), so a process with preallocation off reads one correctly. In
+	// the other direction there is nothing to notice - a non-preallocated
+	// segment is just a smaller file. Segments are never reopened for appending
+	// by either (delta.Factory.OpenWriter always starts a new one), which is
+	// what keeps that true rather than merely usually true.
+	PreallocateBytes int64
 }
 
 // DefaultPlatformIOConfig returns sensible defaults.
