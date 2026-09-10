@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -52,10 +53,8 @@ type documentExpiry struct {
 // deletes them, since it has no write path at all.
 func (s *KdbServerRuntime) SetDocumentExpiry(p *policy.DocumentExpiryPolicy) {
 	s.stopSweeper()
-	s.expiryMu.Lock()
 	if p == nil || p.FieldPath == "" {
-		s.expiry = nil
-		s.expiryMu.Unlock()
+		s.expiry.Store(nil)
 		return
 	}
 	interval := time.Duration(p.SweepIntervalMillis) * time.Millisecond
@@ -66,8 +65,7 @@ func (s *KdbServerRuntime) SetDocumentExpiry(p *policy.DocumentExpiryPolicy) {
 	if grace < 0 {
 		grace = 0
 	}
-	s.expiry = &documentExpiry{fieldPath: p.FieldPath, grace: grace, interval: interval}
-	s.expiryMu.Unlock()
+	s.expiry.Store(&documentExpiry{fieldPath: p.FieldPath, grace: grace, interval: interval})
 	if s.Runtime.AssertWritable() != nil {
 		return
 	}
@@ -88,24 +86,24 @@ func (s *KdbServerRuntime) DocumentExpiry() *policy.DocumentExpiryPolicy {
 }
 
 func (s *KdbServerRuntime) expirySetting() *documentExpiry {
-	s.expiryMu.RLock()
-	defer s.expiryMu.RUnlock()
-	return s.expiry
+	return s.expiry.Load()
 }
 
 // SetClockForTest replaces the clock expiry is evaluated against. Tests only.
 func (s *KdbServerRuntime) SetClockForTest(now func() time.Time) {
-	s.expiryMu.Lock()
-	s.now = now
-	s.expiryMu.Unlock()
+	if now == nil {
+		s.now.Store(nil)
+		return
+	}
+	fn := clockFunc(now)
+	s.now.Store(&fn)
 }
 
 func (s *KdbServerRuntime) clock() time.Time {
-	s.expiryMu.RLock()
-	now := s.now
-	s.expiryMu.RUnlock()
-	if now != nil {
-		return now()
+	// Also on the read path: isExpiredAtHead consults it for every document that
+	// carries an expiry timestamp, so it gets the same treatment as expiry above.
+	if fn := s.now.Load(); fn != nil {
+		return (*fn)()
 	}
 	return time.Now()
 }
@@ -366,10 +364,30 @@ func (s *KdbServerRuntime) ExpirySummary() string {
 // sweeperState is embedded in KdbServerRuntime (see server_runtime.go) - declared here so the
 // expiry machinery's fields live next to the code that uses them.
 type sweeperState struct {
-	expiryMu    sync.RWMutex
-	expiry      *documentExpiry
-	now         func() time.Time
+	// expiry and now are published rather than locked, because both are read on
+	// the point-read path - GetDocument -> isExpiredAtHead - and a sync.RWMutex
+	// there does not scale, however briefly it is held.
+	//
+	// RLock is not a read. It increments a reader count, which is a *write* to a
+	// shared cache line, so N cores reading concurrently invalidate that line on
+	// each other and serialize on the coherence traffic rather than on the lock.
+	// An atomic load only reads, so the line stays shared and readers scale.
+	// Guarding a single immutable pointer this way cost 37% of heavy-multi-user
+	// read throughput when expiry landed, re-creating precisely the defect the
+	// RCU work had removed from this path earlier - and it cost it even with
+	// expiry disabled, since the nil check itself took the lock.
+	//
+	// Both values are immutable once stored and replaced wholesale, so a reader
+	// sees the old setting or the new one, never a torn one. This matches how
+	// InMemoryCommitDag.head publishes.
+	expiry atomic.Pointer[documentExpiry]
+	now    atomic.Pointer[clockFunc]
+
 	sweeperMu   sync.Mutex
 	sweeperStop chan struct{}
 	sweeperDone chan struct{}
 }
+
+// clockFunc names the test clock's type so it can be published through an
+// atomic.Pointer, which needs something to point at.
+type clockFunc func() time.Time
