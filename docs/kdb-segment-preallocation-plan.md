@@ -72,8 +72,22 @@ Three properties of the current code mean this is mostly a write-path change, no
 
 ## 2a. Feature flag and format compatibility
 
-Preallocation is a switch — `PlatformIOConfig.PreallocateBytes`, zero (the default) meaning off
-and restoring exactly the previous grow-as-you-go behavior. The requirement is stronger than
+Preallocation is a switch — `embed.StorageOptions.PreallocateSegments`, off by default and
+restoring exactly the previous grow-as-you-go behavior.
+
+**A switch, not a size.** Only one size is ever correct — the size segments rotate at — and
+exposing a second number to keep in step with the first invites exactly one bug, silently:
+preallocate below the rotation cap and every segment starts growing again once it passes the
+preallocated region, quietly giving back the metadata-commit saving that is the whole point;
+preallocate above it and the difference is wasted on every segment. So the byte count is derived
+(`embed.preallocateBytesFor` → `delta.EffectiveMaxSegmentBytes`), which is also what the writer's
+rotation threshold comes from, making disagreement impossible rather than merely unlikely. Tuning
+`DeltaMaxSegmentBytes` down for a small instance tunes preallocation with it.
+
+`PlatformIOConfig.PreallocateBytes` remains a byte count because the IO layer genuinely needs a
+size; it is not the user-facing knob and callers should not set it directly.
+
+The requirement is stronger than
 "it can be turned off": **a process with it off must read an image written with it on, and vice
 versa.** That holds, and for a reason worth stating rather than assuming:
 
@@ -211,7 +225,9 @@ the spare and kick off preparation of the next.
   are never reopened for appending (§2a) — noted in the code so the assumption is visible if it
   ever stops holding.
 - **P4 — Measure. DONE — both success criteria met.** Linux, 2 vCPU / 1 GiB container,
-  `-benchtime 2000x -count=5`, 64 MiB segments, medians:
+  `-benchtime 2000x -count=5`, 64 MiB segments — which is what `PreallocateSegments: true`
+  derives on a default `DeltaMaxSegmentBytes`, so these are the shipped configuration's numbers
+  rather than a hand-picked size. Medians:
 
   | Config | write ns/op | fsync p50 | fsync p99 |
   |---|---:|---:|---:|

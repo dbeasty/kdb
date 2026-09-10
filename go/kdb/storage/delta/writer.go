@@ -96,6 +96,23 @@ func (w *DefaultWriter) Flush() error {
 // the entire namespace.
 const DefaultDeltaMaxSegmentBytes = 64 * 1024 * 1024
 
+// EffectiveMaxSegmentBytes resolves a configured cap (zero meaning "default")
+// to the size a segment actually rotates at.
+//
+// It exists so that the rotation threshold has exactly one definition. Segment
+// preallocation has to create a segment at precisely this size, and the two
+// numbers are only ever correct when they are equal: preallocate less than the
+// cap and the segment grows past the preallocated region, silently losing the
+// benefit on every segment's tail; preallocate more and the excess is wasted on
+// every segment. Deriving both from here makes disagreement impossible rather
+// than merely unlikely - see docs/kdb-segment-preallocation-plan.md.
+func EffectiveMaxSegmentBytes(configured int64) int64 {
+	if configured <= 0 {
+		return DefaultDeltaMaxSegmentBytes
+	}
+	return configured
+}
+
 // RotateIfNeeded seals the active segment and starts the next one once it
 // has grown past its cap, and reports whether it did.
 //
@@ -123,10 +140,7 @@ func (w *DefaultWriter) RotateIfNeeded() (bool, error) {
 	if w.sealed {
 		return false, nil
 	}
-	max := w.config.DeltaMaxSegmentBytes
-	if max <= 0 {
-		max = DefaultDeltaMaxSegmentBytes
-	}
+	max := EffectiveMaxSegmentBytes(w.config.DeltaMaxSegmentBytes)
 	// An empty segment never rotates, whatever the cap. Rotating on size
 	// alone would let a cap smaller than a single frame produce an endless
 	// run of empty segments, each sealed the moment it was created.
