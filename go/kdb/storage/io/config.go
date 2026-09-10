@@ -29,6 +29,15 @@ type PlatformIOConfig struct {
 	// at a time. Zero - the default - turns the whole thing off and restores
 	// exactly the previous grow-as-you-go behavior.
 	//
+	// Callers should not pick this number. It has exactly one correct value -
+	// the size segments rotate at - and it is derived from there by
+	// embed.preallocateBytesFor via delta.EffectiveMaxSegmentBytes. Set below
+	// the rotation cap, every segment starts growing again once it passes the
+	// preallocated region and the metadata-commit saving is quietly given back;
+	// set above it, the difference is wasted on every segment. The user-facing
+	// switch is embed.StorageOptions.PreallocateSegments, which is a bool for
+	// this reason.
+	//
 	// Why it exists: a growing file makes every sync commit the new file size,
 	// which is filesystem metadata, so fdatasync cannot skip it and collapses
 	// into fsync. That is why syncMode=fast measures the same as full on Linux.
