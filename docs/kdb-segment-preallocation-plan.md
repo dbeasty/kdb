@@ -210,9 +210,24 @@ the spare and kick off preparation of the next.
   logical-end discovery originally planned here turned out to be unnecessary, because segments
   are never reopened for appending (§2a) — noted in the code so the assumption is visible if it
   ever stops holding.
-- **P4 — Measure.** §7. Decide on the default here, with numbers, not before. **Not yet done —
-  the feature is implemented but nothing sets `PreallocateBytes`, so it is inert until P4 says
-  what to default it to.**
+- **P4 — Measure. DONE — both success criteria met.** Linux, 2 vCPU / 1 GiB container,
+  `-benchtime 2000x -count=5`, 64 MiB segments, medians:
+
+  | Config | write ns/op | fsync p50 | fsync p99 |
+  |---|---:|---:|---:|
+  | `sync-full`, prealloc off *(today's default)* | 450,313 | 287µs | 2.05ms |
+  | `sync-fast`, prealloc off | 425,925 | 292µs | 1.57-6.25ms |
+  | `sync-full`, prealloc on | 235,423 | 77µs | 1.23ms |
+  | **`sync-fast`, prealloc on** | **145,190** | **75µs** | **136-168µs** |
+
+  `sync-full` nearly halved (1.9x), and — the criterion that cannot be faked — **`sync-fast`
+  separated from `sync-full`**: 5.7% apart without preallocation (the no-op), 1.6x apart with it.
+  `fdatasync` can finally skip the metadata commit. Best config is **3.1x** the current default,
+  with a sync p99 **12-15x** tighter, which is the metadata-journal contention disappearing.
+
+  `sync-full` keeps a ~1.2ms p99 even preallocated, because `fsync` still commits inode metadata
+  on a file whose size never changes. Only `fdatasync` skips it — which is precisely why the two
+  modes now differ, and why `fast` is the mode that benefits.
 - **P5 — Background spare segments.** Only if P4 shows rotation latency is a real p99 problem.
 - **P6 — Truncate sealed segments to logical end**, so retention accounting stays honest.
 
