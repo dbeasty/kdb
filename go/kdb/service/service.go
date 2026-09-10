@@ -219,12 +219,19 @@ func Main() {
 		compression, _ := config.ParseCompression(cfg.Compression)
 		syncMode, _ := config.ParseSyncMode(cfg.SyncMode)
 		opts := embed.FileRuntimeOptionsFromEnv()
-		opts.Storage = embed.StorageOptions{
-			Durability:              durability,
-			Compression:             &compression,
-			AsyncSyncIntervalMillis: int64(cfg.AsyncSyncIntervalMS),
-			SyncMode:                syncMode,
-		}
+		// Assign the four fields this config owns rather than replacing the
+		// struct. FileRuntimeOptionsFromEnv has already populated Storage from
+		// the environment, and a wholesale `opts.Storage = StorageOptions{...}`
+		// silently discarded every one of those: KDB_HISTORY_STRATEGY,
+		// KDB_HISTORY_MODE, KDB_RETAIN_DURATION, KDB_RETAIN_COMMITS,
+		// KDB_DOCUMENT_CACHE_BYTES, KDB_COMMIT_OPS_BYTES,
+		// KDB_HISTORY_TREE_CACHE_BYTES, the checkpoint switch and the graph
+		// settings. Every one of them reached the embedded runtime and none of
+		// them reached the service, with no error to say so.
+		opts.Storage.Durability = durability
+		opts.Storage.Compression = &compression
+		opts.Storage.AsyncSyncIntervalMillis = int64(cfg.AsyncSyncIntervalMS)
+		opts.Storage.SyncMode = syncMode
 		host, err = embed.OpenFileHost(dataDir, opts)
 		if err == nil {
 			rt, err = host.NamespaceWithOptions(
