@@ -8,6 +8,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/delta"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 	s3io "github.com/limidus/kdb/go/kdb/storage/io/s3"
@@ -159,10 +160,13 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 			return buildSegmentByteStore(config, s3Cfg, archiveCfg, opts.ArchiveBlobs, policy)
 		},
 	}).Open(storio.PlatformIOConfig{
-		RootDirectory:    &dataRoot,
-		FsyncOnFlush:     !opts.ReadOnly,
-		SyncMode:         opts.Storage.SyncMode,
-		PreallocateBytes: opts.Storage.PreallocateBytes,
+		RootDirectory: &dataRoot,
+		FsyncOnFlush:  !opts.ReadOnly,
+		SyncMode:      opts.Storage.SyncMode,
+		// Derived, never configured alongside the rotation cap: a segment must be
+		// preallocated at exactly the size it rotates at, so both come from
+		// delta.EffectiveMaxSegmentBytes and cannot disagree.
+		PreallocateBytes: preallocateBytesFor(opts.Storage),
 	})
 	if err != nil {
 		lock.Release()
@@ -370,4 +374,20 @@ func (h *Host) Close() error {
 		lock.Release()
 	}
 	return firstErr
+}
+
+// preallocateBytesFor turns the PreallocateSegments switch into the byte count
+// the IO layer needs, or 0 when it is off.
+//
+// The size is derived rather than configured because only one value is ever
+// correct: the size segments rotate at. Preallocate less and every segment
+// grows again once it passes the preallocated region, quietly giving back the
+// metadata-commit saving that is the entire point; preallocate more and the
+// excess is wasted on every segment. Both numbers therefore come from
+// delta.EffectiveMaxSegmentBytes, so they cannot drift apart.
+func preallocateBytesFor(s StorageOptions) int64 {
+	if !s.PreallocateSegments {
+		return 0
+	}
+	return delta.EffectiveMaxSegmentBytes(s.DeltaMaxSegmentBytes)
 }
