@@ -159,3 +159,93 @@ func BenchmarkFileBackedUpsertModes(b *testing.B) {
 		}
 	}
 }
+
+// What the async flush interval actually costs.
+//
+// BenchmarkFileBackedUpsertModes covers async only at 100ms - the window that
+// matches MongoDB's default journalCommitInterval - but the shipped default is
+// 5ms (embed.StorageOptions.AsyncSyncIntervalMillis), and the interval is the
+// only thing standing between an acknowledged write and a lost one when the
+// *kernel* dies. A process crash is already survivable under async: the drain
+// loop appends into the page cache before acking, so the OS still writes those
+// bytes out even if this process is gone. The interval bounds the OS-crash and
+// power-loss window, nothing else.
+//
+// That makes "what does a tighter interval cost?" the question a deployment
+// actually has to answer, and it was unmeasured. Measured on Linux (2 vCPU /
+// 1GiB container, the small-instance target) it turns out to cost almost
+// nothing - 1ms lands within a few percent of 100ms, because a sustained
+// writer's flushes are already coalesced by the drain loop rather than issued
+// per commit. A 1ms window is therefore ~100x tighter than MongoDB's default
+// for roughly the same throughput, which is worth knowing before anyone
+// reaches for a looser interval to buy speed that isn't there.
+//
+// sync-full is included as the anchor: it is what the interval is being traded
+// against, and on Linux it is ~15-20x more expensive than any async setting.
+//
+//	go test ./kdb/server/ -run '^$' -bench BenchmarkAsyncFlushInterval -benchmem
+func BenchmarkAsyncFlushInterval(b *testing.B) {
+	// SyncMode is held at Full throughout so the interval is the only variable.
+	// On Linux that costs nothing anyway: syncMode=fast selects fdatasync, which
+	// cannot skip the file-size metadata commit while the delta log is still a
+	// growing file, so it measures the same as fsync there (it is macOS, where
+	// full means F_FULLFSYNC, that the mode matters on).
+	modes := []struct {
+		name string
+		opts embed.StorageOptions
+	}{
+		{"sync-full", embed.StorageOptions{Durability: storage.DurabilitySync, SyncMode: storio.SyncModeFull}},
+		{"async-1ms", embed.StorageOptions{Durability: storage.DurabilityAsync, SyncMode: storio.SyncModeFull, AsyncSyncIntervalMillis: 1}},
+		{"async-5ms", embed.StorageOptions{Durability: storage.DurabilityAsync, SyncMode: storio.SyncModeFull, AsyncSyncIntervalMillis: 5}},
+		{"async-100ms", embed.StorageOptions{Durability: storage.DurabilityAsync, SyncMode: storio.SyncModeFull, AsyncSyncIntervalMillis: 100}},
+	}
+	for _, mode := range modes {
+		for _, parallelism := range []int{1, 8} {
+			b.Run(fmt.Sprintf("%s/parallel-%d", mode.name, parallelism), func(b *testing.B) {
+				ns := "bench/writes"
+				rt, err := embed.OpenFileRuntimeWithOptions(
+					b.TempDir(), "bench", ns, schema.None(),
+					embed.FileRuntimeOptions{Storage: mode.opts},
+				)
+				if err != nil {
+					b.Fatalf("OpenFileRuntimeWithOptions: %v", err)
+				}
+				defer rt.Close()
+				srv := NewKdbServerRuntime(rt)
+				srv.SetWriteQueueCapacityForTest(4096)
+
+				metrics.Default.Reset()
+				var counter, busy int64
+				// Note when comparing against another system: this is
+				// parallelism*GOMAXPROCS goroutines, not `parallelism` of them.
+				b.SetParallelism(parallelism)
+				b.ReportAllocs()
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						n := atomic.AddInt64(&counter, 1)
+						docID, err := codec.RandomUUID()
+						if err != nil {
+							b.Fatal(err)
+						}
+						body := fmt.Sprintf(`{"v":%d,"name":"bench"}`, n)
+						_, err = srv.Upsert(ns, docID, body, auth.Principal{})
+						var busyErr *BusyError
+						switch {
+						case err == nil:
+						case errors.As(err, &busyErr):
+							atomic.AddInt64(&busy, 1)
+						default:
+							b.Fatalf("Upsert: %v", err)
+						}
+					}
+				})
+				b.StopTimer()
+				if busy > 0 {
+					b.Logf("admission: %d/%d writes rejected BUSY (write queue full)", busy, counter)
+				}
+				reportStagesTo(b)
+			})
+		}
+	}
+}
