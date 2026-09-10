@@ -23,8 +23,9 @@ import (
 // per segment, so the handle cache itself only needs to guard the map,
 // not each write.
 type OSByteStore struct {
-	root     string
-	syncMode SyncMode
+	root             string
+	syncMode         SyncMode
+	preallocateBytes int64
 
 	mu      sync.Mutex
 	handles map[string]*openSegment
@@ -40,14 +41,39 @@ func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 		return nil, fmt.Errorf("os byte store requires root directory")
 	}
 	return &OSByteStore{
-		root:     *config.RootDirectory,
-		syncMode: config.SyncMode,
-		handles:  make(map[string]*openSegment),
+		root:             *config.RootDirectory,
+		syncMode:         config.SyncMode,
+		preallocateBytes: config.PreallocateBytes,
+		handles:          make(map[string]*openSegment),
 	}, nil
 }
 
 func (s *OSByteStore) pathFor(segmentName string) string {
 	return filepath.Join(s.root, filepath.FromSlash(segmentName))
+}
+
+// preallocateFor reports the size a newly created segment should be created
+// at, or 0 for the default grow-as-you-go behavior.
+//
+// Scoped to delta segments on purpose. They are the append-per-commit path
+// whose fsync cost this exists to remove, and - because OpenWriter always
+// starts a new segment - the only ones guaranteed never to be reopened for
+// appending, which is what makes a preallocated file safe to hand to a process
+// that has the feature switched off. SSTables are written once and legitimately
+// read by file length, so padding one would change what a reader sees; the WAL
+// is not on the commit-ack path.
+func (s *OSByteStore) preallocateFor(segmentName string) int64 {
+	if s.preallocateBytes <= 0 {
+		return 0
+	}
+	base := segmentName
+	if i := strings.LastIndex(segmentName, "/"); i >= 0 {
+		base = segmentName[i+1:]
+	}
+	if _, ok := ParseDeltaSequencedFileName(base); !ok {
+		return 0
+	}
+	return s.preallocateBytes
 }
 
 func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
@@ -62,13 +88,46 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	info, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
+	// Create and reopen are distinguished with O_EXCL rather than a prior Stat,
+	// which would be a race: preallocation must happen exactly once, on the
+	// creating call, and the logical size of a segment we just created is 0 no
+	// matter how large the file itself now is.
+	//
+	// Deliberately not O_APPEND either way: writes are positional (see Append).
+	// O_APPEND targets the end of the *file*, which stops being the end of the
+	// *data* as soon as a segment is preallocated
+	// (docs/kdb-segment-preallocation-plan.md §3.1).
+	var logicalSize int64
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	switch {
+	case err == nil:
+		if n := s.preallocateFor(segmentName); n > 0 {
+			if perr := preallocateFile(f, n); perr != nil {
+				_ = f.Close()
+				return nil, perr
+			}
+		}
+		// Created: no data in it yet, whatever its physical size.
+		logicalSize = 0
+	case os.IsExist(err):
+		f, err = os.OpenFile(p, os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		info, serr := f.Stat()
+		if serr != nil {
+			_ = f.Close()
+			return nil, serr
+		}
+		// Reopening an existing segment: its file size is its logical size,
+		// because a *preallocated* segment is never reopened for writing -
+		// delta.Factory.OpenWriter always starts a new segment rather than
+		// resuming one. Were that to change, this line would need to find the
+		// logical end by scanning frames instead (plan doc §3.3), since the
+		// file size of a preallocated segment says nothing about how much of
+		// it is data.
+		logicalSize = info.Size()
+	default:
 		return nil, err
 	}
 
@@ -78,7 +137,7 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 		_ = f.Close()
 		return existing, nil
 	}
-	seg = &openSegment{file: f, size: info.Size()}
+	seg = &openSegment{file: f, size: logicalSize}
 	s.handles[segmentName] = seg
 	s.mu.Unlock()
 	return seg, nil
@@ -89,7 +148,21 @@ func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := seg.file.Write(bytes); err != nil {
+	// Positional write at the segment's logical end, rather than an O_APPEND
+	// write at the file's physical end. The two are the same thing today and
+	// stop being the same thing under preallocation, where the file is created
+	// at its full size up front and O_APPEND would put the first record 64MiB
+	// in - growing the file, which is the exact cost preallocation exists to
+	// remove (docs/kdb-segment-preallocation-plan.md §3.1).
+	//
+	// size is advanced only after the write succeeds, so a failed write leaves
+	// the next caller pointed at the same offset rather than at a hole - a hole
+	// would read back as an invalid frame and silently truncate the segment at
+	// that point on the next scan. Callers are serialized per segment by
+	// FileBackedPlatformIO (see this type's doc comment), which is what makes
+	// load-then-advance safe here.
+	offset := atomic.LoadInt64(&seg.size)
+	if _, err := seg.file.WriteAt(bytes, offset); err != nil {
 		return 0, err
 	}
 	return atomic.AddInt64(&seg.size, int64(len(bytes))), nil
