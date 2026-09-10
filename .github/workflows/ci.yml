@@ -51,6 +51,23 @@ jobs:
         # finding in docs/kdb-finish-up-plan.md). macosArm64's tests only run on a macOS host,
         # so they're implicitly skipped here (ubuntu-latest) rather than failing.
         run: ./gradlew test allTests --no-daemon
+      # Gradle's console output gives the failing assertion's *line* but not its
+      # message, and for a test whose body is a runBlocking { } it reports the
+      # builder's line rather than the assert's - so a failure here can name a
+      # line that contains nothing but `runBlocking {`. That is how the flakiest
+      # test in this repo stayed undiagnosed for as long as it did. The XML
+      # reports carry both the message and the real stack frame; keeping them
+      # turns the next failure into a diagnosis instead of an investigation.
+      - name: Upload Kotlin test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-test-results
+          path: |
+            **/build/test-results/**/*.xml
+            **/build/reports/tests/**
+          retention-days: 14
+          if-no-files-found: ignore
 
   go-test:
     runs-on: ubuntu-latest

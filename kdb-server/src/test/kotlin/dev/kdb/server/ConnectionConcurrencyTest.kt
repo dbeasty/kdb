@@ -25,7 +25,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 /**
  * Component 74 (§12), connection half: frames on one connection are handled concurrently, so a slow
@@ -116,7 +115,23 @@ class ConnectionConcurrencyTest {
             assertNull(first.error, "first statement failed: ${first.error}")
             assertNull(second.error, "second statement failed: ${second.error}")
             assertEquals(2, startsMutex.withLock { starts })
-            assertTrue(conn.completionOrder().indexOf(2) < conn.completionOrder().indexOf(3))
+            // Deliberately not asserting that reply 2 was *written* before reply 3.
+            // The guarantee this test is named for is that the two are processed in
+            // order, which is what `starts` above checks - and processing order is
+            // enforced inside host.handleFrame. The send is not: pipelinedPerConnection
+            // handles every frame in its own coroutine and only takes sendMutex once
+            // handleFrame has returned, and a Mutex gives mutual exclusion, not FIFO.
+            // So the second statement can legally reach the mutex first if the first
+            // one is descheduled between finishing and sending, and the replies go out
+            // in the other order. That is not a defect: replies carry correlation ids
+            // precisely so a client need not depend on arrival order, and the Go client
+            // matches on them rather than on sequence.
+            //
+            // Asserting it anyway made this the most frequent CI failure in the repo -
+            // invisibly, because the AssertionError is reported against the runBlocking
+            // line rather than the assert. It reproduces on the first run under
+            // -XX:ActiveProcessorCount=2 (a CI runner's core count) and effectively
+            // never on a 16-core developer machine.
 
             conn.close()
             loop.join()
