@@ -212,6 +212,25 @@ type ConnectOptions struct {
 	// authorization-scoping hint: per-namespace sessions are still opened lazily and
 	// re-authorized on SessionBegin regardless.
 	Namespaces []string
+
+	// Transport replaces the transport this client would otherwise pick from the address's
+	// scheme, for transports that cannot live in this module.
+	//
+	// The gRPC transport is the reason this exists. It ships as a *listener*
+	// (grpc/register), so a service can serve it, but nothing in this module could dial one:
+	// dialTransport knows tcp/tcps/ws/wss, and teaching it grpc:// would pull google.golang.org/grpc
+	// into the core module - which is exactly what keeping the transport in its own module is
+	// meant to prevent, since this module is what gomobile and embedbundle build from.
+	//
+	// So the dependency is inverted here the same way it already is on the server side, where
+	// grpc/register calls service.RegisterGRPCListener: the grpc module (or any caller that
+	// imports it) supplies a stream.Transport, and this module stays unaware of it. Everything
+	// above the transport - handshake, correlation, sessions, retries - is the same code path
+	// either way, which is the point: a client over gRPC is this client, not a reimplementation
+	// of it.
+	//
+	// When nil, the scheme decides as before.
+	Transport stream.Transport
 }
 
 // Connect dials addr (host:port, or a tcp://... wire URI) and performs the wire handshake.
@@ -227,12 +246,20 @@ func Connect(ctx context.Context, addr string, token string) (*Client, error) {
 // tcps:// or wss:// addr - see dialTransport).
 func ConnectWithOptions(ctx context.Context, addr string, token string, opts ConnectOptions) (*Client, error) {
 	uri := addr
-	if !hasScheme(uri) {
-		uri = "tcp://" + uri
-	}
-	transport, err := dialTransport(uri, opts)
-	if err != nil {
-		return nil, err
+	transport := opts.Transport
+	if transport == nil {
+		// Defaulting the scheme is part of *choosing* the transport, so it only
+		// applies when the scheme is what does the choosing. A caller that
+		// supplied its own transport gets its address passed through untouched -
+		// prepending tcp:// to a bare host:port would otherwise hand a gRPC
+		// dialer a target it cannot parse.
+		if !hasScheme(uri) {
+			uri = "tcp://" + uri
+		}
+		var err error
+		if transport, err = dialTransport(uri, opts); err != nil {
+			return nil, err
+		}
 	}
 	conn, err := transport.Connect(uri)
 	if err != nil {
