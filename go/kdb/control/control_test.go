@@ -92,6 +92,7 @@ func TestEveryEndpointRequiresCredentials(t *testing.T) {
 		"/v1/health", "/v1/namespaces", "/v1/settings", "/v1/ops/runtime",
 		"/v1/ns/demo%2Fusers/status", "/v1/ns/demo%2Fusers/log",
 		"/v1/ns/demo%2Fusers/refs", "/v1/ns/demo%2Fusers/schema",
+		"/v1/restore-points",
 	} {
 		res, err := http.Get(base + path)
 		if err != nil {

@@ -366,6 +366,13 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("DELETE /v1/promotion", s.adminRead(s.handleAbandonPromotion))
 
 	mux.Handle("POST /v1/ns/{ns}/revert/plan", s.nsRead(s.handleRevertPlan))
+
+	// Restore points: one name across every namespace, and putting the whole
+	// database back to one. Process-scoped rather than namespace-scoped
+	// because spanning namespaces is the entire point of them.
+	mux.Handle("GET /v1/restore-points", s.adminRead(s.handleRestorePoints))
+	mux.Handle("POST /v1/restore-points", s.adminRead(s.handleCreateRestorePoint))
+	mux.Handle("POST /v1/restore-points/{name}/restore", s.adminRead(s.handleRestoreToPoint))
 	mux.Handle("POST /v1/ns/{ns}/revert/apply", s.nsWrite(s.handleRevertApply))
 
 	if s.opts.ServeUI {
