@@ -153,6 +153,16 @@
 <div class="timebar" id="timebar" hidden>
   <span id="atmsg">Viewing at <strong id="atref"></strong> — this is a past state, and it is read-only.</span>
   <span class="sp" style="flex:1"></span>
+  <span id="rpbox" hidden>
+    <button class="act" id="rpback" title="The next restore point back">◀</button>
+    <select id="rppick" title="Restore points, newest first"></select>
+    <button class="act" id="rpfwd" title="The next restore point forward">▶</button>
+    <button class="act" id="rpview" title="Read the whole database at this point">View here</button>
+    <button class="act danger" id="rprestore" title="Put every namespace back to this point">Restore…</button>
+    <button class="act" id="rpsave" title="Name this instant in every namespace">Save point</button>
+  </span>
+  <input type="text" id="atbox" placeholder="head~10, a hash, tag:v1" style="width:170px">
+  <button class="act" id="atgo">Go</button>
   <button class="act" id="exitat">Return to HEAD</button>
 </div>
 <main id="main"></main>
@@ -162,6 +172,12 @@
 <dialog id="promotedlg"><h3>Promote a restored copy</h3><div class="body" id="promotebody"></div>
   <footer><button class="act" id="promotecancel">Cancel</button>
   <button class="act danger" id="promotego">Promote and restart</button></footer></dialog>
+<dialog id="rpsavedlg"><h3>Save a restore point</h3><div class="body" id="rpsavebody"></div>
+  <footer><button class="act" id="rpsavecancel">Cancel</button>
+  <button class="act" id="rpsavego">Save point</button></footer></dialog>
+<dialog id="rpdlg"><h3>Restore every namespace</h3><div class="body" id="rpbody"></div>
+  <footer><button class="act" id="rpcancel">Cancel</button>
+  <button class="act danger" id="rpgo">Restore everything</button></footer></dialog>
 <dialog id="docdiffdlg"><h3>What this commit did to this document</h3>
   <div class="body" id="docdiffbody"></div>
   <footer><button class="act" id="docdiffclose">Close</button></footer></dialog>
@@ -196,7 +212,7 @@ let state = { ns: null, namespaces: [], tab: "data", commits: [], graph: [], sel
               es: null, at: null, canWrite: false,
               docs: [], docCursor: null, docsMore: false, openDoc: null, editing: null, timeline: null,
               sqlText: "SELECT * FROM users", sqlResult: null, sqlError: null, settings: null,
-              compare: null };
+              compare: null, restorePoints: [], rpNote: "" };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -301,14 +317,191 @@ function renderNamespacePicker() {
   sel.title = state.namespaces.length < 2 ? "This server serves one namespace" : "Switch namespace";
 }
 
+
+// ---- Restore points ----------------------------------------------------------------------
+//
+// A restore point is one name tagged in every namespace at one instant, so stepping between
+// them moves the whole database rather than one collection. The controls live on the time bar
+// because that is already the "where in time am I" surface — and the bar is now shown at head
+// too, since the first step back has to start from somewhere.
+
+async function loadRestorePoints() {
+  try {
+    const r = await api("/v1/restore-points");
+    state.restorePoints = r.points || [];
+    state.rpNote = r.note || "";
+  } catch {
+    // A control plane that cannot list them is not a reason to take the rest of the console
+    // away; the controls simply stay empty.
+    state.restorePoints = [];
+  }
+  drawBanner();
+}
+
+// Only a complete, placed point can be stepped to or restored. The others are kept in the
+// picker, disabled and labelled, because a point that cannot restore one collection is the one
+// an operator most needs to be told about.
+function steppableRestorePoints() {
+  return state.restorePoints.filter((p) => p.restorable);
+}
+
+// The cursor is derived from where the app is reading, never stored: a stored index and a
+// stored revision would disagree the first time either moved on its own, which is every restore.
+function rpCursor() {
+  if (!state.at) return -1;
+  return steppableRestorePoints().findIndex((p) => state.at === "tag:" + p.name);
+}
+
+// The list is newest first, so going back in time is toward a higher index.
+function stepRestorePoint(delta) {
+  const pts = steppableRestorePoints();
+  if (!pts.length) return;
+  const cur = rpCursor();
+  const next = cur < 0 ? (delta > 0 ? 0 : -1) : cur + delta;
+  if (next < 0) { exitAt(); return; }
+  if (next >= pts.length) return;
+  const name = pts[next].name;
+  // Spec and label identically: enterAt puts the *label* on the wire, not the spec.
+  enterAt("tag:" + name, "tag:" + name);
+}
+
+function drawRestorePoints() {
+  const box = $("rpbox");
+  if (!box) return;
+  const pts = state.restorePoints;
+  box.hidden = pts.length === 0 && !state.canWrite;
+  const pick = $("rppick");
+  const cur = rpCursor();
+  const steppable = steppableRestorePoints();
+  setKids(pick, ...pts.map((p) => {
+    const why = !p.complete ? "missing from " + (p.missing || []).join(", ")
+              : !p.restorable ? "one of its commits is archived or no longer on this history"
+              : p.handMade ? "made by hand, in several calls — the order is a guess"
+              : (p.message || p.createdAt || "");
+    return el("option", {
+      value: p.name,
+      selected: cur >= 0 && steppable[cur] && steppable[cur].name === p.name ? "selected" : null,
+      disabled: p.restorable ? null : "disabled",
+      title: why,
+    }, p.name + (p.complete ? "" : "  (incomplete)"));
+  }));
+  pick.disabled = steppable.length === 0;
+  $("rpback").disabled = steppable.length === 0 || cur >= steppable.length - 1;
+  $("rpfwd").disabled = cur < 0;
+  const chosen = pts.find((p) => p.name === pick.value);
+  $("rpview").disabled = !chosen || !chosen.restorable;
+  $("rprestore").disabled = !chosen || !chosen.restorable || !state.canWrite;
+  $("rprestore").hidden = !state.canWrite || isStagedNs(state.ns);
+  $("rpsave").hidden = !state.canWrite || isStagedNs(state.ns);
+}
+
+// A dialog rather than prompt(): every other input in this console is one, and
+// a native prompt cannot be styled, cannot explain itself, and is blocked
+// outright in some embeddings.
+function saveRestorePoint() {
+  const dlg = $("rpsavedlg");
+  const go = $("rpsavego");
+  const nameField = el("input", { id: "rpsavename", type: "text", placeholder: "before-import",
+                                  style: "width:100%;margin-top:6px" });
+  const err = el("div", { class: "err", hidden: "hidden" });
+  go.disabled = true;
+  nameField.addEventListener("input", () => { go.disabled = nameField.value.trim() === ""; });
+
+  setKids($("rpsavebody"),
+    el("p", { style: "margin-top:0" },
+      "Name this instant. The name is tagged in ",
+      el("strong", { text: "every namespace" }),
+      " at once, which is what makes it restorable as one point."),
+    el("p", { text: "Name:" }), nameField, err);
+
+  go.onclick = async () => {
+    const name = nameField.value.trim();
+    if (!name) return;
+    go.disabled = true;
+    try {
+      await api("/v1/restore-points", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, durable: true }),
+      });
+      dlg.close();
+      await loadRestorePoints();
+      flash("Saved restore point " + name + " in every namespace.");
+    } catch (e) {
+      err.hidden = false;
+      err.textContent = e.message;
+      go.disabled = false;
+    }
+  };
+  dlg.showModal();
+}
+
+// The restore itself. Its own dialog rather than the per-namespace one, because it is a
+// different operation against a different endpoint — but the same ceremony, deliberately: this
+// is the most destructive thing in the product and it does not get a softer confirmation.
+function openRestorePoint(name) {
+  const point = state.restorePoints.find((p) => p.name === name);
+  if (!point) return;
+  const dlg = $("rpdlg");
+  const body = $("rpbody");
+  const go = $("rpgo");
+  go.disabled = true;
+
+  const confirmField = el("input", { type: "text", placeholder: name,
+                                     style: "width:100%;margin-top:6px" });
+  confirmField.addEventListener("input", () => { go.disabled = confirmField.value.trim() !== name; });
+
+  setKids(body,
+    el("p", { style: "margin-top:0" },
+      "Put every namespace back to ", el("code", { text: name }), "."),
+    el("div", { class: "scroll", style: "margin:10px 0" },
+      el("table", {}, el("tbody", {}, (point.in || []).map((m) => el("tr", {},
+        el("td", {}, el("code", { text: m.namespace })),
+        el("td", { text: m.depth >= 0 ? m.depth + " commits back" : "position unknown" })))))),
+    el("p", {},
+      el("strong", { text: "This is one revert per namespace, not one transaction across them." }),
+      " An undo point is taken first, so a restore that stops partway can be walked back — and " +
+      "every namespace gains a new commit, so none of this rewrites history."),
+    el("p", { text: "Type the name to confirm:" }),
+    confirmField);
+
+  go.onclick = async () => {
+    go.disabled = true;
+    try {
+      const r = await api("/v1/restore-points/" + encodeURIComponent(name) + "/restore",
+                          { method: "POST" });
+      dlg.close();
+      // Back to head, re-read, re-render, and only then say so. exitAt kicks
+      // off a render it does not wait for, so a message posted after it was
+      // wiped by the render landing — the restore worked and looked silent.
+      state.at = null;
+      await loadRestorePoints();
+      await selectTab(state.tab);
+      flash("Restored " + (r.restored || []).length + " namespaces to " + name +
+            ". Undo point: " + r.undoPoint + " — restore that to put this back.");
+    } catch (e) {
+      setKids(body, el("div", { class: "err", text: e.message }));
+    }
+  };
+  dlg.showModal();
+}
+
 // drawBanner is the one place the bar above the content is decided. A staged copy and a past
 // revision are different situations - a different database versus a different point in time - and
 // both have to be impossible to miss, so they share the bar but not the wording.
 function drawBanner() {
   const staged = isStagedNs(state.ns);
   const bar = $("timebar");
-  bar.hidden = !staged && !state.at;
+  // Shown whenever the console is booted, not only when time-travelling: the restore-point
+  // controls live here, and the first step back has to start from head.
+  bar.hidden = !state.ns;
   if (bar.hidden) return;
+  bar.classList.toggle("past", !!state.at || staged);
+  $("exitat").hidden = !state.at && !staged;
+  drawRestorePoints();
+  if (!staged && !state.at) {
+    setKids($("atmsg"), "At ", el("strong", { text: "HEAD" }), " — the live database.");
+    return;
+  }
   if (staged) {
     setKids($("atmsg"), "Viewing a restored copy, not the live database — ",
       el("strong", { text: state.ns }), ". It is read-only.");
@@ -320,6 +513,20 @@ function drawBanner() {
   $("exitat").textContent = "Return to HEAD";
 }
 
+// keptAcrossNamespaces says whether a viewing revision still means something in another
+// namespace, and returns it when it does.
+//
+// Only a restore point does: it is one name tagged everywhere at one instant, and this control
+// plane knows which namespaces have it. A point missing from the target is not carried, because
+// reading at a name that namespace never had would fail on every panel at once.
+function keptAcrossNamespaces(at, ns) {
+  if (!at || !at.startsWith("tag:")) return null;
+  const name = at.slice(4);
+  const point = state.restorePoints.find((p) => p.name === name);
+  if (!point) return null;
+  return (point.in || []).some((m) => m.namespace === ns) ? at : null;
+}
+
 // switchNamespace is the single path for changing which namespace every view is looking at, used by
 // the picker and by attaching a staged restore. Having two of these is what let them disagree.
 async function switchNamespace(id, tab) {
@@ -328,9 +535,17 @@ async function switchNamespace(id, tab) {
   renderNamespacePicker();
   // Everything view-shaped belongs to the namespace it came from: a cursor, a selected commit or an
   // open document from another one means nothing here.
+  //
+  // The viewing revision is the one exception, and only when it is a restore point. A commit hash
+  // or a head~N names a position in the namespace it came from and nothing at all in this one, so
+  // it goes. A restore point is a name deliberately created in every namespace at one instant, so
+  // carrying it across is the whole reason it is a name rather than a hash — an operator who
+  // stepped the database back to a point and then opened another collection means to still be
+  // looking at that point, not at head.
+  const carried = keptAcrossNamespaces(state.at, id);
   Object.assign(state, { commits: [], graph: [], selected: null, docs: [], docCursor: null,
                          openDoc: null, editing: null, timeline: null, sqlResult: null,
-                         sqlError: null, at: null, compare: null });
+                         sqlError: null, at: carried, compare: null });
   await selectTab(tab || state.tab);
 }
 
@@ -358,6 +573,7 @@ async function boot() {
     $("tabs").hidden = false; $("signout").hidden = false;
     connectEvents();
     await selectTab(state.tab);
+    await loadRestorePoints();
   } catch (e) {
     if (e.message !== "unauthenticated") renderGate("Could not reach the control plane: " + e.message);
   }
@@ -2419,6 +2635,28 @@ $("tabs").addEventListener("click", (e) => {
 });
 $("signout").addEventListener("click", () => signOut());
 $("exitat").addEventListener("click", exitAt);
+$("rpback").addEventListener("click", () => stepRestorePoint(1));
+$("rpfwd").addEventListener("click", () => stepRestorePoint(-1));
+$("rppick").addEventListener("change", () => {
+  const name = $("rppick").value;
+  const p = state.restorePoints.find((x) => x.name === name);
+  if (p && p.restorable) enterAt("tag:" + name, "tag:" + name);
+});
+$("rpview").addEventListener("click", () => {
+  const name = $("rppick").value;
+  if (name) enterAt("tag:" + name, "tag:" + name);
+});
+$("rprestore").addEventListener("click", () => openRestorePoint($("rppick").value));
+$("rpsave").addEventListener("click", saveRestorePoint);
+$("rpcancel").addEventListener("click", () => $("rpdlg").close());
+$("rpsavecancel").addEventListener("click", () => $("rpsavedlg").close());
+// The revision box the Commits tab has always pointed at ("read at an older revision - e.g.
+// <hash> - in the revision box above") and which was never built until now.
+$("atgo").addEventListener("click", () => {
+  const spec = $("atbox").value.trim();
+  if (spec) enterAt(spec, spec);
+});
+$("atbox").addEventListener("keydown", (e) => { if (e.key === "Enter") $("atgo").click(); });
 $("nspick").addEventListener("change", (e) => { switchNamespace(e.target.value); });
 $("revertcancel").addEventListener("click", () => $("revertdlg").close());
 $("promotecancel").addEventListener("click", () => $("promotedlg").close());
