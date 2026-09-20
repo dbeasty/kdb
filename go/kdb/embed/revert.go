@@ -52,7 +52,7 @@ type treeResolver interface {
 // (document id -> content hash) mapping, so its tree hash equals the
 // target's tree hash. That equality is the operation's postcondition and
 // the cheapest way to check it did what it says.
-func RevertTo(rt *EmbeddedKdbRuntime, namespaceID, spec string) (RevertResult, error) {
+func RevertTo(rt *EmbeddedKdbRuntime, namespaceID, spec string) (res RevertResult, err error) {
 	if err := rt.AssertWritable(); err != nil {
 		return RevertResult{}, err
 	}
@@ -98,6 +98,23 @@ func RevertTo(rt *EmbeddedKdbRuntime, namespaceID, spec string) (RevertResult, e
 	targetEntries := targetTree.MaterializedEntries()
 	headEntries := headTree.MaterializedEntries()
 
+	// From here on this function stages documents, and every way out that is
+	// not success has to unstage them.
+	//
+	// PutDocument and DeleteDocument write into the engine's pending set,
+	// which is invisible to reads until something calls CommitTree — so an
+	// abandoned revert looks harmless right up until the next unrelated write
+	// to this namespace commits, flushes the pending set wholesale, and
+	// records this revert's documents under that write's commit message.
+	// Only the tree-postcondition path used to discard; the five others
+	// returned with the staging still in place.
+	staged := false
+	defer func() {
+		if staged && err != nil {
+			_ = rt.Storage.DiscardPending(namespaceID)
+		}
+	}()
+
 	var ops []document.Op
 	restored := 0
 	for docID, want := range targetEntries {
@@ -117,6 +134,7 @@ func RevertTo(rt *EmbeddedKdbRuntime, namespaceID, spec string) (RevertResult, e
 					"but its content is no longer retained",
 				namespaceID, target.Hex(), docID.String())
 		}
+		staged = true
 		if err := rt.Storage.PutDocument(namespaceID, *doc); err != nil {
 			return RevertResult{}, err
 		}
@@ -128,6 +146,7 @@ func RevertTo(rt *EmbeddedKdbRuntime, namespaceID, spec string) (RevertResult, e
 		if _, ok := targetEntries[docID]; ok {
 			continue
 		}
+		staged = true
 		if err := rt.Storage.DeleteDocument(namespaceID, docID); err != nil {
 			return RevertResult{}, err
 		}
@@ -143,8 +162,8 @@ func RevertTo(rt *EmbeddedKdbRuntime, namespaceID, spec string) (RevertResult, e
 		// The postcondition, checked rather than assumed: a revert that
 		// produced a different tree has restored something other than the
 		// state asked for, and committing it would record that mistake
-		// permanently.
-		_ = rt.Storage.DiscardPending(namespaceID)
+		// permanently. (Unstaged by the deferred discard above, like every
+		// other failure here.)
 		return RevertResult{}, fmt.Errorf(
 			"kdb: revert of namespace %q to %s produced tree %s, want %s",
 			namespaceID, target.Hex(), tree.TreeHash.Hex(), targetCommit.DocumentTreeHash.Hex())
