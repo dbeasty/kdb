@@ -41,6 +41,14 @@ type createTagRequest struct {
 	Name    string `json:"name"`
 	At      string `json:"at"`
 	Message string `json:"message"`
+	// Durable asks for a checkpoint before answering, so the tag's *name*
+	// survives a kill -9 rather than only the commit it points at.
+	//
+	// Opt-in, because this is the engine's maintenance pass and not a ref
+	// flush: under an immediate reclaim mode it merges the blob store on the
+	// way past. A casual tag should not buy that; a restore point, whose
+	// whole promise is being there later, should — and is told what it cost.
+	Durable bool `json:"durable"`
 }
 
 // refDurabilityNote is the caveat, in one place so every answer says the same thing.
@@ -51,6 +59,9 @@ const refDurabilityNote = "a ref is not a commit: branches and tags are recorded
 
 func (s *Server) handleCreateBranch(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	if refuseIfStaged(w, ns) {
+		return
+	}
+	if refuseWithoutHistory(w, rt, ns, "creating a branch") {
 		return
 	}
 	var req createBranchRequest
@@ -123,8 +134,37 @@ func (s *Server) handleDeleteBranch(w http.ResponseWriter, r *http.Request, _ au
 	})
 }
 
+// refuseWithoutHistory stops a ref being created in a namespace that does not
+// keep its history.
+//
+// The CLI has always refused this (cmd/kdb/cli/commands.go) and the control
+// plane never has, so the same DAG call meant two different things depending
+// on which door you came in by. Under history=none nothing consults a ref
+// before reclaiming, so one created here becomes a name for a commit whose
+// documents can stop being producible — which is precisely what a restore
+// point must never be.
+//
+// 409 rather than 403: in this package 403 is permission (read_only,
+// forbidden, staged_copy), while this is a conflict with how the namespace is
+// configured, and is fixed by changing that. The error's own message already
+// names the mode and the kdb-inspect remedy.
+func refuseWithoutHistory(w http.ResponseWriter, rt *serverRuntime, ns, feature string) bool {
+	if rt.Runtime == nil {
+		writeError(w, http.StatusInternalServerError, "no_runtime", "runtime has no embedded runtime")
+		return true
+	}
+	if err := rt.Runtime.AssertRetainsHistory(ns, feature); err != nil {
+		writeError(w, http.StatusConflict, "history_not_retained", err.Error())
+		return true
+	}
+	return false
+}
+
 func (s *Server) handleCreateTag(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	if refuseIfStaged(w, ns) {
+		return
+	}
+	if refuseWithoutHistory(w, rt, ns, "creating a tag") {
 		return
 	}
 	var req createTagRequest
@@ -160,7 +200,7 @@ func (s *Server) handleCreateTag(w http.ResponseWriter, r *http.Request, _ auth.
 		writeError(w, status, "create_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	body := map[string]any{
 		"namespace": ns,
 		"tag": map[string]any{
 			"name": tag.Name, "head": tag.CommitHash.Hex(),
@@ -168,7 +208,31 @@ func (s *Server) handleCreateTag(w http.ResponseWriter, r *http.Request, _ auth.
 		},
 		"note": "this tag is also a retention root: compaction will not squash the commit it " +
 			"names while it exists. " + refDurabilityNote,
-	})
+		// The machine-readable half of refDurabilityNote, so a client does not
+		// have to read prose to learn whether the name is on disk yet.
+		"checkpointPending": true,
+	}
+	if req.Durable {
+		// Maintain is the engine's maintenance pass, not a ref flush: it
+		// checkpoints, and under an immediate reclaim mode also merges the
+		// blob store. That is the bill for the name surviving a kill -9, and
+		// it is itemised below rather than hidden.
+		res, merr := rt.Runtime.Maintain()
+		if merr != nil {
+			// The tag exists either way. Reporting the checkpoint as failed is
+			// honest; unwinding the tag would be worse — a ref the caller
+			// asked for and got, silently taken away again.
+			body["durability"] = map[string]any{"checkpointWritten": false, "error": merr.Error()}
+		} else {
+			body["checkpointPending"] = false
+			body["durability"] = map[string]any{
+				"checkpointWritten": true,
+				"tablesMerged":      res.TablesMerged,
+				"tablesRemoved":     res.TablesRemoved,
+			}
+		}
+	}
+	writeJSON(w, http.StatusCreated, body)
 }
 
 func (s *Server) handleDeleteTag(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
