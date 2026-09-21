@@ -30,6 +30,7 @@ public object DeltaNamespaceReplayer {
         dag: CommitDag,
         storage: StorageAdapter,
         deltaReader: DeltaSegmentReader,
+        decisions: CrossNamespaceDecisions? = null,
     ): KdbHash {
         val segments = deltaReader.listSegments()
         val allCommits = mutableListOf<KdbCommit>()
@@ -72,8 +73,43 @@ public object DeltaNamespaceReplayer {
                 allCommits += KdbCommit.fromPayloadBytes(record.commitPayload)
             }
         }
-        applyCommitsTopologically(dag, storage, allCommits)
+        applyCommitsTopologically(dag, storage, withoutUncommittedGroups(dag, allCommits, decisions))
         return dag.head()
+    }
+
+    /**
+     * Drops the parts of cross-namespace groups that never committed, and every commit descending
+     * from one - the rule Go's replay applies (go/kdb/embed/delta_replay.go, groupGate). Nothing
+     * descending from an undecided part was ever acknowledged, and dropping by ancestry rather
+     * than log position keeps the answer the same on every later open.
+     */
+    internal fun withoutUncommittedGroups(
+        dag: CommitDag,
+        commits: List<KdbCommit>,
+        decisions: CrossNamespaceDecisions?,
+    ): List<KdbCommit> {
+        if (decisions == null) return commits
+        val dropped = HashSet<KdbHash>()
+        for (c in commits) {
+            if (decisions.resolve(c) == CrossNamespaceDecisions.Decision.ABORTED) dropped += c.hash
+        }
+        if (dropped.isEmpty()) return commits
+        // Descendants, to a fixpoint: a commit can appear before its parent in the log.
+        var grew = true
+        while (grew) {
+            grew = false
+            for (c in commits) {
+                if (c.hash !in dropped && c.parentHashes.any { it in dropped }) {
+                    dropped += c.hash
+                    grew = true
+                }
+            }
+        }
+        System.err.println(
+            "kdb: namespace ${dag.namespaceId}: rolled back ${dropped.size} commit(s) belonging to or built on " +
+                "cross-namespace transactions that never committed",
+        )
+        return commits.filter { it.hash !in dropped }
     }
 
     /**

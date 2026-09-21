@@ -58,7 +58,7 @@ public fun openFileRuntime(
             ?: error("SERVER storage engine requires delta writer for file mode")
     val baseDag = inMemoryCommitDag(namespaceId)
   runBlocking {
-        DeltaNamespaceReplayer.replay(baseDag, handle.adapter, handle.deltaReader!!)
+        DeltaNamespaceReplayer.replay(baseDag, handle.adapter, handle.deltaReader!!, CrossNamespaceDecisions(dataRoot))
     }
     val dag: CommitDag =
         PersistingCommitDag(
