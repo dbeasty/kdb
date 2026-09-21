@@ -441,7 +441,7 @@ It's idempotent, and a failure is recorded on the meta conflict queue instead of
 
 ---
 
-## Phase 8 — Verifiable partial clone (gated)
+## Phase 8 — Verifiable partial clone (gated) — gate not passed, not built
 
 **8.0 Measurement first.** `docs/benchmarks/<date>-partial-clone-model.md` compares a filtered projection with a modelled partial clone (tree metadata plus fetched bodies) on 50k documents × {1 KB, 64 KB, 1 MB}. Proceed only if the partial clone is less than half the projection's resident and disk cost on at least one realistic size **and** the workload needs replica-side writes into the source history.
 
@@ -691,3 +691,11 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 **Not built:**
 - **7.4, offline write-back.** A projection is read-only, and writes go to the source directly. An outbox that queues writes while offline and replays them as `TransactionReplay` needs its own design for conflicts coming back through the projection. The read-only refusal names the source, so a client knows where to write.
 - **7.5, stream Mode 1/2 rebuilt on projections.** The existing stream hub keeps working (and gained authentication in Phase 0). Folding it into projections is a refactor with no new capability, so it's deferred until someone needs resumable streams.
+
+### Phase 8 — gate evaluated, not built
+
+Step 8.0 was done as a model, grounded in a fresh measurement of the document trie (~165 B per entry) and the commit-graph figure already on record (~519 B per commit). See [benchmarks/2026-09-21-partial-clone-model.md](benchmarks/2026-09-21-partial-clone-model.md).
+
+A partial clone holds a strict superset of a projection: every tree entry and the whole graph, plus the same fetched bodies. Its cost is therefore the projection's plus a fixed ~138 MB for a 50k-document, 250k-commit source, whatever the selectivity or body size. The gate required it to cost less than half the projection's, so it cannot pass.
+
+Commit format v2 is not introduced. The write need Phase 8 might have served belongs to Phase 7.4 (write-back).
