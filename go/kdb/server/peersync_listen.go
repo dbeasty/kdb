@@ -7,7 +7,6 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/document"
-	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -81,8 +80,11 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 		NamespaceID:    namespaceID,
 		NodeID:         "kdb-service-go",
 		ConflictPolicy: runtime.PeerSyncConflictPolicy,
-		MaterializeCommit: func(commit document.Commit) error {
-			return embed.MaterializeCommit(runtime.Runtime.Storage, runtime.dag, namespaceID, commit)
+		Node:           runtime.PeerSyncNode(),
+		ApplyToStorage: true,
+		ClassifyError: func(err error) (wire.ErrorCode, bool) {
+			code, _ := classifyError(err)
+			return code, code != wire.ErrorCodeInternal
 		},
 		Persist: func(commit document.Commit) error {
 			if runtime.persister == nil {

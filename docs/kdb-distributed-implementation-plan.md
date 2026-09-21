@@ -23,7 +23,7 @@ Status markers: ☐ not started · ◐ in progress · ☑ done (with the commit 
 
 Goal: two nodes can sync any history correctly, under concurrent local writes, with every local subsystem kept consistent.
 
-### 0.1 One ingest path under the write gate ☐ (D2, D3, D6, D8)
+### 0.1 One ingest path under the write gate ☑ (D2, D3, D6, D8)
 
 **New file `peersync/ingest.go`:**
 
@@ -81,7 +81,7 @@ func Ingest(env IngestEnv, commits []document.Commit, incomingHead codec.Hash) (
 - `TestPeerIngestUniqueDuplicateRecorded`
 - `TestMaterializeFailureLeavesHeadAtLastGoodCommit`: the injected `Materialize` fails on the 3rd of 5 commits, so the head ends at commit 2 and storage agrees.
 
-### 0.2 Parents-first paging and haves ☐ (D1)
+### 0.2 Parents-first paging and haves ☑ (D1)
 
 **Wire:** `CommitFetchMessage` gains an additive `Haves []string` (hex, omitempty).
 
@@ -104,13 +104,13 @@ func Ingest(env IngestEnv, commits []document.Commit, incomingHead codec.Hash) (
 - `TestPushMoreThanOnePage`
 - `TestPullDivergedDoesNotResendSharedHistory`: diverged by 5 on each side over a 500-commit shared base, so the fetch returns about 5 commits, not 505.
 
-### 0.3 Namespace validation ☐ (D5)
+### 0.3 Namespace validation ☑ (D5)
 
 The host refuses any CommitFetch or CommitPush whose `Namespace` differs from `cfg.NamespaceID`, replying with an error frame (0.4). The handshake refuses a `Namespaces` list that doesn't contain the served namespace.
 
 **Test:** `TestPeerPushWrongNamespaceRefused`.
 
-### 0.4 Error frame and unknown messages ☐ (D7, D12)
+### 0.4 Error frame and unknown messages ☑ (D7, D12)
 
 - **New `MsgPeerError` (0x25):** `PeerErrorMessage{Namespace, Code ErrorCode, Message string}`.
 - **The host replies with it** for:
@@ -124,19 +124,19 @@ The host refuses any CommitFetch or CommitPush whose `Namespace` differs from `c
 
 **Tests:** `TestPeerUnknownFrameGetsErrorReply` (no 20s wait), `TestPeerHandlerErrorIsReportedNotDropped`.
 
-### 0.5 Stubbed commits in fetch and push ☐ (D9)
+### 0.5 Stubbed commits in fetch and push ☑ (D9)
 
 Walks that meet a `StubbedEntry` send a **stub record** (`CommitStubDto{OriginalHash, ArchiveLocation}`) in a new additive `Stubs` field on CommitPush. The receiver calls `PutStub` (a new DAG method mirroring `StubCommit` for a commit it never had), so children validate.
 
 **Test:** `TestSyncAcrossArchivedCommit`.
 
-### 0.6 Cross-namespace parts from foreign hosts ☐ (D10, interim)
+### 0.6 Cross-namespace parts from foreign hosts ☑ (D10, interim)
 
 `txn_coordinator.go:375` stops treating a `kdb:xns/1` part whose `host=` isn't this node as committed-by-default. It's classified `ForeignGroupPart` and reads exactly as it does today, but it's **reported**: a `ForeignGroupParts()` accessor and a metric. That keeps behaviour, removes the silent claim, and is enough until Phase 6.4 does the full check.
 
 **Test:** `TestForeignGroupPartIsFlagged`.
 
-### 0.7 Authenticated stream ☐ (D11)
+### 0.7 Authenticated stream ☑ (D11)
 
 - **The stream handshake authenticates** with the same credentials fields as the peer handshake, and authorizes `auth.StreamSubscribeAction{Namespace}`. That's a new action; under `AllowAll` it's a no-op.
 - **Write-back replays** run as the authenticated principal.
@@ -503,3 +503,20 @@ The `TEST_SEEDS` env var widens the run; CI uses 20 seeds.
 ## Progress log
 
 This log is filled in as items land. Each entry gives the commit, what landed, and what deviated from this plan and why.
+
+### Phase 0 — landed
+
+`peersync.Ingest` = `StoreCommits` + `Adopt`, the one head-moving path used by the host's CommitPush and the client's pull. The server's `serverLocalNode` runs it under the write gate and feeds indexes, the unique registry, cross-namespace group checks and `CommitListener`. Tests are in `server/peersync_ingest_test.go`, `peersync/ingest_test.go`, `peersync/paging_test.go`, `wire/peer_sync_fields_test.go` and `server/stream_listen_test.go`.
+
+**Deviations from the plan, and why:**
+
+- **Fast-forward applies a net effect.** It no longer replays commit by commit. `fastForward` folds every newly reachable commit (parents first) into one final operation per document, applies them, and verifies the result against the incoming head's declared tree once.
+  - Replay can follow only first parents. A fast-forward across a merge whose first parent is the *other* side's branch would check that side's commits against a tree that already holds this side's writes, and refuse a valid history. `TestIngestFastForwardAcrossMergeWithForeignFirstParent` pins this.
+  - As a result, `HostConfig.MaterializeCommit`/`ClientConfig.MaterializeCommit` are no longer called. Setting either one now just means `ApplyToStorage`.
+- **Tree mismatch restores pre-images.** This goes beyond `DiscardPending`. The mismatch is only discovered after `CommitTree` has committed the built tree, so pre-images are read before anything is staged and written back on failure.
+- **`touchedDocsForRange` uses `commitsBetween`, not `Walk(head, &ancestor)`.** Walk prunes only at the ancestor's exact hash, so after a criss-cross it counts shared history as one side's edits.
+- **Pull and push are store-then-decide.** Every page is stored, and only the final state is decided (`CommitPush.More`, and the pull loop calls `Adopt` once). Deciding per page merges half a divergent branch, then merges again for each later page. `TestDivergedPushMergesOnceNotPerPage` pins this.
+- **The haves overshoot.** A diverged fetch overshoots the true common ancestor by up to the divergence length, because the haves are exponentially spaced. That's bounded and expected; before, the fetch went all the way to genesis.
+- **D9 is only half closed.** Stubs now travel and children are stored, but adopting across an archived commit still needs a shared ancestor that the stub hides. That's Phase 4's shallow roots. Until then the error is `VersionNotFound` ("no common ancestor") instead of "missing parent".
+- **Unique keys on ingest use `RebuildLenient`** (O(n) per ingest batch, only when the schema declares unique fields). Duplicates are kept in `ReplicationIssues()`, an in-memory bounded list that Phase 3's durable conflict queue replaces.
+- **The stream hub's `AllowAnonymous` is an atomic setter,** because the hub is already accepting connections when `kdb-service` configures it.

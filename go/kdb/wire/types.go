@@ -89,6 +89,9 @@ const (
 	MsgTxCommitMulti       MessageType = 0x23
 	MsgTxCommitMultiResult MessageType = 0x24
 
+	// Peer-sync error reply (see PeerErrorMessage). Go-only, like 0x14-0x24.
+	MsgPeerError MessageType = 0x25
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -168,6 +171,8 @@ func (t MessageType) String() string {
 		return "TX_COMMIT_MULTI"
 	case MsgTxCommitMultiResult:
 		return "TX_COMMIT_MULTI_RESULT"
+	case MsgPeerError:
+		return "PEER_ERROR"
 	default:
 		return "UNKNOWN"
 	}
@@ -247,6 +252,8 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgTxCommitMulti, true
 	case 0x24:
 		return MsgTxCommitMultiResult, true
+	case 0x25:
+		return MsgPeerError, true
 	default:
 		return 0, false
 	}
@@ -403,6 +410,10 @@ type CommitFetchMessage struct {
 	Namespace  string
 	SinceHash  *codec.Hash
 	MaxCommits int
+	// Haves are further commits the fetcher already holds (Go-only, additive). The host sends
+	// nothing reachable from SinceHash or from any Have it recognizes - which is what keeps a
+	// fetcher whose head the host has never seen (it diverged) from being sent all of history.
+	Haves []codec.Hash
 }
 
 func (m CommitFetchMessage) Header() Header { return m.H }
@@ -411,7 +422,27 @@ type CommitPushMessage struct {
 	H         Header
 	Namespace string
 	Commits   []document.Commit
+	// Stubs name archived commits the sender cannot send whole but whose children it is sending
+	// (Go-only, additive). The receiver records them so those children's parents resolve.
+	Stubs []document.CommitStub
+	// More marks a page of a multi-page push (Go-only, additive): the receiver stores these
+	// commits but decides nothing until the page without More arrives. Deciding on a partial
+	// push would merge half of a divergent branch, then merge again for every later page.
+	More bool
 }
+
+// PeerErrorMessage is the peer-sync reply to a frame the host could not serve: an unknown
+// message type, an authorization failure, a namespace mismatch, or an ingest error. Go-only.
+// Before it existed every such case either went unanswered, leaving the caller to wait out its
+// correlation timeout, or dropped the connection with no reason given.
+type PeerErrorMessage struct {
+	H         Header
+	Namespace string
+	Code      ErrorCode
+	Message   string
+}
+
+func (m PeerErrorMessage) Header() Header { return m.H }
 
 func (m CommitPushMessage) Header() Header { return m.H }
 

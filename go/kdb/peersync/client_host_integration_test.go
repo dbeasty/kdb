@@ -594,9 +594,9 @@ func TestPullMissingMaterializesFetchedCommitIntoLocalStorage(t *testing.T) {
 	if result.FinalHead != remoteCommit.Hash {
 		t.Fatalf("expected local head to fast-forward to %s, got %s", remoteCommit.Hash.Hex(), result.FinalHead.Hex())
 	}
-	if materializedCalls != 1 {
-		t.Fatalf("expected MaterializeCommit called exactly once, got %d", materializedCalls)
-	}
+	// The callback itself is no longer invoked: setting it asks Ingest to apply the fetch's net
+	// effect to storage in one verified step. What matters is that the document is visible.
+	_ = materializedCalls
 
 	doc, err := localStorage.GetDocument(ns, docID, remoteCommit.DocumentTreeHash)
 	if err != nil {

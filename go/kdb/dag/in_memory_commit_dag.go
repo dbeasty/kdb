@@ -439,6 +439,23 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	return stub, nil
 }
 
+// PutStub records an archived commit this DAG never held: a peer can name it (its children are
+// being sent) but not send it. The stub satisfies those children's parent check exactly as a
+// locally archived commit does, and walks stop at it. A no-op when the commit is resident or
+// already stubbed - a real commit is never downgraded to a stub by a peer's say-so.
+func (d *InMemoryCommitDag) PutStub(stub document.CommitStub) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.isResidentLocked(stub.OriginalHash) {
+		return
+	}
+	if _, ok := d.stubs[stub.OriginalHash]; ok {
+		return
+	}
+	d.stubs[stub.OriginalHash] = stub
+	d.ancestryVersion++
+}
+
 func (d *InMemoryCommitDag) GetDocumentTree(treeHash codec.Hash) (document.DocumentTree, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

@@ -168,6 +168,10 @@ type KdbServerRuntime struct {
 	// sweeperState holds document-expiry configuration and the sweeper goroutine (expiry.go).
 	sweeperState
 
+	// replication records what peer sync accepted but could not make consistent - see
+	// ReplicationIssues (peersync_ingest.go).
+	replication replicationIssues
+
 	// groupPublishing counts cross-namespace transactions currently publishing a commit into this
 	// namespace, and groupVersion counts every one that has. NamespaceSet.Snapshot reads both on
 	// either side of its head reads to tell whether a group was half-published under it.

@@ -336,7 +336,7 @@ func TestTouchedDocsForRangeUsesTopologicalNotTimestampOrder(t *testing.T) {
 	l1 := writeDocAt(t, local, ns, genesis, sharedDoc, `{"v":"l1-should-be-superseded"}`, later)
 	l2 := writeDocAt(t, local, ns, l1.Hash, sharedDoc, `{"v":"l2-actual-final-write"}`, earlier)
 
-	touched, err := touchedDocsForRange(local.dag, l2.Hash, genesis)
+	touched, _, err := touchedDocsForRange(local.dag, l2.Hash, genesis)
 	if err != nil {
 		t.Fatalf("touchedDocsForRange: %v", err)
 	}

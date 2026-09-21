@@ -53,6 +53,12 @@ type PeerSyncAction struct{ Namespace string }
 
 func (PeerSyncAction) isAction() {}
 
+// StreamSubscribeAction is subscribing to a namespace's commit stream (Mode 1/2): every commit's
+// full operations are sent, so it is a read of the whole namespace.
+type StreamSubscribeAction struct{ Namespace string }
+
+func (StreamSubscribeAction) isAction() {}
+
 // DocumentWriteAction is a per-document write/delete check, resolved at document > collection >
 // database grant specificity. Raised by the Transaction Engine for each op in a transaction, not
 // just at the wire layer.

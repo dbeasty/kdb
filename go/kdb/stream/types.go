@@ -29,6 +29,11 @@ type SubscriberConfig struct {
 	Mode           ClientMode
 	CoordinatorURI string
 	ResumeFrom     *codec.Hash
+	// User/Password/Token authenticate the handshake; a coordinator running RBAC refuses a
+	// subscriber without them.
+	User     *string
+	Password *string
+	Token    *string
 }
 
 // PublishedCommit is a commit broadcast to subscribers.

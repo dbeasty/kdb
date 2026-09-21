@@ -7,6 +7,7 @@ import (
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
+	"github.com/limidus/kdb/go/kdb/wire"
 )
 
 // HostConfig configures an in-memory peer sync host hub.
@@ -31,7 +32,21 @@ type HostConfig struct {
 	// these fields existed.
 	ConflictPolicy   transaction.ConflictPolicy
 	ConflictResolver transaction.ConflictResolver
+	// Node serializes ingest against the runtime's own writers and runs its post-commit hooks -
+	// see LocalNode. nil serializes only against other ingests in this process.
+	Node LocalNode
+	// ClassifyError maps a failure to the wire error code sent back in a PeerErrorMessage; the
+	// server supplies its own classifier so a busy or draining node says so. Unrecognized errors
+	// fall back to peer sync's own classification.
+	ClassifyError func(error) (wire.ErrorCode, bool)
+	// ApplyToStorage writes ingested documents into the storage adapter. Setting
+	// MaterializeCommit (the older way to ask for this) implies it; the function itself is no
+	// longer called, because Ingest applies a head move's net effect in one verified step.
+	ApplyToStorage bool
 }
+
+// DefaultPageCommits caps one page of a commit transfer when the requester names no cap.
+const DefaultPageCommits = 500
 
 // ClientConfig configures a peer sync client connection.
 type ClientConfig struct {
@@ -52,6 +67,11 @@ type ClientConfig struct {
 	// ConflictPolicy/ConflictResolver - see HostConfig's doc comment; same contract, client side.
 	ConflictPolicy   transaction.ConflictPolicy
 	ConflictResolver transaction.ConflictResolver
+	// Node / ApplyToStorage - see HostConfig's doc comments; same contract, client side.
+	Node           LocalNode
+	ApplyToStorage bool
+	// PageCommits caps each page of a pull or push; 0 means DefaultPageCommits.
+	PageCommits int
 }
 
 // DagSyncPlan describes commits unique to each side of a sync.

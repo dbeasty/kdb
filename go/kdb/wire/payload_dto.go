@@ -44,6 +44,7 @@ type payloadEnvelope struct {
 	HandshakeAck      *handshakeAckDto      `json:"handshakeAck,omitempty"`
 	DeltaCommit       *deltaCommitDto       `json:"deltaCommit,omitempty"`
 	CommitFetch       *commitFetchDto       `json:"commitFetch,omitempty"`
+	PeerError         *peerErrorDto         `json:"peerError,omitempty"`
 	CommitPush        *commitPushDto        `json:"commitPush,omitempty"`
 	CommitPushAck     *commitPushAckDto     `json:"commitPushAck,omitempty"`
 	DagDiff           *dagDiffDto           `json:"dagDiff,omitempty"`
@@ -127,11 +128,29 @@ type commitFetchDto struct {
 	Namespace    string  `json:"namespace"`
 	SinceHashHex *string `json:"sinceHashHex"`
 	MaxCommits   int     `json:"maxCommits"`
+	// HaveHexes (Go-only, additive): more commits the fetcher already has, besides SinceHash.
+	HaveHexes []string `json:"haveHexes,omitempty"`
 }
 
 type commitPushDto struct {
 	Namespace      string        `json:"namespace"`
 	CommitsPayload jsonByteArray `json:"commitsPayload"`
+	// Stubs (Go-only, additive): archived commits the sender can only name.
+	Stubs []commitStubDto `json:"stubs,omitempty"`
+	// More (Go-only, additive): further pages of this push follow; store, do not decide yet.
+	More bool `json:"more,omitempty"`
+}
+
+type commitStubDto struct {
+	OriginalHashHex string `json:"originalHashHex"`
+	ArchiveLocation string `json:"archiveLocation"`
+	StubbedAtMicros int64  `json:"stubbedAtMicros"`
+}
+
+type peerErrorDto struct {
+	Namespace string    `json:"namespace"`
+	Code      ErrorCode `json:"code"`
+	Message   string    `json:"message"`
 }
 
 type commitPushAckDto struct {

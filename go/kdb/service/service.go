@@ -48,12 +48,14 @@ func Main() {
 	var configPath string
 	var showVersion bool
 	var peerConflictPolicy string
+	var streamAllowAnonymous bool
 	var expireField string
 	var expireGrace, expireInterval time.Duration
 	fs.StringVar(&expireField, "expire-field", "", "document expiry (kdb-spec-layer16 §9.5): the top-level field (or dotted path) holding each document's expiry timestamp as an RFC 3339 string or epoch milliseconds. Documents whose timestamp has passed are hidden from reads at head and deleted by a periodic sweep; empty (default) disables expiry")
 	fs.DurationVar(&expireGrace, "expire-grace", 0, "how long a document stays readable past its --expire-field timestamp before it counts as expired")
 	fs.DurationVar(&expireInterval, "expire-interval", time.Duration(policy.DefaultSweepIntervalMillis)*time.Millisecond, "how often the expiry sweeper scans head and deletes expired documents (batches of at most 500 per commit, message \"expiry sweep\")")
 	fs.StringVar(&peerConflictPolicy, "peer-conflict-policy", "strict", "how the peer-sync listener resolves a same-document divergence pushed by a peer: strict (report a conflict, never silently resolve - default) or last-write (later timestamp wins symmetrically on every node)")
+	fs.BoolVar(&streamAllowAnonymous, "stream-allow-anonymous", false, "accept stream (--stream-addr) subscribers without credentials, as every subscriber was before the stream handshake authenticated. Under --rbac this lets anyone read every commit in the namespace; without --rbac credentials are not checked anyway, so this changes nothing")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
 	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
 	fs.BoolVar(&flagVals.Memory, "memory", flagVals.Memory, "use in-memory runtime")
@@ -468,6 +470,7 @@ func Main() {
 			os.Exit(1)
 		}
 		defer streamListener.Close()
+		hub.SetAllowAnonymous(streamAllowAnonymous)
 		// The cross-write notification bridge (KdbServerRuntime.CommitListener's own doc
 		// comment): without this, the stream hub would accept connections and handshakes but
 		// never actually publish anything, since nothing would ever call hub.Publish.

@@ -104,6 +104,9 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 			Namespaces: []string{cfg.NamespaceID},
 			LocalHeads: localHeads,
 			ClientMode: wireMode,
+			User:       cfg.User,
+			Password:   cfg.Password,
+			Token:      cfg.Token,
 		},
 	}
 	go s.readLoop(conn)

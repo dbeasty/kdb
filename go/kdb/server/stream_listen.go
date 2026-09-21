@@ -62,6 +62,9 @@ type registeredSubscriber struct {
 	nodeID  string
 	conn    stream.ConnectionHandle
 	lastAck *codec.Hash
+	// principal is who this connection's handshake authenticated as; write-back replays run as
+	// it.
+	principal auth.Principal
 
 	// outbound is this subscriber's own queue, drained by its own goroutine (sendLoop). Publish
 	// only ever hands frames to this channel, never to conn.Send: socketConnection.Send does a
@@ -127,7 +130,17 @@ type StreamHub struct {
 	mu          sync.Mutex
 	subscribers []*registeredSubscriber
 	correlation int
+
+	// allowAnonymous skips authenticating the handshake: every subscriber is the anonymous
+	// principal, as every subscriber was before the handshake authenticated at all. Off by
+	// default; only an explicit operator opt-in (kdb-service --stream-allow-anonymous) turns it
+	// on, since under RBAC it lets anyone read the whole namespace's commit stream. Atomic
+	// because the hub is already accepting connections when a caller sets it.
+	allowAnonymous atomic.Bool
 }
+
+// SetAllowAnonymous turns anonymous subscription on or off - see StreamHub.allowAnonymous.
+func (h *StreamHub) SetAllowAnonymous(on bool) { h.allowAnonymous.Store(on) }
 
 // NewStreamHub creates a stream hub for namespaceID, backed by runtime for both head lookups
 // (handshake responses) and TransactionReplay (write-back). Exported so a caller that already
@@ -207,7 +220,7 @@ func (h *StreamHub) handleFrame(conn stream.ConnectionHandle, frame []byte) []by
 		h.updateLastAck(conn, m.CommitHash)
 		return nil
 	case wire.TransactionReplayMessage:
-		return h.handleTransactionReplay(m)
+		return h.handleTransactionReplay(conn, m)
 	default:
 		return nil
 	}
@@ -221,6 +234,21 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 	if !slices.Contains(msg.Request.Namespaces, h.namespaceID) {
 		return h.encodeHandshakeReject(msg, "namespace mismatch")
 	}
+	// The handshake authenticates (D11). It used not to at all, so under RBAC any client could
+	// subscribe and receive every commit's full operations, and write back as nobody in
+	// particular.
+	principal := auth.Principal{}
+	if !h.allowAnonymous.Load() {
+		creds := auth.Credentials{User: msg.Request.User, Password: msg.Request.Password, Token: msg.Request.Token}
+		p, err := h.runtime.AuthEngine.Authenticator().Authenticate(context.Background(), creds)
+		if err != nil {
+			return h.encodeHandshakeReject(msg, err.Error())
+		}
+		if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), p, auth.StreamSubscribeAction{Namespace: h.namespaceID}); err != nil {
+			return h.encodeHandshakeReject(msg, err.Error())
+		}
+		principal = p
+	}
 	head, err := h.runtime.Runtime.DAG.Head()
 	if err != nil {
 		return h.encodeHandshakeReject(msg, err.Error())
@@ -232,9 +260,10 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 		}
 	}
 	sub := &registeredSubscriber{
-		nodeID:   msg.Request.NodeID,
-		conn:     conn,
-		lastAck:  resume,
+		nodeID:    msg.Request.NodeID,
+		conn:      conn,
+		lastAck:   resume,
+		principal: principal,
 		outbound: make(chan []byte, subscriberQueueDepth),
 		stop:     make(chan struct{}),
 	}
@@ -278,28 +307,39 @@ func (h *StreamHub) encodeHandshakeReject(msg wire.HandshakeMessage, reason stri
 	return frame
 }
 
-// handleTransactionReplay serves Mode 2 write-back. Unlike the SQL_CLIENT entry point
-// (wire_listen.go's handleTransactionReplay), a stream connection has no per-connection
-// authenticated principal - its handshake never authenticates, matching Kotlin's
-// StreamBroadcastHub.handleHandshake exactly - so this authorizes an anonymous auth.Principal{}
-// directly against runtime.AuthEngine: a no-op against the default auth.AllowAll, and a
-// deliberate fail-closed choice if RBAC is enabled (kdb-service's --rbac), rather than silently
-// bypassing it the way an unauthenticated caller reaching straight into runtime.Replay would.
-func (h *StreamHub) handleTransactionReplay(msg wire.TransactionReplayMessage) []byte {
+// handleTransactionReplay serves Mode 2 write-back, as the principal this connection's handshake
+// authenticated. A connection that never completed a handshake has no principal and is refused
+// unless the hub allows anonymous access, in which case it is the anonymous principal - a no-op
+// against auth.AllowAll and fail-closed under RBAC.
+func (h *StreamHub) handleTransactionReplay(conn stream.ConnectionHandle, msg wire.TransactionReplayMessage) []byte {
 	if msg.Namespace != h.namespaceID {
 		return nil
 	}
+	principal, ok := h.principalFor(conn)
 	var reply wire.Message
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), auth.Principal{}, auth.TxCommitAction{Namespace: msg.Namespace}); err != nil {
+	if !ok && !h.allowAnonymous.Load() {
+		reply = sqlResultError(msg.H.CorrelationID, msg.Namespace, "", "stream write-back requires a completed handshake")
+	} else if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.TxCommitAction{Namespace: msg.Namespace}); err != nil {
 		reply = sqlResultError(msg.H.CorrelationID, msg.Namespace, "", (&AuthorizationError{Cause: err}).Error())
 	} else {
-		reply = replayTransaction(h.runtime, auth.Principal{}, msg)
+		reply = replayTransaction(h.runtime, principal, msg)
 	}
 	frame, err := h.wire.Encode(reply)
 	if err != nil {
 		return nil
 	}
 	return frame
+}
+
+func (h *StreamHub) principalFor(conn stream.ConnectionHandle) (auth.Principal, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, sub := range h.subscribers {
+		if sub.conn == conn {
+			return sub.principal, true
+		}
+	}
+	return auth.Principal{}, false
 }
 
 func (h *StreamHub) updateLastAck(conn stream.ConnectionHandle, commitHash codec.Hash) {

@@ -305,3 +305,79 @@ func handshakeStreamSubscriber(t *testing.T, hub *StreamHub, conn stream.Connect
 		t.Fatal("handshake produced no ack frame")
 	}
 }
+
+// streamRBACRuntime is a runtime under RBAC with one user allowed to read and write app/data
+// ("rw") and one with no grant at all ("nobody").
+func streamRBACRuntime(t *testing.T) *KdbServerRuntime {
+	t.Helper()
+	rt := newTestRuntime(t)
+	engine, store := newTestRegistryAuthEngine(t)
+	rt.AuthEngine = engine
+	if err := store.CreateRole("rw", []string{"read:app/data", "write:app/data"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser("rw", "pw", []string{"rw"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateUser("nobody", "pw", nil); err != nil {
+		t.Fatal(err)
+	}
+	return rt
+}
+
+func connectStream(t *testing.T, addr, user string, mode stream.ClientMode) (*stream.Connection, error) {
+	t.Helper()
+	subscriber := stream.NewSubscriber(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(core.DefaultConnectOptions()), nil)
+	t.Cleanup(func() { subscriber.Disconnect() })
+	cfg := stream.SubscriberConfig{NamespaceID: "app/data", NodeID: "sub-" + user, Mode: mode, CoordinatorURI: "tcp://" + addr}
+	if user != "" {
+		pw := "pw"
+		cfg.User, cfg.Password = &user, &pw
+	}
+	return subscriber.Connect(cfg)
+}
+
+// TestStreamRejectsUnauthenticatedUnderRBAC is D11: the stream handshake never authenticated,
+// so under RBAC anyone could subscribe and receive every commit's full operations.
+func TestStreamRejectsUnauthenticatedUnderRBAC(t *testing.T) {
+	rt := streamRBACRuntime(t)
+	_, listener, err := ListenStream("tcp://127.0.0.1:0?bind=true", rt, "app/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	addr := listener.Addr().String()
+	if _, err := connectStream(t, addr, "", stream.ClientReadOnly); err == nil {
+		t.Fatal("an anonymous subscriber was accepted under RBAC")
+	}
+	if _, err := connectStream(t, addr, "nobody", stream.ClientReadOnly); err == nil {
+		t.Fatal("a subscriber with no read grant was accepted")
+	}
+	if _, err := connectStream(t, addr, "rw", stream.ClientReadOnly); err != nil {
+		t.Fatalf("a granted subscriber was refused: %v", err)
+	}
+}
+
+// TestStreamWriteBackUsesPrincipal: write-back runs as the handshake's principal, so a granted
+// subscriber's replay commits.
+func TestStreamWriteBackUsesPrincipal(t *testing.T) {
+	rt := streamRBACRuntime(t)
+	_, listener, err := ListenStream("tcp://127.0.0.1:0?bind=true", rt, "app/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	conn, err := connectStream(t, listener.Addr().String(), "rw", stream.ClientWriteBack)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	docID, _ := codec.RandomUUID()
+	txID, _ := codec.RandomUUID()
+	result := conn.SubmitTransaction(document.Transaction{
+		ID: txID, Timestamp: codec.TimestampNow(),
+		Operations: []document.Op{document.WriteOp{DocID: docID, Patch: `{"v":"as rw"}`}},
+	})
+	if result.Rejected != nil {
+		t.Fatalf("write-back as a granted principal was rejected: %s", *result.Rejected)
+	}
+}

@@ -517,6 +517,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgRevertResult, "REVERT_RESULT"},
 		{wire.MsgTxCommitMulti, "TX_COMMIT_MULTI"},
 		{wire.MsgTxCommitMultiResult, "TX_COMMIT_MULTI_RESULT"},
+		{wire.MsgPeerError, "PEER_ERROR"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -533,14 +534,17 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 	if _, ok := wire.MessageTypeFromCode(0x00); ok {
 		t.Error("code 0x00 should not be a known message type")
 	}
-	// 0x23-0x24 are the cross-namespace commit messages; 0x25 is the next free code.
-	if _, ok := wire.MessageTypeFromCode(0x25); ok {
-		t.Error("code 0x25 is unassigned and should not be recognized")
+	// 0x25 is the peer-sync error reply; nextFreeMessageCode is the next free code.
+	if _, ok := wire.MessageTypeFromCode(nextFreeMessageCode); ok {
+		t.Errorf("code %#x is unassigned and should not be recognized", nextFreeMessageCode)
 	}
-	if wire.MessageType(0x25).String() != "UNKNOWN" {
-		t.Errorf("unassigned type names itself %q", wire.MessageType(0x25).String())
+	if wire.MessageType(nextFreeMessageCode).String() != "UNKNOWN" {
+		t.Errorf("unassigned type names itself %q", wire.MessageType(nextFreeMessageCode).String())
 	}
 }
+
+// nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
+const nextFreeMessageCode = 0x26
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{

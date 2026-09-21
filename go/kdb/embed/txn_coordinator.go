@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -39,6 +40,9 @@ type TxnCoordinator struct {
 	// another data root (peer sync) is never judged by that root's unrelated decision log. Empty
 	// until the first epoch assigns one; see localHost.
 	hostID string
+	// foreignParts counts group parts read back whose marker names another host - see
+	// ForeignGroupParts.
+	foreignParts atomic.Int64
 
 	mu sync.Mutex
 	// epoch and log are zero/nil until the first group starts an epoch, and again after a seal.
@@ -374,7 +378,11 @@ func (c *TxnCoordinator) resolvePart(commit document.Commit) (decision partDecis
 	}
 	if m.Host != c.localHost() {
 		// Decided by another data root's log, not this one's - a part that arrived by peer sync.
-		// Whatever epoch number it carries means nothing here.
+		// Whatever epoch number it carries means nothing here. It is still read as committed -
+		// this node cannot know better until it can see every part of the group
+		// (docs/kdb-distributed-implementation-plan.md 6.4) - but it is counted rather than
+		// silently claimed to be atomic.
+		c.foreignParts.Add(1)
 		return partCommitted, true
 	}
 	c.mu.Lock()
@@ -430,6 +438,25 @@ func (c *TxnCoordinator) resolvePart(commit document.Commit) (decision partDecis
 // localHost is this data root's host id. A reader re-checks for one it has not seen yet: the
 // writer assigns it lazily, at its first cross-namespace transaction, which may be after the
 // reader attached.
+// LocalHostID is the host id this data root writes into group markers, or "" if it has never
+// run a cross-namespace transaction.
+func (c *TxnCoordinator) LocalHostID() string {
+	if c == nil {
+		return ""
+	}
+	return c.localHost()
+}
+
+// ForeignGroupParts counts cross-namespace group parts read back from a namespace log whose
+// marker names another host. Such a part was decided by a decision log this node does not have,
+// so its atomicity with the rest of its group is unverified here.
+func (c *TxnCoordinator) ForeignGroupParts() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.foreignParts.Load()
+}
+
 func (c *TxnCoordinator) localHost() string {
 	c.mu.Lock()
 	host := c.hostID

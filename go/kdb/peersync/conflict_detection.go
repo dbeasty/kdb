@@ -1,7 +1,6 @@
 package peersync
 
 import (
-	"math"
 	"sort"
 	"sync"
 
@@ -153,7 +152,8 @@ func resolveDivergenceLocked(
 	case HeadAlreadyAncestor:
 		return CommitPushOutcome{Kind: OutcomeNoOp}, nil
 	default: // HeadDiverged
-		return resolveDivergedLocked(d, store, namespaceID, localHead, incomingHead, opts)
+		outcome, _, err := resolveDivergedLocked(d, store, namespaceID, localHead, incomingHead, opts)
+		return outcome, err
 	}
 }
 
@@ -169,13 +169,13 @@ func resolveDivergedLocked(
 	namespaceID string,
 	localHead, incomingHead codec.Hash,
 	opts ResolutionOptions,
-) (CommitPushOutcome, error) {
+) (CommitPushOutcome, AdvanceStep, error) {
 	plan, err := ComputeSyncPlan(d, localHead, incomingHead)
 	if err != nil {
-		return CommitPushOutcome{}, err
+		return CommitPushOutcome{}, AdvanceStep{}, err
 	}
 	if plan.CommonAncestor == nil {
-		return CommitPushOutcome{}, kdberr.NewVersionNotFoundError(
+		return CommitPushOutcome{}, AdvanceStep{}, kdberr.NewVersionNotFoundError(
 			"no common ancestor between local "+localHead.Hex()+" and incoming "+incomingHead.Hex()+
 				" - a commit references a parent this node never received",
 			namespaceID, incomingHead.Hex(),
@@ -183,22 +183,48 @@ func resolveDivergedLocked(
 	}
 	ancestor := *plan.CommonAncestor
 
-	localTouched, err := touchedDocsForRange(d, localHead, ancestor)
+	localTouched, _, err := touchedDocsForRange(d, localHead, ancestor)
 	if err != nil {
-		return CommitPushOutcome{}, err
+		return CommitPushOutcome{}, AdvanceStep{}, err
 	}
-	remoteTouched, err := touchedDocsForRange(d, incomingHead, ancestor)
+	remoteTouched, remoteCommits, err := touchedDocsForRange(d, incomingHead, ancestor)
 	if err != nil {
-		return CommitPushOutcome{}, err
+		return CommitPushOutcome{}, AdvanceStep{}, err
 	}
-	overlapping := intersectDocIDs(localTouched, remoteTouched)
+	writes, report, err := decideMergeWrites(d, store, namespaceID, localHead, incomingHead, ancestor, localTouched, remoteTouched, opts)
+	if err != nil {
+		return CommitPushOutcome{}, AdvanceStep{}, err
+	}
+	if report != nil {
+		return CommitPushOutcome{Kind: OutcomeConflict, Report: report}, AdvanceStep{}, nil
+	}
+	mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, writes)
+	if err != nil {
+		return CommitPushOutcome{}, AdvanceStep{}, err
+	}
+	applied := make([]document.Op, 0, len(writes))
+	for _, id := range sortedDocIDs(writes) {
+		applied = append(applied, writes[id])
+	}
+	step := AdvanceStep{Commits: append(remoteCommits, mergeCommit), Applied: applied}
+	return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, step, nil
+}
 
+// decideMergeWrites decides what each document the remote side touched should end up as on top
+// of the local head - or, for a same-document conflict the policy will not resolve, returns the
+// report instead. Disjoint histories need no decision: the remote side's final writes apply as
+// they are.
+func decideMergeWrites(
+	d *dag.InMemoryCommitDag,
+	store storage.Adapter,
+	namespaceID string,
+	localHead, incomingHead, ancestor codec.Hash,
+	localTouched, remoteTouched map[codec.UUID]touchedDoc,
+	opts ResolutionOptions,
+) (map[codec.UUID]document.Op, *kdberr.ConflictReport, error) {
+	overlapping := intersectDocIDs(localTouched, remoteTouched)
 	if len(overlapping) == 0 {
-		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, opsOnly(remoteTouched))
-		if err != nil {
-			return CommitPushOutcome{}, err
-		}
-		return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, nil
+		return opsOnly(remoteTouched), nil, nil
 	}
 
 	// A genuine same-document conflict. Real "replay per conflict policy" (kdb-spec.md §8.3 step
@@ -212,55 +238,40 @@ func resolveDivergedLocked(
 		// LAST_WRITE non-commutative: node A pulling from B and node B receiving A's push both
 		// resolve the *same* conflicting document, but "remote" means B on A and A on B, so they
 		// picked opposite winners and permanently diverged on exactly the document LAST_WRITE
-		// exists to reconcile (kdb-finish-up-plan.md's 1-G11). resolveLastWriteWinners compares
-		// each overlapping document's two candidate writes directly, so every node computing this
+		// exists to reconcile (kdb-finish-up-plan.md's 1-G11). localWriteWins compares each
+		// overlapping document's two candidate writes directly, so every node computing this
 		// same resolution reaches the same answer regardless of which side it's running on.
 		effectiveRemoteWrites := opsOnly(remoteTouched)
 		for _, docID := range overlapping {
 			if localWriteWins(localTouched[docID], remoteTouched[docID]) {
 				// The winning write must ride IN the merge commit's own operations, not be
-				// omitted. Deleting the entry (the previous fix's shape) was right for the node
-				// creating the merge - its storage already holds local's write - but the merge
-				// commit travels: a peer whose own state is the LOSING side materializes the
-				// pushed commits oldest-first, so the losing raw commit lands after the winning
-				// one, and a merge commit carrying no op for the document leaves that peer on
-				// the loser's content forever (observed live in the e2e
-				// direction-reversed-relay scenario: A converged to the winner, B to the
-				// loser). Substituting local's own op makes the merge self-contained: applying
-				// it is a no-op where local already won, and imposes the winner everywhere
-				// else.
+				// omitted: a peer whose own state is the losing side would otherwise stay on the
+				// loser's content forever (observed live in the e2e direction-reversed-relay
+				// scenario). Substituting local's own op makes the merge self-contained.
 				effectiveRemoteWrites[docID] = localTouched[docID].Op
 			}
 		}
-		mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, effectiveRemoteWrites)
-		if err != nil {
-			return CommitPushOutcome{}, err
-		}
-		return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, nil
+		return effectiveRemoteWrites, nil, nil
 	case transaction.ConflictPolicyCustom:
 		ancestorCommit, err := d.GetCommitOrThrow(ancestor)
 		if err != nil {
-			return CommitPushOutcome{}, err
+			return nil, nil, err
 		}
 		resolvedWrites, resolved, err := resolveCustomConflicts(
 			store, namespaceID, ancestorCommit.DocumentTreeHash, overlapping, localTouched, remoteTouched, opts.Resolver,
 		)
 		if err != nil {
-			return CommitPushOutcome{}, err
+			return nil, nil, err
 		}
 		if resolved {
-			mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, ancestor, resolvedWrites)
-			if err != nil {
-				return CommitPushOutcome{}, err
-			}
-			return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, nil
+			return resolvedWrites, nil, nil
 		}
 		// Falls through to reporting below - matches finalizeTransaction's own CUSTOM fallback
 		// when there is no resolver, or it declines/fails on any document.
 	}
 
 	report := buildConflictReport(localHead, incomingHead, overlapping, localTouched, remoteTouched)
-	return CommitPushOutcome{Kind: OutcomeConflict, Report: &report}, nil
+	return nil, &report, nil
 }
 
 // localWriteWins compares two candidate writes for the same document - local's own final write
@@ -297,21 +308,25 @@ func mergeNonConflicting(
 	if err != nil {
 		return document.Commit{}, err
 	}
+	fail := func(err error) (document.Commit, error) {
+		_ = store.DiscardPending(namespaceID)
+		return document.Commit{}, err
+	}
 	for _, op := range remoteTouched {
 		switch o := op.(type) {
 		case document.WriteOp:
 			if err := store.PutDocument(namespaceID, document.Document{ID: o.DocID, JSON: o.Patch}); err != nil {
-				return document.Commit{}, err
+				return fail(err)
 			}
 		case document.DeleteOp:
 			if err := store.DeleteDocument(namespaceID, o.DocID); err != nil {
-				return document.Commit{}, err
+				return fail(err)
 			}
 		}
 	}
 	mergedTree, err := store.CommitTree(namespaceID, localHeadCommit.DocumentTreeHash)
 	if err != nil {
-		return document.Commit{}, err
+		return fail(err)
 	}
 	txID, err := codec.RandomUUID()
 	if err != nil {
@@ -363,33 +378,29 @@ type touchedDoc struct {
 	CommitHash codec.Hash
 }
 
-func touchedDocsForRange(d *dag.InMemoryCommitDag, head, ancestor codec.Hash) (map[codec.UUID]touchedDoc, error) {
+func touchedDocsForRange(d *dag.InMemoryCommitDag, head, ancestor codec.Hash) (map[codec.UUID]touchedDoc, []document.Commit, error) {
 	if head == ancestor {
-		return map[codec.UUID]touchedDoc{}, nil
+		return map[codec.UUID]touchedDoc{}, nil, nil
 	}
-	// Reads each commit's operations to decide what each side touched, so
-	// evicted operations must be loaded back first - see
-	// WalkWithOperations.
-	walked, err := d.WalkWithOperations(head, &ancestor, math.MaxInt)
+	// commitsBetween, not Walk(head, &ancestor): Walk prunes only at ancestor's exact hash and so
+	// revisits shared history reachable around it through a merge's other parent, which would
+	// count writes both sides already share as one side's divergent edits.
+	commits, err := commitsBetween(d, head, ancestor)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make(map[codec.UUID]touchedDoc)
-	for i := len(walked) - 1; i >= 0; i-- {
-		full, ok := walked[i].(dag.FullEntry)
-		if !ok {
-			continue
-		}
-		for _, op := range full.Commit.Operations {
+	for _, c := range commits {
+		for _, op := range c.Operations {
 			switch o := op.(type) {
 			case document.WriteOp:
-				out[o.DocID] = touchedDoc{Op: o, Timestamp: full.Commit.Timestamp, CommitHash: full.Commit.Hash}
+				out[o.DocID] = touchedDoc{Op: o, Timestamp: c.Timestamp, CommitHash: c.Hash}
 			case document.DeleteOp:
-				out[o.DocID] = touchedDoc{Op: o, Timestamp: full.Commit.Timestamp, CommitHash: full.Commit.Hash}
+				out[o.DocID] = touchedDoc{Op: o, Timestamp: c.Timestamp, CommitHash: c.Hash}
 			}
 		}
 	}
-	return out, nil
+	return out, commits, nil
 }
 
 // opsOnly discards touchedDoc's provenance, keeping just each document's resulting Op - the
