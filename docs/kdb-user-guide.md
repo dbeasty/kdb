@@ -178,6 +178,29 @@ if errors.Is(err, client.ErrConflict) {
 }
 ```
 
+Transactions across namespaces — every namespace gets its commit, or none does, including
+across a crash at any point:
+
+```go
+res, err := c.CommitAcross(ctx, []client.Transaction{
+    {Namespace: "bank/accounts", BaseVersion: acctHead, Writes: []client.DocWrite{{DocID: acct, JSON: debited}}},
+    {Namespace: "bank/ledger",   Writes: []client.DocWrite{{DocID: entryID, JSON: entry}}}, // "" base: blind write
+})
+var cne *client.CrossNamespaceError
+if errors.As(err, &cne) {
+    // cne.Namespace refused; nothing was written anywhere. errors.Is(err, client.ErrConflict) etc. still work.
+}
+// res.Commits["bank/accounts"] is that namespace's new head; res.GroupID is the transaction id
+// every participant commit carries.
+```
+
+Each participant is checked (schema, unique keys, preconditions, conflicts) before any is
+written; one refusal refuses the whole transaction. On the server the participating namespaces
+must share one data root (`kdb-service --data-dir`), which is where the transaction's decision is
+recorded. Reads of one namespace are read-committed as always; in-process callers that need a
+consistent view of several namespaces use `server.NamespaceSet.Snapshot`. Design and guarantees:
+[cross-namespace transactions](kdb-cross-namespace-transactions-plan.md).
+
 TLS:
 
 ```go

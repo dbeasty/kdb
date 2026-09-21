@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -71,4 +72,39 @@ func CatalogsOf(namespaces []string) map[string][]string {
 		out[cat] = append(out[cat], ns)
 	}
 	return out
+}
+
+// ValidateNamespaceID refuses a namespace id that is not safe to turn into a directory under the
+// data root: empty, too long, a segment that is empty, "." or "..", or a character outside
+// [A-Za-z0-9._-]. Namespaces beginning with "_" are reserved for the process itself (the
+// "_system/..." auth registry) and refused too.
+//
+// Needed wherever a namespace id arrives from a client rather than from configuration: opening a
+// namespace creates its directory, so an unchecked id is a path a remote caller chose.
+func ValidateNamespaceID(id string) error {
+	if id == "" || len(id) > 200 {
+		return fmt.Errorf("kdb: invalid namespace id %q: must be 1-200 characters", id)
+	}
+	if strings.HasPrefix(id, "_") {
+		return fmt.Errorf("kdb: invalid namespace id %q: names beginning with '_' are reserved", id)
+	}
+	for _, seg := range strings.Split(id, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("kdb: invalid namespace id %q: empty, '.' or '..' segment", id)
+		}
+		for _, r := range seg {
+			ok := r == '.' || r == '_' || r == '-' ||
+				(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+			if !ok {
+				return fmt.Errorf("kdb: invalid namespace id %q: character %q is not allowed", id, r)
+			}
+		}
+	}
+	return nil
+}
+
+// NamespaceExists reports whether namespaceID has a directory under dataRoot. The id must already
+// have passed ValidateNamespaceID.
+func NamespaceExists(dataRoot, namespaceID string) bool {
+	return namespaceDirExists(dataRoot, namespaceID)
 }

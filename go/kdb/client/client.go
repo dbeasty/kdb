@@ -171,13 +171,38 @@ type DocWrite struct {
 }
 
 // Transaction mirrors the wire Transaction object - the operation Commit needs: "write iff
-// nothing else committed since I read BaseVersion." All Writes must share one namespace (see
-// Commit's doc comment) - a single KdbServerRuntime is scoped to one namespace, so a
-// transaction spanning namespaces isn't something the current server can execute atomically.
+// nothing else committed since I read BaseVersion." One Transaction is one namespace's work;
+// CommitAcross commits several, in different namespaces, atomically.
 type Transaction struct {
 	Namespace   string
 	BaseVersion string // commit hash this write is anchored on; from a prior GetJSON/PutJSON/Commit
 	Writes      []DocWrite
+	// Deletes removes documents by id, in the same commit as Writes. Conflict detection covers
+	// them exactly as it covers writes: a document changed since BaseVersion is not deleted.
+	Deletes []string
+}
+
+// operations turns tx's writes and deletes into document operations, writes first.
+func (tx Transaction) operations() ([]document.Op, error) {
+	ops := make([]document.Op, 0, len(tx.Writes)+len(tx.Deletes))
+	for _, w := range tx.Writes {
+		id, err := codec.UUIDFromString(w.DocID)
+		if err != nil {
+			return nil, fmt.Errorf("kdb: invalid docID %q: %w", w.DocID, err)
+		}
+		ops = append(ops, document.WriteOp{DocID: id, Patch: string(w.JSON)})
+	}
+	for _, d := range tx.Deletes {
+		id, err := codec.UUIDFromString(d)
+		if err != nil {
+			return nil, fmt.Errorf("kdb: invalid docID %q: %w", d, err)
+		}
+		ops = append(ops, document.DeleteOp{DocID: id})
+	}
+	if len(ops) == 0 {
+		return nil, fmt.Errorf("kdb: transaction for namespace %q has no writes or deletes", tx.Namespace)
+	}
+	return ops, nil
 }
 
 // Client is one TCP connection and one KDB session per namespace touched. Safe for concurrent
@@ -561,24 +586,16 @@ func (c *Client) Upsert(ctx context.Context, ns string, docID string, jsonBody [
 // committed against the same BaseVersion first) returns a *ConflictError satisfying
 // errors.Is(err, ErrConflict); no partial write happens either way.
 //
-// All tx.Writes must share tx.Namespace - a KdbServerRuntime is scoped to one namespace, so a
-// transaction spanning namespaces can't be executed atomically by the current server; Commit
-// returns an error rather than silently splitting it into several commits.
+// Commit writes into tx.Namespace only. To change several namespaces together - all of them or
+// none - use CommitAcross.
 func (c *Client) Commit(ctx context.Context, tx Transaction) (string, error) {
-	if len(tx.Writes) == 0 {
-		return "", fmt.Errorf("kdb: transaction has no writes")
+	ops, err := tx.operations()
+	if err != nil {
+		return "", err
 	}
 	base, err := codec.HashFromHex(tx.BaseVersion)
 	if err != nil {
 		return "", fmt.Errorf("kdb: invalid BaseVersion: %w", err)
-	}
-	ops := make([]document.Op, len(tx.Writes))
-	for i, w := range tx.Writes {
-		id, err := codec.UUIDFromString(w.DocID)
-		if err != nil {
-			return "", fmt.Errorf("kdb: invalid docID %q: %w", w.DocID, err)
-		}
-		ops[i] = document.WriteOp{DocID: id, Patch: string(w.JSON)}
 	}
 	st, err := c.ensureNamespace(ctx, tx.Namespace)
 	if err != nil {

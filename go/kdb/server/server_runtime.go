@@ -167,6 +167,22 @@ type KdbServerRuntime struct {
 	// sweeperState holds document-expiry configuration and the sweeper goroutine (expiry.go).
 	sweeperState
 
+	// groupPublishing counts cross-namespace transactions currently publishing a commit into this
+	// namespace, and groupVersion counts every one that has. NamespaceSet.Snapshot reads both on
+	// either side of its head reads to tell whether a group was half-published under it.
+	groupPublishing atomic.Int64
+	groupVersion    atomic.Uint64
+	// fenced is set once a cross-namespace transaction this namespace took part in failed after
+	// publishing: the in-memory state then holds a commit recovery will roll back, so every later
+	// write is refused until the namespace is reopened. See docs/kdb-cross-namespace-transactions-plan.md §4.5.
+	fenced atomic.Pointer[error]
+	// Namespaces, when set, is the set this runtime belongs to, through which a listener serving
+	// it can reach the process's other namespaces - cross-namespace commits, and reads routed by
+	// namespace. nil (the default) keeps every frame on this runtime, as before.
+	Namespaces *NamespaceSet
+	// soloNamespaceSet backs namespaceSet() for a runtime with no Namespaces configured.
+	soloNamespaceSet
+
 	// hookMu guards beforeSqlExec, which a test may set while the listener is already running.
 	hookMu sync.RWMutex
 	// beforeSqlExec, when set by a test, runs at the top of every SqlExec dispatch - the way a
@@ -632,19 +648,8 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	// Checked in cheapest-first order, before authorization or taking the write gate: a server
 	// shedding load should do as little work per rejected request as possible, and a rejection
 	// reason "closer to the front" (shutting down entirely) makes every later check moot anyway.
-	if s.draining.Load() {
-		return document.Commit{}, &UnavailableError{Reason: "server is shutting down"}
-	}
-	// A read-only runtime has no WAL and no delta writer at all, so a write that got this far
-	// would fail deep in the storage engine with an error naming a missing component rather than
-	// the actual reason. Refused at the front, in the same cheapest-first spirit as draining.
-	if err := s.Runtime.AssertWritable(); err != nil {
+	if err := s.admitWrite(tx, principal, opts.system); err != nil {
 		return document.Commit{}, err
-	}
-	if !opts.system {
-		if err := s.authorizeOperations(tx, principal); err != nil {
-			return document.Commit{}, err
-		}
 	}
 	if s.dag == nil {
 		return document.Commit{}, fmt.Errorf("kdb server: commit requires an InMemoryCommitDag (or a wrapper exposing one), got %T", s.Runtime.DAG)
@@ -755,6 +760,46 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 	default:
 		return document.Commit{}, fmt.Errorf("kdb server: unrecognized transaction result %T", result)
 	}
+}
+
+// admitWrite is the cheapest-first front of every write path: refusals that need no gate, no
+// memory and no look at the data. Shared by runTransaction and NamespaceSet, so a cross-namespace
+// participant is refused for exactly the reasons a single-namespace commit would be.
+func (s *KdbServerRuntime) admitWrite(tx document.Transaction, principal auth.Principal, system bool) error {
+	// Checked in cheapest-first order, before authorization or taking the write gate: a server
+	// shedding load should do as little work per rejected request as possible, and a rejection
+	// reason "closer to the front" (shutting down entirely) makes every later check moot anyway.
+	if s.draining.Load() {
+		return &UnavailableError{Reason: "server is shutting down"}
+	}
+	// A read-only runtime has no WAL and no delta writer at all, so a write that got this far
+	// would fail deep in the storage engine with an error naming a missing component rather than
+	// the actual reason. Refused at the front, in the same cheapest-first spirit as draining.
+	if err := s.Runtime.AssertWritable(); err != nil {
+		return err
+	}
+	if err := s.fenceErr(); err != nil {
+		return err
+	}
+	if !system {
+		if err := s.authorizeOperations(tx, principal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fence refuses every later write with cause. Idempotent; the first cause is kept.
+func (s *KdbServerRuntime) fence(cause error) {
+	s.fenced.CompareAndSwap(nil, &cause)
+}
+
+// fenceErr is the reason this runtime refuses writes, or nil.
+func (s *KdbServerRuntime) fenceErr() error {
+	if p := s.fenced.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // GetDocument reads docID's current JSON at the DAG's current head, or (nil, false, nil) if it

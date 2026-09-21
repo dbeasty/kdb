@@ -323,6 +323,11 @@ func (h *sqlWireConnHandler) dispatchRecovering(message wire.Message) (reply wir
 func internalErrorReply(message wire.Message) wire.Message {
 	const msg = "internal server error"
 	correlationID := message.Header().CorrelationID
+	if m, ok := message.(wire.TxCommitMultiMessage); ok {
+		// Its client waits for TX_COMMIT_MULTI_RESULT specifically; a SQL_RESULT would arrive as
+		// an unexpected reply type instead of as the error it is.
+		return multiCommitError(m, "", errors.New(msg))
+	}
 	namespace, sessionID := "", ""
 	switch m := message.(type) {
 	case wire.SqlExecMessage:
@@ -376,6 +381,8 @@ func (h *sqlWireConnHandler) dispatch(message wire.Message) wire.Message {
 		return h.handleHistoryList(msg)
 	case wire.RevertMessage:
 		return h.handleRevert(msg)
+	case wire.TxCommitMultiMessage:
+		return h.handleTxCommitMulti(msg)
 	default:
 		return nil
 	}
@@ -869,8 +876,14 @@ func (h *sqlWireConnHandler) handleDocumentGet(msg wire.DocumentGetMessage) wire
 	if err != nil {
 		return documentGetError(msg, "invalid docId: "+err.Error())
 	}
+	// Routed by namespace when this listener serves several (see runtimeFor); the runtime serving
+	// the namespace is the one whose grants, admission and data apply.
+	rt, err := h.runtimeFor(msg.Namespace)
+	if err != nil {
+		return documentGetErrorClassified(msg, err)
+	}
 	action := auth.DocumentReadAction{Namespace: msg.Namespace, DocID: msg.DocID}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
+	if err := rt.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
 		return documentGetError(msg, (&AuthorizationError{Cause: err}).Error())
 	}
 	// Point reads take a small grant too - not because one is dangerous, but because a flood
@@ -882,7 +895,7 @@ func (h *sqlWireConnHandler) handleDocumentGet(msg wire.DocumentGetMessage) wire
 		grant    *Grant
 		estimate int64
 	)
-	if adm := h.runtime.admission; adm != nil {
+	if adm := rt.admission; adm != nil {
 		estimate = adm.Costs().EstimatePointRead(msg.Namespace)
 		actx, cancel := context.WithTimeout(context.Background(), readAcquireTimeout)
 		g, err := adm.AcquireBytes(actx, ClassPointRead, estimate)
@@ -893,11 +906,11 @@ func (h *sqlWireConnHandler) handleDocumentGet(msg wire.DocumentGetMessage) wire
 		grant = g
 		defer grant.Release()
 	}
-	jsonBody, commitHex, found, err := h.runtime.GetDocument(msg.Namespace, docID)
+	jsonBody, commitHex, found, err := rt.GetDocument(msg.Namespace, docID)
 	if err != nil {
 		return documentGetErrorClassified(msg, err)
 	}
-	if adm := h.runtime.admission; adm != nil && found {
+	if adm := rt.admission; adm != nil && found {
 		adm.Costs().ObserveDocSize(msg.Namespace, len(jsonBody))
 		// Actual: the document plus its response copy - the same two terms the estimate models.
 		adm.Costs().ObservePointReadActual(msg.Namespace, estimate, int64(len(jsonBody))*2)

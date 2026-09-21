@@ -515,6 +515,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgHistoryResult, "HISTORY_RESULT"},
 		{wire.MsgRevert, "REVERT"},
 		{wire.MsgRevertResult, "REVERT_RESULT"},
+		{wire.MsgTxCommitMulti, "TX_COMMIT_MULTI"},
+		{wire.MsgTxCommitMultiResult, "TX_COMMIT_MULTI_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -531,12 +533,12 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 	if _, ok := wire.MessageTypeFromCode(0x00); ok {
 		t.Error("code 0x00 should not be a known message type")
 	}
-	// 0x1F-0x22 are the history messages; 0x23 is the next free code.
-	if _, ok := wire.MessageTypeFromCode(0x23); ok {
-		t.Error("code 0x23 is unassigned and should not be recognized")
+	// 0x23-0x24 are the cross-namespace commit messages; 0x25 is the next free code.
+	if _, ok := wire.MessageTypeFromCode(0x25); ok {
+		t.Error("code 0x25 is unassigned and should not be recognized")
 	}
-	if wire.MessageType(0x23).String() != "UNKNOWN" {
-		t.Errorf("unassigned type names itself %q", wire.MessageType(0x23).String())
+	if wire.MessageType(0x25).String() != "UNKNOWN" {
+		t.Errorf("unassigned type names itself %q", wire.MessageType(0x25).String())
 	}
 }
 
@@ -703,5 +705,41 @@ func TestEncodeFrameOnlyAndDecodeHeaderViaCodec(t *testing.T) {
 	if _, err := c.EncodeFrameOnly(wire.Header{MessageType: wire.MsgPositionAck},
 		make([]byte, wire.DefaultMaxFrameBytes)); err == nil {
 		t.Fatal("expected an error encoding an oversized frame")
+	}
+}
+
+func TestRoundTripTxCommitMulti(t *testing.T) {
+	msg := wire.TxCommitMultiMessage{
+		H:         wire.Header{MessageType: wire.MsgTxCommitMulti, ProtocolVersion: 1, CorrelationID: 41},
+		SessionID: "sess-7",
+		Parts: []wire.TxCommitMultiPart{
+			{Namespace: "bank/accounts", TransactionBytes: []byte{1, 2, 3}},
+			{Namespace: "bank/ledger", TransactionBytes: []byte{4, 5}},
+		},
+	}
+	got, ok := roundTrip(t, msg).(wire.TxCommitMultiMessage)
+	if !ok || got.SessionID != "sess-7" || len(got.Parts) != 2 ||
+		got.Parts[1].Namespace != "bank/ledger" || !bytes.Equal(got.Parts[0].TransactionBytes, []byte{1, 2, 3}) {
+		t.Fatalf("round trip: %+v", got)
+	}
+
+	errMsg := "conflict"
+	code := wire.ErrorCodeConflict
+	retry := 12
+	reply := wire.TxCommitMultiResultMessage{
+		H:               wire.Header{MessageType: wire.MsgTxCommitMultiResult, ProtocolVersion: 1, CorrelationID: 41},
+		GroupID:         "g",
+		Parts:           []wire.TxCommitMultiResultPart{{Namespace: "bank/accounts", CommitHex: "ab"}},
+		FailedNamespace: "bank/ledger",
+		ConflictReport:  []byte(`{"transactionId":"t"}`),
+		Error:           &errMsg,
+		ErrorCode:       &code,
+		RetryAfterMs:    &retry,
+	}
+	back, ok := roundTrip(t, reply).(wire.TxCommitMultiResultMessage)
+	if !ok || back.GroupID != "g" || len(back.Parts) != 1 || back.Parts[0].CommitHex != "ab" ||
+		back.FailedNamespace != "bank/ledger" || string(back.ConflictReport) != `{"transactionId":"t"}` ||
+		back.Error == nil || *back.ErrorCode != code || *back.RetryAfterMs != 12 {
+		t.Fatalf("round trip: %+v", back)
 	}
 }

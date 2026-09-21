@@ -359,6 +359,46 @@ func Main() {
 		}
 	}
 
+	// Every namespace this process writes to, behind one runtime each. The primary is served on
+	// the wire as before; the others are reached through it - by a cross-namespace commit
+	// (TX_COMMIT_MULTI), by a document read naming them, and by the control plane - and all of
+	// those must meet the *same* KdbServerRuntime per namespace, because the write gate and the
+	// cross-namespace ack barrier live there. Two runtimes over one namespace would be two
+	// uncoordinated writers. See docs/kdb-cross-namespace-transactions-plan.md.
+	var txnCoordinator *embed.TxnCoordinator
+	if host != nil {
+		txnCoordinator = host.Transactions()
+	}
+	nsSet := server.NewNamespaceSet(txnCoordinator)
+	if err := nsSet.Add(srv); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	srv.Namespaces = nsSet
+	if host != nil {
+		nsSet.SetOpener(func(id string, create bool) (*server.KdbServerRuntime, error) {
+			// A client-supplied id becomes a directory under the data root: validate it before
+			// anything touches the filesystem.
+			if err := embed.ValidateNamespaceID(id); err != nil {
+				return nil, err
+			}
+			// Reads never create a namespace; only a commit, which is a write authorized
+			// against that namespace, may.
+			if !create && !embed.NamespaceExists(dataDir, id) {
+				return nil, fmt.Errorf("%w: %s", server.ErrUnknownNamespace, id)
+			}
+			nsRT, err := host.Namespace(embed.CatalogFromNamespace(id), id, schema.None())
+			if err != nil {
+				return nil, err
+			}
+			sec := server.NewKdbServerRuntime(nsRT)
+			sec.AuthEngine = srv.AuthEngine
+			sec.WriteTimeout = srv.WriteTimeout
+			sec.Namespaces = nsSet
+			return sec, nil
+		})
+	}
+
 	peerStatus := "disabled"
 	streamStatus := "disabled"
 	sqlStatus := "disabled"
@@ -485,14 +525,26 @@ func Main() {
 				if id == namespace {
 					continue
 				}
-				nsRT, nerr := host.Namespace(embed.CatalogFromNamespace(id), id, schema.None())
+				// Through the set, so the control plane writes through the same runtime a
+				// cross-namespace commit does. Reserved namespaces (the "_system" auth
+				// registry) are never wire-reachable, so they stay outside it, opened as before.
+				var nsRT *server.KdbServerRuntime
+				var nerr error
+				if strings.HasPrefix(id, "_") {
+					var raw *embed.EmbeddedKdbRuntime
+					if raw, nerr = host.Namespace(embed.CatalogFromNamespace(id), id, schema.None()); nerr == nil {
+						nsRT = server.NewKdbServerRuntime(raw)
+					}
+				} else {
+					nsRT, nerr = nsSet.Resolve(id, false)
+				}
 				if nerr != nil {
 					// One unopenable namespace must not cost the operator the whole UI; it is
 					// reported and skipped, and the rest are still browsable.
 					slog.Warn("namespace not available to the control plane", "namespace", id, "error", nerr)
 					continue
 				}
-				secondary[id] = server.NewKdbServerRuntime(nsRT)
+				secondary[id] = nsRT
 			}
 		}
 		// Describe re-runs the same precedence decision ResolveService just made, over the same
