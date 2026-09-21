@@ -3,6 +3,7 @@ package peersync
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -52,6 +53,41 @@ type IngestEnv struct {
 	// auto-merge path always writes storage, since the merge tree is built there.
 	ApplyToStorage bool
 	Resolution     ResolutionOptions
+	// MaxClockSkew refuses a commit timestamped further than this past local wall time. Commits
+	// are timestamped at least one microsecond after their parents, so a single commit from a node
+	// whose clock runs far ahead would drag every later commit that descends from it into that
+	// future. 0 means DefaultMaxClockSkew; negative disables the check.
+	MaxClockSkew time.Duration
+}
+
+// DefaultMaxClockSkew is how far ahead of this node's clock a replicated commit may be.
+const DefaultMaxClockSkew = 5 * time.Minute
+
+// ClockSkewError refuses a commit timestamped too far in the future.
+type ClockSkewError struct {
+	CommitHash codec.Hash
+	Ahead      time.Duration
+	Max        time.Duration
+}
+
+func (e *ClockSkewError) Error() string {
+	return fmt.Sprintf("peer sync: commit %s is timestamped %s ahead of this node's clock (limit %s) - "+
+		"the node that made it has a clock running fast", e.CommitHash.Hex(), e.Ahead.Round(time.Second), e.Max)
+}
+
+func (env IngestEnv) checkSkew(c document.Commit) error {
+	max := env.MaxClockSkew
+	if max < 0 {
+		return nil
+	}
+	if max == 0 {
+		max = DefaultMaxClockSkew
+	}
+	ahead := time.Duration(c.Timestamp.EpochMicros()-time.Now().UnixMicro()) * time.Microsecond
+	if ahead > max {
+		return &ClockSkewError{CommitHash: c.Hash, Ahead: ahead, Max: max}
+	}
+	return nil
 }
 
 // IngestResult reports what Ingest did.
@@ -99,6 +135,9 @@ func StoreCommits(env IngestEnv, commits []document.Commit, stubs []document.Com
 	for _, c := range commits {
 		if env.DAG.HasCommit(c.Hash) {
 			continue
+		}
+		if err := env.checkSkew(c); err != nil {
+			return stored, err
 		}
 		if err := env.DAG.PutCommit(c, true); err != nil {
 			return stored, fmt.Errorf("peer sync: storing commit %s: %w", c.Hash.Hex(), err)

@@ -226,9 +226,16 @@ func (c *TxnCoordinator) startEpochLocked() error {
 	}
 	next++
 	if c.hostID == "" {
-		id, err := codec.RandomUUID()
+		// The node's identity, when it has one, is also its cross-namespace host id: one name
+		// per data root, whichever of the two was assigned first.
+		id, ok, err := readNodeID(c.dataRoot)
 		if err != nil {
 			return err
+		}
+		if !ok {
+			if id, err = codec.RandomUUID(); err != nil {
+				return err
+			}
 		}
 		if err := writeHostID(c.dataRoot, id.String()); err != nil {
 			return err

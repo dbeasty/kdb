@@ -234,6 +234,12 @@ func Main() {
 		opts.Storage.Compression = &compression
 		opts.Storage.AsyncSyncIntervalMillis = int64(cfg.AsyncSyncIntervalMS)
 		opts.Storage.SyncMode = syncMode
+		var nodeID codec.UUID
+		if nodeID, err = embed.LoadOrCreateNodeID(dataDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: node identity: %v\n", err)
+			os.Exit(1)
+		}
+		server.SetProcessNodeID(nodeID)
 		host, err = embed.OpenFileHost(dataDir, opts)
 		if err == nil {
 			rt, err = host.NamespaceWithOptions(

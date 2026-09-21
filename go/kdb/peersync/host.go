@@ -216,6 +216,13 @@ func (h *frameHandler) serve(msg wire.Message) (wire.Message, error) {
 			reason := "FULL_PEER mode required"
 			return peerHandshakeAck(m, false, nil, &reason), nil
 		}
+		if h.cfg.NodeID != "" && m.Request.NodeID == h.cfg.NodeID {
+			// Two nodes sharing an identity would record progress against each other as if they
+			// were one - almost always a data root copied without deleting its NODE file.
+			reason := "peer sync: the connecting node has this node's own identity " + h.cfg.NodeID +
+				"; a copied data root must delete its NODE file to become a separate node"
+			return peerHandshakeAck(m, false, nil, &reason), nil
+		}
 		if len(m.Request.Namespaces) > 0 && !containsString(m.Request.Namespaces, h.cfg.NamespaceID) {
 			reason := (&NamespaceMismatchError{Served: h.cfg.NamespaceID, Requested: strings.Join(m.Request.Namespaces, ",")}).Error()
 			return peerHandshakeAck(m, false, nil, &reason), nil

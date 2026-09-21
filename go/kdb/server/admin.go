@@ -92,6 +92,9 @@ func (a *AdminServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	b := version.Get()
 	fmt.Fprintf(w, "ok\nversion=%s\ncommit=%s\ncommit_dirty=%t\nbuild_date=%s\n",
 		b.Version, b.Commit, b.Dirty, b.BuildDate)
+	if a.runtime != nil {
+		fmt.Fprintf(w, "node_id=%s\n", a.runtime.NodeID)
+	}
 }
 
 func (a *AdminServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {

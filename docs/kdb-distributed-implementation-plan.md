@@ -150,7 +150,7 @@ Walks that meet a `StubbedEntry` send a **stub record** (`CommitStubDto{Original
 
 ## Phase 1 — Identity, causal timestamps, deterministic merge
 
-### 1.1 Node identity ☐
+### 1.1 Node identity ☑
 
 - **`embed/node_identity.go`:** `LoadOrCreateNodeID(dataRoot string) (codec.UUID, error)` reads or creates `<dataRoot>/NODE`, written atomically with temp + rename + fsync.
   - If `<dataRoot>/txn/HOST` exists, it's adopted, so a cross-namespace host keeps its identity.
@@ -163,7 +163,7 @@ Walks that meet a `StubbedEntry` send a **stub record** (`CommitStubDto{Original
 
 **Tests:** `TestNodeIDPersistsAcrossOpen`, `TestNodeIDAdoptsTxnHost`, `TestPeerHandshakeRefusesOwnNodeID`, `TestServerStampsAuthorNodeID`.
 
-### 1.2 Causal timestamps ☐
+### 1.2 Causal timestamps ☑
 
 In `dag.appendCommitLocked`:
 
@@ -183,7 +183,7 @@ This one line gives the HLC property that matters: **every commit's timestamp is
 - `TestLastWriteRespectsCausalityUnderClockSkew`: node A's clock is 10 minutes behind; A reads B's write and overwrites it, and after sync A's value wins on both nodes.
 - `TestIngestRefusesFutureCommit`
 
-### 1.3 Deterministic merge commits ☐ (D4)
+### 1.3 Deterministic merge commits ☑ (D4)
 
 Rewrite `mergeNonConflicting` to take a fully resolved `merged map[UUID]Op` over *all* touched docs, and to derive everything else from the pair of heads:
 
@@ -520,3 +520,24 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 - **D9 is only half closed.** Stubs now travel and children are stored, but adopting across an archived commit still needs a shared ancestor that the stub hides. That's Phase 4's shallow roots. Until then the error is `VersionNotFound` ("no common ancestor") instead of "missing parent".
 - **Unique keys on ingest use `RebuildLenient`** (O(n) per ingest batch, only when the schema declares unique fields). Duplicates are kept in `ReplicationIssues()`, an in-memory bounded list that Phase 3's durable conflict queue replaces.
 - **The stream hub's `AllowAnonymous` is an atomic setter,** because the hub is already accepting connections when `kdb-service` configures it.
+
+### Phase 1 — landed
+
+- **Node identity.** `embed.LoadOrCreateNodeID` writes `<dataRoot>/NODE`, adopting `txn/HOST` if it exists. The coordinator now takes `NODE` as its host id when it has to create one. `KDB_NODE_ID` overrides it.
+  - `server.SetProcessNodeID` is called by `kdb-service` before any namespace opens.
+  - `KdbServerRuntime.NodeID` authors every commit through `authored()`.
+  - The peer host introduces itself by node id and refuses a peer presenting its own id. `/healthz` prints `node_id`.
+- **Causal timestamps** landed in `dag.causalTimestampLocked`, applied in `appendCommitLocked`: every commit Go builds is at least 1µs past its parents. Ingest refuses commits more than `MaxClockSkew` (default 5m) in the future.
+  - **Deviation:** there's no separate HLC state. The parents already carry the "max seen" timestamp a clock would track, so clamping to them is the whole mechanism.
+- **Deterministic merges.** `mergeNonConflicting` builds the merge with:
+  - hash-ordered parents
+  - `DerivedUUID("kdb:merge/1:P0:P1")` as the tx id
+  - `MergeAuthorNodeID` as author
+  - `max(parent timestamps)` as timestamp
+  - the fixed message `kdb:merge/1`
+  - schema hash passed through when both parents agree
+
+  Its operations are the delta from the *canonical* first parent. When that parent is the remote head, they're the local side's final writes, with overlaps taking the resolution.
+  - The Custom resolver now sees Existing = first parent's side and Incoming = second's. Its determinism contract lives on that ordering.
+- **The property test catches the old behaviour.** `TestMeshConvergesDeterministically` (20 seeds by default, `TEST_SEEDS` to widen; run green at 50 under `-race`) fails on every seed when the merge tx id is put back to random.
+- **Deviation: no separate simulation harness package yet.** The in-process `pullInto`/`exchange` helpers in `peersync/determinism_test.go` are that harness's first cut. The package split waits until Phase 3 needs it across packages.

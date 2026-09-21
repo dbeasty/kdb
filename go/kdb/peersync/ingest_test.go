@@ -72,10 +72,21 @@ func TestIngestTreeMismatchLeavesHeadAndStorageUntouched(t *testing.T) {
 // this side's writes and refuses a valid history.
 func TestIngestFastForwardAcrossMergeWithForeignFirstParent(t *testing.T) {
 	ns := "app/ingest-ff-merge"
-	local, remote := forkTwoSides(t, ns)
-	genesis, _ := local.dag.Head()
-	l1 := writeDoc(t, local, ns, genesis, newUUID(t), `{"side":"local"}`)
-	r1 := writeDoc(t, remote, ns, genesis, newUUID(t), `{"side":"remote"}`)
+	// Merge parents are ordered by hash, so write until the remote's commit sorts first: that is
+	// the case where the merge's first parent is the side the local node does not have.
+	var local, remote side
+	var l1, r1 document.Commit
+	for {
+		local, remote = forkTwoSides(t, ns)
+		genesis, _ := local.dag.Head()
+		l1 = writeDoc(t, local, ns, genesis, newUUID(t), `{"side":"local"}`)
+		r1 = writeDoc(t, remote, ns, genesis, newUUID(t), `{"side":"remote"}`)
+		if p0, _ := mergeCommitParents(l1.Hash, r1.Hash); p0 == r1.Hash {
+			break
+		}
+	}
+	setHead(t, remote, r1.Hash)
+	setHead(t, local, l1.Hash)
 
 	// The remote merges local's commit in with its own branch as first parent, then writes on.
 	if err := remote.dag.PutCommit(l1, true); err != nil {

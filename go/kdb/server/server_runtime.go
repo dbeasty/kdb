@@ -113,6 +113,9 @@ type KdbServerRuntime struct {
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.
 	WriteTimeout time.Duration
+	// NodeID is this node's identity (embed.LoadOrCreateNodeID): it authors every commit this
+	// runtime makes and names it to peers. Defaults to ProcessNodeID at construction.
+	NodeID codec.UUID
 	// PeerSyncConflictPolicy selects how the peer-sync listener resolves a same-document
 	// divergence pushed by a peer (see peersync.ResolutionOptions.Policy). Zero value
 	// (ConflictPolicyAppendOnly) keeps the safe default: disjoint-document histories
@@ -245,6 +248,7 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		persister:         persister,
 		writeGate:         newWriteGate(DefaultMaxQueuedWrites),
 		WriteTimeout:      DefaultWriteTimeout,
+		NodeID:            ProcessNodeID(),
 	}
 	// The SQL engine reads through the expiry filter, not the raw adapter - this is the one place
 	// the read side of §9.5 is applied to SQL, since go/kdb/sql knows nothing about expiry.
@@ -647,15 +651,27 @@ func (s *KdbServerRuntime) Replay(namespaceID string, tx document.Transaction, r
 }
 
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
+	tx = s.authored(tx)
 	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
 		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
 	})
 }
 
 func (s *KdbServerRuntime) replayWith(engine transaction.Engine, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
+	tx = s.authored(tx)
 	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
 		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, "")
 	})
+}
+
+// authored stamps this node as tx's author. The commit records where it was made - the thing
+// peers, conflict reports and audits need - rather than whatever a client put there, which was a
+// fresh random UUID per write and so identified nothing.
+func (s *KdbServerRuntime) authored(tx document.Transaction) document.Transaction {
+	if s.NodeID != (codec.UUID{}) {
+		tx.AuthorNodeID = s.NodeID
+	}
+	return tx
 }
 
 type transactionResult = transaction.TransactionResult

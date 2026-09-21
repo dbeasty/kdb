@@ -78,7 +78,7 @@ type peerSyncConnHandler struct {
 func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespaceID string) *peerSyncConnHandler {
 	cfg := peersync.HostConfig{
 		NamespaceID:    namespaceID,
-		NodeID:         "kdb-service-go",
+		NodeID:         runtime.NodeID.String(),
 		ConflictPolicy: runtime.PeerSyncConflictPolicy,
 		Node:           runtime.PeerSyncNode(),
 		ApplyToStorage: true,

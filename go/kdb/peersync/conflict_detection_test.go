@@ -221,8 +221,8 @@ func TestResolveDivergenceMergesNonConflictingDisjointWrites(t *testing.T) {
 	if len(outcome.MergeCommit.ParentHashes) != 2 {
 		t.Fatalf("expected a two-parent merge commit, got %d parents", len(outcome.MergeCommit.ParentHashes))
 	}
-	if outcome.MergeCommit.ParentHashes[0] != localC.Hash || outcome.MergeCommit.ParentHashes[1] != remoteC.Hash {
-		t.Fatalf("expected parents [local, remote], got %v", outcome.MergeCommit.ParentHashes)
+	if !isMergeOf(*outcome.MergeCommit, localC.Hash, remoteC.Hash) {
+		t.Fatalf("expected parents local and remote in hash order, got %v", outcome.MergeCommit.ParentHashes)
 	}
 	head, _ := local.dag.Head()
 	if head != outcome.MergeCommit.Hash {
@@ -422,6 +422,12 @@ func TestResolveDivergenceCustomPolicyResolvesViaResolver(t *testing.T) {
 	remoteC := writeDoc(t, remote, ns, genesis, sharedDoc, `{"v":"remote"}`)
 	mergeInto(t, local, ns, remoteC)
 
+	// Existing/Incoming are in canonical order - the merge's first parent (lower hash) is
+	// Existing - so a deterministic resolver gives both nodes the same answer.
+	wantExisting, wantIncoming := `{"v":"local"}`, `{"v":"remote"}`
+	if p0, _ := mergeCommitParents(localC.Hash, remoteC.Hash); p0 != localC.Hash {
+		wantExisting, wantIncoming = wantIncoming, wantExisting
+	}
 	resolverCalls := 0
 	resolver := customResolverFunc(func(c transaction.DocumentConflict) (*document.Document, error) {
 		resolverCalls++
@@ -431,11 +437,11 @@ func TestResolveDivergenceCustomPolicyResolvesViaResolver(t *testing.T) {
 		if c.OperationType != kdberr.ConcurrentWrite {
 			t.Fatalf("expected CONCURRENT_WRITE, got %v", c.OperationType)
 		}
-		if c.ExistingDoc == nil || c.ExistingDoc.JSON != `{"v":"local"}` {
-			t.Fatalf("expected ExistingDoc to be local's write, got %+v", c.ExistingDoc)
+		if c.ExistingDoc == nil || c.ExistingDoc.JSON != wantExisting {
+			t.Fatalf("expected ExistingDoc to be the first parent's write %s, got %+v", wantExisting, c.ExistingDoc)
 		}
-		if c.IncomingDoc == nil || c.IncomingDoc.JSON != `{"v":"remote"}` {
-			t.Fatalf("expected IncomingDoc to be remote's write, got %+v", c.IncomingDoc)
+		if c.IncomingDoc == nil || c.IncomingDoc.JSON != wantIncoming {
+			t.Fatalf("expected IncomingDoc to be the second parent's write %s, got %+v", wantIncoming, c.IncomingDoc)
 		}
 		return &document.Document{ID: c.DocID, JSON: `{"v":"resolved"}`}, nil
 	})
@@ -563,4 +569,11 @@ func TestResolveDivergenceNoOpWhenLocalAlreadyAhead(t *testing.T) {
 	if head != c1.Hash {
 		t.Fatalf("expected head unchanged at c1, got %s", head.Hex())
 	}
+}
+
+// isMergeOf reports whether c is a two-parent merge of a and b, in the canonical (hash) order
+// every node uses.
+func isMergeOf(c document.Commit, a, b codec.Hash) bool {
+	p0, p1 := mergeCommitParents(a, b)
+	return len(c.ParentHashes) == 2 && c.ParentHashes[0] == p0 && c.ParentHashes[1] == p1
 }

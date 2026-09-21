@@ -289,3 +289,30 @@ func TestTwoServersConvergeWithIndexes(t *testing.T) {
 		}
 	}
 }
+
+// TestServerStampsAuthorNodeID: a commit records the node that made it, not the random UUID a
+// client put in the transaction.
+func TestServerStampsAuthorNodeID(t *testing.T) {
+	rt := newTestRuntime(t)
+	id, _ := codec.RandomUUID()
+	c, err := rt.Upsert(rt.Runtime.DefaultNamespace, id, `{"a":1}`, auth.Principal{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AuthorNodeID != rt.NodeID || rt.NodeID == (codec.UUID{}) {
+		t.Fatalf("commit authored by %s, runtime node is %s", c.AuthorNodeID, rt.NodeID)
+	}
+}
+
+// TestPeerHandshakeRefusesOwnNodeID: a peer presenting this node's own identity is a copied data
+// root, and two nodes recording progress as one would corrupt both.
+func TestPeerHandshakeRefusesOwnNodeID(t *testing.T) {
+	rt := newTestRuntime(t)
+	peer := newPeerFixture(t, rt)
+	client := peersync.NewClient(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(core.DefaultConnectOptions()), peer.dag, peer.storage)
+	_, err := client.Connect(peersync.ClientConfig{NamespaceID: peer.ns, NodeID: rt.NodeID.String(), PeerURI: peer.addr})
+	if err == nil {
+		client.Disconnect()
+		t.Fatal("a peer with this node's own identity was accepted")
+	}
+}

@@ -770,7 +770,7 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	}
 	d.putTreeLocked(newDocumentTree)
 	commit, err := document.BuildCommit(
-		parents, d.NamespaceID, tx.ID, tx.Timestamp, tx.AuthorNodeID,
+		parents, d.NamespaceID, tx.ID, d.causalTimestampLocked(tx.Timestamp, parents), tx.AuthorNodeID,
 		tx.Operations, newDocumentTree.TreeHash, schemaHash, message,
 	)
 	if err != nil {
@@ -793,6 +793,27 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	// this core - AppendCommit, AppendCommitDetached and AppendMergeCommitOnto.
 	d.publishHeadLocked()
 	return commit, nil
+}
+
+// causalTimestampLocked returns ts, raised if needed to one microsecond past the latest of
+// parents' timestamps. Every commit is then strictly later than everything it descends from,
+// whatever the clock of the node that made it said - the one property of a hybrid logical clock
+// that last-write-wins actually needs: a write made after reading another write always counts as
+// later, even on a node whose clock runs behind. The parents carry the "max seen" a separate HLC
+// would have to track, so there is nothing else to keep.
+func (d *InMemoryCommitDag) causalTimestampLocked(ts codec.Timestamp, parents []codec.Hash) codec.Timestamp {
+	micros := ts.EpochMicros()
+	for _, p := range parents {
+		if c, ok := d.commitLocked(p); ok {
+			if pm := c.Timestamp.EpochMicros(); pm >= micros {
+				micros = pm + 1
+			}
+		}
+	}
+	if micros == ts.EpochMicros() {
+		return ts
+	}
+	return codec.TimestampFromEpochMicros(micros)
 }
 
 func (d *InMemoryCommitDag) Squash(

@@ -85,8 +85,8 @@ func TestPullMissingDoesNotBlindlyMoveHeadOnDivergence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected head to be a real commit in the local dag: %v", err)
 	}
-	if len(merged.ParentHashes) != 2 || merged.ParentHashes[0] != localCommit.Hash || merged.ParentHashes[1] != remoteCommit.Hash {
-		t.Fatalf("expected a two-parent auto-merge commit [local, remote], got parents %v", merged.ParentHashes)
+	if !isMergeOf(merged, localCommit.Hash, remoteCommit.Hash) {
+		t.Fatalf("expected a two-parent auto-merge of local and remote in hash order, got parents %v", merged.ParentHashes)
 	}
 	if !localDag.HasCommit(remoteCommit.Hash) {
 		t.Fatal("remote's commit must still be stored even though main didn't move directly onto it")
@@ -369,8 +369,8 @@ func TestHostCommitPushAutoMergesDisjointWritesAndAcks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected head to be a real merge commit: %v", err)
 	}
-	if len(merged.ParentHashes) != 2 || merged.ParentHashes[0] != hostCommit.Hash || merged.ParentHashes[1] != incomingCommit.Hash {
-		t.Fatalf("expected a two-parent auto-merge [host, incoming], got %v", merged.ParentHashes)
+	if !isMergeOf(merged, hostCommit.Hash, incomingCommit.Hash) {
+		t.Fatalf("expected a two-parent auto-merge of host and incoming in hash order, got %v", merged.ParentHashes)
 	}
 }
 
