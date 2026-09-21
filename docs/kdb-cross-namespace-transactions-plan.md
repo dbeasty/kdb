@@ -250,6 +250,12 @@ namespace).
 
 - ~~Full wire routing by namespace for session-bound frames.~~ Done, §8.
 - ~~Cross-namespace SQL transactions.~~ Done, §7.
+- ~~DML and transactions in the embedded `database/sql` driver.~~ Done: the driver
+  (`go/kdb/driver`) implements the same table routing and commits cross-namespace transactions
+  with the same embed group protocol. It cannot import `server` - `kdb/driver` is an entry point
+  of the embeddable source bundle, which excludes the server and wire layers - so it keeps its
+  own per-namespace write lock where the server has a write gate. The two orchestration layers
+  (`driver/commit.go`, `server/namespace_set.go`) are candidates to merge into `embed`.
 - Include `txn/` in `backup.CreateDatabase`; today a database backup is taken with no writer
   running, so every epoch it could see is sealed, but a crash-left `.dead` epoch is not copied.
 - The Kotlin reference has no cross-namespace commit; it reads group parts as ordinary commits.

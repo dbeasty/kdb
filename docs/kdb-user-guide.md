@@ -131,11 +131,31 @@ db, err := sql.Open("kdb", "kdb://file:///var/lib/kdb/myapp/users")
 // or in-memory:  kdb://memory:///demo/users?unique=true&dropOnClose=true
 
 rows, err := db.Query("SELECT kdb_id, _doc FROM users WHERE age > ?", 30)
+res, err := db.Exec("UPDATE users SET age = age + 1 WHERE name = ?", "Ada") // commits immediately
+
+tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSnapshot})
+tx.Exec("UPDATE users SET plan = 'pro' WHERE name = ?", "Ada")
+tx.Exec("INSERT INTO myapp.billing (name, plan) VALUES (?, 'pro')", "Ada") // another namespace
+err = tx.Commit() // both namespaces or neither; errors.Is(err, driver.ErrConflict) on a conflict
 ```
+
+- `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE` (with `UNIQUE`), and `SELECT` with positional `?`
+  parameters. Values come back typed: `int64`, `float64`, `bool`, `string`, and `NULL`.
+- Outside a transaction every write commits immediately. `db.Begin`/`BeginTx`, or `BEGIN` /
+  `COMMIT` / `ROLLBACK` statements on one `sql.Conn`, buffer writes until commit.
+- A table names a namespace the way it does on the server: `myapp.billing` is `myapp/billing`;
+  an unqualified table is `<catalog>/<table>` if that namespace exists, and otherwise the URL's
+  own namespace. A transaction that writes several namespaces commits them atomically.
+- Isolation: read committed (default) or `LevelSnapshot` / `LevelRepeatableRead`, which read
+  every namespace as of `Begin`. Under read committed a transaction's conflict check starts at
+  its first write, so read-modify-write loops belong in a snapshot transaction; there a
+  concurrent change is always a conflict, never a lost update. `LevelSerializable` is refused.
+- All connections to one data root (or one memory group) share it, so pooling works; a file data
+  root is still one process's at a time.
 
 | DSN | Meaning |
 |-----|---------|
-| `kdb://memory:///catalog/namespace` | shared in-process database per URL |
+| `kdb://memory:///catalog/namespace` | shared in-process database; every namespace in the same group (`isolate`) is part of one database |
 | `…?unique=true` | fresh isolated database per connect (tests) |
 | `…?isolate=name` | named shared instance |
 | `…?dropOnClose=true` | dropped when the last connection closes |
