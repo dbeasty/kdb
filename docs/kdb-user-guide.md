@@ -194,6 +194,20 @@ if errors.As(err, &cne) {
 // every participant commit carries.
 ```
 
+The same over SQL, with a transaction whose statements name other namespaces by table
+(`bank.ledger` is namespace `bank/ledger`; an unqualified table that is another namespace in the
+same catalog is routed there too, and any other table means the transaction's own namespace):
+
+```go
+tx, err := c.Begin(ctx, "bank/accounts")        // BeginTx(..., client.TxOptions{Snapshot: true}) for one snapshot of every namespace
+defer tx.Rollback(ctx)
+tx.Exec(ctx, "UPDATE accounts SET balance = 70 WHERE owner = ?", "ada")
+tx.Exec(ctx, "INSERT INTO bank.ledger (owner, debit) VALUES (?, ?)", "ada", 30)
+_, err = tx.Commit(ctx)                          // both namespaces or neither
+```
+
+`BEGIN` / `COMMIT` / `ROLLBACK` sent as SQL text do the same on any wire session.
+
 Each participant is checked (schema, unique keys, preconditions, conflicts) before any is
 written; one refusal refuses the whole transaction. On the server the participating namespaces
 must share one data root (`kdb-service --data-dir`), which is where the transaction's decision is

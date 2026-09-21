@@ -61,6 +61,52 @@ type StmtDropIndex struct {
 
 func (StmtDropIndex) isStatement() {}
 
+// StmtBegin is BEGIN [WORK | TRANSACTION] or START TRANSACTION: open an explicit transaction.
+// Transaction control is not executed by Engine - it is session state, and the session layer
+// (server.KdbSession) acts on it.
+type StmtBegin struct{}
+
+func (StmtBegin) isStatement() {}
+
+// StmtCommit is COMMIT [WORK | TRANSACTION] (or END [WORK | TRANSACTION]).
+type StmtCommit struct{}
+
+func (StmtCommit) isStatement() {}
+
+// StmtRollback is ROLLBACK [WORK | TRANSACTION] (or ABORT).
+type StmtRollback struct{}
+
+func (StmtRollback) isStatement() {}
+
+// IsTransactionControl reports whether stmt is BEGIN, COMMIT or ROLLBACK.
+func IsTransactionControl(stmt Statement) bool {
+	switch stmt.(type) {
+	case StmtBegin, StmtCommit, StmtRollback:
+		return true
+	}
+	return false
+}
+
+// TargetTable returns the table a statement reads or writes, and false for a statement that names
+// none (a table-less SELECT, transaction control).
+func TargetTable(stmt Statement) (TableRef, bool) {
+	switch s := stmt.(type) {
+	case StmtSelect:
+		return s.Query.From, s.Query.HasFrom()
+	case StmtInsert:
+		return s.Insert.Table, true
+	case StmtUpdate:
+		return s.Update.Table, true
+	case StmtDelete:
+		return s.Delete.Table, true
+	case StmtCreateTable:
+		return s.DDL.Table, true
+	case StmtCreateIndex:
+		return TableRef{Name: s.Table}, s.Table != ""
+	}
+	return TableRef{}, false
+}
+
 // UpdateStatement is the body of an UPDATE. Assignment targets are dotted JSON paths (the
 // reserved target "_doc" replaces the whole document); values are evaluated against the
 // pre-update document.

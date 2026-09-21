@@ -73,9 +73,11 @@ func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any
 }
 
 type sqlExecResult struct {
-	Columns     []string
-	Rows        [][]string
-	needsCommit bool
+	Columns      []string
+	Rows         [][]string
+	needsCommit  bool
+	rowsAffected int
+	resolvedHex  string
 }
 
 func (c *Client) execSql(ctx context.Context, ns string, sqlText string, args []any) (sqlExecResult, error) {
@@ -83,6 +85,11 @@ func (c *Client) execSql(ctx context.Context, ns string, sqlText string, args []
 	if err != nil {
 		return sqlExecResult{}, err
 	}
+	return c.execSqlOnSession(ctx, ns, st.sessionID, sqlText, args)
+}
+
+// execSqlOnSession sends one SQL_EXEC on a specific session.
+func (c *Client) execSqlOnSession(ctx context.Context, ns, sessionID string, sqlText string, args []any) (sqlExecResult, error) {
 	var paramsJSON *string
 	if len(args) > 0 {
 		b, err := json.Marshal(args)
@@ -95,7 +102,7 @@ func (c *Client) execSql(ctx context.Context, ns string, sqlText string, args []
 	msg := wire.SqlExecMessage{
 		H:              wire.Header{MessageType: wire.MsgSqlExec, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
 		Namespace:      ns,
-		SessionID:      st.sessionID,
+		SessionID:      sessionID,
 		SQL:            sqlText,
 		ParametersJSON: paramsJSON,
 	}
@@ -110,7 +117,8 @@ func (c *Client) execSql(ctx context.Context, ns string, sqlText string, args []
 	if result.Error != nil {
 		return sqlExecResult{}, classifiedError(*result.Error, result.ErrorCode, result.RetryAfterMs)
 	}
-	return sqlExecResult{Columns: result.Columns, Rows: result.Rows, needsCommit: !result.ReadOnly}, nil
+	return sqlExecResult{Columns: result.Columns, Rows: result.Rows, needsCommit: !result.ReadOnly,
+		rowsAffected: result.RowsAffected, resolvedHex: result.ResolvedCommitHex}, nil
 }
 
 // decodeRows fills dest (a *[]T for a struct type T) from columns/rows, matching each column to
