@@ -395,6 +395,15 @@ func Main() {
 			sec.AuthEngine = srv.AuthEngine
 			sec.WriteTimeout = srv.WriteTimeout
 			sec.Namespaces = nsSet
+			// The same process budget as the primary, not none: otherwise a namespace reached
+			// through the wire would bypass admission and the scan row budget altogether.
+			sec.ShareGovernanceWith(srv)
+			// Its own indexes, so CREATE INDEX, indexed lookups and SEARCH work on every
+			// namespace the listener serves, not only --namespace. Document expiry stays with
+			// --namespace alone: it deletes data, and the flag names one namespace's policy.
+			if _, err := sec.OpenIndexes(stores.Options{}); err != nil {
+				return nil, fmt.Errorf("opening indexes for %s: %w", id, err)
+			}
 			return sec, nil
 		})
 	}

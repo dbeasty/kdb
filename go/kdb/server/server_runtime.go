@@ -183,6 +183,9 @@ type KdbServerRuntime struct {
 	Namespaces *NamespaceSet
 	// soloNamespaceSet backs namespaceSet() for a runtime with no Namespaces configured.
 	soloNamespaceSet
+	// sharedGovernance is set when memGuard and admission belong to another runtime (see
+	// ShareGovernanceWith), which then owns stopping the guard.
+	sharedGovernance bool
 
 	// hookMu guards beforeSqlExec, which a test may set while the listener is already running.
 	hookMu sync.RWMutex
@@ -494,7 +497,9 @@ func (s *KdbServerRuntime) Release() {
 	}
 	// The sweeper commits through this runtime; it has to be gone before storage closes.
 	s.stopSweeper()
-	s.memGuard.Stop()
+	if !s.sharedGovernance {
+		s.memGuard.Stop()
+	}
 	if s.Runtime != nil {
 		s.Runtime.Close()
 	}
@@ -526,6 +531,21 @@ func (s *KdbServerRuntime) SetMemoryBudget(limitBytes uint64, rejectFraction flo
 	s.memGuard.Stop()
 	s.memGuard = NewMemoryGuard(limitBytes, rejectFraction)
 	s.admission = NewAdmission(s.memGuard, reserveBytes, scanRowBudget)
+}
+
+// ShareGovernanceWith makes this runtime admit and shed work through primary's memory guard and
+// grant pool rather than its own. One process has one memory budget: a namespace opened on demand
+// beside the primary must draw on the same one, or its writes and scans would bypass admission
+// entirely, and a guard per namespace would each measure the same process and trip together.
+// The primary owns the guard; releasing this runtime does not stop it.
+func (s *KdbServerRuntime) ShareGovernanceWith(primary *KdbServerRuntime) {
+	if primary == nil || primary.memGuard == nil {
+		return
+	}
+	s.memGuard.Stop()
+	s.memGuard = primary.memGuard
+	s.admission = primary.admission
+	s.sharedGovernance = true
 }
 
 // Admission exposes the grant system, for metrics and tests. Nil when no budget is configured.

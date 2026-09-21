@@ -365,6 +365,19 @@ Without a `NamespaceSet`, every frame still goes to the listener's runtime, as b
   there, and nowhere else.
 - **Session ids are unique process-wide**, not per runtime. One connection's session map now holds
   sessions on several runtimes, and two independent counters would both have issued "sess-1".
+- **Namespaces opened on demand get the primary's setup** (found by the post-merge audit). In
+  kdb-service they were bare runtimes. That was harmless while only the control plane used them,
+  and wrong once wire frames could reach them: `CREATE INDEX`, indexed lookups, `MATCH` and
+  `SEARCH` failed there, and their writes and scans bypassed admission. Each now opens its own
+  indexes and shares the primary's memory guard and grant pool
+  (`KdbServerRuntime.ShareGovernanceWith`), because one process has one budget.
+  **Document expiry stays with `--namespace` only**: it deletes data, and the flag names one
+  namespace's policy.
+- **Index state is per namespace.** It used to live per *catalog*
+  (`<dataRoot>/<catalog>/index`), which only worked while a process served one namespace: two
+  namespaces of one catalog would load and overwrite each other's `catalog.json`. It now lives at
+  `<dataRoot>/ns/<namespace>/index`. An existing catalog-level directory is still used by the
+  namespace its `catalog.json` names, so deployments keep their indexes without a migration.
 - **Behaviour change, deliberate.** In kdb-service a client that opened a session on a namespace
   other than `--namespace` used to be silently served the `--namespace` data. It now gets the
   namespace it named, created on first write.
