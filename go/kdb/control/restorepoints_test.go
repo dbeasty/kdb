@@ -225,3 +225,23 @@ func TestRestoringAnUnknownPointIsNotFound(t *testing.T) {
 		t.Errorf("status = %d, want 404", res.StatusCode)
 	}
 }
+
+// The order must follow the instants, not their text. RFC3339Nano drops trailing zeros, so 340ms
+// renders as "…49.34Z" and sorts after "…49.341Z" as a string - the flake CI kept hitting when
+// three captures landed a few milliseconds apart.
+func TestRestorePointOrderFollowsTheInstantNotItsText(t *testing.T) {
+	base := int64(1_790_000_049_000)
+	mk := func(name string, ms int64) restorePoint {
+		return restorePoint{Name: name, CreatedAt: millisToRFC3339(base + ms), createdMillis: base + ms}
+	}
+	points := []restorePoint{mk("older", 340), mk("newer", 341), mk("oldest", 300)}
+	if points[0].CreatedAt < points[1].CreatedAt {
+		t.Fatalf("fixture no longer exercises the bug: %q sorts before %q as text", points[0].CreatedAt, points[1].CreatedAt)
+	}
+	sortRestorePoints(points)
+	for i, want := range []string{"newer", "older", "oldest"} {
+		if points[i].Name != want {
+			t.Errorf("position %d: %s, want %s", i, points[i].Name, want)
+		}
+	}
+}

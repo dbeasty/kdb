@@ -83,6 +83,11 @@ type restorePoint struct {
 	// these by hand, in several calls, and the order is a guess.
 	HandMade bool                    `json:"handMade,omitempty"`
 	In       []restorePointNamespace `json:"in"`
+
+	// createdMillis is CreatedAt as an instant, which is what the list is sorted by. Never the
+	// string: RFC3339Nano drops trailing zeros, so "…49.34Z" (340ms) sorts after "…49.341Z"
+	// (341ms) as text, and captures a few milliseconds apart came back in the wrong order.
+	createdMillis int64
 }
 
 // handMadeSkew is how far apart member tags may be created and still be taken
@@ -237,6 +242,7 @@ func (s *Server) collectRestorePoints(only string) ([]restorePoint, []string, er
 		// The point is dated by its oldest member, so a capture is dated when
 		// it began rather than when it happened to finish.
 		p.CreatedAt = millisToRFC3339(oldest.EpochMillis)
+		p.createdMillis = oldest.EpochMillis
 		if newest.EpochMillis-oldest.EpochMillis > handMadeSkew.Milliseconds() {
 			p.HandMade = true
 		}
@@ -255,29 +261,7 @@ func (s *Server) collectRestorePoints(only string) ([]restorePoint, []string, er
 	// plainly can. A point nearer its namespace's head is the newer one, so
 	// the shallowest member is the tiebreak — the one piece of ordering
 	// information that does not depend on a clock at all.
-	minDepth := func(p restorePoint) int {
-		best := -1
-		for _, m := range p.In {
-			if m.Depth < 0 {
-				continue
-			}
-			if best < 0 || m.Depth < best {
-				best = m.Depth
-			}
-		}
-		return best
-	}
-	sort.Slice(points, func(i, j int) bool {
-		a, b := points[i], points[j]
-		if a.CreatedAt != b.CreatedAt {
-			return a.CreatedAt > b.CreatedAt
-		}
-		da, db := minDepth(a), minDepth(b)
-		if da != db && da >= 0 && db >= 0 {
-			return da < db
-		}
-		return a.Name < b.Name
-	})
+	sortRestorePoints(points)
 	return points, all, nil
 }
 
@@ -574,5 +558,33 @@ func (s *Server) handleRestoreToPoint(w http.ResponseWriter, r *http.Request, _ 
 		"restored":  done,
 		"note": "every namespace moved. Each one gained a new commit, so this is undoable the same " +
 			"way it was done: restore " + undo.Name + ".",
+	})
+}
+
+// sortRestorePoints orders points newest first: by capture instant, then by depth, then by name.
+// See the comment at its call site for why each key is there.
+func sortRestorePoints(points []restorePoint) {
+	minDepth := func(p restorePoint) int {
+		best := -1
+		for _, m := range p.In {
+			if m.Depth < 0 {
+				continue
+			}
+			if best < 0 || m.Depth < best {
+				best = m.Depth
+			}
+		}
+		return best
+	}
+	sort.Slice(points, func(i, j int) bool {
+		a, b := points[i], points[j]
+		if a.createdMillis != b.createdMillis {
+			return a.createdMillis > b.createdMillis
+		}
+		da, db := minDepth(a), minDepth(b)
+		if da != db && da >= 0 && db >= 0 {
+			return da < db
+		}
+		return a.Name < b.Name
 	})
 }
