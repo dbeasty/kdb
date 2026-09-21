@@ -355,3 +355,23 @@ func (s *KdbServerRuntime) systemCommit(ops []document.Op, message string) (docu
 		return s.UpsertEngine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, message)
 	})
 }
+
+// Placement lists every namespace this process knows a single-home assignment for.
+func (m *MetaStore) Placement() (map[string]Home, error) {
+	if m == nil {
+		return nil, nil
+	}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	docs, err := m.docs()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]Home{}
+	for _, d := range docs {
+		if d.Kind == "home" && d.Home != nil && d.Home.Node != "" {
+			out[d.Namespace] = *d.Home
+		}
+	}
+	return out, nil
+}

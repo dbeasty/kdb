@@ -469,7 +469,7 @@ This is a separate design review before any code.
 
 ---
 
-## Phase 10 — Placement and cross-node transactions
+## Phase 10 — Placement and cross-node transactions ◐
 
 - **10.1** Placement documents in `_kdb/meta` (`placement:<ns>` → `{replicas[], home}`), and a `WhereIs(ns)` API.
 - **10.2** Client SDK: on `UnavailableError{home=X}` or an explicit redirect, it reconnects to X and caches the placement.
@@ -716,3 +716,11 @@ Commit format v2 is not introduced. The write need Phase 8 might have served bel
 - **Concurrent assignments on two nodes** are a same-document conflict in `_kdb/meta`, surfaced for an operator.
 
 **Tests:** `server/home_test.go`. Writes are refused away from the home and carry the home's address; the home's writes are stamped and replicate. A handover makes the former home's in-flight write unadoptable, and makes the former home refuse writes once it learns.
+
+### Phase 10 — landed (10.1–10.3, and 10.4's refusal; cross-node 2PC not built)
+
+- **10.1 Placement.** There's no separate placement document: a namespace's home is its placement, since every node that holds it serves reads. `MetaStore.Placement` and `GET /v1/placement` list the assignments.
+- **10.2 Client redirects.** The Go SDK's `client.NotHomeError` carries the home's address, parsed from the `NOT_HOME` refusal. `client.Router` retries a refused write once at the home and remembers the home per namespace. Reads stay on the first connection. Test: `client/router_test.go`.
+- **10.3 Rebalancing** is a documented runbook in the user guide ("Moving a namespace to another node"), built from pieces that already exist: `--peer` (optionally with `bootstrap=snapshot`), the lag signals, `PUT /v1/ns/{ns}/home`, and removing the old peer.
+- **10.4 Cross-node transactions.** A cross-namespace transaction touching a namespace homed elsewhere is refused (`TestCrossNamespaceCommitRefusedAcrossHomes`). That isn't new code: `admitWrite`, which `CommitAcross` runs per part, refuses any part not homed here.
+  - **Not built:** 2PC across nodes. It needs a coordinator reachable from every home and a participant protocol over the wire. It is also the one piece that would make the system depend on several nodes being up to commit anything, and nothing so far has needed that. Until a workload does, a transaction that has to span homes should move those namespaces to one home first.

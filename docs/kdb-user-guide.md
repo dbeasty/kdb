@@ -1230,6 +1230,43 @@ namespace `_kdb/meta`. It replicates alongside every peer's namespaces unless a 
 and each node builds the indexes locally. Under `--rbac`, a peer therefore also needs `sync` on
 `_kdb/meta`.
 
+### Single-home namespaces (opt-in strong consistency)
+
+By default every node that holds a namespace accepts its writes. In that mode a unique constraint
+or a compare-and-set only holds on the node that checked it, because two nodes can each accept
+`email=x` while apart. Where that matters, give the namespace a **home**: one node that alone
+accepts its writes.
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -d '{"node":"<home node id>","addr":"tcp://home:9090"}' \
+  http://node:7070/v1/ns/billing%2Finvoices/home
+```
+
+**Where writes go.** Every other node still holds and serves the namespace, and replicates the
+home's writes. A write sent to one of them is refused with `NOT_HOME`, and the refusal names the
+home's address. `client.NewRouter` in the Go SDK follows that redirect by itself, and afterwards
+sends the namespace's writes straight to the home.
+
+**Cross-namespace transactions.** A cross-namespace transaction that touches a namespace homed
+elsewhere is refused: atomicity needs one node to decide every part.
+
+**Moving the home.** Moving the home is the same `PUT` naming another node. Every assignment
+raises a **fence**, and the home stamps its commits with it. A write the old home makes before it
+hears it has been replaced is refused wherever it arrives: it's queued as a conflict, not applied.
+`GET /v1/placement` lists every assigned home. There is no automatic failover; moving a home is an
+operator's decision.
+
+### Moving a namespace to another node
+
+1. **Add the new node** with `--peer name=…,addr=<a node holding it>,namespaces=<ns>`. Add
+   `bootstrap=snapshot` to start it from the current state rather than the whole history.
+2. **Wait until it's caught up.** In `GET /v1/peers` on the new node, the namespace's `remoteMain`
+   should equal the source's head, and `kdb_replication_last_success_seconds` should be recent.
+3. **If the namespace is single-home,** `PUT /v1/ns/{ns}/home` naming the new node.
+4. **Remove the old node's `--peer` entry** for the namespace, or stop the old node. Its data can
+   be deleted once nothing lists it as a peer.
+
 ### Observing it
 
 - **Metrics.** `/metrics` exposes:
@@ -1237,8 +1274,8 @@ and each node builds the indexes locally. Under `--rbac`, a peer therefore also 
   - `kdb_replication_consecutive_failures{peer}`
   - `kdb_replication_commits_total{peer,namespace,direction}`
   - `kdb_conflicts_open{namespace,kind}`
-- **Control plane.** `GET /v1/peers` shows each peer's progress, and `POST /v1/peers/{name}/sync`
-  syncs now.
+- **Control plane.** `GET /v1/peers` shows each peer's progress, `POST /v1/peers/{name}/sync` syncs
+  now, and `GET /v1/placement` lists single-home assignments.
 - **One-shot sync.** `kdb sync <namespace> <addr>` runs a single sync from the CLI.
 
 Peer connections are authenticated and authorized under `--rbac` (`sync` permission per

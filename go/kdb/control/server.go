@@ -303,6 +303,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("DELETE /v1/ns/{ns}/conflicts/{id}", s.nsWrite(s.handleDismissConflict))
 	mux.Handle("GET /v1/ns/{ns}/home", s.nsRead(s.handleHome))
 	mux.Handle("PUT /v1/ns/{ns}/home", s.nsWrite(s.handleAssignHome))
+	mux.Handle("GET /v1/placement", s.adminRead(s.handlePlacement))
 	mux.Handle("GET /v1/peers", s.adminRead(s.handlePeers))
 	mux.Handle("POST /v1/peers/{name}/sync", s.adminRead(s.handlePeerSync))
 	mux.Handle("GET /v1/ns/{ns}/schema", s.nsRead(s.handleSchema))

@@ -124,3 +124,19 @@ func (s *Server) handleAssignHome(w http.ResponseWriter, r *http.Request, _ auth
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "home": h})
 }
+
+// GET /v1/placement - every namespace with a single-home assignment, and where its home is. A
+// namespace absent from the list is multi-leader: any node holding it accepts its writes.
+func (s *Server) handlePlacement(w http.ResponseWriter, _ *http.Request, _ auth.Principal) {
+	rt, ok := s.namespaces().Runtime(s.defaultNamespace())
+	if !ok || rt.Meta == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"homes": map[string]any{}})
+		return
+	}
+	homes, err := rt.Meta.Placement()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"homes": homes})
+}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
@@ -117,4 +118,28 @@ func mustHeadOf(t *testing.T, rt *KdbServerRuntime) codec.Hash {
 		t.Fatal(err)
 	}
 	return h
+}
+
+// TestCrossNamespaceCommitRefusedAcrossHomes: a cross-namespace transaction can be atomic only
+// where one node decides every part, so a part in a namespace homed elsewhere refuses the whole
+// group.
+func TestCrossNamespaceCommitRefusedAcrossHomes(t *testing.T) {
+	rts := newNamespaceSetRuntimes(t, "a/local", "a/remote")
+	other := mustRandomUUID(t)
+	rts["a/remote"].SetHome(&Home{Node: other.String(), Addr: "tcp://elsewhere", Fence: 1})
+	set := rts["a/local"].Namespaces
+	var parts []NamespaceTransaction
+	for _, ns := range []string{"a/local", "a/remote"} {
+		head, _ := rts[ns].dag.Head()
+		id := mustRandomUUID(t)
+		parts = append(parts, NamespaceTransaction{Namespace: ns, Tx: document.Transaction{
+			ID: mustRandomUUID(t), BaseVersion: head, Timestamp: codec.TimestampNow(),
+			Operations: []document.Op{document.WriteOp{DocID: id, Patch: `{"x":1}`}},
+		}})
+	}
+	_, err := set.CommitAcross(parts, auth.Principal{})
+	var nh *NotHomeError
+	if !errors.As(err, &nh) {
+		t.Fatalf("expected the group refused with NotHomeError, got %v", err)
+	}
 }

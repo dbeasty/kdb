@@ -97,6 +97,8 @@ func classifiedError(errMsg string, code *wire.ErrorCode, retryAfterMs *int) err
 		return &DeadlineExceededError{Message: errMsg}
 	case wire.ErrorCodeUnsupported:
 		return &UnsupportedError{Message: errMsg}
+	case wire.ErrorCodeNotHome:
+		return &NotHomeError{Message: errMsg, Home: homeAddr(errMsg)}
 	default:
 		return fmt.Errorf("kdb: %s", errMsg)
 	}
