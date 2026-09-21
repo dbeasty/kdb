@@ -20,14 +20,16 @@ var (
 
 func init() {
 	sql.Register("kdb", &Driver{})
-	clearMemoryHook = func() { sharedMemory.clearAll() }
+	clearMemoryHook = func() { databases.clearAll() }
 }
 
 // Driver implements database/sql/driver for kdb:// URLs.
 type Driver struct{}
 
 func (d *Driver) Open(name string) (driver.Conn, error) {
-	parsed, err := ParseDSN(name)
+	// Accept the full URL as well as the bare DSN: sql.Open("kdb", "kdb://memory:///...") is what
+	// the documentation shows and what a caller naturally writes.
+	parsed, err := ParseDSN(strings.TrimPrefix(name, URLPrefix))
 	if err != nil {
 		return nil, err
 	}
