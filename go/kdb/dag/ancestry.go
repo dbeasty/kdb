@@ -207,6 +207,9 @@ func (d *InMemoryCommitDag) expandParentsLocked(hash codec.Hash) []codec.Hash {
 	if _, ok := d.stubs[hash]; ok {
 		return nil
 	}
+	if _, ok := d.shallow[hash]; ok {
+		return nil
+	}
 	c, ok := d.commitLocked(hash)
 	if !ok {
 		return nil

@@ -343,13 +343,13 @@ In `kdb-cli`, the Go CLI entry points, as far as its structure allows:
 
 ## Phase 4 — Snapshot bootstrap, shallow roots, peer-aware retention
 
-### 4.1 Shallow roots in the DAG ☐
+### 4.1 Shallow roots in the DAG ☑
 
 - `InMemoryCommitDag.AddShallow(hash)`, backed by a `shallow map[Hash]struct{}` that's persisted in the checkpoint as an additive field.
 - `putCommitLocked(requireParents)` accepts a parent that's shallow.
 - `Walk`, `CommonAncestor` and `IsAncestor` treat a shallow commit's parents as absent, the same way they treat stubs today. A shallow commit is inserted through `PutShallowCommit(c)`, which verifies the hash but not the parents.
 
-### 4.2 Snapshot messages (0x0A / 0x0B, finally implemented) ☐
+### 4.2 Snapshot messages (0x0A / 0x0B, finally implemented) ☑
 
 ```
 SnapshotRequest  {Namespace, At (ref or hex, default main), Cursor?}
@@ -364,7 +364,7 @@ SnapshotResponse {Namespace, Commit, TreeEntries[(docId, contentHash)] (first pa
 - the remote's `HistoryFloorHex` isn't an ancestor of anything local, or
 - ingest reports a missing parent below the floor.
 
-### 4.3 Peer-aware truncation floor ☐
+### 4.3 Peer-aware truncation floor ☑
 
 - **`embed` retention** takes an optional `PeerFloor func(ns) (codec.Hash, bool)`. The replicator provides it as the oldest `lastPushedRefs` among peers whose `lastSuccess` falls within `--peer-retention-grace` (default 7d).
 - **`checkpointAndTruncate`** takes the older of the retention floor and the peer floor.
@@ -600,3 +600,43 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 - **The admin UI Conflicts tab.** The API it would sit on is complete.
 - **0.1c, incremental unique-key maintenance on ingest.** It's still a lenient full rebuild per ingest batch, and only when the schema declares unique fields.
 - **Persistent held-open sessions.** A remote commit reaches this node on the next interval tick, not immediately. Push is immediate because it's commit-triggered. The interval is the knob.
+
+### Phase 4 — landed
+
+**Shallow roots.** `dag.PutShallowCommit`/`MarkShallow`/`IsShallow`/`ShallowRoots`/`Horizon`/`CommitCount`. Traversals stop at a shallow root as they do at a stub. Its operations are never evicted, because no log holds them. `RefsOf` advertises the horizon, meaning shallow roots plus commits whose parent was truncated away, as `Shallow`.
+
+**Snapshot transfer.**
+- **Frames:** new Go-only SNAPSHOT_FETCH/SNAPSHOT_PAGE (0x2E/0x2F). The old 0x0A/0x0B are left alone: they're shared with Kotlin, and their opaque payload would have hidden a Go-only format.
+- **Host:** pages the tree at a commit in id order, by bytes, through a new optional `storage.TreeWalker`, implemented by the mem adapter, `ServerEngine` and `MultiplexAdapter`.
+- **Receiver:** `peersync.InstallSnapshot` requires an empty namespace. It verifies the commit's own hash, installs page by page (committing a tree each page, so memory isn't the whole namespace), and requires the final tree to be the declared one, undoing everything otherwise. It then admits the commit as a shallow root.
+- **When `SyncV2` uses it:** automatically when the local namespace is empty and the peer advertises a horizon, or on request (`PreferSnapshot`; the peer config `bootstrap=snapshot`).
+
+**Durability on a file runtime** (`embed/snapshot_install.go`). None of this changes an on-disk format.
+- `CanInstallSnapshot` refuses up front if checkpoints are disabled or the namespace has any commit.
+- `PersistSnapshot` does three things, in order:
+  1. `ServerEngine.MaterializeLiveBodies` writes the bodies to the blob store (history=full included).
+  2. It writes a checkpoint claiming `through=-1`, carrying the shallow root's payload.
+  3. It adds `shallowRoots` to `meta.json`.
+- Open reads the marker. It points cold reads at the blob store, re-marks the roots, and refuses with `SnapshotCheckpointMissingError` rather than silently replaying an empty namespace.
+- `saveCheckpoint` always carries shallow roots' payloads, so their operations survive after they stop being a branch head.
+
+**Two fixes found along the way.** Both mattered before this phase, and more after it:
+- `OSByteStore.WriteSnapshot` was a plain overwrite. It's now temp file, fsync, rename, directory fsync. The checkpoint had been a disposable cache; for a bootstrapped namespace it's the only record.
+- `meta.json` writes are atomic, for the same reason.
+
+**Peer-aware retention.** `EmbeddedKdbRuntime.SetPeerRetentionFloor` widens the history=none truncation window to keep everything newer than the floor. That makes it a floor on retention, never a ceiling. The floor is the older of two sources:
+- `Replicator.PeerFloor`: for peers this node pushes to, the last successful sync of that namespace within `--peer-retention-grace` (default 7 days).
+- `KdbServerRuntime.InboundPeerFloor`: for peers that fetch from this node, the last time each one finished a fetch. The host records it through `V2HostConfig.OnCaughtUp`, persisted under `replication/inbound/`.
+
+**Tests:**
+- `peersync/snapshot_test.go`: bootstrap; tampered body refused and undone; automatic snapshot from a shallow peer.
+- `server/snapshot_restart_test.go`: clean restart; crash replaying the log tail onto the bootstrap checkpoint; a lost checkpoint refused; a namespace with history refused.
+- `embed/peer_floor_test.go`, plus the floor-source tests.
+- e2e `test_new_node_bootstraps_from_a_snapshot_and_survives_kill9`.
+
+**Deviations and gaps:**
+- **CompactionNotice (0x08) is not sent.** The floor travels as the advertised horizon instead, which a peer reads on every hello.
+- **Squash isn't guarded against peers.** `dag.Squash` is only reached from the compaction evaluator, which the Go engine doesn't run. The guard belongs with whoever wires that evaluator up.
+- **In a running process, truncation can delete the segments behind commits the DAG still holds in memory.** Until a restart makes them a horizon, fetching them fails with "operations unavailable" instead of being advertised. The peer floor makes this unlikely for known peers.
+- **Replicated side branches and tags still survive only a clean restart,** as recorded in Phase 2.
+- **Historical reads below a shallow root under the replay history strategy fail.** The objects strategy, which is the default, is unaffected.

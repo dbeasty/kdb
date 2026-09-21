@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/peersync"
@@ -110,6 +111,11 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 					return code, code != wire.ErrorCodeInternal
 				},
 				CreateOnPush: h.runtime.PeerCreateOnPush,
+				OnCaughtUp: func(ns, peer string) {
+					if rt, ok := h.runtime.namespaceSet().Get(ns); ok {
+						rt.NoteInboundPeer(peer, time.Now())
+					}
+				},
 			}, h.runtime.AuthEngine, auth.EmptyContext)
 		}
 	}

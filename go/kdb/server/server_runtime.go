@@ -180,6 +180,9 @@ type KdbServerRuntime struct {
 	// duplicates and unverifiable cross-namespace parts. Durable under a file-backed runtime's
 	// data root, in memory otherwise.
 	Conflicts *peersync.ConflictQueue
+	// inboundState records peers that fetch from this namespace - see inbound_peers.go.
+	inboundOnce  sync.Once
+	inboundState *inboundPeers
 
 	// groupPublishing counts cross-namespace transactions currently publishing a commit into this
 	// namespace, and groupVersion counts every one that has. NamespaceSet.Snapshot reads both on

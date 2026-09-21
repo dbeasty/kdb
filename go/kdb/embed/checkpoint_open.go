@@ -31,6 +31,7 @@ func restoreNamespace(
 	namespaceID string,
 	disabled bool,
 	coord *TxnCoordinator,
+	shallowRoots []string,
 ) (replayedInFull bool, err error) {
 	eng, _ := store.(*engine.ServerEngine)
 	if eng != nil {
@@ -51,6 +52,11 @@ func restoreNamespace(
 	// automatic recovery from that, so it is an error.
 	replayIsComplete := lowestSegmentSequence(r) <= 0
 	mustReplay := func() (bool, error) {
+		if len(shallowRoots) > 0 {
+			// Bootstrapped from a peer's snapshot: the log starts after state it never held, so a
+			// replay would open an empty (or unreplayable) namespace rather than this one.
+			return true, &SnapshotCheckpointMissingError{NamespaceID: namespaceID, Roots: shallowRoots}
+		}
 		if !replayIsComplete {
 			return true, &TruncatedLogError{
 				NamespaceID: namespaceID,
@@ -207,6 +213,15 @@ func saveCheckpoint(
 	}
 	state := d.CheckpointSnapshotRetaining(commitRetentionFilter(eng))
 	var headPayloads [][]byte
+	// Shallow roots' operations, whether or not a branch still names them: they arrived with a
+	// snapshot, so no segment holds them to load back.
+	for _, h := range d.ShallowRoots() {
+		if c, err := d.GetCommitOrThrow(h); err == nil {
+			if payload, err := c.ToPayloadBytes(); err == nil {
+				headPayloads = append(headPayloads, payload)
+			}
+		}
+	}
 	for _, b := range state.Branches {
 		c, err := d.GetCommitOrThrow(b.HeadHash)
 		if err != nil {
@@ -474,4 +489,19 @@ func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID 
 			namespaceID, c.Merged, c.Removed, c.Dropped)
 	}
 	return res
+}
+
+// SnapshotCheckpointMissingError refuses to open a namespace bootstrapped from a peer's snapshot
+// whose checkpoint is gone or unreadable. Its documents and root commit exist only there - the
+// delta log begins after them - so replaying the log would open a namespace missing all of it.
+// Restore the checkpoint from a backup, or delete the namespace and bootstrap it again.
+type SnapshotCheckpointMissingError struct {
+	NamespaceID string
+	Roots       []string
+}
+
+func (e *SnapshotCheckpointMissingError) Error() string {
+	return fmt.Sprintf("kdb: namespace %s was bootstrapped from a snapshot (root %v) and its checkpoint, the only "+
+		"record of that state, is missing or unusable; refusing to open it by replaying a log that begins after it",
+		e.NamespaceID, e.Roots)
 }

@@ -110,6 +110,21 @@ func (e *ServerEngine) PrepareForTruncation() error {
 	if e.memTable == nil || e.config.IOShim == nil {
 		return nil
 	}
+	return e.MaterializeLiveBodies()
+}
+
+// MaterializeLiveBodies is PrepareForTruncation for any history mode: every version the live tree
+// names is written to the blob store and flushed. A namespace bootstrapped from a peer's
+// snapshot needs it under history=full too - its documents arrived with no delta log behind
+// them, so the blob store is the only place they can be durable.
+//
+// After it, cold reads consult the blob store in every mode (see loadCold), since bodies that
+// exist nowhere else are now there.
+func (e *ServerEngine) MaterializeLiveBodies() error {
+	if e.memTable == nil || e.config.IOShim == nil {
+		return fmt.Errorf("kdb: namespace %s has no durable blob store to materialize bodies into", e.namespaceID)
+	}
+	defer e.bodiesExternal.Store(true)
 	tree := e.LiveTree()
 	var missing []treeEntryRef
 	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
@@ -151,6 +166,11 @@ func (e *ServerEngine) PrepareForTruncation() error {
 	}
 	return nil
 }
+
+// SetBodiesExternal records that some of this namespace's document bodies live only in the blob
+// store - set at open for a namespace bootstrapped from a snapshot - so cold reads look there
+// whatever the history mode.
+func (e *ServerEngine) SetBodiesExternal(on bool) { e.bodiesExternal.Store(on) }
 
 // treeEntryRef pairs a document with the version the live tree names for
 // it, which is the unit PrepareForTruncation has to make durable.

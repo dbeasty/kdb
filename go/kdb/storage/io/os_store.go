@@ -331,12 +331,47 @@ func (s *OSByteStore) ReadSnapshot(key string) ([]byte, error) {
 	return b, nil
 }
 
+// WriteSnapshot replaces key's snapshot atomically: written to a temporary file, synced, renamed
+// over the old one, and the directory synced. A checkpoint used to be a plain overwrite - fine
+// while it was only ever a cache the log could rebuild, and not once it can be the only record
+// of state (a namespace bootstrapped from a peer's snapshot), where a torn write would lose it.
 func (s *OSByteStore) WriteSnapshot(key string, data []byte) error {
 	p := s.snapPathFor(key)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o644)
+	tmp, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 func (s *OSByteStore) DeleteSnapshot(key string) error {

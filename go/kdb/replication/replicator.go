@@ -258,6 +258,7 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
 		Namespaces:        l.peer.Namespaces, Mode: l.peer.Mode, Local: l.r.cfg.Local,
 		CreateLocal: l.peer.CreateLocal, ExtraHaves: extra, Timeout: l.r.cfg.Timeout,
+		PreferSnapshot: l.peer.PreferSnapshot,
 	})
 	now := time.Now().UTC()
 	st.LastAttempt = now
@@ -336,4 +337,36 @@ func (r *Replicator) WriteMetrics(b *strings.Builder) {
 			fmt.Fprintf(b, "kdb_replication_commits_total{peer=%q,namespace=%q,direction=\"push\"} %d\n", p.Name, ns, st.Pushed)
 		}
 	}
+}
+
+// PeerFloor is the oldest moment every active peer this node pushes ns to is known to have
+// caught up to: for each peer that syncs ns in a mode that pushes, and has succeeded within
+// grace, the time of its last successful sync of ns. Retention must keep everything newer, or a
+// peer that is only behind would find the commits it needs deleted. A peer silent for longer than
+// grace stops holding retention back - otherwise one abandoned laptop pins history forever - and
+// catches up by snapshot if it ever returns.
+func (r *Replicator) PeerFloor(ns string, grace time.Duration, now time.Time) (time.Time, bool) {
+	var floor time.Time
+	found := false
+	for _, name := range r.order {
+		l := r.loops[name]
+		if l.peer.Mode&peersync.SyncPush == 0 {
+			continue
+		}
+		if len(peersync.SelectNamespaces(l.peer.Namespaces, []string{ns})) == 0 {
+			continue
+		}
+		st, err := r.cfg.State.Load(name)
+		if err != nil || st.LastSuccess.IsZero() || now.Sub(st.LastSuccess) > grace {
+			continue
+		}
+		synced := st.Namespaces[ns].LastSync
+		if synced.IsZero() {
+			continue
+		}
+		if !found || synced.Before(floor) {
+			floor, found = synced, true
+		}
+	}
+	return floor, found
 }

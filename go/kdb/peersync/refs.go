@@ -23,6 +23,10 @@ func RefsOf(ns string, d *dag.InMemoryCommitDag) wire.NamespaceRefs {
 	for _, t := range d.ListTags() {
 		refs.Tags[t.Name] = t.CommitHash.Hex()
 	}
+	for _, h := range d.Horizon() {
+		refs.Shallow = append(refs.Shallow, h.Hex())
+	}
+	sort.Strings(refs.Shallow)
 	return refs
 }
 

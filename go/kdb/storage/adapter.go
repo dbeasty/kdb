@@ -42,6 +42,14 @@ type Adapter interface {
 	IngestDeltaSegment(segment DeltaSegmentRef) error
 }
 
+// TreeWalker is implemented by adapters that can stream a tree's (doc id, content hash) entries
+// without loading document bodies - what a snapshot needs to page through a namespace in id
+// order without reading every body for every page. treeHash is a document tree hash, as for
+// Adapter's atCommit. A tree the adapter cannot resolve is an error, not an empty walk.
+type TreeWalker interface {
+	WalkTree(namespaceID string, treeHash codec.Hash, visit func(docID codec.UUID, contentHash codec.Hash) bool) error
+}
+
 // TreePinner is implemented by adapters that cache historical document trees under a budget,
 // and so can be asked to keep one resolvable for as long as a caller still needs it.
 //

@@ -34,6 +34,9 @@ type PeerConfig struct {
 	User, Password *string
 	// CreateLocal lets a pull create a namespace this node does not hold yet.
 	CreateLocal bool
+	// PreferSnapshot bootstraps an empty local namespace from a snapshot of the peer's main
+	// instead of fetching its whole history (bootstrap=snapshot).
+	PreferSnapshot bool
 }
 
 // DefaultInterval is the anti-entropy tick when a peer names none.
@@ -41,7 +44,7 @@ const DefaultInterval = 30 * time.Second
 
 // ParsePeer reads one peer from its flag form:
 //
-//	name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both,interval=30s,user=u,password-env=VAR,create=true
+//	name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both,interval=30s,user=u,password-env=VAR,create=true,bootstrap=snapshot
 //
 // Namespaces are separated by '|' because ',' separates fields. mode is pull, push or both
 // (default both). The password is taken from an environment variable, never from the flag, so it
@@ -96,6 +99,15 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			p.Password = &v
 		case "create":
 			p.CreateLocal = value == "true"
+		case "bootstrap":
+			switch value {
+			case "snapshot":
+				p.PreferSnapshot = true
+			case "history":
+				p.PreferSnapshot = false
+			default:
+				return PeerConfig{}, fmt.Errorf("peer %q: bootstrap %q is not snapshot or history", spec, value)
+			}
 		default:
 			return PeerConfig{}, fmt.Errorf("peer %q: unknown key %q", spec, key)
 		}

@@ -67,3 +67,35 @@ def test_replicator_resumes_after_a_crash(pair):
     wait_for("B's write on A after restart", lambda: get(a, DOC_B) is not None)
     put(a, DOC_A2, {"id": DOC_A2, "after": "restart"})
     wait_for("A's post-restart write on B", lambda: get(b, DOC_A2) is not None)
+
+
+def test_new_node_bootstraps_from_a_snapshot_and_survives_kill9():
+    """A node joining with bootstrap=snapshot installs the peer's current state without its
+    history, and that state survives an unclean restart - it is held by a checkpoint and the blob
+    store, not by any delta log this node ever wrote."""
+    source = KdbServer().start()
+    joiner = None
+    try:
+        docs = [f"{i:032x}" for i in range(200, 230)]
+        for i, doc in enumerate(docs):
+            put(source, doc, {"id": doc, "n": i})
+        joiner = KdbServer(extra_args=[
+            "--peer", f"name=src,addr={source.peer_addr},mode=pull,interval=300ms,bootstrap=snapshot"]).start()
+        wait_for("the snapshot to arrive", lambda: (get(joiner, docs[-1]) or {}).get("n") == len(docs) - 1)
+
+        joiner.kill9()
+        joiner.restart()
+        for i, doc in enumerate(docs):
+            assert (get(joiner, doc) or {}).get("n") == i, f"doc {doc} lost across kill -9:\n{joiner.logs()}"
+
+        # And it keeps following the source commit by commit.
+        put(source, DOC_B, {"id": DOC_B, "after": "bootstrap"})
+        wait_for("a later write to follow", lambda: get(joiner, DOC_B) is not None)
+    finally:
+        for srv in (joiner, source):
+            if srv is None:
+                continue
+            try:
+                srv.stop()
+            finally:
+                srv.cleanup()

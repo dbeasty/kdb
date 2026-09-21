@@ -141,3 +141,33 @@ func TestPeerStatePersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("reloaded %+v, %v", got, err)
 	}
 }
+
+// TestPeerFloorOnlyCountsActivePushPeers: the retention floor for a namespace is the oldest last
+// sync among peers that receive it from this node and have been heard from within the grace.
+func TestPeerFloorOnlyCountsActivePushPeers(t *testing.T) {
+	now := time.Now()
+	st, _ := NewStateStore("")
+	save := func(name string, lastSuccess, synced time.Time) {
+		_ = st.Save(PeerState{Name: name, LastSuccess: lastSuccess, Namespaces: map[string]NamespaceState{"app/data": {LastSync: synced}}})
+	}
+	save("fresh", now, now.Add(-time.Minute))
+	save("behind", now.Add(-time.Hour), now.Add(-time.Hour))
+	save("silent", now.Add(-30*24*time.Hour), now.Add(-30*24*time.Hour))
+	save("puller", now, now.Add(-48*time.Hour))
+	r, err := New(Config{Local: newNode(t, "app/data").PeerNamespaces(), State: st, Peers: []PeerConfig{
+		{Name: "fresh", Addr: "tcp://x:1", Namespaces: []string{"app/*"}, Mode: peersync.SyncBoth},
+		{Name: "behind", Addr: "tcp://x:2", Namespaces: []string{"app/data"}, Mode: peersync.SyncPush},
+		{Name: "silent", Addr: "tcp://x:3", Namespaces: []string{"**"}, Mode: peersync.SyncBoth},
+		{Name: "puller", Addr: "tcp://x:4", Namespaces: []string{"**"}, Mode: peersync.SyncPull},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	floor, ok := r.PeerFloor("app/data", 7*24*time.Hour, now)
+	if !ok || !floor.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("floor %v %v, want the behind peer's last sync", floor, ok)
+	}
+	if _, ok := r.PeerFloor("other/ns", 7*24*time.Hour, now); ok {
+		t.Fatal("a namespace no pushing peer syncs has no floor")
+	}
+}

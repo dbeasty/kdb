@@ -526,6 +526,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgPackPage, "PACK_PAGE"},
 		{wire.MsgRefUpdate, "REF_UPDATE"},
 		{wire.MsgRefUpdateAck, "REF_UPDATE_ACK"},
+		{wire.MsgSnapshotFetch, "SNAPSHOT_FETCH"},
+		{wire.MsgSnapshotPage, "SNAPSHOT_PAGE"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -552,7 +554,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x2E
+const nextFreeMessageCode = 0x30
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{

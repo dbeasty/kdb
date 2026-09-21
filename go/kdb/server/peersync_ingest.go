@@ -34,14 +34,22 @@ func (s *KdbServerRuntime) peerPersistAsync() func(document.Commit) (func() erro
 // serialization and hooks, its log, and its conflict policy.
 func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 	return peersync.IngestEnv{
-		DAG:            s.dag,
-		Storage:        s.Runtime.Storage,
-		NamespaceID:    s.Runtime.DefaultNamespace,
-		Node:           s.PeerSyncNode(),
-		PersistAsync:   s.peerPersistAsync(),
-		ApplyToStorage: true,
-		Resolution:     peersync.ResolutionOptions{Policy: s.PeerSyncConflictPolicy},
-		Conflicts:      s.Conflicts,
+		DAG:                s.dag,
+		Storage:            s.Runtime.Storage,
+		NamespaceID:        s.Runtime.DefaultNamespace,
+		Node:               s.PeerSyncNode(),
+		PersistAsync:       s.peerPersistAsync(),
+		ApplyToStorage:     true,
+		Resolution:         peersync.ResolutionOptions{Policy: s.PeerSyncConflictPolicy},
+		Conflicts:          s.Conflicts,
+		CanInstallSnapshot: s.Runtime.CanInstallSnapshot,
+		SnapshotInstalled: func(root document.Commit) error {
+			if err := s.Runtime.PersistSnapshot(root); err != nil {
+				return err
+			}
+			// The documents arrived without commits the unique registry could be told about.
+			return s.RebuildUniqueKeys()
+		},
 	}
 }
 

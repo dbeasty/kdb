@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,9 @@ import (
 type ServerEngine struct {
 	namespaceID string
 	config      storage.StorageEngineConfig
+	// bodiesExternal is set once some document bodies exist only in the blob store - see
+	// MaterializeLiveBodies - so cold reads consult it in every history mode.
+	bodiesExternal atomic.Bool
 	// retainLive overrides config.Retain once something has set the
 	// retention window on the running engine; nil means "whatever this
 	// engine was opened with". Guarded because it is written from the
@@ -480,7 +484,7 @@ func (e *ServerEngine) loadCold(docID codec.UUID, contentHash codec.Hash) (docum
 	// faster answer and, for anything older than the retained window, the
 	// only one. Under HistoryModeFull nothing is written there and this
 	// would be a wasted lookup on every cold read.
-	if e.HistoryMode() == storage.HistoryModeNone {
+	if e.HistoryMode() == storage.HistoryModeNone || e.bodiesExternal.Load() {
 		if doc, found, err := e.loadDocumentBody(docID, contentHash); err != nil {
 			return document.Document{}, false, err
 		} else if found {
@@ -875,5 +879,18 @@ func (h *defaultHandle) Close() error {
 	if closer, ok := h.adapter.(interface{ Close() error }); ok {
 		return closer.Close()
 	}
+	return nil
+}
+
+// WalkTree implements storage.TreeWalker.
+func (e *ServerEngine) WalkTree(namespaceID string, treeHash codec.Hash, visit func(codec.UUID, codec.Hash) bool) error {
+	tree, ok, err := e.treeAt(treeHash)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("no tree " + treeHash.Hex() + " in namespace " + namespaceID)
+	}
+	tree.Walk(visit)
 	return nil
 }

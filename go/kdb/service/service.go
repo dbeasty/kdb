@@ -54,6 +54,8 @@ func Main() {
 	var streamAllowAnonymous bool
 	var peerSpecs []string
 	var peerCreateNamespaces bool
+	var peerRetentionGrace time.Duration
+	fs.DurationVar(&peerRetentionGrace, "peer-retention-grace", 7*24*time.Hour, "history truncation (history=none) keeps every commit a replication peer active within this long has not yet been seen to receive - both peers this node pushes to (--peer) and peers that fetch from it. A peer silent for longer stops holding history back and catches up by snapshot if it returns")
 	fs.Func("peer", "an outbound replication peer, repeatable: name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both|pull|push,interval=30s,user=u,password-env=VAR,create=true - this node keeps the matching namespaces in sync with it (see docs/kdb-distributed-plan.md). KDB_PEERS holds the same, ';'-separated", func(v string) error {
 		peerSpecs = append(peerSpecs, v)
 		return nil
@@ -396,6 +398,22 @@ func Main() {
 			r.OnLocalCommit(ns)
 		}
 	}
+	// peerFloorFor is the retention floor replication imposes on one namespace: the oldest point
+	// an active peer - pushed to by the replicator, or fetching from this node - is known to have
+	// reached. Set on every runtime, primary and opened alike.
+	peerFloorFor := func(rt *server.KdbServerRuntime) func() (time.Time, bool) {
+		return func() (time.Time, bool) {
+			now := time.Now()
+			floor, ok := rt.InboundPeerFloor(peerRetentionGrace, now)
+			if r := replicatorRef.Load(); r != nil {
+				if f, has := r.PeerFloor(rt.Runtime.DefaultNamespace, peerRetentionGrace, now); has && (!ok || f.Before(floor)) {
+					floor, ok = f, true
+				}
+			}
+			return floor, ok
+		}
+	}
+	srv.Runtime.SetPeerRetentionFloor(peerFloorFor(srv))
 	nsSet := server.NewNamespaceSet(txnCoordinator)
 	if err := nsSet.Add(srv); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -425,6 +443,7 @@ func Main() {
 			sec.PeerSyncConflictPolicy = srv.PeerSyncConflictPolicy
 			sec.PeerCreateOnPush = srv.PeerCreateOnPush
 			sec.CommitListener = func(ns string, _ document.Commit) { notifyReplicator(ns) }
+			sec.Runtime.SetPeerRetentionFloor(peerFloorFor(sec))
 			// The same process budget as the primary, not none: otherwise a namespace reached
 			// through the wire would bypass admission and the scan row budget altogether.
 			sec.ShareGovernanceWith(srv)

@@ -43,6 +43,11 @@ type V2ClientConfig struct {
 	CreateLocal bool
 	// Timeout bounds each request's wait for its reply; 0 means 30s.
 	Timeout time.Duration
+	// PreferSnapshot bootstraps an empty namespace from a snapshot of the peer's main even when
+	// the peer could send its whole history - faster for a large history, at the cost of not
+	// holding it. An empty namespace whose peer cannot send its whole history (it holds a
+	// shallow root or a retention floor) is bootstrapped from a snapshot regardless.
+	PreferSnapshot bool
 	// ExtraHaves adds, per namespace, commits this node already stored that its refs do not
 	// reach - the ReceivedTips of an interrupted earlier sync. Naming them resumes that sync
 	// instead of fetching its pages again.
@@ -59,6 +64,8 @@ type NamespaceSyncResult struct {
 	Local, Remote map[string]wire.RefUpdateOutcome
 	// Conflicts are every ref, on either side, whose update was refused as a conflict.
 	Conflicts []RefConflict
+	// Snapshot is the commit this sync bootstrapped the namespace from, when it did.
+	Snapshot string
 	// LocalMain / RemoteMain are both sides' main heads when this sync finished, as far as it
 	// knows: the peer's is its advertised head, or what it reported after the last push to it.
 	LocalMain, RemoteMain string
@@ -160,6 +167,27 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 }
 
 func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRefs, res *NamespaceSyncResult) error {
+	if needsSnapshot(env, remote, cfg.PreferSnapshot) {
+		at := remote.Branches[mainBranch]
+		installed, err := InstallSnapshot(env, func(after string) (wire.SnapshotPageMessage, error) {
+			reply, err := c.request(wire.SnapshotFetchMessage{
+				H: header(wire.MsgSnapshotFetch, c.next()), Namespace: remote.Namespace,
+				AtHex: at, After: after, MaxBytes: cfg.PageBytes,
+			})
+			if err != nil {
+				return wire.SnapshotPageMessage{}, err
+			}
+			page, ok := reply.(wire.SnapshotPageMessage)
+			if !ok {
+				return wire.SnapshotPageMessage{}, NewError(fmt.Sprintf("expected SNAPSHOT_PAGE, got %T", reply), nil)
+			}
+			return page, nil
+		})
+		if err != nil {
+			return err
+		}
+		res.Snapshot = installed.Hash.Hex()
+	}
 	targets, err := refTargets(remote)
 	if err != nil {
 		return err

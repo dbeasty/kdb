@@ -69,6 +69,12 @@ type IngestEnv struct {
 	// Peer names the node the incoming history came from, for the conflict queue and tracking
 	// branches. Empty when unknown.
 	Peer string
+	// CanInstallSnapshot, when set, is asked before a snapshot changes anything - a namespace that
+	// could not make one durable refuses it up front rather than after installing it.
+	CanInstallSnapshot func() error
+	// SnapshotInstalled makes an installed snapshot durable - see InstallSnapshot. nil leaves it
+	// in memory, which is all a memory runtime has.
+	SnapshotInstalled func(document.Commit) error
 	// MaxClockSkew refuses a commit timestamped further than this past local wall time. Commits
 	// are timestamped at least one microsecond after their parents, so a single commit from a node
 	// whose clock runs far ahead would drag every later commit that descends from it into that

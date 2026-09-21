@@ -33,6 +33,10 @@ type V2HostConfig struct {
 	// CreateOnPush lets a peer push into a namespace this node does not hold yet, creating it.
 	// Off by default: whether a peer may create namespaces here is an operator's decision.
 	CreateOnPush bool
+	// OnCaughtUp, when set, is told each time a peer finishes fetching a namespace - the last
+	// page of a fetch, after which the peer holds everything this node's refs named. It is how a
+	// node learns what inbound peers have, for peer-aware retention.
+	OnCaughtUp func(ns, peer string)
 }
 
 // V2Host serves one v2 peer-sync connection.
@@ -58,7 +62,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -125,12 +129,38 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		if err != nil {
 			return nil, err
 		}
+		if done && h.cfg.OnCaughtUp != nil {
+			h.mu.Lock()
+			peer := h.peer
+			h.mu.Unlock()
+			h.cfg.OnCaughtUp(m.Namespace, peer)
+		}
 		return wire.PackPageMessage{
 			H: header(wire.MsgPackPage, m.H.CorrelationID), Namespace: m.Namespace,
 			Commits: commits, Stubs: stubs, Done: done,
 		}, nil
 	case wire.RefUpdateMessage:
 		return h.refUpdate(m)
+	case wire.SnapshotFetchMessage:
+		env, err := h.env(m.Namespace, false)
+		if err != nil {
+			return nil, err
+		}
+		at, err := env.DAG.Head()
+		if err != nil {
+			return nil, err
+		}
+		if m.AtHex != "" {
+			if at, err = codec.HashFromHex(m.AtHex); err != nil {
+				return nil, err
+			}
+		}
+		page, err := snapshotPage(env, at, m.After, m.MaxBytes)
+		if err != nil {
+			return nil, err
+		}
+		page.H = header(wire.MsgSnapshotPage, m.H.CorrelationID)
+		return page, nil
 	default:
 		return nil, &UnsupportedFrameError{Type: msg.Header().MessageType}
 	}

@@ -405,3 +405,113 @@ func decodeSyncV2Message(header Header, env payloadEnvelope) (Message, bool, err
 		return nil, false, nil
 	}
 }
+
+// SnapshotFetchMessage asks for the documents of the tree at a commit, in document-id order,
+// starting after a cursor - one page of a snapshot bootstrap (SNAPSHOT_FETCH 0x2E).
+type SnapshotFetchMessage struct {
+	H         Header
+	Namespace string
+	// AtHex is the commit whose tree to send; empty means the host's main head, and the page
+	// says which commit that was.
+	AtHex string
+	// After is the last document id received; empty starts from the first.
+	After    string
+	MaxBytes int
+}
+
+func (m SnapshotFetchMessage) Header() Header { return m.H }
+
+// SnapshotDoc is one document of a snapshot page.
+type SnapshotDoc struct {
+	DocID string
+	Body  string
+}
+
+// SnapshotPageMessage answers SNAPSHOT_FETCH (SNAPSHOT_PAGE 0x2F).
+type SnapshotPageMessage struct {
+	H         Header
+	Namespace string
+	// Commit is the commit the snapshot is of. It travels on every page so a receiver can check
+	// every page belongs to the same snapshot.
+	Commit document.Commit
+	Docs   []SnapshotDoc
+	// Next is the cursor for the following page; Done means there is none.
+	Next string
+	Done bool
+	// Total is how many documents the whole snapshot holds.
+	Total int
+}
+
+func (m SnapshotPageMessage) Header() Header { return m.H }
+
+type snapshotFetchDto struct {
+	Namespace string `json:"namespace"`
+	AtHex     string `json:"atHex,omitempty"`
+	After     string `json:"after,omitempty"`
+	MaxBytes  int    `json:"maxBytes,omitempty"`
+}
+
+type snapshotDocDto struct {
+	DocID string `json:"id"`
+	Body  string `json:"body"`
+}
+
+type snapshotPageDto struct {
+	Namespace     string           `json:"namespace"`
+	CommitPayload []byte           `json:"commitPayload"`
+	Docs          []snapshotDocDto `json:"docs"`
+	Next          string           `json:"next,omitempty"`
+	Done          bool             `json:"done"`
+	Total         int              `json:"total"`
+}
+
+func encodeSnapshotV2Message(msg Message) (payloadEnvelope, bool, error) {
+	switch m := msg.(type) {
+	case SnapshotFetchMessage:
+		return payloadEnvelope{Kind: "snapshotFetch", SnapshotFetch: &snapshotFetchDto{
+			Namespace: m.Namespace, AtHex: m.AtHex, After: m.After, MaxBytes: m.MaxBytes,
+		}}, true, nil
+	case SnapshotPageMessage:
+		payload, err := EncodeCommits([]document.Commit{m.Commit})
+		if err != nil {
+			return payloadEnvelope{}, true, err
+		}
+		docs := make([]snapshotDocDto, len(m.Docs))
+		for i, d := range m.Docs {
+			docs[i] = snapshotDocDto{DocID: d.DocID, Body: d.Body}
+		}
+		return payloadEnvelope{Kind: "snapshotPage", SnapshotPage: &snapshotPageDto{
+			Namespace: m.Namespace, CommitPayload: payload, Docs: docs, Next: m.Next, Done: m.Done, Total: m.Total,
+		}}, true, nil
+	}
+	return payloadEnvelope{}, false, nil
+}
+
+func decodeSnapshotV2Message(header Header, env payloadEnvelope) (Message, bool, error) {
+	switch env.Kind {
+	case "snapshotFetch":
+		d := env.SnapshotFetch
+		if d == nil {
+			return nil, true, newDecodeError("missing snapshotFetch body")
+		}
+		return SnapshotFetchMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, After: d.After, MaxBytes: d.MaxBytes}, true, nil
+	case "snapshotPage":
+		d := env.SnapshotPage
+		if d == nil {
+			return nil, true, newDecodeError("missing snapshotPage body")
+		}
+		commits, err := DecodeCommits(d.CommitPayload)
+		if err != nil {
+			return nil, true, err
+		}
+		if len(commits) != 1 {
+			return nil, true, newDecodeError("snapshotPage must carry exactly one commit")
+		}
+		docs := make([]SnapshotDoc, len(d.Docs))
+		for i, x := range d.Docs {
+			docs[i] = SnapshotDoc{DocID: x.DocID, Body: x.Body}
+		}
+		return SnapshotPageMessage{H: header, Namespace: d.Namespace, Commit: commits[0], Docs: docs, Next: d.Next, Done: d.Done, Total: d.Total}, true, nil
+	}
+	return nil, false, nil
+}

@@ -93,14 +93,16 @@ const (
 	MsgPeerError MessageType = 0x25
 
 	// Peer sync protocol v2 (see sync_v2_ops.go). Go-only, like 0x14-0x25.
-	MsgSyncHello    MessageType = 0x26
-	MsgSyncHelloAck MessageType = 0x27
-	MsgRefsRequest  MessageType = 0x28
-	MsgRefsResult   MessageType = 0x29
-	MsgFetchRequest MessageType = 0x2A
-	MsgPackPage     MessageType = 0x2B
-	MsgRefUpdate    MessageType = 0x2C
-	MsgRefUpdateAck MessageType = 0x2D
+	MsgSyncHello     MessageType = 0x26
+	MsgSyncHelloAck  MessageType = 0x27
+	MsgRefsRequest   MessageType = 0x28
+	MsgRefsResult    MessageType = 0x29
+	MsgFetchRequest  MessageType = 0x2A
+	MsgPackPage      MessageType = 0x2B
+	MsgRefUpdate     MessageType = 0x2C
+	MsgRefUpdateAck  MessageType = 0x2D
+	MsgSnapshotFetch MessageType = 0x2E
+	MsgSnapshotPage  MessageType = 0x2F
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -199,6 +201,10 @@ func (t MessageType) String() string {
 		return "REF_UPDATE"
 	case MsgRefUpdateAck:
 		return "REF_UPDATE_ACK"
+	case MsgSnapshotFetch:
+		return "SNAPSHOT_FETCH"
+	case MsgSnapshotPage:
+		return "SNAPSHOT_PAGE"
 	default:
 		return "UNKNOWN"
 	}
@@ -296,6 +302,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgRefUpdate, true
 	case 0x2D:
 		return MsgRefUpdateAck, true
+	case 0x2E:
+		return MsgSnapshotFetch, true
+	case 0x2F:
+		return MsgSnapshotPage, true
 	default:
 		return 0, false
 	}
