@@ -15,7 +15,12 @@ func listenUnderPressure(t *testing.T, usedFraction float64) (*KdbServerRuntime,
 	srv.SetMemoryLimit(testBudget, 0.85)
 	t.Cleanup(func() { srv.memGuard.Stop() })
 	srv.memGuard.Stop()
-	srv.memGuard.observe(float64(testBudget) * usedFraction)
+	// The whole averaging window, not one sample: the guard's sampler runs from SetMemoryLimit
+	// until Stop, and on a loaded runner it can land a real reading first, which averaged with
+	// one forced one leaves the zone below the one this test asked for.
+	for i := 0; i < sampleWindow; i++ {
+		srv.memGuard.observe(float64(testBudget) * usedFraction)
+	}
 
 	ln, err := ListenSqlWire("tcp://127.0.0.1:0?bind=true", srv)
 	if err != nil {
