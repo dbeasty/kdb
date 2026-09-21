@@ -1,0 +1,1 @@
+kdb:xns/1 host=host-a epoch=7 group=01020304-0506-0708-090a-0b0c0d0e0f10 parts=bank/accounts,bank/ledger

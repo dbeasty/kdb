@@ -101,8 +101,13 @@ func parseMemoryBody(body string, readOnly bool, q url.Values) (ParsedURL, error
 }
 
 func parseFileBody(body string, readOnly bool) (ParsedURL, error) {
-	body = strings.TrimPrefix(body, "//")
-	if body == "" {
+	// Any leading run of slashes is one absolute path: file:///var/lib/kdb (after "file:") and
+	// the legacy file///var/lib/kdb (after "file/") both mean /var/lib/kdb. Trimming a fixed "//"
+	// turned the second into var/lib/kdb, relative to the working directory.
+	if strings.HasPrefix(body, "/") {
+		body = "/" + strings.TrimLeft(body, "/")
+	}
+	if body == "" || body == "/" {
 		return ParsedURL{}, fmt.Errorf("file kdb URL missing data directory path")
 	}
 	clean := filepath.Clean(body)
@@ -118,6 +123,12 @@ func parseFileBody(body string, readOnly bool) (ParsedURL, error) {
 		namespace = catalog + "/" + nsLeaf
 		if len(parts) > 2 {
 			dataRoot = filepath.Join(parts[:len(parts)-2]...)
+			// The split above trimmed the leading separator; without putting it back an absolute
+			// URL (file:///var/lib/kdb/app/users) named a data root relative to the working
+			// directory - var/lib/kdb - and the database quietly landed somewhere else.
+			if filepath.IsAbs(clean) {
+				dataRoot = string(filepath.Separator) + dataRoot
+			}
 		} else {
 			dataRoot = string(filepath.Separator)
 		}

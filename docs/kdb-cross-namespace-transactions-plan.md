@@ -265,7 +265,19 @@ namespace).
   restores them before any namespace. Without them a restored database would read a crash-aborted
   group as committed - `TestDatabaseBackupCarriesCrossNamespaceDecisions` shows exactly that when
   the restore skips them.
-- The Kotlin reference has no cross-namespace commit; it reads group parts as ordinary commits.
+- **Kotlin reference: the read side is done, the write side is not.** Kotlin's delta replay
+  (`kdb-jdbc` `DeltaNamespaceReplayer`) now reads `<dataRoot>/txn/` with Go's resolution table
+  (`CrossNamespaceDecisions`) and rolls back a group that never committed, with everything built
+  on it - so Kotlin opening a data root Go wrote cannot resurrect half a transaction. The formats
+  are pinned by Go-exported fixtures (`go/testdata/golden/physical/go/txn_*`,
+  `TestExportTxnGoldenFixtures` / `CrossNamespaceDecisionsTest`).
+
+  Kotlin cannot *run* cross-namespace transactions, and adding that is its own project rather than
+  a port of this one: the Kotlin runtime has no multi-namespace host (Layer 17 was built in Go
+  only), so its server and JDBC driver route every namespace through one runtime's single commit
+  graph and log; it has no group commit on the commit log (each commit is fsynced alone); and no
+  checkpoints. The Go-only wire messages `TX_COMMIT_MULTI` / `_RESULT` (0x23-0x24) stay out of the
+  Kotlin codec, like 0x18-0x22 before them.
 
 ## 7. Cross-namespace SQL transactions
 

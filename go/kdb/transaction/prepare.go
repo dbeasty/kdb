@@ -86,19 +86,27 @@ func (e *defaultEngine) PrepareCommit(
 	if err != nil {
 		return nil, nil, err
 	}
-	return e.plan(tx, d, store, sch, head, baseCommit.DocumentTreeHash, baseCommit.DocumentTreeHash, targetCommit.DocumentTreeHash)
+	p, result, err := e.plan(tx, d, store, sch, head, baseCommit.DocumentTreeHash, baseCommit.DocumentTreeHash, targetCommit.DocumentTreeHash)
+	if err != nil || result != nil {
+		return nil, result, err
+	}
+	return &p, nil, nil
 }
 
 // plan is the check half of finalizeTransaction: everything that can reject a transaction, and
 // nothing that writes. Returning a rejection from here costs nothing to unwind, which is what
 // lets a caller check several transactions before committing to any.
+//
+// It returns the prepared commit by value so the ordinary commit path - plan then Apply, in one
+// call - keeps it on the stack. Returning a pointer cost every single commit an extra heap
+// allocation of the whole plan (~450 bytes) for a split only cross-namespace commits use.
 func (e *defaultEngine) plan(
 	tx document.Transaction,
 	d *dag.InMemoryCommitDag,
 	store storage.Adapter,
 	incomingSchema schema.KdbSchema,
 	anchorCommit, baseDocTreeHash, baselineDocTreeHash, targetDocTreeHash codec.Hash,
-) (*PreparedCommit, TransactionResult, error) {
+) (PreparedCommit, TransactionResult, error) {
 	// Whether this transaction extends the branch tip or deliberately forks off an older commit
 	// is decided here, before any work is staged, because that is when the caller's intent is
 	// still legible. If the anchor is the tip right now, the append must still find it there
@@ -108,11 +116,11 @@ func (e *defaultEngine) plan(
 	// fork (Replay onto a named target) and the branch head is not this transaction's business.
 	extendingTip := d.HeadIs(anchorCommit)
 	if fileViolations := preflightFileWrites(tx, store); len(fileViolations) > 0 {
-		return nil, ResultSchemaError{Violations: fileViolations}, nil
+		return PreparedCommit{}, ResultSchemaError{Violations: fileViolations}, nil
 	}
 	schemaFrame := runSchemaPhase(tx, store, d.NamespaceID, incomingSchema, baselineDocTreeHash)
 	if len(schemaFrame.violations) > 0 {
-		return nil, ResultSchemaError{Violations: schemaFrame.violations}, nil
+		return PreparedCommit{}, ResultSchemaError{Violations: schemaFrame.violations}, nil
 	}
 	writes := schemaFrame.writesByOpIndex
 
@@ -126,10 +134,10 @@ func (e *defaultEngine) plan(
 	if e.preconditions && len(tx.Preconditions) > 0 {
 		preFailures, preViolations := evaluatePreconditions(tx, d.NamespaceID, store, targetDocTreeHash)
 		if len(preViolations) > 0 {
-			return nil, ResultSchemaError{Violations: preViolations}, nil
+			return PreparedCommit{}, ResultSchemaError{Violations: preViolations}, nil
 		}
 		if len(preFailures) > 0 {
-			return nil, ResultConflict{Report: toReport(tx, anchorCommit, preFailures), ConflictingOps: preFailures}, nil
+			return PreparedCommit{}, ResultConflict{Report: toReport(tx, anchorCommit, preFailures), ConflictingOps: preFailures}, nil
 		}
 		guarded = guardedOpIndexes(tx)
 	}
@@ -143,16 +151,16 @@ func (e *defaultEngine) plan(
 	}
 
 	if len(conflicts) > 0 && e.conflictPolicy == ConflictPolicyStrict {
-		return nil, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
+		return PreparedCommit{}, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
 	}
 
 	if len(conflicts) > 0 && e.conflictPolicy == ConflictPolicyCustom {
 		if e.customResolver == nil {
-			return nil, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
+			return PreparedCommit{}, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
 		}
 		for _, c := range conflicts {
 			if _, ok := c.Op.(document.WriteOp); !ok {
-				return nil, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
+				return PreparedCommit{}, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
 			}
 			w := c.Op.(document.WriteOp)
 			resolved, err := e.customResolver.Resolve(DocumentConflict{
@@ -160,7 +168,7 @@ func (e *defaultEngine) plan(
 				ExistingDoc: c.ExistingDoc, IncomingDoc: c.IncomingDoc, BaseDoc: c.BaseDoc,
 			})
 			if err != nil || resolved == nil {
-				return nil, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
+				return PreparedCommit{}, ResultConflict{Report: toReport(tx, anchorCommit, conflicts), ConflictingOps: conflicts}, nil
 			}
 			vr := schema.Validate(*resolved, schemaFrame.rollingSchema)
 			if vr.IsFailure() {
@@ -171,7 +179,7 @@ func (e *defaultEngine) plan(
 				if sve, ok := vr.Exception().(*kdberr.SchemaViolationError); ok {
 					violations = sve.Violations
 				}
-				return nil, ResultSchemaError{Violations: []OperationViolation{{
+				return PreparedCommit{}, ResultSchemaError{Violations: []OperationViolation{{
 					OpIndex: c.OpIndex, Op: c.Op, Violations: violations,
 				}}}, nil
 			}
@@ -187,9 +195,9 @@ func (e *defaultEngine) plan(
 		tx, d.NamespaceID, store, targetDocTreeHash, schemaFrame.rollingSchema, e.uniqueKeys, writes,
 	)
 	if len(uniqueViolations) > 0 {
-		return nil, ResultSchemaError{Violations: uniqueViolations}, nil
+		return PreparedCommit{}, ResultSchemaError{Violations: uniqueViolations}, nil
 	}
-	return &PreparedCommit{
+	return PreparedCommit{
 		e:            e,
 		tx:           tx,
 		d:            d,
