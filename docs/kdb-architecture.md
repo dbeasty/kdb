@@ -257,7 +257,7 @@ process/OS crash but not power loss) trade the guarantee for an order of magnitu
 | Pessimistic holds | expiring, fenced document leases for work that spans round trips; a holder that stalls past its deadline is refused at commit rather than overwriting whoever took the document next |
 | Read isolation | `SNAPSHOT` sessions pin a commit; `READ_COMMITTED` reads the live head; scans are not snapshots |
 | Cross-process readers | read-only runtimes attach alongside a live writer and see a snapshot as of their open (or last `Refresh`) |
-| Across namespaces | none — one runtime serves one namespace; there are no cross-namespace transactions |
+| Across namespaces | atomic on the Go server: `NamespaceSet.CommitAcross`, the `TX_COMMIT_MULTI` wire frame and SQL `BEGIN`/`COMMIT` commit every namespace or none, including across a crash ([plan](kdb-cross-namespace-transactions-plan.md)); the Kotlin runtime only honours those decisions on replay |
 | Across peers | eventual, application-controlled: peers converge when they choose to sync, and conflicts are surfaced |
 
 ### 7.3 Availability and degradation

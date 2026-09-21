@@ -244,6 +244,7 @@ namespace).
 | 9 | Go client `CommitAcross`, `Deletes` | `client/` |
 | 10 | kdb-service wiring | `service/service.go` |
 | 11 | Tests: engine equivalence, atomicity on every rejection kind, crash at every protocol point, replay stability across restarts, follower holds, checkpoint guard, invariant-preserving concurrent transfers under `-race`, snapshot consistency, deadlock freedom, wire + client e2e | `*_test.go` |
+| 11a | Process e2e against the shipped `kdb-service`: `CommitAcross` over the wire, a conflict in one namespace writing nothing anywhere, SQL commit/rollback across a qualified table, kill -9 mid-stream never splitting a group and replaying stably across two restarts | `kdb-integration/e2e/test_cross_namespace_transactions.py`, `kdb-e2e-helper commit-across` / `sql-tx` / `xns-transfers` |
 | 12 | Benchmarks: cross vs single vs non-atomic pair, disjoint scaling, cost to single-namespace writers, simple-lock variant for comparison | `server/cross_namespace_bench_test.go`, `docs/benchmarks/2026-09-20-cross-namespace-transactions.md` |
 
 ## 6. Follow-ups
