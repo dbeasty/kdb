@@ -94,3 +94,33 @@ func (s *Server) handleDismissConflict(w http.ResponseWriter, r *http.Request, p
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
+
+// GET /v1/ns/{ns}/home - the namespace's single-home assignment, if any.
+func (s *Server) handleHome(w http.ResponseWriter, _ *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	h, ok := rt.HomeOf()
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "singleHome": ok, "home": h, "thisNode": rt.NodeID.String()})
+}
+
+// PUT /v1/ns/{ns}/home - {"node": "<node id>", "addr": "<client address>"} makes that node the
+// only one that accepts the namespace's writes; {"node": ""} returns it to multi-leader. Either
+// raises the fence.
+func (s *Server) handleAssignHome(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	var body struct {
+		Node string `json:"node"`
+		Addr string `json:"addr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if rt.Meta == nil {
+		writeError(w, http.StatusConflict, "no_metadata", "this process has no metadata namespace, which single-home ownership is recorded in")
+		return
+	}
+	h, err := rt.Meta.AssignHome(ns, body.Node, body.Addr)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "home": h})
+}

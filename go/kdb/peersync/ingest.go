@@ -69,6 +69,10 @@ type IngestEnv struct {
 	// Peer names the node the incoming history came from, for the conflict queue and tracking
 	// branches. Empty when unknown.
 	Peer string
+	// CheckCommit, when set, is asked about every commit a head move would adopt; an error refuses
+	// the move - the commits stay stored, the head stays put, and the refusal is queued as a
+	// conflict. How a single-home namespace refuses writes from a superseded home.
+	CheckCommit func(document.Commit) error
 	// CanInstallSnapshot, when set, is asked before a snapshot changes anything - a namespace that
 	// could not make one durable refuses it up front rather than after installing it.
 	CanInstallSnapshot func() error
@@ -192,6 +196,21 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 		localHead, err := env.DAG.Head()
 		if err != nil {
 			return err
+		}
+		if env.CheckCommit != nil && ResolveHeadUpdate(env.DAG, localHead, incomingHead) != HeadAlreadyAncestor {
+			adopting, err := commitsBetween(env.DAG, incomingHead, localHead)
+			if err != nil {
+				return err
+			}
+			for _, c := range adopting {
+				if cerr := env.CheckCommit(c); cerr != nil {
+					res.Outcome = CommitPushOutcome{Kind: OutcomeConflict}
+					_ = env.noteConflict("branch:"+mainBranch, localHead, incomingHead, &kdberr.ConflictReport{
+						TransactionID: c.Hash.Hex(), BaseHash: localHead.Hex(), TargetHash: incomingHead.Hex(),
+					})
+					return cerr
+				}
+			}
 		}
 		switch ResolveHeadUpdate(env.DAG, localHead, incomingHead) {
 		case HeadAlreadyAncestor:

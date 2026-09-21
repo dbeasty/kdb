@@ -34,7 +34,7 @@ func (s *KdbServerRuntime) peerPersistAsync() func(document.Commit) (func() erro
 // PeerIngestEnv describes this runtime's namespace to peer sync: its DAG and storage, its write
 // serialization and hooks, its log, and its conflict policy.
 func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
-	return peersync.IngestEnv{
+	env := peersync.IngestEnv{
 		DAG:                s.dag,
 		Storage:            s.Runtime.Storage,
 		NamespaceID:        s.Runtime.DefaultNamespace,
@@ -52,6 +52,11 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 			return s.RebuildUniqueKeys()
 		},
 	}
+	if _, ok := s.HomeOf(); ok {
+		// Only a single-home namespace has fences to check; everything else skips the walk.
+		env.CheckCommit = s.checkReplicatedCommit
+	}
+	return env
 }
 
 // PeerNamespaces is the set of namespaces this runtime's process serves to peers, and feeds

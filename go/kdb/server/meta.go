@@ -57,9 +57,12 @@ type metaDoc struct {
 	Unique    bool              `json:"unique,omitempty"`
 	With      map[string]string `json:"with,omitempty"`
 	Dropped   bool              `json:"dropped,omitempty"`
+	// Home is a single-home assignment (kind "home"); an empty Node means multi-leader.
+	Home *Home `json:"home,omitempty"`
 }
 
 func metaSchemaID(ns string) codec.UUID { return codec.DerivedUUID("kdb:meta/schema/" + ns) }
+func metaHomeID(ns string) codec.UUID   { return codec.DerivedUUID("kdb:meta/home/" + ns) }
 func metaIndexID(ns, name string) codec.UUID {
 	return codec.DerivedUUID("kdb:meta/index/" + ns + "/" + name)
 }
@@ -148,6 +151,36 @@ func (m *MetaStore) RecordDropIndex(ns, name string) error {
 	return m.put(metaIndexID(ns, name), metaDoc{Kind: "index", Namespace: ns, Name: name, Dropped: true})
 }
 
+// AssignHome makes node (reachable for clients at addr) the only node that accepts ns's writes,
+// or with an empty node returns ns to multi-leader. Every assignment raises the fence past the
+// last one this node knows of, so commits the previous home makes after it has been replaced are
+// refused wherever they arrive.
+//
+// Assignments are made on one node and replicate like any definition; making two assignments on
+// two nodes at once is a same-document conflict in the metadata namespace, surfaced for an
+// operator rather than resolved by whichever arrives last.
+func (m *MetaStore) AssignHome(ns, node, addr string) (Home, error) {
+	if m == nil {
+		return Home{}, fmt.Errorf("no metadata namespace: single-home ownership needs one")
+	}
+	h := Home{Node: node, Addr: addr, Fence: 1}
+	if cur, _, found, err := m.meta.GetDocument(MetaNamespace, metaHomeID(ns)); err == nil && found {
+		var d metaDoc
+		if json.Unmarshal([]byte(cur), &d) == nil && d.Home != nil {
+			h.Fence = d.Home.Fence + 1
+		}
+	}
+	if err := m.put(metaHomeID(ns), metaDoc{Kind: "home", Namespace: ns, Home: &h}); err != nil {
+		return Home{}, err
+	}
+	// Applied here at once, not only when the reconciler gets to it: a caller that just moved
+	// the home must not be able to write to the old one a moment later on this node.
+	if rt, ok := m.set.Get(ns); ok {
+		m.apply(rt, metaDoc{Kind: "home", Namespace: ns, Home: &h})
+	}
+	return h, nil
+}
+
 // ReconcileAll applies every definition the meta namespace holds to the namespaces this process
 // serves. A definition that cannot be applied - a schema the namespace's data violates, an index
 // that will not build - is recorded in that namespace's conflict queue rather than stopping the
@@ -222,6 +255,13 @@ func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
 		err = m.applySchema(rt, d)
 	case "index":
 		err = m.applyIndex(rt, d)
+	case "home":
+		if d.Home == nil || d.Home.Node == "" {
+			rt.SetHome(nil)
+		} else {
+			h := *d.Home
+			rt.SetHome(&h)
+		}
 	}
 	if err != nil {
 		_, _ = rt.Conflicts.Record(peersync.ConflictEntry{

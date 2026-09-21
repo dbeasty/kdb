@@ -180,6 +180,8 @@ type KdbServerRuntime struct {
 	// duplicates and unverifiable cross-namespace parts. Durable under a file-backed runtime's
 	// data root, in memory otherwise.
 	Conflicts *peersync.ConflictQueue
+	// home is this namespace's single-home assignment, if any - see home.go.
+	home atomic.Pointer[Home]
 	// ProjectionOf, when set, makes this namespace a filtered projection of that source namespace
 	// (see peersync.SyncProjection): its content comes only from the source, so every write but
 	// the projection's own is refused, clients' and peers' alike.
@@ -690,14 +692,14 @@ func (s *KdbServerRuntime) Replay(namespaceID string, tx document.Transaction, r
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
 	tx = s.authored(tx)
 	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
-		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
+		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, s.commitMessage())
 	})
 }
 
 func (s *KdbServerRuntime) replayWith(engine transaction.Engine, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
 	tx = s.authored(tx)
 	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
-		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, "")
+		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, s.commitMessage())
 	})
 }
 
@@ -866,6 +868,11 @@ func (s *KdbServerRuntime) admitWrite(tx document.Transaction, principal auth.Pr
 	}
 	if s.ProjectionOf != "" && !system {
 		return &ProjectionReadOnlyError{Namespace: s.Runtime.DefaultNamespace, Source: s.ProjectionOf}
+	}
+	if !system {
+		if err := s.admitHome(); err != nil {
+			return err
+		}
 	}
 	if !system {
 		if err := s.authorizeOperations(tx, principal); err != nil {

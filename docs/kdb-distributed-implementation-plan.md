@@ -455,7 +455,7 @@ This is a separate design review before any code.
 
 ---
 
-## Phase 9 — Single-home ownership
+## Phase 9 — Single-home ownership ◐
 
 - **9.1** A policy field `Consistency {MultiLeader (default), SingleHome}` in `policy.NamespacePolicy`, additive.
 - **9.2** A home lease document in `_kdb/meta`: `DerivedUUID("home:<ns>")` → `{holder nodeId, expiresAt, fence}`.
@@ -699,3 +699,20 @@ Step 8.0 was done as a model, grounded in a fresh measurement of the document tr
 A partial clone holds a strict superset of a projection: every tree entry and the whole graph, plus the same fetched bodies. Its cost is therefore the projection's plus a fixed ~138 MB for a 50k-document, 250k-commit source, whatever the selectivity or body size. The gate required it to cost less than half the projection's, so it cannot pass.
 
 Commit format v2 is not introduced. The write need Phase 8 might have served belongs to Phase 7.4 (write-back).
+
+### Phase 9 — landed (manual handover; automatic failover not built)
+
+**The assignment.** A namespace's single-home assignment `{node, addr, fence}` is a `kind:"home"` definition in `_kdb/meta`, made with `MetaStore.AssignHome` or `PUT /v1/ns/{ns}/home`, and read with `GET` on the same path. Every assignment, including returning a namespace to multi-leader, raises the fence past the last one this node knows of.
+
+**Enforcement:**
+- **Writes elsewhere:** on a node that isn't the home, `admitWrite` refuses every non-system write with `NotHomeError`. The error names the home's address and classifies as the new wire code `NOT_HOME`. Replication is unchanged: the other nodes still receive the home's writes and serve reads.
+- **Stamping:** the home stamps every commit it makes with `kdb:home/1 node=<id> fence=<n>`.
+- **Fence check:** ingest checks every commit a head move would adopt (the new `IngestEnv.CheckCommit`, set only on single-home namespaces). A commit stamped with an older fence than the namespace's current one is refused with `StaleFenceError`. It stays stored, the head doesn't move, and the refusal is queued as a conflict. That's the write a former home made after it was replaced.
+- **Global uniqueness:** unique constraints and compare-and-set are global on a single-home namespace, because only one node's registry ever decides.
+
+**Deviations, and why:**
+- **No lease, and no automatic failover.** The plan's lease with a CAS on a meta-home node would put a linearizable coordination point back into a system built to have none, and done properly it's consensus. Assignment is explicit, and a handover is an operator action. The fence is what makes a handover safe: a stale home's writes are refused wherever they land, not trusted until a lease runs out.
+- **Redirect, not forwarding (9.3).** A non-home node refuses with the home's address instead of forwarding the write. Server-to-server forwarding would need the home to trust a node acting for a principal it never authenticated. A redirect keeps authentication end to end; the client follows it (Phase 10.2).
+- **Concurrent assignments on two nodes** are a same-document conflict in `_kdb/meta`, surfaced for an operator.
+
+**Tests:** `server/home_test.go`. Writes are refused away from the home and carry the home's address; the home's writes are stamped and replicate. A handover makes the former home's in-flight write unadoptable, and makes the former home refuse writes once it learns.
