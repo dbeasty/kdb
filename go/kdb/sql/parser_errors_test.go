@@ -55,8 +55,8 @@ func TestParseRejectsMalformedInputWithoutPanicking(t *testing.T) {
 		// These four moved when Layer 16 widened the grammar with UPDATE, DELETE, CREATE INDEX
 		// and DROP INDEX. Each input is still rejected; only the message changed, because the
 		// parser now gets further before it runs out of statement it understands.
-		{"empty statement", "", "expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP"},
-		{"whitespace only", "   \t\n ", "expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP"},
+		{"empty statement", "", "expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK"},
+		{"whitespace only", "   \t\n ", "expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK"},
 		{"drop table is not supported", "DROP TABLE players", "expected INDEX"},
 		{"create index without ON", "CREATE INDEX x", "expected ON"},
 

@@ -220,6 +220,11 @@ type Client struct {
 
 	nsMu       sync.Mutex
 	namespaces map[string]*namespaceState
+	// idleTxSessions holds server sessions a finished Tx left behind, keyed by namespace and read
+	// consistency, for the next Tx to reuse. The wire protocol has no session end short of
+	// closing the connection, so without reuse a long-lived client would leave one abandoned
+	// session on the server per transaction.
+	idleTxSessions map[string][]string
 }
 
 type namespaceState struct {
@@ -463,34 +468,43 @@ func (c *Client) ensureNamespace(ctx context.Context, ns string) (*namespaceStat
 	if ok {
 		return st, nil
 	}
-	msg := wire.SessionBeginMessage{
-		H:               wire.Header{MessageType: wire.MsgSessionBegin, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
-		Namespace:       ns,
-		ReadConsistency: "READ_COMMITTED",
-	}
-	reply, err := c.request(ctx, msg)
+	sessionID, head, err := c.beginSession(ctx, ns, "READ_COMMITTED")
 	if err != nil {
 		return nil, err
 	}
-	ack, ok := reply.(wire.SessionBeginAckMessage)
-	if !ok {
-		return nil, fmt.Errorf("kdb: expected SessionBeginAck, got %T", reply)
-	}
-	if ack.SessionID == "" {
-		if ack.Error != nil && *ack.Error != "" {
-			return nil, fmt.Errorf("%w: session begin rejected for namespace %s: %s", ErrUnauthenticated, ns, *ack.Error)
-		}
-		return nil, fmt.Errorf("kdb: session begin rejected for namespace %s", ns)
-	}
-	head, err := codec.HashFromHex(ack.HeadHex)
-	if err != nil {
-		return nil, err
-	}
-	st = &namespaceState{sessionID: ack.SessionID, head: head}
+	st = &namespaceState{sessionID: sessionID, head: head}
 	c.nsMu.Lock()
 	c.namespaces[ns] = st
 	c.nsMu.Unlock()
 	return st, nil
+}
+
+// beginSession opens a new server session on ns and returns its id and the head it started at.
+func (c *Client) beginSession(ctx context.Context, ns, readConsistency string) (string, codec.Hash, error) {
+	msg := wire.SessionBeginMessage{
+		H:               wire.Header{MessageType: wire.MsgSessionBegin, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
+		Namespace:       ns,
+		ReadConsistency: readConsistency,
+	}
+	reply, err := c.request(ctx, msg)
+	if err != nil {
+		return "", codec.Hash{}, err
+	}
+	ack, ok := reply.(wire.SessionBeginAckMessage)
+	if !ok {
+		return "", codec.Hash{}, fmt.Errorf("kdb: expected SessionBeginAck, got %T", reply)
+	}
+	if ack.SessionID == "" {
+		if ack.Error != nil && *ack.Error != "" {
+			return "", codec.Hash{}, fmt.Errorf("%w: session begin rejected for namespace %s: %s", ErrUnauthenticated, ns, *ack.Error)
+		}
+		return "", codec.Hash{}, fmt.Errorf("kdb: session begin rejected for namespace %s", ns)
+	}
+	head, err := codec.HashFromHex(ack.HeadHex)
+	if err != nil {
+		return "", codec.Hash{}, err
+	}
+	return ack.SessionID, head, nil
 }
 
 // PutJSON writes one document as a new commit in namespace ns - used for the create-only /

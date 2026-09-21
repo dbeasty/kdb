@@ -96,8 +96,29 @@ func (p *rdParser) parseStatement() (Statement, error) {
 			return nil, p.parseError("expected INDEX")
 		}
 		return p.parseDropIndexBody()
+	case p.matchKeyword("BEGIN"):
+		p.matchWorkOrTransaction()
+		return StmtBegin{}, nil
+	case p.matchKeyword("START"):
+		if !p.matchKeyword("TRANSACTION") {
+			return nil, p.parseError("expected TRANSACTION")
+		}
+		return StmtBegin{}, nil
+	case p.matchKeyword("COMMIT"), p.matchKeyword("END"):
+		p.matchWorkOrTransaction()
+		return StmtCommit{}, nil
+	case p.matchKeyword("ROLLBACK"), p.matchKeyword("ABORT"):
+		p.matchWorkOrTransaction()
+		return StmtRollback{}, nil
 	default:
-		return nil, p.parseError("expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP")
+		return nil, p.parseError("expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, BEGIN, COMMIT, or ROLLBACK")
+	}
+}
+
+// matchWorkOrTransaction consumes the optional noise word after BEGIN, COMMIT or ROLLBACK.
+func (p *rdParser) matchWorkOrTransaction() {
+	if !p.matchKeyword("WORK") {
+		p.matchKeyword("TRANSACTION")
 	}
 }
 

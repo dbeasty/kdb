@@ -223,3 +223,54 @@ func TestShapeFingerprintCoversLayer16Nodes(t *testing.T) {
 		t.Fatal("HasAggregate")
 	}
 }
+
+func TestParseTransactionControl(t *testing.T) {
+	p := sql.DefaultParser{}
+	for sqlText, want := range map[string]sql.Statement{
+		"BEGIN": sql.StmtBegin{}, "begin work;": sql.StmtBegin{}, "BEGIN TRANSACTION": sql.StmtBegin{},
+		"START TRANSACTION": sql.StmtBegin{}, "COMMIT": sql.StmtCommit{}, "commit work": sql.StmtCommit{},
+		"END": sql.StmtCommit{}, "ROLLBACK": sql.StmtRollback{}, "ROLLBACK TRANSACTION;": sql.StmtRollback{},
+		"ABORT": sql.StmtRollback{},
+	} {
+		got, err := p.Parse(sqlText)
+		if err != nil {
+			t.Errorf("%q: %v", sqlText, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("%q parsed as %#v, want %#v", sqlText, got, want)
+		}
+		if !sql.IsTransactionControl(got) {
+			t.Errorf("%q is not reported as transaction control", sqlText)
+		}
+	}
+	for _, bad := range []string{"START", "BEGIN NOW", "COMMIT everything"} {
+		if _, err := p.Parse(bad); err == nil {
+			t.Errorf("%q parsed", bad)
+		}
+	}
+}
+
+func TestTargetTableNamesQualifiedTables(t *testing.T) {
+	p := sql.DefaultParser{}
+	for sqlText, want := range map[string]string{
+		"SELECT * FROM bank.ledger WHERE x = 1":          "bank.ledger",
+		"INSERT INTO ledger (_doc) VALUES ('{}')":        "ledger",
+		"UPDATE bank.accounts SET balance = 1":           "bank.accounts",
+		"DELETE FROM accounts a WHERE a.balance = 0":     "accounts",
+		"CREATE TABLE bank.audit (who VARCHAR NOT NULL)": "bank.audit",
+	} {
+		stmt, err := p.Parse(sqlText)
+		if err != nil {
+			t.Fatalf("%q: %v", sqlText, err)
+		}
+		ref, ok := sql.TargetTable(stmt)
+		if !ok || ref.Name != want {
+			t.Errorf("%q: table %q (%v), want %q", sqlText, ref.Name, ok, want)
+		}
+	}
+	stmt, _ := p.Parse("SELECT 1")
+	if _, ok := sql.TargetTable(stmt); ok {
+		t.Error("a table-less SELECT reported a table")
+	}
+}

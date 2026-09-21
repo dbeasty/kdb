@@ -67,6 +67,15 @@ type KdbSession struct {
 	// tell the leases a client is holding across round trips from the implicit locks the commit
 	// itself takes and drops: releasing by session id would silently revoke the former.
 	leases map[codec.UUID]transaction.Lease
+
+	// crossMu guards cross and snapshotHeads: the current transaction's state in namespaces
+	// other than this session's own, for SQL statements that name them (sql_cross_namespace.go).
+	// Taken after versionMu when both are held, never before.
+	crossMu sync.Mutex
+	cross   map[string]*crossNamespaceState
+	// snapshotHeads is the multi-namespace snapshot an explicit BEGIN took for a SNAPSHOT
+	// session: where it will read each namespace it has not touched yet.
+	snapshotHeads map[string]codec.Hash
 }
 
 // BaseVersion returns the commit this session's next write anchors on.
@@ -103,6 +112,8 @@ func (s *KdbSession) ReadHead(liveHead func() (codec.Hash, error)) (codec.Hash, 
 func (s *KdbSession) startTransactionAt(head codec.Hash) {
 	s.versionMu.Lock()
 	defer s.versionMu.Unlock()
+	// A transaction boundary ends the transaction in every namespace, not only this one.
+	s.clearCross()
 	s.baseVersion = head
 	s.releasePinLocked()
 	if s.ReadConsistency == Snapshot {
@@ -150,6 +161,7 @@ func (s *KdbSession) releasePinLocked() {
 func (s *KdbSession) EndTransaction() {
 	s.versionMu.Lock()
 	defer s.versionMu.Unlock()
+	s.clearCross()
 	s.releasePinLocked()
 }
 

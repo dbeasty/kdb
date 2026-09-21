@@ -246,11 +246,70 @@ namespace).
 | 11 | Tests: engine equivalence, atomicity on every rejection kind, crash at every protocol point, replay stability across restarts, follower holds, checkpoint guard, invariant-preserving concurrent transfers under `-race`, snapshot consistency, deadlock freedom, wire + client e2e | `*_test.go` |
 | 12 | Benchmarks: cross vs single vs non-atomic pair, disjoint scaling, cost to single-namespace writers, simple-lock variant for comparison | `server/cross_namespace_bench_test.go`, `docs/benchmarks/2026-09-20-cross-namespace-transactions.md` |
 
-## 6. Follow-ups (not in this change)
+## 6. Follow-ups
 
-- Full wire routing by namespace for session-bound frames (`SQL_EXEC`, `TX_COMMIT`, `UPSERT`,
-  leases) — today those still serve the primary namespace only.
-- Cross-namespace SQL transactions.
+- Full wire routing by namespace for session-bound frames (`TX_COMMIT` with client-built bytes,
+  `UPSERT`, leases) — those still serve the primary namespace only. SQL reaches other namespaces
+  through its table names instead (§7).
+- ~~Cross-namespace SQL transactions.~~ Done, §7.
 - Include `txn/` in `backup.CreateDatabase`; today a database backup is taken with no writer
   running, so every epoch it could see is sealed, but a crash-left `.dead` epoch is not copied.
 - The Kotlin reference has no cross-namespace commit; it reads group parts as ordinary commits.
+
+## 7. Cross-namespace SQL transactions
+
+`BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, and `ROLLBACK` / `ABORT` (each with optional `WORK`
+or `TRANSACTION`) are now parsed by the Go SQL engine and run by the wire server. A SQL
+transaction can write to several namespaces, and its `COMMIT` commits every one of them through
+`NamespaceSet.CommitAcross`, with every guarantee in §2.
+
+### 7.1 Which namespace a statement touches
+
+A SQL session is opened on one namespace. With a `NamespaceSet` configured (kdb-service always
+has one), a statement's table picks its namespace:
+
+| Table in the statement | Namespace |
+|---|---|
+| qualified, `bank.ledger` | always `bank/ledger`. A write may create it; a read of a missing one is an error. |
+| unqualified, `ledger`, and `<session catalog>/ledger` exists | that namespace, the Kotlin/JDBC mapping |
+| unqualified, anything else | the session's own namespace, which is what every table has meant on the Go server so far |
+
+Without a `NamespaceSet` nothing is routed and table names mean what they always did.
+
+The fallback keeps every existing client working. It has one sharp edge, which was chosen
+knowingly: creating a namespace whose name matches a table that clients use unqualified redirects
+those statements to the new namespace from then on. Qualify table names in new code.
+
+### 7.2 Transaction state
+
+The wire session already had an implicit transaction: DML buffers until `TX_COMMIT`. Nothing about
+that changes. SQL `COMMIT` is `TX_COMMIT` and SQL `ROLLBACK` is `TX_ROLLBACK`; both now act on
+every namespace the transaction touched. `BEGIN` starts the next transaction at the current head.
+It is refused while writes are pending: it neither commits them implicitly nor keeps them silently.
+
+For each other namespace it touches, a session keeps what it keeps for its own:
+
+- A **pending builder**, whose base version is fixed by the first write in that namespace.
+  Conflict detection works exactly as it does for the session's own namespace.
+- For a `SNAPSHOT` session, a **read point**, pinned so compaction cannot reclaim it. An explicit
+  `BEGIN` on a `SNAPSHOT` session takes one `NamespaceSet.Snapshot` of every namespace, so a
+  transaction that reads several of them sees all of them as of one instant. Without `BEGIN`, a
+  namespace's read point is its head at first touch.
+
+Every transaction boundary (commit, rollback, `BEGIN`, session end) drops the pending builders
+and releases the pins in every namespace.
+
+### 7.3 Go client
+
+```go
+tx, err := c.BeginTx(ctx, "bank/accounts", client.TxOptions{Snapshot: true}) // or c.Begin
+defer tx.Rollback(ctx)                                                        // no-op after Commit
+tx.Exec(ctx, "UPDATE accounts SET balance = balance - ? WHERE owner = ?", 30, "ada")
+tx.Exec(ctx, "INSERT INTO bank.ledger (owner, debit) VALUES (?, ?)", "ada", 30)
+_, err = tx.Commit(ctx) // both namespaces or neither
+```
+
+A `Tx` runs on a server session of its own. The client's cached per-namespace session is shared
+with `Exec`, which auto-commits, and would otherwise commit a transaction's buffered writes out
+from under it. Sessions are reused across transactions: the protocol has no way to end one short
+of closing the connection. A conflict in another namespace is a `*CrossNamespaceError` naming it.

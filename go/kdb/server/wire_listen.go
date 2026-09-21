@@ -504,10 +504,10 @@ func (h *sqlWireConnHandler) handleSessionBegin(msg wire.SessionBeginMessage) wi
 // handleSqlExec runs SELECT immediately (read-only, at the session's read head), applies DDL
 // (CREATE TABLE, CREATE/DROP INDEX) immediately, and buffers DML - INSERT, UPDATE, DELETE, and
 // any statement kind that is neither a SELECT nor DDL - as document ops on the session's pending
-// transaction builder; it does not commit. A client must send TxCommit to persist buffered
-// writes. (No BEGIN/COMMIT SQL-text transaction control exists yet - go/kdb/sql's parser doesn't
-// parse those statements - so TxCommit/TxRollback are the only way to flush or discard buffered
-// writes in this phase.)
+// transaction builder; it does not commit. Buffered writes are persisted by TxCommit or SQL
+// COMMIT and discarded by TxRollback or SQL ROLLBACK (execTransactionControl). With a
+// NamespaceSet, a statement whose table names another namespace runs there, and the commit spans
+// every namespace the transaction touched - see sql_cross_namespace.go.
 func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message {
 	if hook := h.runtime.beforeSqlExecHook(); hook != nil {
 		hook(msg)
@@ -520,12 +520,26 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 	if err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
 	}
+	if sql.IsTransactionControl(stmt) {
+		return h.execTransactionControl(msg, sess, stmt)
+	}
 	// ReadOnly must be false for anything that isn't actually a read - a read-only principal
 	// must be able neither to buffer writes (DML) nor to rewrite the namespace's schema (DDL,
 	// kdb-finish-up-plan.md's 1-G6).
 	isSelect, isDDL := classifyStatement(stmt)
-	action := auth.SqlExecAction{Namespace: msg.Namespace, ReadOnly: isSelect}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), sess.Principal, action); err != nil {
+	// The namespace the statement's table names, which is the session's own unless a
+	// NamespaceSet routes it elsewhere (sql_cross_namespace.go). Authorized there, by that
+	// namespace's engine: the grant that matters is the one on the data being touched.
+	target, err := h.statementTarget(stmt, !isSelect)
+	if err != nil {
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+	}
+	actionNS := msg.Namespace
+	if !target.own {
+		actionNS = target.ns
+	}
+	action := auth.SqlExecAction{Namespace: actionNS, ReadOnly: isSelect}
+	if err := target.rt.AuthEngine.Authorizer().Authorize(context.Background(), sess.Principal, action); err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, (&AuthorizationError{Cause: err}).Error())
 	}
 	params, err := decodeParametersJSON(msg.ParametersJSON)
@@ -533,9 +547,9 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, "invalid parameters: "+err.Error())
 	}
 	if isSelect || isDDL {
-		return h.execRead(msg, sess, params, stmt)
+		return h.execRead(msg, sess, target, params, stmt)
 	}
-	return h.execDML(msg, sess, params)
+	return h.execDML(msg, sess, target, params)
 }
 
 // classifyStatement sorts a parsed statement into the three paths handleSqlExec has: a SELECT
@@ -560,12 +574,20 @@ func classifyStatement(stmt sql.Statement) (isSelect, isDDL bool) {
 // synchronously waiting on, and a fast typed Busy beats a slow success at the tail.
 const readAcquireTimeout = 2 * time.Second
 
-func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession, params []sql.Parameter, stmt sql.Statement) wire.Message {
+func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession, target sqlTarget, params []sql.Parameter, stmt sql.Statement) wire.Message {
 	// A SNAPSHOT session reads at the pin its current transaction started from;
 	// READ_COMMITTED/READ_YOUR_WRITES follow the live head. See KdbSession.ReadHead for the
 	// two bugs this has had - a pin that was computed and never read, then a pin that was read
 	// but never advanced.
-	resolved, err := sess.ReadHead(h.runtime.Runtime.DAG.Head)
+	rt, namespaceID := target.rt, sess.NamespaceID
+	var resolved codec.Hash
+	var err error
+	if target.own {
+		resolved, err = sess.ReadHead(h.runtime.Runtime.DAG.Head)
+	} else {
+		namespaceID = target.ns
+		resolved, err = sess.crossReadHead(target)
+	}
 	if err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
 	}
@@ -581,12 +603,12 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		estimate int64
 		grant    *Grant
 	)
-	adm := h.runtime.admission
+	adm := rt.admission
 	if sel, ok := stmt.(sql.StmtSelect); ok && adm != nil {
 		scanIn = ScanEstimateInput{
-			Namespace: sess.NamespaceID,
+			Namespace: namespaceID,
 			Shape:     sql.ShapeOfSelect(sel.Query),
-			TreeSize:  h.runtime.treeSizeAt(*head),
+			TreeSize:  rt.treeSizeAt(*head),
 			MaxRows:   10_000,
 			RowBudget: int(adm.ScanRowBudget()),
 		}
@@ -603,18 +625,18 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 
 	stats := &sql.ExecStats{}
 	ctx := sql.QueryContext{
-		NamespaceID: sess.NamespaceID,
-		Schema:      h.runtime.Schema(),
+		NamespaceID: namespaceID,
+		Schema:      rt.Schema(),
 		AtCommit:    head,
 		Parameters:  params,
 		MaxRows:     10_000,
 		// Bounds rows *examined*, and shrinks automatically as memory pressure rises - a scan
 		// that reads the whole namespace to return nothing is otherwise unbounded work no
 		// admission decision can see coming (kdb-spec-layer13 §2.8).
-		RowBudget: int(h.runtime.admission.ScanRowBudget()),
+		RowBudget: int(rt.admission.ScanRowBudget()),
 		Stats:     stats,
 	}
-	result, err := h.runtime.SQLEngine().Execute(msg.SQL, ctx)
+	result, err := rt.SQLEngine().Execute(msg.SQL, ctx)
 	if err != nil {
 		// Classified, not a bare string: a scan aborted for exceeding its row budget has to reach
 		// the client as RESOURCE_EXHAUSTED, or the one signal telling them to narrow the query
@@ -625,7 +647,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		// Checked, not blind: a schema that turns a field unique must be rejected outright when
 		// the data already there violates it, rather than applied and left permanently at odds
 		// with its own namespace.
-		if err := h.runtime.SetSchemaChecked(*result.AppliedSchema); err != nil {
+		if err := rt.SetSchemaChecked(*result.AppliedSchema); err != nil {
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 		}
 	}
@@ -637,7 +659,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		actual := stats.RetainedBytes + stringsBytes(rows)
 		adm.Costs().ObserveScanActual(scanIn, estimate, actual)
 		if stats.DocsRead > 0 {
-			adm.Costs().ObserveDocSize(sess.NamespaceID, int(stats.DocBytesRead/int64(stats.DocsRead)))
+			adm.Costs().ObserveDocSize(namespaceID, int(stats.DocBytesRead/int64(stats.DocsRead)))
 		}
 	}
 	return wire.SqlResultMessage{
@@ -667,25 +689,38 @@ func stringsBytes(rows [][]string) int64 {
 // execDML resolves a mutating statement into document ops (INSERT mints or derives ids; UPDATE
 // and DELETE scan for their targets at the session's read head) and buffers them on the
 // session's pending transaction.
-func (h *sqlWireConnHandler) execDML(msg wire.SqlExecMessage, sess *KdbSession, params []sql.Parameter) wire.Message {
-	readHead, err := sess.ReadHead(h.runtime.Runtime.DAG.Head)
+func (h *sqlWireConnHandler) execDML(msg wire.SqlExecMessage, sess *KdbSession, target sqlTarget, params []sql.Parameter) wire.Message {
+	rt, namespaceID := target.rt, sess.NamespaceID
+	var readHead codec.Hash
+	var err error
+	if target.own {
+		readHead, err = sess.ReadHead(h.runtime.Runtime.DAG.Head)
+	} else {
+		namespaceID = target.ns
+		readHead, err = sess.crossReadHead(target)
+	}
 	if err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
 	}
 	ctx := sql.QueryContext{
 		AtCommit:    &readHead,
-		NamespaceID: sess.NamespaceID,
-		Schema:      h.runtime.Schema(),
+		NamespaceID: namespaceID,
+		Schema:      rt.Schema(),
 		Parameters:  params,
 		// UPDATE/DELETE resolve their target rows by scanning too, so the same bound applies -
 		// an unbounded DML predicate is unbounded work for exactly the same reason a SELECT's is.
-		RowBudget: int(h.runtime.admission.ScanRowBudget()),
+		RowBudget: int(rt.admission.ScanRowBudget()),
 	}
-	dmlResult, err := h.runtime.SQLEngine().ExecuteDML(msg.SQL, ctx)
+	dmlResult, err := rt.SQLEngine().ExecuteDML(msg.SQL, ctx)
 	if err != nil {
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
-	builder := h.sessions.PendingBuilder(sess)
+	var builder *transaction.Builder
+	if target.own {
+		builder = h.sessions.PendingBuilder(sess)
+	} else if builder, err = sess.crossBuilder(target); err != nil {
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+	}
 	for _, op := range dmlResult.Operations {
 		switch o := op.(type) {
 		case document.WriteOp:
@@ -699,83 +734,160 @@ func (h *sqlWireConnHandler) execDML(msg wire.SqlExecMessage, sess *KdbSession, 
 		Namespace:         msg.Namespace,
 		SessionID:         msg.SessionID,
 		RowsAffected:      dmlResult.RowsAffected,
-		ResolvedCommitHex: sess.BaseVersion().Hex(),
+		ResolvedCommitHex: builder.BaseVersion.Hex(),
 		ReadOnly:          false,
 		GeneratedIDs:      dmlResult.GeneratedIDs,
 	}
 }
 
-// handleTxCommit commits the session's buffered pending transaction. msg.TransactionBytes
-// (a client-pre-built, already-encoded transaction) is not yet supported - go/kdb/wire has no
-// document.Transaction codec (that's Component 40's Go client SDK territory) - and is rejected
-// with a clean, named error rather than silently ignored.
+// handleTxCommit commits the session's buffered pending transaction - see commitSession.
 func (h *sqlWireConnHandler) handleTxCommit(msg wire.TxCommitMessage) wire.Message {
 	sess, ok := h.sessions.Get(msg.SessionID)
 	if !ok {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, "unknown session: "+msg.SessionID)
 	}
-	var tx document.Transaction
-	if len(msg.TransactionBytes) > 0 {
-		// A client-pre-built, already-encoded transaction (component 40's Go Client SDK path:
-		// PutJSON/Commit build one directly with wire.EncodeTransaction, since it's the only
-		// way to write at a caller-chosen document id - SqlExec's INSERT always mints a fresh
-		// random UUID). Takes priority over the session's pending builder, matching the Kotlin
-		// reference's commitEncodedTransaction.
-		decoded, err := wire.DecodeTransaction(msg.TransactionBytes)
+	return h.commitSession(msg.H.CorrelationID, msg.Namespace, sess, msg.TransactionBytes)
+}
+
+// commitSession commits the session's current transaction: TX_COMMIT, and SQL COMMIT.
+//
+// encoded, when non-empty, is a client-built transaction for the session's own namespace (the Go
+// client SDK's path: PutJSON/Commit build one directly with wire.EncodeTransaction, since it is the
+// only way to write at a caller-chosen document id). It takes priority over the session's pending
+// builder, matching the Kotlin reference's commitEncodedTransaction.
+//
+// When the transaction also buffered writes in other namespaces (SQL naming another namespace's
+// table), every namespace commits together or none does, through NamespaceSet.CommitAcross.
+func (h *sqlWireConnHandler) commitSession(correlationID int, namespace string, sess *KdbSession, encoded []byte) wire.Message {
+	var tx *document.Transaction
+	if len(encoded) > 0 {
+		decoded, err := wire.DecodeTransaction(encoded)
 		if err != nil {
-			return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, "invalid transactionBytes: "+err.Error())
+			return sqlResultError(correlationID, namespace, sess.ID.Value, "invalid transactionBytes: "+err.Error())
 		}
-		tx = decoded
-	} else {
-		if sess.Pending == nil {
-			return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, "no pending transaction to commit")
-		}
+		tx = &decoded
+	} else if sess.Pending != nil {
 		built, err := sess.Pending.Build(codec.Timestamp{})
 		if err != nil {
-			return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+			return sqlResultError(correlationID, namespace, sess.ID.Value, err.Error())
 		}
-		tx = built
+		tx = &built
 	}
-	// Any lease this session took explicitly must still be current before the commit runs.
-	// Acquiring below would happily re-grant a document whose lease had lapsed and been picked
-	// up by nobody - under a brand-new fence token - which would let a writer that had already
-	// lost its claim land the write anyway. Checking the fences first is what closes that.
-	held := sess.LeasesFor(transaction.DocumentIDsIn(tx.Operations))
-	if err := h.runtime.DocumentLocks.ValidateFences(held); err != nil {
-		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+	others := sess.pendingCross()
+	if tx == nil && len(others) == 0 {
+		return sqlResultError(correlationID, namespace, sess.ID.Value, "no pending transaction to commit")
+	}
+	if tx != nil {
+		// Any lease this session took explicitly must still be current before the commit runs.
+		// Acquiring below would happily re-grant a document whose lease had lapsed and been
+		// picked up by nobody - under a brand-new fence token - which would let a writer that had
+		// already lost its claim land the write anyway. Checking the fences first is what closes
+		// that.
+		held := sess.LeasesFor(transaction.DocumentIDsIn(tx.Operations))
+		if err := h.runtime.DocumentLocks.ValidateFences(held); err != nil {
+			return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, err)
+		}
+	}
+	if len(others) > 0 {
+		return h.commitSessionAcross(correlationID, namespace, sess, tx, others)
 	}
 	// Refuse only what someone else is actually holding. The commit does not take locks of its
 	// own: writes into a runtime are already serialized by the write gate, and taking fail-fast
 	// locks on top of that meant a writer waiting its turn in the gate refused every other
 	// writer to the same document instead of letting them queue behind it.
-	if err := h.runtime.DocumentLocks.AssertUnheldByOthers(sess.NamespaceID, sess.ID.Value, tx); err != nil {
-		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+	if err := h.runtime.DocumentLocks.AssertUnheldByOthers(sess.NamespaceID, sess.ID.Value, *tx); err != nil {
+		return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, err)
 	}
-	commit, err := h.runtime.Commit(sess.NamespaceID, tx, sess.ID.Value, sess.Principal)
+	commit, err := h.runtime.Commit(sess.NamespaceID, *tx, sess.ID.Value, sess.Principal)
 	h.sessions.ClearPending(sess)
 	if err != nil {
 		var conflictErr *ConflictError
 		if asError(err, &conflictErr) {
-			return conflictReport(msg.H.CorrelationID, msg.Namespace, conflictErr)
+			return conflictReport(correlationID, namespace, conflictErr)
 		}
-		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+		return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, err)
 	}
 	// The transaction is over: the next one anchors on - and, for a SNAPSHOT session, reads at -
 	// the commit just produced. Without re-pinning here a SNAPSHOT session kept reading at the
 	// version it opened with and could not see its own committed writes.
 	sess.startTransactionAt(commit.Hash)
 	return wire.SqlResultMessage{
-		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
-		Namespace:         msg.Namespace,
-		SessionID:         msg.SessionID,
+		H:                 header(correlationID, wire.MsgSqlResult),
+		Namespace:         namespace,
+		SessionID:         sess.ID.Value,
 		RowsAffected:      len(tx.Operations),
 		ResolvedCommitHex: commit.Hash.Hex(),
 		ReadOnly:          false,
 	}
 }
 
+// commitSessionAcross commits a transaction that wrote to namespaces besides the session's own.
+// own is the session's own namespace's share, nil when the transaction wrote nothing there.
+func (h *sqlWireConnHandler) commitSessionAcross(correlationID int, namespace string, sess *KdbSession, own *document.Transaction, others []string) wire.Message {
+	ownNS := h.runtime.Runtime.DefaultNamespace
+	var parts []NamespaceTransaction
+	rows := 0
+	if own != nil {
+		parts = append(parts, NamespaceTransaction{Namespace: ownNS, Tx: *own, SessionID: sess.ID.Value})
+		rows += len(own.Operations)
+	}
+	sess.crossMu.Lock()
+	for _, ns := range others {
+		built, err := sess.cross[ns].builder.Build(codec.Timestamp{})
+		if err != nil {
+			sess.crossMu.Unlock()
+			return sqlResultError(correlationID, namespace, sess.ID.Value, err.Error())
+		}
+		parts = append(parts, NamespaceTransaction{Namespace: ns, Tx: built, SessionID: sess.ID.Value})
+		rows += len(built.Operations)
+	}
+	sess.crossMu.Unlock()
+
+	result, err := h.runtime.namespaceSet().CommitAcross(parts, sess.Principal)
+	h.sessions.ClearPending(sess)
+	if err != nil {
+		// The transaction is over either way, in every namespace it touched.
+		sess.clearCross()
+		var conflictErr *ConflictError
+		if asError(err, &conflictErr) {
+			// The report names the namespace that refused, which need not be the session's.
+			failedNS := namespace
+			var cne *CrossNamespaceError
+			if asError(err, &cne) {
+				failedNS = cne.Namespace
+			}
+			return conflictReport(correlationID, failedNS, conflictErr)
+		}
+		return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, err)
+	}
+	next, wrote := result.Commit(ownNS)
+	resolved := next.Hash
+	if !wrote {
+		head, herr := h.runtime.Runtime.DAG.Head()
+		if herr != nil {
+			return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, herr)
+		}
+		resolved = head
+	}
+	sess.startTransactionAt(resolved)
+	return wire.SqlResultMessage{
+		H:                 header(correlationID, wire.MsgSqlResult),
+		Namespace:         namespace,
+		SessionID:         sess.ID.Value,
+		RowsAffected:      rows,
+		ResolvedCommitHex: resolved.Hex(),
+		ReadOnly:          false,
+	}
+}
+
 func (h *sqlWireConnHandler) handleTxRollback(msg wire.TxRollbackMessage) wire.Message {
-	sess, ok := h.sessions.Get(msg.SessionID)
+	return h.rollbackSession(msg.H.CorrelationID, msg.Namespace, msg.SessionID)
+}
+
+// rollbackSession abandons the session's current transaction in every namespace it touched:
+// TX_ROLLBACK, and SQL ROLLBACK.
+func (h *sqlWireConnHandler) rollbackSession(correlationID int, namespace, sessionID string) wire.Message {
+	sess, ok := h.sessions.Get(sessionID)
 	head, headErr := h.runtime.Runtime.DAG.Head()
 	headHex := ""
 	if headErr == nil {
@@ -783,9 +895,9 @@ func (h *sqlWireConnHandler) handleTxRollback(msg wire.TxRollbackMessage) wire.M
 	}
 	if !ok {
 		return wire.SqlResultMessage{
-			H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
-			Namespace:         msg.Namespace,
-			SessionID:         msg.SessionID,
+			H:                 header(correlationID, wire.MsgSqlResult),
+			Namespace:         namespace,
+			SessionID:         sessionID,
 			ResolvedCommitHex: headHex,
 			ReadOnly:          false,
 		}
@@ -796,17 +908,69 @@ func (h *sqlWireConnHandler) handleTxRollback(msg wire.TxRollbackMessage) wire.M
 	h.runtime.DocumentLocks.ReleaseAll(sess.ID.Value)
 	sess.ClearLeases()
 	h.sessions.ClearPending(sess)
+	sess.clearCross()
 	// Rollback ends the transaction too, so the next one starts from the current head rather
 	// than from the abandoned transaction's snapshot.
 	if headErr == nil {
 		sess.startTransactionAt(head)
 	}
 	return wire.SqlResultMessage{
+		H:                 header(correlationID, wire.MsgSqlResult),
+		Namespace:         namespace,
+		SessionID:         sessionID,
+		ResolvedCommitHex: headHex,
+		ReadOnly:          false,
+	}
+}
+
+// execTransactionControl runs BEGIN, COMMIT and ROLLBACK sent as SQL text.
+//
+// The wire session has always had an implicit transaction - DML buffers until TX_COMMIT - so
+// COMMIT and ROLLBACK are exactly TX_COMMIT and TX_ROLLBACK. BEGIN starts the next transaction
+// fresh at the current head (re-pinning a SNAPSHOT session's reads), and for a SNAPSHOT session
+// on a runtime with a NamespaceSet, takes one consistent snapshot of every namespace, so a
+// transaction that reads several of them sees them all as of one instant.
+func (h *sqlWireConnHandler) execTransactionControl(msg wire.SqlExecMessage, sess *KdbSession, stmt sql.Statement) wire.Message {
+	switch stmt.(type) {
+	case sql.StmtCommit:
+		return h.commitSession(msg.H.CorrelationID, msg.Namespace, sess, nil)
+	case sql.StmtRollback:
+		return h.rollbackSession(msg.H.CorrelationID, msg.Namespace, msg.SessionID)
+	}
+	if sess.hasPendingWrites() {
+		// Not an implicit COMMIT (MySQL) and not a warning that is easy to miss (PostgreSQL):
+		// silently committing or keeping writes the client may have forgotten about are both
+		// worse than asking it to say which it meant.
+		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
+			"a transaction with pending writes is already open; COMMIT or ROLLBACK it first")
+	}
+	head, err := h.runtime.Runtime.DAG.Head()
+	if err != nil {
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+	}
+	var heads map[string]codec.Hash
+	if set := h.runtime.Namespaces; set != nil && sess.ReadConsistency == Snapshot {
+		heads, err = set.Snapshot(set.Namespaces()...)
+		if err != nil {
+			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
+		}
+		if own, ok := heads[h.runtime.Runtime.DefaultNamespace]; ok {
+			head = own
+			delete(heads, h.runtime.Runtime.DefaultNamespace)
+		}
+	}
+	sess.startTransactionAt(head)
+	if heads != nil {
+		sess.crossMu.Lock()
+		sess.snapshotHeads = heads
+		sess.crossMu.Unlock()
+	}
+	return wire.SqlResultMessage{
 		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
 		Namespace:         msg.Namespace,
 		SessionID:         msg.SessionID,
-		ResolvedCommitHex: headHex,
-		ReadOnly:          false,
+		ResolvedCommitHex: head.Hex(),
+		ReadOnly:          true,
 	}
 }
 
