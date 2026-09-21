@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -36,7 +37,7 @@ import (
 // segments in commit order, which Component 47 §4.1 guarantees - that set
 // is empty.
 func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r storage.DeltaSegmentReader) error {
-	return replayDeltaNamespaceFrom(d, store, r, -1)
+	return replayDeltaNamespaceFrom(d, store, r, -1, nil)
 }
 
 // replayDeltaNamespaceFrom is replayDeltaNamespace restricted to segments
@@ -49,11 +50,16 @@ func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r sto
 // resuming the previous run's last one - so a segment that existed when a
 // checkpoint was taken is never appended to afterwards, and "this sequence
 // is fully accounted for" cannot go stale.
+//
+// coord decides the parts of cross-namespace groups the log contains: a part whose group never
+// committed is dropped, along with everything descending from it (see groupGate). nil keeps every
+// part, which is right only for namespaces no group can have touched.
 func replayDeltaNamespaceFrom(
 	d *dag.InMemoryCommitDag,
 	store storage.Adapter,
 	r storage.DeltaSegmentReader,
 	afterSequence int64,
+	coord *TxnCoordinator,
 ) error {
 	if r == nil {
 		return nil
@@ -72,6 +78,8 @@ func replayDeltaNamespaceFrom(
 		}
 	}
 
+	gate := newGroupGate(d, coord)
+	defer gate.report()
 	// deferred holds only commits whose parents had not been applied when
 	// they were read - see applyCommitsTopologically, which drains it.
 	var deferred []document.Commit
@@ -79,6 +87,9 @@ func replayDeltaNamespaceFrom(
 		read := 0
 		readErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
 			read++
+			if gate.skip(c) {
+				return nil
+			}
 			applied, err := applyIfParentsReady(d, store, c)
 			if err != nil {
 				return &replayApplyError{err: err}
@@ -123,7 +134,82 @@ func replayDeltaNamespaceFrom(
 		}
 	}
 
-	return applyCommitsTopologically(d, store, deferred)
+	return applyCommitsTopologically(d, store, deferred, gate)
+}
+
+// groupGate is replay's view of cross-namespace groups: which commits to leave out, and why.
+//
+// A part whose group did not commit is dropped, and so is every commit descending from a dropped
+// commit. That is safe, and not just convenient, because nothing descending from an undecided part
+// was ever acknowledged: a commit queued behind a part waits for the part's group to be decided
+// before its own acknowledgement (see chainOnBarrier). Dropping by ancestry rather than by position
+// in the log is what keeps the answer the same on every later open - a commit made after this
+// recovery descends from the head recovery chose, not from the dropped part, however far along
+// the log it lands.
+//
+// A held part - undecided, with a live writer that may yet decide it, which only a read-only
+// follower sees - is left out with its descendants in the same way, but without prejudice: the
+// next replay asks again.
+type groupGate struct {
+	d       *dag.InMemoryCommitDag
+	coord   *TxnCoordinator
+	dropped map[codec.Hash]struct{}
+	held    map[codec.Hash]struct{}
+	// droppedGroups counts distinct groups rolled back, for the one log line replay emits.
+	droppedGroups map[codec.UUID]struct{}
+}
+
+func newGroupGate(d *dag.InMemoryCommitDag, coord *TxnCoordinator) *groupGate {
+	if coord == nil {
+		return nil
+	}
+	return &groupGate{
+		d:             d,
+		coord:         coord,
+		dropped:       make(map[codec.Hash]struct{}),
+		held:          make(map[codec.Hash]struct{}),
+		droppedGroups: make(map[codec.UUID]struct{}),
+	}
+}
+
+// skip reports whether c must be left out of this replay.
+func (g *groupGate) skip(c document.Commit) bool {
+	if g == nil || g.d.HasCommit(c.Hash) {
+		return false
+	}
+	for _, p := range c.ParentHashes {
+		if _, ok := g.dropped[p]; ok {
+			g.dropped[c.Hash] = struct{}{}
+			return true
+		}
+		if _, ok := g.held[p]; ok {
+			g.held[c.Hash] = struct{}{}
+			return true
+		}
+	}
+	decision, isPart := g.coord.resolvePart(c)
+	if !isPart {
+		return false
+	}
+	switch decision {
+	case partAborted:
+		g.dropped[c.Hash] = struct{}{}
+		g.droppedGroups[c.TransactionID] = struct{}{}
+		return true
+	case partHeld:
+		g.held[c.Hash] = struct{}{}
+		return true
+	}
+	return false
+}
+
+func (g *groupGate) report() {
+	if g == nil || len(g.dropped) == 0 {
+		return
+	}
+	log.Printf("kdb: namespace %s: rolled back %d commit(s) belonging to or built on %d cross-namespace "+
+		"transaction(s) that never committed (cut off by an unclean shutdown before their decision was durable; "+
+		"none of them was ever acknowledged)", g.d.NamespaceID, len(g.dropped), len(g.droppedGroups))
 }
 
 // replayApplyError distinguishes "applying this commit failed" from
@@ -192,7 +278,7 @@ func applyIfParentsReady(d *dag.InMemoryCommitDag, store storage.Adapter, c docu
 // rounds only run at all if something upstream still got the order
 // wrong, so this stays cheap in the case it exists to protect against
 // being rare.
-func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, commits []document.Commit) error {
+func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, commits []document.Commit, gate *groupGate) error {
 	pending := make([]document.Commit, 0, len(commits))
 	for _, c := range commits {
 		if !d.HasCommit(c.Hash) {
@@ -203,6 +289,12 @@ func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, 
 		var next []document.Commit
 		progressed := false
 		for _, c := range pending {
+			// Re-asked here rather than trusted from the streaming pass: a parent that was still
+			// unread then may since have been dropped, and its descendants go with it.
+			if gate.skip(c) {
+				progressed = true
+				continue
+			}
 			ready := true
 			for _, p := range c.ParentHashes {
 				if !d.HasCommit(p) {

@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -14,6 +15,12 @@ type PersistingCommitDAG struct {
 	delegate *dag.InMemoryCommitDag
 	writer   storage.DeltaSegmentWriter
 	log      *commitLogWriter
+
+	// barrier is the most recent cross-namespace group with a part in this log whose decision is
+	// not yet durable, or nil. Every commit queued behind it descends from that part, so it must
+	// not be acknowledged before the group is decided - see PersistAsync. Set and read under
+	// whatever serializes this namespace's writers, like the queue order itself.
+	barrier atomic.Pointer[TxnGroup]
 }
 
 // NewPersistingCommitDAG persists commits with DurabilitySync - every Persist
@@ -132,11 +139,49 @@ func (d *PersistingCommitDAG) PersistAsync(c document.Commit) (wait func() error
 	if d.log == nil {
 		return func() error { return nil }, nil
 	}
-	payload, err := c.ToPayloadBytes()
+	rec, err := deltaRecordFor(c)
 	if err != nil {
 		return nil, err
 	}
-	return d.log.EnqueueAsync(storage.DeltaRecord{
+	wait, err = d.log.EnqueueAsync(rec, c.DocumentTreeHash)
+	if err != nil {
+		return nil, err
+	}
+	return chainOnBarrier(wait, d.barrier.Load(), d.log.durability == storage.DurabilitySync), nil
+}
+
+// chainOnBarrier extends a durability wait with the decision of the group queued ahead of it.
+//
+// A commit queued behind an undecided group's part descends from that part. Should the group then
+// fail to commit - a crash before its decision is durable - recovery rolls the part back and, with
+// it, everything descending from it. So being on disk is not enough for this commit to be
+// acknowledged: the group ahead of it must also be decided. Only under DurabilitySync, where an
+// acknowledgement promises survival; an async acknowledgement promises nothing a crash cannot take.
+func chainOnBarrier(wait func() error, barrier *TxnGroup, syncAck bool) func() error {
+	if barrier == nil || !syncAck {
+		return wait
+	}
+	if barrier.decided() && barrier.Err() == nil {
+		return wait
+	}
+	return func() error {
+		if err := wait(); err != nil {
+			return err
+		}
+		<-barrier.done
+		if err := barrier.Err(); err != nil {
+			return &GroupFailedError{Group: barrier.ID, Cause: err}
+		}
+		return nil
+	}
+}
+
+func deltaRecordFor(c document.Commit) (storage.DeltaRecord, error) {
+	payload, err := c.ToPayloadBytes()
+	if err != nil {
+		return storage.DeltaRecord{}, err
+	}
+	return storage.DeltaRecord{
 		CommitHash:  c.Hash,
 		NamespaceID: c.NamespaceID,
 		Authorship: storage.DeltaAuthorshipEnvelope{
@@ -146,7 +191,45 @@ func (d *PersistingCommitDAG) PersistAsync(c document.Commit) (wait func() error
 			ClientContext: "",
 		},
 		CommitPayload: payload,
-	}, c.DocumentTreeHash)
+	}, nil
+}
+
+// persistPart queues one part of group g, with an acknowledgement that means "on disk" in every
+// durability mode, and makes g the barrier later commits in this log chain on. Returns the group
+// that was the barrier before - g's predecessor in this namespace - so g can order its decision
+// behind that one's.
+//
+// Must be called under the same serialization as PersistAsync: the queue position and the barrier
+// swap have to describe the same moment.
+func (d *PersistingCommitDAG) persistPart(c document.Commit, g *TxnGroup) (wait func() error, predecessor *TxnGroup, err error) {
+	predecessor = d.barrier.Load()
+	if predecessor != nil && predecessor.decided() && predecessor.Err() == nil {
+		predecessor = nil
+	}
+	if d.log == nil {
+		return func() error { return nil }, predecessor, nil
+	}
+	rec, err := deltaRecordFor(c)
+	if err != nil {
+		return nil, nil, err
+	}
+	wait, err = d.log.EnqueueDurableAsync(rec, c.DocumentTreeHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	d.barrier.Store(g)
+	return wait, predecessor, nil
+}
+
+// clearBarrier drops g as this log's barrier once it is decided, unless a later group has already
+// replaced it.
+func (d *PersistingCommitDAG) clearBarrier(g *TxnGroup) { d.barrier.CompareAndSwap(g, nil) }
+
+// fence refuses every later append with err. See commitLogWriter.fence.
+func (d *PersistingCommitDAG) fence(err error) {
+	if d.log != nil {
+		d.log.fence(err)
+	}
 }
 
 // Close drains and flushes everything still queued, then stops the log writer.
@@ -229,3 +312,9 @@ func (d *PersistingCommitDAG) ListTags() []document.Tag   { return d.delegate.Li
 func (d *PersistingCommitDAG) DeleteTag(name string) bool { return d.delegate.DeleteTag(name) }
 
 var _ dag.HistoryNavigator = (*PersistingCommitDAG)(nil)
+
+// AcknowledgesDurably reports whether a commit's durability wait means "on disk"
+// (storage.DurabilitySync). False under DurabilityAsync and for a DAG with no log at all.
+func (d *PersistingCommitDAG) AcknowledgesDurably() bool {
+	return d.log != nil && d.log.durability == storage.DurabilitySync
+}

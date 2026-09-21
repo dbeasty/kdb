@@ -84,6 +84,11 @@ const (
 	MsgRevert        MessageType = 0x21
 	MsgRevertResult  MessageType = 0x22
 
+	// Cross-namespace commit (see multi_commit_ops.go): several namespaces' transactions,
+	// committed together or not at all. Go-only for now, like 0x14-0x22.
+	MsgTxCommitMulti       MessageType = 0x23
+	MsgTxCommitMultiResult MessageType = 0x24
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -159,6 +164,10 @@ func (t MessageType) String() string {
 		return "REVERT"
 	case MsgRevertResult:
 		return "REVERT_RESULT"
+	case MsgTxCommitMulti:
+		return "TX_COMMIT_MULTI"
+	case MsgTxCommitMultiResult:
+		return "TX_COMMIT_MULTI_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -234,6 +243,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgRevert, true
 	case 0x22:
 		return MsgRevertResult, true
+	case 0x23:
+		return MsgTxCommitMulti, true
+	case 0x24:
+		return MsgTxCommitMultiResult, true
 	default:
 		return 0, false
 	}

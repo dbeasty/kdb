@@ -1,17 +1,17 @@
 # Layer 17 — One Runtime, Many Spaces + gRPC Transport
 
-## Status: Component 65 and Phases A-D IMPLEMENTED; Phase E PROPOSED
+## Status: Component 65 and Phases A-E IMPLEMENTED
 
 Two asks, one document, because the second one only gets cheap once the first one lands:
 
 ```
 Layer 17 — Multi-Namespace Runtime + gRPC
-  [~] 64. Multi-namespace embedded runtime (one host, N spaces)
+  [x] 64. Multi-namespace embedded runtime (one host, N spaces)
         [x] A. Split the open path                 - go/kdb/embed/host.go
         [x] B. Routing adapter                     - go/kdb/storage/engine/multiplex.go
         [x] C. One budget, arbitrated              - go/kdb/storage/budget_arbiter.go
         [x] D. Whole-database maintenance          - go/kdb/backup/database.go
-        [ ] E. Cross-namespace transactions
+        [x] E. Cross-namespace transactions         - docs/kdb-cross-namespace-transactions-plan.md
   [x] 65. gRPC transport hooks (frame service over HTTP/2) - go/grpc/ (separate module)
 ```
 
@@ -203,7 +203,9 @@ namespace, so `kdb-inspect verify/backup/restore` gain a real database-wide mode
 genuinely crash-consistent backup instant. Mostly plumbing once A lands, but it is the phase
 that turns "nine directories" into "a database" for operators.
 
-**Phase E — cross-namespace transactions.** Deliberately last, and deliberately optional. It
+**Phase E — cross-namespace transactions.** *Shipped; see
+[kdb-cross-namespace-transactions-plan.md](kdb-cross-namespace-transactions-plan.md) for the
+protocol, the options considered and the measurements.* Deliberately last, and deliberately optional. It
 needs a commit protocol across N DAGs and is the only phase that touches correctness of
 existing data. Nothing else here depends on it, and Zolik's per-namespace mutex works without
 it. Do not bundle it into A–D.
@@ -517,8 +519,9 @@ the test sweep.
 2. ~~**65** (gRPC over the frame seam)~~ — **done**. See §3.5.
 3. ~~**64 Phase C** (shared budget)~~ — **done**. See §2.3.
 4. ~~**64 Phases B and D**~~ — **done**. See §2.4 and §2.5.
-5. **64 Phase E** (cross-namespace transactions) — only on a concrete requirement. Still the one
-   phase that touches correctness of existing data, and still not worth starting without one.
+5. ~~**64 Phase E** (cross-namespace transactions)~~ — **done**, on the requirement that a
+   transaction has to be able to span namespaces. See
+   [kdb-cross-namespace-transactions-plan.md](kdb-cross-namespace-transactions-plan.md).
 
 Phases A and C together are what turn "nine engines because the lock says so" into "one database
 with nine spaces sharing one budget". Both are in. B, D and E are follow-ons, not prerequisites,

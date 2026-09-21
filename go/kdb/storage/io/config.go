@@ -1,5 +1,7 @@
 package io
 
+import "os"
+
 // SyncMode selects the physical primitive a Flush with fsync=true uses.
 type SyncMode int
 
@@ -71,3 +73,8 @@ type SegmentHealthReport struct {
 	Readable    bool
 	Error       *string
 }
+
+// SyncFile flushes f with the primitive mode selects - the same one every segment flush uses, for
+// files the storage layer does not own but whose durability must match it (the cross-namespace
+// decision log, embed.TxnCoordinator).
+func SyncFile(f *os.File, mode SyncMode) error { return syncFile(f, mode) }

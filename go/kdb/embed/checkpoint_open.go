@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -29,6 +30,7 @@ func restoreNamespace(
 	shim storage.PlatformIOShim,
 	namespaceID string,
 	disabled bool,
+	coord *TxnCoordinator,
 ) (replayedInFull bool, err error) {
 	eng, _ := store.(*engine.ServerEngine)
 	if eng != nil {
@@ -55,7 +57,7 @@ func restoreNamespace(
 				Floor:       lowestSegmentSequence(r),
 			}
 		}
-		return true, replayDeltaNamespace(d, store, r)
+		return true, replayDeltaNamespaceFrom(d, store, r, -1, coord)
 	}
 
 	if disabled {
@@ -113,7 +115,7 @@ func restoreNamespace(
 		c, err := document.FromPayloadBytes(payload)
 		if err != nil {
 			log.Printf("kdb: namespace %s: a checkpointed head commit would not decode (%v) - replaying the log in full", namespaceID, err)
-			return true, replayDeltaNamespace(d, store, r)
+			return true, replayDeltaNamespaceFrom(d, store, r, -1, coord)
 		}
 		heads = append(heads, c)
 	}
@@ -127,7 +129,7 @@ func restoreNamespace(
 	}
 
 	// Only the tail: everything up to cp.ThroughSequence is already here.
-	if err := replayDeltaNamespaceFrom(d, store, r, cp.ThroughSequence); err != nil {
+	if err := replayDeltaNamespaceFrom(d, store, r, cp.ThroughSequence, coord); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -190,6 +192,15 @@ func saveCheckpoint(
 	if !ok || shim == nil || through < 0 {
 		return nil
 	}
+	// A checkpoint must never capture a part of a cross-namespace group that is not yet decided:
+	// should the group then fail to commit, recovery is obliged to roll the part back, and a
+	// checkpoint that already holds it would restore it anyway. Checked before the snapshot and
+	// again after the live tree is captured - the two are not read under one lock, and a part
+	// published between them would reach the live tree without reaching the graph.
+	provisionalGen := d.ProvisionalGeneration()
+	if d.HasProvisional() {
+		return ErrCheckpointDeferred
+	}
 	segments, err := segmentFingerprints(r, through)
 	if err != nil {
 		return err
@@ -209,16 +220,26 @@ func saveCheckpoint(
 		}
 		headPayloads = append(headPayloads, payload)
 	}
+	liveTree := eng.LiveTree()
+	if d.HasProvisional() || d.ProvisionalGeneration() != provisionalGen {
+		return ErrCheckpointDeferred
+	}
 	return writeCheckpoint(shim, namespaceCheckpoint{
 		NamespaceID:     namespaceID,
 		ThroughSequence: through,
 		FloorSequence:   floor,
 		State:           state,
-		LiveTree:        eng.LiveTree(),
+		LiveTree:        liveTree,
 		Segments:        segments,
 		HeadCommits:     headPayloads,
 	})
 }
+
+// ErrCheckpointDeferred means a checkpoint was not written because a cross-namespace transaction
+// touching the namespace was still being decided. Nothing is wrong; the next maintenance pass
+// writes it. A pass that meant to reclaim segments behind the checkpoint reclaims nothing this
+// time, since the checkpoint it would stand on does not exist yet.
+var ErrCheckpointDeferred = errors.New("kdb: checkpoint deferred: a cross-namespace transaction is still being decided")
 
 // checkpointAfterFullReplay writes a checkpoint immediately after an open
 // that had to read the whole log.

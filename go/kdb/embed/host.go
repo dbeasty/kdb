@@ -45,6 +45,8 @@ type Host struct {
 	// adapter presents every open namespace under this host as one storage.Adapter, kept in step
 	// with nss as namespaces open and close.
 	adapter *engine.MultiplexAdapter
+	// txn commits transactions that span this host's namespaces. See TxnCoordinator.
+	txn *TxnCoordinator
 
 	mu     sync.Mutex
 	nss    map[string]*namespaceEntry
@@ -173,11 +175,20 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 		return nil, err
 	}
 
+	// Before any namespace can open and replay: a writer has to have marked the previous
+	// writer's undecided epoch dead before replay asks it about that epoch's groups.
+	txn, err := openTxnCoordinator(dataRoot, opts.ReadOnly, opts.Storage.SyncMode)
+	if err != nil {
+		lock.Release()
+		return nil, fmt.Errorf("kdb: opening the cross-namespace transaction log: %w", err)
+	}
+
 	pool := opts.Storage.MemoryBudgetBytes
 	if pool <= 0 {
 		pool = DefaultHostMemoryBudgetBytes
 	}
 	return &Host{
+		txn:      txn,
 		dataRoot: dataRoot,
 		opts:     opts,
 		lock:     lock,
@@ -196,6 +207,10 @@ func OpenFileHost(dataRoot string, opts FileRuntimeOptions) (*Host, error) {
 // which is the same engine without the indirection. The returned adapter tracks the host: a
 // namespace opened later becomes routable through it, and one closed stops being.
 func (h *Host) Adapter() storage.Adapter { return h.adapter }
+
+// Transactions is the coordinator that commits transactions spanning this host's namespaces.
+// Every runtime the host opens shares it (EmbeddedKdbRuntime.TxnCoordinator).
+func (h *Host) Transactions() *TxnCoordinator { return h.txn }
 
 // MemoryArbiter is the pool this host divides across its namespaces. Exposed so a caller can
 // change the floor, pin one namespace's share with Reserve, or read the current allocation for
@@ -368,6 +383,13 @@ func (h *Host) Close() error {
 			if err := e.close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
+		}
+	}
+	// After every namespace, whose close drains its commit log: only then is every part of every
+	// finished group on disk, which is what sealing the epoch declares.
+	if h.txn != nil {
+		if err := h.txn.close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	if lock != nil {

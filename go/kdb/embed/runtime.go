@@ -51,6 +51,19 @@ type EmbeddedKdbRuntime struct {
 	// window. Nil for a runtime with nothing to reclaim - a read-only or
 	// pure in-memory one. See Maintain.
 	maintain func() (TruncationResult, error)
+	// txn decides cross-namespace transactions for the host this runtime belongs to. nil for a
+	// runtime with no host (a pure in-memory one) - see TxnCoordinator.
+	txn *TxnCoordinator
+}
+
+// TxnCoordinator is the cross-namespace transaction coordinator of the host this runtime was
+// opened under, or nil for a runtime that has none. Every namespace a cross-namespace transaction
+// touches must share one: the decision log that commits a group lives with the host.
+func (rt *EmbeddedKdbRuntime) TxnCoordinator() *TxnCoordinator {
+	if rt == nil {
+		return nil
+	}
+	return rt.txn
 }
 
 // Maintain writes a checkpoint and reclaims what the retention window

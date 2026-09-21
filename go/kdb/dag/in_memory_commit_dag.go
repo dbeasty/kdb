@@ -147,6 +147,11 @@ type InMemoryCommitDag struct {
 	// which is what tells a status report or a fallback test the
 	// difference between "asked for" and "in use".
 	graphFile *graphFile
+
+	// provisional holds commits appended as one part of a cross-namespace group that has not
+	// been durably decided yet; provisionalGen counts every such append. See provisional.go.
+	provisional    map[codec.Hash]struct{}
+	provisionalGen uint64
 }
 
 // graphFile is a placeholder for the mapped on-disk commit graph

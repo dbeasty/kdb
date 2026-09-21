@@ -92,6 +92,9 @@ type logRequest struct {
 	treeHash codec.Hash
 	// ack is nil for records whose caller does not wait (DurabilityAsync).
 	ack chan error
+	// force asks for this record to be flushed before it is acknowledged even under
+	// DurabilityAsync - see EnqueueDurableAsync.
+	force bool
 }
 
 func newCommitLogWriter(w storage.DeltaSegmentWriter, durability storage.Durability, asyncFlushInterval time.Duration) *commitLogWriter {
@@ -160,6 +163,37 @@ func (c *commitLogWriter) EnqueueAsync(rec storage.DeltaRecord, treeHash codec.H
 	}
 	return func() error { return <-req.ack }, nil
 }
+
+// EnqueueDurableAsync is EnqueueAsync with an acknowledgement that means "on disk" whatever the
+// durability mode. Under DurabilitySync that is what every record gets anyway; under
+// DurabilityAsync the batch holding this record is flushed at once instead of on the timer.
+//
+// This is for the one kind of record whose durability something else depends on rather than a
+// client merely waiting for it: a part of a cross-namespace group. The group's decision may only
+// be written once every part is on disk, whatever the namespace's own ack policy is, or a crash
+// could leave a decision naming a part the log never received.
+func (c *commitLogWriter) EnqueueDurableAsync(rec storage.DeltaRecord, treeHash codec.Hash) (wait func() error, err error) {
+	if err := c.latched(); err != nil {
+		return nil, err
+	}
+	req := &logRequest{rec: rec, treeHash: treeHash, ack: make(chan error, 1), force: true}
+	c.sendMu.RLock()
+	select {
+	case <-c.closed:
+		c.sendMu.RUnlock()
+		return nil, ErrCommitLogClosed
+	default:
+	}
+	c.reqs <- req
+	c.sendMu.RUnlock()
+	return func() error { return <-req.ack }, nil
+}
+
+// fence latches err as this log's failure, so every later append is refused with it. Used when a
+// cross-namespace group this namespace took part in fails after publishing: the namespace's
+// in-memory state then holds a commit recovery will roll back, and anything appended on top of it
+// would be rolled back with it - after having been acknowledged.
+func (c *commitLogWriter) fence(err error) { c.latch(err) }
 
 func (c *commitLogWriter) latched() error {
 	c.mu.Lock()
@@ -252,14 +286,31 @@ func (c *commitLogWriter) runAsync() {
 		if err != nil {
 			c.latch(err)
 		}
+		forced := false
+		for _, r := range batch {
+			if r.force {
+				forced = true
+				break
+			}
+		}
+		switch {
+		case err == nil && forced:
+			// Something in this batch needs to be on disk before it is acknowledged (see
+			// EnqueueDurableAsync): flush now rather than on the timer. Stop is enough to disarm
+			// it - timer channels are unbuffered since Go 1.23, so no stale tick can follow.
+			if dirty {
+				timer.Stop()
+			}
+			flush()
+			err = c.latched()
+		case !dirty:
+			dirty = true
+			timer.Reset(c.flushInterval)
+		}
 		for _, r := range batch {
 			if r.ack != nil {
 				r.ack <- err
 			}
-		}
-		if !dirty {
-			dirty = true
-			timer.Reset(c.flushInterval)
 		}
 	}
 }

@@ -173,7 +173,7 @@ func (h *Host) openNamespace(
 		// the sum of its whole history (docs/benchmarks/open-cost.md).
 		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
 	}
-	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints)
+	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -205,6 +205,7 @@ func (h *Host) openNamespace(
 		ReadOnly:         opts.ReadOnly,
 		deltaReader:      handle.DeltaReader(),
 		shim:             io,
+		txn:              h.txn,
 	}
 	if !sch.IsNone() && !opts.ReadOnly {
 		// syncEmbedSchema commits a schema migration when the stored schema differs - a write,
@@ -219,7 +220,7 @@ func (h *Host) openNamespace(
 		// because the reader needs the same handle and namespace the open resolved, and nothing
 		// else in EmbeddedKdbRuntime carries them.
 		rt.refresh = func() error {
-			return replayDeltaNamespace(d, store, handle.DeltaReader())
+			return replayDeltaNamespaceFrom(d, store, handle.DeltaReader(), -1, h.txn)
 		}
 	}
 	handleClosed = true

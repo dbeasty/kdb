@@ -83,6 +83,10 @@ type payloadEnvelope struct {
 	HistoryResult *historyResultDto `json:"historyResult,omitempty"`
 	Revert        *revertDto        `json:"revert,omitempty"`
 	RevertResult  *revertResultDto  `json:"revertResult,omitempty"`
+
+	// Cross-namespace commit additions (Go-only) - see multi_commit_ops.go.
+	TxCommitMulti       *txCommitMultiDto       `json:"txCommitMulti,omitempty"`
+	TxCommitMultiResult *txCommitMultiResultDto `json:"txCommitMultiResult,omitempty"`
 }
 
 type handshakeDto struct {

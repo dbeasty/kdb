@@ -20,7 +20,7 @@ func opClassForMessage(t wire.MessageType) (OpClass, bool) {
 		return ClassPointRead, true
 	case wire.MsgSqlExec, wire.MsgSearch:
 		return ClassScan, true
-	case wire.MsgTxCommit, wire.MsgUpsert, wire.MsgTransactionReplay:
+	case wire.MsgTxCommit, wire.MsgUpsert, wire.MsgTransactionReplay, wire.MsgTxCommitMulti:
 		return ClassWrite, true
 	case wire.MsgCommitPush, wire.MsgDeltaCommit:
 		return ClassReplication, true
@@ -94,6 +94,8 @@ func rejectionMessage(h wire.Header, err error) (wire.Message, bool) {
 		}, true
 	case wire.MsgSearch:
 		return searchErrorClassified(wire.SearchMessage{H: h}, err.Error(), err), true
+	case wire.MsgTxCommitMulti:
+		return multiCommitError(wire.TxCommitMultiMessage{H: h}, "", err), true
 	default:
 		return nil, false
 	}
