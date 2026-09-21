@@ -51,6 +51,9 @@ func usage() {
   relay   --namespace NS --servers URI,URI[,URI...] [--rounds N] [--token U:P] [tls flags]
   load    --addr URI --namespace NS --rounds N
   tx-drop --addr URI --namespace NS --json JSON
+  commit-across --addr URI --parts JSON
+  sql-tx  --addr URI --namespace NS --stmt SQL [--stmt SQL ...] [--rollback] [--snapshot]
+  xns-transfers --addr URI --namespaces NS,NS[,...] --doc-id ID --rounds N
 
 TLS flags: --tls-ca FILE [--tls-cert FILE --tls-key FILE]`)
 }
@@ -100,12 +103,20 @@ func run(cmd string, args []string) error {
 	cf.register(fs)
 	var docID, jsonBody, sqlText, servers, conflictPolicy string
 	var rounds int
+	var parts, namespaces string
+	var stmts stringList
+	var rollback, snapshot bool
 	fs.StringVar(&docID, "doc-id", "", "document id (32 hex chars)")
 	fs.StringVar(&jsonBody, "json", "", "document JSON body")
 	fs.StringVar(&sqlText, "sql", "", "SQL text")
 	fs.StringVar(&servers, "servers", "", "comma-separated server URIs for relay")
 	fs.StringVar(&conflictPolicy, "conflict-policy", "strict", "relay-side divergence policy: strict or last-write")
 	fs.IntVar(&rounds, "rounds", 1, "relay rounds over the server list")
+	fs.StringVar(&parts, "parts", "", "commit-across participants as a JSON array")
+	fs.StringVar(&namespaces, "namespaces", "", "comma-separated namespaces for xns-transfers")
+	fs.Var(&stmts, "stmt", "SQL statement for sql-tx (repeatable, run in order)")
+	fs.BoolVar(&rollback, "rollback", false, "sql-tx: roll back instead of committing")
+	fs.BoolVar(&snapshot, "snapshot", false, "sql-tx: open a SNAPSHOT transaction")
 	_ = fs.Parse(args)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cf.timeout)
@@ -160,6 +171,12 @@ func run(cmd string, args []string) error {
 		return load(ctx, cf, rounds)
 	case "tx-drop":
 		return txDrop(cf, docID, jsonBody)
+	case "commit-across":
+		return commitAcross(ctx, cf, parts)
+	case "sql-tx":
+		return sqlTx(ctx, cf, stmts, rollback, snapshot)
+	case "xns-transfers":
+		return xnsTransfers(cf, namespaces, docID, rounds)
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
