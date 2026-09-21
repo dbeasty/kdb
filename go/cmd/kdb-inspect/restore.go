@@ -146,6 +146,11 @@ func restoreDatabase(fromBackup, databaseID, outDir string, comp storage.Compres
 	if err != nil {
 		return err
 	}
+	// Before any namespace: replay decides cross-namespace groups from this state, and a group
+	// whose writer crashed before deciding it reads as committed without it.
+	if err := backup.RestoreTxnState(store, m, outDir); err != nil {
+		return fmt.Errorf("restoring cross-namespace transaction state: %w", err)
+	}
 
 	fmt.Printf("restoring database backup %s (taken %s, %d namespaces)\n", m.BackupID, m.CreatedAt, len(m.Entries))
 	for _, e := range m.Entries {

@@ -42,6 +42,10 @@ type DatabaseManifest struct {
 	// DataRoot is recorded for provenance only; a restore may target any directory.
 	DataRoot string          `json:"dataRoot"`
 	Entries  []DatabaseEntry `json:"entries"`
+	// Txn is the data root's cross-namespace transaction state (backup/txn.go), empty for a root
+	// that never ran a cross-namespace transaction. Absent from manifests written before it
+	// existed, which read as having none.
+	Txn []TxnFile `json:"txn,omitempty"`
 }
 
 // DatabaseManifestKey is the object key a database manifest lives at. Deliberately outside the
@@ -60,6 +64,9 @@ func DatabaseManifestKey(backupID string) string {
 // individually valid and cost nothing to leave - but no manifest claiming they are a database.
 //
 // bases, when non-nil, maps a namespace id to the backup id to take an incremental against.
+//
+// dataRoot's cross-namespace transaction state is backed up with the namespaces (see txn.go);
+// RestoreTxnState puts it back.
 //
 // The caller is responsible for holding the data root's lock across this call. It is not taken
 // here because the tooling that calls it needs the same lock for the enumeration that produced
@@ -89,6 +96,13 @@ func CreateDatabase(
 		}
 		m.Entries = append(m.Entries, DatabaseEntry{NamespaceID: ns, BackupID: nsManifest.BackupID})
 	}
+	// With the namespaces, under the same lock: the decisions describe exactly the parts those
+	// logs hold.
+	txn, err := backupTxnState(store, m.BackupID, dataRoot)
+	if err != nil {
+		return nil, fmt.Errorf("backing up cross-namespace transaction state: %w", err)
+	}
+	m.Txn = txn
 	body, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return nil, err
@@ -154,6 +168,11 @@ func VerifyDatabase(store ObjectStore, backupID string) (map[string]*VerifyResul
 			return out, fmt.Errorf("verifying %s: %w", e.NamespaceID, err)
 		}
 		out[e.NamespaceID] = res
+	}
+	// The transaction state is part of the database: a damaged decision file is as much a
+	// restore failure as a damaged namespace, reported under its own key.
+	if problems := verifyTxnState(store, m); len(problems) > 0 {
+		out[txnDirName+"/"] = &VerifyResult{BackupID: m.BackupID, Problems: problems}
 	}
 	return out, nil
 }
