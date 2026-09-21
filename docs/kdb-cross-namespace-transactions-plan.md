@@ -259,8 +259,12 @@ namespace).
   runs the protocol (ordered locks, group begin, prepare-all, provisional publish, fencing,
   unlock, the durability wait). The server and the driver each supply a `GroupParticipant` - how
   their namespace is locked, checked and applied - and nothing else.
-- Include `txn/` in `backup.CreateDatabase`; today a database backup is taken with no writer
-  running, so every epoch it could see is sealed, but a crash-left `.dead` epoch is not copied.
+- ~~Include `txn/` in `backup.CreateDatabase`.~~ Done: a database backup copies every file of
+  `<dataRoot>/txn/` (host id, epoch counter, unsealed decision files) with a size and SHA-256 in
+  the manifest; `backup.VerifyDatabase` checks them and `kdb-inspect restore --database-backup-id`
+  restores them before any namespace. Without them a restored database would read a crash-aborted
+  group as committed - `TestDatabaseBackupCarriesCrossNamespaceDecisions` shows exactly that when
+  the restore skips them.
 - The Kotlin reference has no cross-namespace commit; it reads group parts as ordinary commits.
 
 ## 7. Cross-namespace SQL transactions
