@@ -57,6 +57,8 @@ type payloadEnvelope struct {
 	RefUpdateAck      *refUpdateAckDto      `json:"refUpdateAck,omitempty"`
 	SnapshotFetch     *snapshotFetchDto     `json:"snapshotFetch,omitempty"`
 	SnapshotPage      *snapshotPageDto      `json:"snapshotPage,omitempty"`
+	ProjectFetch      *projectFetchDto      `json:"projectFetch,omitempty"`
+	ProjectPage       *projectPageDto       `json:"projectPage,omitempty"`
 	CommitPush        *commitPushDto        `json:"commitPush,omitempty"`
 	CommitPushAck     *commitPushAckDto     `json:"commitPushAck,omitempty"`
 	DagDiff           *dagDiffDto           `json:"dagDiff,omitempty"`

@@ -293,6 +293,12 @@ func sameIndex(a, b index.Descriptor) bool {
 // systemUpsert writes one document as the runtime itself, bypassing RBAC - definitions are
 // recorded because a principal already had the right to change them.
 func (s *KdbServerRuntime) systemUpsert(docID codec.UUID, body string) (document.Commit, error) {
+	return s.systemCommit([]document.Op{document.WriteOp{DocID: docID, Patch: body}}, "kdb:meta")
+}
+
+// systemCommit commits ops as the runtime itself: no RBAC, and allowed on a namespace that
+// refuses client writes (a projection).
+func (s *KdbServerRuntime) systemCommit(ops []document.Op, message string) (document.Commit, error) {
 	head, err := s.Runtime.DAG.Head()
 	if err != nil {
 		return document.Commit{}, err
@@ -303,10 +309,9 @@ func (s *KdbServerRuntime) systemUpsert(docID codec.UUID, body string) (document
 	}
 	defer s.pinBaseTree(head)()
 	tx := s.authored(document.Transaction{
-		ID: txID, BaseVersion: head, Timestamp: codec.TimestampNow(),
-		Operations: []document.Op{document.WriteOp{DocID: docID, Patch: body}},
+		ID: txID, BaseVersion: head, Timestamp: codec.TimestampNow(), Operations: ops,
 	})
 	return s.runTransaction(tx, auth.Principal{}, txOptions{system: true}, func() (transactionResult, error) {
-		return s.UpsertEngine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "kdb:meta")
+		return s.UpsertEngine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, message)
 	})
 }

@@ -457,6 +457,9 @@ func Main() {
 				return nil, err
 			}
 			sec := server.NewKdbServerRuntime(nsRT)
+			if source, isProjection := peersync.ProjectionSource(id); isProjection {
+				sec.ProjectionOf = source // read-only from the moment it opens, not from the first sync
+			}
 			sec.AuthEngine = srv.AuthEngine
 			sec.WriteTimeout = srv.WriteTimeout
 			sec.Namespaces = nsSet
@@ -773,6 +776,9 @@ func Main() {
 		// Definitions travel with the data: a peer syncing any namespace also syncs the metadata
 		// namespace, unless its patterns exclude it by name.
 		for i := range peers {
+			if peers[i].Filter != "" {
+				continue // a projection carries documents only; definitions stay with the source
+			}
 			if len(peersync.SelectNamespaces(peers[i].Namespaces, []string{server.MetaNamespace})) == 0 &&
 				!containsExclusion(peers[i].Namespaces, server.MetaNamespace) {
 				peers[i].Namespaces = append(peers[i].Namespaces, server.MetaNamespace)
@@ -789,6 +795,14 @@ func Main() {
 		}
 		replicator, err = replication.New(replication.Config{
 			NodeID: srv.NodeID.String(), Local: srv.PeerNamespaces(), Peers: peers, State: state, TLS: tlsSettings,
+			Projections: func(source, filter string) (peersync.ProjectionTarget, error) {
+				rt, err := nsSet.Resolve(peersync.ProjectionNamespace(source, filter), true)
+				if err != nil {
+					return nil, err
+				}
+				rt.ProjectionOf = source
+				return rt.ProjectionTarget(), nil
+			},
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

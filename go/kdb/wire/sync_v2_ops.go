@@ -515,3 +515,98 @@ func decodeSnapshotV2Message(header Header, env payloadEnvelope) (Message, bool,
 	}
 	return nil, false, nil
 }
+
+// ProjectFetchMessage asks for one page of a filtered projection of a namespace (PROJECT_FETCH
+// 0x30): what changed in the set of documents matching Filter between FromHex and AtHex.
+type ProjectFetchMessage struct {
+	H         Header
+	Namespace string
+	// Filter is a KDB-SQL boolean expression over document fields.
+	Filter string
+	// FromHex is the source commit the replica's projection last reached; empty, or a commit the
+	// host cannot relate to AtHex, gets a full filtered snapshot instead of a delta.
+	FromHex string
+	// AtHex fixes the source commit being projected to across the pages of one transfer; empty
+	// on the first page means the host's head, which the page reports.
+	AtHex    string
+	After    string
+	MaxBytes int
+}
+
+func (m ProjectFetchMessage) Header() Header { return m.H }
+
+// ProjectPageMessage answers PROJECT_FETCH (PROJECT_PAGE 0x31).
+type ProjectPageMessage struct {
+	H         Header
+	Namespace string
+	// AtHex is the source commit this transfer projects to.
+	AtHex string
+	// Reset means this is a full snapshot of the filtered set: the replica replaces its
+	// projection with exactly the documents the transfer delivers.
+	Reset   bool
+	Writes  []SnapshotDoc
+	Deletes []string
+	Next    string
+	Done    bool
+}
+
+func (m ProjectPageMessage) Header() Header { return m.H }
+
+type projectFetchDto struct {
+	Namespace string `json:"namespace"`
+	Filter    string `json:"filter"`
+	FromHex   string `json:"fromHex,omitempty"`
+	AtHex     string `json:"atHex,omitempty"`
+	After     string `json:"after,omitempty"`
+	MaxBytes  int    `json:"maxBytes,omitempty"`
+}
+
+type projectPageDto struct {
+	Namespace string           `json:"namespace"`
+	AtHex     string           `json:"atHex"`
+	Reset     bool             `json:"reset,omitempty"`
+	Writes    []snapshotDocDto `json:"writes,omitempty"`
+	Deletes   []string         `json:"deletes,omitempty"`
+	Next      string           `json:"next,omitempty"`
+	Done      bool             `json:"done"`
+}
+
+func encodeProjectionMessage(msg Message) (payloadEnvelope, bool, error) {
+	switch m := msg.(type) {
+	case ProjectFetchMessage:
+		return payloadEnvelope{Kind: "projectFetch", ProjectFetch: &projectFetchDto{
+			Namespace: m.Namespace, Filter: m.Filter, FromHex: m.FromHex, AtHex: m.AtHex, After: m.After, MaxBytes: m.MaxBytes,
+		}}, true, nil
+	case ProjectPageMessage:
+		writes := make([]snapshotDocDto, len(m.Writes))
+		for i, d := range m.Writes {
+			writes[i] = snapshotDocDto{DocID: d.DocID, Body: d.Body}
+		}
+		return payloadEnvelope{Kind: "projectPage", ProjectPage: &projectPageDto{
+			Namespace: m.Namespace, AtHex: m.AtHex, Reset: m.Reset, Writes: writes, Deletes: m.Deletes, Next: m.Next, Done: m.Done,
+		}}, true, nil
+	}
+	return payloadEnvelope{}, false, nil
+}
+
+func decodeProjectionMessage(header Header, env payloadEnvelope) (Message, bool, error) {
+	switch env.Kind {
+	case "projectFetch":
+		d := env.ProjectFetch
+		if d == nil {
+			return nil, true, newDecodeError("missing projectFetch body")
+		}
+		return ProjectFetchMessage{H: header, Namespace: d.Namespace, Filter: d.Filter, FromHex: d.FromHex, AtHex: d.AtHex, After: d.After, MaxBytes: d.MaxBytes}, true, nil
+	case "projectPage":
+		d := env.ProjectPage
+		if d == nil {
+			return nil, true, newDecodeError("missing projectPage body")
+		}
+		writes := make([]SnapshotDoc, len(d.Writes))
+		for i, x := range d.Writes {
+			writes[i] = SnapshotDoc{DocID: x.DocID, Body: x.Body}
+		}
+		return ProjectPageMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, Reset: d.Reset, Writes: writes, Deletes: d.Deletes, Next: d.Next, Done: d.Done}, true, nil
+	}
+	return nil, false, nil
+}

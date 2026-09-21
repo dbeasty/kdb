@@ -422,7 +422,7 @@ It's idempotent, and a failure is recorded on the meta conflict queue instead of
 
 ---
 
-## Phase 7 — Filtered projection replicas
+## Phase 7 — Filtered projection replicas ◐
 
 - **7.1 Filter language:** a KDB-SQL boolean expression over `_doc` paths and schema fields, parsed with the existing `sql` parser's expression grammar and evaluated per document. The capability is `filter`.
 - **7.2 `SubscribeFiltered{Namespace, Filter, FromSourceHex?}`** gets a stream of `ProjectedDelta{SourceHex, Writes[], Deletes[]}`. The host computes each commit's effect on the filtered set:
@@ -666,3 +666,28 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
   - When the last part lands, the flags on all parts clear.
   - **Deviation:** parts are *not* held back from readers until their group is complete, as the plan had proposed. That would make one namespace's availability depend on another's replication, which multi-leader replication exists to avoid. The flag tells a reader what they may be looking at instead.
 - **6.5:** the user guide's "Peer sync and replication" section is rewritten around `--peer`, partitioning by namespace, conflicts, snapshots, retention and `_kdb/meta`. The flags table covers the new flags.
+
+### Phase 7 — landed (7.1–7.3; 7.4 and 7.5 deliberately not)
+
+**Filter.** `sql.ParseFilter` makes a WHERE expression usable on its own, and it's evaluated with `sql.EvalPredicate` against each document.
+
+**Protocol.** PROJECT_FETCH/PROJECT_PAGE (0x30/0x31), pull-based. A fetch names the source commit the replica last reached.
+- **Delta:** when that commit is an ancestor of the target, the host sends the net effect since then. A document that now matches is a write. One deleted, no longer matching, or no longer readable is a delete.
+- **Snapshot:** on the first fetch, or when the replica's position is unrelated, the host sends a paged, filtered snapshot marked `Reset`.
+- **Consistent target:** `AtHex` pins the target across a transfer's pages.
+- **Authorization:** read on the namespace (`StreamSubscribeAction`), then document by document (`DocumentReadAction`). A projection is a filtered read, so it needs no sync rights. A document the principal can't read goes out as a delete.
+
+**Replica.** The projection lives in `<ns>.projection-<sha256(filter)[:8]>`. Each page is one local commit whose message is `kdb:projection/1 source=<hex> complete=<bool>`. The last complete one is where the next transfer starts, so an interrupted transfer is simply redone from there, which is safe because pages carry final states. A `Reset` transfer deletes, at its end, every local document it didn't deliver.
+
+`KdbServerRuntime.ProjectionOf` makes the namespace read-only to everything but the projection itself: client writes, cross-namespace commits and peer pushes all get `ProjectionReadOnlyError`. The service's opener recognises projection names, so the namespace is read-only from the moment it opens.
+
+**Replicator.** A `filter=` peer runs projection cycles instead of sync. The filter is always the last field of the spec, because it may contain commas, and it requires exactly one literal namespace.
+
+**Tests:**
+- `server/projection_test.go`: only matching documents arrive; entering and leaving the filter; deletes; a no-op resync; an out-of-filter change only moves the recorded position; RBAC-hidden documents never sent; client writes refused.
+- `sql/filter_test.go`.
+- e2e `test_filtered_peer_keeps_only_matching_documents`.
+
+**Not built:**
+- **7.4, offline write-back.** A projection is read-only, and writes go to the source directly. An outbox that queues writes while offline and replays them as `TransactionReplay` needs its own design for conflicts coming back through the projection. The read-only refusal names the source, so a client knows where to write.
+- **7.5, stream Mode 1/2 rebuilt on projections.** The existing stream hub keeps working (and gained authentication in Phase 0). Folding it into projections is a refactor with no new capability, so it's deferred until someone needs resumable streams.

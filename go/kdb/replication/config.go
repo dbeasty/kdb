@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/peersync"
+	"github.com/limidus/kdb/go/kdb/sql"
 )
 
 // PeerConfig is one configured peer.
@@ -37,6 +38,11 @@ type PeerConfig struct {
 	// PreferSnapshot bootstraps an empty local namespace from a snapshot of the peer's main
 	// instead of fetching its whole history (bootstrap=snapshot).
 	PreferSnapshot bool
+	// Filter makes this peer a filtered projection subscription: this node keeps only the
+	// documents of Namespaces[0] that match it (and that it may read), in a read-only namespace
+	// of its own - see peersync.SyncProjection. Always the last field of the spec, since a
+	// filter may contain commas.
+	Filter string
 }
 
 // DefaultInterval is the anti-entropy tick when a peer names none.
@@ -51,6 +57,13 @@ const DefaultInterval = 30 * time.Second
 // does not appear in process listings. Unknown keys are an error, like every other setting.
 func ParsePeer(spec string) (PeerConfig, error) {
 	p := PeerConfig{Mode: peersync.SyncBoth, Interval: DefaultInterval}
+	if i := strings.Index(spec, "filter="); i >= 0 && (i == 0 || spec[i-1] == ',') {
+		p.Filter = strings.TrimSpace(spec[i+len("filter="):])
+		spec = strings.TrimSuffix(spec[:i], ",")
+		if p.Filter == "" {
+			return PeerConfig{}, fmt.Errorf("peer %q: filter is empty", spec)
+		}
+	}
 	for _, field := range strings.Split(spec, ",") {
 		field = strings.TrimSpace(field)
 		if field == "" {
@@ -115,6 +128,15 @@ func ParsePeer(spec string) (PeerConfig, error) {
 	if p.Name == "" || p.Addr == "" {
 		return PeerConfig{}, fmt.Errorf("peer %q: name and addr are required", spec)
 	}
+	if p.Filter != "" {
+		if len(p.Namespaces) != 1 || !literalNamespace(p.Namespaces[0]) {
+			return PeerConfig{}, fmt.Errorf("peer %q: a filtered peer projects exactly one namespace, named literally", spec)
+		}
+		if _, err := sql.ParseFilter(p.Filter); err != nil {
+			return PeerConfig{}, fmt.Errorf("peer %q: filter: %w", spec, err)
+		}
+		p.Mode = peersync.SyncPull
+	}
 	if len(p.Namespaces) == 0 {
 		p.Namespaces = []string{"**"}
 	}
@@ -143,4 +165,8 @@ func ParsePeers(specs string) ([]PeerConfig, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+func literalNamespace(ns string) bool {
+	return ns != "" && !strings.ContainsAny(ns, "*!")
 }

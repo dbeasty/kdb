@@ -647,3 +647,17 @@ func cellKey(c Cell) string {
 		return "?"
 	}
 }
+
+// ParseFilter parses a boolean expression - the body of a WHERE clause - on its own, for callers
+// that evaluate it against documents outside a query (replication filters).
+func ParseFilter(expr string) (Expr, error) {
+	stmt, err := DefaultParser{}.Parse("SELECT * FROM t WHERE " + expr)
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := stmt.(StmtSelect)
+	if !ok || sel.Query.Where == nil {
+		return nil, NewParseError("not a filter expression", expr, 0)
+	}
+	return sel.Query.Where, nil
+}

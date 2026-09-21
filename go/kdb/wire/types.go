@@ -103,6 +103,8 @@ const (
 	MsgRefUpdateAck  MessageType = 0x2D
 	MsgSnapshotFetch MessageType = 0x2E
 	MsgSnapshotPage  MessageType = 0x2F
+	MsgProjectFetch  MessageType = 0x30
+	MsgProjectPage   MessageType = 0x31
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -205,6 +207,10 @@ func (t MessageType) String() string {
 		return "SNAPSHOT_FETCH"
 	case MsgSnapshotPage:
 		return "SNAPSHOT_PAGE"
+	case MsgProjectFetch:
+		return "PROJECT_FETCH"
+	case MsgProjectPage:
+		return "PROJECT_PAGE"
 	default:
 		return "UNKNOWN"
 	}
@@ -306,6 +312,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgSnapshotFetch, true
 	case 0x2F:
 		return MsgSnapshotPage, true
+	case 0x30:
+		return MsgProjectFetch, true
+	case 0x31:
+		return MsgProjectPage, true
 	default:
 		return 0, false
 	}

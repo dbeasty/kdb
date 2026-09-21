@@ -39,3 +39,22 @@ func TestParsePeer(t *testing.T) {
 		t.Error("a duplicated peer name was accepted")
 	}
 }
+
+func TestParseFilteredPeer(t *testing.T) {
+	p, err := ParsePeer("name=hq,addr=tcp://hq:1,namespaces=orders,filter=region IN ('EU', 'UK') AND qty > 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Filter != "region IN ('EU', 'UK') AND qty > 2" || p.Mode != peersync.SyncPull || p.Namespaces[0] != "orders" {
+		t.Fatalf("parsed %+v", p)
+	}
+	for _, bad := range []string{
+		"name=hq,addr=tcp://hq:1,namespaces=orders/*,filter=a = 1",
+		"name=hq,addr=tcp://hq:1,filter=a = 1",
+		"name=hq,addr=tcp://hq:1,namespaces=orders,filter=a = ",
+	} {
+		if _, err := ParsePeer(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}

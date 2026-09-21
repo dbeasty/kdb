@@ -94,6 +94,9 @@ func (n serverLocalNode) Exclusive(fn func() error) error {
 	if err := rt.fenceErr(); err != nil {
 		return err
 	}
+	if rt.ProjectionOf != "" {
+		return &ProjectionReadOnlyError{Namespace: rt.Runtime.DefaultNamespace, Source: rt.ProjectionOf}
+	}
 	timeout := rt.WriteTimeout
 	if timeout <= 0 {
 		timeout = DefaultWriteTimeout

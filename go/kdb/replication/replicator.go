@@ -39,6 +39,9 @@ type Config struct {
 	MaxBackoff time.Duration
 	// Timeout bounds each request in a sync; 0 means peersync's default.
 	Timeout time.Duration
+	// Projections opens (creating if need be) the local namespace that keeps the projection of
+	// a source namespace through a filter. Required only for filtered peers.
+	Projections func(source, filter string) (peersync.ProjectionTarget, error)
 }
 
 // Replicator runs one sync loop per configured peer.
@@ -253,6 +256,9 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 		}
 	}
 	transport := l.transport()
+	if l.peer.Filter != "" {
+		return peersync.V2Result{}, l.projectionCycle(st, transport)
+	}
 	res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), transport, peersync.V2ClientConfig{
 		NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
 		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
@@ -369,4 +375,41 @@ func (r *Replicator) PeerFloor(ns string, grace time.Duration, now time.Time) (t
 		}
 	}
 	return floor, found
+}
+
+// projectionCycle runs one sync of a filtered peer and records it like any other.
+func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) error {
+	source := l.peer.Namespaces[0]
+	var err error
+	var res peersync.ProjectionResult
+	if l.r.cfg.Projections == nil {
+		err = errors.New("replication: a filtered peer needs a projection target, and none is configured")
+	} else {
+		var target peersync.ProjectionTarget
+		if target, err = l.r.cfg.Projections(source, l.peer.Filter); err == nil {
+			res, err = peersync.SyncProjection(wire.NewCodec(wire.EncodingJSON), transport, peersync.ProjectionConfig{
+				NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
+				ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+				Namespace:         source, Filter: l.peer.Filter, Timeout: l.r.cfg.Timeout, Target: target,
+			})
+		}
+	}
+	now := time.Now().UTC()
+	st.LastAttempt = now
+	ns := peersync.ProjectionNamespace(source, l.peer.Filter)
+	cur := st.Namespaces[ns]
+	if err != nil {
+		st.ConsecutiveFailures++
+		st.LastError, cur.LastError = err.Error(), err.Error()
+		slog.Warn("replication: projection sync failed", "peer", l.peer.Name, "error", err)
+	} else {
+		st.ConsecutiveFailures, st.LastError, st.LastSuccess = 0, "", now
+		cur.LastError, cur.RemoteMain, cur.LastSync = "", res.Source, now
+		cur.Pulled += int64(res.Writes + res.Deletes)
+	}
+	st.Namespaces[ns] = cur
+	if serr := l.r.cfg.State.Save(st); serr != nil && err == nil {
+		err = serr
+	}
+	return err
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -62,7 +63,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -141,6 +142,8 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}, nil
 	case wire.RefUpdateMessage:
 		return h.refUpdate(m)
+	case wire.ProjectFetchMessage:
+		return h.projectFetch(m)
 	case wire.SnapshotFetchMessage:
 		env, err := h.env(m.Namespace, false)
 		if err != nil {
@@ -297,4 +300,35 @@ func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {
 		}
 	}
 	return ack, nil
+}
+
+// projectFetch serves one page of a filtered projection. It needs only read access: a
+// projection is a filtered read of the namespace, not a peer of it, so it is authorized like a
+// stream subscription (read on the namespace) and then document by document, rather than
+// needing sync rights. A document the principal may not read is sent as a delete.
+func (h *V2Host) projectFetch(m wire.ProjectFetchMessage) (wire.Message, error) {
+	h.mu.Lock()
+	principal := h.principal
+	h.mu.Unlock()
+	if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.StreamSubscribeAction{Namespace: m.Namespace}); err != nil {
+		return nil, err
+	}
+	filter, err := sql.ParseFilter(m.Filter)
+	if err != nil {
+		return nil, fmt.Errorf("peer sync: projection filter: %w", err)
+	}
+	env, err := h.cfg.Namespaces.Env(m.Namespace, false)
+	if err != nil {
+		return nil, err
+	}
+	canRead := func(id codec.UUID) bool {
+		return h.auth.Authorizer().Authorize(context.Background(), principal,
+			auth.DocumentReadAction{Namespace: m.Namespace, DocID: id.String()}) == nil
+	}
+	page, err := projectPage(env, filter, canRead, m.FromHex, m.AtHex, m.After, m.MaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	page.H = header(wire.MsgProjectPage, m.H.CorrelationID)
+	return page, nil
 }

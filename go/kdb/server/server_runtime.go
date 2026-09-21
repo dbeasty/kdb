@@ -180,6 +180,10 @@ type KdbServerRuntime struct {
 	// duplicates and unverifiable cross-namespace parts. Durable under a file-backed runtime's
 	// data root, in memory otherwise.
 	Conflicts *peersync.ConflictQueue
+	// ProjectionOf, when set, makes this namespace a filtered projection of that source namespace
+	// (see peersync.SyncProjection): its content comes only from the source, so every write but
+	// the projection's own is refused, clients' and peers' alike.
+	ProjectionOf string
 	// Meta, when set, records this namespace's definition changes (schema, index DDL) into the
 	// replicated metadata namespace - see MetaStore. metaApplying suppresses that while the
 	// store is itself applying a replicated definition, so applying never echoes back.
@@ -860,6 +864,9 @@ func (s *KdbServerRuntime) admitWrite(tx document.Transaction, principal auth.Pr
 	if err := s.fenceErr(); err != nil {
 		return err
 	}
+	if s.ProjectionOf != "" && !system {
+		return &ProjectionReadOnlyError{Namespace: s.Runtime.DefaultNamespace, Source: s.ProjectionOf}
+	}
 	if !system {
 		if err := s.authorizeOperations(tx, principal); err != nil {
 			return err
@@ -1068,4 +1075,14 @@ func (r *ServerRuntimeRegistry) Release(key string) {
 	if rt.refCount.Load() <= 0 {
 		delete(r.runtimes, key)
 	}
+}
+
+// ProjectionReadOnlyError refuses a write to a filtered projection: its content is the source's,
+// so a write belongs on the source, and reaches the projection from there.
+type ProjectionReadOnlyError struct {
+	Namespace, Source string
+}
+
+func (e *ProjectionReadOnlyError) Error() string {
+	return fmt.Sprintf("namespace %s is a read-only projection of %s; write to %s instead", e.Namespace, e.Source, e.Source)
 }

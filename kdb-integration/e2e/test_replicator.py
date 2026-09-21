@@ -7,6 +7,7 @@ interval. See docs/kdb-distributed-implementation-plan.md Phase 3.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -93,6 +94,45 @@ def test_new_node_bootstraps_from_a_snapshot_and_survives_kill9():
         wait_for("a later write to follow", lambda: get(joiner, DOC_B) is not None)
     finally:
         for srv in (joiner, source):
+            if srv is None:
+                continue
+            try:
+                srv.stop()
+            finally:
+                srv.cleanup()
+
+
+def test_filtered_peer_keeps_only_matching_documents():
+    """A --peer with filter= keeps a read-only projection: only matching documents, following
+    the source as documents enter and leave the filter."""
+    import hashlib
+
+    from server_fixtures import helper
+
+    source = KdbServer().start()
+    replica = None
+    flt = "region = 'EU'"
+    proj = source.namespace + ".projection-" + hashlib.sha256(flt.encode()).hexdigest()[:8]
+    eu, us = "000000000000000000000000000e0001", "000000000000000000000000000a0001"
+    try:
+        put(source, eu, {"id": eu, "region": "EU"})
+        put(source, us, {"id": us, "region": "US"})
+        replica = KdbServer(extra_args=[
+            "--peer", f"name=src,addr={source.peer_addr},namespaces={source.namespace},interval=300ms,filter={flt}"]).start()
+
+        def proj_get(doc):
+            r = helper("get", "--addr", replica.sql_addr, "--namespace", proj, "--doc-id", doc, check=False)
+            lines = r.stdout.strip().splitlines()
+            return json.loads(lines[1]) if r.returncode == 0 and len(lines) > 1 and lines[1] else None
+
+        wait_for("the EU document in the projection", lambda: proj_get(eu) is not None)
+        assert proj_get(us) is None, "a document outside the filter reached the projection"
+
+        # It leaves the filter at the source, and so leaves the projection.
+        put(source, eu, {"id": eu, "region": "US"})
+        wait_for("the document to leave the projection", lambda: proj_get(eu) is None)
+    finally:
+        for srv in (replica, source):
             if srv is None:
                 continue
             try:
