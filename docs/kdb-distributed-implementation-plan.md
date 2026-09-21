@@ -408,7 +408,7 @@ It's idempotent, and a failure is recorded on the meta conflict queue instead of
 
 ---
 
-## Phase 6 — Namespace sync sets
+## Phase 6 — Namespace sync sets ☑
 
 - **6.1** `Patterns` matching: `*` matches one path segment, `**` any depth, and a `!` prefix excludes. The intersection of what the client asks for and what the host grants is computed at hello (2.1 already carries patterns).
 - **6.2** Namespaces are auto-created on the receiving side through `NamespaceSet.Resolve(ns, create=true)`, with the policy taken from `_kdb/meta` when it's present.
@@ -657,3 +657,12 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 - **Policy documents are not replicated yet.** `policy.Registry` has no durable store in the Go server to mirror, so there's nothing to reconcile against.
 - **The replicator adds `_kdb/meta` to every peer's patterns** unless a pattern excludes it by name. Under RBAC, a peer then also needs `sync` on `_kdb/meta`.
 - **Found along the way, and fixed as a consequence:** `CREATE TABLE` on the Go server set the schema in memory only, so it didn't survive a restart. The metadata namespace is now its durable record (`TestSchemaSurvivesRestartThroughMeta`).
+
+### Phase 6 — landed
+
+- **6.1–6.3 were already in place from Phase 2:** pattern matching, per-namespace grants, and a pull with `CreateLocal` opening namespaces through the process's opener. Phase 6 adds the server-level test `TestNamespaceAutoCreatedOnReplica`.
+- **6.4 follows each foreign cross-namespace group as its parts arrive** (`trackForeignGroupPart`).
+  - While any part is missing, every arrived part is flagged in its namespace's conflict queue. The flag says whether the missing part's namespace isn't replicated here at all (the group can never be whole) or just hasn't arrived yet.
+  - When the last part lands, the flags on all parts clear.
+  - **Deviation:** parts are *not* held back from readers until their group is complete, as the plan had proposed. That would make one namespace's availability depend on another's replication, which multi-leader replication exists to avoid. The flag tells a reader what they may be looking at instead.
+- **6.5:** the user guide's "Peer sync and replication" section is rewritten around `--peer`, partitioning by namespace, conflicts, snapshots, retention and `_kdb/meta`. The flags table covers the new flags.

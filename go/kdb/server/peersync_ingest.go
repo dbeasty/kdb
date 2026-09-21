@@ -167,15 +167,7 @@ func (n serverLocalNode) Advanced(step peersync.AdvanceStep) error {
 	localHost := rt.namespaceSet().Coordinator().LocalHostID()
 	for _, c := range step.Commits {
 		if m, ok := embed.ParseGroupMarker(c.Message); ok && m.Host != localHost {
-			_, err := rt.Conflicts.Record(peersync.ConflictEntry{
-				ID:        peersync.ConflictID(peersync.ConflictForeignGroupPart, rt.Runtime.DefaultNamespace, m.Group.String()),
-				Kind:      peersync.ConflictForeignGroupPart,
-				Namespace: rt.Runtime.DefaultNamespace,
-				Detail: fmt.Sprintf("commit %s is part of cross-namespace group %s (namespaces %v) decided on host %q; "+
-					"its atomicity with the other parts is not verified on this node", c.Hash.Hex(), m.Group, m.Parts, m.Host),
-				IncomingHex: c.Hash.Hex(),
-			})
-			keep(err)
+			keep(rt.trackForeignGroupPart(m, c))
 		}
 	}
 	if rt.CommitListener != nil {
@@ -242,4 +234,55 @@ func (s *KdbServerRuntime) DismissConflict(id string, principal auth.Principal) 
 		_ = s.dag.DeleteBranch(e.TrackingRef)
 	}
 	return s.Conflicts.Remove(id)
+}
+
+// trackForeignGroupPart follows a cross-namespace group decided on another host as its parts
+// arrive by replication, one namespace at a time and possibly in separate syncs. While any part
+// is missing - its namespace is not replicated here, or has not received the part yet - every
+// part that has arrived is flagged in its namespace's conflict queue, because a reader here can
+// see some of the group's effects and not the rest. When the last part arrives, the flags on all
+// of them are cleared: the group is whole on this node.
+//
+// Parts are not held back from readers until the group is complete. That would make one
+// namespace's availability depend on another's replication, which multi-leader replication is
+// specifically meant not to do; the flag says what a reader may be looking at instead.
+func (s *KdbServerRuntime) trackForeignGroupPart(m embed.GroupMarker, c document.Commit) error {
+	s.foreignGroups.Store(m.Group, c.Hash)
+	set := s.namespaceSet()
+	var missing, pending []string
+	for _, part := range m.Parts {
+		prt, ok := set.Get(part)
+		if !ok {
+			missing = append(missing, part)
+			continue
+		}
+		if _, arrived := prt.foreignGroups.Load(m.Group); !arrived {
+			pending = append(pending, part)
+		}
+	}
+	id := func(ns string) string {
+		return peersync.ConflictID(peersync.ConflictForeignGroupPart, ns, m.Group.String())
+	}
+	if len(missing) == 0 && len(pending) == 0 {
+		for _, part := range m.Parts {
+			if prt, ok := set.Get(part); ok {
+				if err := prt.Conflicts.Remove(id(part)); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	detail := fmt.Sprintf("commit %s is one part of cross-namespace group %s (namespaces %v, decided on host %q); ",
+		c.Hash.Hex(), m.Group, m.Parts, m.Host)
+	if len(missing) > 0 {
+		detail += fmt.Sprintf("namespaces %v are not replicated to this node, so the group can never be whole here", missing)
+	} else {
+		detail += fmt.Sprintf("waiting for the parts in %v to arrive", pending)
+	}
+	_, err := s.Conflicts.Record(peersync.ConflictEntry{
+		ID: id(s.Runtime.DefaultNamespace), Kind: peersync.ConflictForeignGroupPart,
+		Namespace: s.Runtime.DefaultNamespace, Detail: detail, IncomingHex: c.Hash.Hex(),
+	})
+	return err
 }

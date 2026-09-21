@@ -185,6 +185,9 @@ type KdbServerRuntime struct {
 	// store is itself applying a replicated definition, so applying never echoes back.
 	Meta         *MetaStore
 	metaApplying atomic.Bool
+	// foreignGroups maps a cross-namespace group decided on another host to the commit that
+	// brought its part here - see trackForeignGroupPart.
+	foreignGroups sync.Map
 	// inboundState records peers that fetch from this namespace - see inbound_peers.go.
 	inboundOnce  sync.Once
 	inboundState *inboundPeers
