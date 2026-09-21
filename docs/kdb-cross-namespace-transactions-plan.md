@@ -254,8 +254,11 @@ namespace).
   (`go/kdb/driver`) implements the same table routing and commits cross-namespace transactions
   with the same embed group protocol. It cannot import `server` - `kdb/driver` is an entry point
   of the embeddable source bundle, which excludes the server and wire layers - so it keeps its
-  own per-namespace write lock where the server has a write gate. The two orchestration layers
-  (`driver/commit.go`, `server/namespace_set.go`) are candidates to merge into `embed`.
+  own per-namespace write lock where the server has a write gate.
+- ~~Merge the driver's and the server's orchestration into `embed`.~~ Done: `embed.CommitGroup`
+  runs the protocol (ordered locks, group begin, prepare-all, provisional publish, fencing,
+  unlock, the durability wait). The server and the driver each supply a `GroupParticipant` - how
+  their namespace is locked, checked and applied - and nothing else.
 - Include `txn/` in `backup.CreateDatabase`; today a database backup is taken with no writer
   running, so every epoch it could see is sealed, but a crash-left `.dead` epoch is not copied.
 - The Kotlin reference has no cross-namespace commit; it reads group parts as ordinary commits.
