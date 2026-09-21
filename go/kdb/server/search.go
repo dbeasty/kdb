@@ -43,17 +43,21 @@ func (h *sqlWireConnHandler) handleSearch(msg wire.SearchMessage) wire.Message {
 	if !authenticated {
 		return searchError(msg, "not authenticated")
 	}
+	rt, err := h.runtimeFor(msg.Namespace)
+	if err != nil {
+		return searchErrorClassified(msg, err.Error(), err)
+	}
 	action := auth.DocumentReadAction{Namespace: msg.Namespace}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
+	if err := rt.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
 		return searchErrorClassified(msg, (&AuthorizationError{Cause: err}).Error(), &AuthorizationError{Cause: err})
 	}
 	if msg.Text == nil && msg.Vector == nil {
 		return searchError(msg, "search needs a text arm, a vector arm, or both")
 	}
-	if adm := h.runtime.admission; adm != nil {
+	if adm := rt.admission; adm != nil {
 		// Sized like a small ordered scan: a search materializes at most Limit hits (plus their
 		// bodies when asked for), never the namespace.
-		head, err := h.runtime.Runtime.DAG.Head()
+		head, err := rt.Runtime.DAG.Head()
 		if err != nil {
 			return searchErrorClassified(msg, err.Error(), err)
 		}
@@ -64,7 +68,7 @@ func (h *sqlWireConnHandler) handleSearch(msg wire.SearchMessage) wire.Message {
 		estimate := adm.Costs().EstimateScan(ScanEstimateInput{
 			Namespace: msg.Namespace,
 			Shape:     sql.QueryShape{HasOrderBy: true, HasPredicate: true},
-			TreeSize:  h.runtime.treeSizeAt(head),
+			TreeSize:  rt.treeSizeAt(head),
 			MaxRows:   limit,
 			RowBudget: int(adm.ScanRowBudget()),
 		})
@@ -76,7 +80,7 @@ func (h *sqlWireConnHandler) handleSearch(msg wire.SearchMessage) wire.Message {
 		}
 		defer grant.Release()
 	}
-	provider := h.runtime.SearchProvider()
+	provider := rt.SearchProvider()
 	if provider == nil {
 		return searchErrorClassified(msg, ErrSearchNotConfigured.Error(), ErrSearchNotConfigured)
 	}

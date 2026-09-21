@@ -34,11 +34,30 @@ func (s *KdbServerRuntime) namespaceSet() *NamespaceSet {
 // no NamespaceSet configured every frame is served by this runtime, whatever namespace it names -
 // the behaviour before namespaces could be routed at all. Reads never create a namespace.
 func (h *sqlWireConnHandler) runtimeFor(namespace string) (*KdbServerRuntime, error) {
+	return h.resolveRuntime(namespace, false)
+}
+
+// runtimeForWrite is runtimeFor for a frame that writes, which may open a namespace that does not
+// exist yet - the same rule a cross-namespace commit follows. Session begin uses it too: a
+// session is how a client comes to write, and PutJSON into a new namespace starts with one.
+func (h *sqlWireConnHandler) runtimeForWrite(namespace string) (*KdbServerRuntime, error) {
+	return h.resolveRuntime(namespace, true)
+}
+
+func (h *sqlWireConnHandler) resolveRuntime(namespace string, create bool) (*KdbServerRuntime, error) {
 	set := h.runtime.Namespaces
 	if set == nil || namespace == "" || namespace == h.runtime.Runtime.DefaultNamespace {
 		return h.runtime, nil
 	}
-	return set.Resolve(namespace, false)
+	return set.Resolve(namespace, create)
+}
+
+// sessionRuntime is the runtime serving sess: the namespace it was opened on.
+func (h *sqlWireConnHandler) sessionRuntime(sess *KdbSession) *KdbServerRuntime {
+	if sess != nil && sess.runtime != nil {
+		return sess.runtime
+	}
+	return h.runtime
 }
 
 func (h *sqlWireConnHandler) handleTxCommitMulti(msg wire.TxCommitMultiMessage) wire.Message {

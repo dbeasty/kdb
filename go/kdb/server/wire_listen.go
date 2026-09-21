@@ -260,7 +260,7 @@ func sessionIDOf(message wire.Message) (string, bool) {
 // Safe to call more than once; a second call finds nothing left to do.
 func (h *sqlWireConnHandler) closeAllSessions() {
 	for _, sess := range h.sessions.All() {
-		h.runtime.DocumentLocks.ReleaseAll(sess.ID.Value)
+		h.sessionRuntime(sess).DocumentLocks.ReleaseAll(sess.ID.Value)
 		sess.ClearLeases()
 		h.sessions.End(sess.ID.Value)
 	}
@@ -471,7 +471,14 @@ func (h *sqlWireConnHandler) handleSessionBegin(msg wire.SessionBeginMessage) wi
 	if !authenticated {
 		return sessionBeginError(msg, "not authenticated: handshake required before session begin")
 	}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.SessionBeginAction{Namespace: msg.Namespace}); err != nil {
+	// The session is bound to the runtime serving the namespace it names (with a NamespaceSet;
+	// without one, every session is on this listener's runtime, as before), and everything the
+	// session later does - SQL, commit, rollback, leases - happens there.
+	rt, err := h.runtimeForWrite(msg.Namespace)
+	if err != nil {
+		return sessionBeginError(msg, err.Error())
+	}
+	if err := rt.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.SessionBeginAction{Namespace: msg.Namespace}); err != nil {
 		return sessionBeginError(msg, err.Error())
 	}
 	sessionID := ""
@@ -482,7 +489,7 @@ func (h *sqlWireConnHandler) handleSessionBegin(msg wire.SessionBeginMessage) wi
 	if msg.BaseVersionHex != nil {
 		baseVersionHex = *msg.BaseVersionHex
 	}
-	sess, err := h.sessions.Begin(msg.Namespace, parseReadConsistency(msg.ReadConsistency), baseVersionHex, sessionID, principal)
+	sess, err := h.sessions.BeginOn(rt, msg.Namespace, parseReadConsistency(msg.ReadConsistency), baseVersionHex, sessionID, principal)
 	if err != nil {
 		return wire.SessionBeginAckMessage{
 			H:               header(msg.H.CorrelationID, wire.MsgSessionBeginAck),
@@ -530,7 +537,7 @@ func (h *sqlWireConnHandler) handleSqlExec(msg wire.SqlExecMessage) wire.Message
 	// The namespace the statement's table names, which is the session's own unless a
 	// NamespaceSet routes it elsewhere (sql_cross_namespace.go). Authorized there, by that
 	// namespace's engine: the grant that matters is the one on the data being touched.
-	target, err := h.statementTarget(stmt, !isSelect)
+	target, err := h.statementTarget(sess, stmt, !isSelect)
 	if err != nil {
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
@@ -583,7 +590,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 	var resolved codec.Hash
 	var err error
 	if target.own {
-		resolved, err = sess.ReadHead(h.runtime.Runtime.DAG.Head)
+		resolved, err = sess.ReadHead(target.rt.Runtime.DAG.Head)
 	} else {
 		namespaceID = target.ns
 		resolved, err = sess.crossReadHead(target)
@@ -694,7 +701,7 @@ func (h *sqlWireConnHandler) execDML(msg wire.SqlExecMessage, sess *KdbSession, 
 	var readHead codec.Hash
 	var err error
 	if target.own {
-		readHead, err = sess.ReadHead(h.runtime.Runtime.DAG.Head)
+		readHead, err = sess.ReadHead(target.rt.Runtime.DAG.Head)
 	} else {
 		namespaceID = target.ns
 		readHead, err = sess.crossReadHead(target)
@@ -759,6 +766,7 @@ func (h *sqlWireConnHandler) handleTxCommit(msg wire.TxCommitMessage) wire.Messa
 // When the transaction also buffered writes in other namespaces (SQL naming another namespace's
 // table), every namespace commits together or none does, through NamespaceSet.CommitAcross.
 func (h *sqlWireConnHandler) commitSession(correlationID int, namespace string, sess *KdbSession, encoded []byte) wire.Message {
+	srv := h.sessionRuntime(sess)
 	var tx *document.Transaction
 	if len(encoded) > 0 {
 		decoded, err := wire.DecodeTransaction(encoded)
@@ -784,7 +792,7 @@ func (h *sqlWireConnHandler) commitSession(correlationID int, namespace string, 
 		// already lost its claim land the write anyway. Checking the fences first is what closes
 		// that.
 		held := sess.LeasesFor(transaction.DocumentIDsIn(tx.Operations))
-		if err := h.runtime.DocumentLocks.ValidateFences(held); err != nil {
+		if err := srv.DocumentLocks.ValidateFences(held); err != nil {
 			return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, err)
 		}
 	}
@@ -795,10 +803,10 @@ func (h *sqlWireConnHandler) commitSession(correlationID int, namespace string, 
 	// own: writes into a runtime are already serialized by the write gate, and taking fail-fast
 	// locks on top of that meant a writer waiting its turn in the gate refused every other
 	// writer to the same document instead of letting them queue behind it.
-	if err := h.runtime.DocumentLocks.AssertUnheldByOthers(sess.NamespaceID, sess.ID.Value, *tx); err != nil {
+	if err := srv.DocumentLocks.AssertUnheldByOthers(sess.NamespaceID, sess.ID.Value, *tx); err != nil {
 		return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, err)
 	}
-	commit, err := h.runtime.Commit(sess.NamespaceID, *tx, sess.ID.Value, sess.Principal)
+	commit, err := srv.Commit(sess.NamespaceID, *tx, sess.ID.Value, sess.Principal)
 	h.sessions.ClearPending(sess)
 	if err != nil {
 		var conflictErr *ConflictError
@@ -824,7 +832,8 @@ func (h *sqlWireConnHandler) commitSession(correlationID int, namespace string, 
 // commitSessionAcross commits a transaction that wrote to namespaces besides the session's own.
 // own is the session's own namespace's share, nil when the transaction wrote nothing there.
 func (h *sqlWireConnHandler) commitSessionAcross(correlationID int, namespace string, sess *KdbSession, own *document.Transaction, others []string) wire.Message {
-	ownNS := h.runtime.Runtime.DefaultNamespace
+	srv := h.sessionRuntime(sess)
+	ownNS := srv.Runtime.DefaultNamespace
 	var parts []NamespaceTransaction
 	rows := 0
 	if own != nil {
@@ -843,7 +852,7 @@ func (h *sqlWireConnHandler) commitSessionAcross(correlationID int, namespace st
 	}
 	sess.crossMu.Unlock()
 
-	result, err := h.runtime.namespaceSet().CommitAcross(parts, sess.Principal)
+	result, err := srv.namespaceSet().CommitAcross(parts, sess.Principal)
 	h.sessions.ClearPending(sess)
 	if err != nil {
 		// The transaction is over either way, in every namespace it touched.
@@ -863,7 +872,7 @@ func (h *sqlWireConnHandler) commitSessionAcross(correlationID int, namespace st
 	next, wrote := result.Commit(ownNS)
 	resolved := next.Hash
 	if !wrote {
-		head, herr := h.runtime.Runtime.DAG.Head()
+		head, herr := srv.Runtime.DAG.Head()
 		if herr != nil {
 			return sqlResultErrorClassified(correlationID, namespace, sess.ID.Value, herr)
 		}
@@ -888,7 +897,8 @@ func (h *sqlWireConnHandler) handleTxRollback(msg wire.TxRollbackMessage) wire.M
 // TX_ROLLBACK, and SQL ROLLBACK.
 func (h *sqlWireConnHandler) rollbackSession(correlationID int, namespace, sessionID string) wire.Message {
 	sess, ok := h.sessions.Get(sessionID)
-	head, headErr := h.runtime.Runtime.DAG.Head()
+	srv := h.sessionRuntime(sess)
+	head, headErr := srv.Runtime.DAG.Head()
 	headHex := ""
 	if headErr == nil {
 		headHex = head.Hex()
@@ -905,7 +915,7 @@ func (h *sqlWireConnHandler) rollbackSession(correlationID int, namespace, sessi
 	// Rollback abandons this session's write state wholesale, explicitly-held leases included -
 	// a client that rolled back is done with the work those leases were protecting. Clearing the
 	// session's own tracking keeps its view from outliving the manager's.
-	h.runtime.DocumentLocks.ReleaseAll(sess.ID.Value)
+	srv.DocumentLocks.ReleaseAll(sess.ID.Value)
 	sess.ClearLeases()
 	h.sessions.ClearPending(sess)
 	sess.clearCross()
@@ -931,6 +941,7 @@ func (h *sqlWireConnHandler) rollbackSession(correlationID int, namespace, sessi
 // on a runtime with a NamespaceSet, takes one consistent snapshot of every namespace, so a
 // transaction that reads several of them sees them all as of one instant.
 func (h *sqlWireConnHandler) execTransactionControl(msg wire.SqlExecMessage, sess *KdbSession, stmt sql.Statement) wire.Message {
+	srv := h.sessionRuntime(sess)
 	switch stmt.(type) {
 	case sql.StmtCommit:
 		return h.commitSession(msg.H.CorrelationID, msg.Namespace, sess, nil)
@@ -944,19 +955,19 @@ func (h *sqlWireConnHandler) execTransactionControl(msg wire.SqlExecMessage, ses
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
 			"a transaction with pending writes is already open; COMMIT or ROLLBACK it first")
 	}
-	head, err := h.runtime.Runtime.DAG.Head()
+	head, err := srv.Runtime.DAG.Head()
 	if err != nil {
 		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 	}
 	var heads map[string]codec.Hash
-	if set := h.runtime.Namespaces; set != nil && sess.ReadConsistency == Snapshot {
+	if set := srv.Namespaces; set != nil && sess.ReadConsistency == Snapshot {
 		heads, err = set.Snapshot(set.Namespaces()...)
 		if err != nil {
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 		}
-		if own, ok := heads[h.runtime.Runtime.DefaultNamespace]; ok {
+		if own, ok := heads[srv.Runtime.DefaultNamespace]; ok {
 			head = own
-			delete(heads, h.runtime.Runtime.DefaultNamespace)
+			delete(heads, srv.Runtime.DefaultNamespace)
 		}
 	}
 	sess.startTransactionAt(head)
@@ -988,11 +999,15 @@ func (h *sqlWireConnHandler) handleTransactionReplay(msg wire.TransactionReplayM
 	if !authenticated {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, "", "not authenticated")
 	}
+	rt, err := h.runtimeForWrite(msg.Namespace)
+	if err != nil {
+		return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, "", err)
+	}
 	action := auth.TxCommitAction{Namespace: msg.Namespace}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
+	if err := rt.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
 		return sqlResultError(msg.H.CorrelationID, msg.Namespace, "", (&AuthorizationError{Cause: err}).Error())
 	}
-	return replayTransaction(h.runtime, principal, msg)
+	return replayTransaction(rt, principal, msg)
 }
 
 // replayTransaction is handleTransactionReplay's shared core, reused by both entry points that
@@ -1157,11 +1172,15 @@ func (h *sqlWireConnHandler) handleUpsert(msg wire.UpsertMessage) wire.Message {
 	// A lease binds every write path, not only TxCommit. Upsert is the one that most needs
 	// saying so: it is the unconditional verb, so a client holding a document while it edits
 	// would otherwise watch a stranger's Upsert land on top of it.
-	leaseCheck := document.Transaction{Operations: []document.Op{document.WriteOp{DocID: docID}}}
-	if err := h.runtime.DocumentLocks.AssertUnheldByOthers(msg.Namespace, msg.SessionID, leaseCheck); err != nil {
+	rt, err := h.upsertRuntime(msg)
+	if err != nil {
 		return upsertErrorClassified(msg, err)
 	}
-	commit, err := h.runtime.Upsert(msg.Namespace, docID, msg.JSON, principal)
+	leaseCheck := document.Transaction{Operations: []document.Op{document.WriteOp{DocID: docID}}}
+	if err := rt.DocumentLocks.AssertUnheldByOthers(msg.Namespace, msg.SessionID, leaseCheck); err != nil {
+		return upsertErrorClassified(msg, err)
+	}
+	commit, err := rt.Upsert(msg.Namespace, docID, msg.JSON, principal)
 	if err != nil {
 		return upsertErrorClassified(msg, err)
 	}
@@ -1170,6 +1189,18 @@ func (h *sqlWireConnHandler) handleUpsert(msg wire.UpsertMessage) wire.Message {
 		Namespace: msg.Namespace,
 		CommitHex: commit.Hash.Hex(),
 	}
+}
+
+// upsertRuntime resolves where an UPSERT lands: the runtime of the session it names, when it
+// names one on the same namespace - so a lease the session holds there is the one checked - and
+// otherwise the runtime serving the namespace it names.
+func (h *sqlWireConnHandler) upsertRuntime(msg wire.UpsertMessage) (*KdbServerRuntime, error) {
+	if msg.SessionID != "" {
+		if sess, ok := h.sessions.Get(msg.SessionID); ok && sess.NamespaceID == msg.Namespace {
+			return h.sessionRuntime(sess), nil
+		}
+	}
+	return h.runtimeForWrite(msg.Namespace)
 }
 
 func upsertError(msg wire.UpsertMessage, errMsg string) wire.Message {

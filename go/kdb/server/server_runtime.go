@@ -84,7 +84,8 @@ type KdbServerRuntime struct {
 	refCount atomic.Int32
 	closeMu  sync.Mutex
 
-	// sessionSeq mints session ids that are unique across every connection this runtime serves.
+	// sessionSeq is unused since session ids became process-unique (see sessionOrdinals); kept
+	// only so the struct layout other files rely on is unchanged.
 	// It lives here rather than on SessionManager because a manager is per-connection while the
 	// document lock manager, which keys ownership by session id, is per-runtime.
 	sessionSeq atomic.Int64
@@ -342,7 +343,12 @@ func (s *KdbServerRuntime) RebuildUniqueKeys() error {
 }
 
 // nextSessionOrdinal returns the next runtime-unique session ordinal.
-func (s *KdbServerRuntime) nextSessionOrdinal() int64 { return s.sessionSeq.Add(1) }
+func (s *KdbServerRuntime) nextSessionOrdinal() int64 { return sessionOrdinals.Add(1) }
+
+// sessionOrdinals mints session ids unique across the whole process, not just one runtime. A
+// connection can now hold sessions on several namespaces - each bound to its own runtime - in one
+// session map, and two runtimes counting independently would both hand out "sess-1".
+var sessionOrdinals atomic.Int64
 
 // Schema returns the runtime's current schema (safe for concurrent use with SetSchema).
 func (s *KdbServerRuntime) Schema() schema.KdbSchema {

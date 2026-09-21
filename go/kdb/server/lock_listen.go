@@ -25,7 +25,7 @@ func (h *sqlWireConnHandler) handleLockAcquire(msg wire.LockAcquireMessage) wire
 	if fail != nil {
 		return fail
 	}
-	lease, err := h.runtime.DocumentLocks.TryAcquireLease(
+	lease, err := h.sessionRuntime(sess).DocumentLocks.TryAcquireLease(
 		sess.NamespaceID, docID, sess.ID.Value, clampLeaseTTL(msg.TTLMillis),
 	)
 	if err != nil {
@@ -43,7 +43,7 @@ func (h *sqlWireConnHandler) handleLockRenew(msg wire.LockRenewMessage) wire.Mes
 	if fail != nil {
 		return fail
 	}
-	lease, err := h.runtime.DocumentLocks.Renew(
+	lease, err := h.sessionRuntime(sess).DocumentLocks.Renew(
 		sess.NamespaceID, docID, sess.ID.Value, clampLeaseTTL(msg.TTLMillis),
 	)
 	if err != nil {
@@ -62,7 +62,7 @@ func (h *sqlWireConnHandler) handleLockRelease(msg wire.LockReleaseMessage) wire
 	if fail != nil {
 		return fail
 	}
-	h.runtime.DocumentLocks.Release(sess.NamespaceID, docID, sess.ID.Value)
+	h.sessionRuntime(sess).DocumentLocks.Release(sess.NamespaceID, docID, sess.ID.Value)
 	sess.UntrackLease(docID)
 	return wire.LockResultMessage{
 		H:         header(msg.H.CorrelationID, wire.MsgLockResult),
@@ -87,7 +87,7 @@ func (h *sqlWireConnHandler) lockPreamble(
 		return nil, codec.UUID{}, lockError(correlationID, namespace, sessionID, docIDHex, "unknown session: "+sessionID, nil)
 	}
 	action := auth.TxCommitAction{Namespace: sess.NamespaceID}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), sess.Principal, action); err != nil {
+	if err := h.sessionRuntime(sess).AuthEngine.Authorizer().Authorize(context.Background(), sess.Principal, action); err != nil {
 		return nil, codec.UUID{}, lockError(correlationID, namespace, sessionID, docIDHex, err.Error(), nil)
 	}
 	docID, err := codec.UUIDFromString(docIDHex)

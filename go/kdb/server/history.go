@@ -36,13 +36,17 @@ func (h *sqlWireConnHandler) handleHistoryList(msg wire.HistoryListMessage) wire
 	if !authenticated {
 		return historyError(msg, "not authenticated", nil)
 	}
+	rt, err := h.runtimeFor(msg.Namespace)
+	if err != nil {
+		return historyError(msg, err.Error(), err)
+	}
 	action := auth.DocumentReadAction{Namespace: msg.Namespace}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
+	if err := rt.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
 		wrapped := &AuthorizationError{Cause: err}
 		return historyError(msg, wrapped.Error(), wrapped)
 	}
 
-	nav, ok := h.runtime.Runtime.DAG.(dag.HistoryNavigator)
+	nav, ok := rt.Runtime.DAG.(dag.HistoryNavigator)
 	if !ok {
 		err := &UnsupportedError{Reason: "this namespace's commit graph does not navigate"}
 		return historyError(msg, err.Error(), err)
@@ -100,8 +104,13 @@ func (h *sqlWireConnHandler) handleRevert(msg wire.RevertMessage) wire.Message {
 	if !authenticated {
 		return revertError(msg, "not authenticated", nil)
 	}
+	// Resolved without creating: reverting a namespace that does not exist has nothing to restore.
+	rt, err := h.runtimeFor(msg.Namespace)
+	if err != nil {
+		return revertError(msg, err.Error(), err)
+	}
 	action := auth.DocumentWriteAction{Namespace: msg.Namespace}
-	if err := h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
+	if err := rt.AuthEngine.Authorizer().Authorize(context.Background(), principal, action); err != nil {
 		wrapped := &AuthorizationError{Cause: err}
 		return revertError(msg, wrapped.Error(), wrapped)
 	}
@@ -112,13 +121,13 @@ func (h *sqlWireConnHandler) handleRevert(msg wire.RevertMessage) wire.Message {
 	// head tree, computes a diff against it and commits, and interleaving
 	// that with another writer would commit a tree built against a head
 	// that has moved.
-	release, err := h.runtime.writeGate.acquire(context.Background())
+	release, err := rt.writeGate.acquire(context.Background())
 	if err != nil {
 		return revertError(msg, err.Error(), err)
 	}
 	defer release()
 
-	res, err := embed.RevertTo(h.runtime.Runtime, msg.Namespace, msg.To)
+	res, err := embed.RevertTo(rt.Runtime, msg.Namespace, msg.To)
 	if err != nil {
 		return revertError(msg, err.Error(), err)
 	}

@@ -248,9 +248,7 @@ namespace).
 
 ## 6. Follow-ups
 
-- Full wire routing by namespace for session-bound frames (`TX_COMMIT` with client-built bytes,
-  `UPSERT`, leases) — those still serve the primary namespace only. SQL reaches other namespaces
-  through its table names instead (§7).
+- ~~Full wire routing by namespace for session-bound frames.~~ Done, §8.
 - ~~Cross-namespace SQL transactions.~~ Done, §7.
 - Include `txn/` in `backup.CreateDatabase`; today a database backup is taken with no writer
   running, so every epoch it could see is sealed, but a crash-left `.dead` epoch is not copied.
@@ -313,3 +311,34 @@ A `Tx` runs on a server session of its own. The client's cached per-namespace se
 with `Exec`, which auto-commits, and would otherwise commit a transaction's buffered writes out
 from under it. Sessions are reused across transactions: the protocol has no way to end one short
 of closing the connection. A conflict in another namespace is a `*CrossNamespaceError` naming it.
+
+## 8. Every wire frame reaches the namespace it names
+
+Until this section, one wire listener served one namespace. Session-bound frames (`SQL_EXEC`,
+`TX_COMMIT`, `TX_ROLLBACK`, the lease frames) went to the listener's runtime whatever namespace
+the session was opened on, and so did most sessionless ones. With a `NamespaceSet` configured:
+
+| Frame | Served by |
+|---|---|
+| `SESSION_BEGIN` | the runtime of the namespace it names. The session is bound to it for life. |
+| `SQL_EXEC`, `TX_COMMIT` (including client-built bytes), `TX_ROLLBACK`, `LOCK_ACQUIRE` / `RENEW` / `RELEASE` | the session's runtime |
+| `UPSERT` | its session's runtime when the session is on the same namespace, otherwise the runtime of the namespace it names |
+| `TRANSACTION_REPLAY` | the runtime of the namespace it names |
+| `DOCUMENT_GET`, `SEARCH`, `HISTORY_LIST`, `REVERT` | the runtime of the namespace it names; never creates one |
+| `TX_COMMIT_MULTI` | each part's namespace (§4.6) |
+
+Without a `NamespaceSet`, every frame still goes to the listener's runtime, as before.
+
+- **Namespace creation.** A frame that writes may open a namespace that does not exist yet:
+  `SESSION_BEGIN`, `UPSERT`, `TRANSACTION_REPLAY`, `TX_COMMIT_MULTI`. That is what lets `PutJSON`
+  into a new namespace work, and it is authorized per namespace like any write. A frame that only
+  reads never creates one. Every client-supplied id is validated
+  (`embed.ValidateNamespaceID`) before it touches the filesystem, and `_`-prefixed ids stay
+  reserved.
+- **Leases live in their namespace.** A lease on document X in `bank/ledger` blocks writers to X
+  there, and nowhere else.
+- **Session ids are unique process-wide**, not per runtime. One connection's session map now holds
+  sessions on several runtimes, and two independent counters would both have issued "sess-1".
+- **Behaviour change, deliberate.** In kdb-service a client that opened a session on a namespace
+  other than `--namespace` used to be silently served the `--namespace` data. It now gets the
+  namespace it named, created on first write.
