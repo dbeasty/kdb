@@ -143,3 +143,49 @@ func TestCrossNamespaceCommitRefusedAcrossHomes(t *testing.T) {
 		t.Fatalf("expected the group refused with NotHomeError, got %v", err)
 	}
 }
+
+// TestHandoverOnOldHomeKeepsItsWrites: a handover made on the current home captures everything
+// it wrote - including writes it acknowledged but had not yet replicated - so the new home
+// accepts them when they arrive, and takes no writes of its own until it has them.
+func TestHandoverOnOldHomeKeepsItsWrites(t *testing.T) {
+	a, b := newMetaNode(t), newMetaNode(t)
+	if _, err := a.store.AssignHome("app/data", a.data.NodeID.String(), "tcp://a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncPatterns(t, a, b, "**"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "B to learn A is home", func() bool { _, ok := b.data.HomeOf(); return ok })
+	late, err := a.data.Upsert("app/data", mustRandomUUID(t), `{"acknowledged":"before handover"}`, auth.Principal{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Handover made on A, naming B; only the metadata reaches B first.
+	h, err := a.store.AssignHome("app/data", b.data.NodeID.String(), "tcp://b")
+	if err != nil || h.Since != late.Hash.Hex() {
+		t.Fatalf("handover point %q, want A's head %s (%v)", h.Since, late.Hash.Hex(), err)
+	}
+	if _, err := a.data.Upsert("app/data", mustRandomUUID(t), `{"x":1}`, auth.Principal{}); !errors.As(err, new(*NotHomeError)) {
+		t.Fatalf("A still accepts writes after handing over: %v", err)
+	}
+	if _, err := syncPatterns(t, a, b, metaOnly()...); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "B to learn it is home", func() bool { h, _ := b.data.HomeOf(); return h.Node == b.data.NodeID.String() })
+	var unavailable *UnavailableError
+	if _, err := b.data.Upsert("app/data", mustRandomUUID(t), `{"x":1}`, auth.Principal{}); !errors.As(err, &unavailable) {
+		t.Fatalf("B took a write before holding the handover point: %v", err)
+	}
+	// Now the data: A's late write is part of the handover and is adopted.
+	if _, err := syncPatterns(t, a, b, "app/data"); err != nil {
+		t.Fatal(err)
+	}
+	if !b.data.dag.IsAncestor(late.Hash, mustHeadOf(t, b.data)) && mustHeadOf(t, b.data) != late.Hash {
+		t.Fatal("B refused a write A made before the handover")
+	}
+	if _, err := b.data.Upsert("app/data", mustRandomUUID(t), `{"on":"new home"}`, auth.Principal{}); err != nil {
+		t.Fatalf("the new home refused a write once it held the handover point: %v", err)
+	}
+}
+
+func metaOnly() []string { return []string{MetaNamespace} }

@@ -257,6 +257,9 @@ func (s *KdbServerRuntime) DismissConflict(id string, principal auth.Principal) 
 func (s *KdbServerRuntime) trackForeignGroupPart(m embed.GroupMarker, c document.Commit) error {
 	s.foreignGroups.Store(m.Group, c.Hash)
 	set := s.namespaceSet()
+	id := func(ns string) string {
+		return peersync.ConflictID(peersync.ConflictForeignGroupPart, ns, m.Group.String())
+	}
 	var missing, pending []string
 	for _, part := range m.Parts {
 		prt, ok := set.Get(part)
@@ -264,12 +267,17 @@ func (s *KdbServerRuntime) trackForeignGroupPart(m embed.GroupMarker, c document
 			missing = append(missing, part)
 			continue
 		}
-		if _, arrived := prt.foreignGroups.Load(m.Group); !arrived {
-			pending = append(pending, part)
+		if _, arrived := prt.foreignGroups.Load(m.Group); arrived {
+			continue
 		}
-	}
-	id := func(ns string) string {
-		return peersync.ConflictID(peersync.ConflictForeignGroupPart, ns, m.Group.String())
+		// foreignGroups is memory only; a part that arrived before a restart is still flagged
+		// in its namespace's (durable) conflict queue, and that flag is what says it is here.
+		if prt.Conflicts != nil {
+			if _, flagged := prt.Conflicts.Get(id(part)); flagged {
+				continue
+			}
+		}
+		pending = append(pending, part)
 	}
 	if len(missing) == 0 && len(pending) == 0 {
 		for _, part := range m.Parts {

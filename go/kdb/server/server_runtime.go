@@ -187,12 +187,11 @@ type KdbServerRuntime struct {
 	// the projection's own is refused, clients' and peers' alike.
 	ProjectionOf string
 	// Meta, when set, records this namespace's definition changes (schema, index DDL) into the
-	// replicated metadata namespace - see MetaStore. metaApplying suppresses that while the
-	// store is itself applying a replicated definition, so applying never echoes back.
-	Meta         *MetaStore
-	metaApplying atomic.Bool
+	// replicated metadata namespace - see MetaStore.
+	Meta *MetaStore
 	// foreignGroups maps a cross-namespace group decided on another host to the commit that
-	// brought its part here - see trackForeignGroupPart.
+	// brought its part here - see trackForeignGroupPart. Memory only: across a restart, the
+	// flag an arrived part leaves in the conflict queue stands in for its entry here.
 	foreignGroups sync.Map
 	// inboundState records peers that fetch from this namespace - see inbound_peers.go.
 	inboundOnce  sync.Once

@@ -410,3 +410,58 @@ func removeCheckpointFiles(t *testing.T, root string) {
 		t.Fatal("no checkpoint found to remove - the test would not exercise log replay")
 	}
 }
+
+// TestReplayDoesNotMoveMainOntoAPeerBranchCutOffFromItsMerge: a crash between logging a peer's
+// commits and logging the merge that adopts them leaves the log with commits main never reached.
+// Replay must store them without making them main - applying every logged commit in log order
+// moved main onto the peer's branch and orphaned the local commits.
+func TestReplayDoesNotMoveMainOntoAPeerBranchCutOffFromItsMerge(t *testing.T) {
+	dir := t.TempDir()
+	ns := "app/data"
+	rt, err := embed.OpenFileRuntime(dir, "app", ns, schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewKdbServerRuntime(rt)
+	localDoc := mustRandomUUID(t)
+	local, err := srv.Upsert(ns, localDoc, `{"from":"local"}`, auth.Principal{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A peer's diverged branch, stored and logged exactly as Adopt logs it before the merge.
+	peer := newPeerFixture(t, srv)
+	genesis, _ := peer.dag.Head()
+	r1 := pushDoc(t, peer.dag, peer.storage, ns, genesis, mustRandomUUID(t), `{"from":"peer","n":1}`)
+	r2 := pushDoc(t, peer.dag, peer.storage, ns, r1.Hash, mustRandomUUID(t), `{"from":"peer","n":2}`)
+	for _, c := range []document.Commit{r1, r2} {
+		if err := srv.dag.PutCommit(c, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.persister.Persist(c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt.Close()
+	removeCheckpointFiles(t, dir)
+
+	rt, err = embed.OpenFileRuntime(dir, "app", ns, schema.None())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer rt.Close()
+	after := NewKdbServerRuntime(rt)
+	if h, _ := after.dag.Head(); h != local.Hash {
+		t.Fatalf("main moved to %s after replay; the local head is %s", h.Hex(), local.Hash.Hex())
+	}
+	if !after.dag.HasCommit(r2.Hash) {
+		t.Fatal("the peer's commits were not kept")
+	}
+	next, err := after.Upsert(ns, mustRandomUUID(t), `{"after":"replay"}`, auth.Principal{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body, _, found, _ := after.GetDocument(ns, localDoc); !found || body != `{"from":"local"}` {
+		t.Fatalf("the local document is %q after the next write", body)
+	}
+	_ = next
+}

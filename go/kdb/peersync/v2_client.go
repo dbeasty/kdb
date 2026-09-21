@@ -69,6 +69,9 @@ type NamespaceSyncResult struct {
 	// LocalMain / RemoteMain are both sides' main heads when this sync finished, as far as it
 	// knows: the peer's is its advertised head, or what it reported after the last push to it.
 	LocalMain, RemoteMain string
+	// RefErrors records refs other than main this sync could not take, by ref key; the rest of
+	// the namespace synced regardless.
+	RefErrors map[string]string
 	// ReceivedTips are the tips of every page this sync stored, so a caller whose sync is
 	// interrupted can pass them back as ExtraHaves and resume.
 	ReceivedTips []codec.Hash
@@ -141,7 +144,7 @@ func SyncV2(w wire.Codec, transport stream.Transport, cfg V2ClientConfig) (V2Res
 }
 
 func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) NamespaceSyncResult {
-	res := NamespaceSyncResult{Namespace: remote.Namespace, Local: map[string]wire.RefUpdateOutcome{}, Remote: map[string]wire.RefUpdateOutcome{}}
+	res := NamespaceSyncResult{Namespace: remote.Namespace, Local: map[string]wire.RefUpdateOutcome{}, Remote: map[string]wire.RefUpdateOutcome{}, RefErrors: map[string]string{}}
 	env, err := cfg.Local.Env(remote.Namespace, cfg.CreateLocal && cfg.Mode&SyncPull != 0)
 	if err != nil {
 		res.Err = err
@@ -188,61 +191,37 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 		}
 		res.Snapshot = installed.Hash.Hex()
 	}
-	targets, err := refTargets(remote)
+	localHead, err := env.DAG.Head()
 	if err != nil {
 		return err
 	}
-	var wants []codec.Hash
-	for _, h := range targets {
-		if !env.DAG.HasCommit(h) {
-			wants = append(wants, h)
-		}
-	}
-	if len(wants) > 0 {
-		localHead, err := env.DAG.Head()
-		if err != nil {
-			return err
-		}
-		haves := append(spreadAncestors(env.DAG, localHead), localRefHeads(env.DAG)...)
-		haves = append(haves, cfg.ExtraHaves[remote.Namespace]...)
-		for {
-			reply, err := c.request(wire.FetchRequestMessage{
-				H: header(wire.MsgFetchRequest, c.next()), Namespace: remote.Namespace,
-				Wants: wants, Haves: haves, MaxBytes: cfg.PageBytes,
-			})
-			if err != nil {
-				return err
-			}
-			page, ok := reply.(wire.PackPageMessage)
-			if !ok {
-				return NewError(fmt.Sprintf("expected PACK_PAGE, got %T", reply), nil)
-			}
-			n, err := StoreCommits(env, page.Commits, page.Stubs)
-			res.Pulled += n
-			if err != nil {
-				return err
-			}
-			tips := pageTips(page.Commits)
-			res.ReceivedTips = append(res.ReceivedTips, tips...)
-			if page.Done || len(page.Commits) == 0 {
-				break
-			}
-			haves = append(haves, tips...)
-		}
-	}
-	// main first: it is the ref with live documents behind it, and the one a push depends on.
+	haves := append(spreadAncestors(env.DAG, localHead), localRefHeads(env.DAG)...)
+	haves = append(haves, cfg.ExtraHaves[remote.Namespace]...)
+	// One ref at a time, main first. A ref this node cannot take - a side branch forked below
+	// the snapshot this node was bootstrapped from, whose parents no peer can send it - is
+	// recorded and skipped; it must not stop main, or every later sync of the namespace fails
+	// the same way.
 	for _, ref := range orderedRefs(remote) {
 		h, err := codec.HashFromHex(ref.hex)
 		if err != nil {
 			return err
 		}
 		if !env.DAG.HasCommit(h) {
-			// Behind a stub or a floor this node cannot cross yet (Phase 4); not fatal to the rest.
-			continue
+			if haves, err = c.fetchRef(cfg, env, remote.Namespace, h, haves, res); err != nil {
+				if ref.kind == wire.RefBranch && ref.name == mainBranch {
+					return err
+				}
+				res.RefErrors[ref.key()] = err.Error()
+				continue
+			}
 		}
 		r, err := ApplyRef(env, ref.kind, ref.name, h)
 		if err != nil {
-			return err
+			if ref.kind == wire.RefBranch && ref.name == mainBranch {
+				return err
+			}
+			res.RefErrors[ref.key()] = err.Error()
+			continue
 		}
 		res.Local[ref.key()] = r.Outcome
 		if r.Outcome == wire.RefConflict {
@@ -250,6 +229,35 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 		}
 	}
 	return nil
+}
+
+// fetchRef pages in everything want needs that this node lacks, returning the haves grown by
+// what arrived.
+func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
+	for {
+		reply, err := c.request(wire.FetchRequestMessage{
+			H: header(wire.MsgFetchRequest, c.next()), Namespace: ns,
+			Wants: []codec.Hash{want}, Haves: haves, MaxBytes: cfg.PageBytes,
+		})
+		if err != nil {
+			return haves, err
+		}
+		page, ok := reply.(wire.PackPageMessage)
+		if !ok {
+			return haves, NewError(fmt.Sprintf("expected PACK_PAGE, got %T", reply), nil)
+		}
+		n, err := StoreCommits(env, page.Commits, page.Stubs)
+		res.Pulled += n
+		if err != nil {
+			return haves, err
+		}
+		tips := pageTips(page.Commits)
+		res.ReceivedTips = append(res.ReceivedTips, tips...)
+		haves = append(haves, tips...)
+		if page.Done || len(page.Commits) == 0 {
+			return haves, nil
+		}
+	}
 }
 
 func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRefs, res *NamespaceSyncResult) error {

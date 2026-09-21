@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,12 @@ type MetaStore struct {
 	once sync.Once
 	// applyMu serializes reconciliation, so a startup pass and a triggered one never race.
 	applyMu sync.Mutex
+	// seen holds, per definition document, the body this node last applied or recorded.
+	// Reconciliation applies only a version it has not seen: a definition changed locally is
+	// recorded before anything reconciles, and a replicated one is applied once - so no
+	// reconciliation pass can put an older version back over a newer local one.
+	seenMu sync.Mutex
+	seen   map[codec.UUID]string
 }
 
 // metaDoc is one definition. Kind "schema" carries Schema (hex of schema.ToBytes); kind "index"
@@ -47,6 +54,10 @@ type MetaStore struct {
 // tombstone rather than a deletion, so a node reconciling knows to drop it rather than merely not
 // knowing about it.
 type metaDoc struct {
+	// id and raw are the document's id and body as stored; not part of the JSON.
+	id  codec.UUID
+	raw string
+
 	Kind      string            `json:"kind"`
 	Namespace string            `json:"namespace"`
 	Schema    string            `json:"schema,omitempty"`
@@ -70,7 +81,7 @@ func metaIndexID(ns, name string) codec.UUID {
 // NewMetaStore returns a store over the meta runtime, applying to the namespaces in set, and wires
 // every commit the meta namespace takes - local or replicated - to a reconciliation pass.
 func NewMetaStore(meta *KdbServerRuntime, set *NamespaceSet) *MetaStore {
-	m := &MetaStore{meta: meta, set: set, kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
+	m := &MetaStore{meta: meta, set: set, kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), seen: map[codec.UUID]string{}}
 	previous := meta.CommitListener
 	meta.CommitListener = func(ns string, c document.Commit) {
 		if previous != nil {
@@ -111,6 +122,7 @@ func (m *MetaStore) put(id codec.UUID, d metaDoc) error {
 	if err != nil {
 		return err
 	}
+	m.markSeen(id, string(body))
 	// Unchanged definitions write nothing: a no-op commit would still be a commit every peer
 	// then has to fetch.
 	if cur, _, found, err := m.meta.GetDocument(MetaNamespace, id); err == nil && found && cur == string(body) {
@@ -118,6 +130,19 @@ func (m *MetaStore) put(id codec.UUID, d metaDoc) error {
 	}
 	_, err = m.meta.systemUpsert(id, string(body))
 	return err
+}
+
+func (m *MetaStore) markSeen(id codec.UUID, body string) {
+	m.seenMu.Lock()
+	m.seen[id] = body
+	m.seenMu.Unlock()
+}
+
+// fresh reports whether body is a version of id this node has not yet applied or recorded.
+func (m *MetaStore) fresh(id codec.UUID, body string) bool {
+	m.seenMu.Lock()
+	defer m.seenMu.Unlock()
+	return m.seen[id] != body
 }
 
 // RecordSchema records ns's schema.
@@ -170,6 +195,24 @@ func (m *MetaStore) AssignHome(ns, node, addr string) (Home, error) {
 			h.Fence = d.Home.Fence + 1
 		}
 	}
+	if rt, ok := m.set.Get(ns); ok && node != "" {
+		// Stop this node taking writes under the old assignment, let any already admitted finish,
+		// then take the head as the handover point: everything written here before the
+		// assignment is in its history.
+		stopping := h
+		stopping.Since = "" // no handover point yet: nothing to wait for if this node is the new home
+		rt.SetHome(&stopping)
+		release, err := rt.writeGate.acquire(context.Background())
+		if err != nil {
+			return Home{}, err
+		}
+		head, herr := rt.dag.Head()
+		release()
+		if herr != nil {
+			return Home{}, herr
+		}
+		h.Since = head.Hex()
+	}
 	if err := m.put(metaHomeID(ns), metaDoc{Kind: "home", Namespace: ns, Home: &h}); err != nil {
 		return Home{}, err
 	}
@@ -212,6 +255,7 @@ func (m *MetaStore) docs() ([]metaDoc, error) {
 		for _, d := range batch {
 			var md metaDoc
 			if json.Unmarshal([]byte(d.JSON), &md) == nil && md.Namespace != "" {
+				md.id, md.raw = d.ID, d.JSON
 				docs = append(docs, md)
 			}
 		}
@@ -247,8 +291,9 @@ func (m *MetaStore) ApplyTo(rt *KdbServerRuntime) {
 }
 
 func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
-	rt.metaApplying.Store(true)
-	defer rt.metaApplying.Store(false)
+	if d.raw != "" && !m.fresh(d.id, d.raw) {
+		return
+	}
 	var err error
 	switch d.Kind {
 	case "schema":
@@ -273,6 +318,9 @@ func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
 		return
 	}
 	_ = rt.Conflicts.Remove(peersync.ConflictID("meta-apply", d.Namespace, d.Kind, d.Name))
+	if d.raw != "" {
+		m.markSeen(d.id, d.raw)
+	}
 }
 
 func (m *MetaStore) applySchema(rt *KdbServerRuntime, d metaDoc) error {
@@ -307,7 +355,7 @@ func (m *MetaStore) applyIndex(rt *KdbServerRuntime, d metaDoc) error {
 		if existing == nil {
 			return nil
 		}
-		return p.DropIndex(sql.StmtDropIndex{Name: d.Name}, ctx)
+		return p.dropIndexLocal(sql.StmtDropIndex{Name: d.Name}, ctx)
 	}
 	stmt := sql.StmtCreateIndex{Name: d.Name, Table: d.Table, Fields: d.Fields, Using: d.Using, Unique: d.Unique, With: d.With}
 	want, err := descriptorFor(stmt, d.Namespace)
@@ -318,11 +366,11 @@ func (m *MetaStore) applyIndex(rt *KdbServerRuntime, d metaDoc) error {
 		if sameIndex(*existing, want) {
 			return nil
 		}
-		if err := p.DropIndex(sql.StmtDropIndex{Name: d.Name}, ctx); err != nil {
+		if err := p.dropIndexLocal(sql.StmtDropIndex{Name: d.Name}, ctx); err != nil {
 			return err
 		}
 	}
-	return p.CreateIndex(stmt, ctx)
+	return p.createIndexLocal(stmt, ctx)
 }
 
 func sameIndex(a, b index.Descriptor) bool {

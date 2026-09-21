@@ -12,6 +12,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -22,6 +23,8 @@ type testNamespaces struct {
 	t     *testing.T
 	mu    sync.Mutex
 	sides map[string]side
+	// installed, when set, is every env's SnapshotInstalled.
+	installed func(document.Commit) error
 }
 
 func newTestNamespaces(t *testing.T, names ...string) *testNamespaces {
@@ -55,7 +58,8 @@ func (p *testNamespaces) Env(ns string, create bool) (IngestEnv, error) {
 		p.sides[ns] = s
 	}
 	return IngestEnv{DAG: s.dag, Storage: s.storage, NamespaceID: ns, ApplyToStorage: true,
-		Resolution: ResolutionOptions{Policy: transaction.ConflictPolicyLastWrite}}, nil
+		Resolution:        ResolutionOptions{Policy: transaction.ConflictPolicyLastWrite},
+		SnapshotInstalled: p.installed}, nil
 }
 
 func (p *testNamespaces) side(ns string) side {

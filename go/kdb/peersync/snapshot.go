@@ -170,15 +170,17 @@ func InstallSnapshot(env IngestEnv, fetch func(after string) (wire.SnapshotPageM
 			return undo(err)
 		}
 		if err := env.DAG.SetHead(mainBranch, target.Hash); err != nil {
-			return err
+			return undo(err)
 		}
 		if env.SnapshotInstalled != nil {
 			if err := env.SnapshotInstalled(target); err != nil {
-				return fmt.Errorf("peer sync: snapshot installed but not made durable: %w", err)
+				// Nothing durable stands behind the snapshot: put main back, or later commits
+				// would be logged on top of state a restart cannot bring back.
+				_ = env.DAG.SetHead(mainBranch, head)
+				return undo(fmt.Errorf("peer sync: snapshot could not be made durable: %w", err))
 			}
 		}
 		installed = target
-		_ = head
 		return node.Advanced(AdvanceStep{Commits: []document.Commit{target}, Applied: applied})
 	})
 	return installed, err

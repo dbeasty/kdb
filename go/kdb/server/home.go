@@ -7,6 +7,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/peersync"
 )
 
 // Single-home ownership (docs/kdb-distributed-implementation-plan.md Phase 9): a namespace can
@@ -25,6 +26,10 @@ type Home struct {
 	Node  string `json:"node"`
 	Addr  string `json:"addr,omitempty"`
 	Fence int64  `json:"fence"`
+	// Since is the handover point: the assigning node's head when the assignment was made,
+	// captured after in-flight writes finished. Every write made before the assignment is in its
+	// history; the new home accepts no writes until it holds it.
+	Since string `json:"since,omitempty"`
 }
 
 // SetHome records ns's assignment on this runtime. Called by the metadata store as the definition
@@ -85,13 +90,21 @@ func parseHomeStamp(msg string) (node string, fence int64, ok bool) {
 	return node, fence, node != ""
 }
 
-// admitHome refuses a client write on a node that is not this namespace's home.
+// admitHome refuses a client write on a node that is not this namespace's home - and, on the new
+// home, until it holds the handover point, since writing before then would build on a history
+// missing the previous home's last writes.
 func (s *KdbServerRuntime) admitHome() error {
 	h, ok := s.HomeOf()
-	if !ok || h.Node == s.NodeID.String() {
+	if !ok {
 		return nil
 	}
-	return &NotHomeError{Namespace: s.Runtime.DefaultNamespace, Home: h}
+	if h.Node != s.NodeID.String() {
+		return &NotHomeError{Namespace: s.Runtime.DefaultNamespace, Home: h}
+	}
+	if since, err := codec.HashFromHex(h.Since); err == nil && !s.dag.HasCommit(since) {
+		return &UnavailableError{Reason: "this node is becoming the namespace's home and has not yet received the previous home's last writes (" + h.Since + ")"}
+	}
+	return nil
 }
 
 // commitMessage is the message a client write commits with: the home's stamp on a single-home
@@ -103,16 +116,39 @@ func (s *KdbServerRuntime) commitMessage() string {
 	return ""
 }
 
-// checkReplicatedCommit refuses a commit stamped by a home at a fence older than this
-// namespace's current one. Unstamped commits are history from before the namespace was
-// single-home, or merges, and pass.
+// checkReplicatedCommit refuses a commit written by anyone but the current home after the
+// handover point. It passes:
+//
+//   - the current home's own writes (authored by it, or stamped with the current fence);
+//   - history up to the handover point - including a former home's writes made before the
+//     handover and acknowledged, which must replicate even if they arrive late;
+//   - merge commits, which write nothing of their own (anything stale they bring is checked as
+//     the commit it is).
+//
+// Everything else - notably a former home's write made after it was replaced, cross-namespace
+// parts included - is refused. Until the handover point itself arrives there is no telling the
+// two apart, so the check passes and the new home, which refuses writes until then, decides.
 func (s *KdbServerRuntime) checkReplicatedCommit(c document.Commit) error {
 	h, ok := s.HomeOf()
 	if !ok {
 		return nil
 	}
-	if _, fence, stamped := parseHomeStamp(c.Message); stamped && fence < h.Fence {
-		return &StaleFenceError{Namespace: s.Runtime.DefaultNamespace, CommitHash: c.Hash, Fence: fence, Current: h.Fence}
+	if c.AuthorNodeID == peersync.MergeAuthorNodeID || c.AuthorNodeID.String() == h.Node {
+		return nil
 	}
-	return nil
+	if _, fence, stamped := parseHomeStamp(c.Message); stamped && fence == h.Fence {
+		return nil
+	}
+	since, err := codec.HashFromHex(h.Since)
+	if err != nil || !s.dag.HasCommit(since) {
+		return nil
+	}
+	if c.Hash == since || s.dag.IsAncestor(c.Hash, since) {
+		return nil
+	}
+	fence := int64(0)
+	if _, f, stamped := parseHomeStamp(c.Message); stamped {
+		fence = f
+	}
+	return &StaleFenceError{Namespace: s.Runtime.DefaultNamespace, CommitHash: c.Hash, Fence: fence, Current: h.Fence}
 }

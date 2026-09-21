@@ -228,11 +228,11 @@ func TestResolveDivergenceMergesNonConflictingDisjointWrites(t *testing.T) {
 	if head != outcome.MergeCommit.Hash {
 		t.Fatalf("expected main to point at the merge commit, got %s", head.Hex())
 	}
-	// Neither side's document was dropped: the merge commit's own operations carry the delta it
-	// introduces relative to its primary parent (regression: an empty operations list here would
-	// silently drop the remote side's documents for a replay-based materializer).
-	if len(outcome.MergeCommit.Operations) != 1 {
-		t.Fatalf("expected the merge commit to carry the remote side's write, got %d ops", len(outcome.MergeCommit.Operations))
+	// Neither side's document was dropped: the merge commit writes every document its parents
+	// disagree on - here both, since each side has a document the other lacks - so replaying it
+	// on top of either parent builds the merged tree.
+	if len(outcome.MergeCommit.Operations) != 2 {
+		t.Fatalf("expected the merge commit to carry both sides' writes, got %d ops", len(outcome.MergeCommit.Operations))
 	}
 }
 

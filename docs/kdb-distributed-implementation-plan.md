@@ -724,3 +724,46 @@ Commit format v2 is not introduced. The write need Phase 8 might have served bel
 - **10.3 Rebalancing** is a documented runbook in the user guide ("Moving a namespace to another node"), built from pieces that already exist: `--peer` (optionally with `bootstrap=snapshot`), the lag signals, `PUT /v1/ns/{ns}/home`, and removing the old peer.
 - **10.4 Cross-node transactions.** A cross-namespace transaction touching a namespace homed elsewhere is refused (`TestCrossNamespaceCommitRefusedAcrossHomes`). That isn't new code: `admitWrite`, which `CommitAcross` runs per part, refuses any part not homed here.
   - **Not built:** 2PC across nodes. It needs a coordinator reachable from every home and a participant protocol over the wire. It is also the one piece that would make the system depend on several nodes being up to commit anything, and nothing so far has needed that. Until a workload does, a transaction that has to span homes should move those namespaces to one home first.
+
+### Review fixes — landed
+
+An adversarial review of phases 0–10 found eight defects. Each has a regression test.
+
+1. **A merge echoed a node's own write back as a change** and re-applied it over a newer local write.
+2. **Criss-cross merges** (two nodes merging the same pair) disagreed or reported false conflicts.
+   - **Fix for 1 and 2:** `peersync/merge_resolution.go` replaces the op-based resolver with a value-based one.
+     - For each document either side wrote since the merge base, it compares the values at the two heads.
+     - It traces each value to the commit that introduced it. Through a merge, that is the parent that already held it.
+     - A side has changed a document only if its value's origin is neither zero nor an ancestor of the other side's.
+     - One side changed: take it. Both changed: a conflict, resolved by policy (LastWrite compares the origins' timestamps, then hashes).
+   - **New rule:** a merge commit's ops contain *every* document the parents differ on, with its merged value. Applying them on top of either parent gives the merged tree.
+   - Tests: `TestMergeEchoOfOwnWriteIsNotAChange`, `TestCrissCrossMergesAgreeWithoutConflict`.
+3. **A snapshot replica stopped following main** once a side branch on the peer reached below its shallow root.
+   - Pull now runs per ref, main first.
+   - A failure on any other ref is recorded in `NamespaceSyncResult.RefErrors` and doesn't stop the rest of the sync.
+   - Test: `TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot`.
+4. **A crash between logging a peer commit and logging the merge** made replay move main onto the peer's branch.
+   - **Replay rule:** a logged commit is applied only if the current head is one of its parents. Otherwise it is only stored.
+   - Test: `TestReplayDoesNotMoveMainOntoAPeerBranchCutOffFromItsMerge`.
+5. **Race on `metaApplying`:** a flag that suppressed Meta recording while applying Meta could hide a concurrent local DDL.
+   - Removed. Meta apply calls the local-only variants (`createIndexLocal`, `dropIndexLocal`) directly.
+   - Meta tracks the document versions it has seen and skips re-applying them.
+   - Local DDL records into Meta and rolls back if the record fails: CREATE INDEX drops the index, CREATE TABLE restores the previous schema.
+6. **A handover refused the old home's own acknowledged writes** once they replicated after the new fence was known.
+   - `Home.Since` is the handover point. `AssignHome` marks the home as stopping, takes the writeGate, and records the head as `Since`.
+   - The new home refuses writes (`UnavailableError`) until it holds `Since`.
+   - A replicated commit passes the fence check if any of these holds:
+     - it is a merge commit
+     - the current home authored it
+     - it carries the current fence stamp
+     - it is an ancestor of `Since`
+   - Cross-namespace parts are now authored by the node, so this author check covers them too.
+   - Test: `TestHandoverOnOldHomeKeepsItsWrites`.
+   - **Known consequence:** a failover assigned on a node *other* than the old home can't know what the old home acknowledged but never replicated. Those writes arrive later as stale-fence conflicts. That is the intended behaviour for writes acknowledged by a home that has since been replaced.
+7. **Snapshot durability.**
+   - If `SnapshotInstalled` (the checkpoint plus the meta.json marker) fails, `InstallSnapshot` moves main back and undoes the document writes. Test: `TestSnapshotNotMadeDurableLeavesNamespaceEmpty`.
+   - A crash after the checkpoint but before the marker used to leave a DAG with horizon commits whose bodies cold reads never looked for. On open, any horizon commit now switches the engine to external bodies.
+8. **Retention floor.**
+   - A peer's `LastSync` is now the time its sync *started*. The inbound `OnCaughtUp` passes the time of the session's hello, so commits made during a long transfer stay above the floor.
+   - `foreignGroups` is memory only. After a restart, an arrived part is recognised by the flag it left in the durable conflict queue, so a group can still complete.
+   - **Not changed:** commit listeners fire before the delta log is fsynced, as they always have. A crash can lose a commit a listener already saw. Peers get it again on the next sync, because the refs they compare are durable.

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -126,5 +127,67 @@ func TestSyncFallsBackToSnapshotBelowHorizon(t *testing.T) {
 	}
 	if mustHead(t, edge.side(ns)) != mustHead(t, middle.side(ns)) {
 		t.Fatal("edge did not reach middle's head")
+	}
+}
+
+// TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot: the peer has a side branch forked below
+// the commit this node was bootstrapped from. Its parents can never arrive, so the branch is
+// reported and skipped - and main keeps syncing, now and on every later sync.
+func TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot(t *testing.T) {
+	ns := "app/snap-side"
+	remote := newTestNamespaces(t, ns)
+	local := newTestNamespaces(t, ns)
+	r := remote.side(ns)
+	f := writeAtHead(t, r, ns, newUUID(t), `{"a":1}`)
+	writeAtHead(t, r, ns, newUUID(t), `{"b":1}`)
+	root := writeAtHead(t, r, ns, newUUID(t), `{"c":1}`)
+	v2Hub(t, "hub-snap-side", newHost(remote), nil)
+	syncV2(t, "hub-snap-side", local, V2ClientConfig{Namespaces: []string{ns}, Mode: SyncPull, PreferSnapshot: true})
+
+	side := writeDoc(t, r, ns, f.Hash, newUUID(t), `{"side":1}`)
+	if _, err := r.dag.CreateBranch("feature", side.Hash); err != nil {
+		t.Fatal(err)
+	}
+	setHead(t, r, root.Hash)
+	next := writeAtHead(t, r, ns, newUUID(t), `{"d":1}`)
+	for i := 0; i < 2; i++ {
+		res := syncV2(t, "hub-snap-side", local, V2ClientConfig{Namespaces: []string{ns}, Mode: SyncPull})
+		if res.Namespaces[0].RefErrors["branch:feature"] == "" {
+			t.Fatalf("sync %d: the unreachable branch was not reported: %+v", i, res.Namespaces[0])
+		}
+		if mustHead(t, local.side(ns)) != next.Hash {
+			t.Fatalf("sync %d: main stopped following the peer", i)
+		}
+	}
+}
+
+// TestSnapshotNotMadeDurableLeavesNamespaceEmpty: when the snapshot cannot be made durable, main
+// goes back to where it was and the documents go with it - nothing is left for later commits to
+// be logged on top of that a restart could not bring back.
+func TestSnapshotNotMadeDurableLeavesNamespaceEmpty(t *testing.T) {
+	ns := "app/snap-persist"
+	remote := newTestNamespaces(t, ns)
+	local := newTestNamespaces(t, ns)
+	local.installed = func(document.Commit) error { return errors.New("disk full") }
+	seedHistory(t, remote, ns, 10)
+	v2Hub(t, "hub-snap-persist", newHost(remote), nil)
+	l := local.side(ns)
+	before := mustHead(t, l)
+
+	cfg := V2ClientConfig{PeerURI: "memory://hub-snap-persist", Local: local, NodeID: "c", Namespaces: []string{ns}, Mode: SyncPull, PreferSnapshot: true}
+	res, _ := SyncV2(wire.NewCodec(wire.EncodingJSON), stream.NewInMemoryTransport(), cfg)
+	if err := res.Namespaces[0].Err; err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected the persist failure to be reported, got %v", err)
+	}
+	if mustHead(t, l) != before {
+		t.Fatal("main moved to a snapshot that was not made durable")
+	}
+	_, head, _, _ := l.dag.HeadCommit()
+	n := 0
+	if err := l.storage.(storage.TreeWalker).WalkTree(ns, head.DocumentTreeHash, func(codec.UUID, codec.Hash) bool { n++; return true }); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("an undone snapshot left %d documents behind", n)
 	}
 }

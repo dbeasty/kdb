@@ -264,7 +264,7 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 		if err != nil {
 			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: part.Namespace, Err: err}
 		}
-		ps = append(ps, &serverParticipant{ns: part.Namespace, rt: rt, sessionID: part.SessionID, tx: part.Tx})
+		ps = append(ps, &serverParticipant{ns: part.Namespace, rt: rt, sessionID: part.SessionID, tx: rt.authored(part.Tx)})
 	}
 
 	// Cheapest-first refusals, before any gate: the same order runTransaction checks them in.

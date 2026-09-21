@@ -188,6 +188,11 @@ func (h *Host) openNamespace(
 			d.MarkShallow(h)
 		}
 	}
+	if eng != nil && len(meta.ShallowRoots) == 0 && len(d.Horizon()) > 0 {
+		// Commits whose parents are gone: a snapshot bootstrap whose marker a crash cut off, or
+		// history truncated away. Either way some bodies may exist only in the blob store.
+		eng.SetBodiesExternal(true)
+	}
 	dagOut := dag.CommitDAG(d)
 	var persisting *PersistingCommitDAG
 	if w := handle.DeltaWriter(); w != nil && !opts.ReadOnly {

@@ -111,9 +111,9 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 					return code, code != wire.ErrorCodeInternal
 				},
 				CreateOnPush: h.runtime.PeerCreateOnPush,
-				OnCaughtUp: func(ns, peer string) {
+				OnCaughtUp: func(ns, peer string, since time.Time) {
 					if rt, ok := h.runtime.namespaceSet().Get(ns); ok {
-						rt.NoteInboundPeer(peer, time.Now())
+						rt.NoteInboundPeer(peer, since)
 					}
 				},
 			}, h.runtime.AuthEngine, auth.EmptyContext)

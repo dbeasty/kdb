@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -37,7 +38,7 @@ type V2HostConfig struct {
 	// OnCaughtUp, when set, is told each time a peer finishes fetching a namespace - the last
 	// page of a fetch, after which the peer holds everything this node's refs named. It is how a
 	// node learns what inbound peers have, for peer-aware retention.
-	OnCaughtUp func(ns, peer string)
+	OnCaughtUp func(ns, peer string, since time.Time)
 }
 
 // V2Host serves one v2 peer-sync connection.
@@ -50,8 +51,11 @@ type V2Host struct {
 	mu        sync.Mutex
 	principal auth.Principal
 	helloDone bool
-	granted   map[string]bool
-	peer      string
+	// helloAt is when the session began: the peer holds everything committed before it once it
+	// catches up, not everything committed before the last page.
+	helloAt time.Time
+	granted map[string]bool
+	peer    string
 }
 
 // NewV2Host returns a host for one connection.
@@ -132,9 +136,9 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}
 		if done && h.cfg.OnCaughtUp != nil {
 			h.mu.Lock()
-			peer := h.peer
+			peer, since := h.peer, h.helloAt
 			h.mu.Unlock()
-			h.cfg.OnCaughtUp(m.Namespace, peer)
+			h.cfg.OnCaughtUp(m.Namespace, peer, since)
 		}
 		return wire.PackPageMessage{
 			H: header(wire.MsgPackPage, m.H.CorrelationID), Namespace: m.Namespace,
@@ -208,7 +212,7 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 		}
 	}
 	h.mu.Lock()
-	h.principal, h.helloDone, h.granted, h.peer = principal, true, granted, m.NodeID
+	h.principal, h.helloDone, h.granted, h.peer, h.helloAt = principal, true, granted, m.NodeID, time.Now()
 	h.mu.Unlock()
 	refs, err := h.refs(names)
 	if err != nil {

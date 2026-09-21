@@ -259,6 +259,9 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 	if l.peer.Filter != "" {
 		return peersync.V2Result{}, l.projectionCycle(st, transport)
 	}
+	// A namespace that syncs cleanly holds what the peer had when the session began, not when it
+	// ended: that is the retention floor to record.
+	started := time.Now().UTC()
 	res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), transport, peersync.V2ClientConfig{
 		NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
 		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
@@ -286,7 +289,7 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 				}
 			} else {
 				cur.LastError, cur.PendingTips = "", nil
-				cur.LocalMain, cur.RemoteMain, cur.LastSync = ns.LocalMain, ns.RemoteMain, now
+				cur.LocalMain, cur.RemoteMain, cur.LastSync = ns.LocalMain, ns.RemoteMain, started
 			}
 			st.Namespaces[ns.Namespace] = cur
 		}
@@ -382,9 +385,11 @@ func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) err
 	source := l.peer.Namespaces[0]
 	var err error
 	var res peersync.ProjectionResult
+	var started time.Time
 	if l.r.cfg.Projections == nil {
 		err = errors.New("replication: a filtered peer needs a projection target, and none is configured")
 	} else {
+		started = time.Now().UTC()
 		var target peersync.ProjectionTarget
 		if target, err = l.r.cfg.Projections(source, l.peer.Filter); err == nil {
 			res, err = peersync.SyncProjection(wire.NewCodec(wire.EncodingJSON), transport, peersync.ProjectionConfig{
@@ -404,7 +409,7 @@ func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) err
 		slog.Warn("replication: projection sync failed", "peer", l.peer.Name, "error", err)
 	} else {
 		st.ConsecutiveFailures, st.LastError, st.LastSuccess = 0, "", now
-		cur.LastError, cur.RemoteMain, cur.LastSync = "", res.Source, now
+		cur.LastError, cur.RemoteMain, cur.LastSync = "", res.Source, started
 		cur.Pulled += int64(res.Writes + res.Deletes)
 	}
 	st.Namespaces[ns] = cur
