@@ -15,6 +15,9 @@ import (
 func RefsOf(ns string, d *dag.InMemoryCommitDag) wire.NamespaceRefs {
 	refs := wire.NamespaceRefs{Namespace: ns, Branches: map[string]string{}, Tags: map[string]string{}}
 	for _, b := range d.ListBranches() {
+		if IsTrackingBranch(b.Name) {
+			continue // local bookkeeping about another peer, never replicated
+		}
 		refs.Branches[b.Name] = b.HeadHash.Hex()
 	}
 	for _, t := range d.ListTags() {
@@ -94,18 +97,19 @@ func applySideBranch(env IngestEnv, name string, proposed codec.Hash) (RefUpdate
 		}
 		return RefUpdateResult{Outcome: wire.RefCreated, Head: proposed}, nil
 	}
+	ref := "branch:" + name
 	switch ResolveHeadUpdate(env.DAG, b.HeadHash, proposed) {
 	case HeadFastForward:
 		if err := env.DAG.SetHead(name, proposed); err != nil {
 			return RefUpdateResult{}, err
 		}
-		return RefUpdateResult{Outcome: wire.RefFastForwarded, Head: proposed}, nil
+		return RefUpdateResult{Outcome: wire.RefFastForwarded, Head: proposed}, env.clearConflict(ref)
 	case HeadAlreadyAncestor:
-		return RefUpdateResult{Outcome: wire.RefNoOp, Head: b.HeadHash}, nil
+		return RefUpdateResult{Outcome: wire.RefNoOp, Head: b.HeadHash}, env.clearConflict(ref)
 	default:
-		return RefUpdateResult{Outcome: wire.RefConflict, Head: b.HeadHash, Conflict: &kdberr.ConflictReport{
-			TransactionID: proposed.Hex(), BaseHash: b.HeadHash.Hex(), TargetHash: proposed.Hex(),
-		}}, nil
+		report := &kdberr.ConflictReport{TransactionID: proposed.Hex(), BaseHash: b.HeadHash.Hex(), TargetHash: proposed.Hex()}
+		return RefUpdateResult{Outcome: wire.RefConflict, Head: b.HeadHash, Conflict: report},
+			env.noteConflict(ref, b.HeadHash, proposed, report)
 	}
 }
 
@@ -114,12 +118,13 @@ func applyTag(env IngestEnv, name string, proposed codec.Hash) (RefUpdateResult,
 	lock.Lock()
 	defer lock.Unlock()
 	if t, ok := env.DAG.GetTag(name); ok {
+		ref := "tag:" + name
 		if t.CommitHash == proposed {
-			return RefUpdateResult{Outcome: wire.RefNoOp, Head: proposed}, nil
+			return RefUpdateResult{Outcome: wire.RefNoOp, Head: proposed}, env.clearConflict(ref)
 		}
-		return RefUpdateResult{Outcome: wire.RefConflict, Head: t.CommitHash, Conflict: &kdberr.ConflictReport{
-			TransactionID: proposed.Hex(), BaseHash: t.CommitHash.Hex(), TargetHash: proposed.Hex(),
-		}}, nil
+		report := &kdberr.ConflictReport{TransactionID: proposed.Hex(), BaseHash: t.CommitHash.Hex(), TargetHash: proposed.Hex()}
+		return RefUpdateResult{Outcome: wire.RefConflict, Head: t.CommitHash, Conflict: report},
+			env.noteConflict(ref, t.CommitHash, proposed, report)
 	}
 	if _, err := env.DAG.CreateTag(name, proposed, "replicated"); err != nil {
 		return RefUpdateResult{}, err

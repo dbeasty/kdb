@@ -85,6 +85,12 @@ type ResolutionOptions struct {
 	// [local's] HEAD", so "the transaction being applied" is the remote side.
 	// ConflictPolicyCustom consults Resolver once per conflicting document.
 	Policy transaction.ConflictPolicy
+	// Choose, when set, decides every same-document conflict before Policy is consulted: given a
+	// document's final operation on each side, it returns the operation the merge applies, or
+	// false to leave the conflict reported. It is how an operator's resolution of a queued
+	// conflict is applied (see ResolveConflict) - an explicit local/remote choice, not a policy,
+	// so unlike Resolver it is told which side is which.
+	Choose func(docID codec.UUID, local, remote document.Op) (document.Op, bool)
 	// Resolver is consulted when Policy is ConflictPolicyCustom. A nil Resolver, or a
 	// resolution failure/nil result for any document, falls back to reporting the conflict
 	// rather than guessing - matching transaction.Engine's own CUSTOM fallback.
@@ -241,6 +247,21 @@ func decideMergeWrites(
 	overlapping := intersectDocIDs(localTouched, remoteTouched)
 	if len(overlapping) == 0 {
 		return opsOnly(remoteTouched), nil, nil
+	}
+	if opts.Choose != nil {
+		writes := opsOnly(remoteTouched)
+		chosenAll := true
+		for _, docID := range overlapping {
+			op, ok := opts.Choose(docID, localTouched[docID].Op, remoteTouched[docID].Op)
+			if !ok {
+				chosenAll = false
+				break
+			}
+			writes[docID] = op
+		}
+		if chosenAll {
+			return writes, nil, nil
+		}
 	}
 
 	// A genuine same-document conflict. Real "replay per conflict policy" (kdb-spec.md §8.3 step

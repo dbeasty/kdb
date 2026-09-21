@@ -111,6 +111,8 @@ type frameHandler struct {
 	// authenticated" from "authenticated as an anonymous/empty principal").
 	principal     auth.Principal
 	authenticated bool
+	// peer is the connecting node's id from its handshake.
+	peer string
 }
 
 func newFrameHandler(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage.Adapter, cfg HostConfig, engine auth.Engine, ctx auth.ConnectionContext) *frameHandler {
@@ -239,6 +241,7 @@ func (h *frameHandler) serve(msg wire.Message) (wire.Message, error) {
 		}
 		h.principal = principal
 		h.authenticated = true
+		h.peer = m.Request.NodeID
 		heads := map[string]string{h.cfg.NamespaceID: mustHeadHex(h.dag)}
 		return peerHandshakeAck(m, true, heads, nil), nil
 	case wire.CommitFetchMessage:
@@ -339,6 +342,8 @@ func (h *frameHandler) ingestEnv() IngestEnv {
 		PersistAsync:   h.cfg.PersistAsync,
 		ApplyToStorage: h.cfg.MaterializeCommit != nil || h.cfg.ApplyToStorage,
 		Resolution:     ResolutionOptions{Policy: h.cfg.ConflictPolicy, Resolver: h.cfg.ConflictResolver},
+		Conflicts:      h.cfg.Conflicts,
+		Peer:           h.peer,
 	}
 }
 

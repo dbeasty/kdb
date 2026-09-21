@@ -38,6 +38,8 @@ type HostConfig struct {
 	// Node serializes ingest against the runtime's own writers and runs its post-commit hooks -
 	// see LocalNode. nil serializes only against other ingests in this process.
 	Node LocalNode
+	// Conflicts records refused updates durably - see IngestEnv.Conflicts.
+	Conflicts *ConflictQueue
 	// ClassifyError maps a failure to the wire error code sent back in a PeerErrorMessage; the
 	// server supplies its own classifier so a busy or draining node says so. Unrecognized errors
 	// fall back to peer sync's own classification.

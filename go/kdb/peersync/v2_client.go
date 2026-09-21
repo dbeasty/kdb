@@ -59,6 +59,9 @@ type NamespaceSyncResult struct {
 	Local, Remote map[string]wire.RefUpdateOutcome
 	// Conflicts are every ref, on either side, whose update was refused as a conflict.
 	Conflicts []RefConflict
+	// LocalMain / RemoteMain are both sides' main heads when this sync finished, as far as it
+	// knows: the peer's is its advertised head, or what it reported after the last push to it.
+	LocalMain, RemoteMain string
 	// ReceivedTips are the tips of every page this sync stored, so a caller whose sync is
 	// interrupted can pass them back as ExtraHaves and resume.
 	ReceivedTips []codec.Hash
@@ -123,6 +126,7 @@ func SyncV2(w wire.Codec, transport stream.Transport, cfg V2ClientConfig) (V2Res
 		return V2Result{}, NewError("peer refused sync: "+ack.Reason, nil)
 	}
 	out := V2Result{RemoteNodeID: ack.NodeID, Protocol: wire.SyncProtocolVersion}
+	c.remoteNode = ack.NodeID
 	for _, refs := range ack.Refs {
 		out.Namespaces = append(out.Namespaces, c.syncNamespace(cfg, refs))
 	}
@@ -136,16 +140,21 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 		res.Err = err
 		return res
 	}
+	env.Peer = c.remoteNode
 	if cfg.Mode&SyncPull != 0 {
 		if err := c.pull(cfg, env, remote, &res); err != nil {
 			res.Err = err
 			return res
 		}
 	}
+	res.RemoteMain = remote.Branches[mainBranch]
 	if cfg.Mode&SyncPush != 0 {
 		if err := c.push(cfg, env, remote, &res); err != nil {
 			res.Err = err
 		}
+	}
+	if h, err := env.DAG.Head(); err == nil {
+		res.LocalMain = h.Hex()
 	}
 	return res
 }
@@ -264,6 +273,9 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 				continue
 			}
 			res.Remote[ref.key()] = ack.Outcome
+			if ref.kind == wire.RefBranch && ref.name == mainBranch && ack.HeadHex != "" {
+				res.RemoteMain = ack.HeadHex
+			}
 			if ack.Outcome == wire.RefConflict {
 				var report kdberr.ConflictReport
 				if len(ack.ConflictBytes) > 0 {
@@ -355,6 +367,7 @@ func syncV1Fallback(w wire.Codec, transport stream.Transport, cfg V2ClientConfig
 
 // v2Conn is one v2 connection's request/response plumbing.
 type v2Conn struct {
+	remoteNode  string
 	wire        wire.Codec
 	conn        stream.ConnectionHandle
 	mu          sync.Mutex

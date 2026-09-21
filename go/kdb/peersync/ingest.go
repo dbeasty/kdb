@@ -8,6 +8,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
+	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
@@ -62,6 +63,12 @@ type IngestEnv struct {
 	// auto-merge path always writes storage, since the merge tree is built there.
 	ApplyToStorage bool
 	Resolution     ResolutionOptions
+	// Conflicts, when set, records every refused ref update durably and clears it once a later
+	// sync with the same peer succeeds - see ConflictQueue.
+	Conflicts *ConflictQueue
+	// Peer names the node the incoming history came from, for the conflict queue and tracking
+	// branches. Empty when unknown.
+	Peer string
 	// MaxClockSkew refuses a commit timestamped further than this past local wall time. Commits
 	// are timestamped at least one microsecond after their parents, so a single commit from a node
 	// whose clock runs far ahead would drag every later commit that descends from it into that
@@ -200,6 +207,9 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 				return err
 			}
 			res.Outcome = outcome
+			if outcome.Kind == OutcomeConflict {
+				return env.noteConflict("branch:"+mainBranch, localHead, incomingHead, outcome.Report)
+			}
 			if outcome.MergeCommit == nil {
 				return nil
 			}
@@ -222,7 +232,61 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 	if err != nil {
 		return res, err
 	}
+	if res.Outcome.Kind != OutcomeConflict {
+		if cerr := env.clearConflict("branch:" + mainBranch); cerr != nil {
+			return res, cerr
+		}
+	}
 	return res, headErr
+}
+
+// noteConflict records a refused update of ref to incoming, and points a tracking branch at the
+// incoming side so it stays reachable - retention keeps what a branch names - and resolution can
+// find it after the peer has moved on.
+func (env IngestEnv) noteConflict(ref string, local, incoming codec.Hash, report *kdberr.ConflictReport) error {
+	if env.Conflicts == nil {
+		return nil
+	}
+	peer := env.Peer
+	if peer == "" {
+		peer = "unknown"
+	}
+	tracking := TrackingBranch(peer, ref)
+	if _, ok := env.DAG.GetBranch(tracking); ok {
+		if err := env.DAG.SetHead(tracking, incoming); err != nil {
+			return err
+		}
+	} else if _, err := env.DAG.CreateBranch(tracking, incoming); err != nil {
+		return err
+	}
+	e := ConflictEntry{
+		ID: ConflictID(ConflictDivergence, env.NamespaceID, ref, peer), Kind: ConflictDivergence,
+		Namespace: env.NamespaceID, Ref: ref, Peer: env.Peer,
+		LocalHex: local.Hex(), IncomingHex: incoming.Hex(), TrackingRef: tracking,
+	}
+	if report != nil {
+		e.Items = report.Conflicts
+	}
+	_, err := env.Conflicts.Record(e)
+	return err
+}
+
+// clearConflict drops a recorded divergence of ref with this peer once an update of it has gone
+// through, along with its tracking branch.
+func (env IngestEnv) clearConflict(ref string) error {
+	if env.Conflicts == nil {
+		return nil
+	}
+	peer := env.Peer
+	if peer == "" {
+		peer = "unknown"
+	}
+	id := ConflictID(ConflictDivergence, env.NamespaceID, ref, peer)
+	if _, ok := env.Conflicts.Get(id); !ok {
+		return nil
+	}
+	_ = env.DAG.DeleteBranch(TrackingBranch(peer, ref))
+	return env.Conflicts.Remove(id)
 }
 
 // persistAll queues commits for the log in order, returning what to wait on.

@@ -90,6 +90,7 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 			return code, code != wire.ErrorCodeInternal
 		},
 		PersistAsync: runtime.peerPersistAsync(),
+		Conflicts:    runtime.Conflicts,
 	}
 	host := peersync.NewConnectionHost(codec, runtime.dag, runtime.Runtime.Storage, cfg, runtime.AuthEngine, auth.EmptyContext)
 	return &peerSyncConnHandler{host: host, runtime: runtime, codec: codec}

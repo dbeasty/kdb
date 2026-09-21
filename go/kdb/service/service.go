@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,8 +23,10 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/policy"
 	"github.com/limidus/kdb/go/kdb/recovery"
+	"github.com/limidus/kdb/go/kdb/replication"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
@@ -49,6 +52,13 @@ func Main() {
 	var showVersion bool
 	var peerConflictPolicy string
 	var streamAllowAnonymous bool
+	var peerSpecs []string
+	var peerCreateNamespaces bool
+	fs.Func("peer", "an outbound replication peer, repeatable: name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both|pull|push,interval=30s,user=u,password-env=VAR,create=true - this node keeps the matching namespaces in sync with it (see docs/kdb-distributed-plan.md). KDB_PEERS holds the same, ';'-separated", func(v string) error {
+		peerSpecs = append(peerSpecs, v)
+		return nil
+	})
+	fs.BoolVar(&peerCreateNamespaces, "peer-create-namespaces", false, "let a peer that pushes over sync protocol v2 create a namespace this node does not hold yet (a literal name it is authorized to sync); off, a push into an unknown namespace is refused")
 	var expireField string
 	var expireGrace, expireInterval time.Duration
 	fs.StringVar(&expireField, "expire-field", "", "document expiry (kdb-spec-layer16 §9.5): the top-level field (or dotted path) holding each document's expiry timestamp as an RFC 3339 string or epoch milliseconds. Documents whose timestamp has passed are hidden from reads at head and deleted by a periodic sweep; empty (default) disables expiry")
@@ -265,6 +275,7 @@ func Main() {
 		fmt.Fprintf(os.Stderr, "Error: unknown --peer-conflict-policy %q (want strict or last-write)\n", peerConflictPolicy)
 		os.Exit(2)
 	}
+	srv.PeerCreateOnPush = peerCreateNamespaces
 
 	// Resource governance. Unlike every previous release this is on unless explicitly turned
 	// off: the mechanism that keeps sustained write load from ending in an OOM kill was
@@ -377,6 +388,14 @@ func Main() {
 	if host != nil {
 		txnCoordinator = host.Transactions()
 	}
+	// Set once the replicator starts; every runtime's commit listener tells it what changed, and a
+	// runtime opened later through the set reaches it through this pointer.
+	var replicatorRef atomic.Pointer[replication.Replicator]
+	notifyReplicator := func(ns string) {
+		if r := replicatorRef.Load(); r != nil {
+			r.OnLocalCommit(ns)
+		}
+	}
 	nsSet := server.NewNamespaceSet(txnCoordinator)
 	if err := nsSet.Add(srv); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -403,6 +422,9 @@ func Main() {
 			sec.AuthEngine = srv.AuthEngine
 			sec.WriteTimeout = srv.WriteTimeout
 			sec.Namespaces = nsSet
+			sec.PeerSyncConflictPolicy = srv.PeerSyncConflictPolicy
+			sec.PeerCreateOnPush = srv.PeerCreateOnPush
+			sec.CommitListener = func(ns string, _ document.Commit) { notifyReplicator(ns) }
 			// The same process budget as the primary, not none: otherwise a namespace reached
 			// through the wire would bypass admission and the scan row budget altogether.
 			sec.ShareGovernanceWith(srv)
@@ -619,6 +641,8 @@ func Main() {
 			// process, by reopening the namespace. Costs a brief unavailability, which the
 			// outcome reports.
 			Reopener: reopener,
+			// Resolved when asked: the replicator starts after the control plane does.
+			Replication: lazyReplication{&replicatorRef},
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)
@@ -687,6 +711,52 @@ func Main() {
 		}
 	}
 
+	// Outbound replication: one loop per configured peer, started last so every namespace it
+	// might sync is open, and stopped first so no sync is mid-ingest while storage closes.
+	if env, ok := os.LookupEnv("KDB_PEERS"); ok && len(peerSpecs) == 0 {
+		peerSpecs = append(peerSpecs, env)
+	}
+	replicationStatus := "disabled"
+	var replicator *replication.Replicator
+	if len(peerSpecs) > 0 {
+		peers, err := replication.ParsePeers(strings.Join(peerSpecs, ";"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: --peer: %v\n", err)
+			os.Exit(1)
+		}
+		stateDir := ""
+		if dataDir != "" {
+			stateDir = replication.StateDir(dataDir)
+		}
+		state, err := replication.NewStateStore(stateDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: replication state: %v\n", err)
+			os.Exit(1)
+		}
+		replicator, err = replication.New(replication.Config{
+			NodeID: srv.NodeID.String(), Local: srv.PeerNamespaces(), Peers: peers, State: state, TLS: tlsSettings,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		replicatorRef.Store(replicator)
+		// Namespaces opened through the set notify the replicator from the opener; the primary
+		// runtime's listener is chained, since the stream hub and control plane may own it.
+		previous := srv.CommitListener
+		srv.CommitListener = func(n string, c document.Commit) {
+			if previous != nil {
+				previous(n, c)
+			}
+			notifyReplicator(n)
+		}
+		replicator.Start()
+		if admin != nil {
+			admin.SetExtraMetrics(replicator.WriteMetrics)
+		}
+		replicationStatus = fmt.Sprintf("%d peer(s)", len(peers))
+	}
+
 	build := version.Get()
 	slog.Info("KDB service started",
 		"version", build.Version,
@@ -696,6 +766,7 @@ func Main() {
 		"commit_dirty", build.Dirty,
 		"build_date", build.BuildDate,
 		"peer", peerStatus,
+		"replication", replicationStatus,
 		"stream", streamStatus,
 		"sql", sqlStatus,
 		"ws", wsStatus,
@@ -740,6 +811,10 @@ func Main() {
 	// Storage stays crash-consistent even if step 5 times out: replay covers the rest.
 	if admin != nil {
 		admin.SetReady(false, "draining")
+	}
+	// Replication first: a sync in flight is a writer, and Stop waits for it to finish.
+	if replicator != nil {
+		replicator.Stop()
 	}
 	// Before anything else: a pass that is mid-truncation holds the invariant that makes
 	// truncation safe (bodies flushed, checkpoint written, then segments deleted), and Stop waits
@@ -977,4 +1052,23 @@ func (m multiCloser) Close() error {
 		}
 	}
 	return first
+}
+
+// lazyReplication hands the control plane the replicator once it exists.
+type lazyReplication struct {
+	ref *atomic.Pointer[replication.Replicator]
+}
+
+func (l lazyReplication) Status() []replication.PeerStatus {
+	if r := l.ref.Load(); r != nil {
+		return r.Status()
+	}
+	return nil
+}
+
+func (l lazyReplication) SyncNow(name string) (peersync.V2Result, error) {
+	if r := l.ref.Load(); r != nil {
+		return r.SyncNow(name)
+	}
+	return peersync.V2Result{}, fmt.Errorf("no replication peers are configured")
 }

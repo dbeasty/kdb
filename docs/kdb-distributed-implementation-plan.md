@@ -271,7 +271,7 @@ RefUpdateAck  {Namespace, Ref, Outcome (ff|merged|noop|conflict|rejected), HeadH
 
 ## Phase 3 — Replicator, conflict queue, CLI
 
-### 3.1 Peer configuration (`service/peers.go`) ☐
+### 3.1 Peer configuration (`service/peers.go`) ☑
 
 ```
 --peer name=cloud,addr=tcps://cloud:4242,namespaces=site/*;shared/*,mode=bidirectional,interval=30s,user=..,password-env=..
@@ -280,7 +280,7 @@ KDB_PEERS="name=...;name=..."   (same grammar, ';'-separated entries use '|' ins
 
 Parsed into `replication.PeerConfig{Name, Addr, Patterns []string, Mode, Interval, Credentials}`. It's validated at startup; an unknown key is fatal, following the config convention.
 
-### 3.2 Replicator (`go/kdb/replication/`) ☐
+### 3.2 Replicator (`go/kdb/replication/`) ☑
 
 ```go
 type Replicator struct { ... }
@@ -302,7 +302,7 @@ func (r *Replicator) OnLocalCommit(ns string)   // wired to CommitListener (chai
   - `kdb_replication_errors_total{peer}`
   - `kdb_replication_lag_commits{peer,ns}`
 
-### 3.3 Durable conflict queue (`embed/conflict_queue.go`) ☐
+### 3.3 Durable conflict queue (`embed/conflict_queue.go`) ☑
 
 - **Per namespace**, as `<nsRoot>/conflicts/<id>.json`, where the id is `sha256(localHead ‖ incomingHead)`, so it's idempotent.
 - **An entry holds:** `{id, namespace, localHead, incomingHead, ancestor, policy, firstSeen, lastSeen, peer, items []ConflictItem, kind: divergence|unique}`.
@@ -315,13 +315,13 @@ func (r *Replicator) OnLocalCommit(ns string)   // wired to CommitListener (chai
   - the `kdb_conflicts_open{ns}` gauge
 - **Admin UI:** a Conflicts tab, following the Retention tab's pattern.
 
-### 3.4 Control endpoints ☐
+### 3.4 Control endpoints ☑
 
 - `GET /v1/peers`: status
 - `POST /v1/peers/{name}/sync`: sync now
 - `/healthz` gains `replication: {peers: n, failing: m}`
 
-### 3.5 CLI ☐
+### 3.5 CLI ☑
 
 In `kdb-cli`, the Go CLI entry points, as far as its structure allows:
 
@@ -564,3 +564,39 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 - **Not measured yet:** the 100k-commit v1-vs-v2 comparison. It needs an isolated machine (see the benchmark-isolation note), so it's recorded as outstanding rather than run under load.
 
 **Known limitation, carried to Phase 4:** replicated side branches and tags are held in the DAG and survive a clean restart through the checkpoint, but not a crash. The delta log records only commits on `main`, in the order `main` reached them — that's what keeps replay correct (commit `2aec036`).
+
+### Phase 3 — landed
+
+**Replicator.** `go/kdb/replication` holds:
+- `ParsePeer`/`ParsePeers`, the `--peer` / `KDB_PEERS` grammar. Passwords come only from an environment variable named in the spec, never from the flag.
+- `StateStore`: `<dataRoot>/replication/peers/<name>.json`.
+- `Replicator`: one loop per peer, triggered by a debounced commit, the interval tick, or `SyncNow`. Backoff doubles per failure, is capped, and has jitter. An interrupted pull's received tips are kept as `PendingTips` and passed back as `ExtraHaves`, so the next attempt resumes.
+
+**Conflict queue.** It's `peersync.ConflictQueue`, not an `embed` type as planned: every writer to it is in peersync, and `embed` doesn't need it.
+- Stored at `<dataRoot>/replication/conflicts/<escaped ns>/<id>.json`.
+- Keyed by what the conflict is about: `(ns, ref, peer)` for a divergence, so a conflict that persists is one entry whose `Seen` counter grows.
+- A refused ref update records an entry and points `peers/<peer>/<kind>/<name>` at the incoming side. A later clean update of that ref with that peer clears both.
+- Unique duplicates and foreign cross-namespace parts moved here from Phase 0's in-memory `ReplicationIssues`, which is gone. Unique-duplicate entries clear themselves once a rebuild no longer finds the duplicate.
+
+**Resolution.** `peersync.ResolveConflict` merges the tracked side through `Adopt`, driven by a new `ResolutionOptions.Choose` hook. That hook is explicitly local/remote, unlike the canonical-order Custom resolver, because it's an operator's decision rather than a policy. `KdbServerRuntime.ResolveConflict` and `DismissConflict` authorize as a commit.
+
+**Surfaces.**
+- `kdb-service`: `--peer`, `KDB_PEERS`, `--peer-create-namespaces`.
+- Every runtime's commits notify the replicator: the primary through the chained listener, the others from the namespace opener. The replicator stops first on shutdown.
+- Outbound connections use the node's own TLS settings, which gives node-to-node mTLS when `--tls-ca` is set.
+- Control plane:
+  - `GET /v1/peers`, `POST /v1/peers/{name}/sync`
+  - `GET /v1/ns/{ns}/conflicts`, `POST .../conflicts/{id}/resolve`, `DELETE .../conflicts/{id}`
+- `/metrics`:
+  - `kdb_conflicts_open{namespace,kind}`
+  - `kdb_replication_last_success_seconds{peer}`
+  - `kdb_replication_consecutive_failures{peer}`
+  - `kdb_replication_commits_total{peer,namespace,direction}`
+- CLI: `kdb node status`, `kdb sync <ns> <addr> [--pull|--push]`, `kdb conflicts <ns>`, `kdb resolve <ns> <id> --take local|remote`.
+
+**e2e.** `kdb-integration/e2e/test_replicator.py` covers two real processes configured only with `--peer`: writes travel both ways, and replication resumes after `kill -9` and restart.
+
+**Not done, deliberately:**
+- **The admin UI Conflicts tab.** The API it would sit on is complete.
+- **0.1c, incremental unique-key maintenance on ingest.** It's still a lenient full rebuild per ingest batch, and only when the schema declares unique fields.
+- **Persistent held-open sessions.** A remote commit reaches this node on the next interval tick, not immediately. Push is immediate because it's commit-triggered. The interval is the knob.

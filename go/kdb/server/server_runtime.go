@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
+	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -174,9 +176,10 @@ type KdbServerRuntime struct {
 	// sweeperState holds document-expiry configuration and the sweeper goroutine (expiry.go).
 	sweeperState
 
-	// replication records what peer sync accepted but could not make consistent - see
-	// ReplicationIssues (peersync_ingest.go).
-	replication replicationIssues
+	// Conflicts is this namespace's queue of replication conflicts - refused ref updates, unique
+	// duplicates and unverifiable cross-namespace parts. Durable under a file-backed runtime's
+	// data root, in memory otherwise.
+	Conflicts *peersync.ConflictQueue
 
 	// groupPublishing counts cross-namespace transactions currently publishing a commit into this
 	// namespace, and groupVersion counts every one that has. NamespaceSet.Snapshot reads both on
@@ -220,6 +223,21 @@ func (s *KdbServerRuntime) beforeSqlExecHook() func(msg wire.SqlExecMessage) {
 	return s.beforeSqlExec
 }
 
+// openConflictQueue opens rt's conflict queue, falling back to memory - with the reason logged -
+// if the durable one cannot be read, rather than refusing to open the namespace over it.
+func openConflictQueue(rt *embed.EmbeddedKdbRuntime) *peersync.ConflictQueue {
+	if rt.DataRoot != "" && !rt.ReadOnly {
+		q, err := peersync.NewConflictQueue(peersync.ConflictQueueDir(rt.DataRoot, rt.DefaultNamespace))
+		if err == nil {
+			return q
+		}
+		slog.Warn("replication conflict queue unreadable; keeping this session's conflicts in memory",
+			"namespace", rt.DefaultNamespace, "error", err)
+	}
+	q, _ := peersync.NewConflictQueue("")
+	return q
+}
+
 // NewKdbServerRuntime creates a server runtime with ref-count 1, wiring the transaction and SQL
 // engines against rt's DAG/storage. rt.DAG must be a *dag.InMemoryCommitDag or a
 // *embed.PersistingCommitDAG wrapping one (true of every runtime
@@ -253,6 +271,7 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		WriteTimeout:      DefaultWriteTimeout,
 		NodeID:            ProcessNodeID(),
 	}
+	s.Conflicts = openConflictQueue(rt)
 	// The SQL engine reads through the expiry filter, not the raw adapter - this is the one place
 	// the read side of §9.5 is applied to SQL, since go/kdb/sql knows nothing about expiry.
 	s.rebuildSQLEngine()

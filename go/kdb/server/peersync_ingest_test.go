@@ -183,9 +183,9 @@ func TestPeerIngestUniqueDuplicateRecorded(t *testing.T) {
 	if !rt.dag.IsAncestor(c.Hash, head) {
 		t.Fatal("replicated commit was not merged into main")
 	}
-	issues := rt.ReplicationIssues()
-	if len(issues) != 1 || issues[0].Kind != ReplicationIssueUniqueDuplicate {
-		t.Fatalf("expected one unique-duplicate issue, got %+v", issues)
+	issues := rt.Conflicts.List()
+	if len(issues) != 1 || issues[0].Kind != peersync.ConflictUniqueDuplicate {
+		t.Fatalf("expected one unique-duplicate conflict, got %+v", issues)
 	}
 	if got := rt.UniqueKeys.Len(); got != 1 {
 		t.Fatalf("expected the contested key to have exactly one owner, got %d keys", got)
@@ -222,12 +222,12 @@ func TestForeignGroupPartIsFlagged(t *testing.T) {
 	if _, err := peer.push(c); err != nil {
 		t.Fatalf("push: %v", err)
 	}
-	for _, issue := range rt.ReplicationIssues() {
-		if issue.Kind == ReplicationIssueForeignGroupPart && issue.CommitHex == c.Hash.Hex() {
+	for _, issue := range rt.Conflicts.List() {
+		if issue.Kind == peersync.ConflictForeignGroupPart && issue.IncomingHex == c.Hash.Hex() {
 			return
 		}
 	}
-	t.Fatalf("foreign group part not flagged; issues: %+v", rt.ReplicationIssues())
+	t.Fatalf("foreign group part not flagged; conflicts: %+v", rt.Conflicts.List())
 }
 
 // TestTwoServersConvergeWithIndexes is Phase 0's exit criterion: two server runtimes that each

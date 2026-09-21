@@ -46,6 +46,7 @@ type V2Host struct {
 	principal auth.Principal
 	helloDone bool
 	granted   map[string]bool
+	peer      string
 }
 
 // NewV2Host returns a host for one connection.
@@ -174,7 +175,7 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 		}
 	}
 	h.mu.Lock()
-	h.principal, h.helloDone, h.granted = principal, true, granted
+	h.principal, h.helloDone, h.granted, h.peer = principal, true, granted, m.NodeID
 	h.mu.Unlock()
 	refs, err := h.refs(names)
 	if err != nil {
@@ -222,7 +223,7 @@ func (h *V2Host) refs(namespaces []string) ([]wire.NamespaceRefs, error) {
 // mid-session takes effect on the next frame.
 func (h *V2Host) env(ns string, create bool) (IngestEnv, error) {
 	h.mu.Lock()
-	ok, principal := h.granted[ns], h.principal
+	ok, principal, peer := h.granted[ns], h.principal, h.peer
 	h.mu.Unlock()
 	if !ok {
 		return IngestEnv{}, &NotGrantedError{Namespace: ns}
@@ -230,7 +231,9 @@ func (h *V2Host) env(ns string, create bool) (IngestEnv, error) {
 	if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.PeerSyncAction{Namespace: ns}); err != nil {
 		return IngestEnv{}, err
 	}
-	return h.cfg.Namespaces.Env(ns, create)
+	env, err := h.cfg.Namespaces.Env(ns, create)
+	env.Peer = peer
+	return env, err
 }
 
 func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {

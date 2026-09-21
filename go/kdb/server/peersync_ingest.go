@@ -3,12 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
-	"sync"
-	"time"
 
+	"github.com/limidus/kdb/go/kdb/auth"
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/peersync"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // serverLocalNode makes peer sync an ordinary writer of this runtime: it queues on the same
@@ -40,6 +41,7 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 		PersistAsync:   s.peerPersistAsync(),
 		ApplyToStorage: true,
 		Resolution:     peersync.ResolutionOptions{Policy: s.PeerSyncConflictPolicy},
+		Conflicts:      s.Conflicts,
 	}
 }
 
@@ -120,26 +122,23 @@ func (n serverLocalNode) Advanced(step peersync.AdvanceStep) error {
 		if sch.HasUniqueConstraints() {
 			dups, err := rt.UniqueKeys.RebuildLenient(rt.Runtime.DefaultNamespace, rt.Runtime.Storage, last.DocumentTreeHash, sch)
 			keep(err)
-			for _, d := range dups {
-				rt.replication.record(ReplicationIssue{
-					Kind:      ReplicationIssueUniqueDuplicate,
-					Namespace: rt.Runtime.DefaultNamespace,
-					Detail:    d.Error(),
-					CommitHex: last.Hash.Hex(),
-				})
+			if err == nil {
+				keep(rt.recordUniqueDuplicates(dups, last))
 			}
 		}
 	}
 	localHost := rt.namespaceSet().Coordinator().LocalHostID()
 	for _, c := range step.Commits {
 		if m, ok := embed.ParseGroupMarker(c.Message); ok && m.Host != localHost {
-			rt.replication.record(ReplicationIssue{
-				Kind:      ReplicationIssueForeignGroupPart,
+			_, err := rt.Conflicts.Record(peersync.ConflictEntry{
+				ID:        peersync.ConflictID(peersync.ConflictForeignGroupPart, rt.Runtime.DefaultNamespace, m.Group.String()),
+				Kind:      peersync.ConflictForeignGroupPart,
 				Namespace: rt.Runtime.DefaultNamespace,
-				Detail: fmt.Sprintf("commit is part of cross-namespace group %s (namespaces %v) decided on host %q; "+
-					"its atomicity with the other parts is not verified on this node", m.Group, m.Parts, m.Host),
-				CommitHex: c.Hash.Hex(),
+				Detail: fmt.Sprintf("commit %s is part of cross-namespace group %s (namespaces %v) decided on host %q; "+
+					"its atomicity with the other parts is not verified on this node", c.Hash.Hex(), m.Group, m.Parts, m.Host),
+				IncomingHex: c.Hash.Hex(),
 			})
+			keep(err)
 		}
 	}
 	if rt.CommitListener != nil {
@@ -150,51 +149,60 @@ func (n serverLocalNode) Advanced(step peersync.AdvanceStep) error {
 	return firstErr
 }
 
-// ReplicationIssueKind classifies something peer sync accepted but could not make consistent.
-type ReplicationIssueKind string
-
-const (
-	// ReplicationIssueUniqueDuplicate: replicated documents claim a value a unique constraint
-	// says only one document may hold.
-	ReplicationIssueUniqueDuplicate ReplicationIssueKind = "unique-duplicate"
-	// ReplicationIssueForeignGroupPart: a replicated commit is one part of a cross-namespace
-	// group decided on another host; nothing here checks the other parts arrived with it.
-	ReplicationIssueForeignGroupPart ReplicationIssueKind = "foreign-group-part"
-)
-
-// ReplicationIssue is one such thing, kept for an operator to act on.
-type ReplicationIssue struct {
-	Kind      ReplicationIssueKind
-	Namespace string
-	Detail    string
-	CommitHex string
-	At        time.Time
-}
-
-// replicationIssues is the in-memory record of ReplicationIssue. Bounded: it is a diagnostic,
-// and the durable conflict queue is where anything that needs resolving is kept.
-type replicationIssues struct {
-	mu     sync.Mutex
-	issues []ReplicationIssue
-}
-
-const maxReplicationIssues = 1000
-
-func (r *replicationIssues) record(i ReplicationIssue) {
-	if i.At.IsZero() {
-		i.At = time.Now()
+// recordUniqueDuplicates brings the conflict queue's unique-duplicate entries in line with the
+// duplicates a rebuild just found: new ones are recorded, and ones no longer present - an
+// operator fixed the data, or a later replicated write did - are cleared.
+func (s *KdbServerRuntime) recordUniqueDuplicates(dups []transaction.UniqueConstraintError, at document.Commit) error {
+	ns := s.Runtime.DefaultNamespace
+	current := map[string]bool{}
+	for _, d := range dups {
+		id := peersync.ConflictID(peersync.ConflictUniqueDuplicate, ns, d.Key.String(), d.DocID.String())
+		current[id] = true
+		if _, err := s.Conflicts.Record(peersync.ConflictEntry{
+			ID: id, Kind: peersync.ConflictUniqueDuplicate, Namespace: ns,
+			Detail: d.Error(), IncomingHex: at.Hash.Hex(),
+		}); err != nil {
+			return err
+		}
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.issues = append(r.issues, i)
-	if len(r.issues) > maxReplicationIssues {
-		r.issues = r.issues[len(r.issues)-maxReplicationIssues:]
+	for _, e := range s.Conflicts.List() {
+		if e.Kind == peersync.ConflictUniqueDuplicate && !current[e.ID] {
+			if err := s.Conflicts.Remove(e.ID); err != nil {
+				return err
+			}
+		}
 	}
+	return nil
 }
 
-// ReplicationIssues returns what peer sync has recorded, oldest first.
-func (s *KdbServerRuntime) ReplicationIssues() []ReplicationIssue {
-	s.replication.mu.Lock()
-	defer s.replication.mu.Unlock()
-	return append([]ReplicationIssue(nil), s.replication.issues...)
+// ResolveConflict settles a queued divergence of main by merging the peer's side with the
+// documents chosen as choices say - see peersync.ResolveConflict. It is an ordinary write: the
+// principal needs commit rights, and the merge replicates like any other commit.
+func (s *KdbServerRuntime) ResolveConflict(id string, choices map[codec.UUID]peersync.Choice, principal auth.Principal) (document.Commit, error) {
+	if err := s.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.TxCommitAction{Namespace: s.Runtime.DefaultNamespace}); err != nil {
+		return document.Commit{}, &AuthorizationError{Cause: err}
+	}
+	res, err := peersync.ResolveConflict(s.PeerIngestEnv(), id, choices)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	return s.dag.GetCommitOrThrow(res.Head)
+}
+
+// DismissConflict drops a queued conflict without acting on it - for kinds nothing can merge
+// away (a unique duplicate an operator fixed by hand, a foreign group part accepted as is), and
+// for a divergence the operator has decided to leave unmerged. A divergence's tracking branch
+// goes with it.
+func (s *KdbServerRuntime) DismissConflict(id string, principal auth.Principal) error {
+	if err := s.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.TxCommitAction{Namespace: s.Runtime.DefaultNamespace}); err != nil {
+		return &AuthorizationError{Cause: err}
+	}
+	e, ok := s.Conflicts.Get(id)
+	if !ok {
+		return peersync.ErrConflictNotFound
+	}
+	if e.TrackingRef != "" {
+		_ = s.dag.DeleteBranch(e.TrackingRef)
+	}
+	return s.Conflicts.Remove(id)
 }
