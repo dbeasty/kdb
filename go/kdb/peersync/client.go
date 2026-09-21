@@ -116,7 +116,7 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 	}
 	return &defaultSession{
 		client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn,
-		materialize: config.MaterializeCommit, persist: config.Persist,
+		materialize: config.MaterializeCommit, persist: config.Persist, persistAsync: config.PersistAsync,
 		conflictPolicy: config.ConflictPolicy, conflictResolver: config.ConflictResolver,
 		node: config.Node, applyToStorage: config.ApplyToStorage, pageSize: config.PageCommits,
 	}, nil
@@ -246,7 +246,8 @@ type defaultSession struct {
 	// persist durably logs a commit pulled from a peer - see ClientConfig.Persist's doc
 	// comment. May be nil (peer sync then has no local durability of its own, matching the
 	// behavior before this field existed).
-	persist func(document.Commit) error
+	persist      func(document.Commit) error
+	persistAsync func(document.Commit) (func() error, error)
 	// conflictPolicy/conflictResolver - see ClientConfig's doc comment.
 	conflictPolicy   transaction.ConflictPolicy
 	conflictResolver transaction.ConflictResolver
@@ -372,6 +373,7 @@ func (s *defaultSession) ingestEnv() IngestEnv {
 		NamespaceID:    s.namespaceID,
 		Node:           s.node,
 		Persist:        s.persist,
+		PersistAsync:   s.persistAsync,
 		ApplyToStorage: s.materialize != nil || s.applyToStorage,
 		Resolution:     ResolutionOptions{Policy: s.conflictPolicy, Resolver: s.conflictResolver},
 	}

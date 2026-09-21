@@ -39,12 +39,22 @@ func (b *jsonByteArray) UnmarshalJSON(data []byte) error {
 }
 
 type payloadEnvelope struct {
-	Kind              string                `json:"kind"`
-	Handshake         *handshakeDto         `json:"handshake,omitempty"`
-	HandshakeAck      *handshakeAckDto      `json:"handshakeAck,omitempty"`
-	DeltaCommit       *deltaCommitDto       `json:"deltaCommit,omitempty"`
-	CommitFetch       *commitFetchDto       `json:"commitFetch,omitempty"`
-	PeerError         *peerErrorDto         `json:"peerError,omitempty"`
+	Kind         string           `json:"kind"`
+	Handshake    *handshakeDto    `json:"handshake,omitempty"`
+	HandshakeAck *handshakeAckDto `json:"handshakeAck,omitempty"`
+	DeltaCommit  *deltaCommitDto  `json:"deltaCommit,omitempty"`
+	CommitFetch  *commitFetchDto  `json:"commitFetch,omitempty"`
+	PeerError    *peerErrorDto    `json:"peerError,omitempty"`
+
+	// Peer sync v2 (Go-only) - see sync_v2_ops.go.
+	SyncHello         *syncHelloDto         `json:"syncHello,omitempty"`
+	SyncHelloAck      *syncHelloAckDto      `json:"syncHelloAck,omitempty"`
+	RefsRequest       *refsRequestDto       `json:"refsRequest,omitempty"`
+	RefsResult        *refsResultDto        `json:"refsResult,omitempty"`
+	FetchRequest      *fetchRequestDto      `json:"fetchRequest,omitempty"`
+	PackPage          *packPageDto          `json:"packPage,omitempty"`
+	RefUpdate         *refUpdateDto         `json:"refUpdate,omitempty"`
+	RefUpdateAck      *refUpdateAckDto      `json:"refUpdateAck,omitempty"`
 	CommitPush        *commitPushDto        `json:"commitPush,omitempty"`
 	CommitPushAck     *commitPushAckDto     `json:"commitPushAck,omitempty"`
 	DagDiff           *dagDiffDto           `json:"dagDiff,omitempty"`

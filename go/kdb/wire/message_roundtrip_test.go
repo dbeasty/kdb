@@ -518,6 +518,14 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgTxCommitMulti, "TX_COMMIT_MULTI"},
 		{wire.MsgTxCommitMultiResult, "TX_COMMIT_MULTI_RESULT"},
 		{wire.MsgPeerError, "PEER_ERROR"},
+		{wire.MsgSyncHello, "SYNC_HELLO"},
+		{wire.MsgSyncHelloAck, "SYNC_HELLO_ACK"},
+		{wire.MsgRefsRequest, "REFS_REQUEST"},
+		{wire.MsgRefsResult, "REFS_RESULT"},
+		{wire.MsgFetchRequest, "FETCH_REQUEST"},
+		{wire.MsgPackPage, "PACK_PAGE"},
+		{wire.MsgRefUpdate, "REF_UPDATE"},
+		{wire.MsgRefUpdateAck, "REF_UPDATE_ACK"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -544,7 +552,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x26
+const nextFreeMessageCode = 0x2E
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{

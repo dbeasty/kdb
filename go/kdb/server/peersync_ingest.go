@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/peersync"
 )
@@ -17,6 +18,15 @@ import (
 // local writers, and never reached any of those hooks (docs/kdb-distributed-plan.md D2/D3/D8).
 type serverLocalNode struct {
 	rt *KdbServerRuntime
+}
+
+// peerPersistAsync is how peer sync logs commits it adopts into this runtime, or nil for a
+// runtime with no log.
+func (s *KdbServerRuntime) peerPersistAsync() func(document.Commit) (func() error, error) {
+	if s.persister == nil {
+		return nil
+	}
+	return s.persister.PersistAsync
 }
 
 // PeerSyncNode returns the peersync.LocalNode that feeds this runtime.

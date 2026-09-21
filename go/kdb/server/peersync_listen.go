@@ -6,7 +6,6 @@ import (
 	"log/slog"
 
 	"github.com/limidus/kdb/go/kdb/auth"
-	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -86,12 +85,7 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 			code, _ := classifyError(err)
 			return code, code != wire.ErrorCodeInternal
 		},
-		Persist: func(commit document.Commit) error {
-			if runtime.persister == nil {
-				return nil
-			}
-			return runtime.persister.Persist(commit)
-		},
+		PersistAsync: runtime.peerPersistAsync(),
 	}
 	host := peersync.NewConnectionHost(codec, runtime.dag, runtime.Runtime.Storage, cfg, runtime.AuthEngine, auth.EmptyContext)
 	return &peerSyncConnHandler{host: host}

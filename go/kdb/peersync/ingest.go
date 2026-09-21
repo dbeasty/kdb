@@ -45,9 +45,18 @@ type IngestEnv struct {
 	// notifications. nil serializes only against other ingests of the same namespace in this
 	// process (the embedded / test default).
 	Node LocalNode
-	// Persist durably logs a commit stored from a peer, or a merge commit created here. nil
-	// means peer sync has no durability of its own (memory runtimes).
-	Persist func(document.Commit) error
+	// Persist durably logs a commit that has just become reachable from main - adopted from a
+	// peer, or a merge created here. nil means peer sync has no durability of its own (memory
+	// runtimes). PersistAsync, when set, is preferred: it queues under the node's serialization
+	// and is waited for after it, so a large fast-forward shares fsyncs instead of paying one per
+	// commit.
+	//
+	// Only adopted commits are logged, and in the order main moved to them. Delta replay applies
+	// every logged commit to the live tree in log order and moves main to each - so a commit
+	// stored but not adopted (a conflicting side, a page of a push still in flight) would, on
+	// restart, be replayed onto main as if it had been.
+	Persist      func(document.Commit) error
+	PersistAsync func(document.Commit) (wait func() error, err error)
 	// ApplyToStorage writes the documents a head move introduces into Storage. false leaves
 	// storage untouched on fast-forward - DAG-only callers (tests of the decision logic). The
 	// auto-merge path always writes storage, since the merge tree is built there.
@@ -122,11 +131,11 @@ func Ingest(env IngestEnv, commits []document.Commit, incomingHead codec.Hash) (
 	return res, err
 }
 
-// StoreCommits adds commits (parents first) and stubs to the DAG, persisting each new commit,
-// and decides nothing: no head moves, no storage changes. It is the first half of Ingest, used
-// alone for every page of a multi-page transfer but the last. Returns how many commits were new;
-// on error, the commits before the failing one stay stored (history is never lost) and the count
-// says how many.
+// StoreCommits adds commits (parents first) and stubs to the DAG and decides nothing: no head
+// moves, no storage changes, nothing is logged - see IngestEnv.Persist for why logging waits for
+// adoption. It is the first half of Ingest, used alone for every page of a multi-page transfer
+// but the last. Returns how many commits were new; on error, the commits before the failing one
+// stay stored and the count says how many.
 func StoreCommits(env IngestEnv, commits []document.Commit, stubs []document.CommitStub) (int, error) {
 	for _, s := range stubs {
 		env.DAG.PutStub(s)
@@ -141,11 +150,6 @@ func StoreCommits(env IngestEnv, commits []document.Commit, stubs []document.Com
 		}
 		if err := env.DAG.PutCommit(c, true); err != nil {
 			return stored, fmt.Errorf("peer sync: storing commit %s: %w", c.Hash.Hex(), err)
-		}
-		if env.Persist != nil {
-			if err := env.Persist(c); err != nil {
-				return stored, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
-			}
 		}
 		stored++
 	}
@@ -165,6 +169,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 	if node == nil {
 		node = lockOnlyNode{}
 	}
+	var durable []func() error
 	err := node.Exclusive(func() error {
 		lock := divergenceLockFor(env.NamespaceID)
 		lock.Lock()
@@ -185,6 +190,9 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 				return err
 			}
 			res.Outcome = CommitPushOutcome{Kind: OutcomeFastForwarded}
+			if durable, err = env.persistAll(step.Commits); err != nil {
+				return err
+			}
 			return advance(node, step)
 		default:
 			outcome, step, err := resolveDivergedLocked(env.DAG, env.Storage, env.NamespaceID, localHead, incomingHead, env.Resolution)
@@ -195,20 +203,46 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			if outcome.MergeCommit == nil {
 				return nil
 			}
-			if env.Persist != nil {
-				if err := env.Persist(*outcome.MergeCommit); err != nil {
-					return err
-				}
+			// The remote side's commits, then the merge: the order main came to reach them.
+			if durable, err = env.persistAll(step.Commits); err != nil {
+				return err
 			}
 			return advance(node, step)
 		}
 	})
+	// Waited for outside the serialization, like a local commit's: the log position is fixed,
+	// so the next writer can proceed while this one's fsync is in flight.
+	for _, wait := range durable {
+		if werr := wait(); werr != nil && err == nil {
+			err = fmt.Errorf("peer sync: persisting adopted commits: %w", werr)
+		}
+	}
 	head, headErr := env.DAG.Head()
 	res.Head = head
 	if err != nil {
 		return res, err
 	}
 	return res, headErr
+}
+
+// persistAll queues commits for the log in order, returning what to wait on.
+func (env IngestEnv) persistAll(commits []document.Commit) ([]func() error, error) {
+	var waits []func() error
+	for _, c := range commits {
+		switch {
+		case env.PersistAsync != nil:
+			wait, err := env.PersistAsync(c)
+			if err != nil {
+				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
+			}
+			waits = append(waits, wait)
+		case env.Persist != nil:
+			if err := env.Persist(c); err != nil {
+				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
+			}
+		}
+	}
+	return waits, nil
 }
 
 func advance(node LocalNode, step AdvanceStep) error {

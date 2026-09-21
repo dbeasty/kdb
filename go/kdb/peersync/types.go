@@ -16,6 +16,9 @@ type HostConfig struct {
 	NodeID            string
 	TransportHub      string
 	MaterializeCommit func(document.Commit) error
+	// PersistAsync is Persist split into queue and wait - see IngestEnv.PersistAsync. Preferred
+	// over Persist when set.
+	PersistAsync func(document.Commit) (wait func() error, err error)
 	// Persist durably logs a commit ingested from a peer (via CommitPush, or a
 	// ResolveDivergence-created auto-merge commit) - separate from MaterializeCommit, which is
 	// about tree reconstruction, not durability. dag.PutCommit only ever mutates the in-memory
@@ -61,6 +64,8 @@ type ClientConfig struct {
 	// auto-merge commit already writes its own documents into storage as it builds the merge
 	// tree (see mergeNonConflicting), so it is deliberately not passed through this callback.
 	MaterializeCommit func(document.Commit) error
+	// PersistAsync - see HostConfig.PersistAsync; same contract, client side.
+	PersistAsync func(document.Commit) (wait func() error, err error)
 	// Persist durably logs a commit pulled from a peer - see HostConfig.Persist's doc comment;
 	// same contract, client side.
 	Persist func(document.Commit) error

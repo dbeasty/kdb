@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/index/stores"
 	"github.com/limidus/kdb/go/kdb/peersync"
+	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	mem "github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -314,5 +318,95 @@ func TestPeerHandshakeRefusesOwnNodeID(t *testing.T) {
 	if err == nil {
 		client.Disconnect()
 		t.Fatal("a peer with this node's own identity was accepted")
+	}
+}
+
+// TestPeerSyncSurvivesRestartAfterConflictAndMerge: delta replay applies every logged commit to
+// the live tree in log order and moves main to each. Peer sync used to log every commit it
+// stored before deciding anything, so the losing side of a refused conflict came back on
+// restart as if it had been on main. Only adopted commits are logged now, in adoption order.
+func TestPeerSyncSurvivesRestartAfterConflictAndMerge(t *testing.T) {
+	dataDir := t.TempDir()
+	ns := "app/data"
+	rt, err := embed.OpenFileRuntime(dataDir, "app", ns, schema.None())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewKdbServerRuntime(rt)
+	shared := mustRandomUUID(t)
+	if _, err := srv.Upsert(ns, shared, `{"v":"local"}`, auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A peer that wrote the same document: refused under the default strict policy.
+	loser := newPeerFixture(t, srv)
+	genesis, _ := loser.dag.Head()
+	loserOnly := mustRandomUUID(t)
+	c1 := pushDoc(t, loser.dag, loser.storage, ns, genesis, shared, `{"v":"remote"}`)
+	c2 := pushDoc(t, loser.dag, loser.storage, ns, c1.Hash, loserOnly, `{"from":"loser"}`)
+	if _, err := loser.push(c1, c2); err == nil {
+		t.Fatal("expected the same-document push to be refused as a conflict")
+	}
+
+	// A peer that wrote something else: merged.
+	winner := newPeerFixture(t, srv)
+	_, merged := winner.write(`{"from":"winner"}`)
+	if _, err := winner.push(merged); err != nil {
+		t.Fatalf("disjoint push: %v", err)
+	}
+	head, _ := srv.dag.Head()
+	rt.Close()
+	// A clean close checkpoints, and reopening from a checkpoint never replays the log. Remove
+	// it - the state a kill before the next checkpoint leaves - so the log alone has to rebuild
+	// main.
+	removeCheckpointFiles(t, dataDir)
+
+	reopened, err := embed.OpenFileRuntime(dataDir, "app", ns, schema.None())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	got, err := reopened.DAG.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != head {
+		t.Fatalf("head after restart %s, before %s", got.Hex(), head.Hex())
+	}
+	// Reads at a commit's tree go through stored tree objects and look right either way; the
+	// damage a bad replay does is to the live tree, which the next write builds on. So write.
+	after := NewKdbServerRuntime(reopened)
+	next, err := after.Upsert(ns, mustRandomUUID(t), `{"after":"restart"}`, auth.Principal{})
+	if err != nil {
+		t.Fatalf("write after restart: %v", err)
+	}
+	hc := next
+	doc, err := reopened.Storage.GetDocument(ns, shared, hc.DocumentTreeHash)
+	if err != nil || doc == nil || doc.JSON != `{"v":"local"}` {
+		t.Fatalf("after restart the shared document is %+v (%v), want the local write", doc, err)
+	}
+	if d, _ := reopened.Storage.GetDocument(ns, loserOnly, hc.DocumentTreeHash); d != nil {
+		t.Fatal("a document from the refused push is on main after restart")
+	}
+}
+
+func removeCheckpointFiles(t *testing.T, root string) {
+	t.Helper()
+	removed := 0
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		if strings.Contains(filepath.ToSlash(path), "/snap/kdb_checkpoint_") {
+			removed++
+			return os.Remove(path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed == 0 {
+		t.Fatal("no checkpoint found to remove - the test would not exercise log replay")
 	}
 }

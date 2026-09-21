@@ -92,6 +92,16 @@ const (
 	// Peer-sync error reply (see PeerErrorMessage). Go-only, like 0x14-0x24.
 	MsgPeerError MessageType = 0x25
 
+	// Peer sync protocol v2 (see sync_v2_ops.go). Go-only, like 0x14-0x25.
+	MsgSyncHello    MessageType = 0x26
+	MsgSyncHelloAck MessageType = 0x27
+	MsgRefsRequest  MessageType = 0x28
+	MsgRefsResult   MessageType = 0x29
+	MsgFetchRequest MessageType = 0x2A
+	MsgPackPage     MessageType = 0x2B
+	MsgRefUpdate    MessageType = 0x2C
+	MsgRefUpdateAck MessageType = 0x2D
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -173,6 +183,22 @@ func (t MessageType) String() string {
 		return "TX_COMMIT_MULTI_RESULT"
 	case MsgPeerError:
 		return "PEER_ERROR"
+	case MsgSyncHello:
+		return "SYNC_HELLO"
+	case MsgSyncHelloAck:
+		return "SYNC_HELLO_ACK"
+	case MsgRefsRequest:
+		return "REFS_REQUEST"
+	case MsgRefsResult:
+		return "REFS_RESULT"
+	case MsgFetchRequest:
+		return "FETCH_REQUEST"
+	case MsgPackPage:
+		return "PACK_PAGE"
+	case MsgRefUpdate:
+		return "REF_UPDATE"
+	case MsgRefUpdateAck:
+		return "REF_UPDATE_ACK"
 	default:
 		return "UNKNOWN"
 	}
@@ -254,6 +280,22 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgTxCommitMultiResult, true
 	case 0x25:
 		return MsgPeerError, true
+	case 0x26:
+		return MsgSyncHello, true
+	case 0x27:
+		return MsgSyncHelloAck, true
+	case 0x28:
+		return MsgRefsRequest, true
+	case 0x29:
+		return MsgRefsResult, true
+	case 0x2A:
+		return MsgFetchRequest, true
+	case 0x2B:
+		return MsgPackPage, true
+	case 0x2C:
+		return MsgRefUpdate, true
+	case 0x2D:
+		return MsgRefUpdateAck, true
 	default:
 		return 0, false
 	}

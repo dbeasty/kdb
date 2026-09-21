@@ -336,6 +336,7 @@ func (h *frameHandler) ingestEnv() IngestEnv {
 		NamespaceID:    h.cfg.NamespaceID,
 		Node:           h.cfg.Node,
 		Persist:        h.cfg.Persist,
+		PersistAsync:   h.cfg.PersistAsync,
 		ApplyToStorage: h.cfg.MaterializeCommit != nil || h.cfg.ApplyToStorage,
 		Resolution:     ResolutionOptions{Policy: h.cfg.ConflictPolicy, Resolver: h.cfg.ConflictResolver},
 	}
