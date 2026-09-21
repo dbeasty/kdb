@@ -61,11 +61,22 @@ func (s *KdbServerRuntime) OpenIndexes(opts stores.Options) (*RegistryIndexProvi
 
 // indexDir is where this namespace's index snapshots and catalog live, or "" for a
 // memory-backed runtime.
+//
+// Per namespace: <dataRoot>/ns/<namespace>/index. It used to be per *catalog*
+// (<dataRoot>/<catalog>/index), which was only right while one process served one namespace:
+// with several namespaces of one catalog under a host, each would have loaded the others' index
+// definitions from the shared catalog.json and overwritten it on save. A catalog-level directory
+// already on disk is still used by the one namespace its catalog.json names, so an existing
+// deployment keeps its indexes without a migration.
 func (s *KdbServerRuntime) indexDir() string {
 	if s.Runtime == nil || s.Runtime.DataRoot == "" {
 		return ""
 	}
-	return filepath.Join(s.Runtime.DataRoot, s.Runtime.Catalog, "index")
+	legacy := filepath.Join(s.Runtime.DataRoot, s.Runtime.Catalog, "index")
+	if cat, err := index.LoadCatalog(legacy); err == nil && cat.NamespaceID == s.Runtime.DefaultNamespace {
+		return legacy
+	}
+	return filepath.Join(s.Runtime.DataRoot, "ns", filepath.FromSlash(s.Runtime.DefaultNamespace), "index")
 }
 
 // scanAtCommit yields every document in the namespace at commitHash, for a rebuild.
