@@ -180,6 +180,11 @@ type KdbServerRuntime struct {
 	// duplicates and unverifiable cross-namespace parts. Durable under a file-backed runtime's
 	// data root, in memory otherwise.
 	Conflicts *peersync.ConflictQueue
+	// Meta, when set, records this namespace's definition changes (schema, index DDL) into the
+	// replicated metadata namespace - see MetaStore. metaApplying suppresses that while the
+	// store is itself applying a replicated definition, so applying never echoes back.
+	Meta         *MetaStore
+	metaApplying atomic.Bool
 	// inboundState records peers that fetch from this namespace - see inbound_peers.go.
 	inboundOnce  sync.Once
 	inboundState *inboundPeers

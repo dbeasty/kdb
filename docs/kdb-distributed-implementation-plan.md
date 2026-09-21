@@ -384,13 +384,13 @@ SnapshotResponse {Namespace, Commit, TreeEntries[(docId, contentHash)] (first pa
 
 ## Phase 5 — Replicated metadata (`_kdb/meta`)
 
-### 5.1 The meta namespace ☐
+### 5.1 The meta namespace ☑
 
 - **Created on first start** in every `NamespaceSet`, with the Strict policy.
 - **Document ids** are `DerivedUUID("schema:<ns>")`, `DerivedUUID("indexes:<ns>")` and `DerivedUUID("policy:<ns>")`, so two nodes creating the same definition independently produce the *same document*, and any disagreement shows up as a document conflict.
 - **Writers:** `SetSchemaChecked`, index DDL and policy `Put` write the meta document alongside their local effect, through `CommitAcross` so the pair is atomic.
 
-### 5.2 Reconciler ☐
+### 5.2 Reconciler ☑
 
 `meta.Reconciler` subscribes to `_kdb/meta` commits through the `CommitListener` chain. For each changed document, it applies the change locally:
 
@@ -400,7 +400,7 @@ SnapshotResponse {Namespace, Commit, TreeEntries[(docId, contentHash)] (first pa
 
 It's idempotent, and a failure is recorded on the meta conflict queue instead of blocking ingest.
 
-### 5.3 Schema migrations in data commits ☐
+### 5.3 Schema migrations in data commits ☑
 
 `MaterializeCommit` stops skipping `SchemaMigrationOp`. It applies the migration to the runtime's schema through a new `IngestEnv.ApplySchemaMigration` hook, so data never lands ahead of its schema.
 
@@ -640,3 +640,20 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 - **In a running process, truncation can delete the segments behind commits the DAG still holds in memory.** Until a restart makes them a horizon, fetching them fails with "operations unavailable" instead of being advertised. The peer floor makes this unlikely for known peers.
 - **Replicated side branches and tags still survive only a clean restart,** as recorded in Phase 2.
 - **Historical reads below a shallow root under the replay history strategy fail.** The objects strategy, which is the default, is unaffected.
+
+### Phase 5 — landed
+
+`server.MetaStore` over the reserved namespace `_kdb/meta`.
+- **One document per definition,** with a derived id, so two nodes making the same definition agree for free:
+  - `kdb:meta/schema/<ns>` holds the schema's bytes as hex.
+  - `kdb:meta/index/<ns>/<name>` holds the CREATE INDEX statement, or `dropped:true` as a tombstone, so a node knows to drop an index rather than merely not knowing about it.
+- **Recording.** `CREATE TABLE` (through `SetSchemaChecked` on the wire path) and index DDL record into it, as long as the change isn't the store itself applying a replicated definition (`metaApplying`). A definition identical to the stored one writes nothing.
+- **Reconciling.** Every commit `_kdb/meta` takes, local or replicated, kicks a background reconcile. Startup runs one synchronously, and a namespace opened later gets its definitions through `ApplyTo` before it joins the set.
+- **Failures.** A definition that can't apply here (data violates the schema, an index won't build) becomes a `meta-apply` entry in that namespace's conflict queue and clears once it applies.
+- **Schema migrations inside replicated commits** now reach the schema. `serverLocalNode.Advanced` applies each `SchemaMigrationOp` in commit order.
+
+**Deviations, and why:**
+- **Reserved, not ordinary.** `_kdb/meta` joins the `NamespaceSet` through a new `AddSystem`, not `Add`. `Get`/`Resolve` never return it, so SQL, the document wire and cross-namespace commits can't reach it; only `PeerNamespaces` sees it. The plan hadn't said how to keep a system namespace off the wire, and `ValidateNamespaceID` rightly refuses reserved names through the opener.
+- **Policy documents are not replicated yet.** `policy.Registry` has no durable store in the Go server to mirror, so there's nothing to reconcile against.
+- **The replicator adds `_kdb/meta` to every peer's patterns** unless a pattern excludes it by name. Under RBAC, a peer then also needs `sync` on `_kdb/meta`.
+- **Found along the way, and fixed as a consequence:** `CREATE TABLE` on the Go server set the schema in memory only, so it didn't survive a restart. The metadata namespace is now its durable record (`TestSchemaSurvivesRestartThroughMeta`).

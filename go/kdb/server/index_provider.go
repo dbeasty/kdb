@@ -187,7 +187,13 @@ func (p *RegistryIndexProvider) CreateIndex(stmt sql.StmtCreateIndex, ctx sql.Qu
 		p.registry.Remove(desc.IndexName())
 		return err
 	}
-	return p.runtime.saveIndexCatalog()
+	if err := p.runtime.saveIndexCatalog(); err != nil {
+		return err
+	}
+	if !p.runtime.metaApplying.Load() {
+		return p.runtime.Meta.RecordIndex(ctx.NamespaceID, stmt)
+	}
+	return nil
 }
 
 // DropIndex removes an index by name.
@@ -198,7 +204,13 @@ func (p *RegistryIndexProvider) DropIndex(stmt sql.StmtDropIndex, ctx sql.QueryC
 	if p.runtime == nil {
 		return nil
 	}
-	return p.runtime.saveIndexCatalog()
+	if err := p.runtime.saveIndexCatalog(); err != nil {
+		return err
+	}
+	if !p.runtime.metaApplying.Load() {
+		return p.runtime.Meta.RecordDropIndex(ctx.NamespaceID, stmt.Name)
+	}
+	return nil
 }
 
 // descriptorFor builds the index descriptor a CREATE INDEX statement asks for, validating the

@@ -420,6 +420,26 @@ func Main() {
 		os.Exit(1)
 	}
 	srv.Namespaces = nsSet
+
+	// Definitions (schema, index DDL) live as documents in a reserved namespace so they are
+	// durable and replicate with the data - see server.MetaStore.
+	var metaRT *embed.EmbeddedKdbRuntime
+	if host != nil {
+		metaRT, err = host.Namespace(embed.CatalogFromNamespace(server.MetaNamespace), server.MetaNamespace, schema.None())
+	} else {
+		metaRT, err = embed.OpenMemoryRuntime(embed.CatalogFromNamespace(server.MetaNamespace), server.MetaNamespace, schema.None())
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: opening %s: %v\n", server.MetaNamespace, err)
+		os.Exit(1)
+	}
+	metaSrv := server.NewKdbServerRuntime(metaRT)
+	metaSrv.AuthEngine = srv.AuthEngine
+	metaSrv.CommitListener = func(ns string, _ document.Commit) { notifyReplicator(ns) }
+	nsSet.AddSystem(metaSrv)
+	metaStore := server.NewMetaStore(metaSrv, nsSet)
+	defer metaStore.Close()
+
 	if host != nil {
 		nsSet.SetOpener(func(id string, create bool) (*server.KdbServerRuntime, error) {
 			// A client-supplied id becomes a directory under the data root: validate it before
@@ -453,6 +473,7 @@ func Main() {
 			if _, err := sec.OpenIndexes(stores.Options{}); err != nil {
 				return nil, fmt.Errorf("opening indexes for %s: %w", id, err)
 			}
+			metaStore.ApplyTo(sec)
 			return sec, nil
 		})
 	}
@@ -737,11 +758,25 @@ func Main() {
 	}
 	replicationStatus := "disabled"
 	var replicator *replication.Replicator
+	// Every definition this process holds, applied now that every namespace it serves is open -
+	// its own recorded schema and indexes (which is what makes a CREATE TABLE survive a restart)
+	// and whatever arrived from peers while it was down.
+	if err := metaStore.ReconcileAll(); err != nil {
+		slog.Warn("could not apply stored definitions", "error", err)
+	}
 	if len(peerSpecs) > 0 {
 		peers, err := replication.ParsePeers(strings.Join(peerSpecs, ";"))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: --peer: %v\n", err)
 			os.Exit(1)
+		}
+		// Definitions travel with the data: a peer syncing any namespace also syncs the metadata
+		// namespace, unless its patterns exclude it by name.
+		for i := range peers {
+			if len(peersync.SelectNamespaces(peers[i].Namespaces, []string{server.MetaNamespace})) == 0 &&
+				!containsExclusion(peers[i].Namespaces, server.MetaNamespace) {
+				peers[i].Namespaces = append(peers[i].Namespaces, server.MetaNamespace)
+			}
 		}
 		stateDir := ""
 		if dataDir != "" {
@@ -1090,4 +1125,13 @@ func (l lazyReplication) SyncNow(name string) (peersync.V2Result, error) {
 		return r.SyncNow(name)
 	}
 	return peersync.V2Result{}, fmt.Errorf("no replication peers are configured")
+}
+
+func containsExclusion(patterns []string, ns string) bool {
+	for _, p := range patterns {
+		if strings.HasPrefix(p, "!") && peersync.MatchNamespace(p[1:], ns) {
+			return true
+		}
+	}
+	return false
 }

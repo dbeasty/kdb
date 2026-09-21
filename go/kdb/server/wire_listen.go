@@ -657,6 +657,11 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		if err := rt.SetSchemaChecked(*result.AppliedSchema); err != nil {
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 		}
+		if !rt.metaApplying.Load() {
+			if err := rt.Meta.RecordSchema(rt.Runtime.DefaultNamespace, *result.AppliedSchema); err != nil {
+				slog.Warn("schema applied but not recorded for replication", "namespace", rt.Runtime.DefaultNamespace, "error", err)
+			}
+		}
 	}
 	rows := rowsToStrings(result.Rows)
 	if grant != nil {

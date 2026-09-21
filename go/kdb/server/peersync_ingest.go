@@ -9,6 +9,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/peersync"
+	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
@@ -61,12 +62,17 @@ func (s *KdbServerRuntime) PeerNamespaces() peersync.NamespaceProvider {
 
 type peerNamespaceProvider struct{ set *NamespaceSet }
 
-func (p peerNamespaceProvider) List() []string { return p.set.Namespaces() }
+func (p peerNamespaceProvider) List() []string {
+	return append(p.set.Namespaces(), p.set.systemNames()...)
+}
 
 func (p peerNamespaceProvider) Env(ns string, create bool) (peersync.IngestEnv, error) {
-	rt, err := p.set.Resolve(ns, create)
-	if err != nil {
-		return peersync.IngestEnv{}, err
+	rt, ok := p.set.systemRuntime(ns)
+	if !ok {
+		var err error
+		if rt, err = p.set.Resolve(ns, create); err != nil {
+			return peersync.IngestEnv{}, err
+		}
 	}
 	if rt.dag == nil {
 		return peersync.IngestEnv{}, fmt.Errorf("kdb server: namespace %s has no commit DAG peer sync can use", ns)
@@ -109,6 +115,29 @@ func (n serverLocalNode) Advanced(step peersync.AdvanceStep) error {
 	keep := func(err error) {
 		if err != nil && firstErr == nil {
 			firstErr = err
+		}
+	}
+	// Schema migrations carried inside replicated commits, in commit order - the storage-level
+	// apply skips them (they change no document), so without this a peer's migration would
+	// reach the history but never the schema.
+	for _, c := range step.Commits {
+		for _, op := range c.Operations {
+			m, ok := op.(document.SchemaMigrationOp)
+			if !ok {
+				continue
+			}
+			mig, err := transaction.DecodeMigration(m.MigrationPayload)
+			if err != nil {
+				keep(fmt.Errorf("peer sync: commit %s carries an undecodable schema migration: %w", c.Hash.Hex(), err))
+				continue
+			}
+			res := schema.ApplyMigration(rt.Schema(), mig)
+			if res.IsFailure() {
+				keep(fmt.Errorf("peer sync: commit %s's schema migration does not apply here: %w", c.Hash.Hex(), res.Exception()))
+				continue
+			}
+			sch, _ := res.Value()
+			rt.SetSchema(sch)
 		}
 	}
 	if p, ok := rt.SQLIndexProvider().(*RegistryIndexProvider); ok && len(p.registry.Descriptors()) > 0 && len(step.Applied) > 0 {

@@ -87,6 +87,10 @@ type NamespaceSet struct {
 
 	mu       sync.RWMutex
 	runtimes map[string]*KdbServerRuntime
+	// system holds reserved namespaces (MetaNamespace) that replicate like any other but are
+	// never reachable through Get/Resolve - so never through SQL, the document wire or a
+	// cross-namespace commit. Only peer sync sees them (PeerNamespaces).
+	system map[string]*KdbServerRuntime
 	// opener opens a namespace the set does not hold yet. create says whether a namespace that
 	// does not exist on disk may be created - true for a commit, false for a read.
 	opener func(namespace string, create bool) (*KdbServerRuntime, error)
@@ -134,6 +138,34 @@ func (s *NamespaceSet) Add(rt *KdbServerRuntime) error {
 	}
 	s.runtimes[rt.Runtime.DefaultNamespace] = rt
 	return nil
+}
+
+// AddSystem puts a reserved namespace in the set for replication only - see NamespaceSet.system.
+func (s *NamespaceSet) AddSystem(rt *KdbServerRuntime) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.system == nil {
+		s.system = map[string]*KdbServerRuntime{}
+	}
+	s.system[rt.Runtime.DefaultNamespace] = rt
+}
+
+// system returns a reserved namespace's runtime, if the set holds it.
+func (s *NamespaceSet) systemRuntime(ns string) (*KdbServerRuntime, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rt, ok := s.system[ns]
+	return rt, ok
+}
+
+func (s *NamespaceSet) systemNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.system))
+	for ns := range s.system {
+		out = append(out, ns)
+	}
+	return out
 }
 
 // SetOpener installs the function that opens namespaces the set does not yet hold. Without one,
