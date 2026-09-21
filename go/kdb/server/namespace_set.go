@@ -58,16 +58,9 @@ func (r CrossNamespaceResult) Commit(namespace string) (document.Commit, bool) {
 // CrossNamespaceError is a cross-namespace transaction refused by one participant, before anything
 // was written anywhere. Err is what that namespace said - a *ConflictError, *SchemaError,
 // *AuthorizationError, *BusyError and so on - and errors.As reaches it through this wrapper.
-type CrossNamespaceError struct {
-	Namespace string
-	Err       error
-}
-
-func (e *CrossNamespaceError) Error() string {
-	return fmt.Sprintf("cross-namespace transaction refused by namespace %s: %v", e.Namespace, e.Err)
-}
-
-func (e *CrossNamespaceError) Unwrap() error { return e.Err }
+//
+// The same type embed.CommitGroup reports, so an error from either layer matches either name.
+type CrossNamespaceError = embed.GroupPartError
 
 // ErrUnknownNamespace is returned for a namespace the set does not hold and cannot open.
 var ErrUnknownNamespace = errors.New("kdb server: unknown namespace")
@@ -214,25 +207,14 @@ func (s *NamespaceSet) Resolve(namespace string, create bool) (*KdbServerRuntime
 // measured against. Not for production use.
 func (s *NamespaceSet) SetSerializedForBenchmark(on bool) { s.serializeAll = on }
 
-// participant is one namespace's state through a cross-namespace commit.
-type participant struct {
-	ns        string
-	rt        *KdbServerRuntime
-	tx        document.Transaction
-	sessionID string
-
-	release       func()
-	prepared      *transaction.PreparedCommit
-	indexes       []*index.PreparedWrite
-	indexProvider *RegistryIndexProvider
-	commit        document.Commit
-}
-
 // CommitAcross commits parts atomically: every namespace gets its commit, or none does. On
 // success every participant's commit is returned. A rejection by any participant is a
 // *CrossNamespaceError naming it, and nothing was written. A failure after publication - an I/O
 // error writing a part or the decision - is an *embed.GroupFailedError, and the participants are
 // fenced until reopened (see docs/kdb-cross-namespace-transactions-plan.md §4.5).
+//
+// The protocol itself is embed.CommitGroup, shared with the embedded database/sql driver; this is
+// the server's side of it: admission, authorization, the write gates, leases and indexes.
 func (s *NamespaceSet) CommitAcross(parts []NamespaceTransaction, principal auth.Principal) (CrossNamespaceResult, error) {
 	return s.commitAcross(parts, principal, false)
 }
@@ -241,26 +223,17 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 	if len(parts) == 0 {
 		return CrossNamespaceResult{}, errors.New("kdb server: cross-namespace transaction has no participants")
 	}
-	ps := make([]*participant, 0, len(parts))
-	seen := make(map[string]struct{}, len(parts))
+	ps := make([]*serverParticipant, 0, len(parts))
 	for _, part := range parts {
 		if part.Namespace == "" {
 			return CrossNamespaceResult{}, errors.New("kdb server: cross-namespace transaction names an empty namespace")
 		}
-		if _, dup := seen[part.Namespace]; dup {
-			// Two transactions into one namespace would be two commits there, the second built
-			// on a base the first invalidates. The caller should merge them into one.
-			return CrossNamespaceResult{}, fmt.Errorf("kdb server: namespace %s appears twice in one cross-namespace transaction; "+
-				"merge its operations into one", part.Namespace)
-		}
-		seen[part.Namespace] = struct{}{}
 		rt, err := s.Resolve(part.Namespace, true)
 		if err != nil {
 			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: part.Namespace, Err: err}
 		}
-		ps = append(ps, &participant{ns: part.Namespace, rt: rt, tx: part.Tx, sessionID: part.SessionID})
+		ps = append(ps, &serverParticipant{ns: part.Namespace, rt: rt, sessionID: part.SessionID, tx: part.Tx})
 	}
-	sort.Slice(ps, func(i, j int) bool { return ps[i].ns < ps[j].ns })
 
 	// Cheapest-first refusals, before any gate: the same order runTransaction checks them in.
 	for _, p := range ps {
@@ -270,6 +243,10 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 		if _, ok := p.rt.TransactionEngine.(transaction.Preparer); !ok {
 			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: p.ns,
 				Err: fmt.Errorf("kdb server: transaction engine %T cannot take part in a cross-namespace transaction", p.rt.TransactionEngine)}
+		}
+		if p.rt.dag == nil {
+			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: p.ns,
+				Err: fmt.Errorf("kdb server: commit requires an InMemoryCommitDag (or a wrapper exposing one), got %T", p.rt.Runtime.DAG)}
 		}
 	}
 
@@ -288,18 +265,20 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	for _, p := range ps {
+	groupParts := make([]embed.GroupPart, len(ps))
+	for i, p := range ps {
+		p.ctx = ctx
 		// Held until return, including through the durability wait: see runTransaction.
 		grant, err := p.rt.admission.Acquire(ctx, ClassWrite, transactionPayloadBytes(p.tx))
 		if err != nil {
 			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: p.ns, Err: err}
 		}
 		defer grant.Release()
-		if p.tx.BaseVersion != (codec.Hash{}) && p.rt.dag != nil {
-			// A client-supplied base has to survive the gate queue: see runTransaction.
-			defer p.rt.dag.Pin(p.tx.BaseVersion)()
+		if p.tx.BaseVersion != (codec.Hash{}) {
+			// The base's tree too, so the schema phase does not rebuild it: see runTransaction.
 			defer p.rt.pinBaseTree(p.tx.BaseVersion)()
 		}
+		groupParts[i] = embed.GroupPart{Participant: p, Tx: p.tx}
 	}
 
 	if s.serializeAll {
@@ -307,99 +286,26 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 		defer s.globalMu.Unlock()
 	}
 
-	// 1. Gates, in namespace order.
-	releaseAll := func() {
-		for i := len(ps) - 1; i >= 0; i-- {
-			if ps[i].release != nil {
-				ps[i].release()
-				ps[i].release = nil
-			}
-		}
-	}
-	defer releaseAll()
-	for _, p := range ps {
-		release, err := p.rt.writeGate.acquire(ctx)
-		if err != nil {
-			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: p.ns, Err: err}
-		}
-		start := time.Now()
-		p.release = func() {
-			p.rt.writeGate.observeService(time.Since(start))
-			release()
-		}
-	}
-
-	// The group is begun before preparing so every participant carries its id as the
-	// transaction id; a rejection below abandons it, which writes nothing.
-	namespaces := make([]string, len(ps))
-	for i, p := range ps {
-		namespaces[i] = p.ns
-	}
-	group, err := s.coord.Begin(namespaces)
+	published, wait, err := embed.CommitGroup(s.coord, groupParts)
 	if err != nil {
 		return CrossNamespaceResult{}, err
 	}
-	for _, p := range ps {
-		p.tx.ID = group.ID
-	}
-
-	// 2. Prepare everything.
-	discardAll := func() {
-		for _, p := range ps {
-			if p.prepared != nil {
-				p.prepared.Discard()
-			}
-		}
-	}
-	for _, p := range ps {
-		if err := s.prepare(p); err != nil {
-			discardAll()
-			group.Abandon()
-			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: p.ns, Err: err}
-		}
-	}
-
-	// 3. Apply everything. Readers taking a Snapshot retry across this window; nothing else
-	// notices it.
-	for _, p := range ps {
-		p.rt.groupPublishing.Add(1)
-	}
-	applied, applyErr := s.applyAll(ps, group)
-	for _, p := range ps {
-		p.rt.groupVersion.Add(1)
-		p.rt.groupPublishing.Add(-1)
-	}
-	if applyErr != nil {
-		if applied == 0 {
-			group.Abandon()
-			return CrossNamespaceResult{}, applyErr
-		}
-		err := group.Fail(applyErr)
-		s.fenceAll(ps, err)
-		return CrossNamespaceResult{}, err
-	}
-
-	// 4. Gates off.
-	releaseAll()
-
-	// 5. Decide.
-	result := CrossNamespaceResult{Group: group.ID, Commits: make([]NamespaceCommit, len(ps))}
-	for i, p := range ps {
-		result.Commits[i] = NamespaceCommit{Namespace: p.ns, Commit: p.commit}
+	result := CrossNamespaceResult{Group: published.Group, Commits: make([]NamespaceCommit, len(published.Commits))}
+	for i, c := range published.Commits {
+		result.Commits[i] = NamespaceCommit{Namespace: c.Namespace, Commit: c.Commit}
 	}
 	finish := func() error {
-		if err := group.Finish(); err != nil {
-			s.fenceAll(ps, err)
+		if err := wait(); err != nil {
 			return err
 		}
-		for _, p := range ps {
-			if p.rt.CommitListener != nil {
-				p.rt.CommitListener(p.ns, p.commit)
+		for _, c := range result.Commits {
+			if rt, ok := s.Get(c.Namespace); ok && rt.CommitListener != nil {
+				rt.CommitListener(c.Namespace, c.Commit)
 			}
 		}
 		return nil
 	}
-	if !s.acknowledgesDurably(ps) {
+	if !acknowledgesDurably(ps) {
 		// Every participant acknowledges before durability (DurabilityAsync), so this one does
 		// too. The decision still follows its parts to disk - the protocol does not change, only
 		// who waits for it.
@@ -412,93 +318,114 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 	return result, nil
 }
 
-// prepare runs every check for one participant, with its gate held.
-func (s *NamespaceSet) prepare(p *participant) error {
-	rt := p.rt
-	if rt.dag == nil {
-		return fmt.Errorf("kdb server: commit requires an InMemoryCommitDag (or a wrapper exposing one), got %T", rt.Runtime.DAG)
+// serverParticipant is one server runtime's side of embed.CommitGroup.
+type serverParticipant struct {
+	ns        string
+	rt        *KdbServerRuntime
+	sessionID string
+	tx        document.Transaction
+	ctx       context.Context
+}
+
+func (p *serverParticipant) Namespace() string                  { return p.ns }
+func (p *serverParticipant) Runtime() *embed.EmbeddedKdbRuntime { return p.rt.Runtime }
+func (p *serverParticipant) Fence(cause error)                  { p.rt.fence(cause) }
+
+// Lock takes the runtime's write gate - the same queue, bound and deadline a single-namespace
+// commit waits in.
+func (p *serverParticipant) Lock() (func(), error) {
+	release, err := p.rt.writeGate.acquire(p.ctx)
+	if err != nil {
+		return nil, err
 	}
-	if p.tx.BaseVersion == (codec.Hash{}) {
+	start := time.Now()
+	return func() {
+		p.rt.writeGate.observeService(time.Since(start))
+		release()
+	}, nil
+}
+
+// PublishStarted and PublishFinished bracket the group's publication for Snapshot, which retries
+// a read that overlapped one.
+func (p *serverParticipant) PublishStarted() { p.rt.groupPublishing.Add(1) }
+func (p *serverParticipant) PublishFinished() {
+	p.rt.groupVersion.Add(1)
+	p.rt.groupPublishing.Add(-1)
+}
+
+// Prepare runs every check a server commit runs, with the gate held.
+func (p *serverParticipant) Prepare(tx document.Transaction) (embed.PreparedPart, error) {
+	rt := p.rt
+	if tx.BaseVersion == (codec.Hash{}) {
 		head, err := rt.dag.Head()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		p.tx.BaseVersion = head
+		tx.BaseVersion = head
 	}
 	// Checked under the gate, where the commit that would land is fixed: a document someone
 	// else holds a lease on is refused, exactly as handleTxCommit refuses it.
-	if err := rt.DocumentLocks.AssertUnheldByOthers(p.ns, p.sessionID, p.tx); err != nil {
-		return err
+	if err := rt.DocumentLocks.AssertUnheldByOthers(p.ns, p.sessionID, tx); err != nil {
+		return nil, err
 	}
 	// Index extraction and validation happen before anything lands (Component 68), so a value
 	// the indexes cannot accept rejects the whole transaction rather than one participant after
 	// the others were written.
-	preparedIndexes, indexProvider, err := rt.prepareIndexes(p.tx)
+	preparedIndexes, indexProvider, err := rt.prepareIndexes(tx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	p.indexes, p.indexProvider = preparedIndexes, indexProvider
-	preparer := rt.TransactionEngine.(transaction.Preparer)
-	prepared, result, err := preparer.PrepareCommit(p.tx, rt.dag, rt.Runtime.Storage, rt.Schema())
+	pc, result, err := rt.TransactionEngine.(transaction.Preparer).PrepareCommit(tx, rt.dag, rt.Runtime.Storage, rt.Schema())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	switch r := result.(type) {
 	case nil:
 	case transaction.ResultConflict:
-		return &ConflictError{Report: r.Report, RetryAfterMs: rt.conflictRetryAfterMs()}
+		return nil, &ConflictError{Report: r.Report, RetryAfterMs: rt.conflictRetryAfterMs()}
 	case transaction.ResultSchemaError:
-		return &SchemaError{Violations: r.Violations}
+		return nil, &SchemaError{Violations: r.Violations}
 	case transaction.ResultAborted:
-		return r.Cause
+		return nil, r.Cause
 	default:
-		return fmt.Errorf("kdb server: unexpected prepare result %T", result)
+		return nil, fmt.Errorf("kdb server: unexpected prepare result %T", result)
 	}
-	p.prepared = prepared
-	return nil
+	return &serverPrepared{p: p, pc: pc, indexes: preparedIndexes, provider: indexProvider}, nil
 }
 
-// applyAll publishes every participant and queues it as a part of group. applied counts the
-// participants whose commit reached their graph - the ones a failure has to fence.
-func (s *NamespaceSet) applyAll(ps []*participant, group *embed.TxnGroup) (applied int, err error) {
-	for _, p := range ps {
-		result, err := p.prepared.Apply(transaction.ApplyOptions{Message: group.Message(), Provisional: true})
-		if err != nil {
-			return applied, &CrossNamespaceError{Namespace: p.ns, Err: err}
-		}
-		success, ok := result.(transaction.ResultSuccess)
-		if !ok {
-			if aborted, isAborted := result.(transaction.ResultAborted); isAborted {
-				return applied, &CrossNamespaceError{Namespace: p.ns, Err: aborted.Cause}
-			}
-			return applied, &CrossNamespaceError{Namespace: p.ns, Err: fmt.Errorf("kdb server: unexpected apply result %T", result)}
-		}
-		p.commit = success.Commit
-		applied++
-		if p.indexProvider != nil {
+type serverPrepared struct {
+	p        *serverParticipant
+	pc       *transaction.PreparedCommit
+	indexes  []*index.PreparedWrite
+	provider *RegistryIndexProvider
+}
+
+func (sp *serverPrepared) Discard() { sp.pc.Discard() }
+
+func (sp *serverPrepared) Apply(message string) (document.Commit, error) {
+	result, err := sp.pc.Apply(transaction.ApplyOptions{Message: message, Provisional: true})
+	if err != nil {
+		return document.Commit{}, err
+	}
+	switch r := result.(type) {
+	case transaction.ResultSuccess:
+		if sp.provider != nil {
 			// Under the gate, so index state advances in commit order - as in runTransaction.
-			if _, err := p.indexProvider.commitToIndexes(p.indexes, p.commit.Hash); err != nil {
-				return applied, &CrossNamespaceError{Namespace: p.ns, Err: err}
+			if _, err := sp.provider.commitToIndexes(sp.indexes, r.Commit.Hash); err != nil {
+				return r.Commit, err
 			}
 		}
-		if err := group.AddPart(p.rt.Runtime, p.commit); err != nil {
-			return applied, &CrossNamespaceError{Namespace: p.ns, Err: err}
-		}
-	}
-	return applied, nil
-}
-
-// fenceAll refuses further writes on every participant. Their commit logs are already latched by
-// the group; this stops the server from publishing commits it could never persist.
-func (s *NamespaceSet) fenceAll(ps []*participant, cause error) {
-	for _, p := range ps {
-		p.rt.fence(cause)
+		return r.Commit, nil
+	case transaction.ResultAborted:
+		return document.Commit{}, r.Cause
+	default:
+		return document.Commit{}, fmt.Errorf("kdb server: unexpected apply result %T", result)
 	}
 }
 
 // acknowledgesDurably reports whether any participant promises durability at acknowledgement.
 // If one does, the transaction as a whole must: it is one transaction.
-func (s *NamespaceSet) acknowledgesDurably(ps []*participant) bool {
+func acknowledgesDurably(ps []*serverParticipant) bool {
 	for _, p := range ps {
 		if p.rt.persister != nil && p.rt.persister.AcknowledgesDurably() {
 			return true

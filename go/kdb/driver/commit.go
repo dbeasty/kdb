@@ -3,11 +3,11 @@ package driver
 import (
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
@@ -106,102 +106,65 @@ func commitOne(ns *namespace, tx document.Transaction) error {
 	return nil
 }
 
-// commitAcross commits a transaction spanning namespaces, with the protocol
-// server.NamespaceSet.CommitAcross uses (docs/kdb-cross-namespace-transactions-plan.md §3.2):
-// every namespace's lock in id order, every participant checked before any is written, parts
-// published provisional and queued, locks released, then the group decided.
+// commitAcross commits a transaction spanning namespaces through embed.CommitGroup - the protocol
+// the wire server uses too (docs/kdb-cross-namespace-transactions-plan.md §3.2). The driver's
+// side of it is driverParticipant: a namespace mutex where the server has a write gate.
 func (db *database) commitAcross(parts []commitPart) error {
-	sort.Slice(parts, func(i, j int) bool { return parts[i].ns.id < parts[j].ns.id })
-	for i := 1; i < len(parts); i++ {
-		if parts[i].ns == parts[i-1].ns {
-			return fmt.Errorf("kdb driver: namespace %s appears twice in one transaction", parts[i].ns.id)
-		}
-	}
-	for _, p := range parts {
+	groupParts := make([]embed.GroupPart, len(parts))
+	for i, p := range parts {
 		if err := p.ns.fenceErr(); err != nil {
 			return err
 		}
-		defer p.ns.d.Pin(p.tx.BaseVersion)()
+		groupParts[i] = embed.GroupPart{Participant: driverParticipant{p.ns}, Tx: p.tx}
 	}
-	locked := 0
-	unlock := func() {
-		for ; locked > 0; locked-- {
-			parts[locked-1].ns.write.Unlock()
-		}
-	}
-	defer unlock()
-	for _, p := range parts {
-		p.ns.write.Lock()
-		locked++
-	}
-
-	ids := make([]string, len(parts))
-	for i, p := range parts {
-		ids[i] = p.ns.id
-	}
-	group, err := db.coord.Begin(ids)
+	_, wait, err := embed.CommitGroup(db.coord, groupParts)
 	if err != nil {
 		return err
 	}
-	prepared := make([]*transaction.PreparedCommit, len(parts))
-	for i := range parts {
-		parts[i].tx.ID = group.ID
-		if parts[i].tx.Timestamp.EpochMicros() == 0 {
-			parts[i].tx.Timestamp = codec.TimestampNow()
-		}
-		preparer, ok := parts[i].ns.engine.(transaction.Preparer)
-		if !ok {
-			group.Abandon()
-			return fmt.Errorf("kdb driver: engine %T cannot prepare", parts[i].ns.engine)
-		}
-		pc, result, err := preparer.PrepareCommit(parts[i].tx, parts[i].ns.d, parts[i].ns.rt.Storage, parts[i].ns.schema())
-		if err == nil && result != nil {
-			_, err = resultError(parts[i].ns.id, result)
-		}
-		if err != nil {
-			for _, done := range prepared[:i] {
-				done.Discard()
-			}
-			group.Abandon()
-			return err
-		}
-		prepared[i] = pc
-	}
+	return wait()
+}
 
-	fail := func(applied int, cause error) error {
-		if applied == 0 {
-			group.Abandon()
-			return cause
-		}
-		err := group.Fail(cause)
-		for _, p := range parts {
-			p.ns.fence(err)
-		}
-		return err
-	}
-	for i, p := range parts {
-		result, err := prepared[i].Apply(transaction.ApplyOptions{Message: group.Message(), Provisional: true})
-		if err == nil {
-			var c document.Commit
-			if c, err = resultError(p.ns.id, result); err == nil {
-				err = group.AddPart(p.ns.rt, c)
-				if err != nil {
-					return fail(i+1, err)
-				}
-				continue
-			}
-		}
-		return fail(i, err)
-	}
-	unlock()
+// driverParticipant is one namespace's side of embed.CommitGroup.
+type driverParticipant struct{ ns *namespace }
 
-	if err := group.Finish(); err != nil {
-		for _, p := range parts {
-			p.ns.fence(err)
-		}
-		return err
+func (p driverParticipant) Namespace() string                  { return p.ns.id }
+func (p driverParticipant) Runtime() *embed.EmbeddedKdbRuntime { return p.ns.rt }
+func (p driverParticipant) Fence(cause error)                  { p.ns.fence(cause) }
+
+func (p driverParticipant) Lock() (func(), error) {
+	p.ns.write.Lock()
+	return p.ns.write.Unlock, nil
+}
+
+func (p driverParticipant) Prepare(tx document.Transaction) (embed.PreparedPart, error) {
+	preparer, ok := p.ns.engine.(transaction.Preparer)
+	if !ok {
+		return nil, fmt.Errorf("kdb driver: engine %T cannot prepare", p.ns.engine)
 	}
-	return nil
+	pc, result, err := preparer.PrepareCommit(tx, p.ns.d, p.ns.rt.Storage, p.ns.schema())
+	if err != nil {
+		return nil, err
+	}
+	if result != nil {
+		_, err := resultError(p.ns.id, result)
+		return nil, err
+	}
+	return driverPrepared{ns: p.ns, pc: pc}, nil
+}
+
+type driverPrepared struct {
+	ns *namespace
+	pc *transaction.PreparedCommit
+}
+
+func (dp driverPrepared) Discard() { dp.pc.Discard() }
+
+func (dp driverPrepared) Apply(message string) (document.Commit, error) {
+	result, err := dp.pc.Apply(transaction.ApplyOptions{Message: message, Provisional: true})
+	if err != nil {
+		return document.Commit{}, err
+	}
+	return resultError(dp.ns.id, result)
 }
 
 // resultError turns an engine result into the commit it produced or the error it amounts to.
