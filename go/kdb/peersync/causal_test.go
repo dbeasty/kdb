@@ -8,8 +8,8 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
-	"github.com/limidus/kdb/go/kdb/transaction"
 	mem "github.com/limidus/kdb/go/kdb/storage/mem"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // TestLastWriteRespectsCausalityUnderClockSkew: node A's clock runs ten minutes slow. It has

@@ -216,7 +216,7 @@ Rewrite `mergeNonConflicting` to take a fully resolved `merged map[UUID]Op` over
 
 ## Phase 2 — Sync protocol v2
 
-### 2.1 Messages (`wire/sync_v2_ops.go`, opcodes 0x26–0x2B) ☐
+### 2.1 Messages (`wire/sync_v2_ops.go`, opcodes 0x26–0x2B) ☑
 
 ```
 SyncHello     {NodeID, Protocol=2, Capabilities[], Namespaces[] (patterns), credentials}
@@ -232,7 +232,7 @@ RefUpdateAck  {Namespace, Ref, Outcome (ff|merged|noop|conflict|rejected), HeadH
 - **`MaxBytes`** defaults to 4 MiB. Pages are filled until the next commit would exceed it; a single commit that is larger still goes out alone.
 - **Capabilities:** `zstd`, `stubs`, `snapshot` (Phase 4), `filter` (Phase 7), `tags`, `branches`.
 
-### 2.2 Host (`peersync/v2_host.go`) ☐
+### 2.2 Host (`peersync/v2_host.go`) ☑
 
 - **One connection serves many namespaces** through a `NamespaceResolver` interface. `server.NamespaceSet` implements it, returning a per-namespace `IngestEnv`.
 - **Authorization is per namespace** (`PeerSyncAction{ns}`).
@@ -241,7 +241,7 @@ RefUpdateAck  {Namespace, Ref, Outcome (ff|merged|noop|conflict|rejected), HeadH
 - **`RefUpdate`** goes through `Ingest` for branch `main`. Other branches run the same `ResolveHeadUpdate` against that branch's head. Only FF is supported off `main`; a divergent non-main branch gets `conflict`.
 - **Tags:** a new tag is created. The same name at a different hash gets `conflict`, and the tag is never moved.
 
-### 2.3 Client (`peersync/v2_client.go`) ☐
+### 2.3 Client (`peersync/v2_client.go`) ☑
 
 `SyncV2(conn, namespaces, mode) (map[string]NamespaceSyncResult, error)`:
 
@@ -251,7 +251,7 @@ RefUpdateAck  {Namespace, Ref, Outcome (ff|merged|noop|conflict|rejected), HeadH
    - **Push:** for each local ref whose hash isn't known on the remote, send `RefUpdate` with the pack of commits from `CommitsToPush(localRef, remoteRef)`, paged.
 3. **Fallback:** if the ack reports `Protocol < 2`, fall back to the v1 session.
 
-### 2.4 Server listener ☐
+### 2.4 Server listener ☑
 
 `ListenPeerSync` dispatches by the first frame: `SyncHello` → v2 host over the runtime's `NamespaceSet` (or a solo set), and `Handshake` → the v1 host.
 
@@ -541,3 +541,26 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
   - The Custom resolver now sees Existing = first parent's side and Incoming = second's. Its determinism contract lives on that ordering.
 - **The property test catches the old behaviour.** `TestMeshConvergesDeterministically` (20 seeds by default, `TEST_SEEDS` to widen; run green at 50 under `-race`) fails on every seed when the merge tx id is put back to random.
 - **Deviation: no separate simulation harness package yet.** The in-process `pullInto`/`exchange` helpers in `peersync/determinism_test.go` are that harness's first cut. The package split waits until Phase 3 needs it across packages.
+
+### Phase 2 — landed
+
+**Wire:** eight messages at 0x26–0x2D (`wire/sync_v2_ops.go`), one more than planned. REFS_REQUEST/REFS_RESULT is a request/response pair, and the initial refs ride on SYNC_HELLO_ACK.
+
+**`peersync` pieces:**
+- `V2Host` and `SyncV2`
+- `NamespaceProvider`
+- `ApplyRef`, one decision function for every ref kind, shared by host and client
+- `MissingCommitsFrom`, byte-paged
+- `MatchNamespace`/`SelectNamespaces`, the pattern grammar Phase 6 also uses
+
+**Server side:** the listener picks v1 or v2 from the first frame, and `KdbServerRuntime.PeerNamespaces()`/`PeerIngestEnv()` expose the process's namespace set.
+
+**Deviations, and why:**
+- **No server-side cursor.** Paging is stateless: each page is "missing from wants, excluding haves", and the client names the tips of what it has received as further haves. A resume after disconnect is a new session that passes `ExtraHaves` = the previous session's `ReceivedTips` (`TestV2ResumeAfterInterruption`). Stateless means a host holds nothing per session, which matters once a hub serves many edges.
+- **Commit payloads are base64 `[]byte` in v2 frames,** not the integer-array `jsonByteArray` that v1 keeps for Kotlin's decoder. v2 is Go-only, and the integer form is three to four times larger.
+- **Only `main` merges. Side branches only fast-forward** (a diverged side branch is a conflict), and **tags never move.** Only `main` has live documents behind it; merging someone else's side branch is their decision.
+- **Namespaces are granted one by one at hello.** A pattern is a request, and a principal with rights to some of what it matches gets exactly those. Every later frame re-authorizes, so revocation takes effect mid-session.
+- **`CreateOnPush` (off by default)** lets a peer push into a namespace this node doesn't hold, but only a literal (wildcard-free) name.
+- **Not measured yet:** the 100k-commit v1-vs-v2 comparison. It needs an isolated machine (see the benchmark-isolation note), so it's recorded as outstanding rather than run under load.
+
+**Known limitation, carried to Phase 4:** replicated side branches and tags are held in the DAG and survive a clean restart through the checkpoint, but not a crash. The delta log records only commits on `main`, in the order `main` reached them — that's what keeps replay correct (commit `2aec036`).

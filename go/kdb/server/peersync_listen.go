@@ -72,6 +72,10 @@ func ListenPeerSyncTLS(addr string, runtime *KdbServerRuntime, namespaceID strin
 // SessionManager).
 type peerSyncConnHandler struct {
 	host *peersync.ConnectionHost
+	// v2, once the connection's first frame is SYNC_HELLO, serves it instead of host.
+	v2      *peersync.V2Host
+	runtime *KdbServerRuntime
+	codec   wire.Codec
 }
 
 func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespaceID string) *peerSyncConnHandler {
@@ -88,12 +92,37 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 		PersistAsync: runtime.peerPersistAsync(),
 	}
 	host := peersync.NewConnectionHost(codec, runtime.dag, runtime.Runtime.Storage, cfg, runtime.AuthEngine, auth.EmptyContext)
-	return &peerSyncConnHandler{host: host}
+	return &peerSyncConnHandler{host: host, runtime: runtime, codec: codec}
+}
+
+// handle routes a frame to the v1 or v2 host. The protocol is fixed by the connection's first
+// frame: SYNC_HELLO opens a v2 session over every namespace this process serves; anything else
+// is v1 against the listener's one namespace, as before v2 existed.
+func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
+	if first {
+		if hdr, err := wire.DecodeHeader(frame); err == nil && hdr.MessageType == wire.MsgSyncHello {
+			h.v2 = peersync.NewV2Host(h.codec, peersync.V2HostConfig{
+				NodeID:     h.runtime.NodeID.String(),
+				Namespaces: h.runtime.PeerNamespaces(),
+				ClassifyError: func(err error) (wire.ErrorCode, bool) {
+					code, _ := classifyError(err)
+					return code, code != wire.ErrorCodeInternal
+				},
+				CreateOnPush: h.runtime.PeerCreateOnPush,
+			}, h.runtime.AuthEngine, auth.EmptyContext)
+		}
+	}
+	if h.v2 != nil {
+		return h.v2.HandleFrame(frame)
+	}
+	return h.host.HandleFrame(frame)
 }
 
 func (h *peerSyncConnHandler) run(conn stream.ConnectionHandle) {
+	first := true
 	for frame := range conn.Incoming() {
-		response, err := h.host.HandleFrame(frame)
+		response, err := h.handle(frame, first)
+		first = false
 		if err != nil {
 			// A handler error used to be silently swallowed with no reply at all - the peer
 			// blocked on its request timeout with zero diagnostics (kdb-finish-up-plan 4.H's

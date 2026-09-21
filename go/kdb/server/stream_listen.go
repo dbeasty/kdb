@@ -264,8 +264,8 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 		conn:      conn,
 		lastAck:   resume,
 		principal: principal,
-		outbound: make(chan []byte, subscriberQueueDepth),
-		stop:     make(chan struct{}),
+		outbound:  make(chan []byte, subscriberQueueDepth),
+		stop:      make(chan struct{}),
 	}
 	h.mu.Lock()
 	h.removeConnLocked(conn)

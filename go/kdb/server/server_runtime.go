@@ -113,6 +113,9 @@ type KdbServerRuntime struct {
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.
 	WriteTimeout time.Duration
+	// PeerCreateOnPush lets a v2 peer push into a namespace this process does not hold yet,
+	// creating it. Off by default - see peersync.V2HostConfig.CreateOnPush.
+	PeerCreateOnPush bool
 	// NodeID is this node's identity (embed.LoadOrCreateNodeID): it authors every commit this
 	// runtime makes and names it to peers. Defaults to ProcessNodeID at construction.
 	NodeID codec.UUID

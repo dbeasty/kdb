@@ -29,6 +29,41 @@ func (s *KdbServerRuntime) peerPersistAsync() func(document.Commit) (func() erro
 	return s.persister.PersistAsync
 }
 
+// PeerIngestEnv describes this runtime's namespace to peer sync: its DAG and storage, its write
+// serialization and hooks, its log, and its conflict policy.
+func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
+	return peersync.IngestEnv{
+		DAG:            s.dag,
+		Storage:        s.Runtime.Storage,
+		NamespaceID:    s.Runtime.DefaultNamespace,
+		Node:           s.PeerSyncNode(),
+		PersistAsync:   s.peerPersistAsync(),
+		ApplyToStorage: true,
+		Resolution:     peersync.ResolutionOptions{Policy: s.PeerSyncConflictPolicy},
+	}
+}
+
+// PeerNamespaces is the set of namespaces this runtime's process serves to peers, and feeds
+// from them: every namespace in its NamespaceSet, or just its own when it has none.
+func (s *KdbServerRuntime) PeerNamespaces() peersync.NamespaceProvider {
+	return peerNamespaceProvider{set: s.namespaceSet()}
+}
+
+type peerNamespaceProvider struct{ set *NamespaceSet }
+
+func (p peerNamespaceProvider) List() []string { return p.set.Namespaces() }
+
+func (p peerNamespaceProvider) Env(ns string, create bool) (peersync.IngestEnv, error) {
+	rt, err := p.set.Resolve(ns, create)
+	if err != nil {
+		return peersync.IngestEnv{}, err
+	}
+	if rt.dag == nil {
+		return peersync.IngestEnv{}, fmt.Errorf("kdb server: namespace %s has no commit DAG peer sync can use", ns)
+	}
+	return rt.PeerIngestEnv(), nil
+}
+
 // PeerSyncNode returns the peersync.LocalNode that feeds this runtime.
 func (s *KdbServerRuntime) PeerSyncNode() peersync.LocalNode { return serverLocalNode{rt: s} }
 
