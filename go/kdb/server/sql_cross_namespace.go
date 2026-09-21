@@ -49,14 +49,15 @@ type crossNamespaceState struct {
 // open a namespace that does not exist yet: a write is an explicit request for it, and the commit
 // would create it anyway. A read of a namespace that does not exist is an error, not an empty
 // result.
-func (h *sqlWireConnHandler) statementTarget(stmt sql.Statement, forWrite bool) (sqlTarget, error) {
-	own := sqlTarget{rt: h.runtime, own: true}
-	set := h.runtime.Namespaces
+func (h *sqlWireConnHandler) statementTarget(sess *KdbSession, stmt sql.Statement, forWrite bool) (sqlTarget, error) {
+	srv := h.sessionRuntime(sess)
+	own := sqlTarget{rt: srv, own: true}
+	set := srv.Namespaces
 	ref, named := sql.TargetTable(stmt)
 	if set == nil || !named {
 		return own, nil
 	}
-	ownNS := h.runtime.Runtime.DefaultNamespace
+	ownNS := srv.Runtime.DefaultNamespace
 	if strings.Contains(ref.Name, ".") {
 		ns := strings.ReplaceAll(ref.Name, ".", "/")
 		if ns == ownNS {

@@ -32,6 +32,11 @@ type KdbSession struct {
 	Pending         *transaction.Builder
 	Principal       auth.Principal
 
+	// runtime serves this session's namespace: the runtime its SQL runs against, its commits land
+	// in and its leases are held on. The listener's own runtime unless the session was opened on
+	// another namespace through a NamespaceSet.
+	runtime *KdbServerRuntime
+
 	// versionMu guards baseVersion and readPin. Both move at a transaction boundary while
 	// reads on the same session may be in flight: frames on one connection are dispatched
 	// concurrently (see SqlWireListen's pipelining), so a TxCommit advancing the session's
@@ -220,7 +225,7 @@ func NewSessionManager(server *KdbServerRuntime) *SessionManager {
 	}
 }
 
-// Begin opens a new session pinned to a base DAG version.
+// Begin opens a new session on the manager's own runtime, pinned to a base DAG version.
 func (m *SessionManager) Begin(
 	namespaceID string,
 	readConsistency ReadConsistency,
@@ -228,7 +233,20 @@ func (m *SessionManager) Begin(
 	sessionID string,
 	principal auth.Principal,
 ) (*KdbSession, error) {
-	head, err := m.server.Runtime.DAG.Head()
+	return m.BeginOn(m.server, namespaceID, readConsistency, baseVersionHex, sessionID, principal)
+}
+
+// BeginOn opens a new session bound to rt - the runtime serving namespaceID, which need not be
+// the connection's own.
+func (m *SessionManager) BeginOn(
+	rt *KdbServerRuntime,
+	namespaceID string,
+	readConsistency ReadConsistency,
+	baseVersionHex string,
+	sessionID string,
+	principal auth.Principal,
+) (*KdbSession, error) {
+	head, err := rt.Runtime.DAG.Head()
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +255,7 @@ func (m *SessionManager) Begin(
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := m.server.Runtime.DAG.GetCommit(h); !ok {
+		if _, ok := rt.Runtime.DAG.GetCommit(h); !ok {
 			return nil, fmt.Errorf("unknown base version: %s", baseVersionHex)
 		}
 		head = h
@@ -250,14 +268,15 @@ func (m *SessionManager) Begin(
 		// the document lock manager is runtime-global and keys ownership by session id. Two
 		// connections both calling themselves "sess-1" were therefore treated as one holder:
 		// each could take locks the other held, and either could release the other's.
-		id = fmt.Sprintf("sess-%d", m.server.nextSessionOrdinal())
+		id = fmt.Sprintf("sess-%d", rt.nextSessionOrdinal())
 	}
 	sess := &KdbSession{
 		ID:              SessionID{Value: id},
 		NamespaceID:     namespaceID,
 		ReadConsistency: readConsistency,
 		Principal:       principal,
-		dag:             m.server.dag,
+		dag:             rt.dag,
+		runtime:         rt,
 	}
 	// The session's first transaction starts here, at the version it was opened against.
 	sess.startTransactionAt(head)
@@ -355,15 +374,24 @@ func (m *SessionManager) PendingBuilder(sess *KdbSession) *transaction.Builder {
 			// A DAG that cannot report a head leaves the session on its existing base rather
 			// than failing the statement: that is the behaviour this call has always had, and
 			// the commit still validates against reality.
-			if head, err := m.server.Runtime.DAG.Head(); err == nil {
+			if head, err := m.runtimeOf(sess).Runtime.DAG.Head(); err == nil {
 				sess.anchorWritesAt(head)
 			}
 		}
 		sess.Pending = &transaction.Builder{
 			NamespaceID: sess.NamespaceID,
 			BaseVersion: sess.BaseVersion(),
-			Schema:      m.server.Schema(),
+			Schema:      m.runtimeOf(sess).Schema(),
 		}
 	}
 	return sess.Pending
+}
+
+// runtimeOf is the runtime serving sess - its own, or the manager's for a session created before
+// sessions carried one.
+func (m *SessionManager) runtimeOf(sess *KdbSession) *KdbServerRuntime {
+	if sess.runtime != nil {
+		return sess.runtime
+	}
+	return m.server
 }

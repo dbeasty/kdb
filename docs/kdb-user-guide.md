@@ -208,6 +208,10 @@ _, err = tx.Commit(ctx)                          // both namespaces or neither
 
 `BEGIN` / `COMMIT` / `ROLLBACK` sent as SQL text do the same on any wire session.
 
+One `kdb-service` listener serves every namespace under its data root: `PutJSON`, `Commit`,
+`Upsert`, leases, SQL, history and search all act on the namespace they name. A write to a
+namespace that does not exist creates it; a read does not.
+
 Each participant is checked (schema, unique keys, preconditions, conflicts) before any is
 written; one refusal refuses the whole transaction. On the server the participating namespaces
 must share one data root (`kdb-service --data-dir`), which is where the transaction's decision is
