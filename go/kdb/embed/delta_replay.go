@@ -37,7 +37,7 @@ import (
 // segments in commit order, which Component 47 §4.1 guarantees - that set
 // is empty.
 func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r storage.DeltaSegmentReader) error {
-	return replayDeltaNamespaceFrom(d, store, r, -1, nil)
+	return replayDeltaNamespaceFrom(d, store, r, -1, nil, nil)
 }
 
 // replayDeltaNamespaceFrom is replayDeltaNamespace restricted to segments
@@ -60,6 +60,7 @@ func replayDeltaNamespaceFrom(
 	r storage.DeltaSegmentReader,
 	afterSequence int64,
 	coord *TxnCoordinator,
+	shallow map[codec.Hash]bool,
 ) error {
 	if r == nil {
 		return nil
@@ -134,7 +135,7 @@ func replayDeltaNamespaceFrom(
 		}
 	}
 
-	return applyCommitsTopologically(d, store, deferred, gate)
+	return applyCommitsTopologically(d, store, deferred, gate, shallow)
 }
 
 // groupGate is replay's view of cross-namespace groups: which commits to leave out, and why.
@@ -278,7 +279,12 @@ func applyIfParentsReady(d *dag.InMemoryCommitDag, store storage.Adapter, c docu
 // rounds only run at all if something upstream still got the order
 // wrong, so this stays cheap in the case it exists to protect against
 // being rare.
-func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, commits []document.Commit, gate *groupGate) error {
+//
+// A commit in shallow is a known history horizon - a root the namespace's marker names, logged
+// when history below a snapshot was fetched (peersync.Deepen) but whose own parents the peer did
+// not have either. It is admitted without them, as it was when it was fetched, rather than failing
+// the open for want of parents nobody has.
+func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, commits []document.Commit, gate *groupGate, shallow map[codec.Hash]bool) error {
 	pending := make([]document.Commit, 0, len(commits))
 	for _, c := range commits {
 		if !d.HasCommit(c.Hash) {
@@ -303,6 +309,13 @@ func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, 
 				}
 			}
 			if !ready {
+				if shallow[c.Hash] {
+					if err := d.PutShallowCommit(c); err != nil {
+						return err
+					}
+					progressed = true
+					continue
+				}
 				next = append(next, c)
 				continue
 			}

@@ -63,7 +63,7 @@ func restoreNamespace(
 				Floor:       lowestSegmentSequence(r),
 			}
 		}
-		return true, replayDeltaNamespaceFrom(d, store, r, -1, coord)
+		return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, nil)
 	}
 
 	if disabled {
@@ -125,7 +125,7 @@ func restoreNamespace(
 		c, err := document.FromPayloadBytes(payload)
 		if err != nil {
 			log.Printf("kdb: namespace %s: a checkpointed head commit would not decode (%v) - replaying the log in full", namespaceID, err)
-			return true, replayDeltaNamespaceFrom(d, store, r, -1, coord)
+			return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, nil)
 		}
 		heads = append(heads, c)
 	}
@@ -139,7 +139,13 @@ func restoreNamespace(
 	}
 
 	// Only the tail: everything up to cp.ThroughSequence is already here.
-	if err := replayDeltaNamespaceFrom(d, store, r, cp.ThroughSequence, coord); err != nil {
+	shallow := map[codec.Hash]bool{}
+	for _, hex := range shallowRoots {
+		if h, err := codec.HashFromHex(hex); err == nil {
+			shallow[h] = true
+		}
+	}
+	if err := replayDeltaNamespaceFrom(d, store, r, cp.ThroughSequence, coord, shallow); err != nil {
 		return false, err
 	}
 	return false, nil

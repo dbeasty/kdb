@@ -27,6 +27,10 @@ type namespaceMeta struct {
 	// delta log holds. Non-empty makes the checkpoint the only record of that state: open then
 	// refuses to fall back to a replay that would silently produce an empty namespace.
 	ShallowRoots []string `json:"shallowRoots,omitempty"`
+	// BodiesExternal records that the namespace was once bootstrapped from a snapshot, so some
+	// documents' bodies exist only in the blob store - even after its history has been fetched
+	// back (peersync.Deepen) and ShallowRoots has emptied. Set once, never cleared.
+	BodiesExternal bool `json:"bodiesExternal,omitempty"`
 }
 
 func namespaceMetaPath(dataRoot, namespaceID string) string {
