@@ -1,0 +1,16 @@
+{
+  "name": "merge-disjoint-fields",
+  "comment": "The common case: each side changed a different field, so the procedure builds the union. It works off the fields list rather than re-deriving the diff.",
+  "source": "function main(c) {\n  var out = {};\n  for (var k in c.base) { out[k] = c.base[k]; }\n  for (var i = 0; i < c.fields.length; i++) {\n    var f = c.fields[i];\n    if (f.kind === 'both') { return { defer: true }; }\n    var key = f.path.slice(1);\n    var side = f.kind === 'remote' ? 'remote' : 'local';\n    if (f.present[side]) { out[key] = f[side]; } else { delete out[key]; }\n  }\n  return { doc: out };\n}",
+  "input": {
+    "docId": "22222222-2222-4222-8222-222222222222",
+    "base": {"name": "widget", "qty": 1, "colour": "red"},
+    "local": {"name": "widget", "qty": 5, "colour": "red"},
+    "remote": {"name": "widget", "qty": 1, "colour": "blue"},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "doc", "doc": {"name": "widget", "qty": 5, "colour": "blue"}}
+}

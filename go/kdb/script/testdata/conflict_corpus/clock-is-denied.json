@@ -1,0 +1,16 @@
+{
+  "name": "clock-is-denied",
+  "comment": "A procedure that reads the clock would decide differently on two nodes, so in the deterministic mode it throws instead.",
+  "source": "function main(c) { return { doc: { at: Date.now() } }; }",
+  "input": {
+    "docId": "99999999-9999-4999-8999-999999999999",
+    "base": {"a": 1},
+    "local": {"a": 2},
+    "remote": {"a": 3},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "errorContains": "Date.now is not available"
+}
