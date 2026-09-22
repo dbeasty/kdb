@@ -1316,6 +1316,85 @@ Resolvers registered on the Go API (`ConflictPolicyCustom`) now also receive the
 (`BaseDoc`) and which node wrote each side, in which commit and when (`ExistingOrigin`,
 `IncomingOrigin`).
 
+### Handing conflicts to your application: the resolver authority
+
+When your application has the business rules that decide a conflict, end the chain with an
+`authority` rule. It takes whatever the earlier rules left undecided and hands it to a
+**resolver authority**: a service of yours, or a person, holding the `resolve` permission.
+
+```json
+{"rules": [
+  {"kind": "field-merge"},
+  {"kind": "authority", "pending": "hold", "node": "<node id>", "timeout": "24h"}
+]}
+```
+
+| Field | Meaning |
+|---|---|
+| `pending` | What the namespace holds while it waits. `hold` (default): the conflict stays unmerged and queued, like `queue`. `provisional`: merge now by last write, and let the authority overrule it later. |
+| `node` | The one node that tells the authority, so it hears about a conflict once. The home node or hub is the natural choice. Empty: every node tells it. `kdb node status` prints a node's id. |
+| `timeout` | How long a conflict waits (a duration such as `24h`). Past it, the fallback becomes final: a held conflict is settled by last write, and a provisional value simply stands. Empty waits forever. |
+
+**Why the authority decides after the merge, not during it.** Automatic rules run inside the merge,
+so they must decide identically on every node. The authority's decision instead becomes an
+ordinary commit, which replicates like any write. So your service can apply any logic it likes:
+call other systems, look up which site is trusted, or ask a person.
+
+**Learning about conflicts.** Choose one of two ways:
+- **Webhook.** Start the notifying node with `--conflict-webhook https://resolver.internal/kdb` and
+  `--conflict-webhook-secret` (or `$KDB_CONFLICT_WEBHOOK_SECRET`).
+  - Each conflict is POSTed as `{"type":"kdb.conflict","node",...,"namespace",...,"conflict":{...}}`.
+  - The body is signed with HMAC-SHA256: `X-KDB-Signature: sha256=<hex>`. Verify it over the raw
+    body.
+  - `X-KDB-Delivery` carries the conflict id, so you can deduplicate: delivery is at least once.
+  - Anything other than a 2xx is retried every `--conflict-webhook-interval` (default 10s).
+- **Polling.** `GET /v1/ns/{ns}/conflicts?authority=true&undelivered=true`, then
+  `POST /v1/ns/{ns}/conflicts/{id}/ack` for each one you have taken. It won't be listed as
+  undelivered again unless its report changes.
+
+**What each conflict tells you.** Per document:
+- both values (`items`: `localDoc`, `incomingDoc`);
+- the value they both started from (`details[].base`);
+- which node wrote each side, in which commit and when (`details[].localOrigin` /
+  `incomingOrigin`: `nodeId`, `commit`, `timestampMicros`).
+
+**Deciding.** Settle a conflict with
+`POST /v1/ns/{ns}/conflicts/{id}/resolve {"choices":{"<docId>":{"take":"local"|"remote"}|{"body":"<json>"}}}`.
+- For a `provisional` entry, `local` is the value the merge kept (confirm it) and `remote` is the
+  value it displaced (overrule it).
+- The resolution is a commit whose message is `kdb:resolve/1 <id>`. Every node that receives it
+  closes its own copy of the conflict.
+- A provisional decision is refused (409 `stale`) if the document changed after the merge. Decide
+  again against its current value.
+
+**Settling many at once.**
+`POST /v1/ns/{ns}/conflicts/resolve-all {"take":"remote","filter":{"origin":"<node id>"},"dryRun":true}`
+previews taking one side for every matching conflict ("the AWS node is right about all of these").
+Drop `dryRun` to apply it. You can filter by `kind`, `peer` and `origin`. From the command line:
+
+```bash
+kdb --data-dir /var/lib/kdb resolve site/berlin/orders --all --take remote --origin <node id> --dry-run
+```
+
+**A client resolving its own conflicts.** Use the same endpoints:
+- `GET /v1/ns/{ns}/conflicts?doc=<id>` lists every candidate version of one document;
+- `POST .../resolve` settles it.
+
+**Permissions.** In a namespace whose chain has an `authority` rule:
+- settling, acknowledging and dismissing need `resolve` (`GRANT RESOLVE ON COLLECTION app.data TO
+  resolver`, stored as the grant `resolve:app/data`);
+- the resolution is also a write, so the principal needs `write` as well;
+- a writer without `resolve` gets 403.
+
+Other namespaces keep the old rule, where commit rights are enough.
+
+**Across nodes and versions.**
+- Peer sync protocol v1, which Kotlin peers speak, carries no chain hash. So a namespace with a chain
+  never merges over v1: divergences are queued, and `main` is pushed only as a fast-forward.
+- Kotlin reads the resulting history (the merge and `kdb:resolve/1` commits) like any other.
+- The Go CLI's `kdb sync` and `kdb resolve` read the chain from the data directory's `_kdb/meta`.
+- `kdb resolution <ns>` shows the chain.
+
 ### Joining, catching up, and retention
 
 **Joining.** A new node either fetches a peer's whole history or, with `bootstrap=snapshot`,

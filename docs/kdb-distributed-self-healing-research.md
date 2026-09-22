@@ -1,6 +1,6 @@
 # Distributed KDB: self-healing, merging and partial replication — research and gap analysis
 
-Status: research and proposal. Nothing in this document is built.
+Status: research and proposal. Phase 10.5 has since landed (see §5); the rest is not built.
 Basis: `main` at d30efd4, which includes the distributed work (PR #78, Phases 0–10 plus 7.4 and 7.5). Every `file:line` below refers to `go/kdb/` at that commit.
 Companion docs: [kdb-distributed-plan.md](kdb-distributed-plan.md) (design, D1–D12) and [kdb-distributed-implementation-plan.md](kdb-distributed-implementation-plan.md) (phases and progress log).
 
@@ -142,7 +142,9 @@ That is the same trust level projections have today, plus verified reads beyond 
 
 ## 5. Proposed phases
 
-### Phase 10.5 — Resolution policies and application authority (before Phase 11)
+### Phase 10.5 — Resolution policies and application authority (before Phase 11) — landed
+
+Built as described below, except node labels. See the implementation plan's progress log (slices 1 and 2) and the user guide.
 
 Merging an unrelated database (Phase 11) turns every document that differs into a conflict, so this has to come first.
 
