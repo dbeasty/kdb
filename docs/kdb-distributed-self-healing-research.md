@@ -1,6 +1,6 @@
 # Distributed KDB: self-healing, merging and partial replication — research and gap analysis
 
-Status: research and proposal. Phases 10.5, 12 and 13 have since landed (see §5 and the implementation plan's progress log); Phase 11 is blocked on engine support (see its section); 14–15 are not built.
+Status: research and proposal. Phases 10.5, 12, 13 and 14 (read-through) have since landed (see §5 and the implementation plan's progress log); Phase 11 is blocked on engine support (see its section); 14–15 are not built.
 Basis: `main` at d30efd4, which includes the distributed work (PR #78, Phases 0–10 plus 7.4 and 7.5). Every `file:line` below refers to `go/kdb/` at that commit.
 Companion docs: [kdb-distributed-plan.md](kdb-distributed-plan.md) (design, D1–D12) and [kdb-distributed-implementation-plan.md](kdb-distributed-implementation-plan.md) (phases and progress log).
 
@@ -227,7 +227,7 @@ The foundation for Phases 13 and 14.
 - **Missing commits on the repair path:** `integrity.Repair` fetches them from a peer before falling back to "run kdb restore".
 - **Live-tree check:** periodically compare the live tree's root with the declared tree hash of the head. On a mismatch, walk `TREE_NODES` against a peer to find the damaged documents and repair only those.
 
-### Phase 14 — Edge lazy fill
+### Phase 14 — Edge lazy fill — read-through landed; widening and deepen not (see the progress log)
 
 - **Read-through:** a projection's `GetDocument` for an id outside its data does `OBJECT_FETCH` from the source with a proof (§4). The result optionally goes into a bounded LRU *hoard* [24] kept apart from the projection's history, so the projection's DAG stays exactly its filter.
 - **Filter widening** becomes a tree-diff against the source instead of a `Reset` [23].

@@ -1395,6 +1395,27 @@ Other namespaces keep the old rule, where commit rights are enough.
 - The Go CLI's `kdb sync` and `kdb resolve` read the chain from the data directory's `_kdb/meta`.
 - `kdb resolution <ns>` shows the chain.
 
+### Reading beyond the filter: read-through
+
+A filtered peer holds only the documents that match its filter. Add `readthrough=true` and a
+client's read of any *other* document is answered from the source instead of "not found":
+
+```bash
+--peer "name=hq,addr=tcps://hq:4242,namespaces=orders,readthrough=true,filter=region = 'EU'"
+```
+
+- **Consistent.** The document is read as of the source commit the projection is at, so it is
+  never newer than what the edge already holds. Once the projection syncs forward, so do its reads.
+- **Verified.** The source sends a Merkle proof of what that commit's tree holds for the document,
+  and the whole commit, which the edge checks hashes to the one it asked for. A wrong, stale or
+  invented answer is refused, not served. The edge never needs the source's tree.
+- **Bounded.** Fetched documents go into an in-memory cache of the 1024 most recently read. It is
+  never committed, never replicated, and never makes a document part of the projection.
+- **The source's read rights apply**, per document, with the peer's credentials.
+
+Only point reads (a document by id, over the wire or the control plane) read through. Queries see
+the projection alone.
+
 ### Self-repair: scrub, and comparing with a peer
 
 A **scrub** re-reads every live document and checks its body against the content hash the
