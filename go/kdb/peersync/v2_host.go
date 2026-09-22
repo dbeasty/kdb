@@ -35,6 +35,9 @@ type V2HostConfig struct {
 	// For engines whose rules go below the namespace. Merge commits carry every document their
 	// sides disagreed on, so a peer needs write rights on those too.
 	AuthorizeDocuments bool
+	// MetaView answers META_VIEW: the definitions a session may see, given which namespaces it
+	// was granted. nil answers with none.
+	MetaView func(canSee func(ns string) bool) ([]wire.MetaDefinition, error)
 	// Namespaces supplies the namespaces this host serves.
 	Namespaces NamespaceProvider
 	// ClassifyError maps a failure to the code sent back in PEER_ERROR - see HostConfig.
@@ -83,7 +86,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -190,6 +193,23 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		return h.docFetch(m)
 	case wire.GraftPushMessage:
 		return h.graftPush(m)
+	case wire.MetaViewMessage:
+		reply := wire.MetaViewResultMessage{H: header(wire.MsgMetaViewResult, m.H.CorrelationID)}
+		if h.cfg.MetaView == nil {
+			return reply, nil
+		}
+		h.mu.Lock()
+		granted := make(map[string]bool, len(h.granted))
+		for ns, ok := range h.granted {
+			granted[ns] = ok
+		}
+		h.mu.Unlock()
+		defs, err := h.cfg.MetaView(func(ns string) bool { return granted[ns] })
+		if err != nil {
+			return nil, err
+		}
+		reply.Definitions = defs
+		return reply, nil
 	case wire.TreeNodesMessage:
 		env, err := h.env(m.Namespace, false, dirPull)
 		if err != nil {

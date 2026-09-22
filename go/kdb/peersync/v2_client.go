@@ -29,6 +29,11 @@ const (
 
 // V2ClientConfig configures one v2 sync against a peer.
 type V2ClientConfig struct {
+	// MetaView, when set, makes this a scoped session for definitions: right after hello - before
+	// any namespace syncs, so resolution chains are in place for its merges - the client asks
+	// the host for the definitions it may see (META_VIEW) and hands them here. The metadata
+	// namespace itself should then not be among Namespaces.
+	MetaView          func([]wire.MetaDefinition) error
 	NodeID            string
 	PeerURI           string
 	ConnectionContext auth.ConnectionContext
@@ -106,6 +111,8 @@ type V2Result struct {
 	// Protocol is 2, or 1 when the peer only speaks v1 and the sync fell back to it.
 	Protocol   int
 	Namespaces []NamespaceSyncResult
+	// MetaDefinitions counts the definitions a scoped session received (V2ClientConfig.MetaView).
+	MetaDefinitions int
 }
 
 // ClientCapabilities are what a v2 client of this build can do.
@@ -151,6 +158,20 @@ func SyncV2(w wire.Codec, transport stream.Transport, cfg V2ClientConfig) (V2Res
 	out := V2Result{RemoteNodeID: ack.NodeID, Protocol: wire.SyncProtocolVersion}
 	c.remoteNode = ack.NodeID
 	c.caps = ack.Capabilities
+	if cfg.MetaView != nil && containsString(c.caps, wire.SyncCapMetaView) {
+		reply, err := c.request(wire.MetaViewMessage{H: header(wire.MsgMetaView, c.next())})
+		if err != nil {
+			return out, err
+		}
+		view, ok := reply.(wire.MetaViewResultMessage)
+		if !ok {
+			return out, NewError(fmt.Sprintf("expected META_VIEW_RESULT, got %T", reply), nil)
+		}
+		if err := cfg.MetaView(view.Definitions); err != nil {
+			return out, fmt.Errorf("peer sync: adopting the peer's definitions: %w", err)
+		}
+		out.MetaDefinitions = len(view.Definitions)
+	}
 	for _, refs := range ack.Refs {
 		out.Namespaces = append(out.Namespaces, c.syncNamespace(cfg, refs))
 	}

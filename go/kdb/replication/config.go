@@ -60,6 +60,11 @@ type PeerConfig struct {
 	// by fetching it from the source, proved against the source commit the projection is at
 	// (readthrough=true; filtered peers only).
 	ReadThrough bool
+	// ScopedMeta takes definitions from this peer as a view - the patterns, and the definitions
+	// of the namespaces this node may sync - instead of syncing the metadata namespace whole
+	// (meta=scoped). For a node that must not learn other namespaces' names; see
+	// server.MetaStore.View.
+	ScopedMeta bool
 	// Deepen fetches the history below any shallow root a synced namespace has - one bootstrapped
 	// by snapshot - from this peer after each sync, until the peer has no more (deepen=true). Such
 	// a namespace can then sync with nodes that have history of their own.
@@ -146,6 +151,14 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			p.ReadThrough = value == "true"
 		case "deepen":
 			p.Deepen = value == "true"
+		case "meta":
+			switch value {
+			case "scoped":
+				p.ScopedMeta = true
+			case "full":
+			default:
+				return PeerConfig{}, fmt.Errorf("peer %q: meta %q is not scoped or full", spec, value)
+			}
 		case "bootstrap":
 			switch value {
 			case "snapshot":

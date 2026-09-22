@@ -115,6 +115,8 @@ const (
 	MsgDocFetchResult     MessageType = 0x39
 	MsgGraftPush          MessageType = 0x3A
 	MsgGraftPushResult    MessageType = 0x3B
+	MsgMetaView           MessageType = 0x3C
+	MsgMetaViewResult     MessageType = 0x3D
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -241,6 +243,10 @@ func (t MessageType) String() string {
 		return "GRAFT_PUSH"
 	case MsgGraftPushResult:
 		return "GRAFT_PUSH_RESULT"
+	case MsgMetaView:
+		return "META_VIEW"
+	case MsgMetaViewResult:
+		return "META_VIEW_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -366,6 +372,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgGraftPush, true
 	case 0x3B:
 		return MsgGraftPushResult, true
+	case 0x3C:
+		return MsgMetaView, true
+	case 0x3D:
+		return MsgMetaViewResult, true
 	default:
 		return 0, false
 	}

@@ -40,6 +40,12 @@ type Config struct {
 	MaxBackoff time.Duration
 	// Timeout bounds each request in a sync; 0 means peersync's default.
 	Timeout time.Duration
+	// MetaNamespace names the metadata namespace (server.MetaNamespace), which a ScopedMeta peer
+	// never syncs whole whatever its patterns say.
+	MetaNamespace string
+	// MetaView adopts the definitions a ScopedMeta peer sends (server.MetaStore.AdoptView). A
+	// scoped peer's sessions do not ask for them when it is nil.
+	MetaView func(peer string, defs []wire.MetaDefinition) error
 	// Projections opens (creating if need be) the local namespace that keeps the projection of
 	// a source namespace through a filter. Required only for filtered peers.
 	Projections func(source, filter string, writeBack bool) (peersync.ProjectionTarget, error)
@@ -264,6 +270,10 @@ type peerLoop struct {
 func (l *peerLoop) namespaces() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.peer.ScopedMeta && l.r.cfg.MetaNamespace != "" {
+		// Definitions come from this peer as a view; its metadata namespace is never synced.
+		return append(append([]string(nil), l.peer.Namespaces...), "!"+l.r.cfg.MetaNamespace)
+	}
 	return l.peer.Namespaces
 }
 
@@ -367,7 +377,7 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 		ConnectionContext: l.connCx(),
 		Namespaces:        l.namespaces(), Mode: l.peer.Mode, Local: l.r.cfg.Local,
 		CreateLocal: l.peer.CreateLocal, ExtraHaves: extra, Timeout: l.r.cfg.Timeout,
-		PreferSnapshot: l.peer.PreferSnapshot,
+		PreferSnapshot: l.peer.PreferSnapshot, MetaView: l.metaView(),
 	})
 	now := time.Now().UTC()
 	st.LastAttempt = now
@@ -423,6 +433,16 @@ func (l *peerLoop) transport() stream.Transport {
 		return l.r.cfg.Transport(l.peer)
 	}
 	return defaultTransport(l.peer.Addr, l.r.cfg.TLS)
+}
+
+// metaView is the session's definitions callback: set for a ScopedMeta peer when the replicator
+// can adopt definitions.
+func (l *peerLoop) metaView() func([]wire.MetaDefinition) error {
+	if !l.peer.ScopedMeta || l.r.cfg.MetaView == nil {
+		return nil
+	}
+	name := l.peer.Name
+	return func(defs []wire.MetaDefinition) error { return l.r.cfg.MetaView(name, defs) }
 }
 
 // connCx is the credentials to connect to the peer with: from the peer's Credentials callback

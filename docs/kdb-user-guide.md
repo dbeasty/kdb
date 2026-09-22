@@ -1500,6 +1500,26 @@ for {
 - `Expect{Absent: true}` is a create that must not overwrite. A nil `Expect` is an unconditional
   replace.
 
+### Definitions by pattern, and peers that see only their own
+
+With a namespace per user or per match, one definition per namespace does not scale, and sending
+every definition to every peer leaks namespace names (which contain user ids).
+
+**Patterns.** A resolution chain or a home can be defined for a pattern:
+- `PUT /v1/ns/app%2Fu%2F*/resolution` from the control plane, or `Meta().SetResolution("app/u/*", chain)` in Go.
+- It applies to every matching namespace, open now or later.
+- A namespace's own definition overrides the pattern.
+- Among patterns, the most specific wins: more literal segments, then fewer `**`, then name order.
+
+  This is the same on every node, so chain hashes agree.
+
+**Scoped peers.** `meta=scoped` on a peer spec (`ScopedMeta` in Go) makes the node take
+definitions from that peer as a view instead of syncing `_kdb/meta` whole. The view is every
+pattern definition, plus the definitions of the namespaces this node was granted.
+- It arrives at the start of each session (`META_VIEW`), before any namespace syncs, so merges use
+  the right chain.
+- A scoped node must not also sync `_kdb/meta` whole with anyone: its copy is a subset.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.

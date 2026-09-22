@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -17,6 +18,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
+	"github.com/limidus/kdb/go/kdb/wire"
 )
 
 // MetaNamespace holds every namespace's definitions - schema and index DDL - as documents, so they
@@ -47,7 +49,14 @@ type MetaStore struct {
 	// recorded before anything reconciles, and a replicated one is applied once - so no
 	// reconciliation pass can put an older version back over a newer local one.
 	seenMu sync.Mutex
-	seen   map[codec.UUID]string
+	seen   map[seenKey]string
+}
+
+// seenKey is one definition document as applied to one namespace: a pattern definition applies to
+// many.
+type seenKey struct {
+	id codec.UUID
+	ns string
 }
 
 // metaDoc is one definition. Kind "schema" carries Schema (hex of schema.ToBytes); kind "index"
@@ -55,9 +64,11 @@ type MetaStore struct {
 // tombstone rather than a deletion, so a node reconciling knows to drop it rather than merely not
 // knowing about it.
 type metaDoc struct {
-	// id and raw are the document's id and body as stored; not part of the JSON.
-	id  codec.UUID
-	raw string
+	// id and raw are the document's id and body as stored; not part of the JSON. pattern is the
+	// pattern a definition was resolved from (effective), empty for a namespace's own.
+	id      codec.UUID
+	raw     string
+	pattern string
 
 	Kind      string            `json:"kind"`
 	Namespace string            `json:"namespace"`
@@ -73,6 +84,94 @@ type metaDoc struct {
 	Home *Home `json:"home,omitempty"`
 	// Resolution is a conflict resolution chain (kind "resolution"); no rules means none.
 	Resolution *peersync.ResolutionChain `json:"resolution,omitempty"`
+	// V is the definition format version, set only when a definition needs a newer reader than
+	// the first format: MetaFormatPatterns for a definition whose Namespace is a pattern. A node
+	// skips a definition newer than it understands rather than misapplying it; a node from
+	// before patterns ignores a pattern definition anyway, since no namespace is named "*".
+	V int `json:"v,omitempty"`
+}
+
+// Definition format versions.
+const (
+	// MetaFormatPatterns: Namespace may be a namespace pattern ("app/u/*", "app/**"), applying
+	// to every matching namespace without a definition of the same kind and name of its own.
+	MetaFormatPatterns = 2
+	metaFormatCurrent  = MetaFormatPatterns
+)
+
+// IsNamespacePattern reports whether ns is a pattern rather than one namespace's name.
+func IsNamespacePattern(ns string) bool { return strings.Contains(ns, "*") }
+
+// key is what a definition defines within a namespace: one schema, one resolution chain, one
+// home, one index per name. A namespace's own definition of a key overrides any pattern's.
+func (d metaDoc) key() string { return d.Kind + "/" + d.Name }
+
+// patternRank orders patterns that match the same namespace, most specific first, the same way
+// on every node: more literal segments, then fewer "**", then the pattern itself.
+func patternLess(a, b string) bool {
+	la, da := patternWeight(a)
+	lb, db := patternWeight(b)
+	if la != lb {
+		return la > lb
+	}
+	if da != db {
+		return da < db
+	}
+	return a < b
+}
+
+func patternWeight(p string) (literal, deep int) {
+	for _, seg := range strings.Split(p, "/") {
+		switch seg {
+		case "**":
+			deep++
+		case "*":
+		default:
+			literal++
+		}
+	}
+	return literal, deep
+}
+
+// metaIndex is the stored definitions arranged for resolution: each namespace's own, and the
+// patterns in specificity order.
+type metaIndex struct {
+	exact    map[string][]metaDoc
+	patterns []metaDoc
+}
+
+func indexDocs(docs []metaDoc) metaIndex {
+	ix := metaIndex{exact: map[string][]metaDoc{}}
+	for _, d := range docs {
+		if IsNamespacePattern(d.Namespace) {
+			ix.patterns = append(ix.patterns, d)
+		} else {
+			ix.exact[d.Namespace] = append(ix.exact[d.Namespace], d)
+		}
+	}
+	sort.SliceStable(ix.patterns, func(i, j int) bool { return patternLess(ix.patterns[i].Namespace, ix.patterns[j].Namespace) })
+	return ix
+}
+
+// effective is the definitions that apply to ns: its own, and for every key it has none of, the
+// most specific matching pattern's. The result names ns; pattern keeps where it came from.
+func (ix metaIndex) effective(ns string) []metaDoc {
+	out := append([]metaDoc(nil), ix.exact[ns]...)
+	have := map[string]bool{}
+	for _, d := range out {
+		have[d.key()] = true
+	}
+	for _, d := range ix.patterns {
+		if have[d.key()] || !peersync.MatchNamespace(d.Namespace, ns) {
+			continue
+		}
+		have[d.key()] = true
+		d.pattern = d.Namespace
+		d.Namespace = ns
+		out = append(out, d)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Kind > out[j].Kind }) // schema before index
+	return out
 }
 
 func metaSchemaID(ns string) codec.UUID { return codec.DerivedUUID("kdb:meta/schema/" + ns) }
@@ -87,7 +186,7 @@ func metaIndexID(ns, name string) codec.UUID {
 // NewMetaStore returns a store over the meta runtime, applying to the namespaces in set, and wires
 // every commit the meta namespace takes - local or replicated - to a reconciliation pass.
 func NewMetaStore(meta *KdbServerRuntime, set *NamespaceSet) *MetaStore {
-	m := &MetaStore{meta: meta, set: set, kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), seen: map[codec.UUID]string{}}
+	m := &MetaStore{meta: meta, set: set, kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), seen: map[seenKey]string{}}
 	previous := meta.CommitListener
 	meta.CommitListener = func(ns string, c document.Commit) {
 		if previous != nil {
@@ -124,11 +223,18 @@ func (m *MetaStore) loop() {
 }
 
 func (m *MetaStore) put(id codec.UUID, d metaDoc) error {
+	if IsNamespacePattern(d.Namespace) {
+		d.V = MetaFormatPatterns
+	}
 	body, err := json.Marshal(d)
 	if err != nil {
 		return err
 	}
-	m.markSeen(id, string(body))
+	if !IsNamespacePattern(d.Namespace) {
+		// A pattern definition is applied by reconciliation to every namespace it reaches; a
+		// namespace's own is applied by the caller, and must not be again.
+		m.markSeen(id, d.Namespace, string(body))
+	}
 	// Unchanged definitions write nothing: a no-op commit would still be a commit every peer
 	// then has to fetch.
 	if cur, _, found, err := m.meta.GetDocument(MetaNamespace, id); err == nil && found && cur == string(body) {
@@ -138,17 +244,17 @@ func (m *MetaStore) put(id codec.UUID, d metaDoc) error {
 	return err
 }
 
-func (m *MetaStore) markSeen(id codec.UUID, body string) {
+func (m *MetaStore) markSeen(id codec.UUID, ns, body string) {
 	m.seenMu.Lock()
-	m.seen[id] = body
+	m.seen[seenKey{id, ns}] = body
 	m.seenMu.Unlock()
 }
 
 // fresh reports whether body is a version of id this node has not yet applied or recorded.
-func (m *MetaStore) fresh(id codec.UUID, body string) bool {
+func (m *MetaStore) fresh(id codec.UUID, ns, body string) bool {
 	m.seenMu.Lock()
 	defer m.seenMu.Unlock()
-	return m.seen[id] != body
+	return m.seen[seenKey{id, ns}] != body
 }
 
 // Local runs a definition change made on this node - the change and its record together - as one
@@ -209,12 +315,32 @@ func (m *MetaStore) SetResolution(ns string, c peersync.ResolutionChain) error {
 	}
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
+	if err := validNamespaceOrPattern(ns); err != nil {
+		return err
+	}
 	d := metaDoc{Kind: "resolution", Namespace: ns, Resolution: &c}
 	if err := m.put(metaResolutionID(ns), d); err != nil {
 		return err
 	}
+	if IsNamespacePattern(ns) {
+		return m.reconcileLocked()
+	}
 	if rt, ok := m.set.Get(ns); ok {
 		m.apply(rt, d)
+	}
+	return nil
+}
+
+// validNamespaceOrPattern refuses a definition target that is neither a namespace nor a pattern
+// of one.
+func validNamespaceOrPattern(ns string) error {
+	if ns == "" || strings.HasPrefix(ns, "/") || strings.HasSuffix(ns, "/") || strings.Contains(ns, "//") {
+		return fmt.Errorf("%q is not a namespace or a namespace pattern", ns)
+	}
+	for _, seg := range strings.Split(ns, "/") {
+		if strings.Contains(seg, "*") && seg != "*" && seg != "**" {
+			return fmt.Errorf("pattern %q: a wildcard must be a whole segment (* or **)", ns)
+		}
 	}
 	return nil
 }
@@ -231,9 +357,26 @@ func (m *MetaStore) AssignHome(ns, node, addr string) (Home, error) {
 	if m == nil {
 		return Home{}, fmt.Errorf("no metadata namespace: single-home ownership needs one")
 	}
+	if err := validNamespaceOrPattern(ns); err != nil {
+		return Home{}, err
+	}
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 	h := Home{Node: node, Addr: addr, Fence: 1}
+	if IsNamespacePattern(ns) {
+		// A rule for namespaces not yet created as much as for open ones: no handover point. A
+		// namespace moved away from the rule later gets its own assignment, which overrides it.
+		if cur, _, found, err := m.meta.GetDocument(MetaNamespace, metaHomeID(ns)); err == nil && found {
+			var d metaDoc
+			if json.Unmarshal([]byte(cur), &d) == nil && d.Home != nil {
+				h.Fence = d.Home.Fence + 1
+			}
+		}
+		if err := m.put(metaHomeID(ns), metaDoc{Kind: "home", Namespace: ns, Home: &h}); err != nil {
+			return Home{}, err
+		}
+		return h, m.reconcileLocked()
+	}
 	if cur, _, found, err := m.meta.GetDocument(MetaNamespace, metaHomeID(ns)); err == nil && found {
 		var d metaDoc
 		if json.Unmarshal([]byte(cur), &d) == nil && d.Home != nil {
@@ -276,16 +419,20 @@ func (m *MetaStore) AssignHome(ns, node, addr string) (Home, error) {
 func (m *MetaStore) ReconcileAll() error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
+	return m.reconcileLocked()
+}
+
+func (m *MetaStore) reconcileLocked() error {
 	docs, err := m.docs()
 	if err != nil {
 		return err
 	}
-	for _, d := range docs {
-		rt, ok := m.set.Get(d.Namespace)
-		if !ok {
-			continue // not served here; applied if and when this process opens it (ApplyTo)
+	ix := indexDocs(docs)
+	// Namespaces not served here are applied if and when this process opens them (ApplyTo).
+	for ns, rt := range m.set.Runtimes() {
+		for _, d := range ix.effective(ns) {
+			m.apply(rt, d)
 		}
-		m.apply(rt, d)
 	}
 	return nil
 }
@@ -299,7 +446,7 @@ func (m *MetaStore) docs() ([]metaDoc, error) {
 	err = m.meta.Runtime.Storage.ScanDocuments(MetaNamespace, head.DocumentTreeHash, 256, func(batch []document.Document) error {
 		for _, d := range batch {
 			var md metaDoc
-			if json.Unmarshal([]byte(d.JSON), &md) == nil && md.Namespace != "" {
+			if json.Unmarshal([]byte(d.JSON), &md) == nil && md.Namespace != "" && md.V <= metaFormatCurrent {
 				md.id, md.raw = d.ID, d.JSON
 				docs = append(docs, md)
 			}
@@ -328,15 +475,14 @@ func (m *MetaStore) ApplyTo(rt *KdbServerRuntime) {
 	if err != nil {
 		return
 	}
-	for _, d := range docs {
-		if d.Namespace == rt.Runtime.DefaultNamespace {
-			m.apply(rt, d)
-		}
+	for _, d := range indexDocs(docs).effective(rt.Runtime.DefaultNamespace) {
+		m.apply(rt, d)
 	}
 }
 
 func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
-	if d.raw != "" && !m.fresh(d.id, d.raw) {
+	ns := rt.Runtime.DefaultNamespace
+	if d.raw != "" && !m.fresh(d.id, ns, d.raw) {
 		return
 	}
 	var err error
@@ -371,7 +517,7 @@ func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
 	}
 	_ = rt.Conflicts.Remove(peersync.ConflictID("meta-apply", d.Namespace, d.Kind, d.Name))
 	if d.raw != "" {
-		m.markSeen(d.id, d.raw)
+		m.markSeen(d.id, ns, d.raw)
 	}
 }
 
@@ -484,13 +630,23 @@ func ReadResolutionChain(meta *embed.EmbeddedKdbRuntime, ns string) (*peersync.R
 	if err != nil || !ok {
 		return nil, err
 	}
-	doc, err := meta.Storage.GetDocument(MetaNamespace, metaResolutionID(ns), head.DocumentTreeHash)
-	if err != nil || doc == nil {
+	var all []metaDoc
+	if err := meta.Storage.ScanDocuments(MetaNamespace, head.DocumentTreeHash, 256, func(batch []document.Document) error {
+		for _, doc := range batch {
+			var md metaDoc
+			if json.Unmarshal([]byte(doc.JSON), &md) == nil && md.Kind == "resolution" && md.V <= metaFormatCurrent {
+				all = append(all, md)
+			}
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	var d metaDoc
-	if err := json.Unmarshal([]byte(doc.JSON), &d); err != nil {
-		return nil, err
+	for _, e := range indexDocs(all).effective(ns) {
+		if e.Kind == "resolution" {
+			d = e
+		}
 	}
 	if d.Resolution == nil || (len(d.Resolution.Rules) == 0 && !d.Resolution.AllowUnrelated) {
 		return nil, nil
@@ -499,4 +655,58 @@ func ReadResolutionChain(meta *embed.EmbeddedKdbRuntime, ns string) (*peersync.R
 		return nil, err
 	}
 	return d.Resolution, nil
+}
+
+// View is the definitions a peer that may see only some namespaces gets instead of the whole
+// metadata namespace (a scoped peer, peersync.V2ClientConfig.MetaView): every pattern definition -
+// they name no namespace - and the definitions of the namespaces canSee admits. Sorted by id.
+func (m *MetaStore) View(canSee func(ns string) bool) ([]wire.MetaDefinition, error) {
+	if m == nil {
+		return nil, nil
+	}
+	docs, err := m.docs()
+	if err != nil {
+		return nil, err
+	}
+	var out []wire.MetaDefinition
+	for _, d := range docs {
+		if IsNamespacePattern(d.Namespace) || canSee(d.Namespace) {
+			out = append(out, wire.MetaDefinition{ID: d.id.String(), Body: d.raw})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// AdoptView records definitions a scoped peer was sent (View) into this node's metadata
+// namespace, as documents with the same ids and bodies, so they resolve and apply exactly as on
+// the node that defined them - and chain hashes agree. Only changed definitions are written, in
+// one commit; nothing is removed. A scoped node must not also sync the metadata namespace in
+// full with anyone: its copy is a subset.
+func (m *MetaStore) AdoptView(defs []wire.MetaDefinition) (int, error) {
+	if m == nil {
+		return 0, fmt.Errorf("no metadata namespace to adopt definitions into")
+	}
+	var ops []document.Op
+	for _, def := range defs {
+		id, err := codec.ParseUUID(def.ID)
+		if err != nil {
+			return 0, fmt.Errorf("definition id %q: %w", def.ID, err)
+		}
+		var md metaDoc
+		if err := json.Unmarshal([]byte(def.Body), &md); err != nil || md.Namespace == "" {
+			return 0, fmt.Errorf("definition %s is not a definition", def.ID)
+		}
+		if cur, _, found, err := m.meta.GetDocument(MetaNamespace, id); err == nil && found && cur == def.Body {
+			continue
+		}
+		ops = append(ops, document.WriteOp{DocID: id, Patch: def.Body})
+	}
+	if len(ops) == 0 {
+		return 0, nil
+	}
+	if _, err := m.meta.systemCommit(replacing(ops), "kdb:meta view"); err != nil {
+		return 0, err
+	}
+	return len(ops), m.ReconcileAll()
 }

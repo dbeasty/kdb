@@ -32,6 +32,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
+	"github.com/limidus/kdb/go/kdb/wire"
 )
 
 // Config configures a Node. The zero value is a node with no peers that still serves peers who
@@ -139,6 +140,9 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 			// configured (read-only, or writable with write-back).
 			n.projectionPeers.Store(peersync.ProjectionNamespace(p.Namespaces[0], p.Filter), *p)
 			continue // a projection carries documents only; definitions stay with the source
+		}
+		if p.ScopedMeta {
+			continue // definitions come as a view (META_VIEW); the replicator excludes the namespace
 		}
 		if len(peersync.SelectNamespaces(p.Namespaces, []string{server.MetaNamespace})) == 0 &&
 			!excludes(p.Namespaces, server.MetaNamespace) {
@@ -302,6 +306,11 @@ func (n *Node) Start() error {
 			NodeID: n.primary.NodeID.String(), Local: n.primary.PeerNamespaces(), Peers: n.peers, State: state,
 			TLS: n.cfg.TLS, Transport: n.cfg.Transport,
 			Debounce: n.cfg.Debounce, MaxBackoff: n.cfg.MaxBackoff, Timeout: n.cfg.Timeout,
+			MetaNamespace: server.MetaNamespace,
+			MetaView: func(_ string, defs []wire.MetaDefinition) error {
+				_, err := n.metaStore.AdoptView(defs)
+				return err
+			},
 			Projections: func(source, filter string, writeBack bool) (peersync.ProjectionTarget, error) {
 				rt, err := n.set.Resolve(peersync.ProjectionNamespace(source, filter), true)
 				if err != nil {

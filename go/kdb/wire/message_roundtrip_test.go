@@ -538,6 +538,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgDocFetchResult, "DOC_FETCH_RESULT"},
 		{wire.MsgGraftPush, "GRAFT_PUSH"},
 		{wire.MsgGraftPushResult, "GRAFT_PUSH_RESULT"},
+		{wire.MsgMetaView, "META_VIEW"},
+		{wire.MsgMetaViewResult, "META_VIEW_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -564,7 +566,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x3C
+const nextFreeMessageCode = 0x3E
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{
@@ -860,5 +862,16 @@ func TestGraftPushRoundTrip(t *testing.T) {
 	}).(wire.GraftPushResultMessage)
 	if !res.Grafted || res.Namespace != "app/data" {
 		t.Fatalf("round trip changed the result: %+v", res)
+	}
+}
+
+func TestMetaViewRoundTrip(t *testing.T) {
+	roundTrip(t, wire.MetaViewMessage{H: wire.Header{MessageType: wire.MsgMetaView, CorrelationID: 8}})
+	res := roundTrip(t, wire.MetaViewResultMessage{
+		H:           wire.Header{MessageType: wire.MsgMetaViewResult, CorrelationID: 8},
+		Definitions: []wire.MetaDefinition{{ID: "a", Body: `{"kind":"resolution"}`}},
+	}).(wire.MetaViewResultMessage)
+	if len(res.Definitions) != 1 || res.Definitions[0].Body != `{"kind":"resolution"}` {
+		t.Fatalf("round trip changed the view: %+v", res)
 	}
 }

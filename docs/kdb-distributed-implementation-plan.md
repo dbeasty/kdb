@@ -1170,6 +1170,25 @@ The fix is Cimbiosys-style move-out: the source sends a delete only for a docume
 
 **Tests:** replace semantics; stale, fresh and absent expectations; 8×10 concurrent read-modify-writes with retry and no lost updates; a peer merge between read and write is seen, while an unrelated one does not get in the way.
 
+### Phase 16.5 — landed (definitions by pattern, scoped meta views, G4)
+
+**Patterns:**
+- A definition's `Namespace` may be a pattern (`*` one segment, `**` any number). Pattern documents carry `"v": 2` (`MetaFormatPatterns`). A node skips definitions newer than it understands; one from before patterns never applies them, because no namespace is named `*`.
+- Resolution (`metaIndex.effective`): a namespace's own definition per key (kind and name), then the most specific matching pattern. Specificity is more literal segments, then fewer `**`, then name order.
+- Applied-state tracking is per document per namespace.
+- `SetResolution` and `AssignHome` accept patterns (a pattern home has no handover point). `ReadResolutionChain` and `Placement` resolve them too.
+
+**Scoped views:**
+- `MetaStore.View(canSee)` returns every pattern plus the definitions of the namespaces `canSee` admits.
+- `META_VIEW` (0x3C/0x3D, capability `metaview`) serves it for the session's granted namespaces.
+- `V2ClientConfig.MetaView` asks for it right after hello, before any namespace syncs.
+- `PeerConfig.ScopedMeta` (`meta=scoped`): the replicator always excludes the meta namespace for that peer, whatever its patterns, and `syncnode` adopts the view (`AdoptView`: same ids and bodies, one commit, changed documents only).
+
+**Tests:**
+- specificity, overrides, namespaces opened later, pattern homes, validation;
+- the view contains nothing of another user's;
+- a scoped phone gets only the pattern, its chain hash matches the cloud's, and a divergent write merges.
+
 ### Phase 11 — landed (graft: merging unrelated histories)
 
 Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).
