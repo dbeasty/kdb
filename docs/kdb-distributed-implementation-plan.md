@@ -1247,6 +1247,28 @@ The open and close times are fsync-bound on macOS.
 - the dark phone's offline write is refused by the fence when it returns;
 - a request for another node, or to a node without a policy, is refused.
 
+### Phase 16.8 — landed (gomobile packaging, G9)
+
+- **`go/mobile/kdbsync`** is a gomobile-shaped facade: strings, bools and errors only. It wraps a file host plus `syncnode`:
+  - `Open`, `AddPeer` (a refreshable token via `SetToken`; `meta=scoped`), `Start`
+  - `AddNamespaces` / `RemoveNamespaces`, `SyncNow`
+  - `Put` (the gated `PutJSON`), `Get`
+  - `RequestHome`, `Close`
+
+  It is tested end to end against a cloud serving `Node.Handler()` over WebSocket.
+- **`syncnode.Open` now adopts the data root's identity** (its `NODE` file) when the primary still has the process default, as `kdb-service` does. Two hosts in one process, such as a device and the cloud in a test, are then two nodes.
+- **CI:**
+  - `mobile-android` (ubuntu, NDK): `gomobile bind -target=android/arm64,android/amd64`
+  - `mobile-ios` (macOS): `-target=ios`
+  - Sizes go to the job summary.
+- **Sizes measured locally:** Android arm64 `libgojni.so` is 27.4 MB (the `.aar` is 9.3 MB compressed); the iOS arm64 static framework is 35 MB (before linking into the app).
+
+**Finding:** binding `go/kdb/embed` directly, as the gap report assumed still worked, fails on main.
+- Some exported functions return three values (`NamespaceMarker`).
+- `GroupParticipant.Lock` returns a function (since f049228, the cross-namespace commit protocol).
+
+gomobile can bind neither. Mobile apps should bind a facade: `kdbsync`, or their own over `syncnode`. Reshaping `embed`'s core API for the binding tool was not done.
+
 ### Phase 11 — landed (graft: merging unrelated histories)
 
 Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).
