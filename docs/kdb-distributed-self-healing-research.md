@@ -1,6 +1,6 @@
 # Distributed KDB: self-healing, merging and partial replication — research and gap analysis
 
-Status: research and proposal. Phase 10.5 has since landed (see §5); the rest is not built.
+Status: research and proposal. Phases 10.5, 12 and 13 have since landed (see §5 and the implementation plan's progress log); Phase 11 is blocked on engine support (see its section); 14–15 are not built.
 Basis: `main` at d30efd4, which includes the distributed work (PR #78, Phases 0–10 plus 7.4 and 7.5). Every `file:line` below refers to `go/kdb/` at that commit.
 Companion docs: [kdb-distributed-plan.md](kdb-distributed-plan.md) (design, D1–D12) and [kdb-distributed-implementation-plan.md](kdb-distributed-implementation-plan.md) (phases and progress log).
 
@@ -209,7 +209,7 @@ Histories really are unrelated only when one side is **rooted at a snapshot**. T
 - **Prerequisite:** engine support for a durable non-live tree. Phase 12's `OBJECT_FETCH` and tree frames are a natural way to fetch the root's state.
 - **Known semantic limit:** with an empty base, a document one side deleted and the other still holds comes back.
 
-### Phase 12 — Tree-diff frames and object fetch
+### Phase 12 — Tree-diff frames and object fetch — landed
 
 The foundation for Phases 13 and 14.
 
@@ -220,7 +220,7 @@ The foundation for Phases 13 and 14.
   - Both are Go-only frames, recorded as such, like 0x1F–0x22.
 - **Anti-entropy:** comparing root hashes at a shared commit is one message. On a mismatch, descend only into the differing prefixes.
 
-### Phase 13 — Scrub and self-repair
+### Phase 13 — Scrub and self-repair — landed (live tree; see the progress log for what is not)
 
 - **Scrub pass** in the existing `embed.MaintenanceScheduler`: re-hash stored bodies and materialised tree nodes at a bounded rate.
 - **On a mismatch:** quarantine the object, `OBJECT_FETCH` it by content hash from the configured peers, verify it, rewrite it. The peer need not be trusted.

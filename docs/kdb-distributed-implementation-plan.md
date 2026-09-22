@@ -913,3 +913,38 @@ These come from the research survey and gap analysis in [kdb-distributed-self-he
 
 **Not built:** node labels for `source-priority` (would need label assignments covered by the chain hash to stay deterministic), and an embedded-Go convenience beyond `ConflictQueue.OnRecord` plus the async API.
 
+### Phases 12–13 — landed (anti-entropy frames, scrub and self-repair)
+
+**Merkle views.** `DocumentTree.Node(prefix, limit)` gives the trie's subtree hash, 16 child hashes and small-subtree entries. Compressed leaves are folded, so the hashes are exactly the tree hash's own. `document.DiffTrees` finds the documents two node sources hold differently, one batched round trip per level.
+
+**Wire (Go-only).** `TREE_NODES`, `OBJECT_FETCH` and their results (0x34–0x37), behind a `repair` capability. `peersync.RepairSession` provides `Nodes`, `Diff` and `Fetch`. Fetch returns only bodies that hash to what was asked for.
+
+**Scrub.** `server.Scrub(BodyFetcher)` walks the head's tree, verifies every body, fetches damaged ones through `Replicator.FetchBodies` (the peers, in order), and rewrites them in one `kdb:repair/1` commit. The tree is unchanged. What can't be repaired becomes a `damaged` queue entry.
+
+**Surfaces:**
+- service: `--scrub-interval`
+- control: `POST /v1/ns/{ns}/scrub`, `GET /v1/ns/{ns}/peers/{peer}/diff`
+- CLI: `kdb scrub`, `kdb peer-diff`
+
+**A durability bug found by the scrub tests.** A byte flipped in the middle of a delta segment made the next open **silently roll the namespace back** past the damage, and the next close checkpointed the loss. The chain of steps:
+1. The segment's listing stops at the damaged frame, so the checkpoint looked stale.
+2. The full replay treated the newest-segment damage as a torn tail and stopped there.
+
+The fix, in `checkpointMatchesLog`: damage in place is told apart from a replaced or truncated log using the physical size and the last intact commit, read past the damage with `delta.ScanSkippingCorrupt` / `storage.DamageTolerantReader`. The checkpoint is then kept. The cold loader also indexes past damaged frames, so damage costs only its own frame's bodies.
+
+**Kotlin had the same bug.** Kotlin replay now refuses newest-segment damage that intact frames follow (`CorruptFrameException.intactFramesAfter`).
+
+**Tests:**
+- trie diff against a brute-force diff;
+- frame round trips;
+- real on-disk corruption repaired from a peer and durable across restarts;
+- a forged body refused;
+- CLI and control plane;
+- a Python e2e with a real service repairing itself on a schedule;
+- Kotlin: a scanner unit test, and interop tests that Kotlin refuses a damaged newest segment rather than rolling back, and that on a Go-repaired log it serves exact values or refuses.
+
+**Not built:**
+- live-tree-vs-declared-root checking (the engine resolves trees by hash, so a mismatch has no reachable cause today);
+- repair of damaged *historical* versions (only the live tree is scrubbed);
+- Kotlin opening from checkpoints, which is what would let it read a Go-repaired log.
+

@@ -1395,6 +1395,47 @@ Other namespaces keep the old rule, where commit rights are enough.
 - The Go CLI's `kdb sync` and `kdb resolve` read the chain from the data directory's `_kdb/meta`.
 - `kdb resolution <ns>` shows the chain.
 
+### Self-repair: scrub, and comparing with a peer
+
+A **scrub** re-reads every live document and checks its body against the content hash the
+namespace's tree records. If a body can't be read or doesn't match (bit rot, a bad sector), the
+scrub fetches it by content hash from a peer, verifies it, and writes it back in a `kdb:repair/1`
+commit.
+- The content is the same, so the tree doesn't change and peers see a commit that changes nothing
+  for them.
+- The peer needn't be trusted: a body that doesn't hash to what the tree names is refused.
+- A document no peer can supply stays as a `damaged` entry in the conflict queue. The next clean
+  scrub clears it.
+
+Running a scrub:
+- **On a schedule:** `--scrub-interval 24h` scrubs every namespace, repairing from the `--peer`
+  nodes. A scrub reads every body, so scale the interval to the data.
+- **On demand:** `POST /v1/ns/{ns}/scrub` returns the report: 200 when clean, 409 when damage is
+  left. `{"repair": false}` only reports.
+- **From the command line:**
+
+```bash
+kdb --data-dir /var/lib/kdb scrub site/berlin/orders --peer tcp://hub:7401
+```
+
+It exits 3 when damage is left.
+
+**Comparing with a peer.** `GET /v1/ns/{ns}/peers/{peer}/diff`, or
+`kdb peer-diff <ns> <peer-addr>`, lists the documents two nodes hold differently. It compares subtree
+hashes of the two trees, not documents, so equal trees cost one round trip and each level of
+difference one more.
+
+**A damaged log keeps its history.** A frame damaged in the middle of the delta log used to make
+the next open drop every commit after it. Open now recognizes damage in place: the file is its
+recorded length and its intact frames still end at the checkpoint's commit. It then opens from
+the checkpoint, logs which frames are damaged, and only the bodies in those frames are unreadable
+until a scrub repairs them.
+- A log that was cut short or replaced is still distrusted, as before.
+- Kotlin, which replays without checkpoints, refuses to open such a log rather than serve less than
+  was committed.
+- A log Go has repaired still holds the damaged frame, because repair appends and never rewrites.
+  So Kotlin refuses that log too.
+
 ### Joining, catching up, and retention
 
 **Joining.** A new node either fetches a peer's whole history or, with `bootstrap=snapshot`,
