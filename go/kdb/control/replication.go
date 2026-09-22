@@ -7,6 +7,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/replication"
 	"github.com/limidus/kdb/go/kdb/server"
@@ -249,4 +250,89 @@ func (s *Server) handlePlacement(w http.ResponseWriter, _ *http.Request, _ auth.
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"homes": homes})
+}
+
+// RepairSource is what the scrub and compare endpoints need from the replicator: bodies from the
+// configured peers, and a Merkle comparison with one of them. The service's replicator implements
+// it; a process without peers answers these endpoints as having none.
+type RepairSource interface {
+	FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, treeHex string) (map[codec.UUID]string, error)
+	Compare(name, ns string, local document.DocumentTree) (string, []document.TreeDifference, error)
+}
+
+func (s *Server) repairSource() RepairSource {
+	if s.opts.Replication == nil {
+		return nil
+	}
+	rs, _ := s.opts.Replication.(RepairSource)
+	return rs
+}
+
+// POST /v1/ns/{ns}/scrub - re-read and verify every document at the head, repairing damaged bodies
+// from the configured peers ({"repair": false} only reports). Answers the ScrubReport; 200 when
+// nothing is left damaged, 409 when something is.
+func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request, _ auth.Principal, _ string, rt *serverRuntime) {
+	var body struct {
+		Repair *bool `json:"repair"`
+	}
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	}
+	var fetch server.BodyFetcher
+	if rs := s.repairSource(); rs != nil && (body.Repair == nil || *body.Repair) {
+		fetch = rs.FetchBodies
+	}
+	rep, err := rt.Scrub(fetch)
+	switch {
+	case server.IsScrubUnrepaired(err):
+		writeJSON(w, http.StatusConflict, rep)
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+	default:
+		writeJSON(w, http.StatusOK, rep)
+	}
+}
+
+// GET /v1/ns/{ns}/peers/{peer}/diff - the documents this node holds differently from the named
+// replication peer's head, found by comparing subtree hashes rather than documents.
+func (s *Server) handlePeerDiff(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	rs := s.repairSource()
+	if rs == nil {
+		writeError(w, http.StatusConflict, "no_peers", "no replication peers are configured")
+		return
+	}
+	peer := r.PathValue("peer")
+	local, err := rt.HeadTree()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	peerTree, diff, err := rs.Compare(peer, ns, local)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "peer_unavailable", err.Error())
+		return
+	}
+	type row struct {
+		DocumentID string `json:"documentId"`
+		Local      string `json:"local,omitempty"`
+		Remote     string `json:"remote,omitempty"`
+	}
+	rows := make([]row, 0, len(diff))
+	for _, d := range diff {
+		r := row{DocumentID: d.DocID.String()}
+		if d.Local != (codec.Hash{}) {
+			r.Local = d.Local.Hex()
+		}
+		if d.Remote != (codec.Hash{}) {
+			r.Remote = d.Remote.Hex()
+		}
+		rows = append(rows, r)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"namespace": ns, "peer": peer, "localTree": local.TreeHash.Hex(), "peerTree": peerTree,
+		"equal": len(rows) == 0, "differences": rows,
+	})
 }

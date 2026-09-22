@@ -12,6 +12,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -467,4 +468,24 @@ func (r *Replicator) FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, tr
 		return out, lastErr
 	}
 	return out, nil
+}
+
+// Compare finds the documents this node's local tree holds differently from peer name's head for
+// namespace ns, by Merkle diff (peersync.RepairSession.Diff). It returns the peer's tree compared
+// against.
+func (r *Replicator) Compare(name, ns string, local document.DocumentTree) (string, []document.TreeDifference, error) {
+	l, ok := r.loops[name]
+	if !ok {
+		return "", nil, fmt.Errorf("replication: no peer %q", name)
+	}
+	s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
+		NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
+		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+		Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	defer s.Close()
+	return s.Diff(ns, local, "")
 }

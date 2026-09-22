@@ -65,6 +65,8 @@ Commands:
   resolve <namespace> <conflict-id> --take local|remote
   resolve <namespace> --all --take local|remote [--kind K] [--peer NODE] [--origin NODE] [--dry-run]
   resolution <namespace>
+  scrub <namespace> [--peer ADDR] [--user U --password-env VAR]
+  peer-diff <namespace> <peer-addr> [--user U --password-env VAR]
 
 A REV is a revision: head, head~10, head^, a commit hash, <hash>~2,
 tag:NAME, branch:NAME, or any of those with ~N appended.`)

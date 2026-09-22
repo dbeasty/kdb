@@ -53,6 +53,7 @@ func Main() {
 	var peerConflictPolicy string
 	var conflictWebhook, conflictWebhookSecret string
 	var conflictWebhookInterval time.Duration
+	var scrubInterval time.Duration
 	var streamAllowAnonymous bool
 	var peerSpecs []string
 	var peerCreateNamespaces bool
@@ -72,6 +73,7 @@ func Main() {
 	fs.StringVar(&conflictWebhook, "conflict-webhook", "", "URL to POST conflicts to when a namespace's resolution chain hands them to a resolver authority (and names this node, or no node). Each is retried until answered with 2xx")
 	fs.StringVar(&conflictWebhookSecret, "conflict-webhook-secret", os.Getenv("KDB_CONFLICT_WEBHOOK_SECRET"), "HMAC-SHA256 key signing each conflict webhook body (X-KDB-Signature: sha256=<hex>); defaults to $KDB_CONFLICT_WEBHOOK_SECRET")
 	fs.DurationVar(&conflictWebhookInterval, "conflict-webhook-interval", 10*time.Second, "how often undelivered conflicts are retried to --conflict-webhook")
+	fs.DurationVar(&scrubInterval, "scrub-interval", 0, "how often to scrub every namespace: re-read and verify every live document against its content hash, repairing damaged ones from the --peer nodes by content hash (they need not be trusted). Reads every body, so scale it to the data - daily is typical. 0 disables; POST /v1/ns/{ns}/scrub runs one on demand")
 	fs.BoolVar(&streamAllowAnonymous, "stream-allow-anonymous", false, "accept stream (--stream-addr) subscribers without credentials, as every subscriber was before the stream handshake authenticated. Under --rbac this lets anyone read every commit in the namespace; without --rbac credentials are not checked anyway, so this changes nothing")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
 	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
@@ -844,6 +846,39 @@ func Main() {
 		replicationStatus = fmt.Sprintf("%d peer(s)", len(peers))
 	}
 
+	// Stopped with replication at shutdown, waiting for a pass in flight: a scrub that repairs is
+	// a writer.
+	stopScrub, scrubDone := make(chan struct{}), make(chan struct{})
+	if scrubInterval <= 0 {
+		close(scrubDone)
+	} else {
+		go func() {
+			defer close(scrubDone)
+			t := time.NewTicker(scrubInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-stopScrub:
+					return
+				case <-t.C:
+				}
+				var fetch server.BodyFetcher
+				if r := replicatorRef.Load(); r != nil {
+					fetch = r.FetchBodies
+				}
+				for ns, rt := range nsSet.Runtimes() {
+					rep, err := rt.Scrub(fetch)
+					switch {
+					case err != nil:
+						slog.Warn("scrub found damage it could not repair", "namespace", ns, "damaged", len(rep.Damaged), "repaired", len(rep.Repaired), "error", err)
+					case len(rep.Repaired) > 0:
+						slog.Info("scrub repaired damaged documents from peers", "namespace", ns, "repaired", len(rep.Repaired), "commit", rep.RepairCommit)
+					}
+				}
+			}
+		}()
+	}
+
 	build := version.Get()
 	slog.Info("KDB service started",
 		"version", build.Version,
@@ -899,7 +934,10 @@ func Main() {
 	if admin != nil {
 		admin.SetReady(false, "draining")
 	}
-	// Replication first: a sync in flight is a writer, and Stop waits for it to finish.
+	// Replication first: a sync in flight is a writer, and Stop waits for it to finish. The
+	// scrub loop likewise.
+	close(stopScrub)
+	<-scrubDone
 	if replicator != nil {
 		replicator.Stop()
 	}
@@ -1158,6 +1196,20 @@ func (l lazyReplication) SyncNow(name string) (peersync.V2Result, error) {
 		return r.SyncNow(name)
 	}
 	return peersync.V2Result{}, fmt.Errorf("no replication peers are configured")
+}
+
+func (l lazyReplication) FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, treeHex string) (map[codec.UUID]string, error) {
+	if r := l.ref.Load(); r != nil {
+		return r.FetchBodies(ns, wanted, treeHex)
+	}
+	return nil, fmt.Errorf("no replication peers are configured")
+}
+
+func (l lazyReplication) Compare(name, ns string, local document.DocumentTree) (string, []document.TreeDifference, error) {
+	if r := l.ref.Load(); r != nil {
+		return r.Compare(name, ns, local)
+	}
+	return "", nil, fmt.Errorf("no replication peers are configured")
 }
 
 func containsExclusion(patterns []string, ns string) bool {

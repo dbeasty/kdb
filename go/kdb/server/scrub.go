@@ -209,3 +209,31 @@ func bodyMatches(d *document.Document, want codec.Hash) bool {
 	h, err := d.ContentHash()
 	return err == nil && h == want
 }
+
+// HeadTree is the document tree at the namespace's main head.
+func (s *KdbServerRuntime) HeadTree() (document.DocumentTree, error) {
+	_, head, ok, err := s.dag.HeadCommit()
+	if err != nil {
+		return document.DocumentTree{}, err
+	}
+	if !ok {
+		return document.DocumentTree{}, errors.New("namespace has no head")
+	}
+	if r, ok := s.Runtime.Storage.(storage.TreeResolver); ok {
+		if t, found, err := r.TreeAt(head.DocumentTreeHash); err != nil || found {
+			return t, err
+		}
+	}
+	w, ok := s.Runtime.Storage.(storage.TreeWalker)
+	if !ok {
+		return document.DocumentTree{}, errors.New("storage cannot resolve trees")
+	}
+	entries := map[codec.UUID]codec.Hash{}
+	if err := w.WalkTree(s.Runtime.DefaultNamespace, head.DocumentTreeHash, func(id codec.UUID, h codec.Hash) bool {
+		entries[id] = h
+		return true
+	}); err != nil {
+		return document.DocumentTree{}, err
+	}
+	return document.BuildDocumentTree(entries)
+}
