@@ -194,6 +194,8 @@ type conflictSides struct {
 // chainOutcome is what a chain made of one document.
 type chainOutcome struct {
 	winner *string
+	// fork, when set, is the extra document that keeps the side winner displaced.
+	fork *ForkDoc
 	// decided: winner is the merged value. provisional additionally marks it as the authority's
 	// to overrule.
 	decided, provisional bool

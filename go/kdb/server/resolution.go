@@ -83,12 +83,30 @@ func (s *KdbServerRuntime) resolveProvisional(e peersync.ConflictEntry, choices 
 		}
 		c, ok := choices[id]
 		var body *string
+		var fork *peersync.ForkDoc
 		switch {
 		case !ok:
 			undecided = append(undecided, it.DocumentID)
 			continue
 		case c.Body != nil:
 			body = c.Body
+		case c.Delete:
+			body = nil
+		case c.Fork != nil:
+			keep, losing := it.LocalDoc, it.IncomingDoc
+			if c.Fork.Keep == "remote" {
+				keep, losing = it.IncomingDoc, it.LocalDoc
+			} else if c.Fork.Keep != "local" {
+				undecided = append(undecided, it.DocumentID)
+				continue
+			}
+			f, ok := peersync.ForkOf(id, losing, codec.Hash{})
+			if !ok {
+				// Nothing to fork: the losing side deleted the document, or is not an object.
+				undecided = append(undecided, it.DocumentID)
+				continue
+			}
+			body, fork = keep, f
 		case c.Take == "local":
 			body = it.LocalDoc
 		case c.Take == "remote":
@@ -109,6 +127,9 @@ func (s *KdbServerRuntime) resolveProvisional(e peersync.ConflictEntry, choices 
 			ops = append(ops, document.DeleteOp{DocID: id})
 		} else {
 			ops = append(ops, document.DeleteOp{DocID: id}, document.WriteOp{DocID: id, Patch: *body})
+		}
+		if fork != nil {
+			ops = append(ops, document.WriteOp{DocID: fork.ID, Patch: fork.Body})
 		}
 	}
 	if len(undecided) > 0 {
