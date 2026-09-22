@@ -681,3 +681,41 @@ type lockOnlyNode struct{}
 
 func (lockOnlyNode) Exclusive(fn func() error) error { return fn() }
 func (lockOnlyNode) Advanced(AdvanceStep) error      { return nil }
+
+// unsharedRoot reports the commit in page that failed to store because it is one of the peer's
+// shallow roots whose parents this node does not hold: the page reached the bottom of a history
+// the peer itself received as a snapshot.
+func unsharedRoot(env IngestEnv, page []document.Commit, shallow []string) (codec.Hash, bool) {
+	roots := map[string]bool{}
+	for _, h := range shallow {
+		roots[h] = true
+	}
+	for _, c := range page {
+		if !roots[c.Hash.Hex()] || env.DAG.HasCommit(c.Hash) {
+			continue
+		}
+		for _, p := range c.ParentHashes {
+			if !env.DAG.HasCommit(p) {
+				return c.Hash, true
+			}
+		}
+	}
+	return codec.Hash{}, false
+}
+
+// noteUnrelated records that this namespace cannot sync with the peer because of root, and
+// returns the typed error for the sync result.
+func (env IngestEnv) noteUnrelated(root codec.Hash, cause error) error {
+	e := &UnrelatedHistoryError{Namespace: env.NamespaceID, Root: root, Cause: cause}
+	if env.Conflicts != nil {
+		peer := env.Peer
+		if peer == "" {
+			peer = "unknown"
+		}
+		_, _ = env.Conflicts.Record(ConflictEntry{
+			ID: ConflictID(ConflictUnrelatedHistory, env.NamespaceID, peer, root.Hex()), Kind: ConflictUnrelatedHistory,
+			Namespace: env.NamespaceID, Peer: env.Peer, IncomingHex: root.Hex(), Detail: e.Error(),
+		})
+	}
+	return e
+}

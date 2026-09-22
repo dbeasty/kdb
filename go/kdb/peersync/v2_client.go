@@ -219,7 +219,7 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			return err
 		}
 		if !env.DAG.HasCommit(h) {
-			if haves, err = c.fetchRef(cfg, env, remote.Namespace, h, haves, res); err != nil {
+			if haves, err = c.fetchRef(cfg, env, remote.Namespace, remote.Shallow, h, haves, res); err != nil {
 				if ref.kind == wire.RefBranch && ref.name == mainBranch {
 					return err
 				}
@@ -245,7 +245,7 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 
 // fetchRef pages in everything want needs that this node lacks, returning the haves grown by
 // what arrived.
-func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
+func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow []string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
 	for {
 		reply, err := c.request(wire.FetchRequestMessage{
 			H: header(wire.MsgFetchRequest, c.next()), Namespace: ns,
@@ -261,6 +261,9 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, want cod
 		n, err := StoreCommits(env, page.Commits, page.Stubs)
 		res.Pulled += n
 		if err != nil {
+			if root, ok := unsharedRoot(env, page.Commits, shallow); ok {
+				return haves, env.noteUnrelated(root, err)
+			}
 			return haves, err
 		}
 		tips := pageTips(page.Commits)

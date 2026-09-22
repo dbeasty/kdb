@@ -542,3 +542,49 @@ func TestAuthorityWithoutTimeoutNeverExpires(t *testing.T) {
 		t.Fatalf("nothing should expire without a timeout: %d %v", settled, err)
 	}
 }
+
+// A node with history of its own cannot yet merge with a peer whose history is rooted at a
+// snapshot it does not share (Phase 11 needs the peer's state grafted beside its own). Until then
+// the sync must say so plainly and leave a visible entry, not fail with an opaque missing parent.
+func TestSyncWithASnapshotRootedPeerIsReportedAsUnrelatedHistory(t *testing.T) {
+	a, b, c := newMetaNode(t), newMetaNode(t), newMetaNode(t)
+	for i := 0; i < 3; i++ {
+		if _, err := b.data.Upsert("app/data", mustRandomUUID(t), `{"from":"b"}`, auth.Principal{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ln, err := ListenPeerSync("tcp://127.0.0.1:0?bind=true", b.data, "app/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boot, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(core.DefaultConnectOptions()), peersync.V2ClientConfig{
+		NodeID: a.data.NodeID.String(), PeerURI: "tcp://" + ln.Addr().String(), Namespaces: []string{"app/data"},
+		Local: a.data.PeerNamespaces(), PreferSnapshot: true,
+	})
+	ln.Close()
+	if err != nil || boot.Namespaces[0].Snapshot == "" {
+		t.Fatalf("A should bootstrap from a snapshot: %+v %v", boot, err)
+	}
+	root := boot.Namespaces[0].Snapshot
+	if _, err := c.data.Upsert("app/data", mustRandomUUID(t), `{"from":"c"}`, auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := syncPatterns(t, c, a, "app/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unrelated *peersync.UnrelatedHistoryError
+	if ns := res.Namespaces[0]; !errors.As(ns.Err, &unrelated) || unrelated.Root.Hex() != root {
+		t.Fatalf("expected an unrelated-history error naming root %s, got %v", root, ns.Err)
+	}
+	var found bool
+	for _, e := range c.data.Conflicts.List() {
+		if e.Kind == peersync.ConflictUnrelatedHistory && e.IncomingHex == root {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an unrelated-history entry in C's queue: %+v", c.data.Conflicts.List())
+	}
+}

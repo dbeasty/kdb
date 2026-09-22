@@ -43,7 +43,28 @@ const (
 	// chance to overrule it. Its id is derived from the merge, so it is the same on every node,
 	// and the authority's resolution closes it everywhere it replicates.
 	ConflictProvisional ConflictKind = "provisional"
+	// ConflictUnrelatedHistory: the peer's history is rooted at a snapshot (a shallow root) this
+	// node has no ancestry for, while this node has history of its own - so none of the peer's
+	// commits can be stored here, and the namespace cannot sync with that peer. Merging the two
+	// needs the peer's state grafted beside this node's history, which is not built yet (see
+	// docs/kdb-distributed-self-healing-research.md, Phase 11).
+	ConflictUnrelatedHistory ConflictKind = "unrelated-history"
 )
+
+// UnrelatedHistoryError is a sync that cannot proceed because the peer's history is rooted at a
+// snapshot Root this node does not share - see ConflictUnrelatedHistory.
+type UnrelatedHistoryError struct {
+	Namespace string
+	Root      codec.Hash
+	Cause     error
+}
+
+func (e *UnrelatedHistoryError) Error() string {
+	return fmt.Sprintf("peer sync: %s: the peer's history is rooted at snapshot %s, which this node has no history for; "+
+		"this node's own history cannot be merged with it yet (%v)", e.Namespace, e.Root.Hex(), e.Cause)
+}
+
+func (e *UnrelatedHistoryError) Unwrap() error { return e.Cause }
 
 // resolveMessagePrefix introduces the id of the conflict entry a commit resolves, in the message
 // of the commit an authority makes to settle it. Every node that adopts such a commit closes its

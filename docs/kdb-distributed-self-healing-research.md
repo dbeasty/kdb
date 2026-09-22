@@ -196,11 +196,18 @@ Merging an unrelated database (Phase 11) turns every document that differs into 
 
 ### Phase 11 — Merge unrelated histories (import another database)
 
-- Add opt-in `AllowUnrelated` on `ResolutionOptions`. When `CommonAncestor` is nil, `resolveDivergedLocked` uses the empty tree as the base, instead of refusing.
-- A document present on one side only is adopted. A document present on both sides with different values goes through the Phase 10.5 chain.
-- The merge commit stays deterministic under the existing §3.3 rules.
-- Surface it as `kdb sync --allow-unrelated` and a control-plane namespace import. It must stay opt-in, because today's refusal also catches a genuinely missing parent.
-- Tests: two separately seeded namespaces converge to the same merge hash in either order, and a third node that syncs with both converges too.
+**Revised after investigation (2026-09-21).** The original sketch assumed that two independently created databases have no common ancestor. They do have one: genesis is a fixed commit per namespace (`dag.NewInMemoryCommitDag`), so two databases holding the same namespace already merge through the ordinary path, with the chain deciding conflicts.
+
+Histories really are unrelated only when one side is **rooted at a snapshot**. That is a node bootstrapped with `bootstrap=snapshot`, or one that caught up by snapshot after falling below a retention floor. What happens then, reproduced and now tested (`TestSyncWithASnapshotRootedPeerIsReportedAsUnrelatedHistory`):
+- **Pulling from the snapshot-rooted peer fails at storage.** Its shallow root's parents are not held here, and `StoreCommits` requires parents. So no merge is ever attempted, and the namespace cannot sync with that peer at all.
+- **What changed now:** that failure used to be an opaque "missing parent". It is now `UnrelatedHistoryError` naming the root, plus an `unrelated-history` entry in the conflict queue.
+- **The reverse direction would be mergeable** on the snapshot-rooted node, because it still holds genesis. It is deliberately not built: the other node could never fast-forward to the result, so a one-sided merge would only move the problem.
+
+**What a real fix needs** is a *graft*: admit the peer's shallow root with its full state beside this node's own history. Then merge the two heads with an empty base.
+- **Candidates must come from diffing the two head trees, not from commit ops.** Documents that exist only in the root's tree appear in no commit, so op-derived candidates would give the two nodes different merge trees.
+- **The engine can't do this safely yet.** Building and keeping a second, non-live tree is not supported: the file engine's `commitTreeLocked` always mutates the single live tree. The graft also has to be durable in the same way snapshot bootstrap is (a checkpoint plus the blob store).
+- **Prerequisite:** engine support for a durable non-live tree. Phase 12's `OBJECT_FETCH` and tree frames are a natural way to fetch the root's state.
+- **Known semantic limit:** with an empty base, a document one side deleted and the other still holds comes back.
 
 ### Phase 12 — Tree-diff frames and object fetch
 
