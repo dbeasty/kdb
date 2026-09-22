@@ -255,6 +255,13 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 				extra[ns] = append(extra[ns], h)
 			}
 		}
+		// The peer's main as of the last clean sync is a commit both sides hold, and usually the
+		// newest one: as a have it pins the merge base almost exactly. Without it the exponentially
+		// spaced haves over-send up to the local divergence - the whole shared history once the
+		// local side has diverged further than that history is long (Phase 15, M1).
+		if h, err := codec.HashFromHex(progress.RemoteMain); err == nil {
+			extra[ns] = append(extra[ns], h)
+		}
 	}
 	transport := l.transport()
 	if l.peer.Filter != "" {
@@ -435,7 +442,7 @@ func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) err
 func (r *Replicator) FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, treeHex string) (map[codec.UUID]string, error) {
 	out := map[codec.UUID]string{}
 	var lastErr error
-	for _, name := range r.order {
+	for _, name := range r.healthiestFirst() {
 		if len(out) == len(wanted) {
 			break
 		}
@@ -560,4 +567,36 @@ func (r *Replicator) OpenRepairSessionTo(name, ns string) (*peersync.RepairSessi
 		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
 		Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
 	})
+}
+
+// healthiestFirst orders the peers for a repair request: fewest consecutive failures first, then
+// the most recent success. A peer that is down is asked last rather than first, so a repair does
+// not wait out its timeout before trying one that answers. (The Phase 15 stand-in for a phi-accrual
+// detector: sync outcomes, not heartbeats, are what this replicator observes about a peer.)
+func (r *Replicator) healthiestFirst() []string {
+	type ranked struct {
+		name     string
+		failures int
+		success  time.Time
+	}
+	peers := make([]ranked, 0, len(r.order))
+	for _, name := range r.order {
+		st, err := r.cfg.State.Load(name)
+		if err != nil {
+			peers = append(peers, ranked{name: name, failures: 1 << 30})
+			continue
+		}
+		peers = append(peers, ranked{name: name, failures: st.ConsecutiveFailures, success: st.LastSuccess})
+	}
+	sort.SliceStable(peers, func(i, j int) bool {
+		if peers[i].failures != peers[j].failures {
+			return peers[i].failures < peers[j].failures
+		}
+		return peers[i].success.After(peers[j].success)
+	})
+	out := make([]string, len(peers))
+	for i, p := range peers {
+		out[i] = p.name
+	}
+	return out
 }

@@ -19,6 +19,11 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 		ms := int(busy.RetryAfter().Milliseconds())
 		return wire.ErrorCodeBusy, &ms
 	}
+	var behind *ReplicaBehindError
+	if errors.As(err, &behind) {
+		ms := int(behind.RetryAfter().Milliseconds())
+		return wire.ErrorCodeBusy, &ms
+	}
 	var unavailable *UnavailableError
 	if errors.As(err, &unavailable) {
 		return wire.ErrorCodeUnavailable, nil
