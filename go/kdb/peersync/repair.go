@@ -353,3 +353,23 @@ func (s *RepairSession) Fetch(ns string, wanted map[codec.UUID]codec.Hash, treeH
 	}
 	return out, nil
 }
+
+// RequestHome asks the peer to make this node - reachable for clients at addr - the home of ns
+// (HOME_REQUEST). force asks a node the namespace's chain names as its authority to do it without
+// the current home. The answer says whether it was granted and, if not, why and who the home is.
+func (s *RepairSession) RequestHome(ns, node, addr, reason string, force bool) (wire.HomeRequestResultMessage, error) {
+	if !containsString(s.caps, wire.SyncCapHome) {
+		return wire.HomeRequestResultMessage{}, NewError("peer sync: the peer does not take home requests", nil)
+	}
+	reply, err := s.conn.request(wire.HomeRequestMessage{
+		H: header(wire.MsgHomeRequest, s.conn.next()), Namespace: ns, Node: node, Addr: addr, Force: force, Reason: reason,
+	})
+	if err != nil {
+		return wire.HomeRequestResultMessage{}, err
+	}
+	res, ok := reply.(wire.HomeRequestResultMessage)
+	if !ok {
+		return wire.HomeRequestResultMessage{}, NewError(fmt.Sprintf("expected HOME_REQUEST_RESULT, got %T", reply), nil)
+	}
+	return res, nil
+}

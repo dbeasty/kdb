@@ -394,3 +394,20 @@ func TestMatchNamespace(t *testing.T) {
 		t.Errorf("SelectNamespaces with exclusion: %v", got)
 	}
 }
+
+// TestExtraHaveNotHeldIsNotOffered: an extra have naming a commit this node does not hold - the
+// peer's merge of this node's last push, recorded as the peer's main - must not be offered, or
+// the peer sends nothing below it and the ref cannot be adopted.
+func TestExtraHaveNotHeldIsNotOffered(t *testing.T) {
+	ns := "app/extra-have"
+	remote := newTestNamespaces(t, ns)
+	local := newTestNamespaces(t, ns)
+	writeAtHead(t, remote.side(ns), ns, newUUID(t), `{"v":1}`)
+	head := mustHead(t, remote.side(ns))
+	v2Hub(t, "hub-extra-have", newHost(remote), nil)
+	res := syncV2(t, "hub-extra-have", local, V2ClientConfig{Namespaces: []string{ns}, Mode: SyncPull,
+		ExtraHaves: map[string][]codec.Hash{ns: {head}}}) // the remote head itself, which local lacks
+	if res.Namespaces[0].Err != nil || mustHead(t, local.side(ns)) != head {
+		t.Fatalf("local should have fetched and adopted the remote head: %+v", res.Namespaces[0])
+	}
+}

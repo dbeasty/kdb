@@ -118,6 +118,15 @@ type KdbServerRuntime struct {
 	// PeerCreateOnPush lets a v2 peer push into a namespace this process does not hold yet,
 	// creating it. Off by default - see peersync.V2HostConfig.CreateOnPush.
 	PeerCreateOnPush bool
+	// PeerAuthorizeDocuments asks the auth engine about every document a peer's push writes or
+	// deletes, not only whether it may push to the namespace (peersync.V2HostConfig).
+	PeerAuthorizeDocuments bool
+	// HandoverPolicy decides peers' requests to become a namespace's home (HOME_REQUEST); nil
+	// refuses them all. See HandoverRequest.
+	HandoverPolicy HandoverPolicy
+	// lastUsed is when the namespace set last handed this runtime out, in Unix seconds - for
+	// idle close (NamespaceSet.CloseIdle).
+	lastUsed atomic.Int64
 	// NodeID is this node's identity (embed.LoadOrCreateNodeID): it authors every commit this
 	// runtime makes and names it to peers. Defaults to ProcessNodeID at construction.
 	NodeID codec.UUID

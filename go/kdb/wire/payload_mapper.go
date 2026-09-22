@@ -323,6 +323,12 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 		if env, ok, err := encodeGraftMessage(msg); ok || err != nil {
 			return env, err
 		}
+		if env, ok, err := encodeMetaViewMessage(msg); ok || err != nil {
+			return env, err
+		}
+		if env, ok, err := encodeHomeRequestMessage(msg); ok || err != nil {
+			return env, err
+		}
 		return payloadEnvelope{}, fmt.Errorf("unsupported message type")
 	}
 }
@@ -658,6 +664,12 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			return msg, err
 		}
 		if msg, ok, err := decodeGraftMessage(header, env); ok || err != nil {
+			return msg, err
+		}
+		if msg, ok, err := decodeMetaViewMessage(header, env); ok || err != nil {
+			return msg, err
+		}
+		if msg, ok, err := decodeHomeRequestMessage(header, env); ok || err != nil {
 			return msg, err
 		}
 		return nil, newDecodeError("unknown payload kind: " + env.Kind)

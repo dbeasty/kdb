@@ -9,6 +9,7 @@ package replication
 
 import (
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/auth"
 	"os"
 	"strings"
 	"time"
@@ -22,7 +23,8 @@ type PeerConfig struct {
 	// Name identifies the peer in state, metrics and the control plane. Not its node id: a peer
 	// is configured before anything is known about it.
 	Name string
-	// Addr is the peer's peer-sync listener, e.g. tcp://host:4242 or tcps://host:4242.
+	// Addr is the peer's peer-sync listener: tcp://host:4242 or tcps://host:4242, or an HTTP
+	// endpoint serving syncnode.Node.Handler - ws://host/kdb/sync or wss://host/kdb/sync.
 	Addr string
 	// Namespaces are the namespaces or patterns to sync with this peer ("!" excludes).
 	Namespaces []string
@@ -33,6 +35,14 @@ type PeerConfig struct {
 	Interval time.Duration
 	// User/Password authenticate to the peer.
 	User, Password *string
+	// Token authenticates to the peer as a bearer token (token-env=VAR). Over ws:// and wss:// it
+	// also rides the upgrade request as "Authorization: Bearer <token>", so an application
+	// mounting the peer handler behind its own HTTP auth sees it there.
+	Token *string
+	// Credentials, when set, supplies the connection's credentials afresh for every connection -
+	// a token that expires and is refreshed, say. It takes precedence over User, Password and
+	// Token. Programmatic only.
+	Credentials func() (auth.ConnectionContext, error) `json:"-"`
 	// CreateLocal lets a pull create a namespace this node does not hold yet.
 	CreateLocal bool
 	// PreferSnapshot bootstraps an empty local namespace from a snapshot of the peer's main
@@ -50,6 +60,11 @@ type PeerConfig struct {
 	// by fetching it from the source, proved against the source commit the projection is at
 	// (readthrough=true; filtered peers only).
 	ReadThrough bool
+	// ScopedMeta takes definitions from this peer as a view - the patterns, and the definitions
+	// of the namespaces this node may sync - instead of syncing the metadata namespace whole
+	// (meta=scoped). For a node that must not learn other namespaces' names; see
+	// server.MetaStore.View.
+	ScopedMeta bool
 	// Deepen fetches the history below any shallow root a synced namespace has - one bootstrapped
 	// by snapshot - from this peer after each sync, until the peer has no more (deepen=true). Such
 	// a namespace can then sync with nodes that have history of their own.
@@ -122,6 +137,12 @@ func ParsePeer(spec string) (PeerConfig, error) {
 				return PeerConfig{}, fmt.Errorf("peer %q: password-env names %s, which is not set", spec, value)
 			}
 			p.Password = &v
+		case "token-env":
+			v, ok := os.LookupEnv(value)
+			if !ok {
+				return PeerConfig{}, fmt.Errorf("peer %q: token-env names %s, which is not set", spec, value)
+			}
+			p.Token = &v
 		case "create":
 			p.CreateLocal = value == "true"
 		case "writeback":
@@ -130,6 +151,14 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			p.ReadThrough = value == "true"
 		case "deepen":
 			p.Deepen = value == "true"
+		case "meta":
+			switch value {
+			case "scoped":
+				p.ScopedMeta = true
+			case "full":
+			default:
+				return PeerConfig{}, fmt.Errorf("peer %q: meta %q is not scoped or full", spec, value)
+			}
 		case "bootstrap":
 			switch value {
 			case "snapshot":

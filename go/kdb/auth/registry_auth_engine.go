@@ -74,7 +74,12 @@ func (a registryAuthorizer) Authorize(_ context.Context, principal Principal, ac
 		return err
 	}
 	kind, resource := actionToResource(action)
-	if !PrincipalHasPermission(principal, roleGrants, kind, resource) {
+	allowed := PrincipalHasPermission(principal, roleGrants, kind, resource)
+	if !allowed && (kind == "sync_pull" || kind == "sync_push") {
+		// "sync" is both directions, so a role granted it before directions existed keeps both.
+		allowed = PrincipalHasPermission(principal, roleGrants, "sync", resource)
+	}
+	if !allowed {
 		docSuffix := ""
 		if resource.DocumentID != "" {
 			docSuffix = "/" + resource.DocumentID
@@ -99,6 +104,10 @@ func actionToResource(action Action) (kind string, resource ResourcePath) {
 		return "write", NewResourcePath(a.Namespace, "")
 	case PeerSyncAction:
 		return "sync", NewResourcePath(a.Namespace, "")
+	case PeerPullAction:
+		return "sync_pull", NewResourcePath(a.Namespace, "")
+	case PeerPushAction:
+		return "sync_push", NewResourcePath(a.Namespace, "")
 	case ConflictResolveAction:
 		return "resolve", NewResourcePath(a.Namespace, "")
 	case StreamSubscribeAction:

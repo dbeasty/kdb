@@ -1416,6 +1416,163 @@ client's read of any *other* document is answered from the source instead of "no
 Only point reads (a document by id, over the wire or the control plane) read through. Queries see
 the projection alone.
 
+### Embedding sync in your application: `syncnode`
+
+An application that embeds KDB (through `embed.Host` and its own `server.NamespaceSet`) becomes a
+sync node with `go/kdb/syncnode`, the same code `kdb-service` runs:
+
+```go
+node, err := syncnode.Open(host, set, primary, syncnode.Config{
+	Peers:   []replication.PeerConfig{{Name: "cloud", Addr: "wss://api.example.com/kdb/sync",
+		Namespaces: []string{"app/u/42"}, CreateLocal: true, Credentials: currentToken}},
+	DataDir: dataDir,
+})
+set.SetOpener(node.Opener(nil)) // or call node.Prepare(rt) from your own opener
+// ... open the namespaces you serve ...
+node.Start()
+defer node.Close()
+```
+
+- `host` may be nil: namespaces are then in memory, which is what tests use.
+- The working set can change while it runs: `node.Replicator().AddNamespaces("cloud", "app/m/7")`
+  when a user joins a match, `RemoveNamespaces` when they leave, `SetPeerNamespaces` to replace
+  the set. Progress on namespaces that stay is kept.
+- `Credentials` is called for every connection, so a token that expires can be refreshed.
+
+### Peer sync over HTTP (WebSocket)
+
+A node can serve peer sync from an HTTP server instead of a raw TCP port, on the same origin and
+certificate as its API. That is what phones behind mobile networks and captive portals need.
+
+- **In an application:** mount `node.Handler()` on your router, for example at `/kdb/sync`.
+- **In `kdb-service`:** `--peer-http 0.0.0.0:8443` serves it at `/kdb/sync`. It is plain HTTP, so
+  terminate TLS in front of it.
+- **Dialling:** peers use `addr=ws://host/kdb/sync` or `wss://host/kdb/sync`.
+- **Bearer token:** `token-env=VAR` on the peer spec, or `Token` / `Credentials` in Go. It is sent
+  as `Authorization: Bearer ...` on the upgrade request, and in the sync hello. The node's auth
+  engine authenticates from either.
+
+### Pull-only and push-only peers
+
+The auth engine can grant each direction of peer sync separately, per namespace. For example, a
+phone may pull its cloud-authored `app/u/42/ro` but never push to it.
+
+- **Registry engine (RBAC):**
+  - `sync:<ns>` is both directions, as before.
+  - `sync_pull:<ns>` grants pull only, and `sync_push:<ns>` grants push only (`GRANT sync_pull ON ...`).
+- **Custom engine:** it answers `auth.PeerSyncAction` for both directions. To limit a peer to one
+  direction, deny that action and answer `auth.PeerPullAction` or `auth.PeerPushAction`. Engines
+  that only know `PeerSyncAction` keep working unchanged.
+- **At hello:** the node tells the peer each namespace's access. The peer skips a direction it
+  isn't granted instead of failing the namespace.
+- **Every frame is checked:** fetches, snapshots and tree reads need pull; ref updates and pushed
+  grafts need push. A grant revoked mid-session takes effect on the next frame.
+- **Per-document checks:** `syncnode.Config.AuthorizePushedDocuments` also asks the engine about
+  every document a push writes or deletes (`DocumentWriteAction` / `DocumentDeleteAction`), and
+  refuses the page at the first denial.
+
+### Read-modify-write on a replicating node: `PutJSON` with a precondition
+
+On a node that syncs, peers write too: a replicated merge can land between your read and your
+write. Writing with `embed.PutJSONDocument` bypasses the server's write gate, so it can fail with
+"branch main moved", or overwrite a value it never saw. Use the runtime's gated write instead:
+
+```go
+for {
+	body, hash, found, err := rt.ReadForUpdate(ns, id)
+	// ... decide the new body from body ...
+	expect := &server.Expect{ContentHash: hash}
+	if !found {
+		expect = &server.Expect{Absent: true}
+	}
+	_, err = rt.PutJSON(ns, id, newBody, expect, principal)
+	var changed *server.PreconditionFailedError
+	if errors.As(err, &changed) {
+		continue // someone - a peer, another writer - changed it; decide again
+	}
+	break
+}
+```
+
+- `PutJSON` replaces the whole document: fields the new body leaves out are removed.
+- It goes through the same write gate as every other write, including peer ingest.
+- The precondition is checked at the front of the gate, so it holds at the instant of the commit.
+- `Expect{Absent: true}` is a create that must not overwrite. A nil `Expect` is an unconditional
+  replace.
+
+### Definitions by pattern, and peers that see only their own
+
+With a namespace per user or per match, one definition per namespace does not scale, and sending
+every definition to every peer leaks namespace names (which contain user ids).
+
+**Patterns.** A resolution chain or a home can be defined for a pattern:
+- `PUT /v1/ns/app%2Fu%2F*/resolution` from the control plane, or `Meta().SetResolution("app/u/*", chain)` in Go.
+- It applies to every matching namespace, open now or later.
+- A namespace's own definition overrides the pattern.
+- Among patterns, the most specific wins: more literal segments, then fewer `**`, then name order.
+
+  This is the same on every node, so chain hashes agree.
+
+**Scoped peers.** `meta=scoped` on a peer spec (`ScopedMeta` in Go) makes the node take
+definitions from that peer as a view instead of syncing `_kdb/meta` whole. The view is every
+pattern definition, plus the definitions of the namespaces this node was granted.
+- It arrives at the start of each session (`META_VIEW`), before any namespace syncs, so merges use
+  the right chain.
+- A scoped node must not also sync `_kdb/meta` whole with anyone: its copy is a subset.
+
+### Many namespaces: idle close
+
+Each open namespace holds about 40 KB of heap and 2 file descriptors, however little it stores. A
+process with a namespace per user or per match should close the ones nobody is using. In
+`syncnode`:
+
+```go
+syncnode.Config{Idle: &syncnode.IdleConfig{MaxOpen: 20000, IdleAfter: 30 * time.Minute}}
+```
+
+- The least recently used namespaces close first, and never while a write or sync is in flight.
+- A closed namespace is still served to peers. A write, read or sync reopens it in a few milliseconds.
+- At startup the namespaces on disk are known without being opened.
+- `node.CloseIdle(time.Now())` sheds idle namespaces at a moment of your choosing, for example when a phone app goes to the background.
+
+### Moving a namespace's home from your application
+
+A single-home namespace (only its home accepts writes) can be moved by the application itself,
+for example to resume a match on another device:
+
+- **From the current home:** `node.Handover(ns, toNode, addr)`.
+- **From the device that wants it:** `node.RequestHome(peer, ns, addr, reason, false)`. The current
+  home's `Config.HandoverPolicy` decides.
+
+  On yes, the home assigns the namespace to the requester and raises the fence. The requester
+  syncs at once and can write when the call returns. Without a policy, every request is refused.
+- **When the home is unreachable:** `RequestHome(..., force=true)` asks the node that the
+  namespace's resolution chain names as its authority (`{"kind":"authority","node":"<id>"}`).
+  That node may reassign the home without the old one.
+
+  The old home's writes made after the move are refused by the fence wherever they arrive.
+  Writes it made but never delivered are lost, which is the cost of not waiting for it.
+
+A node may only ask for itself, and only for a namespace it may push to.
+
+### On a phone: `kdbsync` (gomobile)
+
+`go/mobile/kdbsync` packages the sync node for iOS and Android. Bind it with
+`gomobile bind -target=android ./mobile/kdbsync` (or `-target=ios`). The API:
+
+```
+node = Kdbsync.open(dataDir, "app/device")
+node.addPeer("cloud", "wss://api.example.com/kdb/sync", "app/u/42", scopedMeta=true)
+node.setToken("cloud", token)   // refresh whenever the app's token changes
+node.start()
+node.put("app/u/42", "settings", "{\"theme\":\"dark\"}")
+node.addNamespaces("cloud", "app/m/7")   // joined a match
+node.requestHome("cloud", "app/m/7", "", "resume")
+```
+
+Bind `kdbsync`, or your own package over `syncnode`, rather than `go/kdb/embed` directly: embed's
+exported API includes shapes gomobile cannot bind.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.

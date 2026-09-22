@@ -71,7 +71,9 @@ func (s *KdbServerRuntime) PeerNamespaces() peersync.NamespaceProvider {
 type peerNamespaceProvider struct{ set *NamespaceSet }
 
 func (p peerNamespaceProvider) List() []string {
-	return append(p.set.Namespaces(), p.set.systemNames()...)
+	// Known, not only open: a namespace closed for idleness is still served, and reopened by the
+	// sync that reaches it.
+	return append(p.set.KnownNamespaces(), p.set.systemNames()...)
 }
 
 func (p peerNamespaceProvider) Env(ns string, create bool) (peersync.IngestEnv, error) {

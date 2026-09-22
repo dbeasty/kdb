@@ -29,6 +29,11 @@ const (
 
 // V2ClientConfig configures one v2 sync against a peer.
 type V2ClientConfig struct {
+	// MetaView, when set, makes this a scoped session for definitions: right after hello - before
+	// any namespace syncs, so resolution chains are in place for its merges - the client asks
+	// the host for the definitions it may see (META_VIEW) and hands them here. The metadata
+	// namespace itself should then not be among Namespaces.
+	MetaView          func([]wire.MetaDefinition) error
 	NodeID            string
 	PeerURI           string
 	ConnectionContext auth.ConnectionContext
@@ -72,6 +77,9 @@ type NamespaceSyncResult struct {
 	Snapshot string
 	// Grafted lists the peer's shallow roots this sync grafted in (see Graft).
 	Grafted []string
+	// Access is the peer's grant for this namespace: "" both directions, wire.AccessPull or
+	// wire.AccessPush. The direction not granted was skipped.
+	Access string
 	// LocalMain / RemoteMain are both sides' main heads when this sync finished, as far as it
 	// knows: the peer's is its advertised head, or what it reported after the last push to it.
 	LocalMain, RemoteMain string
@@ -103,6 +111,8 @@ type V2Result struct {
 	// Protocol is 2, or 1 when the peer only speaks v1 and the sync fell back to it.
 	Protocol   int
 	Namespaces []NamespaceSyncResult
+	// MetaDefinitions counts the definitions a scoped session received (V2ClientConfig.MetaView).
+	MetaDefinitions int
 }
 
 // ClientCapabilities are what a v2 client of this build can do.
@@ -148,6 +158,20 @@ func SyncV2(w wire.Codec, transport stream.Transport, cfg V2ClientConfig) (V2Res
 	out := V2Result{RemoteNodeID: ack.NodeID, Protocol: wire.SyncProtocolVersion}
 	c.remoteNode = ack.NodeID
 	c.caps = ack.Capabilities
+	if cfg.MetaView != nil && containsString(c.caps, wire.SyncCapMetaView) {
+		reply, err := c.request(wire.MetaViewMessage{H: header(wire.MsgMetaView, c.next())})
+		if err != nil {
+			return out, err
+		}
+		view, ok := reply.(wire.MetaViewResultMessage)
+		if !ok {
+			return out, NewError(fmt.Sprintf("expected META_VIEW_RESULT, got %T", reply), nil)
+		}
+		if err := cfg.MetaView(view.Definitions); err != nil {
+			return out, fmt.Errorf("peer sync: adopting the peer's definitions: %w", err)
+		}
+		out.MetaDefinitions = len(view.Definitions)
+	}
 	for _, refs := range ack.Refs {
 		out.Namespaces = append(out.Namespaces, c.syncNamespace(cfg, refs))
 	}
@@ -169,14 +193,16 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 		env.Resolution = ResolutionOptions{Policy: transaction.ConflictPolicyStrict}
 		res.ResolutionMismatch = true
 	}
-	if cfg.Mode&SyncPull != 0 {
+	res.Access = remote.Access
+	// A direction the peer does not grant is skipped, not attempted and refused.
+	if cfg.Mode&SyncPull != 0 && remote.Access != wire.AccessPush {
 		if err := c.pull(cfg, env, remote, &res); err != nil {
 			res.Err = err
 			return res
 		}
 	}
 	res.RemoteMain = remote.Branches[mainBranch]
-	if cfg.Mode&SyncPush != 0 {
+	if cfg.Mode&SyncPush != 0 && remote.Access != wire.AccessPull {
 		if err := c.push(cfg, env, remote, &res); err != nil {
 			res.Err = err
 		}
@@ -201,7 +227,15 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 		return err
 	}
 	haves := append(spreadAncestors(env.DAG, localHead), localRefHeads(env.DAG)...)
-	haves = append(haves, cfg.ExtraHaves[remote.Namespace]...)
+	// Only commits this node holds: a have tells the peer it need not send anything below it. The
+	// peer's main as of the last sync (the replicator's extra have) is not held when that sync
+	// ended with the peer merging this node's push - offering it would make the peer send
+	// nothing, and the ref could not be adopted.
+	for _, h := range cfg.ExtraHaves[remote.Namespace] {
+		if env.DAG.HasCommit(h) {
+			haves = append(haves, h)
+		}
+	}
 	// One ref at a time, main first. A ref this node cannot take - a side branch forked below
 	// the snapshot this node was bootstrapped from, whose parents no peer can send it - is
 	// recorded and skipped; it must not stop main, or every later sync of the namespace fails

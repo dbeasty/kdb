@@ -69,6 +69,10 @@ type payloadEnvelope struct {
 	DocFetchResult     *docFetchResultDto     `json:"docFetchResult,omitempty"`
 	GraftPush          *snapshotPageDto       `json:"graftPush,omitempty"`
 	GraftPushResult    *graftPushResultDto    `json:"graftPushResult,omitempty"`
+	MetaView           *metaViewDto           `json:"metaView,omitempty"`
+	MetaViewResult     *metaViewResultDto     `json:"metaViewResult,omitempty"`
+	HomeRequest        *homeRequestDto        `json:"homeRequest,omitempty"`
+	HomeRequestResult  *homeRequestResultDto  `json:"homeRequestResult,omitempty"`
 	CommitPush         *commitPushDto         `json:"commitPush,omitempty"`
 	CommitPushAck      *commitPushAckDto      `json:"commitPushAck,omitempty"`
 	DagDiff            *dagDiffDto            `json:"dagDiff,omitempty"`

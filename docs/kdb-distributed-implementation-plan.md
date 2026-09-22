@@ -500,6 +500,107 @@ The `TEST_SEEDS` env var widens the run; CI uses 20 seeds.
 
 ---
 
+## Phase 16 — Embedding sync in an application (zolik gaps G1–G9)
+
+**Source.** The zolik application embeds KDB through `embed.Host` and its own `NamespaceSet`. It needs every node (cloud, LAN server, phone) to be a sync node. Its review found nine gaps (G1–G9). Each was checked against main at 32a7c29, and the evidence held.
+
+**Partitioning.** Zolik partitions by namespace:
+- `zolik/u/<uid>` for a user's own data;
+- `zolik/u/<uid>/ro` for cloud-authored data;
+- `zolik/m/<id>` for a match.
+
+It does not use filtered projections: a projection filters one namespace on a SQL WHERE and cannot bind the filter to the caller. **Not needed:** Phase 8 partial clone, projections, 2PC.
+
+Slices, in dependency order. Each slice is one PR with its own tests.
+
+### 16.1 — `syncnode`: sync as a library (G1) and a live namespace set (G5)
+
+**G1.** `replication.New` has one caller, `service/service.go:827`. Everything a node needs is assembled inline in `service.go`:
+- the retention floor (`:423`);
+- the `MetaStore` (`:447`);
+- authority expiry (`:454`);
+- the conflict webhook (`:456`);
+- projection setup inside the opener (`:465-506`);
+- the peer listener (`:564`);
+- the replicator (`:822-835`);
+- commit notification (`:405`);
+- the scrub loop.
+
+An embedder cannot become a sync node without copying about 600 lines.
+
+The new package `go/kdb/syncnode`:
+- `Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerRuntime, cfg Config) (*Node, error)`.
+- The node owns the meta runtime and `MetaStore`, authority expiry, the conflict webhook, the peer-floor and commit-notify plumbing, projection peers, the replicator, the scrub loop and listeners.
+- `Node.Prepare(rt)` wires a runtime the application opened: commit listener, retention floor, projection settings, definitions. An application's opener calls it.
+- `Node.Opener(...)` is a default opener that does the same for embedders with nothing extra to add.
+- It exposes `Replicator()`, `Meta()`, `Conflicts(ns)`, `SyncNow(peer)`, `Listen(addr, tls)`, `Handler()` (16.2), `Start()` and `Close()`.
+- `service.go` becomes its first caller with no behaviour change. The service e2e suites are the regression gate.
+- It works on an in-memory `Host`.
+
+**G5.** The peer namespace set is fixed at start: patterns come from `Config.Peers` only. A phone's set changes as its user joins matches and signs in or out. Restarting the replicator would drop watermarks and backoff.
+- Add `Replicator.SetPeerNamespaces(peer, patterns)` and `AddNamespaces(peer, ns...)`.
+- Each peer loop reads its patterns at the start of each cycle.
+- Per-namespace state (watermarks, pending tips) is kept for namespaces that stay.
+
+### 16.2 — Peer sync over an HTTP handler (G2)
+
+The host side is TCP only (`server/peersync_listen.go:40,46`), although the client already dials WebSocket (`peersync/v2_client.go` `dial`). Phones must sync over the API's own origin on 443, behind the HTTPS load balancer, with a bearer token on the upgrade request.
+
+- `Node.Handler() http.Handler` upgrades to WebSocket and runs the same per-connection handler as the TCP listener.
+- The request's `Authorization` header (bearer or basic) goes into `auth.ConnectionContext`, so the pluggable `auth.Engine` authenticates it.
+- The application mounts it on its own router, for example at `/kdb/sync`.
+- The client's `ws://` / `wss://` peer addresses dial it, with headers on the upgrade.
+
+### 16.3 — Pull versus push authorization (G3)
+
+`auth.PeerSyncAction{Namespace}` is the only peer action. It is checked once per namespace at hello and on each frame's namespace, never per direction. A phone must pull `u/<uid>/ro` but never push to it.
+
+- Add `auth.PeerPullAction` and `auth.PeerPushAction`.
+- `PeerSyncAction` stays as "both", for compatibility and for existing policies.
+- The v2 host authorizes:
+  - pull at hello, at refs and at every read frame;
+  - push at `REF_UPDATE` and `GRAFT_PUSH`, and on the v1 host's commit push.
+- Optional per-document check: `DocumentWriteAction` on each document a push ingests, when the engine is configured to ask.
+- The registry engine maps both new actions onto its existing peer permission with a direction, so current role definitions keep working.
+
+### 16.4 — A gated, preconditioned whole-document write (G7)
+
+`embed.PutJSONDocument` bypasses the server write gate that peer ingest runs under. A replicated merge landing between an application's read and its write causes "branch main moved" errors or, worse, a write based on a pre-merge read.
+
+- `KdbServerRuntime.PutJSON(ns, id, body, Expect{ContentHash, Absent})`: whole-document swap semantics (delete and write in one transaction), through the gate.
+- It fails with a typed `PreconditionFailedError` carrying the current hash when the expectation does not hold.
+- The application retries its read-modify-write on that error.
+
+### 16.5 — Metadata by pattern, and meta sync scoped to what the peer may see (G4)
+
+`_kdb/meta` holds one document per namespace (`SetResolution`, `AssignHome`) and replicates whole to every peer. With per-user and per-match namespaces that is millions of documents, and a privacy leak: namespace names contain user ids.
+
+- **Pattern definitions:** `SetResolution("zolik/u/*", chain)`, home rules by pattern, and a per-namespace document overriding its pattern.
+- **Resolution is deterministic:** exact name first, then the most specific pattern (the longest literal prefix, then lexicographic order). Both sides of a chain-hash comparison resolve identically.
+- **Scoped meta sync:** when a peer syncs `_kdb/meta`, the host sends a per-peer *view* containing only the definitions that are patterns, or that name namespaces the peer may pull (16.3).
+- **This needs a meta format version.** Pattern documents are new document kinds. An old node ignores them, and a new node refuses to merge a chain it cannot resolve.
+
+### 16.6 — Many namespaces: idle close, and a measurement first (G6)
+
+The cloud holds about two namespaces per user plus one per match. Phones hold tens to hundreds.
+
+- **Measure first:** open latency, RSS, file descriptors and disk for 1k, 10k and 50k small namespaces (500k by extrapolation).
+- **LRU idle close in `NamespaceSet`:** a bounded number of open runtimes and an idle timeout. It closes through `Host.CloseNamespace`, never while a write, sync or transaction holds the runtime, and reopens through the opener on the next `Resolve`.
+- **Gate:** if the per-namespace cost is too high even with idle close, the fallback (finished matches folded into per-user archive namespaces) is an application decision. It is recorded, not built here.
+
+### 16.7 — Application-driven handover (G8)
+
+Phase 9 has manual handover only (control plane). Resuming a match on another device means moving its home from phone A to the cloud, or from the cloud to phone B.
+
+- `Node.Handover(ns, toNode)`: in-process, by the current home, with the fence bump the control plane does.
+- **`HOME_REQUEST` over the sync connection.** The would-be home asks the current home, and the current home's application hook (`HandoverPolicy`) approves or refuses. For zolik the hook asks whether the match is idle and the requester is a seated player. On approval the current home hands over and the requester's next pull adopts the new assignment.
+- **Forced handover:** a node the namespace's chain names as its authority may reassign the home when the current home is unreachable. The fence makes the old home's late writes unadoptable.
+
+### 16.8 — gomobile packaging (G9)
+
+- A CI job runs `gomobile bind` for Android (and for iOS on a macOS runner) on a tiny package that imports `syncnode`, `replication`, `peersync` and the WebSocket transport.
+- It records the binary size so growth is visible.
+
 ## Progress log
 
 This log is filled in as items land. Each entry gives the commit, what landed, and what deviated from this plan and why.
@@ -846,7 +947,7 @@ The fan-out tests were rewritten for coalescing: 300 commits behind a stuck subs
 
 ---
 
-## Proposed next phases (10.5, 11–15) — 10.5 in progress, the rest not started
+## Proposed next phases (10.5, 11–15) — landed (see each entry)
 
 These come from the research survey and gap analysis in [kdb-distributed-self-healing-research.md](kdb-distributed-self-healing-research.md). That document carries the rationale, the citations and the full work items. The phases are listed here so the plan shows the sequence.
 
@@ -1023,6 +1124,150 @@ The fix is Cimbiosys-style move-out: the source sends a delete only for a docume
 **Session tokens: built.** `DocumentGet.MinCommit` (wire, Go-only), `KdbServerRuntime.AwaitCommit` (bounded wait, then `ReplicaBehindError` mapped to BUSY with a retry-after), and `client.Session` with a portable `Token`/`Resume`. Read-your-writes and monotonic reads across replicas are tested end to end.
 
 **Also:** `NamespaceSyncResult.Received` counts every commit a pull received, so overshoot is observable.
+
+### Phase 16.1–16.2 — landed (syncnode, live namespace sets, peer sync over HTTP)
+
+**16.1 (G1, G5), PR #88:**
+- `go/kdb/syncnode` owns everything `service.go` assembled inline: the meta runtime and `MetaStore`, authority expiry, the webhook, the retention floor, commit notification, projection peers, the replicator, scrub and listeners.
+- `Prepare`, `Opener`, `Start`, `StopSync` and `Close` handle the lifecycle.
+- `kdb-service` is its first caller, with no behaviour change: Python e2e 44 + 8 passed.
+- `Replicator.SetPeerNamespaces`, `AddNamespaces` and `RemoveNamespaces` take effect on the next cycle and keep per-namespace progress.
+
+**16.2 (G2):**
+- `ws.Upgrade` turns a request on an application's HTTP server into a KDB WebSocket connection, with the listener's own RFC 6455 validation.
+- `server.ServePeerSyncConnection` serves peer sync on any accepted connection with its `ConnectionContext`.
+- A v2 hello without credentials authenticates from that context.
+- `Node.Handler()` maps `Authorization: Bearer|Basic` to credentials.
+- Client side:
+  - the replicator dials `ws://` / `wss://` addresses over WebSocket;
+  - `PeerConfig.Token` (`token-env=`) rides the upgrade as a bearer header and in the hello;
+  - `PeerConfig.Credentials` refreshes per connection.
+- `kdb-service --peer-http`.
+
+**Tests:**
+- `syncnode`: sync through an `httptest` server beside an API route; a missing token refused; a token only on the upgrade header; a plain GET answered with 400.
+- `test_peer_http.py`: processes, with the phone killed by `kill -9`.
+
+### Phase 16.3 — landed (pull versus push authorization, G3)
+
+- **Actions:** `auth.PeerPullAction` and `auth.PeerPushAction`.
+  - `AuthorizePeer` and `PeerDirections` treat an allowed `PeerSyncAction` as both directions, so every existing engine is unchanged. A directional engine denies it and answers the new actions.
+  - Registry kinds are `sync_pull` and `sync_push` (underscores, because the Kotlin GRANT parser reads the kind as an identifier). `sync` still grants both.
+- **v2 host:**
+  - Hello grants each namespace in either direction and records its access in `NamespaceRefs.Access` (`pull` or `push`, JSON `access`, omitted when both). The client skips the other direction instead of failing.
+  - Every frame re-authorizes its direction: fetch, snapshot, tree and object reads need pull; `REF_UPDATE` and `GRAFT_PUSH` need push; refs need either.
+- **v1 host:** `COMMIT_FETCH` needs pull and `COMMIT_PUSH` needs push. The handshake needs either.
+- **Optional per-document check:** `AuthorizeDocuments` (`syncnode.Config.AuthorizePushedDocuments`).
+
+**Tests:** grant semantics; a phone's tampered write to its read-only namespace never reaches the cloud while its own namespace still pushes; a locked document refuses its push.
+
+### Phase 16.4 — landed (gated, preconditioned whole-document write, G7)
+
+`KdbServerRuntime.PutJSON(ns, id, body, *Expect, principal)` replaces a document with Delete+Write in one transaction, through the write gate.
+- `Expect{ContentHash}` or `Expect{Absent}` is checked inside the gate, at the live head. A failure is `*PreconditionFailedError` carrying the current hash.
+- The transaction is then re-based on the live head, so a merge that touched other documents is not a conflict.
+- `ReadForUpdate` returns a document together with its content hash.
+
+**Tests:** replace semantics; stale, fresh and absent expectations; 8×10 concurrent read-modify-writes with retry and no lost updates; a peer merge between read and write is seen, while an unrelated one does not get in the way.
+
+### Phase 16.5 — landed (definitions by pattern, scoped meta views, G4)
+
+**Patterns:**
+- A definition's `Namespace` may be a pattern (`*` one segment, `**` any number). Pattern documents carry `"v": 2` (`MetaFormatPatterns`). A node skips definitions newer than it understands; one from before patterns never applies them, because no namespace is named `*`.
+- Resolution (`metaIndex.effective`): a namespace's own definition per key (kind and name), then the most specific matching pattern. Specificity is more literal segments, then fewer `**`, then name order.
+- Applied-state tracking is per document per namespace.
+- `SetResolution` and `AssignHome` accept patterns (a pattern home has no handover point). `ReadResolutionChain` and `Placement` resolve them too.
+
+**Scoped views:**
+- `MetaStore.View(canSee)` returns every pattern plus the definitions of the namespaces `canSee` admits.
+- `META_VIEW` (0x3C/0x3D, capability `metaview`) serves it for the session's granted namespaces.
+- `V2ClientConfig.MetaView` asks for it right after hello, before any namespace syncs.
+- `PeerConfig.ScopedMeta` (`meta=scoped`): the replicator always excludes the meta namespace for that peer, whatever its patterns, and `syncnode` adopts the view (`AdoptView`: same ids and bodies, one commit, changed documents only).
+
+**Tests:**
+- specificity, overrides, namespaces opened later, pattern homes, validation;
+- the view contains nothing of another user's;
+- a scoped phone gets only the pattern, its chain hash matches the cloud's, and a divergent write merges.
+
+### Phase 16.6 — landed (many namespaces: measured, then idle close, G6)
+
+**Measured** (`embed/measure_many_namespaces_test.go`, `KDB_MEASURE=1`, file host, macOS/APFS). Each namespace holds one small document:
+
+| | 1,000 | 2,000 | 5,000 |
+|---|---|---|---|
+| open + first write | 12.9 ms | 14.2 ms | 16.3 ms |
+| heap while open | 43.6 KB | 41.8 KB | 39.3 KB |
+| RSS while open | 75.5 KB | 77.9 KB | 77.6 KB |
+| file descriptors while open | 2 | 2 | 2 |
+| disk (allocated) | 8.0 KB | — | — |
+| close | 17.6 ms | 18.3 ms | 19.3 ms |
+| cold reopen | 8.0 ms | 7.6 ms | 7.6 ms |
+
+Costs per namespace are flat with count, so 500k extrapolates linearly:
+- **All open:** about 20 GB of heap and 38 GB of RSS. Not viable, so idle close is required.
+- **Cap of 20k open:** about 0.8 GB of heap.
+- **Disk:** about 4 GB.
+
+The open and close times are fsync-bound on macOS.
+
+**Found and fixed on the way: a descriptor leak.**
+- The host's byte store is shared by every namespace and kept a file handle per segment until the whole host closed. Closing 300 namespaces left 900 descriptors open, so a process that opens and closes namespaces over time would have run out.
+- Fix: `Host.CloseNamespace` now releases them (`storio.HandleReleaser`, implemented by `OSByteStore`, `PrimaryWithReplicas` and `FileBackedPlatformIO`). Descriptors after close: 0.
+- What remains after close is fixed-size (zstd encoder pools, runtime state) plus map capacity from the peak number of open namespaces: nothing per closed namespace.
+
+**Idle close:**
+- `NamespaceSet.StartIdleClose(IdlePolicy{MaxOpen, IdleAfter, MinIdle, Pinned, Close})` / `CloseIdle(policy, now)`.
+  - Least recently used first, never under `MinIdle`, never while busy (a write queued or a group publishing).
+  - The set stays aware of closed namespaces (`KnownNamespaces`), so peers are still served them, and `Resolve` reopens through the opener.
+  - `MetaStore.Forget(ns)` on close means a reopened runtime gets its definitions applied afresh.
+- `syncnode`:
+  - `Config.Idle` (a host is required) never closes the primary.
+  - At `Open` it seeds known namespaces from disk.
+  - `Node.CloseIdle(now)` runs a sweep on demand.
+
+**Gate:** per-namespace layout with idle close is viable, so the archive-folding fallback is not needed at these costs.
+
+**Tests:** LRU over the cap with pinning; age; busy left open; reopen on resolve; a file-backed cloud that closes both user namespaces, serves one to a phone by reopening it with its chain, and after a restart knows the namespaces on disk without opening them.
+
+### Phase 16.7 — landed (application-driven handover, G8)
+
+- **`HOME_REQUEST` (0x3E/0x3F, capability `home`):** the would-be home asks over the sync connection. The host requires a push grant, and the request must be for the session's own node.
+  - The current home asks `server.HandoverPolicy` (`syncnode.Config.HandoverPolicy`; nil refuses everything). The policy sees who asks, their principal, the reason and the assignment being replaced.
+  - On yes the home calls `AssignHome`, which bumps the fence and sets the handover point.
+  - A node that isn't the home refuses and names the home.
+- **Forced handover:** allowed only for the node the namespace's chain names as its authority (`Authority().Node`).
+- **API:**
+  - `syncnode.Node.Handover` and `ForceHandover` are in-process.
+  - `RequestHome` asks a peer. On a grant it syncs and reconciles definitions synchronously, so the caller can write when it returns. (Definitions arriving by sync are otherwise applied in the background, which a first version of the test caught.)
+
+**Tests:**
+- the phone is refused writes while the cloud is home;
+- the policy's refusal reaches the phone; a grant lets the phone write while the cloud is refused;
+- a second phone is told who the home is, then force-requests from the authority;
+- the dark phone's offline write is refused by the fence when it returns;
+- a request for another node, or to a node without a policy, is refused.
+
+### Phase 16.8 — landed (gomobile packaging, G9)
+
+- **`go/mobile/kdbsync`** is a gomobile-shaped facade: strings, bools and errors only. It wraps a file host plus `syncnode`:
+  - `Open`, `AddPeer` (a refreshable token via `SetToken`; `meta=scoped`), `Start`
+  - `AddNamespaces` / `RemoveNamespaces`, `SyncNow`
+  - `Put` (the gated `PutJSON`), `Get`
+  - `RequestHome`, `Close`
+
+  It is tested end to end against a cloud serving `Node.Handler()` over WebSocket.
+- **`syncnode.Open` now adopts the data root's identity** (its `NODE` file) when the primary still has the process default, as `kdb-service` does. Two hosts in one process, such as a device and the cloud in a test, are then two nodes.
+- **CI:**
+  - `mobile-android` (ubuntu, NDK): `gomobile bind -target=android/arm64,android/amd64`
+  - `mobile-ios` (macOS): `-target=ios`
+  - Sizes go to the job summary.
+- **Sizes measured locally:** Android arm64 `libgojni.so` is 27.4 MB (the `.aar` is 9.3 MB compressed); the iOS arm64 static framework is 35 MB (before linking into the app).
+
+**Finding:** binding `go/kdb/embed` directly, as the gap report assumed still worked, fails on main.
+- Some exported functions return three values (`NamespaceMarker`).
+- `GroupParticipant.Lock` returns a function (since f049228, the cross-namespace commit protocol).
+
+gomobile can bind neither. Mobile apps should bind a facade: `kdbsync`, or their own over `syncnode`. Reshaping `embed`'s core API for the binding tool was not done.
 
 ### Phase 11 — landed (graft: merging unrelated histories)
 
