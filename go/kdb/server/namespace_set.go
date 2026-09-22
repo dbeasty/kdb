@@ -106,6 +106,9 @@ type NamespaceSet struct {
 	// buys. See SetSerializedForBenchmark.
 	serializeAll bool
 	globalMu     sync.Mutex
+	// known are namespaces that exist though they may not be open: closed for idleness, or found
+	// on disk at startup (AddKnown). Peers are served these too; a sync reopens them.
+	known map[string]struct{}
 }
 
 // NewNamespaceSet returns an empty set committing through coord - a host's Transactions(). nil
@@ -179,8 +182,11 @@ func (s *NamespaceSet) SetOpener(open func(namespace string, create bool) (*KdbS
 // Get returns the runtime serving namespace, if the set holds it.
 func (s *NamespaceSet) Get(namespace string) (*KdbServerRuntime, bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	rt, ok := s.runtimes[namespace]
+	s.mu.RUnlock()
+	if ok {
+		rt.touch(time.Now())
+	}
 	return rt, ok
 }
 
@@ -231,6 +237,7 @@ func (s *NamespaceSet) Resolve(namespace string, create bool) (*KdbServerRuntime
 	if err := s.Add(rt); err != nil {
 		return nil, err
 	}
+	rt.touch(time.Now())
 	return rt, nil
 }
 

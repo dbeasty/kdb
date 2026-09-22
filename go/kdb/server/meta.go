@@ -48,15 +48,10 @@ type MetaStore struct {
 	// Reconciliation applies only a version it has not seen: a definition changed locally is
 	// recorded before anything reconciles, and a replicated one is applied once - so no
 	// reconciliation pass can put an older version back over a newer local one.
+	// Keyed by namespace, then document: a pattern definition applies to many namespaces, and a
+	// namespace closed for idleness is forgotten whole.
 	seenMu sync.Mutex
-	seen   map[seenKey]string
-}
-
-// seenKey is one definition document as applied to one namespace: a pattern definition applies to
-// many.
-type seenKey struct {
-	id codec.UUID
-	ns string
+	seen   map[string]map[codec.UUID]string
 }
 
 // metaDoc is one definition. Kind "schema" carries Schema (hex of schema.ToBytes); kind "index"
@@ -186,7 +181,7 @@ func metaIndexID(ns, name string) codec.UUID {
 // NewMetaStore returns a store over the meta runtime, applying to the namespaces in set, and wires
 // every commit the meta namespace takes - local or replicated - to a reconciliation pass.
 func NewMetaStore(meta *KdbServerRuntime, set *NamespaceSet) *MetaStore {
-	m := &MetaStore{meta: meta, set: set, kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), seen: map[seenKey]string{}}
+	m := &MetaStore{meta: meta, set: set, kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}), seen: map[string]map[codec.UUID]string{}}
 	previous := meta.CommitListener
 	meta.CommitListener = func(ns string, c document.Commit) {
 		if previous != nil {
@@ -246,7 +241,10 @@ func (m *MetaStore) put(id codec.UUID, d metaDoc) error {
 
 func (m *MetaStore) markSeen(id codec.UUID, ns, body string) {
 	m.seenMu.Lock()
-	m.seen[seenKey{id, ns}] = body
+	if m.seen[ns] == nil {
+		m.seen[ns] = map[codec.UUID]string{}
+	}
+	m.seen[ns][id] = body
 	m.seenMu.Unlock()
 }
 
@@ -254,7 +252,7 @@ func (m *MetaStore) markSeen(id codec.UUID, ns, body string) {
 func (m *MetaStore) fresh(id codec.UUID, ns, body string) bool {
 	m.seenMu.Lock()
 	defer m.seenMu.Unlock()
-	return m.seen[seenKey{id, ns}] != body
+	return m.seen[ns][id] != body
 }
 
 // Local runs a definition change made on this node - the change and its record together - as one
@@ -410,6 +408,17 @@ func (m *MetaStore) AssignHome(ns, node, addr string) (Home, error) {
 		m.apply(rt, metaDoc{Kind: "home", Namespace: ns, Home: &h})
 	}
 	return h, nil
+}
+
+// Forget drops what this store has applied to ns, for a namespace being closed: the runtime that
+// reopens it later is a new one, and must get every definition applied afresh.
+func (m *MetaStore) Forget(ns string) {
+	if m == nil {
+		return
+	}
+	m.seenMu.Lock()
+	delete(m.seen, ns)
+	m.seenMu.Unlock()
 }
 
 // ReconcileAll applies every definition the meta namespace holds to the namespaces this process

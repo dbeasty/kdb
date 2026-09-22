@@ -343,7 +343,16 @@ func (h *Host) CloseNamespace(namespaceID string) error {
 	// Before the storage close, so the namespaces that are staying get the room back at the
 	// moment it stops being used rather than at the next tick.
 	h.arbiter.Unregister(namespaceID)
-	return entry.close()
+	err := entry.close()
+	// The host's byte store is shared by every namespace and keeps a handle per segment written:
+	// without this, each namespace ever opened would hold its file descriptors and memory until
+	// the whole host closed.
+	if r, ok := h.io.(storio.HandleReleaser); ok {
+		if rerr := r.ReleaseHandles(storio.SegmentNameBuilder.NamespacePrefix(namespaceID)); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	return err
 }
 
 // Close shuts every namespace down and then releases the directory lock, in that order - a

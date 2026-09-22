@@ -251,3 +251,11 @@ func readFullSegment(store SegmentByteStore, segmentName string) ([]byte, error)
 }
 
 var _ SegmentByteStore = (*PrimaryWithReplicas)(nil)
+
+// ReleaseHandles forwards to the primary: the sinks keep no handles of their own.
+func (p *PrimaryWithReplicas) ReleaseHandles(prefix string) error {
+	if r, ok := p.primary.(HandleReleaser); ok {
+		return r.ReleaseHandles(prefix)
+	}
+	return nil
+}

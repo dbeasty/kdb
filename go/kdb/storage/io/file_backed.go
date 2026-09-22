@@ -2,6 +2,7 @@ package io
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -250,4 +251,25 @@ func (f *FileBackedPlatformIOFactory) Open(config PlatformIOConfig) (storage.Pla
 		return nil, err
 	}
 	return NewFileBackedPlatformIO(config, store), nil
+}
+
+// ReleaseHandles forgets the per-segment state kept for segments under prefix and releases the
+// store's handles for them - for a namespace that has closed (see HandleReleaser).
+func (f *FileBackedPlatformIO) ReleaseHandles(prefix string) error {
+	f.globalMu.Lock()
+	for name := range f.segmentMu {
+		if strings.HasPrefix(name, prefix) {
+			delete(f.segmentMu, name)
+		}
+	}
+	for name := range f.sealedSegments {
+		if strings.HasPrefix(name, prefix) {
+			delete(f.sealedSegments, name)
+		}
+	}
+	f.globalMu.Unlock()
+	if r, ok := f.store.(HandleReleaser); ok {
+		return r.ReleaseHandles(prefix)
+	}
+	return nil
 }

@@ -62,8 +62,23 @@ type Config struct {
 	// writes or deletes (DocumentWriteAction / DocumentDeleteAction), for engines whose rules go
 	// below the namespace. Namespace-level push rights are always checked.
 	AuthorizePushedDocuments bool
+	// Idle, when set, closes namespaces nobody has used for a while (and the least recently used
+	// beyond a cap), reopening each on its next use - for a process with a namespace per user or
+	// per match. Needs a host: an in-memory namespace closed is gone. The primary is never closed.
+	Idle *IdleConfig
 	// Debounce, MaxBackoff and Timeout tune the replicator (see replication.Config).
 	Debounce, MaxBackoff, Timeout time.Duration
+}
+
+// IdleConfig is Config.Idle; see server.IdlePolicy.
+type IdleConfig struct {
+	MaxOpen   int
+	IdleAfter time.Duration
+	MinIdle   time.Duration
+	Interval  time.Duration
+	// OnClose, when set, runs after the node has closed a namespace's storage - for whatever the
+	// application opened alongside it.
+	OnClose func(rt *server.KdbServerRuntime)
 }
 
 // Node is one sync node. Its methods are safe for concurrent use.
@@ -91,6 +106,7 @@ type Node struct {
 	hook       *server.ConflictWebhook
 	stopScrub  chan struct{}
 	scrubDone  chan struct{}
+	stopIdle   func()
 }
 
 // Open prepares primary - a runtime already in set - to sync, opens the metadata namespace and
@@ -130,6 +146,22 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	server.StartAuthorityExpiry(set, cfg.AuthorityExpiryInterval, n.stopExpiry)
 	if cfg.ConflictWebhook != nil {
 		n.hook = server.StartConflictWebhook(set, primary.NodeID.String(), cfg.ConflictWebhook)
+	}
+
+	if cfg.Idle != nil && host == nil {
+		return nil, errors.New("syncnode: idle close needs a host - an in-memory namespace closed is gone")
+	}
+	if host != nil {
+		// Every namespace on disk is served, open or not: a peer's sync opens the one it reaches.
+		if ids, err := embed.ListNamespaces(host.DataRoot()); err == nil {
+			var known []string
+			for _, id := range ids {
+				if !strings.HasPrefix(id, "_") {
+					known = append(known, id)
+				}
+			}
+			set.AddKnown(known...)
+		}
 	}
 
 	n.peers = append([]replication.PeerConfig(nil), cfg.Peers...)
@@ -326,6 +358,9 @@ func (n *Node) Start() error {
 		n.replicator.Store(r)
 		r.Start()
 	}
+	if n.cfg.Idle != nil {
+		n.stopIdle = n.set.StartIdleClose(n.idlePolicy())
+	}
 	n.stopScrub, n.scrubDone = make(chan struct{}), make(chan struct{})
 	if n.cfg.ScrubInterval <= 0 {
 		close(n.scrubDone)
@@ -333,6 +368,33 @@ func (n *Node) Start() error {
 		go n.scrubLoop()
 	}
 	return nil
+}
+
+// idlePolicy is Config.Idle as the set applies it.
+func (n *Node) idlePolicy() server.IdlePolicy {
+	ic := n.cfg.Idle
+	primaryNS := n.primary.Runtime.DefaultNamespace
+	return server.IdlePolicy{
+		MaxOpen: ic.MaxOpen, IdleAfter: ic.IdleAfter, MinIdle: ic.MinIdle, Interval: ic.Interval,
+		Pinned: func(ns string) bool { return ns == primaryNS },
+		Close: func(rt *server.KdbServerRuntime) error {
+			err := n.host.CloseNamespace(rt.Runtime.DefaultNamespace)
+			if ic.OnClose != nil {
+				ic.OnClose(rt)
+			}
+			return err
+		},
+	}
+}
+
+// CloseIdle runs one idle-close sweep now, as if at now, returning what it closed - for an
+// application that wants to shed namespaces at a moment of its choosing (backgrounded on a phone,
+// say), and for tests. Nothing without Config.Idle.
+func (n *Node) CloseIdle(now time.Time) []string {
+	if n.cfg.Idle == nil {
+		return nil
+	}
+	return n.set.CloseIdle(n.idlePolicy(), now)
 }
 
 // scrubLoop re-verifies every open namespace each interval, repairing damage from peers. It is a
@@ -435,6 +497,7 @@ func (n *Node) Close() error {
 	}
 	n.closed = true
 	listeners := n.listeners
+	stopIdle := n.stopIdle
 	var conns []stream.ConnectionHandle
 	for c := range n.conns {
 		conns = append(conns, c)
@@ -444,6 +507,9 @@ func (n *Node) Close() error {
 		_ = c.Close()
 	}
 	n.StopSync()
+	if stopIdle != nil {
+		stopIdle()
+	}
 	for _, ln := range listeners {
 		_ = ln.Close()
 	}

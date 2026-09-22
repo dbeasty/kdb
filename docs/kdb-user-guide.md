@@ -1520,6 +1520,21 @@ pattern definition, plus the definitions of the namespaces this node was granted
   the right chain.
 - A scoped node must not also sync `_kdb/meta` whole with anyone: its copy is a subset.
 
+### Many namespaces: idle close
+
+Each open namespace holds about 40 KB of heap and 2 file descriptors, however little it stores. A
+process with a namespace per user or per match should close the ones nobody is using. In
+`syncnode`:
+
+```go
+syncnode.Config{Idle: &syncnode.IdleConfig{MaxOpen: 20000, IdleAfter: 30 * time.Minute}}
+```
+
+- The least recently used namespaces close first, and never while a write or sync is in flight.
+- A closed namespace is still served to peers. A write, read or sync reopens it in a few milliseconds.
+- At startup the namespaces on disk are known without being opened.
+- `node.CloseIdle(time.Now())` sheds idle namespaces at a moment of your choosing, for example when a phone app goes to the background.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.

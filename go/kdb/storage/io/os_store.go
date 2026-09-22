@@ -381,3 +381,31 @@ func (s *OSByteStore) DeleteSnapshot(key string) error {
 	}
 	return nil
 }
+
+// HandleReleaser is implemented by stores that keep a file handle per segment they have written:
+// ReleaseHandles closes and forgets those under prefix. A host sharing one store across many
+// namespaces calls it when it closes one, or every namespace ever opened would keep its handles -
+// file descriptors and memory - until the whole host closed.
+type HandleReleaser interface {
+	ReleaseHandles(prefix string) error
+}
+
+// ReleaseHandles implements HandleReleaser. A segment appended to again later is reopened.
+func (s *OSByteStore) ReleaseHandles(prefix string) error {
+	s.mu.Lock()
+	var release []*openSegment
+	for name, seg := range s.handles {
+		if strings.HasPrefix(name, prefix) {
+			release = append(release, seg)
+			delete(s.handles, name)
+		}
+	}
+	s.mu.Unlock()
+	var firstErr error
+	for _, seg := range release {
+		if err := seg.file.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}

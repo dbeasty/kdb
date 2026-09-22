@@ -1189,6 +1189,46 @@ The fix is Cimbiosys-style move-out: the source sends a delete only for a docume
 - the view contains nothing of another user's;
 - a scoped phone gets only the pattern, its chain hash matches the cloud's, and a divergent write merges.
 
+### Phase 16.6 — landed (many namespaces: measured, then idle close, G6)
+
+**Measured** (`embed/measure_many_namespaces_test.go`, `KDB_MEASURE=1`, file host, macOS/APFS). Each namespace holds one small document:
+
+| | 1,000 | 2,000 | 5,000 |
+|---|---|---|---|
+| open + first write | 12.9 ms | 14.2 ms | 16.3 ms |
+| heap while open | 43.6 KB | 41.8 KB | 39.3 KB |
+| RSS while open | 75.5 KB | 77.9 KB | 77.6 KB |
+| file descriptors while open | 2 | 2 | 2 |
+| disk (allocated) | 8.0 KB | — | — |
+| close | 17.6 ms | 18.3 ms | 19.3 ms |
+| cold reopen | 8.0 ms | 7.6 ms | 7.6 ms |
+
+Costs per namespace are flat with count, so 500k extrapolates linearly:
+- **All open:** about 20 GB of heap and 38 GB of RSS. Not viable, so idle close is required.
+- **Cap of 20k open:** about 0.8 GB of heap.
+- **Disk:** about 4 GB.
+
+The open and close times are fsync-bound on macOS.
+
+**Found and fixed on the way: a descriptor leak.**
+- The host's byte store is shared by every namespace and kept a file handle per segment until the whole host closed. Closing 300 namespaces left 900 descriptors open, so a process that opens and closes namespaces over time would have run out.
+- Fix: `Host.CloseNamespace` now releases them (`storio.HandleReleaser`, implemented by `OSByteStore`, `PrimaryWithReplicas` and `FileBackedPlatformIO`). Descriptors after close: 0.
+- What remains after close is fixed-size (zstd encoder pools, runtime state) plus map capacity from the peak number of open namespaces: nothing per closed namespace.
+
+**Idle close:**
+- `NamespaceSet.StartIdleClose(IdlePolicy{MaxOpen, IdleAfter, MinIdle, Pinned, Close})` / `CloseIdle(policy, now)`.
+  - Least recently used first, never under `MinIdle`, never while busy (a write queued or a group publishing).
+  - The set stays aware of closed namespaces (`KnownNamespaces`), so peers are still served them, and `Resolve` reopens through the opener.
+  - `MetaStore.Forget(ns)` on close means a reopened runtime gets its definitions applied afresh.
+- `syncnode`:
+  - `Config.Idle` (a host is required) never closes the primary.
+  - At `Open` it seeds known namespaces from disk.
+  - `Node.CloseIdle(now)` runs a sweep on demand.
+
+**Gate:** per-namespace layout with idle close is viable, so the archive-folding fallback is not needed at these costs.
+
+**Tests:** LRU over the cap with pinning; age; busy left open; reopen on resolve; a file-backed cloud that closes both user namespaces, serves one to a phone by reopening it with its chain, and after a restart knows the namespaces on disk without opening them.
+
 ### Phase 11 — landed (graft: merging unrelated histories)
 
 Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).
