@@ -108,10 +108,94 @@ func (r *Replicator) Stop() {
 func (r *Replicator) OnLocalCommit(ns string) {
 	for _, name := range r.order {
 		l := r.loops[name]
-		if len(peersync.SelectNamespaces(l.peer.Namespaces, []string{ns})) == 1 {
+		if len(peersync.SelectNamespaces(l.namespaces(), []string{ns})) == 1 {
 			l.kick()
 		}
 	}
+}
+
+// SetPeerNamespaces replaces the namespace patterns synced with the named peer, while the
+// replicator runs: the peer's next cycle - started now - syncs the new set. Progress recorded for
+// namespaces that stay in the set is kept, so nothing is re-sent from scratch. How an application
+// whose working set changes at runtime (a user signing in, joining a match) follows it without
+// restarting replication and losing every peer's watermarks and backoff.
+func (r *Replicator) SetPeerNamespaces(name string, patterns []string) error {
+	l, ok := r.loops[name]
+	if !ok {
+		return fmt.Errorf("replication: no peer named %q", name)
+	}
+	if len(patterns) == 0 {
+		return fmt.Errorf("replication: peer %q needs at least one namespace pattern", name)
+	}
+	if l.peer.Filter != "" {
+		return fmt.Errorf("replication: peer %q is filtered; its source namespace is fixed", name)
+	}
+	l.mu.Lock()
+	l.peer.Namespaces = append([]string(nil), patterns...)
+	l.mu.Unlock()
+	l.kick()
+	return nil
+}
+
+// AddNamespaces adds namespaces (or patterns) to those synced with the named peer, skipping any
+// the peer's patterns already select, and syncs soon.
+func (r *Replicator) AddNamespaces(name string, namespaces ...string) error {
+	l, ok := r.loops[name]
+	if !ok {
+		return fmt.Errorf("replication: no peer named %q", name)
+	}
+	if l.peer.Filter != "" {
+		return fmt.Errorf("replication: peer %q is filtered; its source namespace is fixed", name)
+	}
+	l.mu.Lock()
+	added := false
+	for _, ns := range namespaces {
+		if len(peersync.SelectNamespaces(l.peer.Namespaces, []string{ns})) == 1 || containsString(l.peer.Namespaces, ns) {
+			continue
+		}
+		l.peer.Namespaces = append(append([]string(nil), l.peer.Namespaces...), ns)
+		added = true
+	}
+	l.mu.Unlock()
+	if added {
+		l.kick()
+	}
+	return nil
+}
+
+// RemoveNamespaces stops syncing namespaces (exact patterns, as added) with the named peer. What
+// was synced stays local; only replication of it stops.
+func (r *Replicator) RemoveNamespaces(name string, namespaces ...string) error {
+	l, ok := r.loops[name]
+	if !ok {
+		return fmt.Errorf("replication: no peer named %q", name)
+	}
+	drop := map[string]bool{}
+	for _, ns := range namespaces {
+		drop[ns] = true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var kept []string
+	for _, p := range l.peer.Namespaces {
+		if !drop[p] {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) == 0 {
+		return fmt.Errorf("replication: peer %q would be left with no namespaces", name)
+	}
+	l.peer.Namespaces = kept
+	return nil
+}
+
+func containsString(xs []string, x string) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
 }
 
 // SyncNow runs one sync with the named peer and waits for it.
@@ -146,7 +230,7 @@ func (r *Replicator) Status() []PeerStatus {
 		next := l.nextAttempt
 		l.mu.Unlock()
 		out = append(out, PeerStatus{
-			Name: name, Addr: l.peer.Addr, Namespaces: l.peer.Namespaces, Mode: modeName(l.peer.Mode),
+			Name: name, Addr: l.peer.Addr, Namespaces: l.namespaces(), Mode: modeName(l.peer.Mode),
 			State: st, Failing: st.ConsecutiveFailures > 0, NextAttempt: next,
 		})
 	}
@@ -173,6 +257,14 @@ type peerLoop struct {
 	cycleMu     sync.Mutex // one sync at a time per peer
 	mu          sync.Mutex
 	nextAttempt time.Time
+}
+
+// namespaces is the peer's namespace patterns as of now: SetPeerNamespaces and AddNamespaces
+// change them while the loop runs, and each cycle reads them afresh.
+func (l *peerLoop) namespaces() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.peer.Namespaces
 }
 
 func (l *peerLoop) kick() {
@@ -273,7 +365,7 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 	res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), transport, peersync.V2ClientConfig{
 		NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
 		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
-		Namespaces:        l.peer.Namespaces, Mode: l.peer.Mode, Local: l.r.cfg.Local,
+		Namespaces:        l.namespaces(), Mode: l.peer.Mode, Local: l.r.cfg.Local,
 		CreateLocal: l.peer.CreateLocal, ExtraHaves: extra, Timeout: l.r.cfg.Timeout,
 		PreferSnapshot: l.peer.PreferSnapshot,
 	})
@@ -376,7 +468,7 @@ func (r *Replicator) PeerFloor(ns string, grace time.Duration, now time.Time) (t
 		if l.peer.Mode&peersync.SyncPush == 0 {
 			continue
 		}
-		if len(peersync.SelectNamespaces(l.peer.Namespaces, []string{ns})) == 0 {
+		if len(peersync.SelectNamespaces(l.namespaces(), []string{ns})) == 0 {
 			continue
 		}
 		st, err := r.cfg.State.Load(name)
@@ -396,7 +488,7 @@ func (r *Replicator) PeerFloor(ns string, grace time.Duration, now time.Time) (t
 
 // projectionCycle runs one sync of a filtered peer and records it like any other.
 func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) error {
-	source := l.peer.Namespaces[0]
+	source := l.namespaces()[0]
 	var err error
 	var res peersync.ProjectionResult
 	var started time.Time
@@ -450,7 +542,7 @@ func (r *Replicator) FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, tr
 			break
 		}
 		l := r.loops[name]
-		if l.peer.Filter != "" || len(peersync.SelectNamespaces(l.peer.Namespaces, []string{ns})) == 0 {
+		if l.peer.Filter != "" || len(peersync.SelectNamespaces(l.namespaces(), []string{ns})) == 0 {
 			continue
 		}
 		rest := map[codec.UUID]codec.Hash{}
@@ -508,7 +600,7 @@ func (r *Replicator) Compare(name, ns string, local document.DocumentTree) (stri
 func (r *Replicator) OpenDocSession(projectionNS string) (*peersync.RepairSession, string, error) {
 	for _, name := range r.order {
 		l := r.loops[name]
-		if l.peer.Filter == "" || peersync.ProjectionNamespace(l.peer.Namespaces[0], l.peer.Filter) != projectionNS {
+		if l.peer.Filter == "" || peersync.ProjectionNamespace(l.namespaces()[0], l.peer.Filter) != projectionNS {
 			continue
 		}
 		s, err := peersync.OpenDocSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
@@ -516,7 +608,7 @@ func (r *Replicator) OpenDocSession(projectionNS string) (*peersync.RepairSessio
 			ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
 			Timeout:           r.cfg.Timeout,
 		})
-		return s, l.peer.Namespaces[0], err
+		return s, l.namespaces()[0], err
 	}
 	return nil, "", fmt.Errorf("replication: no filtered peer keeps its projection in %s", projectionNS)
 }

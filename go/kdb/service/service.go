@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,6 +30,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/storage/mem"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/syncnode"
 	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/version"
@@ -397,70 +397,44 @@ func Main() {
 	if host != nil {
 		txnCoordinator = host.Transactions()
 	}
-	// Set once the replicator starts; every runtime's commit listener tells it what changed, and a
-	// runtime opened later through the set reaches it through this pointer.
-	var replicatorRef atomic.Pointer[replication.Replicator]
-	notifyReplicator := func(ns string) {
-		if r := replicatorRef.Load(); r != nil {
-			r.OnLocalCommit(ns)
-		}
-	}
-	// peerFloorFor is the retention floor replication imposes on one namespace: the oldest point
-	// an active peer - pushed to by the replicator, or fetching from this node - is known to have
-	// reached. Set on every runtime, primary and opened alike.
-	peerFloorFor := func(rt *server.KdbServerRuntime) func() (time.Time, bool) {
-		return func() (time.Time, bool) {
-			now := time.Now()
-			floor, ok := rt.InboundPeerFloor(peerRetentionGrace, now)
-			if r := replicatorRef.Load(); r != nil {
-				if f, has := r.PeerFloor(rt.Runtime.DefaultNamespace, peerRetentionGrace, now); has && (!ok || f.Before(floor)) {
-					floor, ok = f, true
-				}
-			}
-			return floor, ok
-		}
-	}
-	srv.Runtime.SetPeerRetentionFloor(peerFloorFor(srv))
 	nsSet := server.NewNamespaceSet(txnCoordinator)
 	if err := nsSet.Add(srv); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	srv.Namespaces = nsSet
 
-	// Definitions (schema, index DDL) live as documents in a reserved namespace so they are
-	// durable and replicate with the data - see server.MetaStore.
-	var metaRT *embed.EmbeddedKdbRuntime
-	if host != nil {
-		metaRT, err = host.Namespace(embed.CatalogFromNamespace(server.MetaNamespace), server.MetaNamespace, schema.None())
-	} else {
-		metaRT, err = embed.OpenMemoryRuntime(embed.CatalogFromNamespace(server.MetaNamespace), server.MetaNamespace, schema.None())
+	// Everything that makes this process a sync node - definitions in _kdb/meta, conflict
+	// delivery to a resolver authority, the retention floor peers impose, the replicator, the peer
+	// listener and scrub - lives in syncnode, which an application embedding KDB uses the same
+	// way. Peers are parsed now so a filtered peer's projection is configured before any
+	// namespace opens.
+	if env, ok := os.LookupEnv("KDB_PEERS"); ok && len(peerSpecs) == 0 {
+		peerSpecs = append(peerSpecs, env)
 	}
+	var peers []replication.PeerConfig
+	if len(peerSpecs) > 0 {
+		peers, err = replication.ParsePeers(strings.Join(peerSpecs, ";"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: --peer: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	nodeCfg := syncnode.Config{
+		Peers: peers, DataDir: dataDir, TLS: tlsSettings,
+		PeerRetentionGrace: peerRetentionGrace, ScrubInterval: scrubInterval,
+	}
+	if conflictWebhook != "" {
+		nodeCfg.ConflictWebhook = &server.ConflictWebhook{
+			URL: conflictWebhook, Secret: conflictWebhookSecret, Interval: conflictWebhookInterval,
+		}
+	}
+	node, err := syncnode.Open(host, nsSet, srv, nodeCfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: opening %s: %v\n", server.MetaNamespace, err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	metaSrv := server.NewKdbServerRuntime(metaRT)
-	metaSrv.AuthEngine = srv.AuthEngine
-	metaSrv.CommitListener = func(ns string, _ document.Commit) { notifyReplicator(ns) }
-	nsSet.AddSystem(metaSrv)
-	metaStore := server.NewMetaStore(metaSrv, nsSet)
-	defer metaStore.Close()
+	defer node.Close()
 
-	// A resolver authority learns of the conflicts it owns by webhook, or by polling
-	// GET /v1/ns/{ns}/conflicts?authority=true&undelivered=true and acknowledging each.
-	stopExpiry := make(chan struct{})
-	defer close(stopExpiry)
-	server.StartAuthorityExpiry(nsSet, 30*time.Second, stopExpiry)
-	if conflictWebhook != "" {
-		hook := server.StartConflictWebhook(nsSet, srv.NodeID.String(), &server.ConflictWebhook{
-			URL: conflictWebhook, Secret: conflictWebhookSecret, Interval: conflictWebhookInterval,
-		})
-		defer hook.Close()
-	}
-
-	// projectionPeers maps each filtered peer's local projection namespace to its peer config.
-	var projectionPeers sync.Map
 	if host != nil {
 		nsSet.SetOpener(func(id string, create bool) (*server.KdbServerRuntime, error) {
 			// A client-supplied id becomes a directory under the data root: validate it before
@@ -478,32 +452,11 @@ func Main() {
 				return nil, err
 			}
 			sec := server.NewKdbServerRuntime(nsRT)
-			if source, isProjection := peersync.ProjectionSource(id); isProjection {
-				sec.ProjectionOf = source // read-only from the moment it opens, not from the first sync
-				// ...or writable, if a peer configures it so: known before any sync, so a node
-				// that starts offline takes writes all the same.
-				if p, ok := projectionPeers.Load(id); ok {
-					cfg := p.(replication.PeerConfig)
-					sec.ProjectionFilter, sec.ProjectionWriteBack = cfg.Filter, cfg.WriteBack
-					if cfg.ReadThrough {
-						projectionNS := id
-						sec.ReadThrough = &server.ReadThrough{Open: func() (*peersync.RepairSession, string, error) {
-							r := replicatorRef.Load()
-							if r == nil {
-								return nil, "", fmt.Errorf("read-through: replication has not started")
-							}
-							return r.OpenDocSession(projectionNS)
-						}}
-					}
-				}
-			}
 			sec.AuthEngine = srv.AuthEngine
 			sec.WriteTimeout = srv.WriteTimeout
-			sec.Namespaces = nsSet
-			sec.PeerSyncConflictPolicy = srv.PeerSyncConflictPolicy
-			sec.PeerCreateOnPush = srv.PeerCreateOnPush
-			sec.CommitListener = func(ns string, _ document.Commit) { notifyReplicator(ns) }
-			sec.Runtime.SetPeerRetentionFloor(peerFloorFor(sec))
+			// Commit notification, retention floor, projection configuration and the stored
+			// definitions.
+			node.Prepare(sec)
 			// The same process budget as the primary, not none: otherwise a namespace reached
 			// through the wire would bypass admission and the scan row budget altogether.
 			sec.ShareGovernanceWith(srv)
@@ -513,7 +466,6 @@ func Main() {
 			if _, err := sec.OpenIndexes(stores.Options{}); err != nil {
 				return nil, fmt.Errorf("opening indexes for %s: %w", id, err)
 			}
-			metaStore.ApplyTo(sec)
 			return sec, nil
 		})
 	}
@@ -561,12 +513,11 @@ func Main() {
 	}
 	var peerListener *server.Listener
 	if peerAddr != "" {
-		peerListener, err = server.ListenPeerSyncTLS(peerAddr, srv, namespace, tlsSettings)
+		peerListener, err = node.Listen(peerAddr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: peer sync listen: %v\n", err)
 			os.Exit(1)
 		}
-		defer peerListener.Close()
 		peerStatus = fmt.Sprintf("enabled (%s)", peerListener.Addr())
 	}
 	var streamListener *server.Listener
@@ -715,7 +666,7 @@ func Main() {
 			// outcome reports.
 			Reopener: reopener,
 			// Resolved when asked: the replicator starts after the control plane does.
-			Replication: lazyReplication{&replicatorRef},
+			Replication: lazyReplication{node: node},
 		})
 		if err != nil {
 			slog.Error("control listen failed", "error", err)
@@ -785,108 +736,21 @@ func Main() {
 	}
 
 	// Outbound replication: one loop per configured peer, started last so every namespace it
-	// might sync is open, and stopped first so no sync is mid-ingest while storage closes.
-	if env, ok := os.LookupEnv("KDB_PEERS"); ok && len(peerSpecs) == 0 {
-		peerSpecs = append(peerSpecs, env)
-	}
+	// might sync is open, and stopped first so no sync is mid-ingest while storage closes. Every
+	// definition this process holds is applied first - its own recorded schema and indexes (which
+	// is what makes a CREATE TABLE survive a restart) and whatever arrived from peers while it was
+	// down.
 	replicationStatus := "disabled"
-	var replicator *replication.Replicator
-	// Every definition this process holds, applied now that every namespace it serves is open -
-	// its own recorded schema and indexes (which is what makes a CREATE TABLE survive a restart)
-	// and whatever arrived from peers while it was down.
-	if err := metaStore.ReconcileAll(); err != nil {
-		slog.Warn("could not apply stored definitions", "error", err)
+	if err := node.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
-	if len(peerSpecs) > 0 {
-		peers, err := replication.ParsePeers(strings.Join(peerSpecs, ";"))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: --peer: %v\n", err)
-			os.Exit(1)
-		}
-		// Definitions travel with the data: a peer syncing any namespace also syncs the metadata
-		// namespace, unless its patterns exclude it by name.
-		for i := range peers {
-			if peers[i].Filter != "" {
-				projectionPeers.Store(peersync.ProjectionNamespace(peers[i].Namespaces[0], peers[i].Filter), peers[i])
-				continue // a projection carries documents only; definitions stay with the source
-			}
-			if len(peersync.SelectNamespaces(peers[i].Namespaces, []string{server.MetaNamespace})) == 0 &&
-				!containsExclusion(peers[i].Namespaces, server.MetaNamespace) {
-				peers[i].Namespaces = append(peers[i].Namespaces, server.MetaNamespace)
-			}
-		}
-		stateDir := ""
-		if dataDir != "" {
-			stateDir = replication.StateDir(dataDir)
-		}
-		state, err := replication.NewStateStore(stateDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: replication state: %v\n", err)
-			os.Exit(1)
-		}
-		replicator, err = replication.New(replication.Config{
-			NodeID: srv.NodeID.String(), Local: srv.PeerNamespaces(), Peers: peers, State: state, TLS: tlsSettings,
-			Projections: func(source, filter string, writeBack bool) (peersync.ProjectionTarget, error) {
-				rt, err := nsSet.Resolve(peersync.ProjectionNamespace(source, filter), true)
-				if err != nil {
-					return nil, err
-				}
-				rt.ProjectionOf, rt.ProjectionFilter, rt.ProjectionWriteBack = source, filter, writeBack
-				return rt.ProjectionTarget(), nil
-			},
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		replicatorRef.Store(replicator)
-		// Namespaces opened through the set notify the replicator from the opener; the primary
-		// runtime's listener is chained, since the stream hub and control plane may own it.
-		previous := srv.CommitListener
-		srv.CommitListener = func(n string, c document.Commit) {
-			if previous != nil {
-				previous(n, c)
-			}
-			notifyReplicator(n)
-		}
-		replicator.Start()
+	replicator := node.Replicator()
+	if replicator != nil {
 		if admin != nil {
 			admin.SetExtraMetrics(replicator.WriteMetrics)
 		}
 		replicationStatus = fmt.Sprintf("%d peer(s)", len(peers))
-	}
-
-	// Stopped with replication at shutdown, waiting for a pass in flight: a scrub that repairs is
-	// a writer.
-	stopScrub, scrubDone := make(chan struct{}), make(chan struct{})
-	if scrubInterval <= 0 {
-		close(scrubDone)
-	} else {
-		go func() {
-			defer close(scrubDone)
-			t := time.NewTicker(scrubInterval)
-			defer t.Stop()
-			for {
-				select {
-				case <-stopScrub:
-					return
-				case <-t.C:
-				}
-				var fetch server.BodyFetcher
-				if r := replicatorRef.Load(); r != nil {
-					fetch = r.FetchBodies
-				}
-				for ns, rt := range nsSet.Runtimes() {
-					rep, err := rt.Scrub(fetch)
-					switch {
-					case err != nil:
-						slog.Warn("scrub found damage it could not repair", "namespace", ns, "damaged", len(rep.Damaged), "repaired", len(rep.Repaired), "error", err)
-					case len(rep.Repaired) > 0:
-						slog.Info("scrub repaired damaged documents from peers", "namespace", ns, "repaired", len(rep.Repaired), "commit", rep.RepairCommit)
-					}
-				}
-			}
-		}()
 	}
 
 	build := version.Get()
@@ -946,11 +810,7 @@ func Main() {
 	}
 	// Replication first: a sync in flight is a writer, and Stop waits for it to finish. The
 	// scrub loop likewise.
-	close(stopScrub)
-	<-scrubDone
-	if replicator != nil {
-		replicator.Stop()
-	}
+	node.StopSync()
 	// Before anything else: a pass that is mid-truncation holds the invariant that makes
 	// truncation safe (bodies flushed, checkpoint written, then segments deleted), and Stop waits
 	// for it rather than cutting it short.
@@ -1191,49 +1051,40 @@ func (m multiCloser) Close() error {
 
 // lazyReplication hands the control plane the replicator once it exists.
 type lazyReplication struct {
-	ref *atomic.Pointer[replication.Replicator]
+	node *syncnode.Node
 }
 
 func (l lazyReplication) Status() []replication.PeerStatus {
-	if r := l.ref.Load(); r != nil {
+	if r := l.node.Replicator(); r != nil {
 		return r.Status()
 	}
 	return nil
 }
 
 func (l lazyReplication) SyncNow(name string) (peersync.V2Result, error) {
-	if r := l.ref.Load(); r != nil {
+	if r := l.node.Replicator(); r != nil {
 		return r.SyncNow(name)
 	}
 	return peersync.V2Result{}, fmt.Errorf("no replication peers are configured")
 }
 
 func (l lazyReplication) FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, treeHex string) (map[codec.UUID]string, error) {
-	if r := l.ref.Load(); r != nil {
+	if r := l.node.Replicator(); r != nil {
 		return r.FetchBodies(ns, wanted, treeHex)
 	}
 	return nil, fmt.Errorf("no replication peers are configured")
 }
 
 func (l lazyReplication) Compare(name, ns string, local document.DocumentTree) (string, []document.TreeDifference, error) {
-	if r := l.ref.Load(); r != nil {
+	if r := l.node.Replicator(); r != nil {
 		return r.Compare(name, ns, local)
 	}
 	return "", nil, fmt.Errorf("no replication peers are configured")
 }
 
 func (l lazyReplication) OpenRepairSessionTo(name, ns string) (*peersync.RepairSession, error) {
-	if r := l.ref.Load(); r != nil {
+	if r := l.node.Replicator(); r != nil {
 		return r.OpenRepairSessionTo(name, ns)
 	}
 	return nil, fmt.Errorf("no replication peers are configured")
-}
-
-func containsExclusion(patterns []string, ns string) bool {
-	for _, p := range patterns {
-		if strings.HasPrefix(p, "!") && peersync.MatchNamespace(p[1:], ns) {
-			return true
-		}
-	}
-	return false
 }
