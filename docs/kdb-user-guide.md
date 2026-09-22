@@ -1555,6 +1555,24 @@ for example to resume a match on another device:
 
 A node may only ask for itself, and only for a namespace it may push to.
 
+### On a phone: `kdbsync` (gomobile)
+
+`go/mobile/kdbsync` packages the sync node for iOS and Android. Bind it with
+`gomobile bind -target=android ./mobile/kdbsync` (or `-target=ios`). The API:
+
+```
+node = Kdbsync.open(dataDir, "app/device")
+node.addPeer("cloud", "wss://api.example.com/kdb/sync", "app/u/42", scopedMeta=true)
+node.setToken("cloud", token)   // refresh whenever the app's token changes
+node.start()
+node.put("app/u/42", "settings", "{\"theme\":\"dark\"}")
+node.addNamespaces("cloud", "app/m/7")   // joined a match
+node.requestHome("cloud", "app/m/7", "", "resume")
+```
+
+Bind `kdbsync`, or your own package over `syncnode`, rather than `go/kdb/embed` directly: embed's
+exported API includes shapes gomobile cannot bind.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.

@@ -121,6 +121,15 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	if cfg.AuthorityExpiryInterval <= 0 {
 		cfg.AuthorityExpiryInterval = 30 * time.Second
 	}
+	if host != nil && primary.NodeID == server.ProcessNodeID() {
+		// The data root's identity (its NODE file), as kdb-service uses: two hosts in one process -
+		// or a device and the cloud in one test - are two nodes, and a restart is the same node.
+		id, err := embed.LoadOrCreateNodeID(host.DataRoot())
+		if err != nil {
+			return nil, fmt.Errorf("syncnode: node identity: %w", err)
+		}
+		primary.NodeID = id
+	}
 	n := &Node{host: host, set: set, primary: primary, cfg: cfg, stopExpiry: make(chan struct{})}
 	primary.Namespaces = set
 	primary.PeerAuthorizeDocuments = cfg.AuthorizePushedDocuments
