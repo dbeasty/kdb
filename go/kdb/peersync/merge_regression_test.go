@@ -102,3 +102,150 @@ func TestCrissCrossMergesAgreeWithoutConflict(t *testing.T) {
 		}
 	}
 }
+
+// replaceDocAt appends the transaction a whole-document replace makes: a delete of the document
+// followed by a write of the new body, both in one commit. That is what KdbServerRuntime.PutJSON
+// emits, and what any client replacing a document rather than patching it emits, so it is the
+// shape most real commits have.
+func replaceDocAt(t *testing.T, s side, ns string, parent codec.Hash, docID codec.UUID, json string) document.Commit {
+	t.Helper()
+	if err := s.storage.PutDocument(ns, document.Document{ID: docID, JSON: json}); err != nil {
+		t.Fatalf("putDocument: %v", err)
+	}
+	parentCommit, err := s.dag.GetCommitOrThrow(parent)
+	if err != nil {
+		t.Fatalf("getCommitOrThrow(parent): %v", err)
+	}
+	tree, err := s.storage.CommitTree(ns, parentCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("commitTree: %v", err)
+	}
+	txID, _ := codec.RandomUUID()
+	authorID, _ := codec.RandomUUID()
+	tx := document.Transaction{
+		ID: txID, BaseVersion: parent,
+		Operations: []document.Op{
+			document.DeleteOp{DocID: docID},
+			document.WriteOp{DocID: docID, Patch: json},
+		},
+		Timestamp:    codec.TimestampNow(),
+		AuthorNodeID: authorID,
+	}
+	commit, err := s.dag.AppendCommitDetached(tx, parent, tree, nil, "test replace")
+	if err != nil {
+		t.Fatalf("appendCommit: %v", err)
+	}
+	return commit
+}
+
+// TestMergeKeepsADocumentWrittenByAReplace is the regression for a merge reading a document's
+// value from the first operation naming it in a commit rather than the last.
+//
+// A commit's operations are applied in order, so what a commit leaves a document holding is its
+// last operation on it. A replace is a delete followed by a write, so reading the first one said
+// "this document is not there" - and a document neither side appeared to have is a document the
+// merge has nothing to carry across. The other side's write was dropped, silently, and the merge
+// then declared a tree no other node could rebuild: every node that received that merge refused
+// it as an integrity failure, for ever, so nothing about that divergence could ever travel.
+func TestMergeKeepsADocumentWrittenByAReplace(t *testing.T) {
+	ns := "app/replace"
+	b, c := forkTwoSides(t, ns)
+
+	// One side creates a document the way a replace does; the other writes a different one, so
+	// the histories diverge without conflicting over anything.
+	ch, _ := c.dag.Head()
+	theirs := newUUID(t)
+	c1 := replaceDocAt(t, c, ns, ch, theirs, `{"from":"c"}`)
+	setHead(t, c, c1.Hash)
+
+	bh, _ := b.dag.Head()
+	mine := newUUID(t)
+	b1 := writeDoc(t, b, ns, bh, mine, `{"from":"b"}`)
+	setHead(t, b, b1.Hash)
+
+	cc, cs, chh := snapshotFor(t, b, c)
+	r := ingestWith(t, ns, b, cc, cs, chh, transaction.ConflictPolicyLastWrite)
+	if r.Outcome.Kind == OutcomeConflict {
+		t.Fatalf("two sides writing different documents reported a conflict: %+v", r.Outcome)
+	}
+
+	_, head, _, _ := b.dag.HeadCommit()
+	for _, want := range []struct {
+		id   codec.UUID
+		body string
+	}{{theirs, `{"from":"c"}`}, {mine, `{"from":"b"}`}} {
+		doc, err := b.storage.GetDocument(ns, want.id, head.DocumentTreeHash)
+		if err != nil {
+			t.Fatalf("reading %s after the merge: %v", want.id, err)
+		}
+		if doc == nil {
+			t.Fatalf("the merge dropped %s, which %s wrote", want.id, want.body)
+		}
+		if doc.JSON != want.body {
+			t.Fatalf("after the merge %s holds %s, want %s", want.id, doc.JSON, want.body)
+		}
+	}
+}
+
+// TestMergeReadsTheLastOperationOnADocument is the same fault one level down: a commit that
+// writes a document and then deletes it leaves it deleted, and a merge that read the write would
+// resurrect it.
+func TestMergeReadsTheLastOperationOnADocument(t *testing.T) {
+	ns := "app/lastop"
+	b, c := forkTwoSides(t, ns)
+
+	// A document both sides start from.
+	root, _ := b.dag.Head()
+	shared := newUUID(t)
+	seed := writeDoc(t, b, ns, root, shared, `{"v":1}`)
+	setHead(t, b, seed.Hash)
+	cc, cs, chh := snapshotFor(t, c, b)
+	ingestWith(t, ns, c, cc, cs, chh, transaction.ConflictPolicyLastWrite)
+
+	// C writes it once more and then deletes it, in one commit.
+	ch, _ := c.dag.Head()
+	parentCommit, err := c.dag.GetCommitOrThrow(ch)
+	if err != nil {
+		t.Fatalf("parent: %v", err)
+	}
+	if err := c.storage.DeleteDocument(ns, shared); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	tree, err := c.storage.CommitTree(ns, parentCommit.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("commitTree: %v", err)
+	}
+	txID, _ := codec.RandomUUID()
+	authorID, _ := codec.RandomUUID()
+	tx := document.Transaction{
+		ID: txID, BaseVersion: ch,
+		Operations: []document.Op{
+			document.WriteOp{DocID: shared, Patch: `{"v":2}`},
+			document.DeleteOp{DocID: shared},
+		},
+		Timestamp:    codec.TimestampNow(),
+		AuthorNodeID: authorID,
+	}
+	c1, err := c.dag.AppendCommitDetached(tx, ch, tree, nil, "write then delete")
+	if err != nil {
+		t.Fatalf("appendCommit: %v", err)
+	}
+	setHead(t, c, c1.Hash)
+
+	// B moves on elsewhere, so the two diverge.
+	bh, _ := b.dag.Head()
+	b1 := writeDoc(t, b, ns, bh, newUUID(t), `{"from":"b"}`)
+	setHead(t, b, b1.Hash)
+
+	cc, cs, chh = snapshotFor(t, b, c)
+	ingestWith(t, ns, b, cc, cs, chh, transaction.ConflictPolicyLastWrite)
+
+	_, head, _, _ := b.dag.HeadCommit()
+	doc, err := b.storage.GetDocument(ns, shared, head.DocumentTreeHash)
+	if err != nil {
+		t.Fatalf("reading the deleted document: %v", err)
+	}
+	if doc != nil {
+		t.Fatalf("the merge brought back a document its writer had deleted: %s", doc.JSON)
+	}
+}

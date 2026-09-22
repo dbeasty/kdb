@@ -153,12 +153,24 @@ func (vi valueIndex) valuesAt(x codec.Hash, ids []codec.UUID) (map[codec.UUID]do
 		if err != nil {
 			return nil, err
 		}
+		// A commit's operations are applied in order, so a document's value
+		// after the commit is what its *last* operation left - not its first.
+		// One transaction may well touch a document twice: a whole-document
+		// replace is a delete followed by a write of the new body, which is
+		// how PutJSON and every client replacing a document writes one. Taking
+		// the first operation read that as a deletion and so as a document
+		// that is not there, which made a merge drop the other side's value
+		// silently and build a tree no other node could rebuild.
+		settled := map[codec.UUID]bool{}
 		for _, op := range ops {
 			id := opDocID(op)
 			if pending[id] {
 				out[id] = docVal{body: opBody(op), writer: c}
-				delete(pending, id)
+				settled[id] = true
 			}
+		}
+		for id := range settled {
+			delete(pending, id)
 		}
 		if len(pending) == 0 {
 			break
