@@ -311,13 +311,20 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 		}
 	}
 	// A literal (wildcard-free) name the node does not hold yet can still be granted for a push
-	// that creates it, when the operator allows that.
+	// that creates it, when the operator allows that. It has no refs of its own to look up - see
+	// the "creating" namespaces below.
+	var creating []string
 	if h.cfg.CreateOnPush {
 		for _, p := range m.Namespaces {
 			if isLiteralNamespace(p) && !granted[p] {
-				if grant(p) && access[p] == wire.AccessPull {
-					delete(granted, p) // nothing to pull from a namespace this node does not hold
+				if !grant(p) {
+					continue
 				}
+				if access[p] == wire.AccessPull {
+					delete(granted, p) // nothing to pull from a namespace this node does not hold
+					continue
+				}
+				creating = append(creating, p)
 			}
 		}
 	}
@@ -327,6 +334,16 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 	refs, err := h.refs(names)
 	if err != nil {
 		return nil, err
+	}
+	// A "creating" namespace doesn't exist here yet, so it has no DAG to read refs from - advertise
+	// it as holding nothing. That makes every one of the client's refs look new, so it pushes them
+	// all, and the REF_UPDATE handler's own h.env(ns, h.cfg.CreateOnPush, dirPush) creates the
+	// namespace when the push actually arrives (not here, so a hello that never pushes anything
+	// leaves nothing behind).
+	for _, ns := range creating {
+		refs = append(refs, wire.NamespaceRefs{
+			Namespace: ns, Branches: map[string]string{}, Tags: map[string]string{}, Access: access[ns],
+		})
 	}
 	return wire.SyncHelloAckMessage{
 		H: header(wire.MsgSyncHelloAck, m.H.CorrelationID), Accepted: true,
