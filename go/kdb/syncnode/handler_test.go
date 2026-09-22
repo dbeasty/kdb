@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,12 +98,12 @@ func TestTokenOnlyOnTheUpgradeRequest(t *testing.T) {
 	cloud, srv := cloudOverHTTP(t)
 	profile := mustID(t)
 	cloud.put(t, "zolik/u/1", profile, `{"name":"ada"}`)
-	calls := 0
+	var calls atomic.Int32 // the callback runs on the replicator's goroutines
 	phone := newTestNode(t, "zolik/phone", Config{Peers: []replication.PeerConfig{{
 		Name: "cloud", Addr: strings.Replace(srv.URL, "http://", "ws://", 1) + "/kdb/sync", Namespaces: []string{"zolik/u/1"},
 		Mode: peersync.SyncPull, Interval: time.Hour, CreateLocal: true,
 		Credentials: func() (auth.ConnectionContext, error) {
-			calls++ // refreshed per connection
+			calls.Add(1) // refreshed per connection
 			return auth.ConnectionContext{Headers: map[string]string{"Authorization": "Bearer phone-token"}}, nil
 		},
 	}}})
@@ -112,8 +113,8 @@ func TestTokenOnlyOnTheUpgradeRequest(t *testing.T) {
 	if _, err := phone.node.SyncNow("cloud"); err != nil {
 		t.Fatal(err)
 	}
-	if phone.get("zolik/u/1", profile) == "" || calls == 0 {
-		t.Fatalf("header-only token: synced=%v credential calls=%d", phone.get("zolik/u/1", profile) != "", calls)
+	if phone.get("zolik/u/1", profile) == "" || calls.Load() == 0 {
+		t.Fatalf("header-only token: synced=%v credential calls=%d", phone.get("zolik/u/1", profile) != "", calls.Load())
 	}
 }
 
