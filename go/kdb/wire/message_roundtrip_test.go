@@ -556,7 +556,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x32
+const nextFreeMessageCode = 0x34
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{
@@ -757,5 +757,24 @@ func TestRoundTripTxCommitMulti(t *testing.T) {
 		back.FailedNamespace != "bank/ledger" || string(back.ConflictReport) != `{"transactionId":"t"}` ||
 		back.Error == nil || *back.ErrorCode != code || *back.RetryAfterMs != 12 {
 		t.Fatalf("round trip: %+v", back)
+	}
+}
+
+func TestRoundTripProjectWrite(t *testing.T) {
+	msg := wire.ProjectWriteMessage{
+		H: wire.Header{MessageType: wire.MsgProjectWrite, CorrelationID: 9}, Namespace: "app/data", TxID: "tx-1",
+		Docs: []wire.WriteBackDoc{{DocID: "a", Body: `{"x":1}`, BaseHash: "ab"}, {DocID: "b", Deleted: true}},
+	}
+	back := roundTrip(t, msg).(wire.ProjectWriteMessage)
+	if back.TxID != "tx-1" || len(back.Docs) != 2 || back.Docs[0] != msg.Docs[0] || back.Docs[1] != msg.Docs[1] {
+		t.Fatalf("round trip changed the message: %+v", back)
+	}
+	res := wire.ProjectWriteResultMessage{
+		H: wire.Header{MessageType: wire.MsgProjectWriteResult, CorrelationID: 9}, Namespace: "app/data",
+		Outcome: wire.WriteBackConflict, Reason: "changed", Current: []wire.WriteBackCurrent{{DocID: "a", Body: `{"x":2}`}, {DocID: "b", Absent: true}},
+	}
+	rb := roundTrip(t, res).(wire.ProjectWriteResultMessage)
+	if rb.Outcome != wire.WriteBackConflict || len(rb.Current) != 2 || rb.Current[1] != res.Current[1] {
+		t.Fatalf("round trip changed the result: %+v", rb)
 	}
 }

@@ -186,6 +186,12 @@ type KdbServerRuntime struct {
 	// (see peersync.SyncProjection): its content comes only from the source, so every write but
 	// the projection's own is refused, clients' and peers' alike.
 	ProjectionOf string
+	// ProjectionWriteBack lets a projection take client writes, committed here at once and sent
+	// to the source on each sync - see writeback.go. ProjectionFilter is the projection's filter,
+	// which decides whether a document put back after a rejected write still belongs here.
+	ProjectionWriteBack bool
+	ProjectionFilter    string
+	writeBack           writeBackState
 	// Meta, when set, records this namespace's definition changes (schema, index DDL) into the
 	// replicated metadata namespace - see MetaStore.
 	Meta *MetaStore
@@ -690,15 +696,48 @@ func (s *KdbServerRuntime) Replay(namespaceID string, tx document.Transaction, r
 
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
 	tx = s.authored(tx)
-	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
-		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, s.commitMessage())
+	return s.clientWrite(tx, func() (document.Commit, error) {
+		return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
+			return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(tx))
+		})
 	})
+}
+
+// clientWrite runs a client's write. On a write-back projection it is serialized with the
+// projection's other writers and, once committed, joins the writes waiting to go to the source.
+func (s *KdbServerRuntime) clientWrite(tx document.Transaction, run func() (document.Commit, error)) (document.Commit, error) {
+	if !s.writeBackOn() {
+		return run()
+	}
+	st := &s.writeBack
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	c, err := run()
+	if err != nil {
+		// A write can fail after reaching the DAG (durability, indexes); the DAG is the truth.
+		st.loaded = false
+		return c, err
+	}
+	if w, ok := pendingWrite(c); ok && st.loaded {
+		st.pending = append(st.pending, w)
+	}
+	return c, nil
+}
+
+// clientMessage is the message a client commit carries. Called under the write gate.
+func (s *KdbServerRuntime) clientMessage(tx document.Transaction) string {
+	if s.writeBackOn() {
+		return s.localWriteMessage(tx)
+	}
+	return s.commitMessage()
 }
 
 func (s *KdbServerRuntime) replayWith(engine transaction.Engine, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
 	tx = s.authored(tx)
-	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
-		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, s.commitMessage())
+	return s.clientWrite(tx, func() (document.Commit, error) {
+		return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
+			return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, s.clientMessage(tx))
+		})
 	})
 }
 
@@ -866,7 +905,9 @@ func (s *KdbServerRuntime) admitWrite(tx document.Transaction, principal auth.Pr
 		return err
 	}
 	if s.ProjectionOf != "" && !system {
-		return &ProjectionReadOnlyError{Namespace: s.Runtime.DefaultNamespace, Source: s.ProjectionOf}
+		if err := s.admitProjectionWrite(tx); err != nil {
+			return err
+		}
 	}
 	if !system {
 		if err := s.admitHome(); err != nil {

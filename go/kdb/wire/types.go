@@ -93,18 +93,20 @@ const (
 	MsgPeerError MessageType = 0x25
 
 	// Peer sync protocol v2 (see sync_v2_ops.go). Go-only, like 0x14-0x25.
-	MsgSyncHello     MessageType = 0x26
-	MsgSyncHelloAck  MessageType = 0x27
-	MsgRefsRequest   MessageType = 0x28
-	MsgRefsResult    MessageType = 0x29
-	MsgFetchRequest  MessageType = 0x2A
-	MsgPackPage      MessageType = 0x2B
-	MsgRefUpdate     MessageType = 0x2C
-	MsgRefUpdateAck  MessageType = 0x2D
-	MsgSnapshotFetch MessageType = 0x2E
-	MsgSnapshotPage  MessageType = 0x2F
-	MsgProjectFetch  MessageType = 0x30
-	MsgProjectPage   MessageType = 0x31
+	MsgSyncHello          MessageType = 0x26
+	MsgSyncHelloAck       MessageType = 0x27
+	MsgRefsRequest        MessageType = 0x28
+	MsgRefsResult         MessageType = 0x29
+	MsgFetchRequest       MessageType = 0x2A
+	MsgPackPage           MessageType = 0x2B
+	MsgRefUpdate          MessageType = 0x2C
+	MsgRefUpdateAck       MessageType = 0x2D
+	MsgSnapshotFetch      MessageType = 0x2E
+	MsgSnapshotPage       MessageType = 0x2F
+	MsgProjectFetch       MessageType = 0x30
+	MsgProjectPage        MessageType = 0x31
+	MsgProjectWrite       MessageType = 0x32
+	MsgProjectWriteResult MessageType = 0x33
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -211,6 +213,10 @@ func (t MessageType) String() string {
 		return "PROJECT_FETCH"
 	case MsgProjectPage:
 		return "PROJECT_PAGE"
+	case MsgProjectWrite:
+		return "PROJECT_WRITE"
+	case MsgProjectWriteResult:
+		return "PROJECT_WRITE_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -316,6 +322,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgProjectFetch, true
 	case 0x31:
 		return MsgProjectPage, true
+	case 0x32:
+		return MsgProjectWrite, true
+	case 0x33:
+		return MsgProjectWriteResult, true
 	default:
 		return 0, false
 	}

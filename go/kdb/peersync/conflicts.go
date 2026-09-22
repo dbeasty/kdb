@@ -33,6 +33,10 @@ const (
 	// ConflictForeignGroupPart: a replicated commit is one part of a cross-namespace group decided
 	// on another host, and this node cannot check the rest of the group arrived with it.
 	ConflictForeignGroupPart ConflictKind = "foreign-group-part"
+	// ConflictWriteBack: a write-back projection's local write that its source did not apply -
+	// the documents had changed there, or the source refused it. The projection holds the
+	// source's state again; the entry keeps what was attempted.
+	ConflictWriteBack ConflictKind = "write-back"
 )
 
 // ConflictEntry is one conflict awaiting an operator or application.

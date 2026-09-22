@@ -43,6 +43,9 @@ type PeerConfig struct {
 	// of its own - see peersync.SyncProjection. Always the last field of the spec, since a
 	// filter may contain commas.
 	Filter string
+	// WriteBack lets clients write to a filtered peer's projection: writes commit locally and go
+	// to the source on each sync (writeback=true; filtered peers only).
+	WriteBack bool
 }
 
 // DefaultInterval is the anti-entropy tick when a peer names none.
@@ -51,6 +54,7 @@ const DefaultInterval = 30 * time.Second
 // ParsePeer reads one peer from its flag form:
 //
 //	name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both,interval=30s,user=u,password-env=VAR,create=true,bootstrap=snapshot
+//	name=hq,addr=tcps://hq:4242,namespaces=orders,writeback=true,filter=region = 'EU'
 //
 // Namespaces are separated by '|' because ',' separates fields. mode is pull, push or both
 // (default both). The password is taken from an environment variable, never from the flag, so it
@@ -112,6 +116,8 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			p.Password = &v
 		case "create":
 			p.CreateLocal = value == "true"
+		case "writeback":
+			p.WriteBack = value == "true"
 		case "bootstrap":
 			switch value {
 			case "snapshot":
@@ -136,6 +142,8 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			return PeerConfig{}, fmt.Errorf("peer %q: filter: %w", spec, err)
 		}
 		p.Mode = peersync.SyncPull
+	} else if p.WriteBack {
+		return PeerConfig{}, fmt.Errorf("peer %q: writeback applies only to a filtered peer", spec)
 	}
 	if len(p.Namespaces) == 0 {
 		p.Namespaces = []string{"**"}

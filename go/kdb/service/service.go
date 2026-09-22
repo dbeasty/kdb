@@ -440,6 +440,8 @@ func Main() {
 	metaStore := server.NewMetaStore(metaSrv, nsSet)
 	defer metaStore.Close()
 
+	// projectionPeers maps each filtered peer's local projection namespace to its peer config.
+	var projectionPeers sync.Map
 	if host != nil {
 		nsSet.SetOpener(func(id string, create bool) (*server.KdbServerRuntime, error) {
 			// A client-supplied id becomes a directory under the data root: validate it before
@@ -459,6 +461,12 @@ func Main() {
 			sec := server.NewKdbServerRuntime(nsRT)
 			if source, isProjection := peersync.ProjectionSource(id); isProjection {
 				sec.ProjectionOf = source // read-only from the moment it opens, not from the first sync
+				// ...or writable, if a peer configures it so: known before any sync, so a node
+				// that starts offline takes writes all the same.
+				if p, ok := projectionPeers.Load(id); ok {
+					cfg := p.(replication.PeerConfig)
+					sec.ProjectionFilter, sec.ProjectionWriteBack = cfg.Filter, cfg.WriteBack
+				}
 			}
 			sec.AuthEngine = srv.AuthEngine
 			sec.WriteTimeout = srv.WriteTimeout
@@ -777,6 +785,7 @@ func Main() {
 		// namespace, unless its patterns exclude it by name.
 		for i := range peers {
 			if peers[i].Filter != "" {
+				projectionPeers.Store(peersync.ProjectionNamespace(peers[i].Namespaces[0], peers[i].Filter), peers[i])
 				continue // a projection carries documents only; definitions stay with the source
 			}
 			if len(peersync.SelectNamespaces(peers[i].Namespaces, []string{server.MetaNamespace})) == 0 &&
@@ -795,12 +804,12 @@ func Main() {
 		}
 		replicator, err = replication.New(replication.Config{
 			NodeID: srv.NodeID.String(), Local: srv.PeerNamespaces(), Peers: peers, State: state, TLS: tlsSettings,
-			Projections: func(source, filter string) (peersync.ProjectionTarget, error) {
+			Projections: func(source, filter string, writeBack bool) (peersync.ProjectionTarget, error) {
 				rt, err := nsSet.Resolve(peersync.ProjectionNamespace(source, filter), true)
 				if err != nil {
 					return nil, err
 				}
-				rt.ProjectionOf = source
+				rt.ProjectionOf, rt.ProjectionFilter, rt.ProjectionWriteBack = source, filter, writeBack
 				return rt.ProjectionTarget(), nil
 			},
 		})

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -180,6 +181,33 @@ type ProjectionTarget interface {
 	Apply(ops []document.Op, source string, complete bool) error
 }
 
+// PendingWrite is one local transaction on a write-back projection that the source has not yet
+// decided on.
+type PendingWrite struct {
+	// Commit is the local commit that made the write.
+	Commit codec.Hash
+	// TxID is the id the source commits it under: derived from Commit, so a resend after a lost
+	// reply is recognised rather than applied twice.
+	TxID codec.UUID
+	Docs []wire.WriteBackDoc
+}
+
+// WriteBackTxID is the source transaction id for the local write-back commit c.
+func WriteBackTxID(c codec.Hash) codec.UUID {
+	return codec.DerivedUUID("kdb:writeback/1:" + c.Hex())
+}
+
+// WriteBackTarget is a projection that takes local writes and sends them to its source.
+type WriteBackTarget interface {
+	ProjectionTarget
+	// PendingWrites lists the local writes not yet decided on, oldest first. They are sent in
+	// this order, so a write that depends on an earlier one is never applied without it.
+	PendingWrites() ([]PendingWrite, error)
+	// ResolveWrite records the source's decision on w. Not applied: the documents go back to the
+	// source's state, and the attempt is kept where an operator or the application can find it.
+	ResolveWrite(w PendingWrite, res wire.ProjectWriteResultMessage) error
+}
+
 // ProjectionConfig configures one projection sync.
 type ProjectionConfig struct {
 	NodeID            string
@@ -191,6 +219,9 @@ type ProjectionConfig struct {
 	PageBytes         int
 	Timeout           time.Duration
 	Target            ProjectionTarget
+	// WriteBack sends the target's local writes to the source before each pull. The target must
+	// be a WriteBackTarget, and the source must accept write-back.
+	WriteBack bool
 }
 
 // ProjectionResult reports one projection sync.
@@ -199,6 +230,9 @@ type ProjectionResult struct {
 	Reset   bool
 	Writes  int
 	Deletes int
+	// Written counts local writes the source applied this sync; Rejected those it did not
+	// (conflicts and refusals), now in the conflict queue.
+	Written, Rejected int
 }
 
 // SyncProjection brings a projection up to its source's current head.
@@ -211,10 +245,19 @@ func SyncProjection(w wire.Codec, transport stream.Transport, cfg ProjectionConf
 		return ProjectionResult{}, err
 	}
 	defer conn.Close()
+	var wb WriteBackTarget
+	caps := []string{wire.SyncCapFilter}
+	if cfg.WriteBack {
+		var ok bool
+		if wb, ok = cfg.Target.(WriteBackTarget); !ok {
+			return ProjectionResult{}, fmt.Errorf("peer sync: projection target %T cannot send writes back", cfg.Target)
+		}
+		caps = append(caps, wire.SyncCapWriteBack)
+	}
 	c := &v2Conn{wire: w, conn: conn, correlation: 20000, timeout: cfg.Timeout}
 	reply, err := c.request(wire.SyncHelloMessage{
 		H: header(wire.MsgSyncHello, c.next()), NodeID: cfg.NodeID, Protocol: wire.SyncProtocolVersion,
-		Capabilities: []string{wire.SyncCapFilter},
+		Capabilities: caps,
 		User:         cfg.ConnectionContext.User, Password: cfg.ConnectionContext.Password, Token: cfg.ConnectionContext.Token,
 	})
 	if err != nil {
@@ -227,11 +270,20 @@ func SyncProjection(w wire.Codec, transport stream.Transport, cfg ProjectionConf
 		}
 		return ProjectionResult{}, NewError("peer refused the projection session: "+reason, nil)
 	}
+	var res ProjectionResult
+	if wb != nil {
+		if !slices.Contains(reply.(wire.SyncHelloAckMessage).Capabilities, wire.SyncCapWriteBack) {
+			return res, NewError("peer does not accept write-back to "+cfg.Namespace, nil)
+		}
+		// Writes go first, so the pull that follows already carries what the source made of them.
+		if err := pushWrites(c, wb, cfg.Namespace, &res); err != nil {
+			return res, err
+		}
+	}
 	from, err := cfg.Target.LastSource()
 	if err != nil {
 		return ProjectionResult{}, err
 	}
-	var res ProjectionResult
 	var at, after string
 	received := map[codec.UUID]struct{}{}
 	for {
@@ -288,4 +340,38 @@ func SyncProjection(w wire.Codec, transport stream.Transport, cfg ProjectionConf
 		}
 		after = page.Next
 	}
+}
+
+// pushWrites sends every pending write in order. A write the source decides on - applied or not -
+// is resolved and the next one goes; anything else (the source unavailable, not the home, the
+// connection gone) stops here with the rest still pending, to go again next sync.
+func pushWrites(c *v2Conn, wb WriteBackTarget, ns string, res *ProjectionResult) error {
+	pending, err := wb.PendingWrites()
+	if err != nil {
+		return err
+	}
+	for _, w := range pending {
+		reply, err := c.request(wire.ProjectWriteMessage{
+			H: header(wire.MsgProjectWrite, c.next()), Namespace: ns, TxID: w.TxID.String(), Docs: w.Docs,
+		})
+		if err != nil {
+			return fmt.Errorf("peer sync: write-back of %s: %w", w.Commit.Hex(), err)
+		}
+		r, ok := reply.(wire.ProjectWriteResultMessage)
+		if !ok {
+			return NewError(fmt.Sprintf("expected PROJECT_WRITE_RESULT, got %T", reply), nil)
+		}
+		switch r.Outcome {
+		case wire.WriteBackApplied:
+			res.Written++
+		case wire.WriteBackConflict, wire.WriteBackRefused:
+			res.Rejected++
+		default:
+			return NewError("unknown write-back outcome "+r.Outcome, nil)
+		}
+		if err := wb.ResolveWrite(w, r); err != nil {
+			return err
+		}
+	}
+	return nil
 }

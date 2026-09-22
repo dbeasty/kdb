@@ -47,35 +47,37 @@ type payloadEnvelope struct {
 	PeerError    *peerErrorDto    `json:"peerError,omitempty"`
 
 	// Peer sync v2 (Go-only) - see sync_v2_ops.go.
-	SyncHello         *syncHelloDto         `json:"syncHello,omitempty"`
-	SyncHelloAck      *syncHelloAckDto      `json:"syncHelloAck,omitempty"`
-	RefsRequest       *refsRequestDto       `json:"refsRequest,omitempty"`
-	RefsResult        *refsResultDto        `json:"refsResult,omitempty"`
-	FetchRequest      *fetchRequestDto      `json:"fetchRequest,omitempty"`
-	PackPage          *packPageDto          `json:"packPage,omitempty"`
-	RefUpdate         *refUpdateDto         `json:"refUpdate,omitempty"`
-	RefUpdateAck      *refUpdateAckDto      `json:"refUpdateAck,omitempty"`
-	SnapshotFetch     *snapshotFetchDto     `json:"snapshotFetch,omitempty"`
-	SnapshotPage      *snapshotPageDto      `json:"snapshotPage,omitempty"`
-	ProjectFetch      *projectFetchDto      `json:"projectFetch,omitempty"`
-	ProjectPage       *projectPageDto       `json:"projectPage,omitempty"`
-	CommitPush        *commitPushDto        `json:"commitPush,omitempty"`
-	CommitPushAck     *commitPushAckDto     `json:"commitPushAck,omitempty"`
-	DagDiff           *dagDiffDto           `json:"dagDiff,omitempty"`
-	TransactionReplay *transactionReplayDto `json:"transactionReplay,omitempty"`
-	ConflictReport    *conflictReportDto    `json:"conflictReport,omitempty"`
-	CompactionNotice  *compactionNoticeDto  `json:"compactionNotice,omitempty"`
-	IceArchiveNotice  *iceArchiveNoticeDto  `json:"iceArchiveNotice,omitempty"`
-	SnapshotRequest   *snapshotRequestDto   `json:"snapshotRequest,omitempty"`
-	SnapshotResponse  *snapshotResponseDto  `json:"snapshotResponse,omitempty"`
-	PositionAck       *positionAckDto       `json:"positionAck,omitempty"`
-	SchemaPush        *schemaPushDto        `json:"schemaPush,omitempty"`
-	SessionBegin      *sessionBeginDto      `json:"sessionBegin,omitempty"`
-	SessionBeginAck   *sessionBeginAckDto   `json:"sessionBeginAck,omitempty"`
-	SqlExec           *sqlExecDto           `json:"sqlExec,omitempty"`
-	SqlResult         *sqlResultDto         `json:"sqlResult,omitempty"`
-	TxCommit          *txCommitDto          `json:"txCommit,omitempty"`
-	TxRollback        *txRollbackDto        `json:"txRollback,omitempty"`
+	SyncHello          *syncHelloDto          `json:"syncHello,omitempty"`
+	SyncHelloAck       *syncHelloAckDto       `json:"syncHelloAck,omitempty"`
+	RefsRequest        *refsRequestDto        `json:"refsRequest,omitempty"`
+	RefsResult         *refsResultDto         `json:"refsResult,omitempty"`
+	FetchRequest       *fetchRequestDto       `json:"fetchRequest,omitempty"`
+	PackPage           *packPageDto           `json:"packPage,omitempty"`
+	RefUpdate          *refUpdateDto          `json:"refUpdate,omitempty"`
+	RefUpdateAck       *refUpdateAckDto       `json:"refUpdateAck,omitempty"`
+	SnapshotFetch      *snapshotFetchDto      `json:"snapshotFetch,omitempty"`
+	SnapshotPage       *snapshotPageDto       `json:"snapshotPage,omitempty"`
+	ProjectFetch       *projectFetchDto       `json:"projectFetch,omitempty"`
+	ProjectPage        *projectPageDto        `json:"projectPage,omitempty"`
+	ProjectWrite       *projectWriteDto       `json:"projectWrite,omitempty"`
+	ProjectWriteResult *projectWriteResultDto `json:"projectWriteResult,omitempty"`
+	CommitPush         *commitPushDto         `json:"commitPush,omitempty"`
+	CommitPushAck      *commitPushAckDto      `json:"commitPushAck,omitempty"`
+	DagDiff            *dagDiffDto            `json:"dagDiff,omitempty"`
+	TransactionReplay  *transactionReplayDto  `json:"transactionReplay,omitempty"`
+	ConflictReport     *conflictReportDto     `json:"conflictReport,omitempty"`
+	CompactionNotice   *compactionNoticeDto   `json:"compactionNotice,omitempty"`
+	IceArchiveNotice   *iceArchiveNoticeDto   `json:"iceArchiveNotice,omitempty"`
+	SnapshotRequest    *snapshotRequestDto    `json:"snapshotRequest,omitempty"`
+	SnapshotResponse   *snapshotResponseDto   `json:"snapshotResponse,omitempty"`
+	PositionAck        *positionAckDto        `json:"positionAck,omitempty"`
+	SchemaPush         *schemaPushDto         `json:"schemaPush,omitempty"`
+	SessionBegin       *sessionBeginDto       `json:"sessionBegin,omitempty"`
+	SessionBeginAck    *sessionBeginAckDto    `json:"sessionBeginAck,omitempty"`
+	SqlExec            *sqlExecDto            `json:"sqlExec,omitempty"`
+	SqlResult          *sqlResultDto          `json:"sqlResult,omitempty"`
+	TxCommit           *txCommitDto           `json:"txCommit,omitempty"`
+	TxRollback         *txRollbackDto         `json:"txRollback,omitempty"`
 
 	// Component 40 additions - see document_ops.go.
 	DocumentGet       *documentGetDto       `json:"documentGet,omitempty"`

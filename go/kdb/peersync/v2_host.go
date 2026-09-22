@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -39,6 +40,11 @@ type V2HostConfig struct {
 	// page of a fetch, after which the peer holds everything this node's refs named. It is how a
 	// node learns what inbound peers have, for peer-aware retention.
 	OnCaughtUp func(ns, peer string, since time.Time)
+	// WriteBack, when set, applies a filtered projection's local write to its source namespace
+	// as principal, and says what became of it. An error means the source could not decide now
+	// (unavailable, not the home): it goes back as PEER_ERROR and the replica tries again later.
+	// Unset, the host does not offer write-back.
+	WriteBack func(principal auth.Principal, m wire.ProjectWriteMessage) (wire.ProjectWriteResultMessage, error)
 }
 
 // V2Host serves one v2 peer-sync connection.
@@ -148,6 +154,8 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		return h.refUpdate(m)
 	case wire.ProjectFetchMessage:
 		return h.projectFetch(m)
+	case wire.ProjectWriteMessage:
+		return h.projectWrite(m)
 	case wire.SnapshotFetchMessage:
 		env, err := h.env(m.Namespace, false)
 		if err != nil {
@@ -221,8 +229,35 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 	return wire.SyncHelloAckMessage{
 		H: header(wire.MsgSyncHelloAck, m.H.CorrelationID), Accepted: true,
 		NodeID: h.cfg.NodeID, Protocol: wire.SyncProtocolVersion,
-		Capabilities: intersect(HostCapabilities, m.Capabilities), Refs: refs,
+		Capabilities: intersect(h.capabilities(), m.Capabilities), Refs: refs,
 	}, nil
+}
+
+func (h *V2Host) capabilities() []string {
+	if h.cfg.WriteBack == nil {
+		return HostCapabilities
+	}
+	return append(slices.Clone(HostCapabilities), wire.SyncCapWriteBack)
+}
+
+// projectWrite hands a projection's write to the source. The namespace must be one the session
+// may read as a projection; what the write itself may touch is the source's to authorize.
+func (h *V2Host) projectWrite(m wire.ProjectWriteMessage) (wire.Message, error) {
+	if h.cfg.WriteBack == nil {
+		return nil, &UnsupportedFrameError{Type: m.H.MessageType}
+	}
+	h.mu.Lock()
+	principal := h.principal
+	h.mu.Unlock()
+	if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.StreamSubscribeAction{Namespace: m.Namespace}); err != nil {
+		return nil, err
+	}
+	res, err := h.cfg.WriteBack(principal, m)
+	if err != nil {
+		return nil, err
+	}
+	res.H, res.Namespace = header(wire.MsgProjectWriteResult, m.H.CorrelationID), m.Namespace
+	return res, nil
 }
 
 func isLiteralNamespace(p string) bool {

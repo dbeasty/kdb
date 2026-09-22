@@ -111,6 +111,13 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 					return code, code != wire.ErrorCodeInternal
 				},
 				CreateOnPush: h.runtime.PeerCreateOnPush,
+				WriteBack: func(principal auth.Principal, m wire.ProjectWriteMessage) (wire.ProjectWriteResultMessage, error) {
+					rt, err := h.runtime.namespaceSet().Resolve(m.Namespace, false)
+					if err != nil {
+						return wire.ProjectWriteResultMessage{}, err
+					}
+					return rt.ApplyWriteBack(principal, m)
+				},
 				OnCaughtUp: func(ns, peer string, since time.Time) {
 					if rt, ok := h.runtime.namespaceSet().Get(ns); ok {
 						rt.NoteInboundPeer(peer, since)

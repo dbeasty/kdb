@@ -269,6 +269,12 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 
 	// Cheapest-first refusals, before any gate: the same order runTransaction checks them in.
 	for _, p := range ps {
+		if p.rt.ProjectionOf != "" && !system {
+			// A write-back projection sends each local transaction to its source on its own; a
+			// group spanning it and anything else could not arrive there as one.
+			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: p.ns,
+				Err: &ProjectionReadOnlyError{Namespace: p.ns, Source: p.rt.ProjectionOf}}
+		}
 		if err := p.rt.admitWrite(p.tx, principal, system); err != nil {
 			return CrossNamespaceResult{}, &CrossNamespaceError{Namespace: p.ns, Err: err}
 		}

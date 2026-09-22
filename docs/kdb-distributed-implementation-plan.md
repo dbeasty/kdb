@@ -667,7 +667,7 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
   - **Deviation:** parts are *not* held back from readers until their group is complete, as the plan had proposed. That would make one namespace's availability depend on another's replication, which multi-leader replication exists to avoid. The flag tells a reader what they may be looking at instead.
 - **6.5:** the user guide's "Peer sync and replication" section is rewritten around `--peer`, partitioning by namespace, conflicts, snapshots, retention and `_kdb/meta`. The flags table covers the new flags.
 
-### Phase 7 — landed (7.1–7.3; 7.4 and 7.5 deliberately not)
+### Phase 7 — landed (7.1–7.4; 7.5 deliberately not)
 
 **Filter.** `sql.ParseFilter` makes a WHERE expression usable on its own, and it's evaluated with `sql.EvalPredicate` against each document.
 
@@ -688,8 +688,9 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 - `sql/filter_test.go`.
 - e2e `test_filtered_peer_keeps_only_matching_documents`.
 
+**7.4, offline write-back (landed later; see "Phase 7.4 — landed" below).**
+
 **Not built:**
-- **7.4, offline write-back.** A projection is read-only, and writes go to the source directly. An outbox that queues writes while offline and replays them as `TransactionReplay` needs its own design for conflicts coming back through the projection. The read-only refusal names the source, so a client knows where to write.
 - **7.5, stream Mode 1/2 rebuilt on projections.** The existing stream hub keeps working (and gained authentication in Phase 0). Folding it into projections is a refactor with no new capability, so it's deferred until someone needs resumable streams.
 
 ### Phase 8 — gate evaluated, not built
@@ -767,3 +768,41 @@ An adversarial review of phases 0–10 found eight defects. Each has a regressio
    - A peer's `LastSync` is now the time its sync *started*. The inbound `OnCaughtUp` passes the time of the session's hello, so commits made during a long transfer stay above the floor.
    - `foreignGroups` is memory only. After a restart, an arrived part is recognised by the flag it left in the durable conflict queue, so a group can still complete.
    - **Not changed:** commit listeners fire before the delta log is fsynced, as they always have. A crash can lose a commit a listener already saw. Peers get it again on the next sync, because the refs they compare are durable.
+
+### Phase 7.4 — landed (offline write-back to filtered projections)
+
+**Configuration.** A filtered peer with `writeback=true` makes its projection writable. The service knows which projections are write-back from the peer config, before any sync runs, so a node that starts offline takes writes straight away.
+
+**The DAG is the outbox.** There is no separate outbox log to keep consistent with the data.
+- **A local write** on a write-back projection is an ordinary client commit. Its message is `kdb:writeback-local/1 <doc>=<base content hash|-> …`, where each base is read under the write gate from the tree the commit lands on.
+- **A decision** is a later system commit, `kdb:writeback/1 commit=<local> outcome=<applied|conflict|refused>`.
+- **Pending** means the local commits above the local write the newest decision names. Decisions are made in order, so that is the whole rule, and a local write made while a decision was in flight sits below the decision but above the write it names. The projection's history is a single line, so walking the first parent is exact.
+- **The cache.** An in-memory list caches the result and is rebuilt from the DAG after any error, or after a restart.
+
+**Sync order.** Before each pull, `SyncProjection` sends every pending write in order as PROJECT_WRITE (0x32), and the source answers PROJECT_WRITE_RESULT (0x33).
+- **What the source commits.** For each document it replaces the value with the write's final state (delete+write). Every op carries a precondition: `ExpectContentHash(base)`, or `ExpectAbsent` if the projection didn't hold the document. A guarded op is judged by its precondition alone, so the write lands on whatever head it reaches the gate at, and never overwrites a change it didn't see.
+- **Idempotent resend.** The source transaction id is `DerivedUUID("kdb:writeback/1:" + local commit hash)`, and the source checks for an existing commit with that id first. A resend after a lost reply therefore answers `applied`. The engine's own idempotency check is not enough: it only matches a retry onto the same parents.
+- **Outcomes:**
+  - `applied`: the local value already is the source's.
+  - `conflict` (a precondition failed) or `refused` (authorization, schema, a read-only source, ResourceExhausted, an unsupported op): the reply carries the source's current state of each document, as far as the principal may read it. The replica records a `write-back` conflict entry with the attempted and current bodies. The decision commit then puts each document back to the source's state, or removes it if that state is absent, unreadable or outside the filter. The decision and its effect land in one commit.
+  - Any other failure is a PEER_ERROR. The write stays pending and the cycle stops.
+- **Pulled pages skip pending documents.** Otherwise a pull would overwrite a local value before the source decides on it. Client writes, pulled pages and decisions are serialized by one mutex, so the pending set can't change between the check and the commit. A pulled page may skip a document whose source value changed; that write then conflicts, and the conflict reply restores the source's value. The projection doesn't depend on a later delta for it.
+
+**Authorization.** The source authorizes a write-back as the sync session's principal: `StreamSubscribeAction` on the namespace, `TxCommitAction`, then the ordinary per-document checks in `admitWrite`. The replica's local writers are authorized locally as usual. The source never learns who wrote at the site, only the peer's user.
+
+**Restrictions.**
+- Only `WriteOp` and `DeleteOp` are accepted (`ErrProjectionWriteOp`).
+- A projection can't take part in a cross-namespace transaction. Each local transaction reaches the source on its own, so a group could not arrive there as one.
+- A dependent chain of local writes (a second edit of a document before the first is decided) cascades: if the first is rejected, the second's base no longer matches and it is rejected too. Both attempts are kept in the conflict queue.
+
+**Two defects found on the way, fixed in 11d5c9f.** A `WriteOp` merges into the document it lands on.
+- **Projection pages** carry final states, so a key removed at the source used to stay in the projection. Pages now write delete+write.
+- **`_kdb/meta` records** had the same problem: an index created again after a drop stayed `dropped:true`. They now write delete+write too.
+
+**Also fixed (ed8a6b8).** A local DDL change could race the meta reconciler, which applied a definition it had read just before the change. For example, a DROP INDEX was undone by the CREATE the reconciler had read a moment earlier. Local definition changes now run under the reconciler's lock (`MetaStore.Local`).
+
+**Tests:**
+- `server/writeback_test.go`: applied (update, create, delete); conflict with the source's value put back, including a pull in between that must not overwrite the pending write; offline then reconnect, with dependent writes in order; idempotent resend after the source moved on; pending list rebuilt from the DAG with a write made during a decision; refusal not retried; leaving the filter; unsupported ops refused.
+- `server/projection_test.go` `TestProjectionFollowsKeyRemoval`; `server/meta_test.go` `TestIndexRecreatedAfterDropReachesPeer`.
+- `replication/config_test.go` `TestParseWriteBackPeer`; `wire` `TestRoundTripProjectWrite`.
+- e2e `test_writeback_peer_sends_local_writes_to_source`.

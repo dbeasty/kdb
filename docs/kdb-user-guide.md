@@ -1168,6 +1168,8 @@ side of a pair needs `--peer`: it pushes its writes (right after each commit) an
 | `user`, `password-env` | credentials. The password is read from the named environment variable, never from the flag |
 | `create=true` | let a pull create namespaces this node doesn't hold yet |
 | `bootstrap=snapshot` | an empty namespace starts from a snapshot of the peer's current state instead of its whole history |
+| `writeback=true` | a filtered peer's projection takes writes and sends them to the source (see below) |
+| `filter=` | keep only the documents of one namespace that match a SQL condition (see below). Always the last field, because the condition may contain commas |
 
 **Connections.** Outbound connections use the node's own `--tls-*` settings, so a shared CA gives
 node-to-node mTLS. Every node has a stable identity, stored in `NODE` in its data directory and
@@ -1182,6 +1184,47 @@ matching `namespaces=` patterns. Cross-namespace transactions still work within 
 
 When a group replicates to a node that lacks one of its namespaces, that group is reported as
 incomplete there: its parts are visible, but the group can't be atomic on that node.
+
+### A subset of one namespace: filtered peers
+
+A peer with `filter=` keeps a *projection*: only the documents of one namespace that match a
+KDB-SQL condition, and only those the peer's `user` may read.
+
+```bash
+kdb-service --peer "name=hq,addr=tcps://hq:4242,namespaces=orders,user=eu-site,password-env=HQ_PW,filter=region = 'EU'"
+```
+
+- **Where it lives.** The projection is its own local namespace, `orders.projection-<8 hex>` (a hash
+  of the filter). It is not a peer of `orders`: it has its own commits, and it follows the source
+  as documents enter the filter, change, leave it or are deleted.
+- **Read-only by default.** A write to it is refused with an error that names the source.
+
+**Writing to a projection (`writeback=true`).** With write-back on, the projection takes document
+writes and deletes:
+- **Local first.** A write commits locally at once and is readable there, so a site keeps working
+  offline.
+- **Sent on each sync.** Every sync first sends the waiting writes to the source, oldest first, and
+  then pulls.
+- **Applied only over what the projection saw.** The source applies a write only if each document
+  it touches still has the content the projection had when the write was made. Nothing is
+  overwritten blindly.
+- **Conflicts and refusals.** If a document changed at the source in the meantime, or the source
+  refuses the write (not authorized, a schema violation), the write is not applied. It goes to
+  the projection's conflict queue with what was attempted (`GET /v1/ns/{projection}/conflicts`),
+  and the projection holds the source's version again. There is nothing to merge: to keep the
+  change, write it again over the current version, then dismiss the entry
+  (`DELETE …/conflicts/{id}`).
+- **Retries.** If the source can't decide right now (unreachable, busy, not the home), the write
+  stays pending and goes again on the next sync. A resend of a write the source already applied
+  is recognised, not applied twice.
+
+A few things to keep in mind:
+- **One identity.** The source sees every write-back as the peer's `user`, not as whoever wrote
+  locally. Grant that user exactly what the site may change.
+- **Only writes and deletes.** A projection can't take part in a cross-namespace transaction, and
+  it takes no file or schema operations.
+- **Leaving the filter.** A write that moves a document out of the filter is applied at the
+  source, and the next pull removes it from the projection.
 
 ### Conflicts
 

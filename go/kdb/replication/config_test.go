@@ -58,3 +58,16 @@ func TestParseFilteredPeer(t *testing.T) {
 		}
 	}
 }
+
+func TestParseWriteBackPeer(t *testing.T) {
+	p, err := ParsePeer("name=hq,addr=tcp://hq:1,namespaces=orders,writeback=true,filter=region = 'EU'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.WriteBack || p.Filter != "region = 'EU'" {
+		t.Fatalf("parsed %+v", p)
+	}
+	if _, err := ParsePeer("name=hq,addr=tcp://hq:1,namespaces=orders,writeback=true"); err == nil {
+		t.Error("accepted writeback on an unfiltered peer")
+	}
+}

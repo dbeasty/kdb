@@ -51,6 +51,24 @@ func (p projectionTarget) DocIDs() ([]codec.UUID, error) {
 }
 
 func (p projectionTarget) Apply(ops []document.Op, source string, complete bool) error {
+	if p.rt.writeBackOn() {
+		// A document with a local write the source has not decided on keeps its local value:
+		// the decision, not the page, says what it becomes.
+		st := &p.rt.writeBack
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		pending, err := p.rt.pendingDocsLocked()
+		if err != nil {
+			return err
+		}
+		kept := ops[:0:0]
+		for _, op := range ops {
+			if !pending[opDocID(op)] {
+				kept = append(kept, op)
+			}
+		}
+		ops = kept
+	}
 	_, err := p.rt.systemCommit(replacing(ops), peersync.ProjectionMessage(source, complete))
 	return err
 }

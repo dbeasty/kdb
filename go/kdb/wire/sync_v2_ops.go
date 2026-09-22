@@ -28,6 +28,8 @@ const (
 	SyncCapStubs    = "stubs"
 	SyncCapSnapshot = "snapshot"
 	SyncCapFilter   = "filter"
+	// SyncCapWriteBack: the host accepts PROJECT_WRITE, a projection's local writes sent back.
+	SyncCapWriteBack = "writeback"
 )
 
 // RefKind distinguishes the two kinds of ref a namespace has.
@@ -552,6 +554,91 @@ type ProjectPageMessage struct {
 
 func (m ProjectPageMessage) Header() Header { return m.H }
 
+// WriteBackDoc is one document's part of a write-back: its final state on the projection, and the
+// state the projection held when the write was made.
+type WriteBackDoc struct {
+	DocID string
+	// Body is the document's final JSON; empty when Deleted.
+	Body    string
+	Deleted bool
+	// BaseHash is the content hash of the document the write replaced, "" if it was absent. The
+	// host applies the write only if it still holds exactly that.
+	BaseHash string
+}
+
+// ProjectWriteMessage sends one local transaction of a projection back to its source
+// (PROJECT_WRITE 0x32). TxID makes it idempotent: a resend of an applied write answers applied.
+type ProjectWriteMessage struct {
+	H         Header
+	Namespace string
+	TxID      string
+	Docs      []WriteBackDoc
+}
+
+func (m ProjectWriteMessage) Header() Header { return m.H }
+
+// Write-back outcomes.
+const (
+	// WriteBackApplied: the source committed the write (or had already).
+	WriteBackApplied = "applied"
+	// WriteBackConflict: a document had changed at the source since the projection's base.
+	WriteBackConflict = "conflict"
+	// WriteBackRefused: the source will never accept this write as sent - not authorized, a
+	// schema violation, a namespace that takes no writes. Resending it cannot help.
+	WriteBackRefused = "refused"
+)
+
+// WriteBackCurrent is the source's current state of one document after a write-back it did not
+// apply, so the projection can put it back. Absent when the document is gone or not readable.
+type WriteBackCurrent struct {
+	DocID  string
+	Body   string
+	Absent bool
+}
+
+// ProjectWriteResultMessage answers PROJECT_WRITE (PROJECT_WRITE_RESULT 0x33). A failure that
+// may pass - the source unavailable, not the home - is a PEER_ERROR instead, and the write stays
+// pending.
+type ProjectWriteResultMessage struct {
+	H         Header
+	Namespace string
+	Outcome   string
+	CommitHex string
+	Reason    string
+	// Current is set unless Outcome is applied: the source's state of every document the write
+	// named.
+	Current []WriteBackCurrent
+}
+
+func (m ProjectWriteResultMessage) Header() Header { return m.H }
+
+type writeBackDocDto struct {
+	DocID    string `json:"docId"`
+	Body     string `json:"body,omitempty"`
+	Deleted  bool   `json:"deleted,omitempty"`
+	BaseHash string `json:"baseHash,omitempty"`
+}
+
+type projectWriteDto struct {
+	Namespace string            `json:"namespace"`
+	TxID      string            `json:"txId"`
+	Docs      []writeBackDocDto `json:"docs"`
+}
+
+type writeBackCurrentDto struct {
+	DocID  string `json:"docId"`
+	Body   string `json:"body,omitempty"`
+	Absent bool   `json:"absent,omitempty"`
+}
+
+type projectWriteResultDto struct {
+	Namespace string                `json:"namespace"`
+	Outcome   string                `json:"outcome"`
+	CommitHex string                `json:"commitHex,omitempty"`
+	Reason    string                `json:"reason,omitempty"`
+	Current   []writeBackCurrentDto `json:"current,omitempty"`
+}
+
 type projectFetchDto struct {
 	Namespace string `json:"namespace"`
 	Filter    string `json:"filter"`
@@ -585,6 +672,20 @@ func encodeProjectionMessage(msg Message) (payloadEnvelope, bool, error) {
 		return payloadEnvelope{Kind: "projectPage", ProjectPage: &projectPageDto{
 			Namespace: m.Namespace, AtHex: m.AtHex, Reset: m.Reset, Writes: writes, Deletes: m.Deletes, Next: m.Next, Done: m.Done,
 		}}, true, nil
+	case ProjectWriteMessage:
+		docs := make([]writeBackDocDto, len(m.Docs))
+		for i, d := range m.Docs {
+			docs[i] = writeBackDocDto{DocID: d.DocID, Body: d.Body, Deleted: d.Deleted, BaseHash: d.BaseHash}
+		}
+		return payloadEnvelope{Kind: "projectWrite", ProjectWrite: &projectWriteDto{Namespace: m.Namespace, TxID: m.TxID, Docs: docs}}, true, nil
+	case ProjectWriteResultMessage:
+		current := make([]writeBackCurrentDto, len(m.Current))
+		for i, c := range m.Current {
+			current[i] = writeBackCurrentDto{DocID: c.DocID, Body: c.Body, Absent: c.Absent}
+		}
+		return payloadEnvelope{Kind: "projectWriteResult", ProjectWriteResult: &projectWriteResultDto{
+			Namespace: m.Namespace, Outcome: m.Outcome, CommitHex: m.CommitHex, Reason: m.Reason, Current: current,
+		}}, true, nil
 	}
 	return payloadEnvelope{}, false, nil
 }
@@ -607,6 +708,26 @@ func decodeProjectionMessage(header Header, env payloadEnvelope) (Message, bool,
 			writes[i] = SnapshotDoc{DocID: x.DocID, Body: x.Body}
 		}
 		return ProjectPageMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, Reset: d.Reset, Writes: writes, Deletes: d.Deletes, Next: d.Next, Done: d.Done}, true, nil
+	case "projectWrite":
+		d := env.ProjectWrite
+		if d == nil {
+			return nil, true, newDecodeError("missing projectWrite body")
+		}
+		docs := make([]WriteBackDoc, len(d.Docs))
+		for i, x := range d.Docs {
+			docs[i] = WriteBackDoc{DocID: x.DocID, Body: x.Body, Deleted: x.Deleted, BaseHash: x.BaseHash}
+		}
+		return ProjectWriteMessage{H: header, Namespace: d.Namespace, TxID: d.TxID, Docs: docs}, true, nil
+	case "projectWriteResult":
+		d := env.ProjectWriteResult
+		if d == nil {
+			return nil, true, newDecodeError("missing projectWriteResult body")
+		}
+		var current []WriteBackCurrent
+		for _, x := range d.Current {
+			current = append(current, WriteBackCurrent{DocID: x.DocID, Body: x.Body, Absent: x.Absent})
+		}
+		return ProjectWriteResultMessage{H: header, Namespace: d.Namespace, Outcome: d.Outcome, CommitHex: d.CommitHex, Reason: d.Reason, Current: current}, true, nil
 	}
 	return nil, false, nil
 }

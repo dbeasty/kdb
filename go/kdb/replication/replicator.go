@@ -41,7 +41,7 @@ type Config struct {
 	Timeout time.Duration
 	// Projections opens (creating if need be) the local namespace that keeps the projection of
 	// a source namespace through a filter. Required only for filtered peers.
-	Projections func(source, filter string) (peersync.ProjectionTarget, error)
+	Projections func(source, filter string, writeBack bool) (peersync.ProjectionTarget, error)
 }
 
 // Replicator runs one sync loop per configured peer.
@@ -391,11 +391,12 @@ func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) err
 	} else {
 		started = time.Now().UTC()
 		var target peersync.ProjectionTarget
-		if target, err = l.r.cfg.Projections(source, l.peer.Filter); err == nil {
+		if target, err = l.r.cfg.Projections(source, l.peer.Filter, l.peer.WriteBack); err == nil {
 			res, err = peersync.SyncProjection(wire.NewCodec(wire.EncodingJSON), transport, peersync.ProjectionConfig{
 				NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
 				ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
 				Namespace:         source, Filter: l.peer.Filter, Timeout: l.r.cfg.Timeout, Target: target,
+				WriteBack: l.peer.WriteBack,
 			})
 		}
 	}
@@ -411,6 +412,7 @@ func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) err
 		st.ConsecutiveFailures, st.LastError, st.LastSuccess = 0, "", now
 		cur.LastError, cur.RemoteMain, cur.LastSync = "", res.Source, started
 		cur.Pulled += int64(res.Writes + res.Deletes)
+		cur.Pushed += int64(res.Written)
 	}
 	st.Namespaces[ns] = cur
 	if serr := l.r.cfg.State.Save(st); serr != nil && err == nil {

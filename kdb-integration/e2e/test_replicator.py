@@ -139,3 +139,40 @@ def test_filtered_peer_keeps_only_matching_documents():
                 srv.stop()
             finally:
                 srv.cleanup()
+
+
+def test_writeback_peer_sends_local_writes_to_source():
+    """A filtered --peer with writeback=true takes writes: they are readable on the replica at
+    once and reach the source on the next sync."""
+    import hashlib
+
+    from server_fixtures import helper
+
+    source = KdbServer().start()
+    replica = None
+    flt = "region = 'EU'"
+    proj = source.namespace + ".projection-" + hashlib.sha256(flt.encode()).hexdigest()[:8]
+    eu, fresh = "000000000000000000000000000e0011", "000000000000000000000000000e0012"
+    try:
+        put(source, eu, {"id": eu, "region": "EU", "n": 1})
+        replica = KdbServer(extra_args=[
+            "--peer", f"name=src,addr={source.peer_addr},namespaces={source.namespace},interval=300ms,writeback=true,filter={flt}"]).start()
+
+        def proj_get(doc):
+            r = helper("get", "--addr", replica.sql_addr, "--namespace", proj, "--doc-id", doc, check=False)
+            lines = r.stdout.strip().splitlines()
+            return json.loads(lines[1]) if r.returncode == 0 and len(lines) > 1 and lines[1] else None
+
+        wait_for("the EU document in the projection", lambda: proj_get(eu) is not None)
+        helper("put", "--addr", replica.sql_addr, "--namespace", proj, "--doc-id", fresh,
+               "--json", json.dumps({"id": fresh, "region": "EU", "n": 2}))
+        assert proj_get(fresh) is not None, "a local write is not readable on the replica"
+        wait_for("the local write to reach the source", lambda: (get(source, fresh) or {}).get("n") == 2)
+    finally:
+        for srv in (replica, source):
+            if srv is None:
+                continue
+            try:
+                srv.stop()
+            finally:
+                srv.cleanup()
