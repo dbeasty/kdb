@@ -12,6 +12,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/ws"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -75,6 +76,10 @@ type NamespaceSyncResult struct {
 	// ReceivedTips are the tips of every page this sync stored, so a caller whose sync is
 	// interrupted can pass them back as ExtraHaves and resume.
 	ReceivedTips []codec.Hash
+	// ResolutionMismatch is set when the two nodes' resolution chains for this namespace differ.
+	// Neither then merges: a divergence pulled here is queued as a conflict, and main is pushed
+	// only where it fast-forwards the peer. It clears once the chain definition has replicated.
+	ResolutionMismatch bool
 	// Err is set when this namespace failed; others may still have succeeded.
 	Err error
 }
@@ -151,6 +156,13 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 		return res
 	}
 	env.Peer = c.remoteNode
+	if env.Resolution.Chain.Hash() != remote.ResolutionHash {
+		// The two nodes would settle a conflict differently and so build different merges. Hold
+		// off merging on either side until they agree - report instead of resolving here, and
+		// do not propose a head the peer would have to merge (see push).
+		env.Resolution = ResolutionOptions{Policy: transaction.ConflictPolicyStrict}
+		res.ResolutionMismatch = true
+	}
 	if cfg.Mode&SyncPull != 0 {
 		if err := c.pull(cfg, env, remote, &res); err != nil {
 			res.Err = err
@@ -207,7 +219,7 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			return err
 		}
 		if !env.DAG.HasCommit(h) {
-			if haves, err = c.fetchRef(cfg, env, remote.Namespace, h, haves, res); err != nil {
+			if haves, err = c.fetchRef(cfg, env, remote.Namespace, remote.Shallow, h, haves, res); err != nil {
 				if ref.kind == wire.RefBranch && ref.name == mainBranch {
 					return err
 				}
@@ -233,7 +245,7 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 
 // fetchRef pages in everything want needs that this node lacks, returning the haves grown by
 // what arrived.
-func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
+func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow []string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
 	for {
 		reply, err := c.request(wire.FetchRequestMessage{
 			H: header(wire.MsgFetchRequest, c.next()), Namespace: ns,
@@ -249,6 +261,9 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, want cod
 		n, err := StoreCommits(env, page.Commits, page.Stubs)
 		res.Pulled += n
 		if err != nil {
+			if root, ok := unsharedRoot(env, page.Commits, shallow); ok {
+				return haves, env.noteUnrelated(root, err)
+			}
 			return haves, err
 		}
 		tips := pageTips(page.Commits)
@@ -284,6 +299,10 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 		local, err := codec.HashFromHex(ref.hex)
 		if err != nil {
 			return err
+		}
+		if res.ResolutionMismatch && ref.kind == wire.RefBranch && ref.name == mainBranch && !fastForwards(env, remoteHex, local) {
+			res.RefErrors[ref.key()] = "not pushed: the peer's conflict resolution chain differs from this node's, so it must not merge"
+			continue
 		}
 		haves := append([]codec.Hash(nil), known...)
 		for {
@@ -374,11 +393,17 @@ func syncV1Fallback(w wire.Codec, transport stream.Transport, cfg V2ClientConfig
 			out.Namespaces = append(out.Namespaces, res)
 			continue
 		}
+		// v1 carries no chain hash: with a chain, merge nothing over it - queue what diverges
+		// and push only fast-forwards (see ClientConfig.FastForwardPushOnly).
+		policy, resolver, ffOnly := env.Resolution.Policy, env.Resolution.Resolver, false
+		if env.Resolution.Chain != nil {
+			policy, resolver, ffOnly = transaction.ConflictPolicyStrict, nil, true
+		}
 		client := NewClient(w, transport, env.DAG, env.Storage)
 		session, err := client.Connect(ClientConfig{
 			NamespaceID: ns, NodeID: cfg.NodeID, PeerURI: cfg.PeerURI, ConnectionContext: cfg.ConnectionContext,
 			TLS: cfg.TLS, Node: env.Node, ApplyToStorage: env.ApplyToStorage, PersistAsync: env.PersistAsync,
-			Persist: env.Persist, ConflictPolicy: env.Resolution.Policy, ConflictResolver: env.Resolution.Resolver,
+			Persist: env.Persist, ConflictPolicy: policy, ConflictResolver: resolver, FastForwardPushOnly: ffOnly,
 		})
 		if err != nil {
 			res.Err = err
@@ -466,4 +491,17 @@ func dial(transport stream.Transport, uri string, tls *core.TransportTlsSettings
 		return wsTransport.ConnectWithOptions(uri, opts)
 	}
 	return transport.Connect(uri)
+}
+
+// fastForwards reports whether moving a ref from remoteHex to local is a fast-forward: remoteHex
+// is empty or an ancestor of local that this node holds.
+func fastForwards(env IngestEnv, remoteHex string, local codec.Hash) bool {
+	if remoteHex == "" {
+		return true
+	}
+	r, err := codec.HashFromHex(remoteHex)
+	if err != nil || !env.DAG.HasCommit(r) {
+		return false
+	}
+	return r == local || env.DAG.IsAncestor(r, local)
 }

@@ -846,7 +846,7 @@ The fan-out tests were rewritten for coalescing: 300 commits behind a stuck subs
 
 ---
 
-## Proposed next phases (10.5, 11–15) — not started
+## Proposed next phases (10.5, 11–15) — 10.5 in progress, the rest not started
 
 These come from the research survey and gap analysis in [kdb-distributed-self-healing-research.md](kdb-distributed-self-healing-research.md). That document carries the rationale, the citations and the full work items. The phases are listed here so the plan shows the sequence.
 
@@ -858,4 +858,58 @@ These come from the research survey and gap analysis in [kdb-distributed-self-he
 | 13 | Scrub and self-repair from peers in the maintenance scheduler; `integrity.Repair` fetches missing commits from peers | 12 |
 | 14 | Edge lazy fill: projection read-through with inclusion proofs, bounded hoard, filter widening by tree diff, deepen | 12 |
 | 15 | Gated on measurement: Bloom/RIBLT negotiation, φ-accrual suspicion, changed-docID Bloom per commit, session head tokens | — |
+
+### Phase 10.5, slice 1 — landed (resolution chains)
+
+**Landed:**
+- **Chains:** `peersync/resolution_chain.go` adds the `source-priority`, `validity`, `field-merge`, `last-write` and `queue` rules. Each is evaluated per document in canonical parent order, so it is symmetric.
+- **Order of decision:** `resolveConflicting` now tries `Choose`, then the chain, then the policy, **per document**. Before, `Choose` was all-or-nothing. An operator's choice for one document now stands while the chain settles the rest, and a report names only what is still undecided.
+- **Base:** it comes from `CommonAncestor(p0, p1)` in canonical order. With a criss-cross, the local/incoming order would let two nodes pick different bases.
+- **Resolver input:** `transaction.DocumentConflict` gains `ExistingOrigin`/`IncomingOrigin` ({node, commit, timestamp}), and `BaseDoc` is now filled.
+- **Replication:** the chain is replicated as `_kdb/meta` kind `resolution` (`MetaStore.SetResolution`), with `GET`/`PUT /v1/ns/{ns}/resolution`.
+- **Hash check:** `NamespaceRefs.ResolutionHash` travels in the hello ack. The client compares hashes, and on a mismatch it pulls with strict resolution and pushes `main` only as a fast-forward. So neither side builds a merge under a chain the other lacks. The Go-only v2 frames mean there's no Kotlin counterpart.
+
+**Superseded by slice 2 below.** Still not built: node labels for `source-priority`, and a chain dry-run preview over the queued conflicts.
+
+**Known limit:** the chain hash doesn't cover the schema that `validity` checks against. Two nodes that have received different schema versions can judge differently until the schema has replicated.
+
+### Phase 10.5, slice 2 — landed (resolver authority)
+
+**The rule.** A terminal `authority` rule with three settings:
+- `pending`: `hold` (queue unmerged) or `provisional` (merge by last write now).
+- `node`: the one node that notifies the authority.
+- `timeout`: after it, the fallback becomes final.
+
+**Every node learns of a provisional decision from the merge itself.** Its message is `kdb:merge/1 provisional=<ids>`, part of the deterministic merge content. Every node that adopts the merge records the same `provisional` entry, with its id derived from the merge. So it doesn't matter whether the notifying node made the merge or fetched it.
+
+**Closing entries everywhere.** The authority's decision is an ordinary commit with message `kdb:resolve/1 <id>`, and every node that adopts it closes that entry. A held divergence is instead **swept** once `main` contains its incoming side. That covers a settlement arriving from a different peer than the one the divergence was recorded against, which the per-peer clear cannot see.
+
+**Delivery.**
+- A signed webhook (`ConflictWebhook`), or poll-with-ack.
+- The queue keeps a `delivered` flag across unchanged re-sightings and an `OnRecord` hook.
+- Delivery is at least once, keyed by the conflict id.
+
+**Permission.** A new RBAC kind, `resolve` (`auth.ConflictResolveAction`). It applies only to namespaces whose chain names an authority; other namespaces keep the commit-rights check.
+
+**v1.** The host is strict whenever the namespace has a chain, and the v1 client pushes only fast-forwards (`FastForwardPushOnly`).
+
+**Surfaces:**
+- control plane: `?authority`, `?undelivered` and `?doc` filters; `ack`; `resolve-all` with dry run; 403 and 409 mapped;
+- CLI: `resolve --all`, `resolution`, and richer `conflicts`. The CLI reads the chain from `_kdb/meta`;
+- `kdb-service` flags: `--conflict-webhook*`, plus a 30s expiry loop.
+
+**Tests:**
+- peersync scenarios;
+- server end-to-end tests over real sync (hold, provisional overrule/confirm, stale refusal, permissions, bulk, poll/ack, webhook retry and signature, notifying-node filter, v1, timeouts);
+- control-plane tests;
+- a CLI scenario;
+- a Python e2e test against two `kdb-service` processes with a real webhook receiver;
+- Kotlin interop: the Kotlin CLI replays Go's provisional-merge and resolve history to identical documents, and grants are tested case for case in both trees.
+
+**Traps found:**
+- `codec.UUID` and `codec.Hash` have no JSON marshalers, so `transaction.ConflictOrigin` needed its own. Without it, origins went over the API and into the durable queue as raw structs.
+- A test mutating a recorded entry's `Items` slice aliased the queue's copy: the queue stores caller slices.
+- Go↔Kotlin *peer sync* is broken independently of this work: v2 hello isn't decodable by Kotlin, and the CommitPushAck frames mismatch. The interop surface that works, and is tested, is Kotlin reading Go-written data.
+
+**Not built:** node labels for `source-priority` (would need label assignments covered by the chain hash to stay deterministic), and an embedded-Go convenience beyond `ConflictQueue.OnRecord` plus the async API.
 

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -37,7 +38,47 @@ const (
 	// the documents had changed there, or the source refused it. The projection holds the
 	// source's state again; the entry keeps what was attempted.
 	ConflictWriteBack ConflictKind = "write-back"
+	// ConflictProvisional: a merge settled documents by last write on a resolver authority's
+	// behalf (RuleAuthority, PendingProvisional). The merge stands; the entry is the authority's
+	// chance to overrule it. Its id is derived from the merge, so it is the same on every node,
+	// and the authority's resolution closes it everywhere it replicates.
+	ConflictProvisional ConflictKind = "provisional"
+	// ConflictUnrelatedHistory: the peer's history is rooted at a snapshot (a shallow root) this
+	// node has no ancestry for, while this node has history of its own - so none of the peer's
+	// commits can be stored here, and the namespace cannot sync with that peer. Merging the two
+	// needs the peer's state grafted beside this node's history, which is not built yet (see
+	// docs/kdb-distributed-self-healing-research.md, Phase 11).
+	ConflictUnrelatedHistory ConflictKind = "unrelated-history"
 )
+
+// UnrelatedHistoryError is a sync that cannot proceed because the peer's history is rooted at a
+// snapshot Root this node does not share - see ConflictUnrelatedHistory.
+type UnrelatedHistoryError struct {
+	Namespace string
+	Root      codec.Hash
+	Cause     error
+}
+
+func (e *UnrelatedHistoryError) Error() string {
+	return fmt.Sprintf("peer sync: %s: the peer's history is rooted at snapshot %s, which this node has no history for; "+
+		"this node's own history cannot be merged with it yet (%v)", e.Namespace, e.Root.Hex(), e.Cause)
+}
+
+func (e *UnrelatedHistoryError) Unwrap() error { return e.Cause }
+
+// resolveMessagePrefix introduces the id of the conflict entry a commit resolves, in the message
+// of the commit an authority makes to settle it. Every node that adopts such a commit closes its
+// entry with that id.
+const resolveMessagePrefix = "kdb:resolve/1 "
+
+// ResolveMessage is the message of a commit resolving entry id.
+func ResolveMessage(id string) string { return resolveMessagePrefix + id }
+
+// ResolvedEntry returns the entry a commit resolves, if its message says it resolves one.
+func ResolvedEntry(c document.Commit) (string, bool) {
+	id, ok := strings.CutPrefix(c.Message, resolveMessagePrefix)
+	return id, ok && id != ""
+}
 
 // ConflictEntry is one conflict awaiting an operator or application.
 type ConflictEntry struct {
@@ -60,6 +101,18 @@ type ConflictEntry struct {
 	LastSeen    time.Time             `json:"lastSeen"`
 	// Seen counts how many syncs have reported this conflict.
 	Seen int `json:"seen"`
+	// Details holds, per conflicting document, its base value and which writes produced each
+	// side - for a resolver authority, which may decide by where a value came from.
+	Details []ConflictDetail `json:"details,omitempty"`
+	// Authority is set when the namespace's chain hands this conflict to a resolver authority;
+	// AuthorityNode is the node that notifies it (empty: every node).
+	Authority     bool   `json:"authority,omitempty"`
+	AuthorityNode string `json:"authorityNode,omitempty"`
+	// Delivered is set once the authority has acknowledged a notification of this entry. It is
+	// kept while the entry is re-recorded unchanged, and cleared when what it reports changes.
+	Delivered bool `json:"delivered,omitempty"`
+	// MergeHex is, for a provisional entry, the merge that settled it.
+	MergeHex string `json:"mergeHex,omitempty"`
 }
 
 // ConflictQueue holds a node's open replication conflicts, durably when it has a directory.
@@ -71,6 +124,7 @@ type ConflictQueue struct {
 	dir     string
 	mu      sync.Mutex
 	entries map[string]ConflictEntry
+	notify  func(ConflictEntry)
 }
 
 // NewConflictQueue opens the queue kept in dir, loading what is already there. An empty dir keeps
@@ -125,6 +179,9 @@ func (q *ConflictQueue) Record(e ConflictEntry) (ConflictEntry, error) {
 	defer q.mu.Unlock()
 	if prev, ok := q.entries[e.ID]; ok {
 		e.FirstSeen, e.Seen = prev.FirstSeen, prev.Seen
+		if prev.Delivered && reflect.DeepEqual(prev.Items, e.Items) {
+			e.Delivered = true
+		}
 	} else {
 		e.FirstSeen = now
 	}
@@ -134,7 +191,43 @@ func (q *ConflictQueue) Record(e ConflictEntry) (ConflictEntry, error) {
 		return e, err
 	}
 	q.entries[e.ID] = e
+	notify := q.notify
+	if notify != nil && !e.Delivered {
+		// Outside the caller's view, but under the queue's lock: a notifier only kicks a loop.
+		notify(e)
+	}
 	return e, nil
+}
+
+// OnRecord registers fn to be told about every entry recorded that is not yet delivered. It must
+// not block or call back into the queue; a notifier kicks its own loop.
+func (q *ConflictQueue) OnRecord(fn func(ConflictEntry)) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.notify = fn
+}
+
+// MarkDelivered records that the authority acknowledged sent, the entry as it was when sent. An
+// entry whose report has changed since - recorded again with different items - stays undelivered.
+func (q *ConflictQueue) MarkDelivered(sent ConflictEntry) error {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	e, ok := q.entries[sent.ID]
+	if !ok || e.Delivered || !reflect.DeepEqual(e.Items, sent.Items) {
+		return nil
+	}
+	e.Delivered = true
+	if err := q.writeLocked(e); err != nil {
+		return err
+	}
+	q.entries[sent.ID] = e
+	return nil
 }
 
 // Get returns the entry with id.

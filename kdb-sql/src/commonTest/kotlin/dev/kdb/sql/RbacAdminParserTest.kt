@@ -50,6 +50,14 @@ class RbacAdminParserTest {
         assertEquals(GrantSpec("write", "orders", null, null, "analyst"), stmt.grant)
     }
 
+    /** GRANT resolve yields the grant string the Go server checks conflict resolution against. */
+    @Test
+    fun grantResolveOnCollection() {
+        val stmt = parser.parse("GRANT RESOLVE ON COLLECTION app.data TO resolver")
+        assertIs<SqlStatement.Grant>(stmt)
+        assertEquals(GrantSpec("resolve", "app", "data", null, "resolver"), stmt.grant)
+    }
+
     @Test
     fun grantOnCollection() {
         val stmt = parser.parse("GRANT read ON COLLECTION orders.invoices TO analyst")

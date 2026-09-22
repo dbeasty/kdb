@@ -182,6 +182,8 @@ type KdbServerRuntime struct {
 	Conflicts *peersync.ConflictQueue
 	// home is this namespace's single-home assignment, if any - see home.go.
 	home atomic.Pointer[Home]
+	// resolution is the namespace's conflict resolution chain, a replicated definition (nil: none).
+	resolution atomic.Pointer[peersync.ResolutionChain]
 	// ProjectionOf, when set, makes this namespace a filtered projection of that source namespace
 	// (see peersync.SyncProjection): its content comes only from the source, so every write but
 	// the projection's own is refused, clients' and peers' alike.

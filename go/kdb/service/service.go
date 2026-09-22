@@ -51,6 +51,8 @@ func Main() {
 	var configPath string
 	var showVersion bool
 	var peerConflictPolicy string
+	var conflictWebhook, conflictWebhookSecret string
+	var conflictWebhookInterval time.Duration
 	var streamAllowAnonymous bool
 	var peerSpecs []string
 	var peerCreateNamespaces bool
@@ -67,6 +69,9 @@ func Main() {
 	fs.DurationVar(&expireGrace, "expire-grace", 0, "how long a document stays readable past its --expire-field timestamp before it counts as expired")
 	fs.DurationVar(&expireInterval, "expire-interval", time.Duration(policy.DefaultSweepIntervalMillis)*time.Millisecond, "how often the expiry sweeper scans head and deletes expired documents (batches of at most 500 per commit, message \"expiry sweep\")")
 	fs.StringVar(&peerConflictPolicy, "peer-conflict-policy", "strict", "how the peer-sync listener resolves a same-document divergence pushed by a peer: strict (report a conflict, never silently resolve - default) or last-write (later timestamp wins symmetrically on every node)")
+	fs.StringVar(&conflictWebhook, "conflict-webhook", "", "URL to POST conflicts to when a namespace's resolution chain hands them to a resolver authority (and names this node, or no node). Each is retried until answered with 2xx")
+	fs.StringVar(&conflictWebhookSecret, "conflict-webhook-secret", os.Getenv("KDB_CONFLICT_WEBHOOK_SECRET"), "HMAC-SHA256 key signing each conflict webhook body (X-KDB-Signature: sha256=<hex>); defaults to $KDB_CONFLICT_WEBHOOK_SECRET")
+	fs.DurationVar(&conflictWebhookInterval, "conflict-webhook-interval", 10*time.Second, "how often undelivered conflicts are retried to --conflict-webhook")
 	fs.BoolVar(&streamAllowAnonymous, "stream-allow-anonymous", false, "accept stream (--stream-addr) subscribers without credentials, as every subscriber was before the stream handshake authenticated. Under --rbac this lets anyone read every commit in the namespace; without --rbac credentials are not checked anyway, so this changes nothing")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
 	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
@@ -439,6 +444,18 @@ func Main() {
 	nsSet.AddSystem(metaSrv)
 	metaStore := server.NewMetaStore(metaSrv, nsSet)
 	defer metaStore.Close()
+
+	// A resolver authority learns of the conflicts it owns by webhook, or by polling
+	// GET /v1/ns/{ns}/conflicts?authority=true&undelivered=true and acknowledging each.
+	stopExpiry := make(chan struct{})
+	defer close(stopExpiry)
+	server.StartAuthorityExpiry(nsSet, 30*time.Second, stopExpiry)
+	if conflictWebhook != "" {
+		hook := server.StartConflictWebhook(nsSet, srv.NodeID.String(), &server.ConflictWebhook{
+			URL: conflictWebhook, Secret: conflictWebhookSecret, Interval: conflictWebhookInterval,
+		})
+		defer hook.Close()
+	}
 
 	// projectionPeers maps each filtered peer's local projection namespace to its peer config.
 	var projectionPeers sync.Map

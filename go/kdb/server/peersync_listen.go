@@ -84,6 +84,7 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 		NamespaceID:    namespaceID,
 		NodeID:         runtime.NodeID.String(),
 		ConflictPolicy: runtime.PeerSyncConflictPolicy,
+		ChainOf:        runtime.ResolutionChainOf,
 		Node:           runtime.PeerSyncNode(),
 		ApplyToStorage: true,
 		ClassifyError: func(err error) (wire.ErrorCode, bool) {

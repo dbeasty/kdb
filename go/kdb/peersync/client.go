@@ -118,7 +118,8 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 		client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn,
 		materialize: config.MaterializeCommit, persist: config.Persist, persistAsync: config.PersistAsync,
 		conflictPolicy: config.ConflictPolicy, conflictResolver: config.ConflictResolver,
-		node: config.Node, applyToStorage: config.ApplyToStorage, pageSize: config.PageCommits,
+		fastForwardPushOnly: config.FastForwardPushOnly,
+		node:                config.Node, applyToStorage: config.ApplyToStorage, pageSize: config.PageCommits,
 	}, nil
 }
 
@@ -249,11 +250,12 @@ type defaultSession struct {
 	persist      func(document.Commit) error
 	persistAsync func(document.Commit) (func() error, error)
 	// conflictPolicy/conflictResolver - see ClientConfig's doc comment.
-	conflictPolicy   transaction.ConflictPolicy
-	conflictResolver transaction.ConflictResolver
-	node             LocalNode
-	applyToStorage   bool
-	pageSize         int
+	conflictPolicy      transaction.ConflictPolicy
+	conflictResolver    transaction.ConflictResolver
+	fastForwardPushOnly bool
+	node                LocalNode
+	applyToStorage      bool
+	pageSize            int
 }
 
 func (s *defaultSession) NamespaceID() string    { return s.namespaceID }
@@ -391,6 +393,10 @@ func (s *defaultSession) SyncBidirectional() (Result, error) {
 	localHead, err := s.dag.Head()
 	if err != nil {
 		return Result{}, err
+	}
+	if s.fastForwardPushOnly && s.remoteHead != localHead && !s.dag.IsAncestor(s.remoteHead, localHead) {
+		pull.FinalHead = localHead
+		return pull, nil
 	}
 	pushed, err := s.pushMissing(localHead)
 	if err != nil {

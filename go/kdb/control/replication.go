@@ -9,6 +9,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/replication"
+	"github.com/limidus/kdb/go/kdb/server"
 )
 
 // ReplicationSource is the replicator a control plane reports and drives. nil when the process
@@ -48,8 +49,83 @@ func (s *Server) handlePeerSync(w http.ResponseWriter, r *http.Request, _ auth.P
 }
 
 // GET /v1/ns/{ns}/conflicts - the namespace's open replication conflicts.
-func (s *Server) handleConflicts(w http.ResponseWriter, _ *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
-	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "conflicts": rt.Conflicts.List()})
+// GET /v1/ns/{ns}/conflicts - the namespace's queued conflicts. ?authority=true keeps only those
+// handed to a resolver authority, and ?undelivered=true only those not yet acknowledged - together,
+// what a polling authority has still to see (it acknowledges each with POST .../{id}/ack).
+// ?doc=<id> keeps those involving one document: a client resolving its own conflicts reads every
+// candidate version of the document it holds, then settles with POST .../{id}/resolve.
+func (s *Server) handleConflicts(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	q := r.URL.Query()
+	onlyAuthority, onlyUndelivered, doc := q.Get("authority") == "true", q.Get("undelivered") == "true", q.Get("doc")
+	out := []peersync.ConflictEntry{}
+	for _, e := range rt.Conflicts.List() {
+		if (onlyAuthority && !e.Authority) || (onlyUndelivered && e.Delivered) || (doc != "" && !involves(e, doc)) {
+			continue
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "conflicts": out})
+}
+
+func involves(e peersync.ConflictEntry, doc string) bool {
+	for _, it := range e.Items {
+		if it.DocumentID == doc {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveError answers a failed resolution: 404 for an unknown entry, 403 for a principal
+// without the right, 409 for anything the caller can fix by deciding again.
+func resolveError(w http.ResponseWriter, err error) {
+	var authz *server.AuthorizationError
+	var stale *server.ErrResolutionStale
+	switch {
+	case errors.Is(err, peersync.ErrConflictNotFound):
+		writeError(w, http.StatusNotFound, "unknown_conflict", err.Error())
+	case errors.As(err, &authz):
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+	case errors.As(err, &stale):
+		writeError(w, http.StatusConflict, "stale", err.Error())
+	default:
+		writeError(w, http.StatusConflict, "not_resolved", err.Error())
+	}
+}
+
+// POST /v1/ns/{ns}/conflicts/{id}/ack - a polling resolver authority has received the entry as
+// it is now; it is not listed as undelivered again unless its report changes.
+func (s *Server) handleAckConflict(w http.ResponseWriter, r *http.Request, principal auth.Principal, _ string, rt *serverRuntime) {
+	if err := rt.AckConflict(r.PathValue("id"), principal); err != nil {
+		resolveError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// POST /v1/ns/{ns}/conflicts/resolve-all - {"take": "local"|"remote", "filter": {"kind", "peer",
+// "origin"}, "dryRun": true} settles every matching conflict by taking one side for all its
+// documents, or with dryRun lists what it would settle.
+func (s *Server) handleResolveAll(w http.ResponseWriter, r *http.Request, principal auth.Principal, ns string, rt *serverRuntime) {
+	var body struct {
+		Take   string                `json:"take"`
+		Filter server.ConflictFilter `json:"filter"`
+		DryRun bool                  `json:"dryRun"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if body.Take != "local" && body.Take != "remote" {
+		writeError(w, http.StatusBadRequest, "bad_request", "take must be \"local\" or \"remote\"")
+		return
+	}
+	res, err := rt.ResolveAll(body.Filter, body.Take, body.DryRun, principal)
+	if err != nil {
+		resolveError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "dryRun": body.DryRun, "results": res})
 }
 
 // POST /v1/ns/{ns}/conflicts/{id}/resolve - {"choices": {"<docId>": {"take":"local"|"remote"} |
@@ -72,22 +148,20 @@ func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request, p
 		choices[docID] = c
 	}
 	commit, err := rt.ResolveConflict(r.PathValue("id"), choices, principal)
-	switch {
-	case errors.Is(err, peersync.ErrConflictNotFound):
-		writeError(w, http.StatusNotFound, "unknown_conflict", err.Error())
-	case err != nil:
-		writeError(w, http.StatusConflict, "not_resolved", err.Error())
-	default:
-		writeJSON(w, http.StatusOK, map[string]any{"commit": commit.Hash.Hex()})
+	if err != nil {
+		resolveError(w, err)
+		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"commit": commit.Hash.Hex()})
 }
 
 // DELETE /v1/ns/{ns}/conflicts/{id} - dismiss a conflict without acting on it.
 func (s *Server) handleDismissConflict(w http.ResponseWriter, r *http.Request, principal auth.Principal, _ string, rt *serverRuntime) {
 	err := rt.DismissConflict(r.PathValue("id"), principal)
+	var authz *server.AuthorizationError
 	switch {
-	case errors.Is(err, peersync.ErrConflictNotFound):
-		writeError(w, http.StatusNotFound, "unknown_conflict", err.Error())
+	case errors.Is(err, peersync.ErrConflictNotFound), errors.As(err, &authz):
+		resolveError(w, err)
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 	default:
@@ -123,6 +197,42 @@ func (s *Server) handleAssignHome(w http.ResponseWriter, r *http.Request, _ auth
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "home": h})
+}
+
+// GET /v1/ns/{ns}/resolution - the namespace's conflict resolution chain and its hash, which
+// peers compare before they merge.
+func (s *Server) handleResolution(w http.ResponseWriter, _ *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	c := rt.ResolutionChainOf()
+	rules := []peersync.ResolutionRule{}
+	if c != nil {
+		rules = c.Rules
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": rules, "hash": c.Hash(), "thisNode": rt.NodeID.String()})
+}
+
+// PUT /v1/ns/{ns}/resolution - {"rules": [{"kind": "source-priority", "nodes": ["<node id>", ...]},
+// {"kind": "field-merge"}, {"kind": "queue"}]} replaces the namespace's chain; {"rules": []}
+// removes it. Recorded as a replicated definition.
+func (s *Server) handleSetResolution(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	var body peersync.ResolutionChain
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if err := body.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_chain", err.Error())
+		return
+	}
+	if rt.Meta == nil {
+		writeError(w, http.StatusConflict, "no_metadata", "this process has no metadata namespace, which resolution chains are recorded in")
+		return
+	}
+	if err := rt.Meta.SetResolution(ns, body); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	c := rt.ResolutionChainOf()
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": body.Rules, "hash": c.Hash()})
 }
 
 // GET /v1/placement - every namespace with a single-home assignment, and where its home is. A

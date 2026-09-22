@@ -13,6 +13,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -333,6 +334,12 @@ func containsString(xs []string, x string) bool {
 
 // ingestEnv describes this host's namespace to Ingest.
 func (h *frameHandler) ingestEnv() IngestEnv {
+	resolution := ResolutionOptions{Policy: h.cfg.ConflictPolicy, Resolver: h.cfg.ConflictResolver}
+	if h.cfg.ChainOf != nil {
+		if chain := h.cfg.ChainOf(); chain != nil {
+			resolution = ResolutionOptions{Policy: transaction.ConflictPolicyStrict}
+		}
+	}
 	return IngestEnv{
 		DAG:            h.dag,
 		Storage:        h.storage,
@@ -341,9 +348,10 @@ func (h *frameHandler) ingestEnv() IngestEnv {
 		Persist:        h.cfg.Persist,
 		PersistAsync:   h.cfg.PersistAsync,
 		ApplyToStorage: h.cfg.MaterializeCommit != nil || h.cfg.ApplyToStorage,
-		Resolution:     ResolutionOptions{Policy: h.cfg.ConflictPolicy, Resolver: h.cfg.ConflictResolver},
+		Resolution:     resolution,
 		Conflicts:      h.cfg.Conflicts,
 		Peer:           h.peer,
+		Self:           h.cfg.NodeID,
 	}
 }
 

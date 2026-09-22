@@ -176,6 +176,8 @@ type divergedDoc struct {
 	localOrig, remoteOrig codec.Hash
 	localChanged          bool
 	remoteChanged         bool
+	// base is the value at the canonical common ancestor, filled only for conflicting documents.
+	base *string
 }
 
 func resolveDivergedLocked(
@@ -228,6 +230,7 @@ func resolveDivergedLocked(
 	}
 
 	merged := map[codec.UUID]*string{}
+	var provisional []codec.UUID
 	var differing, conflicting []divergedDoc
 	for _, id := range ids {
 		l, r := vL[id], vR[id]
@@ -260,13 +263,33 @@ func resolveDivergedLocked(
 	}
 
 	if len(conflicting) > 0 {
-		resolved, report := resolveConflicting(d, localHead, incomingHead, conflicting, opts)
-		if report != nil {
-			return CommitPushOutcome{Kind: OutcomeConflict, Report: report}, AdvanceStep{}, nil
+		if opts.Chain != nil || opts.Resolver != nil {
+			// The base comes from the ancestor found in canonical parent order: CommonAncestor
+			// walks from its second argument, so with several nearest ancestors (a criss-cross)
+			// the local/incoming order would let two nodes pick different bases.
+			p0, p1 := mergeCommitParents(localHead, incomingHead)
+			if anc := d.CommonAncestor(p0, p1); anc != nil {
+				cids := make([]codec.UUID, len(conflicting))
+				for i, dd := range conflicting {
+					cids[i] = dd.id
+				}
+				bv, err := vi.valuesAt(*anc, cids)
+				if err != nil {
+					return CommitPushOutcome{}, AdvanceStep{}, err
+				}
+				for i := range conflicting {
+					conflicting[i].base = bv[conflicting[i].id].body
+				}
+			}
 		}
-		for id, body := range resolved {
+		r := resolveConflicting(d, localHead, incomingHead, conflicting, opts)
+		if r.report != nil {
+			return CommitPushOutcome{Kind: OutcomeConflict, Report: r.report, Details: r.details}, AdvanceStep{}, nil
+		}
+		for id, body := range r.out {
 			merged[id] = body
 		}
+		provisional = r.provisional
 	}
 
 	storageWrites := map[codec.UUID]document.Op{}
@@ -278,7 +301,7 @@ func resolveDivergedLocked(
 			storageWrites[dd.id] = bodyOp(dd.id, m)
 		}
 	}
-	mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, *ancestor, storageWrites, commitOps)
+	mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, *ancestor, storageWrites, commitOps, mergeMessageFor(provisional))
 	if err != nil {
 		return CommitPushOutcome{}, AdvanceStep{}, err
 	}
@@ -290,80 +313,162 @@ func resolveDivergedLocked(
 	return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, step, nil
 }
 
+// resolution is what resolveConflicting made of a merge's conflicting documents: either the
+// merged values (out, with provisional naming those an authority may still overrule), or a
+// report of the documents left undecided with a detail for each.
+type resolution struct {
+	out         map[codec.UUID]*string
+	provisional []codec.UUID
+	report      *kdberr.ConflictReport
+	details     []ConflictDetail
+}
+
+// ConflictDetail is what a resolver needs about one undecided document beyond its two values:
+// the value they both started from and which writes produced each side.
+type ConflictDetail struct {
+	DocumentID     string                     `json:"documentId"`
+	Base           *string                    `json:"base,omitempty"`
+	LocalOrigin    transaction.ConflictOrigin `json:"localOrigin"`
+	IncomingOrigin transaction.ConflictOrigin `json:"incomingOrigin"`
+}
+
 // resolveConflicting decides each genuinely conflicting document per the resolution options,
-// or reports them. Every rule is symmetric in the two sides, so both nodes reach the same
-// answer.
-func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.Hash, docs []divergedDoc, opts ResolutionOptions) (map[codec.UUID]*string, *kdberr.ConflictReport) {
+// or reports the ones left undecided. Each document goes to the first of these that decides it:
+// an explicit choice (Choose), the namespace's chain, then the policy. Every rule is symmetric in
+// the two sides, so both nodes reach the same answer.
+func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.Hash, docs []divergedDoc, opts ResolutionOptions) resolution {
 	out := map[codec.UUID]*string{}
+	var provisional []codec.UUID
+	pending := docs
 	if opts.Choose != nil {
-		all := true
-		for _, dd := range docs {
-			op, ok := opts.Choose(dd.id, bodyOp(dd.id, dd.local), bodyOp(dd.id, dd.remote))
-			if !ok {
-				all = false
-				break
-			}
-			out[dd.id] = opBody(op)
-		}
-		if all {
-			return out, nil
-		}
-		out = map[codec.UUID]*string{}
-	}
-	switch opts.Policy {
-	case transaction.ConflictPolicyLastWrite:
-		// The later origin wins - the write that actually happened later, not whichever side is
-		// being applied. Commits are stamped after their parents, so a write made after seeing
-		// another counts as later whatever the clocks say. Ties break on the origin's hash.
-		for _, dd := range docs {
-			if originLater(d, dd.localOrig, dd.remoteOrig) {
-				out[dd.id] = dd.local
+		var rest []divergedDoc
+		for _, dd := range pending {
+			if op, ok := opts.Choose(dd.id, bodyOp(dd.id, dd.local), bodyOp(dd.id, dd.remote)); ok {
+				out[dd.id] = opBody(op)
 			} else {
-				out[dd.id] = dd.remote
+				rest = append(rest, dd)
 			}
 		}
-		return out, nil
-	case transaction.ConflictPolicyCustom:
-		if opts.Resolver != nil {
-			p0, _ := mergeCommitParents(localHead, incomingHead)
-			ok := true
-			for _, dd := range docs {
-				// Canonical order: Existing is the merge's first parent's side.
-				existing, incoming := dd.local, dd.remote
-				if p0 != localHead {
-					existing, incoming = incoming, existing
+		pending = rest
+	}
+	p0, _ := mergeCommitParents(localHead, incomingHead)
+	localFirst := p0 == localHead
+	var queued []divergedDoc
+	if opts.Chain != nil && len(pending) > 0 {
+		var rest []divergedDoc
+		for _, dd := range pending {
+			o := opts.Chain.resolve(d, canonicalSides(dd, localFirst), opts.Valid)
+			switch {
+			case o.decided:
+				out[dd.id] = o.winner
+				if o.provisional {
+					provisional = append(provisional, dd.id)
 				}
-				existingOp, incomingOp := bodyOp(dd.id, existing), bodyOp(dd.id, incoming)
-				res, err := opts.Resolver.Resolve(transaction.DocumentConflict{
-					DocID:         dd.id,
-					OperationType: classifyConflictOp(existingOp, incomingOp),
-					ExistingDoc:   documentFromOp(dd.id, existingOp),
-					IncomingDoc:   documentFromOp(dd.id, incomingOp),
-				})
-				if err != nil || res == nil {
-					ok = false
-					break
-				}
-				b := res.JSON
-				out[dd.id] = &b
+			case o.queued:
+				queued = append(queued, dd)
+			default:
+				rest = append(rest, dd)
 			}
-			if ok {
-				return out, nil
+		}
+		pending = rest
+	}
+	if len(pending) > 0 {
+		switch opts.Policy {
+		case transaction.ConflictPolicyLastWrite:
+			// The later origin wins - the write that actually happened later, not whichever side
+			// is being applied. Commits are stamped after their parents, so a write made after
+			// seeing another counts as later whatever the clocks say. Ties break on the origin's
+			// hash.
+			for _, dd := range pending {
+				if originLater(d, dd.localOrig, dd.remoteOrig) {
+					out[dd.id] = dd.local
+				} else {
+					out[dd.id] = dd.remote
+				}
+			}
+			pending = nil
+		case transaction.ConflictPolicyCustom:
+			if opts.Resolver != nil {
+				decided := map[codec.UUID]*string{}
+				ok := true
+				for _, dd := range pending {
+					// Canonical order: Existing is the merge's first parent's side.
+					s := canonicalSides(dd, localFirst)
+					existingOp, incomingOp := bodyOp(dd.id, s.body[0]), bodyOp(dd.id, s.body[1])
+					conflict := transaction.DocumentConflict{
+						DocID:          dd.id,
+						OperationType:  classifyConflictOp(existingOp, incomingOp),
+						ExistingDoc:    documentFromOp(dd.id, existingOp),
+						IncomingDoc:    documentFromOp(dd.id, incomingOp),
+						ExistingOrigin: conflictOrigin(d, s.origin[0]),
+						IncomingOrigin: conflictOrigin(d, s.origin[1]),
+					}
+					if dd.base != nil {
+						conflict.BaseDoc = &document.Document{ID: dd.id, JSON: *dd.base}
+					}
+					res, err := opts.Resolver.Resolve(conflict)
+					if err != nil || res == nil {
+						ok = false
+						break
+					}
+					b := res.JSON
+					decided[dd.id] = &b
+				}
+				if ok {
+					for id, b := range decided {
+						out[id] = b
+					}
+					pending = nil
+				}
 			}
 		}
 	}
-	items := make([]kdberr.ConflictItem, 0, len(docs))
-	for _, dd := range docs {
+	reported := append(queued, pending...)
+	if len(reported) == 0 {
+		sort.Slice(provisional, func(i, j int) bool { return provisional[i].String() < provisional[j].String() })
+		return resolution{out: out, provisional: provisional}
+	}
+	sort.Slice(reported, func(i, j int) bool { return reported[i].id.String() < reported[j].id.String() })
+	items := make([]kdberr.ConflictItem, 0, len(reported))
+	details := make([]ConflictDetail, 0, len(reported))
+	for _, dd := range reported {
 		items = append(items, kdberr.ConflictItem{
 			DocumentID:    dd.id.String(),
 			OperationType: classifyConflictOp(bodyOp(dd.id, dd.local), bodyOp(dd.id, dd.remote)),
 			LocalDoc:      dd.local,
 			IncomingDoc:   dd.remote,
 		})
+		details = append(details, ConflictDetail{
+			DocumentID: dd.id.String(), Base: dd.base,
+			LocalOrigin: conflictOrigin(d, dd.localOrig), IncomingOrigin: conflictOrigin(d, dd.remoteOrig),
+		})
 	}
-	return nil, &kdberr.ConflictReport{
-		TransactionID: incomingHead.Hex(), BaseHash: localHead.Hex(), TargetHash: incomingHead.Hex(), Conflicts: items,
+	return resolution{
+		report: &kdberr.ConflictReport{
+			TransactionID: incomingHead.Hex(), BaseHash: localHead.Hex(), TargetHash: incomingHead.Hex(), Conflicts: items,
+		},
+		details: details,
 	}
+}
+
+// canonicalSides orders a conflicting document's sides by the merge's parents: side 0 is the
+// first parent's.
+func canonicalSides(dd divergedDoc, localFirst bool) conflictSides {
+	s := conflictSides{body: [2]*string{dd.local, dd.remote}, origin: [2]codec.Hash{dd.localOrig, dd.remoteOrig}, base: dd.base}
+	if !localFirst {
+		s.body[0], s.body[1] = s.body[1], s.body[0]
+		s.origin[0], s.origin[1] = s.origin[1], s.origin[0]
+	}
+	return s
+}
+
+// conflictOrigin describes the write o for a resolver.
+func conflictOrigin(d *dag.InMemoryCommitDag, o codec.Hash) transaction.ConflictOrigin {
+	c, ok := d.GetCommit(o)
+	if !ok {
+		return transaction.ConflictOrigin{}
+	}
+	return transaction.ConflictOrigin{NodeID: c.AuthorNodeID, Commit: o, TimestampMicros: c.Timestamp.EpochMicros()}
 }
 
 // originLater reports whether origin a is later than b: by commit timestamp, then by hash. A

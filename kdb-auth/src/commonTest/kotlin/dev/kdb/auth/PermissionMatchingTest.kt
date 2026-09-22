@@ -64,4 +64,22 @@ class PermissionMatchingTest {
         val principal = Principal(id = "u5", roles = setOf("wildcard-writer"))
         assertTrue(principalHasPermission(principal, roles, "write", "orders/invoices"))
     }
+
+    /**
+     * "resolve" is the Go server's permission to settle replication conflicts a resolver authority
+     * owns. Kotlin enforces no action with it, but grants are shared strings: a role holding
+     * "resolve:app/data" must match exactly the resources the Go matcher gives it
+     * (go/kdb/auth TestResolveGrantMatchesLikeKotlin), and grant no other kind.
+     */
+    @Test
+    fun resolveGrantIsAnOrdinaryKindScopedLikeAnyOther() {
+        val grants = mapOf("resolver" to setOf("resolve:app/data"), "writer" to setOf("write:app/data"))
+        val resolver = Principal(id = "r", roles = setOf("resolver"))
+        val writer = Principal(id = "w", roles = setOf("writer"))
+        assertTrue(permissionKind("resolve:app/data") == "resolve")
+        assertTrue(principalHasPermission(resolver, grants, "resolve", ResourcePath.of("app/data")))
+        assertFalse(principalHasPermission(resolver, grants, "resolve", ResourcePath.of("app/other")))
+        assertFalse(principalHasPermission(resolver, grants, "write", ResourcePath.of("app/data")))
+        assertFalse(principalHasPermission(writer, grants, "resolve", ResourcePath.of("app/data")))
+    }
 }

@@ -35,6 +35,10 @@ type HostConfig struct {
 	// these fields existed.
 	ConflictPolicy   transaction.ConflictPolicy
 	ConflictResolver transaction.ConflictResolver
+	// ChainOf, when set, returns the namespace's resolution chain. v1 carries no chain hash, so
+	// a v1 peer cannot be known to decide conflicts alike: a namespace with a chain never
+	// auto-merges over v1 - its divergences are queued instead.
+	ChainOf func() *ResolutionChain
 	// Node serializes ingest against the runtime's own writers and runs its post-commit hooks -
 	// see LocalNode. nil serializes only against other ingests in this process.
 	Node LocalNode
@@ -74,6 +78,10 @@ type ClientConfig struct {
 	// ConflictPolicy/ConflictResolver - see HostConfig's doc comment; same contract, client side.
 	ConflictPolicy   transaction.ConflictPolicy
 	ConflictResolver transaction.ConflictResolver
+	// FastForwardPushOnly pushes only when the peer's head is already in this node's history, so
+	// the push fast-forwards it and the peer never has to merge. Set for a namespace with a
+	// resolution chain: a v1 peer cannot be known to settle conflicts the same way.
+	FastForwardPushOnly bool
 	// Node / ApplyToStorage - see HostConfig's doc comments; same contract, client side.
 	Node           LocalNode
 	ApplyToStorage bool

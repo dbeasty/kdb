@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/peersync"
+	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
@@ -31,17 +33,30 @@ type SyncCmd struct {
 // ConflictsCmd lists a namespace's open replication conflicts.
 type ConflictsCmd struct{ Namespace string }
 
-// ResolveCmd settles a queued divergence by taking one side for every conflicting document.
+// ResolveCmd settles a queued conflict by taking one side for every conflicting document.
 type ResolveCmd struct {
 	Namespace string
 	ID        string
 	Take      string
 }
 
+// ResolveAllCmd settles every queued conflict a filter matches by taking one side.
+type ResolveAllCmd struct {
+	Namespace string
+	Take      string
+	Filter    server.ConflictFilter
+	DryRun    bool
+}
+
+// ResolutionCmd shows a namespace's conflict resolution chain.
+type ResolutionCmd struct{ Namespace string }
+
 func (NodeStatusCmd) command() {}
 func (SyncCmd) command()       {}
 func (ConflictsCmd) command()  {}
 func (ResolveCmd) command()    {}
+func (ResolveAllCmd) command() {}
+func (ResolutionCmd) command() {}
 
 func parseReplicationCommand(rest []string) (Command, bool, error) {
 	switch rest[0] {
@@ -83,12 +98,131 @@ func parseReplicationCommand(rest []string) (Command, bool, error) {
 		}
 		return ConflictsCmd{Namespace: rest[1]}, true, nil
 	case "resolve":
+		if len(rest) >= 3 && rest[2] == "--all" {
+			return parseResolveAll(rest)
+		}
 		if len(rest) != 5 || rest[3] != "--take" || (rest[4] != "local" && rest[4] != "remote") {
-			return nil, true, fmt.Errorf("usage: kdb resolve <namespace> <conflict-id> --take local|remote")
+			return nil, true, fmt.Errorf("usage: kdb resolve <namespace> <conflict-id> --take local|remote\n" +
+				"       kdb resolve <namespace> --all --take local|remote [--kind K] [--peer NODE] [--origin NODE] [--dry-run]")
 		}
 		return ResolveCmd{Namespace: rest[1], ID: rest[2], Take: rest[4]}, true, nil
+	case "resolution":
+		if len(rest) != 2 {
+			return nil, true, fmt.Errorf("usage: kdb resolution <namespace>")
+		}
+		return ResolutionCmd{Namespace: rest[1]}, true, nil
 	}
 	return nil, false, nil
+}
+
+func parseResolveAll(rest []string) (Command, bool, error) {
+	c := ResolveAllCmd{Namespace: rest[1]}
+	for i := 3; i < len(rest); i++ {
+		switch rest[i] {
+		case "--dry-run":
+			c.DryRun = true
+		case "--take", "--kind", "--peer", "--origin":
+			flag := rest[i]
+			i++
+			if i >= len(rest) {
+				return nil, true, fmt.Errorf("%s requires a value", flag)
+			}
+			switch flag {
+			case "--take":
+				c.Take = rest[i]
+			case "--kind":
+				c.Filter.Kind = peersync.ConflictKind(rest[i])
+			case "--peer":
+				c.Filter.Peer = rest[i]
+			case "--origin":
+				c.Filter.Origin = rest[i]
+			}
+		default:
+			return nil, true, fmt.Errorf("unknown option for resolve --all: %s", rest[i])
+		}
+	}
+	if c.Take != "local" && c.Take != "remote" {
+		return nil, true, fmt.Errorf("resolve --all needs --take local|remote")
+	}
+	return c, true, nil
+}
+
+// chainFor reads ns's resolution chain from the data root's metadata namespace, if it has one,
+// so a CLI sync or resolution decides conflicts as the service would. It opens and closes the
+// metadata namespace before the command opens its own - one namespace holds the directory lock.
+func chainFor(cfg Config, ns string) (*peersync.ResolutionChain, error) {
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "ns", filepath.FromSlash(server.MetaNamespace))); err != nil {
+		return nil, nil // no metadata namespace: no chain
+	}
+	meta, err := embed.OpenFileRuntime(cfg.DataDir, embed.CatalogFromNamespace(server.MetaNamespace), server.MetaNamespace, schema.None())
+	if err != nil {
+		return nil, err
+	}
+	defer meta.Close()
+	return server.ReadResolutionChain(meta, ns)
+}
+
+func cmdResolution(cfg Config, c ResolutionCmd) int {
+	chain, err := chainFor(cfg, c.Namespace)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if chain == nil {
+		fmt.Printf("%s: no resolution chain (conflicts follow the peer conflict policy)\n", c.Namespace)
+		return 0
+	}
+	fmt.Printf("%s: chain %s\n", c.Namespace, chain.Hash())
+	for i, r := range chain.Rules {
+		line := fmt.Sprintf("  %d. %s", i+1, r.Kind)
+		if len(r.Nodes) > 0 {
+			line += " nodes=" + strings.Join(r.Nodes, ",")
+		}
+		if r.Kind == peersync.RuleAuthority {
+			pending := r.Pending
+			if pending == "" {
+				pending = peersync.PendingHold
+			}
+			line += " pending=" + pending
+			if r.Node != "" {
+				line += " node=" + r.Node
+			}
+			if r.Timeout != "" {
+				line += " timeout=" + r.Timeout
+			}
+		}
+		fmt.Println(line)
+	}
+	return 0
+}
+
+func cmdResolveAll(cfg Config, rt *embed.EmbeddedKdbRuntime, chain *peersync.ResolutionChain, c ResolveAllCmd) int {
+	srv, err := serverFor(cfg, rt, chain)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	res, err := srv.ResolveAll(c.Filter, c.Take, c.DryRun, auth.Principal{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	code := 0
+	for _, r := range res {
+		switch {
+		case r.Error != "":
+			fmt.Printf("%s\t%s\tfailed: %s\n", r.ID, r.Kind, r.Error)
+			code = 1
+		case c.DryRun:
+			fmt.Printf("%s\t%s\twould take %s for %s\n", r.ID, r.Kind, c.Take, strings.Join(r.Documents, ","))
+		default:
+			fmt.Printf("%s\t%s\tresolved: %s\n", r.ID, r.Kind, r.CommitHex)
+		}
+	}
+	if len(res) == 0 {
+		fmt.Println("no matching conflicts")
+	}
+	return code
 }
 
 func cmdNodeStatus(cfg Config) int {
@@ -103,18 +237,19 @@ func cmdNodeStatus(cfg Config) int {
 
 // serverFor wraps rt the way kdb-service does, so a CLI sync ingests through the same write
 // serialization, log and conflict queue a running service would use.
-func serverFor(cfg Config, rt *embed.EmbeddedKdbRuntime) (*server.KdbServerRuntime, error) {
+func serverFor(cfg Config, rt *embed.EmbeddedKdbRuntime, chain *peersync.ResolutionChain) (*server.KdbServerRuntime, error) {
 	id, err := embed.LoadOrCreateNodeID(cfg.DataDir)
 	if err != nil {
 		return nil, err
 	}
 	srv := server.NewKdbServerRuntime(rt)
 	srv.NodeID = id
+	srv.SetResolutionChain(chain)
 	return srv, nil
 }
 
-func cmdSync(cfg Config, rt *embed.EmbeddedKdbRuntime, c SyncCmd) int {
-	srv, err := serverFor(cfg, rt)
+func cmdSync(cfg Config, rt *embed.EmbeddedKdbRuntime, chain *peersync.ResolutionChain, c SyncCmd) int {
+	srv, err := serverFor(cfg, rt, chain)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
@@ -174,9 +309,24 @@ func cmdConflicts(cfg Config, c ConflictsCmd) int {
 		return 1
 	}
 	for _, e := range q.List() {
-		fmt.Printf("%s\t%s\t%s\tpeer=%s\tseen=%d\n", e.ID, e.Kind, e.Ref, e.Peer, e.Seen)
+		fmt.Printf("%s\t%s\t%s\tpeer=%s\tseen=%d", e.ID, e.Kind, e.Ref, e.Peer, e.Seen)
+		if e.Authority {
+			fmt.Printf("\tauthority delivered=%t", e.Delivered)
+			if e.AuthorityNode != "" {
+				fmt.Printf(" node=%s", e.AuthorityNode)
+			}
+		}
+		fmt.Println()
+		origins := map[string]peersync.ConflictDetail{}
+		for _, d := range e.Details {
+			origins[d.DocumentID] = d
+		}
 		for _, item := range e.Items {
-			fmt.Printf("\t%s\t%s\n", item.DocumentID, item.OperationType)
+			fmt.Printf("\t%s\t%s", item.DocumentID, item.OperationType)
+			if d, ok := origins[item.DocumentID]; ok {
+				fmt.Printf("\tlocal-by=%s incoming-by=%s", d.LocalOrigin.NodeID, d.IncomingOrigin.NodeID)
+			}
+			fmt.Println()
 		}
 		if e.Detail != "" {
 			fmt.Printf("\t%s\n", e.Detail)
@@ -185,8 +335,8 @@ func cmdConflicts(cfg Config, c ConflictsCmd) int {
 	return 0
 }
 
-func cmdResolve(cfg Config, rt *embed.EmbeddedKdbRuntime, c ResolveCmd) int {
-	srv, err := serverFor(cfg, rt)
+func cmdResolve(cfg Config, rt *embed.EmbeddedKdbRuntime, chain *peersync.ResolutionChain, c ResolveCmd) int {
+	srv, err := serverFor(cfg, rt, chain)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1

@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/peersync"
 	"os"
 	"sort"
 	"strings"
@@ -32,6 +33,19 @@ func execute(cfg Config, cmd Command) int {
 		return cmdNodeStatus(cfg)
 	case ConflictsCmd:
 		return cmdConflicts(cfg, c)
+	case ResolutionCmd:
+		return cmdResolution(cfg, c)
+	}
+	// Sync and resolution decide conflicts, so they need the namespace's replicated chain - read
+	// before the namespace itself is opened, since that open holds the directory lock.
+	var chain *peersync.ResolutionChain
+	switch c := cmd.(type) {
+	case SyncCmd, ResolveCmd, ResolveAllCmd:
+		var err error
+		if chain, err = chainFor(cfg, namespaceFor(c)); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: reading the resolution chain: %v\n", err)
+			return 1
+		}
 	}
 	rt, err := openRuntime(cfg, namespaceFor(cmd))
 	if err != nil {
@@ -75,9 +89,11 @@ func execute(cfg Config, cmd Command) int {
 	case BranchCheckoutCmd:
 		return cmdBranchCheckout(cfg, rt, c)
 	case SyncCmd:
-		return cmdSync(cfg, rt, c)
+		return cmdSync(cfg, rt, chain, c)
 	case ResolveCmd:
-		return cmdResolve(cfg, rt, c)
+		return cmdResolve(cfg, rt, chain, c)
+	case ResolveAllCmd:
+		return cmdResolveAll(cfg, rt, chain, c)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unsupported command\n")
 		return 2
@@ -119,6 +135,8 @@ func namespaceFor(cmd Command) string {
 	case SyncCmd:
 		return c.Namespace
 	case ResolveCmd:
+		return c.Namespace
+	case ResolveAllCmd:
 		return c.Namespace
 	default:
 		return ""

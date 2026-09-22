@@ -63,6 +63,8 @@ Commands:
   sync <namespace> <peer-addr> [--pull|--push] [--user U --password-env VAR]
   conflicts <namespace>
   resolve <namespace> <conflict-id> --take local|remote
+  resolve <namespace> --all --take local|remote [--kind K] [--peer NODE] [--origin NODE] [--dry-run]
+  resolution <namespace>
 
 A REV is a revision: head, head~10, head^, a commit hash, <hash>~2,
 tag:NAME, branch:NAME, or any of those with ~N appended.`)

@@ -286,7 +286,9 @@ func (h *V2Host) refs(namespaces []string) ([]wire.NamespaceRefs, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, RefsOf(ns, env.DAG))
+		refs := RefsOf(ns, env.DAG)
+		refs.ResolutionHash = env.Resolution.Chain.Hash()
+		out = append(out, refs)
 	}
 	return out, nil
 }
