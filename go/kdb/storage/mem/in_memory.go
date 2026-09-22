@@ -228,3 +228,11 @@ func (a *InMemoryStorageAdapter) WalkTree(namespaceID string, treeHash codec.Has
 	tree.Walk(visit)
 	return nil
 }
+
+// TreeAt implements storage.TreeResolver.
+func (a *InMemoryStorageAdapter) TreeAt(treeHash codec.Hash) (document.DocumentTree, bool, error) {
+	a.treesMu.Lock()
+	defer a.treesMu.Unlock()
+	tree, ok := a.trees[treeHash]
+	return tree, ok, nil
+}

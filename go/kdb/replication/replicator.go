@@ -12,6 +12,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -419,4 +420,72 @@ func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) err
 		err = serr
 	}
 	return err
+}
+
+// FetchBodies asks the configured peers, in name order, for the bodies of wanted (document id to
+// the content hash it must have) in namespace ns - what a scrub needs to repair documents it can
+// no longer read. Each peer is asked only for what the peers before it did not supply, and every
+// body returned has been verified against its content hash (peersync.RepairSession.Fetch), so a
+// peer need not be trusted. Filtered peers, which hold only part of a namespace, are skipped, as
+// are peers whose patterns do not cover ns. A peer that cannot be reached is skipped too; the
+// error returned is the last such failure, and only when nothing at all could be fetched.
+func (r *Replicator) FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, treeHex string) (map[codec.UUID]string, error) {
+	out := map[codec.UUID]string{}
+	var lastErr error
+	for _, name := range r.order {
+		if len(out) == len(wanted) {
+			break
+		}
+		l := r.loops[name]
+		if l.peer.Filter != "" || len(peersync.SelectNamespaces(l.peer.Namespaces, []string{ns})) == 0 {
+			continue
+		}
+		rest := map[codec.UUID]codec.Hash{}
+		for id, h := range wanted {
+			if _, got := out[id]; !got {
+				rest[id] = h
+			}
+		}
+		s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
+			NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
+			ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+			Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
+		})
+		if err != nil {
+			lastErr = fmt.Errorf("replication: peer %s: %w", name, err)
+			continue
+		}
+		got, err := s.Fetch(ns, rest, treeHex)
+		s.Close()
+		for id, body := range got {
+			out[id] = body
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("replication: peer %s: %w", name, err)
+		}
+	}
+	if len(out) == 0 && lastErr != nil {
+		return out, lastErr
+	}
+	return out, nil
+}
+
+// Compare finds the documents this node's local tree holds differently from peer name's head for
+// namespace ns, by Merkle diff (peersync.RepairSession.Diff). It returns the peer's tree compared
+// against.
+func (r *Replicator) Compare(name, ns string, local document.DocumentTree) (string, []document.TreeDifference, error) {
+	l, ok := r.loops[name]
+	if !ok {
+		return "", nil, fmt.Errorf("replication: no peer %q", name)
+	}
+	s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
+		NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
+		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+		Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	defer s.Close()
+	return s.Diff(ns, local, "")
 }

@@ -61,6 +61,10 @@ type payloadEnvelope struct {
 	ProjectPage        *projectPageDto        `json:"projectPage,omitempty"`
 	ProjectWrite       *projectWriteDto       `json:"projectWrite,omitempty"`
 	ProjectWriteResult *projectWriteResultDto `json:"projectWriteResult,omitempty"`
+	TreeNodes          *treeNodesDto          `json:"treeNodes,omitempty"`
+	TreeNodesResult    *treeNodesResultDto    `json:"treeNodesResult,omitempty"`
+	ObjectFetch        *objectFetchDto        `json:"objectFetch,omitempty"`
+	ObjectFetchResult  *objectFetchResultDto  `json:"objectFetchResult,omitempty"`
 	CommitPush         *commitPushDto         `json:"commitPush,omitempty"`
 	CommitPushAck      *commitPushAckDto      `json:"commitPushAck,omitempty"`
 	DagDiff            *dagDiffDto            `json:"dagDiff,omitempty"`

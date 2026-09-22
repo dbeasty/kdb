@@ -94,6 +94,10 @@ func execute(cfg Config, cmd Command) int {
 		return cmdResolve(cfg, rt, chain, c)
 	case ResolveAllCmd:
 		return cmdResolveAll(cfg, rt, chain, c)
+	case ScrubCmd:
+		return cmdScrub(cfg, rt, c)
+	case PeerDiffCmd:
+		return cmdPeerDiff(cfg, rt, c)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unsupported command\n")
 		return 2
@@ -137,6 +141,10 @@ func namespaceFor(cmd Command) string {
 	case ResolveCmd:
 		return c.Namespace
 	case ResolveAllCmd:
+		return c.Namespace
+	case ScrubCmd:
+		return c.Namespace
+	case PeerDiffCmd:
 		return c.Namespace
 	default:
 		return ""

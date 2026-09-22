@@ -51,12 +51,30 @@ type ResolveAllCmd struct {
 // ResolutionCmd shows a namespace's conflict resolution chain.
 type ResolutionCmd struct{ Namespace string }
 
+// ScrubCmd verifies every live document and repairs damaged ones from a peer, when one is given.
+type ScrubCmd struct {
+	Namespace   string
+	Peer        string
+	User        string
+	PasswordEnv string
+}
+
+// PeerDiffCmd lists the documents this node holds differently from a peer, by Merkle comparison.
+type PeerDiffCmd struct {
+	Namespace   string
+	Peer        string
+	User        string
+	PasswordEnv string
+}
+
 func (NodeStatusCmd) command() {}
 func (SyncCmd) command()       {}
 func (ConflictsCmd) command()  {}
 func (ResolveCmd) command()    {}
 func (ResolveAllCmd) command() {}
 func (ResolutionCmd) command() {}
+func (ScrubCmd) command()      {}
+func (PeerDiffCmd) command()   {}
 
 func parseReplicationCommand(rest []string) (Command, bool, error) {
 	switch rest[0] {
@@ -106,6 +124,24 @@ func parseReplicationCommand(rest []string) (Command, bool, error) {
 				"       kdb resolve <namespace> --all --take local|remote [--kind K] [--peer NODE] [--origin NODE] [--dry-run]")
 		}
 		return ResolveCmd{Namespace: rest[1], ID: rest[2], Take: rest[4]}, true, nil
+	case "scrub":
+		if len(rest) < 2 {
+			return nil, true, fmt.Errorf("usage: kdb scrub <namespace> [--peer ADDR] [--user U --password-env VAR]")
+		}
+		c := ScrubCmd{Namespace: rest[1]}
+		if err := peerFlags(rest[2:], &c.Peer, &c.User, &c.PasswordEnv, true); err != nil {
+			return nil, true, err
+		}
+		return c, true, nil
+	case "peer-diff":
+		if len(rest) < 3 {
+			return nil, true, fmt.Errorf("usage: kdb peer-diff <namespace> <peer-addr> [--user U --password-env VAR]")
+		}
+		c := PeerDiffCmd{Namespace: rest[1], Peer: rest[2]}
+		if err := peerFlags(rest[3:], nil, &c.User, &c.PasswordEnv, false); err != nil {
+			return nil, true, err
+		}
+		return c, true, nil
 	case "resolution":
 		if len(rest) != 2 {
 			return nil, true, fmt.Errorf("usage: kdb resolution <namespace>")
@@ -361,5 +397,131 @@ func cmdResolve(cfg Config, rt *embed.EmbeddedKdbRuntime, chain *peersync.Resolu
 		return 1
 	}
 	fmt.Printf("resolved %s: %s\n", c.ID, commit.Hash.Hex())
+	return 0
+}
+
+func peerFlags(args []string, peer, user, passwordEnv *string, allowPeer bool) error {
+	for i := 0; i < len(args); i++ {
+		flag := args[i]
+		switch flag {
+		case "--peer", "--user", "--password-env":
+			if flag == "--peer" && !allowPeer {
+				return fmt.Errorf("unknown option: %s", flag)
+			}
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("%s requires a value", flag)
+			}
+			switch flag {
+			case "--peer":
+				*peer = args[i]
+			case "--user":
+				*user = args[i]
+			default:
+				*passwordEnv = args[i]
+			}
+		default:
+			return fmt.Errorf("unknown option: %s", flag)
+		}
+	}
+	return nil
+}
+
+func repairSession(srv *server.KdbServerRuntime, ns, peer, user, passwordEnv string) (*peersync.RepairSession, error) {
+	var cc auth.ConnectionContext
+	if user != "" {
+		u := user
+		cc.User = &u
+		if passwordEnv != "" {
+			pw := os.Getenv(passwordEnv)
+			cc.Password = &pw
+		}
+	}
+	var tls *core.TransportTlsSettings
+	if strings.HasPrefix(peer, "tcps://") {
+		tls = &core.TransportTlsSettings{Enabled: true}
+	}
+	opts := core.DefaultConnectOptions()
+	opts.TLS = tls
+	return peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(opts), peersync.V2ClientConfig{
+		NodeID: srv.NodeID.String(), PeerURI: peer, ConnectionContext: cc, TLS: tls,
+		Namespaces: []string{ns}, Timeout: time.Minute,
+	})
+}
+
+func cmdScrub(cfg Config, rt *embed.EmbeddedKdbRuntime, c ScrubCmd) int {
+	srv, err := serverFor(cfg, rt, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	var fetch server.BodyFetcher
+	if c.Peer != "" {
+		fetch = func(ns string, wanted map[codec.UUID]codec.Hash, treeHex string) (map[codec.UUID]string, error) {
+			s, err := repairSession(srv, ns, c.Peer, c.User, c.PasswordEnv)
+			if err != nil {
+				return nil, err
+			}
+			defer s.Close()
+			return s.Fetch(ns, wanted, treeHex)
+		}
+	}
+	rep, err := srv.Scrub(fetch)
+	fmt.Printf("%s: checked %d, damaged %d, repaired %d\n", c.Namespace, rep.Checked, len(rep.Damaged), len(rep.Repaired))
+	if rep.RepairCommit != "" {
+		fmt.Printf("  repair commit %s\n", rep.RepairCommit)
+	}
+	for _, id := range rep.Unrepaired {
+		fmt.Printf("  unrepaired %s\n", id)
+	}
+	if rep.FetchError != "" {
+		fmt.Printf("  fetch: %s\n", rep.FetchError)
+	}
+	switch {
+	case server.IsScrubUnrepaired(err):
+		return 3
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func cmdPeerDiff(cfg Config, rt *embed.EmbeddedKdbRuntime, c PeerDiffCmd) int {
+	srv, err := serverFor(cfg, rt, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	local, err := srv.HeadTree()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	s, err := repairSession(srv, c.Namespace, c.Peer, c.User, c.PasswordEnv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	defer s.Close()
+	peerTree, diff, err := s.Diff(c.Namespace, local, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	fmt.Printf("%s: local tree %s, peer tree %s, %d difference(s)\n", c.Namespace, local.TreeHash.Hex(), peerTree, len(diff))
+	for _, d := range diff {
+		side := "both"
+		switch {
+		case d.Local == (codec.Hash{}):
+			side = "peer only"
+		case d.Remote == (codec.Hash{}):
+			side = "local only"
+		}
+		fmt.Printf("  %s\t%s\n", d.DocID, side)
+	}
+	if len(diff) > 0 {
+		return 3
+	}
 	return 0
 }

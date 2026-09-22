@@ -38,7 +38,17 @@ public object DeltaSegmentScanner {
         public val offset: Int,
         public val reason: String,
         public val partialCommits: List<ScannedCommit>,
-    ) : Exception("delta segment: corrupt frame at offset $offset: $reason")
+        /**
+         * How many complete frames with a valid CRC follow the damaged one. Zero is the shape of
+         * a torn tail - the last write never completed. Anything more means intact data follows:
+         * the frame was damaged in place (bit rot, a bad sector), and treating it as a torn tail
+         * would silently drop every commit after it.
+         */
+        public val intactFramesAfter: Int = 0,
+    ) : Exception(
+            "delta segment: corrupt frame at offset $offset: $reason" +
+                if (intactFramesAfter > 0) " ($intactFramesAfter intact frame(s) follow it)" else "",
+        )
 
     /**
      * @throws CorruptFrameException if a frame's stored CRC doesn't match
@@ -62,6 +72,7 @@ public object DeltaSegmentScanner {
                     offset,
                     "crc mismatch: stored=${storedCrc.toUInt().toString(16)} actual=${actualCrc.toUInt().toString(16)}",
                     out,
+                    intactFramesFrom(bytes, frameEnd),
                 )
             }
             val commit =
@@ -69,12 +80,29 @@ public object DeltaSegmentScanner {
                     val payload = DeltaPageCodec.parse(frame)
                     KdbCommit.fromPayloadBytes(payload)
                 } catch (e: Exception) {
-                    throw CorruptFrameException(offset, e.message ?: e.toString(), out)
+                    throw CorruptFrameException(offset, e.message ?: e.toString(), out, intactFramesFrom(bytes, frameEnd))
                 }
             out.add(ScannedCommit(commit.hash, commit, offset))
             offset = frameEnd
         }
         return out
+    }
+
+    /** Counts the complete, CRC-valid frames from [start] on, stepping over damaged ones. */
+    internal fun intactFramesFrom(bytes: ByteArray, start: Int): Int {
+        var count = 0
+        var offset = start
+        while (offset + FRAME_HEADER_SIZE <= bytes.size) {
+            if (!isKdbpFrame(bytes, offset)) break
+            val compressedSize = readIntBe(bytes, offset + 8)
+            if (compressedSize < 0) break
+            val frameEnd = offset + FRAME_HEADER_SIZE + compressedSize
+            if (frameEnd > bytes.size) break
+            val storedCrc = readIntBe(bytes, offset + 16)
+            if (Crc32.of(bytes, offset + FRAME_HEADER_SIZE, compressedSize) == storedCrc) count++
+            offset = frameEnd
+        }
+        return count
     }
 
     private fun isKdbpFrame(bytes: ByteArray, offset: Int): Boolean =

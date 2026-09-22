@@ -584,3 +584,40 @@ func scanExistingDeltaSequence(shim storage.PlatformIOShim, namespaceID string) 
 	}
 	return maxSeq + 1, legacyNames, nil
 }
+
+// SkimSegment implements storage.DamageTolerantReader: it reads segment's whole file - not just
+// the readable prefix its ref records - and reports its physical size, the last commit any intact
+// frame holds, and the offsets of frames that are damaged.
+func (r *DefaultReader) SkimSegment(segment storage.DeltaSegmentRef) (storage.SegmentSkim, error) {
+	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
+	raw, err := r.shim.ReadFromSegment(segmentName, 0, maxScannedSegmentBytes)
+	if err != nil {
+		return storage.SegmentSkim{}, err
+	}
+	skim := storage.SegmentSkim{PhysicalSize: int64(len(raw))}
+	lastGood := -1
+	skipped, err := ScanSkippingCorrupt(raw, func(s ScannedCommit) error {
+		skim.LastCommitHash = s.CommitHash
+		lastGood = s.FrameOffset
+		return nil
+	})
+	if len(skipped) > 0 && skipped[len(skipped)-1] > lastGood {
+		skim.LastFrameDamaged = true
+	}
+	for _, o := range skipped {
+		skim.DamagedFrames = append(skim.DamagedFrames, int64(o))
+	}
+	return skim, err
+}
+
+// StreamCommitsPastDamage implements storage.DamageTolerantReader: StreamCommits over the whole
+// file, skipping damaged frames instead of stopping at the first.
+func (r *DefaultReader) StreamCommitsPastDamage(segment storage.DeltaSegmentRef, fn func(document.Commit, int64) error) error {
+	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
+	raw, err := r.shim.ReadFromSegment(segmentName, 0, maxScannedSegmentBytes)
+	if err != nil {
+		return err
+	}
+	_, err = ScanSkippingCorrupt(raw, func(s ScannedCommit) error { return fn(s.Commit, int64(s.FrameOffset)) })
+	return err
+}

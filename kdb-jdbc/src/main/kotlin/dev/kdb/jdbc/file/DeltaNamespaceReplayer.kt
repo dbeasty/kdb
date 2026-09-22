@@ -40,6 +40,18 @@ public object DeltaNamespaceReplayer {
                 try {
                     deltaReader.readAll(segment)
                 } catch (e: DeltaSegmentScanner.CorruptFrameException) {
+                    if (isMostRecent && e.intactFramesAfter > 0) {
+                        // Damage in place, not a torn tail: intact commits follow the damaged
+                        // frame. Truncating here would silently drop them - and everything
+                        // descending from them - so refuse, as for any other damaged segment.
+                        throw IllegalStateException(
+                            "kdb: namespace ${dag.namespaceId}: delta segment (sequence " +
+                                "${segment.sequenceNumber}) has a damaged frame followed by intact " +
+                                "ones, so this is not a torn tail and replaying past it would drop " +
+                                "committed history: ${e.message}",
+                            e,
+                        )
+                    }
                     if (!isMostRecent) {
                         throw IllegalStateException(
                             "kdb: namespace ${dag.namespaceId}: delta segment (sequence " +

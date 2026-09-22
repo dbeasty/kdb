@@ -42,6 +42,34 @@ type Adapter interface {
 	IngestDeltaSegment(segment DeltaSegmentRef) error
 }
 
+// SegmentSkim is what a damage-tolerant read of one delta segment found - see
+// DamageTolerantReader.
+type SegmentSkim struct {
+	// PhysicalSize is the segment file's length, damaged frames and all.
+	PhysicalSize int64
+	// LastCommitHash is the last commit any intact frame holds.
+	LastCommitHash codec.Hash
+	// DamagedFrames are the offsets of complete frames that failed their CRC or would not parse.
+	DamagedFrames []int64
+	// LastFrameDamaged is set when the segment's final complete frame is one of them.
+	LastFrameDamaged bool
+}
+
+// DamageTolerantReader reads delta segments past damaged frames. A DeltaSegmentReader stops at the
+// first damaged frame, as replay must; this is for telling a damaged log from a replaced one, and
+// for recovering what the damage did not touch.
+type DamageTolerantReader interface {
+	SkimSegment(segment DeltaSegmentRef) (SegmentSkim, error)
+	StreamCommitsPastDamage(segment DeltaSegmentRef, fn func(document.Commit, int64) error) error
+}
+
+// TreeResolver resolves a whole document tree by hash - for Merkle comparison between peers
+// (document.DocumentTree.Node), which needs the trie rather than a walk of it. ok is false for a
+// tree the store does not hold.
+type TreeResolver interface {
+	TreeAt(treeHash codec.Hash) (document.DocumentTree, bool, error)
+}
+
 // TreeWalker is implemented by adapters that can stream a tree's (doc id, content hash) entries
 // without loading document bodies - what a snapshot needs to page through a namespace in id
 // order without reading every body for every page. treeHash is a document tree hash, as for
