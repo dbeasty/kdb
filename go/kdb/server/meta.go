@@ -12,6 +12,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/index"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
@@ -474,4 +475,28 @@ func (m *MetaStore) Placement() (map[string]Home, error) {
 		}
 	}
 	return out, nil
+}
+
+// ReadResolutionChain reads ns's resolution chain from a metadata namespace opened on its own -
+// for a tool that has the data root but no running MetaStore (the CLI). nil when there is none.
+func ReadResolutionChain(meta *embed.EmbeddedKdbRuntime, ns string) (*peersync.ResolutionChain, error) {
+	_, head, ok, err := meta.DAG.HeadCommit()
+	if err != nil || !ok {
+		return nil, err
+	}
+	doc, err := meta.Storage.GetDocument(MetaNamespace, metaResolutionID(ns), head.DocumentTreeHash)
+	if err != nil || doc == nil {
+		return nil, err
+	}
+	var d metaDoc
+	if err := json.Unmarshal([]byte(doc.JSON), &d); err != nil {
+		return nil, err
+	}
+	if d.Resolution == nil || len(d.Resolution.Rules) == 0 {
+		return nil, nil
+	}
+	if err := d.Resolution.Validate(); err != nil {
+		return nil, err
+	}
+	return d.Resolution, nil
 }
