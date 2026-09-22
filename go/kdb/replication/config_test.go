@@ -87,4 +87,3 @@ func TestParsePeerDeepen(t *testing.T) {
 		t.Fatal("readthrough must be refused on an unfiltered peer")
 	}
 }
-
