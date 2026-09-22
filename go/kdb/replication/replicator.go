@@ -392,6 +392,10 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 				cur.LocalMain, cur.RemoteMain, cur.LastSync = ns.LocalMain, ns.RemoteMain, started
 			}
 			st.Namespaces[ns.Namespace] = cur
+			if ns.Snapshot != "" {
+				slog.Info("replication: bootstrapped a namespace from a peer's snapshot", "peer", l.peer.Name,
+					"namespace", ns.Namespace, "root", ns.Snapshot)
+			}
 			if len(ns.Grafted) > 0 {
 				slog.Info("replication: grafted an unrelated history", "peer", l.peer.Name, "namespace", ns.Namespace, "roots", ns.Grafted)
 			}

@@ -41,6 +41,11 @@ def test_an_independent_node_grafts_a_snapshot_joined_one_whose_source_is_gone()
             "--peer", f"name=b,addr={b.peer_addr},mode=pull,interval=300ms,bootstrap=snapshot",
         ]).start()
         wait_for("A to join B", lambda: all(get(a, d) for d in b_docs))
+        # The test's premise: A holds B's state without its history. Without this it could have
+        # fetched the history instead, and then A and C would share a genesis and never graft.
+        wait_for("A to be rooted at B's snapshot",
+                 lambda: any(line.get("msg") == "replication: bootstrapped a namespace from a peer's snapshot"
+                             for line in a.log_lines()))
         b.stop()  # the snapshot's source is gone
 
         a_doc = "00000000000000000000000000000a01"
@@ -66,7 +71,8 @@ def test_an_independent_node_grafts_a_snapshot_joined_one_whose_source_is_gone()
         except AssertionError:
             raise AssertionError("A and C did not converge.\n--- C:\n" + c.logs()[-6000:]
                                  + "\n--- A:\n" + a.logs()[-6000:])
-        assert any(line.get("msg") == "replication: grafted an unrelated history" for line in c.log_lines()), c.logs()[-5000:]
+        assert any(line.get("msg") == "replication: grafted an unrelated history" for line in c.log_lines()), (
+            "C converged without grafting.\n--- C:\n" + c.logs()[-5000:] + "\n--- A:\n" + a.logs()[-3000:])
 
         # The graft survives an unclean restart, and the two keep syncing.
         c.kill9()
