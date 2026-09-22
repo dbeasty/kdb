@@ -105,8 +105,7 @@ internal class PeerSyncFrameHandler(
         }
         val incomingHead = msg.commits.lastOrNull()?.hash
         if (incomingHead != null) {
-            val localHead = dag.head()
-            val outcome = resolveDivergence(dag, storage, cfg.namespaceId, localHead, incomingHead, cfg.conflictPolicy)
+            val outcome = resolveDivergence(dag, storage, cfg.namespaceId, incomingHead, cfg.conflictPolicy)
             if (outcome is CommitPushOutcome.Conflict) {
                 val conflictMsg =
                     WireMessage.ConflictReport(
