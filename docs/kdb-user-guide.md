@@ -1471,6 +1471,35 @@ phone may pull its cloud-authored `app/u/42/ro` but never push to it.
   every document a push writes or deletes (`DocumentWriteAction` / `DocumentDeleteAction`), and
   refuses the page at the first denial.
 
+### Read-modify-write on a replicating node: `PutJSON` with a precondition
+
+On a node that syncs, peers write too: a replicated merge can land between your read and your
+write. Writing with `embed.PutJSONDocument` bypasses the server's write gate, so it can fail with
+"branch main moved", or overwrite a value it never saw. Use the runtime's gated write instead:
+
+```go
+for {
+	body, hash, found, err := rt.ReadForUpdate(ns, id)
+	// ... decide the new body from body ...
+	expect := &server.Expect{ContentHash: hash}
+	if !found {
+		expect = &server.Expect{Absent: true}
+	}
+	_, err = rt.PutJSON(ns, id, newBody, expect, principal)
+	var changed *server.PreconditionFailedError
+	if errors.As(err, &changed) {
+		continue // someone - a peer, another writer - changed it; decide again
+	}
+	break
+}
+```
+
+- `PutJSON` replaces the whole document: fields the new body leaves out are removed.
+- It goes through the same write gate as every other write, including peer ingest.
+- The precondition is checked at the front of the gate, so it holds at the instant of the commit.
+- `Expect{Absent: true}` is a create that must not overwrite. A nil `Expect` is an unconditional
+  replace.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.

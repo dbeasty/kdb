@@ -1161,6 +1161,15 @@ The fix is Cimbiosys-style move-out: the source sends a delete only for a docume
 
 **Tests:** grant semantics; a phone's tampered write to its read-only namespace never reaches the cloud while its own namespace still pushes; a locked document refuses its push.
 
+### Phase 16.4 — landed (gated, preconditioned whole-document write, G7)
+
+`KdbServerRuntime.PutJSON(ns, id, body, *Expect, principal)` replaces a document with Delete+Write in one transaction, through the write gate.
+- `Expect{ContentHash}` or `Expect{Absent}` is checked inside the gate, at the live head. A failure is `*PreconditionFailedError` carrying the current hash.
+- The transaction is then re-based on the live head, so a merge that touched other documents is not a conflict.
+- `ReadForUpdate` returns a document together with its content hash.
+
+**Tests:** replace semantics; stale, fresh and absent expectations; 8×10 concurrent read-modify-writes with retry and no lost updates; a peer merge between read and write is seen, while an unrelated one does not get in the way.
+
 ### Phase 11 — landed (graft: merging unrelated histories)
 
 Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).
