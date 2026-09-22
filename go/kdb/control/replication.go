@@ -10,6 +10,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/replication"
+	"github.com/limidus/kdb/go/kdb/script"
 	"github.com/limidus/kdb/go/kdb/server"
 )
 
@@ -236,6 +237,73 @@ func (s *Server) handleSetResolution(w http.ResponseWriter, r *http.Request, _ a
 	}
 	c := rt.ResolutionChainOf()
 	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": body.Rules, "hash": c.Hash()})
+}
+
+// GET /v1/ns/{ns}/procedures - the namespace's stored procedures: each name with the hash of the
+// source this node holds. A chain that calls one pins that hash, so comparing this listing across
+// nodes is how an operator sees why a namespace has stopped merging.
+func (s *Server) handleProcedures(w http.ResponseWriter, _ *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	procs := []map[string]string{}
+	for _, name := range rt.ProcedureNames() {
+		procs = append(procs, map[string]string{"name": name, "sourceHash": rt.ProcedureHash(name)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "procedures": procs, "thisNode": rt.NodeID.String()})
+}
+
+// GET /v1/ns/{ns}/procedures/{name} - one procedure's source.
+func (s *Server) handleProcedure(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	name := r.PathValue("name")
+	src, ok := rt.ProcedureSource(name)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "this node holds no procedure named "+name+" in "+ns)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"namespace": ns, "name": name, "source": src, "sourceHash": rt.ProcedureHash(name),
+	})
+}
+
+// PUT /v1/ns/{ns}/procedures/{name} - {"source": "function main(conflict) { ... }"} defines or
+// replaces a stored procedure, as a replicated definition. Source that does not compile is
+// refused here rather than at the merge that would have called it.
+func (s *Server) handleSetProcedure(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	var body struct {
+		Source string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if rt.Meta == nil {
+		writeError(w, http.StatusConflict, "no_metadata", "this process has no metadata namespace, which stored procedures are recorded in")
+		return
+	}
+	name := r.PathValue("name")
+	if err := rt.Meta.SetProcedure(ns, name, body.Source); err != nil {
+		if errors.Is(err, script.ErrCompile) {
+			writeError(w, http.StatusBadRequest, "invalid_procedure", err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "name": name, "sourceHash": rt.ProcedureHash(name)})
+}
+
+// DELETE /v1/ns/{ns}/procedures/{name} - drops a stored procedure, as a replicated tombstone. A
+// chain still calling it then stops that namespace merging until the chain is changed too, which
+// is the safe order: the alternative is nodes merging under different rules.
+func (s *Server) handleDropProcedure(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	if rt.Meta == nil {
+		writeError(w, http.StatusConflict, "no_metadata", "this process has no metadata namespace, which stored procedures are recorded in")
+		return
+	}
+	name := r.PathValue("name")
+	if err := rt.Meta.DropProcedure(ns, name); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "name": name, "dropped": true})
 }
 
 // GET /v1/placement - every namespace with a single-home assignment, and where its home is. A

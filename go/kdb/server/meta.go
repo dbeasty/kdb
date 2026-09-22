@@ -79,6 +79,11 @@ type metaDoc struct {
 	Home *Home `json:"home,omitempty"`
 	// Resolution is a conflict resolution chain (kind "resolution"); no rules means none.
 	Resolution *peersync.ResolutionChain `json:"resolution,omitempty"`
+	// Source is a stored procedure's JavaScript (kind "procedure"), under Name. There is no
+	// revision number: the source is the revision, and its hash is what a resolution chain pins
+	// and what peers compare - a counter would only be a second answer to the same question, and
+	// one two nodes could disagree about.
+	Source string `json:"source,omitempty"`
 	// V is the definition format version, set only when a definition needs a newer reader than
 	// the first format: MetaFormatPatterns for a definition whose Namespace is a pattern. A node
 	// skips a definition newer than it understands rather than misapplying it; a node from
@@ -173,6 +178,9 @@ func metaSchemaID(ns string) codec.UUID { return codec.DerivedUUID("kdb:meta/sch
 func metaHomeID(ns string) codec.UUID   { return codec.DerivedUUID("kdb:meta/home/" + ns) }
 func metaResolutionID(ns string) codec.UUID {
 	return codec.DerivedUUID("kdb:meta/resolution/" + ns)
+}
+func metaProcedureID(ns, name string) codec.UUID {
+	return codec.DerivedUUID("kdb:meta/procedure/" + ns + "/" + name)
 }
 func metaIndexID(ns, name string) codec.UUID {
 	return codec.DerivedUUID("kdb:meta/index/" + ns + "/" + name)
@@ -343,6 +351,66 @@ func validNamespaceOrPattern(ns string) error {
 	return nil
 }
 
+// SetProcedure records a stored procedure on ns and applies it here at once, refusing source
+// that does not compile - a procedure is checked when it is defined rather than in the middle of
+// a merge, where the only thing a caller could do with a broken one is stop merging.
+//
+// It replicates like any definition. Until it has, a node without it cannot run a chain that
+// calls it, and says so by advertising a different resolution hash, so no node merges that
+// namespace on half the rules.
+func (m *MetaStore) SetProcedure(ns, name, source string) error {
+	if m == nil {
+		return fmt.Errorf("no metadata namespace: stored procedures are recorded in it")
+	}
+	if name == "" {
+		return fmt.Errorf("a procedure needs a name")
+	}
+	if err := procRuntime.Compile(source); err != nil {
+		return err
+	}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	if err := validNamespaceOrPattern(ns); err != nil {
+		return err
+	}
+	d := metaDoc{Kind: "procedure", Namespace: ns, Name: name, Source: source}
+	if err := m.put(metaProcedureID(ns, name), d); err != nil {
+		return err
+	}
+	if IsNamespacePattern(ns) {
+		return m.reconcileLocked()
+	}
+	if rt, ok := m.set.Get(ns); ok {
+		m.apply(rt, d)
+	}
+	return nil
+}
+
+// DropProcedure records that ns no longer has the named procedure. Like a dropped index it is a
+// tombstone, not a deleted document: a node reconciling has to learn that the procedure is gone,
+// which the absence of a document cannot tell it.
+func (m *MetaStore) DropProcedure(ns, name string) error {
+	if m == nil {
+		return fmt.Errorf("no metadata namespace: stored procedures are recorded in it")
+	}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	if err := validNamespaceOrPattern(ns); err != nil {
+		return err
+	}
+	d := metaDoc{Kind: "procedure", Namespace: ns, Name: name, Dropped: true}
+	if err := m.put(metaProcedureID(ns, name), d); err != nil {
+		return err
+	}
+	if IsNamespacePattern(ns) {
+		return m.reconcileLocked()
+	}
+	if rt, ok := m.set.Get(ns); ok {
+		m.apply(rt, d)
+	}
+	return nil
+}
+
 // AssignHome makes node (reachable for clients at addr) the only node that accepts ns's writes,
 // or with an empty node returns ns to multi-leader. Every assignment raises the fence past the
 // last one this node knows of, so commits the previous home makes after it has been replaced are
@@ -506,6 +574,12 @@ func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
 		} else if err = d.Resolution.Validate(); err == nil {
 			c := *d.Resolution
 			rt.SetResolutionChain(&c)
+		}
+	case "procedure":
+		if d.Dropped {
+			rt.RemoveProcedure(d.Name)
+		} else {
+			err = rt.SetProcedure(d.Name, d.Source)
 		}
 	case "home":
 		if d.Home == nil || d.Home.Node == "" {

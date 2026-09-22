@@ -193,6 +193,9 @@ type KdbServerRuntime struct {
 	home atomic.Pointer[Home]
 	// resolution is the namespace's conflict resolution chain, a replicated definition (nil: none).
 	resolution atomic.Pointer[peersync.ResolutionChain]
+	// procs holds the namespace's stored procedures by name, also replicated definitions - see
+	// procedures.go.
+	procs procsField
 	// ReadThrough, on a filtered projection, answers client reads of documents the projection
 	// does not hold from the source (see ReadDocument). nil: those reads find nothing.
 	ReadThrough *ReadThrough
