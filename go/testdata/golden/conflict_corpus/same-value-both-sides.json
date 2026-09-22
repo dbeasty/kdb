@@ -1,0 +1,16 @@
+{
+  "name": "same-value-both-sides",
+  "comment": "Both sides set a field to the same new value. That is not a conflict, and 'same' distinguishes it from 'both' - a procedure that only checked 'changed on both sides' would deadlock on it.",
+  "source": "function main(c) {\n  var kinds = c.fields.map(function (f) { return f.path + '=' + f.kind; }).join(',');\n  return { doc: { kinds: kinds } };\n}",
+  "input": {
+    "docId": "44444444-4444-4444-8444-444444444444",
+    "base": {"a": 1, "b": 1},
+    "local": {"a": 2, "b": 9},
+    "remote": {"a": 2, "b": 1},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "doc", "doc": {"kinds": "/a=same,/b=local"}}
+}

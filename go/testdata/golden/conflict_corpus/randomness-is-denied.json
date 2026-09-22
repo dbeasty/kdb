@@ -1,0 +1,16 @@
+{
+  "name": "randomness-is-denied",
+  "comment": "Same for randomness: two nodes would pick different sides.",
+  "source": "function main(c) { return { take: Math.random() < 0.5 ? 'local' : 'remote' }; }",
+  "input": {
+    "docId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "base": {"a": 1},
+    "local": {"a": 2},
+    "remote": {"a": 3},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "errorContains": "Math.random is not available"
+}

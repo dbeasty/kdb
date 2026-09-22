@@ -11,6 +11,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/script"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
@@ -31,8 +32,16 @@ func (s *KdbServerRuntime) SetResolutionChain(c *peersync.ResolutionChain) {
 // ResolutionChainOf returns this namespace's chain, or nil.
 func (s *KdbServerRuntime) ResolutionChainOf() *peersync.ResolutionChain { return s.resolution.Load() }
 
+// maxProcedureCallsPerSync bounds how much script one sync may run. A merge with a very large
+// number of conflicting documents starts one sandbox per document; past this many the merge is
+// held rather than left to run for minutes. Holding is safe - the other node may still merge and
+// this one fast-forwards - which is why a limit that two nodes could hit at different points is
+// no threat to convergence.
+const maxProcedureCallsPerSync = 10_000
+
 // peerResolution is the resolution options peer sync merges this namespace with.
 func (s *KdbServerRuntime) peerResolution() peersync.ResolutionOptions {
+	calls := 0
 	return peersync.ResolutionOptions{
 		Policy: s.PeerSyncConflictPolicy,
 		Chain:  s.ResolutionChainOf(),
@@ -42,7 +51,81 @@ func (s *KdbServerRuntime) peerResolution() peersync.ResolutionOptions {
 			// cover the schema - which is why the rule only ever picks between two present values.
 			return schema.Validate(document.Document{JSON: body}, s.Schema()).IsSuccess()
 		},
+		ProcedureHash: s.ProcedureHash,
+		Procedure: func(name, sourceHash string, c peersync.ProcedureConflict) (peersync.Settlement, bool, error) {
+			calls++
+			if calls > maxProcedureCallsPerSync {
+				return peersync.Settlement{}, false, fmt.Errorf("more than %d conflicting documents in one sync", maxProcedureCallsPerSync)
+			}
+			return s.runConflictProcedure(name, sourceHash, c)
+		},
 	}
+}
+
+// runConflictProcedure runs a stored procedure over one conflicting document for RuleProcedure.
+//
+// Everything that can go wrong returns an error, which holds the merge. That includes this node
+// not holding the procedure, or holding a different revision of it: peers compare resolution
+// hashes before merging and so should never reach this, but a merge is not the place to discover
+// that the rules are not what they were.
+func (s *KdbServerRuntime) runConflictProcedure(name, sourceHash string, c peersync.ProcedureConflict) (peersync.Settlement, bool, error) {
+	ns := s.Runtime.DefaultNamespace
+	src, ok := s.ProcedureSource(name)
+	if !ok {
+		return peersync.Settlement{}, false, fmt.Errorf("this node holds no procedure %q in %s", name, ns)
+	}
+	if have := script.SourceHash(src); have != sourceHash {
+		return peersync.Settlement{}, false, fmt.Errorf("this node holds revision %s of %q, the chain was set against %s", short(have), name, short(sourceHash))
+	}
+	dec, err := procRuntime.ResolveConflict(context.Background(), src, script.ModePure, nil, script.ConflictInput{
+		DocID:        c.DocID.String(),
+		Base:         c.Base,
+		Local:        c.Side0,
+		Remote:       c.Side1,
+		LocalOrigin:  procedureOrigin(c.Origin0),
+		RemoteOrigin: procedureOrigin(c.Origin1),
+	})
+	if err != nil {
+		return peersync.Settlement{}, false, err
+	}
+	sides := [2]*string{c.Side0, c.Side1}
+	origins := [2]transaction.ConflictOrigin{c.Origin0, c.Origin1}
+	switch dec.Kind {
+	case script.DecideDefer:
+		return peersync.Settlement{}, false, nil
+	case script.DecideTake:
+		return peersync.Settlement{Body: sides[dec.Side]}, true, nil
+	case script.DecideDoc:
+		body := dec.Doc
+		return peersync.Settlement{Body: &body}, true, nil
+	case script.DecideDelete:
+		return peersync.Settlement{}, true, nil
+	case script.DecideFork:
+		losing := 1 - dec.Side
+		f, ok := peersync.ForkOf(c.DocID, sides[losing], origins[losing].Commit)
+		if !ok {
+			// Nothing to fork: that side deleted the document, or its body is not an object.
+			return peersync.Settlement{}, false, fmt.Errorf("procedure asked to keep both sides of %s, but the other side cannot be forked", c.DocID)
+		}
+		return peersync.Settlement{Body: sides[dec.Side], Fork: f}, true, nil
+	default:
+		return peersync.Settlement{}, false, fmt.Errorf("procedure returned an unknown decision")
+	}
+}
+
+func procedureOrigin(o transaction.ConflictOrigin) script.Origin {
+	return script.Origin{NodeID: o.NodeID.String(), Commit: o.Commit.Hex(), TimestampMicros: o.TimestampMicros}
+}
+
+// short abbreviates a hash for a message an operator reads.
+func short(hash string) string {
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	if hash == "" {
+		return "(none)"
+	}
+	return hash
 }
 
 // authorizeResolve checks principal may settle this namespace's conflicts: "resolve" when its
@@ -83,12 +166,30 @@ func (s *KdbServerRuntime) resolveProvisional(e peersync.ConflictEntry, choices 
 		}
 		c, ok := choices[id]
 		var body *string
+		var fork *peersync.ForkDoc
 		switch {
 		case !ok:
 			undecided = append(undecided, it.DocumentID)
 			continue
 		case c.Body != nil:
 			body = c.Body
+		case c.Delete:
+			body = nil
+		case c.Fork != nil:
+			keep, losing := it.LocalDoc, it.IncomingDoc
+			if c.Fork.Keep == "remote" {
+				keep, losing = it.IncomingDoc, it.LocalDoc
+			} else if c.Fork.Keep != "local" {
+				undecided = append(undecided, it.DocumentID)
+				continue
+			}
+			f, ok := peersync.ForkOf(id, losing, codec.Hash{})
+			if !ok {
+				// Nothing to fork: the losing side deleted the document, or is not an object.
+				undecided = append(undecided, it.DocumentID)
+				continue
+			}
+			body, fork = keep, f
 		case c.Take == "local":
 			body = it.LocalDoc
 		case c.Take == "remote":
@@ -109,6 +210,9 @@ func (s *KdbServerRuntime) resolveProvisional(e peersync.ConflictEntry, choices 
 			ops = append(ops, document.DeleteOp{DocID: id})
 		} else {
 			ops = append(ops, document.DeleteOp{DocID: id}, document.WriteOp{DocID: id, Patch: *body})
+		}
+		if fork != nil {
+			ops = append(ops, document.WriteOp{DocID: fork.ID, Patch: fork.Body})
 		}
 	}
 	if len(undecided) > 0 {

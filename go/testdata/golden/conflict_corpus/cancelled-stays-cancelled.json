@@ -1,0 +1,16 @@
+{
+  "name": "cancelled-stays-cancelled",
+  "comment": "The worked example from the user guide, kept here so the documentation is a tested procedure rather than a plausible one. A cancelled order stays cancelled whichever side cancelled it; anything else is someone else's problem.",
+  "source": "function main(c) {\n  if (c.local.status === \"cancelled\") { return { take: \"local\" }; }\n  if (c.remote.status === \"cancelled\") { return { take: \"remote\" }; }\n  return { defer: true };\n}",
+  "input": {
+    "docId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "base": {"status": "open", "total": 20},
+    "local": {"status": "open", "total": 35},
+    "remote": {"status": "cancelled", "total": 20},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 300},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 100}
+    }
+  },
+  "expected": {"kind": "take", "side": 1}
+}

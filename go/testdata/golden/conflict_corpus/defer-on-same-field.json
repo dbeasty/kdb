@@ -1,0 +1,16 @@
+{
+  "name": "defer-on-same-field",
+  "comment": "Both sides moved the same field, so this procedure declines and lets the rest of the chain decide. kind is 'both' exactly when that happened.",
+  "source": "function main(c) {\n  for (var i = 0; i < c.fields.length; i++) { if (c.fields[i].kind === 'both') { return { defer: true }; } }\n  return { take: 'local' };\n}",
+  "input": {
+    "docId": "33333333-3333-4333-8333-333333333333",
+    "base": {"qty": 1},
+    "local": {"qty": 2},
+    "remote": {"qty": 3},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "defer"}
+}

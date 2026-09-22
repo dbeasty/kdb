@@ -42,7 +42,7 @@ for native servers, the CLI, `database/sql`, WASM, and mobile bindings.
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
 | **File attachments** (`file put` / `get` / `meta`, ZIP, bundles, `fileId` GUID) | Implemented — see [file attachments spec](kdb-spec-layer1-component3b-file-attachments.md) |
-| **Stored procedures** (`:kdb-script`, sandboxed JS) | Library-level API implemented and tested (registry, GraalVM sandbox, per-call authorized `kdb` host API); no wire protocol frame or CLI subcommand yet — see [Component 32 spec](kdb-spec-layer11-component32-stored-procedures.md) |
+| **Stored procedures** (`:kdb-script`, `go/kdb/script`, sandboxed JS) | Reachable as **conflict resolvers** on the Go server — replicated definitions, a `procedure` chain rule and a procedure-backed resolver authority (see [Deciding conflicts with your own code](#deciding-conflicts-with-your-own-code)). As a general-purpose callable API still library-level: no wire protocol frame or CLI subcommand — see [Component 32 spec](kdb-spec-layer11-component32-stored-procedures.md) |
 
 ---
 
@@ -974,7 +974,17 @@ APIs: `head()`, `getBaseVersion()`, `setBaseVersion(hex)`, `acceptRemote(remoteH
 
 ## Stored procedures (`:kdb-script`)
 
-> **Status: library-level API today.** The pieces below (`ProcedureRegistry`, `GraalProcedureRuntime`) work end-to-end and are unit-tested against the real engines, but there is no wire protocol frame or CLI subcommand yet — you drive them from Kotlin, on the JVM backend, in the same process as the rest of the engine. See [Component 32 spec](kdb-spec-layer11-component32-stored-procedures.md) for the full design and what's left (§9 Implementation phases, §11 Implementation status).
+> **Status.** There is one thing procedures are wired into end to end: **resolving replication
+> conflicts**, on the Go server, where a procedure is a replicated definition that a resolution
+> chain or a resolver authority calls — see [Deciding conflicts with your own
+> code](#deciding-conflicts-with-your-own-code) and §12 of the spec.
+>
+> As a general-purpose callable API they remain library-level. The pieces below
+> (`ProcedureRegistry`, `GraalProcedureRuntime`) work end-to-end and are unit-tested against the
+> real engines, but there is no wire protocol frame or CLI subcommand yet — you drive them from
+> Kotlin, on the JVM backend, in the same process as the rest of the engine. See [Component 32
+> spec](kdb-spec-layer11-component32-stored-procedures.md) for the full design and what's left (§9
+> Implementation phases, §11 Implementation status).
 
 Stored procedures are restricted-JavaScript functions that run **inside the backend process**, next to storage, instead of round-tripping documents to a client for simple read-modify-write logic. They are sandboxed (no filesystem, network, process, or Java-class access) and every data access they make is re-authorized against the *calling* principal's own permissions — a procedure never runs with elevated "owner" rights, so being allowed to invoke one never implies being allowed to do what it attempts.
 
@@ -1285,6 +1295,7 @@ when nodes merge. Each rule either decides or passes to the next:
 | `source-priority` | the value written by the higher-ranked node. `nodes` lists node ids, highest first; a node not listed ranks below all of them |
 | `validity` | the value that passes the namespace's schema, when the other doesn't |
 | `field-merge` | a field-by-field merge, when the two sides changed different top-level fields |
+| `procedure` | whatever the namespace's stored procedure says: keep a side, build a document, keep both, delete, or pass on |
 | `last-write` | the later write (always decides; must be last) |
 | `queue` | nothing: the conflict is queued for the application or an operator, whatever `--peer-conflict-policy` says (must be last) |
 
@@ -1358,8 +1369,69 @@ call other systems, look up which site is trusted, or ask a person.
 - which node wrote each side, in which commit and when (`details[].localOrigin` /
   `incomingOrigin`: `nodeId`, `commit`, `timestampMicros`).
 
+### Deciding conflicts with your own code
+
+The built-in rules are about the shape of a conflict, not what the data means. When the answer is
+"a cancelled order stays cancelled" or "add the two counters together", write a **stored
+procedure** and have the chain call it.
+
+A procedure is JavaScript defining `main(conflict)`. Define it before any chain names it:
+
+```bash
+curl -X PUT https://kdb:9443/v1/ns/site/berlin/orders/procedures/keepCancelled -d '{
+  "source": "function main(c) {\n  if (c.local.status === \"cancelled\") { return { take: \"local\" }; }\n  if (c.remote.status === \"cancelled\") { return { take: \"remote\" }; }\n  return { defer: true };\n}"
+}'
+```
+
+Then call it from the chain:
+
+```json
+{"rules": [{"kind": "procedure", "name": "keepCancelled"}, {"kind": "field-merge"}, {"kind": "queue"}]}
+```
+
+**What the procedure is given.** One conflicting document: `local` and `remote` (either can be
+`null`, meaning that side deleted it), `base` — the value they last agreed on — `origins`, saying
+which node wrote each side and when, and `fields`, the list of paths on which the two sides
+actually differ, each marked `local`, `remote`, `both` or `same`. Inside a merge, `local` and
+`remote` are fixed sides rather than "this node" and "the other one"; say `side0`/`side1` if that
+matters to you.
+
+**What it can return.** Exactly one of `{take: "local"}`, `{doc: {…}}` (a document you built),
+`{fork: {keep: "local"}}`, `{delete: true}` or `{defer: true}` to pass to the next rule.
+
+`fork` is the one worth knowing about: it keeps *both* versions. The side you name stays where it
+is, and the other becomes a new document carrying `conflictOf: {id, commit}` pointing back. Use it
+when there is no right answer to pick and a person should choose — nothing is thrown away, and the
+back-reference is how your application finds the pair.
+
+**Rules a merge-time procedure lives under.** Every node runs it and all of them must agree, so:
+
+- there is no clock, no `Math.random`, no locale-dependent comparison, no database access and none
+  of the `Math` functions that are allowed to be approximate. Calling one throws.
+- the chain records the exact revision of the procedure it was set against. A node with a
+  different copy stops merging that namespace rather than merging under different rules; the
+  divergence waits. Changing a procedure updates the chain for you, so merging resumes once both
+  definitions have replicated. `GET …/procedures` lists each name with the source hash this node
+  holds — compare two nodes to see why they have stopped.
+- a procedure that throws or times out **holds the merge** and says so in the conflict's
+  `details[].reason`. It never falls through to the next rule.
+
+**When you need a database read or non-deterministic logic**, put the procedure on the authority
+instead of in the merge:
+
+```json
+{"rules": [{"kind": "field-merge"},
+           {"kind": "authority", "pending": "hold", "procedure": "decideOrder"}]}
+```
+
+The conflict is queued as usual, and the node the rule notifies runs the procedure over it after
+the merge. There it may read documents and run SQL (`kdb.get`, `kdb.query`), because its answer is
+an ordinary commit rather than part of a merge. It still cannot write: the settlement is committed
+for it, as a principal holding `resolve`, so it stays attributable. A procedure that returns
+`{defer: true}` leaves the conflict for a person, which is what an `authority` rule promised.
+
 **Deciding.** Settle a conflict with
-`POST /v1/ns/{ns}/conflicts/{id}/resolve {"choices":{"<docId>":{"take":"local"|"remote"}|{"body":"<json>"}}}`.
+`POST /v1/ns/{ns}/conflicts/{id}/resolve {"choices":{"<docId>":{"take":"local"|"remote"}|{"body":"<json>"}|{"delete":true}|{"fork":{"keep":"local"}}}}`.
 - For a `provisional` entry, `local` is the value the merge kept (confirm it) and `remote` is the
   value it displaced (overrule it).
 - The resolution is a commit whose message is `kdb:resolve/1 <id>`. Every node that receives it

@@ -389,7 +389,7 @@ func (h *V2Host) refs(namespaces []string) ([]wire.NamespaceRefs, error) {
 			return nil, err
 		}
 		refs := RefsOf(ns, env.DAG)
-		refs.ResolutionHash = env.Resolution.Chain.Hash()
+		refs.ResolutionHash = env.Resolution.AdvertisedHash()
 		h.mu.Lock()
 		refs.Access = h.access[ns]
 		h.mu.Unlock()

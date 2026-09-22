@@ -107,9 +107,11 @@ type Node struct {
 	conns      map[stream.ConnectionHandle]struct{}
 	stopExpiry chan struct{}
 	hook       *server.ConflictWebhook
-	stopScrub  chan struct{}
-	scrubDone  chan struct{}
-	stopIdle   func()
+	// authorityProcs settles conflicts for chains whose authority rule names a procedure.
+	authorityProcs *server.ConflictProcedure
+	stopScrub      chan struct{}
+	scrubDone      chan struct{}
+	stopIdle       func()
 }
 
 // Open prepares primary - a runtime already in set - to sync, opens the metadata namespace and
@@ -160,6 +162,12 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	if cfg.ConflictWebhook != nil {
 		n.hook = server.StartConflictWebhook(set, primary.NodeID.String(), cfg.ConflictWebhook)
 	}
+	// A namespace whose authority rule names a stored procedure has its conflicts settled here
+	// instead of by a webhook receiver, on the node the rule notifies. Always started: a chain
+	// that asks for it is the opt-in, and one that does not is left alone.
+	n.authorityProcs = server.StartConflictProcedure(set, primary.NodeID.String(), &server.ConflictProcedure{
+		Interval: cfg.AuthorityExpiryInterval,
+	})
 
 	if cfg.Idle != nil && host == nil {
 		return nil, errors.New("syncnode: idle close needs a host - an in-memory namespace closed is gone")
@@ -528,6 +536,9 @@ func (n *Node) Close() error {
 	}
 	if n.hook != nil {
 		n.hook.Close()
+	}
+	if n.authorityProcs != nil {
+		n.authorityProcs.Close()
 	}
 	close(n.stopExpiry)
 	n.metaStore.Close()

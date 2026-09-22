@@ -1,0 +1,16 @@
+{
+  "name": "delete-loses-to-write",
+  "comment": "A delete on one side against a write on the other. The deleted side is absent, not an empty object, and a procedure may settle it either way - here by keeping the surviving write.",
+  "source": "function main(c) {\n  if (!c.present.local) { return { take: 'remote' }; }\n  if (!c.present.remote) { return { take: 'local' }; }\n  return { defer: true };\n}",
+  "input": {
+    "docId": "77777777-7777-4777-8777-777777777777",
+    "base": {"qty": 1},
+    "local": null,
+    "remote": {"qty": 7},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "take", "side": 1}
+}

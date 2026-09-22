@@ -1,0 +1,16 @@
+{
+  "name": "nested-paths",
+  "comment": "The diff walks into objects and compares arrays whole, and paths are JSON Pointers. The order is by path bytes, whatever order the fields were written in.",
+  "source": "function main(c) { return { doc: { paths: c.fields.map(function (f) { return f.path; }) } }; }",
+  "input": {
+    "docId": "66666666-6666-4666-8666-666666666666",
+    "base": {"z": 1, "addr": {"city": "Lisbon", "zip": "1000"}, "tags": ["a"]},
+    "local": {"z": 2, "addr": {"city": "Porto", "zip": "1000"}, "tags": ["a", "b"]},
+    "remote": {"z": 1, "addr": {"city": "Lisbon", "zip": "4000"}, "tags": ["a"]},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "doc", "doc": {"paths": ["/addr/city", "/addr/zip", "/tags", "/z"]}}
+}

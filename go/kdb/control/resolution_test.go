@@ -163,3 +163,45 @@ func TestAuthorityConflictResolutionIsForbiddenWithoutResolve(t *testing.T) {
 		t.Fatal("nothing may have been settled")
 	}
 }
+
+func TestProcedureEndpoints(t *testing.T) {
+	cs, base := newFixture(t, func(o *Options) { o.AllowWrites = true }, withMeta(t))
+	res, body := get(t, base, "/v1/ns/demo%2Fusers/procedures")
+	if res.StatusCode != http.StatusOK || len(body["procedures"].([]any)) != 0 {
+		t.Fatalf("no procedures yet: %d %v", res.StatusCode, body)
+	}
+	if res, body := sendJSON(t, http.MethodPut, base, "/v1/ns/demo%2Fusers/procedures/broken",
+		`{"source":"function main( {"}`); res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("source that will not compile must be refused: %d %v", res.StatusCode, body)
+	}
+	res, body = sendJSON(t, http.MethodPut, base, "/v1/ns/demo%2Fusers/procedures/keepLocal",
+		`{"source":"function main(c) { return { take: \"local\" }; }"}`)
+	if res.StatusCode != http.StatusOK || body["sourceHash"] == "" {
+		t.Fatalf("define: %d %v", res.StatusCode, body)
+	}
+	hash := body["sourceHash"]
+	if got := cs.opts.Runtime.ProcedureHash("keepLocal"); got != hash {
+		t.Fatalf("the runtime holds %q, the endpoint reported %q", got, hash)
+	}
+	res, body = get(t, base, "/v1/ns/demo%2Fusers/procedures/keepLocal")
+	if res.StatusCode != http.StatusOK || body["sourceHash"] != hash {
+		t.Fatalf("read back: %d %v", res.StatusCode, body)
+	}
+	if res, _ := get(t, base, "/v1/ns/demo%2Fusers/procedures/absent"); res.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for a procedure this node does not hold, got %d", res.StatusCode)
+	}
+	if res, body := sendJSON(t, http.MethodDelete, base, "/v1/ns/demo%2Fusers/procedures/keepLocal", ``); res.StatusCode != http.StatusOK {
+		t.Fatalf("drop: %d %v", res.StatusCode, body)
+	}
+	if _, ok := cs.opts.Runtime.ProcedureSource("keepLocal"); ok {
+		t.Fatal("the dropped procedure is still on the runtime")
+	}
+}
+
+func TestProcedureNeedsAMetadataNamespace(t *testing.T) {
+	_, base := newFixture(t, func(o *Options) { o.AllowWrites = true })
+	if res, _ := sendJSON(t, http.MethodPut, base, "/v1/ns/demo%2Fusers/procedures/p",
+		`{"source":"function main() { return { defer: true }; }"}`); res.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 without a metadata namespace, got %d", res.StatusCode)
+	}
+}

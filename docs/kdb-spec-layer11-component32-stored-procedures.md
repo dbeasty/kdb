@@ -383,3 +383,170 @@ Two real findings surfaced while wiring this to the actual engines, both fixed:
 2. **`kdb_id` isn't part of a document's JSON body** — see the implementation note in §4. `kdb.get` embeds it, `kdb.put` strips it back out.
 
 Remaining before this is callable over the wire: Phase 5 (`WireMessage.ProcExec`/`ProcDefine`, `SqlWireHost`/`ProcWireHost` integration) and Phase 6 (audit logging, `kdb-cli proc` subcommand). The `HybridScriptDataAccess`/`GraalProcedureRuntime` pair is wire-protocol-agnostic, so Phase 5 is additive — no changes anticipated to the code landed so far.
+
+-----
+
+## 12. Addendum: procedures as conflict resolvers
+
+This section specifies a second use of stored procedures, added after §1–§11: settling a
+replication conflict. It is implemented in both trees, and it is the only use of the engine that
+is reachable today — the wire frames of §7 are still unbuilt, so a procedure cannot yet be called
+by an application, only by a conflict.
+
+### 12.1 Why a conflict wants a procedure
+
+A resolution chain (`peersync.ResolutionChain`, `docs/kdb-user-guide.md`) settles a same-document
+conflict with declarative rules: prefer this node, prefer the valid side, merge disjoint fields,
+take the later write. Those cover the mechanical cases and none of the ones that are about what
+the data means — "a cancelled order stays cancelled", "sum the two counters", "keep both drafts
+and let someone choose". Expressing those needs code.
+
+### 12.2 Three positions, two guarantees
+
+A procedure can resolve a conflict in three places. They are not interchangeable, and which
+guarantees apply follows from where the answer ends up.
+
+| Position | Where | Determinism | May read the database |
+|---|---|---|---|
+| In-merge (`RuleProcedure`) | every node, during the merge | **required** | no |
+| Authority (`RuleAuthority.procedure`) | the notifying node, after the merge | not required | yes |
+| Local transaction (`ConflictResolver`) | one process, at commit | not required | caller's choice |
+
+The in-merge position decides part of a merge commit's content, and a merge commit's hash covers
+its content. Two nodes that answered differently would build different merges and never converge.
+So the procedure runs with no clock, no randomness, no locale-dependent comparison, no database
+and none of the `Math` functions ECMAScript allows an implementation to approximate; each is
+replaced by a stub that throws. A procedure that reaches for one fails, which holds the merge,
+rather than receiving a value that would silently diverge.
+
+The other two positions produce ordinary commits, which replicate like any write, so neither
+needs determinism and both may read.
+
+### 12.3 Pinning the revision
+
+A chain that calls a procedure records the source hash that procedure had when the chain was set
+(`ResolutionRule.sourceHash`). The hash is part of the chain, so it is part of the chain's own
+hash, which peers compare in the sync v2 hello before they merge.
+
+A node whose copy of the procedure is missing or at another revision therefore does not look like
+a node that agrees: it advertises `unavailable:<chain hash>`, nothing merges, and the divergence
+waits. Changing a procedure re-pins the chain that calls it and records both definitions, so the
+two replicate and merging resumes without an operator having to set the same chain again. A chain
+may only name a procedure that already exists; refusing when the chain is set is the last moment
+at which anyone can be told.
+
+### 12.4 The calling convention
+
+`main(conflict)` receives:
+
+```
+{
+  "docId":  "<uuid>",
+  "base":   <document | null>,      // the value both sides last agreed on
+  "local":  <document | null>,      // null where that side deleted the document
+  "remote": <document | null>,
+  "side0":  <document | null>,      // aliases of local/remote (see below)
+  "side1":  <document | null>,
+  "present": { "base": bool, "local": bool, "remote": bool, "side0": bool, "side1": bool },
+  "origins": { "local": <origin>, "remote": <origin>, "side0": …, "side1": … },
+  "fields": [ { "path": "/addr/city", "kind": "both",
+                "base": …, "local": …, "remote": …, "present": { … } } ]
+}
+```
+
+An origin is `{nodeId, commit, timestampMicros}`: the commit that produced that side. Timestamps
+are a commit's, not the moment of the call, so a procedure may use them and stay deterministic.
+
+`fields` is the three-way diff of the two sides against the base, computed by the runtime rather
+than by each procedure so that every node derives the same list:
+
+- paths are RFC 6901 JSON Pointers, sorted by **UTF-8 bytes** (Kotlin's own `String.compareTo` is
+  UTF-16 and orders astral characters differently);
+- the walk recurses into objects and compares arrays whole;
+- `present` distinguishes a field deleted from one set to `null`;
+- `kind` is `local`, `remote`, `both` (each side moved it, differently — the set a resolver exists
+  for) or `same` (both moved it to the same value, which is not a conflict).
+
+In a merge, `local`/`remote` are canonical sides: side 0 is the merge's first parent's, the lower
+head hash, so both nodes see the same two sides in the same order whichever is running the merge.
+A procedure that must not depend on that can say `side0`/`side1`. In the authority and local
+positions they mean what they say, relative to the node.
+
+The return value is exactly one of:
+
+| Result | Meaning | In-merge | Authority | Local |
+|---|---|---|---|---|
+| `{take: "local"｜"remote"｜"side0"｜"side1"}` | keep that side whole | ✓ | ✓ | ✓ |
+| `{doc: {…}}` | store this document | ✓ | ✓ | ✓ |
+| `{fork: {keep: "local"｜"remote"}}` | keep that side here, write the other to a new document | ✓ | ✓ | — |
+| `{delete: true}` | neither side survives | ✓ | ✓ | — |
+| `{defer: true}` | no opinion; fall through | ✓ | ✓ | ✓ |
+
+Parsing is strict — unknown keys, two decisions, an unnamed side, a non-object `doc` are all
+refused — because a result that can be read two ways is a result two nodes might read differently.
+
+A local transaction has no merge commit to put an extra document or a deletion in, so `fork` and
+`delete` are refused there rather than collapsed into storing one side.
+
+### 12.5 Forking
+
+`fork` keeps the losing side as a document of its own, carrying
+`"conflictOf": {"id": "<original>", "commit": "<origin>"}`.
+
+Its id is derived from what it keeps (`peersync.ForkID`), so both nodes settling the same conflict
+write the same document, and a conflict that recurs over the same content forks to the same id
+rather than to a new one every merge. It is written only once: a merge whose heads already hold
+that id leaves it alone, or a criss-cross would put the original losing content back over a fork
+copy that has since been edited or deleted.
+
+Forked documents duplicate their source's field values, so a namespace with unique constraints
+may see a `unique-duplicate` conflict as a result. A procedure that expects this should rewrite
+the losing body in its `doc`/`fork` output.
+
+### 12.6 Failure
+
+Inside a merge, a procedure that throws, times out or is not on this node **holds the merge**: the
+document is reported with the reason on its conflict detail and no merge commit is made. It never
+falls through to the next rule. The failure may be local — a timeout, an older copy — and two
+nodes carrying on under different rules is the one outcome that does not heal. Holding is safe:
+the other node may merge, and this one fast-forwards to that merge later.
+
+In the authority position a failure leaves the conflict queued, retried a few times and then left
+for a person, with the reason kept.
+
+### 12.7 Two runtimes
+
+Go's `kdb/script` (goja) and Kotlin's `kdb-script` (GraalJS) implement the same convention. The
+shared corpus at `go/testdata/golden/conflict_corpus` is run by both, so parity is asserted rather
+than assumed. Because only Go nodes resolve inside a merge, byte-identical behaviour across the
+two matters only for that corpus.
+
+Procedures should stay inside a conservative subset — goja is ES2015+ with gaps, and the two
+engines' regular-expression implementations differ.
+
+### 12.8 What is where
+
+| | Go | Kotlin |
+|---|---|---|
+| Field diff | `kdb/json/diff.go` | `kdb-json` `ConflictDiff.kt` |
+| Deterministic runtime | `kdb/script` `ModePure` | `PureProcedureRuntime` |
+| Calling convention | `kdb/script/conflict.go` | `ConflictProcedure.kt` |
+| In-merge rule | `peersync` `RuleProcedure` | — |
+| Authority runner | `server/conflict_procedure.go` | — |
+| Local resolver | `script.ConflictResolver` | `ProcedureConflictResolver` |
+| Replicated definition | `_kdb/meta` kind `procedure` | — |
+
+Kotlin peer sync does not build deterministic merges (it stamps one with a random transaction id,
+the current time and a random author) and has neither the metadata namespace nor the sync v2
+hello, so the in-merge and authority positions are Go-only. Mixed clusters are safe without extra
+work: a v1 host falls back to strict whenever a namespace has a chain.
+
+### 12.9 Still open
+
+- `ProcedureRegistry`'s blob backup is still not replicated; on the Go side the definition lives
+  in `_kdb/meta` instead. Kotlin has no equivalent, so a Kotlin node cannot learn a procedure by
+  replication.
+- The authority runner's `kdb.query` caps at 10,000 rows, which is §10's first open question
+  answered only for this caller.
+- No audit log entry is written when a procedure settles a conflict; the settlement commit names
+  the principal, but not the procedure.

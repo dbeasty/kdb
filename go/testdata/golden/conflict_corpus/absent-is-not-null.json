@@ -1,0 +1,16 @@
+{
+  "name": "absent-is-not-null",
+  "comment": "One side set the field to null, the other removed it. present tells them apart, which reading the value alone cannot.",
+  "source": "function main(c) {\n  var f = c.fields[0];\n  return { doc: { path: f.path, localPresent: f.present.local, remotePresent: f.present.remote, localIsNull: f.local === null } };\n}",
+  "input": {
+    "docId": "55555555-5555-4555-8555-555555555555",
+    "base": {"note": "hello"},
+    "local": {"note": null},
+    "remote": {},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "doc", "doc": {"path": "/note", "localPresent": true, "remotePresent": false, "localIsNull": true}}
+}
