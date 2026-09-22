@@ -59,6 +59,14 @@ type ScrubCmd struct {
 	PasswordEnv string
 }
 
+// DeepenCmd fetches the history below a snapshot's shallow roots from a peer.
+type DeepenCmd struct {
+	Namespace   string
+	Peer        string
+	User        string
+	PasswordEnv string
+}
+
 // PeerDiffCmd lists the documents this node holds differently from a peer, by Merkle comparison.
 type PeerDiffCmd struct {
 	Namespace   string
@@ -75,6 +83,7 @@ func (ResolveAllCmd) command() {}
 func (ResolutionCmd) command() {}
 func (ScrubCmd) command()      {}
 func (PeerDiffCmd) command()   {}
+func (DeepenCmd) command()     {}
 
 func parseReplicationCommand(rest []string) (Command, bool, error) {
 	switch rest[0] {
@@ -130,6 +139,15 @@ func parseReplicationCommand(rest []string) (Command, bool, error) {
 		}
 		c := ScrubCmd{Namespace: rest[1]}
 		if err := peerFlags(rest[2:], &c.Peer, &c.User, &c.PasswordEnv, true); err != nil {
+			return nil, true, err
+		}
+		return c, true, nil
+	case "deepen":
+		if len(rest) < 3 {
+			return nil, true, fmt.Errorf("usage: kdb deepen <namespace> <peer-addr> [--user U --password-env VAR]")
+		}
+		c := DeepenCmd{Namespace: rest[1], Peer: rest[2]}
+		if err := peerFlags(rest[3:], nil, &c.User, &c.PasswordEnv, false); err != nil {
 			return nil, true, err
 		}
 		return c, true, nil
@@ -521,6 +539,34 @@ func cmdPeerDiff(cfg Config, rt *embed.EmbeddedKdbRuntime, c PeerDiffCmd) int {
 		fmt.Printf("  %s\t%s\n", d.DocID, side)
 	}
 	if len(diff) > 0 {
+		return 3
+	}
+	return 0
+}
+
+func cmdDeepen(cfg Config, rt *embed.EmbeddedKdbRuntime, c DeepenCmd) int {
+	srv, err := serverFor(cfg, rt, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	results, err := srv.Deepen(func() (*peersync.RepairSession, error) {
+		return repairSession(srv, c.Namespace, c.Peer, c.User, c.PasswordEnv)
+	})
+	for _, r := range results {
+		state := "still shallow"
+		if r.Unshallowed {
+			state = "history complete"
+		}
+		fmt.Printf("root %s: fetched %d commit(s), %s\n", r.Root.Hex(), r.Fetched, state)
+	}
+	left := srv.ShallowRoots()
+	fmt.Printf("%s: %d shallow root(s) left\n", c.Namespace, len(left))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if len(left) > 0 {
 		return 3
 	}
 	return 0

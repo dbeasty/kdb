@@ -178,3 +178,43 @@ func TestPeerFloorOnlyCountsActivePushPeers(t *testing.T) {
 		t.Fatal("a namespace no pushing peer syncs has no floor")
 	}
 }
+
+// TestReplicatorDeepensASnapshotBootstrap: a peer configured bootstrap=snapshot,deepen=true
+// installs the peer's state by snapshot, then fetches the history below it - so the namespace
+// ends with no shallow roots and the peer's first commit in its history.
+func TestReplicatorDeepensASnapshotBootstrap(t *testing.T) {
+	ns := "app/data"
+	a, b := newNode(t, ns), newNode(t, ns)
+	put(t, b, `{"n":1}`)
+	put(t, b, `{"n":2}`)
+	put(t, b, `{"n":3}`)
+	var first codec.Hash
+	{
+		h := head(t, b)
+		for {
+			c, _ := b.Runtime.DAG.GetCommitOrThrow(h)
+			if len(c.ParentHashes) == 0 {
+				break
+			}
+			first, h = h, c.ParentHashes[0]
+		}
+	}
+	ln, err := server.ListenPeerSync("tcp://127.0.0.1:0?bind=true", b, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	r, err := New(Config{
+		NodeID: a.NodeID.String(), Local: a.PeerNamespaces(),
+		Peers: []PeerConfig{{Name: "b", Addr: "tcp://" + ln.Addr().String(), Namespaces: []string{ns}, Mode: peersync.SyncPull,
+			Interval: 100 * time.Millisecond, PreferSnapshot: true, Deepen: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop()
+	eventually(t, 3*time.Second, "the snapshot to be installed and deepened", func() bool {
+		return head(t, a) == head(t, b) && len(a.ShallowRoots()) == 0 && a.Runtime.DAG.(interface{ HasCommit(codec.Hash) bool }).HasCommit(first)
+	})
+}

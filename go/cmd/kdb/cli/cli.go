@@ -67,6 +67,7 @@ Commands:
   resolution <namespace>
   scrub <namespace> [--peer ADDR] [--user U --password-env VAR]
   peer-diff <namespace> <peer-addr> [--user U --password-env VAR]
+  deepen <namespace> <peer-addr> [--user U --password-env VAR]
 
 A REV is a revision: head, head~10, head^, a commit hash, <hash>~2,
 tag:NAME, branch:NAME, or any of those with ~N appended.`)

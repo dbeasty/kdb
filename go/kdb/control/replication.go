@@ -336,3 +336,46 @@ func (s *Server) handlePeerDiff(w http.ResponseWriter, r *http.Request, _ auth.P
 		"equal": len(rows) == 0, "differences": rows,
 	})
 }
+
+// DeepenSource opens a repair session to a named replication peer - what deepen needs.
+type DeepenSource interface {
+	OpenRepairSessionTo(name, ns string) (*peersync.RepairSession, error)
+}
+
+// POST /v1/ns/{ns}/deepen - {"peer": "<name>"} fetches the history below the namespace's shallow
+// roots (a namespace bootstrapped by snapshot) from that replication peer. Answers what each root
+// got and the shallow roots left.
+func (s *Server) handleDeepen(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	var body struct {
+		Peer string `json:"peer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Peer == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "body must be {\"peer\": \"<name>\"}")
+		return
+	}
+	src, _ := s.opts.Replication.(DeepenSource)
+	if s.opts.Replication == nil || src == nil {
+		writeError(w, http.StatusConflict, "no_peers", "no replication peers are configured")
+		return
+	}
+	results, err := rt.Deepen(func() (*peersync.RepairSession, error) { return src.OpenRepairSessionTo(body.Peer, ns) })
+	type row struct {
+		Root        string   `json:"root"`
+		Fetched     int      `json:"fetched"`
+		Horizon     []string `json:"horizon,omitempty"`
+		Unshallowed bool     `json:"unshallowed"`
+	}
+	rows := []row{}
+	for _, res := range results {
+		rw := row{Root: res.Root.Hex(), Fetched: res.Fetched, Unshallowed: res.Unshallowed}
+		for _, h := range res.Horizon {
+			rw.Horizon = append(rw.Horizon, h.Hex())
+		}
+		rows = append(rows, rw)
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"namespace": ns, "results": rows, "error": err.Error(), "shallowRoots": rt.ShallowRoots()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "results": rows, "shallowRoots": rt.ShallowRoots()})
+}

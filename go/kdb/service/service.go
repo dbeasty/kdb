@@ -1222,6 +1222,13 @@ func (l lazyReplication) Compare(name, ns string, local document.DocumentTree) (
 	return "", nil, fmt.Errorf("no replication peers are configured")
 }
 
+func (l lazyReplication) OpenRepairSessionTo(name, ns string) (*peersync.RepairSession, error) {
+	if r := l.ref.Load(); r != nil {
+		return r.OpenRepairSessionTo(name, ns)
+	}
+	return nil, fmt.Errorf("no replication peers are configured")
+}
+
 func containsExclusion(patterns []string, ns string) bool {
 	for _, p := range patterns {
 		if strings.HasPrefix(p, "!") && peersync.MatchNamespace(p[1:], ns) {

@@ -300,6 +300,7 @@ func (s *Server) routes() http.Handler {
 	// Replication: conflicts are a namespace's; peers are the process's, so admin-scoped.
 	mux.Handle("GET /v1/ns/{ns}/conflicts", s.nsRead(s.handleConflicts))
 	mux.Handle("POST /v1/ns/{ns}/scrub", s.nsWrite(s.handleScrub))
+	mux.Handle("POST /v1/ns/{ns}/deepen", s.nsWrite(s.handleDeepen))
 	mux.Handle("GET /v1/ns/{ns}/peers/{peer}/diff", s.nsRead(s.handlePeerDiff))
 	mux.Handle("POST /v1/ns/{ns}/conflicts/{id}/resolve", s.nsWrite(s.handleResolveConflict))
 	mux.Handle("POST /v1/ns/{ns}/conflicts/{id}/ack", s.nsWrite(s.handleAckConflict))
