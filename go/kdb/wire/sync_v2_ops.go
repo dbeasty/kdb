@@ -55,7 +55,16 @@ type NamespaceRefs struct {
 	// ResolutionHash identifies the namespace's conflict resolution chain (empty: none). Peers
 	// whose hashes differ would settle the same conflict differently, so neither merges.
 	ResolutionHash string
+	// Access is what the session may do with the namespace: "" both directions, AccessPull or
+	// AccessPush one only. A client skips the other direction instead of being refused in it.
+	Access string
 }
+
+// Access values of NamespaceRefs.
+const (
+	AccessPull = "pull"
+	AccessPush = "push"
+)
 
 // SyncHelloMessage opens a v2 session.
 type SyncHelloMessage struct {
@@ -186,6 +195,7 @@ type namespaceRefsDto struct {
 	HistoryFloorHex string            `json:"historyFloorHex,omitempty"`
 	ResolutionHash  string            `json:"resolutionHash,omitempty"`
 	Shallow         []string          `json:"shallow,omitempty"`
+	Access          string            `json:"access,omitempty"`
 }
 
 type syncHelloDto struct {
@@ -258,6 +268,7 @@ func refsToDto(refs []NamespaceRefs) []namespaceRefsDto {
 		out[i] = namespaceRefsDto{
 			Namespace: r.Namespace, Branches: r.Branches, Tags: r.Tags,
 			HistoryFloorHex: r.HistoryFloorHex, Shallow: r.Shallow, ResolutionHash: r.ResolutionHash,
+			Access: r.Access,
 		}
 	}
 	return out
@@ -269,6 +280,7 @@ func refsFromDto(dtos []namespaceRefsDto) []NamespaceRefs {
 		out[i] = NamespaceRefs{
 			Namespace: d.Namespace, Branches: d.Branches, Tags: d.Tags,
 			HistoryFloorHex: d.HistoryFloorHex, Shallow: d.Shallow, ResolutionHash: d.ResolutionHash,
+			Access: d.Access,
 		}
 	}
 	return out

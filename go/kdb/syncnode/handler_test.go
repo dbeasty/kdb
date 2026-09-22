@@ -143,3 +143,133 @@ func TestConnectionContextFromReadsBearerAndBasic(t *testing.T) {
 		t.Fatalf("basic: %+v", cc)
 	}
 }
+
+// directionEngine admits every caller as "phone" and grants peer sync per namespace: both
+// directions on zolik/u/1, pull only on zolik/u/1/ro (cloud-authored), nothing else.
+type directionEngine struct{}
+
+func (directionEngine) Authenticator() auth.Authenticator { return directionEngine{} }
+func (directionEngine) Authorizer() auth.Authorizer       { return directionEngine{} }
+func (directionEngine) Authenticate(context.Context, auth.Credentials) (auth.Principal, error) {
+	return auth.Principal{ID: "phone"}, nil
+}
+func (directionEngine) Authorize(_ context.Context, _ auth.Principal, a auth.Action) error {
+	switch a := a.(type) {
+	case auth.PeerSyncAction:
+		if a.Namespace == "zolik/u/1" || a.Namespace == "_kdb/meta" {
+			return nil
+		}
+	case auth.PeerPullAction:
+		if a.Namespace == "zolik/u/1/ro" {
+			return nil
+		}
+	case auth.PeerPushAction:
+	default:
+		return nil // local writes and reads: not what this test is about
+	}
+	return errors.New("forbidden")
+}
+
+// TestPhoneCannotPushToItsReadOnlyNamespace (G3): the phone pulls its cloud-authored namespace but
+// the cloud never takes a push to it - a modified client that writes its own stats locally gets
+// nothing onto the cloud, and its sync of the namespace is a skipped direction, not a failure.
+func TestPhoneCannotPushToItsReadOnlyNamespace(t *testing.T) {
+	cloud := newTestNode(t, "zolik/cloud", Config{})
+	cloud.primary.AuthEngine = directionEngine{}
+	if err := cloud.node.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := cloud.node.Listen("tcp://127.0.0.1:0?bind=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, profile := mustID(t), mustID(t)
+	cloud.put(t, "zolik/u/1/ro", stats, `{"wins":3}`)
+	cloud.put(t, "zolik/u/1", profile, `{"name":"ada"}`)
+	phone := newTestNode(t, "zolik/phone", Config{Peers: []replication.PeerConfig{{
+		Name: "cloud", Addr: "tcp://" + ln.Addr().String(), Namespaces: []string{"zolik/u/1", "zolik/u/1/ro"},
+		Mode: peersync.SyncBoth, Interval: time.Hour, CreateLocal: true,
+	}}})
+	if err := phone.node.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := phone.node.SyncNow("cloud"); err != nil {
+		t.Fatal(err)
+	}
+	if phone.get("zolik/u/1/ro", stats) != `{"wins":3}` {
+		t.Fatal("the phone should pull its read-only namespace")
+	}
+
+	// A tampered client rewrites its stats locally and syncs.
+	phone.put(t, "zolik/u/1/ro", stats, `{"wins":999}`)
+	mine := mustID(t)
+	phone.put(t, "zolik/u/1", mine, `{"theme":"dark"}`)
+	res, err := phone.node.SyncNow("cloud")
+	if err != nil {
+		t.Fatalf("a direction the cloud does not grant must be skipped, not fail the sync: %v", err)
+	}
+	for _, ns := range res.Namespaces {
+		if ns.Namespace == "zolik/u/1/ro" && ns.Access != "pull" {
+			t.Fatalf("the cloud should report pull-only access, got %q", ns.Access)
+		}
+	}
+	if got := cloud.get("zolik/u/1/ro", stats); got != `{"wins":3}` {
+		t.Fatalf("the cloud took a push to a read-only namespace: %s", got)
+	}
+	if cloud.get("zolik/u/1", mine) == "" {
+		t.Fatal("the phone's own namespace should still push")
+	}
+}
+
+// docEngine lets peers sync everything but refuses writes to one document.
+type docEngine struct{ locked string }
+
+func (e docEngine) Authenticator() auth.Authenticator { return e }
+func (e docEngine) Authorizer() auth.Authorizer       { return e }
+func (docEngine) Authenticate(context.Context, auth.Credentials) (auth.Principal, error) {
+	return auth.Principal{ID: "peer"}, nil
+}
+func (e docEngine) Authorize(_ context.Context, p auth.Principal, a auth.Action) error {
+	if w, ok := a.(auth.DocumentWriteAction); ok && w.DocID == e.locked && p.ID == "peer" {
+		return errors.New("forbidden: document is locked")
+	}
+	return nil
+}
+
+// TestPushedDocumentsAreAuthorizedWhenAsked: with AuthorizePushedDocuments, a push that writes a
+// document the engine locks is refused whole; other pushes go through.
+func TestPushedDocumentsAreAuthorizedWhenAsked(t *testing.T) {
+	locked := mustID(t)
+	cloud := newTestNode(t, "zolik/cloud", Config{AuthorizePushedDocuments: true})
+	cloud.primary.AuthEngine = docEngine{locked: locked.String()}
+	if err := cloud.node.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := cloud.node.Listen("tcp://127.0.0.1:0?bind=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloud.put(t, "zolik/u/1", mustID(t), `{"seed":true}`)
+	phone := newTestNode(t, "zolik/phone", Config{Peers: []replication.PeerConfig{{
+		Name: "cloud", Addr: "tcp://" + ln.Addr().String(), Namespaces: []string{"zolik/u/1"},
+		Mode: peersync.SyncBoth, Interval: time.Hour, CreateLocal: true,
+	}}})
+	if err := phone.node.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := phone.node.SyncNow("cloud"); err != nil {
+		t.Fatal(err)
+	}
+	ok := mustID(t)
+	phone.put(t, "zolik/u/1", ok, `{"fine":true}`)
+	if _, err := phone.node.SyncNow("cloud"); err != nil || cloud.get("zolik/u/1", ok) == "" {
+		t.Fatalf("an allowed push: %v", err)
+	}
+	phone.put(t, "zolik/u/1", locked, `{"sneaky":true}`)
+	if _, err := phone.node.SyncNow("cloud"); err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("a push writing a locked document must be refused, got %v", err)
+	}
+	if cloud.get("zolik/u/1", locked) != "" {
+		t.Fatal("the locked document reached the cloud")
+	}
+}

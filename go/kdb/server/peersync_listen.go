@@ -122,7 +122,8 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 					code, _ := classifyError(err)
 					return code, code != wire.ErrorCodeInternal
 				},
-				CreateOnPush: h.runtime.PeerCreateOnPush,
+				CreateOnPush:       h.runtime.PeerCreateOnPush,
+				AuthorizeDocuments: h.runtime.PeerAuthorizeDocuments,
 				WriteBack: func(principal auth.Principal, m wire.ProjectWriteMessage) (wire.ProjectWriteResultMessage, error) {
 					rt, err := h.runtime.namespaceSet().Resolve(m.Namespace, false)
 					if err != nil {

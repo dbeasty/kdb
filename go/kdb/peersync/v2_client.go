@@ -72,6 +72,9 @@ type NamespaceSyncResult struct {
 	Snapshot string
 	// Grafted lists the peer's shallow roots this sync grafted in (see Graft).
 	Grafted []string
+	// Access is the peer's grant for this namespace: "" both directions, wire.AccessPull or
+	// wire.AccessPush. The direction not granted was skipped.
+	Access string
 	// LocalMain / RemoteMain are both sides' main heads when this sync finished, as far as it
 	// knows: the peer's is its advertised head, or what it reported after the last push to it.
 	LocalMain, RemoteMain string
@@ -169,14 +172,16 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 		env.Resolution = ResolutionOptions{Policy: transaction.ConflictPolicyStrict}
 		res.ResolutionMismatch = true
 	}
-	if cfg.Mode&SyncPull != 0 {
+	res.Access = remote.Access
+	// A direction the peer does not grant is skipped, not attempted and refused.
+	if cfg.Mode&SyncPull != 0 && remote.Access != wire.AccessPush {
 		if err := c.pull(cfg, env, remote, &res); err != nil {
 			res.Err = err
 			return res
 		}
 	}
 	res.RemoteMain = remote.Branches[mainBranch]
-	if cfg.Mode&SyncPush != 0 {
+	if cfg.Mode&SyncPush != 0 && remote.Access != wire.AccessPull {
 		if err := c.push(cfg, env, remote, &res); err != nil {
 			res.Err = err
 		}

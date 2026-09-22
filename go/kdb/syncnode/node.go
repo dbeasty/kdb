@@ -57,6 +57,10 @@ type Config struct {
 	// ScrubInterval, when positive, re-verifies every open namespace at this interval and
 	// repairs damage from peers.
 	ScrubInterval time.Duration
+	// AuthorizePushedDocuments also asks the auth engine about every document a peer's push
+	// writes or deletes (DocumentWriteAction / DocumentDeleteAction), for engines whose rules go
+	// below the namespace. Namespace-level push rights are always checked.
+	AuthorizePushedDocuments bool
 	// Debounce, MaxBackoff and Timeout tune the replicator (see replication.Config).
 	Debounce, MaxBackoff, Timeout time.Duration
 }
@@ -99,6 +103,7 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	}
 	n := &Node{host: host, set: set, primary: primary, cfg: cfg, stopExpiry: make(chan struct{})}
 	primary.Namespaces = set
+	primary.PeerAuthorizeDocuments = cfg.AuthorizePushedDocuments
 	primary.Runtime.SetPeerRetentionFloor(n.peerFloorFor(primary))
 
 	// Definitions (schema, index DDL, resolution chains, homes) live as documents in a reserved

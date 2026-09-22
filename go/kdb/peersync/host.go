@@ -128,7 +128,7 @@ func newFrameHandler(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage
 // - the transport-provided connection context, empty for TCP the same way SqlWireHost's own
 // Handshake-credentials-only model is (see wire_listen.go's principal field doc comment) - rather
 // than treating an un-handshaken connection as implicitly trusted.
-func (h *frameHandler) authorizePeerSync() error {
+func (h *frameHandler) authorizePeerSync(push bool) error {
 	if !h.authenticated {
 		principal, err := h.auth.Authenticator().Authenticate(context.Background(), h.ctx.ToCredentials())
 		if err != nil {
@@ -137,7 +137,7 @@ func (h *frameHandler) authorizePeerSync() error {
 		h.principal = principal
 		h.authenticated = true
 	}
-	return h.auth.Authorizer().Authorize(context.Background(), h.principal, auth.PeerSyncAction{Namespace: h.cfg.NamespaceID})
+	return auth.AuthorizePeer(context.Background(), h.auth.Authorizer(), h.principal, h.cfg.NamespaceID, push)
 }
 
 func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
@@ -236,8 +236,9 @@ func (h *frameHandler) serve(msg wire.Message) (wire.Message, error) {
 			reason := err.Error()
 			return peerHandshakeAck(m, false, nil, &reason), nil
 		}
-		if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.PeerSyncAction{Namespace: h.cfg.NamespaceID}); err != nil {
-			reason := err.Error()
+		// Either direction admits the session; each frame then checks its own.
+		if pull, push := auth.PeerDirections(context.Background(), h.auth.Authorizer(), principal, h.cfg.NamespaceID); !pull && !push {
+			reason := auth.AuthorizePeer(context.Background(), h.auth.Authorizer(), principal, h.cfg.NamespaceID, false).Error()
 			return peerHandshakeAck(m, false, nil, &reason), nil
 		}
 		h.principal = principal
@@ -249,7 +250,7 @@ func (h *frameHandler) serve(msg wire.Message) (wire.Message, error) {
 		if err := h.requireNamespace(m.Namespace); err != nil {
 			return nil, err
 		}
-		if err := h.authorizePeerSync(); err != nil {
+		if err := h.authorizePeerSync(false); err != nil {
 			return nil, err
 		}
 		commits, stubs, err := h.fetchCommits(m.SinceHash, m.Haves, m.MaxCommits)
@@ -270,7 +271,7 @@ func (h *frameHandler) serve(msg wire.Message) (wire.Message, error) {
 		if err := h.requireNamespace(m.Namespace); err != nil {
 			return nil, err
 		}
-		if err := h.authorizePeerSync(); err != nil {
+		if err := h.authorizePeerSync(true); err != nil {
 			return nil, err
 		}
 		return h.commitPush(m)

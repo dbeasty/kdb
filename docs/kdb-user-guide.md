@@ -1452,6 +1452,25 @@ certificate as its API. That is what phones behind mobile networks and captive p
   as `Authorization: Bearer ...` on the upgrade request, and in the sync hello. The node's auth
   engine authenticates from either.
 
+### Pull-only and push-only peers
+
+The auth engine can grant each direction of peer sync separately, per namespace. For example, a
+phone may pull its cloud-authored `app/u/42/ro` but never push to it.
+
+- **Registry engine (RBAC):**
+  - `sync:<ns>` is both directions, as before.
+  - `sync_pull:<ns>` grants pull only, and `sync_push:<ns>` grants push only (`GRANT sync_pull ON ...`).
+- **Custom engine:** it answers `auth.PeerSyncAction` for both directions. To limit a peer to one
+  direction, deny that action and answer `auth.PeerPullAction` or `auth.PeerPushAction`. Engines
+  that only know `PeerSyncAction` keep working unchanged.
+- **At hello:** the node tells the peer each namespace's access. The peer skips a direction it
+  isn't granted instead of failing the namespace.
+- **Every frame is checked:** fetches, snapshots and tree reads need pull; ref updates and pushed
+  grafts need push. A grant revoked mid-session takes effect on the next frame.
+- **Per-document checks:** `syncnode.Config.AuthorizePushedDocuments` also asks the engine about
+  every document a push writes or deletes (`DocumentWriteAction` / `DocumentDeleteAction`), and
+  refuses the page at the first denial.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.

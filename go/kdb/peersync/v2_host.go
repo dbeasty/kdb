@@ -11,6 +11,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -29,6 +30,11 @@ type NamespaceProvider interface {
 type V2HostConfig struct {
 	// NodeID is this node's identity; a peer presenting the same one is refused.
 	NodeID string
+	// AuthorizeDocuments asks the auth engine about every document a pushed commit writes or
+	// deletes (DocumentWriteAction / DocumentDeleteAction), on top of the namespace's push grant.
+	// For engines whose rules go below the namespace. Merge commits carry every document their
+	// sides disagreed on, so a peer needs write rights on those too.
+	AuthorizeDocuments bool
 	// Namespaces supplies the namespaces this host serves.
 	Namespaces NamespaceProvider
 	// ClassifyError maps a failure to the code sent back in PEER_ERROR - see HostConfig.
@@ -61,7 +67,9 @@ type V2Host struct {
 	// catches up, not everything committed before the last page.
 	helloAt time.Time
 	granted map[string]bool
-	peer    string
+	// access is each granted namespace's direction limit: "" both, wire.AccessPull or AccessPush.
+	access map[string]string
+	peer   string
 	// grafts stages GRAFT_PUSH pages per namespace until the last one arrives.
 	grafts map[string][]wire.SnapshotPageMessage
 }
@@ -134,7 +142,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}
 		return wire.RefsResultMessage{H: header(wire.MsgRefsResult, m.H.CorrelationID), Refs: refs}, nil
 	case wire.FetchRequestMessage:
-		env, err := h.env(m.Namespace, false)
+		env, err := h.env(m.Namespace, false, dirPull)
 		if err != nil {
 			return nil, err
 		}
@@ -159,7 +167,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 	case wire.ProjectWriteMessage:
 		return h.projectWrite(m)
 	case wire.SnapshotFetchMessage:
-		env, err := h.env(m.Namespace, false)
+		env, err := h.env(m.Namespace, false, dirPull)
 		if err != nil {
 			return nil, err
 		}
@@ -183,7 +191,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 	case wire.GraftPushMessage:
 		return h.graftPush(m)
 	case wire.TreeNodesMessage:
-		env, err := h.env(m.Namespace, false)
+		env, err := h.env(m.Namespace, false, dirPull)
 		if err != nil {
 			return nil, err
 		}
@@ -194,7 +202,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		res.H = header(wire.MsgTreeNodesResult, m.H.CorrelationID)
 		return res, nil
 	case wire.ObjectFetchMessage:
-		env, err := h.env(m.Namespace, false)
+		env, err := h.env(m.Namespace, false, dirPull)
 		if err != nil {
 			return nil, err
 		}
@@ -233,10 +241,25 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 	// allowed to sync some of what it names gets exactly those, not a refusal of the whole.
 	matched := SelectNamespaces(m.Namespaces, h.cfg.Namespaces.List())
 	granted := map[string]bool{}
+	access := map[string]string{}
+	grant := func(ns string) bool {
+		pull, push := auth.PeerDirections(context.Background(), h.auth.Authorizer(), principal, ns)
+		switch {
+		case pull && push:
+			access[ns] = ""
+		case pull:
+			access[ns] = wire.AccessPull
+		case push:
+			access[ns] = wire.AccessPush
+		default:
+			return false
+		}
+		granted[ns] = true
+		return true
+	}
 	var names []string
 	for _, ns := range matched {
-		if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.PeerSyncAction{Namespace: ns}); err == nil {
-			granted[ns] = true
+		if grant(ns) {
 			names = append(names, ns)
 		}
 	}
@@ -245,14 +268,14 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 	if h.cfg.CreateOnPush {
 		for _, p := range m.Namespaces {
 			if isLiteralNamespace(p) && !granted[p] {
-				if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.PeerSyncAction{Namespace: p}); err == nil {
-					granted[p] = true
+				if grant(p) && access[p] == wire.AccessPull {
+					delete(granted, p) // nothing to pull from a namespace this node does not hold
 				}
 			}
 		}
 	}
 	h.mu.Lock()
-	h.principal, h.helloDone, h.granted, h.peer, h.helloAt = principal, true, granted, m.NodeID, time.Now()
+	h.principal, h.helloDone, h.granted, h.access, h.peer, h.helloAt = principal, true, granted, access, m.NodeID, time.Now()
 	h.mu.Unlock()
 	refs, err := h.refs(names)
 	if err != nil {
@@ -314,32 +337,81 @@ func intersect(a, b []string) []string {
 func (h *V2Host) refs(namespaces []string) ([]wire.NamespaceRefs, error) {
 	out := make([]wire.NamespaceRefs, 0, len(namespaces))
 	for _, ns := range namespaces {
-		env, err := h.env(ns, false)
+		env, err := h.env(ns, false, dirEither)
 		if err != nil {
 			return nil, err
 		}
 		refs := RefsOf(ns, env.DAG)
 		refs.ResolutionHash = env.Resolution.Chain.Hash()
+		h.mu.Lock()
+		refs.Access = h.access[ns]
+		h.mu.Unlock()
 		out = append(out, refs)
 	}
 	return out, nil
 }
 
-// env returns ns's ingest environment, re-authorizing on every use so a grant revoked
-// mid-session takes effect on the next frame.
-func (h *V2Host) env(ns string, create bool) (IngestEnv, error) {
+// direction is what a frame does with a namespace, for authorization.
+type direction int
+
+const (
+	dirPull   direction = iota // reads history: fetch, snapshot, tree nodes, bodies
+	dirPush                    // writes history: ref updates, pushed grafts
+	dirEither                  // reads only refs, which a peer syncing either way needs
+)
+
+// env returns ns's ingest environment, re-authorizing the frame's direction on every use so a
+// grant revoked mid-session takes effect on the next frame.
+func (h *V2Host) env(ns string, create bool, dir direction) (IngestEnv, error) {
 	h.mu.Lock()
 	ok, principal, peer := h.granted[ns], h.principal, h.peer
 	h.mu.Unlock()
 	if !ok {
 		return IngestEnv{}, &NotGrantedError{Namespace: ns}
 	}
-	if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.PeerSyncAction{Namespace: ns}); err != nil {
+	var err error
+	switch dir {
+	case dirPull:
+		err = auth.AuthorizePeer(context.Background(), h.auth.Authorizer(), principal, ns, false)
+	case dirPush:
+		err = auth.AuthorizePeer(context.Background(), h.auth.Authorizer(), principal, ns, true)
+	default:
+		if pull, push := auth.PeerDirections(context.Background(), h.auth.Authorizer(), principal, ns); !pull && !push {
+			err = auth.AuthorizePeer(context.Background(), h.auth.Authorizer(), principal, ns, false)
+		}
+	}
+	if err != nil {
 		return IngestEnv{}, err
 	}
 	env, err := h.cfg.Namespaces.Env(ns, create)
 	env.Peer = peer
 	return env, err
+}
+
+// authorizePushedDocuments asks the engine about every document the pushed commits write or
+// delete (V2HostConfig.AuthorizeDocuments), refusing the page at the first denial.
+func (h *V2Host) authorizePushedDocuments(ns string, commits []document.Commit) error {
+	h.mu.Lock()
+	principal := h.principal
+	h.mu.Unlock()
+	authz := h.auth.Authorizer()
+	for _, c := range commits {
+		for _, op := range c.Operations {
+			var action auth.Action
+			switch o := op.(type) {
+			case document.WriteOp:
+				action = auth.DocumentWriteAction{Namespace: ns, DocID: o.DocID.String()}
+			case document.DeleteOp:
+				action = auth.DocumentDeleteAction{Namespace: ns, DocID: o.DocID.String()}
+			default:
+				continue
+			}
+			if err := authz.Authorize(context.Background(), principal, action); err != nil {
+				return fmt.Errorf("peer sync: commit %s writes a document this peer may not: %w", c.Hash.Hex(), err)
+			}
+		}
+	}
+	return nil
 }
 
 // maxGraftPushBytes bounds what one session may stage for a pushed graft: the state is held in
@@ -349,7 +421,7 @@ const maxGraftPushBytes = 1 << 30
 // graftPush stages one GRAFT_PUSH page and, on the last, grafts the pushed root (see Graft).
 func (h *V2Host) graftPush(m wire.GraftPushMessage) (wire.Message, error) {
 	ns := m.Page.Namespace
-	env, err := h.env(ns, false)
+	env, err := h.env(ns, false, dirPush)
 	if err != nil {
 		return nil, err
 	}
@@ -392,9 +464,14 @@ func (h *V2Host) graftPush(m wire.GraftPushMessage) (wire.Message, error) {
 }
 
 func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {
-	env, err := h.env(m.Namespace, h.cfg.CreateOnPush)
+	env, err := h.env(m.Namespace, h.cfg.CreateOnPush, dirPush)
 	if err != nil {
 		return nil, err
+	}
+	if h.cfg.AuthorizeDocuments {
+		if err := h.authorizePushedDocuments(m.Namespace, m.Commits); err != nil {
+			return nil, err
+		}
 	}
 	stored, err := StoreCommits(env, m.Commits, m.Stubs)
 	if err != nil {

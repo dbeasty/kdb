@@ -1148,6 +1148,19 @@ The fix is Cimbiosys-style move-out: the source sends a delete only for a docume
 - `syncnode`: sync through an `httptest` server beside an API route; a missing token refused; a token only on the upgrade header; a plain GET answered with 400.
 - `test_peer_http.py`: processes, with the phone killed by `kill -9`.
 
+### Phase 16.3 — landed (pull versus push authorization, G3)
+
+- **Actions:** `auth.PeerPullAction` and `auth.PeerPushAction`.
+  - `AuthorizePeer` and `PeerDirections` treat an allowed `PeerSyncAction` as both directions, so every existing engine is unchanged. A directional engine denies it and answers the new actions.
+  - Registry kinds are `sync_pull` and `sync_push` (underscores, because the Kotlin GRANT parser reads the kind as an identifier). `sync` still grants both.
+- **v2 host:**
+  - Hello grants each namespace in either direction and records its access in `NamespaceRefs.Access` (`pull` or `push`, JSON `access`, omitted when both). The client skips the other direction instead of failing.
+  - Every frame re-authorizes its direction: fetch, snapshot, tree and object reads need pull; `REF_UPDATE` and `GRAFT_PUSH` need push; refs need either.
+- **v1 host:** `COMMIT_FETCH` needs pull and `COMMIT_PUSH` needs push. The handshake needs either.
+- **Optional per-document check:** `AuthorizeDocuments` (`syncnode.Config.AuthorizePushedDocuments`).
+
+**Tests:** grant semantics; a phone's tampered write to its read-only namespace never reaches the cloud while its own namespace still pushes; a locked document refuses its push.
+
 ### Phase 11 — landed (graft: merging unrelated histories)
 
 Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).
