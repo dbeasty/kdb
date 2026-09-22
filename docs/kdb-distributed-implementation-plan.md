@@ -990,3 +990,37 @@ The fix, in `checkpointMatchesLog`: damage in place is told apart from a replace
 - an interrupted deepen finished by rerunning it;
 - the replicator option, the CLI, and a three-service Python e2e with a kill -9.
 
+### Phase 15 — measured, then built what the measurements justified
+
+Measurements are in `go/kdb/server/measure_phase15_test.go` (`KDB_MEASURE=1`).
+
+**M1: have/want overshoot** (2,000 shared commits, each side diverged by d):
+
+| Divergence d | Before (exponential haves) | After (peer's last-known head as a have) |
+|---|---|---|
+| 1 | 0 | 0 |
+| 10 | 6 | 0 |
+| 100 | 28 | 0 |
+| 1,000 | 24 | 0 |
+| 5,000 | 2,001 (the whole shared history) | 0 |
+
+The overshoot never exceeded about d, so Bloom/IBLT reconciliation was not justified. The fix is the replicator's recorded `RemoteMain` (the peer's main as of the last clean sync), sent as an extra have. It pins the merge base exactly.
+
+**M2: projection delta noise** (5,000 documents, 2,000 updates):
+
+| Filter matches | Before | After |
+|---|---|---|
+| 1% | 15 writes, **1,634 deletes** (99% of entries were deletes of documents never held) | 15 writes, 0 deletes |
+| 10% | — | 177 writes, 0 deletes |
+| 50% | — | 815 writes, 0 deletes |
+
+The fix is Cimbiosys-style move-out: the source sends a delete only for a document that matched the filter at the replica's position. It checks the filter against the document's value at `from`, ignoring read rights, so a lost read right still deletes. Exact, with no protocol change.
+
+**Changed-document-id Bloom filter per commit: not built.** Projection filters are content predicates, so knowing which ids a commit touched cannot tell whether it is relevant. The premise does not hold.
+
+**φ-accrual: built as health ordering.** The replicator observes sync outcomes, not heartbeats. Repair requests (`FetchBodies`) now ask peers in health order: fewest consecutive failures, then most recent success. A dead first peer no longer costs every repair its timeout.
+
+**Session tokens: built.** `DocumentGet.MinCommit` (wire, Go-only), `KdbServerRuntime.AwaitCommit` (bounded wait, then `ReplicaBehindError` mapped to BUSY with a retry-after), and `client.Session` with a portable `Token`/`Resume`. Read-your-writes and monotonic reads across replicas are tested end to end.
+
+**Also:** `NamespaceSyncResult.Received` counts every commit a pull received, so overshoot is observable.
+

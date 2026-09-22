@@ -1,6 +1,6 @@
 # Distributed KDB: self-healing, merging and partial replication — research and gap analysis
 
-Status: research and proposal. Phases 10.5, 12, 13 and 14 (read-through) have since landed (see §5 and the implementation plan's progress log); Phase 11 is blocked on engine support (see its section); 14–15 are not built.
+Status: research and proposal. Phases 10.5, 12, 13, 14 (read-through, deepen) and 15 have since landed (see §5 and the implementation plan's progress log); Phase 11 is blocked on engine support (see its section); 14–15 are not built.
 Basis: `main` at d30efd4, which includes the distributed work (PR #78, Phases 0–10 plus 7.4 and 7.5). Every `file:line` below refers to `go/kdb/` at that commit.
 Companion docs: [kdb-distributed-plan.md](kdb-distributed-plan.md) (design, D1–D12) and [kdb-distributed-implementation-plan.md](kdb-distributed-implementation-plan.md) (phases and progress log).
 
@@ -233,7 +233,7 @@ The foundation for Phases 13 and 14.
 - **Filter widening** becomes a tree-diff against the source instead of a `Reset` [23].
 - **Deepen:** a request that extends a shallow root further back.
 
-### Phase 15 — Build only on measurement
+### Phase 15 — Build only on measurement — measured and closed (see the progress log)
 
 - **Bloom-filter negotiation** [10], or RIBLT [7], when a peer has more than N heads or measured overshoot is high. Needs the 100k-commit v1-vs-v2 benchmark first.
 - **φ-accrual suspicion** [29] for peer choice and backoff in the replicator. SWIM [28] only if meshes need dynamic membership.

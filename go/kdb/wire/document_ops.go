@@ -8,6 +8,9 @@ type DocumentGetMessage struct {
 	H         Header
 	Namespace string
 	DocID     string
+	// MinCommit is a session token: serve the read only once main contains this commit, so a
+	// client never reads older than what it has written or read (Go server; ignored elsewhere).
+	MinCommit string
 }
 
 func (m DocumentGetMessage) Header() Header { return m.H }
@@ -69,6 +72,7 @@ func (m UpsertResultMessage) Header() Header { return m.H }
 type documentGetDto struct {
 	Namespace string `json:"namespace"`
 	DocID     string `json:"docId"`
+	MinCommit string `json:"minCommit,omitempty"`
 }
 
 type documentGetResultDto struct {
@@ -100,7 +104,7 @@ func encodeDocumentOpMessage(msg Message) (payloadEnvelope, bool, error) {
 	switch m := msg.(type) {
 	case DocumentGetMessage:
 		return payloadEnvelope{Kind: "documentGet", DocumentGet: &documentGetDto{
-			Namespace: m.Namespace, DocID: m.DocID,
+			Namespace: m.Namespace, DocID: m.DocID, MinCommit: m.MinCommit,
 		}}, true, nil
 	case DocumentGetResultMessage:
 		return payloadEnvelope{Kind: "documentGetResult", DocumentGetResult: &documentGetResultDto{
@@ -128,7 +132,7 @@ func decodeDocumentOpMessage(header Header, env payloadEnvelope) (Message, bool,
 		if d == nil {
 			return nil, true, newDecodeError("missing documentGet body")
 		}
-		return DocumentGetMessage{H: header, Namespace: d.Namespace, DocID: d.DocID}, true, nil
+		return DocumentGetMessage{H: header, Namespace: d.Namespace, DocID: d.DocID, MinCommit: d.MinCommit}, true, nil
 	case "documentGetResult":
 		d := env.DocumentGetResult
 		if d == nil {

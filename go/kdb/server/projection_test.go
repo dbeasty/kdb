@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -205,5 +206,30 @@ func TestProjectionFollowsKeyRemoval(t *testing.T) {
 	f.sync()
 	if got := f.held()[id]; got != src {
 		t.Fatalf("projection holds %s, source holds %s", got, src)
+	}
+}
+
+// A projection delta carries a delete only for a document the replica can hold - one that matched
+// the filter at the replica's position and has since left it. Changes to documents that never
+// matched send nothing (Cimbiosys move-out; Phase 15 M2).
+func TestProjectionDeltaSendsDeletesOnlyForDocumentsThatLeftTheFilter(t *testing.T) {
+	f := newProjectionFixture(t, "region = 'EU'")
+	eu, us, leaving := mustRandomUUID(t), mustRandomUUID(t), mustRandomUUID(t)
+	f.put(eu, `{"region":"EU","v":0}`)
+	f.put(us, `{"region":"US","v":0}`)
+	f.put(leaving, `{"region":"EU","v":0}`)
+	f.sync()
+	for i := 1; i <= 5; i++ {
+		f.put(us, fmt.Sprintf(`{"region":"US","v":%d}`, i)) // never matched: nothing to send
+	}
+	f.put(leaving, `{"region":"US","v":1}`) // leaves the filter: must be deleted
+	f.put(eu, `{"region":"EU","v":1}`)
+	res := f.sync()
+	if res.Deletes != 1 || res.Writes != 1 {
+		t.Fatalf("expected one write (eu) and one delete (leaving), got %d writes and %d deletes", res.Writes, res.Deletes)
+	}
+	held := f.held()
+	if _, ok := held[leaving]; ok || len(held) != 1 {
+		t.Fatalf("the document that left the filter must be gone: %v", held)
 	}
 }

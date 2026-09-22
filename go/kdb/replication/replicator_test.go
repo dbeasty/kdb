@@ -218,3 +218,30 @@ func TestReplicatorDeepensASnapshotBootstrap(t *testing.T) {
 		return head(t, a) == head(t, b) && len(a.ShallowRoots()) == 0 && a.Runtime.DAG.(interface{ HasCommit(codec.Hash) bool }).HasCommit(first)
 	})
 }
+
+// A repair asks the healthiest peer first: one that keeps failing goes to the back, whatever its
+// name.
+func TestRepairPeersAreAskedHealthiestFirst(t *testing.T) {
+	st, _ := NewStateStore("")
+	r, err := New(Config{
+		NodeID: "x", Local: newNode(t, "app/data").PeerNamespaces(), State: st,
+		Peers: []PeerConfig{{Name: "a-down", Addr: "tcp://127.0.0.1:1"}, {Name: "b-stale", Addr: "tcp://127.0.0.1:2"}, {Name: "c-fresh", Addr: "tcp://127.0.0.1:3"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, s := range []PeerState{
+		{Name: "a-down", ConsecutiveFailures: 4, LastSuccess: now.Add(-time.Hour)},
+		{Name: "b-stale", LastSuccess: now.Add(-time.Minute)},
+		{Name: "c-fresh", LastSuccess: now},
+	} {
+		if err := st.Save(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := r.healthiestFirst()
+	if len(got) != 3 || got[0] != "c-fresh" || got[1] != "b-stale" || got[2] != "a-down" {
+		t.Fatalf("expected c-fresh, b-stale, a-down; got %v", got)
+	}
+}

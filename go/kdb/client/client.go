@@ -421,6 +421,11 @@ func (c *Client) nextCorrelation() int {
 // cancelled context aborts this call and returns ctx.Err(), leaving the connection itself
 // reusable for the next call (component 40 spec §5).
 func (c *Client) request(ctx context.Context, msg wire.Message) (wire.Message, error) {
+	// A context cancelled before the call must not send it: once sent, a fast reply and the
+	// cancellation race in the select below, and a write could commit under a cancelled context.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	frame, err := c.codec.Encode(msg)
 	if err != nil {
 		return nil, err
@@ -541,10 +546,17 @@ func (c *Client) PutJSON(ctx context.Context, ns string, docID string, jsonBody 
 // GetJSON reads one document's current JSON by id, plus the commit hash it was read at.
 // Returns ErrNotFound if no document exists at docID.
 func (c *Client) GetJSON(ctx context.Context, ns string, docID string) ([]byte, string, error) {
+	return c.getJSON(ctx, ns, docID, "")
+}
+
+// getJSON is GetJSON with a session token: minCommit, when set, makes the server serve the read
+// only once its main contains that commit (see Session).
+func (c *Client) getJSON(ctx context.Context, ns string, docID string, minCommit string) ([]byte, string, error) {
 	msg := wire.DocumentGetMessage{
 		H:         wire.Header{MessageType: wire.MsgDocumentGet, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
 		Namespace: ns,
 		DocID:     docID,
+		MinCommit: minCommit,
 	}
 	reply, err := c.request(ctx, msg)
 	if err != nil {

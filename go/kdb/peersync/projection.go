@@ -143,6 +143,24 @@ func projectPage(env IngestEnv, filter sql.Expr, canRead func(codec.UUID) bool, 
 	if err != nil {
 		return wire.ProjectPageMessage{}, err
 	}
+	fromCommit, err := env.DAG.GetCommitOrThrow(from)
+	if err != nil {
+		return wire.ProjectPageMessage{}, err
+	}
+	// heldAtFrom reports whether the replica can hold id: it matched the filter at the position
+	// the replica is at. Only such a document needs a delete when it stops matching (Cimbiosys's
+	// move-out); sending one for every changed document outside the filter made a selective
+	// projection's deltas almost all deletes of documents it never held - 99% of entries at a 1%
+	// filter (docs/kdb-distributed-self-healing-research.md, Phase 15, M2). Read rights are left out
+	// on purpose: a document the replica held and may no longer read must still be deleted, and an
+	// extra delete of one it never held is harmless.
+	heldAtFrom := func(id codec.UUID) bool {
+		prev, err := env.Storage.GetDocument(env.NamespaceID, id, fromCommit.DocumentTreeHash)
+		if err != nil {
+			return true // cannot tell: delete, as before
+		}
+		return prev != nil && sql.EvalPredicate(filter, *prev, schema.None(), nil)
+	}
 	for _, op := range netEffect(commits) {
 		id := opDocID(op)
 		if id.String() <= after {
@@ -157,9 +175,9 @@ func projectPage(env IngestEnv, filter sql.Expr, canRead func(codec.UUID) bool, 
 		if isWrite && matches(document.Document{ID: id, JSON: w.Patch}) {
 			page.Writes = append(page.Writes, wire.SnapshotDoc{DocID: id.String(), Body: w.Patch})
 			size += len(w.Patch)
-		} else {
+		} else if heldAtFrom(id) {
 			// Deleted at the source, no longer matching, or no longer readable: gone from the
-			// projection. A delete of a document the replica never held is harmless.
+			// projection.
 			page.Deletes = append(page.Deletes, id.String())
 			size += 40
 		}

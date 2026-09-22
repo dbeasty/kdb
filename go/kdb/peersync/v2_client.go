@@ -60,6 +60,9 @@ type NamespaceSyncResult struct {
 	Namespace string
 	// Pulled / Pushed count commits new to the receiving side.
 	Pulled, Pushed int
+	// Received counts every commit the peer sent in a pull, including ones this node already
+	// held - Received minus Pulled is what negotiation over-sent (overshoot).
+	Received int
 	// Local / Remote record each ref's outcome on this node and on the peer, keyed
 	// "branch:<name>" or "tag:<name>".
 	Local, Remote map[string]wire.RefUpdateOutcome
@@ -260,6 +263,7 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow 
 		}
 		n, err := StoreCommits(env, page.Commits, page.Stubs)
 		res.Pulled += n
+		res.Received += len(page.Commits)
 		if err != nil {
 			if root, ok := unsharedRoot(env, page.Commits, shallow); ok {
 				return haves, env.noteUnrelated(root, err)

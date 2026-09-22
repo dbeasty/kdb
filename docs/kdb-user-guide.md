@@ -1436,6 +1436,25 @@ the whole history finishes the job.
 
 Deepen is safe to interrupt. Run it again and it finishes, without fetching what it already has.
 
+### Reading your own writes across replicas: sessions
+
+A client that writes through one replica and then reads through another can, by default, read an
+older value: the second replica may not have received the write yet. A **session** (Go client)
+prevents that, and also ensures a session never reads something older than what it has already
+read (Bayou's session guarantees):
+
+```go
+s := client.NewSession()
+s.Upsert(ctx, "orders", id, body)        // remembers the commit
+other := otherReplicaClient.NewSession()
+other.Resume(s.Token())                  // the user moved to another replica
+body, _, err := other.GetJSON(ctx, "orders", id)
+```
+
+A replica serves the read only once its main contains the session's newest commit. It waits up to 2
+seconds for replication, and otherwise answers `BUSY` with a retry-after rather than an older value.
+Only a Go `kdb-service` honours the token.
+
 ### Self-repair: scrub, and comparing with a peer
 
 A **scrub** re-reads every live document and checks its body against the content hash the

@@ -187,6 +187,9 @@ type KdbServerRuntime struct {
 	// ReadThrough, on a filtered projection, answers client reads of documents the projection
 	// does not hold from the source (see ReadDocument). nil: those reads find nothing.
 	ReadThrough *ReadThrough
+	// SessionWait bounds how long a read carrying a session token waits for this replica to catch
+	// up (see AwaitCommit); 0 means DefaultSessionWait.
+	SessionWait time.Duration
 	// ProjectionOf, when set, makes this namespace a filtered projection of that source namespace
 	// (see peersync.SyncProjection): its content comes only from the source, so every write but
 	// the projection's own is refused, clients' and peers' alike.
