@@ -72,13 +72,18 @@ def test_a_body_damaged_on_disk_is_repaired_from_a_peer():
         for i in (3, 4, 5):
             assert (safe_get(a, docs[i]) or {}).get("payload") == f"needle-{i}-{docs[i]}", a.logs()
 
-        # And the background scrub restores the damaged body from B.
-        wait_for("the scrub to repair the damaged document",
+        # The damaged body reads again: either it never stopped (it was also flushed to the
+        # document store before the restart, so the log damage was masked) or the background
+        # scrub restored it from B. When it was unreadable, the scrub must be what fixed it.
+        was_unreadable = safe_get(a, docs[2]) is None
+        wait_for("the damaged document to read again",
                  lambda: (safe_get(a, docs[2]) or {}).get("payload") == f"needle-2-{docs[2]}",
                  timeout=30)
-        assert any(
-            line.get("msg") == "scrub repaired damaged documents from peers" for line in a.log_lines()
-        ), a.logs()
+        if was_unreadable:
+            # The repair commit makes the document readable a moment before the scrub logs it.
+            wait_for("the scrub to report the repair", lambda: any(
+                line.get("msg") == "scrub repaired damaged documents from peers" for line in a.log_lines()
+            ), timeout=10)
     finally:
         for srv in (a, b):
             try:
