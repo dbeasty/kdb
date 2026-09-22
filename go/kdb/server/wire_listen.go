@@ -654,14 +654,19 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		// Checked, not blind: a schema that turns a field unique must be rejected outright when
 		// the data already there violates it, rather than applied and left permanently at odds
 		// with its own namespace.
-		previous := rt.Schema()
-		if err := rt.SetSchemaChecked(*result.AppliedSchema); err != nil {
-			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
-		}
-		// Recorded, or undone: a schema applied but not recorded would neither survive a
-		// restart nor replicate, and the next reconciliation would revert it.
-		if err := rt.Meta.RecordSchema(rt.Runtime.DefaultNamespace, *result.AppliedSchema); err != nil {
-			rt.SetSchema(previous)
+		if err := rt.Meta.Local(func() error {
+			previous := rt.Schema()
+			if err := rt.SetSchemaChecked(*result.AppliedSchema); err != nil {
+				return err
+			}
+			// Recorded, or undone: a schema applied but not recorded would neither survive a
+			// restart nor replicate, and the next reconciliation would revert it.
+			if err := rt.Meta.RecordSchema(rt.Runtime.DefaultNamespace, *result.AppliedSchema); err != nil {
+				rt.SetSchema(previous)
+				return err
+			}
+			return nil
+		}); err != nil {
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 		}
 	}

@@ -145,6 +145,19 @@ func (m *MetaStore) fresh(id codec.UUID, body string) bool {
 	return m.seen[id] != body
 }
 
+// Local runs a definition change made on this node - the change and its record together - as one
+// step with respect to reconciliation. Otherwise the reconciler can read the stored definitions,
+// the change and its record then land, and the reconciler applies what it read over them: a
+// DROP INDEX undone by the CREATE it had read a moment before.
+func (m *MetaStore) Local(fn func() error) error {
+	if m == nil {
+		return fn()
+	}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	return fn()
+}
+
 // RecordSchema records ns's schema.
 func (m *MetaStore) RecordSchema(ns string, sch schema.KdbSchema) error {
 	if m == nil {
@@ -188,6 +201,8 @@ func (m *MetaStore) AssignHome(ns, node, addr string) (Home, error) {
 	if m == nil {
 		return Home{}, fmt.Errorf("no metadata namespace: single-home ownership needs one")
 	}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
 	h := Home{Node: node, Addr: addr, Fence: 1}
 	if cur, _, found, err := m.meta.GetDocument(MetaNamespace, metaHomeID(ns)); err == nil && found {
 		var d metaDoc

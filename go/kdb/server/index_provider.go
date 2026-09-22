@@ -171,21 +171,23 @@ func indexKeyForCell(c sql.Cell) (index.Key, bool) {
 // CreateIndex registers a new index and rebuilds it from the current head, so the index is
 // queryable the moment the statement returns rather than only covering later writes.
 func (p *RegistryIndexProvider) CreateIndex(stmt sql.StmtCreateIndex, ctx sql.QueryContext) error {
-	if err := p.createIndexLocal(stmt, ctx); err != nil {
-		return err
-	}
 	if p.runtime == nil {
+		return p.createIndexLocal(stmt, ctx)
+	}
+	return p.runtime.Meta.Local(func() error {
+		if err := p.createIndexLocal(stmt, ctx); err != nil {
+			return err
+		}
+		// Recorded for replication. A definition that cannot be recorded is undone rather than
+		// left in place unrecorded: the next reconciliation would otherwise treat the stored
+		// definitions as the truth and quietly undo it anyway.
+		if err := p.runtime.Meta.RecordIndex(ctx.NamespaceID, stmt); err != nil {
+			p.registry.Remove(stmt.Name)
+			_ = p.runtime.saveIndexCatalog()
+			return err
+		}
 		return nil
-	}
-	// Recorded for replication. A definition that cannot be recorded is undone rather than
-	// left in place unrecorded: the next reconciliation would otherwise treat the stored
-	// definitions as the truth and quietly undo it anyway.
-	if err := p.runtime.Meta.RecordIndex(ctx.NamespaceID, stmt); err != nil {
-		p.registry.Remove(stmt.Name)
-		_ = p.runtime.saveIndexCatalog()
-		return err
-	}
-	return nil
+	})
 }
 
 // createIndexLocal is CreateIndex without recording - how a replicated definition is applied.
@@ -211,13 +213,15 @@ func (p *RegistryIndexProvider) createIndexLocal(stmt sql.StmtCreateIndex, ctx s
 
 // DropIndex removes an index by name.
 func (p *RegistryIndexProvider) DropIndex(stmt sql.StmtDropIndex, ctx sql.QueryContext) error {
-	if err := p.dropIndexLocal(stmt, ctx); err != nil {
-		return err
-	}
 	if p.runtime == nil {
-		return nil
+		return p.dropIndexLocal(stmt, ctx)
 	}
-	return p.runtime.Meta.RecordDropIndex(ctx.NamespaceID, stmt.Name)
+	return p.runtime.Meta.Local(func() error {
+		if err := p.dropIndexLocal(stmt, ctx); err != nil {
+			return err
+		}
+		return p.runtime.Meta.RecordDropIndex(ctx.NamespaceID, stmt.Name)
+	})
 }
 
 // dropIndexLocal is DropIndex without recording.
