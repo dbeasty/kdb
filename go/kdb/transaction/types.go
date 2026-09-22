@@ -1,6 +1,8 @@
 package transaction
 
 import (
+	"encoding/json"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
@@ -94,4 +96,49 @@ type OperationViolation struct {
 	OpIndex    int
 	Op         document.Op
 	Violations []kdberr.FieldViolation
+}
+
+// conflictOriginJSON is ConflictOrigin as the control plane and the conflict queue carry it: ids
+// as their text forms, zero values omitted.
+type conflictOriginJSON struct {
+	NodeID          string `json:"nodeId,omitempty"`
+	Commit          string `json:"commit,omitempty"`
+	TimestampMicros int64  `json:"timestampMicros,omitempty"`
+}
+
+// MarshalJSON writes the origin with its node id and commit as text.
+func (o ConflictOrigin) MarshalJSON() ([]byte, error) {
+	var j conflictOriginJSON
+	if o.NodeID != (codec.UUID{}) {
+		j.NodeID = o.NodeID.String()
+	}
+	if o.Commit != (codec.Hash{}) {
+		j.Commit = o.Commit.Hex()
+	}
+	j.TimestampMicros = o.TimestampMicros
+	return json.Marshal(j)
+}
+
+// UnmarshalJSON reads what MarshalJSON writes.
+func (o *ConflictOrigin) UnmarshalJSON(b []byte) error {
+	var j conflictOriginJSON
+	if err := json.Unmarshal(b, &j); err != nil {
+		return err
+	}
+	*o = ConflictOrigin{TimestampMicros: j.TimestampMicros}
+	if j.NodeID != "" {
+		id, err := codec.ParseUUID(j.NodeID)
+		if err != nil {
+			return err
+		}
+		o.NodeID = id
+	}
+	if j.Commit != "" {
+		h, err := codec.HashFromHex(j.Commit)
+		if err != nil {
+			return err
+		}
+		o.Commit = h
+	}
+	return nil
 }
