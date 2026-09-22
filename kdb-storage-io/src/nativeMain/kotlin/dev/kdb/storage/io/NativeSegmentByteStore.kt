@@ -137,11 +137,28 @@ internal class NativeSegmentByteStore(private val root: Path) : SegmentByteStore
 
     override suspend fun availableBytes(): Long = Long.MAX_VALUE
 
-    private fun snapPath(key: String): Path = Path(Path(root, "snap"), key.replace(':', '_'))
+    /**
+     * The single flat file a snapshot key is stored under. Must stay identical to Go's
+     * storio.SnapFileName and to JvmSegmentByteStore.snapFile: a snapshot written by one runtime
+     * has to be found by the other. The slash is flattened because a namespace id may contain one
+     * and this has to stay a single path component - nested, a namespace whose name is a prefix
+     * of another's wrote a file where the other needed a directory, and the second could never be
+     * written at all.
+     */
+    private fun snapPath(key: String): Path =
+        Path(Path(root, "snap"), key.replace(':', '_').replace("/", "%2F"))
+
+    /** Where a snapshot written before the slash was flattened still lives. */
+    private fun legacySnapPath(key: String): Path = Path(Path(root, "snap"), key.replace(':', '_'))
 
     override suspend fun readSnapshot(key: String): ByteArray? {
         val p = snapPath(key)
-        return if (fs.exists(p)) fs.source(p).buffered().use { it.readByteArray() } else null
+        if (fs.exists(p)) return fs.source(p).buffered().use { it.readByteArray() }
+        // A namespace bootstrapped from a peer's snapshot has nothing but its checkpoint to open
+        // from, so a pre-flattening file still has to be found. writeSnapshot retires it.
+        val legacy = legacySnapPath(key)
+        if (legacy != p && fs.exists(legacy)) return fs.source(legacy).buffered().use { it.readByteArray() }
+        return null
     }
 
     override suspend fun writeSnapshot(
@@ -151,10 +168,14 @@ internal class NativeSegmentByteStore(private val root: Path) : SegmentByteStore
         val p = snapPath(key)
         p.parent?.let { if (!fs.exists(it)) fs.createDirectories(it) }
         fs.sink(p).buffered().use { it.write(data) }
+        val legacy = legacySnapPath(key)
+        if (legacy != p && fs.exists(legacy)) fs.delete(legacy, mustExist = false)
     }
 
     override suspend fun deleteSnapshot(key: String) {
         val p = snapPath(key)
         if (fs.exists(p)) fs.delete(p, mustExist = false)
+        val legacy = legacySnapPath(key)
+        if (legacy != p && fs.exists(legacy)) fs.delete(legacy, mustExist = false)
     }
 }

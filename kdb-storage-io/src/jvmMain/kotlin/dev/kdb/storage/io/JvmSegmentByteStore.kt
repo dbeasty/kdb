@@ -111,23 +111,46 @@ internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
             Long.MAX_VALUE
         }
 
-    private fun snapFile(key: String): File {
-        val safeKey = key.replace(':', '_').replace('/', File.separatorChar)
-        return File(File(root, "snap"), safeKey)
-    }
+    /**
+     * The single flat file a snapshot key is stored under. Must stay identical to Go's
+     * storio.SnapFileName and to NativeSegmentByteStore.snapPath: a snapshot written by one
+     * runtime has to be found by the other.
+     *
+     * The colon goes because the raw key ("kdb:snap:<id>", "kdb:checkpoint:<id>") is not a
+     * portable path name. The slash goes because a namespace id may contain one and this has to
+     * stay a single path component: nesting it made "repro/account" write the FILE
+     * snap/kdb_checkpoint_repro/account while "repro/account/ro" needed that same "account" to be
+     * a directory, so whichever came second could never be written. "%2F" cannot collide, since a
+     * namespace id segment allows only [A-Za-z0-9._-].
+     */
+    private fun snapFile(key: String): File =
+        File(File(root, "snap"), key.replace(':', '_').replace("/", "%2F"))
+
+    /** Where a snapshot written before the slash was flattened still lives. */
+    private fun legacySnapFile(key: String): File =
+        File(File(root, "snap"), key.replace(':', '_').replace('/', File.separatorChar))
 
     override suspend fun readSnapshot(key: String): ByteArray? {
         val f = snapFile(key)
-        return if (f.exists()) f.readBytes() else null
+        if (f.exists()) return f.readBytes()
+        // For a namespace bootstrapped from a peer's snapshot the checkpoint is the only record
+        // of its state and open refuses to proceed without it, so a pre-flattening file has to
+        // still be found or upgrading would strand the namespace. writeSnapshot retires it.
+        val legacy = legacySnapFile(key)
+        return if (legacy != f && legacy.exists()) legacy.readBytes() else null
     }
 
     override suspend fun writeSnapshot(key: String, data: ByteArray) {
         val f = snapFile(key)
         f.parentFile?.mkdirs()
         f.writeBytes(data)
+        val legacy = legacySnapFile(key)
+        if (legacy != f) legacy.delete()
     }
 
     override suspend fun deleteSnapshot(key: String) {
         snapFile(key).delete()
+        val legacy = legacySnapFile(key)
+        if (legacy != snapFile(key)) legacy.delete()
     }
 }

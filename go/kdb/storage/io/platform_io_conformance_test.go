@@ -369,6 +369,46 @@ func TestShimSnapshotRoundTrip(t *testing.T) {
 	})
 }
 
+// A namespace whose name is a prefix of another's must be able to hold a snapshot, and so must
+// the one nested under it. The file-backed store used to keep a namespace id's slash as a real
+// path separator, so "repro/account" wrote the FILE snap/kdb_checkpoint_repro/account while
+// "repro/account/ro" needed that same "account" to be a directory: whichever came second failed
+// with "not a directory" and could never be written. Nesting is how namespace patterns are meant
+// to be used, and for a namespace bootstrapped from a peer's snapshot the checkpoint is the only
+// record of its state, so this left such a namespace permanently unbootstrappable.
+func TestShimSnapshotKeysThatArePrefixesOfEachOther(t *testing.T) {
+	forEachShim(t, func(t *testing.T, shim storage.PlatformIOShim) {
+		outer := "kdb:checkpoint:repro/account"
+		nested := "kdb:checkpoint:repro/account/ro"
+
+		if err := shim.WriteSnapshot(outer, []byte("outer")); err != nil {
+			t.Fatalf("writing the outer namespace's snapshot: %v", err)
+		}
+		if err := shim.WriteSnapshot(nested, []byte("nested")); err != nil {
+			t.Fatalf("writing the nested namespace's snapshot: %v", err)
+		}
+
+		// Neither may have overwritten or hidden the other.
+		got, err := shim.ReadSnapshot(outer)
+		if err != nil || string(got) != "outer" {
+			t.Fatalf("outer read back as %q (err %v), want %q", got, err, "outer")
+		}
+		got, err = shim.ReadSnapshot(nested)
+		if err != nil || string(got) != "nested" {
+			t.Fatalf("nested read back as %q (err %v), want %q", got, err, "nested")
+		}
+
+		// Deleting one leaves the other, which a shared path would not.
+		if err := shim.DeleteSnapshot(outer); err != nil {
+			t.Fatalf("delete outer: %v", err)
+		}
+		got, err = shim.ReadSnapshot(nested)
+		if err != nil || string(got) != "nested" {
+			t.Fatalf("after deleting the outer namespace, nested read back as %q (err %v)", got, err)
+		}
+	})
+}
+
 // Returned buffers must be copies: a caller that mutates what it read must not corrupt the
 // stored bytes, which for the in-memory shim would be the live map value.
 func TestShimReturnsCopiesNotAliases(t *testing.T) {
