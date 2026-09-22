@@ -87,6 +87,13 @@ type ResolutionRule struct {
 	Timeout string `json:"timeout,omitempty"`
 	// Name is RuleProcedure's stored procedure.
 	Name string `json:"name,omitempty"`
+	// Procedure, for RuleAuthority, is a stored procedure that settles what the rule queues -
+	// the authority itself, rather than a webhook to one. It runs after the merge, on the
+	// notifying node only, and its decision is an ordinary commit. No revision is pinned for it:
+	// unlike RuleProcedure it decides nothing inside a merge commit, so two nodes running
+	// different copies of it cannot diverge - at most the one that notifies settles a conflict
+	// the other has not yet seen settled.
+	Procedure string `json:"procedure,omitempty"`
 	// SourceHash is the source that procedure had when the chain was set (server.MetaStore.
 	// SetResolution pins it). It is part of the chain, so it is part of the chain's hash, so a
 	// node whose copy of the procedure differs - an older revision, or none yet - does not look
@@ -156,6 +163,9 @@ func (c ResolutionChain) Validate() error {
 		}
 		if r.Kind != RuleProcedure && (r.Name != "" || r.SourceHash != "") {
 			return fmt.Errorf("rule %d: only %s takes name and sourceHash", i, RuleProcedure)
+		}
+		if r.Kind != RuleAuthority && r.Procedure != "" {
+			return fmt.Errorf("rule %d: only %s takes procedure", i, RuleAuthority)
 		}
 		if r.Kind == RuleAuthority {
 			switch r.Pending {
