@@ -95,12 +95,20 @@ public class PeerSyncConflictException(
  *    [conflictPolicy] STRICT (and, conservatively, LAST_WRITE/CUSTOM until they get a real
  *    document-level auto-resolution implementation - not part of this component's test list)
  *    reports it rather than picking a winner; main does not move.
+ *
+ * The local side is always [dag]'s current head, read *inside* the namespace lock - deliberately
+ * not a caller-supplied parameter. A head read before the lock is stale by the time the lock is
+ * held whenever another push landed in between: two concurrent pushes from genesis both read
+ * genesis, the first fast-forwards main to its commit, and the second - still comparing against
+ * genesis - also sees a plain fast-forward and moves main onto its own commit, silently dropping
+ * the first one off main. (That was WebSocketPeerSyncIntegrationTest's CI-only
+ * wsPeerSyncBidirectionalGenuinelyConcurrent flake: the lock serialized the decisions, but not
+ * the head each decision was made against.)
  */
 public suspend fun resolveDivergence(
     dag: CommitDag,
     storage: StorageAdapter,
     namespaceId: String,
-    localHead: KdbHash,
     incomingHead: KdbHash,
     conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
 ): CommitPushOutcome =
@@ -114,7 +122,7 @@ public suspend fun resolveDivergence(
     // shape of bug, found independently while implementing this component's concurrent test
     // (§7 test 9).
     divergenceLockFor(namespaceId).withLock {
-        resolveDivergenceLocked(dag, storage, namespaceId, localHead, incomingHead, conflictPolicy)
+        resolveDivergenceLocked(dag, storage, namespaceId, dag.head(), incomingHead, conflictPolicy)
     }
 
 private val divergenceLocksGuard = Mutex()

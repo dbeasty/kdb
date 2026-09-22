@@ -178,7 +178,7 @@ internal class DefaultPeerSession(
         // Same resolveDivergence call as the push-receiving side (§5's symmetry contract: one
         // shared decision function, not two that can drift) - this is the fix for pullMissing's
         // half of the original blind dag.setHead("main", fetched.last().hash) bug.
-        val outcome = resolveDivergence(dag, storage, namespaceId, localHead, incomingHead, conflictPolicy)
+        val outcome = resolveDivergence(dag, storage, namespaceId, incomingHead, conflictPolicy)
         val conflictReport = (outcome as? CommitPushOutcome.Conflict)?.report
         val finalHead = dag.head()
         val plan = computeSyncPlan(dag, finalHead, remoteHead)

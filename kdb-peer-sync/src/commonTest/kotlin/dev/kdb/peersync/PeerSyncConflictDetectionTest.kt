@@ -12,8 +12,15 @@ import dev.kdb.document.KdbTransaction
 import dev.kdb.storage.mem.InMemoryStorageAdapter
 import dev.kdb.stream.InMemoryWireTransport
 import dev.kdb.transaction.ConflictPolicy
+import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
+import dev.kdb.wire.WireHeader
+import dev.kdb.wire.WireMessage
+import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.defaultWireCodec
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -74,6 +81,14 @@ class PeerSyncConflictDetectionTest {
         commit: KdbCommit,
     ) {
         to.dag.putCommit(commit, requireParents = true)
+        stageTree(to, ns, commit)
+    }
+
+    private suspend fun stageTree(
+        to: Side,
+        ns: String,
+        commit: KdbCommit,
+    ) {
         val parentTree = to.dag.getCommitOrThrow(commit.parentHashes.first()).documentTreeHash
         for (op in commit.operations) {
             when (op) {
@@ -98,7 +113,7 @@ class PeerSyncConflictDetectionTest {
             // Same as handleCommitPush's put loop: history always stored first.
             receiveCommit(a, ns, commitB)
 
-            val outcome = resolveDivergence(a.dag, a.storage, ns, commitA.hash, commitB.hash, ConflictPolicy.STRICT)
+            val outcome = resolveDivergence(a.dag, a.storage, ns, commitB.hash, ConflictPolicy.STRICT)
             val conflict = outcome as? CommitPushOutcome.Conflict
             assertTrue(conflict != null, "expected Conflict, got $outcome")
             assertEquals(1, conflict.report.conflicts.size)
@@ -130,7 +145,7 @@ class PeerSyncConflictDetectionTest {
             // auto-merge, same as APPEND_ONLY - this is the STRICT-policy case explicitly, to
             // prove the auto-merge path isn't gated on policy at all, only on whether a real
             // per-document conflict exists.
-            val outcome = resolveDivergence(a.dag, a.storage, ns, commitA.hash, commitB.hash, ConflictPolicy.STRICT)
+            val outcome = resolveDivergence(a.dag, a.storage, ns, commitB.hash, ConflictPolicy.STRICT)
             val merged = outcome as? CommitPushOutcome.Merged
             assertTrue(merged != null, "expected Merged, got $outcome")
 
@@ -153,7 +168,7 @@ class PeerSyncConflictDetectionTest {
             val commitB = writeDoc(b, ns, genesis, docIdB, """{"v":"b"}""")
             receiveCommit(a, ns, commitB)
 
-            val outcome = resolveDivergence(a.dag, a.storage, ns, commitA.hash, commitB.hash, ConflictPolicy.APPEND_ONLY)
+            val outcome = resolveDivergence(a.dag, a.storage, ns, commitB.hash, ConflictPolicy.APPEND_ONLY)
             val merged = outcome as? CommitPushOutcome.Merged
             assertTrue(merged != null, "expected Merged, got $outcome")
 
@@ -179,7 +194,7 @@ class PeerSyncConflictDetectionTest {
 
             // Sync A -> coordinator: coordinator was at genesis, A is a pure descendant.
             receiveCommit(coordinator, ns, commitA)
-            val outcome1 = resolveDivergence(coordinator.dag, coordinator.storage, ns, genesis, commitA.hash, ConflictPolicy.APPEND_ONLY)
+            val outcome1 = resolveDivergence(coordinator.dag, coordinator.storage, ns, commitA.hash, ConflictPolicy.APPEND_ONLY)
             assertTrue(outcome1 is CommitPushOutcome.FastForwarded)
             assertEquals(commitA.hash, coordinator.dag.head())
 
@@ -195,7 +210,6 @@ class PeerSyncConflictDetectionTest {
                     coordinator.dag,
                     coordinator.storage,
                     ns,
-                    localHeadBeforeSecondSync,
                     commitB.hash,
                     ConflictPolicy.APPEND_ONLY,
                 )
@@ -219,7 +233,7 @@ class PeerSyncConflictDetectionTest {
             val bDag = inMemoryCommitDag(nsB)
             var threw = false
             try {
-                resolveDivergence(a.dag, a.storage, nsA, a.dag.head(), bDag.head(), ConflictPolicy.STRICT)
+                resolveDivergence(a.dag, a.storage, nsA, bDag.head(), ConflictPolicy.STRICT)
             } catch (e: AncestryLookupException) {
                 threw = true
             }
@@ -244,7 +258,6 @@ class PeerSyncConflictDetectionTest {
                     pushLocal.dag,
                     pushLocal.storage,
                     ns,
-                    pushCommitLocal.hash,
                     pushCommitIncoming.hash,
                     ConflictPolicy.STRICT,
                 )
@@ -273,5 +286,66 @@ class PeerSyncConflictDetectionTest {
             assertTrue(pushOutcome is CommitPushOutcome.Conflict, "push: expected Conflict, got $pushOutcome")
             assertTrue(pullResult.conflict != null, "pull: expected a conflict report, got $pullResult")
             assertEquals(pullCommitLocal.hash, pullLocalDag.head(), "pull must not have moved main to the host's commit")
+        }
+
+    /**
+     * Regression for WebSocketPeerSyncIntegrationTest.wsPeerSyncBidirectionalGenuinelyConcurrent's
+     * CI-only flake. Two connections push disjoint commits forked from genesis at the same time.
+     * The host used to read `dag.head()` *before* taking resolveDivergence's namespace lock, so
+     * both handlers could read genesis; the first then fast-forwarded main to its commit and the
+     * second, still comparing against genesis, fast-forwarded main onto its own - dropping the
+     * first off main. [head] yielding here forces that interleaving deterministically, exactly
+     * where a busy two-CPU CI runner happened to preempt.
+     */
+    @Test
+    fun concurrentPushes_fromSameBase_bothReachableFromMain() =
+        runTest {
+            val ns = "app/concurrent-push"
+            val host = Side(inMemoryCommitDag(ns), InMemoryStorageAdapter())
+            val genesis = host.dag.head()
+            val docIdA = KdbUuid.random()
+            val docIdB = KdbUuid.random()
+            val commitA = writeDoc(Side(inMemoryCommitDag(ns), InMemoryStorageAdapter()), ns, genesis, docIdA, """{"v":"a"}""")
+            val commitB = writeDoc(Side(inMemoryCommitDag(ns), InMemoryStorageAdapter()), ns, genesis, docIdB, """{"v":"b"}""")
+
+            val yieldingDag =
+                object : CommitDag by host.dag {
+                    override suspend fun head(): KdbHash = host.dag.head().also { yield() }
+                }
+            val cfg =
+                PeerHostConfig(
+                    ns,
+                    "host",
+                    ns,
+                    // Stage each received commit's tree the way a real host's materializer does,
+                    // so an auto-merge has the pushed side's tree to build on.
+                    materializeCommit = { commit -> stageTree(host, ns, commit) },
+                    conflictPolicy = ConflictPolicy.STRICT,
+                )
+            // One handler per connection, sharing the host's dag - as PeerSyncHost does.
+            val handlerA = PeerSyncFrameHandler(wire, yieldingDag, host.storage, cfg)
+            val handlerB = PeerSyncFrameHandler(wire, yieldingDag, host.storage, cfg)
+            fun push(
+                cid: Int,
+                commit: KdbCommit,
+            ) = wire.encode(
+                WireMessage.CommitPush(
+                    WireHeader(WireMessageType.COMMIT_PUSH, KDB_WIRE_PROTOCOL_VERSION, cid, 0),
+                    ns,
+                    listOf(commit),
+                ),
+            )
+
+            listOf(
+                async { handlerA.handleFrame(push(1, commitA)) },
+                async { handlerB.handleFrame(push(2, commitB)) },
+            ).awaitAll()
+
+            val head = host.dag.head()
+            assertTrue(host.dag.isAncestor(commitA.hash, head), "commitA dropped off main")
+            assertTrue(host.dag.isAncestor(commitB.hash, head), "commitB dropped off main")
+            val tree = host.dag.getDocumentTreeOrThrow(host.dag.getCommitOrThrow(head).documentTreeHash)
+            assertTrue(tree.contains(docIdA))
+            assertTrue(tree.contains(docIdB))
         }
 }

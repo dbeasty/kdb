@@ -340,9 +340,11 @@ class WebSocketPeerSyncIntegrationTest {
                     launch { pushCommitsSinceRemoteHead(sessionA, clientA.dag, sessionA.remoteHead) }
                     launch { pushCommitsSinceRemoteHead(sessionB, clientB.dag, sessionB.remoteHead) }
                 }
+                // No settle delay needed: pushCommits returns only on the host's ack, which the
+                // host sends after resolveDivergence has moved main - both pushes are fully
+                // resolved here.
                 connA.disconnect()
                 connB.disconnect()
-                delay(150)
 
                 // Both commits touched disjoint documents, so per §5/test 3 the server
                 // auto-merges rather than reporting a conflict - both documents must end up
