@@ -553,17 +553,10 @@ func Main() {
 		// The cross-write notification bridge (KdbServerRuntime.CommitListener's own doc
 		// comment): without this, the stream hub would accept connections and handshakes but
 		// never actually publish anything, since nothing would ever call hub.Publish.
+		// Publish only wakes the subscribers; each is caught up from the DAG, so peer
+		// fast-forwards and merges reach them as correctly as local commits do.
 		srv.CommitListener = func(ns string, commit document.Commit) {
-			parentHash := codec.Hash{}
-			if len(commit.ParentHashes) > 0 {
-				parentHash = commit.ParentHashes[0]
-			}
-			hub.Publish(stream.PublishedCommit{
-				CommitHash:      commit.Hash,
-				ParentHash:      parentHash,
-				Operations:      commit.Operations,
-				TimestampMicros: commit.Timestamp.EpochMicros(),
-			})
+			hub.Publish(stream.PublishedCommit{CommitHash: commit.Hash})
 		}
 		streamStatus = fmt.Sprintf("enabled (%s)", streamListener.Addr())
 	}

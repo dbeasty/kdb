@@ -109,6 +109,10 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 			Token:      cfg.Token,
 		},
 	}
+	if cfg.Filter != "" {
+		f := cfg.Filter
+		hs.Request.Filter = &f
+	}
 	go s.readLoop(conn)
 	frame, err := s.wire.Encode(hs)
 	if err != nil {

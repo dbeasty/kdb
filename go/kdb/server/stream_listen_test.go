@@ -1,6 +1,7 @@
 package server
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -215,6 +216,8 @@ func TestListenStreamRejectsSqlClientHandshake(t *testing.T) {
 type stuckConn struct {
 	release chan struct{}
 	sent    atomic.Int64
+	mu      sync.Mutex
+	lastHex codec.Hash
 }
 
 func newStuckConn() *stuckConn { return &stuckConn{release: make(chan struct{})} }
@@ -222,7 +225,21 @@ func newStuckConn() *stuckConn { return &stuckConn{release: make(chan struct{})}
 func (c *stuckConn) Send(frame []byte) error {
 	<-c.release
 	c.sent.Add(1)
+	if msg, err := wire.NewCodec(wire.EncodingJSON).Decode(frame); err == nil {
+		if d, ok := msg.(wire.DeltaCommitMessage); ok {
+			c.mu.Lock()
+			c.lastHex = d.Payload.CommitHash
+			c.mu.Unlock()
+		}
+	}
 	return nil
+}
+
+// last is the commit of the latest delta sent to c.
+func (c *stuckConn) last() codec.Hash {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastHex
 }
 func (c *stuckConn) Incoming() <-chan []byte { return nil }
 func (c *stuckConn) Close() error            { return nil }
@@ -232,34 +249,45 @@ func (c *stuckConn) TryPoll() []byte         { return nil }
 // Publish used to call conn.Send inline for every subscriber, and socketConnection.Send does a
 // blocking socket write - so one subscriber that had stopped reading stalled the whole fan-out
 // and, behind it, the goroutine that had just committed (Publish is called from
-// KdbServerRuntime.CommitListener on the commit path). Every subscriber now has its own queue
-// and its own sender goroutine, so Publish returns regardless.
+// KdbServerRuntime.CommitListener on the commit path). Publish now only wakes each subscriber's
+// own sender goroutine, so it returns regardless - and once the subscriber drains, it is caught
+// up to the head rather than having lost what it could not take.
 func TestPublishDoesNotBlockOnAStuckSubscriber(t *testing.T) {
 	const ns = "app/data"
 	rt := newTestRuntime(t)
 	hub := NewStreamHub(wire.NewCodec(wire.EncodingJSON), ns, rt)
+	rt.CommitListener = func(string, document.Commit) { hub.Publish(stream.PublishedCommit{}) }
 
 	stuck := newStuckConn()
-	defer close(stuck.release)
 	handshakeStreamSubscriber(t, hub, stuck, ns)
 
-	// One more frame than the queue can hold: the first fills it (the sender goroutine is parked
-	// inside the blocked Send), the rest are dropped. None of it may block Publish.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for i := 0; i < subscriberQueueDepth+8; i++ {
-			hub.Publish(stream.PublishedCommit{TimestampMicros: int64(i)})
+		for i := 0; i < 300; i++ {
+			if _, err := rt.Upsert(ns, mustRandomUUID(t), `{"i":1}`, auth.Principal{}); err != nil {
+				t.Error(err)
+				return
+			}
 		}
 	}()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("Publish blocked on a subscriber that stopped reading")
+		t.Fatal("a write blocked on a subscriber that stopped reading")
 	}
-
-	if dropped := hub.DroppedFrames(); dropped == 0 {
-		t.Fatal("expected the overflowing frames to be counted as dropped, got 0")
+	close(stuck.release)
+	head, _ := rt.dag.Head()
+	deadline := time.Now().Add(5 * time.Second)
+	for stuck.last() != head {
+		if time.Now().After(deadline) {
+			t.Fatalf("the drained subscriber never caught up to the head (sent %d frames)", stuck.sent.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// 300 commits reached it in far fewer frames: everything it missed while stuck came as one.
+	if n := stuck.sent.Load(); n >= 300 {
+		t.Fatalf("expected the backlog coalesced, got %d frames for 300 commits", n)
 	}
 }
 
@@ -269,6 +297,7 @@ func TestPublishReachesAHealthySubscriberBesideAStuckOne(t *testing.T) {
 	const ns = "app/data"
 	rt := newTestRuntime(t)
 	hub := NewStreamHub(wire.NewCodec(wire.EncodingJSON), ns, rt)
+	rt.CommitListener = func(string, document.Commit) { hub.Publish(stream.PublishedCommit{}) }
 
 	stuck := newStuckConn()
 	defer close(stuck.release)
@@ -278,8 +307,9 @@ func TestPublishReachesAHealthySubscriberBesideAStuckOne(t *testing.T) {
 	close(healthy.release) // never blocks
 	handshakeStreamSubscriber(t, hub, healthy, ns)
 
-	hub.Publish(stream.PublishedCommit{TimestampMicros: 1})
-
+	if _, err := rt.Upsert(ns, mustRandomUUID(t), `{"i":1}`, auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for healthy.sent.Load() == 0 {
 		if time.Now().After(deadline) {
@@ -293,7 +323,7 @@ func TestPublishReachesAHealthySubscriberBesideAStuckOne(t *testing.T) {
 // handshake path, so the test exercises the same registration Publish fans out to.
 func handshakeStreamSubscriber(t *testing.T, hub *StreamHub, conn stream.ConnectionHandle, ns string) {
 	t.Helper()
-	frame := hub.handleHandshake(conn, wire.HandshakeMessage{
+	frame, start := hub.handleHandshake(conn, wire.HandshakeMessage{
 		H: wire.Header{MessageType: wire.MsgHandshake, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: 1},
 		Request: wire.HandshakePayload{
 			NodeID:     "sub",
@@ -301,9 +331,10 @@ func handshakeStreamSubscriber(t *testing.T, hub *StreamHub, conn stream.Connect
 			ClientMode: wire.ClientStreamReadOnly,
 		},
 	})
-	if frame == nil {
-		t.Fatal("handshake produced no ack frame")
+	if frame == nil || start == nil {
+		t.Fatal("handshake was not accepted")
 	}
+	start()
 }
 
 // streamRBACRuntime is a runtime under RBAC with one user allowed to read and write app/data

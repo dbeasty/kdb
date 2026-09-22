@@ -34,6 +34,10 @@ type SubscriberConfig struct {
 	User     *string
 	Password *string
 	Token    *string
+	// Filter subscribes to only the documents matching this KDB-SQL condition; "" is every
+	// document. A document that stops matching (or that the subscriber may no longer read)
+	// arrives as a delete. A resume must use the same filter as the position it resumes from.
+	Filter string
 }
 
 // PublishedCommit is a commit broadcast to subscribers.

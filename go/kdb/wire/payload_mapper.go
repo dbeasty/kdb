@@ -59,6 +59,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				User:                      m.Request.User,
 				Password:                  m.Request.Password,
 				Token:                     m.Request.Token,
+				Filter:                    m.Request.Filter,
 			},
 		}, nil
 	case HandshakeAckMessage:
@@ -346,6 +347,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 				User:               h.User,
 				Password:           h.Password,
 				Token:              h.Token,
+				Filter:             h.Filter,
 			},
 		}, nil
 	case "handshakeAck":

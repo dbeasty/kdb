@@ -416,6 +416,10 @@ type HandshakePayload struct {
 	User     *string
 	Password *string
 	Token    *string
+	// Filter, on a stream handshake, subscribes to only the documents matching this KDB-SQL
+	// condition. Nil is every document. Omitted from the frame when nil, so older peers see the
+	// handshake they always did.
+	Filter *string
 }
 
 type HandshakeAckPayload struct {

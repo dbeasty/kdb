@@ -667,7 +667,7 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
   - **Deviation:** parts are *not* held back from readers until their group is complete, as the plan had proposed. That would make one namespace's availability depend on another's replication, which multi-leader replication exists to avoid. The flag tells a reader what they may be looking at instead.
 - **6.5:** the user guide's "Peer sync and replication" section is rewritten around `--peer`, partitioning by namespace, conflicts, snapshots, retention and `_kdb/meta`. The flags table covers the new flags.
 
-### Phase 7 — landed (7.1–7.4; 7.5 deliberately not)
+### Phase 7 — landed (7.1–7.5)
 
 **Filter.** `sql.ParseFilter` makes a WHERE expression usable on its own, and it's evaluated with `sql.EvalPredicate` against each document.
 
@@ -690,8 +690,7 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 
 **7.4, offline write-back (landed later; see "Phase 7.4 — landed" below).**
 
-**Not built:**
-- **7.5, stream Mode 1/2 rebuilt on projections.** The existing stream hub keeps working (and gained authentication in Phase 0). Folding it into projections is a refactor with no new capability, so it's deferred until someone needs resumable streams.
+**7.5 (landed later; see "Phase 7.5 — landed" below).**
 
 ### Phase 8 — gate evaluated, not built
 
@@ -806,3 +805,41 @@ An adversarial review of phases 0–10 found eight defects. Each has a regressio
 - `server/projection_test.go` `TestProjectionFollowsKeyRemoval`; `server/meta_test.go` `TestIndexRecreatedAfterDropReachesPeer`.
 - `replication/config_test.go` `TestParseWriteBackPeer`; `wire` `TestRoundTripProjectWrite`.
 - e2e `test_writeback_peer_sends_local_writes_to_source`.
+
+### Phase 7.5 — landed (stream subscriptions as unstored projections)
+
+**What was wrong with the stream hub.** It was more broken than "has no resume":
+- **Resume did nothing.** A subscriber's `LocalHeads` was recorded and then ignored. A reconnecting subscriber got only commits made after it reconnected, the first one failed its parent check (`DesyncError`), and it could never recover.
+- **Slow subscribers were stuck for good.** One that fell behind lost frames (`DroppedFrames`) and was then in the same state.
+- **Replication broke it.** The service published each commit against its first parent, so every peer merge whose first parent was the peer's side desynced every subscriber.
+- **No read checks.** Every subscriber got every commit's full operations; only `StreamSubscribeAction` was checked.
+
+**Now.** A subscription is followed like a projection that is not stored:
+- **Publish only wakes.** `Publish` pokes each subscriber's own goroutine (one pending poke is enough). It carries no content, and the service passes the commit only for the listener signature.
+- **Catch-up from the DAG.** The goroutine brings the subscriber from its position to the head.
+  - **Per-commit** when the head's first-parent line reaches the position within 64 commits and every commit still has its ops: each commit goes as it was made.
+  - **Otherwise one frame** named for the head. It carries the difference between the two trees (`embed.DiffCommits`, final bodies and deletes), with `ParentHash` set to the subscriber's position. This covers a merge that put the position on a side branch, a long absence, and archived ops.
+  - Either way the client's existing parent check holds frame to frame. The frame format is unchanged, so existing Go and Kotlin clients work as they are.
+- **Visibility.**
+  - **Filter:** an optional `Filter` on the handshake, JSON `filter` omitted when nil, same grammar as projections.
+  - **Read checks:** each written document is checked with `DocumentReadAction` for the handshake's principal. A write the subscriber may not see, or that doesn't match, becomes a delete. Ops naming no document pass only on an unfiltered subscription.
+  - **Anonymous hubs** (`--stream-allow-anonymous`) skip the per-document check, keeping that flag's documented meaning.
+- **Resume.**
+  - A `LocalHeads` position must be on this node's main, as the head or an ancestor. Anything else is refused at the handshake with a message saying to subscribe fresh.
+  - With no position, the subscriber starts at the head.
+  - The subscriber's goroutine starts only after the ack is sent, so no delta can overtake it.
+
+**Not changed.** The in-memory `stream.Coordinator` (tests and embedding) still publishes what it is given. Index hints were never sent by the service and still aren't.
+
+**Limits.**
+- A tree-diff frame is as large as the difference and isn't paged, so a subscriber far enough behind for that to matter should resubscribe fresh.
+- A resume under a different filter than the position was built with can't be detected.
+
+**Tests:** `server/stream_resume_test.go`, with a recording subscriber that applies every frame and checks the parent chain:
+- resume over TCP sends exactly the missed commits
+- an unknown position is refused
+- a 74-commit absence arrives as one frame, deletes included
+- six rounds of peer merges end with the subscriber holding the merged tree; a mutation shows the tree-diff path is taken
+- a filter plus a hidden document: only readable matching documents, and leaving the filter arrives as a delete
+
+The fan-out tests were rewritten for coalescing: 300 commits behind a stuck subscriber arrive, once it drains, in far fewer frames and end at the head.

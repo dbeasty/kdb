@@ -120,6 +120,7 @@ type handshakeDto struct {
 	User                      *string           `json:"user,omitempty"`
 	Password                  *string           `json:"password,omitempty"`
 	Token                     *string           `json:"token,omitempty"`
+	Filter                    *string           `json:"filter,omitempty"`
 }
 
 type handshakeAckDto struct {

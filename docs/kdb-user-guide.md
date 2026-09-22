@@ -1226,6 +1226,27 @@ A few things to keep in mind:
 - **Leaving the filter.** A write that moves a document out of the filter is applied at the
   source, and the next pull removes it from the projection.
 
+### Stream subscriptions (`--stream-addr`)
+
+A stream subscriber (Go `stream.NewSubscriber`, Mode 1 read-only or Mode 2 write-back) is a
+filtered projection that isn't stored. It gets the namespace's changes as `DeltaCommit` frames:
+- **Only what it may read.** A document the subscriber may not read never reaches it. A document
+  it held and may no longer read arrives as a delete.
+- **Optional filter.** `SubscriberConfig.Filter` takes the same SQL condition as a filtered peer.
+  A document that stops matching arrives as a delete.
+- **Resume.** Reconnect with `ResumeFrom` set to the last position (`Connection.Position()`) and
+  the subscriber is sent exactly what it missed:
+  - Up to 64 commits behind, each commit is sent as it was made.
+  - Further behind, or across a peer merge, it gets one frame holding the difference between its
+    state and the head.
+
+  A position the node doesn't have (never had, or truncated away under `history=none`) is refused
+  at the handshake. Subscribe without one and reload.
+- **No dropped frames.** A slow subscriber is caught up when it drains. Commits made from peer
+  sync reach subscribers as reliably as local ones.
+- **Filter and resume go together.** A resumed subscription must use the same filter as the
+  position it resumes from. The node can't check this.
+
 ### Conflicts
 
 Under `--peer-conflict-policy strict` (the default), a same-document divergence is recorded, not
