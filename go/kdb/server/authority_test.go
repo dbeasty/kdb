@@ -467,3 +467,78 @@ func TestV1SyncOfANamespaceWithAChainNeverMerges(t *testing.T) {
 		t.Fatal("neither node may move main over v1")
 	}
 }
+
+func withAuthorityTimeout(t *testing.T, a, b metaNode, pending, timeout string) {
+	t.Helper()
+	chain := peersync.ResolutionChain{Rules: []peersync.ResolutionRule{
+		{Kind: peersync.RuleAuthority, Pending: pending, Timeout: timeout},
+	}}
+	if err := a.store.SetResolution("app/data", chain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncPatterns(t, a, b, MetaNamespace); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "B to apply the chain", func() bool { return b.data.ResolutionChainOf().Hash() == chain.Hash() })
+}
+
+// A held conflict nobody settles in time falls back to last write. Each node expires its own copy
+// independently, and because the merge is deterministic they arrive at the same commit without
+// talking to each other.
+func TestHeldConflictSettlesByLastWriteAfterItsTimeout(t *testing.T) {
+	a, b := newMetaNode(t), newMetaNode(t)
+	withAuthorityTimeout(t, a, b, peersync.PendingHold, "1h")
+	doc := conflictingWrites(t, a, b)
+	mustSync(t, a, b)
+	if len(authorityEntries(a.data.Conflicts)) != 1 || len(authorityEntries(b.data.Conflicts)) != 1 {
+		t.Fatalf("both nodes should hold the conflict: A %+v B %+v", a.data.Conflicts.List(), b.data.Conflicts.List())
+	}
+	now := time.Now()
+	for _, n := range []metaNode{a, b} {
+		if settled, err := n.data.ExpireAuthorityConflicts(now); err != nil || settled != 0 {
+			t.Fatalf("nothing expires before its timeout: %d %v", settled, err)
+		}
+	}
+	for name, n := range map[string]metaNode{"A": a, "B": b} {
+		if settled, err := n.data.ExpireAuthorityConflicts(now.Add(2 * time.Hour)); err != nil || settled != 1 {
+			t.Fatalf("%s: expected one settled, got %d %v", name, settled, err)
+		}
+	}
+	if mustHeadOf(t, a.data) != mustHeadOf(t, b.data) {
+		t.Fatal("independent expiries must build the same merge")
+	}
+	for name, n := range map[string]metaNode{"A": a, "B": b} {
+		if got := docBody(t, n.data, doc); got != `{"v":"from B"}` {
+			t.Fatalf("%s holds %s, want the later write", name, got)
+		}
+		if es := authorityEntries(n.data.Conflicts); len(es) != 0 {
+			t.Fatalf("%s still holds %+v", name, es)
+		}
+	}
+}
+
+// A provisional decision nobody overrules in time simply stands.
+func TestProvisionalDecisionStandsAfterItsTimeout(t *testing.T) {
+	a, b := newMetaNode(t), newMetaNode(t)
+	withAuthorityTimeout(t, a, b, peersync.PendingProvisional, "1h")
+	doc := conflictingWrites(t, a, b)
+	mustSync(t, a, b)
+	head := mustHeadOf(t, a.data)
+	if settled, err := a.data.ExpireAuthorityConflicts(time.Now().Add(2 * time.Hour)); err != nil || settled != 1 {
+		t.Fatalf("expected the provisional entry to expire: %d %v", settled, err)
+	}
+	if len(authorityEntries(a.data.Conflicts)) != 0 || mustHeadOf(t, a.data) != head || docBody(t, a.data, doc) != `{"v":"from B"}` {
+		t.Fatal("expiry should only drop the entry, leaving the provisional value and head as they were")
+	}
+}
+
+// Without a timeout, conflicts wait for the authority indefinitely.
+func TestAuthorityWithoutTimeoutNeverExpires(t *testing.T) {
+	a, b := newMetaNode(t), newMetaNode(t)
+	withAuthority(t, a, b, peersync.PendingHold, "")
+	conflictingWrites(t, a, b)
+	mustSync(t, a, b)
+	if settled, err := a.data.ExpireAuthorityConflicts(time.Now().Add(1000 * time.Hour)); err != nil || settled != 0 {
+		t.Fatalf("nothing should expire without a timeout: %d %v", settled, err)
+	}
+}

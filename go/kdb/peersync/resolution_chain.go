@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -67,6 +68,22 @@ type ResolutionRule struct {
 	Node string `json:"node,omitempty"`
 	// Pending is RuleAuthority's mode: PendingHold (default) or PendingProvisional.
 	Pending string `json:"pending,omitempty"`
+	// Timeout, for RuleAuthority, is how long a conflict waits for the authority (a Go duration,
+	// "24h") before its fallback becomes final: a held conflict is settled by last write, a
+	// provisional decision simply stands. Empty waits forever.
+	Timeout string `json:"timeout,omitempty"`
+}
+
+// TimeoutDuration is Timeout parsed; zero when unset or invalid (Validate refuses invalid).
+func (r *ResolutionRule) TimeoutDuration() time.Duration {
+	if r == nil || r.Timeout == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(r.Timeout)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
 }
 
 // ResolutionChain is a namespace's ordered resolution rules.
@@ -116,8 +133,13 @@ func (c ResolutionChain) Validate() error {
 					return fmt.Errorf("rule %d: %q is not a node id: %v", i, r.Node, err)
 				}
 			}
-		} else if r.Node != "" || r.Pending != "" {
-			return fmt.Errorf("rule %d: only %s takes node and pending", i, RuleAuthority)
+			if r.Timeout != "" {
+				if d, err := time.ParseDuration(r.Timeout); err != nil || d <= 0 {
+					return fmt.Errorf("rule %d: timeout %q is not a positive duration", i, r.Timeout)
+				}
+			}
+		} else if r.Node != "" || r.Pending != "" || r.Timeout != "" {
+			return fmt.Errorf("rule %d: only %s takes node, pending and timeout", i, RuleAuthority)
 		}
 	}
 	return nil

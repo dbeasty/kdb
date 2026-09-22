@@ -52,17 +52,28 @@ func (s *Server) handlePeerSync(w http.ResponseWriter, r *http.Request, _ auth.P
 // GET /v1/ns/{ns}/conflicts - the namespace's queued conflicts. ?authority=true keeps only those
 // handed to a resolver authority, and ?undelivered=true only those not yet acknowledged - together,
 // what a polling authority has still to see (it acknowledges each with POST .../{id}/ack).
+// ?doc=<id> keeps those involving one document: a client resolving its own conflicts reads every
+// candidate version of the document it holds, then settles with POST .../{id}/resolve.
 func (s *Server) handleConflicts(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
-	onlyAuthority := r.URL.Query().Get("authority") == "true"
-	onlyUndelivered := r.URL.Query().Get("undelivered") == "true"
+	q := r.URL.Query()
+	onlyAuthority, onlyUndelivered, doc := q.Get("authority") == "true", q.Get("undelivered") == "true", q.Get("doc")
 	out := []peersync.ConflictEntry{}
 	for _, e := range rt.Conflicts.List() {
-		if (onlyAuthority && !e.Authority) || (onlyUndelivered && e.Delivered) {
+		if (onlyAuthority && !e.Authority) || (onlyUndelivered && e.Delivered) || (doc != "" && !involves(e, doc)) {
 			continue
 		}
 		out = append(out, e)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "conflicts": out})
+}
+
+func involves(e peersync.ConflictEntry, doc string) bool {
+	for _, it := range e.Items {
+		if it.DocumentID == doc {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveError answers a failed resolution: 404 for an unknown entry, 403 for a principal

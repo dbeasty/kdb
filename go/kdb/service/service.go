@@ -447,6 +447,9 @@ func Main() {
 
 	// A resolver authority learns of the conflicts it owns by webhook, or by polling
 	// GET /v1/ns/{ns}/conflicts?authority=true&undelivered=true and acknowledging each.
+	stopExpiry := make(chan struct{})
+	defer close(stopExpiry)
+	server.StartAuthorityExpiry(nsSet, 30*time.Second, stopExpiry)
 	if conflictWebhook != "" {
 		hook := server.StartConflictWebhook(nsSet, srv.NodeID.String(), &server.ConflictWebhook{
 			URL: conflictWebhook, Secret: conflictWebhookSecret, Interval: conflictWebhookInterval,

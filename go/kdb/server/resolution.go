@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // Conflict resolution chains (docs/kdb-distributed-self-healing-research.md, Phase 10.5): a
@@ -218,4 +220,77 @@ func (s *KdbServerRuntime) AckConflict(id string, principal auth.Principal) erro
 		return peersync.ErrConflictNotFound
 	}
 	return s.Conflicts.MarkDelivered(e)
+}
+
+// ExpireAuthorityConflicts makes the fallback final for every conflict that has waited for the
+// namespace's resolver authority longer than its rule's timeout: a held divergence of main is
+// merged by last write - every node computes the same merge, so nodes expiring independently
+// converge - and a provisional decision simply stands, its entry dropped. It acts as the runtime,
+// not as any principal: the timeout is the namespace's own policy. It returns how many it settled.
+func (s *KdbServerRuntime) ExpireAuthorityConflicts(now time.Time) (int, error) {
+	rule := s.ResolutionChainOf().Authority()
+	timeout := rule.TimeoutDuration()
+	if timeout == 0 {
+		return 0, nil
+	}
+	settled := 0
+	for _, e := range s.Conflicts.List() {
+		if !e.Authority || now.Sub(e.FirstSeen) < timeout {
+			continue
+		}
+		switch e.Kind {
+		case peersync.ConflictProvisional:
+			if err := s.Conflicts.Remove(e.ID); err != nil {
+				return settled, err
+			}
+		case peersync.ConflictDivergence:
+			choices := map[codec.UUID]peersync.Choice{}
+			for _, d := range e.Details {
+				id, err := codec.ParseUUID(d.DocumentID)
+				if err != nil {
+					return settled, err
+				}
+				take := "remote"
+				if laterOrigin(d.LocalOrigin, d.IncomingOrigin) {
+					take = "local"
+				}
+				choices[id] = peersync.Choice{Take: take}
+			}
+			if _, err := peersync.ResolveConflict(s.PeerIngestEnv(), e.ID, choices); err != nil {
+				return settled, fmt.Errorf("conflict %s: settling by last write after %s: %w", e.ID, timeout, err)
+			}
+		default:
+			continue
+		}
+		settled++
+	}
+	return settled, nil
+}
+
+// laterOrigin mirrors peersync's last-write order: the later commit timestamp, then the higher
+// commit hash - so every node picks the same side.
+func laterOrigin(a, b transaction.ConflictOrigin) bool {
+	if a.TimestampMicros != b.TimestampMicros {
+		return a.TimestampMicros > b.TimestampMicros
+	}
+	return a.Commit.Hex() > b.Commit.Hex()
+}
+
+// StartAuthorityExpiry runs ExpireAuthorityConflicts over set's namespaces every interval until
+// stop is closed.
+func StartAuthorityExpiry(set *NamespaceSet, interval time.Duration, stop <-chan struct{}) {
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case now := <-t.C:
+				for _, rt := range set.Runtimes() {
+					_, _ = rt.ExpireAuthorityConflicts(now)
+				}
+			}
+		}
+	}()
 }

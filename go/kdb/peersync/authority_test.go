@@ -388,6 +388,10 @@ func TestAuthorityRuleValidation(t *testing.T) {
 		"bad node":             {[]ResolutionRule{{Kind: RuleAuthority, Node: "aws"}}, false},
 		"not last":             {[]ResolutionRule{{Kind: RuleAuthority}, {Kind: RuleLastWrite}}, false},
 		"pending elsewhere":    {[]ResolutionRule{{Kind: RuleQueue, Pending: PendingHold}}, false},
+		"timeout":              {[]ResolutionRule{{Kind: RuleAuthority, Timeout: "24h"}}, true},
+		"bad timeout":          {[]ResolutionRule{{Kind: RuleAuthority, Timeout: "soon"}}, false},
+		"negative timeout":     {[]ResolutionRule{{Kind: RuleAuthority, Timeout: "-1h"}}, false},
+		"timeout elsewhere":    {[]ResolutionRule{{Kind: RuleQueue, Timeout: "1h"}}, false},
 	} {
 		c := ResolutionChain{Rules: tc.rules}
 		if err := c.Validate(); (err == nil) != tc.ok {
