@@ -11,7 +11,11 @@ import (
 	kdbjson "github.com/limidus/kdb/go/kdb/json"
 )
 
-// corpusCase is one file of testdata/conflict_corpus. Kotlin's kdb-script runs the same files;
+// corpusDir is the shared parity corpus, under the tree's golden fixtures beside the Layer 16
+// search ones - both runtimes read it, so it belongs to neither.
+const corpusDir = "../../testdata/golden/conflict_corpus"
+
+// corpusCase is one file of the corpus. Kotlin's kdb-script runs the same files;
 // see that directory's README.
 type corpusCase struct {
 	Name    string `json:"name"`
@@ -44,7 +48,7 @@ func body(raw json.RawMessage) *string {
 }
 
 func TestConflictCorpus(t *testing.T) {
-	files, err := filepath.Glob("testdata/conflict_corpus/*.json")
+	files, err := filepath.Glob(corpusDir + "/*.json")
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no corpus files: %v", err)
 	}
