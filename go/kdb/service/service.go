@@ -485,6 +485,16 @@ func Main() {
 				if p, ok := projectionPeers.Load(id); ok {
 					cfg := p.(replication.PeerConfig)
 					sec.ProjectionFilter, sec.ProjectionWriteBack = cfg.Filter, cfg.WriteBack
+					if cfg.ReadThrough {
+						projectionNS := id
+						sec.ReadThrough = &server.ReadThrough{Open: func() (*peersync.RepairSession, string, error) {
+							r := replicatorRef.Load()
+							if r == nil {
+								return nil, "", fmt.Errorf("read-through: replication has not started")
+							}
+							return r.OpenDocSession(projectionNS)
+						}}
+					}
 				}
 			}
 			sec.AuthEngine = srv.AuthEngine

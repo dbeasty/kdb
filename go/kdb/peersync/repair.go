@@ -222,11 +222,16 @@ type RepairSession struct {
 	conn *v2Conn
 	// Peer is the peer's node id, from its hello.
 	Peer string
+	caps []string
 }
 
 // OpenRepairSession connects to cfg.PeerURI and says hello for cfg.Namespaces. The peer must
 // grant each namespace it will be asked about, and speak the repair capability.
 func OpenRepairSession(w wire.Codec, transport stream.Transport, cfg V2ClientConfig) (*RepairSession, error) {
+	return openSession(w, transport, cfg, wire.SyncCapRepair)
+}
+
+func openSession(w wire.Codec, transport stream.Transport, cfg V2ClientConfig, needCap string) (*RepairSession, error) {
 	conn, err := dial(transport, cfg.PeerURI, cfg.TLS, cfg.ConnectionContext)
 	if err != nil {
 		return nil, err
@@ -249,11 +254,11 @@ func OpenRepairSession(w wire.Codec, transport stream.Transport, cfg V2ClientCon
 		}
 		return nil, NewError(fmt.Sprintf("expected SYNC_HELLO_ACK, got %T", reply), nil)
 	}
-	if !containsString(ack.Capabilities, wire.SyncCapRepair) {
+	if !containsString(ack.Capabilities, needCap) {
 		conn.Close()
-		return nil, NewError("peer does not support repair (TREE_NODES / OBJECT_FETCH)", nil)
+		return nil, NewError("peer does not support "+needCap, nil)
 	}
-	return &RepairSession{conn: c, Peer: ack.NodeID}, nil
+	return &RepairSession{conn: c, Peer: ack.NodeID, caps: ack.Capabilities}, nil
 }
 
 // Close ends the session.

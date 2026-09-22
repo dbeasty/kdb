@@ -348,7 +348,7 @@ func (s *Server) handleDocument(w http.ResponseWriter, r *http.Request, _ auth.P
 	}
 	at := r.URL.Query().Get("at")
 	if at == "" {
-		body, commitHex, found, err := rt.GetDocument(ns, docID)
+		body, commitHex, found, err := rt.ReadDocument(ns, docID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "read_failed", err.Error())
 			return

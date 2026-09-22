@@ -948,3 +948,16 @@ The fix, in `checkpointMatchesLog`: damage in place is told apart from a replace
 - repair of damaged *historical* versions (only the live tree is scrubbed);
 - Kotlin opening from checkpoints, which is what would let it read a Go-repaired log.
 
+### Phase 14 — landed in part (projection read-through)
+
+**Landed:**
+- **Proofs:** `DocumentTree.Proof` and `VerifyTreeProof`, Merkle inclusion and absence proofs of about ceil(log16 n) × 16 × 32 bytes.
+- **Wire:** `DOC_FETCH`/`DOC_FETCH_RESULT` (0x38/0x39), requiring read rights only.
+- **Verifying client:** `RepairSession.FetchDocs`, whose `verifyDocFetch` refuses the whole answer on any inconsistency.
+- **`server.ReadThrough`:** a bounded LRU hoard. An entry is valid only at the source position it was read at.
+- **Client reads:** `KdbServerRuntime.ReadDocument` for client point reads, and a `readthrough=true` peer option.
+
+**Deliberately not built, and why:**
+- **Filter widening by tree diff.** A projection's namespace is keyed by its filter (`ProjectionNamespace`), so a wider filter is a *new* projection and must start from a snapshot anyway. What a diff could save is the case where the source cannot relate the projection's position to its head. There, a Merkle diff of a *filtered subset* against the whole source tree would name every source document outside the filter as a difference, which is not cheaper than the reset.
+- **Deepen (fetching history below a shallow root).** Valuable, because it would also let a snapshot-rooted node sync with independent peers again (Phase 11), provided the snapshot's source still holds the history. But the deepened commits have to be persisted without the delta-log replay treating them as adopted, and the shallow-root markers (`meta.json`) have to be retired in step with the checkpoint. That is its own piece of durability work.
+
