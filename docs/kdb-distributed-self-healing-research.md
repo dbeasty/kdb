@@ -1,6 +1,6 @@
 # Distributed KDB: self-healing, merging and partial replication — research and gap analysis
 
-Status: research and proposal. Phases 10.5, 12, 13, 14 (read-through, deepen) and 15 have since landed (see §5 and the implementation plan's progress log); Phase 11 is blocked on engine support (see its section); 14–15 are not built.
+Status: research and proposal. Phases 10.5, 12, 13, 14 (read-through, deepen) and 15 have since landed (see §5 and the implementation plan's progress log); Phase 11 (the graft) has landed too.
 Basis: `main` at d30efd4, which includes the distributed work (PR #78, Phases 0–10 plus 7.4 and 7.5). Every `file:line` below refers to `go/kdb/` at that commit.
 Companion docs: [kdb-distributed-plan.md](kdb-distributed-plan.md) (design, D1–D12) and [kdb-distributed-implementation-plan.md](kdb-distributed-implementation-plan.md) (phases and progress log).
 
@@ -194,7 +194,9 @@ Merging an unrelated database (Phase 11) turns every document that differs into 
    - A principal without `ConflictResolve` is refused.
    - Under `provisional`, the fallback is replaced by the authority's decision.
 
-### Phase 11 — Merge unrelated histories (import another database)
+### Phase 11 — Merge unrelated histories (import another database) — landed as the graft
+
+**Landed:** the graft described below. `storage.ForeignTreeStore` is the non-live-tree support it needed. Candidates come from both sides' ops plus the grafted roots' trees, because neither node holds the other's head tree. See the implementation plan's progress log.
 
 **Revised after investigation (2026-09-21).** The original sketch assumed that two independently created databases have no common ancestor. They do have one: genesis is a fixed commit per namespace (`dag.NewInMemoryCommitDag`), so two databases holding the same namespace already merge through the ordinary path, with the chain deciding conflicts.
 

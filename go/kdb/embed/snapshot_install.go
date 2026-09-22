@@ -100,9 +100,14 @@ func (r *EmbeddedKdbRuntime) PersistSnapshot(root document.Commit) error {
 }
 
 // RecordShallowRoots rewrites the namespace marker's shallow roots to roots: the history horizons
-// that remain after history below a snapshot was fetched back (peersync.Deepen). Empty means the
-// namespace's history is whole again - a full replay from genesis rebuilds it - so open stops
-// requiring the snapshot's checkpoint. The marker keeps recording that bodies may be external.
+// that remain after history below a snapshot or a graft was fetched back (peersync.Deepen). Empty
+// means the namespace's history is whole again - a full replay from genesis rebuilds it - so open
+// stops requiring the snapshot's checkpoint. The marker keeps recording that bodies may be
+// external.
+//
+// A root the marker already lists keeps its kind. A new one - a horizon deeper in some root's
+// history - is a snapshot root whenever the namespace has any, which at worst makes open require a
+// checkpoint it has anyway; in a namespace with only grafts it is a graft.
 func (r *EmbeddedKdbRuntime) RecordShallowRoots(roots []codec.Hash) error {
 	s := r.snapshot
 	if s == nil {
@@ -110,10 +115,41 @@ func (r *EmbeddedKdbRuntime) RecordShallowRoots(roots []codec.Hash) error {
 	}
 	meta, _ := readNamespaceMeta(s.dataRoot, s.namespaceID)
 	meta.NamespaceID = s.namespaceID
-	meta.ShallowRoots = nil
+	grafts := map[string]bool{}
+	for _, h := range meta.GraftRoots {
+		grafts[h] = true
+	}
+	newAreGrafts := len(meta.ShallowRoots) == 0 && len(meta.GraftRoots) > 0
+	meta.ShallowRoots, meta.GraftRoots = nil, nil
 	for _, h := range roots {
-		meta.ShallowRoots = append(meta.ShallowRoots, h.Hex())
+		if hex := h.Hex(); grafts[hex] || (newAreGrafts && !grafts[hex]) {
+			meta.GraftRoots = append(meta.GraftRoots, hex)
+		} else {
+			meta.ShallowRoots = append(meta.ShallowRoots, hex)
+		}
 	}
 	meta.BodiesExternal = true
+	return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
+}
+
+// RecordGraft adds root to the namespace marker's grafted roots (peersync.Graft), before the root
+// is logged: a replay that meets it must admit it without its parents.
+func (r *EmbeddedKdbRuntime) RecordGraft(root codec.Hash) error {
+	s := r.snapshot
+	if s == nil {
+		return nil
+	}
+	meta, _ := readNamespaceMeta(s.dataRoot, s.namespaceID)
+	meta.NamespaceID = s.namespaceID
+	meta.BodiesExternal = true
+	for _, existing := range meta.GraftRoots {
+		if existing == root.Hex() {
+			return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
+		}
+	}
+	meta.GraftRoots = append(meta.GraftRoots, root.Hex())
+	if eng, ok := s.store.(*engine.ServerEngine); ok {
+		eng.SetBodiesExternal(true)
+	}
 	return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
 }

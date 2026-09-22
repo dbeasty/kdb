@@ -212,8 +212,10 @@ func (s *Server) handleResolution(w http.ResponseWriter, _ *http.Request, _ auth
 }
 
 // PUT /v1/ns/{ns}/resolution - {"rules": [{"kind": "source-priority", "nodes": ["<node id>", ...]},
-// {"kind": "field-merge"}, {"kind": "queue"}]} replaces the namespace's chain; {"rules": []}
-// removes it. Recorded as a replicated definition.
+// {"kind": "field-merge"}, {"kind": "queue"}], "allowUnrelated": true} replaces the namespace's
+// chain; {"rules": []} removes it. allowUnrelated lets the namespace merge a peer's history that
+// shares no commit with its own, grafting the peer's shallow root (peersync.Graft). Recorded as a
+// replicated definition.
 func (s *Server) handleSetResolution(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	var body peersync.ResolutionChain
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {

@@ -179,11 +179,11 @@ func (h *Host) openNamespace(
 		// Some bodies exist only in the blob store; cold reads must look there.
 		eng.SetBodiesExternal(true)
 	}
-	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn, meta.ShallowRoots)
+	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn, meta.ShallowRoots, meta.GraftRoots)
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, hex := range meta.ShallowRoots {
+	for _, hex := range append(append([]string(nil), meta.ShallowRoots...), meta.GraftRoots...) {
 		if h, err := codec.HashFromHex(hex); err == nil {
 			d.MarkShallow(h)
 		}

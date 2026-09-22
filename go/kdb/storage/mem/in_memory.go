@@ -236,3 +236,32 @@ func (a *InMemoryStorageAdapter) TreeAt(treeHash codec.Hash) (document.DocumentT
 	tree, ok := a.trees[treeHash]
 	return tree, ok, nil
 }
+
+// StoreForeignTree implements storage.ForeignTreeStore.
+func (a *InMemoryStorageAdapter) StoreForeignTree(namespaceID string, tree document.DocumentTree, bodies map[codec.UUID]string) error {
+	docs := make([]document.Document, 0, tree.Size())
+	var bad error
+	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
+		body, ok := bodies[id]
+		doc := document.Document{ID: id, JSON: body}
+		got, err := doc.ContentHash()
+		if !ok || err != nil || got != h {
+			bad = fmt.Errorf("foreign tree %s: document %s's body is missing or does not match its content hash", tree.TreeHash.Hex(), id)
+			return false
+		}
+		docs = append(docs, doc)
+		return true
+	})
+	if bad != nil {
+		return bad
+	}
+	for _, d := range docs {
+		if err := a.blobStore.RememberDocument(d); err != nil {
+			return err
+		}
+	}
+	a.treesMu.Lock()
+	a.trees[tree.TreeHash] = tree
+	a.treesMu.Unlock()
+	return nil
+}

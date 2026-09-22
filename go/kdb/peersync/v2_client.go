@@ -70,6 +70,8 @@ type NamespaceSyncResult struct {
 	Conflicts []RefConflict
 	// Snapshot is the commit this sync bootstrapped the namespace from, when it did.
 	Snapshot string
+	// Grafted lists the peer's shallow roots this sync grafted in (see Graft).
+	Grafted []string
 	// LocalMain / RemoteMain are both sides' main heads when this sync finished, as far as it
 	// knows: the peer's is its advertised head, or what it reported after the last push to it.
 	LocalMain, RemoteMain string
@@ -145,6 +147,7 @@ func SyncV2(w wire.Codec, transport stream.Transport, cfg V2ClientConfig) (V2Res
 	}
 	out := V2Result{RemoteNodeID: ack.NodeID, Protocol: wire.SyncProtocolVersion}
 	c.remoteNode = ack.NodeID
+	c.caps = ack.Capabilities
 	for _, refs := range ack.Refs {
 		out.Namespaces = append(out.Namespaces, c.syncNamespace(cfg, refs))
 	}
@@ -187,20 +190,7 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRefs, res *NamespaceSyncResult) error {
 	if needsSnapshot(env, remote, cfg.PreferSnapshot) {
 		at := remote.Branches[mainBranch]
-		installed, err := InstallSnapshot(env, func(after string) (wire.SnapshotPageMessage, error) {
-			reply, err := c.request(wire.SnapshotFetchMessage{
-				H: header(wire.MsgSnapshotFetch, c.next()), Namespace: remote.Namespace,
-				AtHex: at, After: after, MaxBytes: cfg.PageBytes,
-			})
-			if err != nil {
-				return wire.SnapshotPageMessage{}, err
-			}
-			page, ok := reply.(wire.SnapshotPageMessage)
-			if !ok {
-				return wire.SnapshotPageMessage{}, NewError(fmt.Sprintf("expected SNAPSHOT_PAGE, got %T", reply), nil)
-			}
-			return page, nil
-		})
+		installed, err := InstallSnapshot(env, c.snapshotFetcher(cfg, remote.Namespace, at))
 		if err != nil {
 			return err
 		}
@@ -246,6 +236,81 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 	return nil
 }
 
+// graftRootsFor makes sure the peer can store what a push of local would send. That history may
+// reach down to one of this node's shallow roots; the peer can store the root only if it holds
+// the root already or its parents. When it holds neither, and both nodes merge unrelated
+// histories, the root's state goes first by GRAFT_PUSH. Otherwise the ref is not pushed, and the
+// returned reason says why: the peer takes it when it pulls, if it ever can.
+func (c *v2Conn) graftRootsFor(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRefs, local codec.Hash, known []codec.Hash) (string, error) {
+	roots := env.DAG.ShallowRoots()
+	if len(roots) == 0 {
+		return "", nil
+	}
+	have := env.DAG.AncestorSetOf(known)
+	for _, root := range roots {
+		if _, ok := have[root]; ok {
+			continue
+		}
+		if root != local && !env.DAG.IsAncestor(root, local) {
+			continue
+		}
+		rc, err := env.DAG.GetCommitOrThrow(root)
+		if err != nil {
+			return "", err
+		}
+		// Does the peer hold the root, or what is below it? Any commit back means yes.
+		reply, err := c.request(wire.FetchRequestMessage{
+			H: header(wire.MsgFetchRequest, c.next()), Namespace: remote.Namespace,
+			Wants: append([]codec.Hash{root}, rc.ParentHashes...), MaxBytes: 1,
+		})
+		if err != nil {
+			return "", err
+		}
+		if page, ok := reply.(wire.PackPageMessage); ok && len(page.Commits) > 0 {
+			continue
+		}
+		if !env.Resolution.Chain.AllowsUnrelated() || !containsString(c.caps, wire.SyncCapGraft) {
+			return fmt.Sprintf("not pushed: the peer holds none of the history below this node's root %s, and cannot graft it", root.Hex()), nil
+		}
+		for after := ""; ; {
+			page, err := snapshotPage(env, root, after, cfg.PageBytes)
+			if err != nil {
+				return "", err
+			}
+			reply, err := c.request(wire.GraftPushMessage{H: header(wire.MsgGraftPush, c.next()), Page: page})
+			if err != nil {
+				return "", err
+			}
+			if _, ok := reply.(wire.GraftPushResultMessage); !ok {
+				return "", NewError(fmt.Sprintf("expected GRAFT_PUSH_RESULT, got %T", reply), nil)
+			}
+			if page.Done {
+				break
+			}
+			after = page.Next
+		}
+	}
+	return "", nil
+}
+
+// snapshotFetcher pages the peer's state at the commit at, for InstallSnapshot and Graft.
+func (c *v2Conn) snapshotFetcher(cfg V2ClientConfig, ns, at string) func(after string) (wire.SnapshotPageMessage, error) {
+	return func(after string) (wire.SnapshotPageMessage, error) {
+		reply, err := c.request(wire.SnapshotFetchMessage{
+			H: header(wire.MsgSnapshotFetch, c.next()), Namespace: ns,
+			AtHex: at, After: after, MaxBytes: cfg.PageBytes,
+		})
+		if err != nil {
+			return wire.SnapshotPageMessage{}, err
+		}
+		page, ok := reply.(wire.SnapshotPageMessage)
+		if !ok {
+			return wire.SnapshotPageMessage{}, NewError(fmt.Sprintf("expected SNAPSHOT_PAGE, got %T", reply), nil)
+		}
+		return page, nil
+	}
+}
+
 // fetchRef pages in everything want needs that this node lacks, returning the haves grown by
 // what arrived.
 func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow []string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
@@ -264,10 +329,26 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow 
 		n, err := StoreCommits(env, page.Commits, page.Stubs)
 		res.Pulled += n
 		res.Received += len(page.Commits)
-		if err != nil {
-			if root, ok := unsharedRoot(env, page.Commits, shallow); ok {
+		// A page can reach down to more than one of the peer's roots; each graft lets the retry
+		// store further, so there are at most as many rounds as commits.
+		for round := 0; err != nil && round < len(page.Commits); round++ {
+			root, ok := unsharedRoot(env, page.Commits, shallow)
+			if !ok {
+				return haves, err
+			}
+			if !env.Resolution.Chain.AllowsUnrelated() {
 				return haves, env.noteUnrelated(root, err)
 			}
+			// The peer's history is rooted where this node's is not, and the namespace merges
+			// unrelated histories: graft the root, then the page stores.
+			if _, gerr := Graft(env, root, c.snapshotFetcher(cfg, ns, root.Hex())); gerr != nil {
+				return haves, env.noteUnrelated(root, fmt.Errorf("%w; grafting it failed: %v", err, gerr))
+			}
+			res.Grafted = append(res.Grafted, root.Hex())
+			n, err = StoreCommits(env, page.Commits, page.Stubs)
+			res.Pulled += n
+		}
+		if err != nil {
 			return haves, err
 		}
 		tips := pageTips(page.Commits)
@@ -306,6 +387,12 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 		}
 		if res.ResolutionMismatch && ref.kind == wire.RefBranch && ref.name == mainBranch && !fastForwards(env, remoteHex, local) {
 			res.RefErrors[ref.key()] = "not pushed: the peer's conflict resolution chain differs from this node's, so it must not merge"
+			continue
+		}
+		if skip, err := c.graftRootsFor(cfg, env, remote, local, known); err != nil {
+			return err
+		} else if skip != "" {
+			res.RefErrors[ref.key()] = skip
 			continue
 		}
 		haves := append([]codec.Hash(nil), known...)
@@ -438,6 +525,8 @@ type v2Conn struct {
 	mu          sync.Mutex
 	correlation int
 	timeout     time.Duration
+	// caps are the peer's capabilities, from its SYNC_HELLO_ACK.
+	caps []string
 }
 
 func (c *v2Conn) next() int {

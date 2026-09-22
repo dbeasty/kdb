@@ -32,6 +32,7 @@ func restoreNamespace(
 	disabled bool,
 	coord *TxnCoordinator,
 	shallowRoots []string,
+	graftRoots []string,
 ) (replayedInFull bool, err error) {
 	eng, _ := store.(*engine.ServerEngine)
 	if eng != nil {
@@ -63,7 +64,9 @@ func restoreNamespace(
 				Floor:       lowestSegmentSequence(r),
 			}
 		}
-		return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, nil)
+		// Grafted roots are side history: the log alone rebuilds main, but meets them without
+		// their parents and must admit them as they were admitted.
+		return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, hashSet(graftRoots))
 	}
 
 	if disabled {
@@ -139,12 +142,7 @@ func restoreNamespace(
 	}
 
 	// Only the tail: everything up to cp.ThroughSequence is already here.
-	shallow := map[codec.Hash]bool{}
-	for _, hex := range shallowRoots {
-		if h, err := codec.HashFromHex(hex); err == nil {
-			shallow[h] = true
-		}
-	}
+	shallow := hashSet(append(append([]string(nil), shallowRoots...), graftRoots...))
 	if err := replayDeltaNamespaceFrom(d, store, r, cp.ThroughSequence, coord, shallow); err != nil {
 		return false, err
 	}
@@ -514,4 +512,15 @@ func (e *SnapshotCheckpointMissingError) Error() string {
 	return fmt.Sprintf("kdb: namespace %s was bootstrapped from a snapshot (root %v) and its checkpoint, the only "+
 		"record of that state, is missing or unusable; refusing to open it by replaying a log that begins after it",
 		e.NamespaceID, e.Roots)
+}
+
+// hashSet parses hex commit hashes into a set, skipping any that do not parse.
+func hashSet(hexes []string) map[codec.Hash]bool {
+	out := map[codec.Hash]bool{}
+	for _, hex := range hexes {
+		if h, err := codec.HashFromHex(hex); err == nil {
+			out[h] = true
+		}
+	}
+	return out
 }

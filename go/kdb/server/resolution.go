@@ -22,7 +22,7 @@ import (
 // SetResolutionChain records ns's chain on this runtime. Called by the metadata store as the
 // definition arrives or changes; nil clears it.
 func (s *KdbServerRuntime) SetResolutionChain(c *peersync.ResolutionChain) {
-	if c != nil && len(c.Rules) == 0 {
+	if c != nil && len(c.Rules) == 0 && !c.AllowUnrelated {
 		c = nil
 	}
 	s.resolution.Store(c)

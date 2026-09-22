@@ -70,6 +70,14 @@ type TreeResolver interface {
 	TreeAt(treeHash codec.Hash) (document.DocumentTree, bool, error)
 }
 
+// ForeignTreeStore is implemented by adapters that can hold a document tree they did not build - a
+// peer's state at a commit this namespace grafts in (peersync.Graft) - resolvable by hash, with
+// its documents, without it becoming the live tree. Every body is checked against the content
+// hash the tree names, and the tree is durable when the call returns.
+type ForeignTreeStore interface {
+	StoreForeignTree(namespaceID string, tree document.DocumentTree, bodies map[codec.UUID]string) error
+}
+
 // TreeWalker is implemented by adapters that can stream a tree's (doc id, content hash) entries
 // without loading document bodies - what a snapshot needs to page through a namespace in id
 // order without reading every body for every page. treeHash is a document tree hash, as for

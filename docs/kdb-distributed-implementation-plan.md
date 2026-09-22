@@ -1024,3 +1024,30 @@ The fix is Cimbiosys-style move-out: the source sends a delete only for a docume
 
 **Also:** `NamespaceSyncResult.Received` counts every commit a pull received, so overshoot is observable.
 
+### Phase 11 — landed (graft: merging unrelated histories)
+
+Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).
+
+- **Engine:** `storage.ForeignTreeStore.StoreForeignTree(ns, tree, bodies)`. Every body is checked against the tree's content hashes. Bodies and one full tree object go to the blob store, which is flushed and synced, then the tree is cached. The live tree is untouched. Refused (`ErrForeignTreeNeedsObjects`) unless the history strategy is `objects`. Also implemented for the memory adapter and the multiplex.
+- **Graft (`peersync.Graft`):** fetches a root's state page by page (`SNAPSHOT_FETCH AtHex=root`), checks the commit hash and rebuilds the tree to its declared hash, then commits in durability order:
+  1. store the tree;
+  2. write `meta.json` `graftRoots`;
+  3. `PutShallowCommit`;
+  4. log the root.
+
+  The pull grafts when a page fails on one of the peer's shallow roots (`unsharedRoot`) and the chain allows it, then stores the page again.
+- **Push side:** before pushing a ref, the client probes each of its own shallow roots under it (a `FETCH_REQUEST` for the root and its parents; any commit back means the peer can store it). If the peer lacks it, the client sends `GRAFT_PUSH` (0x3A/0x3B, capability `graft`), which the host stages and grafts on the last page. Without `allowUnrelated`, the ref is skipped with a reason instead of failing on the peer's missing-parent error.
+- **Merge:** with no common ancestor and `allowUnrelated`, `resolveDivergedLocked` merges with an empty base. Candidates are every op of both sides' histories plus every document in any shallow root's tree they reach. The base commit is recorded as the zero hash. Genesis is fixed per namespace, so independent databases always share an ancestor; histories are unrelated only through a shallow root.
+- **Replay:** grafted roots are side history. A replay of the log with no checkpoint rebuilds the namespace; it admits `graftRoots` shallow (`applyCommitsTopologically`), and open marks them shallow. `RecordShallowRoots` (deepen) keeps each root's kind.
+
+**Tests:**
+- peersync: both directions converge; the unrelated merge is identical on both nodes; refused without the flag; a tampered state is rejected; push skip; push graft.
+- server (file-backed): restart, replay with no checkpoint, a push graft to a host that is only dialled, and a refusal under `history=none`.
+- wire round trip.
+- Python e2e `test_graft.py`: B stopped, C grafts, `kill -9` of C.
+- Kotlin interop `TestKotlinReadsAGoNamespaceThatGraftedAnUnrelatedHistory`: Kotlin refuses loudly.
+
+**Not done:**
+- Kotlin replay of grafted (and snapshot-rooted) namespaces. That needs shallow roots and Go's rule that only commits extending main are applied.
+- Candidates miss documents written only in pruned (stubbed) history.
+

@@ -1,6 +1,7 @@
 package peersync
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -188,10 +189,11 @@ func resolveDivergedLocked(
 	opts ResolutionOptions,
 ) (CommitPushOutcome, AdvanceStep, error) {
 	ancestor := d.CommonAncestor(localHead, incomingHead)
-	if ancestor == nil {
+	unrelated := ancestor == nil
+	if unrelated && !opts.Chain.AllowsUnrelated() {
 		return CommitPushOutcome{}, AdvanceStep{}, kdberr.NewVersionNotFoundError(
 			"no common ancestor between local "+localHead.Hex()+" and incoming "+incomingHead.Hex()+
-				" - a commit references a parent this node never received",
+				" - the histories are unrelated (set allowUnrelated in the namespace's resolution chain to merge them)",
 			namespaceID, incomingHead.Hex(),
 		)
 	}
@@ -204,6 +206,17 @@ func resolveDivergedLocked(
 		return CommitPushOutcome{}, AdvanceStep{}, err
 	}
 	candidates := map[codec.UUID]struct{}{}
+	if unrelated {
+		// Merging unrelated histories (Phase 11): the base is the empty tree. The two sides'
+		// commits reach down to genesis or to a shallow root, so every document either head holds
+		// was written by one of those commits - or is in a shallow root's tree, which no commit
+		// here carries an operation for.
+		for _, cs := range [][]document.Commit{localCommits, remoteCommits} {
+			if err := shallowRootDocs(d, store, namespaceID, cs, candidates); err != nil {
+				return CommitPushOutcome{}, AdvanceStep{}, err
+			}
+		}
+	}
 	for _, cs := range [][]document.Commit{localCommits, remoteCommits} {
 		for _, c := range cs {
 			for _, op := range c.Operations {
@@ -301,7 +314,12 @@ func resolveDivergedLocked(
 			storageWrites[dd.id] = bodyOp(dd.id, m)
 		}
 	}
-	mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, *ancestor, storageWrites, commitOps, mergeMessageFor(provisional))
+	// An unrelated merge has no base commit; the zero hash says so, the same on every node.
+	var base codec.Hash
+	if ancestor != nil {
+		base = *ancestor
+	}
+	mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, base, storageWrites, commitOps, mergeMessageFor(provisional))
 	if err != nil {
 		return CommitPushOutcome{}, AdvanceStep{}, err
 	}
@@ -311,6 +329,26 @@ func resolveDivergedLocked(
 	}
 	step := AdvanceStep{Commits: append(remoteCommits, mergeCommit), Applied: applied}
 	return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, step, nil
+}
+
+// shallowRootDocs adds to into every document in the trees of the shallow roots among commits.
+func shallowRootDocs(d *dag.InMemoryCommitDag, store storage.Adapter, ns string, commits []document.Commit, into map[codec.UUID]struct{}) error {
+	for _, c := range commits {
+		if !d.IsShallow(c.Hash) {
+			continue
+		}
+		walker, ok := store.(storage.TreeWalker)
+		if !ok {
+			return fmt.Errorf("peer sync: merging unrelated histories needs storage that walks trees")
+		}
+		if err := walker.WalkTree(ns, c.DocumentTreeHash, func(id codec.UUID, _ codec.Hash) bool {
+			into[id] = struct{}{}
+			return true
+		}); err != nil {
+			return fmt.Errorf("peer sync: merging unrelated histories: shallow root %s: %w", c.Hash.Hex(), err)
+		}
+	}
+	return nil
 }
 
 // resolution is what resolveConflicting made of a merge's conflicting documents: either the
