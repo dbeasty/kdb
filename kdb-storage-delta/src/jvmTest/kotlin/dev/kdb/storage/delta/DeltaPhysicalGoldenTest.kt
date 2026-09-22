@@ -112,6 +112,24 @@ class DeltaPhysicalGoldenTest {
             }
         assertEquals(one.size, e.offset)
         assertEquals(1, e.partialCommits.size, "commits scanned before the damage must survive")
+        assertEquals(0, e.intactFramesAfter, "damage to the last frame is shaped like a torn tail")
+    }
+
+    // Damage in place: a CRC mismatch with intact frames after it reports how many follow, which is
+    // how replay tells bit rot in the middle of a log (refuse) from a torn tail (truncate).
+    // Mirrors Go's delta.ScanSkippingCorrupt / storage.SegmentSkim.
+    @Test
+    fun damageInTheMiddleCountsTheIntactFramesAfterIt() {
+        val one = DeltaPageCodec.frame(fixtureCommit().toPayloadBytes(), CompressionCodec.NONE)
+        val bytes = one + one + one
+        bytes[DeltaPageCodec.FRAME_HEADER_SIZE] = (bytes[DeltaPageCodec.FRAME_HEADER_SIZE].toInt() xor 0x01).toByte()
+        val e =
+            assertFailsWith<DeltaSegmentScanner.CorruptFrameException> {
+                DeltaSegmentScanner.scanSegmentBytes(bytes)
+            }
+        assertEquals(0, e.offset)
+        assertEquals(0, e.partialCommits.size)
+        assertEquals(2, e.intactFramesAfter)
     }
 
     // D5/L1: the segment path builders must agree with Go's string-for-string, and the parser

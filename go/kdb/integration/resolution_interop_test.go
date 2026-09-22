@@ -129,11 +129,16 @@ func syncInto(t *testing.T, from, to *server.KdbServerRuntime, ns string) {
 	}
 }
 
-func kotlinCLI(t *testing.T, repo string, args ...string) string {
-	t.Helper()
+func kotlinCommand(repo string, args ...string) *exec.Cmd {
 	cmd := exec.Command(filepath.Join(repo, "gradlew"), ":kdb-cli:runCli", "--args="+strings.Join(args, " "), "--quiet")
 	cmd.Dir = repo
 	cmd.Env = append(os.Environ(), "TERM=dumb")
+	return cmd
+}
+
+func kotlinCLI(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmd := kotlinCommand(repo, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		var stderr string
