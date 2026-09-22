@@ -1416,6 +1416,26 @@ client's read of any *other* document is answered from the source instead of "no
 Only point reads (a document by id, over the wire or the control plane) read through. Queries see
 the projection alone.
 
+### Getting history back after a snapshot join: deepen
+
+A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.
+That is fast, but it has two costs:
+- history below that point can't be read;
+- the node **cannot sync with any node that has history of its own**. The other node can't store
+  a commit whose parents it has never seen, and the sync reports `unrelated-history`.
+
+**Deepen** fetches that history from a peer that has it:
+- `deepen=true` on the peer spec does it after each sync:
+  `--peer "name=hub,addr=tcps://hub:4242,bootstrap=snapshot,deepen=true"`.
+- `POST /v1/ns/{ns}/deepen {"peer": "hub"}` does it on demand.
+- So does `kdb deepen <namespace> <peer-addr>` (exit 3 while shallow roots remain).
+
+Each fetched commit is verified against its hash, logged, and replayed like any other. If the peer's
+own history also started from a snapshot, what it lacks stays shallow. Deepening from a node with
+the whole history finishes the job.
+
+Deepen is safe to interrupt. Run it again and it finishes, without fetching what it already has.
+
 ### Self-repair: scrub, and comparing with a peer
 
 A **scrub** re-reads every live document and checks its body against the content hash the
