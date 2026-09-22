@@ -113,9 +113,16 @@ func (l *deltaColdLoader) index() error {
 		return nil
 	}
 	frames := make(map[codec.Hash]coldFrameRef)
+	// Past damage where the reader can: a damaged frame loses only the versions it held, not
+	// every version after it in its segment. Safe, because load verifies every version it reads
+	// against the content hash it was asked for.
+	stream := streamer.StreamCommits
+	if dr, ok := l.reader.(storage.DamageTolerantReader); ok {
+		stream = dr.StreamCommitsPastDamage
+	}
 	for _, seg := range segments {
 		segment := seg
-		err := streamer.StreamCommits(segment, func(c document.Commit, offset int64) error {
+		err := stream(segment, func(c document.Commit, offset int64) error {
 			for _, op := range c.Operations {
 				w, isWrite := op.(document.WriteOp)
 				if !isWrite {

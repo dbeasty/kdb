@@ -75,7 +75,11 @@ func restoreNamespace(
 	if !ok || eng == nil || r == nil {
 		return mustReplay()
 	}
-	if ok, why := checkpointMatchesLog(cp, r); !ok {
+	ok, why := checkpointMatchesLog(cp, r)
+	if ok && why != "" {
+		log.Printf("kdb: namespace %s: %s", namespaceID, why)
+	}
+	if !ok {
 		// The log no longer matches what the checkpoint was written
 		// against. Trusting it here would skip reading exactly the
 		// segments that changed, turning damage or a rolled-back data

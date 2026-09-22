@@ -313,3 +313,47 @@ func decodeFrameAt(pc *PageCodec, bytes []byte, offset int) (document.Commit, er
 	}
 	return commit, nil
 }
+
+// ScanSkippingCorrupt walks bytes like ScanSegmentFrames, but a complete frame that fails its CRC
+// or will not parse is skipped rather than ending the walk - its declared length still says where
+// the next frame starts. It returns the offsets of the frames it skipped. A torn tail (an
+// incomplete frame) still ends the walk cleanly.
+//
+// For damage assessment and recovery only: replay never skips a frame, because a skipped commit
+// would leave the history after it unreplayable. What this lets a caller see is that the frames
+// after a damaged one are intact - the difference between a flipped bit in the middle of a log
+// and a torn tail at its end.
+func ScanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, error) {
+	var codec PageCodec
+	var skipped []int
+	offset := 0
+	for offset+frameHeaderSize <= len(bytes) {
+		frameEnd, ok := frameBounds(bytes, offset)
+		if !ok {
+			break
+		}
+		frame := bytes[offset:frameEnd]
+		if verifyFrameCRC(frame, offset) != nil {
+			skipped = append(skipped, offset)
+			offset = frameEnd
+			continue
+		}
+		payload, err := codec.Parse(frame)
+		if err != nil {
+			skipped = append(skipped, offset)
+			offset = frameEnd
+			continue
+		}
+		commit, err := document.FromPayloadBytes(payload)
+		if err != nil {
+			skipped = append(skipped, offset)
+			offset = frameEnd
+			continue
+		}
+		if err := fn(ScannedCommit{CommitHash: commit.Hash, Commit: commit, FrameOffset: offset}); err != nil {
+			return skipped, err
+		}
+		offset = frameEnd
+	}
+	return skipped, nil
+}

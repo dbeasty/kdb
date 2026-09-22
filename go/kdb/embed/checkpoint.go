@@ -2,6 +2,7 @@ package embed
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -548,6 +549,7 @@ func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) 
 	for _, sg := range current {
 		bySeq[sg.Sequence] = sg
 	}
+	var damaged []string
 	for _, want := range cp.Segments {
 		if want.Sequence < cp.FloorSequence {
 			// Deliberately truncated. Its commits are accounted for by the
@@ -558,16 +560,63 @@ func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) 
 		if !ok {
 			return false, fmt.Sprintf("delta segment %d is missing", want.Sequence)
 		}
+		if got.SizeBytes == want.SizeBytes && got.LastCommitHash == want.LastCommitHash {
+			continue
+		}
+		// A segment's listing stops at its first damaged frame, so a flipped bit in the middle of
+		// it reads here exactly like truncation. Tell them apart before distrusting the
+		// checkpoint: if the file is the same length and its intact frames still end at the
+		// commit the checkpoint recorded, the log was damaged in place, not replaced - and the
+		// checkpoint, which already holds everything the damaged frames said, is the better
+		// source. Replaying instead would stop at the damage and silently drop every commit after
+		// it (and the next checkpoint would make that permanent). What the damage costs is only
+		// the bodies in the damaged frames, which a scrub finds and repairs from a peer.
+		if skim, ok := damagedInPlace(r, want); ok {
+			damaged = append(damaged, fmt.Sprintf("delta segment %d has %d damaged frame(s) at offset(s) %v", want.Sequence, len(skim.DamagedFrames), skim.DamagedFrames))
+			continue
+		}
 		if got.SizeBytes != want.SizeBytes {
 			return false, fmt.Sprintf(
 				"delta segment %d is %d bytes but was %d when the checkpoint was written",
 				want.Sequence, got.SizeBytes, want.SizeBytes)
 		}
-		if got.LastCommitHash != want.LastCommitHash {
-			return false, fmt.Sprintf("delta segment %d ends at a different commit than it did", want.Sequence)
-		}
+		return false, fmt.Sprintf("delta segment %d ends at a different commit than it did", want.Sequence)
+	}
+	if len(damaged) > 0 {
+		return true, strings.Join(damaged, "; ") +
+			" - opening from the checkpoint, which holds what they recorded; documents whose bodies were only in them are unreadable until a scrub repairs them from a peer"
 	}
 	return true, ""
+}
+
+// damagedInPlace reports whether the segment the checkpoint recorded as want is still that
+// segment, with frames damaged in place: the same length on disk, damaged frames, and intact
+// frames that still end at the checkpoint's commit.
+func damagedInPlace(r storage.DeltaSegmentReader, want checkpointSegment) (storage.SegmentSkim, bool) {
+	dr, ok := r.(storage.DamageTolerantReader)
+	if !ok {
+		return storage.SegmentSkim{}, false
+	}
+	segments, err := r.ListSegments()
+	if err != nil {
+		return storage.SegmentSkim{}, false
+	}
+	for _, seg := range segments {
+		if seg.SequenceNumber != want.Sequence {
+			continue
+		}
+		skim, err := dr.SkimSegment(seg)
+		if err != nil || len(skim.DamagedFrames) == 0 {
+			return skim, false
+		}
+		// The checkpoint was written against this file whole, so the same length means the bytes
+		// were changed, not cut short or replaced. The intact frames must still end at the
+		// checkpoint's last commit - or the last frame must itself be the damaged one, whose
+		// commit can no longer be read but which a torn tail could not produce at full length.
+		return skim, skim.PhysicalSize == want.SizeBytes &&
+			(skim.LastCommitHash == want.LastCommitHash || skim.LastFrameDamaged)
+	}
+	return storage.SegmentSkim{}, false
 }
 
 // readCheckpoint loads the namespace's checkpoint, or reports that there
