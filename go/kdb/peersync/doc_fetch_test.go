@@ -50,6 +50,17 @@ func cloneDocFetch(r wire.DocFetchResultMessage) wire.DocFetchResultMessage {
 	return out
 }
 
+// alterHex returns h with its first digit changed, so the tamper is never a no-op whatever h is.
+func alterHex(h string) string {
+	if h == "" {
+		return h
+	}
+	if h[0] == '0' {
+		return "1" + h[1:]
+	}
+	return "0" + h[1:]
+}
+
 // Every way a source could lie in a DOC_FETCH answer is refused, whole.
 func TestDocFetchAnswersAreVerified(t *testing.T) {
 	ns := "app/docfetch"
@@ -76,13 +87,20 @@ func TestDocFetchAnswersAreVerified(t *testing.T) {
 			r.Docs[1].Present, r.Docs[1].Body = true, `{"v":"invented"}`
 		},
 		"a sibling hash altered": func(r *wire.DocFetchResultMessage) {
-			row := r.Docs[0].Proof.Levels[0]
-			for i := range row {
-				if row[i] != "" {
-					row[i] = "00" + row[i][2:]
+			for _, row := range r.Docs[0].Proof.Levels {
+				for i := range row {
+					if row[i] == "" {
+						continue
+					}
+					was := row[i]
+					row[i] = alterHex(was)
+					if row[i] == was {
+						t.Fatalf("a sibling hash altered: %s was left as it was", was)
+					}
 					return
 				}
 			}
+			t.Fatal("a sibling hash altered: the proof holds no sibling hash to alter")
 		},
 		"an unasked document added": func(r *wire.DocFetchResultMessage) {
 			r.Docs = append(r.Docs, wire.FetchedDoc{DocID: newUUID(t).String()})
