@@ -138,6 +138,14 @@ Gossip and mDNS are optional later work.
 
 ---
 
+### 1.12 Self-healing and merging foreign state
+
+This section was added after Phases 0–10 landed. It is the outcome of a research survey; see [kdb-distributed-self-healing-research.md](kdb-distributed-self-healing-research.md) for sources.
+
+- **The trie is already a Merkle tree.** Exposing its interior hashes enables tree-diff anti-entropy, scrub-and-repair by content hash from any peer, and inclusion proofs.
+- **Phase 8 reframed.** An edge that fetches documents outside its projection *with an inclusion proof* (about 2.4 KB at 1M documents) gets verified reads without holding the full trie. The space objection to partial clone does not apply to it.
+- **Merging a database with no shared history** needs an empty-tree base and application-driven resolution. Merge-time rules must be deterministic and replicated. Business-logic resolution happens *after* the merge, as an ordinary commit by a resolver authority.
+
 ## 2. What exists — audit
 
 ### 2.1 Inventory
