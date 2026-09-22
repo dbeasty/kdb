@@ -182,3 +182,28 @@ func deleteTx(t *testing.T, rt *KdbServerRuntime, id codec.UUID) document.Transa
 		Operations: []document.Op{document.DeleteOp{DocID: id}},
 	}
 }
+
+// TestProjectionFollowsKeyRemoval: a source document that loses a key loses it in the
+// projection too. Pages carry final states, so the projection must replace, not merge.
+func TestProjectionFollowsKeyRemoval(t *testing.T) {
+	f := newProjectionFixture(t, `region = 'EU'`)
+	id := mustRandomUUID(t)
+	f.put(id, `{"region":"EU","draft":true}`)
+	f.sync()
+	head, err := f.source.dag.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replace := document.Transaction{
+		ID: mustRandomUUID(t), BaseVersion: head, Timestamp: codec.TimestampNow(),
+		Operations: []document.Op{document.DeleteOp{DocID: id}, document.WriteOp{DocID: id, Patch: `{"region":"EU"}`}},
+	}
+	if _, err := f.source.Commit("app/data", replace, "", auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+	src, _, _, _ := f.source.GetDocument("app/data", id)
+	f.sync()
+	if got := f.held()[id]; got != src {
+		t.Fatalf("projection holds %s, source holds %s", got, src)
+	}
+}

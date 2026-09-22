@@ -185,3 +185,36 @@ func TestSchemaMigrationInReplicatedCommitApplies(t *testing.T) {
 		t.Fatal("the replicated migration did not reach the schema")
 	}
 }
+
+// TestIndexRecreatedAfterDropReachesPeer: a definition record is replaced, not merged, so an index
+// created again after a drop is not still marked dropped.
+func TestIndexRecreatedAfterDropReachesPeer(t *testing.T) {
+	a, b := newMetaNode(t), newMetaNode(t)
+	pa := a.data.SQLIndexProvider().(*RegistryIndexProvider)
+	ctx := sql.QueryContext{NamespaceID: "app/data"}
+	create := sql.StmtCreateIndex{Name: "titles", Table: "docs", Fields: []sql.IndexField{{Path: "title", Weight: 1}}, Using: "FULLTEXT"}
+	if err := pa.CreateIndex(create, ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := pa.DropIndex(sql.StmtDropIndex{Name: "titles", Table: "docs"}, ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := pa.CreateIndex(create, ctx); err != nil {
+		t.Fatal(err)
+	}
+	putDoc(t, a.data, `{"title":"recreated definitions"}`)
+	syncNodes(t, a, b)
+
+	pb := b.data.SQLIndexProvider().(*RegistryIndexProvider)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		hits, _, err := pb.Search(context.Background(), wire.SearchMessage{
+			Namespace: "app/data", Text: &wire.SearchTextArm{Index: "titles", Query: "recreated"}, Limit: 5,
+		})
+		if err == nil && len(hits) == 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the index created again after a drop never reached B")
+}

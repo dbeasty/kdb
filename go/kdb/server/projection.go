@@ -51,6 +51,21 @@ func (p projectionTarget) DocIDs() ([]codec.UUID, error) {
 }
 
 func (p projectionTarget) Apply(ops []document.Op, source string, complete bool) error {
-	_, err := p.rt.systemCommit(ops, peersync.ProjectionMessage(source, complete))
+	_, err := p.rt.systemCommit(replacing(ops), peersync.ProjectionMessage(source, complete))
 	return err
+}
+
+// replacing turns each write into a replacement. A page carries a document's final state, but a
+// write op merges into the document it lands on, so a key the source removed would otherwise
+// stay. A delete followed by a write of the same document is the engine's spelling of replace; a
+// delete of a document that is not there is a no-op.
+func replacing(ops []document.Op) []document.Op {
+	out := make([]document.Op, 0, len(ops)*2)
+	for _, op := range ops {
+		if w, ok := op.(document.WriteOp); ok {
+			out = append(out, document.DeleteOp{DocID: w.DocID})
+		}
+		out = append(out, op)
+	}
+	return out
 }

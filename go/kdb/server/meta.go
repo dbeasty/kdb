@@ -378,10 +378,11 @@ func sameIndex(a, b index.Descriptor) bool {
 		reflect.DeepEqual(a.Options, b.Options)
 }
 
-// systemUpsert writes one document as the runtime itself, bypassing RBAC - definitions are
-// recorded because a principal already had the right to change them.
+// systemUpsert replaces one document as the runtime itself, bypassing RBAC - definitions are
+// recorded because a principal already had the right to change them. Replaced, not merged: a
+// record's omitted fields (dropped=false, no handover point) must not keep their old values.
 func (s *KdbServerRuntime) systemUpsert(docID codec.UUID, body string) (document.Commit, error) {
-	return s.systemCommit([]document.Op{document.WriteOp{DocID: docID, Patch: body}}, "kdb:meta")
+	return s.systemCommit(replacing([]document.Op{document.WriteOp{DocID: docID, Patch: body}}), "kdb:meta")
 }
 
 // systemCommit commits ops as the runtime itself: no RBAC, and allowed on a namespace that
