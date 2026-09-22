@@ -38,6 +38,9 @@ type V2HostConfig struct {
 	// MetaView answers META_VIEW: the definitions a session may see, given which namespaces it
 	// was granted. nil answers with none.
 	MetaView func(canSee func(ns string) bool) ([]wire.MetaDefinition, error)
+	// HomeRequest decides a HOME_REQUEST from peer (its node id at hello), authenticated as
+	// principal and granted push on the namespace. nil refuses every request.
+	HomeRequest func(principal auth.Principal, peer string, m wire.HomeRequestMessage) (wire.HomeRequestResultMessage, error)
 	// Namespaces supplies the namespaces this host serves.
 	Namespaces NamespaceProvider
 	// ClassifyError maps a failure to the code sent back in PEER_ERROR - see HostConfig.
@@ -86,7 +89,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -193,6 +196,30 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		return h.docFetch(m)
 	case wire.GraftPushMessage:
 		return h.graftPush(m)
+	case wire.HomeRequestMessage:
+		reply := wire.HomeRequestResultMessage{H: header(wire.MsgHomeRequestResult, m.H.CorrelationID), Namespace: m.Namespace}
+		// Only a node that may write the namespace may ask to become its home, and only for itself.
+		if _, err := h.env(m.Namespace, false, dirPush); err != nil {
+			return nil, err
+		}
+		h.mu.Lock()
+		principal, peer := h.principal, h.peer
+		h.mu.Unlock()
+		if m.Node != peer {
+			reply.Reason = "a node may ask to become a namespace's home only for itself (asked for " + m.Node + ", connected as " + peer + ")"
+			return reply, nil
+		}
+		if h.cfg.HomeRequest == nil {
+			reply.Reason = "this node does not hand namespaces over on request"
+			return reply, nil
+		}
+		res, err := h.cfg.HomeRequest(principal, peer, m)
+		if err != nil {
+			return nil, err
+		}
+		res.H = reply.H
+		res.Namespace = m.Namespace
+		return res, nil
 	case wire.MetaViewMessage:
 		reply := wire.MetaViewResultMessage{H: header(wire.MsgMetaViewResult, m.H.CorrelationID)}
 		if h.cfg.MetaView == nil {

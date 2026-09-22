@@ -127,6 +127,9 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 				MetaView: func(canSee func(string) bool) ([]wire.MetaDefinition, error) {
 					return h.runtime.Meta.View(canSee)
 				},
+				HomeRequest: func(principal auth.Principal, _ string, m wire.HomeRequestMessage) (wire.HomeRequestResultMessage, error) {
+					return h.runtime.answerHomeRequest(principal, m)
+				},
 				WriteBack: func(principal auth.Principal, m wire.ProjectWriteMessage) (wire.ProjectWriteResultMessage, error) {
 					rt, err := h.runtime.namespaceSet().Resolve(m.Namespace, false)
 					if err != nil {

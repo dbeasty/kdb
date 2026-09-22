@@ -62,6 +62,9 @@ type Config struct {
 	// writes or deletes (DocumentWriteAction / DocumentDeleteAction), for engines whose rules go
 	// below the namespace. Namespace-level push rights are always checked.
 	AuthorizePushedDocuments bool
+	// HandoverPolicy decides peers' requests to become a namespace's home (Node.RequestHome on
+	// their side); nil refuses them all. See server.HandoverRequest.
+	HandoverPolicy server.HandoverPolicy
 	// Idle, when set, closes namespaces nobody has used for a while (and the least recently used
 	// beyond a cap), reopening each on its next use - for a process with a namespace per user or
 	// per match. Needs a host: an in-memory namespace closed is gone. The primary is never closed.
@@ -121,6 +124,7 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	n := &Node{host: host, set: set, primary: primary, cfg: cfg, stopExpiry: make(chan struct{})}
 	primary.Namespaces = set
 	primary.PeerAuthorizeDocuments = cfg.AuthorizePushedDocuments
+	primary.HandoverPolicy = cfg.HandoverPolicy
 	primary.Runtime.SetPeerRetentionFloor(n.peerFloorFor(primary))
 
 	// Definitions (schema, index DDL, resolution chains, homes) live as documents in a reserved

@@ -1229,6 +1229,24 @@ The open and close times are fsync-bound on macOS.
 
 **Tests:** LRU over the cap with pinning; age; busy left open; reopen on resolve; a file-backed cloud that closes both user namespaces, serves one to a phone by reopening it with its chain, and after a restart knows the namespaces on disk without opening them.
 
+### Phase 16.7 — landed (application-driven handover, G8)
+
+- **`HOME_REQUEST` (0x3E/0x3F, capability `home`):** the would-be home asks over the sync connection. The host requires a push grant, and the request must be for the session's own node.
+  - The current home asks `server.HandoverPolicy` (`syncnode.Config.HandoverPolicy`; nil refuses everything). The policy sees who asks, their principal, the reason and the assignment being replaced.
+  - On yes the home calls `AssignHome`, which bumps the fence and sets the handover point.
+  - A node that isn't the home refuses and names the home.
+- **Forced handover:** allowed only for the node the namespace's chain names as its authority (`Authority().Node`).
+- **API:**
+  - `syncnode.Node.Handover` and `ForceHandover` are in-process.
+  - `RequestHome` asks a peer. On a grant it syncs and reconciles definitions synchronously, so the caller can write when it returns. (Definitions arriving by sync are otherwise applied in the background, which a first version of the test caught.)
+
+**Tests:**
+- the phone is refused writes while the cloud is home;
+- the policy's refusal reaches the phone; a grant lets the phone write while the cloud is refused;
+- a second phone is told who the home is, then force-requests from the authority;
+- the dark phone's offline write is refused by the fence when it returns;
+- a request for another node, or to a node without a policy, is refused.
+
 ### Phase 11 — landed (graft: merging unrelated histories)
 
 Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).

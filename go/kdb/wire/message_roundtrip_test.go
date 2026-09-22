@@ -540,6 +540,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgGraftPushResult, "GRAFT_PUSH_RESULT"},
 		{wire.MsgMetaView, "META_VIEW"},
 		{wire.MsgMetaViewResult, "META_VIEW_RESULT"},
+		{wire.MsgHomeRequest, "HOME_REQUEST"},
+		{wire.MsgHomeRequestResult, "HOME_REQUEST_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -566,7 +568,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x3E
+const nextFreeMessageCode = 0x40
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{
@@ -873,5 +875,18 @@ func TestMetaViewRoundTrip(t *testing.T) {
 	}).(wire.MetaViewResultMessage)
 	if len(res.Definitions) != 1 || res.Definitions[0].Body != `{"kind":"resolution"}` {
 		t.Fatalf("round trip changed the view: %+v", res)
+	}
+}
+
+func TestHomeRequestRoundTrip(t *testing.T) {
+	req := roundTrip(t, wire.HomeRequestMessage{H: wire.Header{MessageType: wire.MsgHomeRequest, CorrelationID: 9},
+		Namespace: "app/m/1", Node: "n", Addr: "tcp://x", Force: true, Reason: "resume"}).(wire.HomeRequestMessage)
+	if req.Namespace != "app/m/1" || !req.Force || req.Reason != "resume" || req.Addr != "tcp://x" {
+		t.Fatalf("request: %+v", req)
+	}
+	res := roundTrip(t, wire.HomeRequestResultMessage{H: wire.Header{MessageType: wire.MsgHomeRequestResult, CorrelationID: 9},
+		Namespace: "app/m/1", Granted: true, HomeNode: "n", Fence: 3, Since: "ab"}).(wire.HomeRequestResultMessage)
+	if !res.Granted || res.Fence != 3 || res.Since != "ab" || res.HomeNode != "n" {
+		t.Fatalf("result: %+v", res)
 	}
 }

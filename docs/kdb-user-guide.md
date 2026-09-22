@@ -1535,6 +1535,26 @@ syncnode.Config{Idle: &syncnode.IdleConfig{MaxOpen: 20000, IdleAfter: 30 * time.
 - At startup the namespaces on disk are known without being opened.
 - `node.CloseIdle(time.Now())` sheds idle namespaces at a moment of your choosing, for example when a phone app goes to the background.
 
+### Moving a namespace's home from your application
+
+A single-home namespace (only its home accepts writes) can be moved by the application itself,
+for example to resume a match on another device:
+
+- **From the current home:** `node.Handover(ns, toNode, addr)`.
+- **From the device that wants it:** `node.RequestHome(peer, ns, addr, reason, false)`. The current
+  home's `Config.HandoverPolicy` decides.
+
+  On yes, the home assigns the namespace to the requester and raises the fence. The requester
+  syncs at once and can write when the call returns. Without a policy, every request is refused.
+- **When the home is unreachable:** `RequestHome(..., force=true)` asks the node that the
+  namespace's resolution chain names as its authority (`{"kind":"authority","node":"<id>"}`).
+  That node may reassign the home without the old one.
+
+  The old home's writes made after the move are refused by the fence wherever they arrive.
+  Writes it made but never delivered are lost, which is the cost of not waiting for it.
+
+A node may only ask for itself, and only for a namespace it may push to.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.
