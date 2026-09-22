@@ -3,6 +3,7 @@ package embed
 import (
 	"errors"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/codec"
 
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -94,5 +95,25 @@ func (r *EmbeddedKdbRuntime) PersistSnapshot(root document.Commit) error {
 		}
 	}
 	meta.ShallowRoots = append(meta.ShallowRoots, root.Hash.Hex())
+	meta.BodiesExternal = true
+	return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
+}
+
+// RecordShallowRoots rewrites the namespace marker's shallow roots to roots: the history horizons
+// that remain after history below a snapshot was fetched back (peersync.Deepen). Empty means the
+// namespace's history is whole again - a full replay from genesis rebuilds it - so open stops
+// requiring the snapshot's checkpoint. The marker keeps recording that bodies may be external.
+func (r *EmbeddedKdbRuntime) RecordShallowRoots(roots []codec.Hash) error {
+	s := r.snapshot
+	if s == nil {
+		return nil // a memory runtime has no marker to keep
+	}
+	meta, _ := readNamespaceMeta(s.dataRoot, s.namespaceID)
+	meta.NamespaceID = s.namespaceID
+	meta.ShallowRoots = nil
+	for _, h := range roots {
+		meta.ShallowRoots = append(meta.ShallowRoots, h.Hex())
+	}
+	meta.BodiesExternal = true
 	return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
 }

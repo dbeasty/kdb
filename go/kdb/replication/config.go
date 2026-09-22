@@ -50,6 +50,10 @@ type PeerConfig struct {
 	// by fetching it from the source, proved against the source commit the projection is at
 	// (readthrough=true; filtered peers only).
 	ReadThrough bool
+	// Deepen fetches the history below any shallow root a synced namespace has - one bootstrapped
+	// by snapshot - from this peer after each sync, until the peer has no more (deepen=true). Such
+	// a namespace can then sync with nodes that have history of their own.
+	Deepen bool
 }
 
 // DefaultInterval is the anti-entropy tick when a peer names none.
@@ -124,6 +128,8 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			p.WriteBack = value == "true"
 		case "readthrough":
 			p.ReadThrough = value == "true"
+		case "deepen":
+			p.Deepen = value == "true"
 		case "bootstrap":
 			switch value {
 			case "snapshot":
@@ -152,6 +158,9 @@ func ParsePeer(spec string) (PeerConfig, error) {
 		return PeerConfig{}, fmt.Errorf("peer %q: writeback applies only to a filtered peer", spec)
 	} else if p.ReadThrough {
 		return PeerConfig{}, fmt.Errorf("peer %q: readthrough applies only to a filtered peer", spec)
+	}
+	if p.Filter != "" && p.Deepen {
+		return PeerConfig{}, fmt.Errorf("peer %q: deepen does not apply to a filtered peer, which keeps no source history", spec)
 	}
 	if len(p.Namespaces) == 0 {
 		p.Namespaces = []string{"**"}

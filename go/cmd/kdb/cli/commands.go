@@ -98,6 +98,8 @@ func execute(cfg Config, cmd Command) int {
 		return cmdScrub(cfg, rt, c)
 	case PeerDiffCmd:
 		return cmdPeerDiff(cfg, rt, c)
+	case DeepenCmd:
+		return cmdDeepen(cfg, rt, c)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unsupported command\n")
 		return 2
@@ -145,6 +147,8 @@ func namespaceFor(cmd Command) string {
 	case ScrubCmd:
 		return c.Namespace
 	case PeerDiffCmd:
+		return c.Namespace
+	case DeepenCmd:
 		return c.Namespace
 	default:
 		return ""

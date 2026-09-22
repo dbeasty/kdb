@@ -227,7 +227,7 @@ The foundation for Phases 13 and 14.
 - **Missing commits on the repair path:** `integrity.Repair` fetches them from a peer before falling back to "run kdb restore".
 - **Live-tree check:** periodically compare the live tree's root with the declared tree hash of the head. On a mismatch, walk `TREE_NODES` against a peer to find the damaged documents and repair only those.
 
-### Phase 14 — Edge lazy fill — read-through landed; widening and deepen not (see the progress log)
+### Phase 14 — Edge lazy fill — read-through and deepen landed; widening not (see the progress log)
 
 - **Read-through:** a projection's `GetDocument` for an id outside its data does `OBJECT_FETCH` from the source with a proof (§4). The result optionally goes into a bounded LRU *hoard* [24] kept apart from the projection's history, so the projection's DAG stays exactly its filter.
 - **Filter widening** becomes a tree-diff against the source instead of a `Reset` [23].

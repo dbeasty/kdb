@@ -2,6 +2,7 @@ package dag
 
 import (
 	"container/list"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -471,6 +472,37 @@ func (d *InMemoryCommitDag) MarkShallow(hash codec.Hash) {
 		return
 	}
 	d.shallow[hash] = struct{}{}
+	d.ancestryVersion++
+}
+
+// Unshallow stops treating hash as a shallow root once its history is here: every parent resident
+// (or stubbed). Its generation, and every descendant's, was derived without that history, so they
+// are recomputed before the next pruned walk.
+func (d *InMemoryCommitDag) Unshallow(hash codec.Hash) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.shallow[hash]; !ok {
+		return nil
+	}
+	c, ok := d.commitLocked(hash)
+	if !ok {
+		return fmt.Errorf("dag: unshallow %s: not resident", hash.Hex())
+	}
+	if !d.parentsResidentLocked(c) {
+		return fmt.Errorf("dag: unshallow %s: its parents are not all here", hash.Hex())
+	}
+	delete(d.shallow, hash)
+	d.genStale = true
+	d.ancestryVersion++
+	return nil
+}
+
+// InvalidateGenerations makes the next pruned walk recompute every generation first - for callers
+// that admitted a commit's ancestors after the commit itself.
+func (d *InMemoryCommitDag) InvalidateGenerations() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.genStale = true
 	d.ancestryVersion++
 }
 

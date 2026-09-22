@@ -82,6 +82,9 @@ type IngestEnv struct {
 	// SnapshotInstalled makes an installed snapshot durable - see InstallSnapshot. nil leaves it
 	// in memory, which is all a memory runtime has.
 	SnapshotInstalled func(document.Commit) error
+	// ShallowRootsChanged records the namespace's shallow roots durably when Deepen changes them -
+	// see Deepen for the order it is called in. nil: nothing to record (memory runtimes).
+	ShallowRootsChanged func([]codec.Hash) error
 	// MaxClockSkew refuses a commit timestamped further than this past local wall time. Commits
 	// are timestamped at least one microsecond after their parents, so a single commit from a node
 	// whose clock runs far ahead would drag every later commit that descends from it into that

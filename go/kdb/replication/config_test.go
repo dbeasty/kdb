@@ -71,3 +71,19 @@ func TestParseWriteBackPeer(t *testing.T) {
 		t.Error("accepted writeback on an unfiltered peer")
 	}
 }
+
+func TestParsePeerDeepen(t *testing.T) {
+	p, err := ParsePeer("name=b,addr=tcp://b:1,bootstrap=snapshot,deepen=true")
+	if err != nil || !p.Deepen || !p.PreferSnapshot {
+		t.Fatalf("%+v %v", p, err)
+	}
+	if _, err := ParsePeer("name=b,addr=tcp://b:1,namespaces=orders,deepen=true,filter=x = 1"); err == nil {
+		t.Fatal("deepen must be refused on a filtered peer")
+	}
+	if p, err := ParsePeer("name=b,addr=tcp://b:1,namespaces=orders,readthrough=true,filter=x = 1"); err != nil || !p.ReadThrough {
+		t.Fatalf("readthrough on a filtered peer: %+v %v", p, err)
+	}
+	if _, err := ParsePeer("name=b,addr=tcp://b:1,readthrough=true"); err == nil {
+		t.Fatal("readthrough must be refused on an unfiltered peer")
+	}
+}

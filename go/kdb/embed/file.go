@@ -175,7 +175,7 @@ func (h *Host) openNamespace(
 		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
 	}
 	meta, _ := readNamespaceMeta(dataRoot, namespaceID)
-	if len(meta.ShallowRoots) > 0 && eng != nil {
+	if (len(meta.ShallowRoots) > 0 || meta.BodiesExternal) && eng != nil {
 		// Some bodies exist only in the blob store; cold reads must look there.
 		eng.SetBodiesExternal(true)
 	}
@@ -187,6 +187,11 @@ func (h *Host) openNamespace(
 		if h, err := codec.HashFromHex(hex); err == nil {
 			d.MarkShallow(h)
 		}
+	}
+	if meta.BodiesExternal {
+		// History fetched below a snapshot arrives after the commits it is the history of, so
+		// their generations were derived without it; recompute before anything prunes a walk.
+		d.InvalidateGenerations()
 	}
 	if eng != nil && len(meta.ShallowRoots) == 0 && len(d.Horizon()) > 0 {
 		// Commits whose parents are gone: a snapshot bootstrap whose marker a crash cut off, or
@@ -242,7 +247,7 @@ func (h *Host) openNamespace(
 		// because the reader needs the same handle and namespace the open resolved, and nothing
 		// else in EmbeddedKdbRuntime carries them.
 		rt.refresh = func() error {
-			return replayDeltaNamespaceFrom(d, store, handle.DeltaReader(), -1, h.txn)
+			return replayDeltaNamespaceFrom(d, store, handle.DeltaReader(), -1, h.txn, nil)
 		}
 	}
 	handleClosed = true

@@ -961,3 +961,32 @@ The fix, in `checkpointMatchesLog`: damage in place is told apart from a replace
 - **Filter widening by tree diff.** A projection's namespace is keyed by its filter (`ProjectionNamespace`), so a wider filter is a *new* projection and must start from a snapshot anyway. What a diff could save is the case where the source cannot relate the projection's position to its head. There, a Merkle diff of a *filtered subset* against the whole source tree would name every source document outside the filter as a difference, which is not cheaper than the reset.
 - **Deepen (fetching history below a shallow root).** Valuable, because it would also let a snapshot-rooted node sync with independent peers again (Phase 11), provided the snapshot's source still holds the history. But the deepened commits have to be persisted without the delta-log replay treating them as adopted, and the shallow-root markers (`meta.json`) have to be retired in step with the checkpoint. That is its own piece of durability work.
 
+### Phase 14, deepen — landed
+
+**`peersync.Deepen` / `DeepenAll`** fetch a shallow root's ancestors (`FETCH_REQUEST`, paged, parents first), verify and store them, and unshallow the root. Commits at the peer's own horizon become the new shallow roots.
+
+**Durability, in order:**
+1. The marker names the new horizons.
+2. The fetched commits and the root are logged and waited on.
+3. `dag.Unshallow` runs, invalidating generations.
+4. The marker is rewritten without the root.
+
+**Engine changes:**
+- Replay admits a marker-named root without its parents.
+- `meta.json` gains `bodiesExternal`, set once and never cleared: snapshot bodies are only in the blob store.
+- Open invalidates generations for deepened namespaces, since history arrives after its descendants.
+
+**Surfaces:**
+- the `deepen=true` peer option;
+- `POST /v1/ns/{ns}/deepen`;
+- `kdb deepen`.
+
+**It partly unblocks Phase 11.** A snapshot-rooted node that deepens from a peer holding the history syncs with independent nodes again. The graft, which needs a durable non-live tree, is still needed only when no reachable peer holds that history.
+
+**Tests:**
+- the unrelated-history case resolved;
+- durability across restart;
+- a partial deepen surviving a replay and then finished from a full node;
+- an interrupted deepen finished by rerunning it;
+- the replicator option, the CLI, and a three-service Python e2e with a kill -9.
+

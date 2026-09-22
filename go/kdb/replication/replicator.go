@@ -294,6 +294,9 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 			}
 			st.Namespaces[ns.Namespace] = cur
 		}
+		if l.peer.Deepen {
+			l.deepen(res.Namespaces, transport)
+		}
 	}
 	if err != nil {
 		st.ConsecutiveFailures++
@@ -506,4 +509,55 @@ func (r *Replicator) OpenDocSession(projectionNS string) (*peersync.RepairSessio
 		return s, l.peer.Namespaces[0], err
 	}
 	return nil, "", fmt.Errorf("replication: no filtered peer keeps its projection in %s", projectionNS)
+}
+
+// deepen fetches, from this peer, the history below the shallow roots of every namespace the sync
+// just brought up to date (PeerConfig.Deepen). A failure is logged, not the sync's: the namespace
+// is as synced as it was, and the next cycle tries again.
+func (l *peerLoop) deepen(synced []peersync.NamespaceSyncResult, transport stream.Transport) {
+	for _, ns := range synced {
+		if ns.Err != nil {
+			continue
+		}
+		env, err := l.r.cfg.Local.Env(ns.Namespace, false)
+		if err != nil || len(env.DAG.ShallowRoots()) == 0 {
+			continue
+		}
+		s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), transport, peersync.V2ClientConfig{
+			NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
+			ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+			Namespaces:        []string{ns.Namespace}, Timeout: l.r.cfg.Timeout,
+		})
+		if err != nil {
+			slog.Warn("replication: deepen could not connect", "peer", l.peer.Name, "namespace", ns.Namespace, "error", err)
+			continue
+		}
+		env.Peer = s.Peer
+		results, err := peersync.DeepenAll(env, s)
+		s.Close()
+		fetched := 0
+		for _, r := range results {
+			fetched += r.Fetched
+		}
+		if err != nil {
+			slog.Warn("replication: deepen failed", "peer", l.peer.Name, "namespace", ns.Namespace, "error", err)
+		} else if fetched > 0 {
+			slog.Info("replication: fetched history below a snapshot", "peer", l.peer.Name, "namespace", ns.Namespace,
+				"commits", fetched, "remainingShallowRoots", len(env.DAG.ShallowRoots()))
+		}
+	}
+}
+
+// OpenRepairSessionTo connects to peer name for namespace ns - for deepen and other repairs asked
+// for by hand.
+func (r *Replicator) OpenRepairSessionTo(name, ns string) (*peersync.RepairSession, error) {
+	l, ok := r.loops[name]
+	if !ok {
+		return nil, fmt.Errorf("replication: no peer %q", name)
+	}
+	return peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
+		NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
+		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+		Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
+	})
 }
