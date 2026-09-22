@@ -39,28 +39,45 @@ func (b *jsonByteArray) UnmarshalJSON(data []byte) error {
 }
 
 type payloadEnvelope struct {
-	Kind              string                `json:"kind"`
-	Handshake         *handshakeDto         `json:"handshake,omitempty"`
-	HandshakeAck      *handshakeAckDto      `json:"handshakeAck,omitempty"`
-	DeltaCommit       *deltaCommitDto       `json:"deltaCommit,omitempty"`
-	CommitFetch       *commitFetchDto       `json:"commitFetch,omitempty"`
-	CommitPush        *commitPushDto        `json:"commitPush,omitempty"`
-	CommitPushAck     *commitPushAckDto     `json:"commitPushAck,omitempty"`
-	DagDiff           *dagDiffDto           `json:"dagDiff,omitempty"`
-	TransactionReplay *transactionReplayDto `json:"transactionReplay,omitempty"`
-	ConflictReport    *conflictReportDto    `json:"conflictReport,omitempty"`
-	CompactionNotice  *compactionNoticeDto  `json:"compactionNotice,omitempty"`
-	IceArchiveNotice  *iceArchiveNoticeDto  `json:"iceArchiveNotice,omitempty"`
-	SnapshotRequest   *snapshotRequestDto   `json:"snapshotRequest,omitempty"`
-	SnapshotResponse  *snapshotResponseDto  `json:"snapshotResponse,omitempty"`
-	PositionAck       *positionAckDto       `json:"positionAck,omitempty"`
-	SchemaPush        *schemaPushDto        `json:"schemaPush,omitempty"`
-	SessionBegin      *sessionBeginDto      `json:"sessionBegin,omitempty"`
-	SessionBeginAck   *sessionBeginAckDto   `json:"sessionBeginAck,omitempty"`
-	SqlExec           *sqlExecDto           `json:"sqlExec,omitempty"`
-	SqlResult         *sqlResultDto         `json:"sqlResult,omitempty"`
-	TxCommit          *txCommitDto          `json:"txCommit,omitempty"`
-	TxRollback        *txRollbackDto        `json:"txRollback,omitempty"`
+	Kind         string           `json:"kind"`
+	Handshake    *handshakeDto    `json:"handshake,omitempty"`
+	HandshakeAck *handshakeAckDto `json:"handshakeAck,omitempty"`
+	DeltaCommit  *deltaCommitDto  `json:"deltaCommit,omitempty"`
+	CommitFetch  *commitFetchDto  `json:"commitFetch,omitempty"`
+	PeerError    *peerErrorDto    `json:"peerError,omitempty"`
+
+	// Peer sync v2 (Go-only) - see sync_v2_ops.go.
+	SyncHello          *syncHelloDto          `json:"syncHello,omitempty"`
+	SyncHelloAck       *syncHelloAckDto       `json:"syncHelloAck,omitempty"`
+	RefsRequest        *refsRequestDto        `json:"refsRequest,omitempty"`
+	RefsResult         *refsResultDto         `json:"refsResult,omitempty"`
+	FetchRequest       *fetchRequestDto       `json:"fetchRequest,omitempty"`
+	PackPage           *packPageDto           `json:"packPage,omitempty"`
+	RefUpdate          *refUpdateDto          `json:"refUpdate,omitempty"`
+	RefUpdateAck       *refUpdateAckDto       `json:"refUpdateAck,omitempty"`
+	SnapshotFetch      *snapshotFetchDto      `json:"snapshotFetch,omitempty"`
+	SnapshotPage       *snapshotPageDto       `json:"snapshotPage,omitempty"`
+	ProjectFetch       *projectFetchDto       `json:"projectFetch,omitempty"`
+	ProjectPage        *projectPageDto        `json:"projectPage,omitempty"`
+	ProjectWrite       *projectWriteDto       `json:"projectWrite,omitempty"`
+	ProjectWriteResult *projectWriteResultDto `json:"projectWriteResult,omitempty"`
+	CommitPush         *commitPushDto         `json:"commitPush,omitempty"`
+	CommitPushAck      *commitPushAckDto      `json:"commitPushAck,omitempty"`
+	DagDiff            *dagDiffDto            `json:"dagDiff,omitempty"`
+	TransactionReplay  *transactionReplayDto  `json:"transactionReplay,omitempty"`
+	ConflictReport     *conflictReportDto     `json:"conflictReport,omitempty"`
+	CompactionNotice   *compactionNoticeDto   `json:"compactionNotice,omitempty"`
+	IceArchiveNotice   *iceArchiveNoticeDto   `json:"iceArchiveNotice,omitempty"`
+	SnapshotRequest    *snapshotRequestDto    `json:"snapshotRequest,omitempty"`
+	SnapshotResponse   *snapshotResponseDto   `json:"snapshotResponse,omitempty"`
+	PositionAck        *positionAckDto        `json:"positionAck,omitempty"`
+	SchemaPush         *schemaPushDto         `json:"schemaPush,omitempty"`
+	SessionBegin       *sessionBeginDto       `json:"sessionBegin,omitempty"`
+	SessionBeginAck    *sessionBeginAckDto    `json:"sessionBeginAck,omitempty"`
+	SqlExec            *sqlExecDto            `json:"sqlExec,omitempty"`
+	SqlResult          *sqlResultDto          `json:"sqlResult,omitempty"`
+	TxCommit           *txCommitDto           `json:"txCommit,omitempty"`
+	TxRollback         *txRollbackDto         `json:"txRollback,omitempty"`
 
 	// Component 40 additions - see document_ops.go.
 	DocumentGet       *documentGetDto       `json:"documentGet,omitempty"`
@@ -103,6 +120,7 @@ type handshakeDto struct {
 	User                      *string           `json:"user,omitempty"`
 	Password                  *string           `json:"password,omitempty"`
 	Token                     *string           `json:"token,omitempty"`
+	Filter                    *string           `json:"filter,omitempty"`
 }
 
 type handshakeAckDto struct {
@@ -127,11 +145,29 @@ type commitFetchDto struct {
 	Namespace    string  `json:"namespace"`
 	SinceHashHex *string `json:"sinceHashHex"`
 	MaxCommits   int     `json:"maxCommits"`
+	// HaveHexes (Go-only, additive): more commits the fetcher already has, besides SinceHash.
+	HaveHexes []string `json:"haveHexes,omitempty"`
 }
 
 type commitPushDto struct {
 	Namespace      string        `json:"namespace"`
 	CommitsPayload jsonByteArray `json:"commitsPayload"`
+	// Stubs (Go-only, additive): archived commits the sender can only name.
+	Stubs []commitStubDto `json:"stubs,omitempty"`
+	// More (Go-only, additive): further pages of this push follow; store, do not decide yet.
+	More bool `json:"more,omitempty"`
+}
+
+type commitStubDto struct {
+	OriginalHashHex string `json:"originalHashHex"`
+	ArchiveLocation string `json:"archiveLocation"`
+	StubbedAtMicros int64  `json:"stubbedAtMicros"`
+}
+
+type peerErrorDto struct {
+	Namespace string    `json:"namespace"`
+	Code      ErrorCode `json:"code"`
+	Message   string    `json:"message"`
 }
 
 type commitPushAckDto struct {

@@ -3,6 +3,9 @@ package peersync
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -108,6 +111,8 @@ type frameHandler struct {
 	// authenticated" from "authenticated as an anonymous/empty principal").
 	principal     auth.Principal
 	authenticated bool
+	// peer is the connecting node's id from its handshake.
+	peer string
 }
 
 func newFrameHandler(w wire.Codec, dagInst *dag.InMemoryCommitDag, store storage.Adapter, cfg HostConfig, engine auth.Engine, ctx auth.ConnectionContext) *frameHandler {
@@ -137,37 +142,120 @@ func (h *frameHandler) authorizePeerSync() error {
 func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 	msg, err := h.wire.Decode(frame)
 	if err != nil {
+		// Nothing trustworthy to correlate a reply with; the caller drops the connection.
 		return nil, err
 	}
+	reply, err := h.serve(msg)
+	if err != nil {
+		// Every request gets an answer. Before PeerErrorMessage existed an unknown frame got none
+		// (the peer waited out its 20s correlation timeout) and any other failure dropped the
+		// connection without saying why (D7).
+		return h.wire.Encode(wire.PeerErrorMessage{
+			H:         wire.Header{MessageType: wire.MsgPeerError, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: msg.Header().CorrelationID},
+			Namespace: h.cfg.NamespaceID,
+			Code:      h.classify(err),
+			Message:   err.Error(),
+		})
+	}
+	if reply == nil {
+		return nil, nil
+	}
+	return h.wire.Encode(reply)
+}
+
+// NamespaceMismatchError is a peer-sync frame naming a namespace this connection does not serve.
+type NamespaceMismatchError struct {
+	Served, Requested string
+}
+
+func (e *NamespaceMismatchError) Error() string {
+	return fmt.Sprintf("peer sync: this listener serves namespace %q, not %q", e.Served, e.Requested)
+}
+
+// UnsupportedFrameError is a frame type the peer-sync host does not serve.
+type UnsupportedFrameError struct {
+	Type wire.MessageType
+}
+
+func (e *UnsupportedFrameError) Error() string {
+	return "peer sync: unsupported message type " + e.Type.String()
+}
+
+func (h *frameHandler) classify(err error) wire.ErrorCode {
+	if h.cfg.ClassifyError != nil {
+		if code, ok := h.cfg.ClassifyError(err); ok {
+			return code
+		}
+	}
+	var ns *NamespaceMismatchError
+	var unsupported *UnsupportedFrameError
+	var mismatch *TreeMismatchError
+	var authErr *auth.AuthorizationError
+	switch {
+	case errors.As(err, &ns):
+		return wire.ErrorCodeNamespaceMismatch
+	case errors.As(err, &unsupported):
+		return wire.ErrorCodeUnsupported
+	case errors.As(err, &mismatch):
+		return wire.ErrorCodeIntegrity
+	case errors.As(err, &authErr):
+		return wire.ErrorCodeUnauthorized
+	}
+	return wire.ErrorCodeInternal
+}
+
+func (h *frameHandler) requireNamespace(ns string) error {
+	if ns != h.cfg.NamespaceID {
+		return &NamespaceMismatchError{Served: h.cfg.NamespaceID, Requested: ns}
+	}
+	return nil
+}
+
+func (h *frameHandler) serve(msg wire.Message) (wire.Message, error) {
 	switch m := msg.(type) {
 	case wire.HandshakeMessage:
 		if m.Request.ClientMode != wire.ClientFullPeer {
 			reason := "FULL_PEER mode required"
-			return h.wire.Encode(peerHandshakeAck(m, false, nil, &reason))
+			return peerHandshakeAck(m, false, nil, &reason), nil
+		}
+		if h.cfg.NodeID != "" && m.Request.NodeID == h.cfg.NodeID {
+			// Two nodes sharing an identity would record progress against each other as if they
+			// were one - almost always a data root copied without deleting its NODE file.
+			reason := "peer sync: the connecting node has this node's own identity " + h.cfg.NodeID +
+				"; a copied data root must delete its NODE file to become a separate node"
+			return peerHandshakeAck(m, false, nil, &reason), nil
+		}
+		if len(m.Request.Namespaces) > 0 && !containsString(m.Request.Namespaces, h.cfg.NamespaceID) {
+			reason := (&NamespaceMismatchError{Served: h.cfg.NamespaceID, Requested: strings.Join(m.Request.Namespaces, ",")}).Error()
+			return peerHandshakeAck(m, false, nil, &reason), nil
 		}
 		creds := auth.Credentials{User: m.Request.User, Password: m.Request.Password, Token: m.Request.Token}
 		principal, err := h.auth.Authenticator().Authenticate(context.Background(), creds)
 		if err != nil {
 			reason := err.Error()
-			return h.wire.Encode(peerHandshakeAck(m, false, nil, &reason))
+			return peerHandshakeAck(m, false, nil, &reason), nil
 		}
 		if err := h.auth.Authorizer().Authorize(context.Background(), principal, auth.PeerSyncAction{Namespace: h.cfg.NamespaceID}); err != nil {
 			reason := err.Error()
-			return h.wire.Encode(peerHandshakeAck(m, false, nil, &reason))
+			return peerHandshakeAck(m, false, nil, &reason), nil
 		}
 		h.principal = principal
 		h.authenticated = true
+		h.peer = m.Request.NodeID
 		heads := map[string]string{h.cfg.NamespaceID: mustHeadHex(h.dag)}
-		return h.wire.Encode(peerHandshakeAck(m, true, heads, nil))
+		return peerHandshakeAck(m, true, heads, nil), nil
 	case wire.CommitFetchMessage:
+		if err := h.requireNamespace(m.Namespace); err != nil {
+			return nil, err
+		}
 		if err := h.authorizePeerSync(); err != nil {
 			return nil, err
 		}
-		commits, err := h.fetchCommits(m.SinceHash, m.MaxCommits)
+		commits, stubs, err := h.fetchCommits(m.SinceHash, m.Haves, m.MaxCommits)
 		if err != nil {
 			return nil, err
 		}
-		push := wire.CommitPushMessage{
+		return wire.CommitPushMessage{
 			H: wire.Header{
 				MessageType:     wire.MsgCommitPush,
 				ProtocolVersion: wire.KdbWireProtocolVersion,
@@ -175,140 +263,107 @@ func (h *frameHandler) handleFrame(frame []byte) ([]byte, error) {
 			},
 			Namespace: m.Namespace,
 			Commits:   commits,
-		}
-		return h.wire.Encode(push)
+			Stubs:     stubs,
+		}, nil
 	case wire.CommitPushMessage:
+		if err := h.requireNamespace(m.Namespace); err != nil {
+			return nil, err
+		}
 		if err := h.authorizePeerSync(); err != nil {
 			return nil, err
 		}
-		// putCommit always stores, regardless of what happens to "main" below (component 39
-		// spec §5: history must never be lost, only the branch-pointer decision is gated).
-		// Materialization into live document storage is deliberately DEFERRED until after the
-		// divergence decision below: ServerEngine/InMemoryStorageAdapter's CommitTree has no
-		// branch tracking (parentTreeHash is ignored - it always extends the one current tree,
-		// see storage/engine/server_engine.go), so materializing a pushed side branch immediately
-		// mutated the peer's visible documents even when the push was then rejected with a
-		// ConflictReport and the head never moved - a strict-policy peer served the pushed
-		// content while its own head still pointed at its own write (caught live by the e2e
-		// same-document conflict scenario).
-		applied := 0
-		var fresh []document.Commit
-		for _, commit := range m.Commits {
-			if h.dag.HasCommit(commit.Hash) {
-				continue
-			}
-			if err := h.dag.PutCommit(commit, true); err != nil {
-				return nil, err
-			}
-			// Fixes kdb-spec-layer13 §2.2: dag.PutCommit only mutates the in-memory DAG - without
-			// this, a commit received from a peer lived only in memory and vanished on restart of
-			// a file-backed node, even though the node re-fetching it from peers on next connect
-			// would eventually paper over it cluster-wide (this is about *this* node's local
-			// durability, not data loss overall).
-			if h.cfg.Persist != nil {
-				if err := h.cfg.Persist(commit); err != nil {
-					return nil, err
-				}
-			}
-			fresh = append(fresh, commit)
-			applied++
-		}
-		if len(m.Commits) > 0 {
-			incomingHead := m.Commits[len(m.Commits)-1].Hash
-			localHead, err := h.dag.Head()
-			if err != nil {
-				return nil, err
-			}
-			// Component 39-equivalent fix: an incoming push is not automatically "ahead" of
-			// main just because it was pushed - this host's own history may have diverged
-			// (e.g. local writes since the last sync). Same shared decision function as the
-			// client's PullMissing, not two independently maintained copies - that's exactly
-			// how the original blind dag.SetHead("main", ...) bug went unnoticed on one side
-			// while looking "fine" on the other.
-			outcome, err := ResolveDivergence(h.dag, h.storage, m.Namespace, localHead, incomingHead, ResolutionOptions{
-				Policy:   h.cfg.ConflictPolicy,
-				Resolver: h.cfg.ConflictResolver,
-			})
-			if err != nil {
-				return nil, err
-			}
-			// The auto-merge case (OutcomeMerged) creates a brand new commit (via
-			// AppendMergeCommit) that exists nowhere but this node - it needs the same
-			// persistence as any other newly-created commit, not just the commits that arrived
-			// over the wire above (kdb-spec-layer13 §2.2).
-			if outcome.MergeCommit != nil && h.cfg.Persist != nil {
-				if err := h.cfg.Persist(*outcome.MergeCommit); err != nil {
-					return nil, err
-				}
-			}
-			if outcome.Kind == OutcomeConflict {
-				reportBytes, err := json.Marshal(outcome.Report)
-				if err != nil {
-					return nil, err
-				}
-				return h.wire.Encode(wire.ConflictReportMessage{
-					H:           wire.Header{MessageType: wire.MsgConflictReport, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: m.H.CorrelationID},
-					Namespace:   m.Namespace,
-					ReportBytes: reportBytes,
-				})
-			}
-			// Deferred materialization (see the loop above): only now that the head decision is
-			// made do the pushed commits' operations reach live document storage.
-			// FastForwarded: the pushed branch IS the new head - apply its commits oldest-first.
-			// Merged: mergeNonConflicting already wrote every remote-touched document's winning
-			// final state into storage itself (the merge commit is self-contained), so applying
-			// the raw commits' intermediate states first is unnecessary - and, for a document
-			// the local side won, would be wrong (the remote raw commit's op is the LOSER and
-			// must not overwrite the winner). NoOp: incoming was already-known history; nothing
-			// to apply. Conflict returned above: live storage stays untouched, matching the
-			// unmoved head.
-			if outcome.Kind == OutcomeFastForwarded && h.cfg.MaterializeCommit != nil {
-				for _, commit := range fresh {
-					_ = h.cfg.MaterializeCommit(commit)
-				}
-			}
-		}
-		// CommitPush is a request/response pair, not fire-and-forget (component 23 spec §5): the
-		// client blocks on a correlated reply, so every non-conflicting outcome owes it one.
-		// Returning nil here instead left a clean push with no reply at all and hung the caller
-		// until its correlation wait expired.
+		return h.commitPush(m)
+	default:
+		return nil, &UnsupportedFrameError{Type: msg.Header().MessageType}
+	}
+}
+
+// commitPush stores a pushed page and, on the last page, decides the head - through Ingest, the
+// same function the client's pull uses, so push and pull cannot drift - under this node's write
+// serialization.
+func (h *frameHandler) commitPush(m wire.CommitPushMessage) (wire.Message, error) {
+	env := h.ingestEnv()
+	stored, err := StoreCommits(env, m.Commits, m.Stubs)
+	if err != nil {
+		return nil, fmt.Errorf("%w (%d of %d commits in this page were stored before it)", err, stored, len(m.Commits))
+	}
+	ack := func() (wire.Message, error) {
 		head, err := h.dag.Head()
 		if err != nil {
 			return nil, err
 		}
-		return h.wire.Encode(wire.CommitPushAckMessage{
+		return wire.CommitPushAckMessage{
 			H:              wire.Header{MessageType: wire.MsgCommitPushAck, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: m.H.CorrelationID},
 			Namespace:      m.Namespace,
-			AppliedCommits: applied,
+			AppliedCommits: stored,
 			HeadHex:        head.Hex(),
-		})
-	default:
-		return nil, nil
+		}, nil
+	}
+	if m.More || len(m.Commits) == 0 {
+		return ack()
+	}
+	result, err := Adopt(env, m.Commits[len(m.Commits)-1].Hash)
+	if err != nil {
+		return nil, err
+	}
+	if result.Outcome.Kind == OutcomeConflict {
+		reportBytes, err := json.Marshal(result.Outcome.Report)
+		if err != nil {
+			return nil, err
+		}
+		return wire.ConflictReportMessage{
+			H:           wire.Header{MessageType: wire.MsgConflictReport, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: m.H.CorrelationID},
+			Namespace:   m.Namespace,
+			ReportBytes: reportBytes,
+		}, nil
+	}
+	// CommitPush is a request/response pair, not fire-and-forget (component 23 spec §5): the
+	// client blocks on a correlated reply, so every non-conflicting outcome owes it one.
+	return ack()
+}
+
+func containsString(xs []string, x string) bool {
+	for _, s := range xs {
+		if s == x {
+			return true
+		}
+	}
+	return false
+}
+
+// ingestEnv describes this host's namespace to Ingest.
+func (h *frameHandler) ingestEnv() IngestEnv {
+	return IngestEnv{
+		DAG:            h.dag,
+		Storage:        h.storage,
+		NamespaceID:    h.cfg.NamespaceID,
+		Node:           h.cfg.Node,
+		Persist:        h.cfg.Persist,
+		PersistAsync:   h.cfg.PersistAsync,
+		ApplyToStorage: h.cfg.MaterializeCommit != nil || h.cfg.ApplyToStorage,
+		Resolution:     ResolutionOptions{Policy: h.cfg.ConflictPolicy, Resolver: h.cfg.ConflictResolver},
+		Conflicts:      h.cfg.Conflicts,
+		Peer:           h.peer,
 	}
 }
 
-func (h *frameHandler) fetchCommits(sinceHash *codec.Hash, maxCommits int) ([]document.Commit, error) {
+// fetchCommits pages what the fetcher lacks: commits reachable from this host's head and not
+// from sinceHash or any of haves, parents first (D1). The old walk went newest-first from the
+// head and cut at the cap, so a fetcher more than one page behind received the newest page -
+// whose oldest commit's parent it did not have - and could never catch up.
+func (h *frameHandler) fetchCommits(sinceHash *codec.Hash, haves []codec.Hash, maxCommits int) ([]document.Commit, []document.CommitStub, error) {
 	head, err := h.dag.Head()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if sinceHash != nil && *sinceHash == head {
-		return nil, nil
+	if maxCommits <= 0 {
+		maxCommits = DefaultPageCommits
 	}
-	// WalkWithOperations, not Walk: these commits are sent to a peer whole,
-	// and a commit whose operations the retention budget evicted would go
-	// out looking like it wrote nothing.
-	walked, err := h.dag.WalkWithOperations(head, sinceHash, maxCommits)
-	if err != nil {
-		return nil, err
+	known := append([]codec.Hash(nil), haves...)
+	if sinceHash != nil {
+		known = append(known, *sinceHash)
 	}
-	out := make([]document.Commit, 0, len(walked))
-	for i := len(walked) - 1; i >= 0; i-- {
-		if full, ok := walked[i].(dag.FullEntry); ok {
-			out = append(out, full.Commit)
-		}
-	}
-	return out, nil
+	return MissingCommits(h.dag, head, known, maxCommits)
 }
 
 func mustHeadHex(d *dag.InMemoryCommitDag) string {

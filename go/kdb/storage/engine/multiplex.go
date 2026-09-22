@@ -287,3 +287,16 @@ func (m *MultiplexAdapter) IngestDeltaSegment(segment storage.DeltaSegmentRef) e
 	}
 	return a.IngestDeltaSegment(segment)
 }
+
+// WalkTree implements storage.TreeWalker by routing to the namespace's engine.
+func (m *MultiplexAdapter) WalkTree(namespaceID string, treeHash codec.Hash, visit func(codec.UUID, codec.Hash) bool) error {
+	a, err := m.route(namespaceID)
+	if err != nil {
+		return err
+	}
+	w, ok := a.(storage.TreeWalker)
+	if !ok {
+		return fmt.Errorf("kdb: storage for namespace %q cannot walk trees", namespaceID)
+	}
+	return w.WalkTree(namespaceID, treeHash, visit)
+}

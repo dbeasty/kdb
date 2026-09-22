@@ -328,6 +328,26 @@ func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, 
 // applyCommitsTopologically can call it once a commit's parents are known
 // ready rather than only in file order.
 func applyReplayedCommit(d *dag.InMemoryCommitDag, store storage.Adapter, c document.Commit) error {
+	// A commit extends main only if main is one of its parents. Anything else in the log is a
+	// peer's commit that main reached through a merge (logged just before that merge), or one a
+	// crash cut off before its merge was logged: stored, so the history is whole, but neither
+	// applied to the live tree nor made the head. The merge that adopts it writes every document
+	// its parents disagree on, so applying the merge on top of whichever parent main is at builds
+	// the merged tree. Applying every commit in log order instead - what replay did before peer
+	// sync logged side commits - moved main onto a peer's branch whenever a crash separated the
+	// branch from its merge, orphaning local commits.
+	if head, err := d.Head(); err == nil && len(c.ParentHashes) > 0 {
+		extends := false
+		for _, p := range c.ParentHashes {
+			if p == head {
+				extends = true
+				break
+			}
+		}
+		if !extends {
+			return d.PutCommit(c, true)
+		}
+	}
 	for _, op := range c.Operations {
 		switch o := op.(type) {
 		case document.WriteOp:

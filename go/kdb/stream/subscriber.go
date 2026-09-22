@@ -104,7 +104,14 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 			Namespaces: []string{cfg.NamespaceID},
 			LocalHeads: localHeads,
 			ClientMode: wireMode,
+			User:       cfg.User,
+			Password:   cfg.Password,
+			Token:      cfg.Token,
 		},
+	}
+	if cfg.Filter != "" {
+		f := cfg.Filter
+		hs.Request.Filter = &f
 	}
 	go s.readLoop(conn)
 	frame, err := s.wire.Encode(hs)

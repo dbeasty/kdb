@@ -216,3 +216,15 @@ func (a *InMemoryStorageAdapter) WriteBlob(bytes []byte) (codec.Hash, error) {
 func (a *InMemoryStorageAdapter) IngestDeltaSegment(segment storage.DeltaSegmentRef) error {
 	return fmt.Errorf("memory adapter cannot ingest delta segment %s", segment.SegmentID.String())
 }
+
+// WalkTree implements storage.TreeWalker.
+func (a *InMemoryStorageAdapter) WalkTree(namespaceID string, treeHash codec.Hash, visit func(codec.UUID, codec.Hash) bool) error {
+	a.treesMu.Lock()
+	tree, ok := a.trees[treeHash]
+	a.treesMu.Unlock()
+	if !ok {
+		return fmt.Errorf("no tree %s in namespace %s", treeHash.Hex(), namespaceID)
+	}
+	tree.Walk(visit)
+	return nil
+}

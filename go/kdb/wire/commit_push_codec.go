@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 )
 
@@ -68,4 +69,64 @@ func DecodeCommits(bytes []byte) ([]document.Commit, error) {
 		o += ln
 	}
 	return result, nil
+}
+
+func hashesToHex(hs []codec.Hash) []string {
+	if len(hs) == 0 {
+		return nil
+	}
+	out := make([]string, len(hs))
+	for i, h := range hs {
+		out[i] = h.Hex()
+	}
+	return out
+}
+
+func hashesFromHex(hexes []string) ([]codec.Hash, error) {
+	if len(hexes) == 0 {
+		return nil, nil
+	}
+	out := make([]codec.Hash, len(hexes))
+	for i, s := range hexes {
+		h, err := codec.HashFromHex(s)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = h
+	}
+	return out, nil
+}
+
+func stubsToDto(stubs []document.CommitStub) []commitStubDto {
+	if len(stubs) == 0 {
+		return nil
+	}
+	out := make([]commitStubDto, len(stubs))
+	for i, s := range stubs {
+		out[i] = commitStubDto{
+			OriginalHashHex: s.OriginalHash.Hex(),
+			ArchiveLocation: s.ArchiveLocation,
+			StubbedAtMicros: s.StubbedAt.EpochMicros(),
+		}
+	}
+	return out
+}
+
+func stubsFromDto(dtos []commitStubDto) ([]document.CommitStub, error) {
+	if len(dtos) == 0 {
+		return nil, nil
+	}
+	out := make([]document.CommitStub, len(dtos))
+	for i, d := range dtos {
+		h, err := codec.HashFromHex(d.OriginalHashHex)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = document.CommitStub{
+			OriginalHash:    h,
+			ArchiveLocation: d.ArchiveLocation,
+			StubbedAt:       codec.TimestampFromEpochMicros(d.StubbedAtMicros),
+		}
+	}
+	return out, nil
 }

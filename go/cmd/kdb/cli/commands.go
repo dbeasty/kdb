@@ -26,6 +26,13 @@ func execute(cfg Config, cmd Command) int {
 	if _, ok := cmd.(UnlockCmd); ok {
 		return cmdUnlock(cfg)
 	}
+	// Neither needs a namespace open: one reads NODE, the other the conflict queue's directory.
+	switch c := cmd.(type) {
+	case NodeStatusCmd:
+		return cmdNodeStatus(cfg)
+	case ConflictsCmd:
+		return cmdConflicts(cfg, c)
+	}
 	rt, err := openRuntime(cfg, namespaceFor(cmd))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -67,6 +74,10 @@ func execute(cfg Config, cmd Command) int {
 		return cmdBranchCreate(cfg, rt, c)
 	case BranchCheckoutCmd:
 		return cmdBranchCheckout(cfg, rt, c)
+	case SyncCmd:
+		return cmdSync(cfg, rt, c)
+	case ResolveCmd:
+		return cmdResolve(cfg, rt, c)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unsupported command\n")
 		return 2
@@ -104,6 +115,10 @@ func namespaceFor(cmd Command) string {
 	case BranchCreateCmd:
 		return c.Namespace
 	case BranchCheckoutCmd:
+		return c.Namespace
+	case SyncCmd:
+		return c.Namespace
+	case ResolveCmd:
 		return c.Namespace
 	default:
 		return ""

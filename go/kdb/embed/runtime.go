@@ -3,6 +3,8 @@ package embed
 import (
 	"errors"
 	"log"
+	"sync/atomic"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -51,6 +53,12 @@ type EmbeddedKdbRuntime struct {
 	// window. Nil for a runtime with nothing to reclaim - a read-only or
 	// pure in-memory one. See Maintain.
 	maintain func() (TruncationResult, error)
+	// peerFloor, when set, is the oldest moment an active replication peer is known to be caught
+	// up to - see SetPeerRetentionFloor.
+	peerFloor atomic.Pointer[func() (time.Time, bool)]
+	// snapshot makes a snapshot bootstrap of this namespace durable; nil for a runtime with no
+	// data root, where there is nothing to make durable.
+	snapshot *snapshotSupport
 	// txn decides cross-namespace transactions for the host this runtime belongs to. nil for a
 	// runtime with no host (a pure in-memory one) - see TxnCoordinator.
 	txn *TxnCoordinator
@@ -206,4 +214,35 @@ func (r *EmbeddedKdbRuntime) Close() {
 		r.release()
 		r.release = nil
 	}
+}
+
+// SetPeerRetentionFloor makes history truncation keep every commit newer than floor() reports:
+// the oldest point an active replication peer is known to have caught up to. Without it a
+// history=none namespace deletes, on its own schedule, commits a peer that is merely behind has
+// not received yet - and that peer can then only catch up by snapshot. floor reporting false
+// means no active peer constrains retention.
+func (r *EmbeddedKdbRuntime) SetPeerRetentionFloor(floor func() (time.Time, bool)) {
+	r.peerFloor.Store(&floor)
+}
+
+// withPeerFloor widens window so it keeps everything since the peer floor, if one is set. The
+// window is a floor on retention, so widening it is always safe; it never narrows.
+func (r *EmbeddedKdbRuntime) withPeerFloor(window storage.RetentionWindow, now time.Time) storage.RetentionWindow {
+	p := r.peerFloor.Load()
+	if p == nil {
+		return window
+	}
+	since, ok := (*p)()
+	if !ok {
+		return window
+	}
+	keep := now.Sub(since)
+	if keep <= 0 {
+		return window
+	}
+	w := window.Resolve()
+	if w.Duration < keep {
+		w.Duration = keep
+	}
+	return w
 }

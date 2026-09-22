@@ -517,6 +517,19 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgRevertResult, "REVERT_RESULT"},
 		{wire.MsgTxCommitMulti, "TX_COMMIT_MULTI"},
 		{wire.MsgTxCommitMultiResult, "TX_COMMIT_MULTI_RESULT"},
+		{wire.MsgPeerError, "PEER_ERROR"},
+		{wire.MsgSyncHello, "SYNC_HELLO"},
+		{wire.MsgSyncHelloAck, "SYNC_HELLO_ACK"},
+		{wire.MsgRefsRequest, "REFS_REQUEST"},
+		{wire.MsgRefsResult, "REFS_RESULT"},
+		{wire.MsgFetchRequest, "FETCH_REQUEST"},
+		{wire.MsgPackPage, "PACK_PAGE"},
+		{wire.MsgRefUpdate, "REF_UPDATE"},
+		{wire.MsgRefUpdateAck, "REF_UPDATE_ACK"},
+		{wire.MsgSnapshotFetch, "SNAPSHOT_FETCH"},
+		{wire.MsgSnapshotPage, "SNAPSHOT_PAGE"},
+		{wire.MsgProjectFetch, "PROJECT_FETCH"},
+		{wire.MsgProjectPage, "PROJECT_PAGE"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -533,14 +546,17 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 	if _, ok := wire.MessageTypeFromCode(0x00); ok {
 		t.Error("code 0x00 should not be a known message type")
 	}
-	// 0x23-0x24 are the cross-namespace commit messages; 0x25 is the next free code.
-	if _, ok := wire.MessageTypeFromCode(0x25); ok {
-		t.Error("code 0x25 is unassigned and should not be recognized")
+	// 0x25 is the peer-sync error reply; nextFreeMessageCode is the next free code.
+	if _, ok := wire.MessageTypeFromCode(nextFreeMessageCode); ok {
+		t.Errorf("code %#x is unassigned and should not be recognized", nextFreeMessageCode)
 	}
-	if wire.MessageType(0x25).String() != "UNKNOWN" {
-		t.Errorf("unassigned type names itself %q", wire.MessageType(0x25).String())
+	if wire.MessageType(nextFreeMessageCode).String() != "UNKNOWN" {
+		t.Errorf("unassigned type names itself %q", wire.MessageType(nextFreeMessageCode).String())
 	}
 }
+
+// nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
+const nextFreeMessageCode = 0x34
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{
@@ -741,5 +757,24 @@ func TestRoundTripTxCommitMulti(t *testing.T) {
 		back.FailedNamespace != "bank/ledger" || string(back.ConflictReport) != `{"transactionId":"t"}` ||
 		back.Error == nil || *back.ErrorCode != code || *back.RetryAfterMs != 12 {
 		t.Fatalf("round trip: %+v", back)
+	}
+}
+
+func TestRoundTripProjectWrite(t *testing.T) {
+	msg := wire.ProjectWriteMessage{
+		H: wire.Header{MessageType: wire.MsgProjectWrite, CorrelationID: 9}, Namespace: "app/data", TxID: "tx-1",
+		Docs: []wire.WriteBackDoc{{DocID: "a", Body: `{"x":1}`, BaseHash: "ab"}, {DocID: "b", Deleted: true}},
+	}
+	back := roundTrip(t, msg).(wire.ProjectWriteMessage)
+	if back.TxID != "tx-1" || len(back.Docs) != 2 || back.Docs[0] != msg.Docs[0] || back.Docs[1] != msg.Docs[1] {
+		t.Fatalf("round trip changed the message: %+v", back)
+	}
+	res := wire.ProjectWriteResultMessage{
+		H: wire.Header{MessageType: wire.MsgProjectWriteResult, CorrelationID: 9}, Namespace: "app/data",
+		Outcome: wire.WriteBackConflict, Reason: "changed", Current: []wire.WriteBackCurrent{{DocID: "a", Body: `{"x":2}`}, {DocID: "b", Absent: true}},
+	}
+	rb := roundTrip(t, res).(wire.ProjectWriteResultMessage)
+	if rb.Outcome != wire.WriteBackConflict || len(rb.Current) != 2 || rb.Current[1] != res.Current[1] {
+		t.Fatalf("round trip changed the result: %+v", rb)
 	}
 }

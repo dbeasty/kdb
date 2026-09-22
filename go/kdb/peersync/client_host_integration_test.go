@@ -85,8 +85,8 @@ func TestPullMissingDoesNotBlindlyMoveHeadOnDivergence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected head to be a real commit in the local dag: %v", err)
 	}
-	if len(merged.ParentHashes) != 2 || merged.ParentHashes[0] != localCommit.Hash || merged.ParentHashes[1] != remoteCommit.Hash {
-		t.Fatalf("expected a two-parent auto-merge commit [local, remote], got parents %v", merged.ParentHashes)
+	if !isMergeOf(merged, localCommit.Hash, remoteCommit.Hash) {
+		t.Fatalf("expected a two-parent auto-merge of local and remote in hash order, got parents %v", merged.ParentHashes)
 	}
 	if !localDag.HasCommit(remoteCommit.Hash) {
 		t.Fatal("remote's commit must still be stored even though main didn't move directly onto it")
@@ -369,8 +369,8 @@ func TestHostCommitPushAutoMergesDisjointWritesAndAcks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected head to be a real merge commit: %v", err)
 	}
-	if len(merged.ParentHashes) != 2 || merged.ParentHashes[0] != hostCommit.Hash || merged.ParentHashes[1] != incomingCommit.Hash {
-		t.Fatalf("expected a two-parent auto-merge [host, incoming], got %v", merged.ParentHashes)
+	if !isMergeOf(merged, hostCommit.Hash, incomingCommit.Hash) {
+		t.Fatalf("expected a two-parent auto-merge of host and incoming in hash order, got %v", merged.ParentHashes)
 	}
 }
 
@@ -594,9 +594,9 @@ func TestPullMissingMaterializesFetchedCommitIntoLocalStorage(t *testing.T) {
 	if result.FinalHead != remoteCommit.Hash {
 		t.Fatalf("expected local head to fast-forward to %s, got %s", remoteCommit.Hash.Hex(), result.FinalHead.Hex())
 	}
-	if materializedCalls != 1 {
-		t.Fatalf("expected MaterializeCommit called exactly once, got %d", materializedCalls)
-	}
+	// The callback itself is no longer invoked: setting it asks Ingest to apply the fetch's net
+	// effect to storage in one verified step. What matters is that the document is visible.
+	_ = materializedCalls
 
 	doc, err := localStorage.GetDocument(ns, docID, remoteCommit.DocumentTreeHash)
 	if err != nil {

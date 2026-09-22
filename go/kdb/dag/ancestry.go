@@ -141,6 +141,27 @@ func (d *InMemoryCommitDag) AncestorSet(hash codec.Hash) map[codec.Hash]struct{}
 	return d.ancestorClosureLocked(hash)
 }
 
+// AncestorSetOf is AncestorSet for several starting points, in a single walk. A hash this DAG
+// does not know contributes only itself. Peer sync uses it to exclude everything a fetcher
+// already has - its head and a spread of its ancestors - in one pass rather than one closure per
+// hash.
+func (d *InMemoryCommitDag) AncestorSetOf(hashes []codec.Hash) map[codec.Hash]struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	acc := make(map[codec.Hash]struct{})
+	queue := append([]codec.Hash(nil), hashes...)
+	for len(queue) > 0 {
+		h := queue[0]
+		queue = queue[1:]
+		if _, ok := acc[h]; ok {
+			continue
+		}
+		acc[h] = struct{}{}
+		queue = append(queue, d.expandParentsLocked(h)...)
+	}
+	return acc
+}
+
 // AppendMergeCommit appends a merge commit with two parents, advancing the default branch to it
 // only if the branch is still at primaryParent - the same compare-and-swap AppendCommit performs,
 // and for the same reason: a merge is planned against a head that is read well before this call
@@ -184,6 +205,9 @@ func (d *InMemoryCommitDag) AppendMergeCommitOnto(
 
 func (d *InMemoryCommitDag) expandParentsLocked(hash codec.Hash) []codec.Hash {
 	if _, ok := d.stubs[hash]; ok {
+		return nil
+	}
+	if _, ok := d.shallow[hash]; ok {
 		return nil
 	}
 	c, ok := d.commitLocked(hash)

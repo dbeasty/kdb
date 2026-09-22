@@ -3,6 +3,7 @@ package transaction
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -189,6 +190,77 @@ func (r *UniqueKeyRegistry) Rebuild(
 	r.owners = fresh
 	r.mu.Unlock()
 	return nil
+}
+
+// RebuildLenient is Rebuild for state this node did not choose: documents replicated from a
+// peer, which accepted them under its own registry. Two nodes can each hand the same value to a
+// different document while disconnected, and refusing the replicated history would leave the
+// two unable to ever converge - so instead of failing on a duplicate, every contested key is
+// owned by its lowest document id (the same answer on every node) and each contest is returned
+// for the caller to surface. An unreadable document still fails the rebuild and leaves the
+// registry as it was.
+func (r *UniqueKeyRegistry) RebuildLenient(
+	namespaceID string,
+	store storage.Adapter,
+	treeHash codec.Hash,
+	sch schema.KdbSchema,
+) ([]UniqueConstraintError, error) {
+	if r == nil {
+		return nil, nil
+	}
+	fresh := make(map[UniqueKey]codec.UUID)
+	if !sch.HasUniqueConstraints() {
+		r.mu.Lock()
+		r.owners = fresh
+		r.mu.Unlock()
+		return nil, nil
+	}
+	contested := map[UniqueKey]map[codec.UUID]struct{}{}
+	err := store.ScanDocuments(namespaceID, treeHash, 256, func(batch []document.Document) error {
+		for _, doc := range batch {
+			keys, err := UniqueKeysFor(namespaceID, sch, doc)
+			if err != nil {
+				return fmt.Errorf("kdb unique: document %s: %w", doc.ID, err)
+			}
+			for _, key := range keys {
+				owner, dup := fresh[key]
+				if !dup || owner == doc.ID {
+					fresh[key] = doc.ID
+					continue
+				}
+				if contested[key] == nil {
+					contested[key] = map[codec.UUID]struct{}{owner: {}}
+				}
+				contested[key][doc.ID] = struct{}{}
+				if doc.ID.String() < owner.String() {
+					fresh[key] = doc.ID
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []UniqueConstraintError
+	for key, docs := range contested {
+		owner := fresh[key]
+		for id := range docs {
+			if id != owner {
+				out = append(out, UniqueConstraintError{Key: key, OwnerDocID: owner, DocID: id})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key.String() != out[j].Key.String() {
+			return out[i].Key.String() < out[j].Key.String()
+		}
+		return out[i].DocID.String() < out[j].DocID.String()
+	})
+	r.mu.Lock()
+	r.owners = fresh
+	r.mu.Unlock()
+	return out, nil
 }
 
 // UniqueConstraintError reports two documents claiming one unique value tuple. It names the

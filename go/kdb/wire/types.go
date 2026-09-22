@@ -89,6 +89,25 @@ const (
 	MsgTxCommitMulti       MessageType = 0x23
 	MsgTxCommitMultiResult MessageType = 0x24
 
+	// Peer-sync error reply (see PeerErrorMessage). Go-only, like 0x14-0x24.
+	MsgPeerError MessageType = 0x25
+
+	// Peer sync protocol v2 (see sync_v2_ops.go). Go-only, like 0x14-0x25.
+	MsgSyncHello          MessageType = 0x26
+	MsgSyncHelloAck       MessageType = 0x27
+	MsgRefsRequest        MessageType = 0x28
+	MsgRefsResult         MessageType = 0x29
+	MsgFetchRequest       MessageType = 0x2A
+	MsgPackPage           MessageType = 0x2B
+	MsgRefUpdate          MessageType = 0x2C
+	MsgRefUpdateAck       MessageType = 0x2D
+	MsgSnapshotFetch      MessageType = 0x2E
+	MsgSnapshotPage       MessageType = 0x2F
+	MsgProjectFetch       MessageType = 0x30
+	MsgProjectPage        MessageType = 0x31
+	MsgProjectWrite       MessageType = 0x32
+	MsgProjectWriteResult MessageType = 0x33
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -168,6 +187,36 @@ func (t MessageType) String() string {
 		return "TX_COMMIT_MULTI"
 	case MsgTxCommitMultiResult:
 		return "TX_COMMIT_MULTI_RESULT"
+	case MsgPeerError:
+		return "PEER_ERROR"
+	case MsgSyncHello:
+		return "SYNC_HELLO"
+	case MsgSyncHelloAck:
+		return "SYNC_HELLO_ACK"
+	case MsgRefsRequest:
+		return "REFS_REQUEST"
+	case MsgRefsResult:
+		return "REFS_RESULT"
+	case MsgFetchRequest:
+		return "FETCH_REQUEST"
+	case MsgPackPage:
+		return "PACK_PAGE"
+	case MsgRefUpdate:
+		return "REF_UPDATE"
+	case MsgRefUpdateAck:
+		return "REF_UPDATE_ACK"
+	case MsgSnapshotFetch:
+		return "SNAPSHOT_FETCH"
+	case MsgSnapshotPage:
+		return "SNAPSHOT_PAGE"
+	case MsgProjectFetch:
+		return "PROJECT_FETCH"
+	case MsgProjectPage:
+		return "PROJECT_PAGE"
+	case MsgProjectWrite:
+		return "PROJECT_WRITE"
+	case MsgProjectWriteResult:
+		return "PROJECT_WRITE_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -247,6 +296,36 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgTxCommitMulti, true
 	case 0x24:
 		return MsgTxCommitMultiResult, true
+	case 0x25:
+		return MsgPeerError, true
+	case 0x26:
+		return MsgSyncHello, true
+	case 0x27:
+		return MsgSyncHelloAck, true
+	case 0x28:
+		return MsgRefsRequest, true
+	case 0x29:
+		return MsgRefsResult, true
+	case 0x2A:
+		return MsgFetchRequest, true
+	case 0x2B:
+		return MsgPackPage, true
+	case 0x2C:
+		return MsgRefUpdate, true
+	case 0x2D:
+		return MsgRefUpdateAck, true
+	case 0x2E:
+		return MsgSnapshotFetch, true
+	case 0x2F:
+		return MsgSnapshotPage, true
+	case 0x30:
+		return MsgProjectFetch, true
+	case 0x31:
+		return MsgProjectPage, true
+	case 0x32:
+		return MsgProjectWrite, true
+	case 0x33:
+		return MsgProjectWriteResult, true
 	default:
 		return 0, false
 	}
@@ -337,6 +416,10 @@ type HandshakePayload struct {
 	User     *string
 	Password *string
 	Token    *string
+	// Filter, on a stream handshake, subscribes to only the documents matching this KDB-SQL
+	// condition. Nil is every document. Omitted from the frame when nil, so older peers see the
+	// handshake they always did.
+	Filter *string
 }
 
 type HandshakeAckPayload struct {
@@ -403,6 +486,10 @@ type CommitFetchMessage struct {
 	Namespace  string
 	SinceHash  *codec.Hash
 	MaxCommits int
+	// Haves are further commits the fetcher already holds (Go-only, additive). The host sends
+	// nothing reachable from SinceHash or from any Have it recognizes - which is what keeps a
+	// fetcher whose head the host has never seen (it diverged) from being sent all of history.
+	Haves []codec.Hash
 }
 
 func (m CommitFetchMessage) Header() Header { return m.H }
@@ -411,7 +498,27 @@ type CommitPushMessage struct {
 	H         Header
 	Namespace string
 	Commits   []document.Commit
+	// Stubs name archived commits the sender cannot send whole but whose children it is sending
+	// (Go-only, additive). The receiver records them so those children's parents resolve.
+	Stubs []document.CommitStub
+	// More marks a page of a multi-page push (Go-only, additive): the receiver stores these
+	// commits but decides nothing until the page without More arrives. Deciding on a partial
+	// push would merge half of a divergent branch, then merge again for every later page.
+	More bool
 }
+
+// PeerErrorMessage is the peer-sync reply to a frame the host could not serve: an unknown
+// message type, an authorization failure, a namespace mismatch, or an ingest error. Go-only.
+// Before it existed every such case either went unanswered, leaving the caller to wait out its
+// correlation timeout, or dropped the connection with no reason given.
+type PeerErrorMessage struct {
+	H         Header
+	Namespace string
+	Code      ErrorCode
+	Message   string
+}
+
+func (m PeerErrorMessage) Header() Header { return m.H }
 
 func (m CommitPushMessage) Header() Header { return m.H }
 

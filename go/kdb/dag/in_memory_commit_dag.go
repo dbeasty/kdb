@@ -91,6 +91,9 @@ type InMemoryCommitDag struct {
 	// CommitForTree for why it is not maintained from the start.
 	treeIndex map[codec.Hash]codec.Hash
 	stubs     map[codec.Hash]document.CommitStub
+	// shallow holds commits admitted without their parents - the root of a history installed
+	// from a peer's snapshot. Traversal treats their parents as absent, exactly like a stub's.
+	shallow map[codec.Hash]struct{}
 	// trees is this DAG's own tree store, used only when no external one
 	// has been installed - see SetTreeStore. In the assembled engine there
 	// is always an external one and this map stays empty.
@@ -223,6 +226,7 @@ func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 		NamespaceID: namespaceID,
 		nodes:       make(map[codec.Hash]commitNode),
 		stubs:       make(map[codec.Hash]document.CommitStub),
+		shallow:     make(map[codec.Hash]struct{}),
 		trees:       make(map[codec.Hash]document.DocumentTree),
 		branches:    make(map[string]document.Branch),
 		tags:        make(map[string]document.Tag),
@@ -439,6 +443,113 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	return stub, nil
 }
 
+// PutShallowCommit admits c without its parents: the root of a history this node received as a
+// snapshot rather than commit by commit. The hash is verified - c is exactly what its peer
+// signed - but its parents are never required, and every traversal stops at it as it would at a
+// stub. Admitting a commit that is already resident changes nothing.
+func (d *InMemoryCommitDag) PutShallowCommit(c document.Commit) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.isResidentLocked(c.Hash) {
+		return nil
+	}
+	if err := d.putCommitLocked(c, false, true); err != nil {
+		return err
+	}
+	d.shallow[c.Hash] = struct{}{}
+	d.ancestryVersion++
+	return nil
+}
+
+// MarkShallow records that a resident commit is a shallow root - how a reopened namespace that
+// was bootstrapped from a snapshot gets its roots back, since the checkpoint that restores the
+// commit does not say which commits were admitted without parents on purpose.
+func (d *InMemoryCommitDag) MarkShallow(hash codec.Hash) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.isResidentLocked(hash) {
+		return
+	}
+	d.shallow[hash] = struct{}{}
+	d.ancestryVersion++
+}
+
+// CommitCount is how many commits this DAG holds, stubs included.
+func (d *InMemoryCommitDag) CommitCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.nodes) + len(d.stubs)
+}
+
+// IsShallow reports whether hash is a shallow root.
+func (d *InMemoryCommitDag) IsShallow(hash codec.Hash) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	_, ok := d.shallow[hash]
+	return ok
+}
+
+// ShallowRoots lists every shallow root.
+func (d *InMemoryCommitDag) ShallowRoots() []codec.Hash {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]codec.Hash, 0, len(d.shallow))
+	for h := range d.shallow {
+		out = append(out, h)
+	}
+	return out
+}
+
+// Horizon lists the oldest commits this DAG can send whole: shallow roots, and resident commits
+// with a parent that is neither resident nor stubbed - what retention leaves at its floor. A peer
+// whose history ends below the horizon cannot catch up commit by commit and needs a snapshot.
+func (d *InMemoryCommitDag) Horizon() []codec.Hash {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	seen := map[codec.Hash]struct{}{}
+	for h := range d.shallow {
+		seen[h] = struct{}{}
+	}
+	for h := range d.nodes {
+		c, ok := d.commitLocked(h)
+		if !ok {
+			continue
+		}
+		for _, p := range c.ParentHashes {
+			if _, resident := d.nodes[p]; resident {
+				continue
+			}
+			if _, stubbed := d.stubs[p]; stubbed {
+				continue
+			}
+			seen[h] = struct{}{}
+			break
+		}
+	}
+	out := make([]codec.Hash, 0, len(seen))
+	for h := range seen {
+		out = append(out, h)
+	}
+	return out
+}
+
+// PutStub records an archived commit this DAG never held: a peer can name it (its children are
+// being sent) but not send it. The stub satisfies those children's parent check exactly as a
+// locally archived commit does, and walks stop at it. A no-op when the commit is resident or
+// already stubbed - a real commit is never downgraded to a stub by a peer's say-so.
+func (d *InMemoryCommitDag) PutStub(stub document.CommitStub) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.isResidentLocked(stub.OriginalHash) {
+		return
+	}
+	if _, ok := d.stubs[stub.OriginalHash]; ok {
+		return
+	}
+	d.stubs[stub.OriginalHash] = stub
+	d.ancestryVersion++
+}
+
 func (d *InMemoryCommitDag) GetDocumentTree(treeHash codec.Hash) (document.DocumentTree, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -605,6 +716,9 @@ func (d *InMemoryCommitDag) Walk(from codec.Hash, until *codec.Hash, limit int) 
 			continue
 		}
 		out = append(out, FullEntry{Commit: c})
+		if _, root := d.shallow[h]; root {
+			continue
+		}
 		for _, p := range c.ParentHashes {
 			enqueue(p)
 		}
@@ -753,7 +867,7 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	}
 	d.putTreeLocked(newDocumentTree)
 	commit, err := document.BuildCommit(
-		parents, d.NamespaceID, tx.ID, tx.Timestamp, tx.AuthorNodeID,
+		parents, d.NamespaceID, tx.ID, d.causalTimestampLocked(tx.Timestamp, parents), tx.AuthorNodeID,
 		tx.Operations, newDocumentTree.TreeHash, schemaHash, message,
 	)
 	if err != nil {
@@ -776,6 +890,27 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 	// this core - AppendCommit, AppendCommitDetached and AppendMergeCommitOnto.
 	d.publishHeadLocked()
 	return commit, nil
+}
+
+// causalTimestampLocked returns ts, raised if needed to one microsecond past the latest of
+// parents' timestamps. Every commit is then strictly later than everything it descends from,
+// whatever the clock of the node that made it said - the one property of a hybrid logical clock
+// that last-write-wins actually needs: a write made after reading another write always counts as
+// later, even on a node whose clock runs behind. The parents carry the "max seen" a separate HLC
+// would have to track, so there is nothing else to keep.
+func (d *InMemoryCommitDag) causalTimestampLocked(ts codec.Timestamp, parents []codec.Hash) codec.Timestamp {
+	micros := ts.EpochMicros()
+	for _, p := range parents {
+		if c, ok := d.commitLocked(p); ok {
+			if pm := c.Timestamp.EpochMicros(); pm >= micros {
+				micros = pm + 1
+			}
+		}
+	}
+	if micros == ts.EpochMicros() {
+		return ts
+	}
+	return codec.TimestampFromEpochMicros(micros)
 }
 
 func (d *InMemoryCommitDag) Squash(

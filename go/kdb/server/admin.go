@@ -40,6 +40,39 @@ type AdminServer struct {
 	// notReadyReason explains a 503 from /readyz ("starting" before SetReady(true),
 	// "draining" once shutdown begins) - stored, not derived, so the handler stays lock-free.
 	notReadyReason atomic.Value // string
+	// extraMetrics lets the service append families this package cannot see, such as the
+	// replicator's per-peer state. See SetExtraMetrics.
+	extraMetrics atomic.Pointer[func(*strings.Builder)]
+}
+
+// SetExtraMetrics appends fn's output to every /metrics response.
+func (a *AdminServer) SetExtraMetrics(fn func(*strings.Builder)) { a.extraMetrics.Store(&fn) }
+
+// writeReplicationMetrics exposes each namespace's open replication conflicts.
+func (a *AdminServer) writeReplicationMetrics(b *strings.Builder) {
+	if a.runtime == nil {
+		return
+	}
+	b.WriteString("# HELP kdb_conflicts_open Replication conflicts awaiting resolution, per namespace and kind.\n")
+	b.WriteString("# TYPE kdb_conflicts_open gauge\n")
+	for ns, rt := range a.runtime.namespaceSet().Runtimes() {
+		counts := map[string]int{}
+		for _, e := range rt.Conflicts.List() {
+			counts[string(e.Kind)]++
+		}
+		if len(counts) == 0 {
+			fmt.Fprintf(b, "kdb_conflicts_open{namespace=%q,kind=\"divergence\"} 0\n", ns)
+			continue
+		}
+		kinds := make([]string, 0, len(counts))
+		for k := range counts {
+			kinds = append(kinds, k)
+		}
+		sort.Strings(kinds)
+		for _, k := range kinds {
+			fmt.Fprintf(b, "kdb_conflicts_open{namespace=%q,kind=%q} %d\n", ns, k, counts[k])
+		}
+	}
 }
 
 // NewAdminServer binds addr (host:port; port 0 for ephemeral) and starts serving immediately.
@@ -92,6 +125,9 @@ func (a *AdminServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	b := version.Get()
 	fmt.Fprintf(w, "ok\nversion=%s\ncommit=%s\ncommit_dirty=%t\nbuild_date=%s\n",
 		b.Version, b.Commit, b.Dirty, b.BuildDate)
+	if a.runtime != nil {
+		fmt.Fprintf(w, "node_id=%s\n", a.runtime.NodeID)
+	}
 }
 
 func (a *AdminServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
@@ -166,6 +202,10 @@ func (a *AdminServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 
 	a.writeGovernanceMetrics(&b)
 
+	a.writeReplicationMetrics(&b)
+	if fn := a.extraMetrics.Load(); fn != nil {
+		(*fn)(&b)
+	}
 	_, _ = w.Write([]byte(b.String()))
 }
 

@@ -59,6 +59,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				User:                      m.Request.User,
 				Password:                  m.Request.Password,
 				Token:                     m.Request.Token,
+				Filter:                    m.Request.Filter,
 			},
 		}, nil
 	case HandshakeAckMessage:
@@ -105,7 +106,13 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				Namespace:    m.Namespace,
 				SinceHashHex: since,
 				MaxCommits:   m.MaxCommits,
+				HaveHexes:    hashesToHex(m.Haves),
 			},
+		}, nil
+	case PeerErrorMessage:
+		return payloadEnvelope{
+			Kind:      "peerError",
+			PeerError: &peerErrorDto{Namespace: m.Namespace, Code: m.Code, Message: m.Message},
 		}, nil
 	case CommitPushMessage:
 		payload, err := EncodeCommits(m.Commits)
@@ -117,6 +124,8 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 			CommitPush: &commitPushDto{
 				Namespace:      m.Namespace,
 				CommitsPayload: payload,
+				Stubs:          stubsToDto(m.Stubs),
+				More:           m.More,
 			},
 		}, nil
 	case CommitPushAckMessage:
@@ -296,6 +305,15 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 		if env, ok, err := encodeMultiCommitMessage(msg); ok || err != nil {
 			return env, err
 		}
+		if env, ok, err := encodeSyncV2Message(msg); ok || err != nil {
+			return env, err
+		}
+		if env, ok, err := encodeSnapshotV2Message(msg); ok || err != nil {
+			return env, err
+		}
+		if env, ok, err := encodeProjectionMessage(msg); ok || err != nil {
+			return env, err
+		}
 		return payloadEnvelope{}, fmt.Errorf("unsupported message type")
 	}
 }
@@ -329,6 +347,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 				User:               h.User,
 				Password:           h.Password,
 				Token:              h.Token,
+				Filter:             h.Filter,
 			},
 		}, nil
 	case "handshakeAck":
@@ -400,7 +419,17 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			}
 			since = &h
 		}
-		return CommitFetchMessage{H: header, Namespace: c.Namespace, SinceHash: since, MaxCommits: c.MaxCommits}, nil
+		haves, err := hashesFromHex(c.HaveHexes)
+		if err != nil {
+			return nil, err
+		}
+		return CommitFetchMessage{H: header, Namespace: c.Namespace, SinceHash: since, MaxCommits: c.MaxCommits, Haves: haves}, nil
+	case "peerError":
+		e := env.PeerError
+		if e == nil {
+			return nil, newDecodeError("missing peerError body")
+		}
+		return PeerErrorMessage{H: header, Namespace: e.Namespace, Code: e.Code, Message: e.Message}, nil
 	case "commitPush":
 		c := env.CommitPush
 		if c == nil {
@@ -410,7 +439,11 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 		if err != nil {
 			return nil, err
 		}
-		return CommitPushMessage{H: header, Namespace: c.Namespace, Commits: commits}, nil
+		stubs, err := stubsFromDto(c.Stubs)
+		if err != nil {
+			return nil, err
+		}
+		return CommitPushMessage{H: header, Namespace: c.Namespace, Commits: commits, Stubs: stubs, More: c.More}, nil
 	case "commitPushAck":
 		a := env.CommitPushAck
 		if a == nil {
@@ -598,6 +631,15 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			return msg, err
 		}
 		if msg, ok, err := decodeMultiCommitMessage(header, env); ok || err != nil {
+			return msg, err
+		}
+		if msg, ok, err := decodeSyncV2Message(header, env); ok || err != nil {
+			return msg, err
+		}
+		if msg, ok, err := decodeSnapshotV2Message(header, env); ok || err != nil {
+			return msg, err
+		}
+		if msg, ok, err := decodeProjectionMessage(header, env); ok || err != nil {
 			return msg, err
 		}
 		return nil, newDecodeError("unknown payload kind: " + env.Kind)

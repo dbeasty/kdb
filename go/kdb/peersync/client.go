@@ -2,6 +2,7 @@ package peersync
 
 import (
 	"encoding/json"
+	"math"
 	"sync"
 	"time"
 
@@ -115,8 +116,9 @@ func (c *defaultClient) Connect(config ClientConfig) (Session, error) {
 	}
 	return &defaultSession{
 		client: c, dag: c.dag, storage: c.storage, namespaceID: config.NamespaceID, remoteHead: remoteHead, conn: conn,
-		materialize: config.MaterializeCommit, persist: config.Persist,
+		materialize: config.MaterializeCommit, persist: config.Persist, persistAsync: config.PersistAsync,
 		conflictPolicy: config.ConflictPolicy, conflictResolver: config.ConflictResolver,
+		node: config.Node, applyToStorage: config.ApplyToStorage, pageSize: config.PageCommits,
 	}, nil
 }
 
@@ -155,6 +157,9 @@ func (c *defaultClient) request(conn stream.ConnectionHandle, message wire.Messa
 				return nil, err
 			}
 			if decoded.Header().CorrelationID == cid {
+				if pe, ok := decoded.(wire.PeerErrorMessage); ok {
+					return nil, &RemoteError{Code: pe.Code, Message: pe.Message}
+				}
 				return decoded, nil
 			}
 		}
@@ -163,7 +168,7 @@ func (c *defaultClient) request(conn stream.ConnectionHandle, message wire.Messa
 	return nil, NewError("no response for correlation", nil)
 }
 
-func (c *defaultClient) fetchRemote(conn stream.ConnectionHandle, namespaceID string, sinceHash *codec.Hash, maxCommits int) ([]document.Commit, error) {
+func (c *defaultClient) fetchRemote(conn stream.ConnectionHandle, namespaceID string, sinceHash *codec.Hash, haves []codec.Hash, maxCommits int) ([]document.Commit, []document.CommitStub, error) {
 	fetch := wire.CommitFetchMessage{
 		H: wire.Header{
 			MessageType:     wire.MsgCommitFetch,
@@ -173,19 +178,24 @@ func (c *defaultClient) fetchRemote(conn stream.ConnectionHandle, namespaceID st
 		Namespace:  namespaceID,
 		SinceHash:  sinceHash,
 		MaxCommits: maxCommits,
+		Haves:      haves,
 	}
 	resp, err := c.request(conn, fetch)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	push, ok := resp.(wire.CommitPushMessage)
 	if !ok {
-		return nil, NewError("expected CommitPush response to CommitFetch", nil)
+		return nil, nil, NewError("expected CommitPush response to CommitFetch", nil)
 	}
-	return push.Commits, nil
+	return push.Commits, push.Stubs, nil
 }
 
 func (c *defaultClient) pushToRemote(conn stream.ConnectionHandle, namespaceID string, commits []document.Commit) (int, error) {
+	return c.pushPage(conn, namespaceID, commits, nil, false)
+}
+
+func (c *defaultClient) pushPage(conn stream.ConnectionHandle, namespaceID string, commits []document.Commit, stubs []document.CommitStub, more bool) (int, error) {
 	if len(commits) == 0 {
 		return 0, nil
 	}
@@ -197,6 +207,8 @@ func (c *defaultClient) pushToRemote(conn stream.ConnectionHandle, namespaceID s
 		},
 		Namespace: namespaceID,
 		Commits:   commits,
+		Stubs:     stubs,
+		More:      more,
 	}
 	resp, err := c.request(conn, push)
 	if err != nil {
@@ -234,10 +246,14 @@ type defaultSession struct {
 	// persist durably logs a commit pulled from a peer - see ClientConfig.Persist's doc
 	// comment. May be nil (peer sync then has no local durability of its own, matching the
 	// behavior before this field existed).
-	persist func(document.Commit) error
+	persist      func(document.Commit) error
+	persistAsync func(document.Commit) (func() error, error)
 	// conflictPolicy/conflictResolver - see ClientConfig's doc comment.
 	conflictPolicy   transaction.ConflictPolicy
 	conflictResolver transaction.ConflictResolver
+	node             LocalNode
+	applyToStorage   bool
+	pageSize         int
 }
 
 func (s *defaultSession) NamespaceID() string    { return s.namespaceID }
@@ -252,80 +268,115 @@ func (s *defaultSession) PullMissing() (Result, error) {
 		plan, _ := ComputeSyncPlan(s.dag, localHead, s.remoteHead)
 		return Result{FinalHead: localHead, Plan: plan}, nil
 	}
-	fetched, err := s.client.fetchRemote(s.conn, s.namespaceID, &localHead, 100)
-	if err != nil {
-		return Result{}, err
-	}
-	// putCommit always stores every fetched commit, same as the push-receiving side - only the
-	// branch-pointer decision below is gated. Materialization into live document storage is
-	// deferred until after that decision, exactly as in host.go's CommitPush handler: with no
-	// MVCC in the storage layer, materializing a fetched side branch immediately would mutate
-	// this node's visible documents even when the pull then resolves as a conflict (head
-	// unmoved) or as local-wins.
+	// Page until the host has nothing this node lacks, storing each page as it arrives and
+	// deciding nothing: deciding on a partial fetch of a divergent branch would merge half of
+	// it, then merge again for every later page. The head decision is made once, below.
+	haves := spreadAncestors(s.dag, localHead)
+	env := s.ingestEnv()
 	applied := 0
-	var fresh []document.Commit
-	for _, commit := range fetched {
-		if _, ok := s.dag.GetCommit(commit.Hash); ok {
-			continue
-		}
-		if err := s.dag.PutCommit(commit, true); err != nil {
-			return Result{}, err
-		}
-		// Fixes kdb-spec-layer13 §2.2 client-side: without this, a commit pulled from a peer
-		// lived only in memory and vanished on restart of a file-backed node.
-		if s.persist != nil {
-			if err := s.persist(commit); err != nil {
-				return Result{}, err
-			}
-		}
-		fresh = append(fresh, commit)
-		applied++
-	}
 	incomingHead := s.remoteHead
-	if len(fetched) > 0 {
-		incomingHead = fetched[len(fetched)-1].Hash
-	}
-	// Component 39-equivalent fix: the remote head is not automatically "ahead" just because we
-	// fetched commits leading to it - local history may have diverged from remote since the last
-	// sync (see ResolveDivergence's own doc comment). Blindly moving main to the last fetched
-	// commit here would silently orphan any local-only commits from main, exactly the bug fixed
-	// on the Kotlin side for Component 39 - same shared decision function as the host's
-	// CommitPush handler, not two independently maintained copies.
-	outcome, err := ResolveDivergence(s.dag, s.storage, s.namespaceID, localHead, incomingHead, ResolutionOptions{
-		Policy:   s.conflictPolicy,
-		Resolver: s.conflictResolver,
-	})
-	if err != nil {
-		return Result{}, err
-	}
-	// See host.go's identical comment: the auto-merge case creates a brand new commit that
-	// exists nowhere but this node and needs the same persistence as anything pulled over the
-	// wire above (kdb-spec-layer13 §2.2).
-	if outcome.MergeCommit != nil && s.persist != nil {
-		if err := s.persist(*outcome.MergeCommit); err != nil {
+	for {
+		page, stubs, err := s.client.fetchRemote(s.conn, s.namespaceID, &localHead, haves, s.pageCommits())
+		if err != nil {
 			return Result{}, err
 		}
-	}
-	// Deferred materialization, mirroring host.go: FastForwarded applies the fetched commits
-	// oldest-first; Merged already wrote every remote-touched document's winning state inside
-	// mergeNonConflicting; NoOp/Conflict leave live storage untouched alongside the unmoved
-	// head.
-	if outcome.Kind == OutcomeFastForwarded && s.materialize != nil {
-		for _, commit := range fresh {
-			if err := s.materialize(commit); err != nil {
-				return Result{}, err
-			}
+		if len(page) == 0 {
+			break
 		}
+		n, err := StoreCommits(env, page, stubs)
+		applied += n
+		if err != nil {
+			return Result{AppliedCommits: applied}, err
+		}
+		// Parents first means the page's last commit is the host's head when this was the final
+		// page, and in every case a commit whose ancestry covers everything received so far is
+		// among the page's childless commits - which are what the next fetch names as haves.
+		incomingHead = page[len(page)-1].Hash
+		haves = append(haves, pageTips(page)...)
 	}
+	ingested, err := Adopt(env, incomingHead)
+	if err != nil {
+		return Result{AppliedCommits: applied}, err
+	}
+	outcome := ingested.Outcome
 	finalHead, err := s.dag.Head()
 	if err != nil {
 		return Result{}, err
 	}
 	plan, _ := ComputeSyncPlan(s.dag, finalHead, s.remoteHead)
-	// Non-nil only on a genuine same-document divergence (§7 test 2/3 equivalent): finalHead was
-	// deliberately left unmoved from what it was before the pull - the caller must resolve this
-	// before retrying, not just ignore it.
+	// Non-nil only on a genuine same-document divergence: finalHead was deliberately left
+	// unmoved from what it was before the pull - the caller must resolve this before retrying.
 	return Result{AppliedCommits: applied, FinalHead: finalHead, Plan: plan, Conflict: outcome.Report}, nil
+}
+
+func (s *defaultSession) pageCommits() int {
+	if s.pageSize > 0 {
+		return s.pageSize
+	}
+	return DefaultPageCommits
+}
+
+// spreadAncestors names head plus first-parent ancestors at exponentially growing distances
+// (1, 2, 4, ...), and every local branch head: enough for the host to find a recent common
+// ancestor when this node's head is one it has never seen, without sending all of history.
+func spreadAncestors(d *dag.InMemoryCommitDag, head codec.Hash) []codec.Hash {
+	out := []codec.Hash{head}
+	cur, step, walked := head, 1, 0
+	for len(out) < 32 {
+		c, ok := d.GetCommit(cur)
+		if !ok || len(c.ParentHashes) == 0 {
+			break
+		}
+		cur = c.ParentHashes[0]
+		walked++
+		if walked == step {
+			out = append(out, cur)
+			step *= 2
+		}
+	}
+	for _, b := range d.ListBranches() {
+		out = append(out, b.HeadHash)
+	}
+	return out
+}
+
+// pageTips returns the commits in page no other commit in page names as a parent.
+func pageTips(page []document.Commit) []codec.Hash {
+	parent := map[codec.Hash]bool{}
+	for _, c := range page {
+		for _, p := range c.ParentHashes {
+			parent[p] = true
+		}
+	}
+	var out []codec.Hash
+	for _, c := range page {
+		if !parent[c.Hash] {
+			out = append(out, c.Hash)
+		}
+	}
+	return out
+}
+
+// RemoteError is a PeerErrorMessage the remote peer replied with.
+type RemoteError struct {
+	Code    wire.ErrorCode
+	Message string
+}
+
+func (e *RemoteError) Error() string { return "peer: " + string(e.Code) + ": " + e.Message }
+
+// ingestEnv describes this session's local namespace to Ingest.
+func (s *defaultSession) ingestEnv() IngestEnv {
+	return IngestEnv{
+		DAG:            s.dag,
+		Storage:        s.storage,
+		NamespaceID:    s.namespaceID,
+		Node:           s.node,
+		Persist:        s.persist,
+		PersistAsync:   s.persistAsync,
+		ApplyToStorage: s.materialize != nil || s.applyToStorage,
+		Resolution:     ResolutionOptions{Policy: s.conflictPolicy, Resolver: s.conflictResolver},
+	}
 }
 
 func (s *defaultSession) PushCommits(commits []document.Commit) (int, error) {
@@ -341,11 +392,7 @@ func (s *defaultSession) SyncBidirectional() (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	toPush, err := CommitsToPush(s.dag, localHead, s.remoteHead, 100)
-	if err != nil {
-		return Result{}, err
-	}
-	pushed, err := s.PushCommits(toPush)
+	pushed, err := s.pushMissing(localHead)
 	if err != nil {
 		return Result{}, err
 	}
@@ -358,8 +405,33 @@ func (s *defaultSession) SyncBidirectional() (Result, error) {
 	return pull, nil
 }
 
+// pushMissing sends everything reachable from localHead that the remote lacks, in pages; only
+// the last page asks the remote to decide its head.
+func (s *defaultSession) pushMissing(localHead codec.Hash) (int, error) {
+	all, stubs, err := MissingCommits(s.dag, localHead, []codec.Hash{s.remoteHead}, math.MaxInt)
+	if err != nil {
+		return 0, err
+	}
+	pushed := 0
+	size := s.pageCommits()
+	for start := 0; start < len(all); start += size {
+		end := min(start+size, len(all))
+		var pageStubs []document.CommitStub
+		if start == 0 {
+			pageStubs = stubs
+		}
+		n, err := s.client.pushPage(s.conn, s.namespaceID, all[start:end], pageStubs, end < len(all))
+		pushed += n
+		if err != nil {
+			return pushed, err
+		}
+	}
+	return pushed, nil
+}
+
 func (s *defaultSession) FetchCommitsSince(sinceHash *codec.Hash) ([]document.Commit, error) {
-	return s.client.fetchRemote(s.conn, s.namespaceID, sinceHash, 100)
+	commits, _, err := s.client.fetchRemote(s.conn, s.namespaceID, sinceHash, nil, s.pageCommits())
+	return commits, err
 }
 
 func coreConnectOptions(config ClientConfig) core.TransportConnectOptions {

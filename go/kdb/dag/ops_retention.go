@@ -108,6 +108,11 @@ func (d *InMemoryCommitDag) opsPinnedLocked(hash codec.Hash) bool {
 	if d.pins[hash] > 0 {
 		return true
 	}
+	// A shallow root's operations came with a snapshot, not from the delta log, so there is no
+	// log to load them back from once evicted.
+	if _, ok := d.shallow[hash]; ok {
+		return true
+	}
 	for _, b := range d.branches {
 		if b.HeadHash == hash {
 			return true

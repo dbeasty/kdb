@@ -79,6 +79,14 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 		// (a SEARCH before any index is configured). Retrying cannot help; configuration can.
 		return wire.ErrorCodeUnsupported, nil
 	}
+	var notHome *NotHomeError
+	if errors.As(err, &notHome) {
+		return wire.ErrorCodeNotHome, nil
+	}
+	var stale *StaleFenceError
+	if errors.As(err, &stale) {
+		return wire.ErrorCodeConflict, nil
+	}
 	var schemaErr *SchemaError
 	if errors.As(err, &schemaErr) {
 		if schemaErr.HasUniqueViolation() {

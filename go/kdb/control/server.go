@@ -106,6 +106,8 @@ type Options struct {
 	// applied live, but there is nowhere to write it down, and asking to persist says so rather
 	// than inventing a file that nothing would read on the next startup.
 	ConfigPath string
+	// Replication is the process's replicator, when it has peers configured.
+	Replication ReplicationSource
 	// Maintenance is the background maintenance loops this process is running, by namespace, so
 	// their cadence can be changed without a restart. Empty leaves the maintenance settings
 	// reported but refused - which is the honest answer for a process that is not running any.
@@ -295,6 +297,15 @@ func (s *Server) routes() http.Handler {
 	// Retention: what this namespace keeps, and the three operations that change it. Reading is
 	// a read; all three changes are writes, and compaction is the only one that deletes.
 	mux.Handle("GET /v1/ns/{ns}/retention", s.nsRead(s.handleRetentionStatus))
+	// Replication: conflicts are a namespace's; peers are the process's, so admin-scoped.
+	mux.Handle("GET /v1/ns/{ns}/conflicts", s.nsRead(s.handleConflicts))
+	mux.Handle("POST /v1/ns/{ns}/conflicts/{id}/resolve", s.nsWrite(s.handleResolveConflict))
+	mux.Handle("DELETE /v1/ns/{ns}/conflicts/{id}", s.nsWrite(s.handleDismissConflict))
+	mux.Handle("GET /v1/ns/{ns}/home", s.nsRead(s.handleHome))
+	mux.Handle("PUT /v1/ns/{ns}/home", s.nsWrite(s.handleAssignHome))
+	mux.Handle("GET /v1/placement", s.adminRead(s.handlePlacement))
+	mux.Handle("GET /v1/peers", s.adminRead(s.handlePeers))
+	mux.Handle("POST /v1/peers/{name}/sync", s.adminRead(s.handlePeerSync))
 	mux.Handle("GET /v1/ns/{ns}/schema", s.nsRead(s.handleSchema))
 	mux.Handle("GET /v1/ns/{ns}/indexes", s.nsRead(s.handleIndexes))
 	mux.Handle("GET /v1/ns/{ns}/log", s.nsRead(s.handleLog))

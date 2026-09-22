@@ -57,7 +57,7 @@ for native servers, the CLI, `database/sql`, WASM, and mobile bindings.
 | read from several processes on one data directory | read-only runtimes alongside the writer | [Read-only replicas](#4-read-only-replicas-unix) |
 | script or inspect a workspace from a shell | the `kdb` CLI (Go) or `:kdb-cli` (Kotlin) | [Command-line usage](#command-line-usage) |
 | push live changes to browsers or caches | `kdb-service --stream-addr`, Mode 1 / Mode 2 subscribers | [Stream modes](#stream-subscribe-over-websocket) |
-| keep independent replicas that merge later | `kdb-service --peer-addr` peer sync | [Peer sync](#peer-sync) |
+| keep independent replicas that merge later | `kdb-service --peer-addr` + `--peer` | [Peer sync and replication](#peer-sync-and-replication) |
 | back up, verify, or repair a data directory | `kdb-inspect` | [Operations](#operations--durability-backup-and-recovery) |
 
 **One writer per data directory.** A writable runtime holds `{dataDir}/.kdb.write.lock`
@@ -330,6 +330,10 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 | Flag | Meaning |
 |------|---------|
 | `--peer-conflict-policy strict\|last-write` | how a same-document divergence pushed by a peer is resolved |
+| `--peer name=…,addr=…` (repeatable; `KDB_PEERS`) | replicate matching namespaces with another node - see [Peer sync and replication](#peer-sync-and-replication) |
+| `--peer-create-namespaces` | let a peer pushing over sync v2 create a namespace this node does not hold |
+| `--peer-retention-grace 168h` | how long a silent peer holds `history=none` truncation back |
+| `--stream-allow-anonymous` | accept stream subscribers without credentials (the old behaviour; under `--rbac` it exposes every commit) |
 | `--log-level debug\|info\|warn\|error`, `--log-format text\|json` | structured logging |
 | `--config FILE` | JSON config file |
 
@@ -1124,35 +1128,222 @@ explicit part of your contract. Unix only: the shared lock needs `flock(2)`.
 
 ---
 
-## Peer sync
+## Peer sync and replication
 
-Peers are fully independent replicas. Each keeps its own history, may accept writes while
-disconnected, and reconciles on contact — fast-forwarding when one side is simply ahead,
-auto-merging when both sides changed *different* documents, and reporting a structured conflict
-when both changed the *same* document.
+Every node is a full, independent replica of the namespaces it holds. It accepts writes while
+disconnected and reconciles on contact:
+- **Fast-forward** when one side is simply ahead.
+- **Auto-merge** when both sides changed *different* documents. The merge commit is identical on
+  every node that makes it, so a mesh settles instead of merging its own merges forever.
+- **Structured conflict** when both changed the *same* document and the policy won't pick a winner.
+
+The design and its rationale are in [kdb-distributed-plan.md](kdb-distributed-plan.md).
+
+### Keeping nodes in sync: `--peer`
+
+A node listens with `--peer-addr` and keeps itself in step with other nodes with `--peer`. Only one
+side of a pair needs `--peer`: it pushes its writes (right after each commit) and pulls the other's
+(on every `interval` tick).
 
 ```bash
-# node A
-./go/bin/kdb-service --data-dir /var/lib/kdb-a --namespace myapp/users \
-  --sql-addr "tcp://0.0.0.0:9090?bind=true" --peer-addr "tcp://0.0.0.0:9091?bind=true"
+# the hub: only listens
+./go/bin/kdb-service --data-dir /var/lib/kdb-hub --namespace site/berlin/orders \
+  --peer-addr "tcps://0.0.0.0:9091?bind=true" --tls-cert hub.pem --tls-key hub.key --tls-ca ca.pem
 
-# node B, pointed at A
-./go/bin/kdb-service --data-dir /var/lib/kdb-b --namespace myapp/users \
-  --sql-addr "tcp://0.0.0.0:9190?bind=true" --peer-addr "tcp://0.0.0.0:9191?bind=true"
+# an edge node: listens too, and replicates everything under site/berlin/ with the hub
+./go/bin/kdb-service --data-dir /var/lib/kdb-edge --namespace site/berlin/orders \
+  --peer-addr "tcps://0.0.0.0:9091?bind=true" --tls-cert edge.pem --tls-key edge.key --tls-ca ca.pem \
+  --peer "name=hub,addr=tcps://hub:9091,namespaces=site/berlin/*,interval=30s"
 ```
 
-| Setting | Effect |
-|---------|--------|
-| `--peer-conflict-policy strict` (default) | same-document divergence returns a conflict report; the branch head is left untouched for you to resolve |
-| `--peer-conflict-policy last-write` | later timestamp wins, symmetrically on every node |
+**`--peer` fields.** `--peer` is repeatable, and `KDB_PEERS` holds the same specs `;`-separated.
 
-Peer connections are authenticated and authorized when `--rbac` is on (`PeerSyncAction`), and can
-be TLS/mTLS-protected like any other listener. The Kotlin CLI's `sync <namespace> <peer-uri>`
-performs a one-shot bidirectional sync.
+| Field | Meaning |
+|---|---|
+| `name` | how the peer appears in status, metrics and the control plane (required) |
+| `addr` | the peer's `--peer-addr` (required) |
+| `namespaces` | patterns separated by `\|`: `*` is one path segment, `**` is any depth, and `!` excludes. Default `**` |
+| `mode` | `both` (default), `pull` or `push` |
+| `interval` | the anti-entropy tick, default `30s`. Pulls happen at least this often |
+| `user`, `password-env` | credentials. The password is read from the named environment variable, never from the flag |
+| `create=true` | let a pull create namespaces this node doesn't hold yet |
+| `bootstrap=snapshot` | an empty namespace starts from a snapshot of the peer's current state instead of its whole history |
+| `writeback=true` | a filtered peer's projection takes writes and sends them to the source (see below) |
+| `filter=` | keep only the documents of one namespace that match a SQL condition (see below). Always the last field, because the condition may contain commas |
 
-What to expect operationally: divergence is *normal*, merges create real two-parent commits, and
-nothing is ever silently overwritten under the default policy. The classification rules are in
-[Flows §12](kdb-lld-flows.md#12-peer-sync-mode-3).
+**Connections.** Outbound connections use the node's own `--tls-*` settings, so a shared CA gives
+node-to-node mTLS. Every node has a stable identity, stored in `NODE` in its data directory and
+printed by `kdb node status` and `/healthz`. A data directory copied to make a *new* node must have
+`NODE` deleted, and a peer that presents this node's own identity is refused.
+
+### Partition by namespace
+
+A namespace is the unit that replicates. The way to have a node hold only the data it needs is to
+make that data its own namespaces: `tenant/<id>/…`, `site/<site>/…`. Then give each node the
+matching `namespaces=` patterns. Cross-namespace transactions still work within a node.
+
+When a group replicates to a node that lacks one of its namespaces, that group is reported as
+incomplete there: its parts are visible, but the group can't be atomic on that node.
+
+### A subset of one namespace: filtered peers
+
+A peer with `filter=` keeps a *projection*: only the documents of one namespace that match a
+KDB-SQL condition, and only those the peer's `user` may read.
+
+```bash
+kdb-service --peer "name=hq,addr=tcps://hq:4242,namespaces=orders,user=eu-site,password-env=HQ_PW,filter=region = 'EU'"
+```
+
+- **Where it lives.** The projection is its own local namespace, `orders.projection-<8 hex>` (a hash
+  of the filter). It is not a peer of `orders`: it has its own commits, and it follows the source
+  as documents enter the filter, change, leave it or are deleted.
+- **Read-only by default.** A write to it is refused with an error that names the source.
+
+**Writing to a projection (`writeback=true`).** With write-back on, the projection takes document
+writes and deletes:
+- **Local first.** A write commits locally at once and is readable there, so a site keeps working
+  offline.
+- **Sent on each sync.** Every sync first sends the waiting writes to the source, oldest first, and
+  then pulls.
+- **Applied only over what the projection saw.** The source applies a write only if each document
+  it touches still has the content the projection had when the write was made. Nothing is
+  overwritten blindly.
+- **Conflicts and refusals.** If a document changed at the source in the meantime, or the source
+  refuses the write (not authorized, a schema violation), the write is not applied. It goes to
+  the projection's conflict queue with what was attempted (`GET /v1/ns/{projection}/conflicts`),
+  and the projection holds the source's version again. There is nothing to merge: to keep the
+  change, write it again over the current version, then dismiss the entry
+  (`DELETE …/conflicts/{id}`).
+- **Retries.** If the source can't decide right now (unreachable, busy, not the home), the write
+  stays pending and goes again on the next sync. A resend of a write the source already applied
+  is recognised, not applied twice.
+
+A few things to keep in mind:
+- **One identity.** The source sees every write-back as the peer's `user`, not as whoever wrote
+  locally. Grant that user exactly what the site may change.
+- **Only writes and deletes.** A projection can't take part in a cross-namespace transaction, and
+  it takes no file or schema operations.
+- **Leaving the filter.** A write that moves a document out of the filter is applied at the
+  source, and the next pull removes it from the projection.
+
+### Stream subscriptions (`--stream-addr`)
+
+A stream subscriber (Go `stream.NewSubscriber`, Mode 1 read-only or Mode 2 write-back) is a
+filtered projection that isn't stored. It gets the namespace's changes as `DeltaCommit` frames:
+- **Only what it may read.** A document the subscriber may not read never reaches it. A document
+  it held and may no longer read arrives as a delete.
+- **Optional filter.** `SubscriberConfig.Filter` takes the same SQL condition as a filtered peer.
+  A document that stops matching arrives as a delete.
+- **Resume.** Reconnect with `ResumeFrom` set to the last position (`Connection.Position()`) and
+  the subscriber is sent exactly what it missed:
+  - Up to 64 commits behind, each commit is sent as it was made.
+  - Further behind, or across a peer merge, it gets one frame holding the difference between its
+    state and the head.
+
+  A position the node doesn't have (never had, or truncated away under `history=none`) is refused
+  at the handshake. Subscribe without one and reload.
+- **No dropped frames.** A slow subscriber is caught up when it drains. Commits made from peer
+  sync reach subscribers as reliably as local ones.
+- **Filter and resume go together.** A resumed subscription must use the same filter as the
+  position it resumes from. The node can't check this.
+
+### Conflicts
+
+Under `--peer-conflict-policy strict` (the default), a same-document divergence is recorded, not
+applied. Three things happen:
+- The local `main` is left alone.
+- The peer's side is kept reachable on a `peers/<node>/branch/main` tracking branch.
+- The conflict waits in the namespace's queue.
+
+To work the queue:
+
+```bash
+kdb --data-dir /var/lib/kdb-edge conflicts site/berlin/orders
+kdb --data-dir /var/lib/kdb-edge resolve site/berlin/orders <conflict-id> --take remote
+```
+
+Over the control plane, the same operations are `GET /v1/ns/{ns}/conflicts`,
+`POST /v1/ns/{ns}/conflicts/{id}/resolve` with `{"choices":{"<docId>":{"take":"local"|"remote"}|{"body":"<json>"}}}`,
+and `DELETE …/conflicts/{id}` to dismiss. A resolution is an ordinary merge commit, and it
+replicates like any other write.
+
+`--peer-conflict-policy last-write` makes the later write win on every node. Commits are always
+stamped after everything they descend from, so a write made after seeing another one wins even
+from a node whose clock runs behind.
+
+The queue also records two things nothing can merge away:
+- documents that replicated into a unique-key clash
+- replicated schema or index definitions that can't be applied here
+
+### Joining, catching up, and retention
+
+**Joining.** A new node either fetches a peer's whole history or, with `bootstrap=snapshot`,
+installs the peer's current documents and starts from there. The snapshot is verified against the
+commit it claims, and it survives crashes like any other state. An empty node joining a peer that
+itself only has recent history bootstraps from a snapshot automatically.
+
+**Retention.** Under `history=none`, retention won't delete commits that an active peer hasn't
+been seen to receive. That covers peers this node pushes to and peers that fetch from it.
+`--peer-retention-grace` (default 7 days) is how long a silent peer holds history back. Past it,
+the peer catches up by snapshot when it returns.
+
+### Definitions travel with the data
+
+Schemas (`CREATE TABLE`) and indexes (`CREATE INDEX`/`DROP INDEX`) are recorded in the reserved
+namespace `_kdb/meta`. It replicates alongside every peer's namespaces unless a pattern excludes it,
+and each node builds the indexes locally. Under `--rbac`, a peer therefore also needs `sync` on
+`_kdb/meta`.
+
+### Single-home namespaces (opt-in strong consistency)
+
+By default every node that holds a namespace accepts its writes. In that mode a unique constraint
+or a compare-and-set only holds on the node that checked it, because two nodes can each accept
+`email=x` while apart. Where that matters, give the namespace a **home**: one node that alone
+accepts its writes.
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -d '{"node":"<home node id>","addr":"tcp://home:9090"}' \
+  http://node:7070/v1/ns/billing%2Finvoices/home
+```
+
+**Where writes go.** Every other node still holds and serves the namespace, and replicates the
+home's writes. A write sent to one of them is refused with `NOT_HOME`, and the refusal names the
+home's address. `client.NewRouter` in the Go SDK follows that redirect by itself, and afterwards
+sends the namespace's writes straight to the home.
+
+**Cross-namespace transactions.** A cross-namespace transaction that touches a namespace homed
+elsewhere is refused: atomicity needs one node to decide every part.
+
+**Moving the home.** Moving the home is the same `PUT` naming another node. Every assignment
+raises a **fence**, and the home stamps its commits with it. A write the old home makes before it
+hears it has been replaced is refused wherever it arrives: it's queued as a conflict, not applied.
+`GET /v1/placement` lists every assigned home. There is no automatic failover; moving a home is an
+operator's decision.
+
+### Moving a namespace to another node
+
+1. **Add the new node** with `--peer name=…,addr=<a node holding it>,namespaces=<ns>`. Add
+   `bootstrap=snapshot` to start it from the current state rather than the whole history.
+2. **Wait until it's caught up.** In `GET /v1/peers` on the new node, the namespace's `remoteMain`
+   should equal the source's head, and `kdb_replication_last_success_seconds` should be recent.
+3. **If the namespace is single-home,** `PUT /v1/ns/{ns}/home` naming the new node.
+4. **Remove the old node's `--peer` entry** for the namespace, or stop the old node. Its data can
+   be deleted once nothing lists it as a peer.
+
+### Observing it
+
+- **Metrics.** `/metrics` exposes:
+  - `kdb_replication_last_success_seconds{peer}`
+  - `kdb_replication_consecutive_failures{peer}`
+  - `kdb_replication_commits_total{peer,namespace,direction}`
+  - `kdb_conflicts_open{namespace,kind}`
+- **Control plane.** `GET /v1/peers` shows each peer's progress, `POST /v1/peers/{name}/sync` syncs
+  now, and `GET /v1/placement` lists single-home assignments.
+- **One-shot sync.** `kdb sync <namespace> <addr>` runs a single sync from the CLI.
+
+Peer connections are authenticated and authorized under `--rbac` (`sync` permission per
+namespace). The classification rules are in [Flows §12](kdb-lld-flows.md#12-peer-sync-mode-3).
 
 ---
 

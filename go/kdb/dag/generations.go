@@ -59,6 +59,9 @@ func (d *InMemoryCommitDag) replaceCommitLocked(c document.Commit) {
 // as a commit or as a stub. A stub counts: traversal cannot descend past
 // one, so a stubbed parent bounds a generation exactly as a root does.
 func (d *InMemoryCommitDag) parentsResidentLocked(c document.Commit) bool {
+	if _, ok := d.shallow[c.Hash]; ok {
+		return true // admitted without its parents on purpose; nothing to wait for
+	}
 	for _, p := range c.ParentHashes {
 		if _, ok := d.nodes[p]; ok {
 			continue

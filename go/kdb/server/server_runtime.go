@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
+	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -113,6 +115,12 @@ type KdbServerRuntime struct {
 	// WriteTimeout bounds how long a commit may wait queued before *DeadlineExceededError.
 	// Defaults to DefaultWriteTimeout; safe to change at any time.
 	WriteTimeout time.Duration
+	// PeerCreateOnPush lets a v2 peer push into a namespace this process does not hold yet,
+	// creating it. Off by default - see peersync.V2HostConfig.CreateOnPush.
+	PeerCreateOnPush bool
+	// NodeID is this node's identity (embed.LoadOrCreateNodeID): it authors every commit this
+	// runtime makes and names it to peers. Defaults to ProcessNodeID at construction.
+	NodeID codec.UUID
 	// PeerSyncConflictPolicy selects how the peer-sync listener resolves a same-document
 	// divergence pushed by a peer (see peersync.ResolutionOptions.Policy). Zero value
 	// (ConflictPolicyAppendOnly) keeps the safe default: disjoint-document histories
@@ -168,6 +176,33 @@ type KdbServerRuntime struct {
 	// sweeperState holds document-expiry configuration and the sweeper goroutine (expiry.go).
 	sweeperState
 
+	// Conflicts is this namespace's queue of replication conflicts - refused ref updates, unique
+	// duplicates and unverifiable cross-namespace parts. Durable under a file-backed runtime's
+	// data root, in memory otherwise.
+	Conflicts *peersync.ConflictQueue
+	// home is this namespace's single-home assignment, if any - see home.go.
+	home atomic.Pointer[Home]
+	// ProjectionOf, when set, makes this namespace a filtered projection of that source namespace
+	// (see peersync.SyncProjection): its content comes only from the source, so every write but
+	// the projection's own is refused, clients' and peers' alike.
+	ProjectionOf string
+	// ProjectionWriteBack lets a projection take client writes, committed here at once and sent
+	// to the source on each sync - see writeback.go. ProjectionFilter is the projection's filter,
+	// which decides whether a document put back after a rejected write still belongs here.
+	ProjectionWriteBack bool
+	ProjectionFilter    string
+	writeBack           writeBackState
+	// Meta, when set, records this namespace's definition changes (schema, index DDL) into the
+	// replicated metadata namespace - see MetaStore.
+	Meta *MetaStore
+	// foreignGroups maps a cross-namespace group decided on another host to the commit that
+	// brought its part here - see trackForeignGroupPart. Memory only: across a restart, the
+	// flag an arrived part leaves in the conflict queue stands in for its entry here.
+	foreignGroups sync.Map
+	// inboundState records peers that fetch from this namespace - see inbound_peers.go.
+	inboundOnce  sync.Once
+	inboundState *inboundPeers
+
 	// groupPublishing counts cross-namespace transactions currently publishing a commit into this
 	// namespace, and groupVersion counts every one that has. NamespaceSet.Snapshot reads both on
 	// either side of its head reads to tell whether a group was half-published under it.
@@ -210,6 +245,21 @@ func (s *KdbServerRuntime) beforeSqlExecHook() func(msg wire.SqlExecMessage) {
 	return s.beforeSqlExec
 }
 
+// openConflictQueue opens rt's conflict queue, falling back to memory - with the reason logged -
+// if the durable one cannot be read, rather than refusing to open the namespace over it.
+func openConflictQueue(rt *embed.EmbeddedKdbRuntime) *peersync.ConflictQueue {
+	if rt.DataRoot != "" && !rt.ReadOnly {
+		q, err := peersync.NewConflictQueue(peersync.ConflictQueueDir(rt.DataRoot, rt.DefaultNamespace))
+		if err == nil {
+			return q
+		}
+		slog.Warn("replication conflict queue unreadable; keeping this session's conflicts in memory",
+			"namespace", rt.DefaultNamespace, "error", err)
+	}
+	q, _ := peersync.NewConflictQueue("")
+	return q
+}
+
 // NewKdbServerRuntime creates a server runtime with ref-count 1, wiring the transaction and SQL
 // engines against rt's DAG/storage. rt.DAG must be a *dag.InMemoryCommitDag or a
 // *embed.PersistingCommitDAG wrapping one (true of every runtime
@@ -241,7 +291,9 @@ func NewKdbServerRuntime(rt *embed.EmbeddedKdbRuntime) *KdbServerRuntime {
 		persister:         persister,
 		writeGate:         newWriteGate(DefaultMaxQueuedWrites),
 		WriteTimeout:      DefaultWriteTimeout,
+		NodeID:            ProcessNodeID(),
 	}
+	s.Conflicts = openConflictQueue(rt)
 	// The SQL engine reads through the expiry filter, not the raw adapter - this is the one place
 	// the read side of §9.5 is applied to SQL, since go/kdb/sql knows nothing about expiry.
 	s.rebuildSQLEngine()
@@ -643,15 +695,60 @@ func (s *KdbServerRuntime) Replay(namespaceID string, tx document.Transaction, r
 }
 
 func (s *KdbServerRuntime) commitWith(engine transaction.Engine, tx document.Transaction, principal auth.Principal) (document.Commit, error) {
-	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
-		return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, "")
+	tx = s.authored(tx)
+	return s.clientWrite(tx, func() (document.Commit, error) {
+		return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
+			return engine.Commit(tx, s.dag, s.Runtime.Storage, s.Schema(), nil, s.clientMessage(tx))
+		})
 	})
 }
 
+// clientWrite runs a client's write. On a write-back projection it is serialized with the
+// projection's other writers and, once committed, joins the writes waiting to go to the source.
+func (s *KdbServerRuntime) clientWrite(tx document.Transaction, run func() (document.Commit, error)) (document.Commit, error) {
+	if !s.writeBackOn() {
+		return run()
+	}
+	st := &s.writeBack
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	c, err := run()
+	if err != nil {
+		// A write can fail after reaching the DAG (durability, indexes); the DAG is the truth.
+		st.loaded = false
+		return c, err
+	}
+	if w, ok := pendingWrite(c); ok && st.loaded {
+		st.pending = append(st.pending, w)
+	}
+	return c, nil
+}
+
+// clientMessage is the message a client commit carries. Called under the write gate.
+func (s *KdbServerRuntime) clientMessage(tx document.Transaction) string {
+	if s.writeBackOn() {
+		return s.localWriteMessage(tx)
+	}
+	return s.commitMessage()
+}
+
 func (s *KdbServerRuntime) replayWith(engine transaction.Engine, tx document.Transaction, replayTarget codec.Hash, principal auth.Principal) (document.Commit, error) {
-	return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
-		return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, "")
+	tx = s.authored(tx)
+	return s.clientWrite(tx, func() (document.Commit, error) {
+		return s.runTransaction(tx, principal, txOptions{}, func() (transactionResult, error) {
+			return engine.Replay(tx, s.dag, s.Runtime.Storage, s.Schema(), replayTarget, s.clientMessage(tx))
+		})
 	})
+}
+
+// authored stamps this node as tx's author. The commit records where it was made - the thing
+// peers, conflict reports and audits need - rather than whatever a client put there, which was a
+// fresh random UUID per write and so identified nothing.
+func (s *KdbServerRuntime) authored(tx document.Transaction) document.Transaction {
+	if s.NodeID != (codec.UUID{}) {
+		tx.AuthorNodeID = s.NodeID
+	}
+	return tx
 }
 
 type transactionResult = transaction.TransactionResult
@@ -806,6 +903,16 @@ func (s *KdbServerRuntime) admitWrite(tx document.Transaction, principal auth.Pr
 	}
 	if err := s.fenceErr(); err != nil {
 		return err
+	}
+	if s.ProjectionOf != "" && !system {
+		if err := s.admitProjectionWrite(tx); err != nil {
+			return err
+		}
+	}
+	if !system {
+		if err := s.admitHome(); err != nil {
+			return err
+		}
 	}
 	if !system {
 		if err := s.authorizeOperations(tx, principal); err != nil {
@@ -1015,4 +1122,14 @@ func (r *ServerRuntimeRegistry) Release(key string) {
 	if rt.refCount.Load() <= 0 {
 		delete(r.runtimes, key)
 	}
+}
+
+// ProjectionReadOnlyError refuses a write to a filtered projection: its content is the source's,
+// so a write belongs on the source, and reaches the projection from there.
+type ProjectionReadOnlyError struct {
+	Namespace, Source string
+}
+
+func (e *ProjectionReadOnlyError) Error() string {
+	return fmt.Sprintf("namespace %s is a read-only projection of %s; write to %s instead", e.Namespace, e.Source, e.Source)
 }

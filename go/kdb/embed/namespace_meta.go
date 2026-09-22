@@ -22,6 +22,11 @@ type namespaceMeta struct {
 	// predates the setting, and is therefore full: every commit it ever
 	// wrote is still there, because nothing has ever reclaimed one.
 	HistoryMode string `json:"historyMode,omitempty"`
+	// ShallowRoots are the commits this namespace was bootstrapped from by snapshot (see
+	// InstallSnapshot in go/kdb/peersync) - admitted without their parents, with documents no
+	// delta log holds. Non-empty makes the checkpoint the only record of that state: open then
+	// refuses to fall back to a replay that would silently produce an empty namespace.
+	ShallowRoots []string `json:"shallowRoots,omitempty"`
 }
 
 func namespaceMetaPath(dataRoot, namespaceID string) string {
@@ -49,7 +54,25 @@ func writeNamespaceMeta(dataRoot, namespaceID string, m namespaceMeta) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o644)
+	// Replaced, never rewritten in place: a torn marker reads as absent, and for a namespace
+	// bootstrapped from a snapshot the marker is what stops open replaying it into emptiness.
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // HistoryStrategyMismatchError reports a namespace being opened under a

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -173,9 +174,24 @@ func (h *Host) openNamespace(
 		// the sum of its whole history (docs/benchmarks/open-cost.md).
 		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
 	}
-	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn)
+	meta, _ := readNamespaceMeta(dataRoot, namespaceID)
+	if len(meta.ShallowRoots) > 0 && eng != nil {
+		// Some bodies exist only in the blob store; cold reads must look there.
+		eng.SetBodiesExternal(true)
+	}
+	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn, meta.ShallowRoots)
 	if err != nil {
 		return nil, nil, err
+	}
+	for _, hex := range meta.ShallowRoots {
+		if h, err := codec.HashFromHex(hex); err == nil {
+			d.MarkShallow(h)
+		}
+	}
+	if eng != nil && len(meta.ShallowRoots) == 0 && len(d.Horizon()) > 0 {
+		// Commits whose parents are gone: a snapshot bootstrap whose marker a crash cut off, or
+		// history truncated away. Either way some bodies may exist only in the blob store.
+		eng.SetBodiesExternal(true)
 	}
 	dagOut := dag.CommitDAG(d)
 	var persisting *PersistingCommitDAG
@@ -206,6 +222,12 @@ func (h *Host) openNamespace(
 		deltaReader:      handle.DeltaReader(),
 		shim:             io,
 		txn:              h.txn,
+	}
+	if !opts.ReadOnly {
+		rt.snapshot = &snapshotSupport{
+			dag: d, store: store, shim: io, dataRoot: dataRoot, namespaceID: namespaceID,
+			checkpointsDisabled: opts.Storage.DisableCheckpoints,
+		}
 	}
 	if !sch.IsNone() && !opts.ReadOnly {
 		// syncEmbedSchema commits a schema migration when the stored schema differs - a write,
@@ -272,9 +294,10 @@ func (h *Host) openNamespace(
 					through = open - 1
 				}
 			}
+			now := time.Now()
 			return checkpointAndTruncate(
 				d, store, r, io, namespaceID, through,
-				liveRetention(store, opts.Storage.Retain), time.Now(), opts.Storage.DisableCheckpoints,
+				rt.withPeerFloor(liveRetention(store, opts.Storage.Retain), now), now, opts.Storage.DisableCheckpoints,
 				liveReclaim(store))
 		}
 	}

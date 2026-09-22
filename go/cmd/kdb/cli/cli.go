@@ -59,6 +59,10 @@ Commands:
   tag create <namespace> <name> [rev] [message]
   tag delete <namespace> <name>
   unlock
+  node status
+  sync <namespace> <peer-addr> [--pull|--push] [--user U --password-env VAR]
+  conflicts <namespace>
+  resolve <namespace> <conflict-id> --take local|remote
 
 A REV is a revision: head, head~10, head^, a commit hash, <hash>~2,
 tag:NAME, branch:NAME, or any of those with ~N appended.`)
@@ -94,6 +98,9 @@ func parseArgs(args []string) (Config, Command, error) {
 }
 
 func parseCommand(rest []string) (Command, error) {
+	if cmd, ok, err := parseReplicationCommand(rest); ok {
+		return cmd, err
+	}
 	switch rest[0] {
 	case "init":
 		if len(rest) < 2 {
