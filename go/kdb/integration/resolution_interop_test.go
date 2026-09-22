@@ -96,7 +96,7 @@ func TestKotlinReadsGoConflictResolution(t *testing.T) {
 	fileRT.Close()
 
 	for id, body := range want {
-		out := kotlinCLI(t, repo, "--data-dir", root, "get", ns, id.String())
+		out := lastLine(kotlinCLI(t, repo, "--data-dir", root, "get", ns, id.String()))
 		if !sameJSON(out, body) {
 			t.Fatalf("Kotlin read %q for %s, Go wrote %s", out, id, body)
 		}
@@ -148,6 +148,14 @@ func kotlinCLI(t *testing.T, repo string, args ...string) string {
 		t.Fatalf("kotlin %v: %v\n%s\n%s", args, err, out, stderr)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// lastLine is the last non-empty line of a CLI's output: the value it printed. Anything before it
+// is not the CLI's - the first gradle run on a fresh machine (CI) prints its wrapper download to
+// stdout ahead of it.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 func sameJSON(a, b string) bool {

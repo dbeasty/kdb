@@ -92,7 +92,7 @@ func TestKotlinReadsAGoLogRepairedByScrub(t *testing.T) {
 	for i, id := range ids {
 		out := kotlinCLIResult(t, repo, "--data-dir", root, "get", ns, id.String())
 		switch {
-		case out.code == 0 && sameJSON(out.stdout, bodies[i]):
+		case out.code == 0 && sameJSON(lastLine(out.stdout), bodies[i]):
 		case out.code != 0 && strings.Contains(out.stderr, "corrupt"):
 			// A loud refusal: Kotlin replays the whole log and stops at the damaged frame.
 		default:

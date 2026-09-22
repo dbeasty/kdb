@@ -82,12 +82,19 @@ func TestReplicatorConvergesTwoNodes(t *testing.T) {
 	put(t, b, `{"from":"b"}`)
 	eventually(t, 3*time.Second, "b's write to reach a", func() bool { return head(t, a) == head(t, b) })
 
+	// The heads meet as soon as the pull is adopted, a moment before the cycle that did it records
+	// its progress - so the status is waited for, not read at once.
+	eventually(t, 3*time.Second, "the sync's progress to be recorded", func() bool {
+		st := r.Status()
+		if len(st) != 1 {
+			return false
+		}
+		p := st[0].State.Namespaces[ns]
+		return p.RemoteMain != "" && p.Pushed > 0 && p.Pulled > 0
+	})
 	st := r.Status()
-	if len(st) != 1 || st[0].State.LastSuccess.IsZero() || st[0].State.PeerNodeID != b.NodeID.String() {
+	if st[0].State.LastSuccess.IsZero() || st[0].State.PeerNodeID != b.NodeID.String() {
 		t.Fatalf("status after syncing: %+v", st)
-	}
-	if ns := st[0].State.Namespaces[ns]; ns.RemoteMain == "" || ns.Pushed == 0 || ns.Pulled == 0 {
-		t.Fatalf("namespace progress not recorded: %+v", ns)
 	}
 }
 
