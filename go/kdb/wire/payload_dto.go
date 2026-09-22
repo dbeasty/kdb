@@ -65,6 +65,8 @@ type payloadEnvelope struct {
 	TreeNodesResult    *treeNodesResultDto    `json:"treeNodesResult,omitempty"`
 	ObjectFetch        *objectFetchDto        `json:"objectFetch,omitempty"`
 	ObjectFetchResult  *objectFetchResultDto  `json:"objectFetchResult,omitempty"`
+	DocFetch           *docFetchDto           `json:"docFetch,omitempty"`
+	DocFetchResult     *docFetchResultDto     `json:"docFetchResult,omitempty"`
 	CommitPush         *commitPushDto         `json:"commitPush,omitempty"`
 	CommitPushAck      *commitPushAckDto      `json:"commitPushAck,omitempty"`
 	DagDiff            *dagDiffDto            `json:"dagDiff,omitempty"`

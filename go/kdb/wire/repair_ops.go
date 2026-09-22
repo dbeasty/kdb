@@ -1,5 +1,7 @@
 package wire
 
+import "github.com/limidus/kdb/go/kdb/document"
+
 // Anti-entropy and repair frames (Go-only, v2): a peer compares document trees by subtree hash
 // (TREE_NODES) and fetches document bodies it lacks or holds damaged, by content hash
 // (OBJECT_FETCH). Bodies are self-verifying - the receiver checks each against the content hash it
@@ -180,6 +182,127 @@ func decodeRepairMessage(header Header, env payloadEnvelope) (Message, bool, err
 			docs[i] = SnapshotDoc{DocID: x.DocID, Body: x.Body}
 		}
 		return ObjectFetchResultMessage{H: header, Namespace: d.Namespace, Docs: docs, Missing: d.Missing}, true, nil
+	}
+	return nil, false, nil
+}
+
+// SyncCapDocFetch: the host answers DOC_FETCH.
+const SyncCapDocFetch = "docfetch"
+
+// DocFetchMessage asks for documents by id as of one source commit, each with a Merkle proof of
+// what that commit's tree holds for it (DOC_FETCH 0x38) - how a filtered projection reads a document
+// it does not hold. Read rights suffice, as for a projection.
+type DocFetchMessage struct {
+	H         Header
+	Namespace string
+	// AtHex is the commit to read at; empty means the host's main head.
+	AtHex  string
+	DocIDs []string
+}
+
+func (m DocFetchMessage) Header() Header { return m.H }
+
+// DocProofInfo is a document tree proof (document.TreeProof) in hex.
+type DocProofInfo struct {
+	Levels   [][]string
+	HasLeaf  bool
+	LeafID   string
+	LeafHash string
+}
+
+// FetchedDoc is one answer of DOC_FETCH: the body when the commit holds the document, and the
+// proof of what its tree holds for the id. Forbidden is set, with neither, when the principal may
+// not read the document.
+type FetchedDoc struct {
+	DocID     string
+	Body      string
+	Present   bool
+	Forbidden bool
+	Proof     DocProofInfo
+}
+
+// DocFetchResultMessage answers DOC_FETCH (DOC_FETCH_RESULT 0x39). Commit is the commit read at,
+// whole, so the receiver can check it hashes to the commit it asked for and take the tree hash
+// the proofs are against from it.
+type DocFetchResultMessage struct {
+	H         Header
+	Namespace string
+	Commit    document.Commit
+	Docs      []FetchedDoc
+}
+
+func (m DocFetchResultMessage) Header() Header { return m.H }
+
+type docFetchDto struct {
+	Namespace string   `json:"namespace"`
+	AtHex     string   `json:"atHex,omitempty"`
+	DocIDs    []string `json:"ids"`
+}
+
+type docProofDto struct {
+	Levels   [][]string `json:"levels,omitempty"`
+	HasLeaf  bool       `json:"hasLeaf,omitempty"`
+	LeafID   string     `json:"leafId,omitempty"`
+	LeafHash string     `json:"leafHash,omitempty"`
+}
+
+type fetchedDocDto struct {
+	DocID     string      `json:"id"`
+	Body      string      `json:"body,omitempty"`
+	Present   bool        `json:"present,omitempty"`
+	Forbidden bool        `json:"forbidden,omitempty"`
+	Proof     docProofDto `json:"proof"`
+}
+
+type docFetchResultDto struct {
+	Namespace     string          `json:"namespace"`
+	CommitPayload []byte          `json:"commitPayload"`
+	Docs          []fetchedDocDto `json:"docs"`
+}
+
+func encodeDocFetchMessage(msg Message) (payloadEnvelope, bool, error) {
+	switch m := msg.(type) {
+	case DocFetchMessage:
+		return payloadEnvelope{Kind: "docFetch", DocFetch: &docFetchDto{Namespace: m.Namespace, AtHex: m.AtHex, DocIDs: m.DocIDs}}, true, nil
+	case DocFetchResultMessage:
+		payload, err := EncodeCommits([]document.Commit{m.Commit})
+		if err != nil {
+			return payloadEnvelope{}, true, err
+		}
+		docs := make([]fetchedDocDto, len(m.Docs))
+		for i, d := range m.Docs {
+			docs[i] = fetchedDocDto{DocID: d.DocID, Body: d.Body, Present: d.Present, Forbidden: d.Forbidden, Proof: docProofDto(d.Proof)}
+		}
+		return payloadEnvelope{Kind: "docFetchResult", DocFetchResult: &docFetchResultDto{Namespace: m.Namespace, CommitPayload: payload, Docs: docs}}, true, nil
+	}
+	return payloadEnvelope{}, false, nil
+}
+
+func decodeDocFetchMessage(header Header, env payloadEnvelope) (Message, bool, error) {
+	switch env.Kind {
+	case "docFetch":
+		d := env.DocFetch
+		if d == nil {
+			return nil, true, newDecodeError("missing docFetch body")
+		}
+		return DocFetchMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, DocIDs: d.DocIDs}, true, nil
+	case "docFetchResult":
+		d := env.DocFetchResult
+		if d == nil {
+			return nil, true, newDecodeError("missing docFetchResult body")
+		}
+		commits, err := DecodeCommits(d.CommitPayload)
+		if err != nil {
+			return nil, true, err
+		}
+		if len(commits) != 1 {
+			return nil, true, newDecodeError("docFetchResult must carry exactly one commit")
+		}
+		docs := make([]FetchedDoc, len(d.Docs))
+		for i, x := range d.Docs {
+			docs[i] = FetchedDoc{DocID: x.DocID, Body: x.Body, Present: x.Present, Forbidden: x.Forbidden, Proof: DocProofInfo(x.Proof)}
+		}
+		return DocFetchResultMessage{H: header, Namespace: d.Namespace, Commit: commits[0], Docs: docs}, true, nil
 	}
 	return nil, false, nil
 }

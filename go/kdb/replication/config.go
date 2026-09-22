@@ -46,6 +46,10 @@ type PeerConfig struct {
 	// WriteBack lets clients write to a filtered peer's projection: writes commit locally and go
 	// to the source on each sync (writeback=true; filtered peers only).
 	WriteBack bool
+	// ReadThrough lets a filtered peer's projection answer a read for a document it does not hold
+	// by fetching it from the source, proved against the source commit the projection is at
+	// (readthrough=true; filtered peers only).
+	ReadThrough bool
 }
 
 // DefaultInterval is the anti-entropy tick when a peer names none.
@@ -118,6 +122,8 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			p.CreateLocal = value == "true"
 		case "writeback":
 			p.WriteBack = value == "true"
+		case "readthrough":
+			p.ReadThrough = value == "true"
 		case "bootstrap":
 			switch value {
 			case "snapshot":
@@ -144,6 +150,8 @@ func ParsePeer(spec string) (PeerConfig, error) {
 		p.Mode = peersync.SyncPull
 	} else if p.WriteBack {
 		return PeerConfig{}, fmt.Errorf("peer %q: writeback applies only to a filtered peer", spec)
+	} else if p.ReadThrough {
+		return PeerConfig{}, fmt.Errorf("peer %q: readthrough applies only to a filtered peer", spec)
 	}
 	if len(p.Namespaces) == 0 {
 		p.Namespaces = []string{"**"}

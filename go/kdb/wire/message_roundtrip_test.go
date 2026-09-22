@@ -534,6 +534,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgTreeNodesResult, "TREE_NODES_RESULT"},
 		{wire.MsgObjectFetch, "OBJECT_FETCH"},
 		{wire.MsgObjectFetchResult, "OBJECT_FETCH_RESULT"},
+		{wire.MsgDocFetch, "DOC_FETCH"},
+		{wire.MsgDocFetchResult, "DOC_FETCH_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -560,7 +562,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x38
+const nextFreeMessageCode = 0x3A
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{
@@ -817,6 +819,26 @@ func TestRoundTripRepairFrames(t *testing.T) {
 		Docs: []wire.SnapshotDoc{{DocID: "d", Body: `{"v":1}`}}, Missing: []string{"e"},
 	}).(wire.ObjectFetchResultMessage)
 	if len(res.Docs) != 1 || res.Docs[0].Body != `{"v":1}` || len(res.Missing) != 1 {
+		t.Fatalf("round trip changed the result: %+v", res)
+	}
+}
+
+func TestRoundTripDocFetch(t *testing.T) {
+	req := roundTrip(t, wire.DocFetchMessage{
+		H: wire.Header{MessageType: wire.MsgDocFetch, CorrelationID: 6}, Namespace: "app/data", AtHex: "ab", DocIDs: []string{"d1", "d2"},
+	}).(wire.DocFetchMessage)
+	if req.AtHex != "ab" || len(req.DocIDs) != 2 {
+		t.Fatalf("round trip changed the request: %+v", req)
+	}
+	c := buildTestCommit(t, "anchor")
+	res := roundTrip(t, wire.DocFetchResultMessage{
+		H: wire.Header{MessageType: wire.MsgDocFetchResult, CorrelationID: 6}, Namespace: "app/data", Commit: c,
+		Docs: []wire.FetchedDoc{
+			{DocID: "d1", Body: `{"v":1}`, Present: true, Proof: wire.DocProofInfo{Levels: [][]string{{"aa", ""}}, HasLeaf: true, LeafID: "d1", LeafHash: "cc"}},
+			{DocID: "d2", Forbidden: true},
+		},
+	}).(wire.DocFetchResultMessage)
+	if res.Commit.Hash != c.Hash || len(res.Docs) != 2 || !res.Docs[0].Proof.HasLeaf || res.Docs[0].Proof.Levels[0][0] != "aa" || !res.Docs[1].Forbidden {
 		t.Fatalf("round trip changed the result: %+v", res)
 	}
 }

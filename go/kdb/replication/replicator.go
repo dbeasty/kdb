@@ -489,3 +489,21 @@ func (r *Replicator) Compare(name, ns string, local document.DocumentTree) (stri
 	defer s.Close()
 	return s.Diff(ns, local, "")
 }
+
+// OpenDocSession connects to the filtered peer whose projection lives in projectionNS, for reading
+// source documents the projection does not hold (DOC_FETCH).
+func (r *Replicator) OpenDocSession(projectionNS string) (*peersync.RepairSession, string, error) {
+	for _, name := range r.order {
+		l := r.loops[name]
+		if l.peer.Filter == "" || peersync.ProjectionNamespace(l.peer.Namespaces[0], l.peer.Filter) != projectionNS {
+			continue
+		}
+		s, err := peersync.OpenDocSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
+			NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
+			ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+			Timeout:           r.cfg.Timeout,
+		})
+		return s, l.peer.Namespaces[0], err
+	}
+	return nil, "", fmt.Errorf("replication: no filtered peer keeps its projection in %s", projectionNS)
+}

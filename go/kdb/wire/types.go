@@ -111,6 +111,8 @@ const (
 	MsgTreeNodesResult    MessageType = 0x35
 	MsgObjectFetch        MessageType = 0x36
 	MsgObjectFetchResult  MessageType = 0x37
+	MsgDocFetch           MessageType = 0x38
+	MsgDocFetchResult     MessageType = 0x39
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -229,6 +231,10 @@ func (t MessageType) String() string {
 		return "OBJECT_FETCH"
 	case MsgObjectFetchResult:
 		return "OBJECT_FETCH_RESULT"
+	case MsgDocFetch:
+		return "DOC_FETCH"
+	case MsgDocFetchResult:
+		return "DOC_FETCH_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -346,6 +352,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgObjectFetch, true
 	case 0x37:
 		return MsgObjectFetchResult, true
+	case 0x38:
+		return MsgDocFetch, true
+	case 0x39:
+		return MsgDocFetchResult, true
 	default:
 		return 0, false
 	}

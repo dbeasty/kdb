@@ -1097,7 +1097,7 @@ func (h *sqlWireConnHandler) handleDocumentGet(msg wire.DocumentGetMessage) wire
 		grant = g
 		defer grant.Release()
 	}
-	jsonBody, commitHex, found, err := rt.GetDocument(msg.Namespace, docID)
+	jsonBody, commitHex, found, err := rt.ReadDocument(msg.Namespace, docID)
 	if err != nil {
 		return documentGetErrorClassified(msg, err)
 	}
