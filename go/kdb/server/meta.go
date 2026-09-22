@@ -492,7 +492,7 @@ func ReadResolutionChain(meta *embed.EmbeddedKdbRuntime, ns string) (*peersync.R
 	if err := json.Unmarshal([]byte(doc.JSON), &d); err != nil {
 		return nil, err
 	}
-	if d.Resolution == nil || len(d.Resolution.Rules) == 0 {
+	if d.Resolution == nil || (len(d.Resolution.Rules) == 0 && !d.Resolution.AllowUnrelated) {
 		return nil, nil
 	}
 	if err := d.Resolution.Validate(); err != nil {

@@ -85,6 +85,10 @@ type IngestEnv struct {
 	// ShallowRootsChanged records the namespace's shallow roots durably when Deepen changes them -
 	// see Deepen for the order it is called in. nil: nothing to record (memory runtimes).
 	ShallowRootsChanged func([]codec.Hash) error
+	// GraftRecorded records durably that root is grafted - a peer's shallow root taken in without
+	// its parents (see Graft), which a replay must admit as such. nil: nothing to record (memory
+	// runtimes).
+	GraftRecorded func(root codec.Hash) error
 	// MaxClockSkew refuses a commit timestamped further than this past local wall time. Commits
 	// are timestamped at least one microsecond after their parents, so a single commit from a node
 	// whose clock runs far ahead would drag every later commit that descends from it into that

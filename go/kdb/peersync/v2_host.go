@@ -62,6 +62,8 @@ type V2Host struct {
 	helloAt time.Time
 	granted map[string]bool
 	peer    string
+	// grafts stages GRAFT_PUSH pages per namespace until the last one arrives.
+	grafts map[string][]wire.SnapshotPageMessage
 }
 
 // NewV2Host returns a host for one connection.
@@ -73,7 +75,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -178,6 +180,8 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		return page, nil
 	case wire.DocFetchMessage:
 		return h.docFetch(m)
+	case wire.GraftPushMessage:
+		return h.graftPush(m)
 	case wire.TreeNodesMessage:
 		env, err := h.env(m.Namespace, false)
 		if err != nil {
@@ -332,6 +336,55 @@ func (h *V2Host) env(ns string, create bool) (IngestEnv, error) {
 	env, err := h.cfg.Namespaces.Env(ns, create)
 	env.Peer = peer
 	return env, err
+}
+
+// maxGraftPushBytes bounds what one session may stage for a pushed graft: the state is held in
+// memory until the last page lets it be verified.
+const maxGraftPushBytes = 1 << 30
+
+// graftPush stages one GRAFT_PUSH page and, on the last, grafts the pushed root (see Graft).
+func (h *V2Host) graftPush(m wire.GraftPushMessage) (wire.Message, error) {
+	ns := m.Page.Namespace
+	env, err := h.env(ns, false)
+	if err != nil {
+		return nil, err
+	}
+	reply := wire.GraftPushResultMessage{H: header(wire.MsgGraftPushResult, m.H.CorrelationID), Namespace: ns}
+	h.mu.Lock()
+	if h.grafts == nil {
+		h.grafts = map[string][]wire.SnapshotPageMessage{}
+	}
+	pages := append(h.grafts[ns], m.Page)
+	size := 0
+	for _, p := range pages {
+		for _, d := range p.Docs {
+			size += len(d.Body)
+		}
+	}
+	if m.Page.Done || size > maxGraftPushBytes {
+		delete(h.grafts, ns)
+	} else {
+		h.grafts[ns] = pages
+	}
+	h.mu.Unlock()
+	if size > maxGraftPushBytes {
+		return nil, fmt.Errorf("peer sync: a pushed graft of %s exceeds %d bytes", ns, maxGraftPushBytes)
+	}
+	if !m.Page.Done {
+		return reply, nil
+	}
+	next := 0
+	if _, err := Graft(env, pages[0].Commit.Hash, func(string) (wire.SnapshotPageMessage, error) {
+		if next >= len(pages) {
+			return wire.SnapshotPageMessage{}, errors.New("peer sync: pushed graft ended early")
+		}
+		next++
+		return pages[next-1], nil
+	}); err != nil {
+		return nil, err
+	}
+	reply.Grafted = true
+	return reply, nil
 }
 
 func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {

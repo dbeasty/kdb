@@ -113,6 +113,8 @@ const (
 	MsgObjectFetchResult  MessageType = 0x37
 	MsgDocFetch           MessageType = 0x38
 	MsgDocFetchResult     MessageType = 0x39
+	MsgGraftPush          MessageType = 0x3A
+	MsgGraftPushResult    MessageType = 0x3B
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -235,6 +237,10 @@ func (t MessageType) String() string {
 		return "DOC_FETCH"
 	case MsgDocFetchResult:
 		return "DOC_FETCH_RESULT"
+	case MsgGraftPush:
+		return "GRAFT_PUSH"
+	case MsgGraftPushResult:
+		return "GRAFT_PUSH_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -356,6 +362,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgDocFetch, true
 	case 0x39:
 		return MsgDocFetchResult, true
+	case 0x3A:
+		return MsgGraftPush, true
+	case 0x3B:
+		return MsgGraftPushResult, true
 	default:
 		return 0, false
 	}

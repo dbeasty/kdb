@@ -25,6 +25,8 @@ type testNamespaces struct {
 	sides map[string]side
 	// installed, when set, is every env's SnapshotInstalled.
 	installed func(document.Commit) error
+	// resolution, when set, replaces every env's last-write policy.
+	resolution *ResolutionOptions
 }
 
 func newTestNamespaces(t *testing.T, names ...string) *testNamespaces {
@@ -57,9 +59,12 @@ func (p *testNamespaces) Env(ns string, create bool) (IngestEnv, error) {
 		s = newSide(p.t, ns)
 		p.sides[ns] = s
 	}
+	res := ResolutionOptions{Policy: transaction.ConflictPolicyLastWrite}
+	if p.resolution != nil {
+		res = *p.resolution
+	}
 	return IngestEnv{DAG: s.dag, Storage: s.storage, NamespaceID: ns, ApplyToStorage: true,
-		Resolution:        ResolutionOptions{Policy: transaction.ConflictPolicyLastWrite},
-		SnapshotInstalled: p.installed}, nil
+		Resolution: res, SnapshotInstalled: p.installed}, nil
 }
 
 func (p *testNamespaces) side(ns string) side {

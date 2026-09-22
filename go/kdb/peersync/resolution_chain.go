@@ -89,6 +89,13 @@ func (r *ResolutionRule) TimeoutDuration() time.Duration {
 // ResolutionChain is a namespace's ordered resolution rules.
 type ResolutionChain struct {
 	Rules []ResolutionRule `json:"rules"`
+	// AllowUnrelated lets the namespace merge a peer's history that shares no commit with its
+	// own - another database, or a copy bootstrapped from a snapshot whose source is gone
+	// (docs/kdb-distributed-self-healing-research.md, Phase 11). The merge takes the empty tree
+	// as the base: a document only one side holds is adopted, one both hold differently is a
+	// conflict for the rules. Off, such a sync is refused as unrelated history. Part of the
+	// chain, and so of its hash, because two nodes that disagree on it build different graphs.
+	AllowUnrelated bool `json:"allowUnrelated,omitempty"`
 }
 
 // Validate reports a chain that cannot run: an unknown rule, a source-priority rule without
@@ -156,6 +163,9 @@ func (c *ResolutionChain) Authority() *ResolutionRule {
 	return nil
 }
 
+// AllowsUnrelated reports whether the chain lets unrelated histories merge.
+func (c *ResolutionChain) AllowsUnrelated() bool { return c != nil && c.AllowUnrelated }
+
 // Notifies reports whether node is one that tells the authority about this chain's conflicts.
 func (r *ResolutionRule) Notifies(node string) bool {
 	return r != nil && r.Kind == RuleAuthority && (r.Node == "" || r.Node == node)
@@ -164,7 +174,7 @@ func (r *ResolutionRule) Notifies(node string) bool {
 // Hash identifies the chain's behaviour: two chains with the same hash decide every conflict
 // alike. Empty for no chain, so a node without one and a node with an empty one agree.
 func (c *ResolutionChain) Hash() string {
-	if c == nil || len(c.Rules) == 0 {
+	if c == nil || (len(c.Rules) == 0 && !c.AllowUnrelated) {
 		return ""
 	}
 	b, _ := json.Marshal(c)

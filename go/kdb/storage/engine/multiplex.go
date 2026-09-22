@@ -300,3 +300,16 @@ func (m *MultiplexAdapter) WalkTree(namespaceID string, treeHash codec.Hash, vis
 	}
 	return w.WalkTree(namespaceID, treeHash, visit)
 }
+
+// StoreForeignTree implements storage.ForeignTreeStore by routing to the namespace's adapter.
+func (m *MultiplexAdapter) StoreForeignTree(namespaceID string, tree document.DocumentTree, bodies map[codec.UUID]string) error {
+	a, err := m.route(namespaceID)
+	if err != nil {
+		return err
+	}
+	f, ok := a.(storage.ForeignTreeStore)
+	if !ok {
+		return fmt.Errorf("kdb: storage for namespace %q cannot hold a foreign tree", namespaceID)
+	}
+	return f.StoreForeignTree(namespaceID, tree, bodies)
+}

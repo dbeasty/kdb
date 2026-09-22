@@ -536,6 +536,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgObjectFetchResult, "OBJECT_FETCH_RESULT"},
 		{wire.MsgDocFetch, "DOC_FETCH"},
 		{wire.MsgDocFetchResult, "DOC_FETCH_RESULT"},
+		{wire.MsgGraftPush, "GRAFT_PUSH"},
+		{wire.MsgGraftPushResult, "GRAFT_PUSH_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -562,7 +564,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x3A
+const nextFreeMessageCode = 0x3C
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{
@@ -839,6 +841,24 @@ func TestRoundTripDocFetch(t *testing.T) {
 		},
 	}).(wire.DocFetchResultMessage)
 	if res.Commit.Hash != c.Hash || len(res.Docs) != 2 || !res.Docs[0].Proof.HasLeaf || res.Docs[0].Proof.Levels[0][0] != "aa" || !res.Docs[1].Forbidden {
+		t.Fatalf("round trip changed the result: %+v", res)
+	}
+}
+
+func TestGraftPushRoundTrip(t *testing.T) {
+	c := buildTestCommit(t, "graft")
+	req := roundTrip(t, wire.GraftPushMessage{
+		H: wire.Header{MessageType: wire.MsgGraftPush, CorrelationID: 7},
+		Page: wire.SnapshotPageMessage{Namespace: "app/data", Commit: c,
+			Docs: []wire.SnapshotDoc{{DocID: "d1", Body: `{"v":1}`}}, Next: "d1", Total: 2},
+	}).(wire.GraftPushMessage)
+	if req.Page.Commit.Hash != c.Hash || req.Page.Namespace != "app/data" || len(req.Page.Docs) != 1 || req.Page.Next != "d1" || req.Page.Done || req.Page.Total != 2 {
+		t.Fatalf("round trip changed the push: %+v", req)
+	}
+	res := roundTrip(t, wire.GraftPushResultMessage{
+		H: wire.Header{MessageType: wire.MsgGraftPushResult, CorrelationID: 7}, Namespace: "app/data", Grafted: true,
+	}).(wire.GraftPushResultMessage)
+	if !res.Grafted || res.Namespace != "app/data" {
 		t.Fatalf("round trip changed the result: %+v", res)
 	}
 }

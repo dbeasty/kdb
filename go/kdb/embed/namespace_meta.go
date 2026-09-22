@@ -27,6 +27,11 @@ type namespaceMeta struct {
 	// delta log holds. Non-empty makes the checkpoint the only record of that state: open then
 	// refuses to fall back to a replay that would silently produce an empty namespace.
 	ShallowRoots []string `json:"shallowRoots,omitempty"`
+	// GraftRoots are peers' shallow roots this namespace took in without their parents to merge a
+	// history unrelated to its own (peersync.Graft). Unlike ShallowRoots they are side history -
+	// main reaches them only through a merge that writes everything it adopts - so a replay of
+	// the log still rebuilds the namespace; it just has to admit these without their parents.
+	GraftRoots []string `json:"graftRoots,omitempty"`
 	// BodiesExternal records that the namespace was once bootstrapped from a snapshot, so some
 	// documents' bodies exist only in the blob store - even after its history has been fetched
 	// back (peersync.Deepen) and ShallowRoots has emptied. Set once, never cleared.

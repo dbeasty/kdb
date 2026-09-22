@@ -1436,6 +1436,41 @@ the whole history finishes the job.
 
 Deepen is safe to interrupt. Run it again and it finishes, without fetching what it already has.
 
+### Merging a history nobody else holds: allowUnrelated (graft)
+
+Deepen needs a peer that still holds the history. When none does (the node the snapshot came from
+is gone), a namespace can instead merge the two histories as they are. Set `allowUnrelated` in the
+namespace's resolution chain, on the nodes that should merge:
+
+```bash
+curl -X PUT -H 'Authorization: Bearer ...' \
+  http://node:7070/v1/ns/app%2Fdata/resolution \
+  -d '{"allowUnrelated": true, "rules": [{"kind": "source-priority", "nodes": ["<hub id>"]}, {"kind": "last-write"}]}'
+```
+
+What happens:
+- **The node without the history grafts the other's root.** It fetches the peer's state at its
+  snapshot root, checks every body against the root's tree hash, and keeps it as a root of its own.
+  That works whichever node dials: a pull grafts, and a push sends the root first (`GRAFT_PUSH`),
+  so a hub that is only ever dialled still takes an edge's history.
+- **The two heads merge with an empty base.** A document only one side holds is adopted. A
+  document both hold with different values is a conflict for the chain's rules. Both nodes build
+  the same merge commit.
+- **It is durable.** The grafted state goes into the blob store, the root is recorded in the
+  namespace's `meta.json` (`graftRoots`), and a restart or a replay of the log rebuilds it all.
+
+Limits:
+- **Needs `history=full` (tree objects).** A `history=none` namespace refuses with
+  `unrelated-history` and a reason pointing at deepen.
+- **A delete does not win.** With an empty base, a document one side deleted and the other still
+  holds comes back.
+- **The whole root state is held in memory** until it is verified (the tree hash is checked only
+  once the last page is in).
+- **The Kotlin CLI cannot read a grafted namespace.** It refuses the directory loudly, as it does a
+  snapshot-rooted one; it never serves a wrong value.
+- Nodes whose chains differ (including `allowUnrelated`) do not merge at all; the chain's hash is
+  compared at every sync.
+
 ### Reading your own writes across replicas: sessions
 
 A client that writes through one replica and then reads through another can, by default, read an
