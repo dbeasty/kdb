@@ -201,7 +201,15 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 		return err
 	}
 	haves := append(spreadAncestors(env.DAG, localHead), localRefHeads(env.DAG)...)
-	haves = append(haves, cfg.ExtraHaves[remote.Namespace]...)
+	// Only commits this node holds: a have tells the peer it need not send anything below it. The
+	// peer's main as of the last sync (the replicator's extra have) is not held when that sync
+	// ended with the peer merging this node's push - offering it would make the peer send
+	// nothing, and the ref could not be adopted.
+	for _, h := range cfg.ExtraHaves[remote.Namespace] {
+		if env.DAG.HasCommit(h) {
+			haves = append(haves, h)
+		}
+	}
 	// One ref at a time, main first. A ref this node cannot take - a side branch forked below
 	// the snapshot this node was bootstrapped from, whose parents no peer can send it - is
 	// recorded and skipped; it must not stop main, or every later sync of the namespace fails

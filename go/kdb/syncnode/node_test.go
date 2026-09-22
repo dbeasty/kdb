@@ -141,7 +141,11 @@ func TestPeerNamespacesChangeWhileRunning(t *testing.T) {
 	}
 	eventually(t, "the phone to pull its user's namespace", func() bool { return phone.get("zolik/u/1", profile) != "" })
 	r := phone.node.Replicator()
-	before, _ := r.Status()[0].State.Namespaces["zolik/u/1"]
+	// Progress is recorded when the cycle that brought the document ends, a moment after it lands.
+	eventually(t, "the user's namespace progress to be recorded", func() bool {
+		return r.Status()[0].State.Namespaces["zolik/u/1"].RemoteMain != ""
+	})
+	before := r.Status()[0].State.Namespaces["zolik/u/1"]
 
 	if err := r.AddNamespaces("cloud", "zolik/m/9"); err != nil {
 		t.Fatal(err)
