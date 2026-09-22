@@ -530,6 +530,10 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgSnapshotPage, "SNAPSHOT_PAGE"},
 		{wire.MsgProjectFetch, "PROJECT_FETCH"},
 		{wire.MsgProjectPage, "PROJECT_PAGE"},
+		{wire.MsgTreeNodes, "TREE_NODES"},
+		{wire.MsgTreeNodesResult, "TREE_NODES_RESULT"},
+		{wire.MsgObjectFetch, "OBJECT_FETCH"},
+		{wire.MsgObjectFetchResult, "OBJECT_FETCH_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -556,7 +560,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x34
+const nextFreeMessageCode = 0x38
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{
@@ -776,5 +780,43 @@ func TestRoundTripProjectWrite(t *testing.T) {
 	rb := roundTrip(t, res).(wire.ProjectWriteResultMessage)
 	if rb.Outcome != wire.WriteBackConflict || len(rb.Current) != 2 || rb.Current[1] != res.Current[1] {
 		t.Fatalf("round trip changed the result: %+v", rb)
+	}
+}
+
+func TestRoundTripRepairFrames(t *testing.T) {
+	children := make([]string, 16)
+	children[3] = "ab"
+	nodes := wire.TreeNodesResultMessage{
+		H: wire.Header{MessageType: wire.MsgTreeNodesResult, CorrelationID: 4}, Namespace: "app/data", TreeHex: "cd",
+		Nodes: []wire.TreeNodeInfo{
+			{Prefix: "", Hash: "ee", Children: children},
+			{Prefix: "3", Hash: "ab", HasEntries: true, Entries: map[string]string{"id-1": "ff"}},
+			{Prefix: "4"},
+		},
+	}
+	nb := roundTrip(t, nodes).(wire.TreeNodesResultMessage)
+	if nb.TreeHex != "cd" || len(nb.Nodes) != 3 || nb.Nodes[0].Children[3] != "ab" || !nb.Nodes[1].HasEntries ||
+		nb.Nodes[1].Entries["id-1"] != "ff" || nb.Nodes[2].Hash != "" || nb.Nodes[2].HasEntries {
+		t.Fatalf("round trip changed the nodes: %+v", nb)
+	}
+	req := roundTrip(t, wire.TreeNodesMessage{
+		H: wire.Header{MessageType: wire.MsgTreeNodes, CorrelationID: 4}, Namespace: "app/data", Prefixes: []string{"", "3"}, EntryLimit: 8,
+	}).(wire.TreeNodesMessage)
+	if len(req.Prefixes) != 2 || req.Prefixes[0] != "" || req.EntryLimit != 8 {
+		t.Fatalf("round trip changed the request: %+v", req)
+	}
+	fetch := roundTrip(t, wire.ObjectFetchMessage{
+		H: wire.Header{MessageType: wire.MsgObjectFetch, CorrelationID: 5}, Namespace: "app/data",
+		Items: []wire.ObjectRef{{DocID: "d", ContentHex: "aa", TreeHex: "bb"}},
+	}).(wire.ObjectFetchMessage)
+	if len(fetch.Items) != 1 || fetch.Items[0].TreeHex != "bb" {
+		t.Fatalf("round trip changed the fetch: %+v", fetch)
+	}
+	res := roundTrip(t, wire.ObjectFetchResultMessage{
+		H: wire.Header{MessageType: wire.MsgObjectFetchResult, CorrelationID: 5}, Namespace: "app/data",
+		Docs: []wire.SnapshotDoc{{DocID: "d", Body: `{"v":1}`}}, Missing: []string{"e"},
+	}).(wire.ObjectFetchResultMessage)
+	if len(res.Docs) != 1 || res.Docs[0].Body != `{"v":1}` || len(res.Missing) != 1 {
+		t.Fatalf("round trip changed the result: %+v", res)
 	}
 }

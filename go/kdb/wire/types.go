@@ -107,6 +107,10 @@ const (
 	MsgProjectPage        MessageType = 0x31
 	MsgProjectWrite       MessageType = 0x32
 	MsgProjectWriteResult MessageType = 0x33
+	MsgTreeNodes          MessageType = 0x34
+	MsgTreeNodesResult    MessageType = 0x35
+	MsgObjectFetch        MessageType = 0x36
+	MsgObjectFetchResult  MessageType = 0x37
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -217,6 +221,14 @@ func (t MessageType) String() string {
 		return "PROJECT_WRITE"
 	case MsgProjectWriteResult:
 		return "PROJECT_WRITE_RESULT"
+	case MsgTreeNodes:
+		return "TREE_NODES"
+	case MsgTreeNodesResult:
+		return "TREE_NODES_RESULT"
+	case MsgObjectFetch:
+		return "OBJECT_FETCH"
+	case MsgObjectFetchResult:
+		return "OBJECT_FETCH_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -326,6 +338,14 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgProjectWrite, true
 	case 0x33:
 		return MsgProjectWriteResult, true
+	case 0x34:
+		return MsgTreeNodes, true
+	case 0x35:
+		return MsgTreeNodesResult, true
+	case 0x36:
+		return MsgObjectFetch, true
+	case 0x37:
+		return MsgObjectFetchResult, true
 	default:
 		return 0, false
 	}
