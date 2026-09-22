@@ -70,10 +70,15 @@ type metaDoc struct {
 	Dropped   bool              `json:"dropped,omitempty"`
 	// Home is a single-home assignment (kind "home"); an empty Node means multi-leader.
 	Home *Home `json:"home,omitempty"`
+	// Resolution is a conflict resolution chain (kind "resolution"); no rules means none.
+	Resolution *peersync.ResolutionChain `json:"resolution,omitempty"`
 }
 
 func metaSchemaID(ns string) codec.UUID { return codec.DerivedUUID("kdb:meta/schema/" + ns) }
 func metaHomeID(ns string) codec.UUID   { return codec.DerivedUUID("kdb:meta/home/" + ns) }
+func metaResolutionID(ns string) codec.UUID {
+	return codec.DerivedUUID("kdb:meta/resolution/" + ns)
+}
 func metaIndexID(ns, name string) codec.UUID {
 	return codec.DerivedUUID("kdb:meta/index/" + ns + "/" + name)
 }
@@ -187,6 +192,30 @@ func (m *MetaStore) RecordDropIndex(ns, name string) error {
 		return nil
 	}
 	return m.put(metaIndexID(ns, name), metaDoc{Kind: "index", Namespace: ns, Name: name, Dropped: true})
+}
+
+// SetResolution records ns's conflict resolution chain, or with no rules removes it, and applies
+// it here at once. Set on one node, it replicates like any definition; setting different chains
+// on two nodes at once is a same-document conflict in the metadata namespace. Until it has
+// replicated, peers see different chain hashes and do not merge that namespace (see
+// peersync.ResolutionChain.Hash).
+func (m *MetaStore) SetResolution(ns string, c peersync.ResolutionChain) error {
+	if m == nil {
+		return fmt.Errorf("no metadata namespace: resolution chains are recorded in it")
+	}
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	d := metaDoc{Kind: "resolution", Namespace: ns, Resolution: &c}
+	if err := m.put(metaResolutionID(ns), d); err != nil {
+		return err
+	}
+	if rt, ok := m.set.Get(ns); ok {
+		m.apply(rt, d)
+	}
+	return nil
 }
 
 // AssignHome makes node (reachable for clients at addr) the only node that accepts ns's writes,
@@ -315,6 +344,13 @@ func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
 		err = m.applySchema(rt, d)
 	case "index":
 		err = m.applyIndex(rt, d)
+	case "resolution":
+		if d.Resolution == nil {
+			rt.SetResolutionChain(nil)
+		} else if err = d.Resolution.Validate(); err == nil {
+			c := *d.Resolution
+			rt.SetResolutionChain(&c)
+		}
 	case "home":
 		if d.Home == nil || d.Home.Node == "" {
 			rt.SetHome(nil)

@@ -28,6 +28,18 @@ type DocumentConflict struct {
 	ExistingDoc   *document.Document
 	IncomingDoc   *document.Document
 	BaseDoc       *document.Document
+	// ExistingOrigin and IncomingOrigin name the writes that produced each side's value, when
+	// the conflict comes from a peer-sync merge: which node wrote it, in which commit, and when.
+	// Zero when unknown.
+	ExistingOrigin ConflictOrigin
+	IncomingOrigin ConflictOrigin
+}
+
+// ConflictOrigin is the write that produced one side of a conflict.
+type ConflictOrigin struct {
+	NodeID          codec.UUID
+	Commit          codec.Hash
+	TimestampMicros int64
 }
 
 // TransactionResult is the outcome of commit, replay, or merge.

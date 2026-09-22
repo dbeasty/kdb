@@ -95,6 +95,12 @@ type ResolutionOptions struct {
 	// resolution failure/nil result for any document, falls back to reporting the conflict
 	// rather than guessing - matching transaction.Engine's own CUSTOM fallback.
 	Resolver transaction.ConflictResolver
+	// Chain, when set, is the namespace's resolution chain: it decides each same-document
+	// conflict Choose left, before Policy is consulted. A document the chain leaves undecided
+	// falls through to Policy, unless the chain ended in RuleQueue - then it is reported.
+	Chain *ResolutionChain
+	// Valid reports whether a document body passes the namespace's schema, for RuleValidity.
+	Valid func(body string) bool
 }
 
 var (

@@ -846,7 +846,7 @@ The fan-out tests were rewritten for coalescing: 300 commits behind a stuck subs
 
 ---
 
-## Proposed next phases (10.5, 11–15) — not started
+## Proposed next phases (10.5, 11–15) — 10.5 in progress, the rest not started
 
 These come from the research survey and gap analysis in [kdb-distributed-self-healing-research.md](kdb-distributed-self-healing-research.md). That document carries the rationale, the citations and the full work items. The phases are listed here so the plan shows the sequence.
 
@@ -858,4 +858,22 @@ These come from the research survey and gap analysis in [kdb-distributed-self-he
 | 13 | Scrub and self-repair from peers in the maintenance scheduler; `integrity.Repair` fetches missing commits from peers | 12 |
 | 14 | Edge lazy fill: projection read-through with inclusion proofs, bounded hoard, filter widening by tree diff, deepen | 12 |
 | 15 | Gated on measurement: Bloom/RIBLT negotiation, φ-accrual suspicion, changed-docID Bloom per commit, session head tokens | — |
+
+### Phase 10.5, slice 1 — landed (resolution chains)
+
+**Landed:**
+- **Chains:** `peersync/resolution_chain.go` adds the `source-priority`, `validity`, `field-merge`, `last-write` and `queue` rules. Each is evaluated per document in canonical parent order, so it is symmetric.
+- **Order of decision:** `resolveConflicting` now tries `Choose`, then the chain, then the policy, **per document**. Before, `Choose` was all-or-nothing. An operator's choice for one document now stands while the chain settles the rest, and a report names only what is still undecided.
+- **Base:** it comes from `CommonAncestor(p0, p1)` in canonical order. With a criss-cross, the local/incoming order would let two nodes pick different bases.
+- **Resolver input:** `transaction.DocumentConflict` gains `ExistingOrigin`/`IncomingOrigin` ({node, commit, timestamp}), and `BaseDoc` is now filled.
+- **Replication:** the chain is replicated as `_kdb/meta` kind `resolution` (`MetaStore.SetResolution`), with `GET`/`PUT /v1/ns/{ns}/resolution`.
+- **Hash check:** `NamespaceRefs.ResolutionHash` travels in the hello ack. The client compares hashes, and on a mismatch it pulls with strict resolution and pushes `main` only as a fast-forward. So neither side builds a merge under a chain the other lacks. The Go-only v2 frames mean there's no Kotlin counterpart.
+
+**Not yet (next slices):**
+- node labels for `source-priority`
+- the resolver authority: a `ConflictResolve` permission, a conflict stream/webhook, `kdb:resolve/1` commits, and `hold`/`provisional` modes
+- operator bulk take-theirs/ours, and a CLI for chains
+- Phase 11 (unrelated histories)
+
+**Known limit:** the chain hash doesn't cover the schema that `validity` checks against. Two nodes that have received different schema versions can judge differently until the schema has replicated.
 

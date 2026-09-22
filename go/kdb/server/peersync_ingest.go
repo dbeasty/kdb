@@ -41,7 +41,7 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 		Node:               s.PeerSyncNode(),
 		PersistAsync:       s.peerPersistAsync(),
 		ApplyToStorage:     true,
-		Resolution:         peersync.ResolutionOptions{Policy: s.PeerSyncConflictPolicy},
+		Resolution:         s.peerResolution(),
 		Conflicts:          s.Conflicts,
 		CanInstallSnapshot: s.Runtime.CanInstallSnapshot,
 		SnapshotInstalled: func(root document.Commit) error {

@@ -52,6 +52,9 @@ type NamespaceRefs struct {
 	HistoryFloorHex string
 	// Shallow lists commits this node holds without their parents.
 	Shallow []string
+	// ResolutionHash identifies the namespace's conflict resolution chain (empty: none). Peers
+	// whose hashes differ would settle the same conflict differently, so neither merges.
+	ResolutionHash string
 }
 
 // SyncHelloMessage opens a v2 session.
@@ -181,6 +184,7 @@ type namespaceRefsDto struct {
 	Branches        map[string]string `json:"branches"`
 	Tags            map[string]string `json:"tags,omitempty"`
 	HistoryFloorHex string            `json:"historyFloorHex,omitempty"`
+	ResolutionHash  string            `json:"resolutionHash,omitempty"`
 	Shallow         []string          `json:"shallow,omitempty"`
 }
 
@@ -253,7 +257,7 @@ func refsToDto(refs []NamespaceRefs) []namespaceRefsDto {
 	for i, r := range refs {
 		out[i] = namespaceRefsDto{
 			Namespace: r.Namespace, Branches: r.Branches, Tags: r.Tags,
-			HistoryFloorHex: r.HistoryFloorHex, Shallow: r.Shallow,
+			HistoryFloorHex: r.HistoryFloorHex, Shallow: r.Shallow, ResolutionHash: r.ResolutionHash,
 		}
 	}
 	return out
@@ -264,7 +268,7 @@ func refsFromDto(dtos []namespaceRefsDto) []NamespaceRefs {
 	for i, d := range dtos {
 		out[i] = NamespaceRefs{
 			Namespace: d.Namespace, Branches: d.Branches, Tags: d.Tags,
-			HistoryFloorHex: d.HistoryFloorHex, Shallow: d.Shallow,
+			HistoryFloorHex: d.HistoryFloorHex, Shallow: d.Shallow, ResolutionHash: d.ResolutionHash,
 		}
 	}
 	return out

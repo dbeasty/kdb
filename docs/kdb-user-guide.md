@@ -1275,6 +1275,47 @@ The queue also records two things nothing can merge away:
 - documents that replicated into a unique-key clash
 - replicated schema or index definitions that can't be applied here
 
+### Resolution chains: deciding conflicts automatically, per namespace
+
+A **resolution chain** is a namespace's ordered list of rules for settling a same-document conflict
+when nodes merge. Each rule either decides or passes to the next:
+
+| Rule | Decides |
+|---|---|
+| `source-priority` | the value written by the higher-ranked node. `nodes` lists node ids, highest first; a node not listed ranks below all of them |
+| `validity` | the value that passes the namespace's schema, when the other doesn't |
+| `field-merge` | a field-by-field merge, when the two sides changed different top-level fields |
+| `last-write` | the later write (always decides; must be last) |
+| `queue` | nothing: the conflict is queued for the application or an operator, whatever `--peer-conflict-policy` says (must be last) |
+
+A chain that runs out without deciding falls back to `--peer-conflict-policy`.
+
+For example, "the AWS node is the source of truth, otherwise merge fields, otherwise ask":
+
+```bash
+curl -X PUT https://kdb:9443/v1/ns/site/berlin/orders/resolution -d '{
+  "rules": [
+    {"kind": "source-priority", "nodes": ["<aws node id>"]},
+    {"kind": "field-merge"},
+    {"kind": "queue"}
+  ]}'
+```
+
+`GET …/resolution` shows the chain and its hash. `{"rules": []}` removes it.
+
+A merge must come out the same on every node, so the chain is a replicated definition in
+`_kdb/meta`, like a schema. Peers compare chain hashes at the start of each sync. **While the hashes
+differ, neither node merges that namespace**:
+- a divergence is queued;
+- `main` is pushed only where it fast-forwards the peer, and the sync result reports
+  `ResolutionMismatch`.
+
+This clears on the next sync after the definition has replicated.
+
+Resolvers registered on the Go API (`ConflictPolicyCustom`) now also receive the common base value
+(`BaseDoc`) and which node wrote each side, in which commit and when (`ExistingOrigin`,
+`IncomingOrigin`).
+
 ### Joining, catching up, and retention
 
 **Joining.** A new node either fetches a peer's whole history or, with `bootstrap=snapshot`,
