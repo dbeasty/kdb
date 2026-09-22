@@ -421,6 +421,11 @@ func (c *Client) nextCorrelation() int {
 // cancelled context aborts this call and returns ctx.Err(), leaving the connection itself
 // reusable for the next call (component 40 spec §5).
 func (c *Client) request(ctx context.Context, msg wire.Message) (wire.Message, error) {
+	// A context cancelled before the call must not send it: once sent, a fast reply and the
+	// cancellation race in the select below, and a write could commit under a cancelled context.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	frame, err := c.codec.Encode(msg)
 	if err != nil {
 		return nil, err
