@@ -186,7 +186,7 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 		return res
 	}
 	env.Peer = c.remoteNode
-	if env.Resolution.Chain.Hash() != remote.ResolutionHash {
+	if env.Resolution.AdvertisedHash() != remote.ResolutionHash {
 		// The two nodes would settle a conflict differently and so build different merges. Hold
 		// off merging on either side until they agree - report instead of resolving here, and
 		// do not propose a head the peer would have to merge (see push).

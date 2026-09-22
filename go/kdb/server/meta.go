@@ -319,6 +319,9 @@ func (m *MetaStore) SetResolution(ns string, c peersync.ResolutionChain) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
+	if err := m.pinProcedures(ns, &c); err != nil {
+		return err
+	}
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 	if err := validNamespaceOrPattern(ns); err != nil {
@@ -351,6 +354,32 @@ func validNamespaceOrPattern(ns string) error {
 	return nil
 }
 
+// pinProcedures fills in the source hash of every procedure the chain calls, from what this node
+// holds now. That is what makes the chain's own hash cover the code it runs: a node with an older
+// revision of the procedure no longer looks like a node that agrees, so it stops merging instead
+// of merging differently.
+//
+// It follows that the procedure must be defined before a chain may call it. Refusing here is the
+// only moment where that can be said plainly; every later one is a merge that will not happen.
+func (m *MetaStore) pinProcedures(ns string, c *peersync.ResolutionChain) error {
+	rt, served := m.set.Get(ns)
+	for i := range c.Rules {
+		r := &c.Rules[i]
+		if r.Kind != peersync.RuleProcedure {
+			continue
+		}
+		if !served {
+			return fmt.Errorf("this process does not serve %s, so it cannot pin the revision of procedure %q the chain would run", ns, r.Name)
+		}
+		hash := rt.ProcedureHash(r.Name)
+		if hash == "" {
+			return fmt.Errorf("define procedure %q in %s before a chain calls it", r.Name, ns)
+		}
+		r.SourceHash = hash
+	}
+	return nil
+}
+
 // SetProcedure records a stored procedure on ns and applies it here at once, refusing source
 // that does not compile - a procedure is checked when it is defined rather than in the middle of
 // a merge, where the only thing a caller could do with a broken one is stop merging.
@@ -378,11 +407,51 @@ func (m *MetaStore) SetProcedure(ns, name, source string) error {
 		return err
 	}
 	if IsNamespacePattern(ns) {
+		// A procedure defined for a pattern belongs to no one runtime, so there is no chain here
+		// to re-pin against it; every matching namespace picks it up as it reconciles.
 		return m.reconcileLocked()
 	}
-	if rt, ok := m.set.Get(ns); ok {
-		m.apply(rt, d)
+	rt, ok := m.set.Get(ns)
+	if !ok {
+		return nil
 	}
+	m.apply(rt, d)
+	return m.repinChain(ns, rt)
+}
+
+// repinChain re-pins ns's chain when it calls a procedure whose source has just changed, and
+// records the new chain alongside it.
+//
+// Without this, changing a procedure would quietly stop the namespace merging: the chain would
+// still pin the old revision, every node would find its own copy no longer matching, and an
+// operator would have to know to set the same chain again. The two definitions replicate
+// separately, so a peer may hold one and not the other for a moment - during which the hashes
+// differ and nothing merges, which is the outcome this whole mechanism exists to produce.
+func (m *MetaStore) repinChain(ns string, rt *KdbServerRuntime) error {
+	c := rt.ResolutionChainOf()
+	if c == nil {
+		return nil
+	}
+	next := peersync.ResolutionChain{Rules: append([]peersync.ResolutionRule{}, c.Rules...)}
+	changed := false
+	for i := range next.Rules {
+		r := &next.Rules[i]
+		if r.Kind != peersync.RuleProcedure {
+			continue
+		}
+		if hash := rt.ProcedureHash(r.Name); hash != "" && hash != r.SourceHash {
+			r.SourceHash = hash
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	d := metaDoc{Kind: "resolution", Namespace: ns, Resolution: &next}
+	if err := m.put(metaResolutionID(ns), d); err != nil {
+		return err
+	}
+	m.apply(rt, d)
 	return nil
 }
 

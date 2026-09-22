@@ -461,8 +461,12 @@ type resolution struct {
 // ConflictDetail is what a resolver needs about one undecided document beyond its two values:
 // the value they both started from and which writes produced each side.
 type ConflictDetail struct {
-	DocumentID     string                     `json:"documentId"`
-	Base           *string                    `json:"base,omitempty"`
+	DocumentID string  `json:"documentId"`
+	Base       *string `json:"base,omitempty"`
+	// Reason is set when a rule could not run at all rather than leaving the conflict undecided -
+	// a stored procedure that threw, timed out, or is not on this node. It is something to fix,
+	// not something to decide, so it is said rather than left for an operator to infer.
+	Reason         string                     `json:"reason,omitempty"`
 	LocalOrigin    transaction.ConflictOrigin `json:"localOrigin"`
 	IncomingOrigin transaction.ConflictOrigin `json:"incomingOrigin"`
 }
@@ -489,16 +493,20 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 	p0, _ := mergeCommitParents(localHead, incomingHead)
 	localFirst := p0 == localHead
 	var queued []divergedDoc
+	reasons := map[codec.UUID]string{}
 	if opts.Chain != nil && len(pending) > 0 {
 		var rest []divergedDoc
 		for _, dd := range pending {
-			o := opts.Chain.resolve(d, canonicalSides(dd, localFirst), opts.Valid)
+			o := opts.Chain.resolve(d, dd.id, canonicalSides(dd, localFirst), opts)
 			switch {
 			case o.decided:
 				out[dd.id] = Settlement{Body: o.winner, Fork: o.fork}
 				if o.provisional {
 					provisional = append(provisional, dd.id)
 				}
+			case o.held:
+				reasons[dd.id] = o.reason
+				queued = append(queued, dd)
 			case o.queued:
 				queued = append(queued, dd)
 			default:
@@ -574,7 +582,7 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 			IncomingDoc:   dd.remote,
 		})
 		details = append(details, ConflictDetail{
-			DocumentID: dd.id.String(), Base: dd.base,
+			DocumentID: dd.id.String(), Base: dd.base, Reason: reasons[dd.id],
 			LocalOrigin: conflictOrigin(d, dd.localOrig), IncomingOrigin: conflictOrigin(d, dd.remoteOrig),
 		})
 	}
