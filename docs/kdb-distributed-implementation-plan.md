@@ -843,3 +843,19 @@ An adversarial review of phases 0–10 found eight defects. Each has a regressio
 - a filter plus a hidden document: only readable matching documents, and leaving the filter arrives as a delete
 
 The fan-out tests were rewritten for coalescing: 300 commits behind a stuck subscriber arrive, once it drains, in far fewer frames and end at the head.
+
+---
+
+## Proposed next phases (10.5, 11–15) — not started
+
+These come from the research survey and gap analysis in [kdb-distributed-self-healing-research.md](kdb-distributed-self-healing-research.md). That document carries the rationale, the citations and the full work items. The phases are listed here so the plan shows the sequence.
+
+| Phase | Scope | Depends on |
+|---|---|---|
+| 10.5 | Resolution policies and an application resolver authority:<ul><li>`DocumentConflict` gains base + origins</li><li>replicated per-namespace/collection resolution chains (`source-priority`, `validity`, `field-merge`, `last-write`, `queue` / `authority`)</li><li>a `ConflictResolve` permission, conflict stream/webhook, `kdb:resolve/1` resolution commits, `hold`/`provisional` pending modes</li><li>operator bulk take-theirs/ours</li></ul> | 5 (`_kdb/meta`), 9 (home = resolver node) |
+| 11 | Merge unrelated histories: opt-in `AllowUnrelated`, with the empty tree as the base | 10.5 |
+| 12 | `TREE_NODES` / `OBJECT_FETCH` frames; trie `NodeHash`/`Children`/`Proof` | — |
+| 13 | Scrub and self-repair from peers in the maintenance scheduler; `integrity.Repair` fetches missing commits from peers | 12 |
+| 14 | Edge lazy fill: projection read-through with inclusion proofs, bounded hoard, filter widening by tree diff, deepen | 12 |
+| 15 | Gated on measurement: Bloom/RIBLT negotiation, φ-accrual suspicion, changed-docID Bloom per commit, session head tokens | — |
+
