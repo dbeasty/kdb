@@ -230,6 +230,7 @@ func resolveDivergedLocked(
 	}
 
 	merged := map[codec.UUID]*string{}
+	var provisional []codec.UUID
 	var differing, conflicting []divergedDoc
 	for _, id := range ids {
 		l, r := vL[id], vR[id]
@@ -281,13 +282,14 @@ func resolveDivergedLocked(
 				}
 			}
 		}
-		resolved, report := resolveConflicting(d, localHead, incomingHead, conflicting, opts)
-		if report != nil {
-			return CommitPushOutcome{Kind: OutcomeConflict, Report: report}, AdvanceStep{}, nil
+		r := resolveConflicting(d, localHead, incomingHead, conflicting, opts)
+		if r.report != nil {
+			return CommitPushOutcome{Kind: OutcomeConflict, Report: r.report, Details: r.details}, AdvanceStep{}, nil
 		}
-		for id, body := range resolved {
+		for id, body := range r.out {
 			merged[id] = body
 		}
+		provisional = r.provisional
 	}
 
 	storageWrites := map[codec.UUID]document.Op{}
@@ -299,7 +301,7 @@ func resolveDivergedLocked(
 			storageWrites[dd.id] = bodyOp(dd.id, m)
 		}
 	}
-	mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, *ancestor, storageWrites, commitOps)
+	mergeCommit, err := mergeNonConflicting(d, store, namespaceID, localHead, incomingHead, *ancestor, storageWrites, commitOps, mergeMessageFor(provisional))
 	if err != nil {
 		return CommitPushOutcome{}, AdvanceStep{}, err
 	}
@@ -311,12 +313,32 @@ func resolveDivergedLocked(
 	return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, step, nil
 }
 
+// resolution is what resolveConflicting made of a merge's conflicting documents: either the
+// merged values (out, with provisional naming those an authority may still overrule), or a
+// report of the documents left undecided with a detail for each.
+type resolution struct {
+	out         map[codec.UUID]*string
+	provisional []codec.UUID
+	report      *kdberr.ConflictReport
+	details     []ConflictDetail
+}
+
+// ConflictDetail is what a resolver needs about one undecided document beyond its two values:
+// the value they both started from and which writes produced each side.
+type ConflictDetail struct {
+	DocumentID     string                     `json:"documentId"`
+	Base           *string                    `json:"base,omitempty"`
+	LocalOrigin    transaction.ConflictOrigin `json:"localOrigin"`
+	IncomingOrigin transaction.ConflictOrigin `json:"incomingOrigin"`
+}
+
 // resolveConflicting decides each genuinely conflicting document per the resolution options,
 // or reports the ones left undecided. Each document goes to the first of these that decides it:
 // an explicit choice (Choose), the namespace's chain, then the policy. Every rule is symmetric in
 // the two sides, so both nodes reach the same answer.
-func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.Hash, docs []divergedDoc, opts ResolutionOptions) (map[codec.UUID]*string, *kdberr.ConflictReport) {
+func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.Hash, docs []divergedDoc, opts ResolutionOptions) resolution {
 	out := map[codec.UUID]*string{}
+	var provisional []codec.UUID
 	pending := docs
 	if opts.Choose != nil {
 		var rest []divergedDoc
@@ -335,11 +357,14 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 	if opts.Chain != nil && len(pending) > 0 {
 		var rest []divergedDoc
 		for _, dd := range pending {
-			winner, decided, q := opts.Chain.resolve(d, canonicalSides(dd, localFirst), opts.Valid)
+			o := opts.Chain.resolve(d, canonicalSides(dd, localFirst), opts.Valid)
 			switch {
-			case decided:
-				out[dd.id] = winner
-			case q:
+			case o.decided:
+				out[dd.id] = o.winner
+				if o.provisional {
+					provisional = append(provisional, dd.id)
+				}
+			case o.queued:
 				queued = append(queued, dd)
 			default:
 				rest = append(rest, dd)
@@ -400,10 +425,12 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 	}
 	reported := append(queued, pending...)
 	if len(reported) == 0 {
-		return out, nil
+		sort.Slice(provisional, func(i, j int) bool { return provisional[i].String() < provisional[j].String() })
+		return resolution{out: out, provisional: provisional}
 	}
 	sort.Slice(reported, func(i, j int) bool { return reported[i].id.String() < reported[j].id.String() })
 	items := make([]kdberr.ConflictItem, 0, len(reported))
+	details := make([]ConflictDetail, 0, len(reported))
 	for _, dd := range reported {
 		items = append(items, kdberr.ConflictItem{
 			DocumentID:    dd.id.String(),
@@ -411,9 +438,16 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 			LocalDoc:      dd.local,
 			IncomingDoc:   dd.remote,
 		})
+		details = append(details, ConflictDetail{
+			DocumentID: dd.id.String(), Base: dd.base,
+			LocalOrigin: conflictOrigin(d, dd.localOrig), IncomingOrigin: conflictOrigin(d, dd.remoteOrig),
+		})
 	}
-	return nil, &kdberr.ConflictReport{
-		TransactionID: incomingHead.Hex(), BaseHash: localHead.Hex(), TargetHash: incomingHead.Hex(), Conflicts: items,
+	return resolution{
+		report: &kdberr.ConflictReport{
+			TransactionID: incomingHead.Hex(), BaseHash: localHead.Hex(), TargetHash: incomingHead.Hex(), Conflicts: items,
+		},
+		details: details,
 	}
 }
 

@@ -3,6 +3,7 @@ package peersync
 import (
 	"bytes"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -67,6 +68,8 @@ type CommitPushOutcome struct {
 	Kind        CommitPushOutcomeKind
 	MergeCommit *document.Commit
 	Report      *kdberr.ConflictReport
+	// Details carries, for each document in Report, its base value and each side's origin.
+	Details []ConflictDetail
 }
 
 // ResolutionOptions controls how resolveDivergedLocked handles a genuine same-document conflict
@@ -179,6 +182,40 @@ var MergeAuthorNodeID = codec.DerivedUUID("kdb:merge-author/1")
 // mergeMessage is every peer-sync merge commit's message.
 const mergeMessage = "kdb:merge/1"
 
+// provisionalMarker introduces, in a merge's message, the documents a resolver authority settled
+// provisionally - by last write, pending its decision. The list is part of the merge's content
+// (every node merging the same heads under the same chain writes the same one), so every node
+// that receives the merge, whether it made it or fetched it, learns which documents await the
+// authority.
+const provisionalMarker = " provisional="
+
+// mergeMessageFor is the message of a merge whose provisional documents are ids.
+func mergeMessageFor(ids []codec.UUID) string {
+	if len(ids) == 0 {
+		return mergeMessage
+	}
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = id.String()
+	}
+	return mergeMessage + provisionalMarker + strings.Join(parts, ",")
+}
+
+// ProvisionalDocuments returns the documents a merge commit settled provisionally, if any.
+func ProvisionalDocuments(c document.Commit) []codec.UUID {
+	rest, ok := strings.CutPrefix(c.Message, mergeMessage+provisionalMarker)
+	if !ok || len(c.ParentHashes) < 2 {
+		return nil
+	}
+	var out []codec.UUID
+	for _, p := range strings.Split(rest, ",") {
+		if id, err := codec.ParseUUID(p); err == nil {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // mergeCommitParents orders a merge's parents canonically - by hash, not by which side is local -
 // so both nodes joining the same two heads name the same first parent.
 func mergeCommitParents(a, b codec.Hash) (codec.Hash, codec.Hash) {
@@ -207,6 +244,7 @@ func mergeNonConflicting(
 	localHead, incomingHead, ancestor codec.Hash,
 	storageWrites map[codec.UUID]document.Op,
 	commitOps map[codec.UUID]document.Op,
+	message string,
 ) (document.Commit, error) {
 	localHeadCommit, err := d.GetCommitOrThrow(localHead)
 	if err != nil {
@@ -259,7 +297,7 @@ func mergeNonConflicting(
 		Timestamp:    ts,
 		AuthorNodeID: MergeAuthorNodeID,
 	}
-	return d.AppendMergeCommitOnto(&localHead, mergeTx, p0, p1, mergedTree, schemaHash, mergeMessage)
+	return d.AppendMergeCommitOnto(&localHead, mergeTx, p0, p1, mergedTree, schemaHash, message)
 }
 
 // touchedDocsForRange replays every commit strictly between ancestor and head, oldest first, to

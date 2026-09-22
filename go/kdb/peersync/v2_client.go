@@ -390,11 +390,17 @@ func syncV1Fallback(w wire.Codec, transport stream.Transport, cfg V2ClientConfig
 			out.Namespaces = append(out.Namespaces, res)
 			continue
 		}
+		// v1 carries no chain hash: with a chain, merge nothing over it - queue what diverges
+		// and push only fast-forwards (see ClientConfig.FastForwardPushOnly).
+		policy, resolver, ffOnly := env.Resolution.Policy, env.Resolution.Resolver, false
+		if env.Resolution.Chain != nil {
+			policy, resolver, ffOnly = transaction.ConflictPolicyStrict, nil, true
+		}
 		client := NewClient(w, transport, env.DAG, env.Storage)
 		session, err := client.Connect(ClientConfig{
 			NamespaceID: ns, NodeID: cfg.NodeID, PeerURI: cfg.PeerURI, ConnectionContext: cfg.ConnectionContext,
 			TLS: cfg.TLS, Node: env.Node, ApplyToStorage: env.ApplyToStorage, PersistAsync: env.PersistAsync,
-			Persist: env.Persist, ConflictPolicy: env.Resolution.Policy, ConflictResolver: env.Resolution.Resolver,
+			Persist: env.Persist, ConflictPolicy: policy, ConflictResolver: resolver, FastForwardPushOnly: ffOnly,
 		})
 		if err != nil {
 			res.Err = err

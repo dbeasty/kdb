@@ -42,6 +42,20 @@ const (
 	// RuleQueue stops the chain: whatever is still undecided is reported and queued for the
 	// application or an operator, regardless of the namespace's conflict policy.
 	RuleQueue = "queue"
+	// RuleAuthority stops the chain and hands whatever is still undecided to a resolver authority
+	// - an application service with its own business rules, or a person - holding the "resolve"
+	// permission. Pending says what the namespace holds meanwhile: PendingHold (the default)
+	// leaves the conflict unmerged, like RuleQueue; PendingProvisional merges now by last write
+	// and marks the merge, so the authority can overrule it later with an ordinary write. Node,
+	// when set, is the one node that notifies the authority; every node still records the
+	// conflict and closes it when the resolution replicates in.
+	RuleAuthority = "authority"
+)
+
+// Pending modes of RuleAuthority.
+const (
+	PendingHold        = "hold"
+	PendingProvisional = "provisional"
 )
 
 // ResolutionRule is one step of a chain.
@@ -49,6 +63,10 @@ type ResolutionRule struct {
 	Kind string `json:"kind"`
 	// Nodes ranks node ids for RuleSourcePriority, highest first.
 	Nodes []string `json:"nodes,omitempty"`
+	// Node is RuleAuthority's notifying node; empty means every node notifies.
+	Node string `json:"node,omitempty"`
+	// Pending is RuleAuthority's mode: PendingHold (default) or PendingProvisional.
+	Pending string `json:"pending,omitempty"`
 }
 
 // ResolutionChain is a namespace's ordered resolution rules.
@@ -77,7 +95,7 @@ func (c ResolutionChain) Validate() error {
 				seen[id] = true
 			}
 		case RuleValidity, RuleFieldMerge:
-		case RuleLastWrite, RuleQueue:
+		case RuleLastWrite, RuleQueue, RuleAuthority:
 			if i != len(c.Rules)-1 {
 				return fmt.Errorf("rule %d: %s always ends the chain, so no rule may follow it", i, r.Kind)
 			}
@@ -87,8 +105,38 @@ func (c ResolutionChain) Validate() error {
 		if r.Kind != RuleSourcePriority && len(r.Nodes) > 0 {
 			return fmt.Errorf("rule %d: only %s takes nodes", i, RuleSourcePriority)
 		}
+		if r.Kind == RuleAuthority {
+			switch r.Pending {
+			case "", PendingHold, PendingProvisional:
+			default:
+				return fmt.Errorf("rule %d: pending must be %q or %q, not %q", i, PendingHold, PendingProvisional, r.Pending)
+			}
+			if r.Node != "" {
+				if _, err := codec.ParseUUID(r.Node); err != nil {
+					return fmt.Errorf("rule %d: %q is not a node id: %v", i, r.Node, err)
+				}
+			}
+		} else if r.Node != "" || r.Pending != "" {
+			return fmt.Errorf("rule %d: only %s takes node and pending", i, RuleAuthority)
+		}
 	}
 	return nil
+}
+
+// Authority returns the chain's authority rule, or nil when it has none.
+func (c *ResolutionChain) Authority() *ResolutionRule {
+	if c == nil || len(c.Rules) == 0 {
+		return nil
+	}
+	if last := c.Rules[len(c.Rules)-1]; last.Kind == RuleAuthority {
+		return &last
+	}
+	return nil
+}
+
+// Notifies reports whether node is one that tells the authority about this chain's conflicts.
+func (r *ResolutionRule) Notifies(node string) bool {
+	return r != nil && r.Kind == RuleAuthority && (r.Node == "" || r.Node == node)
 }
 
 // Hash identifies the chain's behaviour: two chains with the same hash decide every conflict
@@ -111,14 +159,23 @@ type conflictSides struct {
 	base   *string
 }
 
-// resolve runs the chain over one document. decided is false when no rule settled it - either the
-// chain ran out, or it reached RuleQueue (queued is then true).
-func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, s conflictSides, valid func(string) bool) (winner *string, decided, queued bool) {
+// chainOutcome is what a chain made of one document.
+type chainOutcome struct {
+	winner *string
+	// decided: winner is the merged value. provisional additionally marks it as the authority's
+	// to overrule.
+	decided, provisional bool
+	// queued: the chain ended in RuleQueue or a holding RuleAuthority; report it.
+	queued bool
+}
+
+// resolve runs the chain over one document. Neither decided nor queued means the chain ran out.
+func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, s conflictSides, valid func(string) bool) chainOutcome {
 	for _, r := range c.Rules {
 		switch r.Kind {
 		case RuleSourcePriority:
 			if i, ok := sourcePriority(d, r.Nodes, s.origin); ok {
-				return s.body[i], true, false
+				return chainOutcome{winner: s.body[i], decided: true}
 			}
 		case RuleValidity:
 			if valid == nil || s.body[0] == nil || s.body[1] == nil {
@@ -127,24 +184,33 @@ func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, s conflictSides, val
 			v0, v1 := valid(*s.body[0]), valid(*s.body[1])
 			if v0 != v1 {
 				if v0 {
-					return s.body[0], true, false
+					return chainOutcome{winner: s.body[0], decided: true}
 				}
-				return s.body[1], true, false
+				return chainOutcome{winner: s.body[1], decided: true}
 			}
 		case RuleFieldMerge:
 			if merged, ok := fieldMerge(s.base, s.body[0], s.body[1]); ok {
-				return &merged, true, false
+				return chainOutcome{winner: &merged, decided: true}
 			}
 		case RuleLastWrite:
-			if originLater(d, s.origin[0], s.origin[1]) {
-				return s.body[0], true, false
+			return chainOutcome{winner: lastWrite(d, s), decided: true}
+		case RuleAuthority:
+			if r.Pending == PendingProvisional {
+				return chainOutcome{winner: lastWrite(d, s), decided: true, provisional: true}
 			}
-			return s.body[1], true, false
+			return chainOutcome{queued: true}
 		case RuleQueue:
-			return nil, false, true
+			return chainOutcome{queued: true}
 		}
 	}
-	return nil, false, false
+	return chainOutcome{}
+}
+
+func lastWrite(d *dag.InMemoryCommitDag, s conflictSides) *string {
+	if originLater(d, s.origin[0], s.origin[1]) {
+		return s.body[0]
+	}
+	return s.body[1]
 }
 
 // sourcePriority returns the side whose origin was written by the higher-ranked node.

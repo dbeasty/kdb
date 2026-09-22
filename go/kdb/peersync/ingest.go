@@ -69,6 +69,9 @@ type IngestEnv struct {
 	// Peer names the node the incoming history came from, for the conflict queue and tracking
 	// branches. Empty when unknown.
 	Peer string
+	// Self is this node's id, for deciding whether it is the one that notifies a resolver
+	// authority. Empty when unknown.
+	Self string
 	// CheckCommit, when set, is asked about every commit a head move would adopt; an error refuses
 	// the move - the commits stay stored, the head stays put, and the refusal is queued as a
 	// conflict. How a single-home namespace refuses writes from a superseded home.
@@ -187,6 +190,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 		node = lockOnlyNode{}
 	}
 	var durable []func() error
+	var adopted []document.Commit
 	err := node.Exclusive(func() error {
 		lock := divergenceLockFor(env.NamespaceID)
 		lock.Lock()
@@ -225,6 +229,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			if durable, err = env.persistAll(step.Commits); err != nil {
 				return err
 			}
+			adopted = step.Commits
 			return advance(node, step)
 		default:
 			outcome, step, err := resolveDivergedLocked(env.DAG, env.Storage, env.NamespaceID, localHead, incomingHead, env.Resolution)
@@ -233,7 +238,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			}
 			res.Outcome = outcome
 			if outcome.Kind == OutcomeConflict {
-				return env.noteConflict("branch:"+mainBranch, localHead, incomingHead, outcome.Report)
+				return env.noteConflict("branch:"+mainBranch, localHead, incomingHead, outcome.Report, outcome.Details...)
 			}
 			if outcome.MergeCommit == nil {
 				return nil
@@ -242,6 +247,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			if durable, err = env.persistAll(step.Commits); err != nil {
 				return err
 			}
+			adopted = step.Commits
 			return advance(node, step)
 		}
 	})
@@ -262,13 +268,127 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			return res, cerr
 		}
 	}
+	if headErr == nil && len(adopted) > 0 {
+		if cerr := env.afterAdvance(adopted, head); cerr != nil {
+			return res, cerr
+		}
+	}
 	return res, headErr
+}
+
+// afterAdvance keeps the conflict queue in step with commits main has just adopted: it records
+// the provisional decisions their merges made, closes the entries they resolve, and drops
+// divergences main now contains - a conflict some other node settled, whose resolution arrived
+// here as an ordinary fast-forward.
+func (env IngestEnv) afterAdvance(adopted []document.Commit, head codec.Hash) error {
+	if env.Conflicts == nil {
+		return nil
+	}
+	for _, c := range adopted {
+		if id, ok := ResolvedEntry(c); ok {
+			if err := env.Conflicts.Remove(id); err != nil {
+				return err
+			}
+		}
+		if ids := ProvisionalDocuments(c); len(ids) > 0 {
+			if err := env.noteProvisional(c, ids); err != nil {
+				return err
+			}
+		}
+	}
+	return SweepIncorporated(env.DAG, env.Conflicts, head)
+}
+
+// SweepIncorporated drops every divergence of main whose incoming side head already contains,
+// with its tracking branch: nothing about it is left to decide.
+func SweepIncorporated(d *dag.InMemoryCommitDag, q *ConflictQueue, head codec.Hash) error {
+	for _, e := range q.List() {
+		if e.Kind != ConflictDivergence || e.Ref != "branch:"+mainBranch {
+			continue
+		}
+		in, err := codec.HashFromHex(e.IncomingHex)
+		if err != nil || !d.HasCommit(in) || (in != head && !d.IsAncestor(in, head)) {
+			continue
+		}
+		if e.TrackingRef != "" {
+			_ = d.DeleteBranch(e.TrackingRef)
+		}
+		if err := q.Remove(e.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// noteProvisional records merge m's provisional decisions for the authority: each document's
+// merged value as the local side, the value it displaced as the incoming one.
+func (env IngestEnv) noteProvisional(m document.Commit, ids []codec.UUID) error {
+	if len(m.ParentHashes) < 2 {
+		return nil
+	}
+	vi := valueIndex{d: env.DAG, store: env.Storage, ns: env.NamespaceID}
+	p0, p1 := m.ParentHashes[0], m.ParentHashes[1]
+	v0, err := vi.valuesAt(p0, ids)
+	if err != nil {
+		return err
+	}
+	v1, err := vi.valuesAt(p1, ids)
+	if err != nil {
+		return err
+	}
+	var base map[codec.UUID]docVal
+	if anc := env.DAG.CommonAncestor(p0, p1); anc != nil {
+		if base, err = vi.valuesAt(*anc, ids); err != nil {
+			return err
+		}
+	}
+	merged := map[codec.UUID]*string{}
+	for _, op := range m.Operations {
+		merged[opDocID(op)] = opBody(op)
+	}
+	e := ConflictEntry{
+		ID: ConflictID(ConflictProvisional, env.NamespaceID, m.Hash.Hex()), Kind: ConflictProvisional,
+		Namespace: env.NamespaceID, MergeHex: m.Hash.Hex(), Peer: env.Peer,
+		Detail: "settled provisionally by last write; the authority may overrule it",
+	}
+	if a := env.Resolution.Chain.Authority(); a != nil {
+		e.Authority, e.AuthorityNode = true, a.Node
+	}
+	for _, id := range ids {
+		kept, keptAt, lost, lostAt := v0[id].body, p0, v1[id].body, p1
+		if !sameBody(merged[id], kept) {
+			kept, keptAt, lost, lostAt = lost, lostAt, kept, keptAt
+		}
+		oKept, err := vi.origin(keptAt, id)
+		if err != nil {
+			return err
+		}
+		oLost, err := vi.origin(lostAt, id)
+		if err != nil {
+			return err
+		}
+		e.Items = append(e.Items, kdberr.ConflictItem{
+			DocumentID:    id.String(),
+			OperationType: classifyConflictOp(bodyOp(id, kept), bodyOp(id, lost)),
+			LocalDoc:      kept,
+			IncomingDoc:   lost,
+		})
+		e.Details = append(e.Details, ConflictDetail{
+			DocumentID: id.String(), Base: base[id].body,
+			LocalOrigin: conflictOrigin(env.DAG, oKept), IncomingOrigin: conflictOrigin(env.DAG, oLost),
+		})
+	}
+	if prev, ok := env.Conflicts.Get(e.ID); ok && prev.Kind == ConflictProvisional {
+		return nil // already known; re-recording would only bump its sighting count
+	}
+	_, err = env.Conflicts.Record(e)
+	return err
 }
 
 // noteConflict records a refused update of ref to incoming, and points a tracking branch at the
 // incoming side so it stays reachable - retention keeps what a branch names - and resolution can
 // find it after the peer has moved on.
-func (env IngestEnv) noteConflict(ref string, local, incoming codec.Hash, report *kdberr.ConflictReport) error {
+func (env IngestEnv) noteConflict(ref string, local, incoming codec.Hash, report *kdberr.ConflictReport, details ...ConflictDetail) error {
 	if env.Conflicts == nil {
 		return nil
 	}
@@ -291,6 +411,10 @@ func (env IngestEnv) noteConflict(ref string, local, incoming codec.Hash, report
 	}
 	if report != nil {
 		e.Items = report.Conflicts
+	}
+	e.Details = details
+	if a := env.Resolution.Chain.Authority(); a != nil && len(details) > 0 {
+		e.Authority, e.AuthorityNode = true, a.Node
 	}
 	_, err := env.Conflicts.Record(e)
 	return err
