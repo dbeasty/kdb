@@ -159,6 +159,11 @@ func TestPeerNamespacesChangeWhileRunning(t *testing.T) {
 	if err := r.RemoveNamespaces("cloud", "zolik/m/9"); err != nil {
 		t.Fatal(err)
 	}
+	// A cycle already under way read the old patterns when it began; SyncNow waits for it, and
+	// every cycle after reads the new ones.
+	if _, err := phone.node.SyncNow("cloud"); err != nil {
+		t.Fatal(err)
+	}
 	later := mustID(t)
 	cloud.put(t, "zolik/m/9", later, `{"move":"e5"}`)
 	if _, err := phone.node.SyncNow("cloud"); err != nil {
