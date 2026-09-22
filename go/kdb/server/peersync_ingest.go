@@ -213,12 +213,23 @@ func (s *KdbServerRuntime) recordUniqueDuplicates(dups []transaction.UniqueConst
 	return nil
 }
 
-// ResolveConflict settles a queued divergence of main by merging the peer's side with the
-// documents chosen as choices say - see peersync.ResolveConflict. It is an ordinary write: the
-// principal needs commit rights, and the merge replicates like any other commit.
+// ResolveConflict settles a queued conflict as choices say. A divergence of main is merged with
+// the peer's side (see peersync.ResolveConflict); a provisional decision is overruled or confirmed
+// by an ordinary commit naming the entry (see resolveProvisional). Either replicates like any
+// write and closes the entry on every node that adopts it.
+//
+// In a namespace whose chain hands conflicts to a resolver authority, only a principal holding
+// "resolve" may settle them; otherwise commit rights are enough, as before authorities existed.
 func (s *KdbServerRuntime) ResolveConflict(id string, choices map[codec.UUID]peersync.Choice, principal auth.Principal) (document.Commit, error) {
-	if err := s.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.TxCommitAction{Namespace: s.Runtime.DefaultNamespace}); err != nil {
-		return document.Commit{}, &AuthorizationError{Cause: err}
+	if err := s.authorizeResolve(principal); err != nil {
+		return document.Commit{}, err
+	}
+	e, ok := s.Conflicts.Get(id)
+	if !ok {
+		return document.Commit{}, peersync.ErrConflictNotFound
+	}
+	if e.Kind == peersync.ConflictProvisional {
+		return s.resolveProvisional(e, choices, principal)
 	}
 	res, err := peersync.ResolveConflict(s.PeerIngestEnv(), id, choices)
 	if err != nil {
@@ -232,8 +243,8 @@ func (s *KdbServerRuntime) ResolveConflict(id string, choices map[codec.UUID]pee
 // for a divergence the operator has decided to leave unmerged. A divergence's tracking branch
 // goes with it.
 func (s *KdbServerRuntime) DismissConflict(id string, principal auth.Principal) error {
-	if err := s.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.TxCommitAction{Namespace: s.Runtime.DefaultNamespace}); err != nil {
-		return &AuthorizationError{Cause: err}
+	if err := s.authorizeResolve(principal); err != nil {
+		return err
 	}
 	e, ok := s.Conflicts.Get(id)
 	if !ok {

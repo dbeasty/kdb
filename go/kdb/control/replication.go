@@ -9,6 +9,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/replication"
+	"github.com/limidus/kdb/go/kdb/server"
 )
 
 // ReplicationSource is the replicator a control plane reports and drives. nil when the process
@@ -48,8 +49,72 @@ func (s *Server) handlePeerSync(w http.ResponseWriter, r *http.Request, _ auth.P
 }
 
 // GET /v1/ns/{ns}/conflicts - the namespace's open replication conflicts.
-func (s *Server) handleConflicts(w http.ResponseWriter, _ *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
-	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "conflicts": rt.Conflicts.List()})
+// GET /v1/ns/{ns}/conflicts - the namespace's queued conflicts. ?authority=true keeps only those
+// handed to a resolver authority, and ?undelivered=true only those not yet acknowledged - together,
+// what a polling authority has still to see (it acknowledges each with POST .../{id}/ack).
+func (s *Server) handleConflicts(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	onlyAuthority := r.URL.Query().Get("authority") == "true"
+	onlyUndelivered := r.URL.Query().Get("undelivered") == "true"
+	out := []peersync.ConflictEntry{}
+	for _, e := range rt.Conflicts.List() {
+		if (onlyAuthority && !e.Authority) || (onlyUndelivered && e.Delivered) {
+			continue
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "conflicts": out})
+}
+
+// resolveError answers a failed resolution: 404 for an unknown entry, 403 for a principal
+// without the right, 409 for anything the caller can fix by deciding again.
+func resolveError(w http.ResponseWriter, err error) {
+	var authz *server.AuthorizationError
+	var stale *server.ErrResolutionStale
+	switch {
+	case errors.Is(err, peersync.ErrConflictNotFound):
+		writeError(w, http.StatusNotFound, "unknown_conflict", err.Error())
+	case errors.As(err, &authz):
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+	case errors.As(err, &stale):
+		writeError(w, http.StatusConflict, "stale", err.Error())
+	default:
+		writeError(w, http.StatusConflict, "not_resolved", err.Error())
+	}
+}
+
+// POST /v1/ns/{ns}/conflicts/{id}/ack - a polling resolver authority has received the entry as
+// it is now; it is not listed as undelivered again unless its report changes.
+func (s *Server) handleAckConflict(w http.ResponseWriter, r *http.Request, principal auth.Principal, _ string, rt *serverRuntime) {
+	if err := rt.AckConflict(r.PathValue("id"), principal); err != nil {
+		resolveError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// POST /v1/ns/{ns}/conflicts/resolve-all - {"take": "local"|"remote", "filter": {"kind", "peer",
+// "origin"}, "dryRun": true} settles every matching conflict by taking one side for all its
+// documents, or with dryRun lists what it would settle.
+func (s *Server) handleResolveAll(w http.ResponseWriter, r *http.Request, principal auth.Principal, ns string, rt *serverRuntime) {
+	var body struct {
+		Take   string                `json:"take"`
+		Filter server.ConflictFilter `json:"filter"`
+		DryRun bool                  `json:"dryRun"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if body.Take != "local" && body.Take != "remote" {
+		writeError(w, http.StatusBadRequest, "bad_request", "take must be \"local\" or \"remote\"")
+		return
+	}
+	res, err := rt.ResolveAll(body.Filter, body.Take, body.DryRun, principal)
+	if err != nil {
+		resolveError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "dryRun": body.DryRun, "results": res})
 }
 
 // POST /v1/ns/{ns}/conflicts/{id}/resolve - {"choices": {"<docId>": {"take":"local"|"remote"} |
@@ -72,22 +137,20 @@ func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request, p
 		choices[docID] = c
 	}
 	commit, err := rt.ResolveConflict(r.PathValue("id"), choices, principal)
-	switch {
-	case errors.Is(err, peersync.ErrConflictNotFound):
-		writeError(w, http.StatusNotFound, "unknown_conflict", err.Error())
-	case err != nil:
-		writeError(w, http.StatusConflict, "not_resolved", err.Error())
-	default:
-		writeJSON(w, http.StatusOK, map[string]any{"commit": commit.Hash.Hex()})
+	if err != nil {
+		resolveError(w, err)
+		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"commit": commit.Hash.Hex()})
 }
 
 // DELETE /v1/ns/{ns}/conflicts/{id} - dismiss a conflict without acting on it.
 func (s *Server) handleDismissConflict(w http.ResponseWriter, r *http.Request, principal auth.Principal, _ string, rt *serverRuntime) {
 	err := rt.DismissConflict(r.PathValue("id"), principal)
+	var authz *server.AuthorizationError
 	switch {
-	case errors.Is(err, peersync.ErrConflictNotFound):
-		writeError(w, http.StatusNotFound, "unknown_conflict", err.Error())
+	case errors.Is(err, peersync.ErrConflictNotFound), errors.As(err, &authz):
+		resolveError(w, err)
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 	default:

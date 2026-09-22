@@ -99,6 +99,8 @@ func actionToResource(action Action) (kind string, resource ResourcePath) {
 		return "write", NewResourcePath(a.Namespace, "")
 	case PeerSyncAction:
 		return "sync", NewResourcePath(a.Namespace, "")
+	case ConflictResolveAction:
+		return "resolve", NewResourcePath(a.Namespace, "")
 	case StreamSubscribeAction:
 		return "read", NewResourcePath(a.Namespace, "")
 	case DocumentWriteAction:

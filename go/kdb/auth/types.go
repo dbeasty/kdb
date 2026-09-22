@@ -53,6 +53,14 @@ type PeerSyncAction struct{ Namespace string }
 
 func (PeerSyncAction) isAction() {}
 
+// ConflictResolveAction is settling or dismissing a replication conflict in a namespace whose
+// resolution chain hands conflicts to a resolver authority. It maps to the "resolve" permission
+// kind, which only the authority's principal should hold; the resolution itself is also an
+// ordinary write, so the principal needs "write" as well.
+type ConflictResolveAction struct{ Namespace string }
+
+func (ConflictResolveAction) isAction() {}
+
 // StreamSubscribeAction is subscribing to a namespace's commit stream (Mode 1/2): every commit's
 // full operations are sent, so it is a read of the whole namespace.
 type StreamSubscribeAction struct{ Namespace string }
