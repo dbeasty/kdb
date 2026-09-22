@@ -364,7 +364,7 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 	started := time.Now().UTC()
 	res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), transport, peersync.V2ClientConfig{
 		NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
-		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+		ConnectionContext: l.connCx(),
 		Namespaces:        l.namespaces(), Mode: l.peer.Mode, Local: l.r.cfg.Local,
 		CreateLocal: l.peer.CreateLocal, ExtraHaves: extra, Timeout: l.r.cfg.Timeout,
 		PreferSnapshot: l.peer.PreferSnapshot,
@@ -422,7 +422,35 @@ func (l *peerLoop) transport() stream.Transport {
 	if l.r.cfg.Transport != nil {
 		return l.r.cfg.Transport(l.peer)
 	}
-	return defaultTransport(l.r.cfg.TLS)
+	return defaultTransport(l.peer.Addr, l.r.cfg.TLS)
+}
+
+// connCx is the credentials to connect to the peer with: from the peer's Credentials callback
+// when it has one (a failure is logged and the connection goes without, which the peer refuses
+// with a reason), else its static user, password and token. A token is also sent as a bearer
+// Authorization header, which only the WebSocket transport carries.
+func (l *peerLoop) connCx() auth.ConnectionContext {
+	var cc auth.ConnectionContext
+	if l.peer.Credentials != nil {
+		c, err := l.peer.Credentials()
+		if err != nil {
+			slog.Warn("replication: peer credentials unavailable", "peer", l.peer.Name, "error", err)
+		}
+		cc = c
+	} else {
+		cc = auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password, Token: l.peer.Token}
+	}
+	if cc.Token != nil {
+		if _, set := cc.Headers["Authorization"]; !set {
+			headers := map[string]string{}
+			for k, v := range cc.Headers {
+				headers[k] = v
+			}
+			headers["Authorization"] = "Bearer " + *cc.Token
+			cc.Headers = headers
+		}
+	}
+	return cc
 }
 
 // WriteMetrics appends the replicator's Prometheus families to b.
@@ -504,7 +532,7 @@ func (l *peerLoop) projectionCycle(st PeerState, transport stream.Transport) err
 		if target, err = l.r.cfg.Projections(source, l.peer.Filter, l.peer.WriteBack); err == nil {
 			res, err = peersync.SyncProjection(wire.NewCodec(wire.EncodingJSON), transport, peersync.ProjectionConfig{
 				NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
-				ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+				ConnectionContext: l.connCx(),
 				Namespace:         source, Filter: l.peer.Filter, Timeout: l.r.cfg.Timeout, Target: target,
 				WriteBack: l.peer.WriteBack,
 			})
@@ -557,7 +585,7 @@ func (r *Replicator) FetchBodies(ns string, wanted map[codec.UUID]codec.Hash, tr
 		}
 		s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
 			NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
-			ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+			ConnectionContext: l.connCx(),
 			Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
 		})
 		if err != nil {
@@ -589,7 +617,7 @@ func (r *Replicator) Compare(name, ns string, local document.DocumentTree) (stri
 	}
 	s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
 		NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
-		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+		ConnectionContext: l.connCx(),
 		Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
 	})
 	if err != nil {
@@ -609,7 +637,7 @@ func (r *Replicator) OpenDocSession(projectionNS string) (*peersync.RepairSessio
 		}
 		s, err := peersync.OpenDocSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
 			NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
-			ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+			ConnectionContext: l.connCx(),
 			Timeout:           r.cfg.Timeout,
 		})
 		return s, l.namespaces()[0], err
@@ -631,7 +659,7 @@ func (l *peerLoop) deepen(synced []peersync.NamespaceSyncResult, transport strea
 		}
 		s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), transport, peersync.V2ClientConfig{
 			NodeID: l.r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: l.r.cfg.TLS,
-			ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+			ConnectionContext: l.connCx(),
 			Namespaces:        []string{ns.Namespace}, Timeout: l.r.cfg.Timeout,
 		})
 		if err != nil {
@@ -663,7 +691,7 @@ func (r *Replicator) OpenRepairSessionTo(name, ns string) (*peersync.RepairSessi
 	}
 	return peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), l.transport(), peersync.V2ClientConfig{
 		NodeID: r.cfg.NodeID, PeerURI: l.peer.Addr, TLS: r.cfg.TLS,
-		ConnectionContext: auth.ConnectionContext{User: l.peer.User, Password: l.peer.Password},
+		ConnectionContext: l.connCx(),
 		Namespaces:        []string{ns}, Timeout: r.cfg.Timeout,
 	})
 }

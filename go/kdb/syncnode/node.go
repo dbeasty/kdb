@@ -81,6 +81,7 @@ type Node struct {
 	started    bool
 	closed     bool
 	listeners  []*server.Listener
+	conns      map[stream.ConnectionHandle]struct{}
 	stopExpiry chan struct{}
 	hook       *server.ConflictWebhook
 	stopScrub  chan struct{}
@@ -420,7 +421,14 @@ func (n *Node) Close() error {
 	}
 	n.closed = true
 	listeners := n.listeners
+	var conns []stream.ConnectionHandle
+	for c := range n.conns {
+		conns = append(conns, c)
+	}
 	n.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
 	n.StopSync()
 	for _, ln := range listeners {
 		_ = ln.Close()

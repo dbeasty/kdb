@@ -1416,6 +1416,42 @@ client's read of any *other* document is answered from the source instead of "no
 Only point reads (a document by id, over the wire or the control plane) read through. Queries see
 the projection alone.
 
+### Embedding sync in your application: `syncnode`
+
+An application that embeds KDB (through `embed.Host` and its own `server.NamespaceSet`) becomes a
+sync node with `go/kdb/syncnode`, the same code `kdb-service` runs:
+
+```go
+node, err := syncnode.Open(host, set, primary, syncnode.Config{
+	Peers:   []replication.PeerConfig{{Name: "cloud", Addr: "wss://api.example.com/kdb/sync",
+		Namespaces: []string{"app/u/42"}, CreateLocal: true, Credentials: currentToken}},
+	DataDir: dataDir,
+})
+set.SetOpener(node.Opener(nil)) // or call node.Prepare(rt) from your own opener
+// ... open the namespaces you serve ...
+node.Start()
+defer node.Close()
+```
+
+- `host` may be nil: namespaces are then in memory, which is what tests use.
+- The working set can change while it runs: `node.Replicator().AddNamespaces("cloud", "app/m/7")`
+  when a user joins a match, `RemoveNamespaces` when they leave, `SetPeerNamespaces` to replace
+  the set. Progress on namespaces that stay is kept.
+- `Credentials` is called for every connection, so a token that expires can be refreshed.
+
+### Peer sync over HTTP (WebSocket)
+
+A node can serve peer sync from an HTTP server instead of a raw TCP port, on the same origin and
+certificate as its API. That is what phones behind mobile networks and captive portals need.
+
+- **In an application:** mount `node.Handler()` on your router, for example at `/kdb/sync`.
+- **In `kdb-service`:** `--peer-http 0.0.0.0:8443` serves it at `/kdb/sync`. It is plain HTTP, so
+  terminate TLS in front of it.
+- **Dialling:** peers use `addr=ws://host/kdb/sync` or `wss://host/kdb/sync`.
+- **Bearer token:** `token-env=VAR` on the peer spec, or `Token` / `Credentials` in Go. It is sent
+  as `Authorization: Bearer ...` on the upgrade request, and in the sync hello. The node's auth
+  engine authenticates from either.
+
 ### Getting history back after a snapshot join: deepen
 
 A node that joined with `bootstrap=snapshot` holds its peer's state without the history before it.

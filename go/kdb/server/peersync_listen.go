@@ -61,7 +61,7 @@ func ListenPeerSyncTLS(addr string, runtime *KdbServerRuntime, namespaceID strin
 	go func() {
 		defer close(done)
 		_ = transport.Serve(ctx, ln, func(conn stream.ConnectionHandle) {
-			newPeerSyncConnHandler(codec, runtime, namespaceID).run(conn)
+			newPeerSyncConnHandler(codec, runtime, namespaceID, auth.EmptyContext).run(conn)
 		})
 	}()
 	return l, nil
@@ -77,9 +77,20 @@ type peerSyncConnHandler struct {
 	v2      *peersync.V2Host
 	runtime *KdbServerRuntime
 	codec   wire.Codec
+	// cc is the connection's transport-provided auth context.
+	cc auth.ConnectionContext
 }
 
-func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespaceID string) *peerSyncConnHandler {
+// ServePeerSyncConnection serves peer sync - v1 against namespaceID, v2 across every namespace
+// runtime's process serves - on one connection a caller already accepted, until it closes. cc
+// is what the transport learned about the caller (an HTTP upgrade's Authorization header, say):
+// a v2 hello without credentials of its own authenticates with it. How peer sync is served from
+// an application's HTTP stack (syncnode.Node.Handler).
+func ServePeerSyncConnection(conn stream.ConnectionHandle, runtime *KdbServerRuntime, namespaceID string, cc auth.ConnectionContext) {
+	newPeerSyncConnHandler(wire.NewCodec(wire.EncodingJSON), runtime, namespaceID, cc).run(conn)
+}
+
+func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespaceID string, cc auth.ConnectionContext) *peerSyncConnHandler {
 	cfg := peersync.HostConfig{
 		NamespaceID:    namespaceID,
 		NodeID:         runtime.NodeID.String(),
@@ -94,8 +105,8 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 		PersistAsync: runtime.peerPersistAsync(),
 		Conflicts:    runtime.Conflicts,
 	}
-	host := peersync.NewConnectionHost(codec, runtime.dag, runtime.Runtime.Storage, cfg, runtime.AuthEngine, auth.EmptyContext)
-	return &peerSyncConnHandler{host: host, runtime: runtime, codec: codec}
+	host := peersync.NewConnectionHost(codec, runtime.dag, runtime.Runtime.Storage, cfg, runtime.AuthEngine, cc)
+	return &peerSyncConnHandler{host: host, runtime: runtime, codec: codec, cc: cc}
 }
 
 // handle routes a frame to the v1 or v2 host. The protocol is fixed by the connection's first
@@ -124,7 +135,7 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 						rt.NoteInboundPeer(peer, since)
 					}
 				},
-			}, h.runtime.AuthEngine, auth.EmptyContext)
+			}, h.runtime.AuthEngine, h.cc)
 		}
 	}
 	if h.v2 != nil {

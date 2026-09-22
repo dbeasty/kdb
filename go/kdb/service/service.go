@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -54,6 +56,7 @@ func Main() {
 	var conflictWebhook, conflictWebhookSecret string
 	var conflictWebhookInterval time.Duration
 	var scrubInterval time.Duration
+	var peerHTTPAddr string
 	var streamAllowAnonymous bool
 	var peerSpecs []string
 	var peerCreateNamespaces bool
@@ -73,6 +76,7 @@ func Main() {
 	fs.StringVar(&conflictWebhook, "conflict-webhook", "", "URL to POST conflicts to when a namespace's resolution chain hands them to a resolver authority (and names this node, or no node). Each is retried until answered with 2xx")
 	fs.StringVar(&conflictWebhookSecret, "conflict-webhook-secret", os.Getenv("KDB_CONFLICT_WEBHOOK_SECRET"), "HMAC-SHA256 key signing each conflict webhook body (X-KDB-Signature: sha256=<hex>); defaults to $KDB_CONFLICT_WEBHOOK_SECRET")
 	fs.DurationVar(&conflictWebhookInterval, "conflict-webhook-interval", 10*time.Second, "how often undelivered conflicts are retried to --conflict-webhook")
+	fs.StringVar(&peerHTTPAddr, "peer-http", "", "also serve peer sync over WebSocket on this HTTP address (host:port), at /kdb/sync - what an application mounts syncnode.Node.Handler for. Peers dial ws://host:port/kdb/sync; a bearer token rides the upgrade request (token-env= on the peer spec). Plain HTTP: terminate TLS in front of it")
 	fs.DurationVar(&scrubInterval, "scrub-interval", 0, "how often to scrub every namespace: re-read and verify every live document against its content hash, repairing damaged ones from the --peer nodes by content hash (they need not be trusted). Reads every body, so scale it to the data - daily is typical. 0 disables; POST /v1/ns/{ns}/scrub runs one on demand")
 	fs.BoolVar(&streamAllowAnonymous, "stream-allow-anonymous", false, "accept stream (--stream-addr) subscribers without credentials, as every subscriber was before the stream handshake authenticated. Under --rbac this lets anyone read every commit in the namespace; without --rbac credentials are not checked anyway, so this changes nothing")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
@@ -519,6 +523,24 @@ func Main() {
 			os.Exit(1)
 		}
 		peerStatus = fmt.Sprintf("enabled (%s)", peerListener.Addr())
+	}
+	if peerHTTPAddr != "" {
+		ln, err := net.Listen("tcp", peerHTTPAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: peer http listen: %v\n", err)
+			os.Exit(1)
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/kdb/sync", node.Handler())
+		peerHTTP := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() { _ = peerHTTP.Serve(ln) }()
+		defer peerHTTP.Close()
+		ws := fmt.Sprintf("websocket ws://%s/kdb/sync", ln.Addr())
+		if peerAddr == "" {
+			peerStatus = "enabled (" + ws + ")"
+		} else {
+			peerStatus += ", " + ws
+		}
 	}
 	var streamListener *server.Listener
 	if streamAddr != "" {

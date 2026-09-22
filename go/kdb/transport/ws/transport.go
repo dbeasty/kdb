@@ -262,34 +262,15 @@ func performServerHandshake(
 	}
 
 	parts := strings.Fields(requestLine)
-	if len(parts) < 3 || parts[0] != http.MethodGet {
-		return nil, respondHandshakeError(conn, http.StatusMethodNotAllowed, "websocket upgrade requires GET")
+	method := ""
+	if len(parts) >= 3 {
+		method = parts[0]
 	}
-
-	if !headerHasToken(headers["connection"], "upgrade") ||
-		!strings.EqualFold(strings.TrimSpace(headers["upgrade"]), "websocket") {
-		return nil, respondHandshakeError(conn, http.StatusBadRequest, "not a websocket upgrade request")
+	key, status, reason, extra := checkUpgrade(method, func(name string) string { return headers[name] })
+	if status != 0 {
+		return nil, respondHandshakeErrorWith(conn, status, reason, extra)
 	}
-	if version := strings.TrimSpace(headers["sec-websocket-version"]); version != "13" {
-		// RFC 6455 §4.2.2 asks for the supported version in the failure response, so a client
-		// speaking an older draft learns what to speak rather than merely that it failed.
-		return nil, respondHandshakeErrorWith(
-			conn,
-			http.StatusUpgradeRequired,
-			"unsupported Sec-WebSocket-Version: "+version,
-			"Sec-WebSocket-Version: 13\r\n",
-		)
-	}
-	key := strings.TrimSpace(headers["sec-websocket-key"])
-	if !validWebSocketKey(key) {
-		return nil, respondHandshakeError(conn, http.StatusBadRequest, "missing or malformed Sec-WebSocket-Key")
-	}
-
-	response := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + websocketAccept(key) + "\r\n\r\n"
-	if _, err := conn.Write([]byte(response)); err != nil {
+	if _, err := conn.Write([]byte(switchingProtocols(key))); err != nil {
 		return nil, err
 	}
 
@@ -298,7 +279,42 @@ func performServerHandshake(
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
+	return newServerConnection(conn, reader, options, onClose), nil
+}
 
+// checkUpgrade validates a client's upgrade request - its method and headers (header looks one up
+// by lower-case name) - returning the Sec-WebSocket-Key, or the HTTP status, reason and extra
+// response headers to refuse it with.
+func checkUpgrade(method string, header func(string) string) (key string, status int, reason, extra string) {
+	if method != http.MethodGet {
+		return "", http.StatusMethodNotAllowed, "websocket upgrade requires GET", ""
+	}
+	if !headerHasToken(header("connection"), "upgrade") ||
+		!strings.EqualFold(strings.TrimSpace(header("upgrade")), "websocket") {
+		return "", http.StatusBadRequest, "not a websocket upgrade request", ""
+	}
+	if version := strings.TrimSpace(header("sec-websocket-version")); version != "13" {
+		// RFC 6455 §4.2.2 asks for the supported version in the failure response, so a client
+		// speaking an older draft learns what to speak rather than merely that it failed.
+		return "", http.StatusUpgradeRequired, "unsupported Sec-WebSocket-Version: " + version, "Sec-WebSocket-Version: 13\r\n"
+	}
+	key = strings.TrimSpace(header("sec-websocket-key"))
+	if !validWebSocketKey(key) {
+		return "", http.StatusBadRequest, "missing or malformed Sec-WebSocket-Key", ""
+	}
+	return key, 0, "", ""
+}
+
+func switchingProtocols(key string) string {
+	return "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + websocketAccept(key) + "\r\n\r\n"
+}
+
+// newServerConnection is the server side of an upgraded connection, reading through reader
+// (which may hold bytes already buffered past the upgrade request).
+func newServerConnection(conn net.Conn, reader *bufio.Reader, options core.TransportConnectOptions, onClose func()) *wsConnection {
 	maxFrameBytes := options.MaxFrameBytes
 	if maxFrameBytes == 0 {
 		maxFrameBytes = core.DefaultConnectOptions().MaxFrameBytes
@@ -320,7 +336,49 @@ func performServerHandshake(
 		onClose:            onClose,
 	}
 	go c.readLoop()
-	return c, nil
+	return c
+}
+
+// Upgrade turns an HTTP request on an existing server into a WebSocket connection, for serving
+// KDB frames from an application's own HTTP stack - behind its router, its middleware and its
+// load balancer, on its port. It validates the request exactly as a KDB WebSocket listener does
+// and answers a bad one with an HTTP error, returning the error. The ResponseWriter must support
+// hijacking (net/http's does for HTTP/1.1; HTTP/2 has no upgrade).
+func Upgrade(w http.ResponseWriter, r *http.Request, options core.TransportConnectOptions) (stream.ConnectionHandle, error) {
+	key, status, reason, extra := checkUpgrade(r.Method, func(name string) string { return r.Header.Get(name) })
+	if status != 0 {
+		if extra != "" {
+			w.Header().Set("Sec-WebSocket-Version", "13")
+		}
+		http.Error(w, reason, status)
+		return nil, fmt.Errorf("kdb ws: %s", reason)
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "websocket upgrade needs a connection that can be taken over (HTTP/1.1)", http.StatusInternalServerError)
+		return nil, fmt.Errorf("kdb ws: response writer %T cannot be hijacked", w)
+	}
+	conn, rw, err := hj.Hijack()
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if _, err := conn.Write([]byte(switchingProtocols(key))); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	setNoDelay(conn)
+	if options.MaxFrameBytes == 0 {
+		options = core.DefaultConnectOptions()
+	}
+	return newServerConnection(conn, rw.Reader, options, nil), nil
 }
 
 // headerHasToken reports whether a comma-separated header value contains token. `Connection` is

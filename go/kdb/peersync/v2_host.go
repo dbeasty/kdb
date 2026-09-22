@@ -220,8 +220,12 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 		return reject("peer sync: the connecting node has this node's own identity " + h.cfg.NodeID +
 			"; a copied data root must delete its NODE file to become a separate node")
 	}
-	principal, err := h.auth.Authenticator().Authenticate(context.Background(),
-		auth.Credentials{User: m.User, Password: m.Password, Token: m.Token})
+	creds := auth.Credentials{User: m.User, Password: m.Password, Token: m.Token}
+	if creds.User == nil && creds.Password == nil && creds.Token == nil {
+		// None in the hello: the transport's (an HTTP upgrade's Authorization header).
+		creds = h.connCx.ToCredentials()
+	}
+	principal, err := h.auth.Authenticator().Authenticate(context.Background(), creds)
 	if err != nil {
 		return reject(err.Error())
 	}

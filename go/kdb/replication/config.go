@@ -9,6 +9,7 @@ package replication
 
 import (
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/auth"
 	"os"
 	"strings"
 	"time"
@@ -22,7 +23,8 @@ type PeerConfig struct {
 	// Name identifies the peer in state, metrics and the control plane. Not its node id: a peer
 	// is configured before anything is known about it.
 	Name string
-	// Addr is the peer's peer-sync listener, e.g. tcp://host:4242 or tcps://host:4242.
+	// Addr is the peer's peer-sync listener: tcp://host:4242 or tcps://host:4242, or an HTTP
+	// endpoint serving syncnode.Node.Handler - ws://host/kdb/sync or wss://host/kdb/sync.
 	Addr string
 	// Namespaces are the namespaces or patterns to sync with this peer ("!" excludes).
 	Namespaces []string
@@ -33,6 +35,14 @@ type PeerConfig struct {
 	Interval time.Duration
 	// User/Password authenticate to the peer.
 	User, Password *string
+	// Token authenticates to the peer as a bearer token (token-env=VAR). Over ws:// and wss:// it
+	// also rides the upgrade request as "Authorization: Bearer <token>", so an application
+	// mounting the peer handler behind its own HTTP auth sees it there.
+	Token *string
+	// Credentials, when set, supplies the connection's credentials afresh for every connection -
+	// a token that expires and is refreshed, say. It takes precedence over User, Password and
+	// Token. Programmatic only.
+	Credentials func() (auth.ConnectionContext, error) `json:"-"`
 	// CreateLocal lets a pull create a namespace this node does not hold yet.
 	CreateLocal bool
 	// PreferSnapshot bootstraps an empty local namespace from a snapshot of the peer's main
@@ -122,6 +132,12 @@ func ParsePeer(spec string) (PeerConfig, error) {
 				return PeerConfig{}, fmt.Errorf("peer %q: password-env names %s, which is not set", spec, value)
 			}
 			p.Password = &v
+		case "token-env":
+			v, ok := os.LookupEnv(value)
+			if !ok {
+				return PeerConfig{}, fmt.Errorf("peer %q: token-env names %s, which is not set", spec, value)
+			}
+			p.Token = &v
 		case "create":
 			p.CreateLocal = value == "true"
 		case "writeback":

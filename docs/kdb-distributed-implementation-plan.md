@@ -1125,6 +1125,29 @@ The fix is Cimbiosys-style move-out: the source sends a delete only for a docume
 
 **Also:** `NamespaceSyncResult.Received` counts every commit a pull received, so overshoot is observable.
 
+### Phase 16.1–16.2 — landed (syncnode, live namespace sets, peer sync over HTTP)
+
+**16.1 (G1, G5), PR #88:**
+- `go/kdb/syncnode` owns everything `service.go` assembled inline: the meta runtime and `MetaStore`, authority expiry, the webhook, the retention floor, commit notification, projection peers, the replicator, scrub and listeners.
+- `Prepare`, `Opener`, `Start`, `StopSync` and `Close` handle the lifecycle.
+- `kdb-service` is its first caller, with no behaviour change: Python e2e 44 + 8 passed.
+- `Replicator.SetPeerNamespaces`, `AddNamespaces` and `RemoveNamespaces` take effect on the next cycle and keep per-namespace progress.
+
+**16.2 (G2):**
+- `ws.Upgrade` turns a request on an application's HTTP server into a KDB WebSocket connection, with the listener's own RFC 6455 validation.
+- `server.ServePeerSyncConnection` serves peer sync on any accepted connection with its `ConnectionContext`.
+- A v2 hello without credentials authenticates from that context.
+- `Node.Handler()` maps `Authorization: Bearer|Basic` to credentials.
+- Client side:
+  - the replicator dials `ws://` / `wss://` addresses over WebSocket;
+  - `PeerConfig.Token` (`token-env=`) rides the upgrade as a bearer header and in the hello;
+  - `PeerConfig.Credentials` refreshes per connection.
+- `kdb-service --peer-http`.
+
+**Tests:**
+- `syncnode`: sync through an `httptest` server beside an API route; a missing token refused; a token only on the upgrade header; a plain GET answered with 400.
+- `test_peer_http.py`: processes, with the phone killed by `kill -9`.
+
 ### Phase 11 — landed (graft: merging unrelated histories)
 
 Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, part of the chain's hash, so two nodes that disagree never merge).
