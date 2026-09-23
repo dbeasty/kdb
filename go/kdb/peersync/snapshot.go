@@ -110,7 +110,30 @@ func InstallSnapshot(env IngestEnv, fetch func(after string) (wire.SnapshotPageM
 		var target document.Commit
 		var written []codec.UUID
 		var applied []document.Op
+		// admitted records that the root is in the DAG, so undo knows whether it has a commit
+		// to take back as well as documents. Everything after PutShallowCommit can still fail.
+		//
+		// The DAG is undone before storage, and a failure there abandons the undo rather than
+		// carrying on: documents deleted out from under a head that is still pointing at them
+		// would be worse than the failure being reported.
+		admitted := false
 		undo := func(cause error) error {
+			if admitted {
+				// Main first: DropShallowCommit refuses a commit a branch head names, and this
+				// is also what stops later commits being logged on top of state that nothing
+				// durable stands behind. SetHead is a no-op when main never moved.
+				if err := env.DAG.SetHead(mainBranch, head); err != nil {
+					return fmt.Errorf("peer sync: %w (and main could not be put back: %v)", cause, err)
+				}
+				// Leaving the root resident is not cosmetic: a namespace holding a commit it
+				// never bootstrapped from refuses every later bootstrap attempt for the life of
+				// the process (embed.CanInstallSnapshot), so a failure here is reported rather
+				// than swallowed - a retry that will be refused is worse than a loud failure.
+				if err := env.DAG.DropShallowCommit(target.Hash); err != nil {
+					return fmt.Errorf("peer sync: %w (and the snapshot root could not be taken back: %v)", cause, err)
+				}
+				admitted = false
+			}
 			for _, id := range written {
 				_ = env.Storage.DeleteDocument(env.NamespaceID, id)
 			}
@@ -169,17 +192,22 @@ func InstallSnapshot(env IngestEnv, fetch func(after string) (wire.SnapshotPageM
 		if err := env.DAG.PutShallowCommit(target); err != nil {
 			return undo(err)
 		}
+		admitted = true
 		if err := env.DAG.SetHead(mainBranch, target.Hash); err != nil {
 			return undo(err)
 		}
 		if env.SnapshotInstalled != nil {
 			if err := env.SnapshotInstalled(target); err != nil {
-				// Nothing durable stands behind the snapshot: put main back, or later commits
-				// would be logged on top of state a restart cannot bring back.
-				_ = env.DAG.SetHead(mainBranch, head)
+				// Nothing durable stands behind the snapshot: undo puts main back and takes the
+				// root out of the DAG, leaving the namespace as empty as it was - and so still
+				// able to be bootstrapped, which is the whole point of retrying.
 				return undo(fmt.Errorf("peer sync: snapshot could not be made durable: %w", err))
 			}
 		}
+		// Durable from here: the root stays whatever happens next. Advanced's error is returned
+		// to the caller but never undoes a head move (see LocalNode), and this one is now backed
+		// by a checkpoint on disk.
+		admitted = false
 		installed = target
 		return node.Advanced(AdvanceStep{Commits: []document.Commit{target}, Applied: applied})
 	})

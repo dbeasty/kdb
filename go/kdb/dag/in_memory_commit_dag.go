@@ -462,6 +462,92 @@ func (d *InMemoryCommitDag) PutShallowCommit(c document.Commit) error {
 	return nil
 }
 
+// DropShallowCommit takes back a shallow root admitted by PutShallowCommit, leaving the DAG as
+// it was before - the inverse of that call, and the only way a commit admitted without its
+// parents leaves memory again.
+//
+// It exists for one caller: peersync.InstallSnapshot, which admits the snapshot's root and can
+// then still fail, either moving main or making the result durable. Without this the orphan
+// stayed resident with nothing pointing at it, and since CanInstallSnapshot refuses a namespace
+// holding more than the genesis commit, the node could never be bootstrapped again for the life
+// of the process - a failed bootstrap stranded it permanently.
+//
+// Deliberately narrow: this is not a general commit delete. Anything that is not a shallow root
+// this DAG can safely take back is refused rather than half-removed -
+//
+//   - a resident commit that is not a shallow root: only PutShallowCommit's own admissions
+//     come back out this way
+//   - a pinned commit, or one a branch head or a tag names: the same three retention roots
+//     Squash and StubCommit consult, refused the same way
+//   - a commit some resident commit lists as a parent: removing it would leave that child
+//     with a parent that is neither resident nor stubbed, which is a truncated history rather
+//     than an undone one
+//
+// A hash that is not resident is a no-op, so an undo path may call it without first checking
+// whether the admission got that far - PutShallowCommit is idempotent in the same way.
+//
+// The document tree the commit named is left where it is. Trees are content-addressed and
+// shared - several commits name the same one - and in the assembled engine they live in the
+// storage engine's own bounded store (see SetTreeStore), which has no delete and evicts on its
+// own terms. Nothing reaches the tree through this DAG once the commit is gone.
+func (d *InMemoryCommitDag) DropShallowCommit(hash codec.Hash) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	c, resident := d.commitLocked(hash)
+	if !resident {
+		return nil
+	}
+	if _, ok := d.shallow[hash]; !ok {
+		return NewConsistencyError("cannot drop a commit that is not a shallow root", d.NamespaceID, &hash)
+	}
+	if err := d.assertUnpinnedLocked(hash, "shallow root being taken back"); err != nil {
+		return err
+	}
+	for _, b := range d.branches {
+		if b.HeadHash == hash {
+			return NewCompactionSafetyError(
+				"shallow root is a branch head", d.NamespaceID, hash, "branch="+b.Name)
+		}
+	}
+	for name, t := range d.tags {
+		if t.CommitHash == hash {
+			return NewCompactionSafetyError(
+				"shallow root is tagged", d.NamespaceID, hash, "tag="+name)
+		}
+	}
+	for h, n := range d.nodes {
+		if h == hash {
+			continue
+		}
+		for _, p := range n.commit.ParentHashes {
+			if p == hash {
+				return NewCompactionSafetyError(
+					"shallow root has a resident child", d.NamespaceID, hash, "child="+h.Hex())
+			}
+		}
+	}
+	d.untrackOpsLocked(c)
+	delete(d.nodes, hash)
+	delete(d.shallow, hash)
+	delete(d.provisional, hash)
+	// Both indexes are "first writer wins", so an entry is this commit's only if it names it.
+	if d.treeIndex != nil && d.treeIndex[c.DocumentTreeHash] == hash {
+		delete(d.treeIndex, c.DocumentTreeHash)
+	}
+	if d.txIndex[c.TransactionID] == hash {
+		delete(d.txIndex, c.TransactionID)
+	}
+	// Generations are not rebuilt, for the reason ensureGenerationsLocked gives about Squash and
+	// StubCommit: removal can only leave a generation larger than it needs to be, which prunes
+	// less rather than wrongly. This commit has no resident child anyway - that was checked above.
+	d.ancestryVersion++
+	// The head cannot name this commit (a branch head is refused above), but republish for the
+	// same reason every other mutator does: the invariant is checkable at the call site, not by
+	// reasoning about which checks happen to make it unreachable.
+	d.publishHeadLocked()
+	return nil
+}
+
 // MarkShallow records that a resident commit is a shallow root - how a reopened namespace that
 // was bootstrapped from a snapshot gets its roots back, since the checkpoint that restores the
 // commit does not say which commits were admitted without parents on purpose.

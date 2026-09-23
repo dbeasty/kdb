@@ -704,12 +704,13 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 
 ### Phase 4 — landed
 
-**Shallow roots.** `dag.PutShallowCommit`/`MarkShallow`/`IsShallow`/`ShallowRoots`/`Horizon`/`CommitCount`. Traversals stop at a shallow root as they do at a stub. Its operations are never evicted, because no log holds them. `RefsOf` advertises the horizon, meaning shallow roots plus commits whose parent was truncated away, as `Shallow`.
+**Shallow roots.** `dag.PutShallowCommit`/`DropShallowCommit`/`MarkShallow`/`IsShallow`/`ShallowRoots`/`Horizon`/`CommitCount`. Traversals stop at a shallow root as they do at a stub. Its operations are never evicted, because no log holds them. `RefsOf` advertises the horizon, meaning shallow roots plus commits whose parent was truncated away, as `Shallow`.
 
 **Snapshot transfer.**
 - **Frames:** new Go-only SNAPSHOT_FETCH/SNAPSHOT_PAGE (0x2E/0x2F). The old 0x0A/0x0B are left alone: they're shared with Kotlin, and their opaque payload would have hidden a Go-only format.
 - **Host:** pages the tree at a commit in id order, by bytes, through a new optional `storage.TreeWalker`, implemented by the mem adapter, `ServerEngine` and `MultiplexAdapter`.
 - **Receiver:** `peersync.InstallSnapshot` requires an empty namespace. It verifies the commit's own hash, installs page by page (committing a tree each page, so memory isn't the whole namespace), and requires the final tree to be the declared one, undoing everything otherwise. It then admits the commit as a shallow root.
+- **Undoing an admitted root.** `DropShallowCommit` is the inverse of `PutShallowCommit`, and the only way a commit admitted without its parents leaves memory again. It refuses anything it cannot safely take back - a resident commit that is not a shallow root, one that is pinned or named by a branch head or tag, one with a resident child - and otherwise undoes every index the admission touched, the operations budget included. The tree stays: trees are content-addressed, shared, and bounded by the storage engine.
 - **When `SyncV2` uses it:** automatically when the local namespace is empty and the peer advertises a horizon, or on request (`PreferSnapshot`; the peer config `bootstrap=snapshot`).
 
 **Durability on a file runtime** (`embed/snapshot_install.go`). None of this changes an on-disk format.
@@ -862,7 +863,8 @@ An adversarial review of phases 0–10 found eight defects. Each has a regressio
    - Test: `TestHandoverOnOldHomeKeepsItsWrites`.
    - **Known consequence:** a failover assigned on a node *other* than the old home can't know what the old home acknowledged but never replicated. Those writes arrive later as stale-fence conflicts. That is the intended behaviour for writes acknowledged by a home that has since been replaced.
 7. **Snapshot durability.**
-   - If `SnapshotInstalled` (the checkpoint plus the meta.json marker) fails, `InstallSnapshot` moves main back and undoes the document writes. Test: `TestSnapshotNotMadeDurableLeavesNamespaceEmpty`.
+   - If `SnapshotInstalled` (the checkpoint plus the meta.json marker) fails, `InstallSnapshot` moves main back, takes the root back out of the DAG and undoes the document writes, so the namespace is as fresh as it was and the bootstrap can be retried in the same process. Tests: `TestSnapshotNotMadeDurableLeavesNamespaceEmpty`, `TestSnapshotCanBeRetriedAfterAFailedInstall`, `TestSnapshotBootstrapCanBeRetriedAfterAFailedInstall`.
+   - **Was a known issue through 0.6.1.** The undo rolled back storage and main but left the root resident, and `CanInstallSnapshot` refuses a namespace holding more than its genesis commit - so one failed bootstrap refused every later attempt for the life of the process. Fixed by `dag.DropShallowCommit`.
    - A crash after the checkpoint but before the marker used to leave a DAG with horizon commits whose bodies cold reads never looked for. On open, any horizon commit now switches the engine to external bodies.
 8. **Retention floor.**
    - A peer's `LastSync` is now the time its sync *started*. The inbound `OnCaughtUp` passes the time of the session's hello, so commits made during a long transfer stay above the floor.

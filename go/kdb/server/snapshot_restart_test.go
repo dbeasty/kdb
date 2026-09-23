@@ -10,6 +10,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/schema"
@@ -255,5 +256,124 @@ func TestSnapshotRefusedIntoANamespaceWithHistory(t *testing.T) {
 	}
 	if err := rt.CanInstallSnapshot(); !errors.Is(err, embed.ErrSnapshotNeedsFreshNamespace) {
 		t.Fatalf("want ErrSnapshotNeedsFreshNamespace, got %v", err)
+	}
+}
+
+// failingSnapshotInstall wraps a provider so the durable half of a snapshot bootstrap
+// (PersistSnapshot plus the unique-key rebuild) can be made to fail on demand - a full disk, a
+// directory that cannot be written. Everything else about the node is real.
+type failingSnapshotInstall struct {
+	inner peersync.NamespaceProvider
+	fail  *bool
+}
+
+func (f failingSnapshotInstall) List() []string { return f.inner.List() }
+
+func (f failingSnapshotInstall) Env(ns string, create bool) (peersync.IngestEnv, error) {
+	env, err := f.inner.Env(ns, create)
+	if err != nil {
+		return env, err
+	}
+	real := env.SnapshotInstalled
+	env.SnapshotInstalled = func(root document.Commit) error {
+		if *f.fail {
+			return errors.New("injected: no space left on device")
+		}
+		return real(root)
+	}
+	return env, nil
+}
+
+// TestSnapshotBootstrapCanBeRetriedAfterAFailedInstall: a file-backed node whose bootstrap fails
+// after the documents are in - the checkpoint could not be written - can be bootstrapped again
+// once the cause is gone, in the same process, and what it ends up with survives a restart.
+//
+// The failure used to be permanent. InstallSnapshot put main back and deleted the documents but
+// left the snapshot's root resident in the DAG, and CanInstallSnapshot refuses a namespace
+// holding more than its genesis commit - so every later attempt was refused as needing a fresh
+// namespace, for the life of the process, with no way back but a restart. It is the same shape
+// as the nested-namespace failure above, reached by a different cause.
+func TestSnapshotBootstrapCanBeRetriedAfterAFailedInstall(t *testing.T) {
+	ns := "app/data"
+	source := newTestRuntime(t)
+	var ids []codec.UUID
+	for i := 0; i < 12; i++ {
+		id := mustRandomUUID(t)
+		ids = append(ids, id)
+		if _, err := source.Upsert(ns, id, fmt.Sprintf(`{"i":%d}`, i), auth.Principal{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ln, err := ListenPeerSync("tcp://127.0.0.1:0?bind=true", source, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	root, _ := source.dag.Head()
+
+	dir := t.TempDir()
+	open := func() *KdbServerRuntime {
+		t.Helper()
+		rt, err := embed.OpenFileRuntime(dir, "app", ns, schema.None())
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		srv := NewKdbServerRuntime(rt)
+		srv.NodeID = mustRandomUUID(t)
+		return srv
+	}
+	b := open()
+	fail := true
+	bootstrap := func() peersync.V2Result {
+		t.Helper()
+		res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(core.DefaultConnectOptions()), peersync.V2ClientConfig{
+			NodeID: b.NodeID.String(), PeerURI: "tcp://" + ln.Addr().String(), Namespaces: []string{ns},
+			Mode: peersync.SyncPull, Local: failingSnapshotInstall{inner: b.PeerNamespaces(), fail: &fail},
+			PreferSnapshot: true, PageBytes: 200,
+		})
+		if err != nil {
+			t.Fatalf("sync: %v", err)
+		}
+		return res
+	}
+
+	res := bootstrap()
+	if err := res.Namespaces[0].Err; err == nil || !strings.Contains(err.Error(), "no space left") {
+		t.Fatalf("expected the bootstrap to fail on the persist hook, got %v", err)
+	}
+	if err := b.Runtime.CanInstallSnapshot(); err != nil {
+		t.Fatalf("after a failed bootstrap the namespace refuses to be bootstrapped again: %v", err)
+	}
+	if n := b.dag.CommitCount(); n != 1 {
+		t.Fatalf("a failed bootstrap left %d commits in the DAG, want 1 (genesis)", n)
+	}
+
+	fail = false
+	res = bootstrap()
+	if res.Namespaces[0].Err != nil || res.Namespaces[0].Snapshot != root.Hex() {
+		t.Fatalf("the retry did not bootstrap: %+v", res.Namespaces[0])
+	}
+	if h, _ := b.dag.Head(); h != root || !b.dag.IsShallow(root) {
+		t.Fatal("after the retry, main is not the peer's head as a shallow root")
+	}
+	for i, id := range ids {
+		body, _, found, err := b.GetDocument(ns, id)
+		if err != nil || !found || body != fmt.Sprintf(`{"i":%d}`, i) {
+			t.Fatalf("document %d after the retry = %q found=%v err=%v", i, body, found, err)
+		}
+	}
+	b.Runtime.Close()
+
+	// The retry's own durability is real, not just its in-memory result.
+	reopened := open()
+	defer reopened.Runtime.Close()
+	if h, _ := reopened.dag.Head(); h != root {
+		t.Fatalf("after reopening, head is %s, want the snapshot root %s", h.Hex(), root.Hex())
+	}
+	for i, id := range ids {
+		body, _, found, err := reopened.GetDocument(ns, id)
+		if err != nil || !found || body != fmt.Sprintf(`{"i":%d}`, i) {
+			t.Fatalf("document %d after reopening = %q found=%v err=%v", i, body, found, err)
+		}
 	}
 }

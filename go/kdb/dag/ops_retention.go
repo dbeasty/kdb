@@ -97,6 +97,24 @@ func (d *InMemoryCommitDag) trackOpsLocked(c document.Commit) {
 	d.evictOpsLocked(c.Hash)
 }
 
+// untrackOpsLocked drops a commit's operations from the retention accounting, for a commit that
+// is leaving the DAG entirely (see DropShallowCommit). The mirror of trackOpsLocked: without it
+// the bytes stay counted against the budget forever, and every later eviction pass works from a
+// resident total that is too high - evicting operations that did not need to go.
+//
+// Must be called with mu held exclusively, before the commit is removed from d.nodes.
+func (d *InMemoryCommitDag) untrackOpsLocked(c document.Commit) {
+	if el, ok := d.opsElem[c.Hash]; ok {
+		d.opsLRU.Remove(el)
+		delete(d.opsElem, c.Hash)
+		d.opsResident -= commitOpsBytes(c)
+		if d.opsResident < 0 {
+			d.opsResident = 0
+		}
+	}
+	delete(d.opsEvicted, c.Hash)
+}
+
 // opsPinnedLocked reports commits whose operations must stay resident
 // whatever the budget says: branch heads and tags, which are the DAG's
 // retention roots for writers, and reader pins (see Pin). These are the
