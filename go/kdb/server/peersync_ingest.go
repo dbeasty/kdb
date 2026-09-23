@@ -48,11 +48,28 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 		Conflicts:           s.Conflicts,
 		CanInstallSnapshot:  s.Runtime.CanInstallSnapshot,
 		SnapshotInstalled: func(root document.Commit) error {
-			if err := s.Runtime.PersistSnapshot(root); err != nil {
+			// The documents arrived without commits the unique registry could be told about, so
+			// it is rebuilt from the tree they built.
+			//
+			// Before PersistSnapshot, not after. PersistSnapshot is the only durable half of this
+			// hook, and InstallSnapshot undoes the whole bootstrap in memory when the hook fails -
+			// so a failure *after* it left a checkpoint and a namespace marker on disk claiming a
+			// bootstrap that memory had just rolled back. That namespace then looks fresh, takes
+			// local writes on genesis, and reopens bootstrapped, with a log that does not descend
+			// from the root the checkpoint restores. Nothing durable is written until everything
+			// that can still refuse the snapshot has agreed to it.
+			if err := s.RebuildUniqueKeys(); err != nil {
 				return err
 			}
-			// The documents arrived without commits the unique registry could be told about.
-			return s.RebuildUniqueKeys()
+			if err := s.Runtime.PersistSnapshot(root); err != nil {
+				// The registry was just rebuilt from a tree the caller is about to take away.
+				// InstallSnapshot only runs on a namespace whose head is genesis, and its undo
+				// puts it back there, so the claims go with the documents. Safe here rather than
+				// after the undo because the whole sequence holds the write gate.
+				s.UniqueKeys.Reset()
+				return err
+			}
+			return nil
 		},
 	}
 	if _, ok := s.HomeOf(); ok {
