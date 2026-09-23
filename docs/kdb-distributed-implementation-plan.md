@@ -704,12 +704,13 @@ This log is filled in as items land. Each entry gives the commit, what landed, a
 
 ### Phase 4 — landed
 
-**Shallow roots.** `dag.PutShallowCommit`/`MarkShallow`/`IsShallow`/`ShallowRoots`/`Horizon`/`CommitCount`. Traversals stop at a shallow root as they do at a stub. Its operations are never evicted, because no log holds them. `RefsOf` advertises the horizon, meaning shallow roots plus commits whose parent was truncated away, as `Shallow`.
+**Shallow roots.** `dag.PutShallowCommit`/`DropShallowCommit`/`MarkShallow`/`IsShallow`/`ShallowRoots`/`Horizon`/`CommitCount`. Traversals stop at a shallow root as they do at a stub. Its operations are never evicted, because no log holds them. `RefsOf` advertises the horizon, meaning shallow roots plus commits whose parent was truncated away, as `Shallow`.
 
 **Snapshot transfer.**
 - **Frames:** new Go-only SNAPSHOT_FETCH/SNAPSHOT_PAGE (0x2E/0x2F). The old 0x0A/0x0B are left alone: they're shared with Kotlin, and their opaque payload would have hidden a Go-only format.
 - **Host:** pages the tree at a commit in id order, by bytes, through a new optional `storage.TreeWalker`, implemented by the mem adapter, `ServerEngine` and `MultiplexAdapter`.
 - **Receiver:** `peersync.InstallSnapshot` requires an empty namespace. It verifies the commit's own hash, installs page by page (committing a tree each page, so memory isn't the whole namespace), and requires the final tree to be the declared one, undoing everything otherwise. It then admits the commit as a shallow root.
+- **Undoing an admitted root.** `DropShallowCommit` is the inverse of `PutShallowCommit`, and the only way a commit admitted without its parents leaves memory again. It refuses anything it cannot safely take back - a resident commit that is not a shallow root, one that is pinned or named by a branch head or tag, one with a resident child - and otherwise undoes every index the admission touched, the operations budget included. The tree stays: trees are content-addressed, shared, and bounded by the storage engine.
 - **When `SyncV2` uses it:** automatically when the local namespace is empty and the peer advertises a horizon, or on request (`PreferSnapshot`; the peer config `bootstrap=snapshot`).
 
 **Durability on a file runtime** (`embed/snapshot_install.go`). None of this changes an on-disk format.
@@ -862,7 +863,10 @@ An adversarial review of phases 0–10 found eight defects. Each has a regressio
    - Test: `TestHandoverOnOldHomeKeepsItsWrites`.
    - **Known consequence:** a failover assigned on a node *other* than the old home can't know what the old home acknowledged but never replicated. Those writes arrive later as stale-fence conflicts. That is the intended behaviour for writes acknowledged by a home that has since been replaced.
 7. **Snapshot durability.**
-   - If `SnapshotInstalled` (the checkpoint plus the meta.json marker) fails, `InstallSnapshot` moves main back and undoes the document writes. Test: `TestSnapshotNotMadeDurableLeavesNamespaceEmpty`.
+   - If `SnapshotInstalled` (the checkpoint plus the meta.json marker) fails, `InstallSnapshot` moves main back, takes the root back out of the DAG and undoes the document writes, so the namespace is as fresh as it was and the bootstrap can be retried in the same process. Tests: `TestSnapshotNotMadeDurableLeavesNamespaceEmpty`, `TestSnapshotCanBeRetriedAfterAFailedInstall`, `TestSnapshotBootstrapCanBeRetriedAfterAFailedInstall`.
+   - **Was a known issue through 0.6.1.** The undo rolled back storage and main but left the root resident, and `CanInstallSnapshot` refuses a namespace holding more than its genesis commit - so one failed bootstrap refused every later attempt for the life of the process. Fixed by `dag.DropShallowCommit`.
+   - **The hook's durable half runs last.** `SnapshotInstalled` rebuilds the unique-key registry *then* calls `PersistSnapshot`. The other order wrote a checkpoint and a marker for a bootstrap the caller then rolled back in memory - a namespace that looks fresh, takes writes on genesis and reopens bootstrapped from a checkpoint its log does not descend from. Because the rebuild now runs first, a `PersistSnapshot` failure resets the registry: its claims came from documents the undo takes away. Tests: `TestSnapshotInstallWritesNothingDurableUntilItCanSucceed`, `TestSnapshotInstallDropsUniqueClaimsWhenItCannotBeMadeDurable`.
+   - **Open question:** that rebuild is the strict `RebuildUniqueKeys`, while ordinary peer ingest uses `RebuildLenient` for the same reason (documents this node did not choose). A snapshot carrying a duplicate the peer's schema never declared is currently refused outright rather than resolved by lowest document id.
    - A crash after the checkpoint but before the marker used to leave a DAG with horizon commits whose bodies cold reads never looked for. On open, any horizon commit now switches the engine to external bodies.
 8. **Retention floor.**
    - A peer's `LastSync` is now the time its sync *started*. The inbound `OnCaughtUp` passes the time of the session's hello, so commits made during a long transfer stay above the floor.
@@ -1281,12 +1285,14 @@ Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, p
   4. log the root.
 
   The pull grafts when a page fails on one of the peer's shallow roots (`unsharedRoot`) and the chain allows it, then stores the page again.
+- **Undoing an admitted root.** Step 4 can fail - the log write itself, or the fsync behind it, which is waited for after the serialization is dropped. `dag.DropShallowCommit` then takes the root back out, as it does for a failed snapshot bootstrap. The tree stays (content-addressed, shared, and a foreign tree is never the live tree), and so does the `graftRoots` entry from step 2: it is standing permission for a replay that *meets* the hash to admit it parentless, which is why it is written before the root is logged. A hash that never reached the log is never looked up, and if the fsync did land after all, the entry is what keeps that log readable.
+  - **Was a known issue through 0.6.1.** The root was left resident with nothing naming it. Graft's own "a root already held is left alone" short-circuit then returned success on every later attempt in the same process - a graft that was never logged, and that a restart came up without. The orphan also counted toward `dag.CommitCount()`, which `embed.CanInstallSnapshot` uses to decide whether a namespace is still fresh enough to bootstrap.
 - **Push side:** before pushing a ref, the client probes each of its own shallow roots under it (a `FETCH_REQUEST` for the root and its parents; any commit back means the peer can store it). If the peer lacks it, the client sends `GRAFT_PUSH` (0x3A/0x3B, capability `graft`), which the host stages and grafts on the last page. Without `allowUnrelated`, the ref is skipped with a reason instead of failing on the peer's missing-parent error.
 - **Merge:** with no common ancestor and `allowUnrelated`, `resolveDivergedLocked` merges with an empty base. Candidates are every op of both sides' histories plus every document in any shallow root's tree they reach. The base commit is recorded as the zero hash. Genesis is fixed per namespace, so independent databases always share an ancestor; histories are unrelated only through a shallow root.
 - **Replay:** grafted roots are side history. A replay of the log with no checkpoint rebuilds the namespace; it admits `graftRoots` shallow (`applyCommitsTopologically`), and open marks them shallow. `RecordShallowRoots` (deepen) keeps each root's kind.
 
 **Tests:**
-- peersync: both directions converge; the unrelated merge is identical on both nodes; refused without the flag; a tampered state is rejected; push skip; push graft.
+- peersync: both directions converge; the unrelated merge is identical on both nodes; refused without the flag; a tampered state is rejected; push skip; push graft. Rollback: `TestGraftCanBeRetriedAfterAFailedPersist` (the fsync, outside the serialization), `TestGraftRolledBackWhenTheLogRefusesTheCommit` (the log write, inside it), `TestGraftMarkerIsNotRolledBack`.
 - server (file-backed): restart, replay with no checkpoint, a push graft to a host that is only dialled, and a refusal under `history=none`.
 - wire round trip.
 - Python e2e `test_graft.py`: B stopped, C grafts, `kill -9` of C.

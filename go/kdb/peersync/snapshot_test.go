@@ -190,4 +190,85 @@ func TestSnapshotNotMadeDurableLeavesNamespaceEmpty(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("an undone snapshot left %d documents behind", n)
 	}
+	// And nothing of the snapshot's root is left in the DAG either. It used to stay resident
+	// with nothing pointing at it, which is worse than untidy: a file runtime counts commits to
+	// decide whether a namespace is still fresh enough to bootstrap, so the orphan refused every
+	// later attempt for the life of the process. See TestSnapshotCanBeRetriedAfterAFailedInstall.
+	if n := l.dag.CommitCount(); n != 1 {
+		t.Fatalf("an undone snapshot left the DAG holding %d commits, want 1 (genesis)", n)
+	}
+	if roots := l.dag.ShallowRoots(); len(roots) != 0 {
+		t.Fatalf("an undone snapshot left shallow roots behind: %v", roots)
+	}
+}
+
+// TestSnapshotCanBeRetriedAfterAFailedInstall: the regression this exists for. A node whose
+// bootstrap fails part-way - here because the snapshot could not be made durable - can be
+// bootstrapped again once the cause is gone, in the same process. Before the root was taken back
+// out of the DAG, the namespace was left holding a commit it had never bootstrapped from, and the
+// up-front freshness check refused every retry for as long as the process lived.
+func TestSnapshotCanBeRetriedAfterAFailedInstall(t *testing.T) {
+	ns := "app/snap-retry"
+	remote := newTestNamespaces(t, ns)
+	local := newTestNamespaces(t, ns)
+	seedHistory(t, remote, ns, 12)
+	v2Hub(t, "hub-snap-retry", newHost(remote), nil)
+	l := local.side(ns)
+
+	// The same rule a file-backed runtime applies (embed.CanInstallSnapshot): a namespace holding
+	// anything more than its genesis commit is no longer fresh enough to bootstrap.
+	notFresh := errors.New("a snapshot can only bootstrap a namespace that has never had a commit")
+	local.canInstall = func() error {
+		if l.dag.CommitCount() > 1 {
+			return notFresh
+		}
+		return nil
+	}
+	failing := true
+	local.installed = func(document.Commit) error {
+		if failing {
+			return errors.New("disk full")
+		}
+		return nil
+	}
+
+	cfg := V2ClientConfig{PeerURI: "memory://hub-snap-retry", Local: local, NodeID: "c",
+		Namespaces: []string{ns}, Mode: SyncPull, PreferSnapshot: true, PageBytes: 1_000}
+	res, _ := SyncV2(wire.NewCodec(wire.EncodingJSON), stream.NewInMemoryTransport(), cfg)
+	if err := res.Namespaces[0].Err; err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected the first attempt to fail on the persist hook, got %v", err)
+	}
+	if err := local.canInstall(); err != nil {
+		t.Fatalf("the namespace is no longer bootstrappable after a failed attempt: %v", err)
+	}
+
+	failing = false
+	res = syncV2(t, "hub-snap-retry", local, V2ClientConfig{Namespaces: []string{ns},
+		Mode: SyncPull, PreferSnapshot: true, PageBytes: 1_000})
+	rh := mustHead(t, remote.side(ns))
+	if res.Namespaces[0].Snapshot != rh.Hex() {
+		t.Fatalf("the retry did not install a snapshot: %+v", res.Namespaces[0])
+	}
+	if mustHead(t, l) != rh || !l.dag.IsShallow(rh) {
+		t.Fatal("after the retry, local main is not the remote head as a shallow root")
+	}
+	// And the state came with it: the retry holds every document the peer's head tree does.
+	count := func(s side, at codec.Hash) int {
+		t.Helper()
+		c, err := s.dag.GetCommitOrThrow(at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		if err := s.storage.(storage.TreeWalker).WalkTree(ns, c.DocumentTreeHash, func(codec.UUID, codec.Hash) bool {
+			n++
+			return true
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if got, want := count(l, rh), count(remote.side(ns), rh); got != want || want == 0 {
+		t.Fatalf("the retried snapshot holds %d documents, the peer's head tree holds %d", got, want)
+	}
 }
