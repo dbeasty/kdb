@@ -1,0 +1,16 @@
+{
+  "name": "merge-array-union-tags",
+  "comment": "Arrays compare whole, not element by element (see the corpus README and kdb/json/diff.go), so a field-diff-driven merge like merge-disjoint-fields.json cannot pick this apart itself. A procedure that wants the union has to read both arrays and build it, sorting first so the two engines - and the two nodes running this - land on the same element order regardless of goja's vs GraalJS's iteration order over an object used as a set.",
+  "source": "function main(c) {\n  var set = {};\n  function addAll(arr) { for (var i = 0; i < arr.length; i++) { set[arr[i]] = true; } }\n  addAll(c.local.tags);\n  addAll(c.remote.tags);\n  var out = [];\n  for (var k in set) { out.push(k); }\n  out.sort();\n  return { doc: { tags: out } };\n}",
+  "input": {
+    "docId": "44444444-4444-4444-8444-444444444444",
+    "base": {"tags": ["a", "b"]},
+    "local": {"tags": ["a", "b", "c"]},
+    "remote": {"tags": ["a", "b", "d"]},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "doc", "doc": {"tags": ["a", "b", "c", "d"]}}
+}

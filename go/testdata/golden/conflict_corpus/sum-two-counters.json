@@ -1,0 +1,16 @@
+{
+  "name": "sum-two-counters",
+  "comment": "The case the spec addendum names but never ships (§12.9): a counter both sides incremented. Taking either side loses one side's increment; this adds both deltas to the base instead, which is what 'sum the two counters' has to mean for a merge to lose no writes.",
+  "source": "function main(c) {\n  var base = c.base.count;\n  var localDelta = c.local.count - base;\n  var remoteDelta = c.remote.count - base;\n  return { doc: { count: base + localDelta + remoteDelta } };\n}",
+  "input": {
+    "docId": "33333333-3333-4333-8333-333333333333",
+    "base": {"count": 10},
+    "local": {"count": 14},
+    "remote": {"count": 17},
+    "origins": {
+      "local": {"nodeId": "a", "commit": "aa", "timestampMicros": 100},
+      "remote": {"nodeId": "b", "commit": "bb", "timestampMicros": 200}
+    }
+  },
+  "expected": {"kind": "doc", "doc": {"count": 21}}
+}
