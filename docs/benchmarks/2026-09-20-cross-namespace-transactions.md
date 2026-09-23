@@ -208,3 +208,57 @@ namespaces with 8 writers, retrying conflicts. It committed 320 transfers with 1
 retried, and took 558–36,662 consistent snapshots. No snapshot, and not the final state, ever saw
 the total change. With the snapshot's publication check removed (a mutation test), the same test
 fails on every run.
+
+## 8. Re-run after the plan audit (2026-09-21)
+
+The audit of the plan against the code found one gap, fixed in #76. Namespaces that
+`kdb-service` opens on demand now get indexes and share the primary's governance, and index
+state is kept per namespace. Both measurements were repeated on `main` after #75 and #76. The
+single-namespace baseline is still `a2eb827`, the last commit before any cross-namespace code.
+The setup, commands and container are those of §5 and §6. Six interleaved rounds were run
+(`benchstat`, n=6).
+
+**Single-namespace commits: still no change.**
+
+| | macOS (load 3.6–6.4) | Linux (container, load up to 6.9) |
+|---|---|---|
+| Time per op, geomean over 19 server benchmarks | **+0.13%** | **−1.08%** |
+| Write, update, transaction and upsert benchmarks | no significant change | no significant change |
+| Significant differences | none | one read benchmark got *faster* (−2.55%, p=0.002) |
+| Engine commit latency (`CommitBytesPerOp`, `CommitConcurrent_DisjointDocs`) | geomean −0.96%, none significant | geomean +0.45%, none significant |
+| Allocations per op, server and engine | **identical** | **identical** |
+| Bytes per op, geomean (server / engine) | −1.10% / −0.33% | +0.16% / −0.18% |
+
+`BenchmarkCommitConcurrent_DisjointDocs` failed intermittently, as described in §6. On macOS it
+failed in 1 sub-benchmark on each side. On Linux it failed in 4 on `a2eb827` and in 1 on `main`.
+
+**Cross-namespace suite on the current code** (median of 5, `-test.benchtime 1s`):
+
+| | macOS | Linux |
+|---|---:|---:|
+| Two namespaces, 1 writer | 93 ops/s | 1,301 ops/s · p50 0.72 ms |
+| Two commits, not atomic, 1 writer | 122 | 1,873 · p50 0.52 ms |
+| Two namespaces, 16 / 64 writers | 423 / 1,594 | 7,784 / 16,310 |
+| Two commits, not atomic, 16 / 64 writers | 579 / 2,075 | 8,168 / 16,340 |
+| Simple protocol (serialized), 64 writers | 93 | 1,107 |
+| Four namespaces, 16 / 64 writers | 281 / 1,040 | 5,823 / 9,001 |
+| Disjoint pairs, 16 / 64 writers | 316 / 1,117 | 7,538 / 21,070 |
+
+| 16 writers on `a`, beside 16 background writers doing… | macOS | Linux | Linux p50 |
+|---|---:|---:|---:|
+| nothing | 1,881 ops/s | 12,610 ops/s | 0.99 ms |
+| ordinary commits to `b` | 977 | 14,330 | 1.01 ms |
+| groups over `b`+`c` | 419 | 12,160 | 1.17 ms |
+| groups over `a`+`b` | 368 | **6,548** | 2.17 ms |
+
+The results match §4 and §5 within the container's noise:
+
+- At 64 writers on Linux, an atomic two-namespace commit keeps pace with two non-atomic commits
+  (16,310 vs 16,340 ops/s).
+- Disjoint groups still scale, reaching 21,070 ops/s.
+- Groups on other namespaces cost their neighbours little on Linux: 12,160 against 12,610 ops/s
+  with no background load.
+- Sharing a namespace with groups still halves throughput, because of ack chaining. The p50
+  doubles from about 1.0 ms to 2.17 ms.
+- On macOS, neighbours slow down even when groups run on other namespaces. That is the
+  device-wide `F_FULLFSYNC` drain described in §4, not the protocol.
