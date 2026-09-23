@@ -1076,6 +1076,9 @@ The fix, in `checkpointMatchesLog`: damage in place is told apart from a replace
 3. `dag.Unshallow` runs, invalidating generations.
 4. The marker is rewritten without the root.
 
+**Re-runnable rather than undoable.** Steps 1 and 2 can fail, and step 2's fsync is waited for after the serialization is dropped, so commits can be resident in the DAG with no frame in the log. That is not rolled back: undoing it would mean deleting commits admitted by `PutCommit`, and `dag.DropShallowCommit` - what a failed snapshot install or graft takes its single root back with - deliberately refuses anything that is not a shallow root or that a resident commit names as a parent, which is most of what a deepen stores. Nor can the log be written first: a checkpoint pairs a DAG snapshot with the log position it has been replayed through, so one taken in between would record a DAG missing commits the log had already passed, and the next open would replay from after their frames. The DAG holding at least what the log holds is what makes checkpointing safe. So what to log, and the horizon to record, are read back out of the DAG (`commitsBelow`) instead of collected as commits are admitted, and a re-run logs the history below the root again. A repeated frame costs log space and nothing else: replay stores a commit only if the DAG does not already hold it.
+  - **Was a known issue through 0.6.1.** Both were taken from the store loop, which skips a commit the DAG already holds - exactly the commits a failed attempt leaves behind. A retry in the same process logged nothing but the root and reported success, over history no restart would come up with; and if the first attempt failed before the marker was written, the retry logged a parentless horizon commit the marker did not name, which is a namespace that fails to open.
+
 **Engine changes:**
 - Replay admits a marker-named root without its parents.
 - `meta.json` gains `bodiesExternal`, set once and never cleared: snapshot bodies are only in the blob store.
@@ -1093,6 +1096,7 @@ The fix, in `checkpointMatchesLog`: damage in place is told apart from a replace
 - durability across restart;
 - a partial deepen surviving a replay and then finished from a full node;
 - an interrupted deepen finished by rerunning it;
+- retrying after a failed log write, from both failure points and including the horizon: `TestDeepenCanBeRetriedAfterAFailedPersist` (the fsync, outside the serialization), `TestDeepenCanBeRetriedWhenTheLogRefusesTheWrite` (the log write, inside it), `TestDeepenRetryStillRecordsTheHorizon`;
 - the replicator option, the CLI, and a three-service Python e2e with a kill -9.
 
 ### Phase 15 — measured, then built what the measurements justified

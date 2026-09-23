@@ -34,6 +34,9 @@ type testNamespaces struct {
 	persistAsync func(document.Commit) (func() error, error)
 	// grafted, when set, is every env's GraftRecorded.
 	grafted func(codec.Hash) error
+	// shallowRootsChanged, when set, is every env's ShallowRootsChanged - the namespace marker a
+	// file runtime rewrites when a deepen changes the horizon.
+	shallowRootsChanged func([]codec.Hash) error
 	// resolution, when set, replaces every env's last-write policy.
 	resolution *ResolutionOptions
 }
@@ -74,7 +77,8 @@ func (p *testNamespaces) Env(ns string, create bool) (IngestEnv, error) {
 	}
 	return IngestEnv{DAG: s.dag, Storage: s.storage, NamespaceID: ns, ApplyToStorage: true,
 		Resolution: res, SnapshotInstalled: p.installed, CanInstallSnapshot: p.canInstall,
-		PersistAsync: p.persistAsync, GraftRecorded: p.grafted}, nil
+		PersistAsync: p.persistAsync, GraftRecorded: p.grafted,
+		ShallowRootsChanged: p.shallowRootsChanged}, nil
 }
 
 func (p *testNamespaces) side(ns string) side {
