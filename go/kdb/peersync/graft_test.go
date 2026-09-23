@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -258,4 +259,141 @@ func TestGraftPushThenPushStoresTheHistory(t *testing.T) {
 	// C merged A's proposal itself (an unrelated merge) - and a pull the other way converges.
 	syncV2(t, "graft-push-c", f.a, V2ClientConfig{Namespaces: []string{f.ns}, Mode: SyncPull})
 	requireConverged(t, f)
+}
+
+// graftRollbackFixture is newGraftFixture with C's log wired to a switch: while failing is set,
+// the graft root's fsync fails and every other commit logs normally. It returns the fixture and
+// the number of commits C's DAG held before any graft, which is what a clean rollback restores.
+func graftRollbackFixture(t *testing.T, hubPrefix string, failing *bool, failQueue bool) (graftFixture, int) {
+	t.Helper()
+	f := newGraftFixture(t, hubPrefix, unrelatedChain())
+	boom := errors.New("log device is full")
+	f.c.persistAsync = func(c document.Commit) (func() error, error) {
+		if *failing && c.Hash == f.root {
+			if failQueue {
+				// Under the serialization: persistAll never returns a wait for this one.
+				return nil, boom
+			}
+			// After it: the log position is taken, the fsync behind it is not.
+			return func() error { return boom }, nil
+		}
+		return func() error { return nil }, nil
+	}
+	return f, f.c.side(f.ns).dag.CommitCount()
+}
+
+// requireRolledBack: after a failed graft, C is as it was - no root, no shallow root, and no
+// commit left over. The commit count matters on its own: a file runtime decides whether a
+// namespace is still fresh enough to bootstrap by counting commits (embed.CanInstallSnapshot),
+// so an orphan nothing points at is not merely untidy.
+func requireRolledBack(t *testing.T, f graftFixture, before int) {
+	t.Helper()
+	c := f.c.side(f.ns)
+	if c.dag.HasCommit(f.root) {
+		t.Fatal("a failed graft left the root resident in C's DAG")
+	}
+	if c.dag.IsShallow(f.root) {
+		t.Fatal("a failed graft left the root as a shallow root on C")
+	}
+	for _, r := range c.dag.ShallowRoots() {
+		if r == f.root {
+			t.Fatalf("a failed graft left %s in C's shallow roots", r.Hex())
+		}
+	}
+	if n := c.dag.CommitCount(); n != before {
+		t.Fatalf("a failed graft left C holding %d commits, want %d", n, before)
+	}
+	if mustHead(t, c) != f.cPre {
+		t.Fatalf("a failed graft moved C's main to %s", mustHead(t, c).Hex())
+	}
+}
+
+// TestGraftCanBeRetriedAfterAFailedPersist is the regression this exists for. C's graft of A's
+// root fails on the fsync behind the log write. Before the root was taken back out of the DAG it
+// stayed resident with nothing naming it, and Graft's own "a root already held is left alone"
+// short-circuit then reported success on every later attempt in the same process - a graft that
+// was never logged, and that a restart would come up without.
+func TestGraftCanBeRetriedAfterAFailedPersist(t *testing.T) {
+	failing := true
+	f, before := graftRollbackFixture(t, "graft-retry", &failing, false)
+
+	cfg := V2ClientConfig{PeerURI: "memory://graft-retry-a", Local: f.c, NodeID: "c",
+		Namespaces: []string{f.ns}, Mode: SyncPull}
+	res, err := SyncV2(wire.NewCodec(wire.EncodingJSON), stream.NewInMemoryTransport(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := res.Namespaces[0].Err; e == nil || !strings.Contains(e.Error(), "log device is full") {
+		t.Fatalf("expected the first attempt to fail on the log, got %v", e)
+	}
+	requireRolledBack(t, f, before)
+
+	// The retry must actually re-graft rather than short-circuit on a resident root.
+	failing = false
+	got := syncV2(t, "graft-retry-a", f.c, V2ClientConfig{Namespaces: []string{f.ns}, Mode: SyncPull})
+	if g := got.Namespaces[0].Grafted; len(g) != 1 || g[0] != f.root.Hex() {
+		t.Fatalf("the retry did not graft A's root %s, grafted %v", f.root.Hex(), g)
+	}
+	if !f.c.side(f.ns).dag.IsShallow(f.root) {
+		t.Fatal("the retried graft did not store the root as a shallow root")
+	}
+	// And the state came with it: C merges the two unrelated histories and converges with A.
+	syncV2(t, "graft-retry-c", f.a, V2ClientConfig{Namespaces: []string{f.ns}, Mode: SyncPull})
+	requireConverged(t, f)
+}
+
+// TestGraftRolledBackWhenTheLogRefusesTheCommit is the same undo reached from inside the
+// serialization, where the log write itself is refused and no fsync is ever waited on.
+func TestGraftRolledBackWhenTheLogRefusesTheCommit(t *testing.T) {
+	failing := true
+	f, before := graftRollbackFixture(t, "graft-refuse", &failing, true)
+
+	cfg := V2ClientConfig{PeerURI: "memory://graft-refuse-a", Local: f.c, NodeID: "c",
+		Namespaces: []string{f.ns}, Mode: SyncPull}
+	res, err := SyncV2(wire.NewCodec(wire.EncodingJSON), stream.NewInMemoryTransport(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := res.Namespaces[0].Err; e == nil || !strings.Contains(e.Error(), "log device is full") {
+		t.Fatalf("expected the graft to fail on the log, got %v", e)
+	}
+	requireRolledBack(t, f, before)
+
+	failing = false
+	syncV2(t, "graft-refuse-a", f.c, V2ClientConfig{Namespaces: []string{f.ns}, Mode: SyncPull})
+	syncV2(t, "graft-refuse-c", f.a, V2ClientConfig{Namespaces: []string{f.ns}, Mode: SyncPull})
+	requireConverged(t, f)
+}
+
+// TestGraftMarkerIsNotRolledBack: the namespace marker's graftRoots entry stays after a failed
+// graft, on purpose. It is not a record that the graft happened - it is standing permission for a
+// replay that meets this hash in the log to admit it without its parents, which is why
+// RecordGraft writes it before the root is logged rather than after. A hash that never reached
+// the log is never looked up; and if the failed fsync did land after all, the entry is exactly
+// what lets that log be replayed. Rolling it back would reintroduce the ordering hazard it
+// exists to close.
+func TestGraftMarkerIsNotRolledBack(t *testing.T) {
+	failing := true
+	f, before := graftRollbackFixture(t, "graft-marker", &failing, false)
+	var recorded []codec.Hash
+	f.c.grafted = func(root codec.Hash) error {
+		recorded = append(recorded, root)
+		return nil
+	}
+
+	cfg := V2ClientConfig{PeerURI: "memory://graft-marker-a", Local: f.c, NodeID: "c",
+		Namespaces: []string{f.ns}, Mode: SyncPull}
+	if _, err := SyncV2(wire.NewCodec(wire.EncodingJSON), stream.NewInMemoryTransport(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	requireRolledBack(t, f, before)
+	if len(recorded) != 1 || recorded[0] != f.root {
+		t.Fatalf("the graft marker should have been written once for %s, got %v", f.root.Hex(), recorded)
+	}
+	// Nothing un-records it: there is no such call, and the retry simply writes it again.
+	failing = false
+	syncV2(t, "graft-marker-a", f.c, V2ClientConfig{Namespaces: []string{f.ns}, Mode: SyncPull})
+	if len(recorded) != 2 {
+		t.Fatalf("the retry should have recorded the graft again, got %v", recorded)
+	}
 }

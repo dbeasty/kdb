@@ -119,6 +119,42 @@ func Graft(env IngestEnv, root codec.Hash, fetch func(after string) (wire.Snapsh
 		node = lockOnlyNode{}
 	}
 	var durable []func() error
+	// admitted records that the root reached the DAG, so undo knows whether it has a commit to
+	// take back. Everything after PutShallowCommit can still fail: the log queue under the lock,
+	// and the fsync it returns, which is waited for after the lock is dropped.
+	admitted := false
+	// undo takes the root back out, leaving the namespace as it was for a retry. Without it the
+	// root stayed resident with nothing naming it, and Graft's own "a root already held is left
+	// alone" short-circuit then reported success for a graft that was never logged - so a retry
+	// in the same process did nothing, while a restart came up without the root at all.
+	//
+	// Two things the admission touched are deliberately left behind:
+	//
+	//   - The document tree, in the DAG and in the store's foreign-tree side store. Trees are
+	//     content-addressed and shared, and a foreign tree never becomes the live tree
+	//     (storage.ForeignTreeStore); nothing reaches it once no commit names it.
+	//   - The graftRoots entry GraftRecorded wrote into the namespace marker. That entry is not a
+	//     record that the graft happened - it is standing permission for a replay that *meets*
+	//     this hash in the log to admit it without its parents, which is why RecordGraft writes it
+	//     before the root is logged (embed/snapshot_install.go) rather than after. A hash that
+	//     never reached the log is never looked up, so the entry is inert; and if the fsync did
+	//     land after reporting failure, the entry is exactly what makes that log readable. It is
+	//     also self-clearing: the next RecordShallowRoots rewrites the marker from the live roots,
+	//     which no longer include this one.
+	undo := func(cause error) error {
+		if !admitted {
+			return cause
+		}
+		// Reported rather than swallowed, for the reason InstallSnapshot's undo gives: a retry
+		// that will be refused is worse than a loud failure. DropShallowCommit refuses a root
+		// something has since built on - a concurrent sync's merge, which this runs outside the
+		// serialization to meet - and that root is genuinely in use, so refusing is right.
+		if err := env.DAG.DropShallowCommit(root); err != nil {
+			return fmt.Errorf("%w (and the grafted root could not be taken back: %v)", cause, err)
+		}
+		admitted = false
+		return cause
+	}
 	err = node.Exclusive(func() error {
 		lock := divergenceLockFor(env.NamespaceID)
 		lock.Lock()
@@ -140,13 +176,19 @@ func Graft(env IngestEnv, root codec.Hash, fetch func(after string) (wire.Snapsh
 		if err := env.DAG.PutShallowCommit(commit); err != nil {
 			return fmt.Errorf("peer sync: graft: storing %s: %w", root.Hex(), err)
 		}
+		admitted = true
 		env.DAG.PutDocumentTree(tree)
-		durable, err = env.persistAll([]document.Commit{commit})
-		return err
+		if durable, err = env.persistAll([]document.Commit{commit}); err != nil {
+			return undo(err)
+		}
+		return nil
 	})
+	// Waited for outside the serialization, as an adopted commit's is (see ingest.go): the log
+	// position is fixed, so the next writer need not wait on this one's fsync. The undo therefore
+	// runs unserialized too - which is what DropShallowCommit's refusals are for.
 	for _, wait := range durable {
 		if werr := wait(); werr != nil && err == nil {
-			err = fmt.Errorf("peer sync: graft: persisting %s: %w", root.Hex(), werr)
+			err = undo(fmt.Errorf("peer sync: graft: persisting %s: %w", root.Hex(), werr))
 		}
 	}
 	return res, err
