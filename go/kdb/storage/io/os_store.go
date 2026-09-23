@@ -309,19 +309,50 @@ func (s *OSByteStore) AvailableBytes() (int64, error) {
 	return availableBytes(s.root)
 }
 
-// snapPathFor is where an enlistment snapshot lives on disk. Both the directory name and the
-// key sanitization must match Kotlin's JvmSegmentByteStore.snapFile: this used to write to
-// "snapshots/" with the raw key, so (a) a snapshot written by one runtime was invisible to the
-// other, and (b) the raw key - SnapshotKeyBuilder.Enlistment produces "kdb:snap:<id>" - put a
-// colon in the file name, which is not a portable path character.
+// SnapFileName is the single flat file name a snapshot key is stored under inside a data root's
+// snap/ directory. Both the directory name and this sanitization must match Kotlin's
+// JvmSegmentByteStore.snapFile and NativeSegmentByteStore.snapPath: a snapshot written by one
+// runtime has to be found by the other.
+//
+// Two substitutions, and both are load-bearing. The colon, because the raw key -
+// SnapshotKeyBuilder.Enlistment produces "kdb:snap:<id>", checkpoints "kdb:checkpoint:<id>" - is
+// not a portable path character. The slash, because a namespace id may contain one and the name
+// has to stay a single path component: a nested id used to become real directories, so
+// "repro/account" wrote the FILE snap/kdb_checkpoint_repro/account while "repro/account/ro"
+// needed that same "account" to be a directory, and whichever came second could never be written
+// at all. "%2F" is safe to substitute because ValidateNamespaceID allows only [A-Za-z0-9._-] in a
+// segment, so no id can produce a "%" of its own and two ids can never flatten to one name.
+func SnapFileName(key string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(key, ":", "_"), "/", "%2F")
+}
+
+// legacySnapPathFor is where a snapshot written before SnapFileName flattened the slash still
+// lives. Only ids containing a slash moved; everything else names the same file under both.
+func (s *OSByteStore) legacySnapPathFor(key string) string {
+	return filepath.Join(s.root, "snap", filepath.FromSlash(strings.ReplaceAll(key, ":", "_")))
+}
+
 func (s *OSByteStore) snapPathFor(key string) string {
-	safeKey := strings.ReplaceAll(key, ":", "_")
-	return filepath.Join(s.root, "snap", filepath.FromSlash(safeKey))
+	return filepath.Join(s.root, "snap", SnapFileName(key))
 }
 
 func (s *OSByteStore) ReadSnapshot(key string) ([]byte, error) {
-	p := s.snapPathFor(key)
-	b, err := os.ReadFile(p)
+	b, err := os.ReadFile(s.snapPathFor(key))
+	if err == nil {
+		return b, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	// Written by a build that nested the slash. For a namespace bootstrapped from a peer's
+	// snapshot the checkpoint is the only record of its state and open refuses to proceed
+	// without it, so failing to look here would not cost a slow start - it would strand the
+	// namespace. WriteSnapshot retires the old file once the new one is in place.
+	legacy := s.legacySnapPathFor(key)
+	if legacy == s.snapPathFor(key) {
+		return nil, nil
+	}
+	b, err = os.ReadFile(legacy)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -371,10 +402,22 @@ func (s *OSByteStore) WriteSnapshot(key string, data []byte) error {
 		_ = d.Sync()
 		d.Close()
 	}
+	// The new name now holds this key's state, so retire any pre-flattening file. Leaving it
+	// would be worse than untidy: ReadSnapshot falls back to it whenever the new name is absent,
+	// and promotion moves only the new one - so a promoted namespace would fall back to a
+	// checkpoint describing a log that is no longer underneath it.
+	if legacy := s.legacySnapPathFor(key); legacy != p {
+		_ = os.Remove(legacy)
+	}
 	return nil
 }
 
 func (s *OSByteStore) DeleteSnapshot(key string) error {
+	if legacy := s.legacySnapPathFor(key); legacy != s.snapPathFor(key) {
+		if err := os.Remove(legacy); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 	p := s.snapPathFor(key)
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err

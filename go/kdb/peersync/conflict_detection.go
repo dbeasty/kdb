@@ -89,11 +89,11 @@ type ResolutionOptions struct {
 	// ConflictPolicyCustom consults Resolver once per conflicting document.
 	Policy transaction.ConflictPolicy
 	// Choose, when set, decides every same-document conflict before Policy is consulted: given a
-	// document's final operation on each side, it returns the operation the merge applies, or
-	// false to leave the conflict reported. It is how an operator's resolution of a queued
-	// conflict is applied (see ResolveConflict) - an explicit local/remote choice, not a policy,
-	// so unlike Resolver it is told which side is which.
-	Choose func(docID codec.UUID, local, remote document.Op) (document.Op, bool)
+	// document's final operation on each side, it returns how the merge settles it, or false to
+	// leave the conflict reported. It is how an operator's resolution of a queued conflict is
+	// applied (see ResolveConflict) - an explicit local/remote choice, not a policy, so unlike
+	// Resolver it is told which side is which.
+	Choose func(docID codec.UUID, local, remote document.Op) (Settlement, bool)
 	// Resolver is consulted when Policy is ConflictPolicyCustom. A nil Resolver, or a
 	// resolution failure/nil result for any document, falls back to reporting the conflict
 	// rather than guessing - matching transaction.Engine's own CUSTOM fallback.
@@ -104,6 +104,57 @@ type ResolutionOptions struct {
 	Chain *ResolutionChain
 	// Valid reports whether a document body passes the namespace's schema, for RuleValidity.
 	Valid func(body string) bool
+	// Procedure runs one of the namespace's stored procedures over a conflicting document, for
+	// RuleProcedure. It is injected rather than called directly because the script engine is not
+	// this package's business: peer sync decides which conflicts exist and what a settlement
+	// means, and the server decides what running a procedure entails.
+	//
+	// decided false falls through to the next rule. An error holds the merge: the document is
+	// reported with the reason and no merge commit is made. sourceHash is the revision the chain
+	// was set against, for the caller to check its own copy against.
+	Procedure func(name, sourceHash string, c ProcedureConflict) (st Settlement, decided bool, err error)
+	// ProcedureHash returns the source hash of a stored procedure this node holds, or "" for one
+	// it does not. It is what makes a missing or stale procedure visible to peers before they
+	// merge - see ResolutionOptions.AdvertisedHash.
+	ProcedureHash func(name string) string
+}
+
+// ProcedureConflict is one conflicting document as RuleProcedure passes it on. Side 0 is the
+// merge's first parent's, so the two sides arrive in the same order on both nodes, whichever of
+// them is running the merge.
+type ProcedureConflict struct {
+	DocID codec.UUID
+	// Base is the value at the common ancestor; nil when the document did not exist there.
+	Base *string
+	// Side0 and Side1 are the two sides' bodies; nil where that side deleted the document.
+	Side0, Side1 *string
+	// Origin0 and Origin1 are the writes that produced each side.
+	Origin0, Origin1 transaction.ConflictOrigin
+}
+
+// AdvertisedHash is the resolution hash this node tells peers, which they compare with their own
+// before merging (see v2_client.syncNamespace).
+//
+// It is the chain's hash while this node can actually run the chain. When it cannot - a rule
+// calls a procedure this node does not hold, or holds at a different revision - it advertises a
+// hash no peer will match, so neither side merges until the definition has caught up. Saying
+// nothing and merging anyway is the one outcome that must not happen: a node applying half the
+// rules builds a merge no other node would build.
+func (o ResolutionOptions) AdvertisedHash() string {
+	base := o.Chain.Hash()
+	if base == "" {
+		return ""
+	}
+	for _, r := range o.Chain.Procedures() {
+		have := ""
+		if o.ProcedureHash != nil {
+			have = o.ProcedureHash(r.Name)
+		}
+		if have != r.SourceHash {
+			return "unavailable:" + base
+		}
+	}
+	return base
 }
 
 var (

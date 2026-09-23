@@ -370,6 +370,66 @@ func TestV2UngrantedNamespaceRefused(t *testing.T) {
 	}
 }
 
+// TestV2CreateOnPushAckAdvertisesTheNamespace is the narrow regression: a literal name the hub
+// grants under CreateOnPush must appear in the hello ack's refs (with no history), not just in
+// the session's granted set - a v2 client only syncs what ack.Refs names, so before the fix
+// CreateOnPush could never actually trigger for a v2 client.
+func TestV2CreateOnPushAckAdvertisesTheNamespace(t *testing.T) {
+	remote := newTestNamespaces(t) // the hub holds nothing
+	host := NewV2Host(wire.NewCodec(wire.EncodingJSON),
+		V2HostConfig{NodeID: "hub", Namespaces: remote, CreateOnPush: true}, auth.AllowAll, auth.EmptyContext)
+	w := wire.NewCodec(wire.EncodingJSON)
+	hello, _ := w.Encode(wire.SyncHelloMessage{
+		H: header(wire.MsgSyncHello, 1), NodeID: "spoke", Protocol: 2, Namespaces: []string{"node/phone1/outbox"},
+	})
+	out, err := host.HandleFrame(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := w.Decode(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, ok := decoded.(wire.SyncHelloAckMessage)
+	if !ok {
+		t.Fatalf("expected SYNC_HELLO_ACK, got %T", decoded)
+	}
+	if len(ack.Refs) != 1 || ack.Refs[0].Namespace != "node/phone1/outbox" {
+		t.Fatalf("expected the CreateOnPush namespace in the ack's refs, got %+v", ack.Refs)
+	}
+	if len(ack.Refs[0].Branches) != 0 || len(ack.Refs[0].Tags) != 0 {
+		t.Fatalf("a namespace the hub doesn't hold yet should advertise no history, got %+v", ack.Refs[0])
+	}
+}
+
+// TestV2CreateOnPushEndToEnd reproduces the full gap: a namespace born only on a spoke (a phone's
+// outbox, or a match hosted on a phone) synced to a hub that has never held it, with CreateOnPush
+// on. Before the fix this reported zero namespaces synced and created nothing on the hub.
+func TestV2CreateOnPushEndToEnd(t *testing.T) {
+	ns := "node/phone1/outbox"
+	remote := newTestNamespaces(t) // hub holds nothing
+	local := newTestNamespaces(t, ns)
+	l := local.side(ns)
+	g, _ := l.dag.Head()
+	tip := chain(t, l, ns, g, 3, "main")
+
+	host := NewV2Host(wire.NewCodec(wire.EncodingJSON),
+		V2HostConfig{NodeID: "hub", Namespaces: remote, CreateOnPush: true}, auth.AllowAll, auth.EmptyContext)
+	v2Hub(t, "hub-create-on-push", host, nil)
+
+	res := syncV2(t, "hub-create-on-push", local, V2ClientConfig{Namespaces: []string{ns}, Mode: SyncPush})
+	if len(res.Namespaces) != 1 {
+		t.Fatalf("expected the namespace to be synced, got %d: %+v", len(res.Namespaces), res)
+	}
+	rSide := remote.side(ns)
+	if rSide.dag == nil {
+		t.Fatalf("the hub never created the namespace")
+	}
+	if rh, err := rSide.dag.Head(); err != nil || rh != tip.Hash {
+		t.Fatalf("hub main not fast-forwarded: head %s (err %v), want %s", rh.Hex(), err, tip.Hash.Hex())
+	}
+}
+
 func TestMatchNamespace(t *testing.T) {
 	cases := []struct {
 		pattern, ns string

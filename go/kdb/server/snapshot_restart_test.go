@@ -140,6 +140,102 @@ func TestSnapshotBootstrapSurvivesRestart(t *testing.T) {
 	}
 }
 
+// TestNestedNamespacesBootstrapFromSnapshots: two namespaces on one file-backed node, where one's
+// name is a prefix of the other's, can both be bootstrapped from a peer's snapshot and both
+// reopen afterwards.
+//
+// Nesting is how namespace patterns are meant to be used ("u/<account>" for what a person writes,
+// "u/<account>/ro" for what the cloud writes for them), and it used to be impossible here: the
+// checkpoint kept the id's slash as a real path separator, so the outer namespace's checkpoint
+// was the FILE snap/kdb_checkpoint_u/<account> and the nested one needed that same path to be a
+// directory. The second bootstrap failed with "not a directory" - and did not recover, because by
+// then the namespace had a commit, so every later attempt was refused as needing a fresh
+// namespace and it could never be bootstrapped on that node again.
+func TestNestedNamespacesBootstrapFromSnapshots(t *testing.T) {
+	outer, nested := "repro/account", "repro/account/ro"
+	dir := t.TempDir()
+
+	// One source per namespace, each serving its own listener.
+	serve := func(ns string, body string) (string, codec.UUID) {
+		t.Helper()
+		rt, err := embed.OpenMemoryRuntime(embed.CatalogFromNamespace(ns), ns, schema.None())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { rt.Close() })
+		src := NewKdbServerRuntime(rt)
+		id := mustRandomUUID(t)
+		if _, err := src.Upsert(ns, id, body, auth.Principal{}); err != nil {
+			t.Fatal(err)
+		}
+		ln, err := ListenPeerSync("tcp://127.0.0.1:0?bind=true", src, ns)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		return ln.Addr().String(), id
+	}
+	outerAddr, outerDoc := serve(outer, `{"who":"outer"}`)
+	nestedAddr, nestedDoc := serve(nested, `{"who":"nested"}`)
+
+	open := func(ns string) *KdbServerRuntime {
+		t.Helper()
+		rt, err := embed.OpenFileRuntime(dir, embed.CatalogFromNamespace(ns), ns, schema.None())
+		if err != nil {
+			t.Fatalf("open %s: %v", ns, err)
+		}
+		srv := NewKdbServerRuntime(rt)
+		srv.NodeID = mustRandomUUID(t)
+		return srv
+	}
+	bootstrap := func(ns, addr string) {
+		t.Helper()
+		b := open(ns)
+		defer b.Runtime.Close()
+		res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(core.DefaultConnectOptions()), peersync.V2ClientConfig{
+			NodeID: b.NodeID.String(), PeerURI: "tcp://" + addr, Namespaces: []string{ns},
+			Mode: peersync.SyncPull, Local: b.PeerNamespaces(), PreferSnapshot: true,
+		})
+		if err != nil {
+			t.Fatalf("bootstrapping %s: %v", ns, err)
+		}
+		if res.Namespaces[0].Err != nil {
+			t.Fatalf("bootstrapping %s: %v", ns, res.Namespaces[0].Err)
+		}
+		if res.Namespaces[0].Snapshot == "" {
+			t.Fatalf("bootstrapping %s did not install a snapshot: %+v", ns, res.Namespaces[0])
+		}
+	}
+	// The outer namespace first, so its checkpoint is the one already on disk when the nested
+	// namespace needs the same path.
+	bootstrap(outer, outerAddr)
+	bootstrap(nested, nestedAddr)
+
+	// Both reopen from what is on disk, each holding its own snapshot's document - and each
+	// namespace's checkpoint still describes its own namespace, not its neighbour's.
+	for _, c := range []struct {
+		ns, want string
+		doc      codec.UUID
+	}{
+		{outer, `{"who":"outer"}`, outerDoc},
+		{nested, `{"who":"nested"}`, nestedDoc},
+	} {
+		srv := open(c.ns)
+		body, _, found, err := srv.GetDocument(c.ns, c.doc)
+		if err != nil || !found || body != c.want {
+			t.Fatalf("%s after reopening: document = %q found=%v err=%v, want %q", c.ns, body, found, err, c.want)
+		}
+		h, err := srv.dag.Head()
+		if err != nil {
+			t.Fatalf("%s: head after reopening: %v", c.ns, err)
+		}
+		if !srv.dag.IsShallow(h) {
+			t.Fatalf("%s: the snapshot root is not a shallow root after reopening", c.ns)
+		}
+		srv.Runtime.Close()
+	}
+}
+
 // TestSnapshotRefusedIntoANamespaceWithHistory: a file-backed namespace that has commits of its
 // own cannot be bootstrapped - the snapshot's root would have no place in its log.
 func TestSnapshotRefusedIntoANamespaceWithHistory(t *testing.T) {

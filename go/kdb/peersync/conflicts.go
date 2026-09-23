@@ -324,6 +324,18 @@ type Choice struct {
 	Take string `json:"take,omitempty"`
 	// Body replaces the document with this JSON.
 	Body *string `json:"body,omitempty"`
+	// Delete removes the document, whatever either side holds. Taking a side that happens to be
+	// a delete cannot express this: sometimes the answer to two conflicting writes is that
+	// neither belongs there.
+	Delete bool `json:"delete,omitempty"`
+	// Fork keeps both sides: the side Fork.Keep names stays at this document's id and the other
+	// is written to a document of its own (see ForkDoc).
+	Fork *ForkChoice `json:"fork,omitempty"`
+}
+
+// ForkChoice keeps both sides of a conflict. Keep is "local" or "remote".
+type ForkChoice struct {
+	Keep string `json:"keep"`
 }
 
 // ErrConflictNotFound is resolving an entry the queue does not hold.
@@ -350,19 +362,37 @@ func ResolveConflict(env IngestEnv, id string, choices map[codec.UUID]Choice) (I
 	if err != nil {
 		return IngestResult{}, err
 	}
-	env.Resolution.Choose = func(docID codec.UUID, local, remote document.Op) (document.Op, bool) {
+	env.Resolution.Choose = func(docID codec.UUID, local, remote document.Op) (Settlement, bool) {
 		c, ok := choices[docID]
 		switch {
 		case !ok:
-			return nil, false
+			return Settlement{}, false
 		case c.Body != nil:
-			return document.WriteOp{DocID: docID, Patch: *c.Body}, true
+			body := *c.Body
+			return Settlement{Body: &body}, true
+		case c.Delete:
+			return Settlement{}, true
+		case c.Fork != nil:
+			keep, losing := local, remote
+			if c.Fork.Keep == "remote" {
+				keep, losing = remote, local
+			} else if c.Fork.Keep != "local" {
+				return Settlement{}, false
+			}
+			// No origin: an operator's choice is made on one node, and the merge it produces is
+			// what the others fast-forward to, so the fork needs no back-reference to a commit
+			// for two nodes to agree on it.
+			f, ok := ForkOf(docID, opBody(losing), codec.Hash{})
+			if !ok {
+				return Settlement{}, false
+			}
+			return Settlement{Body: opBody(keep), Fork: f}, true
 		case c.Take == "local":
-			return local, true
+			return Settlement{Body: opBody(local)}, true
 		case c.Take == "remote":
-			return remote, true
+			return Settlement{Body: opBody(remote)}, true
 		}
-		return nil, false
+		return Settlement{}, false
 	}
 	env.Peer = e.Peer
 	res, err := Adopt(env, incoming)

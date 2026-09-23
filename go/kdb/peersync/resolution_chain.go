@@ -43,6 +43,19 @@ const (
 	// RuleQueue stops the chain: whatever is still undecided is reported and queued for the
 	// application or an operator, regardless of the namespace's conflict policy.
 	RuleQueue = "queue"
+	// RuleProcedure calls one of the namespace's stored procedures (a replicated definition, see
+	// server.MetaStore) with the conflicting document: both sides, their common base, who wrote
+	// each, and the list of fields that differ. The procedure keeps a side, returns a document it
+	// built, forks to keep both, deletes, or defers to the next rule.
+	//
+	// It is the escape hatch for rules this package cannot express - "a cancelled order stays
+	// cancelled", "sum the two counters" - without giving up what makes a chain safe. The
+	// procedure runs with no clock, no randomness and no database access, so two nodes merging
+	// the same heads get the same answer; the chain pins the source hash it was set against, so
+	// a node holding a different revision stops merging rather than merging differently. A
+	// procedure that throws, times out or is missing holds the merge; it never falls through,
+	// because "it failed here" is not something both nodes can be relied on to agree about.
+	RuleProcedure = "procedure"
 	// RuleAuthority stops the chain and hands whatever is still undecided to a resolver authority
 	// - an application service with its own business rules, or a person - holding the "resolve"
 	// permission. Pending says what the namespace holds meanwhile: PendingHold (the default)
@@ -72,6 +85,21 @@ type ResolutionRule struct {
 	// "24h") before its fallback becomes final: a held conflict is settled by last write, a
 	// provisional decision simply stands. Empty waits forever.
 	Timeout string `json:"timeout,omitempty"`
+	// Name is RuleProcedure's stored procedure.
+	Name string `json:"name,omitempty"`
+	// Procedure, for RuleAuthority, is a stored procedure that settles what the rule queues -
+	// the authority itself, rather than a webhook to one. It runs after the merge, on the
+	// notifying node only, and its decision is an ordinary commit. No revision is pinned for it:
+	// unlike RuleProcedure it decides nothing inside a merge commit, so two nodes running
+	// different copies of it cannot diverge - at most the one that notifies settles a conflict
+	// the other has not yet seen settled.
+	Procedure string `json:"procedure,omitempty"`
+	// SourceHash is the source that procedure had when the chain was set (server.MetaStore.
+	// SetResolution pins it). It is part of the chain, so it is part of the chain's hash, so a
+	// node whose copy of the procedure differs - an older revision, or none yet - does not look
+	// like a node that agrees. Without it, two nodes could hold the same chain, run different
+	// code and build different merges.
+	SourceHash string `json:"sourceHash,omitempty"`
 }
 
 // TimeoutDuration is Timeout parsed; zero when unset or invalid (Validate refuses invalid).
@@ -119,6 +147,10 @@ func (c ResolutionChain) Validate() error {
 				seen[id] = true
 			}
 		case RuleValidity, RuleFieldMerge:
+		case RuleProcedure:
+			if r.Name == "" {
+				return fmt.Errorf("rule %d: %s needs the name of a stored procedure", i, r.Kind)
+			}
 		case RuleLastWrite, RuleQueue, RuleAuthority:
 			if i != len(c.Rules)-1 {
 				return fmt.Errorf("rule %d: %s always ends the chain, so no rule may follow it", i, r.Kind)
@@ -128,6 +160,12 @@ func (c ResolutionChain) Validate() error {
 		}
 		if r.Kind != RuleSourcePriority && len(r.Nodes) > 0 {
 			return fmt.Errorf("rule %d: only %s takes nodes", i, RuleSourcePriority)
+		}
+		if r.Kind != RuleProcedure && (r.Name != "" || r.SourceHash != "") {
+			return fmt.Errorf("rule %d: only %s takes name and sourceHash", i, RuleProcedure)
+		}
+		if r.Kind != RuleAuthority && r.Procedure != "" {
+			return fmt.Errorf("rule %d: only %s takes procedure", i, RuleAuthority)
 		}
 		if r.Kind == RuleAuthority {
 			switch r.Pending {
@@ -150,6 +188,20 @@ func (c ResolutionChain) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Procedures names the stored procedures this chain calls, in order.
+func (c *ResolutionChain) Procedures() []ResolutionRule {
+	if c == nil {
+		return nil
+	}
+	var out []ResolutionRule
+	for _, r := range c.Rules {
+		if r.Kind == RuleProcedure {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Authority returns the chain's authority rule, or nil when it has none.
@@ -194,17 +246,44 @@ type conflictSides struct {
 // chainOutcome is what a chain made of one document.
 type chainOutcome struct {
 	winner *string
+	// fork, when set, is the extra document that keeps the side winner displaced.
+	fork *ForkDoc
 	// decided: winner is the merged value. provisional additionally marks it as the authority's
 	// to overrule.
 	decided, provisional bool
 	// queued: the chain ended in RuleQueue or a holding RuleAuthority; report it.
 	queued bool
+	// held: a rule could not run at all. Like queued the document is reported, but reason says
+	// what went wrong, because unlike a queued conflict this is something to fix rather than
+	// something to decide.
+	held   bool
+	reason string
 }
 
 // resolve runs the chain over one document. Neither decided nor queued means the chain ran out.
-func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, s conflictSides, valid func(string) bool) chainOutcome {
+func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, docID codec.UUID, s conflictSides, opts ResolutionOptions) chainOutcome {
+	valid := opts.Valid
 	for _, r := range c.Rules {
 		switch r.Kind {
+		case RuleProcedure:
+			if opts.Procedure == nil {
+				return chainOutcome{held: true, reason: "this node cannot run stored procedures, so it cannot apply rule " + r.Name}
+			}
+			st, decided, err := opts.Procedure(r.Name, r.SourceHash, ProcedureConflict{
+				DocID: docID, Base: s.base,
+				Side0: s.body[0], Side1: s.body[1],
+				Origin0: conflictOrigin(d, s.origin[0]), Origin1: conflictOrigin(d, s.origin[1]),
+			})
+			switch {
+			case err != nil:
+				// Held, never fallen through. A procedure that failed here may well succeed on
+				// the other node - it timed out, or this node holds no copy of it - and two
+				// nodes that carried on under different rules would build different merges. The
+				// other node may merge; this one fast-forwards to that merge later.
+				return chainOutcome{held: true, reason: "procedure " + r.Name + ": " + err.Error()}
+			case decided:
+				return chainOutcome{winner: st.Body, fork: st.Fork, decided: true}
+			}
 		case RuleSourcePriority:
 			if i, ok := sourcePriority(d, r.Nodes, s.origin); ok {
 				return chainOutcome{winner: s.body[i], decided: true}

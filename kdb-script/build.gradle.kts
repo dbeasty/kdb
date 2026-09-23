@@ -11,6 +11,7 @@ dependencies {
     implementation(project(":kdb-auth"))
     implementation(project(":kdb-codec"))
     implementation(project(":kdb-document"))
+    implementation(project(":kdb-json"))
     implementation(project(":kdb-schema"))
     implementation(project(":kdb-dag"))
     implementation(project(":kdb-storage"))

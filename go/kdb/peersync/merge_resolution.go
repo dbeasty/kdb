@@ -8,6 +8,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
+	kdbjson "github.com/limidus/kdb/go/kdb/json"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/transaction"
 )
@@ -64,6 +65,68 @@ func bodyOp(id codec.UUID, body *string) document.Op {
 	return document.WriteOp{DocID: id, Patch: *body}
 }
 
+// Settlement is how one conflicting document is settled: the value the merge writes for it - nil
+// deletes it - and, when the settlement keeps both sides rather than choosing between them, the
+// extra document the other side is written to.
+type Settlement struct {
+	Body *string
+	Fork *ForkDoc
+}
+
+// ForkDoc keeps a conflict's losing side rather than discarding it: the same content under an id
+// of its own, with a conflictOf back-reference to the document it was split from.
+//
+// It exists because some conflicts have no right answer to pick. Two people wrote two versions of
+// a paragraph; a rule that keeps one throws the other away, and nothing in the store records that
+// it ever existed. A fork keeps both, and the back-reference is what lets an application find
+// them and put the question to a person.
+type ForkDoc struct {
+	ID   codec.UUID
+	Body string
+}
+
+// ConflictOfField is the back-reference a forked document carries.
+const ConflictOfField = "conflictOf"
+
+// ForkID derives the id a fork holding body, split from docID, gets. It is a function of what the
+// fork holds, so two nodes settling the same conflict the same way write the same document - and
+// so a conflict that recurs with the same losing content forks to the same id rather than to a
+// new one every merge.
+func ForkID(docID codec.UUID, body string) codec.UUID {
+	return codec.DerivedUUID("kdb:fork/1:" + docID.String() + ":" + body)
+}
+
+// ForkOf builds the fork that keeps losing, written by origin. It refuses a side that is not
+// there to keep - a delete has no content - and one that is not a JSON object, which could not
+// carry the back-reference. Refusing leaves the document undecided rather than guessing.
+func ForkOf(docID codec.UUID, losing *string, origin codec.Hash) (*ForkDoc, bool) {
+	if losing == nil {
+		return nil, false
+	}
+	v, err := kdbjson.ParseValue(*losing)
+	if err != nil {
+		return nil, false
+	}
+	o, ok := v.(kdbjson.ObjectValue)
+	if !ok {
+		return nil, false
+	}
+	ref := kdbjson.ObjectValue{Keys: []string{"id"}, Fields: map[string]kdbjson.Value{"id": kdbjson.StringValue{V: docID.String()}}}
+	if origin != (codec.Hash{}) {
+		ref.Keys = append(ref.Keys, "commit")
+		ref.Fields["commit"] = kdbjson.StringValue{V: origin.Hex()}
+	}
+	out := kdbjson.ObjectValue{Keys: append([]string{}, o.Keys...), Fields: map[string]kdbjson.Value{}}
+	for k, val := range o.Fields {
+		out.Fields[k] = val
+	}
+	if _, replaced := out.Fields[ConflictOfField]; !replaced {
+		out.Keys = append(out.Keys, ConflictOfField)
+	}
+	out.Fields[ConflictOfField] = ref
+	return &ForkDoc{ID: ForkID(docID, *losing), Body: kdbjson.ToJSONString(out)}, true
+}
+
 // valueIndex answers "what is document id at commit x" under replay semantics: every commit's
 // operations are the change from its first parent, so a document's value at x is the nearest
 // write along x's first-parent chain. At a commit whose parents this node does not hold (a
@@ -90,12 +153,24 @@ func (vi valueIndex) valuesAt(x codec.Hash, ids []codec.UUID) (map[codec.UUID]do
 		if err != nil {
 			return nil, err
 		}
+		// A commit's operations are applied in order, so a document's value
+		// after the commit is what its *last* operation left - not its first.
+		// One transaction may well touch a document twice: a whole-document
+		// replace is a delete followed by a write of the new body, which is
+		// how PutJSON and every client replacing a document writes one. Taking
+		// the first operation read that as a deletion and so as a document
+		// that is not there, which made a merge drop the other side's value
+		// silently and build a tree no other node could rebuild.
+		settled := map[codec.UUID]bool{}
 		for _, op := range ops {
 			id := opDocID(op)
 			if pending[id] {
 				out[id] = docVal{body: opBody(op), writer: c}
-				delete(pending, id)
+				settled[id] = true
 			}
+		}
+		for id := range settled {
+			delete(pending, id)
 		}
 		if len(pending) == 0 {
 			break
@@ -168,6 +243,21 @@ func changed(d *dag.InMemoryCommitDag, o, other codec.Hash) bool {
 		return false
 	}
 	return o != other && !d.IsAncestor(o, other)
+}
+
+// forkWritten reports whether id exists on either head's history - written or written and since
+// deleted. Either way the merge leaves it alone.
+func forkWritten(vi valueIndex, localHead, incomingHead codec.Hash, id codec.UUID) (bool, error) {
+	for _, head := range []codec.Hash{localHead, incomingHead} {
+		v, err := vi.valueAt(head, id)
+		if err != nil {
+			return false, err
+		}
+		if v.writer != (codec.Hash{}) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // divergedDoc is one document the two sides hold differently.
@@ -243,6 +333,7 @@ func resolveDivergedLocked(
 	}
 
 	merged := map[codec.UUID]*string{}
+	var forks []ForkDoc
 	var provisional []codec.UUID
 	var differing, conflicting []divergedDoc
 	for _, id := range ids {
@@ -299,8 +390,11 @@ func resolveDivergedLocked(
 		if r.report != nil {
 			return CommitPushOutcome{Kind: OutcomeConflict, Report: r.report, Details: r.details}, AdvanceStep{}, nil
 		}
-		for id, body := range r.out {
-			merged[id] = body
+		for id, st := range r.out {
+			merged[id] = st.Body
+			if st.Fork != nil {
+				forks = append(forks, *st.Fork)
+			}
 		}
 		provisional = r.provisional
 	}
@@ -313,6 +407,21 @@ func resolveDivergedLocked(
 		if !sameBody(m, dd.local) {
 			storageWrites[dd.id] = bodyOp(dd.id, m)
 		}
+	}
+	for _, f := range forks {
+		// Only ever written once. Two heads that already hold the fork are being merged again -
+		// a criss-cross, or a later divergence over the same document - and writing it a second
+		// time would put the original losing content back over whatever has happened to the fork
+		// since: an edit, or a deletion. Both nodes hold both heads, so both skip alike.
+		written, err := forkWritten(vi, localHead, incomingHead, f.ID)
+		if err != nil {
+			return CommitPushOutcome{}, AdvanceStep{}, err
+		}
+		if written {
+			continue
+		}
+		op := document.WriteOp{DocID: f.ID, Patch: f.Body}
+		storageWrites[f.ID], commitOps[f.ID] = op, op
 	}
 	// An unrelated merge has no base commit; the zero hash says so, the same on every node.
 	var base codec.Hash
@@ -355,7 +464,7 @@ func shallowRootDocs(d *dag.InMemoryCommitDag, store storage.Adapter, ns string,
 // merged values (out, with provisional naming those an authority may still overrule), or a
 // report of the documents left undecided with a detail for each.
 type resolution struct {
-	out         map[codec.UUID]*string
+	out         map[codec.UUID]Settlement
 	provisional []codec.UUID
 	report      *kdberr.ConflictReport
 	details     []ConflictDetail
@@ -364,8 +473,12 @@ type resolution struct {
 // ConflictDetail is what a resolver needs about one undecided document beyond its two values:
 // the value they both started from and which writes produced each side.
 type ConflictDetail struct {
-	DocumentID     string                     `json:"documentId"`
-	Base           *string                    `json:"base,omitempty"`
+	DocumentID string  `json:"documentId"`
+	Base       *string `json:"base,omitempty"`
+	// Reason is set when a rule could not run at all rather than leaving the conflict undecided -
+	// a stored procedure that threw, timed out, or is not on this node. It is something to fix,
+	// not something to decide, so it is said rather than left for an operator to infer.
+	Reason         string                     `json:"reason,omitempty"`
 	LocalOrigin    transaction.ConflictOrigin `json:"localOrigin"`
 	IncomingOrigin transaction.ConflictOrigin `json:"incomingOrigin"`
 }
@@ -375,14 +488,14 @@ type ConflictDetail struct {
 // an explicit choice (Choose), the namespace's chain, then the policy. Every rule is symmetric in
 // the two sides, so both nodes reach the same answer.
 func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.Hash, docs []divergedDoc, opts ResolutionOptions) resolution {
-	out := map[codec.UUID]*string{}
+	out := map[codec.UUID]Settlement{}
 	var provisional []codec.UUID
 	pending := docs
 	if opts.Choose != nil {
 		var rest []divergedDoc
 		for _, dd := range pending {
-			if op, ok := opts.Choose(dd.id, bodyOp(dd.id, dd.local), bodyOp(dd.id, dd.remote)); ok {
-				out[dd.id] = opBody(op)
+			if st, ok := opts.Choose(dd.id, bodyOp(dd.id, dd.local), bodyOp(dd.id, dd.remote)); ok {
+				out[dd.id] = st
 			} else {
 				rest = append(rest, dd)
 			}
@@ -392,16 +505,20 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 	p0, _ := mergeCommitParents(localHead, incomingHead)
 	localFirst := p0 == localHead
 	var queued []divergedDoc
+	reasons := map[codec.UUID]string{}
 	if opts.Chain != nil && len(pending) > 0 {
 		var rest []divergedDoc
 		for _, dd := range pending {
-			o := opts.Chain.resolve(d, canonicalSides(dd, localFirst), opts.Valid)
+			o := opts.Chain.resolve(d, dd.id, canonicalSides(dd, localFirst), opts)
 			switch {
 			case o.decided:
-				out[dd.id] = o.winner
+				out[dd.id] = Settlement{Body: o.winner, Fork: o.fork}
 				if o.provisional {
 					provisional = append(provisional, dd.id)
 				}
+			case o.held:
+				reasons[dd.id] = o.reason
+				queued = append(queued, dd)
 			case o.queued:
 				queued = append(queued, dd)
 			default:
@@ -419,9 +536,9 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 			// hash.
 			for _, dd := range pending {
 				if originLater(d, dd.localOrig, dd.remoteOrig) {
-					out[dd.id] = dd.local
+					out[dd.id] = Settlement{Body: dd.local}
 				} else {
-					out[dd.id] = dd.remote
+					out[dd.id] = Settlement{Body: dd.remote}
 				}
 			}
 			pending = nil
@@ -454,7 +571,7 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 				}
 				if ok {
 					for id, b := range decided {
-						out[id] = b
+						out[id] = Settlement{Body: b}
 					}
 					pending = nil
 				}
@@ -477,7 +594,7 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 			IncomingDoc:   dd.remote,
 		})
 		details = append(details, ConflictDetail{
-			DocumentID: dd.id.String(), Base: dd.base,
+			DocumentID: dd.id.String(), Base: dd.base, Reason: reasons[dd.id],
 			LocalOrigin: conflictOrigin(d, dd.localOrig), IncomingOrigin: conflictOrigin(d, dd.remoteOrig),
 		})
 	}

@@ -100,8 +100,13 @@ func NamespaceDir(dataRoot, namespaceID string) string {
 // written from. A checkpoint left behind after the log underneath it has been replaced would let
 // the next open skip replaying data it has never seen, so promotion always moves it with - or
 // removes it alongside - the segments it describes.
+//
+// The name is derived through the same helper the byte store writes it with, from the same key
+// embed's checkpointKey builds. It used to rebuild that string here instead, which meant two
+// independent copies of an encoding that has to agree exactly - and both of them nested a
+// namespace id's slash into real directories.
 func checkpointPath(dataRoot, namespaceID string) string {
-	return filepath.Join(dataRoot, "snap", filepath.FromSlash("kdb_checkpoint_"+namespaceID))
+	return filepath.Join(dataRoot, "snap", storio.SnapFileName("kdb:checkpoint:"+namespaceID))
 }
 
 // StagePromotion copies a staged namespace into the live data root and writes the intent.

@@ -182,11 +182,11 @@ func TestChooseDecidesPerDocumentAlongsideTheChain(t *testing.T) {
 		mergeInto(t, local, ns, cm)
 	}
 	chain := &ResolutionChain{Rules: []ResolutionRule{{Kind: RuleFieldMerge}, {Kind: RuleQueue}}}
-	choose := func(id codec.UUID, l, r document.Op) (document.Op, bool) {
+	choose := func(id codec.UUID, l, r document.Op) (Settlement, bool) {
 		if id == a {
-			return r, true
+			return Settlement{Body: opBody(r)}, true
 		}
-		return nil, false
+		return Settlement{}, false
 	}
 	out, err := ResolveDivergence(local.dag, local.storage, ns, l3.Hash, r3.Hash, ResolutionOptions{Chain: chain, Choose: choose})
 	if err != nil {
@@ -195,14 +195,14 @@ func TestChooseDecidesPerDocumentAlongsideTheChain(t *testing.T) {
 	if out.Kind != OutcomeConflict || len(out.Report.Conflicts) != 1 || out.Report.Conflicts[0].DocumentID != c.String() {
 		t.Fatalf("expected only document c to be left, got %v %+v", out.Kind, out.Report)
 	}
-	choose2 := func(id codec.UUID, l, r document.Op) (document.Op, bool) {
+	choose2 := func(id codec.UUID, l, r document.Op) (Settlement, bool) {
 		switch id {
 		case a:
-			return r, true
+			return Settlement{Body: opBody(r)}, true
 		case c:
-			return l, true
+			return Settlement{Body: opBody(l)}, true
 		}
-		return nil, false
+		return Settlement{}, false
 	}
 	out, err = ResolveDivergence(local.dag, local.storage, ns, l3.Hash, r3.Hash, ResolutionOptions{Chain: chain, Choose: choose2})
 	if err != nil || out.Kind != OutcomeMerged {

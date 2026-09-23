@@ -149,6 +149,11 @@ func validateJSON(id codec.UUID, jsonText string, sch schema.KdbSchema) error {
 	return nil
 }
 
+// CellToJSONValue converts a result cell to a JSON value. Exported for callers outside this
+// package that hand query results to something that speaks JSON - a stored procedure, say - so
+// that they read a cell exactly as an INSERT writes one.
+func CellToJSONValue(cell Cell) (kdbjson.Value, error) { return cellToJSONValue(cell) }
+
 func cellToJSONValue(cell Cell) (kdbjson.Value, error) {
 	switch c := cell.(type) {
 	case nil, CellNull:
