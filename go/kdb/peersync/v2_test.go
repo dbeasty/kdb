@@ -29,6 +29,11 @@ type testNamespaces struct {
 	// runtime makes (embed.CanInstallSnapshot), which is what a failed bootstrap used to trip
 	// permanently.
 	canInstall func() error
+	// persistAsync, when set, is every env's PersistAsync - the queue-then-fsync a file runtime
+	// logs a commit through. Tests fail the queue or the wait to exercise the undo paths.
+	persistAsync func(document.Commit) (func() error, error)
+	// grafted, when set, is every env's GraftRecorded.
+	grafted func(codec.Hash) error
 	// resolution, when set, replaces every env's last-write policy.
 	resolution *ResolutionOptions
 }
@@ -68,7 +73,8 @@ func (p *testNamespaces) Env(ns string, create bool) (IngestEnv, error) {
 		res = *p.resolution
 	}
 	return IngestEnv{DAG: s.dag, Storage: s.storage, NamespaceID: ns, ApplyToStorage: true,
-		Resolution: res, SnapshotInstalled: p.installed, CanInstallSnapshot: p.canInstall}, nil
+		Resolution: res, SnapshotInstalled: p.installed, CanInstallSnapshot: p.canInstall,
+		PersistAsync: p.persistAsync, GraftRecorded: p.grafted}, nil
 }
 
 func (p *testNamespaces) side(ns string) side {
