@@ -33,11 +33,17 @@ Everything lands in `dist/`:
 
 ```
 dist/
-  bin/       kdb-linux-amd64, kdb-service-darwin-arm64, kdb-inspect-linux-arm64, ...  (9 files)
+  bin/       kdb-linux-amd64, kdb-service-darwin-arm64, kdb-inspect-linux-arm64, ...  (12 files)
   bundle/    kdb-go-embed-<version>.zip
-  jars/      kdb-embed-jvm-<version>.jar, kdb-cli-<version>.jar, ...                  (55 files)
+  jars/      kdb-embed-jvm-<version>.jar, kdb-cli-<version>.jar, ...                  (50 files)
   SHA256SUMS
 ```
+
+Those two counts are what the build currently produces, not fixed quantities: `bin/` is
+`RELEASE_PLATFORMS` × the binaries `release-binaries` names, and `jars/` is one per jar-producing
+Gradle module. Both move when a platform, a command or a module is added, and neither is asserted
+anywhere — `release-checksums` prints the total it wrote, and a release's asset count is the
+quickest way to check a published one.
 
 `VERSION`, `GIT_COMMIT` and `RELEASE_DATE` all have sane defaults (current `VERSION` file,
 `git rev-parse HEAD`, the commit's own timestamp) and can be overridden, which is how CI pins
@@ -50,7 +56,7 @@ RELEASE_DATE=$(git log -1 --format=%cI $GITHUB_SHA)`.
 
 | Artifact | Name | Produced by |
 |---|---|---|
-| Go binaries | `kdb`, `kdb-service`, `kdb-inspect` × `linux/amd64`, `linux/arm64`, `darwin/arm64` | `make release-binaries` |
+| Go binaries | `kdb`, `kdb-service`, `kdb-inspect`, `kdb-service-grpc` × `linux/amd64`, `linux/arm64`, `darwin/arm64` | `make release-binaries` |
 | **Embeddable Go source** | `kdb-go-embed-<version>.zip` | `make release-bundle` |
 | Kotlin jars | one per Gradle module, `<module>-<version>.jar` | `make release-kotlin` |
 | Container image | `ghcr.io/dbeasty/kdb/kdb-service:<tag>` (`release.yml` uses `${{ github.repository }}`) | `docker/build-push-action` (unchanged) |
@@ -314,7 +320,10 @@ described in this document, not just planned.
   `*-metadata-<version>.jar` (Kotlin Multiplatform's non-consumable common-metadata jars).
   Depends on `./gradlew jar`, not `./gradlew build` — `build` is broken on a clean checkout
   (`docs/kdb-finish-up-plan.md`); `jar` alone is green.
-  *Verified:* `make release-kotlin` from clean → 55 jars in `dist/jars/`.
+  *Verified:* `make release-kotlin` from clean → 50 jars in `dist/jars/`. (Recorded as 55 until
+  2026-09-24. Every release that has ever completed, `v0.4.0` onward, shipped 50 — so the 55 was
+  either counted before the `kdb-compute` collision below was fixed, or simply miscounted; it was
+  never what a release contained.)
   **Found and fixed in the process:** `:kdb-compute` (a Kotlin Multiplatform module) and
   `:kdb-compute-jvm` (a separate plain-JVM module) both resolved to the jar filename
   `kdb-compute-jvm-<version>.jar` — the KMP module via Kotlin's `<project>-<target>` naming
