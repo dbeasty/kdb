@@ -254,6 +254,13 @@ whole run unless `v$(cat VERSION)` equals `$GITHUB_REF_NAME`, before anything el
 Cutting a release is still a manual `VERSION` bump + commit + `git tag -a vX.Y.Z && git push
 origin vX.Y.Z` — no `cut-release.sh` helper exists yet (open item, not blocking; see §7).
 
+**Release notes** live in `docs/releases/vX.Y.Z.md`, written and reviewed in the same change as
+the `VERSION` bump. `release.yml` passes `generate_release_notes: true`, which produces only the
+commit and PR list, so the prose is pasted onto the GitHub release after the tag is pushed. The
+file is the source of truth: it is reviewable before the tag exists, and a release whose notes
+were edited on GitHub alone leaves no trace in the tree. Releases up to and including `v0.6.1`
+predate this and have their prose only on the GitHub release object.
+
 ---
 
 ## 5. Work items
