@@ -44,13 +44,15 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: gradle
-      - name: Run full Kotlin test suite
-        # `test` alone only covers plain-kotlin.jvm-plugin modules - Kotlin Multiplatform
-        # modules (most of them) have jvmTest/jsTest/linuxX64Test instead, aggregated as
-        # allTests, which Gradle's `test` invocation never reaches (see the "MPP test-CI gap"
-        # finding in docs/kdb-finish-up-plan.md). macosArm64's tests only run on a macOS host,
-        # so they're implicitly skipped here (ubuntu-latest) rather than failing.
-        run: ./gradlew test allTests --no-daemon
+      - name: Build and run the full Kotlin test suite
+        # `build` rather than `test allTests`: it runs everything those did (through
+        # `check`, which covers the Multiplatform jvmTest/jsTest/linuxX64Test that a bare
+        # `test` never reaches - see the "MPP test-CI gap" finding in
+        # docs/kdb-finish-up-plan.md) and also compiles each source set's common metadata.
+        # `test allTests` never compiles that, which is how an expect declaration that only
+        # the metadata compiler rejects kept `./gradlew build` broken on main unnoticed.
+        # macosArm64's tasks only run on a macOS host, so they're skipped here.
+        run: ./gradlew build --no-daemon
       # Gradle's console output gives the failing assertion's *line* but not its
       # message, and for a test whose body is a runBlocking { } it reports the
       # builder's line rather than the assert's - so a failure here can name a
