@@ -275,6 +275,7 @@ func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree) {
 func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w wal.WriteAheadLog) *ServerEngine {
 	cache := sstable.NewBlockCache(config.ResolvedGlobalMemoryBudgetBytes() / 4)
 	blobStore := sstable.NewLsmBlobStore(config.IOShim, namespaceID, cache)
+	blobStore.SetIndexCacheBudget(storage.ResolvedSSTableIndexCacheBytes(config))
 	if config.IOShim != nil {
 		// Pick up tables written by previous runs. Without this the store
 		// starts empty every process and everything ever flushed - tree

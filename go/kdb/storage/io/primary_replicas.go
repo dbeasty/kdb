@@ -2,6 +2,8 @@ package io
 
 import (
 	"fmt"
+
+	"github.com/limidus/kdb/go/kdb/storage"
 )
 
 // ReplicationPolicy controls replica error handling.
@@ -133,6 +135,14 @@ func (s *PrimaryWithReplicas) Append(segmentName string, bytes []byte) (int64, e
 
 func (s *PrimaryWithReplicas) Read(segmentName string, offset int64, length int) ([]byte, error) {
 	return s.primary.Read(segmentName, offset, length)
+}
+
+// Size forwards to the primary, which is where every read is served from.
+func (s *PrimaryWithReplicas) Size(segmentName string) (int64, error) {
+	if sz, ok := s.primary.(segmentStoreSizer); ok {
+		return sz.Size(segmentName)
+	}
+	return 0, storage.ErrSegmentSizeUnknown
 }
 
 func (s *PrimaryWithReplicas) Flush(segmentName string, fsync bool) error {
