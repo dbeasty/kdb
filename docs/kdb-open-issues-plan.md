@@ -307,7 +307,8 @@ engine config, with a test that a small cap rotates. (Rotation itself is done; s
 
 ### U12. In-memory stream transport drops frames — S, low priority
 
-**Status: open** (low priority; no production caller).
+**Status: done** (branch `fix/stream-memory-transport-drops`; both halves fixed, not just `emit`;
+see the progress log).
 
 `go/kdb/stream/transport.go:129-139` (`deliver`, `memory://` hub only) and `subscriber.go:335-340`
 (`emit`, including the desync `EventError` at `:259`) drop on a full buffer. `NewSubscriber` has no
@@ -580,3 +581,25 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   U3 local: 97 merged local branches deleted and finished worktrees removed. The origin half (44
   merged or superseded branches, and closing #26) was refused to automation and is left to the
   owner; every tip is saved in `kdb-deleted-branches-2026-10-11.bundle` beside the checkout.
+- **2026-10-11 — U12: the in-memory stream transport and the Go subscriber stop dropping.**
+  Done although the plan said to wait for a real caller, and `deliver` was fixed too, not left.
+  Frames: `clientLink.deliver` (`memory://` hub) now blocks until the client reads or closes,
+  instead of dropping once its 64-slot buffer is full. That is backpressure on `ServerSend`, which
+  is how a push transport with no DAG to catch up from keeps the documented contract ("No dropped
+  frames. A slow subscriber is caught up when it drains"); disconnecting a slow client would break
+  the second half of it. Close-safety follows 1-G12/1-G13: `Close` sets `closed` and closes a `done`
+  channel under the mutex, releases it, waits for in-flight delivers (which `done` has woken), and
+  only then closes `incoming`. The mutex is never held while a deliver waits. Events: `emit` keeps
+  the last slot of the 32-slot buffer for one terminal `EventDisconnected` per subscription. Any
+  other event that finds the rest full closes the subscription and takes that slot as
+  `EventDisconnected{Cause: *EventOverflowError}`, which wraps the event that did not fit;
+  `errors.As` finds a `*DesyncError` through it. So the reader never blocks, a stalled consumer
+  can't stall the hub for long, and a desync is never lost. `Connect` refuses while the buffer is
+  completely full. Tests (`go/kdb/stream/backpressure_test.go`), each failing on main and again
+  against the reverted fix: a 500-frame burst arrives whole and in order (main: 64 of 500); sends
+  past a full buffer wait, and `Close` during them neither deadlocks nor panics under `-race`
+  (main: the sends returned at once); a desync after 32 or 40 undrained notices is reported or ends
+  the subscription with a terminal event (main: silently gone). **Found along the way:** a second
+  `Disconnect` closed `stopIncoming` twice (panic), and `readLoop` read `s.stopIncoming` without the
+  lock; both fixed. Still open, same family: `Coordinator.updateSubscriber` drops `SubscriberState`
+  updates on a full 16-slot channel, and a closed `clientLink` is never removed from its hub.
