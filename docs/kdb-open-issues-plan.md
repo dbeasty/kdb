@@ -489,3 +489,5 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   state first (as `graftRootsFor` does for its own roots); not done here.
 - A `history=none` (replay strategy) receiver cannot hold the fork point's tree
   (`ErrForeignTreeNeedsObjects`), so it gets the typed error and has to deepen.
+- 2026-10-11 — Scan cap (silent truncation at `MaxRows` before `WHERE`): found by qtask, Go fix on
+  `fix/scan-cap-before-filter`. Follow-on units live in `docs/kdb-scan-cap-plan.md`.
