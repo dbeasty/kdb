@@ -250,8 +250,9 @@ the other:
   written then hold them) and could not read zstd at all. Since R1 both targets use a pure-Kotlin
   zstd in `kdb-compression`'s commonMain: a full RFC 8878 decoder (every block, literals and
   sequence-table mode, checksums, concatenated and skippable frames; no dictionaries) and a small
-  encoder (greedy matches, raw literals, predefined FSE tables — real frames at roughly 1.7x
-  libzstd level 3's size on JSON). `ZstdCompression.canCompress`/`canDecompress` replace
+  encoder (greedy matches, Huffman-coded literals, predefined FSE tables for sequences — real
+  frames at roughly 1.6x libzstd level 3's size on large JSON, and on par for a commit-sized
+  record). `ZstdCompression.canCompress`/`canDecompress` replace
   `isAvailable`. Coverage:
   - `gradle/physical-golden-fixtures.gradle.kts` compiles the `.hex` fixtures into commonTest, so
     JS (node and browser) and Native tests read the same bytes the JVM reads from disk.

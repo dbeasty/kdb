@@ -6,7 +6,8 @@ package dev.kdb.compression
  * The JVM uses zstd-jni (libzstd). Kotlin/JS and Kotlin/Native use the pure-Kotlin [ZstdDecoder]
  * and [ZstdEncoder] in commonMain (docs/kdb-open-issues-plan.md, roadmap R1): the decoder reads
  * every frame Go and the JVM write; the encoder writes real zstd frames that Go and the JVM read,
- * at a lower ratio than libzstd (raw literals, predefined tables - see [ZstdEncoder]).
+ * at a lower ratio than libzstd on large inputs (greedy matching, predefined sequence tables -
+ * see [ZstdEncoder]).
  *
  * Writers of on-disk formats that carry a codec byte (SSTable blocks, delta pages, ice bundles)
  * must check [canCompress] and record "no compression" when it is false; readers check

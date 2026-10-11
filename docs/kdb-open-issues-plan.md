@@ -446,10 +446,11 @@ notes close v0.6.1's known issue.
   targets). One decoder (`ZstdDecoder`, RFC 8878: every block, literals and sequence-table mode,
   XXH64 checksum, concatenated and skippable frames; no dictionaries) serves both targets and runs
   under the JVM's differential tests against libzstd.
-- **Both directions.** `ZstdEncoder` writes real frames (greedy hash matches, raw literals,
-  predefined FSE tables, single-segment, content size and checksum always present). It compresses
-  less than libzstd - 108,624 bytes vs zstd-jni level 3's 65,497 on a 400KB JSON corpus - but Go
-  and the JVM read it. So `canCompress` and `canDecompress` (replacing `isAvailable`) are both true
+- **Both directions.** `ZstdEncoder` writes real frames (greedy hash matches, Huffman-coded
+  literals with direct or FSE-compressed weights, predefined FSE tables for sequences,
+  single-segment, content size and checksum always present). It compresses less than libzstd on
+  large inputs - 104,986 bytes vs zstd-jni level 3's 65,497 on a 400KB JSON corpus - but matches it
+  on a 158-byte commit-shaped record (143 bytes each), and Go and the JVM read it. So `canCompress` and `canDecompress` (replacing `isAvailable`) are both true
   everywhere, and JS/Native SSTable blocks, delta pages and ice bundles are zstd again. The split
   stays so a decode-only target remains expressible; every writer checks `canCompress`.
 - **Errors.** Malformed input throws `ZstdFormatException` (an `IllegalArgumentException`) on
@@ -471,5 +472,10 @@ notes close v0.6.1's known issue.
   - A pre-U5 Native data directory (length-prefixed blocks tagged ZSTD) now fails with
     `ZstdFormatException` (bad frame magic) instead of `ZstdUnavailableException` - still refused,
     never misread. No such directory was ever released.
-  - Not done: Huffman-coded literals in the encoder (the bulk of the ratio gap), and no throughput
-    numbers - the machine's load average was 50-140 throughout, too high to measure honestly.
+  - Huffman literals (added in the same PR) are not where the large-input gap is. On the 400KB
+    JSON corpus a 128KB block holds ~4KB of literals (Huffman halves them) but ~10,700 sequences
+    costing ~33KB: the gap is sequence coding - predefined rather than per-block FSE tables, no
+    repeat offsets, greedy rather than lazy matching. Huffman matters for small, literal-heavy
+    payloads: a 700-byte JSON went 299 -> 265 bytes, a 158-byte record 171 -> 143.
+  - Not done: per-block sequence tables, repeat offsets and lazy matching; and no throughput
+    numbers - the machine's load average was 50-140 for most of the work.
