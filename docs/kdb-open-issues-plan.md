@@ -792,6 +792,16 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   harness: `preserve_evidence` failed teardown with `shutil.Error` when a running node's
   `peers/*.json.tmp` vanished mid-copy, hiding the test's own failure.
 
+- **2026-10-11 — the deepen=true peer option ignored a stuck snapshot joiner (found by #125).**
+  `replication.peerLoop.deepen` skipped every namespace whose sync returned an error, and the
+  `ShallowBoundaryError` a joiner reports (when a peer, e.g. v0.6.2, cannot supply a fork point's
+  state behind its snapshot root) is one, though its message names `deepen=true` as the cure.
+  `deepenAfter` now lets that error, and only that one, through; a lost connection or a refused
+  push still skips deepen. Evidence: #125's `test_deepen_peer_option_recovers_a_stuck_snapshot_joiner`
+  against a real v0.6.2 server fails with the old binary and passed 3 of 3 with the fix (its xfail
+  mark is removed); the whole upgrade suite passes; `TestDeepenRunsAfterAShallowBoundaryError`
+  pins the decision. The release notes drop it from Known issues and list it under Fixes.
+
 - **2026-10-11 — found while working on #43 (U6): crash-recovery open scaled with commits ×
   SSTable size** (branch `perf/sstable-index-cache`). The #43 kill -9 reproducer left a namespace
   with 14,736 commits and no checkpoint; it took 28 s to open (~1.9 ms per replayed commit, 24

@@ -51,6 +51,12 @@ written before #109 is refused (no Native build was ever released).
 
 ## Fixes — distributed sync
 
+**The `deepen=true` peer option now rescues a snapshot joiner stuck behind its root.** The
+`ShallowBoundaryError` such a joiner reports names `deepen=true` as a cure, but the replicator
+skipped deepen for any namespace whose sync had just failed, which that error always is. It now
+deepens after that error, and only that one; other failures still skip it. Found by the
+mixed-version upgrade test (#125), whose test of it now passes against a v0.6.2 server.
+
 **A five-node mesh could fall into a merge storm and never converge (#114).** Nodes holding
 identical documents kept creating empty merge commits faster than they spread: over 10,000
 after writes had stopped, with every sync succeeding and no node ever settling. Needed three or
@@ -137,8 +143,8 @@ write survives and every node converges (#125).
 Folding a fork point's state needs the serving node to have #111; an older server can't, so the
 joiner reports a typed `ShallowBoundaryError` instead of converging. Recover it with
 `POST /v1/ns/{ns}/deepen` or `kdb deepen`, or bootstrap with `bootstrap=snapshot,deepen=true`
-from the start. Upgrading the serving peers first avoids it. (The error message also suggests
-setting `deepen=true` on an already-stuck joiner; that does not work yet — see Known issues.)
+from the start, or set `deepen=true` on the stuck joiner's peer. Upgrading the serving peers
+first avoids it.
 
 **Rolling back to v0.6.2 is only safe from a clean stop.** v0.6.2 does not understand the
 canonical join commits this release writes (#114). If a node running this release crashed, do
@@ -165,8 +171,5 @@ the node on this release first, let it recover, stop it cleanly, and only then d
 - **A lookup racing a compaction can transiently miss a key** whose old table compaction is
   deleting. A fix is in progress (table reference counting); it should land before this release.
 - Issue #43 stays open pending the nightly Linux soak (see above).
-- **The `deepen=true` peer option cannot rescue a snapshot joiner that is already stuck** on a
-  fork point an older server cannot fold, although the error suggests it: the replicator skips
-  deepen for a namespace whose sync just failed. Use `POST /v1/ns/{ns}/deepen` or `kdb deepen`.
 - `Coordinator.updateSubscriber` can still drop subscriber-state updates when its buffer is full,
   and closed in-memory stream clients are never removed from their hub (#120's follow-ups).
