@@ -37,7 +37,7 @@ import (
 // segments in commit order, which Component 47 §4.1 guarantees - that set
 // is empty.
 func replayDeltaNamespace(d *dag.InMemoryCommitDag, store storage.Adapter, r storage.DeltaSegmentReader) error {
-	return replayDeltaNamespaceFrom(d, store, r, -1, nil, nil)
+	return replayDeltaNamespaceFrom(d, store, r, -1, nil, nil, nil)
 }
 
 // replayDeltaNamespaceFrom is replayDeltaNamespace restricted to segments
@@ -61,10 +61,12 @@ func replayDeltaNamespaceFrom(
 	afterSequence int64,
 	coord *TxnCoordinator,
 	shallow map[codec.Hash]bool,
+	report *RecoveryReport,
 ) error {
 	if r == nil {
 		return nil
 	}
+	unapplied := &unappliedCommits{}
 	all, err := r.ListSegments()
 	if err != nil {
 		return err
@@ -91,7 +93,7 @@ func replayDeltaNamespaceFrom(
 			if gate.skip(c) {
 				return nil
 			}
-			applied, err := applyIfParentsReady(d, store, c)
+			applied, err := applyIfParentsReady(d, store, c, unapplied)
 			if err != nil {
 				return &replayApplyError{err: err}
 			}
@@ -135,7 +137,11 @@ func replayDeltaNamespaceFrom(
 		}
 	}
 
-	return applyCommitsTopologically(d, store, deferred, gate, shallow)
+	if err := applyCommitsTopologically(d, store, deferred, gate, shallow, unapplied); err != nil {
+		return err
+	}
+	unapplied.report(d, report)
+	return nil
 }
 
 // groupGate is replay's view of cross-namespace groups: which commits to leave out, and why.
@@ -252,7 +258,7 @@ func streamSegmentCommits(r storage.DeltaSegmentReader, seg storage.DeltaSegment
 // arrived before an ancestor did, and the caller should hold it for
 // applyCommitsTopologically to place once the rest of the log has been
 // read. A commit already present in d counts as applied.
-func applyIfParentsReady(d *dag.InMemoryCommitDag, store storage.Adapter, c document.Commit) (bool, error) {
+func applyIfParentsReady(d *dag.InMemoryCommitDag, store storage.Adapter, c document.Commit, unapplied *unappliedCommits) (bool, error) {
 	if d.HasCommit(c.Hash) {
 		return true, nil
 	}
@@ -261,7 +267,7 @@ func applyIfParentsReady(d *dag.InMemoryCommitDag, store storage.Adapter, c docu
 			return false, nil
 		}
 	}
-	if err := applyReplayedCommit(d, store, c); err != nil {
+	if err := applyReplayedCommit(d, store, c, unapplied); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -284,7 +290,7 @@ func applyIfParentsReady(d *dag.InMemoryCommitDag, store storage.Adapter, c docu
 // when history below a snapshot was fetched (peersync.Deepen) but whose own parents the peer did
 // not have either. It is admitted without them, as it was when it was fetched, rather than failing
 // the open for want of parents nobody has.
-func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, commits []document.Commit, gate *groupGate, shallow map[codec.Hash]bool) error {
+func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, commits []document.Commit, gate *groupGate, shallow map[codec.Hash]bool, unapplied *unappliedCommits) error {
 	pending := make([]document.Commit, 0, len(commits))
 	for _, c := range commits {
 		if !d.HasCommit(c.Hash) {
@@ -319,7 +325,7 @@ func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, 
 				next = append(next, c)
 				continue
 			}
-			if err := applyReplayedCommit(d, store, c); err != nil {
+			if err := applyReplayedCommit(d, store, c, unapplied); err != nil {
 				return err
 			}
 			progressed = true
@@ -340,7 +346,9 @@ func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, 
 // replay ran inline, unchanged, just factored out so
 // applyCommitsTopologically can call it once a commit's parents are known
 // ready rather than only in file order.
-func applyReplayedCommit(d *dag.InMemoryCommitDag, store storage.Adapter, c document.Commit) error {
+//
+// unapplied, when non-nil, is told about every commit stored here without being applied.
+func applyReplayedCommit(d *dag.InMemoryCommitDag, store storage.Adapter, c document.Commit, unapplied *unappliedCommits) error {
 	// A commit extends main only if main is one of its parents. Anything else in the log is a
 	// peer's commit that main reached through a merge (logged just before that merge), or one a
 	// crash cut off before its merge was logged: stored, so the history is whole, but neither
@@ -369,6 +377,7 @@ func applyReplayedCommit(d *dag.InMemoryCommitDag, store storage.Adapter, c docu
 			if d.SupersedesHead(c, head) {
 				return d.SetHead("main", c.Hash)
 			}
+			unapplied.add(c.Hash, head)
 			return nil
 		}
 	}
