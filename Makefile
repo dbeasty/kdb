@@ -120,7 +120,7 @@ release-go: release-bundle release-binaries
 	$(MAKE) release-checksums
 
 # The embeddable Go source bundle (docs/kdb-release-plan.md §2): the transitive dependency
-# closure of kdb/embed, kdb/driver, kdb/sql, kdb/query/hybrid and kdb/index
+# closure of kdb/embed, kdb/driver, kdb/sql, kdb/query/hybrid, kdb/index and kdb/server
 # (go/embedbundle/entrypoints.txt), zipped deterministically so the archive itself reproduces
 # byte-for-byte (see release-verify below).
 release-bundle:

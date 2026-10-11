@@ -335,3 +335,39 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 ## Progress log
 
 _(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
+
+### 2026-10-11 — U2: `kdb/server` in the embeddable Go bundle
+
+Branch `fix/embedbundle-kdb-server`, supersedes #26 (left open for the user to close).
+`kdb/server` added to `go/embedbundle/entrypoints.txt`; #26's EMBEDDING.md and README text carried
+over; `docs/kdb-release-plan.md` §2.1, §2.2, §2.3, §2.5 and §7.1 rewritten from `main`'s version;
+`Makefile` comment updated; new `go/embedbundle/main_test.go` asserts every entry point is in the
+computed closure and no file in any closure package imports `"C"` (counts deliberately not
+asserted). Probed it: a temporary `import "C"` file in `kdb/server` fails the test.
+
+Measured on this branch (regenerated, not copied from the plan):
+- Closure **27 → 40 packages**; the 13 added are `server`, `wire`, `transport/{core,tcp,ws}`,
+  `peersync`, `stream`, `version`, `script`, `index/{analyzer,fulltext,stores,vector}`.
+- Bundle **426 → 665 files** (bundle.json manifest), 2.45 → 4.58 MB unpacked,
+  **913,545 → 1,655,615 bytes zipped** (~914 KB → ~1.66 MB). The plan's ~907 KB / ~1.64 MB were
+  slightly stale; `main`'s release plan still said 351 files / ~708 KB, older still.
+- Skipped test files: `kdb/embed/database_backup_test.go`, `kdb/server/backup_txn_test.go`,
+  `kdb/server/panic_recovery_test.go`; `kdb/transaction/procedure_resolver_test.go` now ships
+  (its `kdb/script` import is in the closure).
+- New bundle requires: `dop251/goja` (from `kdb/script`) and `golang.org/x/sync` (from
+  `kdb/server`), plus indirects `dlclark/regexp2/v2`, `go-sourcemap/sourcemap`, `google/pprof`,
+  `x/text` — 14 → 18 indirects. All pure Go.
+
+Gates: `scripts/verify-bundle.sh` on the 40-package bundle passes (build, vet, `go test` all 40
+ok, cross-compile linux/amd64, linux/arm64, darwin/arm64); the bundle also builds for
+windows/amd64 and js/wasm; `CGO_ENABLED=0 go build ./kdb/server` passes on all five platforms;
+two runs into different output directories produce a byte-identical zip; `go vet ./...` and
+`go test -race ./embedbundle/...` pass.
+
+Found along the way: `main`'s §2.2 said "27 of the module's 37 top-level packages" and its
+excluded list named packages that no longer match the tree; the module has 59 `kdb/...` packages,
+and the excluded list now names the real 19 (incl. `replication`, `syncnode`, `storage/manager`).
+No convention existed for notes between releases, so this adds `docs/releases/unreleased.md`
+(renamed at the `VERSION` bump) and documents it in the release plan §4. The v0.6.2 known issue is
+recorded there as fixed; `docs/releases/v0.6.2.md` is left as shipped, matching how v0.6.2's own
+notes close v0.6.1's known issue.
