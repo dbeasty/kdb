@@ -27,6 +27,17 @@ jobs:
       - name: Run slow + destructive scenarios
         working-directory: kdb-integration/e2e
         run: python -m pytest -v -m "slow or destructive"
+      - name: Upload e2e failure evidence
+        # Data directories, every launch's service log and kdb-inspect output, kept by
+        # preserve_evidence() when a crash or cluster scenario fails - the only way to examine a
+        # failure that shows up on a runner and not on a laptop (issue #43).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence-nightly-${{ github.run_attempt }}
+          path: kdb-integration/e2e/evidence/
+          if-no-files-found: ignore
+          retention-days: 14
 
   s3-integration:
     runs-on: ubuntu-latest
