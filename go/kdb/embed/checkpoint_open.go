@@ -33,6 +33,7 @@ func restoreNamespace(
 	coord *TxnCoordinator,
 	shallowRoots []string,
 	graftRoots []string,
+	report *RecoveryReport,
 ) (replayedInFull bool, err error) {
 	eng, _ := store.(*engine.ServerEngine)
 	if eng != nil {
@@ -66,7 +67,7 @@ func restoreNamespace(
 		}
 		// Grafted roots are side history: the log alone rebuilds main, but meets them without
 		// their parents and must admit them as they were admitted.
-		return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, hashSet(graftRoots))
+		return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, hashSet(graftRoots), report)
 	}
 
 	if disabled {
@@ -128,7 +129,7 @@ func restoreNamespace(
 		c, err := document.FromPayloadBytes(payload)
 		if err != nil {
 			log.Printf("kdb: namespace %s: a checkpointed head commit would not decode (%v) - replaying the log in full", namespaceID, err)
-			return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, nil)
+			return true, replayDeltaNamespaceFrom(d, store, r, -1, coord, nil, report)
 		}
 		heads = append(heads, c)
 	}
@@ -143,7 +144,7 @@ func restoreNamespace(
 
 	// Only the tail: everything up to cp.ThroughSequence is already here.
 	shallow := hashSet(append(append([]string(nil), shallowRoots...), graftRoots...))
-	if err := replayDeltaNamespaceFrom(d, store, r, cp.ThroughSequence, coord, shallow); err != nil {
+	if err := replayDeltaNamespaceFrom(d, store, r, cp.ThroughSequence, coord, shallow, report); err != nil {
 		return false, err
 	}
 	return false, nil

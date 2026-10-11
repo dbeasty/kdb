@@ -179,10 +179,12 @@ func (h *Host) openNamespace(
 		// Some bodies exist only in the blob store; cold reads must look there.
 		eng.SetBodiesExternal(true)
 	}
-	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn, meta.ShallowRoots, meta.GraftRoots)
+	var recovery RecoveryReport
+	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn, meta.ShallowRoots, meta.GraftRoots, &recovery)
 	if err != nil {
 		return nil, nil, err
 	}
+	recovery.ReplayedInFull = replayedInFull
 	for _, hex := range append(append([]string(nil), meta.ShallowRoots...), meta.GraftRoots...) {
 		if h, err := codec.HashFromHex(hex); err == nil {
 			d.MarkShallow(h)
@@ -227,6 +229,7 @@ func (h *Host) openNamespace(
 		deltaReader:      handle.DeltaReader(),
 		shim:             io,
 		txn:              h.txn,
+		recovery:         recovery,
 	}
 	if !opts.ReadOnly {
 		rt.snapshot = &snapshotSupport{
@@ -247,7 +250,7 @@ func (h *Host) openNamespace(
 		// because the reader needs the same handle and namespace the open resolved, and nothing
 		// else in EmbeddedKdbRuntime carries them.
 		rt.refresh = func() error {
-			return replayDeltaNamespaceFrom(d, store, handle.DeltaReader(), -1, h.txn, nil)
+			return replayDeltaNamespaceFrom(d, store, handle.DeltaReader(), -1, h.txn, nil, nil)
 		}
 	}
 	handleClosed = true

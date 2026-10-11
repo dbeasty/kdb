@@ -62,6 +62,8 @@ type EmbeddedKdbRuntime struct {
 	// txn decides cross-namespace transactions for the host this runtime belongs to. nil for a
 	// runtime with no host (a pure in-memory one) - see TxnCoordinator.
 	txn *TxnCoordinator
+	// recovery is what open found in the delta log - see Recovery.
+	recovery RecoveryReport
 }
 
 // TxnCoordinator is the cross-namespace transaction coordinator of the host this runtime was
