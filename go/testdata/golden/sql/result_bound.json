@@ -1,0 +1,20 @@
+{
+  "description": "MaxRows bounds what a query may return, never what it may look at. The namespace holds more documents than maxRows; a query over it must answer from every document, and a result larger than maxRows is an error, not a prefix. Read by go/kdb/sql/result_bound_fixture_test.go and kdb-sql's jvmTest ResultBoundFixtureTest; both trees must agree on every case.",
+  "docs": 50,
+  "maxRows": 10,
+  "document": "{\"name\":\"n%03d\",\"rank\":%d}  (name and rank both from the 0-based index, name zero-padded to 3 digits)",
+  "cases": [
+    { "name": "selective equality past the bound", "sql": "SELECT name FROM t WHERE name = 'n049'", "rows": ["n049"] },
+    { "name": "range matching only late documents", "sql": "SELECT name FROM t WHERE rank >= 45 ORDER BY name", "rows": ["n045", "n046", "n047", "n048", "n049"] },
+    { "name": "COUNT sees the whole namespace", "sql": "SELECT COUNT(*) FROM t", "rows": ["50"] },
+    { "name": "filtered COUNT", "sql": "SELECT COUNT(*) FROM t WHERE rank >= 10", "rows": ["40"] },
+    { "name": "unfiltered overflow is an error", "sql": "SELECT name FROM t", "error": true },
+    { "name": "filtered overflow is an error", "sql": "SELECT name FROM t WHERE rank >= 5", "error": true },
+    { "name": "ordered overflow is an error", "sql": "SELECT name FROM t ORDER BY name", "error": true },
+    { "name": "LIMIT within the bound", "sql": "SELECT name FROM t LIMIT 5", "count": 5 },
+    { "name": "LIMIT and OFFSET reaching past the bound", "sql": "SELECT name FROM t LIMIT 5 OFFSET 40", "count": 5 },
+    { "name": "ORDER BY DESC with LIMIT", "sql": "SELECT name FROM t ORDER BY name DESC LIMIT 3", "rows": ["n049", "n048", "n047"] },
+    { "name": "LIMIT larger than the bound is still an overflow", "sql": "SELECT name FROM t LIMIT 30", "error": true },
+    { "name": "grouped result within the bound", "sql": "SELECT COUNT(*) FROM t WHERE rank < 20", "rows": ["20"] }
+  ]
+}

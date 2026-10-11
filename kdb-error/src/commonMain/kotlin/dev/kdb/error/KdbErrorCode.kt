@@ -58,4 +58,11 @@ public enum class KdbErrorCode(public val numericCode: Int) {
 
     /** Layer 11 Component 32: uncaught exception thrown by the script body itself. */
     SCRIPT_RUNTIME_ERROR(8005),
+
+    /**
+     * The request as written is larger than the engine will serve (a SQL result with more rows
+     * than the configured bound). Never worth retrying unchanged; mirrors the wire's
+     * RESOURCE_EXHAUSTED class.
+     */
+    RESOURCE_EXHAUSTED(9001),
 }
