@@ -3,6 +3,8 @@
 ### `dev.kdb.storage.compaction`
 
 **File:** `kdb-spec-layer4a-component10f-storage-compaction.md`
+
+> **Not implemented.** The stub module `:kdb-storage-compaction` (a planner that planned nothing and runners that threw) was removed in U9 of `docs/kdb-open-issues-plan.md`; this design is retained for a future implementation.
 **Layer:** 4a — KDB Storage Engine
 **Depends on:** Layer 3 Component 9; Layer 4a 10c, 10d, 10e, 10g; Layer 4b 11e (tier signals, optional)
 

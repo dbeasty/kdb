@@ -276,7 +276,7 @@ These need a decision from you. Each has a recommendation.
 
 ### U9. Remove dead stubs — S each
 
-**Status: approved 2026-10-11; both stubs removed in their own PR.**
+**Status: done** (#118): both stubs deleted; neither was ever released or imported.
 
 - **Kotlin `kdb-storage-compaction`.** `plan()` returns `emptyList()` and every runner throws
   `CompactionNotImplementedException` (`Compaction.kt:31,45-76`). No source anywhere references it;
@@ -594,3 +594,13 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   reopened engine recovers every blob, and that the replay is in write order. It fails on `main`
   (one segment) and was confirmed failing against the reverted resolution. It also covers the
   64 MiB default and rejecting 0/-1. `WalTest` adds the factory's override-vs-config order.
+- **2026-10-11, U9** (branch `chore/remove-dead-stubs`): deleted the Kotlin stub module
+  `kdb-storage-compaction` (its `settings.gradle.kts` include and the unused dependency in
+  `kdb-storage-manager/build.gradle.kts` were the only references) and the Go stub package
+  `go/kdb/tier` (no importer, test or otherwise; it had no tests). No CI workflow, Makefile target or
+  release script named either. The module never produced a release asset (checked `v0.4.0` and
+  `v0.6.2`: neither lists a `kdb-storage-compaction` jar), so the 50-jar count is unchanged. Docs
+  that listed them as implemented now say 10f is not implemented (`kdb-spec.md`,
+  `kdb-lld-storage.md`, `kdb-spec-layer6-execution-plan.md`); the 10f spec keeps its design with a
+  removal note; `kdb-release-plan.md` §2.2 drops `kdb/tier` from the excluded list and the module's
+  package count goes 59 to 58. Historical entries in `kdb-finish-up-plan.md` were left as written.
