@@ -52,9 +52,21 @@ func (d *InMemoryCommitDag) CheckpointSnapshot() CheckpointState {
 // Branch heads and tags are kept whatever keep says. A ref naming a commit
 // the checkpoint omitted would restore a graph whose own head is missing,
 // which is not a smaller database but a broken one.
+//
+// Commits received from a peer and never logged are left out whatever keep
+// says, and so is every ref other than main that names one (a conflict's
+// tracking branch, say). A checkpoint carries no operations for them and the
+// log has none to load, so restoring them would bring back commits nothing
+// can read - and, because the DAG then holds them, that no sync would fetch
+// again. Leaving them out reopens the namespace as a crash would have: without
+// them, and with the next sync fetching them afresh. See unlogged.go.
 func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commit) bool) CheckpointState {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	unlogged := func(h codec.Hash) bool {
+		_, ok := d.unlogged[h]
+		return ok
+	}
 	pinned := make(map[codec.Hash]struct{}, len(d.branches)+len(d.tags))
 	for _, b := range d.branches {
 		pinned[b.HeadHash] = struct{}{}
@@ -69,6 +81,9 @@ func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commi
 	}
 	for _, n := range d.nodes {
 		c := n.commit
+		if unlogged(c.Hash) {
+			continue
+		}
 		if keep != nil && !keep(c) {
 			if _, isRef := pinned[c.Hash]; !isRef {
 				continue
@@ -85,9 +100,17 @@ func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commi
 		state.Commits = append(state.Commits, CheckpointCommit{Commit: c, OperationCount: count})
 	}
 	for _, b := range d.branches {
+		// main never names an unlogged commit - adopting one is what logs it - and is kept
+		// whatever happens, since a checkpoint without it does not open.
+		if b.Name != mainBranch && unlogged(b.HeadHash) {
+			continue
+		}
 		state.Branches = append(state.Branches, b)
 	}
 	for _, t := range d.tags {
+		if unlogged(t.CommitHash) {
+			continue
+		}
 		state.Tags = append(state.Tags, t)
 	}
 	return state

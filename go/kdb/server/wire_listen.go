@@ -75,6 +75,9 @@ type Listener struct {
 	ln     net.Listener
 	cancel context.CancelFunc
 	done   chan struct{}
+	// sessions, when set, makes Close also end the connections already accepted and wait for
+	// their handlers - see ListenPeerSyncTLS. nil leaves them running, as the other listeners do.
+	sessions *sessionSet
 }
 
 // Addr returns the bound local address (useful when the listen URI's port was 0).
@@ -83,7 +86,54 @@ func (l *Listener) Addr() net.Addr { return l.ln.Addr() }
 func (l *Listener) Close() error {
 	l.cancel()
 	<-l.done
+	if l.sessions != nil {
+		l.sessions.closeAndWait()
+	}
 	return nil
+}
+
+// sessionSet tracks the connections a listener has handed to handlers, so Close can end them and
+// wait for the handlers to return.
+type sessionSet struct {
+	mu     sync.Mutex
+	closed bool
+	conns  map[stream.ConnectionHandle]struct{}
+	wg     sync.WaitGroup
+}
+
+func newSessionSet() *sessionSet {
+	return &sessionSet{conns: map[stream.ConnectionHandle]struct{}{}}
+}
+
+// serve runs handler on conn unless the set is already closed, in which case conn is closed
+// unserved - the accept loop can hand over a connection after Close has begun.
+func (s *sessionSet) serve(conn stream.ConnectionHandle, handler func(stream.ConnectionHandle)) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	s.conns[conn] = struct{}{}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		s.wg.Done()
+	}()
+	handler(conn)
+}
+
+func (s *sessionSet) closeAndWait() {
+	s.mu.Lock()
+	s.closed = true
+	for conn := range s.conns {
+		_ = conn.Close()
+	}
+	s.mu.Unlock()
+	s.wg.Wait()
 }
 
 // MaxInFlightFrames bounds how many frames one connection may have dispatched at once
@@ -616,7 +666,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 			Namespace: namespaceID,
 			Shape:     sql.ShapeOfSelect(sel.Query),
 			TreeSize:  rt.treeSizeAt(*head),
-			MaxRows:   10_000,
+			MaxRows:   rt.MaxResultRows(),
 			RowBudget: int(adm.ScanRowBudget()),
 		}
 		estimate = adm.Costs().EstimateScan(scanIn)
@@ -636,7 +686,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		Schema:      rt.Schema(),
 		AtCommit:    head,
 		Parameters:  params,
-		MaxRows:     10_000,
+		MaxRows:     rt.MaxResultRows(),
 		// Bounds rows *examined*, and shrinks automatically as memory pressure rises - a scan
 		// that reads the whole namespace to return nothing is otherwise unbounded work no
 		// admission decision can see coming (kdb-spec-layer13 §2.8).

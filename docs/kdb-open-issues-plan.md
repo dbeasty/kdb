@@ -435,6 +435,104 @@ notes close v0.6.1's known issue.
   `main`'s sources was also 6/6 green, with no `Exception in thread` in captured stderr — the
   integration-level flake does not reproduce locally, so the unit tests above are the before/after
   evidence. `:kdb-transport-tcp:jvmTest`, `:kdb-transport-ws:jvmTest`, `:kdb-jdbc:test` green.
+### 2026-10-11 — N1 (new, found by multi-node e2e): snapshot-bootstrapped node stuck on "missing parent" — PR #111, branch `fix/shallow-node-missing-parent`, commit `0641f37`
+
+**Found by** the multi-node e2e `test_cluster.py::test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes`
+(sibling worktree `e2e-multi`, not on `main` yet), 3/3: a node joining a busy three-writer mesh
+with `bootstrap=snapshot` failed every replication cycle, for ever, with
+`peer sync: storing commit C: missing parent P`. `consecutiveFailures` grew without bound.
+
+**Root cause.** The joiner's snapshot root S was a merge with parents [Q, P]. Another node went on
+committing on P (C, parent P) before it saw S. The sender computes a pack as "reachable from my head
+minus the ancestor closure of the receiver's haves" (`peersync/refs.go` `MissingCommitsFrom`,
+`have := d.AncestorSetOf(haves)`); P is an ancestor of S, so it was treated as held and never sent.
+A shallow node holds nothing behind S, so `StoreCommits` (`peersync/ingest.go`) refused C. The
+existing single-source test never forks behind the boundary, and `TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot`
+had enshrined the side-branch half of this as unfixable ("its parents can never arrive").
+
+**Fix (no wire change, Go only - Kotlin has no v2 sync).**
+- Receiver (`peersync/boundary.go`, called from `fetchRef`): a page commit whose parent is neither in
+  the page nor held, on a node with shallow roots, and not itself one of the peer's shallow roots
+  (that case stays Graft's), has its parent's *state* taken in by `SNAPSHOT_FETCH` at the parent and
+  admitted as a shallow root through Graft's durable path (`admitRootFromState`: foreign tree, marker
+  `graftRoots` before the log frame). No `allowUnrelated` needed: the parent is history S already
+  descends from. One state transfer per fork point; no history is fetched.
+- Host (`peersync/snapshot_state.go`): a node never builds a tree for a commit it merged rather than
+  fast-forwarded onto, so `SNAPSHOT_FETCH` at such a commit failed "no tree". It now folds the commit's
+  first-parent chain forward from the nearest tree it holds, checks the result against the declared
+  tree hash, and serves that (cached for the snapshot's later pages). A pre-fix host still answers
+  "no tree", which the joiner reports as below.
+- Adoption (`peersync/ingest.go` `adoptable`): shallow roots are dropped from the commits a
+  fast-forward or merge adopts - they were logged on their own, and their operations are a change
+  from parents this node lacks; re-logging them, fence-checking them or announcing them to commit
+  listeners was wrong (by inspection the same already happened to graft roots).
+- Surfacing: when the parent's state cannot be had, the pull fails with a typed
+  `peersync.ShallowBoundaryError` naming both commits and pointing at deepen; that text is what
+  `/v1/peers` `lastError` and the namespace's `lastError` show. Successful extensions are in
+  `NamespaceSyncResult.BoundaryExtended` and logged by the replicator. An automatic *full* deepen
+  fallback was rejected: it defeats snapshot bootstrap, and FETCH_REQUEST has no depth to bound it.
+
+**Tests.** `server/shallow_boundary_test.go` (file-backed joiner, real `PutJSON` writes, memory and
+file-backed source): fast-forward across the fork point, a real merge on the joiner that traces a
+value down to the fork point's tree, clean restart, crash replay onto the bootstrap checkpoint, and
+deepen-after-extension with a no-checkpoint replay. `peersync/boundary_test.go`: the fork point is
+logged once, not re-adopted; a failure is a `ShallowBoundaryError` and leaves nothing resident.
+Revert-confirmed: without the receiver change the server tests fail with the original
+"missing parent"; without the host fold they fail "no tree"; without `adoptable` the fork point is
+logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parametrizations).
+
+**Not fixed, found along the way.**
+- The push direction (by inspection, not reproduced): a node that dials a shallow host and pushes it a branch forked behind the
+  host's root still gets "missing parent" from the host, which cannot fetch from its client. It
+  heals once the shallow node pulls from anyone; a shallow node that is only ever dialled stays
+  stuck on that ref. The pusher has the host's advertised horizon and could send the fork point's
+  state first (as `graftRootsFor` does for its own roots); not done here.
+- A `history=none` (replay strategy) receiver cannot hold the fork point's tree
+  (`ErrForeignTreeNeedsObjects`), so it gets the typed error and has to deepen.
+- 2026-10-11 — Scan cap (silent truncation at `MaxRows` before `WHERE`): found by qtask, Go fix on
+  `fix/scan-cap-before-filter`. Follow-on units live in `docs/kdb-scan-cap-plan.md`.
+- **2026-10-11 — multi-node e2e harness, and U6a.** New `kdb-integration/e2e/test_cluster.py` +
+  `cluster_fixtures.py`: real kdb-service clusters (mesh, chain, star; 2-5 nodes) replicating with
+  `--peer`, concurrent writers on every node, `kill -9` of one node, two at once and the whole
+  cluster, clean drains, partitions (a node down while others write), late snapshot joiners,
+  SQL schema/UPDATE/DELETE replication, last-write and strict conflicts (queued, then resolved
+  through the control plane). Every scenario ends on a strict convergence check: the same head
+  commit on every node, identical documents, no open conflicts. Fixtures: ports pinned across
+  restarts, the control plane on demand, one log per launch (a restart no longer erases the
+  killed run's log), and evidence (data dirs, logs, `kdb-inspect verify`) preserved to
+  `e2e/evidence/` and uploaded by CI on failure. U6a: `test_kill9_mid_load...` checks every
+  acknowledged document before failing and reports missing / rolled back / unreadable
+  separately with the head each read was served at; `kdb-e2e-helper get` now exits 0 with an
+  empty body for not-found, so "absent" and "read failed" are distinguishable. A six-pass soak
+  (three with `GOMAXPROCS=2`) found three defects, each with its own PR:
+  **N1** snapshot joiner stuck on a branch forked behind its root (#111);
+  **N2** five-node mesh merge storm, 10k+ empty merges after writes stopped, never converging
+  (`fix/mesh-merge-convergence`); **N3** a drain mid-replication checkpoints a stored-but-unlogged
+  peer commit, after which the node fails every sync with "no frame in the delta log", 4 of 8
+  runs (`fix/checkpoint-unlogged-peer-commits`). The three tests that hit them carry non-strict
+  xfail marks to remove as the fixes land.
+- **2026-10-11 — new item, found by multi-node e2e testing: a drained node checkpointed peer
+  commits it never logged** (branch `fix/checkpoint-unlogged-peer-commits`, PR #113, commit 70424df). SIGTERM a
+  node of a 3-node mesh under concurrent writes and, in 5 of 20 runs here, the restarted node failed
+  every sync forever with `commit ... has no frame in the delta log`. A push that arrived as the
+  drain began was stored (`peersync.StoreCommits`, outside the write gate) and then refused by
+  `Adopt` (`serverLocalNode.Exclusive` refuses while draining), so it was never logged; the clean
+  close checkpointed the whole in-memory DAG, that commit included, with no operations; the
+  reopened DAG held it, so every sync skipped the peer's copy and then failed to log it on
+  adoption. Not drain-specific: any stored-but-unadopted commit (conflict side, unfinished
+  multi-page transfer) reached a checkpoint the same way. Fixed by marking peer-stored commits
+  unlogged until adoption logs them (`dag/unlogged.go`): checkpoints leave them out (and any
+  non-main ref naming one), the operations budget does not evict them, and a resident commit whose
+  operations the log cannot supply is refilled from a peer's copy that reproduces its hash, which
+  heals data directories v0.6.2 already wrote (verified on the preserved e2e evidence). The
+  peer-sync listener's `Close` now ends inbound sessions and waits for them, and the service closes
+  it before draining. 0 of 20 runs broken after. **Found along the way:** the ops loader indexed the
+  delta log once, on its first cold load, and never again, so any commit logged after that and then
+  evicted reported the same "no frame" error with its frame on disk; it now re-indexes the newest
+  and unseen segments on a miss. **Not fixed here, same family:** a failed `Deepen` and a failed
+  merge-commit persist still leave unlogged commits a checkpoint will describe; the HTTP/websocket
+  peer endpoint (`syncnode.Handler`) is not drained before storage closes; Kotlin peer sync was not
+  checked for the same checkpoint behaviour.
 
 ### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (#116, branch `feat/zstd-js-native`)
 

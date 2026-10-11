@@ -105,3 +105,12 @@ def run_kdb(
         text=True,
         check=False,
     )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Records each phase's report on the test item (item.rep_setup / rep_call / rep_teardown),
+    so a fixture can tell at teardown whether the test failed and keep its evidence."""
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, "rep_" + rep.when, rep)

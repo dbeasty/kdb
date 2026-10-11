@@ -1,6 +1,7 @@
 package peersync
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -163,6 +164,10 @@ func Ingest(env IngestEnv, commits []document.Commit, incomingHead codec.Hash) (
 // adoption. It is the first half of Ingest, used alone for every page of a multi-page transfer
 // but the last. Returns how many commits were new; on error, the commits before the failing one
 // stay stored and the count says how many.
+//
+// Commits are stored marked unlogged (dag.PutUnloggedCommit) until persistAll logs them, so that
+// a checkpoint taken meanwhile - a clean close while a push is refused by the drain, a
+// maintenance pass while a conflict waits - does not describe history only memory holds.
 func StoreCommits(env IngestEnv, commits []document.Commit, stubs []document.CommitStub) (int, error) {
 	for _, s := range stubs {
 		env.DAG.PutStub(s)
@@ -170,17 +175,39 @@ func StoreCommits(env IngestEnv, commits []document.Commit, stubs []document.Com
 	stored := 0
 	for _, c := range commits {
 		if env.DAG.HasCommit(c.Hash) {
+			if err := env.refillUnlogged(c); err != nil {
+				return stored, fmt.Errorf("peer sync: repairing commit %s: %w", c.Hash.Hex(), err)
+			}
 			continue
 		}
 		if err := env.checkSkew(c); err != nil {
 			return stored, err
 		}
-		if err := env.DAG.PutCommit(c, true); err != nil {
+		if err := env.DAG.PutUnloggedCommit(c); err != nil {
 			return stored, fmt.Errorf("peer sync: storing commit %s: %w", c.Hash.Hex(), err)
 		}
 		stored++
 	}
 	return stored, nil
+}
+
+// refillUnlogged repairs a commit this node holds without operations the delta log can supply,
+// from the copy a peer just sent. Earlier versions checkpointed commits received from a peer and
+// never logged; such a commit reopens with its operations gone and no frame to load them from,
+// and since the DAG holds it, "already have it" made every later sync skip the copy that could
+// fix it and then fail when adoption needed its operations. The copy is checked against the
+// commit's hash, which covers its operations.
+//
+// Only a commit whose operations are evicted is checked, so a resident one costs a map lookup;
+// one the log does hold is left alone.
+func (env IngestEnv) refillUnlogged(c document.Commit) error {
+	if len(c.Operations) == 0 || !env.DAG.OperationsEvicted(c.Hash) {
+		return nil
+	}
+	if _, err := env.DAG.CommitOperations(c.Hash); err == nil || !errors.Is(err, dag.ErrOperationsNotLogged) {
+		return nil
+	}
+	return env.DAG.RefillUnloggedCommit(c)
 }
 
 // Adopt decides what main should point at given incomingHead, a commit already stored, and
@@ -213,7 +240,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			if err != nil {
 				return err
 			}
-			for _, c := range adopting {
+			for _, c := range adoptable(env.DAG, adopting) {
 				if cerr := env.CheckCommit(c); cerr != nil {
 					res.Outcome = CommitPushOutcome{Kind: OutcomeConflict}
 					_ = env.noteConflict("branch:"+mainBranch, localHead, incomingHead, &kdberr.ConflictReport{
@@ -446,18 +473,25 @@ func (env IngestEnv) clearConflict(ref string) error {
 }
 
 // persistAll queues commits for the log in order, returning what to wait on.
+//
+// Each commit's unlogged mark is cleared before its frame is queued and put back if queueing
+// fails. Not after: a checkpoint claiming the segment the frame lands in must describe the
+// commit, or the next open would skip the frame and lose it - see dag.MarkLogged.
 func (env IngestEnv) persistAll(commits []document.Commit) ([]func() error, error) {
 	var waits []func() error
 	for _, c := range commits {
+		env.DAG.MarkLogged(c.Hash)
 		switch {
 		case env.PersistAsync != nil:
 			wait, err := env.PersistAsync(c)
 			if err != nil {
+				env.DAG.MarkUnlogged(c.Hash)
 				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
 			}
 			waits = append(waits, wait)
 		case env.Persist != nil:
 			if err := env.Persist(c); err != nil {
+				env.DAG.MarkUnlogged(c.Hash)
 				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
 			}
 		}
@@ -478,6 +512,7 @@ func fastForward(env IngestEnv, localHead, incomingHead codec.Hash) (AdvanceStep
 	if err != nil {
 		return AdvanceStep{}, err
 	}
+	commits = adoptable(env.DAG, commits)
 	applied := netEffect(commits)
 	if env.ApplyToStorage {
 		if err := applyAndVerify(env, localHead, incomingHead, applied); err != nil {
@@ -621,6 +656,23 @@ func commitsBetween(d *dag.InMemoryCommitDag, head, base codec.Hash) ([]document
 		queue = append(queue, c.ParentHashes...)
 	}
 	return topoSort(inRange), nil
+}
+
+// adoptable drops shallow roots from commits a head move is about to adopt. A shallow root - a
+// snapshot's root, a graft, or a commit behind this node's root whose state a pull took in
+// (boundary.go) - was admitted and logged on its own, and is never newly reachable history: its
+// operations are the change from parents this node does not hold, so applying them, logging them
+// again, checking them against a home's fence or announcing them to commit listeners as if main had
+// just taken them would all be wrong. The merge above such a root already carries every document
+// its parents disagree on.
+func adoptable(d *dag.InMemoryCommitDag, commits []document.Commit) []document.Commit {
+	out := commits[:0:0]
+	for _, c := range commits {
+		if !d.IsShallow(c.Hash) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // topoSort orders commits parents first (Kahn's algorithm over edges inside the set), breaking
