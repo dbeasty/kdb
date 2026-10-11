@@ -15,6 +15,7 @@ import dev.kdb.storage.NoOpDeltaDebugHook
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.StorageEngineConfig
 import dev.kdb.storage.io.SegmentNameBuilder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -192,6 +193,25 @@ public class LegacySegmentFormatException(
             "namespace before opening it (see kdb-spec-layer13-resource-governance.md §4.1)",
     )
 
+/**
+ * A delta segment [DefaultDeltaSegmentReader.listSegments] found but could not read - an I/O error.
+ * Leaving it out of the listing would drop every commit in it from replay, so this is reported
+ * wherever the segment is, newest or not. A torn tail or damage the scan can step over is not this:
+ * those still list, and the replayer classifies them. Mirrors Go's delta.UnreadableSegmentError
+ * (U6c, #121); the cause is [cause].
+ */
+public class UnreadableSegmentException(
+    public val namespaceId: String,
+    public val sequenceNumber: Long,
+    public val segmentName: String,
+    cause: Throwable,
+) : Exception(
+        "kdb: namespace '$namespaceId': delta segment $sequenceNumber ($segmentName) cannot be read, so the " +
+            "commits in it cannot be recovered from this log - run 'kdb-inspect verify' to classify the damage " +
+            "and 'kdb-inspect repair-segments' to repair it: ${cause.message ?: cause}",
+        cause,
+    )
+
 public class DefaultDeltaSegmentReader(
     override val namespaceId: String,
     private val ioShim: PlatformIoShim,
@@ -247,6 +267,8 @@ public class DefaultDeltaSegmentReader(
      *
      * @throws LegacySegmentFormatException if a pre-Layer-13 random-name
      *   segment is present.
+     * @throws UnreadableSegmentException if a listed segment cannot be read, unless it was
+     *   deleted in the meantime - never a silent omission.
      */
     override suspend fun listSegments(): List<DeltaSegmentRef> {
         val prefix = SegmentNameBuilder.namespacePrefix(namespaceId) + "delta/"
@@ -260,11 +282,34 @@ public class DefaultDeltaSegmentReader(
                 legacy += name
                 continue
             }
-            scanSegmentRef(name, seq)?.let { out += it }
+            val ref =
+                try {
+                    scanSegmentRef(name, seq)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // A segment deleted between the listing above and this read - truncation
+                    // running alongside a reader - is not damage: it is no longer part of the log.
+                    // Anything else is. Skipping it used to drop every commit in it from replay
+                    // without a word (Go's U6c, #121).
+                    if (segmentGone(name)) continue
+                    throw UnreadableSegmentException(namespaceId, seq, name, e)
+                }
+            out += ref
         }
         if (legacy.isNotEmpty()) throw LegacySegmentFormatException(namespaceId, legacy)
         return out
     }
+
+    /** Whether [name] has disappeared from the namespace's listing. A listing that fails says no. */
+    private suspend fun segmentGone(name: String): Boolean =
+        try {
+            name !in ioShim.listSegments(namespaceId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
 
     private suspend fun readFullSegment(segmentName: String, sizeBytes: Long): ByteArray {
         if (sizeBytes <= 0) return byteArrayOf()
@@ -272,13 +317,9 @@ public class DefaultDeltaSegmentReader(
         return ioShim.readFromSegment(segmentName, 0, len)
     }
 
-    private suspend fun scanSegmentRef(segmentName: String, seq: Long): DeltaSegmentRef? {
-        val bytes =
-            try {
-                readEntireSegment(segmentName)
-            } catch (_: Exception) {
-                return null
-            }
+    /** @throws Exception from the read itself - [listSegments] decides whether that is damage. */
+    private suspend fun scanSegmentRef(segmentName: String, seq: Long): DeltaSegmentRef {
+        val bytes = readEntireSegment(segmentName)
         val scanned =
             try {
                 DeltaSegmentScanner.scanSegmentBytes(bytes)
