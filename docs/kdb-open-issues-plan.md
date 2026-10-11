@@ -491,6 +491,48 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   (`ErrForeignTreeNeedsObjects`), so it gets the typed error and has to deepen.
 - 2026-10-11 — Scan cap (silent truncation at `MaxRows` before `WHERE`): found by qtask, Go fix on
   `fix/scan-cap-before-filter`. Follow-on units live in `docs/kdb-scan-cap-plan.md`.
+- **2026-10-11 — multi-node e2e harness, and U6a.** New `kdb-integration/e2e/test_cluster.py` +
+  `cluster_fixtures.py`: real kdb-service clusters (mesh, chain, star; 2-5 nodes) replicating with
+  `--peer`, concurrent writers on every node, `kill -9` of one node, two at once and the whole
+  cluster, clean drains, partitions (a node down while others write), late snapshot joiners,
+  SQL schema/UPDATE/DELETE replication, last-write and strict conflicts (queued, then resolved
+  through the control plane). Every scenario ends on a strict convergence check: the same head
+  commit on every node, identical documents, no open conflicts. Fixtures: ports pinned across
+  restarts, the control plane on demand, one log per launch (a restart no longer erases the
+  killed run's log), and evidence (data dirs, logs, `kdb-inspect verify`) preserved to
+  `e2e/evidence/` and uploaded by CI on failure. U6a: `test_kill9_mid_load...` checks every
+  acknowledged document before failing and reports missing / rolled back / unreadable
+  separately with the head each read was served at; `kdb-e2e-helper get` now exits 0 with an
+  empty body for not-found, so "absent" and "read failed" are distinguishable. A six-pass soak
+  (three with `GOMAXPROCS=2`) found three defects, each with its own PR:
+  **N1** snapshot joiner stuck on a branch forked behind its root (#111);
+  **N2** five-node mesh merge storm, 10k+ empty merges after writes stopped, never converging
+  (`fix/mesh-merge-convergence`); **N3** a drain mid-replication checkpoints a stored-but-unlogged
+  peer commit, after which the node fails every sync with "no frame in the delta log", 4 of 8
+  runs (`fix/checkpoint-unlogged-peer-commits`). The three tests that hit them carry non-strict
+  xfail marks to remove as the fixes land.
+- **2026-10-11 — new item, found by multi-node e2e testing: a drained node checkpointed peer
+  commits it never logged** (branch `fix/checkpoint-unlogged-peer-commits`, PR #113, commit 70424df). SIGTERM a
+  node of a 3-node mesh under concurrent writes and, in 5 of 20 runs here, the restarted node failed
+  every sync forever with `commit ... has no frame in the delta log`. A push that arrived as the
+  drain began was stored (`peersync.StoreCommits`, outside the write gate) and then refused by
+  `Adopt` (`serverLocalNode.Exclusive` refuses while draining), so it was never logged; the clean
+  close checkpointed the whole in-memory DAG, that commit included, with no operations; the
+  reopened DAG held it, so every sync skipped the peer's copy and then failed to log it on
+  adoption. Not drain-specific: any stored-but-unadopted commit (conflict side, unfinished
+  multi-page transfer) reached a checkpoint the same way. Fixed by marking peer-stored commits
+  unlogged until adoption logs them (`dag/unlogged.go`): checkpoints leave them out (and any
+  non-main ref naming one), the operations budget does not evict them, and a resident commit whose
+  operations the log cannot supply is refilled from a peer's copy that reproduces its hash, which
+  heals data directories v0.6.2 already wrote (verified on the preserved e2e evidence). The
+  peer-sync listener's `Close` now ends inbound sessions and waits for them, and the service closes
+  it before draining. 0 of 20 runs broken after. **Found along the way:** the ops loader indexed the
+  delta log once, on its first cold load, and never again, so any commit logged after that and then
+  evicted reported the same "no frame" error with its frame on disk; it now re-indexes the newest
+  and unseen segments on a miss. **Not fixed here, same family:** a failed `Deepen` and a failed
+  merge-commit persist still leave unlogged commits a checkpoint will describe; the HTTP/websocket
+  peer endpoint (`syncnode.Handler`) is not drained before storage closes; Kotlin peer sync was not
+  checked for the same checkpoint behaviour.
 
 ### 2026-10-11 — new item, found by multi-node e2e testing: mesh merge storm (branch `fix/mesh-merge-convergence`)
 

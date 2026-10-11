@@ -93,10 +93,7 @@ def control(srv: KdbServer, method: str, path: str, body: dict | None = None) ->
 
 
 def with_control(extra: list[str]) -> KdbServer:
-    port = free_port()
-    srv = KdbServer(extra_args=["--control-addr", f"127.0.0.1:{port}", "--control-write", *extra])
-    srv.control_port = port
-    return srv
+    return KdbServer(control=True, control_write=True, extra_args=list(extra))
 
 
 @pytest.fixture

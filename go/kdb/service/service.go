@@ -835,6 +835,13 @@ func Main() {
 	// Replication first: a sync in flight is a writer, and Stop waits for it to finish. The
 	// scrub loop likewise.
 	node.StopSync()
+	// Inbound peer sync likewise, and before BeginDraining: Close ends the sessions peers have
+	// open and waits for their handlers. A session left running past the drain had a push
+	// stored and then refused - no longer harmful, since a checkpoint leaves out commits never
+	// logged, but not quiescent either: it kept writing into the DAG while storage closed.
+	if peerListener != nil {
+		_ = peerListener.Close()
+	}
 	// Before anything else: a pass that is mid-truncation holds the invariant that makes
 	// truncation safe (bodies flushed, checkpoint written, then segments deleted), and Stop waits
 	// for it rather than cutting it short.
@@ -845,9 +852,6 @@ func Main() {
 	srv.BeginDraining()
 	if sqlListener != nil {
 		_ = sqlListener.Close()
-	}
-	if peerListener != nil {
-		_ = peerListener.Close()
 	}
 	if streamListener != nil {
 		_ = streamListener.Close()

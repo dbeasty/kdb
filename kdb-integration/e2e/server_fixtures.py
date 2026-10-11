@@ -83,6 +83,43 @@ def free_ports(count: int) -> list[int]:
             s.close()
 
 
+# Pinned ports come from below every OS's ephemeral range (Linux starts at 32768 by default, macOS
+# at 49152). A port the kernel handed out as ephemeral is also fair game as the *source* port of
+# any outgoing connection, so while a killed node is down one of the many client connections a
+# cluster test makes can take its port, and the node cannot bind it again on restart - which is
+# exactly what happened on a Linux runner and never on a laptop.
+_STABLE_PORT_RANGE = (20000, 32000)
+_stable_ports_taken: set[int] = set()
+
+
+def stable_ports(count: int) -> list[int]:
+    """Reserves `count` distinct ports outside the ephemeral range, for servers that must come back
+    on the same ports after a kill. Each is checked by binding it, and never handed out twice in
+    this process."""
+    import random
+    rng = random.Random()
+    lo, hi = _STABLE_PORT_RANGE
+    socks, ports = [], []
+    try:
+        while len(ports) < count:
+            port = rng.randrange(lo, hi)
+            if port in _stable_ports_taken or port in ports:
+                continue
+            s = socket.socket()
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                s.close()
+                continue
+            socks.append(s)
+            ports.append(port)
+        _stable_ports_taken.update(ports)
+        return ports
+    finally:
+        for s in socks:
+            s.close()
+
+
 @dataclass
 class TlsMaterial:
     """A self-signed CA plus one server cert/key issued from it (session-scoped fixture)."""
@@ -123,14 +160,23 @@ class KdbServer:
     bootstrap_users: list = field(default_factory=list)
     bootstrap_roles: list = field(default_factory=list)
     extra_args: list = field(default_factory=list)
+    # control: also serve the /v1 control plane (--control-addr), which cluster tests read heads,
+    # documents, conflicts and peer progress from; control_write enables its mutating endpoints.
+    control: bool = False
+    control_write: bool = False
+    # pin_ports: keep the same ports across restarts. Peers name each other by address in their
+    # --peer specs, so a node that came back on new ports would silently drop out of the cluster.
+    pin_ports: bool = False
 
     data_dir: str = ""
     sql_port: int = 0
     peer_port: int = 0
     stream_port: int = 0
     admin_port: int = 0
+    control_port: int = 0
     proc: subprocess.Popen | None = None
     log_path: str = ""
+    launches: int = 0
 
     _bootstrapped: bool = False
 
@@ -154,6 +200,15 @@ class KdbServer:
         self._bootstrapped = True
         return self._launch()
 
+    def reserve_ports(self) -> "KdbServer":
+        """Allocates this server's ports now, so its addresses are known before it starts -
+        what a cluster needs to write every node's --peer specs up front."""
+        if not self.sql_port:
+            alloc = stable_ports if self.pin_ports else free_ports
+            (self.sql_port, self.peer_port, self.stream_port, self.admin_port,
+             self.control_port) = alloc(5)
+        return self
+
     def _launch(self, attempts: int = 4) -> "KdbServer":
         """Starts the service, retrying a port collision.
 
@@ -164,6 +219,10 @@ class KdbServer:
         set rather than failing the run. Any other early exit is a real failure and is raised.
         """
         last: RuntimeError | None = None
+        if self.pin_ports:
+            # The same ports or nothing: retry for longer, since what holds a pinned port is
+            # normally this server's own previous process, killed a moment ago.
+            attempts = max(attempts, 25)
         for attempt in range(attempts):
             try:
                 return self._launch_once()
@@ -172,15 +231,22 @@ class KdbServer:
                     raise
                 last = e
                 # Give the kernel a moment to reclaim whatever is holding it before trying again.
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(0.2 * min(attempt + 1, 5))
         raise RuntimeError(
             f"kdb-service could not bind a free port in {attempts} attempts; "
             f"last failure:\n{last}")
 
     def _launch_once(self) -> "KdbServer":
-        # One allocation for all four, so the kernel cannot hand the same port to two of them.
-        self.sql_port, self.peer_port, self.stream_port, self.admin_port = free_ports(4)
-        self.log_path = os.path.join(self.data_dir, "service.log")
+        # One allocation for all of them, so the kernel cannot hand the same port to two.
+        if not self.pin_ports:
+            (self.sql_port, self.peer_port, self.stream_port, self.admin_port,
+             self.control_port) = free_ports(5)
+        elif not self.sql_port:
+            self.reserve_ports()
+        # One log per launch: reopening a single file with "w" on restart erased the log of the
+        # run that was killed, which is the one a crash test needs to read.
+        self.launches += 1
+        self.log_path = os.path.join(self.data_dir, f"service.{self.launches}.log")
         cmd = [
             service_bin(),
             "--data-dir", self.data_dir,
@@ -192,6 +258,10 @@ class KdbServer:
             "--log-format", "json",
             "--drain-timeout", "10s",
         ]
+        if self.control:
+            cmd += ["--control-addr", f"127.0.0.1:{self.control_port}", "--control-ui=false"]
+            if self.control_write:
+                cmd.append("--control-write")
         if self.rbac:
             cmd.append("--rbac")
         if self.tls:
@@ -243,10 +313,22 @@ class KdbServer:
             return e.code, e.read().decode()
 
     def logs(self) -> str:
+        """The current launch's log."""
         try:
             return Path(self.log_path).read_text()
         except OSError:
             return "<no logs>"
+
+    def all_logs(self) -> str:
+        """Every launch's log, oldest first - what to read after a kill and restart."""
+        parts = []
+        for n in range(1, self.launches + 1):
+            path = os.path.join(self.data_dir, f"service.{n}.log")
+            try:
+                parts.append(f"--- launch {n} ---\n" + Path(path).read_text())
+            except OSError:
+                pass
+        return "\n".join(parts) or "<no logs>"
 
     def log_lines(self) -> list[dict]:
         out = []
@@ -279,6 +361,39 @@ class KdbServer:
         if self.proc and self.proc.poll() is None:
             self.kill9()
         shutil.rmtree(self.data_dir, ignore_errors=True)
+
+
+# -- failure evidence ------------------------------------------------------------------------
+
+EVIDENCE_DIR = Path(os.environ.get("KDB_E2E_EVIDENCE_DIR", Path(__file__).parent / "evidence"))
+
+
+def preserve_evidence(name: str, servers: list["KdbServer"], notes: str = "") -> str:
+    """Copies each server's data directory - delta log, checkpoints, every launch's log - plus
+    `notes` to EVIDENCE_DIR/<name>, so a failure that only shows up in CI can be examined after the
+    runner is gone (CI uploads that directory when a job fails). Returns the path."""
+    dest = EVIDENCE_DIR / f"{name}-{int(time.time())}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for i, srv in enumerate(servers):
+        if srv.data_dir and os.path.isdir(srv.data_dir):
+            shutil.copytree(srv.data_dir, dest / f"node{i}", dirs_exist_ok=True)
+    if notes:
+        (dest / "notes.txt").write_text(notes)
+    return str(dest)
+
+
+def inspect_report(srv: "KdbServer") -> str:
+    """kdb-inspect's verify and segment listing for a server's namespace, as text."""
+    out = []
+    for args in (["verify", "--codec", "zstd"], ["verify", "--codec", "zstd", "--level", "L2"]):
+        try:
+            r = subprocess.run([inspect_bin(), args[0], "--data-dir", srv.data_dir,
+                                "--namespace", srv.namespace, *args[1:]],
+                               capture_output=True, text=True, timeout=60)
+            out.append(f"$ kdb-inspect {' '.join(args)} (exit {r.returncode})\n{r.stdout}{r.stderr}")
+        except Exception as e:  # evidence gathering must not mask the real failure
+            out.append(f"$ kdb-inspect {' '.join(args)}: {e}")
+    return "\n".join(out)
 
 
 # -- helper-binary client calls --------------------------------------------------------------
@@ -322,6 +437,18 @@ def get(server: KdbServer, doc_id: str, **kw) -> dict | None:
         return None
     lines = r.stdout.strip().splitlines()
     return json.loads(lines[1]) if len(lines) > 1 and lines[1] else None
+
+
+def read(server: KdbServer, doc_id: str, **kw) -> tuple[str, dict | None]:
+    """A point read that tells "not there" from "the read failed": returns (commit served at,
+    body or None when the document does not exist) and raises, with the helper's stderr, on any
+    failure. Prefer this to get() wherever an absent document would fail the test."""
+    r = helper("get", "--addr", server.sql_addr, "--namespace", server.namespace,
+               "--doc-id", doc_id, check=True, **kw)
+    lines = r.stdout.split("\n")
+    commit = lines[0].strip() if lines else ""
+    body = lines[1].strip() if len(lines) > 1 else ""
+    return commit, (json.loads(body) if body else None)
 
 
 def sql_exec(server: KdbServer, sql: str, **kw) -> subprocess.CompletedProcess:

@@ -34,6 +34,17 @@ jobs:
         run: pip install -q -r kdb-integration/e2e/requirements.txt
       - name: Run integration tests
         run: ./gradlew :kdb-integration:test :kdb-integration:e2ePython --no-daemon
+      - name: Upload e2e failure evidence
+        # Data directories, every launch's service log and kdb-inspect output, kept by
+        # preserve_evidence() when a crash or cluster scenario fails - the only way to examine a
+        # failure that shows up on a runner and not on a laptop (issue #43).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence-integration-${{ github.run_attempt }}
+          path: kdb-integration/e2e/evidence/
+          if-no-files-found: ignore
+          retention-days: 14
 
   kotlin-test:
     runs-on: ubuntu-latest
@@ -284,6 +295,17 @@ jobs:
       - name: Run e2e scenarios (server/cluster/destructive; interop/slow/s3 excluded)
         working-directory: kdb-integration/e2e
         run: python -m pytest -v
+      - name: Upload e2e failure evidence
+        # Data directories, every launch's service log and kdb-inspect output, kept by
+        # preserve_evidence() when a crash or cluster scenario fails - the only way to examine a
+        # failure that shows up on a runner and not on a laptop (issue #43).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence-${{ github.run_attempt }}
+          path: kdb-integration/e2e/evidence/
+          if-no-files-found: ignore
+          retention-days: 14
 
   e2e-interop:
     runs-on: ubuntu-latest
