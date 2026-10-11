@@ -122,6 +122,25 @@ type LsmBlobStore struct {
 	ordered []Handle
 	// indexes caches each table's parsed footer index; also guarded by mu (see tableIndexCache).
 	indexes tableIndexCache
+
+	// readers counts, per segment, the lookups currently holding that table (see pin), and
+	// doomed names the tables a compaction has swapped out whose files wait for their last
+	// reader to let go. Both guarded by mu.
+	//
+	// Compaction used to delete its inputs the moment it swapped them out, and a lookup that had
+	// taken the table list just before the swap went on to read files that were gone. Lookup
+	// treats an unreadable table as one that cannot answer, so a key the merged table held came
+	// back as not found. A reader now pins every table it may read; a compaction deletes an input
+	// at once only when nothing holds it, and otherwise leaves the deletion to the last release.
+	readers map[string]int
+	doomed  map[string]struct{}
+	// compactMu serializes Compact. Two at once would both merge the same inputs, and the second
+	// would fail reading a file the first had already deleted.
+	compactMu sync.Mutex
+
+	// afterSearchOrder, when set, runs between a lookup taking its table list and reading any
+	// table - the window a concurrent compaction used to delete an input in. Tests only.
+	afterSearchOrder func()
 }
 
 // NewLsmBlobStore returns an LSM blob store.
@@ -131,6 +150,8 @@ func NewLsmBlobStore(io storage.PlatformIOShim, namespaceID string, cache *Block
 		namespaceID: namespaceID,
 		cache:       cache,
 		indexes:     newTableIndexCache(DefaultIndexCacheBytes),
+		readers:     make(map[string]int),
+		doomed:      make(map[string]struct{}),
 	}
 }
 
@@ -151,7 +172,12 @@ func (s *LsmBlobStore) Get(key codec.Hash) []byte {
 // each fresh reader read the whole file to learn its size and then re-read and re-parsed the
 // footer - time proportional to the table, on every probe (issue #43's slow recovery).
 func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool) {
-	for _, h := range s.searchOrder() {
+	order := s.pin()
+	defer s.release(order)
+	if s.afterSearchOrder != nil {
+		s.afterSearchOrder()
+	}
+	for _, h := range order {
 		index, err := s.indexFor(h)
 		if err != nil {
 			// A read error is treated the way it always has been - as "this table cannot answer" -
@@ -184,7 +210,12 @@ func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool
 // block counts as present; nothing relies on replay rewriting one, since every object read is
 // verified against its content hash and treats a bad block as a miss.
 func (s *LsmBlobStore) Contains(key codec.Hash) bool {
-	for _, h := range s.searchOrder() {
+	order := s.pin()
+	defer s.release(order)
+	if s.afterSearchOrder != nil {
+		s.afterSearchOrder()
+	}
+	for _, h := range order {
 		index, err := s.indexFor(h)
 		if err != nil {
 			continue
@@ -196,7 +227,7 @@ func (s *LsmBlobStore) Contains(key codec.Hash) bool {
 	return false
 }
 
-// searchOrder returns the tables newest-first.
+// searchOrderLocked returns the tables newest-first. Callers hold s.mu.
 //
 // Level ascending, then reverse insertion order within a level: level 0 is
 // where a memtable flush lands, and compaction writes its output one level
@@ -206,13 +237,50 @@ func (s *LsmBlobStore) Contains(key codec.Hash) bool {
 // never compacted.
 //
 // The returned slice is shared and must not be modified.
-func (s *LsmBlobStore) searchOrder() []Handle {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *LsmBlobStore) searchOrderLocked() []Handle {
 	if s.ordered == nil && len(s.tables) > 0 {
 		s.ordered = newestFirst(s.tables)
 	}
 	return s.ordered
+}
+
+// pin returns the tables newest-first, as searchOrderLocked does, and holds every one of them until the
+// matching release: a compaction that swaps one of them out in the meantime defers deleting its
+// file rather than pulling it from under the read. Taking the list and pinning it in one critical
+// section is the point - a table cannot be swapped out between the two.
+func (s *LsmBlobStore) pin() []Handle {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	order := s.searchOrderLocked()
+	for _, h := range order {
+		s.readers[h.SegmentName]++
+	}
+	return order
+}
+
+// release lets go of tables taken by pin, and deletes any a compaction has swapped out that no
+// reader holds any more. The deletion runs outside the lock, as Compact's own does; a failure
+// leaves the file behind, which costs disk until the next open and never an answer (see
+// Compact).
+func (s *LsmBlobStore) release(order []Handle) {
+	var gone []string
+	s.mu.Lock()
+	for _, h := range order {
+		name := h.SegmentName
+		if n := s.readers[name]; n > 1 {
+			s.readers[name] = n - 1
+			continue
+		}
+		delete(s.readers, name)
+		if _, ok := s.doomed[name]; ok {
+			delete(s.doomed, name)
+			gone = append(gone, name)
+		}
+	}
+	s.mu.Unlock()
+	for _, name := range gone {
+		_ = s.io.DeleteSegment(name)
+	}
 }
 
 // setTablesLocked replaces the table list and invalidates the cached search order. Callers hold
@@ -251,10 +319,13 @@ func (s *LsmBlobStore) Tables() []Handle {
 
 // CompactionResult reports one compaction pass.
 type CompactionResult struct {
-	// Merged is how many tables went in, Removed how many were actually
-	// deleted afterwards. They differ only when a deletion failed.
-	Merged  int
-	Removed int
+	// Merged is how many tables went in, Removed how many were deleted
+	// before Compact returned, and Deferred how many were still being read
+	// and are deleted when their last reader lets go. Merged exceeds
+	// Removed+Deferred only when a deletion failed.
+	Merged   int
+	Removed  int
+	Deferred int
 	// Dropped is how many keys the keep predicate refused - superseded
 	// document versions that will never be asked for again.
 	Dropped int
@@ -284,6 +355,12 @@ type CompactionResult struct {
 // that is harmless, because every key in this store is the hash of its own
 // value, so an old table and the merged table cannot disagree about one.
 //
+// "Then delete" may now be later than Compact's return: an input a lookup is still reading is
+// deleted when that lookup releases it (see pin). A crash in that window is the same crash as
+// one between the swap and the deletions - the inputs survive, the next open registers them
+// beside the merged table, and the next compaction merges them in and deletes them - and the
+// window is no wider than the longest lookup in flight, which reads one block per table.
+//
 // The exception, stated rather than hidden: a *tombstone* in the merged
 // table can be shadowed by a leftover input holding the value it deleted,
 // because a leftover input is discovered at level 0 and the merged output
@@ -296,13 +373,18 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	if trigger < 2 {
 		trigger = 2
 	}
-	inputs := s.Tables()
-	if len(inputs) < trigger {
+	s.compactMu.Lock()
+	defer s.compactMu.Unlock()
+	// The inputs are pinned like any reader's tables, so the release below is what deletes them -
+	// immediately when no lookup holds one, otherwise when the last one lets go.
+	pinned := s.pin()
+	defer s.release(pinned)
+	if len(pinned) < trigger {
 		return CompactionResult{}, nil
 	}
 	// Oldest first, so a later table's opinion wins in the merge.
-	// A copy: searchOrder's slice is shared with concurrent lookups and is reversed here.
-	ordered := append([]Handle(nil), s.searchOrder()...)
+	// A copy: the pinned slice is shared with concurrent lookups and is reversed here.
+	ordered := append([]Handle(nil), pinned...)
 	for i, j := 0, len(ordered)-1; i < j; i, j = i+1, j-1 {
 		ordered[i], ordered[j] = ordered[j], ordered[i]
 	}
@@ -365,23 +447,34 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	}
 	s.setTablesLocked(next)
 	// Dropped in the same critical section as the swap, so indexFor cannot re-insert one of
-	// these after it is gone (it only caches a table that is still registered).
-	for _, in := range ordered {
-		if in.SegmentName != merged.SegmentName {
-			s.indexes.remove(in.SegmentName)
-		}
-	}
-	s.mu.Unlock()
-
+	// these after it is gone (it only caches a table that is still registered). A lookup still
+	// holding one reads its index from the file, which stays until that lookup releases it.
+	//
+	// Each input is doomed here, under the lock that also guards pin, so from this point no new
+	// reader can take it (it is no longer registered) and the last of the existing ones - this
+	// compaction's own release included - deletes it.
 	result := CompactionResult{Merged: len(ordered), Output: merged.SegmentName, Dropped: dropped}
+	var now []string
 	for _, in := range ordered {
 		if in.SegmentName == merged.SegmentName {
 			continue
 		}
-		if err := s.io.DeleteSegment(in.SegmentName); err != nil {
+		s.indexes.remove(in.SegmentName)
+		if s.readers[in.SegmentName] > 1 {
+			// Held by a lookup besides this compaction's own pin.
+			s.doomed[in.SegmentName] = struct{}{}
+			result.Deferred++
+			continue
+		}
+		now = append(now, in.SegmentName)
+	}
+	s.mu.Unlock()
+
+	for _, name := range now {
+		if err := s.io.DeleteSegment(name); err != nil {
 			// The table is already unreachable through this store; leaving
 			// the file behind costs disk, not correctness, and the next
-			// compaction will try again.
+			// open rediscovers it and the compaction after that merges it.
 			continue
 		}
 		result.Removed++

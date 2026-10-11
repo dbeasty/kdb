@@ -792,3 +792,42 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   155, warm hits one read, warm misses and `Contains` none; compaction invalidation, budget,
   concurrency, the no-sizer fallback, file-backed size), and the opt-in measurement
   `TestReplayOpenTimeWithoutCheckpoint` (`KDB_REPLAY_COMMITS=14000`) in `go/kdb/embed`.
+
+- **2026-10-11 — found by #123: a lookup racing a compaction could report a stored key as
+  missing** (branch `fix/compaction-lookup-race`). `LsmBlobStore.Lookup`/`Contains`
+  (`go/kdb/storage/sstable/types.go`) took the table list under the lock and read the tables
+  after releasing it; `Compact` swapped its output in and deleted its inputs straight away. A
+  lookup holding the pre-swap list then read deleted files, treated the read error as "this table
+  cannot answer", and never saw the merged table: not found. Predates #123 (the per-probe reader
+  hit the same deleted file). **Real impact:** live documents are pinned in `docsByHash`, so the
+  common read is unaffected. What reaches the blob store is a version that is not resident:
+  `GetDocument`/`ScanDocuments` (`engine/server_engine.go`) → `documentFromObject`
+  (`tree_objects.go`) → `loadCold` → `loadDocumentBody` (`document_bodies.go`). Under
+  `history=none` after truncation, or with bodies external (snapshot bootstrap, truncated
+  horizon), a miss there falls through to a delta log that no longer holds the version, so
+  `GetDocument` reported a stored document as not found and `ScanDocuments` **silently skipped the
+  row** - including live documents on their first read after reopen, which are not resident until
+  then. Under `history=full` the misses fall back to the log (`coldLoader`, tree folding in
+  `treeAt`): slower, not wrong. `MaterializeLiveBodies` re-wrote a body it thought missing
+  (harmless), and replay's `skipExistingObject` runs before maintenance starts. Compaction runs only
+  from maintenance (`CompactBlobStore` via `withCompaction` in `embed/checkpoint_open.go`, driven by
+  `embed/maintenance_loop.go`), concurrently with reads. **Fix, no format change:** reference-count
+  tables. `pin` takes the newest-first list and counts a reader on every table in one critical
+  section; `release` drops the counts and deletes any table a compaction has doomed once its last
+  reader is gone. `Compact` pins its own inputs, and at the swap (same lock) deletes at once an
+  input only it holds, and dooms the rest (`CompactionResult.Deferred`). An unregistered table
+  cannot be pinned, so a doomed table gains no new readers and the last release always deletes it.
+  The index cache stays correct: inputs' indexes are still dropped at the swap, and `indexFor`
+  only caches a registered table, so a pinned reader of a doomed table reads its index from the
+  file (still present) without re-caching it. `Compact` is now serialized (`compactMu`); two at
+  once would merge the same inputs and the second would fail reading the first's deletions.
+  Crash safety is unchanged: a crash with deletions pending is the existing crash between swap
+  and deletes, widened only by the longest lookup in flight; the next open rediscovers the inputs,
+  content addressing means they cannot change an answer, and the next compaction merges and
+  deletes them. The history-modes plan's item 7 (a leftover input shadowing a tombstone) is still
+  unreachable - nothing in production writes an SSTable tombstone - and still has to be closed by
+  whoever starts writing them. Tests (`go/kdb/storage/sstable/lookup_race_test.go`): a
+  deterministic interleaving through a test hook between taking the list and reading (Lookup, and
+  Contains with indexes evicted), and a stress run of 6 readers against 40 flushes and 60
+  compactions that asserts zero misses and no orphaned file. With deferral reverted: Lookup
+  `found=false`, Contains `false`, and 23 of 4,990 stress probes missed; with it, none.
