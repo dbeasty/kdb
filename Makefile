@@ -67,7 +67,7 @@ test-cross: test-kotlin test-go
 test-physical-golden:
 	./gradlew :kdb-integration:test --tests "dev.kdb.integration.ExportGoldenTest" \
 	          :kdb-storage-wal:jvmTest :kdb-storage-sstable:jvmTest :kdb-storage-delta:jvmTest \
-	          --rerun-tasks --no-daemon
+	          :kdb-compression:jvmTest --rerun-tasks --no-daemon
 	cd go && go test ./kdb/interop/... -count=1
 	@git diff --exit-code -- go/testdata/golden \
 	  || (echo "\nERROR: golden fixtures changed - a physical format changed on one side." \

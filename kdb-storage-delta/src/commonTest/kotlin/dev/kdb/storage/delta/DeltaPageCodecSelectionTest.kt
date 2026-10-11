@@ -27,9 +27,9 @@ class DeltaPageCodecSelectionTest {
     fun defaultCodecRoundTripsAndRecordsTheCodecActuallyUsed() =
         runTest {
             val (frameCodec, refCodec) = writeOneFrame(CompressionCodec.ZSTD)
-            val want = if (ZstdCompression.isAvailable) DeltaPageCodec.CODEC_ZSTD else DeltaPageCodec.CODEC_NONE
+            val want = if (ZstdCompression.canCompress) DeltaPageCodec.CODEC_ZSTD else DeltaPageCodec.CODEC_NONE
             assertEquals(want, frameCodec, "a page must record the codec its body was actually written with")
-            val wantRef = if (ZstdCompression.isAvailable) CompressionCodec.ZSTD else CompressionCodec.NONE
+            val wantRef = if (ZstdCompression.canCompress) CompressionCodec.ZSTD else CompressionCodec.NONE
             assertEquals(wantRef, refCodec, "the sealed segment ref must report the codec actually used")
         }
 
@@ -78,15 +78,16 @@ internal suspend fun writeOneFrame(codec: CompressionCodec): Pair<Byte, Compress
 }
 
 /**
- * Shared by jsTest and nativeTest: on a target with no real zstd, the default codec (ZSTD) must
- * degrade to CODEC_NONE pages, which Go and the JVM read.
+ * Shared by jsTest and nativeTest: roadmap R1 gave those targets a real (pure-Kotlin) zstd, so the
+ * default codec (ZSTD) must now produce ZSTD pages, as on Go and the JVM. Until R1 they degraded
+ * to CODEC_NONE.
  */
-internal suspend fun assertTargetWithoutZstdWritesNonePages() {
-    assertEquals(false, ZstdCompression.isAvailable, "this target has no zstd codec linked (roadmap R1)")
+internal suspend fun assertTargetWritesZstdPages() {
+    assertEquals(true, ZstdCompression.canCompress, "roadmap R1: this target writes real zstd")
     assertEquals(
-        DeltaPageCodec.CODEC_NONE,
+        DeltaPageCodec.CODEC_ZSTD,
         // The configured default, not a literal: this is the codec every embedded store gets.
         writeOneFrame(StorageEngineConfig(ioShim = InMemoryPlatformIoShim()).compressionCodec).first,
-        "a target without zstd must not tag pages ZSTD, even with the default ZSTD codec configured",
+        "the default ZSTD codec must write ZSTD pages",
     )
 }

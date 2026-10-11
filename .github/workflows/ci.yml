@@ -336,7 +336,7 @@ jobs:
         run: |
           ./gradlew :kdb-integration:test --tests "dev.kdb.integration.ExportGoldenTest" \
                     :kdb-storage-wal:jvmTest :kdb-storage-sstable:jvmTest \
-                    :kdb-storage-delta:jvmTest --rerun-tasks --no-daemon
+                    :kdb-storage-delta:jvmTest :kdb-compression:jvmTest --rerun-tasks --no-daemon
       # This both regenerates the Go-side fixtures and verifies each side against the other's,
       # so a genuine incompatibility fails here as a test failure rather than only as drift.
       - name: Regenerate the Go-side fixtures and run the conformance suite

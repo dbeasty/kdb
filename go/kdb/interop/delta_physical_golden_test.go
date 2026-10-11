@@ -337,9 +337,10 @@ func secondFixtureCommit(t *testing.T) document.Commit {
 	return c
 }
 
-// U5 (docs/kdb-open-issues-plan.md): Kotlin/JS and Native have no zstd, so their delta segments
-// are all CODEC_NONE pages. Before U5 they tagged a length-prefixed copy of the payload as ZSTD,
-// which this side could not decode. Kotlin's segment comes from its real segment writer; with no
+// U5 (docs/kdb-open-issues-plan.md): from U5 until roadmap R1 gave them a pure-Kotlin zstd,
+// Kotlin/JS and Native wrote all-CODEC_NONE delta segments (as a writer configured for NONE still
+// does), so logs they wrote then hold them. Before U5 they tagged a length-prefixed copy of the
+// payload as ZSTD, which this side could not decode. Kotlin's segment comes from its real segment writer; with no
 // compressor involved it must match Go's own frames byte for byte, and scan to both commits.
 func TestKotlinDeltaCodecNoneSegmentReads(t *testing.T) {
 	golden := readKotlinGolden(t, "delta_segment_none.hex")
@@ -378,5 +379,55 @@ func TestKotlinDeltaCodecNoneSegmentReads(t *testing.T) {
 			t.Fatalf("frame %d at offset %d has codec id %d, want 0 (none)", i, off, golden[off+5])
 		}
 		off += delta.PageFrameHeaderSize + be32(golden, off+8)
+	}
+}
+
+// zstdDeltaSegment is fixtureCommit then secondFixtureCommit, each framed ZSTD by Go's page codec.
+func zstdDeltaSegment(t *testing.T) []byte {
+	t.Helper()
+	var seg []byte
+	for _, c := range []document.Commit{fixtureCommit(t), secondFixtureCommit(t)} {
+		p, err := c.ToPayloadBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := delta.PageCodec{}.Frame(p, storage.CompressionZSTD)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seg = append(seg, f...)
+	}
+	return seg
+}
+
+// R1 (docs/kdb-open-issues-plan.md): a whole ZSTD delta segment, which kdb-storage-delta's
+// DeltaZstdGoldenReadTest replays on every Kotlin target - JS and Native included.
+func TestExportPhysicalGoldenDeltaZstd(t *testing.T) {
+	writePhysicalGolden(t, "delta_segment_zstd.hex", zstdDeltaSegment(t))
+}
+
+// R1 in this direction: a ZSTD segment from the JVM's real segment writer scans to both commits.
+// (What Kotlin/JS and Native write is the same frame layout around pure-Kotlin zstd bodies, which
+// TestKotlinZstdCorpusCrossDecodes covers byte for byte.)
+func TestKotlinDeltaZstdSegmentReads(t *testing.T) {
+	golden := readKotlinGolden(t, "delta_segment_zstd.hex")
+	if golden == nil {
+		return
+	}
+	commits := []document.Commit{fixtureCommit(t), secondFixtureCommit(t)}
+	scanned, err := delta.ScanSegmentBytes(golden)
+	if err != nil {
+		t.Fatalf("scanning Kotlin's ZSTD segment: %v", err)
+	}
+	if len(scanned) != len(commits) {
+		t.Fatalf("scanned %d commits, want %d", len(scanned), len(commits))
+	}
+	for i, s := range scanned {
+		if s.CommitHash != commits[i].Hash {
+			t.Fatalf("commit %d hash %s, want %s", i, s.CommitHash.Hex(), commits[i].Hash.Hex())
+		}
+		if golden[s.FrameOffset+5] != 1 {
+			t.Fatalf("frame %d has codec id %d, want 1 (zstd)", i, golden[s.FrameOffset+5])
+		}
 	}
 }

@@ -55,10 +55,11 @@ public class DefaultIceBundleWriter : IceBundleWriter {
                 indexSnapshotsHex = null,
             )
         val body = json.encodeToString(manifest).encodeToByteArray()
-        // Without a real zstd (Kotlin/JS and Native) the bundle is stored as plain JSON. The
-        // bundle has no codec byte, but readBundle already falls back to the raw bytes when
-        // they do not decompress, on every platform.
-        val compressed = if (ZstdCompression.isAvailable) ZstdCompression.compress(body) else body
+        // On a platform that cannot write zstd the bundle is stored as plain JSON. The bundle has
+        // no codec byte, but readBundle falls back to the raw bytes when they do not decompress,
+        // on every platform - which is also how bundles JS and Native wrote before roadmap R1
+        // (plain JSON) still read.
+        val compressed = if (ZstdCompression.canCompress) ZstdCompression.compress(body) else body
         val contentHash = KdbHash.fromBytes(kdbSha256(compressed))
         val key = "$namespaceId/${commit.toHex().take(16)}.kdbice"
         val location = backend.put(key, compressed)
