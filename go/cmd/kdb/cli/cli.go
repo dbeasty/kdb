@@ -54,7 +54,6 @@ Commands:
   status <namespace>
   branch list <namespace>
   branch create <namespace> <name> [from-hash]
-  branch checkout <namespace> <name>
   tag list <namespace>
   tag create <namespace> <name> [rev] [message]
   tag delete <namespace> <name>
@@ -239,9 +238,17 @@ func parseTagCommand(rest []string) (Command, error) {
 	}
 }
 
+// errBranchCheckoutUnsupported explains why `kdb branch checkout` is refused rather than accepted
+// and ignored.
+var errBranchCheckoutUnsupported = fmt.Errorf("kdb branch checkout is not supported: the CLI " +
+	"keeps no current branch between invocations, so there is nothing to check out. Commands " +
+	"write to a namespace's main; read another branch by naming it as a revision, e.g. " +
+	"`kdb log <namespace> --limit 5` is main and `kdb show <namespace> branch:<name>` is the " +
+	"branch's head")
+
 func parseBranchCommand(rest []string) (Command, error) {
 	if len(rest) == 0 {
-		return nil, fmt.Errorf("usage: kdb branch list|create|checkout ...")
+		return nil, fmt.Errorf("usage: kdb branch list|create ...")
 	}
 	switch rest[0] {
 	case "list":
@@ -259,10 +266,10 @@ func parseBranchCommand(rest []string) (Command, error) {
 		}
 		return cmd, nil
 	case "checkout":
-		if len(rest) < 3 {
-			return nil, fmt.Errorf("usage: kdb branch checkout <namespace> <name>")
-		}
-		return BranchCheckoutCmd{Namespace: rest[1], Name: rest[2]}, nil
+		// Refused before anything is opened. The CLI keeps no current branch between
+		// invocations, so a checkout has nothing to change: the old command set the branch to the
+		// head it already had and reported success.
+		return nil, errBranchCheckoutUnsupported
 	default:
 		return nil, fmt.Errorf("unknown branch command: %s", rest[0])
 	}
