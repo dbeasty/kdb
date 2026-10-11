@@ -8,6 +8,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/config"
+	"github.com/limidus/kdb/go/kdb/embed"
 )
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, _ auth.Principal) {
@@ -94,6 +95,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ auth.Pri
 		Draining    bool           `json:"draining"`
 		ReadOnly    bool           `json:"readOnly"`
 		ExpiryState string         `json:"documentExpiry"`
+		// Recovery is what open found in the namespace's delta log (embed.RecoveryReport).
+		Recovery *embed.RecoveryReport `json:"recovery,omitempty"`
 	}
 	out := body{
 		Namespace:   ns,
@@ -101,6 +104,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request, _ auth.Pri
 		Branches:    len(d.ListBranches()),
 		Draining:    rt.IsDraining(),
 		ExpiryState: rt.ExpirySummary(),
+	}
+	if rt.Runtime != nil && rt.Runtime.DataRoot != "" {
+		rep := rt.Runtime.Recovery()
+		out.Recovery = &rep
 	}
 	if rt := s.opts.Runtime.Runtime; rt != nil {
 		out.ReadOnly = rt.ReadOnly

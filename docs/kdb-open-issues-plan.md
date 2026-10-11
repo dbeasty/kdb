@@ -162,7 +162,8 @@ readable data but still can't read JVM/Go-written compressed data. Say so in the
 
 ### U6. Issue #43 — acknowledged write unreadable after `kill -9` — L, in four steps
 
-**Status: U6a done** (#112, which also added the multi-node suite); **U6b–U6d open.** U6c's two silent recovery paths are still open.
+**Status: U6a done** (#112, which also added the multi-node suite); **U6c done** (#121; see the
+progress log, which also records a third silent path it found); **U6b and U6d in progress.**
 
 The durability contract is the most important open item. It is sequenced so each step is its own PR
 and each makes the next one possible. **Do not relax or retry the test** at any step.
@@ -626,6 +627,51 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   `Disconnect` closed `stopIncoming` twice (panic), and `readLoop` read `s.stopIncoming` without the
   lock; both fixed. Still open, same family: `Coordinator.updateSubscriber` drops `SubscriberState`
   updates on a full 16-slot channel, and a closed `clientLink` is never removed from its hub.
+
+- **2026-10-11 — U6c: recovery's two silent paths (branch `fix/recovery-silent-skips`).**
+  1. `delta.DefaultReader.ListSegments` (`storage/delta/writer.go`) `continue`d past any segment
+     `scanSegmentRef` could not scan. That happens only for an I/O error or a frame that passes its
+     body CRC and still will not decode (a header field such as the codec byte at offset 5 is
+     outside the CRC). A torn write never gets there: a short frame or a CRC mismatch stops the
+     scan cleanly and still lists. It is now a typed `*delta.UnreadableSegmentError` (namespace,
+     sequence, file, cause), newest segment or not. The one tolerated case is a segment that is no
+     longer listed when re-checked, which is truncation deleting it between the listing and the
+     read. Callers: replay, checkpoint matching, the ops loader, the cold loader, history, truncate
+     and restore-archive all propagate it or already treated a listing error as "don't trust".
+     `kdb-inspect verify` and backup read segments themselves and are unchanged.
+     **Before**, codec byte damaged in the first frame of the newest non-empty segment: open
+     succeeded with main 3 commits behind the last acknowledged one, with or without a checkpoint.
+     In a non-newest segment it failed with the misleading "parent commits never found in the log".
+     **After**, both fail with `UnreadableSegmentError` naming the segment. A torn newest segment
+     still opens at its last intact commit.
+  2. Replay (`embed/delta_replay.go` `applyReplayedCommit`) stores a logged commit that neither
+     extends main's head nor supersedes it, and does not apply it. Which commits are applied is
+     unchanged. Open now collects them and, after the whole log is read, splits them by whether
+     main reaches them. Those main reaches are a peer's commits a logged merge adopted, which is
+     expected, so they are counted but not logged. Those it does not reach get one `slog.Warn` each
+     (`namespace`, `commit`, `head` it failed to extend, `mainHead`), capped at 20 lines plus a
+     count. A single-writer log has neither. The counts are in `embed.RecoveryReport`
+     (`rt.Recovery()`: `replayedInFull`, `commitsNotApplied`, `commitsOffMain`) and in
+     `GET /v1/ns/{ns}/status` as `recovery`, so a crash test's service log and status both show it.
+  **Tests** (each confirmed failing with its fix reverted): `storage/delta/unreadable_segment_test.go`,
+  `embed/unreadable_segment_test.go` (file-backed: non-newest and newest, with and without a
+  checkpoint, plus a torn newest segment), `server/replay_unapplied_test.go` (an unmerged peer commit
+  counted and logged at WARN, a merged one counted and not logged, a single-writer log reporting
+  zero), and `control/recovery_status_test.go`.
+  **Found, not fixed (same family):** (a) replay's torn-tail rule accepts a `CorruptFrameError`
+  anywhere in the newest segment, even with intact frames after it. A CRC-valid frame that will not
+  decode in the middle of the newest segment therefore truncates the rest of that segment with
+  only a `log.Printf`. Per the #81 rule, a torn tail can only be at the end. (b) **silent loss, worth its own
+  unit:** `scanSegmentRef` ends a segment at a garbled frame header or a CRC mismatch, in any
+  segment, and records only the bytes before it as the segment's size. Replay therefore never sees
+  damage in a non-newest segment, so its "corrupt and not the most recent segment" refusal cannot
+  fire for `DefaultReader`. The damage is caught only indirectly: by checkpoint matching, or by
+  later commits whose parents are missing. A probe showed the silent case: 6 commits in one run,
+  then a run that wrote nothing (an empty newer segment), the 4th frame's magic flipped, and the
+  checkpoint removed. Open succeeded at commit 3 of 6 with no error and no log line. Simply refusing
+  is wrong, because a torn tail from an earlier killed run legitimately ends a segment that is no
+  longer the newest. The correct test is "intact frames after the stop" (the #81 rule;
+  `SkimSegment` / `DamageTolerantReader` can already read past damage).
 
 ### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (#116, branch `feat/zstd-js-native`)
 
