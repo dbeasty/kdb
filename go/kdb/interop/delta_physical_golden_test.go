@@ -307,3 +307,76 @@ func fixtureDeltaSegment(t *testing.T) []byte {
 func be32(b []byte, off int) int {
 	return int(b[off])<<24 | int(b[off+1])<<16 | int(b[off+2])<<8 | int(b[off+3])
 }
+
+// secondFixtureCommit is a child of fixtureCommit - the second commit in Kotlin's CODEC_NONE
+// golden segment (DeltaPhysicalGoldenTest.secondFixtureCommit).
+func secondFixtureCommit(t *testing.T) document.Commit {
+	t.Helper()
+	txID, err := codec.UUIDFromString("11111111-2222-3333-4444-555555555556")
+	if err != nil {
+		t.Fatal(err)
+	}
+	author, err := codec.UUIDFromString("66666666-7777-8888-9999-aaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := document.BuildCommit(
+		[]codec.Hash{fixtureCommit(t).Hash},
+		fixtureNamespaceID,
+		txID,
+		codec.TimestampFromEpochMicros(fixtureEpochMicros+1),
+		author,
+		nil,
+		fixtureHash(t, 4),
+		nil,
+		"second fixture commit",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// U5 (docs/kdb-open-issues-plan.md): Kotlin/JS and Native have no zstd, so their delta segments
+// are all CODEC_NONE pages. Before U5 they tagged a length-prefixed copy of the payload as ZSTD,
+// which this side could not decode. Kotlin's segment comes from its real segment writer; with no
+// compressor involved it must match Go's own frames byte for byte, and scan to both commits.
+func TestKotlinDeltaCodecNoneSegmentReads(t *testing.T) {
+	golden := readKotlinGolden(t, "delta_segment_none.hex")
+	if golden == nil {
+		return
+	}
+	commits := []document.Commit{fixtureCommit(t), secondFixtureCommit(t)}
+	var want []byte
+	for _, c := range commits {
+		p, err := c.ToPayloadBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := delta.PageCodec{}.Frame(p, storage.CompressionNone)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, f...)
+	}
+	if !bytes.Equal(golden, want) {
+		t.Fatalf("Kotlin's CODEC_NONE segment differs from Go's frames\nkotlin %x\ngo     %x", golden, want)
+	}
+	scanned, err := delta.ScanSegmentBytes(golden)
+	if err != nil {
+		t.Fatalf("scanning Kotlin's CODEC_NONE segment: %v", err)
+	}
+	if len(scanned) != len(commits) {
+		t.Fatalf("scanned %d commits, want %d", len(scanned), len(commits))
+	}
+	off := 0
+	for i, s := range scanned {
+		if s.CommitHash != commits[i].Hash {
+			t.Fatalf("commit %d hash %s, want %s", i, s.CommitHash.Hex(), commits[i].Hash.Hex())
+		}
+		if golden[off+5] != 0 {
+			t.Fatalf("frame %d at offset %d has codec id %d, want 0 (none)", i, off, golden[off+5])
+		}
+		off += delta.PageFrameHeaderSize + be32(golden, off+8)
+	}
+}

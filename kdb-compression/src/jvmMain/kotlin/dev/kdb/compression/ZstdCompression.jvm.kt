@@ -3,6 +3,8 @@ package dev.kdb.compression
 import com.github.luben.zstd.Zstd
 
 public actual object ZstdCompression {
+    public actual val isAvailable: Boolean = true
+
     public actual fun compress(input: ByteArray, level: Int): ByteArray = Zstd.compress(input, level)
 
     public actual fun decompress(input: ByteArray, maxOutputSize: Int): ByteArray {

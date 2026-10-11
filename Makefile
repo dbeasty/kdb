@@ -72,6 +72,9 @@ test-physical-golden:
 	@git diff --exit-code -- go/testdata/golden \
 	  || (echo "\nERROR: golden fixtures changed - a physical format changed on one side." \
 	          "Review the diff above and commit it only if the change is deliberate." >&2; exit 1)
+	@test -z "$$(git ls-files --others --exclude-standard -- go/testdata/golden)" \
+	  || (git ls-files --others --exclude-standard -- go/testdata/golden; \
+	      echo "\nERROR: the exporters wrote golden fixtures that are not committed (listed above)." >&2; exit 1)
 
 # Always -benchmem: the engine's single largest allocation (a throwaway zstd
 # encoder per commit, ~21MB) survived for as long as it did because no benchmark
@@ -120,7 +123,7 @@ release-go: release-bundle release-binaries
 	$(MAKE) release-checksums
 
 # The embeddable Go source bundle (docs/kdb-release-plan.md §2): the transitive dependency
-# closure of kdb/embed, kdb/driver, kdb/sql, kdb/query/hybrid and kdb/index
+# closure of kdb/embed, kdb/driver, kdb/sql, kdb/query/hybrid, kdb/index and kdb/server
 # (go/embedbundle/entrypoints.txt), zipped deterministically so the archive itself reproduces
 # byte-for-byte (see release-verify below).
 release-bundle:

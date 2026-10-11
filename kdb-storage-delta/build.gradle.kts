@@ -7,6 +7,8 @@ kotlin {
     sourceSets {
         val nativeMain by creating { dependsOn(commonMain.get()) }
         linuxX64Main.get().dependsOn(nativeMain); macosArm64Main.get().dependsOn(nativeMain)
+        val nativeTest by creating { dependsOn(commonTest.get()) }
+        linuxX64Test.get().dependsOn(nativeTest); macosArm64Test.get().dependsOn(nativeTest)
         commonMain.dependencies {
             implementation(project(":kdb-storage-io"))
             implementation(project(":kdb-storage"))

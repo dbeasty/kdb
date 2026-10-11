@@ -1,6 +1,7 @@
 package dev.kdb.storage.sstable
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.storage.CompressionCodec
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.mem.InMemoryPlatformIoShim
 import java.io.File
@@ -35,6 +36,27 @@ class SsTablePhysicalGoldenTest {
             val (_, _, segment) = buildFixtureSegment()
             writeHex("sstable_segment.hex", segment)
             writeHex("sstable_footer.hex", footerOf(segment))
+            // The shape Kotlin/JS and Native write (no zstd there, so every block is CODEC_NONE -
+            // docs/kdb-open-issues-plan.md U5). Go must read it. Unlike the zstd segment above,
+            // nothing in it depends on a compressor, so it is byte-stable on every platform.
+            writeHex("sstable_segment_none.hex", buildFixtureSegment(CompressionCodec.NONE).third)
+        }
+
+    // U5: a CODEC_NONE table holds the same index and fileHash as the zstd one - the codec
+    // changes only block bodies, never the content address - and every block says NONE.
+    @Test
+    fun codecNoneSegmentHasTheSameIdentity() =
+        runTest {
+            val (shim, handle, none) = buildFixtureSegment(CompressionCodec.NONE)
+            val zstd = buildFixtureSegment().third
+            assertEquals(footerIndexLines(footerOf(zstd)).map { it.keyAndFlag() }, footerIndexLines(footerOf(none)).map { it.keyAndFlag() })
+            assertContentEquals(fileHashOf(footerOf(zstd)), fileHashOf(footerOf(none)))
+            for (line in footerIndexLines(footerOf(none))) {
+                val parts = line.split(':')
+                if (parts.size > 3) continue
+                assertEquals(SsTableCodec.BLOCK_CODEC_NONE, none[parts[1].toInt() + 1], "block at ${parts[1]} must be CODEC_NONE")
+            }
+            assertEquals("alpha-rewritten", DefaultSsTableReader(shim, handle).get(hash(1))?.decodeToString())
         }
 
     // S3: the same table must produce the same footer every time. Go's index came out of a map,
@@ -152,9 +174,11 @@ class SsTablePhysicalGoldenTest {
      * The put/delete sequence both runtimes apply, including a key written twice - the case where
      * the two writers disagreed.
      */
-    private suspend fun buildFixtureSegment(): Triple<PlatformIoShim, SsTableHandle, ByteArray> {
+    private suspend fun buildFixtureSegment(
+        codec: CompressionCodec = CompressionCodec.ZSTD,
+    ): Triple<PlatformIoShim, SsTableHandle, ByteArray> {
         val shim = InMemoryPlatformIoShim()
-        val w = DefaultSsTableWriter(shim, NAMESPACE_ID, 0)
+        val w = DefaultSsTableWriter(shim, NAMESPACE_ID, 0, codec)
         w.put(hash(1), "alpha".encodeToByteArray())
         w.put(hash(2), PAYLOAD)
         w.delete(hash(3))
