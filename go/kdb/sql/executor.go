@@ -331,18 +331,17 @@ func applyLimitOffset[T any](items []T, limit, offset int) []T {
 // score, else the first top-level AND conjunct the provider can serve (MATCH, =, range,
 // BETWEEN, IN), else a full scan. The label is reported as QueryResult.Plan.
 func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEnv, ctx QueryContext, stopAt int) ([]codec.UUID, string, error) {
-	max := e.maxResultRows(ctx)
 	if len(orderBy) > 0 {
 		if lead := env.resolveAlias(orderBy[0].Expr); isSearchExpr(lead) {
 			if hits := env.scores[searchKey(lead)]; hits != nil {
-				return rankedIDs(hits, max), hits.label, nil
+				return rankedIDs(hits), hits.label, nil
 			}
 		}
 	}
 	for _, conj := range conjuncts(where) {
 		if isSearchExpr(conj) {
 			if hits := env.scores[searchKey(conj)]; hits != nil {
-				return rankedIDs(hits, max), hits.label, nil
+				return rankedIDs(hits), hits.label, nil
 			}
 			continue
 		}
@@ -363,7 +362,11 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 	return ids, "fullscan", err
 }
 
-func rankedIDs(hits *searchHits, max int) []codec.UUID {
+// rankedIDs lists a ranking's documents best-first. It is not cut: the residual WHERE still runs
+// over these, so cutting here (at MaxRows, as this once did) dropped every match ranked below the
+// cut. How many candidates a ranking holds is the search's depth (searchDepth), which the spec
+// bounds when there is a LIMIT; the result bound is enforced on the rows actually returned.
+func rankedIDs(hits *searchHits) []codec.UUID {
 	ids := make([]codec.UUID, 0, len(hits.ranked))
 	seen := map[codec.UUID]bool{}
 	for _, r := range hits.ranked {
@@ -372,9 +375,6 @@ func rankedIDs(hits *searchHits, max int) []codec.UUID {
 		}
 		seen[r.DocID] = true
 		ids = append(ids, r.DocID)
-		if len(ids) >= max {
-			break
-		}
 	}
 	return ids
 }
