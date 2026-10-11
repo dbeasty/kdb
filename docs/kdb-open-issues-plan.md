@@ -35,6 +35,8 @@ its own, and leaves `main` green. Execute them in order unless a unit says it is
 
 ### U1. Make `./gradlew build` green and gate CI on it — S
 
+**Status: done** (#106).
+
 **Problem.** `:kdb-storage-io:compileCommonMainKotlinMetadata` fails on clean `main`:
 `Class 'JvmFileBackedPlatformIoShim' is not abstract and does not implement abstract member
 'appendToSegment'` (and the Native/Browser equivalents), at
@@ -58,6 +60,8 @@ never compiles common metadata, which is how the break went unnoticed.
 `kdb-known-failing-baseline` (it will be wrong once this lands).
 
 ### U2. Ship `kdb/server` in the embeddable Go bundle — S/M
+
+**Status: done** (#108; #26 superseded).
 
 **Problem.** The only known issue in `docs/releases/v0.6.2.md:95-98`: a downstream project (Zolik)
 that imports `kdb/server` gets a bundle without it. PR #26 has the change but conflicts, and its
@@ -94,6 +98,8 @@ change with every package added.
 
 ### U3. Branch and worktree cleanup — S (needs your go-ahead; deletes are not reversible on origin)
 
+**Status: local half done 2026-10-11** (97 merged local branches deleted, stale worktrees pruned; `kdb-deleted-local-branches-2026-10-11.bundle` keeps the two non-ancestor ones). **Origin half pending:** 44 merged or superseded branches on GitHub, plus closing #26, are left for the owner to run (automated deletion was refused); every tip is saved in `kdb-deleted-branches-2026-10-11.bundle` beside the checkout.
+
 Verified with `git cherry`. None of these hold content that isn't on `main`:
 
 | Branch | Why it's safe |
@@ -113,6 +119,8 @@ against `main` first. Whatever isn't on `main` becomes its own PR or is discarde
 
 ### U4. Correct stale docs and notes — S
 
+**Status: done** (this unit's PR): finish-up-plan entries annotated, memory notes corrected, unit statuses added here.
+
 - `docs/kdb-finish-up-plan.md:378,386,388,596,597` still list the explicit compression flag and the
   cross-language SSTable fixture test as open. Both landed (see [Already resolved](#already-resolved)).
 - The memory notes on flaky Kotlin tests, the Gradle baseline and preallocation (KDB **does**
@@ -125,6 +133,8 @@ Can ride along with U1 or U3.
 ## Phase B — Correctness
 
 ### U5. JS/Native write zstd-tagged blocks that are not zstd — S/M, format correctness
+
+**Status: done** (#109). Real zstd on those targets is R1, done in #116.
 
 **Problem.** On JS and Native, `ZstdCompression.compress` is a 4-byte length prefix plus the raw bytes
 (`kdb-compression/src/jsMain/.../ZstdCompression.js.kt:3-31`,
@@ -151,6 +161,8 @@ readers handle `CODEC_NONE` (`go/kdb/storage/sstable/codec.go:41,90`, `SsTableCo
 readable data but still can't read JVM/Go-written compressed data. Say so in the PR.
 
 ### U6. Issue #43 — acknowledged write unreadable after `kill -9` — L, in four steps
+
+**Status: U6a done** (#112, which also added the multi-node suite); **U6b–U6d open.** U6c's two silent recovery paths are still open.
 
 The durability contract is the most important open item. It is sequenced so each step is its own PR
 and each makes the next one possible. **Do not relax or retry the test** at any step.
@@ -218,6 +230,8 @@ the closing comment.
 
 ### U7. Kotlin transport shutdown leaks exceptions into later tests — M
 
+**Status: done** (#110).
+
 **Problem.** None of the four "flaky Kotlin tests" failed in the last 45 failed CI runs. Two were
 already fixed (`4fa8665`, `52f99fa`). The other two (`IndexDurabilityIntegrationTest`,
 `MultiClientSqlIntegrationTest`) fail with `UncaughtExceptionsBeforeTest`: another test in the same
@@ -247,6 +261,8 @@ the memory note `kdb-ci-is-intermittently-red-on-main` has the init-script recip
 
 ### U8. Go `json` getters panic instead of returning their error — S
 
+**Status: done** (#107).
+
 `go/kdb/json/api.go:245-289`: `navigateGet`, behind `Get`/`GetAll`/`Contains`, panics with
 `JsonPathError` on a type mismatch, though all three return `error`. There are no production callers
 today, and the wire path recovers anyway (`wire_listen.go:304`), which is why this is small. But it's
@@ -260,6 +276,8 @@ These need a decision from you. Each has a recommendation.
 
 ### U9. Remove dead stubs — S each
 
+**Status: done** (#118): both stubs deleted; neither was ever released or imported.
+
 - **Kotlin `kdb-storage-compaction`.** `plan()` returns `emptyList()` and every runner throws
   `CompactionNotImplementedException` (`Compaction.kt:31,45-76`). No source anywhere references it;
   `kdb-storage-manager/build.gradle.kts:10` declares the dependency and never uses it. (Not to be
@@ -272,6 +290,8 @@ These need a decision from you. Each has a recommendation.
 
 ### U10. `kdb branch checkout` does nothing — S
 
+**Status: done** (this unit's PR): refused at parse time with an explanation; the dead command is removed.
+
 `go/cmd/kdb/cli/commands.go:578-592` calls `SetHead(name, b.HeadHash)`, which sets a branch to its own
 head. The CLI has no persisted "current branch". **Recommend** making it fail clearly ("checkout is not
 supported: the CLI has no current branch; pass `--branch` per command") rather than inventing a
@@ -279,11 +299,15 @@ supported: the CLI has no current branch; pass `--branch` per command") rather t
 
 ### U11. Kotlin WAL ignores the configured segment size — S
 
+**Status: done** (branch `fix/kotlin-wal-segment-size`).
+
 `kdb-storage-engine/.../ServerStorageEngine.kt:279` builds `DefaultWriteAheadLogFactory()` with no
 arguments, so the rotation cap is always the 64 MiB default. Thread `walMaxSegmentBytes` from the
 engine config, with a test that a small cap rotates. (Rotation itself is done; see below.)
 
 ### U12. In-memory stream transport drops frames — S, low priority
+
+**Status: done** (#120): both halves fixed, not just `emit`; see the progress log.
 
 `go/kdb/stream/transport.go:129-139` (`deliver`, `memory://` hub only) and `subscriber.go:335-340`
 (`emit`, including the desync `EventError` at `:259`) drop on a full buffer. `NewSubscriber` has no
@@ -534,6 +558,75 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   peer endpoint (`syncnode.Handler`) is not drained before storage closes; Kotlin peer sync was not
   checked for the same checkpoint behaviour.
 
+### 2026-10-11 — new item, found by multi-node e2e testing: mesh merge storm (branch `fix/mesh-merge-convergence`)
+
+**Symptom.** In a five-node `kdb-service` full mesh with concurrent writes and kill -9/restart (`test_cluster.py::test_rolling_kill9_soak`), the mesh failed to converge 2 of 2 times under load avg 20-45. For 150s+ after writes stopped, every head differed and kept changing, with every sync succeeding and the same 40 documents on every node. One node held 10,677 empty `kdb:merge/1` commits.
+
+**Cause.** Merges were deterministic per pair but not confluent. Fixed with canonical joins of same-content heads; see "Merge convergence in a mesh" in `docs/kdb-distributed-implementation-plan.md`.
+
+**Tests.** Failing tests first, each confirmed against the reverted fix:
+- `server/mesh_convergence_test.go`: the ring, the property and the restart tests
+- `syncnode/mesh_test.go`
+- `peersync/join_test.go`
+- `integration/join_interop_test.go` (Kotlin)
+
+**Evidence.** The e2e soak is 1 of 2 non-converging (XFAIL after 174s) with `origin/main` binaries, and 5 of 5 converged (~25s per run, about 2-3s of it after writes stop) with this branch, both under load avg 18-28.
+
+- **2026-10-11 — U10, U4 and the local half of U3.** U10: `kdb branch checkout` is refused while
+  parsing (exit 2, nothing opened) with an explanation, instead of setting a branch to its own head
+  and printing "checked out"; `TestBranchCheckoutIsRefused` fails on main. U4: the finish-up plan's
+  stale "not done" entries for the explicit compression flag (`456c673`) and the cross-language
+  SSTable fixture (`adfb98b`) carry dated notes, and every unit above now opens with its status.
+  U3 local: 97 merged local branches deleted and finished worktrees removed. The origin half (44
+  merged or superseded branches, and closing #26) was refused to automation and is left to the
+  owner; every tip is saved in `kdb-deleted-branches-2026-10-11.bundle` beside the checkout.
+- **2026-10-11 — U11.** `StorageEngineConfig.walMaxSegmentBytes` (kdb-storage) is new: the
+  Kotlin twin of Go's `storage.StorageEngineConfig.WalMaxSegmentBytes`, same name and meaning,
+  default 64 MiB. It is validated (zero or negative throws) where Go treats zero as "use the
+  default", since the Kotlin field has a real default. `DefaultWriteAheadLogFactory` now resolves
+  the cap as Go's `wal.DefaultFactory` does: an explicit factory override
+  (`walMaxSegmentBytesOverride`), otherwise the config's. The engine's no-argument factory
+  therefore picks up the config, which it previously never consulted. Not added: a knob on
+  `openFileRuntime` (kdb-jdbc) or any runtime setting descriptor. Go has neither for the WAL cap
+  (only `DeltaMaxSegmentBytes` is exposed through `embed`), and no Kotlin caller exposes any other
+  `StorageEngineConfig` field either. Tests: `WalSegmentSizeTest` (kdb-storage-engine) opens a
+  SERVER engine with a 512-byte cap, writes ~5 KiB, and asserts several WAL segments, that a
+  reopened engine recovers every blob, and that the replay is in write order. It fails on `main`
+  (one segment) and was confirmed failing against the reverted resolution. It also covers the
+  64 MiB default and rejecting 0/-1. `WalTest` adds the factory's override-vs-config order.
+- **2026-10-11, U9** (branch `chore/remove-dead-stubs`): deleted the Kotlin stub module
+  `kdb-storage-compaction` (its `settings.gradle.kts` include and the unused dependency in
+  `kdb-storage-manager/build.gradle.kts` were the only references) and the Go stub package
+  `go/kdb/tier` (no importer, test or otherwise; it had no tests). No CI workflow, Makefile target or
+  release script named either. The module never produced a release asset (checked `v0.4.0` and
+  `v0.6.2`: neither lists a `kdb-storage-compaction` jar), so the 50-jar count is unchanged. Docs
+  that listed them as implemented now say 10f is not implemented (`kdb-spec.md`,
+  `kdb-lld-storage.md`, `kdb-spec-layer6-execution-plan.md`); the 10f spec keeps its design with a
+  removal note; `kdb-release-plan.md` §2.2 drops `kdb/tier` from the excluded list and the module's
+  package count goes 59 to 58. Historical entries in `kdb-finish-up-plan.md` were left as written.
+- **2026-10-11 — U12: the in-memory stream transport and the Go subscriber stop dropping.**
+  Done although the plan said to wait for a real caller, and `deliver` was fixed too, not left.
+  Frames: `clientLink.deliver` (`memory://` hub) now blocks until the client reads or closes,
+  instead of dropping once its 64-slot buffer is full. That is backpressure on `ServerSend`, which
+  is how a push transport with no DAG to catch up from keeps the documented contract ("No dropped
+  frames. A slow subscriber is caught up when it drains"); disconnecting a slow client would break
+  the second half of it. Close-safety follows 1-G12/1-G13: `Close` sets `closed` and closes a `done`
+  channel under the mutex, releases it, waits for in-flight delivers (which `done` has woken), and
+  only then closes `incoming`. The mutex is never held while a deliver waits. Events: `emit` keeps
+  the last slot of the 32-slot buffer for one terminal `EventDisconnected` per subscription. Any
+  other event that finds the rest full closes the subscription and takes that slot as
+  `EventDisconnected{Cause: *EventOverflowError}`, which wraps the event that did not fit;
+  `errors.As` finds a `*DesyncError` through it. So the reader never blocks, a stalled consumer
+  can't stall the hub for long, and a desync is never lost. `Connect` refuses while the buffer is
+  completely full. Tests (`go/kdb/stream/backpressure_test.go`), each failing on main and again
+  against the reverted fix: a 500-frame burst arrives whole and in order (main: 64 of 500); sends
+  past a full buffer wait, and `Close` during them neither deadlocks nor panics under `-race`
+  (main: the sends returned at once); a desync after 32 or 40 undrained notices is reported or ends
+  the subscription with a terminal event (main: silently gone). **Found along the way:** a second
+  `Disconnect` closed `stopIncoming` twice (panic), and `readLoop` read `s.stopIncoming` without the
+  lock; both fixed. Still open, same family: `Coordinator.updateSubscriber` drops `SubscriberState`
+  updates on a full 16-slot channel, and a closed `clientLink` is never removed from its hub.
+
 ### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (#116, branch `feat/zstd-js-native`)
 
 - **Choice.** A pure-Kotlin codec in `kdb-compression`'s commonMain, used by both JS and Native;
@@ -584,3 +677,4 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
     step against an RFC model.
   - Not done: lazy matching (the rest of the large-input gap) and repeat-mode tables; and no
     throughput numbers - the machine's load average was 50-140 for most of the work.
+

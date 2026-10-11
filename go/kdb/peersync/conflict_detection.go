@@ -228,10 +228,10 @@ func resolveDivergenceLocked(
 // the two heads it joins, not something a particular node did, so no node's identity goes in it
 // - otherwise two nodes merging the same pair would disagree about the author and so about the
 // hash.
-var MergeAuthorNodeID = codec.DerivedUUID("kdb:merge-author/1")
+var MergeAuthorNodeID = dag.MergeAuthorNodeID
 
 // mergeMessage is every peer-sync merge commit's message.
-const mergeMessage = "kdb:merge/1"
+const mergeMessage = dag.MergeMessage
 
 // provisionalMarker introduces, in a merge's message, the documents a resolver authority settled
 // provisionally - by last write, pending its decision. The list is part of the merge's content

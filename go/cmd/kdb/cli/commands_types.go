@@ -71,24 +71,19 @@ type BranchCreateCmd struct {
 	Name      string
 	FromHash  string
 }
-type BranchCheckoutCmd struct {
-	Namespace string
-	Name      string
-}
 
-func (InitCmd) command()           {}
-func (PutCmd) command()            {}
-func (GetCmd) command()            {}
-func (QueryCmd) command()          {}
-func (LogCmd) command()            {}
-func (ShowCmd) command()           {}
-func (DiffCmd) command()           {}
-func (RevertCmd) command()         {}
-func (TagListCmd) command()        {}
-func (TagCreateCmd) command()      {}
-func (TagDeleteCmd) command()      {}
-func (StatusCmd) command()         {}
-func (UnlockCmd) command()         {}
-func (BranchListCmd) command()     {}
-func (BranchCreateCmd) command()   {}
-func (BranchCheckoutCmd) command() {}
+func (InitCmd) command()         {}
+func (PutCmd) command()          {}
+func (GetCmd) command()          {}
+func (QueryCmd) command()        {}
+func (LogCmd) command()          {}
+func (ShowCmd) command()         {}
+func (DiffCmd) command()         {}
+func (RevertCmd) command()       {}
+func (TagListCmd) command()      {}
+func (TagCreateCmd) command()    {}
+func (TagDeleteCmd) command()    {}
+func (StatusCmd) command()       {}
+func (UnlockCmd) command()       {}
+func (BranchListCmd) command()   {}
+func (BranchCreateCmd) command() {}

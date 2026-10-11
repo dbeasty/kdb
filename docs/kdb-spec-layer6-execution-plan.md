@@ -104,7 +104,7 @@ Dependency edges:
 ```
 :kdb-namespace-policy  → kdb-codec, kdb-error, kdb-schema, kdb-storage, kdb-transaction
 :kdb-hybrid-query      → kdb-sql, kdb-namespace-policy, kdb-transaction, kdb-dag, …
-:kdb-compaction        → kdb-dag, kdb-namespace-policy, kdb-storage, kdb-storage-compaction (optional)
+:kdb-compaction        → kdb-dag, kdb-namespace-policy, kdb-storage
 ```
 
 -----

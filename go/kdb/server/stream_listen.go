@@ -402,11 +402,13 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 		return h.encodeHandshakeReject(msg, err.Error()), nil
 	}
 	// A subscriber with no position starts at the head: it asked for what happens from now on.
-	// One with a position is caught up from it - if this namespace's main has it in its past.
+	// One with a position is caught up from it - if this namespace's main holds everything the
+	// position does: has it in its past, or, for a content-free merge peer sync has since joined
+	// past, every content-carrying commit it stands for (catch-up then sends a tree diff).
 	position := head
 	if hex, ok := msg.Request.LocalHeads[h.namespaceID]; ok && hex != "" {
 		p, err := codec.HashFromHex(hex)
-		if err != nil || h.runtime.dag == nil || !h.runtime.dag.HasCommit(p) || (p != head && !h.runtime.dag.IsAncestor(p, head)) {
+		if err != nil || h.runtime.dag == nil || !h.runtime.dag.HasCommit(p) || !h.runtime.dag.Incorporates(p, head) {
 			return h.encodeHandshakeReject(msg, fmt.Sprintf(
 				"resume position %s is not in %s's history here (never was, or truncated away); subscribe without one and reload", hex, h.namespaceID)), nil
 		}

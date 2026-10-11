@@ -114,7 +114,7 @@ OUT=$(./go/bin/kdb --data-dir /tmp/kdb-data put myapp/users '{"name":"Ada"}')
 | `get` | `get <namespace> <docId>` — full UUID, 32 hex, or an unambiguous 8+ hex prefix |
 | `query` | `query <namespace> <sql>` — tab-separated rows |
 | `log` / `status` | commit history / head hash and document count |
-| `branch` | `branch list\|create\|checkout <namespace> …` |
+| `branch` | `branch list\|create <namespace> …` (there is no `checkout`: the CLI keeps no current branch; read a branch as the revision `branch:<name>`) |
 | `unlock` | remove a stale `.kdb.lock` when the holder process is gone |
 
 Global flags: `--data-dir DIR` (default `~/.kdb`), `--quiet`, `--version`.

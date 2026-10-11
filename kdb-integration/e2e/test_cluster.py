@@ -290,10 +290,6 @@ def test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes(make_cl
 
 @pytest.mark.slow
 @pytest.mark.destructive
-@pytest.mark.xfail(strict=False, reason=(
-    "a five-node mesh can fall into a merge storm and never converge: nodes keep creating empty "
-    "merge commits of identical trees faster than they spread (10k+ seen after writes stopped; "
-    "found by this test; fix in progress on fix/mesh-merge-convergence)"))
 def test_rolling_kill9_soak(make_cluster):
     """Five nodes, all writing, for several rounds of SIGKILLing a random node - sometimes two
     at once - and bringing them back. Ends converged with every acknowledged write everywhere."""

@@ -10,6 +10,7 @@ import dev.kdb.storage.mem.InMemoryPlatformIoShim
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class WalTest {
@@ -141,5 +142,29 @@ class WalCodecCorruptionTest {
 
             assertEquals(listOf(1L, 3L), replayedSequences)
             assertEquals(1L, summary.recordsSkippedCorrupt, "the one corrupt record must be counted, not silently reported as zero")
+        }
+
+    // U11: with no factory override the cap comes from the engine config; an override wins, as in
+    // Go's wal.DefaultFactory.
+    @Test
+    fun rotationCapComesFromConfigUnlessTheFactoryOverridesIt() =
+        runTest {
+            suspend fun segmentsAfterWrites(factory: DefaultWriteAheadLogFactory, configCap: Long): Int {
+                val shim = InMemoryPlatformIoShim()
+                val config = StorageEngineConfig(ioShim = shim, walMaxSegmentBytes = configCap)
+                val wal = factory.openOrCreate("ns-cap", config, shim)
+                repeat(20) {
+                    wal.append(WalRecord(0, KdbTimestamp.now(), WalRecordKind.PutBlob, ByteArray(100)))
+                }
+                wal.close()
+                return shim.listSegments("ns-cap").count { it.startsWith("ns/ns-cap/wal/") }
+            }
+            assertTrue(segmentsAfterWrites(DefaultWriteAheadLogFactory(), 256) > 1, "config cap must rotate")
+            assertEquals(1, segmentsAfterWrites(DefaultWriteAheadLogFactory(), 64L * 1024 * 1024))
+            assertTrue(
+                segmentsAfterWrites(DefaultWriteAheadLogFactory(walMaxSegmentBytesOverride = 256), 64L * 1024 * 1024) > 1,
+                "factory override must win over the config",
+            )
+            assertFailsWith<IllegalArgumentException> { DefaultWriteAheadLogFactory(walMaxSegmentBytesOverride = 0) }
         }
 }

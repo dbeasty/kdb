@@ -77,6 +77,8 @@ const (
 	EventPositionUpdated
 	EventCompactionWarning
 	EventIceArchived
+	// EventDisconnected is the last event of a subscription. Cause is nil after Disconnect, and an
+	// *EventOverflowError when the subscriber closed itself because Events was not drained.
 	EventDisconnected
 	EventError
 )
