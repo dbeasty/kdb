@@ -358,7 +358,18 @@ func applyReplayedCommit(d *dag.InMemoryCommitDag, store storage.Adapter, c docu
 			}
 		}
 		if !extends {
-			return d.PutCommit(c, true)
+			if err := d.PutCommit(c, true); err != nil {
+				return err
+			}
+			// Peer sync's canonical join of the history two same-content heads stand for need not
+			// name the head it replaced (see peersync.joinSameContent), and nor need the head it
+			// adopts in its place. Main moved onto such a commit only when it held the same
+			// documents as main and every content-carrying commit main stood for, so moving main
+			// again here loses nothing and writes nothing.
+			if d.SupersedesHead(c, head) {
+				return d.SetHead("main", c.Hash)
+			}
+			return nil
 		}
 	}
 	for _, op := range c.Operations {

@@ -1306,3 +1306,32 @@ Opt-in per namespace: `ResolutionChain.AllowUnrelated` (json `allowUnrelated`, p
 - Kotlin replay of grafted (and snapshot-rooted) namespaces. That needs shallow roots and Go's rule that only commits extending main are applied.
 - Candidates miss documents written only in pruned (stubbed) history.
 
+
+### Merge convergence in a mesh — landed (canonical joins of same-content heads)
+
+**Found by** the multi-node e2e soak (`test_cluster.py::test_rolling_kill9_soak`): five `kdb-service` nodes in a full mesh under load never settled after writes stopped. For 150s+ every head differed and kept changing while every sync succeeded; one node's log held 15,442 commits, 10,677 of them `kdb:merge/1` merges with no operations, stamped at the last real write.
+
+**Cause.** 1.3's merge is a deterministic function of the *pair* it joins, so merge(a, b) is one commit on every node, but merging is not confluent. merge(merge(a, b), c) and merge(merge(a, c), b) are different commits with the same tree. Once trees agree, every sync of two different heads still made a new head, and when syncs overlap those are made faster than they spread. Three nodes pulling in a ring never settle (`TestPullRingConvergesOnceWritesStop`).
+
+**Amends 1.3's fixed decision** for one case: two diverged heads with the **same tree and schema**.
+- **Content-free merge** (`dag.IsContentFreeMerge`): authored by `MergeAuthorNodeID`, message exactly `kdb:merge/1`, and the same tree and schema as every parent. It adds nothing a reader can see.
+- **Frontier** (`dag.Frontier`): look through content-free merges from a head, and keep the maximal commits that carry content.
+- **The join** (`peersync.joinSameContent`): for the two heads' joint frontier P, a content-free merge whose parents are P in hash order. Its tx id is `DerivedUUID("kdb:merge/1:" + hex(P[0]) + ":" + …)`, its timestamp is the latest parent's (clamped +1µs), and it has no operations. It is a function of P alone, so every node joining heads that stand for P builds the same commit, whatever order it learned P in. For two content heads it is exactly the old pairwise merge (`TestJoinOfTwoContentHeadsIsThePairwiseMerge`), so old and new nodes agree wherever both rules apply.
+- If P is one of the heads (a content commit that already holds the other side), main stays put or moves to it. A head that already is the join is adopted, not rebuilt.
+- **Main may now move to a commit that does not descend from the old head.** Only content-free merges are left off main's path; no commit that wrote anything ever is, and the documents don't change, so nothing is written to storage. Heads whose trees differ merge exactly as before.
+
+**What had to follow:**
+- **Replay** (`embed.applyReplayedCommit`): a logged commit that does not name the head as a parent is still stored only. Now, if it holds the head's documents and every content commit the head stands for (`dag.SupersedesHead`), main moves to it without writing anything. Without this a node reopened from its log at its previous head (`TestRingJoinSurvivesRestart`).
+- **"Does main contain x"** is `dag.Incorporates` (x is an ancestor, or its whole frontier is). It's used by `SweepIncorporated`, `AwaitCommit` (session tokens), and the stream's resume-position check. The stream's catch-up already sends a tree diff when the position is not on main's first-parent line. Projection pages still use ancestry; a non-ancestor `from` falls back to a full reset, which is correct, just larger.
+
+**Why it converges.** Once writes stop, trees converge as before, and after that no content commit is made. Each node's set of reachable content commits only grows (a join's covers both sides), and it is bounded. Once two nodes hold the same set R, any sync between them yields the single commit join(max R).
+
+The property test (`TestMeshConvergesUnderOverlappingSyncs`, 3-5 nodes, random writes and stale-head pulls, then all-pairs rounds against round-start heads) settles in at most three rounds. It makes no commits once settled, and passed at 150 seeds.
+
+**Tests:**
+- server: `TestPullRingConvergesOnceWritesStop`, `TestMeshConvergesUnderOverlappingSyncs`, `TestRingJoinSurvivesRestart` (file-backed, log replay with the checkpoint removed)
+- syncnode: `TestReplicatorRingSettlesOnOneHead`, `TestFullMeshSettlesAfterConcurrentWrites` (five replicators, concurrent writes; on main it did not settle in 30s)
+- peersync: `TestJoinLooksThroughContentFreeMerges` (pairwise merges from an older version are flattened, then adopted, not re-merged), `TestJoinOfTwoContentHeadsIsThePairwiseMerge`
+- Kotlin interop: `TestKotlinReadsAGoNamespaceSettledOnACanonicalJoin`. Kotlin replays a Go log holding a three-parent join to the same documents. Kotlin applies every logged commit, so it needs no rule change.
+
+**Not changed:** a merge of heads whose trees differ is still pairwise and still not confluent. Its outputs are content commits that the joins above then flatten. Any resolution rule that is not associative (`field-merge`, a stored procedure, forks) could, in principle, keep trees from converging. That is a separate property this fix does not establish.

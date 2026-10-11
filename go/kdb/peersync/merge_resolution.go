@@ -287,6 +287,11 @@ func resolveDivergedLocked(
 			namespaceID, incomingHead.Hex(),
 		)
 	}
+	// Two heads holding the same documents need no merge of their own - only the canonical join
+	// of the history they stand for, which every node builds alike (see joinSameContent).
+	if out, step, ok, err := joinSameContent(d, store, namespaceID, localHead, incomingHead); ok || err != nil {
+		return out, step, err
+	}
 	localCommits, err := commitsBetween(d, localHead, incomingHead)
 	if err != nil {
 		return CommitPushOutcome{}, AdvanceStep{}, err

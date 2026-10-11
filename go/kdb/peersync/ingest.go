@@ -314,7 +314,7 @@ func SweepIncorporated(d *dag.InMemoryCommitDag, q *ConflictQueue, head codec.Ha
 			continue
 		}
 		in, err := codec.HashFromHex(e.IncomingHex)
-		if err != nil || !d.HasCommit(in) || (in != head && !d.IsAncestor(in, head)) {
+		if err != nil || !d.HasCommit(in) || !d.Incorporates(in, head) {
 			continue
 		}
 		if e.TrackingRef != "" {
