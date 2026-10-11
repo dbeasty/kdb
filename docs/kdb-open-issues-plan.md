@@ -24,8 +24,10 @@ its own, and leaves `main` green. Execute them in order unless a unit says it is
    - Check `uptime` first; don't run the Go suite alongside another heavy job.
 5. Anything that changes a wire or on-disk format lands in **Go and Kotlin in the same PR**
    (the "must land together" table in `docs/kdb-finish-up-plan.md`).
-6. Update the **Progress log** at the bottom of this file in the same PR: what landed, the commit,
-   and anything found along the way.
+6. Record the unit's progress in the same PR as **a new file** `docs/progress/YYYY-MM-DD-<slug>.md`
+   (see `docs/progress/README.md`): what landed, the commit, and anything found along the way. Never
+   append to the log at the bottom of this file. Every open PR appending to the same place made each
+   merge conflict with all the others; a new file per entry cannot.
 7. When CI goes red, read every failing job. Don't write a failure off as "flaky" until the same
    SHA has passed on a re-run.
 
@@ -359,7 +361,8 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 
 ## Progress log
 
-_(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
+_Closed for new entries on 2026-10-11. Entries are now one file each in
+[`docs/progress/`](progress/README.md); the entries below are kept as they were written._
 
 - **2026-10-11, U8** (branch `fix/json-getters-return-errors`): `navigateGet`, `collectAll` and
   `normalizeIndex` in `go/kdb/json/api.go` now return `*JsonPathError` instead of panicking, so
