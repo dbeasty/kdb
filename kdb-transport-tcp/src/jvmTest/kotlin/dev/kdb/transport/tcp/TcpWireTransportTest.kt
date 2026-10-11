@@ -22,6 +22,7 @@ import dev.kdb.wire.defaultWireCodec
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -71,8 +72,11 @@ class TcpWireTransportTest {
             val c2 = transport.connect(server.connectUri)
             c1.send(wire.encode(handshakeFrame("a")))
             c2.send(wire.encode(handshakeFrame("b")))
-            c1.incoming().first()
-            c2.incoming().first()
+            // Bounded, so a lost frame fails the test instead of hanging the whole build.
+            withTimeout(30_000) {
+                c1.incoming().first()
+                c2.incoming().first()
+            }
             assertEquals(setOf("a", "b"), seen.toSet())
             c1.close()
             c2.close()

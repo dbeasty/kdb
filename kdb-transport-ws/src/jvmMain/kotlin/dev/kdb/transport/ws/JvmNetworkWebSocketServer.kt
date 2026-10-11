@@ -7,19 +7,24 @@ import dev.kdb.transport.core.FrameStreamWriter
 import dev.kdb.transport.core.TransportConnectOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.IOException
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -28,6 +33,9 @@ public class JvmNetworkWebSocketServer(
     private val secure: Boolean = false,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val openSockets = ConcurrentHashMap.newKeySet<Socket>()
+
+    @Volatile
     private var serverSocket: ServerSocket? = null
     private val active = AtomicInteger(0)
     var port: Int = 0
@@ -64,9 +72,23 @@ public class JvmNetworkWebSocketServer(
             listenPath = path.ifEmpty { "/" }
             scope.launch {
                 while (isActive) {
-                    val socket = ss.accept()
+                    val socket =
+                        try {
+                            ss.accept()
+                        } catch (e: SocketException) {
+                            // stop() closes the server socket to unblock accept(); that is the
+                            // normal way out of this loop. Any other socket failure is real.
+                            if (!isActive || ss.isClosed) break
+                            throw e
+                        }
+                    openSockets += socket
+                    if (!isActive) {
+                        // Accepted just as stop() began; it may already have swept openSockets.
+                        closeQuietly(socket)
+                        break
+                    }
                     active.incrementAndGet()
-                    scope.launch {
+                    launch {
                         try {
                             val (conn, headers) = acceptWebSocket(socket, listenPath)
                             handler(
@@ -76,11 +98,9 @@ public class JvmNetworkWebSocketServer(
                                 ),
                             )
                         } catch (_: Exception) {
-                            try {
-                                socket.close()
-                            } catch (_: Exception) {
-                            }
+                            closeQuietly(socket)
                         } finally {
+                            openSockets -= socket
                             active.decrementAndGet()
                         }
                     }
@@ -89,11 +109,28 @@ public class JvmNetworkWebSocketServer(
         }
     }
 
+    /**
+     * Stops accepting, closes the sockets whose handlers are still running, and suspends until
+     * every coroutine the server launched has finished — so nothing it started can still be
+     * unwinding (and throwing) after this returns. Safe to call from a cancelled coroutine, e.g. a
+     * `finally` block.
+     */
     suspend fun stop() {
-        scope.cancel()
-        withContext(Dispatchers.IO) {
-            serverSocket?.close()
+        withContext(NonCancellable + Dispatchers.IO) {
+            scope.cancel()
+            serverSocket?.let(::closeQuietly)
             serverSocket = null
+            // A handler blocked in socket I/O (the HTTP upgrade read, most often) does not see
+            // cancellation; closing its socket unblocks it.
+            for (socket in openSockets) closeQuietly(socket)
+            scope.coroutineContext.job.join()
+        }
+    }
+
+    private fun closeQuietly(socket: java.io.Closeable) {
+        try {
+            socket.close()
+        } catch (_: IOException) {
         }
     }
 
