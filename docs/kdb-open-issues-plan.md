@@ -758,4 +758,37 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   and reports the slowest restart instead. Fix: `perf/sstable-index-cache`.
   **(N5)** the third silent recovery path from U6c: damage in the middle of a segment that is no
   longer the newest truncates that segment at the damage, with no error.
+- **2026-10-11 — mixed-version upgrade check, the pre-release check before v0.7.0** (branch
+  `test/mixed-version-upgrade`). Since v0.6.2, main changed multi-node behaviour (#114 canonical
+  joins and `SupersedesHead` replay, #111 fork-point SNAPSHOT_FETCH folded by the serving node,
+  #113 unlogged peer commits kept out of checkpoints, #121 unscannable segments fail the open),
+  and deployments upgrade one node at a time, so `kdb-integration/e2e/test_upgrade.py` runs
+  v0.6.2 and this build in one mesh. Harness: `KdbServer.service_bin` / `restart(service_bin=)`
+  and `Cluster(service_bins=...)` / `Cluster.switch_binary` switch a node's binary on the same
+  data dir and pinned ports; `KDB_SERVICE_BIN_PREV` names the old binary (tests skip without
+  it); `make build-prev-service` (`scripts/build-prev-service.sh`) builds it from the tag via
+  `git archive`. Every flag the fixtures pass exists in v0.6.2 (the only flag main added is
+  `--max-result-rows`); the launch now checks a binary's `--help` and names the binary and
+  version if a flag is missing. New nightly job `e2e-upgrade` (~4 minutes). Results, 4 runs of
+  the file plus probes, macOS, load 3-7: **passing every run** - a 3-node v0.6.2 mesh upgraded a
+  node at a time under writes, by clean stop and by SIGKILL (this build recovers a log v0.6.2
+  crashed in), converged after every step with every acknowledged write; a 2-old + 3-new mesh
+  with SIGKILLs converged and stayed on one head after writes stopped (no merge storm from the
+  old pair); SQL schema and rows from v0.6.2 read, updated and deleted on new nodes; a snapshot
+  joiner served by v0.6.2 always hit the boundary and reported the typed `ShallowBoundaryError`
+  (cause `INTERNAL: no tree`, the old server cannot fold), never a silent stall, and
+  `POST /v1/ns/{ns}/deepen` recovered it; `bootstrap=snapshot,deepen=true` converged directly.
+  **Rollback to v0.6.2:** safe from a clean stop of every node, and safe after a crash once the
+  node has been started on this build and stopped cleanly. **Not safe straight after a crash**
+  (xfail, 4 of 4): v0.6.2's replay does not move main onto a logged canonical join that does not
+  descend from it, so every later write is stored but not applied. A/B on the same crashed data
+  dirs (5 nodes): this build opens with 0 of 30 documents behind, v0.6.2 with 30 of 30 behind;
+  once v0.6.2 stops cleanly its checkpoint names the stale head and this build reopens there too,
+  and in one probe run the whole mesh converged on the old values. **Found (not fixed here):**
+  the `deepen=true` peer option the `ShallowBoundaryError` message recommends cannot recover a
+  joiner that is already stuck - `replication.peerLoop.deepen` skips any namespace whose sync
+  returned an error, and the boundary error is one (xfail
+  `test_deepen_peer_option_recovers_a_stuck_snapshot_joiner`, 4 of 4). Also fixed in the
+  harness: `preserve_evidence` failed teardown with `shutil.Error` when a running node's
+  `peers/*.json.tmp` vanished mid-copy, hiding the test's own failure.
 
