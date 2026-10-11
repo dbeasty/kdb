@@ -47,12 +47,31 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	}
 	offset := query.Offset
 
-	ids, label, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx)
+	grouped := isGroupedQuery(query)
+	pushLimit := !grouped && len(query.OrderBy) == 0 && !query.Distinct
+	// How many ids a full scan needs before it may stop. Only a query with nothing to filter
+	// afterwards and nothing that needs every row can stop early; everything else must see the
+	// whole namespace, because the residual WHERE runs after id resolution. Stopping a scan at
+	// the result bound *before* the filter ran is what made a selective query over a large
+	// namespace return a prefix of its answer with no error.
+	stopAt := 0
+	if pushLimit && residual == nil {
+		// Rows wanted: the LIMIT, but never more than one past the result bound (so an
+		// overflow is detectable without reading the rest of the namespace), after skipping
+		// OFFSET rows.
+		want := e.maxResultRows(ctx) + 1
+		if query.Limit != nil && limit < want {
+			want = limit
+		}
+		if offset > 0 && offset <= math.MaxInt-want {
+			want += offset
+		}
+		stopAt = want
+	}
+	ids, label, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt)
 	if err != nil {
 		return QueryResult{}, err
 	}
-	grouped := isGroupedQuery(query)
-	pushLimit := !grouped && len(query.OrderBy) == 0 && !query.Distinct
 	limited := false
 	if pushLimit && residual == nil {
 		ids = applyLimitOffset(ids, limit, offset)
@@ -79,6 +98,9 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	// than its output (TestAggregateIgnoresLimitOnItsInput). Grouped rows are paged normally.
 	if !limited && !(grouped && len(query.GroupBy) == 0) {
 		rows = applyLimitOffset(rows, limit, offset)
+	}
+	if max := e.maxResultRows(ctx); len(rows) > max {
+		return QueryResult{}, &ResultRowLimitError{Limit: max}
 	}
 	for _, r := range rows {
 		ctx.Stats.addRetained(rowBytes(r))
@@ -308,11 +330,8 @@ func applyLimitOffset[T any](items []T, limit, offset int) []T {
 // chooseAccessPath picks the id source (§9.3): a search ranking when ORDER BY leads with a
 // score, else the first top-level AND conjunct the provider can serve (MATCH, =, range,
 // BETWEEN, IN), else a full scan. The label is reported as QueryResult.Plan.
-func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEnv, ctx QueryContext) ([]codec.UUID, string, error) {
-	max := ctx.MaxRows
-	if max <= 0 {
-		max = 10000
-	}
+func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEnv, ctx QueryContext, stopAt int) ([]codec.UUID, string, error) {
+	max := e.maxResultRows(ctx)
 	if len(orderBy) > 0 {
 		if lead := env.resolveAlias(orderBy[0].Expr); isSearchExpr(lead) {
 			if hits := env.scores[searchKey(lead)]; hits != nil {
@@ -335,13 +354,12 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 			return nil, "", err
 		}
 		if ok {
-			if len(ids) > max {
-				ids = ids[:max]
-			}
+			// Not truncated: the residual WHERE still runs over these, so cutting the list here
+			// would drop matches. The result bound is enforced on the rows actually returned.
 			return ids, label, nil
 		}
 	}
-	ids, err := e.fullScan(ctx)
+	ids, err := e.fullScan(ctx, stopAt)
 	return ids, "fullscan", err
 }
 
@@ -538,7 +556,7 @@ func (e *Executor) matchingDocs(where Expr, from TableRef, ctx QueryContext) ([]
 	if err := e.resolveSearches(q, env, ctx); err != nil {
 		return nil, "", err
 	}
-	ids, label, err := e.chooseAccessPath(where, nil, env, ctx)
+	ids, label, err := e.chooseAccessPath(where, nil, env, ctx, 0)
 	if err != nil {
 		return nil, "", err
 	}
@@ -560,7 +578,11 @@ func (e *Executor) ResolveDocIDsForWhere(where Expr, sch schema.KdbSchema, ctx Q
 	return ids, nil
 }
 
-func (e *Executor) fullScan(ctx QueryContext) ([]codec.UUID, error) {
+// fullScan lists the ids of every document at the resolved commit. stopAt > 0 lets it stop once
+// it has that many; 0 means read everything. Work is bounded by ctx.RowBudget, not by MaxRows:
+// MaxRows bounds what a query may *return*, and applying it here, before the residual filter,
+// silently dropped every document past the first MaxRows.
+func (e *Executor) fullScan(ctx QueryContext, stopAt int) ([]codec.UUID, error) {
 	atCommit, err := e.atCommit(ctx)
 	if err != nil {
 		return nil, err
@@ -570,10 +592,6 @@ func (e *Executor) fullScan(ctx QueryContext) ([]codec.UUID, error) {
 		return nil, err
 	}
 	treeHash := commit.DocumentTreeHash
-	max := ctx.MaxRows
-	if max <= 0 {
-		max = 10000
-	}
 	var ids []codec.UUID
 	examined := 0
 	err = e.Storage.ScanDocuments(ctx.NamespaceID, treeHash, 256, func(batch []document.Document) error {
@@ -584,7 +602,7 @@ func (e *Executor) fullScan(ctx QueryContext) ([]codec.UUID, error) {
 				return &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
 			}
 			ids = append(ids, d.ID)
-			if len(ids) >= max {
+			if stopAt > 0 && len(ids) >= stopAt {
 				// Stop the scan outright rather than merely stopping appending: a query that
 				// has everything it can return must not read the rest of the namespace.
 				return errScanComplete
@@ -599,6 +617,28 @@ func (e *Executor) fullScan(ctx QueryContext) ([]codec.UUID, error) {
 		return nil, err
 	}
 	return ids, nil
+}
+
+const defaultMaxResultRows = 10000
+
+// maxResultRows is the most rows a query may return.
+func (e *Executor) maxResultRows(ctx QueryContext) int {
+	if ctx.MaxRows <= 0 {
+		return defaultMaxResultRows
+	}
+	return ctx.MaxRows
+}
+
+// ResultRowLimitError reports a query whose result is larger than the server returns in one
+// reply. It is an error rather than a truncation on purpose: a client handed the first N rows
+// of an answer with no indication there were more has no way to know its answer is wrong.
+// Surfaced as RESOURCE_EXHAUSTED - add a LIMIT, or a more selective predicate.
+type ResultRowLimitError struct {
+	Limit int
+}
+
+func (e *ResultRowLimitError) Error() string {
+	return fmt.Sprintf("kdb sql: result has more than %d rows - add a LIMIT or a more selective predicate", e.Limit)
 }
 
 // errScanComplete unwinds ScanDocuments once a scan has all the rows it can return. A sentinel
