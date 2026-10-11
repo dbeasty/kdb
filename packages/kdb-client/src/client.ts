@@ -223,6 +223,13 @@ export class Client implements KdbOperations {
     return this.#writeTransaction(ns, docId, body, undefined, options);
   }
 
+  async delete(ns: string, docId: string, options: CallOptions = {}): Promise<CommitHash> {
+    assertUuid(docId);
+    const state = await this.#ensureNamespace(ns, options);
+    const tx = this.#buildTransaction(state.head, [{ kind: "delete", docId }], undefined);
+    return this.#commitTransaction(ns, state, tx, options);
+  }
+
   async get(
     ns: string,
     docId: string,
@@ -374,11 +381,14 @@ export class Client implements KdbOperations {
 
   async commit(tx: Transaction, options: CallOptions = {}): Promise<CommitHash> {
     const state = await this.#ensureNamespace(tx.namespace, options);
-    const operations: OpDto[] = tx.writes.map((write) => ({
-      kind: "write",
-      docId: assertUuid(write.docId),
-      patch: JSON.stringify(write.body),
-    }));
+    const operations: OpDto[] = [
+      ...tx.writes.map((write): OpDto => ({
+        kind: "write",
+        docId: assertUuid(write.docId),
+        patch: JSON.stringify(write.body),
+      })),
+      ...(tx.deletes ?? []).map((docId): OpDto => ({ kind: "delete", docId: assertUuid(docId) })),
+    ];
     const preconditions: PreconditionDto[] | undefined = tx.preconditions?.length
       ? tx.preconditions.map((p) =>
           p.kind === "EXPECT_CONTENT_HASH"

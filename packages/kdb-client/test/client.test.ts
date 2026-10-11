@@ -163,6 +163,43 @@ describe("sessions", () => {
     );
   });
 
+  it("sends a delete as a delete operation anchored on the current head", async () => {
+    const server = new FakeServer((request) =>
+      request.kind === "sessionBegin" ? sessionAck(NS, HEAD_ZERO) : sqlOk(NS, HEAD_ONE),
+    );
+    const commit = await new Client(server).delete(NS, DOC);
+
+    assert.equal(commit, HEAD_ONE);
+    const tx = decodeTx(server.requests.find((r) => r.kind === "txCommit")!);
+    assert.equal(tx.baseVersionHex, HEAD_ZERO);
+    assert.deepEqual(tx.operations, [{ kind: "delete", docId: DOC }]);
+  });
+
+  it("puts a transaction's deletes after its writes, so write opIndexes do not move", async () => {
+    const other = "7f9619ff-8b86-d011-b42d-00cf4fc964ff";
+    const server = new FakeServer((request) =>
+      request.kind === "sessionBegin" ? sessionAck(NS, HEAD_ZERO) : sqlOk(NS, HEAD_ONE),
+    );
+    await new Client(server).commit({
+      namespace: NS,
+      baseVersion: HEAD_ZERO,
+      writes: [{ docId: DOC, body: { n: 1 } }],
+      deletes: [other],
+    });
+    const tx = decodeTx(server.requests.find((r) => r.kind === "txCommit")!);
+    assert.deepEqual(
+      tx.operations.map((op) => [op.kind, op.docId]),
+      [["write", DOC], ["delete", other]],
+    );
+  });
+
+  it("refuses to delete something that is not a UUID", async () => {
+    const server = new FakeServer((request) =>
+      request.kind === "sessionBegin" ? sessionAck(NS, HEAD_ZERO) : sqlOk(NS, HEAD_ONE),
+    );
+    await assert.rejects(new Client(server).delete(NS, "not-a-uuid"));
+  });
+
   it("advances the cached head to the commit a write resolved to", async () => {
     const server = new FakeServer((request) =>
       request.kind === "sessionBegin" ? sessionAck(NS, HEAD_ZERO) : sqlOk(NS, HEAD_ONE),
