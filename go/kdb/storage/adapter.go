@@ -53,6 +53,13 @@ type SegmentSkim struct {
 	DamagedFrames []int64
 	// LastFrameDamaged is set when the segment's final complete frame is one of them.
 	LastFrameDamaged bool
+	// FramesEnd is where the last complete frame - intact or damaged - ends. Unlike PhysicalSize
+	// it does not count a preallocated segment's zero-filled remainder.
+	FramesEnd int64
+	// TrailingUnreadable is set when bytes that are neither a frame nor zero padding follow
+	// FramesEnd with no intact frame after them: a torn tail, or a final frame damaged so badly
+	// (its header) that it no longer reads as a frame at all.
+	TrailingUnreadable bool
 }
 
 // DamageTolerantReader reads delta segments past damaged frames. A DeltaSegmentReader stops at the

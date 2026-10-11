@@ -10,7 +10,13 @@ import dev.kdb.storage.DeltaAuthorshipEnvelope
 import dev.kdb.storage.DeltaRecord
 import dev.kdb.storage.DeltaSegmentReader
 import dev.kdb.storage.StorageAdapter
+import dev.kdb.storage.delta.DamagedSegmentException
 import dev.kdb.storage.delta.DeltaSegmentScanner
+
+/** Replay's "the log is missing data": commits whose parents no segment holds. */
+internal class MissingParentsException(
+    message: String,
+) : IllegalStateException(message)
 
 /**
  * Rebuilds dag and storage from every commit durably logged for this
@@ -22,8 +28,12 @@ import dev.kdb.storage.delta.DeltaSegmentScanner
  *     own listSegments contract), but commits are *applied* in
  *     dependency order, not file order (see applyCommitsTopologically
  *     below). File order is a fast path, not a correctness requirement.
- *  2. Corruption in the most recently written segment is tolerated as an
- *     expected torn tail; corruption anywhere else is not (§4.3).
+ *  2. A torn tail - bytes at the very end of a segment with nothing intact
+ *     after them - is tolerated as the expected shape of an unclean
+ *     shutdown, in the newest segment or, after a restart opened a newer
+ *     one, in an older one. Damage that an intact frame follows is never a
+ *     torn tail, wherever it is, and is refused (DamagedSegmentException;
+ *     the rule Go's replay applies, N5).
  */
 public object DeltaNamespaceReplayer {
     public suspend fun replay(
@@ -34,37 +44,31 @@ public object DeltaNamespaceReplayer {
     ): KdbHash {
         val segments = deltaReader.listSegments()
         val allCommits = mutableListOf<KdbCommit>()
+        // Segments other than the newest whose tails were torn - see the missing-parents case below.
+        val torn = mutableListOf<Pair<Long, DeltaSegmentScanner.CorruptFrameException>>()
         segments.forEachIndexed { i, segment ->
             val isMostRecent = i == segments.lastIndex
             val records =
                 try {
                     deltaReader.readAll(segment)
                 } catch (e: DeltaSegmentScanner.CorruptFrameException) {
-                    if (isMostRecent && e.intactFramesAfter > 0) {
+                    if (!e.torn) {
                         // Damage in place, not a torn tail: intact commits follow the damaged
-                        // frame. Truncating here would silently drop them - and everything
-                        // descending from them - so refuse, as for any other damaged segment.
-                        throw IllegalStateException(
-                            "kdb: namespace ${dag.namespaceId}: delta segment (sequence " +
-                                "${segment.sequenceNumber}) has a damaged frame followed by intact " +
-                                "ones, so this is not a torn tail and replaying past it would drop " +
-                                "committed history: ${e.message}",
-                            e,
+                        // frame (or it passes its CRC and will not decode). Truncating here would
+                        // silently drop them - and everything descending from them - so refuse,
+                        // whichever segment it is in. A garbled frame header used to end the scan
+                        // as quietly as a torn tail, in any segment (N5).
+                        throw DamagedSegmentException(
+                            dag.namespaceId, segment.sequenceNumber, e.offset, e.reason, e.nextIntactFrame, cause = e,
                         )
                     }
-                    if (!isMostRecent) {
-                        throw IllegalStateException(
-                            "kdb: namespace ${dag.namespaceId}: delta segment (sequence " +
-                                "${segment.sequenceNumber}) is corrupt and is not the most recently " +
-                                "written segment, so this is not an expected torn tail - data may be " +
-                                "unrecoverable: ${e.message}",
-                            e,
-                        )
-                    }
-                    // Torn tail on the most recently written segment: the expected shape of an
-                    // unclean shutdown. Keep every commit scanned before it and continue - this
-                    // segment is never appended to again, so this decision is stable across
-                    // future restarts too.
+                    // A torn tail: nothing intact follows it, so it is the last append before an
+                    // unclean shutdown, never acknowledged. In the newest segment, or - once a
+                    // restart has opened a newer one - in an older segment: the writer always
+                    // starts a fresh segment, so that one is never appended to again and this
+                    // decision is stable across future restarts too. Keep every commit scanned
+                    // before it and continue.
+                    if (!isMostRecent) torn += segment.sequenceNumber to e
                     e.partialCommits.map { scanned ->
                         DeltaRecord(
                             commitHash = scanned.commitHash,
@@ -85,7 +89,16 @@ public object DeltaNamespaceReplayer {
                 allCommits += KdbCommit.fromPayloadBytes(record.commitPayload)
             }
         }
-        applyCommitsTopologically(dag, storage, withoutUncommittedGroups(dag, allCommits, decisions))
+        try {
+            applyCommitsTopologically(dag, storage, withoutUncommittedGroups(dag, allCommits, decisions))
+        } catch (e: MissingParentsException) {
+            // A torn tail is never built on: what never finished writing was never acknowledged.
+            // Later commits naming parents the log no longer holds therefore mean an older
+            // segment's last frame(s) were damaged in place after being read and built on - the
+            // one damage a tail alone cannot show. Point at that segment.
+            val (seq, tornAt) = torn.firstOrNull() ?: throw e
+            throw DamagedSegmentException(dag.namespaceId, seq, tornAt.offset, tornAt.reason, -1, builtOn = true, cause = e)
+        }
         return dag.head()
     }
 
@@ -150,7 +163,7 @@ public object DeltaNamespaceReplayer {
                 progressed = true
             }
             if (!progressed) {
-                throw IllegalStateException(
+                throw MissingParentsException(
                     "kdb: namespace ${dag.namespaceId}: delta replay: ${next.size} commit(s) " +
                         "reference parent commits never found in the log - the log is missing data " +
                         "(first unresolved: ${next.first().hash})",

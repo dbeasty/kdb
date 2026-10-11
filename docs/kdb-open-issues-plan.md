@@ -163,7 +163,7 @@ readable data but still can't read JVM/Go-written compressed data. Say so in the
 ### U6. Issue #43 — acknowledged write unreadable after `kill -9` — L, in four steps
 
 **Status: U6a done** (#112, which also added the multi-node suite); **U6c done** (#121; see the
-progress log, which also records a third silent path it found); **U6b done** (#122: the server-path reproducer, plus a nightly Linux soak); **U6d: no loss reproduced** in 620 kills across five configurations (110,950 acknowledged writes). #43 stays open until the nightly Linux soak has run (see the progress log).
+progress log, which also records a third silent path it found); **U6b done** (#122: the server-path reproducer, plus a nightly Linux soak); **U6d: no loss reproduced** in 620 kills across five configurations (110,950 acknowledged writes); **N5 done** (the third silent path - damaged frames truncating a segment - closed in Go and Kotlin; see the progress log). #43 stays open until the nightly Linux soak has run (see the progress log).
 
 The durability contract is the most important open item. It is sequenced so each step is its own PR
 and each makes the next one possible. **Do not relax or retry the test** at any step.
@@ -759,3 +759,87 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   **(N5)** the third silent recovery path from U6c: damage in the middle of a segment that is no
   longer the newest truncates that segment at the damage, with no error.
 
+
+- **2026-10-11 — N5: damaged frames no longer silently truncate history (branch
+  `fix/damaged-segment-silent-truncation`).** The third silent recovery path #121 found. Both holes
+  lost acknowledged commits with no error.
+  - **Root cause.** Every scanner ended a segment at its first garbled header or CRC mismatch and
+    recorded only the bytes before it, which is the right answer for a torn tail and the wrong
+    one for damage. `DefaultReader.scanSegmentRef` (`storage/delta/writer.go`, main's lines
+    416-433) did this in any segment, so replay streamed only the prefix and its "corrupt and not
+    the most recent segment" refusal (`embed/delta_replay.go:132`) could never fire. Replay also
+    accepted any `CorruptFrameError` in the newest segment as a torn tail (`:117`), even with
+    intact frames after it. Kotlin had the same holes: `DeltaSegmentScanner.scanSegmentBytes`
+    `break`s at a garbled header in any segment (`:62`), so even #81's `intactFramesAfter` was
+    never computed for one. And it refused a legitimate torn tail in an older segment (`:55`).
+  - **The rule, at the scanner, applied by every consumer.** A torn tail can only be bytes at the
+    very end of a segment with nothing intact after them. A segment's listing now carries
+    `DeltaSegmentRef.Tail` (`storage.TailKind`). The values are `clean` (nothing, or only zero
+    padding), `torn`, or `damaged` (an intact frame follows the stop, or a CRC-valid frame will not
+    decode). "Intact" means a well-formed v2 header plus a body matching its CRC, found by
+    searching for the frame magic past the stop (`delta.NextIntactFrame`), not by following frame
+    lengths. That is how it sees past a garbled header.
+    - Replay refuses `damaged` in any segment with a typed `*delta.DamagedSegmentError`
+      (namespace, sequence, byte offset, next intact frame), pointing at `kdb-inspect verify`,
+      restore and `repair-segments`. It tolerates `torn` in any segment.
+    - Listing does not refuse. #81's `damagedInPlace` still opens from a checkpoint that already
+      holds a damaged segment's commits. It now also reads past a garbled header, and works for
+      preallocated segments by comparing where the frames end instead of the file size.
+    - The ops loader indexes past damage, so commits after it keep their operations.
+    - `kdb-inspect verify` reports damage that intact frames follow as `mid_log_corruption` in
+      every segment. In the newest one it used to say `torn_tail`, and `repair-segments` then
+      truncated the intact commits after it away. Zero padding is no longer a finding.
+    - Repair refuses to keep a prefix when intact commits follow the damage, and names them.
+    - Kotlin applies the same rule: the scanner, the `DeltaNamespaceReplayer` (now
+      `DamagedSegmentException`), and `kdb-integrity` verify and repair.
+  - **Why sound.** Appends to a segment are sequential and `OpenWriter` always starts a fresh
+    segment, so an append that never completed cannot be followed by one that did. Torn tails
+    stay recoverable:
+    - in the newest segment;
+    - after a restart, at the end of an older segment, which is the kill -9 sequence;
+    - as a header torn just after its magic. A zero-length body is no longer a frame. On main
+      that preallocated-segment shape read as a complete frame that will not decode, and made the
+      namespace unopenable with `UnreadableSegmentError`.
+  - **A damaged LAST frame of an older segment.** With nothing intact after it, this is
+    byte-for-byte the torn tail a crash leaves there. A full-length frame failing its CRC is also
+    what a preallocated file or a power loss leaves, so the bytes cannot tell them apart. Two
+    things still can:
+    - A torn tail is never built on. When later commits name parents the log lacks and an older
+      segment ended torn, replay reports `DamagedSegmentError{BuiltOn}` for that segment rather
+      than only the missing commit.
+    - A checkpoint that covered the segment proves the damage is in place.
+    Only a damaged last frame that nothing was built on and no checkpoint covered still opens at
+    the commit before it, exactly as the crash it is indistinguishable from must.
+  - **Before/after.** Uncompressed frames, damage at frame 2 of 4, no checkpoint. Shown as
+    main → this branch:
+    - Middle of the newest segment: magic flip, body flip or codec byte each opened at commit 5
+      of 8 → `DamagedSegmentError`.
+    - Middle of an older segment: refused only indirectly, by an untyped "parent commits never
+      found" (magic or body flip) because the next segment builds on the lost commits → typed
+      error naming segment and byte.
+    - #121's probe (6 commits, an empty run, the 4th frame's magic flipped): opened at 3 of 6 →
+      refused.
+    - Preallocated segment with damage in the middle and a checkpoint: refused → opens at 6 of 6
+      from the checkpoint.
+    - Torn header in an older segment: unopenable → recovers.
+    - `kdb-inspect` on a damaged newest segment: verify said `torn_tail` and repair truncated 2
+      acknowledged commits → `mid_log_corruption` ("intact frames follow it"), and repair refuses,
+      naming both.
+  - **Tests**, each confirmed failing with its fix reverted:
+    - `embed/damaged_segment_test.go`: file-backed. Asserts the head and which commits exist, with
+      and without a checkpoint and preallocation.
+    - `storage/delta/damaged_segment_test.go`, including frames straddling the 1 MiB scan windows.
+    - `integrity/damaged_segment_test.go`.
+    - Kotlin `DeltaSegmentTailTest` (all targets), `DamagedSegmentTest` (kdb-integrity) and
+      `DeltaNamespaceReplayerDamageTest` (kdb-jdbc).
+  - **Gates.** `go test -race ./...`; the kill -9 reproducer at 40 kills (9,703 acknowledged
+    writes, all intact) and with `KDB_PREALLOCATE_SEGMENTS=true` (40 kills, 3,923 writes, all
+    intact, slowest restart 3.8 s); e2e `-k "kill9 or crash or scrub"` (5 passed).
+  - **Found, not fixed:**
+    - Backup (`integrity.VerifiedSegmentPrefix`) still uploads only the prefix before damage. A
+      backup of a segment damaged in place silently lacks the commits after the damage. Uploading
+      the whole file, or refusing, needs a decision.
+    - Kotlin's `scanSegmentRef` still skips a segment it cannot read (Go's U6c fix was Go-only).
+    - A power loss that persists a later page of a batch before an earlier one would leave intact
+      frames after a hole. Neither was acknowledged, but this rule refuses it as damage, which is
+      the safe direction.

@@ -572,7 +572,11 @@ func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) 
 		// it (and the next checkpoint would make that permanent). What the damage costs is only
 		// the bodies in the damaged frames, which a scrub finds and repairs from a peer.
 		if skim, ok := damagedInPlace(r, want); ok {
-			damaged = append(damaged, fmt.Sprintf("delta segment %d has %d damaged frame(s) at offset(s) %v", want.Sequence, len(skim.DamagedFrames), skim.DamagedFrames))
+			what := fmt.Sprintf("delta segment %d has %d damaged frame(s) at offset(s) %v", want.Sequence, len(skim.DamagedFrames), skim.DamagedFrames)
+			if skim.TrailingUnreadable {
+				what += fmt.Sprintf(" and unreadable bytes after its last frame (from offset %d)", skim.FramesEnd)
+			}
+			damaged = append(damaged, what)
 			continue
 		}
 		if got.SizeBytes != want.SizeBytes {
@@ -606,15 +610,26 @@ func damagedInPlace(r storage.DeltaSegmentReader, want checkpointSegment) (stora
 			continue
 		}
 		skim, err := dr.SkimSegment(seg)
-		if err != nil || len(skim.DamagedFrames) == 0 {
+		if err != nil {
 			return skim, false
 		}
-		// The checkpoint was written against this file whole, so the same length means the bytes
-		// were changed, not cut short or replaced. The intact frames must still end at the
-		// checkpoint's last commit - or the last frame must itself be the damaged one, whose
-		// commit can no longer be read but which a torn tail could not produce at full length.
-		return skim, skim.PhysicalSize == want.SizeBytes &&
-			(skim.LastCommitHash == want.LastCommitHash || skim.LastFrameDamaged)
+		// The checkpoint recorded where this segment's intact frames ended when it was written
+		// (want.SizeBytes). A torn tail already there then lies past that point, so unreadable
+		// bytes before it were changed in place, after the checkpoint read them.
+		//
+		// The file must still be that segment, not a shorter or older copy: the same length (or,
+		// for a preallocated segment, whose file is always full size, frames still ending at the
+		// same byte), and the intact frames read past the damage must still end at the
+		// checkpoint's last commit. Or the last frame is itself the damaged one: as a complete
+		// frame failing its CRC, or - a header too damaged to read as a frame - as unreadable bytes
+		// up to the end of a file of the recorded length.
+		samePlace := skim.PhysicalSize == want.SizeBytes || skim.FramesEnd == want.SizeBytes
+		damagedTail := skim.TrailingUnreadable && skim.PhysicalSize == want.SizeBytes
+		if len(skim.DamagedFrames) == 0 && !damagedTail {
+			return skim, false
+		}
+		return skim, samePlace &&
+			(skim.LastCommitHash == want.LastCommitHash || skim.LastFrameDamaged || damagedTail)
 	}
 	return storage.SegmentSkim{}, false
 }

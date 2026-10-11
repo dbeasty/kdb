@@ -1,6 +1,7 @@
 package delta
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -300,8 +301,11 @@ func (r *DefaultReader) ReadRange(segment storage.DeltaSegmentRef, sinceCommit, 
 // exactly the bug Component 47 fixes (kdb-spec-layer13 §4.1).
 //
 // A segment it cannot scan is an *UnreadableSegmentError, never a silent omission: leaving it out
-// would drop every commit in it from replay, checkpoints and history. Damage the scan stops at
-// cleanly (a torn tail, a CRC mismatch) still lists, up to the damage; callers classify that.
+// would drop every commit in it from replay, checkpoints and history. A segment whose intact
+// frames stop early still lists, up to the stop, with Tail saying what follows it: zero padding
+// (clean), a torn tail, or damage that intact frames follow (storage.TailKind). Listing is not
+// where damage is refused, because a checkpoint may already hold everything a damaged segment
+// recorded (embed's damagedInPlace); replay refuses a damaged segment it actually has to read.
 func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
 	prefix := storio.SegmentNameBuilder.NamespacePrefix(r.namespaceID) + "delta/"
 	names, err := r.shim.ListSegments(r.namespaceID)
@@ -390,9 +394,12 @@ func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.
 	var (
 		firstOffset = int64(-1)
 		lastOffset  = int64(-1)
-		total       int64
 		pos         int64
 		window      = int64(segmentScanWindowBytes)
+		// stopped is set when the walk ended somewhere other than the end of the file - at a
+		// torn tail, zero padding or damage. stopReason says why, when the walk knows.
+		stopped    bool
+		stopReason string
 	)
 	for {
 		raw, err := r.shim.ReadFromSegment(segmentName, pos, int(window))
@@ -414,30 +421,49 @@ func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.
 			lastOffset = walk.LastOffset
 		}
 		if walkErr != nil {
-			// A corrupt frame ends the scan here, exactly as a whole-segment
-			// scan would: the ends reported are what was readable before it.
-			total = walk.ConsumedEnd
+			// A frame failing its CRC ends the walk; what follows it decides whether that
+			// is a torn tail or damage.
+			pos, stopped, stopReason = walk.ConsumedEnd, true, corrupt.Reason
 			break
 		}
-		if walk.ConsumedEnd == pos {
-			// Nothing complete in this window. Either the segment ends here
-			// or one frame is larger than the window; grow and retry so a
-			// large frame cannot stall the scan.
-			if int64(len(raw)) < window {
-				total = pos
+		eof := int64(len(raw)) < window
+		rest := raw[walk.ConsumedEnd-pos:]
+		pos = walk.ConsumedEnd
+		if len(rest) == 0 {
+			if eof {
 				break
 			}
-			window *= 2
+			window = int64(segmentScanWindowBytes)
 			continue
 		}
-		total = walk.ConsumedEnd
-		if int64(len(raw)) < window {
-			// Short read: the file ended inside this window.
-			break
+		if !eof {
+			// The window may simply have ended inside a frame (or its header). Read on from
+			// it, with a window large enough for the whole frame, before concluding anything.
+			if len(rest) < frameHeaderSize {
+				window = int64(segmentScanWindowBytes)
+				continue
+			}
+			if n, ok := validFrameHeader(rest[:frameHeaderSize]); ok && frameHeaderSize+n > len(rest) {
+				window = int64(segmentScanWindowBytes)
+				if need := int64(frameHeaderSize + n); need > window {
+					window = need
+				}
+				continue
+			}
 		}
-		pos = walk.ConsumedEnd
-		window = int64(segmentScanWindowBytes)
+		stopped, stopReason = true, describeStop(rest)
+		break
 	}
+
+	tail := storage.SegmentTail{Offset: pos, NextIntactFrame: -1}
+	if stopped {
+		var err error
+		tail, err = r.tailAfter(segmentName, pos, stopReason)
+		if err != nil {
+			return nil, err
+		}
+	}
+	total := pos
 
 	zero, _ := codec.HashFromBytes(make([]byte, 32))
 	if firstOffset < 0 {
@@ -445,6 +471,7 @@ func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.
 			NamespaceID: r.namespaceID, SequenceNumber: seq,
 			FirstCommitHash: zero, LastCommitHash: zero,
 			SizeBytes: total, Compression: r.config.CompressionCodec,
+			Tail: tail,
 		}, nil
 	}
 	first, err := r.commitAtOffset(segmentName, firstOffset)
@@ -464,7 +491,84 @@ func (r *DefaultReader) scanSegmentRef(segmentName string, seq int64) (*storage.
 		LastCommitHash:  last.Hash,
 		SizeBytes:       total,
 		Compression:     r.config.CompressionCodec,
+		Tail:            tail,
 	}, nil
+}
+
+// tailAfter classifies the bytes from stop - where a segment's intact frames end - to the end of
+// its file (see storage.TailKind), a window at a time. Only zero bytes there is a clean end: a
+// preallocated segment's unused space. Anything else is a torn tail, unless an intact frame
+// starts somewhere in it, which makes it damage.
+//
+// Searching for intact frames costs a pass over the rest of the file, which for a preallocated
+// segment is its zero-filled remainder; the walk this replaces read that remainder too, in
+// doubling windows. A candidate is checked only where the frame magic appears.
+func (r *DefaultReader) tailAfter(segmentName string, stop int64, reason string) (storage.SegmentTail, error) {
+	tail := storage.SegmentTail{Offset: stop, Reason: reason, NextIntactFrame: -1}
+	nonZero := false
+	at := stop
+	window := int64(segmentScanWindowBytes)
+	for {
+		raw, err := r.shim.ReadFromSegment(segmentName, at, int(window))
+		if err != nil {
+			return tail, err
+		}
+		if len(raw) == 0 {
+			break
+		}
+		if !nonZero && !allZero(raw) {
+			nonZero = true
+		}
+		for i := 0; ; {
+			j := bytes.Index(raw[i:], kdbpMagic)
+			if j < 0 {
+				break
+			}
+			c := at + int64(i+j)
+			if c > stop {
+				ok, err := r.intactFrameAtOffset(segmentName, c)
+				if err != nil {
+					return tail, err
+				}
+				if ok {
+					tail.Kind = storage.TailDamaged
+					tail.NextIntactFrame = c
+					return tail, nil
+				}
+			}
+			i += j + 1
+		}
+		if int64(len(raw)) < window {
+			break
+		}
+		// Overlap by less than a magic's length, so one that straddles two windows is
+		// still seen whole.
+		at += int64(len(raw)) - int64(len(kdbpMagic)-1)
+	}
+	if nonZero {
+		tail.Kind = storage.TailTorn
+	} else {
+		tail.Reason = ""
+	}
+	return tail, nil
+}
+
+// intactFrameAtOffset is intactFrameAt for a frame in a segment file, reading only that frame.
+func (r *DefaultReader) intactFrameAtOffset(segmentName string, offset int64) (bool, error) {
+	header, err := r.shim.ReadFromSegment(segmentName, offset, frameHeaderSize)
+	if err != nil {
+		return false, err
+	}
+	n, ok := validFrameHeader(header)
+	if !ok {
+		return false, nil
+	}
+	frame, err := r.shim.ReadFromSegment(segmentName, offset, frameHeaderSize+n)
+	if err != nil {
+		return false, err
+	}
+	_, ok = intactFrameAt(frame, 0)
+	return ok, nil
 }
 
 // commitAtOffset decodes the single frame starting at offset, reading only
@@ -647,11 +751,13 @@ func (r *DefaultReader) SkimSegment(segment storage.DeltaSegmentRef) (storage.Se
 	}
 	skim := storage.SegmentSkim{PhysicalSize: int64(len(raw))}
 	lastGood := -1
-	skipped, err := ScanSkippingCorrupt(raw, func(s ScannedCommit) error {
+	skipped, framesEnd, err := scanSkippingCorrupt(raw, func(s ScannedCommit) error {
 		skim.LastCommitHash = s.CommitHash
 		lastGood = s.FrameOffset
 		return nil
 	})
+	skim.FramesEnd = int64(framesEnd)
+	skim.TrailingUnreadable = framesEnd < len(raw) && !allZero(raw[framesEnd:])
 	if len(skipped) > 0 && skipped[len(skipped)-1] > lastGood {
 		skim.LastFrameDamaged = true
 	}

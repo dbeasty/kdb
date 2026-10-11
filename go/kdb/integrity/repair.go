@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/delta"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -107,12 +108,13 @@ func repairTornTail(shim storage.PlatformIOShim, namespaceID string, f Finding) 
 
 // repairMidLogCorruption quarantines the full original segment and, only
 // if the namespace's parent closure holds using just that segment's good
-// prefix (the frames before the corrupt one - the scanner cannot resync
-// past a corrupt frame to recover anything after it), rewrites the
-// segment to contain that prefix alone. If closure would break, it
-// touches nothing and reports exactly which commit hashes would go
-// missing (kdb-spec-layer15 §5.2, P3: never guess, never destroy
-// evidence unless the repair it would enable is actually safe).
+// prefix (the frames before the corrupt one), rewrites the segment to
+// contain that prefix alone. If closure would break - a later segment
+// builds on a dropped commit, or intact frames follow the damage in the
+// same segment, whose commits the prefix would drop (N5) - it touches
+// nothing and reports exactly which commit hashes would go missing
+// (kdb-spec-layer15 §5.2, P3: never guess, never destroy evidence unless
+// the repair it would enable is actually safe).
 func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f Finding, opts Options) (RepairStep, error) {
 	seqs, err := listSequencedSegments(shim, namespaceID)
 	if err != nil {
@@ -133,6 +135,15 @@ func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f F
 					allCommits[c.CommitHash.Hex()] = struct{}{}
 					prefixCommits[c.CommitHash.Hex()] = struct{}{}
 				}
+			}
+			// Intact frames after the damage are acknowledged commits too. Keeping only the
+			// prefix would drop them - and, in the newest segment, nothing later would even
+			// notice they were gone (N5). Refuse, naming them, and leave the segment alone.
+			if after := intactCommitsAfter(ss.raw, f.Offset); len(after) > 0 {
+				return RepairStep{
+					Finding: f, Action: ActionRefused, MissingHashes: after,
+					Detail: fmt.Sprintf("segment %d has %d intact commit(s) after the damage at byte %d; keeping only the frames before it would drop them - restore the namespace from a backup or a peer instead", f.Segment, len(after), f.Offset),
+				}, nil
 			}
 			continue
 		}
@@ -197,6 +208,19 @@ func repairMidLogCorruption(shim storage.PlatformIOShim, namespaceID string, f F
 		Finding: f, Action: ActionRewroteSegmentPrefix, QuarantineName: quarantineName,
 		Detail: fmt.Sprintf("kept %d of %d commit(s) from segment %d (frames before the corrupt one); full original preserved in %s", len(prefixCommits), len(prefixCommits)+1, f.Segment, quarantineName),
 	}, nil
+}
+
+// intactCommitsAfter returns the hashes of the commits in raw's intact frames after offset,
+// reading past damage.
+func intactCommitsAfter(raw []byte, offset int) []string {
+	var out []string
+	_, _ = delta.ScanSkippingCorrupt(raw, func(s delta.ScannedCommit) error {
+		if s.FrameOffset > offset {
+			out = append(out, s.CommitHash.Hex())
+		}
+		return nil
+	})
+	return out
 }
 
 // quarantineSegmentName builds a path for preserved bytes deliberately

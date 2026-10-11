@@ -114,7 +114,18 @@ func (l *commitOpsLoader) refresh() error {
 			continue
 		}
 		segment := seg
-		err := streamer.StreamCommits(segment, func(c document.Commit, offset int64) error {
+		stream := streamer.StreamCommits
+		if seg.Tail.Kind == storage.TailDamaged {
+			// Damaged in place, with intact frames after the damage. Open only gets here when a
+			// checkpoint already holds everything the segment recorded (replay refuses such a
+			// segment); the commits after the damage are as real as those before it, so index
+			// them too rather than stopping where the listing's readable prefix ends. A lookup
+			// for the damaged frame's own commit still fails loudly.
+			if dr, ok := l.reader.(storage.DamageTolerantReader); ok {
+				stream = dr.StreamCommitsPastDamage
+			}
+		}
+		err := stream(segment, func(c document.Commit, offset int64) error {
 			frames[c.Hash] = commitFrameRef{segment: segment, frameOffset: offset}
 			return nil
 		})
