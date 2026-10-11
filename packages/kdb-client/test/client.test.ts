@@ -9,14 +9,17 @@ import { describe, it } from "node:test";
 import { Client, backoffDelay } from "../src/client.ts";
 import {
   KdbAbortedError,
+  KdbBusyError,
   KdbClosedError,
   KdbConflictError,
   KdbError,
   KdbLockError,
   KdbNotFoundError,
   KdbPreconditionError,
+  KdbResourceExhaustedError,
   KdbUnauthenticatedError,
   KdbUnsupportedError,
+  classifiedError,
 } from "../src/errors.ts";
 import { encodeFrame } from "../src/wire/frame.ts";
 import { MSG, type TransactionDto } from "../src/wire/messages.ts";
@@ -587,6 +590,49 @@ describe("SQL", () => {
       assert.equal(error.retryAfterMs, 25);
       return true;
     });
+  });
+});
+
+describe("resource exhaustion", () => {
+  const exhausted = (message: string) =>
+    new FakeServer((request) =>
+      request.kind === "sessionBegin"
+        ? sessionAck(NS)
+        : {
+            kind: "sqlResult",
+            payload: {
+              namespace: NS,
+              sessionId: "sess-1",
+              columns: [],
+              rows: [],
+              rowsAffected: 0,
+              resolvedCommitHex: "",
+              readOnly: true,
+              generatedIds: [],
+              error: message,
+              errorCode: "RESOURCE_EXHAUSTED",
+            },
+          },
+    );
+
+  it("is its own error class, not a busy one", async () => {
+    const server = exhausted("kdb sql: result has more than 10000 rows - add a LIMIT");
+    await assert.rejects(new Client(server).query(NS, "SELECT * FROM t"), (error: unknown) => {
+      assert.ok(error instanceof KdbResourceExhaustedError);
+      assert.ok(!(error instanceof KdbBusyError), "retrying an over-large query fails forever");
+      assert.equal(error.code, "RESOURCE_EXHAUSTED");
+      assert.match(error.message, /resource exhausted/);
+      assert.doesNotMatch(error.message, /busy/);
+      assert.match(error.message, /add a LIMIT/);
+      return true;
+    });
+  });
+
+  it("leaves BUSY retryable and distinct", () => {
+    const busy = classifiedError("queue full", "BUSY", 40);
+    assert.ok(busy instanceof KdbBusyError);
+    assert.equal(busy.retryAfterMs, 40);
+    assert.ok(!(classifiedError("too big", "RESOURCE_EXHAUSTED") instanceof KdbBusyError));
   });
 });
 
