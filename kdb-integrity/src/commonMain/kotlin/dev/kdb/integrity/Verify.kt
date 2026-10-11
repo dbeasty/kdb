@@ -4,14 +4,11 @@
  * corruption, and the repair actions that are provably safe to take on
  * what verification finds. Mirrors go/kdb/integrity exactly.
  *
- * Verification is deliberately independent of [DefaultDeltaSegmentReader]:
- * that reader's listSegments/readAll are replay-oriented and silently
- * discard a [DeltaSegmentScanner.CorruptFrameException] on any segment
- * that isn't the caller's concern at replay time (see
- * DefaultDeltaSegmentReader.scanSegmentRef, which catches the exception
- * and just uses its partialCommits, for every segment - not just the
- * last one). A verification tool exists specifically to not silently
- * discard that information, so it scans raw segment bytes itself.
+ * Verification reads raw segment bytes itself rather than going through
+ * [DefaultDeltaSegmentReader], whose listing keeps only what a segment's
+ * intact frames say. It classifies what follows them with the rule replay
+ * applies ([DeltaSegmentScanner.scanSegment]), so verify and open cannot
+ * disagree about whether a segment lost data.
  */
 package dev.kdb.integrity
 
@@ -24,14 +21,18 @@ import dev.kdb.storage.io.SegmentNameBuilder
 /** The kind of problem a [Finding] reports - see kdb-spec-layer15 §4.2. */
 public enum class Classification {
     /**
-     * A corrupt or short final frame in the highest-sequence segment - by
-     * kdb-spec-layer13 §4.3's rule, the expected shape of an unclean
-     * shutdown (a commit that was never acknowledged), not real
-     * corruption.
+     * A corrupt or short final frame in the highest-sequence segment, with
+     * nothing intact after it - by kdb-spec-layer13 §4.3's rule, the
+     * expected shape of an unclean shutdown (a commit that was never
+     * acknowledged), not real corruption.
      */
     TORN_TAIL,
 
-    /** A corrupt or short frame anywhere other than the tail of the last segment - real corruption, never silently tolerated. */
+    /**
+     * A corrupt or short frame anywhere else: any fault that intact frames follow, in any segment
+     * (N5), and a faulty last frame in a segment that is no longer the newest - real corruption,
+     * never silently tolerated.
+     */
     MID_LOG_CORRUPTION,
 
     /** A commit whose parent hash is not present anywhere in the namespace's scanned log. */
@@ -108,9 +109,12 @@ internal class ScannedSegment(
     val sequence: Long,
     val raw: ByteArray,
     val commits: List<DeltaSegmentScanner.ScannedCommit>,
-    val corrupt: DeltaSegmentScanner.CorruptFrameException?,
-    val consumedBytes: Int,
-)
+    /** How the intact frames end - the rule replay applies (DeltaSegmentScanner.TailKind). */
+    val tail: DeltaSegmentScanner.SegmentTail,
+) {
+    /** Where the intact frames end. */
+    val consumedBytes: Int get() = tail.offset
+}
 
 /**
  * Returns namespaceId's delta segment sequence numbers in ascending
@@ -144,33 +148,8 @@ internal suspend fun readAndScanSegment(
 ): ScannedSegment {
     val name = SegmentNameBuilder.deltaSequenced(namespaceId, seq)
     val raw = shim.readFromSegment(name, 0, Int.MAX_VALUE / 4)
-    return try {
-        val commits = DeltaSegmentScanner.scanSegmentBytes(raw)
-        val consumed =
-            if (commits.isEmpty()) {
-                0
-            } else {
-                val last = commits.last()
-                last.frameOffset + frameLen(raw, last.frameOffset)
-            }
-        ScannedSegment(seq, raw, commits, null, consumed)
-    } catch (e: DeltaSegmentScanner.CorruptFrameException) {
-        ScannedSegment(seq, raw, e.partialCommits, e, e.offset)
-    }
-}
-
-/**
- * Reads the frame header's compressed-body-length field (the
- * same layout DeltaSegmentScanner parses) to compute the full on-disk
- * size of the frame starting at offset, so verify can tell whether a
- * clean scan actually consumed every byte of the segment.
- */
-internal fun frameLen(raw: ByteArray, offset: Int): Int {
-    val b0 = raw[offset + 8].toInt() and 0xFF
-    val b1 = raw[offset + 9].toInt() and 0xFF
-    val b2 = raw[offset + 10].toInt() and 0xFF
-    val b3 = raw[offset + 11].toInt() and 0xFF
-    return FRAME_HEADER_SIZE + ((b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3)
+    val scan = DeltaSegmentScanner.scanSegment(raw)
+    return ScannedSegment(seq, raw, scan.commits, scan.tail)
 }
 
 /** Walks namespaceId's delta log at the requested level and reports exactly what it finds - see kdb-spec-layer15 Component 58. */
@@ -193,21 +172,35 @@ public suspend fun verify(shim: PlatformIoShim, namespaceId: String, opts: Optio
         segments += SegmentSummary(seq, ss.raw.size.toLong(), ss.commits.size)
         val isLastSegment = i == seqs.lastIndex
 
-        if (ss.corrupt != null) {
-            val cls = if (isLastSegment) Classification.TORN_TAIL else Classification.MID_LOG_CORRUPTION
-            findings += Finding(namespaceId, Level.L1, seq, ss.corrupt.offset, cls, ss.corrupt.reason)
-        } else if (ss.consumedBytes < ss.raw.size) {
-            val trailing = ss.raw.size - ss.consumedBytes
-            val cls: Classification
-            val detail: String
-            if (isLastSegment) {
-                cls = Classification.TORN_TAIL
-                detail = "$trailing trailing byte(s) after the last valid frame - an incomplete write never fsynced before shutdown"
-            } else {
-                cls = Classification.MID_LOG_CORRUPTION
-                detail = "$trailing trailing byte(s) after the last valid frame were never consumed by a frame - truncated data in a sealed segment"
+        // The rule replay applies (DeltaSegmentScanner.TailKind; Go's storage.TailKind). Zero
+        // padding after the last frame is no finding. Damage that intact frames follow is
+        // mid-log corruption wherever it is, the newest segment included: calling it a torn
+        // tail there let repair truncate away the intact commits after it (N5).
+        val tail = ss.tail
+        when (tail.kind) {
+            DeltaSegmentScanner.TailKind.DAMAGED -> {
+                val detail =
+                    if (tail.nextIntactFrame >= 0) {
+                        "${tail.reason} - intact frames follow it (the next at offset ${tail.nextIntactFrame}), so this is damage in place, not a torn tail"
+                    } else {
+                        "${tail.reason} - damaged in place, not a torn tail"
+                    }
+                findings += Finding(namespaceId, Level.L1, seq, tail.offset, Classification.MID_LOG_CORRUPTION, detail)
             }
-            findings += Finding(namespaceId, Level.L1, seq, ss.consumedBytes, cls, detail)
+            DeltaSegmentScanner.TailKind.TORN -> {
+                // Nothing intact follows. In an older segment that is a torn tail from an earlier
+                // unclean shutdown or a damaged last frame - indistinguishable here - so it stays
+                // mid-log corruption, which repair removes only if no later commit builds on it.
+                val cls = if (isLastSegment) Classification.TORN_TAIL else Classification.MID_LOG_CORRUPTION
+                val detail =
+                    if (isLastSegment) {
+                        "${tail.reason}, with no intact frame after it - an incomplete write never fsynced before shutdown"
+                    } else {
+                        "${tail.reason}, ${ss.raw.size - tail.offset} byte(s) before the end of the segment, with no intact frame after it - in a segment that is no longer the newest, so either a torn tail from an earlier unclean shutdown or a damaged last frame"
+                    }
+                findings += Finding(namespaceId, Level.L1, seq, tail.offset, cls, detail)
+            }
+            DeltaSegmentScanner.TailKind.CLEAN -> Unit
         }
 
         for (sc in ss.commits) {

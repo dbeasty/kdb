@@ -214,9 +214,8 @@ func TestIndexCacheIsBounded(t *testing.T) {
 // once, for the race detector, and then checks nothing was lost: every key ever added resolves,
 // and the cache holds no index for a table the store no longer has.
 //
-// Lookups during the run are not asserted. A lookup that took the table list just before a
-// compaction swapped it can find an input already deleted and miss - a window that predates
-// the index cache (the per-probe reader hit the same deleted file) and is not closed here.
+// Lookups during the run are not asserted here; TestLookupNeverMissesUnderConcurrentCompaction
+// asserts them, now that a lookup pins the tables it reads (lookup_race_test.go).
 func TestIndexCacheConcurrentLookupAndCompaction(t *testing.T) {
 	io := storio.NewInMemoryPlatformIO()
 	ns := "app/docs"

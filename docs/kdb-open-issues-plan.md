@@ -163,7 +163,7 @@ readable data but still can't read JVM/Go-written compressed data. Say so in the
 ### U6. Issue #43 — acknowledged write unreadable after `kill -9` — L, in four steps
 
 **Status: U6a done** (#112, which also added the multi-node suite); **U6c done** (#121; see the
-progress log, which also records a third silent path it found); **U6b done** (#122: the server-path reproducer, plus a nightly Linux soak); **U6d: no loss reproduced** in 620 kills across five configurations (110,950 acknowledged writes). #43 stays open until the nightly Linux soak has run (see the progress log).
+progress log, which also records a third silent path it found); **U6b done** (#122: the server-path reproducer, plus a nightly Linux soak); **U6d: no loss reproduced** in 620 kills across five configurations (110,950 acknowledged writes); **N5 done** (the third silent path - damaged frames truncating a segment - closed in Go and Kotlin; see the progress log). #43 stays open until the nightly Linux soak has run (see the progress log).
 
 The durability contract is the most important open item. It is sequenced so each step is its own PR
 and each makes the next one possible. **Do not relax or retry the test** at any step.
@@ -758,6 +758,49 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   and reports the slowest restart instead. Fix: `perf/sstable-index-cache`.
   **(N5)** the third silent recovery path from U6c: damage in the middle of a segment that is no
   longer the newest truncates that segment at the damage, with no error.
+- **2026-10-11 — mixed-version upgrade check, the pre-release check before v0.7.0** (branch
+  `test/mixed-version-upgrade`). Since v0.6.2, main changed multi-node behaviour (#114 canonical
+  joins and `SupersedesHead` replay, #111 fork-point SNAPSHOT_FETCH folded by the serving node,
+  #113 unlogged peer commits kept out of checkpoints, #121 unscannable segments fail the open),
+  and deployments upgrade one node at a time, so `kdb-integration/e2e/test_upgrade.py` runs
+  v0.6.2 and this build in one mesh. Harness: `KdbServer.service_bin` / `restart(service_bin=)`
+  and `Cluster(service_bins=...)` / `Cluster.switch_binary` switch a node's binary on the same
+  data dir and pinned ports; `KDB_SERVICE_BIN_PREV` names the old binary (tests skip without
+  it); `make build-prev-service` (`scripts/build-prev-service.sh`) builds it from the tag via
+  `git archive`. Every flag the fixtures pass exists in v0.6.2 (the only flag main added is
+  `--max-result-rows`); the launch now checks a binary's `--help` and names the binary and
+  version if a flag is missing. New nightly job `e2e-upgrade` (~4 minutes). Results, 4 runs of
+  the file plus probes, macOS, load 3-7: **passing every run** - a 3-node v0.6.2 mesh upgraded a
+  node at a time under writes, by clean stop and by SIGKILL (this build recovers a log v0.6.2
+  crashed in), converged after every step with every acknowledged write; a 2-old + 3-new mesh
+  with SIGKILLs converged and stayed on one head after writes stopped (no merge storm from the
+  old pair); SQL schema and rows from v0.6.2 read, updated and deleted on new nodes; a snapshot
+  joiner served by v0.6.2 always hit the boundary and reported the typed `ShallowBoundaryError`
+  (cause `INTERNAL: no tree`, the old server cannot fold), never a silent stall, and
+  `POST /v1/ns/{ns}/deepen` recovered it; `bootstrap=snapshot,deepen=true` converged directly.
+  **Rollback to v0.6.2:** safe from a clean stop of every node, and safe after a crash once the
+  node has been started on this build and stopped cleanly. **Not safe straight after a crash**
+  (xfail, 4 of 4): v0.6.2's replay does not move main onto a logged canonical join that does not
+  descend from it, so every later write is stored but not applied. A/B on the same crashed data
+  dirs (5 nodes): this build opens with 0 of 30 documents behind, v0.6.2 with 30 of 30 behind;
+  once v0.6.2 stops cleanly its checkpoint names the stale head and this build reopens there too,
+  and in one probe run the whole mesh converged on the old values. **Found (not fixed here):**
+  the `deepen=true` peer option the `ShallowBoundaryError` message recommends cannot recover a
+  joiner that is already stuck - `replication.peerLoop.deepen` skips any namespace whose sync
+  returned an error, and the boundary error is one (xfail
+  `test_deepen_peer_option_recovers_a_stuck_snapshot_joiner`, 4 of 4). Also fixed in the
+  harness: `preserve_evidence` failed teardown with `shutil.Error` when a running node's
+  `peers/*.json.tmp` vanished mid-copy, hiding the test's own failure.
+
+- **2026-10-11 — the deepen=true peer option ignored a stuck snapshot joiner (found by #125).**
+  `replication.peerLoop.deepen` skipped every namespace whose sync returned an error, and the
+  `ShallowBoundaryError` a joiner reports (when a peer, e.g. v0.6.2, cannot supply a fork point's
+  state behind its snapshot root) is one, though its message names `deepen=true` as the cure.
+  `deepenAfter` now lets that error, and only that one, through; a lost connection or a refused
+  push still skips deepen. Evidence: #125's `test_deepen_peer_option_recovers_a_stuck_snapshot_joiner`
+  against a real v0.6.2 server fails with the old binary and passed 3 of 3 with the fix (its xfail
+  mark is removed); the whole upgrade suite passes; `TestDeepenRunsAfterAShallowBoundaryError`
+  pins the decision. The release notes drop it from Known issues and list it under Fixes.
 
 - **2026-10-11 — found while working on #43 (U6): crash-recovery open scaled with commits ×
   SSTable size** (branch `perf/sstable-index-cache`). The #43 kill -9 reproducer left a namespace
@@ -793,6 +836,128 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   concurrency, the no-sizer fallback, file-backed size), and the opt-in measurement
   `TestReplayOpenTimeWithoutCheckpoint` (`KDB_REPLAY_COMMITS=14000`) in `go/kdb/embed`.
 
+- **2026-10-11 — found by #123: a lookup racing a compaction could report a stored key as
+  missing** (branch `fix/compaction-lookup-race`). `LsmBlobStore.Lookup`/`Contains`
+  (`go/kdb/storage/sstable/types.go`) took the table list under the lock and read the tables
+  after releasing it; `Compact` swapped its output in and deleted its inputs straight away. A
+  lookup holding the pre-swap list then read deleted files, treated the read error as "this table
+  cannot answer", and never saw the merged table: not found. Predates #123 (the per-probe reader
+  hit the same deleted file). **Real impact:** live documents are pinned in `docsByHash`, so the
+  common read is unaffected. What reaches the blob store is a version that is not resident:
+  `GetDocument`/`ScanDocuments` (`engine/server_engine.go`) → `documentFromObject`
+  (`tree_objects.go`) → `loadCold` → `loadDocumentBody` (`document_bodies.go`). Under
+  `history=none` after truncation, or with bodies external (snapshot bootstrap, truncated
+  horizon), a miss there falls through to a delta log that no longer holds the version, so
+  `GetDocument` reported a stored document as not found and `ScanDocuments` **silently skipped the
+  row** - including live documents on their first read after reopen, which are not resident until
+  then. Under `history=full` the misses fall back to the log (`coldLoader`, tree folding in
+  `treeAt`): slower, not wrong. `MaterializeLiveBodies` re-wrote a body it thought missing
+  (harmless), and replay's `skipExistingObject` runs before maintenance starts. Compaction runs only
+  from maintenance (`CompactBlobStore` via `withCompaction` in `embed/checkpoint_open.go`, driven by
+  `embed/maintenance_loop.go`), concurrently with reads. **Fix, no format change:** reference-count
+  tables. `pin` takes the newest-first list and counts a reader on every table in one critical
+  section; `release` drops the counts and deletes any table a compaction has doomed once its last
+  reader is gone. `Compact` pins its own inputs, and at the swap (same lock) deletes at once an
+  input only it holds, and dooms the rest (`CompactionResult.Deferred`). An unregistered table
+  cannot be pinned, so a doomed table gains no new readers and the last release always deletes it.
+  The index cache stays correct: inputs' indexes are still dropped at the swap, and `indexFor`
+  only caches a registered table, so a pinned reader of a doomed table reads its index from the
+  file (still present) without re-caching it. `Compact` is now serialized (`compactMu`); two at
+  once would merge the same inputs and the second would fail reading the first's deletions.
+  Crash safety is unchanged: a crash with deletions pending is the existing crash between swap
+  and deletes, widened only by the longest lookup in flight; the next open rediscovers the inputs,
+  content addressing means they cannot change an answer, and the next compaction merges and
+  deletes them. The history-modes plan's item 7 (a leftover input shadowing a tombstone) is still
+  unreachable - nothing in production writes an SSTable tombstone - and still has to be closed by
+  whoever starts writing them. Tests (`go/kdb/storage/sstable/lookup_race_test.go`): a
+  deterministic interleaving through a test hook between taking the list and reading (Lookup, and
+  Contains with indexes evicted), and a stress run of 6 readers against 40 flushes and 60
+  compactions that asserts zero misses and no orphaned file. With deferral reverted: Lookup
+  `found=false`, Contains `false`, and 23 of 4,990 stress probes missed; with it, none.
+
+- **2026-10-11 — N5: damaged frames no longer silently truncate history (branch
+  `fix/damaged-segment-silent-truncation`).** The third silent recovery path #121 found. Both holes
+  lost acknowledged commits with no error.
+  - **Root cause.** Every scanner ended a segment at its first garbled header or CRC mismatch and
+    recorded only the bytes before it, which is the right answer for a torn tail and the wrong
+    one for damage. `DefaultReader.scanSegmentRef` (`storage/delta/writer.go`, main's lines
+    416-433) did this in any segment, so replay streamed only the prefix and its "corrupt and not
+    the most recent segment" refusal (`embed/delta_replay.go:132`) could never fire. Replay also
+    accepted any `CorruptFrameError` in the newest segment as a torn tail (`:117`), even with
+    intact frames after it. Kotlin had the same holes: `DeltaSegmentScanner.scanSegmentBytes`
+    `break`s at a garbled header in any segment (`:62`), so even #81's `intactFramesAfter` was
+    never computed for one. And it refused a legitimate torn tail in an older segment (`:55`).
+  - **The rule, at the scanner, applied by every consumer.** A torn tail can only be bytes at the
+    very end of a segment with nothing intact after them. A segment's listing now carries
+    `DeltaSegmentRef.Tail` (`storage.TailKind`). The values are `clean` (nothing, or only zero
+    padding), `torn`, or `damaged` (an intact frame follows the stop, or a CRC-valid frame will not
+    decode). "Intact" means a well-formed v2 header plus a body matching its CRC, found by
+    searching for the frame magic past the stop (`delta.NextIntactFrame`), not by following frame
+    lengths. That is how it sees past a garbled header.
+    - Replay refuses `damaged` in any segment with a typed `*delta.DamagedSegmentError`
+      (namespace, sequence, byte offset, next intact frame), pointing at `kdb-inspect verify`,
+      restore and `repair-segments`. It tolerates `torn` in any segment.
+    - Listing does not refuse. #81's `damagedInPlace` still opens from a checkpoint that already
+      holds a damaged segment's commits. It now also reads past a garbled header, and works for
+      preallocated segments by comparing where the frames end instead of the file size.
+    - The ops loader indexes past damage, so commits after it keep their operations.
+    - `kdb-inspect verify` reports damage that intact frames follow as `mid_log_corruption` in
+      every segment. In the newest one it used to say `torn_tail`, and `repair-segments` then
+      truncated the intact commits after it away. Zero padding is no longer a finding.
+    - Repair refuses to keep a prefix when intact commits follow the damage, and names them.
+    - Kotlin applies the same rule: the scanner, the `DeltaNamespaceReplayer` (now
+      `DamagedSegmentException`), and `kdb-integrity` verify and repair.
+  - **Why sound.** Appends to a segment are sequential and `OpenWriter` always starts a fresh
+    segment, so an append that never completed cannot be followed by one that did. Torn tails
+    stay recoverable:
+    - in the newest segment;
+    - after a restart, at the end of an older segment, which is the kill -9 sequence;
+    - as a header torn just after its magic. A zero-length body is no longer a frame. On main
+      that preallocated-segment shape read as a complete frame that will not decode, and made the
+      namespace unopenable with `UnreadableSegmentError`.
+  - **A damaged LAST frame of an older segment.** With nothing intact after it, this is
+    byte-for-byte the torn tail a crash leaves there. A full-length frame failing its CRC is also
+    what a preallocated file or a power loss leaves, so the bytes cannot tell them apart. Two
+    things still can:
+    - A torn tail is never built on. When later commits name parents the log lacks and an older
+      segment ended torn, replay reports `DamagedSegmentError{BuiltOn}` for that segment rather
+      than only the missing commit.
+    - A checkpoint that covered the segment proves the damage is in place.
+    Only a damaged last frame that nothing was built on and no checkpoint covered still opens at
+    the commit before it, exactly as the crash it is indistinguishable from must.
+  - **Before/after.** Uncompressed frames, damage at frame 2 of 4, no checkpoint. Shown as
+    main → this branch:
+    - Middle of the newest segment: magic flip, body flip or codec byte each opened at commit 5
+      of 8 → `DamagedSegmentError`.
+    - Middle of an older segment: refused only indirectly, by an untyped "parent commits never
+      found" (magic or body flip) because the next segment builds on the lost commits → typed
+      error naming segment and byte.
+    - #121's probe (6 commits, an empty run, the 4th frame's magic flipped): opened at 3 of 6 →
+      refused.
+    - Preallocated segment with damage in the middle and a checkpoint: refused → opens at 6 of 6
+      from the checkpoint.
+    - Torn header in an older segment: unopenable → recovers.
+    - `kdb-inspect` on a damaged newest segment: verify said `torn_tail` and repair truncated 2
+      acknowledged commits → `mid_log_corruption` ("intact frames follow it"), and repair refuses,
+      naming both.
+  - **Tests**, each confirmed failing with its fix reverted:
+    - `embed/damaged_segment_test.go`: file-backed. Asserts the head and which commits exist, with
+      and without a checkpoint and preallocation.
+    - `storage/delta/damaged_segment_test.go`, including frames straddling the 1 MiB scan windows.
+    - `integrity/damaged_segment_test.go`.
+    - Kotlin `DeltaSegmentTailTest` (all targets), `DamagedSegmentTest` (kdb-integrity) and
+      `DeltaNamespaceReplayerDamageTest` (kdb-jdbc).
+  - **Gates.** `go test -race ./...`; the kill -9 reproducer at 40 kills (9,703 acknowledged
+    writes, all intact) and with `KDB_PREALLOCATE_SEGMENTS=true` (40 kills, 3,923 writes, all
+    intact, slowest restart 3.8 s); e2e `-k "kill9 or crash or scrub"` (5 passed).
+  - **Found, not fixed:**
+    - Backup (`integrity.VerifiedSegmentPrefix`) still uploads only the prefix before damage. A
+      backup of a segment damaged in place silently lacks the commits after the damage. Uploading
+      the whole file, or refusing, needs a decision.
+    - Kotlin's `scanSegmentRef` still skips a segment it cannot read (Go's U6c fix was Go-only).
+    - A power loss that persists a later page of a batch before an earlier one would leave intact
+      frames after a hole. Neither was acknowledged, but this rule refuses it as damage, which is
+      the safe direction.
 - **2026-10-11 — found by e2e testing: resolution chains on a mesh do not always converge on the
   value the rule defines** (branch `test/conflict-rule-convergence`, test-only). #114 made merges
   of same-content heads converge. This asks whether merges of *different* content, which are

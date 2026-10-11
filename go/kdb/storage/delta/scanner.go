@@ -30,13 +30,36 @@ type ScannedCommit struct {
 // on disk before its body did. ScanSegmentBytes cannot tell those apart
 // by itself; it reports the offset and lets the caller decide based on
 // context it doesn't have (is this the most recently written segment?).
+//
+// IntactFramesAfter and Undecodable are what let the caller decide (N5): a torn tail is the
+// segment's last bytes, with nothing intact after them, so a fault followed by an intact frame,
+// or a frame whose body passes its CRC and still will not decode, is damage wherever it is.
+// See Torn and storage.TailKind.
 type CorruptFrameError struct {
 	Offset int
 	Reason string
+	// IntactFramesAfter counts the complete, CRC-valid frames found after the fault, reading past
+	// further damage (see NextIntactFrame).
+	IntactFramesAfter int
+	// NextIntactFrame is the offset of the first of them, or -1.
+	NextIntactFrame int
+	// Undecodable is set when the frame passed its CRC but would not decode: a torn write cannot
+	// produce that, because a frame's CRC only matches once all of its body has been written.
+	Undecodable bool
 }
 
 func (e *CorruptFrameError) Error() string {
-	return fmt.Sprintf("delta segment: corrupt frame at offset %d: %s", e.Offset, e.Reason)
+	msg := fmt.Sprintf("delta segment: corrupt frame at offset %d: %s", e.Offset, e.Reason)
+	if e.IntactFramesAfter > 0 {
+		msg += fmt.Sprintf(" (%d intact frame(s) follow it, the first at offset %d)", e.IntactFramesAfter, e.NextIntactFrame)
+	}
+	return msg
+}
+
+// Torn reports whether this fault has the shape of a torn tail: nothing intact after it, and not
+// a complete frame that merely fails to decode. Anything else is damage in place.
+func (e *CorruptFrameError) Torn() bool {
+	return !e.Undecodable && e.IntactFramesAfter == 0
 }
 
 // ScanSegmentBytes scans delta segment bytes (sequential KDBP frames). Each
@@ -74,44 +97,65 @@ func ScanSegmentBytes(bytes []byte) ([]ScannedCommit, error) {
 // (docs/benchmarks/open-cost.md).
 //
 // Error semantics match ScanSegmentBytes exactly: a torn tail (a frame
-// whose declared length runs past the end of bytes, or a garbled header)
-// stops the walk cleanly with a nil error, while a CRC mismatch or a frame
-// that is complete but will not parse returns *CorruptFrameError. In every
+// whose declared length runs past the end of bytes, or a garbled header
+// with no intact frame after it) or zero padding stops the walk cleanly
+// with a nil error. A CRC mismatch, a frame that is complete but will not
+// parse, or a garbled header that intact frames follow returns
+// *CorruptFrameError, which counts the intact frames after the fault so the
+// caller can tell a torn tail from damage (CorruptFrameError.Torn). In every
 // case each frame already handed to fn stands - that partial progress is
 // what makes torn-tail tolerance work. An error returned by fn stops the
 // walk and is propagated unwrapped.
 func ScanSegmentFrames(bytes []byte, fn func(ScannedCommit) error) error {
+	_, err := scanFrames(bytes, fn)
+	return err
+}
+
+// scanFrames is ScanSegmentFrames, also reporting where the walk stopped: the end of the last
+// frame handed to fn, or the offset of the faulty one.
+func scanFrames(bytes []byte, fn func(ScannedCommit) error) (int, error) {
 	var codec PageCodec
 	offset := 0
 	for offset+frameHeaderSize <= len(bytes) {
 		frameEnd, ok := frameBounds(bytes, offset)
 		if !ok {
-			// Torn tail or garbled header: no valid frame here or after
-			// it. Not an error - stop cleanly with what came before.
 			break
 		}
 		frame := bytes[offset:frameEnd]
 		if err := verifyFrameCRC(frame, offset); err != nil {
-			return err
+			return offset, newCorruptFrameError(bytes, offset, err.(*CorruptFrameError).Reason, false)
 		}
 		payload, err := codec.Parse(frame)
 		if err != nil {
-			return &CorruptFrameError{Offset: offset, Reason: err.Error()}
+			return offset, newCorruptFrameError(bytes, offset, err.Error(), true)
 		}
 		commit, err := document.FromPayloadBytes(payload)
 		if err != nil {
-			return &CorruptFrameError{Offset: offset, Reason: err.Error()}
+			return offset, newCorruptFrameError(bytes, offset, err.Error(), true)
 		}
 		if err := fn(ScannedCommit{
 			CommitHash:  commit.Hash,
 			Commit:      commit,
 			FrameOffset: offset,
 		}); err != nil {
-			return err
+			return offset, err
 		}
 		offset = frameEnd
 	}
-	return nil
+	if offset < len(bytes) {
+		// A torn tail, zero padding or a garbled header: only what follows tells them apart. This
+		// used to end the walk as quietly as a torn tail even with intact frames after it, which
+		// is how a flipped byte in a frame header silently truncated a segment (N5).
+		if next := NextIntactFrame(bytes, offset); next >= 0 {
+			return offset, &CorruptFrameError{
+				Offset:            offset,
+				Reason:            describeStop(bytes[offset:]),
+				IntactFramesAfter: countIntactFramesFrom(bytes, next),
+				NextIntactFrame:   next,
+			}
+		}
+	}
+	return offset, nil
 }
 
 // frameBounds returns the end offset of the frame starting at offset, and
@@ -124,7 +168,11 @@ func frameBounds(bytes []byte, offset int) (frameEnd int, ok bool) {
 		return 0, false
 	}
 	compressedSize := readIntBE(bytes, offset+8)
-	if compressedSize < 0 {
+	if compressedSize <= 0 {
+		// The writer never frames an empty payload, and a header torn just after its magic -
+		// the rest still zero, as in a preallocated segment - declares exactly this, with a CRC
+		// of zero that an empty body matches. Read as a frame, a torn tail would look like a
+		// complete frame that will not decode, which is damage.
 		return 0, false
 	}
 	frameEnd = offset + frameHeaderSize + compressedSize
@@ -323,15 +371,34 @@ func decodeFrameAt(pc *PageCodec, bytes []byte, offset int) (document.Commit, er
 // would leave the history after it unreplayable. What this lets a caller see is that the frames
 // after a damaged one are intact - the difference between a flipped bit in the middle of a log
 // and a torn tail at its end.
+//
+// A garbled header that intact frames follow is skipped too, by searching for the next intact
+// frame (NextIntactFrame); its offset is reported like a damaged frame's. One that nothing intact
+// follows is the segment's tail, torn or padding, and ends the walk without being reported.
 func ScanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, error) {
+	skipped, _, err := scanSkippingCorrupt(bytes, fn)
+	return skipped, err
+}
+
+// scanSkippingCorrupt is ScanSkippingCorrupt, also reporting where the last complete frame it
+// walked - intact or damaged - ends.
+func scanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, int, error) {
 	var codec PageCodec
 	var skipped []int
 	offset := 0
+	framesEnd := 0
 	for offset+frameHeaderSize <= len(bytes) {
 		frameEnd, ok := frameBounds(bytes, offset)
 		if !ok {
-			break
+			next := NextIntactFrame(bytes, offset)
+			if next < 0 {
+				break
+			}
+			skipped = append(skipped, offset)
+			offset = next
+			continue
 		}
+		framesEnd = frameEnd
 		frame := bytes[offset:frameEnd]
 		if verifyFrameCRC(frame, offset) != nil {
 			skipped = append(skipped, offset)
@@ -351,9 +418,9 @@ func ScanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, err
 			continue
 		}
 		if err := fn(ScannedCommit{CommitHash: commit.Hash, Commit: commit, FrameOffset: offset}); err != nil {
-			return skipped, err
+			return skipped, framesEnd, err
 		}
 		offset = frameEnd
 	}
-	return skipped, nil
+	return skipped, framesEnd, nil
 }

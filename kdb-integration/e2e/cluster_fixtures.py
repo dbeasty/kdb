@@ -110,12 +110,18 @@ class Cluster:
     conflict_policy: str = "strict"
     node_args: list = field(default_factory=list)
     control_write: bool = False
+    # service_bins: the kdb-service binary per node (index i is node i; "" or a missing entry
+    # means today's binary). Mixed-version clusters start this way; Cluster.switch_binary moves
+    # one node to another binary on the same data dir and ports.
+    service_bins: list = field(default_factory=list)
     nodes: list[KdbServer] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        bins = list(self.service_bins) + [""] * (self.size - len(self.service_bins))
         self.nodes = [
-            KdbServer(control=True, control_write=self.control_write, pin_ports=True).reserve_ports()
-            for _ in range(self.size)
+            KdbServer(control=True, control_write=self.control_write, pin_ports=True,
+                      service_bin=bins[i]).reserve_ports()
+            for i in range(self.size)
         ]
         for i, node in enumerate(self.nodes):
             node.extra_args = list(self.node_args) + [
@@ -138,9 +144,23 @@ class Cluster:
             node.start()
         return self
 
-    def add_node(self, peer_spec_extra: str = "", peer_of: int = 0) -> KdbServer:
+    def switch_binary(self, i: int, binary: str, kill: bool = False) -> KdbServer:
+        """Moves node i to `binary`: a clean stop (asserted to exit 0), or SIGKILL when `kill`,
+        then a restart on the same data dir and the same pinned ports - one step of a rolling
+        upgrade."""
+        node = self.nodes[i]
+        if kill:
+            node.kill9()
+        else:
+            code = node.stop()
+            assert code == 0, f"n{i} did not stop cleanly (exit {code}):\n{tail(node.logs())}"
+        return node.restart(service_bin=binary)
+
+    def add_node(self, peer_spec_extra: str = "", peer_of: int = 0,
+                 service_bin: str = "") -> KdbServer:
         """A node joining later, peering with one existing node."""
-        node = KdbServer(control=True, control_write=self.control_write, pin_ports=True).reserve_ports()
+        node = KdbServer(control=True, control_write=self.control_write, pin_ports=True,
+                         service_bin=service_bin).reserve_ports()
         spec = f"name=n{peer_of},addr={self.nodes[peer_of].peer_addr},interval={self.interval}"
         if peer_spec_extra:
             spec += "," + peer_spec_extra
@@ -192,7 +212,8 @@ class Cluster:
         lines = []
         for i, n in enumerate(self.nodes):
             alive = n.proc is not None and n.proc.poll() is None
-            lines.append(f"== n{i} {'up' if alive else 'DOWN'} sql={n.sql_addr}")
+            lines.append(f"== n{i} {'up' if alive else 'DOWN'} sql={n.sql_addr} "
+                         f"bin={n.binary}")
             if not alive:
                 continue
             try:

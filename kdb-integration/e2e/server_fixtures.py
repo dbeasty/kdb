@@ -45,6 +45,46 @@ def service_bin() -> str:
     return _binary("KDB_SERVICE_BIN", "go/bin/kdb-service")
 
 
+def prev_service_bin() -> str | None:
+    """The previous release's kdb-service (``KDB_SERVICE_BIN_PREV``) for the mixed-version
+    upgrade tests, or None when it is not set. Build it with `make build-prev-service`
+    (scripts/build-prev-service.sh); tests that need it skip without it."""
+    path = os.environ.get("KDB_SERVICE_BIN_PREV")
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        raise RuntimeError(f"KDB_SERVICE_BIN_PREV={path} does not exist")
+    return path
+
+
+_flag_cache: dict[str, frozenset[str]] = {}
+
+
+def supported_flags(binary: str) -> frozenset[str]:
+    """The flags a kdb-service binary accepts, read from its --help once per binary.
+
+    The harness drives binaries of different releases with one launch command. A flag a binary
+    does not know is a startup failure ("flag provided but not defined"), so it is caught before
+    the launch with a message naming the binary and its version instead. v0.6.2 accepts every flag
+    the fixtures pass; the only flag main has added since is --max-result-rows."""
+    cached = _flag_cache.get(binary)
+    if cached is None:
+        r = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=30)
+        names = set()
+        for line in (r.stdout + r.stderr).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("-"):
+                names.add(stripped.lstrip("-").split()[0].split("=")[0])
+        cached = _flag_cache[binary] = frozenset(names)
+    return cached
+
+
+def binary_version(binary: str) -> str:
+    """The first line of `<binary> --version`, e.g. "0.6.2 (commit afa9351, ...)"."""
+    r = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30)
+    return ((r.stdout or r.stderr).strip().splitlines() or ["?"])[0]
+
+
 def helper_bin() -> str:
     return _binary("KDB_E2E_HELPER_BIN", "go/bin/kdb-e2e-helper")
 
@@ -167,6 +207,10 @@ class KdbServer:
     # pin_ports: keep the same ports across restarts. Peers name each other by address in their
     # --peer specs, so a node that came back on new ports would silently drop out of the cluster.
     pin_ports: bool = False
+    # service_bin: the kdb-service binary this server runs; empty means today's service_bin().
+    # restart(service_bin=...) switches it on the same data dir and (with pin_ports) the same
+    # ports - how the upgrade tests move a node from one release to the next.
+    service_bin: str = ""
 
     data_dir: str = ""
     sql_port: int = 0
@@ -180,6 +224,10 @@ class KdbServer:
 
     _bootstrapped: bool = False
 
+    @property
+    def binary(self) -> str:
+        return self.service_bin or service_bin()
+
     def start(self) -> "KdbServer":
         if not self.data_dir:
             self.data_dir = tempfile.mkdtemp(prefix="kdb-e2e-srv-")
@@ -189,12 +237,12 @@ class KdbServer:
             return self._launch()
         for role, grants in self.bootstrap_roles:
             subprocess.run(
-                [service_bin(), "user", "role", "--data-dir", self.data_dir,
+                [self.binary, "user", "role", "--data-dir", self.data_dir,
                  "--role", role, "--grants", grants],
                 check=True, capture_output=True, text=True)
         for user, password, roles in self.bootstrap_users:
             subprocess.run(
-                [service_bin(), "user", "create", "--data-dir", self.data_dir,
+                [self.binary, "user", "create", "--data-dir", self.data_dir,
                  "--user", user, "--password", password, "--roles", roles],
                 check=True, capture_output=True, text=True)
         self._bootstrapped = True
@@ -248,7 +296,7 @@ class KdbServer:
         self.launches += 1
         self.log_path = os.path.join(self.data_dir, f"service.{self.launches}.log")
         cmd = [
-            service_bin(),
+            self.binary,
             "--data-dir", self.data_dir,
             "--namespace", self.namespace,
             "--sql-addr", f"tcp://127.0.0.1:{self.sql_port}?bind=true",
@@ -267,7 +315,15 @@ class KdbServer:
         if self.tls:
             cmd += ["--tls-cert", self.tls.server_cert, "--tls-key", self.tls.server_key]
         cmd += self.extra_args
+        unknown = sorted({a[2:].split("=")[0] for a in cmd[1:] if a.startswith("--")}
+                         - supported_flags(self.binary))
+        if unknown:
+            raise RuntimeError(f"{self.binary} ({binary_version(self.binary)}) does not accept "
+                               f"{', '.join('--' + f for f in unknown)}")
         log = open(self.log_path, "w")
+        # Not JSON, so log_lines() skips it: which binary this launch ran, for the evidence.
+        log.write(f"# launch {self.launches}: {self.binary}\n")
+        log.flush()
         self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
         self.wait_ready()
         return self
@@ -352,9 +408,12 @@ class KdbServer:
             self.proc.send_signal(signal.SIGKILL)
             self.proc.wait(timeout=10)
 
-    def restart(self) -> "KdbServer":
-        """Start again over the same data dir (new ports)."""
+    def restart(self, service_bin: str | None = None) -> "KdbServer":
+        """Start again over the same data dir (new ports unless pin_ports), optionally switching
+        to a different kdb-service binary first."""
         assert self.proc is None or self.proc.poll() is not None, "stop/kill first"
+        if service_bin is not None:
+            self.service_bin = service_bin
         return self.start()
 
     def cleanup(self) -> None:
@@ -376,7 +435,13 @@ def preserve_evidence(name: str, servers: list["KdbServer"], notes: str = "") ->
     dest.mkdir(parents=True, exist_ok=True)
     for i, srv in enumerate(servers):
         if srv.data_dir and os.path.isdir(srv.data_dir):
-            shutil.copytree(srv.data_dir, dest / f"node{i}", dirs_exist_ok=True)
+            try:
+                shutil.copytree(srv.data_dir, dest / f"node{i}", dirs_exist_ok=True)
+            except shutil.Error as e:
+                # The node is usually still running, so a temp file (peers/*.json.tmp) can vanish
+                # between listing and copying. Keep everything else rather than failing teardown
+                # with this error in place of the test's own.
+                notes += f"\n\nnode{i}: files that changed during the copy: {e}"
     if notes:
         (dest / "notes.txt").write_text(notes)
     return str(dest)

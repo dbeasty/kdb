@@ -1,4 +1,4 @@
-.PHONY: test-go test-kotlin test-cross test-physical-golden build-go build-kotlin bench bench-write print-version \
+.PHONY: test-go test-kotlin test-cross test-physical-golden build-go build-kotlin build-prev-service bench bench-write print-version \
         release release-go release-bundle bundle-verify release-binaries release-kotlin \
         release-checksums release-all release-verify release-clean
 
@@ -100,6 +100,13 @@ build-go:
 
 build-kotlin:
 	./gradlew build --no-daemon
+
+# The previous release's kdb-service, for the mixed-version upgrade e2e tests
+# (kdb-integration/e2e/test_upgrade.py): built from the PREV_TAG tag into go/bin/prev/ without
+# touching this checkout. Then: export KDB_SERVICE_BIN_PREV=$$PWD/go/bin/prev/kdb-service-$(PREV_TAG)
+PREV_TAG ?= v0.6.2
+build-prev-service:
+	./scripts/build-prev-service.sh $(PREV_TAG)
 
 # What the binaries in bin/ will claim to be. Handy for checking the injection before a release.
 print-version:

@@ -51,6 +51,12 @@ written before #109 is refused (no Native build was ever released).
 
 ## Fixes — distributed sync
 
+**The `deepen=true` peer option now rescues a snapshot joiner stuck behind its root.** The
+`ShallowBoundaryError` such a joiner reports names `deepen=true` as a cure, but the replicator
+skipped deepen for any namespace whose sync had just failed, which that error always is. It now
+deepens after that error, and only that one; other failures still skip it. Found by the
+mixed-version upgrade test (#125), whose test of it now passes against a v0.6.2 server.
+
 **A five-node mesh could fall into a merge storm and never converge (#114).** Nodes holding
 identical documents kept creating empty merge commits faster than they spread: over 10,000
 after writes had stopped, with every sync succeeding and no node ever settling. Needed three or
@@ -126,11 +132,25 @@ packages compiles none of this in, but the requirements are in the bundle's modu
 
 ## Upgrading
 
-_To be completed from the mixed-version upgrade test (in progress): whether a cluster can be
-upgraded node by node with old and new nodes syncing in between, what a new node snapshot-joining
-an old one sees (a node needs #111 on the serving side to fold a fork point's state; against an
-older server a joiner gets the typed error instead), and whether a data directory written by
-this release still opens on v0.6.2 (i.e. whether rollback is possible)._
+**Upgrade one node at a time.** Stop a node (cleanly, or after a crash), start the new binary on
+the same data directory and addresses, and move on. No flag changes are needed, and old and new
+nodes replicate with each other throughout. A nightly test does exactly this from v0.6.2 — a
+3-node rolling upgrade under writes, a node killed with `kill -9` and restarted on the new
+binary, and a 5-node mesh of old and new nodes under writes and kills — and every acknowledged
+write survives and every node converges (#125).
+
+**A new node joining by snapshot through a v0.6.2 peer can stop with an error naming deepen.**
+Folding a fork point's state needs the serving node to have #111; an older server can't, so the
+joiner reports a typed `ShallowBoundaryError` instead of converging. Recover it with
+`POST /v1/ns/{ns}/deepen` or `kdb deepen`, or bootstrap with `bootstrap=snapshot,deepen=true`
+from the start, or set `deepen=true` on the stuck joiner's peer. Upgrading the serving peers
+first avoids it.
+
+**Rolling back to v0.6.2 is only safe from a clean stop.** v0.6.2 does not understand the
+canonical join commits this release writes (#114). If a node running this release crashed, do
+not start v0.6.2 on its data directory: v0.6.2's replay silently rolls back acknowledged writes,
+and upgrading again afterwards does not bring them back (its checkpoint names the old head). Start
+the node on this release first, let it recover, stop it cleanly, and only then downgrade.
 
 ## Build, tests and CI
 
