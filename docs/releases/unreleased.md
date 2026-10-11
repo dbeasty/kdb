@@ -126,11 +126,25 @@ packages compiles none of this in, but the requirements are in the bundle's modu
 
 ## Upgrading
 
-_To be completed from the mixed-version upgrade test (in progress): whether a cluster can be
-upgraded node by node with old and new nodes syncing in between, what a new node snapshot-joining
-an old one sees (a node needs #111 on the serving side to fold a fork point's state; against an
-older server a joiner gets the typed error instead), and whether a data directory written by
-this release still opens on v0.6.2 (i.e. whether rollback is possible)._
+**Upgrade one node at a time.** Stop a node (cleanly, or after a crash), start the new binary on
+the same data directory and addresses, and move on. No flag changes are needed, and old and new
+nodes replicate with each other throughout. A nightly test does exactly this from v0.6.2 — a
+3-node rolling upgrade under writes, a node killed with `kill -9` and restarted on the new
+binary, and a 5-node mesh of old and new nodes under writes and kills — and every acknowledged
+write survives and every node converges (#125).
+
+**A new node joining by snapshot through a v0.6.2 peer can stop with an error naming deepen.**
+Folding a fork point's state needs the serving node to have #111; an older server can't, so the
+joiner reports a typed `ShallowBoundaryError` instead of converging. Recover it with
+`POST /v1/ns/{ns}/deepen` or `kdb deepen`, or bootstrap with `bootstrap=snapshot,deepen=true`
+from the start. Upgrading the serving peers first avoids it. (The error message also suggests
+setting `deepen=true` on an already-stuck joiner; that does not work yet — see Known issues.)
+
+**Rolling back to v0.6.2 is only safe from a clean stop.** v0.6.2 does not understand the
+canonical join commits this release writes (#114). If a node running this release crashed, do
+not start v0.6.2 on its data directory: v0.6.2's replay silently rolls back acknowledged writes,
+and upgrading again afterwards does not bring them back (its checkpoint names the old head). Start
+the node on this release first, let it recover, stop it cleanly, and only then downgrade.
 
 ## Build, tests and CI
 
@@ -151,5 +165,8 @@ this release still opens on v0.6.2 (i.e. whether rollback is possible)._
 - **A lookup racing a compaction can transiently miss a key** whose old table compaction is
   deleting. A fix is in progress (table reference counting); it should land before this release.
 - Issue #43 stays open pending the nightly Linux soak (see above).
+- **The `deepen=true` peer option cannot rescue a snapshot joiner that is already stuck** on a
+  fork point an older server cannot fold, although the error suggests it: the replicator skips
+  deepen for a namespace whose sync just failed. Use `POST /v1/ns/{ns}/deepen` or `kdb deepen`.
 - `Coordinator.updateSubscriber` can still drop subscriber-state updates when its buffer is full,
   and closed in-memory stream clients are never removed from their hub (#120's follow-ups).
