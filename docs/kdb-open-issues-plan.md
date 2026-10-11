@@ -337,7 +337,7 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 _(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
 
 - **2026-10-11 — new item, found by multi-node e2e testing: a drained node checkpointed peer
-  commits it never logged** (branch `fix/checkpoint-unlogged-peer-commits`, PR #PRNUM). SIGTERM a
+  commits it never logged** (branch `fix/checkpoint-unlogged-peer-commits`, PR #113, commit 70424df). SIGTERM a
   node of a 3-node mesh under concurrent writes and, in 5 of 20 runs here, the restarted node failed
   every sync forever with `commit ... has no frame in the delta log`. A push that arrived as the
   drain began was stored (`peersync.StoreCommits`, outside the write gate) and then refused by
