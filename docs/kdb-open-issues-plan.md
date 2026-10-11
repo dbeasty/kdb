@@ -958,3 +958,71 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
     - A power loss that persists a later page of a batch before an earlier one would leave intact
       frames after a hole. Neither was acknowledged, but this rule refuses it as damage, which is
       the safe direction.
+
+- **2026-10-11 — N5 follow-up: a backup refuses a damaged segment (branch
+  `fix/backup-refuse-damaged-segments`).** Closes the two items N5 found and did not fix. The user
+  decided: a backup refuses, rather than uploading the whole damaged file.
+  - **The hole.** `backup.Create` uploaded each segment's `integrity.VerifiedSegmentPrefix`: the
+    bytes before the first bad frame. For a torn tail that is right. For a segment damaged in
+    place it was N5's silent loss again: the manifest looked complete and lacked every acknowledged
+    commit after the damage. `backup-verify` passed it, since it only re-hashes what the manifest
+    names. An incremental was worse. It uploaded the damaged segment's shorter prefix under the
+    segment's shared key, the key the *base* backup's manifest names, so it also corrupted the base.
+  - **The fix.** It uses #129's classification, so backup, replay and verify apply one rule.
+    - `VerifiedSegmentPrefix` (`integrity/scan.go`) returns `*delta.DamagedSegmentError` for
+      `storage.TailDamaged`. It now also returns the prefix's commits, so backup no longer decodes
+      each segment twice. A torn tail still yields its intact prefix, and zero padding is clean.
+    - `backup.Create` classifies every segment before it uploads anything. A damaged one refuses
+      the backup with `*backup.DamagedSegmentError` (`backup/damaged.go`): namespace, segment, byte
+      offset, next intact frame, whether it was incremental, and the next steps (`kdb-inspect
+      verify`, then `repair-segments` or `restore`). The delta error stays reachable through
+      `errors.As`. A refused backup uploads no object and writes no manifest. The upload pass
+      re-reads each segment up to the classified length, so the whole log is never held in memory.
+    - Every trigger surfaces it. `kdb-inspect backup` prints it and exits 1, for one namespace,
+      for `--base-backup-id` and for a whole-database backup (no database manifest is written).
+      `POST /v1/ns/{ns}/backups` returns **409 `segment_damaged`** (it was 503 `backup_failed`,
+      which invites a retry that cannot help) with the message and `segment` / `offset` /
+      `nextIntactFrame` / `incremental`, and logs a WARN line. Go has no scheduled or
+      maintenance-driven backup (`embed/maintenance_loop.go` never backs up), so these two are
+      every trigger.
+    - Kotlin has no backup creation path (`kdb-recovery` restores, `kdb-integrity` verifies and
+      repairs), so there is nothing to change there.
+  - **Not covered: a damaged last frame of an older segment.** With nothing intact after it, it
+    is byte-for-byte a torn tail, so backup records the prefix, as replay does. Replay names it
+    (`BuiltOn`) only once later commits turn out to need it. Backup does no parent-closure check.
+    A shallow or checkpoint-trimmed namespace can legitimately lack parents, so such a check would
+    need the replay context. Opening a restore of that backup still fails loudly with "parent
+    commits never found", not silently.
+  - **`backup-verify` on a manifest the old code made from a damaged segment.** Unchanged, and it
+    reports such a backup **clean**: it re-hashes the truncated object, which matches. Probe (8
+    commits, a body flip at frame 2 of 4, uncompressed): damage in the older segment gave 5 commits,
+    verify clean, and a restore that will not open (missing parents). Damage in the newest segment
+    gave 5 commits, verify clean, and a restore that opens **silently at commit 5 of 8**. An
+    operator with backups taken from a possibly damaged directory should run `kdb-inspect verify`
+    on the source. A backup alone cannot show the newest-segment case.
+  - **Kotlin `scanSegmentRef` (separate commit).** `DefaultDeltaSegmentReader.listSegments`
+    skipped a segment it could not read (`catch (_: Exception) { return null }`), as Go did before
+    #121. It now throws `UnreadableSegmentException` (namespace, sequence, segment name, cause).
+    The one tolerated case is Go's: a segment deleted between the listing and its read is skipped.
+    Decode faults are unchanged. They list up to the fault and the replayer classifies them, as in
+    Go after N5.
+  - **Before/after**, main → this branch:
+    - Damage in the middle of the newest or an older segment (magic, body or codec byte): the
+      backup succeeded with 5 of 8 commits → refused with the typed error, store empty.
+    - Incremental over a segment damaged since its base: succeeded and broke the base ("segment 0:
+      size 191, manifest says 764") → refused, base still verifies.
+    - `POST /backups` on a live namespace with a damaged active segment: 200, `commitCount: 1` of
+      4 → 409 `segment_damaged`.
+    - Kotlin: listing with segment 1 unreadable returned segments 0 and 2 → `UnreadableSegmentException`.
+  - **Tests**, each confirmed failing with its fix reverted:
+    - `backup/damaged_segment_test.go`. File-backed, real commits, uncompressed. Covers damage in
+      the newest and an older segment (3 kinds), a database backup, an incremental, a torn tail in
+      3 shapes (restored, every acknowledged commit present) in the newest segment and in the kill
+      -9 sequence, and a preallocated segment (restored).
+    - `control/backup_damaged_test.go` (HTTP status, body, log line, nothing listed).
+    - `cmd/kdb-inspect/backup_test.go` (namespace, incremental, database).
+    - Kotlin `UnreadableSegmentTest` (all targets).
+    The torn-tail and preallocated tests pass on main too. They guard what must not change.
+  - **Found, not fixed:** a sealed segment whose bytes change for any other reason (a repair that
+    quarantines frames, say) would still be re-uploaded under the shared key a base manifest names.
+    Only damage is refused now. Uploading changed content under a fresh key would close that.

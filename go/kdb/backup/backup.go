@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/integrity"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/delta"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -75,6 +77,10 @@ func activePrefixKey(namespaceID, backupID string, seq int64) string {
 // incremental backup: segments already named (same sequence, same hash, full - not prefix) by
 // the base manifest are referenced, not re-uploaded. Returns the new manifest (already
 // uploaded, last).
+//
+// A segment damaged in place (storage.TailDamaged) refuses the backup with a
+// *DamagedSegmentError before anything is uploaded; a torn tail is left out of the segment's
+// upload, since it was never acknowledged.
 func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, baseBackupID string) (*Manifest, error) {
 	ctx := context.Background()
 	seqs, err := integrity.ListSequencedSegments(shim, namespaceID)
@@ -117,24 +123,52 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 		m.BaseBackupID = &id
 	}
 
+	// First, classify every segment before anything is uploaded, with the rule replay and
+	// kdb-inspect verify apply (storage.TailKind). A segment damaged in place refuses the whole
+	// backup: its verified prefix would leave out acknowledged commits, and a manifest naming it
+	// would look complete. A torn tail - bytes a crash cut short, never acknowledged - is left
+	// out, as it always was, and zero padding is no damage at all. Checking all of them first
+	// means a refused backup uploads nothing: not even a full segment under the shared key a base
+	// backup's manifest names (an incremental used to overwrite that with the damaged segment's
+	// shorter prefix, corrupting the base).
+	allCommits := map[string]document.Commit{}
+	prefixLen := make([]int, len(seqs))
+	for i, seq := range seqs {
+		prefix, commits, err := integrity.VerifiedSegmentPrefix(shim, namespaceID, seq)
+		if err != nil {
+			var damaged *delta.DamagedSegmentError
+			if errors.As(err, &damaged) {
+				return nil, &DamagedSegmentError{
+					NamespaceID: namespaceID, Sequence: damaged.Sequence, Offset: damaged.Offset,
+					Reason: damaged.Reason, NextIntactFrame: damaged.NextIntactFrame,
+					Incremental: base != nil, Err: damaged,
+				}
+			}
+			return nil, fmt.Errorf("backup: segment %d: %w", seq, err)
+		}
+		prefixLen[i] = len(prefix)
+		for _, c := range commits {
+			allCommits[c.CommitHash.Hex()] = c.Commit
+		}
+	}
+
 	// Every segment except the highest-sequence one is sealed and immutable (the writer only
 	// ever appends to the newest); those upload in full under their shared, stable key. The
 	// highest-sequence segment may still be active, so only its CRC-verified prefix is backed
-	// up, under a backup-scoped key (spec §6.1's activeSegmentPrefix).
-	allCommits := map[string]document.Commit{}
+	// up, under a backup-scoped key (spec §6.1's activeSegmentPrefix). Each is re-read here
+	// rather than held from the pass above, so a backup never holds the whole log in memory; a
+	// segment only ever grows by appends, so the classified prefix is still its prefix.
 	for i, seq := range seqs {
 		activeCandidate := i == len(seqs)-1
-		prefix, _, err := integrity.VerifiedSegmentPrefix(shim, namespaceID, seq)
+		name := storio.SegmentNameBuilder.DeltaSequenced(namespaceID, seq)
+		raw, err := shim.ReadFromSegment(name, 0, prefixLen[i])
 		if err != nil {
 			return nil, fmt.Errorf("backup: segment %d: %w", seq, err)
 		}
-		commits, err := commitsIn(prefix)
-		if err != nil {
-			return nil, fmt.Errorf("backup: segment %d: %w", seq, err)
+		if len(raw) < prefixLen[i] {
+			return nil, fmt.Errorf("backup: segment %d shrank from %d to %d bytes while it was being backed up", seq, prefixLen[i], len(raw))
 		}
-		for h, c := range commits {
-			allCommits[h] = c
-		}
+		prefix := raw[:prefixLen[i]]
 		sum := sha256.Sum256(prefix)
 		sumHex := hex.EncodeToString(sum[:])
 
@@ -149,7 +183,7 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 			continue
 		}
 
-		key := storio.SegmentNameBuilder.DeltaSequenced(namespaceID, seq)
+		key := name
 		if baseEntry, ok := baseFull[seq]; ok && baseEntry.FileSha256 == sumHex {
 			// Incremental: already uploaded by the base backup, immutable since - reference it.
 			m.Segments = append(m.Segments, baseEntry)
@@ -286,22 +320,6 @@ func ListBackups(store ObjectStore, namespaceID string) ([]string, error) {
 	}
 	sort.Strings(ids)
 	return ids, nil
-}
-
-// commitsIn scans a verified segment prefix's frames into commits keyed by hex hash.
-func commitsIn(prefix []byte) (map[string]document.Commit, error) {
-	out := map[string]document.Commit{}
-	if len(prefix) == 0 {
-		return out, nil
-	}
-	scanned, err := scanSegmentBytes(prefix)
-	if err != nil {
-		return nil, err
-	}
-	for h, c := range scanned {
-		out[h] = c
-	}
-	return out, nil
 }
 
 // tips returns the hex hashes of every commit that is not any other commit's parent - the
