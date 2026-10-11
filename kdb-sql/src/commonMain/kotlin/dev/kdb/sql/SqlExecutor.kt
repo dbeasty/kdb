@@ -48,7 +48,7 @@ internal class SqlExecutor(
         if (stripped != null) {
             rows = rows.drop(stripped.offset).take(stripped.limit)
         }
-        return QueryResult(columns = columnsFor(query, context.schema), rows = rows.take(context.maxRows))
+        return QueryResult(columns = columnsFor(query, context.schema), rows = boundRows(rows, context.maxRows))
     }
 
     private suspend fun materialize(
@@ -119,7 +119,7 @@ internal class SqlExecutor(
                         registry,
                         arm.descriptor.fieldName,
                         arm.vector,
-                        if (depth == Int.MAX_VALUE) context.maxRows else depth,
+                        depth,
                         context.atCommit,
                     )
             }
@@ -165,7 +165,21 @@ internal class SqlExecutor(
         var out = rows.map { QueryRow(it.cells) }
         if (query.distinct) out = out.distinctBy { it.values }
         if (stripped != null) out = out.drop(stripped.offset).take(stripped.limit)
-        return QueryResult(columns = columnsFor(query, context.schema), rows = out.take(context.maxRows))
+        return QueryResult(columns = columnsFor(query, context.schema), rows = boundRows(out, context.maxRows))
+    }
+
+    /**
+     * `maxRows` bounds what a query may return, never what it may look at: the id lists above are
+     * not cut, because a residual filter still runs over them and cutting first dropped every
+     * match past the cut. A result larger than the bound is an error, not a prefix - a caller
+     * handed the first N rows of an answer cannot tell it is incomplete.
+     */
+    private fun boundRows(
+        rows: List<QueryRow>,
+        maxRows: Int,
+    ): List<QueryRow> {
+        if (rows.size > maxRows) throw SqlResultLimitException(maxRows)
+        return rows
     }
 
     private class AggregateRow(val key: List<SqlCell>, val docs: List<KdbDocument>, val cells: List<SqlCell>)
@@ -284,7 +298,7 @@ internal class SqlExecutor(
                 rows += QueryRow(projectJoinRow(query.projections, joined, envs))
             }
         }
-        return QueryResult(columns = columnsFor(query, leftSchema), rows = rows.take(context.maxRows))
+        return QueryResult(columns = columnsFor(query, leftSchema), rows = boundRows(rows, context.maxRows))
     }
 
     private fun projectJoinRow(
@@ -379,7 +393,7 @@ internal class SqlExecutor(
         when (plan) {
             is PhysicalPlan.Limit -> {
                 val inner = resolveDocIds(plan.input, context, env, commitDag)
-                inner.drop(plan.offset).take(plan.limit).take(context.maxRows)
+                inner.drop(plan.offset).take(plan.limit)
             }
             is PhysicalPlan.Sort -> resolveDocIds(plan.input, context, env, commitDag)
             is PhysicalPlan.Project -> resolveDocIds(plan.input, context, env, commitDag)
@@ -391,7 +405,7 @@ internal class SqlExecutor(
             is PhysicalPlan.InListScan -> inListScan(plan, context)
             is PhysicalPlan.ScoredScan ->
                 (env.scores[plan.scoreExpr] ?: throw SqlPlanningException("ranking missing for ${plan.scoreExpr}", ""))
-                    .keys.toList().take(context.maxRows)
+                    .keys.toList()
             is PhysicalPlan.FullTableScan -> fullScan(context, commitDag)
         }
 
@@ -404,7 +418,6 @@ internal class SqlExecutor(
         return plan.keys
             .flatMap { key -> reader.lookupExact(registry, plan.fieldName, key, context.atCommit) }
             .distinct()
-            .take(context.maxRows)
     }
 
     private suspend fun indexScan(
@@ -417,9 +430,9 @@ internal class SqlExecutor(
             is IndexLookupSpec.Exact ->
                 reader.lookupExact(registry, plan.fieldName, spec.key, context.atCommit)
             is IndexLookupSpec.Range ->
-                reader.lookupRange(registry, plan.fieldName, spec.from, spec.to, context.atCommit, limit = context.maxRows)
+                reader.lookupRange(registry, plan.fieldName, spec.from, spec.to, context.atCommit)
             is IndexLookupSpec.FullText ->
-                reader.lookupFullText(registry, plan.fieldName, spec.query, context.atCommit, context.maxRows).map { it.docId }
+                reader.lookupFullText(registry, plan.fieldName, spec.query, context.atCommit).map { it.docId }
             is IndexLookupSpec.VectorAnn ->
                 reader.lookupVector(registry, plan.fieldName, spec.queryVector, spec.k, context.atCommit).map { it.docId }
         }
@@ -435,7 +448,7 @@ internal class SqlExecutor(
         storage.scanDocuments(context.namespaceId, treeHash, batchSize = 256) { batch ->
             ids += batch.map { it.id }
         }
-        return ids.take(context.maxRows)
+        return ids
     }
 
     private suspend fun filterIds(

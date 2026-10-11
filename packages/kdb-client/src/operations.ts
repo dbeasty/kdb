@@ -30,6 +30,12 @@ export interface Transaction {
   namespace: string;
   baseVersion: CommitHash;
   writes: DocWrite[];
+  /**
+   * Documents to delete in the same commit. Their operations follow the writes, so a
+   * precondition's `opIndex` for a write is unchanged by adding deletes. Deleting an absent
+   * document is not an error; the commit just records nothing for it.
+   */
+  deletes?: string[];
   preconditions?: Precondition[];
 }
 
@@ -46,6 +52,12 @@ export interface CompareAndSwapOptions extends CallOptions {
 export interface KdbOperations {
   /** Writes a document as a new commit anchored on the namespace's current head. */
   putJSON(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<CommitHash>;
+
+  /**
+   * Deletes a document as a new commit, by key. Unlike `DELETE ... WHERE` through SQL it does not
+   * scan, so its cost does not grow with the namespace.
+   */
+  delete(ns: string, docId: string, options?: CallOptions): Promise<CommitHash>;
 
   /** Reads a document and the commit it was read at. Throws KdbNotFoundError if absent. */
   get(

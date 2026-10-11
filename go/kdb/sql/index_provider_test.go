@@ -140,9 +140,11 @@ func TestIndexExactLookupIsUsedAndResidualStillApplies(t *testing.T) {
 	if res.Plan != "fullscan" {
 		t.Fatalf("NULL key must not use the index: %q", res.Plan)
 	}
+	// The document id is a key, served directly (key_lookup_test.go) - never through an index.
+	before := len(p.exactCalls)
 	_, res, _ = f.query(`SELECT title FROM tasks WHERE kdb_id = 'x'`)
-	if res.Plan != "fullscan" {
-		t.Fatalf("reserved column must not use the index: %q", res.Plan)
+	if strings.HasPrefix(res.Plan, "index:") || len(p.exactCalls) != before {
+		t.Fatalf("reserved column must not use the index: plan %q, provider calls %v", res.Plan, p.exactCalls[before:])
 	}
 }
 

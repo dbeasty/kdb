@@ -112,6 +112,18 @@ export class KdbBusyError extends KdbError {
   }
 }
 
+/**
+ * The request as written is too large for the server to serve - a result with more rows than
+ * `--max-result-rows`, a scan over its examined-rows budget, or a memory grant larger than the
+ * node can ever hold. Unlike {@link KdbBusyError} it is never worth retrying unchanged: it fails
+ * identically next time. Add a LIMIT or a more selective predicate.
+ */
+export class KdbResourceExhaustedError extends KdbError {
+  constructor(message: string, options: KdbErrorOptions = {}) {
+    super(message, { code: "RESOURCE_EXHAUSTED", ...options });
+  }
+}
+
 export class KdbUnavailableError extends KdbError {
   constructor(message: string, options: KdbErrorOptions = {}) {
     super(message, { code: "UNAVAILABLE", ...options });
@@ -193,8 +205,9 @@ export function classifiedError(
 
   switch (code) {
     case "BUSY":
-    case "RESOURCE_EXHAUSTED":
       return new KdbBusyError(`kdb: server busy: ${message}`, options);
+    case "RESOURCE_EXHAUSTED":
+      return new KdbResourceExhaustedError(`kdb: resource exhausted: ${message}`, options);
     case "UNAVAILABLE":
       return new KdbUnavailableError(`kdb: server unavailable: ${message}`, options);
     case "DEADLINE_EXCEEDED":

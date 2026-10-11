@@ -22,6 +22,9 @@ func TestGovernanceIsOnByDefault(t *testing.T) {
 	if s.MaxConnections <= 0 {
 		t.Errorf("a connection cap must be configured by default, got %d", s.MaxConnections)
 	}
+	if s.MaxResultRows != 10000 {
+		t.Errorf("the result bound should default to 10000, got %d", s.MaxResultRows)
+	}
 	if s.ScanRowBudget <= 0 {
 		t.Errorf("a scan row budget must be configured by default, got %d", s.ScanRowBudget)
 	}
@@ -90,11 +93,12 @@ func TestGovernanceEnvVars(t *testing.T) {
 		"KDB_MEMORY_RESERVE_MB": "64",
 		"KDB_MAX_CONNECTIONS":   "512",
 		"KDB_SCAN_ROW_BUDGET":   "250000",
+		"KDB_MAX_RESULT_ROWS":   "50000",
 	}), noFlags, ServiceSettings{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.MemoryBudgetMB != 2048 || s.MemoryReserveMB != 64 || s.MaxConnections != 512 || s.ScanRowBudget != 250000 {
+	if s.MemoryBudgetMB != 2048 || s.MemoryReserveMB != 64 || s.MaxConnections != 512 || s.ScanRowBudget != 250000 || s.MaxResultRows != 50000 {
 		t.Errorf("environment overrides not applied: %+v", s)
 	}
 }
@@ -110,6 +114,7 @@ func TestGovernanceValidationRejectsNonsense(t *testing.T) {
 		{"negative reserve", ServiceSettings{MemoryReserveMB: -1}, "memory-reserve-mb", "memory-reserve-mb"},
 		{"negative connections", ServiceSettings{MaxConnections: -1}, "max-connections", "max-connections"},
 		{"negative row budget", ServiceSettings{ScanRowBudget: -1}, "scan-row-budget", "scan-row-budget"},
+		{"zero result bound", ServiceSettings{MaxResultRows: 0}, "max-result-rows", "max-result-rows"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ResolveService(nil, noEnv, flagsOf(tc.set), tc.flags)
