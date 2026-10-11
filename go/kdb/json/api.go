@@ -15,7 +15,7 @@ func Get(jsonText string, path *Path) (Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return navigateGet(root, path, 1), nil
+	return navigateGet(root, path, 1)
 }
 
 // GetString is Get with path compiled from a string.
@@ -34,13 +34,16 @@ func GetAll(jsonText string, path *Path) ([]Value, error) {
 		return nil, err
 	}
 	if !path.HasWildcards() {
-		if v := navigateGet(root, path, 1); v != nil {
-			return []Value{v}, nil
+		v, err := navigateGet(root, path, 1)
+		if err != nil || v == nil {
+			return nil, err
 		}
-		return nil, nil
+		return []Value{v}, nil
 	}
 	var out []Value
-	collectAll(root, path.segments, 1, &out, path.Expression)
+	if err := collectAll(root, path.segments, 1, &out, path.Expression); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -129,7 +132,10 @@ func Contains(jsonText string, path *Path, value Value) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	target := navigateGet(root, path, 1)
+	target, err := navigateGet(root, path, 1)
+	if err != nil {
+		return false, err
+	}
 	if target == nil {
 		return false, nil
 	}
@@ -161,7 +167,9 @@ func Keys(jsonText string, path *Path) ([]string, error) {
 	if len(path.segments) == 1 {
 		target = root
 	} else {
-		target = navigateGet(root, path, 1)
+		if target, err = navigateGet(root, path, 1); err != nil {
+			return nil, err
+		}
 	}
 	if target == nil {
 		return nil, nil
@@ -186,7 +194,9 @@ func TypeName(jsonText string, path *Path) (string, error) {
 	if len(path.segments) == 1 {
 		target = root
 	} else {
-		target = navigateGet(root, path, 1)
+		if target, err = navigateGet(root, path, 1); err != nil {
+			return "", err
+		}
 	}
 	if target == nil {
 		return "", nil
@@ -207,7 +217,9 @@ func ArrayLength(jsonText string, path *Path) (*int, error) {
 	if len(path.segments) == 1 {
 		target = root
 	} else {
-		target = navigateGet(root, path, 1)
+		if target, err = navigateGet(root, path, 1); err != nil {
+			return nil, err
+		}
 	}
 	if target == nil {
 		return nil, nil
@@ -242,100 +254,115 @@ func jsonTypeName(v Value) string {
 	}
 }
 
-func navigateGet(root Value, path *Path, startIdx int) Value {
+// navigateGet walks path from segment startIdx. A missing field or an out-of-range index yields
+// (nil, nil); a step that does not fit the value it lands on (a field into a non-object, an
+// index into a non-array) is a *JsonPathError. It is returned, never panicked: every exported
+// caller already returns error, and a panic here would take down any caller without a recover.
+func navigateGet(root Value, path *Path, startIdx int) (Value, error) {
 	cur := root
 	for si := startIdx; si < len(path.segments); si++ {
 		switch seg := path.segments[si].(type) {
 		case rootSeg:
-			return nil
+			return nil, nil
 		case fieldSeg:
 			o, ok := cur.(ObjectValue)
 			if !ok {
-				panic(kdberr.NewJsonPathError("not object", path.Expression, nil))
+				return nil, kdberr.NewJsonPathError("not object", path.Expression, nil)
 			}
 			next, ok := o.Fields[seg.name]
 			if !ok {
-				return nil
+				return nil, nil
 			}
 			cur = next
 		case idxSeg:
 			a, ok := cur.(ArrayValue)
 			if !ok {
-				panic(kdberr.NewJsonPathError("not array", path.Expression, nil))
+				return nil, kdberr.NewJsonPathError("not array", path.Expression, nil)
 			}
-			ix := normalizeIndex(seg.index, len(a.Elements), path.Expression, true)
+			ix, err := normalizeIndex(seg.index, len(a.Elements), path.Expression, true)
+			if err != nil {
+				return nil, err
+			}
 			if ix < 0 || ix >= len(a.Elements) {
-				return nil
+				return nil, nil
 			}
 			cur = a.Elements[ix]
 		case wildcardElemSeg, wildcardFieldSeg:
-			panic(kdberr.NewJsonPathError("wildcard in Get", path.Expression, nil))
+			return nil, kdberr.NewJsonPathError("wildcard in Get", path.Expression, nil)
 		}
 	}
-	return cur
+	return cur, nil
 }
 
-func normalizeIndex(index, length int, expr string, forGet bool) int {
+func normalizeIndex(index, length int, expr string, forGet bool) (int, error) {
 	if index == -1 {
 		if length == 0 {
-			return -1
+			return -1, nil
 		}
-		return length - 1
+		return length - 1, nil
 	}
 	if index < -1 {
-		panic(kdberr.NewJsonPathError("bad array index", expr, nil))
+		return 0, kdberr.NewJsonPathError("bad array index", expr, nil)
 	}
 	if !forGet && index < 0 {
-		panic(kdberr.NewJsonPathError("bad array index", expr, nil))
+		return 0, kdberr.NewJsonPathError("bad array index", expr, nil)
 	}
-	return index
+	return index, nil
 }
 
-func collectAll(cur Value, segs []pathSeg, idx int, out *[]Value, expr string) {
+func collectAll(cur Value, segs []pathSeg, idx int, out *[]Value, expr string) error {
 	if idx == len(segs) {
 		*out = append(*out, cur)
-		return
+		return nil
 	}
 	switch seg := segs[idx].(type) {
 	case rootSeg:
-		collectAll(cur, segs, idx+1, out, expr)
+		return collectAll(cur, segs, idx+1, out, expr)
 	case fieldSeg:
 		o, ok := cur.(ObjectValue)
 		if !ok {
-			panic(kdberr.NewJsonPathError("not object", expr, nil))
+			return kdberr.NewJsonPathError("not object", expr, nil)
 		}
 		next, ok := o.Fields[seg.name]
 		if !ok {
-			return
+			return nil
 		}
-		collectAll(next, segs, idx+1, out, expr)
+		return collectAll(next, segs, idx+1, out, expr)
 	case idxSeg:
 		a, ok := cur.(ArrayValue)
 		if !ok {
-			panic(kdberr.NewJsonPathError("not array", expr, nil))
+			return kdberr.NewJsonPathError("not array", expr, nil)
 		}
-		ix := normalizeIndex(seg.index, len(a.Elements), expr, true)
+		ix, err := normalizeIndex(seg.index, len(a.Elements), expr, true)
+		if err != nil {
+			return err
+		}
 		if ix < 0 || ix >= len(a.Elements) {
-			return
+			return nil
 		}
-		collectAll(a.Elements[ix], segs, idx+1, out, expr)
+		return collectAll(a.Elements[ix], segs, idx+1, out, expr)
 	case wildcardElemSeg:
 		a, ok := cur.(ArrayValue)
 		if !ok {
-			panic(kdberr.NewJsonPathError("not array", expr, nil))
+			return kdberr.NewJsonPathError("not array", expr, nil)
 		}
 		for _, e := range a.Elements {
-			collectAll(e, segs, idx+1, out, expr)
+			if err := collectAll(e, segs, idx+1, out, expr); err != nil {
+				return err
+			}
 		}
 	case wildcardFieldSeg:
 		o, ok := cur.(ObjectValue)
 		if !ok {
-			panic(kdberr.NewJsonPathError("not object", expr, nil))
+			return kdberr.NewJsonPathError("not object", expr, nil)
 		}
 		for _, e := range o.Fields {
-			collectAll(e, segs, idx+1, out, expr)
+			if err := collectAll(e, segs, idx+1, out, expr); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func jsonSet(cur Value, segs []pathSeg, idx int, newVal Value, expr string) (Value, error) {
@@ -376,7 +403,14 @@ func jsonSet(cur Value, segs []pathSeg, idx int, newVal Value, expr string) (Val
 			return nil, kdberr.NewJsonPathError("not array", expr, nil)
 		}
 		list := append([]Value(nil), arr.Elements...)
-		ix := normalizeIndex(s.index, len(list), expr, false)
+		ix, err := normalizeIndex(s.index, len(list), expr, false)
+		if err != nil {
+			return nil, err
+		}
+		if ix < 0 {
+			// [-1] on an empty array names no element; there is nothing to overwrite.
+			return nil, kdberr.NewJsonPathError("bad array index", expr, nil)
+		}
 		for len(list) <= ix {
 			list = append(list, NullValue{})
 		}
@@ -443,7 +477,10 @@ func jsonDelete(cur Value, segs []pathSeg, idx int, expr string) (Value, error) 
 			return nil, kdberr.NewJsonPathError("not array", expr, nil)
 		}
 		if last {
-			ix := normalizeIndex(s.index, len(arr.Elements), expr, true)
+			ix, err := normalizeIndex(s.index, len(arr.Elements), expr, true)
+			if err != nil {
+				return nil, err
+			}
 			if ix < 0 || ix >= len(arr.Elements) {
 				return cur, nil
 			}
@@ -451,7 +488,10 @@ func jsonDelete(cur Value, segs []pathSeg, idx int, expr string) (Value, error) 
 			list = append(list[:ix], list[ix+1:]...)
 			return ArrayValue{Elements: list}, nil
 		}
-		ix := normalizeIndex(s.index, len(arr.Elements), expr, true)
+		ix, err := normalizeIndex(s.index, len(arr.Elements), expr, true)
+		if err != nil {
+			return nil, err
+		}
 		if ix < 0 || ix >= len(arr.Elements) {
 			return cur, nil
 		}
