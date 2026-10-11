@@ -1,13 +1,24 @@
 package dev.kdb.compression
 
 import com.github.luben.zstd.Zstd
+import com.github.luben.zstd.ZstdException
 
+/** JVM: zstd-jni (libzstd). See [ZstdCompression]. */
 public actual object ZstdCompression {
-    public actual val isAvailable: Boolean = true
+    public actual val canCompress: Boolean = true
+    public actual val canDecompress: Boolean = true
 
     public actual fun compress(input: ByteArray, level: Int): ByteArray = Zstd.compress(input, level)
 
-    public actual fun decompress(input: ByteArray, maxOutputSize: Int): ByteArray {
+    public actual fun decompress(input: ByteArray, maxOutputSize: Int): ByteArray =
+        try {
+            decompressJni(input, maxOutputSize)
+        } catch (e: ZstdException) {
+            // The same typed failure the pure-Kotlin decoder raises on JS and Native.
+            throw ZstdFormatException("corrupt zstd data: ${e.message}", e)
+        }
+
+    private fun decompressJni(input: ByteArray, maxOutputSize: Int): ByteArray {
         // An empty body decodes to empty output - there is no frame to inspect. Not a
         // hypothetical: Go's klauspost EncodeAll returns zero bytes for a zero-length input
         // (upstream libzstd emits a 9-byte empty frame instead), so every SSTable block and
@@ -17,7 +28,7 @@ public actual object ZstdCompression {
         if (input.isEmpty()) return ByteArray(0)
         val size = Zstd.decompressedSize(input).toInt()
         if (size > 0) {
-            require(size <= maxOutputSize) { "decompressed size $size exceeds max $maxOutputSize" }
+            if (size > maxOutputSize) throw ZstdFormatException("decompressed size $size exceeds max $maxOutputSize")
             return Zstd.decompress(input, size)
         }
         // The frame does not declare its content size. Perfectly legal zstd - streaming
@@ -29,7 +40,9 @@ public actual object ZstdCompression {
         // and a Go-written data directory opened as silently empty on the JVM.
         val out = ByteArray(maxOutputSize)
         val written = Zstd.decompress(out, input).toInt()
-        require(written in 0..maxOutputSize) { "decompressed $written bytes, expected at most $maxOutputSize" }
+        if (written !in 0..maxOutputSize) {
+            throw ZstdFormatException("decompressed $written bytes, expected at most $maxOutputSize")
+        }
         return if (written == out.size) out else out.copyOf(written)
     }
 }

@@ -3,8 +3,8 @@ package dev.kdb.storage.delta
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 
-/** Kotlin/JS has no zstd (roadmap R1): its delta pages must be tagged CODEC_NONE. */
+/** Kotlin/JS compresses delta pages with the pure-Kotlin zstd (roadmap R1). */
 class DeltaJsCodecTest {
     @Test
-    fun jsWritesCodecNonePages() = runTest { assertTargetWithoutZstdWritesNonePages() }
+    fun jsWritesZstdPages() = runTest { assertTargetWritesZstdPages() }
 }

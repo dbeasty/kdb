@@ -134,7 +134,7 @@ Can ride along with U1 or U3.
 
 ### U5. JS/Native write zstd-tagged blocks that are not zstd — S/M, format correctness
 
-**Status: done** (#109). Real zstd on those targets is R1, in progress (#116).
+**Status: done** (#109). Real zstd on those targets is R1, done in #116.
 
 **Problem.** On JS and Native, `ZstdCompression.compress` is a 4-byte length prefix plus the raw bytes
 (`kdb-compression/src/jsMain/.../ZstdCompression.js.kt:3-31`,
@@ -325,7 +325,7 @@ and commit-graph plans. These are listed so they're tracked, not scheduled.
 
 | # | Item | State at `e125a10` | First step |
 |---|---|---|---|
-| R1 | Real zstd on Kotlin JS/Native | stub; after U5 at least not wrong | Decoder-only is enough to read JVM/Go data: pure-JS `fzstd` via `npm()` on JS; cinterop to libzstd on Native |
+| R1 | Real zstd on Kotlin JS/Native | **Done** 2026-10-11 (#116, branch `feat/zstd-js-native`): pure-Kotlin decoder and encoder in `kdb-compression` commonMain, both directions on both targets — see the progress log | — |
 | R2 | Go LSM leveled compaction | `LsmBlobStore.Compact` always merges to one table (`sstable/types.go:235-294`) | Measure write amplification at realistic sizes first |
 | R3 | Commit graph on disk | Phase 1 (generation numbers) + settings landed, off by default; `KDB_GRAPH_FILE` is accepted and ignored (`config/descriptors.go:625-627`) | **Phase 0 measurement** at 100k/500k/2M commits; it gates the rest (`docs/kdb-commit-graph-on-disk.md`). Also: stop accepting the ignored flag, or warn. |
 | R4 | Kotlin history-mode parity | wire messages 0x1F-0x22 are Go-only; Kotlin NONE is validator-only | Decide whether Kotlin needs NONE at all (it's the embedded/reference tree) |
@@ -672,3 +672,55 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   is wrong, because a torn tail from an earlier killed run legitimately ends a segment that is no
   longer the newest. The correct test is "intact frames after the stop" (the #81 rule;
   `SkimSegment` / `DamageTolerantReader` can already read past damage).
+
+### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (#116, branch `feat/zstd-js-native`)
+
+- **Choice.** A pure-Kotlin codec in `kdb-compression`'s commonMain, used by both JS and Native;
+  the JVM keeps zstd-jni. Rejected: `fzstd` (decoder only, and JS only), `@bokuweb/zstd-wasm` /
+  `zstd-codec` (async wasm initialisation behind the synchronous `ZstdCompression` API, a
+  different loader for node and the browser, 0.9MB and 2.1MB unpacked; all three are MIT), and cinterop to libzstd (a static
+  library per target - linuxX64 on the ubuntu runner, macosArm64 only on macOS - for one of the two
+  targets). One decoder (`ZstdDecoder`, RFC 8878: every block, literals and sequence-table mode,
+  XXH64 checksum, concatenated and skippable frames; no dictionaries) serves both targets and runs
+  under the JVM's differential tests against libzstd.
+- **Both directions.** `ZstdEncoder` writes real frames: greedy hash matches that try the most
+  recent offset first, repeat-offset codes, Huffman-coded literals (direct or FSE-compressed
+  weights), and per-block RLE, predefined or custom FSE tables for the sequence codes. Frames are
+  single-segment, with content size and checksum always present. It matches zstd-jni level 3 on
+  small payloads (158-byte record: 143 bytes each; 700-byte JSON: 232 vs 230) and is about 1.2x
+  its size on large ones (400KB JSON: 79,141 vs 65,497), and Go and the JVM read it. So `canCompress` and `canDecompress` (replacing `isAvailable`) are both true
+  everywhere, and JS/Native SSTable blocks, delta pages and ice bundles are zstd again. The split
+  stays so a decode-only target remains expressible; every writer checks `canCompress`.
+- **Errors.** Malformed input throws `ZstdFormatException` (an `IllegalArgumentException`) on
+  every target; the JVM now wraps zstd-jni's `ZstdException` the same way. `ZstdUnavailableException`
+  is gone - nothing throws it.
+- **Tests.** Golden fixtures are compiled into commonTest (`gradle/physical-golden-fixtures.gradle.kts`),
+  so JS (node and browser) and Native read Go's and the JVM's bytes: a zstd corpus from klauspost
+  (levels 1/3/7/19), zstd-jni (1/3/19 and a streamed frame without content size) and the
+  pure-Kotlin encoder; both `sstable_segment.hex` fixtures; and a new `delta_segment_zstd.hex` from
+  each side. JS/Native assert their encoder output equals the committed `_purekotlin` fixtures,
+  which Go decodes (`TestKotlinZstdCorpusCrossDecodes`). Corruption: truncated, flipped and zeroed
+  frames fail typed, never with another exception and never with wrong bytes from a checksummed
+  frame. Restoring the pre-R1 stubs fails 4 kdb-compression, 2 SSTable and 2 delta tests on both
+  jsNode and macosArm64.
+- **Found along the way.**
+  - A zero-length body is a valid "frame" (Go writes nothing for an empty payload), so a body
+    truncated to zero bytes decodes to empty output. Every KDB format stores the uncompressed
+    length beside the body and checks it, which is where that truncation is caught.
+  - A pre-U5 Native data directory (length-prefixed blocks tagged ZSTD) now fails with
+    `ZstdFormatException` (bad frame magic) instead of `ZstdUnavailableException` - still refused,
+    never misread. No such directory was ever released.
+  - The encoder was built up in three steps in this PR; measured on the 400KB JSON corpus
+    (zstd-jni level 3: 65,497): raw literals and predefined tables 108,624; + Huffman literals
+    104,986; + per-block sequence tables and repeat offsets 79,141. A 128KB block of that corpus
+    has ~4KB of literals but ~10,700 sequences, so sequence coding was the gap: custom tables alone
+    took it to 79,321, repeat offsets alone only to 104,483. Huffman and repeat offsets matter
+    most on small payloads (700-byte JSON: 299 -> 265 -> 232).
+  - The repeat-offset history persists across a frame's compressed blocks but a raw block leaves
+    the decoder's untouched, so the encoder rolls its history back when it stores a block raw
+    (`rawBlockDoesNotAdvanceRepeatOffsets`). A wrong update to the third history slot can survive
+    round-trip tests (the greedy parser rarely reads it), so `RepeatOffsetsTest` checks every
+    step against an RFC model.
+  - Not done: lazy matching (the rest of the large-input gap) and repeat-mode tables; and no
+    throughput numbers - the machine's load average was 50-140 for most of the work.
+

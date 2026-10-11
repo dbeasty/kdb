@@ -17,7 +17,7 @@ KDB data directory that either runtime may open:
 | Segment path naming | `SegmentNameBuilder.kt` | `storage/io/segment_name.go` |
 | Directory layout / snapshots | `JvmSegmentByteStore` | `storage/io/os_store.go` |
 | CRC-32 | `Crc32.kt` | `compression/crc32.go` |
-| ZSTD | `ZstdCompression` (zstd-jni) | `compression/zstd.go` (klauspost) |
+| ZSTD | `ZstdCompression`: zstd-jni on the JVM; pure-Kotlin `ZstdDecoder`/`ZstdEncoder` on JS and Native | `compression/zstd.go` (klauspost) |
 
 Explicitly **out of scope**: the wire protocol (`kdb-wire` / `go/kdb/wire`, already covered by
 `go/kdb/interop/wire_interop_test.go`), query planning, and anything that never reaches a file.
@@ -65,6 +65,12 @@ different match finders, different block splits. There is no configuration of ei
 them agree byte-for-byte. So no test may compare a compressed body across languages. Tests
 compare the 16/20-byte header around it, and separately assert that each side decompresses the
 other's body to the identical plaintext.
+
+Kotlin/JS and Kotlin/Native are a third compressor (roadmap R1): the pure-Kotlin `ZstdEncoder` in
+`kdb-compression`'s commonMain. Its output is deterministic and identical on every Kotlin target,
+so it *is* pinned byte for byte - but only against itself (`zstd_corpus_*_purekotlin.hex`, which
+jsTest/nativeTest compare their own output to and Go decodes). Across languages it is C2 like the
+others.
 
 `Decompress` must also tolerate frames that omit the content-size field. klauspost's `EncodeAll`
 emits such frames; `ZstdCompression.jvm.kt` already handles this and the reason is recorded in
@@ -237,12 +243,34 @@ the other:
 
 ## 6. Known gaps not fixed by this plan
 
-- **Kotlin JS/native have no ZSTD.** Until U5 of `docs/kdb-open-issues-plan.md` this was an
-  identity wrapper whose output was tagged `CODEC_ZSTD`, so JS/Native segments were unreadable
-  by Go and the JVM. Since U5, `ZstdCompression.isAvailable` is false there, SSTable blocks and
-  delta pages are written `CODEC_NONE` (fixtures `sstable_segment_none.hex` and
-  `delta_segment_none.hex`, read by Go), and `decompress` throws `ZstdUnavailableException`.
-  Still open: JS/Native cannot *read* zstd data written by the JVM or Go (roadmap R1).
+- **Kotlin JS/Native zstd — closed by roadmap R1.** History: until U5 of
+  `docs/kdb-open-issues-plan.md` JS/Native "compressed" with an identity wrapper tagged
+  `CODEC_ZSTD`, unreadable by Go and the JVM; from U5 they wrote `CODEC_NONE` (fixtures
+  `sstable_segment_none.hex`, `delta_segment_none.hex` — Go still reads them, since stores
+  written then hold them) and could not read zstd at all. Since R1 both targets use a pure-Kotlin
+  zstd in `kdb-compression`'s commonMain: a full RFC 8878 decoder (every block, literals and
+  sequence-table mode, checksums, concatenated and skippable frames; no dictionaries) and a small
+  encoder (greedy matches, repeat offsets, Huffman-coded literals, per-block FSE tables for
+  sequences — real frames on par with libzstd level 3 for commit-sized records and about 1.2x
+  its size on large JSON). `ZstdCompression.canCompress`/`canDecompress` replace
+  `isAvailable`. Coverage:
+  - `gradle/physical-golden-fixtures.gradle.kts` compiles the `.hex` fixtures into commonTest, so
+    JS (node and browser) and Native tests read the same bytes the JVM reads from disk.
+  - zstd corpus: `zstd_corpus_<payload>_<variant>.hex` — Go at klauspost levels 1/3/7/19, the JVM
+    (zstd-jni 1/3/19, a streamed frame without content size), and `_purekotlin`. Every Kotlin
+    target decodes all of them (`ZstdGoldenCorpusTest`); Go decodes Kotlin's
+    (`TestKotlinZstdCorpusCrossDecodes`); JS/Native assert their encoder writes exactly the
+    `_purekotlin` bytes.
+  - Whole segments on every target: `sstable_segment.hex` from both sides
+    (`SsTableZstdGoldenReadTest`) and a new `delta_segment_zstd.hex` from both sides
+    (`DeltaZstdGoldenReadTest`; Go replays the JVM's in `TestKotlinDeltaZstdSegmentReads`).
+  - `PureKotlinZstdDifferentialTest` (jvmTest): the pure-Kotlin decoder against libzstd frames at
+    levels -5..22, streamed and checksummed, multi-block, random; libzstd decoding every
+    pure-Kotlin frame.
+  - `ZstdCorruptionTest` (every target, deeper on the JVM): truncated, bit-flipped and zeroed
+    frames fail with `ZstdFormatException` — never another exception, and never wrong bytes from
+    a checksummed frame. (A frame without a checksum cannot promise the latter; KDB's block and
+    page headers CRC the compressed body.)
 - **Encryption at rest** (`docs/kdb-spec-layer14-encryption-at-rest.md`) sits below these
   formats and has no cross-language fixtures yet.
 

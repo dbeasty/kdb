@@ -594,9 +594,11 @@ Known blockers either path must clear first, all already recorded in the finish-
   data vanishes on reload, appends are quadratic, only ~5MB localStorage snapshots persist. Real
   IndexedDB/OPFS persistence is a prerequisite for calling this durable, and saying otherwise
   would be dishonest.
-- Kotlin's JS/Native has no zstd. Since U5 (`docs/kdb-open-issues-plan.md`) it writes
-  `CODEC_NONE` blocks, which JVM/Go read, but it still cannot read zstd data the JVM or Go wrote
-  (roadmap R1). Path (a) inherits this; path (b) does not.
+- ~~Kotlin's JS/Native has no zstd.~~ Resolved by roadmap R1 (`docs/kdb-open-issues-plan.md`):
+  Kotlin/JS reads and writes zstd through a pure-Kotlin codec in `kdb-compression` (no npm
+  dependency, synchronous, works in node and the browser), so path (a) no longer inherits a gap.
+  Its encoder matches libzstd on small values and is about 1.2x its size on large inputs
+  (greedy matching); that costs bytes, not compatibility.
 - `go/kdb/embed/dir_lock.go` needed build tags for `GOOS=js` (finish-up plan item 0.3) — confirm
   it is fixed before path (b).
 

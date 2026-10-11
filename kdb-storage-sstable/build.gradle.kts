@@ -1,5 +1,7 @@
 plugins { alias(libs.plugins.kotlin.multiplatform) }
 
+apply(from = rootProject.file("gradle/physical-golden-fixtures.gradle.kts"))
+
 kotlin {
     jvm(); js(IR) { browser(); nodejs() }; linuxX64(); macosArm64()
     sourceSets {
@@ -17,5 +19,7 @@ kotlin {
             implementation(libs.kotlinx.coroutines.core)
         }
         commonTest.dependencies { implementation(libs.kotlin.test); implementation(libs.kotlinx.coroutines.test) }
+        // Go's and the JVM's zstd-compressed segments, readable from JS and Native tests (roadmap R1).
+        commonTest { kotlin.srcDir(tasks.named("generatePhysicalGoldenFixtures")) }
     }
 }
