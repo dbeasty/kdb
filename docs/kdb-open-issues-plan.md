@@ -435,3 +435,57 @@ notes close v0.6.1's known issue.
   `main`'s sources was also 6/6 green, with no `Exception in thread` in captured stderr — the
   integration-level flake does not reproduce locally, so the unit tests above are the before/after
   evidence. `:kdb-transport-tcp:jvmTest`, `:kdb-transport-ws:jvmTest`, `:kdb-jdbc:test` green.
+### 2026-10-11 — N1 (new, found by multi-node e2e): snapshot-bootstrapped node stuck on "missing parent" — PR #111, branch `fix/shallow-node-missing-parent`, commit `0641f37`
+
+**Found by** the multi-node e2e `test_cluster.py::test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes`
+(sibling worktree `e2e-multi`, not on `main` yet), 3/3: a node joining a busy three-writer mesh
+with `bootstrap=snapshot` failed every replication cycle, for ever, with
+`peer sync: storing commit C: missing parent P`. `consecutiveFailures` grew without bound.
+
+**Root cause.** The joiner's snapshot root S was a merge with parents [Q, P]. Another node went on
+committing on P (C, parent P) before it saw S. The sender computes a pack as "reachable from my head
+minus the ancestor closure of the receiver's haves" (`peersync/refs.go` `MissingCommitsFrom`,
+`have := d.AncestorSetOf(haves)`); P is an ancestor of S, so it was treated as held and never sent.
+A shallow node holds nothing behind S, so `StoreCommits` (`peersync/ingest.go`) refused C. The
+existing single-source test never forks behind the boundary, and `TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot`
+had enshrined the side-branch half of this as unfixable ("its parents can never arrive").
+
+**Fix (no wire change, Go only - Kotlin has no v2 sync).**
+- Receiver (`peersync/boundary.go`, called from `fetchRef`): a page commit whose parent is neither in
+  the page nor held, on a node with shallow roots, and not itself one of the peer's shallow roots
+  (that case stays Graft's), has its parent's *state* taken in by `SNAPSHOT_FETCH` at the parent and
+  admitted as a shallow root through Graft's durable path (`admitRootFromState`: foreign tree, marker
+  `graftRoots` before the log frame). No `allowUnrelated` needed: the parent is history S already
+  descends from. One state transfer per fork point; no history is fetched.
+- Host (`peersync/snapshot_state.go`): a node never builds a tree for a commit it merged rather than
+  fast-forwarded onto, so `SNAPSHOT_FETCH` at such a commit failed "no tree". It now folds the commit's
+  first-parent chain forward from the nearest tree it holds, checks the result against the declared
+  tree hash, and serves that (cached for the snapshot's later pages). A pre-fix host still answers
+  "no tree", which the joiner reports as below.
+- Adoption (`peersync/ingest.go` `adoptable`): shallow roots are dropped from the commits a
+  fast-forward or merge adopts - they were logged on their own, and their operations are a change
+  from parents this node lacks; re-logging them, fence-checking them or announcing them to commit
+  listeners was wrong (by inspection the same already happened to graft roots).
+- Surfacing: when the parent's state cannot be had, the pull fails with a typed
+  `peersync.ShallowBoundaryError` naming both commits and pointing at deepen; that text is what
+  `/v1/peers` `lastError` and the namespace's `lastError` show. Successful extensions are in
+  `NamespaceSyncResult.BoundaryExtended` and logged by the replicator. An automatic *full* deepen
+  fallback was rejected: it defeats snapshot bootstrap, and FETCH_REQUEST has no depth to bound it.
+
+**Tests.** `server/shallow_boundary_test.go` (file-backed joiner, real `PutJSON` writes, memory and
+file-backed source): fast-forward across the fork point, a real merge on the joiner that traces a
+value down to the fork point's tree, clean restart, crash replay onto the bootstrap checkpoint, and
+deepen-after-extension with a no-checkpoint replay. `peersync/boundary_test.go`: the fork point is
+logged once, not re-adopted; a failure is a `ShallowBoundaryError` and leaves nothing resident.
+Revert-confirmed: without the receiver change the server tests fail with the original
+"missing parent"; without the host fold they fail "no tree"; without `adoptable` the fork point is
+logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parametrizations).
+
+**Not fixed, found along the way.**
+- The push direction (by inspection, not reproduced): a node that dials a shallow host and pushes it a branch forked behind the
+  host's root still gets "missing parent" from the host, which cannot fetch from its client. It
+  heals once the shallow node pulls from anyone; a shallow node that is only ever dialled stays
+  stuck on that ref. The pusher has the host's advertised horizon and could send the fork point's
+  state first (as `graftRootsFor` does for its own roots); not done here.
+- A `history=none` (replay strategy) receiver cannot hold the fork point's tree
+  (`ErrForeignTreeNeedsObjects`), so it gets the typed error and has to deepen.

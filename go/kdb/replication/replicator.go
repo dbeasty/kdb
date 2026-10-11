@@ -409,6 +409,10 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 			if len(ns.Grafted) > 0 {
 				slog.Info("replication: grafted an unrelated history", "peer", l.peer.Name, "namespace", ns.Namespace, "roots", ns.Grafted)
 			}
+			if len(ns.BoundaryExtended) > 0 {
+				slog.Info("replication: took the state of commits behind this node's snapshot root, which the peer's history forked from",
+					"peer", l.peer.Name, "namespace", ns.Namespace, "commits", ns.BoundaryExtended)
+			}
 		}
 		if l.peer.Deepen {
 			l.deepen(res.Namespaces, transport)

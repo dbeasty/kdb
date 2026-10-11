@@ -38,11 +38,15 @@ func snapshotPage(env IngestEnv, at codec.Hash, after string, maxBytes int) (wir
 	if maxBytes <= 0 {
 		maxBytes = DefaultPageBytes
 	}
+	state, err := stateAt(env, walker, commit)
+	if err != nil {
+		return wire.SnapshotPageMessage{}, err
+	}
 	// Ids after the cursor, sorted: a tree's walk order is only incidentally sorted, and the
 	// cursor has to mean the same thing on every page.
 	total := 0
 	var ids []codec.UUID
-	if err := walker.WalkTree(env.NamespaceID, commit.DocumentTreeHash, func(id codec.UUID, _ codec.Hash) bool {
+	if err := state.walk(func(id codec.UUID, _ codec.Hash) bool {
 		total++
 		if id.String() > after {
 			ids = append(ids, id)
@@ -57,7 +61,7 @@ func snapshotPage(env IngestEnv, at codec.Hash, after string, maxBytes int) (wir
 	const chunk = 128
 	for start := 0; start < len(ids); start += chunk {
 		end := min(start+chunk, len(ids))
-		docs, err := env.Storage.GetDocuments(env.NamespaceID, ids[start:end], commit.DocumentTreeHash)
+		docs, err := state.read(ids[start:end])
 		if err != nil {
 			return wire.SnapshotPageMessage{}, err
 		}
