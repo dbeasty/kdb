@@ -491,3 +491,23 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   (`ErrForeignTreeNeedsObjects`), so it gets the typed error and has to deepen.
 - 2026-10-11 — Scan cap (silent truncation at `MaxRows` before `WHERE`): found by qtask, Go fix on
   `fix/scan-cap-before-filter`. Follow-on units live in `docs/kdb-scan-cap-plan.md`.
+- **2026-10-11 — multi-node e2e harness, and U6a.** New `kdb-integration/e2e/test_cluster.py` +
+  `cluster_fixtures.py`: real kdb-service clusters (mesh, chain, star; 2-5 nodes) replicating with
+  `--peer`, concurrent writers on every node, `kill -9` of one node, two at once and the whole
+  cluster, clean drains, partitions (a node down while others write), late snapshot joiners,
+  SQL schema/UPDATE/DELETE replication, last-write and strict conflicts (queued, then resolved
+  through the control plane). Every scenario ends on a strict convergence check: the same head
+  commit on every node, identical documents, no open conflicts. Fixtures: ports pinned across
+  restarts, the control plane on demand, one log per launch (a restart no longer erases the
+  killed run's log), and evidence (data dirs, logs, `kdb-inspect verify`) preserved to
+  `e2e/evidence/` and uploaded by CI on failure. U6a: `test_kill9_mid_load...` checks every
+  acknowledged document before failing and reports missing / rolled back / unreadable
+  separately with the head each read was served at; `kdb-e2e-helper get` now exits 0 with an
+  empty body for not-found, so "absent" and "read failed" are distinguishable. A six-pass soak
+  (three with `GOMAXPROCS=2`) found three defects, each with its own PR:
+  **N1** snapshot joiner stuck on a branch forked behind its root (#111);
+  **N2** five-node mesh merge storm, 10k+ empty merges after writes stopped, never converging
+  (`fix/mesh-merge-convergence`); **N3** a drain mid-replication checkpoints a stored-but-unlogged
+  peer commit, after which the node fails every sync with "no frame in the delta log", 4 of 8
+  runs (`fix/checkpoint-unlogged-peer-commits`). The three tests that hit them carry non-strict
+  xfail marks to remove as the fixes land.

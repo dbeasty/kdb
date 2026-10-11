@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -147,6 +148,13 @@ func run(cmd string, args []string) error {
 			fmt.Println(hash)
 		case "get":
 			body, commit, err := cl.GetJSON(ctx, cf.namespace, docID)
+			if errors.Is(err, client.ErrNotFound) {
+				// Not found is an answer, not a failure: exit 0 with the commit the read was
+				// served at and an empty body, so a caller can tell "this document is not
+				// there" from "the read failed" - which a crash test has to.
+				fmt.Printf("%s\n\n", commit)
+				return nil
+			}
 			if err != nil {
 				return err
 			}
