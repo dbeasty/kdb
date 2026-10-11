@@ -131,6 +131,10 @@ func (d *InMemoryCommitDag) opsPinnedLocked(hash codec.Hash) bool {
 	if _, ok := d.shallow[hash]; ok {
 		return true
 	}
+	// Nor one received from a peer and not yet logged - see unlogged.go.
+	if _, ok := d.unlogged[hash]; ok {
+		return true
+	}
 	for _, b := range d.branches {
 		if b.HeadHash == hash {
 			return true

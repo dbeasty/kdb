@@ -57,11 +57,16 @@ func ListenPeerSyncTLS(addr string, runtime *KdbServerRuntime, namespaceID strin
 	codec := wire.NewCodec(wire.EncodingJSON)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	l := &Listener{ln: ln, cancel: cancel, done: done}
+	// Close ends the sessions peers already have open, not just the accept loop, and waits for
+	// their handlers. A session left running stored pushed commits into the DAG while the node
+	// drained, checkpointed and closed its storage underneath it; the shutdown sequence closes
+	// this listener before it drains, so peer sync is finished by then rather than merely refused.
+	sessions := newSessionSet()
+	l := &Listener{ln: ln, cancel: cancel, done: done, sessions: sessions}
 	go func() {
 		defer close(done)
 		_ = transport.Serve(ctx, ln, func(conn stream.ConnectionHandle) {
-			newPeerSyncConnHandler(codec, runtime, namespaceID, auth.EmptyContext).run(conn)
+			sessions.serve(conn, newPeerSyncConnHandler(codec, runtime, namespaceID, auth.EmptyContext).run)
 		})
 	}()
 	return l, nil
