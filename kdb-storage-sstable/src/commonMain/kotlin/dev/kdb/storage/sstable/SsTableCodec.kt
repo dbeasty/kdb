@@ -5,6 +5,7 @@ import dev.kdb.codec.KdbUuid
 import dev.kdb.compression.Crc32
 import dev.kdb.compression.ZstdCompression
 import dev.kdb.document.kdbSha256
+import dev.kdb.storage.CompressionCodec
 import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.io.SegmentNameBuilder
 
@@ -34,9 +35,15 @@ internal object SsTableCodec {
     const val BLOCK_CODEC_NONE: Byte = 0
     const val BLOCK_CODEC_ZSTD: Byte = 1
 
+    /**
+     * [compress] asks for ZSTD; on a platform without a real zstd ([ZstdCompression.isAvailable]
+     * false: Kotlin/JS and Native) the block is written CODEC_NONE instead. The header always
+     * records the codec actually used, so every reader on every platform decodes it.
+     */
     fun encodeBlock(payload: ByteArray, compress: Boolean): ByteArray {
-        val id = if (compress) BLOCK_CODEC_ZSTD else BLOCK_CODEC_NONE
-        val body = if (compress) ZstdCompression.compress(payload) else payload
+        val zstd = compress && ZstdCompression.isAvailable
+        val id = if (zstd) BLOCK_CODEC_ZSTD else BLOCK_CODEC_NONE
+        val body = if (zstd) ZstdCompression.compress(payload) else payload
         val out = ByteArray(BLOCK_HEADER_SIZE + body.size)
         out[0] = BLOCK_FORMAT_VERSION
         out[1] = id
@@ -147,7 +154,17 @@ public class DefaultSsTableWriter(
     private val ioShim: PlatformIoShim,
     private val namespaceId: String,
     private val level: Int,
+    /**
+     * The codec this writer asks for. ZSTD degrades to NONE on a platform without a real zstd
+     * ([ZstdCompression.isAvailable] false: Kotlin/JS and Native). The block header records the
+     * codec actually used, so every reader decodes the block either way. Before this, JS and
+     * Native wrote a length-prefixed copy of the payload and tagged it ZSTD, which Go and the JVM
+     * could not read.
+     */
+    codec: CompressionCodec = CompressionCodec.ZSTD,
 ) : SsTableWriter {
+    private val compress: Boolean = codec == CompressionCodec.ZSTD
+
     // A null value is a tombstone - deliberately distinguishable from "no entry at all", which is
     // what a missing key in this map means.
     private val entries = linkedMapOf<KdbHash, ByteArray?>()
@@ -174,7 +191,7 @@ public class DefaultSsTableWriter(
                 blocks[k] = BlockHandle(0L, 0, 0, deleted = true)
                 continue
             }
-            val block = SsTableCodec.encodeBlock(v, compress = true)
+            val block = SsTableCodec.encodeBlock(v, compress)
             ioShim.appendToSegment(segmentName, block)
             // compressedSize is the compressed body's own length - excluding encodeBlock's
             // header - matching what get() expects when it later reads

@@ -335,3 +335,23 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 ## Progress log
 
 _(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
+
+- **2026-10-11, U5** (branch `fix/js-native-codec-none`): `ZstdCompression.isAvailable` (an
+  `expect val`, true only on the JVM). On JS/Native, `compress`/`decompress` now throw
+  `ZstdUnavailableException` instead of the length-prefix stub. `SsTableCodec.encodeBlock` and
+  `DeltaPageCodec.frame` write `CODEC_NONE` when zstd is not available, and the sealed
+  `DeltaSegmentRef` reports the codec actually used. `DefaultSsTableWriter` takes an optional
+  `codec` (default ZSTD) so the JVM can export the NONE shape. The ice-bundle writer
+  (`kdb-storage-tier`) stores plain JSON there; its reader already falls back to raw bytes.
+  New physical goldens `sstable_segment_none.hex` and `delta_segment_none.hex` are read by Go.
+  The delta one is compared byte for byte.
+  `golden-freshness` and `make test-physical-golden` now also fail on *untracked* fixtures:
+  `git diff` ignored them, so a new exporter file nobody committed would have passed. The
+  js/native/common codec tests failed (codec byte 1, want 0) with the old stub and writers put
+  back. Found along the way, existing data: JS persistence is in memory
+  (`BrowserSegmentByteStore`), so none survives. **Native does persist to real files**
+  (`NativeSegmentByteStore`). A Native data directory written before U5 holds ZSTD-tagged
+  length-prefixed blocks, and Native now refuses those with `ZstdUnavailableException` instead
+  of reading them back. No Native or JS artifact has ever been released (releases ship Go
+  binaries and JVM jars only), and no fixture or test in the repo holds JS/Native-written files.
+  Still open: JS/Native cannot read JVM/Go zstd data (R1).

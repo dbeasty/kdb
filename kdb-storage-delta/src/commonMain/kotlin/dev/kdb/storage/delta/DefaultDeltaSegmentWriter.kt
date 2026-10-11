@@ -74,7 +74,7 @@ public class DefaultDeltaSegmentWriter(
             firstCommitHash = firstCommit ?: zero,
             lastCommitHash = lastCommit ?: zero,
             sizeBytes = sizeBytes,
-            compressionCodec = config.compressionCodec,
+            compressionCodec = DeltaPageCodec.effectiveCodec(config.compressionCodec),
             sequenceNumber = sequenceNumber,
         )
     }
@@ -116,8 +116,17 @@ internal object DeltaPageCodec {
             CompressionCodec.ZSTD -> CODEC_ZSTD
         }
 
+    /**
+     * The codec a frame is actually written with: ZSTD degrades to NONE on a platform without a
+     * real zstd ([ZstdCompression.isAvailable] false: Kotlin/JS and Native). The frame records it,
+     * so readers on every platform decode it. Before this, JS and Native wrote a length-prefixed
+     * copy of the payload and tagged it ZSTD, which Go and the JVM could not read.
+     */
+    fun effectiveCodec(codec: CompressionCodec): CompressionCodec =
+        if (codec == CompressionCodec.ZSTD && !ZstdCompression.isAvailable) CompressionCodec.NONE else codec
+
     fun frame(payload: ByteArray, codec: CompressionCodec): ByteArray {
-        val id = codecId(codec)
+        val id = codecId(effectiveCodec(codec))
         val body =
             when (id) {
                 CODEC_NONE -> payload
