@@ -1,6 +1,8 @@
 package replication
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -243,5 +245,29 @@ func TestRepairPeersAreAskedHealthiestFirst(t *testing.T) {
 	got := r.healthiestFirst()
 	if len(got) != 3 || got[0] != "c-fresh" || got[1] != "b-stale" || got[2] != "a-down" {
 		t.Fatalf("expected c-fresh, b-stale, a-down; got %v", got)
+	}
+}
+
+// TestDeepenRunsAfterAShallowBoundaryError: a joiner whose pull failed because the peer could not
+// supply a fork point's state behind its snapshot root (a ShallowBoundaryError, typically from an
+// older peer) must still be deepened when deepen=true - that error names deepen as the cure. Any
+// other failure still skips deepen. Before, every failed sync skipped it, so a stuck joiner
+// configured with deepen=true stayed stuck (found by the mixed-version upgrade test, #125).
+func TestDeepenRunsAfterAShallowBoundaryError(t *testing.T) {
+	boundary := &peersync.ShallowBoundaryError{Namespace: "app/data", Cause: errors.New("peer: INTERNAL: no tree")}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"sync succeeded", nil, true},
+		{"shallow boundary", boundary, true},
+		{"shallow boundary, wrapped", fmt.Errorf("namespace app/data: %w", boundary), true},
+		{"connection lost", errors.New("dial tcp: connection refused"), false},
+	}
+	for _, c := range cases {
+		if got := deepenAfter(peersync.NamespaceSyncResult{Namespace: "app/data", Err: c.err}); got != c.want {
+			t.Errorf("%s: deepenAfter = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

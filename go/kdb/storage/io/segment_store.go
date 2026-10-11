@@ -13,3 +13,11 @@ type SegmentByteStore interface {
 	WriteSnapshot(key string, data []byte) error
 	DeleteSnapshot(key string) error
 }
+
+// segmentStoreSizer is the optional SegmentByteStore counterpart of storage.SegmentSizer: a
+// store that knows a segment's length without reading it (OSByteStore stats the file).
+// Optional so a store written against the interface above keeps compiling; FileBackedPlatformIO
+// reports storage.ErrSegmentSizeUnknown for one that lacks it, and the caller reads instead.
+type segmentStoreSizer interface {
+	Size(segmentName string) (int64, error)
+}

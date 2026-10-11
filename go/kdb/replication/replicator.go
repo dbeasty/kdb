@@ -674,7 +674,7 @@ func (r *Replicator) OpenDocSession(projectionNS string) (*peersync.RepairSessio
 // is as synced as it was, and the next cycle tries again.
 func (l *peerLoop) deepen(synced []peersync.NamespaceSyncResult, transport stream.Transport) {
 	for _, ns := range synced {
-		if ns.Err != nil {
+		if !deepenAfter(ns) {
 			continue
 		}
 		env, err := l.r.cfg.Local.Env(ns.Namespace, false)
@@ -704,6 +704,20 @@ func (l *peerLoop) deepen(synced []peersync.NamespaceSyncResult, transport strea
 				"commits", fetched, "remainingShallowRoots", len(env.DAG.ShallowRoots()))
 		}
 	}
+}
+
+// deepenAfter reports whether a namespace's sync result leaves deepen worth trying. A sync that
+// failed is normally skipped - a lost connection or a refused push is not cured by fetching
+// history - with one exception: a ShallowBoundaryError means the peer sent a commit whose parent
+// lies behind this node's snapshot root and its state could not be taken (an older peer cannot
+// fold it). Deepening is exactly what recovers that, and the error tells the operator so; skipping
+// it left a joiner configured with deepen=true failing the same way on every cycle.
+func deepenAfter(ns peersync.NamespaceSyncResult) bool {
+	if ns.Err == nil {
+		return true
+	}
+	var boundary *peersync.ShallowBoundaryError
+	return errors.As(ns.Err, &boundary)
 }
 
 // OpenRepairSessionTo connects to peer name for namespace ns - for deepen and other repairs asked

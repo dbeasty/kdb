@@ -168,6 +168,29 @@ func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
 	return atomic.AddInt64(&seg.size, int64(len(bytes))), nil
 }
 
+// Size reports a segment's length without reading it: the logical size this process has
+// written when it holds the segment open for appending, and otherwise the file's length.
+//
+// The file length is what Read clamps to, so it is the same answer reading to the end would
+// give - including for a preallocated delta segment reopened by a later process, whose padding
+// reads back as zeros either way. SSTables, the reason this exists, are never preallocated.
+func (s *OSByteStore) Size(segmentName string) (int64, error) {
+	s.mu.Lock()
+	seg, ok := s.handles[segmentName]
+	s.mu.Unlock()
+	if ok {
+		return atomic.LoadInt64(&seg.size), nil
+	}
+	info, err := os.Stat(s.pathFor(segmentName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, &PlatformIOError{Message: "segment does not exist", SegmentName: segmentName, Cause: err}
+		}
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
 func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte, error) {
 	if length == 0 {
 		return []byte{}, nil

@@ -137,6 +137,22 @@ func ResolvedMemtableFlushBytes(cfg StorageEngineConfig) int64 {
 	return budget
 }
 
+// DefaultSSTableIndexFraction is the share of the hot-tier budget the SSTable store may spend
+// on parsed table indexes. Small, because an index costs about 128 bytes per key and compaction
+// keeps the table count low; the cache keeps the most recently used index even over budget, so
+// a namespace whose single table is larger than this still never re-parses it per probe.
+const DefaultSSTableIndexFraction = 0.125
+
+// ResolvedSSTableIndexCacheBytes is how many bytes of parsed SSTable footer indexes a namespace
+// keeps resident (see sstable.LsmBlobStore.SetIndexCacheBudget).
+func ResolvedSSTableIndexCacheBytes(cfg StorageEngineConfig) int64 {
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultSSTableIndexFraction)
+	if budget <= 0 {
+		return DefaultHotTierBytes / 8
+	}
+	return budget
+}
+
 // DefaultHistoryTreeFraction is the share of the hot-tier budget that
 // historical document trees may hold.
 const DefaultHistoryTreeFraction = 0.25

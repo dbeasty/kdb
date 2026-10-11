@@ -73,6 +73,20 @@ func (s *InMemoryPlatformIO) ReadFromSegment(segmentName string, offset int64, l
 	return out, nil
 }
 
+// SegmentSize implements storage.SegmentSizer, failing for an unknown segment as
+// ReadFromSegment does.
+func (s *InMemoryPlatformIO) SegmentSize(segmentName string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	full, ok := s.segments[segmentName]
+	if !ok {
+		return 0, fmt.Errorf("unknown segment %s", segmentName)
+	}
+	return int64(len(full)), nil
+}
+
+var _ storage.SegmentSizer = (*InMemoryPlatformIO)(nil)
+
 func (s *InMemoryPlatformIO) FlushSegment(string) error { return nil }
 
 func (s *InMemoryPlatformIO) SealSegment(segmentName string) error {

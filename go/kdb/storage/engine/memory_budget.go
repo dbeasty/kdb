@@ -52,6 +52,9 @@ func (e *ServerEngine) SetMemoryBudgetBytes(budgetBytes int64) {
 	if e.config.HistoryTreeCacheBytes <= 0 && e.treesByHash != nil {
 		e.treesByHash.SetBudget(int64(float64(budgetBytes) * storage.DefaultHistoryTreeFraction))
 	}
+	if e.blobStore != nil {
+		e.blobStore.SetIndexCacheBudget(int64(float64(budgetBytes) * storage.DefaultSSTableIndexFraction))
+	}
 	if e.config.MemtableFlushBytes <= 0 {
 		e.memtableFlushOverride.Store(int64(float64(budgetBytes) * storage.DefaultMemtableFraction))
 	}

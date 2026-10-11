@@ -187,6 +187,24 @@ func (mgr *Manager) Get(key codec.Hash) []byte {
 	return v
 }
 
+// Contains reports whether Get would find a value for key, without reading it out of an
+// SSTable - see sstable.LsmBlobStore.Contains.
+func (mgr *Manager) Contains(key codec.Hash) bool {
+	mgr.mu.Lock()
+	active := mgr.active
+	pending := mgr.pendingFlush
+	mgr.mu.Unlock()
+	if _, deleted, found := active.Lookup(key); found {
+		return !deleted
+	}
+	if pending != nil {
+		if _, deleted, found := pending.Lookup(key); found {
+			return !deleted
+		}
+	}
+	return mgr.blobStore.Contains(key)
+}
+
 // Flush writes the active memtable out as an SSTable and starts a fresh one. pendingFlush is
 // cleared only once the write has actually succeeded: clearing it before Finish (the call
 // that can fail on I/O) left the flushed-but-not-yet-durable generation reachable from

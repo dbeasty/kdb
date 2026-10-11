@@ -26,7 +26,8 @@ jobs:
         run: pip install -q -r kdb-integration/e2e/requirements.txt
       - name: Run slow + destructive scenarios
         working-directory: kdb-integration/e2e
-        run: python -m pytest -v -m "slow or destructive"
+        # Upgrade tests have their own job (e2e-upgrade), which builds the previous release.
+        run: python -m pytest -v -m "(slow or destructive) and not upgrade"
       - name: Upload e2e failure evidence
         # Data directories, every launch's service log and kdb-inspect output, kept by
         # preserve_evidence() when a crash or cluster scenario fails - the only way to examine a
@@ -35,6 +36,47 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-evidence-nightly-${{ github.run_attempt }}
+          path: kdb-integration/e2e/evidence/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e-upgrade:
+    # Mixed-version clusters (kdb-integration/e2e/test_upgrade.py): a v0.6.2 mesh upgraded to this
+    # build one node at a time under load, crashed nodes recovered by the new binary, a 2-old +
+    # 3-new mesh with kills, a snapshot joiner served by v0.6.2, SQL across versions, and what a
+    # rollback to v0.6.2 keeps. ~5 minutes, so nightly rather than per PR.
+    runs-on: ubuntu-latest
+    env:
+      PREV_TAG: v0.6.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch the previous release tag
+        run: git fetch --no-tags --depth=1 origin "+refs/tags/${PREV_TAG}:refs/tags/${PREV_TAG}"
+      - name: Build the previous release's kdb-service
+        run: make build-prev-service PREV_TAG="${PREV_TAG}"
+      - name: Build this build's Go binaries
+        run: |
+          make build-go
+          cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
+      - name: Install pytest
+        run: pip install -q -r kdb-integration/e2e/requirements.txt
+      - name: Run upgrade scenarios
+        working-directory: kdb-integration/e2e
+        run: |
+          export KDB_SERVICE_BIN_PREV="$GITHUB_WORKSPACE/go/bin/prev/kdb-service-${PREV_TAG}"
+          "$KDB_SERVICE_BIN_PREV" --version
+          python -m pytest -v -rxXs -m upgrade test_upgrade.py
+      - name: Upload e2e failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence-upgrade-${{ github.run_attempt }}
           path: kdb-integration/e2e/evidence/
           if-no-files-found: ignore
           retention-days: 14

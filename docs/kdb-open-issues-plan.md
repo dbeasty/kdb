@@ -758,7 +758,122 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   and reports the slowest restart instead. Fix: `perf/sstable-index-cache`.
   **(N5)** the third silent recovery path from U6c: damage in the middle of a segment that is no
   longer the newest truncates that segment at the damage, with no error.
+- **2026-10-11 — mixed-version upgrade check, the pre-release check before v0.7.0** (branch
+  `test/mixed-version-upgrade`). Since v0.6.2, main changed multi-node behaviour (#114 canonical
+  joins and `SupersedesHead` replay, #111 fork-point SNAPSHOT_FETCH folded by the serving node,
+  #113 unlogged peer commits kept out of checkpoints, #121 unscannable segments fail the open),
+  and deployments upgrade one node at a time, so `kdb-integration/e2e/test_upgrade.py` runs
+  v0.6.2 and this build in one mesh. Harness: `KdbServer.service_bin` / `restart(service_bin=)`
+  and `Cluster(service_bins=...)` / `Cluster.switch_binary` switch a node's binary on the same
+  data dir and pinned ports; `KDB_SERVICE_BIN_PREV` names the old binary (tests skip without
+  it); `make build-prev-service` (`scripts/build-prev-service.sh`) builds it from the tag via
+  `git archive`. Every flag the fixtures pass exists in v0.6.2 (the only flag main added is
+  `--max-result-rows`); the launch now checks a binary's `--help` and names the binary and
+  version if a flag is missing. New nightly job `e2e-upgrade` (~4 minutes). Results, 4 runs of
+  the file plus probes, macOS, load 3-7: **passing every run** - a 3-node v0.6.2 mesh upgraded a
+  node at a time under writes, by clean stop and by SIGKILL (this build recovers a log v0.6.2
+  crashed in), converged after every step with every acknowledged write; a 2-old + 3-new mesh
+  with SIGKILLs converged and stayed on one head after writes stopped (no merge storm from the
+  old pair); SQL schema and rows from v0.6.2 read, updated and deleted on new nodes; a snapshot
+  joiner served by v0.6.2 always hit the boundary and reported the typed `ShallowBoundaryError`
+  (cause `INTERNAL: no tree`, the old server cannot fold), never a silent stall, and
+  `POST /v1/ns/{ns}/deepen` recovered it; `bootstrap=snapshot,deepen=true` converged directly.
+  **Rollback to v0.6.2:** safe from a clean stop of every node, and safe after a crash once the
+  node has been started on this build and stopped cleanly. **Not safe straight after a crash**
+  (xfail, 4 of 4): v0.6.2's replay does not move main onto a logged canonical join that does not
+  descend from it, so every later write is stored but not applied. A/B on the same crashed data
+  dirs (5 nodes): this build opens with 0 of 30 documents behind, v0.6.2 with 30 of 30 behind;
+  once v0.6.2 stops cleanly its checkpoint names the stale head and this build reopens there too,
+  and in one probe run the whole mesh converged on the old values. **Found (not fixed here):**
+  the `deepen=true` peer option the `ShallowBoundaryError` message recommends cannot recover a
+  joiner that is already stuck - `replication.peerLoop.deepen` skips any namespace whose sync
+  returned an error, and the boundary error is one (xfail
+  `test_deepen_peer_option_recovers_a_stuck_snapshot_joiner`, 4 of 4). Also fixed in the
+  harness: `preserve_evidence` failed teardown with `shutil.Error` when a running node's
+  `peers/*.json.tmp` vanished mid-copy, hiding the test's own failure.
 
+- **2026-10-11 — the deepen=true peer option ignored a stuck snapshot joiner (found by #125).**
+  `replication.peerLoop.deepen` skipped every namespace whose sync returned an error, and the
+  `ShallowBoundaryError` a joiner reports (when a peer, e.g. v0.6.2, cannot supply a fork point's
+  state behind its snapshot root) is one, though its message names `deepen=true` as the cure.
+  `deepenAfter` now lets that error, and only that one, through; a lost connection or a refused
+  push still skips deepen. Evidence: #125's `test_deepen_peer_option_recovers_a_stuck_snapshot_joiner`
+  against a real v0.6.2 server fails with the old binary and passed 3 of 3 with the fix (its xfail
+  mark is removed); the whole upgrade suite passes; `TestDeepenRunsAfterAShallowBoundaryError`
+  pins the decision. The release notes drop it from Known issues and list it under Fixes.
+
+- **2026-10-11 — found while working on #43 (U6): crash-recovery open scaled with commits ×
+  SSTable size** (branch `perf/sstable-index-cache`). The #43 kill -9 reproducer left a namespace
+  with 14,736 commits and no checkpoint; it took 28 s to open (~1.9 ms per replayed commit, 24
+  documents). Root cause: `LsmBlobStore.Lookup` (`go/kdb/storage/sstable/types.go`) built a new
+  `DefaultReader` per table per probe, and `DefaultReader.Index` (`codec.go`) learned the file size
+  in `segmentSize` by reading the whole segment in 8 KB chunks (each chunk an open+stat+read+close
+  in `OSByteStore.Read`), then re-read and re-parsed the footer. Replay probes once per tree object
+  per commit (`engine.skipExistingObject`), so each replayed commit cost time proportional to the
+  table. The ordinary write path does not probe; history reads through the object store did pay it.
+  Fix, no format change: an optional `storage.SegmentSizer` (implemented by `InMemoryPlatformIO`,
+  and by `FileBackedPlatformIO` forwarding to `OSByteStore.Size`, which stats or uses the open
+  handle's logical size, and through `PrimaryWithReplicas` to the primary; S3 is a replica sink and
+  never serves reads). Shims without it, or returning `storage.ErrSegmentSizeUnknown`, fall back
+  to the old scan. `LsmBlobStore` caches each table's parsed index (LRU, budget
+  `storage.ResolvedSSTableIndexCacheBytes` = 1/8 of the hot tier, re-cut by `SetMemoryBudgetBytes`;
+  ~128 B per key; the most recent index is kept even over budget so one huge table never goes back
+  to per-probe parsing). It is guarded by the same mutex as the table list, so `Compact` drops the
+  inputs' indexes in the critical section that swaps them, and a load racing the swap is only
+  cached if its table is still registered. The newest-first order is cached instead of re-sorted
+  per probe. Replay's existence probe now asks `Contains` (index only) instead of `Get`, which
+  read and decompressed the probed tree object. A bloom filter was not added: replay's probes are
+  hits, and a warm miss is already ~20 ns. Numbers (14,000 commits / 24 docs, no checkpoint, one
+  ~3.3 MB table, load 7-9 on 16 cores): open 148.9 s → 0.62 s with the cache → 0.36 s with
+  `Contains`. Lookup against a ~1 MB table: file-backed hit 2.55 ms → 15 µs, miss 2.50 ms → 19 ns;
+  in-memory hit 554 µs → 1.6 µs. **Also found and fixed:** `Compact` replaced the table list
+  with its output outright, so a table flushed while a compaction ran vanished from the store until
+  the next open (`TestCompactKeepsTablesAddedDuringTheMerge`, fails against the old swap).
+  **Still open:** a lookup that took the table list just before a compaction's swap can miss a key,
+  because the inputs are deleted while it reads them; predates this change. Tests:
+  `go/kdb/storage/sstable/index_cache_test.go` (a first probe makes at most 4 reads where main made
+  155, warm hits one read, warm misses and `Contains` none; compaction invalidation, budget,
+  concurrency, the no-sizer fallback, file-backed size), and the opt-in measurement
+  `TestReplayOpenTimeWithoutCheckpoint` (`KDB_REPLAY_COMMITS=14000`) in `go/kdb/embed`.
+
+- **2026-10-11 — found by #123: a lookup racing a compaction could report a stored key as
+  missing** (branch `fix/compaction-lookup-race`). `LsmBlobStore.Lookup`/`Contains`
+  (`go/kdb/storage/sstable/types.go`) took the table list under the lock and read the tables
+  after releasing it; `Compact` swapped its output in and deleted its inputs straight away. A
+  lookup holding the pre-swap list then read deleted files, treated the read error as "this table
+  cannot answer", and never saw the merged table: not found. Predates #123 (the per-probe reader
+  hit the same deleted file). **Real impact:** live documents are pinned in `docsByHash`, so the
+  common read is unaffected. What reaches the blob store is a version that is not resident:
+  `GetDocument`/`ScanDocuments` (`engine/server_engine.go`) → `documentFromObject`
+  (`tree_objects.go`) → `loadCold` → `loadDocumentBody` (`document_bodies.go`). Under
+  `history=none` after truncation, or with bodies external (snapshot bootstrap, truncated
+  horizon), a miss there falls through to a delta log that no longer holds the version, so
+  `GetDocument` reported a stored document as not found and `ScanDocuments` **silently skipped the
+  row** - including live documents on their first read after reopen, which are not resident until
+  then. Under `history=full` the misses fall back to the log (`coldLoader`, tree folding in
+  `treeAt`): slower, not wrong. `MaterializeLiveBodies` re-wrote a body it thought missing
+  (harmless), and replay's `skipExistingObject` runs before maintenance starts. Compaction runs only
+  from maintenance (`CompactBlobStore` via `withCompaction` in `embed/checkpoint_open.go`, driven by
+  `embed/maintenance_loop.go`), concurrently with reads. **Fix, no format change:** reference-count
+  tables. `pin` takes the newest-first list and counts a reader on every table in one critical
+  section; `release` drops the counts and deletes any table a compaction has doomed once its last
+  reader is gone. `Compact` pins its own inputs, and at the swap (same lock) deletes at once an
+  input only it holds, and dooms the rest (`CompactionResult.Deferred`). An unregistered table
+  cannot be pinned, so a doomed table gains no new readers and the last release always deletes it.
+  The index cache stays correct: inputs' indexes are still dropped at the swap, and `indexFor`
+  only caches a registered table, so a pinned reader of a doomed table reads its index from the
+  file (still present) without re-caching it. `Compact` is now serialized (`compactMu`); two at
+  once would merge the same inputs and the second would fail reading the first's deletions.
+  Crash safety is unchanged: a crash with deletions pending is the existing crash between swap
+  and deletes, widened only by the longest lookup in flight; the next open rediscovers the inputs,
+  content addressing means they cannot change an answer, and the next compaction merges and
+  deletes them. The history-modes plan's item 7 (a leftover input shadowing a tombstone) is still
+  unreachable - nothing in production writes an SSTable tombstone - and still has to be closed by
+  whoever starts writing them. Tests (`go/kdb/storage/sstable/lookup_race_test.go`): a
+  deterministic interleaving through a test hook between taking the list and reading (Lookup, and
+  Contains with indexes evicted), and a stress run of 6 readers against 40 flushes and 60
+  compactions that asserts zero misses and no orphaned file. With deferral reverted: Lookup
+  `found=false`, Contains `false`, and 23 of 4,990 stress probes missed; with it, none.
 
 - **2026-10-11 — N5: damaged frames no longer silently truncate history (branch
   `fix/damaged-segment-silent-truncation`).** The third silent recovery path #121 found. Both holes
