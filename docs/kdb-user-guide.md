@@ -1914,6 +1914,7 @@ data-directory lock a live service holds, so they refuse to run against a direct
 | service starts normally after `kill -9` | a torn tail on the newest segment was tolerated | nothing — this is the designed path |
 | open fails naming `repair-segments` | corruption in a segment that is **not** the newest | `verify`, then `repair-segments`; if it refuses, `restore` |
 | `repair-segments` refuses and names commits | repairing would drop history later segments still reference | `restore` from a backup and/or the damaged directory |
+| `backup` (or `POST /v1/ns/{ns}/backups`, HTTP 409 `segment_damaged`) refuses, naming a segment and byte | a segment is damaged in place with acknowledged commits after the damage; a backup of the bytes before it would silently lack them, so nothing was uploaded | `verify`, then `repair-segments` or `restore`, then back up again. A torn tail from a crash is not this: it backs up its intact prefix |
 | open fails with "legacy segment format" | a pre-Layer-13 data directory | `repair-segments` migrates it |
 | `data directory locked` | another process holds the workspace | stop it, or use a server; `kdb unlock` removes a stale lock file only when the recorded PID is gone |
 

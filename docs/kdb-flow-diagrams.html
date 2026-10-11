@@ -1,0 +1,477 @@
+<!doctype html><html><head><meta charset="utf-8"><title>KDB Flow Diagrams</title>
+<style>body{font-family:system-ui;max-width:1200px;margin:2rem auto;padding:0 1rem}h2{margin-top:2.5rem;border-bottom:1px solid #ccc}pre.mermaid{background:#fff;overflow:auto}</style></head><body>
+<h1>KDB — Major Flow Diagrams</h1><p>Rendered from kdb-flows.md (14 diagrams)</p><h2>1. Server startup and namespace open</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant M as service.Main
+    participant C as config
+    participant R as recovery
+    participant H as embed.Host
+    participant L as embed.dirLock
+    participant T as embed.TxnCoordinator
+    participant N as Host.openNamespace
+    participant E as engine.ServerEngine
+    participant D as dag.InMemoryCommitDag
+    participant Q as embed.restoreNamespace
+    participant S as server.KdbServerRuntime
+    participant Y as syncnode.Node
+    participant X as listeners and admin
+
+    M-&gt;&gt;C: LoadServiceFile, ResolveService
+    M-&gt;&gt;R: ApplyPromotion (before any lock)
+    M-&gt;&gt;H: LoadOrCreateNodeID then OpenFileHost
+    H-&gt;&gt;L: flock .kdb.lock SH, .kdb.write.lock EX
+    H-&gt;&gt;T: openTxnCoordinator (mark open epochs dead)
+    M-&gt;&gt;H: NamespaceWithOptions
+    H-&gt;&gt;N: openNamespace
+    N-&gt;&gt;N: ensureNamespaceDirs, resolveNamespaceHistory
+    N-&gt;&gt;E: DefaultFactory.Open (WAL, SSTables, delta writer)
+    N-&gt;&gt;D: NewInMemoryCommitDag, SetOperationsLoader
+    N-&gt;&gt;Q: restoreNamespace
+    Q-&gt;&gt;Q: readCheckpoint, checkpointMatchesLog
+    Q-&gt;&gt;D: RestoreCheckpoint, replay tail segments
+    N-&gt;&gt;N: PersistingCommitDAG, checkpointAfterFullReplay
+    M-&gt;&gt;S: NewKdbServerRuntime, OpenIndexes
+    M-&gt;&gt;Y: syncnode.Open (opens _kdb/meta)
+    M-&gt;&gt;X: Listen sql, ws, peer, stream, admin, control
+    M-&gt;&gt;Y: StartMaintenance, node.Start (ReconcileAll)
+    M-&gt;&gt;X: admin.SetReady(true)
+</pre><h2>2. Client connect + auth/session token + admission</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as client.Client
+    participant T as transport (tcp/ws) socketConnection
+    participant FR as core.FrameStreamReader + frameAdmitter
+    participant H as server.sqlWireConnHandler
+    participant AU as auth.Engine (registryAuthenticator/Authorizer)
+    participant SM as server.SessionManager
+    participant RT as server.KdbServerRuntime
+
+    C-&gt;&gt;T: transport.Connect(uri) dial, optional TLS handshake
+    C-&gt;&gt;C: go readLoop(), correlation=1
+    C-&gt;&gt;T: HANDSHAKE {NodeID, ClientMode=SQL_CLIENT, Namespaces, Token=&quot;user:secret&quot;}
+    T-&gt;&gt;FR: Feed(bytes) -&gt; PeekHeader -&gt; admit(header)
+    Note over FR: HANDSHAKE has no OpClass, always admitted
+    FR-&gt;&gt;H: run(): Decode, not yet authenticated, dispatchAndSend inline
+    H-&gt;&gt;AU: Authenticator.Authenticate(creds) (PBKDF2-SHA256 120k)
+    AU--&gt;&gt;H: Principal{ID, Roles} or error
+    H-&gt;&gt;AU: Authorizer.Authorize(principal, SessionBeginAction{ns})
+    H-&gt;&gt;RT: Runtime.DAG.Head()
+    H-&gt;&gt;H: authMu.Lock: principal=..., authenticated=true
+    H--&gt;&gt;C: HandshakeAck{Accepted, RemoteHeads[ns]=head} or {Accepted=false, RejectionReason}
+    C-&gt;&gt;H: SESSION_BEGIN {ns, ReadConsistency} (lazy, on first PutJSON/Commit/Upsert)
+    H-&gt;&gt;RT: runtimeForWrite(ns) (may open or create the namespace)
+    H-&gt;&gt;AU: Authorize(SessionBeginAction{ns}) on the namespace&#x27;s own AuthEngine
+    H-&gt;&gt;SM: BeginOn(rt, ns, consistency, base, id, principal)
+    SM--&gt;&gt;H: KdbSession{ID &quot;sess-N&quot;, baseVersion=head, readPin if SNAPSHOT}
+    H--&gt;&gt;C: SessionBeginAck{SessionID, HeadHex}
+    loop every later request frame
+        T-&gt;&gt;FR: header peek: opClassForMessage + admitInZone(zone)
+        alt class shed in current zone
+            FR--&gt;&gt;C: typed refusal frame (BUSY, RetryAfterMs), body discarded
+        else admitted
+            FR-&gt;&gt;H: frame -&gt; goroutine (max 64 in flight, per-session FIFO)
+            H-&gt;&gt;RT: handler, then Admission.Acquire + writeGate.acquire
+        end
+    end
+</pre><h2>3. Document put/commit (single write, incl. group commit)</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as client.Client
+    participant H as server.sqlWireConnHandler
+    participant RT as server.KdbServerRuntime
+    participant G as server.writeGate (cap 1) + Admission
+    participant E as transaction.defaultEngine
+    participant ST as storage/engine.ServerEngine
+    participant D as dag.InMemoryCommitDag
+    participant IX as server.RegistryIndexProvider
+    participant P as embed.PersistingCommitDAG
+    participant L as embed.commitLogWriter goroutine
+    participant W as storage/delta.DefaultWriter -&gt; OSByteStore
+    participant S as StreamHub / CommitListener
+
+    C-&gt;&gt;H: TX_COMMIT {ns, sessionId, TransactionBytes}
+    H-&gt;&gt;H: Decode tx, ValidateFences, AssertUnheldByOthers
+    H-&gt;&gt;RT: Commit(ns, tx, sessionId, principal)
+    RT-&gt;&gt;RT: authored(tx), admitWrite (draining, writable, fence, home, per-op RBAC)
+    RT-&gt;&gt;D: Pin(base) and pinBaseTree(base)
+    RT-&gt;&gt;G: Admission.Acquire(ClassWrite) then writeGate.acquire(ctx 5s)
+    RT-&gt;&gt;IX: prepareIndexes (validate, no mutation)
+    RT-&gt;&gt;E: Engine.Commit(tx, dag, storage, schema)
+    E-&gt;&gt;E: head, HasCommit(base), findExistingCommit (idempotent retry)
+    E-&gt;&gt;E: plan: schema merge, preconditions, detectConflicts, unique keys
+    E-&gt;&gt;ST: PutDocument/DeleteDocument (pending shard), CommitTree
+    ST--&gt;&gt;E: new DocumentTree (trie root hash)
+    E-&gt;&gt;D: AppendCommitWith: CAS head, BuildCommit, publishHeadLocked
+    D--&gt;&gt;E: Commit{Hash}
+    E--&gt;&gt;RT: ResultSuccess
+    RT-&gt;&gt;IX: commitToIndexes(prepared, commit.Hash)
+    RT-&gt;&gt;P: PersistAsync(commit)
+    P-&gt;&gt;L: EnqueueAsync(DeltaRecord) (queue order = commit order)
+    RT-&gt;&gt;G: release write gate
+    L-&gt;&gt;L: drain up to 256 queued records
+    L-&gt;&gt;W: Append each record (zstd frame, WriteAt)
+    L-&gt;&gt;W: Flush once (fsync or fdatasync) then ack all
+    L--&gt;&gt;RT: wait() returns nil
+    RT-&gt;&gt;S: CommitListener(ns, commit) -&gt; StreamHub.Publish
+    RT--&gt;&gt;H: Commit
+    H-&gt;&gt;H: sess.startTransactionAt(commit.Hash)
+    H--&gt;&gt;C: SQL_RESULT {ResolvedCommitHex} or CONFLICT_REPORT / error
+    C-&gt;&gt;C: st.head = new commit hash
+</pre><h2>4. Document read: get by id, at commit/ref, history</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as client.Client / Session
+    participant FA as frameAdmitter (header)
+    participant H as server.sqlWireConnHandler
+    participant AU as auth.Authorizer
+    participant AD as Admission (ClassPointRead)
+    participant RT as server.KdbServerRuntime
+    participant D as dag.InMemoryCommitDag
+    participant ST as storage/engine.ServerEngine
+    participant DL as delta.DefaultReader (cold)
+
+    C-&gt;&gt;FA: DOCUMENT_GET {ns, docId, MinCommit?}
+    FA-&gt;&gt;H: always admitted (point reads never shed)
+    H-&gt;&gt;H: principalSnapshot, UUIDFromString
+    H-&gt;&gt;H: runtimeFor(ns) (no create)
+    H-&gt;&gt;AU: Authorize DocumentReadAction{ns, docId}
+    H-&gt;&gt;AD: AcquireBytes(ClassPointRead, EstimatePointRead) timeout 2s
+    opt MinCommit set (Session)
+        H-&gt;&gt;RT: AwaitCommit(MinCommit, 2s)
+        RT-&gt;&gt;D: Head / IsAncestor poll with backoff
+    end
+    H-&gt;&gt;RT: ReadDocument(ns, id)
+    RT-&gt;&gt;D: HeadCommit() one atomic snapshot
+    D--&gt;&gt;RT: head hash + Commit{DocumentTreeHash}
+    RT-&gt;&gt;ST: GetDocument(ns, id, treeHash)
+    ST-&gt;&gt;ST: treeAt: latestTree, treesByHash, treeFromObjects, rebuildTree
+    ST-&gt;&gt;ST: tree.HashFor(id) then docsByHash.Get(contentHash)
+    opt version evicted
+        ST-&gt;&gt;DL: documentFromObject / loadCold (body store or commit frame)
+    end
+    ST--&gt;&gt;RT: Document or nil
+    RT-&gt;&gt;RT: isExpiredAtHead filter, optional ReadThrough fallback
+    RT--&gt;&gt;H: json, headHex, found
+    H--&gt;&gt;C: DOCUMENT_GET_RESULT {JSON?, CommitHex}
+    C-&gt;&gt;C: JSON nil -&gt; ErrNotFound, Session.observe(commit)
+    Note over C,H: History: HISTORY_LIST {from, skip, limit} -&gt; ResolveRevision -&gt; ListCommits(Walk)
+</pre><h2>5. SQL query: wire request to result (SELECT, DML buffering, commit)</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as Client
+    participant H as server.sqlWireConnHandler
+    participant A as server.Admission and CostModel
+    participant E as sql.defaultEngine
+    participant P as sql.DefaultParser and DefaultPlanner
+    participant X as sql.Executor
+    participant IP as server.RegistryIndexProvider
+    participant S as storage.Adapter (expiryHidingAdapter)
+    participant R as server.KdbServerRuntime
+    C-&gt;&gt;H: SqlExecMessage (sessionId, sql, parametersJson)
+    H-&gt;&gt;H: Parse, classifyStatement, statementTarget, Authorize
+    alt SELECT or DDL
+        H-&gt;&gt;A: EstimateScan then AcquireBytes(ClassScan) SELECT only
+        H-&gt;&gt;E: Execute(sql, QueryContext{AtCommit, MaxRows 10000, RowBudget})
+        E-&gt;&gt;P: Parse then PlanSelect (validate columns)
+        E-&gt;&gt;X: ExecuteSelect(query, plan, residual, ctx)
+        X-&gt;&gt;IP: FullTextSearch or VectorSearch (resolveSearches)
+        X-&gt;&gt;IP: ExactLookup or RangeLookup (indexLookup)
+        X-&gt;&gt;S: ScanDocuments (fullScan) and GetDocument (materialize)
+        X--&gt;&gt;E: QueryResult (columns, rows, plan label)
+        E--&gt;&gt;H: QueryResult (CREATE TABLE returns AppliedSchema)
+        H-&gt;&gt;R: SetSchemaChecked and Meta.RecordSchema (CREATE TABLE only)
+        H-&gt;&gt;A: ObserveScanActual
+        H--&gt;&gt;C: SqlResultMessage (columns, rows as strings, resolvedCommitHex)
+    else INSERT UPDATE DELETE
+        H-&gt;&gt;E: ExecuteDML(sql, ctx)
+        E-&gt;&gt;X: matchingDocs (UPDATE and DELETE) via the same access path
+        E--&gt;&gt;H: DMLResult (WriteOp and DeleteOp list)
+        H-&gt;&gt;H: PendingBuilder.Write or Delete (buffered, nothing durable)
+        H--&gt;&gt;C: SqlResultMessage (rowsAffected, generatedIds)
+    else COMMIT
+        H-&gt;&gt;R: Commit(tx) via commitSession
+        R--&gt;&gt;H: document.Commit (durable after fsync wait)
+        H--&gt;&gt;C: SqlResultMessage (resolvedCommitHex = new head)
+    end
+</pre><h2>6. Transaction, including the cross-namespace commit group</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as client.Client / client.Tx
+    participant H as server.sqlWireConnHandler
+    participant NS as server.NamespaceSet
+    participant CG as embed.CommitGroup
+    participant TC as embed.TxnCoordinator
+    participant P as server.serverParticipant
+    participant E as transaction.defaultEngine
+    participant D as dag.InMemoryCommitDag
+    participant PD as embed.PersistingCommitDAG
+    participant CL as embed.commitLogWriter
+    participant DL as embed.decisionLog
+
+    C-&gt;&gt;H: TX_COMMIT_MULTI (parts, encoded tx per namespace)
+    H-&gt;&gt;H: handleTxCommitMulti authorize each part
+    H-&gt;&gt;NS: CommitAcross(parts)
+    NS-&gt;&gt;NS: commitAcross resolve, admitWrite, admission.Acquire
+    NS-&gt;&gt;CG: CommitGroup(coord, parts)
+    CG-&gt;&gt;P: Lock() in namespace order (writeGate.acquire)
+    CG-&gt;&gt;TC: Begin(namespaces) epoch, group id, inflight
+    loop each participant
+        CG-&gt;&gt;P: Prepare(tx)
+        P-&gt;&gt;E: PrepareCommit (schema, preconditions, conflicts, uniques)
+    end
+    loop each participant
+        CG-&gt;&gt;P: Apply(group.Message())
+        P-&gt;&gt;D: AppendCommitWith(Provisional=true)
+        CG-&gt;&gt;PD: TxnGroup.AddPart -&gt; persistPart
+        PD-&gt;&gt;CL: EnqueueDurableAsync (force flush)
+    end
+    CG-&gt;&gt;P: unlock all (writers may proceed)
+    NS-&gt;&gt;CG: wait()
+    CG-&gt;&gt;CL: TxnGroup.Finish phase 1 wait every part fsynced
+    CG-&gt;&gt;TC: decide(group)
+    TC-&gt;&gt;DL: enqueue(group id)
+    DL-&gt;&gt;DL: write 20 bytes + fsync (group commit batch)
+    DL--&gt;&gt;CG: durable
+    CG-&gt;&gt;D: SettleProvisional(part)
+    CG--&gt;&gt;H: GroupID, commits per namespace
+    H--&gt;&gt;C: TX_COMMIT_MULTI_RESULT
+</pre><h2>7. Branch, merge, revert and truncate</h2><pre class="mermaid">flowchart TD
+    subgraph Refs
+      CB[control.Server.handleCreateBranch] --&gt; DCB[dag.InMemoryCommitDag.CreateBranch]
+      CT[control.Server.handleCreateTag] --&gt; DCT[dag.InMemoryCommitDag.CreateTag]
+      DCB --&gt; MEM[(branches / tags maps in memory)]
+      DCT --&gt; MEM
+      MEM -. only via .-&gt; CK[embed.saveCheckpoint -&gt; writeCheckpoint snap file]
+    end
+    subgraph Revert
+      WR[server.sqlWireConnHandler.handleRevert holds writeGate] --&gt; RT[embed.RevertTo]
+      CR[control.Server.handleRevertApply expectHead check, no writeGate] --&gt; RT
+      RP[control.Server.handleRestoreToPoint N reverts] --&gt; RT
+      RT --&gt; RES[dag.ResolveRevision + resolveTree head and target]
+      RES --&gt; STG[Storage.PutDocument / DeleteDocument staged]
+      STG --&gt; CTR[Storage.CommitTree check tree hash == target tree hash]
+      CTR --&gt; AC[PersistingCommitDAG.AppendCommit -&gt; InMemoryCommitDag.AppendCommit CAS on main]
+      AC --&gt; LOG[Persist -&gt; commitLogWriter fsync]
+    end
+    subgraph Merge
+      ING[peersync.Adopt] --&gt; RD[peersync.resolveDivergedLocked]
+      RD --&gt; MN[peersync.mergeNonConflicting]
+      MN --&gt; AM[dag.AppendMergeCommitOnto two parents CAS on main]
+      AM --&gt; PA[IngestEnv.persistAll -&gt; PersistAsync, wait outside gate]
+    end
+    subgraph Truncate
+      MS[MaintenanceScheduler.runPass / Maintain / CompactHistory / close] --&gt; CAT[embed.checkpointAndTruncate]
+      CAT --&gt; PL[embed.planTruncation segmentsToDelete]
+      PL --&gt; SC[saveCheckpoint with floor = highest victim + 1]
+      SC --&gt; AT[embed.applyTruncation PrepareForTruncation then DeleteSegment per victim]
+    end
+</pre><h2>8. Index maintenance and schema change</h2><pre class="mermaid">flowchart TD
+    subgraph DDL[&quot;CREATE INDEX / DROP INDEX / CREATE TABLE (wire)&quot;]
+        D1[&quot;handleSqlExec -&gt; execRead (wire_listen.go:584)&quot;]
+        D2[&quot;sql.defaultEngine.Execute (engine.go:53)&quot;]
+        D3[&quot;RegistryIndexProvider.CreateIndex (index_provider.go:173)&quot;]
+        D4[&quot;MetaStore.Local lock (meta.go:270)&quot;]
+        D5[&quot;createIndexLocal: descriptorFor, Registry.Add, rebuildIndex, saveIndexCatalog&quot;]
+        D6[&quot;MetaStore.RecordIndex -&gt; put -&gt; systemUpsert (commit in _kdb/meta)&quot;]
+        D7[&quot;CREATE TABLE: ExecuteCreateTable -&gt; AppliedSchema -&gt; SetSchemaChecked -&gt; RecordSchema&quot;]
+        D1 --&gt; D2
+        D2 --&gt; D3 --&gt; D4 --&gt; D5 --&gt; D6
+        D2 --&gt; D7
+    end
+    subgraph COMMIT[&quot;Every commit (runTransaction)&quot;]
+        C1[&quot;prepareIndexes: Registry.PrepareWrite/PrepareDelete (no mutation)&quot;]
+        C2[&quot;transaction.Engine.Commit: runSchemaPhase, planUniqueKeys, AppendCommit, UniqueKeys.Apply&quot;]
+        C3[&quot;commitToIndexes: PreparedWrite.Commit(commitHash) -&gt; eventLog put/delete&quot;]
+        C4[&quot;every 64th: RegistryIndexProvider.save -&gt; catalog.json + snapshot.bin + manifest.json&quot;]
+        C5[&quot;PersistAsync + waitDurable (delta log fsync)&quot;]
+        C1 --&gt; C2 --&gt; C3 --&gt; C4
+        C3 --&gt; C5
+    end
+    subgraph OPEN[&quot;Process start&quot;]
+        O1[&quot;service.go:353 KdbServerRuntime.OpenIndexes&quot;]
+        O2[&quot;stores.Open -&gt; index.LoadRegistry: catalog + snapshot, compare manifest head with DAG head&quot;]
+        O3[&quot;stale: RebuildFromScan(scanAtCommit(head)) then save&quot;]
+        O4[&quot;syncnode.Node.Start -&gt; MetaStore.ReconcileAll&quot;]
+        O5[&quot;applySchema: SetSchemaChecked; applyIndex: createIndexLocal if definition differs or missing&quot;]
+        O1 --&gt; O2 --&gt; O3 --&gt; O4 --&gt; O5
+    end
+    DDL -. &quot;descriptors registered&quot; .-&gt; COMMIT
+    COMMIT -. &quot;snapshots on disk&quot; .-&gt; OPEN
+</pre><h2>9. Peer sync (v2 client and server)</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant L as replication.peerLoop
+    participant C as peersync.SyncV2 / v2Conn
+    participant H as peersync.V2Host
+    participant I as peersync.Adopt / StoreCommits
+    participant N as server.serverLocalNode
+    participant D as InMemoryCommitDag + Storage
+    participant W as embed.PersistingCommitDAG (delta log)
+
+    L-&gt;&gt;C: cycle(): SyncV2(namespaces, ExtraHaves)
+    C-&gt;&gt;H: SYNC_HELLO {nodeId, caps, patterns, creds}
+    H-&gt;&gt;H: Authenticate, SelectNamespaces, PeerDirections
+    H--&gt;&gt;C: SYNC_HELLO_ACK {caps, refs per namespace, resolutionHash, access}
+    loop each granted namespace
+        C-&gt;&gt;C: resolution hash differs? then Strict, no merge
+        opt namespace empty and peer shallow or PreferSnapshot
+            C-&gt;&gt;H: SNAPSHOT_FETCH pages
+            H--&gt;&gt;C: SNAPSHOT_PAGE docs + commit
+            C-&gt;&gt;D: InstallSnapshot (verify tree hash, shallow root, SetHead)
+        end
+        loop each ref, main first, missing commit
+            C-&gt;&gt;H: FETCH_REQUEST {wants, haves, maxBytes}
+            H--&gt;&gt;C: PACK_PAGE {commits parents first, stubs, done}
+            C-&gt;&gt;I: StoreCommits (DAG only, nothing logged)
+        end
+        C-&gt;&gt;I: ApplyRef(main) then Adopt
+        I-&gt;&gt;N: Exclusive(fn)
+        N-&gt;&gt;D: fast-forward or merge, apply to storage, SetHead
+        I-&gt;&gt;W: PersistAsync(adopted commits) under the gate
+        N--&gt;&gt;I: release gate
+        I-&gt;&gt;W: wait() for fsync, outside the gate
+        C-&gt;&gt;H: REF_UPDATE pages {commits, stubs, more}
+        H-&gt;&gt;I: StoreCommits, ApplyRef (same decision)
+        H--&gt;&gt;C: REF_UPDATE_ACK {outcome, head, conflict}
+    end
+    L-&gt;&gt;L: StateStore.Save (JSON, rename)
+</pre><h2>10. Conflict detection and stored-procedure merge resolution</h2><pre class="mermaid">flowchart TD
+    A[peersync.Adopt] --&gt; B{ResolveHeadUpdate}
+    B --&gt;|incoming is ancestor| N[no-op]
+    B --&gt;|incoming descends| FF[fastForward]
+    B --&gt;|diverged| R[resolveDivergedLocked]
+    R --&gt; U{CommonAncestor nil?}
+    U --&gt;|yes, chain lacks allowUnrelated| E[VersionNotFoundError]
+    U --&gt;|no or allowed| V[valuesAt and origin per candidate doc]
+    V --&gt; S{same body?}
+    S --&gt;|yes| SKIP[skip]
+    S --&gt;|only one side changed| M1[take the changed side]
+    S --&gt;|both changed| CF[conflicting docs]
+    CF --&gt; RC[resolveConflicting]
+    RC --&gt; CH[Choose: operator choice]
+    CH --&gt; CN[Chain.resolve rules in order]
+    CN --&gt; PR[procedure rule: runConflictProcedure in script.ModePure]
+    PR --&gt;|error| HOLD[held: report with Reason]
+    CN --&gt; PO[Policy LastWrite or Custom]
+    PO --&gt; REP{anything undecided?}
+    REP --&gt;|yes| Q[OutcomeConflict, noteConflict into ConflictQueue, main untouched]
+    REP --&gt;|no| MG[mergeNonConflicting]
+    M1 --&gt; MG
+    MG --&gt; AM[AppendMergeCommitOnto, CAS on local head]
+    AM --&gt; P[persistAll then Advanced then fsync wait]
+    Q --&gt; AU{authority rule?}
+    AU --&gt;|webhook| WH[ConflictWebhook.Pass]
+    AU --&gt;|procedure| CP[ConflictProcedure.Pass, ModeRead]
+    AU --&gt;|control plane| CR[ResolveConflict]
+    WH --&gt; CR
+    CP --&gt; CR
+    CR --&gt; A
+</pre><h2>11. Checkpoint, compaction, maintenance loop, retention and history-mode switch</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant K as MaintenanceScheduler
+    participant RT as EmbeddedKdbRuntime
+    participant CK as checkpointAndTruncate
+    participant SV as saveCheckpoint
+    participant TR as planTruncation and applyTruncation
+    participant EN as ServerEngine
+    participant IO as FileBackedPlatformIO
+    participant LW as commitLogWriter
+
+    LW-&gt;&gt;K: onSealed (NotifySegmentSealed, immediate mode only)
+    K-&gt;&gt;K: tick, decide, needsWork, Busy and MaxDefer
+    K-&gt;&gt;RT: runPass then Maintain
+    RT-&gt;&gt;CK: rt.maintain closure (through = newest sealed segment)
+    CK-&gt;&gt;TR: planTruncation (history=none, reclaim on)
+    CK-&gt;&gt;SV: saveCheckpoint(through, plan.Floor)
+    SV-&gt;&gt;IO: WriteSnapshot snap/kdb_checkpoint (tmp, fsync, rename, dir fsync)
+    CK-&gt;&gt;TR: applyTruncation
+    TR-&gt;&gt;EN: PrepareForTruncation (live bodies to SSTable, fsync)
+    TR-&gt;&gt;IO: DeleteSegment for each victim, lowest first
+    CK-&gt;&gt;EN: CompactBlobStore (flush memtable, merge SSTables)
+    EN-&gt;&gt;IO: write merged table, seal, then delete inputs
+</pre><h2>12. Backup, verify, repair, restore and promote</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant Op as Operator (kdb-inspect or control plane)
+    participant BK as backup.Create / CreateDatabase
+    participant IG as integrity (Verify, VerifiedSegmentPrefix)
+    participant OS as backup.ObjectStore (DirStore)
+    participant RS as recovery.HybridRestore
+    participant ST as control.Server.runRestore (staging dir)
+    participant PR as recovery.StagePromotion / ApplyPromotion
+    participant SV as service.Run startup
+
+    Op-&gt;&gt;BK: backup (CLI holds LockDataDir, control plane is online)
+    BK-&gt;&gt;IG: ListSequencedSegments, VerifiedSegmentPrefix per segment
+    BK-&gt;&gt;OS: Put sealed segments, Put active prefix, Put txn files
+    BK-&gt;&gt;OS: Put manifest.json LAST
+    Op-&gt;&gt;ST: POST /v1/ns/ns/restore/staging (backupId and/or includeLive)
+    ST-&gt;&gt;OS: FetchToDir (sha256 check each segment)
+    ST-&gt;&gt;RS: HybridRestore(sources, out shim)
+    RS-&gt;&gt;IG: ScanVerifiedCommits per source
+    RS-&gt;&gt;RS: union by hash, topologicalOrder
+    RS-&gt;&gt;ST: new sealed delta segment in restored/ (Flush, Seal)
+    Op-&gt;&gt;ST: attach (read-only runtime) and inspect
+    Op-&gt;&gt;PR: POST promote with confirm string
+    PR-&gt;&gt;PR: copy payload to dataRoot/.kdb.promote, write intent file
+    PR--&gt;&gt;SV: process exits 75, supervisor restarts
+    SV-&gt;&gt;PR: ApplyPromotion before opening data root
+    PR-&gt;&gt;PR: verify commit count, rename live ns to superseded/, rename payload into place
+</pre><h2>13. Shutdown and crash recovery</h2><pre class="mermaid">flowchart TD
+    subgraph CLEAN[&quot;Clean stop in service.Main&quot;]
+        A1[&quot;SIGINT or SIGTERM, or RequestRestart from control plane&quot;] --&gt; A2[&quot;admin.SetReady false (readyz 503)&quot;]
+        A2 --&gt; A3[&quot;node.StopSync: replicator and scrub&quot;]
+        A3 --&gt; A4[&quot;MaintenanceScheduler.Stop (waits for pass)&quot;]
+        A4 --&gt; A5[&quot;watchdog.Stop, srv.BeginDraining&quot;]
+        A5 --&gt; A6[&quot;close sql, peer, stream listeners&quot;]
+        A6 --&gt; A7[&quot;WaitForWritesToDrain (default 30s)&quot;]
+        A7 --&gt; A8[&quot;saveCostModelState, srv.Release&quot;]
+        A8 --&gt; A9[&quot;EmbeddedKdbRuntime.Close then Host.CloseNamespace&quot;]
+        A9 --&gt; A10[&quot;persisting.Close: drain queue and fsync&quot;]
+        A10 --&gt; A11[&quot;writer.Flush then Seal&quot;]
+        A11 --&gt; A12[&quot;checkpointOnClose (and truncate if history none)&quot;]
+        A12 --&gt; A13[&quot;engine.Close: memtable flush&quot;]
+        A13 --&gt; A14[&quot;Host.Close: other namespaces, txn epoch seal, release flocks&quot;]
+        A14 --&gt; A15[&quot;exit 0, or exit 75 on restart request&quot;]
+    end
+    subgraph CRASH[&quot;kill -9 or power loss&quot;]
+        B1[&quot;kernel drops flocks&quot;] --&gt; B2[&quot;next start: ApplyPromotion if intent exists&quot;]
+        B2 --&gt; B3[&quot;openTxnCoordinator: txn/*.log renamed to .dead&quot;]
+        B3 --&gt; B4[&quot;restoreNamespace: checkpoint matches log?&quot;]
+        B4 --&gt;|yes| B5[&quot;restore graph, replay segments after ThroughSequence&quot;]
+        B4 --&gt;|no| B6[&quot;replay all segments, or TruncatedLogError&quot;]
+        B5 --&gt; B7[&quot;newest segment: torn tail tolerated, groupGate rolls back undecided parts&quot;]
+        B6 --&gt; B7
+        B7 --&gt; B8[&quot;new writer segment max+1, checkpointAfterFullReplay if replayed in full&quot;]
+    end
+</pre><h2>14. Stream mode and replication (stream pkg, StreamHub, replicator, projections, handover)</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant S as stream.defaultSubscriber
+    participant HUB as server.StreamHub
+    participant RT as server.KdbServerRuntime
+    participant DAG as InMemoryCommitDag
+    participant RP as replication.peerLoop
+    participant HOST as peersync.V2Host
+    participant PT as server.projectionTarget
+
+    S-&gt;&gt;HUB: HANDSHAKE {nodeId, namespaces, localHeads, clientMode, filter, creds}
+    HUB-&gt;&gt;HUB: Authenticate, StreamSubscribeAction, parse filter, check resume point
+    HUB--&gt;&gt;S: HANDSHAKE ack {remoteHeads}
+    HUB-&gt;&gt;HUB: go sendLoop(sub), poke
+    RT-&gt;&gt;HUB: CommitListener -&gt; Publish (wake only)
+    HUB-&gt;&gt;DAG: catchUp: head, firstParentChain or treeDelta
+    HUB--&gt;&gt;S: DELTA_COMMIT {commit, parent, ops filtered by visible()}
+    S-&gt;&gt;S: parent must equal position, else DesyncError
+    S--&gt;&gt;HUB: POSITION_ACK
+    S-&gt;&gt;HUB: TRANSACTION_REPLAY (mode 2)
+    HUB-&gt;&gt;RT: Replay onto current head as handshake principal
+    HUB--&gt;&gt;S: SQL_RESULT {resolvedCommitHex} or CONFLICT_REPORT
+    Note over RP,PT: replication with a filtered peer
+    RP-&gt;&gt;HOST: SYNC_HELLO {caps filter, writeback}
+    opt write-back
+        RP-&gt;&gt;HOST: PROJECT_WRITE {txId, docs with baseHash}
+        HOST-&gt;&gt;RT: ApplyWriteBack, preconditions on content hash
+        HOST--&gt;&gt;RP: PROJECT_WRITE_RESULT {applied, conflict, refused, current}
+        RP-&gt;&gt;PT: ResolveWrite (decision commit)
+    end
+    RP-&gt;&gt;HOST: PROJECT_FETCH {from, filter, after}
+    HOST--&gt;&gt;RP: PROJECT_PAGE {writes, deletes, reset, done}
+    RP-&gt;&gt;PT: Apply -&gt; systemCommit(kdb:projection/1)
+</pre>
+<script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.esm.min.mjs";mermaid.initialize({startOnLoad:false,securityLevel:"loose",sequence:{useMaxWidth:false}});
+const els=[...document.querySelectorAll("pre.mermaid")];window.__res=[];
+for(const [i,el] of els.entries()){try{await mermaid.run({nodes:[el]});window.__res.push("ok")}catch(e){window.__res.push("ERR "+i+": "+String(e.message||e).split("\n")[0]);el.insertAdjacentHTML("afterend","<p style=color:red>render error</p>")}}
+window.__done=true;</script></body></html>
