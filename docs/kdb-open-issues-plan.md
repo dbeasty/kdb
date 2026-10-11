@@ -336,7 +336,7 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 
 _(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
 
-### 2026-10-11 — N1 (new, found by multi-node e2e): snapshot-bootstrapped node stuck on "missing parent" — branch `fix/shallow-node-missing-parent`
+### 2026-10-11 — N1 (new, found by multi-node e2e): snapshot-bootstrapped node stuck on "missing parent" — PR #111, branch `fix/shallow-node-missing-parent`, commit `0641f37`
 
 **Found by** the multi-node e2e `test_cluster.py::test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes`
 (sibling worktree `e2e-multi`, not on `main` yet), 3/3: a node joining a busy three-writer mesh
