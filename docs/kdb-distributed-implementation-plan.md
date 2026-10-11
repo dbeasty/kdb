@@ -844,6 +844,7 @@ An adversarial review of phases 0–10 found eight defects. Each has a regressio
    - Pull now runs per ref, main first.
    - A failure on any other ref is recorded in `NamespaceSyncResult.RefErrors` and doesn't stop the rest of the sync.
    - Test: `TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot`.
+   - **Superseded (2026-10, `fix/shallow-node-missing-parent`):** such a branch - and, worse, a branch merged into main - is now taken. The pull takes the fork point's *state* (`SNAPSHOT_FETCH` at it, which the host folds from its history when it never built that tree) and admits it as a shallow root of this node's own; see `peersync/boundary.go` and `docs/kdb-open-issues-plan.md` progress log.
 4. **A crash between logging a peer commit and logging the merge** made replay move main onto the peer's branch.
    - **Replay rule:** a logged commit is applied only if the current head is one of its parents. Otherwise it is only stored.
    - Test: `TestReplayDoesNotMoveMainOntoAPeerBranchCutOffFromItsMerge`.

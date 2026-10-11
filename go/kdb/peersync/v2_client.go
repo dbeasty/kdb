@@ -77,6 +77,9 @@ type NamespaceSyncResult struct {
 	Snapshot string
 	// Grafted lists the peer's shallow roots this sync grafted in (see Graft).
 	Grafted []string
+	// BoundaryExtended lists commits behind this node's snapshot root whose state this sync took
+	// in, because the peer sent a branch forked from them (see boundary.go).
+	BoundaryExtended []string
 	// Access is the peer's grant for this namespace: "" both directions, wire.AccessPull or
 	// wire.AccessPush. The direction not granted was skipped.
 	Access string
@@ -363,9 +366,23 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow 
 		n, err := StoreCommits(env, page.Commits, page.Stubs)
 		res.Pulled += n
 		res.Received += len(page.Commits)
-		// A page can reach down to more than one of the peer's roots; each graft lets the retry
-		// store further, so there are at most as many rounds as commits.
+		// A page can reach down to more than one of the peer's roots, or below this node's own;
+		// each round takes in at least one and lets the retry store further, so there are at
+		// most as many rounds as commits.
 		for round := 0; err != nil && round < len(page.Commits); round++ {
+			// A parent behind this node's own snapshot root: the peer counted it as held because
+			// this node's root descends from it (see boundary.go). Take its state, then store.
+			if gaps := gapsBelowBoundary(env, page.Commits, shallow); len(gaps) > 0 {
+				for _, gap := range gaps {
+					if ferr := extendBoundary(env, gap, c.snapshotFetcher(cfg, ns, gap.parent.Hex())); ferr != nil {
+						return haves, ferr
+					}
+					res.BoundaryExtended = append(res.BoundaryExtended, gap.parent.Hex())
+				}
+				n, err = StoreCommits(env, page.Commits, page.Stubs)
+				res.Pulled += n
+				continue
+			}
 			root, ok := unsharedRoot(env, page.Commits, shallow)
 			if !ok {
 				return haves, err
