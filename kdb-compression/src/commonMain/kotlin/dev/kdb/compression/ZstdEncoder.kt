@@ -11,7 +11,8 @@ import dev.kdb.compression.ZstdTables.highBit
  * for size and simplicity:
  *  - one greedy hash-table match finder (4-byte minimum match, matches may reach back across
  *    blocks to the start of the frame);
- *  - literals stored raw, never Huffman-coded;
+ *  - literals Huffman-coded per block when that is smaller (ZstdLiteralsEncoder), never reusing
+ *    the previous block's table;
  *  - sequences coded with the predefined FSE tables only, and no repeat offsets;
  *  - a block that does not shrink is stored raw.
  * Every frame is single-segment, declares its content size, and carries the XXH64 content
@@ -110,17 +111,11 @@ internal object ZstdEncoder {
                     pos += 1 + ((pos - litStart) ushr 6)
                 }
             }
-            if (nbSeq == 0) return null
             src.copyInto(literals, litSize, litStart, end)
             litSize += end - litStart
 
             sink.reset()
-            when {
-                litSize < 32 -> sink.byte(litSize shl 3)
-                litSize < 4096 -> sink.le((1 shl 2) or (litSize shl 4), 2)
-                else -> sink.le((3 shl 2) or (litSize shl 4), 3)
-            }
-            sink.bytes(literals, 0, litSize)
+            ZstdLiteralsEncoder.write(sink, literals, litSize)
             when {
                 nbSeq < 128 -> sink.byte(nbSeq)
                 nbSeq < 0x7F00 -> {
@@ -132,8 +127,10 @@ internal object ZstdEncoder {
                     sink.le(nbSeq - 0x7F00, 2)
                 }
             }
-            sink.byte(0) // predefined tables for literal lengths, offsets and match lengths
-            writeSequences(nbSeq)
+            if (nbSeq > 0) {
+                sink.byte(0) // predefined tables for literal lengths, offsets and match lengths
+                writeSequences(nbSeq)
+            }
             return if (sink.size < end - start) sink else null
         }
 
@@ -195,7 +192,7 @@ internal object ZstdEncoder {
 }
 
 /** FSE encoding table for one predefined distribution (the reference's FSE_buildCTable). */
-private class FseEncoder(norm: ShortArray, private val log: Int) {
+internal class FseEncoder(norm: ShortArray, private val log: Int) {
     private val stateTable: IntArray
     private val deltaNbBits: IntArray
     private val deltaFindState: IntArray
@@ -253,7 +250,7 @@ private class FseEncoder(norm: ShortArray, private val log: Int) {
 }
 
 /** Forward little-endian bit writer; [close] adds the end marker a backward reader starts from. */
-private class BitWriter(private val sink: ByteSink) {
+internal class BitWriter(private val sink: ByteSink) {
     private var acc = 0
     private var count = 0
 
@@ -278,7 +275,7 @@ private class BitWriter(private val sink: ByteSink) {
     }
 }
 
-private class ByteSink(initial: Int) {
+internal class ByteSink(initial: Int) {
     var buf = ByteArray(maxOf(16, initial))
     var size = 0
 

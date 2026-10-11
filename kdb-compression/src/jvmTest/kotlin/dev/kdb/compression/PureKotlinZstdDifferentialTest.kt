@@ -32,6 +32,9 @@ class PureKotlinZstdDifferentialTest {
             "small json" to ZstdTestCorpus.json(700),
             "skewed bytes" to ByteArray(100_000) { (rnd.nextInt(64).let { v -> if (v < 50) 'a'.code + v % 3 else v }).toByte() },
             "all byte values" to ByteArray(70_000) { (it * 31 + it / 256).toByte() },
+            // Every byte value, geometrically skewed: Huffman literals with FSE-compressed weights.
+            "skewed binary" to ByteArray(150_000) { var v = 0; while (v < 255 && rnd.nextInt(5) != 0) v++; (v * 37).toByte() },
+            "skewed binary, small" to ByteArray(300) { var v = 0; while (v < 255 && rnd.nextInt(3) != 0) v++; (255 - v).toByte() },
         )
     }
 
@@ -93,6 +96,50 @@ class PureKotlinZstdDifferentialTest {
         val libzstd = Zstd.compress(json, 3)
         println("json corpus ${json.size} B: pure-Kotlin ${frame.size} B, zstd-jni level 3 ${libzstd.size} B")
         assert(frame.size < json.size / 3) { "pure-Kotlin frame is ${frame.size} bytes for ${json.size}" }
+    }
+
+    /** Offset of the first block's literals section in a pure-Kotlin (single-segment) frame. */
+    private fun literalsAt(frame: ByteArray): Int {
+        val fcs = when ((frame[4].toInt() and 0xFF) ushr 6) { 0 -> 1; 1 -> 2; 2 -> 4; else -> 8 }
+        val block = 5 + fcs
+        assertEquals(2, (frame[block].toInt() ushr 1) and 3, "the first block is compressed")
+        return block + 3
+    }
+
+    /** The first block's literals type (0 raw, 1 RLE, 2 Huffman). */
+    private fun firstLiteralsType(frame: ByteArray): Int = frame[literalsAt(frame)].toInt() and 3
+
+    /** The first block's Huffman tree header byte: >= 128 direct weights, < 128 FSE-compressed. */
+    private fun treeHeader(frame: ByteArray): Int {
+        val at = literalsAt(frame)
+        val headerSize = when ((frame[at].toInt() ushr 2) and 3) { 0, 1 -> 3; 2 -> 4; else -> 5 }
+        return frame[at + headerSize].toInt() and 0xFF
+    }
+
+    @Test
+    fun encoderUsesHuffmanLiteralsWithBothWeightEncodings() {
+        // Bytes 0-3, equally likely: every weight is the same, which FSE cannot code, so the
+        // table must use direct 4-bit weights (tree header >= 128).
+        val rnd = Random(3)
+        val four = ByteArray(20_000) { rnd.nextInt(4).toByte() }
+        val fourFrame = ZstdEncoder.compress(four)
+        assertEquals(2, firstLiteralsType(fourFrame))
+        assert(treeHeader(fourFrame) >= 128) { "expected direct weights, tree header ${treeHeader(fourFrame)}" }
+        assertContentEquals(four, ZstdDecoder.decompress(fourFrame, four.size))
+        assertContentEquals(four, ByteArray(four.size).also { Zstd.decompress(it, fourFrame) })
+        // JSON: mostly-zero weights, where FSE-compressed weights are smaller.
+        val json = ZstdEncoder.compress(ZstdTestCorpus.json(20_000))
+        assertEquals(2, firstLiteralsType(json))
+        assert(treeHeader(json) < 128) { "expected FSE-compressed weights, tree header ${treeHeader(json)}" }
+        // Bytes above 128 can only use FSE-compressed weights (tree header < 128).
+        val binary = ByteArray(20_000) { var v = 0; while (v < 255 && rnd.nextInt(4) != 0) v++; (255 - v).toByte() }
+        val frame = ZstdEncoder.compress(binary)
+        assertEquals(2, firstLiteralsType(frame))
+        assert(treeHeader(frame) < 128) { "expected FSE-compressed weights, tree header ${treeHeader(frame)}" }
+        assertContentEquals(binary, ZstdDecoder.decompress(frame, binary.size))
+        val back = ByteArray(binary.size)
+        Zstd.decompress(back, frame)
+        assertContentEquals(binary, back)
     }
 
     @Test
