@@ -10,10 +10,12 @@ import dev.kdb.compression.ZstdTables.highBit
  * zstd-jni and [ZstdDecoder] all do (ZstdEncoderInteropTest, go/kdb/interop) - but trades ratio
  * for size and simplicity:
  *  - one greedy hash-table match finder (4-byte minimum match, matches may reach back across
- *    blocks to the start of the frame);
+ *    blocks to the start of the frame) that tries the most recent offset first, and codes
+ *    offsets as repeat offsets whenever the decoder's history allows;
  *  - literals Huffman-coded per block when that is smaller (ZstdLiteralsEncoder), never reusing
  *    the previous block's table;
- *  - sequences coded with the predefined FSE tables only, and no repeat offsets;
+ *  - sequence codes per block as RLE, predefined or custom FSE tables, whichever is smallest
+ *    (ZstdSequenceTables) - never repeat mode;
  *  - a block that does not shrink is stored raw.
  * Every frame is single-segment, declares its content size, and carries the XXH64 content
  * checksum (as Go's frames do), so a damaged frame fails to decode rather than misdecoding. The
@@ -73,11 +75,22 @@ internal object ZstdEncoder {
         private val literals = ByteArray(maxBlock)
         private val litLens = IntArray(maxBlock / MIN_MATCH + 1)
         private val matchLens = IntArray(litLens.size)
-        private val offsets = IntArray(litLens.size)
+        private val ofValues = IntArray(litLens.size)
         private val sink = ByteSink(maxBlock + 64)
+
+        private val reps = RepeatOffsets()
 
         /** The compressed block body for [start, end), or null when storing it raw is no larger. */
         fun encode(start: Int, end: Int): ByteSink? {
+            // The history persists across the frame's compressed blocks, but a block stored raw
+            // does not touch the decoder's, so roll back what this block's parse did to ours.
+            val saved = reps.snapshot()
+            val body = encodeBody(start, end)
+            if (body == null) reps.restore(saved)
+            return body
+        }
+
+        private fun encodeBody(start: Int, end: Int): ByteSink? {
             var nbSeq = 0
             var litSize = 0
             var pos = start
@@ -86,8 +99,12 @@ internal object ZstdEncoder {
             while (pos <= limit) {
                 val v = readInt(src, pos)
                 val h = hash(v)
-                val cand = table[h]
+                var cand = table[h]
                 table[h] = pos
+                // The most recent offset first: structured data repeats at a fixed stride, and a
+                // repeat offset costs almost nothing to code.
+                val rep = pos - reps.recent
+                if (pos > litStart && rep >= 0 && readInt(src, rep) == v) cand = rep
                 if (cand >= 0 && readInt(src, cand) == v) {
                     var len = MIN_MATCH
                     while (pos + len < end && src[cand + len] == src[pos + len]) len++
@@ -101,7 +118,7 @@ internal object ZstdEncoder {
                     src.copyInto(literals, litSize, litStart, s)
                     litSize += s - litStart
                     litLens[nbSeq] = s - litStart
-                    offsets[nbSeq] = s - c
+                    ofValues[nbSeq] = reps.encode(s - litStart, s - c)
                     matchLens[nbSeq] = len
                     nbSeq++
                     pos = s + len
@@ -127,10 +144,7 @@ internal object ZstdEncoder {
                     sink.le(nbSeq - 0x7F00, 2)
                 }
             }
-            if (nbSeq > 0) {
-                sink.byte(0) // predefined tables for literal lengths, offsets and match lengths
-                writeSequences(nbSeq)
-            }
+            if (nbSeq > 0) writeSequences(nbSeq)
             return if (sink.size < end - start) sink else null
         }
 
@@ -141,19 +155,25 @@ internal object ZstdEncoder {
          * decoder, reading backwards, meets the first sequence first.
          */
         private fun writeSequences(nbSeq: Int) {
-            val bits = BitWriter(sink)
             val llCode = IntArray(nbSeq)
             val mlCode = IntArray(nbSeq)
             val ofCode = IntArray(nbSeq)
             for (i in 0 until nbSeq) {
                 llCode[i] = code(ZstdTables.LL_BASE, litLens[i])
                 mlCode[i] = code(ZstdTables.ML_BASE, matchLens[i])
-                ofCode[i] = highBit(offsets[i] + 3)
+                ofCode[i] = highBit(ofValues[i])
             }
+            val llChoice = ZstdSequenceTables.choose(llCode, nbSeq, ZstdSequenceTables.Kind.LL)
+            val ofChoice = ZstdSequenceTables.choose(ofCode, nbSeq, ZstdSequenceTables.Kind.OF)
+            val mlChoice = ZstdSequenceTables.choose(mlCode, nbSeq, ZstdSequenceTables.Kind.ML)
+            sink.byte((llChoice.mode shl 6) or (ofChoice.mode shl 4) or (mlChoice.mode shl 2))
+            for (c in listOf(llChoice, ofChoice, mlChoice)) sink.bytes(c.description, 0, c.description.size)
+
+            val bits = BitWriter(sink)
             val n = nbSeq - 1
-            val ml = FseEncoder.ML.start(mlCode[n])
-            val of = FseEncoder.OF.start(ofCode[n])
-            val ll = FseEncoder.LL.start(llCode[n])
+            val ml = mlChoice.coder.also { it.start(mlCode[n]) }
+            val of = ofChoice.coder.also { it.start(ofCode[n]) }
+            val ll = llChoice.coder.also { it.start(llCode[n]) }
             extraBits(bits, n, llCode[n], mlCode[n], ofCode[n])
             for (i in n - 1 downTo 0) {
                 of.encode(bits, ofCode[i])
@@ -170,7 +190,7 @@ internal object ZstdEncoder {
         private fun extraBits(bits: BitWriter, i: Int, ll: Int, ml: Int, of: Int) {
             bits.add(litLens[i] - ZstdTables.LL_BASE[ll], ZstdTables.LL_BITS[ll])
             bits.add(matchLens[i] - ZstdTables.ML_BASE[ml], ZstdTables.ML_BITS[ml])
-            bits.add(offsets[i] + 3 - (1 shl of), of)
+            bits.add(ofValues[i] - (1 shl of), of)
         }
     }
 
@@ -189,6 +209,60 @@ internal object ZstdEncoder {
     private fun readInt(b: ByteArray, p: Int): Int =
         (b[p].toInt() and 0xFF) or ((b[p + 1].toInt() and 0xFF) shl 8) or
             ((b[p + 2].toInt() and 0xFF) shl 16) or ((b[p + 3].toInt() and 0xFF) shl 24)
+}
+
+/**
+ * The decoder's repeat-offset history (RFC 8878 §3.1.2.5), kept by the encoder so it can code an
+ * offset the decoder already holds as Offset_Value 1-3 - and must keep in exact step, since a
+ * repeat code means whatever the decoder's history says.
+ */
+internal class RepeatOffsets {
+    private val reps = intArrayOf(1, 4, 8)
+
+    /** The most recently used offset. */
+    val recent: Int get() = reps[0]
+
+    fun snapshot(): IntArray = reps.copyOf()
+
+    fun restore(saved: IntArray) {
+        saved.copyInto(reps)
+    }
+
+    /** The Offset_Value that makes the decoder use [offset] after [litLen] literals; updates the history as it will. */
+    fun encode(litLen: Int, offset: Int): Int {
+        val value =
+            if (litLen > 0) {
+                when (offset) {
+                    reps[0] -> 1
+                    reps[1] -> 2
+                    reps[2] -> 3
+                    else -> offset + 3
+                }
+            } else {
+                when (offset) {
+                    reps[1] -> 1
+                    reps[2] -> 2
+                    reps[0] - 1 -> 3
+                    else -> offset + 3
+                }
+            }
+        // The decoder's update (ZstdDecoder.decodeSequences): a new offset or anything but
+        // "repeat 1" moves to the front; "repeat 2" swaps with the front.
+        val idx = if (value > 3) 3 else value - 1 + (if (litLen == 0) 1 else 0)
+        when (idx) {
+            0 -> {}
+            1 -> {
+                reps[1] = reps[0]
+                reps[0] = offset
+            }
+            else -> {
+                reps[2] = reps[1]
+                reps[1] = reps[0]
+                reps[0] = offset
+            }
+        }
+        return value
+    }
 }
 
 /** FSE encoding table for one predefined distribution (the reference's FSE_buildCTable). */

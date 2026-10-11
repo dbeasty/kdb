@@ -142,6 +142,75 @@ class PureKotlinZstdDifferentialTest {
         assertContentEquals(binary, back)
     }
 
+    /** Block types of a pure-Kotlin frame, in order (0 raw, 2 compressed). */
+    private fun blockTypes(frame: ByteArray): List<Int> {
+        val fcs = when ((frame[4].toInt() and 0xFF) ushr 6) { 0 -> 1; 1 -> 2; 2 -> 4; else -> 8 }
+        var p = 5 + fcs
+        val types = mutableListOf<Int>()
+        while (true) {
+            val h = (frame[p].toInt() and 0xFF) or ((frame[p + 1].toInt() and 0xFF) shl 8) or ((frame[p + 2].toInt() and 0xFF) shl 16)
+            val type = (h ushr 1) and 3
+            types += type
+            p += 3 + if (type == 1) 1 else h ushr 3
+            if (h and 1 == 1) return types
+        }
+    }
+
+    /**
+     * The repeat-offset history persists across a frame's compressed blocks but a raw block does
+     * not touch it, so an encoder that kept the offsets it found in a block it then stored raw
+     * would code the next block's repeats against a history the decoder never saw.
+     */
+    @Test
+    fun rawBlockDoesNotAdvanceRepeatOffsets() {
+        val rnd = Random(11)
+        val block = ZstdTables.BLOCK_SIZE_MAX
+        // Block 1: period 1000, so the history the decoder ends block 1 with is all about 1000.
+        val unit1000 = rnd.nextBytes(1000)
+        val first = ByteArray(block) { unit1000[it % 1000] }
+        // Block 2: noise holding a single 6-byte repeat at offset 37, near the start where the
+        // match finder still visits every position. The encoder finds it (and moves 37 to the
+        // front of its history), but saving 6 bytes does not pay for a sequences section, so the
+        // block is stored raw and the decoder's history never sees 37.
+        val second = rnd.nextBytes(block)
+        second.copyInto(second, 40, 3, 9)
+        // Block 3: period 37. Coded against the right history, offset 37 is a new offset; against
+        // block 2's, it would be "repeat offset 1", which the decoder resolves to 1000.
+        val unit37 = rnd.nextBytes(37)
+        val third = ByteArray(block) { unit37[it % 37] }
+        val input = first + second + third
+        val frame = ZstdEncoder.compress(input)
+        assertEquals(listOf(2, 0, 2), blockTypes(frame), "block types")
+        assertContentEquals(input, ZstdDecoder.decompress(frame, input.size))
+        assertContentEquals(input, ByteArray(input.size).also { Zstd.decompress(it, frame) })
+    }
+
+    /** Copies cycling through a few offsets, often back to back: every repeat-offset code and update. */
+    @Test
+    fun repeatOffsetCodesRoundTrip() {
+        val rnd = Random(77)
+        repeat(200) { case ->
+            val pool = IntArray(2 + rnd.nextInt(4)) { 1 + rnd.nextInt(if (rnd.nextBoolean()) 40 else 3000) }
+            val size = 2000 + rnd.nextInt(60_000)
+            val input = ByteArray(size)
+            var p = 0
+            while (p < size) {
+                val off = pool[rnd.nextInt(pool.size)]
+                if (p >= off && rnd.nextInt(5) != 0) {
+                    val len = minOf(size - p, 4 + rnd.nextInt(30))
+                    repeat(len) { input[p] = input[p - off]; p++ }
+                    // Sometimes a literal or two between copies, sometimes none (litLen 0).
+                    repeat(rnd.nextInt(3)) { if (p < size) input[p++] = rnd.nextInt().toByte() }
+                } else {
+                    input[p++] = rnd.nextInt().toByte()
+                }
+            }
+            val frame = ZstdEncoder.compress(input)
+            assertContentEquals(input, ByteArray(size).also { Zstd.decompress(it, frame) }, "case $case: libzstd")
+            assertContentEquals(input, ZstdDecoder.decompress(frame, size), "case $case: pure-Kotlin")
+        }
+    }
+
     @Test
     fun randomisedRoundTrips() {
         val rnd = Random(1234)

@@ -213,9 +213,9 @@ internal object ZstdLiteralsEncoder {
         val counts = IntArray(maxWeight + 1)
         for (w in weights) counts[w]++
         if (counts.count { it > 0 } < 2) return null
-        val norm = normalize(counts, weights.size, WEIGHT_TABLE_LOG)
+        val norm = FseDescription.normalize(counts, weights.size, WEIGHT_TABLE_LOG)
         val body = ByteSink(160)
-        writeNormalizedCounts(body, norm, WEIGHT_TABLE_LOG)
+        FseDescription.write(body, norm, WEIGHT_TABLE_LOG)
         val enc = FseEncoder(norm, WEIGHT_TABLE_LOG)
         val bits = BitWriter(body)
         var i = weights.size
@@ -240,78 +240,6 @@ internal object ZstdLiteralsEncoder {
         return ByteSink(body.size + 1).also {
             it.byte(body.size)
             it.bytes(body.buf, 0, body.size)
-        }
-    }
-
-    /** Scales [counts] (summing to [total]) to a distribution summing to 2^[log], every used symbol >= 1. */
-    private fun normalize(counts: IntArray, total: Int, log: Int): ShortArray {
-        val size = 1 shl log
-        val norm = IntArray(counts.size) { s -> if (counts[s] == 0) 0 else maxOf(1, counts[s] * size / total) }
-        var sum = norm.sum()
-        while (sum != size) {
-            var best = -1
-            for (s in norm.indices) {
-                if (norm[s] == 0 || (sum > size && norm[s] == 1)) continue
-                if (best < 0 || norm[s] > norm[best]) best = s
-            }
-            if (sum > size) norm[best]-- else norm[best]++
-            sum += if (sum > size) -1 else 1
-        }
-        return ShortArray(norm.size) { norm[it].toShort() }
-    }
-
-    /** The FSE table description the decoder's NormalizedCounts.read parses (RFC 8878 §4.1.1). */
-    private fun writeNormalizedCounts(sink: ByteSink, norm: ShortArray, log: Int) {
-        val bits = ForwardBits(sink)
-        bits.add(log - 5, 4)
-        var remaining = (1 shl log) + 1
-        var threshold = 1 shl log
-        var nbBits = log + 1
-        var symbol = 0
-        var previousZero = false
-        while (remaining > 1) {
-            if (previousZero) {
-                val start = symbol
-                while (norm[symbol].toInt() == 0) symbol++
-                var run = symbol - start
-                while (run >= 3) {
-                    bits.add(3, 2)
-                    run -= 3
-                }
-                bits.add(run, 2)
-            }
-            var count = norm[symbol++].toInt()
-            val max = (2 * threshold - 1) - remaining
-            remaining -= if (count < 0) -count else count
-            count++
-            if (count >= threshold) count += max
-            bits.add(count, if (count < max) nbBits - 1 else nbBits)
-            previousZero = count == 1
-            while (remaining < threshold) {
-                nbBits--
-                threshold = threshold shr 1
-            }
-        }
-        bits.flush()
-    }
-
-    /** Little-endian bit writer with no end marker - for the forward-read table description. */
-    private class ForwardBits(private val sink: ByteSink) {
-        private var acc = 0
-        private var count = 0
-
-        fun add(value: Int, n: Int) {
-            acc = acc or (value shl count)
-            count += n
-            while (count >= 8) {
-                sink.byte(acc and 0xFF)
-                acc = acc ushr 8
-                count -= 8
-            }
-        }
-
-        fun flush() {
-            if (count > 0) sink.byte(acc and 0xFF)
         }
     }
 }
