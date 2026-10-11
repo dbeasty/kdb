@@ -299,7 +299,7 @@ supported: the CLI has no current branch; pass `--branch` per command") rather t
 
 ### U11. Kotlin WAL ignores the configured segment size — S
 
-**Status: open.**
+**Status: done** (branch `fix/kotlin-wal-segment-size`).
 
 `kdb-storage-engine/.../ServerStorageEngine.kt:279` builds `DefaultWriteAheadLogFactory()` with no
 arguments, so the rotation cap is always the 64 MiB default. Thread `walMaxSegmentBytes` from the
@@ -580,3 +580,17 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   U3 local: 97 merged local branches deleted and finished worktrees removed. The origin half (44
   merged or superseded branches, and closing #26) was refused to automation and is left to the
   owner; every tip is saved in `kdb-deleted-branches-2026-10-11.bundle` beside the checkout.
+- **2026-10-11 — U11.** `StorageEngineConfig.walMaxSegmentBytes` (kdb-storage) is new: the
+  Kotlin twin of Go's `storage.StorageEngineConfig.WalMaxSegmentBytes`, same name and meaning,
+  default 64 MiB. It is validated (zero or negative throws) where Go treats zero as "use the
+  default", since the Kotlin field has a real default. `DefaultWriteAheadLogFactory` now resolves
+  the cap as Go's `wal.DefaultFactory` does: an explicit factory override
+  (`walMaxSegmentBytesOverride`), otherwise the config's. The engine's no-argument factory
+  therefore picks up the config, which it previously never consulted. Not added: a knob on
+  `openFileRuntime` (kdb-jdbc) or any runtime setting descriptor. Go has neither for the WAL cap
+  (only `DeltaMaxSegmentBytes` is exposed through `embed`), and no Kotlin caller exposes any other
+  `StorageEngineConfig` field either. Tests: `WalSegmentSizeTest` (kdb-storage-engine) opens a
+  SERVER engine with a 512-byte cap, writes ~5 KiB, and asserts several WAL segments, that a
+  reopened engine recovers every blob, and that the replay is in write order. It fails on `main`
+  (one segment) and was confirmed failing against the reverted resolution. It also covers the
+  64 MiB default and rejecting 0/-1. `WalTest` adds the factory's override-vs-config order.
