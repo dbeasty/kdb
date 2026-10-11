@@ -24,8 +24,10 @@ its own, and leaves `main` green. Execute them in order unless a unit says it is
    - Check `uptime` first; don't run the Go suite alongside another heavy job.
 5. Anything that changes a wire or on-disk format lands in **Go and Kotlin in the same PR**
    (the "must land together" table in `docs/kdb-finish-up-plan.md`).
-6. Update the **Progress log** at the bottom of this file in the same PR: what landed, the commit,
-   and anything found along the way.
+6. Record the unit's progress in the same PR as **a new file** `docs/progress/YYYY-MM-DD-<slug>.md`
+   (see `docs/progress/README.md`): what landed, the commit, and anything found along the way. Never
+   append to the log at the bottom of this file. Every open PR appending to the same place made each
+   merge conflict with all the others; a new file per entry cannot.
 7. When CI goes red, read every failing job. Don't write a failure off as "flaky" until the same
    SHA has passed on a re-run.
 
@@ -359,7 +361,8 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 
 ## Progress log
 
-_(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
+_Closed for new entries on 2026-10-11. Entries are now one file each in
+[`docs/progress/`](progress/README.md); the entries below are kept as they were written._
 
 - **2026-10-11, U8** (branch `fix/json-getters-return-errors`): `navigateGet`, `collectAll` and
   `normalizeIndex` in `go/kdb/json/api.go` now return `*JsonPathError` instead of panicking, so
@@ -958,3 +961,136 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
     - A power loss that persists a later page of a batch before an earlier one would leave intact
       frames after a hole. Neither was acknowledged, but this rule refuses it as damage, which is
       the safe direction.
+- **2026-10-11 — found by e2e testing: resolution chains on a mesh do not always converge on the
+  value the rule defines** (branch `test/conflict-rule-convergence`, test-only). #114 made merges
+  of same-content heads converge. This asks whether merges of *different* content, which are
+  still pairwise, converge on what each chain rule promises. New file
+  `kdb-integration/e2e/test_cluster_resolution.py`. Each scenario runs on 3- and 5-node meshes.
+  *Ordered* tests (default run) make the concurrent writes on isolated nodes, fix the merge order
+  by relaunching a node with one pull-only peer and forcing a sync, then restart the full mesh and
+  require `Cluster.wait_converged`. *Load* tests (`slow`) write from every node at once, some with
+  kill -9. No fixture changes. Every mesh **converges** (same head, same documents, no open
+  conflicts) except where the chain queues by design. The failures are about *which* value it
+  converges on:
+  - **Pass:** `source-priority` (a total order on origins, so associative); `validity` once
+    every merging node has the schema; a set-union procedure; `field-merge` over disjoint
+    fields when there is one merge base; `queue`; no chain under `last-write` and `strict`.
+    With `queue`/`strict`, *every* node queues one entry per peer it met. Settling them takes
+    N-1 control-plane resolutions, and the other nodes' copies close as the resolution replicates.
+  - **(F1) Wrong merge base.** `dag.CommonAncestor` (`dag/ancestry.go:39`) returns the first
+    common ancestor in breadth-first order from its second argument. That can be a proper
+    ancestor of the real nearest one, if it is fewer hops away. In a criss-cross it is one of
+    several nearest ones. `resolveDivergedLocked` takes the chain's base from it
+    (`peersync/merge_resolution.go:380`). Field-merge then sees a field only one side changed as
+    changed by both, falls to whole-document last-write, and drops the other side's field writes.
+    Acknowledged writes are lost, deterministically:
+    `test_field_merge_against_the_true_merge_base[3,5]`. Under load:
+    `test_load_field_merge_keeps_each_nodes_own_field`, with no kills. Captured: merge
+    `6257888a1f` had two nearest ancestors, f0=128 and f0=136. The base was the 128 one, so f0
+    went 144 -> 136 and f1 132 -> 124.
+  - **(F2) Order-dependent field-merge then last-write.** A value field-merge builds has no
+    parent with that value. So `origin()` (`peersync/merge_resolution.go:233`) attributes it to
+    the merge commit, stamped with the later head's time (`peersync/conflict_detection.go:335`).
+    A later last-write compares that stamp, not the colliding field's real write time.
+    `merge(merge(A,C),B)` gave x=n0 and `merge(merge(B,C),A)` gave x=n1, though n1 wrote x last:
+    `test_field_merge_collision_has_the_last_write_winner_everywhere`. Whole-document last-write
+    over a composite value is not associative.
+  - **(F3) Delta-based procedures cannot be right.** Merges are state-based. A document both
+    sides hold with the same value is never a conflict (`merge_resolution.go:346`,
+    `join.go:43`), so two +1s make 1
+    (`test_procedure_counter_sum_when_both_sides_reach_the_same_value`). With F1's base,
+    `local+remote-base` double-counts (`test_procedure_counter_sum_is_the_total_of_increments`:
+    each increment owns a decimal digit, and the result counted one twice). Under load on 5 nodes,
+    603 increments converged on 6.3e30: merge results fed further merges. The user guide's "add
+    the two counters together" example invites exactly this.
+  - **(F4) Validity vs. schema replication.** This is the documented limitation, now as a test. A
+    node that merges before the schema reaches it settles by last-write, and the others
+    fast-forward to that merge, so an invalid value survives
+    (`test_validity_before_the_schema_arrives`).
+
+  **Recommended fixes, none made here** (each changes merge results, so mixed-version meshes
+  would build different merges; gate them on a chain or protocol version):
+  - F1: compute the merge-base set from generation numbers. Use a single base as is. For several,
+    use a virtual base (merge the bases recursively, as git does), the same on every node.
+  - F2: make field-merge's fallback per field, with each field's last-writer origin (an LWW map),
+    rather than whole-document last-write.
+  - F3: document that procedures must be state-based joins (commutative, associative,
+    idempotent: union, max, per-node G-counter fields), and fix the guide's counter example.
+  - F4: include the schema hash in the chain-compatibility check when a chain has `validity`.
+
+  **Soak** (load avg 4-12, shared machine): the default run 4 times, 2 of them with
+  `GOMAXPROCS=2` in the services' environment, gave 14 passed and 9 xfailed every time. The slow
+  run gave 8 passed and 6 xfailed, both normally and with `GOMAXPROCS=2`. Deterministic failures
+  are `xfail(strict=True)`; load ones are `strict=False`.
+
+  **Also seen:** `GET /v1/ns/{ns}/docs/{id}?at=<commit>` answers 404 "does not exist" for a
+  commit whose tree the node does not hold (made elsewhere and adopted by its operations). The
+  document is readable at that commit on the node that made it.
+
+- **2026-10-11 — N5 follow-up: a backup refuses a damaged segment (branch
+  `fix/backup-refuse-damaged-segments`).** Closes the two items N5 found and did not fix. The user
+  decided: a backup refuses, rather than uploading the whole damaged file.
+  - **The hole.** `backup.Create` uploaded each segment's `integrity.VerifiedSegmentPrefix`: the
+    bytes before the first bad frame. For a torn tail that is right. For a segment damaged in
+    place it was N5's silent loss again: the manifest looked complete and lacked every acknowledged
+    commit after the damage. `backup-verify` passed it, since it only re-hashes what the manifest
+    names. An incremental was worse. It uploaded the damaged segment's shorter prefix under the
+    segment's shared key, the key the *base* backup's manifest names, so it also corrupted the base.
+  - **The fix.** It uses #129's classification, so backup, replay and verify apply one rule.
+    - `VerifiedSegmentPrefix` (`integrity/scan.go`) returns `*delta.DamagedSegmentError` for
+      `storage.TailDamaged`. It now also returns the prefix's commits, so backup no longer decodes
+      each segment twice. A torn tail still yields its intact prefix, and zero padding is clean.
+    - `backup.Create` classifies every segment before it uploads anything. A damaged one refuses
+      the backup with `*backup.DamagedSegmentError` (`backup/damaged.go`): namespace, segment, byte
+      offset, next intact frame, whether it was incremental, and the next steps (`kdb-inspect
+      verify`, then `repair-segments` or `restore`). The delta error stays reachable through
+      `errors.As`. A refused backup uploads no object and writes no manifest. The upload pass
+      re-reads each segment up to the classified length, so the whole log is never held in memory.
+    - Every trigger surfaces it. `kdb-inspect backup` prints it and exits 1, for one namespace,
+      for `--base-backup-id` and for a whole-database backup (no database manifest is written).
+      `POST /v1/ns/{ns}/backups` returns **409 `segment_damaged`** (it was 503 `backup_failed`,
+      which invites a retry that cannot help) with the message and `segment` / `offset` /
+      `nextIntactFrame` / `incremental`, and logs a WARN line. Go has no scheduled or
+      maintenance-driven backup (`embed/maintenance_loop.go` never backs up), so these two are
+      every trigger.
+    - Kotlin has no backup creation path (`kdb-recovery` restores, `kdb-integrity` verifies and
+      repairs), so there is nothing to change there.
+  - **Not covered: a damaged last frame of an older segment.** With nothing intact after it, it
+    is byte-for-byte a torn tail, so backup records the prefix, as replay does. Replay names it
+    (`BuiltOn`) only once later commits turn out to need it. Backup does no parent-closure check.
+    A shallow or checkpoint-trimmed namespace can legitimately lack parents, so such a check would
+    need the replay context. Opening a restore of that backup still fails loudly with "parent
+    commits never found", not silently.
+  - **`backup-verify` on a manifest the old code made from a damaged segment.** Unchanged, and it
+    reports such a backup **clean**: it re-hashes the truncated object, which matches. Probe (8
+    commits, a body flip at frame 2 of 4, uncompressed): damage in the older segment gave 5 commits,
+    verify clean, and a restore that will not open (missing parents). Damage in the newest segment
+    gave 5 commits, verify clean, and a restore that opens **silently at commit 5 of 8**. An
+    operator with backups taken from a possibly damaged directory should run `kdb-inspect verify`
+    on the source. A backup alone cannot show the newest-segment case.
+  - **Kotlin `scanSegmentRef` (separate commit).** `DefaultDeltaSegmentReader.listSegments`
+    skipped a segment it could not read (`catch (_: Exception) { return null }`), as Go did before
+    #121. It now throws `UnreadableSegmentException` (namespace, sequence, segment name, cause).
+    The one tolerated case is Go's: a segment deleted between the listing and its read is skipped.
+    Decode faults are unchanged. They list up to the fault and the replayer classifies them, as in
+    Go after N5.
+  - **Before/after**, main → this branch:
+    - Damage in the middle of the newest or an older segment (magic, body or codec byte): the
+      backup succeeded with 5 of 8 commits → refused with the typed error, store empty.
+    - Incremental over a segment damaged since its base: succeeded and broke the base ("segment 0:
+      size 191, manifest says 764") → refused, base still verifies.
+    - `POST /backups` on a live namespace with a damaged active segment: 200, `commitCount: 1` of
+      4 → 409 `segment_damaged`.
+    - Kotlin: listing with segment 1 unreadable returned segments 0 and 2 → `UnreadableSegmentException`.
+  - **Tests**, each confirmed failing with its fix reverted:
+    - `backup/damaged_segment_test.go`. File-backed, real commits, uncompressed. Covers damage in
+      the newest and an older segment (3 kinds), a database backup, an incremental, a torn tail in
+      3 shapes (restored, every acknowledged commit present) in the newest segment and in the kill
+      -9 sequence, and a preallocated segment (restored).
+    - `control/backup_damaged_test.go` (HTTP status, body, log line, nothing listed).
+    - `cmd/kdb-inspect/backup_test.go` (namespace, incremental, database).
+    - Kotlin `UnreadableSegmentTest` (all targets).
+    The torn-tail and preallocated tests pass on main too. They guard what must not change.
+  - **Found, not fixed:** a sealed segment whose bytes change for any other reason (a repair that
+    quarantines frames, say) would still be re-uploaded under the shared key a base manifest names.
+    Only damage is refused now. Uploading changed content under a fresh key would close that.
