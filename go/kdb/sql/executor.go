@@ -345,6 +345,11 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 			}
 			continue
 		}
+		// A document id is a key, not a column to scan for: serve it directly. Needs no index
+		// provider, and the residual WHERE still re-checks every candidate.
+		if ids, ok := keyLookup(conj, env); ok {
+			return ids, "keylookup", nil
+		}
 		if e.IndexProvider == nil {
 			continue
 		}
@@ -488,6 +493,71 @@ func (e *Executor) indexLookup(conj Expr, env *evalEnv, ctx QueryContext) ([]cod
 		return union, "index:in(" + field + ")", true, nil
 	}
 	return nil, "", false, nil
+}
+
+// keyLookup serves `kdb_id = <const>` and `kdb_id IN (<const>, ...)` by key. It returns the
+// candidate ids, which may name documents that do not exist (materialize skips those) - a
+// string that is not a UUID names nothing, so it contributes no candidate. Only the reserved
+// kdb_id column qualifies: every other column is a path into the document and needs a scan or
+// an index.
+func keyLookup(conj Expr, env *evalEnv) ([]codec.UUID, bool) {
+	isKey := func(x Expr) bool {
+		col, ok := x.(ExprColumnRef)
+		return ok && env.columnName(col.Name) == "kdb_id"
+	}
+	constString := func(x Expr) (string, bool) {
+		switch x.(type) {
+		case ExprLiteral, ExprParameter:
+			if c, ok := env.cell(x, newEvalDoc(emptyDoc)).(CellString); ok {
+				return c.Value, true
+			}
+		}
+		return "", false
+	}
+	parse := func(raw string) []codec.UUID {
+		if id, err := codec.ParseUUID(raw); err == nil {
+			return []codec.UUID{id}
+		}
+		return nil
+	}
+	switch c := conj.(type) {
+	case ExprBinary:
+		if c.Op != BinaryOpEQ {
+			return nil, false
+		}
+		other := c.Right
+		if !isKey(c.Left) {
+			if !isKey(c.Right) {
+				return nil, false
+			}
+			other = c.Left
+		}
+		raw, ok := constString(other)
+		if !ok {
+			return nil, false
+		}
+		return parse(raw), true
+	case ExprIn:
+		if !isKey(c.Expr) {
+			return nil, false
+		}
+		var out []codec.UUID
+		seen := map[codec.UUID]bool{}
+		for _, v := range c.Values {
+			raw, ok := constString(v)
+			if !ok {
+				return nil, false
+			}
+			for _, id := range parse(raw) {
+				if !seen[id] {
+					seen[id] = true
+					out = append(out, id)
+				}
+			}
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // flipOp mirrors a comparison when the column is on the right-hand side.
