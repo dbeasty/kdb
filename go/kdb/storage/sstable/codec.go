@@ -2,6 +2,7 @@ package sstable
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -414,7 +415,27 @@ func (r *DefaultReader) ReadBlockAt(bh BlockHandle) ([]byte, error) {
 	return decodeBlock(block)
 }
 
+// segmentSize asks the IO layer for the segment's length, and reads to the end only when it
+// cannot say.
+//
+// Reading was the only way until issue #43's crash-recovery stall: every probe of every table
+// read the whole file in 8 KB chunks just to find where its footer was, so a 1.3 MB table cost
+// ~160 reads per lookup and a replay of 14,736 commits took 28 seconds.
 func (r *DefaultReader) segmentSize() (int64, error) {
+	if sz, ok := r.io.(storage.SegmentSizer); ok {
+		n, err := sz.SegmentSize(r.handle.SegmentName)
+		if err == nil {
+			return n, nil
+		}
+		if !errors.Is(err, storage.ErrSegmentSizeUnknown) {
+			return 0, err
+		}
+	}
+	return r.scanSegmentSize()
+}
+
+// scanSegmentSize learns the segment's length by reading it, for a shim that cannot report one.
+func (r *DefaultReader) scanSegmentSize() (int64, error) {
 	const chunk = 8192
 	var total int64
 	for {

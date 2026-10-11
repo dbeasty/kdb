@@ -475,11 +475,15 @@ func decodeDocumentLocation(b []byte) (segmentSeq, frameOffset int64, ok bool) {
 // (the content hash is new), so the lookup would be a guaranteed miss
 // walking every table's index on the hot path, which is why this is not
 // asked there.
+//
+// Asks Contains rather than Get: existence is all this needs, and Get read and decompressed
+// every probed tree object out of its SSTable - after the index cache removed the per-probe
+// footer parse, that block read was all of the probe's cost.
 func (e *ServerEngine) skipExistingObject(h codec.Hash) bool {
 	if !e.replaying.Load() {
 		return false
 	}
-	return e.memTable.Get(h) != nil
+	return e.memTable.Contains(h)
 }
 
 // SetReplaying marks the window in which this engine is being rebuilt from

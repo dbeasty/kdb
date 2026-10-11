@@ -759,3 +759,36 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   **(N5)** the third silent recovery path from U6c: damage in the middle of a segment that is no
   longer the newest truncates that segment at the damage, with no error.
 
+- **2026-10-11 — found while working on #43 (U6): crash-recovery open scaled with commits ×
+  SSTable size** (branch `perf/sstable-index-cache`). The #43 kill -9 reproducer left a namespace
+  with 14,736 commits and no checkpoint; it took 28 s to open (~1.9 ms per replayed commit, 24
+  documents). Root cause: `LsmBlobStore.Lookup` (`go/kdb/storage/sstable/types.go`) built a new
+  `DefaultReader` per table per probe, and `DefaultReader.Index` (`codec.go`) learned the file size
+  in `segmentSize` by reading the whole segment in 8 KB chunks (each chunk an open+stat+read+close
+  in `OSByteStore.Read`), then re-read and re-parsed the footer. Replay probes once per tree object
+  per commit (`engine.skipExistingObject`), so each replayed commit cost time proportional to the
+  table. The ordinary write path does not probe; history reads through the object store did pay it.
+  Fix, no format change: an optional `storage.SegmentSizer` (implemented by `InMemoryPlatformIO`,
+  and by `FileBackedPlatformIO` forwarding to `OSByteStore.Size`, which stats or uses the open
+  handle's logical size, and through `PrimaryWithReplicas` to the primary; S3 is a replica sink and
+  never serves reads). Shims without it, or returning `storage.ErrSegmentSizeUnknown`, fall back
+  to the old scan. `LsmBlobStore` caches each table's parsed index (LRU, budget
+  `storage.ResolvedSSTableIndexCacheBytes` = 1/8 of the hot tier, re-cut by `SetMemoryBudgetBytes`;
+  ~128 B per key; the most recent index is kept even over budget so one huge table never goes back
+  to per-probe parsing). It is guarded by the same mutex as the table list, so `Compact` drops the
+  inputs' indexes in the critical section that swaps them, and a load racing the swap is only
+  cached if its table is still registered. The newest-first order is cached instead of re-sorted
+  per probe. Replay's existence probe now asks `Contains` (index only) instead of `Get`, which
+  read and decompressed the probed tree object. A bloom filter was not added: replay's probes are
+  hits, and a warm miss is already ~20 ns. Numbers (14,000 commits / 24 docs, no checkpoint, one
+  ~3.3 MB table, load 7-9 on 16 cores): open 148.9 s → 0.62 s with the cache → 0.36 s with
+  `Contains`. Lookup against a ~1 MB table: file-backed hit 2.55 ms → 15 µs, miss 2.50 ms → 19 ns;
+  in-memory hit 554 µs → 1.6 µs. **Also found and fixed:** `Compact` replaced the table list
+  with its output outright, so a table flushed while a compaction ran vanished from the store until
+  the next open (`TestCompactKeepsTablesAddedDuringTheMerge`, fails against the old swap).
+  **Still open:** a lookup that took the table list just before a compaction's swap can miss a key,
+  because the inputs are deleted while it reads them; predates this change. Tests:
+  `go/kdb/storage/sstable/index_cache_test.go` (a first probe makes at most 4 reads where main made
+  155, warm hits one read, warm misses and `Contains` none; compaction invalidation, budget,
+  concurrency, the no-sizer fallback, file-backed size), and the opt-in measurement
+  `TestReplayOpenTimeWithoutCheckpoint` (`KDB_REPLAY_COMMITS=14000`) in `go/kdb/embed`.

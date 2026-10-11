@@ -116,11 +116,22 @@ type LsmBlobStore struct {
 	// straight data race.
 	mu     sync.Mutex
 	tables []Handle
+	// ordered is tables newest-first, rebuilt only when tables changes. Lookup used to sort a
+	// fresh copy on every probe. Never mutated in place once published, so a caller may range
+	// over the slice it was handed after the lock is released.
+	ordered []Handle
+	// indexes caches each table's parsed footer index; also guarded by mu (see tableIndexCache).
+	indexes tableIndexCache
 }
 
 // NewLsmBlobStore returns an LSM blob store.
 func NewLsmBlobStore(io storage.PlatformIOShim, namespaceID string, cache *BlockCache) *LsmBlobStore {
-	return &LsmBlobStore{io: io, namespaceID: namespaceID, cache: cache}
+	return &LsmBlobStore{
+		io:          io,
+		namespaceID: namespaceID,
+		cache:       cache,
+		indexes:     newTableIndexCache(DefaultIndexCacheBytes),
+	}
 }
 
 // Get searches tables newest-first, stopping at the first table that has an opinion about key -
@@ -134,21 +145,55 @@ func (s *LsmBlobStore) Get(key codec.Hash) []byte {
 
 // Lookup is Get with the distinction Get cannot express: whether the key is absent from every
 // table, or present as a tombstone.
+//
+// Each table's index comes from the store's index cache, so a probe costs a map lookup per
+// table plus one block read on a hit. It used to build a fresh reader per table per probe, and
+// each fresh reader read the whole file to learn its size and then re-read and re-parsed the
+// footer - time proportional to the table, on every probe (issue #43's slow recovery).
 func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool) {
 	for _, h := range s.searchOrder() {
-		reader := NewDefaultReader(s.io, h)
-		v, del, ok, err := reader.Lookup(key)
-		if err != nil || !ok {
+		index, err := s.indexFor(h)
+		if err != nil {
 			// A read error is treated the way it always has been - as "this table cannot answer" -
 			// so one damaged segment does not make the whole store unreadable.
 			continue
 		}
-		if del {
+		bh, ok := index[key]
+		if !ok {
+			continue
+		}
+		if bh.Deleted {
 			return nil, true, true
+		}
+		v, err := NewDefaultReader(s.io, h).ReadBlockAt(bh)
+		if err != nil {
+			continue
 		}
 		return v, false, true
 	}
 	return nil, false, false
+}
+
+// Contains reports whether the newest table with an opinion about key holds a value for it,
+// without reading the value: Lookup's answer to "found and not deleted", from the cached
+// indexes alone.
+//
+// For replay's existence probe (engine.skipExistingObject), which only needs to know a
+// content-addressed object is already stored and used to read and decompress every tree object
+// it probed to find out. Unlike Lookup it does not check the block is readable, so a damaged
+// block counts as present; nothing relies on replay rewriting one, since every object read is
+// verified against its content hash and treats a bad block as a miss.
+func (s *LsmBlobStore) Contains(key codec.Hash) bool {
+	for _, h := range s.searchOrder() {
+		index, err := s.indexFor(h)
+		if err != nil {
+			continue
+		}
+		if bh, ok := index[key]; ok {
+			return !bh.Deleted
+		}
+	}
+	return false
 }
 
 // searchOrder returns the tables newest-first.
@@ -159,10 +204,25 @@ func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool
 // Before compaction existed every table was level 0 and this was plain
 // insertion order, which is what it still reduces to for a store that has
 // never compacted.
+//
+// The returned slice is shared and must not be modified.
 func (s *LsmBlobStore) searchOrder() []Handle {
 	s.mu.Lock()
-	tables := append([]Handle(nil), s.tables...)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.ordered == nil && len(s.tables) > 0 {
+		s.ordered = newestFirst(s.tables)
+	}
+	return s.ordered
+}
+
+// setTablesLocked replaces the table list and invalidates the cached search order. Callers hold
+// s.mu.
+func (s *LsmBlobStore) setTablesLocked(tables []Handle) {
+	s.tables = tables
+	s.ordered = nil
+}
+
+func newestFirst(tables []Handle) []Handle {
 	order := make([]int, len(tables))
 	for i := range order {
 		order[i] = i
@@ -241,7 +301,8 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 		return CompactionResult{}, nil
 	}
 	// Oldest first, so a later table's opinion wins in the merge.
-	ordered := s.searchOrder()
+	// A copy: searchOrder's slice is shared with concurrent lookups and is reversed here.
+	ordered := append([]Handle(nil), s.searchOrder()...)
 	for i, j := 0, len(ordered)-1; i < j; i, j = i+1, j-1 {
 		ordered[i], ordered[j] = ordered[j], ordered[i]
 	}
@@ -262,7 +323,7 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	if keep != nil {
 		seen := make(map[codec.Hash]struct{})
 		for _, h := range ordered {
-			index, err := NewDefaultReader(s.io, h).Index()
+			index, err := s.indexFor(h)
 			if err != nil {
 				continue
 			}
@@ -286,10 +347,29 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	}
 
 	s.mu.Lock()
+	// Keep any table registered while the merge ran (a concurrent memtable flush): only the
+	// inputs are replaced. Assigning []Handle{merged} outright dropped such a table from the
+	// store until the next open rediscovered it.
+	merging := make(map[string]struct{}, len(ordered))
+	for _, in := range ordered {
+		merging[in.SegmentName] = struct{}{}
+	}
+	var next []Handle
 	if merged.SegmentName != "" {
-		s.tables = []Handle{merged}
-	} else {
-		s.tables = nil
+		next = append(next, merged)
+	}
+	for _, t := range s.tables {
+		if _, ok := merging[t.SegmentName]; !ok {
+			next = append(next, t)
+		}
+	}
+	s.setTablesLocked(next)
+	// Dropped in the same critical section as the swap, so indexFor cannot re-insert one of
+	// these after it is gone (it only caches a table that is still registered).
+	for _, in := range ordered {
+		if in.SegmentName != merged.SegmentName {
+			s.indexes.remove(in.SegmentName)
+		}
 	}
 	s.mu.Unlock()
 
@@ -315,7 +395,7 @@ func (s *LsmBlobStore) AddTable(handle Handle) {
 	defer s.mu.Unlock()
 	// Copy rather than append in place so a Get holding the old slice header keeps reading a
 	// stable backing array.
-	s.tables = append(append([]Handle(nil), s.tables...), handle)
+	s.setTablesLocked(append(append([]Handle(nil), s.tables...), handle))
 }
 
 // DiscoverTables registers every SSTable already on disk for this

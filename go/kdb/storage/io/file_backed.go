@@ -1,6 +1,7 @@
 package io
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -140,6 +141,34 @@ func (f *FileBackedPlatformIO) ReadFromSegment(segmentName string, offset int64,
 	}
 	return b, nil
 }
+
+// SegmentSize implements storage.SegmentSizer by asking the store beneath, under the same
+// per-segment lock ReadFromSegment takes so it cannot observe an append half-applied.
+func (f *FileBackedPlatformIO) SegmentSize(segmentName string) (int64, error) {
+	if err := ValidateSegmentName(segmentName); err != nil {
+		return 0, err
+	}
+	sz, ok := f.store.(segmentStoreSizer)
+	if !ok {
+		return 0, storage.ErrSegmentSizeUnknown
+	}
+	mu := f.mutexFor(segmentName)
+	mu.Lock()
+	defer mu.Unlock()
+	n, err := sz.Size(segmentName)
+	if err != nil {
+		if errors.Is(err, storage.ErrSegmentSizeUnknown) {
+			return 0, err
+		}
+		if _, ok := err.(*PlatformIOError); ok {
+			return 0, err
+		}
+		return 0, &PlatformIOError{Message: "size failed: " + err.Error(), SegmentName: segmentName, Cause: err}
+	}
+	return n, nil
+}
+
+var _ storage.SegmentSizer = (*FileBackedPlatformIO)(nil)
 
 // FlushSegment deliberately does NOT take mutexFor(segmentName): that
 // mutex also guards AppendToSegment, and group commit relies on new
