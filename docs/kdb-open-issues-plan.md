@@ -435,3 +435,41 @@ notes close v0.6.1's known issue.
   `main`'s sources was also 6/6 green, with no `Exception in thread` in captured stderr — the
   integration-level flake does not reproduce locally, so the unit tests above are the before/after
   evidence. `:kdb-transport-tcp:jvmTest`, `:kdb-transport-ws:jvmTest`, `:kdb-jdbc:test` green.
+
+### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (branch `feat/zstd-js-native`)
+
+- **Choice.** A pure-Kotlin codec in `kdb-compression`'s commonMain, used by both JS and Native;
+  the JVM keeps zstd-jni. Rejected: `fzstd` (decoder only, and JS only), `@bokuweb/zstd-wasm` /
+  `zstd-codec` (async wasm initialisation behind the synchronous `ZstdCompression` API, a
+  different loader for node and the browser, 0.9MB and 2.1MB unpacked; all three are MIT), and cinterop to libzstd (a static
+  library per target - linuxX64 on the ubuntu runner, macosArm64 only on macOS - for one of the two
+  targets). One decoder (`ZstdDecoder`, RFC 8878: every block, literals and sequence-table mode,
+  XXH64 checksum, concatenated and skippable frames; no dictionaries) serves both targets and runs
+  under the JVM's differential tests against libzstd.
+- **Both directions.** `ZstdEncoder` writes real frames (greedy hash matches, raw literals,
+  predefined FSE tables, single-segment, content size and checksum always present). It compresses
+  less than libzstd - 108,624 bytes vs zstd-jni level 3's 65,497 on a 400KB JSON corpus - but Go
+  and the JVM read it. So `canCompress` and `canDecompress` (replacing `isAvailable`) are both true
+  everywhere, and JS/Native SSTable blocks, delta pages and ice bundles are zstd again. The split
+  stays so a decode-only target remains expressible; every writer checks `canCompress`.
+- **Errors.** Malformed input throws `ZstdFormatException` (an `IllegalArgumentException`) on
+  every target; the JVM now wraps zstd-jni's `ZstdException` the same way. `ZstdUnavailableException`
+  is gone - nothing throws it.
+- **Tests.** Golden fixtures are compiled into commonTest (`gradle/physical-golden-fixtures.gradle.kts`),
+  so JS (node and browser) and Native read Go's and the JVM's bytes: a zstd corpus from klauspost
+  (levels 1/3/7/19), zstd-jni (1/3/19 and a streamed frame without content size) and the
+  pure-Kotlin encoder; both `sstable_segment.hex` fixtures; and a new `delta_segment_zstd.hex` from
+  each side. JS/Native assert their encoder output equals the committed `_purekotlin` fixtures,
+  which Go decodes (`TestKotlinZstdCorpusCrossDecodes`). Corruption: truncated, flipped and zeroed
+  frames fail typed, never with another exception and never with wrong bytes from a checksummed
+  frame. Restoring the pre-R1 stubs fails 4 kdb-compression, 2 SSTable and 2 delta tests on both
+  jsNode and macosArm64.
+- **Found along the way.**
+  - A zero-length body is a valid "frame" (Go writes nothing for an empty payload), so a body
+    truncated to zero bytes decodes to empty output. Every KDB format stores the uncompressed
+    length beside the body and checks it, which is where that truncation is caught.
+  - A pre-U5 Native data directory (length-prefixed blocks tagged ZSTD) now fails with
+    `ZstdFormatException` (bad frame magic) instead of `ZstdUnavailableException` - still refused,
+    never misread. No such directory was ever released.
+  - Not done: Huffman-coded literals in the encoder (the bulk of the ratio gap), and no throughput
+    numbers - the machine's load average was 50-140 throughout, too high to measure honestly.
