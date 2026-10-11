@@ -50,9 +50,18 @@ example sorts.
   - New helper `converged_full`: the docs listing returns only a *preview*, which a map keyed by
     node ids outgrows. `converged_docs` would fail on it with a JSON decode error.
 
-**Evidence:** load runs converged exactly, e.g. 916/916 and 914/914 increments on 3 nodes
-without kills. With a kill: 831 converged against 830 acknowledged, which is the one cut-off
-write. The summing procedure stays xfailed alongside it.
+**Evidence** (shared machine, load 4-35, binaries from this branch):
+- Default `test_cluster_resolution.py`: 3 runs out of 3 gave 16 passed and 9 xfailed. Before
+  this change it was 14 passed and 9 xfailed.
+- `-m slow`: 2 runs out of 2 gave 12 passed and 5-6 xfailed. Before this change it was 8 passed.
+  The one XPASS is the pre-existing non-strict load field-merge test.
+- Per-node counter totals under load, converged against acknowledged: exact without kills on
+  3 and 5 nodes (e.g. 706/706, 494/494, 605/605, 545/545).
+- With one SIGKILL, every run either matched or was off by one write the kill cut off after it
+  committed (831/830, 483/482, 671/670).
+- The summing procedure stays xfailed in the same runs.
+- `go test ./kdb/script/... ./kdb/transaction/` passes, as does Kotlin
+  `:kdb-script:test --tests ConflictCorpusTest`.
 
 **Not done:** a lint at `PUT …/procedures` for the `- base` pattern. A source-text match would
 also flag legitimate uses (comparisons, the parity corpus's own sum case), so it wouldn't be
