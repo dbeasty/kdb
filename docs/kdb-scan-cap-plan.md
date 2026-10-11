@@ -173,3 +173,8 @@ _(append one entry per unit: date, unit, PR, commit, and anything found along th
 
 - 2026-10-11 — Go fix committed on `fix/scan-cap-before-filter` (`27336e1`), not pushed. Found by
   qtask; reproduced and verified there against the release binary and the fixed build.
+- 2026-10-11 — U1 verification (partial): with the old truncation reinstated inside the fixed
+  executor, 4 of the 5 new tests fail (selective WHERE, COUNT(*), overflow error, LIMIT/OFFSET);
+  restored, all pass. `go test -race ./kdb/sql ./kdb/server` passes. Still to do for U1: rebase on
+  `origin/main` (now at `f7b2256`, which includes the Gradle build gate), full `go test -race ./...`
+  on an idle machine, and open the PR.
