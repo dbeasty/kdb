@@ -336,6 +336,15 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 
 _(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
 
+- **2026-10-11, U8** (branch `fix/json-getters-return-errors`): `navigateGet`, `collectAll` and
+  `normalizeIndex` in `go/kdb/json/api.go` now return `*JsonPathError` instead of panicking, so
+  `Get`/`GetAll`/`Contains`/`Keys`/`TypeName`/`ArrayLength`/`Set`/`Delete` all report a mismatched
+  path as an error. Found along the way: the panic reached further than the plan said. `collectAll`
+  (wildcard `GetAll`) and `normalizeIndex` (`[-2]` and below, reached from `Set` and `Delete` too)
+  panicked the same way, and `Set` with `[-1]` on an empty array indexed `list[-1]`, a runtime
+  panic. `Set` is the one production caller (`sql/dml.go`, SQL `UPDATE ... SET` on a JSON path), so
+  that path was reachable from a SQL statement; it now gets an error. Table test
+  `go/kdb/json/getter_errors_test.go` fails with panics on `main`.
 - **2026-10-11 — multi-node e2e harness, and U6a.** New `kdb-integration/e2e/test_cluster.py` +
   `cluster_fixtures.py`: real kdb-service clusters (mesh, chain, star; 2-5 nodes) replicating with
   `--peer`, concurrent writers on every node, `kill -9` of one node, two at once and the whole

@@ -83,6 +83,43 @@ def free_ports(count: int) -> list[int]:
             s.close()
 
 
+# Pinned ports come from below every OS's ephemeral range (Linux starts at 32768 by default, macOS
+# at 49152). A port the kernel handed out as ephemeral is also fair game as the *source* port of
+# any outgoing connection, so while a killed node is down one of the many client connections a
+# cluster test makes can take its port, and the node cannot bind it again on restart - which is
+# exactly what happened on a Linux runner and never on a laptop.
+_STABLE_PORT_RANGE = (20000, 32000)
+_stable_ports_taken: set[int] = set()
+
+
+def stable_ports(count: int) -> list[int]:
+    """Reserves `count` distinct ports outside the ephemeral range, for servers that must come back
+    on the same ports after a kill. Each is checked by binding it, and never handed out twice in
+    this process."""
+    import random
+    rng = random.Random()
+    lo, hi = _STABLE_PORT_RANGE
+    socks, ports = [], []
+    try:
+        while len(ports) < count:
+            port = rng.randrange(lo, hi)
+            if port in _stable_ports_taken or port in ports:
+                continue
+            s = socket.socket()
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                s.close()
+                continue
+            socks.append(s)
+            ports.append(port)
+        _stable_ports_taken.update(ports)
+        return ports
+    finally:
+        for s in socks:
+            s.close()
+
+
 @dataclass
 class TlsMaterial:
     """A self-signed CA plus one server cert/key issued from it (session-scoped fixture)."""
@@ -167,8 +204,9 @@ class KdbServer:
         """Allocates this server's ports now, so its addresses are known before it starts -
         what a cluster needs to write every node's --peer specs up front."""
         if not self.sql_port:
+            alloc = stable_ports if self.pin_ports else free_ports
             (self.sql_port, self.peer_port, self.stream_port, self.admin_port,
-             self.control_port) = free_ports(5)
+             self.control_port) = alloc(5)
         return self
 
     def _launch(self, attempts: int = 4) -> "KdbServer":
@@ -200,9 +238,11 @@ class KdbServer:
 
     def _launch_once(self) -> "KdbServer":
         # One allocation for all of them, so the kernel cannot hand the same port to two.
-        if not (self.pin_ports and self.sql_port):
+        if not self.pin_ports:
             (self.sql_port, self.peer_port, self.stream_port, self.admin_port,
              self.control_port) = free_ports(5)
+        elif not self.sql_port:
+            self.reserve_ports()
         # One log per launch: reopening a single file with "w" on restart erased the log of the
         # run that was killed, which is the one a crash test needs to read.
         self.launches += 1
