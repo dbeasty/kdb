@@ -3,17 +3,14 @@
 // of delta-log corruption, and the repair actions that are provably safe
 // to take on what verification finds.
 //
-// Verification is deliberately independent of delta.DefaultReader: that
-// reader's ListSegments/ReadAll are replay-oriented and silently discard
-// a *delta.CorruptFrameError on any segment that isn't the caller's
-// concern at replay time (see DefaultReader.ListSegments' scanSegmentRef,
-// which drops scanErr whenever it's a CorruptFrameError at all, not just
-// on the last segment). A verification tool exists specifically to not
-// silently discard that information, so it scans raw segment bytes itself.
+// Verification reads raw segment bytes itself rather than going through
+// delta.DefaultReader, whose listing records only where a segment's intact
+// frames stop. It classifies what follows with the same rule replay applies
+// (delta.ScanSegment, storage.TailKind), so verify and open cannot disagree
+// about whether a segment lost data.
 package integrity
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -36,13 +33,14 @@ type Classification string
 
 const (
 	// TornTail is a corrupt or short final frame in the highest-sequence
-	// segment - by kdb-spec-layer13 §4.3's rule, the expected shape of an
-	// unclean shutdown (a commit that was never acknowledged), not real
-	// corruption.
+	// segment, with nothing intact after it - by kdb-spec-layer13 §4.3's
+	// rule, the expected shape of an unclean shutdown (a commit that was
+	// never acknowledged), not real corruption.
 	TornTail Classification = "torn_tail"
-	// MidLogCorruption is a corrupt or short frame anywhere other than
-	// the tail of the last segment - real corruption, never silently
-	// tolerated.
+	// MidLogCorruption is a corrupt or short frame anywhere else: any
+	// fault that intact frames follow, in any segment (N5), and a faulty
+	// last frame in a segment that is no longer the newest - real
+	// corruption, never silently tolerated.
 	MidLogCorruption Classification = "mid_log_corruption"
 	// MissingParent is a commit whose parent hash is not present anywhere
 	// in the namespace's scanned log.
@@ -94,17 +92,15 @@ func (r *Report) Clean() bool { return len(r.Findings) == 0 }
 
 // scannedSegment is one segment's independently-scanned bytes and result.
 type scannedSegment struct {
-	sequence   int64
-	raw        []byte
-	commits    []delta.ScannedCommit
-	corruptErr *delta.CorruptFrameError
-	// consumedBytes is how much of raw the scan actually accounted for -
-	// either up to corruptErr's offset, or (on a clean scan) up to the end
-	// of the last frame. Anything past it and before len(raw) is either
-	// the expected shape of a torn tail (see ScanSegmentBytes' doc
-	// comment on the frameEnd > len(bytes) case) or, if this isn't the
-	// last segment, evidence of truncation that the scanner's silent
-	// short-tail tolerance was never meant to hide.
+	sequence int64
+	raw      []byte
+	commits  []delta.ScannedCommit
+	// tail is how the segment's intact frames end - the rule replay applies too (see
+	// storage.TailKind): nothing or zero padding after them, a torn tail, or damage that
+	// intact frames follow.
+	tail storage.SegmentTail
+	// consumedBytes is where the intact frames end (tail.Offset). Anything past it that is not
+	// zero padding is a torn tail or damage, as tail says.
 	consumedBytes int
 }
 
@@ -148,35 +144,8 @@ func readAndScanSegment(shim storage.PlatformIOShim, namespaceID string, seq int
 	if err != nil {
 		return scannedSegment{}, err
 	}
-	commits, scanErr := delta.ScanSegmentBytes(raw)
-	ss := scannedSegment{sequence: seq, raw: raw, commits: commits}
-	var corrupt *delta.CorruptFrameError
-	if scanErr != nil {
-		if !errors.As(scanErr, &corrupt) {
-			return scannedSegment{}, scanErr
-		}
-		ss.corruptErr = corrupt
-		ss.consumedBytes = corrupt.Offset
-		return ss, nil
-	}
-	if len(commits) == 0 {
-		ss.consumedBytes = 0
-		return ss, nil
-	}
-	last := commits[len(commits)-1]
-	ss.consumedBytes = last.FrameOffset + frameLen(raw, last.FrameOffset)
-	return ss, nil
-}
-
-const frameHeaderSize = delta.PageFrameHeaderSize
-
-// frameLen reads the frame header's compressed-body-length field
-// (the same layout delta.ScanSegmentBytes parses) to compute the full
-// on-disk size of the frame starting at offset, so verify can tell
-// whether a clean scan actually consumed every byte of the segment.
-func frameLen(raw []byte, offset int) int {
-	b := raw[offset+8 : offset+12]
-	return frameHeaderSize + (int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3]))
+	commits, tail := delta.ScanSegment(raw)
+	return scannedSegment{sequence: seq, raw: raw, commits: commits, tail: tail, consumedBytes: int(tail.Offset)}, nil
 }
 
 // Options configures a verification run.
@@ -217,21 +186,32 @@ func Verify(shim storage.PlatformIOShim, namespaceID string, opts Options) (*Rep
 		})
 		isLastSegment := i == len(seqs)-1
 
-		if ss.corruptErr != nil {
-			class := MidLogCorruption
-			if isLastSegment {
-				class = TornTail
+		// The same rule replay applies (storage.TailKind). Zero padding after the last frame -
+		// a preallocated segment's unused space - is not a finding. Damage that intact frames
+		// follow is mid-log corruption wherever it is, the newest segment included: calling it a
+		// torn tail there let repair truncate away the intact, acknowledged frames after it.
+		switch ss.tail.Kind {
+		case storage.TailDamaged:
+			detail := fmt.Sprintf("%s - damaged in place, not a torn tail", ss.tail.Reason)
+			if ss.tail.NextIntactFrame >= 0 {
+				detail = fmt.Sprintf("%s - intact frames follow it (the next at offset %d), so this is damage in place, not a torn tail",
+					ss.tail.Reason, ss.tail.NextIntactFrame)
 			}
 			report.Findings = append(report.Findings, Finding{
-				Namespace: namespaceID, Level: L1, Segment: seq, Offset: ss.corruptErr.Offset,
-				Classification: class, Detail: ss.corruptErr.Reason,
+				Namespace: namespaceID, Level: L1, Segment: seq, Offset: ss.consumedBytes,
+				Classification: MidLogCorruption, Detail: detail,
 			})
-		} else if ss.consumedBytes < len(ss.raw) {
+		case storage.TailTorn:
+			// Nothing intact follows. In the newest segment that is a torn tail. In an older one
+			// it is either a torn tail from an earlier unclean shutdown (a restart then opened a
+			// newer segment) or a damaged last frame - indistinguishable here, so it stays
+			// mid-log corruption: repair then removes it only if no later commit builds on it.
 			class := MidLogCorruption
-			detail := fmt.Sprintf("%d trailing byte(s) after the last valid frame were never consumed by a frame - truncated data in a sealed segment", len(ss.raw)-ss.consumedBytes)
+			detail := fmt.Sprintf("%s, %d byte(s) before the end of the segment, with no intact frame after it - in a segment that is no longer the newest, so either a torn tail from an earlier unclean shutdown or a damaged last frame",
+				ss.tail.Reason, len(ss.raw)-ss.consumedBytes)
 			if isLastSegment {
 				class = TornTail
-				detail = fmt.Sprintf("%d trailing byte(s) after the last valid frame - an incomplete write never fsynced before shutdown", len(ss.raw)-ss.consumedBytes)
+				detail = fmt.Sprintf("%s, with no intact frame after it - an incomplete write never fsynced before shutdown", ss.tail.Reason)
 			}
 			report.Findings = append(report.Findings, Finding{
 				Namespace: namespaceID, Level: L1, Segment: seq, Offset: ss.consumedBytes,

@@ -2,6 +2,7 @@ package dev.kdb.integrity
 
 import dev.kdb.codec.KdbUuid
 import dev.kdb.storage.PlatformIoShim
+import dev.kdb.storage.delta.DeltaSegmentScanner
 import dev.kdb.storage.io.SegmentNameBuilder
 
 /** What [repair] did (or refused to do) for one [Finding]. */
@@ -80,9 +81,10 @@ private suspend fun repairTornTail(shim: PlatformIoShim, namespaceId: String, f:
 /**
  * Quarantines the full original segment and, only if the namespace's
  * parent closure holds using just that segment's good prefix (the frames
- * before the corrupt one - the scanner cannot resync past a corrupt frame
- * to recover anything after it), rewrites the segment to contain that
- * prefix alone. If closure would break, it touches nothing and reports
+ * before the corrupt one), rewrites the segment to contain that prefix
+ * alone. If closure would break - a later segment builds on a dropped
+ * commit, or intact frames follow the damage in the same segment, whose
+ * commits the prefix would drop (N5) - it touches nothing and reports
  * exactly which commit hashes would go missing (kdb-spec-layer15 §5.2,
  * P3: never guess, never destroy evidence unless the repair it would
  * enable is actually safe).
@@ -101,6 +103,18 @@ private suspend fun repairMidLogCorruption(shim: PlatformIoShim, namespaceId: St
                     allCommits += c.commitHash.toHex()
                     prefixCount++
                 }
+            }
+            // Intact frames after the damage are acknowledged commits too. Keeping only the
+            // prefix would drop them - and in the newest segment nothing later would even notice
+            // (N5). Refuse, naming them, and leave the segment alone.
+            val after = DeltaSegmentScanner.intactCommitsAfter(ss.raw, f.offset).map { it.commitHash.toHex() }
+            if (after.isNotEmpty()) {
+                return RepairStep(
+                    finding = f,
+                    action = Action.REFUSED,
+                    missingHashes = after,
+                    detail = "segment ${f.segment} has ${after.size} intact commit(s) after the damage at byte ${f.offset}; keeping only the frames before it would drop them - restore the namespace from a backup or a peer instead",
+                )
             }
             continue
         }

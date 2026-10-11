@@ -24,8 +24,11 @@ import (
 //     correctness requirement, so a bug in segment ordering elsewhere
 //     degrades to a slower replay, not a permanently unopenable
 //     namespace - which is exactly the failure this replaces (§2.1).
-//  2. Corruption in the most recently written segment is tolerated as an
-//     expected torn tail; corruption anywhere else is not (§4.3).
+//  2. A torn tail - bytes at the very end of a segment with nothing intact
+//     after them - is tolerated as the expected shape of an unclean
+//     shutdown, in the newest segment or, after a restart opened a newer
+//     one, in an older one. Damage that an intact frame follows is never a
+//     torn tail, wherever it is, and is refused (storage.TailKind; N5).
 //
 // Commits are applied as they are read rather than collected first. The
 // collect-then-apply version held every commit in the namespace's history
@@ -86,7 +89,37 @@ func replayDeltaNamespaceFrom(
 	// deferred holds only commits whose parents had not been applied when
 	// they were read - see applyCommitsTopologically, which drains it.
 	var deferred []document.Commit
+	// torn holds the segments, other than the newest, whose tails were torn: the expected shape
+	// of a restart after an unclean shutdown, unless a later commit turns out to build on what
+	// the tail held (see applyCommitsTopologically's caller below).
+	var torn []storage.DeltaSegmentRef
 	for i, seg := range segments {
+		isMostRecent := i == len(segments)-1
+		switch seg.Tail.Kind {
+		case storage.TailDamaged:
+			// Intact frames follow the damage, so stopping at it - which is all a reader can do,
+			// since the commits after it descend from the one it held - would drop committed
+			// history without a word. This is the rule from #81: a torn tail can only be the
+			// last bytes of a segment. Wherever the segment is, refuse (N5).
+			return &delta.DamagedSegmentError{
+				NamespaceID:     d.NamespaceID,
+				Sequence:        seg.SequenceNumber,
+				Offset:          seg.Tail.Offset,
+				Reason:          seg.Tail.Reason,
+				NextIntactFrame: seg.Tail.NextIntactFrame,
+			}
+		case storage.TailTorn:
+			// Only bytes no intact frame follows: the last append before a crash never
+			// completed, so it was never acknowledged. OpenWriter always starts a new segment,
+			// so a torn tail in an older segment is a crash from an earlier run.
+			log.Printf(
+				"kdb: namespace %s: delta segment (sequence %d) has a torn tail at byte offset %d (%s) - "+
+					"treating it as an incomplete write from an unclean shutdown",
+				d.NamespaceID, seg.SequenceNumber, seg.Tail.Offset, seg.Tail.Reason)
+			if !isMostRecent {
+				torn = append(torn, seg)
+			}
+		}
 		read := 0
 		readErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
 			read++
@@ -113,31 +146,65 @@ func replayDeltaNamespaceFrom(
 			return applyFailed.err
 		}
 		if readErr != nil {
-			isMostRecent := i == len(segments)-1
-			if errors.As(readErr, &corrupt) && isMostRecent {
-				// Torn tail on the most recently written segment: the
-				// expected shape of an unclean shutdown (the last frame's
-				// write never completed, or completed but wasn't fsynced
-				// before the process died). Keep every commit applied
-				// before it, log it, and continue - this segment is never
-				// appended to again (OpenWriter always starts a fresh one),
-				// so this decision is stable across future restarts too.
+			switch {
+			case errors.As(readErr, &corrupt) && corrupt.Torn():
+				// A torn tail the listing did not already account for (a reader that does not
+				// classify tails): nothing intact follows it, so it is the last append before
+				// a crash. Keep every commit applied before it, log it, and continue - this
+				// segment is never appended to again (OpenWriter always starts a fresh one), so
+				// this decision is stable across future restarts too.
 				log.Printf(
 					"kdb: namespace %s: delta segment (sequence %d) has a torn tail at byte offset %d (%s) - "+
 						"treating as an incomplete write from an unclean shutdown and continuing with the %d "+
 						"commit(s) read cleanly before it",
 					d.NamespaceID, seg.SequenceNumber, corrupt.Offset, corrupt.Reason, read)
-			} else {
+				if !isMostRecent {
+					s := seg
+					s.Tail = storage.SegmentTail{Kind: storage.TailTorn, Offset: int64(corrupt.Offset), Reason: corrupt.Reason}
+					torn = append(torn, s)
+				}
+			case corrupt != nil:
+				// Intact frames follow the fault, or the frame passed its CRC and will not
+				// decode. Either way it is not a torn tail, newest segment or not: replay used to
+				// accept any fault in the newest segment as one, truncating the rest of it with
+				// only a log line (N5).
+				return &delta.DamagedSegmentError{
+					NamespaceID:     d.NamespaceID,
+					Sequence:        seg.SequenceNumber,
+					Offset:          int64(corrupt.Offset),
+					Reason:          corrupt.Reason,
+					NextIntactFrame: int64(corrupt.NextIntactFrame),
+					Err:             readErr,
+				}
+			default:
 				return fmt.Errorf(
-					"kdb: namespace %s: delta segment (sequence %d) is corrupt and is not the most recently "+
-						"written segment, so this is not an expected torn tail - data may be unrecoverable; "+
-						"run kdb-inspect repair-segments before retrying: %w",
+					"kdb: namespace %s: delta segment (sequence %d) could not be read - data may be "+
+						"unrecoverable; run kdb-inspect verify, then kdb-inspect repair-segments, before retrying: %w",
 					d.NamespaceID, seg.SequenceNumber, readErr)
 			}
 		}
 	}
 
 	if err := applyCommitsTopologically(d, store, deferred, gate, shallow, unapplied); err != nil {
+		var missing *missingParentsError
+		if errors.As(err, &missing) && len(torn) > 0 {
+			// A torn tail is never built on: a commit that did not finish writing was never
+			// acknowledged, so nothing after a restart can descend from it. Later commits that
+			// name parents the log no longer holds therefore mean an older segment's tail - its
+			// last frame(s) - was damaged in place after it had been read and built on. That is
+			// the one damage the tail alone cannot show (a damaged last frame reads exactly like
+			// a torn one); point at the segment rather than only at the missing commit.
+			seg := torn[0]
+			return &delta.DamagedSegmentError{
+				NamespaceID:     d.NamespaceID,
+				Sequence:        seg.SequenceNumber,
+				Offset:          seg.Tail.Offset,
+				Reason:          seg.Tail.Reason,
+				NextIntactFrame: -1,
+				BuiltOn:         true,
+				Err:             err,
+			}
+		}
 		return err
 	}
 	unapplied.report(d, report)
@@ -217,6 +284,21 @@ func (g *groupGate) report() {
 	log.Printf("kdb: namespace %s: rolled back %d commit(s) belonging to or built on %d cross-namespace "+
 		"transaction(s) that never committed (cut off by an unclean shutdown before their decision was durable; "+
 		"none of them was ever acknowledged)", g.d.NamespaceID, len(g.dropped), len(g.droppedGroups))
+}
+
+// missingParentsError is applyCommitsTopologically's "the log is missing data": commits whose
+// parents no segment holds.
+type missingParentsError struct {
+	namespaceID string
+	count       int
+	first       codec.Hash
+}
+
+func (e *missingParentsError) Error() string {
+	return fmt.Sprintf(
+		"kdb: namespace %s: delta replay: %d commit(s) reference parent commits never found in "+
+			"the log - the log is missing data (first unresolved: %s)",
+		e.namespaceID, e.count, e.first.Hex())
 }
 
 // replayApplyError distinguishes "applying this commit failed" from
@@ -331,10 +413,7 @@ func applyCommitsTopologically(d *dag.InMemoryCommitDag, store storage.Adapter, 
 			progressed = true
 		}
 		if !progressed {
-			return fmt.Errorf(
-				"kdb: namespace %s: delta replay: %d commit(s) reference parent commits never found in "+
-					"the log - the log is missing data (first unresolved: %s)",
-				d.NamespaceID, len(next), next[0].Hash.Hex())
+			return &missingParentsError{namespaceID: d.NamespaceID, count: len(next), first: next[0].Hash}
 		}
 		pending = next
 	}
