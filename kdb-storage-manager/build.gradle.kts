@@ -7,7 +7,6 @@ kotlin {
         linuxX64Main.get().dependsOn(nativeMain); macosArm64Main.get().dependsOn(nativeMain)
         commonMain.dependencies {
             implementation(project(":kdb-storage-engine"))
-            implementation(project(":kdb-storage-compaction"))
             implementation(project(":kdb-storage"))
             implementation(project(":kdb-codec"))
             implementation(project(":kdb-error"))

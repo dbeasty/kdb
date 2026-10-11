@@ -258,7 +258,7 @@ a trap for the first caller. Convert the panic to a returned error, and add a ta
 
 These need a decision from you. Each has a recommendation.
 
-### U9. Remove dead stubs — S each
+### U9. Remove dead stubs — S each — DONE 2026-10-11 (both deleted; see progress log)
 
 - **Kotlin `kdb-storage-compaction`.** `plan()` returns `emptyList()` and every runner throws
   `CompactionNotImplementedException` (`Compaction.kt:31,45-76`). No source anywhere references it;
@@ -547,3 +547,14 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
 - `integration/join_interop_test.go` (Kotlin)
 
 **Evidence.** The e2e soak is 1 of 2 non-converging (XFAIL after 174s) with `origin/main` binaries, and 5 of 5 converged (~25s per run, about 2-3s of it after writes stop) with this branch, both under load avg 18-28.
+
+- **2026-10-11, U9** (branch `chore/remove-dead-stubs`): deleted the Kotlin stub module
+  `kdb-storage-compaction` (its `settings.gradle.kts` include and the unused dependency in
+  `kdb-storage-manager/build.gradle.kts` were the only references) and the Go stub package
+  `go/kdb/tier` (no importer, test or otherwise; it had no tests). No CI workflow, Makefile target or
+  release script named either. The module never produced a release asset (checked `v0.4.0` and
+  `v0.6.2`: neither lists a `kdb-storage-compaction` jar), so the 50-jar count is unchanged. Docs
+  that listed them as implemented now say 10f is not implemented (`kdb-spec.md`,
+  `kdb-lld-storage.md`, `kdb-spec-layer6-execution-plan.md`); the 10f spec keeps its design with a
+  removal note; `kdb-release-plan.md` §2.2 drops `kdb/tier` from the excluded list and the module's
+  package count goes 59 to 58. Historical entries in `kdb-finish-up-plan.md` were left as written.

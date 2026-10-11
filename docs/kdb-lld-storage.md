@@ -434,7 +434,7 @@ Two distinct compactions, easily confused:
 
 | Name | Module | What it merges |
 |------|--------|----------------|
-| **Storage compaction** | `kdb-storage-compaction` (Kotlin), Layer 4a component 10f | SSTable generations — physical space |
+| **Storage compaction** | not implemented (Layer 4a component 10f; the Kotlin stub module was removed) | SSTable generations — physical space |
 | **DAG compaction** | `compaction` (Go) / `:kdb-compaction`, Layer 6 component 19 | commit history via `dag.Squash` — logical space |
 
 DAG compaction is gated by policy (`squashAfter=NEVER` blocks it outright) and by peer safety: a

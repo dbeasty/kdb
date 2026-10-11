@@ -43,7 +43,7 @@ Layer 4a — Storage Engine    [COMPLETE]
   [x] 10c. SSTable + Block Cache   — `:kdb-storage-sstable`; `dev.kdb.storage.sstable`; spec: `kdb-spec-layer4a-component10c-sstable-block-cache.md`
   [x] 10d. Delta Segment Writer    — `:kdb-storage-delta`; `dev.kdb.storage.delta`; spec: `kdb-spec-layer4a-component10d-delta-segment-writer.md`
   [x] 10e. Storage Engine Core     — `:kdb-storage-engine`; `dev.kdb.storage.engine`; spec: `kdb-spec-layer4a-component10e-storage-engine-core.md`
-  [x] 10f. Storage Compaction      — `:kdb-storage-compaction`; `dev.kdb.storage.compaction`; spec: `kdb-spec-layer4a-component10f-storage-compaction.md`
+  [ ] 10f. Storage Compaction      — not implemented (stub module removed, U9 of `kdb-open-issues-plan.md`); spec: `kdb-spec-layer4a-component10f-storage-compaction.md`
   [x] 10g. Platform I/O Shim       — `:kdb-storage-io`; `dev.kdb.storage.io`; spec: `kdb-spec-layer4a-component10g-platform-io-shim.md`
 
 Layer 4b — Storage Manager   [COMPLETE]
@@ -116,7 +116,7 @@ Layer 12 — Go-Native Server + Peer-Sync Hardening [IMPLEMENTED — P0/P1; 42/4
 - Layer 3 specs and §17 drafts are aligned with **implemented** Layer 2: transactional writes are expected to go through `CommitDag.appendCommit` / `appendMergeCommit` (with `schemaHash` carried on `KdbCommit`); `SchemaEngine.computeSchemaHash` and commit payload hashing (`KdbCommit.build` / `computeCommitHash`) are the normative hooks for schema- and content-addressed heads. Component 7 (`DefaultTransactionEngine`) is now the orchestration path atop those primitives.
 - Layer 3 Gradle modules landed: `:kdb-storage` (adapter surface + memory adapter +expect/actual `PlatformIoShim`), `:kdb-index` (`IndexStore`, `MemoryIndexStore`, registry/writer/reader/manager stack, wire helpers), `:kdb-transaction` (`TransactionEngine`, builder, replay/merge atop the DAG).
 - Layer 4 component specs generated (12 files): Layer 4a Components 10a–10g and Layer 4b Components 11a–11e.
-- Layer 4 implemented (Gradle modules): `:kdb-compression`, `:kdb-storage-io` (10g), `:kdb-storage-wal` (10a), `:kdb-storage-sstable` (10c), `:kdb-storage-memtable` (10b), `:kdb-storage-delta` (10d), `:kdb-storage-engine` (10e), `:kdb-storage-compaction` (10f), `:kdb-storage-manager` (11a–11e). Production I/O via `FileBackedPlatformIoShimFactory`; tests use `InMemoryPlatformIoShim`.
+- Layer 4 implemented (Gradle modules): `:kdb-compression`, `:kdb-storage-io` (10g), `:kdb-storage-wal` (10a), `:kdb-storage-sstable` (10c), `:kdb-storage-memtable` (10b), `:kdb-storage-delta` (10d), `:kdb-storage-engine` (10e), `:kdb-storage-manager` (11a–11e). Production I/O via `FileBackedPlatformIoShimFactory`; tests use `InMemoryPlatformIoShim`.
 - Layer 5 component specs generated (5 files): Components 12–16 — hash+btree, full-text, vector, SQL DSL + planner, virtual view engine. See Section 16.1 Layer 5 execution order.
 - Layer 5 implemented (first Kotlin cut): `:kdb-index-hash`, `:kdb-index-btree`, `:kdb-index-fulltext`, `:kdb-index-vector`, `:kdb-index-composite`, `:kdb-sql`. Index writer JSONPath fixed (`$.field`). Vector index uses brute-force cosine v1.
 - Layer 6 component specs generated (3 files): Components 17–19 — hybrid query, namespace policy, DAG compaction engine. Execution plan: `kdb-spec-layer6-execution-plan.md`. See Section 16.1 Layer 6 implementation order.
@@ -1291,7 +1291,7 @@ STATUS KEY:  [ ] not started   [~] in progress   [x] complete
 [x] 10c. SSTable + Block Cache      — `:kdb-storage-sstable`; spec `kdb-spec-layer4a-component10c-sstable-block-cache.md`
 [x] 10d. Delta Segment Writer       — `:kdb-storage-delta`; spec `kdb-spec-layer4a-component10d-delta-segment-writer.md`
 [x] 10e. Storage Engine Core        — `:kdb-storage-engine`; spec `kdb-spec-layer4a-component10e-storage-engine-core.md`
-[x] 10f. Storage Compaction         — `:kdb-storage-compaction`; spec `kdb-spec-layer4a-component10f-storage-compaction.md`
+[ ] 10f. Storage Compaction         — not implemented (stub module removed); spec `kdb-spec-layer4a-component10f-storage-compaction.md`
 [x] 10g. Platform I/O Shim          — `:kdb-storage-io`; spec `kdb-spec-layer4a-component10g-platform-io-shim.md`
 ```
 
@@ -2776,7 +2776,7 @@ class EnlistmentNotFoundException(message: String, val enlistmentId: KdbUuid) : 
 
 ### Layer 4a Interfaces — KDB Storage Engine
 
-> **Status: IMPLEMENTED (first Kotlin cut)** — modules `:kdb-compression`, `:kdb-storage-io`, `:kdb-storage-wal`, `:kdb-storage-memtable`, `:kdb-storage-sstable`, `:kdb-storage-delta`, `:kdb-storage-engine`, `:kdb-storage-compaction`. Normative detail remains in `docs/kdb-spec-layer4a-component10*.md`. Entry points: `FileBackedPlatformIoShimFactory.open`, `DefaultWriteAheadLogFactory`, `DefaultSsTableWriter`/`Reader`, `MemTableManager`, `DefaultDeltaSegmentWriter`, `DefaultStorageEngineFactory.forTarget`, `runSstableCompaction`.
+> **Status: IMPLEMENTED (first Kotlin cut)** — modules `:kdb-compression`, `:kdb-storage-io`, `:kdb-storage-wal`, `:kdb-storage-memtable`, `:kdb-storage-sstable`, `:kdb-storage-delta`, `:kdb-storage-engine` (10f storage compaction is not implemented; its stub module was removed). Normative detail remains in `docs/kdb-spec-layer4a-component10*.md`. Entry points: `FileBackedPlatformIoShimFactory.open`, `DefaultWriteAheadLogFactory`, `DefaultSsTableWriter`/`Reader`, `MemTableManager`, `DefaultDeltaSegmentWriter`, `DefaultStorageEngineFactory.forTarget`.
 
 | Component | Module | Primary packages |
 |---|---|---|
@@ -2786,7 +2786,7 @@ class EnlistmentNotFoundException(message: String, val enlistmentId: KdbUuid) : 
 | 10c SSTable + Block Cache | `:kdb-storage-sstable` | `dev.kdb.storage.sstable` — `SsTableWriter`, `BlockCache`, `LsmBlobStore` |
 | 10d Delta Segment Writer | `:kdb-storage-delta` | `dev.kdb.storage.delta` — `DefaultDeltaSegmentWriter` |
 | 10e Storage Engine Core | `:kdb-storage-engine` | `dev.kdb.storage.engine` — `ServerStorageEngine`, `StorageEngineFactory` |
-| 10f Storage Compaction | `:kdb-storage-compaction` | `dev.kdb.storage.compaction` — `CompactionPlanner`, `runSstableCompaction` |
+| 10f Storage Compaction | — | not implemented; stub module `:kdb-storage-compaction` removed (U9 of `kdb-open-issues-plan.md`) |
 
 ### Layer 4b Interfaces — Storage Manager
 
