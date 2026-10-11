@@ -597,8 +597,8 @@ Known blockers either path must clear first, all already recorded in the finish-
 - ~~Kotlin's JS/Native has no zstd.~~ Resolved by roadmap R1 (`docs/kdb-open-issues-plan.md`):
   Kotlin/JS reads and writes zstd through a pure-Kotlin codec in `kdb-compression` (no npm
   dependency, synchronous, works in node and the browser), so path (a) no longer inherits a gap.
-  Its encoder compresses less than libzstd on large inputs (predefined sequence tables, greedy
-  matching); that costs bytes, not compatibility.
+  Its encoder matches libzstd on small values and is about 1.2x its size on large inputs
+  (greedy matching); that costs bytes, not compatibility.
 - `go/kdb/embed/dir_lock.go` needed build tags for `GOOS=js` (finish-up plan item 0.3) — confirm
   it is fixed before path (b).
 

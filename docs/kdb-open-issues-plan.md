@@ -544,11 +544,12 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   targets). One decoder (`ZstdDecoder`, RFC 8878: every block, literals and sequence-table mode,
   XXH64 checksum, concatenated and skippable frames; no dictionaries) serves both targets and runs
   under the JVM's differential tests against libzstd.
-- **Both directions.** `ZstdEncoder` writes real frames (greedy hash matches, Huffman-coded
-  literals with direct or FSE-compressed weights, predefined FSE tables for sequences,
-  single-segment, content size and checksum always present). It compresses less than libzstd on
-  large inputs - 104,986 bytes vs zstd-jni level 3's 65,497 on a 400KB JSON corpus - but matches it
-  on a 158-byte commit-shaped record (143 bytes each), and Go and the JVM read it. So `canCompress` and `canDecompress` (replacing `isAvailable`) are both true
+- **Both directions.** `ZstdEncoder` writes real frames: greedy hash matches that try the most
+  recent offset first, repeat-offset codes, Huffman-coded literals (direct or FSE-compressed
+  weights), and per-block RLE, predefined or custom FSE tables for the sequence codes. Frames are
+  single-segment, with content size and checksum always present. It matches zstd-jni level 3 on
+  small payloads (158-byte record: 143 bytes each; 700-byte JSON: 232 vs 230) and is about 1.2x
+  its size on large ones (400KB JSON: 79,141 vs 65,497), and Go and the JVM read it. So `canCompress` and `canDecompress` (replacing `isAvailable`) are both true
   everywhere, and JS/Native SSTable blocks, delta pages and ice bundles are zstd again. The split
   stays so a decode-only target remains expressible; every writer checks `canCompress`.
 - **Errors.** Malformed input throws `ZstdFormatException` (an `IllegalArgumentException`) on
@@ -570,10 +571,16 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   - A pre-U5 Native data directory (length-prefixed blocks tagged ZSTD) now fails with
     `ZstdFormatException` (bad frame magic) instead of `ZstdUnavailableException` - still refused,
     never misread. No such directory was ever released.
-  - Huffman literals (added in the same PR) are not where the large-input gap is. On the 400KB
-    JSON corpus a 128KB block holds ~4KB of literals (Huffman halves them) but ~10,700 sequences
-    costing ~33KB: the gap is sequence coding - predefined rather than per-block FSE tables, no
-    repeat offsets, greedy rather than lazy matching. Huffman matters for small, literal-heavy
-    payloads: a 700-byte JSON went 299 -> 265 bytes, a 158-byte record 171 -> 143.
-  - Not done: per-block sequence tables, repeat offsets and lazy matching; and no throughput
-    numbers - the machine's load average was 50-140 for most of the work.
+  - The encoder was built up in three steps in this PR; measured on the 400KB JSON corpus
+    (zstd-jni level 3: 65,497): raw literals and predefined tables 108,624; + Huffman literals
+    104,986; + per-block sequence tables and repeat offsets 79,141. A 128KB block of that corpus
+    has ~4KB of literals but ~10,700 sequences, so sequence coding was the gap: custom tables alone
+    took it to 79,321, repeat offsets alone only to 104,483. Huffman and repeat offsets matter
+    most on small payloads (700-byte JSON: 299 -> 265 -> 232).
+  - The repeat-offset history persists across a frame's compressed blocks but a raw block leaves
+    the decoder's untouched, so the encoder rolls its history back when it stores a block raw
+    (`rawBlockDoesNotAdvanceRepeatOffsets`). A wrong update to the third history slot can survive
+    round-trip tests (the greedy parser rarely reads it), so `RepeatOffsetsTest` checks every
+    step against an RFC model.
+  - Not done: lazy matching (the rest of the large-input gap) and repeat-mode tables; and no
+    throughput numbers - the machine's load average was 50-140 for most of the work.
