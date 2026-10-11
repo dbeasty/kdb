@@ -276,7 +276,7 @@ These need a decision from you. Each has a recommendation.
 
 ### U9. Remove dead stubs — S each
 
-**Status: approved 2026-10-11; both stubs removed in their own PR.**
+**Status: done** (#118): both stubs deleted; neither was ever released or imported.
 
 - **Kotlin `kdb-storage-compaction`.** `plan()` returns `emptyList()` and every runner throws
   `CompactionNotImplementedException` (`Compaction.kt:31,45-76`). No source anywhere references it;
@@ -299,7 +299,7 @@ supported: the CLI has no current branch; pass `--branch` per command") rather t
 
 ### U11. Kotlin WAL ignores the configured segment size — S
 
-**Status: open.**
+**Status: done** (branch `fix/kotlin-wal-segment-size`).
 
 `kdb-storage-engine/.../ServerStorageEngine.kt:279` builds `DefaultWriteAheadLogFactory()` with no
 arguments, so the rotation cap is always the 64 MiB default. Thread `walMaxSegmentBytes` from the
@@ -307,8 +307,7 @@ engine config, with a test that a small cap rotates. (Rotation itself is done; s
 
 ### U12. In-memory stream transport drops frames — S, low priority
 
-**Status: done** (branch `fix/stream-memory-transport-drops`; both halves fixed, not just `emit`;
-see the progress log).
+**Status: done** (#120): both halves fixed, not just `emit`; see the progress log.
 
 `go/kdb/stream/transport.go:129-139` (`deliver`, `memory://` hub only) and `subscriber.go:335-340`
 (`emit`, including the desync `EventError` at `:259`) drop on a full buffer. `NewSubscriber` has no
@@ -581,6 +580,30 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   U3 local: 97 merged local branches deleted and finished worktrees removed. The origin half (44
   merged or superseded branches, and closing #26) was refused to automation and is left to the
   owner; every tip is saved in `kdb-deleted-branches-2026-10-11.bundle` beside the checkout.
+- **2026-10-11 — U11.** `StorageEngineConfig.walMaxSegmentBytes` (kdb-storage) is new: the
+  Kotlin twin of Go's `storage.StorageEngineConfig.WalMaxSegmentBytes`, same name and meaning,
+  default 64 MiB. It is validated (zero or negative throws) where Go treats zero as "use the
+  default", since the Kotlin field has a real default. `DefaultWriteAheadLogFactory` now resolves
+  the cap as Go's `wal.DefaultFactory` does: an explicit factory override
+  (`walMaxSegmentBytesOverride`), otherwise the config's. The engine's no-argument factory
+  therefore picks up the config, which it previously never consulted. Not added: a knob on
+  `openFileRuntime` (kdb-jdbc) or any runtime setting descriptor. Go has neither for the WAL cap
+  (only `DeltaMaxSegmentBytes` is exposed through `embed`), and no Kotlin caller exposes any other
+  `StorageEngineConfig` field either. Tests: `WalSegmentSizeTest` (kdb-storage-engine) opens a
+  SERVER engine with a 512-byte cap, writes ~5 KiB, and asserts several WAL segments, that a
+  reopened engine recovers every blob, and that the replay is in write order. It fails on `main`
+  (one segment) and was confirmed failing against the reverted resolution. It also covers the
+  64 MiB default and rejecting 0/-1. `WalTest` adds the factory's override-vs-config order.
+- **2026-10-11, U9** (branch `chore/remove-dead-stubs`): deleted the Kotlin stub module
+  `kdb-storage-compaction` (its `settings.gradle.kts` include and the unused dependency in
+  `kdb-storage-manager/build.gradle.kts` were the only references) and the Go stub package
+  `go/kdb/tier` (no importer, test or otherwise; it had no tests). No CI workflow, Makefile target or
+  release script named either. The module never produced a release asset (checked `v0.4.0` and
+  `v0.6.2`: neither lists a `kdb-storage-compaction` jar), so the 50-jar count is unchanged. Docs
+  that listed them as implemented now say 10f is not implemented (`kdb-spec.md`,
+  `kdb-lld-storage.md`, `kdb-spec-layer6-execution-plan.md`); the 10f spec keeps its design with a
+  removal note; `kdb-release-plan.md` §2.2 drops `kdb/tier` from the excluded list and the module's
+  package count goes 59 to 58. Historical entries in `kdb-finish-up-plan.md` were left as written.
 - **2026-10-11 — U12: the in-memory stream transport and the Go subscriber stop dropping.**
   Done although the plan said to wait for a real caller, and `deliver` was fixed too, not left.
   Frames: `clientLink.deliver` (`memory://` hub) now blocks until the client reads or closes,
