@@ -124,11 +124,99 @@ type ResolutionChain struct {
 	// conflict for the rules. Off, such a sync is refused as unrelated history. Part of the
 	// chain, and so of its hash, because two nodes that disagree on it build different graphs.
 	AllowUnrelated bool `json:"allowUnrelated,omitempty"`
+	// Version selects the merge semantics the chain runs with (see ChainVersionMergeBases). Zero
+	// and 1 are the original semantics, and a chain that leaves it out hashes exactly as it did
+	// before the field existed, so nodes on older releases keep agreeing with it. It is part of
+	// the chain's hash: two nodes running different semantics build different merges, so they
+	// must not look like nodes that agree.
+	Version int `json:"version,omitempty"`
 }
 
-// Validate reports a chain that cannot run: an unknown rule, a source-priority rule without
-// valid node ids, or a rule after a terminal one.
+// Chain versions.
+const (
+	// ChainVersionOriginal is the first semantics: the base handed to the rules is
+	// dag.CommonAncestor's single ancestor, field-merge compares against it, and a value
+	// field-merge builds is attributed to the merge commit.
+	ChainVersionOriginal = 1
+	// ChainVersionMergeBases (#130's F1, F2, F4):
+	//
+	//   - the base is computed from every nearest common ancestor (dag.MergeBases); with several,
+	//     a virtual base merged from them recursively under the same chain (git's "recursive"
+	//     strategy), the same on every node;
+	//   - field-merge decides who changed a field by following the field's value to the write that
+	//     set it - through merges, into whichever parent already held it - exactly as the merge
+	//     decides who changed a document, and a following last-write settles a field both sides
+	//     changed by that field's own last writer, not by a whole-document write time;
+	//   - validity binds the node's schema into the advertised chain hash, and a node holding no
+	//     schema holds the merge instead of letting the next rule decide.
+	//
+	// An operator switches a namespace to it once every node runs a release that has it: a node
+	// that does not know the version refuses to merge under it (AdvertisedHash, resolve).
+	ChainVersionMergeBases = 2
+	// MaxChainVersion is the newest chain version this release runs.
+	MaxChainVersion = ChainVersionMergeBases
+)
+
+// EffectiveVersion is the semantics the chain runs: 1 for a chain that does not say.
+func (c *ResolutionChain) EffectiveVersion() int {
+	if c == nil || c.Version <= 1 {
+		return ChainVersionOriginal
+	}
+	return c.Version
+}
+
+// Supported reports whether this release can run the chain's version.
+func (c *ResolutionChain) Supported() bool { return c.EffectiveVersion() <= MaxChainVersion }
+
+// mergeBases reports whether the chain runs ChainVersionMergeBases' semantics.
+func (c *ResolutionChain) mergeBases() bool {
+	return c != nil && c.EffectiveVersion() >= ChainVersionMergeBases
+}
+
+// Normalize writes version 1 as the absent version, so the two spellings of the original
+// semantics hash alike - and alike to what releases from before the field hash.
+func (c *ResolutionChain) Normalize() {
+	if c != nil && c.Version == ChainVersionOriginal {
+		c.Version = 0
+	}
+}
+
+// hasRule reports whether the chain has a rule of kind.
+func (c *ResolutionChain) hasRule(kind string) bool {
+	if c == nil {
+		return false
+	}
+	for _, r := range c.Rules {
+		if r.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrUnsupportedChainVersion is a chain whose version this release does not run.
+type ErrUnsupportedChainVersion struct{ Version int }
+
+func (e *ErrUnsupportedChainVersion) Error() string {
+	return fmt.Sprintf("resolution chain version %d is newer than this node runs (up to %d): upgrade this node; until then it does not merge under the chain", e.Version, MaxChainVersion)
+}
+
+// Validate reports a chain that cannot run here: an unknown version or rule, a source-priority
+// rule without valid node ids, or a rule after a terminal one.
 func (c ResolutionChain) Validate() error {
+	if c.Version < 0 {
+		return fmt.Errorf("version %d is not a chain version", c.Version)
+	}
+	if !c.Supported() {
+		return &ErrUnsupportedChainVersion{Version: c.Version}
+	}
+	return c.ValidateRules()
+}
+
+// ValidateRules is Validate without the version check: what a node applies a replicated chain
+// with, so a chain newer than it runs is still held - and refused at merge time, with a reason -
+// rather than dropped in favour of whatever chain it held before.
+func (c ResolutionChain) ValidateRules() error {
 	for i, r := range c.Rules {
 		switch r.Kind {
 		case RuleSourcePriority:
@@ -241,6 +329,14 @@ type conflictSides struct {
 	body   [2]*string
 	origin [2]codec.Hash
 	base   *string
+	// heads are the two heads being merged, in the same order. Zero inside a virtual merge base.
+	heads [2]codec.Hash
+	// fieldOrigin, when set, follows a top-level field's value on one side back to the write that
+	// set it (valueIndex.fieldOrigin). Set for a real merge under ChainVersionMergeBases; nil
+	// inside a virtual merge base, whose sides are not commits.
+	fieldOrigin func(side int, field string) (codec.Hash, error)
+	// baseHeld, when set, says why the base could not be built: the document is held.
+	baseHeld string
 }
 
 // chainOutcome is what a chain made of one document.
@@ -262,8 +358,15 @@ type chainOutcome struct {
 
 // resolve runs the chain over one document. Neither decided nor queued means the chain ran out.
 func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, docID codec.UUID, s conflictSides, opts ResolutionOptions) chainOutcome {
+	if !c.Supported() {
+		return chainOutcome{held: true, reason: (&ErrUnsupportedChainVersion{Version: c.Version}).Error()}
+	}
+	if s.baseHeld != "" {
+		return chainOutcome{held: true, reason: s.baseHeld}
+	}
 	valid := opts.Valid
-	for _, r := range c.Rules {
+	v2 := c.mergeBases()
+	for i, r := range c.Rules {
 		switch r.Kind {
 		case RuleProcedure:
 			if opts.Procedure == nil {
@@ -289,7 +392,17 @@ func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, docID codec.UUID, s 
 				return chainOutcome{winner: s.body[i], decided: true}
 			}
 		case RuleValidity:
-			if valid == nil || s.body[0] == nil || s.body[1] == nil {
+			if s.body[0] == nil || s.body[1] == nil {
+				continue
+			}
+			if v2 && (opts.SchemaHash == nil || opts.SchemaHash() == "") {
+				// Without a schema every value passes, and the next rule would decide what a node
+				// holding the schema decides by validity (#130, F4). Hold until it arrives: the
+				// schema replicates as a definition, and peers holding it advertise a different
+				// chain hash until this node does too.
+				return chainOutcome{held: true, reason: "rule validity: this node holds no schema for the namespace yet, so it cannot judge the two values"}
+			}
+			if valid == nil {
 				continue
 			}
 			v0, v1 := valid(*s.body[0]), valid(*s.body[1])
@@ -300,6 +413,17 @@ func (c *ResolutionChain) resolve(d *dag.InMemoryCommitDag, docID codec.UUID, s 
 				return chainOutcome{winner: s.body[1], decided: true}
 			}
 		case RuleFieldMerge:
+			if v2 && s.fieldOrigin != nil {
+				nextLastWrite := i+1 < len(c.Rules) && c.Rules[i+1].Kind == RuleLastWrite
+				merged, ok, err := fieldMergeByOrigin(d, s, nextLastWrite)
+				if err != nil {
+					return chainOutcome{held: true, reason: "rule field-merge: " + err.Error()}
+				}
+				if ok {
+					return chainOutcome{winner: &merged, decided: true}
+				}
+				continue
+			}
 			if merged, ok := fieldMerge(s.base, s.body[0], s.body[1]); ok {
 				return chainOutcome{winner: &merged, decided: true}
 			}

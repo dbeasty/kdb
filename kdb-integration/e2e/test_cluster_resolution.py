@@ -19,8 +19,11 @@ Two kinds of test per rule:
   plane while one node is killed with SIGKILL and restarted; the same convergence and semantic
   checks follow.
 
-Where a scenario fails today it is marked xfail with the mechanism; the PR that added this file
-and docs/kdb-open-issues-plan.md's progress log carry the evidence.
+Every chain here is set at version 2 (peersync.ChainVersionMergeBases): the merge semantics that
+fix #130's F1 (wrong merge base), F2 (order-dependent field-merge then last-write) and F4 (validity
+before the schema arrives). Version 1 chains keep the original behaviour for meshes with nodes on
+older releases; test_upgrade.py covers that and the switch. What still fails is marked xfail with
+the mechanism: F3, procedures that are not state-based joins, which is a documentation matter.
 """
 
 from __future__ import annotations
@@ -91,9 +94,15 @@ def chain_hash(n) -> str | None:
     return body.get("hash") if status == 200 else None
 
 
-def set_chain(c: Cluster, rules: list[dict], on: int = 0) -> str:
+# KDB_E2E_CHAIN_VERSION=1 reruns the file under the original semantics, which is how the F1, F2
+# and F4 scenarios are confirmed to still catch the defects they were written for.
+CHAIN_VERSION = int(os.environ.get("KDB_E2E_CHAIN_VERSION", "2"))
+
+
+def set_chain(c: Cluster, rules: list[dict], on: int = 0, version: int = CHAIN_VERSION) -> str:
     """PUTs the chain on one node and waits for every node to hold it (through _kdb/meta)."""
-    status, body = control(c.nodes[on], "PUT", ns_path(c.nodes[on], "/resolution"), {"rules": rules})
+    status, body = control(c.nodes[on], "PUT", ns_path(c.nodes[on], "/resolution"),
+                           {"rules": rules, "version": version})
     assert status == 200, f"PUT resolution failed ({status}): {body}"
     want = body["hash"]
     wait_for("the chain to replicate to every node",
@@ -292,11 +301,6 @@ def test_field_merge_keeps_every_disjoint_field_change(make_cluster, size):
 
 
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=True, reason=(
-    "order-dependent: a value field-merge builds is attributed to the merge commit, whose "
-    "timestamp is the later head's (peersync/merge_resolution.go origin(); "
-    "peersync/conflict_detection.go mergeNonConflicting), so last-write later prefers it over a "
-    "genuinely later write of the colliding field"))
 def test_field_merge_collision_has_the_last_write_winner_everywhere(make_cluster, size):
     """n0 and then n1 write the SAME field x; afterwards n2 writes a different field c. Where the
     fields differ every change is kept (c); where they collide, last-write's winner is the later
@@ -349,12 +353,6 @@ def test_field_merge_collision_has_the_last_write_winner_everywhere(make_cluster
 
 
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=True, reason=(
-    "wrong merge base: dag.CommonAncestor (dag/ancestry.go) returns the first common ancestor in "
-    "breadth-first order from its second argument - with 5 nodes a proper ancestor of the real "
-    "one, reached in fewer hops; with 3, one of two nearest ancestors - so field-merge sees a "
-    "field only one side changed as changed by both, falls through to last-write, and the "
-    "losing side's other field changes are dropped"))
 def test_field_merge_against_the_true_merge_base(make_cluster, size):
     """Two heads whose real common history is A (a=1). Since A, one side changed a to 2 and b;
     the other changed c and e (and d is on both). Field-merge must keep all of it - a=2, b, c,
@@ -496,12 +494,10 @@ def test_validity_prefers_the_valid_value_once_every_merger_has_the_schema(make_
 
 
 @pytest.mark.parametrize("size", [3])
-@pytest.mark.xfail(strict=True, reason=(
-    "documented limitation: the chain hash does not cover the schema (server/resolution.go "
-    "peerResolution Valid), so a node that merges before the schema reaches it settles by "
-    "last-write, and everyone else fast-forwards to that merge - an invalid value survives"))
 def test_validity_before_the_schema_arrives(make_cluster, size):
-    """The same race with the merge made by a node that has not received the schema yet."""
+    """The same race with the merge attempted by a node that has not received the schema yet.
+    Under a version 2 chain it holds the conflict rather than settling by last-write, and merges by
+    validity once the schema reaches it."""
     c = make_cluster(size)
     set_chain(c, VALIDITY_CHAIN)
     doc = doc_uuid(21)
@@ -514,7 +510,10 @@ def test_validity_before_the_schema_arrives(make_cluster, size):
     must_write(c.nodes[2], doc, {"v": 2})
     time.sleep(0.02)
     must_write(c.nodes[1], doc, {"v": "bad-n1"})   # later, invalid
-    st.pull(2, 1)          # n2 merges without the schema: last-write takes n1's
+    st.pull(2, 1)          # n2 has no schema: it must hold, not settle by last-write
+    held = read_doc(c.nodes[2], doc)[0]
+    assert held == {"id": doc, "v": 2}, f"n2 settled without the schema: {held}\n{st.log}"
+    assert conflicts(c.nodes[2]), "n2 should hold the divergence until the schema arrives"
     st.mesh()
 
     final = converged_docs(c)[doc]
@@ -599,11 +598,6 @@ def digit_counts(value: int, places: int) -> list[int]:
 
 
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=True, reason=(
-    "criss-cross: a merge whose heads have several nearest common ancestors is handed ONE of "
-    "them as the base (dag.CommonAncestor via peersync/merge_resolution.go resolveDivergedLocked), "
-    "so a base-relative rule such as local+remote-base counts some increments twice or drops "
-    "them; it converges, on the wrong total"))
 def test_procedure_counter_sum_is_the_total_of_increments(make_cluster, size):
     """Each node increments a counter once while isolated, node i by 10**i, so every increment
     owns one decimal digit and the converged value says how many times each was counted. Chosen
@@ -644,10 +638,11 @@ def test_procedure_counter_sum_is_the_total_of_increments(make_cluster, size):
 
 @pytest.mark.parametrize("size", SIZES)
 @pytest.mark.xfail(strict=True, reason=(
-    "merges are state-based: a document both sides hold with the same value is not a conflict "
-    "(peersync/merge_resolution.go resolveDivergedLocked skips sameBody; peersync/join.go "
-    "joinSameContent joins equal trees), so the procedure never runs and one side's increment is "
-    "lost"))
+    "F3, by design: merges are state-based - a document both sides hold with the same value is "
+    "not a conflict (peersync/merge_resolution.go resolveDivergedLocked skips sameBody; "
+    "peersync/join.go joinSameContent joins equal trees), so the procedure never runs and one "
+    "side's increment is lost. A procedure must be a state-based join (union, max, per-node "
+    "counter fields); the user guide's counter example is being corrected separately"))
 def test_procedure_counter_sum_when_both_sides_reach_the_same_value(make_cluster, size):
     """n0 and n1 each increment the counter by 1 while isolated. Both now hold n=1, from two
     different increments; the summing procedure should make it 2."""
@@ -884,10 +879,6 @@ def descends(graph: dict[str, list[str]], commit: str, ancestor: str) -> bool:
 @pytest.mark.slow
 @pytest.mark.parametrize("kills", [0, pytest.param(2, marks=pytest.mark.destructive)])
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=False, reason=(
-    "wrong merge base (see test_field_merge_against_the_true_merge_base): under load a merge is "
-    "handed an older or a second nearest ancestor, field-merge sees a field both sides 'changed', "
-    "and last-write drops the other side's recent field writes"))
 def test_load_field_merge_keeps_each_nodes_own_field(make_cluster, size, kills):
     """Every node patches its own field of the same documents as fast as it can (with kills: one
     node is killed and restarted twice). No two nodes ever write the same field, so field-merge
@@ -960,8 +951,9 @@ def test_load_source_priority_top_node_wins(make_cluster, size):
 @pytest.mark.destructive
 @pytest.mark.parametrize("size", SIZES)
 @pytest.mark.xfail(strict=False, reason=(
-    "criss-cross merges hand a base-relative procedure one of several merge bases "
-    "(see test_procedure_counter_sum_is_the_total_of_increments); under load the total drifts"))
+    "F3 (see test_procedure_counter_sum_when_both_sides_reach_the_same_value): under load two "
+    "nodes often reach the same count from different increments, which a state-based merge never "
+    "offers the procedure, so the total falls short"))
 def test_load_procedure_counter_sum(make_cluster, size):
     """Every node increments the same counters under compare-and-set while one node is killed;
     the summing procedure must converge on exactly the number of acknowledged increments."""

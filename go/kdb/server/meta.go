@@ -319,6 +319,7 @@ func (m *MetaStore) SetResolution(ns string, c peersync.ResolutionChain) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
+	c.Normalize()
 	if err := m.pinProcedures(ns, &c); err != nil {
 		return err
 	}
@@ -432,7 +433,8 @@ func (m *MetaStore) repinChain(ns string, rt *KdbServerRuntime) error {
 	if c == nil {
 		return nil
 	}
-	next := peersync.ResolutionChain{Rules: append([]peersync.ResolutionRule{}, c.Rules...)}
+	next := *c // keeps allowUnrelated and the version, which the chain also is
+	next.Rules = append([]peersync.ResolutionRule{}, c.Rules...)
 	changed := false
 	for i := range next.Rules {
 		r := &next.Rules[i]
@@ -640,9 +642,16 @@ func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
 	case "resolution":
 		if d.Resolution == nil {
 			rt.SetResolutionChain(nil)
-		} else if err = d.Resolution.Validate(); err == nil {
+		} else if err = d.Resolution.ValidateRules(); err == nil {
+			// A chain newer than this release runs is still installed: it advertises a hash no
+			// peer matches and holds every conflict with the reason, so this node stops merging
+			// under the namespace's chain rather than carrying on under the one it held before.
+			// The error also lands in the conflict queue, where an operator sees it.
 			c := *d.Resolution
 			rt.SetResolutionChain(&c)
+			if !c.Supported() {
+				err = &peersync.ErrUnsupportedChainVersion{Version: c.Version}
+			}
 		}
 	case "procedure":
 		if d.Dropped {

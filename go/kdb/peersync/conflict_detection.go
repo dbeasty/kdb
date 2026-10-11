@@ -117,6 +117,10 @@ type ResolutionOptions struct {
 	// it does not. It is what makes a missing or stale procedure visible to peers before they
 	// merge - see ResolutionOptions.AdvertisedHash.
 	ProcedureHash func(name string) string
+	// SchemaHash returns the hash of the namespace schema this node validates against, or "" when
+	// it holds none. Under ChainVersionMergeBases a chain with RuleValidity is only compatible
+	// between nodes judging by the same schema (AdvertisedHash), and a node with none holds.
+	SchemaHash func() string
 }
 
 // ProcedureConflict is one conflicting document as RuleProcedure passes it on. Side 0 is the
@@ -144,6 +148,23 @@ func (o ResolutionOptions) AdvertisedHash() string {
 	base := o.Chain.Hash()
 	if base == "" {
 		return ""
+	}
+	if !o.Chain.Supported() {
+		// A chain version this release does not run: it must not merge under it, and must not
+		// look like a node that would.
+		return "unsupported:" + base
+	}
+	if o.Chain.mergeBases() && o.Chain.hasRule(RuleValidity) {
+		// Validity's answer depends on the schema, so two nodes judging by different schemas
+		// would build different merges: under version 2 the schema is part of what must agree
+		// (#130, F4). Version 1 chains advertise exactly what they always did.
+		schema := "none"
+		if o.SchemaHash != nil {
+			if h := o.SchemaHash(); h != "" {
+				schema = h
+			}
+		}
+		base += ";schema=" + schema
 	}
 	for _, r := range o.Chain.Procedures() {
 		have := ""

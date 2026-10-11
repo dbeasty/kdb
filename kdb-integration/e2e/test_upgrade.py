@@ -271,6 +271,113 @@ def test_deepen_peer_option_recovers_a_stuck_snapshot_joiner(make_cluster):
     converge(c, acked, "stuck joiner restarted with deepen=true", timeout=60)
 
 
+# -- resolution chain versions ---------------------------------------------------------------
+
+FIELD_MERGE_CHAIN = [{"kind": "field-merge"}, {"kind": "last-write"}]
+
+
+def chain_of(n) -> dict:
+    status, body = control(n, "GET", ns_path(n, "/resolution"))
+    assert status == 200, body
+    return body
+
+
+def put_chain(n, rules: list[dict], version: int | None = None) -> str:
+    req: dict = {"rules": rules}
+    if version is not None:
+        req["version"] = version
+    status, body = control(n, "PUT", ns_path(n, "/resolution"), req)
+    assert status == 200, f"PUT resolution on {n.binary or 'new'} failed ({status}): {body}"
+    return body["hash"]
+
+
+def wait_chain(c: Cluster, want: str, nodes=None, timeout: float = 30.0) -> None:
+    nodes = nodes if nodes is not None else c.nodes
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(chain_of(n).get("hash") == want for n in nodes):
+            return
+        time.sleep(0.2)
+    raise AssertionError("the chain did not replicate:\n" +
+                         "\n".join(f"n{i}: {chain_of(n).get('hash')}" for i, n in enumerate(nodes)))
+
+
+def test_resolution_chain_version_2_after_a_rolling_upgrade(make_cluster):
+    """Version 2 chains (#130's F1, F2, F4 merge semantics) change what a merge builds, so they are
+    gated: a chain without a version keeps the original semantics on every node, byte for byte -
+    the same chain hash on v0.6.2 and on this build - and an operator switches it to version 2
+    once every node runs this build.
+
+    1. Three v0.6.2 nodes with a version 1 [field-merge, last-write] chain; one upgraded. Old and new
+       advertise the same chain hash and the mixed mesh merges concurrent field writes and
+       converges, as before.
+    2. Everyone upgraded, the chain switched to version 2: the ordered F2 scenario (n0 then n1
+       write x, n2 writes c; n2 merges n0 first, n1 merges that) converges on n1's x - the later
+       write - which version 1 does not.
+    3. What v0.6.2 does with a version 2 chain, recorded: it ignores the unknown field and keeps
+       the version 1 hash, so it never matches a version 2 node and they do not merge each other.
+    """
+    from test_cluster_resolution import Stages, must_write, read_doc, doc_uuid
+
+    c = make_cluster(3, service_bins=[PREV] * 3, control_write=True)
+    acked = Acked()
+    v1 = put_chain(c.nodes[0], FIELD_MERGE_CHAIN)
+    wait_chain(c, v1)
+
+    c.switch_binary(0, NEW)
+    converge(c, acked, "n0 upgraded")
+    assert chain_of(c.nodes[0]).get("hash") == v1, "this build hashes a version 1 chain differently"
+    assert chain_of(c.nodes[0]).get("advertisedHash") == v1
+
+    # Concurrent writes of different fields of the same documents, on old and new nodes alike.
+    docs = [doc_uuid(500 + k) for k in range(3)]
+    for d in docs:
+        must_write(c.nodes[1], d, {"id": d, "f0": 0, "f1": 0, "f2": 0})
+    converge(c, acked, "mixed, seeded")
+    for rnd in range(3):
+        for i, n in enumerate(c.nodes):
+            for d in docs:
+                must_write(n, d, {f"f{i}": rnd + 1})
+    converge(c, acked, "mixed mesh, version 1 chain")
+    for d in docs:
+        assert read_doc(c.nodes[2], d)[0] == {"id": d, "f0": 3, "f1": 3, "f2": 3}
+
+    c.switch_binary(1, NEW)
+    c.switch_binary(2, NEW)
+    converge(c, acked, "all new, version 1 chain")
+
+    v2 = put_chain(c.nodes[1], FIELD_MERGE_CHAIN, version=2)
+    assert v2 != v1
+    wait_chain(c, v2)
+    doc = doc_uuid(510)
+    must_write(c.nodes[0], doc, {"id": doc, "x": "base", "c": 0})
+    converge(c, acked, "version 2 seeded")
+    st = Stages(c)
+    st.isolate()
+    must_write(c.nodes[0], doc, {"x": "n0"})
+    time.sleep(0.05)
+    must_write(c.nodes[1], doc, {"x": "n1"})
+    time.sleep(0.05)
+    must_write(c.nodes[2], doc, {"c": 2})
+    st.pull(2, 0)
+    st.pull(1, 2)
+    st.mesh()
+    converge(c, acked, "version 2, ordered F2 merges")
+    for i, n in enumerate(c.nodes):
+        assert read_doc(n, doc)[0] == {"id": doc, "x": "n1", "c": 2}, f"n{i}\n{st.log}"
+
+    # v0.6.2 under a version 2 chain: no merges with version 2 nodes, by hash.
+    c.switch_binary(2, PREV)
+    deadline = time.time() + 30
+    while time.time() < deadline and chain_of(c.nodes[2]).get("hash") != v1:
+        time.sleep(0.2)
+    assert chain_of(c.nodes[2]).get("hash") == v1, (
+        "v0.6.2 should read the version 2 chain as its version 1 rules (it ignores the unknown "
+        f"field): {chain_of(c.nodes[2])}")
+    c.switch_binary(2, NEW)
+    converge(c, acked, "all new again")
+
+
 # -- SQL across versions ---------------------------------------------------------------------
 
 def test_sql_schema_and_rows_from_old_nodes_read_and_extended_on_new(make_cluster):
