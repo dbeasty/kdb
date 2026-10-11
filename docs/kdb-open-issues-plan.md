@@ -163,7 +163,7 @@ readable data but still can't read JVM/Go-written compressed data. Say so in the
 ### U6. Issue #43 — acknowledged write unreadable after `kill -9` — L, in four steps
 
 **Status: U6a done** (#112, which also added the multi-node suite); **U6c done** (#121; see the
-progress log, which also records a third silent path it found); **U6b and U6d in progress.**
+progress log, which also records a third silent path it found); **U6b done** (this PR: the server-path reproducer, plus a nightly Linux soak); **U6d: no loss reproduced** in 620 kills across five configurations (110,950 acknowledged writes). #43 stays open until the nightly Linux soak has run (see the progress log).
 
 The durability contract is the most important open item. It is sequenced so each step is its own PR
 and each makes the next one possible. **Do not relax or retry the test** at any step.
@@ -672,3 +672,40 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   is wrong, because a torn tail from an earlier killed run legitimately ends a segment that is no
   longer the newest. The correct test is "intact frames after the stop" (the #81 rule;
   `SkimSegment` / `DamageTolerantReader` can already read past damage).
+
+- **2026-10-11 — U6b and U6d (issue #43).** U6b: `go/kdb/integration/kill9_server_test.go` builds
+  the real `kdb-service` and, on ONE data directory, repeatedly: six connections write their own
+  documents over the wire (`PutJSON` replaces and `Upsert` merges; writer 0 reconnects for every
+  write, the e2e test's shape), the process is SIGKILLed at a random moment, it restarts with
+  `GOMAXPROCS=2`, and every write acknowledged in ANY iteration so far must read back at its
+  acknowledged value or later. So recovery is tested on top of recovered data, kill after kill.
+  It reports missing, rolled-back and unreadable documents separately, keeps the data directory
+  and every launch's log, and prints a seed to replay the kill timing. `KDB_KILL9_ITERATIONS` and
+  `KDB_KILL9_SERVICE_ARGS` set the soak. **Control:** with `--durability async`, which may lose
+  acknowledged writes by design, it fails on the first kill with every document reported rolled
+  back, so a pass means something. It runs 3 kills in the normal suite, and a new nightly job
+  (`kill9-soak` in `e2e-nightly.yml`) runs 150 + 60 on Linux, where #43 was seen, uploading the
+  data directory on failure.
+  U6d results, macOS, every acknowledged write intact in all of them:
+
+  | Configuration | Kills | Acknowledged writes |
+  |---|---|---|
+  | default (`sync`) | 300 | 36,462 |
+  | checkpoints mid-load (`--maintenance-interval 200ms`) | 80 | 14,803 |
+  | `history=none`, 1 s retention (old segments deleted) | 80 | 32,503 |
+  | tiny document, ops and tree caches (reads from the log) | 80 | 11,543 |
+  | preallocated segments + `--sync-mode fast` | 80 | 15,819 (slowest restart 9.7 s; see N4) |
+
+  So the server's acknowledge-then-crash path holds on this machine. The original #43 failure
+  reported its FIRST document (`...01`) as lost, and the old test reported any failed read as lost
+  (fixed in U6a), so a read error after restart is as likely as data loss. #43 stays open until
+  the nightly Linux soak has run. Found along the way, both with their own PRs:
+  **(N4)** crash-recovery startup costs commits × SSTable size: `LsmBlobStore.Lookup` builds a
+  fresh reader per lookup, and `DefaultReader.Index()` reads the WHOLE table in 8 KB chunks just
+  to learn its size, then re-parses the footer index, on every lookup. Replay probes every tree
+  object, so 14,736 commits with no checkpoint took 28 s to open (24 documents, a 1.3 MB table).
+  That surfaced as "not ready after 30 s" in the preallocation run; the test now waits 2 minutes
+  and reports the slowest restart instead. Fix: `perf/sstable-index-cache`.
+  **(N5)** the third silent recovery path from U6c: damage in the middle of a segment that is no
+  longer the newest truncates that segment at the damage, with no error.
+
