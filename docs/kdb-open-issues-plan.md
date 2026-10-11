@@ -300,7 +300,7 @@ and commit-graph plans. These are listed so they're tracked, not scheduled.
 
 | # | Item | State at `e125a10` | First step |
 |---|---|---|---|
-| R1 | Real zstd on Kotlin JS/Native | **Done** 2026-10-11 (branch `feat/zstd-js-native`): pure-Kotlin decoder and encoder in `kdb-compression` commonMain, both directions on both targets — see the progress log | — |
+| R1 | Real zstd on Kotlin JS/Native | **Done** 2026-10-11 (#116, branch `feat/zstd-js-native`): pure-Kotlin decoder and encoder in `kdb-compression` commonMain, both directions on both targets — see the progress log | — |
 | R2 | Go LSM leveled compaction | `LsmBlobStore.Compact` always merges to one table (`sstable/types.go:235-294`) | Measure write amplification at realistic sizes first |
 | R3 | Commit graph on disk | Phase 1 (generation numbers) + settings landed, off by default; `KDB_GRAPH_FILE` is accepted and ignored (`config/descriptors.go:625-627`) | **Phase 0 measurement** at 100k/500k/2M commits; it gates the rest (`docs/kdb-commit-graph-on-disk.md`). Also: stop accepting the ignored flag, or warn. |
 | R4 | Kotlin history-mode parity | wire messages 0x1F-0x22 are Go-only; Kotlin NONE is validator-only | Decide whether Kotlin needs NONE at all (it's the embedded/reference tree) |
@@ -436,7 +436,7 @@ notes close v0.6.1's known issue.
   integration-level flake does not reproduce locally, so the unit tests above are the before/after
   evidence. `:kdb-transport-tcp:jvmTest`, `:kdb-transport-ws:jvmTest`, `:kdb-jdbc:test` green.
 
-### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (branch `feat/zstd-js-native`)
+### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (#116, branch `feat/zstd-js-native`)
 
 - **Choice.** A pure-Kotlin codec in `kdb-compression`'s commonMain, used by both JS and Native;
   the JVM keeps zstd-jni. Rejected: `fzstd` (decoder only, and JS only), `@bokuweb/zstd-wasm` /
