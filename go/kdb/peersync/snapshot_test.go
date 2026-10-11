@@ -131,8 +131,10 @@ func TestSyncFallsBackToSnapshotBelowHorizon(t *testing.T) {
 }
 
 // TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot: the peer has a side branch forked below
-// the commit this node was bootstrapped from. Its parents can never arrive, so the branch is
-// reported and skipped - and main keeps syncing, now and on every later sync.
+// the commit this node was bootstrapped from. Main keeps syncing, now and on every later sync. The
+// branch used to be reported and skipped for good - its fork point is behind this node's root, and
+// the peer, counting it held, never sends it. It is now taken in: the fork point's state arrives
+// as a shallow root of this node's own (boundary.go), and the branch is created.
 func TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot(t *testing.T) {
 	ns := "app/snap-side"
 	remote := newTestNamespaces(t, ns)
@@ -152,12 +154,21 @@ func TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot(t *testing.T) {
 	next := writeAtHead(t, r, ns, newUUID(t), `{"d":1}`)
 	for i := 0; i < 2; i++ {
 		res := syncV2(t, "hub-snap-side", local, V2ClientConfig{Namespaces: []string{ns}, Mode: SyncPull})
-		if res.Namespaces[0].RefErrors["branch:feature"] == "" {
-			t.Fatalf("sync %d: the unreachable branch was not reported: %+v", i, res.Namespaces[0])
+		if e := res.Namespaces[0].RefErrors["branch:feature"]; e != "" {
+			t.Fatalf("sync %d: the branch forked below the root was refused: %s", i, e)
 		}
 		if mustHead(t, local.side(ns)) != next.Hash {
 			t.Fatalf("sync %d: main stopped following the peer", i)
 		}
+		if b, ok := local.side(ns).dag.GetBranch("feature"); !ok || b.HeadHash != side.Hash {
+			t.Fatalf("sync %d: the side branch was not taken: %+v", i, res.Namespaces[0])
+		}
+		if want := 1 - i; len(res.Namespaces[0].BoundaryExtended) != want {
+			t.Fatalf("sync %d: fork points taken in: %v, want %d", i, res.Namespaces[0].BoundaryExtended, want)
+		}
+	}
+	if !local.side(ns).dag.IsShallow(f.Hash) {
+		t.Fatal("the fork point should be a shallow root here")
 	}
 }
 

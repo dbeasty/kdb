@@ -64,6 +64,8 @@ type ServiceSettings struct {
 	MaxConnections int
 	// ScanRowBudget caps rows examined per scan (§5.2), not merely rows returned.
 	ScanRowBudget int
+	// MaxResultRows bounds the rows one SQL reply may carry; a larger result is RESOURCE_EXHAUSTED.
+	MaxResultRows int
 	AbortAfter    time.Duration
 	DrainTimeout  time.Duration
 	// MaintenanceInterval is how often the background maintenance loop considers a pass over
@@ -159,6 +161,7 @@ func DefaultServiceSettings() ServiceSettings {
 		MemoryReserveMB: int(server.DefaultRescueReserveBytes >> 20),
 		MaxConnections:  server.DefaultMaxConnections,
 		ScanRowBudget:   int(server.DefaultScanRowBudget),
+		MaxResultRows:   server.DefaultMaxResultRows,
 		// sync: an acknowledged write is on disk. Group commit (see
 		// embed.commitLogWriter) amortizes the fsync across concurrent writers,
 		// so this is the safe default without being the slow one it used to be.
@@ -193,6 +196,7 @@ type ServiceFile struct {
 	MemoryReserveMB        *int            `json:"memoryReserveMb"`
 	MaxConnections         *int            `json:"maxConnections"`
 	ScanRowBudget          *int            `json:"scanRowBudget"`
+	MaxResultRows          *int            `json:"maxResultRows"`
 	AbortAfter             *string         `json:"abortAfter"`
 	DrainTimeout           *string         `json:"drainTimeout"`
 	MaintenanceInterval    *string         `json:"maintenanceInterval"`
@@ -283,6 +287,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		setIf(&s.MemoryReserveMB, file.MemoryReserveMB)
 		setIf(&s.MaxConnections, file.MaxConnections)
 		setIf(&s.ScanRowBudget, file.ScanRowBudget)
+		setIf(&s.MaxResultRows, file.MaxResultRows)
 		budgetSet = budgetSet || file.MemoryBudgetMB != nil
 		limitSet = limitSet || file.MemoryLimitMB != nil
 		if err := setDurationIf(&s.AbortAfter, file.AbortAfter, "abortAfter"); err != nil {
@@ -401,6 +406,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envInt("KDB_SCAN_ROW_BUDGET", &s.ScanRowBudget); err != nil {
 		return s, err
 	}
+	if err := envInt("KDB_MAX_RESULT_ROWS", &s.MaxResultRows); err != nil {
+		return s, err
+	}
 	if err := envDuration("KDB_ABORT_AFTER", &s.AbortAfter); err != nil {
 		return s, err
 	}
@@ -466,6 +474,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"memory-reserve-mb", func() { s.MemoryReserveMB = flags.MemoryReserveMB }},
 		{"max-connections", func() { s.MaxConnections = flags.MaxConnections }},
 		{"scan-row-budget", func() { s.ScanRowBudget = flags.ScanRowBudget }},
+		{"max-result-rows", func() { s.MaxResultRows = flags.MaxResultRows }},
 		{"abort-after", func() { s.AbortAfter = flags.AbortAfter }},
 		{"drain-timeout", func() { s.DrainTimeout = flags.DrainTimeout }},
 		{"maintenance-interval", func() { s.MaintenanceInterval = flags.MaintenanceInterval }},
@@ -515,6 +524,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	}
 	if s.MaxConnections < 0 {
 		return s, fmt.Errorf("max-connections must be >= 0 (0 means unlimited), got %d", s.MaxConnections)
+	}
+	if s.MaxResultRows < 1 {
+		return s, fmt.Errorf("max-result-rows must be >= 1, got %d", s.MaxResultRows)
 	}
 	if s.ScanRowBudget < 0 {
 		return s, fmt.Errorf("scan-row-budget must be >= 0 (0 means unlimited), got %d", s.ScanRowBudget)

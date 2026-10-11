@@ -240,7 +240,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			if err != nil {
 				return err
 			}
-			for _, c := range adopting {
+			for _, c := range adoptable(env.DAG, adopting) {
 				if cerr := env.CheckCommit(c); cerr != nil {
 					res.Outcome = CommitPushOutcome{Kind: OutcomeConflict}
 					_ = env.noteConflict("branch:"+mainBranch, localHead, incomingHead, &kdberr.ConflictReport{
@@ -512,6 +512,7 @@ func fastForward(env IngestEnv, localHead, incomingHead codec.Hash) (AdvanceStep
 	if err != nil {
 		return AdvanceStep{}, err
 	}
+	commits = adoptable(env.DAG, commits)
 	applied := netEffect(commits)
 	if env.ApplyToStorage {
 		if err := applyAndVerify(env, localHead, incomingHead, applied); err != nil {
@@ -655,6 +656,23 @@ func commitsBetween(d *dag.InMemoryCommitDag, head, base codec.Hash) ([]document
 		queue = append(queue, c.ParentHashes...)
 	}
 	return topoSort(inRange), nil
+}
+
+// adoptable drops shallow roots from commits a head move is about to adopt. A shallow root - a
+// snapshot's root, a graft, or a commit behind this node's root whose state a pull took in
+// (boundary.go) - was admitted and logged on its own, and is never newly reachable history: its
+// operations are the change from parents this node does not hold, so applying them, logging them
+// again, checking them against a home's fence or announcing them to commit listeners as if main had
+// just taken them would all be wrong. The merge above such a root already carries every document
+// its parents disagree on.
+func adoptable(d *dag.InMemoryCommitDag, commits []document.Commit) []document.Commit {
+	out := commits[:0:0]
+	for _, c := range commits {
+		if !d.IsShallow(c.Hash) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // topoSort orders commits parents first (Kahn's algorithm over edges inside the set), breaking

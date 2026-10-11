@@ -345,6 +345,152 @@ _(append one entry per unit: date, unit, PR, commit, and anything found along th
   panic. `Set` is the one production caller (`sql/dml.go`, SQL `UPDATE ... SET` on a JSON path), so
   that path was reachable from a SQL statement; it now gets an error. Table test
   `go/kdb/json/getter_errors_test.go` fails with panics on `main`.
+### 2026-10-11 — U2: `kdb/server` in the embeddable Go bundle
+
+PR #108 (branch `fix/embedbundle-kdb-server`, commit `c043449`), supersedes #26 (left open for the user to close).
+`kdb/server` added to `go/embedbundle/entrypoints.txt`; #26's EMBEDDING.md and README text carried
+over; `docs/kdb-release-plan.md` §2.1, §2.2, §2.3, §2.5 and §7.1 rewritten from `main`'s version;
+`Makefile` comment updated; new `go/embedbundle/main_test.go` asserts every entry point is in the
+computed closure and no file in any closure package imports `"C"` (counts deliberately not
+asserted). Probed it: a temporary `import "C"` file in `kdb/server` fails the test.
+
+Measured on this branch (regenerated, not copied from the plan):
+- Closure **27 → 40 packages**; the 13 added are `server`, `wire`, `transport/{core,tcp,ws}`,
+  `peersync`, `stream`, `version`, `script`, `index/{analyzer,fulltext,stores,vector}`.
+- Bundle **426 → 665 files** (bundle.json manifest), 2.45 → 4.58 MB unpacked,
+  **913,545 → 1,655,615 bytes zipped** (~914 KB → ~1.66 MB). The plan's ~907 KB / ~1.64 MB were
+  slightly stale; `main`'s release plan still said 351 files / ~708 KB, older still.
+- Skipped test files: `kdb/embed/database_backup_test.go`, `kdb/server/backup_txn_test.go`,
+  `kdb/server/panic_recovery_test.go`; `kdb/transaction/procedure_resolver_test.go` now ships
+  (its `kdb/script` import is in the closure).
+- New bundle requires: `dop251/goja` (from `kdb/script`) and `golang.org/x/sync` (from
+  `kdb/server`), plus indirects `dlclark/regexp2/v2`, `go-sourcemap/sourcemap`, `google/pprof`,
+  `x/text` — 14 → 18 indirects. All pure Go.
+
+Gates: `scripts/verify-bundle.sh` on the 40-package bundle passes (build, vet, `go test` all 40
+ok, cross-compile linux/amd64, linux/arm64, darwin/arm64); the bundle also builds for
+windows/amd64 and js/wasm; `CGO_ENABLED=0 go build ./kdb/server` passes on all five platforms;
+two runs into different output directories produce a byte-identical zip; `go vet ./...` and
+`go test -race ./embedbundle/...` pass.
+
+Found along the way: `main`'s §2.2 said "27 of the module's 37 top-level packages" and its
+excluded list named packages that no longer match the tree; the module has 59 `kdb/...` packages,
+and the excluded list now names the real 19 (incl. `replication`, `syncnode`, `storage/manager`).
+No convention existed for notes between releases, so this adds `docs/releases/unreleased.md`
+(renamed at the `VERSION` bump) and documents it in the release plan §4. The v0.6.2 known issue is
+recorded there as fixed; `docs/releases/v0.6.2.md` is left as shipped, matching how v0.6.2's own
+notes close v0.6.1's known issue.
+- **2026-10-11, U5** (branch `fix/js-native-codec-none`): `ZstdCompression.isAvailable` (an
+  `expect val`, true only on the JVM). On JS/Native, `compress`/`decompress` now throw
+  `ZstdUnavailableException` instead of the length-prefix stub. `SsTableCodec.encodeBlock` and
+  `DeltaPageCodec.frame` write `CODEC_NONE` when zstd is not available, and the sealed
+  `DeltaSegmentRef` reports the codec actually used. `DefaultSsTableWriter` takes an optional
+  `codec` (default ZSTD) so the JVM can export the NONE shape. The ice-bundle writer
+  (`kdb-storage-tier`) stores plain JSON there; its reader already falls back to raw bytes.
+  New physical goldens `sstable_segment_none.hex` and `delta_segment_none.hex` are read by Go.
+  The delta one is compared byte for byte.
+  `golden-freshness` and `make test-physical-golden` now also fail on *untracked* fixtures:
+  `git diff` ignored them, so a new exporter file nobody committed would have passed. The
+  js/native/common codec tests failed (codec byte 1, want 0) with the old stub and writers put
+  back. Found along the way, existing data: JS persistence is in memory
+  (`BrowserSegmentByteStore`), so none survives. **Native does persist to real files**
+  (`NativeSegmentByteStore`). A Native data directory written before U5 holds ZSTD-tagged
+  length-prefixed blocks, and Native now refuses those with `ZstdUnavailableException` instead
+  of reading them back. No Native or JS artifact has ever been released (releases ship Go
+  binaries and JVM jars only), and no fixture or test in the repo holds JS/Native-written files.
+  Still open: JS/Native cannot read JVM/Go zstd data (R1).
+### 2026-10-11 — U7: Kotlin transport shutdown leaks (branch `fix/kotlin-transport-shutdown`)
+
+- **Repro first.** `TcpLoopbackServerShutdownTest` (2) and `NetworkWebSocketServerShutdownTest` (3)
+  install a default `Thread.UncaughtExceptionHandler` and stop each server with a connected client.
+  On `main` all five fail: TCP leaks `ConnectionClosedException` when a client disconnects, the WS
+  server leaks `SocketException: Socket closed` on **every** `stop()` (idle or not), and both
+  `stop()`s return before their handlers finish.
+- **Fix.** `TcpLoopbackServer` and `JvmNetworkWebSocketServer`: the per-connection handler catches
+  `ConnectionClosedException` (TCP also an `IOException`, but only once `stop()` has begun); the
+  accept loops treat `SocketException` as the normal exit only when the server is stopping or the
+  socket is closed (the WS loop now rethrows anything else). `stop()` cancels, closes the server
+  socket, closes the sockets of handlers still running, and joins — inside
+  `withContext(NonCancellable + Dispatchers.IO)`. `launchTcpHandler` and the WS `listen` wrapper also
+  catch `ConnectionClosedException`. `TcpLoopbackServer(scope = …)` now runs under a child job, so
+  `stop()` no longer cancels a caller-supplied scope. `CancellationException` is never caught.
+- **Found along the way.**
+  - The old `stop()` did `withContext(Dispatchers.IO) { serverSocket.close() }`. Called from a
+    cancelled coroutine — which is exactly what `JvmWebSocketWireTransport.listen`'s
+    `finally { server.stop() }` does after `awaitCancellation()` — that `withContext` throws
+    immediately, so cancelling a WS `listen` never closed its listening socket.
+  - Joining in `stop()` is only safe if handlers blocked in socket reads are unblocked: a client
+    that connects and never sends its HTTP upgrade request would otherwise hang `stop()` forever
+    (cancellation does not interrupt a blocking read). Hence closing in-flight sockets;
+    `stopDuringHandshake_doesNotHang` fails (10 s timeout) if that sweep is removed.
+  - Not fixed (out of scope): `JvmTcpWireTransport.listen` blocks in `accept()` and cannot be
+    cancelled until a connection arrives, and its handlers (one fresh scope each) and the WS
+    `listen` handlers (`listenScope`) are not children of the `listen` call, so cancelling `listen`
+    leaves running connections behind.
+- **Tests.** Ad-hoc `CoroutineScope(...)`/`cancel()` in the four WebSocket integration tests moved to
+  the class `testScope` (joined in `@AfterTest`); `listenAccept_twoClients` bounded with
+  `withTimeout`.
+- **Evidence.** `:kdb-integration:test` with `-XX:ActiveProcessorCount=2` (init script,
+  `--rerun-tasks`), load average 30–50: 9/9 runs green (40 tests) with the fix. The same loop on
+  `main`'s sources was also 6/6 green, with no `Exception in thread` in captured stderr — the
+  integration-level flake does not reproduce locally, so the unit tests above are the before/after
+  evidence. `:kdb-transport-tcp:jvmTest`, `:kdb-transport-ws:jvmTest`, `:kdb-jdbc:test` green.
+### 2026-10-11 — N1 (new, found by multi-node e2e): snapshot-bootstrapped node stuck on "missing parent" — PR #111, branch `fix/shallow-node-missing-parent`, commit `0641f37`
+
+**Found by** the multi-node e2e `test_cluster.py::test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes`
+(sibling worktree `e2e-multi`, not on `main` yet), 3/3: a node joining a busy three-writer mesh
+with `bootstrap=snapshot` failed every replication cycle, for ever, with
+`peer sync: storing commit C: missing parent P`. `consecutiveFailures` grew without bound.
+
+**Root cause.** The joiner's snapshot root S was a merge with parents [Q, P]. Another node went on
+committing on P (C, parent P) before it saw S. The sender computes a pack as "reachable from my head
+minus the ancestor closure of the receiver's haves" (`peersync/refs.go` `MissingCommitsFrom`,
+`have := d.AncestorSetOf(haves)`); P is an ancestor of S, so it was treated as held and never sent.
+A shallow node holds nothing behind S, so `StoreCommits` (`peersync/ingest.go`) refused C. The
+existing single-source test never forks behind the boundary, and `TestSnapshotReplicaFollowsMainDespiteBranchBelowRoot`
+had enshrined the side-branch half of this as unfixable ("its parents can never arrive").
+
+**Fix (no wire change, Go only - Kotlin has no v2 sync).**
+- Receiver (`peersync/boundary.go`, called from `fetchRef`): a page commit whose parent is neither in
+  the page nor held, on a node with shallow roots, and not itself one of the peer's shallow roots
+  (that case stays Graft's), has its parent's *state* taken in by `SNAPSHOT_FETCH` at the parent and
+  admitted as a shallow root through Graft's durable path (`admitRootFromState`: foreign tree, marker
+  `graftRoots` before the log frame). No `allowUnrelated` needed: the parent is history S already
+  descends from. One state transfer per fork point; no history is fetched.
+- Host (`peersync/snapshot_state.go`): a node never builds a tree for a commit it merged rather than
+  fast-forwarded onto, so `SNAPSHOT_FETCH` at such a commit failed "no tree". It now folds the commit's
+  first-parent chain forward from the nearest tree it holds, checks the result against the declared
+  tree hash, and serves that (cached for the snapshot's later pages). A pre-fix host still answers
+  "no tree", which the joiner reports as below.
+- Adoption (`peersync/ingest.go` `adoptable`): shallow roots are dropped from the commits a
+  fast-forward or merge adopts - they were logged on their own, and their operations are a change
+  from parents this node lacks; re-logging them, fence-checking them or announcing them to commit
+  listeners was wrong (by inspection the same already happened to graft roots).
+- Surfacing: when the parent's state cannot be had, the pull fails with a typed
+  `peersync.ShallowBoundaryError` naming both commits and pointing at deepen; that text is what
+  `/v1/peers` `lastError` and the namespace's `lastError` show. Successful extensions are in
+  `NamespaceSyncResult.BoundaryExtended` and logged by the replicator. An automatic *full* deepen
+  fallback was rejected: it defeats snapshot bootstrap, and FETCH_REQUEST has no depth to bound it.
+
+**Tests.** `server/shallow_boundary_test.go` (file-backed joiner, real `PutJSON` writes, memory and
+file-backed source): fast-forward across the fork point, a real merge on the joiner that traces a
+value down to the fork point's tree, clean restart, crash replay onto the bootstrap checkpoint, and
+deepen-after-extension with a no-checkpoint replay. `peersync/boundary_test.go`: the fork point is
+logged once, not re-adopted; a failure is a `ShallowBoundaryError` and leaves nothing resident.
+Revert-confirmed: without the receiver change the server tests fail with the original
+"missing parent"; without the host fold they fail "no tree"; without `adoptable` the fork point is
+logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parametrizations).
+
+**Not fixed, found along the way.**
+- The push direction (by inspection, not reproduced): a node that dials a shallow host and pushes it a branch forked behind the
+  host's root still gets "missing parent" from the host, which cannot fetch from its client. It
+  heals once the shallow node pulls from anyone; a shallow node that is only ever dialled stays
+  stuck on that ref. The pusher has the host's advertised horizon and could send the fork point's
+  state first (as `graftRootsFor` does for its own roots); not done here.
+- A `history=none` (replay strategy) receiver cannot hold the fork point's tree
+  (`ErrForeignTreeNeedsObjects`), so it gets the typed error and has to deepen.
+- 2026-10-11 — Scan cap (silent truncation at `MaxRows` before `WHERE`): found by qtask, Go fix on
+  `fix/scan-cap-before-filter`. Follow-on units live in `docs/kdb-scan-cap-plan.md`.
 - **2026-10-11 — new item, found by multi-node e2e testing: a drained node checkpointed peer
   commits it never logged** (branch `fix/checkpoint-unlogged-peer-commits`, PR #113, commit 70424df). SIGTERM a
   node of a 3-node mesh under concurrent writes and, in 5 of 20 runs here, the restarted node failed

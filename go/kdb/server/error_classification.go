@@ -62,6 +62,12 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 		// as much next time.
 		return wire.ErrorCodeResourceExhausted, nil
 	}
+	var tooManyRows *sql.ResultRowLimitError
+	if errors.As(err, &tooManyRows) {
+		// The same query returns the same too-large result next time; only a LIMIT or a
+		// narrower predicate helps.
+		return wire.ErrorCodeResourceExhausted, nil
+	}
 	var conflict *ConflictError
 	if errors.As(err, &conflict) {
 		// Retryable, but only after re-reading: the transaction as submitted is anchored on a

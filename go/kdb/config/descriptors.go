@@ -250,6 +250,14 @@ func serviceSpecs() []settingSpec {
 			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.ScanRowBudget = &n }, 0),
 		},
 		{
+			key: "governance.maxResultRows", flag: "max-result-rows", env: "KDB_MAX_RESULT_ROWS",
+			scope: ScopeProcess, mutability: MutabilityRestart, unit: "rows",
+			help:      "most rows one SQL reply may carry; a larger result fails with RESOURCE_EXHAUSTED rather than being cut short. Raise it for applications that read whole collections; it also sizes the memory admission control reserves per query",
+			value:     num(func(s ServiceSettings) int { return s.MaxResultRows }),
+			inFile:    func(f *ServiceFile) bool { return f.MaxResultRows != nil },
+			setInFile: setIntInFile(func(f *ServiceFile, n int) { f.MaxResultRows = &n }, 1),
+		},
+		{
 			key: "governance.abortAfter", flag: "abort-after", env: "KDB_ABORT_AFTER",
 			scope: ScopeProcess, mutability: MutabilityRestart,
 			help:   "if memory pressure stays tripped this long with no recovery, shut down orderly and exit 75. Requires a process supervisor. 0 disables",

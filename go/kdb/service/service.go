@@ -93,6 +93,7 @@ func Main() {
 	fs.IntVar(&flagVals.MemoryLimitMB, "memory-limit-mb", flagVals.MemoryLimitMB, "DEPRECATED alias for --memory-budget-mb, retained for existing configs. Its old meaning is preserved: an explicit 0 disables governance (whereas --memory-budget-mb 0 auto-detects). The old guidance to set this to only 60-80% of the container limit no longer applies - it was a workaround for the reactive sampler this replaces")
 	fs.IntVar(&flagVals.MemoryReserveMB, "memory-reserve-mb", flagVals.MemoryReserveMB, "rescue reserve held back from the grant system and released on entry to the Critical pressure zone, so in-flight commits can finish, storage can be flushed, and typed rejections can be written instead of the process dying partway through (kdb-spec-layer13 Component 48 §5.6)")
 	fs.IntVar(&flagVals.MaxConnections, "max-connections", flagVals.MaxConnections, "cap on concurrently-accepted connections per listener; connections past the cap are closed at accept time. Each accepted connection costs a goroutine stack and a frame buffer whether or not it sends anything, none of which admission control can see - 0 means unlimited (kdb-spec-layer13 Component 49 §6.5)")
+	fs.IntVar(&flagVals.MaxResultRows, "max-result-rows", flagVals.MaxResultRows, "most rows one SQL reply may carry (default 10000). A larger result fails with RESOURCE_EXHAUSTED instead of being silently cut short; raise it for applications that read whole collections. It also sizes the memory admission control reserves per query, so it interacts with --memory-budget-mb")
 	fs.IntVar(&flagVals.ScanRowBudget, "scan-row-budget", flagVals.ScanRowBudget, "maximum rows a single scan may examine (not merely return) before it is aborted with RESOURCE_EXHAUSTED; shrinks automatically as memory pressure rises. 0 means unlimited (kdb-spec-layer13 Component 48 §5.2)")
 	fs.DurationVar(&flagVals.AbortAfter, "abort-after", flagVals.AbortAfter, "if memory pressure (see --memory-budget-mb) stays tripped for at least this long with no recovery, perform an orderly shutdown (stop accepting new work, flush/seal storage, exit 75) instead of staying up indefinitely rejecting writes - see kdb-spec-layer13 Component 50. Requires a process supervisor (Docker --restart=on-failure, systemd Restart=on-failure) to actually restart the service; this process never restarts itself. 0 disables (default) - this should be rare enough in practice that leaving it off is a reasonable default until you have evidence otherwise")
 	fs.StringVar(&flagVals.TLSCert, "tls-cert", flagVals.TLSCert, "PEM certificate file - set together with --tls-key to require TLS on the SQL/peer-sync/stream listeners (each --*-addr's scheme is upgraded from tcp:// to tcps:// automatically)")
@@ -278,6 +279,7 @@ func Main() {
 	}
 
 	srv := server.NewKdbServerRuntime(rt)
+	srv.SetMaxResultRows(cfg.MaxResultRows)
 
 	switch peerConflictPolicy {
 	case "", "strict":
