@@ -117,7 +117,7 @@ public class DefaultQueryPlanner : QueryPlanner {
                         PhysicalPlan.IndexScan(
                             arm.descriptor.fieldName,
                             IndexType.VECTOR,
-                            IndexLookupSpec.VectorAnn(arm.vector, if (depth == Int.MAX_VALUE) context.maxRows else depth),
+                            IndexLookupSpec.VectorAnn(arm.vector, depth),
                         )
                 }
             }

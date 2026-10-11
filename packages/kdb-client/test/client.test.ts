@@ -9,14 +9,17 @@ import { describe, it } from "node:test";
 import { Client, backoffDelay } from "../src/client.ts";
 import {
   KdbAbortedError,
+  KdbBusyError,
   KdbClosedError,
   KdbConflictError,
   KdbError,
   KdbLockError,
   KdbNotFoundError,
   KdbPreconditionError,
+  KdbResourceExhaustedError,
   KdbUnauthenticatedError,
   KdbUnsupportedError,
+  classifiedError,
 } from "../src/errors.ts";
 import { encodeFrame } from "../src/wire/frame.ts";
 import { MSG, type TransactionDto } from "../src/wire/messages.ts";
@@ -158,6 +161,43 @@ describe("sessions", () => {
       (error: unknown) =>
         error instanceof KdbUnauthenticatedError && /no read grant/.test(String(error)),
     );
+  });
+
+  it("sends a delete as a delete operation anchored on the current head", async () => {
+    const server = new FakeServer((request) =>
+      request.kind === "sessionBegin" ? sessionAck(NS, HEAD_ZERO) : sqlOk(NS, HEAD_ONE),
+    );
+    const commit = await new Client(server).delete(NS, DOC);
+
+    assert.equal(commit, HEAD_ONE);
+    const tx = decodeTx(server.requests.find((r) => r.kind === "txCommit")!);
+    assert.equal(tx.baseVersionHex, HEAD_ZERO);
+    assert.deepEqual(tx.operations, [{ kind: "delete", docId: DOC }]);
+  });
+
+  it("puts a transaction's deletes after its writes, so write opIndexes do not move", async () => {
+    const other = "7f9619ff-8b86-d011-b42d-00cf4fc964ff";
+    const server = new FakeServer((request) =>
+      request.kind === "sessionBegin" ? sessionAck(NS, HEAD_ZERO) : sqlOk(NS, HEAD_ONE),
+    );
+    await new Client(server).commit({
+      namespace: NS,
+      baseVersion: HEAD_ZERO,
+      writes: [{ docId: DOC, body: { n: 1 } }],
+      deletes: [other],
+    });
+    const tx = decodeTx(server.requests.find((r) => r.kind === "txCommit")!);
+    assert.deepEqual(
+      tx.operations.map((op) => [op.kind, op.docId]),
+      [["write", DOC], ["delete", other]],
+    );
+  });
+
+  it("refuses to delete something that is not a UUID", async () => {
+    const server = new FakeServer((request) =>
+      request.kind === "sessionBegin" ? sessionAck(NS, HEAD_ZERO) : sqlOk(NS, HEAD_ONE),
+    );
+    await assert.rejects(new Client(server).delete(NS, "not-a-uuid"));
   });
 
   it("advances the cached head to the commit a write resolved to", async () => {
@@ -587,6 +627,49 @@ describe("SQL", () => {
       assert.equal(error.retryAfterMs, 25);
       return true;
     });
+  });
+});
+
+describe("resource exhaustion", () => {
+  const exhausted = (message: string) =>
+    new FakeServer((request) =>
+      request.kind === "sessionBegin"
+        ? sessionAck(NS)
+        : {
+            kind: "sqlResult",
+            payload: {
+              namespace: NS,
+              sessionId: "sess-1",
+              columns: [],
+              rows: [],
+              rowsAffected: 0,
+              resolvedCommitHex: "",
+              readOnly: true,
+              generatedIds: [],
+              error: message,
+              errorCode: "RESOURCE_EXHAUSTED",
+            },
+          },
+    );
+
+  it("is its own error class, not a busy one", async () => {
+    const server = exhausted("kdb sql: result has more than 10000 rows - add a LIMIT");
+    await assert.rejects(new Client(server).query(NS, "SELECT * FROM t"), (error: unknown) => {
+      assert.ok(error instanceof KdbResourceExhaustedError);
+      assert.ok(!(error instanceof KdbBusyError), "retrying an over-large query fails forever");
+      assert.equal(error.code, "RESOURCE_EXHAUSTED");
+      assert.match(error.message, /resource exhausted/);
+      assert.doesNotMatch(error.message, /busy/);
+      assert.match(error.message, /add a LIMIT/);
+      return true;
+    });
+  });
+
+  it("leaves BUSY retryable and distinct", () => {
+    const busy = classifiedError("queue full", "BUSY", 40);
+    assert.ok(busy instanceof KdbBusyError);
+    assert.equal(busy.retryAfterMs, 40);
+    assert.ok(!(classifiedError("too big", "RESOURCE_EXHAUSTED") instanceof KdbBusyError));
   });
 });
 

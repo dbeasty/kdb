@@ -616,7 +616,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 			Namespace: namespaceID,
 			Shape:     sql.ShapeOfSelect(sel.Query),
 			TreeSize:  rt.treeSizeAt(*head),
-			MaxRows:   10_000,
+			MaxRows:   rt.MaxResultRows(),
 			RowBudget: int(adm.ScanRowBudget()),
 		}
 		estimate = adm.Costs().EstimateScan(scanIn)
@@ -636,7 +636,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		Schema:      rt.Schema(),
 		AtCommit:    head,
 		Parameters:  params,
-		MaxRows:     10_000,
+		MaxRows:     rt.MaxResultRows(),
 		// Bounds rows *examined*, and shrinks automatically as memory pressure rises - a scan
 		// that reads the whole namespace to return nothing is otherwise unbounded work no
 		// admission decision can see coming (kdb-spec-layer13 §2.8).

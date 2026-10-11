@@ -489,6 +489,8 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   state first (as `graftRootsFor` does for its own roots); not done here.
 - A `history=none` (replay strategy) receiver cannot hold the fork point's tree
   (`ErrForeignTreeNeedsObjects`), so it gets the typed error and has to deepen.
+- 2026-10-11 — Scan cap (silent truncation at `MaxRows` before `WHERE`): found by qtask, Go fix on
+  `fix/scan-cap-before-filter`. Follow-on units live in `docs/kdb-scan-cap-plan.md`.
 - **2026-10-11 — multi-node e2e harness, and U6a.** New `kdb-integration/e2e/test_cluster.py` +
   `cluster_fixtures.py`: real kdb-service clusters (mesh, chain, star; 2-5 nodes) replicating with
   `--peer`, concurrent writers on every node, `kill -9` of one node, two at once and the whole
