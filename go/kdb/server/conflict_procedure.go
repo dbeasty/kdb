@@ -283,7 +283,7 @@ func (h *runtimeHost) Query(statement string, params []any) (string, error) {
 		Schema:      h.rt.Schema(),
 		AtCommit:    &head,
 		Parameters:  ps,
-		MaxRows:     10_000,
+		MaxRows:     h.rt.MaxResultRows(),
 	})
 	if err != nil {
 		return "", err
