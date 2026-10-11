@@ -6,25 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/limidus/kdb/go/kdb/document"
-	"github.com/limidus/kdb/go/kdb/storage/delta"
 )
-
-// scanSegmentBytes decodes a verified segment prefix's commits, keyed by hex hash. The prefix
-// came from integrity.VerifiedSegmentPrefix, so a scan error here is a real bug, not expected
-// corruption.
-func scanSegmentBytes(raw []byte) (map[string]document.Commit, error) {
-	commits, err := delta.ScanSegmentBytes(raw)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]document.Commit, len(commits))
-	for _, c := range commits {
-		out[c.CommitHash.Hex()] = c.Commit
-	}
-	return out, nil
-}
 
 // DirStore is a filesystem ObjectStore - local backups, tests, and network mounts. Keys map to
 // file paths under Root.

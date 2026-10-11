@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -422,6 +423,7 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request, _ aut
 // Safe while serving because backup.Create already handles a segment that is still being appended
 // to: it stores that one's CRC-verified prefix and records it as such in the manifest. So an online
 // backup is the algorithm that was already there rather than a weaker version of an offline one.
+// A segment damaged in place refuses it, as it refuses the offline one: 409 segment_damaged.
 func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request, principal auth.Principal, ns string, rt *serverRuntime) {
 	var req struct {
 		BaseBackupID string `json:"baseBackupId"`
@@ -448,6 +450,18 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request, prin
 	started := s.opts.Now()
 	m, err := backup.Create(shim, ns, store, req.BaseBackupID)
 	if err != nil {
+		var damaged *backup.DamagedSegmentError
+		if errors.As(err, &damaged) {
+			// Not transient, so not 503: retrying cannot help until the segment is repaired or
+			// the namespace restored. Logged as well, since whoever triggered it may be a script
+			// that only checks the status.
+			s.logf("kdb: control: backup of namespace %s refused: %v", ns, err)
+			writeErrorWithDetail(w, http.StatusConflict, "segment_damaged", err.Error(), map[string]any{
+				"namespace": ns, "segment": damaged.Sequence, "offset": damaged.Offset,
+				"nextIntactFrame": damaged.NextIntactFrame, "incremental": damaged.Incremental,
+			})
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "backup_failed", err.Error())
 		return
 	}

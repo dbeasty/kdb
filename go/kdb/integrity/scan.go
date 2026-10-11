@@ -3,6 +3,7 @@ package integrity
 import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/delta"
 )
 
 // ListSequencedSegments returns namespaceID's delta segment sequence numbers in ascending
@@ -12,16 +13,31 @@ func ListSequencedSegments(shim storage.PlatformIOShim, namespaceID string) ([]i
 	return listSequencedSegments(shim, namespaceID)
 }
 
-// VerifiedSegmentPrefix reads segment seq and returns only its L1 CRC-verified prefix: every
-// byte up to the end of the last frame that scanned clean, never the tail past it (which may be
-// a torn in-progress write - kdb-spec-layer15 Component 60 §6.5 test 4). Also returns how many
-// commits that prefix holds.
-func VerifiedSegmentPrefix(shim storage.PlatformIOShim, namespaceID string, seq int64) ([]byte, int, error) {
+// VerifiedSegmentPrefix reads segment seq and returns its L1 CRC-verified prefix - every byte up
+// to the end of the last intact frame - and the commits in it, classifying what follows with the
+// rule replay and Verify apply (storage.TailKind):
+//
+//   - clean (nothing, or a preallocated segment's zero padding): the prefix is every frame;
+//   - torn (bytes no intact frame follows - an append a crash cut short, never acknowledged): the
+//     prefix leaves them out (kdb-spec-layer15 Component 60 §6.5 test 4);
+//   - damaged (an intact frame follows the bad bytes, or a frame passes its CRC and will not
+//     decode): a *delta.DamagedSegmentError. The commits after the damage were acknowledged, so
+//     the prefix alone would silently lack them - the loss N5 fixed for startup.
+func VerifiedSegmentPrefix(shim storage.PlatformIOShim, namespaceID string, seq int64) ([]byte, []delta.ScannedCommit, error) {
 	ss, err := readAndScanSegment(shim, namespaceID, seq)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
-	return ss.raw[:ss.consumedBytes], len(ss.commits), nil
+	if ss.tail.Kind == storage.TailDamaged {
+		return nil, nil, &delta.DamagedSegmentError{
+			NamespaceID:     namespaceID,
+			Sequence:        seq,
+			Offset:          ss.tail.Offset,
+			Reason:          ss.tail.Reason,
+			NextIntactFrame: ss.tail.NextIntactFrame,
+		}
+	}
+	return ss.raw[:ss.consumedBytes], ss.commits, nil
 }
 
 // ScanVerifiedCommits returns every commit whose frame passed L1 CRC
