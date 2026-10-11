@@ -1,8 +1,9 @@
 # Scan cap: finish the fix
 
-Handoff written 2026-10-11. The Go server fix is committed on branch `fix/scan-cap-before-filter`
-(`27336e1`, based on `d35d044`) and has **not** been pushed, reviewed or released. This document is
-everything the next agent needs to land it and finish the work around it. It follows the unit
+Handoff written 2026-10-11; **all units U1-U8 were then implemented the same day** on branch
+`fix/scan-cap-before-filter` (rebased on `origin/main` at `f7b2256`). What remains is review,
+the full-suite gates on an idle machine, the PR, and a release; each unit's section below now ends
+with what was done. The text of each unit is kept as written so the reasoning survives. It follows the unit
 conventions of `docs/kdb-open-issues-plan.md` (one branch and PR per unit, reproduce before fixing,
 update the progress log, work in a worktree).
 
@@ -166,6 +167,32 @@ not a KDB one. What qtask depends on:
    when `ResidualWhere` is nil? Today the id slice is unbounded in memory below that budget
    (about 16 MB per million ids), which looks acceptable.
 3. Release: this changes observable behaviour, so v0.6.3 or v0.7.0?
+
+## Outcome per unit
+
+| Unit | Done | Notes |
+|---|---|---|
+| U1 | Fix + tests; verified the new tests fail with the old truncation | PR and the full `-race` run on an idle machine still to do |
+| U2 | `--max-result-rows` / `KDB_MAX_RESULT_ROWS` / `maxResultRows`, default 10000, restart to change | Lives on `KdbServerRuntime`, not `Admission` (which is nil without a memory limit). Feeds the cost model's memory estimate |
+| U3 | `KdbResourceExhaustedError` (TS), `ErrResourceExhausted` / `*ResourceExhaustedError` (Go) | Go client previously returned an untyped error for this code |
+| U4 | Kotlin ported; `go/testdata/golden/sql/result_bound.json` read by both trees | New `SqlResultLimitException` and `KdbErrorCode.RESOURCE_EXHAUSTED(9001)` |
+| U5 | Decided: a ranking is never cut; overflow is an error; LIMITed queries keep the spec depth | Go and Kotlin. Kotlin vector search with no LIMIT now asks for every document instead of `maxRows` |
+| U6 | Wire-level tests for UPDATE/DELETE past the bound (Go); engine-level (Kotlin) | Confirmed to fail with the old truncation: an UPDATE past the bound reported success and changed nothing |
+| U7 | `keylookup` access path for `kdb_id = c` and `kdb_id IN (...)` (Go) | Go only; Kotlin still scans (same answers, different cost) |
+| U8 | `Client.delete()` and `Transaction.deletes` (TS) | Verified against the live Go server |
+
+## Decisions made while implementing
+
+- Over-large result: **error**, not paging (open question 1). A continuation token is a larger
+  design; nothing here prevents adding it later.
+- Early stop: a scan stops only when nothing runs after id resolution, at
+  `offset + min(limit, MaxRows+1)`. Everything else reads to the end, bounded by `RowBudget`.
+- Open question 2 (bounding the id list): left as is; the list is bounded by `RowBudget` already
+  when a residual exists, and a keyed/indexed path is bounded by what it returns.
+- Kotlin has no examined-rows budget. It now reads whole namespaces for a filtered scan, exactly
+  as it did before for the scan itself (it never stopped scanning early), so this adds no work.
+- Kotlin's `keylookup` and `--max-result-rows` equivalents were not ported: the Kotlin engine is
+  the reference implementation, not the deployment target, and neither changes an answer.
 
 ## Progress log
 
