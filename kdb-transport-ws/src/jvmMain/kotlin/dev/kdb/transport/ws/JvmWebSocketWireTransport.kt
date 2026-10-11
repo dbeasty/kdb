@@ -3,6 +3,7 @@ package dev.kdb.transport.ws
 import dev.kdb.stream.WireConnection
 import dev.kdb.transport.core.FrameStreamWriter
 import dev.kdb.transport.core.TransportConnectOptions
+import dev.kdb.error.ConnectionClosedException
 import dev.kdb.error.TransportException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -57,6 +58,8 @@ public class JvmWebSocketWireTransport : WebSocketWireTransport {
             listenScope.launch {
                 try {
                     handler(conn)
+                } catch (_: ConnectionClosedException) {
+                    // The peer went away mid-exchange; that ends the connection, not the server.
                 } finally {
                     conn.close()
                 }

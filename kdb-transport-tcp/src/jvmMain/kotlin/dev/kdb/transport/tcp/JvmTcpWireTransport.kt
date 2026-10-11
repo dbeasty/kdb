@@ -9,6 +9,8 @@ import dev.kdb.transport.core.FrameStreamWriter
 import dev.kdb.transport.core.TransportConnectOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -17,12 +19,16 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.EmptyCoroutineContext
 
 public class JvmTcpWireTransport : TcpWireTransport {
     override suspend fun connect(uri: String): WireConnection {
@@ -64,6 +70,8 @@ private fun launchTcpHandler(
     scope.launch {
         try {
             handler(conn)
+        } catch (_: ConnectionClosedException) {
+            // The peer went away. That ends the connection; it is not a failure of the server.
         } finally {
             conn.close()
             scope.cancel()
@@ -148,15 +156,24 @@ internal class TcpSocketConnection(
 
 public actual fun defaultTcpWireTransport(): TcpWireTransport = JvmTcpWireTransport()
 
-/** Loopback server for tests — binds ephemeral port on 127.0.0.1. */
+/**
+ * Loopback server for tests — binds ephemeral port on 127.0.0.1.
+ *
+ * [scope], when given, is the parent of the server's coroutines; the server still owns a child job
+ * of its own, so [stop] never cancels the caller's scope.
+ */
 public class TcpLoopbackServer(
     private val options: TransportConnectOptions = TransportConnectOptions(),
     scope: CoroutineScope? = null,
 ) {
     private val active = AtomicInteger(0)
+    private val openConnections = ConcurrentHashMap.newKeySet<TcpSocketConnection>()
+
+    @Volatile
     private var serverSocket: ServerSocket? = null
     private var port: Int = 0
-    private val scope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val job = SupervisorJob(scope?.coroutineContext?.get(Job))
+    private val scope = CoroutineScope((scope?.coroutineContext ?: EmptyCoroutineContext) + Dispatchers.IO + job)
 
     public val connectUri: String
         get() = "kdb-tcp://127.0.0.1:$port"
@@ -171,21 +188,35 @@ public class TcpLoopbackServer(
             serverSocket = ss
             port = ss.localPort
             scope.launch {
-                while (scope.isActive) {
+                while (isActive) {
                     val client =
                         try {
                             ss.accept()
-                        } catch (_: java.net.SocketException) {
-                            if (!scope.isActive) break
+                        } catch (_: SocketException) {
+                            // stop() closes the socket to unblock accept(); that is the normal exit.
+                            if (!isActive || ss.isClosed) break
                             continue
                         }
                     client.tcpNoDelay = true
-                    active.incrementAndGet()
                     val conn = TcpSocketConnection(client, options)
-                    scope.launch {
+                    openConnections += conn
+                    if (!isActive) {
+                        // Accepted just as stop() began; it may already have swept openConnections.
+                        conn.close()
+                        break
+                    }
+                    active.incrementAndGet()
+                    launch {
                         try {
                             handler(conn)
+                        } catch (_: ConnectionClosedException) {
+                            // The client went away; for a server that is the end of the
+                            // connection, not an error. Anything else still propagates.
+                        } catch (e: IOException) {
+                            // stop() closes the connection under a handler blocked in socket I/O.
+                            if (isActive) throw e
                         } finally {
+                            openConnections -= conn
                             active.decrementAndGet()
                         }
                     }
@@ -194,11 +225,24 @@ public class TcpLoopbackServer(
         }
     }
 
+    /**
+     * Stops accepting, closes the connections whose handlers are still running, and suspends until
+     * every coroutine the server launched has finished — so nothing it started can still be
+     * unwinding (and throwing) after this returns. Safe to call from a cancelled coroutine, e.g. a
+     * `finally` block.
+     */
     public suspend fun stop() {
-        scope.cancel()
-        withContext(Dispatchers.IO) {
-            serverSocket?.close()
+        withContext(NonCancellable + Dispatchers.IO) {
+            job.cancel()
+            try {
+                serverSocket?.close()
+            } catch (_: IOException) {
+            }
             serverSocket = null
+            // A handler blocked in socket I/O does not see cancellation; closing its connection
+            // unblocks it.
+            for (conn in openConnections) conn.close()
+            job.join()
         }
     }
 }

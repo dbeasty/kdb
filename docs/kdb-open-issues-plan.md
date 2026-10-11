@@ -335,3 +335,40 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 ## Progress log
 
 _(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
+
+### 2026-10-11 — U7: Kotlin transport shutdown leaks (branch `fix/kotlin-transport-shutdown`)
+
+- **Repro first.** `TcpLoopbackServerShutdownTest` (2) and `NetworkWebSocketServerShutdownTest` (3)
+  install a default `Thread.UncaughtExceptionHandler` and stop each server with a connected client.
+  On `main` all five fail: TCP leaks `ConnectionClosedException` when a client disconnects, the WS
+  server leaks `SocketException: Socket closed` on **every** `stop()` (idle or not), and both
+  `stop()`s return before their handlers finish.
+- **Fix.** `TcpLoopbackServer` and `JvmNetworkWebSocketServer`: the per-connection handler catches
+  `ConnectionClosedException` (TCP also an `IOException`, but only once `stop()` has begun); the
+  accept loops treat `SocketException` as the normal exit only when the server is stopping or the
+  socket is closed (the WS loop now rethrows anything else). `stop()` cancels, closes the server
+  socket, closes the sockets of handlers still running, and joins — inside
+  `withContext(NonCancellable + Dispatchers.IO)`. `launchTcpHandler` and the WS `listen` wrapper also
+  catch `ConnectionClosedException`. `TcpLoopbackServer(scope = …)` now runs under a child job, so
+  `stop()` no longer cancels a caller-supplied scope. `CancellationException` is never caught.
+- **Found along the way.**
+  - The old `stop()` did `withContext(Dispatchers.IO) { serverSocket.close() }`. Called from a
+    cancelled coroutine — which is exactly what `JvmWebSocketWireTransport.listen`'s
+    `finally { server.stop() }` does after `awaitCancellation()` — that `withContext` throws
+    immediately, so cancelling a WS `listen` never closed its listening socket.
+  - Joining in `stop()` is only safe if handlers blocked in socket reads are unblocked: a client
+    that connects and never sends its HTTP upgrade request would otherwise hang `stop()` forever
+    (cancellation does not interrupt a blocking read). Hence closing in-flight sockets;
+    `stopDuringHandshake_doesNotHang` fails (10 s timeout) if that sweep is removed.
+  - Not fixed (out of scope): `JvmTcpWireTransport.listen` blocks in `accept()` and cannot be
+    cancelled until a connection arrives, and its handlers (one fresh scope each) and the WS
+    `listen` handlers (`listenScope`) are not children of the `listen` call, so cancelling `listen`
+    leaves running connections behind.
+- **Tests.** Ad-hoc `CoroutineScope(...)`/`cancel()` in the four WebSocket integration tests moved to
+  the class `testScope` (joined in `@AfterTest`); `listenAccept_twoClients` bounded with
+  `withTimeout`.
+- **Evidence.** `:kdb-integration:test` with `-XX:ActiveProcessorCount=2` (init script,
+  `--rerun-tasks`), load average 30–50: 9/9 runs green (40 tests) with the fix. The same loop on
+  `main`'s sources was also 6/6 green, with no `Exception in thread` in captured stderr — the
+  integration-level flake does not reproduce locally, so the unit tests above are the before/after
+  evidence. `:kdb-transport-tcp:jvmTest`, `:kdb-transport-ws:jvmTest`, `:kdb-jdbc:test` green.
