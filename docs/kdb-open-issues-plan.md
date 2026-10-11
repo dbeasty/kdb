@@ -958,3 +958,68 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
     - A power loss that persists a later page of a batch before an earlier one would leave intact
       frames after a hole. Neither was acknowledged, but this rule refuses it as damage, which is
       the safe direction.
+- **2026-10-11 — found by e2e testing: resolution chains on a mesh do not always converge on the
+  value the rule defines** (branch `test/conflict-rule-convergence`, test-only). #114 made merges
+  of same-content heads converge. This asks whether merges of *different* content, which are
+  still pairwise, converge on what each chain rule promises. New file
+  `kdb-integration/e2e/test_cluster_resolution.py`. Each scenario runs on 3- and 5-node meshes.
+  *Ordered* tests (default run) make the concurrent writes on isolated nodes, fix the merge order
+  by relaunching a node with one pull-only peer and forcing a sync, then restart the full mesh and
+  require `Cluster.wait_converged`. *Load* tests (`slow`) write from every node at once, some with
+  kill -9. No fixture changes. Every mesh **converges** (same head, same documents, no open
+  conflicts) except where the chain queues by design. The failures are about *which* value it
+  converges on:
+  - **Pass:** `source-priority` (a total order on origins, so associative); `validity` once
+    every merging node has the schema; a set-union procedure; `field-merge` over disjoint
+    fields when there is one merge base; `queue`; no chain under `last-write` and `strict`.
+    With `queue`/`strict`, *every* node queues one entry per peer it met. Settling them takes
+    N-1 control-plane resolutions, and the other nodes' copies close as the resolution replicates.
+  - **(F1) Wrong merge base.** `dag.CommonAncestor` (`dag/ancestry.go:39`) returns the first
+    common ancestor in breadth-first order from its second argument. That can be a proper
+    ancestor of the real nearest one, if it is fewer hops away. In a criss-cross it is one of
+    several nearest ones. `resolveDivergedLocked` takes the chain's base from it
+    (`peersync/merge_resolution.go:380`). Field-merge then sees a field only one side changed as
+    changed by both, falls to whole-document last-write, and drops the other side's field writes.
+    Acknowledged writes are lost, deterministically:
+    `test_field_merge_against_the_true_merge_base[3,5]`. Under load:
+    `test_load_field_merge_keeps_each_nodes_own_field`, with no kills. Captured: merge
+    `6257888a1f` had two nearest ancestors, f0=128 and f0=136. The base was the 128 one, so f0
+    went 144 -> 136 and f1 132 -> 124.
+  - **(F2) Order-dependent field-merge then last-write.** A value field-merge builds has no
+    parent with that value. So `origin()` (`peersync/merge_resolution.go:233`) attributes it to
+    the merge commit, stamped with the later head's time (`peersync/conflict_detection.go:335`).
+    A later last-write compares that stamp, not the colliding field's real write time.
+    `merge(merge(A,C),B)` gave x=n0 and `merge(merge(B,C),A)` gave x=n1, though n1 wrote x last:
+    `test_field_merge_collision_has_the_last_write_winner_everywhere`. Whole-document last-write
+    over a composite value is not associative.
+  - **(F3) Delta-based procedures cannot be right.** Merges are state-based. A document both
+    sides hold with the same value is never a conflict (`merge_resolution.go:346`,
+    `join.go:43`), so two +1s make 1
+    (`test_procedure_counter_sum_when_both_sides_reach_the_same_value`). With F1's base,
+    `local+remote-base` double-counts (`test_procedure_counter_sum_is_the_total_of_increments`:
+    each increment owns a decimal digit, and the result counted one twice). Under load on 5 nodes,
+    603 increments converged on 6.3e30: merge results fed further merges. The user guide's "add
+    the two counters together" example invites exactly this.
+  - **(F4) Validity vs. schema replication.** This is the documented limitation, now as a test. A
+    node that merges before the schema reaches it settles by last-write, and the others
+    fast-forward to that merge, so an invalid value survives
+    (`test_validity_before_the_schema_arrives`).
+
+  **Recommended fixes, none made here** (each changes merge results, so mixed-version meshes
+  would build different merges; gate them on a chain or protocol version):
+  - F1: compute the merge-base set from generation numbers. Use a single base as is. For several,
+    use a virtual base (merge the bases recursively, as git does), the same on every node.
+  - F2: make field-merge's fallback per field, with each field's last-writer origin (an LWW map),
+    rather than whole-document last-write.
+  - F3: document that procedures must be state-based joins (commutative, associative,
+    idempotent: union, max, per-node G-counter fields), and fix the guide's counter example.
+  - F4: include the schema hash in the chain-compatibility check when a chain has `validity`.
+
+  **Soak** (load avg 4-12, shared machine): the default run 4 times, 2 of them with
+  `GOMAXPROCS=2` in the services' environment, gave 14 passed and 9 xfailed every time. The slow
+  run gave 8 passed and 6 xfailed, both normally and with `GOMAXPROCS=2`. Deterministic failures
+  are `xfail(strict=True)`; load ones are `strict=False`.
+
+  **Also seen:** `GET /v1/ns/{ns}/docs/{id}?at=<commit>` answers 404 "does not exist" for a
+  commit whose tree the node does not hold (made elsewhere and adopted by its operations). The
+  document is readable at that commit on the node that made it.
