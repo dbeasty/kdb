@@ -18,8 +18,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlin.test.AfterTest
@@ -33,11 +35,17 @@ import kotlin.test.assertTrue
 class WebSocketStreamFallbackIntegrationTest {
     private val wire = defaultWireCodec()
 
+    /**
+     * Owns every coroutine these tests launch outside the test body - see the same field on
+     * WebSocketStreamIntegrationTest for why a bare `cancel()` on a throwaway scope was not enough.
+     */
+    private val testScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     @BeforeTest
     fun settleBefore() = runBlocking { delay(100) }
 
     @AfterTest
-    fun settleAfter() = runBlocking { delay(100) }
+    fun stopLaunchedCoroutines() = runBlocking { testScope.coroutineContext.job.cancelAndJoin() }
 
     @Test
     fun wsPeerSyncRecoveryWhenStreamUnavailable() =
@@ -54,9 +62,8 @@ class WebSocketStreamFallbackIntegrationTest {
                     PeerHostConfig(ns, "host", "ws"),
                 )(ConnectionContext.EMPTY)
             val server = JvmNetworkWebSocketServer()
-            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val serverJob =
-                scope.launch {
+                testScope.launch {
                     server.start("127.0.0.1", 0, "/kdb") { conn ->
                         conn.incoming().collect { frame ->
                             val ack = peerHost.handleFrame(frame)
@@ -93,7 +100,6 @@ class WebSocketStreamFallbackIntegrationTest {
             } finally {
                 server.stop()
                 serverJob.cancel()
-                scope.cancel()
             }
         }
 }

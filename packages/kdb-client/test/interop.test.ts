@@ -192,6 +192,37 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
     assert.deepEqual((await client.get(NS, second)).body, { v: 2 });
   });
 
+  it("deletes a document by key", async () => {
+    const docId = randomUuid();
+    await client.putJSON(NS, docId, { v: 1 });
+    const commit = await client.delete(NS, docId);
+    assert.match(commit, /^[0-9a-f]{64}$/);
+    await assert.rejects(client.get(NS, docId), KdbNotFoundError);
+  });
+
+  it("deletes inside a transaction alongside writes", async () => {
+    const keep = randomUuid();
+    const drop = randomUuid();
+    const added = randomUuid();
+    await client.putJSON(NS, keep, { v: 1 });
+    const seed = await client.putJSON(NS, drop, { v: 1 });
+
+    await client.commit({
+      namespace: NS,
+      baseVersion: seed,
+      writes: [{ docId: added, body: { v: 2 } }],
+      deletes: [drop],
+    });
+
+    assert.deepEqual((await client.get(NS, keep)).body, { v: 1 });
+    assert.deepEqual((await client.get(NS, added)).body, { v: 2 });
+    await assert.rejects(client.get(NS, drop), KdbNotFoundError);
+  });
+
+  it("deleting a document that is not there is not an error", async () => {
+    await client.delete(NS, randomUuid());
+  });
+
   it("keeps concurrent requests on one connection matched to their callers", async () => {
     const ids = Array.from({ length: 8 }, () => randomUuid());
     await Promise.all(ids.map((id, i) => client.upsert(NS, id, { n: i })));

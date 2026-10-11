@@ -30,6 +30,7 @@ export {
   KdbLockError,
   KdbNotFoundError,
   KdbPreconditionError,
+  KdbResourceExhaustedError,
   KdbProtocolError,
   KdbTransportError,
   KdbUnauthenticatedError,

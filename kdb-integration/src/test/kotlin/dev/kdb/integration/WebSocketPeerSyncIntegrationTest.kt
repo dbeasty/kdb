@@ -399,9 +399,8 @@ class WebSocketPeerSyncIntegrationTest {
         block: suspend (host: PeerSyncHost, port: Int) -> R,
     ): R {
         val server = JvmNetworkWebSocketServer()
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val serverJob =
-            scope.launch {
+            testScope.launch {
                 server.start("127.0.0.1", 0, "/kdb") { conn ->
                     conn.incoming().collect { frame ->
                         val ack = host.handleFrame(frame)
@@ -416,7 +415,6 @@ class WebSocketPeerSyncIntegrationTest {
         } finally {
             server.stop()
             serverJob.cancel()
-            scope.cancel()
         }
     }
 

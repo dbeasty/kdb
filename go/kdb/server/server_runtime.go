@@ -39,6 +39,10 @@ const DefaultMaxQueuedWrites = 64
 type KdbServerRuntime struct {
 	Runtime *embed.EmbeddedKdbRuntime
 
+	// maxResultRows is the most rows one SQL reply may carry (see MaxResultRows). Atomic so a
+	// live settings change cannot race the readers on the wire path.
+	maxResultRows atomic.Int64
+
 	TransactionEngine transaction.Engine
 	// UpsertEngine commits with ConflictPolicyLastWrite, backing Upsert below - component 40
 	// spec §5: "Upsert never conflicts and never needs a BaseVersion", distinct from Commit's
@@ -1152,4 +1156,26 @@ type ProjectionReadOnlyError struct {
 
 func (e *ProjectionReadOnlyError) Error() string {
 	return fmt.Sprintf("namespace %s is a read-only projection of %s; write to %s instead", e.Namespace, e.Source, e.Source)
+}
+
+// DefaultMaxResultRows is the default bound on rows in one SQL reply.
+const DefaultMaxResultRows = 10_000
+
+// MaxResultRows is the most rows a SELECT may return. A query whose result is larger fails with
+// RESOURCE_EXHAUSTED rather than being cut short (sql.ResultRowLimitError). It bounds the reply
+// and the memory the admission cost model grants for it; it does not bound scan work, which is
+// ScanRowBudget's job.
+func (s *KdbServerRuntime) MaxResultRows() int {
+	if n := s.maxResultRows.Load(); n > 0 {
+		return int(n)
+	}
+	return DefaultMaxResultRows
+}
+
+// SetMaxResultRows changes the bound; n <= 0 restores the default.
+func (s *KdbServerRuntime) SetMaxResultRows(n int) {
+	if n <= 0 {
+		n = DefaultMaxResultRows
+	}
+	s.maxResultRows.Store(int64(n))
 }

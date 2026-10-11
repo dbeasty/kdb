@@ -52,10 +52,18 @@ type GraftResult struct {
 // The whole state is held in memory until it is verified: a tree cannot be checked against its
 // hash until the last page is in.
 func Graft(env IngestEnv, root codec.Hash, fetch func(after string) (wire.SnapshotPageMessage, error)) (GraftResult, error) {
-	res := GraftResult{Root: root}
 	if !env.Resolution.Chain.AllowsUnrelated() {
-		return res, ErrUnrelatedNotAllowed
+		return GraftResult{Root: root}, ErrUnrelatedNotAllowed
 	}
+	return admitRootFromState(env, root, fetch)
+}
+
+// admitRootFromState is Graft without the permission check: it fetches root's state, verifies it,
+// and admits root as a shallow root, durably. Graft needs the permission because what it admits is
+// unrelated to this node's history; extendBoundary (boundary.go) does not, because what it admits
+// is history this node's own root already descends from.
+func admitRootFromState(env IngestEnv, root codec.Hash, fetch func(after string) (wire.SnapshotPageMessage, error)) (GraftResult, error) {
+	res := GraftResult{Root: root}
 	store, ok := env.Storage.(storage.ForeignTreeStore)
 	if !ok {
 		return res, fmt.Errorf("peer sync: storage for %s cannot hold a grafted tree", env.NamespaceID)

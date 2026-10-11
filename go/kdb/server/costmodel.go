@@ -263,7 +263,7 @@ type ScanEstimateInput struct {
 	Shape     sql.QueryShape
 	// TreeSize is the namespace's document count at the read head - DocumentTree.Size(), O(1).
 	TreeSize int
-	// MaxRows is the server's result-row cap for this request (wire_listen's 10_000).
+	// MaxRows is the server's result-row cap for this request (KdbServerRuntime.MaxResultRows).
 	MaxRows int
 	// RowBudget is the current admission row budget (rows-examined bound); 0 = unbounded.
 	RowBudget int

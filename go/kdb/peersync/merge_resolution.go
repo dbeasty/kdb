@@ -441,7 +441,7 @@ func resolveDivergedLocked(
 	for _, id := range sortedDocIDs(storageWrites) {
 		applied = append(applied, storageWrites[id])
 	}
-	step := AdvanceStep{Commits: append(remoteCommits, mergeCommit), Applied: applied}
+	step := AdvanceStep{Commits: append(adoptable(d, remoteCommits), mergeCommit), Applied: applied}
 	return CommitPushOutcome{Kind: OutcomeMerged, MergeCommit: &mergeCommit}, step, nil
 }
 

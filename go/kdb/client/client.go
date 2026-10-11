@@ -47,6 +47,20 @@ var ErrUnavailable = errors.New("kdb: server unavailable")
 // admit the request. Unlike ErrBusy, retrying with the same deadline is unlikely to help.
 var ErrDeadlineExceeded = errors.New("kdb: deadline exceeded")
 
+// ErrResourceExhausted is returned when the request as written is too large for the server to
+// serve: a result with more rows than the server's --max-result-rows, a scan over its examined-
+// rows budget, or a memory grant larger than the node can ever hold (RESOURCE_EXHAUSTED).
+// Unlike ErrBusy it is never worth retrying unchanged - it fails identically next time. Narrow
+// the query (a LIMIT, a more selective predicate) or raise the server's bound.
+var ErrResourceExhausted = errors.New("kdb: resource exhausted")
+
+// ResourceExhaustedError carries the server's explanation; errors.Is(err, ErrResourceExhausted)
+// works via Unwrap.
+type ResourceExhaustedError struct{ Message string }
+
+func (e *ResourceExhaustedError) Error() string { return "kdb: " + e.Message }
+func (e *ResourceExhaustedError) Unwrap() error { return ErrResourceExhausted }
+
 // BusyError wraps ErrBusy with the server's suggested retry delay. errors.Is(err, ErrBusy)
 // still works via Unwrap.
 type BusyError struct {
@@ -91,6 +105,8 @@ func classifiedError(errMsg string, code *wire.ErrorCode, retryAfterMs *int) err
 			ms = *retryAfterMs
 		}
 		return &BusyError{Message: errMsg, RetryAfterMs: ms}
+	case wire.ErrorCodeResourceExhausted:
+		return &ResourceExhaustedError{Message: errMsg}
 	case wire.ErrorCodeUnavailable:
 		return &UnavailableError{Message: errMsg}
 	case wire.ErrorCodeDeadlineExceeded:
