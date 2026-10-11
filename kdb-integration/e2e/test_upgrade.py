@@ -258,10 +258,6 @@ def test_new_node_snapshot_joins_a_v062_server_with_deepen(make_cluster):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=False, reason=(
-    "the deepen=true peer option never runs once the sync fails: replication.peerLoop.deepen "
-    "skips namespaces whose sync returned an error, and a ShallowBoundaryError is one - so the "
-    "option the error message recommends cannot recover a joiner already stuck"))
 def test_deepen_peer_option_recovers_a_stuck_snapshot_joiner(make_cluster):
     """The typed error says the deepen=true peer option recovers it. Restart a stuck joiner with
     that option added and see whether it does."""

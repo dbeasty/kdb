@@ -825,3 +825,14 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   155, warm hits one read, warm misses and `Contains` none; compaction invalidation, budget,
   concurrency, the no-sizer fallback, file-backed size), and the opt-in measurement
   `TestReplayOpenTimeWithoutCheckpoint` (`KDB_REPLAY_COMMITS=14000`) in `go/kdb/embed`.
+
+- **2026-10-11 — the deepen=true peer option ignored a stuck snapshot joiner (found by #125).**
+  `replication.peerLoop.deepen` skipped every namespace whose sync returned an error, and the
+  `ShallowBoundaryError` a joiner reports (when a peer, e.g. v0.6.2, cannot supply a fork point's
+  state behind its snapshot root) is one, though its message names `deepen=true` as the cure.
+  `deepenAfter` now lets that error, and only that one, through; a lost connection or a refused
+  push still skips deepen. Evidence: #125's `test_deepen_peer_option_recovers_a_stuck_snapshot_joiner`
+  against a real v0.6.2 server fails with the old binary and passed 3 of 3 with the fix (its xfail
+  mark is removed); the whole upgrade suite passes; `TestDeepenRunsAfterAShallowBoundaryError`
+  pins the decision. The release notes drop it from Known issues and list it under Fixes.
+
