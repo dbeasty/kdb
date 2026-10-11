@@ -269,9 +269,10 @@ func footerIndexLines(t *testing.T, footer []byte) []string {
 
 var _ = codec.Hash{}
 
-// U5 (docs/kdb-open-issues-plan.md): Kotlin/JS and Native have no zstd, so every block they
-// write is CODEC_NONE. Before U5 they tagged a length-prefixed copy of the payload as ZSTD,
-// which this side could not decode. The codec changes only block bodies, so the index and the
+// U5 (docs/kdb-open-issues-plan.md): from U5 until roadmap R1 gave them a pure-Kotlin zstd,
+// Kotlin/JS and Native wrote every block CODEC_NONE (as any writer configured for NONE still
+// does), so stores they wrote then hold such tables. Before U5 they tagged a length-prefixed copy
+// of the payload as ZSTD, which this side could not decode. The codec changes only block bodies, so the index and the
 // fileHash must still equal Go's own (zstd) table's, every block must say NONE, and every value
 // must read back through Go's reader.
 func TestKotlinSSTableCodecNoneGoldenReads(t *testing.T) {

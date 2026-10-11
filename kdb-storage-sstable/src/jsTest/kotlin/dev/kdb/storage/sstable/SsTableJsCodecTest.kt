@@ -3,8 +3,8 @@ package dev.kdb.storage.sstable
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 
-/** Kotlin/JS has no zstd (roadmap R1): its SSTable blocks must be tagged CODEC_NONE. */
+/** Kotlin/JS compresses SSTable blocks with the pure-Kotlin zstd (roadmap R1). */
 class SsTableJsCodecTest {
     @Test
-    fun jsWritesCodecNoneBlocks() = runTest { assertTargetWithoutZstdWritesNone() }
+    fun jsWritesZstdBlocks() = runTest { assertTargetWritesZstdBlocks() }
 }

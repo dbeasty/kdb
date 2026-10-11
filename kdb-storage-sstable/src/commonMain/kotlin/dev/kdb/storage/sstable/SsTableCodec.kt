@@ -36,12 +36,13 @@ internal object SsTableCodec {
     const val BLOCK_CODEC_ZSTD: Byte = 1
 
     /**
-     * [compress] asks for ZSTD; on a platform without a real zstd ([ZstdCompression.isAvailable]
-     * false: Kotlin/JS and Native) the block is written CODEC_NONE instead. The header always
-     * records the codec actually used, so every reader on every platform decodes it.
+     * [compress] asks for ZSTD; on a platform that cannot write zstd ([ZstdCompression.canCompress]
+     * false - none today; JS and Native use the pure-Kotlin encoder since roadmap R1) the block is
+     * written CODEC_NONE instead. The header always records the codec actually used, so every
+     * reader on every platform decodes it.
      */
     fun encodeBlock(payload: ByteArray, compress: Boolean): ByteArray {
-        val zstd = compress && ZstdCompression.isAvailable
+        val zstd = compress && ZstdCompression.canCompress
         val id = if (zstd) BLOCK_CODEC_ZSTD else BLOCK_CODEC_NONE
         val body = if (zstd) ZstdCompression.compress(payload) else payload
         val out = ByteArray(BLOCK_HEADER_SIZE + body.size)
@@ -155,11 +156,11 @@ public class DefaultSsTableWriter(
     private val namespaceId: String,
     private val level: Int,
     /**
-     * The codec this writer asks for. ZSTD degrades to NONE on a platform without a real zstd
-     * ([ZstdCompression.isAvailable] false: Kotlin/JS and Native). The block header records the
-     * codec actually used, so every reader decodes the block either way. Before this, JS and
-     * Native wrote a length-prefixed copy of the payload and tagged it ZSTD, which Go and the JVM
-     * could not read.
+     * The codec this writer asks for. ZSTD degrades to NONE on a platform that cannot write zstd
+     * ([ZstdCompression.canCompress] false). The block header records the codec actually used, so
+     * every reader decodes the block either way. Before U5, JS and Native wrote a length-prefixed
+     * copy of the payload and tagged it ZSTD, which Go and the JVM could not read; until R1 they
+     * wrote CODEC_NONE.
      */
     codec: CompressionCodec = CompressionCodec.ZSTD,
 ) : SsTableWriter {
