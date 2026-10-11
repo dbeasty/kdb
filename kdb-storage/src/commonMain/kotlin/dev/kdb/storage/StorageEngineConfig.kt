@@ -52,7 +52,24 @@ public data class StorageEngineConfig(
     val durability: Durability = Durability.SYNC,
     /** Background fsync period used when [durability] is ASYNC. Null uses a built-in default. */
     val asyncSyncIntervalMillis: Long? = null,
+    /**
+     * Caps the active WAL segment: a write that would take it past this rotates to a new segment
+     * first (a single record larger than the cap gets a segment to itself). Mirrors Go's
+     * `storage.StorageEngineConfig.WalMaxSegmentBytes`; the default is the spec's 64 MiB. Unlike
+     * Go, where zero means "use the default", this has a real default, so zero or negative is
+     * rejected rather than silently meaning something.
+     */
+    val walMaxSegmentBytes: Long = DEFAULT_WAL_MAX_SEGMENT_BYTES,
 ) {
+    init {
+        require(walMaxSegmentBytes > 0) { "walMaxSegmentBytes must be positive, got $walMaxSegmentBytes" }
+    }
+
+    public companion object {
+        /** Spec default for [walMaxSegmentBytes] (docs/kdb-spec-layer4a-component10a-wal.md). */
+        public const val DEFAULT_WAL_MAX_SEGMENT_BYTES: Long = 64L * 1024 * 1024
+    }
+
     /** [globalMemoryBudgetBytes] if set, otherwise resolved from [hotTierMemory]. */
     public fun resolvedGlobalMemoryBudgetBytes(): Long =
         if (globalMemoryBudgetBytes > 0) globalMemoryBudgetBytes else resolveHotTierBytes(hotTierMemory)

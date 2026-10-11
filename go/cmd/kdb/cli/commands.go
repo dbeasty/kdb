@@ -86,8 +86,6 @@ func execute(cfg Config, cmd Command) int {
 		return cmdBranchList(cfg, rt)
 	case BranchCreateCmd:
 		return cmdBranchCreate(cfg, rt, c)
-	case BranchCheckoutCmd:
-		return cmdBranchCheckout(cfg, rt, c)
 	case SyncCmd:
 		return cmdSync(cfg, rt, chain, c)
 	case ResolveCmd:
@@ -135,8 +133,6 @@ func namespaceFor(cmd Command) string {
 	case BranchListCmd:
 		return c.Namespace
 	case BranchCreateCmd:
-		return c.Namespace
-	case BranchCheckoutCmd:
 		return c.Namespace
 	case SyncCmd:
 		return c.Namespace
@@ -571,22 +567,6 @@ func cmdBranchCreate(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCreateCmd
 	}
 	if !cfg.Quiet {
 		fmt.Printf("branch %s at %s\n", b.Name, b.HeadHash.Hex())
-	}
-	return 0
-}
-
-func cmdBranchCheckout(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCheckoutCmd) int {
-	b, ok := rt.DAG.GetBranch(c.Name)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: branch not found: %s\n", c.Name)
-		return 1
-	}
-	if err := rt.DAG.SetHead(c.Name, b.HeadHash); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-	if !cfg.Quiet {
-		fmt.Printf("checked out %s at %s\n", c.Name, b.HeadHash.Hex())
 	}
 	return 0
 }

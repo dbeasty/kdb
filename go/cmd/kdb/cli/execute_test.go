@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -70,5 +71,29 @@ func TestPutSealsSegmentOnExit(t *testing.T) {
 	}
 	if info.Size() == 0 {
 		t.Fatal("expected a non-empty sealed segment")
+	}
+}
+
+// TestBranchCheckoutIsRefused is the regression test for U10 in docs/kdb-open-issues-plan.md:
+// `kdb branch checkout` set a branch to the head it already had and printed "checked out", which
+// read as success while changing nothing - the CLI keeps no current branch between invocations.
+// It is now refused while parsing, with an explanation, and opens nothing.
+func TestBranchCheckoutIsRefused(t *testing.T) {
+	_, _, err := ParseArgsForTest([]string{"--data-dir", t.TempDir(), "branch", "checkout", "app/data", "feature"})
+	if err == nil {
+		t.Fatal("branch checkout parsed; want it refused")
+	}
+	for _, want := range []string{"not supported", "no current branch", "branch:<name>"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+
+	dir := t.TempDir()
+	if code := Run([]string{"--data-dir", dir, "--quiet", "branch", "checkout", "app/data", "feature"}); code != 2 {
+		t.Fatalf("branch checkout exited %d; want 2, the usage-error code", code)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ns")); !os.IsNotExist(err) {
+		t.Fatalf("a refused checkout opened the data directory (ns/ exists or stat failed: %v)", err)
 	}
 }
