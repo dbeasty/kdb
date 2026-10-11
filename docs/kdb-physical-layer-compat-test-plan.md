@@ -237,11 +237,12 @@ the other:
 
 ## 6. Known gaps not fixed by this plan
 
-- **Kotlin JS/native ZSTD is an identity wrapper** (`ZstdCompression.js.kt`,
-  `.native.kt`) while frames are still tagged `CODEC_ZSTD`. A segment written by a JS or native
-  Kotlin build is therefore unreadable by Go *and* by the JVM. Out of scope while the deploy
-  target is Go + JVM, but it is a latent format bug, not a missing feature — a JS build must
-  either link a real zstd or write `CODEC_NONE`.
+- **Kotlin JS/native have no ZSTD.** Until U5 of `docs/kdb-open-issues-plan.md` this was an
+  identity wrapper whose output was tagged `CODEC_ZSTD`, so JS/Native segments were unreadable
+  by Go and the JVM. Since U5, `ZstdCompression.isAvailable` is false there, SSTable blocks and
+  delta pages are written `CODEC_NONE` (fixtures `sstable_segment_none.hex` and
+  `delta_segment_none.hex`, read by Go), and `decompress` throws `ZstdUnavailableException`.
+  Still open: JS/Native cannot *read* zstd data written by the JVM or Go (roadmap R1).
 - **Encryption at rest** (`docs/kdb-spec-layer14-encryption-at-rest.md`) sits below these
   formats and has no cross-language fixtures yet.
 

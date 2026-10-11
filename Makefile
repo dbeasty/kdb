@@ -72,6 +72,9 @@ test-physical-golden:
 	@git diff --exit-code -- go/testdata/golden \
 	  || (echo "\nERROR: golden fixtures changed - a physical format changed on one side." \
 	          "Review the diff above and commit it only if the change is deliberate." >&2; exit 1)
+	@test -z "$$(git ls-files --others --exclude-standard -- go/testdata/golden)" \
+	  || (git ls-files --others --exclude-standard -- go/testdata/golden; \
+	      echo "\nERROR: the exporters wrote golden fixtures that are not committed (listed above)." >&2; exit 1)
 
 # Always -benchmem: the engine's single largest allocation (a throwaway zstd
 # encoder per commit, ~21MB) survived for as long as it did because no benchmark

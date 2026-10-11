@@ -2,6 +2,7 @@ package interop
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -267,3 +268,60 @@ func footerIndexLines(t *testing.T, footer []byte) []string {
 }
 
 var _ = codec.Hash{}
+
+// U5 (docs/kdb-open-issues-plan.md): Kotlin/JS and Native have no zstd, so every block they
+// write is CODEC_NONE. Before U5 they tagged a length-prefixed copy of the payload as ZSTD,
+// which this side could not decode. The codec changes only block bodies, so the index and the
+// fileHash must still equal Go's own (zstd) table's, every block must say NONE, and every value
+// must read back through Go's reader.
+func TestKotlinSSTableCodecNoneGoldenReads(t *testing.T) {
+	kotlinSegment := readKotlinGolden(t, "sstable_segment_none.hex")
+	if kotlinSegment == nil {
+		return
+	}
+	_, _, goSegment := buildFixtureSSTable(t)
+	goFooter, kotlinFooter := footerOf(t, goSegment), footerOf(t, kotlinSegment)
+	g := strings.Join(footerKeysAndFlags(t, goFooter), ",")
+	k := strings.Join(footerKeysAndFlags(t, kotlinFooter), ",")
+	if g != k {
+		t.Fatalf("index keys/flags differ\nkotlin %s\ngo     %s", k, g)
+	}
+	if !bytes.Equal(fileHashOf(t, goFooter), fileHashOf(t, kotlinFooter)) {
+		t.Fatalf("fileHash differs\nkotlin %x\ngo     %x", fileHashOf(t, kotlinFooter), fileHashOf(t, goFooter))
+	}
+	for _, l := range footerIndexLines(t, kotlinFooter) {
+		parts := strings.Split(l, ":")
+		if len(parts) > 3 {
+			continue // tombstone: no block
+		}
+		off, err := strconv.Atoi(parts[1])
+		if err != nil {
+			t.Fatalf("index line %q: %v", l, err)
+		}
+		if kotlinSegment[off+1] != 0 {
+			t.Fatalf("block at offset %d has codec id %d, want 0 (none)", off, kotlinSegment[off+1])
+		}
+	}
+
+	shim := io.NewInMemoryPlatformIO()
+	const name = "ns/" + fixtureNamespaceID + "/sstable/L0/kotlin-none-fixture"
+	if _, err := shim.AppendToSegment(name, kotlinSegment); err != nil {
+		t.Fatal(err)
+	}
+	r := sstable.NewDefaultReader(shim, sstable.Handle{SegmentName: name, Level: 0})
+	for _, tc := range []struct {
+		seed byte
+		want string
+	}{{1, "alpha-rewritten"}, {2, string(fixturePayload)}, {4, ""}} {
+		got, err := r.Get(fixtureHash(t, tc.seed))
+		if err != nil {
+			t.Fatalf("reading key %d out of Kotlin's CODEC_NONE segment: %v", tc.seed, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("key %d = %q, want %q", tc.seed, got, tc.want)
+		}
+	}
+	if _, del, ok, err := r.Lookup(fixtureHash(t, 3)); err != nil || !ok || !del {
+		t.Fatalf("Lookup(deleted) = deleted=%v found=%v err=%v, want a tombstone", del, ok, err)
+	}
+}
