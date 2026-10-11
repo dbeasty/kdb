@@ -338,7 +338,7 @@ _(append one entry per unit: date, unit, PR, commit, and anything found along th
 
 ### 2026-10-11 — U2: `kdb/server` in the embeddable Go bundle
 
-Branch `fix/embedbundle-kdb-server`, supersedes #26 (left open for the user to close).
+PR #108 (branch `fix/embedbundle-kdb-server`, commit `c043449`), supersedes #26 (left open for the user to close).
 `kdb/server` added to `go/embedbundle/entrypoints.txt`; #26's EMBEDDING.md and README text carried
 over; `docs/kdb-release-plan.md` §2.1, §2.2, §2.3, §2.5 and §7.1 rewritten from `main`'s version;
 `Makefile` comment updated; new `go/embedbundle/main_test.go` asserts every entry point is in the
