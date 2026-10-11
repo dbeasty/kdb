@@ -8,11 +8,16 @@ import dev.kdb.compression.ZstdCompression
 import dev.kdb.document.KdbCommit
 import dev.kdb.document.KdbOp
 import dev.kdb.storage.CompressionCodec
+import dev.kdb.storage.DeltaAuthorshipEnvelope
+import dev.kdb.storage.DeltaRecord
+import dev.kdb.storage.StorageEngineConfig
+import dev.kdb.storage.mem.InMemoryPlatformIoShim
 import dev.kdb.storage.io.SegmentNameBuilder
 import dev.kdb.storage.io.SnapshotKeyBuilder
 import java.io.File
 import java.nio.file.Paths
 import kotlin.io.path.isDirectory
+import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -38,6 +43,22 @@ class DeltaPhysicalGoldenTest {
         // P4: shapes Go must be able to consume - an ordinary zstd-jni frame, and an empty one.
         writeHex("zstd_body.hex", ZstdCompression.compress(ZSTD_FIXTURE.encodeToByteArray()))
         writeHex("zstd_empty_body.hex", ZstdCompression.compress(ByteArray(0)))
+        // U5: a whole segment as Kotlin/JS and Native write it - through the real segment writer,
+        // every page CODEC_NONE because those targets have no zstd. Compressor-independent, so
+        // Go compares it byte for byte as well as reading it.
+        writeHex("delta_segment_none.hex", fixtureWriterSegment(CompressionCodec.NONE))
+    }
+
+    // U5: the writer's CODEC_NONE segment is exactly the two frames DeltaPageCodec makes, in order.
+    @Test
+    fun codecNoneWriterSegmentIsTheConcatenatedFrames() {
+        val first = fixtureCommit()
+        val second = secondFixtureCommit()
+        assertContentEquals(
+            DeltaPageCodec.frame(first.toPayloadBytes(), CompressionCodec.NONE) +
+                DeltaPageCodec.frame(second.toPayloadBytes(), CompressionCodec.NONE),
+            fixtureWriterSegment(CompressionCodec.NONE),
+        )
     }
 
     /**
@@ -203,6 +224,42 @@ class DeltaPhysicalGoldenTest {
             schemaHash = null,
             message = "fixture commit 〰",
         )
+
+    /** A child of [fixtureCommit]: the second commit in the CODEC_NONE golden segment. */
+    private fun secondFixtureCommit(): KdbCommit =
+        KdbCommit.build(
+            parentHashes = listOf(fixtureCommit().hash),
+            namespaceId = NAMESPACE_ID,
+            transactionId = KdbUuid.fromString("11111111-2222-3333-4444-555555555556"),
+            timestamp = KdbTimestamp.fromEpochMicros(1_700_000_000_123_457L),
+            authorNodeId = KdbUuid.fromString("66666666-7777-8888-9999-aaaaaaaaaaaa"),
+            operations = emptyList<KdbOp>(),
+            documentTreeHash = hash(4),
+            schemaHash = null,
+            message = "second fixture commit",
+        )
+
+    /** [fixtureCommit] then [secondFixtureCommit], appended through [DefaultDeltaSegmentWriter]. */
+    private fun fixtureWriterSegment(codec: CompressionCodec): ByteArray =
+        runBlocking {
+            val shim = InMemoryPlatformIoShim()
+            val config = StorageEngineConfig(globalMemoryBudgetBytes = 2_000_000, ioShim = shim, compressionCodec = codec)
+            val writer = DeltaSegmentFactory(config).openWriter(NAMESPACE_ID)
+            for (c in listOf(fixtureCommit(), secondFixtureCommit())) {
+                writer.append(
+                    DeltaRecord(
+                        commitHash = c.hash,
+                        namespaceId = NAMESPACE_ID,
+                        authorship =
+                            DeltaAuthorshipEnvelope(principal = "p", timestamp = c.timestamp, rightsToken = "", clientContext = ""),
+                        commitPayload = c.toPayloadBytes(),
+                        documentPatches = emptyList(),
+                    ),
+                )
+            }
+            val ref = writer.seal()
+            shim.readFromSegment(SegmentNameBuilder.deltaSequenced(NAMESPACE_ID, ref.sequenceNumber), 0, ref.sizeBytes.toInt())
+        }
 
     /** Two identical CODEC_NONE frames, so a test can damage the second and still expect the first. */
     private fun fixtureSegment(): ByteArray {

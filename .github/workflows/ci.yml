@@ -371,3 +371,11 @@ jobs:
             echo "Regenerate locally with: make test-physical-golden"
             exit 1
           fi
+          # git diff ignores untracked files, so a fixture an exporter writes but nobody committed
+          # would pass the check above while the Go side silently skips it everywhere else.
+          untracked="$(git ls-files --others --exclude-standard -- go/testdata/golden/)"
+          if [ -n "$untracked" ]; then
+            echo "go/testdata/golden/ has fixtures an exporter writes that are not committed:"
+            echo "$untracked"
+            exit 1
+          fi

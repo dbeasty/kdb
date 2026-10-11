@@ -78,9 +78,13 @@ not a release-script concern. Tracked as **R5b** below.
 
 ### 2.1 What it is for
 
-A downstream Go project vendors the KDB engine into its own tree and links it in-process — no
-service, no wire protocol, no CLI. The bundle is therefore **only the packages an in-process
-consumer can actually reach**, and it must be a self-contained, compiling, testable Go module on
+A downstream Go project vendors the KDB engine into its own tree and links it into its own
+binary, rather than running this repo's binaries or Docker image. Two kinds of consumer do this:
+an **in-process embedder** (`kdb/embed`, the `database/sql` driver, KDB-SQL, hybrid query, index),
+and a project that **builds its own server binary or image around `kdb/server`** — the native
+server engine with its wire protocol, transports and peer sync (Zolik does this). The bundle is
+therefore **only the packages those entry points actually reach** — no CLI, no backup/recovery
+tooling, no remote-client SDK — and it must be a self-contained, compiling, testable Go module on
 its own.
 
 ### 2.2 Scope — derived, never hand-maintained
@@ -95,26 +99,36 @@ kdb/driver        # database/sql driver over that runtime
 kdb/sql           # KDB-SQL parser, planner, executor
 kdb/query/hybrid  # hybrid query engine
 kdb/index         # index core
+kdb/server        # native server engine (wire protocol, transport, peer sync)
 ```
 
-`go list -deps` over those entry points yields the transitive closure — **27 of the module's 37
-top-level `kdb/*` packages**:
+`go list -deps` over those entry points yields the transitive closure — **40 of the module's 59
+`kdb/...` packages**:
 
 ```
-kdb/auth          kdb/codec         kdb/codec/schema  kdb/compression
-kdb/dag           kdb/document      kdb/driver        kdb/embed
-kdb/error         kdb/index         kdb/index/fusion  kdb/json
-kdb/metrics       kdb/policy        kdb/query/hybrid  kdb/schema
-kdb/sql           kdb/storage       kdb/storage/delta kdb/storage/engine
-kdb/storage/io    kdb/storage/io/s3 kdb/storage/mem   kdb/storage/memtable
-kdb/storage/sstable kdb/storage/wal kdb/transaction
+kdb/auth            kdb/codec           kdb/codec/schema    kdb/compression
+kdb/dag             kdb/document        kdb/driver          kdb/embed
+kdb/error           kdb/index           kdb/index/analyzer  kdb/index/fulltext
+kdb/index/fusion    kdb/index/stores    kdb/index/vector    kdb/json
+kdb/metrics         kdb/peersync        kdb/policy          kdb/query/hybrid
+kdb/schema          kdb/script          kdb/server          kdb/sql
+kdb/storage         kdb/storage/delta   kdb/storage/engine  kdb/storage/io
+kdb/storage/io/s3   kdb/storage/mem     kdb/storage/memtable kdb/storage/sstable
+kdb/storage/wal     kdb/stream          kdb/transaction     kdb/transport/core
+kdb/transport/tcp   kdb/transport/ws    kdb/version         kdb/wire
 ```
 
-Excluded, because nothing an embedder imports reaches them: `kdb/server`, `kdb/client`,
-`kdb/wire`, `kdb/transport`, `kdb/peersync`, `kdb/backup`, `kdb/recovery`, `kdb/integrity`,
-`kdb/inspect`, `kdb/interop`, `kdb/compaction`, `kdb/compute`, `kdb/control`, `kdb/file`,
-`kdb/config`, `kdb/integration`, `kdb/service`, `kdb/stream`, `kdb/tier`, `kdb/version`, and all
-of `cmd/` and `wasm/`.
+`kdb/server` adds 13 packages to the 27 the five in-process entry points reach: `kdb/server`
+itself, `kdb/wire`, `kdb/transport/{core,tcp,ws}`, `kdb/peersync`, `kdb/stream`, `kdb/version`,
+`kdb/script` (stored procedures, via `github.com/dop251/goja`), and `kdb/index/{analyzer,fulltext,
+stores,vector}`. None of them uses cgo; `CGO_ENABLED=0 go build ./kdb/server` passes on every
+platform in the matrix below.
+
+Excluded, because no entry point reaches them: `kdb/client`, `kdb/backup`, `kdb/recovery`,
+`kdb/integrity`, `kdb/inspect`, `kdb/interop`, `kdb/compaction`, `kdb/compute` (+`webgpu`),
+`kdb/control`, `kdb/file`, `kdb/config`, `kdb/integration`, `kdb/replication`, `kdb/service`,
+`kdb/storage/manager`, `kdb/syncnode`, `kdb/tier`, `kdb/index/internal/fixturegen`, and all of
+`cmd/` and `wasm/`.
 
 Two rules the generator follows, both of which a naive implementation gets wrong:
 
@@ -129,9 +143,11 @@ Two rules the generator follows, both of which a naive implementation gets wrong
 `_test.go` files are included — they are the bundle's own acceptance gate, `make bundle-verify`
 running `go test ./...` inside the extracted bundle is what proves the extraction is complete —
 with one exception: a test file is **skipped** if it imports a `kdb/...` package outside the
-closure, rather than copied alongside a `go mod tidy` that can't resolve it. Today that's exactly
-one file, `kdb/embed/database_backup_test.go` (it deliberately exercises `kdb/backup` and
-`kdb/recovery`, both out of scope for an embedder); `testFileNeedsOutOfScopeImport` in
+closure, rather than copied alongside a `go mod tidy` that can't resolve it. Today that's three
+files: `kdb/embed/database_backup_test.go` and `kdb/server/backup_txn_test.go` (both deliberately
+exercise `kdb/backup` and `kdb/recovery`, out of scope for the bundle), and
+`kdb/server/panic_recovery_test.go` (drives the server through the out-of-scope `kdb/client`).
+`testFileNeedsOutOfScopeImport` in
 `go/embedbundle/main.go` detects it generically by parsing the file's imports, so a future test
 added the same way is skipped too rather than silently breaking the bundle build again.
 
@@ -154,7 +170,7 @@ kdb-go-embed-<version>/
                          # consumer can report which drop it vendored without parsing bundle.json
   rewrite-module.sh     # optional: re-home the bundle under a different module path
   testdata/golden/...   # fixtures kdb/codec and kdb/index/fusion's golden tests read
-  kdb/...               # the 27 packages
+  kdb/...               # the 40 packages
 ```
 
 `go.mod` keeps the module path `github.com/limidus/kdb/go`, so **no import path in any copied
@@ -163,9 +179,10 @@ file is rewritten** — the bundle is the same code, not a transformed copy. Two
 - Drop the `tool golang.org/x/mobile/cmd/gobind` directive, which drags `x/mobile`, `x/mod` and
   `x/tools` into the module graph for a tool the bundle has no use for.
 - Run `go mod tidy` inside the staged bundle. This prunes the requires down to what the closure
-  actually needs — `aws-sdk-go-v2` (+`config`, `credentials`, `s3`), `klauspost/compress`,
-  `x/crypto`, and 14 indirects. `golang.org/x/sync`, `x/mobile`, `x/mod` and `x/tools` all fall
-  away.
+  actually needs — `aws-sdk-go-v2` (+`config`, `credentials`, `s3`), `dop251/goja`,
+  `klauspost/compress`, `x/crypto`, `x/sync`, and 18 indirects. `x/mobile`, `x/mod` and `x/tools`
+  all fall away. `goja` (pulled in by `kdb/script`) and `x/sync` (used by `kdb/server`) are pure
+  Go and arrived with the `kdb/server` entry point.
 
 The staging directory is scratch: after the zip is written, `go/embedbundle` deletes it, so
 `dist/bundle/` only ever holds the `.zip` — nothing loose duplicating the archive's contents in
@@ -194,18 +211,19 @@ convenience, not the supported path — the `replace` directive is.
 
 ### 2.5 Validated, not assumed
 
-`make bundle-verify` runs this for real every time; the checks below were re-run against the
-`v0.4.0` output, from two independent output directories to rule out any built-in-path leakage:
+`make bundle-verify` runs this for real every time; the checks below were first run against the
+`v0.4.0` output, and re-run when `kdb/server` became an entry point (after `v0.6.2`), from two
+independent output directories to rule out any built-in-path leakage:
 
 | Check | Result |
 |---|---|
 | `go build ./...` in the extracted bundle | OK |
 | `go vet ./...` | OK |
-| `go test ./...` (27 packages) | all `ok`, no failures |
+| `go test ./...` (40 packages) | all `ok`, no failures |
 | Cross-compile `linux/amd64`, `linux/arm64`, `darwin/arm64` (release platforms) | OK |
 | Cross-compile `windows/amd64`, `js/wasm` (closure-coverage check) | OK |
 | Two independent runs, different output paths, one second apart | byte-identical zip (see §3) |
-| Size | 351 files, 2.7 MB unpacked, ~708 KB zipped |
+| Size | 665 files, 4.6 MB unpacked, ~1.66 MB zipped (was 426 files, 2.5 MB, ~914 KB before `kdb/server`) |
 
 ### 2.6 Known wart — the AWS SDK
 
@@ -266,6 +284,12 @@ commit and PR list, so the prose is pasted onto the GitHub release after the tag
 file is the source of truth: it is reviewable before the tag exists, and a release whose notes
 were edited on GitHub alone leaves no trace in the tree. Releases up to and including `v0.6.1`
 predate this and have their prose only on the GitHub release object.
+
+Notes for changes that land on `main` between releases accumulate in
+`docs/releases/unreleased.md`, in the same PR as the change. The `VERSION` bump renames that file
+to `docs/releases/vX.Y.Z.md` and writes the release's summary on top. A known issue listed in a
+shipped release's notes stays there — those notes describe that release — and the fix is recorded
+in the next release's notes, which say which earlier known issue it closes.
 
 ---
 
@@ -402,11 +426,13 @@ described in this document, not just planned.
 ## 7. Open decisions
 
 1. **Bundle scope.** This plan takes the full in-process surface — engine + `database/sql` driver
-   + KDB-SQL + hybrid query + index (27 packages). Dropping `kdb/sql`, `kdb/query/hybrid` and
-   `kdb/index` gives a 21-package KV/document-only bundle. Note that `kdb/driver` does **not**
-   import `kdb/sql`, so the smaller bundle is coherent — but it is a database whose embedders
-   cannot write SQL. Full is the default; editing `go/embedbundle/entrypoints.txt` is the whole
-   change needed to switch.
+   + KDB-SQL + hybrid query + index — plus the `kdb/server` engine (40 packages). `kdb/server` was
+   added after v0.6.2 because a downstream project (Zolik) imports it to build its own server image;
+   without it the in-process surface alone is 27 packages. Dropping `kdb/sql`, `kdb/query/hybrid`
+   and `kdb/index` from that in-process surface gives a smaller KV/document-only bundle. Note that
+   `kdb/driver` does **not** import `kdb/sql`, so the smaller bundle is coherent — but it is a
+   database whose embedders cannot write SQL. Full is the default; editing
+   `go/embedbundle/entrypoints.txt` is the whole change needed to switch.
 2. **Jar distribution.** Attached to the GitHub release (what's implemented) versus published to
    GitHub Packages or Maven Central. Publishing needs `maven-publish` wiring and, for Central,
    signing keys and a namespace — deferred to the parity track unless there is a consumer waiting.

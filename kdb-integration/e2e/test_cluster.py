@@ -260,10 +260,9 @@ def test_full_cluster_restart_keeps_the_converged_state(make_cluster):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("peer_spec", [
-    pytest.param("bootstrap=snapshot", marks=pytest.mark.xfail(strict=False, reason=(
-        "a snapshot-bootstrapped node is stuck forever once a peer commits on a branch forked "
-        "behind its shallow root: 'storing commit ...: missing parent ...' "
-        "(found by this test; fixed by #111 - remove this mark once it lands)"))),
+    # Without deepen this used to stick forever on "missing parent" once a peer committed on a
+    # branch forked behind the joiner's snapshot root; #111 fetches just the fork point's state.
+    "bootstrap=snapshot",
     "bootstrap=snapshot,deepen=true",
 ])
 def test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes(make_cluster, peer_spec):
