@@ -325,15 +325,27 @@ public class DefaultWriteAheadLog internal constructor(
     }
 }
 
+/**
+ * Opens or creates a WAL. The rotation cap comes from [walMaxSegmentBytes] when set, otherwise
+ * from [StorageEngineConfig.walMaxSegmentBytes] (64 MiB unless configured) - the same order as
+ * Go's `wal.DefaultFactory`.
+ */
 public class DefaultWriteAheadLogFactory(
-    private val walMaxSegmentBytes: Long = 64L * 1024 * 1024,
+    private val walMaxSegmentBytesOverride: Long? = null,
     private val skipCorrupt: Boolean = false,
 ) : WriteAheadLogFactory {
+    init {
+        require(walMaxSegmentBytesOverride == null || walMaxSegmentBytesOverride > 0) {
+            "walMaxSegmentBytes must be positive, got $walMaxSegmentBytesOverride"
+        }
+    }
+
     override suspend fun openOrCreate(
         partitionKey: String,
         config: StorageEngineConfig,
         ioShim: PlatformIoShim,
     ): WriteAheadLog {
+        val walMaxSegmentBytes = walMaxSegmentBytesOverride ?: config.walMaxSegmentBytes
         val (chain, walIdStr) = latestWalChain(ioShim.listSegments(partitionKey))
         if (chain.isEmpty() || walIdStr == null) {
             val walId = KdbUuid.random()

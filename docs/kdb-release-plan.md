@@ -102,7 +102,7 @@ kdb/index         # index core
 kdb/server        # native server engine (wire protocol, transport, peer sync)
 ```
 
-`go list -deps` over those entry points yields the transitive closure — **40 of the module's 59
+`go list -deps` over those entry points yields the transitive closure — **40 of the module's 58
 `kdb/...` packages**:
 
 ```
@@ -127,7 +127,7 @@ platform in the matrix below.
 Excluded, because no entry point reaches them: `kdb/client`, `kdb/backup`, `kdb/recovery`,
 `kdb/integrity`, `kdb/inspect`, `kdb/interop`, `kdb/compaction`, `kdb/compute` (+`webgpu`),
 `kdb/control`, `kdb/file`, `kdb/config`, `kdb/integration`, `kdb/replication`, `kdb/service`,
-`kdb/storage/manager`, `kdb/syncnode`, `kdb/tier`, `kdb/index/internal/fixturegen`, and all of
+`kdb/storage/manager`, `kdb/syncnode`, `kdb/index/internal/fixturegen`, and all of
 `cmd/` and `wasm/`.
 
 Two rules the generator follows, both of which a naive implementation gets wrong:

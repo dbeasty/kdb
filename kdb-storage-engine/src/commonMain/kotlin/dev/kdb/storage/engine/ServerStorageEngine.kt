@@ -276,6 +276,7 @@ public class DefaultStorageEngineFactory(
     override suspend fun open(namespaceId: String, config: StorageEngineConfig): StorageEngineHandle {
         val wal =
             if (target == StorageEngineTarget.SERVER) {
+                // No factory override: the rotation cap comes from config.walMaxSegmentBytes.
                 DefaultWriteAheadLogFactory().openOrCreate(namespaceId, config, config.ioShim)
             } else {
                 null

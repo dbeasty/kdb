@@ -52,6 +52,10 @@ type defaultSubscriber struct {
 	// actually registered this subscriber. Without this, a write issued immediately after Connect
 	// can race the coordinator's own handshake processing and never reach this subscriber at all.
 	handshakeAck chan wire.Message
+	// emitMu serializes emit's check-then-send on events. terminated is set once this
+	// subscription's terminal EventDisconnected is in events, and cleared by Connect.
+	emitMu     sync.Mutex
+	terminated bool
 }
 
 // NewSubscriber creates a stream subscriber.
@@ -71,16 +75,26 @@ func NewSubscriber(w wire.Codec, transport Transport, hintApplier IndexHintAppli
 func (s *defaultSubscriber) Events() <-chan Event { return s.events }
 
 func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
+	// A new subscription needs the reserved slot free for its own terminal event (see emit).
+	s.emitMu.Lock()
+	if len(s.events) == cap(s.events) {
+		s.emitMu.Unlock()
+		return nil, errors.New("stream: events buffer is full; drain Events() before connecting again")
+	}
+	s.terminated = false
+	s.emitMu.Unlock()
+
 	conn, err := s.transport.Connect(cfg.CoordinatorURI)
 	if err != nil {
 		return nil, err
 	}
 	ackCh := make(chan wire.Message, 1)
+	stop := make(chan struct{})
 	s.mu.Lock()
 	s.conn = conn
 	s.config = &cfg
 	s.position = cfg.ResumeFrom
-	s.stopIncoming = make(chan struct{})
+	s.stopIncoming = stop
 	s.pendingReplays = make(map[int]chan wire.Message)
 	s.handshakeAck = ackCh
 	s.mu.Unlock()
@@ -113,7 +127,7 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 		f := cfg.Filter
 		hs.Request.Filter = &f
 	}
-	go s.readLoop(conn)
+	go s.readLoop(conn, stop)
 	frame, err := s.wire.Encode(hs)
 	if err != nil {
 		return nil, err
@@ -153,9 +167,18 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 }
 
 func (s *defaultSubscriber) Disconnect() error {
+	s.closeSession()
+	s.emit(Event{Kind: EventDisconnected})
+	return nil
+}
+
+// closeSession closes the connection, stops its reader and fails anything waiting on it. Safe to
+// call more than once, and from the reader itself (emit does, on overflow).
+func (s *defaultSubscriber) closeSession() {
 	s.mu.Lock()
 	conn := s.conn
 	stop := s.stopIncoming
+	s.stopIncoming = nil
 	s.conn = nil
 	stale := s.pendingReplays
 	s.pendingReplays = nil
@@ -178,15 +201,13 @@ func (s *defaultSubscriber) Disconnect() error {
 	if ackCh != nil {
 		close(ackCh)
 	}
-	s.emit(Event{Kind: EventDisconnected})
-	return nil
 }
 
-func (s *defaultSubscriber) readLoop(conn ConnectionHandle) {
+func (s *defaultSubscriber) readLoop(conn ConnectionHandle, stop <-chan struct{}) {
 	incoming := conn.Incoming()
 	for {
 		select {
-		case <-s.stopIncoming:
+		case <-stop:
 			return
 		case frame, ok := <-incoming:
 			if !ok {
@@ -332,11 +353,36 @@ func (s *defaultSubscriber) nextCorrelation() int {
 	return id
 }
 
+// emit hands ev to the consumer without ever blocking the reader and without ever losing an event
+// silently. The last slot of the events buffer is reserved for one terminal EventDisconnected per
+// subscription. When any other event finds the rest of the buffer full, the subscription is closed
+// and that terminal event, carrying an *EventOverflowError that wraps the event it could not hold,
+// takes the reserved slot. A desync error that meets a full buffer therefore still reaches the
+// consumer (errors.As finds the *DesyncError through the overflow error), and the subscriber stops
+// rather than carry on out of sync. Nothing is emitted after the terminal event until the next
+// Connect.
 func (s *defaultSubscriber) emit(ev Event) {
-	select {
-	case s.events <- ev:
-	default:
+	terminal := ev.Kind == EventDisconnected
+	s.emitMu.Lock()
+	if s.terminated {
+		s.emitMu.Unlock()
+		return
 	}
+	// Only emit sends on events, so len can only fall between this check and the send below: the
+	// send never blocks.
+	if terminal || len(s.events) < cap(s.events)-1 {
+		s.events <- ev
+		s.terminated = terminal
+		s.emitMu.Unlock()
+		return
+	}
+	s.events <- Event{
+		Kind:  EventDisconnected,
+		Cause: &EventOverflowError{Buffered: len(s.events), Dropped: ev},
+	}
+	s.terminated = true
+	s.emitMu.Unlock()
+	s.closeSession()
 }
 
 // submitTransaction is Mode 2 (write-back stream)'s write path (kdb-spec.md §8.1): send tx as a
