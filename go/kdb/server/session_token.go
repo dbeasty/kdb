@@ -45,7 +45,7 @@ func (s *KdbServerRuntime) AwaitCommit(commitHex string, wait time.Duration) err
 	}
 	contains := func() bool {
 		head, err := s.dag.Head()
-		return err == nil && (head == want || (s.dag.HasCommit(want) && s.dag.IsAncestor(want, head)))
+		return err == nil && (head == want || (s.dag.HasCommit(want) && s.dag.Incorporates(want, head)))
 	}
 	if contains() {
 		return nil

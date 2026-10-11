@@ -533,3 +533,17 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   merge-commit persist still leave unlogged commits a checkpoint will describe; the HTTP/websocket
   peer endpoint (`syncnode.Handler`) is not drained before storage closes; Kotlin peer sync was not
   checked for the same checkpoint behaviour.
+
+### 2026-10-11 — new item, found by multi-node e2e testing: mesh merge storm (branch `fix/mesh-merge-convergence`)
+
+**Symptom.** In a five-node `kdb-service` full mesh with concurrent writes and kill -9/restart (`test_cluster.py::test_rolling_kill9_soak`), the mesh failed to converge 2 of 2 times under load avg 20-45. For 150s+ after writes stopped, every head differed and kept changing, with every sync succeeding and the same 40 documents on every node. One node held 10,677 empty `kdb:merge/1` commits.
+
+**Cause.** Merges were deterministic per pair but not confluent. Fixed with canonical joins of same-content heads; see "Merge convergence in a mesh" in `docs/kdb-distributed-implementation-plan.md`.
+
+**Tests.** Failing tests first, each confirmed against the reverted fix:
+- `server/mesh_convergence_test.go`: the ring, the property and the restart tests
+- `syncnode/mesh_test.go`
+- `peersync/join_test.go`
+- `integration/join_interop_test.go` (Kotlin)
+
+**Evidence.** The e2e soak is 1 of 2 non-converging (XFAIL after 174s) with `origin/main` binaries, and 5 of 5 converged (~25s per run, about 2-3s of it after writes stop) with this branch, both under load avg 18-28.
