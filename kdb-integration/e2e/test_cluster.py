@@ -340,10 +340,6 @@ def test_sql_updates_and_deletes_replicate(make_cluster):
                         "item6": 6}, rows
 
 
-@pytest.mark.xfail(strict=False, reason=(
-    "about half the time the drained node checkpoints a peer commit it stored but never logged, "
-    "and after restart fails every sync with 'commit ... has no frame in the delta log' "
-    "(found by this test; fix in progress on fix/checkpoint-unlogged-peer-commits)"))
 def test_graceful_drain_under_load_keeps_acknowledged_writes(make_cluster):
     """SIGTERM a node while every node is writing: it drains, exits 0, and nothing it
     acknowledged is lost once it is back."""

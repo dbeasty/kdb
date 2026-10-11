@@ -511,3 +511,25 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   peer commit, after which the node fails every sync with "no frame in the delta log", 4 of 8
   runs (`fix/checkpoint-unlogged-peer-commits`). The three tests that hit them carry non-strict
   xfail marks to remove as the fixes land.
+- **2026-10-11 — new item, found by multi-node e2e testing: a drained node checkpointed peer
+  commits it never logged** (branch `fix/checkpoint-unlogged-peer-commits`, PR #113, commit 70424df). SIGTERM a
+  node of a 3-node mesh under concurrent writes and, in 5 of 20 runs here, the restarted node failed
+  every sync forever with `commit ... has no frame in the delta log`. A push that arrived as the
+  drain began was stored (`peersync.StoreCommits`, outside the write gate) and then refused by
+  `Adopt` (`serverLocalNode.Exclusive` refuses while draining), so it was never logged; the clean
+  close checkpointed the whole in-memory DAG, that commit included, with no operations; the
+  reopened DAG held it, so every sync skipped the peer's copy and then failed to log it on
+  adoption. Not drain-specific: any stored-but-unadopted commit (conflict side, unfinished
+  multi-page transfer) reached a checkpoint the same way. Fixed by marking peer-stored commits
+  unlogged until adoption logs them (`dag/unlogged.go`): checkpoints leave them out (and any
+  non-main ref naming one), the operations budget does not evict them, and a resident commit whose
+  operations the log cannot supply is refilled from a peer's copy that reproduces its hash, which
+  heals data directories v0.6.2 already wrote (verified on the preserved e2e evidence). The
+  peer-sync listener's `Close` now ends inbound sessions and waits for them, and the service closes
+  it before draining. 0 of 20 runs broken after. **Found along the way:** the ops loader indexed the
+  delta log once, on its first cold load, and never again, so any commit logged after that and then
+  evicted reported the same "no frame" error with its frame on disk; it now re-indexes the newest
+  and unseen segments on a miss. **Not fixed here, same family:** a failed `Deepen` and a failed
+  merge-commit persist still leave unlogged commits a checkpoint will describe; the HTTP/websocket
+  peer endpoint (`syncnode.Handler`) is not drained before storage closes; Kotlin peer sync was not
+  checked for the same checkpoint behaviour.

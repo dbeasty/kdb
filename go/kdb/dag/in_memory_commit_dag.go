@@ -156,6 +156,10 @@ type InMemoryCommitDag struct {
 	// been durably decided yet; provisionalGen counts every such append. See provisional.go.
 	provisional    map[codec.Hash]struct{}
 	provisionalGen uint64
+
+	// unlogged holds commits received from a peer that are not in the delta log - see
+	// unlogged.go. Lazily created.
+	unlogged map[codec.Hash]struct{}
 }
 
 // graphFile is a placeholder for the mapped on-disk commit graph
@@ -434,6 +438,7 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 		return document.CommitStub{}, err
 	}
 	delete(d.nodes, hash)
+	delete(d.unlogged, hash)
 	d.ancestryVersion++
 	stub := document.CommitStub{
 		OriginalHash: hash, ArchiveLocation: archiveLocation, StubbedAt: codec.TimestampNow(),
@@ -528,6 +533,7 @@ func (d *InMemoryCommitDag) DropShallowCommit(hash codec.Hash) error {
 	}
 	d.untrackOpsLocked(c)
 	delete(d.nodes, hash)
+	delete(d.unlogged, hash)
 	delete(d.shallow, hash)
 	delete(d.provisional, hash)
 	// Both indexes are "first writer wins", so an entry is this commit's only if it names it.
@@ -1086,6 +1092,7 @@ func (d *InMemoryCommitDag) Squash(
 	}
 	for _, h := range squashHashes {
 		delete(d.nodes, h)
+		delete(d.unlogged, h)
 		delete(d.stubs, h)
 	}
 	d.storeCommitLocked(synthetic)

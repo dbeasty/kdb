@@ -1,6 +1,7 @@
 package peersync
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -163,6 +164,10 @@ func Ingest(env IngestEnv, commits []document.Commit, incomingHead codec.Hash) (
 // adoption. It is the first half of Ingest, used alone for every page of a multi-page transfer
 // but the last. Returns how many commits were new; on error, the commits before the failing one
 // stay stored and the count says how many.
+//
+// Commits are stored marked unlogged (dag.PutUnloggedCommit) until persistAll logs them, so that
+// a checkpoint taken meanwhile - a clean close while a push is refused by the drain, a
+// maintenance pass while a conflict waits - does not describe history only memory holds.
 func StoreCommits(env IngestEnv, commits []document.Commit, stubs []document.CommitStub) (int, error) {
 	for _, s := range stubs {
 		env.DAG.PutStub(s)
@@ -170,17 +175,39 @@ func StoreCommits(env IngestEnv, commits []document.Commit, stubs []document.Com
 	stored := 0
 	for _, c := range commits {
 		if env.DAG.HasCommit(c.Hash) {
+			if err := env.refillUnlogged(c); err != nil {
+				return stored, fmt.Errorf("peer sync: repairing commit %s: %w", c.Hash.Hex(), err)
+			}
 			continue
 		}
 		if err := env.checkSkew(c); err != nil {
 			return stored, err
 		}
-		if err := env.DAG.PutCommit(c, true); err != nil {
+		if err := env.DAG.PutUnloggedCommit(c); err != nil {
 			return stored, fmt.Errorf("peer sync: storing commit %s: %w", c.Hash.Hex(), err)
 		}
 		stored++
 	}
 	return stored, nil
+}
+
+// refillUnlogged repairs a commit this node holds without operations the delta log can supply,
+// from the copy a peer just sent. Earlier versions checkpointed commits received from a peer and
+// never logged; such a commit reopens with its operations gone and no frame to load them from,
+// and since the DAG holds it, "already have it" made every later sync skip the copy that could
+// fix it and then fail when adoption needed its operations. The copy is checked against the
+// commit's hash, which covers its operations.
+//
+// Only a commit whose operations are evicted is checked, so a resident one costs a map lookup;
+// one the log does hold is left alone.
+func (env IngestEnv) refillUnlogged(c document.Commit) error {
+	if len(c.Operations) == 0 || !env.DAG.OperationsEvicted(c.Hash) {
+		return nil
+	}
+	if _, err := env.DAG.CommitOperations(c.Hash); err == nil || !errors.Is(err, dag.ErrOperationsNotLogged) {
+		return nil
+	}
+	return env.DAG.RefillUnloggedCommit(c)
 }
 
 // Adopt decides what main should point at given incomingHead, a commit already stored, and
@@ -446,18 +473,25 @@ func (env IngestEnv) clearConflict(ref string) error {
 }
 
 // persistAll queues commits for the log in order, returning what to wait on.
+//
+// Each commit's unlogged mark is cleared before its frame is queued and put back if queueing
+// fails. Not after: a checkpoint claiming the segment the frame lands in must describe the
+// commit, or the next open would skip the frame and lose it - see dag.MarkLogged.
 func (env IngestEnv) persistAll(commits []document.Commit) ([]func() error, error) {
 	var waits []func() error
 	for _, c := range commits {
+		env.DAG.MarkLogged(c.Hash)
 		switch {
 		case env.PersistAsync != nil:
 			wait, err := env.PersistAsync(c)
 			if err != nil {
+				env.DAG.MarkUnlogged(c.Hash)
 				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
 			}
 			waits = append(waits, wait)
 		case env.Persist != nil:
 			if err := env.Persist(c); err != nil {
+				env.DAG.MarkUnlogged(c.Hash)
 				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
 			}
 		}
