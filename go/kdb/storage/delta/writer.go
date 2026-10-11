@@ -298,6 +298,10 @@ func (r *DefaultReader) ReadRange(segment storage.DeltaSegmentRef, sinceCommit, 
 // same as numerically. Callers (see embed.replayDeltaNamespace) must
 // preserve this order rather than re-sorting by SegmentID - that was
 // exactly the bug Component 47 fixes (kdb-spec-layer13 §4.1).
+//
+// A segment it cannot scan is an *UnreadableSegmentError, never a silent omission: leaving it out
+// would drop every commit in it from replay, checkpoints and history. Damage the scan stops at
+// cleanly (a torn tail, a CRC mismatch) still lists, up to the damage; callers classify that.
 func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
 	prefix := storio.SegmentNameBuilder.NamespacePrefix(r.namespaceID) + "delta/"
 	names, err := r.shim.ListSegments(r.namespaceID)
@@ -321,12 +325,36 @@ func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
 			return nil, &LegacySegmentFormatError{NamespaceID: r.namespaceID, Names: []string{name}}
 		}
 		ref, err := r.scanSegmentRef(name, seq)
-		if err != nil || ref == nil {
-			continue
+		if err == nil && ref == nil {
+			err = errors.New("scan produced no segment reference")
+		}
+		if err != nil {
+			// A segment deleted between the listing above and this read - truncation running
+			// alongside a reader - is not damage: it is simply no longer part of the log.
+			// Anything else is. Skipping it used to drop every commit in it from replay,
+			// checkpoints and history without a word (issue #43, U6c).
+			if gone, listErr := r.segmentGone(name); listErr == nil && gone {
+				continue
+			}
+			return nil, &UnreadableSegmentError{NamespaceID: r.namespaceID, Sequence: seq, Name: name, Err: err}
 		}
 		out = append(out, *ref)
 	}
 	return out, nil
+}
+
+// segmentGone reports whether name has disappeared from the namespace's listing.
+func (r *DefaultReader) segmentGone(name string) (bool, error) {
+	names, err := r.shim.ListSegments(r.namespaceID)
+	if err != nil {
+		return false, err
+	}
+	for _, n := range names {
+		if n == name {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (r *DefaultReader) readFullSegment(segmentName string, sizeBytes int64) ([]byte, error) {
@@ -525,6 +553,29 @@ func (e *LegacySegmentFormatError) Error() string {
 			"namespace before opening it (see kdb-spec-layer13-resource-governance.md §4.1)",
 		e.NamespaceID, len(e.Names), e.NamespaceID)
 }
+
+// UnreadableSegmentError reports a delta segment ListSegments found but could not read: an I/O
+// error, or a frame that passes its CRC and still will not decode (a damaged header field, which
+// the body CRC does not cover). Neither is the shape of a torn tail - a write cut short leaves a
+// frame that is missing bytes or fails its CRC, and the scan stops cleanly before it - so this
+// is reported wherever the segment is, newest or not. Detect with errors.As; the cause stays
+// reachable through Unwrap.
+type UnreadableSegmentError struct {
+	NamespaceID string
+	Sequence    int64
+	Name        string
+	Err         error
+}
+
+func (e *UnreadableSegmentError) Error() string {
+	return fmt.Sprintf(
+		"kdb: namespace %q: delta segment %d (%s) cannot be read, so the commits in it cannot be "+
+			"recovered from this log - run 'kdb-inspect verify' to classify the damage and "+
+			"'kdb-inspect repair-segments' to repair it: %v",
+		e.NamespaceID, e.Sequence, e.Name, e.Err)
+}
+
+func (e *UnreadableSegmentError) Unwrap() error { return e.Err }
 
 // Factory opens delta writers and readers.
 type Factory struct {

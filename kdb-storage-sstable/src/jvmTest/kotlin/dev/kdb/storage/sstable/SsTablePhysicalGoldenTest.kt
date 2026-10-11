@@ -36,8 +36,8 @@ class SsTablePhysicalGoldenTest {
             val (_, _, segment) = buildFixtureSegment()
             writeHex("sstable_segment.hex", segment)
             writeHex("sstable_footer.hex", footerOf(segment))
-            // The shape Kotlin/JS and Native write (no zstd there, so every block is CODEC_NONE -
-            // docs/kdb-open-issues-plan.md U5). Go must read it. Unlike the zstd segment above,
+            // The shape a NONE-configured writer produces - and every Kotlin/JS and Native writer
+            // between U5 and roadmap R1 (docs/kdb-open-issues-plan.md). Go must read it. Unlike the zstd segment above,
             // nothing in it depends on a compressor, so it is byte-stable on every platform.
             writeHex("sstable_segment_none.hex", buildFixtureSegment(CompressionCodec.NONE).third)
         }

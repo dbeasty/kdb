@@ -134,7 +134,7 @@ Can ride along with U1 or U3.
 
 ### U5. JS/Native write zstd-tagged blocks that are not zstd — S/M, format correctness
 
-**Status: done** (#109). Real zstd on those targets is R1, in progress (#116).
+**Status: done** (#109). Real zstd on those targets is R1, done in #116.
 
 **Problem.** On JS and Native, `ZstdCompression.compress` is a 4-byte length prefix plus the raw bytes
 (`kdb-compression/src/jsMain/.../ZstdCompression.js.kt:3-31`,
@@ -162,7 +162,8 @@ readable data but still can't read JVM/Go-written compressed data. Say so in the
 
 ### U6. Issue #43 — acknowledged write unreadable after `kill -9` — L, in four steps
 
-**Status: U6a done** (#112, which also added the multi-node suite); **U6b–U6d open.** U6c's two silent recovery paths are still open.
+**Status: U6a done** (#112, which also added the multi-node suite); **U6c done** (#121; see the
+progress log, which also records a third silent path it found); **U6b done** (#122: the server-path reproducer, plus a nightly Linux soak); **U6d: no loss reproduced** in 620 kills across five configurations (110,950 acknowledged writes). #43 stays open until the nightly Linux soak has run (see the progress log).
 
 The durability contract is the most important open item. It is sequenced so each step is its own PR
 and each makes the next one possible. **Do not relax or retry the test** at any step.
@@ -324,7 +325,7 @@ and commit-graph plans. These are listed so they're tracked, not scheduled.
 
 | # | Item | State at `e125a10` | First step |
 |---|---|---|---|
-| R1 | Real zstd on Kotlin JS/Native | stub; after U5 at least not wrong | Decoder-only is enough to read JVM/Go data: pure-JS `fzstd` via `npm()` on JS; cinterop to libzstd on Native |
+| R1 | Real zstd on Kotlin JS/Native | **Done** 2026-10-11 (#116, branch `feat/zstd-js-native`): pure-Kotlin decoder and encoder in `kdb-compression` commonMain, both directions on both targets — see the progress log | — |
 | R2 | Go LSM leveled compaction | `LsmBlobStore.Compact` always merges to one table (`sstable/types.go:235-294`) | Measure write amplification at realistic sizes first |
 | R3 | Commit graph on disk | Phase 1 (generation numbers) + settings landed, off by default; `KDB_GRAPH_FILE` is accepted and ignored (`config/descriptors.go:625-627`) | **Phase 0 measurement** at 100k/500k/2M commits; it gates the rest (`docs/kdb-commit-graph-on-disk.md`). Also: stop accepting the ignored flag, or warn. |
 | R4 | Kotlin history-mode parity | wire messages 0x1F-0x22 are Go-only; Kotlin NONE is validator-only | Decide whether Kotlin needs NONE at all (it's the embedded/reference tree) |
@@ -626,6 +627,138 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   `Disconnect` closed `stopIncoming` twice (panic), and `readLoop` read `s.stopIncoming` without the
   lock; both fixed. Still open, same family: `Coordinator.updateSubscriber` drops `SubscriberState`
   updates on a full 16-slot channel, and a closed `clientLink` is never removed from its hub.
+
+- **2026-10-11 — U6c: recovery's two silent paths (branch `fix/recovery-silent-skips`).**
+  1. `delta.DefaultReader.ListSegments` (`storage/delta/writer.go`) `continue`d past any segment
+     `scanSegmentRef` could not scan. That happens only for an I/O error or a frame that passes its
+     body CRC and still will not decode (a header field such as the codec byte at offset 5 is
+     outside the CRC). A torn write never gets there: a short frame or a CRC mismatch stops the
+     scan cleanly and still lists. It is now a typed `*delta.UnreadableSegmentError` (namespace,
+     sequence, file, cause), newest segment or not. The one tolerated case is a segment that is no
+     longer listed when re-checked, which is truncation deleting it between the listing and the
+     read. Callers: replay, checkpoint matching, the ops loader, the cold loader, history, truncate
+     and restore-archive all propagate it or already treated a listing error as "don't trust".
+     `kdb-inspect verify` and backup read segments themselves and are unchanged.
+     **Before**, codec byte damaged in the first frame of the newest non-empty segment: open
+     succeeded with main 3 commits behind the last acknowledged one, with or without a checkpoint.
+     In a non-newest segment it failed with the misleading "parent commits never found in the log".
+     **After**, both fail with `UnreadableSegmentError` naming the segment. A torn newest segment
+     still opens at its last intact commit.
+  2. Replay (`embed/delta_replay.go` `applyReplayedCommit`) stores a logged commit that neither
+     extends main's head nor supersedes it, and does not apply it. Which commits are applied is
+     unchanged. Open now collects them and, after the whole log is read, splits them by whether
+     main reaches them. Those main reaches are a peer's commits a logged merge adopted, which is
+     expected, so they are counted but not logged. Those it does not reach get one `slog.Warn` each
+     (`namespace`, `commit`, `head` it failed to extend, `mainHead`), capped at 20 lines plus a
+     count. A single-writer log has neither. The counts are in `embed.RecoveryReport`
+     (`rt.Recovery()`: `replayedInFull`, `commitsNotApplied`, `commitsOffMain`) and in
+     `GET /v1/ns/{ns}/status` as `recovery`, so a crash test's service log and status both show it.
+  **Tests** (each confirmed failing with its fix reverted): `storage/delta/unreadable_segment_test.go`,
+  `embed/unreadable_segment_test.go` (file-backed: non-newest and newest, with and without a
+  checkpoint, plus a torn newest segment), `server/replay_unapplied_test.go` (an unmerged peer commit
+  counted and logged at WARN, a merged one counted and not logged, a single-writer log reporting
+  zero), and `control/recovery_status_test.go`.
+  **Found, not fixed (same family):** (a) replay's torn-tail rule accepts a `CorruptFrameError`
+  anywhere in the newest segment, even with intact frames after it. A CRC-valid frame that will not
+  decode in the middle of the newest segment therefore truncates the rest of that segment with
+  only a `log.Printf`. Per the #81 rule, a torn tail can only be at the end. (b) **silent loss, worth its own
+  unit:** `scanSegmentRef` ends a segment at a garbled frame header or a CRC mismatch, in any
+  segment, and records only the bytes before it as the segment's size. Replay therefore never sees
+  damage in a non-newest segment, so its "corrupt and not the most recent segment" refusal cannot
+  fire for `DefaultReader`. The damage is caught only indirectly: by checkpoint matching, or by
+  later commits whose parents are missing. A probe showed the silent case: 6 commits in one run,
+  then a run that wrote nothing (an empty newer segment), the 4th frame's magic flipped, and the
+  checkpoint removed. Open succeeded at commit 3 of 6 with no error and no log line. Simply refusing
+  is wrong, because a torn tail from an earlier killed run legitimately ends a segment that is no
+  longer the newest. The correct test is "intact frames after the stop" (the #81 rule;
+  `SkimSegment` / `DamageTolerantReader` can already read past damage).
+
+### 2026-10-11 — R1: real zstd on Kotlin/JS and Kotlin/Native (#116, branch `feat/zstd-js-native`)
+
+- **Choice.** A pure-Kotlin codec in `kdb-compression`'s commonMain, used by both JS and Native;
+  the JVM keeps zstd-jni. Rejected: `fzstd` (decoder only, and JS only), `@bokuweb/zstd-wasm` /
+  `zstd-codec` (async wasm initialisation behind the synchronous `ZstdCompression` API, a
+  different loader for node and the browser, 0.9MB and 2.1MB unpacked; all three are MIT), and cinterop to libzstd (a static
+  library per target - linuxX64 on the ubuntu runner, macosArm64 only on macOS - for one of the two
+  targets). One decoder (`ZstdDecoder`, RFC 8878: every block, literals and sequence-table mode,
+  XXH64 checksum, concatenated and skippable frames; no dictionaries) serves both targets and runs
+  under the JVM's differential tests against libzstd.
+- **Both directions.** `ZstdEncoder` writes real frames: greedy hash matches that try the most
+  recent offset first, repeat-offset codes, Huffman-coded literals (direct or FSE-compressed
+  weights), and per-block RLE, predefined or custom FSE tables for the sequence codes. Frames are
+  single-segment, with content size and checksum always present. It matches zstd-jni level 3 on
+  small payloads (158-byte record: 143 bytes each; 700-byte JSON: 232 vs 230) and is about 1.2x
+  its size on large ones (400KB JSON: 79,141 vs 65,497), and Go and the JVM read it. So `canCompress` and `canDecompress` (replacing `isAvailable`) are both true
+  everywhere, and JS/Native SSTable blocks, delta pages and ice bundles are zstd again. The split
+  stays so a decode-only target remains expressible; every writer checks `canCompress`.
+- **Errors.** Malformed input throws `ZstdFormatException` (an `IllegalArgumentException`) on
+  every target; the JVM now wraps zstd-jni's `ZstdException` the same way. `ZstdUnavailableException`
+  is gone - nothing throws it.
+- **Tests.** Golden fixtures are compiled into commonTest (`gradle/physical-golden-fixtures.gradle.kts`),
+  so JS (node and browser) and Native read Go's and the JVM's bytes: a zstd corpus from klauspost
+  (levels 1/3/7/19), zstd-jni (1/3/19 and a streamed frame without content size) and the
+  pure-Kotlin encoder; both `sstable_segment.hex` fixtures; and a new `delta_segment_zstd.hex` from
+  each side. JS/Native assert their encoder output equals the committed `_purekotlin` fixtures,
+  which Go decodes (`TestKotlinZstdCorpusCrossDecodes`). Corruption: truncated, flipped and zeroed
+  frames fail typed, never with another exception and never with wrong bytes from a checksummed
+  frame. Restoring the pre-R1 stubs fails 4 kdb-compression, 2 SSTable and 2 delta tests on both
+  jsNode and macosArm64.
+- **Found along the way.**
+  - A zero-length body is a valid "frame" (Go writes nothing for an empty payload), so a body
+    truncated to zero bytes decodes to empty output. Every KDB format stores the uncompressed
+    length beside the body and checks it, which is where that truncation is caught.
+  - A pre-U5 Native data directory (length-prefixed blocks tagged ZSTD) now fails with
+    `ZstdFormatException` (bad frame magic) instead of `ZstdUnavailableException` - still refused,
+    never misread. No such directory was ever released.
+  - The encoder was built up in three steps in this PR; measured on the 400KB JSON corpus
+    (zstd-jni level 3: 65,497): raw literals and predefined tables 108,624; + Huffman literals
+    104,986; + per-block sequence tables and repeat offsets 79,141. A 128KB block of that corpus
+    has ~4KB of literals but ~10,700 sequences, so sequence coding was the gap: custom tables alone
+    took it to 79,321, repeat offsets alone only to 104,483. Huffman and repeat offsets matter
+    most on small payloads (700-byte JSON: 299 -> 265 -> 232).
+  - The repeat-offset history persists across a frame's compressed blocks but a raw block leaves
+    the decoder's untouched, so the encoder rolls its history back when it stores a block raw
+    (`rawBlockDoesNotAdvanceRepeatOffsets`). A wrong update to the third history slot can survive
+    round-trip tests (the greedy parser rarely reads it), so `RepeatOffsetsTest` checks every
+    step against an RFC model.
+  - Not done: lazy matching (the rest of the large-input gap) and repeat-mode tables; and no
+    throughput numbers - the machine's load average was 50-140 for most of the work.
+- **2026-10-11 — U6b and U6d (issue #43).** U6b: `go/kdb/integration/kill9_server_test.go` builds
+  the real `kdb-service` and, on ONE data directory, repeatedly: six connections write their own
+  documents over the wire (`PutJSON` replaces and `Upsert` merges; writer 0 reconnects for every
+  write, the e2e test's shape), the process is SIGKILLed at a random moment, it restarts with
+  `GOMAXPROCS=2`, and every write acknowledged in ANY iteration so far must read back at its
+  acknowledged value or later. So recovery is tested on top of recovered data, kill after kill.
+  It reports missing, rolled-back and unreadable documents separately, keeps the data directory
+  and every launch's log, and prints a seed to replay the kill timing. `KDB_KILL9_ITERATIONS` and
+  `KDB_KILL9_SERVICE_ARGS` set the soak. **Control:** with `--durability async`, which may lose
+  acknowledged writes by design, it fails on the first kill with every document reported rolled
+  back, so a pass means something. It runs 3 kills in the normal suite, and a new nightly job
+  (`kill9-soak` in `e2e-nightly.yml`) runs 150 + 60 on Linux, where #43 was seen, uploading the
+  data directory on failure.
+  U6d results, macOS, every acknowledged write intact in all of them:
+
+  | Configuration | Kills | Acknowledged writes |
+  |---|---|---|
+  | default (`sync`) | 300 | 36,462 |
+  | checkpoints mid-load (`--maintenance-interval 200ms`) | 80 | 14,803 |
+  | `history=none`, 1 s retention (old segments deleted) | 80 | 32,503 |
+  | tiny document, ops and tree caches (reads from the log) | 80 | 11,543 |
+  | preallocated segments + `--sync-mode fast` | 80 | 15,819 (slowest restart 9.7 s; see N4) |
+
+  So the server's acknowledge-then-crash path holds on this machine. The original #43 failure
+  reported its FIRST document (`...01`) as lost, and the old test reported any failed read as lost
+  (fixed in U6a), so a read error after restart is as likely as data loss. #43 stays open until
+  the nightly Linux soak has run. Found along the way, both with their own PRs:
+  **(N4)** crash-recovery startup costs commits × SSTable size: `LsmBlobStore.Lookup` builds a
+  fresh reader per lookup, and `DefaultReader.Index()` reads the WHOLE table in 8 KB chunks just
+  to learn its size, then re-parses the footer index, on every lookup. Replay probes every tree
+  object, so 14,736 commits with no checkpoint took 28 s to open (24 documents, a 1.3 MB table).
+  That surfaced as "not ready after 30 s" in the preallocation run; the test now waits 2 minutes
+  and reports the slowest restart instead. Fix: `perf/sstable-index-cache`.
+  **(N5)** the third silent recovery path from U6c: damage in the middle of a segment that is no
+  longer the newest truncates that segment at the damage, with no error.
+
 - **2026-10-11 — found while working on #43 (U6): crash-recovery open scaled with commits ×
   SSTable size** (branch `perf/sstable-index-cache`). The #43 kill -9 reproducer left a namespace
   with 14,736 commits and no checkpoint; it took 28 s to open (~1.9 ms per replayed commit, 24

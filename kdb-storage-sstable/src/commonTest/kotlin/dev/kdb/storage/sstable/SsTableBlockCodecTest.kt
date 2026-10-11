@@ -20,7 +20,7 @@ class SsTableBlockCodecTest {
     fun defaultCodecRoundTripsAndRecordsTheCodecActuallyUsed() =
         runTest {
             val (blockCodec, _) = writeOneBlock(codec = null)
-            val want = if (ZstdCompression.isAvailable) SsTableCodec.BLOCK_CODEC_ZSTD else SsTableCodec.BLOCK_CODEC_NONE
+            val want = if (ZstdCompression.canCompress) SsTableCodec.BLOCK_CODEC_ZSTD else SsTableCodec.BLOCK_CODEC_NONE
             assertEquals(want, blockCodec, "a block must record the codec its body was actually written with")
         }
 
@@ -54,11 +54,12 @@ internal suspend fun writeOneBlock(codec: CompressionCodec?): Pair<Byte, ByteArr
 }
 
 /**
- * Shared by jsTest and nativeTest: on a target with no real zstd, the default writer must emit
- * CODEC_NONE (which Go and the JVM read), and the stub must refuse rather than misread.
+ * Shared by jsTest and nativeTest: roadmap R1 gave those targets a real (pure-Kotlin) zstd, so the
+ * default writer must now compress, as Go and the JVM do. Until R1 they wrote CODEC_NONE blocks;
+ * that the frames they write are ones Go reads is kdb-compression's ZstdGoldenCorpus.
  */
-internal suspend fun assertTargetWithoutZstdWritesNone() {
-    assertEquals(false, ZstdCompression.isAvailable, "this target has no zstd codec linked (roadmap R1)")
+internal suspend fun assertTargetWritesZstdBlocks() {
+    assertEquals(true, ZstdCompression.canCompress, "roadmap R1: this target writes real zstd")
     val (blockCodec, _) = writeOneBlock(codec = null)
-    assertEquals(SsTableCodec.BLOCK_CODEC_NONE, blockCodec, "a target without zstd must not tag blocks ZSTD")
+    assertEquals(SsTableCodec.BLOCK_CODEC_ZSTD, blockCodec, "the default writer compresses blocks")
 }

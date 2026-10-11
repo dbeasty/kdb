@@ -117,13 +117,14 @@ internal object DeltaPageCodec {
         }
 
     /**
-     * The codec a frame is actually written with: ZSTD degrades to NONE on a platform without a
-     * real zstd ([ZstdCompression.isAvailable] false: Kotlin/JS and Native). The frame records it,
-     * so readers on every platform decode it. Before this, JS and Native wrote a length-prefixed
-     * copy of the payload and tagged it ZSTD, which Go and the JVM could not read.
+     * The codec a frame is actually written with: ZSTD degrades to NONE on a platform that cannot
+     * write zstd ([ZstdCompression.canCompress] false - none today; JS and Native use the
+     * pure-Kotlin encoder since roadmap R1). The frame records it, so readers on every platform
+     * decode it. Before U5, JS and Native wrote a length-prefixed copy of the payload and tagged
+     * it ZSTD, which Go and the JVM could not read.
      */
     fun effectiveCodec(codec: CompressionCodec): CompressionCodec =
-        if (codec == CompressionCodec.ZSTD && !ZstdCompression.isAvailable) CompressionCodec.NONE else codec
+        if (codec == CompressionCodec.ZSTD && !ZstdCompression.canCompress) CompressionCodec.NONE else codec
 
     fun frame(payload: ByteArray, codec: CompressionCodec): ByteArray {
         val id = codecId(effectiveCodec(codec))

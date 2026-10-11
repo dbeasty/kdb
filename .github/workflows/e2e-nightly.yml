@@ -39,6 +39,40 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  kill9-soak:
+    # Issue #43 (U6b in docs/kdb-open-issues-plan.md): SIGKILL the real kdb-service at random
+    # moments under concurrent writes over the wire, 150 times on one data directory, and check
+    # every acknowledged write after each restart. The issue was only ever seen on a Linux runner;
+    # local soaks are on macOS, so this is where the Linux evidence comes from. The child runs
+    # with GOMAXPROCS=2. On failure the data directory and every launch's log are uploaded.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - name: Kill -9 soak, default durability
+        working-directory: go
+        env:
+          KDB_KILL9_ITERATIONS: "150"
+          TMPDIR: ${{ runner.temp }}
+        run: go test -count=1 -timeout 50m -run TestServerKill9 -v ./kdb/integration/
+      - name: Kill -9 soak, checkpoints mid-load
+        working-directory: go
+        env:
+          KDB_KILL9_ITERATIONS: "60"
+          KDB_KILL9_SERVICE_ARGS: "--maintenance-interval 200ms"
+          TMPDIR: ${{ runner.temp }}
+        run: go test -count=1 -timeout 30m -run TestServerKill9 -v ./kdb/integration/
+      - name: Upload kill -9 evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kill9-evidence-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kdb-kill9-data-*
+          if-no-files-found: ignore
+          retention-days: 14
+
   s3-integration:
     runs-on: ubuntu-latest
     services:

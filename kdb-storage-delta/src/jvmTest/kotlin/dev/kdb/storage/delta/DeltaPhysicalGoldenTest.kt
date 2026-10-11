@@ -1,12 +1,8 @@
 package dev.kdb.storage.delta
 
-import dev.kdb.codec.KdbHash
-import dev.kdb.codec.KdbTimestamp
-import dev.kdb.codec.KdbUuid
 import dev.kdb.compression.Crc32
 import dev.kdb.compression.ZstdCompression
 import dev.kdb.document.KdbCommit
-import dev.kdb.document.KdbOp
 import dev.kdb.storage.CompressionCodec
 import dev.kdb.storage.DeltaAuthorshipEnvelope
 import dev.kdb.storage.DeltaRecord
@@ -43,10 +39,13 @@ class DeltaPhysicalGoldenTest {
         // P4: shapes Go must be able to consume - an ordinary zstd-jni frame, and an empty one.
         writeHex("zstd_body.hex", ZstdCompression.compress(ZSTD_FIXTURE.encodeToByteArray()))
         writeHex("zstd_empty_body.hex", ZstdCompression.compress(ByteArray(0)))
-        // U5: a whole segment as Kotlin/JS and Native write it - through the real segment writer,
-        // every page CODEC_NONE because those targets have no zstd. Compressor-independent, so
-        // Go compares it byte for byte as well as reading it.
+        // U5: a whole CODEC_NONE segment through the real segment writer - what a NONE-configured
+        // writer produces, and what Kotlin/JS and Native wrote between U5 and roadmap R1.
+        // Compressor-independent, so Go compares it byte for byte as well as reading it.
         writeHex("delta_segment_none.hex", fixtureWriterSegment(CompressionCodec.NONE))
+        // R1: the same segment as the JVM writes it by default (zstd-jni pages). Go replays it;
+        // DeltaZstdGoldenReadTest replays it - and Go's - on every Kotlin target.
+        writeHex("delta_segment_zstd.hex", fixtureWriterSegment(CompressionCodec.ZSTD))
     }
 
     // U5: the writer's CODEC_NONE segment is exactly the two frames DeltaPageCodec makes, in order.
@@ -203,41 +202,15 @@ class DeltaPhysicalGoldenTest {
     private companion object {
         const val NAMESPACE_ID = "fixture-ns"
         const val ZSTD_FIXTURE = "kdb zstd interop fixture payload, long enough to actually compress"
-        val TIMESTAMP: KdbTimestamp = KdbTimestamp.fromEpochMicros(1_700_000_000_123_456L)
-
-        fun hash(seed: Int): KdbHash = KdbHash.fromBytes(ByteArray(32) { (seed + it).toByte() })
-
         fun readIntBe(b: ByteArray, off: Int): Int =
             ((b[off].toInt() and 0xFF) shl 24) or ((b[off + 1].toInt() and 0xFF) shl 16) or
                 ((b[off + 2].toInt() and 0xFF) shl 8) or (b[off + 3].toInt() and 0xFF)
     }
 
-    private fun fixtureCommit(): KdbCommit =
-        KdbCommit.build(
-            parentHashes = listOf(hash(1), hash(2)),
-            namespaceId = NAMESPACE_ID,
-            transactionId = KdbUuid.fromString("11111111-2222-3333-4444-555555555555"),
-            timestamp = TIMESTAMP,
-            authorNodeId = KdbUuid.fromString("66666666-7777-8888-9999-aaaaaaaaaaaa"),
-            operations = emptyList<KdbOp>(),
-            documentTreeHash = hash(3),
-            schemaHash = null,
-            message = "fixture commit 〰",
-        )
+    private fun fixtureCommit(): KdbCommit = DeltaGoldenCommits.first()
 
-    /** A child of [fixtureCommit]: the second commit in the CODEC_NONE golden segment. */
-    private fun secondFixtureCommit(): KdbCommit =
-        KdbCommit.build(
-            parentHashes = listOf(fixtureCommit().hash),
-            namespaceId = NAMESPACE_ID,
-            transactionId = KdbUuid.fromString("11111111-2222-3333-4444-555555555556"),
-            timestamp = KdbTimestamp.fromEpochMicros(1_700_000_000_123_457L),
-            authorNodeId = KdbUuid.fromString("66666666-7777-8888-9999-aaaaaaaaaaaa"),
-            operations = emptyList<KdbOp>(),
-            documentTreeHash = hash(4),
-            schemaHash = null,
-            message = "second fixture commit",
-        )
+    /** A child of [fixtureCommit]: the second commit in the golden segments. */
+    private fun secondFixtureCommit(): KdbCommit = DeltaGoldenCommits.second()
 
     /** [fixtureCommit] then [secondFixtureCommit], appended through [DefaultDeltaSegmentWriter]. */
     private fun fixtureWriterSegment(codec: CompressionCodec): ByteArray =
