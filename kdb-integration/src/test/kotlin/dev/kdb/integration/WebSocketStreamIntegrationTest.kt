@@ -175,9 +175,8 @@ class WebSocketStreamIntegrationTest {
     ): R {
         val peerServer = JvmNetworkWebSocketServer()
         val streamServer = JvmNetworkWebSocketServer()
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val peerJob =
-            scope.launch {
+            testScope.launch {
                 peerServer.start("127.0.0.1", 0, "/kdb") { conn ->
                     conn.incoming().collect { frame ->
                         val ack = peerHost.handleFrame(frame)
@@ -186,7 +185,7 @@ class WebSocketStreamIntegrationTest {
                 }
             }
         val streamJob =
-            scope.launch {
+            testScope.launch {
                 streamServer.start("127.0.0.1", 0, "/kdb/stream") { conn ->
                     handleStreamConnection(conn, streamHub)
                 }
@@ -200,7 +199,6 @@ class WebSocketStreamIntegrationTest {
             streamServer.stop()
             peerJob.cancel()
             streamJob.cancel()
-            scope.cancel()
         }
     }
 }

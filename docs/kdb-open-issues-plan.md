@@ -345,6 +345,96 @@ _(append one entry per unit: date, unit, PR, commit, and anything found along th
   panic. `Set` is the one production caller (`sql/dml.go`, SQL `UPDATE ... SET` on a JSON path), so
   that path was reachable from a SQL statement; it now gets an error. Table test
   `go/kdb/json/getter_errors_test.go` fails with panics on `main`.
+### 2026-10-11 — U2: `kdb/server` in the embeddable Go bundle
+
+PR #108 (branch `fix/embedbundle-kdb-server`, commit `c043449`), supersedes #26 (left open for the user to close).
+`kdb/server` added to `go/embedbundle/entrypoints.txt`; #26's EMBEDDING.md and README text carried
+over; `docs/kdb-release-plan.md` §2.1, §2.2, §2.3, §2.5 and §7.1 rewritten from `main`'s version;
+`Makefile` comment updated; new `go/embedbundle/main_test.go` asserts every entry point is in the
+computed closure and no file in any closure package imports `"C"` (counts deliberately not
+asserted). Probed it: a temporary `import "C"` file in `kdb/server` fails the test.
+
+Measured on this branch (regenerated, not copied from the plan):
+- Closure **27 → 40 packages**; the 13 added are `server`, `wire`, `transport/{core,tcp,ws}`,
+  `peersync`, `stream`, `version`, `script`, `index/{analyzer,fulltext,stores,vector}`.
+- Bundle **426 → 665 files** (bundle.json manifest), 2.45 → 4.58 MB unpacked,
+  **913,545 → 1,655,615 bytes zipped** (~914 KB → ~1.66 MB). The plan's ~907 KB / ~1.64 MB were
+  slightly stale; `main`'s release plan still said 351 files / ~708 KB, older still.
+- Skipped test files: `kdb/embed/database_backup_test.go`, `kdb/server/backup_txn_test.go`,
+  `kdb/server/panic_recovery_test.go`; `kdb/transaction/procedure_resolver_test.go` now ships
+  (its `kdb/script` import is in the closure).
+- New bundle requires: `dop251/goja` (from `kdb/script`) and `golang.org/x/sync` (from
+  `kdb/server`), plus indirects `dlclark/regexp2/v2`, `go-sourcemap/sourcemap`, `google/pprof`,
+  `x/text` — 14 → 18 indirects. All pure Go.
+
+Gates: `scripts/verify-bundle.sh` on the 40-package bundle passes (build, vet, `go test` all 40
+ok, cross-compile linux/amd64, linux/arm64, darwin/arm64); the bundle also builds for
+windows/amd64 and js/wasm; `CGO_ENABLED=0 go build ./kdb/server` passes on all five platforms;
+two runs into different output directories produce a byte-identical zip; `go vet ./...` and
+`go test -race ./embedbundle/...` pass.
+
+Found along the way: `main`'s §2.2 said "27 of the module's 37 top-level packages" and its
+excluded list named packages that no longer match the tree; the module has 59 `kdb/...` packages,
+and the excluded list now names the real 19 (incl. `replication`, `syncnode`, `storage/manager`).
+No convention existed for notes between releases, so this adds `docs/releases/unreleased.md`
+(renamed at the `VERSION` bump) and documents it in the release plan §4. The v0.6.2 known issue is
+recorded there as fixed; `docs/releases/v0.6.2.md` is left as shipped, matching how v0.6.2's own
+notes close v0.6.1's known issue.
+- **2026-10-11, U5** (branch `fix/js-native-codec-none`): `ZstdCompression.isAvailable` (an
+  `expect val`, true only on the JVM). On JS/Native, `compress`/`decompress` now throw
+  `ZstdUnavailableException` instead of the length-prefix stub. `SsTableCodec.encodeBlock` and
+  `DeltaPageCodec.frame` write `CODEC_NONE` when zstd is not available, and the sealed
+  `DeltaSegmentRef` reports the codec actually used. `DefaultSsTableWriter` takes an optional
+  `codec` (default ZSTD) so the JVM can export the NONE shape. The ice-bundle writer
+  (`kdb-storage-tier`) stores plain JSON there; its reader already falls back to raw bytes.
+  New physical goldens `sstable_segment_none.hex` and `delta_segment_none.hex` are read by Go.
+  The delta one is compared byte for byte.
+  `golden-freshness` and `make test-physical-golden` now also fail on *untracked* fixtures:
+  `git diff` ignored them, so a new exporter file nobody committed would have passed. The
+  js/native/common codec tests failed (codec byte 1, want 0) with the old stub and writers put
+  back. Found along the way, existing data: JS persistence is in memory
+  (`BrowserSegmentByteStore`), so none survives. **Native does persist to real files**
+  (`NativeSegmentByteStore`). A Native data directory written before U5 holds ZSTD-tagged
+  length-prefixed blocks, and Native now refuses those with `ZstdUnavailableException` instead
+  of reading them back. No Native or JS artifact has ever been released (releases ship Go
+  binaries and JVM jars only), and no fixture or test in the repo holds JS/Native-written files.
+  Still open: JS/Native cannot read JVM/Go zstd data (R1).
+### 2026-10-11 — U7: Kotlin transport shutdown leaks (branch `fix/kotlin-transport-shutdown`)
+
+- **Repro first.** `TcpLoopbackServerShutdownTest` (2) and `NetworkWebSocketServerShutdownTest` (3)
+  install a default `Thread.UncaughtExceptionHandler` and stop each server with a connected client.
+  On `main` all five fail: TCP leaks `ConnectionClosedException` when a client disconnects, the WS
+  server leaks `SocketException: Socket closed` on **every** `stop()` (idle or not), and both
+  `stop()`s return before their handlers finish.
+- **Fix.** `TcpLoopbackServer` and `JvmNetworkWebSocketServer`: the per-connection handler catches
+  `ConnectionClosedException` (TCP also an `IOException`, but only once `stop()` has begun); the
+  accept loops treat `SocketException` as the normal exit only when the server is stopping or the
+  socket is closed (the WS loop now rethrows anything else). `stop()` cancels, closes the server
+  socket, closes the sockets of handlers still running, and joins — inside
+  `withContext(NonCancellable + Dispatchers.IO)`. `launchTcpHandler` and the WS `listen` wrapper also
+  catch `ConnectionClosedException`. `TcpLoopbackServer(scope = …)` now runs under a child job, so
+  `stop()` no longer cancels a caller-supplied scope. `CancellationException` is never caught.
+- **Found along the way.**
+  - The old `stop()` did `withContext(Dispatchers.IO) { serverSocket.close() }`. Called from a
+    cancelled coroutine — which is exactly what `JvmWebSocketWireTransport.listen`'s
+    `finally { server.stop() }` does after `awaitCancellation()` — that `withContext` throws
+    immediately, so cancelling a WS `listen` never closed its listening socket.
+  - Joining in `stop()` is only safe if handlers blocked in socket reads are unblocked: a client
+    that connects and never sends its HTTP upgrade request would otherwise hang `stop()` forever
+    (cancellation does not interrupt a blocking read). Hence closing in-flight sockets;
+    `stopDuringHandshake_doesNotHang` fails (10 s timeout) if that sweep is removed.
+  - Not fixed (out of scope): `JvmTcpWireTransport.listen` blocks in `accept()` and cannot be
+    cancelled until a connection arrives, and its handlers (one fresh scope each) and the WS
+    `listen` handlers (`listenScope`) are not children of the `listen` call, so cancelling `listen`
+    leaves running connections behind.
+- **Tests.** Ad-hoc `CoroutineScope(...)`/`cancel()` in the four WebSocket integration tests moved to
+  the class `testScope` (joined in `@AfterTest`); `listenAccept_twoClients` bounded with
+  `withTimeout`.
+- **Evidence.** `:kdb-integration:test` with `-XX:ActiveProcessorCount=2` (init script,
+  `--rerun-tasks`), load average 30–50: 9/9 runs green (40 tests) with the fix. The same loop on
+  `main`'s sources was also 6/6 green, with no `Exception in thread` in captured stderr — the
+  integration-level flake does not reproduce locally, so the unit tests above are the before/after
+  evidence. `:kdb-transport-tcp:jvmTest`, `:kdb-transport-ws:jvmTest`, `:kdb-jdbc:test` green.
 ### 2026-10-11 — N1 (new, found by multi-node e2e): snapshot-bootstrapped node stuck on "missing parent" — PR #111, branch `fix/shallow-node-missing-parent`, commit `0641f37`
 
 **Found by** the multi-node e2e `test_cluster.py::test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes`
