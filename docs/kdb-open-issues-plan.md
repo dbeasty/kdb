@@ -335,3 +335,13 @@ Listed so nobody re-opens them. All were checked at `e125a10`.
 ## Progress log
 
 _(append one entry per unit: date, unit, PR, commit, and anything found along the way)_
+
+- **2026-10-11, U8** (branch `fix/json-getters-return-errors`): `navigateGet`, `collectAll` and
+  `normalizeIndex` in `go/kdb/json/api.go` now return `*JsonPathError` instead of panicking, so
+  `Get`/`GetAll`/`Contains`/`Keys`/`TypeName`/`ArrayLength`/`Set`/`Delete` all report a mismatched
+  path as an error. Found along the way: the panic reached further than the plan said. `collectAll`
+  (wildcard `GetAll`) and `normalizeIndex` (`[-2]` and below, reached from `Set` and `Delete` too)
+  panicked the same way, and `Set` with `[-1]` on an empty array indexed `list[-1]`, a runtime
+  panic. `Set` is the one production caller (`sql/dml.go`, SQL `UPDATE ... SET` on a JSON path), so
+  that path was reachable from a SQL statement; it now gets an error. Table test
+  `go/kdb/json/getter_errors_test.go` fails with panics on `main`.
