@@ -13,7 +13,8 @@ import time
 
 import pytest
 
-from server_fixtures import KdbServer, get, helper, inspect_bin, put
+from server_fixtures import (
+    KdbServer, inspect_bin, inspect_report, preserve_evidence, put, read)
 
 pytestmark = [pytest.mark.server, pytest.mark.destructive]
 
@@ -56,17 +57,37 @@ def test_kill9_mid_load_recovers_with_no_acknowledged_loss():
         assert r.returncode == 0, f"verify failed after kill -9:\n{r.stdout}\n{r.stderr}"
 
         # Restart over the same directory: every acknowledged write's LAST value per doc must
-        # be readable.
+        # be readable. Check every document before failing, and say which way each one failed:
+        # one document missing, every document missing, and reads that error are three
+        # different bugs (issue #43), and the first failure alone cannot tell them apart.
         srv.restart()
         final_by_doc: dict[str, int] = {}
         for doc_id, v in acked:
             final_by_doc[doc_id] = v
+        missing, behind, errors, served_at = [], [], [], set()
         for doc_id, v in final_by_doc.items():
-            body = get(srv, doc_id)
-            assert body is not None, f"acknowledged doc {doc_id} lost after kill -9"
-            # The recovered value must be at least the last acknowledged one for that doc
-            # (an unacked later write may also have survived - that's allowed).
-            assert body["v"] >= v, f"doc {doc_id} rolled back past an acknowledged write: {body} < {v}"
+            try:
+                commit, body = read(srv, doc_id)
+            except AssertionError as e:
+                errors.append((doc_id, str(e).splitlines()[-1][:300]))
+                continue
+            served_at.add(commit)
+            if body is None:
+                missing.append(doc_id)
+            elif body["v"] < v:
+                # An unacked later write may also have survived - that's allowed; going back
+                # past an acknowledged one is not.
+                behind.append((doc_id, body["v"], v))
+        if missing or behind or errors:
+            report = (
+                f"after kill -9 and restart, of {len(final_by_doc)} acknowledged documents "
+                f"({len(acked)} acknowledged writes): {len(missing)} missing, {len(behind)} "
+                f"rolled back, {len(errors)} unreadable\n"
+                f"missing: {missing}\nrolled back (doc, got, acked): {behind}\n"
+                f"read errors: {errors}\nreads served at: {sorted(served_at)}\n"
+                f"last acknowledged write: {acked[-1]}\n\n{inspect_report(srv)}")
+            where = preserve_evidence("kill9-mid-load", [srv], report + "\n\n" + srv.all_logs())
+            raise AssertionError(f"{report}\n\nevidence preserved at {where}")
         code = srv.stop()
         assert code == 0
     finally:
@@ -81,7 +102,7 @@ def test_kill9_immediately_after_single_write_survives():
         put(srv, doc, {"id": doc, "important": True})
         srv.kill9()
         srv.restart()
-        body = get(srv, doc)
+        _, body = read(srv, doc)
         assert body is not None and body["important"] is True
         code = srv.stop()
         assert code == 0
