@@ -81,7 +81,10 @@ func TestMemoryGuardStopWaitsForTheSamplerToActuallyExit(t *testing.T) {
 		default:
 			t.Fatalf("iteration %d: g.done not closed immediately after Stop returned", i)
 		}
-		g.reset()
+		// The sample that landed may have moved the zone as well as filling the ring (on a loaded
+		// CI runner the package's own process sits near 1 GiB), so return to a fresh guard's
+		// state; what this test proves is that nothing *after* Stop can change it again.
+		g.resetToNormal()
 		g.observe(float64(1 << 30 * 0.90))
 		if got := g.CurrentZone(); got != ZoneHigh {
 			t.Fatalf("iteration %d: expected ZoneHigh from the explicit observe alone, got %v - a stale sample survived Stop+reset", i, got)
