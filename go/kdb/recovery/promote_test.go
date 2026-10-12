@@ -32,8 +32,12 @@ func fixedClock(t string) func() time.Time {
 func rootWithCommits(t *testing.T, ns string, docs int) string {
 	t.Helper()
 	root := t.TempDir()
-	shim := newDirShimAt(t, root)
+	shim, store := newDirShimAt(t, root)
 	seedCommits(t, shim, root, ns, docs)
+	// Released now rather than at cleanup: Windows will not rename a directory with files open in it.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 	return root
 }
 
@@ -450,15 +454,16 @@ func TestSameFilesystemAnswersForPathsThatDoNotExistYet(t *testing.T) {
 
 // newDirShimAt is newDirShim over a caller-chosen root, so a test can hold the path as well as
 // the shim - promotion is about directories, not about the shim over them.
-func newDirShimAt(t *testing.T, root string) storage.PlatformIOShim {
+func newDirShimAt(t *testing.T, root string) (storage.PlatformIOShim, *storio.OSByteStore) {
 	t.Helper()
 	r := root
 	store, err := storio.NewOSByteStore(storio.PlatformIOConfig{RootDirectory: &r})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	return storio.NewFileBackedPlatformIO(
-		storio.PlatformIOConfig{RootDirectory: &r, FsyncOnFlush: true}, store)
+		storio.PlatformIOConfig{RootDirectory: &r, FsyncOnFlush: true}, store), store
 }
 
 // seedCommits writes a chain of n commits into one sequenced segment, plus the meta.json that

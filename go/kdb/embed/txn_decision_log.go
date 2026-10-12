@@ -318,7 +318,8 @@ func writeHostID(dataRoot, id string) error {
 	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o644); err != nil {
 		return err
 	}
-	f, err := os.Open(tmp)
+	// Writable, not os.Open: Windows refuses FlushFileBuffers on a read-only handle.
+	f, err := os.OpenFile(tmp, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}

@@ -376,10 +376,13 @@ func deviceOf(path string) (uint64, error) {
 }
 
 func countVerifiedCommits(dataRoot, namespaceID string) (int, error) {
-	shim, err := shimFor(dataRoot)
+	shim, store, err := shimFor(dataRoot)
 	if err != nil {
 		return 0, err
 	}
+	// Closed before returning: the store caches segment handles, and on Windows an open file
+	// anywhere inside the namespace directory makes the rename that installs it fail.
+	defer store.Close()
 	commits, err := integrity.ScanVerifiedCommits(shim, namespaceID)
 	if err != nil {
 		return 0, err
@@ -387,13 +390,13 @@ func countVerifiedCommits(dataRoot, namespaceID string) (int, error) {
 	return len(commits), nil
 }
 
-func shimFor(dataRoot string) (storage.PlatformIOShim, error) {
+func shimFor(dataRoot string) (storage.PlatformIOShim, *storio.OSByteStore, error) {
 	root := dataRoot
 	store, err := storio.NewOSByteStore(storio.PlatformIOConfig{RootDirectory: &root})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return storio.NewFileBackedPlatformIO(storio.PlatformIOConfig{RootDirectory: &root}, store), nil
+	return storio.NewFileBackedPlatformIO(storio.PlatformIOConfig{RootDirectory: &root}, store), store, nil
 }
 
 // copyTree copies a directory recursively, returning the bytes written. Files are synced: this copy

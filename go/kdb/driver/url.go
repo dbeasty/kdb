@@ -106,6 +106,11 @@ func parseFileBody(body string, readOnly bool) (ParsedURL, error) {
 	// turned the second into var/lib/kdb, relative to the working directory.
 	if strings.HasPrefix(body, "/") {
 		body = "/" + strings.TrimLeft(body, "/")
+		// On Windows the path after the slashes can carry its own drive (file:///C:/kdb/app/users);
+		// a slash in front of "C:" would make it a path rooted on the current drive instead.
+		if filepath.VolumeName(body[1:]) != "" {
+			body = body[1:]
+		}
 	}
 	if body == "" || body == "/" {
 		return ParsedURL{}, fmt.Errorf("file kdb URL missing data directory path")
@@ -122,13 +127,10 @@ func parseFileBody(body string, readOnly bool) (ParsedURL, error) {
 		nsLeaf := parts[len(parts)-1]
 		namespace = catalog + "/" + nsLeaf
 		if len(parts) > 2 {
-			dataRoot = filepath.Join(parts[:len(parts)-2]...)
-			// The split above trimmed the leading separator; without putting it back an absolute
-			// URL (file:///var/lib/kdb/app/users) named a data root relative to the working
-			// directory - var/lib/kdb - and the database quietly landed somewhere else.
-			if filepath.IsAbs(clean) {
-				dataRoot = string(filepath.Separator) + dataRoot
-			}
+			// Taken from the cleaned path rather than rejoined from parts, which dropped the leading
+			// separator (file:///var/lib/kdb/app/users named var/lib/kdb, relative to the working
+			// directory) and, on Windows, turned C:\kdb into the drive-relative C:kdb.
+			dataRoot = filepath.Dir(filepath.Dir(clean))
 		} else {
 			dataRoot = string(filepath.Separator)
 		}

@@ -59,7 +59,7 @@ func buildService(t *testing.T) string {
 			serviceBinErr = err
 			return
 		}
-		serviceBin = filepath.Join(dir, "kdb-service")
+		serviceBin = filepath.Join(dir, exeName("kdb-service"))
 		build := exec.Command("go", "build", "-o", serviceBin, "./cmd/kdb-service")
 		build.Dir = filepath.Join("..", "..")
 		if out, err := build.CombinedOutput(); err != nil {
@@ -98,8 +98,11 @@ type killServer struct {
 	dataDir  string
 	launches int
 	cmd      *exec.Cmd
-	sqlAddr  string
-	admin    string
+	// exited is closed once cmd has been reaped. Waiting on it, rather than probing with signal 0,
+	// is what works on Windows too, where only Kill can be sent to a process.
+	exited  chan struct{}
+	sqlAddr string
+	admin   string
 	// slowestStart is the longest a launch took to become ready. Restart time after a crash
 	// grows with what has to be replayed, so it is reported rather than asserted: a slow start
 	// is its own problem, and failing a durability test over it would hide which one it was.
@@ -150,7 +153,9 @@ func (s *killServer) launch() error {
 	}
 	s.cmd = cmd
 	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait(); _ = logFile.Close() }()
+	reaped := make(chan struct{})
+	s.exited = reaped
+	go func() { err := cmd.Wait(); _ = logFile.Close(); close(reaped); exited <- err }()
 
 	began := time.Now()
 	deadline := began.Add(2 * time.Minute)
@@ -183,26 +188,26 @@ func (s *killServer) kill9() {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return
 	}
-	_ = s.cmd.Process.Signal(syscall.SIGKILL)
+	_ = s.cmd.Process.Kill() // SIGKILL on unix, TerminateProcess on Windows
 	// Wait for the process to be gone, so the restart cannot race the dying one for the lock.
-	for i := 0; i < 200; i++ {
-		if err := s.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-s.exited:
+	case <-time.After(10 * time.Second):
 	}
 	s.cmd = nil
 }
 
 func (s *killServer) stop() {
 	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan struct{})
-		go func() { _, _ = s.cmd.Process.Wait(); close(done) }()
+		// Windows has no SIGTERM to send; there the only stop is a kill.
+		if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			_ = s.cmd.Process.Kill()
+		}
 		select {
-		case <-done:
+		case <-s.exited:
 		case <-time.After(20 * time.Second):
 			_ = s.cmd.Process.Kill()
+			<-s.exited
 		}
 		s.cmd = nil
 	}

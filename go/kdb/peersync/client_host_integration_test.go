@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
@@ -247,6 +248,7 @@ func TestHostCommitPushAutoResolvesSameDocumentConflictUnderLastWritePolicy(t *t
 
 	sharedDoc := newUUID(t)
 	writeDoc(t, hostSide, ns, genesis, sharedDoc, `{"v":"host"}`)
+	awaitNextTimestamp() // the incoming write must be the later one
 	incomingCommit := writeDoc(t, incomingSide, ns, genesis, sharedDoc, `{"v":"incoming"}`)
 
 	w := wire.NewCodec(wire.EncodingJSON)
@@ -607,5 +609,15 @@ func TestPullMissingMaterializesFetchedCommitIntoLocalStorage(t *testing.T) {
 	}
 	if doc.JSON != docJSON {
 		t.Fatalf("expected JSON %q, got %q", docJSON, doc.JSON)
+	}
+}
+
+// awaitNextTimestamp returns once codec.TimestampNow has moved past its value at the call. Windows
+// advances the wall clock in ticks of up to ~16ms, so two writes made back to back there can carry
+// the same timestamp and "the later write" falls to the hash tie-break instead.
+func awaitNextTimestamp() {
+	start := codec.TimestampNow().EpochMicros()
+	for codec.TimestampNow().EpochMicros() == start {
+		time.Sleep(100 * time.Microsecond)
 	}
 }

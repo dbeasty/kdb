@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -55,7 +56,7 @@ func TestFullStackMemory(t *testing.T) {
 func TestGoCliFilePutThenGetCrossProcess(t *testing.T) {
 	root := t.TempDir()
 	ns := "app/t"
-	kdb := filepath.Join("..", "..", "bin", "kdb")
+	kdb := filepath.Join("..", "..", "bin", exeName("kdb"))
 
 	build := exec.Command("go", "build", "-o", kdb, "./cmd/kdb")
 	build.Dir = filepath.Join("..", "..")
@@ -117,7 +118,7 @@ func TestKotlinPutThenGoGet_InteropDelta(t *testing.T) {
 	}
 
 	// Go read (build once per test to keep it self-contained).
-	kdb := filepath.Join(repo, "go", "bin", "kdb")
+	kdb := filepath.Join(repo, "go", "bin", exeName("kdb"))
 	build := exec.Command("go", "build", "-o", kdb, "./cmd/kdb")
 	build.Dir = filepath.Join(repo, "go")
 	if out, err := build.CombinedOutput(); err != nil {
@@ -153,4 +154,13 @@ func findRepoRoot(t *testing.T) string {
 	}
 	t.Fatalf("could not find repo root from %s", wd)
 	return ""
+}
+
+// exeName is name as `go build -o` must be told to write it for exec to find it: Windows will only
+// run a file whose extension is in PATHEXT.
+func exeName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
 }

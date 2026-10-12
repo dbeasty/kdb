@@ -464,7 +464,12 @@ func TestCrashBeforeDecisionRollsBackEveryPartAndWhatWasBuiltOnIt(t *testing.T) 
 		}, auth.Principal{})
 		groupErr <- err
 	}()
-	<-reached
+	select {
+	case <-reached:
+	case err := <-groupErr:
+		// Failed before reaching its decision, so the hook never ran; waiting on it would hang.
+		t.Fatalf("the group returned before its decision point: %v", err)
+	}
 	close(release)
 	if err := <-groupErr; err != nil {
 		t.Fatal(err)
