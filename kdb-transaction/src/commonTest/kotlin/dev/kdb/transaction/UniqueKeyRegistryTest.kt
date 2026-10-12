@@ -218,4 +218,23 @@ class UniqueKeyRegistryTest {
                 )
             assertIs<TransactionResult.SchemaError>(result)
         }
+
+    // Arrays are multikey, as in a MongoDB unique index (same rules as Go's UniqueKeysFor).
+    @Test
+    fun arrayPartsClaimEachElementAndEveryCombination() {
+        val single = schema(compound = false, singleUnique = true)
+        assertEquals(2, uniqueKeysFor(ns, single, doc("""{"code":["a","b"]}""")).size)
+        assertEquals(1, uniqueKeysFor(ns, single, doc("""{"code":["a","a",null]}""")).size)
+        assertEquals(0, uniqueKeysFor(ns, single, doc("""{"code":[]}""")).size)
+        assertEquals(0, uniqueKeysFor(ns, single, doc("""{"code":[null]}""")).size)
+        assertEquals(2, uniqueKeysFor(ns, single, doc("""{"code":[["nested"],"a"]}""")).size)
+        val compound = schema()
+        assertEquals(2, uniqueKeysFor(ns, compound, doc("""{"tenant":"t","code":["a","b"]}""")).size)
+        assertEquals(4, uniqueKeysFor(ns, compound, doc("""{"tenant":["t","u"],"code":["a","b"]}""")).size)
+        assertEquals(0, uniqueKeysFor(ns, compound, doc("""{"tenant":"t","code":[]}""")).size)
+        // Two lists sharing one element share that element's key.
+        val a = uniqueKeysFor(ns, single, doc("""{"code":["x","shared"]}""")).toSet()
+        val b = uniqueKeysFor(ns, single, doc("""{"code":["shared","y"]}""")).toSet()
+        assertEquals(1, a.intersect(b).size)
+    }
 }
