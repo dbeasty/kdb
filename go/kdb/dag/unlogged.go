@@ -27,8 +27,15 @@ import (
 //   - The operations budget evicts on the understanding that the log can load them back
 //     (opsPinnedLocked). An unlogged commit's operations are pinned until it is logged.
 //
-// Only peer sync's StoreCommits marks commits; whatever logs them (peersync's persistAll, the
-// one place adopted commits are logged) clears the mark with MarkLogged before queueing the frame.
+// Peer sync marks what it stores (StoreCommits, and Deepen for the history below a shallow root),
+// and puts the mark back on a commit whose log write failed - including one it made itself, a
+// merge or a join, whose adoption the failure undid. Whatever logs them (peersync's persistAll,
+// the one place adopted commits are logged) clears the mark with MarkLogged before queueing the
+// frame.
+//
+// A commit built on an unlogged one is no better off than it is, whatever the log holds: replay
+// cannot admit a commit whose parent it never stored. Checkpoints treat both alike, and refuse to
+// be written at all while main names either (CheckpointSnapshotLogged).
 
 // ErrOperationsNotLogged is matched (errors.Is) by an operations loader's error for a commit the
 // delta log holds no frame for - as opposed to one it could not read. See RefillUnloggedCommit.
@@ -49,6 +56,24 @@ func (d *InMemoryCommitDag) PutUnloggedCommit(c document.Commit) error {
 	return nil
 }
 
+// PutUnloggedShallowCommit is PutShallowCommit for a commit, received from a peer, whose parents
+// this namespace does not have and that is not logged yet - a deepen's new horizon. A commit
+// already resident is left as it is, mark and all.
+func (d *InMemoryCommitDag) PutUnloggedShallowCommit(c document.Commit) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.isResidentLocked(c.Hash) {
+		return nil
+	}
+	if err := d.putCommitLocked(c, false, true); err != nil {
+		return err
+	}
+	d.shallow[c.Hash] = struct{}{}
+	d.ancestryVersion++
+	d.markUnloggedLocked(c.Hash)
+	return nil
+}
+
 func (d *InMemoryCommitDag) markUnloggedLocked(h codec.Hash) {
 	if d.unlogged == nil {
 		d.unlogged = make(map[codec.Hash]struct{})
@@ -57,7 +82,8 @@ func (d *InMemoryCommitDag) markUnloggedLocked(h codec.Hash) {
 }
 
 // MarkUnlogged puts a commit's mark back - for a caller whose attempt to log it failed after
-// MarkLogged. A commit that is not resident is ignored.
+// MarkLogged - or marks one this node made (a merge, a join) that failed to reach the log. A
+// commit that is not resident is ignored.
 func (d *InMemoryCommitDag) MarkUnlogged(h codec.Hash) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

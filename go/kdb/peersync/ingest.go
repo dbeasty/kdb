@@ -225,6 +225,9 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 	}
 	var durable []func() error
 	var adopted []document.Commit
+	// made is the commit this node created to adopt incomingHead - a merge or a join - once it
+	// has been queued for the log.
+	var made *document.Commit
 	err := node.Exclusive(func() error {
 		lock := divergenceLockFor(env.NamespaceID)
 		lock.Lock()
@@ -261,7 +264,7 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			}
 			res.Outcome = CommitPushOutcome{Kind: OutcomeFastForwarded}
 			if durable, err = env.persistAll(step.Commits); err != nil {
-				return err
+				return env.undoAdoption(err, localHead, incomingHead, step, nil, env.ApplyToStorage)
 			}
 			adopted = step.Commits
 			return advance(node, step)
@@ -279,18 +282,34 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 			}
 			// The remote side's commits, then the merge: the order main came to reach them.
 			if durable, err = env.persistAll(step.Commits); err != nil {
-				return err
+				// A merge writes its documents to storage whatever ApplyToStorage says; a join
+				// writes none (step.Applied is empty).
+				return env.undoAdoption(err, localHead, outcome.MergeCommit.Hash, step, outcome.MergeCommit, true)
 			}
 			adopted = step.Commits
+			made = outcome.MergeCommit
 			return advance(node, step)
 		}
 	})
 	// Waited for outside the serialization, like a local commit's: the log position is fixed,
 	// so the next writer can proceed while this one's fsync is in flight.
+	waitFailed := false
 	for _, wait := range durable {
-		if werr := wait(); werr != nil && err == nil {
-			err = fmt.Errorf("peer sync: persisting adopted commits: %w", werr)
+		if werr := wait(); werr != nil {
+			waitFailed = true
+			if err == nil {
+				err = fmt.Errorf("peer sync: persisting adopted commits: %w", werr)
+			}
 		}
+	}
+	// A failed wait is past undoing here - main has been released to other writers, and a log
+	// that failed a write refuses every later one (embed's commitLogWriter latches it) - so it is
+	// left to the checkpoint: the commits whose waits failed got their marks back (persistAll),
+	// and the one this node made gets one too. While main names any of them, or a commit built
+	// on one, no checkpoint is written (dag.CheckpointSnapshotLogged), and the next open replays
+	// what the log does hold.
+	if waitFailed && made != nil {
+		env.DAG.MarkUnlogged(made.Hash)
 	}
 	head, headErr := env.DAG.Head()
 	res.Head = head
@@ -474,29 +493,105 @@ func (env IngestEnv) clearConflict(ref string) error {
 
 // persistAll queues commits for the log in order, returning what to wait on.
 //
-// Each commit's unlogged mark is cleared before its frame is queued and put back if queueing
-// fails. Not after: a checkpoint claiming the segment the frame lands in must describe the
-// commit, or the next open would skip the frame and lose it - see dag.MarkLogged.
+// Each commit's unlogged mark is cleared before its frame is queued, not after: a checkpoint
+// claiming the segment the frame lands in must describe the commit, or the next open would skip
+// the frame and lose it - see dag.MarkLogged. A commit that was marked gets its mark back if
+// queueing it fails, and if waiting for it does: a failed wait means the log may not hold the
+// frame, and a checkpoint that leaves out a commit the log does hold costs only a refetch, where
+// one that describes a commit the log lacks breaks the namespace. Commits after a refused one are
+// never queued and keep the marks they had.
+//
+// A commit that was not marked - one this node made, a merge or a join, or history already
+// logged - is left unmarked either way. The caller knows which of those is new and marks it
+// (undoAdoption); history already logged is durable whatever this attempt did.
 func (env IngestEnv) persistAll(commits []document.Commit) ([]func() error, error) {
 	var waits []func() error
 	for _, c := range commits {
-		env.DAG.MarkLogged(c.Hash)
+		h := c.Hash
+		was := env.DAG.IsUnlogged(h)
+		env.DAG.MarkLogged(h)
+		failed := func() {
+			if was {
+				env.DAG.MarkUnlogged(h)
+			}
+		}
 		switch {
 		case env.PersistAsync != nil:
 			wait, err := env.PersistAsync(c)
 			if err != nil {
-				env.DAG.MarkUnlogged(c.Hash)
-				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
+				failed()
+				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", h.Hex(), err)
 			}
-			waits = append(waits, wait)
+			waits = append(waits, func() error {
+				err := wait()
+				if err != nil {
+					failed()
+				}
+				return err
+			})
 		case env.Persist != nil:
 			if err := env.Persist(c); err != nil {
-				env.DAG.MarkUnlogged(c.Hash)
-				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", c.Hash.Hex(), err)
+				failed()
+				return waits, fmt.Errorf("peer sync: persisting commit %s: %w", h.Hex(), err)
 			}
 		}
 	}
 	return waits, nil
+}
+
+// undoAdoption takes back an adoption whose log write was refused under the serialization: main
+// moved to newHead, and (when storageMoved) live storage to newHead's tree, before anything was
+// logged, and nothing durable stands behind either. Left in place, every later local write would
+// build on - and be logged on top of - a head whose history the log does not have, and replay
+// cannot admit a commit whose parent it never stored. made is the commit this node created for
+// the adoption (a merge or a join), marked unlogged so no checkpoint describes it; the peer's
+// commits behind it kept their marks (persistAll).
+//
+// Returns cause, with the undo's own failure if it had one. Frames queued before the refusal stay
+// queued; the next open's replay adopts them, as it would after a crash.
+func (env IngestEnv) undoAdoption(cause error, localHead, newHead codec.Hash, step AdvanceStep, made *document.Commit, storageMoved bool) error {
+	if made != nil {
+		env.DAG.MarkUnlogged(made.Hash)
+	}
+	if err := env.DAG.SetHead(mainBranch, localHead); err != nil {
+		return fmt.Errorf("%w (and main could not be put back: %v)", cause, err)
+	}
+	if !storageMoved || len(step.Applied) == 0 {
+		return cause
+	}
+	if err := rewindStorage(env, newHead, localHead, step.Applied); err != nil {
+		return fmt.Errorf("%w (and storage could not be put back on the previous head: %v)", cause, err)
+	}
+	return cause
+}
+
+// rewindStorage puts live storage, standing on from's tree after ops took it there, back on to's
+// tree: every document ops touched gets its value at to's tree back.
+func rewindStorage(env IngestEnv, from, to codec.Hash, ops []document.Op) error {
+	fromCommit, err := env.DAG.GetCommitOrThrow(from)
+	if err != nil {
+		return err
+	}
+	toCommit, err := env.DAG.GetCommitOrThrow(to)
+	if err != nil {
+		return err
+	}
+	ids := make([]codec.UUID, len(ops))
+	for i, op := range ops {
+		ids[i] = opDocID(op)
+	}
+	before, err := env.Storage.GetDocuments(env.NamespaceID, ids, toCommit.DocumentTreeHash)
+	if err != nil {
+		return err
+	}
+	built, err := restoreTree(env, fromCommit.DocumentTreeHash, ids, before)
+	if err != nil {
+		return err
+	}
+	if built.TreeHash != toCommit.DocumentTreeHash {
+		return &TreeMismatchError{CommitHash: to, Declared: toCommit.DocumentTreeHash, Built: built.TreeHash}
+	}
+	return nil
 }
 
 func advance(node LocalNode, step AdvanceStep) error {
@@ -582,6 +677,12 @@ func applyAndVerify(env IngestEnv, fromHead, toHead codec.Hash, ops []document.O
 // restore writes pre-images back on top of the tree a failed apply left behind, returning live
 // storage to the tree it started from.
 func restore(env IngestEnv, onTree codec.Hash, ids []codec.UUID, before []*document.Document) error {
+	_, err := restoreTree(env, onTree, ids, before)
+	return err
+}
+
+// restoreTree is restore, returning the tree it built.
+func restoreTree(env IngestEnv, onTree codec.Hash, ids []codec.UUID, before []*document.Document) (document.DocumentTree, error) {
 	for i, id := range ids {
 		var err error
 		if before[i] == nil {
@@ -591,11 +692,10 @@ func restore(env IngestEnv, onTree codec.Hash, ids []codec.UUID, before []*docum
 		}
 		if err != nil {
 			_ = env.Storage.DiscardPending(env.NamespaceID)
-			return err
+			return document.DocumentTree{}, err
 		}
 	}
-	_, err := env.Storage.CommitTree(env.NamespaceID, onTree)
-	return err
+	return env.Storage.CommitTree(env.NamespaceID, onTree)
 }
 
 func opDocID(op document.Op) codec.UUID {

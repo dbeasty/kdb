@@ -13,6 +13,10 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/replication"
+	"github.com/limidus/kdb/go/kdb/server"
+	"github.com/limidus/kdb/go/kdb/stream"
+	"github.com/limidus/kdb/go/kdb/transport/core"
+	"github.com/limidus/kdb/go/kdb/transport/ws"
 )
 
 // tokenEngine admits one bearer token, as the principal "phone", to everything.
@@ -115,6 +119,59 @@ func TestTokenOnlyOnTheUpgradeRequest(t *testing.T) {
 	}
 	if phone.get("zolik/u/1", profile) == "" || calls.Load() == 0 {
 		t.Fatalf("header-only token: synced=%v credential calls=%d", phone.get("zolik/u/1", profile) != "", calls.Load())
+	}
+}
+
+// TestCloseInboundEndsHandlerSessionsAndWaits: the shutdown sequence stops inbound peer sync
+// before the namespaces drain and close (#113 did this for the TCP peer listener). A session
+// Handler serves is a hijacked WebSocket connection that closing the HTTP server leaves running,
+// and it is a writer - it stores what the peer pushes - so CloseInbound has to end it and wait for
+// its handler, not merely stop new ones.
+func TestCloseInboundEndsHandlerSessionsAndWaits(t *testing.T) {
+	var started, returned atomic.Bool
+	real := servePeerSync
+	servePeerSync = func(conn stream.ConnectionHandle, rt *server.KdbServerRuntime, ns string, cc auth.ConnectionContext) {
+		started.Store(true)
+		real(conn, rt, ns, cc)
+		// A handler that takes a moment to unwind after its connection ends, as one finishing a
+		// push it was storing would.
+		time.Sleep(300 * time.Millisecond)
+		returned.Store(true)
+	}
+	t.Cleanup(func() { servePeerSync = real })
+
+	cloud, srv := cloudOverHTTP(t)
+	conn, err := ws.NewTransport(core.DefaultConnectOptions()).Connect(strings.Replace(srv.URL, "http://", "ws://", 1) + "/kdb/sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	eventually(t, "the session to start", started.Load)
+
+	done := make(chan struct{})
+	go func() {
+		cloud.node.CloseInbound()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("CloseInbound did not return")
+	}
+	if !returned.Load() {
+		t.Fatal("CloseInbound returned while a session's handler was still running")
+	}
+	select {
+	case _, open := <-conn.Incoming():
+		if open {
+			t.Fatal("the session sent a frame after CloseInbound")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session is still open after CloseInbound")
+	}
+	// And no new session starts.
+	if _, err := ws.NewTransport(core.DefaultConnectOptions()).Connect(strings.Replace(srv.URL, "http://", "ws://", 1) + "/kdb/sync"); err == nil {
+		t.Fatal("a new session was accepted after CloseInbound")
 	}
 }
 

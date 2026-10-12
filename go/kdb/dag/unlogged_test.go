@@ -164,3 +164,66 @@ func TestRefillUnloggedCommit(t *testing.T) {
 		t.Fatal("a refilled commit is not marked unlogged, so the next checkpoint would describe it again")
 	}
 }
+
+// TestCheckpointLeavesOutWhatIsBuiltOnUnloggedCommits: a commit whose parent the log does not hold
+// is no more restorable than the parent - replay cannot admit it - so a checkpoint leaves it out
+// too, whether or not it is marked itself (a merge this node made on top of a peer's commits). One
+// main names cannot be left out, so CheckpointSnapshotLogged refuses the checkpoint instead.
+//
+// A shallow root is the exception that keeps a deepen safe: the history being logged below it does
+// not take the root, which its snapshot made durable, out with it.
+func TestCheckpointLeavesOutWhatIsBuiltOnUnloggedCommits(t *testing.T) {
+	d, err := NewInMemoryCommitDag("ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, _ := d.Head()
+	fromPeer := peerCommit(t, genesis, 8)
+	if err := d.PutUnloggedCommit(fromPeer); err != nil {
+		t.Fatal(err)
+	}
+	merge := peerCommit(t, fromPeer.Hash, 8)
+	if err := d.PutCommit(merge, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CheckpointSnapshotLogged(nil); err != nil {
+		t.Fatalf("main names a logged commit, yet the checkpoint was refused: %v", err)
+	}
+	state := d.CheckpointSnapshot()
+	if checkpointHolds(state, fromPeer.Hash) || checkpointHolds(state, merge.Hash) {
+		t.Fatal("the checkpoint describes an unlogged commit or one built on it")
+	}
+	if err := d.SetHead(mainBranch, merge.Hash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CheckpointSnapshotLogged(nil); !errors.Is(err, ErrHeadNotLogged) {
+		t.Fatalf("main names a commit built on an unlogged one: got %v, want ErrHeadNotLogged", err)
+	}
+	d.MarkLogged(fromPeer.Hash)
+	if _, err := d.CheckpointSnapshotLogged(nil); err != nil {
+		t.Fatalf("once its parent is logged the checkpoint is written: %v", err)
+	}
+
+	// A deepen in progress: the snapshot's root is resident and durable, the history fetched
+	// below it is not logged yet.
+	var unknown codec.Hash
+	unknown.Bytes[0] = 1
+	below := peerCommit(t, unknown, 8)
+	root := peerCommit(t, below.Hash, 8)
+	if err := d.PutShallowCommit(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.PutUnloggedShallowCommit(below); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetHead(mainBranch, root.Hash); err != nil {
+		t.Fatal(err)
+	}
+	state, err = d.CheckpointSnapshotLogged(nil)
+	if err != nil {
+		t.Fatalf("a shallow root over history still being logged: %v", err)
+	}
+	if !checkpointHolds(state, root.Hash) || checkpointHolds(state, below.Hash) {
+		t.Fatal("the checkpoint should hold the shallow root and leave out the unlogged history below it")
+	}
+}
