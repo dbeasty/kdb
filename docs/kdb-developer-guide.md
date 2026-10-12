@@ -366,9 +366,10 @@ curl -s localhost:9099/readyz      # ready   (503 "not ready: starting|draining"
 curl -s localhost:9099/metrics     # Prometheus text
 ```
 
-Defaults worth knowing: SQL, peer and stream listeners are **on by default, on loopback**
-(`127.0.0.1:9090/9091/9092`); the admin, WebSocket, gRPC and control listeners are **off**. Pass an
-empty value (`--peer-addr ""`) to turn a listener off. The `?bind=true` suffix on a listen address
+Defaults worth knowing: Only the SQL listener is **on by default, on loopback**
+(`127.0.0.1:9090`); the peer-sync, stream, admin, WebSocket, gRPC and control listeners are **off**,
+so two default instances can run side by side. Pass an address (`--peer-addr tcp://127.0.0.1:9091?bind=true`)
+to turn one on, or an empty value to turn it off. The `?bind=true` suffix on a listen address
 is what marks a URI as a listen address (a client uses the same scheme without it). One server
 serves **every namespace under its data root**: `--namespace` only names the default one, and a
 write to a namespace that does not exist creates it (a read does not).
@@ -1558,8 +1559,8 @@ Settings carry a mutability: *restart*, *live* (changeable through the control p
 | `--memory` | `KDB_MEMORY` | `memory` | on if no data dir | restart | in-memory runtime |
 | `--namespace` | `KDB_NAMESPACE` | `namespace` | `demo/users` | restart | default namespace |
 | `--sql-addr` | `KDB_SQL_ADDR` | `sqlAddr` | `tcp://127.0.0.1:9090?bind=true` | restart | SQL wire listener |
-| `--peer-addr` | `KDB_PEER_ADDR` | `peerAddr` | `tcp://127.0.0.1:9091?bind=true` | restart | peer-sync listener |
-| `--stream-addr` | `KDB_STREAM_ADDR` | `streamAddr` | `tcp://127.0.0.1:9092?bind=true` | restart | stream listener |
+| `--peer-addr` | `KDB_PEER_ADDR` | `peerAddr` | _(off)_ | restart | peer-sync listener, e.g. `tcp://127.0.0.1:9091?bind=true` |
+| `--stream-addr` | `KDB_STREAM_ADDR` | `streamAddr` | _(off)_ | restart | stream listener, e.g. `tcp://127.0.0.1:9092?bind=true` |
 | `--ws-addr` | `KDB_WS_ADDR` | `wsAddr` | off | restart | WebSocket SQL wire (`ws://host:port/kdb?bind=true`) |
 | `--grpc-addr` | `KDB_GRPC_ADDR` | `grpcAddr` | off | restart | gRPC SQL wire; **kdb-service-grpc build only** |
 | `--admin-addr` | `KDB_ADMIN_ADDR` | `adminAddr` | off | restart | `/healthz /readyz /metrics /debug/vars /debug/pprof`, no auth: bind privately |

@@ -123,6 +123,16 @@ func (e *ServerEngine) TreeAt(treeHash codec.Hash) (document.DocumentTree, bool,
 	return e.treeAt(treeHash)
 }
 
+// CountDocuments implements storage.DocumentCounter. It consults only trees already resident
+// (GetTree), never rebuilding one, so it is O(1) or it declines.
+func (e *ServerEngine) CountDocuments(_ string, treeHash codec.Hash) (int, bool, error) {
+	tree, ok := e.GetTree(treeHash)
+	if !ok {
+		return 0, false, nil
+	}
+	return tree.Size(), true, nil
+}
+
 // PutTree implements dag.DocumentTreeStore.
 func (e *ServerEngine) PutTree(tree document.DocumentTree) { e.treesByHash.Put(tree) }
 

@@ -122,6 +122,13 @@ type InMemoryCommitDag struct {
 	// index.eventLog's bucket cache - key their memo on it so they don't have to recompute
 	// against a DAG that has not moved.
 	ancestryVersion uint64
+	// ancestryEpoch is bumped by every mutation that can change the ancestor closure of a commit
+	// that was already resident - anything except a strict append, which adds a commit whose
+	// parents are all resident and so leaves every existing closure untouched. A reader that has
+	// advanced a derived structure commit by commit (index.eventLog's head state) can keep
+	// advancing it for as long as this is unchanged; ancestryVersion cannot say that, because
+	// it moves on every commit.
+	ancestryEpoch uint64
 
 	// Commit operation retention. A commit's operations carry the full
 	// text of every document it wrote, so holding them for all of history
@@ -223,6 +230,14 @@ func (d *InMemoryCommitDag) AncestryVersion() uint64 {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.ancestryVersion
+}
+
+// AncestryEpoch returns a counter that changes whenever a commit that was already resident may
+// have gained or lost ancestors - see the field's comment. A strict append does not move it.
+func (d *InMemoryCommitDag) AncestryEpoch() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.ancestryEpoch
 }
 
 // NewInMemoryCommitDag creates a DAG with genesis commit and main branch.
@@ -393,6 +408,9 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	}
 	d.trackOpsLocked(commit)
 	d.ancestryVersion++
+	if !requireParents {
+		d.ancestryEpoch++
+	}
 	// Only the first commit for a given transaction id is indexed - a caller retrying the same
 	// transaction always expects to find that original result, not a later, unrelated commit
 	// that happens to reuse the id (which should never legitimately happen, since ids are random
@@ -440,6 +458,7 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	delete(d.nodes, hash)
 	delete(d.unlogged, hash)
 	d.ancestryVersion++
+	d.ancestryEpoch++
 	stub := document.CommitStub{
 		OriginalHash: hash, ArchiveLocation: archiveLocation, StubbedAt: codec.TimestampNow(),
 	}
@@ -464,6 +483,7 @@ func (d *InMemoryCommitDag) PutShallowCommit(c document.Commit) error {
 	}
 	d.shallow[c.Hash] = struct{}{}
 	d.ancestryVersion++
+	d.ancestryEpoch++
 	return nil
 }
 
@@ -547,6 +567,7 @@ func (d *InMemoryCommitDag) DropShallowCommit(hash codec.Hash) error {
 	// StubCommit: removal can only leave a generation larger than it needs to be, which prunes
 	// less rather than wrongly. This commit has no resident child anyway - that was checked above.
 	d.ancestryVersion++
+	d.ancestryEpoch++
 	// The head cannot name this commit (a branch head is refused above), but republish for the
 	// same reason every other mutator does: the invariant is checkable at the call site, not by
 	// reasoning about which checks happen to make it unreachable.
@@ -565,6 +586,7 @@ func (d *InMemoryCommitDag) MarkShallow(hash codec.Hash) {
 	}
 	d.shallow[hash] = struct{}{}
 	d.ancestryVersion++
+	d.ancestryEpoch++
 }
 
 // Unshallow stops treating hash as a shallow root once its history is here: every parent resident
@@ -586,6 +608,7 @@ func (d *InMemoryCommitDag) Unshallow(hash codec.Hash) error {
 	delete(d.shallow, hash)
 	d.genStale = true
 	d.ancestryVersion++
+	d.ancestryEpoch++
 	return nil
 }
 
@@ -596,6 +619,7 @@ func (d *InMemoryCommitDag) InvalidateGenerations() {
 	defer d.mu.Unlock()
 	d.genStale = true
 	d.ancestryVersion++
+	d.ancestryEpoch++
 }
 
 // CommitCount is how many commits this DAG holds, stubs included.
@@ -672,6 +696,7 @@ func (d *InMemoryCommitDag) PutStub(stub document.CommitStub) {
 	}
 	d.stubs[stub.OriginalHash] = stub
 	d.ancestryVersion++
+	d.ancestryEpoch++
 }
 
 func (d *InMemoryCommitDag) GetDocumentTree(treeHash codec.Hash) (document.DocumentTree, bool) {
@@ -1097,6 +1122,7 @@ func (d *InMemoryCommitDag) Squash(
 	}
 	d.storeCommitLocked(synthetic)
 	d.ancestryVersion++
+	d.ancestryEpoch++
 	// Squash refuses to run with a branch head inside the window, so the head's commit
 	// survives; republish regardless, since the check above is the only thing guaranteeing
 	// that and it is checked against branches this call does not otherwise touch.

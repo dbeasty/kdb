@@ -274,6 +274,12 @@ public data class QueryContext(
     val atCommit: dev.kdb.codec.KdbHash? = null,
     val parameters: List<SqlParameter> = emptyList(),
     val maxRows: Int = 10_000,
+    /**
+     * Caps how many rows a scan may *examine* (as opposed to [maxRows], which caps how many it
+     * returns): a scan or residual filter that looks at more raises [SqlRowBudgetException].
+     * 0 means unlimited. Mirrors Go's `QueryContext.RowBudget`.
+     */
+    val rowBudget: Int = 0,
     /** catalog/table → namespace id (for JOIN). */
     val namespacesByTable: Map<String, NamespaceBinding> = emptyMap(),
     /**
@@ -317,6 +323,12 @@ public sealed class PhysicalPlan {
     ) : PhysicalPlan()
 
     public data class FullTableScan(val reason: String) : PhysicalPlan()
+
+    /**
+     * `kdb_id = c` / `kdb_id IN (c, ...)` served by key: [ids] are candidates (they may name
+     * documents that do not exist). Go labels this plan `keylookup`.
+     */
+    public data class KeyLookup(val ids: List<KdbUuid>) : PhysicalPlan()
 
     public data class Filter(val predicate: SqlExpr, val input: PhysicalPlan) : PhysicalPlan()
 
@@ -388,6 +400,7 @@ public fun describeAccessPath(plan: PhysicalPlan): String =
         is PhysicalPlan.Project -> describeAccessPath(plan.input)
         is PhysicalPlan.Filter -> describeAccessPath(plan.input)
         is PhysicalPlan.FullTableScan -> "FullTableScan(${plan.reason})"
+        is PhysicalPlan.KeyLookup -> "KeyLookup(${plan.ids.size} ids)"
         is PhysicalPlan.InListScan -> "InListScan(${plan.fieldName} ${plan.indexType} ${plan.keys.size} keys)"
         is PhysicalPlan.IndexScan -> describeIndexScan(plan)
         is PhysicalPlan.ScoredScan ->

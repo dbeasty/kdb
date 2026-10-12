@@ -59,6 +59,18 @@ func (s *MemoryStore) Lookup(key Key, atCommit *codec.Hash) ([]codec.UUID, error
 	return s.log.lookup(key, cutoff), nil
 }
 
+// LookupCount is len(Lookup(key)) without building or copying the id list.
+func (s *MemoryStore) LookupCount(key Key, atCommit *codec.Hash) (int, error) {
+	if err := s.requireKeyedType(); err != nil {
+		return 0, err
+	}
+	cutoff, err := s.log.cutoff(atCommit)
+	if err != nil {
+		return 0, err
+	}
+	return s.log.lookupCount(key, cutoff), nil
+}
+
 func (s *MemoryStore) Range(from, to Key, atCommit *codec.Hash, limit int, ascending bool) ([]codec.UUID, error) {
 	if err := s.requireKeyedType(); err != nil {
 		return nil, err

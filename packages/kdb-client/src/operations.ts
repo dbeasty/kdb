@@ -20,6 +20,11 @@ export type Row = Record<string, string>;
 export interface DocWrite {
   docId: string;
   body: unknown;
+  /**
+   * Make `body` the whole document: keys it omits are removed. The default is a merge patch,
+   * which can add and overwrite keys but never drop one.
+   */
+  replace?: boolean;
 }
 
 export type Precondition =
@@ -77,9 +82,9 @@ export interface KdbOperations {
   ): Promise<{ body: unknown; contentHash: string }>;
 
   /**
-   * Writes unconditionally: create if absent, replace if present. No baseVersion, cannot
-   * conflict. The analogue of Mongo's ReplaceOne(filter, doc, upsert=true), for namespaces
-   * whose conflict policy is LAST_WRITE.
+   * Writes unconditionally: create if absent, otherwise merge `body` into the stored document
+   * (keys it omits survive - use `replace` to drop them). No baseVersion, cannot conflict.
+   * For namespaces whose conflict policy is LAST_WRITE.
    */
   upsert(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<CommitHash>;
 
@@ -89,8 +94,24 @@ export interface KdbOperations {
    */
   appendEvent(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<void>;
 
+  /**
+   * Makes `body` the whole document at `docId`, creating it if absent. Unlike `putJSON` and
+   * `upsert`, which merge, a key `body` omits is removed - in ONE operation and one commit, so a
+   * crash cannot leave the document missing the way delete-then-write could.
+   *
+   * Anchored on this client's last-seen head, like `putIfAbsent`: it throws KdbConflictError if
+   * the document changed since. Use `replaceIf` / `compareAndSwap` to guard on content.
+   */
+  replace(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<CommitHash>;
+
   putIfAbsent(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<CommitHash>;
 
+  /**
+   * Replaces the document wholesale only if its content hash is still `expectedContentHash`
+   * (what `getWithHash` returned): a server-arbitrated compare-and-set. When several clients
+   * race on one hash, the server lets exactly one through and the rest get
+   * KdbPreconditionError - it holds across processes, not just within this one.
+   */
   replaceIf(
     ns: string,
     docId: string,
@@ -141,6 +162,34 @@ export interface KdbOperations {
     options?: CallOptions,
   ): Promise<{ columns: string[]; rows: string[][] }>;
 
-  /** Runs one non-SELECT statement, auto-committing it if the server reports it as a write. */
-  exec(ns: string, sql: string, args?: unknown[], options?: CallOptions): Promise<void>;
+  /**
+   * Streams a SELECT's result page by page, so a whole-collection read is not capped by the
+   * server's `--max-result-rows` (only one page has to fit in a reply). Every page reads the
+   * snapshot the first one did, so writes made meanwhile are not seen. The server re-runs the
+   * query per page: an ORDER BY pays its sort on each, and a deep page of an unordered query
+   * re-reads the rows before it. `pageSize` 0 means the largest page the server allows.
+   */
+  queryRawPages(
+    ns: string,
+    sql: string,
+    args?: unknown[],
+    pageSize?: number,
+    options?: CallOptions,
+  ): AsyncGenerator<{ columns: string[]; rows: string[][] }, void, undefined>;
+
+  /** `queryRawPages`, collected: every row of the result, mapped like `query`. */
+  queryAll<T = Row>(
+    ns: string,
+    sql: string,
+    args?: unknown[],
+    pageSize?: number,
+    options?: CallOptions,
+  ): Promise<T[]>;
+
+  /**
+   * Runs one non-SELECT statement, auto-committing it if the server reports it as a write.
+   * Resolves to the number of rows the statement affected, so a DELETE that matched nothing is
+   * distinguishable from one that removed a row. Concurrent calls on a namespace are safe.
+   */
+  exec(ns: string, sql: string, args?: unknown[], options?: CallOptions): Promise<number>;
 }

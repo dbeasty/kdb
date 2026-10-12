@@ -422,9 +422,11 @@ public class DefaultVectorIndexStore(
         k: Int,
         view: Map<KdbUuid, VecNode>,
     ): List<RankedResult> {
-        val ef = maxOf(config.efSearch, k)
         val (found, _) =
             mutex.withLock {
+                // A beam wider than the graph has nodes cannot return more; clamp so a query with
+                // no LIMIT (k up to Int.MAX_VALUE) asks for "all of them", nothing larger.
+                val ef = minOf(maxOf(config.efSearch, k), nodes.size)
                 graph.search(query, ef) { id -> id < nodes.size && view[nodes[id].docId] === nodes[id] }
             }
         val hits = ArrayList<RankedResult>(found.size)

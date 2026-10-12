@@ -464,7 +464,7 @@ internal class DefaultTransactionEngine(
                     val baseDoc = storage.getDocument(namespaceId, op.docId, baselineTreeHash)
                     val candidate =
                         try {
-                            if (baseDoc != null) {
+                            if (baseDoc != null && !op.replace) {
                                 baseDoc.merge(op.patch)
                             } else {
                                 KdbDocument.fromJson(op.docId, op.patch)

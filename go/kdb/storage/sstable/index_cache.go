@@ -2,6 +2,7 @@ package sstable
 
 import (
 	"container/list"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
@@ -41,10 +42,21 @@ type tableIndexCache struct {
 }
 
 type cachedIndex struct {
-	segment string
-	index   map[codec.Hash]BlockHandle
-	bytes   int64
+	segment  string
+	index    map[codec.Hash]BlockHandle
+	bytes    int64
+	lastUsed time.Time
 }
+
+// indexHotWindow is how long after its last probe an index is exempt from eviction.
+//
+// A lookup probes the tables newest to oldest. When the indexes of two tables together exceed the
+// budget, evicting by recency alone drops the index the *next* lookup needs: every probe then
+// re-reads and re-parses a whole table footer (a text index, ~100 ms and ~100 MB of garbage for a
+// quarter-million entries), and a scan of a few hundred thousand documents after a restart ran for
+// eleven minutes instead of one second. Indexes in active use are therefore kept even over budget
+// and age out once idle, so the budget still bounds what an idle namespace holds.
+var indexHotWindow = 5 * time.Second
 
 func newTableIndexCache(budget int64) tableIndexCache {
 	return tableIndexCache{budget: budget, byName: make(map[string]*list.Element), recency: list.New()}
@@ -60,7 +72,9 @@ func (c *tableIndexCache) get(segment string) (map[codec.Hash]BlockHandle, bool)
 		return nil, false
 	}
 	c.recency.MoveToFront(el)
-	return el.Value.(*cachedIndex).index, true
+	entry := el.Value.(*cachedIndex)
+	entry.lastUsed = time.Now()
+	return entry.index, true
 }
 
 // put records index and evicts least recently used indexes until the cache is back within its
@@ -72,15 +86,21 @@ func (c *tableIndexCache) put(segment string, index map[codec.Hash]BlockHandle) 
 		c.recency.MoveToFront(el)
 		return
 	}
-	entry := &cachedIndex{segment: segment, index: index, bytes: indexCost(index)}
+	entry := &cachedIndex{segment: segment, index: index, bytes: indexCost(index), lastUsed: time.Now()}
 	c.byName[segment] = c.recency.PushFront(entry)
 	c.used += entry.bytes
 	c.evict()
 }
 
 func (c *tableIndexCache) evict() {
+	now := time.Now()
 	for c.used > c.budget && c.recency.Len() > 1 {
-		c.removeElement(c.recency.Back())
+		back := c.recency.Back()
+		// Least recently used is at the back, so the first hot entry means all the rest are hot.
+		if now.Sub(back.Value.(*cachedIndex).lastUsed) < indexHotWindow {
+			return
+		}
+		c.removeElement(back)
 	}
 }
 

@@ -186,6 +186,9 @@ func (e *TransportError) Unwrap() error { return e.Cause }
 type DocWrite struct {
 	DocID string
 	JSON  []byte
+	// Replace makes JSON the whole document: a key it does not name is removed. The default is a
+	// merge patch over the stored document, which can add and overwrite keys but never drop one.
+	Replace bool
 }
 
 // Transaction mirrors the wire Transaction object - the operation Commit needs: "write iff
@@ -208,7 +211,7 @@ func (tx Transaction) operations() ([]document.Op, error) {
 		if err != nil {
 			return nil, fmt.Errorf("kdb: invalid docID %q: %w", w.DocID, err)
 		}
-		ops = append(ops, document.WriteOp{DocID: id, Patch: string(w.JSON)})
+		ops = append(ops, document.WriteOp{DocID: id, Patch: string(w.JSON), Replace: w.Replace})
 	}
 	for _, d := range tx.Deletes {
 		id, err := codec.UUIDFromString(d)
@@ -246,6 +249,14 @@ type Client struct {
 }
 
 type namespaceState struct {
+	// dml keeps the session's single pending transaction coherent. Exec takes it exclusively
+	// (its SQL_EXEC and the empty TX_COMMIT that follows must reach the server back to back),
+	// and a byte-carrying commit takes it shared (each is self-contained, but the server clears
+	// the pending transaction as one lands, so it must not land inside an Exec). Without it two
+	// concurrent Execs interleave and the second fails with "no pending transaction to commit"
+	// although its statement was applied.
+	dml sync.RWMutex
+
 	mu        sync.Mutex
 	sessionID string
 	head      codec.Hash
@@ -626,6 +637,15 @@ func (c *Client) Upsert(ctx context.Context, ns string, docID string, jsonBody [
 	return result.CommitHex, nil
 }
 
+// ReplaceJSON makes jsonBody the whole document at docID, creating it if absent. Unlike PutJSON
+// and Upsert, which merge into what is stored, a key jsonBody does not name is removed - in one
+// operation and one commit, so a crash cannot leave the document missing the way a delete
+// followed by a write could. Like PutJSON it is anchored on the client's last-seen head and
+// returns a *ConflictError if the document changed since; use ReplaceIf to guard on content.
+func (c *Client) ReplaceJSON(ctx context.Context, ns string, docID string, jsonBody []byte) (string, error) {
+	return c.conditionalPut(ctx, ns, docID, jsonBody, nil, true)
+}
+
 // Commit submits tx. On success returns the new commit hash. On a conflict (something else
 // committed against the same BaseVersion first) returns a *ConflictError satisfying
 // errors.Is(err, ErrConflict); no partial write happens either way.
@@ -660,6 +680,8 @@ func (c *Client) Commit(ctx context.Context, tx Transaction) (string, error) {
 }
 
 func (c *Client) commitTransaction(ctx context.Context, ns string, st *namespaceState, tx document.Transaction) (string, error) {
+	st.dml.RLock()
+	defer st.dml.RUnlock()
 	encoded, err := wire.EncodeTransaction(tx)
 	if err != nil {
 		return "", err

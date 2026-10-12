@@ -54,7 +54,7 @@ describe("handshake", () => {
     // rejection, just silence. Go hit this and fixed it the same way.
     const server = new FakeServer(() => ({
       kind: "handshakeAck",
-      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {} },
+      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {}, serverVersion: "0.7.0" },
     }));
     const client = new Client(server);
     await client.handshake();
@@ -69,7 +69,7 @@ describe("handshake", () => {
   it("advertises JSON only, since it implements no other payload codec", async () => {
     const server = new FakeServer(() => ({
       kind: "handshakeAck",
-      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {} },
+      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {}, serverVersion: "0.7.0" },
     }));
     await new Client(server).handshake();
     assert.deepEqual(server.requests[0]!.payload["preferredEncodings"], ["JSON"]);
@@ -83,6 +83,7 @@ describe("handshake", () => {
         negotiatedEncoding: "KDB_BINARY",
         protocolVersion: 1,
         remoteHeads: {},
+        serverVersion: "0.7.0",
       },
     }));
     await assert.rejects(new Client(server).handshake(), /implements JSON only/);
@@ -597,6 +598,87 @@ describe("SQL", () => {
 
     await client.exec(NS, "SELECT 1");
     assert.equal(server.requests.filter((r) => r.kind === "txCommit").length, 1);
+  });
+
+  it("returns the rows a statement affected, and 0 for a delete that matched nothing", async () => {
+    const server = new FakeServer((request) => {
+      if (request.kind === "sessionBegin") return sessionAck(NS);
+      if (request.kind === "sqlExec") {
+        const sql = request.payload["sql"] as string;
+        return sqlOk(NS, HEAD_ONE, false, /missing/.test(sql) ? 0 : 3);
+      }
+      return sqlOk(NS, HEAD_ONE, false, 99); // a commit reports its ops, not the matched rows
+    });
+    const client = new Client(server);
+
+    assert.equal(await client.exec(NS, "DELETE FROM t WHERE id = 'missing'"), 0);
+    assert.equal(await client.exec(NS, "DELETE FROM t WHERE id = 'x'"), 3);
+    assert.equal(await client.exec(NS, "SELECT 1"), 3);
+  });
+
+  it("serializes concurrent DML so 50 deletes all succeed", async () => {
+    // A session holds ONE pending transaction: sqlExec adds to it and txCommit drains it, so
+    // interleaved execs make the second commit find nothing - the real server's behaviour.
+    let pending = 0;
+    const server = new FakeServer((request) => {
+      if (request.kind === "sessionBegin") return sessionAck(NS);
+      if (request.kind === "sqlExec") {
+        pending++;
+        return sqlOk(NS, HEAD_ONE, false, 1);
+      }
+      if (request.kind === "txCommit") {
+        if (pending === 0) {
+          return {
+            kind: "sqlResult" as const,
+            payload: {
+              namespace: NS, sessionId: "sess-1", columns: [], rows: [], rowsAffected: 0,
+              resolvedCommitHex: "", readOnly: false, generatedIds: [],
+              error: "no pending transaction to commit",
+            },
+          };
+        }
+        pending = 0;
+      }
+      return sqlOk(NS, HEAD_ONE, false, 1);
+    });
+    const client = new Client(server);
+
+    const counts = await Promise.all(
+      Array.from({ length: 50 }, (_, i) => client.exec(NS, `DELETE FROM t WHERE id = '${i}'`)),
+    );
+    assert.equal(counts.length, 50);
+    assert.ok(counts.every((n) => n === 1));
+    // Strictly alternating on the wire: every sqlExec is followed by its own txCommit.
+    const dml = server.requests.filter((r) => r.kind === "sqlExec" || r.kind === "txCommit");
+    dml.forEach((r, i) => assert.equal(r.kind, i % 2 === 0 ? "sqlExec" : "txCommit"));
+  });
+
+  it("pages a SELECT by following the continuation token", async () => {
+    const pages = [
+      { rows: [["a"], ["b"]], continuation: "t1" },
+      { rows: [["c"], ["d"]], continuation: "t2" },
+      { rows: [["e"]], continuation: undefined },
+    ];
+    let next = 0;
+    const server = new FakeServer((request) => {
+      if (request.kind === "sessionBegin") return sessionAck(NS);
+      const page = pages[next++]!;
+      // The first request carries a page size and no token; each later one echoes the last.
+      assert.equal(request.payload["pageSize"], 2);
+      assert.equal(request.payload["continuation"], next === 1 ? undefined : pages[next - 2]!.continuation);
+      return {
+        kind: "sqlResult" as const,
+        payload: {
+          namespace: NS, sessionId: "sess-1", columns: ["name"], rows: page.rows, rowsAffected: 0,
+          resolvedCommitHex: HEAD_ONE, readOnly: true, generatedIds: [],
+          ...(page.continuation ? { continuation: page.continuation } : {}),
+        },
+      };
+    });
+    const client = new Client(server);
+    const all = await client.queryAll<{ name: string }>(NS, "SELECT name FROM t", [], 2);
+    assert.deepEqual(all.map((r) => r.name), ["a", "b", "c", "d", "e"]);
+    assert.equal(next, 3);
   });
 
   it("surfaces a server error with its classification", async () => {

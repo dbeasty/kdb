@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -33,6 +34,9 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	// namespace that has no commits yet - exactly when a caller most wants a plain answer.
 	if !query.HasFrom() {
 		return e.executeSingleRowSelect(query, ctx)
+	}
+	if ctx.Page != nil {
+		return e.executePage(query, plan, residual, ctx)
 	}
 	// Aggregates are no longer dispatched to a separate path here: grouped and ungrouped
 	// queries share the pipeline below, which is what lets a GROUP BY key be projected.
@@ -67,6 +71,11 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 			want += offset
 		}
 		stopAt = want
+	}
+	if res, ok, err := e.tryCountOnly(query, env, ctx); err != nil {
+		return QueryResult{}, err
+	} else if ok {
+		return res, nil
 	}
 	ids, label, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt)
 	if err != nil {
@@ -109,6 +118,158 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 		rows = []QueryRow{}
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows, Plan: label}, nil
+}
+
+// executePage runs one page of a SELECT by asking the ordinary pipeline for the page's rows plus
+// one, which is how it knows whether more remain without reading the rest. The pipeline's
+// LIMIT/OFFSET pushdown then bounds the work to the rows up to the end of the page.
+func (e *Executor) executePage(query SelectQuery, plan PhysicalPlan, residual Expr, ctx QueryContext) (QueryResult, error) {
+	page := *ctx.Page
+	ctx.Page = nil
+	if isGroupedQuery(query) && len(query.GroupBy) == 0 {
+		// An ungrouped aggregate is one row: there is nothing to page.
+		return e.ExecuteSelect(query, plan, residual, ctx)
+	}
+	maxRows := e.maxResultRows(ctx)
+	size := page.Size
+	if size < 1 || size > maxRows-1 {
+		size = maxRows - 1
+	}
+	if size < 1 {
+		size = 1
+	}
+	want := size
+	exhaustedByLimit := false
+	if query.Limit != nil {
+		remaining := *query.Limit - page.Offset
+		if remaining <= 0 {
+			return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: []QueryRow{}}, nil
+		}
+		if remaining <= want {
+			want, exhaustedByLimit = remaining, true
+		}
+	}
+	q := query
+	lim := want + 1
+	q.Limit = &lim
+	q.Offset = query.Offset + page.Offset
+	res, err := e.ExecuteSelect(q, plan, residual, ctx)
+	if err != nil {
+		return QueryResult{}, err
+	}
+	if len(res.Rows) > want {
+		res.Rows = res.Rows[:want]
+		res.More = !exhaustedByLimit
+	}
+	return res, nil
+}
+
+// tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE col = const]` from counters
+// instead of reading documents, so counting a large namespace costs the same as counting a small
+// one and is not subject to the scan row budget (nothing is scanned).
+//
+// It declines - leaving the ordinary path to run - unless the answer is provably the one reading
+// the documents would give: the projections are all bare COUNT(*) with no grouping or DISTINCT;
+// the storage can count the tree without reading it and says every document in it is visible
+// (storage.DocumentCounter, which declines while expiry hides documents); and the WHERE is either
+// absent or a single equality on a string or boolean constant that an index serves exactly (the
+// index count and a re-check of the predicate agree for those).
+func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContext) (QueryResult, bool, error) {
+	if query.Distinct || len(query.GroupBy) > 0 || len(query.Projections) == 0 || query.Offset > 0 {
+		return QueryResult{}, false, nil
+	}
+	if query.Limit != nil && *query.Limit < 1 {
+		return QueryResult{}, false, nil
+	}
+	for _, p := range query.Projections {
+		pe, ok := p.(ProjExpression)
+		if !ok || !isCountStar(pe.Expr) {
+			return QueryResult{}, false, nil
+		}
+	}
+	counter, ok := e.Storage.(storage.DocumentCounter)
+	if !ok {
+		return QueryResult{}, false, nil
+	}
+	atCommit, err := e.atCommit(ctx)
+	if err != nil {
+		return QueryResult{}, false, err
+	}
+	commit, err := e.DAG.GetCommitOrThrow(atCommit)
+	if err != nil {
+		return QueryResult{}, false, err
+	}
+	total, ok, err := counter.CountDocuments(ctx.NamespaceID, commit.DocumentTreeHash)
+	if err != nil || !ok {
+		return QueryResult{}, false, err
+	}
+	n, label := total, "count:tree"
+	if query.Where != nil {
+		got, ok := e.countByIndex(query.Where, env, ctx)
+		if !ok {
+			return QueryResult{}, false, nil
+		}
+		n, label = got, "count:index"
+	}
+	row := QueryRow{Values: make([]Cell, len(query.Projections))}
+	for i := range row.Values {
+		row.Values[i] = CellLong{Value: int64(n)}
+	}
+	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: []QueryRow{row}, Plan: label}, true, nil
+}
+
+// isCountStar reports whether x is COUNT(*) (or COUNT with no argument).
+func isCountStar(x Expr) bool {
+	fc, ok := x.(ExprFunctionCall)
+	if !ok || !strings.EqualFold(fc.Name, "count") {
+		return false
+	}
+	if len(fc.Args) == 0 {
+		return true
+	}
+	cr, ok := fc.Args[0].(ExprColumnRef)
+	return len(fc.Args) == 1 && ok && cr.Name == "*"
+}
+
+// countByIndex counts the documents a single `col = <string|bool constant>` WHERE selects, from
+// the index alone.
+func (e *Executor) countByIndex(where Expr, env *evalEnv, ctx QueryContext) (int, bool) {
+	counter, ok := e.IndexProvider.(ExactCounter)
+	if !ok || e.IndexProvider == nil {
+		return 0, false
+	}
+	b, ok := where.(ExprBinary)
+	if !ok || b.Op != BinaryOpEQ {
+		return 0, false
+	}
+	col, other := b.Left, b.Right
+	if _, isCol := col.(ExprColumnRef); !isCol {
+		col, other = b.Right, b.Left
+	}
+	ref, isCol := col.(ExprColumnRef)
+	if !isCol {
+		return 0, false
+	}
+	switch other.(type) {
+	case ExprLiteral, ExprParameter:
+	default:
+		return 0, false
+	}
+	name := env.columnName(ref.Name)
+	if isReservedColumn(name) {
+		return 0, false
+	}
+	value := env.cell(other, newEvalDoc(emptyDoc))
+	switch value.(type) {
+	case CellString, CellBool:
+	default:
+		return 0, false
+	}
+	n, ok, err := counter.ExactCount(ctx, name, value)
+	if err != nil || !ok {
+		return 0, false
+	}
+	return n, true
 }
 
 // plainRows sorts and projects a non-grouped result. Sort keys are computed once per row, not
@@ -338,6 +499,16 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 			}
 		}
 	}
+	var (
+		best      []codec.UUID
+		bestLabel string
+		found     bool
+	)
+	type candidate struct {
+		conj Expr
+		est  int // -1 when unknown
+	}
+	var cands []candidate
 	for _, conj := range conjuncts(where) {
 		if isSearchExpr(conj) {
 			if hits := env.scores[searchKey(conj)]; hits != nil {
@@ -353,18 +524,78 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 		if e.IndexProvider == nil {
 			continue
 		}
-		ids, label, ok, err := e.indexLookup(conj, env, ctx)
+		cands = append(cands, candidate{conj: conj, est: e.estimateConjunct(conj, env, ctx)})
+	}
+	// Cheapest first, unknown costs last: with a good first pick the rest are skipped unless
+	// they might beat it. Every servable conjunct is a correct choice (the residual WHERE
+	// re-checks whatever is fetched) so only the cost differs. The first one used to be taken,
+	// so `_c = 'tasks' AND taskId = 'x'` walked every task through the shared collection tag
+	// when a single id lookup would have done.
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i].est, cands[j].est
+		if a < 0 || b < 0 {
+			return b < 0 && a >= 0
+		}
+		return a < b
+	})
+	for _, c := range cands {
+		if found && c.est >= len(best) {
+			continue
+		}
+		ids, label, ok, err := e.indexLookup(c.conj, env, ctx)
 		if err != nil {
 			return nil, "", err
 		}
-		if ok {
-			// Not truncated: the residual WHERE still runs over these, so cutting the list here
-			// would drop matches. The result bound is enforced on the rows actually returned.
-			return ids, label, nil
+		if ok && (!found || len(ids) < len(best)) {
+			best, bestLabel, found = ids, label, true
 		}
+	}
+	if found {
+		// Not truncated: the residual WHERE still runs over these, so cutting the list here
+		// would drop matches. The result bound is enforced on the rows actually returned.
+		return best, bestLabel, nil
 	}
 	ids, err := e.fullScan(ctx, stopAt)
 	return ids, "fullscan", err
+}
+
+// estimateConjunct is how many ids serving conj from an index would return, or -1 when that is
+// not known without fetching them.
+func (e *Executor) estimateConjunct(conj Expr, env *evalEnv, ctx QueryContext) int {
+	counter, ok := e.IndexProvider.(ExactCounter)
+	if !ok {
+		return -1
+	}
+	b, ok := conj.(ExprBinary)
+	if !ok || b.Op != BinaryOpEQ {
+		return -1
+	}
+	col, other := b.Left, b.Right
+	if _, isCol := col.(ExprColumnRef); !isCol {
+		col, other = b.Right, b.Left
+	}
+	ref, isCol := col.(ExprColumnRef)
+	if !isCol {
+		return -1
+	}
+	switch other.(type) {
+	case ExprLiteral, ExprParameter:
+	default:
+		return -1
+	}
+	name := env.columnName(ref.Name)
+	if isReservedColumn(name) {
+		return -1
+	}
+	value := env.cell(other, newEvalDoc(emptyDoc))
+	if isNullCell(value) {
+		return -1
+	}
+	n, ok, err := counter.ExactCount(ctx, name, value)
+	if err != nil || !ok {
+		return -1
+	}
+	return n
 }
 
 // rankedIDs lists a ranking's documents best-first. It is not cut: the residual WHERE still runs

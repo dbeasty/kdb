@@ -8,7 +8,9 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/policy"
+	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -343,4 +345,82 @@ func (s *KdbServerRuntime) mustHeadHex(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return head.Hex()
+}
+
+// TestExpirySurvivesRestart: expiry is a function of the stored body and the clock, so a reopen
+// must change nothing - a live document is still live, a document that expired while the server
+// was down is hidden on the very first read after reopen (no sweep needed), and the first sweep
+// then removes it durably. Hidden-then-deleted must also hold across a second restart.
+func TestExpirySurvivesRestart(t *testing.T) {
+	dataDir := t.TempDir()
+	open := func() *KdbServerRuntime {
+		t.Helper()
+		rt, err := embed.OpenFileRuntime(dataDir, "app", expiryNS, schema.None())
+		if err != nil {
+			t.Fatalf("OpenFileRuntime: %v", err)
+		}
+		return NewKdbServerRuntime(rt)
+	}
+	t0 := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	pol := &policy.DocumentExpiryPolicy{FieldPath: "expiresAt", SweepIntervalMillis: int64(time.Hour / time.Millisecond)}
+
+	rt := open()
+	rt.SetClockForTest(func() time.Time { return t0 })
+	soon := upsertDoc(t, rt, fmt.Sprintf(`{"expiresAt":%q}`, t0.Add(time.Minute).Format(time.RFC3339)))
+	later := upsertDoc(t, rt, fmt.Sprintf(`{"expiresAt":%d}`, t0.Add(time.Hour).UnixMilli()))
+	never := upsertDoc(t, rt, `{"n":1}`)
+	gone := upsertDoc(t, rt, fmt.Sprintf(`{"expiresAt":%d}`, t0.Add(-time.Minute).UnixMilli()))
+	rt.SetDocumentExpiry(pol)
+	mustFound(t, rt, gone, false, "already expired before restart")
+	if n, err := rt.SweepExpiredNow(); err != nil || n != 1 {
+		t.Fatalf("pre-restart sweep: n=%d err=%v, want 1", n, err)
+	}
+	rt.Release()
+
+	// Restart while the clock is still before `soon`: nothing changes.
+	rt = open()
+	rt.SetClockForTest(func() time.Time { return t0 })
+	rt.SetDocumentExpiry(pol)
+	mustFound(t, rt, soon, true, "live after restart")
+	mustFound(t, rt, later, true, "live after restart")
+	mustFound(t, rt, never, true, "no expiry field")
+	mustFound(t, rt, gone, false, "deleted before restart stays deleted")
+	if n, err := rt.SweepExpiredNow(); err != nil || n != 0 {
+		t.Fatalf("sweep with nothing expired: n=%d err=%v", n, err)
+	}
+	rt.Release()
+
+	// Down past `soon`'s instant: hidden immediately on reopen, still physically present.
+	t1 := t0.Add(time.Minute)
+	rt = open()
+	rt.SetClockForTest(func() time.Time { return t1.Add(-time.Nanosecond) })
+	rt.SetDocumentExpiry(pol)
+	mustFound(t, rt, soon, true, "one instant before expiry")
+	rt.SetClockForTest(func() time.Time { return t1 })
+	mustFound(t, rt, soon, false, "hidden at exactly its expiry instant, before any sweep")
+	mustFound(t, rt, later, true, "later document unaffected")
+	headTree, _ := rt.headTreeHash()
+	if doc, _ := rt.Runtime.Storage.GetDocument(expiryNS, soon, headTree); doc == nil {
+		t.Fatal("hidden is not deleted: the document should still be stored until the sweep")
+	}
+	if n, err := rt.SweepExpiredNow(); err != nil || n != 1 {
+		t.Fatalf("first sweep after restart: n=%d err=%v, want 1", n, err)
+	}
+	headTree, _ = rt.headTreeHash()
+	if doc, _ := rt.Runtime.Storage.GetDocument(expiryNS, soon, headTree); doc != nil {
+		t.Fatal("sweep did not delete the expired document")
+	}
+	rt.Release()
+
+	// And the deletion itself is durable.
+	rt = open()
+	defer rt.Release()
+	rt.SetClockForTest(func() time.Time { return t1 })
+	rt.SetDocumentExpiry(pol)
+	headTree, _ = rt.headTreeHash()
+	if doc, _ := rt.Runtime.Storage.GetDocument(expiryNS, soon, headTree); doc != nil {
+		t.Fatal("swept document came back after restart")
+	}
+	mustFound(t, rt, later, true, "survivor after second restart")
+	mustFound(t, rt, never, true, "survivor after second restart")
 }

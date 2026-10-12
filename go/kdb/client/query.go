@@ -38,17 +38,22 @@ func (c *Client) QueryRaw(ctx context.Context, ns string, sqlText string, args [
 // prefer PutJSON/Upsert/Commit; Exec exists for DDL and the occasional write better expressed as
 // SQL. An INSERT is auto-committed immediately (this call is one client-visible unit of work,
 // not two).
-func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any) error {
-	result, err := c.execSql(ctx, ns, sqlText, args)
-	if err != nil {
-		return err
-	}
-	if !result.needsCommit {
-		return nil
-	}
+//
+// It returns the number of rows the statement affected, so a DELETE that matched nothing is
+// distinguishable from one that removed a row. Concurrent calls on one namespace are safe.
+func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any) (int, error) {
 	st, err := c.ensureNamespace(ctx, ns)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	st.dml.Lock()
+	defer st.dml.Unlock()
+	result, err := c.execSqlOnSession(ctx, ns, st.sessionID, sqlText, args)
+	if err != nil {
+		return 0, err
+	}
+	if !result.needsCommit {
+		return result.rowsAffected, nil
 	}
 	commitMsg := wire.TxCommitMessage{
 		H:         wire.Header{MessageType: wire.MsgTxCommit, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
@@ -57,22 +62,55 @@ func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any
 	}
 	reply, err := c.request(ctx, commitMsg)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	switch r := reply.(type) {
 	case wire.ConflictReportMessage:
-		return decodeConflictError(r.ReportBytes, r.RetryAfterMs)
+		return 0, decodeConflictError(r.ReportBytes, r.RetryAfterMs)
 	case wire.SqlResultMessage:
 		if r.Error != nil {
-			return classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
+			return 0, classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
 		}
-		return nil
+		// The statement's count, not the commit's: the commit reports operations applied.
+		return result.rowsAffected, nil
 	default:
-		return fmt.Errorf("kdb: unexpected commit response %T", reply)
+		return 0, fmt.Errorf("kdb: unexpected commit response %T", reply)
+	}
+}
+
+// QueryRawPages runs a SELECT in pages of at most pageSize rows and hands each page to fn, in
+// order, until the result is exhausted or fn returns an error. Unlike QueryRaw it is not limited
+// by the server's --max-result-rows: only a page has to fit in one reply. Every page reads the
+// same snapshot (the commit the first page read at), so writes made meanwhile are not seen. The
+// server re-runs the query for each page, so a query with ORDER BY pays its sort per page and a
+// deep page of an unordered one re-reads the rows before it; prefer a selective WHERE where you
+// can. pageSize <= 0 uses the server's maximum.
+func (c *Client) QueryRawPages(ctx context.Context, ns string, sqlText string, args []any, pageSize int, fn func(columns []string, rows [][]string) error) error {
+	st, err := c.ensureNamespace(ctx, ns)
+	if err != nil {
+		return err
+	}
+	if pageSize <= 0 {
+		pageSize = 1 << 30 // clamped by the server to its result bound
+	}
+	token := ""
+	for {
+		result, err := c.execSqlPaged(ctx, ns, st.sessionID, sqlText, args, pageSize, token)
+		if err != nil {
+			return err
+		}
+		if err := fn(result.Columns, result.Rows); err != nil {
+			return err
+		}
+		if result.continuation == "" {
+			return nil
+		}
+		token = result.continuation
 	}
 }
 
 type sqlExecResult struct {
+	continuation string
 	Columns      []string
 	Rows         [][]string
 	needsCommit  bool
@@ -90,6 +128,10 @@ func (c *Client) execSql(ctx context.Context, ns string, sqlText string, args []
 
 // execSqlOnSession sends one SQL_EXEC on a specific session.
 func (c *Client) execSqlOnSession(ctx context.Context, ns, sessionID string, sqlText string, args []any) (sqlExecResult, error) {
+	return c.execSqlPaged(ctx, ns, sessionID, sqlText, args, 0, "")
+}
+
+func (c *Client) execSqlPaged(ctx context.Context, ns, sessionID string, sqlText string, args []any, pageSize int, continuation string) (sqlExecResult, error) {
 	var paramsJSON *string
 	if len(args) > 0 {
 		b, err := json.Marshal(args)
@@ -105,6 +147,8 @@ func (c *Client) execSqlOnSession(ctx context.Context, ns, sessionID string, sql
 		SessionID:      sessionID,
 		SQL:            sqlText,
 		ParametersJSON: paramsJSON,
+		PageSize:       pageSize,
+		Continuation:   continuation,
 	}
 	reply, err := c.request(ctx, msg)
 	if err != nil {
@@ -118,7 +162,8 @@ func (c *Client) execSqlOnSession(ctx context.Context, ns, sessionID string, sql
 		return sqlExecResult{}, classifiedError(*result.Error, result.ErrorCode, result.RetryAfterMs)
 	}
 	return sqlExecResult{Columns: result.Columns, Rows: result.Rows, needsCommit: !result.ReadOnly,
-		rowsAffected: result.RowsAffected, resolvedHex: result.ResolvedCommitHex}, nil
+		rowsAffected: result.RowsAffected, resolvedHex: result.ResolvedCommitHex,
+		continuation: result.ContinuationToken}, nil
 }
 
 // decodeRows fills dest (a *[]T for a struct type T) from columns/rows, matching each column to

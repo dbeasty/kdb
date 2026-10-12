@@ -266,3 +266,12 @@ func TestResolveServiceSyncMode(t *testing.T) {
 		}
 	})
 }
+
+// A second instance on the same host (staging, restore drill, tests) must not collide on a fixed
+// default port, so the peer-sync and stream listeners stay off until asked for.
+func TestPeerAndStreamListenersAreOffByDefault(t *testing.T) {
+	d := DefaultServiceSettings()
+	if d.PeerAddr != "" || d.StreamAddr != "" {
+		t.Fatalf("peer/stream must not bind by default, got peer=%q stream=%q", d.PeerAddr, d.StreamAddr)
+	}
+}

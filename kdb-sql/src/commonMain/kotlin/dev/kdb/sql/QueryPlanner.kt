@@ -1,5 +1,6 @@
 package dev.kdb.sql
 
+import dev.kdb.codec.KdbUuid
 import dev.kdb.index.IndexKey
 import dev.kdb.index.IndexType
 import dev.kdb.index.inferIndexType
@@ -145,14 +146,56 @@ public class DefaultQueryPlanner : QueryPlanner {
         expr: SqlExpr,
         context: QueryContext,
         env: EvalEnv,
-    ): ScanCandidate? =
-        when (expr) {
+    ): ScanCandidate? {
+        keyLookup(expr, env)?.let { return ScanCandidate(PhysicalPlan.KeyLookup(it), subsumesConjunct = false) }
+        return when (expr) {
             is SqlExpr.Match -> ScanCandidate(scoredScan(expr, context, Int.MAX_VALUE), subsumesConjunct = true)
             is SqlExpr.Between -> matchBetween(expr, context.schema, env)
             is SqlExpr.Binary -> matchEquality(expr, context.schema, env) ?: matchRange(expr, context.schema, env)
             is SqlExpr.InList -> matchInList(expr, context.schema, env)
             else -> null
         }
+    }
+
+    /**
+     * `kdb_id = <const>` and `kdb_id IN (<const>, ...)` name documents by key, so they need no
+     * index and no scan. A string that is not a UUID names nothing and contributes no candidate.
+     * The conjunct stays in the residual filter, as in Go. Only the reserved column qualifies.
+     */
+    private fun keyLookup(
+        expr: SqlExpr,
+        env: EvalEnv,
+    ): List<KdbUuid>? {
+        fun isKey(x: SqlExpr): Boolean =
+            when (x) {
+                is SqlExpr.ColumnRef -> env.resolvePath(x.name) == SqlPredicate.KDB_ID
+                is SqlExpr.QualifiedColumn -> env.resolvePath("${x.qualifier}.${x.name}") == SqlPredicate.KDB_ID
+                else -> false
+            }
+
+        fun constString(x: SqlExpr): String? =
+            when (x) {
+                is SqlExpr.Literal -> (x.cell as? SqlCell.StringVal)?.value
+                is SqlExpr.Parameter -> (SqlPredicate.parameterToCell(env.parameters.getOrNull(x.index)) as? SqlCell.StringVal)?.value
+                else -> null
+            }
+
+        fun parse(raw: String): KdbUuid? = runCatching { KdbUuid.fromString(raw) }.getOrNull()
+
+        return when (expr) {
+            is SqlExpr.Binary -> {
+                if (expr.op != BinaryOp.EQ) return null
+                val other = if (isKey(expr.left)) expr.right else if (isKey(expr.right)) expr.left else return null
+                val raw = constString(other) ?: return null
+                listOfNotNull(parse(raw))
+            }
+            is SqlExpr.InList -> {
+                if (expr.negated || env.resolvePath(expr.column) != SqlPredicate.KDB_ID) return null
+                expr.values.mapNotNull { v -> parse(constString(v) ?: return null) }.distinct()
+            }
+            else -> null
+        }
+    }
 
     private fun matchInList(
         expr: SqlExpr.InList,

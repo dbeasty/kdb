@@ -11,7 +11,7 @@ func opToDto(op document.Op) opDto {
 	switch o := op.(type) {
 	case document.WriteOp:
 		id := o.DocID.String()
-		return opDto{Kind: "write", DocID: &id, Patch: &o.Patch}
+		return opDto{Kind: "write", DocID: &id, Patch: &o.Patch, Replace: o.Replace}
 	case document.DeleteOp:
 		id := o.DocID.String()
 		return opDto{Kind: "delete", DocID: &id}
@@ -36,7 +36,7 @@ func opFromDto(d opDto) (document.Op, error) {
 		if err != nil {
 			return nil, err
 		}
-		return document.WriteOp{DocID: id, Patch: *d.Patch}, nil
+		return document.WriteOp{DocID: id, Patch: *d.Patch, Replace: d.Replace}, nil
 	case "delete":
 		if d.DocID == nil {
 			return nil, fmt.Errorf("delete missing docId")

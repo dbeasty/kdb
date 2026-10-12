@@ -300,8 +300,8 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--sql-addr` | `tcp://127.0.0.1:9090?bind=true` | SQL wire listener (client SDK, JDBC network) |
-| `--peer-addr` | `tcp://127.0.0.1:9091?bind=true` | peer-sync (Mode 3) listener |
-| `--stream-addr` | `tcp://127.0.0.1:9092?bind=true` | stream (Mode 1 read-only / Mode 2 write-back) listener |
+| `--peer-addr` | _(off)_ | peer-sync (Mode 3) listener, e.g. `tcp://127.0.0.1:9091?bind=true` |
+| `--stream-addr` | _(off)_ | stream (Mode 1 read-only / Mode 2 write-back) listener, e.g. `tcp://127.0.0.1:9092?bind=true` |
 | `--admin-addr` | disabled | operational HTTP: `/healthz`, `/readyz`, `/metrics`, `/debug/pprof` — **no auth; bind privately** |
 | `--max-connections N` | 256 | cap on concurrently accepted connections per listener (0 = unlimited) |
 
@@ -336,6 +336,36 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 | `--stream-allow-anonymous` | accept stream subscribers without credentials (the old behaviour; under `--rbac` it exposes every commit) |
 | `--log-level debug\|info\|warn\|error`, `--log-format text\|json` | structured logging |
 | `--config FILE` | JSON config file |
+
+**Document expiry** — see [kdb-spec-layer16 §9.5](kdb-spec-layer16-qtask-gaps.md#95-document-expiry-component-73)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--expire-field PATH` | _(off)_ | top-level field, or dotted path (`meta.ttl`), holding each document's expiry timestamp |
+| `--expire-grace DUR` | 0 | how long a document stays readable past its timestamp |
+| `--expire-interval DUR` | 60s | how often the sweeper deletes expired documents |
+
+The field is an RFC 3339 string (`"2026-09-05T12:00:00Z"`, fractional seconds allowed) or a number
+of **epoch milliseconds**. Anything else - absent, `null`, a boolean, an unparsable string - means
+the document never expires. A document is expired when its timestamp is **at or before**
+`now - grace`.
+
+Expiry has two separate effects, and they happen at different times:
+
+- **Hidden - immediately, at read time.** At the instant the timestamp (plus grace) passes, the
+  document disappears from `get`, `find`, `count`, SQL `SELECT` (scans, aggregates, joins) and
+  index lookups at head. No sweep is involved, so unlike Mongo's TTL monitor (which runs about once
+  a minute) there is no lag. A hidden document is still stored.
+- **Deleted - at the next sweep.** Every `--expire-interval` the sweeper scans head and commits
+  deletes for the expired documents, at most 500 per commit, with commit message `expiry sweep`.
+  Only then is the document gone from head. Setting `--expire-interval` longer delays deletion
+  (and storage reclamation), never visibility.
+
+Historical reads (`atCommit` an older commit, a `SNAPSHOT` session pinned to one) are not
+filtered: a commit's contents never change. A read-only replica hides expired documents but never
+sweeps. Both effects are functions of the stored body and the wall clock, so a restart changes
+nothing: a document that expired while the server was down is hidden on the first read after
+startup, and removed by the first sweep.
 
 ### Configuration precedence
 
@@ -382,7 +412,7 @@ Clients authenticate with a `"user:secret"` token or user/password at handshake:
 ### Health, readiness, metrics
 
 ```bash
-curl -s localhost:9099/healthz   # ok + version/commit/build_date
+curl -s localhost:9099/healthz   # ok + version/commit/build_date/node_id + per-namespace document counts
 curl -s localhost:9099/readyz    # ready | 503 "not ready: starting|draining"
 curl -s localhost:9099/metrics   # Prometheus text
 ```
@@ -390,6 +420,41 @@ curl -s localhost:9099/metrics   # Prometheus text
 Key metrics to alert on: `kdb_memory_zone` (0–3), `kdb_admission_denied_total`
 (by class and reason), `kdb_stage_latency_seconds{stage="fsync_wait"}`, `kdb_draining`.
 Full list: [Protocol & operations §8](kdb-lld-protocol.md#8-observability).
+
+`/healthz` is `key=value` lines (existing keys unchanged; new ones are appended):
+`version=`, `commit=`, `commit_dirty=`, `build_date=`, `node_id=`, and one
+`namespace.<name>.documents=<n>` per namespace - the live document count at head.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `kdb_build_info{version,commit,dirty,build_date,go_version}` | gauge, always 1 | identity of the running binary; a rollout shows as two label sets |
+| `kdb_namespace_documents{namespace}` | gauge | live documents at head (the head tree's maintained size - O(1), no scan per scrape) |
+| `kdb_namespace_commits{namespace}` | gauge | commits held in the commit graph; history trimmed by retention is not counted |
+
+There is no per-namespace bytes gauge: the byte figures the engine tracks are cache residency,
+not logical or on-disk size, and a metric by that name would mislead. Use
+`kdb_go_heap_alloc_bytes` and your volume's disk usage for capacity.
+
+**Alerting on a namespace approaching a limit.** The limits that bite are per-query, not
+per-namespace: `--scan-row-budget` caps the rows one scan may examine (default 1 000 000, and it
+shrinks as memory pressure rises) and `--max-result-rows` caps what a query may return. A
+namespace whose document count nears the scan budget will start refusing unindexed full scans.
+Alert before that, against the *live* budget gauge:
+
+```yaml
+- alert: KdbNamespaceNearScanBudget
+  expr: kdb_namespace_documents > 0.8 * on() group_left() kdb_admission_scan_row_budget
+  for: 15m
+  annotations:
+    summary: "{{ $labels.namespace }} holds {{ $value }} documents, over 80% of the per-scan row budget"
+    description: "Unindexed scans will be refused soon: add an index, raise --scan-row-budget, or archive."
+- alert: KdbNamespaceGrowthFast
+  expr: predict_linear(kdb_namespace_documents[6h], 24 * 3600) > 1000000
+  for: 30m
+```
+
+Substitute your `--max-result-rows` value for the second threshold if result size, not scan
+size, is what you cap.
 
 ### Shutdown
 
@@ -2005,6 +2070,26 @@ data-directory lock a live service holds, so they refuse to run against a direct
 
 **`--to s3`** uses the `KDB_S3_*` environment configuration below.
 
+### Backup and restore drill
+
+A backup nobody has restored is a guess. `scripts/backup-restore-drill.sh [N]` rehearses the whole
+path on a scratch directory and CI runs it on every change:
+
+1. start `kdb-service` on a temp data dir (peer/stream listeners are off by default, so only the
+   SQL and control ports are needed) and load N documents;
+2. confirm the **offline** `kdb-inspect backup` refuses the live directory (it takes the exclusive
+   data-dir lock - it is a tool for a stopped service);
+3. take the **live** backup through the control plane (`--control-backup-dir`,
+   `POST /v1/ns/{ns}/backups`), which captures the active segment as its CRC-verified prefix;
+4. `kdb-inspect backup-verify` re-hashes every object the manifest names;
+5. stop the service, `kdb-inspect restore --from-backup ... --out FRESH` while it is down, then
+   `kdb-inspect verify --level L2` on the result;
+6. start a second service on the restored directory and check every document and the commit head
+   (`kdb status`) match the original.
+
+Run it before relying on a new backup destination or after upgrading; a nonzero exit prints the
+service logs. `KDB_BIN_DIR=DIR` skips the build, `KEEP=1` keeps the scratch directory.
+
 ### What each failure looks like
 
 | Symptom | Meaning | Action |
@@ -2183,3 +2268,56 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 Connection c = DriverManager.getConnection("jdbc:kdb:memory:///demo/users");
 // Seed data via conn.embedded — see JDBC section above
 ```
+
+### Indexes on schemaless namespaces
+
+A namespace with no declared schema can still be indexed: `CREATE INDEX by_user ON docs (userId)`
+registers a HASH index on that JSON path (`USING BTREE` for ranges), backfills it, and keeps it
+current on every commit. The path may be nested (`a.b`) and an array field is multikey, so
+`projectIds = 'p1'` is membership. A namespace holding several collections told apart by a field
+(`_c`) should index that field plus each filter path.
+
+A filtered read is then independent of the namespace size: with several servable `=` conjuncts the
+planner fetches the id list of the most selective one (counting first, so a collection tag shared
+by most documents is never listed), and the index advances incrementally with each commit instead
+of being rebuilt from its event log on the first read after a write. Measured at 1k, 10k and 100k
+documents the filtered read stays in the tens of microseconds
+(`TestJSONPathIndexKeepsFilteredReadFlat`).
+
+### One namespace per collection
+
+The service opens any namespace a client names on demand (created by its first commit; reads of an
+unknown one are refused), so an application can map each collection to its own namespace instead
+of keeping a `_c` discriminator field in one shared namespace. Each namespace has its own directory
+under `<data-dir>/ns/`, its own commit history, indexes and background maintenance loop, and shares
+the process-wide memory budget and admission control. `TestServiceServesOneNamespacePerCollection`
+drives the real binary through this.
+
+### Reading a result larger than `--max-result-rows`
+
+A SELECT whose result exceeds `--max-result-rows` fails with `RESOURCE_EXHAUSTED` (it is never cut
+short silently). To read a whole collection anyway, ask for it in pages: set `pageSize` on the
+`sqlExec` message (Go `Client.QueryRawPages`, TypeScript `queryRawPages` / `queryAll`). Each reply
+carries at most that many rows (clamped below the bound) and, while rows remain, a
+`continuation` token to send back with the same statement and parameters. Properties:
+
+- every page reads the commit the first page read at, so the pages are one consistent snapshot and
+  writes made meanwhile are not seen; a token whose commit has been dropped from history is refused
+  ("continuation expired") and the query restarts;
+- the server is stateless between pages: each re-runs the query. An `ORDER BY` pays its sort per
+  page, and a deep page of an unordered query re-reads the rows before it. Prefer a selective
+  `WHERE`, or an `ORDER BY` on an indexed path, for very large reads;
+- the statement's own `LIMIT`/`OFFSET` bound the paged result; an ungrouped aggregate is a single
+  row and is not paged;
+- a token is bound to its statement and parameters (a different one is refused) but is not a
+  credential: the read is authorized on every page.
+
+### Garbage-collector pacing
+
+`--gc-headroom-percent` (default 25, `$KDB_GC_HEADROOM_PERCENT`) paces Go's collector to the live heap.
+By default Go lets the heap grow to twice its live size between collections - a gigabyte of garbage
+per gigabyte of data. Below 256 MiB live the runtime default is kept; above it the collector targets
+the live size plus headroom: that percentage of it, at least 128 MiB and at most 2 GiB, which is
+room for growth and for the allocation between two cycles. `0` disables it, and an explicit `GOGC`
+environment variable always wins. It only paces the collector; the memory budget and `GOMEMLIMIT`
+are unchanged.

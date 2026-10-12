@@ -15,6 +15,12 @@ public sealed class KdbOp {
     public data class Write(
         val docId: KdbUuid,
         val patch: String,
+        /**
+         * [patch] is the whole document rather than a merge patch, so keys it omits are removed.
+         * A property of the request only: it is not part of the encoded op (see the Go engine's
+         * operationsAsStored for why), and a replayed write is always read as a whole document.
+         */
+        val replace: Boolean = false,
     ) : KdbOp()
 
     public data class Delete(
