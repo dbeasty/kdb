@@ -143,8 +143,20 @@ def write(n, doc: str, fields: dict, if_hash: str | None = None, replace: bool =
     return control(n, "PUT", ns_path(n, f"/docs/{doc}"), req)
 
 
-def must_write(n, doc: str, fields: dict) -> str:
-    status, body = write(n, doc, fields)
+def must_write(n, doc: str, fields: dict, attempts: int = 20) -> str:
+    """A plain (unconditional) write that must land. A write is optimistic: it is built on the head
+    the server resolves when the request arrives, and if a peer's merge changes the same document
+    before it commits, the server refuses it with 409 `conflict` ("re-read and retry", with a
+    retryAfterMs) - the documented outcome a client retries, not a failure. On a mesh whose nodes
+    write the same documents concurrently that window is real, and on a loaded runner it is hit
+    (nightly, test_upgrade.py's mixed-mesh rounds). So that one outcome is retried; anything else,
+    including a 409 `precondition_failed`, fails at once."""
+    for _ in range(attempts):
+        status, body = write(n, doc, fields)
+        err = (body.get("error") or {}) if isinstance(body, dict) else {}
+        if status != 409 or err.get("code") != "conflict":
+            break
+        time.sleep(max(body.get("retryAfterMs") or 0, 20) / 1000)
     assert status == 200, f"write {fields} to {doc} on {n.sql_addr} failed ({status}): {body}"
     return body["commit"]
 
