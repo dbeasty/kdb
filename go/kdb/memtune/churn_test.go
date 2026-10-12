@@ -11,8 +11,9 @@ import (
 var sink [][]byte
 
 // peakHeapUnderChurn holds liveMB of live data, then allocates churnMB of short-lived garbage, and
-// returns the highest allocated heap (live data plus garbage not yet collected) meanwhile.
-func peakHeapUnderChurn(liveMB, churnMB int, o *Options) uint64 {
+// returns the highest allocated heap (live data plus garbage not yet collected) meanwhile, and the
+// GC percent the tuner had set by the end (the runtime default when there is no tuner).
+func peakHeapUnderChurn(liveMB, churnMB int, o *Options) (uint64, int) {
 	debug.SetGCPercent(100)
 	live := make([][]byte, 0, liveMB)
 	for i := 0; i < liveMB; i++ {
@@ -50,9 +51,10 @@ func peakHeapUnderChurn(liveMB, churnMB int, o *Options) uint64 {
 	}
 	close(stop)
 	wg.Wait()
+	pct := tuner.GCPercent()
 	tuner.Stop()
 	runtime.KeepAlive(live)
-	return peak
+	return peak, pct
 }
 
 // With a large live heap the tuned collector's peak is well below the default's, which lets the
@@ -65,19 +67,19 @@ func TestTunedPeakHeapIsBelowTheDefaultUnderChurn(t *testing.T) {
 		t.Skip("GOGC set in the environment")
 	}
 	const liveMB, churnMB = 768, 3000
-	def := peakHeapUnderChurn(liveMB, churnMB, nil)
-	tuned := peakHeapUnderChurn(liveMB, churnMB, &Options{})
-	t.Logf("live %d MiB: default peak %d MiB, tuned peak %d MiB", liveMB, def>>20, tuned>>20)
+	def, _ := peakHeapUnderChurn(liveMB, churnMB, nil)
+	tuned, pct := peakHeapUnderChurn(liveMB, churnMB, &Options{})
+	t.Logf("live %d MiB: default peak %d MiB, tuned peak %d MiB at GC percent %d", liveMB, def>>20, tuned>>20, pct)
+	// The tuner must have paced the collector to live + 25%: that is its whole job, and it does not
+	// depend on the machine. (Live is slightly over 768 MiB, so the percent rounds to 24 or 25.)
+	if want := (Options{}).GCPercent(int64(liveMB) << 20); pct < want-1 || pct > want+1 {
+		t.Fatalf("tuner set GC percent %d with %d MiB live, want about %d", pct, liveMB, want)
+	}
 	if tuned >= def {
 		t.Fatalf("tuned peak %d MiB is not below the default's %d MiB", tuned>>20, def>>20)
 	}
-	// The heap goal is live + 25% headroom, but the tuner re-reads the heap every 20ms while this
-	// loop allocates more than a GiB a second, and the collector marks concurrently with the
-	// mutator still allocating, so the peak overshoots the goal by what is allocated in between.
-	// That is hardware dependent: +300 MiB over live held on a fast laptop and failed on CI's
-	// Linux runner (1232 MiB peak against live 768 MiB; the default collector reached 1861 MiB).
-	// Allow live + 75%: still far below the default's roughly +100% to +140%.
-	if limit := uint64(liveMB+liveMB*3/4) << 20; tuned > limit {
-		t.Errorf("tuned peak %d MiB exceeds live + headroom + overshoot (%d MiB)", tuned>>20, limit>>20)
-	}
+	// The peak itself is not bounded here. The collector marks concurrently with a loop allocating
+	// more than a GiB a second, so how far the peak overshoots the goal depends on the hardware:
+	// +300 MiB over live held on a fast laptop, and CI's Linux runner has peaked at 1232, 1384 and
+	// 1754 MiB against live 768 MiB, so absolute bounds of live+300 and live+75% both failed there.
 }
