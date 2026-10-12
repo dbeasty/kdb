@@ -20,6 +20,11 @@ export type Row = Record<string, string>;
 export interface DocWrite {
   docId: string;
   body: unknown;
+  /**
+   * Make `body` the whole document: keys it omits are removed. The default is a merge patch,
+   * which can add and overwrite keys but never drop one.
+   */
+  replace?: boolean;
 }
 
 export type Precondition =
@@ -77,9 +82,9 @@ export interface KdbOperations {
   ): Promise<{ body: unknown; contentHash: string }>;
 
   /**
-   * Writes unconditionally: create if absent, replace if present. No baseVersion, cannot
-   * conflict. The analogue of Mongo's ReplaceOne(filter, doc, upsert=true), for namespaces
-   * whose conflict policy is LAST_WRITE.
+   * Writes unconditionally: create if absent, otherwise merge `body` into the stored document
+   * (keys it omits survive - use `replace` to drop them). No baseVersion, cannot conflict.
+   * For namespaces whose conflict policy is LAST_WRITE.
    */
   upsert(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<CommitHash>;
 
@@ -89,8 +94,24 @@ export interface KdbOperations {
    */
   appendEvent(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<void>;
 
+  /**
+   * Makes `body` the whole document at `docId`, creating it if absent. Unlike `putJSON` and
+   * `upsert`, which merge, a key `body` omits is removed - in ONE operation and one commit, so a
+   * crash cannot leave the document missing the way delete-then-write could.
+   *
+   * Anchored on this client's last-seen head, like `putIfAbsent`: it throws KdbConflictError if
+   * the document changed since. Use `replaceIf` / `compareAndSwap` to guard on content.
+   */
+  replace(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<CommitHash>;
+
   putIfAbsent(ns: string, docId: string, body: unknown, options?: CallOptions): Promise<CommitHash>;
 
+  /**
+   * Replaces the document wholesale only if its content hash is still `expectedContentHash`
+   * (what `getWithHash` returned): a server-arbitrated compare-and-set. When several clients
+   * race on one hash, the server lets exactly one through and the rest get
+   * KdbPreconditionError - it holds across processes, not just within this one.
+   */
   replaceIf(
     ns: string,
     docId: string,

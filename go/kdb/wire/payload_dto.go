@@ -298,9 +298,12 @@ type txRollbackDto struct {
 }
 
 type opDto struct {
-	Kind             string  `json:"kind"`
-	DocID            *string `json:"docId,omitempty"`
-	Patch            *string `json:"patch,omitempty"`
+	Kind  string  `json:"kind"`
+	DocID *string `json:"docId,omitempty"`
+	Patch *string `json:"patch,omitempty"`
+	// Replace marks a write whose patch is the whole document rather than a merge patch.
+	// Additive and omitted when false, so every existing frame and golden fixture is unchanged.
+	Replace          bool    `json:"replace,omitempty"`
 	Path             *string `json:"path,omitempty"`
 	BlobHashHex      *string `json:"blobHashHex,omitempty"`
 	MigrationID      *string `json:"migrationId,omitempty"`

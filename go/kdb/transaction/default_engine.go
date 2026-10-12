@@ -347,7 +347,7 @@ func runSchemaPhase(
 			}
 			var candidate document.Document
 			var err error
-			if baseDoc != nil {
+			if baseDoc != nil && !o.Replace {
 				candidate, err = baseDoc.Merge(o.Patch)
 			} else {
 				candidate, err = document.FromJSONWithID(o.DocID, o.Patch)

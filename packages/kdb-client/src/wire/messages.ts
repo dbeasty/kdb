@@ -271,6 +271,11 @@ export interface OpDto {
   docId?: string;
   /** For a write: the whole document JSON, as a string containing JSON. */
   patch?: string;
+  /**
+   * For a write: `patch` is the whole document, not a merge patch, so keys it omits are removed.
+   * Omitted when false, so frames without it are byte-identical to what older clients sent.
+   */
+  replace?: boolean;
   path?: string;
   blobHashHex?: string;
   migrationId?: string;

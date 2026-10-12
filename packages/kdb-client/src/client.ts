@@ -308,6 +308,15 @@ export class Client implements KdbOperations {
 
   // --- conditional writes -------------------------------------------------------------------
 
+  async replace(
+    ns: string,
+    docId: string,
+    body: unknown,
+    options: CallOptions = {},
+  ): Promise<CommitHash> {
+    return this.#writeTransaction(ns, docId, body, undefined, options, true);
+  }
+
   async putIfAbsent(
     ns: string,
     docId: string,
@@ -330,6 +339,7 @@ export class Client implements KdbOperations {
       body,
       { opIndex: 0, kind: "EXPECT_CONTENT_HASH", contentHashHex: expectedContentHash },
       options,
+      true,
     );
   }
 
@@ -339,7 +349,14 @@ export class Client implements KdbOperations {
     body: unknown,
     options: CallOptions = {},
   ): Promise<CommitHash> {
-    return this.#writeTransaction(ns, docId, body, { opIndex: 0, kind: "EXPECT_PRESENT" }, options);
+    return this.#writeTransaction(
+      ns,
+      docId,
+      body,
+      { opIndex: 0, kind: "EXPECT_PRESENT" },
+      options,
+      true,
+    );
   }
 
   async compareAndSwap(
@@ -399,6 +416,7 @@ export class Client implements KdbOperations {
         kind: "write",
         docId: assertUuid(write.docId),
         patch: JSON.stringify(write.body),
+        ...(write.replace ? { replace: true } : {}),
       })),
       ...(tx.deletes ?? []).map((docId): OpDto => ({ kind: "delete", docId: assertUuid(docId) })),
     ];
@@ -552,10 +570,15 @@ export class Client implements KdbOperations {
     body: unknown,
     precondition: PreconditionDto | undefined,
     options: CallOptions,
+    replace = false,
   ): Promise<CommitHash> {
     assertUuid(docId);
     const state = await this.#ensureNamespace(ns, options);
-    const operations: OpDto[] = [{ kind: "write", docId, patch: JSON.stringify(body) }];
+    const operations: OpDto[] = [
+      replace
+        ? { kind: "write", docId, patch: JSON.stringify(body), replace: true }
+        : { kind: "write", docId, patch: JSON.stringify(body) },
+    ];
     const tx = this.#buildTransaction(
       state.head,
       operations,
