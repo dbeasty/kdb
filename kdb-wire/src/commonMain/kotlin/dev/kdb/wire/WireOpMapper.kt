@@ -15,6 +15,7 @@ internal fun KdbOp.toOpDto(): OpDto =
                 kind = "write",
                 docId = docId.toString(),
                 patch = patch,
+                replace = replace,
             )
         is KdbOp.Delete ->
             OpDto(
@@ -41,6 +42,7 @@ internal fun OpDto.toKdbOp(): KdbOp =
             KdbOp.Write(
                 docId = KdbUuid.fromString(docId ?: error("write missing docId")),
                 patch = patch ?: error("write missing patch"),
+                replace = replace,
             )
         "delete" ->
             KdbOp.Delete(
