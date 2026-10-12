@@ -296,7 +296,7 @@ export class InsertQuery<Cols extends Columns> {
 
   async execute(options?: CallOptions): Promise<void> {
     const { sql, args } = this.toSQL();
-    return this.#ops.exec(this.#meta.namespace, sql, args, options);
+    await this.#ops.exec(this.#meta.namespace, sql, args, options);
   }
 }
 
@@ -324,7 +324,7 @@ export class UpdateQuery<Cols extends Columns> extends Filtered<Cols, UpdateQuer
   async execute(options?: CallOptions): Promise<void> {
     if (this.conditions.length === 0 && !this.#all) throw new BuilderError("update without a WHERE would change every row; call .all() to confirm");
     const { sql, args } = this.toSQL();
-    return this.ops.exec(this.meta.namespace, sql, args, options);
+    await this.ops.exec(this.meta.namespace, sql, args, options);
   }
 
   #all = false;
@@ -358,6 +358,6 @@ export class DeleteQuery<Cols extends Columns> extends Filtered<Cols, DeleteQuer
   async execute(options?: CallOptions): Promise<void> {
     if (this.conditions.length === 0 && !this.#all) throw new BuilderError("delete without a WHERE would remove every row; call .all() to confirm");
     const { sql, args } = this.toSQL();
-    return this.ops.exec(this.meta.namespace, sql, args, options);
+    await this.ops.exec(this.meta.namespace, sql, args, options);
   }
 }
