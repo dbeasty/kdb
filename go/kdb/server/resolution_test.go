@@ -2,6 +2,7 @@ package server
 
 import (
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -21,10 +22,21 @@ func conflictingWrites(t *testing.T, a, b metaNode) codec.UUID {
 	if _, err := a.data.Upsert("app/data", doc, `{"v":"from A"}`, auth.Principal{}); err != nil {
 		t.Fatal(err)
 	}
+	awaitNextTimestamp() // B's write must be the later one
 	if _, err := b.data.Upsert("app/data", doc, `{"v":"from B"}`, auth.Principal{}); err != nil {
 		t.Fatal(err)
 	}
 	return doc
+}
+
+// awaitNextTimestamp returns once codec.TimestampNow has moved past its value at the call. Windows
+// advances the wall clock in ticks of up to ~16ms, so two writes made back to back there can carry
+// the same timestamp and "the later write" falls to the hash tie-break instead.
+func awaitNextTimestamp() {
+	start := codec.TimestampNow().EpochMicros()
+	for codec.TimestampNow().EpochMicros() == start {
+		time.Sleep(100 * time.Microsecond)
+	}
 }
 
 func docBody(t *testing.T, rt *KdbServerRuntime, id codec.UUID) string {

@@ -3,10 +3,12 @@ package peersync
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
@@ -608,4 +610,24 @@ func TestPullMissingMaterializesFetchedCommitIntoLocalStorage(t *testing.T) {
 	if doc.JSON != docJSON {
 		t.Fatalf("expected JSON %q, got %q", docJSON, doc.JSON)
 	}
+}
+
+// nextTimestamp is codec.TimestampNow made strictly increasing across the package's tests, so a
+// commit written after another is later by timestamp, as last-write resolution assumes. Windows
+// advances the wall clock in ticks of up to ~16ms, so back-to-back writes there would otherwise tie
+// and fall to the hash tie-break.
+var lastTestTimestamp struct {
+	sync.Mutex
+	micros int64
+}
+
+func nextTimestamp() codec.Timestamp {
+	lastTestTimestamp.Lock()
+	defer lastTestTimestamp.Unlock()
+	m := codec.TimestampNow().EpochMicros()
+	if m <= lastTestTimestamp.micros {
+		m = lastTestTimestamp.micros + 1
+	}
+	lastTestTimestamp.micros = m
+	return codec.TimestampFromEpochMicros(m)
 }

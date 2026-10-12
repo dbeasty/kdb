@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -171,6 +172,9 @@ func TestWriteServiceFilePrunesEmptyNestedBlocks(t *testing.T) {
 // TestWriteServiceFileKeepsPermissions: a config file deliberately made unreadable to other users
 // must not become world-readable because a setting was persisted.
 func TestWriteServiceFileKeepsPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no unix permission bits; os reports every writable file as 0666")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "kdb.json")
 	if err := os.WriteFile(path, []byte(`{"logLevel":"info"}`), 0o600); err != nil {
