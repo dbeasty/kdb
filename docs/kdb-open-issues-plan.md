@@ -100,7 +100,7 @@ change with every package added.
 
 ### U3. Branch and worktree cleanup — S (needs your go-ahead; deletes are not reversible on origin)
 
-**Status: local half done 2026-10-11** (97 merged local branches deleted, stale worktrees pruned; `kdb-deleted-local-branches-2026-10-11.bundle` keeps the two non-ancestor ones). **Origin half pending:** 44 merged or superseded branches on GitHub, plus closing #26, are left for the owner to run (automated deletion was refused); every tip is saved in `kdb-deleted-branches-2026-10-11.bundle` beside the checkout.
+**Status: done 2026-10-11.** Local: 97 merged local branches deleted and stale worktrees pruned. Origin: the owner deleted the 44 merged or superseded branches, and #26 was closed as superseded by #108; GitHub now holds only `main` plus open PR branches. Every deleted tip is kept in `../kdb-deleted-branches-2026-10-11.bundle` (and the two local-only ones in `../kdb-deleted-local-branches-2026-10-11.bundle`), one directory above the checkout.
 
 Verified with `git cherry`. None of these hold content that isn't on `main`:
 
