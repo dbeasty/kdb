@@ -12,6 +12,11 @@ package dag
 // graph record is fixed width - see GraphSettings.RebuildCommits.
 const DefaultGraphRebuildCommits = 50_000
 
+// DefaultGraphMaxSegments is how many graph segments may accumulate before the next write is a
+// full rewrite instead of a flush. Each segment is one more binary search on a lookup that misses
+// the resident tier, so this bounds history-read cost; it is not a memory bound.
+const DefaultGraphMaxSegments = 8
+
 // GraphSettings selects how much of the on-disk commit graph work is
 // active for one namespace.
 //
@@ -68,6 +73,10 @@ type GraphSettings struct {
 	// off, since there is no file to rebuild.
 	RebuildCommits int
 
+	// MaxSegments is how many segment files may accumulate before the next write is a full
+	// rewrite. Zero means DefaultGraphMaxSegments. Ignored when FileEnabled is off.
+	MaxSegments int
+
 	// AnchorInterval is how many commits apart materialized document trees
 	// are written, bounding what a cold historical read has to fold: with
 	// an anchor every N commits there is always one within N below any
@@ -89,10 +98,14 @@ func (s GraphSettings) normalized() GraphSettings {
 		if s.RebuildCommits <= 0 {
 			s.RebuildCommits = DefaultGraphRebuildCommits
 		}
+		if s.MaxSegments <= 0 {
+			s.MaxSegments = DefaultGraphMaxSegments
+		}
 	} else {
 		// Nothing to rebuild, so a value here would only be misleading if
 		// something later reported it back.
 		s.RebuildCommits = 0
+		s.MaxSegments = 0
 	}
 	if s.AnchorInterval < 0 {
 		s.AnchorInterval = 0
@@ -138,5 +151,5 @@ func (d *InMemoryCommitDag) GraphSettings() GraphSettings {
 func (d *InMemoryCommitDag) GraphFileActive() bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.nodes.base != nil
+	return len(d.nodes.segs) > 0
 }

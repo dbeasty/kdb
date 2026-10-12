@@ -204,7 +204,7 @@ func (h *Host) openNamespace(
 	if opts.Storage.Graph.FileEnabled {
 		// After restore, so the DAG already holds every commit and the file can only take
 		// commits out of the heap, never put one in (see dag.nodeStore.attach).
-		d.ConfigureGraphFile(graphFilePath(dataRoot, namespaceID))
+		d.ConfigureGraphFile(graphDirPath(dataRoot, namespaceID), opts.ReadOnly)
 		if err := d.OpenGraphFile(); err != nil {
 			log.Printf("kdb: namespace %s: graph file unusable (%v) - removed; commits stay in memory until it is rebuilt", namespaceID, err)
 		}
@@ -213,11 +213,10 @@ func (h *Host) openNamespace(
 				d.CloseGraphFile()
 			}
 		}()
-		// A read-only runtime shares the directory with a writer and never writes into it.
-		if !opts.ReadOnly {
-			if _, err := d.MaybeRebuildGraphFile(); err != nil {
-				log.Printf("kdb: namespace %s: could not write the graph file (%v) - commits stay in memory", namespaceID, err)
-			}
+		// A no-op for a read-only runtime: it shares the directory with a writer (the DAG was
+		// told so above) and never writes into it.
+		if _, err := d.MaybeRebuildGraphFile(); err != nil {
+			log.Printf("kdb: namespace %s: could not write the graph file (%v) - commits stay in memory", namespaceID, err)
 		}
 	}
 	dagOut := dag.CommitDAG(d)

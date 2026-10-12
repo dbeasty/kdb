@@ -1,81 +1,179 @@
 package dag
 
 import (
-	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
 
-// The DAG's half of the on-disk commit graph: when to write the file, and attaching it. The
-// embedding runtime decides where it lives (ConfigureGraphFile) and when it is worth trying
-// (open, checkpoint, close); everything about what goes in it is decided here, under the same
-// lock that guards the commits themselves.
+// The DAG's half of the on-disk commit graph: when to write segments, which kind, and attaching
+// them. The embedding runtime decides where they live (ConfigureGraphFile) and when it is worth
+// trying (open, maintenance); what goes in them is decided here, under the same lock that guards
+// the commits themselves.
 
-// ConfigureGraphFile names where this DAG's graph file lives. Without a path no file is ever
-// written or read, whatever GraphSettings.FileEnabled says.
-func (d *InMemoryCommitDag) ConfigureGraphFile(path string) {
+// GraphTombstoneRatio is the share of segment records that may be hidden (deleted from the DAG
+// since they were written) before a full rewrite drops them - Cassandra's tombstone compaction.
+const GraphTombstoneRatio = 0.2
+
+// ConfigureGraphFile names the directory this DAG's graph segments live in. Without one no
+// segment is ever written or read, whatever GraphSettings.FileEnabled says. A read-only DAG maps
+// segments but never writes or deletes one: it shares the directory with a writer.
+func (d *InMemoryCommitDag) ConfigureGraphFile(dir string, readOnly bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.graphPath = path
+	d.graphDir = dir
+	d.graphReadOnly = readOnly
 }
 
-// OpenGraphFile attaches the graph file if one exists and is usable. A missing file is not an
-// error. An unusable one is removed and reported; the DAG keeps every commit resident, which is
-// exactly where it was before.
+// OpenGraphFile attaches the segments in the configured directory. Missing segments are not an
+// error. If any segment is unusable, none is used: the DAG keeps every commit resident, exactly
+// where it was before, the segments are removed (unless read-only), and the next write is a full
+// rewrite. All-or-nothing because segments are only disjoint as a set; keeping some of a set that
+// a damaged full segment had superseded could show a commit twice.
 func (d *InMemoryCommitDag) OpenGraphFile() error {
 	d.mu.RLock()
-	path, enabled := d.graphPath, d.graph.FileEnabled
+	dir, ro, enabled := d.graphDir, d.graphReadOnly, d.graph.FileEnabled
 	d.mu.RUnlock()
-	if path == "" || !enabled {
+	if dir == "" || !enabled {
 		return nil
 	}
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	nb, err := openGraphBase(path, d.NamespaceID)
+	seqs, err := listGraphSegments(dir)
 	if err != nil {
-		os.Remove(path)
 		return err
+	}
+	var opened []*graphBase // ascending seq
+	var firstErr error
+	for _, seq := range seqs {
+		b, err := openGraphBase(filepath.Join(dir, graphSegmentName(seq)), d.NamespaceID)
+		if err == nil && b.seq != seq {
+			b.close()
+			err = fmt.Errorf("%w: segment %d names itself %d", errGraphFile, seq, b.seq)
+		}
+		if err != nil {
+			firstErr = err
+			break
+		}
+		opened = append(opened, b)
+	}
+	var maxSeq uint64
+	if len(seqs) > 0 {
+		maxSeq = seqs[len(seqs)-1]
+	}
+	if firstErr != nil {
+		for _, b := range opened {
+			b.close()
+		}
+		if !ro {
+			for _, seq := range seqs {
+				os.Remove(filepath.Join(dir, graphSegmentName(seq)))
+			}
+		}
+		d.mu.Lock()
+		d.graphNextSeq = maxSeq + 1
+		d.mu.Unlock()
+		return firstErr
+	}
+	// A full segment supersedes everything below it: what a crash between a full rewrite's rename
+	// and its deletes leaves behind.
+	start := 0
+	for i, b := range opened {
+		if b.full {
+			start = i
+		}
+	}
+	for _, b := range opened[:start] {
+		b.close()
+		if !ro {
+			os.Remove(b.path)
+		}
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.attachLocked(nb)
+	for _, b := range opened[start:] {
+		d.attachLocked(b, nil)
+	}
+	if len(seqs) > 0 {
+		d.graphNextSeq = maxSeq + 1
+	}
 	return nil
 }
 
-// MaybeRebuildGraphFile writes a new graph file and attaches it when the resident tier has grown
-// past GraphSettings.RebuildCommits, or when there is no file yet and the DAG holds that many.
-// Reports whether it rebuilt. Safe to call concurrently with reads and writes: the file is
-// written without the DAG's lock, from a snapshot.
-func (d *InMemoryCommitDag) MaybeRebuildGraphFile() (bool, error) {
-	return d.rebuildGraphFile(false)
+// graphWrite is which kind of segment write a rebuild makes.
+type graphWrite int
+
+const (
+	graphWriteNone  graphWrite = iota
+	graphWriteFlush            // the resident tier as a new segment
+	graphWriteFull             // everything, as one segment superseding the rest
+)
+
+// planGraphWriteLocked decides what, if anything, to write now. Must hold mu.
+func (d *InMemoryCommitDag) planGraphWriteLocked(forceFull bool) graphWrite {
+	if d.graphDir == "" || !d.graph.FileEnabled || d.graphReadOnly {
+		return graphWriteNone
+	}
+	if forceFull {
+		return graphWriteFull
+	}
+	n := &d.nodes
+	resident, visible := n.residentLen(), n.segVisible()
+	// Tombstones accumulate in the overlay until a rewrite drops them; past the ratio, rewrite
+	// whether or not anything new arrived.
+	if len(n.segs) > 0 && float64(len(n.hidden)) > GraphTombstoneRatio*float64(n.segRecords) {
+		return graphWriteFull
+	}
+	if resident < d.graph.RebuildCommits {
+		return graphWriteNone
+	}
+	switch {
+	case len(n.segs) == 0:
+		return graphWriteFull // the first segment is the whole graph
+	case len(n.segs) >= d.graph.MaxSegments:
+		return graphWriteFull // too many segments for a lookup to search
+	case resident*2 >= visible:
+		return graphWriteFull // rewriting everything costs little more than a flush would
+	default:
+		return graphWriteFlush
+	}
 }
 
-// RebuildGraphFile writes and attaches a graph file regardless of the threshold.
-func (d *InMemoryCommitDag) RebuildGraphFile() error {
-	_, err := d.rebuildGraphFile(true)
+// MaybeRebuildGraphFile writes whatever the policy calls for now - nothing, a flush of the
+// resident tier as a new segment, or a full rewrite - and reports whether it wrote. Safe to call
+// concurrently with reads and writes: segments are written without the DAG's lock, from a
+// snapshot.
+func (d *InMemoryCommitDag) MaybeRebuildGraphFile() (bool, error) {
+	return d.writeGraph(false)
+}
+
+// CompactGraphFile rewrites every segment and the resident tier as one segment, dropping the
+// records of deleted commits - the operator's major compaction. A no-op where no graph directory
+// is configured or the DAG is read-only.
+func (d *InMemoryCommitDag) CompactGraphFile() error {
+	_, err := d.writeGraph(true)
 	return err
 }
 
-func (d *InMemoryCommitDag) rebuildGraphFile(force bool) (bool, error) {
+// RebuildGraphFile is CompactGraphFile.
+func (d *InMemoryCommitDag) RebuildGraphFile() error { return d.CompactGraphFile() }
+
+func (d *InMemoryCommitDag) writeGraph(forceFull bool) (bool, error) {
 	d.graphRebuild.Lock()
 	defer d.graphRebuild.Unlock()
 
 	d.mu.Lock()
-	if d.graphPath == "" || !d.graph.FileEnabled {
+	kind := d.planGraphWriteLocked(forceFull)
+	if kind == graphWriteNone {
 		d.mu.Unlock()
 		return false, nil
 	}
-	if !force && d.nodes.residentLen() < d.graph.RebuildCommits {
-		d.mu.Unlock()
-		return false, nil
-	}
-	// Generations go into the file, so they must be sound before they are copied.
+	full := kind == graphWriteFull
+	// Generations go into the segment, so they must be sound before they are copied.
 	d.ensureGenerationsLocked()
-	snap := d.nodes.snapshotForFile(
-		func(h codec.Hash, sl *slot) bool {
-			if d.nodes.namespaces[sl.ns] != d.NamespaceID {
+	snap := d.nodes.snapshotForSegment(full,
+		func(h codec.Hash, r []byte) bool {
+			if d.nodes.namespaces[recNsIdx(r)] != d.NamespaceID {
 				return false
 			}
 			// Commits that may yet be taken back stay resident: a group part not yet decided,
@@ -88,14 +186,22 @@ func (d *InMemoryCommitDag) rebuildGraphFile(force bool) (bool, error) {
 			}
 			return true
 		},
-		func(h codec.Hash, tx codec.UUID) bool { return d.txIndex[tx] == h },
+		func(h codec.Hash, tx codec.UUID) bool {
+			got, ok := d.txIndex[tx]
+			return ok && got == h
+		},
 	)
-	path := d.graphPath
+	dir, seq := d.graphDir, d.graphNextSeq
+	d.graphNextSeq++
 	d.mu.Unlock()
 	defer snap.release()
 
+	if !full && len(snap.resident) == 0 {
+		return false, nil // everything resident is held back; nothing to flush
+	}
 	next, nextTx := snap.sources()
-	if err := writeGraphFile(path, d.NamespaceID, next, nextTx); err != nil {
+	path, err := writeGraphSegment(dir, d.NamespaceID, seq, full, next, nextTx)
+	if err != nil {
 		return false, err
 	}
 	nb, err := openGraphBase(path, d.NamespaceID)
@@ -104,43 +210,82 @@ func (d *InMemoryCommitDag) rebuildGraphFile(force bool) (bool, error) {
 		return false, err
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.attachLocked(nb)
+	var replaced []*graphBase
+	if full {
+		// Everything attached now is what this one supersedes. Segment writes are serialized,
+		// so nothing was added since the snapshot.
+		replaced = append(replaced, d.nodes.segs...)
+	}
+	d.attachLocked(nb, replaced)
+	d.mu.Unlock()
+	// After the attach, so a crash before these deletes leaves a full segment that the next open
+	// recognises as superseding them. Unlinking a mapped file is safe: the mapping keeps the
+	// inode until the snapshot's reference is released.
+	for _, b := range replaced {
+		os.Remove(b.path)
+	}
+	if full {
+		syncGraphDir(dir)
+	}
 	return true, nil
 }
 
-// attachLocked makes nb the base and drops the transaction-index entries it now answers.
-func (d *InMemoryCommitDag) attachLocked(nb *graphBase) {
-	d.nodes.attach(nb)
+// attachLocked makes nb the newest segment and drops the transaction-index entries the segments
+// now answer. Must hold mu exclusively.
+func (d *InMemoryCommitDag) attachLocked(nb *graphBase, replaced []*graphBase) {
+	d.nodes.attach(nb, replaced)
 	for tx, h := range d.txIndex {
 		if _, resident := d.nodes.index[h]; resident {
 			continue
 		}
-		if bh, ok := nb.findTx(tx); ok && bh == h {
+		if got, ok := d.segmentTxLocked(tx); ok && got == h {
 			delete(d.txIndex, tx)
 		}
 	}
 	d.txIndex = shrunk(d.txIndex) // see nodeStore.attach
-	// What the base answers is now the same graph, so ancestry memos stay valid; the head
-	// snapshot holds a copy and is unaffected. Nothing to republish.
+	// The segments answer for the same graph, so ancestry memos stay valid; the head snapshot
+	// holds a copy and is unaffected. Nothing to republish.
 }
 
-// CloseGraphFile unmaps the graph file. The DAG must not be used afterwards: commits that lived
-// only in the file are no longer reachable.
+// segmentTxLocked resolves a transaction id through the segments, newest first.
+func (d *InMemoryCommitDag) segmentTxLocked(tx codec.UUID) (codec.Hash, bool) {
+	for _, b := range d.nodes.segs {
+		if h, ok := b.findTx(tx); ok {
+			return h, true
+		}
+	}
+	return codec.Hash{}, false
+}
+
+// CloseGraphFile unmaps every segment. The DAG must not be used afterwards: commits that lived
+// only in segments are no longer reachable.
 func (d *InMemoryCommitDag) CloseGraphFile() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.nodes.detach()
 }
 
-// GraphFileStats reports how many commits the attached file holds, how many the resident tier
-// holds, and the file's size in bytes.
-func (d *InMemoryCommitDag) GraphFileStats() (fileCommits, residentCommits int, fileBytes int64) {
+// GraphFileStatus describes the on-disk graph as this DAG sees it.
+type GraphFileStatus struct {
+	Segments        int   // mapped segment files
+	FileCommits     int   // commits the segments answer for
+	HiddenRecords   int   // segment records for commits since deleted; dropped by a full rewrite
+	ResidentCommits int   // commits held in memory
+	FileBytes       int64 // total size of the segment files
+}
+
+// GraphFileStats reports the on-disk graph's shape.
+func (d *InMemoryCommitDag) GraphFileStats() GraphFileStatus {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	if b := d.nodes.base; b != nil {
-		fileCommits = b.count - len(d.nodes.hidden)
-		fileBytes = b.fileBytes
+	st := GraphFileStatus{
+		Segments:        len(d.nodes.segs),
+		FileCommits:     d.nodes.segVisible(),
+		HiddenRecords:   len(d.nodes.hidden),
+		ResidentCommits: d.nodes.residentLen(),
 	}
-	return fileCommits, d.nodes.residentLen(), fileBytes
+	for _, b := range d.nodes.segs {
+		st.FileBytes += b.fileBytes
+	}
+	return st
 }

@@ -141,10 +141,13 @@ type InMemoryCommitDag struct {
 	// generation(parent) < generation(child) and must be rebuilt before
 	// anything prunes with them. See storeCommitLocked.
 	genStale bool
-	// graphPath is where the mapped commit graph lives (see graph_attach.go); the mapping itself
-	// is nodes' base tier. graphRebuild serializes rebuilds, which write without holding mu.
-	graphPath    string
-	graphRebuild sync.Mutex
+	// graphDir is where the commit graph's segments live (see graph_attach.go); the mappings
+	// themselves are nodes' segment tier. graphRebuild serializes segment writes, which run
+	// without holding mu.
+	graphDir      string
+	graphReadOnly bool
+	graphNextSeq  uint64
+	graphRebuild  sync.Mutex
 
 	// provisional holds commits appended as one part of a cross-namespace group that has not
 	// been durably decided yet; provisionalGen counts every such append. See provisional.go.
@@ -420,7 +423,7 @@ func (d *InMemoryCommitDag) txIndexLookupLocked(txID codec.UUID) (codec.Hash, bo
 	if h, ok := d.txIndex[txID]; ok {
 		return h, true
 	}
-	if h, ok := d.nodes.base.findTx(txID); ok && d.nodes.has(h) {
+	if h, ok := d.segmentTxLocked(txID); ok && d.nodes.has(h) {
 		return h, true
 	}
 	return codec.Hash{}, false

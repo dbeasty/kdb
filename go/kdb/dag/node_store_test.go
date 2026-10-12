@@ -10,23 +10,31 @@ import (
 
 func h(b byte) codec.Hash { var x codec.Hash; x.Bytes[0] = b; return x }
 
-// The reason this type exists. If a field with a pointer is ever added to slot, the garbage
-// collector goes back to scanning every commit and nothing else would notice.
-func TestSlotHasNoPointers(t *testing.T) {
-	var check func(rt reflect.Type, path string)
-	check = func(rt reflect.Type, path string) {
-		switch rt.Kind() {
-		case reflect.Pointer, reflect.Slice, reflect.String, reflect.Map, reflect.Interface, reflect.Chan, reflect.Func, reflect.UnsafePointer:
-			t.Fatalf("%s is a %s: slot must be pointer-free", path, rt.Kind())
-		case reflect.Struct:
-			for i := 0; i < rt.NumField(); i++ {
-				check(rt.Field(i).Type, path+"."+rt.Field(i).Name)
-			}
-		case reflect.Array:
-			check(rt.Elem(), path+"[]")
+// The reason this type exists. The resident tier must hold commits in memory the collector does
+// not scan: if a chunk ever became something other than raw bytes, every commit would be traced
+// again and nothing else would notice.
+func TestResidentChunksArePointerFree(t *testing.T) {
+	elem := reflect.TypeOf(nodeStore{}.chunks).Elem().Elem() // *[N]byte -> [N]byte
+	if elem.Kind() != reflect.Array || elem.Elem().Kind() != reflect.Uint8 {
+		t.Fatalf("resident chunks are %s, want an array of bytes", elem)
+	}
+	if elem.Len() != slotsPerChunk*graphRecordSize {
+		t.Fatalf("chunk holds %d bytes, want %d records of %d", elem.Len(), slotsPerChunk, graphRecordSize)
+	}
+}
+
+// Memory and disk share the record layout, including its spare bytes.
+func TestRecordLayoutHasSpareBytes(t *testing.T) {
+	if graphRecordSize-grReserved < 8 {
+		t.Fatalf("only %d spare bytes in a record", graphRecordSize-grReserved)
+	}
+	var r [graphRecordSize]byte
+	encodeRecord(r[:], document.Commit{Hash: h(1), Message: "m"}, 3, 2)
+	for i := grReserved; i < graphRecordSize; i++ {
+		if r[i] != 0 {
+			t.Fatalf("encodeRecord wrote into the reserved byte %d", i)
 		}
 	}
-	check(reflect.TypeOf(slot{}), "slot")
 }
 
 func TestNodeStoreRoundTrip(t *testing.T) {

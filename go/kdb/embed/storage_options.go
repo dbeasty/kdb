@@ -244,6 +244,7 @@ func graphSettingsFromEnv() dag.GraphSettings {
 		AncestryPruning: envBool("KDB_ANCESTRY_PRUNING"),
 		FileEnabled:     envBool("KDB_GRAPH_FILE"),
 		RebuildCommits:  envInt("KDB_GRAPH_REBUILD_COMMITS"),
+		MaxSegments:     envInt("KDB_GRAPH_MAX_SEGMENTS"),
 		AnchorInterval:  envInt("KDB_HISTORY_ANCHOR_INTERVAL"),
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -70,9 +71,8 @@ func TestGraphFileLifecycleThroughRuntime(t *testing.T) {
 	if !d.GraphFileActive() {
 		t.Fatal("no graph file after passing the rebuild threshold")
 	}
-	inFile, resident, _ := d.GraphFileStats()
-	if inFile < 30 || resident != 0 {
-		t.Fatalf("file %d, resident %d after rebuild", inFile, resident)
+	if st := rt.CommitGraphStatus(); st.FileCommits < 30 || st.ResidentCommits != 0 {
+		t.Fatalf("after rebuild: %+v", st)
 	}
 	writeRevs(t, rt, ns, 30, 35) // resident tail on top of the file
 	want := historyOf(t, rt)
@@ -90,8 +90,8 @@ func TestGraphFileLifecycleThroughRuntime(t *testing.T) {
 	if !d2.GraphFileActive() {
 		t.Fatal("graph file not attached on reopen")
 	}
-	if inFile, _, _ := d2.GraphFileStats(); inFile < 30 {
-		t.Fatalf("reopened file shows %d commits", inFile)
+	if st := rt2.CommitGraphStatus(); st.FileCommits < 30 {
+		t.Fatalf("reopened graph shows %d commits", st.FileCommits)
 	}
 	if got := historyOf(t, rt2); !reflect.DeepEqual(got, want) {
 		t.Fatalf("history changed across reopen with the file attached: %d vs %d commits", len(got), len(want))
@@ -102,6 +102,12 @@ func TestGraphFileLifecycleThroughRuntime(t *testing.T) {
 		t.Fatal("transaction lookup lost for a commit in the file")
 	}
 	writeRevs(t, rt2, ns, 35, 40)
+	if err := rt2.CompactCommitGraph(); err != nil {
+		t.Fatal(err)
+	}
+	if st := rt2.CommitGraphStatus(); st.Segments != 1 || st.ResidentCommits != 0 {
+		t.Fatalf("after an explicit compaction: %+v", st)
+	}
 }
 
 // A damaged file costs a rebuild, never data.
@@ -121,10 +127,14 @@ func TestGraphFileDamagedOnDiskStillOpens(t *testing.T) {
 	}
 	rt.Close()
 
-	path := graphFilePath(root, ns)
+	segs, _ := filepath.Glob(filepath.Join(graphDirPath(root, ns), "graph-*.kdbg"))
+	if len(segs) == 0 {
+		t.Fatal("no graph segment written")
+	}
+	path := segs[len(segs)-1]
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("no graph file written: %v", err)
+		t.Fatal(err)
 	}
 	raw[len(raw)/3] ^= 0x5A
 	os.WriteFile(path, raw, 0o644)

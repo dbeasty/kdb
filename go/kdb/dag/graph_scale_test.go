@@ -30,8 +30,8 @@ func TestGraphFileScale(t *testing.T) {
 	baseline := liveHeap()
 	d, _ := NewInMemoryCommitDag("ns")
 	d.SetGraphSettings(GraphSettings{FileEnabled: true, RebuildCommits: 1 << 30})
-	path := filepath.Join(t.TempDir(), "graph.kdbg")
-	d.ConfigureGraphFile(path)
+	path := filepath.Join(t.TempDir(), "graph")
+	d.ConfigureGraphFile(path, false)
 	root, _ := d.Head()
 	hashes := make([]codec.Hash, 0, n)
 	hashes = append(hashes, root)
@@ -101,7 +101,7 @@ func TestGraphFileScale(t *testing.T) {
 		t.Fatal(err)
 	}
 	rebuild := time.Since(s)
-	_, _, size := d.GraphFileStats()
+	size := d.GraphFileStats().FileBytes
 	t.Logf("rebuild (write + attach) %v, file %.0fMB (%.0f B/commit)", rebuild.Round(time.Millisecond), float64(size)/1e6, float64(size)/float64(n))
 	report("file")
 
@@ -109,7 +109,7 @@ func TestGraphFileScale(t *testing.T) {
 	d.CloseGraphFile()
 	d2, _ := NewInMemoryCommitDag("ns")
 	d2.SetGraphSettings(GraphSettings{FileEnabled: true})
-	d2.ConfigureGraphFile(path)
+	d2.ConfigureGraphFile(path, false)
 	s = time.Now()
 	if err := d2.OpenGraphFile(); err != nil {
 		t.Fatal(err)

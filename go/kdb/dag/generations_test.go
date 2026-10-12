@@ -221,12 +221,13 @@ func TestGraphSettingsNormalization(t *testing.T) {
 				FileEnabled:     true,
 				AncestryPruning: true,
 				RebuildCommits:  DefaultGraphRebuildCommits,
+				MaxSegments:     DefaultGraphMaxSegments,
 			},
 		},
 		{
 			name: "an explicit rebuild threshold is kept",
 			in:   GraphSettings{FileEnabled: true, RebuildCommits: 7},
-			want: GraphSettings{FileEnabled: true, AncestryPruning: true, RebuildCommits: 7},
+			want: GraphSettings{FileEnabled: true, AncestryPruning: true, RebuildCommits: 7, MaxSegments: DefaultGraphMaxSegments},
 		},
 		{
 			// Nothing to rebuild, so reporting a threshold back would only
