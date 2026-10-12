@@ -214,6 +214,9 @@ type virtualBase struct {
 	// node stopped taking writes and peer syncs for minutes (5-node load, Linux). Callers only
 	// read the returned map, so it is shared, not copied.
 	memo map[string]map[codec.UUID]baseVal
+	// noMemo computes every values call afresh, ignoring memo. Tests only: it is how they check the
+	// memo changes no result.
+	noMemo bool
 }
 
 // valuesKey identifies one values call: the bases are in fold order, which changes the result,
@@ -230,6 +233,9 @@ func valuesKey(bases []codec.Hash, depth int) string {
 func (vb *virtualBase) values(bases []codec.Hash, ids []codec.UUID, depth int) (map[codec.UUID]baseVal, error) {
 	if len(bases) == 0 {
 		return map[codec.UUID]baseVal{}, nil
+	}
+	if vb.noMemo {
+		return vb.valuesUncached(bases, ids, depth)
 	}
 	key := valuesKey(bases, depth)
 	if got, ok := vb.memo[key]; ok {

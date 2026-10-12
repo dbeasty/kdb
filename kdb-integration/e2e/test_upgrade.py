@@ -102,11 +102,13 @@ class Acked:
                 assert_values_at_least(n, self.values, f"{stage}: n{i} ({n.binary or 'new'})")
 
 
-def load(c: Cluster, stage: int, seconds: float, during=None, docs_per_node: int = 6) -> list[Writer]:
-    """Writers on every node (each its own documents) for `seconds`, calling `during()` halfway
-    through - the step being tested happens under load. Returns the stopped writers."""
+def load(c: Cluster, stage: int, seconds: float, during=None, docs_per_node: int = 6,
+         nodes: list[int] | None = None) -> list[Writer]:
+    """Writers on every node (each its own documents), or on just `nodes`, for `seconds`, calling
+    `during()` halfway through - the step being tested happens under load. Returns the stopped
+    writers."""
     writers = [Writer(n, owned_docs(i, docs_per_node), f"n{i}", value_base=stage * 100_000)
-               for i, n in enumerate(c.nodes)]
+               for i, n in enumerate(c.nodes) if nodes is None or i in nodes]
     for w in writers:
         w.start()
     time.sleep(seconds / 2)
@@ -483,8 +485,17 @@ def _new_cluster_history(c: Cluster, acked: Acked) -> None:
 
 def test_rollback_to_v062_after_a_clean_stop(make_cluster):
     """Data dirs a five-node mesh of this build wrote, stopped cleanly, open on v0.6.2 with every
-    acknowledged write, and that mesh converges and takes writes. A clean stop leaves a checkpoint
-    at main, so v0.6.2 has no log to replay."""
+    acknowledged write, stop cleanly again on v0.6.2, and a v0.6.2 mesh on them takes writes and
+    converges. A clean stop leaves a checkpoint at main, so v0.6.2 has no log to replay.
+
+    Every one of the five rolled-back nodes is checked for every acknowledged write; the writes and
+    the strict convergence after them run on three of them. A five-node v0.6.2 mesh under
+    concurrent writes can merge-storm - N2, v0.6.2's own defect, fixed in this build by #114:
+    syncs all succeed while every node keeps making new empty merges, so the heads never settle -
+    and on a slow runner it did (nightly run 38197566122). That is v0.6.2 behaving as v0.6.2
+    does, whatever data it opened, so it says nothing about whether a rollback works. Three
+    v0.6.2 nodes converge (test_rolling_upgrade_of_a_three_node_mesh_under_load starts from
+    exactly such a mesh)."""
     c = make_cluster(5)
     acked = Acked()
     _new_cluster_history(c, acked)
@@ -493,8 +504,12 @@ def test_rollback_to_v062_after_a_clean_stop(make_cluster):
     for n in c.nodes:
         n.restart(service_bin=PREV)
     acked.check(c, "rolled back to v0.6.2 (clean)")
-    acked.add(load(c, 7, 3))
-    converge(c, acked, "v0.6.2 after rollback")
+    # n3 and n4 leave; their writes are on n0-n2 already (acked.check read them there).
+    for i in (3, 4):
+        code = c.nodes[i].stop()
+        assert code == 0, f"n{i} did not stop cleanly on v0.6.2 (exit {code})"
+    acked.add(load(c, 7, 3, nodes=[0, 1, 2]))
+    converge(c, acked, "three v0.6.2 nodes after rollback", timeout=150)
 
 
 @pytest.mark.destructive
