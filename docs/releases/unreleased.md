@@ -52,3 +52,16 @@ docs/s with 27 indexes against 187–193 without, `CREATE INDEX` ×27 in 0.14–
 columns within a row rather than across runs. With 27 indexes, writes now cost what they cost
 without indexes, within that noise; the remaining per-commit time is the fsync of the commit
 itself.
+
+## Fixes
+
+**A partial write no longer drops a document from the index of a field it left out (Go server).**
+An upsert is a merge patch: it names the keys it changes and the stored document keeps the rest.
+The indexes were fed the patch instead of the stored document, so after `{"g":"a","h":1}` then
+`{"h":2}` the document still had `g = 'a'` but `WHERE g = 'a'` (served by an index on `g`)
+returned nothing. The same was true of a document a custom conflict resolver rewrote. Indexes now
+follow what the commit stored, on both the single-namespace and the cross-namespace commit path.
+Clients that only ever write whole documents (`replace`) were not affected. Indexes built while
+this bug was live can hold such gaps; a restart that rebuilds them (drop the index snapshots, or
+`DROP INDEX` / `CREATE INDEX`) repairs them. The Kotlin server read the stored document already.
+

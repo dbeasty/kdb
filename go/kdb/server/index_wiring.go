@@ -395,6 +395,41 @@ func (p *RegistryIndexProvider) prepareCommitForIndexes(ops []document.Op) ([]*i
 	return prepared, nil
 }
 
+// preparedForStored returns the index updates for what a commit actually stored, given the ones
+// prepared from the request before it landed. They differ for a merge patch - the request names
+// only the keys it changes, the commit stores the merged document - and for a document a conflict
+// resolver rewrote. Indexing the request instead dropped a document from the index of every
+// field a partial write left out, while the stored document still had it, so `WHERE g = 'a'`
+// missed a row whose g was 'a'. An op whose stored form is its request reuses the preparation.
+// requested and stored are the transaction's ops before and after staging (same length and
+// order: operationsAsStored only substitutes documents).
+func (p *RegistryIndexProvider) preparedForStored(requested []document.Op, prepared []*index.PreparedWrite, stored []document.Op) ([]*index.PreparedWrite, error) {
+	if len(stored) != len(requested) {
+		return p.prepareCommitForIndexes(stored)
+	}
+	out := make([]*index.PreparedWrite, 0, len(prepared))
+	next := 0
+	for i, op := range requested {
+		switch o := op.(type) {
+		case document.WriteOp:
+			pw := prepared[next]
+			next++
+			if s, ok := stored[i].(document.WriteOp); ok && s.Patch != o.Patch {
+				fresh, err := p.registry.PrepareWrite(s.DocID, s.Patch)
+				if err != nil {
+					return nil, err
+				}
+				pw = fresh
+			}
+			out = append(out, pw)
+		case document.DeleteOp:
+			out = append(out, prepared[next])
+			next++
+		}
+	}
+	return out, nil
+}
+
 // commitToIndexes applies prepared updates under the landed commit hash and returns the hints
 // that replicate them. It runs after the DAG append and still under the write gate, so index
 // state advances in the same order the log does. It writes nothing to disk: it nudges the
