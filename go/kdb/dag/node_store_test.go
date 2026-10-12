@@ -99,3 +99,42 @@ func TestNodeStoreReplaceKeepsGeneration(t *testing.T) {
 		t.Fatal("replace of absent commit must report false")
 	}
 }
+
+// GraphMemoryGo must behave exactly like the record store: same answers for the whole rich graph,
+// and the genesis commit carried across the switch.
+func TestGoMemoryModeMatchesRecordMode(t *testing.T) {
+	views := map[GraphMemory]graphView{}
+	for _, mode := range []GraphMemory{GraphMemoryKDB, GraphMemoryGo} {
+		b := newDagBuilder(t)
+		b.dag.SetGraphSettings(GraphSettings{AncestryPruning: true, Memory: mode})
+		if got := b.dag.nodes.goMode; got != (mode == GraphMemoryGo) {
+			t.Fatalf("%s: goMode = %v", mode, got)
+		}
+		if !b.dag.HasCommit(b.root) {
+			t.Fatalf("%s: genesis lost switching memory mode", mode)
+		}
+		richGraph(b)
+		b.diamond()
+		views[mode] = viewOfByName(t, b)
+	}
+	if !reflect.DeepEqual(views[GraphMemoryKDB].walk, views[GraphMemoryGo].walk) {
+		t.Fatalf("walks differ:\n kdb %v\n go  %v", views[GraphMemoryKDB].walk, views[GraphMemoryGo].walk)
+	}
+	if views[GraphMemoryKDB].count != views[GraphMemoryGo].count {
+		t.Fatal("commit counts differ between memory modes")
+	}
+}
+
+// viewOfByName is viewOf keyed for comparing two DAGs whose hashes differ (each has its own
+// genesis and random transaction ids): walk order by name, and the count.
+func viewOfByName(t *testing.T, b *dagBuilder) graphView {
+	t.Helper()
+	v := graphView{count: b.dag.CommitCount()}
+	head, _ := b.dag.Head()
+	for _, e := range b.dag.Walk(head, nil, 1<<30) {
+		if f, ok := e.(FullEntry); ok {
+			v.walk = append(v.walk, b.name(f.Commit.Hash))
+		}
+	}
+	return v
+}

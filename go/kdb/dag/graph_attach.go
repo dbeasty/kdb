@@ -256,7 +256,7 @@ type deferredSegment struct {
 func (d *InMemoryCommitDag) attachLocked(nb *graphBase, replaced []*graphBase) {
 	d.nodes.attach(nb, replaced)
 	for tx, h := range d.txIndex {
-		if _, resident := d.nodes.index[h]; resident {
+		if d.nodes.isResident(h) {
 			continue
 		}
 		if got, ok := d.segmentTxLocked(tx); ok && got == h {
@@ -267,7 +267,7 @@ func (d *InMemoryCommitDag) attachLocked(nb *graphBase, replaced []*graphBase) {
 	// Segment records carry whether a commit's operations must be loaded, so the eviction set
 	// keeps entries for the resident tier only.
 	for h := range d.opsEvicted {
-		if _, resident := d.nodes.index[h]; !resident && d.nodes.has(h) {
+		if !d.nodes.isResident(h) && d.nodes.has(h) {
 			delete(d.opsEvicted, h)
 		}
 	}

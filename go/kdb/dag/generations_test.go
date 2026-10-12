@@ -251,9 +251,22 @@ func TestGraphSettingsNormalization(t *testing.T) {
 			in:   GraphSettings{AnchorInterval: 500},
 			want: GraphSettings{AnchorInterval: 500},
 		},
+		{
+			name: "go memory is kept without the file",
+			in:   GraphSettings{Memory: GraphMemoryGo},
+			want: GraphSettings{Memory: GraphMemoryGo},
+		},
+		{
+			name: "the file forces kdb memory",
+			in:   GraphSettings{Memory: GraphMemoryGo, FileEnabled: true},
+			want: GraphSettings{Memory: GraphMemoryKDB, FileEnabled: true, AncestryPruning: true, RebuildCommits: DefaultGraphRebuildCommits, MaxSegments: DefaultGraphMaxSegments},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.want.Memory == "" {
+				tc.want.Memory = GraphMemoryKDB // the default every case without an opinion gets
+			}
 			if got := tc.in.normalized(); got != tc.want {
 				t.Errorf("normalized() = %+v, want %+v", got, tc.want)
 			}

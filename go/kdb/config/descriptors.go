@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
@@ -640,6 +641,18 @@ func envOnlySpecs() []envOnlySpec {
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "commits",
 			help:  "how many commits may accumulate in memory before they are flushed to a new graph segment. Ignored when graph.file is off",
 			parse: count,
+		},
+		{
+			key: "graph.memory", env: "KDB_GRAPH_MEMORY",
+			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
+			help: "how commits are held in memory: kdb (default) as fixed-width records the garbage collector does not scan - the graph files' own format; go as a Go map of commit structs, as before. graph.file requires kdb and overrides go",
+			parse: func(raw string) (any, error) {
+				m, err := dag.ParseGraphMemory(raw)
+				if err != nil {
+					return nil, err
+				}
+				return string(m), nil
+			},
 		},
 		{
 			key: "graph.maxSegments", env: "KDB_GRAPH_MAX_SEGMENTS",

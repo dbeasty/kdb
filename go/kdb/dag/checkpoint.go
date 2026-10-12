@@ -92,9 +92,7 @@ func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) 
 	}
 	hashes := make([]codec.Hash, 0, n)
 	if residentOnly {
-		for h := range d.nodes.index {
-			hashes = append(hashes, h)
-		}
+		d.nodes.forEachResident(func(h codec.Hash) { hashes = append(hashes, h) })
 	} else {
 		d.nodes.forEach(func(h codec.Hash) { hashes = append(hashes, h) })
 	}

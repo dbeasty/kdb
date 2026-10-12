@@ -61,6 +61,65 @@ type nodeStore struct {
 	genOverride map[codec.Hash]uint32
 	// segRecords is the total record count across segs.
 	segRecords int
+
+	// goMode holds commits the way the DAG always used to (GraphMemoryGo): a Go map of whole
+	// document.Commit values, traced by the collector on every cycle. Kept selectable at startup
+	// so the two can be run against each other, and as a fallback. In this mode goNodes is the
+	// resident tier and every other field above is unused; segments are never attached.
+	goMode  bool
+	goNodes map[codec.Hash]goNode
+}
+
+// goNode is one commit in GraphMemoryGo - exactly the old commitNode.
+type goNode struct {
+	commit     document.Commit
+	generation uint32
+}
+
+// setGoMode switches the resident representation, moving any commits already held. Only ever
+// done at startup (SetGraphSettings), when the DAG holds its genesis commit and nothing else.
+func (s *nodeStore) setGoMode(on bool) {
+	if on == s.goMode {
+		return
+	}
+	var held []document.Commit
+	var gens []uint32
+	s.forEach(func(h codec.Hash) {
+		c, _ := s.commit(h)
+		held = append(held, c)
+		gens = append(gens, s.generation(h))
+	})
+	*s = newNodeStore()
+	s.goMode = on
+	if on {
+		s.goNodes = make(map[codec.Hash]goNode)
+	}
+	for i, c := range held {
+		s.put(c, gens[i])
+	}
+}
+
+// isResident reports whether h is held in memory (rather than in a segment).
+func (s *nodeStore) isResident(h codec.Hash) bool {
+	if s.goMode {
+		_, ok := s.goNodes[h]
+		return ok
+	}
+	_, ok := s.index[h]
+	return ok
+}
+
+// forEachResident visits every commit held in memory.
+func (s *nodeStore) forEachResident(fn func(codec.Hash)) {
+	if s.goMode {
+		for h := range s.goNodes {
+			fn(h)
+		}
+		return
+	}
+	for h := range s.index {
+		fn(h)
+	}
 }
 
 const slotsPerChunk = 4096
@@ -102,14 +161,23 @@ func (s *nodeStore) inAnySegment(h codec.Hash) bool {
 }
 
 // residentLen is how many commits the resident tier holds - what the flush threshold counts.
-func (s *nodeStore) residentLen() int { return len(s.index) }
+func (s *nodeStore) residentLen() int {
+	if s.goMode {
+		return len(s.goNodes)
+	}
+	return len(s.index)
+}
 
 // segVisible is how many commits the segment tier answers for.
 func (s *nodeStore) segVisible() int { return s.segRecords - len(s.hidden) }
 
-func (s *nodeStore) len() int { return len(s.index) + s.segVisible() }
+func (s *nodeStore) len() int { return s.residentLen() + s.segVisible() }
 
 func (s *nodeStore) has(h codec.Hash) bool {
+	if s.goMode {
+		_, ok := s.goNodes[h]
+		return ok
+	}
 	if _, ok := s.index[h]; ok {
 		return true
 	}
@@ -118,6 +186,9 @@ func (s *nodeStore) has(h codec.Hash) bool {
 }
 
 func (s *nodeStore) generation(h codec.Hash) uint32 {
+	if s.goMode {
+		return s.goNodes[h].generation
+	}
 	if i, ok := s.index[h]; ok {
 		return recGeneration(s.at(i))
 	}
@@ -131,6 +202,13 @@ func (s *nodeStore) generation(h codec.Hash) uint32 {
 }
 
 func (s *nodeStore) setGeneration(h codec.Hash, gen uint32) {
+	if s.goMode {
+		if n, ok := s.goNodes[h]; ok {
+			n.generation = gen
+			s.goNodes[h] = n
+		}
+		return
+	}
 	if i, ok := s.index[h]; ok {
 		setRecGeneration(s.at(i), gen)
 		return
@@ -174,6 +252,10 @@ func (s *nodeStore) setOps(h codec.Hash, ops []document.Op) {
 
 // put stores c with generation gen, replacing any commit already held under its hash.
 func (s *nodeStore) put(c document.Commit, gen uint32) {
+	if s.goMode {
+		s.goNodes[c.Hash] = goNode{commit: c, generation: gen}
+		return
+	}
 	if _, resident := s.index[c.Hash]; !resident {
 		if b, pos, ok := s.segPos(c.Hash); ok {
 			// Already on disk. A commit's hash covers everything a record carries, so the only
@@ -222,6 +304,14 @@ func (s *nodeStore) put(c document.Commit, gen uint32) {
 // it, for the paths that put operations back on (or take them off) a commit whose shape has not
 // changed. Reports false when the hash is not held.
 func (s *nodeStore) replace(c document.Commit) bool {
+	if s.goMode {
+		n, ok := s.goNodes[c.Hash]
+		if ok {
+			n.commit = c
+			s.goNodes[c.Hash] = n
+		}
+		return ok
+	}
 	if i, ok := s.index[c.Hash]; ok {
 		s.put(c, recGeneration(s.at(i)))
 		return true
@@ -240,6 +330,10 @@ func (s *nodeStore) freeSlot(h codec.Hash, i uint32) {
 }
 
 func (s *nodeStore) delete(h codec.Hash) {
+	if s.goMode {
+		delete(s.goNodes, h)
+		return
+	}
 	if i, ok := s.index[h]; ok {
 		s.freeSlot(h, i)
 	}
@@ -258,6 +352,10 @@ func (s *nodeStore) delete(h codec.Hash) {
 // commit rebuilds the document.Commit for h. It allocates the parent slice, so a path that only
 // needs ancestry should use forEachParent instead.
 func (s *nodeStore) commit(h codec.Hash) (document.Commit, bool) {
+	if s.goMode {
+		n, ok := s.goNodes[h]
+		return n.commit, ok
+	}
 	if i, ok := s.index[h]; ok {
 		r := s.at(i)
 		return decodeRecord(r, s.namespaces[recNsIdx(r)], s.messages[h], s.extra[h], s.ops[h]), true
@@ -270,6 +368,10 @@ func (s *nodeStore) commit(h codec.Hash) (document.Commit, bool) {
 
 // treeHash is a commit's document tree hash without building the commit.
 func (s *nodeStore) treeHash(h codec.Hash) (codec.Hash, bool) {
+	if s.goMode {
+		n, ok := s.goNodes[h]
+		return n.commit.DocumentTreeHash, ok
+	}
 	if i, ok := s.index[h]; ok {
 		return recTree(s.at(i)), true
 	}
@@ -285,6 +387,14 @@ func (s *nodeStore) forEachParent(h codec.Hash, fn func(codec.Hash) bool) {
 	var p0, p1 codec.Hash
 	var n uint32
 	var extra []codec.Hash
+	if s.goMode {
+		for _, p := range s.goNodes[h].commit.ParentHashes {
+			if !fn(p) {
+				return
+			}
+		}
+		return
+	}
 	if i, ok := s.index[h]; ok {
 		p0, p1, n = recParents01(s.at(i))
 		if n > 2 {
@@ -313,6 +423,12 @@ func (s *nodeStore) forEachParent(h codec.Hash, fn func(codec.Hash) bool) {
 
 // forEach visits every commit's hash, in no particular order. fn must not add or remove commits.
 func (s *nodeStore) forEach(fn func(codec.Hash)) {
+	if s.goMode {
+		for h := range s.goNodes {
+			fn(h)
+		}
+		return
+	}
 	for h := range s.index {
 		fn(h)
 	}
@@ -673,6 +789,9 @@ func (s *nodeStore) compactSlab() {
 // none resident - so reading them means going to the loader. Resident commits answer through the
 // DAG's eviction set instead.
 func (s *nodeStore) segmentOpsEvicted(h codec.Hash) bool {
+	if s.goMode {
+		return false
+	}
 	if _, resident := s.index[h]; resident {
 		return false
 	}

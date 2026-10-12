@@ -58,6 +58,16 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 			want: dag.GraphSettings{},
 		},
 		{
+			name: "go memory",
+			env:  map[string]string{"KDB_GRAPH_MEMORY": "Go"},
+			want: dag.GraphSettings{Memory: dag.GraphMemoryGo},
+		},
+		{
+			name: "an unknown memory mode is the default",
+			env:  map[string]string{"KDB_GRAPH_MEMORY": "jvm"},
+			want: dag.GraphSettings{},
+		},
+		{
 			name: "a non-numeric count is no count",
 			env:  map[string]string{"KDB_GRAPH_REBUILD_COMMITS": "lots"},
 			want: dag.GraphSettings{},
@@ -68,7 +78,7 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 			// Clear every variable first: a case names only what it sets, and anything the
 			// surrounding environment exports (KDB_GRAPH_FILE=on for a whole-suite run, say)
 			// would otherwise leak into a case that asserts it is off.
-			for _, k := range []string{"KDB_ANCESTRY_PRUNING", "KDB_GRAPH_FILE", "KDB_GRAPH_REBUILD_COMMITS", "KDB_GRAPH_MAX_SEGMENTS", "KDB_HISTORY_ANCHOR_INTERVAL"} {
+			for _, k := range []string{"KDB_ANCESTRY_PRUNING", "KDB_GRAPH_FILE", "KDB_GRAPH_REBUILD_COMMITS", "KDB_GRAPH_MAX_SEGMENTS", "KDB_GRAPH_MEMORY", "KDB_HISTORY_ANCHOR_INTERVAL"} {
 				t.Setenv(k, "")
 			}
 			for k, v := range tc.env {
@@ -107,6 +117,7 @@ func TestGraphSettingsReachTheDag(t *testing.T) {
 		AncestryPruning: true,
 		RebuildCommits:  dag.DefaultGraphRebuildCommits,
 		MaxSegments:     dag.DefaultGraphMaxSegments,
+		Memory:          dag.GraphMemoryKDB,
 	}
 	if got != want {
 		t.Errorf("DAG settings = %+v, want %+v", got, want)

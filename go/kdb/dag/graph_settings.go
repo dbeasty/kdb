@@ -1,5 +1,10 @@
 package dag
 
+import (
+	"fmt"
+	"strings"
+)
+
 // DefaultGraphRebuildCommits is how many commits may accumulate in the
 // resident tail before the on-disk graph is rebuilt, when the caller has
 // not said.
@@ -16,6 +21,31 @@ const DefaultGraphRebuildCommits = 50_000
 // full rewrite instead of a flush. Each segment is one more binary search on a lookup that misses
 // the resident tier, so this bounds history-read cost; it is not a memory bound.
 const DefaultGraphMaxSegments = 8
+
+// GraphMemory is how the DAG holds commits in memory.
+type GraphMemory string
+
+const (
+	// GraphMemoryKDB holds each commit as a fixed-width record in raw byte chunks - the format the
+	// graph segments use on disk - which the collector does not scan. The default.
+	GraphMemoryKDB GraphMemory = "kdb"
+	// GraphMemoryGo holds commits as a Go map of whole document.Commit values, as the DAG always
+	// did before GraphMemoryKDB: simplest, and traced by the collector on every cycle (~50 ms of
+	// mark work at two million commits, against ~2 ms). Incompatible with FileEnabled.
+	GraphMemoryGo GraphMemory = "go"
+)
+
+// ParseGraphMemory reads a graph.memory setting: "go" or "kdb", case-insensitive. Empty is the
+// default (GraphMemoryKDB).
+func ParseGraphMemory(raw string) (GraphMemory, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", string(GraphMemoryKDB):
+		return GraphMemoryKDB, nil
+	case string(GraphMemoryGo):
+		return GraphMemoryGo, nil
+	}
+	return "", fmt.Errorf("graph memory %q: want %q or %q", raw, GraphMemoryGo, GraphMemoryKDB)
+}
 
 // GraphSettings selects how much of the on-disk commit graph work is
 // active for one namespace.
@@ -77,6 +107,10 @@ type GraphSettings struct {
 	// rewrite. Zero means DefaultGraphMaxSegments. Ignored when FileEnabled is off.
 	MaxSegments int
 
+	// Memory selects how commits are held in memory; empty means GraphMemoryKDB. FileEnabled
+	// forces GraphMemoryKDB, since segments are those same records on disk.
+	Memory GraphMemory
+
 	// AnchorInterval is how many commits apart materialized document trees
 	// are written, bounding what a cold historical read has to fold: with
 	// an anchor every N commits there is always one within N below any
@@ -93,6 +127,9 @@ type GraphSettings struct {
 // brought back, so that everything downstream reads settled values instead
 // of re-deriving them and disagreeing.
 func (s GraphSettings) normalized() GraphSettings {
+	if s.Memory != GraphMemoryGo || s.FileEnabled {
+		s.Memory = GraphMemoryKDB
+	}
 	if s.FileEnabled {
 		s.AncestryPruning = true
 		if s.RebuildCommits <= 0 {
@@ -127,6 +164,7 @@ func (d *InMemoryCommitDag) SetGraphSettings(s GraphSettings) {
 	defer d.mu.Unlock()
 	was := d.graph.AncestryPruning
 	d.graph = s.normalized()
+	d.nodes.setGoMode(d.graph.Memory == GraphMemoryGo)
 	if d.graph.AncestryPruning && !was {
 		d.recomputeGenerationsLocked()
 	}

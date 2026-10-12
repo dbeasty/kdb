@@ -128,9 +128,7 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 	gen := make(map[codec.Hash]uint32, d.nodes.residentLen())
 
 	roots := make([]codec.Hash, 0, d.nodes.residentLen())
-	for h := range d.nodes.index {
-		roots = append(roots, h)
-	}
+	d.nodes.forEachResident(func(h codec.Hash) { roots = append(roots, h) })
 	for _, root := range roots {
 		if state[root] != unvisited {
 			continue
@@ -156,7 +154,7 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 				stack = stack[:len(stack)-1]
 				continue
 			}
-			if _, resident := d.nodes.index[h]; !resident && d.nodes.has(h) {
+			if !d.nodes.isResident(h) && d.nodes.has(h) {
 				// In a segment: its generation is settled.
 				gen[h] = d.nodes.generation(h)
 				state[h] = done
