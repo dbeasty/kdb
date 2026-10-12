@@ -526,6 +526,7 @@ func Main() {
 		}
 		peerStatus = fmt.Sprintf("enabled (%s)", peerListener.Addr())
 	}
+	var peerHTTP *http.Server
 	if peerHTTPAddr != "" {
 		ln, err := net.Listen("tcp", peerHTTPAddr)
 		if err != nil {
@@ -534,7 +535,7 @@ func Main() {
 		}
 		mux := http.NewServeMux()
 		mux.Handle("/kdb/sync", node.Handler())
-		peerHTTP := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		peerHTTP = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		go func() { _ = peerHTTP.Serve(ln) }()
 		defer peerHTTP.Close()
 		ws := fmt.Sprintf("websocket ws://%s/kdb/sync", ln.Addr())
@@ -835,13 +836,17 @@ func Main() {
 	// Replication first: a sync in flight is a writer, and Stop waits for it to finish. The
 	// scrub loop likewise.
 	node.StopSync()
-	// Inbound peer sync likewise, and before BeginDraining: Close ends the sessions peers have
-	// open and waits for their handlers. A session left running past the drain had a push
-	// stored and then refused - no longer harmful, since a checkpoint leaves out commits never
-	// logged, but not quiescent either: it kept writing into the DAG while storage closed.
-	if peerListener != nil {
-		_ = peerListener.Close()
+	// Inbound peer sync likewise, and before BeginDraining: CloseInbound ends the sessions peers
+	// have open - on the TCP peer listener and on the WebSocket endpoint (--peer-http) alike - and
+	// waits for their handlers. A session left running past the drain had a push stored and then
+	// refused - no longer harmful, since a checkpoint leaves out commits never logged, but not
+	// quiescent either: it kept writing into the DAG while storage closed. The HTTP server is
+	// closed first so no new session starts; its Close does not end the WebSocket sessions
+	// themselves, which are hijacked connections.
+	if peerHTTP != nil {
+		_ = peerHTTP.Close()
 	}
+	node.CloseInbound()
 	// Before anything else: a pass that is mid-truncation holds the invariant that makes
 	// truncation safe (bodies flushed, checkpoint written, then segments deleted), and Stop waits
 	// for it rather than cutting it short.
