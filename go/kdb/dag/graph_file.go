@@ -234,16 +234,32 @@ func (b *graphBase) find(h codec.Hash) (int, bool) {
 		lo = int(b.fanout[first-1])
 	}
 	hi := int(b.fanout[first])
+	// Commit hashes are SHA-256, so within a fanout bucket they are uniformly spread and
+	// interpolation lands within a few records of the target: a handful of probes instead of the
+	// ~20 a binary search makes over a million records - and each probe is a page an ancestry walk
+	// would otherwise fault in. Falls back to bisection when an estimate stops narrowing the range.
+	key := binary.BigEndian.Uint64(h.Bytes[1:9])
+	loKey, hiKey := uint64(0), ^uint64(0)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-		c := bytes.Compare(b.rec(mid)[grHash:grHash+32], h.Bytes[:])
+		if hi-lo > 8 && hiKey > loKey && key >= loKey && key <= hiKey {
+			frac := float64(key-loKey) / float64(hiKey-loKey)
+			est := lo + int(frac*float64(hi-lo-1))
+			if est >= lo && est < hi {
+				mid = est
+			}
+		}
+		r := b.rec(mid)
+		c := bytes.Compare(r[grHash:grHash+32], h.Bytes[:])
 		switch {
 		case c == 0:
 			return mid, true
 		case c < 0:
 			lo = mid + 1
+			loKey = binary.BigEndian.Uint64(r[grHash+1 : grHash+9])
 		default:
 			hi = mid
+			hiKey = binary.BigEndian.Uint64(r[grHash+1 : grHash+9])
 		}
 	}
 	return 0, false

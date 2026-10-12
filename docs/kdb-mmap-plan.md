@@ -187,13 +187,54 @@ unless the memory budget (not the GC) becomes the reason.
 
 ### Landed on `perf/mmap-offheap`
 
-- `go/kdb/storage/mmapfile`: refcounted read-only mapping (Phase 1). Tests under `-race`, including owner-close vs.
-  concurrent readers, truncation (SIGBUS -> error), and cross-compile for windows and js/wasm. **No production
-  consumer yet** - it is the primitive the graph file (below) would need.
-- `go/kdb/dag/node_store.go`: pointer-free commit node store (replaces `map[Hash]commitNode`), with
-  `TestSlotHasNoPointers` pinning the property that matters.
+1. **`go/kdb/storage/mmapfile`** - refcounted read-only mapping; `CopyAt`/`Guard` turn SIGBUS into an error;
+   `MappedBytes()` for the budget. Tested under `-race`, cross-compiled for windows and js/wasm.
+2. **Pointer-free resident tier** (`go/kdb/dag/node_store.go`) - replaced `map[Hash]commitNode`.
+3. **The on-disk commit graph** (`go/kdb/dag/graph_file.go`, `graph_attach.go`, `graph_record.go`), behind
+   `graph.file` / `KDB_GRAPH_FILE`, off by default.
+4. **Budget wiring** - `server/memory_guard.go` adds `MappedBytes()` on the runtime/metrics path (macOS, Linux
+   without a cgroup). The cgroup reading already charges page cache, so it is not added there.
 
-### Still open (next, in order)
+## The altered plan (2026-10-12): one format, an LSM on disk
+
+Two changes requested after the first graph file landed, both now built:
+
+### One record format for memory and disk
+
+The resident tier holds each commit as the **same 256-byte record** a graph segment holds
+(`graph_record.go`), in 1 MB heap chunks of raw bytes. Consequences:
+
+- writing a commit to disk is a byte copy; there is one encoder and one decoder for both tiers;
+- the chunks are `[N]byte`, so the collector still never scans them (`TestResidentChunksArePointerFree`);
+- the record carries **14 reserved bytes** (offset 242) so a later field does not need a new layout, and two
+  memory-only fields in a region the writer zeroes (the namespace index; blob offsets are file-only).
+
+### Segments, flushes and full rewrites (Cassandra-style)
+
+The graph on disk is `ns/<namespace>/graph/graph-<seq>.kdbg`, a set of sorted segments:
+
+| Operation | Writes | When |
+|---|---|---|
+| **Flush** (memtable -> SSTable) | only the resident tier, as a new partial segment | resident >= `graph.rebuildCommits` (default 50,000) and no rewrite trigger fires |
+| **Full rewrite** (major compaction) | every segment + the resident tier, as one segment flagged *full* | first write; segments >= `graph.maxSegments` (default 8); hidden records > 20% (tombstone compaction); resident >= half of what is on disk; or `EmbeddedKdbRuntime.CompactCommitGraph()` |
+
+Invariants: segments never share a commit (a flush skips any commit a segment has a record for, even a hidden one);
+a full segment supersedes every lower sequence number, so a crash between its rename and the deletes is repaired at
+the next open; any unusable segment discards the whole set (commits stay resident, next write is a full rewrite);
+read-only runtimes map but never write or delete.
+
+### Known limits
+
+- **Open peak.** Restore still admits every commit from the checkpoint before the attach moves them out, so peak
+  heap at open is unchanged; steady state is what drops. Removing that means teaching the checkpoint to reference
+  the graph instead of carrying commits - a separate change.
+- **Checkpoint writes** still materialize every commit transiently (`CheckpointSnapshotRetaining`). Same fix.
+- **History reads are slower** from segments than from memory (binary search per step, per segment). Accepted by
+  design constraint 3 of the commit-graph doc; measured below.
+- **Not done:** the position-indexed cursor and anchors (commit-graph doc Phases 4-5) - latency/replay features,
+  not memory ones.
+
+### Earlier "still open" list (superseded by the sections above)
 
 - Phase 0 at 1M and 2M commits to size the graph file's win (the existing 100k run took 11 minutes; use a direct-DAG
   loader, not the embedded runtime, for the large sizes).

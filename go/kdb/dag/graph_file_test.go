@@ -577,3 +577,46 @@ func TestGraphReaddedCommitWaitsForFullRewrite(t *testing.T) {
 		t.Fatal("re-added commit lost in the full rewrite")
 	}
 }
+
+// find must answer exactly what a linear scan answers, for present and absent hashes alike - the
+// interpolation is an optimization and may never change a result.
+func TestGraphFindMatchesLinearScan(t *testing.T) {
+	skipWithoutMmap(t)
+	d, _ := NewInMemoryCommitDag("ns")
+	d.SetGraphSettings(GraphSettings{FileEnabled: true})
+	dir := filepath.Join(t.TempDir(), "g")
+	d.ConfigureGraphFile(dir, false)
+	t.Cleanup(d.CloseGraphFile)
+	parent, _ := d.Head()
+	for i := 0; i < 5000; i++ {
+		tx, _ := codec.RandomUUID()
+		c, _ := document.BuildCommit([]codec.Hash{parent}, "ns", tx, codec.Timestamp{EpochMillis: int64(i)}, tx, nil, codec.Hash{}, nil, "")
+		if err := d.PutCommit(c, true); err != nil {
+			t.Fatal(err)
+		}
+		parent = c.Hash
+	}
+	if err := d.CompactGraphFile(); err != nil {
+		t.Fatal(err)
+	}
+	b := d.nodes.segs[0]
+	for pos := 0; pos < b.count; pos++ {
+		if got, ok := b.find(b.hashAt(pos)); !ok || got != pos {
+			t.Fatalf("find(record %d) = %d, %v", pos, got, ok)
+		}
+	}
+	for i := 0; i < 5000; i++ {
+		var h codec.Hash
+		h.Bytes[0], h.Bytes[1], h.Bytes[5], h.Bytes[31] = byte(i), byte(i>>8), byte(i*7), byte(i*13)
+		_, ok := b.find(h)
+		want := false
+		for pos := 0; pos < b.count; pos++ {
+			if b.hashAt(pos) == h {
+				want = true
+			}
+		}
+		if ok != want {
+			t.Fatalf("find(%x) = %v, linear scan says %v", h.Bytes[:4], ok, want)
+		}
+	}
+}
