@@ -2183,3 +2183,18 @@ Class.forName("dev.kdb.jdbc.KdbDriver");
 Connection c = DriverManager.getConnection("jdbc:kdb:memory:///demo/users");
 // Seed data via conn.embedded — see JDBC section above
 ```
+
+### Indexes on schemaless namespaces
+
+A namespace with no declared schema can still be indexed: `CREATE INDEX by_user ON docs (userId)`
+registers a HASH index on that JSON path (`USING BTREE` for ranges), backfills it, and keeps it
+current on every commit. The path may be nested (`a.b`) and an array field is multikey, so
+`projectIds = 'p1'` is membership. A namespace holding several collections told apart by a field
+(`_c`) should index that field plus each filter path.
+
+A filtered read is then independent of the namespace size: with several servable `=` conjuncts the
+planner fetches the id list of the most selective one (counting first, so a collection tag shared
+by most documents is never listed), and the index advances incrementally with each commit instead
+of being rebuilt from its event log on the first read after a write. Measured at 1k, 10k and 100k
+documents the filtered read stays in the tens of microseconds
+(`TestJSONPathIndexKeepsFilteredReadFlat`).

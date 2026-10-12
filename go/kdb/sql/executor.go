@@ -338,6 +338,16 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 			}
 		}
 	}
+	var (
+		best      []codec.UUID
+		bestLabel string
+		found     bool
+	)
+	type candidate struct {
+		conj Expr
+		est  int // -1 when unknown
+	}
+	var cands []candidate
 	for _, conj := range conjuncts(where) {
 		if isSearchExpr(conj) {
 			if hits := env.scores[searchKey(conj)]; hits != nil {
@@ -353,18 +363,78 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 		if e.IndexProvider == nil {
 			continue
 		}
-		ids, label, ok, err := e.indexLookup(conj, env, ctx)
+		cands = append(cands, candidate{conj: conj, est: e.estimateConjunct(conj, env, ctx)})
+	}
+	// Cheapest first, unknown costs last: with a good first pick the rest are skipped unless
+	// they might beat it. Every servable conjunct is a correct choice (the residual WHERE
+	// re-checks whatever is fetched) so only the cost differs. The first one used to be taken,
+	// so `_c = 'tasks' AND taskId = 'x'` walked every task through the shared collection tag
+	// when a single id lookup would have done.
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i].est, cands[j].est
+		if a < 0 || b < 0 {
+			return b < 0 && a >= 0
+		}
+		return a < b
+	})
+	for _, c := range cands {
+		if found && c.est >= len(best) {
+			continue
+		}
+		ids, label, ok, err := e.indexLookup(c.conj, env, ctx)
 		if err != nil {
 			return nil, "", err
 		}
-		if ok {
-			// Not truncated: the residual WHERE still runs over these, so cutting the list here
-			// would drop matches. The result bound is enforced on the rows actually returned.
-			return ids, label, nil
+		if ok && (!found || len(ids) < len(best)) {
+			best, bestLabel, found = ids, label, true
 		}
+	}
+	if found {
+		// Not truncated: the residual WHERE still runs over these, so cutting the list here
+		// would drop matches. The result bound is enforced on the rows actually returned.
+		return best, bestLabel, nil
 	}
 	ids, err := e.fullScan(ctx, stopAt)
 	return ids, "fullscan", err
+}
+
+// estimateConjunct is how many ids serving conj from an index would return, or -1 when that is
+// not known without fetching them.
+func (e *Executor) estimateConjunct(conj Expr, env *evalEnv, ctx QueryContext) int {
+	counter, ok := e.IndexProvider.(ExactCounter)
+	if !ok {
+		return -1
+	}
+	b, ok := conj.(ExprBinary)
+	if !ok || b.Op != BinaryOpEQ {
+		return -1
+	}
+	col, other := b.Left, b.Right
+	if _, isCol := col.(ExprColumnRef); !isCol {
+		col, other = b.Right, b.Left
+	}
+	ref, isCol := col.(ExprColumnRef)
+	if !isCol {
+		return -1
+	}
+	switch other.(type) {
+	case ExprLiteral, ExprParameter:
+	default:
+		return -1
+	}
+	name := env.columnName(ref.Name)
+	if isReservedColumn(name) {
+		return -1
+	}
+	value := env.cell(other, newEvalDoc(emptyDoc))
+	if isNullCell(value) {
+		return -1
+	}
+	n, ok, err := counter.ExactCount(ctx, name, value)
+	if err != nil || !ok {
+		return -1
+	}
+	return n
 }
 
 // rankedIDs lists a ranking's documents best-first. It is not cut: the residual WHERE still runs

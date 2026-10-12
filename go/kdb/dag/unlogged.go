@@ -70,6 +70,7 @@ func (d *InMemoryCommitDag) PutUnloggedShallowCommit(c document.Commit) error {
 	}
 	d.shallow[c.Hash] = struct{}{}
 	d.ancestryVersion++
+	d.ancestryEpoch++
 	d.markUnloggedLocked(c.Hash)
 	return nil
 }

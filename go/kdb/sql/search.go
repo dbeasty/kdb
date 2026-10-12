@@ -32,6 +32,14 @@ type IndexProvider interface {
 	RangeLookup(ctx QueryContext, field string, low, high Cell, lowInclusive, highInclusive bool) (ids []codec.UUID, ok bool, err error)
 }
 
+// ExactCounter is an optional IndexProvider capability: the number of ids ExactLookup would
+// return, without materializing them. The planner uses it to fetch only the most selective of
+// several servable equality conjuncts - a collection tag shared by most documents costs
+// O(documents) to list even when another conjunct names a single one.
+type ExactCounter interface {
+	ExactCount(ctx QueryContext, field string, value Cell) (n int, ok bool, err error)
+}
+
 // searchHits is one resolved search expression: the ranked hit list and a score lookup.
 type searchHits struct {
 	label  string

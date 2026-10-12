@@ -49,6 +49,7 @@ func (p *RegistryIndexProvider) Registry() *index.Registry { return p.registry }
 
 var (
 	_ sql.IndexProvider    = (*RegistryIndexProvider)(nil)
+	_ sql.ExactCounter     = (*RegistryIndexProvider)(nil)
 	_ sql.IndexDDLExecutor = (*RegistryIndexProvider)(nil)
 	_ SearchProvider       = (*RegistryIndexProvider)(nil)
 )
@@ -100,6 +101,29 @@ func (p *RegistryIndexProvider) ExactLookup(ctx sql.QueryContext, field string, 
 		return nil, true, err
 	}
 	return ids, true, nil
+}
+
+// ExactCount is ExactLookup's size, without listing the ids (sql.ExactCounter).
+func (p *RegistryIndexProvider) ExactCount(ctx sql.QueryContext, field string, value sql.Cell) (int, bool, error) {
+	store, ok := p.keyedStore(field)
+	if !ok {
+		return 0, false, nil
+	}
+	counter, ok := store.(interface {
+		LookupCount(key index.Key, atCommit *codec.Hash) (int, error)
+	})
+	if !ok {
+		return 0, false, nil
+	}
+	key, ok := indexKeyForCell(value)
+	if !ok {
+		return 0, false, nil
+	}
+	n, err := counter.LookupCount(key, ctx.AtCommit)
+	if err != nil {
+		return 0, true, err
+	}
+	return n, true, nil
 }
 
 // RangeLookup answers an ordering or BETWEEN conjunct from a BTREE index. Stores scan the
