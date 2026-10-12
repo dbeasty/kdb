@@ -1,6 +1,7 @@
 package io
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,7 +30,14 @@ type OSByteStore struct {
 
 	mu      sync.Mutex
 	handles map[string]*openSegment
+	// readers caches read-only handles so a read does not open, stat and close a file. Reading
+	// every document after a restart (a scan, or a cold get) goes through here once per document,
+	// and the open dominated it: ~45 of 58 seconds for 100k documents. Bounded, and never evicted
+	// while in use: past maxReadHandles a read simply opens its own handle as before.
+	readers map[string]*os.File
 }
+
+const maxReadHandles = 512
 
 type openSegment struct {
 	file *os.File
@@ -45,6 +53,7 @@ func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 		syncMode:         config.SyncMode,
 		preallocateBytes: config.PreallocateBytes,
 		handles:          make(map[string]*openSegment),
+		readers:          make(map[string]*os.File),
 	}, nil
 }
 
@@ -195,20 +204,67 @@ func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte
 	if length == 0 {
 		return []byte{}, nil
 	}
-	p := s.pathFor(segmentName)
-	f, err := os.Open(p)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, &PlatformIOError{Message: "segment does not exist", SegmentName: segmentName, Cause: err}
-		}
-		return nil, err
-	}
-	defer f.Close()
-	if offset != 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+	// A cached handle may be closed under us by Delete/ReleaseHandles/Close between lookup and
+	// read; one retry opens a fresh one.
+	for attempt := 0; ; attempt++ {
+		f, cached, err := s.readHandle(segmentName)
+		if err != nil {
 			return nil, err
 		}
+		buf, err := readAtClamped(f, offset, length)
+		if !cached {
+			_ = f.Close()
+		}
+		if err != nil && cached && attempt == 0 && errors.Is(err, os.ErrClosed) {
+			continue
+		}
+		return buf, err
 	}
+}
+
+// readHandle returns a handle for reading segmentName and whether it is the shared cached one
+// (which the caller must not close).
+func (s *OSByteStore) readHandle(segmentName string) (*os.File, bool, error) {
+	s.mu.Lock()
+	if f, ok := s.readers[segmentName]; ok {
+		s.mu.Unlock()
+		return f, true, nil
+	}
+	s.mu.Unlock()
+	f, err := os.Open(s.pathFor(segmentName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, &PlatformIOError{Message: "segment does not exist", SegmentName: segmentName, Cause: err}
+		}
+		return nil, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.readers[segmentName]; ok {
+		_ = f.Close()
+		return existing, true, nil
+	}
+	if len(s.readers) >= maxReadHandles {
+		return f, false, nil
+	}
+	s.readers[segmentName] = f
+	return f, true, nil
+}
+
+// dropReader closes and forgets the cached read handle for segmentName.
+func (s *OSByteStore) dropReader(segmentName string) {
+	s.mu.Lock()
+	f := s.readers[segmentName]
+	delete(s.readers, segmentName)
+	s.mu.Unlock()
+	if f != nil {
+		_ = f.Close()
+	}
+}
+
+// readAtClamped reads up to length bytes at offset with a positional read, so concurrent readers
+// share one handle without disturbing each other's position.
+func readAtClamped(f *os.File, offset int64, length int) ([]byte, error) {
 	// Clamp to what the file actually holds before allocating. Callers that want
 	// "the whole segment" pass a length that is an upper bound rather than a real
 	// size - delta.DefaultReader.scanSegmentRef passes 1<<28 - and allocating that
@@ -224,7 +280,7 @@ func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte
 		}
 	}
 	buf := make([]byte, length)
-	n, err := io.ReadFull(f, buf)
+	n, err := f.ReadAt(buf, offset)
 	if err == io.ErrUnexpectedEOF || err == io.EOF {
 		return buf[:n], nil
 	}
@@ -263,8 +319,13 @@ func (s *OSByteStore) Close() error {
 	s.mu.Lock()
 	handles := s.handles
 	s.handles = make(map[string]*openSegment)
+	readers := s.readers
+	s.readers = make(map[string]*os.File)
 	s.mu.Unlock()
 	var firstErr error
+	for _, f := range readers {
+		_ = f.Close()
+	}
 	for _, seg := range handles {
 		if err := seg.file.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -306,6 +367,7 @@ func (s *OSByteStore) List(prefix string) ([]string, error) {
 }
 
 func (s *OSByteStore) Delete(segmentName string) error {
+	s.dropReader(segmentName)
 	s.mu.Lock()
 	seg, ok := s.handles[segmentName]
 	if ok {
@@ -460,6 +522,13 @@ type HandleReleaser interface {
 func (s *OSByteStore) ReleaseHandles(prefix string) error {
 	s.mu.Lock()
 	var release []*openSegment
+	var releaseReaders []*os.File
+	for name, f := range s.readers {
+		if strings.HasPrefix(name, prefix) {
+			releaseReaders = append(releaseReaders, f)
+			delete(s.readers, name)
+		}
+	}
 	for name, seg := range s.handles {
 		if strings.HasPrefix(name, prefix) {
 			release = append(release, seg)
@@ -467,6 +536,9 @@ func (s *OSByteStore) ReleaseHandles(prefix string) error {
 		}
 	}
 	s.mu.Unlock()
+	for _, f := range releaseReaders {
+		_ = f.Close()
+	}
 	var firstErr error
 	for _, seg := range release {
 		if err := seg.file.Close(); err != nil && firstErr == nil {
