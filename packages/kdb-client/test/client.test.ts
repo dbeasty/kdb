@@ -54,7 +54,7 @@ describe("handshake", () => {
     // rejection, just silence. Go hit this and fixed it the same way.
     const server = new FakeServer(() => ({
       kind: "handshakeAck",
-      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {} },
+      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {}, serverVersion: "0.7.0" },
     }));
     const client = new Client(server);
     await client.handshake();
@@ -69,7 +69,7 @@ describe("handshake", () => {
   it("advertises JSON only, since it implements no other payload codec", async () => {
     const server = new FakeServer(() => ({
       kind: "handshakeAck",
-      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {} },
+      payload: { accepted: true, negotiatedEncoding: "JSON", protocolVersion: 1, remoteHeads: {}, serverVersion: "0.7.0" },
     }));
     await new Client(server).handshake();
     assert.deepEqual(server.requests[0]!.payload["preferredEncodings"], ["JSON"]);
@@ -83,6 +83,7 @@ describe("handshake", () => {
         negotiatedEncoding: "KDB_BINARY",
         protocolVersion: 1,
         remoteHeads: {},
+        serverVersion: "0.7.0",
       },
     }));
     await assert.rejects(new Client(server).handshake(), /implements JSON only/);

@@ -141,6 +141,7 @@ type handshakeAckDto struct {
 	ProtocolVersion    int               `json:"protocolVersion"`
 	RemoteHeads        map[string]string `json:"remoteHeads"`
 	RejectionReason    *string           `json:"rejectionReason,omitempty"`
+	ServerVersion      string            `json:"serverVersion,omitempty"`
 }
 
 type deltaCommitDto struct {

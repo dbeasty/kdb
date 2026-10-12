@@ -7,6 +7,7 @@
  */
 
 export { connect, Client, backoffDelay, decodeConflictError, DEFAULT_REQUEST_TIMEOUT_MS } from "./client.ts";
+export { CLIENT_VERSION, checkServerCompatible } from "./version.ts";
 export type { ConnectOptions, Lease, TlsOptions } from "./client.ts";
 
 export type {

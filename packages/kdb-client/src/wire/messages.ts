@@ -122,6 +122,8 @@ export interface HandshakeAckDto {
   protocolVersion: number;
   remoteHeads: Record<string, string>;
   rejectionReason?: string | null;
+  /** The server's release version. Absent from servers older than 0.7.0 and from the JVM one. */
+  serverVersion?: string | null;
 }
 
 export interface SessionBeginDto {

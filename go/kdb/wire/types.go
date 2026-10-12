@@ -488,6 +488,11 @@ type HandshakeAckPayload struct {
 	ProtocolVersion    int
 	RemoteHeads        map[string]string
 	RejectionReason    *string
+	// ServerVersion is the release version of the server that sent the ack ("0.7.0",
+	// "0.0.0-dev" for a from-source build). Additive and optional: an older server, or the
+	// Kotlin one, leaves it empty, and a client that cares about compatibility (the TS client
+	// pins its package to the server release) treats empty as "unknown".
+	ServerVersion string
 }
 
 type IndexHint struct {

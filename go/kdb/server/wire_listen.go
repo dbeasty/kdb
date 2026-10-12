@@ -21,6 +21,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
+	"github.com/limidus/kdb/go/kdb/version"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -512,6 +513,7 @@ func handshakeAck(msg wire.HandshakeMessage, accepted bool, headHex string, reje
 			ProtocolVersion:    wire.KdbWireProtocolVersion,
 			RemoteHeads:        remoteHeads,
 			RejectionReason:    rejectionReason,
+			ServerVersion:      version.Get().Version,
 		},
 	}
 }

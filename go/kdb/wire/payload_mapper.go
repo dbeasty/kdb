@@ -71,6 +71,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				ProtocolVersion:    m.Response.ProtocolVersion,
 				RemoteHeads:        m.Response.RemoteHeads,
 				RejectionReason:    m.Response.RejectionReason,
+				ServerVersion:      m.Response.ServerVersion,
 			},
 		}, nil
 	case DeltaCommitMessage:
@@ -378,6 +379,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 				ProtocolVersion:    a.ProtocolVersion,
 				RemoteHeads:        a.RemoteHeads,
 				RejectionReason:    a.RejectionReason,
+				ServerVersion:      a.ServerVersion,
 			},
 		}, nil
 	case "deltaCommit":

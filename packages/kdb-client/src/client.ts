@@ -6,6 +6,7 @@
  * rather than sentinel returns.
  */
 
+import { checkServerCompatible } from "./version.ts";
 import { SessionLock } from "./session-lock.ts";
 import {
   KdbAbortedError,
@@ -86,6 +87,12 @@ export interface ConnectOptions {
   /** Required for tcps:// and wss://. */
   tls?: TlsOptions;
   maxFrameBytes?: number;
+  /**
+   * The handshake fails when the server's release is not the one this package was published
+   * for (or reports none). Set this to talk to a server regardless: a build from source that
+   * carries no release number, or a deliberate version skew you have tested yourself.
+   */
+  skipVersionCheck?: boolean;
 }
 
 interface NamespaceState {
@@ -200,6 +207,10 @@ export class Client implements KdbOperations {
       throw new KdbUnauthenticatedError(
         `kdb: handshake rejected: ${ack.rejectionReason ?? "no reason given"}`,
       );
+    }
+    if (!options.skipVersionCheck) {
+      const problem = checkServerCompatible(ack.serverVersion);
+      if (problem) throw new KdbProtocolError(`kdb: ${problem}`);
     }
     if (ack.negotiatedEncoding !== "JSON") {
       throw new KdbProtocolError(
