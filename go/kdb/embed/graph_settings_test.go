@@ -58,6 +58,16 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 			want: dag.GraphSettings{},
 		},
 		{
+			name: "go memory",
+			env:  map[string]string{"KDB_GRAPH_MEMORY": "Go"},
+			want: dag.GraphSettings{Memory: dag.GraphMemoryGo},
+		},
+		{
+			name: "an unknown memory mode is the default",
+			env:  map[string]string{"KDB_GRAPH_MEMORY": "jvm"},
+			want: dag.GraphSettings{},
+		},
+		{
 			name: "a non-numeric count is no count",
 			env:  map[string]string{"KDB_GRAPH_REBUILD_COMMITS": "lots"},
 			want: dag.GraphSettings{},
@@ -65,6 +75,12 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Clear every variable first: a case names only what it sets, and anything the
+			// surrounding environment exports (KDB_GRAPH_FILE=on for a whole-suite run, say)
+			// would otherwise leak into a case that asserts it is off.
+			for _, k := range []string{"KDB_ANCESTRY_PRUNING", "KDB_GRAPH_FILE", "KDB_GRAPH_REBUILD_COMMITS", "KDB_GRAPH_MAX_SEGMENTS", "KDB_GRAPH_MEMORY", "KDB_HISTORY_ANCHOR_INTERVAL"} {
+				t.Setenv(k, "")
+			}
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}
@@ -100,12 +116,14 @@ func TestGraphSettingsReachTheDag(t *testing.T) {
 		FileEnabled:     true,
 		AncestryPruning: true,
 		RebuildCommits:  dag.DefaultGraphRebuildCommits,
+		MaxSegments:     dag.DefaultGraphMaxSegments,
+		Memory:          dag.GraphMemoryKDB,
 	}
 	if got != want {
 		t.Errorf("DAG settings = %+v, want %+v", got, want)
 	}
 	if p.delegate.GraphFileActive() {
-		t.Error("a graph file is reported active, but none is implemented")
+		t.Error("a fresh namespace below the rebuild threshold should not have a graph file yet")
 	}
 }
 
@@ -126,7 +144,9 @@ func TestDefaultOpenTurnsNothingOn(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a persisting DAG, got %T", rt.DAG)
 	}
-	if got := p.delegate.GraphSettings(); got != (dag.GraphSettings{}) {
-		t.Errorf("DAG settings = %+v, want the zero value", got)
+	// Nothing optional is on; the only value filled in is which memory representation the
+	// DAG uses, and that is the default one.
+	if got := p.delegate.GraphSettings(); got != (dag.GraphSettings{Memory: dag.GraphMemoryKDB}) {
+		t.Errorf("DAG settings = %+v, want nothing on and the default memory mode", got)
 	}
 }

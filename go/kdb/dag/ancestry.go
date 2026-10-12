@@ -210,11 +210,14 @@ func (d *InMemoryCommitDag) expandParentsLocked(hash codec.Hash) []codec.Hash {
 	if _, ok := d.shallow[hash]; ok {
 		return nil
 	}
-	c, ok := d.commitLocked(hash)
-	if !ok {
-		return nil
-	}
-	return c.ParentHashes
+	// Parents only: building the whole commit cost a message lookup, an operations lookup and,
+	// for a commit in the graph file, decoding the full record - on every step of every walk.
+	var out []codec.Hash
+	d.nodes.forEachParent(hash, func(p codec.Hash) bool {
+		out = append(out, p)
+		return true
+	})
+	return out
 }
 
 func (d *InMemoryCommitDag) ancestorClosureLocked(start codec.Hash) map[codec.Hash]struct{} {

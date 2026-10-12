@@ -43,6 +43,12 @@ func namespaceMetaPath(dataRoot, namespaceID string) string {
 	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "meta.json")
 }
 
+// graphDirPath is where a namespace's commit-graph segments live, beside its metadata. They are
+// derived state: deleting the directory costs a rebuild, never data.
+func graphDirPath(dataRoot, namespaceID string) string {
+	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "graph")
+}
+
 func readNamespaceMeta(dataRoot, namespaceID string) (namespaceMeta, bool) {
 	raw, err := os.ReadFile(namespaceMetaPath(dataRoot, namespaceID))
 	if err != nil {

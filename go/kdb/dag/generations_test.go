@@ -161,24 +161,25 @@ func TestGenerationIsOneAboveTheHighestParent(t *testing.T) {
 	b.dag.mu.RLock()
 	defer b.dag.mu.RUnlock()
 	for _, h := range hashes {
-		n, ok := b.dag.nodes[h]
+		c, ok := b.dag.nodes.commit(h)
 		if !ok {
 			t.Fatalf("%s is not resident", b.name(h))
 		}
+		gen := b.dag.nodes.generation(h)
 		var want uint32
-		for _, p := range n.commit.ParentHashes {
-			if pn, ok := b.dag.nodes[p]; ok && pn.generation > want {
-				want = pn.generation
+		for _, p := range c.ParentHashes {
+			if b.dag.nodes.has(p) && b.dag.nodes.generation(p) > want {
+				want = b.dag.nodes.generation(p)
 			}
 		}
 		want++
-		if n.generation != want {
-			t.Errorf("%s: generation %d, want %d", b.name(h), n.generation, want)
+		if gen != want {
+			t.Errorf("%s: generation %d, want %d", b.name(h), gen, want)
 		}
-		for _, p := range n.commit.ParentHashes {
-			if pn, ok := b.dag.nodes[p]; ok && pn.generation >= n.generation {
+		for _, p := range c.ParentHashes {
+			if b.dag.nodes.has(p) && b.dag.nodes.generation(p) >= gen {
 				t.Errorf("%s (generation %d) does not exceed its parent %s (%d)",
-					b.name(h), n.generation, b.name(p), pn.generation)
+					b.name(h), gen, b.name(p), b.dag.nodes.generation(p))
 			}
 		}
 	}
@@ -194,8 +195,8 @@ func TestPruningOffLeavesGenerationsUnset(t *testing.T) {
 	b.dag.mu.RLock()
 	defer b.dag.mu.RUnlock()
 	for _, h := range hashes {
-		if n, ok := b.dag.nodes[h]; ok && n.generation != 0 {
-			t.Fatalf("%s has generation %d with pruning off", b.name(h), n.generation)
+		if b.dag.nodes.has(h) && b.dag.nodes.generation(h) != 0 {
+			t.Fatalf("%s has generation %d with pruning off", b.name(h), b.dag.nodes.generation(h))
 		}
 	}
 }
@@ -220,12 +221,13 @@ func TestGraphSettingsNormalization(t *testing.T) {
 				FileEnabled:     true,
 				AncestryPruning: true,
 				RebuildCommits:  DefaultGraphRebuildCommits,
+				MaxSegments:     DefaultGraphMaxSegments,
 			},
 		},
 		{
 			name: "an explicit rebuild threshold is kept",
 			in:   GraphSettings{FileEnabled: true, RebuildCommits: 7},
-			want: GraphSettings{FileEnabled: true, AncestryPruning: true, RebuildCommits: 7},
+			want: GraphSettings{FileEnabled: true, AncestryPruning: true, RebuildCommits: 7, MaxSegments: DefaultGraphMaxSegments},
 		},
 		{
 			// Nothing to rebuild, so reporting a threshold back would only
@@ -249,9 +251,22 @@ func TestGraphSettingsNormalization(t *testing.T) {
 			in:   GraphSettings{AnchorInterval: 500},
 			want: GraphSettings{AnchorInterval: 500},
 		},
+		{
+			name: "go memory is kept without the file",
+			in:   GraphSettings{Memory: GraphMemoryGo},
+			want: GraphSettings{Memory: GraphMemoryGo},
+		},
+		{
+			name: "the file forces kdb memory",
+			in:   GraphSettings{Memory: GraphMemoryGo, FileEnabled: true},
+			want: GraphSettings{Memory: GraphMemoryKDB, FileEnabled: true, AncestryPruning: true, RebuildCommits: DefaultGraphRebuildCommits, MaxSegments: DefaultGraphMaxSegments},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.want.Memory == "" {
+				tc.want.Memory = GraphMemoryKDB // the default every case without an opinion gets
+			}
 			if got := tc.in.normalized(); got != tc.want {
 				t.Errorf("normalized() = %+v, want %+v", got, tc.want)
 			}

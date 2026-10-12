@@ -18,6 +18,12 @@ import (
 // it costs one slow start and never costs correctness.
 const checkpointFormatVersion = 2
 
+// checkpointGraphFormatVersion is a checkpoint that references graph segments instead of carrying
+// the commits in them (fields 11 and 12). Its own version so that a build that predates it reads
+// it as unusable and replays the log, rather than restoring a graph with most of its commits
+// missing. Written only when there are segments to reference; otherwise version 2, unchanged.
+const checkpointGraphFormatVersion = 3
+
 const checkpointNS = "dev.kdb.checkpoint"
 
 var (
@@ -28,6 +34,7 @@ var (
 	fqnCheckpointEntry  = checkpointNS + ".CheckpointTreeEntry"
 	fqnCheckpointSeg    = checkpointNS + ".CheckpointSegment"
 	fqnCheckpointHash   = checkpointNS + ".Hash32"
+	fqnCheckpointGraph  = checkpointNS + ".CheckpointGraphSegment"
 )
 
 var (
@@ -103,6 +110,17 @@ func checkpointRegistry() *schema.Registry {
 				{ID: 1, Name: "sequence", Type: cpI64},
 				{ID: 2, Name: "sizeBytes", Type: cpI64},
 				{ID: 3, Name: "lastCommitHash", Type: cpHash},
+				// Optional, absent from checkpoints written before stamps: see checkpointSegment.
+				{ID: 4, Name: "stampSize", Type: cpI64, Default: codec.Int64Value{V: -1}},
+				{ID: 5, Name: "stampModTimeNanos", Type: cpI64, Default: codec.Int64Value{V: 0}},
+			},
+		})
+		r.RegisterRecord(&schema.RecordSchema{
+			Name: "CheckpointGraphSegment", Namespace: checkpointNS,
+			Fields: []schema.FieldSchema{
+				{ID: 1, Name: "sequence", Type: cpI64},
+				{ID: 2, Name: "crc", Type: cpI64},
+				{ID: 3, Name: "records", Type: cpI64},
 			},
 		})
 		r.RegisterRecord(&schema.RecordSchema{
@@ -138,6 +156,10 @@ func checkpointRegistry() *schema.Registry {
 				// indistinguishable from a deleted file, and the only safe
 				// reading of an ambiguous log is the pessimistic one.
 				{ID: 10, Name: "floorSequence", Type: cpI64},
+				// Version 3 only: the graph segments holding every commit not in "commits", and
+				// the records in them for commits since deleted. See dag.CheckpointSnapshotWithGraph.
+				{ID: 11, Name: "graphSegments", Type: schema.Array{Element: schema.Ref{FullyQualifiedName: fqnCheckpointGraph}}, Default: codec.ArrayValue{}},
+				{ID: 12, Name: "graphHidden", Type: schema.Array{Element: cpHash}, Default: codec.ArrayValue{}},
 			},
 		})
 		r.Freeze()
@@ -162,6 +184,10 @@ type namespaceCheckpoint struct {
 	LiveTree      document.DocumentTree
 	Segments      []checkpointSegment
 	HeadCommits   [][]byte
+	// GraphRefs, when set, are the graph segments holding every commit State.Commits leaves
+	// out; GraphHidden the records in them for commits since deleted. History=full only.
+	GraphRefs   []dag.GraphSegmentRef
+	GraphHidden []codec.Hash
 }
 
 // checkpointSegment fingerprints one delta segment a checkpoint covers.
@@ -177,6 +203,12 @@ type checkpointSegment struct {
 	Sequence       int64
 	SizeBytes      int64
 	LastCommitHash codec.Hash
+	// Stamp is the segment's size and modification time when the checkpoint was written
+	// (storage.SegmentStamp), when the store could vouch for it. A segment whose stamp is still
+	// the same at open is the segment that was fingerprinted, so open need not scan it again -
+	// which, before stamps, meant reading the whole delta log on every open.
+	Stamp    storage.SegmentStamp
+	HasStamp bool
 }
 
 func checkpointKey(namespaceID string) string {
@@ -275,11 +307,16 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 
 	segs := make([]codec.Value, 0, len(cp.Segments))
 	for _, sg := range cp.Segments {
-		segs = append(segs, codec.RecordValue{Fields: map[int]codec.Value{
+		fields := map[int]codec.Value{
 			1: codec.Int64Value{V: sg.Sequence},
 			2: codec.Int64Value{V: sg.SizeBytes},
 			3: cpHashVal(sg.LastCommitHash),
-		}})
+		}
+		if sg.HasStamp {
+			fields[4] = codec.Int64Value{V: sg.Stamp.Size}
+			fields[5] = codec.Int64Value{V: sg.Stamp.ModTimeNanos}
+		}
+		segs = append(segs, codec.RecordValue{Fields: fields})
 	}
 
 	heads := make([]codec.Value, 0, len(cp.HeadCommits))
@@ -287,8 +324,12 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		heads = append(heads, codec.BytesValue{V: b})
 	}
 
+	version := int32(checkpointFormatVersion)
+	if len(cp.GraphRefs) > 0 {
+		version = checkpointGraphFormatVersion
+	}
 	root := codec.RecordValue{Fields: map[int]codec.Value{
-		1:  codec.Int32Value{V: checkpointFormatVersion},
+		1:  codec.Int32Value{V: version},
 		2:  codec.StringValue{V: cp.NamespaceID},
 		3:  codec.Int64Value{V: cp.ThroughSequence},
 		4:  codec.ArrayValue{Elements: commits},
@@ -299,6 +340,22 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		9:  codec.ArrayValue{Elements: heads},
 		10: codec.Int64Value{V: cp.FloorSequence},
 	}}
+	if len(cp.GraphRefs) > 0 {
+		refs := make([]codec.Value, 0, len(cp.GraphRefs))
+		for _, r := range cp.GraphRefs {
+			refs = append(refs, codec.RecordValue{Fields: map[int]codec.Value{
+				1: codec.Int64Value{V: int64(r.Seq)},
+				2: codec.Int64Value{V: int64(r.CRC)},
+				3: codec.Int64Value{V: int64(r.Records)},
+			}})
+		}
+		hidden := make([]codec.Value, 0, len(cp.GraphHidden))
+		for _, h := range cp.GraphHidden {
+			hidden = append(hidden, cpHashVal(h))
+		}
+		root.Fields[11] = codec.ArrayValue{Elements: refs}
+		root.Fields[12] = codec.ArrayValue{Elements: hidden}
+	}
 	return codec.EncodeBytes(root, checkpointType, checkpointRegistry())
 }
 
@@ -316,7 +373,7 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 	if !ok {
 		return out, fmt.Errorf("kdb: checkpoint: missing format version")
 	}
-	if version.V != checkpointFormatVersion {
+	if version.V != checkpointFormatVersion && version.V != checkpointGraphFormatVersion {
 		return out, fmt.Errorf(
 			"kdb: checkpoint is format version %d, this build reads version %d",
 			version.V, checkpointFormatVersion)
@@ -486,9 +543,14 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 		if err != nil {
 			return out, err
 		}
-		out.Segments = append(out.Segments, checkpointSegment{
-			Sequence: seq.V, SizeBytes: size.V, LastCommitHash: last,
-		})
+		fp := checkpointSegment{Sequence: seq.V, SizeBytes: size.V, LastCommitHash: last}
+		if st, ok := sr.Fields[4].(codec.Int64Value); ok && st.V >= 0 {
+			if mt, ok := sr.Fields[5].(codec.Int64Value); ok {
+				fp.Stamp = storage.SegmentStamp{Size: st.V, ModTimeNanos: mt.V}
+				fp.HasStamp = true
+			}
+		}
+		out.Segments = append(out.Segments, fp)
 	}
 	headsArr, _ := rec.Fields[9].(codec.ArrayValue)
 	for _, el := range headsArr.Elements {
@@ -501,30 +563,121 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 	if floor, ok := rec.Fields[10].(codec.Int64Value); ok {
 		out.FloorSequence = floor.V
 	}
+	if version.V == checkpointGraphFormatVersion {
+		refsArr, _ := rec.Fields[11].(codec.ArrayValue)
+		for _, el := range refsArr.Elements {
+			rr, ok := el.(codec.RecordValue)
+			if !ok {
+				return out, fmt.Errorf("kdb: checkpoint: malformed graph segment entry")
+			}
+			seq, ok1 := rr.Fields[1].(codec.Int64Value)
+			crc, ok2 := rr.Fields[2].(codec.Int64Value)
+			n, ok3 := rr.Fields[3].(codec.Int64Value)
+			if !ok1 || !ok2 || !ok3 {
+				return out, fmt.Errorf("kdb: checkpoint: malformed graph segment entry")
+			}
+			out.GraphRefs = append(out.GraphRefs, dag.GraphSegmentRef{Seq: uint64(seq.V), CRC: uint32(crc.V), Records: int(n.V)})
+		}
+		if len(out.GraphRefs) == 0 {
+			return out, fmt.Errorf("kdb: checkpoint: version %d with no graph segments", version.V)
+		}
+		hiddenArr, _ := rec.Fields[12].(codec.ArrayValue)
+		for _, el := range hiddenArr.Elements {
+			h, err := cpHashFrom(el)
+			if err != nil {
+				return out, err
+			}
+			out.GraphHidden = append(out.GraphHidden, h)
+		}
+	}
 	return out, nil
 }
 
 // segmentFingerprints reads the current shape of every delta segment up to
 // and including through. Uses the reader's own listing, which open already
 // performs, so this adds no I/O of its own.
+// rememberedFingerprints fingerprints the segments through `through` reading only those whose
+// fingerprint the reader cannot vouch for from a stamp (storage.DeltaFingerprintMemo). ok is false
+// when the reader cannot do this, or any segment could not be scanned on its own - the caller then
+// takes the full listing, which owns every rule about missing and unreadable segments.
+func rememberedFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpointSegment, bool) {
+	memo, ok1 := r.(storage.DeltaFingerprintMemo)
+	lister, ok2 := r.(storage.DeltaSegmentSequenceLister)
+	stamper, ok3 := r.(storage.DeltaSegmentStamper)
+	if !ok1 || !ok2 || !ok3 {
+		return nil, false
+	}
+	seqs, err := lister.SegmentSequences()
+	if err != nil {
+		return nil, false
+	}
+	var out []checkpointSegment
+	for _, seq := range seqs {
+		if seq > through {
+			continue
+		}
+		if stamp, size, last, ok := memo.RememberedFingerprint(seq); ok {
+			out = append(out, checkpointSegment{Sequence: seq, SizeBytes: size, LastCommitHash: last, Stamp: stamp, HasStamp: true})
+			continue
+		}
+		ref, err := memo.SegmentRef(seq)
+		if err != nil {
+			return nil, false
+		}
+		fp := checkpointSegment{Sequence: seq, SizeBytes: ref.SizeBytes, LastCommitHash: ref.LastCommitHash}
+		if st, ok, err := stamper.StampSegment(seq); err == nil && ok && st.Size >= ref.SizeBytes {
+			fp.Stamp, fp.HasStamp = st, true
+		}
+		out = append(out, fp)
+	}
+	return out, true
+}
+
+// rememberCheckpointFingerprints tells the reader what the stamped segments of cp looked like, so
+// later checkpoints in this process need not scan them while their stamps hold.
+func rememberCheckpointFingerprints(r storage.DeltaSegmentReader, segs []checkpointSegment) {
+	memo, ok := r.(storage.DeltaFingerprintMemo)
+	if !ok {
+		return
+	}
+	for _, sg := range segs {
+		if sg.HasStamp {
+			memo.RememberFingerprint(sg.Sequence, sg.Stamp, sg.SizeBytes, sg.LastCommitHash)
+		}
+	}
+}
+
 func segmentFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpointSegment, error) {
 	if r == nil {
 		return nil, nil
+	}
+	if fps, ok := rememberedFingerprints(r, through); ok {
+		return fps, nil
 	}
 	segments, err := r.ListSegments()
 	if err != nil {
 		return nil, err
 	}
+	stamper, canStamp := r.(storage.DeltaSegmentStamper)
 	var out []checkpointSegment
 	for _, seg := range segments {
 		if seg.SequenceNumber > through {
 			continue
 		}
-		out = append(out, checkpointSegment{
+		fp := checkpointSegment{
 			Sequence:       seg.SequenceNumber,
 			SizeBytes:      seg.SizeBytes,
 			LastCommitHash: seg.LastCommitHash,
-		})
+		}
+		if canStamp {
+			// Stamped after listing: a segment that changed in between gets a stamp that will
+			// not match the fingerprint's contents at open, which costs a scan, never a miss -
+			// the mismatch is on the side of scanning.
+			if st, ok, err := stamper.StampSegment(seg.SequenceNumber); err == nil && ok && st.Size >= seg.SizeBytes {
+				fp.Stamp, fp.HasStamp = st, true
+			}
+		}
+		out = append(out, fp)
 	}
 	return out, nil
 }
@@ -540,7 +693,51 @@ func segmentFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpo
 // direction is the worst failure available here - too strict and a
 // truncated namespace replays its whole (now incomplete) log on every
 // open, too loose and real damage opens cleanly with data silently gone.
+// unchangedSinceCheckpoint reports, without reading any segment, that every segment the checkpoint
+// fingerprinted is still there with the stamp it had then, and that no segment it covers has
+// appeared since - in which case the log says exactly what it said and the fingerprints match.
+// Any doubt (a missing stamp, a store that cannot stamp, any difference at all) is false, and the
+// caller does the full comparison, damage handling included.
+func unchangedSinceCheckpoint(cp namespaceCheckpoint, r storage.DeltaSegmentReader) bool {
+	stamper, ok1 := r.(storage.DeltaSegmentStamper)
+	lister, ok2 := r.(storage.DeltaSegmentSequenceLister)
+	if !ok1 || !ok2 {
+		return false
+	}
+	seqs, err := lister.SegmentSequences()
+	if err != nil {
+		return false
+	}
+	wanted := make(map[int64]bool, len(cp.Segments))
+	for _, want := range cp.Segments {
+		if want.Sequence < cp.FloorSequence {
+			wanted[want.Sequence] = true
+			continue // deliberately truncated; checkpointMatchesLog skips these too
+		}
+		if !want.HasStamp {
+			return false
+		}
+		st, ok, err := stamper.StampSegment(want.Sequence)
+		if err != nil || !ok || st != want.Stamp {
+			return false
+		}
+		wanted[want.Sequence] = true
+	}
+	for _, seq := range seqs {
+		if seq <= cp.ThroughSequence && seq >= cp.FloorSequence && !wanted[seq] {
+			return false // a segment the checkpoint covers but never fingerprinted
+		}
+	}
+	return true
+}
+
 func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) (bool, string) {
+	if unchangedSinceCheckpoint(cp, r) {
+		// Trusted on stamps, so nothing was scanned; hand the fingerprints to the reader, or the
+		// next checkpoint would scan every segment to rediscover them.
+		rememberCheckpointFingerprints(r, cp.Segments)
+		return true, ""
+	}
 	current, err := segmentFingerprints(r, cp.ThroughSequence)
 	if err != nil {
 		return false, "the delta segments could not be listed"
@@ -674,6 +871,16 @@ func lowestSegmentSequence(r storage.DeltaSegmentReader) int64 {
 	if r == nil {
 		return -1
 	}
+	if sq, ok := r.(storage.DeltaSegmentSequenceLister); ok {
+		// Names only. Listing scanned every segment to answer a question the file names
+		// already answer, and this runs several times per checkpoint.
+		if seqs, err := sq.SegmentSequences(); err == nil {
+			if len(seqs) == 0 {
+				return -1
+			}
+			return seqs[0]
+		}
+	}
 	segments, err := r.ListSegments()
 	if err != nil || len(segments) == 0 {
 		return -1
@@ -693,6 +900,14 @@ func lowestSegmentSequence(r storage.DeltaSegmentReader) int64 {
 func highestSegmentSequence(r storage.DeltaSegmentReader) int64 {
 	if r == nil {
 		return -1
+	}
+	if sq, ok := r.(storage.DeltaSegmentSequenceLister); ok {
+		if seqs, err := sq.SegmentSequences(); err == nil {
+			if len(seqs) == 0 {
+				return -1
+			}
+			return seqs[len(seqs)-1]
+		}
 	}
 	segments, err := r.ListSegments()
 	if err != nil {

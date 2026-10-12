@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
@@ -632,13 +633,31 @@ func envOnlySpecs() []envOnlySpec {
 		{
 			key: "graph.file", env: "KDB_GRAPH_FILE",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
-			help:  "map the commit graph from a file instead of holding it in the heap. Accepted and reported but not yet implemented - GraphFileActive reports whether it is doing anything",
+			help:  "map the commit graph from segment files (ns/<namespace>/graph/) instead of holding it in the heap. The files are a rebuildable cache; Linux and macOS only, ignored elsewhere",
 			parse: onOff,
 		},
 		{
 			key: "graph.rebuildCommits", env: "KDB_GRAPH_REBUILD_COMMITS",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "commits",
-			help:  "how many commits may accumulate in the resident tail before the graph file is rebuilt. Ignored when graph.file is off",
+			help:  "how many commits may accumulate in memory before they are flushed to a new graph segment. Ignored when graph.file is off",
+			parse: count,
+		},
+		{
+			key: "graph.memory", env: "KDB_GRAPH_MEMORY",
+			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
+			help: "how commits are held in memory: kdb (default) as fixed-width records the garbage collector does not scan - the graph files' own format; go as a Go map of commit structs, as before. graph.file requires kdb and overrides go",
+			parse: func(raw string) (any, error) {
+				m, err := dag.ParseGraphMemory(raw)
+				if err != nil {
+					return nil, err
+				}
+				return string(m), nil
+			},
+		},
+		{
+			key: "graph.maxSegments", env: "KDB_GRAPH_MAX_SEGMENTS",
+			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "segments",
+			help:  "how many graph segment files may accumulate before the next write rewrites them all as one (a full compaction). Ignored when graph.file is off",
 			parse: count,
 		},
 		{

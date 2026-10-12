@@ -70,6 +70,36 @@ type DeltaSegmentSequencer interface {
 }
 
 // DeltaSegmentReader reads sealed delta segments.
+// DeltaSegmentSequenceLister is implemented by readers that can list segment sequence numbers
+// from names alone, without scanning any segment - for callers that need only the lowest or
+// highest.
+type DeltaSegmentSequenceLister interface {
+	SegmentSequences() ([]int64, error)
+}
+
+// DeltaSegmentRangeLister is implemented by readers that can list only the segments after a
+// sequence number, scanning nothing below it - for a replay that resumes from a checkpoint.
+type DeltaSegmentRangeLister interface {
+	ListSegmentsAfter(afterSequence int64) ([]DeltaSegmentRef, error)
+}
+
+// DeltaSegmentStamper is implemented by readers that can stamp a segment by sequence number
+// without reading it (see SegmentStamp). ok is false when the segment cannot be vouched for.
+type DeltaSegmentStamper interface {
+	StampSegment(sequence int64) (stamp SegmentStamp, ok bool, err error)
+}
+
+// DeltaFingerprintMemo is implemented by readers that remember a segment's fingerprint - its
+// readable size and last commit - under the stamp it had, so a checkpoint can fingerprint an
+// unchanged segment without reading it. A fingerprint is returned only while the segment's stamp
+// is still the one it was remembered under.
+type DeltaFingerprintMemo interface {
+	RememberFingerprint(sequence int64, stamp SegmentStamp, sizeBytes int64, lastCommit codec.Hash)
+	RememberedFingerprint(sequence int64) (stamp SegmentStamp, sizeBytes int64, lastCommit codec.Hash, ok bool)
+	// SegmentRef scans one segment (through the reader's scan cache), as ListSegments would.
+	SegmentRef(sequence int64) (*DeltaSegmentRef, error)
+}
+
 type DeltaSegmentReader interface {
 	NamespaceID() string
 	ReadAll(segment DeltaSegmentRef) ([]DeltaRecord, error)

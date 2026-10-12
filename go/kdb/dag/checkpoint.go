@@ -97,6 +97,13 @@ func (d *InMemoryCommitDag) CheckpointSnapshotLogged(keep func(document.Commit) 
 func (d *InMemoryCommitDag) checkpointSnapshot(keep func(document.Commit) bool) (CheckpointState, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	return d.checkpointSnapshotLocked(keep, false)
+}
+
+// checkpointSnapshotLocked is checkpointSnapshot's body. residentOnly limits it to the resident
+// tier, for a checkpoint that references the graph segments for the rest (see
+// CheckpointSnapshotWithGraph). Must hold mu.
+func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) bool, residentOnly bool) (CheckpointState, bool) {
 	excluded := d.unloggedClosureLocked()
 	unlogged := func(h codec.Hash) bool {
 		_, ok := excluded[h]
@@ -113,13 +120,23 @@ func (d *InMemoryCommitDag) checkpointSnapshot(keep func(document.Commit) bool) 
 	for _, t := range d.tags {
 		pinned[t.CommitHash] = struct{}{}
 	}
+	n := d.nodes.len()
+	if residentOnly {
+		n = d.nodes.residentLen()
+	}
 	state := CheckpointState{
-		Commits:  make([]CheckpointCommit, 0, len(d.nodes)),
+		Commits:  make([]CheckpointCommit, 0, n),
 		Branches: make([]document.Branch, 0, len(d.branches)),
 		Tags:     make([]document.Tag, 0, len(d.tags)),
 	}
-	for _, n := range d.nodes {
-		c := n.commit
+	hashes := make([]codec.Hash, 0, n)
+	if residentOnly {
+		d.nodes.forEachResident(func(h codec.Hash) { hashes = append(hashes, h) })
+	} else {
+		d.nodes.forEach(func(h codec.Hash) { hashes = append(hashes, h) })
+	}
+	for _, h := range hashes {
+		c, _ := d.nodes.commit(h)
 		if unlogged(c.Hash) {
 			continue
 		}
@@ -169,7 +186,7 @@ func (d *InMemoryCommitDag) unloggedClosureLocked() map[codec.Hash]struct{} {
 		clean
 		tainted
 	)
-	state := make(map[codec.Hash]uint8, len(d.nodes))
+	state := make(map[codec.Hash]uint8, len(d.unlogged))
 	out := make(map[codec.Hash]struct{}, len(d.unlogged))
 	for h := range d.unlogged {
 		state[h] = tainted
@@ -177,7 +194,11 @@ func (d *InMemoryCommitDag) unloggedClosureLocked() map[codec.Hash]struct{} {
 	}
 	// Iterative post-order: the history behind a commit is as deep as the namespace's log.
 	var stack []codec.Hash
-	for start := range d.nodes {
+	// Every commit, graph segments included: a commit that descends from an unlogged one is
+	// newer than it, but may still have been flushed before this ran.
+	var starts []codec.Hash
+	d.nodes.forEach(func(h codec.Hash) { starts = append(starts, h) })
+	for _, start := range starts {
 		if state[start] != unknown {
 			continue
 		}
@@ -187,7 +208,7 @@ func (d *InMemoryCommitDag) unloggedClosureLocked() map[codec.Hash]struct{} {
 			if state[h] == unknown {
 				state[h] = visiting
 				for _, p := range d.expandParentsLocked(h) {
-					if _, resident := d.nodes[p]; resident && state[p] == unknown {
+					if d.nodes.has(p) && state[p] == unknown {
 						stack = append(stack, p)
 					}
 				}

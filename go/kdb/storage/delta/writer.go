@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -233,6 +234,27 @@ type DefaultReader struct {
 	namespaceID string
 	shim        storage.PlatformIOShim
 	config      storage.StorageEngineConfig
+
+	// scans caches each segment's ref under the stamp it had when scanned, for shims that can
+	// stamp (storage.SegmentStamper). A sealed segment does not change, so scanning it again on
+	// every ListSegments - several times per checkpoint, the whole log each time - bought
+	// nothing; the segment still open for appends is never stamped and so always rescanned.
+	scansMu sync.Mutex
+	scans   map[string]cachedScan
+	// fps are fingerprints learned without a scan - from a checkpoint whose stamps still match -
+	// keyed by sequence. Guarded by scansMu. See RememberFingerprint.
+	fps map[int64]rememberedFP
+}
+
+type rememberedFP struct {
+	stamp storage.SegmentStamp
+	size  int64
+	last  codec.Hash
+}
+
+type cachedScan struct {
+	stamp storage.SegmentStamp
+	ref   storage.DeltaSegmentRef
 }
 
 // NewDefaultReader returns a delta segment reader.
@@ -307,6 +329,73 @@ func (r *DefaultReader) ReadRange(segment storage.DeltaSegmentRef, sinceCommit, 
 // where damage is refused, because a checkpoint may already hold everything a damaged segment
 // recorded (embed's damagedInPlace); replay refuses a damaged segment it actually has to read.
 func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
+	return r.listSegments(-1)
+}
+
+// ListSegmentsAfter is ListSegments limited to sequence numbers above afterSequence. Segments at
+// or below it are not scanned at all.
+func (r *DefaultReader) ListSegmentsAfter(afterSequence int64) ([]storage.DeltaSegmentRef, error) {
+	return r.listSegments(afterSequence)
+}
+
+var _ storage.DeltaSegmentRangeLister = (*DefaultReader)(nil)
+
+// StampSegment stamps a segment by sequence number, for a caller that recorded a stamp and wants
+// to know whether the segment is still what it was then.
+func (r *DefaultReader) StampSegment(sequence int64) (storage.SegmentStamp, bool, error) {
+	stamper, can := r.shim.(storage.SegmentStamper)
+	if !can {
+		return storage.SegmentStamp{}, false, nil
+	}
+	return stamper.SegmentStamp(storio.SegmentNameBuilder.DeltaSequenced(r.namespaceID, sequence))
+}
+
+var _ storage.DeltaSegmentStamper = (*DefaultReader)(nil)
+
+// RememberFingerprint records what a segment's fingerprint was under stamp - from a checkpoint
+// open trusted on its stamps, or one just written - so the next checkpoint need not scan the
+// segment again while its stamp is unchanged.
+func (r *DefaultReader) RememberFingerprint(sequence int64, stamp storage.SegmentStamp, sizeBytes int64, lastCommit codec.Hash) {
+	r.scansMu.Lock()
+	defer r.scansMu.Unlock()
+	if r.fps == nil {
+		r.fps = make(map[int64]rememberedFP)
+	}
+	r.fps[sequence] = rememberedFP{stamp: stamp, size: sizeBytes, last: lastCommit}
+}
+
+// RememberedFingerprint returns a segment's fingerprint without reading it, when one was
+// remembered or scanned under the stamp the segment still has.
+func (r *DefaultReader) RememberedFingerprint(sequence int64) (storage.SegmentStamp, int64, codec.Hash, bool) {
+	now, ok, err := r.StampSegment(sequence)
+	if err != nil || !ok {
+		return storage.SegmentStamp{}, 0, codec.Hash{}, false
+	}
+	name := storio.SegmentNameBuilder.DeltaSequenced(r.namespaceID, sequence)
+	r.scansMu.Lock()
+	defer r.scansMu.Unlock()
+	if fp, ok := r.fps[sequence]; ok && fp.stamp == now {
+		return now, fp.size, fp.last, true
+	}
+	if c, ok := r.scans[name]; ok && c.stamp == now {
+		return now, c.ref.SizeBytes, c.ref.LastCommitHash, true
+	}
+	return storage.SegmentStamp{}, 0, codec.Hash{}, false
+}
+
+// SegmentRef scans one segment by sequence number, through the scan cache.
+func (r *DefaultReader) SegmentRef(sequence int64) (*storage.DeltaSegmentRef, error) {
+	name := storio.SegmentNameBuilder.DeltaSequenced(r.namespaceID, sequence)
+	ref, err := r.cachedScanSegmentRef(name, sequence)
+	if err == nil && ref == nil {
+		err = errors.New("scan produced no segment reference")
+	}
+	return ref, err
+}
+
+var _ storage.DeltaFingerprintMemo = (*DefaultReader)(nil)
+
+func (r *DefaultReader) listSegments(afterSequence int64) ([]storage.DeltaSegmentRef, error) {
 	prefix := storio.SegmentNameBuilder.NamespacePrefix(r.namespaceID) + "delta/"
 	names, err := r.shim.ListSegments(r.namespaceID)
 	if err != nil {
@@ -328,7 +417,10 @@ func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
 			// way rather than silently skipping possibly-unread commits.
 			return nil, &LegacySegmentFormatError{NamespaceID: r.namespaceID, Names: []string{name}}
 		}
-		ref, err := r.scanSegmentRef(name, seq)
+		if seq <= afterSequence {
+			continue
+		}
+		ref, err := r.cachedScanSegmentRef(name, seq)
 		if err == nil && ref == nil {
 			err = errors.New("scan produced no segment reference")
 		}
@@ -345,6 +437,74 @@ func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
 		out = append(out, *ref)
 	}
 	return out, nil
+}
+
+// SegmentSequences lists the namespace's delta segment sequence numbers, ascending, from their
+// names alone - no segment is read. For callers that need the lowest or highest and nothing else.
+func (r *DefaultReader) SegmentSequences() ([]int64, error) {
+	prefix := storio.SegmentNameBuilder.NamespacePrefix(r.namespaceID) + "delta/"
+	names, err := r.shim.ListSegments(r.namespaceID)
+	if err != nil {
+		return nil, err
+	}
+	var out []int64
+	for _, name := range names {
+		if len(name) < len(prefix) || name[:len(prefix)] != prefix {
+			continue
+		}
+		seq, ok := storio.ParseDeltaSequencedFileName(name[len(prefix):])
+		if !ok {
+			return nil, &LegacySegmentFormatError{NamespaceID: r.namespaceID, Names: []string{name}}
+		}
+		out = append(out, seq)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+var _ storage.DeltaSegmentSequenceLister = (*DefaultReader)(nil)
+
+// cachedScanSegmentRef is scanSegmentRef, answered from the cache when the segment's stamp is
+// unchanged since it was last scanned.
+func (r *DefaultReader) cachedScanSegmentRef(name string, seq int64) (*storage.DeltaSegmentRef, error) {
+	stamper, can := r.shim.(storage.SegmentStamper)
+	if !can {
+		return r.scanSegmentRef(name, seq)
+	}
+	stamp, ok, err := stamper.SegmentStamp(name)
+	if err != nil || !ok {
+		r.forgetScan(name)
+		return r.scanSegmentRef(name, seq)
+	}
+	r.scansMu.Lock()
+	c, hit := r.scans[name]
+	r.scansMu.Unlock()
+	if hit && c.stamp == stamp {
+		ref := c.ref
+		return &ref, nil
+	}
+	ref, err := r.scanSegmentRef(name, seq)
+	if err != nil || ref == nil {
+		r.forgetScan(name)
+		return ref, err
+	}
+	// Stamp again after the scan: a write that landed during it must not be cached as the
+	// state the scan saw.
+	if after, ok2, err2 := stamper.SegmentStamp(name); err2 == nil && ok2 && after == stamp {
+		r.scansMu.Lock()
+		if r.scans == nil {
+			r.scans = make(map[string]cachedScan)
+		}
+		r.scans[name] = cachedScan{stamp: stamp, ref: *ref}
+		r.scansMu.Unlock()
+	}
+	return ref, nil
+}
+
+func (r *DefaultReader) forgetScan(name string) {
+	r.scansMu.Lock()
+	delete(r.scans, name)
+	r.scansMu.Unlock()
 }
 
 // segmentGone reports whether name has disappeared from the namespace's listing.

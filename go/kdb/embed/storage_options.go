@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -244,8 +245,26 @@ func graphSettingsFromEnv() dag.GraphSettings {
 		AncestryPruning: envBool("KDB_ANCESTRY_PRUNING"),
 		FileEnabled:     envBool("KDB_GRAPH_FILE"),
 		RebuildCommits:  envInt("KDB_GRAPH_REBUILD_COMMITS"),
+		MaxSegments:     envInt("KDB_GRAPH_MAX_SEGMENTS"),
 		AnchorInterval:  envInt("KDB_HISTORY_ANCHOR_INTERVAL"),
+		Memory:          envGraphMemory(),
 	}
+}
+
+// envGraphMemory reads KDB_GRAPH_MEMORY. Unset or unparseable is the default, with a log line for
+// the unparseable case - it cannot be reported as an error from here, and "what it did before" is
+// the only safe reading, as with the other graph variables.
+func envGraphMemory() dag.GraphMemory {
+	raw := os.Getenv("KDB_GRAPH_MEMORY")
+	if strings.TrimSpace(raw) == "" {
+		return "" // unset: the default, resolved by normalization like every other graph setting
+	}
+	m, err := dag.ParseGraphMemory(raw)
+	if err != nil {
+		log.Printf("kdb: ignoring KDB_GRAPH_MEMORY: %v", err)
+		return ""
+	}
+	return m
 }
 
 // envBool reads an on/off switch, defaulting to off. "on", "true", "yes"

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 )
 
 // Zone is the graduated pressure level kdb-spec-layer13 Component 48 §5.5 defines. Policy is
@@ -288,10 +290,25 @@ func (g *MemoryGuard) zoneFor(used float64, from Zone) Zone {
 // Falls back to /memory/classes/total:bytes minus /memory/classes/heap/released:bytes (see the
 // type doc's point 1 for why this, not MemStats.Sys or HeapAlloc) when no cgroup memory
 // controller is available - non-Linux hosts, or a Linux host not running inside one.
+//
+// Mapped files (the commit graph, storage/mmapfile) are page cache, not Go heap, and the two paths
+// treat them differently on purpose:
+//
+//   - cgroup path: mapped pages are charged as page cache, so nothing is added here. Pages that
+//     age onto the inactive LRU are reclaimable and are meant to stop counting; ones the graph
+//     keeps reading stay on the active list and stay counted.
+//   - no-cgroup path (macOS, bare Linux): runtime/metrics knows nothing about the page cache, so
+//     every mapped byte is added - a conservative over-count, hot or cold, rather than budgeting
+//     as if a mapped multi-gigabyte graph cost nothing.
 func currentMemoryUsageBytes() float64 {
 	if v, ok := cgroupMemoryCurrentBytes(); ok {
 		return float64(v)
 	}
+	return goRuntimeFootprintBytes() + float64(mmapfile.MappedBytes())
+}
+
+// goRuntimeFootprintBytes is what the Go runtime has mapped and not released.
+func goRuntimeFootprintBytes() float64 {
 	samples := []metrics.Sample{
 		{Name: "/memory/classes/total:bytes"},
 		{Name: "/memory/classes/heap/released:bytes"},

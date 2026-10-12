@@ -70,7 +70,14 @@ func replayDeltaNamespaceFrom(
 		return nil
 	}
 	unapplied := &unappliedCommits{}
-	all, err := r.ListSegments()
+	var all []storage.DeltaSegmentRef
+	var err error
+	if rl, ok := r.(storage.DeltaSegmentRangeLister); ok && afterSequence >= 0 {
+		// Resuming after a checkpoint: the segments it covers are not read at all.
+		all, err = rl.ListSegmentsAfter(afterSequence)
+	} else {
+		all, err = r.ListSegments()
+	}
 	if err != nil {
 		return err
 	}

@@ -313,7 +313,20 @@ deferred deliberately.
 **Files:** `go/kdb/dag/generations.go`, `go/kdb/dag/ancestry.go`,
 `go/kdb/dag/in_memory_commit_dag.go`, `go/kdb/dag/generations_test.go`
 
-### Phase 2 — the graph file: writer, reader, and the two-tier DAG
+### Phase 2 — the graph file: writer, reader, and the two-tier DAG — **landed 2026-10-12** (`perf/mmap-offheap`)
+
+> **As built, and where it departs from the text below** (see `docs/kdb-mmap-plan.md` for numbers):
+> records are sorted by **hash**, not log position, and parents are stored as **hashes**, not positions -
+> one binary search per step instead of an array index, in exchange for a writer that is a plain merge
+> of two sorted streams and needs no position remapping on rebuild. Messages **are** carried (a
+> `msgs` blob), so a commit read from the file needs no log access; operations are not, and keep coming
+> from the existing loader. The base is `go/kdb/dag/node_store.go`'s second tier, over
+> `go/kdb/storage/mmapfile`; the format is `go/kdb/dag/graph_file.go`; the hooks are
+> `go/kdb/dag/graph_attach.go` and `go/kdb/embed/file.go`. The file is never an authority: a record the
+> DAG does not hold after restore is hidden, so a stale file cannot resurrect a squashed or stubbed commit.
+> Known limit: open still restores every commit from the checkpoint before the attach moves them out, so
+> **peak** heap at open is unchanged; steady state is what drops.
+
 
 Format, chunk writer, mapped reader, fanout lookup. `GetCommit`,
 `HasCommit`, parents, timestamps and generations answered from the mapping;
@@ -330,7 +343,12 @@ read and retires `commitOpsLoader.index()`'s full-log scan.
 `go/kdb/dag/in_memory_commit_dag.go` (two-tier lookup),
 `go/kdb/storage/platform_io.go` (the optional interface)
 
-### Phase 3 — move the two side indexes into the file
+### Phase 3 — move the two side indexes into the file — **`txIndex` landed; `treeIndex` deliberately not**
+
+> `txIndex` entries move into the file's `tidx` section (tx -> commit hash) and are dropped from the heap
+> map on attach; lookups fall back to the file, and first-writer-wins is preserved across both. `treeIndex`
+> stays a lazily built heap map: only the replay strategy's rebuild path ever asks it anything.
+
 
 `treeIndex` (81 B/commit) and `txIndex` (79 B/commit) become the sorted
 `TIDX` chunks. This is what resolves the note left in
@@ -342,7 +360,7 @@ heap without stopping being answerable.
 **Files:** `go/kdb/dag/in_memory_commit_dag.go` (`CommitForTree`,
 `GetCommitByTransactionID`), `go/kdb/embed/graph_file.go`
 
-### Phase 4 — the bidirectional cursor
+### Phase 4 — the bidirectional cursor — **deferred** (a latency optimization for history walks, not a memory one)
 
 Forward and backward stepping over positions, `pos+1` fast path for linear
 chains, timestamp seek with its ordering caveat documented. Replace `Walk`'s
@@ -353,7 +371,7 @@ scan is not.
 **Files:** new `go/kdb/dag/cursor.go`; `go/kdb/dag/in_memory_commit_dag.go`
 (`Walk`), `go/kdb/dag/dag.go`
 
-### Phase 5 — anchors
+### Phase 5 — anchors — **deferred** (replay-strategy feature; unrelated to residency)
 
 Write a tree object every N commits; teach `rebuildTreeByFolding` to ground
 on the nearest anchor as well as the nearest cached ancestor, and delete

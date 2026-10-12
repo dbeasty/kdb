@@ -37,8 +37,8 @@ type headSnapshot struct {
 	commit    document.Commit
 }
 
-// commitNode is one resident commit plus the graph metadata the DAG
-// derives for it.
+// Each resident commit carries, beside the commit itself, a generation number (see nodeStore for
+// how it is held).
 //
 // generation is the length of the longest path from this commit back to a
 // root, one more than the highest of its parents' - git's commit-graph
@@ -50,11 +50,6 @@ type headSnapshot struct {
 // the setting rather than checking for a zero generation - a real root
 // commit's generation is 1, so zero is unambiguous, but only if nothing
 // treats it as a number.
-type commitNode struct {
-	commit     document.Commit
-	generation uint32
-}
-
 // InMemoryCommitDag is an in-memory commit DAG for one namespace.
 type InMemoryCommitDag struct {
 	NamespaceID string
@@ -86,7 +81,7 @@ type InMemoryCommitDag struct {
 	// metadata: a second map keyed by codec.Hash costs roughly 50 bytes
 	// per commit in buckets and key copies, against 8 for widening the
 	// value that is already here, and the two could drift.
-	nodes map[codec.Hash]commitNode
+	nodes nodeStore
 	// treeIndex answers "which commit produced this tree". Nil until the
 	// first CommitForTree call builds it, and maintained from then on - see
 	// CommitForTree for why it is not maintained from the start.
@@ -153,11 +148,17 @@ type InMemoryCommitDag struct {
 	// generation(parent) < generation(child) and must be rebuilt before
 	// anything prunes with them. See storeCommitLocked.
 	genStale bool
-	// graphFile is the mapped graph, once there is one. Always nil today -
-	// the format is not implemented - and read through GraphFileActive,
-	// which is what tells a status report or a fallback test the
-	// difference between "asked for" and "in use".
-	graphFile *graphFile
+	// graphDir is where the commit graph's segments live (see graph_attach.go); the mappings
+	// themselves are nodes' segment tier. graphRebuild serializes segment writes, which run
+	// without holding mu.
+	graphDir      string
+	graphReadOnly bool
+	graphNextSeq  uint64
+	// graphPinned is the segments the checkpoint on disk references, and graphDeferred the
+	// superseded ones waiting for a checkpoint that no longer does. See graph_checkpoint.go.
+	graphPinned   map[uint64]bool
+	graphDeferred []deferredSegment
+	graphRebuild  sync.Mutex
 
 	// provisional holds commits appended as one part of a cross-namespace group that has not
 	// been durably decided yet; provisionalGen counts every such append. See provisional.go.
@@ -168,12 +169,6 @@ type InMemoryCommitDag struct {
 	// unlogged.go. Lazily created.
 	unlogged map[codec.Hash]struct{}
 }
-
-// graphFile is a placeholder for the mapped on-disk commit graph
-// (docs/kdb-commit-graph-on-disk.md, Phase 2). It exists now so that
-// GraphFileActive has something honest to report and so the settings that
-// gate it can be plumbed and tested before the format lands.
-type graphFile struct{}
 
 // publishHeadLocked recomputes the head snapshot from the maps and publishes it. Must be
 // called with mu held exclusively, on every path that changes d.branches or d.commits.
@@ -244,7 +239,7 @@ func (d *InMemoryCommitDag) AncestryEpoch() uint64 {
 func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	d := &InMemoryCommitDag{
 		NamespaceID: namespaceID,
-		nodes:       make(map[codec.Hash]commitNode),
+		nodes:       newNodeStore(),
 		stubs:       make(map[codec.Hash]document.CommitStub),
 		shallow:     make(map[codec.Hash]struct{}),
 		trees:       make(map[codec.Hash]document.DocumentTree),
@@ -293,11 +288,11 @@ func (d *InMemoryCommitDag) LookupHashPrefix(hexPrefixLower string) []codec.Hash
 	defer d.mu.RUnlock()
 	p := strings.ToLower(hexPrefixLower)
 	var out []codec.Hash
-	for h := range d.nodes {
+	d.nodes.forEach(func(h codec.Hash) {
 		if strings.HasPrefix(h.Hex(), p) {
 			out = append(out, h)
 		}
-	}
+	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Hex() < out[j].Hex() })
 	return out
 }
@@ -416,7 +411,7 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	// that happens to reuse the id (which should never legitimately happen, since ids are random
 	// UUIDs minted fresh per transaction attempt, but "first wins" is the safer tie-break if it
 	// ever did).
-	if _, exists := d.txIndex[commit.TransactionID]; !exists {
+	if _, exists := d.txIndexLookupLocked(commit.TransactionID); !exists {
 		d.txIndex[commit.TransactionID] = commit.Hash
 	}
 	// A commit arriving here can be the one the head already names (delta replay onto a
@@ -435,12 +430,25 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 // thousand entries - see docs/benchmarks/lightsail-sim/README.md.
 func (d *InMemoryCommitDag) GetCommitByTransactionID(txID codec.UUID) (document.Commit, bool) {
 	d.mu.RLock()
-	hash, ok := d.txIndex[txID]
+	hash, ok := d.txIndexLookupLocked(txID)
 	d.mu.RUnlock()
 	if !ok {
 		return document.Commit{}, false
 	}
 	return d.GetCommit(hash)
+}
+
+// txIndexLookupLocked resolves a transaction id through the resident index, then the graph
+// file's - which holds the entries an attach moved out of txIndex. A file entry counts only while
+// the commit it names is still in the DAG. Must hold mu.
+func (d *InMemoryCommitDag) txIndexLookupLocked(txID codec.UUID) (codec.Hash, bool) {
+	if h, ok := d.txIndex[txID]; ok {
+		return h, true
+	}
+	if h, ok := d.segmentTxLocked(txID); ok && d.nodes.has(h) {
+		return h, true
+	}
+	return codec.Hash{}, false
 }
 
 // StubCommit archives a commit in place.
@@ -455,7 +463,7 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	if err := d.assertUnpinnedLocked(hash, "archive requested"); err != nil {
 		return document.CommitStub{}, err
 	}
-	delete(d.nodes, hash)
+	d.nodes.delete(hash)
 	delete(d.unlogged, hash)
 	d.ancestryVersion++
 	d.ancestryEpoch++
@@ -540,19 +548,25 @@ func (d *InMemoryCommitDag) DropShallowCommit(hash codec.Hash) error {
 				"shallow root is tagged", d.NamespaceID, hash, "tag="+name)
 		}
 	}
-	for h, n := range d.nodes {
-		if h == hash {
-			continue
+	var childErr error
+	d.nodes.forEach(func(h codec.Hash) {
+		if childErr != nil || h == hash {
+			return
 		}
-		for _, p := range n.commit.ParentHashes {
+		d.nodes.forEachParent(h, func(p codec.Hash) bool {
 			if p == hash {
-				return NewCompactionSafetyError(
+				childErr = NewCompactionSafetyError(
 					"shallow root has a resident child", d.NamespaceID, hash, "child="+h.Hex())
+				return false
 			}
-		}
+			return true
+		})
+	})
+	if childErr != nil {
+		return childErr
 	}
 	d.untrackOpsLocked(c)
-	delete(d.nodes, hash)
+	d.nodes.delete(hash)
 	delete(d.unlogged, hash)
 	delete(d.shallow, hash)
 	delete(d.provisional, hash)
@@ -626,7 +640,7 @@ func (d *InMemoryCommitDag) InvalidateGenerations() {
 func (d *InMemoryCommitDag) CommitCount() int {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return len(d.nodes) + len(d.stubs)
+	return d.nodes.len() + len(d.stubs)
 }
 
 // IsShallow reports whether hash is a shallow root.
@@ -658,22 +672,18 @@ func (d *InMemoryCommitDag) Horizon() []codec.Hash {
 	for h := range d.shallow {
 		seen[h] = struct{}{}
 	}
-	for h := range d.nodes {
-		c, ok := d.commitLocked(h)
-		if !ok {
-			continue
-		}
-		for _, p := range c.ParentHashes {
-			if _, resident := d.nodes[p]; resident {
-				continue
+	d.nodes.forEach(func(h codec.Hash) {
+		d.nodes.forEachParent(h, func(p codec.Hash) bool {
+			if d.nodes.has(p) {
+				return true
 			}
 			if _, stubbed := d.stubs[p]; stubbed {
-				continue
+				return true
 			}
 			seen[h] = struct{}{}
-			break
-		}
-	}
+			return false
+		})
+	})
 	out := make([]codec.Hash, 0, len(seen))
 	for h := range seen {
 		out = append(out, h)
@@ -1050,8 +1060,8 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 func (d *InMemoryCommitDag) causalTimestampLocked(ts codec.Timestamp, parents []codec.Hash) codec.Timestamp {
 	micros := ts.EpochMicros()
 	for _, p := range parents {
-		if c, ok := d.commitLocked(p); ok {
-			if pm := c.Timestamp.EpochMicros(); pm >= micros {
+		if pts, ok := d.nodes.timestamp(p); ok {
+			if pm := pts.EpochMicros(); pm >= micros {
 				micros = pm + 1
 			}
 		}
@@ -1116,7 +1126,7 @@ func (d *InMemoryCommitDag) Squash(
 		}
 	}
 	for _, h := range squashHashes {
-		delete(d.nodes, h)
+		d.nodes.delete(h)
 		delete(d.unlogged, h)
 		delete(d.stubs, h)
 	}
@@ -1160,12 +1170,13 @@ func (d *InMemoryCommitDag) CommitForTree(treeHash codec.Hash) (codec.Hash, bool
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.treeIndex == nil {
-		d.treeIndex = make(map[codec.Hash]codec.Hash, len(d.nodes))
-		for h, n := range d.nodes {
-			if _, seen := d.treeIndex[n.commit.DocumentTreeHash]; !seen {
-				d.treeIndex[n.commit.DocumentTreeHash] = h
+		d.treeIndex = make(map[codec.Hash]codec.Hash, d.nodes.len())
+		d.nodes.forEach(func(h codec.Hash) {
+			tree, _ := d.nodes.treeHash(h)
+			if _, seen := d.treeIndex[tree]; !seen {
+				d.treeIndex[tree] = h
 			}
-		}
+		})
 	}
 	h, ok := d.treeIndex[treeHash]
 	return h, ok

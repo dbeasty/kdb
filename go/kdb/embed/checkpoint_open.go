@@ -104,6 +104,19 @@ func restoreNamespace(
 		return mustReplay()
 	}
 
+	if len(cp.GraphRefs) > 0 {
+		// The checkpoint carries only the commits that were in memory; the rest are in the graph
+		// segments it names, mapped here before anything is restored on top of them.
+		if err := d.AttachCheckpointGraph(cp.GraphRefs, cp.GraphHidden); err != nil {
+			log.Printf("kdb: namespace %s: the graph segments the checkpoint relies on are unusable (%v) - replaying the log in full", namespaceID, err)
+			return mustReplay()
+		}
+		inner := mustReplay
+		mustReplay = func() (bool, error) {
+			d.DetachGraph()
+			return inner()
+		}
+	}
 	if err := d.RestoreCheckpoint(cp.State); err != nil {
 		log.Printf("kdb: namespace %s: checkpoint could not be restored (%v) - replaying the log in full", namespaceID, err)
 		return mustReplay()
@@ -222,8 +235,10 @@ func saveCheckpoint(
 	}
 	// Refused, not trimmed, when main names a commit the log does not hold (a peer adoption whose
 	// log write failed): the previous checkpoint and the log after it are what the namespace
-	// really is, and the next open rebuilds that - see dag.CheckpointSnapshotLogged.
-	state, err := d.CheckpointSnapshotLogged(commitRetentionFilter(eng))
+	// really is, and the next open rebuilds that - see dag.CheckpointSnapshotLogged. Under
+	// history=full with graph segments attached, the checkpoint names the segments instead of
+	// carrying their commits - see dag.CheckpointSnapshotWithGraph, which refuses the same way.
+	state, graphRefs, graphHidden, err := d.CheckpointSnapshotWithGraph(commitRetentionFilter(eng))
 	if err != nil {
 		return err
 	}
@@ -254,7 +269,8 @@ func saveCheckpoint(
 	if d.HasProvisional() || d.ProvisionalGeneration() != provisionalGen {
 		return ErrCheckpointDeferred
 	}
-	return writeCheckpoint(shim, namespaceCheckpoint{
+	rememberCheckpointFingerprints(r, segments)
+	if err := writeCheckpoint(shim, namespaceCheckpoint{
 		NamespaceID:     namespaceID,
 		ThroughSequence: through,
 		FloorSequence:   floor,
@@ -262,7 +278,15 @@ func saveCheckpoint(
 		LiveTree:        liveTree,
 		Segments:        segments,
 		HeadCommits:     headPayloads,
-	})
+		GraphRefs:       graphRefs,
+		GraphHidden:     graphHidden,
+	}); err != nil {
+		return err
+	}
+	// Only now is it the checkpoint on disk: from here the segments it names must outlive any
+	// rewrite that supersedes them, and the ones the previous checkpoint held back may go.
+	d.SetGraphCheckpointRefs(graphRefs)
+	return nil
 }
 
 // ErrCheckpointDeferred means a checkpoint was not written because a cross-namespace transaction
