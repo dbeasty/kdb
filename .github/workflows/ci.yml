@@ -105,7 +105,11 @@ jobs:
       - name: Go test
         run: go test -race ./...
       - name: Go WASM build
-        run: GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
+        run: |
+          GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
+          GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/embed/
+          GOOS=js GOARCH=wasm go build -tags kdb_lite -o /dev/null ./wasm/embed/
+          go vet -tags kdb_lite ./kdb/storage/io/s3
 
   ts-client:
     runs-on: ubuntu-latest
@@ -145,6 +149,58 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+
+  # @kdb/codegen (Component 63 phase 2). Needs the built @kdb/client (a file: dependency) and Go for
+  # the end-to-end suite, which runs the generated typed layer against a real Go server.
+  ts-codegen:
+    runs-on: ubuntu-latest
+    needs: [ts-client]
+    defaults:
+      run:
+        working-directory: packages/kdb-codegen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - name: Build @kdb/client
+        run: cd ../kdb-client && npm ci && npm run build
+      - name: Install
+        run: npm ci
+      - name: Typecheck (includes the compile-time type assertions)
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+
+  # @kdb/embed (Component 63 phase 3): the Go engine compiled to WebAssembly, tested in Node against
+  # the same typed suite and differentially against a real Go server.
+  ts-embed:
+    runs-on: ubuntu-latest
+    needs: [ts-client, ts-codegen]
+    defaults:
+      run:
+        working-directory: packages/kdb-embed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - name: Build @kdb/client and @kdb/codegen
+        run: |
+          (cd ../kdb-client && npm ci && npm run build)
+          (cd ../kdb-codegen && npm ci && npm run build)
+      - name: Install
+        run: npm ci
+      - name: Test (builds the WASM engine first)
+        run: npm test
+      - name: Typecheck
+        run: npm run typecheck
 
   go-interop:
     runs-on: ubuntu-latest

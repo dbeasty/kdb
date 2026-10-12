@@ -5,11 +5,6 @@
  * A WebSocket message is delivered whole, so every message is exactly one frame and no
  * re-framing is needed. That is also why frame.ts validates a frame's declared length against
  * the buffer actually received: unlike a stream reader, nothing upstream of here has checked it.
- *
- * Note the server-side prerequisite (Component 63 §2.3): the Go server's WebSocket listener is
- * still an HTTP 501 stub (go/kdb/transport/ws/transport.go:128). This transport is correct and
- * tested against the wire format, but until that listener lands it has nothing to talk to on
- * the Go deployment target.
  */
 
 import { KdbTransportError } from "../errors.ts";

@@ -1,0 +1,42 @@
+{
+  "name": "@kdb/codegen",
+  "version": "0.1.0",
+  "description": "Types generated from a KDB schema, plus a typed SQL builder over them.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "bin": {
+    "kdb-codegen": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./generate": {
+      "types": "./dist/emit.d.ts",
+      "import": "./dist/emit.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.ts",
+    "pretypecheck": "npm run build"
+  },
+  "peerDependencies": {
+    "@kdb/client": "^0.1.0"
+  },
+  "devDependencies": {
+    "@kdb/client": "file:../kdb-client",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>@kdb/embed browser smoke</title>
+<!--
+  Serve the packages/ directory (so kdb-client and kdb-embed are siblings), then open
+  /kdb-embed/test/browser/smoke.html. Result lands in #result as JSON and in document.title.
+    cd packages && python3 -m http.server 8123
+-->
+<script type="importmap">
+  { "imports": { "@kdb/client": "/kdb-client/dist/index.js" } }
+</script>
+<pre id="result">running…</pre>
+<script type="module">
+  import { openEmbedded } from "/kdb-embed/dist/index.js";
+  const out = { steps: [] };
+  const step = (name, value) => out.steps.push({ name, value });
+  try {
+    const NS = "app/users";
+    const id = "6f9619ff-8b86-d011-b42d-00cf4fc964ff";
+    const t0 = performance.now();
+    const db = await openEmbedded({ namespace: NS });
+    step("open ms < 5000", performance.now() - t0 < 5000);
+    await db.putJSON(NS, id, { name: "Zoë 日本語", n: 1 });
+    step("get", (await db.get(NS, id)).body);
+    await db.exec(NS, "CREATE TABLE users (name TEXT NOT NULL, n INTEGER)");
+    await db.exec(NS, "INSERT INTO users (name, n) VALUES (?, ?)", ["x", 7]);
+    step("sql", await db.query(NS, "SELECT name, n FROM users WHERE n > ? ORDER BY n", [0]));
+    await db.compareAndSwap(NS, id, (c) => ({ ...c, n: c.n + 1 }));
+    step("cas", (await db.get(NS, id)).body.n);
+    const second = await openEmbedded({ namespace: NS });
+    step("isolated second instance", await second.get(NS, id).then(() => "leaked", (e) => e.name));
+    await second.close();
+    await db.close();
+    out.ok = true;
+  } catch (error) {
+    out.ok = false;
+    out.error = String(error && error.stack || error);
+  }
+  document.getElementById("result").textContent = JSON.stringify(out, null, 2);
+  document.title = out.ok ? "PASS" : "FAIL";
+</script>

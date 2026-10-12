@@ -1,3 +1,5 @@
+//go:build !kdb_lite
+
 package s3
 
 import (
