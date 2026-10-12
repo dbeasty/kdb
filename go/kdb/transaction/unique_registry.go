@@ -287,35 +287,84 @@ func (e *UniqueConstraintError) Error() string {
 // matching SQL, where NULLs do not collide with each other. This is a deliberate choice, not an
 // oversight: a schema with an optional unique field would otherwise let exactly one document
 // omit it, and a compound constraint would otherwise treat "(a, missing)" as a value.
+//
+// Arrays are multikey, as in a MongoDB unique index: a part holding an array claims each of its
+// elements, so `{"tags":["a","b"]}` holds "a" and "b" and no other document may hold either. A
+// compound tuple with array parts claims every combination. One document repeating an element
+// claims it once, an empty array claims nothing (as an absent field does), and null elements
+// are skipped. An array nested inside an element is that element's value, not expanded again.
 func UniqueKeysFor(namespaceID string, sch schema.KdbSchema, doc document.Document) ([]UniqueKey, error) {
 	if !sch.HasUniqueConstraints() {
 		return nil, nil
 	}
 	var out []UniqueKey
+	seen := make(map[UniqueKey]struct{})
 	for _, fields := range sch.UniqueTuples() {
-		parts := make([]any, 0, len(fields))
+		choices := make([][]any, 0, len(fields))
 		complete := true
 		for _, name := range fields {
 			raw, err := schema.FieldValue(doc.JSON, name)
 			if err != nil {
 				return nil, err
 			}
-			if raw == nil {
+			values := multikeyValues(raw)
+			if len(values) == 0 {
 				complete = false
 				break
 			}
-			parts = append(parts, raw)
+			choices = append(choices, values)
 		}
 		if !complete {
 			continue
 		}
-		canonical, err := canonicalTuple(parts)
-		if err != nil {
-			return nil, err
+		for _, parts := range combinations(choices) {
+			canonical, err := canonicalTuple(parts)
+			if err != nil {
+				return nil, err
+			}
+			key := NewUniqueKey(namespaceID, fields, canonical)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, key)
 		}
-		out = append(out, NewUniqueKey(namespaceID, fields, canonical))
 	}
 	return out, nil
+}
+
+// multikeyValues is what one constraint part claims: nothing for an absent or null value, each
+// non-null element of an array, the value itself otherwise.
+func multikeyValues(raw any) []any {
+	if raw == nil {
+		return nil
+	}
+	elements, isArray := raw.([]any)
+	if !isArray {
+		return []any{raw}
+	}
+	values := make([]any, 0, len(elements))
+	for _, element := range elements {
+		if element != nil {
+			values = append(values, element)
+		}
+	}
+	return values
+}
+
+// combinations is the cartesian product of the parts' values, in field order.
+func combinations(choices [][]any) [][]any {
+	out := [][]any{{}}
+	for _, values := range choices {
+		next := make([][]any, 0, len(out)*len(values))
+		for _, prefix := range out {
+			for _, value := range values {
+				next = append(next, append(append(make([]any, 0, len(prefix)+1), prefix...), value))
+			}
+		}
+		out = next
+	}
+	return out
 }
 
 // canonicalTuple renders the decoded parts of one constraint tuple as the registry's comparison
