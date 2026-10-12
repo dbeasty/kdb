@@ -291,9 +291,15 @@ func (g *MemoryGuard) zoneFor(used float64, from Zone) Zone {
 // type doc's point 1 for why this, not MemStats.Sys or HeapAlloc) when no cgroup memory
 // controller is available - non-Linux hosts, or a Linux host not running inside one.
 //
-// Mapped files (the commit graph, storage/mmapfile) are page cache, not Go heap. The cgroup
-// reading already charges them, so they are added only on the runtime/metrics path, which cannot
-// see them - otherwise macOS would budget as if a mapped multi-gigabyte graph cost nothing.
+// Mapped files (the commit graph, storage/mmapfile) are page cache, not Go heap, and the two paths
+// treat them differently on purpose:
+//
+//   - cgroup path: mapped pages are charged as page cache, so nothing is added here. Pages that
+//     age onto the inactive LRU are reclaimable and are meant to stop counting; ones the graph
+//     keeps reading stay on the active list and stay counted.
+//   - no-cgroup path (macOS, bare Linux): runtime/metrics knows nothing about the page cache, so
+//     every mapped byte is added - a conservative over-count, hot or cold, rather than budgeting
+//     as if a mapped multi-gigabyte graph cost nothing.
 func currentMemoryUsageBytes() float64 {
 	if v, ok := cgroupMemoryCurrentBytes(); ok {
 		return float64(v)
