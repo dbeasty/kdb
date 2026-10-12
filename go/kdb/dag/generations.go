@@ -7,15 +7,13 @@ import (
 
 // commitLocked returns the resident commit for hash. Must hold mu.
 func (d *InMemoryCommitDag) commitLocked(hash codec.Hash) (document.Commit, bool) {
-	n, ok := d.nodes[hash]
-	return n.commit, ok
+	return d.nodes.commit(hash)
 }
 
 // isResidentLocked reports whether hash names a resident commit - not a
 // stub, and not merely known to some branch. Must hold mu.
 func (d *InMemoryCommitDag) isResidentLocked(hash codec.Hash) bool {
-	_, ok := d.nodes[hash]
-	return ok
+	return d.nodes.has(hash)
 }
 
 // storeCommitLocked admits a commit that is not already resident, giving
@@ -37,7 +35,7 @@ func (d *InMemoryCommitDag) storeCommitLocked(c document.Commit) {
 			d.genStale = true
 		}
 	}
-	d.nodes[c.Hash] = commitNode{commit: c, generation: gen}
+	d.nodes.put(c, gen)
 }
 
 // replaceCommitLocked swaps the commit stored under its own hash while
@@ -46,13 +44,9 @@ func (d *InMemoryCommitDag) storeCommitLocked(c document.Commit) {
 // commit's shape has not changed and recomputing its generation would be
 // waste. Must hold mu.
 func (d *InMemoryCommitDag) replaceCommitLocked(c document.Commit) {
-	n, ok := d.nodes[c.Hash]
-	if !ok {
+	if !d.nodes.replace(c) {
 		d.storeCommitLocked(c)
-		return
 	}
-	n.commit = c
-	d.nodes[c.Hash] = n
 }
 
 // parentsResidentLocked reports whether every one of c's parents is here,
@@ -63,7 +57,7 @@ func (d *InMemoryCommitDag) parentsResidentLocked(c document.Commit) bool {
 		return true // admitted without its parents on purpose; nothing to wait for
 	}
 	for _, p := range c.ParentHashes {
-		if _, ok := d.nodes[p]; ok {
+		if d.nodes.has(p) {
 			continue
 		}
 		if _, ok := d.stubs[p]; ok {
@@ -84,8 +78,8 @@ func (d *InMemoryCommitDag) parentsResidentLocked(c document.Commit) bool {
 func (d *InMemoryCommitDag) deriveGenerationLocked(c document.Commit) uint32 {
 	var max uint32
 	for _, p := range c.ParentHashes {
-		if n, ok := d.nodes[p]; ok && n.generation > max {
-			max = n.generation
+		if g := d.nodes.generation(p); d.nodes.has(p) && g > max {
+			max = g
 		}
 	}
 	return max + 1
@@ -125,10 +119,12 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 		active    = 1
 		done      = 2
 	)
-	state := make(map[codec.Hash]uint8, len(d.nodes))
-	gen := make(map[codec.Hash]uint32, len(d.nodes))
+	state := make(map[codec.Hash]uint8, d.nodes.len())
+	gen := make(map[codec.Hash]uint32, d.nodes.len())
 
-	for root := range d.nodes {
+	var roots []codec.Hash
+	d.nodes.forEach(func(h codec.Hash) { roots = append(roots, h) })
+	for _, root := range roots {
 		if state[root] != unvisited {
 			continue
 		}
@@ -141,20 +137,19 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 				continue
 			case active:
 				// Every parent has been resolved: settle this one.
-				n := d.nodes[h]
 				var max uint32
-				for _, p := range n.commit.ParentHashes {
+				d.nodes.forEachParent(h, func(p codec.Hash) bool {
 					if g, ok := gen[p]; ok && g > max {
 						max = g
 					}
-				}
+					return true
+				})
 				gen[h] = max + 1
 				state[h] = done
 				stack = stack[:len(stack)-1]
 				continue
 			}
-			n, ok := d.nodes[h]
-			if !ok {
+			if !d.nodes.has(h) {
 				// A stub or an absent parent. Contributes no generation,
 				// and marking it done keeps it out of the walk.
 				state[h] = done
@@ -162,7 +157,7 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 				continue
 			}
 			state[h] = active
-			for _, p := range n.commit.ParentHashes {
+			d.nodes.forEachParent(h, func(p codec.Hash) bool {
 				if state[p] == unvisited {
 					stack = append(stack, p)
 				}
@@ -170,15 +165,13 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 				// graph cannot form without a hash collision. Leaving it
 				// alone resolves it as generation 0, which prunes nothing
 				// rather than pruning wrongly.
-			}
+				return true
+			})
 		}
 	}
 
 	for h, g := range gen {
-		if n, ok := d.nodes[h]; ok {
-			n.generation = g
-			d.nodes[h] = n
-		}
+		d.nodes.setGeneration(h, g)
 	}
 	d.genStale = false
 }
@@ -186,5 +179,5 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 // generationLocked returns hash's generation, or 0 for a hash that is not
 // a resident commit. Must hold mu.
 func (d *InMemoryCommitDag) generationLocked(hash codec.Hash) uint32 {
-	return d.nodes[hash].generation
+	return d.nodes.generation(hash)
 }

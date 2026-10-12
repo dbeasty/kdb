@@ -37,8 +37,8 @@ type headSnapshot struct {
 	commit    document.Commit
 }
 
-// commitNode is one resident commit plus the graph metadata the DAG
-// derives for it.
+// Each resident commit carries, beside the commit itself, a generation number (see nodeStore for
+// how it is held).
 //
 // generation is the length of the longest path from this commit back to a
 // root, one more than the highest of its parents' - git's commit-graph
@@ -50,11 +50,6 @@ type headSnapshot struct {
 // the setting rather than checking for a zero generation - a real root
 // commit's generation is 1, so zero is unambiguous, but only if nothing
 // treats it as a number.
-type commitNode struct {
-	commit     document.Commit
-	generation uint32
-}
-
 // InMemoryCommitDag is an in-memory commit DAG for one namespace.
 type InMemoryCommitDag struct {
 	NamespaceID string
@@ -86,7 +81,7 @@ type InMemoryCommitDag struct {
 	// metadata: a second map keyed by codec.Hash costs roughly 50 bytes
 	// per commit in buckets and key copies, against 8 for widening the
 	// value that is already here, and the two could drift.
-	nodes map[codec.Hash]commitNode
+	nodes nodeStore
 	// treeIndex answers "which commit produced this tree". Nil until the
 	// first CommitForTree call builds it, and maintained from then on - see
 	// CommitForTree for why it is not maintained from the start.
@@ -229,7 +224,7 @@ func (d *InMemoryCommitDag) AncestryVersion() uint64 {
 func NewInMemoryCommitDag(namespaceID string) (*InMemoryCommitDag, error) {
 	d := &InMemoryCommitDag{
 		NamespaceID: namespaceID,
-		nodes:       make(map[codec.Hash]commitNode),
+		nodes:       newNodeStore(),
 		stubs:       make(map[codec.Hash]document.CommitStub),
 		shallow:     make(map[codec.Hash]struct{}),
 		trees:       make(map[codec.Hash]document.DocumentTree),
@@ -278,11 +273,11 @@ func (d *InMemoryCommitDag) LookupHashPrefix(hexPrefixLower string) []codec.Hash
 	defer d.mu.RUnlock()
 	p := strings.ToLower(hexPrefixLower)
 	var out []codec.Hash
-	for h := range d.nodes {
+	d.nodes.forEach(func(h codec.Hash) {
 		if strings.HasPrefix(h.Hex(), p) {
 			out = append(out, h)
 		}
-	}
+	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Hex() < out[j].Hex() })
 	return out
 }
@@ -437,7 +432,7 @@ func (d *InMemoryCommitDag) StubCommit(hash codec.Hash, archiveLocation string) 
 	if err := d.assertUnpinnedLocked(hash, "archive requested"); err != nil {
 		return document.CommitStub{}, err
 	}
-	delete(d.nodes, hash)
+	d.nodes.delete(hash)
 	delete(d.unlogged, hash)
 	d.ancestryVersion++
 	stub := document.CommitStub{
@@ -520,19 +515,25 @@ func (d *InMemoryCommitDag) DropShallowCommit(hash codec.Hash) error {
 				"shallow root is tagged", d.NamespaceID, hash, "tag="+name)
 		}
 	}
-	for h, n := range d.nodes {
-		if h == hash {
-			continue
+	var childErr error
+	d.nodes.forEach(func(h codec.Hash) {
+		if childErr != nil || h == hash {
+			return
 		}
-		for _, p := range n.commit.ParentHashes {
+		d.nodes.forEachParent(h, func(p codec.Hash) bool {
 			if p == hash {
-				return NewCompactionSafetyError(
+				childErr = NewCompactionSafetyError(
 					"shallow root has a resident child", d.NamespaceID, hash, "child="+h.Hex())
+				return false
 			}
-		}
+			return true
+		})
+	})
+	if childErr != nil {
+		return childErr
 	}
 	d.untrackOpsLocked(c)
-	delete(d.nodes, hash)
+	d.nodes.delete(hash)
 	delete(d.unlogged, hash)
 	delete(d.shallow, hash)
 	delete(d.provisional, hash)
@@ -602,7 +603,7 @@ func (d *InMemoryCommitDag) InvalidateGenerations() {
 func (d *InMemoryCommitDag) CommitCount() int {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return len(d.nodes) + len(d.stubs)
+	return d.nodes.len() + len(d.stubs)
 }
 
 // IsShallow reports whether hash is a shallow root.
@@ -634,22 +635,18 @@ func (d *InMemoryCommitDag) Horizon() []codec.Hash {
 	for h := range d.shallow {
 		seen[h] = struct{}{}
 	}
-	for h := range d.nodes {
-		c, ok := d.commitLocked(h)
-		if !ok {
-			continue
-		}
-		for _, p := range c.ParentHashes {
-			if _, resident := d.nodes[p]; resident {
-				continue
+	d.nodes.forEach(func(h codec.Hash) {
+		d.nodes.forEachParent(h, func(p codec.Hash) bool {
+			if d.nodes.has(p) {
+				return true
 			}
 			if _, stubbed := d.stubs[p]; stubbed {
-				continue
+				return true
 			}
 			seen[h] = struct{}{}
-			break
-		}
-	}
+			return false
+		})
+	})
 	out := make([]codec.Hash, 0, len(seen))
 	for h := range seen {
 		out = append(out, h)
@@ -1091,7 +1088,7 @@ func (d *InMemoryCommitDag) Squash(
 		}
 	}
 	for _, h := range squashHashes {
-		delete(d.nodes, h)
+		d.nodes.delete(h)
 		delete(d.unlogged, h)
 		delete(d.stubs, h)
 	}
@@ -1134,12 +1131,13 @@ func (d *InMemoryCommitDag) CommitForTree(treeHash codec.Hash) (codec.Hash, bool
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.treeIndex == nil {
-		d.treeIndex = make(map[codec.Hash]codec.Hash, len(d.nodes))
-		for h, n := range d.nodes {
-			if _, seen := d.treeIndex[n.commit.DocumentTreeHash]; !seen {
-				d.treeIndex[n.commit.DocumentTreeHash] = h
+		d.treeIndex = make(map[codec.Hash]codec.Hash, d.nodes.len())
+		d.nodes.forEach(func(h codec.Hash) {
+			tree, _ := d.nodes.treeHash(h)
+			if _, seen := d.treeIndex[tree]; !seen {
+				d.treeIndex[tree] = h
 			}
-		}
+		})
 	}
 	h, ok := d.treeIndex[treeHash]
 	return h, ok

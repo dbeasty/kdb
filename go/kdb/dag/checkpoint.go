@@ -75,12 +75,14 @@ func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commi
 		pinned[t.CommitHash] = struct{}{}
 	}
 	state := CheckpointState{
-		Commits:  make([]CheckpointCommit, 0, len(d.nodes)),
+		Commits:  make([]CheckpointCommit, 0, d.nodes.len()),
 		Branches: make([]document.Branch, 0, len(d.branches)),
 		Tags:     make([]document.Tag, 0, len(d.tags)),
 	}
-	for _, n := range d.nodes {
-		c := n.commit
+	var hashes []codec.Hash
+	d.nodes.forEach(func(h codec.Hash) { hashes = append(hashes, h) })
+	for _, h := range hashes {
+		c, _ := d.nodes.commit(h)
 		if unlogged(c.Hash) {
 			continue
 		}
