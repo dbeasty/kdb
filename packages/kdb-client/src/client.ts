@@ -6,6 +6,7 @@
  * rather than sentinel returns.
  */
 
+import { SessionLock } from "./session-lock.ts";
 import {
   KdbAbortedError,
   KdbClosedError,
@@ -150,6 +151,7 @@ export class Client implements KdbOperations {
   readonly #pending = new Map<number, PendingRequest>();
   readonly #namespaces = new Map<string, NamespaceState>();
   readonly #sessionsInFlight = new Map<string, Promise<NamespaceState>>();
+  readonly #sessionLocks = new Map<string, SessionLock>();
 
   #correlation = 1;
   #closed = false;
@@ -439,22 +441,29 @@ export class Client implements KdbOperations {
     sql: string,
     args: unknown[] = [],
     options: CallOptions = {},
-  ): Promise<void> {
-    const result = await this.#execSql(ns, sql, args, options);
-    if (result.readOnly) return;
+  ): Promise<number> {
+    // The sqlExec and its auto-commit are one unit of work on a session that holds a single
+    // pending transaction, so nothing else may use that session between them. See SessionLock.
+    return this.#sessionLock(ns).exclusive(async () => {
+      const result = await this.#execSql(ns, sql, args, options);
+      if (result.readOnly) return result.rowsAffected;
 
-    // A write statement is not durable until it is committed, and this call is one
-    // client-visible unit of work rather than two, so the auto-commit happens here. The
-    // txCommit carries no transactionBytes: it commits whatever the session accumulated.
-    // Matching go/kdb/client/query.go:44-72. Omitting this is the bug that passes every unit
-    // test and loses writes in production.
-    const state = await this.#ensureNamespace(ns, options);
-    const reply = await this.#request(
-      "txCommit",
-      { namespace: ns, sessionId: state.sessionId, transactionBytes: [] },
-      options,
-    );
-    this.#handleCommitReply(ns, state, reply);
+      // A write statement is not durable until it is committed, and this call is one
+      // client-visible unit of work rather than two, so the auto-commit happens here. The
+      // txCommit carries no transactionBytes: it commits whatever the session accumulated.
+      // Matching go/kdb/client/query.go:44-72. Omitting this is the bug that passes every unit
+      // test and loses writes in production.
+      const state = await this.#ensureNamespace(ns, options);
+      const reply = await this.#request(
+        "txCommit",
+        { namespace: ns, sessionId: state.sessionId, transactionBytes: [] },
+        options,
+      );
+      this.#handleCommitReply(ns, state, reply);
+      // The count comes from the statement, not the commit: the commit reports the operations
+      // it applied, which is not the number of rows a DELETE matched.
+      return result.rowsAffected;
+    });
   }
 
   // --- leases -------------------------------------------------------------------------------
@@ -569,14 +578,18 @@ export class Client implements KdbOperations {
     tx: TransactionDto,
     options: CallOptions,
   ): Promise<CommitHash> {
-    const reply = await this.#request(
-      "txCommit",
-      {
-        namespace: ns,
-        sessionId: state.sessionId,
-        transactionBytes: bytesToWire(utf8Encode(JSON.stringify(tx))),
-      },
-      options,
+    // Shared with other byte-carrying commits, exclusive against exec: the server clears the
+    // session's pending transaction as this lands, so it must not land inside an exec.
+    const reply = await this.#sessionLock(ns).shared(() =>
+      this.#request(
+        "txCommit",
+        {
+          namespace: ns,
+          sessionId: state.sessionId,
+          transactionBytes: bytesToWire(utf8Encode(JSON.stringify(tx))),
+        },
+        options,
+      ),
     );
     const commit = this.#handleCommitReply(ns, state, reply);
     if (commit === undefined) {
@@ -609,7 +622,7 @@ export class Client implements KdbOperations {
     sql: string,
     args: unknown[],
     options: CallOptions,
-  ): Promise<{ columns: string[]; rows: string[][]; readOnly: boolean }> {
+  ): Promise<{ columns: string[]; rows: string[][]; readOnly: boolean; rowsAffected: number }> {
     const state = await this.#ensureNamespace(ns, options);
     const reply = await this.#request(
       "sqlExec",
@@ -627,7 +640,17 @@ export class Client implements KdbOperations {
       columns: result.columns ?? [],
       rows: result.rows ?? [],
       readOnly: result.readOnly,
+      rowsAffected: result.rowsAffected ?? 0,
     };
+  }
+
+  #sessionLock(ns: string): SessionLock {
+    let lock = this.#sessionLocks.get(ns);
+    if (!lock) {
+      lock = new SessionLock();
+      this.#sessionLocks.set(ns, lock);
+    }
+    return lock;
   }
 
   /**

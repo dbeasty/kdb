@@ -141,6 +141,10 @@ export interface KdbOperations {
     options?: CallOptions,
   ): Promise<{ columns: string[]; rows: string[][] }>;
 
-  /** Runs one non-SELECT statement, auto-committing it if the server reports it as a write. */
-  exec(ns: string, sql: string, args?: unknown[], options?: CallOptions): Promise<void>;
+  /**
+   * Runs one non-SELECT statement, auto-committing it if the server reports it as a write.
+   * Resolves to the number of rows the statement affected, so a DELETE that matched nothing is
+   * distinguishable from one that removed a row. Concurrent calls on a namespace are safe.
+   */
+  exec(ns: string, sql: string, args?: unknown[], options?: CallOptions): Promise<number>;
 }

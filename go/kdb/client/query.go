@@ -38,17 +38,22 @@ func (c *Client) QueryRaw(ctx context.Context, ns string, sqlText string, args [
 // prefer PutJSON/Upsert/Commit; Exec exists for DDL and the occasional write better expressed as
 // SQL. An INSERT is auto-committed immediately (this call is one client-visible unit of work,
 // not two).
-func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any) error {
-	result, err := c.execSql(ctx, ns, sqlText, args)
-	if err != nil {
-		return err
-	}
-	if !result.needsCommit {
-		return nil
-	}
+//
+// It returns the number of rows the statement affected, so a DELETE that matched nothing is
+// distinguishable from one that removed a row. Concurrent calls on one namespace are safe.
+func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any) (int, error) {
 	st, err := c.ensureNamespace(ctx, ns)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	st.dml.Lock()
+	defer st.dml.Unlock()
+	result, err := c.execSqlOnSession(ctx, ns, st.sessionID, sqlText, args)
+	if err != nil {
+		return 0, err
+	}
+	if !result.needsCommit {
+		return result.rowsAffected, nil
 	}
 	commitMsg := wire.TxCommitMessage{
 		H:         wire.Header{MessageType: wire.MsgTxCommit, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
@@ -57,18 +62,19 @@ func (c *Client) Exec(ctx context.Context, ns string, sqlText string, args []any
 	}
 	reply, err := c.request(ctx, commitMsg)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	switch r := reply.(type) {
 	case wire.ConflictReportMessage:
-		return decodeConflictError(r.ReportBytes, r.RetryAfterMs)
+		return 0, decodeConflictError(r.ReportBytes, r.RetryAfterMs)
 	case wire.SqlResultMessage:
 		if r.Error != nil {
-			return classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
+			return 0, classifiedError(*r.Error, r.ErrorCode, r.RetryAfterMs)
 		}
-		return nil
+		// The statement's count, not the commit's: the commit reports operations applied.
+		return result.rowsAffected, nil
 	default:
-		return fmt.Errorf("kdb: unexpected commit response %T", reply)
+		return 0, fmt.Errorf("kdb: unexpected commit response %T", reply)
 	}
 }
 

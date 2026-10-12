@@ -160,7 +160,7 @@ func run(cmd string, args []string) error {
 			}
 			fmt.Printf("%s\n%s\n", commit, body)
 		case "exec":
-			if err := cl.Exec(ctx, cf.namespace, sqlText, nil); err != nil {
+			if _, err := cl.Exec(ctx, cf.namespace, sqlText, nil); err != nil {
 				return err
 			}
 			fmt.Println("ok")

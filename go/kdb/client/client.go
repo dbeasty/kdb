@@ -246,6 +246,14 @@ type Client struct {
 }
 
 type namespaceState struct {
+	// dml keeps the session's single pending transaction coherent. Exec takes it exclusively
+	// (its SQL_EXEC and the empty TX_COMMIT that follows must reach the server back to back),
+	// and a byte-carrying commit takes it shared (each is self-contained, but the server clears
+	// the pending transaction as one lands, so it must not land inside an Exec). Without it two
+	// concurrent Execs interleave and the second fails with "no pending transaction to commit"
+	// although its statement was applied.
+	dml sync.RWMutex
+
 	mu        sync.Mutex
 	sessionID string
 	head      codec.Hash
@@ -660,6 +668,8 @@ func (c *Client) Commit(ctx context.Context, tx Transaction) (string, error) {
 }
 
 func (c *Client) commitTransaction(ctx context.Context, ns string, st *namespaceState, tx document.Transaction) (string, error) {
+	st.dml.RLock()
+	defer st.dml.RUnlock()
 	encoded, err := wire.EncodeTransaction(tx)
 	if err != nil {
 		return "", err

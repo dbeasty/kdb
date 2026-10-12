@@ -284,13 +284,13 @@ func TestQueryDecodesRowsIntoStructSlice(t *testing.T) {
 	c := connectTestClient(t, addr)
 	ctx := context.Background()
 
-	if err := c.Exec(ctx, "app/data", `CREATE TABLE players (name VARCHAR NOT NULL, level VARCHAR NOT NULL)`, nil); err != nil {
+	if _, err := c.Exec(ctx, "app/data", `CREATE TABLE players (name VARCHAR NOT NULL, level VARCHAR NOT NULL)`, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Exec(ctx, "app/data", `INSERT INTO players (name, level) VALUES ('Alice', '7')`, nil); err != nil {
+	if _, err := c.Exec(ctx, "app/data", `INSERT INTO players (name, level) VALUES ('Alice', '7')`, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Exec(ctx, "app/data", `INSERT INTO players (name, level) VALUES ('Bob', '3')`, nil); err != nil {
+	if _, err := c.Exec(ctx, "app/data", `INSERT INTO players (name, level) VALUES ('Bob', '3')`, nil); err != nil {
 		t.Fatal(err)
 	}
 

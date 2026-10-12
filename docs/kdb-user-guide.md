@@ -300,8 +300,8 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--sql-addr` | `tcp://127.0.0.1:9090?bind=true` | SQL wire listener (client SDK, JDBC network) |
-| `--peer-addr` | `tcp://127.0.0.1:9091?bind=true` | peer-sync (Mode 3) listener |
-| `--stream-addr` | `tcp://127.0.0.1:9092?bind=true` | stream (Mode 1 read-only / Mode 2 write-back) listener |
+| `--peer-addr` | _(off)_ | peer-sync (Mode 3) listener, e.g. `tcp://127.0.0.1:9091?bind=true` |
+| `--stream-addr` | _(off)_ | stream (Mode 1 read-only / Mode 2 write-back) listener, e.g. `tcp://127.0.0.1:9092?bind=true` |
 | `--admin-addr` | disabled | operational HTTP: `/healthz`, `/readyz`, `/metrics`, `/debug/pprof` — **no auth; bind privately** |
 | `--max-connections N` | 256 | cap on concurrently accepted connections per listener (0 = unlimited) |
 
