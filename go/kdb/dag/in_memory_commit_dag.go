@@ -672,12 +672,16 @@ func (d *InMemoryCommitDag) Horizon() []codec.Hash {
 	for h := range d.shallow {
 		seen[h] = struct{}{}
 	}
-	d.nodes.forEach(func(h codec.Hash) {
+	stubbed := func(h codec.Hash) bool {
+		_, ok := d.stubs[h]
+		return ok
+	}
+	// Only commits that can have a missing parent are visited: walking every commit here cost
+	// 2.4 s of a million-document open once the graph lived in segments. See
+	// nodeStore.forEachHorizonCandidate.
+	d.nodes.forEachHorizonCandidate(stubbed, func(h codec.Hash) {
 		d.nodes.forEachParent(h, func(p codec.Hash) bool {
-			if d.nodes.has(p) {
-				return true
-			}
-			if _, stubbed := d.stubs[p]; stubbed {
+			if d.nodes.has(p) || stubbed(p) {
 				return true
 			}
 			seen[h] = struct{}{}

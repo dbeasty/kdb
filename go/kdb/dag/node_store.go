@@ -205,7 +205,7 @@ func (s *nodeStore) generation(h codec.Hash) uint32 {
 		if g, ok := s.genOverride[h]; ok {
 			return g
 		}
-		return recGeneration(b.rec(pos))
+		return b.generation(pos)
 	}
 	return 0
 }
@@ -223,7 +223,7 @@ func (s *nodeStore) setGeneration(h codec.Hash, gen uint32) {
 		return
 	}
 	if b, pos, ok := s.segPos(h); ok {
-		s.setSegGeneration(h, recGeneration(b.rec(pos)), gen)
+		s.setSegGeneration(h, b.generation(pos), gen)
 	}
 }
 
@@ -254,15 +254,14 @@ func (s *nodeStore) timestamp(h codec.Hash) (codec.Timestamp, bool) {
 		n, ok := s.goNodes[h]
 		return n.commit.Timestamp, ok
 	}
-	var r []byte
 	if i, ok := s.index[h]; ok {
-		r = s.at(i)
-	} else if b, pos, ok := s.segPos(h); ok {
-		r = b.rec(pos)
-	} else {
-		return codec.Timestamp{}, false
+		r := s.at(i)
+		return codec.Timestamp{EpochMillis: int64(le.Uint64(r[grEpochMs:])), MicroRemainder: int(int64(le.Uint64(r[grMicro:])))}, true
 	}
-	return codec.Timestamp{EpochMillis: int64(le.Uint64(r[grEpochMs:])), MicroRemainder: int(int64(le.Uint64(r[grMicro:])))}, true
+	if b, pos, ok := s.segPos(h); ok {
+		return b.timestamp(pos), true
+	}
+	return codec.Timestamp{}, false
 }
 
 func (s *nodeStore) setOps(h codec.Hash, ops []document.Op) {
@@ -291,7 +290,7 @@ func (s *nodeStore) put(c document.Commit, gen uint32) {
 			// Already on disk. A commit's hash covers everything a record carries, so the only
 			// things that can differ are the ones held beside it.
 			s.setOps(c.Hash, c.Operations)
-			s.setSegGeneration(c.Hash, recGeneration(b.rec(pos)), gen)
+			s.setSegGeneration(c.Hash, b.generation(pos), gen)
 			return
 		}
 	}
@@ -397,7 +396,7 @@ func (s *nodeStore) commit(h codec.Hash) (document.Commit, bool) {
 		return decodeRecord(r, s.namespaces[recNsIdx(r)], s.messages[h], s.extra[h], s.ops[h]), true
 	}
 	if b, pos, ok := s.segPos(h); ok {
-		return decodeRecord(b.rec(pos), b.ns, b.messageAt(pos), b.extraAt(pos), s.ops[h]), true
+		return b.commit(pos, s.ops[h]), true
 	}
 	return document.Commit{}, false
 }
@@ -412,7 +411,7 @@ func (s *nodeStore) treeHash(h codec.Hash) (codec.Hash, bool) {
 		return recTree(s.at(i)), true
 	}
 	if b, pos, ok := s.segPos(h); ok {
-		return recTree(b.rec(pos)), true
+		return b.treeHash(pos), true
 	}
 	return codec.Hash{}, false
 }
@@ -437,10 +436,8 @@ func (s *nodeStore) forEachParent(h codec.Hash, fn func(codec.Hash) bool) {
 			extra = s.extra[h]
 		}
 	} else if b, pos, ok := s.segPos(h); ok {
-		p0, p1, n = recParents01(b.rec(pos))
-		if n > 2 {
-			extra = b.extraAt(pos)
-		}
+		b.forEachParent(pos, fn)
+		return
 	} else {
 		return
 	}
@@ -475,6 +472,46 @@ func (s *nodeStore) forEach(fn func(codec.Hash)) {
 				continue
 			}
 			fn(h)
+		}
+	}
+}
+
+// forEachHorizonCandidate visits every commit that could have a parent the DAG does not hold:
+// all of the resident tier, and in each segment only the commits whose XPOS entry says a parent
+// lies outside it. A parent inside the same segment is always held - unless it was deleted without
+// leaving a stub, so if any hidden record is unstubbed every segment commit is visited, and the
+// answer is the same either way.
+func (s *nodeStore) forEachHorizonCandidate(stubbed func(codec.Hash) bool, fn func(codec.Hash)) {
+	if s.goMode {
+		s.forEach(fn)
+		return
+	}
+	for h := range s.index {
+		fn(h)
+	}
+	all := false
+	for h := range s.hidden {
+		if !stubbed(h) {
+			all = true
+			break
+		}
+	}
+	for _, b := range s.segs {
+		visit := func(pos int) {
+			h := b.hashAt(pos)
+			if _, gone := s.hidden[h]; !gone {
+				fn(h)
+			}
+		}
+		if all {
+			for pos := 0; pos < b.count; pos++ {
+				visit(pos)
+			}
+			continue
+		}
+		xp := b.externalParentPositions()
+		for i := 0; i+4 <= len(xp); i += 4 {
+			visit(int(le.Uint32(xp[i:])))
 		}
 	}
 }
@@ -568,8 +605,7 @@ func (snap *graphSnapshot) sources() (func() (graphSource, bool), func() (graphT
 				if _, gone := snap.hidden[h]; gone {
 					continue
 				}
-				src := graphSource{msg: b.messageAt(p), extra: b.extraAt(p)}
-				copy(src.rec[:], b.rec(p))
+				src := b.toSource(p)
 				if g, ok := snap.genOverride[h]; ok {
 					setRecGeneration(src.rec[:], g)
 				}
@@ -626,11 +662,9 @@ func (snap *graphSnapshot) sources() (func() (graphSource, bool), func() (graphT
 		b, i := b, 0
 		txs = append(txs, &txStream{next: func() (graphTx, bool) {
 			for i < b.txCount {
-				e := b.tidx[i*graphTxEntrySize : (i+1)*graphTxEntrySize]
+				pos, key := b.txIndexAt(i)
 				i++
-				var t graphTx
-				copy(t.key[:], e[:16])
-				copy(t.hash.Bytes[:], e[16:48])
+				t := graphTx{key: key, hash: b.hashAt(pos)}
 				if _, gone := snap.hidden[t.hash]; gone {
 					continue
 				}
@@ -702,7 +736,7 @@ func (s *nodeStore) attach(nb *graphBase, replaced []*graphBase) {
 				if g, ok := s.genOverride[h]; ok {
 					return g, true
 				}
-				return recGeneration(b.rec(pos)), true
+				return b.generation(pos), true
 			}
 		}
 		return 0, false
@@ -734,17 +768,17 @@ func (s *nodeStore) attach(nb *graphBase, replaced []*graphBase) {
 		}
 	}
 	for pos := 0; pos < nb.count; pos++ {
-		r := nb.rec(pos)
-		h := recHash(r)
+		h := nb.hashAt(pos)
+		fileGen := nb.generation(pos)
 		if i, ok := s.index[h]; ok {
-			setOverride(h, recGeneration(r), recGeneration(s.at(i)))
+			setOverride(h, fileGen, recGeneration(s.at(i)))
 			s.freeSlot(h, i)
 			delete(s.messages, h)
 			delete(s.extra, h)
 			continue
 		}
 		if gen, ok := replacedVisible(h); ok {
-			setOverride(h, recGeneration(r), gen)
+			setOverride(h, fileGen, gen)
 			continue
 		}
 		hidden[h] = struct{}{}
@@ -762,7 +796,7 @@ func (s *nodeStore) attach(nb *graphBase, replaced []*graphBase) {
 			if _, ok := nb.find(h); ok {
 				continue
 			}
-			c := decodeRecord(b.rec(pos), b.ns, b.messageAt(pos), b.extraAt(pos), s.ops[h])
+			c := b.commit(pos, s.ops[h])
 			saved := s.segs
 			s.segs = nil // so put admits it to the resident tier
 			s.put(c, gen)
@@ -832,7 +866,7 @@ func (s *nodeStore) segmentOpsEvicted(h codec.Hash) bool {
 		return false
 	}
 	b, pos, ok := s.segPos(h)
-	if !ok || !recHasOps(b.rec(pos)) {
+	if !ok || !b.hasOps(pos) {
 		return false
 	}
 	return len(s.ops[h]) == 0
