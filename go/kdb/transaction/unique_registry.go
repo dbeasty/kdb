@@ -431,10 +431,14 @@ func planUniqueKeys(
 				continue
 			}
 			owner, held := registry.Owner(key)
+			// Presence, not equality with the map's zero value: a key nothing released reads back
+			// as the nil UUID, so comparing releasedBy[key] to the holder alone treated every value
+			// held by a document whose id IS the nil UUID as released, and let duplicates in.
+			released, wasReleased := releasedBy[key]
 			switch {
 			case !held:
 			case owner == write.DocID:
-			case releasedBy[key] == owner:
+			case wasReleased && released == owner:
 				// The holder is giving it up in this same transaction.
 			default:
 				violations = append(violations, uniqueViolation(index, op, key, owner))

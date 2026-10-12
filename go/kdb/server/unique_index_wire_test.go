@@ -218,3 +218,26 @@ func TestUniqueIndexOnADeclaredSchemaThatLacksTheConstraintIsRefused(t *testing.
 		t.Fatalf("the error should say what to do instead, got %q", *r.Error)
 	}
 }
+
+// A document may legitimately have the nil UUID as its id (`kdb put` accepts it). The unique
+// registry used to ask "was this key released in this transaction?" by comparing the holder with
+// releasedBy[key], and for a key nothing released the map returns the zero UUID - which is the
+// nil UUID. A value held by the nil-UUID document therefore looked "released" and every duplicate
+// went in.
+func TestUniqueValueHeldByTheNilUUIDDocumentIsProtected(t *testing.T) {
+	f := newUniqueFixture(t)
+	if r := f.sql(`CREATE UNIQUE INDEX u_email ON docs (email) USING HASH`); r.Error != nil {
+		t.Fatalf("create unique index: %s", *r.Error)
+	}
+	nilID := "00000000-0000-0000-0000-000000000000"
+	if r := f.c.upsert(t, "app/data", f.sess.SessionID, nilID, `{"email":"a@b.co"}`); r.Error != nil {
+		t.Fatalf("the nil-UUID document must be accepted: %s", *r.Error)
+	}
+	if r := f.put(`{"email":"a@b.co"}`); r.Error == nil {
+		t.Fatal("a duplicate of a value held by the nil-UUID document was accepted")
+	}
+	// ...and the holder can still rewrite its own value.
+	if r := f.c.upsert(t, "app/data", f.sess.SessionID, nilID, `{"email":"a@b.co","name":"again"}`); r.Error != nil {
+		t.Fatalf("the holder must be able to rewrite its own document: %s", *r.Error)
+	}
+}
