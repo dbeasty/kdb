@@ -1,0 +1,52 @@
+{
+  "name": "per-node-counter-max",
+  "comment": "The counter the user guide documents: each node raises only its own key of counts, the merge takes each key's max, and the total is the sum on read. A join of states (commutative, associative, idempotent), so it converges on the exact count whatever base or merge order a mesh produces (test_cluster_resolution.py). Keys come out sorted on both engines, since the merged body is compared byte for byte.",
+  "source": "function main(c) {\n  if (c.local === null || c.remote === null) { return { defer: true }; }\n  var a = c.local.counts || {}, b = c.remote.counts || {};\n  var max = {};\n  for (var k in a) { max[k] = a[k]; }\n  for (var k in b) { if (!(k in max) || b[k] > max[k]) { max[k] = b[k]; } }\n  var counts = {};\n  Object.keys(max).sort().forEach(function (k) { counts[k] = max[k]; });\n  var out = {};\n  Object.keys(c.local).sort().forEach(function (k) { out[k] = c.local[k]; });\n  out.counts = counts;\n  return { doc: out };\n}",
+  "input": {
+    "docId": "55555555-5555-4555-8555-555555555555",
+    "base": {
+      "id": "c",
+      "counts": {
+        "nodeA": 1
+      }
+    },
+    "local": {
+      "id": "c",
+      "counts": {
+        "nodeB": 5,
+        "nodeA": 3
+      }
+    },
+    "remote": {
+      "id": "c",
+      "counts": {
+        "nodeA": 2,
+        "nodeC": 4,
+        "nodeB": 6
+      }
+    },
+    "origins": {
+      "local": {
+        "nodeId": "nodeA",
+        "commit": "aa",
+        "timestampMicros": 100
+      },
+      "remote": {
+        "nodeId": "nodeC",
+        "commit": "cc",
+        "timestampMicros": 200
+      }
+    }
+  },
+  "expected": {
+    "kind": "doc",
+    "doc": {
+      "counts": {
+        "nodeA": 3,
+        "nodeB": 6,
+        "nodeC": 4
+      },
+      "id": "c"
+    }
+  }
+}

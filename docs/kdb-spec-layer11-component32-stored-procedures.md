@@ -398,8 +398,9 @@ by an application, only by a conflict.
 A resolution chain (`peersync.ResolutionChain`, `docs/kdb-user-guide.md`) settles a same-document
 conflict with declarative rules: prefer this node, prefer the valid side, merge disjoint fields,
 take the later write. Those cover the mechanical cases and none of the ones that are about what
-the data means — "a cancelled order stays cancelled", "sum the two counters", "keep both drafts
-and let someone choose". Expressing those needs code.
+the data means — "a cancelled order stays cancelled", "a counter keeps every node's increments",
+"keep both drafts and let someone choose". Expressing those needs code. (A counter has to be
+stored as per-node counts merged by max, §12.4.1, not merged by summing differences.)
 
 ### 12.2 Three positions, two guarantees
 
@@ -442,7 +443,7 @@ at which anyone can be told.
 ```
 {
   "docId":  "<uuid>",
-  "base":   <document | null>,      // the value both sides last agreed on
+  "base":   <document | null>,      // the value at ONE common ancestor (see §12.4.1)
   "local":  <document | null>,      // null where that side deleted the document
   "remote": <document | null>,
   "side0":  <document | null>,      // aliases of local/remote (see below)
@@ -487,6 +488,33 @@ refused — because a result that can be read two ways is a result two nodes mig
 
 A local transaction has no merge commit to put an extra document or a deletion in, so `fork` and
 `delete` are refused there rather than collapsed into storing one side.
+
+#### 12.4.1 What an in-merge procedure can rely on
+
+Merges are state-based and pairwise (`peersync/merge_resolution.go`), which fixes what a
+`RuleProcedure` sees:
+
+- **Called** only for a document whose bodies differ between the two heads and that both sides
+  changed since the divergence (or neither did and they still differ, after a criss-cross).
+- **Not called** when the bodies are byte-equal (`sameBody`; a pair of heads with equal trees is
+  settled by `joinSameContent` before any document is looked at), or when only one side changed
+  the document (that side is taken whole).
+- **`base`** is the document at `dag.CommonAncestor` of the canonically ordered parents: one
+  nearest common ancestor. With several (a criss-cross) only one is used, so it may be older than
+  what both sides really shared. `fields` is diffed against it.
+- **`origins`** name the commit that produced each side's body, looking through merges that kept a
+  parent's value; a body a merge built has that merge commit as its origin, and its timestamp.
+- The same procedure **runs on every node, possibly more than once over the same writes, in
+  different pairings and orders, and over earlier merge results** — its own included.
+
+So the only procedures that converge on a meaningful value are joins of states: deterministic,
+commutative, associative and idempotent in (`local`, `remote`), using `base` at most as a hint.
+Union of sets, max/min, a monotone status, and the per-node counter (`{counts: {<node>: n}}`,
+each node raising only its own key, merged by per-key max, total = sum on read) qualify. A delta
+merge (`local + remote - base`) does not: it is skipped when both sides reach the same value,
+double-counts over a stale base, and compounds over merge results.
+`kdb-integration/e2e/test_cluster_resolution.py` shows both on 3- and 5-node meshes, ordered and
+under load; the user guide carries the same contract for users.
 
 ### 12.5 Forking
 

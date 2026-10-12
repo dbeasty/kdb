@@ -1,6 +1,6 @@
 {
   "name": "sum-two-counters",
-  "comment": "The case the spec addendum names but never ships (§12.9): a counter both sides incremented. Taking either side loses one side's increment; this adds both deltas to the base instead, which is what 'sum the two counters' has to mean for a merge to lose no writes.",
+  "comment": "Runtime parity only - NOT a merge rule to copy. Both engines must compute base + both deltas alike, but as an in-merge resolver this is the documented anti-pattern (spec §12.4.1, user guide 'What a merge-time procedure can rely on'): a merge never offers a document both sides hold with the same value, base may be a stale common ancestor, and results feed later merges, so increments are lost or counted twice. per-node-counter-max.json is the counter to use.",
   "source": "function main(c) {\n  var base = c.base.count;\n  var localDelta = c.local.count - base;\n  var remoteDelta = c.remote.count - base;\n  return { doc: { count: base + localDelta + remoteDelta } };\n}",
   "input": {
     "docId": "33333333-3333-4333-8333-333333333333",
