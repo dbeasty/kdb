@@ -323,5 +323,17 @@ scan under a stamp (size + mtime; `storage.SegmentStamper`) and answering lowest
 graph on, close + checkpoint went 623 MB / 1.24 s -> 137 MB / 72 ms. The same fix helps the graph-off path (1,770 ->
 1,245 MB allocated), whose checkpoint still carries every commit - its peak is unchanged, as expected.
 
-Still open: an open still scans each segment once to fingerprint it against the checkpoint (a new process has an
-empty cache); persisting the stamps in the checkpoint would let an unchanged log skip that too.
+**Stamps in the checkpoint (done).** Each fingerprinted segment's stamp is stored in the checkpoint; an open whose
+covered segments all still carry their stamps trusts the fingerprints without reading the log, and anything else
+(a changed mtime, a missing stamp, an unfingerprinted covered segment) takes the full comparison with its damage
+handling. The tail replay lists only segments after the checkpoint. Older checkpoints have no stamps and take the
+full path; older builds ignore the new fields.
+
+## Startup flags
+
+| Setting | Env | Values | Effect |
+|---|---|---|---|
+| `graph.memory` | `KDB_GRAPH_MEMORY` | `kdb` (default), `go` | How the DAG holds commits in memory. `kdb`: fixed-width records in raw byte chunks the GC does not scan - the graph files' own format. `go`: a Go map of `document.Commit` structs, exactly as before this work; for A/B runs and as a fallback. |
+| `graph.file` | `KDB_GRAPH_FILE` | off (default), on | Map commits from segment files; checkpoints reference them. Forces `graph.memory=kdb`. |
+| `graph.rebuildCommits` | `KDB_GRAPH_REBUILD_COMMITS` | count (50,000) | Resident commits before a flush to a new segment. |
+| `graph.maxSegments` | `KDB_GRAPH_MAX_SEGMENTS` | count (8) | Segments before the next write is a full rewrite. |
