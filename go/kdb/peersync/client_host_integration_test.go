@@ -3,6 +3,7 @@ package peersync
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -248,7 +249,6 @@ func TestHostCommitPushAutoResolvesSameDocumentConflictUnderLastWritePolicy(t *t
 
 	sharedDoc := newUUID(t)
 	writeDoc(t, hostSide, ns, genesis, sharedDoc, `{"v":"host"}`)
-	awaitNextTimestamp() // the incoming write must be the later one
 	incomingCommit := writeDoc(t, incomingSide, ns, genesis, sharedDoc, `{"v":"incoming"}`)
 
 	w := wire.NewCodec(wire.EncodingJSON)
@@ -612,12 +612,22 @@ func TestPullMissingMaterializesFetchedCommitIntoLocalStorage(t *testing.T) {
 	}
 }
 
-// awaitNextTimestamp returns once codec.TimestampNow has moved past its value at the call. Windows
-// advances the wall clock in ticks of up to ~16ms, so two writes made back to back there can carry
-// the same timestamp and "the later write" falls to the hash tie-break instead.
-func awaitNextTimestamp() {
-	start := codec.TimestampNow().EpochMicros()
-	for codec.TimestampNow().EpochMicros() == start {
-		time.Sleep(100 * time.Microsecond)
+// nextTimestamp is codec.TimestampNow made strictly increasing across the package's tests, so a
+// commit written after another is later by timestamp, as last-write resolution assumes. Windows
+// advances the wall clock in ticks of up to ~16ms, so back-to-back writes there would otherwise tie
+// and fall to the hash tie-break.
+var lastTestTimestamp struct {
+	sync.Mutex
+	micros int64
+}
+
+func nextTimestamp() codec.Timestamp {
+	lastTestTimestamp.Lock()
+	defer lastTestTimestamp.Unlock()
+	m := codec.TimestampNow().EpochMicros()
+	if m <= lastTestTimestamp.micros {
+		m = lastTestTimestamp.micros + 1
 	}
+	lastTestTimestamp.micros = m
+	return codec.TimestampFromEpochMicros(m)
 }

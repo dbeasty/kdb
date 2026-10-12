@@ -128,7 +128,7 @@ func replaceDocAt(t *testing.T, s side, ns string, parent codec.Hash, docID code
 			document.DeleteOp{DocID: docID},
 			document.WriteOp{DocID: docID, Patch: json},
 		},
-		Timestamp:    codec.TimestampNow(),
+		Timestamp:    nextTimestamp(),
 		AuthorNodeID: authorID,
 	}
 	commit, err := s.dag.AppendCommitDetached(tx, parent, tree, nil, "test replace")
@@ -223,7 +223,7 @@ func TestMergeReadsTheLastOperationOnADocument(t *testing.T) {
 			document.WriteOp{DocID: shared, Patch: `{"v":2}`},
 			document.DeleteOp{DocID: shared},
 		},
-		Timestamp:    codec.TimestampNow(),
+		Timestamp:    nextTimestamp(),
 		AuthorNodeID: authorID,
 	}
 	c1, err := c.dag.AppendCommitDetached(tx, ch, tree, nil, "write then delete")
