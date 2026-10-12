@@ -120,6 +120,7 @@ func (d *InMemoryCommitDag) attachLocked(nb *graphBase) {
 			delete(d.txIndex, tx)
 		}
 	}
+	d.txIndex = shrunk(d.txIndex) // see nodeStore.attach
 	// What the base answers is now the same graph, so ancestry memos stay valid; the head
 	// snapshot holds a copy and is unaffected. Nothing to republish.
 }

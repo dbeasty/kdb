@@ -65,6 +65,12 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Clear every variable first: a case names only what it sets, and anything the
+			// surrounding environment exports (KDB_GRAPH_FILE=on for a whole-suite run, say)
+			// would otherwise leak into a case that asserts it is off.
+			for _, k := range []string{"KDB_ANCESTRY_PRUNING", "KDB_GRAPH_FILE", "KDB_GRAPH_REBUILD_COMMITS", "KDB_HISTORY_ANCHOR_INTERVAL"} {
+				t.Setenv(k, "")
+			}
 			for k, v := range tc.env {
 				t.Setenv(k, v)
 			}

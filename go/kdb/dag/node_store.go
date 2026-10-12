@@ -624,6 +624,23 @@ func (s *nodeStore) attach(nb *graphBase) {
 		old.close()
 	}
 	s.compactSlab()
+	// A Go map never gives back its buckets, so an index that held a million commits before the
+	// attach moved them out would keep costing what it cost then. Copying it is O(what is left).
+	s.index = shrunk(s.index)
+	s.messages = shrunk(s.messages)
+	s.extra = shrunk(s.extra)
+}
+
+// shrunk returns m in a map sized for what it holds now.
+func shrunk[K comparable, V any](m map[K]V) map[K]V {
+	if m == nil {
+		return nil
+	}
+	out := make(map[K]V, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 func mustFind(b *graphBase, h codec.Hash) int {
