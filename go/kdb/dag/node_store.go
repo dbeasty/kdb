@@ -68,6 +68,15 @@ type nodeStore struct {
 	// resident tier and every other field above is unused; segments are never attached.
 	goMode  bool
 	goNodes map[codec.Hash]goNode
+
+	// recent is the last commit put, held whole, so the lookups that follow every append - the
+	// head snapshot, the next transaction reading its parent, the causal timestamp - get back
+	// the stored struct the way the Go map always handed it out, instead of decoding the record
+	// (six allocations per write). One commit, so it costs the collector nothing worth counting.
+	// Kept current by every path that changes a commit (put, replace, setOps, delete); cleared
+	// whenever it might not be.
+	recent   document.Commit
+	recentOK bool
 }
 
 // goNode is one commit in GraphMemoryGo - exactly the old commitNode.
@@ -239,7 +248,27 @@ func (s *nodeStore) internNamespace(ns string) uint16 {
 	return uint16(len(s.namespaces) - 1)
 }
 
+// timestamp is a commit's timestamp without building the commit.
+func (s *nodeStore) timestamp(h codec.Hash) (codec.Timestamp, bool) {
+	if s.goMode {
+		n, ok := s.goNodes[h]
+		return n.commit.Timestamp, ok
+	}
+	var r []byte
+	if i, ok := s.index[h]; ok {
+		r = s.at(i)
+	} else if b, pos, ok := s.segPos(h); ok {
+		r = b.rec(pos)
+	} else {
+		return codec.Timestamp{}, false
+	}
+	return codec.Timestamp{EpochMillis: int64(le.Uint64(r[grEpochMs:])), MicroRemainder: int(int64(le.Uint64(r[grMicro:])))}, true
+}
+
 func (s *nodeStore) setOps(h codec.Hash, ops []document.Op) {
+	if s.recentOK && s.recent.Hash == h {
+		s.recent.Operations = ops
+	}
 	if len(ops) > 0 {
 		if s.ops == nil {
 			s.ops = make(map[codec.Hash][]document.Op)
@@ -256,6 +285,7 @@ func (s *nodeStore) put(c document.Commit, gen uint32) {
 		s.goNodes[c.Hash] = goNode{commit: c, generation: gen}
 		return
 	}
+	s.recent, s.recentOK = c, true
 	if _, resident := s.index[c.Hash]; !resident {
 		if b, pos, ok := s.segPos(c.Hash); ok {
 			// Already on disk. A commit's hash covers everything a record carries, so the only
@@ -334,6 +364,9 @@ func (s *nodeStore) delete(h codec.Hash) {
 		delete(s.goNodes, h)
 		return
 	}
+	if s.recentOK && s.recent.Hash == h {
+		s.recent, s.recentOK = document.Commit{}, false
+	}
 	if i, ok := s.index[h]; ok {
 		s.freeSlot(h, i)
 	}
@@ -355,6 +388,9 @@ func (s *nodeStore) commit(h codec.Hash) (document.Commit, bool) {
 	if s.goMode {
 		n, ok := s.goNodes[h]
 		return n.commit, ok
+	}
+	if s.recentOK && s.recent.Hash == h && s.has(h) {
+		return s.recent, true
 	}
 	if i, ok := s.index[h]; ok {
 		r := s.at(i)

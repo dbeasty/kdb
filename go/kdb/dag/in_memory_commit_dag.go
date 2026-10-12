@@ -1035,8 +1035,8 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 func (d *InMemoryCommitDag) causalTimestampLocked(ts codec.Timestamp, parents []codec.Hash) codec.Timestamp {
 	micros := ts.EpochMicros()
 	for _, p := range parents {
-		if c, ok := d.commitLocked(p); ok {
-			if pm := c.Timestamp.EpochMicros(); pm >= micros {
+		if pts, ok := d.nodes.timestamp(p); ok {
+			if pm := pts.EpochMicros(); pm >= micros {
 				micros = pm + 1
 			}
 		}
