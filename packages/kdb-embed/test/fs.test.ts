@@ -84,7 +84,7 @@ describe("PersistentFs semantics", () => {
     await call(api, "read", r, first, 0, 4, null);
     const rest = new Uint8Array(20);
     const n = await call<number>(api, "read", r, rest, 0, 20, null);
-    assert.equal(text(first) + text(rest.subarray(0, n)), "onetwothree");
+    assert.equal(text(first)! + text(rest.subarray(0, n))!, "onetwothree");
   });
 
   it("truncates down and up, zero-filling growth", async () => {
