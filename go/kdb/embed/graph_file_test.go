@@ -310,3 +310,64 @@ func TestGraphCheckpointMissingSegmentReplays(t *testing.T) {
 		t.Fatal("history lost when the named segments were missing")
 	}
 }
+
+// A checkpoint stamps the segments it fingerprints, so an open over an unchanged log can trust
+// them without reading the log; a segment changed in place loses that and is compared in full.
+func TestCheckpointStampsLetOpenSkipTheScan(t *testing.T) {
+	root := t.TempDir()
+	const ns = "test/stamps"
+	opts := FileRuntimeOptions{}
+	opts.Storage.MemoryBudgetBytes = 1 << 20
+	opts.Storage.DeltaMaxSegmentBytes = 4 << 10 // several segments
+	rt, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRevs(t, rt, ns, 0, 80)
+	rt.Close()
+
+	cp, ok := readCheckpoint(rt.shim, ns)
+	if !ok || len(cp.Segments) < 2 {
+		t.Fatalf("want a checkpoint over several segments, have %d", len(cp.Segments))
+	}
+	for _, sg := range cp.Segments {
+		if !sg.HasStamp {
+			t.Fatalf("segment %d fingerprinted without a stamp", sg.Sequence)
+		}
+	}
+
+	rt2, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unchangedSinceCheckpoint(cp, rt2.deltaReader) {
+		t.Fatal("an untouched log was not recognised as unchanged")
+	}
+	rt2.Close()
+
+	// Touch one covered segment in place: same bytes, new mtime. Unchanged must now say no, and
+	// the full comparison - which still matches, since the bytes are the same - takes over.
+	cp, _ = readCheckpoint(rt2.shim, ns)
+	seg := filepath.Join(root, "ns", ns, "delta", fmt.Sprintf("%020d.seg", cp.Segments[0].Sequence))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rt3, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt3.Close()
+	if unchangedSinceCheckpoint(cp, rt3.deltaReader) {
+		t.Fatal("a rewritten segment was trusted on its stamp")
+	}
+	if ok, why := checkpointMatchesLog(cp, rt3.deltaReader); !ok {
+		t.Fatalf("the full comparison rejected identical bytes: %s", why)
+	}
+	if rt3.Recovery().ReplayedInFull {
+		t.Fatal("identical bytes under a new mtime forced a full replay")
+	}
+}

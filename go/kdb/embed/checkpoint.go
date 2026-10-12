@@ -110,6 +110,9 @@ func checkpointRegistry() *schema.Registry {
 				{ID: 1, Name: "sequence", Type: cpI64},
 				{ID: 2, Name: "sizeBytes", Type: cpI64},
 				{ID: 3, Name: "lastCommitHash", Type: cpHash},
+				// Optional, absent from checkpoints written before stamps: see checkpointSegment.
+				{ID: 4, Name: "stampSize", Type: cpI64, Default: codec.Int64Value{V: -1}},
+				{ID: 5, Name: "stampModTimeNanos", Type: cpI64, Default: codec.Int64Value{V: 0}},
 			},
 		})
 		r.RegisterRecord(&schema.RecordSchema{
@@ -200,6 +203,12 @@ type checkpointSegment struct {
 	Sequence       int64
 	SizeBytes      int64
 	LastCommitHash codec.Hash
+	// Stamp is the segment's size and modification time when the checkpoint was written
+	// (storage.SegmentStamp), when the store could vouch for it. A segment whose stamp is still
+	// the same at open is the segment that was fingerprinted, so open need not scan it again -
+	// which, before stamps, meant reading the whole delta log on every open.
+	Stamp    storage.SegmentStamp
+	HasStamp bool
 }
 
 func checkpointKey(namespaceID string) string {
@@ -298,11 +307,16 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 
 	segs := make([]codec.Value, 0, len(cp.Segments))
 	for _, sg := range cp.Segments {
-		segs = append(segs, codec.RecordValue{Fields: map[int]codec.Value{
+		fields := map[int]codec.Value{
 			1: codec.Int64Value{V: sg.Sequence},
 			2: codec.Int64Value{V: sg.SizeBytes},
 			3: cpHashVal(sg.LastCommitHash),
-		}})
+		}
+		if sg.HasStamp {
+			fields[4] = codec.Int64Value{V: sg.Stamp.Size}
+			fields[5] = codec.Int64Value{V: sg.Stamp.ModTimeNanos}
+		}
+		segs = append(segs, codec.RecordValue{Fields: fields})
 	}
 
 	heads := make([]codec.Value, 0, len(cp.HeadCommits))
@@ -529,9 +543,14 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 		if err != nil {
 			return out, err
 		}
-		out.Segments = append(out.Segments, checkpointSegment{
-			Sequence: seq.V, SizeBytes: size.V, LastCommitHash: last,
-		})
+		fp := checkpointSegment{Sequence: seq.V, SizeBytes: size.V, LastCommitHash: last}
+		if st, ok := sr.Fields[4].(codec.Int64Value); ok && st.V >= 0 {
+			if mt, ok := sr.Fields[5].(codec.Int64Value); ok {
+				fp.Stamp = storage.SegmentStamp{Size: st.V, ModTimeNanos: mt.V}
+				fp.HasStamp = true
+			}
+		}
+		out.Segments = append(out.Segments, fp)
 	}
 	headsArr, _ := rec.Fields[9].(codec.ArrayValue)
 	for _, el := range headsArr.Elements {
@@ -585,16 +604,26 @@ func segmentFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpo
 	if err != nil {
 		return nil, err
 	}
+	stamper, canStamp := r.(storage.DeltaSegmentStamper)
 	var out []checkpointSegment
 	for _, seg := range segments {
 		if seg.SequenceNumber > through {
 			continue
 		}
-		out = append(out, checkpointSegment{
+		fp := checkpointSegment{
 			Sequence:       seg.SequenceNumber,
 			SizeBytes:      seg.SizeBytes,
 			LastCommitHash: seg.LastCommitHash,
-		})
+		}
+		if canStamp {
+			// Stamped after listing: a segment that changed in between gets a stamp that will
+			// not match the fingerprint's contents at open, which costs a scan, never a miss -
+			// the mismatch is on the side of scanning.
+			if st, ok, err := stamper.StampSegment(seg.SequenceNumber); err == nil && ok && st.Size >= seg.SizeBytes {
+				fp.Stamp, fp.HasStamp = st, true
+			}
+		}
+		out = append(out, fp)
 	}
 	return out, nil
 }
@@ -610,7 +639,48 @@ func segmentFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpo
 // direction is the worst failure available here - too strict and a
 // truncated namespace replays its whole (now incomplete) log on every
 // open, too loose and real damage opens cleanly with data silently gone.
+// unchangedSinceCheckpoint reports, without reading any segment, that every segment the checkpoint
+// fingerprinted is still there with the stamp it had then, and that no segment it covers has
+// appeared since - in which case the log says exactly what it said and the fingerprints match.
+// Any doubt (a missing stamp, a store that cannot stamp, any difference at all) is false, and the
+// caller does the full comparison, damage handling included.
+func unchangedSinceCheckpoint(cp namespaceCheckpoint, r storage.DeltaSegmentReader) bool {
+	stamper, ok1 := r.(storage.DeltaSegmentStamper)
+	lister, ok2 := r.(storage.DeltaSegmentSequenceLister)
+	if !ok1 || !ok2 {
+		return false
+	}
+	seqs, err := lister.SegmentSequences()
+	if err != nil {
+		return false
+	}
+	wanted := make(map[int64]bool, len(cp.Segments))
+	for _, want := range cp.Segments {
+		if want.Sequence < cp.FloorSequence {
+			wanted[want.Sequence] = true
+			continue // deliberately truncated; checkpointMatchesLog skips these too
+		}
+		if !want.HasStamp {
+			return false
+		}
+		st, ok, err := stamper.StampSegment(want.Sequence)
+		if err != nil || !ok || st != want.Stamp {
+			return false
+		}
+		wanted[want.Sequence] = true
+	}
+	for _, seq := range seqs {
+		if seq <= cp.ThroughSequence && seq >= cp.FloorSequence && !wanted[seq] {
+			return false // a segment the checkpoint covers but never fingerprinted
+		}
+	}
+	return true
+}
+
 func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) (bool, string) {
+	if unchangedSinceCheckpoint(cp, r) {
+		return true, ""
+	}
 	current, err := segmentFingerprints(r, cp.ThroughSequence)
 	if err != nil {
 		return false, "the delta segments could not be listed"

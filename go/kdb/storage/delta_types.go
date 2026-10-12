@@ -77,6 +77,18 @@ type DeltaSegmentSequenceLister interface {
 	SegmentSequences() ([]int64, error)
 }
 
+// DeltaSegmentRangeLister is implemented by readers that can list only the segments after a
+// sequence number, scanning nothing below it - for a replay that resumes from a checkpoint.
+type DeltaSegmentRangeLister interface {
+	ListSegmentsAfter(afterSequence int64) ([]DeltaSegmentRef, error)
+}
+
+// DeltaSegmentStamper is implemented by readers that can stamp a segment by sequence number
+// without reading it (see SegmentStamp). ok is false when the segment cannot be vouched for.
+type DeltaSegmentStamper interface {
+	StampSegment(sequence int64) (stamp SegmentStamp, ok bool, err error)
+}
+
 type DeltaSegmentReader interface {
 	NamespaceID() string
 	ReadAll(segment DeltaSegmentRef) ([]DeltaRecord, error)

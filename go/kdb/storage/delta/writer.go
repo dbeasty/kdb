@@ -320,6 +320,30 @@ func (r *DefaultReader) ReadRange(segment storage.DeltaSegmentRef, sinceCommit, 
 // where damage is refused, because a checkpoint may already hold everything a damaged segment
 // recorded (embed's damagedInPlace); replay refuses a damaged segment it actually has to read.
 func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
+	return r.listSegments(-1)
+}
+
+// ListSegmentsAfter is ListSegments limited to sequence numbers above afterSequence. Segments at
+// or below it are not scanned at all.
+func (r *DefaultReader) ListSegmentsAfter(afterSequence int64) ([]storage.DeltaSegmentRef, error) {
+	return r.listSegments(afterSequence)
+}
+
+var _ storage.DeltaSegmentRangeLister = (*DefaultReader)(nil)
+
+// StampSegment stamps a segment by sequence number, for a caller that recorded a stamp and wants
+// to know whether the segment is still what it was then.
+func (r *DefaultReader) StampSegment(sequence int64) (storage.SegmentStamp, bool, error) {
+	stamper, can := r.shim.(storage.SegmentStamper)
+	if !can {
+		return storage.SegmentStamp{}, false, nil
+	}
+	return stamper.SegmentStamp(storio.SegmentNameBuilder.DeltaSequenced(r.namespaceID, sequence))
+}
+
+var _ storage.DeltaSegmentStamper = (*DefaultReader)(nil)
+
+func (r *DefaultReader) listSegments(afterSequence int64) ([]storage.DeltaSegmentRef, error) {
 	prefix := storio.SegmentNameBuilder.NamespacePrefix(r.namespaceID) + "delta/"
 	names, err := r.shim.ListSegments(r.namespaceID)
 	if err != nil {
@@ -340,6 +364,9 @@ func (r *DefaultReader) ListSegments() ([]storage.DeltaSegmentRef, error) {
 			// data directory after a successful open - surface it the same
 			// way rather than silently skipping possibly-unread commits.
 			return nil, &LegacySegmentFormatError{NamespaceID: r.namespaceID, Names: []string{name}}
+		}
+		if seq <= afterSequence {
+			continue
 		}
 		ref, err := r.cachedScanSegmentRef(name, seq)
 		if err == nil && ref == nil {
