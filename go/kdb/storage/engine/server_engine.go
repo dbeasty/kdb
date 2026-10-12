@@ -623,7 +623,10 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 		}
 		return &loaded, true
 	}
-	window := make([]scanEntry, 0, scanWindowDocs)
+	// Sized to the tree, not the window cap: a full window is 1.5 MiB, and allocating it up front
+	// made every scan of a 100-document namespace pay that. A tree no larger than the cap still
+	// fits in one window, so the one-decode-per-frame property is unchanged.
+	window := make([]scanEntry, 0, min(scanWindowDocs, tree.Size()))
 	flush := func() bool {
 		prefetched := e.prefetchWindow(window)
 		for _, entry := range window {
