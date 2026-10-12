@@ -340,6 +340,7 @@ func (h *Host) CloseNamespace(namespaceID string) error {
 	if !ok || entry == nil || entry.close == nil {
 		return nil
 	}
+	entry.rt.runCloseHooks()
 	// Before the storage close, so the namespaces that are staying get the room back at the
 	// moment it stops being used rather than at the next tick.
 	h.arbiter.Unregister(namespaceID)
@@ -388,6 +389,9 @@ func (h *Host) Close() error {
 
 	var firstErr error
 	for _, id := range ids {
+		if e := entries[id]; e != nil {
+			e.rt.runCloseHooks()
+		}
 		if e := entries[id]; e != nil && e.close != nil {
 			if err := e.close(); err != nil && firstErr == nil {
 				firstErr = err

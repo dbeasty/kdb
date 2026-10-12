@@ -241,3 +241,90 @@ func TestUniqueValueHeldByTheNilUUIDDocumentIsProtected(t *testing.T) {
 		t.Fatalf("the holder must be able to rewrite its own document: %s", *r.Error)
 	}
 }
+
+// Arrays are multikey: each element is its own claim, as in a MongoDB unique index. This is how a
+// rule over a list - one external login linked to one account - is stated at all.
+func TestUniqueIndexOverAnArrayClaimsEachElement(t *testing.T) {
+	f := newUniqueFixture(t)
+	if r := f.sql(`CREATE UNIQUE INDEX u_logins ON docs (logins) USING HASH`); r.Error != nil {
+		t.Fatalf("create unique index: %s", *r.Error)
+	}
+	if r := f.put(`{"logins":["google:1","github:7"]}`); r.Error != nil {
+		t.Fatalf("the first document must be accepted: %s", *r.Error)
+	}
+	dup := f.put(`{"logins":["gitlab:3","github:7"]}`)
+	if dup.Error == nil {
+		t.Fatal("a list sharing one element with another document's list went in")
+	}
+	if dup.ErrorCode == nil || *dup.ErrorCode != wire.ErrorCodeUniqueViolation {
+		t.Fatalf("want UNIQUE_VIOLATION, got code %v (%s)", dup.ErrorCode, *dup.Error)
+	}
+	if r := f.put(`{"logins":["gitlab:3"]}`); r.Error != nil {
+		t.Fatalf("a refused write must not have claimed its other elements: %s", *r.Error)
+	}
+	if r := f.put(`{"logins":[]}`); r.Error != nil {
+		t.Fatalf("an empty list claims nothing: %s", *r.Error)
+	}
+}
+
+func TestDroppingAnArrayElementReleasesIt(t *testing.T) {
+	f := newUniqueFixture(t)
+	if r := f.sql(`CREATE UNIQUE INDEX u_logins ON docs (logins)`); r.Error != nil {
+		t.Fatal(*r.Error)
+	}
+	holder, _ := codec.RandomUUID()
+	if r := f.c.upsert(t, "app/data", f.sess.SessionID, holder.String(), `{"logins":["google:1","github:7"]}`); r.Error != nil {
+		t.Fatal(*r.Error)
+	}
+	// The holder rewrites its own list, keeping one element and adding one: no conflict with itself.
+	if r := f.c.upsert(t, "app/data", f.sess.SessionID, holder.String(), `{"logins":["google:1","gitlab:3"]}`); r.Error != nil {
+		t.Fatalf("a document must be able to rewrite its own list: %s", *r.Error)
+	}
+	if r := f.put(`{"logins":["github:7"]}`); r.Error != nil {
+		t.Fatalf("the element the holder dropped must be free: %s", *r.Error)
+	}
+	if r := f.put(`{"logins":["gitlab:3"]}`); r.Error == nil {
+		t.Fatal("the element the holder added is not protected")
+	}
+}
+
+func TestConcurrentClaimsOfOneArrayElementLetExactlyOneIn(t *testing.T) {
+	f := newUniqueFixture(t)
+	if r := f.sql(`CREATE UNIQUE INDEX u_logins ON docs (logins)`); r.Error != nil {
+		t.Fatal(*r.Error)
+	}
+	const racers = 12
+	var wg sync.WaitGroup
+	results := make([]wire.UpsertResultMessage, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c := dialRawWireClient(t, f.addr)
+			c.handshake(t, wire.ClientSQL, "app/data")
+			sess := c.sessionBegin(t, "app/data", "READ_COMMITTED")
+			id, _ := codec.RandomUUID()
+			// Each racer's list is otherwise its own; they collide only on the shared element.
+			results[i] = c.upsert(t, "app/data", sess.SessionID, id.String(), fmt.Sprintf(`{"logins":["own:%d","shared:1"]}`, i))
+		}(i)
+	}
+	wg.Wait()
+	won := 0
+	for _, r := range results {
+		if r.Error == nil {
+			won++
+		}
+	}
+	if won != 1 {
+		t.Fatalf("%d of %d concurrent claims of one element succeeded; exactly one may", won, racers)
+	}
+}
+
+func TestUniqueIndexOverAnArrayRefusesOverlappingExistingData(t *testing.T) {
+	f := newUniqueFixture(t)
+	f.put(`{"logins":["google:1","github:7"]}`)
+	f.put(`{"logins":["github:7"]}`)
+	if r := f.sql(`CREATE UNIQUE INDEX u_logins ON docs (logins)`); r.Error == nil {
+		t.Fatal("the constraint was installed over lists that already share an element")
+	}
+}

@@ -17,9 +17,10 @@ import (
 // open is not in the registry).
 //
 // The operationally interesting field is none of the descriptor's own: it is how far behind head
-// the registry is. An index is written on the commit path and snapshotted every 64 commits
-// (indexFlushEvery), so "current" is a question with a real answer, and a query planned against a
-// stale index is the kind of thing that is invisible until someone notices wrong results.
+// the registry is. An index is written on the commit path and snapshotted in the background once
+// commits go quiet (server.indexFlushIdle), so "current" is a question with a real answer, and a
+// query planned against a stale index is the kind of thing that is invisible until someone
+// notices wrong results.
 
 func (s *Server) handleIndexes(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
 	provider, ok := rt.SQLIndexProvider().(*server.RegistryIndexProvider)

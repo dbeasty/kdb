@@ -865,7 +865,11 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 		// Applied under the gate so index state advances in commit order. The hints ride along
 		// on the commit for replication.
 		if indexProvider != nil {
-			hints, err := indexProvider.commitToIndexes(preparedIndexes, r.Commit.Hash)
+			stored, err := indexProvider.preparedForStored(tx.Operations, preparedIndexes, r.Commit.Operations)
+			if err != nil {
+				return document.Commit{}, err
+			}
+			hints, err := indexProvider.commitToIndexes(stored, r.Commit.Hash)
 			if err != nil {
 				return document.Commit{}, err
 			}

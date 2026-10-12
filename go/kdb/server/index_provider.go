@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/index"
@@ -24,8 +25,8 @@ import (
 // package stays free of any server or sql import, and the sql package never learns what a
 // registry is.
 //
-// Every method is safe for concurrent use: the registry is, and this type holds no mutable
-// state of its own beyond the pointers set at construction.
+// Every method is safe for concurrent use: the registry is, and this type's own persistence
+// state is guarded by persistMu and applyMu.
 type RegistryIndexProvider struct {
 	registry *index.Registry
 	runtime  *KdbServerRuntime
@@ -34,9 +35,25 @@ type RegistryIndexProvider struct {
 	// opts are the store options this registry was opened with, kept so a store added by
 	// CREATE INDEX is built the same way as one loaded from disk.
 	opts stores.Options
-	// flushed counts index-touching commits since the last save. Only ever touched from the
-	// commit path, which the write gate already serialises.
-	flushed int
+
+	// applyMu makes applying one commit to every store a single step with respect to a snapshot
+	// capture, so a capture never sees a commit half-applied. Commits already run one at a time
+	// under the write gate; the only other taker is the capture.
+	applyMu sync.Mutex
+	// inconsistent is set (under applyMu) when a commit failed part-way through its stores; no
+	// snapshot is written until a full rebuild clears it.
+	inconsistent bool
+
+	// persistMu serializes everything that writes the index directory or must not interleave
+	// with a snapshot capture: the flusher, DDL, rebuilds and Close. Taken before applyMu.
+	persistMu sync.Mutex
+	// saved is the store generation on disk for each index (under persistMu); savedHead is the
+	// head the manifests on disk name.
+	saved        map[codec.UUID]uint64
+	savedHead    codec.Hash
+	hasSavedHead bool
+	closed       bool
+	flusher      *indexFlusher
 }
 
 // NewRegistryIndexProvider wires reg to rt. rt supplies the head commit, document bodies for
@@ -298,19 +315,33 @@ func (p *RegistryIndexProvider) createIndexLocal(stmt sql.StmtCreateIndex, ctx s
 	if err != nil {
 		return err
 	}
+	if p.runtime == nil {
+		_, err := p.registry.Add(desc)
+		return err
+	}
+	// Held from Add to the catalog write, so the flusher never captures the new store before
+	// it is built.
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
 	if _, err := p.registry.Add(desc); err != nil {
 		return err
 	}
-	if p.runtime == nil {
-		return nil
+	// An index of the same id dropped earlier may have left a snapshot whose manifest names
+	// this very head; it must not be read back as the new index's content.
+	if p.dir != "" && !p.closed {
+		if err := index.InvalidateStoreSnapshot(index.IndexDir(p.dir, desc.IndexID)); err != nil {
+			p.registry.Remove(desc.IndexName())
+			return err
+		}
+		delete(p.saved, desc.IndexID)
 	}
-	if err := p.runtime.rebuildIndex(desc.IndexID); err != nil {
+	if err := p.rebuildLocked([]codec.UUID{desc.IndexID}); err != nil {
 		// A rebuild that fails leaves a registered but empty index, which would answer
 		// queries with silently wrong results - the one outcome this layer exists to remove.
 		p.registry.Remove(desc.IndexName())
 		return err
 	}
-	return p.runtime.saveIndexCatalog()
+	return p.saveCatalogLocked()
 }
 
 // DropIndex removes an index by name.
@@ -328,13 +359,18 @@ func (p *RegistryIndexProvider) DropIndex(stmt sql.StmtDropIndex, ctx sql.QueryC
 
 // dropIndexLocal is DropIndex without recording.
 func (p *RegistryIndexProvider) dropIndexLocal(stmt sql.StmtDropIndex, ctx sql.QueryContext) error {
+	if p.runtime == nil {
+		if _, ok := p.registry.Remove(stmt.Name); !ok {
+			return fmt.Errorf("index not found: %s", stmt.Name)
+		}
+		return nil
+	}
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
 	if _, ok := p.registry.Remove(stmt.Name); !ok {
 		return fmt.Errorf("index not found: %s", stmt.Name)
 	}
-	if p.runtime == nil {
-		return nil
-	}
-	return p.runtime.saveIndexCatalog()
+	return p.saveCatalogLocked()
 }
 
 // descriptorFor builds the index descriptor a CREATE INDEX statement asks for, validating the
