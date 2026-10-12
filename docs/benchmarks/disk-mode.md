@@ -101,6 +101,37 @@ Raw JSON for every phase is what `scripts/bench-disk.sh` prints.
    full scan, against 215 MB on disk. After a restart the process starts at 1.3 GB at 1M
    (138 MB at 100k) before any query.
 
+## After the fixes this run motivated
+
+The first run above exposed two defects, both now fixed (same machine, same commands, nothing else
+heavy running; the first table is kept as the "before"):
+
+| | before | after |
+|---|---:|---:|
+| Bulk write, first 100k docs | 49k docs/s | 58k docs/s |
+| Bulk write, 1M docs total | 1,046 docs/s (955 s) | 50.6k docs/s (19.8 s) |
+| First full scan after a restart, 10k | ~4 s | 36 ms |
+| First full scan after a restart, 100k | 60 s | 0.64 s |
+| First full scan after a restart, 1M | 26.6 min | 21 s |
+| Same scan, warm, 1M | 1.2 s | 1.2 s |
+
+**Bulk write collapsed past ~100k documents** because `docHashShard.evictLocked` walked the whole
+recency list on every `Put`, skipping the pinned entries - and the live tree is pinned, so once a
+shard's live data exceeded its budget every commit scanned every live document in the shard
+(CPU profile: 72% of the load in that loop). Pinned entries now stay off the list.
+
+**The first scan after a restart** decoded the whole delta-log commit a document lives in, once
+for every document in it: a namespace loaded in 1,000-document commits cost 1,000x the decoding
+(142 GB of allocation and 3,100 GCs for a 100k scan - the profile attributed the time to syscalls,
+which was a macOS sampling artifact; reads themselves totalled 0.65 s). `ScanDocuments` now
+resolves a window of entries first and decodes each frame once per window. The remaining
+superlinearity (0.64 s at 100k, 21 s at 1M) is frames being re-decoded once per 32k-entry window;
+a larger window or a frame-ordered scan would flatten it at the cost of holding more bodies.
+
+Not fixed, and still worth knowing: resident memory after a restart plus a full scan is ~2.2 GB
+at 1M documents (about 2.2 KB per document against ~215 MB on disk), and a cold point read
+(`get` after a restart) still costs ~0.5 ms because it decodes its whole commit frame.
+
 ## Limits of this run
 
 - Single node, single writer, one namespace, ~200-byte documents, schemaless (no declared fields
