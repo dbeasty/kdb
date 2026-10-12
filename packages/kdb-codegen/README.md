@@ -45,7 +45,7 @@ import { connect } from "@kdb/client";
 import { bind } from "./kdb.ts";
 
 const db = bind(await connect("ws://localhost:9090/kdb"));
-await db.users.create();                       // installs the schema (CREATE TABLE)
+await db.users.ensure();                       // installs the schema (CREATE TABLE) if the namespace has none
 
 await db.users.insert({ name: "ann", age: 30, tier: "pro" }).execute();
 
@@ -92,6 +92,9 @@ generated file is stale against the server.
 
 Every caller-supplied value is a bound `?` parameter. Identifiers come from the generated schema,
 never from the caller. `update()`/`deleteFrom()` without a `WHERE` throw unless you say `.all()`.
+
+`create()` always runs `CREATE TABLE`; `ensure()` is the one to call on every start, because the engine does
+not restore a SQL-defined schema when a store is reopened (see `@kdb/embed`'s `persist`).
 
 ## Limits
 

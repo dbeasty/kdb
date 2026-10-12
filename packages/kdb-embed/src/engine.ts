@@ -6,6 +6,7 @@
  * runtime: embedded databases are isolated from one another the way separate processes are.
  */
 
+import type { PersistentFs } from "./fs.ts";
 import { LoopbackTransport, type EngineHandle } from "./loopback.ts";
 
 export type WasmSource = WebAssembly.Module | BufferSource | URL | string | Response | Promise<Response>;
@@ -17,7 +18,11 @@ interface GoGlue {
 type GoCtor = new () => GoGlue;
 
 interface EmbedApi {
-  open(namespaces: string[], onFrame: (frame: Uint8Array) => void): EngineHandle | { error: string };
+  open(
+    namespaces: string[],
+    onFrame: (frame: Uint8Array) => void,
+    options?: { dataRoot?: string },
+  ): Promise<EngineHandle | { error: string }>;
 }
 
 const isNode = typeof process !== "undefined" && process.versions?.node !== undefined;
@@ -82,6 +87,7 @@ export async function startEngine(
   namespaces: string[],
   module: WebAssembly.Module,
   glue?: string | URL,
+  storage?: { fs: PersistentFs; dataRoot: string },
 ): Promise<StartedEngine> {
   await loadGlue(glue);
   const Go = (globalThis as unknown as { Go: GoCtor }).Go;
@@ -98,12 +104,24 @@ export async function startEngine(
   // take it immediately and remove it before anyone else can start - run() executes Go's main
   // synchronously up to its first block, which is where the API is registered.
   takeApi();
-  const exited = go.run(instance);
+  // Go's syscall package captures `globalThis.fs` while it initialises, which happens synchronously
+  // inside run(). Point it at this database's filesystem for exactly that window, so several
+  // databases - persistent or not - can each hold their own.
+  const g = globalThis as { fs?: Record<string, unknown> };
+  const previousFs = g.fs;
+  if (storage !== undefined) g.fs = storage.fs.api(previousFs);
+  let exited: Promise<void>;
+  try {
+    exited = go.run(instance);
+  } finally {
+    if (previousFs === undefined) delete g.fs;
+    else g.fs = previousFs;
+  }
   const api = takeApi();
   if (api === undefined) throw new Error("kdb embed: the WASM module did not register KdbEmbed");
 
   const transport = new LoopbackTransport();
-  const handle = api.open(namespaces, (frame) => transport.deliver(frame));
+  const handle = await api.open(namespaces, (frame) => transport.deliver(frame), storage === undefined ? {} : { dataRoot: storage.dataRoot });
   if ("error" in handle) throw new Error(`kdb embed: ${handle.error}`);
   transport.attach(handle);
   exited.then(

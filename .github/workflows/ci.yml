@@ -108,6 +108,8 @@ jobs:
         run: |
           GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
           GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/embed/
+          GOOS=js GOARCH=wasm go build -tags kdb_lite -o /dev/null ./wasm/embed/
+          go vet -tags kdb_lite ./kdb/storage/io/s3
 
   ts-client:
     runs-on: ubuntu-latest

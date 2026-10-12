@@ -12,8 +12,10 @@ const goDir = join(here, "..", "..", "..", "go");
 const out = join(here, "..", "wasm");
 mkdirSync(out, { recursive: true });
 
+// kdb_lite swaps the AWS S3 client for a stub (go/kdb/storage/io/s3/client_lite.go): the persistent
+// engine links it, and it alone is ~21 MB of the binary, for a network path a browser never takes.
 const env = { ...process.env, GOOS: "js", GOARCH: "wasm" };
-execFileSync("go", ["build", "-trimpath", "-ldflags=-s -w", "-o", join(out, "kdb.wasm"), "./wasm/embed"], {
+execFileSync("go", ["build", "-tags", "kdb_lite", "-trimpath", "-ldflags=-s -w", "-o", join(out, "kdb.wasm"), "./wasm/embed"], {
   cwd: goDir,
   env,
   stdio: "inherit",

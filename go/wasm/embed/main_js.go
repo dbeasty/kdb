@@ -12,7 +12,18 @@
 //
 // Exposed on globalThis.KdbEmbed:
 //
-//	open(namespaces: string[], onFrame: (frame: Uint8Array) => void) -> { send(frame), close() } | { error }
+//	open(namespaces: string[], onFrame: (frame: Uint8Array) => void, options?: { dataRoot?: string })
+//	  -> Promise<{ send(frame), close() } | { error }>
+//
+// open returns a Promise because opening a file-backed host performs filesystem calls, and those
+// complete through the JavaScript event loop: a js.FuncOf handler that blocked waiting for one
+// would deadlock the Go runtime, so the work happens on a goroutine and the handler returns at once.
+//
+// With options.dataRoot the namespaces are opened under an embed.Host on that directory - the
+// same file-backed engine the service runs: a delta log replayed on open, checkpoints, a
+// cross-namespace transaction log. The directory lives in the JavaScript `fs` object the Go
+// runtime was started with (see packages/kdb-embed/src/fs.ts), which is what decides whether it
+// survives a reload. Without dataRoot everything is in memory.
 //
 // Each namespace is its own in-memory runtime, routed by a server.NamespaceSet exactly as the
 // production service routes them. A namespace not in the list is refused rather than silently
@@ -38,6 +49,18 @@ func main() {
 }
 
 func open(_ js.Value, args []js.Value) any {
+	// Copy what is needed out of args now: they are only valid for the duration of this call.
+	captured := append([]js.Value(nil), args...)
+	executor := js.FuncOf(func(_ js.Value, p []js.Value) any {
+		resolve := p[0]
+		go func() { resolve.Invoke(openEngine(captured)) }()
+		return nil
+	})
+	defer executor.Release()
+	return js.Global().Get("Promise").New(executor)
+}
+
+func openEngine(args []js.Value) any {
 	if len(args) < 2 || args[0].Type() != js.TypeObject || args[1].Type() != js.TypeFunction {
 		return errVal("open(namespaces, onFrame) requires an array of namespaces and a frame callback")
 	}
@@ -45,31 +68,61 @@ func open(_ js.Value, args []js.Value) any {
 	if count == 0 {
 		return errVal("open: at least one namespace is required")
 	}
+	var host *embed.Host
+	if len(args) >= 3 && args[2].Type() == js.TypeObject {
+		if root := args[2].Get("dataRoot"); root.Type() == js.TypeString && root.String() != "" {
+			// Zero options, not FileRuntimeOptionsFromEnv: a browser has no environment to read,
+			// and an S3 replica configured by a stray variable in Node would be a surprise here.
+			h, err := embed.OpenFileHost(root.String(), embed.FileRuntimeOptions{})
+			if err != nil {
+				return errVal(err.Error())
+			}
+			host = h
+		}
+	}
+	var runtimes []*server.KdbServerRuntime
+	teardown := func() {
+		for _, srv := range runtimes {
+			srv.Release()
+		}
+		if host != nil {
+			_ = host.Close()
+		}
+	}
 	var primary *server.KdbServerRuntime
 	var set *server.NamespaceSet
 	for i := 0; i < count; i++ {
 		namespace := args[0].Index(i).String()
-		rt, err := embed.OpenMemoryRuntime(embed.CatalogFromNamespace(namespace), namespace, schema.None())
+		var rt *embed.EmbeddedKdbRuntime
+		var err error
+		if host != nil {
+			rt, err = host.Namespace(embed.CatalogFromNamespace(namespace), namespace, schema.None())
+		} else {
+			rt, err = embed.OpenMemoryRuntime(embed.CatalogFromNamespace(namespace), namespace, schema.None())
+		}
 		if err != nil {
+			teardown()
 			return errVal(err.Error())
 		}
 		srv := server.NewKdbServerRuntime(rt)
+		runtimes = append(runtimes, srv)
 		if primary == nil {
 			primary = srv
 			set = server.NewNamespaceSet(rt.TxnCoordinator())
 		}
 		if err := set.Add(srv); err != nil {
+			teardown()
 			return errVal(err.Error())
 		}
 	}
 	primary.Namespaces = set
-	host := server.NewFrameHost(primary)
+	frames := server.NewFrameHost(primary)
 
 	c := newConn(args[1])
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		host.Serve(c)
+		frames.Serve(c)
 	}()
 
 	var releaseOnce sync.Once
@@ -87,16 +140,26 @@ func open(_ js.Value, args []js.Value) any {
 	})
 	closeFn = js.FuncOf(func(_ js.Value, _ []js.Value) any {
 		c.closeIncoming()
-		// Serve returns once in-flight frames drain, releasing sessions and document locks; wait
-		// for that off the event loop (blocking here would deadlock any callback it is running).
-		go func() {
-			<-served
-			releaseOnce.Do(func() {
-				sendFn.Release()
-				closeFn.Release()
-			})
-		}()
-		return nil
+		// Returns a Promise that settles once the engine is fully shut down. Serve returns when
+		// in-flight frames drain, releasing sessions and document locks; only then are the
+		// runtimes flushed and the directory lock released, and the caller must not treat a
+		// persistent database as closed (or reopen it) before that. The work runs off the event
+		// loop: blocking here would deadlock any callback it is waiting on.
+		executor := js.FuncOf(func(_ js.Value, a []js.Value) any {
+			resolve := a[0]
+			go func() {
+				<-served
+				teardown()
+				releaseOnce.Do(func() {
+					sendFn.Release()
+					closeFn.Release()
+				})
+				resolve.Invoke()
+			}()
+			return nil
+		})
+		defer executor.Release()
+		return js.Global().Get("Promise").New(executor)
 	})
 	return map[string]any{"send": sendFn, "close": closeFn}
 }

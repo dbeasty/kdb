@@ -743,11 +743,22 @@ returns a `Client` (hence a `KdbOperations`, per §11.3) and inherits every beha
 - Namespaces are routed by a `NamespaceSet`, one in-memory runtime per listed namespace. A bare
   single runtime aliases *every* namespace name onto its one store (documented in
   `server/multi_commit.go`), which is wrong for an embedded database; unlisted namespaces are refused.
-- Still open, as §11.2 predicted: **no durability** (in memory; IndexedDB/OPFS is the prerequisite for
-  calling it durable), no peer-sync or stream-subscribe against a server, and the binary is ~31 MB
-  (~6.7 MB gzipped, ~4.7 MB brotli). The first guess - that the server package's AWS SDK, `net/http`
-  and TLS links were the cause - was measured and is wrong (stubbing AWS saved ~1%); the engine itself
-  is the weight, so brotli delivery is the shipped mitigation.
+- **Durability** (`persist`, added in this phase). Key finding: the file engine reaches the disk through
+  `os.*` in about a dozen places (directory lock, namespace metadata, node identity, the
+  cross-namespace transaction log, checkpoints), not through the one `SegmentByteStore` interface, so
+  injecting a store alone could not have made it browser-durable. Instead the Go runtime's `fs` object
+  (which every `os.*` call goes through on js/wasm) is implemented in TypeScript, in memory with
+  write-behind to IndexedDB in 64 KiB chunks; the real engine runs unmodified. `fsync` is the durability
+  boundary - its callback fires only after one atomic backend transaction - and the engine already acks
+  commits only after fsync. Lock files are never persisted. Verified by crash-recovery tests against a
+  backend snapshot, injected storage failure, and three real reloads in Chromium on real IndexedDB.
+  `open()` returns a Promise because the Go `js.FuncOf` handler must not block on a filesystem callback.
+  Limits: a SQL `CREATE TABLE` schema is not restored on reopen (the Go service behaves the same, so
+  codegen gained an idempotent `ensure()`); one open per name; data is held in memory.
+- Still open: no peer-sync or stream-subscribe against a server, and the binary is ~31.7 MB (~6.9 MB
+  gzipped, ~4.9 MB brotli). The persistent engine links the AWS S3 client (~21 MB), so the WASM build
+  uses a `kdb_lite` tag that stubs it; the remainder is the engine itself, so brotli delivery is the
+  shipped mitigation.
 
 ## 14. Estimated lines
 

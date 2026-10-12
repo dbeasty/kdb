@@ -39,6 +39,11 @@ export function typedLayerSuite(label: string, open: () => Promise<Target>, opti
       await target.close();
     });
 
+    it("ensure() is idempotent: a second call finds the schema and changes nothing", async () => {
+      assert.equal(await db.users.ensure(), false, "the schema was installed in before()");
+      assert.equal(await db.users.count().execute(), 4);
+    });
+
     it("returns real types, not strings", async () => {
       const [ann] = await db.users.select("name", "age", "balance", "score", "active", "joined", "tier").where("name", "=", "ann").execute();
       assert.deepEqual(ann, {

@@ -51,6 +51,24 @@ export class Table<Doc, Cols extends Columns> {
     return this.#ops.exec(this.meta.namespace, this.meta.createSql, [], options);
   }
 
+  /**
+   * `create()` that is safe to run on every start: installs the schema if the namespace has none,
+   * and does nothing if it already has one. Returns whether it installed it.
+   *
+   * Needed because a SQL-defined schema is not restored when a store is reopened - the engine opens
+   * every namespace with no schema - so a persistent database must re-apply it each time. It does
+   * not check that an existing schema equals this one.
+   */
+  async ensure(options?: CallOptions): Promise<boolean> {
+    try {
+      await this.create(options);
+      return true;
+    } catch (error) {
+      if (error instanceof Error && /schema already exists/i.test(error.message)) return false;
+      throw error;
+    }
+  }
+
   // --- documents, typed ----------------------------------------------------------------------
 
   put(docId: string, body: Doc, options?: CallOptions): Promise<CommitHash> {

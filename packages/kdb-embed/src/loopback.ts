@@ -11,7 +11,8 @@ import { KdbTransportError, type Transport } from "@kdb/client";
 /** What the WASM module hands back from `KdbEmbed.open`. */
 export interface EngineHandle {
   send(frame: Uint8Array): unknown;
-  close(): void;
+  /** Settles once the engine has drained, flushed and released everything it held. */
+  close(): void | Promise<void>;
 }
 
 export class LoopbackTransport implements Transport {
@@ -19,6 +20,7 @@ export class LoopbackTransport implements Transport {
   readonly #closeHandlers: Array<(cause?: Error) => void> = [];
   #engine: EngineHandle | undefined;
   #closed = false;
+  #closing: Promise<void> = Promise.resolve();
 
   attach(engine: EngineHandle): void {
     this.#engine = engine;
@@ -60,15 +62,17 @@ export class LoopbackTransport implements Transport {
     this.#finish(cause);
   }
 
-  async close(): Promise<void> {
+  /** Resolves when the engine is fully shut down - for a persistent database, when its data is safely flushed. */
+  close(): Promise<void> {
     this.#finish();
+    return this.#closing;
   }
 
   #finish(cause?: Error): void {
     if (this.#closed) return;
     this.#closed = true;
     try {
-      this.#engine?.close();
+      this.#closing = Promise.resolve(this.#engine?.close()).catch(() => undefined);
     } catch {
       // The engine may already be gone; closing is best-effort.
     }
