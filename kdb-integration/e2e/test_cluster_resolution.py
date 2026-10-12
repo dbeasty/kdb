@@ -974,17 +974,28 @@ def patch_step(n, docs: list[str], field: str):
 
 
 def fetch_graph(n) -> dict[str, list[str]]:
-    """The whole commit graph reachable from n's head, as {hash: parents}."""
+    """The whole commit graph reachable from n's head, as {hash: parents}.
+
+    The log API pages by `skip`, which it caps at 20,000, so a long history cannot be read that
+    way: a load loop writes as fast as the node lets it, and on fast hardware 12 seconds of it
+    is more than 20,000 commits (28,000 on one Linux run), where this once looped on the same
+    window for 50 minutes. Instead walk from each parent not yet seen, 500 ancestors at a time.
+    """
     out: dict[str, list[str]] = {}
-    skip = 0
-    while True:
-        status, body = control(n, "GET", ns_path(n, f"/log?limit=500&skip={skip}"), timeout=60)
+    todo = [""]  # "" is the head
+    while todo:
+        start = todo.pop()
+        if start and start in out:
+            continue
+        query = "limit=500" + (f"&from={start}" if start else "")
+        status, body = control(n, "GET", ns_path(n, f"/log?{query}"), timeout=60)
         assert status == 200, body
         for cm in body.get("commits") or []:
             out[cm["hash"]] = cm.get("parents") or []
-        if not body.get("hasMore"):
-            return out
-        skip = body["nextSkip"]
+        # The window is cut at 500 commits, so some of its parents are outside it: continue
+        # from every parent that has not been read.
+        todo.extend({p for parents in out.values() for p in parents if p not in out} - set(todo))
+    return out
 
 
 def descends(graph: dict[str, list[str]], commit: str, ancestor: str) -> bool:
