@@ -104,6 +104,11 @@ jobs:
           fi
       - name: Go test
         run: go test -race ./...
+      - name: Backup and restore drill
+        # Live backup -> verify -> restore into a fresh dir while the service is down -> restart
+        # -> compare documents and head. Also run as a Go test (TestBackupRestoreDrill); this step
+        # keeps the operator-facing script itself from rotting and prints its log on failure.
+        run: ../scripts/backup-restore-drill.sh 100
       - name: Go WASM build
         run: GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
 

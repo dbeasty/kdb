@@ -2035,6 +2035,26 @@ data-directory lock a live service holds, so they refuse to run against a direct
 
 **`--to s3`** uses the `KDB_S3_*` environment configuration below.
 
+### Backup and restore drill
+
+A backup nobody has restored is a guess. `scripts/backup-restore-drill.sh [N]` rehearses the whole
+path on a scratch directory and CI runs it on every change:
+
+1. start `kdb-service` on a temp data dir (peer/stream listeners are off by default, so only the
+   SQL and control ports are needed) and load N documents;
+2. confirm the **offline** `kdb-inspect backup` refuses the live directory (it takes the exclusive
+   data-dir lock - it is a tool for a stopped service);
+3. take the **live** backup through the control plane (`--control-backup-dir`,
+   `POST /v1/ns/{ns}/backups`), which captures the active segment as its CRC-verified prefix;
+4. `kdb-inspect backup-verify` re-hashes every object the manifest names;
+5. stop the service, `kdb-inspect restore --from-backup ... --out FRESH` while it is down, then
+   `kdb-inspect verify --level L2` on the result;
+6. start a second service on the restored directory and check every document and the commit head
+   (`kdb status`) match the original.
+
+Run it before relying on a new backup destination or after upgrading; a nonzero exit prints the
+service logs. `KDB_BIN_DIR=DIR` skips the build, `KEEP=1` keeps the scratch directory.
+
 ### What each failure looks like
 
 | Symptom | Meaning | Action |
