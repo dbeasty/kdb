@@ -243,3 +243,52 @@ read-only runtimes map but never write or delete.
   Re-decide it on the 2M-commit residency numbers, not on GC grounds.
 - Operations and messages still live in pointer-bearing side maps (bounded by the operations budget).
 - Re-run Phase 0 `GOGC` experiment alongside `GOMEMLIMIT`.
+
+## Performance results (2026-10-12, M3 Max, Go 1.26.3, macOS)
+
+Machine shared with other sessions (load average 7-13 throughout), so absolute timings are noisy; every comparison
+below was taken alternately against a detached `main` worktree in the same window. Heap figures are not
+load-sensitive.
+
+### Commit graph at scale (`TestGraphFileScale`, linear history with a merge every 1,000 commits)
+
+| | main | branch, all resident | branch, graph file attached |
+|---|---:|---:|---:|
+| Heap, 1M commits | 458 MB | 458 MB | **~0 MB** |
+| Heap, 2M commits | 915 MB | 915 MB | **~0 MB** |
+| Full-GC mark, 1M | 21 ms | 1.0-6.5 ms | **0.24 ms** |
+| Full-GC mark, 2M | 50-65 ms | 2.3 ms | **0.30 ms** |
+| `GetCommit` (random, 1M) | - | 0.56-0.80 us | 0.61 us |
+| `IsAncestor` deep (1M) | - | 103-107 ms | 220 ms |
+| `Walk` 10k commits (1M) | - | 4.2-4.8 ms | 7.6 ms |
+| `GetCommitByTransactionID` (1M) | - | 0.10 us | 0.22 us |
+| Segment on disk | - | - | 304 B/commit (304 MB at 1M) |
+| Full rewrite (write + attach), 1M / 2M | - | - | 2.5 s / 3.8 s |
+| Attach at open (map + checksum), 1M / 2M | - | - | 167 ms / 306 ms |
+
+Reading the table: the pointer-free resident tier removes the GC cost (scan time) but not the bytes - with the
+shared 256-byte record it costs the same 458 B/commit as `main`'s map (the struct slot it replaced was 425). The
+graph file removes the bytes. History reads from the file are up to ~2x slower than from memory (one interpolated
+search per step instead of a map probe; it was 3.5x before interpolation search).
+
+### Hot path (`go/kdb/server` workload matrix, graph file off - the default)
+
+Alternating `main` / branch, `-benchtime 2s`. No difference is statistically significant (benchstat, p > 0.05):
+
+| Benchmark | main | branch | |
+|---|---:|---:|---|
+| Read single-user overlapping | 318 ns | 312 ns | ~ (n=4) |
+| Read heavy-multi-user overlapping | 153 ns | 184 ns | ~ (p=0.89, n=4) |
+| Read single-user non-overlapping | 212 ns | 241 ns | ~ (p=0.49, n=4) |
+| Read heavy-multi-user non-overlapping | 161 ns | 202 ns | ~ (p=0.49, n=4) |
+| Insert single-user (fsync) | 5.52 ms | 4.77 ms | ~ (p=0.24, n=6) |
+| Insert, memory-only, single-user | 20.2 us | 20.4 us | ~ (p=0.94, n=6) |
+| Insert, memory-only, heavy-multi-user | 24.8 us | 25.8 us | ~ (p=0.13, n=6) |
+| Update single-user overlapping | 5.17 ms | 4.94 ms | ~ (p=0.39, n=6) |
+
+Allocations per read are identical (4 allocs, 176 B). A first n=4 run showed single-user insert +25% (p=0.029)
+during a load-average spike to 17-20; it did not reproduce at n=6 with the order alternated, and the memory-only
+insert - which runs exactly the code this branch changed, without fsync - is flat. Treat that first number as the
+neighbour-contention artifact the benchmarking notes warn about, not a regression. A quiet-machine rerun on Linux
+would still be worth doing before calling the read rows flat to within a few percent.
+
