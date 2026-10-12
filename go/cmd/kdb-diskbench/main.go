@@ -30,6 +30,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/memtune"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/server"
 	"github.com/limidus/kdb/go/kdb/sql"
@@ -64,6 +65,14 @@ func main() {
 	}
 	out := report{"phase": mode, "docs": *n, "goos": runtime.GOOS, "goarch": runtime.GOARCH}
 
+	// The service paces the collector to the live heap (kdb/memtune); measure with it, as shipped.
+	// KDB_GC_HEADROOM_PERCENT=0 gives the runtime default for comparison.
+	headroom := 25
+	if v, err := strconv.Atoi(os.Getenv("KDB_GC_HEADROOM_PERCENT")); err == nil {
+		headroom = v
+	}
+	defer memtune.Start(memtune.Options{HeadroomPercent: headroom, Interval: 500 * time.Millisecond}).Stop()
+
 	opts := embed.FileRuntimeOptions{Storage: embed.StorageOptions{
 		Durability: storage.DurabilitySync,
 		SyncMode:   storio.SyncModeFull,
@@ -97,6 +106,13 @@ func main() {
 
 	measureReads(srv, *n, *reads, out)
 	out["rss_after_reads_mb"] = rssMB()
+	if mp := os.Getenv("HEAPPROF"); mp != "" {
+		runtime.GC()
+		if f, err := os.Create(mp); err == nil {
+			_ = pprof.Lookup("heap").WriteTo(f, 0)
+			f.Close()
+		}
+	}
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 	out["go_heap_inuse_mb"] = int(mem.HeapInuse >> 20)

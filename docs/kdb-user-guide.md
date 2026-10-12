@@ -2311,3 +2311,13 @@ carries at most that many rows (clamped below the bound) and, while rows remain,
   row and is not paged;
 - a token is bound to its statement and parameters (a different one is refused) but is not a
   credential: the read is authorized on every page.
+
+### Garbage-collector pacing
+
+`--gc-headroom-percent` (default 25, `$KDB_GC_HEADROOM_PERCENT`) paces Go's collector to the live heap.
+By default Go lets the heap grow to twice its live size between collections - a gigabyte of garbage
+per gigabyte of data. Below 256 MiB live the runtime default is kept; above it the collector targets
+the live size plus headroom: that percentage of it, at least 128 MiB and at most 2 GiB, which is
+room for growth and for the allocation between two cycles. `0` disables it, and an explicit `GOGC`
+environment variable always wins. It only paces the collector; the memory budget and `GOMEMLIMIT`
+are unchanged.

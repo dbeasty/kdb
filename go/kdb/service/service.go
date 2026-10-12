@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/memtune"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/policy"
 	"github.com/limidus/kdb/go/kdb/recovery"
@@ -79,6 +81,11 @@ func Main() {
 	fs.StringVar(&peerHTTPAddr, "peer-http", "", "also serve peer sync over WebSocket on this HTTP address (host:port), at /kdb/sync - what an application mounts syncnode.Node.Handler for. Peers dial ws://host:port/kdb/sync; a bearer token rides the upgrade request (token-env= on the peer spec). Plain HTTP: terminate TLS in front of it")
 	fs.DurationVar(&scrubInterval, "scrub-interval", 0, "how often to scrub every namespace: re-read and verify every live document against its content hash, repairing damaged ones from the --peer nodes by content hash (they need not be trusted). Reads every body, so scale it to the data - daily is typical. 0 disables; POST /v1/ns/{ns}/scrub runs one on demand")
 	fs.BoolVar(&streamAllowAnonymous, "stream-allow-anonymous", false, "accept stream (--stream-addr) subscribers without credentials, as every subscriber was before the stream handshake authenticated. Under --rbac this lets anyone read every commit in the namespace; without --rbac credentials are not checked anyway, so this changes nothing")
+	gcHeadroom := 25
+	if v, err := strconv.Atoi(os.Getenv("KDB_GC_HEADROOM_PERCENT")); err == nil {
+		gcHeadroom = v
+	}
+	fs.IntVar(&gcHeadroom, "gc-headroom-percent", gcHeadroom, "garbage-collector headroom above the live heap, as a percentage of it (default 25; $KDB_GC_HEADROOM_PERCENT). The Go default lets the heap grow to twice its live size between collections, which on a large dataset is a gigabyte of garbage per gigabyte of data; once the live heap passes 256 MiB the collector is paced to live + this headroom instead (at least 128 MiB, at most 2 GiB). 0 disables it and leaves the runtime default; an explicit GOGC environment variable always wins")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
 	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
 	fs.BoolVar(&flagVals.Memory, "memory", flagVals.Memory, "use in-memory runtime")
@@ -190,6 +197,12 @@ func Main() {
 		peerAddr = secureScheme(peerAddr)
 		streamAddr = secureScheme(streamAddr)
 		wsAddr = secureScheme(wsAddr)
+	}
+
+	if tuner := memtune.Start(memtune.Options{HeadroomPercent: gcHeadroom}); tuner.Active() {
+		defer tuner.Stop()
+		slog.Info("garbage-collector pacing follows the live heap", "headroom_percent", gcHeadroom,
+			"note", "GOGC stays at the runtime default below 256 MiB live; set GOGC or --gc-headroom-percent=0 to opt out")
 	}
 
 	// restartRequested carries a control-plane request to shut down and be restarted, which today

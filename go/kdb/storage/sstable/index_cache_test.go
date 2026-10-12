@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -187,6 +188,10 @@ func TestIndexCacheFollowsCompaction(t *testing.T) {
 // TestIndexCacheIsBounded checks the budget: a cache too small for every index keeps answering
 // correctly and holds no more than its budget (plus the one index being used).
 func TestIndexCacheIsBounded(t *testing.T) {
+	// Strict bound: no index counts as "in use" here, so the budget applies as soon as it is
+	// exceeded (production keeps just-probed indexes - see TestIndexCacheDoesNotThrash...).
+	defer func(w time.Duration) { indexHotWindow = w }(indexHotWindow)
+	indexHotWindow = 0
 	io := storio.NewInMemoryPlatformIO()
 	ns := "app/docs"
 	store := NewLsmBlobStore(io, ns, nil)
@@ -432,5 +437,33 @@ func TestFileBackedSegmentSize(t *testing.T) {
 	}
 	if _, err := shim2.SegmentSize("ns/app/docs/sstable/L0/missing.sst"); err == nil {
 		t.Fatal("a missing segment reported a size")
+	}
+}
+
+// TestIndexCacheDoesNotThrashWhenTablesOutgrowTheBudget pins the defect that made a scan of a few
+// hundred thousand documents run for minutes: with two tables whose indexes together exceed the
+// budget, evicting by recency alone dropped the index the next lookup needed, so every lookup
+// re-read and re-parsed a table's whole footer.
+func TestIndexCacheDoesNotThrashWhenTablesOutgrowTheBudget(t *testing.T) {
+	io := &countingIO{InMemoryPlatformIO: storio.NewInMemoryPlatformIO()}
+	ns := "app/docs"
+	store := NewLsmBlobStore(io, ns, nil)
+	keysA, a := writeSizedTable(t, io, ns, 500, 32, 1)
+	keysB, b := writeSizedTable(t, io, ns, 500, 32, 2)
+	store.AddTable(a)
+	store.AddTable(b)
+	store.SetIndexCacheBudget(500 * indexEntryBytes) // room for one table's index, not two
+
+	io.reads.Store(0)
+	const rounds = 300
+	for i := 0; i < rounds; i++ {
+		// Alternate tables, newest first as a real lookup walks them.
+		if store.Get(keysA[i%len(keysA)]) == nil || store.Get(keysB[i%len(keysB)]) == nil {
+			t.Fatal("key missing")
+		}
+	}
+	// Each lookup costs its block read; footer re-reads on top of that are the defect.
+	if got := io.reads.Load(); got > int64(2*rounds)+20 {
+		t.Fatalf("%d reads for %d lookups: the index cache is re-reading footers on every probe", got, 2*rounds)
 	}
 }

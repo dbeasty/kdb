@@ -20,6 +20,10 @@ const docHashShardCount = 64
 // load - far worse than slightly overshooting a very small budget.
 const minDocHashShardBudgetBytes int64 = 64 << 10
 
+// docHashEntry is one cached version. It lives in the shard's map by value (no allocation of its
+// own) and carries its pin count, so there is no separate pin map: on a large namespace almost
+// every version is pinned, and a map[Hash]int beside the cache cost ~80 bytes per document on top
+// of the entry itself.
 type docHashEntry struct {
 	doc  document.Document
 	size int64
@@ -30,14 +34,17 @@ type docHashEntry struct {
 	// outgrew its budget every Put scanned every live document in the shard
 	// and a bulk load slowed linearly with namespace size (a 1,000-document
 	// commit took 0.36 s at 200k documents against 15 ms at 10k).
-	el *list.Element
+	el   *list.Element
+	pins int32
+	// loaded is false for a placeholder: the engine pins a version before it stores it, so a pin
+	// can exist before the document does. A placeholder is invisible to Get and costs no bytes.
+	loaded bool
 }
 
 type docHashShard struct {
 	mu     sync.Mutex
-	docs   map[codec.Hash]*docHashEntry
+	docs   map[codec.Hash]docHashEntry
 	lru    *list.List
-	pins   map[codec.Hash]int
 	bytes  int64
 	budget int64
 }
@@ -84,9 +91,8 @@ func newShardedDocByHashStore(budgetBytes int64) *shardedDocByHashStore {
 	s := &shardedDocByHashStore{}
 	for i := range s.shards {
 		s.shards[i] = &docHashShard{
-			docs:   make(map[codec.Hash]*docHashEntry),
+			docs:   make(map[codec.Hash]docHashEntry),
 			lru:    list.New(),
-			pins:   make(map[codec.Hash]int),
 			budget: perShard,
 		}
 	}
@@ -112,14 +118,16 @@ func (s *shardedDocByHashStore) Put(h codec.Hash, doc document.Document) {
 	sh := s.shardFor(h)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if e, ok := sh.docs[h]; ok {
+	e, ok := sh.docs[h]
+	if ok && e.loaded {
 		if e.el != nil {
 			sh.lru.MoveToFront(e.el)
 		}
 		return
 	}
-	e := &docHashEntry{doc: doc, size: entrySizeBytes(doc)}
-	if sh.pins[h] == 0 {
+	// A placeholder (pinned before it was stored) is filled in; otherwise this is a new entry.
+	e.doc, e.size, e.loaded = doc, entrySizeBytes(doc), true
+	if e.pins == 0 {
 		e.el = sh.lru.PushFront(h)
 	}
 	sh.docs[h] = e
@@ -155,7 +163,7 @@ func (s *shardedDocByHashStore) Get(h codec.Hash) (document.Document, bool) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	e, ok := sh.docs[h]
-	if !ok {
+	if !ok || !e.loaded {
 		return document.Document{}, false
 	}
 	if e.el != nil {
@@ -171,11 +179,13 @@ func (s *shardedDocByHashStore) Get(h codec.Hash) (document.Document, bool) {
 func (s *shardedDocByHashStore) Pin(h codec.Hash) {
 	sh := s.shardFor(h)
 	sh.mu.Lock()
-	sh.pins[h]++
-	if e, ok := sh.docs[h]; ok && e.el != nil {
+	e := sh.docs[h]
+	e.pins++
+	if e.el != nil {
 		sh.lru.Remove(e.el)
 		e.el = nil
 	}
+	sh.docs[h] = e
 	sh.mu.Unlock()
 }
 
@@ -192,14 +202,16 @@ func (s *shardedDocByHashStore) Pin(h codec.Hash) {
 func (s *shardedDocByHashStore) Unpin(h codec.Hash) {
 	sh := s.shardFor(h)
 	sh.mu.Lock()
-	if n, ok := sh.pins[h]; ok {
-		if n <= 1 {
-			delete(sh.pins, h)
-			if e, ok := sh.docs[h]; ok && e.el == nil {
-				e.el = sh.lru.PushFront(h)
-			}
-		} else {
-			sh.pins[h] = n - 1
+	if e, ok := sh.docs[h]; ok && e.pins > 0 {
+		e.pins--
+		switch {
+		case e.pins > 0:
+			sh.docs[h] = e
+		case !e.loaded:
+			delete(sh.docs, h) // a placeholder nobody holds any more
+		default:
+			e.el = sh.lru.PushFront(h)
+			sh.docs[h] = e
 		}
 	}
 	sh.evictLocked()

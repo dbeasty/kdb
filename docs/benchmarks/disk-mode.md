@@ -128,9 +128,31 @@ resolves a window of entries first and decodes each frame once per window. The r
 superlinearity (0.64 s at 100k, 21 s at 1M) is frames being re-decoded once per 32k-entry window;
 a larger window or a frame-ordered scan would flatten it at the cost of holding more bodies.
 
-Not fixed, and still worth knowing: resident memory after a restart plus a full scan is ~2.2 GB
-at 1M documents (about 2.2 KB per document against ~215 MB on disk), and a cold point read
-(`get` after a restart) still costs ~0.5 ms because it decodes its whole commit frame.
+**Memory, second pass.** The 2.2 GB resident figure after a restart plus a full scan at 1M documents
+was mostly garbage, not data: the SSTable index cache was smaller than two tables' parsed indexes, so
+each lookup evicted the index the next one needed and re-parsed a text footer (~100 MB of garbage a
+time; a 300k-document scan ran for 11+ minutes in one layout). Indexes probed in the last 5 s are now
+exempt from eviction. Together with a more compact document cache (pin counts live in the entry, no
+second map; entries stored by value) the same runs now read:
+
+| 1M documents | before | after |
+|---|---:|---:|
+| RSS after bulk load | 1,285 MB | 723 MB |
+| RSS after restart + full scan | 2,236 MB | 1,289 MB |
+
+The compact cache entry saves about 10 MB per 300k documents (~35 MB at 1M), less than I first
+estimated; the index-cache fix is what moved the number. Live heap is now ~0.7 KB per document at
+300k (233 MB -> 214 MB; bodies 57 MB, SSTable indexes 41 MB, cache 49 MB, document tree 33 MB, checkpoint 26 MB).
+
+The collector is also paced to the live heap (`kdb/memtune`, `--gc-headroom-percent`, default 25):
+with the Go default a large heap may double before it is collected. Under allocation churn on a
+768 MiB live heap the peak is ~0.98 GiB tuned against ~1.54 GiB default
+(`TestTunedPeakHeapIsBelowTheDefaultUnderChurn`). In these benchmarks themselves it changes nothing
+(throughput and RSS are within noise) because the load and the scan allocate little once the
+thrashing is gone; it matters for query-heavy workloads on large namespaces.
+
+Still not fixed: a cold point read (`get` after a restart) costs ~0.5 ms because it decodes its
+whole commit frame.
 
 ## Limits of this run
 
