@@ -144,7 +144,9 @@ func TestDefaultOpenTurnsNothingOn(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a persisting DAG, got %T", rt.DAG)
 	}
-	if got := p.delegate.GraphSettings(); got != (dag.GraphSettings{}) {
-		t.Errorf("DAG settings = %+v, want the zero value", got)
+	// Nothing optional is on; the only value filled in is which memory representation the
+	// DAG uses, and that is the default one.
+	if got := p.delegate.GraphSettings(); got != (dag.GraphSettings{Memory: dag.GraphMemoryKDB}) {
+		t.Errorf("DAG settings = %+v, want nothing on and the default memory mode", got)
 	}
 }
