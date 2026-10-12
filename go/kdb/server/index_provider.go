@@ -11,6 +11,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/index"
 	"github.com/limidus/kdb/go/kdb/index/fusion"
 	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -195,6 +196,12 @@ func indexKeyForCell(c sql.Cell) (index.Key, bool) {
 // CreateIndex registers a new index and rebuilds it from the current head, so the index is
 // queryable the moment the statement returns rather than only covering later writes.
 func (p *RegistryIndexProvider) CreateIndex(stmt sql.StmtCreateIndex, ctx sql.QueryContext) error {
+	// Checked here, on the statement a user typed, and not in createIndexLocal: that is also how
+	// a stored or replicated definition is re-applied at startup, and a definition an earlier
+	// version accepted must not stop the namespace from opening.
+	if err := requireEnforceableUnique(stmt, ctx.Schema); err != nil {
+		return err
+	}
 	if p.runtime == nil {
 		return p.createIndexLocal(stmt, ctx)
 	}
@@ -212,6 +219,34 @@ func (p *RegistryIndexProvider) CreateIndex(stmt sql.StmtCreateIndex, ctx sql.Qu
 		}
 		return nil
 	})
+}
+
+// requireEnforceableUnique refuses a UNIQUE index that nothing would enforce.
+//
+// Uniqueness is enforced at commit from the namespace schema's UNIQUE constraints (the
+// UniqueKeyRegistry in the transaction engine); an index is a lookup structure and does not
+// participate. Accepting `CREATE UNIQUE INDEX` on a field the schema does not declare unique -
+// which includes every field of a schemaless namespace - succeeded and then allowed duplicates,
+// including concurrent ones: a statement that reports success and does nothing, for a promise
+// callers rely on for things like one account per email. Until an index can carry a constraint
+// of its own, say so at the statement.
+func requireEnforceableUnique(stmt sql.StmtCreateIndex, sch schema.KdbSchema) error {
+	if !stmt.Unique {
+		return nil
+	}
+	want := make([]string, 0, len(stmt.Fields))
+	for _, f := range stmt.Fields {
+		want = append(want, f.Path)
+	}
+	for _, tuple := range sch.UniqueTuples() {
+		if len(tuple) == len(want) && strings.Join(tuple, "\x1f") == strings.Join(want, "\x1f") {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"index %s: UNIQUE is not enforced by an index; declare the constraint in the schema "+
+			"(CREATE TABLE ... UNIQUE) or create the index without UNIQUE",
+		stmt.Name)
 }
 
 // createIndexLocal is CreateIndex without recording - how a replicated definition is applied.
