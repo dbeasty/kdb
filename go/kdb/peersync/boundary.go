@@ -109,3 +109,132 @@ func extendBoundary(env IngestEnv, gap boundaryGap, fetch func(after string) (wi
 	}
 	return nil
 }
+
+// The push direction.
+//
+// A node only ever dialled - a hub whose peers push to it (mode=push), or a node with no --peer of
+// its own - never runs the pull above, so a push of a branch forked behind its snapshot root
+// failed "missing parent" on every push, for ever: the pusher counts the fork point as held, for
+// the same reason a pull's peer does, and the receiver cannot fetch from the node that dialled it.
+//
+// The receiver tells the pusher instead. A REF_UPDATE page whose parents are behind its boundary
+// is refused with PEER_ERROR SHALLOW_BOUNDARY (PushBelowBoundaryError), and the receiver notes,
+// for this session, which parents those were. The pusher, which holds them, sends each one's state
+// by GRAFT_PUSH and sends the page again. A GRAFT_PUSH naming a parent this session was refused
+// for is admitted the way a pull admits a fork point (extendBoundary): it needs no
+// allowUnrelated, because the receiver itself found the hash as the parent of a commit it was
+// pushed, behind its own boundary; the state is checked against the commit's tree hash and the
+// commit against its hash. Any other GRAFT_PUSH is a graft, as before.
+//
+// No message changes shape: SHALLOW_BOUNDARY is a new error code, and GRAFT_PUSH is a frame every
+// v2 host already takes. An older pusher (v0.7.0 and before) does not know the code, so its push
+// fails with this error - which names both commits and the way out - rather than a bare "missing
+// parent"; the receiver heals once it pulls from any peer or is deepened. An older receiver
+// answers INTERNAL "missing parent", which a newer pusher reports as it always did.
+
+// PushBelowBoundaryError is a push refused because a pushed commit's parent is behind this
+// node's snapshot root and the pusher has not sent that parent's state (see above). It goes back
+// to the pusher as PEER_ERROR SHALLOW_BOUNDARY.
+type PushBelowBoundaryError struct {
+	Namespace string
+	// Commit is a pushed commit; Missing are the parents the page needs that are behind the
+	// boundary, Missing[0] being Commit's.
+	Commit  codec.Hash
+	Missing []codec.Hash
+	Cause   error
+}
+
+func (e *PushBelowBoundaryError) Error() string {
+	return fmt.Sprintf("peer sync: %s: pushed commit %s has parent %s behind this node's snapshot root "+
+		"(history it was bootstrapped without; missing: %s), and the pusher did not send its state first - "+
+		"a pusher newer than v0.7.0 does when told; otherwise this node takes it when it next pulls from any peer, "+
+		"or by deepening (POST /v1/ns/{ns}/deepen or kdb deepen): %v",
+		e.Namespace, e.Commit.Hex(), e.Missing[0].Hex(), hexList(e.Missing), e.Cause)
+}
+
+func (e *PushBelowBoundaryError) Unwrap() error { return e.Cause }
+
+// PeerBoundaryError is a push this node could not complete because the peer needs the state of
+// commits behind its snapshot root, and this node could not supply it - it does not hold them,
+// or cannot build their state.
+type PeerBoundaryError struct {
+	Namespace string
+	Missing   []codec.Hash
+	Cause     error
+}
+
+func (e *PeerBoundaryError) Error() string {
+	return fmt.Sprintf("peer sync: %s: the peer needs the state of %s, behind its snapshot root, to take this push, "+
+		"and this node could not send it: %v", e.Namespace, hexList(e.Missing), e.Cause)
+}
+
+func (e *PeerBoundaryError) Unwrap() error { return e.Cause }
+
+func hexList(hs []codec.Hash) string {
+	out := ""
+	for i, h := range hs {
+		if i > 0 {
+			out += ", "
+		}
+		out += h.Hex()
+	}
+	return out
+}
+
+// pushBlockedByBoundary is the receiver's half: when a pushed page could not be stored and this
+// node has parents behind its boundary missing for it, the typed refusal naming them; else nil.
+func pushBlockedByBoundary(env IngestEnv, page []document.Commit, cause error) (*PushBelowBoundaryError, []boundaryGap) {
+	gaps := gapsBelowBoundary(env, page, nil)
+	if len(gaps) == 0 {
+		return nil, nil
+	}
+	e := &PushBelowBoundaryError{Namespace: env.NamespaceID, Commit: gaps[0].child, Cause: cause}
+	for _, g := range gaps {
+		e.Missing = append(e.Missing, g.parent)
+	}
+	return e, gaps
+}
+
+// peerBoundaryGaps is the pusher's half: the parents of page's commits that are not in it and lie
+// behind one of the peer's shallow roots (shallow, as the peer advertised them). Only those can be
+// missing there: anything else the page leaves out is below a ref the peer named by a path that
+// does not cross its boundary, so the peer holds it. It walks the history behind those roots, so
+// it is asked only once the peer has refused a page.
+func peerBoundaryGaps(env IngestEnv, page []document.Commit, shallow []string) []codec.Hash {
+	roots := map[codec.Hash]bool{}
+	var held []codec.Hash
+	for _, hex := range shallow {
+		h, err := codec.HashFromHex(hex)
+		if err != nil {
+			continue
+		}
+		roots[h] = true
+		if env.DAG.HasCommit(h) {
+			held = append(held, h)
+		}
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	behind := env.DAG.AncestorSetOf(held)
+	inPage := make(map[codec.Hash]bool, len(page))
+	for _, c := range page {
+		inPage[c.Hash] = true
+	}
+	seen := map[codec.Hash]bool{}
+	var out []codec.Hash
+	for _, c := range page {
+		for _, p := range c.ParentHashes {
+			if inPage[p] || roots[p] || seen[p] {
+				continue
+			}
+			if _, ok := behind[p]; !ok {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Hex() < out[j].Hex() })
+	return out
+}

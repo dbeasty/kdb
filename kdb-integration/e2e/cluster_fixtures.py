@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-from server_fixtures import KdbServer, helper
+from server_fixtures import KdbServer, helper, put
 
 CONTROL_AUTH = "Basic " + base64.b64encode(b"e2e:e2e").decode()
 
@@ -312,3 +312,72 @@ def assert_values_at_least(srv: KdbServer, acked: dict[str, int], where: str) ->
         f"{where}: {len(missing)} acknowledged documents missing, {len(behind)} behind their "
         f"acknowledged value (of {len(acked)} checked; node holds {len(docs)}).\n"
         f"missing (first 5): {missing[:5]}\nbehind (doc, got, acked) (first 5): {behind[:5]}")
+
+
+# -- a snapshot hub that is only ever pushed to ----------------------------------------------
+
+def strip_peers(args: list) -> list:
+    """`args` without any --peer and its value."""
+    out, i = [], 0
+    while i < len(args):
+        if args[i] == "--peer":
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+
+def wait_until(cond, timeout: float, what: str, c: Cluster) -> None:
+    deadline = time.time() + timeout
+    while not cond():
+        if time.time() >= deadline:
+            raise AssertionError(f"{what} in {timeout:.0f}s\n{c.diagnose()}")
+        time.sleep(0.2)
+
+
+def peer_state(srv: KdbServer, name: str) -> dict:
+    """The replicator's state for srv's peer `name` (/v1/peers)."""
+    for p in peers(srv).get("peers") or []:
+        if p.get("Name") == name:
+            return p.get("State") or {}
+    raise AssertionError(f"no peer {name} on {srv.sql_addr}")
+
+
+def fork_behind_a_pushed_only_hub(c: Cluster) -> tuple[KdbServer, list, dict[str, int]]:
+    """Builds, on a two-node mesh, the push-direction twin of #111's late joiner: a hub
+    bootstrapped from n0's snapshot, with no --peer of its own, and n1 about to push it a branch
+    forked behind the hub's root. Deterministic, by stops rather than timing:
+
+      - from a common head H, n1 writes C while n0 is down, and n0 writes X while n1 is down;
+      - the hub is bootstrapped from n0 at X (one sync only), then restarted with no --peer;
+      - n1 takes X from n0 (merging it with C), and only then is wired to push to the hub, so
+        its first push names X as held and leaves out everything below it, H included - C's
+        parent, which the hub does not hold. (A pusher that does not hold the hub's head sends
+        its whole history instead, which needs no fork point.)
+
+    Returns the hub, the --peer arguments that push to it (n1 already has them), and the two
+    fork documents with their values."""
+    n0, n1 = c.nodes[0], c.nodes[1]
+    c.wait_converged()
+    fork_c, fork_x = owned_docs(6, 1)[0], owned_docs(7, 1)[0]
+    assert n0.stop() == 0
+    put(n1, fork_c, {"id": fork_c, "v": 1, "by": "c"})
+    assert n1.stop() == 0
+    n0.restart()
+    put(n0, fork_x, {"id": fork_x, "v": 1, "by": "x"})
+
+    # One sync only (the later interval wins): the bootstrap, at X.
+    hub = c.add_node("bootstrap=snapshot,mode=pull,interval=1h", peer_of=0)
+    wait_until(lambda: head(hub) == head(n0), 30, "the hub never bootstrapped", c)
+    assert hub.stop() == 0
+    hub.extra_args = strip_peers(hub.extra_args)
+    hub.restart()
+
+    n1.restart()
+    wait_until(lambda: head(n1) == head(n0), 30, "n0 and n1 did not converge", c)
+    assert n1.stop() == 0
+    to_hub = ["--peer", f"name=hub,addr={hub.peer_addr},interval={c.interval},mode=push"]
+    n1.extra_args += to_hub
+    n1.restart()
+    return hub, to_hub, {fork_c: 1, fork_x: 1}
