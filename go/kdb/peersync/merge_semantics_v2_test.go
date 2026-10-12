@@ -402,3 +402,61 @@ func TestFieldOriginFollowsTheFieldNotTheDocument(t *testing.T) {
 	}
 	_ = document.Commit{}
 }
+
+// A mesh that merges constantly leaves a history full of criss-crosses, where the nearest common
+// ancestors of two heads are themselves several and are merged into a virtual base one level at a
+// time. Built without sharing, that recursion re-derived the same base sets once per path that
+// reached them - exponential in the depth - and ran the conflict rule at every step, all while the
+// merge held the node's write gate: a 5-node load test on Linux left one node unable to take
+// writes or peer syncs for minutes. The work must stay proportional to the history, and the
+// answer must still count every increment once.
+func TestV2VirtualBaseWorkStaysBoundedOnADeepCrissCrossLattice(t *testing.T) {
+	const nodes, rounds = 5, 5
+	g := newGraph(t, "app/v2-lattice")
+	calls := 0
+	opts := chainV(ChainVersionMergeBases, ResolutionRule{Kind: RuleProcedure, Name: "sum"}, ResolutionRule{Kind: RuleLastWrite})
+	opts.Procedure = func(a, b string, c ProcedureConflict) (Settlement, bool, error) {
+		calls++
+		return sumProcedure(a, b, c)
+	}
+	base := g.write(g.root(), map[string]any{"n": 0})
+	heads := make([]codec.Hash, nodes)
+	for i := range heads {
+		heads[i] = base
+	}
+	want := 0
+	for r := 0; r < rounds; r++ {
+		// Every node counts one increment of its own, each in its own decimal digit.
+		for i := range heads {
+			cur := g.body(heads[i])["n"].(float64)
+			by := 1
+			for k := 0; k < i; k++ {
+				by *= 10
+			}
+			heads[i] = g.write(heads[i], map[string]any{"n": int(cur) + by})
+			want += by
+		}
+		// ...then every node syncs with all the others, from the heads they had before this
+		// round's merges: any two heads end up with several nearest common ancestors.
+		prev := append([]codec.Hash(nil), heads...)
+		for i := range heads {
+			for k := 1; k < nodes; k++ {
+				heads[i] = g.mustMerge(heads[i], prev[(i+k)%nodes], opts)
+			}
+		}
+	}
+	t.Logf("heads 0,1 have %d nearest common ancestors", len(g.s.dag.MergeBases([]codec.Hash{heads[0]}, []codec.Hash{heads[1]})))
+	final := heads[0]
+	for i := 1; i < nodes; i++ {
+		final = g.mustMerge(final, heads[i], opts)
+	}
+	got := g.body(final)["n"].(float64)
+	if int(got) != want {
+		t.Fatalf("converged counter %v, want %d (every increment once)", got, want)
+	}
+	// Generous: proportional to the history, nowhere near the exponential count.
+	if limit := nodes * nodes * rounds * 40; calls > limit {
+		t.Fatalf("building the lattice ran the conflict rule %d times (limit %d): virtual base work is not bounded", calls, limit)
+	}
+	t.Logf("the whole lattice ran the conflict rule %d times over %d nodes x %d rounds", calls, nodes, rounds)
+}
