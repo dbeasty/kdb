@@ -138,5 +138,5 @@ func (d *InMemoryCommitDag) GraphSettings() GraphSettings {
 func (d *InMemoryCommitDag) GraphFileActive() bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.graphFile != nil
+	return d.nodes.base != nil
 }

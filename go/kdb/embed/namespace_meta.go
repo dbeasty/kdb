@@ -42,6 +42,12 @@ func namespaceMetaPath(dataRoot, namespaceID string) string {
 	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "meta.json")
 }
 
+// graphFilePath is where a namespace's mapped commit graph lives, beside its metadata. It is
+// derived state: deleting it costs a rebuild, never data.
+func graphFilePath(dataRoot, namespaceID string) string {
+	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "graph.kdbg")
+}
+
 func readNamespaceMeta(dataRoot, namespaceID string) (namespaceMeta, bool) {
 	raw, err := os.ReadFile(namespaceMetaPath(dataRoot, namespaceID))
 	if err != nil {

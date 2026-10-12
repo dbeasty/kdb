@@ -1,10 +1,15 @@
 package server
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"testing"
 	"time"
+
+	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 )
 
 func TestMemoryGuardDisabledByDefaultNeverRejects(t *testing.T) {
@@ -150,5 +155,29 @@ func TestMemoryGuardPressureClearsOnItsOwn(t *testing.T) {
 		t.Fatalf("expected pressure to clear on its own once the memory was freed and returned to "+
 			"the OS - a guard that never reverses is exactly the zombie behavior Component 48 fixes "+
 			"(base=%d limit=%d final usage=%v)", uint64(base), limit, currentMemoryUsageBytes())
+	}
+}
+
+// Off a cgroup, a mapped file must show up in what the guard measures - otherwise a mapped
+// commit graph is invisible to the zones on macOS.
+func TestMemoryUsageChargesMappedFilesOffCgroup(t *testing.T) {
+	if _, ok := cgroupMemoryCurrentBytes(); ok {
+		t.Skip("cgroup accounting already charges page cache")
+	}
+	p := filepath.Join(t.TempDir(), "m")
+	if err := os.WriteFile(p, make([]byte, 64<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := mmapfile.Open(p)
+	if errors.Is(err, mmapfile.ErrUnsupported) {
+		t.Skip("no mmap")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	diff := currentMemoryUsageBytes() - goRuntimeFootprintBytes()
+	if diff < 64<<20 {
+		t.Fatalf("mapped 64MB but the guard charged only %.0f bytes for it", diff)
 	}
 }

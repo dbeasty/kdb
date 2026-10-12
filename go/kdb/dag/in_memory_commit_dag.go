@@ -141,11 +141,10 @@ type InMemoryCommitDag struct {
 	// generation(parent) < generation(child) and must be rebuilt before
 	// anything prunes with them. See storeCommitLocked.
 	genStale bool
-	// graphFile is the mapped graph, once there is one. Always nil today -
-	// the format is not implemented - and read through GraphFileActive,
-	// which is what tells a status report or a fallback test the
-	// difference between "asked for" and "in use".
-	graphFile *graphFile
+	// graphPath is where the mapped commit graph lives (see graph_attach.go); the mapping itself
+	// is nodes' base tier. graphRebuild serializes rebuilds, which write without holding mu.
+	graphPath    string
+	graphRebuild sync.Mutex
 
 	// provisional holds commits appended as one part of a cross-namespace group that has not
 	// been durably decided yet; provisionalGen counts every such append. See provisional.go.
@@ -156,12 +155,6 @@ type InMemoryCommitDag struct {
 	// unlogged.go. Lazily created.
 	unlogged map[codec.Hash]struct{}
 }
-
-// graphFile is a placeholder for the mapped on-disk commit graph
-// (docs/kdb-commit-graph-on-disk.md, Phase 2). It exists now so that
-// GraphFileActive has something honest to report and so the settings that
-// gate it can be plumbed and tested before the format lands.
-type graphFile struct{}
 
 // publishHeadLocked recomputes the head snapshot from the maps and publishes it. Must be
 // called with mu held exclusively, on every path that changes d.branches or d.commits.
@@ -393,7 +386,7 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 	// that happens to reuse the id (which should never legitimately happen, since ids are random
 	// UUIDs minted fresh per transaction attempt, but "first wins" is the safer tie-break if it
 	// ever did).
-	if _, exists := d.txIndex[commit.TransactionID]; !exists {
+	if _, exists := d.txIndexLookupLocked(commit.TransactionID); !exists {
 		d.txIndex[commit.TransactionID] = commit.Hash
 	}
 	// A commit arriving here can be the one the head already names (delta replay onto a
@@ -412,12 +405,25 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 // thousand entries - see docs/benchmarks/lightsail-sim/README.md.
 func (d *InMemoryCommitDag) GetCommitByTransactionID(txID codec.UUID) (document.Commit, bool) {
 	d.mu.RLock()
-	hash, ok := d.txIndex[txID]
+	hash, ok := d.txIndexLookupLocked(txID)
 	d.mu.RUnlock()
 	if !ok {
 		return document.Commit{}, false
 	}
 	return d.GetCommit(hash)
+}
+
+// txIndexLookupLocked resolves a transaction id through the resident index, then the graph
+// file's - which holds the entries an attach moved out of txIndex. A file entry counts only while
+// the commit it names is still in the DAG. Must hold mu.
+func (d *InMemoryCommitDag) txIndexLookupLocked(txID codec.UUID) (codec.Hash, bool) {
+	if h, ok := d.txIndex[txID]; ok {
+		return h, true
+	}
+	if h, ok := d.nodes.base.findTx(txID); ok && d.nodes.has(h) {
+		return h, true
+	}
+	return codec.Hash{}, false
 }
 
 // StubCommit archives a commit in place.

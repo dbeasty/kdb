@@ -105,7 +105,7 @@ func TestGraphSettingsReachTheDag(t *testing.T) {
 		t.Errorf("DAG settings = %+v, want %+v", got, want)
 	}
 	if p.delegate.GraphFileActive() {
-		t.Error("a graph file is reported active, but none is implemented")
+		t.Error("a fresh namespace below the rebuild threshold should not have a graph file yet")
 	}
 }
 

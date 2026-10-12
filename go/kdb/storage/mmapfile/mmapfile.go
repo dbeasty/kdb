@@ -127,6 +127,20 @@ func (r *Region) CopyAt(off, n int) (out []byte, err error) {
 	return out, nil
 }
 
+// Guard runs fn over the mapped bytes, converting a fault on the mapped pages into an error the
+// way CopyAt does, without copying. fn must not retain the slice.
+func (r *Region) Guard(fn func([]byte)) (err error) {
+	prev := debug.SetPanicOnFault(true)
+	defer debug.SetPanicOnFault(prev)
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("mmapfile: fault reading mapped file: %v", rec)
+		}
+	}()
+	fn(r.m.data)
+	return nil
+}
+
 // Release returns the reference. Safe to call more than once.
 func (r *Region) Release() {
 	if r.released {

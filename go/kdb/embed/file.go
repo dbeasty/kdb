@@ -2,6 +2,7 @@ package embed
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -200,6 +201,25 @@ func (h *Host) openNamespace(
 		// history truncated away. Either way some bodies may exist only in the blob store.
 		eng.SetBodiesExternal(true)
 	}
+	if opts.Storage.Graph.FileEnabled {
+		// After restore, so the DAG already holds every commit and the file can only take
+		// commits out of the heap, never put one in (see dag.nodeStore.attach).
+		d.ConfigureGraphFile(graphFilePath(dataRoot, namespaceID))
+		if err := d.OpenGraphFile(); err != nil {
+			log.Printf("kdb: namespace %s: graph file unusable (%v) - removed; commits stay in memory until it is rebuilt", namespaceID, err)
+		}
+		defer func() {
+			if !handleClosed {
+				d.CloseGraphFile()
+			}
+		}()
+		// A read-only runtime shares the directory with a writer and never writes into it.
+		if !opts.ReadOnly {
+			if _, err := d.MaybeRebuildGraphFile(); err != nil {
+				log.Printf("kdb: namespace %s: could not write the graph file (%v) - commits stay in memory", namespaceID, err)
+			}
+		}
+	}
 	dagOut := dag.CommitDAG(d)
 	var persisting *PersistingCommitDAG
 	if w := handle.DeltaWriter(); w != nil && !opts.ReadOnly {
@@ -285,6 +305,8 @@ func (h *Host) openNamespace(
 		if err := handle.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		// Last: the checkpoint above reads every commit, some of which live only in the file.
+		d.CloseGraphFile()
 		return firstErr
 	}
 	// Closing the runtime closes this namespace through the host, which is what owns the
@@ -303,10 +325,16 @@ func (h *Host) openNamespace(
 				}
 			}
 			now := time.Now()
-			return checkpointAndTruncate(
+			res, err := checkpointAndTruncate(
 				d, store, r, io, namespaceID, through,
 				rt.withPeerFloor(liveRetention(store, opts.Storage.Retain), now), now, opts.Storage.DisableCheckpoints,
 				liveReclaim(store))
+			// The maintenance pass is where the graph file catches up with the commits appended
+			// since it was written; a no-op until the resident tier passes the rebuild threshold.
+			if _, gerr := d.MaybeRebuildGraphFile(); gerr != nil {
+				log.Printf("kdb: namespace %s: could not rebuild the graph file (%v) - commits stay in memory", namespaceID, gerr)
+			}
+			return res, err
 		}
 	}
 
