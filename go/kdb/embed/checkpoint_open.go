@@ -263,6 +263,7 @@ func saveCheckpoint(
 	if d.HasProvisional() || d.ProvisionalGeneration() != provisionalGen {
 		return ErrCheckpointDeferred
 	}
+	rememberCheckpointFingerprints(r, segments)
 	if err := writeCheckpoint(shim, namespaceCheckpoint{
 		NamespaceID:     namespaceID,
 		ThroughSequence: through,

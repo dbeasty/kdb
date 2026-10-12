@@ -596,9 +596,63 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 // segmentFingerprints reads the current shape of every delta segment up to
 // and including through. Uses the reader's own listing, which open already
 // performs, so this adds no I/O of its own.
+// rememberedFingerprints fingerprints the segments through `through` reading only those whose
+// fingerprint the reader cannot vouch for from a stamp (storage.DeltaFingerprintMemo). ok is false
+// when the reader cannot do this, or any segment could not be scanned on its own - the caller then
+// takes the full listing, which owns every rule about missing and unreadable segments.
+func rememberedFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpointSegment, bool) {
+	memo, ok1 := r.(storage.DeltaFingerprintMemo)
+	lister, ok2 := r.(storage.DeltaSegmentSequenceLister)
+	stamper, ok3 := r.(storage.DeltaSegmentStamper)
+	if !ok1 || !ok2 || !ok3 {
+		return nil, false
+	}
+	seqs, err := lister.SegmentSequences()
+	if err != nil {
+		return nil, false
+	}
+	var out []checkpointSegment
+	for _, seq := range seqs {
+		if seq > through {
+			continue
+		}
+		if stamp, size, last, ok := memo.RememberedFingerprint(seq); ok {
+			out = append(out, checkpointSegment{Sequence: seq, SizeBytes: size, LastCommitHash: last, Stamp: stamp, HasStamp: true})
+			continue
+		}
+		ref, err := memo.SegmentRef(seq)
+		if err != nil {
+			return nil, false
+		}
+		fp := checkpointSegment{Sequence: seq, SizeBytes: ref.SizeBytes, LastCommitHash: ref.LastCommitHash}
+		if st, ok, err := stamper.StampSegment(seq); err == nil && ok && st.Size >= ref.SizeBytes {
+			fp.Stamp, fp.HasStamp = st, true
+		}
+		out = append(out, fp)
+	}
+	return out, true
+}
+
+// rememberCheckpointFingerprints tells the reader what the stamped segments of cp looked like, so
+// later checkpoints in this process need not scan them while their stamps hold.
+func rememberCheckpointFingerprints(r storage.DeltaSegmentReader, segs []checkpointSegment) {
+	memo, ok := r.(storage.DeltaFingerprintMemo)
+	if !ok {
+		return
+	}
+	for _, sg := range segs {
+		if sg.HasStamp {
+			memo.RememberFingerprint(sg.Sequence, sg.Stamp, sg.SizeBytes, sg.LastCommitHash)
+		}
+	}
+}
+
 func segmentFingerprints(r storage.DeltaSegmentReader, through int64) ([]checkpointSegment, error) {
 	if r == nil {
 		return nil, nil
+	}
+	if fps, ok := rememberedFingerprints(r, through); ok {
+		return fps, nil
 	}
 	segments, err := r.ListSegments()
 	if err != nil {
@@ -679,6 +733,9 @@ func unchangedSinceCheckpoint(cp namespaceCheckpoint, r storage.DeltaSegmentRead
 
 func checkpointMatchesLog(cp namespaceCheckpoint, r storage.DeltaSegmentReader) (bool, string) {
 	if unchangedSinceCheckpoint(cp, r) {
+		// Trusted on stamps, so nothing was scanned; hand the fingerprints to the reader, or the
+		// next checkpoint would scan every segment to rediscover them.
+		rememberCheckpointFingerprints(r, cp.Segments)
 		return true, ""
 	}
 	current, err := segmentFingerprints(r, cp.ThroughSequence)

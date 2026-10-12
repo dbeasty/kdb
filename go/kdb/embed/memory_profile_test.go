@@ -51,6 +51,9 @@ func TestMemoryProfile(t *testing.T) {
 	if os.Getenv("KDB_MEMPROFILE_GRAPH") == "1" {
 		opts.Storage.Graph = dag.GraphSettings{FileEnabled: true}
 	}
+	if m := os.Getenv("KDB_MEMPROFILE_MEMORY"); m != "" {
+		opts.Storage.Graph.Memory = dag.GraphMemory(m) // "go" or "kdb"; ignored by builds without it
+	}
 	docID := func(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", i) }
 	put := func(rt *EmbeddedKdbRuntime, i, rev int) {
 		b, _ := json.Marshal(map[string]any{"id": docID(i), "rev": rev, "name": fmt.Sprintf("user-%d", i), "score": rev % 997})

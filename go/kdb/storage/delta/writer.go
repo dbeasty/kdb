@@ -241,6 +241,15 @@ type DefaultReader struct {
 	// nothing; the segment still open for appends is never stamped and so always rescanned.
 	scansMu sync.Mutex
 	scans   map[string]cachedScan
+	// fps are fingerprints learned without a scan - from a checkpoint whose stamps still match -
+	// keyed by sequence. Guarded by scansMu. See RememberFingerprint.
+	fps map[int64]rememberedFP
+}
+
+type rememberedFP struct {
+	stamp storage.SegmentStamp
+	size  int64
+	last  codec.Hash
 }
 
 type cachedScan struct {
@@ -342,6 +351,49 @@ func (r *DefaultReader) StampSegment(sequence int64) (storage.SegmentStamp, bool
 }
 
 var _ storage.DeltaSegmentStamper = (*DefaultReader)(nil)
+
+// RememberFingerprint records what a segment's fingerprint was under stamp - from a checkpoint
+// open trusted on its stamps, or one just written - so the next checkpoint need not scan the
+// segment again while its stamp is unchanged.
+func (r *DefaultReader) RememberFingerprint(sequence int64, stamp storage.SegmentStamp, sizeBytes int64, lastCommit codec.Hash) {
+	r.scansMu.Lock()
+	defer r.scansMu.Unlock()
+	if r.fps == nil {
+		r.fps = make(map[int64]rememberedFP)
+	}
+	r.fps[sequence] = rememberedFP{stamp: stamp, size: sizeBytes, last: lastCommit}
+}
+
+// RememberedFingerprint returns a segment's fingerprint without reading it, when one was
+// remembered or scanned under the stamp the segment still has.
+func (r *DefaultReader) RememberedFingerprint(sequence int64) (storage.SegmentStamp, int64, codec.Hash, bool) {
+	now, ok, err := r.StampSegment(sequence)
+	if err != nil || !ok {
+		return storage.SegmentStamp{}, 0, codec.Hash{}, false
+	}
+	name := storio.SegmentNameBuilder.DeltaSequenced(r.namespaceID, sequence)
+	r.scansMu.Lock()
+	defer r.scansMu.Unlock()
+	if fp, ok := r.fps[sequence]; ok && fp.stamp == now {
+		return now, fp.size, fp.last, true
+	}
+	if c, ok := r.scans[name]; ok && c.stamp == now {
+		return now, c.ref.SizeBytes, c.ref.LastCommitHash, true
+	}
+	return storage.SegmentStamp{}, 0, codec.Hash{}, false
+}
+
+// SegmentRef scans one segment by sequence number, through the scan cache.
+func (r *DefaultReader) SegmentRef(sequence int64) (*storage.DeltaSegmentRef, error) {
+	name := storio.SegmentNameBuilder.DeltaSequenced(r.namespaceID, sequence)
+	ref, err := r.cachedScanSegmentRef(name, sequence)
+	if err == nil && ref == nil {
+		err = errors.New("scan produced no segment reference")
+	}
+	return ref, err
+}
+
+var _ storage.DeltaFingerprintMemo = (*DefaultReader)(nil)
 
 func (r *DefaultReader) listSegments(afterSequence int64) ([]storage.DeltaSegmentRef, error) {
 	prefix := storio.SegmentNameBuilder.NamespacePrefix(r.namespaceID) + "delta/"

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
@@ -104,5 +105,36 @@ func TestListSegmentsRescansASegmentChangedInPlace(t *testing.T) {
 	}
 	if got[1].Tail.Kind == storage.TailClean {
 		t.Fatal("the damaged segment still lists as clean")
+	}
+}
+
+// A fingerprint remembered under a stamp is answered without reading the segment, and only while
+// the segment still has that stamp.
+func TestRememberedFingerprintNeedsTheSameStamp(t *testing.T) {
+	fb, root := diskShim(t)
+	cfg := newConfig(fb, storage.CompressionNone)
+	writeChainAcross(t, cfg, []int64{0}, 3)
+	cs := &countingShim{FileBackedPlatformIO: fb}
+	r := NewDefaultReader(testNS, cs, cfg)
+	st, ok, err := r.StampSegment(0)
+	if err != nil || !ok {
+		t.Fatalf("cannot stamp: %v %v", ok, err)
+	}
+	var last codec.Hash
+	last.Bytes[0] = 7
+	r.RememberFingerprint(0, st, 123, last)
+	if _, size, got, ok := r.RememberedFingerprint(0); !ok || size != 123 || got != last {
+		t.Fatalf("remembered fingerprint not returned: %v %d", ok, size)
+	}
+	if n := cs.read.Load(); n != 0 {
+		t.Fatalf("answering a remembered fingerprint read %d bytes", n)
+	}
+	path := filepath.Join(root, filepath.FromSlash(segName(0)))
+	raw, _ := os.ReadFile(path)
+	if err := os.WriteFile(path, raw, 0o644); err != nil { // same bytes, new mtime
+		t.Fatal(err)
+	}
+	if _, _, _, ok := r.RememberedFingerprint(0); ok {
+		t.Fatal("a fingerprint was returned for a segment whose stamp changed")
 	}
 }
