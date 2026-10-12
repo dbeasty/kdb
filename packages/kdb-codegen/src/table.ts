@@ -47,8 +47,9 @@ export class Table<Doc, Cols extends Columns> {
   }
 
   /** Installs the schema on the namespace (`CREATE TABLE`). Run once, before the first write. */
-  create(options?: CallOptions): Promise<void> {
-    return this.#ops.exec(this.meta.namespace, this.meta.createSql, [], options);
+  async create(options?: CallOptions): Promise<void> {
+    // @kdb/client's exec resolves to the rows affected; the declared result here is void.
+    await this.#ops.exec(this.meta.namespace, this.meta.createSql, [], options);
   }
 
   /**
