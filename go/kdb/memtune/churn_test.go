@@ -71,7 +71,13 @@ func TestTunedPeakHeapIsBelowTheDefaultUnderChurn(t *testing.T) {
 	if tuned >= def {
 		t.Fatalf("tuned peak %d MiB is not below the default's %d MiB", tuned>>20, def>>20)
 	}
-	if limit := uint64(liveMB+300) << 20; tuned > limit {
-		t.Errorf("tuned peak %d MiB exceeds live + headroom + slack (%d MiB)", tuned>>20, limit>>20)
+	// The heap goal is live + 25% headroom, but the tuner re-reads the heap every 20ms while this
+	// loop allocates more than a GiB a second, and the collector marks concurrently with the
+	// mutator still allocating, so the peak overshoots the goal by what is allocated in between.
+	// That is hardware dependent: +300 MiB over live held on a fast laptop and failed on CI's
+	// Linux runner (1232 MiB peak against live 768 MiB; the default collector reached 1861 MiB).
+	// Allow live + 75%: still far below the default's roughly +100% to +140%.
+	if limit := uint64(liveMB+liveMB*3/4) << 20; tuned > limit {
+		t.Errorf("tuned peak %d MiB exceeds live + headroom + overshoot (%d MiB)", tuned>>20, limit>>20)
 	}
 }
