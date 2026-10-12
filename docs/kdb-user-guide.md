@@ -1372,8 +1372,9 @@ call other systems, look up which site is trusted, or ask a person.
 ### Deciding conflicts with your own code
 
 The built-in rules are about the shape of a conflict, not what the data means. When the answer is
-"a cancelled order stays cancelled" or "add the two counters together", write a **stored
-procedure** and have the chain call it.
+"a cancelled order stays cancelled" or "a counter must keep every node's increments", write a
+**stored procedure** and have the chain call it. Read "What a merge-time procedure can rely on"
+below before writing one: a merge hands a procedure two states, not two lists of changes.
 
 A procedure is JavaScript defining `main(conflict)`. Define it before any chain names it:
 
@@ -1389,12 +1390,20 @@ Then call it from the chain:
 {"rules": [{"kind": "procedure", "name": "keepCancelled"}, {"kind": "field-merge"}, {"kind": "queue"}]}
 ```
 
-**What the procedure is given.** One conflicting document: `local` and `remote` (either can be
-`null`, meaning that side deleted it), `base` — the value they last agreed on — `origins`, saying
-which node wrote each side and when, and `fields`, the list of paths on which the two sides
-actually differ, each marked `local`, `remote`, `both` or `same`. Inside a merge, `local` and
-`remote` are fixed sides rather than "this node" and "the other one"; say `side0`/`side1` if that
-matters to you.
+**What the procedure is given.** One conflicting document:
+- `local` and `remote`: the document's whole current value on each side (`null` where that side
+  deleted it). Inside a merge they are fixed sides, not "this node" and "the other one": `local`
+  (alias `side0`) belongs to the head with the lower hash, so every node sees the same two sides
+  in the same order. Say `side0`/`side1` if that matters to you.
+- `base`: the document's value at *one* common ancestor of the two heads (`null` if it did not
+  exist there). It is not necessarily the value both sides started from: when the heads have
+  several nearest common ancestors (two nodes that merged each other's work in different orders),
+  only one of them is used.
+- `origins`: for each side, the commit that produced that value (`nodeId`, `commit`,
+  `timestampMicros`). A value an earlier merge built has that merge commit as its origin, not the
+  writes it was built from.
+- `fields`: the paths on which the two sides differ from `base`, each marked `local`, `remote`,
+  `both` or `same`. It is computed against that one `base`, so it inherits its caveat.
 
 **What it can return.** Exactly one of `{take: "local"}`, `{doc: {…}}` (a document you built),
 `{fork: {keep: "local"}}`, `{delete: true}` or `{defer: true}` to pass to the next rule.
@@ -1415,6 +1424,92 @@ back-reference is how your application finds the pair.
   holds — compare two nodes to see why they have stopped.
 - a procedure that throws or times out **holds the merge** and says so in the conflict's
   `details[].reason`. It never falls through to the next rule.
+
+#### What a merge-time procedure can rely on
+
+**When it is called.** Only for a document whose value differs between the two heads *and* that
+both sides changed since they diverged (or, after earlier merges crossed, that neither side
+changed but the two still differ). It is **not** called:
+- when the two sides hold the same value, however each got there. Two nodes that each turned
+  `n: 0` into `n: 1` hold equal documents, and the merge simply keeps `n: 1`;
+- when only one side changed the document. That side's value is taken whole.
+
+**How often, where and over what.** A merge combines two heads at a time, and every node merges.
+So the same procedure:
+- may run more than once for the same writes, on different nodes, pairing the sides in different
+  orders: three concurrent writes A, B, C are merged as (A, B) then C on one node and (A, C) then
+  B on another;
+- receives results of earlier merges, its own included, as `local` or `remote`;
+- gets whichever single `base` the merge found, which may be older than the last value both sides
+  really shared.
+
+Every node must still end on the same value. So **the procedure must be a merge of states, not a
+replay of operations**: a deterministic function of `local` and `remote` that is
+
+- *commutative*: merging A with B gives what merging B with A gives;
+- *associative*: merging (A, B) and then C gives what merging A and then (B, C) gives;
+- *idempotent*: merging A with itself, or with something A already contains, gives A.
+
+Use `base` as a hint at most, never as something to subtract. If a value has to remember who did
+what, keep that in the document itself, as the counter below does.
+
+**A counter: one entry per node, merged by max.** Don't store the count; store each node's own
+count, and have each node only ever raise its own entry:
+
+```json
+{"counts": {"<node A id>": 3, "<node B id>": 5}}
+```
+
+A node incrementing does a compare-and-set on its own key (`counts["<its id>"] += 1`; `kdb node
+status` prints a node's id, and any id that only one writer uses works). The total is computed when
+you read: the sum of the values, 8 here. The merge takes each key's larger value, which already
+includes the smaller one's increments:
+
+```javascript
+function main(c) {
+  if (c.local === null || c.remote === null) { return { defer: true }; }  // a delete: next rule
+  var a = c.local.counts || {}, b = c.remote.counts || {};
+  var max = {};
+  for (var k in a) { max[k] = a[k]; }
+  for (var k in b) { if (!(k in max) || b[k] > max[k]) { max[k] = b[k]; } }
+  var counts = {};
+  Object.keys(max).sort().forEach(function (k) { counts[k] = max[k]; });  // sorted: see below
+  var out = {};
+  Object.keys(c.local).sort().forEach(function (k) { out[k] = c.local[k]; });
+  out.counts = counts;
+  return { doc: out };
+}
+```
+
+Copying the document's other fields from `local` is only right if nothing else in it changes
+concurrently. Keep the counter in a document of its own, or give the other fields a merge of their
+own. A per-node counter can count down too: keep a second map of decrements, merged the same way,
+and read `sum(increments) - sum(decrements)`.
+
+**Other safe patterns.**
+- *Set union.* Collect both arrays into a set, then sort it (`merge-array-union-tags` in
+  `go/testdata/golden/conflict_corpus`). A plain union cannot remove an element: a removal on one
+  side comes back from the other. If you need removals, keep removed elements in a second set.
+- *Max or min* of a number or a string, such as a high-water mark or the earliest deadline.
+- *A status that only moves forward* (`draft < sent < cancelled`): take the later of the two
+  states. `keepCancelled` above does this for its last state.
+
+**Build output in a fixed order.** The merged document is compared byte for byte, so two nodes
+must build the same bytes. Emit object keys sorted and sort arrays, as above. Don't depend on the
+order of `for … in` over two objects merged together.
+
+**Don't:**
+- compute `local + remote - base`, or anything else that adds up differences from `base`. It
+  replays changes against a base that may be the wrong one, over values that may already contain
+  each other, and it is never called when both sides reached the same value. Increments get
+  counted twice or lost, and over many merges the error compounds: in testing, 603 increments on
+  five nodes converged on a number near 6×10³⁰.
+- append to an array without removing duplicates. The same element arrives through more than one
+  merge.
+- decide by time: neither a wall-clock timestamp your application writes into documents (clocks
+  on different machines disagree, and a merge cannot tell a late write from a skewed clock) nor
+  `origins[…].timestampMicros` (the origin of a merged value is the merge commit, stamped when the
+  merge was made). Inside a merge the clock itself is not available.
 
 **When you need a database read or non-deterministic logic**, put the procedure on the authority
 instead of in the merge:

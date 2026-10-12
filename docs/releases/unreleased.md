@@ -130,6 +130,19 @@ from 27 to 40 packages.
 `CGO_ENABLED=0` on every release platform. A consumer that imports only the in-process
 packages compiles none of this in, but the requirements are in the bundle's module graph.
 
+## Fixes — procedures
+
+**A procedure used as a conflict resolver must merge states, and the docs now say so.** The user
+guide suggested "add the two counters together", and a procedure computing `local + remote - base`
+cannot be correct: a merge never offers a document both sides hold with the same value, `base` is
+one common ancestor and can be stale, and the procedure runs again on every node over earlier merge
+results. In testing, two +1s converged on 1 and 603 increments on five nodes on about 6×10³⁰. The
+user guide ("What a merge-time procedure can rely on") and spec §12.4.1 now state what a procedure
+receives and when it runs, require a deterministic function that is commutative, associative and
+idempotent, and replace the example with a per-node counter (`{counts: {<node>: n}}`, merged by
+per-key max, total summed on read), plus set union and max/min. Merge behaviour is unchanged; an
+existing summing procedure keeps miscounting until it is rewritten.
+
 ## Upgrading
 
 **Upgrade one node at a time.** Stop a node (cleanly, or after a crash), start the new binary on
