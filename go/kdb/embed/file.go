@@ -154,6 +154,11 @@ func (h *Host) openNamespace(
 	// whether it is deriving them by the time restoreNamespace starts
 	// putting commits in.
 	d.SetGraphSettings(opts.Storage.Graph)
+	if opts.Storage.Graph.FileEnabled {
+		// Before restore: a checkpoint may name graph segments instead of carrying their
+		// commits, and restore maps them (dag.AttachCheckpointGraph).
+		d.ConfigureGraphFile(graphDirPath(dataRoot, namespaceID), opts.ReadOnly)
+	}
 
 	store := handle.Adapter()
 	if store == nil {
@@ -202,11 +207,13 @@ func (h *Host) openNamespace(
 		eng.SetBodiesExternal(true)
 	}
 	if opts.Storage.Graph.FileEnabled {
-		// After restore, so the DAG already holds every commit and the file can only take
-		// commits out of the heap, never put one in (see dag.nodeStore.attach).
-		d.ConfigureGraphFile(graphDirPath(dataRoot, namespaceID), opts.ReadOnly)
-		if err := d.OpenGraphFile(); err != nil {
-			log.Printf("kdb: namespace %s: graph file unusable (%v) - removed; commits stay in memory until it is rebuilt", namespaceID, err)
+		// A checkpoint that named its segments has attached them already. Otherwise - an older
+		// checkpoint, or a full replay - the DAG holds every commit and the segments on disk can
+		// only take commits out of the heap, never put one in (see dag.nodeStore.attach).
+		if !d.GraphFileActive() {
+			if err := d.OpenGraphFile(); err != nil {
+				log.Printf("kdb: namespace %s: graph file unusable (%v) - removed; commits stay in memory until it is rebuilt", namespaceID, err)
+			}
 		}
 		defer func() {
 			if !handleClosed {

@@ -183,11 +183,14 @@ func (d *InMemoryCommitDag) evictOpsLocked(protect codec.Hash) {
 // need loading before the commit can be handed to anything that reads
 // them.
 func (d *InMemoryCommitDag) opsEvictedFor(hash codec.Hash) bool {
-	if d.opsEvicted == nil {
-		return false
+	if d.opsEvicted != nil {
+		if _, ok := d.opsEvicted[hash]; ok {
+			return true
+		}
 	}
-	_, ok := d.opsEvicted[hash]
-	return ok
+	// A commit in a graph segment carries the answer in its record, so the set above need not
+	// hold an entry for every commit in history.
+	return d.nodes.segmentOpsEvicted(hash)
 }
 
 // hydrate returns c with its operations loaded back. Deliberately does not

@@ -43,7 +43,7 @@ import (
 //
 // Segment layout, little-endian:
 //
-//	header   magic "KDBGRAF2" | version u32 | flags u32 | seq u64 | nsLen u32 | ns | pad to 8
+//	header   magic "KDBGRAF3" | version u32 | flags u32 | seq u64 | nsLen u32 | ns | pad to 8
 //	records  count x graphRecordSize, sorted by hash
 //	tidx     txCount x graphTxEntrySize, sorted by tx    (tx MSB u64 BE, LSB u64 BE, hash)
 //	fanout   256 x u32: fanout[b] = records whose hash[0] <= b
@@ -60,8 +60,8 @@ import (
 // rebuilt - and a full flush of a file this size would stall every neighbouring writer on macOS.
 
 const (
-	graphMagic       = "KDBGRAF2"
-	graphVersion     = 2
+	graphMagic       = "KDBGRAF3"
+	graphVersion     = 3          // 3: records carry grFlagHasOps
 	graphFooterMagic = 0x4B474632 // "KGF2"
 	graphTxEntrySize = 48
 	graphFooterSize  = 9*8 + 4 + 4
@@ -125,6 +125,7 @@ type graphBase struct {
 	msgs      []byte
 	extra     []byte
 	fileBytes int64
+	crc       uint32 // the footer checksum: the segment's identity in a checkpoint's reference
 }
 
 // openGraphBase maps path and checks it end to end. The returned base holds one reference on the
@@ -163,6 +164,7 @@ func (b *graphBase) parse(namespaceID string) error {
 	if gerr := b.region.Guard(func(all []byte) { got = crc32.Checksum(all[:len(all)-8], crcTable) }); gerr != nil {
 		return gerr
 	}
+	b.crc = got
 	if got != want {
 		return fmt.Errorf("checksum mismatch (want %08x, got %08x)", want, got)
 	}

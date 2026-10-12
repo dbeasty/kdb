@@ -119,11 +119,18 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 		active    = 1
 		done      = 2
 	)
-	state := make(map[codec.Hash]uint8, d.nodes.len())
-	gen := make(map[codec.Hash]uint32, d.nodes.len())
+	// Only the resident tier is recomputed. Graph segments are written after
+	// ensureGenerationsLocked and nothing below them can arrive late, so their
+	// generations are sound and a walk that reaches one stops there - which is
+	// what keeps this proportional to the resident tier rather than to all of
+	// history once the graph is on disk.
+	state := make(map[codec.Hash]uint8, d.nodes.residentLen())
+	gen := make(map[codec.Hash]uint32, d.nodes.residentLen())
 
-	var roots []codec.Hash
-	d.nodes.forEach(func(h codec.Hash) { roots = append(roots, h) })
+	roots := make([]codec.Hash, 0, d.nodes.residentLen())
+	for h := range d.nodes.index {
+		roots = append(roots, h)
+	}
 	for _, root := range roots {
 		if state[root] != unvisited {
 			continue
@@ -145,6 +152,13 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 					return true
 				})
 				gen[h] = max + 1
+				state[h] = done
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			if _, resident := d.nodes.index[h]; !resident && d.nodes.has(h) {
+				// In a segment: its generation is settled.
+				gen[h] = d.nodes.generation(h)
 				state[h] = done
 				stack = stack[:len(stack)-1]
 				continue

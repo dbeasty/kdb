@@ -205,3 +205,108 @@ func mmapSupported() bool {
 	m.Close()
 	return true
 }
+
+// With segments attached, the checkpoint names them and carries only the resident tier; a reopen
+// maps them and restores the rest, with history - operations included - unchanged.
+func TestGraphCheckpointReferencesSegments(t *testing.T) {
+	skipIfNoMmap(t)
+	root := t.TempDir()
+	const ns = "test/graphcp"
+	rt, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), graphOpts(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRevs(t, rt, ns, 0, 60)
+	if _, err := rt.Maintain(); err != nil { // checkpoint, then the first graph write
+		t.Fatal(err)
+	}
+	writeRevs(t, rt, ns, 60, 65)
+	want := historyOf(t, rt)
+	rt.Close() // writes a checkpoint that names the segment
+
+	cp, ok := readCheckpoint(rt.shim, ns)
+	if !ok {
+		t.Fatal("no checkpoint after close")
+	}
+	if len(cp.GraphRefs) == 0 {
+		t.Fatal("checkpoint does not reference the graph segments")
+	}
+	if n := len(cp.State.Commits); n > 10 {
+		t.Fatalf("checkpoint carries %d commits; it should carry only the resident tier", n)
+	}
+
+	rt2, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), graphOpts(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+	if rt2.Recovery().ReplayedInFull {
+		t.Fatal("reopen replayed the log instead of restoring from the checkpoint")
+	}
+	if got := historyOf(t, rt2); !reflect.DeepEqual(got, want) {
+		t.Fatalf("history differs after a graph-referencing restore: %d vs %d commits", len(got), len(want))
+	}
+	writeRevs(t, rt2, ns, 65, 70)
+}
+
+// A segment the checkpoint on disk names must survive a full rewrite that supersedes it, until a
+// newer checkpoint stops naming it - otherwise a crash in between leaves a checkpoint whose
+// segments are gone.
+func TestGraphCheckpointPinsItsSegments(t *testing.T) {
+	skipIfNoMmap(t)
+	root := t.TempDir()
+	const ns = "test/graphpin"
+	rt, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), graphOpts(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRevs(t, rt, ns, 0, 20)
+	rt.Maintain() // graph written
+	rt.Close()    // the checkpoint written on close names it
+	cp, _ := readCheckpoint(rt.shim, ns)
+	if len(cp.GraphRefs) == 0 {
+		t.Fatal("checkpoint does not name a segment")
+	}
+	named := filepath.Join(graphDirPath(root, ns), fmt.Sprintf("graph-%016d.kdbg", cp.GraphRefs[0].Seq))
+
+	rt2, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), graphOpts(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRevs(t, rt2, ns, 20, 25)
+	if err := rt2.CompactCommitGraph(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(named); err != nil {
+		t.Fatal("a full rewrite deleted the segment the checkpoint on disk names")
+	}
+	rt2.Close() // new checkpoint names the new segment; the old one may go
+	if _, err := os.Stat(named); !os.IsNotExist(err) {
+		t.Fatalf("superseded segment still on disk after a newer checkpoint (%v)", err)
+	}
+}
+
+// A checkpoint whose named segment has gone is unusable; open replays the log and loses nothing.
+func TestGraphCheckpointMissingSegmentReplays(t *testing.T) {
+	skipIfNoMmap(t)
+	root := t.TempDir()
+	const ns = "test/graphmissing"
+	rt, _ := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), graphOpts(10))
+	writeRevs(t, rt, ns, 0, 25)
+	rt.Maintain()
+	want := historyOf(t, rt)
+	rt.Close()
+	os.RemoveAll(graphDirPath(root, ns))
+
+	rt2, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), graphOpts(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+	if !rt2.Recovery().ReplayedInFull {
+		t.Fatal("open trusted a checkpoint whose segments are gone")
+	}
+	if got := historyOf(t, rt2); !reflect.DeepEqual(got, want) {
+		t.Fatal("history lost when the named segments were missing")
+	}
+}

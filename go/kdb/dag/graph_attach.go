@@ -190,6 +190,9 @@ func (d *InMemoryCommitDag) writeGraph(forceFull bool) (bool, error) {
 			got, ok := d.txIndex[tx]
 			return ok && got == h
 		},
+		func(h codec.Hash) bool {
+			return len(d.nodes.ops[h]) > 0 || d.opsEvictedFor(h)
+		},
 	)
 	dir, seq := d.graphDir, d.graphNextSeq
 	d.graphNextSeq++
@@ -222,12 +225,30 @@ func (d *InMemoryCommitDag) writeGraph(forceFull bool) (bool, error) {
 	// recognises as superseding them. Unlinking a mapped file is safe: the mapping keeps the
 	// inode until the snapshot's reference is released.
 	for _, b := range replaced {
-		os.Remove(b.path)
+		d.retireSegmentFile(b.seq, b.path)
 	}
 	if full {
 		syncGraphDir(dir)
 	}
 	return true, nil
+}
+
+// retireSegmentFile deletes a superseded segment's file - unless the checkpoint on disk still
+// references it, in which case it waits for the next checkpoint (SetGraphCheckpointRefs). The
+// checkpoint is what an open restores from, so a segment it names must outlive its replacement.
+func (d *InMemoryCommitDag) retireSegmentFile(seq uint64, path string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.graphPinned[seq] {
+		d.graphDeferred = append(d.graphDeferred, deferredSegment{seq: seq, path: path})
+		return
+	}
+	os.Remove(path)
+}
+
+type deferredSegment struct {
+	seq  uint64
+	path string
 }
 
 // attachLocked makes nb the newest segment and drops the transaction-index entries the segments
@@ -243,6 +264,14 @@ func (d *InMemoryCommitDag) attachLocked(nb *graphBase, replaced []*graphBase) {
 		}
 	}
 	d.txIndex = shrunk(d.txIndex) // see nodeStore.attach
+	// Segment records carry whether a commit's operations must be loaded, so the eviction set
+	// keeps entries for the resident tier only.
+	for h := range d.opsEvicted {
+		if _, resident := d.nodes.index[h]; !resident && d.nodes.has(h) {
+			delete(d.opsEvicted, h)
+		}
+	}
+	d.opsEvicted = shrunk(d.opsEvicted)
 	// The segments answer for the same graph, so ancestry memos stay valid; the head snapshot
 	// holds a copy and is unaffected. Nothing to republish.
 }

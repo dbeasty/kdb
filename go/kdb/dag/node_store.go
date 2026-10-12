@@ -342,7 +342,7 @@ type graphSnapshot struct {
 // snapshotForSegment captures the resident commits include accepts. A full snapshot also takes a
 // reference on every segment and copies the overlay that says which of their records still count.
 // txOf names the transaction-index entry a commit owns (first writer wins), if it owns one.
-func (s *nodeStore) snapshotForSegment(full bool, include func(codec.Hash, []byte) bool, txOf func(codec.Hash, codec.UUID) bool) graphSnapshot {
+func (s *nodeStore) snapshotForSegment(full bool, include func(codec.Hash, []byte) bool, txOf func(codec.Hash, codec.UUID) bool, hasOps func(codec.Hash) bool) graphSnapshot {
 	var snap graphSnapshot
 	for h, i := range s.index {
 		r := s.at(i)
@@ -353,6 +353,9 @@ func (s *nodeStore) snapshotForSegment(full bool, include func(codec.Hash, []byt
 		}
 		src := graphSource{msg: s.messages[h], extra: s.extra[h]}
 		copy(src.rec[:], r)
+		// Whether the commit wrote anything is not in the record until now: resident, it is
+		// answered by the ops side map and the DAG's eviction set. On disk the record must say.
+		setRecHasOps(src.rec[:], hasOps(h))
 		snap.resident = append(snap.resident, src)
 		if tx := recTx(r); txOf(h, tx) {
 			snap.residentTx = append(snap.residentTx, graphTx{key: txKey(tx), hash: h})
@@ -664,6 +667,48 @@ func (s *nodeStore) compactSlab() {
 		s.index[h] = j
 	}
 	s.chunks, s.used, s.free = chunks, used, nil
+}
+
+// segmentOpsEvicted reports a segment commit whose record says it wrote operations and which has
+// none resident - so reading them means going to the loader. Resident commits answer through the
+// DAG's eviction set instead.
+func (s *nodeStore) segmentOpsEvicted(h codec.Hash) bool {
+	if _, resident := s.index[h]; resident {
+		return false
+	}
+	b, pos, ok := s.segPos(h)
+	if !ok || !recHasOps(b.rec(pos)) {
+		return false
+	}
+	return len(s.ops[h]) == 0
+}
+
+// attachTrusted installs segs (newest first) as the segment tier exactly as a checkpoint
+// describes them: every record visible except hidden ones. For an open that restores from a
+// checkpoint which references these segments instead of carrying their commits - the checkpoint,
+// not the DAG, is what vouches for them, so nothing is hidden for being absent from the DAG.
+// Any resident commit a segment also holds (the genesis commit a new DAG starts with) leaves the
+// resident tier, keeping one commit in one place.
+func (s *nodeStore) attachTrusted(segs []*graphBase, hidden []codec.Hash) {
+	s.segs = segs
+	s.hidden = make(map[codec.Hash]struct{}, len(hidden))
+	for _, h := range hidden {
+		if s.inAnySegment(h) {
+			s.hidden[h] = struct{}{}
+		}
+	}
+	s.genOverride = nil
+	s.segRecords = 0
+	for _, b := range segs {
+		s.segRecords += b.count
+	}
+	for h, i := range s.index {
+		if _, _, ok := s.segPos(h); ok {
+			s.freeSlot(h, i)
+			delete(s.messages, h)
+			delete(s.extra, h)
+		}
+	}
 }
 
 // detach drops every segment, putting nothing back: for a DAG that is closing.

@@ -147,6 +147,10 @@ type InMemoryCommitDag struct {
 	graphDir      string
 	graphReadOnly bool
 	graphNextSeq  uint64
+	// graphPinned is the segments the checkpoint on disk references, and graphDeferred the
+	// superseded ones waiting for a checkpoint that no longer does. See graph_checkpoint.go.
+	graphPinned   map[uint64]bool
+	graphDeferred []deferredSegment
 	graphRebuild  sync.Mutex
 
 	// provisional holds commits appended as one part of a cross-namespace group that has not

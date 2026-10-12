@@ -18,6 +18,12 @@ import (
 // it costs one slow start and never costs correctness.
 const checkpointFormatVersion = 2
 
+// checkpointGraphFormatVersion is a checkpoint that references graph segments instead of carrying
+// the commits in them (fields 11 and 12). Its own version so that a build that predates it reads
+// it as unusable and replays the log, rather than restoring a graph with most of its commits
+// missing. Written only when there are segments to reference; otherwise version 2, unchanged.
+const checkpointGraphFormatVersion = 3
+
 const checkpointNS = "dev.kdb.checkpoint"
 
 var (
@@ -28,6 +34,7 @@ var (
 	fqnCheckpointEntry  = checkpointNS + ".CheckpointTreeEntry"
 	fqnCheckpointSeg    = checkpointNS + ".CheckpointSegment"
 	fqnCheckpointHash   = checkpointNS + ".Hash32"
+	fqnCheckpointGraph  = checkpointNS + ".CheckpointGraphSegment"
 )
 
 var (
@@ -106,6 +113,14 @@ func checkpointRegistry() *schema.Registry {
 			},
 		})
 		r.RegisterRecord(&schema.RecordSchema{
+			Name: "CheckpointGraphSegment", Namespace: checkpointNS,
+			Fields: []schema.FieldSchema{
+				{ID: 1, Name: "sequence", Type: cpI64},
+				{ID: 2, Name: "crc", Type: cpI64},
+				{ID: 3, Name: "records", Type: cpI64},
+			},
+		})
+		r.RegisterRecord(&schema.RecordSchema{
 			Name: "Checkpoint", Namespace: checkpointNS,
 			Fields: []schema.FieldSchema{
 				{ID: 1, Name: "formatVersion", Type: cpI32},
@@ -138,6 +153,10 @@ func checkpointRegistry() *schema.Registry {
 				// indistinguishable from a deleted file, and the only safe
 				// reading of an ambiguous log is the pessimistic one.
 				{ID: 10, Name: "floorSequence", Type: cpI64},
+				// Version 3 only: the graph segments holding every commit not in "commits", and
+				// the records in them for commits since deleted. See dag.CheckpointSnapshotWithGraph.
+				{ID: 11, Name: "graphSegments", Type: schema.Array{Element: schema.Ref{FullyQualifiedName: fqnCheckpointGraph}}, Default: codec.ArrayValue{}},
+				{ID: 12, Name: "graphHidden", Type: schema.Array{Element: cpHash}, Default: codec.ArrayValue{}},
 			},
 		})
 		r.Freeze()
@@ -162,6 +181,10 @@ type namespaceCheckpoint struct {
 	LiveTree      document.DocumentTree
 	Segments      []checkpointSegment
 	HeadCommits   [][]byte
+	// GraphRefs, when set, are the graph segments holding every commit State.Commits leaves
+	// out; GraphHidden the records in them for commits since deleted. History=full only.
+	GraphRefs   []dag.GraphSegmentRef
+	GraphHidden []codec.Hash
 }
 
 // checkpointSegment fingerprints one delta segment a checkpoint covers.
@@ -287,8 +310,12 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		heads = append(heads, codec.BytesValue{V: b})
 	}
 
+	version := int32(checkpointFormatVersion)
+	if len(cp.GraphRefs) > 0 {
+		version = checkpointGraphFormatVersion
+	}
 	root := codec.RecordValue{Fields: map[int]codec.Value{
-		1:  codec.Int32Value{V: checkpointFormatVersion},
+		1:  codec.Int32Value{V: version},
 		2:  codec.StringValue{V: cp.NamespaceID},
 		3:  codec.Int64Value{V: cp.ThroughSequence},
 		4:  codec.ArrayValue{Elements: commits},
@@ -299,6 +326,22 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		9:  codec.ArrayValue{Elements: heads},
 		10: codec.Int64Value{V: cp.FloorSequence},
 	}}
+	if len(cp.GraphRefs) > 0 {
+		refs := make([]codec.Value, 0, len(cp.GraphRefs))
+		for _, r := range cp.GraphRefs {
+			refs = append(refs, codec.RecordValue{Fields: map[int]codec.Value{
+				1: codec.Int64Value{V: int64(r.Seq)},
+				2: codec.Int64Value{V: int64(r.CRC)},
+				3: codec.Int64Value{V: int64(r.Records)},
+			}})
+		}
+		hidden := make([]codec.Value, 0, len(cp.GraphHidden))
+		for _, h := range cp.GraphHidden {
+			hidden = append(hidden, cpHashVal(h))
+		}
+		root.Fields[11] = codec.ArrayValue{Elements: refs}
+		root.Fields[12] = codec.ArrayValue{Elements: hidden}
+	}
 	return codec.EncodeBytes(root, checkpointType, checkpointRegistry())
 }
 
@@ -316,7 +359,7 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 	if !ok {
 		return out, fmt.Errorf("kdb: checkpoint: missing format version")
 	}
-	if version.V != checkpointFormatVersion {
+	if version.V != checkpointFormatVersion && version.V != checkpointGraphFormatVersion {
 		return out, fmt.Errorf(
 			"kdb: checkpoint is format version %d, this build reads version %d",
 			version.V, checkpointFormatVersion)
@@ -500,6 +543,33 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 	}
 	if floor, ok := rec.Fields[10].(codec.Int64Value); ok {
 		out.FloorSequence = floor.V
+	}
+	if version.V == checkpointGraphFormatVersion {
+		refsArr, _ := rec.Fields[11].(codec.ArrayValue)
+		for _, el := range refsArr.Elements {
+			rr, ok := el.(codec.RecordValue)
+			if !ok {
+				return out, fmt.Errorf("kdb: checkpoint: malformed graph segment entry")
+			}
+			seq, ok1 := rr.Fields[1].(codec.Int64Value)
+			crc, ok2 := rr.Fields[2].(codec.Int64Value)
+			n, ok3 := rr.Fields[3].(codec.Int64Value)
+			if !ok1 || !ok2 || !ok3 {
+				return out, fmt.Errorf("kdb: checkpoint: malformed graph segment entry")
+			}
+			out.GraphRefs = append(out.GraphRefs, dag.GraphSegmentRef{Seq: uint64(seq.V), CRC: uint32(crc.V), Records: int(n.V)})
+		}
+		if len(out.GraphRefs) == 0 {
+			return out, fmt.Errorf("kdb: checkpoint: version %d with no graph segments", version.V)
+		}
+		hiddenArr, _ := rec.Fields[12].(codec.ArrayValue)
+		for _, el := range hiddenArr.Elements {
+			h, err := cpHashFrom(el)
+			if err != nil {
+				return out, err
+			}
+			out.GraphHidden = append(out.GraphHidden, h)
+		}
 	}
 	return out, nil
 }

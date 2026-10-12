@@ -63,6 +63,13 @@ func (d *InMemoryCommitDag) CheckpointSnapshot() CheckpointState {
 func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commit) bool) CheckpointState {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	return d.checkpointSnapshotLocked(keep, false)
+}
+
+// checkpointSnapshotLocked is CheckpointSnapshotRetaining's body. residentOnly limits it to the
+// resident tier, for a checkpoint that references the graph segments for the rest (see
+// CheckpointSnapshotWithGraph). Must hold mu.
+func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) bool, residentOnly bool) CheckpointState {
 	unlogged := func(h codec.Hash) bool {
 		_, ok := d.unlogged[h]
 		return ok
@@ -74,13 +81,23 @@ func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commi
 	for _, t := range d.tags {
 		pinned[t.CommitHash] = struct{}{}
 	}
+	n := d.nodes.len()
+	if residentOnly {
+		n = d.nodes.residentLen()
+	}
 	state := CheckpointState{
-		Commits:  make([]CheckpointCommit, 0, d.nodes.len()),
+		Commits:  make([]CheckpointCommit, 0, n),
 		Branches: make([]document.Branch, 0, len(d.branches)),
 		Tags:     make([]document.Tag, 0, len(d.tags)),
 	}
-	var hashes []codec.Hash
-	d.nodes.forEach(func(h codec.Hash) { hashes = append(hashes, h) })
+	hashes := make([]codec.Hash, 0, n)
+	if residentOnly {
+		for h := range d.nodes.index {
+			hashes = append(hashes, h)
+		}
+	} else {
+		d.nodes.forEach(func(h codec.Hash) { hashes = append(hashes, h) })
+	}
 	for _, h := range hashes {
 		c, _ := d.nodes.commit(h)
 		if unlogged(c.Hash) {

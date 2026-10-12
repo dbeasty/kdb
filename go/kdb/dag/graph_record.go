@@ -25,7 +25,8 @@ import (
 //	200  micro rem.    i64
 //	208  generation    u32
 //	212  parent count  u32  (parents beyond two live in the extra blob / side map)
-//	216  flags         u32
+//	216  flags         u32  (grFlagSchema; grFlagHasOps: the commit wrote operations, which live
+//	                         in the delta log - a reader with none resident must load them)
 //	220  message len   u32
 //	224  message off   u64  (file only: offset into the msgs blob)
 //	232  extra off     u64  (file only: offset into the extra blob)
@@ -59,6 +60,7 @@ const (
 	grReserved = 242
 
 	grFlagSchema = 1
+	grFlagHasOps = 2
 )
 
 var le = binary.LittleEndian
@@ -81,6 +83,15 @@ func recGeneration(r []byte) uint32       { return le.Uint32(r[grGen:]) }
 func setRecGeneration(r []byte, g uint32) { le.PutUint32(r[grGen:], g) }
 func recNParents(r []byte) uint32         { return le.Uint32(r[grNParents:]) }
 func recNsIdx(r []byte) uint16            { return le.Uint16(r[grNsIdx:]) }
+func recHasOps(r []byte) bool             { return le.Uint32(r[grFlags:])&grFlagHasOps != 0 }
+
+func setRecHasOps(r []byte, has bool) {
+	f := le.Uint32(r[grFlags:]) &^ grFlagHasOps
+	if has {
+		f |= grFlagHasOps
+	}
+	le.PutUint32(r[grFlags:], f)
+}
 
 // recParents01 returns the inline parents and the total parent count.
 func recParents01(r []byte) (p0, p1 codec.Hash, n uint32) {
