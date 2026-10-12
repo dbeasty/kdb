@@ -272,47 +272,51 @@ search per step instead of a map probe; it was 3.5x before interpolation search)
 
 ### Hot path (`go/kdb/server` workload matrix, graph file off - the default)
 
-Alternating `main` / branch, `-benchtime 2s`. No difference is statistically significant (benchstat, p > 0.05):
+Final run 2026-10-12 10:39-10:58 at `b2fb104` (default `graph.memory=kdb`) against `main` `37d7f98`, alternating
+main/branch, two rounds x `-count 2`, `-benchtime 2s`, load average 3-6 from other sessions. benchstat, n=4:
 
-| Benchmark | main | branch | |
+| | main | branch | |
 |---|---:|---:|---|
-| Read single-user overlapping | 318 ns | 312 ns | ~ (n=4) |
-| Read heavy-multi-user overlapping | 153 ns | 184 ns | ~ (p=0.89, n=4) |
-| Read single-user non-overlapping | 212 ns | 241 ns | ~ (p=0.49, n=4) |
-| Read heavy-multi-user non-overlapping | 161 ns | 202 ns | ~ (p=0.49, n=4) |
-| Insert single-user (fsync) | 5.52 ms | 4.77 ms | ~ (p=0.24, n=6) |
-| Insert, memory-only, single-user | 20.2 us | 20.4 us | ~ (p=0.94, n=6) |
-| Insert, memory-only, heavy-multi-user | 24.8 us | 25.8 us | ~ (p=0.13, n=6) |
-| Update single-user overlapping | 5.17 ms | 4.94 ms | ~ (p=0.39, n=6) |
+| Geomean, all 20 rows | 33.91 us/op | 34.01 us/op | +0.3%, flat |
+| Read, heavy-multi-user overlapping | 14.82 M ops/s | 15.50 M ops/s | +4.6% (p=0.029) |
+| Read, heavy-multi-user non-overlapping | 5.99 M ops/s | 6.14 M ops/s | +2.6% (p=0.029) |
+| Read, single-user (both) | 4.31 / 5.84 M ops/s | 4.49 / 5.93 M ops/s | ~ |
+| Insert / update / transaction, fsync rows | 216-233 ops/s single, 19-40 k heavy | 210-226 single, 19-39 k heavy | all ~ (p >= 0.11) |
+| Insert, memory-only, heavy-multi-user | 40.5 k ops/s | 39.4 k ops/s | -2.8% (p=0.029) |
+| Allocations per write | 122-502 | +5 per write | +2.4-4.1% (deterministic) |
+| Allocations / bytes per read | 4 / 176 B | 4 / 176 B | identical |
 
-Allocations per read are identical (4 allocs, 176 B). A first n=4 run showed single-user insert +25% (p=0.029)
-during a load-average spike to 17-20; it did not reproduce at n=6 with the order alternated, and the memory-only
-insert - which runs exactly the code this branch changed, without fsync - is flat. Treat that first number as the
-neighbour-contention artifact the benchmarking notes warn about, not a regression. A quiet-machine rerun on Linux
-would still be worth doing before calling the read rows flat to within a few percent.
+Every write row gains exactly five allocations: the head snapshot and the other post-commit lookups now decode the
+commit from its record (a parent slice, a schema-hash pointer, a message string) where `main` handed back the
+stored struct. It shows only on the memory-only rows, which have no fsync to hide behind. Caching the commit just
+stored for the head snapshot would remove it; not done yet.
 
 ### Whole-namespace memory across a normal life (`TestMemoryProfile`)
 
 100,000 documents, 500,000 commits (each document inserted, then random updates), async durability, default memory
 budgets, maintenance every 50,000 commits during the build. One process per phase. "Live" is heap after a GC;
-"peak" is the largest live-object heap sampled during the phase; RSS is the process's resident set. Measured
-2026-10-12 after the segment-scan fix below; `main` is `37d7f98`.
+"peak" is the largest live-object heap sampled during the phase; RSS is the process's resident set. Final run
+2026-10-12 10:27-10:38 at `b2fb104`; `main` is `37d7f98`. Load average 4-13 from other sessions: heap and RSS are
+not load-sensitive, timings are indicative.
 
-| Phase | main | branch, graph off | branch, graph on |
-|---|---:|---:|---:|
-| Startup: live heap after open | 297 MB | 297 MB | **27 MB** |
-| Startup: peak heap during open | 1,014 MB | 1,063 MB | **108 MB** |
-| Startup: RSS after open | 1,185 MB | 1,230 MB | **311 MB** |
-| Startup: open time | 3.3 s | 2.3 s | 1.5 s |
-| 200k point reads: live heap after | 372 MB | 373 MB | **103 MB** |
-| 200k point reads: peak heap | 570 MB | 590 MB | **223 MB** |
-| 20k updates: live heap after | 317 MB | 322 MB | **54 MB** |
-| 20k updates: peak heap | 551 MB | 586 MB | **93 MB** |
-| Close + checkpoint: allocated | 1,770 MB | 1,245 MB | **137 MB** |
-| Close + checkpoint: peak heap | 1,464 MB | 1,502 MB | **136 MB** |
-| Close + checkpoint: time | 1.7 s | 0.7 s | **72 ms** |
-| Close + checkpoint: peak RSS | 1,696 MB | 1,918 MB | **393 MB** |
-| Disk (whole data dir) | 336 MB | 335 MB | 436 MB |
+| Phase | main | `graph.memory=go` | `graph.memory=kdb` | kdb + `graph.file` |
+|---|---:|---:|---:|---:|
+| Startup: live heap after open | 297 MB | 297 MB | 298 MB | **27 MB** |
+| Startup: peak heap during open | 1,034 MB | 1,099 MB | 1,052 MB | **106 MB** |
+| Startup: RSS after open | 1,288 MB | 1,184 MB | 1,204 MB | **294 MB** |
+| Startup: open time | 3.5 s | 2.1 s | 2.2 s | **1.3 s** |
+| 200k point reads: live heap / peak | 372 / 594 MB | 372 / 592 MB | 373 / 598 MB | **103 / 257 MB** |
+| 20k updates: live heap / peak | 320 / 571 MB | 315 / 570 MB | 319 / 584 MB | **54 / 100 MB** |
+| Close + checkpoint: allocated | 1,770 MB | 1,229 MB | 1,245 MB | **137 MB** |
+| Close + checkpoint: peak heap | 1,493 MB | 1,274 MB | 1,204 MB | **147 MB** |
+| Close + checkpoint: time | 1.8 s | 0.68 s | 0.66 s | **71 ms** |
+| Disk (whole data dir) | 351 MB | 382 MB | 368 MB | 437 MB |
+
+- `go` and `kdb` memory hold the same bytes (the commit graph is ~460 B/commit either way); what `kdb` buys is GC
+  scan time (~20x less mark work, see the scale table), not heap.
+- The graph file is what removes the bytes: startup heap ~11x lower, checkpoint peak ~10x lower.
+- Open and checkpoint got faster on every branch variant than on `main` because of the segment-scan fixes below
+  (the graph-off checkpoint still carries every commit, so its peak stays ~1.2 GB).
 
 ### The checkpoint's remaining 695 MB was not the checkpoint
 
