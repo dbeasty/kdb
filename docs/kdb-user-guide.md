@@ -337,6 +337,36 @@ memory budget, durability, abort watchdog) plus the exact build identity.
 | `--log-level debug\|info\|warn\|error`, `--log-format text\|json` | structured logging |
 | `--config FILE` | JSON config file |
 
+**Document expiry** — see [kdb-spec-layer16 §9.5](kdb-spec-layer16-qtask-gaps.md#95-document-expiry-component-73)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--expire-field PATH` | _(off)_ | top-level field, or dotted path (`meta.ttl`), holding each document's expiry timestamp |
+| `--expire-grace DUR` | 0 | how long a document stays readable past its timestamp |
+| `--expire-interval DUR` | 60s | how often the sweeper deletes expired documents |
+
+The field is an RFC 3339 string (`"2026-09-05T12:00:00Z"`, fractional seconds allowed) or a number
+of **epoch milliseconds**. Anything else - absent, `null`, a boolean, an unparsable string - means
+the document never expires. A document is expired when its timestamp is **at or before**
+`now - grace`.
+
+Expiry has two separate effects, and they happen at different times:
+
+- **Hidden - immediately, at read time.** At the instant the timestamp (plus grace) passes, the
+  document disappears from `get`, `find`, `count`, SQL `SELECT` (scans, aggregates, joins) and
+  index lookups at head. No sweep is involved, so unlike Mongo's TTL monitor (which runs about once
+  a minute) there is no lag. A hidden document is still stored.
+- **Deleted - at the next sweep.** Every `--expire-interval` the sweeper scans head and commits
+  deletes for the expired documents, at most 500 per commit, with commit message `expiry sweep`.
+  Only then is the document gone from head. Setting `--expire-interval` longer delays deletion
+  (and storage reclamation), never visibility.
+
+Historical reads (`atCommit` an older commit, a `SNAPSHOT` session pinned to one) are not
+filtered: a commit's contents never change. A read-only replica hides expired documents but never
+sweeps. Both effects are functions of the stored body and the wall clock, so a restart changes
+nothing: a document that expired while the server was down is hidden on the first read after
+startup, and removed by the first sweep.
+
 ### Configuration precedence
 
 ```
