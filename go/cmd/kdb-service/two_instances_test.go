@@ -38,14 +38,19 @@ func TestTwoDefaultInstancesStartSideBySide(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer func(c *exec.Cmd) { _ = c.Process.Kill(); _ = c.Wait() }(cmd)
-		exited := make(chan error, 1)
-		go func() { exited <- cmd.Wait() }()
+		// One goroutine owns Wait; cleanup kills the process and waits for that goroutine. Calling
+		// cmd.Wait a second time from the deferred cleanup, concurrently with this one, could block
+		// for ever on the output pipe with the process still running: it hung this test 6 runs in
+		// 8 on a laptop and timed the CI job out at 10 minutes.
+		done := make(chan struct{})
+		var waitErr error
+		go func() { waitErr = cmd.Wait(); close(done) }()
+		defer func(c *exec.Cmd) { _ = c.Process.Kill(); <-done }(cmd)
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			select {
-			case err := <-exited:
-				t.Fatalf("instance %d exited early: %v\n%s", i, err, out.String())
+			case <-done:
+				t.Fatalf("instance %d exited early: %v\n%s", i, waitErr, out.String())
 			default:
 			}
 			if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
