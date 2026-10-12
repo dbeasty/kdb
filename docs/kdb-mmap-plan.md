@@ -286,10 +286,10 @@ main/branch, two rounds x `-count 2`, `-benchtime 2s`, load average 3-6 from oth
 | Allocations per write | 122-502 | +5 per write | +2.4-4.1% (deterministic) |
 | Allocations / bytes per read | 4 / 176 B | 4 / 176 B | identical |
 
-Every write row gains exactly five allocations: the head snapshot and the other post-commit lookups now decode the
-commit from its record (a parent slice, a schema-hash pointer, a message string) where `main` handed back the
-stored struct. It shows only on the memory-only rows, which have no fsync to hide behind. Caching the commit just
-stored for the head snapshot would remove it; not done yet.
+Those five extra allocations per write (the head snapshot and post-commit lookups decoding the record) were then
+removed by keeping the last stored commit whole (`nodeStore.recent`). Re-run after merging `main` at `665d9fc`
+(v0.7.2), same method: **geomean -2.0% time, +0.00% allocations**; the only significant time row is heavy-multi-user
+overlapping reads, 7% faster; every allocation row is within +-1 of `main` (the heavy rows vary by one either way).
 
 ### Whole-namespace memory across a normal life (`TestMemoryProfile`)
 
