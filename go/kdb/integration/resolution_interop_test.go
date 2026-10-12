@@ -2,6 +2,7 @@ package integration
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,11 +26,20 @@ import (
 // file-backed namespace and read back by the Kotlin CLI. Kotlin knows none of these conventions;
 // it must still replay the merge and resolution commits to exactly the documents Go holds.
 //
+// Run under both chain versions: version 2 (peersync.ChainVersionMergeBases) changes which merges
+// Go builds, never their shape, and Kotlin must replay either.
+//
 // Needs a JDK (it runs :kdb-cli:runCli through gradlew); skipped under -short.
 func TestKotlinReadsGoConflictResolution(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs the Kotlin CLI through gradle")
 	}
+	for _, version := range []int{0, peersync.ChainVersionMergeBases} {
+		t.Run(fmt.Sprintf("chain-version=%d", version), func(t *testing.T) { kotlinReadsGoConflictResolution(t, version) })
+	}
+}
+
+func kotlinReadsGoConflictResolution(t *testing.T, version int) {
 	repo := findRepoRoot(t)
 	root := t.TempDir()
 	ns := "app/data"
@@ -49,7 +59,7 @@ func TestKotlinReadsGoConflictResolution(t *testing.T) {
 	chain := &peersync.ResolutionChain{Rules: []peersync.ResolutionRule{
 		{Kind: peersync.RuleFieldMerge},
 		{Kind: peersync.RuleAuthority, Pending: peersync.PendingProvisional},
-	}}
+	}, Version: version}
 	a.SetResolutionChain(chain)
 	b.SetResolutionChain(chain)
 

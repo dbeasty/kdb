@@ -1323,6 +1323,37 @@ differ, neither node merges that namespace**:
 
 This clears on the next sync after the definition has replicated.
 
+#### Chain version 2
+
+A chain with `"version": 2` merges with corrected semantics. Set it once **every node** runs a
+release that has it. On such a release, `GET …/resolution` reports a `version` field:
+
+```bash
+curl -X PUT https://kdb:9443/v1/ns/site/berlin/orders/resolution -d '{
+  "version": 2,
+  "rules": [{"kind": "field-merge"}, {"kind": "last-write"}]}'
+```
+
+Version 2 differs from the original semantics (no `version`, or `1`) in three ways:
+- **The base is the true merge base.** When the two heads have several nearest common ancestors
+  (a criss-cross, routine under concurrent load), rules that use the base, such as procedures,
+  get one virtual base merged from all of them. Under version 1 they get one of them, sometimes an
+  older one.
+- **`field-merge` works per field.** It follows each field to the write that set it, so a
+  field only one side changed is never mistaken for one both changed. When `last-write`
+  follows, a field both sides changed goes to that field's later write. Version 1 compares the
+  whole document's write time. Merged in any order, every field ends at its latest write.
+- **`validity` waits for the schema.** Nodes compare the schema hash along with the chain hash,
+  and a node with no schema yet holds the conflict. Under version 1 it settles by the next rule,
+  so an invalid value can survive.
+
+Version 2 changes what a merge builds, so it is a different chain with a different hash. Older
+releases ignore the `version` field and keep the version 1 hash, so they never merge with a
+version 2 node. They still merge with each other under version 1, so upgrade every node before
+switching. A node that does not know a chain version refuses to merge under it: it advertises an
+`unsupported:` hash and queues the conflict with the reason. `GET …/resolution` shows the
+`version` and the `advertisedHash` this node gives peers.
+
 Resolvers registered on the Go API (`ConflictPolicyCustom`) now also receive the common base value
 (`BaseDoc`) and which node wrote each side, in which commit and when (`ExistingOrigin`,
 `IncomingOrigin`).
@@ -1398,7 +1429,10 @@ Then call it from the chain:
 - `base`: the document's value at *one* common ancestor of the two heads (`null` if it did not
   exist there). It is not necessarily the value both sides started from: when the heads have
   several nearest common ancestors (two nodes that merged each other's work in different orders),
-  only one of them is used.
+  only one of them is used. Under a version 2 chain (see "Chain version 2") `base` is the
+  value at the true merge base: with several nearest common ancestors, a virtual base merged from
+  all of them under the same chain. It is still a state that may contain earlier merges, so the
+  rest of this contract holds.
 - `origins`: for each side, the commit that produced that value (`nodeId`, `commit`,
   `timestampMicros`). A value an earlier merge built has that merge commit as its origin, not the
   writes it was built from.
