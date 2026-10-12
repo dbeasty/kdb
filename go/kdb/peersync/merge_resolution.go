@@ -269,6 +269,8 @@ type divergedDoc struct {
 	remoteChanged         bool
 	// base is the value at the canonical common ancestor, filled only for conflicting documents.
 	base *string
+	// baseHeld, under ChainVersionMergeBases, is why the virtual base could not be built.
+	baseHeld string
 }
 
 func resolveDivergedLocked(
@@ -377,11 +379,23 @@ func resolveDivergedLocked(
 			// walks from its second argument, so with several nearest ancestors (a criss-cross)
 			// the local/incoming order would let two nodes pick different bases.
 			p0, p1 := mergeCommitParents(localHead, incomingHead)
-			if anc := d.CommonAncestor(p0, p1); anc != nil {
-				cids := make([]codec.UUID, len(conflicting))
-				for i, dd := range conflicting {
-					cids[i] = dd.id
+			cids := make([]codec.UUID, len(conflicting))
+			for i, dd := range conflicting {
+				cids[i] = dd.id
+			}
+			if opts.Chain.mergeBases() {
+				// Version 2: every nearest common ancestor, merged into one virtual base when there
+				// are several (#130, F1).
+				vb := &virtualBase{d: d, vi: vi, opts: opts, held: map[codec.UUID]string{}}
+				bv, err := vb.values(d.MergeBases([]codec.Hash{p0}, []codec.Hash{p1}), cids, 0)
+				if err != nil {
+					return CommitPushOutcome{}, AdvanceStep{}, err
 				}
+				for i := range conflicting {
+					conflicting[i].base = bv[conflicting[i].id].body
+					conflicting[i].baseHeld = vb.held[conflicting[i].id]
+				}
+			} else if anc := d.CommonAncestor(p0, p1); anc != nil {
 				bv, err := vi.valuesAt(*anc, cids)
 				if err != nil {
 					return CommitPushOutcome{}, AdvanceStep{}, err
@@ -391,7 +405,7 @@ func resolveDivergedLocked(
 				}
 			}
 		}
-		r := resolveConflicting(d, localHead, incomingHead, conflicting, opts)
+		r := resolveConflicting(d, vi, localHead, incomingHead, conflicting, opts)
 		if r.report != nil {
 			return CommitPushOutcome{Kind: OutcomeConflict, Report: r.report, Details: r.details}, AdvanceStep{}, nil
 		}
@@ -492,7 +506,7 @@ type ConflictDetail struct {
 // or reports the ones left undecided. Each document goes to the first of these that decides it:
 // an explicit choice (Choose), the namespace's chain, then the policy. Every rule is symmetric in
 // the two sides, so both nodes reach the same answer.
-func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.Hash, docs []divergedDoc, opts ResolutionOptions) resolution {
+func resolveConflicting(d *dag.InMemoryCommitDag, vi valueIndex, localHead, incomingHead codec.Hash, docs []divergedDoc, opts ResolutionOptions) resolution {
 	out := map[codec.UUID]Settlement{}
 	var provisional []codec.UUID
 	pending := docs
@@ -514,7 +528,20 @@ func resolveConflicting(d *dag.InMemoryCommitDag, localHead, incomingHead codec.
 	if opts.Chain != nil && len(pending) > 0 {
 		var rest []divergedDoc
 		for _, dd := range pending {
-			o := opts.Chain.resolve(d, dd.id, canonicalSides(dd, localFirst), opts)
+			s := canonicalSides(dd, localFirst)
+			if opts.Chain.mergeBases() {
+				s.heads = [2]codec.Hash{localHead, incomingHead}
+				if !localFirst {
+					s.heads[0], s.heads[1] = s.heads[1], s.heads[0]
+				}
+				memo := map[fieldKey]codec.Hash{}
+				id, heads := dd.id, s.heads
+				s.fieldOrigin = func(side int, field string) (codec.Hash, error) {
+					return vi.fieldOrigin(heads[side], id, field, memo)
+				}
+				s.baseHeld = dd.baseHeld
+			}
+			o := opts.Chain.resolve(d, dd.id, s, opts)
 			switch {
 			case o.decided:
 				out[dd.id] = Settlement{Body: o.winner, Fork: o.fork}

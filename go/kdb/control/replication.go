@@ -209,7 +209,8 @@ func (s *Server) handleResolution(w http.ResponseWriter, _ *http.Request, _ auth
 	if c != nil {
 		rules = c.Rules
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": rules, "hash": c.Hash(), "thisNode": rt.NodeID.String()})
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": rules, "hash": c.Hash(), "thisNode": rt.NodeID.String(),
+		"version": c.EffectiveVersion(), "supported": c.Supported(), "advertisedHash": rt.AdvertisedResolutionHash()})
 }
 
 // PUT /v1/ns/{ns}/resolution - {"rules": [{"kind": "source-priority", "nodes": ["<node id>", ...]},
@@ -236,7 +237,7 @@ func (s *Server) handleSetResolution(w http.ResponseWriter, r *http.Request, _ a
 		return
 	}
 	c := rt.ResolutionChainOf()
-	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": body.Rules, "hash": c.Hash()})
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": body.Rules, "hash": c.Hash(), "version": c.EffectiveVersion()})
 }
 
 // GET /v1/ns/{ns}/procedures - the namespace's stored procedures: each name with the hash of the

@@ -39,6 +39,13 @@ func (s *KdbServerRuntime) ResolutionChainOf() *peersync.ResolutionChain { retur
 // no threat to convergence.
 const maxProcedureCallsPerSync = 10_000
 
+// AdvertisedResolutionHash is the resolution hash this node tells peers: the chain's hash, or a
+// variant no peer matches while this node cannot run the chain as written (a missing procedure, a
+// chain version newer than this release, and under version 2 a different schema).
+func (s *KdbServerRuntime) AdvertisedResolutionHash() string {
+	return s.peerResolution().AdvertisedHash()
+}
+
 // peerResolution is the resolution options peer sync merges this namespace with.
 func (s *KdbServerRuntime) peerResolution() peersync.ResolutionOptions {
 	calls := 0
@@ -46,12 +53,21 @@ func (s *KdbServerRuntime) peerResolution() peersync.ResolutionOptions {
 		Policy: s.PeerSyncConflictPolicy,
 		Chain:  s.ResolutionChainOf(),
 		Valid: func(body string) bool {
-			// Every node validates against the namespace's replicated schema. Until a schema
-			// change has reached both nodes they can judge differently - the chain hash does not
-			// cover the schema - which is why the rule only ever picks between two present values.
+			// Every node validates against the namespace's replicated schema. Under a version 1
+			// chain, until a schema change has reached both nodes they can judge differently -
+			// the chain hash does not cover the schema - which is why the rule only ever picks
+			// between two present values. A version 2 chain binds the schema (SchemaHash below)
+			// into the hash peers compare, and holds on a node with none.
 			return schema.Validate(document.Document{JSON: body}, s.Schema()).IsSuccess()
 		},
 		ProcedureHash: s.ProcedureHash,
+		SchemaHash: func() string {
+			sch := s.Schema()
+			if sch.IsNone() {
+				return ""
+			}
+			return sch.SchemaHash.Hex()
+		},
 		Procedure: func(name, sourceHash string, c peersync.ProcedureConflict) (peersync.Settlement, bool, error) {
 			calls++
 			if calls > maxProcedureCallsPerSync {
