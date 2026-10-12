@@ -1,7 +1,10 @@
 package document
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"sort"
+	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
@@ -255,12 +258,72 @@ func trieDeleteAt(node *trieNode, uuidBytes []byte, id codec.UUID, depth int) *t
 // trieBuild constructs a trie from scratch (O(n)); used when a
 // DocumentTree has no trie to incrementally build on (e.g. decoded from
 // the wire), or as the ground-truth path exercised by parity tests.
+// trieBuild builds the trie for a whole set of entries at once: sorted by key, each node built
+// exactly once and hashed exactly once, and the sixteen top-level subtrees built on separate cores.
+//
+// It used to insert the entries one at a time, each insert copying and re-hashing the path it
+// touched - and opening a namespace builds its live tree this way, so at a million documents
+// that was 7.8 s of a 13 s open. The result is the same trie, node for node, and so the same
+// hash: trieBulkMatchesInsert pins that.
 func trieBuild(entries map[codec.UUID]codec.Hash) *trieNode {
-	var root *trieNode
-	for id, h := range entries {
-		root = trieInsert(root, id, h)
+	if len(entries) == 0 {
+		return nil
 	}
-	return root
+	items := make([]trieItem, 0, len(entries))
+	for id, h := range entries {
+		items = append(items, trieItem{key: id.Bytes(), id: id, hash: h})
+	}
+	sort.Slice(items, func(a, b int) bool { return bytes.Compare(items[a].key, items[b].key) < 0 })
+	// Fanning out pays only when there is enough work to split.
+	return trieBuildRange(items, 0, len(items) >= 4096)
+}
+
+type trieItem struct {
+	key  []byte
+	id   codec.UUID
+	hash codec.Hash
+}
+
+// trieBuildRange builds the subtree at depth holding items, which are sorted and all share the
+// key's first depth nibbles. Mirrors what inserting them would produce: one item is a leaf that
+// stands for the whole subtree (newLeafNode); more than one is an internal node whose children
+// are the runs of items sharing the next nibble - a run of all of them included, which is the
+// single-child chain splitLeafAt builds.
+func trieBuildRange(items []trieItem, depth int, parallel bool) *trieNode {
+	if len(items) == 1 || depth == trieDepth {
+		it := items[len(items)-1] // at full depth equal keys collide; the last write wins, as with inserts
+		return newLeafNode(it.key, it.id, it.hash, depth)
+	}
+	var children [16]*trieNode
+	var runs [16][]trieItem
+	start := 0
+	for i := 1; i <= len(items); i++ {
+		if i == len(items) || nibbleAt(items[i].key, depth) != nibbleAt(items[start].key, depth) {
+			runs[nibbleAt(items[start].key, depth)] = items[start:i]
+			start = i
+		}
+	}
+	if parallel {
+		var wg sync.WaitGroup
+		for nib := range runs {
+			if len(runs[nib]) == 0 {
+				continue
+			}
+			wg.Add(1)
+			go func(nib int) {
+				defer wg.Done()
+				children[nib] = trieBuildRange(runs[nib], depth+1, false)
+			}(nib)
+		}
+		wg.Wait()
+	} else {
+		for nib := range runs {
+			if len(runs[nib]) > 0 {
+				children[nib] = trieBuildRange(runs[nib], depth+1, false)
+			}
+		}
+	}
+	return &trieNode{hash: internalHash(&children), children: &children}
 }
 
 // trieGet looks up id's content hash. O(trieDepth) = O(1) - the read counterpart to

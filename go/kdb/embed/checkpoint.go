@@ -519,7 +519,7 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 		}
 		live[id] = h
 	}
-	tree, err := document.BuildDocumentTree(live)
+	tree, err := document.BuildTrieDocumentTree(live)
 	if err != nil {
 		return out, err
 	}

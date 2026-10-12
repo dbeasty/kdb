@@ -151,6 +151,16 @@ func BuildDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) 
 	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
 }
 
+// BuildTrieDocumentTree is BuildDocumentTree without keeping the flat map: the tree is backed by
+// its trie alone, as one produced by With/Without is. For a tree that will live for the life of
+// the process - the live tree an open restores from a checkpoint - where holding both the map and
+// the trie cost ~120 bytes per document twice over (120 MB at a million documents). entries may
+// be dropped by the caller afterwards.
+func BuildTrieDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) {
+	root := trieBuild(entries)
+	return DocumentTree{TreeHash: trieTreeHash(root), trieRoot: root, size: len(entries)}, nil
+}
+
 func entriesToArrayValue(entries map[codec.UUID]codec.Hash) codec.Value {
 	// Sort keys are computed once per entry (O(n) String() calls) rather
 	// than inside the comparator (O(n log n) calls, ~2x per comparison):
