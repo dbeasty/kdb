@@ -20,7 +20,7 @@
     { "name": "a scan over more rows than the budget is aborted", "sql": "SELECT name FROM t WHERE rank >= 0 ORDER BY name LIMIT 1", "rowBudget": 10, "budgetError": 10 },
     { "name": "the budget counts rows examined, not rows returned (selective filter)", "sql": "SELECT name FROM t WHERE name = 'n049'", "rowBudget": 49, "budgetError": 49 },
     { "name": "a budget equal to the namespace size is enough", "sql": "SELECT name FROM t WHERE name = 'n049'", "rowBudget": 50, "access": "scan", "rows": ["n049"] },
-    { "name": "an aggregate that reads everything is bounded too", "sql": "SELECT COUNT(*) FROM t", "rowBudget": 10, "budgetError": 10 },
+    { "name": "an aggregate that reads everything is bounded too", "sql": "SELECT COUNT(name) FROM t", "rowBudget": 10, "budgetError": 10 },
     { "name": "zero budget is unlimited", "sql": "SELECT COUNT(*) FROM t", "rowBudget": 0, "rows": ["50"] },
     { "name": "the result bound does not limit the scan: filtered count past maxRows", "sql": "SELECT COUNT(*) FROM t WHERE rank >= 10", "maxRows": 10, "rows": ["40"] }
   ]
