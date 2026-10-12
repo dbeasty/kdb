@@ -111,4 +111,24 @@ Also:
 - Kotlin: `TestKotlinReadsGoConflictResolution` runs under chain versions 1 and 2. The Kotlin CLI
   replays merges Go built under either.
 
-SOAK_PLACEHOLDER
+## Gates (shared machine, load average 3-15)
+
+- Targeted `go test -race` for dag, peersync, server, replication, syncnode, control and
+  integration (Kotlin interop included) passed. The full `go test -race ./...` passed once,
+  after the first merge of main.
+- `test_cluster_resolution.py`, default run, before #133 was merged in: 21 passed, 2 xfailed
+  (F3), four times, two of them with `GOMAXPROCS=2` in the services' environment. After merging
+  #133 (F3 docs and per-node counter tests): 23 passed, 2 xfailed.
+- `test_cluster_resolution.py`, slow run: 12 passed, 2 xfailed (load counter sum, F3), once
+  normally and once with `GOMAXPROCS=2`.
+- `test_cluster.py`, `test_resolver_authority.py`, `test_graft.py`: 15 passed.
+- `test_upgrade.py -m upgrade` with v0.6.2 (`scripts/build-prev-service.sh v0.6.2`): 10 passed,
+  1 xfailed. The xfail is the pre-existing rollback-after-crash test.
+
+## Merging with #133 (F3)
+
+#133 marked `test_procedure_counter_sum_is_the_total_of_increments` as a strict xfail (the
+anti-pattern). Under a version 2 chain that ordered scenario passes, because the procedure gets
+the virtual base, so the mark is gone. The sum is still the anti-pattern: the strict
+`..._when_both_sides_reach_the_same_value` and the non-strict load test keep #133's reasons. The
+user guide's "`base` is one common ancestor" sentence now says what version 2 hands a procedure.
