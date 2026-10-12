@@ -1822,6 +1822,8 @@ operator's decision.
   - `kdb_replication_last_success_seconds{peer}`
   - `kdb_replication_consecutive_failures{peer}`
   - `kdb_replication_commits_total{peer,namespace,direction}`
+  - `kdb_replication_overshoot_commits_total{peer,namespace}`: commits a peer sent that this node
+    already held. It should stay near zero; steady growth means negotiation is over-sending.
   - `kdb_conflicts_open{namespace,kind}`
 - **Control plane.** `GET /v1/peers` shows each peer's progress, `POST /v1/peers/{name}/sync` syncs
   now, and `GET /v1/placement` lists single-home assignments.

@@ -2146,8 +2146,8 @@ build date, `node_id`), `/readyz`, `/metrics`, `/debug/vars`, `/debug/pprof/`.
 `kdb_admission_floor_bytes`, `kdb_admission_scan_row_budget`, `kdb_admission_zone_changes_total`,
 `kdb_admission_critical_enters_total`; `kdb_cost_estimate_accuracy_p95`,
 `kdb_cost_safety_multiplier`, `kdb_cost_learned_cells`; `kdb_conflicts_open`; and with peers
-`kdb_replication_commits_total`, `kdb_replication_consecutive_failures`,
-`kdb_replication_last_success_seconds`. Alert on `kdb_memory_zone`, non-zero
+`kdb_replication_commits_total`, `kdb_replication_overshoot_commits_total`,
+`kdb_replication_consecutive_failures`, `kdb_replication_last_success_seconds`. Alert on `kdb_memory_zone`, non-zero
 `kdb_admission_denied_total` and rising `fsync_wait`.
 
 **Control plane** (`--control-addr`, authenticated by the same engine; `--control-write` for
