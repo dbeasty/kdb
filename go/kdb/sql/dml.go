@@ -56,7 +56,7 @@ func (d *DMLExecutor) ExecuteUpdate(upd UpdateStatement, ctx QueryContext) ([]do
 		if path == colKdbID {
 			return nil, NewPlanningError("kdb_id cannot be assigned", "")
 		}
-		if path != colDoc && !ctx.Schema.IsNone() && !ctx.Schema.HasField(rootSegment(path)) {
+		if path != colDoc && !ctx.Schema.IsSchemaless() && !ctx.Schema.HasField(rootSegment(path)) {
 			return nil, NewPlanningError("unknown column: "+path, "")
 		}
 		if err := v.check(a.Value, false, false); err != nil {
@@ -134,7 +134,7 @@ func assignPath(jsonText, path string, value Cell) (string, error) {
 }
 
 func validateJSON(id codec.UUID, jsonText string, sch schema.KdbSchema) error {
-	if sch.IsNone() {
+	if sch.IsSchemaless() {
 		return nil
 	}
 	doc := document.Document{ID: id, JSON: jsonText}

@@ -11,6 +11,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/index"
 	"github.com/limidus/kdb/go/kdb/index/fusion"
 	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -194,24 +195,101 @@ func indexKeyForCell(c sql.Cell) (index.Key, bool) {
 
 // CreateIndex registers a new index and rebuilds it from the current head, so the index is
 // queryable the moment the statement returns rather than only covering later writes.
+//
+// A UNIQUE index is a unique *constraint*: uniqueness is enforced at commit from the namespace
+// schema's constraints, not by the index, so asking for one installs the constraint. On a
+// schemaless namespace that is a constraints-only schema (see schema.KdbSchema.IsSchemaless) -
+// checked against the data already there, recorded so it survives a restart and replicates, and
+// undone if anything after it fails. On a namespace with declared fields the constraint has to be
+// declared in the schema already, because changing a declared schema is a migration, not a side
+// effect of CREATE INDEX.
 func (p *RegistryIndexProvider) CreateIndex(stmt sql.StmtCreateIndex, ctx sql.QueryContext) error {
+	// Checked here, on the statement a user typed, and not in createIndexLocal: that is also how
+	// a stored or replicated definition is re-applied at startup, and a definition an earlier
+	// version accepted must not stop the namespace from opening.
+	constraint, err := uniqueConstraintFor(stmt, ctx.Schema)
+	if err != nil {
+		return err
+	}
+	if constraint != nil && p.runtime == nil {
+		return fmt.Errorf("index %s: a UNIQUE constraint needs a running server to enforce it", stmt.Name)
+	}
+	// A compound UNIQUE has no single-field lookup structure to build: it is the constraint alone.
+	constraintOnly := stmt.Unique && len(stmt.Fields) > 1 && stmt.Using == ""
 	if p.runtime == nil {
 		return p.createIndexLocal(stmt, ctx)
 	}
 	return p.runtime.Meta.Local(func() error {
-		if err := p.createIndexLocal(stmt, ctx); err != nil {
-			return err
+		previous := p.runtime.Schema()
+		if constraint != nil {
+			if err := p.runtime.SetSchemaChecked(*constraint); err != nil {
+				return fmt.Errorf("index %s: %w", stmt.Name, err)
+			}
+		}
+		undoSchema := func() {
+			if constraint != nil {
+				p.runtime.SetSchema(previous)
+			}
+		}
+		if !constraintOnly {
+			if err := p.createIndexLocal(stmt, ctx); err != nil {
+				undoSchema()
+				return err
+			}
 		}
 		// Recorded for replication. A definition that cannot be recorded is undone rather than
 		// left in place unrecorded: the next reconciliation would otherwise treat the stored
 		// definitions as the truth and quietly undo it anyway.
-		if err := p.runtime.Meta.RecordIndex(ctx.NamespaceID, stmt); err != nil {
-			p.registry.Remove(stmt.Name)
-			_ = p.runtime.saveIndexCatalog()
-			return err
+		if constraint != nil {
+			if err := p.runtime.Meta.RecordSchema(ctx.NamespaceID, *constraint); err != nil {
+				if !constraintOnly {
+					p.registry.Remove(stmt.Name)
+					_ = p.runtime.saveIndexCatalog()
+				}
+				undoSchema()
+				return err
+			}
+		}
+		if !constraintOnly {
+			if err := p.runtime.Meta.RecordIndex(ctx.NamespaceID, stmt); err != nil {
+				p.registry.Remove(stmt.Name)
+				_ = p.runtime.saveIndexCatalog()
+				undoSchema()
+				return err
+			}
 		}
 		return nil
 	})
+}
+
+// uniqueConstraintFor works out what a UNIQUE index statement needs from the schema. It returns
+// nil when the statement is not UNIQUE or the schema already enforces the tuple, the schema to
+// install when the namespace is schemaless, and an error when the namespace declares fields but
+// not this constraint.
+func uniqueConstraintFor(stmt sql.StmtCreateIndex, sch schema.KdbSchema) (*schema.KdbSchema, error) {
+	if !stmt.Unique {
+		return nil, nil
+	}
+	want := make([]string, 0, len(stmt.Fields))
+	for _, f := range stmt.Fields {
+		want = append(want, f.Path)
+	}
+	for _, tuple := range sch.UniqueTuples() {
+		if len(tuple) == len(want) && strings.Join(tuple, schema.FieldPathSeparator) == strings.Join(want, schema.FieldPathSeparator) {
+			return nil, nil
+		}
+	}
+	if !sch.IsSchemaless() {
+		return nil, fmt.Errorf(
+			"index %s: this namespace declares its fields, so a UNIQUE constraint on %s has to be "+
+				"declared in the schema (CREATE TABLE ... UNIQUE)",
+			stmt.Name, strings.Join(want, ", "))
+	}
+	next, err := sch.WithUniqueTuple(want, codec.TimestampNow())
+	if err != nil {
+		return nil, fmt.Errorf("index %s: %w", stmt.Name, err)
+	}
+	return &next, nil
 }
 
 // createIndexLocal is CreateIndex without recording - how a replicated definition is applied.
