@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // OSByteStore is a filesystem-backed SegmentByteStore rooted at PlatformIOConfig.RootDirectory.
@@ -107,7 +109,7 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 	// *data* as soon as a segment is preallocated
 	// (docs/kdb-segment-preallocation-plan.md §3.1).
 	var logicalSize int64
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	f, err := fsx.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	switch {
 	case err == nil:
 		if n := s.preallocateFor(segmentName); n > 0 {
@@ -119,7 +121,7 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 		// Created: no data in it yet, whatever its physical size.
 		logicalSize = 0
 	case os.IsExist(err):
-		f, err = os.OpenFile(p, os.O_WRONLY, 0o644)
+		f, err = fsx.OpenFile(p, os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, err
 		}
@@ -231,7 +233,7 @@ func (s *OSByteStore) readHandle(segmentName string) (*os.File, bool, error) {
 		return f, true, nil
 	}
 	s.mu.Unlock()
-	f, err := os.Open(s.pathFor(segmentName))
+	f, err := fsx.Open(s.pathFor(segmentName))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, &PlatformIOError{Message: "segment does not exist", SegmentName: segmentName, Cause: err}
@@ -302,8 +304,15 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 	}
 	// No open handle yet (e.g. Flush called before any Append in this
 	// process): fall back to a one-off open, matching prior behavior.
+	//
+	// Opened for writing where possible: Windows refuses FlushFileBuffers on a handle without
+	// write access, where unix fsyncs a read-only descriptor happily. A file this process cannot
+	// write to keeps the read-only open it always had.
 	p := s.pathFor(segmentName)
-	f, err := os.OpenFile(p, os.O_RDONLY, 0o644)
+	f, err := fsx.OpenFile(p, os.O_RDWR, 0o644)
+	if os.IsPermission(err) {
+		f, err = fsx.OpenFile(p, os.O_RDONLY, 0o644)
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -378,7 +387,7 @@ func (s *OSByteStore) Delete(segmentName string) error {
 		_ = seg.file.Close()
 	}
 	p := s.pathFor(segmentName)
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+	if err := fsx.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -463,48 +472,45 @@ func (s *OSByteStore) WriteSnapshot(key string, data []byte) error {
 	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		os.Remove(tmp.Name())
+		fsx.Remove(tmp.Name())
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		os.Remove(tmp.Name())
+		fsx.Remove(tmp.Name())
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
+		fsx.Remove(tmp.Name())
 		return err
 	}
 	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
-		os.Remove(tmp.Name())
+		fsx.Remove(tmp.Name())
 		return err
 	}
-	if err := os.Rename(tmp.Name(), p); err != nil {
-		os.Remove(tmp.Name())
+	if err := fsx.Rename(tmp.Name(), p); err != nil {
+		fsx.Remove(tmp.Name())
 		return err
 	}
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		d.Close()
-	}
+	_ = fsx.SyncDir(dir)
 	// The new name now holds this key's state, so retire any pre-flattening file. Leaving it
 	// would be worse than untidy: ReadSnapshot falls back to it whenever the new name is absent,
 	// and promotion moves only the new one - so a promoted namespace would fall back to a
 	// checkpoint describing a log that is no longer underneath it.
 	if legacy := s.legacySnapPathFor(key); legacy != p {
-		_ = os.Remove(legacy)
+		_ = fsx.Remove(legacy)
 	}
 	return nil
 }
 
 func (s *OSByteStore) DeleteSnapshot(key string) error {
 	if legacy := s.legacySnapPathFor(key); legacy != s.snapPathFor(key) {
-		if err := os.Remove(legacy); err != nil && !os.IsNotExist(err) {
+		if err := fsx.Remove(legacy); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
 	p := s.snapPathFor(key)
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+	if err := fsx.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil

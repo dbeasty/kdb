@@ -1,0 +1,7 @@
+# Check text out with LF everywhere, including Windows. Golden fixtures, embedded test data and
+# gofmt all compare bytes, and a CRLF checkout would fail them for reasons that have nothing to do
+# with the code.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf

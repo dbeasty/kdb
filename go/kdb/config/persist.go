@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // Writing a setting back to the config file.
@@ -82,7 +84,7 @@ func WriteServiceFile(path string, f *ServiceFile) error {
 	tmpName := tmp.Name()
 	// Any early return from here on leaves nothing behind. Remove is harmless after the rename,
 	// which is why it is unconditional rather than guarded by a success flag.
-	defer os.Remove(tmpName)
+	defer fsx.Remove(tmpName)
 
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
@@ -110,16 +112,13 @@ func WriteServiceFile(path string, f *ServiceFile) error {
 			return fmt.Errorf("could not match %s's permissions: %w", path, err)
 		}
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := fsx.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("could not install %s: %w", path, err)
 	}
 	// The rename is only durable once the directory entry is. Without this the file can be back to
 	// its old contents - or missing - after a crash, which is the case this whole feature exists
 	// to guard against.
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
+	_ = fsx.SyncDir(dir)
 	return nil
 }
 

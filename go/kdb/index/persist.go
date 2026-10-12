@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // Files written under `<indexDir>/<indexId>/` by SaveStoreSnapshot.
@@ -47,7 +48,7 @@ func WriteFileAtomic(path string, data []byte) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	cleanup := func() { _ = os.Remove(tmpName) }
+	cleanup := func() { _ = fsx.Remove(tmpName) }
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		cleanup()
@@ -62,7 +63,7 @@ func WriteFileAtomic(path string, data []byte) error {
 		cleanup()
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := fsx.Rename(tmpName, path); err != nil {
 		cleanup()
 		return err
 	}

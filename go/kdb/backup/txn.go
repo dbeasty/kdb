@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // The cross-namespace transaction state of a data root: <dataRoot>/txn/ (see
@@ -108,12 +110,7 @@ func RestoreTxnState(store ObjectStore, m *DatabaseManifest, outDir string) erro
 			return err
 		}
 	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return fsx.SyncDir(dir)
 }
 
 func checkTxnFile(f TxnFile, body []byte) error {

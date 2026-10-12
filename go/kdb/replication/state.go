@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // PeerState is what the replicator remembers about one peer.
@@ -119,7 +121,7 @@ func (s *StateStore) Save(st PeerState) error {
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(s.dir, st.Name+".json"))
+	return fsx.Rename(tmp, filepath.Join(s.dir, st.Name+".json"))
 }
 
 // All returns every peer's state held in memory.

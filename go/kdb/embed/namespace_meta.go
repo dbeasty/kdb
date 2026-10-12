@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/limidus/kdb/go/kdb/fsx"
 	"github.com/limidus/kdb/go/kdb/storage"
 )
 
@@ -81,7 +82,7 @@ func writeNamespaceMeta(dataRoot, namespaceID string, m namespaceMeta) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return fsx.Rename(tmp, path)
 }
 
 // HistoryStrategyMismatchError reports a namespace being opened under a
