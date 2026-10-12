@@ -23,8 +23,13 @@ const minDocHashShardBudgetBytes int64 = 64 << 10
 type docHashEntry struct {
 	doc  document.Document
 	size int64
-	// el is this entry's position in the shard's recency list. The list
-	// holds codec.Hash values, back = least recently used.
+	// el is this entry's position in the shard's recency list, or nil while
+	// the entry is pinned. The list holds codec.Hash values, back = least
+	// recently used, and only ever unpinned entries: eviction used to walk
+	// the whole list skipping pinned ones, so once a shard's live tree
+	// outgrew its budget every Put scanned every live document in the shard
+	// and a bulk load slowed linearly with namespace size (a 1,000-document
+	// commit took 0.36 s at 200k documents against 15 ms at 10k).
 	el *list.Element
 }
 
@@ -108,11 +113,15 @@ func (s *shardedDocByHashStore) Put(h codec.Hash, doc document.Document) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if e, ok := sh.docs[h]; ok {
-		sh.lru.MoveToFront(e.el)
+		if e.el != nil {
+			sh.lru.MoveToFront(e.el)
+		}
 		return
 	}
 	e := &docHashEntry{doc: doc, size: entrySizeBytes(doc)}
-	e.el = sh.lru.PushFront(h)
+	if sh.pins[h] == 0 {
+		e.el = sh.lru.PushFront(h)
+	}
 	sh.docs[h] = e
 	sh.bytes += e.size
 	sh.evictLocked()
@@ -127,18 +136,17 @@ func (sh *docHashShard) evictLocked() {
 	if sh.budget <= 0 {
 		return
 	}
-	el := sh.lru.Back()
-	for sh.bytes > sh.budget && el != nil {
-		prev := el.Prev()
-		h := el.Value.(codec.Hash)
-		if sh.pins[h] == 0 {
-			if e, ok := sh.docs[h]; ok {
-				sh.bytes -= e.size
-				delete(sh.docs, h)
-			}
-			sh.lru.Remove(el)
+	for sh.bytes > sh.budget {
+		el := sh.lru.Back()
+		if el == nil {
+			return // everything left is pinned
 		}
-		el = prev
+		h := el.Value.(codec.Hash)
+		if e, ok := sh.docs[h]; ok {
+			sh.bytes -= e.size
+			delete(sh.docs, h)
+		}
+		sh.lru.Remove(el)
 	}
 }
 
@@ -150,7 +158,9 @@ func (s *shardedDocByHashStore) Get(h codec.Hash) (document.Document, bool) {
 	if !ok {
 		return document.Document{}, false
 	}
-	sh.lru.MoveToFront(e.el)
+	if e.el != nil {
+		sh.lru.MoveToFront(e.el)
+	}
 	return e.doc, true
 }
 
@@ -162,6 +172,10 @@ func (s *shardedDocByHashStore) Pin(h codec.Hash) {
 	sh := s.shardFor(h)
 	sh.mu.Lock()
 	sh.pins[h]++
+	if e, ok := sh.docs[h]; ok && e.el != nil {
+		sh.lru.Remove(e.el)
+		e.el = nil
+	}
 	sh.mu.Unlock()
 }
 
@@ -181,6 +195,9 @@ func (s *shardedDocByHashStore) Unpin(h codec.Hash) {
 	if n, ok := sh.pins[h]; ok {
 		if n <= 1 {
 			delete(sh.pins, h)
+			if e, ok := sh.docs[h]; ok && e.el == nil {
+				e.el = sh.lru.PushFront(h)
+			}
 		} else {
 			sh.pins[h] = n - 1
 		}

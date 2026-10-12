@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,7 @@ func main() {
 	batch := fs.Int("batch", 1000, "documents per commit during the bulk load")
 	reads := fs.Int("reads", 5000, "point reads for the latency percentiles")
 	single := fs.Int("single", 300, "single-document commits to time after the bulk load (load phase only)")
+	cpuprofile := fs.String("cpuprofile", "", "write a CPU profile of the whole run to this file")
 	_ = fs.Parse(os.Args[2:])
 	if *dir == "" {
 		fmt.Fprintln(os.Stderr, "-dir is required")
@@ -66,6 +68,13 @@ func main() {
 		Durability: storage.DurabilitySync,
 		SyncMode:   storio.SyncModeFull,
 	}}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		must(err)
+		must(pprof.StartCPUProfile(f))
+		defer pprof.StopCPUProfile()
+	}
 
 	start := time.Now()
 	rt, err := embed.OpenFileRuntimeWithOptions(*dir, catalog, ns, schema.None(), opts)
