@@ -206,12 +206,47 @@ type virtualBase struct {
 	// held is why a document's base could not be built - a rule that could not run while merging
 	// the bases. Such a document is held like any other a rule could not decide.
 	held map[codec.UUID]string
+	// memo holds what values returned for a given ordered list of bases at a given depth. The
+	// result depends on nothing else (ids are fixed for the life of one virtualBase), so reusing
+	// it is exact and node-independent. Without it the recursion re-derives the same base sets
+	// once per path that reaches them: on a mesh that merges all the time, that is exponential in
+	// the depth, runs the conflict rule at every step, and all of it holds the write gate - one
+	// node stopped taking writes and peer syncs for minutes (5-node load, Linux). Callers only
+	// read the returned map, so it is shared, not copied.
+	memo map[string]map[codec.UUID]baseVal
+}
+
+// valuesKey identifies one values call: the bases are in fold order, which changes the result,
+// and the depth decides whether the recursion is cut off, which changes it too.
+func valuesKey(bases []codec.Hash, depth int) string {
+	b := make([]byte, 0, 1+len(bases)*32)
+	b = append(b, byte(depth))
+	for _, h := range bases {
+		b = append(b, h.Bytes[:]...)
+	}
+	return string(b)
 }
 
 func (vb *virtualBase) values(bases []codec.Hash, ids []codec.UUID, depth int) (map[codec.UUID]baseVal, error) {
 	if len(bases) == 0 {
 		return map[codec.UUID]baseVal{}, nil
 	}
+	key := valuesKey(bases, depth)
+	if got, ok := vb.memo[key]; ok {
+		return got, nil
+	}
+	out, err := vb.valuesUncached(bases, ids, depth)
+	if err != nil {
+		return nil, err
+	}
+	if vb.memo == nil {
+		vb.memo = map[string]map[codec.UUID]baseVal{}
+	}
+	vb.memo[key] = out
+	return out, nil
+}
+
+func (vb *virtualBase) valuesUncached(bases []codec.Hash, ids []codec.UUID, depth int) (map[codec.UUID]baseVal, error) {
 	acc, err := vb.at(bases[0], ids)
 	if err != nil || len(bases) == 1 || depth >= maxVirtualBaseDepth {
 		return acc, err
