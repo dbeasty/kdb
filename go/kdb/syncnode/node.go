@@ -100,13 +100,17 @@ type Node struct {
 	projectionPeers sync.Map
 	peers           []replication.PeerConfig
 
-	mu         sync.Mutex
-	started    bool
-	closed     bool
-	listeners  []*server.Listener
-	conns      map[stream.ConnectionHandle]struct{}
-	stopExpiry chan struct{}
-	hook       *server.ConflictWebhook
+	mu        sync.Mutex
+	started   bool
+	closed    bool
+	listeners []*server.Listener
+	conns     map[stream.ConnectionHandle]struct{}
+	// inboundClosed refuses new Handler sessions once CloseInbound has run; serving counts the
+	// sessions Handler is running, so CloseInbound can wait for them to finish.
+	inboundClosed bool
+	serving       sync.WaitGroup
+	stopExpiry    chan struct{}
+	hook          *server.ConflictWebhook
 	// authorityProcs settles conflicts for chains whose authority rule names a procedure.
 	authorityProcs *server.ConflictProcedure
 	stopScrub      chan struct{}
@@ -507,6 +511,34 @@ func (n *Node) StopSync() {
 	}
 }
 
+// CloseInbound stops peer sync coming in: it closes every listener Listen opened and ends every
+// session Handler is serving, and returns once their handlers have, with any push they were
+// storing finished or abandoned. Later Handler requests are refused (503). Idempotent.
+//
+// For an orderly shutdown, before the namespaces drain and close: an inbound session is a writer
+// - it stores what peers push and adopts it under the write gate - and one still running when
+// storage closes writes into a DAG that is being checkpointed. Closing the HTTP server Handler is
+// mounted on is not enough to end its sessions: they are hijacked WebSocket connections, which
+// http.Server.Close leaves open.
+func (n *Node) CloseInbound() {
+	n.mu.Lock()
+	n.inboundClosed = true
+	listeners := n.listeners
+	n.listeners = nil
+	var conns []stream.ConnectionHandle
+	for c := range n.conns {
+		conns = append(conns, c)
+	}
+	n.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	for _, ln := range listeners {
+		_ = ln.Close() // ends the listener's sessions and waits for them (server.ListenPeerSyncTLS)
+	}
+	n.serving.Wait()
+}
+
 // Close stops syncing, scrubbing, conflict delivery and every listener the node opened. The
 // namespaces themselves belong to the application (or its host) and stay open, except the
 // metadata namespace when the node opened it in memory.
@@ -517,22 +549,12 @@ func (n *Node) Close() error {
 		return nil
 	}
 	n.closed = true
-	listeners := n.listeners
 	stopIdle := n.stopIdle
-	var conns []stream.ConnectionHandle
-	for c := range n.conns {
-		conns = append(conns, c)
-	}
 	n.mu.Unlock()
-	for _, c := range conns {
-		_ = c.Close()
-	}
+	n.CloseInbound()
 	n.StopSync()
 	if stopIdle != nil {
 		stopIdle()
-	}
-	for _, ln := range listeners {
-		_ = ln.Close()
 	}
 	if n.hook != nil {
 		n.hook.Close()

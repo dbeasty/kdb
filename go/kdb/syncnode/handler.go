@@ -20,11 +20,11 @@ import (
 // others. An application that authenticates the request itself (its middleware) can still leave
 // the per-namespace decisions to the engine: it sees the same token.
 //
-// Connections served by the handler are closed by Close.
+// Connections served by the handler are ended by CloseInbound (and Close), which waits for them.
 func (n *Node) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n.mu.Lock()
-		closed := n.closed
+		closed := n.closed || n.inboundClosed
 		n.mu.Unlock()
 		if closed {
 			http.Error(w, "sync node is closed", http.StatusServiceUnavailable)
@@ -40,7 +40,7 @@ func (n *Node) Handler() http.Handler {
 			return
 		}
 		defer n.untrack(conn)
-		server.ServePeerSyncConnection(conn, n.primary, n.primary.Runtime.DefaultNamespace, cc)
+		servePeerSync(conn, n.primary, n.primary.Runtime.DefaultNamespace, cc)
 	})
 }
 
@@ -69,17 +69,22 @@ func ConnectionContextFrom(r *http.Request) auth.ConnectionContext {
 	return cc
 }
 
-// track records a connection served by Handler, refusing it once the node is closed.
+// servePeerSync runs one peer-sync session; a variable so a test can observe a session ending.
+var servePeerSync = server.ServePeerSyncConnection
+
+// track records a connection served by Handler, refusing it once inbound sync is closed. Counted
+// under the same lock that checks, so CloseInbound's wait cannot miss a session starting.
 func (n *Node) track(conn stream.ConnectionHandle) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.closed {
+	if n.closed || n.inboundClosed {
 		return false
 	}
 	if n.conns == nil {
 		n.conns = map[stream.ConnectionHandle]struct{}{}
 	}
 	n.conns[conn] = struct{}{}
+	n.serving.Add(1)
 	return true
 }
 
@@ -87,4 +92,5 @@ func (n *Node) untrack(conn stream.ConnectionHandle) {
 	n.mu.Lock()
 	delete(n.conns, conn)
 	n.mu.Unlock()
+	n.serving.Done()
 }

@@ -52,6 +52,15 @@ import (
 // commit only if the DAG does not already hold it (embed.applyCommitsTopologically). Paying that
 // on a repair is the price of not tracking which commits are logged, and the alternative was a
 // deepen that reported success having logged nothing.
+//
+// What keeps that resident-but-unlogged history out of a checkpoint is the unlogged mark
+// (dag/unlogged.go): every commit Deepen stores is marked until persistAll queues its frame, and
+// gets the mark back if the write fails. A checkpoint taken before a retry - a clean close, a
+// maintenance pass - leaves those commits out, so the next open is the one a crash would have
+// given: the root still shallow, the history below it absent, and the next Deepen fetching it
+// again (within the same process a retry re-logs it, as above). Described without operations
+// instead, they reopened as held commits nothing could read: a retry found every parent present,
+// fetched nothing, and failed reading them back to log them, for good.
 
 // DeepenResult is what one Deepen did.
 type DeepenResult struct {
@@ -161,10 +170,15 @@ func Deepen(env IngestEnv, s *RepairSession, root codec.Hash) (DeepenResult, err
 					break
 				}
 			}
+			// Marked unlogged until persistAll below logs them, like any commit stored from a
+			// peer: should the log write fail, a checkpoint taken before a retry - a clean close,
+			// a maintenance pass - must not describe history the log never received. It would
+			// reopen holding these commits without operations, a retry would find them all held
+			// and fetch nothing, and reading them back to log them would fail for good.
 			if whole {
-				err = env.DAG.PutCommit(c, true) // recomputes the hash: a peer cannot forge history
+				err = env.DAG.PutUnloggedCommit(c) // recomputes the hash: a peer cannot forge history
 			} else {
-				err = env.DAG.PutShallowCommit(c)
+				err = env.DAG.PutUnloggedShallowCommit(c)
 			}
 			if err != nil {
 				return fmt.Errorf("peer sync: deepen: storing %s: %w", c.Hash.Hex(), err)
