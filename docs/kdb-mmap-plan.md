@@ -145,7 +145,16 @@ offset index, reading bodies on demand through the existing `deltaColdLoader` se
 
 ## Decisions (answered 2026-10-11)
 
-- **Linux-only deploy.** macOS is a developer path; `*_other.go` fallbacks stay minimal (return `ErrUnsupported`).
+- **Linux and macOS are both release targets** (corrected 2026-10-11; first answered as Linux-only). Both are `unix`
+  for mapping, so one implementation serves both and only Windows/wasm fall back (`ErrUnsupported`). Where they differ:
+  - *Budget source:* Linux budgets come from the cgroup; macOS has none, so the budget comes from system memory
+    (`go/kdb/storage/system_memory_darwin.go`). `MappedBytes()` must be charged against whichever budget is in force.
+  - *Durability:* the graph file is written then renamed, so its writer must use the same `fsync` path as the rest of
+    the store (`F_FULLFSYNC` on macOS via `storage/io/sync_darwin.go`), not a bare `File.Sync`.
+  - *Benchmarks:* macOS numbers are not comparable to Linux ones, and extra flushing halves neighbours there, so any
+    graph-file benchmark needs a no-protocol control and a Linux run before it is believed.
+  - *Tests:* the SIGBUS-on-truncate test skips where the platform keeps pages resident; CI must run the mmapfile
+    tests on both OSes.
 - **Design point: ~1M documents / commits is the sweet spot; more than that must still work.** The pointer-free node
   store is the 1M answer; the mapped graph file is the answer beyond it (2M commits is ~600 MB resident at 298 B/commit).
 - **Mapped regions count against the memory budget.** `mmapfile.MappedBytes()` reports whole-file bytes of live
