@@ -442,6 +442,16 @@ def preserve_evidence(name: str, servers: list["KdbServer"], notes: str = "") ->
                 # between listing and copying. Keep everything else rather than failing teardown
                 # with this error in place of the test's own.
                 notes += f"\n\nnode{i}: files that changed during the copy: {e}"
+    # A node that is up but stuck (a held lock, a blocked commit) shows nothing in its logs; its
+    # goroutines say who holds what. The admin port serves them, so keep them with the evidence.
+    for i, srv in enumerate(servers):
+        try:
+            code, dump = srv.admin_get("/debug/pprof/goroutine?debug=2")
+            if code == 200:
+                (dest / f"node{i}").mkdir(parents=True, exist_ok=True)
+                (dest / f"node{i}" / "goroutines.txt").write_text(dump)
+        except Exception:
+            pass  # the node is down or unreachable; its logs are already copied
     if notes:
         (dest / "notes.txt").write_text(notes)
     return str(dest)
