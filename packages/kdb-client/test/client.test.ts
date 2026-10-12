@@ -653,6 +653,34 @@ describe("SQL", () => {
     dml.forEach((r, i) => assert.equal(r.kind, i % 2 === 0 ? "sqlExec" : "txCommit"));
   });
 
+  it("pages a SELECT by following the continuation token", async () => {
+    const pages = [
+      { rows: [["a"], ["b"]], continuation: "t1" },
+      { rows: [["c"], ["d"]], continuation: "t2" },
+      { rows: [["e"]], continuation: undefined },
+    ];
+    let next = 0;
+    const server = new FakeServer((request) => {
+      if (request.kind === "sessionBegin") return sessionAck(NS);
+      const page = pages[next++]!;
+      // The first request carries a page size and no token; each later one echoes the last.
+      assert.equal(request.payload["pageSize"], 2);
+      assert.equal(request.payload["continuation"], next === 1 ? undefined : pages[next - 2]!.continuation);
+      return {
+        kind: "sqlResult" as const,
+        payload: {
+          namespace: NS, sessionId: "sess-1", columns: ["name"], rows: page.rows, rowsAffected: 0,
+          resolvedCommitHex: HEAD_ONE, readOnly: true, generatedIds: [],
+          ...(page.continuation ? { continuation: page.continuation } : {}),
+        },
+      };
+    });
+    const client = new Client(server);
+    const all = await client.queryAll<{ name: string }>(NS, "SELECT name FROM t", [], 2);
+    assert.deepEqual(all.map((r) => r.name), ["a", "b", "c", "d", "e"]);
+    assert.equal(next, 3);
+  });
+
   it("surfaces a server error with its classification", async () => {
     const server = new FakeServer((request) =>
       request.kind === "sessionBegin"

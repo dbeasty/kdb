@@ -465,6 +465,44 @@ export class Client implements KdbOperations {
     return { columns: result.columns, rows: result.rows };
   }
 
+  async *queryRawPages(
+    ns: string,
+    sql: string,
+    args: unknown[] = [],
+    pageSize = 0,
+    options: CallOptions = {},
+  ): AsyncGenerator<{ columns: string[]; rows: string[][] }, void, undefined> {
+    // 0 asks for the largest page the server allows; it clamps an oversized request itself.
+    const size = pageSize > 0 ? Math.floor(pageSize) : 2 ** 30;
+    let continuation: string | undefined;
+    do {
+      const page = await this.#execSql(ns, sql, args, options, { pageSize: size, continuation });
+      yield { columns: page.columns, rows: page.rows };
+      continuation = page.continuation;
+    } while (continuation !== undefined);
+  }
+
+  async queryAll<T = Row>(
+    ns: string,
+    sql: string,
+    args: unknown[] = [],
+    pageSize = 0,
+    options: CallOptions = {},
+  ): Promise<T[]> {
+    const out: T[] = [];
+    for await (const { columns, rows } of this.queryRawPages(ns, sql, args, pageSize, options)) {
+      for (const row of rows) {
+        const obj: Record<string, string> = {};
+        for (let i = 0; i < columns.length; i++) {
+          const column = columns[i];
+          if (column !== undefined) obj[column] = row[i] ?? "";
+        }
+        out.push(obj as T);
+      }
+    }
+    return out;
+  }
+
   async exec(
     ns: string,
     sql: string,
@@ -656,7 +694,14 @@ export class Client implements KdbOperations {
     sql: string,
     args: unknown[],
     options: CallOptions,
-  ): Promise<{ columns: string[]; rows: string[][]; readOnly: boolean; rowsAffected: number }> {
+    paging?: { pageSize: number; continuation?: string },
+  ): Promise<{
+    columns: string[];
+    rows: string[][];
+    readOnly: boolean;
+    rowsAffected: number;
+    continuation: string | undefined;
+  }> {
     const state = await this.#ensureNamespace(ns, options);
     const reply = await this.#request(
       "sqlExec",
@@ -665,6 +710,12 @@ export class Client implements KdbOperations {
         sessionId: state.sessionId,
         sql,
         parametersJson: args.length > 0 ? JSON.stringify(args) : null,
+        ...(paging
+          ? {
+              pageSize: paging.pageSize,
+              ...(paging.continuation ? { continuation: paging.continuation } : {}),
+            }
+          : {}),
       },
       options,
     );
@@ -675,6 +726,7 @@ export class Client implements KdbOperations {
       rows: result.rows ?? [],
       readOnly: result.readOnly,
       rowsAffected: result.rowsAffected ?? 0,
+      continuation: result.continuation || undefined,
     };
   }
 

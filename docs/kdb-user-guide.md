@@ -2292,3 +2292,22 @@ of keeping a `_c` discriminator field in one shared namespace. Each namespace ha
 under `<data-dir>/ns/`, its own commit history, indexes and background maintenance loop, and shares
 the process-wide memory budget and admission control. `TestServiceServesOneNamespacePerCollection`
 drives the real binary through this.
+
+### Reading a result larger than `--max-result-rows`
+
+A SELECT whose result exceeds `--max-result-rows` fails with `RESOURCE_EXHAUSTED` (it is never cut
+short silently). To read a whole collection anyway, ask for it in pages: set `pageSize` on the
+`sqlExec` message (Go `Client.QueryRawPages`, TypeScript `queryRawPages` / `queryAll`). Each reply
+carries at most that many rows (clamped below the bound) and, while rows remain, a
+`continuation` token to send back with the same statement and parameters. Properties:
+
+- every page reads the commit the first page read at, so the pages are one consistent snapshot and
+  writes made meanwhile are not seen; a token whose commit has been dropped from history is refused
+  ("continuation expired") and the query restarts;
+- the server is stateless between pages: each re-runs the query. An `ORDER BY` pays its sort per
+  page, and a deep page of an unordered query re-reads the rows before it. Prefer a selective
+  `WHERE`, or an `ORDER BY` on an indexed path, for very large reads;
+- the statement's own `LIMIT`/`OFFSET` bound the paged result; an ungrouped aggregate is a single
+  row and is not paged;
+- a token is bound to its statement and parameters (a different one is refused) but is not a
+  credential: the read is authorized on every page.

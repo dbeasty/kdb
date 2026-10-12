@@ -146,6 +146,10 @@ export interface SqlExecDto {
   sessionId: string;
   sql: string;
   parametersJson: string | null;
+  /** Paged SELECT: rows per page. Omitted for an ordinary read. */
+  pageSize?: number;
+  /** Paged SELECT: the previous page's continuation token. */
+  continuation?: string;
 }
 
 export interface SqlResultDto {
@@ -160,6 +164,8 @@ export interface SqlResultDto {
   generatedIds: string[];
   errorCode?: string | null;
   retryAfterMs?: number | null;
+  /** Paged SELECT: present while more rows remain; send it back as `continuation`. */
+  continuation?: string | null;
 }
 
 export interface TxCommitDto {

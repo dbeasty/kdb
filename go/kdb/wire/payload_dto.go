@@ -268,6 +268,8 @@ type sqlExecDto struct {
 	SessionID      string  `json:"sessionId"`
 	SQL            string  `json:"sql"`
 	ParametersJSON *string `json:"parametersJson"`
+	PageSize       int     `json:"pageSize,omitempty"`
+	Continuation   string  `json:"continuation,omitempty"`
 }
 
 type sqlResultDto struct {
@@ -284,6 +286,8 @@ type sqlResultDto struct {
 	// doc comment (kdb-spec-layer13 Component 51 §8.1).
 	ErrorCode    *ErrorCode `json:"errorCode,omitempty"`
 	RetryAfterMs *int       `json:"retryAfterMs,omitempty"`
+	// Continuation is the paged-SELECT token (SqlResultMessage.ContinuationToken).
+	Continuation string `json:"continuation,omitempty"`
 }
 
 type txCommitDto struct {

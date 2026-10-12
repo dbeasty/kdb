@@ -723,6 +723,12 @@ type SqlExecMessage struct {
 	SessionID      string
 	SQL            string
 	ParametersJSON *string
+	// PageSize, when > 0, asks for a SELECT's result in pages of at most that many rows (capped
+	// below the server's result bound), each reply carrying ContinuationToken while more remain.
+	// Continuation resumes a previous page. Both are additive: an old server ignores them and
+	// answers as it always did, and without them nothing changes.
+	PageSize     int
+	Continuation string
 }
 
 func (m SqlExecMessage) Header() Header { return m.H }
@@ -743,6 +749,10 @@ type SqlResultMessage struct {
 	// Error, to let a client decide whether/when to retry without parsing Error's prose.
 	ErrorCode    *ErrorCode
 	RetryAfterMs *int
+	// ContinuationToken is set on a paged SELECT's reply when more rows remain; send it back as
+	// SqlExecMessage.Continuation (with the same SQL and parameters) for the next page. Empty on
+	// the last page and on every unpaged reply.
+	ContinuationToken string
 }
 
 func (m SqlResultMessage) Header() Header { return m.H }

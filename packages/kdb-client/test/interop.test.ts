@@ -45,7 +45,7 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
   let serverUri = "";
 
   before(async () => {
-    server = spawn("go", ["run", "./cmd/kdb-tsinterop", "-namespace", NS], {
+    server = spawn("go", ["run", "./cmd/kdb-tsinterop", "-namespace", NS, "-max-result-rows", "50"], {
       cwd: goDir,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -359,5 +359,32 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
     assert.equal(await client.exec(NS, "DELETE FROM players WHERE name = 'never-existed'"), 0);
     const left = await client.query<{ name: string }>(NS, "SELECT name FROM players");
     assert.ok(left.every((r) => !r.name.startsWith("del")));
+  });
+
+  it("streams a result larger than the server's result bound in pages", async () => {
+    const total = 130; // the server in this suite caps a reply at 50 rows
+    for (let i = 0; i < total; i++) {
+      await client.exec(NS, `INSERT INTO players (name, level) VALUES ('page${String(i).padStart(3, "0")}', '1')`);
+    }
+    await assert.rejects(client.query(NS, "SELECT name FROM players WHERE name LIKE 'page%'"), /50/);
+
+    const rows = await client.queryAll<{ name: string }>(
+      NS,
+      "SELECT name FROM players WHERE name LIKE 'page%' ORDER BY name",
+      [],
+      40,
+    );
+    assert.equal(rows.length, total);
+    assert.deepEqual(
+      rows.map((r) => r.name),
+      Array.from({ length: total }, (_, i) => `page${String(i).padStart(3, "0")}`),
+    );
+
+    let pages = 0;
+    for await (const page of client.queryRawPages(NS, "SELECT name FROM players WHERE name LIKE 'page%'", [], 0)) {
+      pages++;
+      assert.ok(page.rows.length <= 50);
+    }
+    assert.equal(pages, 3); // 130 rows at the clamped page size of 49
   });
 });

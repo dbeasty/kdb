@@ -163,6 +163,30 @@ export interface KdbOperations {
   ): Promise<{ columns: string[]; rows: string[][] }>;
 
   /**
+   * Streams a SELECT's result page by page, so a whole-collection read is not capped by the
+   * server's `--max-result-rows` (only one page has to fit in a reply). Every page reads the
+   * snapshot the first one did, so writes made meanwhile are not seen. The server re-runs the
+   * query per page: an ORDER BY pays its sort on each, and a deep page of an unordered query
+   * re-reads the rows before it. `pageSize` 0 means the largest page the server allows.
+   */
+  queryRawPages(
+    ns: string,
+    sql: string,
+    args?: unknown[],
+    pageSize?: number,
+    options?: CallOptions,
+  ): AsyncGenerator<{ columns: string[]; rows: string[][] }, void, undefined>;
+
+  /** `queryRawPages`, collected: every row of the result, mapped like `query`. */
+  queryAll<T = Row>(
+    ns: string,
+    sql: string,
+    args?: unknown[],
+    pageSize?: number,
+    options?: CallOptions,
+  ): Promise<T[]>;
+
+  /**
    * Runs one non-SELECT statement, auto-committing it if the server reports it as a write.
    * Resolves to the number of rows the statement affected, so a DELETE that matched nothing is
    * distinguishable from one that removed a row. Concurrent calls on a namespace are safe.

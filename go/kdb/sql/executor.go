@@ -35,6 +35,9 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	if !query.HasFrom() {
 		return e.executeSingleRowSelect(query, ctx)
 	}
+	if ctx.Page != nil {
+		return e.executePage(query, plan, residual, ctx)
+	}
 	// Aggregates are no longer dispatched to a separate path here: grouped and ungrouped
 	// queries share the pipeline below, which is what lets a GROUP BY key be projected.
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, query.From)
@@ -115,6 +118,50 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 		rows = []QueryRow{}
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows, Plan: label}, nil
+}
+
+// executePage runs one page of a SELECT by asking the ordinary pipeline for the page's rows plus
+// one, which is how it knows whether more remain without reading the rest. The pipeline's
+// LIMIT/OFFSET pushdown then bounds the work to the rows up to the end of the page.
+func (e *Executor) executePage(query SelectQuery, plan PhysicalPlan, residual Expr, ctx QueryContext) (QueryResult, error) {
+	page := *ctx.Page
+	ctx.Page = nil
+	if isGroupedQuery(query) && len(query.GroupBy) == 0 {
+		// An ungrouped aggregate is one row: there is nothing to page.
+		return e.ExecuteSelect(query, plan, residual, ctx)
+	}
+	maxRows := e.maxResultRows(ctx)
+	size := page.Size
+	if size < 1 || size > maxRows-1 {
+		size = maxRows - 1
+	}
+	if size < 1 {
+		size = 1
+	}
+	want := size
+	exhaustedByLimit := false
+	if query.Limit != nil {
+		remaining := *query.Limit - page.Offset
+		if remaining <= 0 {
+			return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: []QueryRow{}}, nil
+		}
+		if remaining <= want {
+			want, exhaustedByLimit = remaining, true
+		}
+	}
+	q := query
+	lim := want + 1
+	q.Limit = &lim
+	q.Offset = query.Offset + page.Offset
+	res, err := e.ExecuteSelect(q, plan, residual, ctx)
+	if err != nil {
+		return QueryResult{}, err
+	}
+	if len(res.Rows) > want {
+		res.Rows = res.Rows[:want]
+		res.More = !exhaustedByLimit
+	}
+	return res, nil
 }
 
 // tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE col = const]` from counters

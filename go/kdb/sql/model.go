@@ -399,6 +399,19 @@ type QueryContext struct {
 	// measured"): unlike a process-wide allocation counter, it is exact and attributable to
 	// this query alone, so it stays meaningful under concurrency.
 	Stats *ExecStats
+	// Page, when non-nil, makes a SELECT return one page of its result instead of failing when
+	// the whole result exceeds MaxRows. See PageRequest.
+	Page *PageRequest
+}
+
+// PageRequest asks for rows [Offset, Offset+Size) of a SELECT's result, in the order the query
+// produces them (its ORDER BY, else the namespace's document order, which is stable at one
+// commit). Offset counts from the start of the query's own result, after its OFFSET and within
+// its LIMIT. Each page re-runs the query, so the caller pins AtCommit across pages to keep them
+// consistent; a query with ORDER BY pays its sort on every page.
+type PageRequest struct {
+	Offset int
+	Size   int
 }
 
 // ExecStats records what a query actually cost while it ran. All counters are additive across
@@ -452,6 +465,8 @@ type QueryResult struct {
 	// "index:eq(field)", "index:range(field)", "index:in(field)", "fulltext(name)",
 	// "vector(field)", "fuse(...)". Tests assert on it to prove an index was used.
 	Plan string
+	// More is set on a paged SELECT when rows remain after this page.
+	More bool
 }
 
 // DMLResult is the outcome of INSERT (operations for commit).
