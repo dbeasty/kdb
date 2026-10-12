@@ -182,6 +182,19 @@ func (a *expiryHidingAdapter) hidesAt(treeHash codec.Hash) bool {
 	return ok && head == treeHash
 }
 
+// CountDocuments implements storage.DocumentCounter. While expiry hides documents at treeHash the
+// tree's size over-counts what a read returns, so the answer is "cannot say" and the caller reads.
+func (a *expiryHidingAdapter) CountDocuments(namespaceID string, treeHash codec.Hash) (int, bool, error) {
+	if a.hidesAt(treeHash) {
+		return 0, false, nil
+	}
+	counter, ok := a.Adapter.(storage.DocumentCounter)
+	if !ok {
+		return 0, false, nil
+	}
+	return counter.CountDocuments(namespaceID, treeHash)
+}
+
 func (a *expiryHidingAdapter) GetDocument(namespaceID string, docID codec.UUID, atCommit codec.Hash) (*document.Document, error) {
 	doc, err := a.Adapter.GetDocument(namespaceID, docID, atCommit)
 	if err != nil || doc == nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -68,6 +69,11 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 		}
 		stopAt = want
 	}
+	if res, ok, err := e.tryCountOnly(query, env, ctx); err != nil {
+		return QueryResult{}, err
+	} else if ok {
+		return res, nil
+	}
 	ids, label, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt)
 	if err != nil {
 		return QueryResult{}, err
@@ -109,6 +115,114 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 		rows = []QueryRow{}
 	}
 	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows, Plan: label}, nil
+}
+
+// tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE col = const]` from counters
+// instead of reading documents, so counting a large namespace costs the same as counting a small
+// one and is not subject to the scan row budget (nothing is scanned).
+//
+// It declines - leaving the ordinary path to run - unless the answer is provably the one reading
+// the documents would give: the projections are all bare COUNT(*) with no grouping or DISTINCT;
+// the storage can count the tree without reading it and says every document in it is visible
+// (storage.DocumentCounter, which declines while expiry hides documents); and the WHERE is either
+// absent or a single equality on a string or boolean constant that an index serves exactly (the
+// index count and a re-check of the predicate agree for those).
+func (e *Executor) tryCountOnly(query SelectQuery, env *evalEnv, ctx QueryContext) (QueryResult, bool, error) {
+	if query.Distinct || len(query.GroupBy) > 0 || len(query.Projections) == 0 || query.Offset > 0 {
+		return QueryResult{}, false, nil
+	}
+	if query.Limit != nil && *query.Limit < 1 {
+		return QueryResult{}, false, nil
+	}
+	for _, p := range query.Projections {
+		pe, ok := p.(ProjExpression)
+		if !ok || !isCountStar(pe.Expr) {
+			return QueryResult{}, false, nil
+		}
+	}
+	counter, ok := e.Storage.(storage.DocumentCounter)
+	if !ok {
+		return QueryResult{}, false, nil
+	}
+	atCommit, err := e.atCommit(ctx)
+	if err != nil {
+		return QueryResult{}, false, err
+	}
+	commit, err := e.DAG.GetCommitOrThrow(atCommit)
+	if err != nil {
+		return QueryResult{}, false, err
+	}
+	total, ok, err := counter.CountDocuments(ctx.NamespaceID, commit.DocumentTreeHash)
+	if err != nil || !ok {
+		return QueryResult{}, false, err
+	}
+	n, label := total, "count:tree"
+	if query.Where != nil {
+		got, ok := e.countByIndex(query.Where, env, ctx)
+		if !ok {
+			return QueryResult{}, false, nil
+		}
+		n, label = got, "count:index"
+	}
+	row := QueryRow{Values: make([]Cell, len(query.Projections))}
+	for i := range row.Values {
+		row.Values[i] = CellLong{Value: int64(n)}
+	}
+	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: []QueryRow{row}, Plan: label}, true, nil
+}
+
+// isCountStar reports whether x is COUNT(*) (or COUNT with no argument).
+func isCountStar(x Expr) bool {
+	fc, ok := x.(ExprFunctionCall)
+	if !ok || !strings.EqualFold(fc.Name, "count") {
+		return false
+	}
+	if len(fc.Args) == 0 {
+		return true
+	}
+	cr, ok := fc.Args[0].(ExprColumnRef)
+	return len(fc.Args) == 1 && ok && cr.Name == "*"
+}
+
+// countByIndex counts the documents a single `col = <string|bool constant>` WHERE selects, from
+// the index alone.
+func (e *Executor) countByIndex(where Expr, env *evalEnv, ctx QueryContext) (int, bool) {
+	counter, ok := e.IndexProvider.(ExactCounter)
+	if !ok || e.IndexProvider == nil {
+		return 0, false
+	}
+	b, ok := where.(ExprBinary)
+	if !ok || b.Op != BinaryOpEQ {
+		return 0, false
+	}
+	col, other := b.Left, b.Right
+	if _, isCol := col.(ExprColumnRef); !isCol {
+		col, other = b.Right, b.Left
+	}
+	ref, isCol := col.(ExprColumnRef)
+	if !isCol {
+		return 0, false
+	}
+	switch other.(type) {
+	case ExprLiteral, ExprParameter:
+	default:
+		return 0, false
+	}
+	name := env.columnName(ref.Name)
+	if isReservedColumn(name) {
+		return 0, false
+	}
+	value := env.cell(other, newEvalDoc(emptyDoc))
+	switch value.(type) {
+	case CellString, CellBool:
+	default:
+		return 0, false
+	}
+	n, ok, err := counter.ExactCount(ctx, name, value)
+	if err != nil || !ok {
+		return 0, false
+	}
+	return n, true
 }
 
 // plainRows sorts and projects a non-grouped result. Sort keys are computed once per row, not

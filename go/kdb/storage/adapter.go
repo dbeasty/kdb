@@ -77,6 +77,16 @@ type TreeResolver interface {
 	TreeAt(treeHash codec.Hash) (document.DocumentTree, bool, error)
 }
 
+// DocumentCounter is implemented by adapters that can say how many documents a tree holds
+// without reading any of them. ok is false when they cannot do so cheaply (the tree is not
+// resident) or when the count would not match what a read returns - the server's expiry layer
+// answers ok=false while documents are being hidden, because a hidden document is still in the
+// tree. A caller that gets ok=false reads the documents instead; it must never rebuild a tree to
+// get a count.
+type DocumentCounter interface {
+	CountDocuments(namespaceID string, treeHash codec.Hash) (n int, ok bool, err error)
+}
+
 // ForeignTreeStore is implemented by adapters that can hold a document tree they did not build - a
 // peer's state at a commit this namespace grafts in (peersync.Graft) - resolvable by hash, with
 // its documents, without it becoming the live tree. Every body is checked against the content
