@@ -714,6 +714,52 @@ Remaining before step 7: step 1 (the Go WS listener), which is not this componen
 step 6, which needs a running server. Until step 6 runs, the compatibility claim is proven at
 the byte level and unproven end to end; the package README states that limitation plainly.
 
+### 13.6 Phase 2 and 3 implementation status
+
+Both are implemented, each in its own package, tested end to end (CI jobs `ts-codegen`, `ts-embed`).
+
+**`@kdb/codegen`** (`packages/kdb-codegen`, §10). Departures from what §10 anticipated:
+
+- The entry point is a Node binary, `kdb-codegen --schema … --out …`, not `kdb schema codegen`: the
+  server has no message that exports a namespace's schema, so the input is the `EmbedSchemaDto` JSON
+  (grouped by namespace) rather than something read live. `--check` is the drift gate §10.2 asks for.
+- Probing the real engine fixed the coercion rules: NULL and `""` both arrive as `""` (so an optional
+  string reads as `""`, not `null`), booleans arrive as `1`/`0`, a BIGINT survives exactly (so int64
+  is `bigint` in rows), and the table name in SQL is ignored — one namespace is one table. `CREATE
+  TABLE` has no JSON type, so object/array fields have no SQL column and are typed on documents only.
+- §10.4 promised "branch operations as typed methods". The wire client exposes none, so the handle
+  exposes what exists — `get` returns the commit, `commit` takes it as `baseVersion` — and invents
+  nothing. Branch operations arrive when the client grows them.
+
+**`@kdb/embed`** (`packages/kdb-embed`, `go/wasm/embed`, §11). §11.2 is decided: **Go → WASM**.
+The decisive finding is that `server.FrameHost` is already the transport-independent seam, so the
+module is the server's own engine behind a pair of JS callbacks, not a second implementation; the
+TypeScript side is a `LoopbackTransport` under the unchanged `Client`. `openEmbedded` therefore
+returns a `Client` (hence a `KdbOperations`, per §11.3) and inherits every behaviour for free.
+
+- Verified three ways: the same `@kdb/codegen` suite passes against it and against the Go server; a
+  differential test runs a 23-step script against both and requires identical results, error classes
+  and messages; and `test/browser/smoke.html` passes in Chromium.
+- Namespaces are routed by a `NamespaceSet`, one in-memory runtime per listed namespace. A bare
+  single runtime aliases *every* namespace name onto its one store (documented in
+  `server/multi_commit.go`), which is wrong for an embedded database; unlisted namespaces are refused.
+- **Durability** (`persist`, added in this phase). Key finding: the file engine reaches the disk through
+  `os.*` in about a dozen places (directory lock, namespace metadata, node identity, the
+  cross-namespace transaction log, checkpoints), not through the one `SegmentByteStore` interface, so
+  injecting a store alone could not have made it browser-durable. Instead the Go runtime's `fs` object
+  (which every `os.*` call goes through on js/wasm) is implemented in TypeScript, in memory with
+  write-behind to IndexedDB in 64 KiB chunks; the real engine runs unmodified. `fsync` is the durability
+  boundary - its callback fires only after one atomic backend transaction - and the engine already acks
+  commits only after fsync. Lock files are never persisted. Verified by crash-recovery tests against a
+  backend snapshot, injected storage failure, and three real reloads in Chromium on real IndexedDB.
+  `open()` returns a Promise because the Go `js.FuncOf` handler must not block on a filesystem callback.
+  Limits: a SQL `CREATE TABLE` schema is not restored on reopen (the Go service behaves the same, so
+  codegen gained an idempotent `ensure()`); one open per name; data is held in memory.
+- Still open: no peer-sync or stream-subscribe against a server, and the binary is ~31.7 MB (~6.9 MB
+  gzipped, ~4.9 MB brotli). The persistent engine links the AWS S3 client (~21 MB), so the WASM build
+  uses a `kdb_lite` tag that stubs it; the remainder is the engine itself, so brotli delivery is the
+  shipped mitigation.
+
 ## 14. Estimated lines
 
 Phase 1, `@kdb/client`: **1,600–2,400 NBNC**, split roughly as — 250 wire framing and envelope,

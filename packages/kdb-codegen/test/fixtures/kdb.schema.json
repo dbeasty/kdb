@@ -1,0 +1,20 @@
+{
+  "namespaces": {
+    "app/users": {
+      "table": "users",
+      "typeName": "User",
+      "fields": [
+        { "name": "name", "type": "string", "required": true },
+        { "name": "age", "type": "int32" },
+        { "name": "balance", "type": "int64" },
+        { "name": "score", "type": "float64" },
+        { "name": "active", "type": "bool" },
+        { "name": "joined", "type": "timestamp" },
+        { "name": "nickname", "type": "string" },
+        { "name": "tier", "type": { "enum": ["free", "pro"] } },
+        { "name": "profile", "type": "object" },
+        { "name": "tags", "type": "array" }
+      ]
+    }
+  }
+}

@@ -1,9 +1,6 @@
 package peersync
 
 import (
-	"strconv"
-	"strings"
-
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	kdbjson "github.com/limidus/kdb/go/kdb/json"
@@ -209,17 +206,28 @@ type virtualBase struct {
 	// held is why a document's base could not be built - a rule that could not run while merging
 	// the bases. Such a document is held like any other a rule could not decide.
 	held map[codec.UUID]string
-	// memo remembers each (depth, bases) fold already built, and atMemo each base's values. The
-	// recursion reaches the same inner bases along many paths - in a dense criss-cross (a mesh
-	// under load) exponentially many - and without them rebuilt each one, and reran the chain's
-	// procedure over it, once per path: past the server's per-sync budget of procedure calls for
-	// just two documents, so the merge was held, on every node, on every retry. Within one merge
-	// a fold depends only on its bases, its depth and ids (fixed for the merge), so a remembered
-	// result is the one rebuilding would produce, and held already records the first reason.
-	memo   map[string]map[codec.UUID]baseVal
-	atMemo map[codec.Hash]map[codec.UUID]baseVal
-	// noMemo turns both off, for the test that checks they change nothing but the cost.
+	// memo holds what values returned for a given ordered list of bases at a given depth. The
+	// result depends on nothing else (ids are fixed for the life of one virtualBase), so reusing
+	// it is exact and node-independent. Without it the recursion re-derives the same base sets
+	// once per path that reaches them: on a mesh that merges all the time, that is exponential in
+	// the depth, runs the conflict rule at every step, and all of it holds the write gate - one
+	// node stopped taking writes and peer syncs for minutes (5-node load, Linux). Callers only
+	// read the returned map, so it is shared, not copied.
+	memo map[string]map[codec.UUID]baseVal
+	// noMemo computes every values call afresh, ignoring memo. Tests only: it is how they check the
+	// memo changes no result.
 	noMemo bool
+}
+
+// valuesKey identifies one values call: the bases are in fold order, which changes the result,
+// and the depth decides whether the recursion is cut off, which changes it too.
+func valuesKey(bases []codec.Hash, depth int) string {
+	b := make([]byte, 0, 1+len(bases)*32)
+	b = append(b, byte(depth))
+	for _, h := range bases {
+		b = append(b, h.Bytes[:]...)
+	}
+	return string(b)
 }
 
 func (vb *virtualBase) values(bases []codec.Hash, ids []codec.UUID, depth int) (map[codec.UUID]baseVal, error) {
@@ -227,32 +235,24 @@ func (vb *virtualBase) values(bases []codec.Hash, ids []codec.UUID, depth int) (
 		return map[codec.UUID]baseVal{}, nil
 	}
 	if vb.noMemo {
-		return vb.fold(bases, ids, depth)
+		return vb.valuesUncached(bases, ids, depth)
 	}
-	var key strings.Builder
-	key.WriteString(strconv.Itoa(depth))
-	for _, b := range bases {
-		key.WriteByte(':')
-		key.WriteString(b.Hex())
-	}
-	if got, ok := vb.memo[key.String()]; ok {
+	key := valuesKey(bases, depth)
+	if got, ok := vb.memo[key]; ok {
 		return got, nil
 	}
-	out, err := vb.fold(bases, ids, depth)
+	out, err := vb.valuesUncached(bases, ids, depth)
 	if err != nil {
 		return nil, err
 	}
 	if vb.memo == nil {
 		vb.memo = map[string]map[codec.UUID]baseVal{}
 	}
-	vb.memo[key.String()] = out
+	vb.memo[key] = out
 	return out, nil
 }
 
-// fold is values without the memo: bases[0], with every later base three-way merged into it.
-// values hands the map it returns to every caller asking for the same bases again; they only
-// read it.
-func (vb *virtualBase) fold(bases []codec.Hash, ids []codec.UUID, depth int) (map[codec.UUID]baseVal, error) {
+func (vb *virtualBase) valuesUncached(bases []codec.Hash, ids []codec.UUID, depth int) (map[codec.UUID]baseVal, error) {
 	acc, err := vb.at(bases[0], ids)
 	if err != nil || len(bases) == 1 || depth >= maxVirtualBaseDepth {
 		return acc, err
@@ -275,29 +275,7 @@ func (vb *virtualBase) fold(bases []codec.Hash, ids []codec.UUID, depth int) (ma
 	return acc, nil
 }
 
-// at returns c's values of ids, as a map of the caller's own (fold accumulates into it).
 func (vb *virtualBase) at(c codec.Hash, ids []codec.UUID) (map[codec.UUID]baseVal, error) {
-	got, ok := vb.atMemo[c]
-	if !ok {
-		var err error
-		if got, err = vb.read(c, ids); err != nil {
-			return nil, err
-		}
-		if !vb.noMemo {
-			if vb.atMemo == nil {
-				vb.atMemo = map[codec.Hash]map[codec.UUID]baseVal{}
-			}
-			vb.atMemo[c] = got
-		}
-	}
-	out := make(map[codec.UUID]baseVal, len(got))
-	for k, v := range got {
-		out[k] = v
-	}
-	return out, nil
-}
-
-func (vb *virtualBase) read(c codec.Hash, ids []codec.UUID) (map[codec.UUID]baseVal, error) {
 	vals, err := vb.vi.valuesAt(c, ids)
 	if err != nil {
 		return nil, err

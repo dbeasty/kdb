@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>@kdb/embed persistence smoke</title>
+<!--
+  Proves persistence in a real browser, on real IndexedDB, across a real page reload.
+    cd packages && python3 -m http.server 8123
+  Open /kdb-embed/test/browser/persist.html, then reload it. Each load increments a counter that
+  lives in the embedded database; the page deliberately never closes it (like a closed tab), so the
+  second load is recovering from an unclean shutdown. Add #reset to wipe the database first.
+-->
+<script type="importmap">
+  { "imports": { "@kdb/client": "/kdb-client/dist/index.js" } }
+</script>
+<pre id="result">running…</pre>
+<script type="module">
+  import { openEmbedded } from "/kdb-embed/dist/index.js";
+  const NS = "app/users";
+  const ID = "6f9619ff-8b86-d011-b42d-00cf4fc964ff";
+  const out = {};
+  try {
+    if (location.hash === "#reset") {
+      await new Promise((resolve, reject) => {
+        const r = indexedDB.deleteDatabase("kdb-embed:persist-smoke");
+        r.onsuccess = resolve; r.onerror = () => reject(r.error); r.onblocked = resolve;
+      });
+      history.replaceState(null, "", location.pathname);
+      out.reset = true;
+    }
+    const t0 = performance.now();
+    const db = await openEmbedded({ namespace: NS, persist: { name: "persist-smoke" } });
+    out.openMs = Math.round(performance.now() - t0);
+    let loads = 0;
+    try { loads = (await db.get(NS, ID)).body.loads; } catch (e) { if (e.name !== "KdbNotFoundError") throw e; }
+    out.previousLoads = loads;
+    const t1 = performance.now();
+    await db.putJSON(NS, ID, { loads: loads + 1 });
+    out.commitMs = Math.round(performance.now() - t1);
+    out.nowStored = (await db.get(NS, ID)).body.loads;
+    // A second tab/instance must be refused while this one is open.
+    out.secondOpen = await openEmbedded({ namespace: NS, persist: { name: "persist-smoke" } }).then(() => "OPENED (bad)", (e) => e.message.slice(0, 60));
+    out.storage = navigator.storage?.persisted ? await navigator.storage.persisted() : "n/a";
+    out.ok = true;
+    // No db.close(): this models closing the tab.
+  } catch (error) {
+    out.ok = false;
+    out.error = String((error && error.stack) || error);
+  }
+  document.getElementById("result").textContent = JSON.stringify(out, null, 2);
+  document.title = out.ok ? "PASS " + out.nowStored : "FAIL";
+</script>
