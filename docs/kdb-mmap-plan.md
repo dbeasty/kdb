@@ -225,10 +225,9 @@ read-only runtimes map but never write or delete.
 
 ### Known limits
 
-- **Open peak.** Restore still admits every commit from the checkpoint before the attach moves them out, so peak
-  heap at open is unchanged; steady state is what drops. Removing that means teaching the checkpoint to reference
-  the graph instead of carrying commits - a separate change.
-- **Checkpoint writes** still materialize every commit transiently (`CheckpointSnapshotRetaining`). Same fix.
+- **Open peak and checkpoint writes - fixed 2026-10-12.** Under `history=full` with segments attached, the checkpoint
+  (format v3) names the segments instead of carrying their commits, so neither open nor a checkpoint write scales with
+  history. `history=none` keeps carrying commits (its log is truncated, so it cannot fall back to a replay).
 - **History reads are slower** from segments than from memory (binary search per step, per segment). Accepted by
   design constraint 3 of the commit-graph doc; measured below.
 - **Not done:** the position-indexed cursor and anchors (commit-graph doc Phases 4-5) - latency/replay features,
@@ -291,4 +290,37 @@ during a load-average spike to 17-20; it did not reproduce at n=6 with the order
 insert - which runs exactly the code this branch changed, without fsync - is flat. Treat that first number as the
 neighbour-contention artifact the benchmarking notes warn about, not a regression. A quiet-machine rerun on Linux
 would still be worth doing before calling the read rows flat to within a few percent.
+
+### Whole-namespace memory across a normal life (`TestMemoryProfile`)
+
+100,000 documents, 500,000 commits (each document inserted, then random updates), async durability, default memory
+budgets, maintenance every 50,000 commits during the build. One process per phase. "Live" is heap after a GC;
+"peak" is the largest live-object heap sampled during the phase; RSS is the process's resident set.
+
+| Phase | main | branch, graph off | branch, graph on |
+|---|---:|---:|---:|
+| Startup: live heap after open | 297 MB | 297 MB | **27 MB** |
+| Startup: peak heap during open | 1,031 MB | 1,025 MB | **108 MB** |
+| Startup: RSS after open | 1,145 MB | 1,308 MB | **326 MB** |
+| Startup: open time | 3.8 s | 3.5 s | 2.7 s |
+| 200k point reads: live heap after | 373 MB | 373 MB | **103 MB** |
+| 200k point reads: peak heap | 582 MB | 592 MB | **230 MB** |
+| 20k updates: live heap after | 317 MB | 319 MB | **52 MB** |
+| 20k updates: peak heap | 542 MB | 582 MB | **99 MB** |
+| Close + checkpoint: allocated | 1,770 MB | 1,803 MB | **695 MB** |
+| Close + checkpoint: peak heap | 1,454 MB | 1,526 MB | **177 MB** |
+| Close + checkpoint: peak RSS | 1,688 MB | 1,744 MB | **415 MB** |
+| Disk (whole data dir) | 335 MB | 351 MB | 419 MB |
+
+Graph off, the branch matches `main` (as it should: the feature is off and the pointer-free store holds the same
+bytes). Graph on, startup needs ~10x less memory and the checkpoint peak drops ~8x. The +84 MB on disk is the graph
+segment (304 B/commit) less the commits the checkpoint no longer carries.
+
+What is left, in order of size:
+- **The checkpoint still allocates 695 MB** to write ~a few hundred KB of resident commits. The remainder is the live
+  tree (100k entries) and the rest of the checkpoint built as generic `codec.Value` maps and encoded in one buffer -
+  allocation churn, not retained memory. A streaming encoder for the live-tree section is the next target.
+- **Reads grow the heap to ~100 MB** - the document cache filling, which is budgeted (`DocumentCacheBytes`), not a leak.
+- Machine load was high (load average up to 24 from other sessions), so the timings are indicative only; the heap
+  and RSS figures are not load-sensitive.
 
