@@ -217,7 +217,7 @@ func (v *validator) check(e Expr, allowAliases, allowAggregates bool) error {
 				return nil
 			}
 		}
-		if !v.sch.IsNone() && !v.sch.HasField(rootSegment(name)) {
+		if !v.sch.IsSchemaless() && !v.sch.HasField(rootSegment(name)) {
 			return NewPlanningError("unknown column: "+name, "")
 		}
 		return nil

@@ -1027,7 +1027,7 @@ func columnsFor(query SelectQuery, sch schema.KdbSchema) []ResultColumn {
 			default:
 				if f, ok := sch.Field(col); ok {
 					sqlType = f.Type.SQLTypeName()
-				} else if sch.IsNone() {
+				} else if sch.IsSchemaless() {
 					sqlType = "JSON"
 				}
 			}
