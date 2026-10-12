@@ -78,6 +78,44 @@ type V2Host struct {
 	peer   string
 	// grafts stages GRAFT_PUSH pages per namespace until the last one arrives.
 	grafts map[string][]wire.SnapshotPageMessage
+	// boundaryGaps are, per namespace, the parents behind this node's snapshot root that a push
+	// on this session was refused for (parent -> the pushed commit naming it). A GRAFT_PUSH of
+	// one of them is a boundary extension, not a graft (boundary.go).
+	boundaryGaps map[string]map[codec.Hash]codec.Hash
+}
+
+// boundaryGapsMax bounds what one session remembers of refused parents; a page that misses more
+// than this is refused again when it is sent again, naming the rest.
+const boundaryGapsMax = 1024
+
+func (h *V2Host) noteBoundaryGaps(ns string, gaps []boundaryGap) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.boundaryGaps == nil {
+		h.boundaryGaps = map[string]map[codec.Hash]codec.Hash{}
+	}
+	m := h.boundaryGaps[ns]
+	if m == nil {
+		m = map[codec.Hash]codec.Hash{}
+		h.boundaryGaps[ns] = m
+	}
+	for _, g := range gaps {
+		if len(m) >= boundaryGapsMax {
+			return
+		}
+		m[g.parent] = g.child
+	}
+}
+
+// takeBoundaryGap reports whether parent is one this session refused a push for, forgetting it.
+func (h *V2Host) takeBoundaryGap(ns string, parent codec.Hash) (boundaryGap, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	child, ok := h.boundaryGaps[ns][parent]
+	if ok {
+		delete(h.boundaryGaps[ns], parent)
+	}
+	return boundaryGap{child: child, parent: parent}, ok
 }
 
 // NewV2Host returns a host for one connection.
@@ -514,13 +552,23 @@ func (h *V2Host) graftPush(m wire.GraftPushMessage) (wire.Message, error) {
 		return reply, nil
 	}
 	next := 0
-	if _, err := Graft(env, pages[0].Commit.Hash, func(string) (wire.SnapshotPageMessage, error) {
+	fetch := func(string) (wire.SnapshotPageMessage, error) {
 		if next >= len(pages) {
 			return wire.SnapshotPageMessage{}, errors.New("peer sync: pushed graft ended early")
 		}
 		next++
 		return pages[next-1], nil
-	}); err != nil {
+	}
+	// A parent this session refused a push for, behind this node's snapshot root: history this
+	// node's root descends from, not an unrelated one, so no allowUnrelated (boundary.go).
+	if gap, ok := h.takeBoundaryGap(ns, pages[0].Commit.Hash); ok {
+		if err := extendBoundary(env, gap, fetch); err != nil {
+			return nil, err
+		}
+		reply.Grafted = true
+		return reply, nil
+	}
+	if _, err := Graft(env, pages[0].Commit.Hash, fetch); err != nil {
 		return nil, err
 	}
 	reply.Grafted = true
@@ -539,7 +587,14 @@ func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {
 	}
 	stored, err := StoreCommits(env, m.Commits, m.Stubs)
 	if err != nil {
-		return nil, fmt.Errorf("%w (%d of %d commits in this page were stored before it)", err, stored, len(m.Commits))
+		err = fmt.Errorf("%w (%d of %d commits in this page were stored before it)", err, stored, len(m.Commits))
+		// A parent behind this node's snapshot root, which it cannot fetch from the node that
+		// dialled it: say so, and remember which, so the pusher can send their state (boundary.go).
+		if blocked, gaps := pushBlockedByBoundary(env, m.Commits, err); blocked != nil {
+			h.noteBoundaryGaps(m.Namespace, gaps)
+			return nil, blocked
+		}
+		return nil, err
 	}
 	ack := wire.RefUpdateAckMessage{
 		H: header(wire.MsgRefUpdateAck, m.H.CorrelationID), Namespace: m.Namespace,

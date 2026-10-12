@@ -1224,7 +1224,8 @@ type Codec interface { Encoding() PayloadEncoding; Encode(Message) ([]byte, erro
 func NewCodec(encoding PayloadEncoding) *DefaultCodec        // EncodingKdbBinary | EncodingJSON
 type HandshakeNegotiator interface{ Negotiate(local, remote HandshakePayload) (HandshakeAckPayload, error) }   // DefaultHandshakeNegotiator
 type ErrorCode string      // BUSY UNAVAILABLE DEADLINE_EXCEEDED RESOURCE_EXHAUSTED CONFLICT SCHEMA_VIOLATION
-                           // UNIQUE_VIOLATION UNAUTHORIZED UNSUPPORTED NAMESPACE_MISMATCH INTEGRITY NOT_HOME INTERNAL
+                           // UNIQUE_VIOLATION UNAUTHORIZED UNSUPPORTED NAMESPACE_MISMATCH INTEGRITY NOT_HOME
+                           // SHALLOW_BOUNDARY (peer sync only) INTERNAL
 ```
 
 Message families (one struct per `MessageType`, 0x01..0x3F):
@@ -2023,7 +2024,9 @@ on `UpsertResult`/`DocumentGetResult`/`SqlResult`; a transaction precondition fa
 `precondition_failed`). `peersync` hosts use `V2HostConfig.ClassifyError` / `HostConfig.ClassifyError`
 (the server passes `classifyError` and treats `INTERNAL` as "not classified") and otherwise
 fall back to `frameHandler.classify`: `NamespaceMismatchError` -> `NAMESPACE_MISMATCH`,
-`UnsupportedFrameError` -> `UNSUPPORTED`, `TreeMismatchError` -> `INTEGRITY`,
+`UnsupportedFrameError` -> `UNSUPPORTED`, `TreeMismatchError` -> `INTEGRITY`, `PushBelowBoundaryError` -> `SHALLOW_BOUNDARY`
+(a pushed page needs parents behind the receiver's snapshot root; a pusher that knows the code sends their
+state by `GRAFT_PUSH` and resends the page - `peersync/boundary.go`),
 `auth.AuthorizationError` -> `UNAUTHORIZED`, else `INTERNAL`. Peer failures are sent as
 `PeerErrorMessage{Code, Message}`; the receiving `peersync` client surfaces `RemoteError{Code, Message}`.
 

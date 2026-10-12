@@ -10,6 +10,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transaction"
@@ -80,6 +81,9 @@ type NamespaceSyncResult struct {
 	// BoundaryExtended lists commits behind this node's snapshot root whose state this sync took
 	// in, because the peer sent a branch forked from them (see boundary.go).
 	BoundaryExtended []string
+	// BoundarySent is the push direction's: commits behind the peer's snapshot root whose state
+	// this sync sent it, because the peer refused a pushed branch forked from them.
+	BoundarySent []string
 	// Access is the peer's grant for this namespace: "" both directions, wire.AccessPull or
 	// wire.AccessPush. The direction not granted was skipped.
 	Access string
@@ -330,6 +334,38 @@ func (c *v2Conn) graftRootsFor(cfg V2ClientConfig, env IngestEnv, remote wire.Na
 	return "", nil
 }
 
+// pushBoundaryStates sends, by GRAFT_PUSH, the state at each commit page needs that lies behind
+// the peer's snapshot root - after the peer refused page for them with SHALLOW_BOUNDARY - and
+// returns their hashes. refused is that refusal, kept as the cause when nothing can be sent.
+func (c *v2Conn) pushBoundaryStates(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRefs, page []document.Commit, refused error) ([]string, error) {
+	gaps := peerBoundaryGaps(env, page, remote.Shallow)
+	if len(gaps) == 0 {
+		return nil, refused
+	}
+	var sent []string
+	for _, gap := range gaps {
+		for after := ""; ; {
+			state, err := snapshotPage(env, gap, after, cfg.PageBytes)
+			if err != nil {
+				return sent, &PeerBoundaryError{Namespace: remote.Namespace, Missing: gaps, Cause: err}
+			}
+			reply, err := c.request(wire.GraftPushMessage{H: header(wire.MsgGraftPush, c.next()), Page: state})
+			if err != nil {
+				return sent, &PeerBoundaryError{Namespace: remote.Namespace, Missing: gaps, Cause: err}
+			}
+			if _, ok := reply.(wire.GraftPushResultMessage); !ok {
+				return sent, NewError(fmt.Sprintf("expected GRAFT_PUSH_RESULT, got %T", reply), nil)
+			}
+			if state.Done {
+				break
+			}
+			after = state.Next
+		}
+		sent = append(sent, gap.Hex())
+	}
+	return sent, nil
+}
+
 // snapshotFetcher pages the peer's state at the commit at, for InstallSnapshot and Graft.
 func (c *v2Conn) snapshotFetcher(cfg V2ClientConfig, ns, at string) func(after string) (wire.SnapshotPageMessage, error) {
 	return func(after string) (wire.SnapshotPageMessage, error) {
@@ -447,6 +483,7 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			continue
 		}
 		haves := append([]codec.Hash(nil), known...)
+		extended := false // whether this page's boundary states were sent already
 		for {
 			commits, stubs, done, err := MissingCommitsFrom(env.DAG, []codec.Hash{local}, haves, cfg.PageBytes)
 			if err != nil {
@@ -457,9 +494,22 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 				Kind: ref.kind, Ref: ref.name, OldHex: remoteHex, NewHex: ref.hex,
 				Commits: commits, Stubs: stubs, More: !done,
 			})
+			var refused *RemoteError
+			if err != nil && !extended && errors.As(err, &refused) && refused.Code == wire.ErrorCodeShallowBoundary {
+				// The page reaches below the peer's snapshot root: send the state of what it
+				// needs there, then the same page again (boundary.go).
+				sent, serr := c.pushBoundaryStates(cfg, env, remote, commits, err)
+				if serr != nil {
+					return serr
+				}
+				res.BoundarySent = append(res.BoundarySent, sent...)
+				extended = true
+				continue
+			}
 			if err != nil {
 				return err
 			}
+			extended = false
 			ack, ok := reply.(wire.RefUpdateAckMessage)
 			if !ok {
 				return NewError(fmt.Sprintf("expected REF_UPDATE_ACK, got %T", reply), nil)

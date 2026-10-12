@@ -23,10 +23,13 @@ from cluster_fixtures import (
     conflicts,
     control,
     documents,
+    fork_behind_a_pushed_only_hub,
     head,
     ns_path,
     owned_docs,
+    peer_state,
     uuid_of,
+    wait_until,
 )
 from server_fixtures import get, preserve_evidence, put, sql_exec, sql_query
 
@@ -286,6 +289,44 @@ def test_late_joiner_bootstraps_from_a_snapshot_while_the_cluster_writes(make_cl
     acked = merged(writers) | {d: 0 for d in seed}
     assert_values_at_least(joiner, acked, "joiner")
     assert head(joiner) == head(c.nodes[0])
+
+
+def test_snapshot_hub_that_is_only_pushed_to_converges(make_cluster):
+    """A snapshot-bootstrapped node with no --peer of its own, which two writing nodes push to
+    (mode=push), takes their branches forked behind its snapshot root. Before the fix the hub
+    refused every such push with "missing parent" for ever: it cannot fetch from a node that
+    dialled it, and #111's fix is on the pull side. The pusher now sends the fork point's state.
+    The fork is built deterministically (fork_behind_a_pushed_only_hub); concurrent writers on
+    both nodes then keep pushing while their own mesh merges."""
+    c = make_cluster(2)
+    n0, n1 = c.nodes
+    seed = owned_docs(5, 20)
+    for d in seed:
+        put(n0, d, {"id": d, "v": 0, "by": "seed"})
+    hub, to_hub, forks = fork_behind_a_pushed_only_hub(c)
+
+    writers = [Writer(n, owned_docs(i, 6), f"n{i}") for i, n in enumerate((n0, n1))]
+    for w in writers:
+        w.start()
+    time.sleep(1)
+    assert n0.stop() == 0
+    n0.extra_args += to_hub
+    n0.restart()
+    time.sleep(2)
+    for w in writers:
+        w.stop()
+
+    # The writers converge as a mesh; the hub has the same documents. Its head is its own merge
+    # of what it was pushed (push-only peers never take it back), so heads are not compared.
+    wait_until(lambda: head(n0) == head(n1) and documents(n0) == documents(n1) == documents(hub),
+               60, "the pushed-to hub did not converge", c)
+    for n in (n0, n1):
+        state = peer_state(n, "hub")
+        assert not state.get("lastError") and state.get("consecutiveFailures") == 0, state
+    assert_values_at_least(hub, merged(writers) | {d: 0 for d in seed} | forks, "hub")
+    # And it converged by the path under test, not because no push happened to reach below the root.
+    assert any("behind its snapshot root" in n.all_logs() for n in (n0, n1)), \
+        "no pusher sent a fork point's state - the scenario did not reach below the hub's root"
 
 
 @pytest.mark.slow

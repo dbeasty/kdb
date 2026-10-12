@@ -32,10 +32,14 @@ from cluster_fixtures import (
     Writer,
     assert_values_at_least,
     control,
+    documents,
+    fork_behind_a_pushed_only_hub,
     head,
     ns_path,
     owned_docs,
+    peer_state,
     peers,
+    wait_until,
 )
 from server_fixtures import (
     binary_version,
@@ -271,6 +275,37 @@ def test_deepen_peer_option_recovers_a_stuck_snapshot_joiner(make_cluster):
                          for a in joiner.extra_args]
     joiner.restart()
     converge(c, acked, "stuck joiner restarted with deepen=true", timeout=60)
+
+
+def test_old_pushers_into_a_new_snapshot_hub_get_a_typed_error_then_heal_on_upgrade(make_cluster):
+    """A snapshot hub that is only ever pushed to, on this build, with v0.6.2 pushers. An old
+    pusher does not know SHALLOW_BOUNDARY, so it cannot send the fork point's state: its push of
+    a branch forked behind the hub's root fails - with that code and a message naming the commit,
+    the missing parent and the way out, not a bare "missing parent" - and the hub stays where it
+    was. Upgrading the pushers, one at a time, heals it (fork_behind_a_pushed_only_hub)."""
+    c = make_cluster(2, service_bins=[PREV, PREV])
+    n0, n1 = c.nodes
+    for d in owned_docs(5, 10):
+        put(n0, d, {"id": d, "v": 0, "by": "seed"})
+    hub, to_hub, forks = fork_behind_a_pushed_only_hub(c)
+    root = head(hub)
+
+    wait_until(lambda: "SHALLOW_BOUNDARY" in (peer_state(n1, "hub").get("lastError") or ""),
+               30, "the old pusher was not refused with SHALLOW_BOUNDARY", c)
+    err = peer_state(n1, "hub")["lastError"]
+    assert "behind this node's snapshot root" in err and "deepen" in err, err
+    assert head(hub) == root, "the hub moved although every push was refused"
+
+    c.switch_binary(1, NEW)
+    assert n0.stop() == 0
+    n0.extra_args += to_hub
+    n0.restart(service_bin=NEW)
+    wait_until(lambda: head(n0) == head(n1) and documents(n0) == documents(n1) == documents(hub),
+               60, "the hub did not converge once its pushers were upgraded", c)
+    for n in (n0, n1):
+        state = peer_state(n, "hub")
+        assert not state.get("lastError") and state.get("consecutiveFailures") == 0, state
+    assert_values_at_least(hub, forks, "hub")
 
 
 # -- resolution chain versions ---------------------------------------------------------------

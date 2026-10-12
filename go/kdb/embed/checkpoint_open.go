@@ -220,7 +220,13 @@ func saveCheckpoint(
 	if err != nil {
 		return err
 	}
-	state := d.CheckpointSnapshotRetaining(commitRetentionFilter(eng))
+	// Refused, not trimmed, when main names a commit the log does not hold (a peer adoption whose
+	// log write failed): the previous checkpoint and the log after it are what the namespace
+	// really is, and the next open rebuilds that - see dag.CheckpointSnapshotLogged.
+	state, err := d.CheckpointSnapshotLogged(commitRetentionFilter(eng))
+	if err != nil {
+		return err
+	}
 	var headPayloads [][]byte
 	// Shallow roots' operations, whether or not a branch still names them: they arrived with a
 	// snapshot, so no segment holds them to load back.
