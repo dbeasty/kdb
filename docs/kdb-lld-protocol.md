@@ -235,7 +235,8 @@ entry thresholds move **up** immediately, exit requires falling below `0.9 ×` t
 ### 5.2 What is measured
 
 `currentMemoryUsageBytes()` prefers the Linux **cgroup `memory.current`** — the exact figure a
-container's `--memory` limit is enforced against — and falls back to
+container's `--memory` limit is enforced against, less the reclaimable `inactive_file` page cache
+(the `docker stats` working set; raw usage would trip the guard on a log writer's cache alone) — and falls back to
 `/memory/classes/total:bytes − /memory/classes/heap/released:bytes` via `runtime/metrics`.
 
 Two earlier mistakes this replaced, both worth remembering:

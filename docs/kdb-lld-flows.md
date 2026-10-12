@@ -621,7 +621,7 @@ sequenceDiagram
     participant FA as FrameAdmitter
     participant OP as an operation
 
-    T->>G: currentMemoryUsageBytes (cgroup memory.current, else runtime/metrics)
+    T->>G: currentMemoryUsageBytes (cgroup memory.current minus inactive_file, else runtime/metrics)
     G->>G: push into 5-sample ring → smoothed average
     G->>G: zoneFor(smoothed, current)  [up immediately; down only after 600 ms dwell]
     G->>A: observer(smoothed, zone)

@@ -24,13 +24,62 @@ import (
 // The cgroup number is what the container's --memory limit is actually checked against, so it is
 // what a MemoryGuard sized off that limit should check against too.
 func cgroupMemoryCurrentBytes() (uint64, bool) {
-	if v, ok := readUintFile("/sys/fs/cgroup/memory.current"); ok { // cgroup v2
-		return v, true
+	return cgroupMemoryCurrentBytesAt(cgroupRoot)
+}
+
+// cgroupRoot is where the cgroup filesystem is mounted; the tests drive
+// cgroupMemoryCurrentBytesAt with a fixture tree instead.
+const cgroupRoot = "/sys/fs/cgroup"
+
+// cgroupMemoryCurrentBytesAt is cgroupMemoryCurrentBytes over an explicit cgroup mount root.
+//
+// The figure returned is the cgroup's usage minus its inactive file cache - the same "working
+// set" `docker stats` and the kubelet report - not the raw counter. Raw memory.current /
+// memory.usage_in_bytes charges page cache to the cgroup, and a database writing a delta log
+// fills the cache until usage sits at the limit through cache alone. The kernel reclaims that
+// cache under pressure instead of OOM-killing, so counting it made the guard reject scans and
+// writes (zone critical) while the process was not short of memory. Only inactive_file is
+// subtracted: active_file holds recently re-referenced pages (hot mmaps included) that the
+// kernel is much slower to give up, so leaving it in keeps the guard on the cautious side.
+func cgroupMemoryCurrentBytesAt(root string) (uint64, bool) {
+	if v, ok := readUintFile(root + "/memory.current"); ok { // cgroup v2
+		return workingSet(v, statField(root+"/memory.stat", "inactive_file")), true
 	}
-	if v, ok := readUintFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); ok { // cgroup v1
-		return v, true
+	if v, ok := readUintFile(root + "/memory/memory.usage_in_bytes"); ok { // cgroup v1
+		// total_ is the hierarchical figure matching usage_in_bytes, which includes children.
+		f := statField(root+"/memory/memory.stat", "total_inactive_file")
+		if f == 0 {
+			f = statField(root+"/memory/memory.stat", "inactive_file")
+		}
+		return workingSet(v, f), true
 	}
 	return 0, false
+}
+
+// workingSet subtracts reclaimable cache from raw usage, clamping so a stat read racing the
+// counter can never underflow.
+func workingSet(usage, inactiveFile uint64) uint64 {
+	if inactiveFile >= usage {
+		return 0
+	}
+	return usage - inactiveFile
+}
+
+// statField returns one field of a flat-keyed memory.stat file, or 0 when the file or the field
+// is absent - in which case the raw usage is used unadjusted, the pre-existing behaviour.
+func statField(path, name string) uint64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(line, " ")
+		if ok && k == name {
+			n, _ := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+			return n
+		}
+	}
+	return 0
 }
 
 func readUintFile(path string) (uint64, bool) {

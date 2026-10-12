@@ -350,7 +350,10 @@ have made automatic restart unreliable) and it already holds — no change neede
 Replace `MemStats.Sys` (§2.5, §2.6) with, in preference order:
 
 1. **cgroup v2** `memory.current` — on Linux, the exact number the kernel enforces `memory.max`
-   against. This is ground truth; everything else is an approximation of it.
+   against. This is ground truth; everything else is an approximation of it. Report it as a
+   working set: subtract `inactive_file` from `memory.stat` (v1: `total_inactive_file`), as
+   `docker stats` does. Raw usage charges page cache, which the kernel reclaims before it OOMs, so
+   a delta-log writer would otherwise sit at the limit on cache alone and be rejected as critical.
 2. **`runtime/metrics`** `/memory/classes/total:bytes` minus `/memory/classes/heap/released:bytes`
    — no stop-the-world, and unlike `Sys` it *decreases* when pages are returned.
 3. `MemStats.Sys - MemStats.HeapReleased` as a last resort.

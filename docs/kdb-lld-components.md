@@ -607,7 +607,7 @@ hard error — never a silent downgrade.
 | `handleLockAcquire` / `handleLockRenew` / `handleLockRelease` (`lock_listen.go`) | the `LOCK_*` verbs; `DefaultLeaseTTL` = 30 s, `MaxLeaseTTL` = 5 min, `clampLeaseTTL` applies both. Authorized as a **write** capability (`TxCommitAction`) — locking exists to exclude other writers. Releasing something not held is not an error |
 | `closeAllSessions` | on connection close: `ReleaseAll` locks, `ClearLeases`, `End` every session. Previously nothing did this, so a dropped client held its locks forever and its session for the process lifetime |
 | `ReadConsistency` | `ReadCommitted`, `ReadYourWrites`, `Snapshot` |
-| `MemoryGuard` | 200 ms sampler over cgroup `memory.current` (or `runtime/metrics` total−released), 5-sample moving average, four `Zone`s with hysteresis and dwell, observer callback |
+| `MemoryGuard` | 200 ms sampler over cgroup `memory.current` minus `inactive_file` (or `runtime/metrics` total−released), 5-sample moving average, four `Zone`s with hysteresis and dwell, observer callback |
 | `Zone` | `Normal`, `Elevated`, `High`, `Critical` |
 | `Admission` | the grant system: `semaphore.Weighted` over `limit − reserve`, a dynamic **non-granted floor** re-held every sample, per-zone class policy, per-zone scan row budgets, `rescueReserve`, `AdmissionStats` |
 | `Grant` | one reservation; `Release()` idempotent |
