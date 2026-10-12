@@ -136,3 +136,20 @@ func TestConcurrentReadersVersusClose(t *testing.T) {
 		}
 	}
 }
+
+func TestMappedBytesTracksLiveMappings(t *testing.T) {
+	before := MappedBytes()
+	m := open(t, writeFile(t, make([]byte, 8192)))
+	if got := MappedBytes() - before; got != 8192 {
+		t.Fatalf("MappedBytes grew by %d, want 8192", got)
+	}
+	r, _ := m.Acquire()
+	m.Close()
+	if got := MappedBytes() - before; got != 8192 {
+		t.Fatalf("mapping released while a reader held it: delta %d", got)
+	}
+	r.Release()
+	if got := MappedBytes() - before; got != 0 {
+		t.Fatalf("MappedBytes did not return to baseline: delta %d", got)
+	}
+}

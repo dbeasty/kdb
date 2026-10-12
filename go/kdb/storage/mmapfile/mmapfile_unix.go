@@ -30,5 +30,6 @@ func Open(path string) (*Mapping, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mmapfile: map %s: %w", path, err)
 	}
+	mappedBytes.Add(int64(len(data)))
 	return &Mapping{data: data, unmap: func() error { return syscall.Munmap(data) }}, nil
 }

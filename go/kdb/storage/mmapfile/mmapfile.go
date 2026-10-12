@@ -27,7 +27,17 @@ import (
 	"fmt"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 )
+
+// mappedBytes is the total size of every live mapping in the process. Mapped pages are page
+// cache, not Go heap, so GOMEMLIMIT does not see them - but the container's cgroup budget does,
+// so the memory-budget zones must be told. Reported whole-file rather than resident: the kernel
+// decides what is resident, and charging the full size is the safe over-estimate.
+var mappedBytes atomic.Int64
+
+// MappedBytes reports the bytes currently mapped by this process through this package.
+func MappedBytes() int64 { return mappedBytes.Load() }
 
 // ErrUnsupported is returned by Open on platforms where file mapping is not available.
 var ErrUnsupported = errors.New("mmapfile: not supported on this platform")
@@ -82,6 +92,7 @@ func (m *Mapping) maybeUnmapLocked() error {
 	m.done = true
 	data := m.data
 	m.data = nil
+	mappedBytes.Add(-int64(len(data)))
 	if m.unmap != nil && data != nil {
 		return m.unmap()
 	}

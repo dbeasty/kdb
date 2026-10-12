@@ -143,14 +143,14 @@ offset index, reading bodies on demand through the existing `deltaColdLoader` se
 5. Phase 4 step 1 (pointer-free tree): only if Phase 0 says the live tree dominates GC cost.
 6. Phases 4 step 3 and 5: only on evidence.
 
-## Open questions
+## Decisions (answered 2026-10-11)
 
-- Is the target deployment Linux-only (the Go deploy target, per the project notes)? If so, `*_other.go` fallbacks can
-  be minimal, and macOS is a developer-only path.
-- What dataset size are we designing for? Below roughly 1M documents and 500k commits, Phase 0 may show none of this
-  is needed.
-- Should mapped regions count against the memory budget (`ApplyGoMemoryLimit`'s 90% fraction)? Page cache is not Go
-  heap, but the cgroup budget does include it, so the zone thresholds may need to account for it.
+- **Linux-only deploy.** macOS is a developer path; `*_other.go` fallbacks stay minimal (return `ErrUnsupported`).
+- **Design point: ~1M documents / commits is the sweet spot; more than that must still work.** The pointer-free node
+  store is the 1M answer; the mapped graph file is the answer beyond it (2M commits is ~600 MB resident at 298 B/commit).
+- **Mapped regions count against the memory budget.** `mmapfile.MappedBytes()` reports whole-file bytes of live
+  mappings (the safe over-estimate). The budget zones in `go/kdb/server/memory_budget.go` must add it to the process
+  total they compare against the cgroup budget; `GOMEMLIMIT` does not see it. Wiring waits for the first consumer.
 
 ## Results so far (2026-10-11)
 
@@ -184,8 +184,11 @@ unless the memory budget (not the GC) becomes the reason.
 - `go/kdb/dag/node_store.go`: pointer-free commit node store (replaces `map[Hash]commitNode`), with
   `TestSlotHasNoPointers` pinning the property that matters.
 
-### Still open
+### Still open (next, in order)
 
+- Phase 0 at 1M and 2M commits to size the graph file's win (the existing 100k run took 11 minutes; use a direct-DAG
+  loader, not the embedded runtime, for the large sizes).
+- Wire `mmapfile.MappedBytes()` into the budget zones when the graph file lands.
 - The mapped graph file (the commit-graph doc's Phases 2-5) now buys *residency* (298 B/commit -> ~0), not GC time.
   Re-decide it on the 2M-commit residency numbers, not on GC grounds.
 - Operations and messages still live in pointer-bearing side maps (bounded by the operations budget).
