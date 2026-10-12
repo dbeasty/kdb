@@ -232,3 +232,16 @@ func (g *MemoryGuard) reset() {
 	defer g.mu.Unlock()
 	g.ring, g.ringNext = nil, 0
 }
+
+// resetToNormal is reset plus the zone itself: back to ZoneNormal, as a fresh guard starts. A
+// real sample that landed before Stop can have moved the zone, not only the ring - on a CI runner
+// whose test process is already near the limit it lands in ZoneCritical - and the zone's
+// hysteresis then keeps it there through any one explicit observe below the entry threshold.
+func (g *MemoryGuard) resetToNormal() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.ring, g.ringNext = nil, 0
+	g.candidate, g.candidateAt = ZoneNormal, time.Time{}
+	g.zone.Store(int32(ZoneNormal))
+	g.pressure.Store(false)
+}
