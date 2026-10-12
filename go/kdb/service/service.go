@@ -472,6 +472,19 @@ func Main() {
 			if _, err := sec.OpenIndexes(stores.Options{}); err != nil {
 				return nil, fmt.Errorf("opening indexes for %s: %w", id, err)
 			}
+			// A namespace opened on demand needs the same upkeep as one opened at startup: a
+			// history=none collection that never ran maintenance would grow without bound.
+			// Replaces (and stops) the loop of an earlier open of the same id, since the idle
+			// closer may have closed it in between.
+			if cfg.MaintenanceInterval > 0 && nsRT != nil {
+				busySrv := sec
+				maintenance.replace(id, embed.StartMaintenance(nsRT, embed.MaintenanceOptions{
+					Interval: cfg.MaintenanceInterval,
+					Sweep:    cfg.MaintenanceSweep,
+					MaxDefer: cfg.MaintenanceMaxDefer,
+					Busy:     func() bool { return busySrv.WriteQueueDepth() > 0 },
+				}))
+			}
 			return sec, nil
 		})
 	}
@@ -898,6 +911,20 @@ type maintenanceRegistry struct {
 
 func newMaintenanceRegistry() *maintenanceRegistry {
 	return &maintenanceRegistry{byNS: map[string]*embed.MaintenanceScheduler{}}
+}
+
+// replace registers sched for namespaceID, stopping the scheduler it supersedes.
+func (m *maintenanceRegistry) replace(namespaceID string, sched *embed.MaintenanceScheduler) {
+	if sched == nil {
+		return
+	}
+	m.mu.Lock()
+	old := m.byNS[namespaceID]
+	m.byNS[namespaceID] = sched
+	m.mu.Unlock()
+	if old != nil {
+		old.Stop()
+	}
 }
 
 func (m *maintenanceRegistry) add(namespaceID string, sched *embed.MaintenanceScheduler) {

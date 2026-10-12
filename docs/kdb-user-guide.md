@@ -2283,3 +2283,12 @@ by most documents is never listed), and the index advances incrementally with ea
 of being rebuilt from its event log on the first read after a write. Measured at 1k, 10k and 100k
 documents the filtered read stays in the tens of microseconds
 (`TestJSONPathIndexKeepsFilteredReadFlat`).
+
+### One namespace per collection
+
+The service opens any namespace a client names on demand (created by its first commit; reads of an
+unknown one are refused), so an application can map each collection to its own namespace instead
+of keeping a `_c` discriminator field in one shared namespace. Each namespace has its own directory
+under `<data-dir>/ns/`, its own commit history, indexes and background maintenance loop, and shares
+the process-wide memory budget and admission control. `TestServiceServesOneNamespacePerCollection`
+drives the real binary through this.
