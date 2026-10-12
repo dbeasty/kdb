@@ -412,7 +412,7 @@ Clients authenticate with a `"user:secret"` token or user/password at handshake:
 ### Health, readiness, metrics
 
 ```bash
-curl -s localhost:9099/healthz   # ok + version/commit/build_date
+curl -s localhost:9099/healthz   # ok + version/commit/build_date/node_id + per-namespace document counts
 curl -s localhost:9099/readyz    # ready | 503 "not ready: starting|draining"
 curl -s localhost:9099/metrics   # Prometheus text
 ```
@@ -420,6 +420,41 @@ curl -s localhost:9099/metrics   # Prometheus text
 Key metrics to alert on: `kdb_memory_zone` (0–3), `kdb_admission_denied_total`
 (by class and reason), `kdb_stage_latency_seconds{stage="fsync_wait"}`, `kdb_draining`.
 Full list: [Protocol & operations §8](kdb-lld-protocol.md#8-observability).
+
+`/healthz` is `key=value` lines (existing keys unchanged; new ones are appended):
+`version=`, `commit=`, `commit_dirty=`, `build_date=`, `node_id=`, and one
+`namespace.<name>.documents=<n>` per namespace - the live document count at head.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `kdb_build_info{version,commit,dirty,build_date,go_version}` | gauge, always 1 | identity of the running binary; a rollout shows as two label sets |
+| `kdb_namespace_documents{namespace}` | gauge | live documents at head (the head tree's maintained size - O(1), no scan per scrape) |
+| `kdb_namespace_commits{namespace}` | gauge | commits held in the commit graph; history trimmed by retention is not counted |
+
+There is no per-namespace bytes gauge: the byte figures the engine tracks are cache residency,
+not logical or on-disk size, and a metric by that name would mislead. Use
+`kdb_go_heap_alloc_bytes` and your volume's disk usage for capacity.
+
+**Alerting on a namespace approaching a limit.** The limits that bite are per-query, not
+per-namespace: `--scan-row-budget` caps the rows one scan may examine (default 1 000 000, and it
+shrinks as memory pressure rises) and `--max-result-rows` caps what a query may return. A
+namespace whose document count nears the scan budget will start refusing unindexed full scans.
+Alert before that, against the *live* budget gauge:
+
+```yaml
+- alert: KdbNamespaceNearScanBudget
+  expr: kdb_namespace_documents > 0.8 * on() group_left() kdb_admission_scan_row_budget
+  for: 15m
+  annotations:
+    summary: "{{ $labels.namespace }} holds {{ $value }} documents, over 80% of the per-scan row budget"
+    description: "Unindexed scans will be refused soon: add an index, raise --scan-row-budget, or archive."
+- alert: KdbNamespaceGrowthFast
+  expr: predict_linear(kdb_namespace_documents[6h], 24 * 3600) > 1000000
+  for: 30m
+```
+
+Substitute your `--max-result-rows` value for the second threshold if result size, not scan
+size, is what you cap.
 
 ### Shutdown
 

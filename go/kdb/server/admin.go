@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/metrics"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/version"
 )
 
@@ -127,6 +128,85 @@ func (a *AdminServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		b.Version, b.Commit, b.Dirty, b.BuildDate)
 	if a.runtime != nil {
 		fmt.Fprintf(w, "node_id=%s\n", a.runtime.NodeID)
+		// Additive lines: the document count per namespace at head, so a probe or a human with
+		// curl sees how big each namespace is without a metrics stack. Same O(1) source as
+		// /metrics; a namespace whose count cannot be had cheaply is left out, not guessed.
+		for _, ns := range a.namespaceStats() {
+			if ns.docsKnown {
+				fmt.Fprintf(w, "namespace.%s.documents=%d\n", ns.name, ns.documents)
+			}
+		}
+	}
+}
+
+// nsStat is one namespace's size figures for the admin surface.
+type nsStat struct {
+	name      string
+	documents int
+	docsKnown bool
+	commits   int
+}
+
+// namespaceStats gathers per-namespace counters in name order. Everything here must stay O(1) per
+// namespace: /metrics is scraped every few seconds and a scan of every document per scrape would
+// make observing a large namespace the thing that slows it. The document count is the head
+// tree's maintained size (DocumentTree.Size) and the commit count is the DAG's node table length.
+func (a *AdminServer) namespaceStats() []nsStat {
+	if a.runtime == nil {
+		return nil
+	}
+	set := a.runtime.namespaceSet().Runtimes()
+	names := make([]string, 0, len(set))
+	for ns := range set {
+		names = append(names, ns)
+	}
+	sort.Strings(names)
+	out := make([]nsStat, 0, len(names))
+	for _, ns := range names {
+		out = append(out, set[ns].sizeStat(ns))
+	}
+	return out
+}
+
+// sizeStat reads the cheap counters. It resolves the head tree only through storage's TreeResolver
+// (an atomic snapshot for the live tree) and never falls back to HeadTree's full walk, so a
+// storage that cannot answer in O(1) reports the count as unknown rather than costing a scan.
+func (s *KdbServerRuntime) sizeStat(name string) nsStat {
+	st := nsStat{name: name}
+	if s.dag == nil {
+		return st
+	}
+	st.commits = s.dag.CommitCount()
+	_, head, ok, err := s.dag.HeadCommit()
+	if err != nil || !ok {
+		st.docsKnown = err == nil // no head yet is an honestly empty namespace
+		return st
+	}
+	if r, ok := s.Runtime.Storage.(storage.TreeResolver); ok {
+		if t, found, err := r.TreeAt(head.DocumentTreeHash); err == nil && found {
+			st.documents, st.docsKnown = t.Size(), true
+		}
+	}
+	return st
+}
+
+// writeNamespaceMetrics exposes per-namespace size gauges. There is deliberately no bytes gauge:
+// the only per-namespace byte figures held are cache residency, not on-disk or logical size, and
+// a gauge named kdb_namespace_bytes that meant "what is cached right now" would mislead.
+func (a *AdminServer) writeNamespaceMetrics(b *strings.Builder) {
+	stats := a.namespaceStats()
+	if len(stats) == 0 {
+		return
+	}
+	b.WriteString("# HELP kdb_namespace_documents Live documents at head, per namespace.\n# TYPE kdb_namespace_documents gauge\n")
+	for _, s := range stats {
+		if s.docsKnown {
+			fmt.Fprintf(b, "kdb_namespace_documents{namespace=%q} %d\n", s.name, s.documents)
+		}
+	}
+	b.WriteString("# HELP kdb_namespace_commits Commits held in the commit graph, per namespace (history trimmed by retention is not counted).\n# TYPE kdb_namespace_commits gauge\n")
+	for _, s := range stats {
+		fmt.Fprintf(b, "kdb_namespace_commits{namespace=%q} %d\n", s.name, s.commits)
 	}
 }
 
@@ -201,6 +281,7 @@ func (a *AdminServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&b, "# HELP kdb_draining Whether the runtime is refusing new writes for shutdown.\n# TYPE kdb_draining gauge\nkdb_draining %d\n", draining)
 
 	a.writeGovernanceMetrics(&b)
+	a.writeNamespaceMetrics(&b)
 
 	a.writeReplicationMetrics(&b)
 	if fn := a.extraMetrics.Load(); fn != nil {
