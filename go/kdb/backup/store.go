@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // DirStore is a filesystem ObjectStore - local backups, tests, and network mounts. Keys map to
@@ -35,7 +37,7 @@ func (d *DirStore) Put(_ context.Context, key string, data []byte) error {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	return fsx.Rename(tmp, p)
 }
 
 func (d *DirStore) Get(_ context.Context, key string) ([]byte, error) {
@@ -51,7 +53,7 @@ func (d *DirStore) Delete(_ context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	return os.Remove(p)
+	return fsx.Remove(p)
 }
 
 func (d *DirStore) List(_ context.Context, prefix string) ([]string, error) {

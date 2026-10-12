@@ -12,7 +12,7 @@ import (
 
 // Validate checks document JSON against a schema.
 func Validate(doc document.Document, sch KdbSchema) kdberr.Result[document.Document] {
-	if sch.IsNone() {
+	if sch.IsSchemaless() {
 		return kdberr.Ok(doc)
 	}
 	var violations []kdberr.FieldViolation

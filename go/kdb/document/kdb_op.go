@@ -13,6 +13,12 @@ type Op interface {
 type WriteOp struct {
 	DocID codec.UUID
 	Patch string
+	// Replace makes Patch the whole document instead of a merge patch over what is stored, so a
+	// key the patch does not name is removed. It is a property of the *request* only: staging
+	// resolves either kind to the full document, and a commit records that document
+	// (operationsAsStored), so Replace is never part of the stored KdbOp and replay, history and
+	// peer sync see no new op kind. That is why it is not in toValue.
+	Replace bool
 }
 
 func (WriteOp) isOp() {}

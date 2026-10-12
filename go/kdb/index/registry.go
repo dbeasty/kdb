@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sync"
+	"sync/atomic"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -24,12 +25,23 @@ type Registry struct {
 	entries []*registryEntry
 	head    codec.Hash
 	hasHead bool
+
+	// genSeq hands out store generations. It is registry-wide, so a store created under an id
+	// that an earlier (dropped) store used never repeats that store's generation.
+	genSeq atomic.Uint64
 }
 
 type registryEntry struct {
 	desc  Descriptor
 	store DocumentStore
+	// gen changes whenever the registry changes the store's content (a commit, a hint, a
+	// rebuild). Equal generations mean equal content, which is what lets a snapshot writer
+	// skip re-serializing a store that has not changed since it was last written.
+	gen atomic.Uint64
 }
+
+// touch records that e's content changed.
+func (r *Registry) touch(e *registryEntry) { e.gen.Store(r.genSeq.Add(1)) }
 
 // ScanFunc feeds every live document at head to yield; returning false from yield stops the
 // scan. It is the shape a document-tree walk naturally has.
@@ -71,7 +83,9 @@ func (r *Registry) Add(desc Descriptor) (Store, error) {
 	if !ok {
 		return nil, fmt.Errorf("index %s: store type %T cannot index documents", desc.IndexID, store)
 	}
-	r.entries = append(r.entries, &registryEntry{desc: desc, store: ds})
+	e := &registryEntry{desc: desc, store: ds}
+	r.touch(e)
+	r.entries = append(r.entries, e)
 	return store, nil
 }
 
@@ -148,6 +162,18 @@ func (r *Registry) Resolve(nameOrField string, typ IndexType) (Store, bool) {
 	return r.ByField(nameOrField, typ)
 }
 
+// entryByID finds the registry entry of an index by its id.
+func (r *Registry) entryByID(id codec.UUID) (*registryEntry, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.entries {
+		if e.desc.IndexID == id {
+			return e, true
+		}
+	}
+	return nil, false
+}
+
 // ByID finds an index by its id.
 func (r *Registry) ByID(id codec.UUID) (Store, bool) {
 	r.mu.RLock()
@@ -207,6 +233,7 @@ func (p *PreparedWrite) Commit(commitHash codec.Hash) ([]Hint, error) {
 		entries := append([]*registryEntry(nil), r.entries...)
 		r.mu.RUnlock()
 		for _, e := range entries {
+			r.touch(e)
 			if err := e.store.Delete(p.docID, commitHash); err != nil {
 				return hints, err
 			}
@@ -217,6 +244,7 @@ func (p *PreparedWrite) Commit(commitHash codec.Hash) ([]Hint, error) {
 		}
 	} else {
 		for _, sp := range p.puts {
+			r.touch(sp.entry)
 			h, err := sp.put.Apply(commitHash)
 			if err != nil {
 				return hints, err
@@ -247,10 +275,12 @@ func (r *Registry) ApplyDelete(docID codec.UUID, commitHash codec.Hash) ([]Hint,
 // unknown indexes are ignored: a peer may carry indexes this node does not.
 func (r *Registry) ApplyHints(hints []Hint) error {
 	for _, h := range hints {
-		store, ok := r.ByID(h.IndexID)
+		e, ok := r.entryByID(h.IndexID)
 		if !ok {
 			continue
 		}
+		store := e.store
+		r.touch(e)
 		var err error
 		switch h.Action {
 		case HintActionDelete:
@@ -310,6 +340,7 @@ func (r *Registry) RebuildFromScan(scan ScanFunc, headCommit codec.Hash, only []
 		return stats, nil
 	}
 	for _, e := range selected {
+		r.touch(e)
 		if err := e.store.Clear(); err != nil {
 			return stats, err
 		}
@@ -355,6 +386,9 @@ func containsID(ids []codec.UUID, id codec.UUID) bool {
 // SaveAll persists the catalog and every store's snapshot under dir
 // (`<dir>/catalog.json`, `<dir>/<indexId>/{manifest.json,snapshot.bin}`), each file atomically.
 // The manifests record the registry head, or the DAG head when nothing has been applied yet.
+//
+// SaveAll serializes and writes every store, whatever changed; the server's write path uses
+// CaptureSnapshots and WriteSnapshots instead, which skip stores that have not changed.
 func (r *Registry) SaveAll(dir string) error {
 	head, ok := r.Head()
 	if !ok {
@@ -376,6 +410,91 @@ func (r *Registry) SaveAll(dir string) error {
 		}
 	}
 	return nil
+}
+
+// Generations returns every store's current generation, by index id. A caller that has just
+// restored stores from snapshots on disk records these as what disk holds.
+func (r *Registry) Generations() map[codec.UUID]uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[codec.UUID]uint64, len(r.entries))
+	for _, e := range r.entries {
+		out[e.desc.IndexID] = e.gen.Load()
+	}
+	return out
+}
+
+// SnapshotCapture is an in-memory copy of a registry's persistable state at one head, taken by
+// CaptureSnapshots and written by WriteSnapshots - possibly much later and off the write path.
+type SnapshotCapture struct {
+	Head   codec.Hash
+	Stores []CapturedStore
+}
+
+// Changed reports whether any store in the capture carries new snapshot bytes.
+func (c SnapshotCapture) Changed() bool {
+	for _, cs := range c.Stores {
+		if cs.Data != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// CapturedStore is one store's part of a SnapshotCapture.
+type CapturedStore struct {
+	Desc Descriptor
+	// Gen is the store generation the capture describes.
+	Gen uint64
+	// Data is the serialized snapshot, or nil when the store's generation equals the one the
+	// caller said disk already holds - then only the manifest is rewritten, naming the new head.
+	Data  []byte
+	Stats map[string]float64
+}
+
+// CaptureSnapshots serializes, in memory, every store whose generation differs from saved[id]
+// (the generation the caller last wrote for it; absent means never), and records the head they
+// all describe. ok is false when the registry has applied no commit yet, so has no head its
+// contents are known to be at.
+//
+// The caller must stop the registry from changing for the duration - no commit applied, no
+// rebuild - or the stores may describe different commits than Head. The result is then a
+// consistent cut, and writing it needs no lock at all.
+func (r *Registry) CaptureSnapshots(saved map[codec.UUID]uint64) (c SnapshotCapture, ok bool, err error) {
+	head, ok := r.Head()
+	if !ok {
+		return SnapshotCapture{}, false, nil
+	}
+	c.Head = head
+	r.mu.RLock()
+	entries := append([]*registryEntry(nil), r.entries...)
+	r.mu.RUnlock()
+	for _, e := range entries {
+		cs := CapturedStore{Desc: e.desc, Gen: e.gen.Load(), Stats: storeStats(e.store)}
+		if g, have := saved[e.desc.IndexID]; !have || g != cs.Gen {
+			data, err := e.store.Snapshot()
+			if err != nil {
+				return SnapshotCapture{}, false, fmt.Errorf("index %s: snapshot: %w", e.desc.IndexID, err)
+			}
+			cs.Data = data
+		}
+		c.Stores = append(c.Stores, cs)
+	}
+	return c, true, nil
+}
+
+// WriteSnapshots writes a capture under dir, store by store, each snapshot before its manifest
+// (see writeStoreSnapshot). It returns the generation now on disk for every store it finished,
+// including on error, so the caller's record of what disk holds stays exact.
+func WriteSnapshots(dir string, c SnapshotCapture) (map[codec.UUID]uint64, error) {
+	written := make(map[codec.UUID]uint64, len(c.Stores))
+	for _, cs := range c.Stores {
+		if err := writeStoreSnapshot(IndexDir(dir, cs.Desc.IndexID), cs.Desc, cs.Data, cs.Stats, c.Head); err != nil {
+			return written, fmt.Errorf("index %s: %w", cs.Desc.IndexID, err)
+		}
+		written[cs.Desc.IndexID] = cs.Gen
+	}
+	return written, nil
 }
 
 // LoadReport says what LoadRegistry found on disk.

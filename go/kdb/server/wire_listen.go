@@ -21,6 +21,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
 	"github.com/limidus/kdb/go/kdb/transport/tcp"
+	"github.com/limidus/kdb/go/kdb/version"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -512,6 +513,7 @@ func handshakeAck(msg wire.HandshakeMessage, accepted bool, headHex string, reje
 			ProtocolVersion:    wire.KdbWireProtocolVersion,
 			RemoteHeads:        remoteHeads,
 			RejectionReason:    rejectionReason,
+			ServerVersion:      version.Get().Version,
 		},
 	}
 }
@@ -650,6 +652,24 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 	}
 	head := &resolved
 
+	// A paged SELECT resumes at the commit its first page read, so every page is one snapshot; a
+	// first page reads at the session's head as usual and mints the token that pins it.
+	var page *sql.PageRequest
+	if msg.PageSize > 0 || msg.Continuation != "" {
+		page = &sql.PageRequest{Size: msg.PageSize}
+		if msg.Continuation != "" {
+			commit, offset, err := decodePageToken(msg.Continuation, msg.SQL, msg.ParametersJSON)
+			if err != nil {
+				return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
+			}
+			if !rt.dag.HasCommit(commit) {
+				return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
+					"continuation expired: the commit the first page read at is no longer held; restart the query")
+			}
+			resolved, page.Offset = commit, offset
+		}
+	}
+
 	// A SELECT reserves the memory it is expected to materialize before it runs - sized from
 	// the namespace's O(1) cardinality at the read head, the observed document sizes, and the
 	// query's shape, not from the SQL string's length, which predicts nothing (kdb-spec-layer13
@@ -692,6 +712,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		// admission decision can see coming (kdb-spec-layer13 §2.8).
 		RowBudget: int(rt.admission.ScanRowBudget()),
 		Stats:     stats,
+		Page:      page,
 	}
 	result, err := rt.SQLEngine().Execute(msg.SQL, ctx)
 	if err != nil {
@@ -731,7 +752,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 			adm.Costs().ObserveDocSize(namespaceID, int(stats.DocBytesRead/int64(stats.DocsRead)))
 		}
 	}
-	return wire.SqlResultMessage{
+	reply := wire.SqlResultMessage{
 		H:                 header(msg.H.CorrelationID, wire.MsgSqlResult),
 		Namespace:         msg.Namespace,
 		SessionID:         msg.SessionID,
@@ -742,6 +763,10 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		ReadOnly:          true,
 		GeneratedIDs:      result.GeneratedIDs,
 	}
+	if page != nil && result.More {
+		reply.ContinuationToken = encodePageToken(*head, page.Offset+len(rows), msg.SQL, msg.ParametersJSON)
+	}
+	return reply
 }
 
 // stringsBytes sizes the wire row copy: cell content plus per-string header overhead.

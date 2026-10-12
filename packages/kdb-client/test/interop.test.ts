@@ -16,7 +16,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { after, before, describe, it } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,9 +42,10 @@ const enabled = goAvailable();
 describe("live interop against the Go server", { skip: enabled ? false : "go toolchain not found" }, () => {
   let server: ChildProcessWithoutNullStreams;
   let client: Client;
+  let serverUri = "";
 
   before(async () => {
-    server = spawn("go", ["run", "./cmd/kdb-tsinterop", "-namespace", NS], {
+    server = spawn("go", ["run", "./cmd/kdb-tsinterop", "-namespace", NS, "-max-result-rows", "50"], {
       cwd: goDir,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -74,6 +75,7 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
       });
     });
 
+    serverUri = uri;
     client = await connect(uri, { requestTimeoutMs: 15_000 });
   });
 
@@ -235,6 +237,52 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
     });
   });
 
+  it("replaces a document wholesale, dropping keys a merge would keep", async () => {
+    const docId = randomUuid();
+    await client.putJSON(NS, docId, { a: 1, b: 2, c: 3 });
+    // The merge default is unchanged: naming only d keeps a, b and c.
+    await client.putJSON(NS, docId, { d: 4 });
+    assert.deepEqual((await client.get(NS, docId)).body, { a: 1, b: 2, c: 3, d: 4 });
+
+    await client.replace(NS, docId, { a: 9 });
+    assert.deepEqual((await client.get(NS, docId)).body, { a: 9 });
+  });
+
+  it("replaceIf and compareAndSwap can remove a field", async () => {
+    const docId = randomUuid();
+    await client.putJSON(NS, docId, { keep: 1, drop: 2 });
+    const { contentHash } = await client.getWithHash(NS, docId);
+    await client.replaceIf(NS, docId, { keep: 1 }, contentHash);
+    assert.deepEqual((await client.get(NS, docId)).body, { keep: 1 });
+
+    await client.compareAndSwap(NS, docId, () => ({ other: true }));
+    assert.deepEqual((await client.get(NS, docId)).body, { other: true });
+  });
+
+  it("lets exactly one of two OS processes win a claim on one document", async () => {
+    const docId = randomUuid();
+    await client.putJSON(NS, docId, { owner: "" });
+    const { contentHash } = await client.getWithHash(NS, docId);
+
+    const worker = join(dirname(fileURLToPath(import.meta.url)), "claim-worker.ts");
+    const startAt = String(Date.now() + 1500);
+    const run = (name: string) =>
+      new Promise<string>((resolve, reject) => {
+        execFile(
+          process.execPath,
+          [worker, serverUri, NS, docId, contentHash, name, startAt],
+          { timeout: 60_000 },
+          (error, stdout, stderr) =>
+            error ? reject(new Error(`${name}: ${error.message}\n${stderr}`)) : resolve(stdout.trim()),
+        );
+      });
+    const results = await Promise.all([run("p1"), run("p2")]);
+    assert.deepEqual([...results].sort(), ["lost", "won"]);
+
+    const owner = ((await client.get(NS, docId)).body as { owner: string }).owner;
+    assert.ok(owner === "p1" || owner === "p2");
+  });
+
   it("runs SQL over the same connection", async () => {
     // Real statements against a real table: KDB's SQL requires a FROM clause, so `SELECT 1` is
     // not a usable smoke test here (see the next case for what it does do).
@@ -296,5 +344,47 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
     }
     const rows = await client.query<{ name: string }>(NS, "SELECT name FROM players");
     assert.ok(rows.length >= 2);
+  });
+
+  it("serializes 50 concurrent DELETEs on one namespace and reports rows affected", async () => {
+    for (let i = 0; i < 50; i++) {
+      await client.exec(NS, `INSERT INTO players (name, level) VALUES ('del${i}', '1')`);
+    }
+    const counts = await Promise.all(
+      Array.from({ length: 50 }, (_, i) =>
+        client.exec(NS, `DELETE FROM players WHERE name = 'del${i}'`),
+      ),
+    );
+    assert.deepEqual(counts, new Array(50).fill(1));
+    assert.equal(await client.exec(NS, "DELETE FROM players WHERE name = 'never-existed'"), 0);
+    const left = await client.query<{ name: string }>(NS, "SELECT name FROM players");
+    assert.ok(left.every((r) => !r.name.startsWith("del")));
+  });
+
+  it("streams a result larger than the server's result bound in pages", async () => {
+    const total = 130; // the server in this suite caps a reply at 50 rows
+    for (let i = 0; i < total; i++) {
+      await client.exec(NS, `INSERT INTO players (name, level) VALUES ('page${String(i).padStart(3, "0")}', '1')`);
+    }
+    await assert.rejects(client.query(NS, "SELECT name FROM players WHERE name LIKE 'page%'"), /50/);
+
+    const rows = await client.queryAll<{ name: string }>(
+      NS,
+      "SELECT name FROM players WHERE name LIKE 'page%' ORDER BY name",
+      [],
+      40,
+    );
+    assert.equal(rows.length, total);
+    assert.deepEqual(
+      rows.map((r) => r.name),
+      Array.from({ length: total }, (_, i) => `page${String(i).padStart(3, "0")}`),
+    );
+
+    let pages = 0;
+    for await (const page of client.queryRawPages(NS, "SELECT name FROM players WHERE name LIKE 'page%'", [], 0)) {
+      pages++;
+      assert.ok(page.rows.length <= 50);
+    }
+    assert.equal(pages, 3); // 130 rows at the clamped page size of 49
   });
 });

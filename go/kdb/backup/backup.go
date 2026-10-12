@@ -45,10 +45,37 @@ type SegmentEntry struct {
 	SizeBytes  int64  `json:"sizeBytes"`
 	Key        string `json:"key"`
 	// VerifiedPrefix marks the entry as the active segment's CRC-verified prefix, stored under
-	// a backup-scoped key (immutable per backup) rather than the shared sealed-segment key -
+	// a backup-scoped key (immutable per backup) rather than a shared sealed-segment key -
 	// the segment may still be growing, and a later backup re-uploading a longer version under
 	// a shared key would silently invalidate this manifest's recorded hash.
 	VerifiedPrefix bool `json:"verifiedPrefix,omitempty"`
+}
+
+// sealedSegmentKey is the object key a sealed segment's bytes live at: the segment's sequence
+// AND the SHA-256 of exactly the bytes stored. Two uploads share a key only when they share
+// content, so an object under one of these keys never changes once written, and every manifest
+// that names it keeps naming the bytes it recorded.
+//
+// The key is outside both "backups/" (manifests, active prefixes) and the "ns/" tree an S3
+// replica sink mirrors live segments into when it shares the bucket and prefix (the replica
+// sink and `kdb-inspect backup --to s3` read the same KDB_S3_* configuration).
+func sealedSegmentKey(namespaceID string, seq int64, sumHex string) string {
+	return fmt.Sprintf("backup-segments/%s/%020d-%s.seg", namespaceID, seq, sumHex)
+}
+
+// legacySealedSegmentKey is the key backups made before content addressing stored a sealed
+// segment under: the segment's own data-directory name, shared by every backup of that
+// sequence whatever its bytes. A later backup of a segment whose bytes had changed (a repair
+// that quarantined frames, a truncation rewrite) re-uploaded under the same key and silently
+// replaced the bytes an older manifest names. New backups never write it; manifests naming it
+// still verify, restore and serve as incremental bases.
+func legacySealedSegmentKey(namespaceID string, seq int64) string {
+	return storio.SegmentNameBuilder.DeltaSequenced(namespaceID, seq)
+}
+
+// isLegacySharedKey reports whether e names a sealed segment under the legacy shared key.
+func (e SegmentEntry) isLegacySharedKey(namespaceID string) bool {
+	return !e.VerifiedPrefix && e.Key == legacySealedSegmentKey(namespaceID, e.Sequence)
 }
 
 // Manifest is the one JSON object whose presence defines a backup (written last - see spec
@@ -152,8 +179,10 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 		}
 	}
 
-	// Every segment except the highest-sequence one is sealed and immutable (the writer only
-	// ever appends to the newest); those upload in full under their shared, stable key. The
+	// Every segment except the highest-sequence one is sealed (the writer only ever appends to
+	// the newest); those upload in full under a key derived from their content (sealedSegmentKey),
+	// since a sealed segment's bytes can still change - a repair that quarantines frames, a
+	// truncation rewrite - and a later backup must never replace bytes a base names. The
 	// highest-sequence segment may still be active, so only its CRC-verified prefix is backed
 	// up, under a backup-scoped key (spec §6.1's activeSegmentPrefix). Each is re-read here
 	// rather than held from the pass above, so a backup never holds the whole log in memory; a
@@ -183,12 +212,16 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 			continue
 		}
 
-		key := name
-		if baseEntry, ok := baseFull[seq]; ok && baseEntry.FileSha256 == sumHex {
-			// Incremental: already uploaded by the base backup, immutable since - reference it.
+		if baseEntry, ok := baseFull[seq]; ok && baseEntry.FileSha256 == sumHex &&
+			baseObjectStillHolds(ctx, store, namespaceID, baseEntry) {
+			// Incremental: the base backup already stored these exact bytes - reference them.
 			m.Segments = append(m.Segments, baseEntry)
 			continue
 		}
+		// Content changed since the base (or there is no base): a key derived from these bytes.
+		// The base's object is never touched, so the base still restores to exactly what it
+		// recorded.
+		key := sealedSegmentKey(namespaceID, seq, sumHex)
 		if err := store.Put(ctx, key, prefix); err != nil {
 			return nil, fmt.Errorf("backup: uploading segment %d: %w", seq, err)
 		}
@@ -257,16 +290,68 @@ func Verify(store ObjectStore, namespaceID, backupID string) (*VerifyResult, err
 			res.Problems = append(res.Problems, fmt.Sprintf("segment %d (%s): missing: %v", e.Sequence, e.Key, err))
 			continue
 		}
+		sum := sha256.Sum256(data)
+		got := hex.EncodeToString(sum[:])
 		if int64(len(data)) != e.SizeBytes {
-			res.Problems = append(res.Problems, fmt.Sprintf("segment %d (%s): size %d, manifest says %d", e.Sequence, e.Key, len(data), e.SizeBytes))
+			res.Problems = append(res.Problems, fmt.Sprintf("segment %d (%s): size %d, manifest says %d%s",
+				e.Sequence, e.Key, len(data), e.SizeBytes, overwriteExplanation(store, m, e, got)))
 			continue
 		}
-		sum := sha256.Sum256(data)
-		if hex.EncodeToString(sum[:]) != e.FileSha256 {
-			res.Problems = append(res.Problems, fmt.Sprintf("segment %d (%s): SHA-256 mismatch", e.Sequence, e.Key))
+		if got != e.FileSha256 {
+			res.Problems = append(res.Problems, fmt.Sprintf("segment %d (%s): SHA-256 mismatch%s",
+				e.Sequence, e.Key, overwriteExplanation(store, m, e, got)))
 		}
 	}
 	return res, nil
+}
+
+// overwriteExplanation says why a legacy shared object no longer matches m, when the store can
+// show it: another backup of the namespace names the same key with exactly the bytes now stored
+// there, so that backup's upload replaced this one's (the defect content-addressed keys fixed).
+// Empty for a key that is not a legacy shared key.
+func overwriteExplanation(store ObjectStore, m *Manifest, e SegmentEntry, gotSha string) string {
+	if !e.isLegacySharedKey(m.NamespaceID) {
+		return ""
+	}
+	if ids, err := ListBackups(store, m.NamespaceID); err == nil {
+		for _, id := range ids {
+			if id == m.BackupID {
+				continue
+			}
+			other, err := LoadManifest(store, m.NamespaceID, id)
+			if err != nil {
+				continue
+			}
+			for _, oe := range other.Segments {
+				if oe.Key == e.Key && oe.FileSha256 == gotSha {
+					return fmt.Sprintf(": the shared object was overwritten by backup %s, which a kdb older "+
+						"than content-addressed backup objects uploaded to the same key after the segment's "+
+						"bytes changed; this backup's own bytes for segment %d are no longer in the store",
+						id, e.Sequence)
+				}
+			}
+		}
+	}
+	return ": the object at this shared key no longer holds the bytes this backup recorded (a kdb older " +
+		"than content-addressed backup objects re-uploaded changed segments under one shared key, and an " +
+		"S3 replica mirror sharing the bucket and prefix writes the same key)"
+}
+
+// baseObjectStillHolds reports whether an incremental may reference base entry e. A
+// content-addressed object is immutable, so yes. A legacy shared key may since have been
+// overwritten - by an older kdb's backup, or an S3 replica mirror writing the same key - so it
+// is re-read and re-hashed first; when it no longer matches, the incremental uploads the segment
+// under its own content key rather than name broken bytes.
+func baseObjectStillHolds(ctx context.Context, store ObjectStore, namespaceID string, e SegmentEntry) bool {
+	if !e.isLegacySharedKey(namespaceID) {
+		return true
+	}
+	data, err := store.Get(ctx, e.Key)
+	if err != nil || int64(len(data)) != e.SizeBytes {
+		return false
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]) == e.FileSha256
 }
 
 // FetchToDir downloads a backup's segments into outDir laid out exactly like a data directory
@@ -285,8 +370,9 @@ func FetchToDir(store ObjectStore, namespaceID, backupID, outDir string) (*Manif
 			return nil, fmt.Errorf("backup fetch: segment %d (%s): %w", e.Sequence, e.Key, err)
 		}
 		sum := sha256.Sum256(data)
-		if hex.EncodeToString(sum[:]) != e.FileSha256 {
-			return nil, fmt.Errorf("backup fetch: segment %d (%s): SHA-256 mismatch - refusing to restore corrupt object", e.Sequence, e.Key)
+		if got := hex.EncodeToString(sum[:]); got != e.FileSha256 {
+			return nil, fmt.Errorf("backup fetch: segment %d (%s): SHA-256 mismatch%s - refusing to restore corrupt object",
+				e.Sequence, e.Key, overwriteExplanation(store, m, e, got))
 		}
 		localName := storio.SegmentNameBuilder.DeltaSequenced(namespaceID, e.Sequence)
 		dest := filepath.Join(outDir, filepath.FromSlash(localName))

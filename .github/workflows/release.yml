@@ -38,6 +38,16 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match VERSION file (expected $want) - bump VERSION and retag" >&2
             exit 1
           fi
+      # @kdb/client is published at the server's version: its handshake refuses any other
+      # release, so a package that disagrees with VERSION would be refused by its own server.
+      - name: "@kdb/client must match VERSION"
+        run: |
+          got="$(node -p "require('./packages/kdb-client/package.json').version")"
+          want="$(cat VERSION)"
+          if [ "$got" != "$want" ]; then
+            echo "packages/kdb-client/package.json is $got but VERSION is $want - bump both together" >&2
+            exit 1
+          fi
 
   test-gate:
     needs: version-guard
@@ -87,6 +97,50 @@ jobs:
             dist/jars/*
             dist/SHA256SUMS
           generate_release_notes: true
+
+  # The TypeScript client, published once per release at the server's own version. The tarball is
+  # always attached to the GitHub release; the registry publish needs an NPM_TOKEN secret (an
+  # automation token for the @kdb scope) and is skipped, loudly, without one.
+  npm-client:
+    needs: test-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/kdb-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - run: npm ci
+      - run: npm run typecheck
+      # Includes the live interop suite against a real Go server, so the package is only
+      # published if it speaks to the server built from this very tag.
+      - run: npm test
+      - run: npm run build
+      - name: Pack
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+      - name: Attach the tarball to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/kdb-client-*.tgz
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::warning::NPM_TOKEN is not set - @kdb/client was NOT published to the registry (the tarball is on the release)"
+            exit 0
+          fi
+          npm publish --access public --provenance
 
   image:
     needs: test-gate

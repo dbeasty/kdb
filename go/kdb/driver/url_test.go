@@ -1,6 +1,10 @@
 package driver
 
-import "testing"
+import (
+	"path/filepath"
+	"runtime"
+	"testing"
+)
 
 func TestParseFileURL(t *testing.T) {
 	p, err := ParseURL("kdb://file///tmp/kdbdata/demo/users")
@@ -14,15 +18,15 @@ func TestParseFileURL(t *testing.T) {
 		t.Fatalf("ns: %+v", p)
 	}
 	// Absolute stays absolute - it used to come back as "tmp/kdbdata", relative to the cwd.
-	if p.DataRoot != "/tmp/kdbdata" {
-		t.Fatalf("data root %q, want /tmp/kdbdata", p.DataRoot)
+	if want := filepath.FromSlash("/tmp/kdbdata"); p.DataRoot != want {
+		t.Fatalf("data root %q, want %s", p.DataRoot, want)
 	}
 	for _, raw := range []string{"kdb://file:///var/lib/kdb/app/users", "kdb://file:///var/lib/kdb/app/users?readOnly=true"} {
 		p, err := ParseURL(raw)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p.DataRoot != "/var/lib/kdb" || p.NamespaceID != "app/users" {
+		if p.DataRoot != filepath.FromSlash("/var/lib/kdb") || p.NamespaceID != "app/users" {
 			t.Errorf("%s: root %q ns %q", raw, p.DataRoot, p.NamespaceID)
 		}
 	}
@@ -32,6 +36,27 @@ func TestParseFileURL(t *testing.T) {
 	}
 	if rel.DataRoot != "data" {
 		t.Errorf("relative URL: root %q, want data", rel.DataRoot)
+	}
+}
+
+// A Windows data root keeps its drive, however the URL spells it - including the file://<root>
+// form the tests build from t.TempDir().
+func TestParseFileURLWindowsDrive(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("drive letters are only volume names on Windows")
+	}
+	for _, raw := range []string{
+		"kdb://file:///C:/kdb/data/app/users",
+		`kdb://file://C:\kdb\data/app/users`,
+		`kdb://file:C:\kdb\data\app\users`,
+	} {
+		p, err := ParseURL(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.DataRoot != `C:\kdb\data` || p.NamespaceID != "app/users" {
+			t.Errorf("%s: root %q ns %q", raw, p.DataRoot, p.NamespaceID)
+		}
 	}
 }
 

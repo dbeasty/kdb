@@ -33,6 +33,30 @@ class TransactionEngineTest {
             assertEquals(1, result.commit.operations.size)
         }
 
+    // A merge patch can add and overwrite keys but never drop one; replace=true makes the patch
+    // the whole document. Parity with the Go engine's WriteOp.Replace.
+    @Test
+    fun write_replace_dropsKeysThatMergeKeeps() =
+        runTest {
+            val dag = inMemoryCommitDag("app/replace")
+            val storage = InMemoryStorageAdapter()
+            val docId = KdbUuid.random()
+            assertIs<TransactionResult.Success>(
+                engine.commit(tx(dag.head(), KdbOp.Write(docId, """{"a":1,"b":2}""")), dag, storage),
+            )
+            assertIs<TransactionResult.Success>(
+                engine.commit(tx(dag.head(), KdbOp.Write(docId, """{"c":3}""")), dag, storage),
+            )
+            val merged = storage.getDocument("app/replace", docId, dag.getCommit(dag.head())!!.documentTreeHash)!!
+            assertTrue(merged.json.contains("\"a\"") && merged.json.contains("\"c\""), merged.json)
+
+            assertIs<TransactionResult.Success>(
+                engine.commit(tx(dag.head(), KdbOp.Write(docId, """{"c":4}""", replace = true)), dag, storage),
+            )
+            val replaced = storage.getDocument("app/replace", docId, dag.getCommit(dag.head())!!.documentTreeHash)!!
+            assertTrue(!replaced.json.contains("\"a\"") && replaced.json.contains("\"c\""), replaced.json)
+        }
+
     @Test
     fun strict_conflict_onConcurrentWrite() =
         runTest {

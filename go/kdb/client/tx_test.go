@@ -29,7 +29,7 @@ func rowsOf(t *testing.T, ctx context.Context, c *client.Client, ns, sqlText str
 
 func seedAccount(t *testing.T, ctx context.Context, c *client.Client, owner string, balance int) {
 	t.Helper()
-	if err := c.Exec(ctx, "bank/accounts", "INSERT INTO accounts (owner, balance) VALUES (?, ?)", []any{owner, balance}); err != nil {
+	if _, err := c.Exec(ctx, "bank/accounts", "INSERT INTO accounts (owner, balance) VALUES (?, ?)", []any{owner, balance}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -134,7 +134,7 @@ func TestSQLTransactionConflictElsewhereWritesNothing(t *testing.T) {
 	c := connectTestClient(t, startMultiNamespaceServer(t))
 	ctx := txCtx(t)
 	seedAccount(t, ctx, c, "ada", 100)
-	if err := c.Exec(ctx, "bank/ledger", "INSERT INTO ledger (owner, total) VALUES ('ada', 0)", nil); err != nil {
+	if _, err := c.Exec(ctx, "bank/ledger", "INSERT INTO ledger (owner, total) VALUES ('ada', 0)", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -174,7 +174,7 @@ func TestSQLTransactionConflictElsewhereWritesNothing(t *testing.T) {
 func TestSQLSnapshotTransactionReadsEveryNamespaceAtOneInstant(t *testing.T) {
 	c := connectTestClient(t, startMultiNamespaceServer(t))
 	ctx := txCtx(t)
-	if err := c.Exec(ctx, "bank/ledger", "INSERT INTO ledger (owner) VALUES ('ada')", nil); err != nil {
+	if _, err := c.Exec(ctx, "bank/ledger", "INSERT INTO ledger (owner) VALUES ('ada')", nil); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := c.BeginTx(ctx, "bank/accounts", client.TxOptions{Snapshot: true})
@@ -183,7 +183,7 @@ func TestSQLSnapshotTransactionReadsEveryNamespaceAtOneInstant(t *testing.T) {
 	}
 	defer tx.Rollback(ctx)
 	// Written after Begin, before the transaction first reads the ledger.
-	if err := c.Exec(ctx, "bank/ledger", "INSERT INTO ledger (owner) VALUES ('grace')", nil); err != nil {
+	if _, err := c.Exec(ctx, "bank/ledger", "INSERT INTO ledger (owner) VALUES ('grace')", nil); err != nil {
 		t.Fatal(err)
 	}
 	_, rows, err := tx.QueryRaw(ctx, "SELECT owner FROM bank.ledger")
@@ -214,7 +214,7 @@ func TestSQLTableRouting(t *testing.T) {
 	ctx := txCtx(t)
 
 	// An unqualified table that is not a namespace keeps meaning the session's own.
-	if err := c.Exec(ctx, "bank/accounts", "INSERT INTO whatever (owner) VALUES ('ada')", nil); err != nil {
+	if _, err := c.Exec(ctx, "bank/accounts", "INSERT INTO whatever (owner) VALUES ('ada')", nil); err != nil {
 		t.Fatal(err)
 	}
 	if rows := rowsOf(t, ctx, c, "bank/accounts", "SELECT owner FROM accounts"); len(rows) != 1 {

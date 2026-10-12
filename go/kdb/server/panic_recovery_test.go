@@ -86,7 +86,7 @@ func TestMalformedStatementIsAnErrorNotAnOutage(t *testing.T) {
 
 	// A well-formed statement still works, proving the server is serving rather than merely
 	// still running.
-	if err := bystander.Exec(ctx, "app/data",
+	if _, err := bystander.Exec(ctx, "app/data",
 		`CREATE TABLE players (name VARCHAR NOT NULL, level VARCHAR NOT NULL)`, nil); err != nil {
 		t.Fatalf("server no longer serving valid statements: %v", err)
 	}

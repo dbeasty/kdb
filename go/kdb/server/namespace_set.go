@@ -435,14 +435,15 @@ func (p *serverParticipant) Prepare(tx document.Transaction) (embed.PreparedPart
 	default:
 		return nil, fmt.Errorf("kdb server: unexpected prepare result %T", result)
 	}
-	return &serverPrepared{p: p, pc: pc, indexes: preparedIndexes, provider: indexProvider}, nil
+	return &serverPrepared{p: p, pc: pc, requested: tx.Operations, indexes: preparedIndexes, provider: indexProvider}, nil
 }
 
 type serverPrepared struct {
-	p        *serverParticipant
-	pc       *transaction.PreparedCommit
-	indexes  []*index.PreparedWrite
-	provider *RegistryIndexProvider
+	p         *serverParticipant
+	pc        *transaction.PreparedCommit
+	requested []document.Op
+	indexes   []*index.PreparedWrite
+	provider  *RegistryIndexProvider
 }
 
 func (sp *serverPrepared) Discard() { sp.pc.Discard() }
@@ -456,7 +457,11 @@ func (sp *serverPrepared) Apply(message string) (document.Commit, error) {
 	case transaction.ResultSuccess:
 		if sp.provider != nil {
 			// Under the gate, so index state advances in commit order - as in runTransaction.
-			if _, err := sp.provider.commitToIndexes(sp.indexes, r.Commit.Hash); err != nil {
+			stored, err := sp.provider.preparedForStored(sp.requested, sp.indexes, r.Commit.Operations)
+			if err != nil {
+				return r.Commit, err
+			}
+			if _, err := sp.provider.commitToIndexes(stored, r.Commit.Hash); err != nil {
 				return r.Commit, err
 			}
 		}

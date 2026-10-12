@@ -83,7 +83,7 @@ func (a authNode) commit(t *testing.T, ns string, doc codec.UUID, body, message 
 		t.Fatal(err)
 	}
 	c, err := a.dag.AppendCommitDetached(document.Transaction{
-		ID: newUUID(t), BaseVersion: head, Timestamp: codec.TimestampNow(), AuthorNodeID: a.id,
+		ID: newUUID(t), BaseVersion: head, Timestamp: nextTimestamp(), AuthorNodeID: a.id,
 		Operations: []document.Op{document.WriteOp{DocID: doc, Patch: body}},
 	}, head, tree, nil, message)
 	if err != nil {

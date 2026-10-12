@@ -27,6 +27,15 @@ func (b *Builder) Write(docID codec.UUID, patchJSON string) *Builder {
 	return b
 }
 
+// Replace appends a write that makes bodyJSON the whole document: unlike Write, a key it does not
+// name is removed, and it is atomic (one operation, one commit).
+func (b *Builder) Replace(docID codec.UUID, bodyJSON string) *Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ops = append(b.ops, document.WriteOp{DocID: docID, Patch: bodyJSON, Replace: true})
+	return b
+}
+
 // WriteDocument writes a full document body.
 func (b *Builder) WriteDocument(doc document.Document) *Builder {
 	return b.Write(doc.ID, doc.JSON)

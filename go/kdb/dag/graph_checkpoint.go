@@ -30,23 +30,25 @@ type GraphSegmentRef struct {
 	Records int
 }
 
-// CheckpointSnapshotWithGraph is CheckpointSnapshotRetaining, except that when graph segments
-// are attached and keep is nil it captures only the resident tier and returns references to the
+// CheckpointSnapshotWithGraph is CheckpointSnapshotLogged, except that when graph segments are
+// attached and keep is nil it captures only the resident tier and returns references to the
 // segments that hold the rest, and the segment records that no longer count. With no segments,
-// or a retention filter, refs is nil and the state is the full one.
-func (d *InMemoryCommitDag) CheckpointSnapshotWithGraph(keep func(document.Commit) bool) (CheckpointState, []GraphSegmentRef, []codec.Hash) {
-	d.mu.RLock()
-	usable := keep == nil && len(d.nodes.segs) > 0
-	d.mu.RUnlock()
-	if !usable {
-		return d.CheckpointSnapshotRetaining(keep), nil, nil
-	}
+// or a retention filter, refs is nil and the state is the full one. Refuses with ErrHeadNotLogged
+// exactly as CheckpointSnapshotLogged does.
+func (d *InMemoryCommitDag) CheckpointSnapshotWithGraph(keep func(document.Commit) bool) (CheckpointState, []GraphSegmentRef, []codec.Hash, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	if len(d.nodes.segs) == 0 { // detached in between
-		return d.checkpointSnapshotLocked(nil, false), nil, nil
+	if keep != nil || len(d.nodes.segs) == 0 {
+		state, mainUnlogged := d.checkpointSnapshotLocked(keep, false)
+		if mainUnlogged {
+			return CheckpointState{}, nil, nil, ErrHeadNotLogged
+		}
+		return state, nil, nil, nil
 	}
-	state := d.checkpointSnapshotLocked(nil, true)
+	state, mainUnlogged := d.checkpointSnapshotLocked(nil, true)
+	if mainUnlogged {
+		return CheckpointState{}, nil, nil, ErrHeadNotLogged
+	}
 	refs := make([]GraphSegmentRef, 0, len(d.nodes.segs))
 	for _, b := range d.nodes.segs {
 		refs = append(refs, GraphSegmentRef{Seq: b.seq, CRC: b.crc, Records: b.count})
@@ -55,7 +57,7 @@ func (d *InMemoryCommitDag) CheckpointSnapshotWithGraph(keep func(document.Commi
 	for h := range d.nodes.hidden {
 		hidden = append(hidden, h)
 	}
-	return state, refs, hidden
+	return state, refs, hidden, nil
 }
 
 // AttachCheckpointGraph maps the segments a checkpoint names, before RestoreCheckpoint puts back

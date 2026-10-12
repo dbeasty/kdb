@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // nodeFileName names the file at a data root that holds the node's identity.
@@ -81,7 +82,8 @@ func writeNodeID(dataRoot string, id codec.UUID) error {
 	if err := os.WriteFile(tmp, []byte(id.String()+"\n"), 0o644); err != nil {
 		return err
 	}
-	f, err := os.Open(tmp)
+	// Writable, not os.Open: Windows refuses FlushFileBuffers on a read-only handle.
+	f, err := os.OpenFile(tmp, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -90,7 +92,7 @@ func writeNodeID(dataRoot string, id codec.UUID) error {
 	if serr != nil {
 		return serr
 	}
-	if err := os.Rename(tmp, filepath.Join(dataRoot, nodeFileName)); err != nil {
+	if err := fsx.Rename(tmp, filepath.Join(dataRoot, nodeFileName)); err != nil {
 		return err
 	}
 	return syncDir(dataRoot)

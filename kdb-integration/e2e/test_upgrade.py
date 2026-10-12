@@ -32,10 +32,14 @@ from cluster_fixtures import (
     Writer,
     assert_values_at_least,
     control,
+    documents,
+    fork_behind_a_pushed_only_hub,
     head,
     ns_path,
     owned_docs,
+    peer_state,
     peers,
+    wait_until,
 )
 from server_fixtures import (
     binary_version,
@@ -98,11 +102,13 @@ class Acked:
                 assert_values_at_least(n, self.values, f"{stage}: n{i} ({n.binary or 'new'})")
 
 
-def load(c: Cluster, stage: int, seconds: float, during=None, docs_per_node: int = 6) -> list[Writer]:
-    """Writers on every node (each its own documents) for `seconds`, calling `during()` halfway
-    through - the step being tested happens under load. Returns the stopped writers."""
+def load(c: Cluster, stage: int, seconds: float, during=None, docs_per_node: int = 6,
+         nodes: list[int] | None = None) -> list[Writer]:
+    """Writers on every node (each its own documents), or on just `nodes`, for `seconds`, calling
+    `during()` halfway through - the step being tested happens under load. Returns the stopped
+    writers."""
     writers = [Writer(n, owned_docs(i, docs_per_node), f"n{i}", value_base=stage * 100_000)
-               for i, n in enumerate(c.nodes)]
+               for i, n in enumerate(c.nodes) if nodes is None or i in nodes]
     for w in writers:
         w.start()
     time.sleep(seconds / 2)
@@ -271,6 +277,144 @@ def test_deepen_peer_option_recovers_a_stuck_snapshot_joiner(make_cluster):
     converge(c, acked, "stuck joiner restarted with deepen=true", timeout=60)
 
 
+def test_old_pushers_into_a_new_snapshot_hub_get_a_typed_error_then_heal_on_upgrade(make_cluster):
+    """A snapshot hub that is only ever pushed to, on this build, with v0.6.2 pushers. An old
+    pusher does not know SHALLOW_BOUNDARY, so it cannot send the fork point's state: its push of
+    a branch forked behind the hub's root fails - with that code and a message naming the commit,
+    the missing parent and the way out, not a bare "missing parent" - and the hub stays where it
+    was. Upgrading the pushers, one at a time, heals it (fork_behind_a_pushed_only_hub)."""
+    c = make_cluster(2, service_bins=[PREV, PREV])
+    n0, n1 = c.nodes
+    for d in owned_docs(5, 10):
+        put(n0, d, {"id": d, "v": 0, "by": "seed"})
+    hub, to_hub, forks = fork_behind_a_pushed_only_hub(c)
+    root = head(hub)
+
+    wait_until(lambda: "SHALLOW_BOUNDARY" in (peer_state(n1, "hub").get("lastError") or ""),
+               30, "the old pusher was not refused with SHALLOW_BOUNDARY", c)
+    err = peer_state(n1, "hub")["lastError"]
+    assert "behind this node's snapshot root" in err and "deepen" in err, err
+    assert head(hub) == root, "the hub moved although every push was refused"
+
+    c.switch_binary(1, NEW)
+    assert n0.stop() == 0
+    n0.extra_args += to_hub
+    n0.restart(service_bin=NEW)
+    wait_until(lambda: head(n0) == head(n1) and documents(n0) == documents(n1) == documents(hub),
+               60, "the hub did not converge once its pushers were upgraded", c)
+    for n in (n0, n1):
+        state = peer_state(n, "hub")
+        assert not state.get("lastError") and state.get("consecutiveFailures") == 0, state
+    assert_values_at_least(hub, forks, "hub")
+
+
+# -- resolution chain versions ---------------------------------------------------------------
+
+FIELD_MERGE_CHAIN = [{"kind": "field-merge"}, {"kind": "last-write"}]
+
+
+def chain_of(n) -> dict:
+    status, body = control(n, "GET", ns_path(n, "/resolution"))
+    assert status == 200, body
+    return body
+
+
+def put_chain(n, rules: list[dict], version: int | None = None) -> str:
+    req: dict = {"rules": rules}
+    if version is not None:
+        req["version"] = version
+    status, body = control(n, "PUT", ns_path(n, "/resolution"), req)
+    assert status == 200, f"PUT resolution on {n.binary or 'new'} failed ({status}): {body}"
+    return body["hash"]
+
+
+def wait_chain(c: Cluster, want: str, nodes=None, timeout: float = 30.0) -> None:
+    nodes = nodes if nodes is not None else c.nodes
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(chain_of(n).get("hash") == want for n in nodes):
+            return
+        time.sleep(0.2)
+    raise AssertionError("the chain did not replicate:\n" +
+                         "\n".join(f"n{i}: {chain_of(n).get('hash')}" for i, n in enumerate(nodes)))
+
+
+def test_resolution_chain_version_2_after_a_rolling_upgrade(make_cluster):
+    """Version 2 chains (#130's F1, F2, F4 merge semantics) change what a merge builds, so they are
+    gated: a chain without a version keeps the original semantics on every node, byte for byte -
+    the same chain hash on v0.6.2 and on this build - and an operator switches it to version 2
+    once every node runs this build.
+
+    1. Three v0.6.2 nodes with a version 1 [field-merge, last-write] chain; one upgraded. Old and new
+       advertise the same chain hash and the mixed mesh merges concurrent field writes and
+       converges, as before.
+    2. Everyone upgraded, the chain switched to version 2: the ordered F2 scenario (n0 then n1
+       write x, n2 writes c; n2 merges n0 first, n1 merges that) converges on n1's x - the later
+       write - which version 1 does not.
+    3. What v0.6.2 does with a version 2 chain, recorded: it ignores the unknown field and keeps
+       the version 1 hash, so it never matches a version 2 node and they do not merge each other.
+    """
+    from test_cluster_resolution import Stages, must_write, read_doc, doc_uuid
+
+    c = make_cluster(3, service_bins=[PREV] * 3, control_write=True)
+    acked = Acked()
+    v1 = put_chain(c.nodes[0], FIELD_MERGE_CHAIN)
+    wait_chain(c, v1)
+
+    c.switch_binary(0, NEW)
+    converge(c, acked, "n0 upgraded")
+    assert chain_of(c.nodes[0]).get("hash") == v1, "this build hashes a version 1 chain differently"
+    assert chain_of(c.nodes[0]).get("advertisedHash") == v1
+
+    # Concurrent writes of different fields of the same documents, on old and new nodes alike.
+    docs = [doc_uuid(500 + k) for k in range(3)]
+    for d in docs:
+        must_write(c.nodes[1], d, {"id": d, "f0": 0, "f1": 0, "f2": 0})
+    converge(c, acked, "mixed, seeded")
+    for rnd in range(3):
+        for i, n in enumerate(c.nodes):
+            for d in docs:
+                must_write(n, d, {f"f{i}": rnd + 1})
+    converge(c, acked, "mixed mesh, version 1 chain")
+    for d in docs:
+        assert read_doc(c.nodes[2], d)[0] == {"id": d, "f0": 3, "f1": 3, "f2": 3}
+
+    c.switch_binary(1, NEW)
+    c.switch_binary(2, NEW)
+    converge(c, acked, "all new, version 1 chain")
+
+    v2 = put_chain(c.nodes[1], FIELD_MERGE_CHAIN, version=2)
+    assert v2 != v1
+    wait_chain(c, v2)
+    doc = doc_uuid(510)
+    must_write(c.nodes[0], doc, {"id": doc, "x": "base", "c": 0})
+    converge(c, acked, "version 2 seeded")
+    st = Stages(c)
+    st.isolate()
+    must_write(c.nodes[0], doc, {"x": "n0"})
+    time.sleep(0.05)
+    must_write(c.nodes[1], doc, {"x": "n1"})
+    time.sleep(0.05)
+    must_write(c.nodes[2], doc, {"c": 2})
+    st.pull(2, 0)
+    st.pull(1, 2)
+    st.mesh()
+    converge(c, acked, "version 2, ordered F2 merges")
+    for i, n in enumerate(c.nodes):
+        assert read_doc(n, doc)[0] == {"id": doc, "x": "n1", "c": 2}, f"n{i}\n{st.log}"
+
+    # v0.6.2 under a version 2 chain: no merges with version 2 nodes, by hash.
+    c.switch_binary(2, PREV)
+    deadline = time.time() + 30
+    while time.time() < deadline and chain_of(c.nodes[2]).get("hash") != v1:
+        time.sleep(0.2)
+    assert chain_of(c.nodes[2]).get("hash") == v1, (
+        "v0.6.2 should read the version 2 chain as its version 1 rules (it ignores the unknown "
+        f"field): {chain_of(c.nodes[2])}")
+    c.switch_binary(2, NEW)
+    converge(c, acked, "all new again")
+
+
 # -- SQL across versions ---------------------------------------------------------------------
 
 def test_sql_schema_and_rows_from_old_nodes_read_and_extended_on_new(make_cluster):
@@ -341,8 +485,17 @@ def _new_cluster_history(c: Cluster, acked: Acked) -> None:
 
 def test_rollback_to_v062_after_a_clean_stop(make_cluster):
     """Data dirs a five-node mesh of this build wrote, stopped cleanly, open on v0.6.2 with every
-    acknowledged write, and that mesh converges and takes writes. A clean stop leaves a checkpoint
-    at main, so v0.6.2 has no log to replay."""
+    acknowledged write, stop cleanly again on v0.6.2, and a v0.6.2 mesh on them takes writes and
+    converges. A clean stop leaves a checkpoint at main, so v0.6.2 has no log to replay.
+
+    Every one of the five rolled-back nodes is checked for every acknowledged write; the writes and
+    the strict convergence after them run on three of them. A five-node v0.6.2 mesh under
+    concurrent writes can merge-storm - N2, v0.6.2's own defect, fixed in this build by #114:
+    syncs all succeed while every node keeps making new empty merges, so the heads never settle -
+    and on a slow runner it did (nightly run 38197566122). That is v0.6.2 behaving as v0.6.2
+    does, whatever data it opened, so it says nothing about whether a rollback works. Three
+    v0.6.2 nodes converge (test_rolling_upgrade_of_a_three_node_mesh_under_load starts from
+    exactly such a mesh)."""
     c = make_cluster(5)
     acked = Acked()
     _new_cluster_history(c, acked)
@@ -351,8 +504,12 @@ def test_rollback_to_v062_after_a_clean_stop(make_cluster):
     for n in c.nodes:
         n.restart(service_bin=PREV)
     acked.check(c, "rolled back to v0.6.2 (clean)")
-    acked.add(load(c, 7, 3))
-    converge(c, acked, "v0.6.2 after rollback")
+    # n3 and n4 leave; their writes are on n0-n2 already (acked.check read them there).
+    for i in (3, 4):
+        code = c.nodes[i].stop()
+        assert code == 0, f"n{i} did not stop cleanly on v0.6.2 (exit {code})"
+    acked.add(load(c, 7, 3, nodes=[0, 1, 2]))
+    converge(c, acked, "three v0.6.2 nodes after rollback", timeout=150)
 
 
 @pytest.mark.destructive

@@ -18,6 +18,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	kdberr "github.com/limidus/kdb/go/kdb/error"
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // ConflictKind classifies a queued conflict.
@@ -282,7 +283,7 @@ func (q *ConflictQueue) Remove(id string) error {
 		return nil
 	}
 	if q.dir != "" {
-		if err := os.Remove(filepath.Join(q.dir, id+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := fsx.Remove(filepath.Join(q.dir, id+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -302,7 +303,7 @@ func (q *ConflictQueue) writeLocked(e ConflictEntry) error {
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(q.dir, e.ID+".json"))
+	return fsx.Rename(tmp, filepath.Join(q.dir, e.ID+".json"))
 }
 
 // trackingBranchPrefix names the branches that keep a conflicting peer's side reachable. They

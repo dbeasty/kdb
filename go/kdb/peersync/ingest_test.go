@@ -28,7 +28,7 @@ func TestIngestTreeMismatchLeavesHeadAndStorageUntouched(t *testing.T) {
 	// A commit that writes a document but claims its parent's (empty) tree - internally
 	// consistent as a commit (its hash covers what it says), wrong about its own state.
 	liar, err := document.BuildCommit(
-		[]codec.Hash{genesis}, ns, newUUID(t), codec.TimestampNow(), newUUID(t),
+		[]codec.Hash{genesis}, ns, newUUID(t), nextTimestamp(), newUUID(t),
 		[]document.Op{document.WriteOp{DocID: docID, Patch: `{"v":1}`}},
 		genesisCommit.DocumentTreeHash, nil, "lying about its tree",
 	)

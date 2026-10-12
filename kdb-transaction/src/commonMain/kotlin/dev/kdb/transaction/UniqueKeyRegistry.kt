@@ -177,6 +177,11 @@ public class UniqueKeyRegistry {
  * The keys [doc] claims under [schema]: one per unique tuple whose every part is present and non-null
  * (sparse semantics - a document missing any part of a tuple claims nothing for it, matching SQL where
  * NULLs never collide). A document whose JSON cannot be evaluated claims nothing.
+ *
+ * Arrays are multikey, as in a MongoDB unique index: a part holding an array claims each non-null
+ * element, a compound tuple with array parts claims every combination, a repeated element is claimed
+ * once and an empty array claims nothing. An array nested inside an element is that element's value.
+ * Same rules as Go's UniqueKeysFor.
  */
 public fun uniqueKeysFor(
     namespaceId: String,
@@ -184,9 +189,9 @@ public fun uniqueKeysFor(
     doc: KdbDocument,
 ): List<UniqueKey> {
     if (!schema.hasUniqueConstraints()) return emptyList()
-    val out = mutableListOf<UniqueKey>()
+    val out = LinkedHashSet<UniqueKey>()
     tuples@ for (fields in schema.uniqueTuples()) {
-        val values = ArrayList<String>(fields.size)
+        var combos: List<List<String>> = listOf(emptyList())
         for (field in fields) {
             val raw =
                 try {
@@ -194,12 +199,18 @@ public fun uniqueKeysFor(
                 } catch (_: Throwable) {
                     null
                 }
-            if (raw == null || raw is JsonValue.JNull) continue@tuples
-            values += canonicalJson(raw)
+            val values =
+                when (raw) {
+                    null, is JsonValue.JNull -> emptyList()
+                    is JsonValue.JArray -> raw.elements.filter { it !is JsonValue.JNull }.map { canonicalJson(it) }
+                    else -> listOf(canonicalJson(raw))
+                }
+            if (values.isEmpty()) continue@tuples
+            combos = combos.flatMap { prefix -> values.map { prefix + it } }
         }
-        out += UniqueKey(namespaceId, fields, values)
+        for (parts in combos) out += UniqueKey(namespaceId, fields, parts)
     }
-    return out
+    return out.toList()
 }
 
 /** Canonical JSON for registry comparison: object keys sorted, integral doubles rendered as integers

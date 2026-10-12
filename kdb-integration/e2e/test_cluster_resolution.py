@@ -19,8 +19,11 @@ Two kinds of test per rule:
   plane while one node is killed with SIGKILL and restarted; the same convergence and semantic
   checks follow.
 
-Where a scenario fails today it is marked xfail with the mechanism; the PR that added this file
-and docs/kdb-open-issues-plan.md's progress log carry the evidence.
+Every chain here is set at version 2 (peersync.ChainVersionMergeBases): the merge semantics that
+fix #130's F1 (wrong merge base), F2 (order-dependent field-merge then last-write) and F4 (validity
+before the schema arrives). Version 1 chains keep the original behaviour for meshes with nodes on
+older releases; test_upgrade.py covers that and the switch. What still fails is marked xfail with
+the mechanism: F3, procedures that are not state-based joins, which is a documentation matter.
 """
 
 from __future__ import annotations
@@ -91,9 +94,15 @@ def chain_hash(n) -> str | None:
     return body.get("hash") if status == 200 else None
 
 
-def set_chain(c: Cluster, rules: list[dict], on: int = 0) -> str:
+# KDB_E2E_CHAIN_VERSION=1 reruns the file under the original semantics, which is how the F1, F2
+# and F4 scenarios are confirmed to still catch the defects they were written for.
+CHAIN_VERSION = int(os.environ.get("KDB_E2E_CHAIN_VERSION", "2"))
+
+
+def set_chain(c: Cluster, rules: list[dict], on: int = 0, version: int = CHAIN_VERSION) -> str:
     """PUTs the chain on one node and waits for every node to hold it (through _kdb/meta)."""
-    status, body = control(c.nodes[on], "PUT", ns_path(c.nodes[on], "/resolution"), {"rules": rules})
+    status, body = control(c.nodes[on], "PUT", ns_path(c.nodes[on], "/resolution"),
+                           {"rules": rules, "version": version})
     assert status == 200, f"PUT resolution failed ({status}): {body}"
     want = body["hash"]
     wait_for("the chain to replicate to every node",
@@ -134,8 +143,20 @@ def write(n, doc: str, fields: dict, if_hash: str | None = None, replace: bool =
     return control(n, "PUT", ns_path(n, f"/docs/{doc}"), req)
 
 
-def must_write(n, doc: str, fields: dict) -> str:
-    status, body = write(n, doc, fields)
+def must_write(n, doc: str, fields: dict, attempts: int = 20) -> str:
+    """A plain (unconditional) write that must land. A write is optimistic: it is built on the head
+    the server resolves when the request arrives, and if a peer's merge changes the same document
+    before it commits, the server refuses it with 409 `conflict` ("re-read and retry", with a
+    retryAfterMs) - the documented outcome a client retries, not a failure. On a mesh whose nodes
+    write the same documents concurrently that window is real, and on a loaded runner it is hit
+    (nightly, test_upgrade.py's mixed-mesh rounds). So that one outcome is retried; anything else,
+    including a 409 `precondition_failed`, fails at once."""
+    for _ in range(attempts):
+        status, body = write(n, doc, fields)
+        err = (body.get("error") or {}) if isinstance(body, dict) else {}
+        if status != 409 or err.get("code") != "conflict":
+            break
+        time.sleep(max(body.get("retryAfterMs") or 0, 20) / 1000)
     assert status == 200, f"write {fields} to {doc} on {n.sql_addr} failed ({status}): {body}"
     return body["commit"]
 
@@ -292,11 +313,6 @@ def test_field_merge_keeps_every_disjoint_field_change(make_cluster, size):
 
 
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=True, reason=(
-    "order-dependent: a value field-merge builds is attributed to the merge commit, whose "
-    "timestamp is the later head's (peersync/merge_resolution.go origin(); "
-    "peersync/conflict_detection.go mergeNonConflicting), so last-write later prefers it over a "
-    "genuinely later write of the colliding field"))
 def test_field_merge_collision_has_the_last_write_winner_everywhere(make_cluster, size):
     """n0 and then n1 write the SAME field x; afterwards n2 writes a different field c. Where the
     fields differ every change is kept (c); where they collide, last-write's winner is the later
@@ -349,12 +365,6 @@ def test_field_merge_collision_has_the_last_write_winner_everywhere(make_cluster
 
 
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=True, reason=(
-    "wrong merge base: dag.CommonAncestor (dag/ancestry.go) returns the first common ancestor in "
-    "breadth-first order from its second argument - with 5 nodes a proper ancestor of the real "
-    "one, reached in fewer hops; with 3, one of two nearest ancestors - so field-merge sees a "
-    "field only one side changed as changed by both, falls through to last-write, and the "
-    "losing side's other field changes are dropped"))
 def test_field_merge_against_the_true_merge_base(make_cluster, size):
     """Two heads whose real common history is A (a=1). Since A, one side changed a to 2 and b;
     the other changed c and e (and d is on both). Field-merge must keep all of it - a=2, b, c,
@@ -496,12 +506,10 @@ def test_validity_prefers_the_valid_value_once_every_merger_has_the_schema(make_
 
 
 @pytest.mark.parametrize("size", [3])
-@pytest.mark.xfail(strict=True, reason=(
-    "documented limitation: the chain hash does not cover the schema (server/resolution.go "
-    "peerResolution Valid), so a node that merges before the schema reaches it settles by "
-    "last-write, and everyone else fast-forwards to that merge - an invalid value survives"))
 def test_validity_before_the_schema_arrives(make_cluster, size):
-    """The same race with the merge made by a node that has not received the schema yet."""
+    """The same race with the merge attempted by a node that has not received the schema yet.
+    Under a version 2 chain it holds the conflict rather than settling by last-write, and merges by
+    validity once the schema reaches it."""
     c = make_cluster(size)
     set_chain(c, VALIDITY_CHAIN)
     doc = doc_uuid(21)
@@ -514,7 +522,10 @@ def test_validity_before_the_schema_arrives(make_cluster, size):
     must_write(c.nodes[2], doc, {"v": 2})
     time.sleep(0.02)
     must_write(c.nodes[1], doc, {"v": "bad-n1"})   # later, invalid
-    st.pull(2, 1)          # n2 merges without the schema: last-write takes n1's
+    st.pull(2, 1)          # n2 has no schema: it must hold, not settle by last-write
+    held = read_doc(c.nodes[2], doc)[0]
+    assert held == {"id": doc, "v": 2}, f"n2 settled without the schema: {held}\n{st.log}"
+    assert conflicts(c.nodes[2]), "n2 should hold the divergence until the schema arrives"
     st.mesh()
 
     final = converged_docs(c)[doc]
@@ -523,10 +534,17 @@ def test_validity_before_the_schema_arrives(make_cluster, size):
 
 # -- 4. procedure ------------------------------------------------------------------------------
 
-# Sums a counter and unions a tag list, against the base. The sum is the textbook three-way
-# counter merge (local + remote - base): correct for one base, and wrong whenever the base handed
-# in is not the true merge base of the two histories. The union is idempotent, so a wrong base
-# cannot hurt it - which is the contrast this scenario draws.
+# Two procedures, one on each side of the contract in docs/kdb-user-guide.md ("What a merge-time
+# procedure can rely on"). A merge hands a procedure two STATES, only when they differ, possibly
+# over earlier merge results and with any one common ancestor as the base; so the procedure must
+# be a join of states - commutative, associative, idempotent - never a replay of operations.
+#
+# MERGE_PROC sums a counter and unions a tag list. The union is a join and converges. The sum is
+# the textbook three-way counter merge (local + remote - base), which replays deltas: it is the
+# documented anti-pattern, kept here as strict xfails that show how it fails.
+#
+# PER_NODE_COUNTER_PROC is the documented counter: each node increments only its own key of
+# `counts`, the procedure takes the per-key max, and the total is the sum, computed on read.
 MERGE_PROC = """
 function main(c) {
   var num = function (d) { return (d && typeof d.n === "number") ? d.n : 0; };
@@ -599,11 +617,9 @@ def digit_counts(value: int, places: int) -> list[int]:
 
 
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=True, reason=(
-    "criss-cross: a merge whose heads have several nearest common ancestors is handed ONE of "
-    "them as the base (dag.CommonAncestor via peersync/merge_resolution.go resolveDivergedLocked), "
-    "so a base-relative rule such as local+remote-base counts some increments twice or drops "
-    "them; it converges, on the wrong total"))
+# Under a version 2 chain the procedure is handed the virtual merge base of a criss-cross,
+# so this ordered scenario counts every increment once; it is still the anti-pattern the
+# procedure contract warns about (equal values are never offered - the next two tests).
 def test_procedure_counter_sum_is_the_total_of_increments(make_cluster, size):
     """Each node increments a counter once while isolated, node i by 10**i, so every increment
     owns one decimal digit and the converged value says how many times each was counted. Chosen
@@ -644,10 +660,10 @@ def test_procedure_counter_sum_is_the_total_of_increments(make_cluster, size):
 
 @pytest.mark.parametrize("size", SIZES)
 @pytest.mark.xfail(strict=True, reason=(
-    "merges are state-based: a document both sides hold with the same value is not a conflict "
-    "(peersync/merge_resolution.go resolveDivergedLocked skips sameBody; peersync/join.go "
-    "joinSameContent joins equal trees), so the procedure never runs and one side's increment is "
-    "lost"))
+    "documented anti-pattern, by the procedure contract: merges are state-based, and a document "
+    "both sides hold with the same value is never offered to a procedure "
+    "(peersync/merge_resolution.go skips sameBody; peersync/join.go joinSameContent joins equal "
+    "trees), so an increment-sum never runs and one side's increment is lost"))
 def test_procedure_counter_sum_when_both_sides_reach_the_same_value(make_cluster, size):
     """n0 and n1 each increment the counter by 1 while isolated. Both now hold n=1, from two
     different increments; the summing procedure should make it 2."""
@@ -666,6 +682,109 @@ def test_procedure_counter_sum_when_both_sides_reach_the_same_value(make_cluster
 
     final = converged_docs(c)[doc]
     assert final["n"] == 2, f"two increments of 1 converged on n={final['n']}\n{st.log}"
+
+
+# The per-node counter, exactly as docs/kdb-user-guide.md shows it: a join of two states. Each
+# node only ever raises its own key, so a key's larger value already contains the smaller one's
+# increments, and per-key max loses nothing and counts nothing twice - whatever the base, however
+# often, in whatever order. Keys are emitted sorted, because the merged body is compared byte for
+# byte and two nodes must build the same bytes.
+PER_NODE_COUNTER_PROC = """
+function main(c) {
+  if (c.local === null || c.remote === null) { return { defer: true }; }
+  var a = c.local.counts || {}, b = c.remote.counts || {};
+  var max = {};
+  for (var k in a) { max[k] = a[k]; }
+  for (var k in b) { if (!(k in max) || b[k] > max[k]) { max[k] = b[k]; } }
+  var counts = {};
+  Object.keys(max).sort().forEach(function (k) { counts[k] = max[k]; });
+  var out = {};
+  Object.keys(c.local).sort().forEach(function (k) { out[k] = c.local[k]; });
+  out.counts = counts;
+  return { doc: out };
+}
+"""
+PER_NODE_COUNTER_NAME = "perNodeCounter"
+
+
+def setup_per_node_counter(c: Cluster) -> list[str]:
+    """Defines the per-node counter procedure and chain; returns each node's key (its node id)."""
+    set_procedure(c, PER_NODE_COUNTER_NAME, PER_NODE_COUNTER_PROC)
+    set_chain(c, [{"kind": "procedure", "name": PER_NODE_COUNTER_NAME}, {"kind": "last-write"}])
+    return [node_id(n) for n in c.nodes]
+
+
+def increment_own(n, doc: str, key: str) -> dict | None:
+    """The writer's half of the pattern: raise this node's own key, under compare-and-set."""
+    def bump(b):
+        counts = dict(b.get("counts") or {})
+        counts[key] = counts.get(key, 0) + 1
+        return {"counts": {k: counts[k] for k in sorted(counts)}}
+    return cas_update(n, doc, bump)
+
+
+def converged_full(c: Cluster, docs: list[str], timeout: float = 120.0) -> dict[str, dict]:
+    """Waits for convergence, then reads each document's FULL body on every node (the listing
+    converged_docs parses carries only a preview, which a counts map with node-id keys outgrows)
+    and checks they agree."""
+    c.wait_converged(timeout=timeout)
+    out: dict[str, dict] = {}
+    for d in docs:
+        bodies = [read_doc(n, d)[0] for n in c.running()]
+        assert all(b == bodies[0] for b in bodies), f"{d} differs across nodes: {bodies}"
+        out[d] = bodies[0]
+    return out
+
+
+def counter_total(body: dict) -> int:
+    """The reader's half: the counter's value is the sum over every node's key."""
+    return sum((body.get("counts") or {}).values())
+
+
+@pytest.mark.parametrize("size", SIZES)
+def test_procedure_per_node_counter_is_the_total_of_increments(make_cluster, size):
+    """The scenario that breaks local+remote-base (test_procedure_counter_sum_is_the_total_of_
+    increments), with the documented per-node counter instead: isolated increments, node i making
+    i+1 of them, merged in a fixed criss-crossing order; more increments on two merged nodes, and
+    on every node once the mesh is back. Every node must converge on each key holding exactly its
+    node's increments, and the total on the number of increments."""
+    c = make_cluster(size)
+    keys = setup_per_node_counter(c)
+    doc = doc_uuid(33)
+    must_write(c.nodes[0], doc, {"id": doc, "counts": {}})
+    settle(c)
+
+    made = [0] * size
+    st = Stages(c)
+    st.isolate()
+    for i, n in enumerate(c.nodes):
+        for _ in range(i + 1):
+            assert increment_own(n, doc, keys[i])
+            made[i] += 1
+    st.pull(0, 1)
+    st.pull(1, 2)
+    st.pull(2, 0)
+    if size == 5:
+        st.pull(3, 0)
+        st.pull(3, 2)
+        st.pull(4, 2)
+        st.pull(4, 1)
+    mid = {f"n{i}": read_doc(n, doc)[0]["counts"] for i, n in enumerate(c.nodes)}
+    for i in (0, 1):
+        assert increment_own(c.nodes[i], doc, keys[i])
+        made[i] += 1
+    st.mesh()
+    converged_full(c, [doc])
+    # Concurrent increments on a live mesh: every node at once, merged however the syncs fall.
+    for i, n in enumerate(c.nodes):
+        assert increment_own(n, doc, keys[i])
+        made[i] += 1
+
+    final = converged_full(c, [doc])[doc]
+    want = {keys[i]: made[i] for i in range(size)}
+    assert final["counts"] == want and counter_total(final) == sum(made), (
+        f"converged on {final['counts']} (total {counter_total(final)}), want {want} "
+        f"(total {sum(made)})\nafter the ordered merges: {mid}\n{st.log}\n" + graph_excerpt(c.nodes[0]))
 
 
 # -- 5. a chain ending in queue ----------------------------------------------------------------
@@ -855,17 +974,28 @@ def patch_step(n, docs: list[str], field: str):
 
 
 def fetch_graph(n) -> dict[str, list[str]]:
-    """The whole commit graph reachable from n's head, as {hash: parents}."""
+    """The whole commit graph reachable from n's head, as {hash: parents}.
+
+    The log API pages by `skip`, which it caps at 20,000, so a long history cannot be read that
+    way: a load loop writes as fast as the node lets it, and on fast hardware 12 seconds of it
+    is more than 20,000 commits (28,000 on one Linux run), where this once looped on the same
+    window for 50 minutes. Instead walk from each parent not yet seen, 500 ancestors at a time.
+    """
     out: dict[str, list[str]] = {}
-    skip = 0
-    while True:
-        status, body = control(n, "GET", ns_path(n, f"/log?limit=500&skip={skip}"), timeout=60)
+    todo = [""]  # "" is the head
+    while todo:
+        start = todo.pop()
+        if start and start in out:
+            continue
+        query = "limit=500" + (f"&from={start}" if start else "")
+        status, body = control(n, "GET", ns_path(n, f"/log?{query}"), timeout=60)
         assert status == 200, body
         for cm in body.get("commits") or []:
             out[cm["hash"]] = cm.get("parents") or []
-        if not body.get("hasMore"):
-            return out
-        skip = body["nextSkip"]
+        # The window is cut at 500 commits, so some of its parents are outside it: continue
+        # from every parent that has not been read.
+        todo.extend({p for parents in out.values() for p in parents if p not in out} - set(todo))
+    return out
 
 
 def descends(graph: dict[str, list[str]], commit: str, ancestor: str) -> bool:
@@ -884,10 +1014,6 @@ def descends(graph: dict[str, list[str]], commit: str, ancestor: str) -> bool:
 @pytest.mark.slow
 @pytest.mark.parametrize("kills", [0, pytest.param(2, marks=pytest.mark.destructive)])
 @pytest.mark.parametrize("size", SIZES)
-@pytest.mark.xfail(strict=False, reason=(
-    "wrong merge base (see test_field_merge_against_the_true_merge_base): under load a merge is "
-    "handed an older or a second nearest ancestor, field-merge sees a field both sides 'changed', "
-    "and last-write drops the other side's recent field writes"))
 def test_load_field_merge_keeps_each_nodes_own_field(make_cluster, size, kills):
     """Every node patches its own field of the same documents as fast as it can (with kills: one
     node is killed and restarted twice). No two nodes ever write the same field, so field-merge
@@ -960,8 +1086,10 @@ def test_load_source_priority_top_node_wins(make_cluster, size):
 @pytest.mark.destructive
 @pytest.mark.parametrize("size", SIZES)
 @pytest.mark.xfail(strict=False, reason=(
-    "criss-cross merges hand a base-relative procedure one of several merge bases "
-    "(see test_procedure_counter_sum_is_the_total_of_increments); under load the total drifts"))
+    "documented anti-pattern: local+remote-base is not a join of states (see "
+    "test_procedure_counter_sum_is_the_total_of_increments); under load equal values are never "
+    "offered, merge results feed further merges, and the total drifts. Not strict: a quiet run "
+    "can merge only fast-forwards"))
 def test_load_procedure_counter_sum(make_cluster, size):
     """Every node increments the same counters under compare-and-set while one node is killed;
     the summing procedure must converge on exactly the number of acknowledged increments."""
@@ -984,6 +1112,56 @@ def test_load_procedure_counter_sum(make_cluster, size):
     acked = {d: sum(1 for lp in loops for x in lp.acks if x == d) for d in docs}
     got = {d: final[d]["n"] for d in docs}
     assert got == acked, f"counter totals {got}, acknowledged increments {acked}"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("kills", [0, pytest.param(1, marks=pytest.mark.destructive)])
+@pytest.mark.parametrize("size", SIZES)
+def test_load_procedure_per_node_counter(make_cluster, size, kills):
+    """The documented per-node counter under load: every node increments its own key of the same
+    counters as fast as compare-and-set lets it (with kills: one node killed and restarted). The
+    mesh must converge on each key holding its node's acknowledged increments, and the total on
+    all of them."""
+    c = make_cluster(size)
+    keys = setup_per_node_counter(c)
+    docs = [doc_uuid(125 + k) for k in range(2)]
+    for d in docs:
+        must_write(c.nodes[0], d, {"id": d, "counts": {}})
+    settle(c)
+
+    def step_for(i, n):
+        def step(k):
+            d = docs[k % len(docs)]
+            ack = increment_own(n, d, keys[i])
+            return (d, ack["counts"][keys[i]]) if ack else None
+        return step
+
+    loops = [Loop(step_for(i, n)) for i, n in enumerate(c.nodes)]
+    run_load(c, loops, seconds=12, kills=kills, seed=300 + size)
+    final = converged_full(c, docs, timeout=180)
+    # Each acknowledged increment wrote its node's key one higher than the node last saw it, so a
+    # key's acknowledged values must rise by exactly one each time (nothing lost or doubled on its
+    # own node), and the converged key must hold the last of them (nothing lost or doubled by the
+    # merges). The one allowance: a write the kill cut off after it committed but before it was
+    # acknowledged - the next acknowledged write on that node then skips a value.
+    wrong, totals = [], {}
+    for d in docs:
+        got = final[d]["counts"]
+        acked_total = 0
+        for i, lp in enumerate(loops):
+            vals = [v for dd, v in lp.acks if dd == d]
+            acked_total += len(vals)
+            gaps = sum(b - a - 1 for a, b in zip([0] + vals, vals))
+            if gaps and not kills or any(b <= a for a, b in zip(vals, vals[1:])):
+                wrong.append((d[-6:], f"n{i}", "acknowledged values", vals[:5], "...", vals[-5:]))
+            last = vals[-1] if vals else 0
+            if got.get(keys[i], 0) not in ((last, last + 1) if kills else (last,)):
+                wrong.append((d[-6:], f"n{i}", "converged", got.get(keys[i]), "last acked", last))
+        totals[d[-6:]] = (counter_total(final[d]), acked_total)
+    print(f"per-node counter totals (converged, acknowledged): {totals}")
+    assert not wrong, f"per-node counter wrong: {wrong}\ntotals {totals}"
+    if not kills:
+        assert all(got == acked for got, acked in totals.values()), totals
 
 
 @pytest.mark.slow

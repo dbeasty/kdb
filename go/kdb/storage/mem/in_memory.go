@@ -237,6 +237,17 @@ func (a *InMemoryStorageAdapter) TreeAt(treeHash codec.Hash) (document.DocumentT
 	return tree, ok, nil
 }
 
+// CountDocuments implements storage.DocumentCounter.
+func (a *InMemoryStorageAdapter) CountDocuments(_ string, treeHash codec.Hash) (int, bool, error) {
+	a.treesMu.Lock()
+	defer a.treesMu.Unlock()
+	tree, ok := a.trees[treeHash]
+	if !ok {
+		return 0, false, nil
+	}
+	return tree.Size(), true, nil
+}
+
 // StoreForeignTree implements storage.ForeignTreeStore.
 func (a *InMemoryStorageAdapter) StoreForeignTree(namespaceID string, tree document.DocumentTree, bodies map[codec.UUID]string) error {
 	docs := make([]document.Document, 0, tree.Size())

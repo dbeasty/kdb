@@ -6,11 +6,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/index"
 	"github.com/limidus/kdb/go/kdb/index/fusion"
 	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -23,8 +25,8 @@ import (
 // package stays free of any server or sql import, and the sql package never learns what a
 // registry is.
 //
-// Every method is safe for concurrent use: the registry is, and this type holds no mutable
-// state of its own beyond the pointers set at construction.
+// Every method is safe for concurrent use: the registry is, and this type's own persistence
+// state is guarded by persistMu and applyMu.
 type RegistryIndexProvider struct {
 	registry *index.Registry
 	runtime  *KdbServerRuntime
@@ -33,9 +35,25 @@ type RegistryIndexProvider struct {
 	// opts are the store options this registry was opened with, kept so a store added by
 	// CREATE INDEX is built the same way as one loaded from disk.
 	opts stores.Options
-	// flushed counts index-touching commits since the last save. Only ever touched from the
-	// commit path, which the write gate already serialises.
-	flushed int
+
+	// applyMu makes applying one commit to every store a single step with respect to a snapshot
+	// capture, so a capture never sees a commit half-applied. Commits already run one at a time
+	// under the write gate; the only other taker is the capture.
+	applyMu sync.Mutex
+	// inconsistent is set (under applyMu) when a commit failed part-way through its stores; no
+	// snapshot is written until a full rebuild clears it.
+	inconsistent bool
+
+	// persistMu serializes everything that writes the index directory or must not interleave
+	// with a snapshot capture: the flusher, DDL, rebuilds and Close. Taken before applyMu.
+	persistMu sync.Mutex
+	// saved is the store generation on disk for each index (under persistMu); savedHead is the
+	// head the manifests on disk name.
+	saved        map[codec.UUID]uint64
+	savedHead    codec.Hash
+	hasSavedHead bool
+	closed       bool
+	flusher      *indexFlusher
 }
 
 // NewRegistryIndexProvider wires reg to rt. rt supplies the head commit, document bodies for
@@ -49,6 +67,7 @@ func (p *RegistryIndexProvider) Registry() *index.Registry { return p.registry }
 
 var (
 	_ sql.IndexProvider    = (*RegistryIndexProvider)(nil)
+	_ sql.ExactCounter     = (*RegistryIndexProvider)(nil)
 	_ sql.IndexDDLExecutor = (*RegistryIndexProvider)(nil)
 	_ SearchProvider       = (*RegistryIndexProvider)(nil)
 )
@@ -100,6 +119,29 @@ func (p *RegistryIndexProvider) ExactLookup(ctx sql.QueryContext, field string, 
 		return nil, true, err
 	}
 	return ids, true, nil
+}
+
+// ExactCount is ExactLookup's size, without listing the ids (sql.ExactCounter).
+func (p *RegistryIndexProvider) ExactCount(ctx sql.QueryContext, field string, value sql.Cell) (int, bool, error) {
+	store, ok := p.keyedStore(field)
+	if !ok {
+		return 0, false, nil
+	}
+	counter, ok := store.(interface {
+		LookupCount(key index.Key, atCommit *codec.Hash) (int, error)
+	})
+	if !ok {
+		return 0, false, nil
+	}
+	key, ok := indexKeyForCell(value)
+	if !ok {
+		return 0, false, nil
+	}
+	n, err := counter.LookupCount(key, ctx.AtCommit)
+	if err != nil {
+		return 0, true, err
+	}
+	return n, true, nil
 }
 
 // RangeLookup answers an ordering or BETWEEN conjunct from a BTREE index. Stores scan the
@@ -170,24 +212,101 @@ func indexKeyForCell(c sql.Cell) (index.Key, bool) {
 
 // CreateIndex registers a new index and rebuilds it from the current head, so the index is
 // queryable the moment the statement returns rather than only covering later writes.
+//
+// A UNIQUE index is a unique *constraint*: uniqueness is enforced at commit from the namespace
+// schema's constraints, not by the index, so asking for one installs the constraint. On a
+// schemaless namespace that is a constraints-only schema (see schema.KdbSchema.IsSchemaless) -
+// checked against the data already there, recorded so it survives a restart and replicates, and
+// undone if anything after it fails. On a namespace with declared fields the constraint has to be
+// declared in the schema already, because changing a declared schema is a migration, not a side
+// effect of CREATE INDEX.
 func (p *RegistryIndexProvider) CreateIndex(stmt sql.StmtCreateIndex, ctx sql.QueryContext) error {
+	// Checked here, on the statement a user typed, and not in createIndexLocal: that is also how
+	// a stored or replicated definition is re-applied at startup, and a definition an earlier
+	// version accepted must not stop the namespace from opening.
+	constraint, err := uniqueConstraintFor(stmt, ctx.Schema)
+	if err != nil {
+		return err
+	}
+	if constraint != nil && p.runtime == nil {
+		return fmt.Errorf("index %s: a UNIQUE constraint needs a running server to enforce it", stmt.Name)
+	}
+	// A compound UNIQUE has no single-field lookup structure to build: it is the constraint alone.
+	constraintOnly := stmt.Unique && len(stmt.Fields) > 1 && stmt.Using == ""
 	if p.runtime == nil {
 		return p.createIndexLocal(stmt, ctx)
 	}
 	return p.runtime.Meta.Local(func() error {
-		if err := p.createIndexLocal(stmt, ctx); err != nil {
-			return err
+		previous := p.runtime.Schema()
+		if constraint != nil {
+			if err := p.runtime.SetSchemaChecked(*constraint); err != nil {
+				return fmt.Errorf("index %s: %w", stmt.Name, err)
+			}
+		}
+		undoSchema := func() {
+			if constraint != nil {
+				p.runtime.SetSchema(previous)
+			}
+		}
+		if !constraintOnly {
+			if err := p.createIndexLocal(stmt, ctx); err != nil {
+				undoSchema()
+				return err
+			}
 		}
 		// Recorded for replication. A definition that cannot be recorded is undone rather than
 		// left in place unrecorded: the next reconciliation would otherwise treat the stored
 		// definitions as the truth and quietly undo it anyway.
-		if err := p.runtime.Meta.RecordIndex(ctx.NamespaceID, stmt); err != nil {
-			p.registry.Remove(stmt.Name)
-			_ = p.runtime.saveIndexCatalog()
-			return err
+		if constraint != nil {
+			if err := p.runtime.Meta.RecordSchema(ctx.NamespaceID, *constraint); err != nil {
+				if !constraintOnly {
+					p.registry.Remove(stmt.Name)
+					_ = p.runtime.saveIndexCatalog()
+				}
+				undoSchema()
+				return err
+			}
+		}
+		if !constraintOnly {
+			if err := p.runtime.Meta.RecordIndex(ctx.NamespaceID, stmt); err != nil {
+				p.registry.Remove(stmt.Name)
+				_ = p.runtime.saveIndexCatalog()
+				undoSchema()
+				return err
+			}
 		}
 		return nil
 	})
+}
+
+// uniqueConstraintFor works out what a UNIQUE index statement needs from the schema. It returns
+// nil when the statement is not UNIQUE or the schema already enforces the tuple, the schema to
+// install when the namespace is schemaless, and an error when the namespace declares fields but
+// not this constraint.
+func uniqueConstraintFor(stmt sql.StmtCreateIndex, sch schema.KdbSchema) (*schema.KdbSchema, error) {
+	if !stmt.Unique {
+		return nil, nil
+	}
+	want := make([]string, 0, len(stmt.Fields))
+	for _, f := range stmt.Fields {
+		want = append(want, f.Path)
+	}
+	for _, tuple := range sch.UniqueTuples() {
+		if len(tuple) == len(want) && strings.Join(tuple, schema.FieldPathSeparator) == strings.Join(want, schema.FieldPathSeparator) {
+			return nil, nil
+		}
+	}
+	if !sch.IsSchemaless() {
+		return nil, fmt.Errorf(
+			"index %s: this namespace declares its fields, so a UNIQUE constraint on %s has to be "+
+				"declared in the schema (CREATE TABLE ... UNIQUE)",
+			stmt.Name, strings.Join(want, ", "))
+	}
+	next, err := sch.WithUniqueTuple(want, codec.TimestampNow())
+	if err != nil {
+		return nil, fmt.Errorf("index %s: %w", stmt.Name, err)
+	}
+	return &next, nil
 }
 
 // createIndexLocal is CreateIndex without recording - how a replicated definition is applied.
@@ -196,19 +315,33 @@ func (p *RegistryIndexProvider) createIndexLocal(stmt sql.StmtCreateIndex, ctx s
 	if err != nil {
 		return err
 	}
+	if p.runtime == nil {
+		_, err := p.registry.Add(desc)
+		return err
+	}
+	// Held from Add to the catalog write, so the flusher never captures the new store before
+	// it is built.
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
 	if _, err := p.registry.Add(desc); err != nil {
 		return err
 	}
-	if p.runtime == nil {
-		return nil
+	// An index of the same id dropped earlier may have left a snapshot whose manifest names
+	// this very head; it must not be read back as the new index's content.
+	if p.dir != "" && !p.closed {
+		if err := index.InvalidateStoreSnapshot(index.IndexDir(p.dir, desc.IndexID)); err != nil {
+			p.registry.Remove(desc.IndexName())
+			return err
+		}
+		delete(p.saved, desc.IndexID)
 	}
-	if err := p.runtime.rebuildIndex(desc.IndexID); err != nil {
+	if err := p.rebuildLocked([]codec.UUID{desc.IndexID}); err != nil {
 		// A rebuild that fails leaves a registered but empty index, which would answer
 		// queries with silently wrong results - the one outcome this layer exists to remove.
 		p.registry.Remove(desc.IndexName())
 		return err
 	}
-	return p.runtime.saveIndexCatalog()
+	return p.saveCatalogLocked()
 }
 
 // DropIndex removes an index by name.
@@ -226,13 +359,18 @@ func (p *RegistryIndexProvider) DropIndex(stmt sql.StmtDropIndex, ctx sql.QueryC
 
 // dropIndexLocal is DropIndex without recording.
 func (p *RegistryIndexProvider) dropIndexLocal(stmt sql.StmtDropIndex, ctx sql.QueryContext) error {
+	if p.runtime == nil {
+		if _, ok := p.registry.Remove(stmt.Name); !ok {
+			return fmt.Errorf("index not found: %s", stmt.Name)
+		}
+		return nil
+	}
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
 	if _, ok := p.registry.Remove(stmt.Name); !ok {
 		return fmt.Errorf("index not found: %s", stmt.Name)
 	}
-	if p.runtime == nil {
-		return nil
-	}
-	return p.runtime.saveIndexCatalog()
+	return p.saveCatalogLocked()
 }
 
 // descriptorFor builds the index descriptor a CREATE INDEX statement asks for, validating the

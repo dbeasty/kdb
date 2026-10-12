@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,7 +24,9 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/fsx"
 	"github.com/limidus/kdb/go/kdb/index/stores"
+	"github.com/limidus/kdb/go/kdb/memtune"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/policy"
 	"github.com/limidus/kdb/go/kdb/recovery"
@@ -79,6 +82,11 @@ func Main() {
 	fs.StringVar(&peerHTTPAddr, "peer-http", "", "also serve peer sync over WebSocket on this HTTP address (host:port), at /kdb/sync - what an application mounts syncnode.Node.Handler for. Peers dial ws://host:port/kdb/sync; a bearer token rides the upgrade request (token-env= on the peer spec). Plain HTTP: terminate TLS in front of it")
 	fs.DurationVar(&scrubInterval, "scrub-interval", 0, "how often to scrub every namespace: re-read and verify every live document against its content hash, repairing damaged ones from the --peer nodes by content hash (they need not be trusted). Reads every body, so scale it to the data - daily is typical. 0 disables; POST /v1/ns/{ns}/scrub runs one on demand")
 	fs.BoolVar(&streamAllowAnonymous, "stream-allow-anonymous", false, "accept stream (--stream-addr) subscribers without credentials, as every subscriber was before the stream handshake authenticated. Under --rbac this lets anyone read every commit in the namespace; without --rbac credentials are not checked anyway, so this changes nothing")
+	gcHeadroom := 25
+	if v, err := strconv.Atoi(os.Getenv("KDB_GC_HEADROOM_PERCENT")); err == nil {
+		gcHeadroom = v
+	}
+	fs.IntVar(&gcHeadroom, "gc-headroom-percent", gcHeadroom, "garbage-collector headroom above the live heap, as a percentage of it (default 25; $KDB_GC_HEADROOM_PERCENT). The Go default lets the heap grow to twice its live size between collections, which on a large dataset is a gigabyte of garbage per gigabyte of data; once the live heap passes 256 MiB the collector is paced to live + this headroom instead (at least 128 MiB, at most 2 GiB). 0 disables it and leaves the runtime default; an explicit GOGC environment variable always wins")
 	fs.StringVar(&configPath, "config", "", "JSON config file (see go/kdb/config's ServiceFile for the shape) - precedence is config file < KDB_* environment variables < explicitly-set flags")
 	fs.StringVar(&flagVals.DataDir, "data-dir", flagVals.DataDir, "filesystem data root")
 	fs.BoolVar(&flagVals.Memory, "memory", flagVals.Memory, "use in-memory runtime")
@@ -190,6 +198,12 @@ func Main() {
 		peerAddr = secureScheme(peerAddr)
 		streamAddr = secureScheme(streamAddr)
 		wsAddr = secureScheme(wsAddr)
+	}
+
+	if tuner := memtune.Start(memtune.Options{HeadroomPercent: gcHeadroom}); tuner.Active() {
+		defer tuner.Stop()
+		slog.Info("garbage-collector pacing follows the live heap", "headroom_percent", gcHeadroom,
+			"note", "GOGC stays at the runtime default below 256 MiB live; set GOGC or --gc-headroom-percent=0 to opt out")
 	}
 
 	// restartRequested carries a control-plane request to shut down and be restarted, which today
@@ -472,6 +486,19 @@ func Main() {
 			if _, err := sec.OpenIndexes(stores.Options{}); err != nil {
 				return nil, fmt.Errorf("opening indexes for %s: %w", id, err)
 			}
+			// A namespace opened on demand needs the same upkeep as one opened at startup: a
+			// history=none collection that never ran maintenance would grow without bound.
+			// Replaces (and stops) the loop of an earlier open of the same id, since the idle
+			// closer may have closed it in between.
+			if cfg.MaintenanceInterval > 0 && nsRT != nil {
+				busySrv := sec
+				maintenance.replace(id, embed.StartMaintenance(nsRT, embed.MaintenanceOptions{
+					Interval: cfg.MaintenanceInterval,
+					Sweep:    cfg.MaintenanceSweep,
+					MaxDefer: cfg.MaintenanceMaxDefer,
+					Busy:     func() bool { return busySrv.WriteQueueDepth() > 0 },
+				}))
+			}
 			return sec, nil
 		})
 	}
@@ -526,6 +553,7 @@ func Main() {
 		}
 		peerStatus = fmt.Sprintf("enabled (%s)", peerListener.Addr())
 	}
+	var peerHTTP *http.Server
 	if peerHTTPAddr != "" {
 		ln, err := net.Listen("tcp", peerHTTPAddr)
 		if err != nil {
@@ -534,7 +562,7 @@ func Main() {
 		}
 		mux := http.NewServeMux()
 		mux.Handle("/kdb/sync", node.Handler())
-		peerHTTP := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		peerHTTP = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		go func() { _ = peerHTTP.Serve(ln) }()
 		defer peerHTTP.Close()
 		ws := fmt.Sprintf("websocket ws://%s/kdb/sync", ln.Addr())
@@ -835,13 +863,17 @@ func Main() {
 	// Replication first: a sync in flight is a writer, and Stop waits for it to finish. The
 	// scrub loop likewise.
 	node.StopSync()
-	// Inbound peer sync likewise, and before BeginDraining: Close ends the sessions peers have
-	// open and waits for their handlers. A session left running past the drain had a push
-	// stored and then refused - no longer harmful, since a checkpoint leaves out commits never
-	// logged, but not quiescent either: it kept writing into the DAG while storage closed.
-	if peerListener != nil {
-		_ = peerListener.Close()
+	// Inbound peer sync likewise, and before BeginDraining: CloseInbound ends the sessions peers
+	// have open - on the TCP peer listener and on the WebSocket endpoint (--peer-http) alike - and
+	// waits for their handlers. A session left running past the drain had a push stored and then
+	// refused - no longer harmful, since a checkpoint leaves out commits never logged, but not
+	// quiescent either: it kept writing into the DAG while storage closed. The HTTP server is
+	// closed first so no new session starts; its Close does not end the WebSocket sessions
+	// themselves, which are hijacked connections.
+	if peerHTTP != nil {
+		_ = peerHTTP.Close()
 	}
+	node.CloseInbound()
 	// Before anything else: a pass that is mid-truncation holds the invariant that makes
 	// truncation safe (bodies flushed, checkpoint written, then segments deleted), and Stop waits
 	// for it rather than cutting it short.
@@ -893,6 +925,20 @@ type maintenanceRegistry struct {
 
 func newMaintenanceRegistry() *maintenanceRegistry {
 	return &maintenanceRegistry{byNS: map[string]*embed.MaintenanceScheduler{}}
+}
+
+// replace registers sched for namespaceID, stopping the scheduler it supersedes.
+func (m *maintenanceRegistry) replace(namespaceID string, sched *embed.MaintenanceScheduler) {
+	if sched == nil {
+		return
+	}
+	m.mu.Lock()
+	old := m.byNS[namespaceID]
+	m.byNS[namespaceID] = sched
+	m.mu.Unlock()
+	if old != nil {
+		old.Stop()
+	}
 }
 
 func (m *maintenanceRegistry) add(namespaceID string, sched *embed.MaintenanceScheduler) {
@@ -983,7 +1029,7 @@ func saveCostModelState(srv *server.KdbServerRuntime, path string) {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := fsx.Rename(tmp, path); err != nil {
 		return
 	}
 	slog.Info("cost model state saved", "path", path, "learned_cells", adm.Costs().LearnedCells())

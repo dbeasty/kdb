@@ -7,6 +7,7 @@ internal data class OpDto(
     val kind: String,
     val docId: String? = null,
     val patch: String? = null,
+    val replace: Boolean = false,
     val path: String? = null,
     val blobHashHex: String? = null,
     val migrationId: String? = null,

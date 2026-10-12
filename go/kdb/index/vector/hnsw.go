@@ -169,7 +169,13 @@ func (g *hnsw) greedy(q []float32, ep, l int) int {
 // searchLayer is the standard beam search at layer l returning up to ef results best-first.
 // Every node is traversed, but only nodes passing accept (nil = all) enter the result set.
 func (g *hnsw) searchLayer(q []float32, eps []int, ef, l int, accept func(*node) bool) []scored {
-	visited := make(map[int]struct{}, ef*4)
+	// The visited set can never hold more than the graph has nodes, so neither a large ef (a
+	// caller with no LIMIT asks for every document) nor ef*4 overflowing may size it.
+	hint := len(g.nodes)
+	if ef < hint/4 {
+		hint = ef * 4
+	}
+	visited := make(map[int]struct{}, hint)
 	cands := &scoredHeap{better: bestFirst}
 	results := &scoredHeap{better: worstFirst}
 	for _, ep := range eps {
@@ -217,9 +223,18 @@ func (g *hnsw) search(q []float32, k, efSearch int, accept func(*node) bool) []s
 	for l := g.maxLevel; l > 0; l-- {
 		ep = g.greedy(q, ep, l)
 	}
+	// k and ef beyond the number of nodes ask for nothing more than "all of them": clamp them so
+	// a query with no LIMIT (k up to MaxInt) neither sizes an allocation by k nor lets the beam
+	// grow past the graph.
+	if k > len(g.nodes) {
+		k = len(g.nodes)
+	}
 	ef := efSearch
 	if ef < k {
 		ef = k
+	}
+	if ef > len(g.nodes) {
+		ef = len(g.nodes)
 	}
 	w := g.searchLayer(q, []int{ep}, ef, 0, accept)
 	if len(w) > k {

@@ -132,10 +132,13 @@ type ServiceSettings struct {
 // DefaultServiceSettings mirrors the flag defaults declared in cmd/kdb-service.
 func DefaultServiceSettings() ServiceSettings {
 	return ServiceSettings{
-		Namespace:  "demo/users",
-		SQLAddr:    "tcp://127.0.0.1:9090?bind=true",
-		PeerAddr:   "tcp://127.0.0.1:9091?bind=true",
-		StreamAddr: "tcp://127.0.0.1:9092?bind=true",
+		Namespace: "demo/users",
+		SQLAddr:   "tcp://127.0.0.1:9090?bind=true",
+		// Peer sync and stream listeners are off by default: a default-bound fixed port makes a
+		// second instance on the same host (staging, restore drill, tests) fail to start. Enable
+		// them with --peer-addr / --stream-addr when the namespace actually syncs or streams.
+		PeerAddr:   "",
+		StreamAddr: "",
 		// Off by default: a browser-reachable port is a deliberate exposure decision, not
 		// something an operator should discover already listening.
 		WSAddr:       "",

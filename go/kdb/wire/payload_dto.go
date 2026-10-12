@@ -141,6 +141,7 @@ type handshakeAckDto struct {
 	ProtocolVersion    int               `json:"protocolVersion"`
 	RemoteHeads        map[string]string `json:"remoteHeads"`
 	RejectionReason    *string           `json:"rejectionReason,omitempty"`
+	ServerVersion      string            `json:"serverVersion,omitempty"`
 }
 
 type deltaCommitDto struct {
@@ -267,6 +268,8 @@ type sqlExecDto struct {
 	SessionID      string  `json:"sessionId"`
 	SQL            string  `json:"sql"`
 	ParametersJSON *string `json:"parametersJson"`
+	PageSize       int     `json:"pageSize,omitempty"`
+	Continuation   string  `json:"continuation,omitempty"`
 }
 
 type sqlResultDto struct {
@@ -283,6 +286,8 @@ type sqlResultDto struct {
 	// doc comment (kdb-spec-layer13 Component 51 §8.1).
 	ErrorCode    *ErrorCode `json:"errorCode,omitempty"`
 	RetryAfterMs *int       `json:"retryAfterMs,omitempty"`
+	// Continuation is the paged-SELECT token (SqlResultMessage.ContinuationToken).
+	Continuation string `json:"continuation,omitempty"`
 }
 
 type txCommitDto struct {
@@ -297,9 +302,12 @@ type txRollbackDto struct {
 }
 
 type opDto struct {
-	Kind             string  `json:"kind"`
-	DocID            *string `json:"docId,omitempty"`
-	Patch            *string `json:"patch,omitempty"`
+	Kind  string  `json:"kind"`
+	DocID *string `json:"docId,omitempty"`
+	Patch *string `json:"patch,omitempty"`
+	// Replace marks a write whose patch is the whole document rather than a merge patch.
+	// Additive and omitted when false, so every existing frame and golden fixture is unchanged.
+	Replace          bool    `json:"replace,omitempty"`
 	Path             *string `json:"path,omitempty"`
 	BlobHashHex      *string `json:"blobHashHex,omitempty"`
 	MigrationID      *string `json:"migrationId,omitempty"`

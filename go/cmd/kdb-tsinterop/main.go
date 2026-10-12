@@ -30,6 +30,7 @@ import (
 func main() {
 	addr := flag.String("addr", "ws://127.0.0.1:0/kdb", "WebSocket listen URI")
 	namespace := flag.String("namespace", "app/users", "namespace to serve")
+	maxRows := flag.Int("max-result-rows", 0, "most rows one SQL reply may carry (0 = the server default)")
 	flag.Parse()
 
 	runtime, err := embed.OpenMemoryRuntime(embed.CatalogFromNamespace(*namespace), *namespace, schema.None())
@@ -38,6 +39,9 @@ func main() {
 		os.Exit(1)
 	}
 	srv := server.NewKdbServerRuntime(runtime)
+	if *maxRows > 0 {
+		srv.SetMaxResultRows(*maxRows)
+	}
 
 	listener, err := server.ListenSqlWireWS(*addr, srv)
 	if err != nil {

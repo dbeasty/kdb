@@ -171,9 +171,16 @@ func (d *InMemoryCommitDag) writeGraph(forceFull bool) (bool, error) {
 	full := kind == graphWriteFull
 	// Generations go into the segment, so they must be sound before they are copied.
 	d.ensureGenerationsLocked()
+	// Commits a checkpoint must leave out - unlogged, and everything descending from one - must
+	// not reach a segment either, or a checkpoint that references the segment would bring them
+	// back. See unloggedClosureLocked.
+	excluded := d.unloggedClosureLocked()
 	snap := d.nodes.snapshotForSegment(full,
 		func(h codec.Hash, r []byte) bool {
 			if d.nodes.namespaces[recNsIdx(r)] != d.NamespaceID {
+				return false
+			}
+			if _, ok := excluded[h]; ok {
 				return false
 			}
 			// Commits that may yet be taken back stay resident: a group part not yet decided,

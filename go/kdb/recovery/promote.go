@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/fsx"
 	"github.com/limidus/kdb/go/kdb/integrity"
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
@@ -137,12 +138,12 @@ func StagePromotion(dataRoot, stagedRoot, namespaceID string, in PromotionIntent
 
 	payload := filepath.Join(dataRoot, promotePayloadDir)
 	// A leftover payload is from an abandoned request, not from this one.
-	if err := os.RemoveAll(payload); err != nil {
+	if err := fsx.RemoveAll(payload); err != nil {
 		return nil, fmt.Errorf("clearing a previous staged promotion: %w", err)
 	}
 	bytes, err := copyTree(source, NamespaceDir(payload, namespaceID))
 	if err != nil {
-		_ = os.RemoveAll(payload)
+		_ = fsx.RemoveAll(payload)
 		return nil, fmt.Errorf("copying the staged namespace into the data root: %w", err)
 	}
 	// The marker, when the staged copy has none. Written into the payload rather than into the
@@ -152,7 +153,7 @@ func StagePromotion(dataRoot, stagedRoot, namespaceID string, in PromotionIntent
 		if _, err := os.Stat(filepath.Join(source, "meta.json")); os.IsNotExist(err) {
 			dest := filepath.Join(NamespaceDir(payload, namespaceID), "meta.json")
 			if err := os.WriteFile(dest, marker, 0o644); err != nil {
-				_ = os.RemoveAll(payload)
+				_ = fsx.RemoveAll(payload)
 				return nil, fmt.Errorf("writing the namespace marker: %w", err)
 			}
 			bytes += int64(len(marker))
@@ -165,7 +166,7 @@ func StagePromotion(dataRoot, stagedRoot, namespaceID string, in PromotionIntent
 	if _, err := os.Stat(checkpointPath(stagedRoot, namespaceID)); err == nil {
 		n, err := copyFile(checkpointPath(stagedRoot, namespaceID), checkpointPath(payload, namespaceID))
 		if err != nil {
-			_ = os.RemoveAll(payload)
+			_ = fsx.RemoveAll(payload)
 			return nil, fmt.Errorf("copying the staged checkpoint: %w", err)
 		}
 		bytes += n
@@ -179,7 +180,7 @@ func StagePromotion(dataRoot, stagedRoot, namespaceID string, in PromotionIntent
 		in.RequestedAt = time.Now().UTC()
 	}
 	if err := writeJSONFile(filepath.Join(dataRoot, promoteIntentFile), in); err != nil {
-		_ = os.RemoveAll(payload)
+		_ = fsx.RemoveAll(payload)
 		return nil, fmt.Errorf("recording the promotion: %w", err)
 	}
 	return &in, nil
@@ -201,12 +202,12 @@ func AbandonPromotion(dataRoot string) (bool, error) {
 	if err != nil || in == nil {
 		return false, err
 	}
-	if err := os.Remove(filepath.Join(dataRoot, promoteIntentFile)); err != nil && !os.IsNotExist(err) {
+	if err := fsx.Remove(filepath.Join(dataRoot, promoteIntentFile)); err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
 	// The intent goes first: with it gone, nothing will act on the payload even if removing it
 	// fails halfway.
-	if err := os.RemoveAll(filepath.Join(dataRoot, promotePayloadDir)); err != nil {
+	if err := fsx.RemoveAll(filepath.Join(dataRoot, promotePayloadDir)); err != nil {
 		return true, fmt.Errorf("the promotion was cancelled, but its staged copy could not be "+
 			"removed: %w", err)
 	}
@@ -249,11 +250,11 @@ func ApplyPromotion(dataRoot string, now func() time.Time) (*PromotionOutcome, e
 
 	// The intent is cleared whatever happened, and before the outcome is written: if writing the
 	// outcome fails, the promotion must still not be attempted again.
-	if rmErr := os.Remove(filepath.Join(dataRoot, promoteIntentFile)); rmErr != nil && !os.IsNotExist(rmErr) {
+	if rmErr := fsx.Remove(filepath.Join(dataRoot, promoteIntentFile)); rmErr != nil && !os.IsNotExist(rmErr) {
 		return &out, fmt.Errorf("could not clear the promotion intent at %s, so the next startup "+
 			"would attempt it again: %w", dataRoot, rmErr)
 	}
-	_ = os.RemoveAll(filepath.Join(dataRoot, promotePayloadDir))
+	_ = fsx.RemoveAll(filepath.Join(dataRoot, promotePayloadDir))
 	if wErr := writeJSONFile(filepath.Join(dataRoot, promoteOutcomeFile), out); wErr != nil && err == nil {
 		err = fmt.Errorf("the promotion succeeded but could not be recorded: %w", wErr)
 	}
@@ -296,14 +297,14 @@ func applyPayload(dataRoot string, in PromotionIntent, now func() time.Time) (su
 			if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
 				return "", mkErr
 			}
-			if mvErr := os.Rename(live, dest); mvErr != nil {
+			if mvErr := fsx.Rename(live, dest); mvErr != nil {
 				return "", fmt.Errorf("moving the live namespace aside: %w", mvErr)
 			}
 			superseded = filepath.ToSlash(rel)
 			// The old checkpoint describes the log that just moved, so it goes with it.
 			if _, cErr := os.Stat(checkpointPath(dataRoot, in.Namespace)); cErr == nil {
 				_ = os.MkdirAll(filepath.Join(dest, "_checkpoint"), 0o755)
-				_ = os.Rename(checkpointPath(dataRoot, in.Namespace),
+				_ = fsx.Rename(checkpointPath(dataRoot, in.Namespace),
 					filepath.Join(dest, "_checkpoint", "checkpoint"))
 			}
 		}
@@ -311,7 +312,7 @@ func applyPayload(dataRoot string, in PromotionIntent, now func() time.Time) (su
 		if mkErr := os.MkdirAll(filepath.Dir(live), 0o755); mkErr != nil {
 			return superseded, mkErr
 		}
-		if mvErr := os.Rename(source, live); mvErr != nil {
+		if mvErr := fsx.Rename(source, live); mvErr != nil {
 			return superseded, fmt.Errorf("installing the staged namespace: %w", mvErr)
 		}
 	}
@@ -323,16 +324,16 @@ func applyPayload(dataRoot string, in PromotionIntent, now func() time.Time) (su
 		if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
 			return superseded, mkErr
 		}
-		if mvErr := os.Rename(checkpointPath(payload, in.Namespace), dest); mvErr != nil {
+		if mvErr := fsx.Rename(checkpointPath(payload, in.Namespace), dest); mvErr != nil {
 			// A missing checkpoint costs a full replay, not correctness, so this is not worth
 			// failing a completed promotion over - but a *stale* one would be read as describing
 			// the new log, so it must go.
-			_ = os.Remove(dest)
+			_ = fsx.Remove(dest)
 		}
 	} else {
 		// No checkpoint came with the payload: the live one, if any, describes a log that is no
 		// longer there.
-		_ = os.Remove(checkpointPath(dataRoot, in.Namespace))
+		_ = fsx.Remove(checkpointPath(dataRoot, in.Namespace))
 	}
 	if _, statErr := os.Stat(live); statErr != nil {
 		return superseded, fmt.Errorf("the namespace is not in place at %s after the promotion", live)
@@ -359,9 +360,9 @@ func SameFilesystem(a, b string) (bool, error) {
 
 func deviceOf(path string) (uint64, error) {
 	for {
-		info, err := os.Stat(path)
+		_, err := os.Stat(path)
 		if err == nil {
-			return deviceID(info)
+			return deviceID(path)
 		}
 		if !os.IsNotExist(err) {
 			return 0, err
@@ -375,10 +376,13 @@ func deviceOf(path string) (uint64, error) {
 }
 
 func countVerifiedCommits(dataRoot, namespaceID string) (int, error) {
-	shim, err := shimFor(dataRoot)
+	shim, store, err := shimFor(dataRoot)
 	if err != nil {
 		return 0, err
 	}
+	// Closed before returning: the store caches segment handles, and on Windows an open file
+	// anywhere inside the namespace directory makes the rename that installs it fail.
+	defer store.Close()
 	commits, err := integrity.ScanVerifiedCommits(shim, namespaceID)
 	if err != nil {
 		return 0, err
@@ -386,13 +390,13 @@ func countVerifiedCommits(dataRoot, namespaceID string) (int, error) {
 	return len(commits), nil
 }
 
-func shimFor(dataRoot string) (storage.PlatformIOShim, error) {
+func shimFor(dataRoot string) (storage.PlatformIOShim, *storio.OSByteStore, error) {
 	root := dataRoot
 	store, err := storio.NewOSByteStore(storio.PlatformIOConfig{RootDirectory: &root})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return storio.NewFileBackedPlatformIO(storio.PlatformIOConfig{RootDirectory: &root}, store), nil
+	return storio.NewFileBackedPlatformIO(storio.PlatformIOConfig{RootDirectory: &root}, store), store, nil
 }
 
 // copyTree copies a directory recursively, returning the bytes written. Files are synced: this copy
@@ -465,7 +469,7 @@ func writeJSONFile(path string, v any) error {
 	if err := os.WriteFile(tmp, body, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return fsx.Rename(tmp, path)
 }
 
 func readJSONFile(path string, v any) (bool, error) {

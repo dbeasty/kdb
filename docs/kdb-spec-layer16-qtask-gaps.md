@@ -372,6 +372,11 @@ Accepted forms: an RFC 3339 string, or a number of epoch milliseconds. Any other
   `DeleteOp`s in batches of at most 500 per commit with the runtime's system principal under the
   LAST_WRITE engine, message `expiry sweep`. It is a goroutine/coroutine owned by the runtime,
   stopped on close, and never runs on a read-only runtime.
+- Hidden vs deleted: the read-side predicate is evaluated against the wall clock on every read
+  at head, so a document is invisible at exactly `timestamp + grace`; physical deletion waits for
+  the next sweep. Both are pure functions of the stored body and the clock, hence unchanged by a
+  restart (a document that expired while the server was down is hidden on first read, deleted by
+  the first sweep). Pinned by `TestExpirySurvivesRestart`.
 - `kdb-service` flags (both): `--expire-field <path>`, `--expire-grace <duration>`,
   `--expire-interval <duration>`.
 

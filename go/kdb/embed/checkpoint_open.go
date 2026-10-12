@@ -233,9 +233,15 @@ func saveCheckpoint(
 	if err != nil {
 		return err
 	}
-	// Under history=full with graph segments attached, the checkpoint names the segments
-	// instead of carrying their commits - see dag.CheckpointSnapshotWithGraph.
-	state, graphRefs, graphHidden := d.CheckpointSnapshotWithGraph(commitRetentionFilter(eng))
+	// Refused, not trimmed, when main names a commit the log does not hold (a peer adoption whose
+	// log write failed): the previous checkpoint and the log after it are what the namespace
+	// really is, and the next open rebuilds that - see dag.CheckpointSnapshotLogged. Under
+	// history=full with graph segments attached, the checkpoint names the segments instead of
+	// carrying their commits - see dag.CheckpointSnapshotWithGraph, which refuses the same way.
+	state, graphRefs, graphHidden, err := d.CheckpointSnapshotWithGraph(commitRetentionFilter(eng))
+	if err != nil {
+		return err
+	}
 	var headPayloads [][]byte
 	// Shallow roots' operations, whether or not a branch still names them: they arrived with a
 	// snapshot, so no segment holds them to load back.

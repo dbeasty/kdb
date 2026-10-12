@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/limidus/kdb/go/kdb/auth"
+	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/metrics"
 	"github.com/limidus/kdb/go/kdb/schema"
@@ -115,5 +118,52 @@ func TestAdminPprofAndExpvarRespond(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("%s = %d, want 200", path, code)
 		}
+	}
+}
+
+// The size gauges must follow the head: documents appear in kdb_namespace_documents and
+// /healthz as they are written and disappear when deleted, and commits count up.
+func TestAdminNamespaceSizeGauges(t *testing.T) {
+	admin, srv := newAdminForTest(t)
+
+	_, body := adminGet(t, admin, "/metrics")
+	for _, want := range []string{
+		`kdb_namespace_documents{namespace="adm/ns"} 0`,
+		`kdb_namespace_commits{namespace="adm/ns"} `,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("empty namespace: metrics missing %q:\n%s", want, body)
+		}
+	}
+
+	var ids []codec.UUID
+	for i := 0; i < 3; i++ {
+		id, _ := codec.RandomUUID()
+		if _, err := srv.Upsert("adm/ns", id, fmt.Sprintf(`{"i":%d}`, i), auth.Principal{ID: "t"}); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	_, body = adminGet(t, admin, "/metrics")
+	if !strings.Contains(body, `kdb_namespace_documents{namespace="adm/ns"} 3`) {
+		t.Fatalf("after 3 upserts:\n%s", body)
+	}
+	_, health := adminGet(t, admin, "/healthz")
+	if !strings.Contains(health, "namespace.adm/ns.documents=3\n") || !strings.Contains(health, "version=") {
+		t.Fatalf("healthz should keep its fields and add the document count: %q", health)
+	}
+
+	base, _ := srv.dag.Head()
+	tx := document.Transaction{
+		ID: mustRandomUUID(t), BaseVersion: base,
+		Operations: []document.Op{document.DeleteOp{DocID: ids[0]}},
+		Timestamp:  codec.TimestampNow(),
+	}
+	if _, err := srv.Commit("adm/ns", tx, "s", auth.Principal{ID: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	_, body = adminGet(t, admin, "/metrics")
+	if !strings.Contains(body, `kdb_namespace_documents{namespace="adm/ns"} 2`) {
+		t.Fatalf("after a delete:\n%s", body)
 	}
 }

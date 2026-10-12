@@ -407,6 +407,7 @@ internal class SqlExecutor(
                 (env.scores[plan.scoreExpr] ?: throw SqlPlanningException("ranking missing for ${plan.scoreExpr}", ""))
                     .keys.toList()
             is PhysicalPlan.FullTableScan -> fullScan(context, commitDag)
+            is PhysicalPlan.KeyLookup -> plan.ids
         }
 
     private suspend fun inListScan(
@@ -445,8 +446,13 @@ internal class SqlExecutor(
         val atCommit = context.atCommit ?: commitDag.head()
         val treeHash = commitDag.getCommitOrThrow(atCommit).documentTreeHash
         val ids = mutableListOf<KdbUuid>()
+        var examined = 0
         storage.scanDocuments(context.namespaceId, treeHash, batchSize = 256) { batch ->
-            ids += batch.map { it.id }
+            for (d in batch) {
+                examined++
+                if (context.rowBudget > 0 && examined > context.rowBudget) throw SqlRowBudgetException(context.rowBudget)
+                ids += d.id
+            }
         }
         return ids
     }
@@ -460,7 +466,10 @@ internal class SqlExecutor(
     ): List<KdbUuid> {
         val atCommit = context.atCommit ?: commitDag.head()
         val treeHash = commitDag.getCommitOrThrow(atCommit).documentTreeHash
+        var examined = 0
         return ids.filter { id ->
+            examined++
+            if (context.rowBudget > 0 && examined > context.rowBudget) throw SqlRowBudgetException(context.rowBudget)
             val doc = storage.getDocument(context.namespaceId, id, treeHash) ?: return@filter false
             SqlPredicate.eval(predicate, doc, env)
         }

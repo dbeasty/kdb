@@ -1,6 +1,8 @@
 package dag
 
 import (
+	"errors"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 )
@@ -60,19 +62,56 @@ func (d *InMemoryCommitDag) CheckpointSnapshot() CheckpointState {
 // can read - and, because the DAG then holds them, that no sync would fetch
 // again. Leaving them out reopens the namespace as a crash would have: without
 // them, and with the next sync fetching them afresh. See unlogged.go.
+//
+// So is every commit descending from one of them: replay cannot admit a commit whose parent it
+// never stored, so a log frame for such a commit is no better than none. See
+// CheckpointSnapshotLogged for the case where main itself is among them.
 func (d *InMemoryCommitDag) CheckpointSnapshotRetaining(keep func(document.Commit) bool) CheckpointState {
+	state, _ := d.checkpointSnapshot(keep)
+	return state
+}
+
+// ErrHeadNotLogged is a checkpoint refused because main names a commit the delta log does not
+// hold: one received from a peer and never logged, or one built on such a commit.
+var ErrHeadNotLogged = errors.New("kdb: main names a commit the delta log does not hold")
+
+// CheckpointSnapshotLogged is CheckpointSnapshotRetaining for a checkpoint that will be written,
+// refusing (ErrHeadNotLogged) when main names a commit it would have to leave out.
+//
+// Main moves before its new commits are logged - adopting a peer's head, or a merge made here,
+// is decided and applied under the write serialization, and the log write can still fail after
+// that. A checkpoint cannot drop main the way it drops other refs, and keeping it would describe
+// a head whose history the log does not have. Writing nothing is what leaves the namespace
+// correct: the next open uses the previous checkpoint and replays the log after it, which is
+// exactly what a crash would have left.
+func (d *InMemoryCommitDag) CheckpointSnapshotLogged(keep func(document.Commit) bool) (CheckpointState, error) {
+	state, mainUnlogged := d.checkpointSnapshot(keep)
+	if mainUnlogged {
+		return CheckpointState{}, ErrHeadNotLogged
+	}
+	return state, nil
+}
+
+// checkpointSnapshot is CheckpointSnapshotRetaining, also reporting whether main names a commit
+// it left out for want of a log frame.
+func (d *InMemoryCommitDag) checkpointSnapshot(keep func(document.Commit) bool) (CheckpointState, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.checkpointSnapshotLocked(keep, false)
 }
 
-// checkpointSnapshotLocked is CheckpointSnapshotRetaining's body. residentOnly limits it to the
-// resident tier, for a checkpoint that references the graph segments for the rest (see
+// checkpointSnapshotLocked is checkpointSnapshot's body. residentOnly limits it to the resident
+// tier, for a checkpoint that references the graph segments for the rest (see
 // CheckpointSnapshotWithGraph). Must hold mu.
-func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) bool, residentOnly bool) CheckpointState {
+func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) bool, residentOnly bool) (CheckpointState, bool) {
+	excluded := d.unloggedClosureLocked()
 	unlogged := func(h codec.Hash) bool {
-		_, ok := d.unlogged[h]
+		_, ok := excluded[h]
 		return ok
+	}
+	mainUnlogged := false
+	if b, ok := d.branches[mainBranch]; ok {
+		mainUnlogged = unlogged(b.HeadHash)
 	}
 	pinned := make(map[codec.Hash]struct{}, len(d.branches)+len(d.tags))
 	for _, b := range d.branches {
@@ -130,7 +169,66 @@ func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) 
 		}
 		state.Tags = append(state.Tags, t)
 	}
-	return state
+	return state, mainUnlogged
+}
+
+// unloggedClosureLocked is every resident commit that is unlogged or descends from one, walking
+// parents the way ancestry does (expandParentsLocked): a shallow root's parents and a stub's are
+// not followed, so the history a deepen is still logging below a root does not take the root -
+// which its snapshot made durable - out with it. nil when nothing is unlogged.
+func (d *InMemoryCommitDag) unloggedClosureLocked() map[codec.Hash]struct{} {
+	if len(d.unlogged) == 0 {
+		return nil
+	}
+	const (
+		unknown = iota
+		visiting
+		clean
+		tainted
+	)
+	state := make(map[codec.Hash]uint8, len(d.unlogged))
+	out := make(map[codec.Hash]struct{}, len(d.unlogged))
+	for h := range d.unlogged {
+		state[h] = tainted
+		out[h] = struct{}{}
+	}
+	// Iterative post-order: the history behind a commit is as deep as the namespace's log.
+	var stack []codec.Hash
+	// Every commit, graph segments included: a commit that descends from an unlogged one is
+	// newer than it, but may still have been flushed before this ran.
+	var starts []codec.Hash
+	d.nodes.forEach(func(h codec.Hash) { starts = append(starts, h) })
+	for _, start := range starts {
+		if state[start] != unknown {
+			continue
+		}
+		stack = append(stack[:0], start)
+		for len(stack) > 0 {
+			h := stack[len(stack)-1]
+			if state[h] == unknown {
+				state[h] = visiting
+				for _, p := range d.expandParentsLocked(h) {
+					if d.nodes.has(p) && state[p] == unknown {
+						stack = append(stack, p)
+					}
+				}
+				continue
+			}
+			stack = stack[:len(stack)-1]
+			if state[h] != visiting {
+				continue
+			}
+			state[h] = clean
+			for _, p := range d.expandParentsLocked(h) {
+				if state[p] == tainted {
+					state[h] = tainted
+					out[h] = struct{}{}
+					break
+				}
+			}
+		}
+	}
+	return out
 }
 
 // RestoreCheckpoint rebuilds the commit graph and refs from a checkpoint,

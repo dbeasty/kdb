@@ -71,6 +71,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				ProtocolVersion:    m.Response.ProtocolVersion,
 				RemoteHeads:        m.Response.RemoteHeads,
 				RejectionReason:    m.Response.RejectionReason,
+				ServerVersion:      m.Response.ServerVersion,
 			},
 		}, nil
 	case DeltaCommitMessage:
@@ -253,6 +254,8 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				SessionID:      m.SessionID,
 				SQL:            m.SQL,
 				ParametersJSON: m.ParametersJSON,
+				PageSize:       m.PageSize,
+				Continuation:   m.Continuation,
 			},
 		}, nil
 	case SqlResultMessage:
@@ -270,6 +273,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				GeneratedIDs:      m.GeneratedIDs,
 				ErrorCode:         m.ErrorCode,
 				RetryAfterMs:      m.RetryAfterMs,
+				Continuation:      m.ContinuationToken,
 			},
 		}, nil
 	case TxCommitMessage:
@@ -378,6 +382,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 				ProtocolVersion:    a.ProtocolVersion,
 				RemoteHeads:        a.RemoteHeads,
 				RejectionReason:    a.RejectionReason,
+				ServerVersion:      a.ServerVersion,
 			},
 		}, nil
 	case "deltaCommit":
@@ -605,6 +610,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 		return SqlExecMessage{
 			H: header, Namespace: s.Namespace, SessionID: s.SessionID,
 			SQL: s.SQL, ParametersJSON: s.ParametersJSON,
+			PageSize: s.PageSize, Continuation: s.Continuation,
 		}, nil
 	case "sqlResult":
 		s := env.SqlResult
@@ -617,6 +623,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			ResolvedCommitHex: s.ResolvedCommitHex, ReadOnly: s.ReadOnly,
 			Error: s.Error, GeneratedIDs: s.GeneratedIDs,
 			ErrorCode: s.ErrorCode, RetryAfterMs: s.RetryAfterMs,
+			ContinuationToken: s.Continuation,
 		}, nil
 	case "txCommit":
 		c := env.TxCommit

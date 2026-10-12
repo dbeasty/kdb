@@ -413,6 +413,10 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 				slog.Info("replication: took the state of commits behind this node's snapshot root, which the peer's history forked from",
 					"peer", l.peer.Name, "namespace", ns.Namespace, "commits", ns.BoundaryExtended)
 			}
+			if len(ns.BoundarySent) > 0 {
+				slog.Info("replication: sent the peer the state of commits behind its snapshot root, which a pushed branch forked from",
+					"peer", l.peer.Name, "namespace", ns.Namespace, "commits", ns.BoundarySent)
+			}
 		}
 		if l.peer.Deepen {
 			l.deepen(res.Namespaces, transport)

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // inboundPeers records, per peer, when it last finished fetching this namespace - what this node
@@ -54,7 +56,7 @@ func (s *KdbServerRuntime) NoteInboundPeer(peer string, t time.Time) {
 	}
 	tmp := p.path + ".tmp"
 	if os.WriteFile(tmp, raw, 0o644) == nil {
-		_ = os.Rename(tmp, p.path)
+		_ = fsx.Rename(tmp, p.path)
 	}
 }
 

@@ -101,7 +101,12 @@ export function sessionAck(namespace: string, headHex = HEAD_ZERO) {
   };
 }
 
-export function sqlOk(namespace: string, resolvedCommitHex = HEAD_ONE, readOnly = false) {
+export function sqlOk(
+  namespace: string,
+  resolvedCommitHex = HEAD_ONE,
+  readOnly = false,
+  rowsAffected = 1,
+) {
   return {
     kind: "sqlResult" as const,
     payload: {
@@ -109,7 +114,7 @@ export function sqlOk(namespace: string, resolvedCommitHex = HEAD_ONE, readOnly 
       sessionId: "sess-1",
       columns: [],
       rows: [],
-      rowsAffected: 1,
+      rowsAffected,
       resolvedCommitHex,
       readOnly,
       generatedIds: [],

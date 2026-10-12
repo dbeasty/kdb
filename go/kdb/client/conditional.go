@@ -46,13 +46,15 @@ func (e *PreconditionError) Unwrap() error { return ErrPreconditionFailed }
 // PutJSON only approximates: PutJSON's optimistic check is content-addressed and per-document,
 // so two clients creating the same id from the same empty base can both believe they won.
 func (c *Client) PutIfAbsent(ctx context.Context, ns string, docID string, jsonBody []byte) (string, error) {
-	return c.conditionalPut(ctx, ns, docID, jsonBody, document.Precondition{
+	return c.conditionalPut(ctx, ns, docID, jsonBody, &document.Precondition{
 		OpIndex: 0, Kind: document.ExpectAbsent,
-	})
+	}, false)
 }
 
 // ReplaceIf writes jsonBody at docID only if the document's current content hash is exactly
-// expectedContentHash - a compare-and-set. Returns a *PreconditionError if it is not.
+// expectedContentHash - a compare-and-set. Returns a *PreconditionError if it is not. The body
+// replaces the document wholesale (see ReplaceJSON): a key it omits is removed, which is what
+// makes a read-modify-write able to delete a field.
 //
 // The hash to pass is the one GetJSONWithHash returned for the value this write was derived
 // from. Note that this check is literal: it fails on a hash mismatch even when jsonBody happens
@@ -63,21 +65,21 @@ func (c *Client) ReplaceIf(ctx context.Context, ns string, docID string, jsonBod
 	if err != nil {
 		return "", fmt.Errorf("kdb: invalid expected content hash: %w", err)
 	}
-	return c.conditionalPut(ctx, ns, docID, jsonBody, document.Precondition{
+	return c.conditionalPut(ctx, ns, docID, jsonBody, &document.Precondition{
 		OpIndex: 0, Kind: document.ExpectContentHash, ContentHash: h,
-	})
+	}, true)
 }
 
 // ReplaceIfPresent writes jsonBody at docID only if some document exists there - an update that
 // refuses to become a create.
 func (c *Client) ReplaceIfPresent(ctx context.Context, ns string, docID string, jsonBody []byte) (string, error) {
-	return c.conditionalPut(ctx, ns, docID, jsonBody, document.Precondition{
+	return c.conditionalPut(ctx, ns, docID, jsonBody, &document.Precondition{
 		OpIndex: 0, Kind: document.ExpectPresent,
-	})
+	}, true)
 }
 
 func (c *Client) conditionalPut(
-	ctx context.Context, ns string, docID string, jsonBody []byte, pre document.Precondition,
+	ctx context.Context, ns string, docID string, jsonBody []byte, pre *document.Precondition, replace bool,
 ) (string, error) {
 	id, err := codec.UUIDFromString(docID)
 	if err != nil {
@@ -95,12 +97,14 @@ func (c *Client) conditionalPut(
 	base := st.head
 	st.mu.Unlock()
 	tx := document.Transaction{
-		ID:            txID,
-		BaseVersion:   base,
-		Operations:    []document.Op{document.WriteOp{DocID: id, Patch: string(jsonBody)}},
-		Timestamp:     codec.TimestampNow(),
-		AuthorNodeID:  c.authorNodeID,
-		Preconditions: []document.Precondition{pre},
+		ID:           txID,
+		BaseVersion:  base,
+		Operations:   []document.Op{document.WriteOp{DocID: id, Patch: string(jsonBody), Replace: replace}},
+		Timestamp:    codec.TimestampNow(),
+		AuthorNodeID: c.authorNodeID,
+	}
+	if pre != nil {
+		tx.Preconditions = []document.Precondition{*pre}
 	}
 	return c.commitTransaction(ctx, ns, st, tx)
 }

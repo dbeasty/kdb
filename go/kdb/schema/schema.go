@@ -2,6 +2,7 @@ package schema
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -53,6 +54,10 @@ func (s KdbSchema) HasUniqueConstraints() bool {
 }
 
 func validateUniqueConstraints(fields []Field, constraints []UniqueConstraint) error {
+	// A schema with no declared fields is a constraints-only schema: the namespace stays
+	// schemaless (see IsSchemaless) and the constraints name JSON paths in its documents, so
+	// there is no field list to check them against.
+	checkNames := len(fields) > 0
 	names := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
 		names[f.Name] = struct{}{}
@@ -63,7 +68,7 @@ func validateUniqueConstraints(fields []Field, constraints []UniqueConstraint) e
 		}
 		seen := make(map[string]struct{}, len(c.Fields))
 		for _, name := range c.Fields {
-			if _, ok := names[name]; !ok {
+			if _, ok := names[name]; checkNames && !ok {
 				return fmt.Errorf("unique constraint references unknown field: %s", name)
 			}
 			if _, dup := seen[name]; dup {
@@ -109,6 +114,35 @@ func None() KdbSchema {
 
 // IsNone reports whether s is the schema-less sentinel.
 func (s KdbSchema) IsNone() bool { return s.SchemaHash == None().SchemaHash }
+
+// IsSchemaless reports whether documents in this namespace are free-form: no declared fields.
+// That is the sentinel (IsNone) and also a constraints-only schema, which declares unique
+// constraints over JSON paths but no fields. Query planning, DML and document validation key off
+// this - a namespace that only carries a constraint must not start rejecting undeclared columns -
+// while the commit path keys off IsNone, because a constraints-only schema is a real schema that
+// has to be recorded, replicated and enforced.
+func (s KdbSchema) IsSchemaless() bool { return s.IsNone() || len(s.Fields) == 0 }
+
+// WithUniqueTuple returns a schema like s with one more unique constraint over fields. For a
+// schemaless namespace the result is a constraints-only schema. It does not mutate s, and adding
+// a tuple s already enforces returns s itself.
+func (s KdbSchema) WithUniqueTuple(fields []string, createdAt codec.Timestamp) (KdbSchema, error) {
+	for _, existing := range s.UniqueTuples() {
+		if len(existing) == len(fields) && strings.Join(existing, FieldPathSeparator) == strings.Join(fields, FieldPathSeparator) {
+			return s, nil
+		}
+	}
+	constraints := append(cloneConstraints(s.UniqueConstraints), UniqueConstraint{Fields: append([]string(nil), fields...)})
+	version := s.Version + 1
+	if version < 1 {
+		version = 1
+	}
+	return BuildWithConstraints(s.Fields, constraints, version, createdAt, s.Description)
+}
+
+// FieldPathSeparator joins a tuple's fields when comparing tuples; a unit separator cannot occur
+// in a field path.
+const FieldPathSeparator = "\x1f"
 
 func (s *KdbSchema) indexFields() {
 	if s.fieldsByName != nil {

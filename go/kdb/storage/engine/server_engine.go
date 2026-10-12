@@ -583,37 +583,7 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 	// memory proportional to what it keeps (the batch buffer) rather than to what exists.
 	buf := make([]document.Document, 0, batchSize)
 	var scanErr error
-	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
-		d, ok := e.docsByHash.Get(h)
-		if !ok {
-			// Evicted history rather than a genuinely absent document:
-			// skipping here would silently drop rows from a scan at an
-			// older atCommit. A version the loader also cannot find is
-			// skipped, which is what a miss has always meant.
-			if obj, found := e.documentFromObject(id, h); found {
-				e.coldLoads.Add(1)
-				e.docsByHash.Put(h, obj)
-				d = obj
-				buf = append(buf, d)
-				if len(buf) >= batchSize {
-					if err := onBatch(append([]document.Document(nil), buf...)); err != nil {
-						scanErr = err
-						return false
-					}
-					buf = buf[:0]
-				}
-				return true
-			}
-			loaded, found, err := e.loadCold(id, h)
-			if err != nil {
-				scanErr = err
-				return false
-			}
-			if !found {
-				return true
-			}
-			d = loaded
-		}
+	emit := func(d document.Document) bool {
 		buf = append(buf, d)
 		if len(buf) >= batchSize {
 			if err := onBatch(append([]document.Document(nil), buf...)); err != nil {
@@ -623,7 +593,66 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 			buf = buf[:0]
 		}
 		return true
+	}
+	// resolve finds one entry's document: the cache, then what the window prefetched, then the
+	// per-document paths. false stops the scan (an error is in scanErr); a nil result is a
+	// version nothing can find, which a scan has always skipped.
+	resolve := func(entry scanEntry, prefetched map[codec.Hash]document.Document) (*document.Document, bool) {
+		if d, ok := e.docsByHash.Get(entry.h); ok {
+			return &d, true
+		}
+		// Evicted history rather than a genuinely absent document: skipping here would silently
+		// drop rows from a scan at an older atCommit.
+		if obj, found := prefetched[entry.h]; found {
+			e.coldLoads.Add(1)
+			e.docsByHash.Put(entry.h, obj)
+			return &obj, true
+		}
+		if obj, found := e.documentFromObject(entry.id, entry.h); found {
+			e.coldLoads.Add(1)
+			e.docsByHash.Put(entry.h, obj)
+			return &obj, true
+		}
+		loaded, found, err := e.loadCold(entry.id, entry.h)
+		if err != nil {
+			scanErr = err
+			return nil, false
+		}
+		if !found {
+			return nil, true
+		}
+		return &loaded, true
+	}
+	// Sized to the tree, not the window cap: a full window is 1.5 MiB, and allocating it up front
+	// made every scan of a 100-document namespace pay that. A tree no larger than the cap still
+	// fits in one window, so the one-decode-per-frame property is unchanged.
+	window := make([]scanEntry, 0, min(scanWindowDocs, tree.Size()))
+	flush := func() bool {
+		prefetched := e.prefetchWindow(window)
+		for _, entry := range window {
+			d, ok := resolve(entry, prefetched)
+			if !ok {
+				return false
+			}
+			if d != nil && !emit(*d) {
+				return false
+			}
+		}
+		window = window[:0]
+		return true
+	}
+	stopped := false
+	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
+		window = append(window, scanEntry{id, h})
+		if len(window) >= scanWindowDocs && !flush() {
+			stopped = true
+			return false
+		}
+		return true
 	})
+	if !stopped && scanErr == nil {
+		flush()
+	}
 	if scanErr != nil {
 		return scanErr
 	}

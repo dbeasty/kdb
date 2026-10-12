@@ -12,6 +12,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/fsx"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -131,7 +132,7 @@ func openTxnCoordinator(dataRoot string, readOnly bool, syncMode storio.SyncMode
 		if !ok || suffix != decisionLiveSuffix {
 			continue
 		}
-		if err := os.Rename(decisionPath(dataRoot, epoch, decisionLiveSuffix), decisionPath(dataRoot, epoch, decisionDeadSuffix)); err != nil {
+		if err := fsx.Rename(decisionPath(dataRoot, epoch, decisionLiveSuffix), decisionPath(dataRoot, epoch, decisionDeadSuffix)); err != nil {
 			return nil, err
 		}
 		renamed = true
@@ -320,7 +321,7 @@ func (c *TxnCoordinator) sealLocked() error {
 	}
 	path := c.log.path
 	c.log = nil
-	if err := os.Remove(path); err != nil {
+	if err := fsx.Remove(path); err != nil {
 		return err
 	}
 	return syncDir(txnDir(c.dataRoot))

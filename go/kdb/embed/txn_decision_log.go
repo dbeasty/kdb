@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/fsx"
 	"github.com/limidus/kdb/go/kdb/metrics"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
@@ -110,14 +111,7 @@ func readDecisions(path string) (map[codec.UUID]struct{}, error) {
 }
 
 // syncDir makes a create, rename or remove inside dir durable.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
+func syncDir(dir string) error { return fsx.SyncDir(dir) }
 
 // readEpochFile returns the last epoch handed out, or 0 when none ever was.
 func readEpochFile(dataRoot string) (uint64, error) {
@@ -153,7 +147,7 @@ func writeEpochFile(dataRoot string, epoch uint64) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Join(dir, epochFileName)); err != nil {
+	if err := fsx.Rename(tmp, filepath.Join(dir, epochFileName)); err != nil {
 		return err
 	}
 	return syncDir(dir)
@@ -324,7 +318,8 @@ func writeHostID(dataRoot, id string) error {
 	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o644); err != nil {
 		return err
 	}
-	f, err := os.Open(tmp)
+	// Writable, not os.Open: Windows refuses FlushFileBuffers on a read-only handle.
+	f, err := os.OpenFile(tmp, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -333,7 +328,7 @@ func writeHostID(dataRoot, id string) error {
 	if serr != nil {
 		return serr
 	}
-	if err := os.Rename(tmp, filepath.Join(dir, hostFileName)); err != nil {
+	if err := fsx.Rename(tmp, filepath.Join(dir, hostFileName)); err != nil {
 		return err
 	}
 	return syncDir(dir)

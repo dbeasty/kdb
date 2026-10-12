@@ -14,6 +14,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/backup"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/fsx"
 	"github.com/limidus/kdb/go/kdb/recovery"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/server"
@@ -392,7 +393,7 @@ func (s *Server) handleDetachRestore(w http.ResponseWriter, r *http.Request, _ a
 	if req.Delete {
 		// Removing a directory is the one destructive thing here, and it only ever removes a
 		// staging directory this server created for this job - never the live data root.
-		if err := os.RemoveAll(dir); err != nil {
+		if err := fsx.RemoveAll(dir); err != nil {
 			body["deleteError"] = err.Error()
 		} else {
 			body["deleted"] = dir

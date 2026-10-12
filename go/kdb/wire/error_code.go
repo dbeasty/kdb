@@ -46,6 +46,12 @@ const (
 	// ErrorCodeNotHome: the namespace is single-home and this node is not its home. The message
 	// names the home ("home=<addr>"); write there. Retrying here cannot succeed.
 	ErrorCodeNotHome ErrorCode = "NOT_HOME"
+	// ErrorCodeShallowBoundary: a peer-sync push named a parent that is behind the receiver's
+	// snapshot root - history it was bootstrapped without - and the pusher did not send that
+	// parent's state. The receiver cannot fetch it from a node that dialled it. A pusher that
+	// knows this code sends the state with GRAFT_PUSH on the same session and retries the page
+	// (peersync.PushBelowBoundaryError); retrying unmodified cannot succeed.
+	ErrorCodeShallowBoundary ErrorCode = "SHALLOW_BOUNDARY"
 	// ErrorCodeInternal: unclassified - the fallback when no more specific code applies.
 	ErrorCodeInternal ErrorCode = "INTERNAL"
 )
