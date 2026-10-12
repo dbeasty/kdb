@@ -21,7 +21,7 @@ def test_sustained_load_reads_correct_during_and_after():
         probe = "00000000000000000000000000000f01"
         for burst in range(5):
             r = helper("load", "--addr", srv.sql_addr, "--namespace", srv.namespace,
-                       "--rounds", "400", timeout=300)
+                       "--rounds", "400", "--timeout", "300s", timeout=300)
             assert "loaded=400" in r.stdout
             put(srv, probe, {"id": probe, "burst": burst})
             body = get(srv, probe)
