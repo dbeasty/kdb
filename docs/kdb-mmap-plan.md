@@ -341,3 +341,57 @@ full path; older builds ignore the new fields.
 | `graph.file` | `KDB_GRAPH_FILE` | off (default), on | Map commits from segment files; checkpoints reference them. Forces `graph.memory=kdb`. |
 | `graph.rebuildCommits` | `KDB_GRAPH_REBUILD_COMMITS` | count (50,000) | Resident commits before a flush to a new segment. |
 | `graph.maxSegments` | `KDB_GRAPH_MAX_SEGMENTS` | count (8) | Segments before the next write is a full rewrite. |
+
+## Final measurements on the merged branch (2026-10-12, `21625cc` vs `main` `665d9fc`)
+
+M3 Max, 51 GB, macOS; load average 3-6 from other sessions throughout. Heap and RSS are load-independent;
+timings are indicative.
+
+### Memory at the design point: 1,000,000 documents, 2,000,000 commits
+
+| Phase | main | `graph.memory=go` | `graph.memory=kdb` | kdb + `graph.file` |
+|---|---:|---:|---:|---:|
+| Startup: live heap after open | 1,518 MB | 1,518 MB | 1,517 MB | **436 MB** |
+| Startup: peak heap during open | 4,864 MB | 4,870 MB | 4,871 MB | **1,115 MB** |
+| Startup: RSS after open | 6,035 MB | 5,602 MB | 6,009 MB | **2,206 MB** |
+| Startup: open time | 19.6 s | 14.5 s | 14.5 s | **13.3 s** |
+| 200k point reads: live heap / peak | 1,820 / 2,794 MB | 1,820 / 2,800 MB | 1,820 / 2,788 MB | **738 / 1,223 MB** |
+| 20k updates: live heap / peak | 1,422 / 1,863 MB | 1,423 / 1,864 MB | 1,423 / 1,870 MB | **343 / 794 MB** |
+| Close + checkpoint: allocated | 7,658 MB | 5,565 MB | 5,629 MB | **923 MB** |
+| Close + checkpoint: peak heap | 6,748 MB | 6,224 MB | 5,559 MB | **1,244 MB** |
+| Close + checkpoint: peak RSS | 8,402 MB | 8,434 MB | 8,423 MB | **2,449 MB** |
+| Close + checkpoint: time | 6.8 s | 2.7 s | 2.6 s | **0.37 s** |
+| Disk | 1.3 GB | 1.3 GB | 1.3 GB | 1.6 GB |
+
+At 100k documents / 500k commits the same run reproduced the earlier table (main 303 MB live after open, graph on
+33 MB; checkpoint peak 1,462 MB vs 158 MB).
+
+### What the remaining heap is, with the graph on (1M documents, heap profile after open)
+
+| Retained by | MB | Per document |
+|---|---:|---:|
+| `engine.shardedDocByHashStore.Pin` - the pinned version index the live tree names | 191 | ~190 B |
+| `decodeCheckpoint` - the live tree's flat `Entries` map, kept beside its trie | 120 | ~120 B |
+| `BuildDocumentTree` trie nodes | 109 | ~110 B |
+
+And where the 13 s open goes (CPU profile): rebuilding the live tree's trie from the checkpoint's flat entries,
+7.8 s (a SHA-256 per internal node); `Horizon()` walking every commit through the segments, 2.4 s. Both are now the
+largest remaining costs and both are independent of history: they scale with documents.
+
+### Commit graph alone (`TestGraphFileScale`)
+
+| | 1M commits | 2M commits |
+|---|---:|---:|
+| Heap, resident / file | 458 MB / 0 | 915 MB / 0 |
+| Full-GC mark, resident / file | 0.68 ms / 0.18 ms | 1.31 ms / 0.26 ms |
+| Deep `IsAncestor`, resident / file | 94 ms / 195 ms | 198 ms / 416 ms |
+| `GetCommit`, resident / file | 0.48 us / 0.59 us | 0.51 us / 0.62 us |
+| Full rewrite; attach at open | 1.7 s; 134 ms | 3.6 s; 304 ms |
+
+### Full workload matrix, graph off (36 rows incl. sync-full and async durability), alternating, n=4
+
+Geomean **+0.25% ops/s**. Significant: heavy-multi-user reads +5 to +10%, single-user non-overlapping read +5%,
+heavy insert +7%. One row first read -7.3% (single-user mixed read/write, overlapping); re-run with n=9 it is
+**+4.0%** (p=0.011) - fsync contention noise. Allocations per op identical on every single-user row, +-1 on the
+heavy rows.
+
