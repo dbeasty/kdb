@@ -1,0 +1,38 @@
+{
+  "name": "@kdb/embed",
+  "version": "0.1.0",
+  "description": "The KDB engine running in-process - Go compiled to WebAssembly, behind the @kdb/client operation set.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./kdb.wasm": "./wasm/kdb.wasm"
+  },
+  "files": [
+    "dist",
+    "wasm",
+    "README.md"
+  ],
+  "scripts": {
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build": "npm run build:wasm && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@kdb/client": "^0.1.0"
+  },
+  "devDependencies": {
+    "@kdb/codegen": "file:../kdb-codegen",
+    "@kdb/client": "file:../kdb-client",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.2"
+  }
+}

@@ -12,7 +12,11 @@
 //
 // Exposed on globalThis.KdbEmbed:
 //
-//	open(namespace: string, onFrame: (frame: Uint8Array) => void) -> { send(frame), close() } | { error }
+//	open(namespaces: string[], onFrame: (frame: Uint8Array) => void) -> { send(frame), close() } | { error }
+//
+// Each namespace is its own in-memory runtime, routed by a server.NamespaceSet exactly as the
+// production service routes them. A namespace not in the list is refused rather than silently
+// aliased onto another - which is what a bare single runtime does with a name it does not own.
 package main
 
 import (
@@ -34,16 +38,32 @@ func main() {
 }
 
 func open(_ js.Value, args []js.Value) any {
-	if len(args) < 2 || args[0].Type() != js.TypeString || args[1].Type() != js.TypeFunction {
-		return errVal("open(namespace, onFrame) requires a namespace string and a frame callback")
+	if len(args) < 2 || args[0].Type() != js.TypeObject || args[1].Type() != js.TypeFunction {
+		return errVal("open(namespaces, onFrame) requires an array of namespaces and a frame callback")
 	}
-	namespace := args[0].String()
-	rt, err := embed.OpenMemoryRuntime(embed.CatalogFromNamespace(namespace), namespace, schema.None())
-	if err != nil {
-		return errVal(err.Error())
+	count := args[0].Get("length").Int()
+	if count == 0 {
+		return errVal("open: at least one namespace is required")
 	}
-	srv := server.NewKdbServerRuntime(rt)
-	host := server.NewFrameHost(srv)
+	var primary *server.KdbServerRuntime
+	var set *server.NamespaceSet
+	for i := 0; i < count; i++ {
+		namespace := args[0].Index(i).String()
+		rt, err := embed.OpenMemoryRuntime(embed.CatalogFromNamespace(namespace), namespace, schema.None())
+		if err != nil {
+			return errVal(err.Error())
+		}
+		srv := server.NewKdbServerRuntime(rt)
+		if primary == nil {
+			primary = srv
+			set = server.NewNamespaceSet(rt.TxnCoordinator())
+		}
+		if err := set.Add(srv); err != nil {
+			return errVal(err.Error())
+		}
+	}
+	primary.Namespaces = set
+	host := server.NewFrameHost(primary)
 
 	c := newConn(args[1])
 	served := make(chan struct{})
