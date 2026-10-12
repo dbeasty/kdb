@@ -21,8 +21,12 @@ COMMITS = 2000
 def test_restart_after_large_history_is_bounded():
     srv = KdbServer().start()
     try:
+        # The helper's --timeout bounds the whole load (all COMMITS sequential upserts), and its
+        # 30s default sat right at the cost of 2000 upserts on a busy machine: it failed at
+        # upsert 1775 under load. Give it the same budget as the subprocess. The assertion this
+        # test exists for - restart under 20s - is unchanged.
         r = helper("load", "--addr", srv.sql_addr, "--namespace", srv.namespace,
-                   "--rounds", str(COMMITS), timeout=600)
+                   "--rounds", str(COMMITS), "--timeout", "600s", timeout=600)
         assert f"loaded={COMMITS}" in r.stdout
 
         code = srv.stop()
