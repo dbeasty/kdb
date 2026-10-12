@@ -24,6 +24,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/fsx"
 	"github.com/limidus/kdb/go/kdb/index/stores"
 	"github.com/limidus/kdb/go/kdb/memtune"
 	"github.com/limidus/kdb/go/kdb/peersync"
@@ -1028,7 +1029,7 @@ func saveCostModelState(srv *server.KdbServerRuntime, path string) {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := fsx.Rename(tmp, path); err != nil {
 		return
 	}
 	slog.Info("cost model state saved", "path", path, "learned_cells", adm.Costs().LearnedCells())

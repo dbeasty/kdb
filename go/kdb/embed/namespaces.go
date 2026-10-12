@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -99,8 +100,37 @@ func ValidateNamespaceID(id string) error {
 				return fmt.Errorf("kdb: invalid namespace id %q: character %q is not allowed", id, r)
 			}
 		}
+		if runtime.GOOS == "windows" {
+			if reason := windowsUnsafeSegment(seg); reason != "" {
+				return fmt.Errorf("kdb: invalid namespace id %q: %s", id, reason)
+			}
+		}
 	}
 	return nil
+}
+
+// windowsUnsafeSegment reports why seg, already limited to [A-Za-z0-9._-], cannot be a directory
+// name on Windows, or "" if it can. Win32 strips a trailing dot - "a." would silently become the
+// directory "a", so two ids would share one namespace - and resolves the legacy device names
+// (with or without an extension) to devices rather than files anywhere in a path.
+//
+// Applied only on Windows: these ids have always been valid elsewhere, and refusing them there
+// would strand namespaces that already exist.
+func windowsUnsafeSegment(seg string) string {
+	if strings.HasSuffix(seg, ".") {
+		return "a segment ending in '.' is not a valid Windows directory name"
+	}
+	base := seg
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	switch strings.ToUpper(base) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return "'" + base + "' is a reserved device name on Windows"
+	}
+	return ""
 }
 
 // NamespaceExists reports whether namespaceID has a directory under dataRoot. The id must already

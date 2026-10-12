@@ -1,4 +1,4 @@
-//go:build !unix
+//go:build !unix && !windows
 
 package embed
 
@@ -9,15 +9,14 @@ import (
 	"runtime"
 )
 
-// dirLock on non-unix platforms (windows, js/wasm, plan9, ...) has no access to flock(2), so it
-// falls back to an O_EXCL create-as-lock: the first opener creates the file and holds it, a
-// second opener's O_EXCL create fails while it exists. Unlike flock, this does NOT release
-// automatically if the process dies without calling Release - a crashed holder leaves a stale
-// lock file that must be removed by hand. That tradeoff is acceptable here because the primary
-// deployment target (go/cmd/kdb-service) is unix; this exists so the embed package - and
-// anything that imports it, including the GOOS=js/wasm build - compiles and has a directionally
-// correct single-process guard everywhere else, not to make Windows/WASM a supported multi-
-// process deployment target.
+// dirLock on platforms with neither flock(2) nor LockFileEx (js/wasm, plan9, ...) falls back to
+// an O_EXCL create-as-lock: the first opener creates the file and holds it, a second opener's
+// O_EXCL create fails while it exists. Unlike a real lock, this does NOT release automatically if
+// the process dies without calling Release - a crashed holder leaves a stale lock file that must
+// be removed by hand. That tradeoff is acceptable here because none of these platforms is a
+// multi-process deployment target; this exists so the embed package - and anything that imports
+// it, including the GOOS=js/wasm build - compiles and has a directionally correct single-process
+// guard. Unix and Windows use dir_lock.go.
 type dirLock struct {
 	f    *os.File
 	path string

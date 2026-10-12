@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // nodeFileName names the file at a data root that holds the node's identity.
@@ -90,7 +91,7 @@ func writeNodeID(dataRoot string, id codec.UUID) error {
 	if serr != nil {
 		return serr
 	}
-	if err := os.Rename(tmp, filepath.Join(dataRoot, nodeFileName)); err != nil {
+	if err := fsx.Rename(tmp, filepath.Join(dataRoot, nodeFileName)); err != nil {
 		return err
 	}
 	return syncDir(dataRoot)

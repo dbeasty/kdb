@@ -1,4 +1,4 @@
-//go:build unix
+//go:build unix || windows
 
 package embed
 
@@ -7,7 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"syscall"
+
+	"github.com/limidus/kdb/go/kdb/fsx"
 )
 
 // Two lock files, because "who may open this directory" and "who may write to it" are different
@@ -42,11 +43,11 @@ type dirLock struct {
 
 // acquireDirLock takes the writer's locks: a shared attach and the exclusive writer lock.
 func acquireDirLock(dataRoot string) (*dirLock, error) {
-	attach, err := flockFile(dataRoot, attachLockName, syscall.LOCK_SH)
+	attach, err := lockNamedFile(dataRoot, attachLockName, false)
 	if err != nil {
 		return nil, fmt.Errorf("data directory is locked for maintenance: %s", filepath.Join(dataRoot, attachLockName))
 	}
-	write, err := flockFile(dataRoot, writeLockName, syscall.LOCK_EX)
+	write, err := lockNamedFile(dataRoot, writeLockName, true)
 	if err != nil {
 		_ = unflock(attach)
 		return nil, fmt.Errorf("data directory locked: %s", filepath.Join(dataRoot, writeLockName))
@@ -62,7 +63,7 @@ func acquireDirLock(dataRoot string) (*dirLock, error) {
 // acquireDirLockShared takes only the shared attach lock, for a read-only runtime. It coexists
 // with a live writer and with other readers, and is excluded only by maintenance tooling.
 func acquireDirLockShared(dataRoot string) (*dirLock, error) {
-	attach, err := flockFile(dataRoot, attachLockName, syscall.LOCK_SH)
+	attach, err := lockNamedFile(dataRoot, attachLockName, false)
 	if err != nil {
 		return nil, fmt.Errorf("data directory is locked for maintenance: %s", filepath.Join(dataRoot, attachLockName))
 	}
@@ -72,23 +73,27 @@ func acquireDirLockShared(dataRoot string) (*dirLock, error) {
 // acquireDirLockExclusive takes the attach lock EXCLUSIVE, excluding every runtime - reader and
 // writer alike. This is the maintenance lock (LockDataDir).
 func acquireDirLockExclusive(dataRoot string) (*dirLock, error) {
-	attach, err := flockFile(dataRoot, attachLockName, syscall.LOCK_EX)
+	attach, err := lockNamedFile(dataRoot, attachLockName, true)
 	if err != nil {
 		return nil, fmt.Errorf("data directory is in use: %s", filepath.Join(dataRoot, attachLockName))
 	}
 	return &dirLock{attach: attach}, nil
 }
 
-func flockFile(dataRoot, name string, mode int) (*os.File, error) {
+// lockNamedFile opens (creating if needed) the lock file name under dataRoot and takes a
+// non-blocking lock on it: exclusive or shared. The OS drops the lock if the process dies, so a
+// crashed holder never leaves the directory locked.
+func lockNamedFile(dataRoot, name string, exclusive bool) (*os.File, error) {
 	path := filepath.Join(dataRoot, name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	// fsx so that on Windows a held lock file is not also undeletable by everything else.
+	f, err := fsx.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), mode|syscall.LOCK_NB); err != nil {
+	if err := lockFile(f, exclusive); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
@@ -99,7 +104,7 @@ func unflock(f *os.File) error {
 	if f == nil {
 		return nil
 	}
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = unlockFile(f)
 	return f.Close()
 }
 

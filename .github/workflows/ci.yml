@@ -115,6 +115,27 @@ jobs:
           GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/embed/
           GOOS=js GOARCH=wasm go build -tags kdb_lite -o /dev/null ./wasm/embed/
           go vet -tags kdb_lite ./kdb/storage/io/s3
+      - name: Go Windows cross-compile
+        # Cheap guard that runs on every push; go-windows below is what actually exercises it.
+        run: GOOS=windows GOARCH=amd64 go vet ./...
+
+  go-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - name: Go build
+        run: go build ./...
+      - name: Go test
+        # No -race: it needs cgo, and the race-enabled run on Linux already covers data races.
+        # What this job is for is Windows file semantics - sharing modes, LockFileEx, rename and
+        # delete of open files - which only a real Windows filesystem exercises.
+        run: go test ./...
 
   ts-client:
     runs-on: ubuntu-latest

@@ -3,16 +3,19 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/limidus/kdb/go/kdb/peersync"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/limidus/kdb/go/kdb/peersync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/fsx"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 )
@@ -572,14 +575,14 @@ func cmdBranchCreate(cfg Config, rt *embed.EmbeddedKdbRuntime, c BranchCreateCmd
 }
 
 func cmdUnlock(cfg Config) int {
-	lockPath := cfg.DataDir + "/.kdb.lock"
+	lockPath := filepath.Join(cfg.DataDir, ".kdb.lock")
 	if _, err := os.Stat(lockPath); os.IsNotExist(err) {
 		if !cfg.Quiet {
 			fmt.Printf("No lock file at %s\n", cfg.DataDir)
 		}
 		return 0
 	}
-	if err := os.Remove(lockPath); err != nil {
+	if err := fsx.Remove(lockPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
