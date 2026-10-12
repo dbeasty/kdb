@@ -83,25 +83,59 @@ func SaveStoreSnapshot(dir string, store Store, head codec.Hash) error {
 	if err != nil {
 		return err
 	}
+	return writeStoreSnapshot(dir, store.Descriptor(), data, storeStats(store), head)
+}
+
+// storeStats is the store's manifest statistics, if it publishes any.
+func storeStats(store Store) map[string]float64 {
+	if sp, ok := store.(StatsProvider); ok {
+		return sp.SnapshotStats()
+	}
+	return nil
+}
+
+// writeStoreSnapshot writes already-serialized snapshot bytes and then the manifest naming head.
+// The directory is synced between the two renames, so after a crash the manifest can never be
+// the newer of the pair: a manifest that names head always sits next to the snapshot taken at
+// head (or a later manifest does). data == nil writes the manifest alone, for a store whose
+// snapshot on disk is already its current content - the caller vouches for that.
+func writeStoreSnapshot(dir string, desc Descriptor, data []byte, stats map[string]float64, head codec.Hash) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if err := WriteFileAtomic(filepath.Join(dir, SnapshotFileName), data); err != nil {
-		return err
+	if data != nil {
+		if err := WriteFileAtomic(filepath.Join(dir, SnapshotFileName), data); err != nil {
+			return err
+		}
+		if err := fsx.SyncDir(dir); err != nil {
+			return err
+		}
 	}
 	m := Manifest{
 		FormatVersion: ManifestFormatVersion,
-		Index:         DescriptorToJSON(store.Descriptor()),
+		Index:         DescriptorToJSON(desc),
 		HeadCommitHex: head.Hex(),
-	}
-	if sp, ok := store.(StatsProvider); ok {
-		m.Stats = sp.SnapshotStats()
+		Stats:         stats,
 	}
 	mb, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
 	return WriteFileAtomic(filepath.Join(dir, ManifestFileName), mb)
+}
+
+// InvalidateStoreSnapshot removes dir's manifest, durably, so whatever snapshot is left there
+// can no longer be taken for current: a store without a manifest is rebuilt on open. Used when
+// an index is (re)created, where an earlier index of the same id may have left a manifest naming
+// the very head the new one is created at. A missing manifest is not an error.
+func InvalidateStoreSnapshot(dir string) error {
+	if err := fsx.Remove(filepath.Join(dir, ManifestFileName)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return fsx.SyncDir(dir)
 }
 
 // ReadManifest reads dir's manifest without touching the snapshot. Missing → ErrNoSnapshot.

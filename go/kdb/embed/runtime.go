@@ -3,6 +3,7 @@ package embed
 import (
 	"errors"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,11 @@ type EmbeddedKdbRuntime struct {
 	// extra topological-replay pass instead of a fast sequential one, and
 	// leaves one extra small segment on disk.
 	storageClose func() error
+	// closeHooks run once, before this namespace's storage closes - however it closes: Close,
+	// Host.CloseNamespace (idle close) or Host.Close. See AddCloseHook.
+	closeHooksMu  sync.Mutex
+	closeHooks    []func()
+	closeHooksRan bool
 	// maintain writes a checkpoint and, under storage.HistoryModeNone,
 	// reclaims the delta segments that are past both it and the retention
 	// window. Nil for a runtime with nothing to reclaim - a read-only or
@@ -204,6 +210,7 @@ func (r *EmbeddedKdbRuntime) Close() {
 	if r == nil {
 		return
 	}
+	r.runCloseHooks()
 	if r.storageClose != nil {
 		if err := r.storageClose(); err != nil {
 			log.Printf("kdb: close: flushing/sealing storage for namespace %s: %v (safe to ignore - "+
@@ -215,6 +222,40 @@ func (r *EmbeddedKdbRuntime) Close() {
 	if r.release != nil {
 		r.release()
 		r.release = nil
+	}
+}
+
+// AddCloseHook registers f to run once, before this runtime's storage is closed and its data
+// directory lock released, on every path that closes it. It is for state kept beside the
+// namespace's storage - the index snapshots - that must be written out while the directory is
+// still this process's, and never after. A hook added after the runtime closed runs at once.
+func (r *EmbeddedKdbRuntime) AddCloseHook(f func()) {
+	r.closeHooksMu.Lock()
+	if r.closeHooksRan {
+		r.closeHooksMu.Unlock()
+		f()
+		return
+	}
+	r.closeHooks = append(r.closeHooks, f)
+	r.closeHooksMu.Unlock()
+}
+
+// runCloseHooks runs the registered close hooks, once, in registration order.
+func (r *EmbeddedKdbRuntime) runCloseHooks() {
+	if r == nil {
+		return
+	}
+	r.closeHooksMu.Lock()
+	if r.closeHooksRan {
+		r.closeHooksMu.Unlock()
+		return
+	}
+	r.closeHooksRan = true
+	hooks := r.closeHooks
+	r.closeHooks = nil
+	r.closeHooksMu.Unlock()
+	for _, f := range hooks {
+		f()
 	}
 }
 
