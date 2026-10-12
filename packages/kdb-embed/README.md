@@ -33,7 +33,7 @@ await db.close();
 | **Durable** | **No.** The database is in memory and is gone when the page reloads or the process exits. IndexedDB/OPFS persistence is not part of this release. |
 | Peer-sync / replication against a server | Not implemented. Embedded databases are local-only. |
 | Cross-namespace transactions | Not available in memory (they need the durable host's decision log). |
-| Size | `kdb.wasm` is ~31 MB raw (~7 MB gzipped). The server package links the AWS SDK, `net/http` and TLS even though the embedded engine uses none of it; shrinking that is future work. |
+| Size | `kdb.wasm` is ~31 MB raw, ~6.7 MB gzipped, **~4.7 MB brotli** (`wasm/kdb.wasm.br`, serve with `Content-Encoding: br`). It is the whole Go engine; it does not shrink much by dropping dependencies (see below). |
 
 Each namespace is an independent store. Pass a list to serve several:
 `openEmbedded({ namespace: ["a/one", "b/two"] })`. A namespace you did not list is refused
@@ -53,6 +53,15 @@ const b = await openEmbedded({ namespace: "b/y", wasm, glue: "/assets/wasm_exec.
 
 Each database has its own linear memory and Go runtime, so they are isolated from one another the way
 separate processes are. Opening one takes ~100 ms once the module is compiled.
+
+### Why it is this big
+
+Not because of the server's network and cloud dependencies, as first suspected: measured on a native
+build of the same packages, `net`, TLS, x509 and the AWS client are a small fraction. The weight is
+the engine itself — the Go runtime, SQL, the transaction and storage layers, the goja JavaScript
+interpreter behind stored procedures, and `x/text` collation tables. Stubbing out AWS saved ~1%, so
+that was not kept. Brotli is the effective lever; a real reduction would mean splitting the engine
+into optional pieces, which is a design change rather than a build flag.
 
 ## Building
 

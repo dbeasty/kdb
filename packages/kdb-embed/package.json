@@ -13,7 +13,8 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./kdb.wasm": "./wasm/kdb.wasm"
+    "./kdb.wasm": "./wasm/kdb.wasm",
+    "./kdb.wasm.br": "./wasm/kdb.wasm.br"
   },
   "files": [
     "dist",

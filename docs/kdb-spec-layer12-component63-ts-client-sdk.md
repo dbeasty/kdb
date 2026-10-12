@@ -745,8 +745,9 @@ returns a `Client` (hence a `KdbOperations`, per §11.3) and inherits every beha
   `server/multi_commit.go`), which is wrong for an embedded database; unlisted namespaces are refused.
 - Still open, as §11.2 predicted: **no durability** (in memory; IndexedDB/OPFS is the prerequisite for
   calling it durable), no peer-sync or stream-subscribe against a server, and the binary is ~31 MB
-  (~7 MB gzipped) because the server package links the AWS SDK, `net/http` and TLS that the embedded
-  engine never uses.
+  (~6.7 MB gzipped, ~4.7 MB brotli). The first guess - that the server package's AWS SDK, `net/http`
+  and TLS links were the cause - was measured and is wrong (stubbing AWS saved ~1%); the engine itself
+  is the weight, so brotli delivery is the shipped mitigation.
 
 ## 14. Estimated lines
 
