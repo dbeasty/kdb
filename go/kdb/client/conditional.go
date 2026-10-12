@@ -97,11 +97,11 @@ func (c *Client) conditionalPut(
 	base := st.head
 	st.mu.Unlock()
 	tx := document.Transaction{
-		ID:            txID,
-		BaseVersion:   base,
-		Operations:    []document.Op{document.WriteOp{DocID: id, Patch: string(jsonBody), Replace: replace}},
-		Timestamp:     codec.TimestampNow(),
-		AuthorNodeID:  c.authorNodeID,
+		ID:           txID,
+		BaseVersion:  base,
+		Operations:   []document.Op{document.WriteOp{DocID: id, Patch: string(jsonBody), Replace: replace}},
+		Timestamp:    codec.TimestampNow(),
+		AuthorNodeID: c.authorNodeID,
 	}
 	if pre != nil {
 		tx.Preconditions = []document.Precondition{*pre}
