@@ -70,6 +70,13 @@ type DeltaSegmentSequencer interface {
 }
 
 // DeltaSegmentReader reads sealed delta segments.
+// DeltaSegmentSequenceLister is implemented by readers that can list segment sequence numbers
+// from names alone, without scanning any segment - for callers that need only the lowest or
+// highest.
+type DeltaSegmentSequenceLister interface {
+	SegmentSequences() ([]int64, error)
+}
+
 type DeltaSegmentReader interface {
 	NamespaceID() string
 	ReadAll(segment DeltaSegmentRef) ([]DeltaRecord, error)

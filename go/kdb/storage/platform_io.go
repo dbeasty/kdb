@@ -18,6 +18,25 @@ type SegmentSizer interface {
 // report a size. It means "read to find out", not "the segment is missing".
 var ErrSegmentSizeUnknown = errors.New("segment size not available from this storage layer")
 
+// SegmentStamp identifies a segment's current contents without reading them: its length and its
+// last modification time. Two equal stamps mean nothing has been written to the segment between
+// them - appended, repaired or damaged in place - as far as the filesystem can tell.
+type SegmentStamp struct {
+	Size         int64
+	ModTimeNanos int64
+}
+
+// SegmentStamper is implemented by shims that can stamp a segment. ok is false when the shim
+// cannot vouch for the segment staying put - it is open for appends in this process, or the layer
+// beneath cannot say - and a caller must not cache anything about it.
+//
+// For delta.DefaultReader, which caches each sealed segment's scan under its stamp: listing the
+// log used to walk every frame header of every segment on every call, several calls per
+// checkpoint, which at 500,000 commits allocated half a gigabyte to write one checkpoint.
+type SegmentStamper interface {
+	SegmentStamp(segmentName string) (stamp SegmentStamp, ok bool, err error)
+}
+
 // PlatformIOShim is the platform I/O boundary for segment and snapshot storage.
 type PlatformIOShim interface {
 	AppendToSegment(segmentName string, bytes []byte) (int64, error)

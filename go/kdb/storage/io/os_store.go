@@ -34,6 +34,10 @@ type OSByteStore struct {
 type openSegment struct {
 	file *os.File
 	size int64 // atomic
+	// sealed is set by MarkSealed and cleared by any later append (atomic). Sealing is otherwise
+	// advisory - the handle stays open - so this is what lets Stamp vouch for a segment this
+	// process wrote and will not append to again.
+	sealed int32
 }
 
 func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
@@ -162,6 +166,10 @@ func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
 	// FileBackedPlatformIO (see this type's doc comment), which is what makes
 	// load-then-advance safe here.
 	offset := atomic.LoadInt64(&seg.size)
+	if atomic.LoadInt32(&seg.sealed) != 0 {
+		// Written after its seal (a repair, say): no longer something Stamp may vouch for.
+		atomic.StoreInt32(&seg.sealed, 0)
+	}
 	if _, err := seg.file.WriteAt(bytes, offset); err != nil {
 		return 0, err
 	}
@@ -189,6 +197,30 @@ func (s *OSByteStore) Size(segmentName string) (int64, error) {
 		return 0, err
 	}
 	return info.Size(), nil
+}
+
+// Stamp reports a segment's size and modification time, or ok=false while this process holds it
+// open for appending and has not sealed it: such a segment's contents are still changing, so
+// nothing may be cached against them.
+func (s *OSByteStore) Stamp(segmentName string) (size, modNanos int64, ok bool, err error) {
+	s.mu.Lock()
+	seg, open := s.handles[segmentName]
+	s.mu.Unlock()
+	if open && atomic.LoadInt32(&seg.sealed) == 0 {
+		return 0, 0, false, nil
+	}
+	info, err := os.Stat(s.pathFor(segmentName))
+	if err == nil && open {
+		// The logical size, which is what a scan reads to; a preallocated file is longer.
+		return atomic.LoadInt64(&seg.size), info.ModTime().UnixNano(), true, nil
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, false, &PlatformIOError{Message: "segment does not exist", SegmentName: segmentName, Cause: err}
+		}
+		return 0, 0, false, err
+	}
+	return info.Size(), info.ModTime().UnixNano(), true, nil
 }
 
 func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte, error) {
@@ -274,7 +306,15 @@ func (s *OSByteStore) Close() error {
 }
 
 func (s *OSByteStore) MarkSealed(segmentName string) error {
-	// v1: sealing is advisory; persisted segments are discovered by listing + scanning.
+	// Sealing is advisory: persisted segments are discovered by listing + scanning, and the
+	// handle stays open. It is recorded only so Stamp can tell a finished segment from one still
+	// being written.
+	s.mu.Lock()
+	seg, ok := s.handles[segmentName]
+	s.mu.Unlock()
+	if ok {
+		atomic.StoreInt32(&seg.sealed, 1)
+	}
 	return nil
 }
 

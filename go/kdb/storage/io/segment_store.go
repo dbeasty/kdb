@@ -18,6 +18,11 @@ type SegmentByteStore interface {
 // store that knows a segment's length without reading it (OSByteStore stats the file).
 // Optional so a store written against the interface above keeps compiling; FileBackedPlatformIO
 // reports storage.ErrSegmentSizeUnknown for one that lacks it, and the caller reads instead.
+// segmentStoreStamper is the optional SegmentByteStore counterpart of storage.SegmentStamper.
+type segmentStoreStamper interface {
+	Stamp(segmentName string) (size, modNanos int64, ok bool, err error)
+}
+
 type segmentStoreSizer interface {
 	Size(segmentName string) (int64, error)
 }

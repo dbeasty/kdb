@@ -170,6 +170,28 @@ func (f *FileBackedPlatformIO) SegmentSize(segmentName string) (int64, error) {
 
 var _ storage.SegmentSizer = (*FileBackedPlatformIO)(nil)
 
+// SegmentStamp implements storage.SegmentStamper by asking the store beneath, under the same
+// per-segment lock as SegmentSize. ok is false when the store cannot vouch for the segment.
+func (f *FileBackedPlatformIO) SegmentStamp(segmentName string) (storage.SegmentStamp, bool, error) {
+	if err := ValidateSegmentName(segmentName); err != nil {
+		return storage.SegmentStamp{}, false, err
+	}
+	st, has := f.store.(segmentStoreStamper)
+	if !has {
+		return storage.SegmentStamp{}, false, nil
+	}
+	mu := f.mutexFor(segmentName)
+	mu.Lock()
+	defer mu.Unlock()
+	size, mod, ok, err := st.Stamp(segmentName)
+	if err != nil || !ok {
+		return storage.SegmentStamp{}, false, err
+	}
+	return storage.SegmentStamp{Size: size, ModTimeNanos: mod}, true, nil
+}
+
+var _ storage.SegmentStamper = (*FileBackedPlatformIO)(nil)
+
 // FlushSegment deliberately does NOT take mutexFor(segmentName): that
 // mutex also guards AppendToSegment, and group commit relies on new
 // appends being able to proceed (and register with the GroupCommitter)

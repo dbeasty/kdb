@@ -744,6 +744,16 @@ func lowestSegmentSequence(r storage.DeltaSegmentReader) int64 {
 	if r == nil {
 		return -1
 	}
+	if sq, ok := r.(storage.DeltaSegmentSequenceLister); ok {
+		// Names only. Listing scanned every segment to answer a question the file names
+		// already answer, and this runs several times per checkpoint.
+		if seqs, err := sq.SegmentSequences(); err == nil {
+			if len(seqs) == 0 {
+				return -1
+			}
+			return seqs[0]
+		}
+	}
 	segments, err := r.ListSegments()
 	if err != nil || len(segments) == 0 {
 		return -1
@@ -763,6 +773,14 @@ func lowestSegmentSequence(r storage.DeltaSegmentReader) int64 {
 func highestSegmentSequence(r storage.DeltaSegmentReader) int64 {
 	if r == nil {
 		return -1
+	}
+	if sq, ok := r.(storage.DeltaSegmentSequenceLister); ok {
+		if seqs, err := sq.SegmentSequences(); err == nil {
+			if len(seqs) == 0 {
+				return -1
+			}
+			return seqs[len(seqs)-1]
+		}
 	}
 	segments, err := r.ListSegments()
 	if err != nil {

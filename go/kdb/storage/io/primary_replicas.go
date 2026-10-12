@@ -145,6 +145,14 @@ func (s *PrimaryWithReplicas) Size(segmentName string) (int64, error) {
 	return 0, storage.ErrSegmentSizeUnknown
 }
 
+// Stamp forwards to the primary, like Size.
+func (s *PrimaryWithReplicas) Stamp(segmentName string) (size, modNanos int64, ok bool, err error) {
+	if st, has := s.primary.(segmentStoreStamper); has {
+		return st.Stamp(segmentName)
+	}
+	return 0, 0, false, nil
+}
+
 func (s *PrimaryWithReplicas) Flush(segmentName string, fsync bool) error {
 	return s.primary.Flush(segmentName, fsync)
 }

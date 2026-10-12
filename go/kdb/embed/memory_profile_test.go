@@ -6,8 +6,10 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"runtime/metrics"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -130,12 +132,26 @@ func TestMemoryProfile(t *testing.T) {
 
 	case "checkpoint":
 		rt := open()
+		pprofDir := os.Getenv("KDB_MEMPROFILE_PPROF") // allocation profiles bracketing the close
+		writeAllocs := func(name string) {
+			if pprofDir == "" {
+				return
+			}
+			f, err := os.Create(filepath.Join(pprofDir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			pprof.Lookup("allocs").WriteTo(f, 0)
+		}
+		writeAllocs("before.pb.gz")
 		var before runtime.MemStats
 		runtime.ReadMemStats(&before)
 		peak := sampleHeap()
 		start := time.Now()
 		rt.Close() // seals the log and writes the checkpoint
 		took := time.Since(start)
+		writeAllocs("after.pb.gz")
 		var after runtime.MemStats
 		runtime.ReadMemStats(&after)
 		report(t, "checkpoint", fmt.Sprintf("close+checkpoint took %v, allocated %s, peakHeapDuringClose=%s",
