@@ -178,7 +178,8 @@ not a KDB one. What qtask depends on:
 | U4 | Kotlin ported; `go/testdata/golden/sql/result_bound.json` read by both trees | New `SqlResultLimitException` and `KdbErrorCode.RESOURCE_EXHAUSTED(9001)` |
 | U5 | Decided: a ranking is never cut; overflow is an error; LIMITed queries keep the spec depth | Go and Kotlin. Kotlin vector search with no LIMIT now asks for every document instead of `maxRows` |
 | U6 | Wire-level tests for UPDATE/DELETE past the bound (Go); engine-level (Kotlin) | Confirmed to fail with the old truncation: an UPDATE past the bound reported success and changed nothing |
-| U7 | `keylookup` access path for `kdb_id = c` and `kdb_id IN (...)` (Go) | Go only; Kotlin still scans (same answers, different cost) |
+| U7 | `keylookup` access path for `kdb_id = c` and `kdb_id IN (...)` | Go and Kotlin (`PhysicalPlan.KeyLookup`); shared fixture `go/testdata/golden/sql/cost_behaviour.json` |
+| U9 | Kotlin examined-rows budget: `QueryContext.rowBudget` / `SqlRowBudgetException` (RESOURCE_EXHAUSTED) | Same counting as Go: every id a full scan visits, and every id a residual filter inspects; 0 = unlimited. Not yet wired to a Kotlin server flag (kdb-server has no query path of its own; embedders set it on the context) |
 | U8 | `Client.delete()` and `Transaction.deletes` (TS) | Verified against the live Go server |
 
 ## Decisions made while implementing
@@ -189,10 +190,11 @@ not a KDB one. What qtask depends on:
   `offset + min(limit, MaxRows+1)`. Everything else reads to the end, bounded by `RowBudget`.
 - Open question 2 (bounding the id list): left as is; the list is bounded by `RowBudget` already
   when a residual exists, and a keyed/indexed path is bounded by what it returns.
-- Kotlin has no examined-rows budget. It now reads whole namespaces for a filtered scan, exactly
-  as it did before for the scan itself (it never stopped scanning early), so this adds no work.
-- Kotlin's `keylookup` and `--max-result-rows` equivalents were not ported: the Kotlin engine is
-  the reference implementation, not the deployment target, and neither changes an answer.
+- Kotlin examined-rows budget and keyed lookup were ported afterwards (U7/U9 above): both engines
+  now have the same cost behaviour, pinned by `cost_behaviour.json` (Go `TestCostBehaviourFixture`,
+  Kotlin `CostBehaviourFixtureTest`): key lookups succeed under a budget of 1, scans over more
+  rows than the budget abort whatever they return, and `maxRows` never limits a scan. Kotlin's
+  `--max-result-rows` equivalent is still not ported (`QueryContext.maxRows` is the knob).
 
 ## Progress log
 

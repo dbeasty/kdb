@@ -1,0 +1,27 @@
+{
+  "description": "Cost behaviour both engines must share: `kdb_id = c` and `kdb_id IN (...)` are resolved by key (never a scan), rowBudget bounds rows EXAMINED (not returned), and a result bound never truncates the scan. Read by go/kdb/sql/cost_behaviour_fixture_test.go and kdb-sql's jvmTest CostBehaviourFixtureTest.",
+  "docs": 50,
+  "id": "document i (0-based) has id 00000000-0000-4000-8000-<i+1, 12 digits>; ${id:N} in sql/params means the id of the document with 1-based number N",
+  "document": "{\"name\":\"n%03d\",\"rank\":%d}  (both from the 0-based index; schemaless)",
+  "cases": [
+    { "name": "equality on kdb_id is a key lookup, not a scan", "sql": "SELECT name FROM t WHERE kdb_id = '${id:3}'", "rowBudget": 1, "access": "keylookup", "rows": ["n002"] },
+    { "name": "reversed operands", "sql": "SELECT name FROM t WHERE '${id:3}' = kdb_id", "rowBudget": 1, "access": "keylookup", "rows": ["n002"] },
+    { "name": "bound parameter", "sql": "SELECT name FROM t WHERE kdb_id = ?", "params": ["${id:3}"], "rowBudget": 1, "access": "keylookup", "rows": ["n002"] },
+    { "name": "IN list; the unknown id contributes nothing", "sql": "SELECT name FROM t WHERE kdb_id IN ('${id:3}', '${id:1}', '00000000-0000-4000-8000-000000000999') ORDER BY name", "rowBudget": 3, "access": "keylookup", "rows": ["n000", "n002"] },
+    { "name": "the rest of the WHERE still applies (match)", "sql": "SELECT name FROM t WHERE kdb_id = '${id:3}' AND rank = 2", "rowBudget": 1, "access": "keylookup", "rows": ["n002"] },
+    { "name": "the rest of the WHERE still applies (no match)", "sql": "SELECT name FROM t WHERE kdb_id = '${id:3}' AND rank = 9", "rowBudget": 1, "access": "keylookup", "rows": [] },
+    { "name": "absent id", "sql": "SELECT name FROM t WHERE kdb_id = '00000000-0000-4000-8000-000000000999'", "rowBudget": 1, "access": "keylookup", "rows": [] },
+    { "name": "a string that is not a uuid names nothing", "sql": "SELECT name FROM t WHERE kdb_id = 'not-a-uuid'", "rowBudget": 1, "access": "keylookup", "rows": [] },
+    { "name": "IN of strings that are not uuids", "sql": "SELECT name FROM t WHERE kdb_id IN ('x', 'y')", "rowBudget": 1, "access": "keylookup", "rows": [] },
+    { "name": "key lookup past a tiny maxRows", "sql": "SELECT name FROM t WHERE kdb_id = '${id:50}'", "rowBudget": 1, "maxRows": 1, "access": "keylookup", "rows": ["n049"] },
+    { "name": "<> on kdb_id is a scan", "sql": "SELECT COUNT(*) FROM t WHERE kdb_id <> '${id:3}'", "access": "scan", "rows": ["49"] },
+    { "name": "OR with a key is a scan that sees both sides", "sql": "SELECT name FROM t WHERE kdb_id = '${id:3}' OR rank = 7 ORDER BY name", "access": "scan", "rows": ["n002", "n007"] },
+    { "name": "LIKE on kdb_id is a scan", "sql": "SELECT COUNT(*) FROM t WHERE kdb_id LIKE '%0001'", "access": "scan", "rows": ["1"] },
+    { "name": "a scan over more rows than the budget is aborted", "sql": "SELECT name FROM t WHERE rank >= 0 ORDER BY name LIMIT 1", "rowBudget": 10, "budgetError": 10 },
+    { "name": "the budget counts rows examined, not rows returned (selective filter)", "sql": "SELECT name FROM t WHERE name = 'n049'", "rowBudget": 49, "budgetError": 49 },
+    { "name": "a budget equal to the namespace size is enough", "sql": "SELECT name FROM t WHERE name = 'n049'", "rowBudget": 50, "access": "scan", "rows": ["n049"] },
+    { "name": "an aggregate that reads everything is bounded too", "sql": "SELECT COUNT(*) FROM t", "rowBudget": 10, "budgetError": 10 },
+    { "name": "zero budget is unlimited", "sql": "SELECT COUNT(*) FROM t", "rowBudget": 0, "rows": ["50"] },
+    { "name": "the result bound does not limit the scan: filtered count past maxRows", "sql": "SELECT COUNT(*) FROM t WHERE rank >= 10", "maxRows": 10, "rows": ["40"] }
+  ]
+}

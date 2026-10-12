@@ -29,6 +29,19 @@ public class SqlResultLimitException(
     override val code: KdbErrorCode get() = KdbErrorCode.RESOURCE_EXHAUSTED
 }
 
+/**
+ * A scan examined more rows than its budget (`QueryContext.rowBudget`). The query is too expensive
+ * as written; narrowing it is the fix, retrying unchanged is not. Mirrors Go's
+ * `sql.ScanRowBudgetExceededError`.
+ */
+public class SqlRowBudgetException(
+    public val budget: Int,
+) : KdbException(
+        "kdb sql: scan examined more than its budget of $budget rows - narrow the query (add a more selective predicate, or an indexed one)",
+    ) {
+    override val code: KdbErrorCode get() = KdbErrorCode.RESOURCE_EXHAUSTED
+}
+
 public class VirtualViewExistsException(
     message: String,
     public val viewName: String,
