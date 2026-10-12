@@ -23,7 +23,7 @@ func TestServiceServesOneNamespacePerCollection(t *testing.T) {
 		t.Skip("builds and runs the service binary")
 	}
 	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "kdb-service")
+	bin := filepath.Join(tmp, exeName("kdb-service"))
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}

@@ -61,7 +61,7 @@ func writeDoc(t *testing.T, s side, ns string, parent codec.Hash, docID codec.UU
 	tx := document.Transaction{
 		ID: txID, BaseVersion: parent,
 		Operations:   []document.Op{document.WriteOp{DocID: docID, Patch: json}},
-		Timestamp:    codec.TimestampNow(),
+		Timestamp:    nextTimestamp(),
 		AuthorNodeID: authorID,
 	}
 	commit, err := s.dag.AppendCommitDetached(tx, parent, tree, nil, "test write")
@@ -529,7 +529,7 @@ func TestResolveDivergenceClassifiesDeleteWriteConflict(t *testing.T) {
 	deleteTx := document.Transaction{
 		ID: txID, BaseVersion: seedC.Hash,
 		Operations:   []document.Op{document.DeleteOp{DocID: sharedDoc}},
-		Timestamp:    codec.TimestampNow(),
+		Timestamp:    nextTimestamp(),
 		AuthorNodeID: authorID,
 	}
 	localC, err := local.dag.AppendCommitDetached(deleteTx, seedC.Hash, tree, nil, "test delete")

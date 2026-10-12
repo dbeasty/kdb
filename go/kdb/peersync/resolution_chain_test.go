@@ -26,7 +26,7 @@ func writeDocBy(t *testing.T, s side, ns string, parent codec.Hash, docID codec.
 	tx := document.Transaction{
 		ID: newUUID(t), BaseVersion: parent,
 		Operations:   []document.Op{document.WriteOp{DocID: docID, Patch: json}},
-		Timestamp:    codec.TimestampNow(),
+		Timestamp:    nextTimestamp(),
 		AuthorNodeID: author,
 	}
 	commit, err := s.dag.AppendCommitDetached(tx, parent, tree, nil, "test write")

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -26,7 +27,7 @@ func TestTwoDefaultInstancesStartSideBySide(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and runs the service binary")
 	}
-	bin := filepath.Join(t.TempDir(), "kdb-service")
+	bin := filepath.Join(t.TempDir(), exeName("kdb-service"))
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
@@ -63,4 +64,13 @@ func TestTwoDefaultInstancesStartSideBySide(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
+}
+
+// exeName is name as `go build -o` must be told to write it for exec to find it: Windows will only
+// run a file whose extension is in PATHEXT.
+func exeName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
 }
