@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"runtime"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
@@ -32,28 +33,32 @@ type TreeProof struct {
 // Proof returns the proof of what t holds for id.
 func (t DocumentTree) Proof(id codec.UUID) TreeProof {
 	p := TreeProof{DocID: id}
-	idBytes := id.Bytes()
-	n := t.trieRootOrBuild()
-	for depth := 0; n != nil; depth++ {
-		if n.leaf != nil {
-			p.HasLeaf, p.LeafID, p.LeafHash = true, n.leaf.uuid, n.leaf.hash
+	key := uuidKey(id)
+	h := t.trieRootOrBuild()
+	if h == nil {
+		return p
+	}
+	defer runtime.KeepAlive(h)
+	v := h.slab.view()
+	r := h.root
+	for depth := 0; r != 0; depth++ {
+		if r&refLeaf != 0 {
+			l := v.leaf(r)
+			p.HasLeaf, p.LeafID, p.LeafHash = true, keyUUID(&l.id), l.content
 			return p
 		}
+		n := v.node(r)
 		var level [16]codec.Hash
-		if n.children == nil {
-			p.Levels = append(p.Levels, level)
-			return p
-		}
-		for i, c := range n.children {
-			if c != nil {
-				level[i] = codec.Hash{Bytes: c.hash}
+		for i, c := range n.child {
+			if c != 0 {
+				level[i] = codec.Hash{Bytes: *v.hash(c)}
 			}
 		}
 		p.Levels = append(p.Levels, level)
 		if depth >= trieDepth {
 			return p
 		}
-		n = n.children[nibbleAt(idBytes, depth)]
+		r = n.child[keyNibble(&key, depth)]
 	}
 	return p
 }

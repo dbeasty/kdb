@@ -87,9 +87,9 @@ func TestCompressedLeafHashesMatchFullDepthSpine(t *testing.T) {
 	// level, all siblings absent, exactly as the uncompressed trie did.
 	want := leafHash(id.Bytes(), h)
 	for d := trieDepth - 1; d >= 0; d-- {
-		var children [16]*trieNode
-		children[nibbleAt(id.Bytes(), d)] = &trieNode{hash: want}
-		want = internalHash(&children)
+		var children [16]*ptrNode
+		children[nibbleAt(id.Bytes(), d)] = &ptrNode{hash: want}
+		want = ptrInternalHash(&children)
 	}
 	if tree.TreeHash.Bytes != want {
 		t.Fatalf("single-entry tree hash changed under compression:\n got %x\nwant %x",
@@ -97,21 +97,30 @@ func TestCompressedLeafHashesMatchFullDepthSpine(t *testing.T) {
 	}
 }
 
-// trieNodeCount counts allocated nodes. Structural on purpose: a compressed leaf hashes
-// *identically* to the spine it replaces - that equivalence is the whole premise - so no
-// assertion about hashes can tell whether compression actually happened. Only counting nodes
+// slabRecordCount counts the records a tree is made of. Structural on purpose: a compressed leaf
+// hashes *identically* to the spine it replaces - that equivalence is the whole premise - so no
+// assertion about hashes can tell whether compression actually happened. Only counting records
 // can.
-func trieNodeCount(n *trieNode) int {
-	if n == nil {
+func slabRecordCount(h *trieTree) int {
+	if h == nil {
 		return 0
 	}
-	c := 1
-	if n.children != nil {
-		for _, ch := range n.children {
-			c += trieNodeCount(ch)
+	v := h.slab.view()
+	var count func(r tref) int
+	count = func(r tref) int {
+		if r == 0 {
+			return 0
 		}
+		if r&refLeaf != 0 {
+			return 1
+		}
+		c := 1
+		for _, ch := range v.node(r).child {
+			c += count(ch)
+		}
+		return c
 	}
-	return c
+	return count(h.root)
 }
 
 // TestDeleteRecompressesTheSpine covers the half of the invariant that is easy to leave out.
@@ -157,7 +166,7 @@ func TestDeleteRecompressesTheSpine(t *testing.T) {
 	}
 	// The hashes above would match even with the spine left in place, so the memory claim needs
 	// its own assertion: one entry means one node.
-	if got := trieNodeCount(tree.trieRoot); got != 1 {
+	if got := slabRecordCount(tree.trie); got != 1 {
 		t.Fatalf("a tree holding one entry is made of %d nodes, want 1; "+
 			"delete is not re-compressing, so the spines grow back as a namespace churns", got)
 	}

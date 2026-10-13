@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -75,19 +76,30 @@ func TestHistoryTreesChargedByTheirDelta(t *testing.T) {
 	runtime.KeepAlive(e)
 }
 
-// The live-tree estimate is close to what a live tree actually occupies.
+// The live-tree figure is close to what a live tree actually occupies, and the per-document
+// estimate is not above it.
 func TestLiveTreeEstimateMatchesHeap(t *testing.T) {
 	if testing.Short() {
 		t.Skip("allocates tens of MB")
 	}
 	const n = 100_000
+	// Trees from earlier tests free their slabs only once their cleanups have run, which is
+	// asynchronous to the GC; let them finish first so they do not land inside the measurement.
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
 	before := heapNow()
 	tree := treeOfSize(t, 7, n)
 	heap := heapNow() - before
-	est := treeBytesPerDoc * int64(tree.Size())
-	t.Logf("%d documents: heap %.1f MB, estimate %.1f MB", n, float64(heap)/1e6, float64(est)/1e6)
+	est := tree.SlabBytes()
+	perDoc := treeBytesPerDoc * int64(tree.Size())
+	t.Logf("%d documents: heap %.1f MB, slab %.1f MB, per-document estimate %.1f MB", n, float64(heap)/1e6, float64(est)/1e6, float64(perDoc)/1e6)
 	if r := float64(est) / float64(heap); r < 0.75 || r > 1.33 {
-		t.Fatalf("live tree estimate is %.2fx the heap", r)
+		t.Fatalf("live tree figure is %.2fx the heap", r)
+	}
+	if perDoc > est {
+		t.Fatalf("the per-document estimate (%d) is above what the slab holds (%d)", perDoc, est)
 	}
 	runtime.KeepAlive(tree)
 }

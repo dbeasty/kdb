@@ -264,15 +264,17 @@ func TestTrieBulkBuildMatchesInsert(t *testing.T) {
 				entries[id] = codec.Hash{}
 			}
 		}
-		var inserted *trieNode
+		var inserted *trieTree
+		var reference *ptrNode
 		for id, h := range entries {
-			inserted = trieInsert(inserted, id, h)
+			inserted = trieWith(inserted, id, h)
+			reference = ptrInsert(reference, id, h)
 		}
 		bulk := trieBuild(entries)
-		if !trieNodesEqual(inserted, bulk) {
-			t.Fatalf("n=%d: bulk-built trie differs from the inserted one", n)
+		if !slabMatchesPtr(inserted, reference) || !slabMatchesPtr(bulk, reference) {
+			t.Fatalf("n=%d: bulk-built or inserted trie differs from the reference", n)
 		}
-		if trieTreeHash(inserted) != trieTreeHash(bulk) {
+		if inserted.rootHash() != bulk.rootHash() || bulk.rootHash() != ptrTreeHash(reference) {
 			t.Fatalf("n=%d: tree hash differs", n)
 		}
 		tree, _ := BuildTrieDocumentTree(entries)
@@ -286,29 +288,6 @@ func TestTrieBulkBuildMatchesInsert(t *testing.T) {
 			}
 		}
 	}
-}
-
-func trieNodesEqual(a, b *trieNode) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	if a.hash != b.hash {
-		return false
-	}
-	if (a.leaf == nil) != (b.leaf == nil) || (a.children == nil) != (b.children == nil) {
-		return false
-	}
-	if a.leaf != nil && *a.leaf != *b.leaf {
-		return false
-	}
-	if a.children != nil {
-		for i := range a.children {
-			if !trieNodesEqual(a.children[i], b.children[i]) {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // A packed tree round-trips to the same tree, from either kind of source tree, and malformed

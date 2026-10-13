@@ -8,15 +8,16 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 )
 
-// Trie cost constants (document/document_tree_trie.go). An internal node is a 48-byte trieNode
-// plus its 128-byte child array; a leaf is a trieNode plus a 48-byte trieLeaf. Leaves are
-// path-compressed - a leaf sits at the first depth where its subtree holds one entry - so a
-// tree of n random ids is about log16(n)+1 levels deep and costs about treeBytesPerDoc per
-// document all told (TestTreeMemoryPerDocumentStaysBounded measures 157).
+// Trie cost constants (document/document_tree_slab.go). The trie's records live in a slab: an
+// internal node is a 100-byte record, a leaf an 84-byte one. Leaves are path-compressed - a leaf
+// sits at the first depth where its subtree holds one entry - so a tree of n random ids is about
+// log16(n)+1 levels deep, has about 0.37 internal nodes per leaf, and costs about
+// treeBytesPerDoc per document all told including chunk slack
+// (TestSlabTreeMemoryPerDocument measures ~131).
 const (
-	treeBytesPerNode = 176
-	treeBytesPerLeaf = 96
-	treeBytesPerDoc  = 160
+	treeBytesPerNode = 100
+	treeBytesPerLeaf = 84
+	treeBytesPerDoc  = 130
 	// treeEntryOverhead is the store's own cost per tree: its entry, map slot and list element.
 	treeEntryOverhead = 192
 )

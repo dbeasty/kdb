@@ -111,8 +111,9 @@ type MemoryBreakdown struct {
 	// DocumentVersions and DocumentPlaceholders count resident versions and pinned-but-unloaded
 	// ones.
 	DocumentVersions, DocumentPlaceholders int64
-	// LiveTree estimates the live tree's trie at treeBytesPerDoc per document. Held outside
-	// every budget: it is the namespace's current state.
+	// LiveTree is the memory of the slab holding the live tree's trie (document.SlabBytes): the
+	// live tree, the history records it shares that slab with, and free slots awaiting reuse.
+	// Held outside every budget: it is the namespace's current state.
 	LiveTree int64
 	// HistoryTrees is the tree store's evictable charge: what the history budget governs.
 	HistoryTrees int64
@@ -150,7 +151,9 @@ func (e *ServerEngine) MemoryBreakdown() MemoryBreakdown {
 		b.DocumentPlaceholders = st.Placeholders
 	}
 	if s := e.latestTree.Load(); s != nil {
-		b.LiveTree = treeBytesPerDoc * int64(s.tree.Size())
+		if b.LiveTree = s.tree.SlabBytes(); b.LiveTree == 0 {
+			b.LiveTree = treeBytesPerDoc * int64(s.tree.Size())
+		}
 	}
 	if e.treesByHash != nil {
 		// Evictable rather than resident: see boundedTreeStore.EvictableBytes.

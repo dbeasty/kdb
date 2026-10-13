@@ -53,8 +53,9 @@ func TestPinnedTreeSurvivesEvictionPressure(t *testing.T) {
 	if s.PinnedCount() != 0 {
 		t.Fatalf("expected no pins after release, got %d", s.PinnedCount())
 	}
-	// Released, it is ordinary history again and goes the way of everything else.
-	for i := 51; i <= 60; i++ {
+	// Released, it is ordinary history again and goes the way of everything else: twice the
+	// budget's worth of newer trees pushes it out.
+	for i := 51; i <= 50+int(2*(8<<10)/treeSizeBytes(base)); i++ {
 		s.Put(treeOfSize(t, i, 4))
 	}
 	if _, ok := s.Peek(base.TreeHash); ok {
