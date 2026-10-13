@@ -501,13 +501,21 @@ const drainPerUpdate = 4
 // the empty tree, which has no handle - except in a slab bound to a tree file, where an empty
 // tree keeps a handle so that what is derived from it stays bound.
 func (s *trieSlab) adopt(root tref) *trieTree {
+	return s.adoptAt(root, s.gen.Load())
+}
+
+// adoptAt is adopt for a root that refers into the segments of generation gen (trieTree.gen):
+// what it was rebased onto, which a segment landing since may already have moved past. Stamping
+// such a root with the newer generation would pass it off as rebased, and no rebase would ever
+// move it off the segments it still holds.
+func (s *trieSlab) adoptAt(root tref, gen uint32) *trieTree {
 	if root == 0 {
 		if s.file.Load() == nil {
 			return nil
 		}
-		return &trieTree{slab: s, gen: s.gen.Load()}
+		return &trieTree{slab: s, gen: gen}
 	}
-	h := &trieTree{slab: s, root: root, gen: s.gen.Load()}
+	h := &trieTree{slab: s, root: root, gen: gen}
 	runtime.AddCleanup(h, dropTrieRoot, trieDrop{slab: s.self, root: root})
 	return h
 }

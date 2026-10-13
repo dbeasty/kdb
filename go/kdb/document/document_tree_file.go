@@ -913,8 +913,10 @@ func (h *trieTree) rebased() *trieTree {
 // onto it, in one pass: the translation, copies and placements of records several of them reach
 // are shared, so rebasing a history of trees costs what they hold between them, not each.
 func (s *trieSlab) rebaseTrees(hs []*trieTree) {
-	gen := s.gen.Load()
 	s.mu.Lock()
+	// Read with the target, under the lock that writeOut moves both under: a generation read
+	// apart from it could be newer than the target, and the trees rebased here stamped with it.
+	gen := s.gen.Load()
 	target := s.rebaseTo
 	if target == 0 {
 		s.mu.Unlock()
@@ -939,7 +941,7 @@ func (s *trieSlab) rebaseTrees(hs []*trieTree) {
 	putEdit(e)
 	for i, h := range hs {
 		if h != nil && !(h.gen == gen || h.root == target) {
-			hs[i] = s.adopt(roots[i])
+			hs[i] = s.adoptAt(roots[i], gen)
 			runtime.KeepAlive(h)
 		}
 	}

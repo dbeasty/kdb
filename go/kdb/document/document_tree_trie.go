@@ -364,17 +364,18 @@ func (s *trieSlab) place(e *trieEdit, r tref) tref {
 	return tref(i)
 }
 
-// commit places the edit's result and wraps it in a new handle.
-func (s *trieSlab) commit(e *trieEdit, r tref) *trieTree {
+// commit places the edit's result and wraps it in a new handle. gen is the generation of the
+// tree the edit derived from (see adoptAt).
+func (s *trieSlab) commit(e *trieEdit, r tref, gen uint32) *trieTree {
 	if r == 0 {
-		return s.adopt(0)
+		return s.adoptAt(0, gen)
 	}
 	s.mu.Lock()
 	s.drain(drainPerUpdate)
 	r = s.place(e, r)
 	s.retain(r)
 	s.mu.Unlock()
-	return s.adopt(r)
+	return s.adoptAt(r, gen)
 }
 
 // trieWith returns the tree h with (id, contentHash) set, sharing every subtree not on id's
@@ -382,18 +383,19 @@ func (s *trieSlab) commit(e *trieEdit, r tref) *trieTree {
 func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
 	var s *trieSlab
 	var root tref
+	var gen uint32
 	if h == nil {
 		s = newTrieSlab()
 	} else {
 		h = h.rebased()
-		s, root = h.slab, h.root
+		s, root, gen = h.slab, h.root, h.gen
 	}
 	e := getEdit(s.view())
 	key := uuidKey(id)
 	nr := e.insert(root, &key, contentHash, 0)
 	out := h
 	if nr != root {
-		out = s.commit(e, nr)
+		out = s.commit(e, nr, gen)
 		s.maybeRewrite(out)
 	}
 	putEdit(e)
@@ -412,7 +414,7 @@ func trieWithout(h *trieTree, id codec.UUID) *trieTree {
 	nr := e.delete(h.root, &key, 0)
 	out := h
 	if nr != h.root {
-		out = h.slab.commit(e, nr)
+		out = h.slab.commit(e, nr, h.gen)
 		h.slab.maybeRewrite(out)
 	}
 	putEdit(e)

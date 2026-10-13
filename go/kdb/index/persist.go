@@ -99,11 +99,20 @@ func storeStats(store Store) map[string]float64 {
 // the newer of the pair: a manifest that names head always sits next to the snapshot taken at
 // head (or a later manifest does). data == nil writes the manifest alone, for a store whose
 // snapshot on disk is already its current content - the caller vouches for that.
+//
+// Nor may the snapshot be the newer of the pair: the old manifest is removed, durably, before new
+// bytes replace the snapshot. Snapshots are captured at heads that are not yet durable (the
+// indexes advance before the commit reaches the delta log), so a crash between the two renames
+// can reopen at exactly the head the old manifest names - which would restore the new bytes as
+// if they described it.
 func writeStoreSnapshot(dir string, desc Descriptor, data []byte, stats map[string]float64, head codec.Hash) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	if data != nil {
+		if err := InvalidateStoreSnapshot(dir); err != nil {
+			return err
+		}
 		if err := WriteFileAtomic(filepath.Join(dir, SnapshotFileName), data); err != nil {
 			return err
 		}
