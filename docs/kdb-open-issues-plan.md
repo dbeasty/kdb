@@ -1094,3 +1094,49 @@ logged twice. The e2e late-joiner test passes 3/3 with `--runxfail` (both parame
   - **Found, not fixed:** a sealed segment whose bytes change for any other reason (a repair that
     quarantines frames, say) would still be re-uploaded under the shared key a base manifest names.
     Only damage is refused now. Uploading changed content under a fresh key would close that.
+
+- **2026-10-13 — rollback to v0.6.2 after a clean stop served stale values again (since #161).**
+  `test_upgrade.py::test_rollback_to_v062_after_a_clean_stop` and
+  `::test_rollback_after_a_crash_is_safe_once_this_build_recovers_and_stops_cleanly` failed on
+  main 529408e: every rolled-back v0.6.2 node held all 30 documents, all 30 behind their
+  acknowledged value. Silent loss on rollback.
+  - **Cause.** cbc3053 (#161, "checkpoint v4") made every checkpoint version 4. v0.6.2 reads only
+    version 2. It treats any other version as "nothing usable" and replays the whole log, and the
+    log is intact (a clean stop truncates nothing). But v0.6.2's replay does not move main onto a
+    logged canonical join that does not descend from it (#114 `SupersedesHead`). That is the same
+    defect behind the xfail `test_rollback_to_v062_after_a_crash`. The clean-stop rollback was
+    safe only because a v2 checkpoint at main left v0.6.2 nothing to replay. #159's version 3 did
+    not break it: it is written only when graph segments exist, which they do not by default.
+    v0.7.x replays this build's log correctly, so a rollback to v0.7.x was never affected.
+  - **Bisect** (macOS, 5 nodes, the clean-stop test, flaky because it needs a join in the log):
+    v0.7.1, 665d9fc, 9f9fd13 (#159) and 93c395c passed every run (4-5 each). cbc3053 failed 5 of
+    5, b18c3f5 (#161 merge) 5 of 5, and 529408e 4 of 4. 0eee4e0 (#163) looked like the first bad
+    merge, but #163 only touches a Linux-only file. fbd388b, its parent, fails 2 of 4.
+  - **Fix: write a checkpoint older versions can read, while it is cheap.**
+    - `encodeCheckpoint` writes version 2 (a record per commit and per live document, and none of
+      the fields v0.6.x does not know) when the namespace has no graph segments and at most
+      `legacyCheckpointMaxEntries` = 20,000 live documents plus commits. Otherwise it writes
+      version 4, as before.
+    - At the bound (10k documents and 9k commits), v2 encodes in 12 ms and decodes in 23 ms, and
+      allocates 55 MB. v4 takes 1.6 ms and 9 ms, and allocates 13 MB. The v4 numbers at 1M documents
+      are unchanged.
+    - The alternatives were rejected:
+      - "Don't truncate the log" does not apply. Nothing is truncated; v0.6.2's replay is the defect.
+      - "Old versions refuse loudly" cannot be built from new data without a hack (for example an
+        unknown history strategy in `meta.json` with a misleading error). It would also break the
+        working rollback to v0.7.x.
+      - Always writing v2 would bring back the 7.6 GB / 8.4 GB RSS checkpoint at 1M documents.
+  - **What stays unsafe, and is now stated:** rollback to v0.6.x of a namespace past the bound, or
+    of one with graph segments, still replays on v0.6.x and can open behind. Roll those back to
+    v0.7.x.
+  - **Tests:** `embed.TestCheckpointFormatFollowsNamespaceSize` replaces
+    `TestCheckpointReadsV2AndWritesPackedV4`. It checks that a small namespace gets v2 with no
+    v4 fields and round-trips its commits, including packed ones; that past the bound, or with
+    graph refs, it gets v4; and that v4 round-trips. With v0.6.2 as `KDB_SERVICE_BIN_PREV`,
+    `test_upgrade.py` passes in full, including the two rollback tests.
+  - **With v0.7.1 as `KDB_SERVICE_BIN_PREV`** two other tests fail. Both are written for v0.6.2,
+    not regressions:
+    - `test_old_pushers_into_a_new_snapshot_hub_get_a_typed_error_then_heal_on_upgrade` expects
+      an old pusher that does not know SHALLOW_BOUNDARY. v0.7.1 has #140.
+    - `test_resolution_chain_version_2_after_a_rolling_upgrade` expects an old node to ignore the
+      chain `version` field. v0.7.1 has chain version 2 (#134).

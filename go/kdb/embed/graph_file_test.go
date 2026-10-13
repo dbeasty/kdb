@@ -372,9 +372,39 @@ func TestCheckpointStampsLetOpenSkipTheScan(t *testing.T) {
 	}
 }
 
-// A version-2 checkpoint (the live tree as records, what main writes today) still restores, and
-// what this build writes is version 4 with the tree packed.
-func TestCheckpointReadsV2AndWritesPackedV4(t *testing.T) {
+// checkpointVersionOf reads the format version a checkpoint was written as.
+func checkpointVersionOf(t *testing.T, raw []byte) int32 {
+	t.Helper()
+	v, err := codec.DecodeBytes(raw, checkpointType, checkpointRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v.(codec.RecordValue).Fields[1].(codec.Int32Value).V
+}
+
+func testCheckpointCommits(t *testing.T, n int) []dag.CheckpointCommit {
+	t.Helper()
+	out := make([]dag.CheckpointCommit, n)
+	var prev codec.Hash
+	for i := range out {
+		var h codec.Hash
+		h.Bytes[0], h.Bytes[1], h.Bytes[2] = 0xc0, byte(i>>8), byte(i)
+		c := document.Commit{NamespaceID: "ns", Hash: h, Message: fmt.Sprintf("c%d", i),
+			Timestamp: codec.TimestampFromEpochMicros(int64(1_700_000_000_000_000 + i))}
+		if i > 0 {
+			c.ParentHashes = []codec.Hash{prev}
+		}
+		out[i], prev = dag.CheckpointCommit{Commit: c, OperationCount: i % 3}, h
+	}
+	return out
+}
+
+// A namespace up to legacyCheckpointMaxEntries is checkpointed as version 2 - the records-only
+// format v0.6.x reads, so a v0.6.2 binary opening a cleanly stopped data dir has no log to replay
+// (its replay loses writes: test_upgrade.py::test_rollback_to_v062_after_a_clean_stop) - and it
+// round-trips through this build, commits handed over packed included. Past the bound, or with
+// graph segments, it is version 4.
+func TestCheckpointFormatFollowsNamespaceSize(t *testing.T) {
 	entries := map[codec.UUID]codec.Hash{}
 	for i := 0; i < 50; i++ {
 		id, _ := codec.RandomUUID()
@@ -383,40 +413,77 @@ func TestCheckpointReadsV2AndWritesPackedV4(t *testing.T) {
 		entries[id] = h
 	}
 	tree, _ := document.BuildDocumentTree(entries)
-	cp := namespaceCheckpoint{NamespaceID: "ns", ThroughSequence: 3, LiveTree: tree}
+	commits := testCheckpointCommits(t, 40)
+	packed, err := dag.PackCheckpointCommits(commits[:30])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := namespaceCheckpoint{NamespaceID: "ns", ThroughSequence: 3, LiveTree: tree,
+		State: dag.CheckpointState{PackedCommits: packed, Commits: commits[30:]}}
 
 	raw, err := encodeCheckpoint(cp)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if v := checkpointVersionOf(t, raw); v != checkpointFormatVersion {
+		t.Fatalf("a %d-document, %d-commit namespace was checkpointed as version %d, want %d (v0.6.x reads only that)",
+			tree.Size(), len(commits), v, checkpointFormatVersion)
+	}
+	root, _ := codec.DecodeBytes(raw, checkpointType, checkpointRegistry())
+	for _, f := range []int{13, 14} {
+		if b, ok := root.(codec.RecordValue).Fields[f].(codec.BytesValue); ok && len(b.V) > 0 {
+			t.Fatalf("version 2 checkpoint carries field %d, which v0.6.x does not know", f)
+		}
 	}
 	got, err := decodeCheckpoint("ns", raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.LiveTree.TreeHash != tree.TreeHash || got.LiveTree.Size() != 50 {
-		t.Fatal("packed live tree did not round-trip")
+		t.Fatal("live tree did not round-trip through version 2")
+	}
+	if len(got.State.PackedCommits) != 0 || len(got.State.Commits) != len(commits) {
+		t.Fatalf("version 2 restored %d commits (%d packed bytes), want %d", len(got.State.Commits), len(got.State.PackedCommits), len(commits))
+	}
+	for i, want := range commits {
+		g := got.State.Commits[i]
+		if g.Commit.Hash != want.Commit.Hash || g.Commit.Message != want.Commit.Message ||
+			g.Commit.Timestamp != want.Commit.Timestamp || g.OperationCount != want.OperationCount ||
+			fmt.Sprint(g.Commit.ParentHashes) != fmt.Sprint(want.Commit.ParentHashes) {
+			t.Fatalf("commit %d did not round-trip through version 2:\n got %+v\nwant %+v", i, g, want)
+		}
 	}
 
-	// Hand-build a v2 root the way the previous encoder did.
-	var recs []codec.Value
-	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
-		recs = append(recs, codec.RecordValue{Fields: map[int]codec.Value{1: cpUUIDVal(id), 2: cpHashVal(h)}})
-		return true
-	})
-	v2 := codec.RecordValue{Fields: map[int]codec.Value{
-		1: codec.Int32Value{V: checkpointFormatVersion}, 2: codec.StringValue{V: "ns"},
-		3: codec.Int64Value{V: 3}, 4: codec.ArrayValue{}, 5: codec.ArrayValue{}, 6: codec.ArrayValue{},
-		7: codec.ArrayValue{Elements: recs}, 8: codec.ArrayValue{}, 9: codec.ArrayValue{}, 10: codec.Int64Value{},
-	}}
-	raw2, err := codec.EncodeBytes(v2, checkpointType, checkpointRegistry())
+	// Past the bound: packed, version 4, and still round-trips.
+	big := testCheckpointCommits(t, legacyCheckpointMaxEntries)
+	bigPacked, err := dag.PackCheckpointCommits(big)
 	if err != nil {
 		t.Fatal(err)
 	}
-	old, err := decodeCheckpoint("ns", raw2)
+	cpBig := namespaceCheckpoint{NamespaceID: "ns", LiveTree: tree, State: dag.CheckpointState{PackedCommits: bigPacked}}
+	raw, err = encodeCheckpoint(cpBig)
 	if err != nil {
-		t.Fatalf("a v2 checkpoint no longer reads: %v", err)
+		t.Fatal(err)
 	}
-	if old.LiveTree.TreeHash != tree.TreeHash {
-		t.Fatal("v2 live tree restored differently")
+	if v := checkpointVersionOf(t, raw); v != checkpointPackedFormatVersion {
+		t.Fatalf("a namespace past legacyCheckpointMaxEntries was checkpointed as version %d, want %d", v, checkpointPackedFormatVersion)
+	}
+	got, err = decodeCheckpoint("ns", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LiveTree.TreeHash != tree.TreeHash || string(got.State.PackedCommits) != string(bigPacked) {
+		t.Fatal("version 4 checkpoint did not round-trip")
+	}
+
+	// Graph segments: version 2 cannot name them.
+	cpGraph := cp
+	cpGraph.GraphRefs = []dag.GraphSegmentRef{{Seq: 1, CRC: 7, Records: 3}}
+	raw, err = encodeCheckpoint(cpGraph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := checkpointVersionOf(t, raw); v != checkpointPackedFormatVersion {
+		t.Fatalf("a checkpoint naming graph segments was written as version %d, want %d", v, checkpointPackedFormatVersion)
 	}
 }

@@ -30,9 +30,25 @@ const checkpointGraphFormatVersion = 3
 // most of an open's peak heap to decode; packed they are 48 MB and decode straight into the bulk
 // trie build. Commits likewise: two million as records were gigabytes each way; packed they are
 // ~150 bytes each and restored one at a time.
-// What this build writes. Its own version so an older build replays the log rather than restoring
-// an empty live tree from a field it does not know.
+// What this build writes for a namespace past legacyCheckpointMaxEntries, or with graph segments.
+// Its own version so an older build replays the log rather than restoring an empty live tree from
+// a field it does not know.
 const checkpointPackedFormatVersion = 4
+
+// legacyCheckpointMaxEntries is the largest namespace - live documents plus commits - whose
+// checkpoint is still written as version 2, the format every release since v0.6.2 reads.
+//
+// An older build that cannot read a checkpoint replays the log, and for v0.6.x that replay is not
+// safe: it does not move main onto a logged canonical join that does not descend from it (#114
+// SupersedesHead), so a namespace this build stopped cleanly opens on v0.6.2 with acknowledged
+// writes behind (test_upgrade.py::test_rollback_to_v062_after_a_clean_stop). v0.7.x replays it
+// correctly. A version 2 checkpoint at main leaves v0.6.2 nothing to replay.
+//
+// Bounded because version 2 is the record form version 4 replaced: ~2.5 KB allocated per entry
+// to encode, which at 1M documents / 2M commits was 7.6 GB per checkpoint. At this bound it is a
+// few tens of MB. Past it, or with graph segments (which version 2 cannot name), a rollback goes
+// to v0.7.x, not v0.6.x.
+const legacyCheckpointMaxEntries = 20_000
 
 const checkpointNS = "dev.kdb.checkpoint"
 
@@ -267,7 +283,21 @@ func cpStrFrom(v codec.Value) (string, error) {
 	return s.V, nil
 }
 
+// legacyCheckpointFits reports whether cp is small enough, and plain enough, to be written as
+// version 2 - see legacyCheckpointMaxEntries. Packed commits are counted at their smallest size,
+// which overstates how many there are: a namespace near the bound is written as version 4.
+func legacyCheckpointFits(cp namespaceCheckpoint) bool {
+	if len(cp.GraphRefs) > 0 || len(cp.GraphHidden) > 0 {
+		return false
+	}
+	n := cp.LiveTree.Size() + len(cp.State.Commits) + len(cp.State.PackedCommits)/dag.PackedCommitMinBytes
+	return n <= legacyCheckpointMaxEntries
+}
+
 func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
+	if legacyCheckpointFits(cp) {
+		return encodeLegacyCheckpoint(cp)
+	}
 	// Commits are packed (dag/checkpoint_packed.go): a snapshot hands them over packed already, and
 	// any listed as structs are packed here, so a checkpoint never holds a codec record per commit.
 	packedCommits := cp.State.PackedCommits
@@ -351,6 +381,102 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		root.Fields[11] = codec.ArrayValue{Elements: refs}
 		root.Fields[12] = codec.ArrayValue{Elements: hidden}
 	}
+	return codec.EncodeBytes(root, checkpointType, checkpointRegistry())
+}
+
+// encodeLegacyCheckpoint writes cp as version 2: a codec record per commit (4) and per live
+// document (7), and none of the fields a v0.6.x reader does not know. See
+// legacyCheckpointMaxEntries for when, and legacyCheckpointFits for the guard.
+func encodeLegacyCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
+	commits := make([]codec.Value, 0, len(cp.State.Commits))
+	addCommit := func(cc dag.CheckpointCommit) error {
+		parents := make([]codec.Value, len(cc.Commit.ParentHashes))
+		for i, p := range cc.Commit.ParentHashes {
+			parents[i] = cpHashVal(p)
+		}
+		fields := map[int]codec.Value{
+			1: cpHashVal(cc.Commit.Hash),
+			2: codec.ArrayValue{Elements: parents},
+			3: cpUUIDVal(cc.Commit.TransactionID),
+			4: cpTsVal(cc.Commit.Timestamp),
+			5: cpUUIDVal(cc.Commit.AuthorNodeID),
+			6: cpHashVal(cc.Commit.DocumentTreeHash),
+			8: codec.StringValue{V: cc.Commit.Message},
+			9: codec.Int32Value{V: int32(cc.OperationCount)},
+		}
+		if cc.Commit.SchemaHash != nil {
+			fields[7] = cpHashVal(*cc.Commit.SchemaHash)
+		}
+		commits = append(commits, codec.RecordValue{Fields: fields})
+		return nil
+	}
+	if err := dag.ForEachPackedCommit(cp.State.PackedCommits, cp.NamespaceID, addCommit); err != nil {
+		return nil, err
+	}
+	for _, cc := range cp.State.Commits {
+		_ = addCommit(cc)
+	}
+
+	branches := make([]codec.Value, 0, len(cp.State.Branches))
+	for _, b := range cp.State.Branches {
+		branches = append(branches, codec.RecordValue{Fields: map[int]codec.Value{
+			1: codec.StringValue{V: b.Name},
+			2: cpHashVal(b.HeadHash),
+			3: cpTsVal(b.CreatedAt),
+			4: cpTsVal(b.UpdatedAt),
+		}})
+	}
+
+	tags := make([]codec.Value, 0, len(cp.State.Tags))
+	for _, t := range cp.State.Tags {
+		tags = append(tags, codec.RecordValue{Fields: map[int]codec.Value{
+			1: codec.StringValue{V: t.Name},
+			2: cpHashVal(t.CommitHash),
+			3: cpTsVal(t.CreatedAt),
+			4: codec.StringValue{V: t.Message},
+		}})
+	}
+
+	entries := make([]codec.Value, 0, cp.LiveTree.Size())
+	cp.LiveTree.Walk(func(id codec.UUID, h codec.Hash) bool {
+		entries = append(entries, codec.RecordValue{Fields: map[int]codec.Value{
+			1: cpUUIDVal(id),
+			2: cpHashVal(h),
+		}})
+		return true
+	})
+
+	segs := make([]codec.Value, 0, len(cp.Segments))
+	for _, sg := range cp.Segments {
+		fields := map[int]codec.Value{
+			1: codec.Int64Value{V: sg.Sequence},
+			2: codec.Int64Value{V: sg.SizeBytes},
+			3: cpHashVal(sg.LastCommitHash),
+		}
+		if sg.HasStamp {
+			fields[4] = codec.Int64Value{V: sg.Stamp.Size}
+			fields[5] = codec.Int64Value{V: sg.Stamp.ModTimeNanos}
+		}
+		segs = append(segs, codec.RecordValue{Fields: fields})
+	}
+
+	heads := make([]codec.Value, 0, len(cp.HeadCommits))
+	for _, b := range cp.HeadCommits {
+		heads = append(heads, codec.BytesValue{V: b})
+	}
+
+	root := codec.RecordValue{Fields: map[int]codec.Value{
+		1:  codec.Int32Value{V: checkpointFormatVersion},
+		2:  codec.StringValue{V: cp.NamespaceID},
+		3:  codec.Int64Value{V: cp.ThroughSequence},
+		4:  codec.ArrayValue{Elements: commits},
+		5:  codec.ArrayValue{Elements: branches},
+		6:  codec.ArrayValue{Elements: tags},
+		7:  codec.ArrayValue{Elements: entries},
+		8:  codec.ArrayValue{Elements: segs},
+		9:  codec.ArrayValue{Elements: heads},
+		10: codec.Int64Value{V: cp.FloorSequence},
+	}}
 	return codec.EncodeBytes(root, checkpointType, checkpointRegistry())
 }
 
