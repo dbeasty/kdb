@@ -17,6 +17,16 @@ type commitFrameRef struct {
 	frameOffset int64
 }
 
+// frameLoc is commitFrameRef as the index stores it: the segment as a position in the loader's
+// segment table, so a value holds no pointers. The index has one entry per commit in the log, and
+// a commitFrameRef per entry - a whole DeltaSegmentRef, strings and all - cost about 225 bytes a
+// commit at 400,000 commits, all of it scanned by the collector on every cycle; a frameLoc and its
+// key are about 60 bytes and are not scanned at all.
+type frameLoc struct {
+	segment uint32
+	offset  int64
+}
+
 // commitOpsLoader serves the operations of commits whose operations the
 // DAG's retention budget has evicted, by reading the frame that holds them
 // out of the delta log - the log being the only place a commit's
@@ -26,8 +36,8 @@ type commitFrameRef struct {
 // frame per lookup after that. The index is built lazily, so a namespace
 // nobody asks history of never pays for it, and it holds locations rather
 // than commits, so the index itself cannot reintroduce the retention it
-// exists to allow removing: 48 bytes per commit against the full text of
-// every document that commit wrote.
+// exists to allow removing: about 60 bytes per commit (frameLoc) against the
+// full text of every document that commit wrote.
 //
 // The log keeps growing after the index is first built, so a lookup that
 // misses brings the index up to date before giving up: segments it has not
@@ -41,7 +51,11 @@ type commitOpsLoader struct {
 	// refreshMu serializes index builds; mu guards frame and sealed.
 	refreshMu sync.Mutex
 	mu        sync.RWMutex
-	frame     map[codec.Hash]commitFrameRef
+	frame     map[codec.Hash]frameLoc
+	// segments is the segment table frameLoc.segment points into; segmentIdx finds a sequence's
+	// position. A segment rescanned after it grew replaces its entry in place.
+	segments   []storage.DeltaSegmentRef
+	segmentIdx map[int64]uint32
 	// sealed holds segments indexed while a newer one already existed: nothing
 	// more can be appended to them, so they are never scanned again.
 	sealed map[int64]struct{}
@@ -80,8 +94,11 @@ func (l *commitOpsLoader) load(hash codec.Hash) ([]document.Op, error) {
 func (l *commitOpsLoader) lookup(hash codec.Hash) (commitFrameRef, bool) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	ref, ok := l.frame[hash]
-	return ref, ok
+	loc, ok := l.frame[hash]
+	if !ok {
+		return commitFrameRef{}, false
+	}
+	return commitFrameRef{segment: l.segments[loc.segment], frameOffset: loc.offset}, true
 }
 
 // refresh indexes every segment not yet known to be sealed, recording where
@@ -107,7 +124,13 @@ func (l *commitOpsLoader) refresh() error {
 	l.mu.RLock()
 	sealed := l.sealed
 	l.mu.RUnlock()
-	frames := make(map[codec.Hash]commitFrameRef)
+	type found struct {
+		hash   codec.Hash
+		seq    int64
+		offset int64
+	}
+	var frames []found
+	scanned := map[int64]storage.DeltaSegmentRef{}
 	var nowSealed []int64
 	for _, seg := range segments {
 		if _, done := sealed[seg.SequenceNumber]; done {
@@ -125,8 +148,9 @@ func (l *commitOpsLoader) refresh() error {
 				stream = dr.StreamCommitsPastDamage
 			}
 		}
+		scanned[segment.SequenceNumber] = segment
 		err := stream(segment, func(c document.Commit, offset int64) error {
-			frames[c.Hash] = commitFrameRef{segment: segment, frameOffset: offset}
+			frames = append(frames, found{hash: c.Hash, seq: segment.SequenceNumber, offset: offset})
 			return nil
 		})
 		var corrupt *delta.CorruptFrameError
@@ -140,13 +164,22 @@ func (l *commitOpsLoader) refresh() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.frame == nil {
-		l.frame = make(map[codec.Hash]commitFrameRef, len(frames))
+		l.frame = make(map[codec.Hash]frameLoc, len(frames))
+		l.segmentIdx = make(map[int64]uint32)
 	}
 	if l.sealed == nil {
 		l.sealed = make(map[int64]struct{})
 	}
-	for h, ref := range frames {
-		l.frame[h] = ref
+	for seq, ref := range scanned {
+		if i, ok := l.segmentIdx[seq]; ok {
+			l.segments[i] = ref
+			continue
+		}
+		l.segmentIdx[seq] = uint32(len(l.segments))
+		l.segments = append(l.segments, ref)
+	}
+	for _, f := range frames {
+		l.frame[f.hash] = frameLoc{segment: l.segmentIdx[f.seq], offset: f.offset}
 	}
 	for _, seq := range nowSealed {
 		l.sealed[seq] = struct{}{}
