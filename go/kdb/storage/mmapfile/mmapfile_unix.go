@@ -8,6 +8,9 @@ import (
 	"syscall"
 )
 
+// Supported reports whether Open can map files on this platform.
+const Supported = true
+
 // Open maps path read-only. An empty file maps to an empty Mapping (mmap rejects length zero).
 func Open(path string) (*Mapping, error) {
 	f, err := os.Open(path)
