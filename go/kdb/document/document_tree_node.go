@@ -65,7 +65,7 @@ func (t DocumentTree) Node(prefix string, entryLimit int) (TreeNode, error) {
 		if r&refLeaf != 0 {
 			break
 		}
-		r = v.node(r).child[hexNibble(prefix[d])]
+		r = v.child(r, int(hexNibble(prefix[d])))
 	}
 	if r == 0 {
 		return out, nil
@@ -87,9 +87,8 @@ func (t DocumentTree) Node(prefix string, entryLimit int) (TreeNode, error) {
 		}
 		return out, nil
 	}
-	n := v.node(r)
-	out.Hash = codec.Hash{Bytes: n.hash}
-	for i, c := range n.child {
+	out.Hash = codec.Hash{Bytes: v.node(r).hash}
+	for i, c := range v.children(r) {
 		if c != 0 {
 			out.Children[i] = codec.Hash{Bytes: *v.hash(c)}
 		}

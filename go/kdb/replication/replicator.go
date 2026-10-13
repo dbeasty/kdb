@@ -291,6 +291,16 @@ func (l *peerLoop) namespaces() []string {
 	return l.peer.Namespaces
 }
 
+// peerConfig is a copy of the peer's configuration taken under the lock: its Namespaces change
+// while the loop runs, so the struct is never copied without it.
+func (l *peerLoop) peerConfig() PeerConfig {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	p := l.peer
+	p.Namespaces = append([]string(nil), l.peer.Namespaces...)
+	return p
+}
+
 func (l *peerLoop) kick() {
 	select {
 	case l.trigger <- struct{}{}:
@@ -302,6 +312,7 @@ func (l *peerLoop) run() {
 	timer := time.NewTimer(l.peer.Interval)
 	defer timer.Stop()
 	first := true
+	bySnapshot := bootstrapsBySnapshot(l.peerConfig())
 	for {
 		select {
 		case <-l.r.stop:
@@ -316,11 +327,11 @@ func (l *peerLoop) run() {
 			l.drainTrigger()
 		case <-timer.C:
 		}
-		if first && !bootstrapsBySnapshot(l.peer) && !l.r.awaitSnapshotPeers() {
+		if first && !bySnapshot && !l.r.awaitSnapshotPeers() {
 			return
 		}
 		_, err := l.cycle()
-		if first && bootstrapsBySnapshot(l.peer) && l.r.snapshotPending.Add(-1) == 0 {
+		if first && bySnapshot && l.r.snapshotPending.Add(-1) == 0 {
 			close(l.r.snapshotFirst)
 		}
 		first = false
@@ -511,7 +522,7 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 
 func (l *peerLoop) transport() stream.Transport {
 	if l.r.cfg.Transport != nil {
-		return l.r.cfg.Transport(l.peer)
+		return l.r.cfg.Transport(l.peerConfig())
 	}
 	return defaultTransport(l.peer.Addr, l.r.cfg.TLS)
 }

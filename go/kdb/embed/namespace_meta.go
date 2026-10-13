@@ -45,8 +45,19 @@ func namespaceMetaPath(dataRoot, namespaceID string) string {
 
 // graphDirPath is where a namespace's commit-graph segments live, beside its metadata. They are
 // derived state: deleting the directory costs a rebuild, never data.
+// treeDirPath is where a namespace's live-tree segments live when tree.file is on.
+func treeDirPath(dataRoot, namespaceID string) string {
+	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "tree")
+}
+
 func graphDirPath(dataRoot, namespaceID string) string {
 	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "graph")
+}
+
+// deltaIndexDirPath is where a namespace's delta-index sidecars live (package deltaindex): one
+// file per sealed delta segment and index kind, derived from the log and rebuilt from it at will.
+func deltaIndexDirPath(dataRoot, namespaceID string) string {
+	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "deltaidx")
 }
 
 func readNamespaceMeta(dataRoot, namespaceID string) (namespaceMeta, bool) {

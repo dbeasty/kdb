@@ -14,8 +14,8 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
 
-// sidecarFiles lists ns's SSTables and their index sidecars, relative to the namespace directory.
-func sidecarFiles(t *testing.T, dataRoot, ns string) (tables, sidecars []string) {
+// sstableSidecarFiles lists ns's SSTables and their index sidecars, relative to the namespace directory.
+func sstableSidecarFiles(t *testing.T, dataRoot, ns string) (tables, sidecars []string) {
 	t.Helper()
 	nsDir := filepath.Join(dataRoot, "ns", filepath.FromSlash(ns))
 	filepath.WalkDir(nsDir, func(p string, d os.DirEntry, err error) error {
@@ -63,7 +63,7 @@ func TestSSTableSidecarsInTheFileRuntime(t *testing.T) {
 		writeDoc(t, rt, `{"n":1}`)
 	}
 	rt.Close()
-	tables, sidecars := sidecarFiles(t, dataRoot, ns)
+	tables, sidecars := sstableSidecarFiles(t, dataRoot, ns)
 	if len(tables) == 0 {
 		t.Fatal("closing wrote no SSTable")
 	}
@@ -88,7 +88,7 @@ func TestSSTableSidecarsInTheFileRuntime(t *testing.T) {
 	}
 	probeEveryTable(t, ro)
 	ro.Close()
-	if _, sidecars := sidecarFiles(t, dataRoot, ns); len(sidecars) != 0 {
+	if _, sidecars := sstableSidecarFiles(t, dataRoot, ns); len(sidecars) != 0 {
 		t.Fatalf("a read-only runtime wrote sidecars: %v", sidecars)
 	}
 
@@ -109,7 +109,7 @@ func TestSSTableSidecarsInTheFileRuntime(t *testing.T) {
 	}
 	probeEveryTable(t, rw)
 	rw.Close()
-	tables, sidecars = sidecarFiles(t, dataRoot, ns)
+	tables, sidecars = sstableSidecarFiles(t, dataRoot, ns)
 	if len(sidecars) != len(tables) {
 		t.Fatalf("after the writer's probe: %d tables, %d sidecars", len(tables), len(sidecars))
 	}

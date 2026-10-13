@@ -2,6 +2,7 @@ package embed
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
@@ -294,8 +295,25 @@ func legacyCheckpointFits(cp namespaceCheckpoint) bool {
 	return n <= legacyCheckpointMaxEntries
 }
 
+// saveTreeSegment gives a paged live tree (tree.file) a segment tagged with the checkpoint's
+// packed tree image, so the next open maps it instead of building the tree; packed is that image,
+// or nil to pack it here. The segment is a cache: failing to write one costs that open the
+// build, nothing more.
+func saveTreeSegment(cp namespaceCheckpoint, packed []byte) {
+	if bound, _ := cp.LiveTree.Paged(); !bound {
+		return
+	}
+	if packed == nil {
+		packed = cp.LiveTree.AppendPacked(make([]byte, 0, cp.LiveTree.Size()*document.PackedTreeEntrySize))
+	}
+	if err := document.SaveTreeSegment(cp.LiveTree, packed); err != nil {
+		log.Printf("kdb: namespace %s: writing the tree segment for the checkpoint: %v", cp.NamespaceID, err)
+	}
+}
+
 func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 	if legacyCheckpointFits(cp) {
+		saveTreeSegment(cp, nil)
 		return encodeLegacyCheckpoint(cp)
 	}
 	// Commits are packed (dag/checkpoint_packed.go): a snapshot hands them over packed already, and
@@ -330,6 +348,7 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 	}
 
 	packedTree := cp.LiveTree.AppendPacked(make([]byte, 0, cp.LiveTree.Size()*document.PackedTreeEntrySize))
+	saveTreeSegment(cp, packedTree)
 
 	segs := make([]codec.Value, 0, len(cp.Segments))
 	for _, sg := range cp.Segments {
@@ -481,6 +500,12 @@ func encodeLegacyCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 }
 
 func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, error) {
+	return decodeCheckpointWith(namespaceID, raw, nil)
+}
+
+// decodeCheckpointWith is decodeCheckpoint building the live tree through tf when it is not nil:
+// mapped from a segment written for this checkpoint, or built to one, instead of the heap.
+func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile) (namespaceCheckpoint, error) {
 	var out namespaceCheckpoint
 	v, err := codec.DecodeBytes(raw, checkpointType, checkpointRegistry())
 	if err != nil {
@@ -650,13 +675,13 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 		if len(live) > 0 {
 			return out, fmt.Errorf("kdb: checkpoint: live tree stored both packed and as records")
 		}
-		tree, err := document.BuildTrieDocumentTreePacked(packed.V)
+		tree, err := document.OpenTreePacked(packed.V, tf)
 		if err != nil {
 			return out, err
 		}
 		out.LiveTree = tree
 	} else {
-		tree, err := document.BuildTrieDocumentTree(live)
+		tree, err := document.OpenTreeEntries(live, tf)
 		if err != nil {
 			return out, err
 		}
@@ -978,11 +1003,16 @@ func damagedInPlace(r storage.DeltaSegmentReader, want checkpointSegment) (stora
 // avoid re-reading it, and anything unreadable, stale-format, corrupt or
 // mismatched simply costs one slow start.
 func readCheckpoint(shim storage.PlatformIOShim, namespaceID string) (namespaceCheckpoint, bool) {
+	return readCheckpointWith(shim, namespaceID, nil)
+}
+
+// readCheckpointWith is readCheckpoint building the live tree through tf (decodeCheckpointWith).
+func readCheckpointWith(shim storage.PlatformIOShim, namespaceID string, tf *document.TreeFile) (namespaceCheckpoint, bool) {
 	raw, err := shim.ReadSnapshot(checkpointKey(namespaceID))
 	if err != nil || len(raw) == 0 {
 		return namespaceCheckpoint{}, false
 	}
-	cp, err := decodeCheckpoint(namespaceID, raw)
+	cp, err := decodeCheckpointWith(namespaceID, raw, tf)
 	if err != nil {
 		return namespaceCheckpoint{}, false
 	}

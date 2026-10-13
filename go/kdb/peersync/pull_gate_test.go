@@ -51,9 +51,17 @@ func TestPullGateTakesTurns(t *testing.T) {
 	if tips := <-got; len(tips) != 1 || tips[0] != tip {
 		t.Fatalf("expected the first pull's tip as a have, got %v", tips)
 	}
-	pullGates.Lock()
-	left := len(pullGates.m)
-	pullGates.Unlock()
+	// The second pull reports its tips before its deferred leavePull runs, so its gate may still be
+	// there for a moment: wait for the drop rather than checking at once.
+	left := 0
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		pullGates.Lock()
+		left = len(pullGates.m)
+		pullGates.Unlock()
+		if left == 0 || time.Now().After(deadline) {
+			break
+		}
+	}
 	if left != 0 {
 		t.Fatalf("gates must be dropped once no pull holds or awaits them, %d left", left)
 	}
