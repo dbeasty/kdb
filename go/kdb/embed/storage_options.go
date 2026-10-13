@@ -111,6 +111,8 @@ type StorageOptions struct {
 	// takes half the hot-tier budget. Raising it trades memory for fewer
 	// cold reads; lowering it, the reverse.
 	DocumentCacheBytes int64
+	// BoundedLiveBodies: see storage.StorageEngineConfig.BoundedLiveBodies. KDB_BOUNDED_LIVE_BODIES.
+	BoundedLiveBodies bool
 	// CommitOpsBytes caps how many bytes of commit operations the DAG
 	// keeps resident. Zero takes a quarter of the hot-tier budget.
 	CommitOpsBytes int64
@@ -223,6 +225,7 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	}
 	opts.Storage.Retain.Commits = envBytes("KDB_RETAIN_COMMITS")
 	opts.Storage.DocumentCacheBytes = envBytes("KDB_DOCUMENT_CACHE_BYTES")
+	opts.Storage.BoundedLiveBodies = envBool("KDB_BOUNDED_LIVE_BODIES")
 	opts.Storage.CommitOpsBytes = envBytes("KDB_COMMIT_OPS_BYTES")
 	opts.Storage.HistoryTreeCacheBytes = envBytes("KDB_HISTORY_TREE_CACHE_BYTES")
 	opts.Storage.PreallocateSegments = envBool("KDB_PREALLOCATE_SEGMENTS")

@@ -21,10 +21,15 @@ type treeRebuilder func(want codec.Hash) (document.DocumentTree, bool, error)
 func (e *ServerEngine) RestoreLiveTree(namespaceID string, tree document.DocumentTree) {
 	e.treeMu.Lock()
 	defer e.treeMu.Unlock()
-	tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
-		e.docsByHash.Pin(h)
-		return true
-	})
+	// Under bounded live bodies a restored tree is pinned nowhere: every version it names is
+	// already durable (in the log, or in the blob store for bodies the log no longer holds), so
+	// the version store may evict it and the cold path read it back.
+	if !e.boundedLiveBodies() {
+		tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
+			e.docsByHash.Pin(h)
+			return true
+		})
+	}
 	e.tree = tree
 	e.treesMu.Lock()
 	e.publishTreeLocked(tree, 0)

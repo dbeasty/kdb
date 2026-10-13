@@ -51,6 +51,8 @@ func TestMemoryProfile(t *testing.T) {
 	if os.Getenv("KDB_MEMPROFILE_GRAPH") == "1" {
 		opts.Storage.Graph = dag.GraphSettings{FileEnabled: true}
 	}
+	// KDB_MEMPROFILE_BOUNDED=1 lets live versions be evicted (StorageOptions.BoundedLiveBodies).
+	opts.Storage.BoundedLiveBodies = os.Getenv("KDB_MEMPROFILE_BOUNDED") == "1"
 	if m := os.Getenv("KDB_MEMPROFILE_MEMORY"); m != "" {
 		opts.Storage.Graph.Memory = dag.GraphMemory(m) // "go" or "kdb"; ignored by builds without it
 	}
