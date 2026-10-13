@@ -55,6 +55,20 @@ type SegmentIntoReader interface {
 	ReadFromSegmentInto(segmentName string, offset int64, dst []byte) (int, error)
 }
 
+// LocalPathResolver is implemented by shims whose segments are files on the local filesystem. It
+// names the file a segment name maps to, whether or not that file exists, so a caller can keep
+// derived, rebuildable state beside a segment - an SSTable's index sidecar (sstable/sidecar.go) -
+// and read it through a memory mapping instead of through the shim.
+//
+// Files written at such a path bypass the shim entirely: they are not replicated, archived or
+// sealed, which is right only for state that can be rebuilt from the segments themselves.
+//
+// Optional: ok is false for a shim (or a store beneath one) with no local files, and callers keep
+// whatever path they had without it.
+type LocalPathResolver interface {
+	LocalSegmentPath(segmentName string) (path string, ok bool)
+}
+
 // SegmentGenerationer is implemented by shims that can name the current incarnation of a segment:
 // a number that stays the same for as long as the segment is only appended to, and changes when it
 // is deleted - by truncation, retention or repair - and whatever later carries its name is a new

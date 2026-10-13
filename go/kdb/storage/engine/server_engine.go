@@ -376,11 +376,15 @@ func (e *ServerEngine) Close() error {
 			firstErr = err
 		}
 	}
-	if e.asyncStop == nil {
-		return firstErr
+	if e.asyncStop != nil {
+		close(e.asyncStop)
+		<-e.asyncDone
 	}
-	close(e.asyncStop)
-	<-e.asyncDone
+	if e.blobStore != nil {
+		// After the flush, which may have written a table and its sidecar: unmaps the SSTable
+		// index sidecars, so a closed namespace stops holding mapped files.
+		_ = e.blobStore.Close()
+	}
 	return firstErr
 }
 
@@ -989,6 +993,14 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 		eng = NewServerEngine(namespaceID, config, nil)
 	default:
 		eng = NewServerEngine(namespaceID, config, nil)
+	}
+	switch f.EngineTarget {
+	case TargetServer:
+		// The owner of the namespace's files clears sidecars a crash left without a table.
+		eng.blobStore.RemoveOrphanSidecars()
+	case TargetReadOnly:
+		// Uses the writer's sidecars but never writes one into a directory it does not own.
+		eng.blobStore.SetSidecarBuild(false)
 	}
 	deltaFactory := delta.Factory{Config: config}
 	var writer storage.DeltaSegmentWriter
