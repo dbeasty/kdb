@@ -57,6 +57,11 @@ type V2HostConfig struct {
 	// (unavailable, not the home): it goes back as PEER_ERROR and the replica tries again later.
 	// Unset, the host does not offer write-back.
 	WriteBack func(principal auth.Principal, m wire.ProjectWriteMessage) (wire.ProjectWriteResultMessage, error)
+	// AdoptEveryBytes is V2ClientConfig.AdoptEveryBytes for pushes into this node: once that much
+	// (estimated commit bytes) of a push of main has been stored and not adopted, a page that
+	// fast-forwards main is adopted before the push's last page arrives. 0 means
+	// DefaultAdoptEveryBytes; negative adopts only on the last page.
+	AdoptEveryBytes int
 }
 
 // V2Host serves one v2 peer-sync connection.
@@ -90,6 +95,12 @@ type V2Host struct {
 	// another walk of the namespace's history.
 	fetchMu sync.Mutex
 	fetch   *hostFetch
+
+	// pushWaiting is, per namespace, the estimated bytes of a push of main this session has
+	// stored and not yet adopted (see refUpdate). Pages of one session arrive in order, served
+	// serially; pushMu guards it anyway.
+	pushMu      sync.Mutex
+	pushWaiting map[string]int
 }
 
 type hostFetch struct {
@@ -647,8 +658,14 @@ func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {
 		Kind: m.Kind, Ref: m.Ref, Stored: stored, Outcome: wire.RefStored,
 	}
 	if m.More {
+		if err := h.adoptPushEarly(env, m); err != nil {
+			return nil, err
+		}
 		return ack, nil
 	}
+	h.pushMu.Lock()
+	delete(h.pushWaiting, m.Namespace)
+	h.pushMu.Unlock()
 	proposed, err := codec.HashFromHex(m.NewHex)
 	if err != nil {
 		return nil, err
@@ -664,6 +681,47 @@ func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {
 		}
 	}
 	return ack, nil
+}
+
+// adoptPushEarly is the push side of a pull's early adoption (fetchRef): a node receiving a long
+// push of main stored every page and adopted only on the last, so the whole range - every
+// received commit's operations, pinned until logged - stayed in memory for the length of the
+// transfer. Once AdoptEveryBytes is waiting, a page that ends in one tip main fast-forwards to is
+// adopted now (AdoptFastForward: never a merge, a no-op if main has diverged), and the decision
+// on the last page proceeds from there exactly as it would have from the start.
+func (h *V2Host) adoptPushEarly(env IngestEnv, m wire.RefUpdateMessage) error {
+	if (m.Kind != wire.RefBranch && m.Kind != "") || m.Ref != mainBranch {
+		return nil
+	}
+	every := h.cfg.AdoptEveryBytes
+	if every == 0 {
+		every = DefaultAdoptEveryBytes
+	}
+	if every < 0 {
+		return nil
+	}
+	h.pushMu.Lock()
+	if h.pushWaiting == nil {
+		h.pushWaiting = map[string]int{}
+	}
+	for _, c := range m.Commits {
+		h.pushWaiting[m.Namespace] += commitSize(c)
+	}
+	waiting := h.pushWaiting[m.Namespace]
+	h.pushMu.Unlock()
+	if waiting < every {
+		return nil
+	}
+	adopted, err := adoptEarly(env, pageTips(m.Commits))
+	if err != nil {
+		return err
+	}
+	if adopted {
+		h.pushMu.Lock()
+		h.pushWaiting[m.Namespace] = 0
+		h.pushMu.Unlock()
+	}
+	return nil
 }
 
 // projectFetch serves one page of a filtered projection. It needs only read access: a
