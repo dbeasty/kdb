@@ -637,6 +637,18 @@ func envOnlySpecs() []envOnlySpec {
 			parse: onOff,
 		},
 		{
+			key: "tree.file", env: "KDB_TREE_FILE",
+			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
+			help:  "page the live document tree's cold records to mapped segment files (ns/<namespace>/tree/) so its heap does not grow with the namespace (default off). The files are a rebuildable cache; Linux and macOS only, ignored elsewhere",
+			parse: onOff,
+		},
+		{
+			key: "tree.residentBytes", env: "KDB_TREE_RESIDENT_BYTES",
+			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "bytes",
+			help:  "bytes of recently written tree records kept in memory before the live tree is written out to a new segment (default 64 MB). Ignored when tree.file is off",
+			parse: bytes,
+		},
+		{
 			key: "graph.rebuildCommits", env: "KDB_GRAPH_REBUILD_COMMITS",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "commits",
 			help:  "how many commits may accumulate in memory before they are flushed to a new graph segment. Ignored when graph.file is off",

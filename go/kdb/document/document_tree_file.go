@@ -797,6 +797,16 @@ func (s *trieSlab) rewrite(f *TreeFile, h *trieTree) error {
 
 // --- Public API ------------------------------------------------------------------------------
 
+// Paged reports whether t is bound to a tree file, and how many of its records it reaches only
+// through mapped segments is not tracked; mapped is whether its root itself is in a segment
+// (true right after an open that mapped one, or once a rewrite has been rebased onto).
+func (t DocumentTree) Paged() (bound, mapped bool) {
+	if t.trie == nil {
+		return false, false
+	}
+	return t.trie.slab.file.Load() != nil, t.trie.root&refFile != 0
+}
+
 // OpenTreePacked is BuildTrieDocumentTreePacked for a namespace with a tree file: it maps the
 // segment written for exactly this packed image if there is one, and otherwise builds a segment
 // from the image straight to the file. On any failure it builds in the heap, bound to f.

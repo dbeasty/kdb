@@ -21,6 +21,7 @@ type treeRebuilder func(want codec.Hash) (document.DocumentTree, bool, error)
 func (e *ServerEngine) RestoreLiveTree(namespaceID string, tree document.DocumentTree) {
 	e.treeMu.Lock()
 	defer e.treeMu.Unlock()
+	tree = document.BindTreeFile(tree, e.treeFile)
 	tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
 		e.docsByHash.Pin(h)
 		return true
@@ -29,6 +30,22 @@ func (e *ServerEngine) RestoreLiveTree(namespaceID string, tree document.Documen
 	e.treesMu.Lock()
 	e.publishTreeLocked(tree, 0)
 	e.treesMu.Unlock()
+}
+
+// SetTreeFile pages this engine's live tree through f from now on: the current tree is bound to
+// it, and so is every tree installed later. Call before restoring the namespace.
+func (e *ServerEngine) SetTreeFile(f *document.TreeFile) {
+	e.treeMu.Lock()
+	defer e.treeMu.Unlock()
+	e.treeFile = f
+	e.tree = document.BindTreeFile(e.tree, f)
+}
+
+// TreeFile is the tree file set by SetTreeFile, or nil.
+func (e *ServerEngine) TreeFile() *document.TreeFile {
+	e.treeMu.Lock()
+	defer e.treeMu.Unlock()
+	return e.treeFile
 }
 
 // RegisterHistoricalTree records a tree that was not restored as the live
