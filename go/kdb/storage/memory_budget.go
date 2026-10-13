@@ -65,12 +65,22 @@ func ValidateHotTierMemoryConfig(cfg HotTierMemoryConfig) error {
 // with no cgroup limit to read - do not have to duplicate the per-platform detection.
 func TotalSystemMemoryBytes() (int64, error) { return totalSystemMemoryBytes() }
 
+// The Default*Fraction shares below split one namespace's hot-tier budget between the structures
+// that hold memory, and they sum to exactly 1.0 (TestDefaultBudgetFractionsSumToOne): every cache
+// filling to its share at once still fits the budget. They summed to 1.75 before, so a namespace
+// under full pressure could hold 75% more than it was given. The split favours what serves the
+// latest data - live documents and the write path's memtable - over history (commit operations,
+// historical trees), which can be read back from the log.
+
+// defaultShare is fraction of DefaultHotTierBytes: the fallback when no budget resolves.
+func defaultShare(fraction float64) int64 { return int64(float64(DefaultHotTierBytes) * fraction) }
+
 // DefaultDocumentCacheFraction is the share of the hot-tier budget the
 // in-memory document version store may hold. The rest of the budget is
 // already spoken for by the block cache and the memtable, and the version
 // store is the one of the three whose miss path is merely slower rather
 // than incorrect - so it is the one that gives ground first.
-const DefaultDocumentCacheFraction = 0.5
+const DefaultDocumentCacheFraction = 0.30
 
 // ResolvedDocumentCacheBytes is how many bytes of document versions the
 // storage engine may hold resident before it starts evicting the oldest
@@ -97,7 +107,7 @@ func ResolvedDocumentCacheBytes(cfg StorageEngineConfig) int64 {
 // store's share because the two hold the same bytes for different readers
 // - the version store answers ordinary document reads, while these answer
 // history walks, which are rarer and already tolerate I/O.
-const DefaultCommitOpsFraction = 0.25
+const DefaultCommitOpsFraction = 0.10
 
 // ResolvedCommitOpsBytes is how many bytes of commit operations the DAG
 // may keep resident before it starts dropping the oldest and re-reading
@@ -115,7 +125,7 @@ func ResolvedCommitOpsBytes(cfg StorageEngineConfig) int64 {
 
 // DefaultMemtableFraction is the share of the hot-tier budget the
 // in-memory blob generation may reach before being flushed to an SSTable.
-const DefaultMemtableFraction = 0.25
+const DefaultMemtableFraction = 0.20
 
 // ResolvedMemtableFlushBytes is how large the memtable may grow before it
 // is written out.
@@ -132,7 +142,7 @@ func ResolvedMemtableFlushBytes(cfg StorageEngineConfig) int64 {
 	}
 	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultMemtableFraction)
 	if budget <= 0 {
-		return DefaultHotTierBytes / 4
+		return defaultShare(DefaultMemtableFraction)
 	}
 	return budget
 }
@@ -141,35 +151,35 @@ func ResolvedMemtableFlushBytes(cfg StorageEngineConfig) int64 {
 // on parsed table indexes. Small, because an index costs about 128 bytes per key and compaction
 // keeps the table count low; the cache keeps the most recently used index even over budget, so
 // a namespace whose single table is larger than this still never re-parses it per probe.
-const DefaultSSTableIndexFraction = 0.125
+const DefaultSSTableIndexFraction = 0.08
 
 // ResolvedSSTableIndexCacheBytes is how many bytes of parsed SSTable footer indexes a namespace
 // keeps resident (see sstable.LsmBlobStore.SetIndexCacheBudget).
 func ResolvedSSTableIndexCacheBytes(cfg StorageEngineConfig) int64 {
 	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultSSTableIndexFraction)
 	if budget <= 0 {
-		return DefaultHotTierBytes / 8
+		return defaultShare(DefaultSSTableIndexFraction)
 	}
 	return budget
 }
 
 // DefaultBlockCacheFraction is the share of the hot-tier budget the SSTable block cache may hold
-// in decoded blocks (see sstable.BlockCache). The engine always sized the cache at a quarter of
-// the budget; until the cache was wired into the lookup path that reservation held nothing.
-const DefaultBlockCacheFraction = 0.25
+// in decoded blocks (see sstable.BlockCache). It was a quarter of the budget, reserved for years
+// while nothing read the cache; since the cache serves lookups it gets a share in the 1.0 split.
+const DefaultBlockCacheFraction = 0.15
 
 // ResolvedBlockCacheBytes is how many bytes of decoded SSTable blocks a namespace keeps resident.
 func ResolvedBlockCacheBytes(cfg StorageEngineConfig) int64 {
 	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultBlockCacheFraction)
 	if budget <= 0 {
-		return DefaultHotTierBytes / 4
+		return defaultShare(DefaultBlockCacheFraction)
 	}
 	return budget
 }
 
 // DefaultHistoryTreeFraction is the share of the hot-tier budget that
 // historical document trees may hold.
-const DefaultHistoryTreeFraction = 0.25
+const DefaultHistoryTreeFraction = 0.10
 
 // ResolvedHistoryTreeBytes is how many bytes of historical document trees
 // stay resident before the least recently used are evicted and obtained
@@ -188,7 +198,7 @@ func ResolvedHistoryTreeBytes(cfg StorageEngineConfig) int64 {
 	}
 	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultHistoryTreeFraction)
 	if budget <= 0 {
-		return DefaultHotTierBytes / 4
+		return defaultShare(DefaultHistoryTreeFraction)
 	}
 	return budget
 }
@@ -196,10 +206,10 @@ func ResolvedHistoryTreeBytes(cfg StorageEngineConfig) int64 {
 // DefaultDeltaFrameCacheFraction is the share of the hot-tier budget a namespace may spend on
 // decompressed delta frames (delta.FrameCache): Cassandra's ChunkCache, sitting beside the SSTable
 // block cache (DefaultBlockCacheFraction) as the cache of the other on-disk structure reads go to.
-// An eighth, half the block cache's share, because a frame read on a miss costs one pread and one
+// About half the block cache's share, because a frame read on a miss costs one pread and one
 // decompress rather than an index probe as well. Like the other shares it is a cap, not a
 // reservation: the cache holds only frames cold reads have actually asked for.
-const DefaultDeltaFrameCacheFraction = 0.125
+const DefaultDeltaFrameCacheFraction = 0.07
 
 // ResolvedDeltaFrameCacheBytes is how many bytes of decompressed delta frames a namespace keeps
 // for cold reads. Zero means no cache.
@@ -212,7 +222,7 @@ func ResolvedDeltaFrameCacheBytes(cfg StorageEngineConfig) int64 {
 	}
 	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultDeltaFrameCacheFraction)
 	if budget <= 0 {
-		return DefaultHotTierBytes / 8
+		return defaultShare(DefaultDeltaFrameCacheFraction)
 	}
 	return budget
 }

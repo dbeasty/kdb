@@ -54,12 +54,13 @@ func TestFrameCacheFollowsTheMemoryBudget(t *testing.T) {
 	cfg := storage.StorageEngineConfig{IOShim: shim, GlobalMemoryBudgetBytes: 64 << 20}
 	eng := NewServerEngine(coldTestNS, cfg, nil)
 	eng.installFrameReads(coldTestNS, delta.Factory{Config: cfg}.OpenReader(coldTestNS), cfg)
-	if got := eng.DeltaFrameCache().Budget(); got != 8<<20 {
-		t.Fatalf("frame cache budget %d, want 8 MiB", got)
+	share := func(budget int64) int64 { return int64(float64(budget) * storage.DefaultDeltaFrameCacheFraction) }
+	if got := eng.DeltaFrameCache().Budget(); got != share(64<<20) {
+		t.Fatalf("frame cache budget %d, want %d", got, share(64<<20))
 	}
 	eng.SetMemoryBudgetBytes(16 << 20)
-	if got := eng.DeltaFrameCache().Budget(); got != 2<<20 {
-		t.Fatalf("after re-cut: %d, want 2 MiB", got)
+	if got := eng.DeltaFrameCache().Budget(); got != share(16<<20) {
+		t.Fatalf("after re-cut: %d, want %d", got, share(16<<20))
 	}
 	cfg.DeltaFrameCacheBytes = 1 << 20
 	pinned := NewServerEngine(coldTestNS, cfg, nil)
