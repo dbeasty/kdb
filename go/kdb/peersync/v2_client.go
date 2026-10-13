@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -565,6 +566,7 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 				H: header(wire.MsgRefUpdate, c.next()), Namespace: remote.Namespace,
 				Kind: ref.kind, Ref: ref.name, OldHex: remoteHex, NewHex: ref.hex,
 				Commits: commits, Stubs: stubs, More: !done,
+				Zstd: slices.Contains(c.caps, wire.SyncCapZstdPack),
 			})
 			var refused *RemoteError
 			if err != nil && !extended && errors.As(err, &refused) && refused.Code == wire.ErrorCodeShallowBoundary {
