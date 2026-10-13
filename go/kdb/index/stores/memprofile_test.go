@@ -213,7 +213,7 @@ func buildMemWorkload(t *testing.T, c memCase, withIndex bool) (int64, int64, in
 	keep := &memKeep{d: d}
 	var ds index.DocumentStore
 	if withIndex {
-		s, err := stores.NewFactory(d, stores.Options{}).Create(memDesc(c.kind))
+		s, err := stores.NewFactory(d, memOpts).Create(memDesc(c.kind))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -273,9 +273,10 @@ func buildMemWorkload(t *testing.T, c memCase, withIndex bool) (int64, int64, in
 				}
 			}
 		}
-		// A read per commit for the keyed kinds; the scored kinds rebuild a view per read, so
-		// they are read every 100 commits to keep the run tractable on the baseline.
-		if c.kind == index.IndexTypeHash || c.kind == index.IndexTypeBTree || (i/writesPerCommit)%100 == 0 {
+		// Reads interleave with the writes: every 10 commits for the keyed kinds, every 100 for
+		// the scored ones. The baseline sorts every key per range and rebuilds a whole view per
+		// search, so reading after every commit would make its runs take hours.
+		if n := i / writesPerCommit; ((c.kind == index.IndexTypeHash || c.kind == index.IndexTypeBTree) && n%10 == 0) || n%100 == 0 {
 			read()
 		}
 	}
@@ -283,3 +284,11 @@ func buildMemWorkload(t *testing.T, c memCase, withIndex bool) (int64, int64, in
 	heap, objs, scan := settledHeap()
 	return heap, objs, scan, keep
 }
+
+// memOpts forces exact vector search: on main the HNSW graph panics on the second put after a
+// search (fixed on this branch), so an A/B over this workload has to keep the graph unbuilt.
+var memOpts = func() stores.Options {
+	var o stores.Options
+	o.Vector.ExactThreshold = 1 << 30
+	return o
+}()
