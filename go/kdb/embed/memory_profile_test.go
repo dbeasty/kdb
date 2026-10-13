@@ -119,18 +119,15 @@ func TestMemoryProfile(t *testing.T) {
 	case "reads":
 		rt := open()
 		baseline := liveHeapBytes()
-		head, err := rt.DAG.Head()
-		if err != nil {
-			t.Fatal(err)
-		}
+		head := headTree(t, rt)
 		rng := rand.New(rand.NewSource(2))
 		const reads = 200_000
 		peak := sampleHeap()
 		start := time.Now()
 		for i := 0; i < reads; i++ {
 			id, _ := codec.UUIDFromString(docID(rng.Intn(docs)))
-			if _, err := rt.Storage.GetDocument(ns, id, head); err != nil {
-				t.Fatal(err)
+			if d, err := rt.Storage.GetDocument(ns, id, head); err != nil || d == nil {
+				t.Fatalf("read %d: %v, found=%v", i, err, d != nil)
 			}
 		}
 		took := time.Since(start)
@@ -143,17 +140,14 @@ func TestMemoryProfile(t *testing.T) {
 		rt := open()
 		afterOpen := liveHeapBytes()
 		openGC := forcedGCCost(5)
-		head, err := rt.DAG.Head()
-		if err != nil {
-			t.Fatal(err)
-		}
+		head := headTree(t, rt)
 		var cpuBefore, cpuAfter [2]float64
 		cpuBefore = gcCPU()
 		start := time.Now()
 		for i := 0; i < docs; i++ {
 			id, _ := codec.UUIDFromString(docID(i))
-			if _, err := rt.Storage.GetDocument(ns, id, head); err != nil {
-				t.Fatal(err)
+			if d, err := rt.Storage.GetDocument(ns, id, head); err != nil || d == nil {
+				t.Fatalf("read %d: %v, found=%v", i, err, d != nil)
 			}
 		}
 		took := time.Since(start)
@@ -166,6 +160,14 @@ func TestMemoryProfile(t *testing.T) {
 			openGC.wall, openGC.markCPU, readGC.wall, readGC.markCPU,
 			(cpuAfter[0]-cpuBefore[0])*1e3, (cpuAfter[1]-cpuBefore[1])*1e3))
 		logMemoryBreakdown(t, rt)
+		if dir := os.Getenv("KDB_MEMPROFILE_PPROF"); dir != "" { // what the full-read heap is made of
+			f, err := os.Create(filepath.Join(dir, "heap-after-fullread.pb.gz"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pprof.Lookup("heap").WriteTo(f, 0)
+			f.Close()
+		}
 		rt.Close()
 
 	case "writes":
@@ -258,6 +260,18 @@ func gcCPU() [2]float64 {
 	s := []metrics.Sample{{Name: "/cpu/classes/gc/total:cpu-seconds"}, {Name: "/cpu/classes/total:cpu-seconds"}}
 	metrics.Read(s)
 	return [2]float64{s[0].Value.Float64(), s[1].Value.Float64()}
+}
+
+// headTree is the document tree hash of the head commit - what Storage.GetDocument reads at. The
+// reads phase used to pass the head *commit* hash, which names no tree, so every read returned
+// "not found" without an error and the phase measured nothing.
+func headTree(t *testing.T, rt *EmbeddedKdbRuntime) codec.Hash {
+	t.Helper()
+	_, c, ok, err := rt.DAG.HeadCommit()
+	if err != nil || !ok {
+		t.Fatalf("head commit: ok=%v err=%v", ok, err)
+	}
+	return c.DocumentTreeHash
 }
 
 func envOr(name string, def int) int {
