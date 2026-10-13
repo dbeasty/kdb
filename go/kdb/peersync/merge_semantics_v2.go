@@ -46,6 +46,7 @@ func fieldMergeByOrigin(d *dag.InMemoryCommitDag, s conflictSides, lastWrite boo
 	}
 	out := kdbjson.ObjectValue{Fields: map[string]kdbjson.Value{}}
 	seen := map[string]bool{}
+	below0, below1 := d.AncestorTest(s.heads[0]), d.AncestorTest(s.heads[1])
 	keys := append(append([]string{}, oa.Keys...), ob.Keys...)
 	for _, k := range keys {
 		if seen[k] {
@@ -64,7 +65,7 @@ func fieldMergeByOrigin(d *dag.InMemoryCommitDag, s conflictSides, lastWrite boo
 			if err != nil {
 				return "", false, err
 			}
-			ch0, ch1 := changed(d, o0, s.heads[1]), changed(d, o1, s.heads[0])
+			ch0, ch1 := changed(below1, o0, s.heads[1]), changed(below0, o1, s.heads[0])
 			switch {
 			case ch0 && !ch1:
 				from = 0

@@ -730,6 +730,7 @@ func commitsBetween(d *dag.InMemoryCommitDag, head, base codec.Hash) ([]document
 		return nil, nil
 	}
 	inRange := map[codec.Hash]document.Commit{}
+	belowBase := d.AncestorTest(base)
 	queue := []codec.Hash{head}
 	for len(queue) > 0 {
 		h := queue[0]
@@ -737,7 +738,7 @@ func commitsBetween(d *dag.InMemoryCommitDag, head, base codec.Hash) ([]document
 		if _, seen := inRange[h]; seen {
 			continue
 		}
-		if h == base || d.IsAncestor(h, base) {
+		if h == base || belowBase(h) {
 			continue
 		}
 		if d.HasStub(h) || !d.HasCommit(h) {

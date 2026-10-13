@@ -222,6 +222,34 @@ func TestIsAncestorAgreesWithAncestorSet(t *testing.T) {
 	}
 }
 
+// AncestorTest answers many IsAncestor questions against one base from one walk; with pruning on
+// or off it must give exactly IsAncestor's answers, including for a hash the DAG does not know
+// and for a commit appended after the first query.
+func TestAncestorTestAgreesWithIsAncestor(t *testing.T) {
+	for _, pruning := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pruning=%v", pruning), func(t *testing.T) {
+			b := newDagBuilder(t)
+			b.dag.SetGraphSettings(GraphSettings{AncestryPruning: pruning})
+			a, left, right, m := b.diamond()
+			extra := b.commit("d", m)
+			unknown := codec.Hash{Bytes: [32]byte{0xee}}
+			all := []codec.Hash{b.root, a, left, right, m, extra, unknown}
+			for _, base := range all {
+				below := b.dag.AncestorTest(base)
+				for _, candidate := range all {
+					if got, want := below(candidate), b.dag.IsAncestor(candidate, base); got != want {
+						t.Errorf("AncestorTest(%s)(%s) = %v, IsAncestor says %v", b.name(base), b.name(candidate), got, want)
+					}
+				}
+				later := b.commit("later-"+b.name(base), extra)
+				if got, want := below(later), b.dag.IsAncestor(later, base); got != want {
+					t.Errorf("AncestorTest(%s) for a commit appended after the first query = %v, IsAncestor says %v", b.name(base), got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestCommonAncestorOfDiamondIsTheFork(t *testing.T) {
 	b := newDagBuilder(t)
 	a, left, right, _ := b.diamond()

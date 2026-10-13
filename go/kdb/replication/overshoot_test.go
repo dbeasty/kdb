@@ -19,15 +19,17 @@ import (
 // countingTransport wraps TCP and counts the bytes of every frame received from and sent to the
 // peer, so a test can see what a sync cost on the wire.
 type countingTransport struct {
-	inner    stream.Transport
-	recv     *atomic.Int64
-	sent     *atomic.Int64
-	killRecv int64         // when > 0, the connection is closed once this many bytes have been received
-	delay    time.Duration // slows every received frame by this much
+	inner stream.Transport
+	recv  *atomic.Int64
+	sent  *atomic.Int64
+	// sentFrames counts frames sent: the requests a sync made.
+	sentFrames *atomic.Int64
+	killRecv   int64         // when > 0, the connection is closed once this many bytes have been received
+	delay      time.Duration // slows every received frame by this much
 }
 
 func newCounting() *countingTransport {
-	return &countingTransport{inner: tcp.NewTransport(core.DefaultConnectOptions()), recv: &atomic.Int64{}, sent: &atomic.Int64{}}
+	return &countingTransport{inner: tcp.NewTransport(core.DefaultConnectOptions()), recv: &atomic.Int64{}, sent: &atomic.Int64{}, sentFrames: &atomic.Int64{}}
 }
 
 func (t *countingTransport) Connect(uri string) (stream.ConnectionHandle, error) {
@@ -79,6 +81,7 @@ func (c *countingConn) pump() {
 
 func (c *countingConn) Send(f []byte) error {
 	c.t.sent.Add(int64(len(f)))
+	c.t.sentFrames.Add(1)
 	return c.inner.Send(f)
 }
 func (c *countingConn) Incoming() <-chan []byte { return c.in }

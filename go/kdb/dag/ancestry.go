@@ -91,6 +91,33 @@ func (d *InMemoryCommitDag) IsAncestor(ancestor, descendant codec.Hash) bool {
 	return d.isAncestorPrunedLocked(ancestor, descendant)
 }
 
+// AncestorTest returns a predicate answering IsAncestor(h, base) for many h against one base.
+// IsAncestor without AncestryPruning builds base's whole ancestor closure on every call, so a
+// caller testing each commit of a range against one base - peer sync adopting a fetched range -
+// paid for the full history once per commit: catching up 10,000 commits allocated 18 GB. Here
+// the closure is built once, on the first query, and every answer after it is a lookup. With
+// pruning on, each answer is IsAncestor's own walk instead, which stops at once for any commit
+// newer than base and keeps nothing resident.
+//
+// The closure is base's history as of the first query; history only grows above base, so later
+// answers stay right. Not safe for concurrent use.
+func (d *InMemoryCommitDag) AncestorTest(base codec.Hash) func(codec.Hash) bool {
+	d.mu.Lock()
+	pruned := d.graph.AncestryPruning
+	d.mu.Unlock()
+	if pruned {
+		return func(h codec.Hash) bool { return d.IsAncestor(h, base) }
+	}
+	var closure map[codec.Hash]struct{}
+	return func(h codec.Hash) bool {
+		if closure == nil {
+			closure = d.AncestorSet(base)
+		}
+		_, ok := closure[h]
+		return ok
+	}
+}
+
 // isAncestorPrunedLocked answers IsAncestor using generation numbers. Must
 // hold mu exclusively, and must be called only once ensureGenerationsLocked
 // has reported the generations usable.
