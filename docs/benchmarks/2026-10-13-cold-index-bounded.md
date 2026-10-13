@@ -74,7 +74,26 @@ The retained index is now O(newest segment + segments), not O(versions):
 
 ### A 1M dataset built with the fix
 
-Pending: a fresh 1M-document build with this branch is running; its full-read numbers will be added here.
+This is the same workload built from scratch with this branch (build: 34m32s), then read in full once.
+
+| | value |
+|---|---|
+| cold-loader index | **never built**: 0 segments, 0 versions. All 1,000,000 cold loads were answered by location records. |
+| live heap after open | 98.7 MB |
+| live heap after reading all 1M documents | 753.6 MB |
+| `sstable.parseFooter` | **589 MB** (vs 299 MB on the old dataset) |
+| 1M reads (single run) | 12.8 s |
+
+**A trade-off to read before merging.** With a location record for every version, the blob store has about 2M more
+entries. Until A4 lands, the SSTable footer index holds every entry on the heap at about 145 B each, which is more than
+the cold-loader map cost (~112 B/version). So on a namespace written from scratch, the full-read heap is **higher**
+than main's on the old dataset (754 vs 683 MB). The cold-loader index is gone from it, but `parseFooter` doubled.
+
+This is the objects strategy working as designed: a location record per version is what it was always meant to write.
+The bug only hid the footer's cost. The footer is the remaining per-version heap structure, and plan item A4 (the
+mmapped SSTable index sidecar, in progress in a separate PR) takes it off the heap. A reviewer who wants to land this
+before A4 without the footer growth can drop the stash-bound part of the fix (`maxPendingLocationTrees`). The
+per-segment sidecars then serve the misses at 40 mapped bytes per version, with the newest segment on the heap.
 
 ## Notes
 
