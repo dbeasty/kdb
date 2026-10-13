@@ -480,7 +480,9 @@ func TestSlabTreeMemoryPerDocument(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		ids = append(ids, keyUUID(&items[r.Intn(n)].key))
 	}
-	for i := 0; i < 50000; i++ {
+	// Long enough for many collection cycles: a slab whose bound drifted by a little each cycle
+	// would show it here.
+	for i := 0; i < 300000; i++ {
 		var h codec.Hash
 		r.Read(h.Bytes[:])
 		if tree, err = tree.With(ids[i%len(ids)], h); err != nil {
@@ -490,7 +492,7 @@ func TestSlabTreeMemoryPerDocument(t *testing.T) {
 	heap2, _ := settledHeap()
 	churned := float64(int64(heap2)-int64(heap0)) / n
 	st = tree.trie.slab.stats()
-	t.Logf("after 50,000 updates: %.1f bytes/document; %d nodes, %d leaves, %d free nodes, %d free leaves, %.1f MB of chunks",
+	t.Logf("after 300,000 updates: %.1f bytes/document; %d nodes, %d leaves, %d free nodes, %d free leaves, %.1f MB of chunks",
 		churned, st.Nodes, st.Leaves, st.FreeNodes, st.FreeLeaves, float64(st.Bytes)/(1<<20))
 	// Bounded by slabNudgeFloor's rule: about 1.5 times the live records, plus a chunk and what
 	// the cleanups have not yet released.
