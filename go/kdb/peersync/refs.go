@@ -202,9 +202,35 @@ func commitSize(c document.Commit) int {
 // MissingCommitsFrom is MissingCommits for several wanted heads, paged by estimated bytes
 // instead of count. done reports whether the page holds everything that was missing.
 func MissingCommitsFrom(d *dag.InMemoryCommitDag, wants, haves []codec.Hash, maxBytes int) (commits []document.Commit, stubs []document.CommitStub, done bool, err error) {
-	if maxBytes <= 0 {
-		maxBytes = DefaultPageBytes
-	}
+	return newMissingCursor(d, wants, haves).page(d, maxBytes)
+}
+
+// missingCursor pages through what a peer is missing without working it out again for every
+// page. Working it out walks the whole history the peer's haves reach (AncestorSetOf) and sorts
+// the whole missing set, and MissingCommitsFrom did both for every page: with the haves grown
+// by the last page's tips, each next page was the same walk over the same history less one
+// page. A transfer of M commits in pages of P cost O((H+M)*M/P) - most of what a 200,000-commit
+// sync allocated. The cursor walks once and keeps the order, 32 bytes per missing commit.
+//
+// The pages are those MissingCommitsFrom would have served: a page is a prefix of the
+// topological order (ancestors first, ties broken by hash), and ordering what remains once a
+// prefix is held reproduces the same order's suffix, so serving the suffix is exact.
+//
+// page builds the next page and does not move past it; advance does, once the peer has stored
+// it - so a page refused and sent again, or a request repeated, gets the same page.
+type missingCursor struct {
+	wants []codec.Hash
+	order []codec.Hash                       // missing commits not yet served, in topological order
+	stubs map[codec.Hash]document.CommitStub // archived parents not yet sent
+
+	pageLen   int                   // commits the last page took from order
+	pageTips  []codec.Hash          // its tips: a peer that names them as haves holds the page
+	pageStubs []document.CommitStub // the stubs it carried
+
+	held []codec.Hash // tips of every page advanced past: haves for working the set out again
+}
+
+func newMissingCursor(d *dag.InMemoryCommitDag, wants, haves []codec.Hash) *missingCursor {
 	have := d.AncestorSetOf(haves)
 	set := map[codec.Hash]document.Commit{}
 	allStubs := map[codec.Hash]document.CommitStub{}
@@ -230,25 +256,89 @@ func MissingCommitsFrom(d *dag.InMemoryCommitDag, wants, haves []codec.Hash, max
 		queue = append(queue, c.ParentHashes...)
 	}
 	ordered := topoSort(set)
+	order := make([]codec.Hash, len(ordered))
+	for i, c := range ordered {
+		order[i] = c.Hash
+	}
+	return &missingCursor{wants: append([]codec.Hash(nil), wants...), order: order, stubs: allStubs}
+}
+
+// errCursorStale is page's report that a commit the cursor ordered is gone from the DAG -
+// squashed or archived since - so the missing set must be worked out again.
+var errCursorStale = fmt.Errorf("peer sync: the missing commits changed while paging")
+
+// page returns the next page - commits with operations, up to maxBytes estimated (at least one)
+// - and the stubs of archived parents it names. done reports whether it holds all that is left.
+func (c *missingCursor) page(d *dag.InMemoryCommitDag, maxBytes int) (commits []document.Commit, stubs []document.CommitStub, done bool, err error) {
+	if maxBytes <= 0 {
+		maxBytes = DefaultPageBytes
+	}
+	c.pageLen, c.pageTips, c.pageStubs = 0, nil, nil
 	size := 0
-	for i := range ordered {
-		ops, err := d.CommitOperations(ordered[i].Hash)
+	for _, h := range c.order {
+		cm, ok := d.GetCommit(h)
+		if !ok {
+			return nil, nil, false, errCursorStale
+		}
+		ops, err := d.CommitOperations(h)
 		if err != nil {
 			return nil, nil, false, err
 		}
-		ordered[i].Operations = ops
-		n := commitSize(ordered[i])
-		if i > 0 && size+n > maxBytes {
-			ordered = ordered[:i]
+		cm.Operations = ops
+		n := commitSize(cm)
+		if len(commits) > 0 && size+n > maxBytes {
 			break
 		}
 		size += n
-		for _, p := range ordered[i].ParentHashes {
-			if s, ok := allStubs[p]; ok {
+		commits = append(commits, cm)
+		for _, p := range cm.ParentHashes {
+			if s, ok := c.stubs[p]; ok && !containsStub(stubs, p) {
 				stubs = append(stubs, s)
-				delete(allStubs, p)
 			}
 		}
 	}
-	return ordered, stubs, len(ordered) == len(set), nil
+	c.pageLen, c.pageTips, c.pageStubs = len(commits), pageTips(commits), stubs
+	return commits, stubs, c.pageLen == len(c.order), nil
+}
+
+func containsStub(stubs []document.CommitStub, h codec.Hash) bool {
+	for _, s := range stubs {
+		if s.OriginalHash == h {
+			return true
+		}
+	}
+	return false
+}
+
+// advance moves past the page last returned: the peer has stored it.
+func (c *missingCursor) advance() {
+	c.held = append(c.held, c.pageTips...)
+	c.order = c.order[c.pageLen:]
+	for _, s := range c.pageStubs {
+		delete(c.stubs, s.OriginalHash)
+	}
+	c.pageLen, c.pageTips, c.pageStubs = 0, nil, nil
+}
+
+// continues reports whether a request for wants with haves is the next page of this cursor's
+// transfer: the same wants, from a peer that now names the last page's tips as held.
+func (c *missingCursor) continues(wants, haves []codec.Hash) bool {
+	if c.pageLen == 0 || len(wants) != len(c.wants) {
+		return false
+	}
+	for i := range wants {
+		if wants[i] != c.wants[i] {
+			return false
+		}
+	}
+	held := make(map[codec.Hash]struct{}, len(haves))
+	for _, h := range haves {
+		held[h] = struct{}{}
+	}
+	for _, t := range c.pageTips {
+		if _, ok := held[t]; !ok {
+			return false
+		}
+	}
+	return true
 }

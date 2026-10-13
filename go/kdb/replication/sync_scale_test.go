@@ -32,10 +32,20 @@ import (
 //
 // Off by default; KDB_SYNC_SCALE lists the sizes, e.g. KDB_SYNC_SCALE=10000,100000. Timings need an
 // otherwise idle machine; bytes, requests and allocations do not.
+//
+// "peak heap+" samples HeapAlloc, which includes garbage the collector has not reached yet, so it
+// moves with GC pacing. KDB_SYNC_LIVE=1 adds "peak live+": a collection before every sample, so
+// it is the live heap the sync held at its worst - the figure that has to fit the memory budget.
+// The forced collections slow the sync, so take wall times from a run without it.
+// KDB_SYNC_ADOPT_BYTES sets V2ClientConfig.AdoptEveryBytes (-1: adopt only at the end).
 func TestSyncScale(t *testing.T) {
 	spec := os.Getenv("KDB_SYNC_SCALE")
 	if spec == "" {
 		t.Skip("set KDB_SYNC_SCALE=10000,100000 to run")
+	}
+	if v, err := strconv.Atoi(os.Getenv("KDB_SYNC_ADOPT_BYTES")); err == nil {
+		testAdoptEveryBytes = v
+		t.Cleanup(func() { testAdoptEveryBytes = 0 })
 	}
 	bodyBytes := 200
 	if v, err := strconv.Atoi(os.Getenv("KDB_SYNC_BODY_BYTES")); err == nil && v > 0 {
@@ -72,15 +82,21 @@ func runSyncScale(t *testing.T, n, bodyBytes int) {
 	}
 
 	seed(0, n)
-	t.Logf("%-9s %10s %12s %12s %9s %12s %12s %12s", "scenario", "commits", "recv", "sent", "requests", "peak heap+", "allocated", "live after")
+	t.Logf("%-9s %10s %12s %12s %9s %12s %12s %12s %12s %6s", "scenario", "commits", "recv", "sent", "requests", "peak heap+", "peak live+", "allocated", "live after", "early")
 	report := func(name string, commits int, m syncMeasure) {
-		t.Logf("%-9s %10d %12s %12s %9d %12s %12s %12s   %s", name, commits, mib(m.recv), mib(m.sent), m.requests,
-			mib(m.peakHeap), mib(m.allocated), mib(m.liveAfter), m.wall.Round(time.Millisecond))
+		live := "-"
+		if m.peakLive > 0 {
+			live = mib(m.peakLive)
+		}
+		t.Logf("%-9s %10d %12s %12s %9d %12s %12s %12s %12s %6d   %s", name, commits, mib(m.recv), mib(m.sent), m.requests,
+			mib(m.peakHeap), live, mib(m.allocated), mib(m.liveAfter), m.early, m.wall.Round(time.Millisecond))
 	}
-	m := measureSync(t, func(tr *countingTransport) {
-		if _, err := syncWith(t, b, ma, ns, peersync.SyncPull, tr); err != nil {
+	m := measureSync(t, func(tr *countingTransport) int {
+		r, err := syncWith(t, b, ma, ns, peersync.SyncPull, tr)
+		if err != nil {
 			t.Fatal(err)
 		}
+		return r.EarlyAdoptions
 	})
 	if head(t, a) != head(t, b) {
 		t.Fatal("join: A and B differ")
@@ -88,10 +104,12 @@ func runSyncScale(t *testing.T, n, bodyBytes int) {
 	report("join", n, m)
 
 	seed(n, 2*n)
-	m = measureSync(t, func(tr *countingTransport) {
-		if _, err := syncWith(t, b, ma, ns, peersync.SyncPull, tr); err != nil {
+	m = measureSync(t, func(tr *countingTransport) int {
+		r, err := syncWith(t, b, ma, ns, peersync.SyncPull, tr)
+		if err != nil {
 			t.Fatal(err)
 		}
+		return r.EarlyAdoptions
 	})
 	if head(t, a) != head(t, b) {
 		t.Fatal("catch-up: A and B differ")
@@ -104,26 +122,40 @@ type syncMeasure struct {
 	recv, sent                     int64
 	requests                       int64
 	peakHeap, allocated, liveAfter int64
+	peakLive                       int64
+	early                          int
 }
 
 // measureSync runs sync with a counting transport and samples the heap while it runs.
-func measureSync(t *testing.T, sync func(*countingTransport)) syncMeasure {
+func measureSync(t *testing.T, sync func(*countingTransport) int) syncMeasure {
 	t.Helper()
 	runtime.GC()
 	var before runtime.MemStats
 	runtime.ReadMemStats(&before)
-	var peak atomic.Uint64
+	var peak, peakLive atomic.Uint64
+	sampleLive := os.Getenv("KDB_SYNC_LIVE") == "1"
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		var ms runtime.MemStats
-		tick := time.NewTicker(20 * time.Millisecond)
+		every := 20 * time.Millisecond
+		if sampleLive {
+			every = 100 * time.Millisecond
+		}
+		tick := time.NewTicker(every)
 		defer tick.Stop()
 		for {
 			runtime.ReadMemStats(&ms)
 			if ms.HeapAlloc > peak.Load() {
 				peak.Store(ms.HeapAlloc)
+			}
+			if sampleLive {
+				runtime.GC()
+				runtime.ReadMemStats(&ms)
+				if ms.HeapAlloc > peakLive.Load() {
+					peakLive.Store(ms.HeapAlloc)
+				}
 			}
 			select {
 			case <-stop:
@@ -134,7 +166,7 @@ func measureSync(t *testing.T, sync func(*countingTransport)) syncMeasure {
 	}()
 	tr := newCounting()
 	start := time.Now()
-	sync(tr)
+	early := sync(tr)
 	wall := time.Since(start)
 	close(stop)
 	<-done
@@ -143,12 +175,17 @@ func measureSync(t *testing.T, sync func(*countingTransport)) syncMeasure {
 	runtime.GC()
 	var live runtime.MemStats
 	runtime.ReadMemStats(&live)
-	return syncMeasure{
+	out := syncMeasure{
 		wall: wall, recv: tr.recv.Load(), sent: tr.sent.Load(), requests: tr.sentFrames.Load(),
 		peakHeap:  int64(peak.Load()) - int64(before.HeapAlloc),
 		allocated: int64(after.TotalAlloc - before.TotalAlloc),
 		liveAfter: int64(live.HeapAlloc) - int64(before.HeapAlloc),
+		early:     early,
 	}
+	if sampleLive {
+		out.peakLive = int64(peakLive.Load()) - int64(before.HeapAlloc)
+	}
+	return out
 }
 
 // fileNode is newNode on disk: a file-backed runtime, so what a sync leaves resident is what a

@@ -1,9 +1,10 @@
 package peersync
 
 import (
+	"bytes"
+	"container/heap"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -213,6 +214,22 @@ func (env IngestEnv) refillUnlogged(c document.Commit) error {
 // Adopt decides what main should point at given incomingHead, a commit already stored, and
 // performs that decision under the node's serialization - the second half of Ingest.
 func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
+	return adopt(env, incomingHead, false)
+}
+
+// AdoptFastForward is Adopt when incomingHead fast-forwards main, and nothing at all otherwise:
+// no merge, no conflict recorded or cleared, outcome OutcomeNoOp. A pull uses it to adopt a long
+// range a prefix at a time as the pages arrive (V2ClientConfig.AdoptEveryBytes): main moves only
+// to commits that extend it, so the result is the history a single adoption at the end would
+// have produced, but the received commits are logged - and their operations become evictable -
+// as the transfer goes, instead of all staying resident until its last page. Whether main can
+// fast-forward is decided under the node's serialization; a local commit that diverged main in
+// between makes this a no-op and leaves the decision to the adoption at the end.
+func AdoptFastForward(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
+	return adopt(env, incomingHead, true)
+}
+
+func adopt(env IngestEnv, incomingHead codec.Hash, fastForwardOnly bool) (IngestResult, error) {
 	var res IngestResult
 	if !env.DAG.HasCommit(incomingHead) {
 		head, err := env.DAG.Head()
@@ -228,6 +245,8 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 	// made is the commit this node created to adopt incomingHead - a merge or a join - once it
 	// has been queued for the log.
 	var made *document.Commit
+	// skipped: fastForwardOnly, and main could not fast-forward - nothing was decided.
+	skipped := false
 	err := node.Exclusive(func() error {
 		lock := divergenceLockFor(env.NamespaceID)
 		lock.Lock()
@@ -237,6 +256,10 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 		localHead, err := env.DAG.Head()
 		if err != nil {
 			return err
+		}
+		if fastForwardOnly && ResolveHeadUpdate(env.DAG, localHead, incomingHead) != HeadFastForward {
+			skipped = true
+			return nil
 		}
 		if env.CheckCommit != nil && ResolveHeadUpdate(env.DAG, localHead, incomingHead) != HeadAlreadyAncestor {
 			adopting, err := commitsBetween(env.DAG, incomingHead, localHead)
@@ -315,6 +338,10 @@ func Adopt(env IngestEnv, incomingHead codec.Hash) (IngestResult, error) {
 	res.Head = head
 	if err != nil {
 		return res, err
+	}
+	if skipped {
+		res.Outcome = CommitPushOutcome{Kind: OutcomeNoOp}
+		return res, headErr
 	}
 	if res.Outcome.Kind != OutcomeConflict {
 		if cerr := env.clearConflict("branch:" + mainBranch); cerr != nil {
@@ -791,26 +818,42 @@ func topoSort(set map[codec.Hash]document.Commit) []document.Commit {
 		}
 		pending[h] = n
 	}
-	var ready []codec.Hash
+	ready := &hashHeap{}
 	for h, n := range pending {
 		if n == 0 {
-			ready = append(ready, h)
+			ready.hs = append(ready.hs, h)
 		}
 	}
+	heap.Init(ready)
 	out := make([]document.Commit, 0, len(set))
-	for len(ready) > 0 {
-		sort.Slice(ready, func(i, j int) bool { return ready[i].Hex() < ready[j].Hex() })
-		h := ready[0]
-		ready = ready[1:]
+	for ready.Len() > 0 {
+		h := heap.Pop(ready).(codec.Hash)
 		out = append(out, set[h])
 		for _, ch := range children[h] {
 			pending[ch]--
 			if pending[ch] == 0 {
-				ready = append(ready, ch)
+				heap.Push(ready, ch)
 			}
 		}
 	}
 	return out
+}
+
+// hashHeap is a min-heap of hashes by their bytes - the order of their hex strings, which is
+// what topoSort breaks ties by. It replaced re-sorting the ready list, through two hex strings
+// per comparison, before every commit taken from it.
+type hashHeap struct{ hs []codec.Hash }
+
+func (h *hashHeap) Len() int { return len(h.hs) }
+func (h *hashHeap) Less(i, j int) bool {
+	return bytes.Compare(h.hs[i].Bytes[:], h.hs[j].Bytes[:]) < 0
+}
+func (h *hashHeap) Swap(i, j int) { h.hs[i], h.hs[j] = h.hs[j], h.hs[i] }
+func (h *hashHeap) Push(x any)    { h.hs = append(h.hs, x.(codec.Hash)) }
+func (h *hashHeap) Pop() any {
+	x := h.hs[len(h.hs)-1]
+	h.hs = h.hs[:len(h.hs)-1]
+	return x
 }
 
 // netEffect folds commits (parents first) into one final operation per document, sorted by id.

@@ -82,6 +82,46 @@ type V2Host struct {
 	// on this session was refused for (parent -> the pushed commit naming it). A GRAFT_PUSH of
 	// one of them is a boundary extension, not a graft (boundary.go).
 	boundaryGaps map[string]map[codec.Hash]codec.Hash
+
+	// fetchMu guards fetch, the session's FETCH transfer in progress: the namespace and the
+	// cursor serving its pages (see missingCursor), kept so each next page costs the page, not
+	// another walk of the namespace's history.
+	fetchMu sync.Mutex
+	fetch   *hostFetch
+}
+
+type hostFetch struct {
+	namespace string
+	cursor    *missingCursor
+}
+
+// fetchPage serves a FETCH_REQUEST: the next page of the session's transfer when the request
+// continues it - same namespace and wants, and the peer names the last page's tips as held -
+// and otherwise a transfer worked out afresh, which is what every page used to be.
+func (h *V2Host) fetchPage(env IngestEnv, m wire.FetchRequestMessage) ([]document.Commit, []document.CommitStub, bool, error) {
+	h.fetchMu.Lock()
+	defer h.fetchMu.Unlock()
+	var cur *missingCursor
+	if f := h.fetch; f != nil && f.namespace == m.Namespace && f.cursor.continues(m.Wants, m.Haves) {
+		cur = f.cursor
+		cur.advance()
+	}
+	for attempt := 0; ; attempt++ {
+		if cur == nil {
+			cur = newMissingCursor(env.DAG, m.Wants, m.Haves)
+		}
+		commits, stubs, done, err := cur.page(env.DAG, m.MaxBytes)
+		if errors.Is(err, errCursorStale) && attempt == 0 {
+			cur = nil
+			continue
+		}
+		if err != nil || done {
+			h.fetch = nil
+			return commits, stubs, done, err
+		}
+		h.fetch = &hostFetch{namespace: m.Namespace, cursor: cur}
+		return commits, stubs, done, nil
+	}
 }
 
 // boundaryGapsMax bounds what one session remembers of refused parents; a page that misses more
@@ -190,7 +230,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		if err != nil {
 			return nil, err
 		}
-		commits, stubs, done, err := MissingCommitsFrom(env.DAG, m.Wants, m.Haves, m.MaxBytes)
+		commits, stubs, done, err := h.fetchPage(env, m)
 		if err != nil {
 			return nil, err
 		}

@@ -44,6 +44,11 @@ type V2ClientConfig struct {
 	Mode       SyncMode
 	// PageBytes caps each page in both directions; 0 means DefaultPageBytes.
 	PageBytes int
+	// AdoptEveryBytes lets a pull that fast-forwards main adopt what it has received so far once
+	// that much (estimated commit bytes) is waiting, instead of holding the whole range in memory
+	// until its last page (see AdoptFastForward). 0 means DefaultAdoptEveryBytes; negative adopts
+	// only at the end.
+	AdoptEveryBytes int
 	// Local supplies this node's namespaces.
 	Local NamespaceProvider
 	// CreateLocal lets a pull create a namespace the peer has and this node does not.
@@ -93,6 +98,9 @@ type NamespaceSyncResult struct {
 	// RefErrors records refs other than main this sync could not take, by ref key; the rest of
 	// the namespace synced regardless.
 	RefErrors map[string]string
+	// EarlyAdoptions counts the times a pull moved main to a prefix of the range it was fetching
+	// before the last page arrived (V2ClientConfig.AdoptEveryBytes).
+	EarlyAdoptions int
 	// ReceivedTips are the tips of every page this sync stored, so a caller whose sync is
 	// interrupted can pass them back as ExtraHaves and resume.
 	ReceivedTips []codec.Hash
@@ -269,7 +277,8 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			return err
 		}
 		if !env.DAG.HasCommit(h) {
-			if haves, err = c.fetchRef(cfg, env, gate, remote.Namespace, remote.Shallow, h, haves, res); err != nil {
+			isMain := ref.kind == wire.RefBranch && ref.name == mainBranch
+			if haves, err = c.fetchRef(cfg, env, gate, remote.Namespace, remote.Shallow, h, haves, isMain, res); err != nil {
 				if ref.kind == wire.RefBranch && ref.name == mainBranch {
 					return err
 				}
@@ -400,9 +409,21 @@ func (c *v2Conn) snapshotFetcher(cfg V2ClientConfig, ns, at string) func(after s
 	}
 }
 
+// DefaultAdoptEveryBytes is how much (estimated commit bytes) a pull fetching main lets pile up
+// before adopting it, when V2ClientConfig.AdoptEveryBytes is 0. Each early adoption walks main's
+// history once to find the range it adopts, so the chunk is large enough that a long transfer
+// adopts a handful of times, not once per page.
+const DefaultAdoptEveryBytes = 32 << 20
+
 // fetchRef pages in everything want needs that this node lacks, returning the haves grown by
-// what arrived.
-func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns string, shallow []string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
+// what arrived. When main is the ref being fetched, it adopts the range a prefix at a time
+// (adoptEarly).
+func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns string, shallow []string, want codec.Hash, haves []codec.Hash, main bool, res *NamespaceSyncResult) ([]codec.Hash, error) {
+	every := cfg.AdoptEveryBytes
+	if every == 0 {
+		every = DefaultAdoptEveryBytes
+	}
+	waiting := 0 // estimated bytes stored and not yet adopted
 	for {
 		reply, err := c.request(wire.FetchRequestMessage{
 			H: header(wire.MsgFetchRequest, c.next()), Namespace: ns,
@@ -461,7 +482,35 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 		if page.Done || len(page.Commits) == 0 {
 			return haves, nil
 		}
+		for _, cm := range page.Commits {
+			waiting += commitSize(cm)
+		}
+		if main && every > 0 && waiting >= every {
+			adopted, err := adoptEarly(env, tips)
+			if err != nil {
+				return haves, err
+			}
+			if adopted {
+				res.EarlyAdoptions++
+				waiting = 0
+			}
+		}
 	}
+}
+
+// adoptEarly moves main to the tip of the pages received so far, if there is one tip and main
+// fast-forwards to it. Pages arrive parents first, so a page's single tip holds everything below
+// it; a page that ends in several tips (a side branch not merged yet) waits for a later page to
+// join them. Reports whether main moved.
+func adoptEarly(env IngestEnv, tips []codec.Hash) (bool, error) {
+	if len(tips) != 1 {
+		return false, nil
+	}
+	res, err := AdoptFastForward(env, tips[0])
+	if err != nil {
+		return false, err
+	}
+	return res.Outcome.Kind == OutcomeFastForwarded, nil
 }
 
 func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRefs, res *NamespaceSyncResult) error {
@@ -499,10 +548,16 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			res.RefErrors[ref.key()] = skip
 			continue
 		}
-		haves := append([]codec.Hash(nil), known...)
+		// Worked out once for the ref, then paged (see missingCursor); a page the peer refuses
+		// and is sent again is the same page.
+		cursor := newMissingCursor(env.DAG, []codec.Hash{local}, known)
 		extended := false // whether this page's boundary states were sent already
 		for {
-			commits, stubs, done, err := MissingCommitsFrom(env.DAG, []codec.Hash{local}, haves, cfg.PageBytes)
+			commits, stubs, done, err := cursor.page(env.DAG, cfg.PageBytes)
+			if errors.Is(err, errCursorStale) {
+				cursor = newMissingCursor(env.DAG, []codec.Hash{local}, append(append([]codec.Hash(nil), known...), cursor.held...))
+				commits, stubs, done, err = cursor.page(env.DAG, cfg.PageBytes)
+			}
 			if err != nil {
 				return err
 			}
@@ -533,7 +588,7 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			}
 			res.Pushed += ack.Stored
 			if !done {
-				haves = append(haves, pageTips(commits)...)
+				cursor.advance()
 				continue
 			}
 			res.Remote[ref.key()] = ack.Outcome

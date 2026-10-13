@@ -85,6 +85,14 @@ func (d *InMemoryCommitDag) trackOpsLocked(c document.Commit) {
 	if _, ok := d.opsElem[c.Hash]; ok {
 		return
 	}
+	// A commit received from a peer and not logged yet stays out of the list until MarkLogged:
+	// its operations cannot be evicted (opsPinnedLocked), and listing them made every eviction
+	// pass walk past all of them. A pull of a long range stores far more than the budget before
+	// any of it is logged, so each commit stored rescanned every one stored before it - O(n^2):
+	// joining 200,000 commits ran for more than ten minutes, almost all of it here.
+	if _, ok := d.unlogged[c.Hash]; ok {
+		return
+	}
 	d.opsElem[c.Hash] = d.opsLRU.PushFront(c.Hash)
 	d.opsResident += commitOpsBytes(c)
 	// The commit being inserted is protected from this eviction pass. It is
@@ -131,7 +139,8 @@ func (d *InMemoryCommitDag) opsPinnedLocked(hash codec.Hash) bool {
 	if _, ok := d.shallow[hash]; ok {
 		return true
 	}
-	// Nor one received from a peer and not yet logged - see unlogged.go.
+	// Nor one received from a peer and not yet logged - see unlogged.go. Such a commit is listed
+	// only if it was logged and then marked again (MarkUnlogged after a failed write).
 	if _, ok := d.unlogged[hash]; ok {
 		return true
 	}

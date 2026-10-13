@@ -49,10 +49,12 @@ func (d *InMemoryCommitDag) PutUnloggedCommit(c document.Commit) error {
 	if d.isResidentLocked(c.Hash) {
 		return nil
 	}
+	// Marked before it is stored, so the operations budget leaves it out (trackOpsLocked).
+	d.markUnloggedLocked(c.Hash)
 	if err := d.putCommitLocked(c, true, true); err != nil {
+		delete(d.unlogged, c.Hash)
 		return err
 	}
-	d.markUnloggedLocked(c.Hash)
 	return nil
 }
 
@@ -65,13 +67,14 @@ func (d *InMemoryCommitDag) PutUnloggedShallowCommit(c document.Commit) error {
 	if d.isResidentLocked(c.Hash) {
 		return nil
 	}
+	d.markUnloggedLocked(c.Hash)
 	if err := d.putCommitLocked(c, false, true); err != nil {
+		delete(d.unlogged, c.Hash)
 		return err
 	}
 	d.shallow[c.Hash] = struct{}{}
 	d.ancestryVersion++
 	d.ancestryEpoch++
-	d.markUnloggedLocked(c.Hash)
 	return nil
 }
 
@@ -99,7 +102,14 @@ func (d *InMemoryCommitDag) MarkUnlogged(h codec.Hash) {
 func (d *InMemoryCommitDag) MarkLogged(h codec.Hash) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if _, ok := d.unlogged[h]; !ok {
+		return
+	}
 	delete(d.unlogged, h)
+	// Its operations can be loaded back from the log from now on: they join the budget.
+	if c, ok := d.commitLocked(h); ok && !d.opsEvictedFor(h) {
+		d.trackOpsLocked(c)
+	}
 }
 
 // IsUnlogged reports whether h was received from a peer and has not been logged.
