@@ -125,6 +125,54 @@ func TestUnloggedOperationsAreNotEvicted(t *testing.T) {
 	}
 }
 
+// TestUnloggedCommitsJoinTheBudgetWhenLogged: an unlogged commit is kept out of the operations
+// budget's eviction list, so storing a long run of them past the budget costs each eviction pass
+// nothing - it used to walk every one stored before, which made a large pull quadratic. Once
+// logged, they join the list and the budget evicts them like any other.
+func TestUnloggedCommitsJoinTheBudgetWhenLogged(t *testing.T) {
+	d, err := NewInMemoryCommitDag("ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader := CommitOperationsLoader(func(h codec.Hash) ([]document.Op, error) {
+		return nil, fmt.Errorf("no frame for %s: %w", h.Hex(), ErrOperationsNotLogged)
+	})
+	d.SetOperationsLoader(loader, 8*1024)
+	parent, _ := d.Head()
+	var stored []codec.Hash
+	for i := 0; i < 200; i++ {
+		c := peerCommit(t, parent, 1024)
+		if err := d.PutUnloggedCommit(c); err != nil {
+			t.Fatal(err)
+		}
+		stored, parent = append(stored, c.Hash), c.Hash
+	}
+	d.mu.RLock()
+	listed := d.opsLRU.Len()
+	d.mu.RUnlock()
+	if listed != 0 {
+		t.Fatalf("%d unlogged commits are on the eviction list; none should be", listed)
+	}
+	for _, h := range stored {
+		if d.OperationsEvicted(h) {
+			t.Fatal("an unlogged commit's operations were evicted")
+		}
+	}
+	for _, h := range stored {
+		d.MarkLogged(h)
+	}
+	evicted := 0
+	for _, h := range stored {
+		if d.OperationsEvicted(h) {
+			evicted++
+		}
+	}
+	// ~1.1 KB each against an 8 KB budget: all but the newest handful go.
+	if evicted < 180 {
+		t.Fatalf("expected the logged commits evicted down to the budget, got %d of 200 evicted", evicted)
+	}
+}
+
 // TestRefillUnloggedCommit: a commit restored without operations the log can supply - what an
 // earlier version's checkpoint left behind - takes them back from a peer's copy that reproduces
 // its hash, and only from one that does.

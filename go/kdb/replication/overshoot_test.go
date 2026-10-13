@@ -106,6 +106,10 @@ func listen(t *testing.T, srv *server.KdbServerRuntime, ns string) meshNode {
 	return meshNode{srv: srv, addr: "tcp://" + ln.Addr().String()}
 }
 
+// testAdoptEveryBytes is the V2ClientConfig.AdoptEveryBytes every sync in these tests uses; 0
+// is the default. TestSyncScale sets it from KDB_SYNC_ADOPT_BYTES.
+var testAdoptEveryBytes int
+
 func syncWith(t *testing.T, from *server.KdbServerRuntime, to meshNode, ns string, mode peersync.SyncMode, tr stream.Transport) (peersync.NamespaceSyncResult, error) {
 	return syncPaged(t, from, to, ns, mode, tr, 0)
 }
@@ -115,6 +119,7 @@ func syncPaged(t *testing.T, from *server.KdbServerRuntime, to meshNode, ns stri
 	res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), tr, peersync.V2ClientConfig{
 		NodeID: from.NodeID.String(), PeerURI: to.addr, Namespaces: []string{ns}, Mode: mode,
 		Local: from.PeerNamespaces(), CreateLocal: true, Timeout: 30 * time.Second, PageBytes: pageBytes,
+		AdoptEveryBytes: testAdoptEveryBytes,
 	})
 	if err != nil {
 		return peersync.NamespaceSyncResult{}, err
