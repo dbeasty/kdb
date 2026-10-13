@@ -85,7 +85,8 @@ type frameShard struct {
 	chunks      [][]byte
 	pageNext    []uint32
 	freePages   []uint32
-	capacity    int // pages allocated in chunks
+	capacity    int   // pages allocated in chunks
+	slack       int64 // chunk backing arrays beyond capacity (extendChunk's headroom)
 	usedPages   int
 }
 
@@ -143,7 +144,8 @@ func (c *FrameCache) Budget() int64 {
 	return c.budget.Load()
 }
 
-// Bytes reports the memory the cache holds: its arena, page table and entry bookkeeping. What the
+// Bytes reports the memory the cache holds: its arena (with the chunks' growth headroom, which
+// stays within what the budget leaves room for), page table and entry bookkeeping. What the
 // memory budget is charged with.
 func (c *FrameCache) Bytes() int64 {
 	if c == nil {
@@ -153,7 +155,7 @@ func (c *FrameCache) Bytes() int64 {
 	for i := range c.shards {
 		s := &c.shards[i]
 		s.mu.Lock()
-		n += s.usedBytes(0, 0)
+		n += s.usedBytes(0, 0) + s.slack
 		s.mu.Unlock()
 	}
 	return n
@@ -293,6 +295,32 @@ func (s *frameShard) page(p uint32) []byte {
 	return s.chunks[p/frameChunkPages][off : off+framePageSize]
 }
 
+// extendChunk returns chunk lengthened to pages pages. Its backing array grows geometrically, up to
+// a whole chunk, so filling a chunk a few pages at a time copies it a constant number of times
+// rather than once per step - the step is one page in a small shard, and copying the partial chunk
+// on every step cost a frame cache ~27 KB of allocation per frame cached (a host serving a 50k
+// commit catch-up allocated 1.4 GB here).
+//
+// maxPages bounds the headroom: the pages the budget leaves room for in this chunk.
+func extendChunk(chunk []byte, pages, maxPages int) []byte {
+	n := pages * framePageSize
+	if n <= cap(chunk) {
+		return chunk[:n]
+	}
+	grown := make([]byte, n, max(n, min(maxPages*framePageSize, 2*cap(chunk))))
+	copy(grown, chunk)
+	return grown
+}
+
+// slackBytes is the chunks' backing arrays beyond the pages allocated: extendChunk's headroom.
+func (s *frameShard) slackBytes() int64 {
+	var n int64
+	for _, c := range s.chunks {
+		n += int64(cap(c) - len(c))
+	}
+	return n
+}
+
 // grow adds at least want pages to the arena if the budget allows, reporting whether it added any.
 func (s *frameShard) grow(want int) bool {
 	limit := s.budgetPages()
@@ -319,15 +347,21 @@ func (s *frameShard) grow(want int) bool {
 		if take > newCap-s.capacity {
 			take = newCap - s.capacity
 		}
+		// Headroom only where the budget is large enough for coarse steps (see above): the budget
+		// does not charge it, so it is kept within what the budget leaves room for. A small
+		// shard's partial chunk is small, and copying it on each step stays cheap.
+		maxPages := inChunk + take
+		if room >= 64*16 {
+			maxPages = min(frameChunkPages, old+room-ci*frameChunkPages)
+		}
 		if ci == len(s.chunks) {
-			s.chunks = append(s.chunks, make([]byte, take*framePageSize))
+			s.chunks = append(s.chunks, extendChunk(nil, take, maxPages))
 		} else {
-			grown := make([]byte, (inChunk+take)*framePageSize)
-			copy(grown, s.chunks[ci])
-			s.chunks[ci] = grown
+			s.chunks[ci] = extendChunk(s.chunks[ci], inChunk+take, maxPages)
 		}
 		s.capacity += take
 	}
+	s.slack = s.slackBytes()
 	for p := old; p < newCap; p++ {
 		s.pageNext = append(s.pageNext, noPage)
 	}
@@ -382,6 +416,7 @@ func (s *frameShard) shrinkArena(limit int) {
 	}
 	s.pageNext = s.pageNext[:limit]
 	s.capacity = limit
+	s.slack = s.slackBytes()
 }
 
 // evictOne drops the least recently used frame, reporting false when there is none.

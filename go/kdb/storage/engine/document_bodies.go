@@ -167,6 +167,28 @@ func (e *ServerEngine) MaterializeLiveBodies() error {
 	return nil
 }
 
+// MaterializeBodies writes bodies (content hash to body) to the blob store and flushes it: the
+// versions a squash catch-up brought, which no log segment holds. MaterializeLiveBodies is the
+// whole live set; this is only what changed. Cold reads consult the blob store from here on.
+func (e *ServerEngine) MaterializeBodies(bodies map[codec.Hash]string) error {
+	if e.memTable == nil || e.config.IOShim == nil {
+		return fmt.Errorf("kdb: namespace %s has no durable blob store to materialize bodies into", e.namespaceID)
+	}
+	defer e.bodiesExternal.Store(true)
+	for h, body := range bodies {
+		if e.memTable.Get(h) == nil {
+			e.memTable.Put(h, []byte(body))
+		}
+	}
+	if _, err := e.memTable.Flush(0); err != nil {
+		return err
+	}
+	if e.wal != nil {
+		return e.wal.Sync()
+	}
+	return nil
+}
+
 // SetBodiesExternal records that some of this namespace's document bodies live only in the blob
 // store - set at open for a namespace bootstrapped from a snapshot - so cold reads look there
 // whatever the history mode.

@@ -70,7 +70,6 @@ func (e *ServerEngine) rebaseHeldTrees() {
 		e.rebaseAgain.Store(true)
 		return
 	}
-	defer e.rebasing.Store(false)
 	for {
 		e.rebaseAgain.Store(false)
 		trees := e.treesByHash.Trees()
@@ -92,7 +91,13 @@ func (e *ServerEngine) rebaseHeldTrees() {
 			e.treesMu.Unlock()
 		}
 		e.treeMu.Unlock()
-		if !e.rebaseAgain.Load() {
+		if e.rebaseAgain.Load() {
+			continue
+		}
+		// A segment that lands between that check and this store finds a pass still running,
+		// asks it for another and leaves - so look once more, and take the pass back if asked.
+		e.rebasing.Store(false)
+		if !e.rebaseAgain.Load() || !e.rebasing.CompareAndSwap(false, true) {
 			return
 		}
 	}

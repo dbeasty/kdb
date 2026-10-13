@@ -69,6 +69,13 @@ type PeerConfig struct {
 	// by snapshot - from this peer after each sync, until the peer has no more (deepen=true). Such
 	// a namespace can then sync with nodes that have history of their own.
 	Deepen bool
+	// CatchUp is how a pull from this peer that is behind on main catches up: replay every commit
+	// (the default), squash straight to the peer's head, or auto - squash when the backlog is large
+	// next to what it changes (catchup=replay|squash|auto; see peersync.CatchUpRoute).
+	// CatchUpNamespaces overrides it per namespace pattern, first match wins
+	// (catchup-ns=pattern:route|pattern:route).
+	CatchUp           peersync.CatchUpRoute
+	CatchUpNamespaces []peersync.CatchUpOverride
 }
 
 // DefaultInterval is the anti-entropy tick when a peer names none.
@@ -77,6 +84,7 @@ const DefaultInterval = 30 * time.Second
 // ParsePeer reads one peer from its flag form:
 //
 //	name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both,interval=30s,user=u,password-env=VAR,create=true,bootstrap=snapshot
+//	name=hub,addr=tcps://hub:4242,namespaces=app/*,catchup=auto,catchup-ns=app/audit:replay
 //	name=hq,addr=tcps://hq:4242,namespaces=orders,writeback=true,filter=region = 'EU'
 //
 // Namespaces are separated by '|' because ',' separates fields. mode is pull, push or both
@@ -158,6 +166,24 @@ func ParsePeer(spec string) (PeerConfig, error) {
 			case "full":
 			default:
 				return PeerConfig{}, fmt.Errorf("peer %q: meta %q is not scoped or full", spec, value)
+			}
+		case "catchup":
+			r, err := peersync.ParseCatchUpRoute(value)
+			if err != nil {
+				return PeerConfig{}, fmt.Errorf("peer %q: %w", spec, err)
+			}
+			p.CatchUp = r
+		case "catchup-ns":
+			for _, item := range strings.Split(value, "|") {
+				pattern, route, ok := strings.Cut(strings.TrimSpace(item), ":")
+				if !ok || pattern == "" {
+					return PeerConfig{}, fmt.Errorf("peer %q: catchup-ns entry %q is not pattern:route", spec, item)
+				}
+				r, err := peersync.ParseCatchUpRoute(route)
+				if err != nil {
+					return PeerConfig{}, fmt.Errorf("peer %q: %w", spec, err)
+				}
+				p.CatchUpNamespaces = append(p.CatchUpNamespaces, peersync.CatchUpOverride{Pattern: pattern, Route: r})
 			}
 		case "bootstrap":
 			switch value {

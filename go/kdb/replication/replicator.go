@@ -460,6 +460,7 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 		Namespaces:        l.namespaces(), Mode: l.peer.Mode, Local: l.r.cfg.Local,
 		CreateLocal: l.peer.CreateLocal, ExtraHaves: extra, Timeout: l.r.cfg.Timeout,
 		PreferSnapshot: l.peer.PreferSnapshot, MetaView: l.metaView(),
+		CatchUp: l.peer.CatchUp, CatchUpNamespaces: l.peer.CatchUpNamespaces,
 	})
 	now := time.Now().UTC()
 	st.LastAttempt = now

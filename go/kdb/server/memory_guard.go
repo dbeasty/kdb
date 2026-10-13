@@ -291,20 +291,26 @@ func (g *MemoryGuard) zoneFor(used float64, from Zone) Zone {
 // type doc's point 1 for why this, not MemStats.Sys or HeapAlloc) when no cgroup memory
 // controller is available - non-Linux hosts, or a Linux host not running inside one.
 //
-// Mapped files (the commit graph, storage/mmapfile) are page cache, not Go heap, and the two paths
-// treat them differently on purpose:
+// Mapped files (storage/mmapfile: the commit graph, the live tree file, the delta-index and
+// SSTable index sidecars) are page cache, not Go heap, and the two paths account for them
+// differently:
 //
 //   - cgroup path: mapped pages are charged as page cache, so nothing is added here. Pages that
-//     age onto the inactive LRU are reclaimable and are meant to stop counting; ones the graph
-//     keeps reading stay on the active list and stay counted.
+//     age onto the inactive LRU are reclaimable and are meant to stop counting; ones that keep
+//     being read stay on the active list and stay counted.
 //   - no-cgroup path (macOS, bare Linux): runtime/metrics knows nothing about the page cache, so
-//     every mapped byte is added - a conservative over-count, hot or cold, rather than budgeting
-//     as if a mapped multi-gigabyte graph cost nothing.
+//     the mapped pages that are resident right now are added (mmapfile.ResidentBytes). Not the
+//     whole mapped size: with the graph, the tree and every index sidecar mapped, charging each
+//     file whole put the guard into a pressure zone and shed load long before memory was short,
+//     for pages the OS can drop at will. Resident is still an over-count of what is unrecoverable
+//     (clean resident pages are reclaimable too) but it is bounded by what is actually in memory.
+//     ResidentBytes is cached for a second or more, so a burst of paging-in shows up a sample or
+//     few late, which the guard's moving average spans anyway.
 func currentMemoryUsageBytes() float64 {
 	if v, ok := cgroupMemoryCurrentBytes(); ok {
 		return float64(v)
 	}
-	return goRuntimeFootprintBytes() + float64(mmapfile.MappedBytes())
+	return goRuntimeFootprintBytes() + float64(mmapfile.ResidentBytes())
 }
 
 // goRuntimeFootprintBytes is what the Go runtime has mapped and not released.

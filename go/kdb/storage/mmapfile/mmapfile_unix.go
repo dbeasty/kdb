@@ -31,7 +31,9 @@ func Open(path string) (*Mapping, error) {
 		return nil, fmt.Errorf("mmapfile: map %s: %w", path, err)
 	}
 	mappedBytes.Add(int64(len(data)))
-	return &Mapping{data: data, unmap: func() error { return syscall.Munmap(data) }}, nil
+	m := &Mapping{data: data, unmap: func() error { return syscall.Munmap(data) }}
+	register(m)
+	return m, nil
 }
 
 // Supported reports whether Open can map files on this platform.

@@ -28,16 +28,109 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // mappedBytes is the total size of every live mapping in the process. Mapped pages are page
-// cache, not Go heap, so GOMEMLIMIT does not see them - but the container's cgroup budget does,
-// so the memory-budget zones must be told. Reported whole-file rather than resident: the kernel
-// decides what is resident, and charging the full size is the safe over-estimate.
+// cache, not Go heap, so GOMEMLIMIT does not see them. This is the whole-file figure; see
+// ResidentBytes for how much of it is in memory right now.
 var mappedBytes atomic.Int64
 
-// MappedBytes reports the bytes currently mapped by this process through this package.
+// MappedBytes reports the bytes currently mapped by this process through this package: the
+// address space the mappings span, whether or not their pages are in memory.
 func MappedBytes() int64 { return mappedBytes.Load() }
+
+// live is every mapping that has not been unmapped yet, so ResidentBytes can walk them.
+var (
+	liveMu sync.Mutex
+	live   = map[*Mapping]struct{}{}
+)
+
+func register(m *Mapping) {
+	liveMu.Lock()
+	live[m] = struct{}{}
+	liveMu.Unlock()
+}
+
+func unregister(m *Mapping) {
+	liveMu.Lock()
+	delete(live, m)
+	liveMu.Unlock()
+}
+
+// residentCacheTTL is the shortest time a ResidentBytes result is reused. The memory guard
+// samples every 200ms; residency moves on the scale of the kernel's reclaim, not of one sample,
+// and a fresh count walks every page of every mapping.
+const residentCacheTTL = time.Second
+
+// residentCostFactor stretches the cache interval to this many times the last count's cost, so
+// counting never takes more than about 2% of a core. Measured over a 4 GiB mapping: about 5ms on
+// linux/arm64 (the 1s floor applies), about 85ms on darwin/arm64, whose mincore costs ~300ns a
+// page (the interval becomes ~4s).
+const residentCostFactor = 50
+
+var resident struct {
+	mu    sync.Mutex
+	at    time.Time
+	ttl   time.Duration
+	bytes int64
+	vec   []byte // mincore output buffer, reused across calls
+}
+
+// ResidentBytes reports how many bytes of the live mappings are in memory now: the pages the OS
+// would have to give up, or keep, rather than the address space they span. Clean mapped pages
+// are reclaimable page cache, so a large mapping read only in part costs only that part; this is
+// the figure to budget against where nothing else (a cgroup) accounts for page cache.
+//
+// Counted with mincore(2), which reports residency in the page cache, so a page counts whether
+// this process or another brought it in. Where mincore is unavailable the full mapped size is
+// returned instead. The result is cached for a second, or longer where counting is slow (see
+// residentCostFactor), and is never reported above MappedBytes.
+func ResidentBytes() int64 {
+	resident.mu.Lock()
+	defer resident.mu.Unlock()
+	if now := time.Now(); resident.at.IsZero() || now.Sub(resident.at) >= resident.ttl {
+		resident.bytes = residentBytesNow()
+		done := time.Now()
+		resident.at = done
+		resident.ttl = max(residentCacheTTL, residentCostFactor*done.Sub(now))
+	}
+	return min(resident.bytes, MappedBytes())
+}
+
+// residentBytesNow counts resident bytes across every live mapping, uncached. The caller holds
+// resident.mu, which owns the mincore buffer.
+func residentBytesNow() int64 {
+	liveMu.Lock()
+	ms := make([]*Mapping, 0, len(live))
+	for m := range live {
+		ms = append(ms, m)
+	}
+	liveMu.Unlock()
+
+	var total int64
+	for _, m := range ms {
+		// Pin the mapping the way a Region does, so a concurrent Close + Release cannot unmap it
+		// under mincore; the last unpin unmaps instead. Holding m.mu across the count would stall
+		// readers' Acquire for its duration.
+		m.mu.Lock()
+		if m.done || len(m.data) == 0 {
+			m.mu.Unlock()
+			continue
+		}
+		m.refs++
+		data := m.data
+		m.mu.Unlock()
+
+		total += residentOf(data, &resident.vec)
+
+		m.mu.Lock()
+		m.refs--
+		_ = m.maybeUnmapLocked()
+		m.mu.Unlock()
+	}
+	return total
+}
 
 // ErrUnsupported is returned by Open on platforms where file mapping is not available.
 var ErrUnsupported = errors.New("mmapfile: not supported on this platform")
@@ -93,6 +186,7 @@ func (m *Mapping) maybeUnmapLocked() error {
 	data := m.data
 	m.data = nil
 	mappedBytes.Add(-int64(len(data)))
+	unregister(m)
 	if m.unmap != nil && data != nil {
 		return m.unmap()
 	}

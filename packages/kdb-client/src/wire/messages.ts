@@ -114,6 +114,8 @@ export interface HandshakeDto {
   user?: string;
   password?: string;
   token?: string;
+  /** Optional frame encodings this client reads and writes (binary.ts). Omitted when none. */
+  wireFeatures?: string[];
 }
 
 export interface HandshakeAckDto {
@@ -124,6 +126,8 @@ export interface HandshakeAckDto {
   rejectionReason?: string | null;
   /** The server's release version. Absent from servers older than 0.7.0 and from the JVM one. */
   serverVersion?: string | null;
+  /** The offered wire features the server accepted. Absent from servers before binary frames. */
+  wireFeatures?: string[] | null;
 }
 
 export interface SessionBeginDto {
@@ -172,7 +176,7 @@ export interface TxCommitDto {
   namespace: string;
   sessionId: string;
   /** Encoded per bytes.ts - an array of numbers, not base64 and not a Uint8Array. */
-  transactionBytes: number[];
+  transactionBytes: number[] | Uint8Array;
 }
 
 export interface TxRollbackDto {
@@ -182,7 +186,8 @@ export interface TxRollbackDto {
 
 export interface ConflictReportDto {
   namespace: string;
-  reportBytes: number[];
+  /** number[] from a JSON envelope, Uint8Array from a binary body. */
+  reportBytes: number[] | Uint8Array;
   errorCode?: string | null;
   retryAfterMs?: number | null;
 }

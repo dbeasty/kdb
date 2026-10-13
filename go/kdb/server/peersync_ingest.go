@@ -46,6 +46,7 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 		Self:                s.NodeID.String(),
 		ShallowRootsChanged: s.Runtime.RecordShallowRoots,
 		GraftRecorded:       s.Runtime.RecordGraft,
+		SquashInstalled:     s.Runtime.PersistSquash,
 		Conflicts:           s.Conflicts,
 		CanInstallSnapshot:  s.Runtime.CanInstallSnapshot,
 		StagingDir:          s.peerStagingDir(),

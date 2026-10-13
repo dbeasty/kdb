@@ -59,6 +59,9 @@ type EmbeddedKdbRuntime struct {
 	// window. Nil for a runtime with nothing to reclaim - a read-only or
 	// pure in-memory one. See Maintain.
 	maintain func() (TruncationResult, error)
+	// checkpointNow writes a checkpoint through the log as it stands, truncating nothing; nil for a
+	// runtime with no log. See PersistSquash.
+	checkpointNow func() error
 	// peerFloor, when set, is the oldest moment an active replication peer is known to be caught
 	// up to - see SetPeerRetentionFloor.
 	peerFloor atomic.Pointer[func() (time.Time, bool)]
