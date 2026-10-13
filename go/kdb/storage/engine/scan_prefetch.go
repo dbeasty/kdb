@@ -42,7 +42,7 @@ func (e *ServerEngine) prefetchWindow(window []scanEntry) map[codec.Hash]documen
 	}
 	byFrame := make(map[frameKey][]want)
 	for _, entry := range window {
-		if _, cached := e.docsByHash.Get(entry.h); cached {
+		if e.docsByHash.Contains(entry.h) {
 			continue
 		}
 		raw := e.memTable.Get(entry.h)

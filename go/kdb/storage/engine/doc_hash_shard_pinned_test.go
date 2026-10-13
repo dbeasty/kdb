@@ -35,7 +35,7 @@ func TestPinnedVersionsDoNotMakeEvictionScanThem(t *testing.T) {
 
 	// The structural guarantee: nothing pinned is on a recency list, so eviction has nothing to skip.
 	for i, sh := range s.shards {
-		if n := sh.lru.Len(); n != 0 {
+		if n := sh.lruLen; n != 0 {
 			t.Fatalf("shard %d has %d entries on its recency list, all of them pinned", i, n)
 		}
 	}
@@ -57,7 +57,14 @@ func TestPinnedVersionsDoNotMakeEvictionScanThem(t *testing.T) {
 	for i := 0; i < live; i++ {
 		s.Unpin(hashN(i))
 	}
-	if got := s.ResidentBytes(); got > 5<<20 {
-		t.Fatalf("after unpinning everything the store still holds %d bytes", got)
+	if got := s.LiveBytes(); got > 5<<20 {
+		t.Fatalf("after unpinning everything the store still holds %d live bytes", got)
+	}
+	// The footprint follows the live bytes down: dead bodies are compacted away and the slot
+	// array and index are rebuilt smaller. It stays above them by the arena's unfilled tail
+	// and up to bodyArenaDeadFraction of dead bodies per shard, which at 64 shards of 64 KiB
+	// each is the same order as the live bytes themselves.
+	if got := s.ResidentBytes(); got > 10<<20 {
+		t.Fatalf("after unpinning everything the store still occupies %d bytes", got)
 	}
 }
