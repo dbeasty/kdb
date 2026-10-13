@@ -37,6 +37,21 @@ type SegmentStamper interface {
 	SegmentStamp(segmentName string) (stamp SegmentStamp, ok bool, err error)
 }
 
+// SegmentIntoReader is implemented by shims that can read segment bytes into a buffer the caller
+// owns, so a read whose bytes are dead once decoded - a delta frame, an SSTable block - can use a
+// pooled buffer (see storage/bufpool) instead of a fresh allocation per read.
+//
+// ReadFromSegmentInto reads up to len(dst) bytes at offset and returns how many it read; fewer
+// than len(dst) means the segment ended, and is not an error. Reading at or past the end reads
+// nothing.
+//
+// Optional, like SegmentSizer. Note for test shims that wrap a real one by embedding: this method
+// is promoted along with the rest, so a wrapper that overrides ReadFromSegment to count or fault
+// reads must override this too (or hide it) to see the reads that use it.
+type SegmentIntoReader interface {
+	ReadFromSegmentInto(segmentName string, offset int64, dst []byte) (int, error)
+}
+
 // PlatformIOShim is the platform I/O boundary for segment and snapshot storage.
 type PlatformIOShim interface {
 	AppendToSegment(segmentName string, bytes []byte) (int64, error)

@@ -137,6 +137,12 @@ func (s *PrimaryWithReplicas) Read(segmentName string, offset int64, length int)
 	return s.primary.Read(segmentName, offset, length)
 }
 
+// ReadInto forwards to the primary, reading into dst; a primary without a positional read is
+// served by Read and a copy.
+func (s *PrimaryWithReplicas) ReadInto(segmentName string, offset int64, dst []byte) (int, error) {
+	return readIntoStore(s.primary, segmentName, offset, dst)
+}
+
 // Size forwards to the primary, which is where every read is served from.
 func (s *PrimaryWithReplicas) Size(segmentName string) (int64, error) {
 	if sz, ok := s.primary.(segmentStoreSizer); ok {

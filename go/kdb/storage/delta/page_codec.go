@@ -4,7 +4,9 @@ import (
 	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/compression"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/bufpool"
 )
 
 // KDBP page frame, v2:
@@ -82,24 +84,73 @@ func (PageCodec) Frame(payload []byte, codec storage.CompressionCodec) ([]byte, 
 // Parse decodes one whole frame (header included) using the codec the frame
 // itself records - callers no longer supply it.
 func (PageCodec) Parse(frame []byte) ([]byte, error) {
-	if len(frame) < PageFrameHeaderSize {
-		return nil, fmt.Errorf("delta page: frame shorter than its %d-byte header", PageFrameHeaderSize)
+	body, codecID, uncompressed, err := frameBody(frame)
+	if err != nil {
+		return nil, err
 	}
-	if v := frame[4]; v != PageFormatVersion {
-		return nil, fmt.Errorf("delta page: unsupported frame version %d (this build writes and reads v%d)", v, PageFormatVersion)
-	}
-	body := frame[PageFrameHeaderSize:]
-	uncompressed := readInt(frame, 12)
-	switch frame[5] {
+	switch codecID {
 	case pageCodecNone:
 		return append([]byte(nil), body...), nil
-	case pageCodecZSTD:
+	default:
 		// Exactly the recorded size, not a padded bound: the header says how
 		// many bytes this frame decodes to, so anything else is corruption.
 		return compression.Decompress(body, uncompressed)
-	default:
-		return nil, fmt.Errorf("delta page: unknown codec id %d in frame", frame[5])
 	}
+}
+
+// frameBody validates frame's header and returns its body, codec and recorded uncompressed size.
+func frameBody(frame []byte) (body []byte, codecID byte, uncompressed int, err error) {
+	if len(frame) < PageFrameHeaderSize {
+		return nil, 0, 0, fmt.Errorf("delta page: frame shorter than its %d-byte header", PageFrameHeaderSize)
+	}
+	if v := frame[4]; v != PageFormatVersion {
+		return nil, 0, 0, fmt.Errorf("delta page: unsupported frame version %d (this build writes and reads v%d)", v, PageFormatVersion)
+	}
+	switch frame[5] {
+	case pageCodecNone, pageCodecZSTD:
+	default:
+		return nil, 0, 0, fmt.Errorf("delta page: unknown codec id %d in frame", frame[5])
+	}
+	return frame[PageFrameHeaderSize:], frame[5], readInt(frame, 12), nil
+}
+
+// parseCommit is Parse followed by document.FromPayloadBytes, without keeping the payload.
+//
+// Every reader of a frame wants the commit, not the payload, and the payload is dead the moment
+// the commit is decoded: the codec copies every field it keeps (codec.cursor.rawN, and string
+// conversion), and the commit hash is computed from the payload, not retained with it. So the
+// payload need not be a fresh allocation per frame:
+//
+//   - an uncompressed frame's body is decoded in place, rather than copied first as Parse does;
+//   - a compressed one is decompressed into a pooled buffer of the recorded size, returned to the
+//     pool once the commit is decoded. TestParseCommitDoesNotAliasThePayload holds the "nothing
+//     keeps the payload" half of that bargain.
+//
+// Errors are Parse's and FromPayloadBytes's, unchanged, so callers report them as before.
+func (pc PageCodec) parseCommit(frame []byte) (document.Commit, error) {
+	body, codecID, uncompressed, err := frameBody(frame)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	if codecID == pageCodecNone {
+		return document.FromPayloadBytes(body)
+	}
+	if uncompressed <= 0 || uncompressed > bufpool.MaxPooled {
+		// Too large to pool (or an implausible size, which Decompress checks against the
+		// frame's own header before allocating for it).
+		payload, err := compression.Decompress(body, uncompressed)
+		if err != nil {
+			return document.Commit{}, err
+		}
+		return document.FromPayloadBytes(payload)
+	}
+	bp := bufpool.Get(uncompressed)
+	defer bufpool.Put(bp)
+	payload, err := compression.DecompressInto((*bp)[:0], body, uncompressed)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	return document.FromPayloadBytes(payload)
 }
 
 func writeInt(a []byte, o, v int) {

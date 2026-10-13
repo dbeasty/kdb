@@ -125,11 +125,7 @@ func scanFrames(bytes []byte, fn func(ScannedCommit) error) (int, error) {
 		if err := verifyFrameCRC(frame, offset); err != nil {
 			return offset, newCorruptFrameError(bytes, offset, err.(*CorruptFrameError).Reason, false)
 		}
-		payload, err := codec.Parse(frame)
-		if err != nil {
-			return offset, newCorruptFrameError(bytes, offset, err.Error(), true)
-		}
-		commit, err := document.FromPayloadBytes(payload)
+		commit, err := codec.parseCommit(frame)
 		if err != nil {
 			return offset, newCorruptFrameError(bytes, offset, err.Error(), true)
 		}
@@ -335,11 +331,7 @@ func DecodeFrame(bytes []byte, offset int) (document.Commit, error) {
 		return document.Commit{}, err
 	}
 	var pc PageCodec
-	payload, err := pc.Parse(bytes[:frameEnd])
-	if err != nil {
-		return document.Commit{}, &CorruptFrameError{Offset: offset, Reason: err.Error()}
-	}
-	commit, err := document.FromPayloadBytes(payload)
+	commit, err := pc.parseCommit(bytes[:frameEnd])
 	if err != nil {
 		return document.Commit{}, &CorruptFrameError{Offset: offset, Reason: err.Error()}
 	}
@@ -351,11 +343,7 @@ func decodeFrameAt(pc *PageCodec, bytes []byte, offset int) (document.Commit, er
 	if !ok {
 		return document.Commit{}, &CorruptFrameError{Offset: offset, Reason: "frame vanished between passes"}
 	}
-	payload, err := pc.Parse(bytes[offset:frameEnd])
-	if err != nil {
-		return document.Commit{}, &CorruptFrameError{Offset: offset, Reason: err.Error()}
-	}
-	commit, err := document.FromPayloadBytes(payload)
+	commit, err := pc.parseCommit(bytes[offset:frameEnd])
 	if err != nil {
 		return document.Commit{}, &CorruptFrameError{Offset: offset, Reason: err.Error()}
 	}
@@ -405,13 +393,7 @@ func scanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, int
 			offset = frameEnd
 			continue
 		}
-		payload, err := codec.Parse(frame)
-		if err != nil {
-			skipped = append(skipped, offset)
-			offset = frameEnd
-			continue
-		}
-		commit, err := document.FromPayloadBytes(payload)
+		commit, err := codec.parseCommit(frame)
 		if err != nil {
 			skipped = append(skipped, offset)
 			offset = frameEnd

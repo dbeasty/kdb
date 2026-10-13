@@ -23,6 +23,12 @@ type segmentStoreStamper interface {
 	Stamp(segmentName string) (size, modNanos int64, ok bool, err error)
 }
 
+// segmentStoreIntoReader is the optional SegmentByteStore counterpart of
+// storage.SegmentIntoReader: a positional read into the caller's buffer.
+type segmentStoreIntoReader interface {
+	ReadInto(segmentName string, offset int64, dst []byte) (int, error)
+}
+
 type segmentStoreSizer interface {
 	Size(segmentName string) (int64, error)
 }
