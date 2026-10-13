@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -47,6 +48,7 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 		GraftRecorded:       s.Runtime.RecordGraft,
 		Conflicts:           s.Conflicts,
 		CanInstallSnapshot:  s.Runtime.CanInstallSnapshot,
+		StagingDir:          s.peerStagingDir(),
 		SnapshotInstalled: func(root document.Commit) error {
 			// The documents arrived without commits the unique registry could be told about, so
 			// it is rebuilt from the tree they built.
@@ -77,6 +79,18 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 		env.CheckCommit = s.checkReplicatedCommit
 	}
 	return env
+}
+
+// peerStagingDir is where peer sync stages transfers it must take in whole (a snapshot, a pushed
+// graft) before acting on them: under the data root, on the disk the namespace lives on, rather
+// than the system temporary directory, which may be memory-backed (tmpfs) - the opposite of the
+// point. Namespaces live under <root>/ns, so this cannot be mistaken for one. A memory runtime
+// stages in the system temporary directory.
+func (s *KdbServerRuntime) peerStagingDir() string {
+	if s.Runtime == nil || s.Runtime.DataRoot == "" {
+		return ""
+	}
+	return filepath.Join(s.Runtime.DataRoot, "peersync-staging")
 }
 
 // PeerNamespaces is the set of namespaces this runtime's process serves to peers, and feeds
@@ -170,11 +184,16 @@ func (n serverLocalNode) Advanced(step peersync.AdvanceStep) error {
 			rt.SetSchema(sch)
 		}
 	}
-	if p, ok := rt.SQLIndexProvider().(*RegistryIndexProvider); ok && len(p.registry.Descriptors()) > 0 && len(step.Applied) > 0 {
-		prepared, err := p.prepareCommitForIndexes(step.Applied)
-		if err == nil {
-			_, err = p.commitToIndexes(prepared, last.Hash)
-		}
+	if p, ok := rt.SQLIndexProvider().(*RegistryIndexProvider); ok && len(p.registry.Descriptors()) > 0 && step.HasApplied() {
+		// In batches: a snapshot install's applied set is the whole namespace, which it streams
+		// from its staging file (AdvanceStep.AppliedPages) rather than holding.
+		err := step.EachApplied(func(ops []document.Op) error {
+			prepared, err := p.prepareCommitForIndexes(ops)
+			if err == nil {
+				_, err = p.commitToIndexes(prepared, last.Hash)
+			}
+			return err
+		})
 		// An index that cannot take a replicated value is not a reason to refuse history the peer
 		// already accepted; it is rebuilt from the documents, which are the truth.
 		if err != nil {

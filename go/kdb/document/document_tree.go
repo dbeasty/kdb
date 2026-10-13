@@ -335,3 +335,30 @@ func CommitStubFromValue(value codec.Value) (CommitStub, error) {
 	}
 	return CommitStub{OriginalHash: oh, ArchiveLocation: loc.V, StubbedAt: ts}, nil
 }
+
+// WalkAfter streams the entries whose id sorts after after - unsigned big-endian bytes, the order
+// of the ids' canonical string forms - in ascending id order, stopping early when visit returns
+// false. Unlike Walk, the order is guaranteed, and finding the first entry costs the depth of the
+// trie rather than a walk of every entry before it: a caller paging through a tree by "the ids
+// after the last one I saw" pays for the page, not for its position (peersync's snapshot pages).
+//
+// A tree built from a flat map without a trie builds one first (O(n), once per call).
+func (t DocumentTree) WalkAfter(after codec.UUID, visit func(codec.UUID, codec.Hash) bool) {
+	t.walkAfter(after, visit, nil)
+}
+
+// WalkAfterCounting is WalkAfter, also reporting how many trie nodes it entered - for tests and
+// benchmarks asserting that a page costs the page.
+func (t DocumentTree) WalkAfterCounting(after codec.UUID, visit func(codec.UUID, codec.Hash) bool) (visited int) {
+	t.walkAfter(after, visit, &visited)
+	return visited
+}
+
+// WalkOrdered streams every entry in ascending id order (see WalkAfter).
+func (t DocumentTree) WalkOrdered(visit func(codec.UUID, codec.Hash) bool) {
+	trieWalkUntil(t.trieRootOrBuild(), visit)
+}
+
+func (t DocumentTree) walkAfter(after codec.UUID, visit func(codec.UUID, codec.Hash) bool, visited *int) {
+	trieWalkAfter(t.trieRootOrBuild(), after.Bytes(), after, 0, visit, visited)
+}

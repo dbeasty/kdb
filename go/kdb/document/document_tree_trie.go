@@ -405,3 +405,71 @@ func trieCount(root *trieNode) int {
 func trieTreeHash(root *trieNode) codec.Hash {
 	return codec.Hash{Bytes: nodeHash(root)}
 }
+
+// uuidAfter reports whether a sorts after b in the trie's order: unsigned big-endian bytes, which
+// is also the order of their canonical (lowercase hex) string forms.
+func uuidAfter(a, b codec.UUID) bool {
+	if a.MSB != b.MSB {
+		return uint64(a.MSB) > uint64(b.MSB)
+	}
+	return uint64(a.LSB) > uint64(b.LSB)
+}
+
+// trieWalkAfter visits, in ascending id order, the leaves under n whose id sorts after the one
+// whose bytes are key, until visit returns false; reports whether the walk ran to completion.
+//
+// It descends only along key's path: every child before key's nibble holds ids at or below key
+// and is skipped without being entered, every child after it is walked whole. So reaching the
+// first id after key costs O(trieDepth) nodes, not a walk of everything before it - what lets a
+// caller page through a tree by "the ids after the last one I saw" at the cost of the page.
+// visited, when non-nil, counts the nodes entered (for tests asserting that cost).
+func trieWalkAfter(n *trieNode, key []byte, after codec.UUID, depth int, visit func(codec.UUID, codec.Hash) bool, visited *int) bool {
+	if n == nil {
+		return true
+	}
+	if visited != nil {
+		*visited++
+	}
+	if n.leaf != nil {
+		if uuidAfter(n.leaf.uuid, after) {
+			return visit(n.leaf.uuid, n.leaf.hash)
+		}
+		return true
+	}
+	if n.children == nil || depth >= trieDepth {
+		return true
+	}
+	nib := nibbleAt(key, depth)
+	if !trieWalkAfter(n.children[nib], key, after, depth+1, visit, visited) {
+		return false
+	}
+	for i := nib + 1; i < 16; i++ {
+		if !trieWalkCounted(n.children[i], visit, visited) {
+			return false
+		}
+	}
+	return true
+}
+
+// trieWalkCounted is trieWalkUntil, counting the nodes it enters when visited is non-nil.
+func trieWalkCounted(n *trieNode, visit func(codec.UUID, codec.Hash) bool, visited *int) bool {
+	if visited == nil {
+		return trieWalkUntil(n, visit)
+	}
+	if n == nil {
+		return true
+	}
+	*visited++
+	if n.leaf != nil {
+		return visit(n.leaf.uuid, n.leaf.hash)
+	}
+	if n.children == nil {
+		return true
+	}
+	for _, c := range n.children {
+		if !trieWalkCounted(c, visit, visited) {
+			return false
+		}
+	}
+	return true
+}
