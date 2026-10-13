@@ -5,28 +5,22 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 )
 
-type putEvent struct {
-	seq   int64
-	entry Entry
-}
-
-type deleteEvent struct {
-	seq      int64
-	docID    codec.UUID
-	atCommit codec.Hash
-}
-
-// MemoryStore is the chronological-replay hash/btree index. Hash and btree share one
-// implementation: lookups hit a bucket map and ranges sort the visible keys, which is exact
-// (if not fast) for both.
+// MemoryStore is the hash/btree index. Hash and btree share one implementation (event_log.go):
+// a head state of interned keys and their documents, kept in key order once a range has been
+// asked for, plus a bounded window of history for reads at older commits.
 type MemoryStore struct {
 	descriptor Descriptor
 	log        *eventLog
 }
 
-// NewMemoryStore creates an in-memory index bound to a DAG.
+// NewMemoryStore creates an in-memory index bound to a DAG, with default options.
 func NewMemoryStore(descriptor Descriptor, d *dag.InMemoryCommitDag) *MemoryStore {
-	return &MemoryStore{descriptor: descriptor, log: newEventLog(d)}
+	return NewMemoryStoreWithOptions(descriptor, d, MemoryOptions{})
+}
+
+// NewMemoryStoreWithOptions creates an in-memory index bound to a DAG.
+func NewMemoryStoreWithOptions(descriptor Descriptor, d *dag.InMemoryCommitDag, opts MemoryOptions) *MemoryStore {
+	return &MemoryStore{descriptor: descriptor, log: newEventLog(d, opts)}
 }
 
 func (s *MemoryStore) Descriptor() Descriptor { return s.descriptor }
@@ -52,11 +46,7 @@ func (s *MemoryStore) Lookup(key Key, atCommit *codec.Hash) ([]codec.UUID, error
 	if err := s.requireKeyedType(); err != nil {
 		return nil, err
 	}
-	cutoff, err := s.log.cutoff(atCommit)
-	if err != nil {
-		return nil, err
-	}
-	return s.log.lookup(key, cutoff), nil
+	return s.log.lookup(key, atCommit)
 }
 
 // LookupCount is len(Lookup(key)) without building or copying the id list.
@@ -64,22 +54,14 @@ func (s *MemoryStore) LookupCount(key Key, atCommit *codec.Hash) (int, error) {
 	if err := s.requireKeyedType(); err != nil {
 		return 0, err
 	}
-	cutoff, err := s.log.cutoff(atCommit)
-	if err != nil {
-		return 0, err
-	}
-	return s.log.lookupCount(key, cutoff), nil
+	return s.log.lookupCount(key, atCommit)
 }
 
 func (s *MemoryStore) Range(from, to Key, atCommit *codec.Hash, limit int, ascending bool) ([]codec.UUID, error) {
 	if err := s.requireKeyedType(); err != nil {
 		return nil, err
 	}
-	cutoff, err := s.log.cutoff(atCommit)
-	if err != nil {
-		return nil, err
-	}
-	return s.log.rangeScan(from, to, cutoff, limit, ascending), nil
+	return s.log.rangeScan(from, to, atCommit, limit, ascending)
 }
 
 func (s *MemoryStore) Search(query string, atCommit *codec.Hash, limit int) ([]RankedResult, error) {
@@ -100,8 +82,19 @@ func (s *MemoryStore) IsValid(atCommit codec.Hash) (bool, error) {
 }
 
 func (s *MemoryStore) Snapshot() ([]byte, error) {
-	return s.log.snapshotBytes(), nil
+	return s.log.snapshotBytes()
 }
+
+// NeedsRebuild brings the head state up to the DAG head and reports whether it could not be:
+// the commit graph changed in a way the incremental state cannot follow (a graft, a move of the
+// head to a commit that does not descend from it) after history was dropped. The store then
+// answers every read with ErrHistoryUnavailable until it is rebuilt.
+func (s *MemoryStore) NeedsRebuild() bool { return s.log.needsRebuild() }
+
+// ForgetHistory records that the store's content was just rebuilt from the documents at head,
+// so it holds no history: a read at an older commit reports ErrHistoryUnavailable instead of
+// replaying the rebuild's events as if they had happened then.
+func (s *MemoryStore) ForgetHistory() { s.log.forgetHistory() }
 
 func (s *MemoryStore) RestoreSnapshot(data []byte) error {
 	return s.log.restoreSnapshotBytes(data)

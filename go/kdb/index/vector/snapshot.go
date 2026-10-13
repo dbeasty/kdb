@@ -9,11 +9,17 @@ import (
 	"github.com/limidus/kdb/go/kdb/index"
 )
 
-// SnapshotFormatVersion is bumped when the snapshot shape changes incompatibly.
+// SnapshotFormatVersion is the format of a snapshot carrying the store's complete event history.
 const SnapshotFormatVersion = 1
 
-// The snapshot holds every vector version and tombstone in sequence order; the graph is not
-// persisted and is rebuilt from the vectors when first needed (§7).
+// snapshotFormatHeadOnly is the format written after history was dropped: one put per document
+// visible at head, under the head commit, plus the commits of skipped events. A restore holds no
+// history before that head.
+const snapshotFormatHeadOnly = 2
+
+// The snapshot holds every vector version and tombstone in sequence order while the store still
+// has its whole history, and the head's vectors once it does not; the graph is not persisted and
+// is rebuilt from the vectors when first needed (§7).
 type snapshotFile struct {
 	FormatVersion int           `json:"formatVersion"`
 	Kind          string        `json:"kind"`
@@ -22,6 +28,7 @@ type snapshotFile struct {
 	Metric        string        `json:"metric"`
 	Seq           int64         `json:"seq"`
 	Docs          []snapshotDoc `json:"docs"`
+	Pending       []string      `json:"pending,omitempty"`
 }
 
 type snapshotDoc struct {
@@ -40,6 +47,12 @@ type snapshotEvent struct {
 func (s *Store) Snapshot() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if h, err := s.dag.Head(); err == nil {
+		s.advanceLocked(h)
+	}
+	if s.broken {
+		return nil, index.ErrHistoryUnavailable
+	}
 	f := snapshotFile{
 		FormatVersion: SnapshotFormatVersion,
 		Kind:          "vector",
@@ -49,18 +62,39 @@ func (s *Store) Snapshot() ([]byte, error) {
 		Seq:           s.seq,
 		Docs:          []snapshotDoc{},
 	}
-	for docID, dl := range s.docs {
-		sd := snapshotDoc{DocID: docID.String()}
-		for _, ev := range dl.events {
-			se := snapshotEvent{Seq: ev.seq, Commit: ev.commit.Hex()}
-			if ev.node == nil {
+	byDoc := make(map[codec.UUID]*snapshotDoc)
+	add := func(doc codec.UUID, se snapshotEvent) {
+		sd := byDoc[doc]
+		if sd == nil {
+			sd = &snapshotDoc{DocID: doc.String()}
+			byDoc[doc] = sd
+		}
+		sd.Events = append(sd.Events, se)
+	}
+	if !s.dropped {
+		for i := range s.events {
+			e := &s.events[i]
+			se := snapshotEvent{Seq: e.seq, Commit: e.commit.Hex()}
+			if e.node == nil {
 				se.Tombstone = true
 			} else {
-				se.Vector = ev.node.vec
+				se.Vector = e.node.vec
 			}
-			sd.Events = append(sd.Events, se)
+			add(e.doc, se)
 		}
-		f.Docs = append(f.Docs, sd)
+	} else {
+		f.FormatVersion = snapshotFormatHeadOnly
+		head := s.lin.Cutoff().Hex()
+		for doc, n := range s.head.base {
+			add(doc, snapshotEvent{Seq: n.seq, Commit: head, Vector: n.vec})
+		}
+		for _, c := range s.lin.PendingCommits() {
+			f.Pending = append(f.Pending, c.Hex())
+		}
+		sort.Strings(f.Pending)
+	}
+	for _, sd := range byDoc {
+		f.Docs = append(f.Docs, *sd)
 	}
 	sort.Slice(f.Docs, func(i, j int) bool { return f.Docs[i].DocID < f.Docs[j].DocID })
 	return json.Marshal(f)
@@ -73,7 +107,7 @@ func (s *Store) RestoreSnapshot(data []byte) error {
 	if err := json.Unmarshal(data, &f); err != nil {
 		return fmt.Errorf("vector snapshot: %w", err)
 	}
-	if f.FormatVersion != SnapshotFormatVersion || f.Kind != "vector" {
+	if (f.FormatVersion != SnapshotFormatVersion && f.FormatVersion != snapshotFormatHeadOnly) || f.Kind != "vector" {
 		return fmt.Errorf("vector snapshot: unsupported format (version %d, kind %q)", f.FormatVersion, f.Kind)
 	}
 	if f.Field != s.field || f.Dimensions != s.dims || f.Metric != s.metric.String() {
@@ -115,6 +149,21 @@ func (s *Store) RestoreSnapshot(data []byte) error {
 	}
 	if f.Seq > s.seq {
 		s.seq = f.Seq
+	}
+	if f.FormatVersion == snapshotFormatHeadOnly {
+		for _, hex := range f.Pending {
+			c, err := codec.HashFromHex(hex)
+			if err != nil {
+				return fmt.Errorf("vector snapshot: %w", err)
+			}
+			s.lin.MarkPending(c)
+		}
+		if h, err := s.dag.Head(); err == nil {
+			s.advanceLocked(h)
+		}
+		if !s.broken && s.started {
+			s.dropped = true
+		}
 	}
 	return nil
 }
