@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 )
@@ -101,6 +102,19 @@ type ForeignTreeStore interface {
 // Adapter's atCommit. A tree the adapter cannot resolve is an error, not an empty walk.
 type TreeWalker interface {
 	WalkTree(namespaceID string, treeHash codec.Hash, visit func(docID codec.UUID, contentHash codec.Hash) bool) error
+}
+
+// ErrOrderedScanUnsupported: see OrderedScanner.
+var ErrOrderedScanUnsupported = errors.New("storage: ordered scan not supported by this adapter")
+
+// OrderedScanner is ScanDocuments in ascending document id order, starting after a given id - what
+// a paged SELECT needs to resume where its last page ended instead of re-reading every row before
+// it. after == nil starts at the first document. Optional: a caller that finds it missing pages by
+// offset, as before.
+type OrderedScanner interface {
+	// ScanDocumentsAfter returns ErrOrderedScanUnsupported when an adapter that routes to others
+	// (engine.MultiplexAdapter) finds the one it routes to cannot do it.
+	ScanDocumentsAfter(namespaceID string, atCommit codec.Hash, after *codec.UUID, batchSize int, onBatch func([]document.Document) error) error
 }
 
 // TreePinner is implemented by adapters that cache historical document trees under a budget,

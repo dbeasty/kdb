@@ -67,7 +67,7 @@ func TestDocHashPinsAcrossPlaceholderAndLoad(t *testing.T) {
 	}
 	s.Put(h, document.Document{JSON: "{}"})
 	sh := s.shardFor(h)
-	if e := sh.docs[h]; e.pins != 2 || e.el != nil {
+	if e := sh.slots[mustFind(t, sh, h)]; e.pins != 2 || e.next != noSlot {
 		t.Fatalf("stored version lost its pins: %+v", e)
 	}
 	if _, left := sh.pinned[h]; left {
@@ -75,7 +75,7 @@ func TestDocHashPinsAcrossPlaceholderAndLoad(t *testing.T) {
 	}
 	s.Unpin(h)
 	s.Unpin(h)
-	if e := sh.docs[h]; e.pins != 0 || e.el == nil {
+	if e := sh.slots[mustFind(t, sh, h)]; e.pins != 0 || e.next == noSlot {
 		t.Fatal("version with no pins is not evictable")
 	}
 
@@ -113,4 +113,13 @@ func heapNow() int64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	return int64(m.HeapAlloc)
+}
+
+func mustFind(t *testing.T, sh *docHashShard, h codec.Hash) uint32 {
+	t.Helper()
+	i, ok := sh.index.find(sh.slots, &h)
+	if !ok {
+		t.Fatalf("%s is not resident", h.Hex())
+	}
+	return i
 }

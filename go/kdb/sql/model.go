@@ -402,6 +402,12 @@ type QueryContext struct {
 	// Page, when non-nil, makes a SELECT return one page of its result instead of failing when
 	// the whole result exceeds MaxRows. See PageRequest.
 	Page *PageRequest
+
+	// keyset and scanAfter are set by executePage for a keyset page: rows come in document id
+	// order, starting after scanAfter (nil: from the first), and the result records each row's
+	// document id.
+	keyset    bool
+	scanAfter *codec.UUID
 }
 
 // PageRequest asks for rows [Offset, Offset+Size) of a SELECT's result, in the order the query
@@ -409,9 +415,20 @@ type QueryContext struct {
 // commit). Offset counts from the start of the query's own result, after its OFFSET and within
 // its LIMIT. Each page re-runs the query, so the caller pins AtCommit across pages to keep them
 // consistent; a query with ORDER BY pays its sort on every page.
+//
+// Keyset paging. A query with no ORDER BY, DISTINCT, GROUP BY or OFFSET over storage that scans in
+// id order (storage.OrderedScanner) is paged by key instead: its rows come in document id order,
+// and the next page passes the last delivered row's document back as After and starts right
+// after it - paying for the page, not for every row before it. Offset still
+// counts the rows returned so far, for the query's LIMIT. The key is a row's document id
+// (QueryResult.RowDocIDs). OffsetOnly forces the offset path - for
+// a continuation that was issued without a key (by a build before keyset paging, or for a query
+// that was not eligible), whose rows were in a different order.
 type PageRequest struct {
-	Offset int
-	Size   int
+	Offset     int
+	Size       int
+	After      *codec.UUID
+	OffsetOnly bool
 }
 
 // ExecStats records what a query actually cost while it ran. All counters are additive across
@@ -467,6 +484,10 @@ type QueryResult struct {
 	Plan string
 	// More is set on a paged SELECT when rows remain after this page.
 	More bool
+	// RowDocIDs is set on a keyset page (PageRequest): each returned row's document id. The next
+	// page starts after the last row the caller actually delivered - which is the last of these,
+	// unless the caller ends the page early (the server's reply byte cap does).
+	RowDocIDs []codec.UUID
 }
 
 // DMLResult is the outcome of INSERT (operations for commit).

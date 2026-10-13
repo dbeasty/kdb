@@ -98,12 +98,12 @@ func TestSortedTableSizeOverwriteNetsOut(t *testing.T) {
 	key := testKey(t, "k")
 
 	table.Put(key, make([]byte, 100))
-	if got := table.SizeBytes(); got != 100 {
-		t.Fatalf("SizeBytes after first Put: got %d, want 100", got)
+	if got, want := table.SizeBytes(), int64(100); got != want {
+		t.Fatalf("SizeBytes after first Put: got %d, want %d", got, want)
 	}
 	table.Put(key, make([]byte, 40)) // overwrite with a smaller value
-	if got := table.SizeBytes(); got != 40 {
-		t.Fatalf("SizeBytes after overwrite: got %d, want 40 (replaced value must be netted out)", got)
+	if got, want := table.SizeBytes(), int64(40); got != want {
+		t.Fatalf("SizeBytes after overwrite: got %d, want %d (replaced value must be netted out)", got, want)
 	}
 }
 

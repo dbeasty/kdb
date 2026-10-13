@@ -275,6 +275,31 @@ func (a *expiryHidingAdapter) ScanDocuments(namespaceID string, atCommit codec.H
 	})
 }
 
+// ScanDocumentsAfter is storage.OrderedScanner through the expiry filter: ScanDocuments in id
+// order after a key, for keyset paging. Reports storage.ErrOrderedScanUnsupported when the
+// adapter underneath cannot scan in order, and the executor pages by offset.
+func (a *expiryHidingAdapter) ScanDocumentsAfter(namespaceID string, atCommit codec.Hash, after *codec.UUID, batchSize int, onBatch func([]document.Document) error) error {
+	ordered, ok := a.Adapter.(storage.OrderedScanner)
+	if !ok {
+		return storage.ErrOrderedScanUnsupported
+	}
+	if !a.hidesAt(atCommit) {
+		return ordered.ScanDocumentsAfter(namespaceID, atCommit, after, batchSize, onBatch)
+	}
+	return ordered.ScanDocumentsAfter(namespaceID, atCommit, after, batchSize, func(batch []document.Document) error {
+		live := batch[:0:0]
+		for _, doc := range batch {
+			if !a.runtime.isExpiredAtHead(doc.JSON) {
+				live = append(live, doc)
+			}
+		}
+		if len(live) == 0 {
+			return nil
+		}
+		return onBatch(live)
+	})
+}
+
 // startSweeper launches the sweep goroutine. Caller must have stopped any previous one.
 func (s *KdbServerRuntime) startSweeper(interval time.Duration) {
 	if interval <= 0 {

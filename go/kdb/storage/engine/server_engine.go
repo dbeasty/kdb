@@ -252,7 +252,9 @@ func (e *ServerEngine) PinTree(treeHash codec.Hash) {
 		return
 	}
 	if s := e.latestTree.Load(); s != nil && s.hash == treeHash {
-		e.treesByHash.Put(s.tree)
+		// The live tree is held by latestTree whatever this store does, so it is charged what
+		// it will cost once it is history: a path, not a copy. See treeDeltaBytes.
+		e.treesByHash.PutCharged(s.tree, treeDeltaBytes(s.tree.Size(), 1))
 	}
 }
 
@@ -266,8 +268,13 @@ func (e *ServerEngine) UnpinTree(treeHash codec.Hash) {
 
 // publishTreeLocked records tree under its hash and republishes it as the latest. Must be
 // called with treesMu held exclusively.
-func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree) {
-	e.treesByHash.Put(tree)
+//
+// changes is how many documents tree differs from the previous live tree by, or 0 when there is
+// no previous one (an open). The store is charged that delta, not the whole tree: the live tree
+// is held by latestTree regardless and is accounted as the live trie (see MemoryBreakdown), and
+// what it will hold uniquely once it is history is the paths the next commit rewrites.
+func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree, changes int) {
+	e.treesByHash.PutCharged(tree, treeDeltaBytes(tree.Size(), changes))
 	e.latestTree.Store(&treeSnapshot{hash: tree.TreeHash, tree: tree})
 }
 
@@ -566,6 +573,25 @@ func (e *ServerEngine) GetDocuments(namespaceID string, docIDs []codec.UUID, atC
 }
 
 func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, batchSize int, onBatch func([]document.Document) error) error {
+	return e.scanDocuments(atCommit, batchSize, func(t document.DocumentTree, visit func(codec.UUID, codec.Hash) bool) {
+		t.Walk(visit)
+	}, onBatch)
+}
+
+// ScanDocumentsAfter implements storage.OrderedScanner: ScanDocuments in id order, from the first
+// id after after. Seeking costs the depth of the trie, not the entries before it
+// (DocumentTree.WalkAfter), so a paged SELECT pays for its page rather than its position.
+func (e *ServerEngine) ScanDocumentsAfter(namespaceID string, atCommit codec.Hash, after *codec.UUID, batchSize int, onBatch func([]document.Document) error) error {
+	return e.scanDocuments(atCommit, batchSize, func(t document.DocumentTree, visit func(codec.UUID, codec.Hash) bool) {
+		if after == nil {
+			t.WalkOrdered(visit)
+			return
+		}
+		t.WalkAfter(*after, visit)
+	}, onBatch)
+}
+
+func (e *ServerEngine) scanDocuments(atCommit codec.Hash, batchSize int, walk func(document.DocumentTree, func(codec.UUID, codec.Hash) bool), onBatch func([]document.Document) error) error {
 	if batchSize <= 0 {
 		batchSize = 256
 	}
@@ -642,7 +668,7 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 		return true
 	}
 	stopped := false
-	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
+	walk(tree, func(id codec.UUID, h codec.Hash) bool {
 		window = append(window, scanEntry{id, h})
 		if len(window) >= scanWindowDocs && !flush() {
 			stopped = true
@@ -783,7 +809,7 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 	// names this tree landed; only then is there a location to record.
 	e.stashPendingLocations(e.tree.TreeHash, changed)
 	e.treesMu.Lock()
-	e.publishTreeLocked(e.tree)
+	e.publishTreeLocked(e.tree, len(changed)+len(deletes))
 	e.treesMu.Unlock()
 	return e.tree, nil
 }

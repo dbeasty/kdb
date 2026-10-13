@@ -15,6 +15,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/metrics"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/engine"
 	"github.com/limidus/kdb/go/kdb/version"
 )
 
@@ -210,6 +211,63 @@ func (a *AdminServer) writeNamespaceMetrics(b *strings.Builder) {
 	}
 }
 
+// memoryReporter is a storage adapter that can say what it holds in memory, by structure
+// (engine.ServerEngine).
+type memoryReporter interface {
+	MemoryBreakdown() engine.MemoryBreakdown
+}
+
+// writeNamespaceMemoryMetrics exposes what each namespace holds in memory, by structure. These
+// are resident-heap figures - maintained counters and estimates from lengths, never a walk, so
+// a scrape costs O(namespaces) - not on-disk or logical size, which is why they are a separate
+// family from kdb_namespace_documents and named for what they are.
+func (a *AdminServer) writeNamespaceMemoryMetrics(b *strings.Builder) {
+	if a.runtime == nil {
+		return
+	}
+	set := a.runtime.namespaceSet().Runtimes()
+	names := make([]string, 0, len(set))
+	for ns := range set {
+		names = append(names, ns)
+	}
+	sort.Strings(names)
+	header := false
+	for _, ns := range names {
+		rt := set[ns]
+		var rows [][2]any
+		if r, ok := rt.Runtime.Storage.(memoryReporter); ok {
+			m := r.MemoryBreakdown()
+			rows = append(rows,
+				[2]any{"document_bodies", m.DocumentBodies},
+				[2]any{"document_bodies_live", m.DocumentBodiesLive},
+				[2]any{"document_index", m.DocumentIndex},
+				[2]any{"live_tree", m.LiveTree},
+				[2]any{"history_trees", m.HistoryTrees},
+				[2]any{"pinned_trees", m.PinnedTrees},
+				[2]any{"memtable", m.Memtable},
+				[2]any{"sstable_indexes", m.SSTableIndexes},
+				[2]any{"sstable_block_cache", m.SSTableBlockCache},
+			)
+		}
+		if rt.dag != nil {
+			rows = append(rows,
+				[2]any{"commit_graph", rt.dag.GraphResidentBytes()},
+				[2]any{"commit_operations", rt.dag.OperationsResidentBytes()},
+			)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		if !header {
+			b.WriteString("# HELP kdb_namespace_memory_bytes Estimated resident heap bytes per namespace and structure (document_bodies_live is part of document_bodies).\n# TYPE kdb_namespace_memory_bytes gauge\n")
+			header = true
+		}
+		for _, r := range rows {
+			fmt.Fprintf(b, "kdb_namespace_memory_bytes{namespace=%q,structure=%q} %d\n", ns, r[0], r[1])
+		}
+	}
+}
+
 func (a *AdminServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	// Draining wins over the stored ready flag: BeginDraining can be triggered by the abort
@@ -282,6 +340,7 @@ func (a *AdminServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 
 	a.writeGovernanceMetrics(&b)
 	a.writeNamespaceMetrics(&b)
+	a.writeNamespaceMemoryMetrics(&b)
 
 	a.writeReplicationMetrics(&b)
 	if fn := a.extraMetrics.Load(); fn != nil {
