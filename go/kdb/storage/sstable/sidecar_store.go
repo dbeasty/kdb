@@ -194,10 +194,10 @@ func (s *LsmBlobStore) removeSidecarFile(segment string) {
 	}
 }
 
-// SidecarMappedBytes reports the bytes of sidecar files this store has mapped. They are page
-// cache, not heap: the OS pages them in on use and may drop them under pressure. Like the commit
-// graph's mappings they are charged whole (mmapfile.MappedBytes, which the memory guard adds to
-// the heap), the safe over-estimate.
+// SidecarMappedBytes reports the bytes of sidecar files this store has mapped: their whole size,
+// not how much is in memory. They are page cache, not heap: the OS pages them in on use and may
+// drop them under pressure. Off a cgroup the memory guard charges only their resident pages
+// (mmapfile.ResidentBytes, process-wide, alongside the commit graph's and the tree's mappings).
 func (s *LsmBlobStore) SidecarMappedBytes() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()

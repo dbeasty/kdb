@@ -124,9 +124,10 @@ type MemoryBreakdown struct {
 	// SSTableIndexes is the parsed SSTable footer indexes held by the blob store: the tables with
 	// no usable sidecar.
 	SSTableIndexes int64
-	// SSTableIndexesMapped is the SSTable index sidecars the blob store has mapped. Page cache,
-	// not heap, so not part of Total; it is charged to the memory budget through
-	// mmapfile.MappedBytes, as the commit graph's mappings are.
+	// SSTableIndexesMapped is the whole size of the SSTable index sidecars the blob store has
+	// mapped. Page cache, not heap, so not part of Total. The memory guard charges mapped files by
+	// their resident pages instead (mmapfile.ResidentBytes, process-wide, as for the commit
+	// graph's mappings); this field stays the mapped size, the most those pages can reach.
 	SSTableIndexesMapped int64
 	// SSTableBlockCache is the decoded SSTable blocks the blob store's cache holds.
 	SSTableBlockCache int64
