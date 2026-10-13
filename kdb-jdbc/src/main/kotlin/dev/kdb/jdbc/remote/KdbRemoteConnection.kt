@@ -19,6 +19,7 @@ import dev.kdb.sql.SqlParameter
 import dev.kdb.transport.ws.defaultWebSocketWireTransport
 import dev.kdb.wire.HandshakePayload
 import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
+import dev.kdb.wire.SUPPORTED_WIRE_FEATURES
 import dev.kdb.wire.TransactionWireCodec
 import dev.kdb.wire.WireCapabilitySet
 import dev.kdb.wire.WireClientMode
@@ -26,6 +27,8 @@ import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.defaultWireCodec
+import dev.kdb.wire.negotiateWireFeatures
+import dev.kdb.wire.withWireFeatures
 import dev.kdb.transaction.TransactionBuilder
 import kotlinx.coroutines.runBlocking
 import java.sql.Connection
@@ -68,12 +71,16 @@ public class KdbRemoteConnection(
                         localHeads = emptyMap(),
                         capabilities = WireCapabilitySet(),
                         clientMode = WireClientMode.SQL_CLIENT,
+                        wireFeatures = SUPPORTED_WIRE_FEATURES,
                     ),
                 ),
             ) as WireMessage.HandshakeAck
         if (!hs.response.accepted) {
             throw SQLException("handshake rejected: ${hs.response.rejectionReason}")
         }
+        // Binary frames only once the server has acked them; an older server acks none.
+        val features = negotiateWireFeatures(hs.response.wireFeatures)
+        if (features.isNotEmpty()) rpc.useCodec(wire.withWireFeatures(features))
         val begin =
             rpc.request(
                 WireMessage.SessionBegin(

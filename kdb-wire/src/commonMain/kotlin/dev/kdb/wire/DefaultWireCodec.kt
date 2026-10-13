@@ -3,10 +3,27 @@ package dev.kdb.wire
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-internal class DefaultWireCodec(override val encoding: PayloadEncoding) : WireCodec {
+internal class DefaultWireCodec(
+    override val encoding: PayloadEncoding,
+    // Encode messages that have a binary form as tag-2 bodies (WIRE_FEATURE_BINARY).
+    private val binaryFrames: Boolean = false,
+) : WireCodec {
     private val json = Json { ignoreUnknownKeys = true }
 
     override fun encode(message: WireMessage): ByteArray {
+        if (binaryFrames) {
+            val body = encodeBinaryBody(message)
+            if (body != null) {
+                val header =
+                    WireHeader(
+                        messageType = message.header.messageType,
+                        protocolVersion = message.header.protocolVersion,
+                        correlationId = message.header.correlationId,
+                        payloadLength = 1 + body.size,
+                    )
+                return encodeFrameOnly(header, byteArrayOf(TAG_BINARY) + body)
+            }
+        }
         val body = encodePayloadBody(message)
         val header =
             WireHeader(
@@ -30,8 +47,11 @@ internal class DefaultWireCodec(override val encoding: PayloadEncoding) : WireCo
             throw WireDecodeException("frame declares an empty payload")
         }
         val tag = frame[payloadOffset].toInt()
+        if (tag == TAG_BINARY.toInt()) {
+            return decodeBinaryBody(header, frame, payloadOffset + 1, payloadOffset + header.payloadLength)
+        }
         val body = frame.copyOfRange(payloadOffset + 1, payloadOffset + header.payloadLength)
-        // v1: KDB_BINARY (0) and JSON (1) both use UTF-8 JSON envelope for debug/interop.
+        // KDB_BINARY (0) and JSON (1) both use the UTF-8 JSON envelope; 2 is a binary body.
         if (tag != 0 && tag != 1) {
             throw WireDecodeException("unsupported encoding tag: $tag")
         }

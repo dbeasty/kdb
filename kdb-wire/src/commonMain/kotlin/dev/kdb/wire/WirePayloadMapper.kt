@@ -23,6 +23,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         preferredEncodings = request.preferredEncodings.map { it.name },
                         clientMode = request.clientMode.name,
                         protocolVersion = request.protocolVersion,
+                        wireFeatures = request.wireFeatures.ifEmpty { null },
                     ),
             )
 
@@ -36,6 +37,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         protocolVersion = response.protocolVersion,
                         remoteHeads = response.remoteHeads,
                         rejectionReason = response.rejectionReason,
+                        wireFeatures = response.wireFeatures.ifEmpty { null },
                     ),
             )
 
@@ -344,6 +346,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                     preferredEncodings = h.preferredEncodings.map { PayloadEncoding.valueOf(it) },
                     clientMode = WireClientMode.valueOf(h.clientMode),
                     protocolVersion = h.protocolVersion,
+                    wireFeatures = h.wireFeatures.orEmpty(),
                 ),
             )
         }
@@ -358,6 +361,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                     protocolVersion = a.protocolVersion,
                     remoteHeads = a.remoteHeads,
                     rejectionReason = a.rejectionReason,
+                    wireFeatures = a.wireFeatures.orEmpty(),
                 ),
             )
         }

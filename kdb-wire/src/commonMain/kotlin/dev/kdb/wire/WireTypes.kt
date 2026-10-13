@@ -84,6 +84,8 @@ public data class HandshakePayload(
     val preferredEncodings: List<PayloadEncoding> = listOf(PayloadEncoding.KDB_BINARY, PayloadEncoding.JSON),
     val clientMode: WireClientMode,
     val protocolVersion: Int = KDB_WIRE_PROTOCOL_VERSION,
+    /** Optional frame encodings offered (WIRE_FEATURE_BINARY); see negotiateWireFeatures. */
+    val wireFeatures: List<String> = emptyList(),
 )
 
 public data class HandshakeAckPayload(
@@ -92,6 +94,8 @@ public data class HandshakeAckPayload(
     val protocolVersion: Int,
     val remoteHeads: Map<String, String> = emptyMap(),
     val rejectionReason: String? = null,
+    /** The offered features the server accepted. Neither side sends a frame in one until it is here. */
+    val wireFeatures: List<String> = emptyList(),
 )
 
 public data class DeltaCommitPayload(
@@ -443,6 +447,13 @@ public interface WireCodec {
 
 public fun defaultWireCodec(encoding: PayloadEncoding = PayloadEncoding.KDB_BINARY): WireCodec =
     DefaultWireCodec(encoding)
+
+/**
+ * A codec like this one that also encodes in the negotiated [features]' formats - the list a
+ * handshake ack carries. Decoding is unaffected: every codec decodes every encoding tag.
+ */
+public fun WireCodec.withWireFeatures(features: List<String>): WireCodec =
+    DefaultWireCodec(encoding, binaryFrames = WIRE_FEATURE_BINARY in features)
 
 public interface HandshakeNegotiator {
     public fun negotiate(local: HandshakePayload, remote: HandshakePayload): HandshakeAckPayload
