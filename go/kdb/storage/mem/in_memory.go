@@ -89,6 +89,23 @@ func (a *InMemoryStorageAdapter) GetDocuments(namespaceID string, docIDs []codec
 }
 
 func (a *InMemoryStorageAdapter) ScanDocuments(namespaceID string, atCommit codec.Hash, batchSize int, onBatch func([]document.Document) error) error {
+	return a.scanDocuments(atCommit, batchSize, func(t document.DocumentTree, visit func(codec.UUID, codec.Hash) bool) {
+		t.Walk(visit)
+	}, onBatch)
+}
+
+// ScanDocumentsAfter implements storage.OrderedScanner (see ServerEngine.ScanDocumentsAfter).
+func (a *InMemoryStorageAdapter) ScanDocumentsAfter(namespaceID string, atCommit codec.Hash, after *codec.UUID, batchSize int, onBatch func([]document.Document) error) error {
+	return a.scanDocuments(atCommit, batchSize, func(t document.DocumentTree, visit func(codec.UUID, codec.Hash) bool) {
+		if after == nil {
+			t.WalkOrdered(visit)
+			return
+		}
+		t.WalkAfter(*after, visit)
+	}, onBatch)
+}
+
+func (a *InMemoryStorageAdapter) scanDocuments(atCommit codec.Hash, batchSize int, walk func(document.DocumentTree, func(codec.UUID, codec.Hash) bool), onBatch func([]document.Document) error) error {
 	if batchSize <= 0 {
 		batchSize = 256
 	}
@@ -105,7 +122,7 @@ func (a *InMemoryStorageAdapter) ScanDocuments(namespaceID string, atCommit code
 	// adapter before the executor's first callback. Streaming the trie keeps a bounded scan's
 	// memory proportional to what it keeps (the batch buffer) rather than to what exists.
 	var walkErr error
-	tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
+	walk(tree, func(_ codec.UUID, h codec.Hash) bool {
 		d, ok := a.blobStore.GetDocByBlob(h)
 		if !ok {
 			return true

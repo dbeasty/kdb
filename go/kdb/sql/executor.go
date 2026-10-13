@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -64,7 +65,10 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	// the result bound *before* the filter ran is what made a selective query over a large
 	// namespace return a prefix of its answer with no error.
 	stopAt := 0
-	if pushLimit && residual == nil {
+	// A keyset page's scan applies the residual itself and keeps only matching documents in id
+	// order, so it can stop at the page however selective the WHERE is - except when the scan
+	// hands back bare ids (scanIDsOnly) and the residual runs afterwards.
+	if pushLimit && (residual == nil || (ctx.keyset && !e.scanIDsOnly)) {
 		// Rows wanted: the LIMIT, but never more than one past the result bound (so an
 		// overflow is detectable without reading the rest of the namespace), after skipping
 		// OFFSET rows.
@@ -99,6 +103,9 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 		}
 	} else {
 		ids := src.ids
+		if ctx.keyset {
+			ids = idsAfterInOrder(ids, ctx.scanAfter)
+		}
 		if pushLimit && residual == nil {
 			ids = applyLimitOffset(ids, limit, offset)
 			limited = true
@@ -118,6 +125,13 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	} else {
 		rows = e.plainRows(query, env, docs)
 	}
+	var rowDocIDs []codec.UUID
+	if ctx.keyset && !grouped && len(query.OrderBy) == 0 && !query.Distinct {
+		rowDocIDs = make([]codec.UUID, len(docs))
+		for i, d := range docs {
+			rowDocIDs[i] = d.doc.ID
+		}
+	}
 	if query.Distinct {
 		rows = distinctRows(rows)
 	}
@@ -135,7 +149,20 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	if rows == nil {
 		rows = []QueryRow{}
 	}
-	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows, Plan: label}, nil
+	return QueryResult{Columns: columnsFor(query, ctx.Schema), Rows: rows, Plan: label, RowDocIDs: rowDocIDs}, nil
+}
+
+// idsAfterInOrder is an index access path's ids as a keyset page reads them: in document id order,
+// those after after (all of them when after is nil).
+func idsAfterInOrder(ids []codec.UUID, after *codec.UUID) []codec.UUID {
+	out := make([]codec.UUID, 0, len(ids))
+	for _, id := range ids {
+		if after == nil || bytes.Compare(id.Bytes(), after.Bytes()) > 0 {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Bytes(), out[j].Bytes()) < 0 })
+	return out
 }
 
 // executePage runs one page of a SELECT by asking the ordinary pipeline for the page's rows plus
@@ -170,6 +197,27 @@ func (e *Executor) executePage(query SelectQuery, plan PhysicalPlan, residual Ex
 	q := query
 	lim := want + 1
 	q.Limit = &lim
+	if e.keysetEligible(query, page) {
+		kctx := ctx
+		kctx.keyset, kctx.scanAfter = true, page.After
+		res, err := e.ExecuteSelect(q, plan, residual, kctx)
+		switch {
+		case errors.Is(err, storage.ErrOrderedScanUnsupported):
+			// The adapter this namespace routes to cannot scan in order after all: page by
+			// offset, which the token carries too.
+		case err != nil:
+			return QueryResult{}, err
+		default:
+			if len(res.Rows) > want {
+				res.Rows = res.Rows[:want]
+				res.More = !exhaustedByLimit
+			}
+			if len(res.RowDocIDs) > len(res.Rows) {
+				res.RowDocIDs = res.RowDocIDs[:len(res.Rows)]
+			}
+			return res, nil
+		}
+	}
 	q.Offset = query.Offset + page.Offset
 	res, err := e.ExecuteSelect(q, plan, residual, ctx)
 	if err != nil {
@@ -180,6 +228,20 @@ func (e *Executor) executePage(query SelectQuery, plan PhysicalPlan, residual Ex
 		res.More = !exhaustedByLimit
 	}
 	return res, nil
+}
+
+// keysetEligible reports whether a page of query can be served by key (see PageRequest): its
+// rows have no order but the documents', nothing needs every row, and the storage can scan in
+// id order. A continuation without a key is not: its earlier pages came in another order.
+func (e *Executor) keysetEligible(query SelectQuery, page PageRequest) bool {
+	if page.OffsetOnly || (page.Offset > 0 && page.After == nil) {
+		return false
+	}
+	if len(query.OrderBy) > 0 || query.Distinct || isGroupedQuery(query) || query.Offset > 0 {
+		return false
+	}
+	_, ok := e.Storage.(storage.OrderedScanner)
+	return ok
 }
 
 // tryCountOnly answers `SELECT COUNT(*) [, COUNT(*) ...] FROM t [WHERE col = const]` from counters
@@ -949,7 +1011,18 @@ func (e *Executor) fullScan(ctx QueryContext, stopAt int, residual Expr, env *ev
 	treeHash := commit.DocumentTreeHash
 	var docs []*evalDoc
 	examined := 0
-	err = e.Storage.ScanDocuments(ctx.NamespaceID, treeHash, 256, func(batch []document.Document) error {
+	scan := e.Storage.ScanDocuments
+	if ctx.keyset {
+		ordered, ok := e.Storage.(storage.OrderedScanner)
+		if !ok {
+			return nil, storage.ErrOrderedScanUnsupported
+		}
+		after := ctx.scanAfter
+		scan = func(ns string, at codec.Hash, batch int, onBatch func([]document.Document) error) error {
+			return ordered.ScanDocumentsAfter(ns, at, after, batch, onBatch)
+		}
+	}
+	err = scan(ctx.NamespaceID, treeHash, 256, func(batch []document.Document) error {
 		for _, d := range batch {
 			examined++
 			ctx.Stats.addExamined(1)

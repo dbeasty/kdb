@@ -182,6 +182,20 @@ func (m *MultiplexAdapter) ScanDocuments(namespaceID string, atCommit codec.Hash
 	return a.ScanDocuments(namespaceID, atCommit, batchSize, onBatch)
 }
 
+// ScanDocumentsAfter implements storage.OrderedScanner when the routed adapter does; otherwise it
+// reports storage.ErrOrderedScanUnsupported and the caller pages by offset.
+func (m *MultiplexAdapter) ScanDocumentsAfter(namespaceID string, atCommit codec.Hash, after *codec.UUID, batchSize int, onBatch func([]document.Document) error) error {
+	a, err := m.route(namespaceID)
+	if err != nil {
+		return err
+	}
+	o, ok := a.(storage.OrderedScanner)
+	if !ok {
+		return storage.ErrOrderedScanUnsupported
+	}
+	return o.ScanDocumentsAfter(namespaceID, atCommit, after, batchSize, onBatch)
+}
+
 func (m *MultiplexAdapter) PutDocument(namespaceID string, doc document.Document) error {
 	a, err := m.route(namespaceID)
 	if err != nil {
