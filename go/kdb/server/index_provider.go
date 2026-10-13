@@ -83,7 +83,7 @@ func (p *RegistryIndexProvider) FullTextSearch(ctx sql.QueryContext, indexOrFiel
 	if !ok {
 		return nil, false, nil
 	}
-	hits, err := store.Search(query, ctx.AtCommit, depth)
+	hits, err := p.searchText(store, query, ctx.AtCommit, depth)
 	if err != nil {
 		return nil, true, err
 	}
@@ -96,7 +96,7 @@ func (p *RegistryIndexProvider) VectorSearch(ctx sql.QueryContext, field string,
 	if !ok {
 		return nil, false, nil
 	}
-	hits, err := store.NearestNeighbours(vector, depth, ctx.AtCommit)
+	hits, err := p.searchVector(store, vector, depth, ctx.AtCommit)
 	if err != nil {
 		return nil, true, err
 	}
@@ -176,6 +176,76 @@ func (p *RegistryIndexProvider) RangeLookup(ctx sql.QueryContext, field string, 
 		return nil, true, err
 	}
 	return ids, true, nil
+}
+
+// searchText is store.Search, falling back to a throwaway index of the documents at the commit
+// when the store no longer holds that commit's history.
+func (p *RegistryIndexProvider) searchText(store index.Store, query string, at *codec.Hash, depth int) ([]index.RankedResult, error) {
+	hits, err := store.Search(query, at, depth)
+	if !errors.Is(err, index.ErrHistoryUnavailable) || at == nil {
+		return hits, err
+	}
+	scratch, serr := p.storeAt(store.Descriptor(), *at)
+	if serr != nil {
+		return nil, err
+	}
+	return scratch.Search(query, at, depth)
+}
+
+// searchVector is searchText for store.NearestNeighbours.
+func (p *RegistryIndexProvider) searchVector(store index.Store, vector []float32, depth int, at *codec.Hash) ([]index.RankedResult, error) {
+	hits, err := store.NearestNeighbours(vector, depth, at)
+	if !errors.Is(err, index.ErrHistoryUnavailable) || at == nil {
+		return hits, err
+	}
+	scratch, serr := p.storeAt(store.Descriptor(), *at)
+	if serr != nil {
+		return nil, err
+	}
+	return scratch.NearestNeighbours(vector, depth, at)
+}
+
+// storeAt builds a throwaway store for desc holding exactly the documents at commit at, read from
+// the document tree: the slow path of an as-of search older than the index's history window.
+// It keeps its whole (single-commit) log, so a read at `at` replays it whatever the head is. It
+// costs a scan of the namespace at that commit and is not kept.
+func (p *RegistryIndexProvider) storeAt(desc index.Descriptor, at codec.Hash) (index.Store, error) {
+	if p.runtime == nil || p.runtime.Runtime == nil {
+		return nil, fmt.Errorf("index %s: no document source for a historical rebuild", desc.IndexID)
+	}
+	opts := p.opts
+	opts.Keyed.HistoryEvents, opts.FullText.HistoryEvents, opts.Vector.HistoryEvents = -1, -1, -1
+	if p.runtime.dag == nil {
+		return nil, fmt.Errorf("index %s: no commit DAG for a historical rebuild", desc.IndexID)
+	}
+	s, err := stores.NewFactory(p.runtime.dag, opts).Create(desc)
+	if err != nil {
+		return nil, err
+	}
+	ds, ok := s.(index.DocumentStore)
+	if !ok {
+		return nil, fmt.Errorf("index %s: store type %T cannot index documents", desc.IndexID, s)
+	}
+	var applyErr error
+	err = p.runtime.scanAtCommit(at)(func(docID codec.UUID, jsonText string) bool {
+		prepared, err := ds.PrepareDocument(docID, jsonText)
+		if err != nil {
+			// A stored document the index cannot take is left out, as RebuildFromScan does.
+			return true
+		}
+		if _, err := prepared.Apply(at); err != nil {
+			applyErr = err
+			return false
+		}
+		return true
+	})
+	if err == nil {
+		err = applyErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // keyedStore prefers a HASH index over a BTREE one for equality, matching the Kotlin reader.
@@ -488,7 +558,7 @@ func (p *RegistryIndexProvider) Search(ctx context.Context, req wire.SearchMessa
 		if !ok {
 			return nil, codec.Hash{}, &UnsupportedError{Reason: "no FULLTEXT index for " + a.Index}
 		}
-		hits, err := store.Search(a.Query, at, armDepth(a.Depth, limit))
+		hits, err := p.searchText(store, a.Query, at, armDepth(a.Depth, limit))
 		if err != nil {
 			return nil, codec.Hash{}, err
 		}
@@ -503,7 +573,7 @@ func (p *RegistryIndexProvider) Search(ctx context.Context, req wire.SearchMessa
 		for i, v := range a.Vector {
 			vec[i] = float32(v)
 		}
-		hits, err := store.NearestNeighbours(vec, armDepth(a.Depth, limit), at)
+		hits, err := p.searchVector(store, vec, armDepth(a.Depth, limit), at)
 		if err != nil {
 			return nil, codec.Hash{}, err
 		}
