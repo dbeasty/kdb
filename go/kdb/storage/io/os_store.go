@@ -63,6 +63,11 @@ func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
 	}, nil
 }
 
+// LocalSegmentPath names the file segmentName lives in (see storage.LocalPathResolver).
+func (s *OSByteStore) LocalSegmentPath(segmentName string) (string, bool) {
+	return s.pathFor(segmentName), true
+}
+
 func (s *OSByteStore) pathFor(segmentName string) string {
 	return filepath.Join(s.root, filepath.FromSlash(segmentName))
 }

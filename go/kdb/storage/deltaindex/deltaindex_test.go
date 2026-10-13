@@ -1,7 +1,6 @@
 package deltaindex
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -102,29 +101,11 @@ func (r *countingReader) StreamCommitsPastDamage(seg storage.DeltaSegmentRef, fn
 	return r.DefaultReader.StreamCommitsPastDamage(seg, fn)
 }
 
-// mmapSupported reports whether this platform maps files (storage/mmapfile); Windows does not.
-func mmapSupported(t testing.TB) bool {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "probe")
-	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	m, err := mmapfile.Open(p)
-	if errors.Is(err, mmapfile.ErrUnsupported) {
-		return false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.Close()
-	return true
-}
-
 // inEverySidecarMode runs a sidecar test against mapped sidecars, where this platform maps files,
 // and against file-backed sidecars (positioned reads), the path a platform without mmap takes -
 // so both are tested on every platform that can, and Windows tests the one it uses.
 func inEverySidecarMode(t *testing.T, test func(*testing.T)) {
-	if mmapSupported(t) {
+	if mmapfile.Supported {
 		t.Run("mapped", func(t *testing.T) { test(t) })
 	}
 	t.Run("file", func(t *testing.T) {
@@ -139,7 +120,7 @@ func inEverySidecarMode(t *testing.T, test func(*testing.T)) {
 func offHeap(t *testing.T, st Stats, n int) bool {
 	t.Helper()
 	want := Stats{FileSegs: n}
-	if mapSidecars && mmapSupported(t) {
+	if mapSidecars && mmapfile.Supported {
 		want = Stats{MappedSegs: n}
 	}
 	if st.MappedSegs != want.MappedSegs || st.FileSegs != want.FileSegs {
@@ -598,7 +579,12 @@ func testPruneDropsDeletedSegmentsWithoutScanning(t *testing.T) {
 		}
 	}
 	scans := r.scans.Load()
+	// Both indexes, as the engine does after truncation: on Windows the other index's open
+	// sidecars can only go once it has closed them.
 	if err := x.Prune(); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Prune(); err != nil {
 		t.Fatal(err)
 	}
 	if r.scans.Load() != scans {

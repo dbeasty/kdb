@@ -32,3 +32,9 @@ type segmentStoreIntoReader interface {
 type segmentStoreSizer interface {
 	Size(segmentName string) (int64, error)
 }
+
+// segmentStoreLocalPather is the optional SegmentByteStore counterpart of
+// storage.LocalPathResolver: a store whose segments are local files.
+type segmentStoreLocalPather interface {
+	LocalSegmentPath(segmentName string) (string, bool)
+}

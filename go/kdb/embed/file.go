@@ -213,6 +213,9 @@ func (h *Host) openNamespace(
 		// Per-segment sidecars for the version locations of sealed segments, so the cold
 		// loader's index lives in mapped files rather than growing the heap with history.
 		eng.ConfigureColdIndex(deltaIndexDirPath(dataRoot, namespaceID), opts.ReadOnly)
+		if opsLoader != nil {
+			eng.AlsoPruneAfterTruncation(opsLoader.index.Prune)
+		}
 	}
 	meta, _ := readNamespaceMeta(dataRoot, namespaceID)
 	if (len(meta.ShallowRoots) > 0 || meta.BodiesExternal) && eng != nil {
