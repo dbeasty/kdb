@@ -113,18 +113,11 @@ type eventLog struct {
 	// dropped is set once any event has been dropped (or the log was filled from a scan, which
 	// has no history): from then on only the window can answer historical reads.
 	dropped bool
-	// pending holds the commit of every event the head skipped because its commit was not an
-	// ancestor of the head. If such a commit later becomes one, replay would apply the event at
-	// its original position - which the incremental state cannot do - so moving the head over it
-	// resets the state. Empty in a server, where every event is logged under the new head.
-	pending map[codec.Hash]struct{}
+	// lin tracks the head cutoff, the steps it moved through and the commits whose events it
+	// skipped (see Lineage).
+	lin *Lineage
 
 	head *headState
-	// steps are the cutoffs the head state has been advanced to, oldest first, each a descendant
-	// of the one before: step number stepBase+i is steps[i]. stepIdx maps a cutoff to its number.
-	steps    []codec.Hash
-	stepBase uint32
-	stepIdx  map[codec.Hash]uint32
 	// broken is set when the head state can neither be advanced nor replayed (the log is no
 	// longer complete); every read then reports ErrHistoryUnavailable until a Clear or rebuild.
 	broken bool
@@ -134,18 +127,11 @@ type eventLog struct {
 	scratch     []byte
 }
 
-// headState is the replay result at cutoff, maintained in place. Guarded by eventLog.mu.
+// headState is the replay result at the lineage's cutoff, maintained in place. Guarded by
+// eventLog.mu.
 type headState struct {
-	cutoff codec.Hash
-	epoch  uint64 // dag.AncestryEpoch it was built under
-	pos    int    // events[:pos] have been processed
-	st     *postingState
-	// fresh is the latest step's new commits: ancestors of cutoff that were not ancestors of
-	// the previous cutoff. Usually just cutoff.
-	fresh map[codec.Hash]struct{}
-	// inCutoff answers ancestry for older commits (a late event for a commit the head passed
-	// long ago). Built on first use, dropped once the step's events are processed.
-	inCutoff func(codec.Hash) bool
+	pos int // events[:pos] have been processed
+	st  *postingState
 }
 
 func newEventLog(d *dag.InMemoryCommitDag, opts MemoryOptions) *eventLog {
@@ -161,11 +147,8 @@ func (l *eventLog) clearLocked() {
 	l.eff = nil
 	l.effBase = 0
 	l.dropped = false
-	l.pending = make(map[codec.Hash]struct{})
+	l.lin = NewLineage(l.dag)
 	l.head = nil
-	l.steps = nil
-	l.stepBase = 0
-	l.stepIdx = make(map[codec.Hash]uint32)
 	l.broken = false
 	l.replays = nil
 	l.replayOrder = nil
@@ -255,90 +238,32 @@ func (l *eventLog) advanceLocked(target codec.Hash) bool {
 	if l.broken {
 		return false
 	}
-	h := l.head
-	if h == nil || h.epoch != l.dag.AncestryEpoch() {
+	if l.head == nil || !l.lin.Advance(target) {
 		return l.resetHeadLocked(target)
 	}
-	if h.cutoff != target {
-		fresh, ok := l.newAncestorsLocked(h.cutoff, target)
-		if !ok {
-			return l.resetHeadLocked(target)
-		}
-		for c := range fresh {
-			if _, p := l.pending[c]; p {
-				return l.resetHeadLocked(target)
-			}
-		}
-		h.cutoff, h.fresh, h.inCutoff = target, fresh, nil
-		l.pushStepLocked(target)
-	}
-	if h.pos < len(l.events) {
+	if l.head.pos < len(l.events) {
 		l.processLocked()
 	}
 	l.truncateLocked()
 	return true
 }
 
-// newAncestorsLocked returns the ancestors of to (itself included) that are not ancestors of
-// from, or false when to does not descend from from. The common case - to reached from from by
-// a short chain of single-parent commits - is a walk of that chain; anything else (a merge, a
-// long gap) takes the two closures, once.
-func (l *eventLog) newAncestorsLocked(from, to codec.Hash) (map[codec.Hash]struct{}, bool) {
-	fresh := make(map[codec.Hash]struct{}, 1)
-	for cur := to; cur != from; {
-		if len(fresh) >= maxAdvanceSteps {
-			return l.newAncestorsByClosure(from, to)
-		}
-		c, ok := l.dag.GetCommit(cur)
-		if !ok || len(c.ParentHashes) != 1 {
-			return l.newAncestorsByClosure(from, to)
-		}
-		fresh[cur] = struct{}{}
-		cur = c.ParentHashes[0]
-	}
-	return fresh, true
-}
-
-func (l *eventLog) newAncestorsByClosure(from, to codec.Hash) (map[codec.Hash]struct{}, bool) {
-	toAnc := l.dag.AncestorSet(to)
-	if _, ok := toAnc[from]; !ok {
-		return nil, false
-	}
-	for c := range l.dag.AncestorSet(from) {
-		delete(toAnc, c)
-	}
-	return toAnc, true
-}
-
-func (l *eventLog) pushStepLocked(cutoff codec.Hash) {
-	if _, seen := l.stepIdx[cutoff]; seen {
-		// A chain of descendants cannot come back to a cutoff it passed; only a reset (which
-		// clears the steps) moves the head backwards.
-		return
-	}
-	l.stepIdx[cutoff] = l.stepBase + uint32(len(l.steps))
-	l.steps = append(l.steps, cutoff)
-}
-
-func (l *eventLog) curStep() uint32 { return l.stepBase + uint32(len(l.steps)) - 1 }
-
 // processLocked applies events[head.pos:] to the head state in log order.
 func (l *eventLog) processLocked() {
 	h := l.head
-	step := l.curStep()
+	step := l.lin.Step()
 	for i := h.pos; i < len(l.events); i++ {
 		e := &l.events[i]
-		in, cstep, exact := l.inHeadLocked(e.commit)
+		in, cstep, exact := l.lin.Classify(e.commit)
 		if !in {
 			e.state = evSkipped
-			l.pending[e.commit] = struct{}{}
 			continue
 		}
 		e.state, e.step, e.cstep, e.cexact = evApplied, step, cstep, exact
 		l.applyLocked(h.st, e)
 	}
 	h.pos = len(l.events)
-	h.inCutoff = nil
+	l.lin.DoneClassifying()
 }
 
 // applyLocked applies an event to st and records its effect on the event.
@@ -359,55 +284,27 @@ func (l *eventLog) effects(e *logEvent) []uint32 {
 	return l.eff[off : off+int(e.effN)]
 }
 
-// inHeadLocked reports whether commit is the head cutoff or one of its ancestors, and if so the
-// step at which it became one (see logEvent.cstep).
-func (l *eventLog) inHeadLocked(commit codec.Hash) (in bool, cstep uint32, exact bool) {
-	h := l.head
-	cur := l.curStep()
-	if _, ok := h.fresh[commit]; ok {
-		return true, cur, true
-	}
-	if s, ok := l.stepIdx[commit]; ok {
-		// A step cutoff became an ancestor at its own step: it descends from every earlier one.
-		return true, s, true
-	}
-	if h.inCutoff == nil {
-		h.inCutoff = l.dag.AncestorTest(h.cutoff)
-	}
-	if !h.inCutoff(commit) {
-		return false, 0, false
-	}
-	if h.fresh == nil || cur == l.stepBase {
-		// The first step after a reset or restore: everything is at or before it.
-		return true, cur, true
-	}
-	// Not new at this step, so an ancestor of the previous step's cutoff.
-	return true, cur - 1, false
-}
-
 // resetHeadLocked rebuilds the head state at target by replaying the whole log, which is only
 // possible while the log is complete. Otherwise the state is broken until a rebuild.
 func (l *eventLog) resetHeadLocked(target codec.Hash) bool {
 	l.head = nil
-	l.steps, l.stepBase = nil, 0
-	l.stepIdx = make(map[codec.Hash]uint32)
 	if l.dropped {
 		l.broken = true
 		l.events, l.eff, l.effBase = nil, nil, 0
-		l.pending = make(map[codec.Hash]struct{})
+		l.lin.Clear()
 		return false
 	}
 	anc := l.dag.AncestorSet(target)
-	h := &headState{cutoff: target, epoch: l.dag.AncestryEpoch(), st: newPostingState()}
+	h := &headState{st: newPostingState()}
 	l.head = h
-	l.pushStepLocked(target)
-	l.pending = make(map[codec.Hash]struct{})
+	l.lin.Start(target)
+	l.lin.ClearPending()
 	l.eff, l.effBase = l.eff[:0], 0
 	for i := range l.events {
 		e := &l.events[i]
 		if _, in := anc[e.commit]; !in {
 			e.state = evSkipped
-			l.pending[e.commit] = struct{}{}
+			l.lin.MarkPending(e.commit)
 			continue
 		}
 		e.state, e.step, e.cstep, e.cexact = evApplied, 0, 0, true
@@ -426,7 +323,7 @@ func (l *eventLog) truncateLocked() {
 		return
 	}
 	h := l.head
-	keepFrom := l.stepBase
+	keepFrom := uint32(0)
 	if len(l.events) > l.maxEvents {
 		drop := len(l.events) - l.maxEvents*3/4
 		if drop > h.pos {
@@ -455,24 +352,10 @@ func (l *eventLog) truncateLocked() {
 			l.events = l.events[:copy(l.events, l.events[drop:])]
 			h.pos -= drop
 			l.replays, l.replayOrder = nil, nil
+			l.maybeCompactKeysLocked()
 		}
 	}
-	if n := uint32(len(l.steps)); n > uint32(l.maxEvents) {
-		if b := l.stepBase + n - uint32(l.maxEvents)*3/4; b > keepFrom {
-			keepFrom = b
-		}
-	}
-	if cur := l.curStep(); keepFrom > cur {
-		keepFrom = cur
-	}
-	if k := int(keepFrom - l.stepBase); k > 0 {
-		for _, c := range l.steps[:k] {
-			delete(l.stepIdx, c)
-		}
-		l.steps = l.steps[:copy(l.steps, l.steps[k:])]
-		l.stepBase = keepFrom
-	}
-	l.maybeCompactKeysLocked()
+	l.lin.TrimSteps(keepFrom, l.maxEvents)
 }
 
 // maybeCompactKeysLocked rebuilds the key table without the keys that are empty at head and
@@ -548,7 +431,7 @@ func (l *eventLog) viewLocked(at *codec.Hash) (keyedView, error) {
 			l.processLocked()
 			l.truncateLocked()
 		}
-		if h.cutoff == cutoff {
+		if l.lin.Cutoff() == cutoff {
 			return keyedView{st: h.st}, nil
 		}
 		if undo, ok := l.planLocked(cutoff); ok {
@@ -576,42 +459,8 @@ func (l *eventLog) viewLocked(at *codec.Hash) (keyedView, error) {
 // fails the plan. If the walk reaches no step at all it has seen x's whole ancestry, which places
 // every event - but only while nothing has been dropped.
 func (l *eventLog) planLocked(x codec.Hash) ([]int, bool) {
-	jmax, stopped := int64(-1), false
-	var visited map[codec.Hash]struct{}
-	if j, ok := l.stepIdx[x]; ok {
-		jmax, stopped = int64(j), true
-	} else {
-		visited = make(map[codec.Hash]struct{})
-		queue := []codec.Hash{x}
-		for len(queue) > 0 {
-			c := queue[len(queue)-1]
-			queue = queue[:len(queue)-1]
-			if j, ok := l.stepIdx[c]; ok {
-				if int64(j) > jmax {
-					jmax = int64(j)
-				}
-				stopped = true
-				continue
-			}
-			if _, seen := visited[c]; seen {
-				continue
-			}
-			visited[c] = struct{}{}
-			if len(visited) > maxAdvanceSteps {
-				return nil, false
-			}
-			if commit, ok := l.dag.GetCommit(c); ok {
-				queue = append(queue, commit.ParentHashes...)
-			}
-		}
-		// An event the head skipped, under a commit x sees, would be applied by a replay at x.
-		for c := range visited {
-			if _, p := l.pending[c]; p {
-				return nil, false
-			}
-		}
-	}
-	if !stopped && l.dropped {
+	p, ok := l.lin.Locate(x, !l.dropped)
+	if !ok {
 		return nil, false
 	}
 	var undo []int
@@ -621,28 +470,19 @@ func (l *eventLog) planLocked(x codec.Hash) ([]int, bool) {
 		if e.state != evApplied {
 			continue
 		}
-		if stopped && int64(e.step) <= jmax {
-			break
-		}
-		var visible bool
-		switch {
-		case !stopped:
-			_, visible = visited[e.commit]
-		case int64(e.cstep) <= jmax:
-			visible = true
-		case e.cexact:
-			_, visible = visited[e.commit]
+		switch p.Visible(e.commit, e.step, e.cstep, e.cexact) {
+		case VisibleAndOlder:
+			return undo, true
+		case Visible:
+			sawVisible = true
+		case Invisible:
+			if sawVisible {
+				return nil, false
+			}
+			undo = append(undo, i)
 		default:
 			return nil, false
 		}
-		if visible {
-			sawVisible = true
-			continue
-		}
-		if sawVisible {
-			return nil, false
-		}
-		undo = append(undo, i)
 	}
 	return undo, true
 }
@@ -931,7 +771,7 @@ type eventLogStats struct {
 func (l *eventLog) stats() eventLogStats {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s := eventLogStats{Events: len(l.events), Steps: len(l.steps), Keys: l.keys.len(), Dropped: l.dropped, Broken: l.broken}
+	s := eventLogStats{Events: len(l.events), Steps: l.lin.Steps(), Keys: l.keys.len(), Dropped: l.dropped, Broken: l.broken}
 	if l.head != nil {
 		s.Live = l.head.st.live
 	}

@@ -92,8 +92,9 @@ func (l *eventLog) snapshotBytes() ([]byte, error) {
 			uuid(id)
 		}
 	}
-	uvarint(uint64(len(l.pending)))
-	for c := range l.pending {
+	pending := l.lin.PendingCommits()
+	uvarint(uint64(len(pending)))
+	for _, c := range pending {
 		b.Write(c.Bytes[:])
 	}
 	return b.Bytes(), nil
@@ -230,10 +231,10 @@ func (l *eventLog) restoreSnapshotBytes(data []byte) error {
 		if err != nil {
 			return err
 		}
-		l.pending[c] = struct{}{}
+		l.lin.MarkPending(c)
 	}
-	l.head = &headState{cutoff: head, epoch: l.dag.AncestryEpoch(), st: st}
-	l.pushStepLocked(head)
+	l.head = &headState{st: st}
+	l.lin.Start(head)
 	l.dropped = true
 	return nil
 }
