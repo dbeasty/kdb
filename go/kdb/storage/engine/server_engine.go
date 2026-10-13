@@ -163,6 +163,9 @@ type ServerEngine struct {
 	// treeFile, when set, pages the live tree's cold records to segment files
 	// (document.TreeFile); every tree this engine installs is bound to it.
 	treeFile *document.TreeFile
+	// rebasing/rebaseAgain make rebaseHeldTrees one pass at a time, with one more after it when
+	// a segment landed during it.
+	rebasing, rebaseAgain atomic.Bool
 
 	// treesMu orders the pair of writes below - the tree store and the
 	// published snapshot - so a reader can never see a latestTree that the
