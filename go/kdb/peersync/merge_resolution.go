@@ -237,12 +237,13 @@ func (vi valueIndex) origin(x codec.Hash, id codec.UUID) (codec.Hash, error) {
 }
 
 // changed reports whether the side at head changed a document whose origin there is o: o is a
-// write the other side does not have.
-func changed(d *dag.InMemoryCommitDag, o, other codec.Hash) bool {
+// write the other side does not have. belowOther is other's AncestorTest - shared across the
+// documents of one merge, so their checks cost one walk of other's history, not one each.
+func changed(belowOther func(codec.Hash) bool, o, other codec.Hash) bool {
 	if o == (codec.Hash{}) {
 		return false
 	}
-	return o != other && !d.IsAncestor(o, other)
+	return o != other && !belowOther(o)
 }
 
 // forkWritten reports whether id exists on either head's history - written or written and since
@@ -343,6 +344,7 @@ func resolveDivergedLocked(
 	var forks []ForkDoc
 	var provisional []codec.UUID
 	var differing, conflicting []divergedDoc
+	belowIncoming, belowLocal := d.AncestorTest(incomingHead), d.AncestorTest(localHead)
 	for _, id := range ids {
 		l, r := vL[id], vR[id]
 		if sameBody(l.body, r.body) {
@@ -358,7 +360,7 @@ func resolveDivergedLocked(
 		}
 		dd := divergedDoc{
 			id: id, local: l.body, remote: r.body, localOrig: oL, remoteOrig: oR,
-			localChanged: changed(d, oL, incomingHead), remoteChanged: changed(d, oR, localHead),
+			localChanged: changed(belowIncoming, oL, incomingHead), remoteChanged: changed(belowLocal, oR, localHead),
 		}
 		differing = append(differing, dd)
 		switch {
