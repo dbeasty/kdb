@@ -467,7 +467,7 @@ func encodeHeader(seg storage.DeltaSegmentRef, count int) []byte {
 // its CRC. Anything else - absent, stale, torn, damaged, unmappable - is reported as no sidecar,
 // and the caller rebuilds it from the segment.
 func (x *Index) openSidecar(seg storage.DeltaSegmentRef) (*segIndex, bool) {
-	if !mapSidecars {
+	if !mapSidecars || !mmapfile.Supported {
 		return x.openSidecarFile(seg)
 	}
 	m, err := mmapfile.Open(x.sidecarPath(seg.SequenceNumber))
@@ -601,7 +601,9 @@ func (x *Index) removeOrphans(listed []storage.DeltaSegmentRef) {
 }
 
 // Prune forgets segments that are no longer in the log and removes their sidecars, without
-// indexing anything. Truncation calls it after deleting segments: a namespace whose cold reads
+// indexing anything. Sidecars of every kind are removed, but on Windows a file another index
+// still holds open cannot be deleted, so every index over the log must be pruned: each one
+// closes its own sidecars before removing them. Truncation calls it after deleting segments: a namespace whose cold reads
 // are answered elsewhere (the blob store under history=none) may never miss again, and the
 // sidecars of deleted segments would otherwise stay on disk until it did.
 func (x *Index) Prune() error {
