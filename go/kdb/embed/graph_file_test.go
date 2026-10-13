@@ -371,3 +371,52 @@ func TestCheckpointStampsLetOpenSkipTheScan(t *testing.T) {
 		t.Fatal("identical bytes under a new mtime forced a full replay")
 	}
 }
+
+// A version-2 checkpoint (the live tree as records, what main writes today) still restores, and
+// what this build writes is version 4 with the tree packed.
+func TestCheckpointReadsV2AndWritesPackedV4(t *testing.T) {
+	entries := map[codec.UUID]codec.Hash{}
+	for i := 0; i < 50; i++ {
+		id, _ := codec.RandomUUID()
+		var h codec.Hash
+		h.Bytes[1] = byte(i)
+		entries[id] = h
+	}
+	tree, _ := document.BuildDocumentTree(entries)
+	cp := namespaceCheckpoint{NamespaceID: "ns", ThroughSequence: 3, LiveTree: tree}
+
+	raw, err := encodeCheckpoint(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeCheckpoint("ns", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LiveTree.TreeHash != tree.TreeHash || got.LiveTree.Size() != 50 {
+		t.Fatal("packed live tree did not round-trip")
+	}
+
+	// Hand-build a v2 root the way the previous encoder did.
+	var recs []codec.Value
+	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
+		recs = append(recs, codec.RecordValue{Fields: map[int]codec.Value{1: cpUUIDVal(id), 2: cpHashVal(h)}})
+		return true
+	})
+	v2 := codec.RecordValue{Fields: map[int]codec.Value{
+		1: codec.Int32Value{V: checkpointFormatVersion}, 2: codec.StringValue{V: "ns"},
+		3: codec.Int64Value{V: 3}, 4: codec.ArrayValue{}, 5: codec.ArrayValue{}, 6: codec.ArrayValue{},
+		7: codec.ArrayValue{Elements: recs}, 8: codec.ArrayValue{}, 9: codec.ArrayValue{}, 10: codec.Int64Value{},
+	}}
+	raw2, err := codec.EncodeBytes(v2, checkpointType, checkpointRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := decodeCheckpoint("ns", raw2)
+	if err != nil {
+		t.Fatalf("a v2 checkpoint no longer reads: %v", err)
+	}
+	if old.LiveTree.TreeHash != tree.TreeHash {
+		t.Fatal("v2 live tree restored differently")
+	}
+}

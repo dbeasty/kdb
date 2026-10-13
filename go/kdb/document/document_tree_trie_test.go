@@ -310,3 +310,41 @@ func trieNodesEqual(a, b *trieNode) bool {
 	}
 	return true
 }
+
+// A packed tree round-trips to the same tree, from either kind of source tree, and malformed
+// packing is an error rather than a different tree.
+func TestPackedTreeRoundTrip(t *testing.T) {
+	for _, n := range []int{0, 1, 5, 5000} {
+		entries := make(map[codec.UUID]codec.Hash, n)
+		for i := 0; i < n; i++ {
+			id, _ := codec.RandomUUID()
+			var h codec.Hash
+			h.Bytes[0] = byte(i)
+			entries[id] = h
+		}
+		mapTree, _ := BuildDocumentTree(entries) // Entries-backed: unordered walk
+		trieTree, _ := BuildTrieDocumentTree(entries)
+		for name, src := range map[string]DocumentTree{"map": mapTree, "trie": trieTree} {
+			packed := src.AppendPacked(nil)
+			if len(packed) != n*PackedTreeEntrySize {
+				t.Fatalf("%s n=%d: packed %d bytes", name, n, len(packed))
+			}
+			got, err := BuildTrieDocumentTreePacked(packed)
+			if err != nil {
+				t.Fatalf("%s n=%d: %v", name, n, err)
+			}
+			if got.TreeHash != src.TreeHash || got.Size() != n {
+				t.Fatalf("%s n=%d: packed round trip changed the tree", name, n)
+			}
+		}
+	}
+	two, _ := BuildTrieDocumentTree(map[codec.UUID]codec.Hash{{MSB: 1}: {}, {MSB: 2}: {}})
+	p := two.AppendPacked(nil)
+	swapped := append(append([]byte(nil), p[PackedTreeEntrySize:]...), p[:PackedTreeEntrySize]...)
+	if _, err := BuildTrieDocumentTreePacked(swapped); err == nil {
+		t.Fatal("out-of-order packed entries accepted")
+	}
+	if _, err := BuildTrieDocumentTreePacked(p[:10]); err == nil {
+		t.Fatal("a ragged packed tree accepted")
+	}
+}

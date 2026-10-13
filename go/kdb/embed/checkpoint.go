@@ -24,6 +24,14 @@ const checkpointFormatVersion = 2
 // missing. Written only when there are segments to reference; otherwise version 2, unchanged.
 const checkpointGraphFormatVersion = 3
 
+// checkpointPackedFormatVersion stores the live tree as one packed byte field (13) in ascending
+// id order instead of a record per entry (7), and makes the graph fields (11, 12) optional. A
+// million live documents as records cost ~900 MB to encode at every checkpoint and most of an
+// open's peak heap to decode; packed they are 48 MB and decode straight into the bulk trie build.
+// What this build writes. Its own version so an older build replays the log rather than restoring
+// an empty live tree from a field it does not know.
+const checkpointPackedFormatVersion = 4
+
 const checkpointNS = "dev.kdb.checkpoint"
 
 var (
@@ -160,6 +168,8 @@ func checkpointRegistry() *schema.Registry {
 				// the records in them for commits since deleted. See dag.CheckpointSnapshotWithGraph.
 				{ID: 11, Name: "graphSegments", Type: schema.Array{Element: schema.Ref{FullyQualifiedName: fqnCheckpointGraph}}, Default: codec.ArrayValue{}},
 				{ID: 12, Name: "graphHidden", Type: schema.Array{Element: cpHash}, Default: codec.ArrayValue{}},
+				// Version 4: the live tree, packed - see checkpointPackedFormatVersion.
+				{ID: 13, Name: "liveTreePacked", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
 			},
 		})
 		r.Freeze()
@@ -296,14 +306,7 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		}})
 	}
 
-	var entries []codec.Value
-	cp.LiveTree.Walk(func(id codec.UUID, h codec.Hash) bool {
-		entries = append(entries, codec.RecordValue{Fields: map[int]codec.Value{
-			1: cpUUIDVal(id),
-			2: cpHashVal(h),
-		}})
-		return true
-	})
+	packedTree := cp.LiveTree.AppendPacked(make([]byte, 0, cp.LiveTree.Size()*document.PackedTreeEntrySize))
 
 	segs := make([]codec.Value, 0, len(cp.Segments))
 	for _, sg := range cp.Segments {
@@ -324,10 +327,7 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		heads = append(heads, codec.BytesValue{V: b})
 	}
 
-	version := int32(checkpointFormatVersion)
-	if len(cp.GraphRefs) > 0 {
-		version = checkpointGraphFormatVersion
-	}
+	version := int32(checkpointPackedFormatVersion)
 	root := codec.RecordValue{Fields: map[int]codec.Value{
 		1:  codec.Int32Value{V: version},
 		2:  codec.StringValue{V: cp.NamespaceID},
@@ -335,10 +335,11 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		4:  codec.ArrayValue{Elements: commits},
 		5:  codec.ArrayValue{Elements: branches},
 		6:  codec.ArrayValue{Elements: tags},
-		7:  codec.ArrayValue{Elements: entries},
+		7:  codec.ArrayValue{},
 		8:  codec.ArrayValue{Elements: segs},
 		9:  codec.ArrayValue{Elements: heads},
 		10: codec.Int64Value{V: cp.FloorSequence},
+		13: codec.BytesValue{V: packedTree},
 	}}
 	if len(cp.GraphRefs) > 0 {
 		refs := make([]codec.Value, 0, len(cp.GraphRefs))
@@ -373,10 +374,10 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 	if !ok {
 		return out, fmt.Errorf("kdb: checkpoint: missing format version")
 	}
-	if version.V != checkpointFormatVersion && version.V != checkpointGraphFormatVersion {
+	if version.V != checkpointFormatVersion && version.V != checkpointGraphFormatVersion && version.V != checkpointPackedFormatVersion {
 		return out, fmt.Errorf(
-			"kdb: checkpoint is format version %d, this build reads version %d",
-			version.V, checkpointFormatVersion)
+			"kdb: checkpoint is format version %d, this build reads versions %d-%d",
+			version.V, checkpointFormatVersion, checkpointPackedFormatVersion)
 	}
 	ns, err := cpStrFrom(rec.Fields[2])
 	if err != nil {
@@ -519,11 +520,22 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 		}
 		live[id] = h
 	}
-	tree, err := document.BuildTrieDocumentTree(live)
-	if err != nil {
-		return out, err
+	if packed, ok := rec.Fields[13].(codec.BytesValue); ok && version.V >= checkpointPackedFormatVersion {
+		if len(live) > 0 {
+			return out, fmt.Errorf("kdb: checkpoint: live tree stored both packed and as records")
+		}
+		tree, err := document.BuildTrieDocumentTreePacked(packed.V)
+		if err != nil {
+			return out, err
+		}
+		out.LiveTree = tree
+	} else {
+		tree, err := document.BuildTrieDocumentTree(live)
+		if err != nil {
+			return out, err
+		}
+		out.LiveTree = tree
 	}
-	out.LiveTree = tree
 
 	segsArr, _ := rec.Fields[8].(codec.ArrayValue)
 	for _, el := range segsArr.Elements {
@@ -563,7 +575,7 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 	if floor, ok := rec.Fields[10].(codec.Int64Value); ok {
 		out.FloorSequence = floor.V
 	}
-	if version.V == checkpointGraphFormatVersion {
+	if version.V >= checkpointGraphFormatVersion {
 		refsArr, _ := rec.Fields[11].(codec.ArrayValue)
 		for _, el := range refsArr.Elements {
 			rr, ok := el.(codec.RecordValue)
@@ -578,7 +590,7 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 			}
 			out.GraphRefs = append(out.GraphRefs, dag.GraphSegmentRef{Seq: uint64(seq.V), CRC: uint32(crc.V), Records: int(n.V)})
 		}
-		if len(out.GraphRefs) == 0 {
+		if len(out.GraphRefs) == 0 && version.V == checkpointGraphFormatVersion {
 			return out, fmt.Errorf("kdb: checkpoint: version %d with no graph segments", version.V)
 		}
 		hiddenArr, _ := rec.Fields[12].(codec.ArrayValue)
