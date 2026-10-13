@@ -633,7 +633,7 @@ func envOnlySpecs() []envOnlySpec {
 		{
 			key: "graph.file", env: "KDB_GRAPH_FILE",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
-			help:  "map the commit graph from segment files (ns/<namespace>/graph/) instead of holding it in the heap. The files are a rebuildable cache; Linux and macOS only, ignored elsewhere",
+			help:  "map the commit graph from segment files (ns/<namespace>/graph/) instead of holding it in the heap (default on; off holds it in the heap). The files are a rebuildable cache; Linux and macOS only, ignored elsewhere",
 			parse: onOff,
 		},
 		{

@@ -1651,7 +1651,7 @@ view reports a discarded value with a warning.
 | `KDB_RETAIN_DURATION`, `KDB_RETAIN_COMMITS` | the `history=none` window (a floor at segment granularity) |
 | `KDB_DOCUMENT_CACHE_BYTES`, `KDB_COMMIT_OPS_BYTES`, `KDB_HISTORY_TREE_CACHE_BYTES` | resident-memory budgets (0 = a share of the hot-tier budget) |
 | `KDB_CHECKPOINTS` | `off` disables the checkpoint that lets an open skip the delta log |
-| `KDB_ANCESTRY_PRUNING`, `KDB_GRAPH_FILE`, `KDB_GRAPH_REBUILD_COMMITS`, `KDB_HISTORY_ANCHOR_INTERVAL` | commit-graph and tree-anchor tuning (`KDB_GRAPH_FILE` is accepted but not yet implemented) |
+| `KDB_ANCESTRY_PRUNING`, `KDB_GRAPH_FILE`, `KDB_GRAPH_REBUILD_COMMITS`, `KDB_GRAPH_MAX_SEGMENTS`, `KDB_HISTORY_ANCHOR_INTERVAL` | commit-graph and tree-anchor tuning. `KDB_GRAPH_FILE` maps the commit graph from segment files instead of the heap and is **on by default**; `KDB_GRAPH_FILE=off` holds it in the heap (see `docs/kdb-mmap-plan.md`) |
 | `KDB_PREALLOCATE_SEGMENTS` | preallocate delta segments (off by default) |
 | `KDB_S3_BUCKET`, `_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, `_PREFIX`, `_PATH_STYLE`, `_ENSURE_BUCKET` | S3 replica tier |
 | `KDB_S3_ARCHIVE_BUCKET`, `_ENDPOINT`, `_REGION`, `_PREFIX` | S3 archive tier (keeps what `history=none` reclaims; use a different bucket/prefix from the replica) |
