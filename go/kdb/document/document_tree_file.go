@@ -316,7 +316,30 @@ func (s *trieSlab) segBySeq(seq uint64) *treeSegment {
 }
 
 // openTreeSegment maps and verifies a segment file.
-func openTreeSegment(f *TreeFile, path string) (g *treeSegment, err error) {
+// treeFullVerifies counts segments checksummed in full at open; for tests.
+var treeFullVerifies atomic.Int64
+
+// segStamp is a segment file's size and modification time as the checkpoint that tagged it saw
+// them. A segment is written once and never modified, so an open that finds both unchanged trusts
+// the file without reading it all for its checksum - the rule a checkpoint already applies to the
+// delta segments it covers (storage.SegmentStamp). What it gives up: damage that changes neither,
+// which only the full read would catch.
+type segStamp struct {
+	size, mtime int64
+}
+
+func statStamp(path string) (segStamp, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return segStamp{}, false
+	}
+	return segStamp{size: fi.Size(), mtime: fi.ModTime().UnixNano()}, true
+}
+
+// openTreeSegment maps and verifies a segment file: fully, by its checksum, unless trusted (its
+// stamp matched), when only what can be checked without reading it all is - the header, the
+// trailer, the sizes, the extern table and the root record.
+func openTreeSegment(f *TreeFile, path string, trusted bool) (g *treeSegment, err error) {
 	m, err := mmapfile.Open(path)
 	if err != nil {
 		return nil, err
@@ -340,16 +363,21 @@ func openTreeSegment(f *TreeFile, path string) (g *treeSegment, err error) {
 	var crc uint32
 	if gerr := region.Guard(func(all []byte) {
 		copy(hdr[:], all)
-		crc = crc32.Checksum(all[:len(all)-treeSegTrailer], treeCRC)
+		if !trusted {
+			crc = crc32.Checksum(all[:len(all)-treeSegTrailer], treeCRC)
+		}
 	}); gerr != nil {
 		return nil, gerr
+	}
+	if !trusted {
+		treeFullVerifies.Add(1)
 	}
 	le := binary.LittleEndian
 	if string(hdr[:8]) != treeSegMagic || le.Uint32(hdr[8:]) != treeSegVersion {
 		return nil, fmt.Errorf("document: tree segment %s: not a version %d tree segment", path, treeSegVersion)
 	}
 	tail := data[len(data)-treeSegTrailer:]
-	if le.Uint32(tail[4:]) != treeSegTailMark || le.Uint32(tail) != crc {
+	if le.Uint32(tail[4:]) != treeSegTailMark || (!trusted && le.Uint32(tail) != crc) {
 		return nil, fmt.Errorf("document: tree segment %s: checksum mismatch", path)
 	}
 	leaves, nodes, externs := le.Uint32(hdr[16:]), le.Uint32(hdr[20:]), le.Uint32(hdr[28:])
@@ -698,7 +726,7 @@ func writeSegmentFrom(f *TreeFile, h *trieTree, docs int, full bool) (*treeSegme
 	if err != nil {
 		return nil, err
 	}
-	g, err := openTreeSegment(f, path)
+	g, err := openTreeSegment(f, path, false)
 	if err != nil {
 		os.Remove(path)
 		return nil, err
@@ -804,7 +832,7 @@ func buildSegmentPacked(f *TreeFile, items []trieItem) (*treeSegment, error) {
 	if err != nil {
 		return nil, err
 	}
-	g, err := openTreeSegment(f, path)
+	g, err := openTreeSegment(f, path, false)
 	if err != nil {
 		os.Remove(path)
 		return nil, err
@@ -816,7 +844,7 @@ func buildSegmentPacked(f *TreeFile, items []trieItem) (*treeSegment, error) {
 
 // attachChain makes a new file-bound slab holding top and the segments it depends on (opened
 // from f by sequence, oldest first), and returns the tree top holds.
-func attachChain(f *TreeFile, top *treeSegment) (*trieTree, error) {
+func attachChain(f *TreeFile, top *treeSegment, trusted map[uint64]bool) (*trieTree, error) {
 	s := newTrieSlab()
 	s.file.Store(f)
 	s.mu.Lock()
@@ -843,7 +871,7 @@ func attachChain(f *TreeFile, top *treeSegment) (*trieTree, error) {
 			if e.seq >= g.seq {
 				return fmt.Errorf("document: tree segment %s refers to a later segment %d", g.path, e.seq)
 			}
-			d, err := openTreeSegment(f, f.segPath(e.seq))
+			d, err := openTreeSegment(f, f.segPath(e.seq), trusted[e.seq])
 			if err != nil {
 				return err
 			}
@@ -1135,7 +1163,7 @@ func OpenTreePacked(packed []byte, f *TreeFile) (DocumentTree, error) {
 		g, err := buildSegmentPacked(f, items)
 		if err == nil {
 			var h *trieTree
-			if h, err = attachChain(f, g); err == nil {
+			if h, err = attachChain(f, g, nil); err == nil {
 				if err = f.writeSource(g, digest); err == nil {
 					f.dropOthers()
 					return DocumentTree{TreeHash: h.rootHash(), trie: h, size: g.docs}, nil
@@ -1174,18 +1202,24 @@ func (f *TreeFile) attachDigest(digest [32]byte, docs int) (DocumentTree, bool) 
 	seqs := listTreeSegments(f.opts.Dir)
 	for i := len(seqs) - 1; i >= 0; i-- {
 		path := f.segPath(seqs[i])
-		src, err := os.ReadFile(path + treeSrcSuffix)
-		if err != nil || len(src) != 36 || binary.LittleEndian.Uint32(src[32:]) != crc32.Checksum(src[:32], treeCRC) || [32]byte(src[:32]) != digest {
+		src, ok := readSource(path + treeSrcSuffix)
+		if !ok || src.digest != digest {
 			continue
 		}
-		g, err := openTreeSegment(f, path)
+		trusted := map[uint64]bool{}
+		for seq, want := range src.stamps {
+			if got, ok := statStamp(f.segPath(seq)); ok && got == want {
+				trusted[seq] = true
+			}
+		}
+		g, err := openTreeSegment(f, path, trusted[seqs[i]])
 		if err == nil && g.docs != docs {
 			g.unmap(false)
 			err = fmt.Errorf("document: tree segment %s holds %d documents, the checkpoint %d", path, g.docs, docs)
 		}
 		var h *trieTree
 		if err == nil {
-			if h, err = attachChain(f, g); err != nil {
+			if h, err = attachChain(f, g, trusted); err != nil {
 				g.unmap(false)
 			}
 		}
@@ -1200,6 +1234,36 @@ func (f *TreeFile) attachDigest(digest [32]byte, docs int) (DocumentTree, bool) 
 	return DocumentTree{}, false
 }
 
+// treeSource is a .src sidecar: the digest of the packed checkpoint image a segment was written
+// for, and the stamp of every segment in its chain when it was.
+type treeSource struct {
+	digest [32]byte
+	stamps map[uint64]segStamp
+}
+
+// Sidecar layout: digest [32], count u32, count x (sequence u64, size i64, mtime i64), crc32c u32
+// of what precedes it. A 36-byte sidecar (digest, crc) is the stampless original.
+func readSource(path string) (treeSource, bool) {
+	b, err := os.ReadFile(path)
+	le := binary.LittleEndian
+	if err != nil || len(b) < 36 || le.Uint32(b[len(b)-4:]) != crc32.Checksum(b[:len(b)-4], treeCRC) {
+		return treeSource{}, false
+	}
+	src := treeSource{digest: [32]byte(b[:32]), stamps: map[uint64]segStamp{}}
+	if len(b) == 36 {
+		return src, true
+	}
+	n := int(le.Uint32(b[32:]))
+	if len(b) != 36+4+n*24 {
+		return treeSource{}, false
+	}
+	for i := 0; i < n; i++ {
+		e := b[36+i*24:]
+		src.stamps[le.Uint64(e)] = segStamp{size: int64(le.Uint64(e[8:])), mtime: int64(le.Uint64(e[16:]))}
+	}
+	return src, true
+}
+
 // markKeep makes g and its chain the segments the next open needs.
 func (f *TreeFile) markKeep(g *treeSegment) {
 	keep := map[uint64]bool{}
@@ -1209,13 +1273,29 @@ func (f *TreeFile) markKeep(g *treeSegment) {
 	f.mu.Unlock()
 }
 
-// writeSource tags g as written for the packed image with digest, and keeps it on disk.
+// writeSource tags g as written for the packed image with digest, stamps its chain, and keeps
+// them on disk.
 func (f *TreeFile) writeSource(g *treeSegment, digest [32]byte) error {
-	var src [36]byte
-	copy(src[:], digest[:])
-	binary.LittleEndian.PutUint32(src[32:], crc32.Checksum(src[:32], treeCRC))
+	chain := map[uint64]bool{}
+	g.chain(chain)
+	le := binary.LittleEndian
+	src := append(make([]byte, 0, 40+24*len(chain)), digest[:]...)
+	src = le.AppendUint32(src, 0)
+	n := 0
+	for seq := range chain {
+		st, ok := statStamp(f.segPath(seq))
+		if !ok {
+			continue // unstamped: verified in full at the next open
+		}
+		src = le.AppendUint64(src, seq)
+		src = le.AppendUint64(src, uint64(st.size))
+		src = le.AppendUint64(src, uint64(st.mtime))
+		n++
+	}
+	le.PutUint32(src[32:], uint32(n))
+	src = le.AppendUint32(src, crc32.Checksum(src, treeCRC))
 	tmp := g.path + treeSrcSuffix + ".tmp"
-	if err := os.WriteFile(tmp, src[:], 0o644); err != nil {
+	if err := os.WriteFile(tmp, src, 0o644); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, g.path+treeSrcSuffix); err != nil {
@@ -1268,7 +1348,7 @@ func BindTreeFile(t DocumentTree, f *TreeFile) DocumentTree {
 	g, err := writeSegmentFrom(f, h, t.Size(), true)
 	if err == nil {
 		var nh *trieTree
-		if nh, err = attachChain(f, g); err == nil {
+		if nh, err = attachChain(f, g, nil); err == nil {
 			return DocumentTree{TreeHash: t.TreeHash, trie: nh, size: t.Size()}
 		}
 		g.unmap(true)

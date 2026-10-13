@@ -562,3 +562,49 @@ func TestTreeFileRebasedHistoryReleasesSegments(t *testing.T) {
 		runtime.KeepAlive(tree)
 	}
 }
+
+// TestTreeFileStampSkipsFullChecksum: reopening a checkpoint whose segments still carry the
+// stamps its sidecar recorded maps them without reading them through for their checksum; a
+// segment whose stamp changed is checksummed in full. The tree is the same either way.
+func TestTreeFileStampSkipsFullChecksum(t *testing.T) {
+	r := rand.New(rand.NewSource(19))
+	f := newTestTreeFile(t, 1<<20)
+	universe := testIDs(r, 20000)
+	model := randomEntriesFrom(r, universe)
+	packed := packedOf(model)
+	if _, err := OpenTreePacked(packed, f); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	reopen := func() DocumentTree {
+		f2, err := NewTreeFile(f.opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := OpenTreePacked(packed, f2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, mapped := tree.Paged(); !mapped {
+			t.Fatal("reopen did not map the segment")
+		}
+		checkTreeAgainst(t, tree, ptrBuild(model), model, universe[:200], r)
+		f2.Close()
+		return tree
+	}
+	before := treeFullVerifies.Load()
+	reopen()
+	if n := treeFullVerifies.Load() - before; n != 0 {
+		t.Fatalf("a reopen with matching stamps checksummed %d segments in full", n)
+	}
+	seqs := segmentFiles(t, f)
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(f.segPath(seqs[len(seqs)-1]), later, later); err != nil {
+		t.Fatal(err)
+	}
+	before = treeFullVerifies.Load()
+	reopen()
+	if n := treeFullVerifies.Load() - before; n != 1 {
+		t.Fatalf("a segment whose stamp changed was checksummed %d times, want 1", n)
+	}
+}
