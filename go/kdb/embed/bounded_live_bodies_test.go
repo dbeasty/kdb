@@ -93,7 +93,7 @@ func TestBoundedLiveBodiesServeLiveDataLargerThanTheCache(t *testing.T) {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			root := t.TempDir()
 			rt := boundedRuntime(t, root, true, mode)
-			ids, texts := writeLiveSet(t, rt, 4000, 5000) // ~20 MB of live bodies; a 1 MiB cache, floored at 4 MiB
+			ids, texts := writeLiveSet(t, rt, 2400, 5000) // ~12 MB of live bodies, twice the 6 MiB ceiling; a 1 MiB cache, floored at 4 MiB
 			eng, ok := rt.Storage.(*engine.ServerEngine)
 			if !ok {
 				t.Skip("not a server engine")
@@ -102,7 +102,7 @@ func TestBoundedLiveBodiesServeLiveDataLargerThanTheCache(t *testing.T) {
 				t.Fatalf("%d versions still pinned waiting for their commits to be logged", n)
 			}
 			if live := eng.MemoryBreakdown().DocumentBodiesLive; live > 6<<20 {
-				t.Fatalf("version store holds %d live body bytes of ~20 MB live data against a 4 MiB floor - live versions are not being evicted", live)
+				t.Fatalf("version store holds %d live body bytes of ~12 MB live data against a 4 MiB floor - live versions are not being evicted", live)
 			}
 			requireAllLive(t, rt, ids, texts, "after writing")
 			if eng.ColdDocumentLoads() == 0 {
