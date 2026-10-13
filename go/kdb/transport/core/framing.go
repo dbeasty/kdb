@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"time"
 
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -29,6 +30,36 @@ type TransportConnectOptions struct {
 	// IncomingQueueFrames overrides how many whole frames a connection may buffer awaiting a
 	// consumer; 0 selects DefaultIncomingQueueFrames.
 	IncomingQueueFrames int
+	// WriteTimeoutMs bounds each Send: a write that has not completed by then fails and the
+	// connection is closed. 0 selects DefaultWriteTimeout; a negative value disables the bound.
+	WriteTimeoutMs int64
+}
+
+// DefaultWriteTimeout is how long one Send may block on a peer that is not reading before the
+// connection is closed. Without it a stalled peer held the connection's send lock forever, and
+// every reply built for it - up to the in-flight frame limit - waited behind it in memory.
+// Thirty seconds is far beyond any healthy write (a 16 MiB frame at 10 Mbit/s takes ~13s) and
+// matches the clients' own request timeouts.
+const DefaultWriteTimeout = 30 * time.Second
+
+// WriteTimeout resolves WriteTimeoutMs: 0 is the default, negative is none (returned as 0).
+func (o TransportConnectOptions) WriteTimeout() time.Duration {
+	switch {
+	case o.WriteTimeoutMs < 0:
+		return 0
+	case o.WriteTimeoutMs == 0:
+		return DefaultWriteTimeout
+	default:
+		return time.Duration(o.WriteTimeoutMs) * time.Millisecond
+	}
+}
+
+// SynchronousSender is implemented by connections whose Send has finished with the frame slice
+// by the time it returns - it was written to the socket, or copied, and no reference is kept. A
+// sender may then reuse the slice (a pooled encode buffer) as soon as Send returns. Connections
+// that do not implement it, or return false, must be handed a frame they may keep.
+type SynchronousSender interface {
+	SendCompletesSynchronously() bool
 }
 
 // DefaultIncomingQueueFrames is how many decoded frames a connection buffers before the read

@@ -334,6 +334,7 @@ func newServerConnection(conn net.Conn, reader *bufio.Reader, options core.Trans
 		requireInboundMask: true,
 		admit:              options.Admitter,
 		onClose:            onClose,
+		writeTimeout:       options.WriteTimeout(),
 	}
 	go c.readLoop()
 	return c
@@ -465,6 +466,7 @@ func performClientHandshake(conn net.Conn, host string, port int, path string, o
 		done:          make(chan struct{}),
 		// Client side: mask everything sent, accept the server's unmasked frames.
 		maskOutbound: true,
+		writeTimeout: options.WriteTimeout(),
 	}
 	go c.readLoop()
 	return c, nil
@@ -539,6 +541,8 @@ type wsConnection struct {
 	closed  bool
 	mu      sync.Mutex
 	writeMu sync.Mutex
+	// writeTimeout bounds each frame write; 0 is no bound. See core.DefaultWriteTimeout.
+	writeTimeout time.Duration
 }
 
 // readLoop is incoming's only sender and its only closer - see kdb/transport/tcp's
@@ -681,31 +685,66 @@ func (c *wsConnection) Send(frame []byte) error {
 // writeFrame writes one unfragmented frame. mask must be true for every client->server frame
 // per RFC 6455's client-masking requirement - a real (non-hand-rolled) WebSocket server would
 // reject an unmasked client frame, even though this repo's own JVM server tolerates either.
+//
+// The WebSocket header and the payload go out in one write: a gathered write (writev) on a plain
+// TCP socket, one buffer otherwise. They used to be two or three separate writes - each its own
+// segment with TCP_NODELAY, and its own record under TLS - and a masked frame was masked into a
+// second payload-sized buffer before being written after them.
 func (c *wsConnection) writeFrame(opcode byte, payload []byte, mask bool) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	buf := append([]byte{0x80 | opcode}, encodeLength(len(payload), mask)...)
-	if _, err := c.conn.Write(buf); err != nil {
-		return err
+	var hdrBuf [14]byte
+	hdrBuf[0] = 0x80 | opcode
+	hdr := hdrBuf[:1+copy(hdrBuf[1:], encodeLength(len(payload), mask))]
+	if c.writeTimeout > 0 {
+		if err := c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			_ = c.Close()
+			return err
+		}
 	}
-	if !mask {
-		_, err := c.conn.Write(payload)
-		return err
+	var err error
+	switch {
+	case mask:
+		var maskKey [4]byte
+		if _, err := rand.Read(maskKey[:]); err != nil {
+			return err
+		}
+		out := make([]byte, len(hdr)+4+len(payload))
+		n := copy(out, hdr)
+		n += copy(out[n:], maskKey[:])
+		masked := out[n:]
+		for i, b := range payload {
+			masked[i] = b ^ maskKey[i&3]
+		}
+		_, err = c.conn.Write(out)
+	case isPlainTCP(c.conn) || len(payload) > singleWriteCopyBytes:
+		bufs := net.Buffers{hdr, payload}
+		_, err = bufs.WriteTo(c.conn)
+	default:
+		out := make([]byte, len(hdr)+len(payload))
+		copy(out[copy(out, hdr):], payload)
+		_, err = c.conn.Write(out)
 	}
-	var maskKey [4]byte
-	if _, err := rand.Read(maskKey[:]); err != nil {
-		return err
+	if err != nil {
+		// A failed write - the deadline passed, or the peer went away - may have left a partial
+		// frame on the wire; the stream cannot be resynchronized, so end it.
+		_ = c.Close()
 	}
-	if _, err := c.conn.Write(maskKey[:]); err != nil {
-		return err
-	}
-	masked := make([]byte, len(payload))
-	for i, b := range payload {
-		masked[i] = b ^ maskKey[i%4]
-	}
-	_, err := c.conn.Write(masked)
 	return err
 }
+
+// singleWriteCopyBytes is the largest payload copied behind its header to make one write on a
+// connection that cannot gather (TLS). Past it the copy costs more than the extra record.
+const singleWriteCopyBytes = 64 << 10
+
+func isPlainTCP(conn net.Conn) bool {
+	_, ok := conn.(*net.TCPConn)
+	return ok
+}
+
+// SendCompletesSynchronously reports that Send has written the frame when it returns and keeps
+// no reference to it (core.SynchronousSender).
+func (c *wsConnection) SendCompletesSynchronously() bool { return true }
 
 func encodeLength(size int, masked bool) []byte {
 	maskBit := byte(0)
