@@ -83,6 +83,9 @@ type LsmBlobStore struct {
 	// would fail reading a file the first had already deleted.
 	compactMu sync.Mutex
 
+	// sidecar bookkeeping (sidecar_store.go), guarded by mu.
+	sidecarState
+
 	// afterSearchOrder, when set, runs between a lookup taking its table list and reading any
 	// table - the window a concurrent compaction used to delete an input in. Tests only.
 	afterSearchOrder func()
@@ -90,7 +93,7 @@ type LsmBlobStore struct {
 
 // NewLsmBlobStore returns an LSM blob store.
 func NewLsmBlobStore(io storage.PlatformIOShim, namespaceID string, cache *BlockCache) *LsmBlobStore {
-	return &LsmBlobStore{
+	s := &LsmBlobStore{
 		io:          io,
 		namespaceID: namespaceID,
 		cache:       cache,
@@ -98,6 +101,12 @@ func NewLsmBlobStore(io storage.PlatformIOShim, namespaceID string, cache *Block
 		readers:     make(map[string]int),
 		doomed:      make(map[string]struct{}),
 	}
+	if r := sidecarResolver(io); r != nil {
+		s.sidecarPaths = r
+		s.sidecarBuild = true
+		s.sidecars = make(map[string]*sidecarSlot)
+	}
+	return s
 }
 
 // Get searches tables newest-first, stopping at the first table that has an opinion about key -
@@ -116,8 +125,10 @@ func (s *LsmBlobStore) Get(key codec.Hash) []byte {
 // gets the same cached slice rather than a copy, so a caller that modified it would corrupt every
 // later read of that block. The same holds for Get.
 //
-// Each table's index comes from the store's index cache, so a probe costs a map lookup per
-// table plus one block read on a hit. It used to build a fresh reader per table per probe, and
+// Each table answers from its sidecar when it has one (sidecar.go): a Bloom filter check, and a
+// binary search of a mapped sorted index only when the filter cannot rule the key out. A table
+// without one answers from the store's index cache, so a probe costs a map lookup per table plus
+// one block read on a hit. It used to build a fresh reader per table per probe, and
 // each fresh reader read the whole file to learn its size and then re-read and re-parsed the
 // footer - time proportional to the table, on every probe (issue #43's slow recovery).
 func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool) {
@@ -127,13 +138,12 @@ func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool
 		s.afterSearchOrder()
 	}
 	for _, h := range order {
-		index, err := s.indexFor(h)
+		bh, ok, err := s.probe(h, &key)
 		if err != nil {
 			// A read error is treated the way it always has been - as "this table cannot answer" -
 			// so one damaged segment does not make the whole store unreadable.
 			continue
 		}
-		bh, ok := index[key]
 		if !ok {
 			continue
 		}
@@ -200,11 +210,11 @@ func (s *LsmBlobStore) Contains(key codec.Hash) bool {
 		s.afterSearchOrder()
 	}
 	for _, h := range order {
-		index, err := s.indexFor(h)
+		bh, ok, err := s.probe(h, &key)
 		if err != nil {
 			continue
 		}
-		if bh, ok := index[key]; ok {
+		if ok {
 			return !bh.Deleted
 		}
 	}
@@ -248,6 +258,7 @@ func (s *LsmBlobStore) pin() []Handle {
 // Compact).
 func (s *LsmBlobStore) release(order []Handle) {
 	var gone []string
+	var unmap []*sidecarSlot
 	s.mu.Lock()
 	for _, h := range order {
 		name := h.SegmentName
@@ -259,11 +270,18 @@ func (s *LsmBlobStore) release(order []Handle) {
 		if _, ok := s.doomed[name]; ok {
 			delete(s.doomed, name)
 			gone = append(gone, name)
+			unmap = append(unmap, s.takeSidecarLocked(name))
+		} else if s.closed {
+			// The store closed while this lookup held the table: its sidecar was left mapped for
+			// the lookup, and is unmapped now that the last one is done.
+			unmap = append(unmap, s.takeSidecarLocked(name))
 		}
 	}
 	s.mu.Unlock()
+	closeSidecars(unmap)
 	for _, name := range gone {
 		_ = s.io.DeleteSegment(name)
+		s.removeSidecarFile(name)
 	}
 }
 
@@ -389,19 +407,15 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	if keep != nil {
 		seen := make(map[codec.Hash]struct{})
 		for _, h := range ordered {
-			index, err := s.indexFor(h)
-			if err != nil {
-				continue
-			}
-			for k := range index {
+			_ = s.forEachKey(h, func(k codec.Hash, _ BlockHandle) {
 				if _, ok := seen[k]; ok {
-					continue
+					return
 				}
 				seen[k] = struct{}{}
 				if !keep(k) {
 					dropped++
 				}
-			}
+			})
 		}
 	}
 	merged, err := Compact(s.io, s.namespaceID, outLevel, ordered, true, keep)
@@ -439,20 +453,25 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	// compaction's own release included - deletes it.
 	result := CompactionResult{Merged: len(ordered), Output: merged.SegmentName, Dropped: dropped}
 	var now []string
+	var unmap []*sidecarSlot
 	for _, in := range ordered {
 		if in.SegmentName == merged.SegmentName {
 			continue
 		}
 		s.indexes.remove(in.SegmentName)
 		if s.readers[in.SegmentName] > 1 {
-			// Held by a lookup besides this compaction's own pin.
+			// Held by a lookup besides this compaction's own pin. Its sidecar stays mapped for
+			// that lookup and is unmapped by the release that deletes the table.
 			s.doomed[in.SegmentName] = struct{}{}
 			result.Deferred++
 			continue
 		}
 		now = append(now, in.SegmentName)
+		// Only this compaction holds it, and the compaction is done reading it.
+		unmap = append(unmap, s.takeSidecarLocked(in.SegmentName))
 	}
 	s.mu.Unlock()
+	closeSidecars(unmap)
 
 	// After the unlock, and still complete: the inputs are unregistered, and readBlock caches a
 	// block only for a registered table, under the lock the swap held. Every block of theirs that
@@ -464,6 +483,7 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	}
 
 	for _, name := range now {
+		s.removeSidecarFile(name)
 		if err := s.io.DeleteSegment(name); err != nil {
 			// The table is already unreachable through this store; leaving
 			// the file behind costs disk, not correctness, and the next

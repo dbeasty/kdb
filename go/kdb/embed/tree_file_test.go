@@ -242,3 +242,40 @@ func TestTreeFileHistoryDoesNotPinSegments(t *testing.T) {
 		}
 	}
 }
+
+// A closed namespace with a paged tree leaves nothing behind in the heap: no path from the
+// tree file's callbacks or the segments' cleanups keeps the engine or the tree alive.
+func TestTreeFileClosedNamespaceIsCollected(t *testing.T) {
+	skipIfNoMmap(t)
+	root := t.TempDir()
+	const ns = "test/treefile-closed"
+	opts := treeFileOpts(64 << 10)
+	opts.Storage.TreeMaxSegments = 2
+	settle := func() uint64 {
+		var ms runtime.MemStats
+		for i := 0; i < 10; i++ {
+			runtime.GC()
+			time.Sleep(10 * time.Millisecond)
+		}
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc
+	}
+	before := settle()
+	rt, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		b, _ := json.Marshal(map[string]any{"id": treeDocID(i % 1000), "rev": i, "pad": strings.Repeat("x", 200)})
+		if _, err := PutJSONDocument(rt, ns, string(b)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open := settle()
+	rt.Close()
+	after := settle()
+	t.Logf("heap: %.1f MB before, %.1f MB open, %.1f MB after close", float64(before)/1e6, float64(open)/1e6, float64(after)/1e6)
+	if int64(after)-int64(before) > (int64(open)-int64(before))/4 {
+		t.Fatalf("a closed namespace keeps %.1f MB of the %.1f MB it held", float64(int64(after)-int64(before))/1e6, float64(int64(open)-int64(before))/1e6)
+	}
+}

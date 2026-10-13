@@ -176,6 +176,15 @@ func (s *PrimaryWithReplicas) MarkSealed(segmentName string) error {
 	})
 }
 
+// LocalSegmentPath forwards to the primary: files kept at a local path are the primary's alone,
+// and are never replicated.
+func (s *PrimaryWithReplicas) LocalSegmentPath(segmentName string) (string, bool) {
+	if p, ok := s.primary.(segmentStoreLocalPather); ok {
+		return p.LocalSegmentPath(segmentName)
+	}
+	return "", false
+}
+
 func (s *PrimaryWithReplicas) List(prefix string) ([]string, error) {
 	return s.primary.List(prefix)
 }

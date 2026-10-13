@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"github.com/limidus/kdb/go/kdb/storage/deltaindex"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,6 +67,13 @@ type ServerEngine struct {
 	// version, and docsByHash is left unbounded - see SetColdLoader.
 	// Read on the miss path only, so an atomic load rather than a lock.
 	coldLoader atomic.Pointer[coldDocLoader]
+	// deltaLoader is the delta-log loader behind coldLoader, when there is one - kept so its
+	// index can be given a sidecar directory (ConfigureColdIndex) and closed with the engine.
+	deltaLoader *deltaColdLoader
+	// pruners are other delta indexes over the same log, pruned with deltaLoader's after a
+	// truncation - see AlsoPruneAfterTruncation.
+	prunersMu sync.Mutex
+	pruners   []func() error
 
 	// Bounded live bodies (StorageEngineConfig.BoundedLiveBodies). durabilityTracking is switched
 	// on by the runtime once something will tell this engine when a commit reaches the log
@@ -375,11 +383,15 @@ func (e *ServerEngine) Close() error {
 			firstErr = err
 		}
 	}
-	if e.asyncStop == nil {
-		return firstErr
+	if e.asyncStop != nil {
+		close(e.asyncStop)
+		<-e.asyncDone
 	}
-	close(e.asyncStop)
-	<-e.asyncDone
+	if e.blobStore != nil {
+		// After the flush, which may have written a table and its sidecar: unmaps the SSTable
+		// index sidecars, so a closed namespace stops holding mapped files.
+		_ = e.blobStore.Close()
+	}
 	return firstErr
 }
 
@@ -601,6 +613,52 @@ func (e *ServerEngine) PendingDurablePins() int {
 		}
 	}
 	return n
+}
+
+// ConfigureColdIndex gives the delta cold loader's index a directory for its per-segment
+// sidecars (see package deltaindex), so that only the newest segment's version locations stay
+// on the heap. readOnly uses sidecars already there and never writes one. A no-op for an engine
+// with no delta log behind it.
+func (e *ServerEngine) ConfigureColdIndex(dir string, readOnly bool) {
+	if e.deltaLoader != nil {
+		e.deltaLoader.index.SetDir(dir, readOnly)
+	}
+}
+
+// PruneColdIndex drops what the cold loader's index holds for delta segments that are no longer
+// in the log, and their sidecars. Called after truncation deletes segments.
+func (e *ServerEngine) PruneColdIndex() error {
+	if e.deltaLoader == nil {
+		return nil
+	}
+	err := e.deltaLoader.index.Prune()
+	e.prunersMu.Lock()
+	pruners := append([]func() error(nil), e.pruners...)
+	e.prunersMu.Unlock()
+	for _, p := range pruners {
+		if perr := p(); perr != nil && err == nil {
+			err = perr
+		}
+	}
+	return err
+}
+
+// AlsoPruneAfterTruncation registers another delta index over this namespace's log (embed's
+// commit-ops index) to be pruned with the cold loader's. Each index has to prune itself: on
+// Windows a sidecar cannot be deleted while the index that reads it holds it open.
+func (e *ServerEngine) AlsoPruneAfterTruncation(prune func() error) {
+	e.prunersMu.Lock()
+	defer e.prunersMu.Unlock()
+	e.pruners = append(e.pruners, prune)
+}
+
+// ColdIndexStats reports the shape of the delta cold loader's index: zero until a version has
+// been looked for in the log. For tests and the memory breakdown.
+func (e *ServerEngine) ColdIndexStats() deltaindex.Stats {
+	if e.deltaLoader == nil {
+		return deltaindex.Stats{}
+	}
+	return e.deltaLoader.index.Stats()
 }
 
 func (e *ServerEngine) SetColdLoader(loader coldDocLoader, budgetBytes int64) {
@@ -961,6 +1019,14 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 	default:
 		eng = NewServerEngine(namespaceID, config, nil)
 	}
+	switch f.EngineTarget {
+	case TargetServer:
+		// The owner of the namespace's files clears sidecars a crash left without a table.
+		eng.blobStore.RemoveOrphanSidecars()
+	case TargetReadOnly:
+		// Uses the writer's sidecars but never writes one into a directory it does not own.
+		eng.blobStore.SetSidecarBuild(false)
+	}
 	deltaFactory := delta.Factory{Config: config}
 	var writer storage.DeltaSegmentWriter
 	if f.EngineTarget == TargetServer {
@@ -976,6 +1042,7 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 		// version from. Every other target keeps the version store
 		// unbounded, because for them memory is the only tier there is.
 		loader := newDeltaColdLoader(reader)
+		eng.deltaLoader = loader
 		eng.SetColdLoader(loader.load, storage.ResolvedDocumentCacheBytes(config))
 		// The fast path for an evicted version: a location record says
 		// which frame holds it, and this reads that frame. The scanning
@@ -1015,6 +1082,10 @@ func (h *defaultHandle) Adapter() storage.EvictableAdapter       { return h.adap
 func (h *defaultHandle) DeltaWriter() storage.DeltaSegmentWriter { return h.deltaWriter }
 func (h *defaultHandle) DeltaReader() storage.DeltaSegmentReader { return h.deltaReader }
 func (h *defaultHandle) Close() error {
+	if eng, ok := h.adapter.(*ServerEngine); ok && eng.deltaLoader != nil {
+		// After the engine's own close: nothing reads history once it is down.
+		defer eng.deltaLoader.index.Close()
+	}
 	if closer, ok := h.adapter.(interface{ Close() error }); ok {
 		return closer.Close()
 	}

@@ -323,11 +323,18 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		return Handle{}, err
 	}
 	footer := buildFooter(blocks, fileHash)
-	if _, err := w.appendAll(segmentName, footer); err != nil {
+	tableSize, err := w.appendAll(segmentName, footer)
+	if err != nil {
 		return Handle{}, err
 	}
 	if err := w.io.SealSegment(segmentName); err != nil {
 		return Handle{}, err
+	}
+	// The table is complete and sealed; its sidecar is an optional extra written after it (see
+	// sidecar.go). A failure here costs the table its fast index, never its data: a lookup finds
+	// no sidecar and reads the footer, as every table did before sidecars, and rebuilds it.
+	if path, ok := sidecarPath(sidecarResolver(w.io), segmentName); ok {
+		_ = writeSidecarFile(path, blocks, tableSize, fileHash)
 	}
 	return Handle{FileHash: fileHash, Level: w.level, SegmentName: segmentName}, nil
 }

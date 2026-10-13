@@ -396,3 +396,17 @@ func (f *FileBackedPlatformIO) ReleaseHandles(prefix string) error {
 	}
 	return nil
 }
+
+// LocalSegmentPath implements storage.LocalPathResolver by forwarding to the store beneath, which
+// alone knows whether its segments are local files.
+func (f *FileBackedPlatformIO) LocalSegmentPath(segmentName string) (string, bool) {
+	if ValidateSegmentName(segmentName) != nil {
+		return "", false
+	}
+	if p, ok := f.store.(segmentStoreLocalPather); ok {
+		return p.LocalSegmentPath(segmentName)
+	}
+	return "", false
+}
+
+var _ storage.LocalPathResolver = (*FileBackedPlatformIO)(nil)
