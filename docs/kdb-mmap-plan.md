@@ -395,3 +395,48 @@ heavy insert +7%. One row first read -7.3% (single-user mixed read/write, overla
 **+4.0%** (p=0.011) - fsync contention noise. Allocations per op identical on every single-user row, +-1 on the
 heavy rows.
 
+## Follow-ups after PR #159 (branch `perf/memory-followups`, 2026-10-12)
+
+The 1M-document profile showed what was left once the commit graph moved out - none of it was the
+graph - plus the question of why the graph made disk worse. Each item, with its fix:
+
+| Issue (1M docs, 2M commits) | Cause | Fix |
+|---|---|---|
+| Graph segments 304 B/commit, disk 1.6 GB vs main's 1.3 GB | parents as full hashes, empty schema slots, spare bytes, a 48-byte tx index entry | **segment v4**: git commit-graph layout (parents by position) + Cassandra-style side tables; **132 B/commit** (116 with repeating authors), disk back to 1.3 GB |
+| Live tree held twice, +120 MB | tree from the checkpoint kept its flat `Entries` map beside the trie | `BuildTrieDocumentTree`: trie only |
+| 7.8 s of the open rebuilding the trie | one persistent insert per entry, each re-hashing its path | sorted bulk build, each node hashed once, top-level subtrees in parallel: **10.1 s -> 0.85 s** |
+| Pinned version index 191 MB, GC-scanned | a full `docHashEntry` per live document, nearly all placeholders | placeholder pins in a pointer-free `map[Hash]int32`: **53 B/doc**, unscanned |
+| `Horizon()` 2.4 s of the open | walked every commit through the segments | segments list commits with an external parent (`XPOS`); only those are visited unless a hidden record is unstubbed |
+| Open peak 4x steady state; checkpoint allocating ~900 MB-5 GB | live tree and commits as one codec record each | **checkpoint v4**: live tree packed (48 B/entry, sorted, straight into the bulk build) and commits packed (~150 B each, restored one at a time) |
+
+Also: segment sections carry a codec field (0 = plain) so encryption at rest and block
+compression can land per section without a new layout; zstd measured only 12-15% on a segment
+(hashes are random). The Layer 14 spec now lists graph segments as leak 2.6.6 - commit messages are
+the one thing in them outside the accepted-metadata list.
+
+### Results at 1M documents / 2M commits (same harness; `main` = `665d9fc`/`4124676`, graph off by default)
+
+| Phase | main | follow-up, graph off | PR #159, graph on | follow-up, graph on |
+|---|---:|---:|---:|---:|
+| Startup: live heap after open | 1,518 MB | 1,282 MB | 436 MB | **201 MB** |
+| Startup: peak heap during open | 4,864 MB | 1,959 MB | 1,115 MB | **408 MB** |
+| Startup: RSS | 6,035 MB | 2,023 MB | 2,206 MB | **699 MB** |
+| Startup: open time | 19.6 s | 2.5 s | 13.3 s | **0.39 s** |
+| 20k updates: live heap / peak | 1,422 / 1,863 MB | 1,311 / 1,638 MB | 343 / 794 MB | **229 / 403 MB** |
+| Close + checkpoint: allocated | 7,658 MB | 2,767 MB | 923 MB | **244 MB** |
+| Close + checkpoint: peak RSS | 8,402 MB | 3,444 MB | 2,449 MB | **865 MB** |
+| Close + checkpoint: time | 6.8 s | 1.1 s | 0.37 s | **81 ms** |
+| Disk | 1.3 GB | 1.3 GB | 1.6 GB | **1.3 GB** |
+
+Graph segment alone (`TestGraphFileScale`, v4): 132 B/commit; deep `IsAncestor` 162 ms / 346 ms at
+1M / 2M (v3: 195 / 416); a full rewrite takes two passes, 3.4 s / 7.9 s (v3: 1.7 / 3.6), in the
+background without the DAG lock; transaction lookups 0.5 us (v3: 0.2).
+
+Formats: segment v3 files are unusable to this build (dropped, rebuilt); checkpoint v4 is what it
+writes and it still reads v2 and v3; older builds read v4 as unusable and replay the log.
+
+Hot path against `main` `4124676` (full 36-row workload matrix, graph off, alternating, n=4): geomean
+**+0.42% ops/s, +0.01% allocations**. Three rows read significant at n=4 (single-user update -5.0%,
+heavy transaction +2.4%, heavy memory-only update -1.9%); the two negative ones re-run at n=9 are
+not significant (p=0.17, p=0.86).
+
