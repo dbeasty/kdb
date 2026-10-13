@@ -49,6 +49,9 @@ func ListenPeerSyncTLS(addr string, runtime *KdbServerRuntime, namespaceID strin
 	}
 	opts := core.DefaultConnectOptions()
 	opts.TLS = tlsSettings
+	// Capped like every other listener: each session is a goroutine, a frame buffer and whatever
+	// sync state it builds up, none of it charged to admission. It used to be unlimited.
+	opts.MaxConnections = peerSyncMaxConnections(runtime.PeerSyncMaxConnections)
 	transport := tcp.NewTransport(opts)
 	ln, err := transport.ListenBound(addr)
 	if err != nil {

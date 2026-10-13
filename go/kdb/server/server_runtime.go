@@ -125,6 +125,9 @@ type KdbServerRuntime struct {
 	// PeerAuthorizeDocuments asks the auth engine about every document a peer's push writes or
 	// deletes, not only whether it may push to the namespace (peersync.V2HostConfig).
 	PeerAuthorizeDocuments bool
+	// PeerSyncMaxConnections caps concurrently-accepted connections on this runtime's peer-sync
+	// listener (ListenPeerSync). 0 means DefaultPeerSyncMaxConnections; negative means unlimited.
+	PeerSyncMaxConnections int
 	// HandoverPolicy decides peers' requests to become a namespace's home (HOME_REQUEST); nil
 	// refuses them all. See HandoverRequest.
 	HandoverPolicy HandoverPolicy

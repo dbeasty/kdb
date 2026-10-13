@@ -86,3 +86,22 @@ func ApplyGoMemoryLimit(budgetBytes uint64) int64 {
 // ever sends a request, and none of that is charged against the grant system - so without a cap,
 // connections are a way to consume the budget that admission control cannot see or refuse.
 const DefaultMaxConnections = 256
+
+// DefaultPeerSyncMaxConnections caps concurrently-accepted peer-sync connections when
+// KdbServerRuntime.PeerSyncMaxConnections is 0. Lower than DefaultMaxConnections because a peer
+// session is heavier than a client's: it can hold a FETCH cursor (32 B per missing commit), a
+// pushed graft being staged, and a snapshot page in flight. A cluster has a handful of peers, each
+// with one session per direction; 64 leaves ample room for reconnects and transient overlap.
+const DefaultPeerSyncMaxConnections = 64
+
+// peerSyncMaxConnections is the listener cap for a runtime's PeerSyncMaxConnections setting.
+func peerSyncMaxConnections(setting int) int {
+	switch {
+	case setting < 0:
+		return 0 // unlimited, in the transport's terms
+	case setting == 0:
+		return DefaultPeerSyncMaxConnections
+	default:
+		return setting
+	}
+}
