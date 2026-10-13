@@ -335,6 +335,13 @@ func (c *commitLogWriter) drain(first *logRequest) []*logRequest {
 	return batch
 }
 
+// batchAppender is the delta writer's AppendBatch: a drained batch's frames in as few writes as the
+// platform allows, rather than one per record (see delta.DefaultWriter.AppendBatch). A writer
+// without it - test doubles - gets one Append per record, as always.
+type batchAppender interface {
+	AppendBatch([]storage.DeltaRecord) ([]int64, error)
+}
+
 // deltaSegmentRotator is the part of the delta writer the commit log needs to keep segments from
 // growing without bound. An interface rather than the concrete type because the commit log is
 // written against storage.DeltaSegmentWriter and several tests substitute their own, which simply
@@ -386,6 +393,22 @@ func (c *commitLogWriter) appendBatch(batch []*logRequest) error {
 	seq, hasSeq := int64(0), false
 	if s, ok := c.writer.(storage.DeltaSegmentSequencer); ok {
 		seq, hasSeq = s.SequenceNumber(), true
+	}
+	if b, ok := c.writer.(batchAppender); ok && len(batch) > 1 {
+		recs := make([]storage.DeltaRecord, len(batch))
+		for i, r := range batch {
+			recs[i] = r.rec
+		}
+		offsets, err := b.AppendBatch(recs)
+		for i, offset := range offsets {
+			if c.onPersisted != nil && hasSeq && batch[i].treeHash != (codec.Hash{}) {
+				c.onPersisted(batch[i].treeHash, seq, offset)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("appending commit %s to the delta log: %w", batch[len(offsets)].rec.CommitHash.Hex(), err)
+		}
+		return nil
 	}
 	for _, r := range batch {
 		offset, err := c.writer.Append(r.rec)
