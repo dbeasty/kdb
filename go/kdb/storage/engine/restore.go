@@ -3,6 +3,7 @@ package engine
 import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
+	"weak"
 )
 
 // treeRebuilder reconstructs one historical document tree, named by its
@@ -45,7 +46,16 @@ func (e *ServerEngine) SetTreeFile(f *document.TreeFile) {
 	e.treeFile = f
 	e.tree = document.BindTreeFile(e.tree, f)
 	if f != nil {
-		f.SetOnWrite(e.rebaseHeldTrees)
+		// Weakly: the tree file is reachable from the cleanup that unmaps a slab's segments, and
+		// a strong path back through this engine to that slab would keep the slab alive for ever
+		// (a cleanup never runs while its argument reaches its object) - a closed namespace's
+		// whole tree retained.
+		self := weak.Make(e)
+		f.SetOnWrite(func() {
+			if e := self.Value(); e != nil {
+				e.rebaseHeldTrees()
+			}
+		})
 	}
 }
 
