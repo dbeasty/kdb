@@ -155,3 +155,39 @@ func TestTreeFileDamagedSegmentRebuilds(t *testing.T) {
 		t.Fatal("tree differs after reopening over a damaged segment")
 	}
 }
+
+// A read-only runtime maps the segment the writer's checkpoint tagged, and writes or deletes
+// nothing in the tree directory.
+func TestTreeFileReadOnlyMapsWithoutWriting(t *testing.T) {
+	skipIfNoMmap(t)
+	root := t.TempDir()
+	const ns = "test/treefile-ro"
+	rt, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), treeFileOpts(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 800; i++ {
+		b, _ := json.Marshal(map[string]any{"id": treeDocID(i), "rev": i})
+		if _, err := PutJSONDocument(rt, ns, string(b)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := rt.Storage.(*engine.ServerEngine).LiveTree().TreeHash
+	rt.Close()
+	before := treeSegments(t, root, ns)
+
+	opts := treeFileOpts(0)
+	opts.ReadOnly = true
+	ro, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := ro.Storage.(*engine.ServerEngine).LiveTree()
+	if _, mapped := live.Paged(); !mapped || live.TreeHash != want {
+		t.Fatalf("read-only open: mapped=%v, hash matches=%v", mapped, live.TreeHash == want)
+	}
+	ro.Close()
+	if after := treeSegments(t, root, ns); strings.Join(after, ",") != strings.Join(before, ",") {
+		t.Fatalf("a read-only runtime changed the tree directory: %v -> %v", before, after)
+	}
+}
