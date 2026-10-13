@@ -1,6 +1,7 @@
 package deltaindex
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/delta"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
+	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 )
 
 const testNS = "test/deltaindex"
@@ -100,6 +102,53 @@ func (r *countingReader) StreamCommitsPastDamage(seg storage.DeltaSegmentRef, fn
 	return r.DefaultReader.StreamCommitsPastDamage(seg, fn)
 }
 
+// mmapSupported reports whether this platform maps files (storage/mmapfile); Windows does not.
+func mmapSupported(t testing.TB) bool {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "probe")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := mmapfile.Open(p)
+	if errors.Is(err, mmapfile.ErrUnsupported) {
+		return false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Close()
+	return true
+}
+
+// inEverySidecarMode runs a sidecar test against mapped sidecars, where this platform maps files,
+// and against file-backed sidecars (positioned reads), the path a platform without mmap takes -
+// so both are tested on every platform that can, and Windows tests the one it uses.
+func inEverySidecarMode(t *testing.T, test func(*testing.T)) {
+	if mmapSupported(t) {
+		t.Run("mapped", func(t *testing.T) { test(t) })
+	}
+	t.Run("file", func(t *testing.T) {
+		mapSidecars = false
+		defer func() { mapSidecars = true }()
+		test(t)
+	})
+}
+
+// offHeap reports whether exactly n segments are in sidecars, of the kind this mode and platform
+// use: mapped when the index maps and the platform can, file-backed otherwise. Logs a mismatch.
+func offHeap(t *testing.T, st Stats, n int) bool {
+	t.Helper()
+	want := Stats{FileSegs: n}
+	if mapSidecars && mmapSupported(t) {
+		want = Stats{MappedSegs: n}
+	}
+	if st.MappedSegs != want.MappedSegs || st.FileSegs != want.FileSegs {
+		t.Logf("sidecars: %d mapped, %d file-backed; want %d mapped, %d file-backed", st.MappedSegs, st.FileSegs, want.MappedSegs, want.FileSegs)
+		return false
+	}
+	return true
+}
+
 func commitKeys(c document.Commit, emit func(codec.Hash)) { emit(c.Hash) }
 
 func newIndex(r storage.DeltaSegmentReader, dir string) *Index {
@@ -135,6 +184,10 @@ func sidecars(t *testing.T, dir string) []string {
 // Every key in a multi-segment log is found, sealed segments are mapped sidecars, only the newest
 // is on the heap, and an absent key is reported absent.
 func TestEveryKeyFoundAcrossSegments(t *testing.T) {
+	inEverySidecarMode(t, testEveryKeyFoundAcrossSegments)
+}
+
+func testEveryKeyFoundAcrossSegments(t *testing.T) {
 	l := newTestLog(t)
 	for i := 0; i < 4; i++ {
 		l.segment(500)
@@ -149,7 +202,7 @@ func TestEveryKeyFoundAcrossSegments(t *testing.T) {
 		t.Fatalf("absent key: ok=%v err=%v", ok, err)
 	}
 	st := x.Stats()
-	if st.Segments != 4 || st.MappedSegs != 3 {
+	if st.Segments != 4 || !offHeap(t, st, 3) {
 		t.Fatalf("stats %+v: want 4 segments, 3 mapped", st)
 	}
 	if st.HeapBytes != 500*recordSize {
@@ -161,7 +214,9 @@ func TestEveryKeyFoundAcrossSegments(t *testing.T) {
 }
 
 // A new index over the same directory - a reopen - reads the sidecars rather than the segments.
-func TestReopenUsesSidecars(t *testing.T) {
+func TestReopenUsesSidecars(t *testing.T) { inEverySidecarMode(t, testReopenUsesSidecars) }
+
+func testReopenUsesSidecars(t *testing.T) {
 	l := newTestLog(t)
 	for i := 0; i < 3; i++ {
 		l.segment(300)
@@ -183,6 +238,10 @@ func TestReopenUsesSidecars(t *testing.T) {
 // Segments added after the index was built are found on a later miss, and the segment that was
 // newest - on the heap - moves to a sidecar once it is sealed, without being scanned again.
 func TestCatchesUpWhenSegmentsAreAdded(t *testing.T) {
+	inEverySidecarMode(t, testCatchesUpWhenSegmentsAreAdded)
+}
+
+func testCatchesUpWhenSegmentsAreAdded(t *testing.T) {
 	l := newTestLog(t)
 	l.segment(200)
 	l.segment(200)
@@ -198,7 +257,7 @@ func TestCatchesUpWhenSegmentsAreAdded(t *testing.T) {
 	if got := r.scans.Load() - scans; got != 2 {
 		t.Fatalf("catching up scanned %d segments; want 2 (the new ones)", got)
 	}
-	if st := x.Stats(); st.Segments != 4 || st.MappedSegs != 3 {
+	if st := x.Stats(); st.Segments != 4 || !offHeap(t, st, 3) {
 		t.Fatalf("stats %+v: want 4 segments, 3 mapped", st)
 	}
 	// Nothing new: a miss scans nothing.
@@ -210,6 +269,10 @@ func TestCatchesUpWhenSegmentsAreAdded(t *testing.T) {
 // Truncation deletes segments from the front of the log: their keys stop resolving, the rest
 // still do, and their sidecars are removed.
 func TestTruncatedSegmentsAndTheirSidecarsGo(t *testing.T) {
+	inEverySidecarMode(t, testTruncatedSegmentsAndTheirSidecarsGo)
+}
+
+func testTruncatedSegmentsAndTheirSidecarsGo(t *testing.T) {
 	l := newTestLog(t)
 	for i := 0; i < 4; i++ {
 		l.segment(200)
@@ -256,6 +319,10 @@ func TestTruncatedSegmentsAndTheirSidecarsGo(t *testing.T) {
 // A damaged, truncated, stale or foreign sidecar is never trusted: the index rebuilds it from
 // the segment, and every key is still found.
 func TestBadSidecarsFallBackToTheSegment(t *testing.T) {
+	inEverySidecarMode(t, testBadSidecarsFallBackToTheSegment)
+}
+
+func testBadSidecarsFallBackToTheSegment(t *testing.T) {
 	l := newTestLog(t)
 	for i := 0; i < 5; i++ {
 		l.segment(300)
@@ -309,6 +376,10 @@ func TestBadSidecarsFallBackToTheSegment(t *testing.T) {
 // A segment rewritten under the same sequence (a repair that truncates a damaged tail) changes
 // its size and last commit, so its old sidecar no longer matches it and is rebuilt.
 func TestSidecarOfAChangedSegmentIsRebuilt(t *testing.T) {
+	inEverySidecarMode(t, testSidecarOfAChangedSegmentIsRebuilt)
+}
+
+func testSidecarOfAChangedSegmentIsRebuilt(t *testing.T) {
 	l := newTestLog(t)
 	l.segment(100)
 	l.segment(100)
@@ -344,7 +415,9 @@ func TestSidecarOfAChangedSegmentIsRebuilt(t *testing.T) {
 }
 
 // Within a segment and across segments, the newest frame holding a key is the one returned.
-func TestNewestFrameWins(t *testing.T) {
+func TestNewestFrameWins(t *testing.T) { inEverySidecarMode(t, testNewestFrameWins) }
+
+func testNewestFrameWins(t *testing.T) {
 	l := newTestLog(t)
 	l.segment(50)
 	l.segment(50)
@@ -381,7 +454,7 @@ func TestReadOnlyWritesNoSidecars(t *testing.T) {
 	if n := len(sidecars(t, dir)); n != 0 {
 		t.Fatalf("read-only index wrote %d sidecars", n)
 	}
-	if st := x.Stats(); st.MappedSegs != 0 || st.Segments != 2 {
+	if st := x.Stats(); st.OffHeapSegs() != 0 || st.Segments != 2 {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -394,7 +467,7 @@ func TestNoDirKeepsCompactHeapArrays(t *testing.T) {
 	x := newIndex(l.reader(), "")
 	defer x.Close()
 	requireAll(t, x, l)
-	if st := x.Stats(); st.MappedSegs != 0 || st.HeapBytes != 600*recordSize {
+	if st := x.Stats(); st.OffHeapSegs() != 0 || st.HeapBytes != 600*recordSize {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -403,6 +476,10 @@ func TestNoDirKeepsCompactHeapArrays(t *testing.T) {
 // a small struct per segment - the same for a log of two segments and of eight. The map this
 // replaced held ~112 bytes per version in the whole log.
 func TestRetainedHeapDoesNotGrowWithHistory(t *testing.T) {
+	inEverySidecarMode(t, testRetainedHeapDoesNotGrowWithHistory)
+}
+
+func testRetainedHeapDoesNotGrowWithHistory(t *testing.T) {
 	const perSegment = 4000
 	measure := func(segments int) (int64, Stats) {
 		l := newTestLog(t)
@@ -443,6 +520,10 @@ func TestRetainedHeapDoesNotGrowWithHistory(t *testing.T) {
 
 // Concurrent lookups while the log grows and the index catches up (run under -race).
 func TestConcurrentLookupsWhileTheLogGrows(t *testing.T) {
+	inEverySidecarMode(t, testConcurrentLookupsWhileTheLogGrows)
+}
+
+func testConcurrentLookupsWhileTheLogGrows(t *testing.T) {
 	l := newTestLog(t)
 	l.segment(200)
 	l.segment(200)
@@ -486,6 +567,10 @@ func TestConcurrentLookupsWhileTheLogGrows(t *testing.T) {
 
 // Prune drops deleted segments and their sidecars - every kind's - without scanning anything.
 func TestPruneDropsDeletedSegmentsWithoutScanning(t *testing.T) {
+	inEverySidecarMode(t, testPruneDropsDeletedSegmentsWithoutScanning)
+}
+
+func testPruneDropsDeletedSegmentsWithoutScanning(t *testing.T) {
 	l := newTestLog(t)
 	for i := 0; i < 4; i++ {
 		l.segment(100)

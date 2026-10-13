@@ -31,6 +31,10 @@ func coldIndexRuntime(tb testing.TB, root string, mutate func(*embed.FileRuntime
 	if err != nil {
 		tb.Fatal(err)
 	}
+	// Closed even when the test fails partway: the package's tests share a process, and a leaked
+	// runtime's heap shows up in the heap-measuring tests that run after it
+	// (TestOpenCostPerCommitDoesNotGrow failed on Windows for exactly that reason).
+	tb.Cleanup(rt.Close)
 	return rt
 }
 
@@ -66,7 +70,6 @@ func TestColdReadsResolveByLocationAfterAFastAsyncWriter(t *testing.T) {
 	rt.Close()
 
 	reopened := coldIndexRuntime(t, root, nil)
-	defer reopened.Close()
 	requireAllLive(t, reopened, ids, texts, "after reopen")
 	eng := serverEngine(t, reopened)
 	if eng.ColdDocumentLoads() == 0 {
@@ -92,7 +95,6 @@ func TestReplayFilesLocationRecords(t *testing.T) {
 	}
 
 	reopened := coldIndexRuntime(t, root, noCheckpoints)
-	defer reopened.Close()
 	requireAllLive(t, reopened, ids, texts, "after a full replay")
 	eng := serverEngine(t, reopened)
 	if eng.ColdDocumentLoads() == 0 {
@@ -105,7 +107,7 @@ func TestReplayFilesLocationRecords(t *testing.T) {
 
 // Where the cold loader is still the way back - the replay strategy keeps no location records,
 // and history=none truncates the log under it - every version is still found, its index lives in
-// mapped per-segment sidecars with only the newest segment on the heap, the sidecars are reused
+// per-segment sidecars (mapped, or read in place without mmap) with only the newest segment on the heap, the sidecars are reused
 // after a reopen, and those of truncated segments are removed.
 func TestColdIndexSidecarsServeTheReplayStrategy(t *testing.T) {
 	for _, mode := range []storage.HistoryMode{storage.HistoryModeFull, storage.HistoryModeNone} {
@@ -125,10 +127,12 @@ func TestColdIndexSidecarsServeTheReplayStrategy(t *testing.T) {
 			eng := serverEngine(t, rt)
 			if mode == storage.HistoryModeFull {
 				st := eng.ColdIndexStats()
-				if st.MappedSegs == 0 || st.MappedSegs != st.Segments-1 {
-					t.Fatalf("cold index %+v: want every segment but the newest mapped", st)
+				// Mapped where the platform maps files, read with positioned reads where it does not
+				// (Windows); off the heap either way (deltaindex's tests check which).
+				if st.OffHeapSegs() == 0 || st.OffHeapSegs() != st.Segments-1 {
+					t.Fatalf("cold index %+v: want every segment but the newest in a sidecar", st)
 				}
-				if st.HeapBytes*int64(st.Segments) > st.MappedBytes*2 {
+				if st.HeapBytes*int64(st.Segments) > (st.MappedBytes+st.FileBytes)*2 {
 					t.Fatalf("cold index %+v: the heap part is not just the newest segment", st)
 				}
 				if len(sidecarFiles(t, root)) == 0 {
@@ -153,7 +157,6 @@ func TestColdIndexSidecarsServeTheReplayStrategy(t *testing.T) {
 			}
 			rt.Close()
 			reopened := coldIndexRuntime(t, root, opts)
-			defer reopened.Close()
 			requireAllLive(t, reopened, ids, texts, "after reopen")
 			// Every sidecar on disk names a segment that is still in the log.
 			segs, _ := filepath.Glob(filepath.Join(root, "ns", filepath.FromSlash(boundedNS), "delta", "*.seg"))

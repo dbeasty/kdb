@@ -17,6 +17,8 @@
 //     way the commit graph's are.
 //   - The newest segment, which may still grow, keeps its array on the heap. That is bounded by
 //     the segment rotation size, not by history.
+//   - On a platform without mmap (Windows), a sealed segment's sidecar is read with positioned
+//     reads instead: still off the heap, at about log2(n) 32-byte reads per segment probed.
 //   - With no sidecar directory (an in-memory store, or a caller that has none to give), every
 //     segment's array stays on the heap. Still pointer-free and about 40 bytes a key.
 //
@@ -96,15 +98,68 @@ type Index struct {
 
 type segIndex struct {
 	ref storage.DeltaSegmentRef
-	// recs is the sorted record array: heap bytes, or the record section of a mapping.
+	// recs is the sorted record array: heap bytes, or the record section of a mapping. Nil for
+	// a file-backed sidecar.
 	recs    []byte
 	mapping *mmapfile.Mapping
 	region  *mmapfile.Region
+	// file is a sidecar read with positioned reads instead of mapped, on platforms without mmap
+	// (Windows): records stay off the heap either way, at a few small reads per lookup.
+	file  *os.File
+	count int
 }
 
 func (s *segIndex) mapped() bool { return s.mapping != nil }
 
+// offHeap reports whether the segment's records live in a sidecar (mapped or file-backed).
+func (s *segIndex) offHeap() bool { return s.mapping != nil || s.file != nil }
+
+// keys is how many records the segment's index holds.
+func (s *segIndex) keys() int {
+	if s.file != nil {
+		return s.count
+	}
+	return len(s.recs) / recordSize
+}
+
+// lookup finds key in this segment's records, wherever they are.
+func (s *segIndex) lookup(key codec.Hash) (int64, bool, error) {
+	if s.file == nil {
+		off, ok := search(s.recs, key)
+		return off, ok, nil
+	}
+	var buf [recordSize]byte
+	var readErr error
+	i := sort.Search(s.count, func(i int) bool {
+		if readErr != nil {
+			return true
+		}
+		if _, err := s.file.ReadAt(buf[:32], int64(headerSize+i*recordSize)); err != nil {
+			readErr = err
+			return true
+		}
+		return bytes.Compare(buf[:32], key.Bytes[:]) >= 0
+	})
+	if readErr != nil {
+		return 0, false, fmt.Errorf("deltaindex: reading sidecar: %w", readErr)
+	}
+	if i >= s.count {
+		return 0, false, nil
+	}
+	if _, err := s.file.ReadAt(buf[:], int64(headerSize+i*recordSize)); err != nil {
+		return 0, false, fmt.Errorf("deltaindex: reading sidecar: %w", err)
+	}
+	if !bytes.Equal(buf[:32], key.Bytes[:]) {
+		return 0, false, nil
+	}
+	return int64(binary.LittleEndian.Uint64(buf[32:])), true, nil
+}
+
 func (s *segIndex) close() {
+	if s.file != nil {
+		_ = s.file.Close()
+		s.file = nil
+	}
 	if s.region != nil {
 		s.region.Release()
 		s.region = nil
@@ -163,7 +218,11 @@ func (x *Index) find(key codec.Hash) (loc Location, found bool, err error) {
 		}
 	}()
 	for _, s := range x.segs {
-		if off, ok := search(s.recs, key); ok {
+		off, ok, err := s.lookup(key)
+		if err != nil {
+			return Location{}, false, err
+		}
+		if ok {
 			return Location{Segment: s.ref, FrameOffset: off}, true, nil
 		}
 	}
@@ -220,7 +279,7 @@ func (x *Index) Refresh() (bool, error) {
 		old := have[seg.SequenceNumber]
 		delete(have, seg.SequenceNumber)
 		if old != nil && sameSegment(old.ref, seg) {
-			if old.mapped() || !sealed || !useDir || x.readOnly {
+			if old.offHeap() || !sealed || !useDir || x.readOnly {
 				next = append(next, old)
 				continue
 			}
@@ -266,10 +325,9 @@ func (x *Index) Refresh() (bool, error) {
 	// deleted by a repair. Its sidecar goes with it.
 	for _, s := range have {
 		changed = true
+		// Its sidecar is removed below (removeOrphans), once the index no longer holds it open:
+		// Windows will not delete an open file.
 		retired = append(retired, s)
-		if useDir && !x.readOnly {
-			_ = os.Remove(x.sidecarPath(s.ref.SequenceNumber))
-		}
 	}
 	if !changed {
 		return false, nil
@@ -409,7 +467,13 @@ func encodeHeader(seg storage.DeltaSegmentRef, count int) []byte {
 // its CRC. Anything else - absent, stale, torn, damaged, unmappable - is reported as no sidecar,
 // and the caller rebuilds it from the segment.
 func (x *Index) openSidecar(seg storage.DeltaSegmentRef) (*segIndex, bool) {
+	if !mapSidecars {
+		return x.openSidecarFile(seg)
+	}
 	m, err := mmapfile.Open(x.sidecarPath(seg.SequenceNumber))
+	if errors.Is(err, mmapfile.ErrUnsupported) {
+		return x.openSidecarFile(seg)
+	}
 	if err != nil {
 		return nil, false
 	}
@@ -447,6 +511,59 @@ func (x *Index) openSidecar(seg storage.DeltaSegmentRef) (*segIndex, bool) {
 		return nil, false
 	}
 	return &segIndex{ref: seg, recs: recs, mapping: m, region: region}, true
+}
+
+// mapSidecars is false only in tests, to run the positioned-read path that platforms without
+// mmap take.
+var mapSidecars = true
+
+// openSidecarFile opens seg's sidecar for positioned reads: the path for a platform without mmap.
+// It is validated exactly as a mapped one is - the whole file is read once to check its CRC - and
+// then only the records a lookup's binary search touches are read.
+func (x *Index) openSidecarFile(seg storage.DeltaSegmentRef) (*segIndex, bool) {
+	f, err := os.Open(x.sidecarPath(seg.SequenceNumber))
+	if err != nil {
+		return nil, false
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			f.Close()
+		}
+	}()
+	st, err := f.Stat()
+	if err != nil || st.Size() < headerSize+crcSize {
+		return nil, false
+	}
+	hdr := make([]byte, headerSize)
+	if _, err := f.ReadAt(hdr, 0); err != nil {
+		return nil, false
+	}
+	want := encodeHeader(seg, 0)
+	if !bytes.Equal(hdr[:headerSize-8], want[:headerSize-8]) {
+		return nil, false
+	}
+	count := binary.LittleEndian.Uint64(hdr[headerSize-8:])
+	size := uint64(st.Size())
+	if count > size || size != headerSize+count*recordSize+crcSize {
+		return nil, false
+	}
+	crc := crc32.Checksum(hdr, castagnoli)
+	buf := make([]byte, 64<<10)
+	for pos, end := int64(headerSize), int64(size-crcSize); pos < end; {
+		n := min(int64(len(buf)), end-pos)
+		if _, err := f.ReadAt(buf[:n], pos); err != nil {
+			return nil, false
+		}
+		crc = crc32.Update(crc, castagnoli, buf[:n])
+		pos += n
+	}
+	var tail [crcSize]byte
+	if _, err := f.ReadAt(tail[:], int64(size-crcSize)); err != nil || binary.LittleEndian.Uint32(tail[:]) != crc {
+		return nil, false
+	}
+	ok = true
+	return &segIndex{ref: seg, file: f, count: int(count)}, true
 }
 
 // removeOrphans deletes sidecars - of every kind, since indexes over one log share a directory -
@@ -524,12 +641,18 @@ func (x *Index) Prune() error {
 
 // Stats describes what the index holds.
 type Stats struct {
-	Segments    int
-	MappedSegs  int
-	Keys        int64
-	HeapBytes   int64 // record arrays on the heap (the newest segment, or every one without a dir)
+	Segments   int
+	MappedSegs int // sidecars mapped into memory
+	FileSegs   int // sidecars read with positioned reads (no mmap on this platform)
+	Keys       int64
+	// HeapBytes is record arrays on the heap: the newest segment, or every one without a dir.
+	HeapBytes   int64
 	MappedBytes int64 // record arrays in mapped sidecars
+	FileBytes   int64 // record arrays in file-backed sidecars
 }
+
+// OffHeapSegs is how many segments' records are in sidecars rather than on the heap.
+func (s Stats) OffHeapSegs() int { return s.MappedSegs + s.FileSegs }
 
 // Stats reports the index's current shape.
 func (x *Index) Stats() Stats {
@@ -538,8 +661,11 @@ func (x *Index) Stats() Stats {
 	var st Stats
 	for _, s := range x.segs {
 		st.Segments++
-		st.Keys += int64(len(s.recs) / recordSize)
-		if s.mapped() {
+		st.Keys += int64(s.keys())
+		if s.file != nil {
+			st.FileSegs++
+			st.FileBytes += int64(s.count) * recordSize
+		} else if s.mapped() {
 			st.MappedSegs++
 			st.MappedBytes += int64(len(s.recs))
 		} else {
