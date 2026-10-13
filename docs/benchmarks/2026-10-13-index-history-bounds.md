@@ -131,7 +131,20 @@ Reading the results:
 - **RecentRead, FULLTEXT and VECTOR (+4%).** The same per-read placement cost, which is small next to
   scoring. These stores have no memo.
 
-Re-run of RecentRead after the plan memo: pending (queued on the bench lock at the time of writing).
+Re-run with the plan memo (commit "memoize the last historical plan"), n=8, interleaved, under the lock (load
+5.92 to 7.75):
+
+```
+                         │   main    │   branch    vs main
+IndexHeadRead/HASH-16       214.1n      216.7n      +1.24%
+IndexHeadRead/BTREE-16      797.0µ      3.079µ     -99.61%
+IndexRecentRead/HASH-16     228.7n      288.1n     +25.95%   (allocs 5 -> 4, B/op 204 -> 241)
+IndexRecentRead/BTREE-16    887.5µ      11.88µ     -98.66%
+```
+
+A pinned read one commit behind head still costs about 60 ns more than on main. Main returns a memoized
+whole-namespace bucket map, one per historical cutoff, eight of them. The branch reverses that commit's
+effects for the requested key, and keeps no copies.
 
 ## Pre-existing bug found
 
