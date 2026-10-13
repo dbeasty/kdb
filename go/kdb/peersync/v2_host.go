@@ -72,7 +72,9 @@ type V2Host struct {
 	// helloAt is when the session began: the peer holds everything committed before it once it
 	// catches up, not everything committed before the last page.
 	helloAt time.Time
-	granted map[string]bool
+	// zstdPack: the session negotiated SyncCapZstdPack, so pages go to the peer compressed.
+	zstdPack bool
+	granted  map[string]bool
 	// access is each granted namespace's direction limit: "" both, wire.AccessPull or AccessPush.
 	access map[string]string
 	peer   string
@@ -167,7 +169,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome, wire.SyncCapZstdPack}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -234,15 +236,15 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		if err != nil {
 			return nil, err
 		}
+		h.mu.Lock()
+		peer, since, zstd := h.peer, h.helloAt, h.zstdPack
+		h.mu.Unlock()
 		if done && h.cfg.OnCaughtUp != nil {
-			h.mu.Lock()
-			peer, since := h.peer, h.helloAt
-			h.mu.Unlock()
 			h.cfg.OnCaughtUp(m.Namespace, peer, since)
 		}
 		return wire.PackPageMessage{
 			H: header(wire.MsgPackPage, m.H.CorrelationID), Namespace: m.Namespace,
-			Commits: commits, Stubs: stubs, Done: done,
+			Commits: commits, Stubs: stubs, Done: done, Zstd: zstd,
 		}, nil
 	case wire.RefUpdateMessage:
 		return h.refUpdate(m)
@@ -423,10 +425,14 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 			Namespace: ns, Branches: map[string]string{}, Tags: map[string]string{}, Access: access[ns],
 		})
 	}
+	caps := intersect(h.capabilities(), m.Capabilities)
+	h.mu.Lock()
+	h.zstdPack = slices.Contains(caps, wire.SyncCapZstdPack)
+	h.mu.Unlock()
 	return wire.SyncHelloAckMessage{
 		H: header(wire.MsgSyncHelloAck, m.H.CorrelationID), Accepted: true,
 		NodeID: h.cfg.NodeID, Protocol: wire.SyncProtocolVersion,
-		Capabilities: intersect(h.capabilities(), m.Capabilities), Refs: refs,
+		Capabilities: caps, Refs: refs,
 	}, nil
 }
 
