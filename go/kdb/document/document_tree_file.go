@@ -1193,4 +1193,3 @@ func SaveTreeSegment(t DocumentTree, packed []byte) error {
 	runtime.KeepAlive(h)
 	return f.writeSource(g, digest)
 }
-

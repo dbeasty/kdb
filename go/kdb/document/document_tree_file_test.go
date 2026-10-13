@@ -29,7 +29,6 @@ func packedOf(entries map[codec.UUID]codec.Hash) []byte {
 	return out
 }
 
-
 func newTestTreeFile(t *testing.T, resident int64) *TreeFile {
 	t.Helper()
 	f, err := NewTreeFile(TreeFileOptions{Dir: filepath.Join(t.TempDir(), "tree"), ResidentBytes: resident})
