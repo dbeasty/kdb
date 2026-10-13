@@ -14,8 +14,15 @@ type FileBackedPlatformIO struct {
 	config PlatformIOConfig
 	store  SegmentByteStore
 
-	globalMu       sync.Mutex
-	segmentMu      map[string]*sync.Mutex
+	globalMu sync.Mutex
+	// segmentMu holds one lock per segment. Appends, seals, restores and deletes take it
+	// exclusively; reads (and size/stamp queries) share it. A read must not see an append
+	// half-applied - a positional read racing a write can return the front of a frame without
+	// its tail - but two reads never disturb each other: OSByteStore reads with pread on a shared
+	// handle (ReadAt), which needs no lock and keeps no file position. Reads used to take the
+	// lock exclusively too, so concurrent cold reads of one segment queued behind each other for
+	// the length of every disk read.
+	segmentMu      map[string]*sync.RWMutex
 	sealedSegments map[string]struct{}
 }
 
@@ -62,17 +69,17 @@ func NewFileBackedPlatformIO(config PlatformIOConfig, store SegmentByteStore) *F
 	return &FileBackedPlatformIO{
 		config:         config,
 		store:          store,
-		segmentMu:      make(map[string]*sync.Mutex),
+		segmentMu:      make(map[string]*sync.RWMutex),
 		sealedSegments: make(map[string]struct{}),
 	}
 }
 
-func (f *FileBackedPlatformIO) mutexFor(segmentName string) *sync.Mutex {
+func (f *FileBackedPlatformIO) mutexFor(segmentName string) *sync.RWMutex {
 	f.globalMu.Lock()
 	defer f.globalMu.Unlock()
 	m, ok := f.segmentMu[segmentName]
 	if !ok {
-		m = &sync.Mutex{}
+		m = &sync.RWMutex{}
 		f.segmentMu[segmentName] = m
 	}
 	return m
@@ -130,8 +137,8 @@ func (f *FileBackedPlatformIO) ReadFromSegment(segmentName string, offset int64,
 		return nil, &PlatformIOError{Message: "negative offset or length", SegmentName: segmentName}
 	}
 	mu := f.mutexFor(segmentName)
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 	b, err := f.store.Read(segmentName, offset, length)
 	if err != nil {
 		if _, ok := err.(*PlatformIOError); ok {
@@ -142,7 +149,44 @@ func (f *FileBackedPlatformIO) ReadFromSegment(segmentName string, offset int64,
 	return b, nil
 }
 
-// SegmentSize implements storage.SegmentSizer by asking the store beneath, under the same
+// ReadFromSegmentInto implements storage.SegmentIntoReader under the same shared lock as
+// ReadFromSegment. A store with no positional read of its own is served by Read and a copy.
+func (f *FileBackedPlatformIO) ReadFromSegmentInto(segmentName string, offset int64, dst []byte) (int, error) {
+	if err := ValidateSegmentName(segmentName); err != nil {
+		return 0, err
+	}
+	if offset < 0 {
+		return 0, &PlatformIOError{Message: "negative offset or length", SegmentName: segmentName}
+	}
+	mu := f.mutexFor(segmentName)
+	mu.RLock()
+	defer mu.RUnlock()
+	n, err := readIntoStore(f.store, segmentName, offset, dst)
+	if err != nil {
+		if _, ok := err.(*PlatformIOError); ok {
+			return 0, err
+		}
+		return 0, &PlatformIOError{Message: "read failed: " + err.Error(), SegmentName: segmentName, Cause: err}
+	}
+	return n, nil
+}
+
+var _ storage.SegmentIntoReader = (*FileBackedPlatformIO)(nil)
+
+// readIntoStore reads into dst through store's positional read when it has one, and through Read
+// and a copy when it does not.
+func readIntoStore(store SegmentByteStore, segmentName string, offset int64, dst []byte) (int, error) {
+	if r, ok := store.(segmentStoreIntoReader); ok {
+		return r.ReadInto(segmentName, offset, dst)
+	}
+	b, err := store.Read(segmentName, offset, len(dst))
+	if err != nil {
+		return 0, err
+	}
+	return copy(dst, b), nil
+}
+
+// SegmentSize implements storage.SegmentSizer by asking the store beneath, under the same shared
 // per-segment lock ReadFromSegment takes so it cannot observe an append half-applied.
 func (f *FileBackedPlatformIO) SegmentSize(segmentName string) (int64, error) {
 	if err := ValidateSegmentName(segmentName); err != nil {
@@ -153,8 +197,8 @@ func (f *FileBackedPlatformIO) SegmentSize(segmentName string) (int64, error) {
 		return 0, storage.ErrSegmentSizeUnknown
 	}
 	mu := f.mutexFor(segmentName)
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 	n, err := sz.Size(segmentName)
 	if err != nil {
 		if errors.Is(err, storage.ErrSegmentSizeUnknown) {
@@ -181,8 +225,8 @@ func (f *FileBackedPlatformIO) SegmentStamp(segmentName string) (storage.Segment
 		return storage.SegmentStamp{}, false, nil
 	}
 	mu := f.mutexFor(segmentName)
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 	size, mod, ok, err := st.Stamp(segmentName)
 	if err != nil || !ok {
 		return storage.SegmentStamp{}, false, err

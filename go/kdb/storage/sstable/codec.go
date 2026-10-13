@@ -12,6 +12,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/compression"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/bufpool"
 	"github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -408,7 +409,20 @@ func (r *DefaultReader) ReadBlockAt(bh BlockHandle) ([]byte, error) {
 	if bh.Deleted {
 		return nil, fmt.Errorf("sstable: a tombstone has no block to read")
 	}
-	block, err := r.io.ReadFromSegment(r.handle.SegmentName, bh.Offset, bh.CompressedSize+blockHeaderSize)
+	size := bh.CompressedSize + blockHeaderSize
+	if into, ok := r.io.(storage.SegmentIntoReader); ok && size <= bufpool.MaxPooled {
+		// The raw block is dead once decoded - decodeBlock returns a fresh copy (uncompressed)
+		// or a fresh decompression (zstd), never a slice of its input - so it is read into a
+		// pooled buffer rather than a new one per lookup.
+		bp := bufpool.Get(size)
+		defer bufpool.Put(bp)
+		n, err := into.ReadFromSegmentInto(r.handle.SegmentName, bh.Offset, *bp)
+		if err != nil {
+			return nil, err
+		}
+		return decodeBlock((*bp)[:n])
+	}
+	block, err := r.io.ReadFromSegment(r.handle.SegmentName, bh.Offset, size)
 	if err != nil {
 		return nil, err
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/bufpool"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -814,6 +815,64 @@ func (r *DefaultReader) intactFrameAtOffset(segmentName string, offset int64) (b
 // commitAtOffset decodes the single frame starting at offset, reading only
 // that frame's bytes.
 func (r *DefaultReader) commitAtOffset(segmentName string, offset int64) (document.Commit, error) {
+	return r.readCommitFrame(segmentName, offset)
+}
+
+// frameProbeBytes is how much readCommitFrame reads on its first try: enough for the header and,
+// for most commits, the whole frame, so one read usually suffices where two always did.
+const frameProbeBytes = 4 << 10
+
+// readCommitFrame decodes the single frame at offset, reading only that frame's bytes.
+//
+// Through a shim that can read into the caller's buffer (storage.SegmentIntoReader) the frame
+// is read into a pooled buffer - and usually in one read, since the first one fetches
+// frameProbeBytes and most frames fit - then decoded and the buffer returned. That is safe because
+// nothing the decode returns refers to the frame's bytes: see PageCodec.parseCommit. Otherwise,
+// and for a frame too large to pool, it reads the header and then the frame, as it always has.
+func (r *DefaultReader) readCommitFrame(segmentName string, offset int64) (document.Commit, error) {
+	into, ok := r.shim.(storage.SegmentIntoReader)
+	if !ok {
+		return r.readCommitFrameAlloc(segmentName, offset)
+	}
+	bp := bufpool.Get(frameProbeBytes)
+	n, err := into.ReadFromSegmentInto(segmentName, offset, *bp)
+	if err != nil {
+		bufpool.Put(bp)
+		return document.Commit{}, err
+	}
+	if n < PageFrameHeaderSize {
+		bufpool.Put(bp)
+		return document.Commit{}, &CorruptFrameError{Offset: int(offset), Reason: "segment ends inside the frame header"}
+	}
+	frameLen := PageFrameHeaderSize + readIntBE(*bp, 8)
+	if frameLen > n && n == len(*bp) {
+		// The frame continues past the probe.
+		if frameLen > bufpool.MaxPooled {
+			bufpool.Put(bp)
+			return r.readCommitFrameAlloc(segmentName, offset)
+		}
+		big := bufpool.Get(frameLen)
+		copy(*big, (*bp)[:n])
+		bufpool.Put(bp)
+		bp = big
+		m, err := into.ReadFromSegmentInto(segmentName, offset+int64(n), (*bp)[n:])
+		if err != nil {
+			bufpool.Put(bp)
+			return document.Commit{}, err
+		}
+		n += m
+	}
+	if n > frameLen {
+		n = frameLen
+	}
+	commit, err := DecodeFrame((*bp)[:n], int(offset))
+	bufpool.Put(bp)
+	return commit, err
+}
+
+// readCommitFrameAlloc is readCommitFrame through plain ReadFromSegment: a header read, then the
+// frame into a fresh buffer.
+func (r *DefaultReader) readCommitFrameAlloc(segmentName string, offset int64) (document.Commit, error) {
 	header, err := r.shim.ReadFromSegment(segmentName, offset, PageFrameHeaderSize)
 	if err != nil {
 		return document.Commit{}, err
@@ -859,21 +918,7 @@ func (r *DefaultReader) StreamCommits(segment storage.DeltaSegmentRef, fn func(d
 // costs one commit, not the segment.
 func (r *DefaultReader) ReadCommitAt(segment storage.DeltaSegmentRef, frameOffset int64) (document.Commit, error) {
 	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
-	header, err := r.shim.ReadFromSegment(segmentName, frameOffset, PageFrameHeaderSize)
-	if err != nil {
-		return document.Commit{}, err
-	}
-	if len(header) < PageFrameHeaderSize {
-		return document.Commit{}, &CorruptFrameError{
-			Offset: int(frameOffset), Reason: "segment ends inside the frame header",
-		}
-	}
-	frameLen := PageFrameHeaderSize + readIntBE(header, 8)
-	raw, err := r.shim.ReadFromSegment(segmentName, frameOffset, frameLen)
-	if err != nil {
-		return document.Commit{}, err
-	}
-	return DecodeFrame(raw, int(frameOffset))
+	return r.readCommitFrame(segmentName, frameOffset)
 }
 
 // LegacySegmentFormatError reports a data directory containing delta

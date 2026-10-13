@@ -54,6 +54,7 @@ func (e *ServerEngine) SetMemoryBudgetBytes(budgetBytes int64) {
 	}
 	if e.blobStore != nil {
 		e.blobStore.SetIndexCacheBudget(int64(float64(budgetBytes) * storage.DefaultSSTableIndexFraction))
+		e.blobStore.SetBlockCacheBudget(int64(float64(budgetBytes) * storage.DefaultBlockCacheFraction))
 	}
 	if e.config.MemtableFlushBytes <= 0 {
 		e.memtableFlushOverride.Store(int64(float64(budgetBytes) * storage.DefaultMemtableFraction))
@@ -84,6 +85,11 @@ func (e *ServerEngine) MemoryDemandBytes() int64 {
 	}
 	if e.memTable != nil {
 		resident += e.memTable.SizeBytes()
+	}
+	if e.blobStore != nil {
+		// Decoded SSTable blocks: a cache, but resident bytes all the same, and the arbiter
+		// cannot weigh what it is not told about.
+		resident += e.blobStore.BlockCacheBytes()
 	}
 	now := e.coldLoads.Load()
 	missed := now > e.lastColdLoads.Load()

@@ -162,6 +162,9 @@ func (mgr *Manager) Delete(key codec.Hash) {
 	mgr.active.Delete(key)
 }
 
+// Get returns the value for key from the newest generation that has one. The result is
+// read-only: a value served from an SSTable may be the block cache's shared copy (see
+// sstable.LsmBlobStore.Lookup).
 func (mgr *Manager) Get(key codec.Hash) []byte {
 	mgr.mu.Lock()
 	active := mgr.active

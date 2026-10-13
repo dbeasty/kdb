@@ -1,6 +1,7 @@
 package compression
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -85,21 +86,63 @@ func Compress(input []byte, level int) ([]byte, error) {
 	return pe.enc.EncodeAll(input, make([]byte, 0, len(input))), nil
 }
 
-// Decompress ZSTD-decompresses input, enforcing maxOutputSize (default 64MiB).
+// Decompress ZSTD-decompresses input, enforcing maxOutputSize (default 64MiB). The result is a
+// fresh slice the caller owns.
 func Decompress(input []byte, maxOutputSize int) ([]byte, error) {
+	return DecompressInto(nil, input, maxOutputSize)
+}
+
+// ErrOutputTooLarge reports a frame that decodes, or declares it decodes, to more than the limit.
+var ErrOutputTooLarge = errors.New("zstd: decompressed size exceeds the limit")
+
+// DecompressInto ZSTD-decompresses input into dst's storage when it is large enough, and into a
+// buffer of exactly the decoded size otherwise, enforcing maxOutputSize (default 64MiB). The
+// result may alias dst.
+//
+// The limit is enforced *before* decoding. Every frame this codebase writes - and every frame
+// Kotlin's zstd-jni writes - declares its content size in the frame header, so that size is
+// checked against the limit first, and a frame claiming more is refused without allocating
+// anything for it. A frame within the limit is decoded into a destination of exactly its declared
+// size, which the decoder then never needs to regrow; a frame that decodes to more than it
+// declared is stopped by the decoder within one block (ErrFrameSizeExceeded).
+//
+// This used to call DecodeAll(input, nil) and check the limit only after the whole output -
+// however large - had been materialised. For a frame declaring its size the decoder allocated
+// that size up front, so a corrupt header claiming a gigabyte cost a gigabyte before failing.
+//
+// A frame with no declared size keeps the old behaviour - decode, then check - since nothing
+// before decoding says how big it is. So does each frame after the first in a multi-frame input.
+//
+// One shared decoder serves every call. A second one, configured to stop at cap(dst), was tried
+// and dropped: each zstd.Decoder carries several megabytes of per-concurrency state, and the
+// second one showed up as a constant ~4.8 MB in TestOpenCostPerCommitDoesNotGrow.
+func DecompressInto(dst, input []byte, maxOutputSize int) ([]byte, error) {
 	if maxOutputSize <= 0 {
 		maxOutputSize = defaultMaxOutput
+	}
+	var hdr zstd.Header
+	if err := hdr.Decode(input); err == nil && hdr.HasFCS && !hdr.Skippable {
+		if hdr.FrameContentSize > uint64(maxOutputSize) {
+			return nil, fmt.Errorf("%w: frame declares %d bytes, limit %d",
+				ErrOutputTooLarge, hdr.FrameContentSize, maxOutputSize)
+		}
+		if size := int(hdr.FrameContentSize); cap(dst) < size {
+			dst = make([]byte, 0, size)
+		}
+	}
+	if dst != nil {
+		dst = dst[:0]
 	}
 	dec, err := sharedDecoder()
 	if err != nil {
 		return nil, err
 	}
-	out, err := dec.DecodeAll(input, nil)
+	out, err := dec.DecodeAll(input, dst)
 	if err != nil {
 		return nil, err
 	}
 	if len(out) > maxOutputSize {
-		return nil, fmt.Errorf("decompressed size %d exceeds max %d", len(out), maxOutputSize)
+		return nil, fmt.Errorf("%w: decoded %d bytes, limit %d", ErrOutputTooLarge, len(out), maxOutputSize)
 	}
 	return out, nil
 }

@@ -256,6 +256,32 @@ func (s *OSByteStore) Read(segmentName string, offset int64, length int) ([]byte
 	}
 }
 
+// ReadInto implements segmentStoreIntoReader: a positional read into dst, sharing the cached read
+// handle exactly as Read does. Unlike Read it needs no stat - dst's length is the caller's bound,
+// and a short read at the end of the file is simply reported as such.
+func (s *OSByteStore) ReadInto(segmentName string, offset int64, dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	for attempt := 0; ; attempt++ {
+		f, cached, err := s.readHandle(segmentName)
+		if err != nil {
+			return 0, err
+		}
+		n, err := f.ReadAt(dst, offset)
+		if !cached {
+			_ = f.Close()
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return n, nil
+		}
+		if err != nil && cached && attempt == 0 && errors.Is(err, os.ErrClosed) {
+			continue
+		}
+		return n, err
+	}
+}
+
 // readHandle returns a handle for reading segmentName and whether it is the shared cached one
 // (which the caller must not close).
 func (s *OSByteStore) readHandle(segmentName string) (*os.File, bool, error) {
@@ -296,9 +322,30 @@ func (s *OSByteStore) dropReader(segmentName string) {
 	}
 }
 
+// statFreeReadBytes is the largest read readAtClamped serves without first stat-ing the file.
+const statFreeReadBytes = 64 << 10
+
 // readAtClamped reads up to length bytes at offset with a positional read, so concurrent readers
 // share one handle without disturbing each other's position.
 func readAtClamped(f *os.File, offset int64, length int) ([]byte, error) {
+	if length <= statFreeReadBytes {
+		// A small read - a frame header, an SSTable block, a footer - allocates what it asked
+		// for and skips the stat: the clamp below exists for huge upper-bound requests, and for
+		// these it cost a syscall per read to save at most a few KiB.
+		buf := make([]byte, length)
+		n, err := f.ReadAt(buf, offset)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return nil, err
+		}
+		if n < length/2 {
+			// Mostly past the end of the file: don't hand back (and let the caller retain) a
+			// buffer mostly made of nothing.
+			out := make([]byte, n)
+			copy(out, buf[:n])
+			return out, nil
+		}
+		return buf[:n], nil
+	}
 	// Clamp to what the file actually holds before allocating. Callers that want
 	// "the whole segment" pass a length that is an upper bound rather than a real
 	// size - delta.DefaultReader.scanSegmentRef passes 1<<28 - and allocating that
