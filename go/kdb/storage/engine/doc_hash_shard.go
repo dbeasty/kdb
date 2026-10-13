@@ -221,6 +221,11 @@ func (s *shardedDocByHashStore) Put(h codec.Hash, doc document.Document) {
 	if n, ok := sh.pinned[h]; ok {
 		r.pins = n
 		delete(sh.pinned, h)
+		// Placeholders drain as the live tree is read in; a full read pass empties the map, and
+		// a Go map keeps its peak size (56 B a slot at a million documents) until rebuilt.
+		if sh.pinnedPeak > docShrinkMinEntries && len(sh.pinned)*2 < sh.pinnedPeak {
+			sh.shrinkPinnedLocked()
+		}
 	}
 	if r.pins == 0 {
 		sh.lruPushFront(i)
@@ -667,16 +672,22 @@ const docShrinkMinEntries = 256
 // million versions and now holds a thousand would otherwise keep the million's footprint.
 func (sh *docHashShard) maybeShrinkIndexesLocked() {
 	if sh.pinnedPeak > docShrinkMinEntries && len(sh.pinned)*2 < sh.pinnedPeak {
-		m := make(map[codec.Hash]int32, len(sh.pinned))
-		for k, v := range sh.pinned {
-			m[k] = v
-		}
-		sh.pinned = m
-		sh.pinnedPeak = len(m)
+		sh.shrinkPinnedLocked()
 	}
 	if len(sh.slots) > docShrinkMinEntries && sh.usedSlots*2 < len(sh.slots) {
 		sh.repackSlotsLocked()
 	}
+}
+
+// shrinkPinnedLocked rebuilds the placeholder map at its current size. Amortised O(1): it runs
+// only after the map has halved since the last rebuild.
+func (sh *docHashShard) shrinkPinnedLocked() {
+	m := make(map[codec.Hash]int32, len(sh.pinned))
+	for k, v := range sh.pinned {
+		m[k] = v
+	}
+	sh.pinned = m
+	sh.pinnedPeak = len(m)
 }
 
 // repackSlotsLocked moves the used slot records to the front of a right-sized array, keeping
