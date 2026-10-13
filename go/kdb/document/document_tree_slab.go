@@ -103,9 +103,9 @@ func slabChunkLen(k int) int {
 type slabPool[R any] struct {
 	chunks atomic.Pointer[[][]R]
 	counts atomic.Pointer[[][]uint32] // reference counts, chunked as the records are
-	used   uint32   // slots below this have been handed out at some time; under the slab lock
-	cap    uint32   // slots below this are addressable; under the slab lock
-	free   []uint32 // freed slots; under the slab lock
+	used   uint32                     // slots below this have been handed out at some time; under the slab lock
+	cap    uint32                     // slots below this are addressable; under the slab lock
+	free   []uint32                   // freed slots; under the slab lock
 }
 
 func (p *slabPool[R]) dir() [][]R {

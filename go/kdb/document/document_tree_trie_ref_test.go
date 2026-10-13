@@ -38,7 +38,6 @@ import (
 // showed costs ~81us at 2000 entries and isn't the bottleneck. Only
 // TreeHash's computation changes.
 
-
 // A ptrNode is either a leaf or an internal node (or neither, for a nil
 // *ptrNode representing an empty subtree - callers use nil directly rather
 // than allocating a ptrNode for that case).
@@ -71,13 +70,11 @@ type ptrLeaf struct {
 	hash codec.Hash
 }
 
-
 // Both hashers build their preimage in a fixed-size array rather than a
 // make()d slice. The buffer never escapes past sha256.Sum256, so it stays on
 // the stack - which matters because ptrInternalHash runs once per trie level and
 // the trie is trieDepth (32) levels deep, so a heap buffer here cost ~16KB of
 // garbage per single-document put or delete.
-
 
 func ptrInternalHash(children *[16]*ptrNode) [32]byte {
 	var buf [1 + 16*32]byte
