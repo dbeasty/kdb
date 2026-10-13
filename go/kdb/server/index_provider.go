@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -115,6 +116,10 @@ func (p *RegistryIndexProvider) ExactLookup(ctx sql.QueryContext, field string, 
 		return nil, false, nil
 	}
 	ids, err := store.Lookup(key, ctx.AtCommit)
+	if errors.Is(err, index.ErrHistoryUnavailable) {
+		// The index no longer holds this commit's history: let the executor scan the documents.
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, true, err
 	}
@@ -138,6 +143,9 @@ func (p *RegistryIndexProvider) ExactCount(ctx sql.QueryContext, field string, v
 		return 0, false, nil
 	}
 	n, err := counter.LookupCount(key, ctx.AtCommit)
+	if errors.Is(err, index.ErrHistoryUnavailable) {
+		return 0, false, nil
+	}
 	if err != nil {
 		return 0, true, err
 	}
@@ -161,6 +169,9 @@ func (p *RegistryIndexProvider) RangeLookup(ctx sql.QueryContext, field string, 
 		return nil, false, nil
 	}
 	ids, err := store.Range(from, to, ctx.AtCommit, 0, true)
+	if errors.Is(err, index.ErrHistoryUnavailable) {
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, true, err
 	}

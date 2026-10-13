@@ -370,8 +370,38 @@ func (r *Registry) RebuildFromScan(scan ScanFunc, headCommit codec.Hash, only []
 	if applyErr != nil {
 		return stats, applyErr
 	}
+	// The rebuilt content is head's, with no history behind it: a store that keeps history must
+	// not answer a read at an older commit by replaying these entries as if they were made then.
+	for _, e := range selected {
+		if hf, ok := e.store.(historyForgetter); ok {
+			hf.ForgetHistory()
+		}
+	}
 	r.MarkCommit(headCommit)
 	return stats, nil
+}
+
+// historyForgetter is a store that keeps history and can be told its content has none.
+type historyForgetter interface{ ForgetHistory() }
+
+// headRepairer is a store that can lose its head state (see MemoryStore.NeedsRebuild).
+type headRepairer interface{ NeedsRebuild() bool }
+
+// NeedingRebuild returns the ids of the stores that can no longer answer at the DAG head and
+// must be rebuilt with RebuildFromScan. It brings every store that maintains a head state up to
+// the DAG head first, so the commit path calling it after each commit keeps those states current
+// and finds out at once when one cannot be.
+func (r *Registry) NeedingRebuild() []codec.UUID {
+	r.mu.RLock()
+	entries := append([]*registryEntry(nil), r.entries...)
+	r.mu.RUnlock()
+	var out []codec.UUID
+	for _, e := range entries {
+		if hr, ok := e.store.(headRepairer); ok && hr.NeedsRebuild() {
+			out = append(out, e.desc.IndexID)
+		}
+	}
+	return out
 }
 
 func containsID(ids []codec.UUID, id codec.UUID) bool {

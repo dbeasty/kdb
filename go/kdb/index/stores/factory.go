@@ -15,6 +15,8 @@ import (
 
 // Options tunes the stores the factory creates.
 type Options struct {
+	// Keyed tunes HASH and BTREE stores (how much history they keep for as-of reads).
+	Keyed    index.MemoryOptions
 	FullText fulltext.Options
 	Vector   vector.Options
 }
@@ -25,7 +27,7 @@ func NewFactory(d *dag.InMemoryCommitDag, opts Options) index.StoreFactory {
 	return index.StoreFactoryFunc(func(desc index.Descriptor) (index.Store, error) {
 		switch desc.Type {
 		case index.IndexTypeHash, index.IndexTypeBTree:
-			return index.NewMemoryStore(desc, d), nil
+			return index.NewMemoryStoreWithOptions(desc, d, opts.Keyed), nil
 		case index.IndexTypeFullText:
 			return fulltext.NewFullTextStore(desc, d, opts.FullText)
 		case index.IndexTypeVector:
