@@ -42,6 +42,8 @@ type KdbServerRuntime struct {
 	// maxResultRows is the most rows one SQL reply may carry (see MaxResultRows). Atomic so a
 	// live settings change cannot race the readers on the wire path.
 	maxResultRows atomic.Int64
+	// maxResultBytes is the most encoded row bytes one SQL reply may carry (see MaxResultBytes).
+	maxResultBytes atomic.Int64
 
 	TransactionEngine transaction.Engine
 	// UpsertEngine commits with ConflictPolicyLastWrite, backing Upsert below - component 40
@@ -176,6 +178,14 @@ type KdbServerRuntime struct {
 	// MaxConnections caps concurrently-accepted connections on listeners this runtime serves
 	// (kdb-spec-layer13 Component 49 §6.5); 0 means unlimited. Set before calling ListenSqlWire.
 	MaxConnections int
+	// MaxQueuedReplyBytesPerConn bounds the encoded reply bytes one wire connection may have
+	// waiting to be written before its reader stops taking new frames (MaxQueuedReplyBytes).
+	// 0 selects DefaultMaxQueuedReplyBytes; negative disables the bound. Set before listening.
+	MaxQueuedReplyBytesPerConn int64
+	// ReplyWriteTimeout bounds each reply write on the listeners this runtime serves; a peer
+	// that does not read for this long is disconnected. 0 selects core.DefaultWriteTimeout;
+	// negative disables the bound. Set before listening.
+	ReplyWriteTimeout time.Duration
 
 	// UniqueKeys enforces unique-declared schema fields across every writer on this runtime.
 	// Shared by TransactionEngine and UpsertEngine - see NewKdbServerRuntime.

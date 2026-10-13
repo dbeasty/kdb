@@ -62,6 +62,14 @@ func classifyError(err error) (wire.ErrorCode, *int) {
 		// as much next time.
 		return wire.ErrorCodeResourceExhausted, nil
 	}
+	var tooLarge *ReplyTooLargeError
+	if errors.As(err, &tooLarge) {
+		return wire.ErrorCodeResourceExhausted, nil
+	}
+	var frameTooLarge *wire.FrameTooLargeError
+	if errors.As(err, &frameTooLarge) {
+		return wire.ErrorCodeResourceExhausted, nil
+	}
 	var tooManyRows *sql.ResultRowLimitError
 	if errors.As(err, &tooManyRows) {
 		// The same query returns the same too-large result next time; only a LIMIT or a
