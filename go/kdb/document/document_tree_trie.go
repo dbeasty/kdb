@@ -339,6 +339,7 @@ func (s *trieSlab) commit(e *trieEdit, r tref) *trieTree {
 		return nil
 	}
 	s.mu.Lock()
+	s.drain(drainPerUpdate)
 	r = s.place(e, r)
 	s.retain(r)
 	s.mu.Unlock()

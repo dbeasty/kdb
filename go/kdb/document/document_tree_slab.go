@@ -153,6 +153,12 @@ type trieSlab struct {
 	nodes  slabPool[nodeRec]
 	leaves slabPool[leafRec]
 
+	// Roots of dropped trees awaiting release, under their own lock so a cleanup never waits on
+	// an update (see dropTrieRoot). pendingN mirrors len(pending) for a lock-free check.
+	pendMu   sync.Mutex
+	pending  []tref
+	pendingN atomic.Int32
+
 	reused uint64 // slots handed out again after being freed
 
 	// For counted: records created, and whether slots were added, since the last GC cycle seen.
@@ -225,6 +231,9 @@ func (s *trieSlab) release(r tref) {
 	case r&refLeaf != 0:
 		i := uint32(r &^ refLeaf)
 		l := s.leaves.at(i)
+		if l.rc == 0 {
+			panic("document: trie slab leaf released more often than retained")
+		}
 		if l.rc--; l.rc == 0 {
 			if slabPoison.Load() {
 				l.hash, l.content = slabPoisonHash, codec.Hash{Bytes: slabPoisonHash}
@@ -233,6 +242,9 @@ func (s *trieSlab) release(r tref) {
 		}
 	default:
 		n := s.nodes.at(uint32(r))
+		if n.rc == 0 {
+			panic("document: trie slab node released more often than retained")
+		}
 		if n.rc--; n.rc == 0 {
 			children := n.child
 			if slabPoison.Load() {
@@ -333,12 +345,49 @@ type trieDrop struct {
 }
 
 // dropTrieRoot runs (on the runtime's cleanup goroutine) once a handle is unreachable: it gives
-// back the handle's reference to its root, freeing whatever only that tree held.
+// back the handle's reference to its root, freeing whatever only that tree held. A collection
+// can drop a whole burst of versions at once, and taking the slab lock for each would hand it
+// back and forth with a writer once per version; so the root is queued, and the queue is
+// drained here only when the slab lock is free. A writer finding roots queued releases a few
+// before each update (drainSome), so the queue cannot outrun the updates making it.
 func dropTrieRoot(d trieDrop) {
-	d.slab.mu.Lock()
-	d.slab.release(d.root)
-	d.slab.mu.Unlock()
+	s := d.slab
+	s.pendMu.Lock()
+	s.pending = append(s.pending, d.root)
+	s.pendingN.Store(int32(len(s.pending)))
+	s.pendMu.Unlock()
+	if s.mu.TryLock() {
+		s.drain(-1)
+		s.mu.Unlock()
+	}
 }
+
+// drain releases up to limit queued roots (all of them when limit < 0). Under s.mu.
+func (s *trieSlab) drain(limit int) {
+	for limit != 0 && s.pendingN.Load() > 0 {
+		var take [64]tref
+		n := len(take)
+		if limit > 0 && limit < n {
+			n = limit
+		}
+		s.pendMu.Lock()
+		n = min(n, len(s.pending))
+		copy(take[:], s.pending[len(s.pending)-n:])
+		s.pending = s.pending[:len(s.pending)-n]
+		s.pendingN.Store(int32(len(s.pending)))
+		s.pendMu.Unlock()
+		for _, r := range take[:n] {
+			s.release(r)
+		}
+		if limit > 0 {
+			limit -= n
+		}
+	}
+}
+
+// drainPerUpdate is how many queued roots an update releases before placing its own records:
+// more than the one version each update drops, so a backlog shrinks.
+const drainPerUpdate = 4
 
 // adopt wraps root, whose count the caller has already raised by one for this handle (under the
 // lock), in a handle that gives that reference back when it becomes unreachable. A zero root is
@@ -366,9 +415,10 @@ func (s *trieSlab) chunkBytes() int64 {
 
 // slabStats describes a slab's occupancy, for tests and measurement.
 type slabStats struct {
-	Nodes, Leaves         int // records in use
+	Nodes, Leaves         int // records in use (including those of queued roots)
 	FreeNodes, FreeLeaves int
 	Reused                int // slots handed out again after being freed
+	Pending               int // dropped roots not yet released
 	Bytes                 int // chunk memory
 }
 
@@ -379,6 +429,7 @@ func (s *trieSlab) stats() slabStats {
 		FreeNodes:  len(s.nodes.free),
 		FreeLeaves: len(s.leaves.free),
 		Reused:     int(s.reused),
+		Pending:    int(s.pendingN.Load()),
 	}
 	if s.nodes.used > 0 {
 		st.Nodes = int(s.nodes.used) - 1 - st.FreeNodes

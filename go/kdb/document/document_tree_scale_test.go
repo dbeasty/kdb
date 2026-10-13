@@ -151,6 +151,29 @@ func measureTreeScale(t *testing.T, n int) {
 		}
 	}
 	withoutNs := float64(time.Since(t0).Nanoseconds()) / dels
+	if os.Getenv("KDB_TREE_SCALE_DEBUG") != "" {
+		t0 = time.Now()
+		d2 := tree
+		for i := 0; i < dels; i++ {
+			if d2, err = d2.Without(sample[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Logf("without on the opened tree: %.0fns", float64(time.Since(t0).Nanoseconds())/dels)
+		runtime.KeepAlive(d2)
+		d2 = DocumentTree{}
+		runtime.GC()
+		time.Sleep(200 * time.Millisecond)
+		t0 = time.Now()
+		d3 := cur
+		for i := 0; i < dels; i++ {
+			if d3, err = d3.Without(sample[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Logf("without on the updated tree after a settle: %.0fns", float64(time.Since(t0).Nanoseconds())/dels)
+		runtime.KeepAlive(d3)
+	}
 	del = DocumentTree{}
 
 	// Keyset pages of 100 from random positions.

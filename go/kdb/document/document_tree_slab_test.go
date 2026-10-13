@@ -225,6 +225,9 @@ func waitForCleanups(s *trieSlab, want int) {
 	for i := 0; i < 200; i++ {
 		runtime.GC()
 		time.Sleep(2 * time.Millisecond)
+		s.mu.Lock()
+		s.drain(-1)
+		s.mu.Unlock()
 		if st := s.stats(); st.Nodes+st.Leaves <= want {
 			return
 		}
