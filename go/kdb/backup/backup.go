@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
-	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/integrity"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/delta"
@@ -158,7 +157,10 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 	// means a refused backup uploads nothing: not even a full segment under the shared key a base
 	// backup's manifest names (an incremental used to overwrite that with the damaged segment's
 	// shorter prefix, corrupting the base).
-	allCommits := map[string]document.Commit{}
+	// The commit count and the tips are worked out as the segments stream past (logTips), not
+	// from every commit of every segment held at once: that map held the whole log, operations
+	// and all, in memory for the length of the backup (plan bug 4).
+	heads := newLogTips()
 	prefixLen := make([]int, len(seqs))
 	for i, seq := range seqs {
 		prefix, commits, err := integrity.VerifiedSegmentPrefix(shim, namespaceID, seq)
@@ -175,7 +177,7 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 		}
 		prefixLen[i] = len(prefix)
 		for _, c := range commits {
-			allCommits[c.CommitHash.Hex()] = c.Commit
+			heads.add(c.CommitHash, c.Commit.ParentHashes)
 		}
 	}
 
@@ -230,8 +232,8 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 		})
 	}
 
-	m.CommitCount = len(allCommits)
-	for i, tip := range tips(allCommits) {
+	m.CommitCount = heads.count()
+	for i, tip := range heads.tips() {
 		name := "main"
 		if i > 0 {
 			name = fmt.Sprintf("tip-%d", i)
@@ -411,18 +413,52 @@ func ListBackups(store ObjectStore, namespaceID string) ([]string, error) {
 // tips returns the hex hashes of every commit that is not any other commit's parent - the
 // head(s) of the backed-up history, recorded informationally in the manifest (replay derives
 // the real head on open; this lets an operator eyeball what a backup contains).
-func tips(all map[string]document.Commit) []string {
-	isParent := map[string]bool{}
-	for _, c := range all {
-		for _, p := range c.ParentHashes {
-			isParent[p.Hex()] = true
+// logTips works out, from a log streamed past it one commit at a time, how many distinct commits
+// it holds and which of them no other commit names as a parent - the log's heads - without
+// holding the commits.
+//
+// What it does hold is pointer-free and small: each distinct commit's hash (32 bytes - a log may
+// carry the same commit in more than one frame, a re-logged deepen say, and an exact count has to
+// recognise the repeat), the current tips, and the parents named before their own commit arrived
+// (a shallow root's missing parents, history logged below a root after it). The tips and the
+// early-named parents are the frontier; the hashes are the one part that grows with the log, at
+// 32 bytes a commit against the whole commit - operations included - the map it replaces held.
+type logTips struct {
+	seen  map[[32]byte]struct{}
+	heads map[[32]byte]struct{}
+	named map[[32]byte]struct{} // named as a parent, not seen yet
+}
+
+func newLogTips() *logTips {
+	return &logTips{seen: map[[32]byte]struct{}{}, heads: map[[32]byte]struct{}{}, named: map[[32]byte]struct{}{}}
+}
+
+func (l *logTips) add(h codec.Hash, parents []codec.Hash) {
+	if _, dup := l.seen[h.Bytes]; dup {
+		return
+	}
+	l.seen[h.Bytes] = struct{}{}
+	for _, p := range parents {
+		if _, ok := l.seen[p.Bytes]; ok {
+			delete(l.heads, p.Bytes)
+		} else {
+			l.named[p.Bytes] = struct{}{}
 		}
 	}
-	var out []string
-	for h := range all {
-		if !isParent[h] {
-			out = append(out, h)
-		}
+	if _, ok := l.named[h.Bytes]; ok {
+		delete(l.named, h.Bytes)
+	} else {
+		l.heads[h.Bytes] = struct{}{}
+	}
+}
+
+func (l *logTips) count() int { return len(l.seen) }
+
+// tips returns the heads as hex, sorted.
+func (l *logTips) tips() []string {
+	out := make([]string, 0, len(l.heads))
+	for h := range l.heads {
+		out = append(out, codec.Hash{Bytes: h}.Hex())
 	}
 	sort.Strings(out)
 	return out

@@ -71,6 +71,9 @@ type Config struct {
 	Idle *IdleConfig
 	// Debounce, MaxBackoff and Timeout tune the replicator (see replication.Config).
 	Debounce, MaxBackoff, Timeout time.Duration
+	// MaxPeerConnections caps the connections Listen accepts at once. 0 means
+	// server.DefaultPeerSyncMaxConnections; negative means unlimited.
+	MaxPeerConnections int
 }
 
 // IdleConfig is Config.Idle; see server.IdlePolicy.
@@ -139,6 +142,9 @@ func Open(host *embed.Host, set *server.NamespaceSet, primary *server.KdbServerR
 	n := &Node{host: host, set: set, primary: primary, cfg: cfg, stopExpiry: make(chan struct{})}
 	primary.Namespaces = set
 	primary.PeerAuthorizeDocuments = cfg.AuthorizePushedDocuments
+	if cfg.MaxPeerConnections != 0 {
+		primary.PeerSyncMaxConnections = cfg.MaxPeerConnections
+	}
 	primary.HandoverPolicy = cfg.HandoverPolicy
 	primary.Runtime.SetPeerRetentionFloor(n.peerFloorFor(primary))
 

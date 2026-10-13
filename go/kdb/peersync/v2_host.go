@@ -52,6 +52,11 @@ type V2HostConfig struct {
 	// page of a fetch, after which the peer holds everything this node's refs named. It is how a
 	// node learns what inbound peers have, for peer-aware retention.
 	OnCaughtUp func(ns, peer string, since time.Time)
+	// MaxGraftPushBytes bounds the document bytes one session may push for a graft (GRAFT_PUSH).
+	// The pages are staged on disk as they arrive, but verifying and storing the graft then holds
+	// its whole state in memory (storage.ForeignTreeStore takes every body at once), so this is
+	// what bounds that. 0 means DefaultMaxGraftPushBytes; negative means unlimited.
+	MaxGraftPushBytes int64
 	// WriteBack, when set, applies a filtered projection's local write to its source namespace
 	// as principal, and says what became of it. An error means the source could not decide now
 	// (unavailable, not the home): it goes back as PEER_ERROR and the replica tries again later.
@@ -83,8 +88,8 @@ type V2Host struct {
 	// access is each granted namespace's direction limit: "" both, wire.AccessPull or AccessPush.
 	access map[string]string
 	peer   string
-	// grafts stages GRAFT_PUSH pages per namespace until the last one arrives.
-	grafts map[string][]wire.SnapshotPageMessage
+	// grafts stages GRAFT_PUSH pages per namespace, on disk, until the last one arrives.
+	grafts map[string]*graftStage
 	// boundaryGaps are, per namespace, the parents behind this node's snapshot root that a push
 	// on this session was refused for (parent -> the pushed commit naming it). A GRAFT_PUSH of
 	// one of them is a boundary extension, not a graft (boundary.go).
@@ -573,9 +578,28 @@ func (h *V2Host) authorizePushedDocuments(ns string, commits []document.Commit) 
 	return nil
 }
 
-// maxGraftPushBytes bounds what one session may stage for a pushed graft: the state is held in
-// memory until the last page lets it be verified.
-const maxGraftPushBytes = 1 << 30
+// DefaultMaxGraftPushBytes is V2HostConfig.MaxGraftPushBytes when unset. It was a fixed 1 GiB of
+// pages held in memory per session; the pages are now staged on disk, and the cap bounds what the
+// final graft holds while it verifies and stores the state.
+const DefaultMaxGraftPushBytes = 256 << 20
+
+func (h *V2Host) maxGraftPushBytes() int64 {
+	switch m := h.cfg.MaxGraftPushBytes; {
+	case m < 0:
+		return 0
+	case m == 0:
+		return DefaultMaxGraftPushBytes
+	default:
+		return m
+	}
+}
+
+// graftStage is one namespace's pushed graft in flight: its pages, staged on disk.
+type graftStage struct {
+	spool  *pageSpool
+	commit document.Commit
+	served int // documents handed back to the graft so far
+}
 
 // graftPush stages one GRAFT_PUSH page and, on the last, grafts the pushed root (see Graft).
 func (h *V2Host) graftPush(m wire.GraftPushMessage) (wire.Message, error) {
@@ -585,51 +609,101 @@ func (h *V2Host) graftPush(m wire.GraftPushMessage) (wire.Message, error) {
 		return nil, err
 	}
 	reply := wire.GraftPushResultMessage{H: header(wire.MsgGraftPushResult, m.H.CorrelationID), Namespace: ns}
-	h.mu.Lock()
-	if h.grafts == nil {
-		h.grafts = map[string][]wire.SnapshotPageMessage{}
+	stage, err := h.stageGraftPage(env, m.Page)
+	if err != nil || stage == nil {
+		return reply, err
 	}
-	pages := append(h.grafts[ns], m.Page)
-	size := 0
-	for _, p := range pages {
-		for _, d := range p.Docs {
-			size += len(d.Body)
-		}
+	defer stage.spool.close()
+	next, err := stage.spool.reader(DefaultPageBytes, -1)
+	if err != nil {
+		return nil, err
 	}
-	if m.Page.Done || size > maxGraftPushBytes {
-		delete(h.grafts, ns)
-	} else {
-		h.grafts[ns] = pages
-	}
-	h.mu.Unlock()
-	if size > maxGraftPushBytes {
-		return nil, fmt.Errorf("peer sync: a pushed graft of %s exceeds %d bytes", ns, maxGraftPushBytes)
-	}
-	if !m.Page.Done {
-		return reply, nil
-	}
-	next := 0
+	// The staged pages are served back in batches of DefaultPageBytes rather than as they were
+	// pushed; a batch is what a page is to Graft (docs in id order, the same commit on each), and
+	// the last one says Done.
 	fetch := func(string) (wire.SnapshotPageMessage, error) {
-		if next >= len(pages) {
+		docs, err := next()
+		if err != nil {
+			return wire.SnapshotPageMessage{}, err
+		}
+		if len(docs) == 0 && stage.served > 0 {
 			return wire.SnapshotPageMessage{}, errors.New("peer sync: pushed graft ended early")
 		}
-		next++
-		return pages[next-1], nil
+		stage.served += len(docs)
+		page := wire.SnapshotPageMessage{Namespace: ns, Commit: stage.commit, Docs: docs, Total: stage.spool.docs,
+			Done: stage.served >= stage.spool.docs}
+		if !page.Done {
+			page.Next = docs[len(docs)-1].DocID
+		}
+		return page, nil
 	}
 	// A parent this session refused a push for, behind this node's snapshot root: history this
 	// node's root descends from, not an unrelated one, so no allowUnrelated (boundary.go).
-	if gap, ok := h.takeBoundaryGap(ns, pages[0].Commit.Hash); ok {
+	if gap, ok := h.takeBoundaryGap(ns, stage.commit.Hash); ok {
 		if err := extendBoundary(env, gap, fetch); err != nil {
 			return nil, err
 		}
 		reply.Grafted = true
 		return reply, nil
 	}
-	if _, err := Graft(env, pages[0].Commit.Hash, fetch); err != nil {
+	if _, err := Graft(env, stage.commit.Hash, fetch); err != nil {
 		return nil, err
 	}
 	reply.Grafted = true
 	return reply, nil
+}
+
+// stageGraftPage appends one pushed page to its namespace's stage, creating the stage for the
+// first. Returns the stage, taken out of the session, once the last page is in; nil before. A
+// push over the session's cap, or whose pages disagree about their commit, is dropped and refused.
+func (h *V2Host) stageGraftPage(env IngestEnv, page wire.SnapshotPageMessage) (*graftStage, error) {
+	ns := page.Namespace
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.grafts == nil {
+		h.grafts = map[string]*graftStage{}
+	}
+	stage := h.grafts[ns]
+	if stage == nil {
+		spool, err := newPageSpool(env.StagingDir)
+		if err != nil {
+			return nil, err
+		}
+		stage = &graftStage{spool: spool, commit: page.Commit}
+		h.grafts[ns] = stage
+	}
+	fail := func(err error) (*graftStage, error) {
+		delete(h.grafts, ns)
+		stage.spool.close()
+		return nil, err
+	}
+	if page.Commit.Hash != stage.commit.Hash {
+		return fail(fmt.Errorf("peer sync: pushed graft pages disagree about their commit (%s, then %s)", stage.commit.Hash.Hex(), page.Commit.Hash.Hex()))
+	}
+	for _, d := range page.Docs {
+		if err := stage.spool.add(d.DocID, d.Body); err != nil {
+			return fail(err)
+		}
+	}
+	if max := h.maxGraftPushBytes(); max > 0 && stage.spool.bodyLen > max {
+		return fail(fmt.Errorf("peer sync: a pushed graft of %s exceeds %d bytes", ns, max))
+	}
+	if !page.Done {
+		return nil, nil
+	}
+	delete(h.grafts, ns)
+	return stage, nil
+}
+
+// Close releases what the session staged and never finished: pushed grafts whose last page did
+// not arrive. The connection's owner calls it when the connection ends.
+func (h *V2Host) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ns, stage := range h.grafts {
+		stage.spool.close()
+		delete(h.grafts, ns)
+	}
 }
 
 func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {

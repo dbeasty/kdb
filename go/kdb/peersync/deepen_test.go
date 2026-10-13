@@ -275,3 +275,74 @@ func containsHash(hs []codec.Hash, want codec.Hash) bool {
 	}
 	return false
 }
+
+// TestDeepenStoresPageByPage: a deepen over many pages stores and logs each page as it arrives -
+// by the time the peer is asked for a page, the ones before it are already in the DAG - under one
+// short hold of the serialization per page, with requests that name only the last page's tips.
+// Every commit is logged once: the final pass re-logs only what is still marked unlogged.
+func TestDeepenStoresPageByPage(t *testing.T) {
+	ns := "app/deepen"
+	b := newTestNamespaces(t, ns)
+	seedHistory(t, b, ns, 60)
+	w := wire.NewCodec(wire.EncodingJSON)
+	var f *deepenFixture
+	bHost := newHost(b)
+	requests, grewBetween, maxHaves := 0, 0, 0
+	lastCount := -1
+	v2HubRaw(t, "deepen-pages-b", func(frame []byte) []byte {
+		if msg, err := w.Decode(frame); err == nil && f != nil {
+			if req, ok := msg.(wire.FetchRequestMessage); ok {
+				requests++
+				maxHaves = max(maxHaves, len(req.Haves))
+				n := f.a.side(ns).dag.CommitCount()
+				if lastCount >= 0 && n > lastCount {
+					grewBetween++
+				}
+				lastCount = n
+			}
+		}
+		out, _ := bHost.HandleFrame(frame)
+		return out
+	})
+	f = newDeepenFixture(t, "deepen-pages-a", b, "deepen-pages-b")
+	f.resetLog()
+	s, err := OpenRepairSession(w, stream.NewInMemoryTransport(),
+		V2ClientConfig{NodeID: "a", PeerURI: "memory://deepen-pages-b", Namespaces: []string{ns}, PageBytes: 3_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	env, err := f.a.Env(ns, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &gateNode{}
+	env.Node = node
+	res, err := Deepen(env, s, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Unshallowed || res.Fetched != len(f.ancestors) {
+		t.Fatalf("deepen %+v, want %d fetched and the root unshallowed", res, len(f.ancestors))
+	}
+	if requests < 5 {
+		t.Fatalf("only %d FETCH pages: the test needs many", requests)
+	}
+	if grewBetween != requests-1 {
+		t.Fatalf("the DAG grew between %d of %d requests: pages are not stored as they arrive", grewBetween, requests-1)
+	}
+	if int(node.exclusive.Load()) != requests+1 {
+		t.Fatalf("serialization taken %d times for %d pages: want once per page plus the final step", node.exclusive.Load(), requests)
+	}
+	if maxHaves > 4 {
+		t.Fatalf("a deepen request carried %d haves: they grow with the transfer", maxHaves)
+	}
+	f.requireLogged(t, append(append([]codec.Hash(nil), f.ancestors...), f.root))
+	seen := map[codec.Hash]bool{}
+	for _, h := range f.logged {
+		if seen[h] {
+			t.Fatalf("commit %s was logged twice", h.Hex())
+		}
+		seen[h] = true
+	}
+}

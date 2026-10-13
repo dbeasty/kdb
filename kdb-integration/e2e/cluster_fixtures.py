@@ -181,6 +181,11 @@ class Cluster:
                     code = node.stop()
                     if code != 0:
                         problems.append(f"n{i} exited {code}:\n{tail(node.logs())}")
+            except subprocess.TimeoutExpired:
+                # A node that will not stop (wedged under its write gate, say) is reported, and
+                # the loop goes on: raising here used to skip every later node's cleanup, leaving
+                # them running - and syncing with each other - after the test runner was gone.
+                problems.append(f"n{i} did not stop within the timeout; killed:\n{tail(node.logs())}")
             finally:
                 node.cleanup()
         return problems
