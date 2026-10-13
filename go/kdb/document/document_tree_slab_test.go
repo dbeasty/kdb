@@ -40,8 +40,8 @@ func slabRecMatchesPtr(v *trieView, r tref, p *ptrNode) bool {
 	if p.leaf != nil || p.children == nil || n.hash != p.hash {
 		return false
 	}
-	for i := range n.child {
-		if !slabRecMatchesPtr(v, n.child[i], p.children[i]) {
+	for i, c := range v.children(r) {
+		if !slabRecMatchesPtr(v, c, p.children[i]) {
 			return false
 		}
 	}
@@ -61,7 +61,7 @@ func reachable(h *trieTree, seen map[tref]bool) {
 		}
 		seen[r] = true
 		if r&refLeaf == 0 {
-			for _, c := range v.node(r).child {
+			for _, c := range v.children(r) {
 				mark(c)
 			}
 		}
@@ -645,7 +645,7 @@ func TestSlabFreedWithItsLastTree(t *testing.T) {
 	slab := tree.trie.slab.self
 	runtime.KeepAlive(tree)
 	tree = DocumentTree{}
-	for i := 0; i < 100 && slab.Value() != nil; i++ {
+	for deadline := time.Now().Add(5 * time.Second); slab.Value() != nil && time.Now().Before(deadline); {
 		runtime.GC()
 		time.Sleep(time.Millisecond)
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 )
 
 // TestMemoryProfile measures what a namespace costs in memory across its ordinary life - startup,
@@ -51,6 +52,10 @@ func TestMemoryProfile(t *testing.T) {
 	if os.Getenv("KDB_MEMPROFILE_GRAPH") == "1" {
 		opts.Storage.Graph = dag.GraphSettings{FileEnabled: true}
 	}
+	// KDB_MEMPROFILE_TREE=1 pages the live tree to segment files (StorageOptions.TreeFile), with
+	// KDB_MEMPROFILE_TREE_RESIDENT bytes of resident overlay (default when unset).
+	opts.Storage.TreeFile = os.Getenv("KDB_MEMPROFILE_TREE") == "1"
+	opts.Storage.TreeResidentBytes = int64(envOr("KDB_MEMPROFILE_TREE_RESIDENT", 0))
 	// KDB_MEMPROFILE_BOUNDED=1 lets live versions be evicted (StorageOptions.BoundedLiveBodies).
 	opts.Storage.BoundedLiveBodies = os.Getenv("KDB_MEMPROFILE_BOUNDED") == "1"
 	if m := os.Getenv("KDB_MEMPROFILE_MEMORY"); m != "" {
@@ -297,7 +302,7 @@ func liveHeapBytes() int64 {
 func report(t *testing.T, phase, detail string) {
 	t.Helper()
 	live := liveHeapBytes()
-	t.Logf("PHASE %-10s liveHeap=%s rss=%s peakRSS=%s | %s", phase, mb(live), mb(currentRSS()), mb(peakRSS()), detail)
+	t.Logf("PHASE %-10s liveHeap=%s rss=%s peakRSS=%s mapped=%s | %s", phase, mb(live), mb(currentRSS()), mb(peakRSS()), mb(mmapfile.MappedBytes()), detail)
 }
 
 func currentRSS() int64 {

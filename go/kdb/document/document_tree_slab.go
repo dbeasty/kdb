@@ -42,13 +42,15 @@ import (
 // slab's mutex; the hashing an update needs, which is most of its cost, is done before taking
 // it (see trieEdit).
 
-// tref addresses a record in a trieSlab: 0 is the empty subtree; the top bit selects the leaf
-// pool; bit 30 marks a record local to an edit not yet placed in the slab.
+// tref addresses a record: 0 is the empty subtree; the top bit selects leaves over internal
+// nodes; bit 30 says the record is in a mapped tree segment rather than the slab (see
+// document_tree_file.go); bit 29 marks a record local to an edit not yet placed in the slab.
 type tref uint32
 
 const (
 	refLeaf      tref = 1 << 31
-	refLocal     tref = 1 << 30
+	refFile      tref = 1 << 30
+	refLocal     tref = 1 << 29
 	refIndexMask tref = refLocal - 1
 )
 
@@ -173,6 +175,17 @@ type trieSlab struct {
 	nodes  slabPool[nodeRec]
 	leaves slabPool[leafRec]
 
+	// Mapped segments this slab's trees reach into (document_tree_file.go): the list is
+	// replaced, never modified, under mu. file is the binding to a tree directory, nil for a
+	// heap-only slab. gen counts segments written; rebaseTo is the latest one's root, which
+	// trees made before it are moved onto (retained by the slab; under mu).
+	segs             *segList
+	file             atomic.Pointer[treeFile]
+	gen              atomic.Uint32
+	rebaseTo         tref
+	createdAtRewrite uint64
+	rewriting        atomic.Bool
+
 	// Roots of dropped trees awaiting release, under their own lock so a cleanup never waits on
 	// an update (see dropTrieRoot). pendingN mirrors len(pending) for a lock-free check.
 	pendMu   sync.Mutex
@@ -193,30 +206,76 @@ const (
 )
 
 func newTrieSlab() *trieSlab {
-	s := &trieSlab{}
+	s := &trieSlab{segs: &segList{}}
 	s.self = weak.Make(s)
+	// A slab collected with segments still mapped - its last trees went in one cycle, so no
+	// release ever retired them - unmaps them here.
+	runtime.AddCleanup(s, closeSegList, s.segs)
 	return s
 }
 
 // trieView is a snapshot of a slab's chunk directories, for reading the records of a tree held
 // by the caller.
+//
+// A segment's node records hold child references local to the segment, so a node's children
+// are read only through child and children, which translate them; node itself is for the hash.
 type trieView struct {
 	nodes  [][]nodeRec
 	leaves [][]leafRec
+	segs   []*treeSegment
 }
 
 func (s *trieSlab) view() trieView {
-	return trieView{nodes: s.nodes.dir(), leaves: s.leaves.dir()}
+	v := trieView{nodes: s.nodes.dir(), leaves: s.leaves.dir()}
+	if g := s.segs.p.Load(); g != nil {
+		v.segs = *g
+	}
+	return v
+}
+
+// seg is the segment holding the file record r.
+func (v *trieView) seg(r tref) *treeSegment {
+	return segmentOf(v.segs, r)
 }
 
 func (v *trieView) node(r tref) *nodeRec {
+	if r&refFile != 0 {
+		g := v.seg(r)
+		return g.nodeAt(uint32(r&refIndexMask) - g.nodeBase)
+	}
 	k, off := slabLocate(uint32(r))
 	return &v.nodes[k][off]
 }
 
 func (v *trieView) leaf(r tref) *leafRec {
+	if r&refFile != 0 {
+		g := v.seg(r)
+		return g.leafAt(uint32(r&refIndexMask) - g.leafBase)
+	}
 	k, off := slabLocate(uint32(r &^ refLeaf))
 	return &v.leaves[k][off]
+}
+
+// child is the internal node r's child at nib.
+func (v *trieView) child(r tref, nib int) tref {
+	if r&refFile == 0 {
+		return v.node(r).child[nib]
+	}
+	g := v.seg(r)
+	return g.global(g.nodeAt(uint32(r&refIndexMask) - g.nodeBase).child[nib])
+}
+
+// children is the internal node r's children.
+func (v *trieView) children(r tref) [16]tref {
+	if r&refFile == 0 {
+		return v.node(r).child
+	}
+	g := v.seg(r)
+	c := g.nodeAt(uint32(r&refIndexMask) - g.nodeBase).child
+	for i := range c {
+		c[i] = g.global(c[i])
+	}
+	return c
 }
 
 func (v *trieView) hash(r tref) *[32]byte {
@@ -241,6 +300,8 @@ var slabPoisonHash = [32]byte{0: 0xde, 1: 0xad, 31: 0xff}
 func (s *trieSlab) retain(r tref) {
 	switch {
 	case r == 0:
+	case r&refFile != 0:
+		segmentOf(*s.segs.p.Load(), r).refs++
 	case r&refLeaf != 0:
 		*s.leaves.count(uint32(r &^ refLeaf))++
 	default:
@@ -251,6 +312,14 @@ func (s *trieSlab) retain(r tref) {
 func (s *trieSlab) release(r tref) {
 	switch {
 	case r == 0:
+	case r&refFile != 0:
+		g := segmentOf(*s.segs.p.Load(), r)
+		if g.refs <= 0 {
+			panic("document: tree segment released more often than retained")
+		}
+		if g.refs--; g.refs == 0 {
+			s.retireSegment(g)
+		}
 	case r&refLeaf != 0:
 		i := uint32(r &^ refLeaf)
 		rc := s.leaves.count(i)
@@ -348,7 +417,12 @@ func (s *trieSlab) counted() {
 		live = inUse - since
 	}
 	const recBytes = (nodeRecBytes + leafRecBytes) / 2
-	if since*recBytes > max(slabNudgeFloor, live*recBytes/2) && slabGCRunning.CompareAndSwap(false, true) {
+	floor := uint64(slabNudgeFloor)
+	if f := s.file.Load(); f != nil {
+		// A file-backed slab's resident records are bounded by its budget, and so is its garbage.
+		floor = min(floor, uint64(f.opts.ResidentBytes/2))
+	}
+	if since*recBytes > max(floor, live*recBytes/2) && slabGCRunning.CompareAndSwap(false, true) {
 		s.cycleCreated = s.created
 		go func() {
 			runtime.GC()
@@ -362,6 +436,7 @@ func (s *trieSlab) counted() {
 type trieTree struct {
 	slab *trieSlab
 	root tref
+	gen  uint32 // the slab's gen when made: older handles are rebased before an update
 }
 
 // trieDrop is a cleanup's argument. It reaches the slab weakly: a cleanup's argument stays
@@ -423,12 +498,16 @@ const drainPerUpdate = 4
 
 // adopt wraps root, whose count the caller has already raised by one for this handle (under the
 // lock), in a handle that gives that reference back when it becomes unreachable. A zero root is
-// the empty tree, which has no handle.
+// the empty tree, which has no handle - except in a slab bound to a tree file, where an empty
+// tree keeps a handle so that what is derived from it stays bound.
 func (s *trieSlab) adopt(root tref) *trieTree {
 	if root == 0 {
-		return nil
+		if s.file.Load() == nil {
+			return nil
+		}
+		return &trieTree{slab: s, gen: s.gen.Load()}
 	}
-	h := &trieTree{slab: s, root: root}
+	h := &trieTree{slab: s, root: root, gen: s.gen.Load()}
 	runtime.AddCleanup(h, dropTrieRoot, trieDrop{slab: s.self, root: root})
 	return h
 }

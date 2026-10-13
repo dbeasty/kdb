@@ -136,7 +136,7 @@ func uuidAfter(a, b codec.UUID) bool {
 type trieEdit struct {
 	v    trieView
 	n    int
-	recs [2*trieDepth + 4]editRec
+	recs []editRec // grows only for a rebase (translate); an update needs at most 2*trieDepth+4
 }
 
 type editRec struct {
@@ -159,6 +159,9 @@ func getEdit(v trieView) *trieEdit {
 
 func putEdit(e *trieEdit) {
 	e.v = trieView{}
+	if len(e.recs) > 1024 { // a large rebase: do not keep its buffer
+		e.recs = nil
+	}
 	editPool.Put(e)
 }
 
@@ -191,12 +194,12 @@ func (e *trieEdit) children(r tref) [16]tref {
 	if r&refLocal != 0 {
 		return e.local(r).child
 	}
-	return e.v.node(r).child
+	return e.v.children(r)
 }
 
 func (e *trieEdit) next() (tref, *editRec) {
 	if e.n == len(e.recs) {
-		panic("document: trie edit overflow")
+		e.recs = append(e.recs, make([]editRec, max(2*trieDepth+4, len(e.recs)))...)
 	}
 	r := refLocal | tref(e.n)
 	e.n++
@@ -351,7 +354,7 @@ func (s *trieSlab) place(e *trieEdit, r tref) tref {
 // commit places the edit's result and wraps it in a new handle.
 func (s *trieSlab) commit(e *trieEdit, r tref) *trieTree {
 	if r == 0 {
-		return nil
+		return s.adopt(0)
 	}
 	s.mu.Lock()
 	s.drain(drainPerUpdate)
@@ -369,6 +372,7 @@ func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
 	if h == nil {
 		s = newTrieSlab()
 	} else {
+		h = h.rebased()
 		s, root = h.slab, h.root
 	}
 	e := getEdit(s.view())
@@ -377,6 +381,7 @@ func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
 	out := h
 	if nr != root {
 		out = s.commit(e, nr)
+		s.maybeRewrite(out)
 	}
 	putEdit(e)
 	runtime.KeepAlive(h)
@@ -388,12 +393,14 @@ func trieWithout(h *trieTree, id codec.UUID) *trieTree {
 	if h == nil {
 		return nil
 	}
+	h = h.rebased()
 	e := getEdit(h.slab.view())
 	key := uuidKey(id)
 	nr := e.delete(h.root, &key, 0)
 	out := h
 	if nr != h.root {
 		out = h.slab.commit(e, nr)
+		h.slab.maybeRewrite(out)
 	}
 	putEdit(e)
 	runtime.KeepAlive(h)
@@ -611,7 +618,7 @@ func (h *trieTree) get(id codec.UUID) (codec.Hash, bool) {
 		if depth >= trieDepth {
 			break
 		}
-		r = v.node(r).child[keyNibble(&key, depth)]
+		r = v.child(r, keyNibble(&key, depth))
 	}
 	runtime.KeepAlive(h)
 	return out, found
@@ -641,8 +648,7 @@ func (v *trieView) walk(r tref, visit func(codec.UUID, codec.Hash) bool, visited
 		l := v.leaf(r)
 		return visit(keyUUID(&l.id), l.content)
 	}
-	n := v.node(r)
-	for _, c := range n.child {
+	for _, c := range v.children(r) {
 		if c != 0 && !v.walk(c, visit, visited) {
 			return false
 		}
@@ -682,13 +688,13 @@ func (v *trieView) walkAfter(r tref, key *[16]byte, after codec.UUID, depth int,
 	if depth >= trieDepth {
 		return true
 	}
-	n := v.node(r)
+	children := v.children(r)
 	nib := keyNibble(key, depth)
-	if !v.walkAfter(n.child[nib], key, after, depth+1, visit, visited) {
+	if !v.walkAfter(children[nib], key, after, depth+1, visit, visited) {
 		return false
 	}
 	for i := nib + 1; i < 16; i++ {
-		if !v.walk(n.child[i], visit, visited) {
+		if !v.walk(children[i], visit, visited) {
 			return false
 		}
 	}

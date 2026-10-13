@@ -148,6 +148,13 @@ type StorageOptions struct {
 	// the latest dataset, and none of it may show up in a read benchmark.
 	Graph dag.GraphSettings
 
+	// TreeFile pages the live document tree's cold records to mapped segment files
+	// (ns/<namespace>/tree/, document.TreeFile) so the tree's heap does not grow with the
+	// namespace; TreeResidentBytes is the resident overlay before the tree is written out again
+	// (document.DefaultTreeResidentBytes when not positive). Off by default.
+	TreeFile          bool
+	TreeResidentBytes int64
+
 	// SyncMode selects the physical sync primitive every flush uses. The zero
 	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous
 	// hardcoded behavior; storio.SyncModeFast trades power-loss protection for
@@ -234,6 +241,8 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 		opts.Storage.DisableCheckpoints = true
 	}
 	opts.Storage.Graph = graphSettingsFromEnv()
+	opts.Storage.TreeFile = envBool("KDB_TREE_FILE")
+	opts.Storage.TreeResidentBytes = envBytes("KDB_TREE_RESIDENT_BYTES")
 	return opts
 }
 

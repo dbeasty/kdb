@@ -9,6 +9,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
@@ -174,6 +175,21 @@ func (h *Host) openNamespace(
 	}
 
 	eng, _ := store.(*engine.ServerEngine)
+	var treeFile *document.TreeFile
+	if eng != nil && opts.Storage.TreeFile {
+		// Before restore: the checkpoint's live tree is mapped from, or built to, its segments.
+		tf, err := document.NewTreeFile(document.TreeFileOptions{
+			Dir:           treeDirPath(dataRoot, namespaceID),
+			ResidentBytes: opts.Storage.TreeResidentBytes,
+			ReadOnly:      opts.ReadOnly,
+		})
+		if err != nil {
+			log.Printf("kdb: namespace %s: tree.file is on but unusable here (%v) - the live tree stays in memory", namespaceID, err)
+		} else {
+			treeFile = tf
+			eng.SetTreeFile(tf)
+		}
+	}
 	if eng != nil {
 		// One owner for trees. The engine already keeps every tree it
 		// commits; leaving the DAG's own map in place would mean two
@@ -335,6 +351,8 @@ func (h *Host) openNamespace(
 		}
 		// Last: the checkpoint above reads every commit, some of which live only in the file.
 		d.CloseGraphFile()
+		// After the checkpoint wrote the segment the next open will map: nothing deletes files now.
+		treeFile.Close()
 		if closeOpsLoader != nil {
 			closeOpsLoader()
 		}

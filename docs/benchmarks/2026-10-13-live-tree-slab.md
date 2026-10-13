@@ -50,9 +50,9 @@ replaces are garbage the pacer cannot see. In a loop that allocates little besid
 (the only way to learn a version died) come further apart as the slab grows. Measured: 50k updates on a
 200k-doc tree doubled the slab. The engine's write path allocates far more per update than the records it
 adds, so natural cycles normally come first. As a bound for when they don't, a slab that has created more
-than half its live records since the last GC cycle, and has had to grow, requests one collection in the
-background (one at a time, process-wide, at least 4 MB of growth). That holds a pure update loop to about
-1.5x the live records. A pointer trie's heap reaches 2x at its GC goal.
+than half its live records since the last GC cycle requests one collection in the
+background (one at a time, process-wide, at least 4 MB). That holds a pure update loop to about
+1.6x the live records, also across 300k updates. A pointer trie's heap reaches 2x at its GC goal.
 
 ## Results: the live tree alone (`TestTreeScale`, `go/kdb/document/document_tree_scale_test.go`)
 
@@ -93,7 +93,39 @@ Reading it:
 
 ## Results: whole namespace, 1M documents / 2M commits (`TestMemoryProfile`)
 
-*Pending: the run is in progress; filled in when it completes.*
+Default settings (graph file on), one process per phase on an APFS clone of one data directory,
+main (`ca4c603`) and branch alternating, two rounds, load average 5-6. Open and close re-run
+after the two fixes below; the others are from before them, which do not affect them.
+
+| Phase | main | slab |
+|---|---:|---:|
+| Open: live heap after | 201 MB | **183 MB** |
+| Open: peak heap during | 402-409 MB | **238-242 MB** |
+| Open: RSS after | 695-701 MB | **521-525 MB** |
+| Open: time (re-run) | 680-693 ms | 619-643 ms |
+| Forced GC after open: wall / mark CPU | 5.5-6.3 ms / 26 ms | **0.4-0.5 ms / 0.4-0.5 ms** |
+| Full read of every document: heap after | 868 MB | 848 MB |
+| Forced GC after full read: wall / mark CPU | 7.7-8.4 ms / 35-36 ms | **3.8-6.1 ms / 7.0-7.7 ms** |
+| GC CPU during the full read | 588-592 ms | 221-498 ms |
+| Full read: time | 16.1-16.2 s | 17.3-19.1 s (load-sensitive; not re-run) |
+| 20k updates: time / peak heap | 0.78-0.89 s / 446-458 MB | 0.76-0.88 s / **387-399 MB** |
+| Close + checkpoint: time / peak heap | 70-73 ms / 367-375 MB | 65-73 ms / **343 MB** |
+| Close + checkpoint: peak RSS | 749-785 MB | **667-669 MB** |
+| Live heap after close (re-run) | 0.9 MB | 0.8 MB |
+
+`MemoryBreakdown().LiveTree` reads 96.8 MB for this tree (its ids are sequential, so the trie is
+shallower than for random ids), against the 160 MB the old per-document estimate reported.
+
+Two defects found by this run and the long churn test, both fixed on the branch:
+
+- **A slab outlived its last tree** by one collection cycle: each handle's cleanup argument
+  pointed at the slab, and an argument stays reachable until its cleanup has run. Live heap after
+  close was 98 MB (main: 0.9 MB). The argument now reaches the slab through a `weak.Pointer`
+  (`TestSlabFreedWithItsLastTree`).
+- **The GC nudge bound drifted.** It fired only when the slab had to grow. Free slots left by
+  the last cycle absorb the next cycle's garbage first, so each cycle ended one floor larger
+  (3.8 → 6 → 7.6 → 8.9 → 10.4 MB in a trace). It now fires on garbage created since the last
+  cycle. Measured over 300k updates: 1.59x, the same as at 50k.
 
 ## Other effects
 
@@ -117,7 +149,8 @@ Reading it:
   against the tree hash they were handed, plus full rebuilds. Concurrent writers derive chains from one
   shared base. The tests assert that slots were actually reused during the run.
 - `TestSlabTreeMemoryPerDocument`: at most 135 B/doc and 0.01 heap objects/doc at 200k documents
-  (measured 130.6 B and 0.0003). At most 1.8x that after 50k updates (measured ~1.6x).
+  (measured 130.6 B and 0.0003). At most 1.8x that after 300k updates (measured 1.59x).
+- `TestSlabFreedWithItsLastTree`: a slab is collected once its trees are.
 - `TestSlabRecordsArePointerFree`, `TestSlabLocate`, plus every existing trie, proof, node, walk and
   packed-tree test.
 - `go vet`; `go test -race ./kdb/document/...`; `go test ./...`; e2e 81 passed / 11 skipped / 2 xfailed.
