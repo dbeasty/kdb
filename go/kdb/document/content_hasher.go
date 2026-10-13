@@ -33,6 +33,16 @@ type ContentHasher struct {
 
 // Hash returns the content hash of the document with this id and JSON text.
 func (h *ContentHasher) Hash(id codec.UUID, json string) codec.Hash {
+	return contentHash(h, id, json)
+}
+
+// HashBytes is Hash for text held as bytes - a patch read in place out of an encoded commit (see
+// ScanCommitWrites) - so checking a candidate version needs no string copy of it first.
+func (h *ContentHasher) HashBytes(id codec.UUID, json []byte) codec.Hash {
+	return contentHash(h, id, json)
+}
+
+func contentHash[T string | []byte](h *ContentHasher, id codec.UUID, json T) codec.Hash {
 	bodyLen := 1 + 1 + 16 + 1 + 1 + lebLen(uint32(len(json))) + len(json)
 	b := h.buf[:0]
 	b = binary.AppendUvarint(b, uint64(uint32(bodyLen)))
