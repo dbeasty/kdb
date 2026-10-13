@@ -199,7 +199,7 @@ while permanently refusing writes. That latch, not read traffic alone, is the re
 was the only safe number found above - see `docs/kdb-spec-layer13-resource-governance.md` §2.5.
 
 Commit `7ad882a` fixed this: the guard now measures the Linux cgroup's own `memory.current` (the
-exact figure `--memory` is enforced against) where available, falling back to
+exact figure `--memory` is enforced against, less reclaimable `inactive_file` page cache, added later) where available, falling back to
 `runtime/metrics`'s `/memory/classes/total:bytes` minus `/memory/classes/heap/released:bytes` -
 both actually decrease when memory is freed - plus real hysteresis (a separate, lower clear
 threshold), so pressure that genuinely subsides releases the latch instead of requiring a

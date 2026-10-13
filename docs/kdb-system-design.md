@@ -1078,7 +1078,7 @@ Until then: platform volume encryption.
 
 Goal: **never be OOM-killed; refuse with a typed, actionable error instead.**
 
-- **MemoryGuard** (`memory_guard.go`): 200 ms sampler; usage from cgroup `memory.current` on Linux, else
+- **MemoryGuard** (`memory_guard.go`): 200 ms sampler; usage from cgroup `memory.current` less reclaimable `inactive_file` cache on Linux, else
   `runtime/metrics`. Zones: Normal, Elevated (70%), High (85%), Critical (93%); hysteresis exits below 0.9x entry
   with a 600 ms dwell. Policy: Normal/Elevated admit all; High admits point reads and replication; Critical admits
   point reads only. Retry-after 50/100/500 ms.
