@@ -57,7 +57,23 @@ import (
 //	XPOS    n x u32          positions of commits with any external parent - what Horizon reads
 //	MSGI    n x 12           (pos u32, off u32, len u32) for commits with a message, sorted by pos
 //	MSGS    bytes            messages
-//	footer  (off u64, len u64) per section | count u64 | txCount u64 | crc32c of all before | magic
+//	footer  (off u64, len u64, codec u32) per section | count u64 | txCount u64 | crc32c of all
+//	        before | magic
+//
+// Every section carries a codec, zero for plain bytes. Nothing writes another value yet; the field
+// is there so that encryption at rest (docs/kdb-spec-layer14-encryption-at-rest.md) and block
+// compression can arrive per section - most likely Cassandra's shape, fixed-size blocks each
+// sealed or compressed on its own with an offset table, decrypted into a small bounded cache on
+// read - without a new layout. A reader that meets a codec it does not know treats the segment as
+// unusable, which costs a rebuild, never a misread. Measured for reference: zstd shrinks a
+// segment only 12-15%, because commit and tree hashes are random bytes, so compression is not
+// worth its CPU today; encryption is the reason the field exists.
+//
+// What a segment holds is all on Layer 14's list of metadata a disk-holder may see (commit graph
+// shape, timestamps, transaction and author ids, hashes) except one thing: commit messages
+// (MSGS). Whoever implements encryption at rest must either seal MSGS or stop storing messages
+// here and load them from the (encrypted) delta log, as operations already are. Under end-to-end
+// encryption the server only ever has the client's opaque bytes, so nothing here changes.
 //
 // About 116 bytes a commit, against 304 in version 3. Parents by position also make an ancestry
 // step an array index within a segment instead of a hash search.
@@ -113,7 +129,10 @@ const (
 	secCount
 )
 
-const graphFooterSize = secCount*16 + 8 + 8 + 4 + 4
+const graphFooterSize = secCount*20 + 8 + 8 + 4 + 4
+
+// sectionCodecPlain is the only section codec this build reads or writes.
+const sectionCodecPlain = 0
 
 var errGraphFile = errors.New("dag: graph file unusable")
 
@@ -225,14 +244,17 @@ func (b *graphBase) parse(namespaceID string) error {
 	}
 	body := len(data) - graphFooterSize
 	for i := 0; i < secCount; i++ {
-		off, n := int(le.Uint64(f[i*16:])), int(le.Uint64(f[i*16+8:]))
+		off, n := int(le.Uint64(f[i*20:])), int(le.Uint64(f[i*20+8:]))
 		if off < 0 || n < 0 || off > body || n > body-off {
 			return fmt.Errorf("section %d overruns file", i)
 		}
+		if c := le.Uint32(f[i*20+16:]); c != sectionCodecPlain {
+			return fmt.Errorf("section %d uses codec %d, which this build cannot read", i, c)
+		}
 		b.sec[i] = data[off : off+n]
 	}
-	b.count = int(le.Uint64(f[secCount*16:]))
-	b.txCount = int(le.Uint64(f[secCount*16+8:]))
+	b.count = int(le.Uint64(f[secCount*20:]))
+	b.txCount = int(le.Uint64(f[secCount*20+8:]))
 	switch {
 	case len(b.sec[secOIDS]) != b.count*32, len(b.sec[secCDAT]) != b.count*cdatSize,
 		len(b.sec[secTIDX]) != b.txCount*4, len(b.sec[secFanout]) != 256*4,
@@ -691,11 +713,12 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, open func
 
 	var foot [graphFooterSize]byte
 	for i := 0; i < secCount; i++ {
-		le.PutUint64(foot[i*16:], uint64(secs[i][0]))
-		le.PutUint64(foot[i*16+8:], uint64(secs[i][1]))
+		le.PutUint64(foot[i*20:], uint64(secs[i][0]))
+		le.PutUint64(foot[i*20+8:], uint64(secs[i][1]))
+		le.PutUint32(foot[i*20+16:], sectionCodecPlain)
 	}
-	le.PutUint64(foot[secCount*16:], uint64(len(oids)))
-	le.PutUint64(foot[secCount*16+8:], uint64(txCount))
+	le.PutUint64(foot[secCount*20:], uint64(len(oids)))
+	le.PutUint64(foot[secCount*20+8:], uint64(txCount))
 	write(foot[:graphFooterSize-8])
 	if err != nil {
 		return "", err

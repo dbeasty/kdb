@@ -3,6 +3,7 @@ package dag
 import (
 	"bytes"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -675,5 +676,28 @@ func TestGraphHorizonMatchesFullWalk(t *testing.T) {
 	b.dag.mu.Unlock()
 	if got := sortedHashes(b.dag.Horizon()); !reflect.DeepEqual(got, naiveHorizon(b.dag)) || len(got) == 0 {
 		t.Fatalf("Horizon %v after an unstubbed removal; want %v", got, naiveHorizon(b.dag))
+	}
+}
+
+// A section codec this build does not know - an encrypted or compressed section from a later
+// build - makes the segment unusable, never misread.
+func TestGraphSegmentUnknownSectionCodecIsUnusable(t *testing.T) {
+	b, _, path := graphDag(t)
+	if err := b.dag.RebuildGraphFile(); err != nil {
+		t.Fatal(err)
+	}
+	seg := onlySegment(t, path)
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foot := raw[len(raw)-graphFooterSize:]
+	le.PutUint32(foot[secMsgs*20+16:], 7) // MSGS "sealed" with codec 7
+	le.PutUint32(foot[graphFooterSize-8:], crc32.Checksum(raw[:len(raw)-8], crcTable))
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openGraphBase(seg, "ns"); !errors.Is(err, errGraphFile) {
+		t.Fatalf("segment with an unknown section codec opened: %v", err)
 	}
 }
