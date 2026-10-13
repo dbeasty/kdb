@@ -162,9 +162,9 @@ type sqlWireConnHandler struct {
 	// replies are encoded with; nil keeps them on codec. Incoming frames are decoded by codec
 	// either way, since decoding goes by each frame's own encoding tag.
 	negotiated atomic.Pointer[wire.DefaultCodec]
-	runtime  *KdbServerRuntime
-	sessions *SessionManager
-	parser   sql.Parser
+	runtime    *KdbServerRuntime
+	sessions   *SessionManager
+	parser     sql.Parser
 
 	// principal is set once, by a successful Handshake, and reused for every SessionBegin on
 	// this connection - there is no per-connection ConnectionContext side channel to
