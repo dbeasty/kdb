@@ -23,6 +23,19 @@ func opsLoaderLog(t testing.TB, segments, perSegment int) (storage.DeltaSegmentR
 	for seq := 0; seq < segments; seq++ {
 		id, _ := codec.RandomUUID()
 		w := delta.NewDefaultWriter(ns, id, int64(seq), shim, cfg)
+		// Appended in batches: the in-memory shim copies a segment on every append, so one
+		// append per commit is quadratic in the segment - seconds here, past CI's ten-minute
+		// test timeout on a slower runner.
+		var batch []storage.DeltaRecord
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			if _, err := w.AppendBatch(batch); err != nil {
+				t.Fatal(err)
+			}
+			batch = batch[:0]
+		}
 		for i := 0; i < perSegment; i++ {
 			tx, _ := codec.RandomUUID()
 			author, _ := codec.RandomUUID()
@@ -39,12 +52,14 @@ func opsLoaderLog(t testing.TB, segments, perSegment int) (storage.DeltaSegmentR
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Append(storage.DeltaRecord{CommitHash: h, NamespaceID: ns, CommitPayload: payload}); err != nil {
-				t.Fatal(err)
+			batch = append(batch, storage.DeltaRecord{CommitHash: h, NamespaceID: ns, CommitPayload: payload})
+			if len(batch) == 1000 {
+				flush()
 			}
 			all = append(all, c)
 			parents = []codec.Hash{h}
 		}
+		flush()
 		if seq < segments-1 {
 			if _, err := w.Seal(); err != nil {
 				t.Fatal(err)

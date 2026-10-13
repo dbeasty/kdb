@@ -70,3 +70,50 @@ func TestColdLoaderIndexMatchesTheLog(t *testing.T) {
 		})
 	}
 }
+
+// TestColdLoaderCatchesUpWithTheLog: versions written after the index was first built - in new
+// segments - are found on a later miss. The index used to be built once, so such a version read as
+// missing once evicted: harmless while live versions never left memory, a lost read once they can
+// (bounded live bodies).
+func TestColdLoaderCatchesUpWithTheLog(t *testing.T) {
+	shim := storio.NewInMemoryPlatformIO()
+	reader, first := writeColdLog(t, shim, storage.CompressionNone, 60, 11)
+	l := newDeltaColdLoader(reader)
+	h0, err := document.Document{ID: first[0].docID, JSON: first[0].text}.ContentHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := l.load(first[0].docID, h0); !ok || err != nil {
+		t.Fatalf("a version from the first batch: ok=%v err=%v", ok, err)
+	}
+	before := len(l.segments)
+	_, later := writeColdLog(t, shim, storage.CompressionNone, 60, 12)
+	for i, v := range later {
+		h, err := document.Document{ID: v.docID, JSON: v.text}.ContentHash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc, ok, err := l.load(v.docID, h)
+		if err != nil || !ok {
+			t.Fatalf("version %d, written after the index was built: ok=%v err=%v", i, ok, err)
+		}
+		if doc.JSON != v.text {
+			t.Fatalf("version %d read back wrong", i)
+		}
+	}
+	if len(l.segments) <= before {
+		t.Fatalf("segment table did not grow: %d segments before, %d after", before, len(l.segments))
+	}
+	// A miss with nothing new in the log scans nothing: the indexed sizes all match the listing.
+	var unknown codec.Hash
+	unknown.Bytes[0] = 0xAB
+	if _, ok, err := l.load(first[0].docID, unknown); ok || err != nil {
+		t.Fatalf("unknown hash: ok=%v err=%v", ok, err)
+	}
+	segs, _ := reader.ListSegments()
+	for _, s := range segs {
+		if l.indexed[s.SequenceNumber] != s.SizeBytes {
+			t.Fatalf("segment %d indexed through %d of %d bytes", s.SequenceNumber, l.indexed[s.SequenceNumber], s.SizeBytes)
+		}
+	}
+}

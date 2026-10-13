@@ -118,6 +118,7 @@ func (h *Host) openNamespace(
 		// every reader resolves at the point of use.
 		Retain:                opts.Storage.Retain,
 		DocumentCacheBytes:    opts.Storage.DocumentCacheBytes,
+		BoundedLiveBodies:     opts.Storage.BoundedLiveBodies,
 		CommitOpsBytes:        opts.Storage.CommitOpsBytes,
 		DeltaMaxSegmentBytes:  opts.Storage.DeltaMaxSegmentBytes,
 		TreeChainLimit:        opts.Storage.TreeChainLimit,
@@ -253,7 +254,12 @@ func (h *Host) openNamespace(
 		if eng, ok := store.(*engine.ServerEngine); ok {
 			// Told where each commit landed, so the versions it wrote can
 			// be found again by position instead of by scanning.
-			persisting.SetPersistListener(eng.RecordCommitLocation)
+			persisting.SetPersistListener(func(treeHash codec.Hash, segmentSeq, frameOffset int64) {
+				eng.RecordCommitLocation(treeHash, segmentSeq, frameOffset)
+				eng.NoteCommitDurable(treeHash)
+			})
+			// Commits from here on are pinned only until the listener above hears they are logged.
+			eng.EnableDurabilityTracking()
 		}
 		if replayedInFull {
 			checkpointAfterFullReplay(d, store, handle.DeltaReader(), w, io, namespaceID, opts.Storage.DisableCheckpoints)

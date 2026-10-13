@@ -603,8 +603,14 @@ func envOnlySpecs() []envOnlySpec {
 		{
 			key: "cache.documentBytes", env: "KDB_DOCUMENT_CACHE_BYTES",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen, unit: "bytes",
-			help:  "bytes of document versions kept resident before the oldest are evicted. 0 takes half the hot-tier budget",
+			help:  "bytes of document versions kept resident before the oldest are evicted. 0 takes the document cache's share of the hot-tier budget",
 			parse: bytes,
+		},
+		{
+			key: "cache.boundedLiveBodies", env: "KDB_BOUNDED_LIVE_BODIES",
+			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
+			help:  "let live document versions be evicted from memory once their commit is logged, so live data need not fit in memory (default off: every live version stays resident)",
+			parse: onOff,
 		},
 		{
 			key: "cache.commitOpsBytes", env: "KDB_COMMIT_OPS_BYTES",
