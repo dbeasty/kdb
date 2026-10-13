@@ -60,6 +60,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				Password:                  m.Request.Password,
 				Token:                     m.Request.Token,
 				Filter:                    m.Request.Filter,
+				WireFeatures:              m.Request.WireFeatures,
 			},
 		}, nil
 	case HandshakeAckMessage:
@@ -72,6 +73,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				RemoteHeads:        m.Response.RemoteHeads,
 				RejectionReason:    m.Response.RejectionReason,
 				ServerVersion:      m.Response.ServerVersion,
+				WireFeatures:       m.Response.WireFeatures,
 			},
 		}, nil
 	case DeltaCommitMessage:
@@ -367,6 +369,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 				Password:           h.Password,
 				Token:              h.Token,
 				Filter:             h.Filter,
+				WireFeatures:       h.WireFeatures,
 			},
 		}, nil
 	case "handshakeAck":
@@ -383,6 +386,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 				RemoteHeads:        a.RemoteHeads,
 				RejectionReason:    a.RejectionReason,
 				ServerVersion:      a.ServerVersion,
+				WireFeatures:       a.WireFeatures,
 			},
 		}, nil
 	case "deltaCommit":

@@ -480,6 +480,10 @@ type HandshakePayload struct {
 	// condition. Nil is every document. Omitted from the frame when nil, so older peers see the
 	// handshake they always did.
 	Filter *string
+	// WireFeatures are the optional frame encodings this side can read and write (WireFeature*).
+	// Additive: an older peer, the Kotlin server among them, ignores the key and acks none, and
+	// both sides then keep to the JSON envelope. See NegotiateWireFeatures.
+	WireFeatures []string
 }
 
 type HandshakeAckPayload struct {
@@ -493,6 +497,11 @@ type HandshakeAckPayload struct {
 	// Kotlin one, leaves it empty, and a client that cares about compatibility (the TS client
 	// pins its package to the server release) treats empty as "unknown".
 	ServerVersion string
+	// WireFeatures are the features the server accepted from the handshake's offer: the ones both
+	// sides support. Empty from an older server, and from any server for a client that offered
+	// none. Neither side sends a frame in a feature's encoding until the ack has named it.
+	// NegotiatedEncoding stays "JSON" regardless, which older clients check for.
+	WireFeatures []string
 }
 
 type IndexHint struct {

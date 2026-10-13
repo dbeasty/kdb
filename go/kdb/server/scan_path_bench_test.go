@@ -9,6 +9,7 @@ package server
 import (
 	"fmt"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 
 // benchGovernedWireServer stands up a real wire listener over an in-memory runtime with
 // admission enabled and docCount pre-seeded documents, mirroring the e2e test harness.
-func benchGovernedWireServer(b *testing.B, docCount, docBytes int) (*KdbServerRuntime, *rawWireClient, string) {
+func benchGovernedWireServer(b *testing.B, docCount, docBytes int, features []string) (*KdbServerRuntime, *rawWireClient, string) {
 	b.Helper()
 	rt, err := embed.OpenMemoryRuntime("bench", "app/data", schema.None())
 	if err != nil {
@@ -51,7 +52,7 @@ func benchGovernedWireServer(b *testing.B, docCount, docBytes int) (*KdbServerRu
 	}
 	b.Cleanup(func() { _ = ln.Close() })
 	client := dialRawWireClientB(b, "tcp://"+ln.Addr().String())
-	client.handshakeB(b, wire.ClientSQL, "app/data")
+	client.handshakeFeaturesB(b, "app/data", features)
 	ack := client.sessionBeginB(b, "app/data", "READ_COMMITTED")
 	return srv, client, ack.SessionID
 }
@@ -69,23 +70,45 @@ func BenchmarkWireSelect(b *testing.B) {
 		{"star-200", "SELECT * FROM t", 200},
 		{"count-1000", "SELECT COUNT(*) FROM t", 1000},
 	} {
-		b.Run(tc.name, func(b *testing.B) {
-			_, client, session := benchGovernedWireServer(b, tc.docs, 512)
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				res := client.sqlExecB(b, "app/data", session, tc.sql)
-				if res.Error != nil {
-					b.Fatalf("%s: %s", tc.sql, *res.Error)
+		for _, enc := range benchWireEncodings {
+			b.Run(tc.name+"/"+enc.name, func(b *testing.B) {
+				_, client, session := benchGovernedWireServer(b, tc.docs, 512, enc.features)
+				b.ReportAllocs()
+				b.ResetTimer()
+				client.wireBytes = 0
+				for i := 0; i < b.N; i++ {
+					res := client.sqlExecB(b, "app/data", session, tc.sql)
+					if res.Error != nil {
+						b.Fatalf("%s: %s", tc.sql, *res.Error)
+					}
 				}
-			}
-		})
+				b.ReportMetric(float64(client.wireBytes)/float64(b.N), "wire-B/op")
+			})
+		}
 	}
+}
+
+// benchWireEncodings are the encodings the wire benchmarks run under: the JSON envelope (every
+// release before B4, and still the encoding for a client that offers no features), binary
+// frames, and binary frames with zstd for large bodies.
+var benchWireEncodings = []struct {
+	name     string
+	features []string
+}{
+	{"json", nil},
+	{"binary", []string{wire.WireFeatureBinary}},
+	{"binary+zstd", []string{wire.WireFeatureBinary, wire.WireFeatureZstd}},
 }
 
 // BenchmarkWireDocumentGet is the point-read equivalent of BenchmarkWireSelect.
 func BenchmarkWireDocumentGet(b *testing.B) {
-	srv, client, _ := benchGovernedWireServer(b, 100, 2048)
+	for _, enc := range benchWireEncodings {
+		b.Run(enc.name, func(b *testing.B) { benchWireDocumentGet(b, enc.features) })
+	}
+}
+
+func benchWireDocumentGet(b *testing.B, features []string) {
+	srv, client, _ := benchGovernedWireServer(b, 100, 2048, features)
 	head, err := srv.Runtime.DAG.Head()
 	if err != nil {
 		b.Fatal(err)
@@ -105,6 +128,8 @@ func BenchmarkWireDocumentGet(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
+	client.wireBytes = 0
+	defer func() { b.ReportMetric(float64(client.wireBytes)/float64(b.N), "wire-B/op") }()
 	for i := 0; i < b.N; i++ {
 		reply := client.requestB(b, wire.DocumentGetMessage{
 			H:         wire.Header{MessageType: wire.MsgDocumentGet, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: client.nextCorrelation()},
@@ -144,6 +169,7 @@ func (c *rawWireClient) requestB(b *testing.B, msg wire.Message) wire.Message {
 	if err := c.conn.Send(frame); err != nil {
 		b.Fatal(err)
 	}
+	c.wireBytes += int64(len(frame))
 	cid := msg.Header().CorrelationID
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -152,6 +178,7 @@ func (c *rawWireClient) requestB(b *testing.B, msg wire.Message) wire.Message {
 			runtime.Gosched()
 			continue
 		}
+		c.wireBytes += int64(len(reply))
 		decoded, err := c.codec.Decode(reply)
 		if err != nil {
 			b.Fatal(err)
@@ -171,6 +198,24 @@ func (c *rawWireClient) handshakeB(b *testing.B, mode wire.ClientMode, namespace
 	if t.Failed() {
 		b.Fatal("handshake failed")
 	}
+}
+
+// handshakeFeaturesB is handshakeB offering features, after which requests are encoded in what
+// the server acked.
+func (c *rawWireClient) handshakeFeaturesB(b *testing.B, namespace string, features []string) {
+	b.Helper()
+	reply := c.requestB(b, wire.HandshakeMessage{
+		H:       wire.Header{MessageType: wire.MsgHandshake, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: c.nextCorrelation()},
+		Request: wire.HandshakePayload{NodeID: "bench", ClientMode: wire.ClientSQL, Namespaces: []string{namespace}, WireFeatures: features},
+	})
+	ack, ok := reply.(wire.HandshakeAckMessage)
+	if !ok || !ack.Response.Accepted {
+		b.Fatalf("handshake: %#v", reply)
+	}
+	if !slices.Equal(ack.Response.WireFeatures, wire.NegotiateWireFeatures(features)) {
+		b.Fatalf("acked %v for an offer of %v", ack.Response.WireFeatures, features)
+	}
+	c.codec = wire.NewCodec(wire.EncodingJSON).WithWireFeatures(ack.Response.WireFeatures)
 }
 
 func (c *rawWireClient) sessionBeginB(b *testing.B, namespace, consistency string) wire.SessionBeginAckMessage {

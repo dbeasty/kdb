@@ -133,6 +133,7 @@ type handshakeDto struct {
 	Password                  *string           `json:"password,omitempty"`
 	Token                     *string           `json:"token,omitempty"`
 	Filter                    *string           `json:"filter,omitempty"`
+	WireFeatures              []string          `json:"wireFeatures,omitempty"`
 }
 
 type handshakeAckDto struct {
@@ -142,6 +143,7 @@ type handshakeAckDto struct {
 	RemoteHeads        map[string]string `json:"remoteHeads"`
 	RejectionReason    *string           `json:"rejectionReason,omitempty"`
 	ServerVersion      string            `json:"serverVersion,omitempty"`
+	WireFeatures       []string          `json:"wireFeatures,omitempty"`
 }
 
 type deltaCommitDto struct {

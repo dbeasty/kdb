@@ -2,7 +2,10 @@ package wire
 
 import (
 	"encoding/json"
+	"slices"
 	"sync"
+
+	"github.com/limidus/kdb/go/kdb/compression"
 )
 
 // Codec encodes and decodes length-prefixed wire frames.
@@ -14,9 +17,14 @@ type Codec interface {
 	DecodeHeader(frame []byte) (Header, error)
 }
 
-// DefaultCodec is the standard JSON-envelope wire codec (v1).
+// DefaultCodec is the standard wire codec. It encodes the JSON envelope unless built by
+// WithWireFeatures with binary frames, and decodes every encoding tag regardless.
 type DefaultCodec struct {
 	encoding PayloadEncoding
+	// binary encodes messages that have a binary form as tag-2 bodies (WireFeatureBinary).
+	binary bool
+	// zstd compresses binary bodies of zstdFrameThreshold bytes or more as tag-3 frames.
+	zstd bool
 }
 
 // NewCodec returns the default wire codec for the given payload encoding tag.
@@ -25,6 +33,19 @@ func NewCodec(encoding PayloadEncoding) *DefaultCodec {
 }
 
 func (c *DefaultCodec) Encoding() PayloadEncoding { return c.encoding }
+
+// WithWireFeatures returns a codec like c that also encodes in the negotiated features' formats -
+// the list a handshake ack carries (NegotiateWireFeatures). Unknown features are ignored, and an
+// empty list returns a JSON-only codec.
+func (c *DefaultCodec) WithWireFeatures(features []string) *DefaultCodec {
+	out := *c
+	out.binary = slices.Contains(features, WireFeatureBinary)
+	out.zstd = out.binary && slices.Contains(features, WireFeatureZstd)
+	return &out
+}
+
+// BinaryFrames reports whether c encodes binary bodies.
+func (c *DefaultCodec) BinaryFrames() bool { return c.binary }
 
 // Encode returns one complete frame in a buffer of its own, which the caller may keep.
 //
@@ -57,6 +78,23 @@ func (c *DefaultCodec) EncodePooled(message Message) (frame []byte, release func
 }
 
 func (c *DefaultCodec) encodeInto(fw *frameWriter, message Message) error {
+	if c.binary && hasBinaryForm(message.Header().MessageType) {
+		if hint := FrameHeaderSize + 1 + binarySizeHint(message); cap(fw.buf) < hint {
+			fw.buf = make([]byte, FrameHeaderSize, hint)
+		} else {
+			fw.reset()
+		}
+		fw.buf = append(fw.buf, tagBinary)
+		var ok bool
+		if fw.buf, ok = appendBinaryBody(fw.buf, message); ok {
+			if c.zstd && len(fw.buf)-FrameHeaderSize-1 >= zstdFrameThreshold {
+				if err := compressBody(fw); err != nil {
+					return err
+				}
+			}
+			return finishFrame(fw, message)
+		}
+	}
 	env, err := messageToEnvelope(message)
 	if err != nil {
 		return err
@@ -73,6 +111,11 @@ func (c *DefaultCodec) encodeInto(fw *frameWriter, message Message) error {
 	if n := len(fw.buf); n > 0 && fw.buf[n-1] == '\n' {
 		fw.buf = fw.buf[:n-1]
 	}
+	return finishFrame(fw, message)
+}
+
+// finishFrame checks the frame's length and patches the header in.
+func finishFrame(fw *frameWriter, message Message) error {
 	totalLength := len(fw.buf)
 	if err := ValidateFrameLength(totalLength, DefaultMaxFrameBytes); err != nil {
 		return err
@@ -82,6 +125,27 @@ func (c *DefaultCodec) encodeInto(fw *frameWriter, message Message) error {
 	writeInt16LE(fw.buf, 4, int16(h.MessageType))
 	writeInt16LE(fw.buf, 6, int16(h.ProtocolVersion))
 	writeInt32LE(fw.buf, 8, int32(h.CorrelationID))
+	return nil
+}
+
+// compressBody replaces fw's tag-2 body with a tag-3 zstd frame of it, when that is smaller. The
+// frame is built in a second pooled buffer and the two are swapped, so a steady stream of large
+// replies allocates nothing for compression.
+func compressBody(fw *frameWriter) error {
+	tmp := framePool.Get().(*frameWriter)
+	tmp.reset()
+	tmp.buf = append(tmp.buf, tagBinaryZstd)
+	body := fw.buf[FrameHeaderSize+1:]
+	out, err := compression.CompressAppend(tmp.buf, body, frameZstdLevel)
+	if err != nil {
+		tmp.release()
+		return err
+	}
+	tmp.buf = out
+	if len(out) < len(fw.buf) {
+		fw.buf, tmp.buf = tmp.buf, fw.buf
+	}
+	tmp.release()
 	return nil
 }
 
@@ -140,7 +204,22 @@ func (c *DefaultCodec) Decode(frame []byte) (Message, error) {
 	}
 	tag := frame[payloadOffset]
 	body := frame[payloadOffset+1 : payloadOffset+header.PayloadLength]
-	if tag != 0 && tag != 1 {
+	switch tag {
+	case 0, 1:
+	case tagBinary:
+		return decodeBinaryBody(header, body)
+	case tagBinaryZstd:
+		// decodeBinaryBody copies every field out of the body, so the decompressed body can live in
+		// a pooled buffer.
+		tmp := framePool.Get().(*frameWriter)
+		defer tmp.release()
+		raw, err := compression.DecompressInto(tmp.buf[:0], body, DefaultMaxFrameBytes)
+		if err != nil {
+			return nil, newDecodeError("invalid zstd frame body")
+		}
+		tmp.buf = raw
+		return decodeBinaryBody(header, raw)
+	default:
 		return nil, newDecodeError("unsupported encoding tag")
 	}
 	var env PayloadEnvelope
