@@ -223,6 +223,9 @@ type RepairSession struct {
 	// Peer is the peer's node id, from its hello.
 	Peer string
 	caps []string
+	// pageBytes is the FETCH page size for history the session pulls (Deepen); 0 means
+	// DefaultPageBytes. From V2ClientConfig.PageBytes.
+	pageBytes int
 }
 
 // OpenRepairSession connects to cfg.PeerURI and says hello for cfg.Namespaces. The peer must
@@ -258,7 +261,7 @@ func openSession(w wire.Codec, transport stream.Transport, cfg V2ClientConfig, n
 		conn.Close()
 		return nil, NewError("peer does not support "+needCap, nil)
 	}
-	return &RepairSession{conn: c, Peer: ack.NodeID, caps: ack.Capabilities}, nil
+	return &RepairSession{conn: c, Peer: ack.NodeID, caps: ack.Capabilities, pageBytes: cfg.PageBytes}, nil
 }
 
 // Close ends the session.

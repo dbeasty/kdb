@@ -85,10 +85,27 @@ var ErrNotShallow = errors.New("peer sync: not a shallow root")
 var ErrPeerLacksHistory = errors.New("peer sync: the peer does not hold the history below this root")
 
 // FetchAncestors fetches every commit the peer holds that is an ancestor-or-self of of, parents
-// first, paged.
+// first, paged, and returns them all. Deepen stores page by page instead (FetchAncestorsPaged);
+// this is for callers that want the whole range in hand.
 func (s *RepairSession) FetchAncestors(ns string, of []codec.Hash, pageBytes int) ([]document.Commit, []document.CommitStub, error) {
 	var commits []document.Commit
 	var stubs []document.CommitStub
+	err := s.FetchAncestorsPaged(ns, of, pageBytes, func(cs []document.Commit, ss []document.CommitStub) error {
+		commits = append(commits, cs...)
+		stubs = append(stubs, ss...)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return commits, stubs, nil
+}
+
+// FetchAncestorsPaged is FetchAncestors handing each page to fn as it arrives, parents first.
+// Each request names only the last page's tips as haves - what the host's cursor needs to
+// continue the transfer (missingCursor.continues) - rather than every page's, so a request stays
+// the same size however deep the history is.
+func (s *RepairSession) FetchAncestorsPaged(ns string, of []codec.Hash, pageBytes int, fn func([]document.Commit, []document.CommitStub) error) error {
 	var haves []codec.Hash
 	for {
 		reply, err := s.conn.request(wire.FetchRequestMessage{
@@ -96,22 +113,30 @@ func (s *RepairSession) FetchAncestors(ns string, of []codec.Hash, pageBytes int
 			Wants: of, Haves: haves, MaxBytes: pageBytes,
 		})
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		page, ok := reply.(wire.PackPageMessage)
 		if !ok {
-			return nil, nil, NewError(fmt.Sprintf("expected PACK_PAGE, got %T", reply), nil)
+			return NewError(fmt.Sprintf("expected PACK_PAGE, got %T", reply), nil)
 		}
-		commits = append(commits, page.Commits...)
-		stubs = append(stubs, page.Stubs...)
+		if err := fn(page.Commits, page.Stubs); err != nil {
+			return err
+		}
 		if page.Done || len(page.Commits) == 0 {
-			return commits, stubs, nil
+			return nil
 		}
-		haves = append(haves, pageTips(page.Commits)...)
+		haves = pageTips(page.Commits)
 	}
 }
 
 // Deepen fetches root's history from the peer behind s and stops treating root as shallow.
+//
+// The history is stored and logged a page at a time, each page under the node's serialization
+// on its own, rather than fetched whole and then stored: the history below a root is as long as
+// the peer's whole log, and holding it all in memory before storing any of it made a deepen
+// O(history) in memory and held the write gate for the whole store. A failure part-way keeps the
+// pages already stored, logged, which a re-run then does not need to fetch again (see the
+// unlogged mark below for what it does still log).
 func Deepen(env IngestEnv, s *RepairSession, root codec.Hash) (DeepenResult, error) {
 	res := DeepenResult{Root: root}
 	if !env.DAG.IsShallow(root) {
@@ -127,78 +152,56 @@ func Deepen(env IngestEnv, s *RepairSession, root codec.Hash) (DeepenResult, err
 			missing = append(missing, p)
 		}
 	}
-	var fetched []document.Commit
-	var stubs []document.CommitStub
-	if len(missing) > 0 {
-		if fetched, stubs, err = s.FetchAncestors(env.NamespaceID, missing, DefaultPageBytes); err != nil {
-			return res, err
-		}
-	}
 
 	node := env.Node
 	if node == nil {
 		node = lockOnlyNode{}
 	}
+	if len(missing) > 0 {
+		pageBytes := s.pageBytes
+		if pageBytes <= 0 {
+			pageBytes = DefaultPageBytes
+		}
+		err := s.FetchAncestorsPaged(env.NamespaceID, missing, pageBytes, func(fetched []document.Commit, stubs []document.CommitStub) error {
+			fresh, err := storeDeepenPage(env, node, fetched, stubs)
+			res.Fetched += fresh
+			return err
+		})
+		if err != nil {
+			return res, err
+		}
+	}
+
 	var durable []func() error
 	lacks := false
 	err = node.Exclusive(func() error {
 		lock := divergenceLockFor(env.NamespaceID)
 		lock.Lock()
 		defer lock.Unlock()
-		for _, st := range stubs {
-			env.DAG.PutStub(st)
-		}
-		// held is every commit the peer sent that this namespace now holds, whether this run
-		// admitted it or a previous one did. It is not the same as what was newly stored: the
-		// skip below is what makes storing idempotent, and a run whose log write failed left
-		// exactly those commits resident, so the next run has to log them rather than pass over
-		// them. Reporting success for a deepen that logged nothing was the defect.
-		var held []document.Commit
-		fresh := 0
-		for _, c := range fetched { // parents first
-			if env.DAG.HasCommit(c.Hash) {
-				held = append(held, c)
-				continue
-			}
-			if err := env.checkSkew(c); err != nil {
-				return err
-			}
-			whole := true
-			for _, p := range c.ParentHashes {
-				if !env.DAG.HasCommit(p) {
-					whole = false
-					break
-				}
-			}
-			// Marked unlogged until persistAll below logs them, like any commit stored from a
-			// peer: should the log write fail, a checkpoint taken before a retry - a clean close,
-			// a maintenance pass - must not describe history the log never received. It would
-			// reopen holding these commits without operations, a retry would find them all held
-			// and fetch nothing, and reading them back to log them would fail for good.
-			if whole {
-				err = env.DAG.PutUnloggedCommit(c) // recomputes the hash: a peer cannot forge history
-			} else {
-				err = env.DAG.PutUnloggedShallowCommit(c)
-			}
-			if err != nil {
-				return fmt.Errorf("peer sync: deepen: storing %s: %w", c.Hash.Hex(), err)
-			}
-			held = append(held, c)
-			fresh++
-		}
-		res.Fetched = fresh
 		for _, p := range rc.ParentHashes {
 			if !env.DAG.HasCommit(p) {
 				lacks = true
 			}
 		}
 		// The history below the root as the DAG now has it, parents first, and the shallow roots
-		// in it. Read back rather than collected above for the reason held gives, and it is the
-		// horizon too: a run that fetched nothing because a failed predecessor had already stored
-		// everything must still name those roots in the marker, or a replay meeting them in the
-		// log would fail the open for want of parents nobody has.
-		var below []document.Commit
-		below, res.Horizon, err = commitsBelow(env.DAG, rc.ParentHashes)
+		// in it. Read back rather than collected from the pages, and it is the horizon too: a run
+		// that fetched nothing because a failed predecessor had already stored everything must
+		// still name those roots in the marker, or a replay meeting them in the log would fail the
+		// open for want of parents nobody has.
+		//
+		// Only what is still marked unlogged is logged again here: the pages logged their own
+		// commits as they were stored, and the mark (dag/unlogged.go) is put back on any whose log
+		// write failed - so it names exactly what a failed run, this one or an earlier one, left
+		// resident without a frame. Re-logging the whole history on every run, as this used to,
+		// doubled every deepen's log writes once pages were logged as they arrived.
+		var toLog []document.Commit
+		res.Horizon, err = commitsBelowEach(env.DAG, rc.ParentHashes, func(c document.Commit) {
+			// A parentless commit is the namespace's own genesis, which every DAG makes for
+			// itself when it opens (dag.NewInMemoryCommitDag) and which no frame has to restore.
+			if len(c.ParentHashes) > 0 && env.DAG.IsUnlogged(c.Hash) {
+				toLog = append(toLog, c)
+			}
+		})
 		if err != nil {
 			return err
 		}
@@ -207,27 +210,6 @@ func Deepen(env IngestEnv, s *RepairSession, root codec.Hash) (DeepenResult, err
 				return err
 			}
 		}
-		// Whatever is held is logged, whether or not the root can be completed: a commit in the
-		// DAG with no frame in the log would lose its operations at the next restart. below is the
-		// history under the root, parents first; held adds anything the peer sent that does not
-		// hang off it, which would otherwise be stored and never logged at all.
-		toLog := make([]document.Commit, 0, len(below)+len(held)+1)
-		seen := make(map[codec.Hash]bool, len(below)+len(held))
-		add := func(cs []document.Commit) {
-			for _, c := range cs {
-				// A parentless commit is the namespace's own genesis, which every DAG makes for
-				// itself when it opens (dag.NewInMemoryCommitDag) and which no frame has to
-				// restore. It is also the one commit replay applies without first asking whether
-				// it extends main, so leaving it out keeps that question from arising.
-				if len(c.ParentHashes) == 0 || seen[c.Hash] {
-					continue
-				}
-				seen[c.Hash] = true
-				toLog = append(toLog, c)
-			}
-		}
-		add(below)
-		add(held)
 		if !lacks {
 			toLog = append(toLog, rc)
 		}
@@ -257,18 +239,102 @@ func Deepen(env IngestEnv, s *RepairSession, root codec.Hash) (DeepenResult, err
 	return res, nil
 }
 
-// commitsBelow lists every commit this namespace holds beneath from, parents first, and which of
-// them are still flagged as shallow roots. It is how Deepen decides what has to be in the log,
-// read out of the DAG rather than remembered from the store loop - see Deepen on re-running.
+// storeDeepenPage stores one page of the history below a shallow root and logs it, under the
+// node's serialization; the log writes are waited for after it. Returns how many commits were
+// newly stored.
+//
+// Every commit the page holds is logged, whether this run stored it or an earlier one did: a run
+// whose log write failed left exactly those resident, and skipping them would leave them without
+// a frame. A repeated frame costs log space and nothing else, because replay stores a commit only
+// if the DAG does not already hold it (embed.applyCommitsTopologically).
+func storeDeepenPage(env IngestEnv, node LocalNode, fetched []document.Commit, stubs []document.CommitStub) (int, error) {
+	var durable []func() error
+	fresh := 0
+	err := node.Exclusive(func() error {
+		lock := divergenceLockFor(env.NamespaceID)
+		lock.Lock()
+		defer lock.Unlock()
+		for _, st := range stubs {
+			env.DAG.PutStub(st)
+		}
+		held := make([]document.Commit, 0, len(fetched))
+		horizon := false
+		for _, c := range fetched { // parents first
+			if env.DAG.HasCommit(c.Hash) {
+				held = append(held, c)
+				horizon = horizon || env.DAG.IsShallow(c.Hash)
+				continue
+			}
+			if err := env.checkSkew(c); err != nil {
+				return err
+			}
+			whole := true
+			for _, p := range c.ParentHashes {
+				if !env.DAG.HasCommit(p) {
+					whole = false
+					break
+				}
+			}
+			// Marked unlogged until persistAll below logs them, like any commit stored from a
+			// peer: should the log write fail, a checkpoint taken before a retry - a clean close,
+			// a maintenance pass - must not describe history the log never received. It would
+			// reopen holding these commits without operations, a retry would find them all held
+			// and fetch nothing, and reading them back to log them would fail for good.
+			var err error
+			if whole {
+				err = env.DAG.PutUnloggedCommit(c) // recomputes the hash: a peer cannot forge history
+			} else {
+				err = env.DAG.PutUnloggedShallowCommit(c)
+				horizon = true
+			}
+			if err != nil {
+				return fmt.Errorf("peer sync: deepen: storing %s: %w", c.Hash.Hex(), err)
+			}
+			held = append(held, c)
+			fresh++
+		}
+		// A new horizon is named in the marker before it is logged: a replay that meets it in the
+		// log must admit it without its parents rather than fail the open.
+		if horizon && env.ShallowRootsChanged != nil {
+			if err := env.ShallowRootsChanged(env.DAG.ShallowRoots()); err != nil {
+				return err
+			}
+		}
+		toLog := held[:0:0]
+		for _, c := range held {
+			// The namespace's own genesis is never logged (see Deepen).
+			if len(c.ParentHashes) > 0 {
+				toLog = append(toLog, c)
+			}
+		}
+		var err error
+		durable, err = env.persistAll(toLog)
+		return err
+	})
+	for _, wait := range durable {
+		if werr := wait(); werr != nil && err == nil {
+			err = fmt.Errorf("peer sync: deepen: persisting fetched history: %w", werr)
+		}
+	}
+	return fresh, err
+}
+
+// commitsBelowEach visits every commit this namespace holds beneath from, parents first, and
+// returns which of them are still flagged as shallow roots. It is how Deepen decides what has to
+// be in the log, read out of the DAG rather than remembered from the store loop - see Deepen on
+// re-running.
 //
 // The walk ends wherever this DAG's own history ends: a parent that is not resident is a stub, a
 // shallow root's missing parent, or history retention truncated away, and there is nothing there
 // to log. Commits still flagged shallow are returned separately because they are what the
 // namespace marker has to name for a replay to admit them without their parents.
-func commitsBelow(d *dag.InMemoryCommitDag, from []codec.Hash) ([]document.Commit, []codec.Hash, error) {
+//
+// Visits rather than collects, and its stack holds hashes, not commits: the history below a
+// bootstrapped root is the peer's whole log, and holding every commit of it - operations included
+// - to log the few that need it was O(history) in memory. A commit is read when it is visited.
+func commitsBelowEach(d *dag.InMemoryCommitDag, from []codec.Hash, visit func(document.Commit)) ([]codec.Hash, error) {
 	type frame struct {
 		hash     codec.Hash
-		commit   document.Commit
 		emitting bool
 	}
 	// Iterative: the history below a bootstrapped root is as deep as the peer's whole log, and
@@ -280,37 +346,37 @@ func commitsBelow(d *dag.InMemoryCommitDag, from []codec.Hash) ([]document.Commi
 		}
 	}
 	push(from)
-	var parentsFirst []document.Commit
 	var shallow []codec.Hash
 	seen := map[codec.Hash]bool{}
 	for len(stack) > 0 {
 		f := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if f.emitting { // every parent of this one has been emitted by now
-			parentsFirst = append(parentsFirst, f.commit)
+		if f.emitting { // every parent of this one has been visited by now
+			// GetCommitOrThrow, not GetCommit: a commit whose operations the retention budget
+			// evicted has to have them loaded back before it is logged, and failing to is worth
+			// reporting rather than writing a frame with no operations in it.
+			c, err := d.GetCommitOrThrow(f.hash)
+			if err != nil {
+				return nil, fmt.Errorf("peer sync: deepen: reading %s back out of the DAG: %w", f.hash.Hex(), err)
+			}
+			visit(c)
 			continue
 		}
 		if seen[f.hash] {
 			continue
 		}
 		seen[f.hash] = true
-		if !d.HasCommit(f.hash) {
+		c, ok := d.GetCommit(f.hash)
+		if !ok {
 			continue
-		}
-		// GetCommitOrThrow, not GetCommit: a commit whose operations the retention budget evicted
-		// has to have them loaded back before it is logged, and failing to is worth reporting
-		// rather than writing a frame with no operations in it.
-		c, err := d.GetCommitOrThrow(f.hash)
-		if err != nil {
-			return nil, nil, fmt.Errorf("peer sync: deepen: reading %s back out of the DAG: %w", f.hash.Hex(), err)
 		}
 		if d.IsShallow(f.hash) {
 			shallow = append(shallow, f.hash)
 		}
-		stack = append(stack, frame{hash: f.hash, commit: c, emitting: true})
+		stack = append(stack, frame{hash: f.hash, emitting: true})
 		push(c.ParentHashes)
 	}
-	return parentsFirst, shallow, nil
+	return shallow, nil
 }
 
 // DeepenAll deepens every shallow root until none is left or the peer has no more history to give.
