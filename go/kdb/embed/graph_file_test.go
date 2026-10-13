@@ -191,6 +191,9 @@ func skipIfNoMmap(t *testing.T) {
 }
 
 func mmapSupported() bool {
+	if !mmapfile.Supported {
+		return false
+	}
 	f, err := os.CreateTemp("", "mmapprobe")
 	if err != nil {
 		return false

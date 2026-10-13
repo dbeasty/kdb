@@ -117,7 +117,7 @@ type treeFile = TreeFile
 // NewTreeFile opens (creating if need be) a namespace's tree directory. It returns
 // ErrTreeFileUnsupported where mapping is not possible, and the caller keeps heap trees.
 func NewTreeFile(opts TreeFileOptions) (*TreeFile, error) {
-	if !littleEndian {
+	if !littleEndian || !mmapfile.Supported {
 		return nil, ErrTreeFileUnsupported
 	}
 	if opts.ResidentBytes <= 0 {
