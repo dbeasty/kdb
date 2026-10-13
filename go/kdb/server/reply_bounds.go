@@ -72,6 +72,22 @@ func rowEncodedBytes(row []string) int {
 // boundResultRows applies the byte cap to a result's rows. It returns how many leading rows fit
 // within limit, and their total encoded size.
 func boundResultRows(rows [][]string, limit int) (fit int, bytes int) {
+	// Escaping at most sextuples a string (\u00XX), so a result whose raw size times six fits
+	// is known to fit without looking at a byte - the common case, which then costs one pass
+	// over the cell lengths instead of one over every cell byte.
+	worst := 0
+	for _, row := range rows {
+		worst += 3 + len(row)*3
+		for _, cell := range row {
+			worst += 6 * len(cell)
+		}
+		if worst > limit {
+			break
+		}
+	}
+	if worst <= limit {
+		return len(rows), worst
+	}
 	for i, row := range rows {
 		n := rowEncodedBytes(row)
 		if bytes+n > limit {

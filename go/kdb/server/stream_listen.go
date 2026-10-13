@@ -305,6 +305,17 @@ func (h *StreamHub) sendDeltaFrame(sub *registeredSubscriber, commit, parent cod
 // returns at least one run (possibly empty: a commit with nothing visible still moves the
 // subscriber's position), and an operation larger than limit travels alone.
 func splitOpsByBytes(ops []document.Op, limit int) [][]document.Op {
+	// Fast path: the worst-case (every byte escaped) size already fits, so nothing is scanned.
+	worst := 0
+	for _, op := range ops {
+		worst += opWorstBytes(op)
+		if worst > limit {
+			break
+		}
+	}
+	if worst <= limit {
+		return [][]document.Op{ops}
+	}
 	var parts [][]document.Op
 	start, size := 0, 0
 	for i, op := range ops {
@@ -316,6 +327,21 @@ func splitOpsByBytes(ops []document.Op, limit int) [][]document.Op {
 		size += n
 	}
 	return append(parts, ops[start:])
+}
+
+// opWorstBytes bounds opEncodedBytes without reading the strings: escaping at most sextuples them.
+func opWorstBytes(op document.Op) int {
+	const fixed = 128
+	switch o := op.(type) {
+	case document.WriteOp:
+		return fixed + 2 + 6*len(o.Patch)
+	case document.FileWriteOp:
+		return fixed + 2 + 6*len(o.Path)
+	case document.SchemaMigrationOp:
+		return fixed + 2 + 6*len(o.MigrationPayload)
+	default:
+		return fixed
+	}
 }
 
 // opEncodedBytes is an upper bound on one operation's size inside a deltaCommit envelope: its
