@@ -50,61 +50,6 @@ type Reader interface {
 	Lookup(key codec.Hash) (value []byte, deleted, found bool, err error)
 }
 
-// BlockCache is an LRU-ish block cache keyed by hash and offset.
-type BlockCache struct {
-	mu       sync.Mutex
-	capacity int64
-	used     int64
-	order    []cacheKey
-	data     map[cacheKey][]byte
-}
-
-type cacheKey struct {
-	hash   codec.Hash
-	offset int64
-}
-
-// NewBlockCache returns a cache with the given byte capacity.
-func NewBlockCache(capacityBytes int64) *BlockCache {
-	return &BlockCache{
-		capacity: capacityBytes,
-		data:     make(map[cacheKey][]byte),
-	}
-}
-
-// Get loads or fetches a block.
-func (c *BlockCache) Get(key codec.Hash, offset int64, loader func() ([]byte, error)) ([]byte, error) {
-	k := cacheKey{hash: key, offset: offset}
-	c.mu.Lock()
-	if v, ok := c.data[k]; ok {
-		c.mu.Unlock()
-		return append([]byte(nil), v...), nil
-	}
-	c.mu.Unlock()
-	v, err := loader()
-	if err != nil {
-		return nil, err
-	}
-	c.put(k, v)
-	return v, nil
-}
-
-func (c *BlockCache) put(k cacheKey, v []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.used += int64(len(v))
-	c.data[k] = append([]byte(nil), v...)
-	c.order = append(c.order, k)
-	for c.used > c.capacity && len(c.order) > 0 {
-		eldest := c.order[0]
-		c.order = c.order[1:]
-		if old, ok := c.data[eldest]; ok {
-			c.used -= int64(len(old))
-			delete(c.data, eldest)
-		}
-	}
-}
-
 // LsmBlobStore layers SSTables for blob lookup.
 type LsmBlobStore struct {
 	io          storage.PlatformIOShim
@@ -167,6 +112,10 @@ func (s *LsmBlobStore) Get(key codec.Hash) []byte {
 // Lookup is Get with the distinction Get cannot express: whether the key is absent from every
 // table, or present as a tombstone.
 //
+// The returned value is read-only and may be shared: with a block cache, every lookup of a key
+// gets the same cached slice rather than a copy, so a caller that modified it would corrupt every
+// later read of that block. The same holds for Get.
+//
 // Each table's index comes from the store's index cache, so a probe costs a map lookup per
 // table plus one block read on a hit. It used to build a fresh reader per table per probe, and
 // each fresh reader read the whole file to learn its size and then re-read and re-parsed the
@@ -191,7 +140,7 @@ func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool
 		if bh.Deleted {
 			return nil, true, true
 		}
-		v, err := NewDefaultReader(s.io, h).ReadBlockAt(bh)
+		v, err := s.readBlock(h, bh)
 		if err != nil {
 			continue
 		}
@@ -199,6 +148,41 @@ func (s *LsmBlobStore) Lookup(key codec.Hash) (value []byte, deleted, found bool
 	}
 	return nil, false, false
 }
+
+// readBlock returns the decoded block bh names in table h, from the block cache when it is
+// there. A block read from disk is cached only while h is still registered - the same rule
+// indexFor follows, and for the same reason: Compact unregisters a table and then drops its
+// cached blocks, so a lookup that read one of its blocks just before the swap must not put it
+// back afterwards, where nothing could ever ask for it again. The check and the insert happen
+// under s.mu, which Compact's swap also holds, so the two cannot interleave.
+func (s *LsmBlobStore) readBlock(h Handle, bh BlockHandle) ([]byte, error) {
+	if v, ok := s.cache.Get(h.SegmentName, bh.Offset); ok {
+		return v, nil
+	}
+	v, err := NewDefaultReader(s.io, h).ReadBlockAt(bh)
+	if err != nil {
+		return nil, err
+	}
+	if s.cache != nil {
+		s.mu.Lock()
+		if s.registeredLocked(h.SegmentName) {
+			s.cache.Put(h.SegmentName, bh.Offset, v)
+		}
+		s.mu.Unlock()
+	}
+	return v, nil
+}
+
+// BlockCache returns the store's block cache, nil when it has none.
+func (s *LsmBlobStore) BlockCache() *BlockCache { return s.cache }
+
+// SetBlockCacheBudget re-bounds the store's block cache. A no-op for a store without one.
+func (s *LsmBlobStore) SetBlockCacheBudget(budgetBytes int64) {
+	s.cache.SetCapacity(budgetBytes)
+}
+
+// BlockCacheBytes reports what the block cache holds, zero for a store without one.
+func (s *LsmBlobStore) BlockCacheBytes() int64 { return s.cache.UsedBytes() }
 
 // Contains reports whether the newest table with an opinion about key holds a value for it,
 // without reading the value: Lookup's answer to "found and not deleted", from the cached
@@ -469,6 +453,15 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 		now = append(now, in.SegmentName)
 	}
 	s.mu.Unlock()
+
+	// After the unlock, and still complete: the inputs are unregistered, and readBlock caches a
+	// block only for a registered table, under the lock the swap held. Every block of theirs that
+	// can ever be in the cache is already there, so this cannot miss one.
+	for _, in := range ordered {
+		if in.SegmentName != merged.SegmentName {
+			s.cache.RemoveSegment(in.SegmentName)
+		}
+	}
 
 	for _, name := range now {
 		if err := s.io.DeleteSegment(name); err != nil {

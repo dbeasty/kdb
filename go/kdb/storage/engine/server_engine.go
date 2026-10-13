@@ -273,7 +273,7 @@ func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree) {
 
 // NewServerEngine constructs a server engine; wal may be nil for in-memory targets.
 func NewServerEngine(namespaceID string, config storage.StorageEngineConfig, w wal.WriteAheadLog) *ServerEngine {
-	cache := sstable.NewBlockCache(config.ResolvedGlobalMemoryBudgetBytes() / 4)
+	cache := sstable.NewBlockCache(storage.ResolvedBlockCacheBytes(config))
 	blobStore := sstable.NewLsmBlobStore(config.IOShim, namespaceID, cache)
 	blobStore.SetIndexCacheBudget(storage.ResolvedSSTableIndexCacheBytes(config))
 	if config.IOShim != nil {

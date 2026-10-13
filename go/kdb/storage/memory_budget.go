@@ -153,6 +153,20 @@ func ResolvedSSTableIndexCacheBytes(cfg StorageEngineConfig) int64 {
 	return budget
 }
 
+// DefaultBlockCacheFraction is the share of the hot-tier budget the SSTable block cache may hold
+// in decoded blocks (see sstable.BlockCache). The engine always sized the cache at a quarter of
+// the budget; until the cache was wired into the lookup path that reservation held nothing.
+const DefaultBlockCacheFraction = 0.25
+
+// ResolvedBlockCacheBytes is how many bytes of decoded SSTable blocks a namespace keeps resident.
+func ResolvedBlockCacheBytes(cfg StorageEngineConfig) int64 {
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultBlockCacheFraction)
+	if budget <= 0 {
+		return DefaultHotTierBytes / 4
+	}
+	return budget
+}
+
 // DefaultHistoryTreeFraction is the share of the hot-tier budget that
 // historical document trees may hold.
 const DefaultHistoryTreeFraction = 0.25
