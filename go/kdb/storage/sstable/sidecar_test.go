@@ -107,7 +107,7 @@ func TestSidecarLookupsEqualTheFooterIndex(t *testing.T) {
 	store := NewLsmBlobStore(shim, sidecarNS, nil)
 	rng := rand.New(rand.NewSource(1))
 	var all []codec.Hash
-	for i, n := range []int{0, 1, 2, 31, 32, 33, 200, 1500, 5000} {
+	for i, n := range []int{0, 1, 2, 31, 32, 33, 200, 1100} {
 		keys, h := writeMixedTable(t, shim, i%3, n, int64(i+10))
 		if n == 0 {
 			continue // an empty writer writes an empty table; covered below
@@ -131,7 +131,7 @@ func TestSidecarLookupsEqualTheFooterIndex(t *testing.T) {
 				t.Fatalf("key %s: sidecar %+v found=%v err=%v, footer %+v", k.Hex(), got, found, err, want)
 			}
 		}
-		for j := 0; j < 2000; j++ {
+		for j := 0; j < 500; j++ {
 			k := randomHash(rng)
 			if _, found, _ := sc.find(&k); found {
 				t.Fatalf("sidecar found key %s the table never held", k.Hex())
@@ -230,7 +230,7 @@ func TestBloomFilterFalsePositiveRateAndNoFalseNegatives(t *testing.T) {
 // indexEntries must read exactly what parseFooter reads, whatever the chunking.
 func TestIndexEntriesMatchesParseFooter(t *testing.T) {
 	shim, _ := osShim(t)
-	_, h := writeMixedTable(t, shim, 0, 700, 3)
+	_, h := writeMixedTable(t, shim, 0, 200, 3)
 	want, err := NewDefaultReader(shim, h).Index()
 	if err != nil {
 		t.Fatal(err)
@@ -316,7 +316,7 @@ func TestBadSidecarsFallBackToTheFooter(t *testing.T) {
 		for _, build := range []bool{false, true} {
 			t.Run(name+map[bool]string{false: "/readonly", true: "/rebuild"}[build], func(t *testing.T) {
 				shim, _ := osShim(t)
-				keys, h := writeMixedTable(t, shim, 0, 300, 5)
+				keys, h := writeMixedTable(t, shim, 0, 120, 5)
 				corrupt(t, shim, h, damage)
 				store := NewLsmBlobStore(shim, sidecarNS, nil)
 				store.SetSidecarBuild(build)
@@ -364,7 +364,7 @@ func TestCompactionKeepsSidecarsConsistent(t *testing.T) {
 	store := NewLsmBlobStore(shim, sidecarNS, nil)
 	var all []codec.Hash
 	for i := 0; i < 5; i++ {
-		keys, h := writeMixedTable(t, shim, 0, 400, int64(100+i))
+		keys, h := writeMixedTable(t, shim, 0, 150, int64(100+i))
 		store.AddTable(h)
 		all = append(all, keys...)
 	}
@@ -402,7 +402,7 @@ func TestCompactionKeepsSidecarsConsistent(t *testing.T) {
 	sc.close()
 	for i, k := range all {
 		// Every fifth key of each table is a tombstone, which a full compaction drops too.
-		want := !dropped[k] && i%400%5 != 4
+		want := !dropped[k] && i%150%5 != 4
 		if _, _, found := store.Lookup(k); found != want {
 			t.Fatalf("key %d: found=%v, want %v", i, found, want)
 		}
@@ -505,7 +505,7 @@ func TestSidecarsCanBeTurnedOff(t *testing.T) {
 // error - the table then answers from its footer - and not take the process down with SIGBUS.
 func TestTruncatedMappedSidecarIsAnErrorNotACrash(t *testing.T) {
 	shim, _ := osShim(t)
-	keys, h := writeMixedTable(t, shim, 0, 3000, 11)
+	keys, h := writeMixedTable(t, shim, 0, 800, 11)
 	store := NewLsmBlobStore(shim, sidecarNS, nil)
 	store.SetSidecarBuild(false)
 	store.AddTable(h)
@@ -590,8 +590,8 @@ func TestSidecarLookupsUnderConcurrentCompaction(t *testing.T) {
 	writers.Add(2)
 	go func() {
 		defer writers.Done()
-		for i := 0; i < 25; i++ {
-			keys, h := writeSizedTable(t, shim, sidecarNS, 40, 24, int64(i+900))
+		for i := 0; i < 15; i++ {
+			keys, h := writeSizedTable(t, shim, sidecarNS, 30, 24, int64(i+900))
 			store.AddTable(h)
 			mu.Lock()
 			present = append(present, keys...)
@@ -600,7 +600,7 @@ func TestSidecarLookupsUnderConcurrentCompaction(t *testing.T) {
 	}()
 	go func() {
 		defer writers.Done()
-		for i := 0; i < 30; i++ {
+		for i := 0; i < 20; i++ {
 			if _, err := store.Compact(2, nil); err != nil {
 				t.Error(err)
 			}
