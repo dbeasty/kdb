@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -189,5 +191,54 @@ func TestTreeFileReadOnlyMapsWithoutWriting(t *testing.T) {
 	ro.Close()
 	if after := treeSegments(t, root, ns); strings.Join(after, ",") != strings.Join(before, ",") {
 		t.Fatalf("a read-only runtime changed the tree directory: %v -> %v", before, after)
+	}
+}
+
+// The engine's history trees are never updated, so on their own they would keep every segment
+// they refer into mapped and on disk. The engine rebases them whenever a segment lands, so
+// through many compactions only the newest chain stays - while every historical tree the store
+// holds still reads as it did.
+func TestTreeFileHistoryDoesNotPinSegments(t *testing.T) {
+	skipIfNoMmap(t)
+	root := t.TempDir()
+	const ns = "test/treefile-history"
+	opts := treeFileOpts(64 << 10)
+	opts.Storage.TreeMaxSegments = 2
+	rt, err := OpenFileRuntimeWithOptions(root, "test", ns, schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	eng := rt.Storage.(*engine.ServerEngine)
+	for i := 0; i < 3000; i++ {
+		b, _ := json.Marshal(map[string]any{"id": treeDocID(i % 1500), "rev": i})
+		if _, err := PutJSONDocument(rt, ns, string(b)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Let the last write-out and its rebase land, and the collector release what they freed.
+	deadline := time.Now().Add(10 * time.Second)
+	files := treeSegments(t, root, ns)
+	for time.Now().Before(deadline) && len(files) > document.DefaultTreeMaxSegments {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+		files = treeSegments(t, root, ns)
+	}
+	for i := 0; i < 20; i++ { // and settle
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	files = treeSegments(t, root, ns)
+	t.Logf("%d segment files on disk with the namespace open: %v; history trees held: %d", len(files), files, eng.HistoryTreesResident())
+	if len(files) > 2*opts.Storage.TreeMaxSegments+1 {
+		t.Fatalf("%d segment files on disk: history is pinning superseded segments", len(files))
+	}
+	// Every historical tree still held reads exactly its documents.
+	for _, tr := range eng.HistoryTrees() {
+		n := 0
+		tr.Walk(func(codec.UUID, codec.Hash) bool { n++; return true })
+		if n != tr.Size() {
+			t.Fatalf("a held tree walks %d entries, sized %d", n, tr.Size())
+		}
 	}
 }

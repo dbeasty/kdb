@@ -107,6 +107,7 @@ type TreeFile struct {
 	mu      sync.Mutex
 	nextSeq uint64
 	keep    map[uint64]bool // the newest checkpoint's segment and its chain: never deleted
+	onWrite func()
 	closed  bool
 	failed  bool // a write failed; stop writing, keep serving from what is mapped and the heap
 }
@@ -875,39 +876,118 @@ func (h *trieTree) rebased() *trieTree {
 	if h == nil || h.gen == h.slab.gen.Load() {
 		return h
 	}
-	s := h.slab
+	out := []*trieTree{h}
+	h.slab.rebaseTrees(out)
+	return out[0]
+}
+
+// rebaseTrees replaces each tree of hs (all of s) made before s's newest segment with its rebase
+// onto it, in one pass: the translation, copies and placements of records several of them reach
+// are shared, so rebasing a history of trees costs what they hold between them, not each.
+func (s *trieSlab) rebaseTrees(hs []*trieTree) {
+	gen := s.gen.Load()
 	s.mu.Lock()
 	target := s.rebaseTo
-	if target == 0 || h.root == target {
+	if target == 0 {
 		s.mu.Unlock()
-		return h
+		return
 	}
 	// Under the lock: the target segment cannot be retired while this reads it.
 	e := getEdit(s.view())
-	r := e.translate(h.root, target)
-	if r != h.root {
+	e.keep = s.chainOf(target)
+	e.memo, e.placed = map[tref]tref{}, map[tref]tref{}
+	roots := make([]tref, len(hs))
+	for i, h := range hs {
+		if h == nil || h.gen == gen || h.root == target {
+			roots[i] = 0
+			continue
+		}
+		r := e.translate(h.root, target)
 		r = s.place(e, r)
+		s.retain(r)
+		roots[i] = r
 	}
-	s.retain(r)
 	s.mu.Unlock()
 	putEdit(e)
-	out := s.adopt(r)
-	runtime.KeepAlive(h)
+	for i, h := range hs {
+		if h != nil && !(h.gen == gen || h.root == target) {
+			hs[i] = s.adopt(roots[i])
+			runtime.KeepAlive(h)
+		}
+	}
+}
+
+// RebaseTrees is Rebased for many trees at once, sharing the work and the copies between trees
+// of one slab - for a holder rebasing a history of trees (TreeFile.SetOnWrite). The result is
+// in the order of ts.
+func RebaseTrees(ts []DocumentTree) []DocumentTree {
+	out := append([]DocumentTree(nil), ts...)
+	bySlab := map[*trieSlab][]int{}
+	for i, t := range ts {
+		if t.trie != nil && t.trie.slab.file.Load() != nil {
+			bySlab[t.trie.slab] = append(bySlab[t.trie.slab], i)
+		}
+	}
+	for s, idx := range bySlab {
+		hs := make([]*trieTree, len(idx))
+		for k, i := range idx {
+			hs[k] = ts[i].trie
+		}
+		s.rebaseTrees(hs)
+		for k, i := range idx {
+			if hs[k] != ts[i].trie {
+				out[i] = DocumentTree{TreeHash: ts[i].TreeHash, Entries: ts[i].Entries, size: ts[i].size, trie: hs[k]}
+			}
+		}
+	}
 	return out
+}
+
+// chainOf is the set of segments the segment holding r depends on, itself included: what a
+// tree rebased onto r may go on referring into. Under s.mu.
+func (s *trieSlab) chainOf(r tref) map[uint64]bool {
+	keep := map[uint64]bool{}
+	if r&refFile != 0 {
+		segmentOf(*s.segs.p.Load(), r).chain(keep)
+	}
+	return keep
 }
 
 // translate returns the tree now (at the same position as file) with every subtree whose hash
 // equals file's at that position replaced by file's record. Merkle hashes make equal hashes
 // equal subtrees, so the result is the same tree; it descends only where they differ.
+//
+// What differs and lives in a segment outside e.keep - a segment the newest one does not build
+// on, superseded by a compaction - is copied into the heap, so that the rebased tree holds no
+// reference into it and it can be released once the trees made before the compaction are gone.
+// What differs is what changed since, so that is all a rebase copies.
 func (e *trieEdit) translate(now, file tref) tref {
 	if now == 0 || now == file {
 		return now
 	}
+	if r, ok := e.memo[now]; ok {
+		return r
+	}
+	r := e.translateRec(now, file)
+	if e.memo != nil {
+		e.memo[now] = r
+	}
+	return r
+}
+
+func (e *trieEdit) translateRec(now, file tref) tref {
 	if file != 0 && *e.v.hash(now) == *e.v.hash(file) {
 		return file
 	}
+	stale := now&refFile != 0 && !e.keep[e.v.seg(now).seq]
 	if now&refLeaf != 0 {
-		return now
+		if !stale {
+			return now
+		}
+		l := e.v.leaf(now)
+		r, rec := e.next()
+		*rec = editRec{hash: l.hash, id: l.id, content: l.content, leaf: true}
+		return r
 	}
 	var fc [16]tref
 	if file != 0 && file&refLeaf == 0 {
@@ -923,7 +1003,7 @@ func (e *trieEdit) translate(now, file tref) tref {
 			nc[i], changed = t, true
 		}
 	}
-	if !changed {
+	if !changed && !stale {
 		return now
 	}
 	r, rec := e.next()
@@ -968,9 +1048,9 @@ func (s *trieSlab) writeOut(f *TreeFile, h *trieTree, docs int, full bool) (*tre
 		return nil, err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := s.register(g); err != nil {
 		g.unmap(true)
+		s.mu.Unlock()
 		return nil, err
 	}
 	root := g.global(g.root)
@@ -980,10 +1060,46 @@ func (s *trieSlab) writeOut(f *TreeFile, h *trieTree, docs int, full bool) (*tre
 	s.createdAtRewrite = s.created
 	s.gen.Add(1)
 	s.release(old)
+	s.mu.Unlock()
+	f.wrote()
 	return g, nil
 }
 
+// SetOnWrite has fn called, on a goroutine of its own, each time a segment of f has been written
+// and trees made before it can be rebased onto it (DocumentTree.Rebased). The holder of trees
+// that are never updated - the engine's history - rebases them there, or they keep the
+// segments they refer into mapped and on disk until they are dropped.
+func (f *TreeFile) SetOnWrite(fn func()) {
+	f.mu.Lock()
+	f.onWrite = fn
+	f.mu.Unlock()
+}
+
+func (f *TreeFile) wrote() {
+	f.mu.Lock()
+	fn := f.onWrite
+	f.mu.Unlock()
+	if fn != nil {
+		go fn()
+	}
+}
+
 // --- Public API ------------------------------------------------------------------------------
+
+// Rebased returns t, or an equal tree moved onto its slab's newest segment: referring into it
+// wherever t's subtrees are the same, and holding none of the records of segments the newest one
+// supersedes. For trees that are kept but never updated - an update rebases on its own - so that
+// segments a compaction superseded can be released (TreeFile.SetOnWrite).
+func (t DocumentTree) Rebased() DocumentTree {
+	if t.trie == nil {
+		return t
+	}
+	h := t.trie.rebased()
+	if h == t.trie {
+		return t
+	}
+	return DocumentTree{TreeHash: t.TreeHash, Entries: t.Entries, size: t.size, trie: h}
+}
 
 // Paged reports whether t is bound to a tree file, and whether its root itself is in a mapped
 // segment (true right after an open that mapped one, or once an update has rebased onto one).

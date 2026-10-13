@@ -114,6 +114,27 @@ func newBoundedTreeStore(budgetBytes int64) *boundedTreeStore {
 	}
 }
 
+// Trees is a snapshot of every tree held, pinned or not.
+func (s *boundedTreeStore) Trees() []document.DocumentTree {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]document.DocumentTree, 0, len(s.trees))
+	for _, e := range s.trees {
+		out = append(out, e.tree)
+	}
+	return out
+}
+
+// Replace swaps the tree held under t's hash for t - an equal tree, as a rebase onto a new tree
+// segment returns - keeping its charge, position and pins. A no-op if nothing is held under it.
+func (s *boundedTreeStore) Replace(t document.DocumentTree) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.trees[t.TreeHash]; ok {
+		e.tree = t
+	}
+}
+
 func (s *boundedTreeStore) Get(h codec.Hash) (document.DocumentTree, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

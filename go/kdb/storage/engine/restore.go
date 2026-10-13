@@ -44,6 +44,48 @@ func (e *ServerEngine) SetTreeFile(f *document.TreeFile) {
 	defer e.treeMu.Unlock()
 	e.treeFile = f
 	e.tree = document.BindTreeFile(e.tree, f)
+	if f != nil {
+		f.SetOnWrite(e.rebaseHeldTrees)
+	}
+}
+
+// rebaseHeldTrees moves the trees this engine holds - the live tree, and the history in the tree
+// store, which is never updated and so never rebases on its own - onto the newest tree segment,
+// in one pass that shares what they have in common. Without it, history trees keep every
+// segment they refer into mapped and on disk until they are evicted, and a compaction briefly
+// doubles the tree's mapped bytes, which the memory budget counts. Each is replaced only if it is
+// still the tree held under its hash; readers holding the old one keep it, unchanged.
+func (e *ServerEngine) rebaseHeldTrees() {
+	if !e.rebasing.CompareAndSwap(false, true) {
+		e.rebaseAgain.Store(true)
+		return
+	}
+	defer e.rebasing.Store(false)
+	for {
+		e.rebaseAgain.Store(false)
+		trees := e.treesByHash.Trees()
+		e.treeMu.Lock()
+		live := e.tree
+		e.treeMu.Unlock()
+		rebased := document.RebaseTrees(append(trees, live))
+		for _, t := range rebased[:len(trees)] {
+			e.treesByHash.Replace(t)
+		}
+		nl := rebased[len(trees)]
+		e.treeMu.Lock()
+		if e.tree.TreeHash == nl.TreeHash {
+			e.tree = nl
+			e.treesMu.Lock()
+			if s := e.latestTree.Load(); s != nil && s.hash == nl.TreeHash {
+				e.latestTree.Store(&treeSnapshot{hash: nl.TreeHash, tree: nl})
+			}
+			e.treesMu.Unlock()
+		}
+		e.treeMu.Unlock()
+		if !e.rebaseAgain.Load() {
+			return
+		}
+	}
 }
 
 // TreeFile is the tree file set by SetTreeFile, or nil.
@@ -167,3 +209,6 @@ func (e *ServerEngine) HistoryTreesPinnedBytes() int64 { return e.treesByHash.Pi
 
 // HistoryTreesResident is how many historical trees are held. For tests.
 func (e *ServerEngine) HistoryTreesResident() int { return e.treesByHash.Len() }
+
+// HistoryTrees is a snapshot of the trees the history store holds.
+func (e *ServerEngine) HistoryTrees() []document.DocumentTree { return e.treesByHash.Trees() }
