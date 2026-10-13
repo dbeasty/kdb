@@ -1,6 +1,7 @@
 package index_test
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -309,5 +310,44 @@ func TestStoreSnapshotManifestNamesItsHead(t *testing.T) {
 	newHead := appendCatalogCommit(t, d, head)
 	if m.HeadCommitHex == newHead.Hex() {
 		t.Error("the manifest must not follow the DAG head; that is what makes it detectably stale")
+	}
+}
+
+// TestSnapshotReplacedWithoutManifestIsNotRestored: a snapshot write that dies after the new
+// bytes land but before the manifest naming their head must not leave the old manifest beside
+// them. Snapshots are taken at heads not yet durable, so a crash can reopen at the very head the
+// old manifest names, and restoring the new bytes then serves documents that head never had.
+func TestSnapshotReplacedWithoutManifestIsNotRestored(t *testing.T) {
+	d, _ := dag.NewInMemoryCommitDag("ns/torn")
+	head, _ := d.Head()
+	id, _ := codec.RandomUUID()
+	desc := index.Descriptor{IndexID: id, FieldName: "a", Type: index.IndexTypeHash}
+	store := index.NewMemoryStore(desc, d)
+	base := t.TempDir()
+	dir := index.IndexDir(base, id)
+	if err := index.SaveStoreSnapshot(dir, store, head); err != nil {
+		t.Fatal(err)
+	}
+
+	next := appendCatalogCommit(t, d, head)
+	docID, _ := codec.RandomUUID()
+	if err := store.Put(index.Entry{DocID: docID, Key: index.StringKey{Value: "k"}, CommitHash: next}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A NaN statistic cannot be encoded, so the manifest write fails after the snapshot's.
+	capture := index.SnapshotCapture{Head: next, Stores: []index.CapturedStore{
+		{Desc: desc, Gen: 1, Data: data, Stats: map[string]float64{"x": math.NaN()}},
+	}}
+	if _, err := index.WriteSnapshots(base, capture); err == nil {
+		t.Fatal("setup: the manifest write was meant to fail")
+	}
+
+	reopened := index.NewMemoryStore(desc, d)
+	if m, err := index.LoadStoreSnapshot(dir, reopened); err == nil {
+		t.Fatalf("restored the new snapshot under a manifest naming %s", m.HeadCommitHex)
 	}
 }
