@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -518,5 +519,32 @@ func TestReadDocumentAtMatchesReadCommitAt(t *testing.T) {
 				t.Fatal("cache never hit")
 			}
 		}
+	}
+}
+
+// Filling a large cache a frame at a time allocates about what it caches: the arena's partial
+// chunk grows geometrically instead of being copied on every step, which had cost ~27 KB of
+// allocation per small frame cached.
+func TestFrameCacheFillAllocatesAboutWhatItHolds(t *testing.T) {
+	c := NewFrameCache(64 << 20)
+	payload := bytes.Repeat([]byte{7}, 300)
+	const n = 20_000
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < n; i++ {
+		c.put(frameKey{gen: 1, off: int64(i) * 1000}, payload)
+	}
+	runtime.ReadMemStats(&after)
+	if got := c.Stats().Frames; got != n {
+		t.Fatalf("cached %d of %d frames; the budget should hold them all", got, n)
+	}
+	perFrame := float64(after.TotalAlloc-before.TotalAlloc) / n
+	t.Logf("%.0f bytes allocated per %d-byte frame; cache reports %d bytes", perFrame, len(payload), c.Bytes())
+	if perFrame > 8*float64(len(payload)) { // pages, page table, index and entries; ~49x before the fix
+		t.Fatalf("%.0f bytes allocated per %d-byte frame cached - the arena is being copied as it grows", perFrame, len(payload))
+	}
+	if c.Bytes() > c.Budget() {
+		t.Fatalf("cache reports %d bytes against a %d budget", c.Bytes(), c.Budget())
 	}
 }
