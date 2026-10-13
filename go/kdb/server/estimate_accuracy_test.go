@@ -224,6 +224,13 @@ func TestOversizedScanRefusedResourceExhausted(t *testing.T) {
 	// the 8MB reserve leaves 8MB; the structural estimate for SELECT * here is ~19-29MB).
 	srv.SetMemoryBudget(16<<20, 0.85, 8<<20, DefaultScanRowBudget)
 	t.Cleanup(func() { srv.memGuard.Stop() })
+	// This test is about grant capacity, not the memory zone - and against a 16MiB budget the
+	// guard's real sampler reads the whole test process, which is far over it: any sample that
+	// lands puts the node in ZoneCritical, which sheds the bounded queries below. It used to
+	// pass only because the test usually finished inside the first 200ms poll interval; a slow
+	// Windows runner took 0.89s and failed. Stop the sampler and start from a fresh guard's zone.
+	srv.memGuard.Stop()
+	srv.memGuard.resetToNormal()
 
 	ln, err := ListenSqlWire("tcp://127.0.0.1:0?bind=true", srv)
 	if err != nil {
