@@ -541,7 +541,7 @@ func (sh *docHashShard) appendBody(body string) (chunk, off uint32) {
 	}
 	if sh.cur < 0 || cap(sh.chunks[sh.cur])-len(sh.chunks[sh.cur]) < n {
 		size := max(sh.nextChunk, n)
-		if sh.nextChunk < bodyArenaMaxChunk {
+		if sh.nextChunk < sh.maxChunk() {
 			sh.nextChunk *= 2
 		}
 		old := sh.cur
@@ -567,6 +567,27 @@ func (sh *docHashShard) accountAppend(c, n int) {
 
 // newChunk allocates a chunk of capacity size, reusing a released chunk's table position if
 // there is one (the position, never the memory).
+// maxChunk is the largest chunk this shard grows to: bodyArenaMaxChunk, but no more than a quarter
+// of the shard's budget. Chunks double up to it, and a shard always holds a partly filled current
+// chunk; at a small budget (64 KiB a shard under a 4 MiB namespace budget) 128 KiB chunks left
+// the arena holding several times what the budget allowed - the version store's heap grew with
+// writes past its bound, which a CI runner caught as 4x the writes costing 2.8x the memory.
+func (sh *docHashShard) maxChunk() int {
+	if sh.budget <= 0 {
+		return bodyArenaMaxChunk
+	}
+	return int(min(int64(bodyArenaMaxChunk), max(int64(bodyArenaMinChunk), sh.budget/4)))
+}
+
+// compactMin is the smallest arena this shard compacts: bodyArenaCompactMin, but no more than half
+// the shard's budget, so a small shard sheds dead bodies before they amount to its whole budget.
+func (sh *docHashShard) compactMin() int64 {
+	if sh.budget <= 0 {
+		return bodyArenaCompactMin
+	}
+	return min(int64(bodyArenaCompactMin), max(int64(bodyArenaMinChunk), sh.budget/2))
+}
+
 func (sh *docHashShard) newChunk(size int) int {
 	return sh.adoptChunk(make([]byte, 0, size))
 }
@@ -614,7 +635,7 @@ func (sh *docHashShard) dropChunk(c int) {
 // maybeCompactLocked compacts the shard once enough of its arena is dead.
 func (sh *docHashShard) maybeCompactLocked() {
 	dead := sh.arenaUsed - sh.arenaLive
-	if sh.arenaUsed >= bodyArenaCompactMin && float64(dead) >= bodyArenaDeadFraction*float64(sh.arenaUsed) {
+	if sh.arenaUsed >= sh.compactMin() && float64(dead) >= bodyArenaDeadFraction*float64(sh.arenaUsed) {
 		sh.compactLocked()
 		return
 	}
