@@ -125,6 +125,20 @@ type eventLog struct {
 	replays     map[replayKey]*postingState
 	replayOrder []replayKey
 	scratch     []byte
+
+	// plan memoizes the last historical plan: a reader pinned one commit behind head (a session's
+	// read head, a paged query) asks for the same cutoff again and again.
+	plan planMemo
+}
+
+type planMemo struct {
+	ok     bool
+	cutoff codec.Hash
+	seq    int64
+	step   uint32
+	base   uint32
+	n      int
+	undo   []int
 }
 
 // headState is the replay result at the lineage's cutoff, maintained in place. Guarded by
@@ -141,6 +155,7 @@ func newEventLog(d *dag.InMemoryCommitDag, opts MemoryOptions) *eventLog {
 }
 
 func (l *eventLog) clearLocked() {
+	l.plan = planMemo{}
 	l.keys = newKeyTable()
 	l.seq = 0
 	l.events = nil
@@ -288,6 +303,7 @@ func (l *eventLog) effects(e *logEvent) []uint32 {
 // possible while the log is complete. Otherwise the state is broken until a rebuild.
 func (l *eventLog) resetHeadLocked(target codec.Hash) bool {
 	l.head = nil
+	l.plan = planMemo{}
 	if l.dropped {
 		l.broken = true
 		l.events, l.eff, l.effBase = nil, nil, 0
@@ -434,7 +450,12 @@ func (l *eventLog) viewLocked(at *codec.Hash) (keyedView, error) {
 		if l.lin.Cutoff() == cutoff {
 			return keyedView{st: h.st}, nil
 		}
+		m := &l.plan
+		if m.ok && m.cutoff == cutoff && m.seq == l.seq && m.step == l.lin.Step() && m.base == l.lin.StepBase() && m.n == len(l.events) {
+			return keyedView{st: h.st, undo: m.undo}, nil
+		}
 		if undo, ok := l.planLocked(cutoff); ok {
+			*m = planMemo{ok: true, cutoff: cutoff, seq: l.seq, step: l.lin.Step(), base: l.lin.StepBase(), n: len(l.events), undo: undo}
 			return keyedView{st: h.st, undo: undo}, nil
 		}
 	}
