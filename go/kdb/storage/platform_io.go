@@ -1,6 +1,9 @@
 package storage
 
-import "errors"
+import (
+	"errors"
+	"sync/atomic"
+)
 
 // SegmentSizer is implemented by shims that can report a segment's length without reading it.
 //
@@ -51,6 +54,28 @@ type SegmentStamper interface {
 type SegmentIntoReader interface {
 	ReadFromSegmentInto(segmentName string, offset int64, dst []byte) (int, error)
 }
+
+// SegmentGenerationer is implemented by shims that can name the current incarnation of a segment:
+// a number that stays the same for as long as the segment is only appended to, and changes when it
+// is deleted - by truncation, retention or repair - and whatever later carries its name is a new
+// file. Generations are unique across every shim in the process (see NextSegmentGeneration), so a
+// generation alone identifies one incarnation of one segment.
+//
+// For caches of segment contents keyed by position, which is how delta.FrameCache keeps a cached
+// frame from outliving its segment: Cassandra's ChunkCache drops a file's chunks when the file is
+// removed, and here the key simply stops being asked for. ok is false when the shim cannot vouch
+// for the segment, and a caller must not cache anything about it then.
+//
+// What it cannot see is a segment changed underneath the shim by another process, which no
+// in-process cache can see either; KDB does not support repairing a store a server has open.
+type SegmentGenerationer interface {
+	SegmentGeneration(segmentName string) (gen uint64, ok bool)
+}
+
+var segmentGenerations atomic.Uint64
+
+// NextSegmentGeneration returns a generation no shim in this process has handed out before.
+func NextSegmentGeneration() uint64 { return segmentGenerations.Add(1) }
 
 // PlatformIOShim is the platform I/O boundary for segment and snapshot storage.
 type PlatformIOShim interface {

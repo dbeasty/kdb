@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -14,7 +15,6 @@ import (
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
-	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/sql"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -75,6 +75,9 @@ type registeredSubscriber struct {
 	principal auth.Principal
 	// filter limits the subscription to the documents matching it; nil is every document.
 	filter sql.Expr
+	// filterKey is filter's text ("" for none): subscribers with the same one share each
+	// commit's filtered view and its encoded frames (stream_fanout.go).
+	filterKey string
 	// checkReads is whether each document is checked against principal before it is sent. Off
 	// for an anonymous hub, which is documented to show everything to everyone.
 	checkReads bool
@@ -133,11 +136,11 @@ func (h *StreamHub) catchUp(sub *registeredSubscriber) error {
 		return err
 	}
 	if chain, ok := h.firstParentChain(head, sub.position); ok {
-		for _, c := range chain {
-			if err := h.sendDelta(sub, c.Hash, sub.position, c.Timestamp.EpochMicros(), c.Operations); err != nil {
+		for _, e := range chain {
+			if err := h.sendCommit(sub, e); err != nil {
 				return err
 			}
-			sub.position = c.Hash
+			sub.position = e.commit.Hash
 		}
 		return nil
 	}
@@ -154,32 +157,44 @@ func (h *StreamHub) catchUp(sub *registeredSubscriber) error {
 
 // firstParentChain lists, oldest first and with their operations, the commits on head's
 // first-parent line down to (not including) from - if from is on it within reach and every one
-// of them still has its operations.
-func (h *StreamHub) firstParentChain(head, from codec.Hash) ([]document.Commit, bool) {
+// of them still has its operations. Commits come from the hub's fan-out cache, so subscribers
+// at the same position load each commit once between them, not once each.
+func (h *StreamHub) firstParentChain(head, from codec.Hash) ([]*fanoutEntry, bool) {
 	d := h.runtime.dag
 	if d == nil {
 		return nil, false
 	}
-	var chain []document.Commit
+	var chain []*fanoutEntry
 	for at := head; at != from; {
+		// Checked before the cache, as before it: a commit whose operations were archived since
+		// it was cached is not sent per commit any more than one that was never cached.
 		if len(chain) == maxPerCommitCatchUp || d.HasStub(at) {
 			return nil, false
 		}
-		c, ok := d.GetCommit(at)
-		if !ok || len(c.ParentHashes) == 0 {
-			return nil, false
-		}
-		ops, err := d.CommitOperations(at)
+		e, err := h.fanout.get(at, func() (document.Commit, error) {
+			c, ok := d.GetCommit(at)
+			if !ok || len(c.ParentHashes) == 0 {
+				return document.Commit{}, errNotChainable
+			}
+			ops, err := d.CommitOperations(at)
+			if err != nil {
+				return document.Commit{}, err
+			}
+			c.Operations = ops
+			return c, nil
+		})
 		if err != nil {
 			return nil, false
 		}
-		c.Operations = ops
-		chain = append(chain, c)
-		at = c.ParentHashes[0]
+		chain = append(chain, e)
+		at = e.commit.ParentHashes[0]
 	}
 	slices.Reverse(chain)
 	return chain, true
 }
+
+// errNotChainable is a commit firstParentChain cannot step through: unknown, or a root.
+var errNotChainable = errors.New("stream: commit not on a first-parent chain")
 
 // treeDelta is the difference between the trees at from and to, as operations: the final body
 // of every document added or changed, a delete for every one removed.
@@ -227,29 +242,11 @@ func (h *StreamHub) treeDelta(from, to codec.Hash) ([]document.Op, int64, error)
 // not read, becomes a delete - it may have held the document before, and must not keep it.
 // Operations that name no document pass only on an unfiltered subscription.
 func (h *StreamHub) visible(sub *registeredSubscriber, ops []document.Op) []document.Op {
-	if sub.filter == nil && !sub.checkReads {
-		return ops
+	ops = filterView(sub.filter, ops)
+	if sub.checkReads {
+		ops, _ = h.readChecked(sub, ops)
 	}
-	out := make([]document.Op, 0, len(ops))
-	for _, op := range ops {
-		switch o := op.(type) {
-		case document.WriteOp:
-			if sub.filter != nil && !sql.EvalPredicate(sub.filter, document.Document{ID: o.DocID, JSON: o.Patch}, schema.None(), nil) ||
-				sub.checkReads && h.runtime.AuthEngine.Authorizer().Authorize(context.Background(), sub.principal,
-					auth.DocumentReadAction{Namespace: h.namespaceID, DocID: o.DocID.String()}) != nil {
-				out = append(out, document.DeleteOp{DocID: o.DocID})
-				continue
-			}
-			out = append(out, o)
-		case document.DeleteOp:
-			out = append(out, o)
-		default:
-			if sub.filter == nil {
-				out = append(out, op)
-			}
-		}
-	}
-	return out
+	return ops
 }
 
 // maxDeltaFrameOpBytes bounds the encoded operation bytes in one deltaCommit frame. A catch-up
@@ -269,36 +266,15 @@ const maxDeltaFrameOpBytes = 4 << 20
 // frame's parent is their position, which this preserves; a subscriber interrupted partway
 // resumes from parent and is sent the same catch-up again, which is safe because a tree delta's
 // operations are final bodies and deletes, so applying them twice is applying them once.
+//
+// This is the tree-delta path, which is per subscriber: its operations depend on the
+// subscriber's position. Per-commit catch-up goes through sendCommit, which shares the work.
 func (h *StreamHub) sendDelta(sub *registeredSubscriber, commit, parent codec.Hash, ts int64, ops []document.Op) error {
-	parts := splitOpsByBytes(h.visible(sub, ops), maxDeltaFrameOpBytes)
-	for i, part := range parts {
-		named := commit
-		if i < len(parts)-1 {
-			named = parent
-		}
-		if err := h.sendDeltaFrame(sub, named, parent, ts, part); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (h *StreamHub) sendDeltaFrame(sub *registeredSubscriber, commit, parent codec.Hash, ts int64, ops []document.Op) error {
-	h.mu.Lock()
-	cid := h.correlation
-	h.correlation++
-	h.mu.Unlock()
-	frame, err := h.wire.Encode(wire.DeltaCommitMessage{
-		H: wire.Header{MessageType: wire.MsgDeltaCommit, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: cid},
-		Payload: wire.DeltaCommitPayload{
-			Namespace: h.namespaceID, CommitHash: commit, ParentHash: parent,
-			TimestampMicros: ts, Operations: ops,
-		},
-	})
+	frames, err := h.encodeDelta(commit, parent, ts, h.visible(sub, ops))
 	if err != nil {
 		return err
 	}
-	return sub.conn.Send(frame)
+	return h.sendFrames(sub, frames)
 }
 
 // splitOpsByBytes cuts ops, in order, into runs whose encoded size stays within limit. It always
@@ -379,6 +355,9 @@ type StreamHub struct {
 	subscribers []*registeredSubscriber
 	correlation int
 
+	// fanout holds recent commits' operations and shared frames (stream_fanout.go).
+	fanout *fanoutCache
+
 	// allowAnonymous skips authenticating the handshake: every subscriber is the anonymous
 	// principal, as every subscriber was before the handshake authenticated at all. Off by
 	// default; only an explicit operator opt-in (kdb-service --stream-allow-anonymous) turns it
@@ -395,7 +374,7 @@ func (h *StreamHub) SetAllowAnonymous(on bool) { h.allowAnonymous.Store(on) }
 // has its own transport (e.g. a test using InMemoryTransport-style wiring, or a future
 // WebSocket listener) can drive one without going through ListenStream's TCP-specific setup.
 func NewStreamHub(w wire.Codec, namespaceID string, runtime *KdbServerRuntime) *StreamHub {
-	return &StreamHub{wire: w, namespaceID: namespaceID, runtime: runtime, correlation: 5000}
+	return &StreamHub{wire: w, namespaceID: namespaceID, runtime: runtime, correlation: 5000, fanout: newFanoutCache()}
 }
 
 // Publish tells every subscriber the namespace has moved, and returns at once: each subscriber's
@@ -481,12 +460,14 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 		principal = p
 	}
 	var filter sql.Expr
+	var filterKey string
 	if msg.Request.Filter != nil && strings.TrimSpace(*msg.Request.Filter) != "" {
 		f, err := sql.ParseFilter(*msg.Request.Filter)
 		if err != nil {
 			return h.encodeHandshakeReject(msg, "filter: "+err.Error()), nil
 		}
 		filter = f
+		filterKey = *msg.Request.Filter
 	}
 	head, err := h.runtime.Runtime.DAG.Head()
 	if err != nil {
@@ -511,6 +492,7 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 		lastAck:    &position,
 		principal:  principal,
 		filter:     filter,
+		filterKey:  filterKey,
 		checkReads: !anonymous,
 		position:   position,
 		wake:       make(chan struct{}, 1),

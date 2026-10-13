@@ -56,6 +56,7 @@ func (e *ServerEngine) SetMemoryBudgetBytes(budgetBytes int64) {
 		e.blobStore.SetIndexCacheBudget(int64(float64(budgetBytes) * storage.DefaultSSTableIndexFraction))
 		e.blobStore.SetBlockCacheBudget(int64(float64(budgetBytes) * storage.DefaultBlockCacheFraction))
 	}
+	e.rebudgetFrameCache(budgetBytes)
 	if e.config.MemtableFlushBytes <= 0 {
 		e.memtableFlushOverride.Store(int64(float64(budgetBytes) * storage.DefaultMemtableFraction))
 	}
@@ -85,7 +86,8 @@ func (e *ServerEngine) MemoryDemandBytes() int64 {
 		return 0
 	}
 	b := e.MemoryBreakdown()
-	resident := b.DocumentBodies + b.DocumentIndex + b.HistoryTrees + b.Memtable + b.SSTableIndexes + b.SSTableBlockCache
+	resident := b.DocumentBodies + b.DocumentIndex + b.HistoryTrees + b.Memtable + b.SSTableIndexes + b.SSTableBlockCache +
+		b.DeltaFrameCache
 	now := e.coldLoads.Load()
 	missed := now > e.lastColdLoads.Load()
 	e.lastColdLoads.Store(now)
@@ -123,13 +125,15 @@ type MemoryBreakdown struct {
 	SSTableIndexes int64
 	// SSTableBlockCache is the decoded SSTable blocks the blob store's cache holds.
 	SSTableBlockCache int64
+	// DeltaFrameCache is the decompressed delta frames the frame cache holds for cold reads.
+	DeltaFrameCache int64
 }
 
 // Total sums every byte figure (not the counts, and not DocumentBodiesLive, which is part of
 // DocumentBodies).
 func (b MemoryBreakdown) Total() int64 {
 	return b.DocumentBodies + b.DocumentIndex + b.LiveTree + b.HistoryTrees + b.PinnedTrees + b.Memtable + b.SSTableIndexes +
-		b.SSTableBlockCache
+		b.SSTableBlockCache + b.DeltaFrameCache
 }
 
 // MemoryBreakdown reports what this engine holds, by structure. See the type.
@@ -163,5 +167,6 @@ func (e *ServerEngine) MemoryBreakdown() MemoryBreakdown {
 		b.SSTableIndexes = e.blobStore.IndexCacheBytes()
 		b.SSTableBlockCache = e.blobStore.BlockCacheBytes()
 	}
+	b.DeltaFrameCache = e.DeltaFrameCache().Bytes()
 	return b
 }

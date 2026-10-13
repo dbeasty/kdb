@@ -79,6 +79,14 @@ func EncodeFrameOnly(header Header, payload []byte) ([]byte, error) {
 	return out, nil
 }
 
+// SetCorrelationID rewrites the correlation id in an encoded frame's header, in place. The id
+// lives only in the fixed header (bytes 8..12, little-endian); no payload encoding repeats it, so
+// one encoded frame can be sent to several peers, each under an id of its own, by copying it and
+// patching those four bytes.
+func SetCorrelationID(frame []byte, correlationID int) {
+	writeInt32LE(frame, 8, int32(correlationID))
+}
+
 func encodingTag(enc PayloadEncoding) byte {
 	if enc == EncodingJSON {
 		return 1

@@ -128,29 +128,41 @@ func frameBody(frame []byte) (body []byte, codecID byte, uncompressed int, err e
 //
 // Errors are Parse's and FromPayloadBytes's, unchanged, so callers report them as before.
 func (pc PageCodec) parseCommit(frame []byte) (document.Commit, error) {
-	body, codecID, uncompressed, err := frameBody(frame)
+	payload, bp, err := framePayload(frame)
+	if bp != nil {
+		defer bufpool.Put(bp)
+	}
 	if err != nil {
 		return document.Commit{}, err
 	}
+	return document.FromPayloadBytes(payload)
+}
+
+// framePayload is Parse without the copy: it returns frame's payload - the body itself for an
+// uncompressed frame, or the body decompressed into a pooled buffer, bp, which the caller returns
+// with bufpool.Put once nothing refers to the payload. bp is nil when there is nothing to return.
+// The CRC is not checked here; callers check it first.
+func framePayload(frame []byte) (payload []byte, bp *[]byte, err error) {
+	body, codecID, uncompressed, err := frameBody(frame)
+	if err != nil {
+		return nil, nil, err
+	}
 	if codecID == pageCodecNone {
-		return document.FromPayloadBytes(body)
+		return body, nil, nil
 	}
 	if uncompressed <= 0 || uncompressed > bufpool.MaxPooled {
 		// Too large to pool (or an implausible size, which Decompress checks against the
 		// frame's own header before allocating for it).
 		payload, err := compression.Decompress(body, uncompressed)
-		if err != nil {
-			return document.Commit{}, err
-		}
-		return document.FromPayloadBytes(payload)
+		return payload, nil, err
 	}
-	bp := bufpool.Get(uncompressed)
-	defer bufpool.Put(bp)
-	payload, err := compression.DecompressInto((*bp)[:0], body, uncompressed)
+	bp = bufpool.Get(uncompressed)
+	payload, err = compression.DecompressInto((*bp)[:0], body, uncompressed)
 	if err != nil {
-		return document.Commit{}, err
+		bufpool.Put(bp)
+		return nil, nil, err
 	}
-	return document.FromPayloadBytes(payload)
+	return payload, bp, nil
 }
 
 func writeInt(a []byte, o, v int) {
