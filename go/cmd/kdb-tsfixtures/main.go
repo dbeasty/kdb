@@ -69,6 +69,7 @@ func main() {
 	dir := *outDir
 
 	writeJSON(filepath.Join(dir, "frames.json"), buildFrames())
+	writeJSON(filepath.Join(dir, "binary-frames.json"), buildBinaryFrames())
 	writeJSON(filepath.Join(dir, "hashes.json"), buildHashes())
 	writeJSON(filepath.Join(dir, "transactions.json"), buildTransactions())
 	fmt.Println("wrote fixtures to", dir)
@@ -178,6 +179,81 @@ func buildFrames() []frameFixture {
 			Kind:          probe.Kind,
 			TypeCode:      int(header.MessageType),
 			CorrelationID: header.CorrelationID,
+			FrameHex:      hex.EncodeToString(frame),
+			EnvelopeJSON:  envelope,
+		})
+	}
+	return out
+}
+
+// buildBinaryFrames is every message with a binary form (wire.WireFeatureBinary), each encoded
+// both ways: frameHex is the tag-2 binary frame and envelopeJson the same message's JSON envelope,
+// so a TS (or Kotlin) codec can check that it decodes the one to what the other says, and that it
+// encodes the JSON form back to exactly these bytes.
+func buildBinaryFrames() []frameFixture {
+	jsonCodec := wire.NewCodec(wire.EncodingJSON)
+	binCodec := jsonCodec.WithWireFeatures([]string{wire.WireFeatureBinary})
+	docJSON := `{"name":"ada","quote":"\"q\"","unicode":"é☃","nl":"a\nb"}`
+	empty := ""
+	sqlError := "no such table"
+	busy := wire.ErrorCodeBusy
+	conflict := wire.ErrorCodeConflict
+	retry := 250
+	zero := 0
+	head := "00" + hex.EncodeToString(make([]byte, 31))
+	docID := "6f9619ff-8b86-d011-b42d-00cf4fc964ff"
+	cases := []struct {
+		name string
+		msg  wire.Message
+	}{
+		{"sessionBegin", wire.SessionBeginMessage{H: hdr(wire.MsgSessionBegin, 3), Namespace: "app/users", ReadConsistency: "READ_COMMITTED"}},
+		{"sessionBeginAt", wire.SessionBeginMessage{H: hdr(wire.MsgSessionBegin, 4), Namespace: "app/users", SessionID: strptr("s"), ReadConsistency: "SNAPSHOT", BaseVersionHex: &head}},
+		{"sessionBeginAck", wire.SessionBeginAckMessage{H: hdr(wire.MsgSessionBeginAck, 3), Namespace: "app/users", SessionID: "sess-1", HeadHex: head, ReadConsistency: "READ_COMMITTED"}},
+		{"sessionBeginAckError", wire.SessionBeginAckMessage{H: hdr(wire.MsgSessionBeginAck, 4), Namespace: "app/users", ReadConsistency: "READ_COMMITTED", Error: strptr("denied")}},
+		{"sqlExec", wire.SqlExecMessage{H: hdr(wire.MsgSqlExec, 5), Namespace: "app/users", SessionID: "sess-1", SQL: "SELECT * FROM users WHERE id = ?", ParametersJSON: strptr(`["u1"]`)}},
+		{"sqlExecPaged", wire.SqlExecMessage{H: hdr(wire.MsgSqlExec, 6), Namespace: "app/users", SessionID: "sess-1", SQL: "SELECT name FROM users", PageSize: 300, Continuation: "opaque-token"}},
+		{"sqlResultRows", wire.SqlResultMessage{H: hdr(wire.MsgSqlResult, 5), Namespace: "app/users", SessionID: "sess-1", Columns: []string{"id", "name", "doc"}, Rows: [][]string{{"u1", "ada", docJSON}, {"u2", "", "é"}}, ReadOnly: true, ResolvedCommitHex: head, ContinuationToken: "next"}},
+		{"sqlResultWrite", wire.SqlResultMessage{H: hdr(wire.MsgSqlResult, 6), Namespace: "app/users", SessionID: "sess-1", RowsAffected: 2, GeneratedIDs: []string{docID, docID}}},
+		{"sqlResultError", wire.SqlResultMessage{H: hdr(wire.MsgSqlResult, 7), Namespace: "app/users", SessionID: "sess-1", Error: &sqlError, ErrorCode: &busy, RetryAfterMs: &retry}},
+		{"txCommit", wire.TxCommitMessage{H: hdr(wire.MsgTxCommit, 8), Namespace: "app/users", SessionID: "sess-1", TransactionBytes: []byte(`{"id":"x"}`)}},
+		{"txCommitEmpty", wire.TxCommitMessage{H: hdr(wire.MsgTxCommit, 9), Namespace: "app/users", SessionID: "sess-1"}},
+		{"txRollback", wire.TxRollbackMessage{H: hdr(wire.MsgTxRollback, 10), Namespace: "app/users", SessionID: "sess-1"}},
+		{"conflictReport", wire.ConflictReportMessage{H: hdr(wire.MsgConflictReport, 8), Namespace: "app/users", ReportBytes: []byte(`{"conflicts":[]}`), ErrorCode: &conflict, RetryAfterMs: &zero}},
+		{"documentGet", wire.DocumentGetMessage{H: hdr(wire.MsgDocumentGet, 11), Namespace: "app/users", DocID: docID}},
+		{"documentGetMinCommit", wire.DocumentGetMessage{H: hdr(wire.MsgDocumentGet, 12), Namespace: "app/users", DocID: docID, MinCommit: head}},
+		{"documentGetResultFound", wire.DocumentGetResultMessage{H: hdr(wire.MsgDocumentGetResult, 11), Namespace: "app/users", DocID: docID, JSON: &docJSON, CommitHex: head}},
+		{"documentGetResultEmptyBody", wire.DocumentGetResultMessage{H: hdr(wire.MsgDocumentGetResult, 12), Namespace: "app/users", DocID: docID, JSON: &empty, CommitHex: head}},
+		{"documentGetResultMissing", wire.DocumentGetResultMessage{H: hdr(wire.MsgDocumentGetResult, 13), Namespace: "app/users", DocID: docID, CommitHex: head}},
+		{"documentGetResultBusy", wire.DocumentGetResultMessage{H: hdr(wire.MsgDocumentGetResult, 14), Error: strptr("busy"), ErrorCode: &busy, RetryAfterMs: &retry}},
+		{"upsert", wire.UpsertMessage{H: hdr(wire.MsgUpsert, 15), Namespace: "app/users", DocID: docID, JSON: docJSON, SessionID: "sess-1"}},
+		{"upsertResult", wire.UpsertResultMessage{H: hdr(wire.MsgUpsertResult, 15), Namespace: "app/users", CommitHex: head}},
+		{"upsertResultError", wire.UpsertResultMessage{H: hdr(wire.MsgUpsertResult, 16), Namespace: "app/users", Error: strptr("too big"), ErrorCode: &busy}},
+	}
+	out := make([]frameFixture, 0, len(cases))
+	for _, tc := range cases {
+		frame, err := binCodec.Encode(tc.msg)
+		if err != nil {
+			fail(fmt.Errorf("%s: %w", tc.name, err))
+		}
+		if frame[wire.FrameHeaderSize] != 2 {
+			fail(fmt.Errorf("%s: not a binary frame", tc.name))
+		}
+		jsonFrame, err := jsonCodec.Encode(tc.msg)
+		if err != nil {
+			fail(fmt.Errorf("%s: %w", tc.name, err))
+		}
+		envelope := string(jsonFrame[wire.FrameHeaderSize+1:])
+		var probe struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal([]byte(envelope), &probe); err != nil {
+			fail(fmt.Errorf("%s: %w", tc.name, err))
+		}
+		out = append(out, frameFixture{
+			Name:          tc.name,
+			Kind:          probe.Kind,
+			TypeCode:      int(tc.msg.Header().MessageType),
+			CorrelationID: tc.msg.Header().CorrelationID,
 			FrameHex:      hex.EncodeToString(frame),
 			EnvelopeJSON:  envelope,
 		})

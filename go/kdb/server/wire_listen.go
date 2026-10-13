@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -156,7 +157,11 @@ const MaxInFlightFrames = 64
 // frames arriving before a successful handshake are answered inline, in order, with the
 // existing "not authenticated" errors.
 type sqlWireConnHandler struct {
-	codec    wire.Codec
+	codec wire.Codec
+	// negotiated, once a handshake has agreed wire features (binary frames, B4), is the codec
+	// replies are encoded with; nil keeps them on codec. Incoming frames are decoded by codec
+	// either way, since decoding goes by each frame's own encoding tag.
+	negotiated atomic.Pointer[wire.DefaultCodec]
 	runtime  *KdbServerRuntime
 	sessions *SessionManager
 	parser   sql.Parser
@@ -266,7 +271,7 @@ func (h *sqlWireConnHandler) dispatchAndSendReserved(conn FrameConn, message wir
 		h.replies.settle(estimate, 0)
 		return
 	}
-	frame, release, ok := encodeReplyOrError(h.codec, conn, reply)
+	frame, release, ok := encodeReplyOrError(h.replyCodec(), conn, reply)
 	if !ok {
 		h.replies.settle(estimate, 0)
 		return
@@ -356,7 +361,15 @@ func (h *sqlWireConnHandler) handleFrame(frame []byte) ([]byte, error) {
 	if reply == nil {
 		return nil, nil
 	}
-	return h.codec.Encode(reply)
+	return h.replyCodec().Encode(reply)
+}
+
+// replyCodec is the codec this connection's replies are encoded with.
+func (h *sqlWireConnHandler) replyCodec() wire.Codec {
+	if c := h.negotiated.Load(); c != nil {
+		return c
+	}
+	return h.codec
 }
 
 // dispatchRecovering is dispatch with a panic backstop: a panic costs one request, not the
@@ -496,11 +509,21 @@ func (h *sqlWireConnHandler) handleHandshake(msg wire.HandshakeMessage) wire.Mes
 		reason := err.Error()
 		return handshakeAck(msg, false, "", &reason)
 	}
+	ack := handshakeAck(msg, true, head.Hex(), nil)
+	// Wire features are agreed only on an accepted handshake, and only with a codec that can
+	// produce them. The ack itself is a JSON frame either way (a handshake has no binary form),
+	// so a client reads it before it has switched anything.
+	if dc, ok := h.codec.(*wire.DefaultCodec); ok {
+		if features := wire.NegotiateWireFeatures(msg.Request.WireFeatures); len(features) > 0 {
+			ack.Response.WireFeatures = features
+			h.negotiated.Store(dc.WithWireFeatures(features))
+		}
+	}
 	h.authMu.Lock()
 	h.principal = principal
 	h.authenticated = true
 	h.authMu.Unlock()
-	return handshakeAck(msg, true, head.Hex(), nil)
+	return ack
 }
 
 // sessionBeginError is a rejected SessionBeginAck (empty SessionID) carrying an explicit error

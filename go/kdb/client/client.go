@@ -15,8 +15,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -230,8 +232,12 @@ func (tx Transaction) operations() ([]document.Op, error) {
 // use: every request carries its own correlation id, so multiple goroutines can have calls in
 // flight on one Client at once (component 40 spec §5).
 type Client struct {
-	conn         stream.ConnectionHandle
-	codec        wire.Codec
+	conn stream.ConnectionHandle
+	// codec decodes every reply (by its own encoding tag) and encodes the handshake; requests
+	// after it are encoded with encoder, which the handshake ack's wire features choose.
+	codec        *wire.DefaultCodec
+	encoder      atomic.Pointer[wire.DefaultCodec]
+	features     []string
 	authorNodeID codec.UUID
 
 	mu          sync.Mutex
@@ -290,6 +296,11 @@ type ConnectOptions struct {
 	//
 	// When nil, the scheme decides as before.
 	Transport stream.Transport
+
+	// JSONOnly keeps the connection on the JSON envelope: the handshake offers no wire features,
+	// so neither side sends binary frames. For comparing the two encodings, and as a way out
+	// should the binary one ever misbehave against a particular server.
+	JSONOnly bool
 }
 
 // Connect dials addr (host:port, or a tcp://... wire URI) and performs the wire handshake.
@@ -337,9 +348,13 @@ func ConnectWithOptions(ctx context.Context, addr string, token string, opts Con
 		namespaces:   make(map[string]*namespaceState),
 		correlation:  1,
 	}
+	c.encoder.Store(c.codec)
 	go c.readLoop()
 
 	req := wire.HandshakePayload{NodeID: "kdb-client-go", ClientMode: wire.ClientSQL, Namespaces: opts.Namespaces}
+	if !opts.JSONOnly {
+		req.WireFeatures = wire.SupportedWireFeatures
+	}
 	if token != "" {
 		req.Token = &token
 	}
@@ -362,8 +377,18 @@ func ConnectWithOptions(ctx context.Context, addr string, token string, opts Con
 		}
 		return nil, fmt.Errorf("%w: %s", ErrUnauthenticated, reason)
 	}
+	// Only what the server acked: an older server, or the Kotlin one, acks no features and the
+	// connection stays on JSON.
+	if features := wire.NegotiateWireFeatures(ack.Response.WireFeatures); len(features) > 0 {
+		c.features = features
+		c.encoder.Store(c.codec.WithWireFeatures(features))
+	}
 	return c, nil
 }
+
+// WireFeatures returns the wire features the handshake agreed (wire.WireFeatureBinary and so on),
+// or nil when the connection is on the JSON envelope.
+func (c *Client) WireFeatures() []string { return slices.Clone(c.features) }
 
 // hasScheme reports whether uri already names a transport scheme (e.g. "tcp://host:port") as
 // opposed to a bare "host:port" or "host:port?query" Connect is also documented to accept.
@@ -453,7 +478,7 @@ func (c *Client) request(ctx context.Context, msg wire.Message) (wire.Message, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	frame, err := c.codec.Encode(msg)
+	frame, err := c.encoder.Load().Encode(msg)
 	if err != nil {
 		return nil, err
 	}

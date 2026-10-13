@@ -43,7 +43,15 @@ export type { ConflictDetail, ErrorCode } from "./errors.ts";
 // The wire layer is exported for tooling (kdb-inspect-style frame dumps, conformance tests)
 // and for @kdb/embed, which shares the transaction and content-hash encodings.
 export { contentHash, encodeDocumentBody } from "./wire/hash.ts";
-export { decodeFrame, decodeHeader, encodeFrame, FrameReader } from "./wire/frame.ts";
+export {
+  decodeFrame,
+  decodeFrameBody,
+  decodeHeader,
+  encodeFrame,
+  encodeFrameBody,
+  FrameReader,
+} from "./wire/frame.ts";
+export { decodeBinaryBody, encodeBinaryBody, WIRE_FEATURE_BINARY } from "./wire/binary.ts";
 export { decodeMessage, encodeMessage } from "./wire/envelope.ts";
 export { MSG } from "./wire/messages.ts";
 export type { MessageKind, TransactionDto } from "./wire/messages.ts";

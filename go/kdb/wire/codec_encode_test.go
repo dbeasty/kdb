@@ -137,8 +137,29 @@ func BenchmarkCodecEncodePooledDocumentGetResult(b *testing.B) {
 	benchEncode(b, sampleMessages()[2], true)
 }
 
+// benchCodecs are the encodings the codec benchmarks compare: the JSON envelope, binary frames
+// (B4), and binary frames with zstd above the threshold.
+var benchCodecs = []struct {
+	name  string
+	codec *DefaultCodec
+}{
+	{"json", NewCodec(EncodingJSON)},
+	{"binary", NewCodec(EncodingJSON).WithWireFeatures([]string{WireFeatureBinary})},
+	{"binary+zstd", NewCodec(EncodingJSON).WithWireFeatures([]string{WireFeatureBinary, WireFeatureZstd})},
+}
+
 func benchEncode(b *testing.B, msg Message, pooled bool) {
-	c := NewCodec(EncodingJSON)
+	for _, bc := range benchCodecs {
+		b.Run(bc.name, func(b *testing.B) { benchEncodeWith(b, bc.codec, msg, pooled) })
+	}
+}
+
+func benchEncodeWith(b *testing.B, c *DefaultCodec, msg Message, pooled bool) {
+	frame, err := c.Encode(msg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(len(frame)), "wire-B/op")
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		if pooled {
@@ -164,7 +185,12 @@ func BenchmarkCodecDecodeDocumentGetResult(b *testing.B) {
 }
 
 func benchDecode(b *testing.B, msg Message) {
-	c := NewCodec(EncodingJSON)
+	for _, bc := range benchCodecs {
+		b.Run(bc.name, func(b *testing.B) { benchDecodeWith(b, bc.codec, msg) })
+	}
+}
+
+func benchDecodeWith(b *testing.B, c *DefaultCodec, msg Message) {
 	frame, err := c.Encode(msg)
 	if err != nil {
 		b.Fatal(err)

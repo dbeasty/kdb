@@ -86,6 +86,21 @@ func Compress(input []byte, level int) ([]byte, error) {
 	return pe.enc.EncodeAll(input, make([]byte, 0, len(input))), nil
 }
 
+// CompressAppend is Compress, appending the frame to dst instead of to a fresh buffer, so a caller
+// with a reusable buffer pays no allocation for the output.
+func CompressAppend(dst, input []byte, level int) ([]byte, error) {
+	if level <= 0 {
+		level = 3
+	}
+	pool := encoderPool(zstd.EncoderLevelFromZstd(level))
+	pe := pool.Get().(*pooledEncoder)
+	if pe.err != nil {
+		return nil, pe.err
+	}
+	defer pool.Put(pe)
+	return pe.enc.EncodeAll(input, dst), nil
+}
+
 // Decompress ZSTD-decompresses input, enforcing maxOutputSize (default 64MiB). The result is a
 // fresh slice the caller owns.
 func Decompress(input []byte, maxOutputSize int) ([]byte, error) {

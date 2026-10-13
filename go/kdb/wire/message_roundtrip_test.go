@@ -649,7 +649,7 @@ func TestDecodeRejectsUnsupportedEncodingTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frame[wire.FrameHeaderSize] = 9 // the encoding tag byte; only 0 and 1 are defined
+	frame[wire.FrameHeaderSize] = 9 // the encoding tag byte; only 0-3 are defined
 	if _, err := c.Decode(frame); err == nil {
 		t.Fatal("expected an error for an unsupported encoding tag")
 	}

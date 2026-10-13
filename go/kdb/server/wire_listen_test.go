@@ -35,6 +35,8 @@ type rawWireClient struct {
 	conn        stream.ConnectionHandle
 	codec       wire.Codec
 	correlation int
+	// wireBytes counts frame bytes sent and received by requestB.
+	wireBytes int64
 }
 
 func dialRawWireClient(t *testing.T, addr string) *rawWireClient {
