@@ -34,7 +34,10 @@ import (
 //	done
 //
 // KDB_MEMPROFILE_DOCS and KDB_MEMPROFILE_COMMITS size the namespace (default 100,000 documents,
-// 500,000 commits: every document inserted once, then updated at random).
+// 500,000 commits: every document inserted once, then updated at random). KDB_MEMPROFILE_BATCH=n
+// builds it n writes to a commit (putJSONBatch) - the same documents and writes in a fraction of
+// the commits, for namespaces too large to build one write at a time (the 10M-document run);
+// COMMITS then counts writes, and the namespace holds about COMMITS/n commits.
 func TestMemoryProfile(t *testing.T) {
 	phase := os.Getenv("KDB_MEMPROFILE_PHASE")
 	if phase == "" {
@@ -62,12 +65,16 @@ func TestMemoryProfile(t *testing.T) {
 		opts.Storage.Graph.Memory = dag.GraphMemory(m) // "go" or "kdb"; ignored by builds without it
 	}
 	docID := func(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", i) }
-	put := func(rt *EmbeddedKdbRuntime, i, rev int) {
+	body := func(i, rev int) string {
 		b, _ := json.Marshal(map[string]any{"id": docID(i), "rev": rev, "name": fmt.Sprintf("user-%d", i), "score": rev % 997})
-		if _, err := PutJSONDocument(rt, ns, string(b)); err != nil {
+		return string(b)
+	}
+	put := func(rt *EmbeddedKdbRuntime, i, rev int) {
+		if _, err := PutJSONDocument(rt, ns, body(i, rev)); err != nil {
 			t.Fatal(err)
 		}
 	}
+	batch := envOr("KDB_MEMPROFILE_BATCH", 1)
 	open := func() *EmbeddedKdbRuntime {
 		rt, err := OpenFileRuntimeWithOptions(dir, "mem", ns, schema.None(), opts)
 		if err != nil {
@@ -82,19 +89,49 @@ func TestMemoryProfile(t *testing.T) {
 		rt := open()
 		start := time.Now()
 		rng := rand.New(rand.NewSource(1))
-		for c := 0; c < commits; c++ {
-			if c < docs {
-				put(rt, c, 0)
-			} else {
-				put(rt, rng.Intn(docs), c)
+		pending := make([]string, 0, batch)
+		flush := func() {
+			if len(pending) == 0 {
+				return
 			}
-			if c%50_000 == 49_999 {
+			if err := putJSONBatch(rt, ns, pending); err != nil {
+				t.Fatal(err)
+			}
+			pending = pending[:0]
+		}
+		for c := 0; c < commits; c++ {
+			i, rev := c, 0
+			if c >= docs {
+				i, rev = rng.Intn(docs), c
+			}
+			if batch <= 1 {
+				put(rt, i, rev)
+			} else if pending = append(pending, body(i, rev)); len(pending) == batch {
+				flush()
+			}
+			// Maintenance as a running server's loop would: every 50,000 commits, or for a batched
+			// build every 500,000 writes, so tables are compacted as they accumulate rather than all
+			// at close.
+			if every := 50_000 * min(batch, 10); c%every == every-1 {
+				flush()
+				m := time.Now()
 				rt.Maintain() // what a running server's maintenance loop does
+				if d := time.Since(m); d > time.Second {
+					t.Logf("  maintenance at %d writes took %v", c+1, d.Round(time.Millisecond))
+				}
+			}
+			if c > 0 && c%1_000_000 == 0 {
+				t.Logf("  %d writes in %v", c, time.Since(start).Round(time.Second))
 			}
 		}
+		flush()
+		t.Logf("  %d writes in %v; maintenance and close follow", commits, time.Since(start).Round(time.Second))
+		m := time.Now()
 		rt.Maintain()
+		c := time.Now()
 		rt.Close()
-		t.Logf("built %d documents, %d commits in %v", docs, commits, time.Since(start).Round(time.Second))
+		t.Logf("  final maintenance %v, close %v", c.Sub(m).Round(time.Millisecond), time.Since(c).Round(time.Millisecond))
+		t.Logf("built %d documents, %d writes (%d to a commit) in %v", docs, commits, batch, time.Since(start).Round(time.Second))
 
 	case "open":
 		peak := sampleHeap()
