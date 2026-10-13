@@ -22,8 +22,12 @@ export function bytesToWire(bytes: Uint8Array): number[] {
   return Array.from(bytes);
 }
 
-/** Decodes the wire's array of numbers back to bytes. */
+/**
+ * Decodes the wire's array of numbers back to bytes. A Uint8Array - what a binary frame body
+ * carries for the same field - is returned as is.
+ */
 export function bytesFromWire(value: unknown, field: string): Uint8Array {
+  if (value instanceof Uint8Array) return value;
   if (!Array.isArray(value)) {
     throw new KdbProtocolError(
       `kdb: ${field} must be a JSON array of byte values, got ${describe(value)}`,

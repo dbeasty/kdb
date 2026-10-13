@@ -8,7 +8,7 @@
  *   offset 6  size 2  protocolVersion (i16)
  *   offset 8  size 4  correlationId (i32)
  *   offset 12 size 1  payload encoding tag
- *   offset 13 size n  JSON envelope, UTF-8
+ *   offset 13 size n  JSON envelope, UTF-8 (tag 1), or a binary body (tag 2, see binary.ts)
  */
 
 import { KdbProtocolError } from "../errors.ts";
@@ -44,10 +44,20 @@ export function encodeFrame(
   envelope: unknown,
   options: { protocolVersion?: number; maxFrameBytes?: number } = {},
 ): Uint8Array {
+  return encodeFrameBody(typeCode, correlationId, ENCODING_JSON, utf8Encode(JSON.stringify(envelope)), options);
+}
+
+/** Builds a complete frame from an already encoded payload body and its encoding tag. */
+export function encodeFrameBody(
+  typeCode: number,
+  correlationId: number,
+  encodingTag: number,
+  body: Uint8Array,
+  options: { protocolVersion?: number; maxFrameBytes?: number } = {},
+): Uint8Array {
   const protocolVersion = options.protocolVersion ?? KDB_WIRE_PROTOCOL_VERSION;
   const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
 
-  const body = utf8Encode(JSON.stringify(envelope));
   const payloadLength = 1 + body.length;
   const frameLength = FRAME_HEADER_SIZE + payloadLength;
 
@@ -63,7 +73,7 @@ export function encodeFrame(
   view.setUint16(4, typeCode, true);
   view.setInt16(6, protocolVersion, true);
   view.setInt32(8, correlationId, true);
-  frame[FRAME_HEADER_SIZE] = ENCODING_JSON;
+  frame[FRAME_HEADER_SIZE] = encodingTag;
   frame.set(body, FRAME_HEADER_SIZE + 1);
   return frame;
 }
@@ -105,24 +115,35 @@ export function decodeHeader(
   };
 }
 
-/** Parses a whole frame: header, encoding tag, and the JSON envelope. */
+/** Splits a whole frame into its header, encoding tag and payload body, undecoded. */
+export function decodeFrameBody(
+  frame: Uint8Array,
+  maxFrameBytes = DEFAULT_MAX_FRAME_BYTES,
+): { header: FrameHeader; encodingTag: number; body: Uint8Array } {
+  const header = decodeHeader(frame, maxFrameBytes);
+  if (frame.length < FRAME_HEADER_SIZE + 1 || header.payloadLength < 1) {
+    throw new KdbProtocolError("kdb: frame too short for payload");
+  }
+  const encodingTag = frame[FRAME_HEADER_SIZE]!;
+  return { header, encodingTag, body: frame.subarray(FRAME_HEADER_SIZE + 1, header.frameLength) };
+}
+
+/** Parses a whole frame carrying a JSON envelope: header, encoding tag, and the envelope. */
 export function decodeFrame(
   frame: Uint8Array,
   maxFrameBytes = DEFAULT_MAX_FRAME_BYTES,
 ): DecodedFrame {
-  const header = decodeHeader(frame, maxFrameBytes);
-  if (frame.length < FRAME_HEADER_SIZE + 1) {
-    throw new KdbProtocolError("kdb: frame too short for payload");
-  }
-  const encodingTag = frame[FRAME_HEADER_SIZE]!;
+  const { header, encodingTag, body } = decodeFrameBody(frame, maxFrameBytes);
   if (encodingTag !== ENCODING_JSON) {
     throw new KdbProtocolError(
-      `kdb: unsupported payload encoding tag 0x${encodingTag.toString(16)} ` +
-        "(this client negotiates JSON only)",
+      `kdb: unsupported payload encoding tag 0x${encodingTag.toString(16)} for a JSON envelope`,
     );
   }
-  const body = frame.subarray(FRAME_HEADER_SIZE + 1, header.frameLength);
+  return { header, encodingTag, envelope: parseEnvelope(body) };
+}
 
+/** Parses a JSON envelope body. */
+export function parseEnvelope(body: Uint8Array): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(utf8Decode(body));
@@ -132,7 +153,7 @@ export function decodeFrame(
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new KdbProtocolError("kdb: payload envelope is not a JSON object");
   }
-  return { header, encodingTag, envelope: parsed as Record<string, unknown> };
+  return parsed as Record<string, unknown>;
 }
 
 /**
