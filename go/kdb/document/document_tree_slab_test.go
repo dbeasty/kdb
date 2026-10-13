@@ -624,3 +624,48 @@ func TestSlabConcurrentWritersFromOneBase(t *testing.T) {
 		t.Fatal("the shared base changed under its writers")
 	}
 }
+
+// TestSlabFreedWithItsLastTree: dropping every tree of a slab frees the slab - nothing (a queued
+// cleanup's argument, say) keeps it alive once the cleanups already running have finished.
+func TestSlabFreedWithItsLastTree(t *testing.T) {
+	r := rand.New(rand.NewSource(6))
+	entries := randomEntriesFrom(r, testIDs(r, 100000))
+	runtime.GC()
+	before, _ := settledHeap()
+	tree, err := BuildTrieDocumentTree(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1000; i++ { // versions with cleanups pending
+		var h codec.Hash
+		r.Read(h.Bytes[:])
+		tree, _ = tree.With(keyUUID(&[16]byte{byte(i), byte(i >> 8)}), h)
+	}
+	held, _ := settledHeap()
+	slab := tree.trie.slab.self
+	runtime.KeepAlive(tree)
+	tree = DocumentTree{}
+	for deadline := time.Now().Add(5 * time.Second); slab.Value() != nil && time.Now().Before(deadline); {
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+	after, _ := settledHeap()
+	if slab.Value() != nil {
+		t.Fatal("the slab is still reachable after its last tree went")
+	}
+	t.Logf("slab %.1f MB while held, %.1f MB after its trees went", float64(held-before)/(1<<20), float64(int64(after)-int64(before))/(1<<20))
+	if int64(after)-int64(before) > int64(held-before)/10 {
+		t.Fatalf("the slab outlived its last tree: %d bytes still held of %d", after-before, held-before)
+	}
+	runtime.KeepAlive(entries)
+}
+
+func randomEntriesFrom(r *rand.Rand, ids []codec.UUID) map[codec.UUID]codec.Hash {
+	m := make(map[codec.UUID]codec.Hash, len(ids))
+	for _, id := range ids {
+		var h codec.Hash
+		r.Read(h.Bytes[:])
+		m[id] = h
+	}
+	return m
+}
