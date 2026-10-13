@@ -27,7 +27,7 @@ func (e *ServerEngine) RestoreLiveTree(namespaceID string, tree document.Documen
 	})
 	e.tree = tree
 	e.treesMu.Lock()
-	e.publishTreeLocked(tree)
+	e.publishTreeLocked(tree, 0)
 	e.treesMu.Unlock()
 }
 

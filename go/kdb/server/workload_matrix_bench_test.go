@@ -85,6 +85,13 @@ func newWorkloadServerWithOptions(b *testing.B, ns string, opts embed.StorageOpt
 	b.Cleanup(closeRuntime)
 	srv := NewKdbServerRuntime(rt)
 	srv.SetWriteQueueCapacityForTest(4096)
+	// Pinned to the normal zone: the guard reads real process memory, so on a machine where
+	// other work is running it can trip mid-run and shed or slow the very operations being
+	// timed, which is a property of the host, not of the code under test.
+	if srv.memGuard != nil { // nil when the runtime has no memory budget to guard
+		srv.memGuard.Stop()
+		srv.memGuard.resetToNormal()
+	}
 	return srv, closeRuntime
 }
 

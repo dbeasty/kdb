@@ -70,27 +70,22 @@ func (e *ServerEngine) SetMemoryBudgetBytes(budgetBytes int64) {
 // re-reading versions from the delta log asks for more than it has, every pass, until it stops
 // missing.
 //
-// Not on any hot path; it walks the stores' shards. Called once per namespace per rebalance.
+// "What it holds" is the stores a share governs, at their real footprint: the version store
+// (arena, dead bytes awaiting compaction, slot index and placeholder pins - the pinned live
+// bodies were always in here), the evictable part of the tree store, both memtable
+// generations, the SSTable block cache, and the parsed SSTable indexes, which
+// SetMemoryBudgetBytes bounds but which were left out of the demand until now. The live trie, pinned trees and the commit graph are
+// reported by MemoryBreakdown but kept out of the demand: no share can shrink them, so counting
+// them would only move pool between namespaces without changing what either can evict.
+//
+// Not on any hot path; it takes each store's locks once. Called once per namespace per
+// rebalance.
 func (e *ServerEngine) MemoryDemandBytes() int64 {
 	if e == nil {
 		return 0
 	}
-	var resident int64
-	if e.docsByHash != nil {
-		resident += e.docsByHash.ResidentBytes()
-	}
-	if e.treesByHash != nil {
-		// Evictable rather than resident: see boundedTreeStore.EvictableBytes.
-		resident += e.treesByHash.EvictableBytes()
-	}
-	if e.memTable != nil {
-		resident += e.memTable.SizeBytes()
-	}
-	if e.blobStore != nil {
-		// Decoded SSTable blocks: a cache, but resident bytes all the same, and the arbiter
-		// cannot weigh what it is not told about.
-		resident += e.blobStore.BlockCacheBytes()
-	}
+	b := e.MemoryBreakdown()
+	resident := b.DocumentBodies + b.DocumentIndex + b.HistoryTrees + b.Memtable + b.SSTableIndexes + b.SSTableBlockCache
 	now := e.coldLoads.Load()
 	missed := now > e.lastColdLoads.Load()
 	e.lastColdLoads.Store(now)
@@ -98,4 +93,72 @@ func (e *ServerEngine) MemoryDemandBytes() int64 {
 		return resident + int64(float64(resident)*coldLoadGrowthFactor)
 	}
 	return resident
+}
+
+// MemoryBreakdown is what a namespace's storage engine holds in memory, by structure. Every
+// figure is maintained by its store or derived from lengths, so producing it walks nothing.
+type MemoryBreakdown struct {
+	// DocumentBodies is the version store's arena: live bodies, bodies evicted or superseded
+	// but not yet compacted away, and the unfilled tail of each shard's current chunk.
+	DocumentBodies int64
+	// DocumentBodiesLive is the part of DocumentBodies still referenced.
+	DocumentBodiesLive int64
+	// DocumentIndex is the version store's records and indexes, including the placeholder pins
+	// for live versions not yet loaded.
+	DocumentIndex int64
+	// DocumentVersions and DocumentPlaceholders count resident versions and pinned-but-unloaded
+	// ones.
+	DocumentVersions, DocumentPlaceholders int64
+	// LiveTree estimates the live tree's trie at treeBytesPerDoc per document. Held outside
+	// every budget: it is the namespace's current state.
+	LiveTree int64
+	// HistoryTrees is the tree store's evictable charge: what the history budget governs.
+	HistoryTrees int64
+	// PinnedTrees is the tree store's charge for trees pinned by in-flight writers.
+	PinnedTrees int64
+	// Memtable is both memtable generations' footprint.
+	Memtable int64
+	// SSTableIndexes is the parsed SSTable footer indexes held by the blob store.
+	SSTableIndexes int64
+	// SSTableBlockCache is the decoded SSTable blocks the blob store's cache holds.
+	SSTableBlockCache int64
+}
+
+// Total sums every byte figure (not the counts, and not DocumentBodiesLive, which is part of
+// DocumentBodies).
+func (b MemoryBreakdown) Total() int64 {
+	return b.DocumentBodies + b.DocumentIndex + b.LiveTree + b.HistoryTrees + b.PinnedTrees + b.Memtable + b.SSTableIndexes +
+		b.SSTableBlockCache
+}
+
+// MemoryBreakdown reports what this engine holds, by structure. See the type.
+func (e *ServerEngine) MemoryBreakdown() MemoryBreakdown {
+	var b MemoryBreakdown
+	if e == nil {
+		return b
+	}
+	if e.docsByHash != nil {
+		st := e.docsByHash.Stats()
+		b.DocumentBodies = st.ArenaBytes
+		b.DocumentBodiesLive = st.BodyLiveBytes
+		b.DocumentIndex = st.IndexBytes
+		b.DocumentVersions = st.Versions
+		b.DocumentPlaceholders = st.Placeholders
+	}
+	if s := e.latestTree.Load(); s != nil {
+		b.LiveTree = treeBytesPerDoc * int64(s.tree.Size())
+	}
+	if e.treesByHash != nil {
+		// Evictable rather than resident: see boundedTreeStore.EvictableBytes.
+		b.HistoryTrees = e.treesByHash.EvictableBytes()
+		b.PinnedTrees = e.treesByHash.PinnedBytes()
+	}
+	if e.memTable != nil {
+		b.Memtable = e.memTable.FootprintBytes()
+	}
+	if e.blobStore != nil {
+		b.SSTableIndexes = e.blobStore.IndexCacheBytes()
+		b.SSTableBlockCache = e.blobStore.BlockCacheBytes()
+	}
+	return b
 }
