@@ -44,6 +44,7 @@ func ListenStream(addr string, runtime *KdbServerRuntime, namespaceID string) (*
 func ListenStreamTLS(addr string, runtime *KdbServerRuntime, namespaceID string, tlsSettings *core.TransportTlsSettings) (*StreamHub, *Listener, error) {
 	opts := core.DefaultConnectOptions()
 	opts.TLS = tlsSettings
+	opts.WriteTimeoutMs = runtime.writeTimeoutMs()
 	transport := tcp.NewTransport(opts)
 	ln, err := transport.ListenBound(addr)
 	if err != nil {
@@ -251,7 +252,38 @@ func (h *StreamHub) visible(sub *registeredSubscriber, ops []document.Op) []docu
 	return out
 }
 
+// maxDeltaFrameOpBytes bounds the encoded operation bytes in one deltaCommit frame. A catch-up
+// carrying more is split (sendDelta). 4 MiB keeps each frame well under the 16 MiB frame limit
+// and keeps the hub from holding one giant encode buffer per far-behind subscriber.
+const maxDeltaFrameOpBytes = 4 << 20
+
+// sendDelta sends sub the operations taking it from parent to commit, split across frames by
+// bytes.
+//
+// A far-behind subscriber's catch-up used to be one frame holding every changed body. Past 16 MiB
+// the encode failed, the subscriber was dropped, and it failed the same way on every reconnect -
+// it could never catch up. Now every frame but the last names parent as both its parent and its
+// commit: the subscriber's parent check holds (its position is still parent), its position does
+// not move, and it applies the operations. The last frame names commit, so the position advances
+// only once everything has arrived. Existing subscribers (Go, Kotlin) check only that each
+// frame's parent is their position, which this preserves; a subscriber interrupted partway
+// resumes from parent and is sent the same catch-up again, which is safe because a tree delta's
+// operations are final bodies and deletes, so applying them twice is applying them once.
 func (h *StreamHub) sendDelta(sub *registeredSubscriber, commit, parent codec.Hash, ts int64, ops []document.Op) error {
+	parts := splitOpsByBytes(h.visible(sub, ops), maxDeltaFrameOpBytes)
+	for i, part := range parts {
+		named := commit
+		if i < len(parts)-1 {
+			named = parent
+		}
+		if err := h.sendDeltaFrame(sub, named, parent, ts, part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *StreamHub) sendDeltaFrame(sub *registeredSubscriber, commit, parent codec.Hash, ts int64, ops []document.Op) error {
 	h.mu.Lock()
 	cid := h.correlation
 	h.correlation++
@@ -260,13 +292,46 @@ func (h *StreamHub) sendDelta(sub *registeredSubscriber, commit, parent codec.Ha
 		H: wire.Header{MessageType: wire.MsgDeltaCommit, ProtocolVersion: wire.KdbWireProtocolVersion, CorrelationID: cid},
 		Payload: wire.DeltaCommitPayload{
 			Namespace: h.namespaceID, CommitHash: commit, ParentHash: parent,
-			TimestampMicros: ts, Operations: h.visible(sub, ops),
+			TimestampMicros: ts, Operations: ops,
 		},
 	})
 	if err != nil {
 		return err
 	}
 	return sub.conn.Send(frame)
+}
+
+// splitOpsByBytes cuts ops, in order, into runs whose encoded size stays within limit. It always
+// returns at least one run (possibly empty: a commit with nothing visible still moves the
+// subscriber's position), and an operation larger than limit travels alone.
+func splitOpsByBytes(ops []document.Op, limit int) [][]document.Op {
+	var parts [][]document.Op
+	start, size := 0, 0
+	for i, op := range ops {
+		n := opEncodedBytes(op)
+		if i > start && size+n > limit {
+			parts = append(parts, ops[start:i])
+			start, size = i, 0
+		}
+		size += n
+	}
+	return append(parts, ops[start:])
+}
+
+// opEncodedBytes is an upper bound on one operation's size inside a deltaCommit envelope: its
+// string fields as encoded, plus the fixed keys, ids and punctuation.
+func opEncodedBytes(op document.Op) int {
+	const fixed = 128
+	switch o := op.(type) {
+	case document.WriteOp:
+		return fixed + wire.EncodedStringLen(o.Patch)
+	case document.FileWriteOp:
+		return fixed + wire.EncodedStringLen(o.Path)
+	case document.SchemaMigrationOp:
+		return fixed + wire.EncodedStringLen(o.MigrationPayload)
+	default:
+		return fixed
+	}
 }
 
 // StreamHub serves Mode 1/2 subscribers for one namespace - the network-listening counterpart to
