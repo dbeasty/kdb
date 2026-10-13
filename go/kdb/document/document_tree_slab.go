@@ -6,6 +6,7 @@ import (
 	"runtime/metrics"
 	"sync"
 	"sync/atomic"
+	"weak"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
@@ -167,6 +168,7 @@ func (p *slabPool[R]) count(i uint32) *uint32 {
 }
 
 type trieSlab struct {
+	self   weak.Pointer[trieSlab] // made once: what each handle's cleanup holds
 	mu     sync.Mutex
 	nodes  slabPool[nodeRec]
 	leaves slabPool[leafRec]
@@ -190,7 +192,11 @@ const (
 	leafRecBytes = 80 + 4
 )
 
-func newTrieSlab() *trieSlab { return &trieSlab{} }
+func newTrieSlab() *trieSlab {
+	s := &trieSlab{}
+	s.self = weak.Make(s)
+	return s
+}
 
 // trieView is a snapshot of a slab's chunk directories, for reading the records of a tree held
 // by the caller.
@@ -358,8 +364,12 @@ type trieTree struct {
 	root tref
 }
 
+// trieDrop is a cleanup's argument. It reaches the slab weakly: a cleanup's argument stays
+// reachable until the cleanup has run, so a strong pointer would keep a whole slab alive for a
+// collection cycle after its last tree went - a dropped namespace's tree surviving its close.
+// When every tree of a slab goes at once, the slab goes with them and there is nothing to release.
 type trieDrop struct {
-	slab *trieSlab
+	slab weak.Pointer[trieSlab]
 	root tref
 }
 
@@ -370,7 +380,10 @@ type trieDrop struct {
 // drained here only when the slab lock is free. A writer finding roots queued releases a few
 // before each update (drainSome), so the queue cannot outrun the updates making it.
 func dropTrieRoot(d trieDrop) {
-	s := d.slab
+	s := d.slab.Value()
+	if s == nil {
+		return
+	}
 	s.pendMu.Lock()
 	s.pending = append(s.pending, d.root)
 	s.pendingN.Store(int32(len(s.pending)))
@@ -416,7 +429,7 @@ func (s *trieSlab) adopt(root tref) *trieTree {
 		return nil
 	}
 	h := &trieTree{slab: s, root: root}
-	runtime.AddCleanup(h, dropTrieRoot, trieDrop{slab: s, root: root})
+	runtime.AddCleanup(h, dropTrieRoot, trieDrop{slab: s.self, root: root})
 	return h
 }
 
