@@ -61,6 +61,12 @@ type V2ClientConfig struct {
 	// holding it. An empty namespace whose peer cannot send its whole history (it holds a
 	// shallow root or a retention floor) is bootstrapped from a snapshot regardless.
 	PreferSnapshot bool
+	// CatchUp chooses how a pull behind on main catches up when the peer's head is a
+	// fast-forward: replay every commit (the default), squash to the peer's head, or auto (see
+	// squash.go). Needs the peer's squash and repair capabilities; without them it replays.
+	CatchUp CatchUpRoute
+	// CatchUpNamespaces overrides CatchUp per namespace pattern, first match wins.
+	CatchUpNamespaces []CatchUpOverride
 	// ExtraHaves adds, per namespace, commits this node already stored that its refs do not
 	// reach - the ReceivedTips of an interrupted earlier sync. Naming them resumes that sync
 	// instead of fetching its pages again.
@@ -90,6 +96,10 @@ type NamespaceSyncResult struct {
 	// BoundarySent is the push direction's: commits behind the peer's snapshot root whose state
 	// this sync sent it, because the peer refused a pushed branch forked from them.
 	BoundarySent []string
+	// Squashed is the peer head this pull caught up to by squash, and SquashedBacklog how many
+	// commits it skipped (by generation). Empty when the pull replayed.
+	Squashed        string
+	SquashedBacklog int64
 	// Access is the peer's grant for this namespace: "" both directions, wire.AccessPull or
 	// wire.AccessPush. The direction not granted was skipped.
 	Access string
@@ -247,6 +257,13 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			return err
 		}
 		res.Snapshot = installed.Hash.Hex()
+	}
+	if main, ok := remote.Branches[mainBranch]; ok && res.Snapshot == "" {
+		if h, err := codec.HashFromHex(main); err == nil {
+			if _, err := c.trySquash(cfg, env, remote.Namespace, h, res); err != nil {
+				return err
+			}
+		}
 	}
 	localHead, err := env.DAG.Head()
 	if err != nil {

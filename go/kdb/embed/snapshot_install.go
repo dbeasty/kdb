@@ -153,3 +153,42 @@ func (r *EmbeddedKdbRuntime) RecordGraft(root codec.Hash) error {
 	}
 	return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
 }
+
+// PersistSquash makes a squash catch-up durable (peersync.InstallSquash): root is now main's head
+// and a shallow root, and changed are the bodies the squash brought, which no log segment holds.
+// It writes those bodies to the blob store, then a checkpoint through the current log position
+// with main at root, then the namespace marker naming root as a snapshot-kind shallow root - so
+// open requires a checkpoint rather than replaying the log alone, which would rebuild the head the
+// squash left and lose everything written on top of root.
+//
+// In that order, as PersistSnapshot's: a crash before the checkpoint leaves the namespace at its
+// previous head, which the next sync squashes again.
+func (r *EmbeddedKdbRuntime) PersistSquash(root document.Commit, changed map[codec.Hash]string) error {
+	s := r.snapshot
+	if s == nil {
+		return nil
+	}
+	if s.checkpointsDisabled {
+		return errors.New("kdb: a squash catch-up is recorded only by a checkpoint, and checkpoints are disabled for this namespace")
+	}
+	eng, ok := s.store.(*engine.ServerEngine)
+	if !ok || r.checkpointNow == nil {
+		return fmt.Errorf("kdb: namespace %s's storage cannot hold a squash catch-up durably", s.namespaceID)
+	}
+	if err := eng.MaterializeBodies(changed); err != nil {
+		return err
+	}
+	if err := r.checkpointNow(); err != nil {
+		return err
+	}
+	meta, _ := readNamespaceMeta(s.dataRoot, s.namespaceID)
+	meta.NamespaceID = s.namespaceID
+	meta.BodiesExternal = true
+	for _, existing := range meta.ShallowRoots {
+		if existing == root.Hash.Hex() {
+			return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
+		}
+	}
+	meta.ShallowRoots = append(meta.ShallowRoots, root.Hash.Hex())
+	return writeNamespaceMeta(s.dataRoot, s.namespaceID, meta)
+}
