@@ -145,6 +145,13 @@ func (h *Host) openNamespace(
 			_ = handle.Close()
 		}
 	}()
+	// The commit-operations loader's mappings go with the namespace, on every path out.
+	var closeOpsLoader func()
+	defer func() {
+		if !handleClosed && closeOpsLoader != nil {
+			closeOpsLoader()
+		}
+	}()
 
 	d, err := dag.NewInMemoryCommitDag(namespaceID)
 	if err != nil {
@@ -190,12 +197,21 @@ func (h *Host) openNamespace(
 		// budget on either would reclaim nothing while the other held on.
 		d.SetTreeStore(eng)
 	}
+	var opsLoader *commitOpsLoader
 	if r := handle.DeltaReader(); r != nil {
 		// Installed before replay, so replay's own commits are subject to
 		// the budget as they arrive rather than all landing resident first
 		// - which is the case that made opening a long-lived namespace cost
 		// the sum of its whole history (docs/benchmarks/open-cost.md).
-		d.SetOperationsLoader(newCommitOpsLoader(r).load, storage.ResolvedCommitOpsBytes(cfg))
+		opsLoader = newCommitOpsLoader(r)
+		closeOpsLoader = opsLoader.index.Close
+		opsLoader.index.SetDir(deltaIndexDirPath(dataRoot, namespaceID), opts.ReadOnly)
+		d.SetOperationsLoader(opsLoader.load, storage.ResolvedCommitOpsBytes(cfg))
+	}
+	if eng != nil {
+		// Per-segment sidecars for the version locations of sealed segments, so the cold
+		// loader's index lives in mapped files rather than growing the heap with history.
+		eng.ConfigureColdIndex(deltaIndexDirPath(dataRoot, namespaceID), opts.ReadOnly)
 	}
 	meta, _ := readNamespaceMeta(dataRoot, namespaceID)
 	if (len(meta.ShallowRoots) > 0 || meta.BodiesExternal) && eng != nil {
@@ -337,6 +353,9 @@ func (h *Host) openNamespace(
 		d.CloseGraphFile()
 		// After the checkpoint wrote the segment the next open will map: nothing deletes files now.
 		treeFile.Close()
+		if closeOpsLoader != nil {
+			closeOpsLoader()
+		}
 		return firstErr
 	}
 	// Closing the runtime closes this namespace through the host, which is what owns the

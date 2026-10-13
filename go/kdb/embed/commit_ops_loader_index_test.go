@@ -82,8 +82,8 @@ func TestCommitOpsLoaderIndexFindsEveryFrame(t *testing.T) {
 			t.Fatalf("commit %d: %d operations, want 1", i, len(ops))
 		}
 	}
-	if len(l.segments) != 3 {
-		t.Fatalf("segment table holds %d segments, want 3", len(l.segments))
+	if n := l.index.Stats().Segments; n != 3 {
+		t.Fatalf("index holds %d segments, want 3", n)
 	}
 }
 
@@ -95,7 +95,7 @@ func TestCommitOpsLoaderIndexBytesPerCommit(t *testing.T) {
 	var before runtime.MemStats
 	runtime.ReadMemStats(&before)
 	l := newCommitOpsLoader(r)
-	if err := l.refresh(); err != nil {
+	if _, err := l.index.Refresh(); err != nil {
 		t.Fatal(err)
 	}
 	runtime.GC()

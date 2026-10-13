@@ -578,6 +578,19 @@ func (e *ServerEngine) RecordDocumentLocation(contentHash codec.Hash, segmentSeq
 	e.putDocumentLocation(contentHash, segmentSeq, frameOffset)
 }
 
+// RecordFrameLocations files a location record for every version commit c wrote, at the frame
+// it was read from. Replay calls it for each commit it reads back from the log: such a commit
+// was logged by an earlier process, and if that process died before the commit log reported
+// its position - or never filed one at all - nothing else ever will, and every later cold read
+// of those versions would fall through to indexing the delta log. Versions whose record already
+// exists are skipped while replaying (skipExistingObject), so a replay rewrites nothing.
+func (e *ServerEngine) RecordFrameLocations(c document.Commit, segmentSeq, frameOffset int64) {
+	if e.memTable == nil || frameOffset < 0 || e.HistoryStrategy() != storage.HistoryStrategyObjects {
+		return
+	}
+	versionKeys(c, func(h codec.Hash) { e.putDocumentLocation(h, segmentSeq, frameOffset) })
+}
+
 // RecordTreeObject records the tree that results from applying puts and
 // deletes to base, under result's own hash - the same thing the commit
 // path does, exposed for the offline migration that has to record objects
@@ -712,16 +725,29 @@ func (e *ServerEngine) treeFromObjects(hash codec.Hash) (document.DocumentTree, 
 // maxPendingLocationTrees bounds how many commits' worth of content hashes
 // wait for their log position.
 //
-// Ordinarily one: a commit is appended to the log immediately after its
-// tree is built, and the batch that writes it reports back. The bound is
-// for the cases where that never happens - memory-only durability, a
-// namespace whose writes are never persisted, a batch that fails - where
-// without it this would grow with every write. Dropping the oldest costs
+// It must exceed how far the commit log can lag behind commits, or the
+// oldest stash - the very next one the log will report - is dropped and its
+// versions never get a location record. The log can hold a full queue
+// (maxLogBatch, 256) plus the batch being written (up to another 256) plus
+// whatever writer is blocked handing off, so under DurabilityAsync a fast
+// writer runs ~512 commits ahead. This used to be 256: at 2M commits that
+// dropped the stash of most commits, every cold read missed its location
+// record, and the delta cold loader had to index the whole log (225 MB of
+// heap at 1M documents) to serve reads the blob store should have answered.
+//
+// The bound is still needed for the cases where a report never comes -
+// memory-only durability, a namespace whose writes are never persisted, a
+// failed batch - where without it this would grow with every write. Each
+// entry is a tree hash and the commit's changed versions, so 4096 of them
+// is well under a megabyte for ordinary commits. Dropping the oldest costs
 // a scan on a later cold read, never an answer.
-const maxPendingLocationTrees = 256
+const maxPendingLocationTrees = 4096
 
 func (e *ServerEngine) stashPendingLocations(treeHash codec.Hash, changed []TreeChange) {
-	if e.HistoryStrategy() != storage.HistoryStrategyObjects || len(changed) == 0 {
+	// Not while replaying: a replayed commit is already in the log, nothing will report its
+	// position through RecordCommitLocation, and replay files its locations itself (see
+	// RecordDocumentLocation and embed's replay loop).
+	if e.HistoryStrategy() != storage.HistoryStrategyObjects || len(changed) == 0 || e.replaying.Load() {
 		return
 	}
 	e.pendingMu.Lock()
