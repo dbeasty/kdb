@@ -70,6 +70,10 @@ type ServerEngine struct {
 	// deltaLoader is the delta-log loader behind coldLoader, when there is one - kept so its
 	// index can be given a sidecar directory (ConfigureColdIndex) and closed with the engine.
 	deltaLoader *deltaColdLoader
+	// pruners are other delta indexes over the same log, pruned with deltaLoader's after a
+	// truncation - see AlsoPruneAfterTruncation.
+	prunersMu sync.Mutex
+	pruners   []func() error
 
 	// Bounded live bodies (StorageEngineConfig.BoundedLiveBodies). durabilityTracking is switched
 	// on by the runtime once something will tell this engine when a commit reaches the log
@@ -624,7 +628,25 @@ func (e *ServerEngine) PruneColdIndex() error {
 	if e.deltaLoader == nil {
 		return nil
 	}
-	return e.deltaLoader.index.Prune()
+	err := e.deltaLoader.index.Prune()
+	e.prunersMu.Lock()
+	pruners := append([]func() error(nil), e.pruners...)
+	e.prunersMu.Unlock()
+	for _, p := range pruners {
+		if perr := p(); perr != nil && err == nil {
+			err = perr
+		}
+	}
+	return err
+}
+
+// AlsoPruneAfterTruncation registers another delta index over this namespace's log (embed's
+// commit-ops index) to be pruned with the cold loader's. Each index has to prune itself: on
+// Windows a sidecar cannot be deleted while the index that reads it holds it open.
+func (e *ServerEngine) AlsoPruneAfterTruncation(prune func() error) {
+	e.prunersMu.Lock()
+	defer e.prunersMu.Unlock()
+	e.pruners = append(e.pruners, prune)
 }
 
 // ColdIndexStats reports the shape of the delta cold loader's index: zero until a version has
