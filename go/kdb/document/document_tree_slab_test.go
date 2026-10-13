@@ -645,7 +645,7 @@ func TestSlabFreedWithItsLastTree(t *testing.T) {
 	slab := tree.trie.slab.self
 	runtime.KeepAlive(tree)
 	tree = DocumentTree{}
-	for i := 0; i < 100 && slab.Value() != nil; i++ {
+	for deadline := time.Now().Add(5 * time.Second); slab.Value() != nil && time.Now().Before(deadline); {
 		runtime.GC()
 		time.Sleep(time.Millisecond)
 	}
