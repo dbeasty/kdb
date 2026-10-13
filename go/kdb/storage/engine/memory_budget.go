@@ -151,8 +151,12 @@ func (e *ServerEngine) MemoryBreakdown() MemoryBreakdown {
 		b.DocumentPlaceholders = st.Placeholders
 	}
 	if s := e.latestTree.Load(); s != nil {
+		// A paged tree's heap is its slab alone, however small; the per-document estimate is for a
+		// tree without a trie (a flat map), whose slab reads zero.
 		if b.LiveTree = s.tree.SlabBytes(); b.LiveTree == 0 {
-			b.LiveTree = treeBytesPerDoc * int64(s.tree.Size())
+			if bound, _ := s.tree.Paged(); !bound {
+				b.LiveTree = treeBytesPerDoc * int64(s.tree.Size())
+			}
 		}
 	}
 	if e.treesByHash != nil {

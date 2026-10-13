@@ -97,7 +97,17 @@ func measureTreeScale(t *testing.T, n int) {
 	gcEmpty := gcTime()
 	heap0, obj0 := settledHeap()
 	t0 := time.Now()
-	tree, err := BuildTrieDocumentTreePacked(sorted)
+	var tree DocumentTree
+	var err error
+	if os.Getenv("KDB_TREE_SCALE_FILE") == "1" { // paged: built to a segment, mapped
+		f, ferr := NewTreeFile(TreeFileOptions{Dir: t.TempDir()})
+		if ferr != nil {
+			t.Skip(ferr)
+		}
+		tree, err = OpenTreePacked(sorted, f)
+	} else {
+		tree, err = BuildTrieDocumentTreePacked(sorted)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

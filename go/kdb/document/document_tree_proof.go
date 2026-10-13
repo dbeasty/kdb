@@ -47,9 +47,9 @@ func (t DocumentTree) Proof(id codec.UUID) TreeProof {
 			p.HasLeaf, p.LeafID, p.LeafHash = true, keyUUID(&l.id), l.content
 			return p
 		}
-		n := v.node(r)
+		children := v.children(r)
 		var level [16]codec.Hash
-		for i, c := range n.child {
+		for i, c := range children {
 			if c != 0 {
 				level[i] = codec.Hash{Bytes: *v.hash(c)}
 			}
@@ -58,7 +58,7 @@ func (t DocumentTree) Proof(id codec.UUID) TreeProof {
 		if depth >= trieDepth {
 			return p
 		}
-		r = n.child[keyNibble(&key, depth)]
+		r = children[keyNibble(&key, depth)]
 	}
 	return p
 }

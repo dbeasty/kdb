@@ -152,6 +152,9 @@ type ServerEngine struct {
 	// update from that pass is preserved; only the "when" changed.
 	treeMu sync.Mutex
 	tree   document.DocumentTree
+	// treeFile, when set, pages the live tree's cold records to segment files
+	// (document.TreeFile); every tree this engine installs is bound to it.
+	treeFile *document.TreeFile
 
 	// treesMu orders the pair of writes below - the tree store and the
 	// published snapshot - so a reader can never see a latestTree that the

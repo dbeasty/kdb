@@ -75,7 +75,11 @@ func restoreNamespace(
 		// off must not read a stale one left from when they were on.
 		return mustReplay()
 	}
-	cp, ok := readCheckpoint(shim, namespaceID)
+	var tf *document.TreeFile
+	if eng != nil {
+		tf = eng.TreeFile()
+	}
+	cp, ok := readCheckpointWith(shim, namespaceID, tf)
 	if !ok || eng == nil || r == nil {
 		return mustReplay()
 	}

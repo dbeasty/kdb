@@ -115,7 +115,7 @@ func slabRecordCount(h *trieTree) int {
 			return 1
 		}
 		c := 1
-		for _, ch := range v.node(r).child {
+		for _, ch := range v.children(r) {
 			c += count(ch)
 		}
 		return c
