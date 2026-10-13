@@ -119,6 +119,9 @@ type ServerEngine struct {
 	// frameReader follows a document location record back into the delta
 	// log. Read on the cold path only, hence atomic rather than a lock.
 	frameReader atomic.Pointer[commitFrameReader]
+	// frameReads reads single versions out of the delta log through the frame cache. See
+	// installFrameReads.
+	frameReads atomic.Pointer[frameReads]
 	// pendingLocations holds the content hashes a commit tree produced,
 	// keyed by that tree's hash, waiting for the log to report where the
 	// commit naming it landed. See RecordCommitLocation.
@@ -905,6 +908,7 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 				NamespaceID: namespaceID, SequenceNumber: seq,
 			}, offset)
 		})
+		eng.installFrameReads(namespaceID, reader, config)
 	}
 	return &defaultHandle{
 		namespaceID: namespaceID,

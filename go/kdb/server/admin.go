@@ -247,6 +247,7 @@ func (a *AdminServer) writeNamespaceMemoryMetrics(b *strings.Builder) {
 				[2]any{"memtable", m.Memtable},
 				[2]any{"sstable_indexes", m.SSTableIndexes},
 				[2]any{"sstable_block_cache", m.SSTableBlockCache},
+				[2]any{"delta_frame_cache", m.DeltaFrameCache},
 			)
 		}
 		if rt.dag != nil {

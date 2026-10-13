@@ -100,6 +100,11 @@ type StorageEngineConfig struct {
 	// obtained again on demand. Zero derives it from the hot-tier budget;
 	// see ResolvedHistoryTreeBytes.
 	HistoryTreeCacheBytes int64
+	// DeltaFrameCacheBytes caps how many bytes of decompressed delta frames a
+	// namespace keeps for cold reads (see delta.FrameCache). Zero derives it
+	// from the hot-tier budget; see ResolvedDeltaFrameCacheBytes. Negative
+	// turns the cache off.
+	DeltaFrameCacheBytes int64
 	// DisableCheckpoints stops this namespace writing the checkpoint that
 	// lets the next open skip the delta log. Off by default. Worth turning
 	// on to measure or debug the replay path, or where the checkpoint's
