@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -33,6 +34,14 @@ type writeGate struct {
 	// Written only by the goroutine releasing the gate - i.e. serialized with itself - so a
 	// plain load/store pair needs no further synchronization.
 	serviceNanos atomic.Int64
+
+	// A long hold - a peer snapshot installing into this namespace, which keeps the gate for as
+	// long as the whole namespace takes to apply - refuses writers at once with holdErr instead
+	// of letting each wait out its deadline behind it. holdWake is closed when a hold begins, so
+	// writers already queued are refused too rather than only those that arrive later.
+	holdMu   sync.Mutex
+	holdErr  *BusyError
+	holdWake chan struct{}
 }
 
 // serviceEWMAShift sets the smoothing: each sample moves the mean by 1/8 of the gap. Slow
@@ -45,15 +54,57 @@ func newWriteGate(maxQueued int) *writeGate {
 		maxQueued = 64
 	}
 	return &writeGate{
-		queued:  make(chan struct{}, maxQueued),
-		running: make(chan struct{}, 1),
+		queued:   make(chan struct{}, maxQueued),
+		running:  make(chan struct{}, 1),
+		holdWake: make(chan struct{}),
 	}
+}
+
+// beginLongHold marks the gate, which the caller holds, as held for a long time: until
+// endLongHold, acquire refuses with err - a BUSY a client backs off from and retries - rather than
+// queueing. Writers already queued are woken and refused.
+func (g *writeGate) beginLongHold(err *BusyError) {
+	g.holdMu.Lock()
+	defer g.holdMu.Unlock()
+	g.holdErr = err
+	close(g.holdWake)
+	g.holdWake = make(chan struct{})
+}
+
+// endLongHold ends a hold begun by beginLongHold, before the gate is released.
+func (g *writeGate) endLongHold() {
+	g.holdMu.Lock()
+	g.holdErr = nil
+	g.holdMu.Unlock()
+}
+
+func (g *writeGate) longHold() (*BusyError, <-chan struct{}) {
+	g.holdMu.Lock()
+	defer g.holdMu.Unlock()
+	return g.holdErr, g.holdWake
 }
 
 // acquire admits one caller to run its commit, respecting ctx's deadline while queued. On
 // success, the returned release func must be called exactly once (typically via defer)  once the
 // commit is done, to free the slot for the next queued caller.
+//
+// While a long hold is on (beginLongHold) it refuses with the hold's BusyError instead.
 func (g *writeGate) acquire(ctx context.Context) (release func(), err error) {
+	return g.admit(ctx, true)
+}
+
+// acquireThroughHold is acquire for an internal caller that must wait out a long hold rather than
+// be refused by it - one that takes the gate to let admitted writes drain, not to write.
+func (g *writeGate) acquireThroughHold(ctx context.Context) (release func(), err error) {
+	return g.admit(ctx, false)
+}
+
+func (g *writeGate) admit(ctx context.Context, refuseDuringHold bool) (release func(), err error) {
+	if refuseDuringHold {
+		if held, _ := g.longHold(); held != nil {
+			return nil, held
+		}
+	}
 	select {
 	case g.queued <- struct{}{}:
 	default:
@@ -61,15 +112,26 @@ func (g *writeGate) acquire(ctx context.Context) (release func(), err error) {
 	}
 	defer func() { <-g.queued }()
 
-	select {
-	case g.running <- struct{}{}:
-		start := time.Now()
-		return func() {
-			g.observeService(time.Since(start))
-			<-g.running
-		}, nil
-	case <-ctx.Done():
-		return nil, &DeadlineExceededError{Reason: "timed out waiting for an earlier write to finish"}
+	for {
+		var wake <-chan struct{}
+		if refuseDuringHold {
+			var held *BusyError
+			if held, wake = g.longHold(); held != nil {
+				return nil, held
+			}
+		}
+		select {
+		case g.running <- struct{}{}:
+			start := time.Now()
+			return func() {
+				g.observeService(time.Since(start))
+				<-g.running
+			}, nil
+		case <-ctx.Done():
+			return nil, &DeadlineExceededError{Reason: "timed out waiting for an earlier write to finish"}
+		case <-wake:
+			// A long hold began: loop to refuse with it (or, if it has already ended, to wait on).
+		}
 	}
 }
 

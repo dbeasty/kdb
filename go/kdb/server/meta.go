@@ -527,7 +527,7 @@ func (m *MetaStore) AssignHome(ns, node, addr string) (Home, error) {
 		stopping := h
 		stopping.Since = "" // no handover point yet: nothing to wait for if this node is the new home
 		rt.SetHome(&stopping)
-		release, err := rt.writeGate.acquire(context.Background())
+		release, err := rt.writeGate.acquireThroughHold(context.Background())
 		if err != nil {
 			return Home{}, err
 		}
