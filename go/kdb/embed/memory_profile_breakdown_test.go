@@ -11,8 +11,9 @@ func logMemoryBreakdown(t *testing.T, rt *EmbeddedKdbRuntime) {
 	t.Helper()
 	if e, ok := rt.Storage.(*engine.ServerEngine); ok {
 		b := e.MemoryBreakdown()
-		t.Logf("breakdown: bodies %s (live %s), doc index %s, versions %d, placeholders %d, live tree ~%s, history trees %s, memtable %s",
+		t.Logf("breakdown: bodies %s (live %s), doc index %s, versions %d, placeholders %d, live tree ~%s, history trees %s, memtable %s, "+
+			"sstable indexes %s heap + %s mapped, sstable block cache %s",
 			mb(b.DocumentBodies), mb(b.DocumentBodiesLive), mb(b.DocumentIndex), b.DocumentVersions, b.DocumentPlaceholders,
-			mb(b.LiveTree), mb(b.HistoryTrees), mb(b.Memtable))
+			mb(b.LiveTree), mb(b.HistoryTrees), mb(b.Memtable), mb(b.SSTableIndexes), mb(b.SSTableIndexesMapped), mb(b.SSTableBlockCache))
 	}
 }

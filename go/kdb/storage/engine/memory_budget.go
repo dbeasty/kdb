@@ -121,8 +121,13 @@ type MemoryBreakdown struct {
 	PinnedTrees int64
 	// Memtable is both memtable generations' footprint.
 	Memtable int64
-	// SSTableIndexes is the parsed SSTable footer indexes held by the blob store.
+	// SSTableIndexes is the parsed SSTable footer indexes held by the blob store: the tables with
+	// no usable sidecar.
 	SSTableIndexes int64
+	// SSTableIndexesMapped is the SSTable index sidecars the blob store has mapped. Page cache,
+	// not heap, so not part of Total; it is charged to the memory budget through
+	// mmapfile.MappedBytes, as the commit graph's mappings are.
+	SSTableIndexesMapped int64
 	// SSTableBlockCache is the decoded SSTable blocks the blob store's cache holds.
 	SSTableBlockCache int64
 	// DeltaFrameCache is the decompressed delta frames the frame cache holds for cold reads.
@@ -165,6 +170,7 @@ func (e *ServerEngine) MemoryBreakdown() MemoryBreakdown {
 	}
 	if e.blobStore != nil {
 		b.SSTableIndexes = e.blobStore.IndexCacheBytes()
+		b.SSTableIndexesMapped = e.blobStore.SidecarMappedBytes()
 		b.SSTableBlockCache = e.blobStore.BlockCacheBytes()
 	}
 	b.DeltaFrameCache = e.DeltaFrameCache().Bytes()
