@@ -217,11 +217,32 @@ func saveCheckpoint(
 	floor int64,
 	disabled bool,
 ) error {
+	if through < 0 {
+		return nil
+	}
+	return saveCheckpointThrough(d, store, r, shim, namespaceID, through, floor, disabled)
+}
+
+// saveCheckpointThrough is saveCheckpoint without its refusal of a negative through: through -1
+// claims the state as of before the log's first segment, as a snapshot install's checkpoint does,
+// and every segment replays on top of it - commits the state already holds are skipped, newer ones
+// applied. A squash catch-up needs that when all of the namespace's commits are still in the open
+// segment: it must be checkpointed now, and there is no sealed segment to take it through.
+func saveCheckpointThrough(
+	d *dag.InMemoryCommitDag,
+	store storage.Adapter,
+	r storage.DeltaSegmentReader,
+	shim storage.PlatformIOShim,
+	namespaceID string,
+	through int64,
+	floor int64,
+	disabled bool,
+) error {
 	if disabled {
 		return nil
 	}
 	eng, ok := store.(*engine.ServerEngine)
-	if !ok || shim == nil || through < 0 {
+	if !ok || shim == nil {
 		return nil
 	}
 	// A checkpoint must never capture a part of a cross-namespace group that is not yet decided:

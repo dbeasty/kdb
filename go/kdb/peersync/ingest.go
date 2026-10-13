@@ -131,6 +131,15 @@ type IngestEnv struct {
 	// its parents (see Graft), which a replay must admit as such. nil: nothing to record (memory
 	// runtimes).
 	GraftRecorded func(root codec.Hash) error
+	// SquashInstalled makes a squash catch-up durable (see squash.go): root, now main's head and a
+	// shallow root, is recorded as one, changed (content hash to body) are the bodies it brought,
+	// which no log segment holds, and a checkpoint is taken through the current log position with
+	// main at root. Called inside the node's serialization. nil leaves the squash in memory, which
+	// is all a memory runtime has.
+	SquashInstalled func(root document.Commit, changed map[codec.Hash]string) error
+	// SquashRefused, when set, makes this namespace refuse to serve squash catch-ups, saying why -
+	// for one that must keep full history on every replica. Peers then replay.
+	SquashRefused string
 	// MaxClockSkew refuses a commit timestamped further than this past local wall time. Commits
 	// are timestamped at least one microsecond after their parents, so a single commit from a node
 	// whose clock runs far ahead would drag every later commit that descends from it into that

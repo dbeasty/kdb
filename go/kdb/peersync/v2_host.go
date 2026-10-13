@@ -185,7 +185,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome, wire.SyncCapZstdPack}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome, wire.SyncCapZstdPack, wire.SyncCapSquash}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -343,6 +343,17 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 			return nil, err
 		}
 		res.H = header(wire.MsgTreeNodesResult, m.H.CorrelationID)
+		return res, nil
+	case wire.SquashHeadMessage:
+		env, err := h.env(m.Namespace, false, dirPull)
+		if err != nil {
+			return nil, err
+		}
+		res, err := squashHeadPage(env, m)
+		if err != nil {
+			return nil, err
+		}
+		res.H = header(wire.MsgSquashHeadResult, m.H.CorrelationID)
 		return res, nil
 	case wire.ObjectFetchMessage:
 		env, err := h.env(m.Namespace, false, dirPull)

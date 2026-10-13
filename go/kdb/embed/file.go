@@ -389,6 +389,17 @@ func (h *Host) openNamespace(
 			}
 			return res, err
 		}
+		// A checkpoint now, through the same position maintenance uses and truncating nothing:
+		// what makes a squash catch-up durable (PersistSquash).
+		rt.checkpointNow = func() error {
+			through := highestSegmentSequence(r)
+			if seq, ok := handle.DeltaWriter().(storage.DeltaSegmentSequencer); ok {
+				if open := seq.SequenceNumber(); open-1 < through {
+					through = open - 1
+				}
+			}
+			return saveCheckpointThrough(d, store, r, io, namespaceID, through, currentFloor(r), opts.Storage.DisableCheckpoints)
+		}
 	}
 
 	// This namespace's side of the host's memory pool. Registered by the caller, after the

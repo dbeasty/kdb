@@ -193,3 +193,19 @@ func (d *InMemoryCommitDag) recomputeGenerationsLocked() {
 func (d *InMemoryCommitDag) generationLocked(hash codec.Hash) uint32 {
 	return d.nodes.generation(hash)
 }
+
+// GenerationDistance is descendant's generation minus ancestor's: a lower bound on the commits
+// between them, exact for a linear history. false when either is not a resident commit or the
+// generations cannot be derived. Squash catch-up uses it to size a backlog without walking it.
+func (d *InMemoryCommitDag) GenerationDistance(ancestor, descendant codec.Hash) (int64, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.ensureGenerationsLocked() {
+		return 0, false
+	}
+	ga, gd := d.generationLocked(ancestor), d.generationLocked(descendant)
+	if ga == 0 || gd == 0 {
+		return 0, false
+	}
+	return int64(gd) - int64(ga), true
+}
