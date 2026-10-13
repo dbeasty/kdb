@@ -218,6 +218,9 @@ type virtualBase struct {
 	// noMemo computes every values call afresh, ignoring memo. Tests only: it is how they check the
 	// memo changes no result.
 	noMemo bool
+	// bases finds each level's merge bases, numbering the history once for all of them rather than
+	// walking all of it per call (see dag.MergeBaseFinder); made on the first fold.
+	bases *dag.MergeBaseFinder
 }
 
 // valuesKey identifies one values call: the bases are in fold order, which changes the result,
@@ -258,13 +261,16 @@ func (vb *virtualBase) valuesUncached(bases []codec.Hash, ids []codec.UUID, dept
 	if err != nil || len(bases) == 1 || depth >= maxVirtualBaseDepth {
 		return acc, err
 	}
+	if vb.bases == nil {
+		vb.bases = vb.d.NewMergeBaseFinder()
+	}
 	folded := []codec.Hash{bases[0]}
 	for _, b := range bases[1:] {
 		bv, err := vb.at(b, ids)
 		if err != nil {
 			return nil, err
 		}
-		inner, err := vb.values(vb.d.MergeBases(folded, []codec.Hash{b}), ids, depth+1)
+		inner, err := vb.values(vb.bases.MergeBases(folded, []codec.Hash{b}), ids, depth+1)
 		if err != nil {
 			return nil, err
 		}

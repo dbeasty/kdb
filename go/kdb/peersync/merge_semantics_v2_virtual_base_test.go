@@ -294,6 +294,58 @@ func TestV2VirtualBaseOfABraidIsLinear(t *testing.T) {
 	t.Logf("the merge ran the procedure %d times", calls)
 }
 
+// TestV2VirtualBaseWalksTheHistoryOnce is the 5-node procedure-counter load wedge (a node held the
+// write gate for minutes inside virtualBase, timing out every other sync and ignoring SIGTERM):
+// the braid above, on top of a long ordinary history, merged under the default graph settings -
+// no generation numbers. Every level of the virtual base asked for merge bases by comparing full
+// ancestor closures, once per pair of candidates, so the merge cost the whole history many times
+// over. Now it must cost a small multiple of one pass over history.
+func TestV2VirtualBaseWalksTheHistoryOnce(t *testing.T) {
+	const prefix, levels = 1500, 10
+	g := newGraph(t, "app/v2-braid-history")
+	v2 := chainV(ChainVersionMergeBases, ResolutionRule{Kind: RuleProcedure, Name: "perNodeCounter"}, ResolutionRule{Kind: RuleLastWrite})
+	v2.Procedure = perNodeCounterProcedure(new(int))
+	v1 := chainV(0, ResolutionRule{Kind: RuleProcedure, Name: "perNodeCounter"}, ResolutionRule{Kind: RuleLastWrite})
+	v1.Procedure = perNodeCounterProcedure(new(int))
+	inc := func(at codec.Hash, k string) codec.Hash {
+		counts, _ := g.body(at)["counts"].(map[string]any)
+		next := map[string]any{}
+		for kk, v := range counts {
+			next[kk] = v
+		}
+		n, _ := next[k].(float64)
+		next[k] = n + 1
+		return g.write(at, map[string]any{"counts": next})
+	}
+	at := g.write(g.root(), map[string]any{"counts": map[string]any{}})
+	for i := 0; i < prefix; i++ {
+		at = inc(at, "p")
+	}
+	lvl := [3]codec.Hash{inc(at, "a"), inc(at, "b"), inc(at, "c")}
+	for l := 0; l < levels; l++ {
+		a, b, c := lvl[0], lvl[1], lvl[2]
+		lvl = [3]codec.Hash{
+			inc(g.mustMerge(g.mustMerge(a, b, v1), c, v1), "a"),
+			inc(g.mustMerge(g.mustMerge(a, c, v1), b, v1), "b"),
+			inc(g.mustMerge(g.mustMerge(b, c, v1), a, v1), "c"),
+		}
+	}
+	commits := uint64(len(g.s.dag.AncestorSetOf(lvl[:])))
+
+	before := g.s.dag.MergeBaseSteps()
+	_, out := g.merge(lvl[0], lvl[1], v2)
+	steps := g.s.dag.MergeBaseSteps() - before
+	if out.Kind == OutcomeConflict {
+		t.Fatalf("the merge was held: %+v", out.Details)
+	}
+	t.Logf("the merge stepped through %d commits of a %d-commit history", steps, commits)
+	// The top-level merge bases (one closure and a walk from the other side), one numbering of the
+	// history by the virtual base's finder, and short walks per level.
+	if limit := 8 * commits; steps > limit {
+		t.Fatalf("the merge stepped through %d commits of a %d-commit history (limit %d): the virtual base walks all of history per level", steps, commits, limit)
+	}
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return "<nil>"
