@@ -27,6 +27,12 @@ func osShim(t testing.TB) (*storio.FileBackedPlatformIO, string) {
 	if !mmapfile.Supported {
 		t.Skip("sidecars need mmap")
 	}
+	return fileShim(t)
+}
+
+// fileShim is osShim on any platform, for tests that hold wherever mapping is unavailable too.
+func fileShim(t testing.TB) (*storio.FileBackedPlatformIO, string) {
+	t.Helper()
 	root := t.TempDir()
 	cfg := storio.PlatformIOConfig{RootDirectory: &root}
 	store, err := storio.NewOSByteStore(cfg)
@@ -229,7 +235,7 @@ func TestBloomFilterFalsePositiveRateAndNoFalseNegatives(t *testing.T) {
 
 // indexEntries must read exactly what parseFooter reads, whatever the chunking.
 func TestIndexEntriesMatchesParseFooter(t *testing.T) {
-	shim, _ := osShim(t)
+	shim, _ := fileShim(t)
 	_, h := writeMixedTable(t, shim, 0, 200, 3)
 	want, err := NewDefaultReader(shim, h).Index()
 	if err != nil {
@@ -629,4 +635,37 @@ func TestSidecarLookupsUnderConcurrentCompaction(t *testing.T) {
 	}
 	store.Close()
 	t.Logf("%d probes, 0 wrong answers", probes.Load())
+}
+
+// On every platform - including those that cannot map, where no sidecar is ever written - a
+// file-backed store answers every key, tombstone and absent key correctly.
+func TestFileBackedLookupsOnEveryPlatform(t *testing.T) {
+	shim, _ := fileShim(t)
+	store := NewLsmBlobStore(shim, sidecarNS, nil)
+	var all []codec.Hash
+	for i := 0; i < 3; i++ {
+		keys, h := writeMixedTable(t, shim, 0, 100, int64(40+i))
+		store.AddTable(h)
+		all = append(all, keys...)
+		_, err := os.Stat(sidecarFile(t, shim, h.SegmentName))
+		if mmapfile.Supported != (err == nil) {
+			t.Fatalf("mapping supported=%v, sidecar written: %v", mmapfile.Supported, err)
+		}
+	}
+	for i, k := range all {
+		_, deleted, found := store.Lookup(k)
+		if !found || deleted != (i%100%5 == 4) {
+			t.Fatalf("key %d: found=%v deleted=%v", i, found, deleted)
+		}
+	}
+	rng := rand.New(rand.NewSource(3))
+	for i := 0; i < 200; i++ {
+		if k := randomHash(rng); store.Contains(k) {
+			t.Fatal("found an absent key")
+		}
+	}
+	if !mmapfile.Supported && (store.sidecarsOn() || store.IndexCacheBytes() == 0) {
+		t.Fatal("without mapping the footer path must serve")
+	}
+	store.Close()
 }
