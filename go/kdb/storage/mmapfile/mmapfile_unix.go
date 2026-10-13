@@ -33,3 +33,6 @@ func Open(path string) (*Mapping, error) {
 	mappedBytes.Add(int64(len(data)))
 	return &Mapping{data: data, unmap: func() error { return syscall.Munmap(data) }}, nil
 }
+
+// Supported reports whether Open can map files on this platform.
+const Supported = true

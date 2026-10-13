@@ -103,7 +103,9 @@ jobs:
             exit 1
           fi
       - name: Go test
-        run: go test -race ./...
+        # The race detector multiplies the heap-scale tests' cost; embed and index/vector run close
+        # to Go's default 10m per-package timeout on hosted runners. A hang still fails, at 25m.
+        run: go test -race -timeout 25m ./...
       - name: Backup and restore drill
         # Live backup -> verify -> restore into a fresh dir while the service is down -> restart
         # -> compare documents and head. Also run as a Go test (TestBackupRestoreDrill); this step

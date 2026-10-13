@@ -43,15 +43,12 @@ func TestColdLoaderIndexMatchesTheLog(t *testing.T) {
 			if _, ok, err := l.load(versions[0].docID, unknown); ok || err != nil {
 				t.Fatalf("unknown hash: ok=%v err=%v", ok, err)
 			}
-			if len(l.frame) != len(want) {
-				t.Fatalf("index holds %d versions, reference %d", len(l.frame), len(want))
-			}
 			for h, w := range want {
-				ref, ok := l.frame[h]
-				if !ok {
-					t.Fatalf("version %s not indexed", h.Hex())
+				ref, ok, err := l.index.Lookup(h)
+				if !ok || err != nil {
+					t.Fatalf("version %s not indexed: %v", h.Hex(), err)
 				}
-				if got := (loc{l.segments[ref.segment].SequenceNumber, ref.frameOffset}); got != w {
+				if got := (loc{ref.Segment.SequenceNumber, ref.FrameOffset}); got != w {
 					t.Fatalf("version %s indexed at %+v, reference %+v", h.Hex(), got, w)
 				}
 				v := text[h]
@@ -86,7 +83,7 @@ func TestColdLoaderCatchesUpWithTheLog(t *testing.T) {
 	if _, ok, err := l.load(first[0].docID, h0); !ok || err != nil {
 		t.Fatalf("a version from the first batch: ok=%v err=%v", ok, err)
 	}
-	before := len(l.segments)
+	before := l.index.Stats().Segments
 	_, later := writeColdLog(t, shim, storage.CompressionNone, 60, 12)
 	for i, v := range later {
 		h, err := document.Document{ID: v.docID, JSON: v.text}.ContentHash()
@@ -101,8 +98,8 @@ func TestColdLoaderCatchesUpWithTheLog(t *testing.T) {
 			t.Fatalf("version %d read back wrong", i)
 		}
 	}
-	if len(l.segments) <= before {
-		t.Fatalf("segment table did not grow: %d segments before, %d after", before, len(l.segments))
+	if after := l.index.Stats().Segments; after <= before {
+		t.Fatalf("segment table did not grow: %d segments before, %d after", before, after)
 	}
 	// A miss with nothing new in the log scans nothing: the indexed sizes all match the listing.
 	var unknown codec.Hash
@@ -110,10 +107,7 @@ func TestColdLoaderCatchesUpWithTheLog(t *testing.T) {
 	if _, ok, err := l.load(first[0].docID, unknown); ok || err != nil {
 		t.Fatalf("unknown hash: ok=%v err=%v", ok, err)
 	}
-	segs, _ := reader.ListSegments()
-	for _, s := range segs {
-		if l.indexed[s.SequenceNumber] != s.SizeBytes {
-			t.Fatalf("segment %d indexed through %d of %d bytes", s.SequenceNumber, l.indexed[s.SequenceNumber], s.SizeBytes)
-		}
+	if changed, err := l.index.Refresh(); changed || err != nil {
+		t.Fatalf("a refresh with nothing new in the log changed the index (err %v)", err)
 	}
 }

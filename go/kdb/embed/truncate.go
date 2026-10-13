@@ -284,6 +284,13 @@ func applyTruncation(
 	if remaining, err := r.ListSegments(); err == nil {
 		result.RetainedSegments = len(remaining)
 	}
+	if result.Removed > 0 {
+		// The delta-index sidecars of the deleted segments go with them (every kind: they share
+		// one directory). Derived data; a failure only leaves files the next prune removes.
+		if err := eng.PruneColdIndex(); err != nil {
+			log.Printf("kdb: namespace %s: could not prune delta-index sidecars after truncation: %v", namespaceID, err)
+		}
+	}
 	return result, nil
 }
 

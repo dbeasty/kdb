@@ -10,6 +10,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/delta"
+	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
 
 // replayDeltaNamespace rebuilds d and store from every commit durably
@@ -91,6 +92,7 @@ func replayDeltaNamespaceFrom(
 		}
 	}
 
+	eng, _ := store.(*engine.ServerEngine)
 	gate := newGroupGate(d, coord)
 	defer gate.report()
 	// deferred holds only commits whose parents had not been applied when
@@ -128,8 +130,17 @@ func replayDeltaNamespaceFrom(
 			}
 		}
 		read := 0
-		readErr := streamSegmentCommits(r, seg, func(c document.Commit) error {
+		readErr := streamSegmentCommits(r, seg, func(c document.Commit, frameOffset int64) error {
 			read++
+			if eng != nil {
+				// The commit is in the log at this frame whatever happens to it below (applied,
+				// deferred, or skipped by the gate): say so, so its versions resolve by location
+				// rather than by indexing the log. A commit replayed here is one whose position
+				// the process that logged it may never have filed - the commit log reports
+				// positions asynchronously, and a crash, or a stash dropped under load, loses
+				// them.
+				eng.RecordFrameLocations(c, seg.SequenceNumber, frameOffset)
+			}
 			if gate.skip(c) {
 				return nil
 			}
@@ -325,9 +336,9 @@ func (e *replayApplyError) Unwrap() error { return e.err }
 // The fallback keeps ReadAll's partial-result contract: on a
 // *CorruptFrameError the records read before the fault are returned
 // alongside the error, and those still reach fn before it is reported.
-func streamSegmentCommits(r storage.DeltaSegmentReader, seg storage.DeltaSegmentRef, fn func(document.Commit) error) error {
+func streamSegmentCommits(r storage.DeltaSegmentReader, seg storage.DeltaSegmentRef, fn func(c document.Commit, frameOffset int64) error) error {
 	if streamer, ok := r.(storage.DeltaCommitStreamer); ok {
-		return streamer.StreamCommits(seg, func(c document.Commit, _ int64) error { return fn(c) })
+		return streamer.StreamCommits(seg, fn)
 	}
 	records, readErr := r.ReadAll(seg)
 	for _, rec := range records {
@@ -335,7 +346,8 @@ func streamSegmentCommits(r storage.DeltaSegmentReader, seg storage.DeltaSegment
 		if err != nil {
 			return err
 		}
-		if err := fn(c); err != nil {
+		// No frame offsets from a reader that cannot stream: nothing to file a location under.
+		if err := fn(c, -1); err != nil {
 			return err
 		}
 	}
