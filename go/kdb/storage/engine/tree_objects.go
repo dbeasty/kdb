@@ -519,6 +519,12 @@ func (e *ServerEngine) documentFromObject(docID codec.UUID, contentHash codec.Ha
 // documentFromLog reads the frame a location record points at and picks
 // the version out of it.
 func (e *ServerEngine) documentFromLog(docID codec.UUID, contentHash codec.Hash, segmentSeq, frameOffset int64) (document.Document, bool) {
+	if dr := e.frameReads.Load(); dr != nil {
+		doc, found, err := readVersionFromFrame(dr.reader, storage.DeltaSegmentRef{
+			NamespaceID: dr.namespaceID, SequenceNumber: segmentSeq,
+		}, frameOffset, docID, contentHash)
+		return doc, err == nil && found
+	}
 	reader := e.frameReader.Load()
 	if reader == nil {
 		return document.Document{}, false

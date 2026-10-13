@@ -61,6 +61,15 @@ type DeltaCommitStreamer interface {
 	ReadCommitAt(segment DeltaSegmentRef, frameOffset int64) (document.Commit, error)
 }
 
+// DeltaDocumentReader is implemented by readers that can read one document's writes out of a
+// framed commit without decoding the whole commit - the cold point read. fn sees the patch of each
+// write of docID in the commit at frameOffset, in operation order, until it returns false; the
+// patch is borrowed and valid only during the call. A frame that is damaged or will not parse is
+// an error, as it is for ReadCommitAt.
+type DeltaDocumentReader interface {
+	ReadDocumentAt(segment DeltaSegmentRef, frameOffset int64, docID codec.UUID, fn func(patch []byte) bool) error
+}
+
 // DeltaSegmentSequencer reports the sequence number of the segment a
 // writer is currently appending to. Everything below it is sealed and can
 // never gain another commit, which is what lets a checkpoint say "segments

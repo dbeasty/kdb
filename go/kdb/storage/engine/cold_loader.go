@@ -76,6 +76,9 @@ func (l *deltaColdLoader) load(docID codec.UUID, contentHash codec.Hash) (docume
 	if !ok {
 		return document.Document{}, false, nil
 	}
+	if dr, ok := l.reader.(storage.DeltaDocumentReader); ok {
+		return readVersionFromFrame(dr, segment, ref.frameOffset, docID, contentHash)
+	}
 	streamer, ok := l.reader.(storage.DeltaCommitStreamer)
 	if !ok {
 		return document.Document{}, false, nil
@@ -100,6 +103,31 @@ func (l *deltaColdLoader) load(docID codec.UUID, contentHash codec.Hash) (docume
 		return documentFromPatch(w.DocID, w.Patch), true, nil
 	}
 	return document.Document{}, false, nil
+}
+
+// contentHashers lends ContentHashers to cold reads, which may run on any goroutine.
+var contentHashers = sync.Pool{New: func() any { return new(document.ContentHasher) }}
+
+// readVersionFromFrame reads the version of docID whose content hash is contentHash out of the
+// commit framed at frameOffset, decoding nothing of the commit but that document's writes (see
+// storage.DeltaDocumentReader). A commit can write the same document more than once; only the
+// write whose content matches is the version asked for, and only it is copied out of the frame.
+func readVersionFromFrame(dr storage.DeltaDocumentReader, segment storage.DeltaSegmentRef, frameOffset int64, docID codec.UUID, contentHash codec.Hash) (document.Document, bool, error) {
+	hasher := contentHashers.Get().(*document.ContentHasher)
+	defer contentHashers.Put(hasher)
+	var doc document.Document
+	found := false
+	err := dr.ReadDocumentAt(segment, frameOffset, docID, func(patch []byte) bool {
+		if hasher.HashBytes(docID, patch) != contentHash {
+			return true
+		}
+		doc, found = documentFromPatch(docID, string(patch)), true
+		return false
+	})
+	if err != nil {
+		return document.Document{}, false, err
+	}
+	return doc, found, nil
 }
 
 // index walks every segment once, recording where each written version

@@ -192,3 +192,27 @@ func ResolvedHistoryTreeBytes(cfg StorageEngineConfig) int64 {
 	}
 	return budget
 }
+
+// DefaultDeltaFrameCacheFraction is the share of the hot-tier budget a namespace may spend on
+// decompressed delta frames (delta.FrameCache): Cassandra's ChunkCache, sitting beside the SSTable
+// block cache (DefaultBlockCacheFraction) as the cache of the other on-disk structure reads go to.
+// An eighth, half the block cache's share, because a frame read on a miss costs one pread and one
+// decompress rather than an index probe as well. Like the other shares it is a cap, not a
+// reservation: the cache holds only frames cold reads have actually asked for.
+const DefaultDeltaFrameCacheFraction = 0.125
+
+// ResolvedDeltaFrameCacheBytes is how many bytes of decompressed delta frames a namespace keeps
+// for cold reads. Zero means no cache.
+func ResolvedDeltaFrameCacheBytes(cfg StorageEngineConfig) int64 {
+	if cfg.DeltaFrameCacheBytes < 0 {
+		return 0
+	}
+	if cfg.DeltaFrameCacheBytes > 0 {
+		return cfg.DeltaFrameCacheBytes
+	}
+	budget := int64(float64(cfg.ResolvedGlobalMemoryBudgetBytes()) * DefaultDeltaFrameCacheFraction)
+	if budget <= 0 {
+		return DefaultHotTierBytes / 8
+	}
+	return budget
+}
