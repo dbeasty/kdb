@@ -179,9 +179,8 @@ type trieSlab struct {
 
 	reused uint64 // slots handed out again after being freed
 
-	// For counted: records created, and whether slots were added, since the last GC cycle seen.
+	// For counted: records created, and as of the last GC cycle seen.
 	created, cycleCreated uint64
-	grewSinceCycle        bool
 	gcCycle               uint64
 	cycles                [1]metrics.Sample
 }
@@ -286,8 +285,7 @@ func (s *trieSlab) allocNode() uint32 {
 		s.nodes.free = s.nodes.free[:n-1]
 		return i
 	}
-	i, grew := s.nodes.reserve(1)
-	s.grewSinceCycle = s.grewSinceCycle || grew > 0
+	i, _ := s.nodes.reserve(1)
 	return i
 }
 
@@ -299,8 +297,7 @@ func (s *trieSlab) allocLeaf() uint32 {
 		s.leaves.free = s.leaves.free[:n-1]
 		return i
 	}
-	i, grew := s.leaves.reserve(1)
-	s.grewSinceCycle = s.grewSinceCycle || grew > 0
+	i, _ := s.leaves.reserve(1)
 	return i
 }
 
@@ -314,9 +311,11 @@ func (s *trieSlab) allocLeaf() uint32 {
 // Go's own rule (GOGC=100) is to collect once allocation since the last cycle matches the live
 // heap; the slab applies it at half that: once the records created since the last cycle - each
 // update's replace about as many as it creates - exceed half the records that were live before
-// it (and at least slabNudgeFloor bytes), and the slab has had to grow, a collection is
-// requested in the background, one at a time process-wide. A slab then holds about 1.5 times
-// what its trees need; a pointer trie's heap would reach twice at its GC goal.
+// it (and at least slabNudgeFloor bytes), a collection is requested in the background, one at a
+// time process-wide. A slab then holds about 1.5 times what its trees need; a pointer trie's
+// heap would reach twice at its GC goal. It must not wait until the slab has to grow: free slots
+// left by the last cycle absorb the next cycle's garbage first, so a slab that collected only
+// when it grew would end every cycle one floor larger than the last.
 const slabNudgeFloor = 4 << 20
 
 const slabNudgeEvery = 4096 // records created between checks
@@ -333,7 +332,7 @@ func (s *trieSlab) counted() {
 	}
 	metrics.Read(s.cycles[:])
 	if c := s.cycles[0].Value.Uint64(); c != s.gcCycle {
-		s.gcCycle, s.cycleCreated, s.grewSinceCycle = c, s.created, false
+		s.gcCycle, s.cycleCreated = c, s.created
 		return
 	}
 	since := s.created - s.cycleCreated
@@ -343,8 +342,8 @@ func (s *trieSlab) counted() {
 		live = inUse - since
 	}
 	const recBytes = (nodeRecBytes + leafRecBytes) / 2
-	if s.grewSinceCycle && since*recBytes > max(slabNudgeFloor, live*recBytes/2) && slabGCRunning.CompareAndSwap(false, true) {
-		s.cycleCreated, s.grewSinceCycle = s.created, false
+	if since*recBytes > max(slabNudgeFloor, live*recBytes/2) && slabGCRunning.CompareAndSwap(false, true) {
+		s.cycleCreated = s.created
 		go func() {
 			runtime.GC()
 			slabGCRunning.Store(false)
