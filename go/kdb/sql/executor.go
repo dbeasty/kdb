@@ -21,6 +21,11 @@ type Executor struct {
 	// IndexProvider, when non-nil, serves index-backed access paths and the search functions
 	// (kdb-spec-layer16 §9). Nil means no indexes: lookups full-scan, MATCH/SIMILARITY fail.
 	IndexProvider IndexProvider
+
+	// scanIDsOnly reproduces the fetch-by-id full scan this replaced (scan for ids, then fetch
+	// each document again). Tests only: it is the oracle that the single-fetch scan returns
+	// identical results.
+	scanIDsOnly bool
 }
 
 // ExecuteSelect runs a planned SELECT. Pipeline for a non-grouped query (§3.3): resolve ids →
@@ -77,18 +82,31 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	} else if ok {
 		return res, nil
 	}
-	ids, label, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt)
+	src, err := e.chooseAccessPath(query.Where, query.OrderBy, env, ctx, stopAt, residual)
 	if err != nil {
 		return QueryResult{}, err
 	}
+	label := src.label
 	limited := false
-	if pushLimit && residual == nil {
-		ids = applyLimitOffset(ids, limit, offset)
-		limited = true
-	}
-	docs, err := e.materialize(ids, residual, env, ctx)
-	if err != nil {
-		return QueryResult{}, err
+	var docs []*evalDoc
+	if src.scanned {
+		// The full scan already resolved every document and applied the residual to it; there
+		// is nothing left to fetch.
+		docs = src.docs
+		if pushLimit && residual == nil {
+			docs = applyLimitOffset(docs, limit, offset)
+			limited = true
+		}
+	} else {
+		ids := src.ids
+		if pushLimit && residual == nil {
+			ids = applyLimitOffset(ids, limit, offset)
+			limited = true
+		}
+		docs, err = e.materialize(ids, residual, env, ctx)
+		if err != nil {
+			return QueryResult{}, err
+		}
 	}
 	if pushLimit && !limited {
 		docs = applyLimitOffset(docs, limit, offset)
@@ -488,14 +506,47 @@ func applyLimitOffset[T any](items []T, limit, offset int) []T {
 
 // --- access paths ------------------------------------------------------------------------
 
+// accessPath is what chooseAccessPath resolved: candidate ids to fetch and filter, or - for a
+// full scan - the documents themselves, already filtered by the residual.
+type accessPath struct {
+	ids     []codec.UUID
+	docs    []*evalDoc
+	scanned bool
+	label   string
+}
+
 // chooseAccessPath picks the id source (§9.3): a search ranking when ORDER BY leads with a
 // score, else the first top-level AND conjunct the provider can serve (MATCH, =, range,
 // BETWEEN, IN), else a full scan. The label is reported as QueryResult.Plan.
-func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEnv, ctx QueryContext, stopAt int) ([]codec.UUID, string, error) {
+//
+// A full scan returns documents, not ids. The scan resolves every document anyway; it used to
+// keep only their ids, and materialize then fetched each one again by id - a second tree walk and
+// lookup per row. residual is applied during the scan, so only matching documents are held, as
+// materialize would have held them.
+func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEnv, ctx QueryContext, stopAt int, residual Expr) (accessPath, error) {
+	ids, label, found, err := e.chooseIndexPath(where, orderBy, env, ctx)
+	if err != nil || found {
+		return accessPath{ids: ids, label: label}, err
+	}
+	if e.scanIDsOnly {
+		docs, err := e.fullScan(ctx, stopAt, nil, env)
+		ids := make([]codec.UUID, len(docs))
+		for i, d := range docs {
+			ids[i] = d.doc.ID
+		}
+		return accessPath{ids: ids, label: "fullscan"}, err
+	}
+	docs, err := e.fullScan(ctx, stopAt, residual, env)
+	return accessPath{docs: docs, scanned: true, label: "fullscan"}, err
+}
+
+// chooseIndexPath is chooseAccessPath without the full-scan fallback: found=false means no
+// ranking, key or index serves where.
+func (e *Executor) chooseIndexPath(where Expr, orderBy []OrderItem, env *evalEnv, ctx QueryContext) ([]codec.UUID, string, bool, error) {
 	if len(orderBy) > 0 {
 		if lead := env.resolveAlias(orderBy[0].Expr); isSearchExpr(lead) {
 			if hits := env.scores[searchKey(lead)]; hits != nil {
-				return rankedIDs(hits), hits.label, nil
+				return rankedIDs(hits), hits.label, true, nil
 			}
 		}
 	}
@@ -512,14 +563,14 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 	for _, conj := range conjuncts(where) {
 		if isSearchExpr(conj) {
 			if hits := env.scores[searchKey(conj)]; hits != nil {
-				return rankedIDs(hits), hits.label, nil
+				return rankedIDs(hits), hits.label, true, nil
 			}
 			continue
 		}
 		// A document id is a key, not a column to scan for: serve it directly. Needs no index
 		// provider, and the residual WHERE still re-checks every candidate.
 		if ids, ok := keyLookup(conj, env); ok {
-			return ids, "keylookup", nil
+			return ids, "keylookup", true, nil
 		}
 		if e.IndexProvider == nil {
 			continue
@@ -544,19 +595,15 @@ func (e *Executor) chooseAccessPath(where Expr, orderBy []OrderItem, env *evalEn
 		}
 		ids, label, ok, err := e.indexLookup(c.conj, env, ctx)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
 		if ok && (!found || len(ids) < len(best)) {
 			best, bestLabel, found = ids, label, true
 		}
 	}
-	if found {
-		// Not truncated: the residual WHERE still runs over these, so cutting the list here
-		// would drop matches. The result bound is enforced on the rows actually returned.
-		return best, bestLabel, nil
-	}
-	ids, err := e.fullScan(ctx, stopAt)
-	return ids, "fullscan", err
+	// Not truncated: the residual WHERE still runs over these, so cutting the list here would
+	// drop matches. The result bound is enforced on the rows actually returned.
+	return best, bestLabel, found, nil
 }
 
 // estimateConjunct is how many ids serving conj from an index would return, or -1 when that is
@@ -857,12 +904,15 @@ func (e *Executor) matchingDocs(where Expr, from TableRef, ctx QueryContext) ([]
 	if err := e.resolveSearches(q, env, ctx); err != nil {
 		return nil, "", err
 	}
-	ids, label, err := e.chooseAccessPath(where, nil, env, ctx, 0)
+	src, err := e.chooseAccessPath(where, nil, env, ctx, 0, where)
 	if err != nil {
 		return nil, "", err
 	}
-	docs, err := e.materialize(ids, where, env, ctx)
-	return docs, label, err
+	if src.scanned {
+		return src.docs, src.label, nil
+	}
+	docs, err := e.materialize(src.ids, where, env, ctx)
+	return docs, src.label, err
 }
 
 // ResolveDocIDsForWhere resolves document ids matching a WHERE clause.
@@ -879,11 +929,15 @@ func (e *Executor) ResolveDocIDsForWhere(where Expr, sch schema.KdbSchema, ctx Q
 	return ids, nil
 }
 
-// fullScan lists the ids of every document at the resolved commit. stopAt > 0 lets it stop once
-// it has that many; 0 means read everything. Work is bounded by ctx.RowBudget, not by MaxRows:
-// MaxRows bounds what a query may *return*, and applying it here, before the residual filter,
-// silently dropped every document past the first MaxRows.
-func (e *Executor) fullScan(ctx QueryContext, stopAt int) ([]codec.UUID, error) {
+// fullScan resolves every document at the resolved commit, keeping those residual accepts (all
+// of them when residual is nil). stopAt > 0 lets it stop once it has that many; 0 means read
+// everything. Work is bounded by ctx.RowBudget, not by MaxRows: MaxRows bounds what a query may
+// *return*, and applying it here, before the residual filter, silently dropped every document
+// past the first MaxRows.
+//
+// Each scanned document counts once toward RowsExamined and DocsRead; each kept one toward
+// RetainedBytes - as the fetch-by-id path (materialize) counts the documents it fetches.
+func (e *Executor) fullScan(ctx QueryContext, stopAt int, residual Expr, env *evalEnv) ([]*evalDoc, error) {
 	atCommit, err := e.atCommit(ctx)
 	if err != nil {
 		return nil, err
@@ -893,7 +947,7 @@ func (e *Executor) fullScan(ctx QueryContext, stopAt int) ([]codec.UUID, error) 
 		return nil, err
 	}
 	treeHash := commit.DocumentTreeHash
-	var ids []codec.UUID
+	var docs []*evalDoc
 	examined := 0
 	err = e.Storage.ScanDocuments(ctx.NamespaceID, treeHash, 256, func(batch []document.Document) error {
 		for _, d := range batch {
@@ -902,8 +956,14 @@ func (e *Executor) fullScan(ctx QueryContext, stopAt int) ([]codec.UUID, error) 
 			if ctx.RowBudget > 0 && examined > ctx.RowBudget {
 				return &ScanRowBudgetExceededError{Budget: ctx.RowBudget}
 			}
-			ids = append(ids, d.ID)
-			if stopAt > 0 && len(ids) >= stopAt {
+			ctx.Stats.addDocRead(len(d.JSON))
+			ed := newEvalDoc(d)
+			if residual != nil && !env.predicate(residual, ed) {
+				continue
+			}
+			ctx.Stats.addRetained(int64(len(d.JSON)) + retainedRowOverheadBytes)
+			docs = append(docs, ed)
+			if stopAt > 0 && len(docs) >= stopAt {
 				// Stop the scan outright rather than merely stopping appending: a query that
 				// has everything it can return must not read the rest of the namespace.
 				return errScanComplete
@@ -913,11 +973,11 @@ func (e *Executor) fullScan(ctx QueryContext, stopAt int) ([]codec.UUID, error) 
 	})
 	if err != nil {
 		if errors.Is(err, errScanComplete) {
-			return ids, nil
+			return docs, nil
 		}
 		return nil, err
 	}
-	return ids, nil
+	return docs, nil
 }
 
 const defaultMaxResultRows = 10000

@@ -1,6 +1,9 @@
 package wire
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sync"
+)
 
 // Codec encodes and decodes length-prefixed wire frames.
 type Codec interface {
@@ -23,21 +26,101 @@ func NewCodec(encoding PayloadEncoding) *DefaultCodec {
 
 func (c *DefaultCodec) Encoding() PayloadEncoding { return c.encoding }
 
+// Encode returns one complete frame in a buffer of its own, which the caller may keep.
+//
+// The JSON envelope is encoded straight into the frame buffer, after a reserved 12-byte header
+// and the encoding tag, and the header is patched in once the length is known. It used to build
+// three buffers per reply - json.Marshal's result, a tagged payload copy, and the frame copy -
+// so every reply paid two full extra copies of its body.
 func (c *DefaultCodec) Encode(message Message) ([]byte, error) {
+	fw := frameWriter{}
+	if err := c.encodeInto(&fw, message); err != nil {
+		return nil, err
+	}
+	return fw.buf, nil
+}
+
+// EncodePooled is Encode into a pooled buffer. The returned release must be called exactly once,
+// after the last use of frame; frame must not be touched after that.
+//
+// Only use it where the frame's lifetime is provably bounded - a Send that has finished with the
+// slice when it returns (core.SynchronousSender). A transport that retains the slice after Send
+// returns (gRPC's ServerStream.SendMsg, for one, documents that the message must not be modified
+// afterwards) must get a frame from Encode instead.
+func (c *DefaultCodec) EncodePooled(message Message) (frame []byte, release func(), err error) {
+	fw := framePool.Get().(*frameWriter)
+	if err := c.encodeInto(fw, message); err != nil {
+		fw.release()
+		return nil, nil, err
+	}
+	return fw.buf, fw.release, nil
+}
+
+func (c *DefaultCodec) encodeInto(fw *frameWriter, message Message) error {
 	env, err := messageToEnvelope(message)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	body, err := json.Marshal(env)
-	if err != nil {
-		return nil, err
+	fw.reset()
+	fw.buf = append(fw.buf, encodingTag(c.encoding))
+	// json.Encoder writes the pooled encodeState's bytes to fw in one Write, so the body is
+	// copied exactly once, into the frame. Its output is json.Marshal's byte for byte (both
+	// escape HTML) plus a trailing newline, trimmed below.
+	enc := json.NewEncoder(fw)
+	if err := enc.Encode(env); err != nil {
+		return err
 	}
-	payload := make([]byte, 1+len(body))
-	payload[0] = encodingTag(c.encoding)
-	copy(payload[1:], body)
+	if n := len(fw.buf); n > 0 && fw.buf[n-1] == '\n' {
+		fw.buf = fw.buf[:n-1]
+	}
+	totalLength := len(fw.buf)
+	if err := ValidateFrameLength(totalLength, DefaultMaxFrameBytes); err != nil {
+		return err
+	}
 	h := message.Header()
-	h.PayloadLength = len(payload)
-	return EncodeFrameOnly(h, payload)
+	writeInt32LE(fw.buf, 0, int32(totalLength))
+	writeInt16LE(fw.buf, 4, int16(h.MessageType))
+	writeInt16LE(fw.buf, 6, int16(h.ProtocolVersion))
+	writeInt32LE(fw.buf, 8, int32(h.CorrelationID))
+	return nil
+}
+
+// frameWriter is the io.Writer a frame is encoded into: a byte slice that starts with the
+// reserved header.
+type frameWriter struct {
+	buf []byte
+}
+
+func (w *frameWriter) reset() {
+	if cap(w.buf) < FrameHeaderSize+1 {
+		// Room for the header and the tag only: the body's single Write then grows the slice to
+		// its final size in one step, so an unpooled frame costs one allocation of its own size
+		// (plus this small one), not a doubling series.
+		w.buf = make([]byte, FrameHeaderSize, 16)
+		return
+	}
+	w.buf = w.buf[:FrameHeaderSize]
+}
+
+func (w *frameWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+// maxPooledFrameBytes bounds the buffers kept for reuse. A pool that kept whatever it was handed
+// would pin the largest reply ever sent (up to 16 MiB) for every concurrent sender until the next
+// GC; replies bigger than this are rare, so they are left to the allocator.
+const maxPooledFrameBytes = 1 << 20
+
+var framePool = sync.Pool{New: func() any { return &frameWriter{} }}
+
+func (w *frameWriter) release() {
+	if cap(w.buf) > maxPooledFrameBytes {
+		w.buf = nil
+	} else {
+		w.buf = w.buf[:0]
+	}
+	framePool.Put(w)
 }
 
 func (c *DefaultCodec) Decode(frame []byte) (Message, error) {

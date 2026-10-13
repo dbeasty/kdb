@@ -191,8 +191,10 @@ func setNoDelay(conn net.Conn) {
 type socketConnection struct {
 	conn          net.Conn
 	maxFrameBytes int
-	reader        *core.FrameStreamReader
-	incoming      chan []byte
+	reader        *core.FrameReader
+	// writeTimeout bounds each Send; 0 is no bound. See core.DefaultWriteTimeout.
+	writeTimeout time.Duration
+	incoming     chan []byte
 	// onClose, if set, runs exactly once when this connection closes - how Serve's connection
 	// cap learns that a slot has freed.
 	onClose func()
@@ -216,7 +218,8 @@ func newSocketConnection(conn net.Conn, options core.TransportConnectOptions, on
 		conn:          conn,
 		onClose:       onClose,
 		maxFrameBytes: max,
-		reader:        core.NewAdmittingFrameStreamReader(max, options.Admitter),
+		reader:        core.NewFrameReader(conn, max, options.Admitter),
+		writeTimeout:  options.WriteTimeout(),
 		incoming:      make(chan []byte, queue),
 		done:          make(chan struct{}),
 	}
@@ -237,35 +240,28 @@ func newSocketConnection(conn net.Conn, options core.TransportConnectOptions, on
 // with "send on closed channel".
 func (c *socketConnection) readLoop() {
 	defer close(c.incoming)
-	buf := make([]byte, 4096)
 	for {
-		n, err := c.conn.Read(buf)
-		if n > 0 {
-			frames, ferr := c.reader.Feed(buf[:n])
-			// Rejections are written before the admitted frames are dispatched, and directly
-			// from this loop rather than through the incoming queue: the whole value of shedding
-			// at the header is that a refusal does not have to queue behind the very work the
-			// server has already decided it cannot do.
-			for _, rejection := range c.reader.TakeRejections() {
-				if sendErr := c.Send(rejection); sendErr != nil {
-					_ = c.Close()
-					return
-				}
-			}
-			if ferr != nil {
+		frame, rejection, err := c.reader.Next()
+		if err != nil {
+			_ = c.Close()
+			return
+		}
+		// A rejection is written directly from this loop rather than through the incoming
+		// queue: the whole value of shedding at the header is that a refusal does not have to
+		// queue behind the very work the server has already decided it cannot do.
+		if rejection != nil {
+			if sendErr := c.Send(rejection); sendErr != nil {
 				_ = c.Close()
 				return
 			}
-			for _, frame := range frames {
-				select {
-				case c.incoming <- frame:
-				case <-c.done:
-					return
-				}
-			}
+			continue
 		}
-		if err != nil {
-			_ = c.Close()
+		if frame == nil {
+			continue // shed with no reply to send
+		}
+		select {
+		case c.incoming <- frame:
+		case <-c.done:
 			return
 		}
 	}
@@ -280,15 +276,37 @@ func (c *socketConnection) Send(frame []byte) error {
 	if c.closed {
 		return stream.NewNotConnectedError()
 	}
-	_, err := c.conn.Write(frame)
-	return err
+	if c.writeTimeout > 0 {
+		if err := c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			c.closeLocked()
+			return err
+		}
+	}
+	if _, err := c.conn.Write(frame); err != nil {
+		// A write that failed - the deadline passed, or the peer went away - may have left a
+		// partial frame on the wire, so the stream can never be resynchronized. Close it: the
+		// peer sees the connection end instead of a corrupt frame, and every reply queued
+		// behind this one fails fast instead of waiting for the same stalled peer.
+		c.closeLocked()
+		return err
+	}
+	return nil
 }
+
+// SendCompletesSynchronously reports that Send writes the frame before returning and keeps no
+// reference to it (core.SynchronousSender).
+func (c *socketConnection) SendCompletesSynchronously() bool { return true }
 
 func (c *socketConnection) Incoming() <-chan []byte { return c.incoming }
 
 func (c *socketConnection) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.closeLocked()
+}
+
+// closeLocked is Close with c.mu already held.
+func (c *socketConnection) closeLocked() error {
 	if c.closed {
 		return nil
 	}

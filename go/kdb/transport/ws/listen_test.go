@@ -540,3 +540,35 @@ func TestListenBoundRefusesWssWithoutTLSSettings(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// The header and payload now go out in one write (masked: one buffer; unmasked: a gathered write
+// on TCP, one copied buffer otherwise). Every length encoding, on both sides of each boundary,
+// must still round trip through a masked client send and an unmasked server echo.
+func TestServeRoundTripAcrossLengthEncodingBoundaries(t *testing.T) {
+	options := core.DefaultConnectOptions()
+	uri, stop := serveEcho(t, options)
+	defer stop()
+
+	conn, err := NewTransport(options).Connect(uri)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close()
+
+	base := len(testFrame(t, 1, ""))
+	for _, frameSize := range []int{base, 125, 126, 127, 65535, 65536, 65537, singleWriteCopyBytes + 1, 1 << 20} {
+		size := max(frameSize-base, 0)
+		sent := testFrame(t, 1, strings.Repeat("y", size))
+		if err := conn.Send(sent); err != nil {
+			t.Fatalf("send %d: %v", len(sent), err)
+		}
+		select {
+		case got := <-conn.Incoming():
+			if string(got) != string(sent) {
+				t.Fatalf("frame of %d bytes: round trip mismatch (%d bytes back)", len(sent), len(got))
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("frame of %d bytes: timed out", len(sent))
+		}
+	}
+}
