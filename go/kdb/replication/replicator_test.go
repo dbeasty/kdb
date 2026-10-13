@@ -3,6 +3,8 @@ package replication
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -270,4 +272,126 @@ func TestDeepenRunsAfterAShallowBoundaryError(t *testing.T) {
 			t.Errorf("%s: deepenAfter = %v, want %v", c.name, got, c.want)
 		}
 	}
+}
+
+// slowAcceptProxy forwards connections to target, each only after delay: a peer that is slow to
+// answer, so the peers dialled alongside it reliably go first.
+func slowAcceptProxy(t *testing.T, target string, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			in, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer in.Close()
+				time.Sleep(delay)
+				out, err := net.Dial("tcp", target)
+				if err != nil {
+					return
+				}
+				defer out.Close()
+				go io.Copy(out, in)
+				io.Copy(in, out)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestSnapshotPeerBootstrapsBeforeOtherPeers: a node joining two peers, one with bootstrap=snapshot,
+// is bootstrapped from that peer's snapshot even when the other peer answers first. A node's pulls
+// of a namespace take turns, and the snapshot decision is made from what the node holds when its
+// turn comes: before, the plain peer's pull usually won the race, the namespace was no longer empty
+// by the snapshot peer's turn, and its whole history was fetched instead (test_deepen.py flaked 7
+// times in 10).
+func TestSnapshotPeerBootstrapsBeforeOtherPeers(t *testing.T) {
+	ns := "app/data"
+	a, b, c := newNode(t, ns), newNode(t, ns), newNode(t, ns)
+	for i := 0; i < 5; i++ {
+		put(t, b, fmt.Sprintf(`{"from":"b","n":%d}`, i))
+	}
+	put(t, c, `{"from":"c"}`)
+	var first codec.Hash // b's oldest commit above its root: a snapshot of b's main leaves it out
+	{
+		h := head(t, b)
+		for {
+			cm, _ := b.Runtime.DAG.GetCommitOrThrow(h)
+			if len(cm.ParentHashes) == 0 {
+				break
+			}
+			first, h = h, cm.ParentHashes[0]
+		}
+	}
+	lnB, err := server.ListenPeerSync("tcp://127.0.0.1:0?bind=true", b, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnB.Close()
+	lnC, err := server.ListenPeerSync("tcp://127.0.0.1:0?bind=true", c, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnC.Close()
+	r, err := New(Config{
+		NodeID: a.NodeID.String(), Local: a.PeerNamespaces(),
+		Peers: []PeerConfig{
+			{Name: "b", Addr: "tcp://" + slowAcceptProxy(t, lnB.Addr().String(), 300*time.Millisecond), Namespaces: []string{ns},
+				Mode: peersync.SyncPull, Interval: 100 * time.Millisecond, PreferSnapshot: true},
+			{Name: "c", Addr: "tcp://" + lnC.Addr().String(), Namespaces: []string{ns}, Mode: peersync.SyncPull, Interval: 100 * time.Millisecond},
+		},
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop()
+	eventually(t, 10*time.Second, "a to hold both peers' heads", func() bool {
+		return a.Runtime.DAG.(interface{ HasCommit(codec.Hash) bool }).HasCommit(head(t, b)) &&
+			a.Runtime.DAG.(interface{ HasCommit(codec.Hash) bool }).HasCommit(head(t, c))
+	})
+	if len(a.ShallowRoots()) == 0 || a.Runtime.DAG.(interface{ HasCommit(codec.Hash) bool }).HasCommit(first) {
+		t.Fatalf("a fetched b's whole history instead of bootstrapping from its snapshot (shallow roots %d)", len(a.ShallowRoots()))
+	}
+}
+
+// A snapshot peer that never answers delays the other peers' first sync by at most a request
+// timeout; it does not block them.
+func TestDownSnapshotPeerDoesNotBlockOtherPeers(t *testing.T) {
+	ns := "app/data"
+	a, c := newNode(t, ns), newNode(t, ns)
+	put(t, c, `{"from":"c"}`)
+	lnC, err := server.ListenPeerSync("tcp://127.0.0.1:0?bind=true", c, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnC.Close()
+	// Accepts and never answers: the snapshot peer's sync hangs until its request timeout.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dead.Close()
+	r, err := New(Config{
+		NodeID: a.NodeID.String(), Local: a.PeerNamespaces(),
+		Peers: []PeerConfig{
+			{Name: "b", Addr: "tcp://" + dead.Addr().String(), Namespaces: []string{ns}, Mode: peersync.SyncPull,
+				Interval: time.Hour, PreferSnapshot: true},
+			{Name: "c", Addr: "tcp://" + lnC.Addr().String(), Namespaces: []string{ns}, Mode: peersync.SyncPull, Interval: 100 * time.Millisecond},
+		},
+		Timeout: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	defer r.Stop()
+	eventually(t, 5*time.Second, "c's write to reach a", func() bool { return head(t, a) == head(t, c) })
 }

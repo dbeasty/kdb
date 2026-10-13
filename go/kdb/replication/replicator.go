@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -59,6 +60,12 @@ type Replicator struct {
 	wg    sync.WaitGroup
 	stop  chan struct{}
 	once  sync.Once
+
+	// snapshotFirst is closed once every peer that bootstraps by snapshot has finished its first
+	// sync (see awaitSnapshotPeers); nil when no peer does. snapshotPending counts the ones still
+	// to finish.
+	snapshotFirst   chan struct{}
+	snapshotPending atomic.Int32
 }
 
 // New returns a replicator for cfg's peers; Start runs it.
@@ -86,6 +93,12 @@ func New(cfg Config) (*Replicator, error) {
 		}
 		r.loops[p.Name] = &peerLoop{r: r, peer: p, trigger: make(chan struct{}, 1), done: make(chan struct{})}
 		r.order = append(r.order, p.Name)
+		if bootstrapsBySnapshot(p) {
+			r.snapshotPending.Add(1)
+		}
+	}
+	if r.snapshotPending.Load() > 0 {
+		r.snapshotFirst = make(chan struct{})
 	}
 	sort.Strings(r.order)
 	return r, nil
@@ -287,6 +300,7 @@ func (l *peerLoop) kick() {
 func (l *peerLoop) run() {
 	timer := time.NewTimer(l.peer.Interval)
 	defer timer.Stop()
+	first := true
 	for {
 		select {
 		case <-l.r.stop:
@@ -301,7 +315,14 @@ func (l *peerLoop) run() {
 			l.drainTrigger()
 		case <-timer.C:
 		}
+		if first && !bootstrapsBySnapshot(l.peer) && !l.r.awaitSnapshotPeers() {
+			return
+		}
 		_, err := l.cycle()
+		if first && bootstrapsBySnapshot(l.peer) && l.r.snapshotPending.Add(-1) == 0 {
+			close(l.r.snapshotFirst)
+		}
+		first = false
 		delay := l.peer.Interval
 		if err != nil {
 			delay = l.backoff()
@@ -317,6 +338,39 @@ func (l *peerLoop) run() {
 		}
 		timer.Reset(delay)
 	}
+}
+
+// bootstrapsBySnapshot reports whether p joins an empty namespace from a snapshot of its main.
+func bootstrapsBySnapshot(p PeerConfig) bool {
+	return p.PreferSnapshot && p.Filter == ""
+}
+
+// awaitSnapshotPeers holds a peer's first sync until every peer that bootstraps by snapshot has
+// finished its own first sync. A node's pulls of a namespace take turns (peersync's pull gate),
+// and the snapshot decision is made at the start of each turn from what the node then holds: had
+// a plain peer's pull gone first, the namespace was no longer empty when the snapshot peer's turn
+// came, so bootstrap=snapshot was silently skipped and the snapshot peer's whole history was
+// fetched instead - which one won was a race between the two loops. The wait is bounded, so a
+// snapshot peer that is down delays the others by at most a request timeout, never blocks them;
+// after that, the pull gate still orders whatever pulls are in flight. It reports false if the
+// replicator stopped while waiting.
+func (r *Replicator) awaitSnapshotPeers() bool {
+	if r.snapshotFirst == nil {
+		return true
+	}
+	wait := r.cfg.Timeout
+	if wait <= 0 {
+		wait = 30 * time.Second
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-r.snapshotFirst:
+	case <-timer.C:
+	case <-r.stop:
+		return false
+	}
+	return true
 }
 
 func (l *peerLoop) drainTrigger() {
