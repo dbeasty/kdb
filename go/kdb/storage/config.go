@@ -82,6 +82,12 @@ type StorageEngineConfig struct {
 	// resident before the oldest are evicted and re-read on demand. Zero
 	// derives it from the hot-tier budget; see ResolvedDocumentCacheBytes.
 	DocumentCacheBytes int64
+	// BoundedLiveBodies lets the document versions the live tree names be evicted like any other,
+	// once the commit that wrote them is in the delta log, so live data no longer has to fit in
+	// memory: an evicted live version is read back through its location record or the cold
+	// loader. Off, every live version stays pinned in memory, as before. Ignored for a namespace
+	// with no cold path (the in-memory runtime), whose versions exist nowhere else.
+	BoundedLiveBodies bool
 	// CommitOpsBytes caps how many bytes of commit operations the DAG
 	// keeps resident. Zero derives it from the hot-tier budget; see
 	// ResolvedCommitOpsBytes.
