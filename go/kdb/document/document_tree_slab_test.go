@@ -559,3 +559,66 @@ func BenchmarkTrieUpdateChain(b *testing.B) {
 		runtime.KeepAlive(h0)
 	})
 }
+
+// TestSlabConcurrentWritersFromOneBase: several goroutines derive their own chains from one
+// shared base tree at once - concurrent transactions on a namespace - so their records are
+// placed into one slab concurrently, while the collector releases what each drops. Each chain
+// must still match the reference trie built from the same operations.
+func TestSlabConcurrentWritersFromOneBase(t *testing.T) {
+	slabPoison.Store(true)
+	defer slabPoison.Store(false)
+	r := rand.New(rand.NewSource(5))
+	universe := testIDs(r, 600)
+	entries := map[codec.UUID]codec.Hash{}
+	for _, id := range universe[:400] {
+		var h codec.Hash
+		r.Read(h.Bytes[:])
+		entries[id] = h
+	}
+	base, err := BuildTrieDocumentTree(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRef := ptrBuild(entries)
+	steps := 3000
+	if testing.Short() {
+		steps = 500
+	}
+	var wg sync.WaitGroup
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			rr := rand.New(rand.NewSource(seed))
+			tree, ref := base, baseRef
+			for i := 0; i < steps; i++ {
+				id := universe[rr.Intn(len(universe))]
+				var err error
+				if rr.Intn(3) == 0 {
+					tree, err = tree.Without(id)
+					ref = ptrDelete(ref, id)
+				} else {
+					var h codec.Hash
+					rr.Read(h.Bytes[:])
+					tree, err = tree.With(id, h)
+					ref = ptrInsert(ref, id, h)
+				}
+				if err != nil || tree.TreeHash != ptrTreeHash(ref) {
+					t.Errorf("writer %d step %d: hash differs from the reference (%v)", seed, i, err)
+					return
+				}
+				if i%200 == 0 {
+					runtime.GC()
+					if !slabMatchesPtr(tree.trie, ref) {
+						t.Errorf("writer %d step %d: shape differs from the reference", seed, i)
+						return
+					}
+				}
+			}
+		}(int64(g))
+	}
+	wg.Wait()
+	if !slabMatchesPtr(base.trie, baseRef) {
+		t.Fatal("the shared base changed under its writers")
+	}
+}
