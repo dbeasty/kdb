@@ -51,20 +51,23 @@ const (
 	refIndexMask tref = refLocal - 1
 )
 
-// nodeRec is an internal node: its hash and its 16 children (0 for an absent child). 100 bytes.
+// nodeRec is an internal node: its hash and its 16 children (0 for an absent child). 96 bytes.
 type nodeRec struct {
 	hash  [32]byte
 	child [16]tref
-	rc    uint32
 }
 
 // leafRec is a compressed leaf: one entry standing for the whole subtree where it sits, with the
-// hash that subtree's full-depth spine would have (foldLeaf at its depth). 84 bytes.
+// hash that subtree's full-depth spine would have (foldLeaf at its depth). 80 bytes.
+//
+// Reference counts are not in the records but in a dense array beside them (slabPool.counts):
+// a release decrements every child of a freed node and an update increments every sibling on
+// its path, and at 4 bytes a count those land in a few megabytes of cache rather than one cache
+// miss each across the whole slab.
 type leafRec struct {
 	hash    [32]byte
 	id      [16]byte
 	content codec.Hash
-	rc      uint32
 }
 
 // Chunks double from 8 records up to 16,384, then stay there: a tree of a few documents (a wire
@@ -99,6 +102,7 @@ func slabChunkLen(k int) int {
 // time after the records it reads were published.
 type slabPool[R any] struct {
 	chunks atomic.Pointer[[][]R]
+	counts atomic.Pointer[[][]uint32] // reference counts, chunked as the records are
 	used   uint32   // slots below this have been handed out at some time; under the slab lock
 	cap    uint32   // slots below this are addressable; under the slab lock
 	free   []uint32 // freed slots; under the slab lock
@@ -120,11 +124,19 @@ func (p *slabPool[R]) grow(n uint32) (added uint32) {
 	d := p.dir()
 	nd := make([][]R, len(d), len(d)+4)
 	copy(nd, d)
+	var cd [][]uint32
+	if c := p.counts.Load(); c != nil {
+		cd = *c
+	}
+	ncd := make([][]uint32, len(cd), len(cd)+4)
+	copy(ncd, cd)
 	for p.cap < n {
 		l := slabChunkLen(len(nd))
 		nd = append(nd, make([]R, l))
+		ncd = append(ncd, make([]uint32, l))
 		p.cap += uint32(l)
 	}
+	p.counts.Store(&ncd)
 	p.chunks.Store(&nd)
 	return p.cap - before
 }
@@ -148,6 +160,12 @@ func (p *slabPool[R]) at(i uint32) *R {
 	return &p.dir()[k][off]
 }
 
+// count is slot i's reference count. Under the slab lock, or by a bulk build on its own slots.
+func (p *slabPool[R]) count(i uint32) *uint32 {
+	k, off := slabLocate(i)
+	return &(*p.counts.Load())[k][off]
+}
+
 type trieSlab struct {
 	mu     sync.Mutex
 	nodes  slabPool[nodeRec]
@@ -169,8 +187,8 @@ type trieSlab struct {
 }
 
 const (
-	nodeRecBytes = 100
-	leafRecBytes = 84
+	nodeRecBytes = 96 + 4 // with its count
+	leafRecBytes = 80 + 4
 )
 
 func newTrieSlab() *trieSlab { return &trieSlab{} }
@@ -219,9 +237,9 @@ func (s *trieSlab) retain(r tref) {
 	switch {
 	case r == 0:
 	case r&refLeaf != 0:
-		s.leaves.at(uint32(r &^ refLeaf)).rc++
+		*s.leaves.count(uint32(r &^ refLeaf))++
 	default:
-		s.nodes.at(uint32(r)).rc++
+		*s.nodes.count(uint32(r))++
 	}
 }
 
@@ -230,22 +248,24 @@ func (s *trieSlab) release(r tref) {
 	case r == 0:
 	case r&refLeaf != 0:
 		i := uint32(r &^ refLeaf)
-		l := s.leaves.at(i)
-		if l.rc == 0 {
+		rc := s.leaves.count(i)
+		if *rc == 0 {
 			panic("document: trie slab leaf released more often than retained")
 		}
-		if l.rc--; l.rc == 0 {
+		if *rc--; *rc == 0 {
 			if slabPoison.Load() {
+				l := s.leaves.at(i)
 				l.hash, l.content = slabPoisonHash, codec.Hash{Bytes: slabPoisonHash}
 			}
 			s.leaves.free = append(s.leaves.free, i)
 		}
 	default:
-		n := s.nodes.at(uint32(r))
-		if n.rc == 0 {
+		rc := s.nodes.count(uint32(r))
+		if *rc == 0 {
 			panic("document: trie slab node released more often than retained")
 		}
-		if n.rc--; n.rc == 0 {
+		if *rc--; *rc == 0 {
+			n := s.nodes.at(uint32(r))
 			children := n.child
 			if slabPoison.Load() {
 				n.hash = slabPoisonHash

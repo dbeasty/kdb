@@ -3,9 +3,11 @@ package document
 import (
 	"bytes"
 	"math/rand"
+	"os"
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -422,8 +424,8 @@ func TestSlabRecordsArePointerFree(t *testing.T) {
 			t.Fatalf("%v holds a pointer", ty)
 		}
 	}
-	if n, l := reflect.TypeOf(nodeRec{}).Size(), reflect.TypeOf(leafRec{}).Size(); n != 100 || l != 84 {
-		t.Fatalf("record sizes %d/%d, want 100/84", n, l)
+	if n, l := reflect.TypeOf(nodeRec{}).Size(), reflect.TypeOf(leafRec{}).Size(); n != 96 || l != 80 {
+		t.Fatalf("record sizes %d/%d, want 96/80", n, l)
 	}
 }
 
@@ -497,4 +499,63 @@ func TestSlabTreeMemoryPerDocument(t *testing.T) {
 	}
 	runtime.KeepAlive(tree)
 	runtime.KeepAlive(packed)
+}
+
+// BenchmarkTrieUpdateChain compares the slab trie with the reference pointer trie (the code it
+// replaced) in one process: a chain of updates to existing documents of a large tree, each
+// version derived from the last and only the last kept, as the live tree is. KDB_TREE_BENCH_N
+// sets the size (default 1,000,000).
+func BenchmarkTrieUpdateChain(b *testing.B) {
+	n := 1_000_000
+	if v, err := strconv.Atoi(os.Getenv("KDB_TREE_BENCH_N")); err == nil && v > 0 {
+		n = v
+	}
+	r := rand.New(rand.NewSource(9))
+	entries := make(map[codec.UUID]codec.Hash, n)
+	ids := make([]codec.UUID, 0, n)
+	for len(ids) < n {
+		var k [16]byte
+		r.Read(k[:])
+		id := keyUUID(&k)
+		var h codec.Hash
+		r.Read(h.Bytes[:])
+		entries[id] = h
+		ids = append(ids, id)
+	}
+	b.Run("ptr", func(b *testing.B) {
+		root := ptrBuild(entries)
+		runtime.GC()
+		b.ReportAllocs()
+		b.ResetTimer()
+		var h codec.Hash
+		for i := 0; i < b.N; i++ {
+			h.Bytes[0], h.Bytes[1], h.Bytes[2] = byte(i), byte(i>>8), byte(i>>16)
+			root = ptrInsert(root, ids[(i*7919)%n], h)
+		}
+		runtime.KeepAlive(root)
+	})
+	b.Run("slab", func(b *testing.B) {
+		tree, _ := BuildTrieDocumentTree(entries)
+		runtime.GC()
+		b.ReportAllocs()
+		b.ResetTimer()
+		var h codec.Hash
+		for i := 0; i < b.N; i++ {
+			h.Bytes[0], h.Bytes[1], h.Bytes[2] = byte(i), byte(i>>8), byte(i>>16)
+			tree, _ = tree.With(ids[(i*7919)%n], h)
+		}
+		runtime.KeepAlive(tree)
+	})
+	b.Run("slab-trie", func(b *testing.B) { // trieWith alone, without DocumentTree.With's lookup
+		h0 := trieBuild(entries)
+		runtime.GC()
+		b.ReportAllocs()
+		b.ResetTimer()
+		var h codec.Hash
+		for i := 0; i < b.N; i++ {
+			h.Bytes[0], h.Bytes[1], h.Bytes[2] = byte(i), byte(i>>8), byte(i>>16)
+			h0 = trieWith(h0, ids[(i*7919)%n], h)
+		}
+		runtime.KeepAlive(h0)
+	})
 }

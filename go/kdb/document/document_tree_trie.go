@@ -147,6 +147,21 @@ type editRec struct {
 	leaf    bool
 }
 
+// editPool recycles edits: a fresh one is ~10 KB that Go would zero on every update, and every
+// record an edit uses is written whole before it is read, so a recycled one needs no clearing.
+var editPool = sync.Pool{New: func() any { return new(trieEdit) }}
+
+func getEdit(v trieView) *trieEdit {
+	e := editPool.Get().(*trieEdit)
+	e.v, e.n = v, 0
+	return e
+}
+
+func putEdit(e *trieEdit) {
+	e.v = trieView{}
+	editPool.Put(e)
+}
+
 func (e *trieEdit) local(r tref) *editRec { return &e.recs[r&refIndexMask] }
 
 func (e *trieEdit) isLeaf(r tref) bool {
@@ -356,14 +371,14 @@ func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
 	} else {
 		s, root = h.slab, h.root
 	}
-	var e trieEdit
-	e.v = s.view()
+	e := getEdit(s.view())
 	key := uuidKey(id)
 	nr := e.insert(root, &key, contentHash, 0)
-	if nr == root {
-		return h
+	out := h
+	if nr != root {
+		out = s.commit(e, nr)
 	}
-	out := s.commit(&e, nr)
+	putEdit(e)
 	runtime.KeepAlive(h)
 	return out
 }
@@ -373,14 +388,14 @@ func trieWithout(h *trieTree, id codec.UUID) *trieTree {
 	if h == nil {
 		return nil
 	}
-	var e trieEdit
-	e.v = h.slab.view()
+	e := getEdit(h.slab.view())
 	key := uuidKey(id)
 	nr := e.delete(h.root, &key, 0)
-	if nr == h.root {
-		return h
+	out := h
+	if nr != h.root {
+		out = h.slab.commit(e, nr)
 	}
-	out := h.slab.commit(&e, nr)
+	putEdit(e)
 	runtime.KeepAlive(h)
 	return out
 }
@@ -551,13 +566,11 @@ func (b *trieBulk) node(children *[16]tref) tref {
 		case c == 0:
 			continue
 		case c&refLeaf != 0:
-			l := b.s.leaves.at(uint32(c &^ refLeaf))
-			copy(buf[1+i*32:], l.hash[:])
-			l.rc++
+			copy(buf[1+i*32:], b.s.leaves.at(uint32(c &^ refLeaf)).hash[:])
+			*b.s.leaves.count(uint32(c &^ refLeaf))++
 		default:
-			n := b.s.nodes.at(uint32(c))
-			copy(buf[1+i*32:], n.hash[:])
-			n.rc++
+			copy(buf[1+i*32:], b.s.nodes.at(uint32(c)).hash[:])
+			*b.s.nodes.count(uint32(c))++
 		}
 	}
 	r, n := b.newNode()
