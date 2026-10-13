@@ -14,26 +14,36 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 		want dag.GraphSettings
 	}{
 		{
-			// The property that matters most: an operator who has not heard
-			// of any of this gets exactly the behaviour they had.
-			name: "nothing set turns nothing on",
+			// An operator who has not heard of any of this gets the mapped commit graph - the
+			// default since it passed its gates - and nothing else.
+			name: "nothing set maps the graph and turns nothing else on",
 			env:  nil,
+			want: dag.GraphSettings{FileEnabled: true},
+		},
+		{
+			name: "the graph file can still be turned off",
+			env:  map[string]string{"KDB_GRAPH_FILE": "off"},
 			want: dag.GraphSettings{},
+		},
+		{
+			name: "an unparseable graph file value is the default",
+			env:  map[string]string{"KDB_GRAPH_FILE": "perhaps"},
+			want: dag.GraphSettings{FileEnabled: true},
 		},
 		{
 			name: "pruning on",
 			env:  map[string]string{"KDB_ANCESTRY_PRUNING": "on"},
-			want: dag.GraphSettings{AncestryPruning: true},
+			want: dag.GraphSettings{AncestryPruning: true, FileEnabled: true},
 		},
 		{
 			name: "the other spellings of on",
 			env:  map[string]string{"KDB_ANCESTRY_PRUNING": " TRUE "},
-			want: dag.GraphSettings{AncestryPruning: true},
+			want: dag.GraphSettings{AncestryPruning: true, FileEnabled: true},
 		},
 		{
 			name: "off is off",
 			env:  map[string]string{"KDB_ANCESTRY_PRUNING": "off"},
-			want: dag.GraphSettings{},
+			want: dag.GraphSettings{FileEnabled: true},
 		},
 		{
 			// Same reading as envBytes and KDB_HISTORY_STRATEGY: this
@@ -41,7 +51,7 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 			// mean "leave it alone" rather than "guess".
 			name: "an unparseable value leaves it off",
 			env:  map[string]string{"KDB_ANCESTRY_PRUNING": "maybe"},
-			want: dag.GraphSettings{},
+			want: dag.GraphSettings{FileEnabled: true},
 		},
 		{
 			name: "the file flag, with its counts",
@@ -55,22 +65,22 @@ func TestGraphSettingsFromEnv(t *testing.T) {
 		{
 			name: "a negative count is no count",
 			env:  map[string]string{"KDB_HISTORY_ANCHOR_INTERVAL": "-5"},
-			want: dag.GraphSettings{},
+			want: dag.GraphSettings{FileEnabled: true},
 		},
 		{
 			name: "go memory",
 			env:  map[string]string{"KDB_GRAPH_MEMORY": "Go"},
-			want: dag.GraphSettings{Memory: dag.GraphMemoryGo},
+			want: dag.GraphSettings{Memory: dag.GraphMemoryGo, FileEnabled: true},
 		},
 		{
 			name: "an unknown memory mode is the default",
 			env:  map[string]string{"KDB_GRAPH_MEMORY": "jvm"},
-			want: dag.GraphSettings{},
+			want: dag.GraphSettings{FileEnabled: true},
 		},
 		{
 			name: "a non-numeric count is no count",
 			env:  map[string]string{"KDB_GRAPH_REBUILD_COMMITS": "lots"},
-			want: dag.GraphSettings{},
+			want: dag.GraphSettings{FileEnabled: true},
 		},
 	}
 	for _, tc := range cases {
