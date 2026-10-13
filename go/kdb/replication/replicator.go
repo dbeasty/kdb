@@ -387,6 +387,9 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 			cur := st.Namespaces[ns.Namespace]
 			cur.Pulled += int64(ns.Pulled)
 			cur.Pushed += int64(ns.Pushed)
+			if over := ns.Received - ns.Pulled; over > 0 {
+				cur.Overshoot += int64(over)
+			}
 			cur.OpenConflicts = len(ns.Conflicts)
 			if ns.Err != nil {
 				cur.LastError = ns.Err.Error()
@@ -510,6 +513,18 @@ func (r *Replicator) WriteMetrics(b *strings.Builder) {
 			st := p.State.Namespaces[ns]
 			fmt.Fprintf(b, "kdb_replication_commits_total{peer=%q,namespace=%q,direction=\"pull\"} %d\n", p.Name, ns, st.Pulled)
 			fmt.Fprintf(b, "kdb_replication_commits_total{peer=%q,namespace=%q,direction=\"push\"} %d\n", p.Name, ns, st.Pushed)
+		}
+	}
+	b.WriteString("# HELP kdb_replication_overshoot_commits_total Commits a peer sent in pulls that this node already held, per peer and namespace.\n")
+	b.WriteString("# TYPE kdb_replication_overshoot_commits_total counter\n")
+	for _, p := range status {
+		names := make([]string, 0, len(p.State.Namespaces))
+		for ns := range p.State.Namespaces {
+			names = append(names, ns)
+		}
+		sort.Strings(names)
+		for _, ns := range names {
+			fmt.Fprintf(b, "kdb_replication_overshoot_commits_total{peer=%q,namespace=%q} %d\n", p.Name, ns, p.State.Namespaces[ns].Overshoot)
 		}
 	}
 }

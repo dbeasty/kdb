@@ -221,6 +221,15 @@ func (c *v2Conn) syncNamespace(cfg V2ClientConfig, remote wire.NamespaceRefs) Na
 }
 
 func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRefs, res *NamespaceSyncResult) error {
+	// Take turns with this node's other pulls of the namespace (see pull_gate.go): everything
+	// below - the snapshot decision, the haves, which refs are already held - is then decided
+	// from what the pull before this one stored.
+	wait := cfg.Timeout
+	if wait <= 0 {
+		wait = 30 * time.Second
+	}
+	gate, held := enterPull(env.DAG, wait)
+	defer leavePull(env.DAG, gate, held)
 	if needsSnapshot(env, remote, cfg.PreferSnapshot) {
 		at := remote.Branches[mainBranch]
 		installed, err := InstallSnapshot(env, c.snapshotFetcher(cfg, remote.Namespace, at))
@@ -243,6 +252,13 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			haves = append(haves, h)
 		}
 	}
+	// What another pull stored that no ref reaches yet - all of it, when that pull's peer
+	// dropped mid-way.
+	for _, h := range gate.shared() {
+		if env.DAG.HasCommit(h) {
+			haves = append(haves, h)
+		}
+	}
 	// One ref at a time, main first. A ref this node cannot take - a side branch forked below
 	// the snapshot this node was bootstrapped from, whose parents no peer can send it - is
 	// recorded and skipped; it must not stop main, or every later sync of the namespace fails
@@ -253,7 +269,7 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			return err
 		}
 		if !env.DAG.HasCommit(h) {
-			if haves, err = c.fetchRef(cfg, env, remote.Namespace, remote.Shallow, h, haves, res); err != nil {
+			if haves, err = c.fetchRef(cfg, env, gate, remote.Namespace, remote.Shallow, h, haves, res); err != nil {
 				if ref.kind == wire.RefBranch && ref.name == mainBranch {
 					return err
 				}
@@ -386,7 +402,7 @@ func (c *v2Conn) snapshotFetcher(cfg V2ClientConfig, ns, at string) func(after s
 
 // fetchRef pages in everything want needs that this node lacks, returning the haves grown by
 // what arrived.
-func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow []string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
+func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns string, shallow []string, want codec.Hash, haves []codec.Hash, res *NamespaceSyncResult) ([]codec.Hash, error) {
 	for {
 		reply, err := c.request(wire.FetchRequestMessage{
 			H: header(wire.MsgFetchRequest, c.next()), Namespace: ns,
@@ -440,6 +456,7 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, ns string, shallow 
 		}
 		tips := pageTips(page.Commits)
 		res.ReceivedTips = append(res.ReceivedTips, tips...)
+		gate.share(tips)
 		haves = append(haves, tips...)
 		if page.Done || len(page.Commits) == 0 {
 			return haves, nil

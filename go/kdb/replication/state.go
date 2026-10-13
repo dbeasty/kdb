@@ -38,6 +38,9 @@ type NamespaceState struct {
 	PendingTips []string `json:"pendingTips,omitempty"`
 	Pulled      int64    `json:"pulled"`
 	Pushed      int64    `json:"pushed"`
+	// Overshoot counts commits the peer sent in pulls that this node already held - what
+	// negotiation over-sent (peersync.NamespaceSyncResult.Received minus Pulled).
+	Overshoot int64 `json:"overshoot,omitempty"`
 	// OpenConflicts counts refused ref updates in the last sync.
 	OpenConflicts int    `json:"openConflicts"`
 	LastError     string `json:"lastError,omitempty"`
