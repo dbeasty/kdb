@@ -29,6 +29,22 @@ type LocalNode interface {
 	Advanced(step AdvanceStep) error
 }
 
+// BootstrapNode is a LocalNode that can run a snapshot install's exclusive section as a long
+// hold: the install keeps the write serialization for as long as the whole namespace takes to
+// apply, so the node refuses writers to the namespace at once with a retryable busy error rather
+// than letting each queue behind it until its deadline. A LocalNode without it gets Exclusive.
+type BootstrapNode interface {
+	ExclusiveBootstrap(fn func() error) error
+}
+
+// exclusiveBootstrap runs fn as a bootstrap's exclusive section on node.
+func exclusiveBootstrap(node LocalNode, fn func() error) error {
+	if b, ok := node.(BootstrapNode); ok {
+		return b.ExclusiveBootstrap(fn)
+	}
+	return node.Exclusive(fn)
+}
+
 // AdvanceStep describes one head move performed by Ingest.
 type AdvanceStep struct {
 	// Commits are the commits that became reachable from main, parents first. The last one is

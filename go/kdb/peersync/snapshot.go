@@ -212,7 +212,7 @@ func InstallSnapshot(env IngestEnv, fetch func(after string) (wire.SnapshotPageM
 	}
 
 	var installed document.Commit
-	err = node.Exclusive(func() error {
+	err = exclusiveBootstrap(node, func() error {
 		lock := divergenceLockFor(env.NamespaceID)
 		lock.Lock()
 		defer lock.Unlock()
