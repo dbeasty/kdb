@@ -63,6 +63,18 @@ func (t DocumentTree) HashFor(docID codec.UUID) (codec.Hash, bool) {
 	return t.trie.get(docID)
 }
 
+// SlabBytes is the memory of the slab holding t's trie: every record of t, and of every other
+// tree derived from the same build by With/Without that is still held (history, readers), plus
+// free slots awaiting reuse. That is what the tree family actually occupies; a per-document
+// estimate cannot see the free slots, which run to about half the live records in a namespace
+// that is mostly updated. Zero for an empty tree or one without a trie.
+func (t DocumentTree) SlabBytes() int64 {
+	if t.trie == nil {
+		return 0
+	}
+	return t.trie.slab.chunkBytes()
+}
+
 // MaterializedEntries returns the full doc id → content hash map, building it from the trie
 // (O(n)) if this tree doesn't already carry one. Only call this where a full map is genuinely
 // needed (wire/storage serialization, DAG diff, full namespace scans) - never on a per-write

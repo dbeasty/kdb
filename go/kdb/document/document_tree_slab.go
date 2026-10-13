@@ -352,6 +352,18 @@ func (s *trieSlab) adopt(root tref) *trieTree {
 	return h
 }
 
+// chunkBytes is the slab's chunk memory, read without the lock.
+func (s *trieSlab) chunkBytes() int64 {
+	var b int64
+	for k := range s.nodes.dir() {
+		b += int64(slabChunkLen(k)) * nodeRecBytes
+	}
+	for k := range s.leaves.dir() {
+		b += int64(slabChunkLen(k)) * leafRecBytes
+	}
+	return b
+}
+
 // slabStats describes a slab's occupancy, for tests and measurement.
 type slabStats struct {
 	Nodes, Leaves         int // records in use
@@ -374,11 +386,6 @@ func (s *trieSlab) stats() slabStats {
 	if s.leaves.used > 0 {
 		st.Leaves = int(s.leaves.used) - 1 - st.FreeLeaves
 	}
-	for k := range s.nodes.dir() {
-		st.Bytes += slabChunkLen(k) * nodeRecBytes
-	}
-	for k := range s.leaves.dir() {
-		st.Bytes += slabChunkLen(k) * leafRecBytes
-	}
+	st.Bytes = int(s.chunkBytes())
 	return st
 }
