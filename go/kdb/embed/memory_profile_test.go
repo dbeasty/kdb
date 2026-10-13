@@ -137,6 +137,37 @@ func TestMemoryProfile(t *testing.T) {
 		report(t, "reads", fmt.Sprintf("%d point reads in %v, heap after open %s, peakHeapDuringReads=%s", reads, took.Round(time.Millisecond), mb(baseline), mb(peak.stop())))
 		rt.Close()
 
+	case "fullread":
+		// Every live document read once, so every live body is resident - the state a server
+		// reaches after serving reads for a while - and then what that costs the collector.
+		rt := open()
+		afterOpen := liveHeapBytes()
+		openGC := forcedGCCost(5)
+		head, err := rt.DAG.Head()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cpuBefore, cpuAfter [2]float64
+		cpuBefore = gcCPU()
+		start := time.Now()
+		for i := 0; i < docs; i++ {
+			id, _ := codec.UUIDFromString(docID(i))
+			if _, err := rt.Storage.GetDocument(ns, id, head); err != nil {
+				t.Fatal(err)
+			}
+		}
+		took := time.Since(start)
+		cpuAfter = gcCPU()
+		afterRead := liveHeapBytes()
+		readGC := forcedGCCost(5)
+		report(t, "fullread", fmt.Sprintf("%d reads in %v; heap after open %s, after full read %s (+%.0f B/doc); "+
+			"forced GC after open %v (mark CPU %v), after full read %v (mark CPU %v); GC CPU during the pass %.0f ms of %.0f ms",
+			docs, took.Round(time.Millisecond), mb(afterOpen), mb(afterRead), float64(afterRead-afterOpen)/float64(docs),
+			openGC.wall, openGC.markCPU, readGC.wall, readGC.markCPU,
+			(cpuAfter[0]-cpuBefore[0])*1e3, (cpuAfter[1]-cpuBefore[1])*1e3))
+		logMemoryBreakdown(t, rt)
+		rt.Close()
+
 	case "writes":
 		rt := open()
 		baseline := liveHeapBytes()
@@ -181,6 +212,52 @@ func TestMemoryProfile(t *testing.T) {
 	default:
 		t.Fatalf("unknown phase %q", phase)
 	}
+}
+
+// gcCost is what a forced, otherwise idle collection costs: its median wall time and the mark
+// CPU it burned (dedicated + idle + assist workers), per collection.
+type gcCost struct{ wall, markCPU time.Duration }
+
+func forcedGCCost(n int) gcCost {
+	walls := make([]time.Duration, n)
+	marks := []metrics.Sample{
+		{Name: "/cpu/classes/gc/mark/dedicated:cpu-seconds"},
+		{Name: "/cpu/classes/gc/mark/idle:cpu-seconds"},
+		{Name: "/cpu/classes/gc/mark/assist:cpu-seconds"},
+	}
+	sum := func() float64 {
+		metrics.Read(marks)
+		var s float64
+		for _, m := range marks {
+			s += m.Value.Float64()
+		}
+		return s
+	}
+	runtime.GC()
+	before := sum()
+	for i := range walls {
+		start := time.Now()
+		runtime.GC()
+		walls[i] = time.Since(start)
+	}
+	after := sum()
+	for i := 1; i < len(walls); i++ { // insertion sort; n is tiny
+		for j := i; j > 0 && walls[j] < walls[j-1]; j-- {
+			walls[j], walls[j-1] = walls[j-1], walls[j]
+		}
+	}
+	return gcCost{
+		wall:    walls[len(walls)/2].Round(10 * time.Microsecond),
+		markCPU: time.Duration((after - before) / float64(n) * 1e9).Round(10 * time.Microsecond),
+	}
+}
+
+// gcCPU reads the process's cumulative GC CPU and total CPU, in seconds. The runtime only
+// refreshes these at GC boundaries, which is precise enough over a pass with many collections.
+func gcCPU() [2]float64 {
+	s := []metrics.Sample{{Name: "/cpu/classes/gc/total:cpu-seconds"}, {Name: "/cpu/classes/total:cpu-seconds"}}
+	metrics.Read(s)
+	return [2]float64{s[0].Value.Float64(), s[1].Value.Float64()}
 }
 
 func envOr(name string, def int) int {
