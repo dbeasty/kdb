@@ -52,6 +52,7 @@ func ListenSqlWireTLS(addr string, runtime *KdbServerRuntime, tlsSettings *core.
 	opts := core.DefaultConnectOptions()
 	opts.TLS = tlsSettings
 	opts.MaxConnections = runtime.MaxConnections
+	opts.WriteTimeoutMs = runtime.writeTimeoutMs()
 	opts.Admitter = runtime.frameAdmitter(codec)
 	transport := tcp.NewTransport(opts)
 	ln, err := transport.ListenBound(addr)
@@ -172,6 +173,9 @@ type sqlWireConnHandler struct {
 
 	// sendMu serializes replies onto the connection.
 	sendMu sync.Mutex
+	// replies bounds the encoded reply bytes waiting on sendMu (B6): past its limit the reader
+	// stops taking frames until they drain.
+	replies *replyBudget
 	// sessionMu guards sessionTails: per session, the completion channel of the most recently
 	// enqueued frame naming it. Tickets are taken on the reader goroutine, in arrival order, so
 	// two frames on one session run strictly in the order they were sent - a plain mutex would
@@ -187,6 +191,7 @@ func newSqlWireConnHandler(codec wire.Codec, runtime *KdbServerRuntime) *sqlWire
 		sessions:     NewSessionManager(runtime),
 		parser:       sql.DefaultParser{},
 		sessionTails: make(map[string]chan struct{}),
+		replies:      newReplyBudget(runtime.MaxQueuedReplyBytes()),
 	}
 }
 
@@ -226,30 +231,53 @@ func (h *sqlWireConnHandler) run(conn FrameConn) {
 		// The ticket is taken here, on the reader goroutine, so session order is arrival order.
 		wait, done := h.sessionTicket(message)
 		inFlight <- struct{}{}
+		estimate := h.replies.reserve()
 		wg.Add(1)
 		go func(message wire.Message) {
 			defer wg.Done()
 			defer func() { <-inFlight }()
 			<-wait
 			defer done()
-			h.dispatchAndSend(conn, message)
+			h.dispatchAndSendReserved(conn, message, estimate)
 		}(message)
+		// Byte-based backpressure: with too many reply bytes already waiting to be written, take
+		// no new frame until they drain. Frames stay in the transport's small incoming queue and
+		// then in the socket, so a client pipelining faster than it reads is slowed by TCP
+		// rather than buffered in server memory.
+		h.replies.waitBelowLimit()
 	}
 }
 
 // dispatchAndSend dispatches one decoded frame and writes its reply under sendMu.
+//
+// Two ways a request used to go unanswered are closed here. A reply that would not encode - one
+// over the 16 MiB frame limit, which 10k rows of 2 KB reach - was dropped, leaving the client to
+// wait out its own timeout; it is now answered with a typed error of the same reply type
+// (RESOURCE_EXHAUSTED for size). And a handler panic on this path was not recovered at all
+// (dispatchRecovering was only wired to handleFrame), so it took the process down.
 func (h *sqlWireConnHandler) dispatchAndSend(conn FrameConn, message wire.Message) {
-	reply := h.dispatch(message)
+	h.dispatchAndSendReserved(conn, message, h.replies.reserve())
+}
+
+// dispatchAndSendReserved is dispatchAndSend for a frame already charged estimate reply bytes.
+func (h *sqlWireConnHandler) dispatchAndSendReserved(conn FrameConn, message wire.Message, estimate int64) {
+	reply := h.dispatchRecovering(message)
 	if reply == nil {
+		h.replies.settle(estimate, 0)
 		return
 	}
-	response, err := h.codec.Encode(reply)
-	if err != nil {
+	frame, release, ok := encodeReplyOrError(h.codec, conn, reply)
+	if !ok {
+		h.replies.settle(estimate, 0)
 		return
 	}
+	n := len(frame)
+	h.replies.settle(estimate, n)
 	h.sendMu.Lock()
-	defer h.sendMu.Unlock()
-	_ = conn.Send(response)
+	_ = conn.Send(frame)
+	h.sendMu.Unlock()
+	release()
+	h.replies.release(n)
 }
 
 // sessionTicket enqueues message behind every earlier frame naming the same session: wait is
@@ -742,6 +770,26 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		}
 	}
 	rows := rowsToStrings(result.Rows)
+	// Bound the reply by bytes as well as rows (B1). MaxResultRows alone let 10k rows of 2 KB
+	// through to the encoder, which refused the 20 MB frame - and the client heard nothing. A
+	// paged request ends its page early instead, and the continuation picks up from the first
+	// row that did not fit; an unpaged one is told how to ask for less.
+	if fit, _ := boundResultRows(rows, rt.MaxResultBytes()); fit < len(rows) {
+		if page == nil || fit == 0 {
+			total := 0
+			for _, row := range rows {
+				total += rowEncodedBytes(row)
+			}
+			remedy := "page it (pageSize), add a LIMIT, or select fewer columns"
+			if page != nil {
+				remedy = "a single row exceeds the limit; select fewer columns"
+			}
+			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
+				&ReplyTooLargeError{Bytes: total, Limit: rt.MaxResultBytes(), What: "result", Remedy: remedy})
+		}
+		rows = rows[:fit]
+		result.More = true
+	}
 	if grant != nil {
 		// Feed back what the query really cost: the executor's exactly-attributed retained
 		// bytes plus the wire copy built above. This is the P2 loop ("cost is estimated, then

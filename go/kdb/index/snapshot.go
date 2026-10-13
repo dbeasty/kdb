@@ -8,27 +8,6 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 )
 
-// snapshotLines emits the log in sequence order, merging the two already-sorted event
-// slices. Order is the whole content of the snapshot: emitting every put before every delete
-// would replay a document's own "delete the old key, then file the new one" update backwards,
-// so a restored index would have pruned exactly the entry it had just written.
-func snapshotLines(puts []putEvent, deletes []deleteEvent) []string {
-	lines := make([]string, 0, len(puts)+len(deletes))
-	p, d := 0, 0
-	for p < len(puts) || d < len(deletes) {
-		if d >= len(deletes) || (p < len(puts) && puts[p].seq < deletes[d].seq) {
-			e := puts[p]
-			p++
-			lines = append(lines, fmt.Sprintf("P|%s|%s|%s", e.entry.DocID, e.entry.CommitHash.Hex(), encodeKeyLine(e.entry.Key)))
-			continue
-		}
-		e := deletes[d]
-		d++
-		lines = append(lines, fmt.Sprintf("D|%s|%s", e.docID, e.atCommit.Hex()))
-	}
-	return lines
-}
-
 func restoreSnapshotLines(lines []string, ingestPut func(Entry), ingestDelete func(codec.UUID, codec.Hash)) error {
 	for _, ln := range lines {
 		ln = strings.TrimSpace(ln)

@@ -435,6 +435,30 @@ func (p *RegistryIndexProvider) preparedForStored(requested []document.Op, prepa
 // state advances in the same order the log does. It writes nothing to disk: it nudges the
 // background flusher, which writes the snapshots once the namespace goes quiet.
 func (p *RegistryIndexProvider) commitToIndexes(prepared []*index.PreparedWrite, commitHash codec.Hash) ([]index.Hint, error) {
+	hints, err := p.applyCommit(prepared, commitHash)
+	if err == nil {
+		p.repairHeads()
+	}
+	return hints, err
+}
+
+// repairHeads rebuilds, from the documents at head, any store whose head state could not follow
+// the commit graph (index.MemoryStore.NeedsRebuild: history it would need to replay was dropped).
+// It runs on the commit path, after the commit is applied, so the stores are current before the
+// next read; until it runs, reads of such a store fall back to a scan rather than a wrong answer.
+func (p *RegistryIndexProvider) repairHeads() {
+	ids := p.registry.NeedingRebuild()
+	if len(ids) == 0 {
+		return
+	}
+	if err := p.rebuild(ids); err != nil {
+		slog.Warn("rebuilding an index whose head state was lost failed; its reads fall back to scans until the next rebuild",
+			"namespace", p.registry.NamespaceID(), "error", err)
+	}
+}
+
+// applyCommit applies one commit's prepared updates to every store.
+func (p *RegistryIndexProvider) applyCommit(prepared []*index.PreparedWrite, commitHash codec.Hash) ([]index.Hint, error) {
 	// One commit is applied to every store, and the registry head moved, as one step with
 	// respect to a snapshot capture.
 	p.applyMu.Lock()

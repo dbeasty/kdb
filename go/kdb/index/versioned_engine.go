@@ -12,7 +12,7 @@ type VersionedEngine struct {
 
 // NewVersionedEngine binds to a commit DAG.
 func NewVersionedEngine(d *dag.InMemoryCommitDag) *VersionedEngine {
-	return &VersionedEngine{log: newEventLog(d)}
+	return &VersionedEngine{log: newEventLog(d, MemoryOptions{})}
 }
 
 func (e *VersionedEngine) Put(entry Entry) error {
@@ -36,30 +36,18 @@ func (e *VersionedEngine) Clear() error {
 }
 
 func (e *VersionedEngine) Lookup(key Key, atCommit *codec.Hash) ([]codec.UUID, error) {
-	cutoff, err := e.log.cutoff(atCommit)
-	if err != nil {
-		return nil, err
-	}
-	return e.log.lookup(key, cutoff), nil
+	return e.log.lookup(key, atCommit)
 }
 
 func (e *VersionedEngine) Range(from, to Key, atCommit *codec.Hash, limit int, ascending bool) ([]codec.UUID, error) {
-	cutoff, err := e.log.cutoff(atCommit)
-	if err != nil {
-		return nil, err
-	}
-	return e.log.rangeScan(from, to, cutoff, limit, ascending), nil
+	return e.log.rangeScan(from, to, atCommit, limit, ascending)
 }
 
 // HeadBuckets returns every key visible at DAG head with its documents, in key order. The
 // caller gets its own copy: the replayed bucket map itself is memoized and shared between
 // lookups.
 func (e *VersionedEngine) HeadBuckets() ([]KeyBucket, error) {
-	cutoff, err := e.log.cutoff(nil)
-	if err != nil {
-		return nil, err
-	}
-	return e.log.bucketsCopy(cutoff), nil
+	return e.log.bucketsCopy(nil)
 }
 
 func (e *VersionedEngine) IsValid(atCommit codec.Hash) (bool, error) {
@@ -67,7 +55,7 @@ func (e *VersionedEngine) IsValid(atCommit codec.Hash) (bool, error) {
 }
 
 func (e *VersionedEngine) SnapshotBytes() ([]byte, error) {
-	return e.log.snapshotBytes(), nil
+	return e.log.snapshotBytes()
 }
 
 func (e *VersionedEngine) RestoreSnapshotBytes(data []byte) error {

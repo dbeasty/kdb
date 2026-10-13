@@ -227,7 +227,7 @@ type missingCursor struct {
 	pageTips  []codec.Hash          // its tips: a peer that names them as haves holds the page
 	pageStubs []document.CommitStub // the stubs it carried
 
-	held []codec.Hash // tips of every page advanced past: haves for working the set out again
+	held []codec.Hash // tips of the latest pages advanced past (maxCursorHeld): haves for working the set out again
 }
 
 func newMissingCursor(d *dag.InMemoryCommitDag, wants, haves []codec.Hash) *missingCursor {
@@ -310,9 +310,17 @@ func containsStub(stubs []document.CommitStub, h codec.Hash) bool {
 	return false
 }
 
+// maxCursorHeld bounds missingCursor.held.
+const maxCursorHeld = 64
+
 // advance moves past the page last returned: the peer has stored it.
 func (c *missingCursor) advance() {
 	c.held = append(c.held, c.pageTips...)
+	// Only a recompute reads held, and any tip it lacks costs a resend, never a wrong answer: keep
+	// the newest, so a transfer of many pages does not grow it by one page's tips each.
+	if len(c.held) > maxCursorHeld {
+		c.held = append(c.held[:0:0], c.held[len(c.held)-maxCursorHeld:]...)
+	}
 	c.order = c.order[c.pageLen:]
 	for _, s := range c.pageStubs {
 		delete(c.stubs, s.OriginalHash)

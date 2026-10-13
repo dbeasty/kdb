@@ -23,6 +23,10 @@ import (
 
 const packedCommitFixed = 32 + 32 + 16 + 16 + 8 + 2 + 1 + 1 + 4 + 4
 
+// PackedCommitMinBytes is the smallest a packed commit can be (no parents, schema or message), so
+// len(packed)/PackedCommitMinBytes is an upper bound on how many commits packed holds.
+const PackedCommitMinBytes = packedCommitFixed
+
 func appendPackedCommit(dst []byte, c document.Commit, opCount int) ([]byte, error) {
 	if len(c.ParentHashes) > 255 {
 		return nil, fmt.Errorf("dag: commit %s has %d parents, more than a packed checkpoint holds", c.Hash.Hex(), len(c.ParentHashes))

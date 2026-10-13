@@ -31,6 +31,7 @@ func ListenSqlWireWSTLS(
 	opts := core.DefaultConnectOptions()
 	opts.TLS = tlsSettings
 	opts.MaxConnections = runtime.MaxConnections
+	opts.WriteTimeoutMs = runtime.writeTimeoutMs()
 	opts.Admitter = runtime.frameAdmitter(codec)
 
 	transport := ws.NewTransport(opts)

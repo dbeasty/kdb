@@ -24,6 +24,7 @@ import (
 //
 //   - join:     B is empty and pulls A's n commits.
 //   - catch-up: B holds A's first n commits; A writes n more and B pulls them.
+//   - push:     A pushes its 2n commits into an empty node C.
 //
 // Both nodes are file-backed and live in this process, so the heap figures cover both sides of the
 // sync - the host's diff work and the receiver's backlog alike. Reported per scenario: wall time,
@@ -115,6 +116,21 @@ func runSyncScale(t *testing.T, n, bodyBytes int) {
 		t.Fatal("catch-up: A and B differ")
 	}
 	report("catch-up", n, m)
+
+	// push: A pushes its whole history (2n commits) into an empty node C, which is the side
+	// whose memory is measured here - a node receiving a long push.
+	c := fileNode(t, ns)
+	mc := listen(t, c, ns)
+	m = measureSync(t, func(tr *countingTransport) int {
+		if _, err := syncWith(t, a, mc, ns, peersync.SyncPush, tr); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if head(t, a) != head(t, c) {
+		t.Fatal("push: A and C differ")
+	}
+	report("push", 2*n, m)
 }
 
 type syncMeasure struct {

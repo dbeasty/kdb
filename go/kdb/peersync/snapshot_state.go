@@ -36,6 +36,9 @@ const maxSnapshotFold = 10_000
 type snapshotState struct {
 	walk func(visit func(codec.UUID, codec.Hash) bool) error
 	read func(ids []codec.UUID) ([]*document.Document, error)
+	// tree resolves the state's tree, for walking it in id order from a cursor (snapshotPage).
+	// nil, or ok false, when only walk is available.
+	tree func() (document.DocumentTree, bool, error)
 }
 
 // stateAt resolves commit's state: straight from storage when it holds the tree, else folded
@@ -48,6 +51,11 @@ func stateAt(env IngestEnv, walker storage.TreeWalker, commit document.Commit) (
 		read: func(ids []codec.UUID) ([]*document.Document, error) {
 			return env.Storage.GetDocuments(env.NamespaceID, ids, commit.DocumentTreeHash)
 		},
+	}
+	if resolver, ok := env.Storage.(storage.TreeResolver); ok {
+		direct.tree = func() (document.DocumentTree, bool, error) {
+			return resolver.TreeAt(commit.DocumentTreeHash)
+		}
 	}
 	probe := walker.WalkTree(env.NamespaceID, commit.DocumentTreeHash, func(codec.UUID, codec.Hash) bool { return false })
 	if probe == nil {
@@ -79,6 +87,7 @@ func (f *foldedState) state(env IngestEnv) snapshotState {
 			f.tree.Walk(visit)
 			return nil
 		},
+		tree: func() (document.DocumentTree, bool, error) { return f.tree, true, nil },
 		read: func(ids []codec.UUID) ([]*document.Document, error) {
 			out := make([]*document.Document, len(ids))
 			var rest []codec.UUID

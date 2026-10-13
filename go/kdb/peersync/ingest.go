@@ -37,7 +37,31 @@ type AdvanceStep struct {
 	// Applied is the net change written to live document storage for this move: one final
 	// operation per document, the delta from the previous head's tree to the new one.
 	Applied []document.Op
+	// AppliedPages, when set, is more of Applied, too large to hold at once: it calls fn with
+	// successive batches of operations, read back from disk. A snapshot install sets it rather
+	// than Applied, which would be every document of the namespace in memory at once. Valid only
+	// during the Advanced call it arrives in; a batch is valid only during fn. Read both through
+	// EachApplied.
+	AppliedPages func(fn func(ops []document.Op) error) error
 }
+
+// EachApplied calls fn with the step's applied operations in batches: Applied, then every batch
+// AppliedPages yields. A step that applied nothing never calls fn.
+func (s AdvanceStep) EachApplied(fn func(ops []document.Op) error) error {
+	if len(s.Applied) > 0 {
+		if err := fn(s.Applied); err != nil {
+			return err
+		}
+	}
+	if s.AppliedPages != nil {
+		return s.AppliedPages(fn)
+	}
+	return nil
+}
+
+// HasApplied reports whether the step applied anything to live storage (or may have: a paged
+// step is not counted up front).
+func (s AdvanceStep) HasApplied() bool { return len(s.Applied) > 0 || s.AppliedPages != nil }
 
 // IngestEnv is everything Ingest needs about the namespace it feeds.
 type IngestEnv struct {
@@ -96,6 +120,10 @@ type IngestEnv struct {
 	// whose clock runs far ahead would drag every later commit that descends from it into that
 	// future. 0 means DefaultMaxClockSkew; negative disables the check.
 	MaxClockSkew time.Duration
+	// StagingDir is where a session stages what it must take in whole before it can act on it -
+	// a snapshot's pages before they are installed, a pushed graft's before it is verified - so
+	// memory holds a page, not the namespace. Empty uses the system temporary directory.
+	StagingDir string
 }
 
 // DefaultMaxClockSkew is how far ahead of this node's clock a replicated commit may be.

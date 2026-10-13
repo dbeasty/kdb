@@ -13,6 +13,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/stream"
@@ -396,6 +397,18 @@ func (l *peerLoop) backoff() time.Duration {
 	return d + jitter
 }
 
+// localDAG is ns's commit DAG here, if the namespace is open; nil otherwise.
+func (l *peerLoop) localDAG(ns string) *dag.InMemoryCommitDag {
+	if l.r.cfg.Local == nil {
+		return nil
+	}
+	env, err := l.r.cfg.Local.Env(ns, false)
+	if err != nil {
+		return nil
+	}
+	return env.DAG
+}
+
 // cycle runs one sync with the peer and records the outcome.
 func (l *peerLoop) cycle() (peersync.V2Result, error) {
 	l.cycleMu.Lock()
@@ -406,7 +419,11 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 	}
 	extra := map[string][]codec.Hash{}
 	for ns, progress := range st.Namespaces {
-		for _, hex := range progress.PendingTips {
+		pending := progress.PendingTips
+		if len(pending) > peersync.MaxPendingTips { // state written before the cap
+			pending = pending[len(pending)-peersync.MaxPendingTips:]
+		}
+		for _, hex := range pending {
 			if h, err := codec.HashFromHex(hex); err == nil {
 				extra[ns] = append(extra[ns], h)
 			}
@@ -447,10 +464,9 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 			cur.OpenConflicts = len(ns.Conflicts)
 			if ns.Err != nil {
 				cur.LastError = ns.Err.Error()
-				// Keep what an interrupted pull stored so the next attempt resumes it.
-				for _, h := range ns.ReceivedTips {
-					cur.PendingTips = append(cur.PendingTips, h.Hex())
-				}
+				// Keep what an interrupted pull stored so the next attempt resumes it - as a
+				// frontier, bounded, not every page's tips of every failed attempt.
+				cur.PendingTips = pendingFrontier(l.localDAG(ns.Namespace), cur.PendingTips, ns.ReceivedTips)
 				if err == nil {
 					err = fmt.Errorf("namespace %s: %w", ns.Namespace, ns.Err)
 				}

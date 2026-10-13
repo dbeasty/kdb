@@ -236,14 +236,17 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 
 // graphSettingsFromEnv reads the commit-graph feature flags.
 //
-// Every one of them defaults off, so an unset or unparseable variable
-// leaves the behaviour that predates this work. Same reading as envBytes
+// KDB_GRAPH_FILE defaults on: the mapped commit graph passed its gates (PRs #159 and #161 -
+// at 1M documents / 2M commits, 201 MB live heap after open against 1,282 MB with the graph
+// in the heap, the workload matrix within noise) and the plan's rule is that a flag flips to
+// the default once it has. "off" still turns it off. The others default off, so an unset or
+// unparseable variable leaves the behaviour that predates them. Same reading as envBytes
 // and KDB_HISTORY_STRATEGY: this returns no error, and "what it did
 // before" is the only safe interpretation of a value nobody can parse.
 func graphSettingsFromEnv() dag.GraphSettings {
 	return dag.GraphSettings{
 		AncestryPruning: envBool("KDB_ANCESTRY_PRUNING"),
-		FileEnabled:     envBool("KDB_GRAPH_FILE"),
+		FileEnabled:     envBoolDefault("KDB_GRAPH_FILE", true),
 		RebuildCommits:  envInt("KDB_GRAPH_REBUILD_COMMITS"),
 		MaxSegments:     envInt("KDB_GRAPH_MAX_SEGMENTS"),
 		AnchorInterval:  envInt("KDB_HISTORY_ANCHOR_INTERVAL"),
@@ -276,6 +279,18 @@ func envBool(name string) bool {
 		return true
 	}
 	return false
+}
+
+// envBoolDefault is envBool for a switch whose default is def: unset or unrecognized gives def,
+// and only an explicit on/off value overrides it.
+func envBoolDefault(name string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "on", "true", "yes", "1":
+		return true
+	case "off", "false", "no", "0":
+		return false
+	}
+	return def
 }
 
 // envInt reads a non-negative count, or zero when the variable is unset or

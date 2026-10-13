@@ -433,7 +433,10 @@ Graph segment alone (`TestGraphFileScale`, v4): 132 B/commit; deep `IsAncestor` 
 background without the DAG lock; transaction lookups 0.5 us (v3: 0.2).
 
 Formats: segment v3 files are unusable to this build (dropped, rebuilt); checkpoint v4 is what it
-writes and it still reads v2 and v3; older builds read v4 as unusable and replay the log.
+writes and it still reads v2 and v3; older builds read v4 as unusable and replay the log. Amended
+after the fact: a namespace of at most 20,000 live documents plus commits with no graph segments is
+still checkpointed as v2 (`legacyCheckpointMaxEntries`), because v0.6.x's replay of this build's log
+loses writes - see the 2026-10-13 entry in `kdb-open-issues-plan.md`.
 
 Hot path against `main` `4124676` (full 36-row workload matrix, graph off, alternating, n=4): geomean
 **+0.42% ops/s, +0.01% allocations**. Three rows read significant at n=4 (single-user update -5.0%,

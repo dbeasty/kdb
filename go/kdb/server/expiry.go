@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,13 +127,22 @@ func (s *KdbServerRuntime) isExpiredAtHead(jsonBody string) bool {
 // expiryTimestamp extracts the timestamp at fieldPath: an RFC 3339 string or a number of epoch
 // milliseconds. Anything else - absent, null, other strings, booleans, objects - is (zero, false):
 // "never expires".
+//
+// It runs on every point read and every scanned row while an expiry policy is set, so it reads
+// the one field it needs with schema.FieldRaw instead of decoding the whole body into a map (which
+// is what it did, through schema.FieldValue, at an allocation per key and value). Only an escaped
+// or non-ASCII string value is handed to encoding/json, to decode it exactly as before.
 func expiryTimestamp(jsonBody, fieldPath string) (time.Time, bool) {
-	raw, err := schema.FieldValue(jsonBody, fieldPath)
-	if err != nil || raw == nil {
+	raw, ok := schema.FieldRaw(jsonBody, fieldPath)
+	if !ok || raw == "" {
 		return time.Time{}, false
 	}
-	switch v := raw.(type) {
-	case string:
+	switch c := raw[0]; {
+	case c == '"':
+		v := raw[1 : len(raw)-1]
+		if needsJSONDecode(v) {
+			v = decodeJSONString(raw)
+		}
 		t, err := time.Parse(time.RFC3339Nano, v)
 		if err != nil {
 			t, err = time.Parse(time.RFC3339, v)
@@ -141,10 +151,8 @@ func expiryTimestamp(jsonBody, fieldPath string) (time.Time, bool) {
 			return time.Time{}, false
 		}
 		return t, true
-	case float64:
-		return time.UnixMilli(int64(v)), true
-	case json.Number:
-		f, err := v.Float64()
+	case c == '-' || (c >= '0' && c <= '9'):
+		f, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
 			return time.Time{}, false
 		}
@@ -152,6 +160,25 @@ func expiryTimestamp(jsonBody, fieldPath string) (time.Time, bool) {
 	default:
 		return time.Time{}, false
 	}
+}
+
+// decodeJSONString decodes a quoted JSON string with encoding/json; "" when it will not decode.
+// A separate function so the decode target's escape to the heap is not paid on the plain path.
+func decodeJSONString(quoted string) string {
+	var v string
+	if err := json.Unmarshal([]byte(quoted), &v); err != nil {
+		return ""
+	}
+	return v
+}
+
+func needsJSONDecode(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '\\' || c >= 0x80 {
+			return true
+		}
+	}
+	return false
 }
 
 // headTreeHash returns the document tree hash at the live head, or false when there is none.

@@ -33,6 +33,8 @@ type DefaultWriter struct {
 	firstCommit *codec.Hash
 	lastCommit  *codec.Hash
 	pageCodec   PageCodec
+	// batchBuf is AppendBatch's frame buffer, kept between batches (see maxRetainedBatchBuf).
+	batchBuf []byte
 }
 
 // NewDefaultWriter opens a new delta segment writer at sequence seq.
@@ -87,6 +89,84 @@ func (w *DefaultWriter) Append(record storage.DeltaRecord) (int64, error) {
 	w.sizeBytes = newSize
 	return offset, nil
 }
+
+// AppendBatch appends records as consecutive frames - the same frames, at the same offsets, that
+// one Append per record writes - but hands them to the platform in as few writes as its append
+// cap allows, usually one. It returns the offset of every record it wrote, in order; on an error,
+// the records before the returned offsets' length were written and the rest were not.
+//
+// Why: the commit log drains up to maxLogBatch queued records at a time but wrote each with its
+// own Append, one positional write per commit. A peer-sync adoption queues a whole fetched range
+// at once, and at 200,000 commits that was about 20 s of write syscalls on the receiver - most of
+// the sync's time, waited for by the adoption. Frame bytes on disk are unchanged, so readers, the
+// torn-tail scan and the Kotlin implementation see exactly what they saw before.
+func (w *DefaultWriter) AppendBatch(records []storage.DeltaRecord) ([]int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.sealed {
+		return nil, fmt.Errorf("segment sealed")
+	}
+	limit := 0
+	if l, ok := w.shim.(interface{ MaxAppendBytes() int }); ok {
+		limit = l.MaxAppendBytes()
+	}
+	offsets := make([]int64, 0, len(records))
+	buf := w.batchBuf[:0]
+	pending := 0 // records framed into buf, not yet written
+	write := func() error {
+		if len(buf) == 0 {
+			return nil
+		}
+		newSize, err := w.shim.AppendToSegment(w.segmentName, buf)
+		if err != nil {
+			offsets = offsets[:len(offsets)-pending]
+			return err
+		}
+		w.sizeBytes = newSize
+		buf, pending = buf[:0], 0
+		return nil
+	}
+	defer func() {
+		// Keep the buffer for the next batch unless one outsized batch grew it past reason.
+		if cap(buf) <= maxRetainedBatchBuf {
+			w.batchBuf = buf[:0]
+		} else {
+			w.batchBuf = nil
+		}
+	}()
+	next := w.sizeBytes
+	for _, record := range records {
+		frame, err := w.pageCodec.Frame(record.CommitPayload, w.config.CompressionCodec)
+		if err != nil {
+			if werr := write(); werr != nil {
+				return offsets, werr
+			}
+			return offsets, err
+		}
+		if limit > 0 && len(buf) > 0 && len(buf)+len(frame) > limit {
+			if err := write(); err != nil {
+				return offsets, err
+			}
+		}
+		if w.firstCommit == nil {
+			h := record.CommitHash
+			w.firstCommit = &h
+		}
+		h := record.CommitHash
+		w.lastCommit = &h
+		offsets = append(offsets, next)
+		next += int64(len(frame))
+		buf = append(buf, frame...)
+		pending++
+	}
+	if err := write(); err != nil {
+		return offsets, err
+	}
+	return offsets, nil
+}
+
+// maxRetainedBatchBuf is the largest AppendBatch buffer a writer keeps between batches.
+const maxRetainedBatchBuf = 4 << 20
 
 func (w *DefaultWriter) Flush() error {
 	return w.shim.FlushSegment(w.segmentName)

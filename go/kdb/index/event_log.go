@@ -1,93 +1,172 @@
 package index
 
 import (
-	"sort"
-	"strings"
+	"errors"
+	"slices"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 )
 
-// bucketCacheEntries caps how many distinct bucket sets are memoized at once. Lookups
-// normally target one cutoff (the current head), so a handful of slots covers the common
-// "head plus a few historical reads" pattern without letting the memo grow without bound.
-const bucketCacheEntries = 8
+// The keyed (HASH and BTREE) index: a head state plus a bounded window of history.
+//
+// What a read at commit X must return is defined by replay: take every put and delete ever
+// logged, in the order they were logged, and apply the ones whose commit is X or an ancestor of
+// X. The log used to be exactly that - every event ever written, kept forever, plus the full
+// ancestor closure of the head and one map entry per commit - so an index's memory grew with its
+// write history rather than with its data.
+//
+// Now the authoritative structure is the head state: the replay result at the head cutoff,
+// advanced in place as events arrive. Each event, once applied, records its effect on the head
+// state (which keys it actually filed or unfiled its document under), and only the most recent
+// MemoryOptions.HistoryEvents events are kept. A read at an older commit X is answered from the
+// head state by undoing the retained events X must not see, newest first. That is exact when
+// those events are a suffix of the applied ones, which they are for any X the head has moved
+// through (see planLocked). A read the window cannot answer exactly returns
+// ErrHistoryUnavailable, and the caller answers it from the documents instead (the server's
+// index provider makes the SQL executor scan). While nothing has been dropped the log is still
+// complete and any cutoff can be replayed, exactly as before.
 
-// bucketCacheKey identifies everything a replay's result depends on: which commit it was cut
-// off at, how many events the log held, and what shape the commit graph was in. Any change to
-// one of those produces a different key, so a stale bucket set can never be served - there is
-// no explicit invalidation to forget to call.
-type bucketCacheKey struct {
+// DefaultHistoryEvents is how many recent events a keyed index keeps for reads at a commit other
+// than the head when MemoryOptions.HistoryEvents is zero. At 88 bytes an event that is under
+// 3 MB per index, whatever its write history.
+const DefaultHistoryEvents = 1 << 15
+
+// MemoryOptions tunes a keyed (HASH or BTREE) MemoryStore.
+type MemoryOptions struct {
+	// HistoryEvents is how many of the most recent index events are kept for as-of reads. 0 means
+	// DefaultHistoryEvents; a negative value keeps every event forever (the unbounded behaviour
+	// this replaced, for tests and comparisons).
+	HistoryEvents int
+}
+
+func (o MemoryOptions) maxEvents() int {
+	switch {
+	case o.HistoryEvents == 0:
+		return DefaultHistoryEvents
+	case o.HistoryEvents < 0:
+		return 0
+	default:
+		return o.HistoryEvents
+	}
+}
+
+// ErrHistoryUnavailable reports that an index no longer holds the history a read at an older
+// commit needs (or, after an unusual change to the commit graph, its head state). The answer is
+// still defined - it is whatever the documents at that commit say - and callers fall back to
+// reading them. Match it with errors.Is.
+var ErrHistoryUnavailable = errors.New("index: history at that commit is not held by the index")
+
+// maxAdvanceSteps bounds the commit walks the log does without a closure: following the head
+// forward along a chain of single-parent commits, and walking back from a historical cutoff to a
+// commit the head passed through.
+const maxAdvanceSteps = 256
+
+// replayCacheEntries caps how many replayed historical states are memoized while the log is
+// complete.
+const replayCacheEntries = 8
+
+const (
+	evNew     uint8 = iota // logged, not yet processed into the head state
+	evApplied              // applied to the head state; effect recorded
+	evSkipped              // its commit was not an ancestor of the head when processed
+)
+
+// logEvent is one put or delete. Pointer-free: the key is an ordinal into the keyTable, and a
+// delete's effect (the keys it unfiled) is a range of the shared effects arena.
+type logEvent struct {
+	seq    int64
+	commit codec.Hash
+	doc    codec.UUID
+	key    uint32 // put: the key ordinal
+	del    bool
+	state  uint8
+	added  bool // put: the document was not already filed under the key
+	// cexact says cstep is exact: the step at which the event's commit became an ancestor of the
+	// head (it is an ancestor of that step's cutoff and not of the one before). Otherwise cstep is
+	// only an upper bound - a late event for a commit the head passed before the retained steps.
+	cexact bool
+	step   uint32 // the step (head cutoff) it was applied under; never decreases along the log
+	cstep  uint32
+	effN   uint32 // delete: how many keys it unfiled
+	effOff uint64 // delete: absolute offset of those keys in the effects arena
+}
+
+type replayKey struct {
 	cutoff          codec.Hash
 	seq             int64
 	ancestryVersion uint64
 }
 
-// bucket is one key's document set. Buckets are stored by KeyString rather than by Key
-// because CompositeKey and VectorKey contain slices and are not hashable.
-type bucket struct {
-	key Key
-	ids map[codec.UUID]struct{}
-	// sorted memoizes the ids in stable order. A low-selectivity key (a collection tag shared by
-	// most documents) is looked up on every query that mentions it, and sorting a hundred
-	// thousand ids each time cost more than the query. Dropped whenever the bucket changes.
-	sorted []codec.UUID
-}
-
-type bucketMap map[string]*bucket
-
-// eventLog is the chronological put/delete log both index implementations replay, together
-// with a memo of the bucket sets already derived from it.
-//
-// Replay used to run on *every* Lookup and Range: rebuilding the whole map from the full
-// event log, sorting a freshly built combined event slice, and asking the DAG IsAncestor per
-// event - which walks the descendant's entire ancestor closure from scratch each time. A
-// lookup against an index with n events and h commits of history therefore cost O(n log n +
-// n*h) and allocated the whole bucket map, per call, even when nothing had changed since the
-// previous identical lookup. Now a replay happens once per (cutoff, log state, DAG shape),
-// walks the two already-sorted event slices by merge instead of sorting a copy of them, and
-// resolves ancestry against one closure computed once.
+// eventLog is the event window and head state both keyed index implementations share.
 type eventLog struct {
-	dag *dag.InMemoryCommitDag
+	dag       *dag.InMemoryCommitDag
+	maxEvents int // 0: never drop
 
-	mu         sync.Mutex
-	puts       []putEvent
-	deletes    []deleteEvent
-	seqCounter int64
+	mu      sync.Mutex
+	keys    *keyTable
+	seq     int64
+	events  []logEvent
+	eff     []uint32 // effects arena: the keys each applied delete unfiled
+	effBase uint64   // absolute offset of eff[0]
+	// dropped is set once any event has been dropped (or the log was filled from a scan, which
+	// has no history): from then on only the window can answer historical reads.
+	dropped bool
+	// lin tracks the head cutoff, the steps it moved through and the commits whose events it
+	// skipped (see Lineage).
+	lin *Lineage
 
-	cache      map[bucketCacheKey]bucketMap
-	cacheOrder []bucketCacheKey
-
-	// head is the bucket state at the commit most recently read at, advanced in place as commits
-	// are appended. Without it the first read after every write replays the whole log - and
-	// materializes the whole ancestor closure - so a filtered read costs O(documents) however
-	// selective the index is. With it a read after a write costs O(that write).
 	head *headState
-	// firstSeq is the sequence number of the first event logged for each commit. Advancing the
-	// head state is only exact when every event of the commits it adds is newer than the state
-	// (see advanceHeadLocked), and this is what answers that in O(1).
-	firstSeq map[codec.Hash]int64
+	// broken is set when the head state can neither be advanced nor replayed (the log is no
+	// longer complete); every read then reports ErrHistoryUnavailable until a Clear or rebuild.
+	broken bool
+
+	replays     map[replayKey]*postingState
+	replayOrder []replayKey
+	scratch     []byte
+
+	// plan memoizes the last historical plan: a reader pinned one commit behind head (a session's
+	// read head, a paged query) asks for the same cutoff again and again.
+	plan planMemo
 }
 
-// headState is a mutable replay result. Everything in it is guarded by eventLog.mu.
+type planMemo struct {
+	ok     bool
+	cutoff codec.Hash
+	seq    int64
+	step   uint32
+	base   uint32
+	n      int
+	undo   []int
+}
+
+// headState is the replay result at the lineage's cutoff, maintained in place. Guarded by
+// eventLog.mu.
 type headState struct {
-	cutoff    codec.Hash
-	seq       int64  // seqCounter this state covers
-	epoch     uint64 // dag.AncestryEpoch it was built under
-	puts      int    // events consumed so far, per slice
-	deletes   int
-	buckets   bucketMap
-	docKeys   map[codec.UUID][]string // bucket keys each document is filed under
-	ancestors map[codec.Hash]struct{}
+	pos int // events[:pos] have been processed
+	st  *postingState
 }
 
-// maxAdvanceSteps bounds how many commits one advance will walk back through before giving up
-// and replaying. A reader that fell far behind is better served by one replay than a long walk.
-const maxAdvanceSteps = 256
+func newEventLog(d *dag.InMemoryCommitDag, opts MemoryOptions) *eventLog {
+	l := &eventLog{dag: d, maxEvents: opts.maxEvents()}
+	l.clearLocked()
+	return l
+}
 
-func newEventLog(d *dag.InMemoryCommitDag) *eventLog {
-	return &eventLog{dag: d}
+func (l *eventLog) clearLocked() {
+	l.plan = planMemo{}
+	l.keys = newKeyTable()
+	l.seq = 0
+	l.events = nil
+	l.eff = nil
+	l.effBase = 0
+	l.dropped = false
+	l.lin = NewLineage(l.dag)
+	l.head = nil
+	l.broken = false
+	l.replays = nil
+	l.replayOrder = nil
 }
 
 func (l *eventLog) put(entry Entry) {
@@ -117,170 +196,530 @@ func (l *eventLog) clear() {
 	l.clearLocked()
 }
 
-func (l *eventLog) snapshotBytes() []byte {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return []byte(strings.Join(snapshotLines(l.puts, l.deletes), "\n"))
-}
-
-func (l *eventLog) restoreSnapshotBytes(data []byte) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.clearLocked()
-	return restoreSnapshotLines(
-		strings.Split(string(data), "\n"),
-		l.appendPutLocked,
-		l.appendDeleteLocked,
-	)
-}
-
 func (l *eventLog) hasCommit(hash codec.Hash) bool {
 	return l.dag.HasCommit(hash)
 }
 
-// cutoff resolves an optional as-of commit to the commit a replay should stop at, defaulting
-// to the DAG head.
-func (l *eventLog) cutoff(atCommit *codec.Hash) (codec.Hash, error) {
-	if atCommit != nil {
-		return *atCommit, nil
+func (l *eventLog) appendPutLocked(entry Entry) {
+	if l.broken {
+		// Nothing can be answered until a rebuild, which clears the log first.
+		return
 	}
-	return l.dag.Head()
+	l.seq++
+	l.scratch = appendKeyEnc(l.scratch[:0], entry.Key)
+	ord := l.keys.intern(l.scratch)
+	l.events = append(l.events, logEvent{seq: l.seq, commit: entry.CommitHash, doc: entry.DocID, key: ord})
+	l.afterAppendLocked()
 }
 
-// bucketsLocked returns the key → doc-id map visible at cutoffHash. Callers hold l.mu and must
-// finish with the map before releasing it: the head state's map is mutated in place by the next
-// write, so unlike the memoized replays it cannot be handed out.
-func (l *eventLog) bucketsLocked(cutoffHash codec.Hash) bucketMap {
-	if m, ok := l.headBucketsLocked(cutoffHash); ok {
-		return m
+func (l *eventLog) appendDeleteLocked(docID codec.UUID, atCommit codec.Hash) {
+	if l.broken {
+		return
 	}
-	version := l.dag.AncestryVersion()
-	key := bucketCacheKey{cutoff: cutoffHash, seq: l.seqCounter, ancestryVersion: version}
-	if cached, ok := l.cache[key]; ok {
-		return cached
-	}
-	built, state := l.replayLocked(cutoffHash)
-	// Only a read at the current head seeds the incremental state: it is the one that the next
-	// write will move on from, whereas a historical read is a one-off that would thrash it.
-	if head, err := l.dag.Head(); err == nil && head == cutoffHash {
-		l.head = state
-		return state.buckets
-	}
-	if l.cache == nil {
-		l.cache = make(map[bucketCacheKey]bucketMap, bucketCacheEntries)
-	}
-	l.cache[key] = built
-	l.cacheOrder = append(l.cacheOrder, key)
-	if len(l.cacheOrder) > bucketCacheEntries {
-		delete(l.cache, l.cacheOrder[0])
-		l.cacheOrder = l.cacheOrder[1:]
-	}
-	return built
+	l.seq++
+	l.events = append(l.events, logEvent{seq: l.seq, commit: atCommit, doc: docID, del: true})
+	l.afterAppendLocked()
 }
 
-// headBucketsLocked serves cutoff from the incremental state when it can: as is when nothing
-// changed, or after advancing it over the commits appended since. ok is false when a replay is
-// needed instead.
-func (l *eventLog) headBucketsLocked(cutoff codec.Hash) (bucketMap, bool) {
-	h := l.head
-	if h == nil || h.epoch != l.dag.AncestryEpoch() {
-		return nil, false
+// afterAppendLocked keeps the unprocessed tail bounded: only processed events can be dropped,
+// so a namespace taking writes and no reads advances the head itself every so often.
+func (l *eventLog) afterAppendLocked() {
+	if l.maxEvents <= 0 {
+		return
 	}
-	if h.cutoff == cutoff && h.seq == l.seqCounter {
-		return h.buckets, true
+	every := l.maxEvents / 4
+	if every < 1 {
+		every = 1
 	}
-	if !l.advanceHeadLocked(cutoff) {
-		return nil, false
+	processed := 0
+	if l.head != nil {
+		processed = l.head.pos
 	}
-	return h.buckets, true
+	if len(l.events)-processed < every {
+		return
+	}
+	if h, err := l.dag.Head(); err == nil {
+		l.advanceLocked(h)
+	}
 }
 
-// advanceHeadLocked moves the head state forward to cutoff by applying only the events logged
-// since it was built. It is exact - the same buckets a full replay at cutoff produces - only
-// when all of these hold, and returns false (leaving the state untouched or discarded) otherwise:
-//
-//   - cutoff reaches the state's cutoff by a chain of single-parent commits, so the new
-//     ancestor closure is the old one plus that chain and nothing else;
-//   - none of the chain's own events pre-dates the state, since a replay would have applied
-//     those at their earlier position in sequence order, not after everything already applied;
-//   - the DAG epoch is unchanged, so no resident commit has gained or lost ancestors.
-//
-// Events newer than the state that belong to commits already in the closure (a backfill, or an
-// index rebuilt late) are applied too, in sequence order, exactly as a replay would.
-func (l *eventLog) advanceHeadLocked(cutoff codec.Hash) bool {
-	h := l.head
-	var chain []codec.Hash
-	cur := cutoff
-	for cur != h.cutoff {
-		if len(chain) >= maxAdvanceSteps {
-			l.head = nil
-			return false
-		}
-		c, ok := l.dag.GetCommit(cur)
-		if !ok || len(c.ParentHashes) != 1 {
-			l.head = nil
-			return false
-		}
-		chain = append(chain, cur)
-		cur = c.ParentHashes[0]
+// ---------------------------------------------------------------------------------------------
+// Head state
+// ---------------------------------------------------------------------------------------------
+
+// advanceLocked brings the head state to target and processes every logged event into it. It
+// returns false when the state could not be brought there (and is now broken).
+func (l *eventLog) advanceLocked(target codec.Hash) bool {
+	if l.broken {
+		return false
 	}
-	for _, c := range chain {
-		if first, seen := l.firstSeq[c]; seen && first <= h.seq {
-			l.head = nil
-			return false
-		}
+	if l.head == nil || !l.lin.Advance(target) {
+		return l.resetHeadLocked(target)
 	}
-	for _, c := range chain {
-		h.ancestors[c] = struct{}{}
+	if l.head.pos < len(l.events) {
+		l.processLocked()
 	}
-	p, d := h.puts, h.deletes
-	for p < len(l.puts) || d < len(l.deletes) {
-		if d >= len(l.deletes) || (p < len(l.puts) && l.puts[p].seq < l.deletes[d].seq) {
-			h.applyPut(l.puts[p].entry)
-			p++
-			continue
-		}
-		h.applyDelete(l.deletes[d])
-		d++
-	}
-	h.puts, h.deletes = p, d
-	h.cutoff, h.seq = cutoff, l.seqCounter
+	l.truncateLocked()
 	return true
 }
 
-func (h *headState) applyPut(entry Entry) {
-	if _, ok := h.ancestors[entry.CommitHash]; !ok {
-		return
-	}
-	ks := KeyString(entry.Key)
-	b := h.buckets[ks]
-	if b == nil {
-		b = &bucket{key: entry.Key, ids: make(map[codec.UUID]struct{})}
-		h.buckets[ks] = b
-	}
-	if _, filed := b.ids[entry.DocID]; !filed {
-		b.sorted = nil
-		b.ids[entry.DocID] = struct{}{}
-		h.docKeys[entry.DocID] = append(h.docKeys[entry.DocID], ks)
-	}
-}
-
-func (h *headState) applyDelete(evt deleteEvent) {
-	if _, ok := h.ancestors[evt.atCommit]; !ok {
-		return
-	}
-	for _, ks := range h.docKeys[evt.docID] {
-		b := h.buckets[ks]
-		if b == nil {
+// processLocked applies events[head.pos:] to the head state in log order.
+func (l *eventLog) processLocked() {
+	h := l.head
+	step := l.lin.Step()
+	for i := h.pos; i < len(l.events); i++ {
+		e := &l.events[i]
+		in, cstep, exact := l.lin.Classify(e.commit)
+		if !in {
+			e.state = evSkipped
 			continue
 		}
-		delete(b.ids, evt.docID)
-		b.sorted = nil
-		if len(b.ids) == 0 {
-			delete(h.buckets, ks)
+		e.state, e.step, e.cstep, e.cexact = evApplied, step, cstep, exact
+		l.applyLocked(h.st, e)
+	}
+	h.pos = len(l.events)
+	l.lin.DoneClassifying()
+}
+
+// applyLocked applies an event to st and records its effect on the event.
+func (l *eventLog) applyLocked(st *postingState, e *logEvent) {
+	if e.del {
+		start := len(l.eff)
+		l.eff = st.removeDoc(e.doc, l.eff)
+		e.effOff = l.effBase + uint64(start)
+		e.effN = uint32(len(l.eff) - start)
+		return
+	}
+	e.added = st.add(e.doc, e.key)
+}
+
+// effects returns the keys an applied delete unfiled.
+func (l *eventLog) effects(e *logEvent) []uint32 {
+	off := int(e.effOff - l.effBase)
+	return l.eff[off : off+int(e.effN)]
+}
+
+// resetHeadLocked rebuilds the head state at target by replaying the whole log, which is only
+// possible while the log is complete. Otherwise the state is broken until a rebuild.
+func (l *eventLog) resetHeadLocked(target codec.Hash) bool {
+	l.head = nil
+	l.plan = planMemo{}
+	if l.dropped {
+		l.broken = true
+		l.events, l.eff, l.effBase = nil, nil, 0
+		l.lin.Clear()
+		return false
+	}
+	anc := l.dag.AncestorSet(target)
+	h := &headState{st: newPostingState()}
+	l.head = h
+	l.lin.Start(target)
+	l.lin.ClearPending()
+	l.eff, l.effBase = l.eff[:0], 0
+	for i := range l.events {
+		e := &l.events[i]
+		if _, in := anc[e.commit]; !in {
+			e.state = evSkipped
+			l.lin.MarkPending(e.commit)
+			continue
+		}
+		e.state, e.step, e.cstep, e.cexact = evApplied, 0, 0, true
+		l.applyLocked(h.st, e)
+	}
+	h.pos = len(l.events)
+	l.truncateLocked()
+	return true
+}
+
+// truncateLocked drops the oldest processed events beyond the window (down to three quarters
+// of it, so the copying is amortized), with the effects only they referred to, and trims the
+// step list the same way.
+func (l *eventLog) truncateLocked() {
+	if l.maxEvents <= 0 || l.head == nil {
+		return
+	}
+	h := l.head
+	keepFrom := uint32(0)
+	if len(l.events) > l.maxEvents {
+		drop := len(l.events) - l.maxEvents*3/4
+		if drop > h.pos {
+			drop = h.pos
+		}
+		if drop > 0 {
+			for i := 0; i < drop; i++ {
+				// Every retained step must be at least as new as every dropped applied event: a
+				// historical read that stops at a retained step counts on every older effect
+				// being one it sees.
+				if e := &l.events[i]; e.state == evApplied && e.step > keepFrom {
+					keepFrom = e.step
+				}
+			}
+			l.dropped = true
+			firstEff := l.effBase + uint64(len(l.eff))
+			for i := drop; i < len(l.events); i++ {
+				if e := &l.events[i]; e.del && e.state == evApplied {
+					firstEff = e.effOff
+					break
+				}
+			}
+			cut := int(firstEff - l.effBase)
+			l.eff = l.eff[:copy(l.eff, l.eff[cut:])]
+			l.effBase = firstEff
+			l.events = l.events[:copy(l.events, l.events[drop:])]
+			h.pos -= drop
+			l.replays, l.replayOrder = nil, nil
+			l.maybeCompactKeysLocked()
 		}
 	}
-	delete(h.docKeys, evt.docID)
+	l.lin.TrimSteps(keepFrom, l.maxEvents)
+}
+
+// maybeCompactKeysLocked rebuilds the key table without the keys that are empty at head and
+// named by no retained event, once those are the majority: keys that come and go (a timestamp
+// field, rewritten forever) must not accumulate.
+func (l *eventLog) maybeCompactKeysLocked() {
+	h := l.head
+	n := l.keys.len()
+	if n < 1024 || n < 2*h.st.live+1024 {
+		return
+	}
+	used := make([]bool, n)
+	for i := range l.events {
+		if e := &l.events[i]; !e.del {
+			used[e.key] = true
+		}
+	}
+	for _, k := range l.eff {
+		used[k] = true
+	}
+	keep := func(ord uint32) bool { return used[ord] || h.st.count(ord) > 0 }
+	kept := 0
+	for i := 0; i < n; i++ {
+		if keep(uint32(i)) {
+			kept++
+		}
+	}
+	if n-kept < n/2 {
+		return
+	}
+	remap := l.keys.compact(keep)
+	for i := range l.events {
+		if e := &l.events[i]; !e.del {
+			e.key = remap[e.key]
+		}
+	}
+	for i, k := range l.eff {
+		l.eff[i] = remap[k]
+	}
+	h.st.remap(remap, l.keys.len())
+	l.replays, l.replayOrder = nil, nil
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reads
+// ---------------------------------------------------------------------------------------------
+
+// keyedView is how a read at one cutoff is answered: st's buckets, with the effects of undo
+// (event indices, newest first) reversed. undo is only ever non-empty with st the head state.
+type keyedView struct {
+	st   *postingState
+	undo []int
+}
+
+// viewLocked resolves the cutoff a read is answered at: at, or the DAG head when at is nil. The
+// head is read under the lock, so a head read is never turned into a historical one by commits
+// that land while it waits.
+func (l *eventLog) viewLocked(at *codec.Hash) (keyedView, error) {
+	head, err := l.dag.Head()
+	if err != nil {
+		return keyedView{}, err
+	}
+	l.advanceLocked(head)
+	cutoff := head
+	if at != nil {
+		cutoff = *at
+	}
+	if l.broken {
+		return keyedView{}, ErrHistoryUnavailable
+	}
+	if h := l.head; h != nil {
+		if h.pos < len(l.events) {
+			l.processLocked()
+			l.truncateLocked()
+		}
+		if l.lin.Cutoff() == cutoff {
+			return keyedView{st: h.st}, nil
+		}
+		m := &l.plan
+		if m.ok && m.cutoff == cutoff && m.seq == l.seq && m.step == l.lin.Step() && m.base == l.lin.StepBase() && m.n == len(l.events) {
+			return keyedView{st: h.st, undo: m.undo}, nil
+		}
+		if undo, ok := l.planLocked(cutoff); ok {
+			*m = planMemo{ok: true, cutoff: cutoff, seq: l.seq, step: l.lin.Step(), base: l.lin.StepBase(), n: len(l.events), undo: undo}
+			return keyedView{st: h.st, undo: undo}, nil
+		}
+	}
+	if !l.dropped {
+		return keyedView{st: l.replayLocked(cutoff)}, nil
+	}
+	return keyedView{}, ErrHistoryUnavailable
+}
+
+// planLocked works out which applied events a read at x must not see, and reports whether
+// undoing exactly those from the head state gives the replay result at x. It does when they are
+// a suffix of the applied events: then undoing their effects, newest first, restores the state
+// from before they were applied, which is what a replay at x builds.
+//
+// x is placed relative to the steps by walking back from it (at most maxAdvanceSteps commits)
+// until every path reaches a retained step cutoff. If the newest step reached is j, an event
+// whose commit became an ancestor of the head at a step <= j (cstep) is visible at x: its commit
+// is an ancestor of step j's cutoff, which is an ancestor of x. One whose commit became an
+// ancestor later is not an ancestor of step j's cutoff, so it is visible exactly when the walk
+// visited its commit. An event whose cstep is only an upper bound (a late event for a commit the
+// head passed before the retained steps) and is above j cannot be placed without a closure, and
+// fails the plan. If the walk reaches no step at all it has seen x's whole ancestry, which places
+// every event - but only while nothing has been dropped.
+func (l *eventLog) planLocked(x codec.Hash) ([]int, bool) {
+	p, ok := l.lin.Locate(x, !l.dropped)
+	if !ok {
+		return nil, false
+	}
+	var undo []int
+	sawVisible := false
+	for i := len(l.events) - 1; i >= 0; i-- {
+		e := &l.events[i]
+		if e.state != evApplied {
+			continue
+		}
+		switch p.Visible(e.commit, e.step, e.cstep, e.cexact) {
+		case VisibleAndOlder:
+			return undo, true
+		case Visible:
+			sawVisible = true
+		case Invisible:
+			if sawVisible {
+				return nil, false
+			}
+			undo = append(undo, i)
+		default:
+			return nil, false
+		}
+	}
+	return undo, true
+}
+
+// replayLocked builds the state at cutoff from the whole (complete) log, memoized.
+func (l *eventLog) replayLocked(cutoff codec.Hash) *postingState {
+	key := replayKey{cutoff: cutoff, seq: l.seq, ancestryVersion: l.dag.AncestryVersion()}
+	if st, ok := l.replays[key]; ok {
+		return st
+	}
+	anc := l.dag.AncestorSet(cutoff)
+	st := newPostingState()
+	var removed []uint32
+	for i := range l.events {
+		e := &l.events[i]
+		if _, in := anc[e.commit]; !in {
+			continue
+		}
+		if e.del {
+			removed = st.removeDoc(e.doc, removed[:0])
+		} else {
+			st.add(e.doc, e.key)
+		}
+	}
+	if l.replays == nil {
+		l.replays = make(map[replayKey]*postingState, replayCacheEntries)
+	}
+	l.replays[key] = st
+	l.replayOrder = append(l.replayOrder, key)
+	if len(l.replayOrder) > replayCacheEntries {
+		delete(l.replays, l.replayOrder[0])
+		l.replayOrder = l.replayOrder[1:]
+	}
+	return st
+}
+
+// overlay is a view's undo, per key: for each (key, document) it touches, whether the document
+// is filed there at the view's cutoff. only, when set, limits it to some keys.
+func (l *eventLog) overlay(v keyedView, only func(ord uint32) bool) map[uint32]map[codec.UUID]bool {
+	if len(v.undo) == 0 {
+		return nil
+	}
+	out := make(map[uint32]map[codec.UUID]bool)
+	set := func(ord uint32, doc codec.UUID, filed bool) {
+		if only != nil && !only(ord) {
+			return
+		}
+		m := out[ord]
+		if m == nil {
+			m = make(map[codec.UUID]bool)
+			out[ord] = m
+		}
+		// Undo runs newest first, so the last write wins: the undo of the oldest event.
+		m[doc] = filed
+	}
+	for _, i := range v.undo {
+		e := &l.events[i]
+		if !e.del {
+			if e.added {
+				set(e.key, e.doc, false)
+			}
+			continue
+		}
+		for _, k := range l.effects(e) {
+			set(k, e.doc, true)
+		}
+	}
+	return out
+}
+
+// applyOverlay returns base adjusted by delta, in UUID order. base is not modified.
+func applyOverlay(base []codec.UUID, delta map[codec.UUID]bool) []codec.UUID {
+	out := make([]codec.UUID, 0, len(base)+len(delta))
+	for _, id := range base {
+		if filed, ok := delta[id]; ok && !filed {
+			continue
+		}
+		out = append(out, id)
+	}
+	for id, filed := range delta {
+		if !filed {
+			continue
+		}
+		if _, ok := slices.BinarySearchFunc(base, id, uuidCmp); ok {
+			continue
+		}
+		out = append(out, id)
+	}
+	slices.SortFunc(out, uuidCmp)
+	return out
+}
+
+func (l *eventLog) findKeyLocked(key Key) (uint32, bool) {
+	l.scratch = appendKeyEnc(l.scratch[:0], key)
+	return l.keys.find(l.scratch)
+}
+
+// lookup returns the doc ids filed under key at cutoff, in UUID order: stable, so a caller
+// comparing two lookups, or handing one straight on as query rows, sees the same order each time.
+func (l *eventLog) lookup(key Key, at *codec.Hash) ([]codec.UUID, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	v, err := l.viewLocked(at)
+	if err != nil {
+		return nil, err
+	}
+	ord, ok := l.findKeyLocked(key)
+	if !ok {
+		return nil, nil
+	}
+	base := v.st.ids(ord)
+	var out []codec.UUID
+	if d := l.overlay(v, func(o uint32) bool { return o == ord })[ord]; d != nil {
+		out = applyOverlay(base, d)
+	} else {
+		out = slices.Clone(base)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// lookupCount is len(lookup(key, cutoff)) without building the list.
+func (l *eventLog) lookupCount(key Key, at *codec.Hash) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	v, err := l.viewLocked(at)
+	if err != nil {
+		return 0, err
+	}
+	ord, ok := l.findKeyLocked(key)
+	if !ok {
+		return 0, nil
+	}
+	n := v.st.count(ord)
+	for doc, filed := range l.overlay(v, func(o uint32) bool { return o == ord })[ord] {
+		in := v.st.contains(ord, doc)
+		switch {
+		case filed && !in:
+			n++
+		case !filed && in:
+			n--
+		}
+	}
+	return n, nil
+}
+
+// rangeScan returns the doc ids whose keys fall within [from, to] at cutoff (a nil bound is
+// open), in key order and UUID order within a key, each id once, capped at limit.
+//
+// The order is what makes a limited range repeatable: an arbitrary order that changed between
+// calls would change *which* documents a limit returns, so paging through an index could show a
+// document twice or never.
+func (l *eventLog) rangeScan(from, to Key, at *codec.Hash, limit int, ascending bool) ([]codec.UUID, error) {
+	if limit <= 0 {
+		limit = 1<<31 - 1
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	v, err := l.viewLocked(at)
+	if err != nil {
+		return nil, err
+	}
+	order := l.keys.order()
+	lo, hi := 0, len(order)
+	if from != nil {
+		lo = l.keys.lowerBound(order, appendKeyEnc(nil, from))
+	}
+	if to != nil {
+		hi = l.keys.upperBound(order, appendKeyEnc(nil, to))
+	}
+	if lo >= hi {
+		return nil, nil
+	}
+	ov := l.overlay(v, nil)
+	// A document filed under several keys in range is returned once, at its first key. Only a
+	// multikey document can be, so a scalar index skips the bookkeeping.
+	var seen map[codec.UUID]struct{}
+	if len(v.st.docMany) > 0 || ov != nil {
+		seen = make(map[codec.UUID]struct{})
+	}
+	var out []codec.UUID
+	emit := func(ord uint32) bool {
+		ids := v.st.ids(ord)
+		if d := ov[ord]; d != nil {
+			ids = applyOverlay(ids, d)
+		}
+		for _, id := range ids {
+			if seen != nil {
+				if _, dup := seen[id]; dup {
+					continue
+				}
+				seen[id] = struct{}{}
+			}
+			out = append(out, id)
+			if len(out) >= limit {
+				return false
+			}
+		}
+		return true
+	}
+	if ascending {
+		for i := lo; i < hi; i++ {
+			if !emit(order[i]) {
+				break
+			}
+		}
+	} else {
+		for i := hi - 1; i >= lo; i-- {
+			if !emit(order[i]) {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 // KeyBucket is one key together with the documents filed under it.
@@ -289,168 +728,73 @@ type KeyBucket struct {
 	DocIDs []codec.UUID
 }
 
-// bucketsCopy returns the buckets at cutoffHash as a caller-owned, key-ordered slice.
-func (l *eventLog) bucketsCopy(cutoffHash codec.Hash) []KeyBucket {
+// bucketsCopy returns the buckets at cutoff as a caller-owned, key-ordered slice.
+func (l *eventLog) bucketsCopy(at *codec.Hash) ([]KeyBucket, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	shared := l.bucketsLocked(cutoffHash)
-	out := make([]KeyBucket, 0, len(shared))
-	for _, b := range shared {
-		out = append(out, KeyBucket{Key: b.key, DocIDs: sortedBucketIDs(b.ids)})
+	v, err := l.viewLocked(at)
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(out, func(i, j int) bool { return CompareKeys(out[i].Key, out[j].Key) < 0 })
-	return out
-}
-
-// replayLocked rebuilds the bucket state at cutoffHash by merging the two event slices in
-// sequence order. Both are appended to in increasing seq, so they are already sorted. The
-// returned state is what advanceHeadLocked continues from.
-func (l *eventLog) replayLocked(cutoffHash codec.Hash) (bucketMap, *headState) {
-	h := &headState{
-		cutoff:    cutoffHash,
-		seq:       l.seqCounter,
-		epoch:     l.dag.AncestryEpoch(),
-		buckets:   make(bucketMap),
-		docKeys:   make(map[codec.UUID][]string),
-		ancestors: l.dag.AncestorSet(cutoffHash),
-	}
-	p, d := 0, 0
-	for p < len(l.puts) || d < len(l.deletes) {
-		if d >= len(l.deletes) || (p < len(l.puts) && l.puts[p].seq < l.deletes[d].seq) {
-			h.applyPut(l.puts[p].entry)
-			p++
+	ov := l.overlay(v, nil)
+	out := []KeyBucket{}
+	for _, ord := range l.keys.order() {
+		ids := v.st.ids(ord)
+		if d := ov[ord]; d != nil {
+			ids = applyOverlay(ids, d)
+		} else {
+			ids = slices.Clone(ids)
+		}
+		if len(ids) == 0 {
 			continue
 		}
-		h.applyDelete(l.deletes[d])
-		d++
+		out = append(out, KeyBucket{Key: l.keys.key(ord), DocIDs: ids})
 	}
-	h.puts, h.deletes = p, d
-	return h.buckets, h
+	return out, nil
 }
 
-func (l *eventLog) appendPutLocked(entry Entry) {
-	l.seqCounter++
-	l.noteFirstLocked(entry.CommitHash)
-	l.puts = append(l.puts, putEvent{seq: l.seqCounter, entry: entry})
-}
-
-func (l *eventLog) appendDeleteLocked(docID codec.UUID, atCommit codec.Hash) {
-	l.seqCounter++
-	l.noteFirstLocked(atCommit)
-	l.deletes = append(l.deletes, deleteEvent{seq: l.seqCounter, docID: docID, atCommit: atCommit})
-}
-
-func (l *eventLog) noteFirstLocked(commit codec.Hash) {
-	if l.firstSeq == nil {
-		l.firstSeq = make(map[codec.Hash]int64)
-	}
-	if _, seen := l.firstSeq[commit]; !seen {
-		l.firstSeq[commit] = l.seqCounter
-	}
-}
-
-func (l *eventLog) clearLocked() {
-	l.head = nil
-	l.firstSeq = nil
-	l.puts = nil
-	l.deletes = nil
-	l.seqCounter = 0
-	l.cache = nil
-	l.cacheOrder = nil
-}
-
-// lookup returns the doc ids filed under key at cutoffHash.
-func (l *eventLog) lookup(key Key, cutoffHash codec.Hash) []codec.UUID {
+// needsRebuild brings the head state to the DAG head and reports whether it is broken.
+func (l *eventLog) needsRebuild() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	buckets := l.bucketsLocked(cutoffHash)
-	b, ok := buckets[KeyString(key)]
-	if !ok {
-		return nil
+	if head, err := l.dag.Head(); err == nil {
+		l.advanceLocked(head)
 	}
-	// Stable order, for the same reason rangeScan needs one: a bucket is a map, and a caller
-	// that compares two lookups - or hands the result straight on as query rows - should not see
-	// the order change between identical calls.
-	return b.sortedIDs()
+	return l.broken
 }
 
-// lookupCount is the number of doc ids filed under key at cutoffHash.
-func (l *eventLog) lookupCount(key Key, cutoffHash codec.Hash) int {
+// forgetHistory marks everything logged so far as describing only the head: the log was filled
+// from a scan of the documents at head, so its events carry no history, and a read at an older
+// commit must not replay them as if they did.
+func (l *eventLog) forgetHistory() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if b, ok := l.bucketsLocked(cutoffHash)[KeyString(key)]; ok {
-		return len(b.ids)
+	if head, err := l.dag.Head(); err == nil {
+		l.advanceLocked(head)
 	}
-	return 0
+	if l.broken || l.head == nil {
+		return
+	}
+	l.dropped = true
+	l.replays, l.replayOrder = nil, nil
 }
 
-// sortedIDs returns a caller-owned copy of the bucket's ids in stable order.
-func (b *bucket) sortedIDs() []codec.UUID {
-	if b.sorted == nil || len(b.sorted) != len(b.ids) {
-		b.sorted = sortedBucketIDs(b.ids)
-	}
-	return append([]codec.UUID(nil), b.sorted...)
+// eventLogStats reports the log's size, for tests and diagnostics.
+type eventLogStats struct {
+	Events  int
+	Steps   int
+	Keys    int
+	Live    int
+	Dropped bool
+	Broken  bool
 }
 
-// rangeScan returns the doc ids whose keys fall within [from, to] at cutoffHash, in key
-// order, capped at limit.
-func (l *eventLog) rangeScan(from, to Key, cutoffHash codec.Hash, limit int, ascending bool) []codec.UUID {
-	if limit <= 0 {
-		limit = 1<<31 - 1
-	}
+func (l *eventLog) stats() eventLogStats {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	buckets := l.bucketsLocked(cutoffHash)
-	matched := make([]*bucket, 0, len(buckets))
-	for _, b := range buckets {
-		if from != nil && CompareKeys(b.key, from) < 0 {
-			continue
-		}
-		if to != nil && CompareKeys(b.key, to) > 0 {
-			continue
-		}
-		matched = append(matched, b)
+	s := eventLogStats{Events: len(l.events), Steps: l.lin.Steps(), Keys: l.keys.len(), Dropped: l.dropped, Broken: l.broken}
+	if l.head != nil {
+		s.Live = l.head.st.live
 	}
-	sort.Slice(matched, func(i, j int) bool {
-		c := CompareKeys(matched[i].key, matched[j].key)
-		if !ascending {
-			return c > 0
-		}
-		return c < 0
-	})
-	seen := make(map[codec.UUID]struct{})
-	var out []codec.UUID
-	for _, b := range matched {
-		// A bucket is a map, so ranging it directly gave a different order on every call. That
-		// is invisible without a limit - the same set comes back, just shuffled - but with one
-		// it changes *which* documents are returned, so a limited range query answered
-		// differently each time it ran, and paging through an index could show a document twice
-		// or never. Sorted by id: an arbitrary order, but the same arbitrary order every time.
-		for _, id := range sortedBucketIDs(b.ids) {
-			if _, ok := seen[id]; ok {
-				continue
-			}
-			seen[id] = struct{}{}
-			out = append(out, id)
-			if len(out) >= limit {
-				return out
-			}
-		}
-	}
-	return out
-}
-
-// sortedBucketIDs returns a bucket's document ids in a stable order.
-func sortedBucketIDs(bucket map[codec.UUID]struct{}) []codec.UUID {
-	ids := make([]codec.UUID, 0, len(bucket))
-	for id := range bucket {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		if ids[i].MSB != ids[j].MSB {
-			return uint64(ids[i].MSB) < uint64(ids[j].MSB)
-		}
-		return uint64(ids[i].LSB) < uint64(ids[j].LSB)
-	})
-	return ids
+	return s
 }

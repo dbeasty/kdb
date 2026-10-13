@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -101,8 +102,9 @@ type NamespaceSyncResult struct {
 	// EarlyAdoptions counts the times a pull moved main to a prefix of the range it was fetching
 	// before the last page arrived (V2ClientConfig.AdoptEveryBytes).
 	EarlyAdoptions int
-	// ReceivedTips are the tips of every page this sync stored, so a caller whose sync is
-	// interrupted can pass them back as ExtraHaves and resume.
+	// ReceivedTips are the tips of what this sync stored - the frontier of every page received,
+	// at most MaxPendingTips of them - so a caller whose sync is interrupted can pass them back as
+	// ExtraHaves and resume.
 	ReceivedTips []codec.Hash
 	// ResolutionMismatch is set when the two nodes' resolution chains for this namespace differ.
 	// Neither then merges: a divergence pulled here is queued as a conflict, and main is pushed
@@ -423,7 +425,8 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 	if every == 0 {
 		every = DefaultAdoptEveryBytes
 	}
-	waiting := 0 // estimated bytes stored and not yet adopted
+	waiting := 0  // estimated bytes stored and not yet adopted
+	base := haves // the haves the transfer started with; each page adds only its own tips (pageHaves)
 	for {
 		reply, err := c.request(wire.FetchRequestMessage{
 			H: header(wire.MsgFetchRequest, c.next()), Namespace: ns,
@@ -476,9 +479,9 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 			return haves, err
 		}
 		tips := pageTips(page.Commits)
-		res.ReceivedTips = append(res.ReceivedTips, tips...)
+		res.ReceivedTips = foldFrontier(res.ReceivedTips, page.Commits, MaxPendingTips)
 		gate.share(tips)
-		haves = append(haves, tips...)
+		haves = pageHaves(base, tips)
 		if page.Done || len(page.Commits) == 0 {
 			return haves, nil
 		}
@@ -565,6 +568,7 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 				H: header(wire.MsgRefUpdate, c.next()), Namespace: remote.Namespace,
 				Kind: ref.kind, Ref: ref.name, OldHex: remoteHex, NewHex: ref.hex,
 				Commits: commits, Stubs: stubs, More: !done,
+				Zstd: slices.Contains(c.caps, wire.SyncCapZstdPack),
 			})
 			var refused *RemoteError
 			if err != nil && !extended && errors.As(err, &refused) && refused.Code == wire.ErrorCodeShallowBoundary {

@@ -1,7 +1,10 @@
 package wire
 
 import (
+	"fmt"
+	kzstd "github.com/klauspost/compress/zstd"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/compression"
 	"github.com/limidus/kdb/go/kdb/document"
 )
 
@@ -24,6 +27,10 @@ const SyncProtocolVersion = 2
 // Sync capabilities a node may advertise in SYNC_HELLO / SYNC_HELLO_ACK.
 const (
 	SyncCapBranches = "branches"
+	// SyncCapZstdPack: the node reads and writes zstd-compressed commit payloads in PACK_PAGE and
+	// REF_UPDATE (PackPageMessage.Zstd, RefUpdateMessage.Zstd). A node sends them compressed only
+	// to a peer that advertised it - an older node would read the compressed bytes as commits.
+	SyncCapZstdPack = "zstd-pack"
 	SyncCapTags     = "tags"
 	SyncCapStubs    = "stubs"
 	SyncCapSnapshot = "snapshot"
@@ -135,6 +142,9 @@ type PackPageMessage struct {
 	// Done is true when nothing further is missing; otherwise fetch again naming the tips of
 	// what has been received as haves.
 	Done bool
+	// Zstd sends the commits payload zstd-compressed; only to a peer with SyncCapZstdPack. Set by
+	// the sender; on a decoded message it reports how the page arrived.
+	Zstd bool
 }
 
 func (m PackPageMessage) Header() Header { return m.H }
@@ -153,6 +163,8 @@ type RefUpdateMessage struct {
 	Stubs   []document.CommitStub
 	// More means further pages follow: store these, decide nothing yet.
 	More bool
+	// Zstd: as PackPageMessage.Zstd.
+	Zstd bool
 }
 
 func (m RefUpdateMessage) Header() Header { return m.H }
@@ -239,6 +251,8 @@ type packPageDto struct {
 	CommitsPayload []byte          `json:"commitsPayload"`
 	Stubs          []commitStubDto `json:"stubs,omitempty"`
 	Done           bool            `json:"done"`
+	// CommitsZstd: CommitsPayload is zstd-compressed (SyncCapZstdPack).
+	CommitsZstd bool `json:"commitsZstd,omitempty"`
 }
 
 type refUpdateDto struct {
@@ -250,6 +264,7 @@ type refUpdateDto struct {
 	CommitsPayload []byte          `json:"commitsPayload"`
 	Stubs          []commitStubDto `json:"stubs,omitempty"`
 	More           bool            `json:"more,omitempty"`
+	CommitsZstd    bool            `json:"commitsZstd,omitempty"`
 }
 
 type refUpdateAckDto struct {
@@ -260,6 +275,40 @@ type refUpdateAckDto struct {
 	HeadHex       string           `json:"headHex"`
 	Stored        int              `json:"stored"`
 	ConflictBytes []byte           `json:"conflictBytes,omitempty"`
+}
+
+// packZstdLevel is the zstd level for commit payloads: the fastest, since a page is compressed on
+// the sync path of a host serving it and the win is in bytes on the wire, not in the last few
+// percent of ratio.
+const packZstdLevel = 1
+
+// maxPackPayload bounds a decompressed commits payload. A page is capped near
+// peersync.DefaultPageBytes (4 MiB, estimated) and a frame at DefaultMaxFrameBytes; this is far
+// above both, there to stop a hostile peer's small frame from inflating into gigabytes.
+const maxPackPayload = 256 << 20
+
+func encodeCommitsPayload(commits []document.Commit, zstd bool) ([]byte, error) {
+	payload, err := EncodeCommits(commits)
+	if err != nil || !zstd {
+		return payload, err
+	}
+	return compression.Compress(payload, packZstdLevel)
+}
+
+func decodeCommitsPayload(payload []byte, zstd bool) ([]document.Commit, error) {
+	if zstd {
+		// Refuse what the frame header says is too large before inflating any of it.
+		var hdr kzstd.Header
+		if err := hdr.Decode(payload); err == nil && hdr.HasFCS && hdr.FrameContentSize > maxPackPayload {
+			return nil, newDecodeError(fmt.Sprintf("commits payload declares %d bytes, more than %d", hdr.FrameContentSize, maxPackPayload))
+		}
+		raw, err := compression.Decompress(payload, maxPackPayload)
+		if err != nil {
+			return nil, newDecodeError("commits payload: " + err.Error())
+		}
+		payload = raw
+	}
+	return DecodeCommits(payload)
 }
 
 func refsToDto(refs []NamespaceRefs) []namespaceRefsDto {
@@ -307,21 +356,22 @@ func encodeSyncV2Message(msg Message) (payloadEnvelope, bool, error) {
 			Namespace: m.Namespace, Wants: hashesToHex(m.Wants), Haves: hashesToHex(m.Haves), MaxBytes: m.MaxBytes,
 		}}, true, nil
 	case PackPageMessage:
-		payload, err := EncodeCommits(m.Commits)
+		payload, err := encodeCommitsPayload(m.Commits, m.Zstd)
 		if err != nil {
 			return payloadEnvelope{}, true, err
 		}
 		return payloadEnvelope{Kind: "packPage", PackPage: &packPageDto{
 			Namespace: m.Namespace, CommitsPayload: payload, Stubs: stubsToDto(m.Stubs), Done: m.Done,
+			CommitsZstd: m.Zstd,
 		}}, true, nil
 	case RefUpdateMessage:
-		payload, err := EncodeCommits(m.Commits)
+		payload, err := encodeCommitsPayload(m.Commits, m.Zstd)
 		if err != nil {
 			return payloadEnvelope{}, true, err
 		}
 		return payloadEnvelope{Kind: "refUpdate", RefUpdate: &refUpdateDto{
 			Namespace: m.Namespace, Kind: m.Kind, Ref: m.Ref, OldHex: m.OldHex, NewHex: m.NewHex,
-			CommitsPayload: payload, Stubs: stubsToDto(m.Stubs), More: m.More,
+			CommitsPayload: payload, Stubs: stubsToDto(m.Stubs), More: m.More, CommitsZstd: m.Zstd,
 		}}, true, nil
 	case RefUpdateAckMessage:
 		return payloadEnvelope{Kind: "refUpdateAck", RefUpdateAck: &refUpdateAckDto{
@@ -384,7 +434,7 @@ func decodeSyncV2Message(header Header, env payloadEnvelope) (Message, bool, err
 		if d == nil {
 			return nil, true, newDecodeError("missing packPage body")
 		}
-		commits, err := DecodeCommits(d.CommitsPayload)
+		commits, err := decodeCommitsPayload(d.CommitsPayload, d.CommitsZstd)
 		if err != nil {
 			return nil, true, err
 		}
@@ -392,13 +442,13 @@ func decodeSyncV2Message(header Header, env payloadEnvelope) (Message, bool, err
 		if err != nil {
 			return nil, true, err
 		}
-		return PackPageMessage{H: header, Namespace: d.Namespace, Commits: commits, Stubs: stubs, Done: d.Done}, true, nil
+		return PackPageMessage{H: header, Namespace: d.Namespace, Commits: commits, Stubs: stubs, Done: d.Done, Zstd: d.CommitsZstd}, true, nil
 	case "refUpdate":
 		d := env.RefUpdate
 		if d == nil {
 			return nil, true, newDecodeError("missing refUpdate body")
 		}
-		commits, err := DecodeCommits(d.CommitsPayload)
+		commits, err := decodeCommitsPayload(d.CommitsPayload, d.CommitsZstd)
 		if err != nil {
 			return nil, true, err
 		}
@@ -408,7 +458,7 @@ func decodeSyncV2Message(header Header, env payloadEnvelope) (Message, bool, err
 		}
 		return RefUpdateMessage{
 			H: header, Namespace: d.Namespace, Kind: d.Kind, Ref: d.Ref, OldHex: d.OldHex, NewHex: d.NewHex,
-			Commits: commits, Stubs: stubs, More: d.More,
+			Commits: commits, Stubs: stubs, More: d.More, Zstd: d.CommitsZstd,
 		}, true, nil
 	case "refUpdateAck":
 		d := env.RefUpdateAck

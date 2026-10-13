@@ -490,8 +490,9 @@ pins, and a lock-free atomic head snapshot (`atomic.Pointer`) so point reads nee
 - **Ops budget** (`dag/ops_retention.go`): commit operations are LRU-bounded (25% of the memory budget by
   default); evicted operations are re-read from the delta log by `embed/commit_ops_loader.go` (a lazy hash to
   frame index, about 48 bytes per commit). Branch heads, tags, pins and shallow roots are never evicted.
-- **Not yet bounded:** the commit *node* map (metadata) is resident for the life of the process in `FULL` mode.
-  `KDB_GRAPH_FILE` (an on-disk mmapped graph) is accepted but is a no-op stub (`graphFile struct{}`);
+- **Commit nodes (metadata):** with `KDB_GRAPH_FILE` on - the default - they are mapped from graph segment files
+  and only a recent tail is resident; with it off they stay resident for the life of the process in `FULL` mode
+  (see `docs/kdb-mmap-plan.md`).
   `KDB_ANCESTRY_PRUNING` adds generation numbers for pruned ancestry walks (off by default).
 - **[HEAD]** `dag/join.go` (`IsContentFreeMerge`, `Frontier`) and `dag/unlogged.go` (`PutUnloggedCommit`;
   unlogged commits are omitted from checkpoints and their ops stay pinned in the ops budget, because a checkpoint
