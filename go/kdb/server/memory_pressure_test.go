@@ -202,7 +202,10 @@ func TestCommitRejectedWhenLargerThanCapacity(t *testing.T) {
 	srv.SetMemoryBudget(128<<10, 0.85, DefaultRescueReserveBytes, DefaultScanRowBudget)
 	defer srv.memGuard.Stop()
 	srv.memGuard.Stop()
-	srv.memGuard.reset()    // see pinZone's doc comment - Stop alone does not guarantee an empty ring
+	// See pinZone's doc comment - Stop alone does not guarantee an empty ring - and resetToNormal's:
+	// a real sample that landed first can already have raised the zone, and hysteresis would keep
+	// it there through one low reading.
+	srv.memGuard.resetToNormal()
 	srv.memGuard.observe(1) // stay in ZoneNormal, so the zone policy is not what rejects
 
 	docID, err := codec.RandomUUID()
