@@ -140,7 +140,7 @@ type trieEdit struct {
 	// translated, copied and placed once and then shared, as it was before.
 	memo, placed map[tref]tref
 	n            int
-	recs []editRec // grows only for a rebase (translate); an update needs at most 2*trieDepth+4
+	recs         []editRec // grows only for a rebase (translate); an update needs at most 2*trieDepth+4
 }
 
 type editRec struct {
