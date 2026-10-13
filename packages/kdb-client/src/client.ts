@@ -35,6 +35,7 @@ import type {
 import { connectWebSocket } from "./transport/websocket.ts";
 import { schemeOf, type Transport } from "./transport/types.ts";
 import { bytesFromWire, bytesToWire, utf8Decode, utf8Encode } from "./wire/bytes.ts";
+import { WIRE_FEATURE_BINARY } from "./wire/binary.ts";
 import { decodeMessage, encodeMessage, isClientKind, type WireMessage } from "./wire/envelope.ts";
 import { DEFAULT_MAX_FRAME_BYTES, KDB_WIRE_PROTOCOL_VERSION } from "./wire/frame.ts";
 import { contentHash } from "./wire/hash.ts";
@@ -93,6 +94,12 @@ export interface ConnectOptions {
    * carries no release number, or a deliberate version skew you have tested yourself.
    */
   skipVersionCheck?: boolean;
+  /**
+   * Keep the connection on the JSON envelope: the handshake offers no wire features, so neither
+   * side sends binary frames. By default the client offers binary frames and uses them when the
+   * server acks them (an older server, or the JVM one, acks none and the connection stays JSON).
+   */
+  jsonOnly?: boolean;
 }
 
 interface NamespaceState {
@@ -153,6 +160,8 @@ export async function connect(addr: string, options: ConnectOptions = {}): Promi
 export class Client implements KdbOperations {
   readonly #transport: Transport;
   readonly #maxFrameBytes: number;
+  /** The handshake agreed binary frames (WIRE_FEATURE_BINARY): requests go out binary. */
+  #binary = false;
   readonly #requestTimeoutMs: number;
   readonly #authorNodeId: string;
   readonly #pending = new Map<number, PendingRequest>();
@@ -196,6 +205,7 @@ export class Client implements KdbOperations {
       protocolVersion: KDB_WIRE_PROTOCOL_VERSION,
     };
     if (options.token !== undefined && options.token !== "") request.token = options.token;
+    if (!options.jsonOnly) request.wireFeatures = [WIRE_FEATURE_BINARY];
 
     const callOptions: CallOptions = {};
     if (options.signal !== undefined) callOptions.signal = options.signal;
@@ -217,6 +227,13 @@ export class Client implements KdbOperations {
         `kdb: server negotiated ${ack.negotiatedEncoding}, but this client implements JSON only`,
       );
     }
+    // Binary frames only once the server has said it reads them. The ack itself is JSON.
+    this.#binary = !options.jsonOnly && (ack.wireFeatures ?? []).includes(WIRE_FEATURE_BINARY);
+  }
+
+  /** The wire features the handshake agreed; empty when the connection is on the JSON envelope. */
+  get wireFeatures(): string[] {
+    return this.#binary ? [WIRE_FEATURE_BINARY] : [];
   }
 
   async close(): Promise<void> {
@@ -838,7 +855,7 @@ export class Client implements KdbOperations {
       });
 
       try {
-        this.#transport.send(encodeMessage(kind, correlationId, payload, this.#maxFrameBytes));
+        this.#transport.send(encodeMessage(kind, correlationId, payload, this.#maxFrameBytes, this.#binary));
       } catch (error) {
         this.#settle(correlationId, () =>
           reject(

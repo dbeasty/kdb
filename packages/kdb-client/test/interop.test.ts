@@ -21,7 +21,7 @@ import { after, before, describe, it } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { connect, type Client } from "../src/index.ts";
+import { connect, type Client, WIRE_FEATURE_BINARY } from "../src/index.ts";
 import { KdbNotFoundError, KdbPreconditionError } from "../src/errors.ts";
 import { randomUuid } from "../src/wire/uuid.ts";
 
@@ -39,7 +39,9 @@ function goAvailable(): boolean {
 
 const enabled = goAvailable();
 
-describe("live interop against the Go server", { skip: enabled ? false : "go toolchain not found" }, () => {
+// Every case runs twice: over binary frames, which a current Go server agrees to by default, and
+// over the JSON envelope, which every older server and the JVM one still speak.
+for (const jsonOnly of [false, true]) describe(`live interop against the Go server (${jsonOnly ? "JSON" : "binary"} frames)`, { skip: enabled ? false : "go toolchain not found" }, () => {
   let server: ChildProcessWithoutNullStreams;
   let client: Client;
   let serverUri = "";
@@ -76,7 +78,7 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
     });
 
     serverUri = uri;
-    client = await connect(uri, { requestTimeoutMs: 15_000 });
+    client = await connect(uri, { requestTimeoutMs: 15_000, jsonOnly });
   });
 
   after(async () => {
@@ -89,6 +91,10 @@ describe("live interop against the Go server", { skip: enabled ? false : "go too
     // Reaching `after` at all means the handshake succeeded - including the [] / {} encoding of
     // namespaces and localHeads, which a null would have failed on.
     assert.ok(client);
+  });
+
+  it("agrees binary frames unless asked not to", () => {
+    assert.deepEqual(client.wireFeatures, jsonOnly ? [] : [WIRE_FEATURE_BINARY]);
   });
 
   it("round trips a document through putJSON and get", async () => {

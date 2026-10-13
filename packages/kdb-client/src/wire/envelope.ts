@@ -6,7 +6,15 @@
  */
 
 import { KdbProtocolError } from "../errors.ts";
-import { decodeFrame, encodeFrame, type FrameHeader } from "./frame.ts";
+import { decodeBinaryBody, ENCODING_BINARY, encodeBinaryBody } from "./binary.ts";
+import {
+  decodeFrameBody,
+  ENCODING_JSON,
+  encodeFrame,
+  encodeFrameBody,
+  type FrameHeader,
+  parseEnvelope,
+} from "./frame.ts";
 import { type MessageKind, TYPE_CODE_BY_KIND } from "./messages.ts";
 
 export interface WireMessage<K extends MessageKind = MessageKind, P = unknown> {
@@ -16,16 +24,27 @@ export interface WireMessage<K extends MessageKind = MessageKind, P = unknown> {
   header?: FrameHeader;
 }
 
-/** Builds a frame carrying one message. */
+/**
+ * Builds a frame carrying one message. With `binary` (the handshake agreed
+ * WIRE_FEATURE_BINARY), a kind that has a binary form goes out as a binary body; every other
+ * kind, and every message on a JSON connection, as the JSON envelope.
+ */
 export function encodeMessage(
   kind: MessageKind,
   correlationId: number,
   payload: unknown,
   maxFrameBytes?: number,
+  binary = false,
 ): Uint8Array {
-  const envelope: Record<string, unknown> = { kind, [kind]: payload };
   const options: { maxFrameBytes?: number } = {};
   if (maxFrameBytes !== undefined) options.maxFrameBytes = maxFrameBytes;
+  if (binary) {
+    const body = encodeBinaryBody(kind, payload);
+    if (body !== undefined) {
+      return encodeFrameBody(TYPE_CODE_BY_KIND[kind], correlationId, ENCODING_BINARY, body, options);
+    }
+  }
+  const envelope: Record<string, unknown> = { kind, [kind]: payload };
   return encodeFrame(TYPE_CODE_BY_KIND[kind], correlationId, envelope, options);
 }
 
@@ -36,7 +55,20 @@ export function encodeMessage(
  * TYPE_CODE_BY_KIND's note on handshakeAck sharing 0x01 with handshake.
  */
 export function decodeMessage(frame: Uint8Array, maxFrameBytes?: number): WireMessage {
-  const { header, envelope } = decodeFrame(frame, maxFrameBytes);
+  const { header, encodingTag, body } = decodeFrameBody(frame, maxFrameBytes);
+  if (encodingTag === ENCODING_BINARY) {
+    // A binary body has no `kind`: it is the header's type code, which is unambiguous here
+    // because the handshake and its ack - the one pair sharing a code - never go binary.
+    const { kind, payload } = decodeBinaryBody(header.typeCode, body);
+    return { kind, payload, correlationId: header.correlationId, header };
+  }
+  if (encodingTag !== ENCODING_JSON) {
+    throw new KdbProtocolError(
+      `kdb: unsupported payload encoding tag 0x${encodingTag.toString(16)} ` +
+        "(this client reads JSON and binary frames only)",
+    );
+  }
+  const envelope = parseEnvelope(body);
   const kind = envelope["kind"];
   if (typeof kind !== "string" || kind === "") {
     throw new KdbProtocolError("kdb: payload envelope has no `kind`");
