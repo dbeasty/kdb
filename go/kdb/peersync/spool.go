@@ -83,50 +83,70 @@ func (s *pageSpool) writeErr(err error) error {
 // document), stopping after limit documents when limit >= 0. A batch is only valid during the
 // call that receives it: its slice is reused.
 func (s *pageSpool) each(maxBytes, limit int, fn func(docs []wire.SnapshotDoc) error) error {
+	next, err := s.reader(maxBytes, limit)
+	if err != nil {
+		return err
+	}
+	for {
+		batch, err := next()
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := fn(batch); err != nil {
+			return err
+		}
+	}
+}
+
+// reader returns a function yielding the spool's documents in order, in batches as each makes
+// them; an empty batch means the end. Each batch is a fresh slice the caller may keep.
+func (s *pageSpool) reader(maxBytes, limit int) (func() ([]wire.SnapshotDoc, error), error) {
 	if err := s.w.Flush(); err != nil {
-		return s.writeErr(err)
+		return nil, s.writeErr(err)
 	}
 	if maxBytes <= 0 {
 		maxBytes = DefaultPageBytes
 	}
 	r := bufio.NewReaderSize(io.NewSectionReader(s.f, 0, s.size), spoolBufferBytes)
-	var batch []wire.SnapshotDoc
-	size, read := 0, 0
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
+	read := 0
+	// held is a document read past the end of the previous batch: the one that did not fit.
+	var held *wire.SnapshotDoc
+	return func() ([]wire.SnapshotDoc, error) {
+		var batch []wire.SnapshotDoc
+		size := 0
+		if held != nil {
+			batch, size, held = append(batch, *held), len(held.Body), nil
 		}
-		err := fn(batch)
-		clear(batch)
-		batch, size = batch[:0], 0
-		return err
-	}
-	for limit < 0 || read < limit {
-		idLen, err := binary.ReadUvarint(r)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return s.readErr(err)
-		}
-		bodyLen, err := binary.ReadUvarint(r)
-		if err != nil {
-			return s.readErr(err)
-		}
-		buf := make([]byte, idLen+bodyLen)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return s.readErr(err)
-		}
-		if len(batch) > 0 && size+int(bodyLen) > maxBytes {
-			if err := flush(); err != nil {
-				return err
+		for limit < 0 || read < limit {
+			idLen, err := binary.ReadUvarint(r)
+			if errors.Is(err, io.EOF) {
+				break
 			}
+			if err != nil {
+				return nil, s.readErr(err)
+			}
+			bodyLen, err := binary.ReadUvarint(r)
+			if err != nil {
+				return nil, s.readErr(err)
+			}
+			buf := make([]byte, idLen+bodyLen)
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return nil, s.readErr(err)
+			}
+			read++
+			d := wire.SnapshotDoc{DocID: string(buf[:idLen]), Body: string(buf[idLen:])}
+			if len(batch) > 0 && size+len(d.Body) > maxBytes {
+				held = &d
+				return batch, nil
+			}
+			batch = append(batch, d)
+			size += len(d.Body)
 		}
-		batch = append(batch, wire.SnapshotDoc{DocID: string(buf[:idLen]), Body: string(buf[idLen:])})
-		size += int(bodyLen)
-		read++
-	}
-	return flush()
+		return batch, nil
+	}, nil
 }
 
 func (s *pageSpool) readErr(err error) error {

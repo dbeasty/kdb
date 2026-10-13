@@ -160,6 +160,12 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 }
 
 func (h *peerSyncConnHandler) run(conn stream.ConnectionHandle) {
+	// What a v2 session staged and never finished (a pushed graft cut off mid-way) goes with it.
+	defer func() {
+		if h.v2 != nil {
+			h.v2.Close()
+		}
+	}()
 	first := true
 	for frame := range conn.Incoming() {
 		response, err := h.handle(frame, first)
