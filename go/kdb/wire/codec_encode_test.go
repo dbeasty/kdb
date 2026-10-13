@@ -177,3 +177,37 @@ func benchDecode(b *testing.B, msg Message) {
 		}
 	}
 }
+
+// TestSetCorrelationIDMatchesAFreshEncode: a frame encoded under one correlation id and patched to
+// another is byte-identical to the same message encoded under the second - the id is in the header
+// only, which is what lets the stream hub encode a delta once and send it to every subscriber.
+func TestSetCorrelationIDMatchesAFreshEncode(t *testing.T) {
+	c := NewCodec(EncodingJSON)
+	msg := func(cid int) Message {
+		return DeltaCommitMessage{
+			H: Header{MessageType: MsgDeltaCommit, ProtocolVersion: KdbWireProtocolVersion, CorrelationID: cid},
+			Payload: DeltaCommitPayload{
+				Namespace: "app/data", TimestampMicros: 42,
+				Operations: []document.Op{document.WriteOp{DocID: codec.UUID{MSB: 1, LSB: 2}, Patch: `{"a":1}`}},
+			},
+		}
+	}
+	patched, err := c.Encode(msg(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cid := range []int{1, 5000, 1 << 30, -7} {
+		SetCorrelationID(patched, cid)
+		want, err := c.Encode(msg(cid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(patched, want) {
+			t.Fatalf("cid %d: patched frame differs from a fresh encode", cid)
+		}
+		h, err := DecodeHeader(patched)
+		if err != nil || h.CorrelationID != cid {
+			t.Fatalf("cid %d: decoded %d (%v)", cid, h.CorrelationID, err)
+		}
+	}
+}
