@@ -252,7 +252,9 @@ func (e *ServerEngine) PinTree(treeHash codec.Hash) {
 		return
 	}
 	if s := e.latestTree.Load(); s != nil && s.hash == treeHash {
-		e.treesByHash.Put(s.tree)
+		// The live tree is held by latestTree whatever this store does, so it is charged what
+		// it will cost once it is history: a path, not a copy. See treeDeltaBytes.
+		e.treesByHash.PutCharged(s.tree, treeDeltaBytes(s.tree.Size(), 1))
 	}
 }
 
@@ -266,8 +268,13 @@ func (e *ServerEngine) UnpinTree(treeHash codec.Hash) {
 
 // publishTreeLocked records tree under its hash and republishes it as the latest. Must be
 // called with treesMu held exclusively.
-func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree) {
-	e.treesByHash.Put(tree)
+//
+// changes is how many documents tree differs from the previous live tree by, or 0 when there is
+// no previous one (an open). The store is charged that delta, not the whole tree: the live tree
+// is held by latestTree regardless and is accounted as the live trie (see MemoryBreakdown), and
+// what it will hold uniquely once it is history is the paths the next commit rewrites.
+func (e *ServerEngine) publishTreeLocked(tree document.DocumentTree, changes int) {
+	e.treesByHash.PutCharged(tree, treeDeltaBytes(tree.Size(), changes))
 	e.latestTree.Store(&treeSnapshot{hash: tree.TreeHash, tree: tree})
 }
 
@@ -783,7 +790,7 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 	// names this tree landed; only then is there a location to record.
 	e.stashPendingLocations(e.tree.TreeHash, changed)
 	e.treesMu.Lock()
-	e.publishTreeLocked(e.tree)
+	e.publishTreeLocked(e.tree, len(changed)+len(deletes))
 	e.treesMu.Unlock()
 	return e.tree, nil
 }

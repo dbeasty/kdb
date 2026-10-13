@@ -8,28 +8,61 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 )
 
-// treeBytesPerNode approximates what one trie node costs resident: a
-// 32-byte hash, a pointer, and a 16-entry child array, plus allocator
-// overhead.
-const treeBytesPerNode = 176
+// Trie cost constants (document/document_tree_trie.go). An internal node is a 48-byte trieNode
+// plus its 128-byte child array; a leaf is a trieNode plus a 48-byte trieLeaf. Leaves are
+// path-compressed - a leaf sits at the first depth where its subtree holds one entry - so a
+// tree of n random ids is about log16(n)+1 levels deep and costs about treeBytesPerDoc per
+// document all told (TestTreeMemoryPerDocumentStaysBounded measures 157).
+const (
+	treeBytesPerNode = 176
+	treeBytesPerLeaf = 96
+	treeBytesPerDoc  = 160
+	// treeEntryOverhead is the store's own cost per tree: its entry, map slot and list element.
+	treeEntryOverhead = 192
+)
 
-// treeSpineNodes is the depth of the document trie. It is fixed at 32 with
-// no path compression (see document/document_tree_trie.go), so every
-// document's path is 32 internal nodes deep whatever else the tree holds -
-// which is why a tree of a single document still costs several kilobytes.
-const treeSpineNodes = 32
-
-// treeSizeBytes approximates a tree's resident cost.
-//
-// Deliberately an approximation. Trees share subtrees with the versions
-// they were derived from, so summing per-tree sizes overcounts what is
-// actually held, and there is no cheap way to know how much of a given
-// tree is shared with another still in the cache. What matters is that the
-// budget is denominated in bytes, so it composes with the engine's other
-// budgets rather than being a count that means something different for
-// every namespace.
+// treeSizeBytes is what a tree costs if nothing else holds any of it: every node, charged as
+// an independent copy. Used for a tree whose relationship to the others is unknown - one
+// rebuilt for a history read, or handed in from outside.
 func treeSizeBytes(t document.DocumentTree) int64 {
-	return int64(treeBytesPerNode) * int64(treeSpineNodes+t.Size())
+	return treeEntryOverhead + treeBytesPerDoc*int64(t.Size())
+}
+
+// treePathBytes is what one changed document adds to a tree that shares everything else with
+// its parent: a new leaf and a new copy of every internal node on its path.
+func treePathBytes(size int) int64 {
+	depth := int64(1) // the root
+	for n := size; n > 16; n /= 16 {
+		depth++
+	}
+	return depth*treeBytesPerNode + treeBytesPerLeaf
+}
+
+// treeDeltaBytes is what a tree derived from a resident parent by changes edits actually adds
+// to memory: the paths it rewrote, nothing else. Capped at treeSizeBytes - a commit that touches
+// most of a small tree has shared nothing worth counting.
+//
+// Charging this rather than treeSizeBytes is what lets the store hold history at all on a large
+// namespace. Every tree used to be charged 176 x (32 + size) as if it were a private copy, so at
+// a million documents a single tree "cost" 176 MB, far over the history budget, and the store
+// held exactly one - every read at any older commit rebuilt its tree. In fact consecutive trees
+// share all but the changed paths, so a run of them costs the live tree plus the sum of their
+// deltas.
+//
+// It is an estimate, and it can undercount in one case: a tree's unique nodes are the paths
+// changed between it and the trees still resident, so once its neighbours are evicted it holds
+// more than its own delta. The store evicts least recently used first, which for trees
+// published commit by commit keeps the retained set a contiguous run back from the live tree,
+// where the sum of deltas is within a factor of two of the truth (a node is unique to at most
+// the tree that introduced it and the one that replaced it). A history read that promotes one
+// old tree out of that run is the exception.
+func treeDeltaBytes(size, changes int) int64 {
+	full := treeEntryOverhead + treeBytesPerDoc*int64(size)
+	if changes < 1 {
+		changes = 1
+	}
+	d := treeEntryOverhead + int64(changes)*treePathBytes(size)
+	return min(d, full)
 }
 
 // boundedTreeStore holds document trees under a byte budget, evicting the
@@ -95,6 +128,12 @@ func (s *boundedTreeStore) Get(h codec.Hash) (document.DocumentTree, bool) {
 }
 
 func (s *boundedTreeStore) Put(t document.DocumentTree) {
+	s.PutCharged(t, treeSizeBytes(t))
+}
+
+// PutCharged stores t charging it size bytes against the budget instead of treeSizeBytes - for a
+// caller that knows how much of t it shares with trees already held (see treeDeltaBytes).
+func (s *boundedTreeStore) PutCharged(t document.DocumentTree, size int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.trees[t.TreeHash]; ok {
@@ -105,7 +144,7 @@ func (s *boundedTreeStore) Put(t document.DocumentTree) {
 		}
 		return
 	}
-	e := &treeEntry{tree: t, size: treeSizeBytes(t)}
+	e := &treeEntry{tree: t, size: size}
 	s.trees[t.TreeHash] = e
 	s.bytes += e.size
 	// A pin taken before the tree was resident - the ordinary case for a writer whose base was

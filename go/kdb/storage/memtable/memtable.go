@@ -321,6 +321,19 @@ func (mgr *Manager) SizeBytes() int64 {
 	return mgr.active.SizeBytes()
 }
 
+// FootprintBytes is the memory both generations occupy - the active one and any generation
+// still being flushed. For accounting; SizeBytes is the flush trigger.
+func (mgr *Manager) FootprintBytes() int64 {
+	mgr.mu.Lock()
+	active, pending := mgr.active, mgr.pendingFlush
+	mgr.mu.Unlock()
+	b := active.FootprintBytes()
+	if pending != nil {
+		b += pending.FootprintBytes()
+	}
+	return b
+}
+
 // Delete tombstones key in the active memtable. The tombstone hides any value in the generation
 // being flushed and in the blob store, and survives the flush: Flush writes it into the SSTable
 // as a real delete marker (see sstable.BlockHandle.Deleted), so a delete of an already-flushed

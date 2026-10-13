@@ -167,3 +167,45 @@ func TestAdminNamespaceSizeGauges(t *testing.T) {
 		t.Fatalf("after a delete:\n%s", body)
 	}
 }
+
+// Every namespace reports what it holds in memory, by structure, and the body gauges move when
+// documents are written.
+func TestAdminNamespaceMemoryGauges(t *testing.T) {
+	// A file runtime: the in-memory one has no storage engine to report.
+	rt, err := embed.OpenFileRuntimeWithOptions(t.TempDir(), "adm", "adm/ns", schema.None(), embed.FileRuntimeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewKdbServerRuntime(rt)
+	t.Cleanup(srv.Release)
+	admin, err := NewAdminServer("127.0.0.1:0", srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	for i := 0; i < 50; i++ {
+		id, _ := codec.RandomUUID()
+		if _, err := srv.Upsert("adm/ns", id, fmt.Sprintf(`{"i":%d,"pad":"%s"}`, i, strings.Repeat("x", 200)), auth.Principal{ID: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, body := adminGet(t, admin, "/metrics")
+	if !strings.Contains(body, "# TYPE kdb_namespace_memory_bytes gauge") {
+		t.Fatalf("no memory family:\n%s", body)
+	}
+	for _, structure := range []string{"document_bodies", "document_bodies_live", "document_index", "live_tree",
+		"history_trees", "pinned_trees", "memtable", "sstable_indexes", "sstable_block_cache", "commit_graph", "commit_operations"} {
+		prefix := fmt.Sprintf(`kdb_namespace_memory_bytes{namespace="adm/ns",structure=%q} `, structure)
+		i := strings.Index(body, prefix)
+		if i < 0 {
+			t.Fatalf("missing %s:\n%s", structure, body)
+		}
+		if structure == "document_bodies_live" {
+			var v int64
+			fmt.Sscan(body[i+len(prefix):], &v)
+			if v < 50*200 {
+				t.Fatalf("document_bodies_live = %d after writing 50 bodies of over 200 bytes", v)
+			}
+		}
+	}
+}
