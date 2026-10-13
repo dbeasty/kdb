@@ -38,14 +38,15 @@ type GraphSegmentRef struct {
 func (d *InMemoryCommitDag) CheckpointSnapshotWithGraph(keep func(document.Commit) bool) (CheckpointState, []GraphSegmentRef, []codec.Hash, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
 	if keep != nil || len(d.nodes.segs) == 0 {
-		state, mainUnlogged := d.checkpointSnapshotLocked(keep, false)
+		state, mainUnlogged := d.checkpointSnapshotLocked(keep, false, true)
 		if mainUnlogged {
 			return CheckpointState{}, nil, nil, ErrHeadNotLogged
 		}
 		return state, nil, nil, nil
 	}
-	state, mainUnlogged := d.checkpointSnapshotLocked(nil, true)
+	state, mainUnlogged := d.checkpointSnapshotLocked(nil, true, true)
 	if mainUnlogged {
 		return CheckpointState{}, nil, nil, ErrHeadNotLogged
 	}

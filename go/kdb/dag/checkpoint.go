@@ -24,9 +24,13 @@ type CheckpointCommit struct {
 
 // CheckpointState is the DAG state a checkpoint captures and restores.
 type CheckpointState struct {
-	Commits  []CheckpointCommit
-	Branches []document.Branch
-	Tags     []document.Tag
+	Commits []CheckpointCommit
+	// PackedCommits holds commits packed (checkpoint_packed.go) in place of, or as well as,
+	// Commits: what a checkpoint snapshot produces and a v4 checkpoint decodes to, so the commit
+	// list never exists as structs. RestoreCheckpoint takes both.
+	PackedCommits []byte
+	Branches      []document.Branch
+	Tags          []document.Tag
 }
 
 // CheckpointSnapshot captures the commit graph and refs as of now.
@@ -97,13 +101,15 @@ func (d *InMemoryCommitDag) CheckpointSnapshotLogged(keep func(document.Commit) 
 func (d *InMemoryCommitDag) checkpointSnapshot(keep func(document.Commit) bool) (CheckpointState, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.checkpointSnapshotLocked(keep, false)
+	return d.checkpointSnapshotLocked(keep, false, false)
 }
 
 // checkpointSnapshotLocked is checkpointSnapshot's body. residentOnly limits it to the resident
 // tier, for a checkpoint that references the graph segments for the rest (see
-// CheckpointSnapshotWithGraph). Must hold mu.
-func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) bool, residentOnly bool) (CheckpointState, bool) {
+// CheckpointSnapshotWithGraph). pack appends commits to PackedCommits instead of listing them, so
+// the commit list is never a slice of structs - at two million commits that slice was gigabytes
+// of transient heap per checkpoint. Must hold mu.
+func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) bool, residentOnly, pack bool) (CheckpointState, bool) {
 	excluded := d.unloggedClosureLocked()
 	unlogged := func(h codec.Hash) bool {
 		_, ok := excluded[h]
@@ -123,6 +129,9 @@ func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) 
 	n := d.nodes.len()
 	if residentOnly {
 		n = d.nodes.residentLen()
+	}
+	if pack {
+		n = 0 // nothing goes in Commits unless a commit cannot be packed
 	}
 	state := CheckpointState{
 		Commits:  make([]CheckpointCommit, 0, n),
@@ -153,6 +162,13 @@ func (d *InMemoryCommitDag) checkpointSnapshotLocked(keep func(document.Commit) 
 			count = 1
 		}
 		c.Operations = nil
+		if pack {
+			packed, err := appendPackedCommit(state.PackedCommits, c, count)
+			if err == nil {
+				state.PackedCommits = packed
+				continue
+			}
+		}
 		state.Commits = append(state.Commits, CheckpointCommit{Commit: c, OperationCount: count})
 	}
 	for _, b := range d.branches {
@@ -246,7 +262,7 @@ func (d *InMemoryCommitDag) unloggedClosureLocked() map[codec.Hash]struct{} {
 func (d *InMemoryCommitDag) RestoreCheckpoint(state CheckpointState) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, cc := range state.Commits {
+	restore := func(cc CheckpointCommit) error {
 		if err := d.putCommitLocked(cc.Commit, false, false); err != nil {
 			return err
 		}
@@ -259,6 +275,15 @@ func (d *InMemoryCommitDag) RestoreCheckpoint(state CheckpointState) error {
 			}
 			d.opsEvicted[cc.Commit.Hash] = struct{}{}
 		}
+		return nil
+	}
+	for _, cc := range state.Commits {
+		if err := restore(cc); err != nil {
+			return err
+		}
+	}
+	if err := ForEachPackedCommit(state.PackedCommits, d.NamespaceID, restore); err != nil {
+		return err
 	}
 	for _, b := range state.Branches {
 		d.branches[b.Name] = b

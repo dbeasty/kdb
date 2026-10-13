@@ -24,10 +24,12 @@ const checkpointFormatVersion = 2
 // missing. Written only when there are segments to reference; otherwise version 2, unchanged.
 const checkpointGraphFormatVersion = 3
 
-// checkpointPackedFormatVersion stores the live tree as one packed byte field (13) in ascending
-// id order instead of a record per entry (7), and makes the graph fields (11, 12) optional. A
-// million live documents as records cost ~900 MB to encode at every checkpoint and most of an
-// open's peak heap to decode; packed they are 48 MB and decode straight into the bulk trie build.
+// checkpointPackedFormatVersion stores the live tree (13) and the commits (14) as packed byte
+// fields instead of a codec record per entry (7, 4), and makes the graph fields (11, 12)
+// optional. A million live documents as records cost ~900 MB to encode at every checkpoint and
+// most of an open's peak heap to decode; packed they are 48 MB and decode straight into the bulk
+// trie build. Commits likewise: two million as records were gigabytes each way; packed they are
+// ~150 bytes each and restored one at a time.
 // What this build writes. Its own version so an older build replays the log rather than restoring
 // an empty live tree from a field it does not know.
 const checkpointPackedFormatVersion = 4
@@ -170,6 +172,8 @@ func checkpointRegistry() *schema.Registry {
 				{ID: 12, Name: "graphHidden", Type: schema.Array{Element: cpHash}, Default: codec.ArrayValue{}},
 				// Version 4: the live tree, packed - see checkpointPackedFormatVersion.
 				{ID: 13, Name: "liveTreePacked", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
+				// Version 4: the commits, packed - see dag/checkpoint_packed.go.
+				{ID: 14, Name: "commitsPacked", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
 			},
 		})
 		r.Freeze()
@@ -264,26 +268,15 @@ func cpStrFrom(v codec.Value) (string, error) {
 }
 
 func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
-	commits := make([]codec.Value, 0, len(cp.State.Commits))
-	for _, cc := range cp.State.Commits {
-		parents := make([]codec.Value, len(cc.Commit.ParentHashes))
-		for i, p := range cc.Commit.ParentHashes {
-			parents[i] = cpHashVal(p)
+	// Commits are packed (dag/checkpoint_packed.go): a snapshot hands them over packed already, and
+	// any listed as structs are packed here, so a checkpoint never holds a codec record per commit.
+	packedCommits := cp.State.PackedCommits
+	if len(cp.State.Commits) > 0 {
+		more, err := dag.PackCheckpointCommits(cp.State.Commits)
+		if err != nil {
+			return nil, err
 		}
-		fields := map[int]codec.Value{
-			1: cpHashVal(cc.Commit.Hash),
-			2: codec.ArrayValue{Elements: parents},
-			3: cpUUIDVal(cc.Commit.TransactionID),
-			4: cpTsVal(cc.Commit.Timestamp),
-			5: cpUUIDVal(cc.Commit.AuthorNodeID),
-			6: cpHashVal(cc.Commit.DocumentTreeHash),
-			8: codec.StringValue{V: cc.Commit.Message},
-			9: codec.Int32Value{V: int32(cc.OperationCount)},
-		}
-		if cc.Commit.SchemaHash != nil {
-			fields[7] = cpHashVal(*cc.Commit.SchemaHash)
-		}
-		commits = append(commits, codec.RecordValue{Fields: fields})
+		packedCommits = append(append([]byte(nil), packedCommits...), more...)
 	}
 
 	branches := make([]codec.Value, 0, len(cp.State.Branches))
@@ -332,7 +325,7 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		1:  codec.Int32Value{V: version},
 		2:  codec.StringValue{V: cp.NamespaceID},
 		3:  codec.Int64Value{V: cp.ThroughSequence},
-		4:  codec.ArrayValue{Elements: commits},
+		4:  codec.ArrayValue{},
 		5:  codec.ArrayValue{Elements: branches},
 		6:  codec.ArrayValue{Elements: tags},
 		7:  codec.ArrayValue{},
@@ -340,6 +333,7 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		9:  codec.ArrayValue{Elements: heads},
 		10: codec.Int64Value{V: cp.FloorSequence},
 		13: codec.BytesValue{V: packedTree},
+		14: codec.BytesValue{V: packedCommits},
 	}}
 	if len(cp.GraphRefs) > 0 {
 		refs := make([]codec.Value, 0, len(cp.GraphRefs))
@@ -455,6 +449,12 @@ func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, erro
 		}
 		out.State.Commits = append(out.State.Commits,
 			dag.CheckpointCommit{Commit: c, OperationCount: int(count.V)})
+	}
+
+	if pc, ok := rec.Fields[14].(codec.BytesValue); ok && version.V >= checkpointPackedFormatVersion {
+		// Kept packed: RestoreCheckpoint decodes one commit at a time, so the list never exists
+		// as structs.
+		out.State.PackedCommits = pc.V
 	}
 
 	branchesArr, _ := rec.Fields[5].(codec.ArrayValue)
