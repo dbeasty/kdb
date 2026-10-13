@@ -1,6 +1,7 @@
 package embed_test
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,6 +51,56 @@ func sidecarFiles(tb testing.TB, root string) []string {
 	tb.Helper()
 	m, _ := filepath.Glob(filepath.Join(coldIndexDir(root), "*"+deltaindex.SidecarSuffix))
 	return m
+}
+
+// Under the objects strategy every logged version has a location record, so cold reads never
+// index the delta log - even when an async writer runs far ahead of the commit log. The engine
+// used to keep at most 256 commits' worth of versions waiting for their log position while the
+// log can lag by twice that, so a fast async writer lost most of its location records and the
+// first cold read built an index of the whole log (225 MB at 1M documents).
+func TestColdReadsResolveByLocationAfterAFastAsyncWriter(t *testing.T) {
+	root := t.TempDir()
+	rt := coldIndexRuntime(t, root, nil)
+	ids, texts := writeLiveSet(t, rt, 3000, 2500) // ~7.5 MB of live bodies against a 4 MiB floor
+	requireAllLive(t, rt, ids, texts, "after writing")
+	rt.Close()
+
+	reopened := coldIndexRuntime(t, root, nil)
+	defer reopened.Close()
+	requireAllLive(t, reopened, ids, texts, "after reopen")
+	eng := serverEngine(t, reopened)
+	if eng.ColdDocumentLoads() == 0 {
+		t.Fatal("nothing was read back from durable storage, so nothing was evicted")
+	}
+	if st := eng.ColdIndexStats(); st.Segments != 0 {
+		t.Fatalf("the cold loader indexed %d delta segments (%d versions): some version had no location record", st.Segments, st.Keys)
+	}
+}
+
+// Replay files location records for the commits it reads back: a commit replayed at open may be
+// one whose position its writer never filed (a crash, or a lost stash), and nothing else would.
+// Simulated here by removing the blob store - and with it every location record - before a full
+// replay.
+func TestReplayFilesLocationRecords(t *testing.T) {
+	root := t.TempDir()
+	noCheckpoints := func(o *embed.FileRuntimeOptions) { o.Storage.DisableCheckpoints = true }
+	rt := coldIndexRuntime(t, root, noCheckpoints)
+	ids, texts := writeLiveSet(t, rt, 2500, 2500)
+	rt.Close()
+	if err := os.RemoveAll(filepath.Join(root, "ns", filepath.FromSlash(boundedNS), "sstable")); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := coldIndexRuntime(t, root, noCheckpoints)
+	defer reopened.Close()
+	requireAllLive(t, reopened, ids, texts, "after a full replay")
+	eng := serverEngine(t, reopened)
+	if eng.ColdDocumentLoads() == 0 {
+		t.Fatal("nothing was read back from durable storage, so nothing was evicted")
+	}
+	if st := eng.ColdIndexStats(); st.Segments != 0 {
+		t.Fatalf("the cold loader indexed %d delta segments: replay did not file location records", st.Segments)
+	}
 }
 
 // Where the cold loader is still the way back - the replay strategy keeps no location records,
