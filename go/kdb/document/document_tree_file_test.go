@@ -443,3 +443,168 @@ func TestTreeFileResidentMemory(t *testing.T) {
 		runtime.KeepAlive(tree)
 	}
 }
+
+type held struct {
+	tree DocumentTree
+	ref  *ptrNode
+}
+
+func rebaseHistory(history []held) {
+	ts := make([]DocumentTree, len(history))
+	for i, h := range history {
+		ts[i] = h.tree
+	}
+	for i, t := range RebaseTrees(ts) {
+		history[i].tree = t
+	}
+}
+
+// TestTreeFileRebasedHistoryReleasesSegments: trees held but never updated - the engine's
+// history - keep every segment they refer into mapped. Rebasing them when a segment lands
+// (SetOnWrite, RebaseTrees) lets the segments compactions superseded go, while each held tree
+// stays exactly what it was - and, the trees' copies being shared, costs no more heap than not
+// rebasing (the control, which keeps the superseded segments mapped instead).
+func TestTreeFileRebasedHistoryReleasesSegments(t *testing.T) {
+	var controlInUse int
+	for _, rebase := range []bool{false, true} {
+		r := rand.New(rand.NewSource(18))
+		f, err := NewTreeFile(TreeFileOptions{Dir: filepath.Join(t.TempDir(), "tree"), ResidentBytes: 8 << 10, MaxSegments: 2})
+		if err != nil {
+			t.Skip(err)
+		}
+		var wrote atomic.Int64
+		f.SetOnWrite(func() { wrote.Add(1) })
+		universe := testIDs(r, 3000)
+		model := randomEntriesFrom(r, universe[:2000])
+		tree, err := OpenTreePacked(packedOf(model), f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref := ptrBuild(model)
+		var history []held
+		seen := int64(0)
+		for step := 0; step < 15000; step++ {
+			id := universe[r.Intn(len(universe))]
+			var h codec.Hash
+			r.Read(h.Bytes[:])
+			if tree, err = tree.With(id, h); err != nil {
+				t.Fatal(err)
+			}
+			ref = ptrInsert(ref, id, h)
+			if step%100 == 0 {
+				history = append(history, held{tree, ref})
+				if len(history) > 80 {
+					// Copied, not resliced: a resliced history keeps the dropped tree alive in
+					// its backing array, pinning what it refers to.
+					history = append([]held(nil), history[1:]...)
+				}
+			}
+			if rebase && wrote.Load() != seen {
+				seen = wrote.Load()
+				rebaseHistory(history)
+			}
+		}
+		waitRewrites(tree)
+		if rebase { // as the engine's hook does: its live tree, and everything it holds
+			tree = tree.Rebased()
+			rebaseHistory(history)
+		}
+		s := tree.trie.slab
+		// Superseded segments go once the old trees' cleanups have run: wait for the count to settle.
+		for deadline, last, stable := time.Now().Add(5*time.Second), -1, 0; time.Now().Before(deadline) && stable < 20; {
+			runtime.GC()
+			time.Sleep(5 * time.Millisecond)
+			s.mu.Lock()
+			s.drain(-1)
+			n := len(*s.segs.p.Load())
+			s.mu.Unlock()
+			if n == last {
+				stable++
+			} else {
+				last, stable = n, 0
+			}
+		}
+		mapped := len(*s.segs.p.Load())
+		{
+			seen := map[tref]bool{}
+			reachable(tree.trie, seen)
+			for _, h := range history {
+				reachable(h.tree.trie, seen)
+			}
+			resident := 0
+			for r := range seen {
+				if r&refFile == 0 {
+					resident++
+				}
+			}
+			st := s.stats()
+			t.Logf("  resident in use %d, reachable from held trees %d, pending %d", st.Nodes+st.Leaves, resident, st.Pending)
+			if st.Nodes+st.Leaves != resident {
+				t.Fatalf("%d records in use, %d reachable", st.Nodes+st.Leaves, resident)
+			}
+			if !rebase {
+				controlInUse = resident
+			} else if resident > controlInUse*12/10 {
+				t.Fatalf("rebasing the history holds %d heap records, against %d without", resident, controlInUse)
+			}
+		}
+
+		t.Logf("rebase=%v: %d writes, %d segments mapped, %d files, %d history trees held", rebase, wrote.Load(), mapped, len(segmentFiles(t, f)), len(history))
+		for _, h := range history {
+			if !slabMatchesPtr(h.tree.trie, h.ref) || h.tree.TreeHash != ptrTreeHash(h.ref) {
+				t.Fatal("a held tree changed")
+			}
+		}
+		if rebase && mapped > f.opts.MaxSegments+1 {
+			t.Fatalf("%d segments mapped with history rebased; the newest chain is at most %d", mapped, f.opts.MaxSegments)
+		}
+
+		runtime.KeepAlive(tree)
+	}
+}
+
+// TestTreeFileStampSkipsFullChecksum: reopening a checkpoint whose segments still carry the
+// stamps its sidecar recorded maps them without reading them through for their checksum; a
+// segment whose stamp changed is checksummed in full. The tree is the same either way.
+func TestTreeFileStampSkipsFullChecksum(t *testing.T) {
+	r := rand.New(rand.NewSource(19))
+	f := newTestTreeFile(t, 1<<20)
+	universe := testIDs(r, 20000)
+	model := randomEntriesFrom(r, universe)
+	packed := packedOf(model)
+	if _, err := OpenTreePacked(packed, f); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	reopen := func() DocumentTree {
+		f2, err := NewTreeFile(f.opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := OpenTreePacked(packed, f2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, mapped := tree.Paged(); !mapped {
+			t.Fatal("reopen did not map the segment")
+		}
+		checkTreeAgainst(t, tree, ptrBuild(model), model, universe[:200], r)
+		f2.Close()
+		return tree
+	}
+	before := treeFullVerifies.Load()
+	reopen()
+	if n := treeFullVerifies.Load() - before; n != 0 {
+		t.Fatalf("a reopen with matching stamps checksummed %d segments in full", n)
+	}
+	seqs := segmentFiles(t, f)
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(f.segPath(seqs[len(seqs)-1]), later, later); err != nil {
+		t.Fatal(err)
+	}
+	before = treeFullVerifies.Load()
+	reopen()
+	if n := treeFullVerifies.Load() - before; n != 1 {
+		t.Fatalf("a segment whose stamp changed was checksummed %d times, want 1", n)
+	}
+}

@@ -124,7 +124,18 @@ func (p peerNamespaceProvider) Env(ns string, create bool) (peersync.IngestEnv, 
 // PeerSyncNode returns the peersync.LocalNode that feeds this runtime.
 func (s *KdbServerRuntime) PeerSyncNode() peersync.LocalNode { return serverLocalNode{rt: s} }
 
-func (n serverLocalNode) Exclusive(fn func() error) error {
+func (n serverLocalNode) Exclusive(fn func() error) error { return n.exclusive(fn, false) }
+
+// ExclusiveBootstrap is Exclusive for a peer snapshot installing into this namespace: for as long
+// as it holds the gate, every writer is refused at once with a BUSY saying so - the namespace is
+// empty until the install finishes, and a 1M-document install holds the gate for over a minute,
+// which every queued writer would otherwise spend waiting out its deadline.
+func (n serverLocalNode) ExclusiveBootstrap(fn func() error) error { return n.exclusive(fn, true) }
+
+// bootstrapRetryAfterMs is the retry hint a writer refused during a snapshot install gets.
+const bootstrapRetryAfterMs = 1000
+
+func (n serverLocalNode) exclusive(fn func() error, bootstrap bool) error {
 	rt := n.rt
 	if rt.draining.Load() {
 		return &UnavailableError{Reason: "server is shutting down"}
@@ -149,6 +160,11 @@ func (n serverLocalNode) Exclusive(fn func() error) error {
 		return err
 	}
 	defer release()
+	if bootstrap {
+		rt.writeGate.beginLongHold(&BusyError{RetryAfterMs: bootstrapRetryAfterMs,
+			Reason: fmt.Sprintf("namespace %s is being bootstrapped from a peer snapshot", rt.Runtime.DefaultNamespace)})
+		defer rt.writeGate.endLongHold()
+	}
 	return fn()
 }
 

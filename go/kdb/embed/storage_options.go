@@ -154,6 +154,9 @@ type StorageOptions struct {
 	// (document.DefaultTreeResidentBytes when not positive). Off by default.
 	TreeFile          bool
 	TreeResidentBytes int64
+	// TreeMaxSegments is the longest chain of tree segments before a compaction
+	// (document.DefaultTreeMaxSegments when not positive). For tests; there is no setting for it.
+	TreeMaxSegments int
 
 	// SyncMode selects the physical sync primitive every flush uses. The zero
 	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous

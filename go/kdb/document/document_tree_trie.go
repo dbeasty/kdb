@@ -135,8 +135,12 @@ func uuidAfter(a, b codec.UUID) bool {
 // the references they add. Records refer to each other by refLocal|index until placed.
 type trieEdit struct {
 	v    trieView
-	n    int
-	recs []editRec // grows only for a rebase (translate); an update needs at most 2*trieDepth+4
+	keep map[uint64]bool // translate: the segments a rebased tree may refer into
+	// Shared across the trees of one rebase (rebaseTrees), so a record several of them reach is
+	// translated, copied and placed once and then shared, as it was before.
+	memo, placed map[tref]tref
+	n            int
+	recs         []editRec // grows only for a rebase (translate); an update needs at most 2*trieDepth+4
 }
 
 type editRec struct {
@@ -158,7 +162,7 @@ func getEdit(v trieView) *trieEdit {
 }
 
 func putEdit(e *trieEdit) {
-	e.v = trieView{}
+	e.v, e.keep, e.memo, e.placed = trieView{}, nil, nil, nil
 	if len(e.recs) > 1024 { // a large rebase: do not keep its buffer
 		e.recs = nil
 	}
@@ -332,10 +336,16 @@ func (s *trieSlab) place(e *trieEdit, r tref) tref {
 	if r&refLocal == 0 {
 		return r
 	}
+	if p, ok := e.placed[r]; ok {
+		return p
+	}
 	rec := e.local(r)
 	if rec.leaf {
 		i := s.allocLeaf()
 		*s.leaves.at(i) = leafRec{hash: rec.hash, id: rec.id, content: rec.content}
+		if e.placed != nil {
+			e.placed[r] = refLeaf | tref(i)
+		}
 		return refLeaf | tref(i)
 	}
 	var children [16]tref
@@ -348,6 +358,9 @@ func (s *trieSlab) place(e *trieEdit, r tref) tref {
 	}
 	i := s.allocNode()
 	*s.nodes.at(i) = nodeRec{hash: rec.hash, child: children}
+	if e.placed != nil {
+		e.placed[r] = tref(i)
+	}
 	return tref(i)
 }
 

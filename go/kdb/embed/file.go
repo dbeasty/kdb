@@ -181,6 +181,7 @@ func (h *Host) openNamespace(
 		tf, err := document.NewTreeFile(document.TreeFileOptions{
 			Dir:           treeDirPath(dataRoot, namespaceID),
 			ResidentBytes: opts.Storage.TreeResidentBytes,
+			MaxSegments:   opts.Storage.TreeMaxSegments,
 			ReadOnly:      opts.ReadOnly,
 		})
 		if err != nil {
