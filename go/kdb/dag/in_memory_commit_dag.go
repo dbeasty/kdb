@@ -148,6 +148,9 @@ type InMemoryCommitDag struct {
 	// generation(parent) < generation(child) and must be rebuilt before
 	// anything prunes with them. See storeCommitLocked.
 	genStale bool
+	// mergeBaseSteps counts the commits the merge-base walks have stepped through (see
+	// MergeBaseSteps). Only those walks touch it, and they hold mu exclusively.
+	mergeBaseSteps uint64
 	// graphDir is where the commit graph's segments live (see graph_attach.go); the mappings
 	// themselves are nodes' segment tier. graphRebuild serializes segment writes, which run
 	// without holding mu.
