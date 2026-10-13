@@ -127,6 +127,9 @@ internal data class HandshakeDto(
     val preferredEncodings: List<String>,
     val clientMode: String,
     val protocolVersion: Int,
+    // Optional frame encodings the sender reads and writes (BinaryWireBody.kt). Null - and so
+    // left out of the JSON, since encodeDefaults is off - when none are offered.
+    val wireFeatures: List<String>? = null,
 )
 
 @Serializable
@@ -136,6 +139,7 @@ internal data class HandshakeAckDto(
     val protocolVersion: Int,
     val remoteHeads: Map<String, String>,
     val rejectionReason: String? = null,
+    val wireFeatures: List<String>? = null,
 )
 
 @Serializable

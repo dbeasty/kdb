@@ -28,6 +28,15 @@ internal class WireRpcClient(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val sendLock = Mutex()
 
+    /** Encodes requests; replaced by [useCodec] once the handshake agrees wire features. Replies
+     * are decoded by [wire] whatever was agreed, since decoding goes by each frame's tag. */
+    @Volatile
+    private var encoder: WireCodec = wire
+
+    fun useCodec(codec: WireCodec) {
+        encoder = codec
+    }
+
     init {
         scope.launch {
             connection.incoming().collect { frame ->
@@ -40,7 +49,7 @@ internal class WireRpcClient(
     suspend fun request(message: WireMessage): WireMessage {
         val id = correlation.getAndIncrement()
         val framed =
-            wire.encode(
+            encoder.encode(
                 withCorrelation(message, id),
             )
         val deferred = CompletableDeferred<WireMessage>()

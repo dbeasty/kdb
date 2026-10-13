@@ -46,6 +46,8 @@ import dev.kdb.wire.WireCodec
 import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
+import dev.kdb.wire.negotiateWireFeatures
+import dev.kdb.wire.withWireFeatures
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonPrimitive
@@ -67,6 +69,12 @@ public class SqlWireHost(
     private val sessions = SessionManager(server)
     private val sqlAuth = SqlAuthSupport(auth, connectionContext)
     private var correlation = 1
+
+    /** The codec replies are encoded with: [wire], until a handshake agrees wire features (binary
+     * frames), then [wire] with those features. Requests are decoded by [wire] either way, since
+     * decoding goes by each frame's own encoding tag. */
+    @Volatile
+    private var replyWire: WireCodec = wire
 
     /** Test-only seam (Component 74 §12): invoked with the session id at the start of every SqlExec,
      * inside the per-session lock, so a test can hold one session's statement open and prove that
@@ -107,7 +115,7 @@ public class SqlWireHost(
             } else {
                 dispatch(message)
             }
-        return reply?.let { wire.encode(it) }
+        return reply?.let { replyWire.encode(it) }
     }
 
     private fun sessionIdOf(message: WireMessage): String? =
@@ -263,7 +271,11 @@ public class SqlWireHost(
             return handshakeAck(msg, accepted = false, head, sqlAuth.authFailureMessage(e))
         }
         sessions.begin(ns, ReadConsistency.READ_COMMITTED, principal = principal)
-        return handshakeAck(msg, accepted = true, head, rejectionReason = null)
+        // Wire features are agreed only on an accepted handshake. The ack is a JSON frame either
+        // way (a handshake has no binary form), so the client reads it before switching anything.
+        val features = negotiateWireFeatures(msg.request.wireFeatures)
+        if (features.isNotEmpty()) replyWire = wire.withWireFeatures(features)
+        return handshakeAck(msg, accepted = true, head, rejectionReason = null, wireFeatures = features)
     }
 
     private fun handshakeAck(
@@ -271,6 +283,7 @@ public class SqlWireHost(
         accepted: Boolean,
         headHex: String,
         rejectionReason: String?,
+        wireFeatures: List<String> = emptyList(),
     ): WireMessage.HandshakeAck =
         WireMessage.HandshakeAck(
             header(msg.header.correlationId, WireMessageType.HANDSHAKE),
@@ -280,6 +293,7 @@ public class SqlWireHost(
                 protocolVersion = KDB_WIRE_PROTOCOL_VERSION,
                 remoteHeads = mapOf(defaultNamespace to headHex),
                 rejectionReason = rejectionReason,
+                wireFeatures = wireFeatures,
             ),
         )
 
