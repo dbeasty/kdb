@@ -3,8 +3,11 @@ package document
 import (
 	"bytes"
 	"crypto/sha256"
-	"sort"
+	"encoding/binary"
+	"runtime"
+	"slices"
 	"sync"
+	"unsafe"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
@@ -29,46 +32,25 @@ import (
 // trieBuild from a flat map (used for wire-decoded trees, which don't
 // carry a trie to build on) stays O(n).
 //
-// DocumentTree.Entries (the flat map[codec.UUID]codec.Hash) is untouched by this -
-// it's still eagerly copied per commit, which Phase 3's own benchmarking
-// showed costs ~81us at 2000 entries and isn't the bottleneck. Only
-// TreeHash's computation changes.
+// The nodes live in a pointer-free slab (document_tree_slab.go), which also explains how
+// structure sharing and reclamation work there. The pointer trie that preceded it is kept, as
+// the reference the tests hold this one to, in document_tree_trie_ref_test.go.
+//
+// Leaf compression. A leaf stands for the whole subtree beneath its position when that subtree
+// holds exactly one entry, at whatever depth that becomes true, rather than only at trieDepth.
+// Without it every entry owned a private spine of 32 internal nodes, which measured at ~4,900
+// bytes of live heap per document regardless of the document's size (see
+// docs/benchmarks/2026-09-08-base-tree-pinning.md).
+//
+// The hash is unaffected, and deliberately so. A subtree containing one entry has a determined
+// hash - fold leafHash up through the single-child internal nodes it would have had - so a
+// compressed leaf carries exactly the hash its 32-node spine would have produced. Every tree hash
+// this package has ever emitted is therefore unchanged: the Kotlin implementation, the golden
+// vectors, and every stored tree object stay valid.
 
 const trieDepth = 32 // 128-bit codec.UUID, 4 bits (one hex nibble) per level
 
 var trieZero [32]byte // all-zero sentinel for an absent child/subtree
-
-// A trieNode is either a leaf or an internal node (or neither, for a nil
-// *trieNode representing an empty subtree - callers use nil directly rather
-// than allocating a trieNode for that case).
-//
-// A leaf stands for the whole subtree beneath its position when that subtree
-// holds exactly one entry, at whatever depth that becomes true, rather than
-// only at trieDepth. This is the one thing keeping a namespace's memory
-// sane: without it every entry owned a private spine of 32 internal nodes,
-// each carrying a 16-pointer array, which measured at ~4,900 bytes of live
-// heap per document *regardless of the document's size* - a 200,000-document
-// namespace held a 932MB tree for documents of about 20 bytes each. See
-// docs/benchmarks/2026-09-08-base-tree-pinning.md.
-//
-// The hash is unaffected, and deliberately so. A subtree containing one entry
-// has a determined hash - fold leafHash up through the single-child internal
-// nodes it would have had - so a compressed leaf can carry exactly the hash
-// its 32-node spine would have produced. Every tree hash this package has
-// ever emitted is therefore unchanged, which is what lets this be an internal
-// representation change rather than an on-disk format break: the Kotlin
-// implementation, the golden vectors, and every stored tree object stay valid
-// without touching any of them.
-type trieNode struct {
-	hash     [32]byte
-	leaf     *trieLeaf
-	children *[16]*trieNode
-}
-
-type trieLeaf struct {
-	uuid codec.UUID
-	hash codec.Hash
-}
 
 func nibbleAt(uuidBytes []byte, depth int) int {
 	b := uuidBytes[depth/2]
@@ -76,6 +58,25 @@ func nibbleAt(uuidBytes []byte, depth int) int {
 		return int(b >> 4)
 	}
 	return int(b & 0x0f)
+}
+
+func keyNibble(k *[16]byte, depth int) int {
+	b := k[depth>>1]
+	if depth&1 == 0 {
+		return int(b >> 4)
+	}
+	return int(b & 0x0f)
+}
+
+// uuidKey is id's bytes, big-endian: the trie's key, and the order ids sort in.
+func uuidKey(id codec.UUID) (k [16]byte) {
+	binary.BigEndian.PutUint64(k[:8], uint64(id.MSB))
+	binary.BigEndian.PutUint64(k[8:], uint64(id.LSB))
+	return k
+}
+
+func keyUUID(k *[16]byte) codec.UUID {
+	return codec.UUID{MSB: int64(binary.BigEndian.Uint64(k[:8])), LSB: int64(binary.BigEndian.Uint64(k[8:]))}
 }
 
 // Both hashers build their preimage in a fixed-size array rather than a
@@ -92,22 +93,7 @@ func leafHash(uuidBytes []byte, contentHash codec.Hash) [32]byte {
 	return sha256.Sum256(buf[:])
 }
 
-func internalHash(children *[16]*trieNode) [32]byte {
-	var buf [1 + 16*32]byte
-	buf[0] = 0x01
-	off := 1
-	for _, c := range children {
-		if c == nil {
-			copy(buf[off:], trieZero[:])
-		} else {
-			copy(buf[off:], c.hash[:])
-		}
-		off += 32
-	}
-	return sha256.Sum256(buf[:])
-}
-
-// internalHashOfOnlyChild is internalHash for the case that matters to
+// internalHashOfOnlyChild is the internal-node hash for the case that matters to
 // compression: an internal node with one occupied slot. The preimage buffer
 // starts zeroed and trieZero is all-zero, so the absent siblings need no
 // writing at all.
@@ -123,287 +109,12 @@ func internalHashOfOnlyChild(nib int, childHash [32]byte) [32]byte {
 // real nodes, evaluated instead. At depth 0 this is 32 rounds on top of the
 // leaf, which is precisely what the uncompressed trie computed for a
 // single-entry tree.
-//
-// Costs the same SHA-256 work the old insert did on its way back up, so
-// compression trades no CPU for the memory it saves; what it removes is the
-// allocation of the nodes, not the hashing of them.
 func foldLeaf(uuidBytes []byte, contentHash codec.Hash, depth int) [32]byte {
 	h := leafHash(uuidBytes, contentHash)
 	for d := trieDepth - 1; d >= depth; d-- {
 		h = internalHashOfOnlyChild(nibbleAt(uuidBytes, d), h)
 	}
 	return h
-}
-
-// newLeafNode builds the compressed leaf standing for one entry at depth.
-func newLeafNode(uuidBytes []byte, id codec.UUID, contentHash codec.Hash, depth int) *trieNode {
-	return &trieNode{
-		hash: foldLeaf(uuidBytes, contentHash, depth),
-		leaf: &trieLeaf{uuid: id, hash: contentHash},
-	}
-}
-
-func nodeHash(n *trieNode) [32]byte {
-	if n == nil {
-		return trieZero
-	}
-	return n.hash
-}
-
-// trieInsert returns a new root with (id, contentHash) set, sharing every
-// subtree not on id's path with the original. O(trieDepth) = O(1).
-func trieInsert(root *trieNode, id codec.UUID, contentHash codec.Hash) *trieNode {
-	uuidBytes := id.Bytes()
-	return trieInsertAt(root, uuidBytes, id, contentHash, 0)
-}
-
-func trieInsertAt(node *trieNode, uuidBytes []byte, id codec.UUID, contentHash codec.Hash, depth int) *trieNode {
-	// An empty subtree becomes one leaf covering everything below here - the
-	// common case, and the whole saving.
-	if node == nil {
-		return newLeafNode(uuidBytes, id, contentHash, depth)
-	}
-	if node.leaf != nil {
-		if node.leaf.uuid == id {
-			return newLeafNode(uuidBytes, id, contentHash, depth)
-		}
-		return splitLeafAt(node.leaf, uuidBytes, id, contentHash, depth)
-	}
-	if depth == trieDepth {
-		return newLeafNode(uuidBytes, id, contentHash, depth)
-	}
-	var children [16]*trieNode
-	if node.children != nil {
-		children = *node.children
-	}
-	nib := nibbleAt(uuidBytes, depth)
-	children[nib] = trieInsertAt(children[nib], uuidBytes, id, contentHash, depth+1)
-	return &trieNode{hash: internalHash(&children), children: &children}
-}
-
-// splitLeafAt makes room beneath a compressed leaf for a second entry. Only
-// the levels the two keys genuinely share get real nodes, so what this
-// allocates is set by where the keys diverge rather than by trieDepth - for
-// random UUIDs, a handful of levels at n documents rather than 32 at any n.
-func splitLeafAt(existing *trieLeaf, uuidBytes []byte, id codec.UUID, contentHash codec.Hash, depth int) *trieNode {
-	existingBytes := existing.uuid.Bytes()
-	d := depth
-	for d < trieDepth && nibbleAt(existingBytes, d) == nibbleAt(uuidBytes, d) {
-		d++
-	}
-	if d == trieDepth {
-		// Identical in all 128 bits but unequal as UUIDs is not reachable; treat
-		// it as a replace rather than building a node that could never be read.
-		return newLeafNode(uuidBytes, id, contentHash, depth)
-	}
-	// The level they part on holds both, each compressed again beneath it.
-	var children [16]*trieNode
-	children[nibbleAt(existingBytes, d)] = newLeafNode(existingBytes, existing.uuid, existing.hash, d+1)
-	children[nibbleAt(uuidBytes, d)] = newLeafNode(uuidBytes, id, contentHash, d+1)
-	node := &trieNode{hash: internalHash(&children), children: &children}
-	// Levels depth..d-1 are shared by both keys, so they stay ordinary
-	// single-child internal nodes: more than one entry now lives below them,
-	// and a single entry is the only thing a compressed leaf may stand for.
-	for k := d - 1; k >= depth; k-- {
-		var c [16]*trieNode
-		c[nibbleAt(uuidBytes, k)] = node
-		node = &trieNode{hash: internalHash(&c), children: &c}
-	}
-	return node
-}
-
-// trieDelete returns a new root with id removed (no-op if absent),
-// sharing every subtree not on id's path with the original.
-func trieDelete(root *trieNode, id codec.UUID) *trieNode {
-	return trieDeleteAt(root, id.Bytes(), id, 0)
-}
-
-func trieDeleteAt(node *trieNode, uuidBytes []byte, id codec.UUID, depth int) *trieNode {
-	if node == nil {
-		return nil
-	}
-	if node.leaf != nil {
-		if node.leaf.uuid == id {
-			return nil
-		}
-		return node // a different entry lives here; the key is absent
-	}
-	if node.children == nil || depth == trieDepth {
-		return node
-	}
-	children := *node.children
-	nib := nibbleAt(uuidBytes, depth)
-	children[nib] = trieDeleteAt(children[nib], uuidBytes, id, depth+1)
-	var only *trieNode
-	remaining := 0
-	for _, c := range children {
-		if c != nil {
-			remaining++
-			only = c
-		}
-	}
-	if remaining == 0 {
-		return nil
-	}
-	// Re-compress on the way back up. One leaf left below means one entry left
-	// below, which is exactly what a compressed leaf stands for. Skipping this
-	// would let the spines compression removed grow back one deletion at a
-	// time, in a namespace that deletes and reinserts steadily.
-	if remaining == 1 && only.leaf != nil {
-		return newLeafNode(only.leaf.uuid.Bytes(), only.leaf.uuid, only.leaf.hash, depth)
-	}
-	return &trieNode{hash: internalHash(&children), children: &children}
-}
-
-// trieBuild constructs a trie from scratch (O(n)); used when a
-// DocumentTree has no trie to incrementally build on (e.g. decoded from
-// the wire), or as the ground-truth path exercised by parity tests.
-// trieBuild builds the trie for a whole set of entries at once: sorted by key, each node built
-// exactly once and hashed exactly once, and the sixteen top-level subtrees built on separate cores.
-//
-// It used to insert the entries one at a time, each insert copying and re-hashing the path it
-// touched - and opening a namespace builds its live tree this way, so at a million documents
-// that was 7.8 s of a 13 s open. The result is the same trie, node for node, and so the same
-// hash: trieBulkMatchesInsert pins that.
-func trieBuild(entries map[codec.UUID]codec.Hash) *trieNode {
-	if len(entries) == 0 {
-		return nil
-	}
-	items := make([]trieItem, 0, len(entries))
-	for id, h := range entries {
-		items = append(items, trieItem{key: id.Bytes(), id: id, hash: h})
-	}
-	sort.Slice(items, func(a, b int) bool { return bytes.Compare(items[a].key, items[b].key) < 0 })
-	// Fanning out pays only when there is enough work to split.
-	return trieBuildRange(items, 0, len(items) >= 4096)
-}
-
-type trieItem struct {
-	key  []byte
-	id   codec.UUID
-	hash codec.Hash
-}
-
-// trieBuildRange builds the subtree at depth holding items, which are sorted and all share the
-// key's first depth nibbles. Mirrors what inserting them would produce: one item is a leaf that
-// stands for the whole subtree (newLeafNode); more than one is an internal node whose children
-// are the runs of items sharing the next nibble - a run of all of them included, which is the
-// single-child chain splitLeafAt builds.
-func trieBuildRange(items []trieItem, depth int, parallel bool) *trieNode {
-	if len(items) == 1 || depth == trieDepth {
-		it := items[len(items)-1] // at full depth equal keys collide; the last write wins, as with inserts
-		return newLeafNode(it.key, it.id, it.hash, depth)
-	}
-	var children [16]*trieNode
-	var runs [16][]trieItem
-	start := 0
-	for i := 1; i <= len(items); i++ {
-		if i == len(items) || nibbleAt(items[i].key, depth) != nibbleAt(items[start].key, depth) {
-			runs[nibbleAt(items[start].key, depth)] = items[start:i]
-			start = i
-		}
-	}
-	if parallel {
-		var wg sync.WaitGroup
-		for nib := range runs {
-			if len(runs[nib]) == 0 {
-				continue
-			}
-			wg.Add(1)
-			go func(nib int) {
-				defer wg.Done()
-				children[nib] = trieBuildRange(runs[nib], depth+1, false)
-			}(nib)
-		}
-		wg.Wait()
-	} else {
-		for nib := range runs {
-			if len(runs[nib]) > 0 {
-				children[nib] = trieBuildRange(runs[nib], depth+1, false)
-			}
-		}
-	}
-	return &trieNode{hash: internalHash(&children), children: &children}
-}
-
-// trieGet looks up id's content hash. O(trieDepth) = O(1) - the read counterpart to
-// trieInsert/trieDelete, letting DocumentTree.Contains/HashFor avoid needing a full flat map.
-func trieGet(root *trieNode, id codec.UUID) (codec.Hash, bool) {
-	if root == nil {
-		return codec.Hash{}, false
-	}
-	uuidBytes := id.Bytes()
-	n := root
-	for depth := 0; depth < trieDepth; depth++ {
-		if n == nil {
-			return codec.Hash{}, false
-		}
-		if n.leaf != nil {
-			if n.leaf.uuid == id {
-				return n.leaf.hash, true
-			}
-			return codec.Hash{}, false
-		}
-		if n.children == nil {
-			return codec.Hash{}, false
-		}
-		n = n.children[nibbleAt(uuidBytes, depth)]
-	}
-	if n != nil && n.leaf != nil && n.leaf.uuid == id {
-		return n.leaf.hash, true
-	}
-	return codec.Hash{}, false
-}
-
-// trieEntries materializes every (id, hash) pair into a flat map - O(n), used only where a full
-// map is genuinely needed (wire/storage serialization, DAG diff, full scans), never on the
-// per-write With/Without hot path.
-func trieEntries(root *trieNode) map[codec.UUID]codec.Hash {
-	out := make(map[codec.UUID]codec.Hash)
-	trieWalk(root, func(id codec.UUID, h codec.Hash) { out[id] = h })
-	return out
-}
-
-func trieWalk(n *trieNode, visit func(codec.UUID, codec.Hash)) {
-	trieWalkUntil(n, func(id codec.UUID, h codec.Hash) bool {
-		visit(id, h)
-		return true
-	})
-}
-
-// trieWalkUntil visits leaves until visit returns false; reports whether the walk ran to
-// completion. The early-stop variant exists for streaming scans (DocumentTree.Walk): a scan
-// that has already collected everything it can return, or exhausted its row budget, stops
-// walking instead of visiting the rest of the namespace to ignore it.
-func trieWalkUntil(n *trieNode, visit func(codec.UUID, codec.Hash) bool) bool {
-	if n == nil {
-		return true
-	}
-	if n.leaf != nil {
-		return visit(n.leaf.uuid, n.leaf.hash)
-	}
-	if n.children == nil {
-		return true
-	}
-	for _, c := range n.children {
-		if !trieWalkUntil(c, visit) {
-			return false
-		}
-	}
-	return true
-}
-
-// trieCount returns the number of leaves reachable from root - O(n), used only to back
-// DocumentTree.Size when no cheaper count is already tracked (e.g. a tree built from a flat map
-// via BuildDocumentTree, which already knows len(entries) directly).
-func trieCount(root *trieNode) int {
-	n := 0
-	trieWalk(root, func(codec.UUID, codec.Hash) { n++ })
-	return n
-}
-
-func trieTreeHash(root *trieNode) codec.Hash {
-	return codec.Hash{Bytes: nodeHash(root)}
 }
 
 // uuidAfter reports whether a sorts after b in the trie's order: unsigned big-endian bytes, which
@@ -415,61 +126,569 @@ func uuidAfter(a, b codec.UUID) bool {
 	return uint64(a.LSB) > uint64(b.LSB)
 }
 
-// trieWalkAfter visits, in ascending id order, the leaves under n whose id sorts after the one
-// whose bytes are key, until visit returns false; reports whether the walk ran to completion.
-//
-// It descends only along key's path: every child before key's nibble holds ids at or below key
-// and is skipped without being entered, every child after it is walked whole. So reaching the
-// first id after key costs O(trieDepth) nodes, not a walk of everything before it - what lets a
-// caller page through a tree by "the ids after the last one I saw" at the cost of the page.
-// visited, when non-nil, counts the nodes entered (for tests asserting that cost).
-func trieWalkAfter(n *trieNode, key []byte, after codec.UUID, depth int, visit func(codec.UUID, codec.Hash) bool, visited *int) bool {
-	if n == nil {
+// --- Updates ---------------------------------------------------------------------------------
+
+// trieEdit assembles the records one update creates before any of them is in the slab. The
+// hashing - up to 33 SHA-256 rounds for a new leaf, one per new internal node - is most of an
+// update's cost and needs no lock, because it only reads records of the tree being updated,
+// which the caller holds. place then takes the slab lock just to copy the records in and count
+// the references they add. Records refer to each other by refLocal|index until placed.
+type trieEdit struct {
+	v    trieView
+	n    int
+	recs [2*trieDepth + 4]editRec
+}
+
+type editRec struct {
+	hash    [32]byte
+	child   [16]tref
+	id      [16]byte
+	content codec.Hash
+	leaf    bool
+}
+
+func (e *trieEdit) local(r tref) *editRec { return &e.recs[r&refIndexMask] }
+
+func (e *trieEdit) isLeaf(r tref) bool {
+	if r&refLocal != 0 {
+		return e.local(r).leaf
+	}
+	return r&refLeaf != 0
+}
+
+func (e *trieEdit) hash(r tref) *[32]byte {
+	if r&refLocal != 0 {
+		return &e.local(r).hash
+	}
+	return e.v.hash(r)
+}
+
+func (e *trieEdit) leafEntry(r tref) ([16]byte, codec.Hash) {
+	if r&refLocal != 0 {
+		l := e.local(r)
+		return l.id, l.content
+	}
+	l := e.v.leaf(r)
+	return l.id, l.content
+}
+
+func (e *trieEdit) children(r tref) [16]tref {
+	if r&refLocal != 0 {
+		return e.local(r).child
+	}
+	return e.v.node(r).child
+}
+
+func (e *trieEdit) next() (tref, *editRec) {
+	if e.n == len(e.recs) {
+		panic("document: trie edit overflow")
+	}
+	r := refLocal | tref(e.n)
+	e.n++
+	return r, &e.recs[r&refIndexMask]
+}
+
+func (e *trieEdit) newLeaf(key *[16]byte, content codec.Hash, depth int) tref {
+	r, rec := e.next()
+	*rec = editRec{hash: foldLeaf(key[:], content, depth), id: *key, content: content, leaf: true}
+	return r
+}
+
+func (e *trieEdit) newNode(children *[16]tref) tref {
+	var buf [1 + 16*32]byte
+	buf[0] = 0x01
+	for i, c := range children {
+		if c != 0 {
+			copy(buf[1+i*32:], e.hash(c)[:])
+		}
+	}
+	r, rec := e.next()
+	*rec = editRec{hash: sha256.Sum256(buf[:]), child: *children}
+	return r
+}
+
+// insert returns the subtree r at depth with (key, content) set, sharing every subtree off
+// key's path. Returns r itself when the entry is already there with that content.
+func (e *trieEdit) insert(r tref, key *[16]byte, content codec.Hash, depth int) tref {
+	// An empty subtree becomes one leaf covering everything below here - the common case.
+	if r == 0 {
+		return e.newLeaf(key, content, depth)
+	}
+	if e.isLeaf(r) {
+		id, c := e.leafEntry(r)
+		if id == *key {
+			if c == content {
+				return r
+			}
+			return e.newLeaf(key, content, depth)
+		}
+		return e.split(r, key, content, depth)
+	}
+	if depth == trieDepth {
+		return e.newLeaf(key, content, depth)
+	}
+	children := e.children(r)
+	nib := keyNibble(key, depth)
+	nc := e.insert(children[nib], key, content, depth+1)
+	if nc == children[nib] {
+		return r
+	}
+	children[nib] = nc
+	return e.newNode(&children)
+}
+
+// split makes room beneath the compressed leaf r for a second entry. Only the levels the two
+// keys genuinely share get real nodes, so what this creates is set by where the keys diverge -
+// for random UUIDs, a handful of levels at n documents rather than 32 at any n.
+func (e *trieEdit) split(r tref, key *[16]byte, content codec.Hash, depth int) tref {
+	exID, exContent := e.leafEntry(r)
+	d := depth
+	for d < trieDepth && keyNibble(&exID, d) == keyNibble(key, d) {
+		d++
+	}
+	if d == trieDepth {
+		// Identical in all 128 bits but unequal as UUIDs is not reachable; treat it as a replace.
+		return e.newLeaf(key, content, depth)
+	}
+	// The level they part on holds both, each compressed again beneath it.
+	var children [16]tref
+	children[keyNibble(&exID, d)] = e.newLeaf(&exID, exContent, d+1)
+	children[keyNibble(key, d)] = e.newLeaf(key, content, d+1)
+	node := e.newNode(&children)
+	// Levels depth..d-1 are shared by both keys, so they stay ordinary single-child internal
+	// nodes: more than one entry now lives below them.
+	for k := d - 1; k >= depth; k-- {
+		var c [16]tref
+		c[keyNibble(key, k)] = node
+		node = e.newNode(&c)
+	}
+	return node
+}
+
+// delete returns the subtree r at depth without key; r itself when key is absent.
+func (e *trieEdit) delete(r tref, key *[16]byte, depth int) tref {
+	if r == 0 {
+		return 0
+	}
+	if e.isLeaf(r) {
+		if id, _ := e.leafEntry(r); id == *key {
+			return 0
+		}
+		return r // a different entry lives here; the key is absent
+	}
+	if depth == trieDepth {
+		return r
+	}
+	children := e.children(r)
+	nib := keyNibble(key, depth)
+	nc := e.delete(children[nib], key, depth+1)
+	if nc == children[nib] {
+		return r
+	}
+	children[nib] = nc
+	var only tref
+	remaining := 0
+	for _, c := range children {
+		if c != 0 {
+			remaining++
+			only = c
+		}
+	}
+	if remaining == 0 {
+		return 0
+	}
+	// Re-compress on the way back up. One leaf left below means one entry left below, which is
+	// exactly what a compressed leaf stands for. Skipping this would let the spines compression
+	// removed grow back one deletion at a time.
+	if remaining == 1 && e.isLeaf(only) {
+		id, c := e.leafEntry(only)
+		return e.newLeaf(&id, c, depth)
+	}
+	return e.newNode(&children)
+}
+
+// place copies the edit's records reachable from r into the slab and returns r's slab
+// reference, counting each child reference the placed records hold. Records the edit made and
+// then dropped (a leaf re-compressed one level up) are never placed. Under s.mu.
+func (s *trieSlab) place(e *trieEdit, r tref) tref {
+	if r&refLocal == 0 {
+		return r
+	}
+	rec := e.local(r)
+	if rec.leaf {
+		i := s.allocLeaf()
+		*s.leaves.at(i) = leafRec{hash: rec.hash, id: rec.id, content: rec.content}
+		return refLeaf | tref(i)
+	}
+	var children [16]tref
+	for k, c := range rec.child {
+		if c != 0 {
+			p := s.place(e, c)
+			s.retain(p)
+			children[k] = p
+		}
+	}
+	i := s.allocNode()
+	*s.nodes.at(i) = nodeRec{hash: rec.hash, child: children}
+	return tref(i)
+}
+
+// commit places the edit's result and wraps it in a new handle.
+func (s *trieSlab) commit(e *trieEdit, r tref) *trieTree {
+	if r == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	r = s.place(e, r)
+	s.retain(r)
+	s.mu.Unlock()
+	return s.adopt(r)
+}
+
+// trieWith returns the tree h with (id, contentHash) set, sharing every subtree not on id's
+// path with h. O(trieDepth). A nil h is the empty tree; the result then starts a new slab.
+func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
+	var s *trieSlab
+	var root tref
+	if h == nil {
+		s = newTrieSlab()
+	} else {
+		s, root = h.slab, h.root
+	}
+	var e trieEdit
+	e.v = s.view()
+	key := uuidKey(id)
+	nr := e.insert(root, &key, contentHash, 0)
+	if nr == root {
+		return h
+	}
+	out := s.commit(&e, nr)
+	runtime.KeepAlive(h)
+	return out
+}
+
+// trieWithout returns the tree h without id (h itself if id is absent).
+func trieWithout(h *trieTree, id codec.UUID) *trieTree {
+	if h == nil {
+		return nil
+	}
+	var e trieEdit
+	e.v = h.slab.view()
+	key := uuidKey(id)
+	nr := e.delete(h.root, &key, 0)
+	if nr == h.root {
+		return h
+	}
+	out := h.slab.commit(&e, nr)
+	runtime.KeepAlive(h)
+	return out
+}
+
+// --- Bulk build ------------------------------------------------------------------------------
+
+// trieItem is one entry of a bulk build. Its layout is a packed tree entry's (16-byte id, then
+// 32-byte content hash), so a packed image is used in place without copying.
+type trieItem struct {
+	key  [16]byte
+	hash codec.Hash
+}
+
+var _ [PackedTreeEntrySize - unsafe.Sizeof(trieItem{})]struct{}
+var _ [unsafe.Sizeof(trieItem{}) - PackedTreeEntrySize]struct{}
+
+func packedItems(packed []byte) []trieItem {
+	if len(packed) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*trieItem)(unsafe.Pointer(&packed[0])), len(packed)/PackedTreeEntrySize)
+}
+
+// trieBuild builds the trie for a whole set of entries at once. Opening a namespace builds its
+// live tree this way (from the checkpoint's packed image, trieBuildItems), so it is sorted by key
+// with each node built and hashed exactly once, and the sixteen top-level subtrees built on
+// separate cores. The result is the same trie, node for node, as inserting the entries one at a
+// time would give, and so the same hash.
+func trieBuild(entries map[codec.UUID]codec.Hash) *trieTree {
+	if len(entries) == 0 {
+		return nil
+	}
+	items := make([]trieItem, 0, len(entries))
+	for id, h := range entries {
+		items = append(items, trieItem{key: uuidKey(id), hash: h})
+	}
+	slices.SortFunc(items, func(a, b trieItem) int { return bytes.Compare(a.key[:], b.key[:]) })
+	return trieBuildItems(items)
+}
+
+// trieBuildItems builds a new slab's tree from items sorted by key.
+func trieBuildItems(items []trieItem) *trieTree {
+	if len(items) == 0 {
+		return nil
+	}
+	s := newTrieSlab()
+	b := trieBulk{s: s}
+	var root tref
+	// Fanning out pays only when there is enough work to split.
+	if len(items) >= 4096 {
+		var children [16]tref
+		var wg sync.WaitGroup
+		forEachRun(items, 0, func(nib int, run []trieItem) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sub := trieBulk{s: s}
+				sub.reserveLeaves(len(run))
+				children[nib] = sub.build(run, 1)
+				sub.finish()
+			}()
+		})
+		wg.Wait()
+		root = b.node(&children)
+	} else {
+		b.reserveLeaves(len(items))
+		root = b.build(items, 0)
+	}
+	b.finish()
+	s.mu.Lock()
+	s.retain(root)
+	s.mu.Unlock()
+	return s.adopt(root)
+}
+
+// forEachRun calls f for each run of items sharing the nibble at depth, in nibble order.
+func forEachRun(items []trieItem, depth int, f func(nib int, run []trieItem)) {
+	start := 0
+	for i := 1; i <= len(items); i++ {
+		if i == len(items) || keyNibble(&items[i].key, depth) != keyNibble(&items[start].key, depth) {
+			f(keyNibble(&items[start].key, depth), items[start:i])
+			start = i
+		}
+	}
+}
+
+// trieBulk writes a bulk build's records straight into slots it reserves in blocks, so builders
+// on separate goroutines share the slab lock once per block rather than once per record. The
+// records are unpublished until the build returns, so they are written and counted without it.
+type trieBulk struct {
+	s                                    *trieSlab
+	nodeNext, nodeEnd, leafNext, leafEnd uint32
+}
+
+// trieBulkBlock is how many node slots a builder reserves at a time. Leaves, one per item, are
+// reserved exactly up front (reserveLeaves), so only node slots are left over, and few.
+const trieBulkBlock = 256
+
+func (b *trieBulk) reserveLeaves(n int) {
+	b.s.mu.Lock()
+	b.leafNext, _ = b.s.leaves.reserve(uint32(n))
+	b.s.mu.Unlock()
+	b.leafEnd = b.leafNext + uint32(n)
+}
+
+func (b *trieBulk) newLeaf() (tref, *leafRec) {
+	if b.leafNext == b.leafEnd {
+		b.s.mu.Lock()
+		b.leafNext, _ = b.s.leaves.reserve(trieBulkBlock)
+		b.s.mu.Unlock()
+		b.leafEnd = b.leafNext + trieBulkBlock
+	}
+	i := b.leafNext
+	b.leafNext++
+	return refLeaf | tref(i), b.s.leaves.at(i)
+}
+
+func (b *trieBulk) newNode() (tref, *nodeRec) {
+	if b.nodeNext == b.nodeEnd {
+		b.s.mu.Lock()
+		b.nodeNext, _ = b.s.nodes.reserve(trieBulkBlock)
+		b.s.mu.Unlock()
+		b.nodeEnd = b.nodeNext + trieBulkBlock
+	}
+	i := b.nodeNext
+	b.nodeNext++
+	return tref(i), b.s.nodes.at(i)
+}
+
+// finish returns the unused part of the last reserved blocks to the free lists.
+func (b *trieBulk) finish() {
+	b.s.mu.Lock()
+	for i := b.nodeNext; i < b.nodeEnd; i++ {
+		b.s.nodes.free = append(b.s.nodes.free, i)
+	}
+	for i := b.leafNext; i < b.leafEnd; i++ {
+		b.s.leaves.free = append(b.s.leaves.free, i)
+	}
+	b.s.mu.Unlock()
+	b.nodeNext, b.nodeEnd, b.leafNext, b.leafEnd = 0, 0, 0, 0
+}
+
+// build builds the subtree at depth holding items, which are sorted and all share the key's
+// first depth nibbles. Mirrors what inserting them would produce: one item is a leaf that stands
+// for the whole subtree; more than one is an internal node whose children are the runs of items
+// sharing the next nibble - a run of all of them included, which is the single-child chain split
+// builds.
+func (b *trieBulk) build(items []trieItem, depth int) tref {
+	if len(items) == 1 || depth == trieDepth {
+		it := &items[len(items)-1] // at full depth equal keys collide; the last write wins, as with inserts
+		r, l := b.newLeaf()
+		*l = leafRec{hash: foldLeaf(it.key[:], it.hash, depth), id: it.key, content: it.hash}
+		return r
+	}
+	var children [16]tref
+	forEachRun(items, depth, func(nib int, run []trieItem) {
+		children[nib] = b.build(run, depth+1)
+	})
+	return b.node(&children)
+}
+
+// node creates the internal node over children, counting a reference to each.
+func (b *trieBulk) node(children *[16]tref) tref {
+	var buf [1 + 16*32]byte
+	buf[0] = 0x01
+	for i, c := range children {
+		switch {
+		case c == 0:
+			continue
+		case c&refLeaf != 0:
+			l := b.s.leaves.at(uint32(c &^ refLeaf))
+			copy(buf[1+i*32:], l.hash[:])
+			l.rc++
+		default:
+			n := b.s.nodes.at(uint32(c))
+			copy(buf[1+i*32:], n.hash[:])
+			n.rc++
+		}
+	}
+	r, n := b.newNode()
+	*n = nodeRec{hash: sha256.Sum256(buf[:]), child: *children}
+	return r
+}
+
+// --- Reads -----------------------------------------------------------------------------------
+
+// rootHash is the tree hash: the root record's hash, or zero for the empty tree.
+func (h *trieTree) rootHash() codec.Hash {
+	if h == nil {
+		return codec.Hash{}
+	}
+	v := h.slab.view()
+	out := codec.Hash{Bytes: *v.hash(h.root)}
+	runtime.KeepAlive(h)
+	return out
+}
+
+// get looks up id's content hash. O(trieDepth).
+func (h *trieTree) get(id codec.UUID) (codec.Hash, bool) {
+	if h == nil {
+		return codec.Hash{}, false
+	}
+	key := uuidKey(id)
+	v := h.slab.view()
+	r := h.root
+	var out codec.Hash
+	found := false
+	for depth := 0; r != 0; depth++ {
+		if r&refLeaf != 0 {
+			if l := v.leaf(r); l.id == key {
+				out, found = l.content, true
+			}
+			break
+		}
+		if depth >= trieDepth {
+			break
+		}
+		r = v.node(r).child[keyNibble(&key, depth)]
+	}
+	runtime.KeepAlive(h)
+	return out, found
+}
+
+// walkUntil visits leaves in ascending id order until visit returns false; reports whether the
+// walk ran to completion.
+func (h *trieTree) walkUntil(visit func(codec.UUID, codec.Hash) bool) bool {
+	if h == nil {
+		return true
+	}
+	v := h.slab.view()
+	ok := v.walk(h.root, visit, nil)
+	runtime.KeepAlive(h)
+	return ok
+}
+
+// walk visits the leaves under r in order, counting the records entered when visited is non-nil.
+func (v *trieView) walk(r tref, visit func(codec.UUID, codec.Hash) bool, visited *int) bool {
+	if r == 0 {
 		return true
 	}
 	if visited != nil {
 		*visited++
 	}
-	if n.leaf != nil {
-		if uuidAfter(n.leaf.uuid, after) {
-			return visit(n.leaf.uuid, n.leaf.hash)
-		}
-		return true
+	if r&refLeaf != 0 {
+		l := v.leaf(r)
+		return visit(keyUUID(&l.id), l.content)
 	}
-	if n.children == nil || depth >= trieDepth {
-		return true
-	}
-	nib := nibbleAt(key, depth)
-	if !trieWalkAfter(n.children[nib], key, after, depth+1, visit, visited) {
-		return false
-	}
-	for i := nib + 1; i < 16; i++ {
-		if !trieWalkCounted(n.children[i], visit, visited) {
+	n := v.node(r)
+	for _, c := range n.child {
+		if c != 0 && !v.walk(c, visit, visited) {
 			return false
 		}
 	}
 	return true
 }
 
-// trieWalkCounted is trieWalkUntil, counting the nodes it enters when visited is non-nil.
-func trieWalkCounted(n *trieNode, visit func(codec.UUID, codec.Hash) bool, visited *int) bool {
-	if visited == nil {
-		return trieWalkUntil(n, visit)
+// walkAfter visits, in ascending id order, the leaves whose id sorts after after, until visit
+// returns false. It descends only along after's path: every child before after's nibble holds
+// ids at or below it and is skipped without being entered, every child after it is walked whole.
+// So reaching the first id after costs O(trieDepth) records, not a walk of everything before it.
+// visited, when non-nil, counts the records entered.
+func (h *trieTree) walkAfter(after codec.UUID, visit func(codec.UUID, codec.Hash) bool, visited *int) {
+	if h == nil {
+		return
 	}
-	if n == nil {
+	v := h.slab.view()
+	key := uuidKey(after)
+	v.walkAfter(h.root, &key, after, 0, visit, visited)
+	runtime.KeepAlive(h)
+}
+
+func (v *trieView) walkAfter(r tref, key *[16]byte, after codec.UUID, depth int, visit func(codec.UUID, codec.Hash) bool, visited *int) bool {
+	if r == 0 {
 		return true
 	}
-	*visited++
-	if n.leaf != nil {
-		return visit(n.leaf.uuid, n.leaf.hash)
+	if visited != nil {
+		*visited++
 	}
-	if n.children == nil {
+	if r&refLeaf != 0 {
+		l := v.leaf(r)
+		if id := keyUUID(&l.id); uuidAfter(id, after) {
+			return visit(id, l.content)
+		}
 		return true
 	}
-	for _, c := range n.children {
-		if !trieWalkCounted(c, visit, visited) {
+	if depth >= trieDepth {
+		return true
+	}
+	n := v.node(r)
+	nib := keyNibble(key, depth)
+	if !v.walkAfter(n.child[nib], key, after, depth+1, visit, visited) {
+		return false
+	}
+	for i := nib + 1; i < 16; i++ {
+		if !v.walk(n.child[i], visit, visited) {
 			return false
 		}
 	}
 	return true
+}
+
+// entries materializes every (id, hash) pair into a flat map - O(n), used only where a full map
+// is genuinely needed (wire/storage serialization, DAG diff, full scans), never on the per-write
+// path.
+func (h *trieTree) entries() map[codec.UUID]codec.Hash {
+	out := make(map[codec.UUID]codec.Hash)
+	h.walkUntil(func(id codec.UUID, c codec.Hash) bool {
+		out[id] = c
+		return true
+	})
+	return out
 }

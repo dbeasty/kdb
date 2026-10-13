@@ -11,13 +11,13 @@ import (
 // DocumentTree is the doc id → content hash map at a commit.
 //
 // Entries is nil for a tree produced by With/Without - those are backed incrementally by
-// trieRoot alone (see document_tree_trie.go) and deliberately do NOT eagerly materialize a flat
+// their trie alone (see document_tree_trie.go) and deliberately do NOT eagerly materialize a flat
 // map, which used to be copied in full on every single call (O(current document count), not
 // O(delta)) and was found to be a major contributor to kdb-service getting OOM-killed under
 // sustained write load once a namespace grew past a few hundred documents (see
 // docs/benchmarks/lightsail-sim/README.md and go/kdb/transaction's
 // BenchmarkCommitScalingWithHistorySize). Contains/HashFor/Size all work correctly regardless of
-// whether Entries is populated (trieRoot-backed when it isn't); call MaterializedEntries()
+// whether Entries is populated (trie-backed when it isn't); call MaterializedEntries()
 // explicitly for the rare cases that genuinely need the full flat map (wire/storage
 // serialization, DAG diff, full scans) - see its own doc comment.
 //
@@ -31,14 +31,12 @@ type DocumentTree struct {
 	// With/Without so Size() stays O(1) without needing a full trie walk.
 	size int
 
-	// trieRoot backs incremental With/Without updates (see
-	// document_tree_trie.go): when present, TreeHash for a derived tree
-	// is computed in O(delta) instead of O(len(Entries)). Trees built
-	// via BuildDocumentTree from a flat map (e.g. wire decode) don't
-	// carry one - With/Without fall back to a one-time O(n) trieBuild
-	// in that case, then are incremental from then on. Always correct
-	// either way; only the constant differs.
-	trieRoot *trieNode
+	// trie backs incremental With/Without updates (see document_tree_trie.go): when present,
+	// TreeHash for a derived tree is computed in O(delta) instead of O(len(Entries)). It is the
+	// tree's handle in its slab (document_tree_slab.go), and holding it is what keeps the tree's
+	// records from being reused. nil for the empty tree, and for a tree built from a flat map
+	// without one (DocumentTreeFromValue does build one) - With/Without then build one first.
+	trie *trieTree
 }
 
 func (t DocumentTree) Size() int {
@@ -53,7 +51,7 @@ func (t DocumentTree) Contains(docID codec.UUID) bool {
 		_, ok := t.Entries[docID]
 		return ok
 	}
-	_, ok := trieGet(t.trieRoot, docID)
+	_, ok := t.trie.get(docID)
 	return ok
 }
 
@@ -62,7 +60,7 @@ func (t DocumentTree) HashFor(docID codec.UUID) (codec.Hash, bool) {
 		h, ok := t.Entries[docID]
 		return h, ok
 	}
-	return trieGet(t.trieRoot, docID)
+	return t.trie.get(docID)
 }
 
 // MaterializedEntries returns the full doc id → content hash map, building it from the trie
@@ -73,7 +71,7 @@ func (t DocumentTree) MaterializedEntries() map[codec.UUID]codec.Hash {
 	if t.Entries != nil {
 		return t.Entries
 	}
-	return trieEntries(t.trieRoot)
+	return t.trie.entries()
 }
 
 // Walk streams every (doc id, content hash) entry to visit, stopping early when visit returns
@@ -91,38 +89,38 @@ func (t DocumentTree) Walk(visit func(codec.UUID, codec.Hash) bool) {
 		}
 		return
 	}
-	trieWalkUntil(t.trieRoot, visit)
+	t.trie.walkUntil(visit)
 }
 
 func (t DocumentTree) With(docID codec.UUID, contentHash codec.Hash) (DocumentTree, error) {
-	root := t.trieRootOrBuild()
-	_, existed := trieGet(root, docID)
-	newRoot := trieInsert(root, docID, contentHash)
+	h := t.trieRootOrBuild()
+	_, existed := h.get(docID)
+	nh := trieWith(h, docID, contentHash)
 	newSize := t.Size()
 	if !existed {
 		newSize++
 	}
-	return DocumentTree{TreeHash: trieTreeHash(newRoot), size: newSize, trieRoot: newRoot}, nil
+	return DocumentTree{TreeHash: nh.rootHash(), size: newSize, trie: nh}, nil
 }
 
 func (t DocumentTree) Without(docID codec.UUID) (DocumentTree, error) {
-	root := t.trieRootOrBuild()
-	_, existed := trieGet(root, docID)
-	newRoot := trieDelete(root, docID)
+	h := t.trieRootOrBuild()
+	_, existed := h.get(docID)
+	nh := trieWithout(h, docID)
 	newSize := t.Size()
 	if existed {
 		newSize--
 	}
-	return DocumentTree{TreeHash: trieTreeHash(newRoot), size: newSize, trieRoot: newRoot}, nil
+	return DocumentTree{TreeHash: nh.rootHash(), size: newSize, trie: nh}, nil
 }
 
 // trieRootOrBuild returns t's trie root, building one from t.Entries (O(n))
 // if t doesn't already carry one - e.g. a tree decoded from the wire via
 // BuildDocumentTree/DocumentTreeFromValue. One-time cost; every
 // subsequent With/Without on the result is O(delta).
-func (t DocumentTree) trieRootOrBuild() *trieNode {
-	if t.trieRoot != nil || t.Entries == nil || len(t.Entries) == 0 {
-		return t.trieRoot
+func (t DocumentTree) trieRootOrBuild() *trieTree {
+	if t.trie != nil || t.Entries == nil || len(t.Entries) == 0 {
+		return t.trie
 	}
 	return trieBuild(t.Entries)
 }
@@ -149,8 +147,8 @@ func BuildDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) 
 	if entries == nil {
 		entries = map[codec.UUID]codec.Hash{}
 	}
-	root := trieBuild(entries)
-	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
+	h := trieBuild(entries)
+	return DocumentTree{TreeHash: h.rootHash(), Entries: entries, trie: h}, nil
 }
 
 // BuildTrieDocumentTree is BuildDocumentTree without keeping the flat map: the tree is backed by
@@ -159,8 +157,8 @@ func BuildDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) 
 // the trie cost ~120 bytes per document twice over (120 MB at a million documents). entries may
 // be dropped by the caller afterwards.
 func BuildTrieDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) {
-	root := trieBuild(entries)
-	return DocumentTree{TreeHash: trieTreeHash(root), trieRoot: root, size: len(entries)}, nil
+	h := trieBuild(entries)
+	return DocumentTree{TreeHash: h.rootHash(), trie: h, size: len(entries)}, nil
 }
 
 // PackedTreeEntrySize is one entry of a packed tree: the document id's 16 bytes, then its 32-byte
@@ -206,26 +204,15 @@ func BuildTrieDocumentTreePacked(packed []byte) (DocumentTree, error) {
 	if len(packed)%PackedTreeEntrySize != 0 {
 		return DocumentTree{}, fmt.Errorf("document: packed tree of %d bytes is not a whole number of entries", len(packed))
 	}
-	n := len(packed) / PackedTreeEntrySize
-	items := make([]trieItem, n)
-	for i := range items {
-		e := packed[i*PackedTreeEntrySize : (i+1)*PackedTreeEntrySize]
-		id, err := codec.UUIDFromBytes(e[:16])
-		if err != nil {
-			return DocumentTree{}, err
-		}
-		if i > 0 && bytes.Compare(items[i-1].key, e[:16]) >= 0 {
+	// The entries are read in place: a packed entry has trieItem's layout.
+	items := packedItems(packed)
+	for i := 1; i < len(items); i++ {
+		if bytes.Compare(items[i-1].key[:], items[i].key[:]) >= 0 {
 			return DocumentTree{}, fmt.Errorf("document: packed tree entries out of order at %d", i)
 		}
-		var h codec.Hash
-		copy(h.Bytes[:], e[16:])
-		items[i] = trieItem{key: e[:16:16], id: id, hash: h}
 	}
-	var root *trieNode
-	if n > 0 {
-		root = trieBuildRange(items, 0, n >= 4096)
-	}
-	return DocumentTree{TreeHash: trieTreeHash(root), trieRoot: root, size: n}, nil
+	h := trieBuildItems(items)
+	return DocumentTree{TreeHash: h.rootHash(), trie: h, size: len(items)}, nil
 }
 
 func entriesToArrayValue(entries map[codec.UUID]codec.Hash) codec.Value {
@@ -356,9 +343,9 @@ func (t DocumentTree) WalkAfterCounting(after codec.UUID, visit func(codec.UUID,
 
 // WalkOrdered streams every entry in ascending id order (see WalkAfter).
 func (t DocumentTree) WalkOrdered(visit func(codec.UUID, codec.Hash) bool) {
-	trieWalkUntil(t.trieRootOrBuild(), visit)
+	t.trieRootOrBuild().walkUntil(visit)
 }
 
 func (t DocumentTree) walkAfter(after codec.UUID, visit func(codec.UUID, codec.Hash) bool, visited *int) {
-	trieWalkAfter(t.trieRootOrBuild(), after.Bytes(), after, 0, visit, visited)
+	t.trieRootOrBuild().walkAfter(after, visit, visited)
 }

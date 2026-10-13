@@ -3,6 +3,7 @@ package document
 import (
 	"encoding/hex"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -53,51 +54,52 @@ func (t DocumentTree) Node(prefix string, entryLimit int) (TreeNode, error) {
 	}
 	out := TreeNode{Prefix: prefix}
 	depth := len(prefix)
-	n := t.trieRootOrBuild()
-	for d := 0; d < depth && n != nil; d++ {
-		if n.leaf != nil {
-			break
-		}
-		if n.children == nil {
-			n = nil
-			break
-		}
-		nib := int(hexNibble(prefix[d]))
-		n = n.children[nib]
-	}
-	if n == nil {
+	h := t.trieRootOrBuild()
+	if h == nil {
 		return out, nil
 	}
-	if n.leaf != nil {
+	defer runtime.KeepAlive(h)
+	v := h.slab.view()
+	r := h.root
+	for d := 0; d < depth && r != 0; d++ {
+		if r&refLeaf != 0 {
+			break
+		}
+		r = v.node(r).child[hexNibble(prefix[d])]
+	}
+	if r == 0 {
+		return out, nil
+	}
+	if r&refLeaf != 0 {
 		// A compressed leaf stands for everything below where it sits; it belongs to this
 		// subtree only if its id carries the whole prefix.
-		idBytes := n.leaf.uuid.Bytes()
+		l := v.leaf(r)
+		idBytes := l.id[:]
 		if !strings.HasPrefix(hex.EncodeToString(idBytes), prefix) {
 			return out, nil
 		}
-		out.Hash = codec.Hash{Bytes: foldLeaf(idBytes, n.leaf.hash, depth)}
+		out.Hash = codec.Hash{Bytes: foldLeaf(idBytes, l.content, depth)}
 		if depth < trieDepth {
-			out.Children[nibbleAt(idBytes, depth)] = codec.Hash{Bytes: foldLeaf(idBytes, n.leaf.hash, depth+1)}
+			out.Children[nibbleAt(idBytes, depth)] = codec.Hash{Bytes: foldLeaf(idBytes, l.content, depth+1)}
 		}
 		if entryLimit >= 1 {
-			out.Entries = map[codec.UUID]codec.Hash{n.leaf.uuid: n.leaf.hash}
+			out.Entries = map[codec.UUID]codec.Hash{keyUUID(&l.id): l.content}
 		}
 		return out, nil
 	}
+	n := v.node(r)
 	out.Hash = codec.Hash{Bytes: n.hash}
-	if n.children != nil {
-		for i, c := range n.children {
-			if c != nil {
-				out.Children[i] = codec.Hash{Bytes: c.hash}
-			}
+	for i, c := range n.child {
+		if c != 0 {
+			out.Children[i] = codec.Hash{Bytes: *v.hash(c)}
 		}
 	}
 	if entryLimit > 0 {
 		entries := map[codec.UUID]codec.Hash{}
-		small := trieWalkUntil(n, func(id codec.UUID, h codec.Hash) bool {
+		small := v.walk(r, func(id codec.UUID, h codec.Hash) bool {
 			entries[id] = h
 			return len(entries) <= entryLimit
-		})
+		}, nil)
 		if small {
 			out.Entries = entries
 		}
