@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
@@ -30,6 +32,16 @@ func treeSegments(t *testing.T, root, ns string) []string {
 		}
 	}
 	return out
+}
+
+func newest(names []string) int {
+	n := 0
+	for _, s := range names {
+		if v, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(s, "tree-"), ".kdbt")); err == nil && v > n {
+			n = v
+		}
+	}
+	return n
 }
 
 func treeDocID(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", i) }
@@ -72,8 +84,14 @@ func TestTreeFileLifecycleThroughRuntime(t *testing.T) {
 	if _, mapped := live2.Paged(); !mapped || live2.TreeHash != wantHash {
 		t.Fatalf("reopen: mapped=%v, hash matches=%v", mapped, live2.TreeHash == wantHash)
 	}
-	if got := treeSegments(t, root, ns); strings.Join(got, ",") != strings.Join(segs, ",") {
-		t.Fatalf("reopen built a segment instead of mapping the checkpoint's: %v -> %v", segs, got)
+	// The open maps the checkpoint's chain - writing nothing - and deletes the earlier run's other
+	// segments, leaving one chain of at most the default maximum length.
+	got := treeSegments(t, root, ns)
+	if newest(got) != newest(segs) {
+		t.Fatalf("reopen wrote a segment instead of mapping the checkpoint's: newest %d -> %d", newest(segs), newest(got))
+	}
+	if len(got) > document.DefaultTreeMaxSegments {
+		t.Fatalf("%d segment files left after reopen: %v", len(got), got)
 	}
 	head := headTree(t, rt2)
 	for i := 0; i < docs; i++ {

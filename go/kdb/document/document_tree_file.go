@@ -2,6 +2,7 @@ package document
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -12,12 +13,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
+	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 )
 
@@ -66,8 +70,10 @@ const (
 	nodeRecSize     = 96
 
 	// DefaultTreeResidentBytes is the resident overlay a file-backed tree keeps before it is
-	// written out again.
+	// flushed to a segment.
 	DefaultTreeResidentBytes = 64 << 20
+	// DefaultTreeMaxSegments is the longest chain of segments before a compaction.
+	DefaultTreeMaxSegments = 8
 )
 
 var treeCRC = crc32.MakeTable(crc32.Castagnoli)
@@ -83,9 +89,12 @@ var littleEndian = func() bool {
 type TreeFileOptions struct {
 	// Dir holds the namespace's tree segments.
 	Dir string
-	// ResidentBytes is the resident overlay before a full rewrite; DefaultTreeResidentBytes if
-	// not positive.
+	// ResidentBytes is the resident overlay before it is flushed to a segment;
+	// DefaultTreeResidentBytes if not positive.
 	ResidentBytes int64
+	// MaxSegments is the longest chain of segments a tree may span before a write compacts it
+	// into one; DefaultTreeMaxSegments if not positive.
+	MaxSegments int
 	// ReadOnly maps segments but never writes or deletes any.
 	ReadOnly bool
 }
@@ -97,7 +106,7 @@ type TreeFile struct {
 
 	mu      sync.Mutex
 	nextSeq uint64
-	keepSeq uint64 // the segment carrying the newest checkpoint's digest; never deleted
+	keep    map[uint64]bool // the newest checkpoint's segment and its chain: never deleted
 	closed  bool
 	failed  bool // a write failed; stop writing, keep serving from what is mapped and the heap
 }
@@ -113,6 +122,9 @@ func NewTreeFile(opts TreeFileOptions) (*TreeFile, error) {
 	}
 	if opts.ResidentBytes <= 0 {
 		opts.ResidentBytes = DefaultTreeResidentBytes
+	}
+	if opts.MaxSegments <= 0 {
+		opts.MaxSegments = DefaultTreeMaxSegments
 	}
 	if !opts.ReadOnly {
 		if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
@@ -187,6 +199,34 @@ func listTreeSegments(dir string) []uint64 {
 
 // --- Segments --------------------------------------------------------------------------------
 
+// Segment file layout (little-endian):
+//
+//	header  128 bytes: magic "KDBTRIE1", version u32, -, leaves u32, nodes u32, root u32 (a local
+//	        reference), externs u32, documents u64 (0 when not known), root hash [32]
+//	leaves  80 bytes each (leafRec)
+//	nodes   96 bytes each (nodeRec; children are local references)
+//	externs 16 bytes each: segment sequence u64, reference u32 local to that segment, -
+//	trailer crc32c of everything before it u32, "KTR1" u32
+//
+// A local reference is 0, a leaf (refLeaf | i), a node (i), or an extern (refFile | i): a record
+// in an older segment this one was flushed on top of. Indexes count from 1.
+
+// segList is a slab's mapped segments, held apart from the slab so that a cleanup on the slab can
+// unmap them (closeSegList) without keeping the slab alive.
+type segList struct {
+	p atomic.Pointer[[]*treeSegment]
+}
+
+func closeSegList(l *segList) {
+	p := l.p.Load()
+	if p == nil {
+		return
+	}
+	for _, g := range *p {
+		g.unmap(true)
+	}
+}
+
 // treeSegment is one mapped segment.
 type treeSegment struct {
 	seq      uint64
@@ -203,7 +243,16 @@ type treeSegment struct {
 	root     tref // local
 	rootHash [32]byte
 	docs     int
+	externs  []segExtern // as written
+	ext      []tref      // the externs resolved to slab references (register)
+	deps     []*treeSegment
 	refs     int // references from outside the segment; under the slab lock
+	unmapped bool
+}
+
+type segExtern struct {
+	seq uint64
+	ref tref
 }
 
 func (g *treeSegment) leafAt(local uint32) *leafRec {
@@ -219,11 +268,21 @@ func (g *treeSegment) global(c tref) tref {
 	switch {
 	case c == 0:
 		return 0
+	case c&refFile != 0:
+		return g.ext[uint32(c&refIndexMask)-1]
 	case c&refLeaf != 0:
 		return refFile | refLeaf | tref(g.leafBase+uint32(c&^refLeaf))
 	default:
 		return refFile | tref(g.nodeBase+uint32(c))
 	}
+}
+
+// local is the slab reference r, a record of g, as a reference local to g.
+func (g *treeSegment) local(r tref) tref {
+	if r&refLeaf != 0 {
+		return refLeaf | tref(uint32(r&refIndexMask)-g.leafBase)
+	}
+	return tref(uint32(r&refIndexMask) - g.nodeBase)
 }
 
 func segmentOf(segs []*treeSegment, r tref) *treeSegment {
@@ -244,8 +303,19 @@ func segmentOf(segs []*treeSegment, r tref) *treeSegment {
 	panic("document: tree reference into no mapped segment")
 }
 
+func (s *trieSlab) segBySeq(seq uint64) *treeSegment {
+	if p := s.segs.p.Load(); p != nil {
+		for _, g := range *p {
+			if g.seq == seq {
+				return g
+			}
+		}
+	}
+	return nil
+}
+
 // openTreeSegment maps and verifies a segment file.
-func openTreeSegment(path string) (g *treeSegment, err error) {
+func openTreeSegment(f *TreeFile, path string) (g *treeSegment, err error) {
 	m, err := mmapfile.Open(path)
 	if err != nil {
 		return nil, err
@@ -281,22 +351,30 @@ func openTreeSegment(path string) (g *treeSegment, err error) {
 	if le.Uint32(tail[4:]) != treeSegTailMark || le.Uint32(tail) != crc {
 		return nil, fmt.Errorf("document: tree segment %s: checksum mismatch", path)
 	}
-	leaves, nodes := le.Uint32(hdr[16:]), le.Uint32(hdr[20:])
-	if want := treeSegHeader + int(leaves)*leafRecSize + int(nodes)*nodeRecSize + treeSegTrailer; len(data) != want {
+	leaves, nodes, externs := le.Uint32(hdr[16:]), le.Uint32(hdr[20:]), le.Uint32(hdr[28:])
+	extOff := treeSegHeader + int(leaves)*leafRecSize + int(nodes)*nodeRecSize
+	if want := extOff + int(externs)*16 + treeSegTrailer; len(data) != want {
 		return nil, fmt.Errorf("document: tree segment %s: %d bytes, header says %d", path, len(data), want)
 	}
 	g = &treeSegment{
-		path: path, mapping: m, region: region, data: data,
+		path: path, file: f, mapping: m, region: region, data: data,
 		leaves: leaves, nodes: nodes,
 		nodeOff: treeSegHeader + int(leaves)*leafRecSize,
 		root:    tref(le.Uint32(hdr[24:])),
 		docs:    int(le.Uint64(hdr[32:])),
 	}
 	copy(g.rootHash[:], hdr[40:72])
+	for i := 0; i < int(externs); i++ {
+		e := data[extOff+i*16:]
+		g.externs = append(g.externs, segExtern{seq: le.Uint64(e), ref: tref(le.Uint32(e[8:]))})
+	}
+	if base := filepath.Base(path); strings.HasPrefix(base, "tree-") {
+		g.seq, _ = strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(base, "tree-"), treeSegSuffix), 10, 64)
+	}
 	if err := g.checkRef(g.root); err != nil {
 		return nil, err
 	}
-	if g.root != 0 {
+	if g.root != 0 && g.root&refFile == 0 {
 		var h [32]byte
 		if g.root&refLeaf != 0 {
 			h = g.leafAt(uint32(g.root &^ refLeaf)).hash
@@ -307,34 +385,51 @@ func openTreeSegment(path string) (g *treeSegment, err error) {
 			return nil, fmt.Errorf("document: tree segment %s: root record does not carry the root hash", path)
 		}
 	}
-	if base := filepath.Base(path); strings.HasPrefix(base, "tree-") {
-		g.seq, _ = strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(base, "tree-"), treeSegSuffix), 10, 64)
-	}
 	return g, nil
 }
 
 func (g *treeSegment) checkRef(c tref) error {
-	if c == 0 {
+	switch {
+	case c == 0:
 		return nil
-	}
-	if c&refLeaf != 0 {
+	case c&refFile != 0:
+		if i := uint32(c & refIndexMask); i == 0 || i > uint32(len(g.externs)) || c&(refLeaf|refLocal) != 0 {
+			return fmt.Errorf("document: tree segment %s: extern reference %d out of range", g.path, i)
+		}
+	case c&refLeaf != 0:
 		if i := uint32(c &^ refLeaf); i == 0 || i > g.leaves {
 			return fmt.Errorf("document: tree segment %s: leaf reference %d out of range", g.path, i)
 		}
-		return nil
-	}
-	if i := uint32(c); i == 0 || i > g.nodes || c&(refFile|refLocal) != 0 {
-		return fmt.Errorf("document: tree segment %s: node reference %d out of range", g.path, i)
+	default:
+		if i := uint32(c); i == 0 || i > g.nodes || c&refLocal != 0 {
+			return fmt.Errorf("document: tree segment %s: node reference %d out of range", g.path, i)
+		}
 	}
 	return nil
 }
 
-// register makes g addressable from s: it gets index ranges that no live segment of s uses, and
-// joins the segment list readers load. Under s.mu.
+// register makes g addressable from s: index ranges no live segment of s uses, its externs
+// resolved against the segments it was flushed on top of (which must already be registered, and
+// which it then holds), and a place in the list readers load. Under s.mu.
 func (s *trieSlab) register(g *treeSegment) error {
 	var cur []*treeSegment
-	if p := s.segs.Load(); p != nil {
+	if p := s.segs.p.Load(); p != nil {
 		cur = *p
+	}
+	ext := make([]tref, len(g.externs))
+	var deps []*treeSegment
+	for i, e := range g.externs {
+		d := s.segBySeq(e.seq)
+		if d == nil {
+			return fmt.Errorf("document: tree segment %s refers to segment %d, which is not mapped", g.path, e.seq)
+		}
+		if e.ref == 0 || e.ref&(refFile|refLocal) != 0 || d.checkRef(e.ref) != nil {
+			return fmt.Errorf("document: tree segment %s: extern %d is not a record of segment %d", g.path, i, e.seq)
+		}
+		ext[i] = d.global(e.ref)
+		if !slices.Contains(deps, d) {
+			deps = append(deps, d)
+		}
 	}
 	var ok bool
 	if g.leafBase, ok = segmentGap(cur, g.leaves, func(o *treeSegment) (uint32, uint32) { return o.leafBase, o.leaves }); !ok {
@@ -343,8 +438,12 @@ func (s *trieSlab) register(g *treeSegment) error {
 	if g.nodeBase, ok = segmentGap(cur, g.nodes, func(o *treeSegment) (uint32, uint32) { return o.nodeBase, o.nodes }); !ok {
 		return errors.New("document: tree slab has no room for another segment's nodes")
 	}
+	g.ext, g.deps = ext, deps
+	for _, r := range ext {
+		s.retain(r)
+	}
 	next := append(append(make([]*treeSegment, 0, len(cur)+1), cur...), g)
-	s.segs.Store(&next)
+	s.segs.p.Store(&next)
 	return nil
 }
 
@@ -369,23 +468,36 @@ func segmentGap(segs []*treeSegment, n uint32, rng func(*treeSegment) (uint32, u
 	return start, uint64(start)+uint64(n) <= uint64(refIndexMask)
 }
 
-// retireSegment drops a segment nothing refers to any more: out of the list, unmapped, and its
-// file deleted unless it is the one the next open should find. Under s.mu. Safe to unmap here:
-// a reader can only reach a segment through a tree that refers into it, which would hold a count.
+// retireSegment drops a segment nothing refers to any more: out of the list, unmapped, its file
+// deleted unless the next open needs it, and its hold on the segments under it given back. Under
+// s.mu. Safe to unmap here: a reader can only reach a segment through a tree that refers into it,
+// which would hold a count.
 func (s *trieSlab) retireSegment(g *treeSegment) {
-	cur := *s.segs.Load()
+	cur := *s.segs.p.Load()
 	next := make([]*treeSegment, 0, len(cur))
 	for _, o := range cur {
 		if o != g {
 			next = append(next, o)
 		}
 	}
-	s.segs.Store(&next)
+	s.segs.p.Store(&next)
+	g.unmap(true)
+	for _, r := range g.ext {
+		s.release(r)
+	}
+}
+
+// unmap closes g's mapping, and deletes its file when del and nothing needs it on disk.
+func (g *treeSegment) unmap(del bool) {
+	if g.unmapped {
+		return
+	}
+	g.unmapped = true
 	g.region.Release()
 	g.mapping.Close()
-	if f := g.file; f != nil {
+	if f := g.file; f != nil && del {
 		f.mu.Lock()
-		del := !f.closed && !f.opts.ReadOnly && g.seq != f.keepSeq
+		del = !f.closed && !f.opts.ReadOnly && !f.keep[g.seq]
 		f.mu.Unlock()
 		if del {
 			os.Remove(g.path)
@@ -394,13 +506,27 @@ func (s *trieSlab) retireSegment(g *treeSegment) {
 	}
 }
 
+// chain is g and every segment it depends on.
+func (g *treeSegment) chain(into map[uint64]bool) {
+	if into[g.seq] {
+		return
+	}
+	into[g.seq] = true
+	for _, d := range g.deps {
+		d.chain(into)
+	}
+}
+
 // --- Writing a segment from a tree -----------------------------------------------------------
 
 // segWriter writes a segment's records to the two sections of a temporary file, numbering them
-// in the order written (post-order, so a subtree's records are contiguous).
+// in the order written (post-order, so a subtree's records are contiguous). A flush writes only
+// the records in the heap and refers to those already in segments as externs.
 type segWriter struct {
 	lw, nw       *bufio.Writer
 	leaves, nods uint32
+	flush        bool
+	externs      []segExtern
 	err          error
 }
 
@@ -425,6 +551,10 @@ func (w *segWriter) copyOut(v *trieView, r tref) tref {
 	switch {
 	case r == 0:
 		return 0
+	case w.flush && r&refFile != 0:
+		g := v.seg(r)
+		w.externs = append(w.externs, segExtern{seq: g.seq, ref: g.local(r)})
+		return refFile | tref(len(w.externs))
 	case r&refLeaf != 0:
 		l := *v.leaf(r)
 		return w.leaf(&l)
@@ -438,15 +568,19 @@ func (w *segWriter) copyOut(v *trieView, r tref) tref {
 	}
 }
 
-func countRecords(v *trieView, r tref) (leaves, nodes uint32) {
+// countRecords counts what writing the tree under r would write: every record, or for a flush
+// the records in the heap, noting each segment the flush would refer into.
+func countRecords(v *trieView, r tref, flush bool, segs map[*treeSegment]bool) (leaves, nodes uint32) {
 	switch {
 	case r == 0:
+	case flush && r&refFile != 0:
+		segs[v.seg(r)] = true
 	case r&refLeaf != 0:
 		leaves = 1
 	default:
 		nodes = 1
 		for _, c := range v.children(r) {
-			l, n := countRecords(v, c)
+			l, n := countRecords(v, c, flush, segs)
 			leaves += l
 			nodes += n
 		}
@@ -455,7 +589,7 @@ func countRecords(v *trieView, r tref) (leaves, nodes uint32) {
 }
 
 // createSegment writes a segment of the given shape with fill, then seals it under path.
-func createSegment(path string, leaves, nodes uint32, docs int, fill func(f *os.File, leafOff, nodeOff int64) (root tref, rootHash [32]byte, err error)) (err error) {
+func createSegment(path string, leaves, nodes uint32, docs int, fill func(f *os.File, leafOff, nodeOff int64) (root tref, rootHash [32]byte, externs []segExtern, err error)) (err error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
 	if err != nil {
@@ -469,22 +603,29 @@ func createSegment(path string, leaves, nodes uint32, docs int, fill func(f *os.
 	}()
 	leafOff := int64(treeSegHeader)
 	nodeOff := leafOff + int64(leaves)*leafRecSize
-	end := nodeOff + int64(nodes)*nodeRecSize
-	if err = tmp.Truncate(end + treeSegTrailer); err != nil {
-		return err
-	}
-	root, rootHash, err := fill(tmp, leafOff, nodeOff)
+	extOff := nodeOff + int64(nodes)*nodeRecSize
+	root, rootHash, externs, err := fill(tmp, leafOff, nodeOff)
 	if err != nil {
 		return err
 	}
-	var hdr [treeSegHeader]byte
 	le := binary.LittleEndian
+	ext := make([]byte, 16*len(externs))
+	for i, e := range externs {
+		le.PutUint64(ext[i*16:], e.seq)
+		le.PutUint32(ext[i*16+8:], uint32(e.ref))
+	}
+	if _, err = tmp.WriteAt(ext, extOff); err != nil {
+		return err
+	}
+	end := extOff + int64(len(ext))
+	var hdr [treeSegHeader]byte
 	copy(hdr[:], treeSegMagic)
 	le.PutUint32(hdr[8:], treeSegVersion)
 	le.PutUint32(hdr[16:], leaves)
 	le.PutUint32(hdr[20:], nodes)
 	le.PutUint32(hdr[24:], uint32(root))
-	le.PutUint64(hdr[32:], uint64(docs))
+	le.PutUint32(hdr[28:], uint32(len(externs)))
+	le.PutUint64(hdr[32:], uint64(max(docs, 0)))
 	copy(hdr[40:72], rootHash[:])
 	if _, err = tmp.WriteAt(hdr[:], 0); err != nil {
 		return err
@@ -517,15 +658,31 @@ func createSegment(path string, leaves, nodes uint32, docs int, fill func(f *os.
 	return nil
 }
 
-// writeSegmentFrom writes the tree h to a new segment of f. h must be held for the duration.
-func writeSegmentFrom(f *TreeFile, h *trieTree) (*treeSegment, error) {
+// writeSegmentFrom writes the tree h (of docs documents, or -1 if not known) to a new segment of
+// f: a flush of its heap records over the segments it already refers into, or - when that would
+// make the chain of segments longer than f allows, or when full is set - every record (a
+// compaction). h must be held throughout.
+func writeSegmentFrom(f *TreeFile, h *trieTree, docs int, full bool) (*treeSegment, error) {
 	v := h.slab.view()
-	leaves, nodes := countRecords(&v, h.root)
+	flush := !full
+	refd := map[*treeSegment]bool{}
+	leaves, nodes := countRecords(&v, h.root, flush, refd)
+	if flush {
+		chain := map[uint64]bool{}
+		for g := range refd {
+			g.chain(chain)
+		}
+		if len(chain)+1 > f.opts.MaxSegments {
+			flush = false
+			leaves, nodes = countRecords(&v, h.root, false, nil)
+		}
+	}
 	path := f.segPath(f.takeSeq())
-	err := createSegment(path, leaves, nodes, int(leaves), func(file *os.File, leafOff, nodeOff int64) (tref, [32]byte, error) {
+	err := createSegment(path, leaves, nodes, docs, func(file *os.File, leafOff, nodeOff int64) (tref, [32]byte, []segExtern, error) {
 		w := segWriter{
-			lw: bufio.NewWriterSize(io.NewOffsetWriter(file, leafOff), 1<<20),
-			nw: bufio.NewWriterSize(io.NewOffsetWriter(file, nodeOff), 1<<20),
+			lw:    bufio.NewWriterSize(io.NewOffsetWriter(file, leafOff), 1<<20),
+			nw:    bufio.NewWriterSize(io.NewOffsetWriter(file, nodeOff), 1<<20),
+			flush: flush,
 		}
 		root := w.copyOut(&v, h.root)
 		if w.err == nil {
@@ -534,18 +691,17 @@ func writeSegmentFrom(f *TreeFile, h *trieTree) (*treeSegment, error) {
 		if w.err == nil {
 			w.err = w.nw.Flush()
 		}
-		return root, *v.hash(h.root), w.err
+		return root, *v.hash(h.root), w.externs, w.err
 	})
 	runtime.KeepAlive(h)
 	if err != nil {
 		return nil, err
 	}
-	g, err := openTreeSegment(path)
+	g, err := openTreeSegment(f, path)
 	if err != nil {
 		os.Remove(path)
 		return nil, err
 	}
-	g.file = f
 	return g, nil
 }
 
@@ -590,7 +746,7 @@ func (b *segBuilder) build(items []trieItem, depth int) (tref, [32]byte) {
 func buildSegmentPacked(f *TreeFile, items []trieItem) (*treeSegment, error) {
 	leaves, nodes := uint32(len(items)), countNodes(items, 0)
 	path := f.segPath(f.takeSeq())
-	err := createSegment(path, leaves, nodes, len(items), func(file *os.File, leafOff, nodeOff int64) (tref, [32]byte, error) {
+	err := createSegment(path, leaves, nodes, len(items), func(file *os.File, leafOff, nodeOff int64) (tref, [32]byte, []segExtern, error) {
 		newBuilder := func(leafStart, nodeStart uint32) *segBuilder {
 			return &segBuilder{segWriter{
 				lw:     bufio.NewWriterSize(io.NewOffsetWriter(file, leafOff+int64(leafStart)*leafRecSize), 256<<10),
@@ -610,7 +766,7 @@ func buildSegmentPacked(f *TreeFile, items []trieItem) (*treeSegment, error) {
 		if len(items) < 4096 {
 			b := newBuilder(0, 0)
 			root, h := b.build(items, 0)
-			return root, h, flush(b)
+			return root, h, nil, flush(b)
 		}
 		// The root is the last node; each top-level subtree gets the leaves and nodes before it.
 		var root nodeRec
@@ -636,50 +792,84 @@ func buildSegmentPacked(f *TreeFile, items []trieItem) (*treeSegment, error) {
 		wg.Wait()
 		for _, e := range errs {
 			if e != nil {
-				return 0, [32]byte{}, e
+				return 0, [32]byte{}, nil, e
 			}
 		}
 		root.hash = sha256.Sum256(buf[:])
 		b := newBuilder(leafStart, nodeStart)
 		r := b.node(&root)
-		return r, root.hash, flush(b)
+		return r, root.hash, nil, flush(b)
 	})
 	if err != nil {
 		return nil, err
 	}
-	g, err := openTreeSegment(path)
+	g, err := openTreeSegment(f, path)
 	if err != nil {
 		os.Remove(path)
 		return nil, err
 	}
-	g.file = f
 	return g, nil
 }
 
-// --- Binding, rebasing and rewriting ---------------------------------------------------------
+// --- Binding, rebasing and writing ----------------------------------------------------------
 
-// attachSegment makes a new file-bound slab whose one tree is g, and returns that tree.
-func attachSegment(f *TreeFile, g *treeSegment) (*trieTree, error) {
+// attachChain makes a new file-bound slab holding top and the segments it depends on (opened
+// from f by sequence, oldest first), and returns the tree top holds.
+func attachChain(f *TreeFile, top *treeSegment) (*trieTree, error) {
 	s := newTrieSlab()
 	s.file.Store(f)
 	s.mu.Lock()
-	if err := s.register(g); err != nil {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	var opened []*treeSegment
+	fail := func(err error) (*trieTree, error) {
+		for _, g := range opened {
+			g.unmap(false)
+		}
+		if p := s.segs.p.Load(); p != nil {
+			s.segs.p.Store(new([]*treeSegment))
+		}
 		return nil, err
 	}
-	root := g.global(g.root)
-	if root == 0 {
-		s.retireSegment(g) // an empty tree needs no file
-	} else {
-		s.retain(root) // the handle's
-		s.retain(root) // the slab's: the tree the next rebase moves onto
-		s.rebaseTo = root
+	var add func(g *treeSegment, depth int) error
+	add = func(g *treeSegment, depth int) error {
+		if depth > 64 {
+			return fmt.Errorf("document: tree segment chain under %s is too long", top.path)
+		}
+		for _, e := range g.externs {
+			if s.segBySeq(e.seq) != nil {
+				continue
+			}
+			if e.seq >= g.seq {
+				return fmt.Errorf("document: tree segment %s refers to a later segment %d", g.path, e.seq)
+			}
+			d, err := openTreeSegment(f, f.segPath(e.seq))
+			if err != nil {
+				return err
+			}
+			opened = append(opened, d)
+			if err := add(d, depth+1); err != nil {
+				return err
+			}
+		}
+		return s.register(g)
 	}
-	s.mu.Unlock()
+	if err := add(top, 0); err != nil {
+		return fail(err)
+	}
+	// Each dependency is held by the segments flushed on top of it; nothing holds the top but
+	// the trees in it. Retained twice: the handle's, and the slab's as the newest segment.
+	root := top.global(top.root)
+	if root == 0 {
+		s.retireSegment(top)
+		return s.adopt(0), nil
+	}
+	s.retain(root)
+	s.retain(root)
+	s.rebaseTo = root
 	return s.adopt(root), nil
 }
 
-// rebased returns h, or - when h was made before its slab's latest segment - an equal tree that
+// rebased returns h, or - when h was made before its slab's newest segment - an equal tree that
 // refers into that segment wherever it can. Called before an update derives from h.
 func (h *trieTree) rebased() *trieTree {
 	if h == nil || h.gen == h.slab.gen.Load() {
@@ -741,11 +931,10 @@ func (e *trieEdit) translate(now, file tref) tref {
 	return r
 }
 
-// maybeRewrite starts a background rewrite of h when the slab's resident records have passed its
+// maybeRewrite starts a background flush of h when the slab's resident records have passed its
 // file's budget, and at least half the budget has been created since the last one. Records
 // created since the last GC cycle are left out of "resident": most are the paths updates
-// replaced, garbage the collector has not reached yet, and writing the tree out does nothing
-// about them.
+// replaced, garbage the collector has not reached yet, and a flush does nothing about them.
 func (s *trieSlab) maybeRewrite(h *trieTree) {
 	f := s.file.Load()
 	if f == nil || h == nil || h.root == 0 {
@@ -765,25 +954,24 @@ func (s *trieSlab) maybeRewrite(h *trieTree) {
 	}
 	go func() {
 		defer s.rewriting.Store(false)
-		if err := s.rewrite(f, h); err != nil {
+		if _, err := s.writeOut(f, h, -1, false); err != nil {
 			f.fail(err)
 		}
 	}()
 }
 
-// rewrite writes h out as a new segment and makes it what older trees rebase onto.
-func (s *trieSlab) rewrite(f *TreeFile, h *trieTree) error {
-	g, err := writeSegmentFrom(f, h)
+// writeOut writes h to a new segment (writeSegmentFrom), registers it, and makes it what older
+// trees rebase onto.
+func (s *trieSlab) writeOut(f *TreeFile, h *trieTree, docs int, full bool) (*treeSegment, error) {
+	g, err := writeSegmentFrom(f, h, docs, full)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.register(g); err != nil {
-		g.region.Release()
-		g.mapping.Close()
-		os.Remove(g.path)
-		return err
+		g.unmap(true)
+		return nil, err
 	}
 	root := g.global(g.root)
 	s.retain(root)
@@ -792,14 +980,13 @@ func (s *trieSlab) rewrite(f *TreeFile, h *trieTree) error {
 	s.createdAtRewrite = s.created
 	s.gen.Add(1)
 	s.release(old)
-	return nil
+	return g, nil
 }
 
 // --- Public API ------------------------------------------------------------------------------
 
-// Paged reports whether t is bound to a tree file, and how many of its records it reaches only
-// through mapped segments is not tracked; mapped is whether its root itself is in a segment
-// (true right after an open that mapped one, or once a rewrite has been rebased onto).
+// Paged reports whether t is bound to a tree file, and whether its root itself is in a mapped
+// segment (true right after an open that mapped one, or once an update has rebased onto one).
 func (t DocumentTree) Paged() (bound, mapped bool) {
 	if t.trie == nil {
 		return false, false
@@ -813,7 +1000,7 @@ func (t DocumentTree) Paged() (bound, mapped bool) {
 func OpenTreePacked(packed []byte, f *TreeFile) (DocumentTree, error) {
 	items := packedItems(packed)
 	for i := 1; i < len(items); i++ {
-		if keyLess(&items[i].key, &items[i-1].key) || items[i].key == items[i-1].key {
+		if bytes.Compare(items[i-1].key[:], items[i].key[:]) >= 0 {
 			return DocumentTree{}, fmt.Errorf("document: packed tree entries out of order at %d", i)
 		}
 	}
@@ -831,12 +1018,11 @@ func OpenTreePacked(packed []byte, f *TreeFile) (DocumentTree, error) {
 	if f.writable() {
 		g, err := buildSegmentPacked(f, items)
 		if err == nil {
-			if err = f.writeSource(g, digest); err == nil {
-				if h, aerr := attachSegment(f, g); aerr == nil {
-					f.dropOthers(g.seq)
+			var h *trieTree
+			if h, err = attachChain(f, g); err == nil {
+				if err = f.writeSource(g, digest); err == nil {
+					f.dropOthers()
 					return DocumentTree{TreeHash: h.rootHash(), trie: h, size: g.docs}, nil
-				} else {
-					err = aerr
 				}
 			}
 		}
@@ -849,16 +1035,25 @@ func OpenTreePacked(packed []byte, f *TreeFile) (DocumentTree, error) {
 	return BindTreeFile(t, f), nil
 }
 
-func keyLess(a, b *[16]byte) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return a[i] < b[i]
-		}
+// OpenTreeEntries is OpenTreePacked for a checkpoint that lists its tree as entries (format v2):
+// packed in id order they are the same bytes AppendPacked gave the checkpoint's SaveTreeSegment.
+func OpenTreeEntries(entries map[codec.UUID]codec.Hash, f *TreeFile) (DocumentTree, error) {
+	if f == nil {
+		return BuildTrieDocumentTree(entries)
 	}
-	return false
+	items := make([]trieItem, 0, len(entries))
+	for id, h := range entries {
+		items = append(items, trieItem{key: uuidKey(id), hash: h})
+	}
+	slices.SortFunc(items, func(a, b trieItem) int { return bytes.Compare(a.key[:], b.key[:]) })
+	var packed []byte
+	if len(items) > 0 {
+		packed = unsafe.Slice((*byte)(unsafe.Pointer(&items[0])), len(items)*PackedTreeEntrySize)
+	}
+	return OpenTreePacked(packed, f)
 }
 
-// attachDigest maps the newest segment tagged with digest, if one verifies.
+// attachDigest maps the newest segment tagged with digest, and its chain, if they verify.
 func (f *TreeFile) attachDigest(digest [32]byte, docs int) (DocumentTree, bool) {
 	seqs := listTreeSegments(f.opts.Dir)
 	for i := len(seqs) - 1; i >= 0; i-- {
@@ -867,28 +1062,35 @@ func (f *TreeFile) attachDigest(digest [32]byte, docs int) (DocumentTree, bool) 
 		if err != nil || len(src) != 36 || binary.LittleEndian.Uint32(src[32:]) != crc32.Checksum(src[:32], treeCRC) || [32]byte(src[:32]) != digest {
 			continue
 		}
-		g, err := openTreeSegment(path)
+		g, err := openTreeSegment(f, path)
+		if err == nil && g.docs != docs {
+			g.unmap(false)
+			err = fmt.Errorf("document: tree segment %s holds %d documents, the checkpoint %d", path, g.docs, docs)
+		}
+		var h *trieTree
+		if err == nil {
+			if h, err = attachChain(f, g); err != nil {
+				g.unmap(false)
+			}
+		}
 		if err != nil {
 			log.Printf("kdb: tree file %s: %v - rebuilding", f.opts.Dir, err)
 			continue
 		}
-		g.file = f
-		if g.docs != docs {
-			g.region.Release()
-			g.mapping.Close()
-			continue
-		}
-		h, err := attachSegment(f, g)
-		if err != nil {
-			continue
-		}
-		f.mu.Lock()
-		f.keepSeq = g.seq
-		f.mu.Unlock()
-		f.dropOthers(g.seq)
+		f.markKeep(g)
+		f.dropOthers()
 		return DocumentTree{TreeHash: h.rootHash(), trie: h, size: g.docs}, true
 	}
 	return DocumentTree{}, false
+}
+
+// markKeep makes g and its chain the segments the next open needs.
+func (f *TreeFile) markKeep(g *treeSegment) {
+	keep := map[uint64]bool{}
+	g.chain(keep)
+	f.mu.Lock()
+	f.keep = keep
+	f.mu.Unlock()
 }
 
 // writeSource tags g as written for the packed image with digest, and keeps it on disk.
@@ -903,20 +1105,21 @@ func (f *TreeFile) writeSource(g *treeSegment, digest [32]byte) error {
 	if err := os.Rename(tmp, g.path+treeSrcSuffix); err != nil {
 		return err
 	}
-	f.mu.Lock()
-	f.keepSeq = g.seq
-	f.mu.Unlock()
+	f.markKeep(g)
 	return nil
 }
 
-// dropOthers deletes segment files other than keep that nothing in this process has mapped:
-// those of an earlier run. Segments a live slab maps are deleted when retired.
-func (f *TreeFile) dropOthers(keep uint64) {
+// dropOthers deletes segment files of an earlier run that the open did not attach: everything
+// but the chain it keeps. Called at open, before this run writes any segment of its own.
+func (f *TreeFile) dropOthers() {
 	if f.opts.ReadOnly {
 		return
 	}
+	f.mu.Lock()
+	keep := f.keep
+	f.mu.Unlock()
 	for _, seq := range listTreeSegments(f.opts.Dir) {
-		if seq < keep {
+		if !keep[seq] {
 			p := f.segPath(seq)
 			os.Remove(p)
 			os.Remove(p + treeSrcSuffix)
@@ -946,20 +1149,21 @@ func BindTreeFile(t DocumentTree, f *TreeFile) DocumentTree {
 		h.slab.file.CompareAndSwap(nil, f)
 		return t
 	}
-	g, err := writeSegmentFrom(f, h)
+	g, err := writeSegmentFrom(f, h, t.Size(), true)
 	if err == nil {
 		var nh *trieTree
-		if nh, err = attachSegment(f, g); err == nil {
+		if nh, err = attachChain(f, g); err == nil {
 			return DocumentTree{TreeHash: t.TreeHash, trie: nh, size: t.Size()}
 		}
+		g.unmap(true)
 	}
 	f.fail(err)
 	return t
 }
 
 // SaveTreeSegment, at a checkpoint whose packed tree image is packed, makes sure a segment holding
-// exactly t is on disk and tagged with the image's digest, so the next open maps it instead of
-// building anything. A no-op for a tree not bound to a writable tree file.
+// exactly t is on disk and tagged with the image's digest, so the next open maps it (and the
+// chain under it) instead of building anything. A no-op for a tree not bound to a writable file.
 func SaveTreeSegment(t DocumentTree, packed []byte) error {
 	h := t.trie
 	if h == nil || h.root == 0 {
@@ -974,34 +1178,19 @@ func SaveTreeSegment(t DocumentTree, packed []byte) error {
 	var g *treeSegment
 	if h.root&refFile != 0 {
 		s.mu.Lock()
-		cand := segmentOf(*s.segs.Load(), h.root)
-		if cand.global(cand.root) == h.root {
+		cand := segmentOf(*s.segs.p.Load(), h.root)
+		if cand.global(cand.root) == h.root && cand.docs == t.Size() {
 			g = cand
 		}
 		s.mu.Unlock()
 	}
 	if g == nil {
 		var err error
-		if g, err = writeSegmentFrom(f, h); err != nil {
+		if g, err = s.writeOut(f, h, t.Size(), false); err != nil {
 			return err
 		}
-		s.mu.Lock()
-		if err := s.register(g); err != nil {
-			s.mu.Unlock()
-			g.region.Release()
-			g.mapping.Close()
-			os.Remove(g.path)
-			return err
-		}
-		root := g.global(g.root)
-		s.retain(root)
-		old := s.rebaseTo
-		s.rebaseTo = root
-		s.createdAtRewrite = s.created
-		s.gen.Add(1)
-		s.release(old)
-		s.mu.Unlock()
 	}
 	runtime.KeepAlive(h)
 	return f.writeSource(g, digest)
 }
+

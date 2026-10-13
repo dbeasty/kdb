@@ -29,15 +29,6 @@ func packedOf(entries map[codec.UUID]codec.Hash) []byte {
 	return out
 }
 
-func randomEntriesFrom(r *rand.Rand, ids []codec.UUID) map[codec.UUID]codec.Hash {
-	m := make(map[codec.UUID]codec.Hash, len(ids))
-	for _, id := range ids {
-		var h codec.Hash
-		r.Read(h.Bytes[:])
-		m[id] = h
-	}
-	return m
-}
 
 func newTestTreeFile(t *testing.T, resident int64) *TreeFile {
 	t.Helper()
@@ -174,17 +165,18 @@ func TestTreeFileUpdatesMatchReference(t *testing.T) {
 		s.mu.Lock()
 		s.drain(-1)
 		s.mu.Unlock()
-		if len(*s.segs.Load()) <= 2 {
+		if len(*s.segs.p.Load()) <= f.opts.MaxSegments+1 {
 			break
 		}
 	}
-	if n := len(*s.segs.Load()); n > 2 {
-		t.Fatalf("%d segments still mapped after %d rewrites with only the live tree held", n, gens)
+	// The live tree spans at most MaxSegments (a longer chain is compacted), plus the newest.
+	if n := len(*s.segs.p.Load()); n > f.opts.MaxSegments+1 {
+		t.Fatalf("%d segments still mapped after %d writes with only the live tree held", n, gens)
 	}
-	if files := segmentFiles(t, f); len(files) > 3 {
+	if files := segmentFiles(t, f); len(files) > f.opts.MaxSegments+2 {
 		t.Fatalf("%d segment files on disk: %v", len(files), files)
 	}
-	t.Logf("%d updates, %d rewrites, %d segments mapped at the end", steps, gens, len(*s.segs.Load()))
+	t.Logf("%d updates, %d rewrites, %d segments mapped at the end", steps, gens, len(*s.segs.p.Load()))
 	runtime.KeepAlive(tree)
 }
 
@@ -438,7 +430,7 @@ func TestTreeFileResidentMemory(t *testing.T) {
 		heap2, _ := settledHeap()
 		open, churned := int64(heap1)-int64(heap0), int64(heap2)-int64(heap0)
 		st := tree.trie.slab.stats()
-		t.Logf("n=%d: slab %+v; segments %d", n, st, len(*tree.trie.slab.segs.Load()))
+		t.Logf("n=%d: slab %+v; segments %d", n, st, len(*tree.trie.slab.segs.p.Load()))
 		t.Logf("n=%d: heap after open %.2f MB, after 60k updates %.2f MB (budget %.0f MB), slab %.2f MB, %d rewrites",
 			n, float64(open)/(1<<20), float64(churned)/(1<<20), float64(budget)/(1<<20),
 			float64(tree.SlabBytes())/(1<<20), tree.trie.slab.gen.Load())

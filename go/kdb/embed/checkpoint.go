@@ -295,8 +295,25 @@ func legacyCheckpointFits(cp namespaceCheckpoint) bool {
 	return n <= legacyCheckpointMaxEntries
 }
 
+// saveTreeSegment gives a paged live tree (tree.file) a segment tagged with the checkpoint's
+// packed tree image, so the next open maps it instead of building the tree; packed is that image,
+// or nil to pack it here. The segment is a cache: failing to write one costs that open the
+// build, nothing more.
+func saveTreeSegment(cp namespaceCheckpoint, packed []byte) {
+	if bound, _ := cp.LiveTree.Paged(); !bound {
+		return
+	}
+	if packed == nil {
+		packed = cp.LiveTree.AppendPacked(make([]byte, 0, cp.LiveTree.Size()*document.PackedTreeEntrySize))
+	}
+	if err := document.SaveTreeSegment(cp.LiveTree, packed); err != nil {
+		log.Printf("kdb: namespace %s: writing the tree segment for the checkpoint: %v", cp.NamespaceID, err)
+	}
+}
+
 func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 	if legacyCheckpointFits(cp) {
+		saveTreeSegment(cp, nil)
 		return encodeLegacyCheckpoint(cp)
 	}
 	// Commits are packed (dag/checkpoint_packed.go): a snapshot hands them over packed already, and
@@ -331,12 +348,7 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 	}
 
 	packedTree := cp.LiveTree.AppendPacked(make([]byte, 0, cp.LiveTree.Size()*document.PackedTreeEntrySize))
-	// A paged live tree (tree.file) gets a segment tagged with this image, so the next open maps it
-	// instead of building the tree. The segment is a cache: failing to write one costs that open
-	// the build, nothing more.
-	if err := document.SaveTreeSegment(cp.LiveTree, packedTree); err != nil {
-		log.Printf("kdb: namespace %s: writing the tree segment for the checkpoint: %v", cp.NamespaceID, err)
-	}
+	saveTreeSegment(cp, packedTree)
 
 	segs := make([]codec.Value, 0, len(cp.Segments))
 	for _, sg := range cp.Segments {
@@ -669,7 +681,7 @@ func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile)
 		}
 		out.LiveTree = tree
 	} else {
-		tree, err := document.BuildTrieDocumentTree(live)
+		tree, err := document.OpenTreeEntries(live, tf)
 		if err != nil {
 			return out, err
 		}

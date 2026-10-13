@@ -179,7 +179,7 @@ type trieSlab struct {
 	// replaced, never modified, under mu. file is the binding to a tree directory, nil for a
 	// heap-only slab. gen counts segments written; rebaseTo is the latest one's root, which
 	// trees made before it are moved onto (retained by the slab; under mu).
-	segs             atomic.Pointer[[]*treeSegment]
+	segs             *segList
 	file             atomic.Pointer[treeFile]
 	gen              atomic.Uint32
 	rebaseTo         tref
@@ -206,8 +206,11 @@ const (
 )
 
 func newTrieSlab() *trieSlab {
-	s := &trieSlab{}
+	s := &trieSlab{segs: &segList{}}
 	s.self = weak.Make(s)
+	// A slab collected with segments still mapped - its last trees went in one cycle, so no
+	// release ever retired them - unmaps them here.
+	runtime.AddCleanup(s, closeSegList, s.segs)
 	return s
 }
 
@@ -224,7 +227,7 @@ type trieView struct {
 
 func (s *trieSlab) view() trieView {
 	v := trieView{nodes: s.nodes.dir(), leaves: s.leaves.dir()}
-	if g := s.segs.Load(); g != nil {
+	if g := s.segs.p.Load(); g != nil {
 		v.segs = *g
 	}
 	return v
@@ -298,7 +301,7 @@ func (s *trieSlab) retain(r tref) {
 	switch {
 	case r == 0:
 	case r&refFile != 0:
-		segmentOf(*s.segs.Load(), r).refs++
+		segmentOf(*s.segs.p.Load(), r).refs++
 	case r&refLeaf != 0:
 		*s.leaves.count(uint32(r &^ refLeaf))++
 	default:
@@ -310,7 +313,7 @@ func (s *trieSlab) release(r tref) {
 	switch {
 	case r == 0:
 	case r&refFile != 0:
-		g := segmentOf(*s.segs.Load(), r)
+		g := segmentOf(*s.segs.p.Load(), r)
 		if g.refs <= 0 {
 			panic("document: tree segment released more often than retained")
 		}
