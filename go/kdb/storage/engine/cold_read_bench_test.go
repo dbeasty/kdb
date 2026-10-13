@@ -137,7 +137,7 @@ func TestColdIndexHeapPerVersion(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
 	runtime.ReadMemStats(&after)
-	versions := len(l.frame)
+	versions := int(l.index.Stats().Keys)
 	perVersion := float64(int64(after.HeapAlloc)-int64(before.HeapAlloc)) / float64(versions)
 	t.Logf("cold index: %d versions, %.1f live heap bytes/version, %d heap objects/version*1000",
 		versions, perVersion, (int64(after.HeapObjects)-int64(before.HeapObjects))*1000/int64(versions))

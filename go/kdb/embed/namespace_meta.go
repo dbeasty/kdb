@@ -49,6 +49,12 @@ func graphDirPath(dataRoot, namespaceID string) string {
 	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "graph")
 }
 
+// deltaIndexDirPath is where a namespace's delta-index sidecars live (package deltaindex): one
+// file per sealed delta segment and index kind, derived from the log and rebuilt from it at will.
+func deltaIndexDirPath(dataRoot, namespaceID string) string {
+	return filepath.Join(dataRoot, "ns", filepath.FromSlash(namespaceID), "deltaidx")
+}
+
 func readNamespaceMeta(dataRoot, namespaceID string) (namespaceMeta, bool) {
 	raw, err := os.ReadFile(namespaceMetaPath(dataRoot, namespaceID))
 	if err != nil {

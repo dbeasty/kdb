@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"github.com/limidus/kdb/go/kdb/storage/deltaindex"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,6 +67,9 @@ type ServerEngine struct {
 	// version, and docsByHash is left unbounded - see SetColdLoader.
 	// Read on the miss path only, so an atomic load rather than a lock.
 	coldLoader atomic.Pointer[coldDocLoader]
+	// deltaLoader is the delta-log loader behind coldLoader, when there is one - kept so its
+	// index can be given a sidecar directory (ConfigureColdIndex) and closed with the engine.
+	deltaLoader *deltaColdLoader
 
 	// Bounded live bodies (StorageEngineConfig.BoundedLiveBodies). durabilityTracking is switched
 	// on by the runtime once something will tell this engine when a commit reaches the log
@@ -597,6 +601,34 @@ func (e *ServerEngine) PendingDurablePins() int {
 	return n
 }
 
+// ConfigureColdIndex gives the delta cold loader's index a directory for its per-segment
+// sidecars (see package deltaindex), so that only the newest segment's version locations stay
+// on the heap. readOnly uses sidecars already there and never writes one. A no-op for an engine
+// with no delta log behind it.
+func (e *ServerEngine) ConfigureColdIndex(dir string, readOnly bool) {
+	if e.deltaLoader != nil {
+		e.deltaLoader.index.SetDir(dir, readOnly)
+	}
+}
+
+// PruneColdIndex drops what the cold loader's index holds for delta segments that are no longer
+// in the log, and their sidecars. Called after truncation deletes segments.
+func (e *ServerEngine) PruneColdIndex() error {
+	if e.deltaLoader == nil {
+		return nil
+	}
+	return e.deltaLoader.index.Prune()
+}
+
+// ColdIndexStats reports the shape of the delta cold loader's index: zero until a version has
+// been looked for in the log. For tests and the memory breakdown.
+func (e *ServerEngine) ColdIndexStats() deltaindex.Stats {
+	if e.deltaLoader == nil {
+		return deltaindex.Stats{}
+	}
+	return e.deltaLoader.index.Stats()
+}
+
 func (e *ServerEngine) SetColdLoader(loader coldDocLoader, budgetBytes int64) {
 	if loader == nil {
 		e.coldLoader.Store(nil)
@@ -970,6 +1002,7 @@ func (f DefaultFactory) Open(namespaceID string, config storage.StorageEngineCon
 		// version from. Every other target keeps the version store
 		// unbounded, because for them memory is the only tier there is.
 		loader := newDeltaColdLoader(reader)
+		eng.deltaLoader = loader
 		eng.SetColdLoader(loader.load, storage.ResolvedDocumentCacheBytes(config))
 		// The fast path for an evicted version: a location record says
 		// which frame holds it, and this reads that frame. The scanning
@@ -1009,6 +1042,10 @@ func (h *defaultHandle) Adapter() storage.EvictableAdapter       { return h.adap
 func (h *defaultHandle) DeltaWriter() storage.DeltaSegmentWriter { return h.deltaWriter }
 func (h *defaultHandle) DeltaReader() storage.DeltaSegmentReader { return h.deltaReader }
 func (h *defaultHandle) Close() error {
+	if eng, ok := h.adapter.(*ServerEngine); ok && eng.deltaLoader != nil {
+		// After the engine's own close: nothing reads history once it is down.
+		defer eng.deltaLoader.index.Close()
+	}
 	if closer, ok := h.adapter.(interface{ Close() error }); ok {
 		return closer.Close()
 	}
