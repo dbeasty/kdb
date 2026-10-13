@@ -240,3 +240,24 @@ func TestSortedTableAccountingMatchesHeap(t *testing.T) {
 		t.Fatalf("SizeBytes %d, want the %d live value bytes", sz, want)
 	}
 }
+
+// Manager.Get serves memtable hits from the arena without copying, and a later overwrite (with
+// the compactions it causes) leaves a value already handed out untouched.
+func TestManagerGetIsSharedAndStable(t *testing.T) {
+	mgr := newManager(io.NewInMemoryPlatformIO())
+	k := seqKey(3)
+	mgr.Put(k, bytes.Repeat([]byte{'a'}, 1000))
+	got := mgr.Get(k)
+	if allocs := testing.AllocsPerRun(100, func() { _ = mgr.Get(k) }); allocs != 0 {
+		t.Fatalf("Manager.Get allocates %.0f times per memtable hit", allocs)
+	}
+	for i := 0; i < 500; i++ {
+		mgr.Put(k, bytes.Repeat([]byte{byte('b' + i%20)}, 900+i%50))
+	}
+	if !bytes.Equal(got, bytes.Repeat([]byte{'a'}, 1000)) {
+		t.Fatal("a value handed out by Get changed under a later write")
+	}
+	if cap(got) != len(got) {
+		t.Fatal("a shared value's capacity reaches past it: an append would write into the arena")
+	}
+}

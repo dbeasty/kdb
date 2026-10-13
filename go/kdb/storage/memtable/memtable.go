@@ -150,6 +150,27 @@ func (m *SortedTable) Lookup(key codec.Hash) (value []byte, deleted, found bool)
 	return append([]byte(nil), m.arena.bytes(r.chunk, r.off, r.n)...), false, true
 }
 
+// lookupShared is Lookup without the copy: the value is the arena's bytes, capacity-capped so an
+// append cannot reach the next value. Safe to hand out because arena bytes are never written
+// twice (compaction copies into new chunks), but the caller must treat it as read-only - which
+// Manager.Get's contract already requires.
+func (m *SortedTable) lookupShared(key codec.Hash) (value []byte, deleted, found bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i, ok := m.index[key]
+	if !ok {
+		return nil, false, false
+	}
+	r := &m.recs[i]
+	if r.deleted {
+		return nil, true, true
+	}
+	if r.n == 0 {
+		return nil, false, true // what Lookup's copy of an empty value has always been
+	}
+	return m.arena.bytes(r.chunk, r.off, r.n), false, true
+}
+
 // has is Lookup without the value: what Contains needs, without copying a value out to throw
 // it away.
 func (m *SortedTable) has(key codec.Hash) (deleted, found bool) {
@@ -350,20 +371,21 @@ func (mgr *Manager) Delete(key codec.Hash) {
 
 // Get returns the value for key from the newest generation that has one. The result is
 // read-only: a value served from an SSTable may be the block cache's shared copy (see
-// sstable.LsmBlobStore.Lookup).
+// sstable.LsmBlobStore.Lookup), and one served from a memtable is the arena's own bytes
+// (lookupShared), so neither is copied per hit.
 func (mgr *Manager) Get(key codec.Hash) []byte {
 	mgr.mu.Lock()
 	active := mgr.active
 	pending := mgr.pendingFlush
 	mgr.mu.Unlock()
-	if v, deleted, found := active.Lookup(key); found {
+	if v, deleted, found := active.lookupShared(key); found {
 		if deleted {
 			return nil
 		}
 		return v
 	}
 	if pending != nil {
-		if v, deleted, found := pending.Lookup(key); found {
+		if v, deleted, found := pending.lookupShared(key); found {
 			if deleted {
 				return nil
 			}
