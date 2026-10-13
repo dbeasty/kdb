@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -325,6 +326,8 @@ type DefaultReader struct {
 	// fps are fingerprints learned without a scan - from a checkpoint whose stamps still match -
 	// keyed by sequence. Guarded by scansMu. See RememberFingerprint.
 	fps map[int64]rememberedFP
+	// frames caches decompressed frame payloads for single-frame reads. See SetFrameCache.
+	frames atomic.Pointer[FrameCache]
 }
 
 type rememberedFP struct {
@@ -818,38 +821,104 @@ func (r *DefaultReader) commitAtOffset(segmentName string, offset int64) (docume
 	return r.readCommitFrame(segmentName, offset)
 }
 
-// frameProbeBytes is how much readCommitFrame reads on its first try: enough for the header and,
+// frameProbeBytes is how much readFrame reads on its first try: enough for the header and,
 // for most commits, the whole frame, so one read usually suffices where two always did.
 const frameProbeBytes = 4 << 10
 
-// readCommitFrame decodes the single frame at offset, reading only that frame's bytes.
+// readCommitFrame decodes the single frame at offset, reading only that frame's bytes - or none,
+// when the frame cache holds its payload.
+func (r *DefaultReader) readCommitFrame(segmentName string, offset int64) (document.Commit, error) {
+	var commit document.Commit
+	err := r.withFramePayload(segmentName, offset, func(payload []byte) error {
+		c, err := document.FromPayloadBytes(payload)
+		if err != nil {
+			return &CorruptFrameError{Offset: int(offset), Reason: err.Error()}
+		}
+		commit = c
+		return nil
+	})
+	return commit, err
+}
+
+// withFramePayload calls fn with the decompressed payload of the frame at offset in segmentName.
+// The payload is valid only during the call: nothing fn keeps may alias it, which FromPayloadBytes
+// and ScanCommitWrites' callers both honour (see PageCodec.parseCommit).
+//
+// The payload comes from the frame cache when it holds this frame of this incarnation of the
+// segment (see FrameCache), and otherwise from disk: one frame read, its CRC checked, its body
+// decompressed - after which a cache-enabled reader keeps a copy for the next read. A frame that
+// fails its CRC or will not parse as a frame is reported as a *CorruptFrameError and never cached.
+func (r *DefaultReader) withFramePayload(segmentName string, offset int64, fn func(payload []byte) error) error {
+	cache := r.frames.Load()
+	var key frameKey
+	cacheable := false
+	if cache != nil {
+		if g, ok := r.shim.(storage.SegmentGenerationer); ok {
+			if gen, ok := g.SegmentGeneration(segmentName); ok {
+				key, cacheable = frameKey{gen: gen, off: offset}, true
+				if bp, hit := cache.get(key); hit {
+					err := fn(*bp)
+					bufpool.Put(bp)
+					return err
+				}
+			}
+		}
+	}
+	frame, frameBuf, err := r.readFrame(segmentName, offset)
+	if err != nil {
+		return err
+	}
+	defer bufpool.Put(frameBuf)
+	frameEnd, ok := frameBounds(frame, 0)
+	if !ok {
+		return &CorruptFrameError{Offset: int(offset), Reason: "no complete frame at this offset"}
+	}
+	frame = frame[:frameEnd]
+	if err := verifyFrameCRC(frame, int(offset)); err != nil {
+		return err
+	}
+	payload, payloadBuf, err := framePayload(frame)
+	if err != nil {
+		return &CorruptFrameError{Offset: int(offset), Reason: err.Error()}
+	}
+	defer bufpool.Put(payloadBuf)
+	if cacheable {
+		cache.put(key, payload)
+	}
+	return fn(payload)
+}
+
+// readFrame reads the frame at offset: its header and as much of the body as the header declares
+// and the segment holds. Whether that is a complete frame is the caller's to check.
 //
 // Through a shim that can read into the caller's buffer (storage.SegmentIntoReader) the frame
-// is read into a pooled buffer - and usually in one read, since the first one fetches
-// frameProbeBytes and most frames fit - then decoded and the buffer returned. That is safe because
-// nothing the decode returns refers to the frame's bytes: see PageCodec.parseCommit. Otherwise,
-// and for a frame too large to pool, it reads the header and then the frame, as it always has.
-func (r *DefaultReader) readCommitFrame(segmentName string, offset int64) (document.Commit, error) {
+// is read into a pooled buffer, returned as buf for the caller to bufpool.Put once done - and
+// usually in one read, since the first one fetches frameProbeBytes and most frames fit. Otherwise,
+// and for a frame too large to pool, it reads the header and then the frame into fresh memory,
+// and buf is nil.
+func (r *DefaultReader) readFrame(segmentName string, offset int64) (frame []byte, buf *[]byte, err error) {
 	into, ok := r.shim.(storage.SegmentIntoReader)
 	if !ok {
-		return r.readCommitFrameAlloc(segmentName, offset)
+		frame, err := r.readFrameAlloc(segmentName, offset)
+		return frame, nil, err
 	}
 	bp := bufpool.Get(frameProbeBytes)
 	n, err := into.ReadFromSegmentInto(segmentName, offset, *bp)
 	if err != nil {
 		bufpool.Put(bp)
-		return document.Commit{}, err
+		return nil, nil, err
 	}
 	if n < PageFrameHeaderSize {
 		bufpool.Put(bp)
-		return document.Commit{}, &CorruptFrameError{Offset: int(offset), Reason: "segment ends inside the frame header"}
+		return nil, nil, &CorruptFrameError{Offset: int(offset), Reason: "segment ends inside the frame header"}
 	}
 	frameLen := PageFrameHeaderSize + readIntBE(*bp, 8)
 	if frameLen > n && n == len(*bp) {
 		// The frame continues past the probe.
 		if frameLen > bufpool.MaxPooled {
 			bufpool.Put(bp)
-			return r.readCommitFrameAlloc(segmentName, offset)
+			frame, err := r.readFrameAlloc(segmentName, offset)
+			return frame, nil, err
 		}
 		big := bufpool.Get(frameLen)
 		copy(*big, (*bp)[:n])
@@ -858,33 +927,27 @@ func (r *DefaultReader) readCommitFrame(segmentName string, offset int64) (docum
 		m, err := into.ReadFromSegmentInto(segmentName, offset+int64(n), (*bp)[n:])
 		if err != nil {
 			bufpool.Put(bp)
-			return document.Commit{}, err
+			return nil, nil, err
 		}
 		n += m
 	}
 	if n > frameLen {
 		n = frameLen
 	}
-	commit, err := DecodeFrame((*bp)[:n], int(offset))
-	bufpool.Put(bp)
-	return commit, err
+	return (*bp)[:n], bp, nil
 }
 
-// readCommitFrameAlloc is readCommitFrame through plain ReadFromSegment: a header read, then the
-// frame into a fresh buffer.
-func (r *DefaultReader) readCommitFrameAlloc(segmentName string, offset int64) (document.Commit, error) {
+// readFrameAlloc is readFrame through plain ReadFromSegment: a header read, then the frame into
+// a fresh buffer.
+func (r *DefaultReader) readFrameAlloc(segmentName string, offset int64) ([]byte, error) {
 	header, err := r.shim.ReadFromSegment(segmentName, offset, PageFrameHeaderSize)
 	if err != nil {
-		return document.Commit{}, err
+		return nil, err
 	}
 	if len(header) < PageFrameHeaderSize {
-		return document.Commit{}, &CorruptFrameError{Offset: int(offset), Reason: "segment ends inside the frame header"}
+		return nil, &CorruptFrameError{Offset: int(offset), Reason: "segment ends inside the frame header"}
 	}
-	raw, err := r.shim.ReadFromSegment(segmentName, offset, PageFrameHeaderSize+readIntBE(header, 8))
-	if err != nil {
-		return document.Commit{}, err
-	}
-	return DecodeFrame(raw, int(offset))
+	return r.shim.ReadFromSegment(segmentName, offset, PageFrameHeaderSize+readIntBE(header, 8))
 }
 
 // StreamCommits implements storage.DeltaCommitStreamer: it hands segment's
@@ -920,6 +983,33 @@ func (r *DefaultReader) ReadCommitAt(segment storage.DeltaSegmentRef, frameOffse
 	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
 	return r.readCommitFrame(segmentName, frameOffset)
 }
+
+// ReadDocumentAt implements storage.DeltaDocumentReader: it calls fn with the patch of every write
+// of docID in the commit framed at frameOffset, in order, until fn returns false - without
+// decoding the rest of the commit (see document.ScanCommitWrites). The patch is valid only during
+// the call; a caller that keeps it copies it.
+//
+// This is the cold point read: one version out of a commit that may hold hundreds. It costs the
+// frame read and decompression ReadCommitAt does (both skipped when the frame cache holds the
+// frame) but none of the decode.
+func (r *DefaultReader) ReadDocumentAt(segment storage.DeltaSegmentRef, frameOffset int64, docID codec.UUID, fn func(patch []byte) bool) error {
+	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
+	return r.withFramePayload(segmentName, frameOffset, func(payload []byte) error {
+		if err := document.ScanCommitWrites(payload, docID, fn); err != nil {
+			return &CorruptFrameError{Offset: int(frameOffset), Reason: err.Error()}
+		}
+		return nil
+	})
+}
+
+// SetFrameCache puts c in front of this reader's single-frame reads (ReadCommitAt, ReadDocumentAt).
+// nil removes it. A cache may be shared by readers of different namespaces: keys name segment
+// incarnations, which are unique across the process. Only shims that report segment generations
+// (storage.SegmentGenerationer) are cached; through any other, reads go to disk as before.
+func (r *DefaultReader) SetFrameCache(c *FrameCache) { r.frames.Store(c) }
+
+// FrameCache reports the cache SetFrameCache installed, or nil.
+func (r *DefaultReader) FrameCache() *FrameCache { return r.frames.Load() }
 
 // LegacySegmentFormatError reports a data directory containing delta
 // segments named by the pre-Layer-13 scheme (random UUIDs) rather than
