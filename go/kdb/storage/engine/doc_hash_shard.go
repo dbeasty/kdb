@@ -20,10 +20,8 @@ const docHashShardCount = 64
 // load - far worse than slightly overshooting a very small budget.
 const minDocHashShardBudgetBytes int64 = 64 << 10
 
-// docHashEntry is one cached version. It lives in the shard's map by value (no allocation of its
-// own) and carries its pin count, so there is no separate pin map: on a large namespace almost
-// every version is pinned, and a map[Hash]int beside the cache cost ~80 bytes per document on top
-// of the entry itself.
+// docHashEntry is one loaded version. It lives in the shard's map by value (no allocation of its
+// own) and carries its pin count while it is loaded.
 type docHashEntry struct {
 	doc  document.Document
 	size int64
@@ -36,14 +34,18 @@ type docHashEntry struct {
 	// commit took 0.36 s at 200k documents against 15 ms at 10k).
 	el   *list.Element
 	pins int32
-	// loaded is false for a placeholder: the engine pins a version before it stores it, so a pin
-	// can exist before the document does. A placeholder is invisible to Get and costs no bytes.
-	loaded bool
 }
 
 type docHashShard struct {
-	mu     sync.Mutex
-	docs   map[codec.Hash]docHashEntry
+	mu   sync.Mutex
+	docs map[codec.Hash]docHashEntry
+	// pinned holds the pin counts of versions that are pinned but not loaded - the live tree's
+	// versions that nothing has read yet, which after an open is nearly all of them. Kept apart
+	// from docs because a docHashEntry is ~90 bytes of slot holding pointers the collector scans,
+	// and a million of those placeholders came to 191 MB; this map's key and value hold no
+	// pointers, cost ~45 bytes a slot, and are never scanned. A version moves to docs, taking its
+	// count, when it is stored.
+	pinned map[codec.Hash]int32
 	lru    *list.List
 	bytes  int64
 	budget int64
@@ -92,6 +94,7 @@ func newShardedDocByHashStore(budgetBytes int64) *shardedDocByHashStore {
 	for i := range s.shards {
 		s.shards[i] = &docHashShard{
 			docs:   make(map[codec.Hash]docHashEntry),
+			pinned: make(map[codec.Hash]int32),
 			lru:    list.New(),
 			budget: perShard,
 		}
@@ -118,15 +121,19 @@ func (s *shardedDocByHashStore) Put(h codec.Hash, doc document.Document) {
 	sh := s.shardFor(h)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	e, ok := sh.docs[h]
-	if ok && e.loaded {
+	if e, ok := sh.docs[h]; ok {
 		if e.el != nil {
 			sh.lru.MoveToFront(e.el)
 		}
 		return
 	}
-	// A placeholder (pinned before it was stored) is filled in; otherwise this is a new entry.
-	e.doc, e.size, e.loaded = doc, entrySizeBytes(doc), true
+	// Pinned before it was stored (the engine pins a version before its commit is written)
+	// carries its count across; otherwise this is a new, evictable entry.
+	e := docHashEntry{doc: doc, size: entrySizeBytes(doc)}
+	if n, ok := sh.pinned[h]; ok {
+		e.pins = n
+		delete(sh.pinned, h)
+	}
 	if e.pins == 0 {
 		e.el = sh.lru.PushFront(h)
 	}
@@ -163,7 +170,7 @@ func (s *shardedDocByHashStore) Get(h codec.Hash) (document.Document, bool) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	e, ok := sh.docs[h]
-	if !ok || !e.loaded {
+	if !ok {
 		return document.Document{}, false
 	}
 	if e.el != nil {
@@ -179,13 +186,16 @@ func (s *shardedDocByHashStore) Get(h codec.Hash) (document.Document, bool) {
 func (s *shardedDocByHashStore) Pin(h codec.Hash) {
 	sh := s.shardFor(h)
 	sh.mu.Lock()
-	e := sh.docs[h]
-	e.pins++
-	if e.el != nil {
-		sh.lru.Remove(e.el)
-		e.el = nil
+	if e, ok := sh.docs[h]; ok {
+		e.pins++
+		if e.el != nil {
+			sh.lru.Remove(e.el)
+			e.el = nil
+		}
+		sh.docs[h] = e
+	} else {
+		sh.pinned[h]++
 	}
-	sh.docs[h] = e
 	sh.mu.Unlock()
 }
 
@@ -204,14 +214,15 @@ func (s *shardedDocByHashStore) Unpin(h codec.Hash) {
 	sh.mu.Lock()
 	if e, ok := sh.docs[h]; ok && e.pins > 0 {
 		e.pins--
-		switch {
-		case e.pins > 0:
-			sh.docs[h] = e
-		case !e.loaded:
-			delete(sh.docs, h) // a placeholder nobody holds any more
-		default:
+		if e.pins == 0 {
 			e.el = sh.lru.PushFront(h)
-			sh.docs[h] = e
+		}
+		sh.docs[h] = e
+	} else if n, ok := sh.pinned[h]; ok {
+		if n <= 1 {
+			delete(sh.pinned, h) // a placeholder nobody holds any more
+		} else {
+			sh.pinned[h] = n - 1
 		}
 	}
 	sh.evictLocked()

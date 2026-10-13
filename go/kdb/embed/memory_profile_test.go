@@ -96,6 +96,24 @@ func TestMemoryProfile(t *testing.T) {
 		took := time.Since(start)
 		openPeak := peak.stop()
 		report(t, "open", fmt.Sprintf("took=%v peakHeapDuringOpen=%s", took.Round(time.Millisecond), mb(openPeak)))
+		if dir := os.Getenv("KDB_MEMPROFILE_PPROF"); dir != "" { // what the live heap after open is made of
+			runtime.GC()
+			f, err := os.Create(filepath.Join(dir, "heap-after-open.pb.gz"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pprof.Lookup("heap").WriteTo(f, 0)
+			f.Close()
+			cpu, err := os.Create(filepath.Join(dir, "open-cpu.pb.gz"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rt.Close()
+			pprof.StartCPUProfile(cpu) // a second open, profiled, to say where the time goes
+			rt = open()
+			pprof.StopCPUProfile()
+			cpu.Close()
+		}
 		rt.Close()
 
 	case "reads":

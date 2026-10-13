@@ -1,6 +1,8 @@
 package document
 
 import (
+	"bytes"
+	"fmt"
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -149,6 +151,81 @@ func BuildDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) 
 	}
 	root := trieBuild(entries)
 	return DocumentTree{TreeHash: trieTreeHash(root), Entries: entries, trieRoot: root}, nil
+}
+
+// BuildTrieDocumentTree is BuildDocumentTree without keeping the flat map: the tree is backed by
+// its trie alone, as one produced by With/Without is. For a tree that will live for the life of
+// the process - the live tree an open restores from a checkpoint - where holding both the map and
+// the trie cost ~120 bytes per document twice over (120 MB at a million documents). entries may
+// be dropped by the caller afterwards.
+func BuildTrieDocumentTree(entries map[codec.UUID]codec.Hash) (DocumentTree, error) {
+	root := trieBuild(entries)
+	return DocumentTree{TreeHash: trieTreeHash(root), trieRoot: root, size: len(entries)}, nil
+}
+
+// PackedTreeEntrySize is one entry of a packed tree: the document id's 16 bytes, then its 32-byte
+// content hash.
+const PackedTreeEntrySize = 16 + 32
+
+// AppendPacked appends the tree's entries to dst in ascending id order, PackedTreeEntrySize bytes
+// each. A trie walk already visits ids in that order, so a trie-backed tree packs without sorting.
+// For a checkpoint: a million entries as generic codec records cost the better part of a gigabyte
+// to encode and again to decode, against 48 MB packed.
+func (t DocumentTree) AppendPacked(dst []byte) []byte {
+	start := len(dst)
+	t.Walk(func(id codec.UUID, h codec.Hash) bool {
+		dst = append(dst, id.Bytes()...)
+		dst = append(dst, h.Bytes[:]...)
+		return true
+	})
+	if t.Entries != nil { // a map walk is unordered
+		packed := dst[start:]
+		n := len(packed) / PackedTreeEntrySize
+		idx := make([]int, n)
+		for i := range idx {
+			idx[i] = i
+		}
+		sort.Slice(idx, func(a, b int) bool {
+			return bytes.Compare(packed[idx[a]*PackedTreeEntrySize:idx[a]*PackedTreeEntrySize+16],
+				packed[idx[b]*PackedTreeEntrySize:idx[b]*PackedTreeEntrySize+16]) < 0
+		})
+		sorted := make([]byte, 0, len(packed))
+		for _, i := range idx {
+			sorted = append(sorted, packed[i*PackedTreeEntrySize:(i+1)*PackedTreeEntrySize]...)
+		}
+		dst = append(dst[:start], sorted...)
+	}
+	return dst
+}
+
+// BuildTrieDocumentTreePacked builds a trie-backed tree from AppendPacked's output without an
+// intermediate map: entries already in ascending id order go straight to the bulk build. Entries
+// that are not strictly ascending (a corrupt or foreign input) are an error, never a silently
+// different tree.
+func BuildTrieDocumentTreePacked(packed []byte) (DocumentTree, error) {
+	if len(packed)%PackedTreeEntrySize != 0 {
+		return DocumentTree{}, fmt.Errorf("document: packed tree of %d bytes is not a whole number of entries", len(packed))
+	}
+	n := len(packed) / PackedTreeEntrySize
+	items := make([]trieItem, n)
+	for i := range items {
+		e := packed[i*PackedTreeEntrySize : (i+1)*PackedTreeEntrySize]
+		id, err := codec.UUIDFromBytes(e[:16])
+		if err != nil {
+			return DocumentTree{}, err
+		}
+		if i > 0 && bytes.Compare(items[i-1].key, e[:16]) >= 0 {
+			return DocumentTree{}, fmt.Errorf("document: packed tree entries out of order at %d", i)
+		}
+		var h codec.Hash
+		copy(h.Bytes[:], e[16:])
+		items[i] = trieItem{key: e[:16:16], id: id, hash: h}
+	}
+	var root *trieNode
+	if n > 0 {
+		root = trieBuildRange(items, 0, n >= 4096)
+	}
+	return DocumentTree{TreeHash: trieTreeHash(root), trieRoot: root, size: n}, nil
 }
 
 func entriesToArrayValue(entries map[codec.UUID]codec.Hash) codec.Value {

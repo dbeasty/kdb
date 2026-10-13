@@ -1,10 +1,13 @@
 package dag
 
 import (
+	"bytes"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 
@@ -47,6 +50,9 @@ func viewOf(t *testing.T, b *dagBuilder, hashes []codec.Hash) graphView {
 		byTx:     map[codec.UUID]codec.Hash{},
 		count:    d.CommitCount(),
 		horizon:  len(d.Horizon()),
+	}
+	if got, want := sortedHashes(d.Horizon()), naiveHorizon(d); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Horizon %v disagrees with a walk of every commit %v", got, want)
 	}
 	for _, h := range hashes {
 		c, ok := d.GetCommit(h)
@@ -618,5 +624,80 @@ func TestGraphFindMatchesLinearScan(t *testing.T) {
 		if ok != want {
 			t.Fatalf("find(%x) = %v, linear scan says %v", h.Bytes[:4], ok, want)
 		}
+	}
+}
+
+// naiveHorizon is Horizon by walking every commit - what the candidate-only walk must agree with.
+func naiveHorizon(d *InMemoryCommitDag) []codec.Hash {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	seen := map[codec.Hash]struct{}{}
+	for h := range d.shallow {
+		seen[h] = struct{}{}
+	}
+	d.nodes.forEach(func(h codec.Hash) {
+		d.nodes.forEachParent(h, func(p codec.Hash) bool {
+			_, st := d.stubs[p]
+			if d.nodes.has(p) || st {
+				return true
+			}
+			seen[h] = struct{}{}
+			return false
+		})
+	})
+	out := make([]codec.Hash, 0, len(seen))
+	for h := range seen {
+		out = append(out, h)
+	}
+	return sortedHashes(out)
+}
+
+func sortedHashes(hs []codec.Hash) []codec.Hash {
+	out := append([]codec.Hash(nil), hs...)
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Bytes[:], out[j].Bytes[:]) < 0 })
+	return out
+}
+
+// Horizon after commits are removed from beneath segment commits - stubbed (not on the horizon)
+// and dropped outright (on it) - must match the walk of every commit.
+func TestGraphHorizonMatchesFullWalk(t *testing.T) {
+	b, _, head := segmentedDag(t, 1, 8)
+	c, _ := b.dag.GetCommit(head)
+	mid := c.ParentHashes[0]
+	cm, _ := b.dag.GetCommit(mid)
+	below := cm.ParentHashes[0]
+	b.dag.mu.Lock()
+	b.dag.stubs[below] = document.CommitStub{OriginalHash: below}
+	b.dag.nodes.delete(below)
+	b.dag.mu.Unlock()
+	viewOf(t, b, []codec.Hash{head})
+	b.dag.mu.Lock()
+	delete(b.dag.stubs, below) // now missing outright: mid is on the horizon
+	b.dag.mu.Unlock()
+	if got := sortedHashes(b.dag.Horizon()); !reflect.DeepEqual(got, naiveHorizon(b.dag)) || len(got) == 0 {
+		t.Fatalf("Horizon %v after an unstubbed removal; want %v", got, naiveHorizon(b.dag))
+	}
+}
+
+// A section codec this build does not know - an encrypted or compressed section from a later
+// build - makes the segment unusable, never misread.
+func TestGraphSegmentUnknownSectionCodecIsUnusable(t *testing.T) {
+	b, _, path := graphDag(t)
+	if err := b.dag.RebuildGraphFile(); err != nil {
+		t.Fatal(err)
+	}
+	seg := onlySegment(t, path)
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foot := raw[len(raw)-graphFooterSize:]
+	le.PutUint32(foot[secMsgs*20+16:], 7) // MSGS "sealed" with codec 7
+	le.PutUint32(foot[graphFooterSize-8:], crc32.Checksum(raw[:len(raw)-8], crcTable))
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openGraphBase(seg, "ns"); !errors.Is(err, errGraphFile) {
+		t.Fatalf("segment with an unknown section codec opened: %v", err)
 	}
 }

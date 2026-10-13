@@ -241,3 +241,110 @@ func BenchmarkIncrementalWith_vs_FullRebuild(b *testing.B) {
 		}
 	})
 }
+
+// trieBulkMatchesInsert: the bulk, parallel build must be the same trie, node for node, as
+// inserting the entries one at a time - the hash every stored tree and the Kotlin port agree on.
+func TestTrieBulkBuildMatchesInsert(t *testing.T) {
+	for _, n := range []int{0, 1, 2, 3, 17, 255, 4095, 4096, 20000} {
+		entries := make(map[codec.UUID]codec.Hash, n)
+		for i := 0; i < n; i++ {
+			id, _ := codec.RandomUUID()
+			var h codec.Hash
+			h.Bytes[0], h.Bytes[1], h.Bytes[2] = byte(i), byte(i>>8), byte(i>>16)
+			entries[id] = h
+		}
+		// Keys sharing long prefixes exercise the single-child chains.
+		if n > 3 {
+			base, _ := codec.RandomUUID()
+			b := base.Bytes()
+			for k := 0; k < 3; k++ {
+				c := append([]byte(nil), b...)
+				c[15] ^= byte(k + 1)
+				id, _ := codec.UUIDFromBytes(c)
+				entries[id] = codec.Hash{}
+			}
+		}
+		var inserted *trieNode
+		for id, h := range entries {
+			inserted = trieInsert(inserted, id, h)
+		}
+		bulk := trieBuild(entries)
+		if !trieNodesEqual(inserted, bulk) {
+			t.Fatalf("n=%d: bulk-built trie differs from the inserted one", n)
+		}
+		if trieTreeHash(inserted) != trieTreeHash(bulk) {
+			t.Fatalf("n=%d: tree hash differs", n)
+		}
+		tree, _ := BuildTrieDocumentTree(entries)
+		full, _ := BuildDocumentTree(entries)
+		if tree.TreeHash != full.TreeHash || tree.Size() != full.Size() || tree.Entries != nil {
+			t.Fatalf("n=%d: trie-only tree disagrees with BuildDocumentTree", n)
+		}
+		for id, h := range entries {
+			if got, ok := tree.HashFor(id); !ok || got != h {
+				t.Fatalf("n=%d: trie-only tree lost %v", n, id)
+			}
+		}
+	}
+}
+
+func trieNodesEqual(a, b *trieNode) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.hash != b.hash {
+		return false
+	}
+	if (a.leaf == nil) != (b.leaf == nil) || (a.children == nil) != (b.children == nil) {
+		return false
+	}
+	if a.leaf != nil && *a.leaf != *b.leaf {
+		return false
+	}
+	if a.children != nil {
+		for i := range a.children {
+			if !trieNodesEqual(a.children[i], b.children[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// A packed tree round-trips to the same tree, from either kind of source tree, and malformed
+// packing is an error rather than a different tree.
+func TestPackedTreeRoundTrip(t *testing.T) {
+	for _, n := range []int{0, 1, 5, 5000} {
+		entries := make(map[codec.UUID]codec.Hash, n)
+		for i := 0; i < n; i++ {
+			id, _ := codec.RandomUUID()
+			var h codec.Hash
+			h.Bytes[0] = byte(i)
+			entries[id] = h
+		}
+		mapTree, _ := BuildDocumentTree(entries) // Entries-backed: unordered walk
+		trieTree, _ := BuildTrieDocumentTree(entries)
+		for name, src := range map[string]DocumentTree{"map": mapTree, "trie": trieTree} {
+			packed := src.AppendPacked(nil)
+			if len(packed) != n*PackedTreeEntrySize {
+				t.Fatalf("%s n=%d: packed %d bytes", name, n, len(packed))
+			}
+			got, err := BuildTrieDocumentTreePacked(packed)
+			if err != nil {
+				t.Fatalf("%s n=%d: %v", name, n, err)
+			}
+			if got.TreeHash != src.TreeHash || got.Size() != n {
+				t.Fatalf("%s n=%d: packed round trip changed the tree", name, n)
+			}
+		}
+	}
+	two, _ := BuildTrieDocumentTree(map[codec.UUID]codec.Hash{{MSB: 1}: {}, {MSB: 2}: {}})
+	p := two.AppendPacked(nil)
+	swapped := append(append([]byte(nil), p[PackedTreeEntrySize:]...), p[:PackedTreeEntrySize]...)
+	if _, err := BuildTrieDocumentTreePacked(swapped); err == nil {
+		t.Fatal("out-of-order packed entries accepted")
+	}
+	if _, err := BuildTrieDocumentTreePacked(p[:10]); err == nil {
+		t.Fatal("a ragged packed tree accepted")
+	}
+}

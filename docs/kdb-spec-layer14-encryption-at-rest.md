@@ -115,7 +115,7 @@ bytes without parsing (`conflict_detection.go:198`). The encryptable surface is 
 registry is already a payload-blind relay — `kdb-service` runs schema NONE today
 (`kdb-service/.../KdbServiceMain.kt:279`).
 
-### 2.6 LEAK: five places plaintext or metadata escapes that encryption must close
+### 2.6 LEAK: six places plaintext or metadata escapes that encryption must close
 
 1. **Debug sidecar** appends full commit contents as plaintext JSONL outside the shim
    (`kdb-inspect/.../FileSidecarWriter.jvm.kt:13-32`); opt-in via
@@ -131,6 +131,20 @@ registry is already a payload-blind relay — `kdb-service` runs schema NONE tod
 5. **Session tokens are stored in plaintext document fields**
    (`kdb-auth/.../token/SessionIssuer.kt:51-61`) — meaning at-rest encryption of `_system`
    namespaces also encrypts the credential store, and key-availability must precede auth (§5.7).
+
+6. **Commit-graph segments** (`ns/<namespace>/graph/graph-<seq>.kdbg`, `graph.file`; added
+   2026-10-12, `go/kdb/dag/graph_file.go`) are written with plain `os` file calls, not through
+   `SegmentByteStore`, so the decorator in §5.4 never sees them. Everything a segment holds is
+   already on §9's accepted list (commit hashes, graph shape, timestamps, transaction and author
+   ids, tree and schema hashes) **except commit messages** (the `MSGS` section). Each section
+   carries a codec in the footer (0 = plain; an unknown codec makes the segment unusable, so it is
+   rebuilt, never misread). Closing this: seal `MSGS` (or every section) as fixed-size AEAD blocks
+   with an offset table, decrypted into a small bounded cache on read - Cassandra's chunked
+   compression shape - or stop storing messages in segments and load them from the encrypted delta
+   log on demand, as operations already are. The checkpoint's segment stamps (size + mtime) and
+   graph references travel inside the checkpoint, which §5.4 already encrypts. Under E2EE
+   (§6) nothing changes: segments only ever hold the client's opaque bytes and metadata the hub
+   needs anyway.
 
 ### 2.7 BUG: SSTable integrity fields are written but never verified
 

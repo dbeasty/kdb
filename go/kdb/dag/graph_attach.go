@@ -209,8 +209,7 @@ func (d *InMemoryCommitDag) writeGraph(forceFull bool) (bool, error) {
 	if !full && len(snap.resident) == 0 {
 		return false, nil // everything resident is held back; nothing to flush
 	}
-	next, nextTx := snap.sources()
-	path, err := writeGraphSegment(dir, d.NamespaceID, seq, full, next, nextTx)
+	path, err := writeGraphSegment(dir, d.NamespaceID, seq, full, snap.sources)
 	if err != nil {
 		return false, err
 	}
