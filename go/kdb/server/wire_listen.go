@@ -686,7 +686,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 	if msg.PageSize > 0 || msg.Continuation != "" {
 		page = &sql.PageRequest{Size: msg.PageSize}
 		if msg.Continuation != "" {
-			commit, offset, err := decodePageToken(msg.Continuation, msg.SQL, msg.ParametersJSON)
+			commit, offset, after, err := decodePageToken(msg.Continuation, msg.SQL, msg.ParametersJSON)
 			if err != nil {
 				return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err.Error())
 			}
@@ -694,7 +694,8 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 				return sqlResultError(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
 					"continuation expired: the commit the first page read at is no longer held; restart the query")
 			}
-			resolved, page.Offset = commit, offset
+			resolved, page.Offset, page.After = commit, offset, after
+			page.OffsetOnly = after == nil
 		}
 	}
 
@@ -812,7 +813,14 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		GeneratedIDs:      result.GeneratedIDs,
 	}
 	if page != nil && result.More {
-		reply.ContinuationToken = encodePageToken(*head, page.Offset+len(rows), msg.SQL, msg.ParametersJSON)
+		// A keyset page continues after the last row this reply carries - not the last the
+		// executor produced, which the byte cap above may have cut.
+		var after *codec.UUID
+		if len(rows) > 0 && len(result.RowDocIDs) >= len(rows) {
+			last := result.RowDocIDs[len(rows)-1]
+			after = &last
+		}
+		reply.ContinuationToken = encodePageToken(*head, page.Offset+len(rows), after, msg.SQL, msg.ParametersJSON)
 	}
 	return reply
 }

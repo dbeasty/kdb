@@ -566,6 +566,25 @@ func (e *ServerEngine) GetDocuments(namespaceID string, docIDs []codec.UUID, atC
 }
 
 func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, batchSize int, onBatch func([]document.Document) error) error {
+	return e.scanDocuments(atCommit, batchSize, func(t document.DocumentTree, visit func(codec.UUID, codec.Hash) bool) {
+		t.Walk(visit)
+	}, onBatch)
+}
+
+// ScanDocumentsAfter implements storage.OrderedScanner: ScanDocuments in id order, from the first
+// id after after. Seeking costs the depth of the trie, not the entries before it
+// (DocumentTree.WalkAfter), so a paged SELECT pays for its page rather than its position.
+func (e *ServerEngine) ScanDocumentsAfter(namespaceID string, atCommit codec.Hash, after *codec.UUID, batchSize int, onBatch func([]document.Document) error) error {
+	return e.scanDocuments(atCommit, batchSize, func(t document.DocumentTree, visit func(codec.UUID, codec.Hash) bool) {
+		if after == nil {
+			t.WalkOrdered(visit)
+			return
+		}
+		t.WalkAfter(*after, visit)
+	}, onBatch)
+}
+
+func (e *ServerEngine) scanDocuments(atCommit codec.Hash, batchSize int, walk func(document.DocumentTree, func(codec.UUID, codec.Hash) bool), onBatch func([]document.Document) error) error {
 	if batchSize <= 0 {
 		batchSize = 256
 	}
@@ -642,7 +661,7 @@ func (e *ServerEngine) ScanDocuments(namespaceID string, atCommit codec.Hash, ba
 		return true
 	}
 	stopped := false
-	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
+	walk(tree, func(id codec.UUID, h codec.Hash) bool {
 		window = append(window, scanEntry{id, h})
 		if len(window) >= scanWindowDocs && !flush() {
 			stopped = true
