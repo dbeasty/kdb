@@ -10,8 +10,9 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 )
 
-// node is one stored vector version in the graph. Nodes are never removed: a deleted or
-// superseded version stays navigable and is filtered out of results by visibility.
+// node is one stored vector version in the graph. A deleted or superseded version stays
+// navigable and is filtered out of results by visibility until nothing can make it visible
+// again; then the store drops it and rebuilds the graph without it.
 type node struct {
 	id    int
 	doc   codec.UUID
@@ -19,6 +20,10 @@ type node struct {
 	vec   []float32
 	level int
 	links [][]int32 // per level, neighbour node ids
+	// refs counts what can still make the node visible somewhere: being the head's node for its
+	// document, and every retained event that puts it or records it as the node it replaced.
+	// The store drops nodes at zero (see Store.compactNodesLocked).
+	refs int32
 }
 
 // hnsw is a Hierarchical Navigable Small World graph over nodes with a deterministic level
