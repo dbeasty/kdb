@@ -13,8 +13,8 @@
 //   - A sealed segment - any but the newest, since a writer never appends to an older segment -
 //     has its array written once to a sidecar file beside the log and memory-mapped
 //     (storage/mmapfile). Mapped bytes are page cache, not Go heap: the collector never sees
-//     them, the kernel pages them, and mmapfile.MappedBytes reports them to the memory guard the
-//     way the commit graph's are.
+//     them, the kernel pages them, and mmapfile.ResidentBytes reports their resident pages to the
+//     memory guard the way the commit graph's are.
 //   - The newest segment, which may still grow, keeps its array on the heap. That is bounded by
 //     the segment rotation size, not by history.
 //   - On a platform without mmap (Windows), a sealed segment's sidecar is read with positioned

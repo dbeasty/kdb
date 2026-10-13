@@ -161,14 +161,25 @@ func TestMemoryGuardPressureClearsOnItsOwn(t *testing.T) {
 	}
 }
 
-// Off a cgroup, a mapped file must show up in what the guard measures - otherwise a mapped
-// commit graph is invisible to the zones on macOS.
-func TestMemoryUsageChargesMappedFilesOffCgroup(t *testing.T) {
+// sparseMapping maps a size-byte file that is all hole, so none of its pages are in memory until
+// read. Skips where the guard's cgroup path applies or mapping is unsupported.
+func sparseMapping(t *testing.T, size int64) *mmapfile.Mapping {
+	t.Helper()
 	if _, ok := cgroupMemoryCurrentBytes(); ok {
 		t.Skip("cgroup accounting already charges page cache")
 	}
+	if !mmapfile.Supported {
+		t.Skip("no mmap")
+	}
 	p := filepath.Join(t.TempDir(), "m")
-	if err := os.WriteFile(p, make([]byte, 64<<20), 0o644); err != nil {
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 	m, err := mmapfile.Open(p)
@@ -178,9 +189,61 @@ func TestMemoryUsageChargesMappedFilesOffCgroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Close()
-	diff := currentMemoryUsageBytes() - goRuntimeFootprintBytes()
-	if diff < 64<<20 {
-		t.Fatalf("mapped 64MB but the guard charged only %.0f bytes for it", diff)
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
+
+// mappedCharge is what the guard's off-cgroup reading adds on top of the Go runtime's footprint.
+func mappedCharge() float64 { return currentMemoryUsageBytes() - goRuntimeFootprintBytes() }
+
+// Off a cgroup, mapped pages that are in memory must show up in what the guard measures -
+// otherwise a hot mapped commit graph is invisible to the zones on macOS.
+func TestMemoryUsageChargesResidentMappedPagesOffCgroup(t *testing.T) {
+	const size = 64 << 20
+	m := sparseMapping(t, size)
+	r, err := m.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Release()
+	if err := r.Guard(func(b []byte) {
+		var sum byte
+		for i := 0; i < len(b); i += os.Getpagesize() {
+			sum += b[i]
+		}
+		touchSink += sum
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// ResidentBytes is cached for about a second: wait for a reading taken after the touch.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		diff := mappedCharge()
+		if diff >= size*9/10 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("read all of a 64MB mapping but the guard charged only %.0f bytes for it", diff)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// touchSink keeps the page-touching loop above from being optimised away.
+var touchSink byte
+
+// Off a cgroup, a mapping nobody has read must not be charged at its full size: the regression
+// this guards against put the guard into a pressure zone over clean, droppable mapped pages.
+func TestMemoryUsageDoesNotChargeUntouchedMappingOffCgroup(t *testing.T) {
+	const size = 256 << 20
+	before := mappedCharge()
+	_ = sparseMapping(t, size)
+	// Past the ResidentBytes cache interval, so the reading below was counted with the mapping live.
+	time.Sleep(1200 * time.Millisecond)
+	if grew := mappedCharge() - before; grew >= size/2 {
+		t.Fatalf("an untouched 256MB mapping raised the guard's reading by %.0f bytes", grew)
+	}
+	if mmapfile.MappedBytes() < size {
+		t.Fatalf("mapping not live: MappedBytes=%d", mmapfile.MappedBytes())
 	}
 }
