@@ -19,14 +19,17 @@ type InMemoryPlatformIO struct {
 	segments  map[string][]byte
 	sealed    map[string]struct{}
 	snapshots map[string][]byte
+	// generations: see FileBackedPlatformIO.generations.
+	generations map[string]uint64
 }
 
 // NewInMemoryPlatformIO returns an empty in-memory shim.
 func NewInMemoryPlatformIO() *InMemoryPlatformIO {
 	return &InMemoryPlatformIO{
-		segments:  make(map[string][]byte),
-		sealed:    make(map[string]struct{}),
-		snapshots: make(map[string][]byte),
+		segments:    make(map[string][]byte),
+		sealed:      make(map[string]struct{}),
+		snapshots:   make(map[string][]byte),
+		generations: make(map[string]uint64),
 	}
 }
 
@@ -121,8 +124,23 @@ func (s *InMemoryPlatformIO) DeleteSegment(segmentName string) error {
 	defer s.mu.Unlock()
 	delete(s.segments, segmentName)
 	delete(s.sealed, segmentName)
+	delete(s.generations, segmentName)
 	return nil
 }
+
+// SegmentGeneration implements storage.SegmentGenerationer, as FileBackedPlatformIO does.
+func (s *InMemoryPlatformIO) SegmentGeneration(segmentName string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.generations[segmentName]
+	if !ok {
+		g = storage.NextSegmentGeneration()
+		s.generations[segmentName] = g
+	}
+	return g, true
+}
+
+var _ storage.SegmentGenerationer = (*InMemoryPlatformIO)(nil)
 
 func (s *InMemoryPlatformIO) AvailableBytes() (int64, error) {
 	return 1 << 62, nil

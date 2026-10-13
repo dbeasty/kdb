@@ -24,6 +24,10 @@ type FileBackedPlatformIO struct {
 	// the length of every disk read.
 	segmentMu      map[string]*sync.RWMutex
 	sealedSegments map[string]struct{}
+	// generations names each segment's current incarnation (storage.SegmentGenerationer). Assigned
+	// on first ask and forgotten when the segment is deleted, restored or its namespace released,
+	// so whatever carries the name afterwards is asked about under a new number.
+	generations map[string]uint64
 }
 
 // HasArchive reports whether the store beneath this shim keeps a copy of what it deletes, which
@@ -60,6 +64,7 @@ func (f *FileBackedPlatformIO) RestoreSegment(segmentName string) error {
 	// open segment and appending into history.
 	f.globalMu.Lock()
 	f.sealedSegments[segmentName] = struct{}{}
+	delete(f.generations, segmentName)
 	f.globalMu.Unlock()
 	return nil
 }
@@ -71,6 +76,7 @@ func NewFileBackedPlatformIO(config PlatformIOConfig, store SegmentByteStore) *F
 		store:          store,
 		segmentMu:      make(map[string]*sync.RWMutex),
 		sealedSegments: make(map[string]struct{}),
+		generations:    make(map[string]uint64),
 	}
 }
 
@@ -309,6 +315,7 @@ func (f *FileBackedPlatformIO) DeleteSegment(segmentName string) error {
 	f.globalMu.Lock()
 	delete(f.sealedSegments, segmentName)
 	delete(f.segmentMu, segmentName)
+	delete(f.generations, segmentName)
 	f.globalMu.Unlock()
 	return f.store.Delete(segmentName)
 }
@@ -330,6 +337,20 @@ func (f *FileBackedPlatformIO) DeleteSnapshot(key string) error {
 }
 
 var _ storage.PlatformIOShim = (*FileBackedPlatformIO)(nil)
+
+// SegmentGeneration implements storage.SegmentGenerationer.
+func (f *FileBackedPlatformIO) SegmentGeneration(segmentName string) (uint64, bool) {
+	f.globalMu.Lock()
+	defer f.globalMu.Unlock()
+	g, ok := f.generations[segmentName]
+	if !ok {
+		g = storage.NextSegmentGeneration()
+		f.generations[segmentName] = g
+	}
+	return g, true
+}
+
+var _ storage.SegmentGenerationer = (*FileBackedPlatformIO)(nil)
 
 // FileBackedPlatformIOFactory opens file-backed shims (skeleton: requires SegmentByteStore injection).
 type FileBackedPlatformIOFactory struct {
@@ -360,6 +381,13 @@ func (f *FileBackedPlatformIO) ReleaseHandles(prefix string) error {
 	for name := range f.sealedSegments {
 		if strings.HasPrefix(name, prefix) {
 			delete(f.sealedSegments, name)
+		}
+	}
+	// A namespace that closed may be changed by another process before it opens again, so it
+	// comes back under new generations and nothing cached about it before is asked for again.
+	for name := range f.generations {
+		if strings.HasPrefix(name, prefix) {
+			delete(f.generations, name)
 		}
 	}
 	f.globalMu.Unlock()
