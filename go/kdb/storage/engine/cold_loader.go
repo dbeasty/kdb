@@ -39,19 +39,28 @@ type coldFrameRef struct {
 //     nothing, and one that walks its history pays for a single pass
 //     instead of a rescan per document, which is what keeps a historical
 //     scan linear rather than quadratic.
+//   - It catches up with the log on a miss. It used to be built once, a picture of the log at the
+//     first miss, so a version written to a later segment and then evicted read as missing - a
+//     wrong answer, not a slow one, and one bounded live bodies would hit on live data. A miss now
+//     indexes the segments it has not seen and the newest one's growth, and only when the log
+//     changed since the last look, so a version that is genuinely absent costs a listing.
 //
 // This is the same bargain a pack index makes: history stays on disk and
 // is read through an index when someone actually asks for it.
 type deltaColdLoader struct {
 	reader storage.DeltaSegmentReader
 
-	once  sync.Once
-	build error
-	mu    sync.RWMutex
-	frame map[codec.Hash]coldFrameRef
+	// refreshMu serializes index passes; mu guards what they publish.
+	refreshMu sync.Mutex
+	mu        sync.RWMutex
+	frame     map[codec.Hash]coldFrameRef
 	// segments is the segment table coldFrameRef.segment indexes: one ref per segment in the
-	// log, rather than one copy per version.
+	// log, rather than one copy per version. slotOf finds a sequence's slot.
 	segments []storage.DeltaSegmentRef
+	slotOf   map[int64]uint32
+	// indexed is how many bytes of each segment have been indexed; a segment whose listed size
+	// has not grown is not scanned again.
+	indexed map[int64]int64
 }
 
 func newDeltaColdLoader(reader storage.DeltaSegmentReader) *deltaColdLoader {
@@ -62,19 +71,14 @@ func newDeltaColdLoader(reader storage.DeltaSegmentReader) *deltaColdLoader {
 // reported as simply not found: that is what a miss meant when the version
 // store never evicted, and no caller can tell the difference.
 func (l *deltaColdLoader) load(docID codec.UUID, contentHash codec.Hash) (document.Document, bool, error) {
-	l.once.Do(func() { l.build = l.index() })
-	if l.build != nil {
-		return document.Document{}, false, l.build
-	}
-	l.mu.RLock()
-	ref, ok := l.frame[contentHash]
-	var segment storage.DeltaSegmentRef
-	if ok {
-		segment = l.segments[ref.segment]
-	}
-	l.mu.RUnlock()
+	ref, segment, ok := l.lookup(contentHash)
 	if !ok {
-		return document.Document{}, false, nil
+		if err := l.index(); err != nil {
+			return document.Document{}, false, err
+		}
+		if ref, segment, ok = l.lookup(contentHash); !ok {
+			return document.Document{}, false, nil
+		}
 	}
 	if dr, ok := l.reader.(storage.DeltaDocumentReader); ok {
 		return readVersionFromFrame(dr, segment, ref.frameOffset, docID, contentHash)
@@ -103,6 +107,16 @@ func (l *deltaColdLoader) load(docID codec.UUID, contentHash codec.Hash) (docume
 		return documentFromPatch(w.DocID, w.Patch), true, nil
 	}
 	return document.Document{}, false, nil
+}
+
+func (l *deltaColdLoader) lookup(contentHash codec.Hash) (coldFrameRef, storage.DeltaSegmentRef, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	ref, ok := l.frame[contentHash]
+	if !ok {
+		return coldFrameRef{}, storage.DeltaSegmentRef{}, false
+	}
+	return ref, l.segments[ref.segment], true
 }
 
 // contentHashers lends ContentHashers to cold reads, which may run on any goroutine.
@@ -141,6 +155,8 @@ func readVersionFromFrame(dr storage.DeltaDocumentReader, segment storage.DeltaS
 // claim - the worst case is a version reported missing that a repair would
 // recover, which is what a miss already meant here.
 func (l *deltaColdLoader) index() error {
+	l.refreshMu.Lock()
+	defer l.refreshMu.Unlock()
 	segments, err := l.reader.ListSegments()
 	if err != nil {
 		return err
@@ -150,12 +166,34 @@ func (l *deltaColdLoader) index() error {
 		// Nothing to index against: a reader that cannot report frame
 		// offsets cannot be asked for one frame later either.
 		l.mu.Lock()
-		l.frame = map[codec.Hash]coldFrameRef{}
+		if l.frame == nil {
+			l.frame = map[codec.Hash]coldFrameRef{}
+		}
 		l.mu.Unlock()
 		return nil
 	}
-	frames := make(map[codec.Hash]coldFrameRef)
-	table := make([]storage.DeltaSegmentRef, 0, len(segments))
+	l.mu.RLock()
+	var todo []storage.DeltaSegmentRef
+	for _, seg := range segments {
+		if done, seen := l.indexed[seg.SequenceNumber]; !seen || seg.SizeBytes > done {
+			todo = append(todo, seg)
+		}
+	}
+	l.mu.RUnlock()
+	if len(todo) == 0 {
+		l.mu.Lock()
+		if l.frame == nil {
+			l.frame = map[codec.Hash]coldFrameRef{}
+		}
+		l.mu.Unlock()
+		return nil
+	}
+	type found struct {
+		hash   codec.Hash
+		seq    int64
+		offset int64
+	}
+	var frames []found
 	// One hasher for the whole pass: ContentHash allocated a record value, a field map and an
 	// encode buffer per operation, for every version in the log.
 	var hasher document.ContentHasher
@@ -166,10 +204,8 @@ func (l *deltaColdLoader) index() error {
 	if dr, ok := l.reader.(storage.DamageTolerantReader); ok {
 		stream = dr.StreamCommitsPastDamage
 	}
-	for _, seg := range segments {
+	for _, seg := range todo {
 		segment := seg
-		slot := uint32(len(table))
-		table = append(table, segment)
 		err := stream(segment, func(c document.Commit, offset int64) error {
 			for _, op := range c.Operations {
 				w, isWrite := op.(document.WriteOp)
@@ -179,7 +215,7 @@ func (l *deltaColdLoader) index() error {
 				// documentFromPatch keeps the patch text verbatim whether or not it parses, so the
 				// version's content hash is the hash of (DocID, Patch) - no need to build the
 				// document, or to validate its JSON, just to hash it.
-				frames[hasher.Hash(w.DocID, w.Patch)] = coldFrameRef{segment: slot, frameOffset: offset}
+				frames = append(frames, found{hash: hasher.Hash(w.DocID, w.Patch), seq: segment.SequenceNumber, offset: offset})
 			}
 			return nil
 		})
@@ -189,9 +225,26 @@ func (l *deltaColdLoader) index() error {
 		}
 	}
 	l.mu.Lock()
-	l.frame = frames
-	l.segments = table
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	if l.frame == nil {
+		l.frame = make(map[codec.Hash]coldFrameRef, len(frames))
+		l.slotOf = map[int64]uint32{}
+		l.indexed = map[int64]int64{}
+	}
+	for _, seg := range todo {
+		if slot, ok := l.slotOf[seg.SequenceNumber]; ok {
+			l.segments[slot] = seg
+		} else {
+			l.slotOf[seg.SequenceNumber] = uint32(len(l.segments))
+			l.segments = append(l.segments, seg)
+		}
+		l.indexed[seg.SequenceNumber] = seg.SizeBytes
+	}
+	// Later frames overwrite earlier ones, so the index names the most recent frame holding a
+	// version, as the single pass always did.
+	for _, f := range frames {
+		l.frame[f.hash] = coldFrameRef{segment: l.slotOf[f.seq], frameOffset: f.offset}
+	}
 	return nil
 }
 

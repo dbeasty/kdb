@@ -66,6 +66,15 @@ type ServerEngine struct {
 	// version, and docsByHash is left unbounded - see SetColdLoader.
 	// Read on the miss path only, so an atomic load rather than a lock.
 	coldLoader atomic.Pointer[coldDocLoader]
+
+	// Bounded live bodies (StorageEngineConfig.BoundedLiveBodies). durabilityTracking is switched
+	// on by the runtime once something will tell this engine when a commit reaches the log
+	// (NoteCommitDurable); until then - restore and replay - every version is already in the log
+	// and needs no pin. durablePins holds, per committed tree, the queue of pin batches each
+	// commit of that tree took, released one batch per durability notice.
+	durabilityTracking atomic.Bool
+	durMu              sync.Mutex
+	durablePins        map[codec.Hash][][]codec.Hash
 	// coldLoads counts versions re-read from durable storage because the
 	// version store had evicted them - from the object store or, failing
 	// that, the delta log; both are the same event from a caller's point of
@@ -541,6 +550,53 @@ type coldDocLoader func(docID codec.UUID, contentHash codec.Hash) (document.Docu
 // a budget would never be consulted.
 //
 // budgetBytes <= 0 leaves the store unbounded even with a loader present.
+// boundedLiveBodies reports whether live versions may be evicted (StorageEngineConfig.
+// BoundedLiveBodies): only with a cold path to read them back through.
+func (e *ServerEngine) boundedLiveBodies() bool {
+	return e.config.BoundedLiveBodies && e.coldLoader.Load() != nil
+}
+
+// EnableDurabilityTracking tells the engine it will hear, through NoteCommitDurable, when each
+// commit's frame reaches the delta log. From then on a bounded engine pins each new version only
+// until that notice. The runtime calls it once it has installed the log's persist listener.
+func (e *ServerEngine) EnableDurabilityTracking() { e.durabilityTracking.Store(true) }
+
+// NoteCommitDurable releases the pins the oldest unlogged commit of treeHash took: its versions
+// are in the delta log now, and a location record or the cold loader can read them back, so the
+// version store may evict them like any other. A no-op unless bounded live bodies is on.
+func (e *ServerEngine) NoteCommitDurable(treeHash codec.Hash) {
+	e.durMu.Lock()
+	batches := e.durablePins[treeHash]
+	if len(batches) == 0 {
+		e.durMu.Unlock()
+		return
+	}
+	batch := batches[0]
+	if len(batches) == 1 {
+		delete(e.durablePins, treeHash)
+	} else {
+		e.durablePins[treeHash] = batches[1:]
+	}
+	e.durMu.Unlock()
+	for _, h := range batch {
+		e.docsByHash.Unpin(h)
+	}
+}
+
+// PendingDurablePins reports how many versions are pinned waiting for their commit to be logged.
+// For tests and the memory breakdown.
+func (e *ServerEngine) PendingDurablePins() int {
+	e.durMu.Lock()
+	defer e.durMu.Unlock()
+	n := 0
+	for _, batches := range e.durablePins {
+		for _, b := range batches {
+			n += len(b)
+		}
+	}
+	return n
+}
+
 func (e *ServerEngine) SetColdLoader(loader coldDocLoader, budgetBytes int64) {
 	if loader == nil {
 		e.coldLoader.Store(nil)
@@ -759,8 +815,14 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 	// un-evictable, and a version the tree stops pointing at becomes a
 	// candidate. That is the invariant shardedDocByHashStore's bound rests
 	// on - see its type doc for why anything looser is unsafe.
+	// Under bounded live bodies a pin means only "not durable yet": taken for each version this
+	// commit adds and released when the commit is logged (NoteCommitDurable), never when a later
+	// commit supersedes the version. Before durability tracking starts no pin is taken at all.
+	bounded := e.boundedLiveBodies()
+	track := bounded && e.durabilityTracking.Load()
+	var durable []codec.Hash
 	for _, id := range deletes {
-		if prev, ok := e.tree.HashFor(id); ok {
+		if prev, ok := e.tree.HashFor(id); ok && !bounded {
 			e.docsByHash.Unpin(prev)
 		}
 		var err error
@@ -790,17 +852,28 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 		// Rewriting a document with byte-identical content leaves the tree
 		// pointing at the same hash, so the pin it already holds is the
 		// right one and taking a second would never be released.
-		if !hadPrev || prev != h {
+		if (!hadPrev || prev != h) && (!bounded || track) {
 			e.docsByHash.Pin(h)
+			if track {
+				durable = append(durable, h)
+			}
 		}
 		e.docsByHash.Put(h, doc)
-		if hadPrev && prev != h {
+		if hadPrev && prev != h && !bounded {
 			e.docsByHash.Unpin(prev)
 		}
 		e.tree, err = e.tree.With(doc.ID, h)
 		if err != nil {
 			return document.DocumentTree{}, err
 		}
+	}
+	if len(durable) > 0 {
+		e.durMu.Lock()
+		if e.durablePins == nil {
+			e.durablePins = map[codec.Hash][][]codec.Hash{}
+		}
+		e.durablePins[e.tree.TreeHash] = append(e.durablePins[e.tree.TreeHash], durable)
+		e.durMu.Unlock()
 	}
 	// Record what this commit's tree looks like, addressed by its own
 	// hash, so a later read at this commit resolves by lookup instead of
