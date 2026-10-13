@@ -10,9 +10,16 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage/delta"
 )
 
-// coldFrameRef locates the delta frame a document version was written in.
+// coldFrameRef locates the delta frame a document version was written in: an index into the
+// loader's segment table and the frame's byte offset in that segment.
+//
+// Pointer-free and 16 bytes on purpose. It used to embed the whole storage.DeltaSegmentRef - a
+// namespace string, a UUID, two hashes and a tail descriptor, about 168 bytes with pointers in
+// it - once per historical version, and the index is never evicted. A map whose keys and values
+// hold no pointers is also one the garbage collector does not scan: the lesson of #159, where a
+// pointer-free map cut full-GC mark time ~35x before anything moved off the heap.
 type coldFrameRef struct {
-	segment     storage.DeltaSegmentRef
+	segment     uint32
 	frameOffset int64
 }
 
@@ -25,7 +32,8 @@ type coldFrameRef struct {
 //
 //   - The index holds locations, not documents. Holding the text would
 //     reintroduce exactly the unbounded retention that bounding the
-//     version store exists to remove; 48 bytes per version does not.
+//     version store exists to remove; a 32-byte key and a 16-byte
+//     pointer-free location per version does not.
 //   - It is built lazily, on the first miss, and never at open. A store
 //     that is only ever read at its head - almost all of them - pays
 //     nothing, and one that walks its history pays for a single pass
@@ -41,6 +49,9 @@ type deltaColdLoader struct {
 	build error
 	mu    sync.RWMutex
 	frame map[codec.Hash]coldFrameRef
+	// segments is the segment table coldFrameRef.segment indexes: one ref per segment in the
+	// log, rather than one copy per version.
+	segments []storage.DeltaSegmentRef
 }
 
 func newDeltaColdLoader(reader storage.DeltaSegmentReader) *deltaColdLoader {
@@ -57,6 +68,10 @@ func (l *deltaColdLoader) load(docID codec.UUID, contentHash codec.Hash) (docume
 	}
 	l.mu.RLock()
 	ref, ok := l.frame[contentHash]
+	var segment storage.DeltaSegmentRef
+	if ok {
+		segment = l.segments[ref.segment]
+	}
 	l.mu.RUnlock()
 	if !ok {
 		return document.Document{}, false, nil
@@ -65,25 +80,24 @@ func (l *deltaColdLoader) load(docID codec.UUID, contentHash codec.Hash) (docume
 	if !ok {
 		return document.Document{}, false, nil
 	}
-	commit, err := streamer.ReadCommitAt(ref.segment, ref.frameOffset)
+	commit, err := streamer.ReadCommitAt(segment, ref.frameOffset)
 	if err != nil {
 		return document.Document{}, false, err
 	}
+	var hasher document.ContentHasher
 	for _, op := range commit.Operations {
 		w, isWrite := op.(document.WriteOp)
 		if !isWrite || w.DocID != docID {
 			continue
 		}
-		doc := documentFromPatch(w.DocID, w.Patch)
-		h, err := doc.ContentHash()
-		if err != nil || h != contentHash {
+		if hasher.Hash(w.DocID, w.Patch) != contentHash {
 			// A commit can write the same document more than once, and
 			// several documents in one frame hash differently; only the
 			// operation whose content actually matches is the one asked
 			// for.
 			continue
 		}
-		return doc, true, nil
+		return documentFromPatch(w.DocID, w.Patch), true, nil
 	}
 	return document.Document{}, false, nil
 }
@@ -113,6 +127,10 @@ func (l *deltaColdLoader) index() error {
 		return nil
 	}
 	frames := make(map[codec.Hash]coldFrameRef)
+	table := make([]storage.DeltaSegmentRef, 0, len(segments))
+	// One hasher for the whole pass: ContentHash allocated a record value, a field map and an
+	// encode buffer per operation, for every version in the log.
+	var hasher document.ContentHasher
 	// Past damage where the reader can: a damaged frame loses only the versions it held, not
 	// every version after it in its segment. Safe, because load verifies every version it reads
 	// against the content hash it was asked for.
@@ -122,17 +140,18 @@ func (l *deltaColdLoader) index() error {
 	}
 	for _, seg := range segments {
 		segment := seg
+		slot := uint32(len(table))
+		table = append(table, segment)
 		err := stream(segment, func(c document.Commit, offset int64) error {
 			for _, op := range c.Operations {
 				w, isWrite := op.(document.WriteOp)
 				if !isWrite {
 					continue
 				}
-				h, err := documentFromPatch(w.DocID, w.Patch).ContentHash()
-				if err != nil {
-					continue
-				}
-				frames[h] = coldFrameRef{segment: segment, frameOffset: offset}
+				// documentFromPatch keeps the patch text verbatim whether or not it parses, so the
+				// version's content hash is the hash of (DocID, Patch) - no need to build the
+				// document, or to validate its JSON, just to hash it.
+				frames[hasher.Hash(w.DocID, w.Patch)] = coldFrameRef{segment: slot, frameOffset: offset}
 			}
 			return nil
 		})
@@ -143,6 +162,7 @@ func (l *deltaColdLoader) index() error {
 	}
 	l.mu.Lock()
 	l.frame = frames
+	l.segments = table
 	l.mu.Unlock()
 	return nil
 }
@@ -151,10 +171,11 @@ func (l *deltaColdLoader) index() error {
 // document (see embed.applyReplayedCommit): a patch that will not parse is
 // still the document's bytes and is kept as-is rather than dropped, so the
 // content hash computed here matches the one the write path recorded.
+//
+// Both outcomes are the same document - the id and the patch text,
+// verbatim - so the patch is not parsed at all. It used to be validated
+// first (document.FromJSONWithID unmarshals the whole body into a map),
+// only for the result to be thrown away either way.
 func documentFromPatch(docID codec.UUID, patch string) document.Document {
-	doc, err := document.FromJSONWithID(docID, patch)
-	if err != nil {
-		return document.Document{ID: docID, JSON: patch}
-	}
-	return doc
+	return document.Document{ID: docID, JSON: patch}
 }
