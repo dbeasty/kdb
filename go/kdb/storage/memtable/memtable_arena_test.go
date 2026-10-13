@@ -174,7 +174,7 @@ func TestSortedTableModelAndCompaction(t *testing.T) {
 			t.Fatalf("tombstone for %s lost", k.Hex())
 		}
 	}
-	if want := live + int64(table.Len())*RecordOverheadBytes; table.SizeBytes() != want {
+	if want := live; table.SizeBytes() != want {
 		t.Fatalf("SizeBytes %d, want %d", table.SizeBytes(), want)
 	}
 	// 20000 overwrites of up to 2 KB into 50 keys: without compaction the arena would hold ~16 MB.
@@ -236,7 +236,7 @@ func TestSortedTableAccountingMatchesHeap(t *testing.T) {
 	if r := float64(fp) / float64(heap); r < 0.8 || r > 1.25 {
 		t.Fatalf("FootprintBytes is %.2fx the heap", r)
 	}
-	if r := float64(sz) / float64(heap); r < 0.7 || r > 1.25 {
-		t.Fatalf("SizeBytes is %.2fx the heap", r)
+	if want := int64(n * size); sz != want {
+		t.Fatalf("SizeBytes %d, want the %d live value bytes", sz, want)
 	}
 }

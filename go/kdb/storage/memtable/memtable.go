@@ -60,9 +60,8 @@ type memRec struct {
 
 // RecordOverheadBytes is what one key costs a SortedTable beyond its value's bytes: its record
 // (the 32-byte key, the value's location and the tombstone flag) and its index entry
-// (a map[codec.Hash]uint32 slot at the swiss table's typical load). SizeBytes charges it per
-// key so that a generation of many small values is bounded by what it really holds; it used to
-// count value bytes only, so a million tombstones or tiny values counted as nearly nothing.
+// (a map[codec.Hash]uint32 slot at the swiss table's typical load). FootprintBytes includes it;
+// SizeBytes, the flush trigger, does not (see there).
 const RecordOverheadBytes = int64(unsafe.Sizeof(memRec{})) + 56
 
 // NewSortedTable returns an empty memtable.
@@ -180,13 +179,17 @@ func (m *SortedTable) Delete(key codec.Hash) {
 	m.recs = append(m.recs, memRec{key: key, deleted: true})
 }
 
-// SizeBytes is what the table holds: its live value bytes plus RecordOverheadBytes for every
-// key, tombstones included. Replaced and deleted values are netted out; the bytes they leave
-// dead in the arena are bounded by maybeCompact, and FootprintBytes reports them.
+// SizeBytes is the flush trigger: live value bytes, with replaced and deleted values netted out
+// (the Kotlin twin's definition). It deliberately does not count per-key overhead even though
+// that is real memory - FootprintBytes reports it, and the memory accounting uses that. Charging
+// RecordOverheadBytes here was tried and measured: under the objects strategy most values are
+// ~20-byte location records, so the threshold was reached ~6x sooner, the memtable flushed ~6x
+// as often, and heavy-multi-user updates lost 18-20% throughput
+// (docs/benchmarks/2026-10-13-live-body-arena.md).
 func (m *SortedTable) SizeBytes() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.live + int64(len(m.recs))*RecordOverheadBytes
+	return m.live
 }
 
 // FootprintBytes is the memory the table occupies: arena chunks (including dead bytes and

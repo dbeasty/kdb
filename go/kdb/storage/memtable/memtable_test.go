@@ -92,34 +92,32 @@ func TestSortedTableGetReturnsCopy(t *testing.T) {
 
 // TestSortedTableSizeOverwriteNetsOut mirrors the Kotlin twin's
 // SortedMemTableSizeTest.overwriteNetsOutThePreviousValuesSize (kdb-finish-up-plan.md 1-K2):
-// overwriting a key must net out the replaced value's size, not just add the new one. The Go
-// table also charges each key RecordOverheadBytes (the Kotlin twin counts value bytes only).
+// overwriting a key must net out the replaced value's size, not just add the new one.
 func TestSortedTableSizeOverwriteNetsOut(t *testing.T) {
 	table := NewSortedTable()
 	key := testKey(t, "k")
 
 	table.Put(key, make([]byte, 100))
-	if got, want := table.SizeBytes(), 100+RecordOverheadBytes; got != want {
+	if got, want := table.SizeBytes(), int64(100); got != want {
 		t.Fatalf("SizeBytes after first Put: got %d, want %d", got, want)
 	}
 	table.Put(key, make([]byte, 40)) // overwrite with a smaller value
-	if got, want := table.SizeBytes(), 40+RecordOverheadBytes; got != want {
+	if got, want := table.SizeBytes(), int64(40); got != want {
 		t.Fatalf("SizeBytes after overwrite: got %d, want %d (replaced value must be netted out)", got, want)
 	}
 }
 
 // TestSortedTableSizeDeleteSubtracts mirrors the Kotlin twin's
 // SortedMemTableSizeTest.deleteSubtractsTheDeletedValuesSize (1-K2): deleting the only entry
-// must return SizeBytes to the value-free cost of the tombstone it leaves (zero value bytes; the
-// Go table charges the tombstone's record, which a flush writes out).
+// must return SizeBytes to zero.
 func TestSortedTableSizeDeleteSubtracts(t *testing.T) {
 	table := NewSortedTable()
 	key := testKey(t, "k")
 
 	table.Put(key, make([]byte, 100))
 	table.Delete(key)
-	if got := table.SizeBytes(); got != RecordOverheadBytes {
-		t.Fatalf("SizeBytes after deleting the only entry: got %d, want %d", got, RecordOverheadBytes)
+	if got := table.SizeBytes(); got != 0 {
+		t.Fatalf("SizeBytes after deleting the only entry: got %d, want 0", got)
 	}
 }
 
