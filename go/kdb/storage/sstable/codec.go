@@ -270,6 +270,10 @@ func (w *DefaultWriter) appendAll(segmentName string, b []byte) (int64, error) {
 	return size, nil
 }
 
+// finishBufferBytes is how many bytes of blocks Finish gathers before appending them. A block
+// larger than it is appended alone (appendAll splits what exceeds the shim's append limit).
+const finishBufferBytes = 1 << 20
+
 func (w *DefaultWriter) Finish() (Handle, error) {
 	blocks := make([]indexEntry, 0, len(w.entries))
 	fileID, err := codec.RandomUUID()
@@ -277,7 +281,25 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		return Handle{}, err
 	}
 	segmentName := io.SegmentNameBuilder.SSTable(w.namespaceID, w.level, fileID.String())
+	// Blocks are gathered and appended finishBufferBytes at a time, not one append per block: an
+	// append is a positional write, a system call each, and at ~150 us apiece on macOS a 10k-entry
+	// flush spent 1.6 s in them for 2 MB of data - every memtable flush and compaction paid it.
 	var offset int64
+	buf := make([]byte, 0, finishBufferBytes)
+	flush := func() error {
+		if len(buf) == 0 {
+			return nil
+		}
+		size, err := w.appendAll(segmentName, buf)
+		if err != nil {
+			return err
+		}
+		if size != offset {
+			return fmt.Errorf("sstable: %s is %d bytes after an append, expected %d", segmentName, size, offset)
+		}
+		buf = buf[:0]
+		return nil
+	}
 	for _, e := range w.entries {
 		if e.deleted {
 			blocks = append(blocks, indexEntry{key: e.key, handle: BlockHandle{Deleted: true}})
@@ -287,10 +309,13 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 		if err != nil {
 			return Handle{}, err
 		}
-		newSize, err := w.appendAll(segmentName, block)
-		if err != nil {
-			return Handle{}, err
+		if len(buf) > 0 && len(buf)+len(block) > finishBufferBytes {
+			if err := flush(); err != nil {
+				return Handle{}, err
+			}
 		}
+		buf = append(buf, block...)
+		newSize := offset + int64(len(block))
 		// CompressedSize is the compressed body's own length - excluding encodeBlock's
 		// header (compSize/uncompSize/crc) - matching what Get() expects when it later reads
 		// bh.CompressedSize+blockHeaderSize bytes starting at Offset. This used to store
@@ -302,6 +327,9 @@ func (w *DefaultWriter) Finish() (Handle, error) {
 			handle: BlockHandle{Offset: offset, CompressedSize: len(block) - blockHeaderSize},
 		})
 		offset = newSize
+	}
+	if err := flush(); err != nil {
+		return Handle{}, err
 	}
 	// Hashed as a stream rather than into one buffer. The preimage is every key and value in
 	// the table, so materialising it doubled the table's bytes in memory at the moment a
