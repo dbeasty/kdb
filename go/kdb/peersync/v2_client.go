@@ -424,7 +424,7 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 	if every == 0 {
 		every = DefaultAdoptEveryBytes
 	}
-	waiting := 0 // estimated bytes stored and not yet adopted
+	waiting := 0  // estimated bytes stored and not yet adopted
 	base := haves // the haves the transfer started with; each page adds only its own tips (pageHaves)
 	for {
 		reply, err := c.request(wire.FetchRequestMessage{
