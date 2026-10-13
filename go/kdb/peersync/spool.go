@@ -80,8 +80,7 @@ func (s *pageSpool) writeErr(err error) error {
 }
 
 // each reads the spool back in order, in batches of up to maxBytes of bodies (at least one
-// document), stopping after limit documents when limit >= 0. A batch is only valid during the
-// call that receives it: its slice is reused.
+// document), stopping after limit documents when limit >= 0.
 func (s *pageSpool) each(maxBytes, limit int, fn func(docs []wire.SnapshotDoc) error) error {
 	next, err := s.reader(maxBytes, limit)
 	if err != nil {
