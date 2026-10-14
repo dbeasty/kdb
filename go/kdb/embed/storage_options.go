@@ -112,7 +112,8 @@ type StorageOptions struct {
 	// takes half the hot-tier budget. Raising it trades memory for fewer
 	// cold reads; lowering it, the reverse.
 	DocumentCacheBytes int64
-	// BoundedLiveBodies: see storage.StorageEngineConfig.BoundedLiveBodies. KDB_BOUNDED_LIVE_BODIES.
+	// BoundedLiveBodies: see storage.StorageEngineConfig.BoundedLiveBodies. FileRuntimeOptionsFromEnv
+	// turns it on unless KDB_BOUNDED_LIVE_BODIES=off; the zero value here is off.
 	BoundedLiveBodies bool
 	// CommitOpsBytes caps how many bytes of commit operations the DAG
 	// keeps resident. Zero takes a quarter of the hot-tier budget.
@@ -179,7 +180,8 @@ type StorageOptions struct {
 	// TreeFile pages the live document tree's cold records to mapped segment files
 	// (ns/<namespace>/tree/, document.TreeFile) so the tree's heap does not grow with the
 	// namespace; TreeResidentBytes is the resident overlay before the tree is written out again
-	// (document.DefaultTreeResidentBytes when not positive). Off by default.
+	// (document.DefaultTreeResidentBytes when not positive). FileRuntimeOptionsFromEnv turns it on
+	// unless KDB_TREE_FILE=off; the zero value here is off.
 	TreeFile          bool
 	TreeResidentBytes int64
 	// TreeMaxSegments is the longest chain of tree segments before a compaction
@@ -268,7 +270,10 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	}
 	opts.Storage.Retain.Commits = envBytes("KDB_RETAIN_COMMITS")
 	opts.Storage.DocumentCacheBytes = envBytes("KDB_DOCUMENT_CACHE_BYTES")
-	opts.Storage.BoundedLiveBodies = envBool("KDB_BOUNDED_LIVE_BODIES")
+	// On by default since the 2026-10-14 benchmark pass (docs/benchmarks/2026-10-14-consolidated-pass.md):
+	// live data larger than memory is the point, and with second-chance eviction bounded bodies
+	// read as fast as pinned ones. KDB_BOUNDED_LIVE_BODIES=off keeps every live version resident.
+	opts.Storage.BoundedLiveBodies = envBoolDefault("KDB_BOUNDED_LIVE_BODIES", true)
 	opts.Storage.CommitOpsBytes = envBytes("KDB_COMMIT_OPS_BYTES")
 	opts.Storage.HistoryTreeCacheBytes = envBytes("KDB_HISTORY_TREE_CACHE_BYTES")
 	opts.Storage.PreallocateSegments = envBool("KDB_PREALLOCATE_SEGMENTS")
@@ -277,7 +282,9 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 		opts.Storage.DisableCheckpoints = true
 	}
 	opts.Storage.Graph = graphSettingsFromEnv()
-	opts.Storage.TreeFile = envBool("KDB_TREE_FILE")
+	// On by default since the same pass: about neutral on throughput, and what bounds the live
+	// tree's heap. KDB_TREE_FILE=off holds the tree in the heap.
+	opts.Storage.TreeFile = envBoolDefault("KDB_TREE_FILE", true)
 	opts.Storage.TreeResidentBytes = envBytes("KDB_TREE_RESIDENT_BYTES")
 	opts.Storage.AttachmentSetBudgetBytes = envBytes("KDB_ATTACHMENT_SET_BUDGET")
 	return opts
