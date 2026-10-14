@@ -507,3 +507,39 @@ func ParsePackedAttachmentTables(packed []byte) ([]AttachmentTable, error) {
 	}
 	return out, nil
 }
+
+// AttachmentSetOps are the operations that turn doc's attachments from before into after (sets in
+// any order): removals and renames first, as deletes, so no put lands on a name still taken, then
+// puts of what is new or changed, in ID order. Merges and write-backs use it, so the same two sets
+// always give the same operations.
+func AttachmentSetOps(doc codec.UUID, before, after AttachmentSet) []Op {
+	next := make(map[codec.UUID]Attachment, len(after))
+	for _, a := range after {
+		next[a.ID] = a
+	}
+	prev := make(map[codec.UUID]Attachment, len(before))
+	for _, a := range before {
+		prev[a.ID] = a
+	}
+	var dels, puts []Op
+	for _, a := range before {
+		if n, ok := next[a.ID]; !ok || n.Name != a.Name {
+			dels = append(dels, AttachmentDeleteOp{DocID: doc, AttachmentID: a.ID})
+		}
+	}
+	sorted := append(AttachmentSet(nil), after...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].ID.MSB != sorted[j].ID.MSB {
+			return uint64(sorted[i].ID.MSB) < uint64(sorted[j].ID.MSB)
+		}
+		return uint64(sorted[i].ID.LSB) < uint64(sorted[j].ID.LSB)
+	})
+	for _, a := range sorted {
+		if p, ok := prev[a.ID]; ok && p == a {
+			continue
+		}
+		puts = append(puts, AttachmentPutOp{DocID: doc, AttachmentID: a.ID, Name: a.Name,
+			Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
+	}
+	return append(dels, puts...)
+}

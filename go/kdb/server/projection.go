@@ -5,6 +5,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/peersync"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 )
 
 // ProjectionTarget is this runtime as the local home of a filtered projection.
@@ -75,15 +76,33 @@ func (p projectionTarget) Apply(ops []document.Op, source string, complete bool)
 
 // replacing turns each write into a replacement. A page carries a document's final state, but a
 // write op merges into the document it lands on, so a key the source removed would otherwise
-// stay. A delete followed by a write of the same document is the engine's spelling of replace; a
-// delete of a document that is not there is a no-op.
+// stay. WriteOp.Replace, not a delete and a write: a delete takes the document's attachments.
 func replacing(ops []document.Op) []document.Op {
-	out := make([]document.Op, 0, len(ops)*2)
+	out := make([]document.Op, 0, len(ops))
 	for _, op := range ops {
 		if w, ok := op.(document.WriteOp); ok {
-			out = append(out, document.DeleteOp{DocID: w.DocID})
+			w.Replace = true
+			op = w
 		}
 		out = append(out, op)
 	}
 	return out
+}
+
+// AttachmentsOf is doc's attachments at the projection's head.
+func (p projectionTarget) AttachmentsOf(doc codec.UUID) (document.AttachmentSet, error) {
+	head, err := p.rt.dag.Head()
+	if err != nil {
+		return nil, err
+	}
+	table, err := p.rt.dag.AttachmentTableAt(head)
+	if err != nil {
+		return nil, err
+	}
+	return table.List(doc), nil
+}
+
+// AttachmentStore is where the projection keeps its attachments' bytes.
+func (p projectionTarget) AttachmentStore() *attachstore.Store {
+	return p.rt.Runtime.AttachmentStore(p.rt.Runtime.DefaultNamespace)
 }

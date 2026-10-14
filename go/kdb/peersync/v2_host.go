@@ -867,6 +867,9 @@ func (h *V2Host) projectFetch(m wire.ProjectFetchMessage) (wire.Message, error) 
 	if err != nil {
 		return nil, err
 	}
+	if err := withAttachmentOnlyChanges(env, &page, filter, canRead, m.FromHex); err != nil {
+		return nil, err
+	}
 	if err := withProjectedAttachments(env, &page); err != nil {
 		return nil, err
 	}

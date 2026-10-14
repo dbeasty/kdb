@@ -686,6 +686,18 @@ type WriteBackDoc struct {
 	// BaseHash is the content hash of the document the write replaced, "" if it was absent. The
 	// host applies the write only if it still holds exactly that.
 	BaseHash string
+	// KeepBody: the write changed the document's attachments only; Body is not sent and the body
+	// is left as it is (still guarded by BaseHash, so the document must be the one the projection
+	// saw).
+	KeepBody bool
+	// AttachmentsChanged: Attachments is the document's whole attachment set after the write
+	// (empty: none), and AttachmentsBase the hash of the set the projection held before it ("" for
+	// none) - the host applies the change only if it still holds that set. The blobs must already
+	// be uploaded (ATTACHMENT_UPLOAD on the session). Unset, the document's attachments are left
+	// as they are - a body write does not touch them.
+	AttachmentsChanged bool
+	Attachments        []TreeAttachment
+	AttachmentsBase    string
 }
 
 // ProjectWriteMessage sends one local transaction of a projection back to its source
@@ -716,6 +728,8 @@ type WriteBackCurrent struct {
 	DocID  string
 	Body   string
 	Absent bool
+	// Attachments are the document's attachments at the source (at CommitHex).
+	Attachments []TreeAttachment
 }
 
 // ProjectWriteResultMessage answers PROJECT_WRITE (PROJECT_WRITE_RESULT 0x33). A failure that
@@ -735,10 +749,14 @@ type ProjectWriteResultMessage struct {
 func (m ProjectWriteResultMessage) Header() Header { return m.H }
 
 type writeBackDocDto struct {
-	DocID    string `json:"docId"`
-	Body     string `json:"body,omitempty"`
-	Deleted  bool   `json:"deleted,omitempty"`
-	BaseHash string `json:"baseHash,omitempty"`
+	DocID    string           `json:"docId"`
+	Body     string           `json:"body,omitempty"`
+	Deleted  bool             `json:"deleted,omitempty"`
+	BaseHash string           `json:"baseHash,omitempty"`
+	KeepBody bool             `json:"keepBody,omitempty"`
+	AttChg   bool             `json:"attachmentsChanged,omitempty"`
+	Att      []TreeAttachment `json:"attachments,omitempty"`
+	AttBase  string           `json:"attachmentsBase,omitempty"`
 }
 
 type projectWriteDto struct {
@@ -748,9 +766,10 @@ type projectWriteDto struct {
 }
 
 type writeBackCurrentDto struct {
-	DocID  string `json:"docId"`
-	Body   string `json:"body,omitempty"`
-	Absent bool   `json:"absent,omitempty"`
+	DocID  string           `json:"docId"`
+	Body   string           `json:"body,omitempty"`
+	Absent bool             `json:"absent,omitempty"`
+	Att    []TreeAttachment `json:"attachments,omitempty"`
 }
 
 type projectWriteResultDto struct {
@@ -799,13 +818,14 @@ func encodeProjectionMessage(msg Message) (payloadEnvelope, bool, error) {
 	case ProjectWriteMessage:
 		docs := make([]writeBackDocDto, len(m.Docs))
 		for i, d := range m.Docs {
-			docs[i] = writeBackDocDto{DocID: d.DocID, Body: d.Body, Deleted: d.Deleted, BaseHash: d.BaseHash}
+			docs[i] = writeBackDocDto{DocID: d.DocID, Body: d.Body, Deleted: d.Deleted, BaseHash: d.BaseHash,
+				KeepBody: d.KeepBody, AttChg: d.AttachmentsChanged, Att: d.Attachments, AttBase: d.AttachmentsBase}
 		}
 		return payloadEnvelope{Kind: "projectWrite", ProjectWrite: &projectWriteDto{Namespace: m.Namespace, TxID: m.TxID, Docs: docs}}, true, nil
 	case ProjectWriteResultMessage:
 		current := make([]writeBackCurrentDto, len(m.Current))
 		for i, c := range m.Current {
-			current[i] = writeBackCurrentDto{DocID: c.DocID, Body: c.Body, Absent: c.Absent}
+			current[i] = writeBackCurrentDto{DocID: c.DocID, Body: c.Body, Absent: c.Absent, Att: c.Attachments}
 		}
 		return payloadEnvelope{Kind: "projectWriteResult", ProjectWriteResult: &projectWriteResultDto{
 			Namespace: m.Namespace, Outcome: m.Outcome, CommitHex: m.CommitHex, Reason: m.Reason, Current: current,
@@ -840,7 +860,8 @@ func decodeProjectionMessage(header Header, env payloadEnvelope) (Message, bool,
 		}
 		docs := make([]WriteBackDoc, len(d.Docs))
 		for i, x := range d.Docs {
-			docs[i] = WriteBackDoc{DocID: x.DocID, Body: x.Body, Deleted: x.Deleted, BaseHash: x.BaseHash}
+			docs[i] = WriteBackDoc{DocID: x.DocID, Body: x.Body, Deleted: x.Deleted, BaseHash: x.BaseHash,
+				KeepBody: x.KeepBody, AttachmentsChanged: x.AttChg, Attachments: x.Att, AttachmentsBase: x.AttBase}
 		}
 		return ProjectWriteMessage{H: header, Namespace: d.Namespace, TxID: d.TxID, Docs: docs}, true, nil
 	case "projectWriteResult":
@@ -850,7 +871,7 @@ func decodeProjectionMessage(header Header, env payloadEnvelope) (Message, bool,
 		}
 		var current []WriteBackCurrent
 		for _, x := range d.Current {
-			current = append(current, WriteBackCurrent{DocID: x.DocID, Body: x.Body, Absent: x.Absent})
+			current = append(current, WriteBackCurrent{DocID: x.DocID, Body: x.Body, Absent: x.Absent, Attachments: x.Att})
 		}
 		return ProjectWriteResultMessage{H: header, Namespace: d.Namespace, Outcome: d.Outcome, CommitHex: d.CommitHex, Reason: d.Reason, Current: current}, true, nil
 	}

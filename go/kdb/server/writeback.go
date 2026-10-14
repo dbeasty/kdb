@@ -54,7 +54,7 @@ func (s *KdbServerRuntime) admitProjectionWrite(tx document.Transaction) error {
 	}
 	for _, op := range tx.Operations {
 		switch op.(type) {
-		case document.WriteOp, document.DeleteOp:
+		case document.WriteOp, document.DeleteOp, document.AttachmentPutOp, document.AttachmentDeleteOp:
 		default:
 			return fmt.Errorf("%w; %T is not one", ErrProjectionWriteOp, op)
 		}
@@ -64,9 +64,24 @@ func (s *KdbServerRuntime) admitProjectionWrite(tx document.Transaction) error {
 
 // localWriteMessage is the message of a client commit on a write-back projection: the content
 // hash each document had before it ("-" for absent), read under the write gate from the tree the
-// commit lands on. Those are what the source must still hold for the write to apply.
+// commit lands on - and, for a document whose attachments it changes, "@" and the hash of the
+// attachment set it had ("-" for none). Those are what the source must still hold for the write
+// to apply.
 func (s *KdbServerRuntime) localWriteMessage(tx document.Transaction) string {
 	_, head, ok, err := s.dag.HeadCommit()
+	var table document.AttachmentTable
+	if err == nil && ok {
+		table, _ = s.dag.AttachmentTableAt(head.Hash)
+	}
+	attaches := map[codec.UUID]bool{}
+	for _, op := range tx.Operations {
+		switch o := op.(type) {
+		case document.AttachmentPutOp:
+			attaches[o.DocID] = true
+		case document.AttachmentDeleteOp:
+			attaches[o.DocID] = true
+		}
+	}
 	var b strings.Builder
 	b.WriteString(localWritePrefix)
 	seen := map[codec.UUID]bool{}
@@ -84,19 +99,21 @@ func (s *KdbServerRuntime) localWriteMessage(tx document.Transaction) string {
 				}
 			}
 		}
+		if attaches[id] {
+			set := setHashHex(table.List(id))
+			if set == "" {
+				set = "-"
+			}
+			base += "@" + set
+		}
 		fmt.Fprintf(&b, "%s=%s ", id, base)
 	}
 	return strings.TrimSpace(b.String())
 }
 
 func opDocID(op document.Op) codec.UUID {
-	switch o := op.(type) {
-	case document.WriteOp:
-		return o.DocID
-	case document.DeleteOp:
-		return o.DocID
-	}
-	return codec.UUID{}
+	id, _ := document.OpDocID(op)
+	return id
 }
 
 // parseLocalWrite reads a local write's bases, in the order the message lists them.
@@ -121,29 +138,49 @@ func parseLocalWrite(msg string) (ids []codec.UUID, bases map[codec.UUID]string,
 }
 
 // pendingWrite turns a local write commit into what is sent: each document's final state, from
-// the commit's ops (which hold full bodies), and its base.
-func pendingWrite(c document.Commit) (peersync.PendingWrite, bool) {
+// the commit's ops (which hold full bodies) and, for one whose attachments it changed, its
+// attachment set after the commit - and its bases.
+func (s *KdbServerRuntime) pendingWrite(c document.Commit) (peersync.PendingWrite, bool) {
 	ids, bases, ok := parseLocalWrite(c.Message)
 	if !ok {
 		return peersync.PendingWrite{}, false
 	}
 	final := map[codec.UUID]*string{}
+	touched := map[codec.UUID]bool{}
 	for _, op := range c.Operations {
 		switch o := op.(type) {
 		case document.WriteOp:
 			body := o.Patch
 			final[o.DocID] = &body
+			touched[o.DocID] = true
 		case document.DeleteOp:
 			final[o.DocID] = nil
+			touched[o.DocID] = true
 		}
 	}
+	var table document.AttachmentTable
+	tableErr := error(nil)
 	w := peersync.PendingWrite{Commit: c.Hash, TxID: peersync.WriteBackTxID(c.Hash)}
 	for _, id := range ids {
-		d := wire.WriteBackDoc{DocID: id.String(), BaseHash: bases[id]}
-		if body := final[id]; body != nil {
-			d.Body = *body
-		} else {
+		base, attachBase, attaches := strings.Cut(bases[id], "@")
+		d := wire.WriteBackDoc{DocID: id.String(), BaseHash: base}
+		switch {
+		case !touched[id]:
+			d.KeepBody = true
+		case final[id] != nil:
+			d.Body = *final[id]
+		default:
 			d.Deleted = true
+		}
+		if attaches && !d.Deleted {
+			if table.Documents() == 0 && tableErr == nil {
+				table, tableErr = s.dag.AttachmentTableAt(c.Hash)
+			}
+			d.AttachmentsChanged = true
+			d.Attachments = toTreeAttachments(table.List(id))
+			if attachBase != "-" {
+				d.AttachmentsBase = attachBase
+			}
 		}
 		w.Docs = append(w.Docs, d)
 	}
@@ -185,7 +222,7 @@ func (s *KdbServerRuntime) loadPendingLocked() error {
 		if !ok {
 			break
 		}
-		if w, ok := pendingWrite(c); ok {
+		if w, ok := s.pendingWrite(c); ok {
 			pending = append(pending, w)
 		} else if r, ok := resolvedCommit(c.Message); ok && stop == nil {
 			stop = &r
@@ -268,6 +305,11 @@ func (p projectionTarget) ResolveWrite(w peersync.PendingWrite, res wire.Project
 				continue
 			}
 			ops = append(ops, document.WriteOp{DocID: id, Patch: c.Body})
+			// The delete above took the local attachments; the source's go back (their bytes
+			// were fetched before this was called - see peersync.pushWrites).
+			if want, err := parseCurrentAttachments(c.Attachments); err == nil {
+				ops = append(ops, document.AttachmentSetOps(id, nil, want)...)
+			}
 		}
 	}
 	msg := fmt.Sprintf("%scommit=%s outcome=%s", resolvedPrefix, w.Commit.Hex(), res.Outcome)
@@ -343,7 +385,12 @@ func (s *KdbServerRuntime) ApplyWriteBack(principal auth.Principal, m wire.Proje
 		return wire.ProjectWriteResultMessage{}, err
 	}
 	tx := document.Transaction{ID: txID, BaseVersion: head, Timestamp: codec.TimestampNow()}
+	table, err := s.dag.AttachmentTableAt(head)
+	if err != nil {
+		return wire.ProjectWriteResultMessage{}, err
+	}
 	ids := make([]codec.UUID, 0, len(m.Docs))
+	attachConflict := false
 	for _, d := range m.Docs {
 		id, err := codec.ParseUUID(d.DocID)
 		if err != nil {
@@ -360,14 +407,51 @@ func (s *KdbServerRuntime) ApplyWriteBack(principal auth.Principal, m wire.Proje
 		}
 		// Every op carries the precondition: a guarded op is judged by it alone, not by what
 		// changed since BaseVersion, so the write lands on whatever head it reaches the gate at.
-		pre.OpIndex = len(tx.Operations)
-		tx.Preconditions = append(tx.Preconditions, pre)
-		tx.Operations = append(tx.Operations, document.DeleteOp{DocID: id})
-		if !d.Deleted {
+		//
+		// A body is replaced in place (WriteOp.Replace), never deleted and written again: a
+		// delete takes the document's attachments with it.
+		guard := func(op document.Op) {
 			pre.OpIndex = len(tx.Operations)
 			tx.Preconditions = append(tx.Preconditions, pre)
-			tx.Operations = append(tx.Operations, document.WriteOp{DocID: id, Patch: d.Body})
+			tx.Operations = append(tx.Operations, op)
 		}
+		switch {
+		case d.Deleted:
+			guard(document.DeleteOp{DocID: id})
+		case d.KeepBody:
+			if d.BaseHash == "" {
+				return refusedWrite("a write that keeps the body needs the body it keeps (baseHash)"), nil
+			}
+		default:
+			guard(document.WriteOp{DocID: id, Patch: d.Body, Replace: true})
+		}
+		if !d.AttachmentsChanged || d.Deleted {
+			continue
+		}
+		want, err := fromTreeAttachments(d.Attachments)
+		if err != nil {
+			return refusedWrite("document " + d.DocID + ": " + err.Error()), nil
+		}
+		have := table.List(id)
+		if setHashHex(have) != d.AttachmentsBase {
+			// Changed at the source since the projection's copy. Judged here, against the head
+			// read above; a change landing after it is a conflict the commit itself detects.
+			attachConflict = true
+			continue
+		}
+		for i, op := range document.AttachmentSetOps(id, have, want) {
+			if i == 0 && d.KeepBody {
+				guard(op) // the document must still be the one the projection saw
+				continue
+			}
+			tx.Operations = append(tx.Operations, op)
+		}
+	}
+	if attachConflict {
+		return s.notApplied(principal, ids, wire.WriteBackConflict, "attachments changed at the source since the projection's copy"), nil
+	}
+	if len(tx.Operations) == 0 {
+		return wire.ProjectWriteResultMessage{Outcome: wire.WriteBackApplied, CommitHex: head.Hex()}, nil
 	}
 	if err := s.AuthEngine.Authorizer().Authorize(context.Background(), principal, auth.TxCommitAction{Namespace: s.Runtime.DefaultNamespace}); err != nil {
 		return s.notApplied(principal, ids, wire.WriteBackRefused, (&AuthorizationError{Cause: err}).Error()), nil
@@ -406,8 +490,15 @@ func (s *KdbServerRuntime) notApplied(principal auth.Principal, ids []codec.UUID
 		cur := wire.WriteBackCurrent{DocID: id.String(), Absent: true}
 		if s.AuthEngine.Authorizer().Authorize(context.Background(), principal,
 			auth.DocumentReadAction{Namespace: s.Runtime.DefaultNamespace, DocID: id.String()}) == nil {
-			if body, _, found, err := s.GetDocument(s.Runtime.DefaultNamespace, id); err == nil && found {
+			if body, at, found, err := s.GetDocument(s.Runtime.DefaultNamespace, id); err == nil && found {
 				cur = wire.WriteBackCurrent{DocID: id.String(), Body: body}
+				// With the attachments at the same commit, so the projection is put back whole.
+				if h, err := codec.HashFromHex(at); err == nil {
+					if table, err := s.dag.AttachmentTableAt(h); err == nil {
+						cur.Attachments = toTreeAttachments(table.List(id))
+						res.CommitHex = at
+					}
+				}
 			}
 		}
 		res.Current = append(res.Current, cur)
