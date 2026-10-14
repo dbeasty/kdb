@@ -444,11 +444,17 @@ func (s *Store) Open(h codec.Hash) (*Reader, error) {
 		r.Close()
 		return nil, err
 	}
-	if err := s.verifyLeaves(h, chain[0].p); err != nil {
-		r.Close()
-		return nil, err
+	if chain[0].p.inline == nil {
+		if err := s.verifyLeaves(h, chain[0].p); err != nil {
+			r.Close()
+			return nil, err
+		}
 	}
 	r.n, r.src, r.leaves = chain[0].p.size, src, chain[0].p.leaves
+	if chain[0].p.inline != nil {
+		r.leaves = "" // checked whole when its pointer was read
+		return r, nil
+	}
 	return r, nil
 }
 
@@ -456,6 +462,9 @@ func (s *Store) Open(h codec.Hash) (*Reader, error) {
 func (s *Store) sourceFor(chain []resolved) (source, error) {
 	last := chain[len(chain)-1].p
 	var src source = segSource{shim: s.shim, name: last.segment, n: last.size}
+	if last.inline != nil {
+		src = memSource(last.inline)
+	}
 	for i := len(chain) - 2; i >= 0; i-- {
 		p := chain[i].p
 		n, err := segmentLength(s.shim, p.segment)
@@ -565,7 +574,7 @@ func (s *Store) StoreAsDelta(old, base codec.Hash) (bool, error) {
 	}
 	p, ok := s.pointers[old]
 	baseChain, baseLarge, err := s.resolveLocked(base)
-	if err != nil || !ok || !baseLarge || p.delta || p.size > s.cfg.DeltaMaxBytes ||
+	if err != nil || !ok || !baseLarge || p.delta || p.inline != nil || p.size > s.cfg.DeltaMaxBytes ||
 		baseChain[0].p.size > s.cfg.DeltaMaxBytes || len(baseChain) > s.cfg.DeltaMaxDepth {
 		s.mu.Unlock()
 		return false, err

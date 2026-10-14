@@ -120,6 +120,10 @@ type pointer struct {
 	size    int64      // the blob's length
 	delta   bool       // segment is a delta against base
 	base    codec.Hash // for a delta: the blob it applies to
+	// inline holds a small blob's bytes in the pointer itself (no segment, no leaves): one file
+	// per small blob, and every attachment byte in the attachment store's own segments, which is
+	// what a backup copies. Checked against the content hash when the pointer is read.
+	inline []byte
 }
 
 // Store holds one namespace's attachment blobs.
@@ -140,12 +144,18 @@ type Store struct {
 	readers  map[*Reader]struct{}
 }
 
+// SegmentPrefix is the name prefix of every segment namespaceID's attachment store writes - for a
+// backup, which copies them.
+func SegmentPrefix(namespaceID string) string {
+	return storio.SegmentNameBuilder.NamespacePrefix(namespaceID) + "attachment/"
+}
+
 // New returns the store for namespaceID. small may be nil, which keeps every blob standalone.
 func New(shim storage.PlatformIOShim, namespaceID string, small SmallBlobs, cfg Config) *Store {
 	return &Store{
 		shim:     shim,
 		ns:       namespaceID,
-		prefix:   storio.SegmentNameBuilder.NamespacePrefix(namespaceID) + "attachment/",
+		prefix:   SegmentPrefix(namespaceID),
 		small:    small,
 		cfg:      cfg.withDefaults(),
 		pointers: map[codec.Hash]pointer{},
@@ -201,6 +211,9 @@ func encodePointer(p pointer) []byte {
 	if p.delta {
 		flags = 1
 	}
+	if p.inline != nil {
+		flags |= 2
+	}
 	b = append(b, flags)
 	b = binary.BigEndian.AppendUint64(b, uint64(p.size))
 	for _, s := range []string{p.segment, p.leaves} {
@@ -210,6 +223,7 @@ func encodePointer(p pointer) []byte {
 	if p.delta {
 		b = append(b, p.base.Bytes[:]...)
 	}
+	b = append(b, p.inline...)
 	sum := sha256.Sum256(b)
 	return append(b, sum[:4]...)
 }
@@ -232,6 +246,16 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 	if err != nil || len(raw) < len(pointerMagic)+1+8+2+4 || string(raw[:len(pointerMagic)]) != pointerMagic {
 		return pointer{}, codec.Hash{}, false
 	}
+	if raw[len(pointerMagic)]&2 != 0 {
+		// Inline: the header, two empty names, the bytes, the checksum.
+		n := int64(binary.BigEndian.Uint64(raw[len(pointerMagic)+1:]))
+		if n < 0 || n > 64<<20 {
+			return pointer{}, codec.Hash{}, false
+		}
+		if raw, err = s.shim.ReadFromSegment(name, 0, len(pointerMagic)+1+8+2+int(n)+4); err != nil {
+			return pointer{}, codec.Hash{}, false
+		}
+	}
 	body, crc := raw[:len(raw)-4], raw[len(raw)-4:]
 	if sum := sha256.Sum256(body); !bytes.Equal(sum[:4], crc) {
 		return pointer{}, codec.Hash{}, false
@@ -249,6 +273,13 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 		off += k
 		*dst = string(body[off : off+int(l)])
 		off += int(l)
+	}
+	if body[len(pointerMagic)]&2 != 0 {
+		p.inline = append([]byte{}, body[off:]...)
+		if int64(len(p.inline)) != p.size || document.AttachmentContentHash(p.inline) != h {
+			return pointer{}, codec.Hash{}, false
+		}
+		return p, h, true
 	}
 	if p.delta {
 		if len(body)-off != 32 {
@@ -413,10 +444,21 @@ func (u *Upload) Finish() (Info, error) {
 		u.cleanup()
 		return info, nil // see emptyHash
 	}
-	if u.segment == "" && u.size <= s.cfg.SmallMaxBytes && s.small != nil {
-		if err := s.small.WriteKeyedBlob(info.Hash, last); err != nil {
+	if u.segment == "" && u.size <= s.cfg.SmallMaxBytes {
+		// Small: the bytes go in the pointer (see pointer.inline).
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if err := s.loadLocked(); err != nil {
 			return Info{}, err
 		}
+		if _, ok := s.pointers[info.Hash]; ok {
+			return info, nil
+		}
+		p, err := s.writePointerLocked(info.Hash, pointer{size: u.size, inline: append([]byte{}, last...)})
+		if err != nil {
+			return Info{}, err
+		}
+		s.pointers[info.Hash] = p
 		return info, nil
 	}
 	if u.segment == "" {

@@ -88,6 +88,9 @@ type Manifest struct {
 	HeadHashes    map[string]string `json:"headHashes"`
 	CommitCount   int               `json:"commitCount"`
 	Segments      []SegmentEntry    `json:"segments"`
+	// Attachments are the attachment store's segments (attachments.go). Absent from a manifest
+	// written before attachments, which restores as a namespace without large attachments.
+	Attachments []AttachmentSegment `json:"attachments,omitempty"`
 }
 
 // ManifestKey returns the object key a backup's manifest lives at.
@@ -232,6 +235,11 @@ func Create(shim storage.PlatformIOShim, namespaceID string, store ObjectStore, 
 		})
 	}
 
+	// After the log: every blob a logged commit names is durable before that commit, so it is
+	// listed here.
+	if m.Attachments, err = backupAttachments(shim, namespaceID, store, base); err != nil {
+		return nil, err
+	}
 	m.CommitCount = heads.count()
 	for i, tip := range heads.tips() {
 		name := "main"
@@ -304,6 +312,7 @@ func Verify(store ObjectStore, namespaceID, backupID string) (*VerifyResult, err
 				e.Sequence, e.Key, overwriteExplanation(store, m, e, got)))
 		}
 	}
+	verifyAttachments(store, m, res)
 	return res, nil
 }
 
@@ -384,6 +393,9 @@ func FetchToDir(store ObjectStore, namespaceID, backupID, outDir string) (*Manif
 		if err := os.WriteFile(dest, data, 0o644); err != nil {
 			return nil, err
 		}
+	}
+	if err := fetchAttachments(store, m, outDir); err != nil {
+		return nil, err
 	}
 	return m, nil
 }

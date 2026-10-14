@@ -119,10 +119,10 @@ func TestDeltaRoundTrip(t *testing.T) {
 	}
 }
 
-// Blobs of every size round-trip, are named by the chunked content hash, and go to the small store
-// only when small.
+// Blobs of every size round-trip, are named by the chunked content hash, and a small one is held
+// inline in its pointer - one segment, and never the engine's blob store.
 func TestBlobsRoundTripUnderTheirChunkedHash(t *testing.T) {
-	s, _, small := newTestStore(t, Config{HashWorkers: 3})
+	s, shim, small := newTestStore(t, Config{HashWorkers: 3})
 	r := rand.New(rand.NewSource(2))
 	for _, n := range []int{0, 1, 1 << 10, 1<<10 + 1, chunk - 1, chunk, chunk + 1, 3*chunk + 17} {
 		data := randomBytes(r, n)
@@ -139,10 +139,21 @@ func TestBlobsRoundTripUnderTheirChunkedHash(t *testing.T) {
 		if got := readBack(t, s, info.Hash); !bytes.Equal(got, data) {
 			t.Fatalf("%d bytes: read back different bytes", n)
 		}
-		_, inSmall := small.m[info.Hash]
-		if wantSmall := n > 0 && int64(n) <= s.cfg.SmallMaxBytes; inSmall != wantSmall {
-			t.Fatalf("%d bytes: in the small store = %v, want %v", n, inSmall, wantSmall)
+		if _, inSmall := small.m[info.Hash]; inSmall {
+			t.Fatalf("%d bytes: written to the engine's blob store", n)
 		}
+		s.mu.Lock()
+		p := s.pointers[info.Hash]
+		s.mu.Unlock()
+		if wantInline := n > 0 && int64(n) <= s.cfg.SmallMaxBytes; (p.inline != nil) != wantInline || (wantInline && p.segment != "") {
+			t.Fatalf("%d bytes: inline = %v, segment %q", n, p.inline != nil, p.segment)
+		}
+	}
+	// A reopened store reads the inline blobs back from their pointers.
+	again := New(shim, "app/data", nil, Config{})
+	data := randomBytes(rand.New(rand.NewSource(2)), 1)
+	if got := readBack(t, again, document.AttachmentContentHash(data)); !bytes.Equal(got, data) {
+		t.Fatal("an inline blob did not survive a reopen")
 	}
 	if _, err := s.Open(document.AttachmentContentHash([]byte("never stored"))); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing blob: %v", err)
