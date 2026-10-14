@@ -245,17 +245,15 @@ func (e *ServerEngine) CompactBlobStore() (sstable.CompactionResult, error) {
 	return e.CompactBlobStoreContext(context.Background())
 }
 
-// CompactBlobStoreUpTo is CompactBlobStore for a caller that must stay bounded: it merges only
-// when the tables, once the memtable is flushed, hold at most maxBytes, and otherwise merges
-// nothing and reports the bytes it left in Postponed.
+// CompactBlobStoreUpTo is CompactBlobStore for a caller that must stay bounded: it runs the merge
+// that is due only when, once the memtable is flushed, that merge would read at most maxBytes of
+// tables, and otherwise merges nothing and reports those bytes in Postponed.
 //
-// All or nothing, deliberately, rather than a merge of some of the tables. A merge of every
-// table is the one whose safety the store already argues - tombstones may be dropped because
-// nothing older survives, and their order against the tables left behind cannot matter because
-// none are left - so bounding which merges run, rather than what a merge covers, keeps every one
-// of those arguments as it is. This is what closing a namespace calls: a small namespace is
-// still merged on every close, as it always was, and a large one leaves its merge to the next
-// maintenance pass instead of making close time grow with the namespace.
+// The store decides which tables the merge takes (sstable/tiering.go): usually a window of its
+// newest, smallest runs, and the whole store only when what is newer has grown as large as the
+// oldest run. So closing a large namespace still merges the few small tables its last session
+// flushed - the cheap merge - and leaves a merge of the whole store to the next maintenance pass
+// instead of making close time grow with the namespace.
 func (e *ServerEngine) CompactBlobStoreUpTo(maxBytes int64) (sstable.CompactionResult, error) {
 	if e.blobStore == nil || e.config.IOShim == nil {
 		return sstable.CompactionResult{}, nil
@@ -265,16 +263,16 @@ func (e *ServerEngine) CompactBlobStoreUpTo(maxBytes int64) (sstable.CompactionR
 			return sstable.CompactionResult{}, err
 		}
 	}
-	if e.blobStore.RunCount() < sstable.DefaultCompactionTrigger {
+	// Asked first, so a merge that would be postponed does not first pay for the reachability
+	// walk below; the store asks again under its own lock, with the same bound.
+	bytes, due := e.blobStore.PendingMerge(sstable.DefaultCompactionTrigger)
+	if !due {
 		return sstable.CompactionResult{}, nil
 	}
-	if total, ok := e.blobStore.TableBytes(); !ok || total > maxBytes {
-		if !ok {
-			total = -1
-		}
-		return sstable.CompactionResult{Postponed: total}, nil
+	if bytes < 0 || bytes > maxBytes {
+		return sstable.CompactionResult{Postponed: bytes}, nil
 	}
-	return e.CompactBlobStoreContext(context.Background())
+	return e.blobStore.CompactContextUpTo(context.Background(), sstable.DefaultCompactionTrigger, e.reachableBlobKeys(), maxBytes)
 }
 
 // CompactBlobStoreContext is CompactBlobStore that abandons the merge, leaving every table as it
@@ -346,6 +344,18 @@ func (e *ServerEngine) reachableBlobKeys() func(codec.Hash) bool {
 // attachments. fn is called once per compaction and returns the predicate for it.
 func (e *ServerEngine) SetExtraReachable(fn func() func(codec.Hash) bool) {
 	e.extraReachable.Store(&fn)
+}
+
+// BlobMergeDue reports whether the SSTables hold a merge worth running under trigger - enough
+// runs of similar size, or more runs than a lookup should search (sstable/tiering.go). What a
+// background merge or a maintenance pass checks before starting one: a store may hold several
+// runs of different sizes with nothing due.
+func (e *ServerEngine) BlobMergeDue(trigger int) bool {
+	if e.blobStore == nil {
+		return false
+	}
+	_, due := e.blobStore.PendingMerge(trigger)
+	return due
 }
 
 // BlobRunCount is how many runs this namespace's SSTables form - what a merge's trigger

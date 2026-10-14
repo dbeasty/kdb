@@ -199,15 +199,19 @@ func TestCompactionTriggerCountsRuns(t *testing.T) {
 	if res, err := store.Compact(DefaultCompactionTrigger, nil); err != nil || res.Merged != 0 {
 		t.Fatalf("a store of one run merged again: %+v, %v", res, err)
 	}
+	// Three small flushes beside the one run are not yet a merge: tiering waits for four of a
+	// size (tiering.go). The fourth makes a window, merged into a run of its own; the large run
+	// is left alone.
 	for i := 0; i < DefaultCompactionTrigger-1; i++ {
 		store.AddTable(bigTable(t, shim, ns, 10, 100, int64(10+i), nil))
 	}
-	if store.RunCount() != DefaultCompactionTrigger {
-		t.Fatalf("%d runs, want %d", store.RunCount(), DefaultCompactionTrigger)
+	if res, err := store.Compact(DefaultCompactionTrigger, nil); err != nil || res.Merged != 0 {
+		t.Fatalf("three small flushes beside a large run were merged: %+v, %v", res, err)
 	}
+	store.AddTable(bigTable(t, shim, ns, 10, 100, int64(10+DefaultCompactionTrigger-1), nil))
 	res, err = store.Compact(DefaultCompactionTrigger, nil)
-	if err != nil || res.Merged == 0 || store.RunCount() != 1 {
-		t.Fatalf("merge of a run and three flushes: %+v, %v, %d runs after", res, err, store.RunCount())
+	if err != nil || res.Merged != DefaultCompactionTrigger || res.Full || store.RunCount() != 2 {
+		t.Fatalf("merge of four small flushes beside a run: %+v, %v, %d runs after", res, err, store.RunCount())
 	}
 	if got := store.Get(keyFor([]byte("key-12-000009"))); len(got) != 100 {
 		t.Fatalf("a key from the last flush reads %d bytes", len(got))

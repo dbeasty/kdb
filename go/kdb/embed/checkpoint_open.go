@@ -572,9 +572,10 @@ func checkpointAndTruncate(
 // asked for; failing them because a space optimization did not run would
 // turn a partial success into a reported failure.
 //
-// limit is compactWhole for maintenance, which merges whatever is there,
-// and a byte bound for close (engine.CompactBlobStoreUpTo), which merges
-// only a store that small.
+// limit is compactWhole for maintenance, which runs whatever merge is due
+// whatever its size, and a byte bound for close (engine.CompactBlobStoreUpTo),
+// which runs it only when it reads that little. Which tables a merge takes is
+// the store's choice (sstable/tiering.go): usually its newest, smallest runs.
 func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID string, limit int64) TruncationResult {
 	var c sstable.CompactionResult
 	var err error
@@ -588,8 +589,8 @@ func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID 
 		return res
 	}
 	if c.Postponed != 0 {
-		log.Printf("kdb: namespace %s: left %d sstables (%s) unmerged at close, over the %d-byte close limit - maintenance or the next open merges them",
-			namespaceID, eng.BlobTableCount(), postponedBytes(c.Postponed), limit)
+		log.Printf("kdb: namespace %s: left a merge of %s of its %d sstables to maintenance or the next open, over the %d-byte close limit",
+			namespaceID, postponedBytes(c.Postponed), eng.BlobTableCount(), limit)
 	}
 	res.TablesMerged, res.TablesRemoved, res.VersionsDropped = c.Merged, c.Removed, c.Dropped
 	if c.Removed > 0 {
@@ -599,7 +600,7 @@ func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID 
 	return res
 }
 
-// compactWhole is withCompaction's limit for a pass that merges every table whatever their size.
+// compactWhole is withCompaction's limit for a pass that runs the due merge whatever its size.
 const compactWhole int64 = -1
 
 func postponedBytes(n int64) string {

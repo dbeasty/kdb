@@ -50,12 +50,12 @@ type backgroundCompaction struct {
 	done   chan struct{}
 }
 
-// startBackgroundCompaction merges eng's SSTables in the background when they have reached the
-// compaction trigger and the namespace's reclaim mode allows reclaiming at all (under
+// startBackgroundCompaction merges eng's SSTables in the background when a merge is due
+// (engine.BlobMergeDue) and the namespace's reclaim mode allows reclaiming at all (under
 // storage.ReclaimManual nothing is destroyed until asked, and a merge drops unreachable versions).
 // Returns nil, having started nothing, otherwise.
 func startBackgroundCompaction(eng *engine.ServerEngine, namespaceID string) *backgroundCompaction {
-	if eng == nil || eng.BlobRunCount() < sstable.DefaultCompactionTrigger || !eng.ReclaimMode().Reclaims() {
+	if eng == nil || !eng.BlobMergeDue(sstable.DefaultCompactionTrigger) || !eng.ReclaimMode().Reclaims() {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())

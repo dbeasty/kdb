@@ -157,7 +157,7 @@ func compact(
 	}
 	heap.Init(&cursors)
 
-	w, err := newRunWriter(io, namespaceID, outLevel)
+	w, err := newRunWriter(io, namespaceID, outLevel, ageOf(inputs[0].SegmentName))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -477,12 +477,14 @@ type runTable struct {
 	fileHash      codec.Hash
 }
 
-func newRunWriter(io storage.PlatformIOShim, namespaceID string, level int) (*runWriter, error) {
-	runID, err := codec.RandomUUID()
+// newRunWriter writes a run whose tables are named with the given age (see ageOf): the oldest
+// input's, so the run sorts where its inputs did.
+func newRunWriter(io storage.PlatformIOShim, namespaceID string, level int, age string) (*runWriter, error) {
+	runID, err := tableFileID(age)
 	if err != nil {
 		return nil, err
 	}
-	w := &runWriter{io: io, namespaceID: namespaceID, level: level, runID: runID.String()}
+	w := &runWriter{io: io, namespaceID: namespaceID, level: level, runID: runID}
 	w.renamer, _ = io.(storage.SegmentRenamer)
 	return w, nil
 }

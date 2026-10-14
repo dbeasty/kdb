@@ -8,6 +8,7 @@ import (
 	"hash"
 	"strconv"
 	"strings"
+	"time"
 
 	kdberr "github.com/limidus/kdb/go/kdb/error"
 
@@ -325,11 +326,11 @@ func appendAll(shim storage.PlatformIOShim, segmentName string, b []byte) (int64
 const finishBufferBytes = 1 << 20
 
 func (w *DefaultWriter) Finish() (Handle, error) {
-	fileID, err := codec.RandomUUID()
+	fileID, err := tableFileID(agePrefix(time.Now()))
 	if err != nil {
 		return Handle{}, err
 	}
-	segmentName := io.SegmentNameBuilder.SSTable(w.namespaceID, w.level, fileID.String())
+	segmentName := io.SegmentNameBuilder.SSTable(w.namespaceID, w.level, fileID)
 	b := newTableBuilder(w.io, segmentName, len(w.entries))
 	for _, e := range w.entries {
 		if e.deleted {
