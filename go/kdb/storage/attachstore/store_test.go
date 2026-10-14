@@ -382,3 +382,48 @@ func TestStoreAsDeltaSkipsUnrelatedVersions(t *testing.T) {
 		t.Fatal("unreachable")
 	}
 }
+
+// The mark survives a reopen and Collect; a torn mark of a newer generation reads as the older
+// one and is never written over.
+func TestMarkSurvivesReopenAndCollect(t *testing.T) {
+	s, shim, small := newTestStore(t, Config{})
+	if m, err := s.Mark(); err != nil || len(m) != 0 {
+		t.Fatalf("fresh store mark %v, %v", m, err)
+	}
+	a, b := codec.Hash{Bytes: [32]byte{1}}, codec.Hash{Bytes: [32]byte{2}}
+	if err := s.SetMark([]codec.Hash{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Collect(func(codec.Hash) bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	// A torn mark two generations ahead, as a crash mid-write would leave.
+	torn := s.markName(3)
+	if _, err := shim.AppendToSegment(torn, []byte(markMagic)); err != nil {
+		t.Fatal(err)
+	}
+	again := New(shim, "app/data", small, Config{})
+	if m, err := again.Mark(); err != nil || len(m) != 2 || m[0] != a || m[1] != b {
+		t.Fatalf("reopened mark %v, %v", m, err)
+	}
+	if err := again.SetMark([]codec.Hash{b}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := again.Collect(func(codec.Hash) bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	third := New(shim, "app/data", small, Config{})
+	if m, err := third.Mark(); err != nil || len(m) != 1 || m[0] != b {
+		t.Fatalf("mark after a torn generation %v, %v", m, err)
+	}
+	names, _ := shim.ListSegments("app/data")
+	marks := 0
+	for _, n := range names {
+		if strings.HasPrefix(n, s.prefix+"m-") {
+			marks++
+		}
+	}
+	if marks != 1 {
+		t.Fatalf("%d mark segments left, want 1: %v", marks, names)
+	}
+}
