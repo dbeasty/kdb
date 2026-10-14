@@ -20,6 +20,7 @@ import dev.kdb.transport.ws.defaultWebSocketWireTransport
 import dev.kdb.wire.HandshakePayload
 import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
 import dev.kdb.wire.SUPPORTED_WIRE_FEATURES
+import dev.kdb.wire.SqlCellKind
 import dev.kdb.wire.TransactionWireCodec
 import dev.kdb.wire.WireCapabilitySet
 import dev.kdb.wire.WireClientMode
@@ -118,14 +119,7 @@ public class KdbRemoteConnection(
                     reply.columns.map {
                         ResultColumn(it, "VARCHAR", ColumnSource.EXPRESSION)
                     }
-                val rows =
-                    reply.rows.map { row ->
-                        QueryRow(
-                            row.map { cell ->
-                                if (cell == "null") SqlCell.Null else SqlCell.StringVal(cell)
-                            },
-                        )
-                    }
+                val rows = typedRows(reply.rows, reply.cellKinds)
                 HybridQueryResult(
                     result =
                         QueryResult(
@@ -206,6 +200,32 @@ public class KdbRemoteConnection(
             is WireMessage.ConflictReport -> throw SQLException("transaction conflict", "40001")
             is WireMessage.SqlResult -> if (reply.error != null) throw SQLException(reply.error)
             else -> throw SQLException("unexpected transaction reply: ${reply.header.messageType}")
+        }
+    }
+
+    /**
+     * The reply's text cells as typed SqlCells. With the server's cell kinds (WireMessage.SqlResult
+     * .cellKinds) each cell gets its SQL type - getObject returns a Long, a Double, null; without
+     * them (an older server) every cell is a string, and "null" the only NULL, as before.
+     */
+    private fun typedRows(rows: List<List<String>>, kinds: String?): List<QueryRow> {
+        var k = 0
+        return rows.map { row ->
+            QueryRow(
+                row.map { cell ->
+                    val kind = if (kinds != null && k < kinds.length) kinds[k] - '0' else -1
+                    k++
+                    when (kind) {
+                        -1 -> if (cell == "null") SqlCell.Null else SqlCell.StringVal(cell)
+                        SqlCellKind.NULL -> SqlCell.Null
+                        SqlCellKind.LONG -> cell.toLongOrNull()?.let { SqlCell.LongVal(it) } ?: SqlCell.StringVal(cell)
+                        SqlCellKind.DOUBLE -> cell.toDoubleOrNull()?.let { SqlCell.DoubleVal(it) } ?: SqlCell.StringVal(cell)
+                        SqlCellKind.BOOL -> SqlCell.BoolVal(cell == "1" || cell == "true")
+                        SqlCellKind.JSON -> SqlCell.JsonVal(cell)
+                        else -> SqlCell.StringVal(cell)
+                    }
+                },
+            )
         }
     }
 

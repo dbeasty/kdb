@@ -2,7 +2,10 @@ package wire
 
 import (
 	"encoding/binary"
+	"math"
 	"slices"
+
+	"github.com/limidus/kdb/go/kdb/codec"
 )
 
 // The binary frame encoding (B4 in docs/kdb-memory-cassandra-plan.md).
@@ -34,8 +37,14 @@ import (
 // Kotlin server, which acks no features.
 
 const (
-	// WireFeatureBinary: the peer reads and writes tag-2 binary bodies.
+	// WireFeatureBinary: the peer reads and writes tag-2 binary bodies of the core load-path
+	// messages (coreBinaryForm).
 	WireFeatureBinary = "binary-frames"
+	// WireFeatureBinary2: the peer also reads and writes binary bodies of the rest of the client
+	// message set - leases, search, history, revert, cross-namespace commit and DeltaCommit
+	// (moreBinaryForm). A separate feature because clients that shipped with WireFeatureBinary
+	// cannot decode those bodies. Only meaningful with WireFeatureBinary.
+	WireFeatureBinary2 = "binary-frames-2"
 	// WireFeatureZstd: the peer reads tag-3 frames, zstd-compressed binary bodies. Only meaningful
 	// with WireFeatureBinary.
 	WireFeatureZstd = "zstd-frames"
@@ -51,11 +60,11 @@ const (
 )
 
 // SupportedWireFeatures is every feature this build implements, in the order a client offers them.
-var SupportedWireFeatures = []string{WireFeatureBinary, WireFeatureZstd}
+var SupportedWireFeatures = []string{WireFeatureBinary, WireFeatureBinary2, WireFeatureZstd}
 
 // NegotiateWireFeatures returns the features in offered that this build supports, in this build's
 // order. A server acks with it; a client passes the ack's list to DefaultCodec.WithWireFeatures.
-// Zstd frames are dropped without binary frames, since they compress a binary body.
+// The other features are dropped without binary frames, since they extend or compress them.
 func NegotiateWireFeatures(offered []string) []string {
 	var out []string
 	for _, f := range SupportedWireFeatures {
@@ -228,6 +237,13 @@ func (r *binReader) sub(wt int) binReader {
 	return binReader{b: r.b[start-r.base : start-r.base+n], base: start}
 }
 
+// adopt carries a nested reader's error up to r.
+func (r *binReader) adopt(sub *binReader) {
+	if sub.err != nil && r.err == nil {
+		r.err = sub.err
+	}
+}
+
 func (r *binReader) str(wt int) string { return string(r.bytes(wt)) }
 
 func (r *binReader) optStr(wt int) *string {
@@ -284,4 +300,106 @@ func (r *binReader) skip(wt int) {
 		r.fail("unknown wire type in binary body")
 		r.off = len(r.b)
 	}
+}
+
+// appendNested writes a length-delimited field whose contents body appends. The length is not
+// known until body has run, so four bytes are reserved for it - a uvarint of up to 2^28, past
+// any frame - and the contents moved down over whatever the uvarint did not need.
+func appendNested(b []byte, field int, body func([]byte) []byte) []byte {
+	b = appendKey(b, field, wtBytes)
+	start := len(b)
+	b = append(b, 0, 0, 0, 0)
+	b = body(b)
+	n := len(b) - start - 4
+	var lenBuf [binary.MaxVarintLen64]byte
+	l := binary.PutUvarint(lenBuf[:], uint64(n))
+	copy(b[start:], lenBuf[:l])
+	copy(b[start+l:], b[start+4:])
+	return b[:start+l+n]
+}
+
+// appendDouble writes v as a little-endian IEEE 754 fixed64, unless it is zero.
+func appendDouble(b []byte, field int, v float64) []byte {
+	if v == 0 {
+		return b
+	}
+	return appendRawDouble(b, field, v)
+}
+
+func appendRawDouble(b []byte, field int, v float64) []byte {
+	b = appendKey(b, field, wtFixed64)
+	return binary.LittleEndian.AppendUint64(b, math.Float64bits(v))
+}
+
+func appendOptDouble(b []byte, field int, v *float64) []byte {
+	if v == nil {
+		return b
+	}
+	return appendRawDouble(b, field, *v)
+}
+
+// appendUUID writes id as its 16 big-endian bytes (the order of its canonical string), unless zero.
+func appendUUID(b []byte, field int, id codec.UUID) []byte {
+	if id == (codec.UUID{}) {
+		return b
+	}
+	b = appendKey(b, field, wtBytes)
+	b = append(b, 16)
+	b = binary.BigEndian.AppendUint64(b, uint64(id.MSB))
+	return binary.BigEndian.AppendUint64(b, uint64(id.LSB))
+}
+
+// appendHash writes h's 32 raw bytes, unless it is the zero hash.
+func appendHash(b []byte, field int, h codec.Hash) []byte {
+	if h == (codec.Hash{}) {
+		return b
+	}
+	return appendBytes(b, field, h.Bytes[:])
+}
+
+func (r *binReader) double(wt int) float64 {
+	if wt != wtFixed64 {
+		r.fail("binary field has the wrong wire type")
+		r.skip(wt)
+		return 0
+	}
+	if len(r.b)-r.off < 8 {
+		r.fail("binary field runs past the end of the body")
+		r.off = len(r.b)
+		return 0
+	}
+	v := math.Float64frombits(binary.LittleEndian.Uint64(r.b[r.off:]))
+	r.off += 8
+	return v
+}
+
+func (r *binReader) optDouble(wt int) *float64 {
+	v := r.double(wt)
+	return &v
+}
+
+func (r *binReader) uuid(wt int) codec.UUID {
+	p := r.bytes(wt)
+	if r.err != nil {
+		return codec.UUID{}
+	}
+	if len(p) != 16 {
+		r.fail("binary uuid is not 16 bytes")
+		return codec.UUID{}
+	}
+	return codec.UUID{MSB: int64(binary.BigEndian.Uint64(p)), LSB: int64(binary.BigEndian.Uint64(p[8:]))}
+}
+
+func (r *binReader) hash(wt int) codec.Hash {
+	p := r.bytes(wt)
+	if r.err != nil {
+		return codec.Hash{}
+	}
+	if len(p) != 32 {
+		r.fail("binary hash is not 32 bytes")
+		return codec.Hash{}
+	}
+	var h codec.Hash
+	copy(h.Bytes[:], p)
+	return h
 }

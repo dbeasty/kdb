@@ -22,11 +22,42 @@ package dev.kdb.wire
 
 public const val WIRE_FEATURE_BINARY: String = "binary-frames"
 
-/** Every feature this build implements, in the order a client offers them. */
-public val SUPPORTED_WIRE_FEATURES: List<String> = listOf(WIRE_FEATURE_BINARY)
+/** The rest of the client set in binary - here, Search and SearchResult. Separate from
+ * [WIRE_FEATURE_BINARY] because peers that shipped with that alone cannot decode these bodies. */
+public const val WIRE_FEATURE_BINARY_2: String = "binary-frames-2"
 
-/** The features in [offered] this build supports; what a server acks. */
-public fun negotiateWireFeatures(offered: List<String>): List<String> = SUPPORTED_WIRE_FEATURES.filter { it in offered }
+/** Tag-3 frames: a zstd frame of a tag-2 body, used for bodies of 8 KiB or more. */
+public const val WIRE_FEATURE_ZSTD: String = "zstd-frames"
+
+/** Every feature this build implements, in the order a client offers them. */
+public val SUPPORTED_WIRE_FEATURES: List<String> = listOf(WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD)
+
+/** The features in [offered] this build supports; what a server acks. The others extend or
+ * compress binary frames, so without [WIRE_FEATURE_BINARY] none is agreed. */
+public fun negotiateWireFeatures(offered: List<String>): List<String> {
+    val agreed = SUPPORTED_WIRE_FEATURES.filter { it in offered }
+    return if (WIRE_FEATURE_BINARY in agreed) agreed else emptyList()
+}
+
+/** Whether [type] is one of the load-path messages [WIRE_FEATURE_BINARY] covers. */
+internal fun coreBinaryForm(type: WireMessageType): Boolean =
+    when (type) {
+        WireMessageType.SESSION_BEGIN, WireMessageType.SESSION_BEGIN_ACK, WireMessageType.SQL_EXEC,
+        WireMessageType.SQL_RESULT, WireMessageType.TX_COMMIT, WireMessageType.TX_ROLLBACK,
+        WireMessageType.CONFLICT_REPORT, WireMessageType.DOCUMENT_GET, WireMessageType.DOCUMENT_GET_RESULT,
+        WireMessageType.UPSERT, WireMessageType.UPSERT_RESULT,
+        -> true
+        else -> false
+    }
+
+/** Whether [type] is one of the messages [WIRE_FEATURE_BINARY_2] adds that Kotlin has. */
+internal fun moreBinaryForm(type: WireMessageType): Boolean =
+    type == WireMessageType.SEARCH || type == WireMessageType.SEARCH_RESULT
+
+internal const val TAG_BINARY_ZSTD: Byte = 3
+
+/** The smallest binary body worth compressing (Go's zstdFrameThreshold). */
+internal const val ZSTD_FRAME_THRESHOLD: Int = 8 shl 10
 
 internal const val TAG_BINARY: Byte = 2
 
@@ -98,6 +129,32 @@ private class BinWriter {
         if (v.isNotEmpty()) bytesField(field, v)
     }
 
+    fun rawDouble(field: Int, v: Double) {
+        key(field, WT_FIXED64)
+        reserve(8)
+        val bits = v.toRawBits()
+        for (i in 0 until 8) buf[len++] = (bits ushr (8 * i)).toByte()
+    }
+
+    fun double(field: Int, v: Double) {
+        if (v != 0.0) rawDouble(field, v)
+    }
+
+    fun optDouble(field: Int, v: Double?) {
+        if (v != null) rawDouble(field, v)
+    }
+
+    /** A nested message: written to its own writer, then as one length-delimited field. */
+    fun nested(field: Int, body: BinWriter.() -> Unit) {
+        val inner = BinWriter()
+        inner.body()
+        key(field, WT_BYTES)
+        uvarint(inner.len.toLong())
+        reserve(inner.len)
+        inner.buf.copyInto(buf, len, 0, inner.len)
+        len += inner.len
+    }
+
     fun finish(): ByteArray = buf.copyOf(len)
 }
 
@@ -157,6 +214,21 @@ private class BinReader(val b: ByteArray, var off: Int, val end: Int) {
     }
 
     fun int(wireType: Int): Int = long(wireType).toInt()
+
+    fun double(wireType: Int): Double {
+        if (wireType != WT_FIXED64) throw WireDecodeException("malformed binary body: wrong wire type")
+        if (end - off < 8) throw WireDecodeException("malformed binary body: field runs past the end of the body")
+        var bits = 0L
+        for (i in 0 until 8) bits = bits or ((b[off + i].toLong() and 0xFF) shl (8 * i))
+        off += 8
+        return Double.fromBits(bits)
+    }
+
+    /** The length-delimited field at the cursor, as a reader of its own. */
+    fun nested(wireType: Int): BinReader {
+        val start = span(wireType)
+        return BinReader(b, start, start + lastLen)
+    }
 
     fun skip(wireType: Int) {
         when (wireType) {
@@ -227,6 +299,50 @@ internal fun encodeBinaryBody(message: WireMessage): ByteArray? {
             for (id in message.generatedIds) w.optString(9, id)
             w.optString(10, message.errorCode)
             w.optInt(11, message.retryAfterMs)
+            // Field 13: every cell's kind, one byte each - the digits of cellKinds.
+            message.cellKinds?.takeIf { it.isNotEmpty() }?.let { kinds ->
+                w.bytesField(13, ByteArray(kinds.length) { (kinds[it] - '0').toByte() })
+            }
+        }
+        is WireMessage.Search -> {
+            w.string(1, message.namespace)
+            w.string(2, message.sessionId ?: "")
+            message.text?.let { t ->
+                w.nested(3) {
+                    string(1, t.index)
+                    string(2, t.query)
+                    int(3, (t.depth ?: 0).toLong())
+                    optDouble(4, t.minScore?.toDouble())
+                    optDouble(5, t.weight)
+                }
+            }
+            message.vector?.let { v ->
+                w.nested(4) {
+                    string(1, v.index)
+                    for (x in v.vector) rawDouble(2, x)
+                    int(3, (v.depth ?: 0).toLong())
+                    optDouble(4, v.minScore?.toDouble())
+                    optDouble(5, v.weight)
+                }
+            }
+            w.string(5, message.fusion ?: "")
+            w.int(6, message.limit.toLong())
+            w.bool(7, message.includeJson)
+            w.string(8, message.atCommitHex ?: "")
+        }
+        is WireMessage.SearchResult -> {
+            w.string(1, message.namespace)
+            for (h in message.hits) {
+                w.nested(2) {
+                    string(1, h.docId)
+                    double(2, h.score.toDouble())
+                    optString(3, h.json)
+                }
+            }
+            w.string(3, message.resolvedCommitHex)
+            w.optString(4, message.error)
+            w.optString(5, message.errorCode)
+            w.optInt(6, message.retryAfterMs)
         }
         is WireMessage.TxCommit -> {
             w.string(1, message.namespace)
@@ -357,6 +473,7 @@ internal fun decodeBinaryBody(
             val generatedIds = ArrayList<String>()
             var errorCode: String? = null
             var retryAfterMs: Int? = null
+            var cellKinds: String? = null
             r.forEachField { f, wt ->
                 when (f) {
                     1 -> namespace = r.string(wt)
@@ -376,14 +493,55 @@ internal fun decodeBinaryBody(
                     9 -> generatedIds.add(r.string(wt))
                     10 -> errorCode = r.string(wt)
                     11 -> retryAfterMs = r.int(wt)
+                    13 -> {
+                        val kinds = r.bytes(wt)
+                        cellKinds = CharArray(kinds.size) { '0' + (kinds[it].toInt() and 0xFF).coerceAtMost(9) }.concatToString()
+                    }
                     else -> return@forEachField false
                 }
                 true
             }
             WireMessage.SqlResult(
                 header, namespace, sessionId, columns, rows, rowsAffected, resolvedCommitHex, readOnly,
-                error, generatedIds, errorCode, retryAfterMs,
+                error, generatedIds, errorCode, retryAfterMs, cellKinds,
             )
+        }
+        WireMessageType.SEARCH -> decodeSearch(header, r)
+        WireMessageType.SEARCH_RESULT -> {
+            var namespace = ""
+            val hits = ArrayList<WireMessage.SearchHit>()
+            var resolvedCommitHex = ""
+            var error: String? = null
+            var errorCode: String? = null
+            var retryAfterMs: Int? = null
+            r.forEachField { f, wt ->
+                when (f) {
+                    1 -> namespace = r.string(wt)
+                    2 -> {
+                        val h = r.nested(wt)
+                        var docId = ""
+                        var score = 0.0
+                        var json: String? = null
+                        h.forEachField { hf, hwt ->
+                            when (hf) {
+                                1 -> docId = h.string(hwt)
+                                2 -> score = h.double(hwt)
+                                3 -> json = h.string(hwt)
+                                else -> return@forEachField false
+                            }
+                            true
+                        }
+                        hits.add(WireMessage.SearchHit(docId, score.toFloat(), json))
+                    }
+                    3 -> resolvedCommitHex = r.string(wt)
+                    4 -> error = r.string(wt)
+                    5 -> errorCode = r.string(wt)
+                    6 -> retryAfterMs = r.int(wt)
+                    else -> return@forEachField false
+                }
+                true
+            }
+            WireMessage.SearchResult(header, namespace, hits, resolvedCommitHex, error, errorCode, retryAfterMs)
         }
         WireMessageType.TX_COMMIT -> {
             var namespace = ""
@@ -502,4 +660,53 @@ internal fun decodeBinaryBody(
         }
         else -> throw WireDecodeException("message type ${header.messageType} has no binary form")
     }
+}
+
+private fun decodeSearch(header: WireHeader, r: BinReader): WireMessage.Search {
+    var namespace = ""
+    var sessionId: String? = null
+    var text: WireMessage.SearchTextArm? = null
+    var vector: WireMessage.SearchVectorArm? = null
+    var fusion: String? = null
+    var limit = 0
+    var includeJson = false
+    var atCommitHex: String? = null
+    r.forEachField { f, wt ->
+        when (f) {
+            1 -> namespace = r.string(wt)
+            2 -> sessionId = r.string(wt)
+            3, 4 -> {
+                val a = r.nested(wt)
+                var index = ""
+                var query = ""
+                val values = ArrayList<Double>()
+                var depth: Int? = null
+                var minScore: Double? = null
+                var weight: Double? = null
+                a.forEachField { af, awt ->
+                    when (af) {
+                        1 -> index = a.string(awt)
+                        2 -> if (f == 3) query = a.string(awt) else values.add(a.double(awt))
+                        3 -> depth = a.int(awt)
+                        4 -> minScore = a.double(awt)
+                        5 -> weight = a.double(awt)
+                        else -> return@forEachField false
+                    }
+                    true
+                }
+                if (f == 3) {
+                    text = WireMessage.SearchTextArm(index, query, depth, minScore?.toFloat(), weight)
+                } else {
+                    vector = WireMessage.SearchVectorArm(index, values, depth, minScore?.toFloat(), weight)
+                }
+            }
+            5 -> fusion = r.string(wt)
+            6 -> limit = r.int(wt)
+            7 -> includeJson = r.long(wt) != 0L
+            8 -> atCommitHex = r.string(wt)
+            else -> return@forEachField false
+        }
+        true
+    }
+    return WireMessage.Search(header, namespace, sessionId, text, vector, fusion, limit, includeJson, atCommitHex)
 }

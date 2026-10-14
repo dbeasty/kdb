@@ -271,6 +271,8 @@ internal data class SqlResultDto(
     val generatedIds: List<String> = emptyList(),
     val errorCode: String? = null,
     val retryAfterMs: Int? = null,
+    // Every cell's kind, one decimal digit each, row by row (WireMessage.SqlResult.cellKinds).
+    val cellKinds: String? = null,
 )
 
 @Serializable

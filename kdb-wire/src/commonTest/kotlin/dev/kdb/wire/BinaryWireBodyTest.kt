@@ -125,7 +125,7 @@ class BinaryWireBodyTest {
         assertTrue("wireFeatures" !in json.encode(hs).decodeToString())
         val offered = hs.copy(request = hs.request.copy(wireFeatures = SUPPORTED_WIRE_FEATURES))
         assertEquals(SUPPORTED_WIRE_FEATURES, (json.decode(json.encode(offered)) as WireMessage.Handshake).request.wireFeatures)
-        assertEquals(listOf(WIRE_FEATURE_BINARY), negotiateWireFeatures(listOf("zstd-frames", WIRE_FEATURE_BINARY, "x")))
+        assertEquals(listOf(WIRE_FEATURE_BINARY, WIRE_FEATURE_ZSTD), negotiateWireFeatures(listOf("zstd-frames", WIRE_FEATURE_BINARY, "x")))
         assertEquals(emptyList(), negotiateWireFeatures(listOf("zstd-frames")))
     }
 

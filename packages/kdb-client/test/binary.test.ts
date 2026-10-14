@@ -12,7 +12,9 @@ import { decodeMessage, encodeMessage } from "../src/wire/envelope.ts";
 import { FRAME_HEADER_SIZE } from "../src/wire/frame.ts";
 import type { MessageKind } from "../src/wire/messages.ts";
 import { KdbProtocolError } from "../src/errors.ts";
-import { binaryFrameFixtures, bytesToHex, hexToBytes } from "./golden.ts";
+import { binaryFrame2Fixtures, binaryFrameFixtures, bytesToHex, hexToBytes } from "./golden.ts";
+import { WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, zstdDecompress } from "../src/wire/binary.ts";
+import { isClientKind } from "../src/wire/envelope.ts";
 
 /** A decoded binary payload with its byte fields in the JSON envelope's number[] form. */
 function asJsonShape(payload: Record<string, unknown>): Record<string, unknown> {
@@ -112,5 +114,46 @@ describe("binary frames", () => {
         }
       }
     }
+  });
+});
+
+describe("binary frames, second set", () => {
+  // Only the kinds this client has: leases, typed SQL results, and the zstd frame.
+  const fixtures = binaryFrame2Fixtures.filter((f) => isClientKind(f.kind));
+  const all = new Set([WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2]);
+
+  it("covers the lease kinds and typed cells", () => {
+    const names = new Set(fixtures.map((f) => f.name));
+    for (const name of ["lockAcquire", "lockRenew", "lockRelease", "lockResultGranted", "lockResultHeld", "sqlResultTyped"]) {
+      assert.ok(names.has(name), name);
+    }
+  });
+
+  it("decodes each Go frame to the payload its JSON envelope carries", () => {
+    for (const fixture of fixtures) {
+      if (fixture.name === "sqlResultZstd" && zstdDecompress === null) continue;
+      const message = decodeMessage(hexToBytes(fixture.frameHex));
+      assert.equal(message.kind, fixture.kind, fixture.name);
+      const want = jsonPayload(fixture);
+      const got = asJsonShape(message.payload as Record<string, unknown>);
+      for (const [key, value] of Object.entries(want)) {
+        const normalized = value === null && Array.isArray(got[key]) && (got[key] as unknown[]).length === 0 ? [] : value;
+        assert.deepEqual(got[key] ?? null, normalized ?? null, `${fixture.name}.${key}`);
+      }
+    }
+  });
+
+  it("encodes each JSON payload to the Go frame byte for byte", () => {
+    for (const fixture of fixtures) {
+      if (fixture.name === "sqlResultZstd") continue; // this client never compresses
+      const frame = encodeMessage(fixture.kind as MessageKind, fixture.correlationId, jsonPayload(fixture), undefined, all);
+      assert.equal(bytesToHex(frame), fixture.frameHex, fixture.name);
+    }
+  });
+
+  it("keeps leases on JSON under binary-frames alone", () => {
+    const lock = fixtures.find((f) => f.name === "lockAcquire")!;
+    const frame = encodeMessage("lockAcquire", 1, jsonPayload(lock), undefined, new Set([WIRE_FEATURE_BINARY]));
+    assert.equal(frame[FRAME_HEADER_SIZE], 1);
   });
 });

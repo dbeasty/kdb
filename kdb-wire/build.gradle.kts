@@ -22,6 +22,7 @@ kotlin {
 
         commonMain.dependencies {
             implementation(project(":kdb-codec"))
+            implementation(project(":kdb-compression"))
             implementation(project(":kdb-compaction"))
             implementation(project(":kdb-document"))
             implementation(project(":kdb-error"))

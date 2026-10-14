@@ -21,8 +21,10 @@ type Codec interface {
 // WithWireFeatures with binary frames, and decodes every encoding tag regardless.
 type DefaultCodec struct {
 	encoding PayloadEncoding
-	// binary encodes messages that have a binary form as tag-2 bodies (WireFeatureBinary).
-	binary bool
+	// binary encodes the core messages as tag-2 bodies (WireFeatureBinary); binary2 the rest of
+	// the client set too (WireFeatureBinary2).
+	binary  bool
+	binary2 bool
 	// zstd compresses binary bodies of zstdFrameThreshold bytes or more as tag-3 frames.
 	zstd bool
 }
@@ -40,6 +42,7 @@ func (c *DefaultCodec) Encoding() PayloadEncoding { return c.encoding }
 func (c *DefaultCodec) WithWireFeatures(features []string) *DefaultCodec {
 	out := *c
 	out.binary = slices.Contains(features, WireFeatureBinary)
+	out.binary2 = out.binary && slices.Contains(features, WireFeatureBinary2)
 	out.zstd = out.binary && slices.Contains(features, WireFeatureZstd)
 	return &out
 }
@@ -78,7 +81,7 @@ func (c *DefaultCodec) EncodePooled(message Message) (frame []byte, release func
 }
 
 func (c *DefaultCodec) encodeInto(fw *frameWriter, message Message) error {
-	if c.binary && hasBinaryForm(message.Header().MessageType) {
+	if t := message.Header().MessageType; c.binary && coreBinaryForm(t) || c.binary2 && moreBinaryForm(t) {
 		if hint := FrameHeaderSize + 1 + binarySizeHint(message); cap(fw.buf) < hint {
 			fw.buf = make([]byte, FrameHeaderSize, hint)
 		} else {

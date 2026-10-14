@@ -681,6 +681,27 @@ describe("SQL", () => {
     assert.equal(next, 3);
   });
 
+  it("returns typed cells from queryValues, and strings from a server that sends no kinds", async () => {
+    const reply = (cellKinds?: string) =>
+      new FakeServer((request) =>
+        request.kind === "sessionBegin"
+          ? sessionAck(NS)
+          : {
+              kind: "sqlResult" as const,
+              payload: {
+                namespace: NS, sessionId: "sess-1", columns: ["s", "n", "big", "x", "b", "nul", "doc"],
+                rows: [["", "42", "9007199254740993", "0.5", "1", "", '{"a":[1]}']],
+                rowsAffected: 0, resolvedCommitHex: HEAD_ONE, readOnly: true, generatedIds: [],
+                ...(cellKinds ? { cellKinds } : {}),
+              },
+            },
+      );
+    const typed = await new Client(reply("0223415")).queryValues(NS, "SELECT ...");
+    assert.deepEqual(typed.rows, [["", 42, 9007199254740993n, 0.5, true, null, { a: [1] }]]);
+    const untyped = await new Client(reply()).queryValues(NS, "SELECT ...");
+    assert.deepEqual(untyped.rows, [["", "42", "9007199254740993", "0.5", "1", "", '{"a":[1]}']]);
+  });
+
   it("surfaces a server error with its classification", async () => {
     const server = new FakeServer((request) =>
       request.kind === "sessionBegin"

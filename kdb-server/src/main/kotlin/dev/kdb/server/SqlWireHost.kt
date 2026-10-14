@@ -46,6 +46,7 @@ import dev.kdb.wire.WireCodec
 import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
+import dev.kdb.wire.SqlCellKind
 import dev.kdb.wire.negotiateWireFeatures
 import dev.kdb.wire.withWireFeatures
 import kotlinx.coroutines.sync.Mutex
@@ -428,6 +429,7 @@ public class SqlWireHost(
                 readOnly = json.readOnly,
                 error = null,
                 generatedIds = result.result.generatedIds,
+                cellKinds = cellKindsOf(result.result.rows),
             )
         } catch (e: ConflictException) {
             conflictReport(msg.header.correlationId, session.namespaceId, e.report, msg.namespace)
@@ -836,6 +838,27 @@ public class SqlWireHost(
         correlationId: Int,
         type: WireMessageType,
     ): WireHeader = WireHeader(type, KDB_WIRE_PROTOCOL_VERSION, correlationId, 0)
+
+    /** Every cell's kind, row by row, as WireMessage.SqlResult.cellKinds digits: the SQL type each
+     * string in the reply's rows is the text of. Null for a result with no cells. */
+    private fun cellKindsOf(rows: List<dev.kdb.sql.QueryRow>): String? {
+        val out = StringBuilder()
+        for (row in rows) {
+            for (cell in row.values) {
+                val kind =
+                    when (cell) {
+                        null, dev.kdb.sql.SqlCell.Null -> SqlCellKind.NULL
+                        is dev.kdb.sql.SqlCell.StringVal -> SqlCellKind.STRING
+                        is dev.kdb.sql.SqlCell.LongVal -> SqlCellKind.LONG
+                        is dev.kdb.sql.SqlCell.DoubleVal -> SqlCellKind.DOUBLE
+                        is dev.kdb.sql.SqlCell.BoolVal -> SqlCellKind.BOOL
+                        is dev.kdb.sql.SqlCell.JsonVal -> SqlCellKind.JSON
+                    }
+                out.append('0' + kind)
+            }
+        }
+        return out.takeIf { it.isNotEmpty() }?.toString()
+    }
 
     private fun cellToString(cell: kotlinx.serialization.json.JsonElement): String =
         when {
