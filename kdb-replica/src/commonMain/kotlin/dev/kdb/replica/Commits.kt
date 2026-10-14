@@ -25,6 +25,9 @@ public class ReplicaCommit internal constructor(
     public val hash: String = commit.hash.toHex()
     public val parents: List<String> = commit.parentHashes.map { it.toHex() }
     public val treeHash: String = commit.documentTreeHash.toHex()
+
+    /** Hex of the commit's attachment table root (field 10); null when its table is empty. */
+    public val attachmentRoot: String? = commit.attachmentTreeHash?.toHex()
     public val timestampMicros: Long get() = commit.timestamp.toEpochMicros()
     public val ops: List<KdbOp> get() = commit.operations
 
@@ -44,6 +47,7 @@ public class ReplicaCommit internal constructor(
             ops: List<KdbOp>,
             treeHash: String,
             message: String,
+            attachmentRoot: String? = null,
         ): ReplicaCommit {
             val c =
                 KdbCommit.build(
@@ -56,6 +60,7 @@ public class ReplicaCommit internal constructor(
                     documentTreeHash = KdbHash.fromBytes(hex32(treeHash)),
                     schemaHash = null,
                     message = message,
+                    attachmentTreeHash = attachmentRoot?.let { KdbHash.fromBytes(hex32(it)) },
                 )
             return ReplicaCommit(c, c.toPayloadBytes())
         }

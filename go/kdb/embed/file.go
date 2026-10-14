@@ -311,6 +311,7 @@ func (h *Host) openNamespace(
 		recovery:         recovery,
 	}
 	rt.attach.config.UploadGrace = opts.Storage.AttachmentUploadGrace
+	rt.attach.config.DeltaStepBytes = opts.Storage.AttachmentDeltaStepBytes
 	rt.registerAttachmentBlobs()
 	// From the start, not from the first attachment store opened: a history=none blob store
 	// merge before then would drop attachment blobs and spilled attachment sets.

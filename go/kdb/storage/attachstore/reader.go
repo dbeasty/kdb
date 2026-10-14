@@ -471,11 +471,17 @@ func (s *Store) sourceFor(chain []resolved) (source, error) {
 		if err != nil {
 			return nil, err
 		}
-		d, err := parseDelta(src, segSource{shim: s.shim, name: p.segment, n: n})
+		seg := segSource{shim: s.shim, name: p.segment, n: n}
+		var d source
+		if p.framed {
+			d, err = openFramedDelta(src, seg)
+		} else {
+			d, err = parseDelta(src, seg)
+		}
 		if err != nil {
 			return nil, err
 		}
-		if d.n != p.size {
+		if d.size() != p.size {
 			return nil, errDeltaCorrupt
 		}
 		src = d
@@ -483,8 +489,13 @@ func (s *Store) sourceFor(chain []resolved) (source, error) {
 	return src, nil
 }
 
-// segmentLength finds a segment's length by probing (the shim reports none).
+// segmentLength asks the shim for a segment's length, or finds it by probing.
 func segmentLength(shim storage.PlatformIOShim, name string) (int64, error) {
+	if sz, ok := shim.(storage.SegmentSizer); ok {
+		if n, err := sz.SegmentSize(name); err == nil {
+			return n, nil
+		}
+	}
 	lo, hi := int64(0), int64(1)
 	for {
 		b, err := shim.ReadFromSegment(name, hi, 1)
@@ -557,90 +568,4 @@ func (s *Store) ReadAll(h codec.Hash, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	return b.Bytes(), nil
-}
-
-// StoreAsDelta re-stores old as a delta against base (the version that replaced it) when old is a
-// whole standalone blob within DeltaMaxBytes, the chain stays within DeltaMaxDepth, and the delta is
-// under half old's size. It reports whether it did. Readers already open on old keep reading the
-// whole copy, which is deleted when the last of them closes.
-func (s *Store) StoreAsDelta(old, base codec.Hash) (bool, error) {
-	if old == base || old == emptyHash || base == emptyHash {
-		return false, nil
-	}
-	s.mu.Lock()
-	if err := s.loadLocked(); err != nil {
-		s.mu.Unlock()
-		return false, err
-	}
-	p, ok := s.pointers[old]
-	baseChain, baseLarge, err := s.resolveLocked(base)
-	if err != nil || !ok || !baseLarge || p.delta || p.inline != nil || p.size > s.cfg.DeltaMaxBytes ||
-		baseChain[0].p.size > s.cfg.DeltaMaxBytes || len(baseChain) > s.cfg.DeltaMaxDepth {
-		s.mu.Unlock()
-		return false, err
-	}
-	s.mu.Unlock()
-
-	oldR, err := s.Open(old)
-	if err != nil {
-		return false, err
-	}
-	defer oldR.Close()
-	baseR, err := s.Open(base)
-	if err != nil {
-		return false, err
-	}
-	defer baseR.Close()
-
-	seg, err := s.newSegmentName()
-	if err != nil {
-		return false, err
-	}
-	s.mu.Lock()
-	s.uploads[seg] = struct{}{}
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.uploads, seg)
-		s.mu.Unlock()
-	}()
-	written := int64(0)
-	limit := p.size / 2
-	errTooBig := errors.New("delta too big")
-	err = encodeDelta(baseR.src, oldR.src, func(b []byte) error {
-		written += int64(len(b))
-		if written >= limit {
-			return errTooBig
-		}
-		_, err := s.shim.AppendToSegment(seg, b)
-		return err
-	})
-	if err != nil {
-		_ = s.shim.DeleteSegment(seg)
-		if errors.Is(err, errTooBig) {
-			return false, nil
-		}
-		return false, err
-	}
-	if err := s.shim.FlushSegment(seg); err != nil {
-		return false, err
-	}
-	if err := s.shim.SealSegment(seg); err != nil {
-		return false, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, ok := s.pointers[old]
-	if !ok || cur.gen != p.gen {
-		_ = s.shim.DeleteSegment(seg) // changed under us; leave it be
-		return false, nil
-	}
-	np, err := s.writePointerLocked(old, pointer{segment: seg, leaves: cur.leaves, size: cur.size, delta: true, base: base})
-	if err != nil {
-		return false, err
-	}
-	s.pointers[old] = np
-	s.deleteOrDeferLocked(cur.name)
-	s.deleteOrDeferLocked(cur.segment)
-	return true, nil
 }

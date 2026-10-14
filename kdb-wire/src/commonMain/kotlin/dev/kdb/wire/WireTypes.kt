@@ -457,7 +457,9 @@ public sealed class WireMessage {
 
     /** One chunk of a blob upload. The first has no [uploadId]; the result names the upload, and
      * every later chunk carries it with the [offset] it starts at (the bytes received so far, so an
-     * interrupted upload resumes from the result's received). [final] finishes the upload. */
+     * interrupted upload resumes from the result's received). [final] finishes the upload.
+     * [expect], on a first chunk, names the blob the upload will be (Go's Expect, field 7): a host
+     * that already holds it answers with its hash and no uploadId, so the rest is not sent. */
     public class AttachmentUpload(
         override val header: WireHeader,
         public val namespace: String,
@@ -466,21 +468,22 @@ public sealed class WireMessage {
         public val offset: Long = 0,
         public val data: ByteArray = ByteArray(0),
         public val final: Boolean = false,
+        public val expect: KdbHash? = null,
     ) : WireMessage() {
         public fun copy(header: WireHeader): AttachmentUpload =
-            AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final)
+            AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final, expect)
 
         override fun equals(other: Any?): Boolean =
             other is AttachmentUpload && header == other.header && namespace == other.namespace &&
                 sessionId == other.sessionId && uploadId == other.uploadId && offset == other.offset &&
-                data.contentEquals(other.data) && final == other.final
+                data.contentEquals(other.data) && final == other.final && expect == other.expect
 
         override fun hashCode(): Int =
-            listOf(header, namespace, sessionId, uploadId, offset, final).hashCode() * 31 + data.contentHashCode()
+            listOf(header, namespace, sessionId, uploadId, offset, final, expect).hashCode() * 31 + data.contentHashCode()
 
         override fun toString(): String =
             "AttachmentUpload(header=$header, namespace=$namespace, sessionId=$sessionId, uploadId=$uploadId, " +
-                "offset=$offset, data=${data.size} bytes, final=$final)"
+                "offset=$offset, data=${data.size} bytes, final=$final, expect=$expect)"
     }
 
     /** Answers an upload chunk: the bytes received so far and, after the final chunk, the blob's

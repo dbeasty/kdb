@@ -43,8 +43,9 @@ These are the owner's decisions from 2026-10-13. Later decisions supersede earli
    - Large blobs are standalone segments.
    - S3 will get its own strategy later. Everything goes through the platform I/O shim, which
      already has an S3 implementation.
-6. **Git-like deltas where small.** The newest version is always whole. A replaced version is
-   re-stored as a delta against its successor when that is under half its size.
+6. **Git-like deltas, any size.** The newest version is always whole. A replaced version is
+   re-stored as a delta against its successor when that is under half its size - whatever its
+   size, with memory bounded independent of it.
 7. **History setting.** Keep all attachment history (`AttachmentHistoryAll`, the default) or only
    the latest (`AttachmentHistoryLatest`).
 8. **Bytes are never held whole.** Reads stream chunks from storage. A read follows the same
@@ -155,20 +156,36 @@ identity = SHA-256(0x02 || be64(size) || tree)
   - Sequential (`Read`) and random access (`ReadAt`, for ranged fetches).
   - Each chunk is checked against its stored leaf before it is returned. Leaves are checked once
     against the root by streaming them.
-  - A delta is read through its instruction index, so only the base ranges and literal bytes a read
-    touches are fetched, and no version is rebuilt in memory.
+  - A delta is read through its instructions, so only the base ranges and literal bytes a read
+    touches are fetched, and no version is rebuilt in memory. A format 2 delta's instructions are
+    framed and indexed on disk: a read loads one frame (at most 4096 instructions) at a time.
 - **Read pins.** An open reader pins every segment it resolved, including a delta's base chain.
-  - `StoreAsDelta` and `Collect` queue a pinned segment for deletion, and the last reader to close
+  - Delta jobs and `Collect` queue a pinned segment for deletion, and the last reader to close
     deletes it.
   - Pins are leases (`ReadLease`, default one hour). A stalled reader is released by the next
     `Collect` and fails with `ErrReadLeaseExpired`.
-- **Deltas** (`delta.go`).
-  - Encoding indexes the base by block hash, with the block size scaled so the index stays under
-    about 1M entries, then rolls a hash over the target through 1 MiB page caches. Neither version
-    is held whole.
-  - A version is diffed only if its size is within `DeltaMaxBytes` (default 256 MiB, because that
-    bounds the index), and chain depth is capped at 8.
-  - Larger versions stay whole. A streaming rolling-hash delta for multi-GB files is a follow-up.
+- **Deltas** (`delta.go`, `deltajob.go`). Any size; chain depth is capped at 8 (`DeltaMaxDepth`).
+  `DeltaMaxBytes` can still cap the size diffed; it is unlimited by default.
+  - **Chunks first.** A target chunk whose leaf equals the base's leaf at the same offset is a copy
+    instruction without reading a byte, so an in-place edit to a TB file costs the chunks touched.
+  - **Index only what did not match.** Only base chunks with no equal target chunk at their
+    offset are indexed, by block hash; the block grows with those bytes so the index stays under
+    `DeltaIndexEntries` (default 1M, ~40 MB) whatever the size.
+  - **Rolling hash where content shifted.** The target is scanned with a rolling hash through a
+    few cached pages; a hit is extended backwards and forwards by page compares, and by whole
+    chunks again where the offsets line up. Neither version is held whole.
+  - **Format 2** (pointer flag 4): frames (literal bytes, then that frame's instructions), a
+    32-byte-per-frame index and a footer (`KDBDLT2`). Format 1 deltas (written before this, at
+    most 256 MiB) still read. The layout is documented in `delta.go`.
+  - **Bounded, resumable steps.** A delta job runs in phases - index the base, encode, verify
+    every chunk of the delta against the old version's leaves, swap the pointer - in steps of
+    `DeltaStepBytes` (default 4 GiB; `--attachment-delta-step-mb` / `KDB_ATTACHMENT_DELTA_STEP_MB` /
+    `attachmentDeltaStepMb` on the service). A maintenance pass that runs out of budget stops
+    with the job pending and its mark unmoved; the next pass resumes it. Between steps it holds
+    no pins or locks, only its index and progress.
+  - **Crash safety.** Nothing replaces the whole copy until the delta has been read back and
+    verified; the swap is the usual higher-generation pointer. A crash mid-job leaves only
+    unnamed segments, which `Collect` retires, and the job starts over (progress is in memory).
 - **GC.** `Collect` deletes what the keep-set rejects, keeps the bases of kept deltas, and deletes
   segments no pointer names (unfinished uploads).
 - **Upload grace.** Every writer uploads first and commits after (client API, SQL `STREAM ?`, a
@@ -310,7 +327,8 @@ identity = SHA-256(0x02 || be64(size) || tree)
   a follow-up.
 - **A collection pass** still lists every stored blob (`Collect`), and a rebuild of the reference
   index reads all of retained history once.
-- **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
+- **Delta jobs restart after a crash.** Progress is in memory, so a restart mid-job redoes it from
+  the start. Versions found not worth a delta are remembered per process only.
 - **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
   read Go's v5 checkpoint and graph formats and has no blob peer transfer.
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.
@@ -322,4 +340,4 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - ~~Set pool held in memory~~: bounded and spilled to the blob store.
 - **Backups.** Backups do not copy attachment segments yet, and a restored node must seed its
   tables (PR 5).
-- **Delta size.** Versions over `DeltaMaxBytes` are not delta-encoded.
+- **Delta size.** Lifted: versions of any size are delta-encoded (see Deltas above).

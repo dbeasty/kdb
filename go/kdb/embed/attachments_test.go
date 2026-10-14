@@ -473,3 +473,58 @@ func TestTransactionReplacementIsStoredAsDelta(t *testing.T) {
 		}
 	}
 }
+
+// A replaced version larger than one pass's delta budget is diffed over several passes: each
+// stops with the delta pending and the mark unmoved, the next goes on, and the old version reads
+// back the same all along.
+func TestAVersionOverThePassBudgetIsDiffedOverSeveralPasses(t *testing.T) {
+	root := t.TempDir()
+	rt := openAttachRuntime(t, root, storage.HistoryModeFull)
+	defer func() { rt.Close() }()
+	rt.SetAttachmentConfig(attachstore.Config{SmallMaxBytes: 1 << 10, DeltaStepBytes: 512 << 10, DeltaIndexEntries: 128})
+	id := codec.UUID{MSB: 44}
+	putAttachDoc(t, rt, id, `{}`)
+	r := rand.New(rand.NewSource(44))
+	v0 := make([]byte, 3<<20+12345)
+	r.Read(v0)
+	v1 := append(append(append([]byte(nil), v0[:1000]...), []byte("an insertion shifts everything after it")...), v0[1000:]...)
+	var commits []codec.Hash
+	for _, v := range [][]byte{v0, v1} {
+		c, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader(v), embed.PutAttachmentOptions{Name: "file", Mime: "x/y"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		commits = append(commits, c)
+	}
+	passes := 0
+	for {
+		passes++
+		res, err := rt.CompactAttachments(attachNS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := readAttachment(t, rt, id, commits[0]); !bytes.Equal(got, v0) {
+			t.Fatalf("pass %d: the old version reads wrong", passes)
+		}
+		if passes > 1 && (res.Scanned != 0 || res.Rebuilt) {
+			// The reference index moved past these commits on the first pass; the delta work is
+			// found again from the mark, which did not.
+			t.Fatalf("pass %d read %d commits for references (%+v)", passes, res.Scanned, res)
+		}
+		if res.Deltas == 1 {
+			break
+		}
+		if !res.DeltaPending || passes > 100 {
+			t.Fatalf("pass %d: %+v", passes, res)
+		}
+	}
+	if passes < 3 {
+		t.Fatalf("done in %d passes; the budget did not bound them", passes)
+	}
+	if res, err := rt.CompactAttachments(attachNS); err != nil || res.Deltas != 0 || res.DeltaPending {
+		t.Fatalf("a pass after the delta: %+v %v", res, err)
+	}
+	if got, _ := readAttachment(t, rt, id, commits[0]); !bytes.Equal(got, v0) {
+		t.Fatal("the delta reads wrong")
+	}
+}

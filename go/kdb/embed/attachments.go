@@ -129,7 +129,8 @@ func (rt *EmbeddedKdbRuntime) SetAttachmentHistory(h AttachmentHistory) {
 }
 
 // SetAttachmentConfig tunes the attachment store (size limit, chunking, deltas, upload grace). It
-// replaces the whole configuration, StorageOptions.AttachmentUploadGrace included. Takes effect for
+// replaces the whole configuration, StorageOptions.AttachmentUploadGrace and
+// AttachmentDeltaStepBytes included. Takes effect for
 // stores opened afterwards.
 func (rt *EmbeddedKdbRuntime) SetAttachmentConfig(cfg attachstore.Config) {
 	rt.attach.mu.Lock()
@@ -551,9 +552,10 @@ type attachmentChange struct {
 // history is not here (a shallow root, a truncated floor) contributes its whole table, which is
 // where its references came from.
 //
-// It also returns, oldest first, the changing commits read that wanted accepts (none when wanted
-// is nil).
-func (rt *EmbeddedKdbRuntime) attachmentReferences(d *dag.InMemoryCommitDag, store *attachstore.Store, heads []codec.Hash, wanted func(codec.Hash) bool, out *AttachmentMaintenance) (attachstore.RefIndex, []attachmentChange, error) {
+// It also returns, oldest first, the commits above markStops that put attachments: the ones the
+// delta pass still owes. They are the commits read here when markStops are the index's heads, and
+// are walked separately otherwise.
+func (rt *EmbeddedKdbRuntime) attachmentReferences(d *dag.InMemoryCommitDag, store *attachstore.Store, heads, markStops []codec.Hash, out *AttachmentMaintenance) (attachstore.RefIndex, []attachmentChange, error) {
 	floor := d.HistoryFloor()
 	prev, ok, err := store.RefIndex()
 	if err != nil {
@@ -568,6 +570,7 @@ func (rt *EmbeddedKdbRuntime) attachmentReferences(d *dag.InMemoryCommitDag, sto
 	var changes []attachmentChange
 	fallback := false
 	above := d.CommitsAbove(heads, stops)
+	sameStops := sameHashes(attachstore.SortHashes(append([]codec.Hash(nil), markStops...)), stops)
 	out.Scanned, out.Rebuilt = len(above), !incremental
 	for _, h := range above {
 		c, ok := d.GetCommit(h)
@@ -596,19 +599,35 @@ func (rt *EmbeddedKdbRuntime) attachmentReferences(d *dag.InMemoryCommitDag, sto
 				continue
 			}
 		}
-		ops, err := d.CommitOperations(h)
+		change, err := readAttachmentChange(d, c)
 		if err != nil {
 			return attachstore.RefIndex{}, nil, err
 		}
-		change := attachmentChange{commit: c}
-		for _, op := range ops {
-			if put, ok := op.(document.AttachmentPutOp); ok {
-				added = append(added, put.ContentHash)
-				change.puts = append(change.puts, put)
-			}
+		for _, put := range change.puts {
+			added = append(added, put.ContentHash)
 		}
-		if wanted != nil && len(change.puts) > 0 && wanted(h) {
+		if sameStops && len(change.puts) > 0 {
 			changes = append(changes, change)
+		}
+	}
+	if !sameStops {
+		// The delta pass is behind the index: its changes come from the mark.
+		for _, h := range d.CommitsAbove(heads, markStops) {
+			c, ok := d.GetCommit(h)
+			if !ok || c.AttachmentTreeHash == nil || len(c.ParentHashes) == 0 {
+				continue
+			}
+			p, ok := d.GetCommit(c.ParentHashes[0])
+			if !ok || (p.AttachmentTreeHash != nil && *p.AttachmentTreeHash == *c.AttachmentTreeHash) {
+				continue
+			}
+			change, err := readAttachmentChange(d, c)
+			if err != nil {
+				return attachstore.RefIndex{}, nil, err
+			}
+			if len(change.puts) > 0 {
+				changes = append(changes, change)
+			}
 		}
 	}
 	if fallback {
@@ -633,6 +652,21 @@ func (rt *EmbeddedKdbRuntime) attachmentReferences(d *dag.InMemoryCommitDag, sto
 		changes[i], changes[j] = changes[j], changes[i]
 	}
 	return ix, changes, nil
+}
+
+// readAttachmentChange is c with the attachment puts its operations carry.
+func readAttachmentChange(d *dag.InMemoryCommitDag, c document.Commit) (attachmentChange, error) {
+	ops, err := d.CommitOperations(c.Hash)
+	if err != nil {
+		return attachmentChange{}, err
+	}
+	change := attachmentChange{commit: c}
+	for _, op := range ops {
+		if put, ok := op.(document.AttachmentPutOp); ok {
+			change.puts = append(change.puts, put)
+		}
+	}
+	return change, nil
 }
 
 // stillBelow reports whether every commit of old is still here and at or below one of heads - so
@@ -700,6 +734,9 @@ func mergeHashes(a, b []codec.Hash) []codec.Hash {
 type AttachmentMaintenance struct {
 	Deltas  int // replaced versions re-stored as deltas
 	Removed int // blobs deleted
+	// DeltaPending: the pass spent its delta budget (attachstore.Config.DeltaStepBytes) before
+	// the replaced versions were all done; the next pass goes on where this one stopped.
+	DeltaPending bool
 	// Under AttachmentHistoryAll: the commits read for the references they add (only those since
 	// the last pass, unless the reference index was rebuilt).
 	Scanned int
@@ -765,32 +802,23 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		return out, err
 	}
 	heads := branchAndTagHeads(d)
-	// Deltas are wanted for commits the last pass that moved the mark did not go through. Usually
-	// the mark is the index's heads, and every commit read is new to both.
+	// Deltas are owed for the commits the last pass that finished its deltas did not go through:
+	// those above the mark. Usually the mark is the reference index's heads and the commits are the
+	// same; after a pass that stopped early (an error, DeltaPending) the mark lags and they are
+	// walked from it again.
 	var known []codec.Hash
 	for _, h := range mark {
 		if d.HasCommit(h) {
 			known = append(known, h)
 		}
 	}
-	var markTests []func(codec.Hash) bool
-	for _, m := range known {
-		markTests = append(markTests, d.AncestorTest(m))
-	}
-	refs, changes, err := rt.attachmentReferences(d, store, heads, func(h codec.Hash) bool {
-		for _, below := range markTests {
-			if below(h) {
-				return false
-			}
-		}
-		return true
-	}, &out)
+	refs, changes, err := rt.attachmentReferences(d, store, heads, known, &out)
 	if err != nil {
 		return out, err
 	}
 	keep := func(h codec.Hash) bool { return refs.Has(h) }
 	deltaErr := rt.deltaReplaced(d, store, keep, changes, &out)
-	if deltaErr == nil && len(changes) > 0 {
+	if deltaErr == nil && !out.DeltaPending && !sameHashes(mark, heads) {
 		deltaErr = store.SetMark(heads)
 	}
 	out.Removed, err = store.Collect(keep)
@@ -802,8 +830,12 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 
 // deltaReplaced re-stores, for each put in changes, the version it replaced in its commit's first
 // parent as a delta against it, when both are kept. A version gone missing or corrupt is left
-// alone; any other failure stops the pass, so the mark is not moved past work not done.
+// alone; any other failure stops the pass, so the mark is not moved past work not done. So does
+// spending the pass's budget (attachstore.Config.DeltaStepBytes): the delta in progress carries
+// over, and the next pass, finding the same changes, finishes it - a multi-GB version is diffed
+// over several passes, none of them long.
 func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *attachstore.Store, keep func(codec.Hash) bool, changes []attachmentChange, out *AttachmentMaintenance) error {
+	budget := store.Config().DeltaStepBytes
 	for _, ch := range changes {
 		if len(ch.commit.ParentHashes) == 0 {
 			continue
@@ -820,15 +852,24 @@ func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *att
 			if !ok || prev.ContentHash == put.ContentHash || !keep(prev.ContentHash) || !keep(put.ContentHash) {
 				continue
 			}
-			did, err := store.StoreAsDelta(prev.ContentHash, put.ContentHash)
+			if budget <= 0 {
+				out.DeltaPending = true
+				return nil
+			}
+			did, used, err := store.DeltaStep(prev.ContentHash, put.ContentHash, budget)
+			budget -= used
 			if errors.Is(err, attachstore.ErrNotFound) || errors.Is(err, attachstore.ErrCorrupt) {
 				continue
 			}
 			if err != nil {
 				return err
 			}
-			if did {
+			switch did {
+			case attachstore.DeltaStored:
 				out.Deltas++
+			case attachstore.DeltaPending:
+				out.DeltaPending = true
+				return nil
 			}
 		}
 	}

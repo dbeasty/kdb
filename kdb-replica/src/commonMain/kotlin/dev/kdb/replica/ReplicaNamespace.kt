@@ -1,6 +1,7 @@
 package dev.kdb.replica
 
 import dev.kdb.codec.KdbUuid
+import dev.kdb.document.AttachmentException
 import dev.kdb.document.KdbOp
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -16,9 +17,6 @@ public class TreeMismatchException(
 public class NotFastForwardException(message: String) : RuntimeException(message)
 
 public class ReplicaBusyException(message: String) : RuntimeException(message)
-
-/** A commit the replica cannot apply faithfully, refused rather than misread. */
-public class UnsupportedCommitException(message: String) : RuntimeException(message)
 
 /** A document as the replica holds it. */
 public data class ReplicaDocument(val id: String, val json: String)
@@ -120,18 +118,6 @@ public fun netEffect(ordered: List<ReplicaCommit>): LinkedHashMap<String, KdbOp>
 }
 
 /**
- * The replica does not hold attachments yet (plan §9): a commit carrying them would leave its
- * attachment table unverified and its blobs unknown, so it is refused rather than half-applied.
- */
-private fun requireSupported(c: ReplicaCommit) {
-    if (c.commit.attachmentTreeHash != null ||
-        c.ops.any { it is KdbOp.AttachmentPut || it is KdbOp.AttachmentDelete }
-    ) {
-        throw UnsupportedCommitException("kdb replica: commit ${c.hash} carries attachments, which this replica does not hold yet")
-    }
-}
-
-/**
  * One namespace held by the replica: its documents, its trie, its head commit and the local
  * commits not yet pushed. It holds no other history.
  *
@@ -140,8 +126,12 @@ private fun requireSupported(c: ReplicaCommit) {
  * tree it built to equal the target's declared tree hash. That is go/kdb/peersync/ingest.go's
  * fastForward → netEffect → applyAndVerify. A merge commit carries every document its parents
  * disagree on, so the last op in any topological order is the merged state. Everything a step
- * changes (documents, trie, head) is one store transaction, written only after the tree hash
- * checks out.
+ * changes (documents, trie, attachment table, head) is one store transaction, written only after
+ * the tree hash and the attachment root check out.
+ *
+ * Attachments (plan §9): beside the document trie the namespace keeps its attachment table -
+ * document id to attachment-set hash, in a second trie - and checks every commit's
+ * `attachmentTreeHash` against it as it checks the tree hash. Bytes are not here; see [BlobStore].
  */
 public class ReplicaNamespace private constructor(
     private val store: ReplicaStore,
@@ -253,7 +243,6 @@ public class ReplicaNamespace private constructor(
             val byHash = commits.associateBy { it.hash }
             val tip = byHash[target] ?: throw NotFastForwardException("kdb replica: the range does not contain its target $target")
             checkReachesHead(byHash, target)
-            commits.forEach(::requireSupported)
             val ordered = topoSort(commits)
             val effect = netEffect(ordered)
             val batch = Batch()
@@ -261,6 +250,21 @@ public class ReplicaNamespace private constructor(
             val built = edit.finish()
             if (built != tip.treeHash) throw TreeMismatchException(target, tip.treeHash, built)
             edit.writeTo(batch)
+            // Attachments: every op of the range, in order. A commit's table is its first parent's
+            // plus its own ops, so this is right for a linear range; across a merge (whose commit
+            // carries the attachment ops its parents disagree on, as Go's three-way merge writes
+            // them) it is checked like the tree - against the root the target declares - and a
+            // mismatch writes nothing.
+            val att = AttachmentEdit(store, key)
+            val attRoot =
+                try {
+                    for (c in ordered) att.apply(c.ops)
+                    att.finish()
+                } catch (e: AttachmentException) {
+                    throw AttachmentRootMismatchException(target, tip.attachmentRoot, "unappliable (${e.message})")
+                }
+            if (attRoot != tip.attachmentRoot) throw AttachmentRootMismatchException(target, tip.attachmentRoot, attRoot)
+            att.writeTo(batch)
             val next = replaceHead(batch, tip, maxMicros(meta.lastMicros, ordered))
             commitMeta(batch, next)
             effect.keys.toList()
@@ -318,6 +322,10 @@ public class ReplicaNamespace private constructor(
             val edit = stage(ops, batch)
             val tree = edit.finish()
             edit.writeTo(batch)
+            val att = AttachmentEdit(store, key)
+            att.apply(ops)
+            val attachmentRoot = att.finish()
+            att.writeTo(batch)
             val ts = if (nowMicros > meta.lastMicros) nowMicros else meta.lastMicros + 1
             val c =
                 ReplicaCommit.build(
@@ -329,6 +337,7 @@ public class ReplicaNamespace private constructor(
                     ops = ops,
                     treeHash = tree,
                     message = message,
+                    attachmentRoot = attachmentRoot,
                 )
             batch[commitKey(c.hash)] = c.payload
             // The head's own payload stays: a pending commit's parent may be needed for a push.
@@ -377,6 +386,31 @@ public class ReplicaNamespace private constructor(
     }
 
     /**
+     * Sets attachment sets during a convergence: a whole replacement (a snapshot's packed table:
+     * every other set goes) or per document (a diff). Unverified until [finishConverge], like the
+     * pages.
+     */
+    public suspend fun applyConvergeAttachments(sets: Map<String, List<ReplicaAttachment>>, whole: Boolean) {
+        lock.withLock {
+            if (meta.target == null) error("kdb replica: not converging")
+            val att = AttachmentEdit(store, key)
+            val wanted = sets.keys.map { it.lowercase() }.toSet()
+            if (whole) for (id in att.heldDocuments()) if (id !in wanted) att.set(id, emptyList())
+            for ((id, set) in sets) att.set(id, set)
+            att.finish()
+            val batch = Batch()
+            att.writeTo(batch)
+            commitMeta(batch, meta)
+        }
+    }
+
+    /** The attachment table's root as the replica holds it now; null when it is empty. */
+    public suspend fun attachmentRoot(): String? = attachmentRootOf(store, key)
+
+    /** The document's attachments (refs; the bytes are fetched on read), in id order. */
+    public suspend fun attachments(id: String): List<ReplicaAttachment> = attachmentsOf(store, key, id)
+
+    /**
      * Completes a convergence: the built tree must be the target's. Then the target is the head, a
      * root this replica holds without its history. Throws [TreeMismatchException] otherwise, and
      * stays converging - a diff against the target's tree then repairs whatever differs.
@@ -387,6 +421,8 @@ public class ReplicaNamespace private constructor(
             val tip = ReplicaCommit.decode(hexToBytes(t.payloadHex))
             val built = trie.rootHash()
             if (built != tip.treeHash) throw TreeMismatchException(tip.hash, tip.treeHash, built)
+            val attRoot = attachmentRootOf(store, key)
+            if (attRoot != tip.attachmentRoot) throw AttachmentRootMismatchException(tip.hash, tip.attachmentRoot, attRoot)
             val batch = Batch()
             val next = replaceHead(batch, tip, maxMicros(meta.lastMicros, listOf(tip)))
             commitMeta(batch, next.copy(target = null))
@@ -411,7 +447,8 @@ public class ReplicaNamespace private constructor(
      * The subtree at [prefix], as Go's DocumentTree.Node reports it, so a diff against a host's
      * TREE_NODES compares like with like - including for a subtree stored folded into one leaf.
      */
-    public suspend fun treeNode(prefix: String, entryLimit: Int): TreeNodeView {
+    public suspend fun treeNode(prefix: String, entryLimit: Int, tree: TreeKind = TreeKind.DOCUMENTS): TreeNodeView {
+        val trie = if (tree == TreeKind.DOCUMENTS) this.trie else TrieReader(store, attachmentTrieKey(key))
         val empty = TreeNodeView(prefix, "", emptyList(), null)
         var at = ""
         var rec = trie.record(at)

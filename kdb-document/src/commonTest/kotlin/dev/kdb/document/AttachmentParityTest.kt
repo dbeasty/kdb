@@ -174,7 +174,8 @@ class AttachmentParityTest {
         assertEquals(filled(1), replaced.get(doc, att(1, "", 0).id)?.contentHash)
         assertFailsWith<AttachmentException> { tab.put(doc, att(4, "a.png", 4)) }
         assertFailsWith<AttachmentException> { tab.put(doc, Attachment(KdbUuid(0, 0), "x", att(0, "", 1).ref)) }
-        for (bad in listOf("", "x".repeat(256), "a\nb", "a\u007fb", "\uD800x")) {
+        // The lone surrogate is built at run time: a "\uD800" literal reaches Kotlin/JS already replaced by "?".
+        for (bad in listOf("", "x".repeat(256), "a\nb", "a\u007fb", Char(0xD800).toString() + "x")) {
             assertFailsWith<AttachmentException>("name '$bad'") { tab.put(doc, att(5, bad, 5)) }
         }
         tab.put(doc, att(5, "é".repeat(127), 5)) // 254 bytes

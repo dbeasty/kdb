@@ -294,6 +294,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.AttachmentUploadGrace != nil },
 		},
 		{
+			key: "governance.attachmentDeltaStepMB", flag: "attachment-delta-step-mb", env: "KDB_ATTACHMENT_DELTA_STEP_MB",
+			scope: ScopeProcess, mutability: MutabilityRestart, unit: "MiB",
+			help:   "how much one maintenance pass reads diffing replaced attachment versions into deltas; a larger version is diffed over several passes, so no pass runs long. 0 uses the default, 4096. Applies to namespaces opened after it is set",
+			value:  num(func(s ServiceSettings) int { return s.AttachmentDeltaStepMB }),
+			inFile: func(f *ServiceFile) bool { return f.AttachmentDeltaStepMB != nil },
+		},
+		{
 			key: "governance.maintenanceMaxDefer", flag: "maintenance-max-defer", env: "KDB_MAINTENANCE_MAX_DEFER",
 			scope: ScopeProcess, mutability: MutabilityLive, unit: "ticks",
 			help:      "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway. The busiest server is the one whose log grows fastest, so this bound is what stops load starving reclamation; -1 never forces and risks exactly that",

@@ -252,6 +252,29 @@ def test_a_small_edit_stores_only_a_delta(tmp_path, edit):
         srv.stop()
 
 
+def test_a_version_over_the_pass_budget_is_diffed_over_many_passes(tmp_path):
+    """V2 at scale: a pass may read only 1 MiB diffing (--attachment-delta-step-mb 1), so a
+    24 MiB version with an insertion - every chunk after it shifted - is diffed over dozens of
+    maintenance passes, as a multi-GB one is under the default budget. The store settles at about
+    one copy plus the change, and both versions read back exactly throughout and after."""
+    v1 = mf.make_bin(tmp_path / "v1", 24 * CHUNK)
+    v2 = mf.insert_bytes(tmp_path / "v1", tmp_path / "v2", 2 * CHUNK + 999, b"inserted!" * 50)
+    srv = maintained_server(extra_args=["--attachment-delta-step-mb", "1"]).start()
+    try:
+        doc = doc_id(0xC250)
+        upsert(srv, doc, {"id": doc})
+        c1 = attach(srv, doc, "f", tmp_path / "v1")["commit"]
+        c2 = attach(srv, doc, "f", tmp_path / "v2")["commit"]
+        check_read(srv, doc, "f", v1, tmp_path, as_of=c1, tag=".mid")
+        budget = v2.size + 450 + 256 * KiB
+        settled = wait_stored_settles(srv, below=budget, timeout=90)
+        assert settled < v1.size + v2.size, (settled, v1.size, v2.size)
+        check_read(srv, doc, "f", v1, tmp_path, as_of=c1, tag=".v1")
+        check_read(srv, doc, "f", v2, tmp_path, as_of=c2, tag=".v2")
+    finally:
+        srv.stop()
+
+
 def test_reencoded_video_is_stored_whole_negative_control(tmp_path):
     """V3: re-encoding changes nearly every byte, so no delta is worth keeping: the store holds
     both versions about whole, and both still decode frame by frame."""
