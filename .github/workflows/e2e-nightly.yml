@@ -118,6 +118,9 @@ jobs:
           cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
       - name: Install pytest
         run: pip install -q -r kdb-integration/e2e/requirements.txt
+      - name: Install ffmpeg
+        # The attachment tests generate and decode MP4 media (kdb-integration/e2e/media_fixtures.py).
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
       - name: Run slow + destructive scenarios
         working-directory: kdb-integration/e2e
         # Upgrade tests have their own job (e2e-upgrade), which builds the previous release.

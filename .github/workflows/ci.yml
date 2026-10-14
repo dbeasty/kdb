@@ -553,6 +553,9 @@ jobs:
           cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
       - name: Install pytest
         run: pip install -q -r kdb-integration/e2e/requirements.txt
+      - name: Install ffmpeg
+        # The attachment tests generate and decode MP4 media (kdb-integration/e2e/media_fixtures.py).
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
       - name: Run e2e scenarios (shard ${{ matrix.shard }} of 3)
         working-directory: kdb-integration/e2e
         run: python -m pytest -v --durations=15 --shard ${{ matrix.shard }}/3

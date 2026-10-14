@@ -8,8 +8,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -57,6 +55,11 @@ func usage() {
   commit-across --addr URI --parts JSON
   sql-tx  --addr URI --namespace NS --stmt SQL [--stmt SQL ...] [--rollback] [--snapshot]
   xns-transfers --addr URI --namespaces NS,NS[,...] --doc-id ID --rounds N
+  attach  --addr URI --namespace NS --doc-id ID --name N --file F [--mime M] [--drop-at BYTES]
+  tx-attach --addr URI --namespace NS --doc-id ID --json JSON --name N --file F [--mime M]
+  read-attachment --addr URI --namespace NS --doc-id ID (--name N | --attachment-id ID)
+          [--as-of C] [--out F] [--pause-after BYTES --ready-file F --go-file F]
+  list-attachments --addr URI --namespace NS --doc-id ID [--as-of C]
 
 TLS flags: --tls-ca FILE [--tls-cert FILE --tls-key FILE]`)
 }
@@ -101,6 +104,9 @@ func (c *commonFlags) dial(ctx context.Context) (*client.Client, error) {
 }
 
 func run(cmd string, args []string) error {
+	if attachmentCommands[cmd] {
+		return runAttachment(cmd, args)
+	}
 	fs := flag.NewFlagSet("kdb-e2e-helper "+cmd, flag.ExitOnError)
 	var cf commonFlags
 	cf.register(fs)
@@ -120,9 +126,6 @@ func run(cmd string, args []string) error {
 	fs.Var(&stmts, "stmt", "SQL statement for sql-tx (repeatable, run in order)")
 	fs.BoolVar(&rollback, "rollback", false, "sql-tx: roll back instead of committing")
 	fs.BoolVar(&snapshot, "snapshot", false, "sql-tx: open a SNAPSHOT transaction")
-	var attName, attFile string
-	fs.StringVar(&attName, "name", "", "attach / read-attachment: the attachment's name")
-	fs.StringVar(&attFile, "file", "", "attach: the file whose bytes to attach")
 	_ = fs.Parse(args)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cf.timeout)
@@ -178,33 +181,6 @@ func run(cmd string, args []string) error {
 			return enc.Encode(map[string]any{"columns": columns, "rows": rows})
 		}
 		return nil
-	case "attach", "read-attachment":
-		cl, err := cf.dial(ctx)
-		if err != nil {
-			return err
-		}
-		defer cl.Close()
-		if cmd == "attach" {
-			f, err := os.Open(attFile)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			commit, info, err := cl.PutAttachment(ctx, cf.namespace, docID, f, client.PutAttachmentOptions{Name: attName})
-			if err != nil {
-				return err
-			}
-			return json.NewEncoder(os.Stdout).Encode(map[string]any{"commit": commit, "id": info.ID, "hash": info.Hash, "size": info.Size})
-		}
-		data, info, err := cl.ReadAttachment(ctx, cf.namespace, docID, client.ByAttachmentName(attName), "")
-		if errors.Is(err, client.ErrNotFound) {
-			return json.NewEncoder(os.Stdout).Encode(map[string]any{"missing": true})
-		}
-		if err != nil {
-			return err
-		}
-		sum := sha256.Sum256(data)
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"sha256": hex.EncodeToString(sum[:]), "size": len(data), "hash": info.Hash})
 	case "relay":
 		return relay(cf, servers, rounds, conflictPolicy)
 	case "load":
