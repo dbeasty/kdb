@@ -354,11 +354,18 @@ identity = SHA-256(0x02 || be64(size) || tree)
 
 ## Known limits
 
-- **The store's pointer map.** `attachstore.Store` holds one pointer per stored blob in memory, so
-  under all-history its size still grows with the number of versions. Paging it like the set pool is
-  a follow-up.
-- **A collection pass** still lists every stored blob (`Collect`), and a rebuild of the reference
-  index reads all of retained history once.
+- **The store's pointer index.** `attachstore.Store` no longer holds a pointer per blob: the
+  pointer segments stay the truth, indexed by sorted runs (`x-<seq>`) plus a bounded overlay, and
+  only `Config.PointerCacheBytes` of pointers are resident (`pointer_index.go`). The index is
+  rebuilt from the pointers at first use, which still reads every pointer once, as before.
+- **A collection pass** still lists every segment of the namespace (`Collect`, and the index
+  rebuild at open): the shim has no streaming or prefix listing, so that listing - and Collect's
+  sweep, a 16-byte key per segment a kept pointer names - is transient memory that grows with the
+  blob count. A rebuild of the reference index reads all of retained history once.
+- **The Kotlin store's pointer map.** Kotlin's `AttachmentBlobStore` still holds every pointer
+  (inline bytes included) and every hold in memory, loaded at first use, as Go's did before
+  `pointer_index.go`; `collect` builds a referenced set of every kept segment. It ignores Go's
+  `x-` index runs, and its `collect` deleting them is harmless (Go rebuilds them at open).
 - **Delta jobs restart after a crash.** Progress is in memory, so a restart mid-job redoes it from
   the start. Versions found not worth a delta are remembered per process only.
 - **The Kotlin store** shares Go's layout (above) but encodes a delta in one call, not in budgeted

@@ -1,10 +1,8 @@
 package attachstore
 
 import (
-	"bytes"
 	"errors"
 	"io"
-	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 )
@@ -32,13 +30,13 @@ func (s *Store) Deltas() ([]codec.Hash, error) {
 		return nil, err
 	}
 	var out []codec.Hash
-	for h, p := range s.pointers {
-		if p.delta {
+	err := s.idx.each(func(h codec.Hash, e indexEntry) error {
+		if e.delta {
 			out = append(out, h)
 		}
-	}
-	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Bytes[:], out[j].Bytes[:]) < 0 })
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 
 // InflateStep copies about budget bytes (zero means Config.DeltaStepBytes) of delta-stored h into
@@ -55,7 +53,11 @@ func (s *Store) InflateStep(h codec.Hash, budget int64) (bool, int64, error) {
 		s.mu.Unlock()
 		return false, 0, err
 	}
-	p, ok := s.pointers[h]
+	p, ok, err := s.getLocked(h)
+	if err != nil {
+		s.mu.Unlock()
+		return false, 0, err
+	}
 	if job := s.inflate; job != nil && (job.h != h || !ok || p.segment != job.deltaSeg) {
 		s.dropInflateLocked()
 	}
@@ -110,7 +112,11 @@ func (s *Store) InflateStep(h codec.Hash, budget int64) (bool, int64, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cur, ok := s.pointers[h]
+	cur, ok, err := s.getLocked(h)
+	if err != nil {
+		s.dropInflateLocked()
+		return false, used, err
+	}
 	if s.inflate != job || !ok || !cur.delta || cur.segment != job.deltaSeg {
 		s.dropInflateLocked() // changed under us; leave it be
 		return !ok || !cur.delta, used, nil
@@ -120,7 +126,9 @@ func (s *Store) InflateStep(h codec.Hash, budget int64) (bool, int64, error) {
 		s.dropInflateLocked()
 		return false, used, err
 	}
-	s.pointers[h] = np
+	if err := s.replaceLocked(h, np); err != nil {
+		return false, used, err
+	}
 	delete(s.uploads, job.seg)
 	s.inflate = nil
 	s.deleteOrDeferLocked(cur.name)

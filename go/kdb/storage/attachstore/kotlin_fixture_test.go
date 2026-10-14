@@ -228,9 +228,7 @@ func checkFixture(t *testing.T, shim *storio.InMemoryPlatformIO, wantFramed bool
 		}
 		r.Close()
 	}
-	s.mu.Lock()
-	p := s.pointers[oldHash]
-	s.mu.Unlock()
+	p := pointerOf(t, s, oldHash)
 	if !p.delta {
 		t.Fatal("the replaced version is not stored as a delta")
 	}

@@ -102,9 +102,7 @@ func TestFramedDeltasOfEveryShape(t *testing.T) {
 			if steps < 3 {
 				t.Fatalf("done in %d steps; the budget did not bound them", steps)
 			}
-			s.mu.Lock()
-			p := s.pointers[oi.Hash]
-			s.mu.Unlock()
+			p := pointerOf(t, s, oi.Hash)
 			if !p.delta || !p.framed {
 				t.Fatalf("pointer %+v is not a format 2 delta", p)
 			}
@@ -261,10 +259,10 @@ func TestDeltaJobLeavesAChangedVersionAlone(t *testing.T) {
 	if out, _, err := s.DeltaStep(oi.Hash, ni.Hash, 0); err != nil || out != DeltaPending {
 		t.Fatalf("first step: %v %v", out, err)
 	}
-	s.mu.Lock()
-	cur := s.pointers[oi.Hash]
+	cur := pointerOf(t, s, oi.Hash)
 	cur.segment = cur.segment + "-moved" // as if replaced under the job
-	s.pointers[oi.Hash] = cur
+	s.mu.Lock()
+	s.cache.put(oi.Hash, cur)
 	s.mu.Unlock()
 	if out, _, err := s.DeltaStep(oi.Hash, ni.Hash, 0); err != nil || out == DeltaStored {
 		t.Fatalf("stored over a changed version: %v %v", out, err)
@@ -284,9 +282,7 @@ func TestDamagedFramedDeltaIsCorrupt(t *testing.T) {
 			if did, err := s.StoreAsDelta(oi.Hash, bi.Hash); err != nil || !did {
 				t.Fatalf("delta: %v %v", did, err)
 			}
-			s.mu.Lock()
-			seg := s.pointers[oi.Hash].segment
-			s.mu.Unlock()
+			seg := pointerOf(t, s, oi.Hash).segment
 			n := segmentBytes(t, s, seg)
 			raw, _ := shim.ReadFromSegment(seg, 0, int(n))
 			raw = append([]byte(nil), raw...)
@@ -374,9 +370,7 @@ func TestVerifyKeepsTheWholeCopyOfABadDelta(t *testing.T) {
 	if out, _ := deltaInSteps(t, s, oi.Hash, bi.Hash); out != DeltaSkipped {
 		t.Fatalf("a bad delta was stored: %v", out)
 	}
-	s.mu.Lock()
-	p := s.pointers[oi.Hash]
-	s.mu.Unlock()
+	p := pointerOf(t, s, oi.Hash)
 	if p.delta {
 		t.Fatal("the whole copy was replaced")
 	}

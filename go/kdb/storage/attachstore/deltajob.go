@@ -89,9 +89,13 @@ func (s *Store) DeltaStep(old, base codec.Hash, budget int64) (DeltaOutcome, int
 		s.mu.Unlock()
 		return DeltaSkipped, 0, err
 	}
-	p, ok := s.pointers[old]
+	p, ok, err := s.getLocked(old)
+	if err != nil {
+		s.mu.Unlock()
+		return DeltaSkipped, 0, err
+	}
 	baseChain, baseLarge, err := s.resolveLocked(base)
-	_, declined := s.declined[[2]codec.Hash{old, base}]
+	_, declined := s.declined.get([2]codec.Hash{old, base})
 	limit := s.cfg.DeltaMaxBytes
 	if job := s.job; job != nil && (job.old != old || job.base != base || !ok || p.segment != job.oldSeg || !baseLarge) {
 		s.dropJobLocked()
@@ -144,7 +148,7 @@ func (s *Store) DeltaStep(old, base codec.Hash, budget int64) (DeltaOutcome, int
 		if errors.Is(err, errDeltaMismatch) {
 			slog.Error("kdb: attachment delta did not reproduce its version; kept whole", "old", old.Hex(), "base", base.Hex(), "err", err)
 		}
-		s.declined[[2]codec.Hash{old, base}] = struct{}{}
+		s.declined.put([2]codec.Hash{old, base}, struct{}{})
 		return DeltaSkipped, used, nil
 	}
 	return DeltaSkipped, used, err
@@ -352,7 +356,11 @@ func (s *Store) finishJob(job *deltaJob) (bool, error) {
 	if s.job != job {
 		return false, nil
 	}
-	cur, ok := s.pointers[job.old]
+	cur, ok, err := s.getLocked(job.old)
+	if err != nil {
+		s.dropJobLocked()
+		return false, err
+	}
 	chain, baseLarge, err := s.resolveLocked(job.base)
 	if !ok || cur.delta || cur.segment != job.oldSeg || err != nil || !baseLarge || len(chain) > s.cfg.DeltaMaxDepth {
 		s.dropJobLocked() // changed under us; leave it be
@@ -363,7 +371,9 @@ func (s *Store) finishJob(job *deltaJob) (bool, error) {
 		s.dropJobLocked()
 		return false, err
 	}
-	s.pointers[job.old] = np
+	if err := s.replaceLocked(job.old, np); err != nil {
+		return false, err
+	}
 	delete(s.uploads, job.seg)
 	s.job = nil
 	s.deleteOrDeferLocked(cur.name)
