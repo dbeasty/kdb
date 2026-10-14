@@ -99,6 +99,9 @@ public data class KdbCommit(
             documentTreeHash: KdbHash,
             schemaHash: KdbHash?,
             message: String = "",
+            /** The commit's attachment table root (Go's BuildCommitWithAttachments); null for an
+             * empty table, which leaves field 10 out so the hash is the pre-attachments one. */
+            attachmentTreeHash: KdbHash? = null,
         ): KdbCommit {
             val reg = KdbDocumentWireRegistry()
             val bytes =
@@ -112,6 +115,7 @@ public data class KdbCommit(
                     documentTreeHash,
                     schemaHash,
                     message,
+                    attachmentTreeHash,
                 ).encodeToBytes(CommitPayloadType, reg)
             val hash = KdbHash.fromBytes(sha256Digest(bytes))
             return KdbCommit(
@@ -125,6 +129,7 @@ public data class KdbCommit(
                 documentTreeHash,
                 schemaHash,
                 message,
+                attachmentTreeHash,
             )
         }
 
