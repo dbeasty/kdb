@@ -215,14 +215,23 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - **Kotlin engine parity** (`kdb-document`, `kdb-dag`, `kdb-transaction`, `kdb-embed`): hashes,
   tables, roots, merges, preflight and conflicts identical to Go (checked against Go fixtures); a
   Kotlin attachment store and embed API.
+- **Write-back projections** (follow-up): `PROJECT_WRITE` docs carry a document's whole
+  attachment set after the write (`attachmentsChanged`, `attachments`), guarded by the set the
+  projection held (`attachmentsBase`), and attachment-only writes (`keepBody`); a refused write
+  reports the source's attachments. A projection session may upload and `BLOB_FETCH`. Delta pages
+  also list documents whose attachments alone changed. A JSON-only write-back no longer wipes the
+  document's attachments at the source (it was a delete plus a write; now a replace). The Go
+  projection node keeps attachments both ways.
+- **Pushed grafts** (follow-up): the pusher uploads the root's blobs before `GRAFT_PUSH`; the host
+  keeps the table from the last page, refuses a graft with attachments it lacks the table or bytes
+  of, and seeds the table. Tables seeded from peers (graft, boundary, snapshot) are persisted
+  (`kdb:attachment-seeds:<ns>`) and seeded again on open, so a crash before the first checkpoint
+  keeps them.
 - **Tests**: unit and golden tests per layer, two-node sync, TS live interop against Go, e2e
   (`test_attachments.py`), upgrade (`test_upgrade.py`: mixed mesh, rollback refused).
 
 ## Known limits
 
-- **Write-back projections** take document writes only: a replica's attachment changes are not
-  yet carried by `PROJECT_WRITE` (the replica session extends it).
-- **A graft pushed to a host** (`GRAFT_PUSH`) does not carry the root's attachment table.
 - **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
 - **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
 - **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not

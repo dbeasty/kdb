@@ -640,6 +640,9 @@ type graftStage struct {
 	spool  *pageSpool
 	commit document.Commit
 	served int // documents handed back to the graft so far
+	// attachTables is the commit's attachment table, from the last page (see
+	// SnapshotPageMessage.AttachmentTables).
+	attachTables []byte
 }
 
 // graftPush stages one GRAFT_PUSH page and, on the last, grafts the pushed root (see Graft).
@@ -677,6 +680,9 @@ func (h *V2Host) graftPush(m wire.GraftPushMessage) (wire.Message, error) {
 			page.Next = docs[len(docs)-1].DocID
 		}
 		return page, nil
+	}
+	if err := admitGraftAttachments(env, stage); err != nil {
+		return nil, err
 	}
 	// A parent this session refused a push for, behind this node's snapshot root: history this
 	// node's root descends from, not an unrelated one, so no allowUnrelated (boundary.go).
@@ -732,6 +738,7 @@ func (h *V2Host) stageGraftPage(env IngestEnv, page wire.SnapshotPageMessage) (*
 	if !page.Done {
 		return nil, nil
 	}
+	stage.attachTables = page.AttachmentTables
 	delete(h.grafts, ns)
 	return stage, nil
 }
@@ -746,6 +753,7 @@ func (h *V2Host) Close() {
 		stage.spool.close()
 		delete(h.grafts, ns)
 	}
+	h.closeUploads()
 }
 
 func (h *V2Host) refUpdate(m wire.RefUpdateMessage) (wire.Message, error) {

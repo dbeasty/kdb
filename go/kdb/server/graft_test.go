@@ -153,3 +153,54 @@ func TestGraftRefusedUnderHistoryNone(t *testing.T) {
 		t.Fatal("a refused graft changed C")
 	}
 }
+
+// TestGraftCarriesAttachments: the snapshot A was bootstrapped from, and so the root A pushes to C
+// by GRAFT_PUSH, has attachments. A takes the table and the bytes with the snapshot; C takes the
+// table with the pushed graft and the bytes A uploads before it - and keeps both across a restart.
+func TestGraftCarriesAttachments(t *testing.T) {
+	a := newMetaNode(t).data
+	dir := t.TempDir()
+	rt, c := openFileNode(t, dir)
+	b := newMetaNode(t).data
+	writeN(t, b, "b", 2)
+	fromB := mustRandomUUID(t)
+	if _, err := b.Upsert("app/data", fromB, `{"from":"b"}`, auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("graft attachment ", 150_000) // 2.5 MB, several chunks
+	if _, _, err := b.Runtime.PutAttachment("app/data", fromB, strings.NewReader(big), embed.PutAttachmentOptions{Name: "b.bin"}); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapFrom(t, a, b)
+	if got := readAttachmentOf(t, a, fromB, "b.bin"); string(got) != big {
+		t.Fatalf("A's snapshot bootstrap did not bring the attachment (%d bytes)", len(got))
+	}
+	writeN(t, a, "a", 1)
+	writeN(t, c, "c", 2)
+	a.SetResolutionChain(allowUnrelated())
+	c.SetResolutionChain(allowUnrelated())
+	if err := trySync(t, a, c); err != nil {
+		t.Fatalf("A should push its root to C by GRAFT_PUSH: %v", err)
+	}
+	requireSameState(t, a, c)
+	if got := readAttachmentOf(t, c, fromB, "b.bin"); string(got) != big {
+		t.Fatalf("the pushed graft did not bring the attachment to C (%d bytes)", len(got))
+	}
+	rt.Close()
+	rt, c = openFileNode(t, dir)
+	if got := readAttachmentOf(t, c, fromB, "b.bin"); string(got) != big {
+		t.Fatalf("C lost the grafted attachment across a restart (%d bytes)", len(got))
+	}
+	rt.Close()
+	// And across a replay of the log with no checkpoint (a crash before the first one).
+	for p := range checkpointFiles(t, dir) {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rt, c = openFileNode(t, dir)
+	defer rt.Close()
+	if got := readAttachmentOf(t, c, fromB, "b.bin"); string(got) != big {
+		t.Fatalf("C lost the grafted attachment replaying its log without a checkpoint (%d bytes)", len(got))
+	}
+}

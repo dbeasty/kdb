@@ -223,6 +223,11 @@ func (h *Host) openNamespace(
 		// Some bodies exist only in the blob store; cold reads must look there.
 		eng.SetBodiesExternal(true)
 	}
+	// Attachment tables peer sync seeded for commits whose history is not here (a graft's or a
+	// boundary's root): replay derives the tables of the commits above them from these.
+	if err := seedPersistedAttachmentTables(io, d, namespaceID); err != nil {
+		return nil, nil, err
+	}
 	var recovery RecoveryReport
 	replayedInFull, err := restoreNamespace(d, store, handle.DeltaReader(), io, namespaceID, opts.Storage.DisableCheckpoints, h.txn, meta.ShallowRoots, meta.GraftRoots, &recovery)
 	if err != nil {

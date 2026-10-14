@@ -530,8 +530,33 @@ func seedingSnapshotPages(env IngestEnv, fetch func(after string) (wire.Snapshot
 		if err := env.DAG.SeedPackedAttachmentTables(page.AttachmentTables); err != nil {
 			return page, fmt.Errorf("peer sync: snapshot attachment table: %w", err)
 		}
+		if env.AttachmentTableSeeded != nil {
+			if err := env.AttachmentTableSeeded(page.AttachmentTables); err != nil {
+				return page, err
+			}
+		}
 		return page, nil
 	}
+}
+
+// tableBlobs is commit's attachment table as puts of one synthetic commit, named commit - so
+// fetchBlobs asks for them at it, and uploadBlobs sends them. ok=false when commit has none.
+func tableBlobs(env IngestEnv, commit codec.Hash) (document.Commit, bool, error) {
+	cm, err := env.DAG.GetCommitOrThrow(commit)
+	if err != nil || cm.AttachmentTreeHash == nil {
+		return document.Commit{}, false, err
+	}
+	table, err := env.DAG.AttachmentTableAt(commit)
+	if err != nil {
+		return document.Commit{}, false, err
+	}
+	synthetic := document.Commit{Hash: commit}
+	table.Walk(func(doc codec.UUID, a document.Attachment) bool {
+		synthetic.Operations = append(synthetic.Operations, document.AttachmentPutOp{DocID: doc, AttachmentID: a.ID,
+			Name: a.Name, Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
+		return true
+	})
+	return synthetic, true, nil
 }
 
 // fetchTableBlobs takes in every blob commit's attachment table names that this node lacks - after
@@ -540,22 +565,68 @@ func (c *v2Conn) fetchTableBlobs(env IngestEnv, ns string, commit codec.Hash) er
 	if env.Attachments == nil || !containsString(c.caps, wire.SyncCapAttachments) {
 		return nil
 	}
-	cm, err := env.DAG.GetCommitOrThrow(commit)
-	if err != nil || cm.AttachmentTreeHash == nil {
+	synthetic, ok, err := tableBlobs(env, commit)
+	if err != nil || !ok {
 		return err
 	}
-	table, err := env.DAG.AttachmentTableAt(commit)
-	if err != nil {
-		return err
-	}
-	// As puts of one synthetic commit, so fetchBlobs asks for them at commit.
-	synthetic := document.Commit{Hash: commit}
-	table.Walk(func(doc codec.UUID, a document.Attachment) bool {
-		synthetic.Operations = append(synthetic.Operations, document.AttachmentPutOp{DocID: doc, AttachmentID: a.ID,
-			Name: a.Name, Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
-		return true
-	})
 	return c.fetchBlobs(env, ns, []document.Commit{synthetic})
+}
+
+// uploadTableBlobs sends the host every blob commit's attachment table names, before a pushed
+// graft or boundary state of commit - the host cannot fetch from a node that dialled it.
+func (c *v2Conn) uploadTableBlobs(env IngestEnv, ns string, commit codec.Hash) error {
+	if env.Attachments == nil || !containsString(c.caps, wire.SyncCapAttachments) {
+		return nil
+	}
+	synthetic, ok, err := tableBlobs(env, commit)
+	if err != nil || !ok {
+		return err
+	}
+	return c.uploadBlobs(env, ns, []document.Commit{synthetic})
+}
+
+// admitGraftAttachments seeds a pushed graft's attachment table before its root is admitted, and
+// refuses a graft whose root has attachments this node would then hold neither the table nor the
+// bytes of.
+func admitGraftAttachments(env IngestEnv, stage *graftStage) error {
+	root := stage.commit.AttachmentTreeHash
+	if root == nil {
+		return nil
+	}
+	if len(stage.attachTables) == 0 {
+		return fmt.Errorf("peer sync: pushed graft of %s has attachments but not their table - the pusher must be upgraded", stage.commit.Hash.Hex())
+	}
+	tables, err := document.ParsePackedAttachmentTables(stage.attachTables)
+	if err != nil {
+		return fmt.Errorf("peer sync: pushed graft attachment table: %w", err)
+	}
+	var table *document.AttachmentTable
+	for i := range tables {
+		if r := tables[i].Root(); r != nil && *r == *root {
+			table = &tables[i]
+		}
+	}
+	if table == nil {
+		return fmt.Errorf("peer sync: pushed graft of %s carries no attachment table with its root %s", stage.commit.Hash.Hex(), root.Hex())
+	}
+	if env.Attachments != nil {
+		var missing error
+		table.Walk(func(_ codec.UUID, a document.Attachment) bool {
+			if has, err := env.Attachments.Has(a.ContentHash); err != nil || !has {
+				missing = fmt.Errorf("peer sync: pushed graft of %s attaches %s, which was not uploaded", stage.commit.Hash.Hex(), a.ContentHash.Hex())
+				return false
+			}
+			return true
+		})
+		if missing != nil {
+			return missing
+		}
+	}
+	env.DAG.SeedAttachmentTable(*table)
+	if env.AttachmentTableSeeded != nil {
+		return env.AttachmentTableSeeded(document.AppendPackedAttachmentTables(nil, []document.AttachmentTable{*table}))
+	}
+	return nil
 }
 
 // withProjectedAttachments adds each written document's attachments at the page's commit.

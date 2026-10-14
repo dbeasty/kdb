@@ -154,6 +154,9 @@ type IngestEnv struct {
 	// what BLOB_FETCH serves and pushes upload from (attachments.go). nil: this node moves no
 	// attachment blobs - commits still carry their refs.
 	Attachments *attachstore.Store
+	// AttachmentTableSeeded makes durable an attachment table seeded from a peer for a commit with
+	// no history here (packed: dag.PackAttachmentTables). nil: kept in memory only.
+	AttachmentTableSeeded func(packed []byte) error
 }
 
 // DefaultMaxClockSkew is how far ahead of this node's clock a replicated commit may be.
