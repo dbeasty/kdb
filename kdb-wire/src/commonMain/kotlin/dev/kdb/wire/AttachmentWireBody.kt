@@ -133,6 +133,7 @@ internal fun encodeAttachmentBody(w: BinWriter, message: WireMessage): Boolean {
             w.int(4, m.offset)
             w.bytes(5, m.data)
             w.bool(6, m.final)
+            w.hash(7, m.expect)
         }
         is WireMessage.AttachmentUploadResult -> {
             w.string(1, m.namespace)
@@ -230,6 +231,7 @@ internal fun decodeAttachmentBody(header: WireHeader, r: BinReader): WireMessage
             var offset = 0L
             var data = ByteArray(0)
             var final = false
+            var expect: KdbHash? = null
             r.forEachField { f, wt ->
                 when (f) {
                     1 -> namespace = r.string(wt)
@@ -238,11 +240,12 @@ internal fun decodeAttachmentBody(header: WireHeader, r: BinReader): WireMessage
                     4 -> offset = r.long(wt)
                     5 -> data = r.bytes(wt)
                     6 -> final = r.bool(wt)
+                    7 -> expect = r.hash(wt)
                     else -> return@forEachField false
                 }
                 true
             }
-            WireMessage.AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final)
+            WireMessage.AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final, expect)
         }
         WireMessageType.ATTACHMENT_UPLOAD_RESULT -> {
             var namespace = ""

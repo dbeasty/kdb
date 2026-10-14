@@ -125,6 +125,19 @@ internal class GoHost private constructor(private val proc: Process, private val
     fun docs(ns: String): Map<String, String> =
         cmd("docs", "ns" to ns)["docs"]!!.obj.mapValues { it.value.jsonPrimitive.content }
 
+    /** Puts (or replaces) the attachment [name] on a document at the host; returns the new head. */
+    fun attach(ns: String, id: String, name: String, text: String, mime: String = "text/plain"): String =
+        cmd("attach", "ns" to ns, "id" to id, "name" to name, "mime" to mime, "text" to text).s("head")
+
+    fun detach(ns: String, id: String, name: String): String = cmd("detach", "ns" to ns, "id" to id, "name" to name).s("head")
+
+    /** The document's attachments at the host's head, as (name, content hash, size). */
+    fun attachments(ns: String, id: String): List<Triple<String, String, Long>> =
+        cmd("attachments", "ns" to ns, "id" to id)["attachments"]!!.arr.map {
+            val o = it.obj
+            Triple(o.s("name"), o.s("hash"), o.s("size").toLong())
+        }
+
     fun stop() {
         try {
             proc.outputStream.close()

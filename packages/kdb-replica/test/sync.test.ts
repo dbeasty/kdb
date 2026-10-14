@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 import { attachmentContentHash } from "../src/attachments.ts";
 import { randomUuid, utf8 } from "../src/bytes.ts";
+import { PeerConnection } from "../src/peer.ts";
 import { openReplica, type Replica, type ReplicaOptions } from "../src/replica.ts";
 import { MemoryStore } from "../src/store.ts";
 import { goAvailable, startHost, type Host } from "./host.ts";
@@ -222,6 +223,33 @@ describe("replica against a Go node", { skip }, () => {
     assert.equal(await local.evictBlobs(0), 2 * MiB);
     assert.equal((await local.blobCache()).bytes, 0);
     assert.deepEqual(await local.readAttachment(ns, docs[0]!, { name: "mine.bin" }), mine, "fetched back from the host");
+  });
+
+  test("a diff convergence takes the attachment table by TREE_NODES, each set checked against its hash", async () => {
+    const ns = "app/u/att-converge";
+    const docs = Array.from({ length: 6 }, () => randomUuid());
+    for (const d of docs) await host.put(ns, d, { d });
+    await host.cmd({ op: "attach", ns, id: docs[0], name: "keep.txt", mime: "text/plain", text: "kept" });
+    await host.cmd({ op: "attach", ns, id: docs[1], name: "gone.txt", mime: "text/plain", text: "removed later" });
+    const r = await replica(ns);
+    await r.syncNow();
+    await host.cmd({ op: "detach", ns, id: docs[1], name: "gone.txt" });
+    await host.cmd({ op: "attach", ns, id: docs[0], name: "keep.txt", mime: "text/plain", text: "replaced" });
+    for (const [i, d] of docs.slice(2).entries()) await host.cmd({ op: "attach", ns, id: d, name: `n${i}.txt`, mime: "text/plain", text: `new ${i}` });
+    // Started by hand, as the repair after an interrupted snapshot starts one: the host refuses to
+    // squash a namespace with attachments, so no ordinary sync takes this route.
+    const conn = await PeerConnection.open(host.url, { nodeId: randomUuid(), token: "rw-token", namespaces: [ns] });
+    const target = (await conn.snapshot(ns, (await host.head(ns)).head, "", 1024)).commit;
+    await conn.close();
+    await r.namespace(ns).beginConverge(target, "diff");
+    await r.syncNow();
+    assert.equal(r.namespace(ns).head, (await host.head(ns)).head);
+    for (const d of docs) {
+      const atHost = ((await host.cmd({ op: "attachments", ns, id: d })).attachments as { name: string; hash: string }[])
+        .map((a) => [a.name, a.hash]).sort();
+      assert.deepEqual((await r.attachments(ns, d)).map((a) => [a.name, a.contentHash]).sort(), atHost, `document ${d}`);
+    }
+    assert.equal(new TextDecoder().decode(await r.readAttachment(ns, docs[0]!, { name: "keep.txt" })), "replaced");
   });
 
   test("attachment refs replay with their commits, and every attachment root is verified", async () => {
