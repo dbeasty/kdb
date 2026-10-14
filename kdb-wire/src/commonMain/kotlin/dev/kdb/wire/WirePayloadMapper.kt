@@ -38,6 +38,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         remoteHeads = response.remoteHeads,
                         rejectionReason = response.rejectionReason,
                         wireFeatures = response.wireFeatures.ifEmpty { null },
+                        serverVersion = response.serverVersion.ifEmpty { null },
                     ),
             )
 
@@ -368,6 +369,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                     remoteHeads = a.remoteHeads,
                     rejectionReason = a.rejectionReason,
                     wireFeatures = a.wireFeatures.orEmpty(),
+                    serverVersion = a.serverVersion.orEmpty(),
                 ),
             )
         }

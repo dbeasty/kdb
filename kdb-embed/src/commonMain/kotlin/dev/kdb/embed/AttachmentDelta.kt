@@ -320,7 +320,7 @@ internal class DeltaSourceV2 private constructor(
             when (ops[p++].toInt() and 0xff) {
                 OP_LITERAL -> {
                     val l = uv()
-                    if (l < 0 || l > opsOff - lit) throw corruptDelta()
+                    if (l <= 0 || l > opsOff - lit) throw corruptDelta()
                     ins += DeltaInstr(t, l, lit, false)
                     lit += l
                     t += l
@@ -328,7 +328,7 @@ internal class DeltaSourceV2 private constructor(
                 OP_COPY -> {
                     val bo = uv()
                     val l = uv()
-                    if (bo < 0 || l < 0 || bo > base.size || l > base.size - bo) throw corruptDelta()
+                    if (bo < 0 || l <= 0 || bo > base.size || l > base.size - bo) throw corruptDelta()
                     ins += DeltaInstr(t, l, bo, true)
                     t += l
                 }

@@ -63,9 +63,17 @@ public class KdbRemoteConnection(
     @Volatile
     private var agreedFeatures: List<String> = emptyList()
 
-    /** Whether the server agreed [WIRE_FEATURE_ATTACHMENTS]: it serves the attachment messages and
-     * takes `{"$bytes": ..}` / `{"$attachment": ..}` parameters. Only the Go server does. */
+    /** Whether the server agreed [WIRE_FEATURE_ATTACHMENTS]: it serves the attachment messages. */
     public val attachmentsSupported: Boolean get() = WIRE_FEATURE_ATTACHMENTS in agreedFeatures
+
+    /**
+     * Whether the server speaks the Go server's SQL dialect: plain JSON parameters (Go's
+     * decodeParametersJSON, `{"$bytes": ..}` / `{"$attachment": ..}` included) and session DML
+     * buffered until TX_COMMIT. Known from the ack's serverVersion, which only the Go server sends -
+     * not from the attachments feature, which the Kotlin server agrees too.
+     */
+    @Volatile
+    private var goDialect: Boolean = false
 
     /** Whether the server agreed [WIRE_FEATURE_ATTACHMENT_PROOFS] as well: it serves verified ranged
      * reads ([KdbAttachments.openRange]). */
@@ -130,6 +138,7 @@ public class KdbRemoteConnection(
         // Binary frames only once the server has acked them; an older server acks none.
         val features = negotiateWireFeatures(hs.response.wireFeatures)
         agreedFeatures = features
+        goDialect = hs.response.serverVersion.isNotEmpty()
         if (features.isNotEmpty()) rpc.useCodec(wire.withWireFeatures(features))
         val begin =
             rpc.request(
@@ -155,8 +164,8 @@ public class KdbRemoteConnection(
     ): HybridQueryResult {
         checkOpen()
         val parametersJson =
-            if (attachmentsSupported) {
-                // A server that agreed attachments takes the plain JSON parameter forms (Go's
+            if (goDialect) {
+                // The Go server takes the plain JSON parameter forms (Go's
                 // decodeParametersJSON), binary ones included. Streams are uploaded first.
                 val resolved =
                     bindings.map { b ->
@@ -172,7 +181,9 @@ public class KdbRemoteConnection(
                 encodeSqlParameters(
                     bindings.map {
                         (it as? KdbBinding.Plain)?.parameter
-                            ?: throw SQLFeatureNotSupportedException(KdbAttachments.ATTACHMENTS_NOT_AGREED)
+                            ?: throw SQLFeatureNotSupportedException(
+                                if (attachmentsSupported) KdbAttachments.BINARY_SQL_UNSUPPORTED else KdbAttachments.ATTACHMENTS_NOT_AGREED,
+                            )
                     },
                 )
             }
@@ -193,7 +204,7 @@ public class KdbRemoteConnection(
                     if (reply.errorCode == "INTEGRITY") throw KdbAttachmentCorruptException(reply.error!!)
                     throw SQLException(reply.error)
                 }
-                val bufferedDml = attachmentsSupported && !reply.readOnly && !isTransactionControl(sql)
+                val bufferedDml = goDialect && !reply.readOnly && !isTransactionControl(sql)
                 if (bufferedDml && !autoCommit) bufferedWrites = true
                 val resolvedCommitHex =
                     if (bufferedDml && autoCommit) commitBufferedDml() else reply.resolvedCommitHex
@@ -224,8 +235,8 @@ public class KdbRemoteConnection(
     /**
      * The Go server buffers a session's DML until TX_COMMIT (its own client commits after every
      * Exec); the Kotlin server commits autocommit DML itself. Without this, an autocommit INSERT
-     * against Go reported its row count and was never committed. Keyed on [attachmentsSupported],
-     * the same Go-dialect switch the parameter encoding uses: only the Go server agrees it.
+     * against Go reported its row count and was never committed. Keyed on [goDialect], the switch
+     * the parameter encoding uses.
      */
     private suspend fun commitBufferedDml(): String {
         val reply =
@@ -306,7 +317,7 @@ public class KdbRemoteConnection(
         if (sql != "BEGIN") {
             val hadWrites = bufferedWrites
             bufferedWrites = false
-            if (sql == "COMMIT" && attachmentsSupported && !hadWrites) return
+            if (sql == "COMMIT" && goDialect && !hadWrites) return
         }
         val reply =
             rpc.request(

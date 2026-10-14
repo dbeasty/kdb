@@ -109,6 +109,9 @@ public data class HandshakeAckPayload(
     val rejectionReason: String? = null,
     /** The offered features the server accepted. Neither side sends a frame in one until it is here. */
     val wireFeatures: List<String> = emptyList(),
+    /** The release version of the server that sent the ack (Go's ServerVersion: "0.7.1", "0.0.0-dev"
+     * from source). The Go server always sends it; the Kotlin server leaves it empty. */
+    val serverVersion: String = "",
 )
 
 public data class DeltaCommitPayload(
@@ -466,21 +469,24 @@ public sealed class WireMessage {
         public val offset: Long = 0,
         public val data: ByteArray = ByteArray(0),
         public val final: Boolean = false,
+        /** On a first chunk, the blob about to be sent: a server already holding it answers with
+         * its hash and size at once (and holds it for the commit), and the client skips the bytes. */
+        public val expect: KdbHash? = null,
     ) : WireMessage() {
         public fun copy(header: WireHeader): AttachmentUpload =
-            AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final)
+            AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final, expect)
 
         override fun equals(other: Any?): Boolean =
             other is AttachmentUpload && header == other.header && namespace == other.namespace &&
                 sessionId == other.sessionId && uploadId == other.uploadId && offset == other.offset &&
-                data.contentEquals(other.data) && final == other.final
+                data.contentEquals(other.data) && final == other.final && expect == other.expect
 
         override fun hashCode(): Int =
-            listOf(header, namespace, sessionId, uploadId, offset, final).hashCode() * 31 + data.contentHashCode()
+            listOf(header, namespace, sessionId, uploadId, offset, final, expect).hashCode() * 31 + data.contentHashCode()
 
         override fun toString(): String =
             "AttachmentUpload(header=$header, namespace=$namespace, sessionId=$sessionId, uploadId=$uploadId, " +
-                "offset=$offset, data=${data.size} bytes, final=$final)"
+                "offset=$offset, data=${data.size} bytes, final=$final, expect=$expect)"
     }
 
     /** Answers an upload chunk: the bytes received so far and, after the final chunk, the blob's

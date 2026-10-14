@@ -283,44 +283,55 @@ public class AttachmentBlobStore(
      * held for [uploadGrace] until one does. A blob already stored is not stored twice.
      */
     public suspend fun put(source: AttachmentSource): StoredAttachmentBlob {
-        val hasher = AttachmentHasher()
-        val buf = ByteArray(ATTACHMENT_CHUNK_BYTES)
-        var segment: String? = null
-        var last = ByteArray(0)
+        val up = begin()
+        val buf = ByteArray(64 shl 10)
         try {
             while (true) {
-                var fill = 0
-                while (fill < buf.size) {
-                    val n = source.read(buf, fill, buf.size - fill)
-                    if (n < 0) break
-                    fill += n
-                }
-                if (maxBytes > 0 && hasher.size + fill > maxBytes) {
-                    throw AttachmentTooLargeException("attachment exceeds the size limit of $maxBytes bytes")
-                }
-                hasher.update(buf, 0, fill)
-                val full = fill == buf.size
-                if (full || segment != null || (fill > 0 && fill > smallMaxBytes)) {
-                    if (fill > 0) {
-                        if (segment == null) {
-                            segment = newSegmentName()
-                            mutex.withLock { uploads += segment }
-                        }
-                        shim.appendToSegment(segment, if (full) buf else buf.copyOf(fill))
-                    }
-                } else {
-                    last = buf.copyOf(fill)
-                }
-                if (!full) break
+                val n = source.read(buf, 0, buf.size)
+                if (n < 0) break
+                if (n > 0) up.write(buf, 0, n)
             }
         } catch (e: Throwable) {
-            segment?.let { abandon(it) }
+            up.abort()
             throw e
         }
-        val hash = hasher.finish()
-        val size = hasher.size
+        return up.finish()
+    }
+
+    /** Starts an upload: [AttachmentUpload.write] the bytes, then [AttachmentUpload.finish] (or abort). */
+    public fun begin(): AttachmentUpload = AttachmentUpload(this)
+
+    internal suspend fun startSegment(): String {
+        val name = newSegmentName()
+        mutex.withLock { uploads += name }
+        return name
+    }
+
+    internal suspend fun appendTo(
+        segment: String,
+        bytes: ByteArray,
+    ) {
+        shim.appendToSegment(segment, bytes)
+    }
+
+    internal suspend fun abandon(segment: String) {
+        runCatching { shim.deleteSegment(segment) }
+        mutex.withLock { uploads -= segment }
+    }
+
+    /** Makes a finished upload durable: its bytes inline ([segment] null) or in [segment]. */
+    internal suspend fun finishUpload(
+        hash: KdbHash,
+        size: Long,
+        segment: String?,
+        last: ByteArray,
+        leaves: List<KdbHash>,
+    ): StoredAttachmentBlob {
         val info = StoredAttachmentBlob(hash, size)
-        if (size == 0L) return info // never stored: see EMPTY_HASH
+        if (size == 0L) {
+            segment?.let { abandon(it) }
+            return info // never stored: see EMPTY_HASH
+        }
         if (segment == null) {
             // Small: the bytes go in the pointer.
             mutex.withLock {
@@ -339,7 +350,7 @@ public class AttachmentBlobStore(
         try {
             shim.flushSegment(segment)
             shim.sealSegment(segment)
-            leavesSeg = writeLeaves(hasher.leafHashes)
+            leavesSeg = writeLeaves(leaves)
         } catch (e: Throwable) {
             abandon(segment)
             throw e
@@ -359,11 +370,6 @@ public class AttachmentBlobStore(
             }
         }
         return info
-    }
-
-    private suspend fun abandon(segment: String) {
-        runCatching { shim.deleteSegment(segment) }
-        mutex.withLock { uploads -= segment }
     }
 
     private suspend fun writeLeaves(leaves: List<KdbHash>): String {
@@ -835,6 +841,76 @@ public class AttachmentBlobStore(
             for (i in 0 until 4) v = (v shl 8) or (b[off + i].toInt() and 0xff)
             return v
         }
+    }
+}
+
+/**
+ * One blob being uploaded ([AttachmentBlobStore.begin]): [write] its bytes in pieces of any size,
+ * then [finish]. Bytes go to their segment a chunk at a time as they arrive, hashed on the way; a
+ * blob that ends within [AttachmentBlobStore.smallMaxBytes] is kept inline instead. Not safe for
+ * concurrent use.
+ */
+public class AttachmentUpload internal constructor(
+    private val store: AttachmentBlobStore,
+) {
+    private val hasher = AttachmentHasher()
+    private val cur = ByteArray(ATTACHMENT_CHUNK_BYTES)
+    private var fill = 0
+    private var segment: String? = null
+    private var done = false
+
+    /** Bytes written so far. */
+    public val size: Long get() = hasher.size
+
+    public suspend fun write(
+        data: ByteArray,
+        offset: Int = 0,
+        length: Int = data.size - offset,
+    ) {
+        check(!done) { "attachment upload already finished" }
+        if (store.maxBytes > 0 && hasher.size + length > store.maxBytes) {
+            abort()
+            throw AttachmentTooLargeException("attachment exceeds the size limit of ${store.maxBytes} bytes")
+        }
+        hasher.update(data, offset, length)
+        var off = offset
+        var left = length
+        while (left > 0) {
+            val n = minOf(left, cur.size - fill)
+            data.copyInto(cur, fill, off, off + n)
+            fill += n
+            off += n
+            left -= n
+            if (fill == cur.size) {
+                val seg = segment ?: store.startSegment().also { segment = it }
+                store.appendTo(seg, cur.copyOf())
+                fill = 0
+            }
+        }
+    }
+
+    /** Makes the blob durable and returns its content hash and size. */
+    public suspend fun finish(): StoredAttachmentBlob {
+        check(!done) { "attachment upload already finished" }
+        done = true
+        val hash = hasher.finish()
+        val last = cur.copyOf(fill)
+        var seg = segment
+        try {
+            if (seg == null && fill.toLong() > store.smallMaxBytes) seg = store.startSegment()
+            if (seg != null && fill > 0) store.appendTo(seg, last)
+        } catch (e: Throwable) {
+            seg?.let { store.abandon(it) }
+            throw e
+        }
+        return store.finishUpload(hash, hasher.size, seg, last, hasher.leafHashes)
+    }
+
+    /** Discards the upload. Idempotent. */
+    public suspend fun abort() {
+        if (done) return
+        done = true
+        segment?.let { store.abandon(it) }
     }
 }
 

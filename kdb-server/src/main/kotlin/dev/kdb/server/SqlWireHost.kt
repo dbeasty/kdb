@@ -47,8 +47,6 @@ import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.SqlCellKind
-import dev.kdb.wire.WIRE_FEATURE_ATTACHMENTS
-import dev.kdb.wire.WIRE_FEATURE_ATTACHMENT_PROOFS
 import dev.kdb.wire.negotiateWireFeatures
 import dev.kdb.wire.withWireFeatures
 import kotlinx.coroutines.sync.Mutex
@@ -71,6 +69,15 @@ public class SqlWireHost(
 ) {
     private val sessions = SessionManager(server)
     private val sqlAuth = SqlAuthSupport(auth, connectionContext)
+    private val attachments =
+        AttachmentWireHandler(
+            server,
+            defaultNamespace,
+            authenticate = { sqlAuth.authenticateConnection() },
+            authorize = { p, a -> sqlAuth.authorize(p, a) },
+            authFailureMessage = { sqlAuth.authFailureMessage(it) },
+            readHead = { id -> sessions.get(id)?.readPin },
+        )
     private var correlation = 1
 
     /** The codec replies are encoded with: [wire], until a handshake agrees wire features (binary
@@ -90,6 +97,7 @@ public class SqlWireHost(
      * finally), not from any wire message. Idempotent (a second call just ends zero sessions). */
     public suspend fun endSession() {
         sessions.endAll()
+        attachments.closeAll()
     }
 
     // Per-session ordering lock: SqlExec/TxCommit/TxRollback for the same
@@ -140,45 +148,22 @@ public class SqlWireHost(
             is WireMessage.DocumentGet -> handleDocumentGet(message)
             is WireMessage.Upsert -> handleUpsert(message)
             is WireMessage.Search -> handleSearch(message)
-            is WireMessage.AttachmentUpload, is WireMessage.AttachmentGet, is WireMessage.AttachmentList,
-            is WireMessage.BlobFetch,
-            -> attachmentsUnsupported(message)
+            is WireMessage.AttachmentUpload -> attachments.handleUpload(message)
+            is WireMessage.AttachmentGet -> attachments.handleGet(message)
+            is WireMessage.AttachmentList -> attachments.handleList(message)
+            is WireMessage.BlobFetch -> blobFetchUnsupported(message)
             else -> null
         }
 
     /**
-     * This server does not serve attachments (the Go server does; docs/kdb-attachments-plan.md), and
-     * never acks [WIRE_FEATURE_ATTACHMENTS] or [WIRE_FEATURE_ATTACHMENT_PROOFS]. A client that sends
-     * one of these anyway gets a typed UNSUPPORTED answer on the request's correlation id, rather
-     * than no reply at all.
+     * BLOB_FETCH is peer sync's (sync v2), which this server does not host yet: a typed UNSUPPORTED
+     * answer on the request's correlation id, rather than no reply at all.
      */
-    private fun attachmentsUnsupported(message: WireMessage): WireMessage {
-        val corr = message.header.correlationId
-        val error = "attachments are not supported by this server"
-        val code = "UNSUPPORTED"
-        return when (message) {
-            is WireMessage.AttachmentUpload ->
-                WireMessage.AttachmentUploadResult(
-                    header(corr, WireMessageType.ATTACHMENT_UPLOAD_RESULT), message.namespace,
-                    uploadId = message.uploadId, error = error, errorCode = code,
-                )
-            is WireMessage.AttachmentGet ->
-                WireMessage.AttachmentData(
-                    header(corr, WireMessageType.ATTACHMENT_DATA), message.namespace, readId = message.readId,
-                    docId = message.docId, error = error, errorCode = code,
-                )
-            is WireMessage.AttachmentList ->
-                WireMessage.AttachmentListResult(
-                    header(corr, WireMessageType.ATTACHMENT_LIST_RESULT), message.namespace, error = error,
-                    errorCode = code,
-                )
-            is WireMessage.BlobFetch ->
-                WireMessage.BlobFetchResult(
-                    header(corr, WireMessageType.BLOB_FETCH_RESULT), message.namespace, error = error, errorCode = code,
-                )
-            else -> error("not an attachment request")
-        }
-    }
+    private fun blobFetchUnsupported(message: WireMessage.BlobFetch): WireMessage =
+        WireMessage.BlobFetchResult(
+            header(message.header.correlationId, WireMessageType.BLOB_FETCH_RESULT), message.namespace,
+            error = "blob fetch is not supported by this server", errorCode = "UNSUPPORTED",
+        )
 
     /**
      * Component 40 direct point lookup by document id - no session, no read-consistency
@@ -313,10 +298,7 @@ public class SqlWireHost(
         sessions.begin(ns, ReadConsistency.READ_COMMITTED, principal = principal)
         // Wire features are agreed only on an accepted handshake. The ack is a JSON frame either
         // way (a handshake has no binary form), so the client reads it before switching anything.
-        // Attachments are left out: this server answers their messages only with UNSUPPORTED. So is
-        // attachment-proofs, which only means anything with them.
-        val features =
-            negotiateWireFeatures(msg.request.wireFeatures) - WIRE_FEATURE_ATTACHMENTS - WIRE_FEATURE_ATTACHMENT_PROOFS
+        val features = negotiateWireFeatures(msg.request.wireFeatures)
         if (features.isNotEmpty()) replyWire = wire.withWireFeatures(features)
         return handshakeAck(msg, accepted = true, head, rejectionReason = null, wireFeatures = features)
     }

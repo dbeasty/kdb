@@ -525,7 +525,7 @@ class AttachmentJdbcTest {
                         val ack =
                             WireMessage.HandshakeAck(
                                 hdr(corr, WireMessageType.HANDSHAKE),
-                                HandshakeAckPayload(true, codec.encoding, KDB_WIRE_PROTOCOL_VERSION, wireFeatures = features),
+                                HandshakeAckPayload(true, codec.encoding, KDB_WIRE_PROTOCOL_VERSION, wireFeatures = features, serverVersion = "0.0.0-dev"),
                             )
                         val out = codec.encode(ack)
                         replyCodec = codec.withWireFeatures(features)

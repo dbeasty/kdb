@@ -140,6 +140,7 @@ internal data class HandshakeAckDto(
     val remoteHeads: Map<String, String>,
     val rejectionReason: String? = null,
     val wireFeatures: List<String>? = null,
+    val serverVersion: String? = null,
 )
 
 @Serializable

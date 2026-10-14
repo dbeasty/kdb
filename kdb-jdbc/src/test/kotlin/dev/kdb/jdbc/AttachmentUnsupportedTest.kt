@@ -116,7 +116,7 @@ class AttachmentUnsupportedTest {
     }
 
     @Test
-    fun kotlinServerDoesNotAgreeAttachments() =
+    fun kotlinServerServesAttachmentsButNotBinarySqlOrBlobFetch() =
         runBlocking {
             val ns = "demo/users"
             val schema = KdbSchema.build(listOf(SchemaField("userId", KdbFieldType.StringType, required = true, indexed = true)))
@@ -124,16 +124,14 @@ class AttachmentUnsupportedTest {
             val wire = defaultWireCodec()
             val host = SqlWireHost(wire, KdbServerRuntime(runtime), ns)
 
-            // A raw attachment request gets a typed UNSUPPORTED answer, not silence.
-            val list =
-                WireMessage.AttachmentList(
-                    WireHeader(WireMessageType.ATTACHMENT_LIST, KDB_WIRE_PROTOCOL_VERSION, 42, 0), ns, "", KdbUuid.random(),
-                )
-            val reply = wire.decode(host.handleFrame(wire.encode(list))!!) as WireMessage.AttachmentListResult
+            // Peer sync's BLOB_FETCH (sync v2, not hosted here yet) gets a typed UNSUPPORTED answer.
+            val fetch = WireMessage.BlobFetch(WireHeader(WireMessageType.BLOB_FETCH, KDB_WIRE_PROTOCOL_VERSION, 42, 0), ns)
+            val reply = wire.decode(host.handleFrame(wire.encode(fetch))!!) as WireMessage.BlobFetchResult
             assertEquals(42, reply.header.correlationId)
             assertEquals("UNSUPPORTED", reply.errorCode)
 
-            // Offered every feature, it acks neither attachments nor attachment-proofs.
+            // Offered every feature, it acks attachments and attachment-proofs (KotlinServerAttachmentTest
+            // covers what it serves), and sends no serverVersion: the driver keeps its own SQL dialect.
             val hs =
                 WireMessage.Handshake(
                     WireHeader(WireMessageType.HANDSHAKE, KDB_WIRE_PROTOCOL_VERSION, 43, 0),
@@ -145,8 +143,9 @@ class AttachmentUnsupportedTest {
             val ack = wire.decode(host.handleFrame(wire.encode(hs))!!) as WireMessage.HandshakeAck
             assertTrue(ack.response.accepted)
             assertTrue(WIRE_FEATURE_BINARY in ack.response.wireFeatures, "${ack.response.wireFeatures}")
-            assertFalse(WIRE_FEATURE_ATTACHMENTS in ack.response.wireFeatures)
-            assertFalse(WIRE_FEATURE_ATTACHMENT_PROOFS in ack.response.wireFeatures)
+            assertTrue(WIRE_FEATURE_ATTACHMENTS in ack.response.wireFeatures)
+            assertTrue(WIRE_FEATURE_ATTACHMENT_PROOFS in ack.response.wireFeatures)
+            assertEquals("", ack.response.serverVersion)
 
             val server = JvmNetworkWebSocketServer()
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -159,16 +158,12 @@ class AttachmentUnsupportedTest {
             while (server.port == 0) delay(10)
             try {
                 DriverManager.getConnection("jdbc:kdb://127.0.0.1:${server.port}/$ns").use { conn ->
-                    assertFalse(conn.unwrap(KdbRemoteConnection::class.java).attachmentsSupported)
-                    assertFalse(conn.unwrap(KdbRemoteConnection::class.java).attachmentProofsSupported)
-                    val att = conn.unwrap(KdbAttachments::class.java)
-                    assertFailsWith<SQLFeatureNotSupportedException> { att.list(KdbUuid.random().toString()) }
-                    val doc = KdbUuid.random().toString()
-                    assertFailsWith<SQLFeatureNotSupportedException> { att.openRange(doc, KdbAttachmentSelector.byName("a"), null, 0, -1) }
-                    assertFailsWith<SQLFeatureNotSupportedException> { att.readAt(doc, KdbAttachmentSelector.byName("a"), null, ByteArray(1), 0) }
+                    assertTrue(conn.unwrap(KdbRemoteConnection::class.java).attachmentsSupported)
+                    assertTrue(conn.unwrap(KdbRemoteConnection::class.java).attachmentProofsSupported)
                     conn.prepareStatement("SELECT _doc FROM users WHERE userId = ?").use { ps ->
                         ps.setBytes(1, byteArrayOf(1))
-                        assertFailsWith<SQLFeatureNotSupportedException> { ps.executeQuery() }
+                        val e = assertFailsWith<SQLFeatureNotSupportedException> { ps.executeQuery() }
+                        assertTrue(e.message!!.contains("KdbAttachments"), e.message)
                         // Ordinary parameters still go in the Kotlin server's own form.
                         ps.setString(1, "u1")
                         ps.executeQuery().close()
