@@ -20,12 +20,17 @@ import (
 // step against the root the commit recorded: a log or cache that disagrees with a commit is an
 // error, never a wrong attachment. A checkpoint seeds the cache with its heads' tables
 // (SeedAttachmentTable), so opening a namespace does not replay history to find them.
+//
+// Every table the DAG derives or is given shares one set pool (document.AttachmentSetPool). Left
+// alone it keeps every set in memory; SetAttachmentSetStore backs it with a store, after which it
+// keeps a bounded number in memory and reads the others back, checked against their hashes.
 
 // attachmentCacheSize bounds the tables kept besides the ones seeded for heads. Versions of a table
 // share their trie nodes, so a cached table costs its changed nodes, not its size.
 const attachmentCacheSize = 64
 
 type attachmentCache struct {
+	pool   *document.AttachmentSetPool // nil until first needed
 	tables map[codec.Hash]document.AttachmentTable
 	order  []codec.Hash // insertion order, oldest first, for eviction
 	// pinned are seeded tables - a checkpoint's heads', a snapshot's or graft's root's - never
@@ -46,6 +51,20 @@ func (c *attachmentCache) pin(root codec.Hash, t document.AttachmentTable) {
 		c.pinned = make(map[codec.Hash]document.AttachmentTable)
 	}
 	c.pinned[root] = t
+}
+
+// setPool is the pool every table of this DAG shares.
+func (c *attachmentCache) setPool() *document.AttachmentSetPool {
+	if c.pool == nil {
+		c.pool = document.NewAttachmentSetPool(nil, 0)
+	}
+	return c.pool
+}
+
+// own returns t with its sets in the DAG's pool - a table built elsewhere (a transaction's, a
+// seed's) would otherwise carry a pool of its own into every table derived from it.
+func (c *attachmentCache) own(t document.AttachmentTable) (document.AttachmentTable, error) {
+	return t.InPool(c.setPool())
 }
 
 func (c *attachmentCache) put(root codec.Hash, t document.AttachmentTable) {
@@ -70,17 +89,81 @@ func (d *InMemoryCommitDag) AttachmentTableAt(commit codec.Hash) (document.Attac
 	return d.attachmentTableLocked(commit)
 }
 
+// SetAttachmentSetStore backs the DAG's attachment set pool with store, keeping about budgetBytes
+// of sets in memory (document.DefaultAttachmentSetBudget when <= 0). Call it before tables are
+// seeded or derived; tables already cached move to the new pool (pinned ones) or are dropped.
+func (d *InMemoryCommitDag) SetAttachmentSetStore(store document.AttachmentSetStore, budgetBytes int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.attachments.pool = document.NewAttachmentSetPool(store, budgetBytes)
+	d.attachments.tables, d.attachments.order = nil, nil
+	for root, t := range d.attachments.pinned {
+		owned, err := d.attachments.own(t)
+		if err != nil {
+			return err
+		}
+		d.attachments.pinned[root] = owned
+	}
+	return nil
+}
+
+// AttachmentSetPool is the pool the DAG's attachment tables share.
+func (d *InMemoryCommitDag) AttachmentSetPool() *document.AttachmentSetPool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.attachments.setPool()
+}
+
+// ForgetAttachmentTablesExcept drops the cached tables that were not seeded, except those of keep.
+// A store collecting the sets no longer referenced calls it: a cached table of an old commit may
+// name sets the collection drops, and is rebuilt from history if asked for again.
+func (d *InMemoryCommitDag) ForgetAttachmentTablesExcept(keep []codec.Hash) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	kept := map[codec.Hash]document.AttachmentTable{}
+	var order []codec.Hash
+	for _, h := range keep {
+		c, ok := d.commitLocked(h)
+		if !ok || c.AttachmentTreeHash == nil {
+			continue
+		}
+		if t, ok := d.attachments.tables[*c.AttachmentTreeHash]; ok {
+			if _, dup := kept[*c.AttachmentTreeHash]; !dup {
+				kept[*c.AttachmentTreeHash] = t
+				order = append(order, *c.AttachmentTreeHash)
+			}
+		}
+	}
+	d.attachments.tables, d.attachments.order = kept, order
+}
+
+// PinnedAttachmentTables are the seeded tables, which are never dropped.
+func (d *InMemoryCommitDag) PinnedAttachmentTables() []document.AttachmentTable {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]document.AttachmentTable, 0, len(d.attachments.pinned))
+	for _, t := range d.attachments.pinned {
+		out = append(out, t)
+	}
+	return out
+}
+
 // SeedAttachmentTable caches table as the attachment table whose root it is - for a checkpoint
 // restoring its heads' tables. An empty table needs no seed.
-func (d *InMemoryCommitDag) SeedAttachmentTable(table document.AttachmentTable) {
+func (d *InMemoryCommitDag) SeedAttachmentTable(table document.AttachmentTable) error {
 	root := table.Root()
 	if root == nil {
-		return
+		return nil
 	}
 	d.mu.Lock()
-	d.attachments.pin(*root, table)
+	defer d.mu.Unlock()
+	owned, err := d.attachments.own(table)
+	if err != nil {
+		return err
+	}
+	d.attachments.pin(*root, owned)
 	d.sawAttachments = true
-	d.mu.Unlock()
+	return nil
 }
 
 // attachmentTableLocked resolves commit's table, rebuilding it from the nearest known ancestor if
@@ -88,7 +171,7 @@ func (d *InMemoryCommitDag) SeedAttachmentTable(table document.AttachmentTable) 
 func (d *InMemoryCommitDag) attachmentTableLocked(commit codec.Hash) (document.AttachmentTable, error) {
 	var chain []document.Commit // commits whose table must be built, newest first
 	at := commit
-	base := document.EmptyAttachmentTable()
+	base := d.attachments.setPool().Empty()
 	for {
 		c, ok := d.commitLocked(at)
 		if !ok {
@@ -140,7 +223,11 @@ func (d *InMemoryCommitDag) attachmentTableLocked(commit codec.Hash) (document.A
 func (d *InMemoryCommitDag) attachmentRootLocked(tx document.Transaction, parents []codec.Hash) (*codec.Hash, error) {
 	if tx.Attachments != nil {
 		if root := tx.Attachments.Root(); root != nil {
-			d.attachments.put(*root, *tx.Attachments)
+			owned, err := d.attachments.own(*tx.Attachments)
+			if err != nil {
+				return nil, err
+			}
+			d.attachments.put(*root, owned)
 			return root, nil
 		}
 		return nil, nil
@@ -154,7 +241,7 @@ func (d *InMemoryCommitDag) attachmentRootLocked(tx document.Transaction, parent
 	if !document.TouchesAttachments(tx.Operations, inherited != nil) {
 		return inherited, nil
 	}
-	base := document.EmptyAttachmentTable()
+	base := d.attachments.setPool().Empty()
 	if inherited != nil {
 		t, err := d.attachmentTableLocked(parents[0])
 		if err != nil {
@@ -217,18 +304,20 @@ func (d *InMemoryCommitDag) PackAttachmentTables(commits []codec.Hash, optional 
 	if len(tables) == 0 {
 		return nil, nil
 	}
-	return document.AppendPackedAttachmentTables(nil, tables), nil
+	return document.AppendPackedAttachmentTables(nil, tables)
 }
 
 // SeedPackedAttachmentTables caches the tables PackAttachmentTables packed. Each is keyed by the
 // root its own entries hash to, so a table only ever answers for the commits that name that root.
 func (d *InMemoryCommitDag) SeedPackedAttachmentTables(packed []byte) error {
-	tables, err := document.ParsePackedAttachmentTables(packed)
+	tables, err := document.ParsePackedAttachmentTablesInto(d.AttachmentSetPool(), packed)
 	if err != nil {
 		return err
 	}
 	for _, t := range tables {
-		d.SeedAttachmentTable(t)
+		if err := d.SeedAttachmentTable(t); err != nil {
+			return err
+		}
 	}
 	return nil
 }

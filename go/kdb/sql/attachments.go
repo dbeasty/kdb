@@ -297,7 +297,11 @@ func (a *attachEnv) set(doc codec.UUID) document.AttachmentSet {
 			a.table = t
 		}
 	}
-	return a.table.List(doc)
+	set, err := a.table.List(doc)
+	if err != nil {
+		a.fail(err)
+	}
+	return set
 }
 
 // attachmentsJSON is the _attachments value of a document.

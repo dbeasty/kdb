@@ -84,8 +84,12 @@ func (rt *EmbeddedKdbRuntime) MigrateFileAttachments(namespaceID string, strip, 
 			if rec.Encoding == "zip" {
 				mime = "application/zip"
 			}
+			have, err := table.List(d.ID)
+			if err != nil {
+				return err
+			}
 			done := false
-			for _, a := range table.List(d.ID) {
+			for _, a := range have {
 				if a.ContentHash == content {
 					done = true
 				}
@@ -94,7 +98,7 @@ func (rt *EmbeddedKdbRuntime) MigrateFileAttachments(namespaceID string, strip, 
 				out.Skipped++
 				continue
 			}
-			if _, clash := table.List(d.ID).ByName(name); clash {
+			if _, clash := have.ByName(name); clash {
 				name = name + "~migrated"
 			}
 			out.Migrated++

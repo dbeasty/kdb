@@ -809,6 +809,9 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 		if !strings.HasPrefix(name, s.prefix) || referenced[name] {
 			continue
 		}
+		if _, ok := s.isRefIndex(name); ok {
+			continue // SetRefIndex retires older ones itself
+		}
 		if _, writing := s.uploads[name]; writing {
 			continue
 		}

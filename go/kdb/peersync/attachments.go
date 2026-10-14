@@ -107,7 +107,10 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 	if err != nil {
 		return fail(wire.ErrorCodeNotFound, "commit %s: %v", e.CommitHex, err)
 	}
-	a, ok := table.Get(e.DocID, e.AttachmentID)
+	a, ok, err := table.Get(e.DocID, e.AttachmentID)
+	if err != nil {
+		return failRead(wire.ErrorCodeIntegrity, err)
+	}
 	if !ok || a.ContentHash != e.Hash {
 		return fail(wire.ErrorCodeNotFound, "attachment %s of %s at %s does not reference %s", e.AttachmentID, e.DocID, e.CommitHex, e.Hash.Hex())
 	}
@@ -153,7 +156,10 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 	}
 	part.EOF = end == a.Size
 	if part.EOF && head != nil {
-		now, ok := head.Get(e.DocID, e.AttachmentID)
+		now, ok, err := head.Get(e.DocID, e.AttachmentID)
+		if err != nil {
+			return failRead(wire.ErrorCodeIntegrity, err)
+		}
 		part.Superseded = !ok || now.ContentHash != e.Hash
 	}
 	return part, int64(len(data))
@@ -520,7 +526,11 @@ func attachmentTreeNodesPage(env IngestEnv, m wire.TreeNodesMessage) (wire.TreeN
 				if err != nil {
 					continue
 				}
-				for _, a := range table.List(id) {
+				set, err := table.List(id)
+				if err != nil {
+					return wire.TreeNodesResultMessage{}, err
+				}
+				for _, a := range set {
 					info.Attachments[docHex] = append(info.Attachments[docHex], wire.TreeAttachment{
 						ID: a.ID.String(), Name: a.Name, Hash: a.ContentHash.Hex(), Size: a.Size, Mime: a.Mime})
 				}
@@ -564,12 +574,12 @@ func tableBlobs(env IngestEnv, commit codec.Hash) (document.Commit, bool, error)
 		return document.Commit{}, false, err
 	}
 	synthetic := document.Commit{Hash: commit}
-	table.Walk(func(doc codec.UUID, a document.Attachment) bool {
+	err = table.Walk(func(doc codec.UUID, a document.Attachment) bool {
 		synthetic.Operations = append(synthetic.Operations, document.AttachmentPutOp{DocID: doc, AttachmentID: a.ID,
 			Name: a.Name, Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
 		return true
 	})
-	return synthetic, true, nil
+	return synthetic, err == nil, err
 }
 
 // fetchTableBlobs takes in every blob commit's attachment table names that this node lacks - after
@@ -624,7 +634,7 @@ func admitGraftAttachments(env IngestEnv, stage *graftStage) error {
 	}
 	if env.Attachments != nil {
 		var missing error
-		table.Walk(func(_ codec.UUID, a document.Attachment) bool {
+		walkErr := table.Walk(func(_ codec.UUID, a document.Attachment) bool {
 			if has, err := env.Attachments.Has(a.ContentHash); err != nil || !has {
 				missing = fmt.Errorf("peer sync: pushed graft of %s attaches %s, which was not uploaded", stage.commit.Hash.Hex(), a.ContentHash.Hex())
 				return false
@@ -634,10 +644,19 @@ func admitGraftAttachments(env IngestEnv, stage *graftStage) error {
 		if missing != nil {
 			return missing
 		}
+		if walkErr != nil {
+			return walkErr
+		}
 	}
-	env.DAG.SeedAttachmentTable(*table)
+	if err := env.DAG.SeedAttachmentTable(*table); err != nil {
+		return err
+	}
 	if env.AttachmentTableSeeded != nil {
-		return env.AttachmentTableSeeded(document.AppendPackedAttachmentTables(nil, []document.AttachmentTable{*table}))
+		packed, err := document.AppendPackedAttachmentTables(nil, []document.AttachmentTable{*table})
+		if err != nil {
+			return err
+		}
+		return env.AttachmentTableSeeded(packed)
 	}
 	return nil
 }
@@ -660,7 +679,11 @@ func withProjectedAttachments(env IngestEnv, page *wire.ProjectPageMessage) erro
 		if err != nil {
 			continue
 		}
-		for _, a := range table.List(id) {
+		set, err := table.List(id)
+		if err != nil {
+			return err
+		}
+		for _, a := range set {
 			if page.Attachments == nil {
 				page.Attachments = map[string][]wire.TreeAttachment{}
 			}
