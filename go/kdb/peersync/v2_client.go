@@ -495,8 +495,9 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 		if err != nil {
 			return haves, err
 		}
-		tips := pageTips(page.Commits)
-		res.ReceivedTips = foldFrontier(res.ReceivedTips, page.Commits, MaxPendingTips)
+		named := namedParents(page.Commits)
+		tips := tipsOf(page.Commits, named)
+		res.ReceivedTips = foldTips(res.ReceivedTips, named, tips, MaxPendingTips)
 		gate.share(tips)
 		haves = pageHaves(base, tips)
 		if page.Done || len(page.Commits) == 0 {

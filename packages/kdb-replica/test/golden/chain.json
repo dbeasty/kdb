@@ -1,0 +1,296 @@
+{
+  "namespace": "app/u/42",
+  "commits": [
+    {
+      "name": "chain0",
+      "payloadHex": "be01010a000209086170702f752f3432030f905289a7be608e25ad733e565363360704050100ceeeb5400600050f11111111222233334444555555555555060a03001c010fb627dc39d3d381b8a1fe5769a9c587ed0209077b2276223a317d001c010f4e106a2285f3874e96e6edbfd4e65ed40209077b2276223a317d001c010fb0fd9d6e748b82a6bfbfa20c931dce780209077b2276223a317d070f4520553ebbf75c042c11fe59fba60d971df8ff6c344f60c28204807e6c8ea841090900",
+      "hash": "f111963e2368ad286770123ab8ad64ee8c26f35e5de69f5c12abeaf1d3cd5bfa",
+      "parents": [],
+      "namespace": "app/u/42",
+      "transactionId": "905289a7-be60-8e25-ad73-3e5653633607",
+      "timestampMicros": "1760000000000001",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "write",
+          "docId": "b627dc39-d3d3-81b8-a1fe-5769a9c587ed",
+          "json": "{\"v\":1}"
+        },
+        {
+          "kind": "write",
+          "docId": "4e106a22-85f3-874e-96e6-edbfd4e65ed4",
+          "json": "{\"v\":1}"
+        },
+        {
+          "kind": "write",
+          "docId": "b0fd9d6e-748b-82a6-bfbf-a20c931dce78",
+          "json": "{\"v\":1}"
+        }
+      ],
+      "treeHash": "4520553ebbf75c042c11fe59fba60d971df8ff6c344f60c28204807e6c8ea841",
+      "message": ""
+    },
+    {
+      "name": "chain1",
+      "payloadHex": "b601010a01f111963e2368ad286770123ab8ad64ee8c26f35e5de69f5c12abeaf1d3cd5bfa0209086170702f752f3432030fd82fdff6e7748b01b89bfd26780c901c04050200ceeeb5400600050f11111111222233334444555555555555060a02001c010fb627dc39d3d381b8a1fe5769a9c587ed0209077b2276223a327d0112010f4e106a2285f3874e96e6edbfd4e65ed4070f15e48c0e6151f9d0af2ccb13723623ab164f5e25935f94e1ebed0b9320dfb42c090900",
+      "hash": "39387d899ce336c18331b91f5135dc5126c624a40b974b313a968ed269ee73f7",
+      "parents": [
+        "f111963e2368ad286770123ab8ad64ee8c26f35e5de69f5c12abeaf1d3cd5bfa"
+      ],
+      "namespace": "app/u/42",
+      "transactionId": "d82fdff6-e774-8b01-b89b-fd26780c901c",
+      "timestampMicros": "1760000000000002",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "write",
+          "docId": "b627dc39-d3d3-81b8-a1fe-5769a9c587ed",
+          "json": "{\"v\":2}"
+        },
+        {
+          "kind": "delete",
+          "docId": "4e106a22-85f3-874e-96e6-edbfd4e65ed4"
+        }
+      ],
+      "treeHash": "15e48c0e6151f9d0af2ccb13723623ab164f5e25935f94e1ebed0b9320dfb42c",
+      "message": ""
+    },
+    {
+      "name": "chain2",
+      "payloadHex": "c001010a0139387d899ce336c18331b91f5135dc5126c624a40b974b313a968ed269ee73f70209086170702f752f3432030f3480b15f2e938e948045ce1ed981b3d004050300ceeeb5400600050f11111111222233334444555555555555060a02001c010fd1ea22b2cf4e896096c55489d51e86140209077b2276223a337d001c010fb627dc39d3d381b8a1fe5769a9c587ed0209077b2276223a337d070f2dbbd14e87b854cb1456232ddec7ac51946dfe9a54d832e8c8bc424612cda0a9090900",
+      "hash": "195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa95",
+      "parents": [
+        "39387d899ce336c18331b91f5135dc5126c624a40b974b313a968ed269ee73f7"
+      ],
+      "namespace": "app/u/42",
+      "transactionId": "3480b15f-2e93-8e94-8045-ce1ed981b3d0",
+      "timestampMicros": "1760000000000003",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "write",
+          "docId": "d1ea22b2-cf4e-8960-96c5-5489d51e8614",
+          "json": "{\"v\":3}"
+        },
+        {
+          "kind": "write",
+          "docId": "b627dc39-d3d3-81b8-a1fe-5769a9c587ed",
+          "json": "{\"v\":3}"
+        }
+      ],
+      "treeHash": "2dbbd14e87b854cb1456232ddec7ac51946dfe9a54d832e8c8bc424612cda0a9",
+      "message": ""
+    },
+    {
+      "name": "chain3",
+      "payloadHex": "c001010a01195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa950209086170702f752f3432030f0dde8f5dc59e8c86af0ec711e525869d04050400ceeeb5400600050f11111111222233334444555555555555060a02001c010f7d6ad03e4c4689ffb70fd76a9004b52e0209077b2261223a317d001c010fb0fd9d6e748b82a6bfbfa20c931dce780209077b2261223a317d070f58327a691ad57c8a971c116c7a6d9689b4e59b8f0e22dfa330809023319a4f14090900",
+      "hash": "4172b17007db786ce09cdef3f3ece3e605480ef2cdb353c48a10e3215afd8ef6",
+      "parents": [
+        "195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa95"
+      ],
+      "namespace": "app/u/42",
+      "transactionId": "0dde8f5d-c59e-8c86-af0e-c711e525869d",
+      "timestampMicros": "1760000000000004",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "write",
+          "docId": "7d6ad03e-4c46-89ff-b70f-d76a9004b52e",
+          "json": "{\"a\":1}"
+        },
+        {
+          "kind": "write",
+          "docId": "b0fd9d6e-748b-82a6-bfbf-a20c931dce78",
+          "json": "{\"a\":1}"
+        }
+      ],
+      "treeHash": "58327a691ad57c8a971c116c7a6d9689b4e59b8f0e22dfa330809023319a4f14",
+      "message": ""
+    },
+    {
+      "name": "chain4",
+      "payloadHex": "b601010a014172b17007db786ce09cdef3f3ece3e605480ef2cdb353c48a10e3215afd8ef60209086170702f752f3432030f13c88c6067e484f79ce7697a8202772304050500ceeeb5400600050f11111111222233334444555555555555060a020112010fd1ea22b2cf4e896096c55489d51e8614001c010f9fd30184e56c82208daa1b3c050289c10209077b2261223a327d070f2b79d2055ed5ca98c458e6a653d9ec7fa87198e07f3161caa63ae53d616154c0090900",
+      "hash": "1808d02cac71800a640b1b8c0c8f7a571044f95638f944207f50bee8bcd5de3e",
+      "parents": [
+        "4172b17007db786ce09cdef3f3ece3e605480ef2cdb353c48a10e3215afd8ef6"
+      ],
+      "namespace": "app/u/42",
+      "transactionId": "13c88c60-67e4-84f7-9ce7-697a82027723",
+      "timestampMicros": "1760000000000005",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "delete",
+          "docId": "d1ea22b2-cf4e-8960-96c5-5489d51e8614"
+        },
+        {
+          "kind": "write",
+          "docId": "9fd30184-e56c-8220-8daa-1b3c050289c1",
+          "json": "{\"a\":2}"
+        }
+      ],
+      "treeHash": "2b79d2055ed5ca98c458e6a653d9ec7fa87198e07f3161caa63ae53d616154c0",
+      "message": ""
+    },
+    {
+      "name": "chain5",
+      "payloadHex": "d401010a01195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa950209086170702f752f3432030f98b980b11bc88d03b3bdbcdcb391c6dd04050600ceeeb5400600050f11111111222233334444555555555555060a03001c010fb0fd9d6e748b82a6bfbfa20c931dce780209077b2262223a317d001c010f74f7970b620b8ab681b31df25dfd7a4d0209077b2262223a317d0112010fb627dc39d3d381b8a1fe5769a9c587ed070fe3f1563a1743fcc8cf7bffe1a44bc25d073026bce2050390075bcc720b3bc6a8090900",
+      "hash": "0c9c0a9f8587a00a64615692aaa8ed7b6e51bf39438aaad1511d36b11888c3da",
+      "parents": [
+        "195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa95"
+      ],
+      "namespace": "app/u/42",
+      "transactionId": "98b980b1-1bc8-8d03-b3bd-bcdcb391c6dd",
+      "timestampMicros": "1760000000000006",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "write",
+          "docId": "b0fd9d6e-748b-82a6-bfbf-a20c931dce78",
+          "json": "{\"b\":1}"
+        },
+        {
+          "kind": "write",
+          "docId": "74f7970b-620b-8ab6-81b3-1df25dfd7a4d",
+          "json": "{\"b\":1}"
+        },
+        {
+          "kind": "delete",
+          "docId": "b627dc39-d3d3-81b8-a1fe-5769a9c587ed"
+        }
+      ],
+      "treeHash": "e3f1563a1743fcc8cf7bffe1a44bc25d073026bce2050390075bcc720b3bc6a8",
+      "message": ""
+    },
+    {
+      "name": "chain6",
+      "payloadHex": "ce02010a021808d02cac71800a640b1b8c0c8f7a571044f95638f944207f50bee8bcd5de3e0c9c0a9f8587a00a64615692aaa8ed7b6e51bf39438aaad1511d36b11888c3da0209086170702f752f3432030f0bf009b112128b689e5d4f1b88d2cbb304050700ceeeb5400600050f11111111222233334444555555555555060a060112010fb627dc39d3d381b8a1fe5769a9c587ed001c010fb0fd9d6e748b82a6bfbfa20c931dce780209077b2262223a317d001c010fd1ea22b2cf4e896096c55489d51e86140209077b2276223a337d001c010f7d6ad03e4c4689ffb70fd76a9004b52e0209077b2261223a317d001c010f9fd30184e56c82208daa1b3c050289c10209077b2261223a327d001c010f74f7970b620b8ab681b31df25dfd7a4d0209077b2262223a317d070f5052ead5cec741dd61522df65a4c7a0605ac4bf26a7880c273ac77a344661db9090900",
+      "hash": "600f111c7e50bae97793df9b96ea706c95c81e33e58fe097a1714bd693135529",
+      "parents": [
+        "1808d02cac71800a640b1b8c0c8f7a571044f95638f944207f50bee8bcd5de3e",
+        "0c9c0a9f8587a00a64615692aaa8ed7b6e51bf39438aaad1511d36b11888c3da"
+      ],
+      "namespace": "app/u/42",
+      "transactionId": "0bf009b1-1212-8b68-9e5d-4f1b88d2cbb3",
+      "timestampMicros": "1760000000000007",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "delete",
+          "docId": "b627dc39-d3d3-81b8-a1fe-5769a9c587ed"
+        },
+        {
+          "kind": "write",
+          "docId": "b0fd9d6e-748b-82a6-bfbf-a20c931dce78",
+          "json": "{\"b\":1}"
+        },
+        {
+          "kind": "write",
+          "docId": "d1ea22b2-cf4e-8960-96c5-5489d51e8614",
+          "json": "{\"v\":3}"
+        },
+        {
+          "kind": "write",
+          "docId": "7d6ad03e-4c46-89ff-b70f-d76a9004b52e",
+          "json": "{\"a\":1}"
+        },
+        {
+          "kind": "write",
+          "docId": "9fd30184-e56c-8220-8daa-1b3c050289c1",
+          "json": "{\"a\":2}"
+        },
+        {
+          "kind": "write",
+          "docId": "74f7970b-620b-8ab6-81b3-1df25dfd7a4d",
+          "json": "{\"b\":1}"
+        }
+      ],
+      "treeHash": "5052ead5cec741dd61522df65a4c7a0605ac4bf26a7880c273ac77a344661db9",
+      "message": ""
+    },
+    {
+      "name": "chain7",
+      "payloadHex": "ca01010a01600f111c7e50bae97793df9b96ea706c95c81e33e58fe097a1714bd6931355290209086170702f752f3432030f8d3cf226ea7989e68d62751c7ae8788a04050800ceeeb5400600050f11111111222233334444555555555555060a020026010f104a69c5abee8b16957388654c282c960209117b226166746572223a226d65726765227d001c010f7d6ad03e4c4689ffb70fd76a9004b52e0209077b2261223a397d070fbd1ab0cdca50252bf014b8892478515638ef2e699765ba3cafcfa11f1e1166fb090900",
+      "hash": "22b8e0ad95f015fd1fe9639d5920f2b7eccba12ba4fa342beaf03cfa72e8a9b9",
+      "parents": [
+        "600f111c7e50bae97793df9b96ea706c95c81e33e58fe097a1714bd693135529"
+      ],
+      "namespace": "app/u/42",
+      "transactionId": "8d3cf226-ea79-89e6-8d62-751c7ae8788a",
+      "timestampMicros": "1760000000000008",
+      "authorNodeId": "11111111-2222-3333-4444-555555555555",
+      "ops": [
+        {
+          "kind": "write",
+          "docId": "104a69c5-abee-8b16-9573-88654c282c96",
+          "json": "{\"after\":\"merge\"}"
+        },
+        {
+          "kind": "write",
+          "docId": "7d6ad03e-4c46-89ff-b70f-d76a9004b52e",
+          "json": "{\"a\":9}"
+        }
+      ],
+      "treeHash": "bd1ab0cdca50252bf014b8892478515638ef2e699765ba3cafcfa11f1e1166fb",
+      "message": ""
+    }
+  ],
+  "steps": [
+    {
+      "from": "",
+      "to": "39387d899ce336c18331b91f5135dc5126c624a40b974b313a968ed269ee73f7",
+      "commits": [
+        "39387d899ce336c18331b91f5135dc5126c624a40b974b313a968ed269ee73f7",
+        "f111963e2368ad286770123ab8ad64ee8c26f35e5de69f5c12abeaf1d3cd5bfa"
+      ],
+      "docs": {
+        "b0fd9d6e-748b-82a6-bfbf-a20c931dce78": "{\"v\":1}",
+        "b627dc39-d3d3-81b8-a1fe-5769a9c587ed": "{\"v\":2}"
+      }
+    },
+    {
+      "from": "39387d899ce336c18331b91f5135dc5126c624a40b974b313a968ed269ee73f7",
+      "to": "195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa95",
+      "commits": [
+        "195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa95"
+      ],
+      "docs": {
+        "b0fd9d6e-748b-82a6-bfbf-a20c931dce78": "{\"v\":1}",
+        "b627dc39-d3d3-81b8-a1fe-5769a9c587ed": "{\"v\":3}",
+        "d1ea22b2-cf4e-8960-96c5-5489d51e8614": "{\"v\":3}"
+      }
+    },
+    {
+      "from": "195a8a37665c0a67e7142123b9c0ab1a0f50e995848b9b2fb68a9adbd54baa95",
+      "to": "600f111c7e50bae97793df9b96ea706c95c81e33e58fe097a1714bd693135529",
+      "commits": [
+        "0c9c0a9f8587a00a64615692aaa8ed7b6e51bf39438aaad1511d36b11888c3da",
+        "600f111c7e50bae97793df9b96ea706c95c81e33e58fe097a1714bd693135529",
+        "4172b17007db786ce09cdef3f3ece3e605480ef2cdb353c48a10e3215afd8ef6",
+        "1808d02cac71800a640b1b8c0c8f7a571044f95638f944207f50bee8bcd5de3e"
+      ],
+      "docs": {
+        "74f7970b-620b-8ab6-81b3-1df25dfd7a4d": "{\"b\":1}",
+        "7d6ad03e-4c46-89ff-b70f-d76a9004b52e": "{\"a\":1}",
+        "9fd30184-e56c-8220-8daa-1b3c050289c1": "{\"a\":2}",
+        "b0fd9d6e-748b-82a6-bfbf-a20c931dce78": "{\"b\":1}",
+        "d1ea22b2-cf4e-8960-96c5-5489d51e8614": "{\"v\":3}"
+      }
+    },
+    {
+      "from": "600f111c7e50bae97793df9b96ea706c95c81e33e58fe097a1714bd693135529",
+      "to": "22b8e0ad95f015fd1fe9639d5920f2b7eccba12ba4fa342beaf03cfa72e8a9b9",
+      "commits": [
+        "22b8e0ad95f015fd1fe9639d5920f2b7eccba12ba4fa342beaf03cfa72e8a9b9"
+      ],
+      "docs": {
+        "104a69c5-abee-8b16-9573-88654c282c96": "{\"after\":\"merge\"}",
+        "74f7970b-620b-8ab6-81b3-1df25dfd7a4d": "{\"b\":1}",
+        "7d6ad03e-4c46-89ff-b70f-d76a9004b52e": "{\"a\":9}",
+        "9fd30184-e56c-8220-8daa-1b3c050289c1": "{\"a\":2}",
+        "b0fd9d6e-748b-82a6-bfbf-a20c931dce78": "{\"b\":1}",
+        "d1ea22b2-cf4e-8960-96c5-5489d51e8614": "{\"v\":3}"
+      }
+    }
+  ]
+}

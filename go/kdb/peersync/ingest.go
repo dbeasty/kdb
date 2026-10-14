@@ -2,7 +2,6 @@ package peersync
 
 import (
 	"bytes"
-	"container/heap"
 	"errors"
 	"fmt"
 	"time"
@@ -810,13 +809,16 @@ func commitsBetween(d *dag.InMemoryCommitDag, head, base codec.Hash) ([]document
 	if head == base {
 		return nil, nil
 	}
-	inRange := map[codec.Hash]document.Commit{}
+	// The range is collected as a slice and an index into it, not a map of commits: a catch-up's
+	// range is every commit it replays, and a map entry per commit (plus topoSort's own maps
+	// over it) was much of what a replay allocated per commit.
+	var inRange []document.Commit
+	index := map[codec.Hash]int32{}
 	belowBase := d.AncestorTest(base)
 	queue := []codec.Hash{head}
-	for len(queue) > 0 {
-		h := queue[0]
-		queue = queue[1:]
-		if _, seen := inRange[h]; seen {
+	for next := 0; next < len(queue); next++ {
+		h := queue[next]
+		if _, seen := index[h]; seen {
 			continue
 		}
 		if h == base || belowBase(h) {
@@ -834,10 +836,11 @@ func commitsBetween(d *dag.InMemoryCommitDag, head, base codec.Hash) ([]document
 			return nil, err
 		}
 		c.Operations = ops
-		inRange[h] = c
+		index[h] = int32(len(inRange))
+		inRange = append(inRange, c)
 		queue = append(queue, c.ParentHashes...)
 	}
-	return topoSort(inRange), nil
+	return topoSortIndexed(inRange, index), nil
 }
 
 // adoptable drops shallow roots from commits a head move is about to adopt. A shallow root - a
@@ -847,9 +850,24 @@ func commitsBetween(d *dag.InMemoryCommitDag, head, base codec.Hash) ([]document
 // again, checking them against a home's fence or announcing them to commit listeners as if main had
 // just taken them would all be wrong. The merge above such a root already carries every document
 // its parents disagree on.
+//
+// The result never shares spare capacity with commits, so appending to it cannot write into the
+// caller's slice; when nothing is dropped - every catch-up but one crossing a graft - it is commits
+// itself, capped, rather than a copy of every commit in the range.
 func adoptable(d *dag.InMemoryCommitDag, commits []document.Commit) []document.Commit {
-	out := commits[:0:0]
-	for _, c := range commits {
+	first := -1
+	for i := range commits {
+		if d.IsShallow(commits[i].Hash) {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return commits[:len(commits):len(commits)]
+	}
+	out := make([]document.Commit, first, len(commits)-1)
+	copy(out, commits[:first])
+	for _, c := range commits[first+1:] {
 		if !d.IsShallow(c.Hash) {
 			out = append(out, c)
 		}
@@ -860,54 +878,141 @@ func adoptable(d *dag.InMemoryCommitDag, commits []document.Commit) []document.C
 // topoSort orders commits parents first (Kahn's algorithm over edges inside the set), breaking
 // ties by hash so the order is identical on every node for the same set.
 func topoSort(set map[codec.Hash]document.Commit) []document.Commit {
-	pending := make(map[codec.Hash]int, len(set))
-	children := make(map[codec.Hash][]codec.Hash, len(set))
+	list := make([]document.Commit, 0, len(set))
+	index := make(map[codec.Hash]int32, len(set))
 	for h, c := range set {
-		n := 0
-		for _, p := range c.ParentHashes {
-			if _, ok := set[p]; ok {
-				n++
-				children[p] = append(children[p], h)
+		index[h] = int32(len(list))
+		list = append(list, c)
+	}
+	return topoSortIndexed(list, index)
+}
+
+// topoSortIndexed is topoSort over list, with index mapping each commit's hash to its position.
+// The order of list does not matter: ties are broken by hash. It sorts list in place and returns
+// it.
+func topoSortIndexed(list []document.Commit, index map[codec.Hash]int32) []document.Commit {
+	n := len(list)
+	if n == 0 {
+		return []document.Commit{}
+	}
+	// pending[i] counts list[i]'s parents inside the set (a parent named twice counts twice, and
+	// is released twice); children are laid out flat, list[i]'s at edges[start[i]:start[i+1]].
+	pending := make([]int32, n)
+	start := make([]int32, n+1)
+	for i := range list {
+		for _, p := range list[i].ParentHashes {
+			if j, ok := index[p]; ok {
+				pending[i]++
+				start[j+1]++
 			}
 		}
-		pending[h] = n
 	}
-	ready := &hashHeap{}
-	for h, n := range pending {
-		if n == 0 {
-			ready.hs = append(ready.hs, h)
+	for i := 0; i < n; i++ {
+		start[i+1] += start[i]
+	}
+	edges := make([]int32, start[n])
+	fill := append([]int32(nil), start[:n]...)
+	for i := range list {
+		for _, p := range list[i].ParentHashes {
+			if j, ok := index[p]; ok {
+				edges[fill[j]] = int32(i)
+				fill[j]++
+			}
 		}
 	}
-	heap.Init(ready)
-	out := make([]document.Commit, 0, len(set))
-	for ready.Len() > 0 {
-		h := heap.Pop(ready).(codec.Hash)
-		out = append(out, set[h])
-		for _, ch := range children[h] {
+	ready := commitHeap{list: list}
+	for i := range pending {
+		if pending[i] == 0 {
+			ready.push(int32(i))
+		}
+	}
+	order := make([]int32, 0, n) // order[k] is the position in list of the k-th commit out
+	for len(ready.idx) > 0 {
+		i := ready.pop()
+		order = append(order, i)
+		for _, ch := range edges[start[i]:start[i+1]] {
 			pending[ch]--
 			if pending[ch] == 0 {
-				heap.Push(ready, ch)
+				ready.push(ch)
 			}
 		}
 	}
-	return out
+	if len(order) < n {
+		// Commits left pending - only a cycle could do it, and content addressing rules cycles
+		// out - are dropped, as they always were. Copied out, since order is no permutation.
+		out := make([]document.Commit, len(order))
+		for k, i := range order {
+			out[k] = list[i]
+		}
+		return out
+	}
+	// The order is applied to list in place, cycle by cycle, rather than copied out: the commits
+	// are the bulk of what a long range holds.
+	moved := make([]bool, n)
+	for k := range order {
+		if moved[k] {
+			continue
+		}
+		held := list[k]
+		j := k
+		for {
+			moved[j] = true
+			src := int(order[j])
+			if src == k {
+				list[j] = held
+				break
+			}
+			list[j] = list[src]
+			j = src
+		}
+	}
+	return list
 }
 
-// hashHeap is a min-heap of hashes by their bytes - the order of their hex strings, which is
-// what topoSort breaks ties by. It replaced re-sorting the ready list, through two hex strings
-// per comparison, before every commit taken from it.
-type hashHeap struct{ hs []codec.Hash }
-
-func (h *hashHeap) Len() int { return len(h.hs) }
-func (h *hashHeap) Less(i, j int) bool {
-	return bytes.Compare(h.hs[i].Bytes[:], h.hs[j].Bytes[:]) < 0
+// commitHeap is a min-heap of positions in list, by their commits' hash bytes - the order of
+// their hex strings, which is what topoSort breaks ties by. Typed, rather than container/heap's,
+// so a push does not box its element.
+type commitHeap struct {
+	list []document.Commit
+	idx  []int32
 }
-func (h *hashHeap) Swap(i, j int) { h.hs[i], h.hs[j] = h.hs[j], h.hs[i] }
-func (h *hashHeap) Push(x any)    { h.hs = append(h.hs, x.(codec.Hash)) }
-func (h *hashHeap) Pop() any {
-	x := h.hs[len(h.hs)-1]
-	h.hs = h.hs[:len(h.hs)-1]
-	return x
+
+func (h *commitHeap) less(a, b int) bool {
+	return bytes.Compare(h.list[h.idx[a]].Hash.Bytes[:], h.list[h.idx[b]].Hash.Bytes[:]) < 0
+}
+
+func (h *commitHeap) push(i int32) {
+	h.idx = append(h.idx, i)
+	for c := len(h.idx) - 1; c > 0; {
+		p := (c - 1) / 2
+		if !h.less(c, p) {
+			break
+		}
+		h.idx[c], h.idx[p] = h.idx[p], h.idx[c]
+		c = p
+	}
+}
+
+func (h *commitHeap) pop() int32 {
+	top := h.idx[0]
+	last := len(h.idx) - 1
+	h.idx[0] = h.idx[last]
+	h.idx = h.idx[:last]
+	for p := 0; ; {
+		c := 2*p + 1
+		if c >= last {
+			break
+		}
+		if r := c + 1; r < last && h.less(r, c) {
+			c = r
+		}
+		if !h.less(c, p) {
+			break
+		}
+		h.idx[c], h.idx[p] = h.idx[p], h.idx[c]
+		p = c
+	}
+	return top
 }
 
 // netEffect folds commits (parents first) into one final operation per document, sorted by id.

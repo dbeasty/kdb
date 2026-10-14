@@ -70,8 +70,34 @@ func (c *Commit) ToCommitPayloadValue() codec.Value {
 }
 
 func (c *Commit) ToPayloadBytes() ([]byte, error) {
+	if b, ok := encodeCommitDirect(c); ok {
+		return b, nil
+	}
 	reg := WireRegistry()
 	return codec.EncodeBytes(c.ToCommitPayloadValue(), CommitPayloadType, reg)
+}
+
+// PayloadSize is the length of c's canonical payload bytes, or -1 if working it out takes an
+// encode (an operation type the direct codec does not know).
+func (c *Commit) PayloadSize() int {
+	body := commitBodyLen(c)
+	if body < 0 {
+		return -1
+	}
+	return lebLenOf(body) + body
+}
+
+// AppendPayloadBytes appends c's canonical payload bytes - ToPayloadBytes's - to dst, so a
+// caller laying many commits into one buffer does not allocate each one's bytes separately.
+func (c *Commit) AppendPayloadBytes(dst []byte) ([]byte, error) {
+	if body := commitBodyLen(c); body >= 0 {
+		return appendCommitPayload(dst, c, body), nil
+	}
+	b, err := c.ToPayloadBytes()
+	if err != nil {
+		return dst, err
+	}
+	return append(dst, b...), nil
 }
 
 // BuildCommit constructs a commit whose Hash is SHA-256 of canonical payload bytes.
@@ -104,29 +130,25 @@ func BuildCommitWithAttachments(
 	message string,
 	attachmentTreeHash *codec.Hash,
 ) (Commit, error) {
-	reg := WireRegistry()
-	payload := commitPayloadRecord(
-		parentHashes, namespaceID, transactionID, timestamp, authorNodeID,
-		operations, documentTreeHash, schemaHash, message, attachmentTreeHash,
-	)
-	bytes, err := codec.EncodeBytes(payload, CommitPayloadType, reg)
-	if err != nil {
-		return Commit{}, err
-	}
-	h, err := codec.HashFromBytes(SHA256Digest(bytes))
-	if err != nil {
-		return Commit{}, err
-	}
-	return Commit{
-		Hash: h, ParentHashes: parentHashes, NamespaceID: namespaceID,
+	c := Commit{
+		ParentHashes: parentHashes, NamespaceID: namespaceID,
 		TransactionID: transactionID, Timestamp: timestamp, AuthorNodeID: authorNodeID,
 		Operations: operations, DocumentTreeHash: documentTreeHash, SchemaHash: schemaHash,
 		Message: message, AttachmentTreeHash: attachmentTreeHash,
-	}, nil
+	}
+	h, err := ComputeCommitHash(c)
+	if err != nil {
+		return Commit{}, err
+	}
+	c.Hash = h
+	return c, nil
 }
 
 // FromPayloadBytes decodes a commit from canonical payload bytes.
 func FromPayloadBytes(bytes []byte) (Commit, error) {
+	if c, ok := decodeCommitDirect(bytes); ok {
+		return c, nil
+	}
 	reg := WireRegistry()
 	v, err := codec.DecodeBytes(bytes, CommitPayloadType, reg)
 	if err != nil {
@@ -230,6 +252,9 @@ func parseCommitFromRecord(rec codec.RecordValue, hash codec.Hash) (Commit, erro
 
 // ComputeCommitHash returns SHA-256 of canonical CommitPayload bytes.
 func ComputeCommitHash(c Commit) (codec.Hash, error) {
+	if h, ok := hashCommitDirect(&c); ok {
+		return h, nil
+	}
 	b, err := c.ToPayloadBytes()
 	if err != nil {
 		return codec.Hash{}, err

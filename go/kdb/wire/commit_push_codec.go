@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -10,13 +11,54 @@ import (
 
 // EncodeCommits serializes commits for CommitPush payloads.
 func EncodeCommits(commits []document.Commit) ([]byte, error) {
-	return EncodeCommitsWithPayloads(commits, nil)
+	return appendCommits(nil, commits, nil)
 }
 
 // EncodeCommitsWithPayloads is EncodeCommits taking known[i], when set, as commits[i]'s encoding
 // instead of encoding it again. The caller vouches that known[i] is commits[i].ToPayloadBytes() -
 // a payload whose SHA-256 is the commit's hash; the receiver checks that hash as for any commit.
 func EncodeCommitsWithPayloads(commits []document.Commit, known [][]byte) ([]byte, error) {
+	return appendCommits(nil, commits, known)
+}
+
+// appendCommits appends EncodeCommits's bytes to dst, taking known[i], when set, as commits[i]'s
+// encoding. Sized first, then each commit's payload is written straight into the one buffer: a
+// page used to cost an allocation per commit for bytes that were copied once and dropped.
+func appendCommits(dst []byte, commits []document.Commit, known [][]byte) ([]byte, error) {
+	total := 4
+	for i := range commits {
+		n := -1
+		if i < len(known) && known[i] != nil {
+			n = len(known[i])
+		} else {
+			n = commits[i].PayloadSize()
+		}
+		if n < 0 {
+			each, err := encodeCommitsEach(commits, known)
+			return append(dst, each...), err
+		}
+		total += 4 + n
+	}
+	out := slices.Grow(dst, total)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(commits)))
+	for i := range commits {
+		o := len(out)
+		out = append(out, 0, 0, 0, 0)
+		if i < len(known) && known[i] != nil {
+			out = append(out, known[i]...)
+		} else {
+			var err error
+			if out, err = commits[i].AppendPayloadBytes(out); err != nil {
+				return dst, err
+			}
+		}
+		binary.LittleEndian.PutUint32(out[o:], uint32(len(out)-o-4))
+	}
+	return out, nil
+}
+
+// encodeCommitsEach is appendCommits for a page with a commit PayloadSize cannot size.
+func encodeCommitsEach(commits []document.Commit, known [][]byte) ([]byte, error) {
 	payloads := make([][]byte, len(commits))
 	total := 4
 	for i, c := range commits {
@@ -45,7 +87,8 @@ func EncodeCommitsWithPayloads(commits []document.Commit, known [][]byte) ([]byt
 	return out, nil
 }
 
-// DecodeCommits deserializes commits from CommitPush payload bytes.
+// DecodeCommits deserializes commits from CommitPush payload bytes. The commits share no memory
+// with bytes, which the caller may reuse once it returns (decodeCommitsPayload pools it).
 func DecodeCommits(bytes []byte) ([]document.Commit, error) {
 	if len(bytes) < 4 {
 		return nil, nil

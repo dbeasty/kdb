@@ -344,15 +344,25 @@ func spreadAncestors(d *dag.InMemoryCommitDag, head codec.Hash) []codec.Hash {
 
 // pageTips returns the commits in page no other commit in page names as a parent.
 func pageTips(page []document.Commit) []codec.Hash {
-	parent := map[codec.Hash]bool{}
+	return tipsOf(page, namedParents(page))
+}
+
+// namedParents is the set of hashes the commits in page name as parents.
+func namedParents(page []document.Commit) map[codec.Hash]struct{} {
+	named := make(map[codec.Hash]struct{}, len(page))
 	for _, c := range page {
 		for _, p := range c.ParentHashes {
-			parent[p] = true
+			named[p] = struct{}{}
 		}
 	}
+	return named
+}
+
+// tipsOf is pageTips given page's namedParents.
+func tipsOf(page []document.Commit, named map[codec.Hash]struct{}) []codec.Hash {
 	var out []codec.Hash
 	for _, c := range page {
-		if !parent[c.Hash] {
+		if _, ok := named[c.Hash]; !ok {
 			out = append(out, c.Hash)
 		}
 	}

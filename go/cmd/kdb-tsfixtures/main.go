@@ -16,7 +16,8 @@
 //
 //	cd go && go run ./cmd/kdb-tsfixtures
 //
-// which rewrites ../packages/kdb-client/test/golden/*.json. Pass -out to write elsewhere.
+// which rewrites ../packages/kdb-client/test/golden/*.json and ../packages/kdb-replica/test/golden/*.json.
+// Pass -out and -replica-out to write elsewhere.
 package main
 
 import (
@@ -62,8 +63,16 @@ func main() {
 		filepath.Join("..", "packages", "kdb-client", "test", "golden"),
 		"directory to write the fixture files into",
 	)
+	replicaDir := flag.String(
+		"replica-out",
+		filepath.Join("..", "packages", "kdb-replica", "test", "golden"),
+		"directory to write @kdb/replica's fixture files into",
+	)
 	flag.Parse()
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fail(err)
+	}
+	if err := os.MkdirAll(*replicaDir, 0o755); err != nil {
 		fail(err)
 	}
 	dir := *outDir
@@ -73,7 +82,8 @@ func main() {
 	writeJSON(filepath.Join(dir, "binary-frames-2.json"), buildBinaryFrames2())
 	writeJSON(filepath.Join(dir, "hashes.json"), buildHashes())
 	writeJSON(filepath.Join(dir, "transactions.json"), buildTransactions())
-	fmt.Println("wrote fixtures to", dir)
+	writeReplicaFixtures(*replicaDir)
+	fmt.Println("wrote fixtures to", dir, "and", *replicaDir)
 }
 
 func buildFrames() []frameFixture {
