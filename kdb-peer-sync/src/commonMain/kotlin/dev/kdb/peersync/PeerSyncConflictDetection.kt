@@ -104,6 +104,12 @@ public class PeerSyncConflictException(
  * the first one off main. (That was WebSocketPeerSyncIntegrationTest's CI-only
  * wsPeerSyncBidirectionalGenuinelyConcurrent flake: the lock serialized the decisions, but not
  * the head each decision was made against.)
+ *
+ * [onFastForward], given the head main moved from, runs inside the lock too: a fast-forward that
+ * applies the adopted commits to live state only after the lock is released lets a concurrent
+ * divergent push auto-merge on top of the new head before that head's tree exists in [storage]
+ * ("missing parent tree"), and lets the two interleave in storage's shared per-namespace staging.
+ * (That was the same test's second CI-only failure, a RemotePeerException over v2's REF_UPDATE.)
  */
 public suspend fun resolveDivergence(
     dag: CommitDag,
@@ -111,6 +117,7 @@ public suspend fun resolveDivergence(
     namespaceId: String,
     incomingHead: KdbHash,
     conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
+    onFastForward: (suspend (from: KdbHash) -> Unit)? = null,
 ): CommitPushOutcome =
     // Serialized per namespace: this function reads the head, decides, and only then mutates
     // the DAG (setHead, or appendMergeCommit) across several non-atomic calls. Two concurrent
@@ -121,9 +128,21 @@ public suspend fun resolveDivergence(
     // mirrors KdbServerRuntime.commitMu on the Go side (go/kdb/server/server_runtime.go) - same
     // shape of bug, found independently while implementing this component's concurrent test
     // (§7 test 9).
-    divergenceLockFor(namespaceId).withLock {
-        resolveDivergenceLocked(dag, storage, namespaceId, dag.head(), incomingHead, conflictPolicy)
+    withDivergenceLock(namespaceId) {
+        val localHead = dag.head()
+        val outcome = resolveDivergenceLocked(dag, storage, namespaceId, localHead, incomingHead, conflictPolicy)
+        if (outcome == CommitPushOutcome.FastForwarded) onFastForward?.invoke(localHead)
+        outcome
     }
+
+/**
+ * Holds [namespaceId]'s divergence lock - not reentrant, so never around [resolveDivergence]. A
+ * host takes it to apply received commits to storage, whose staging a merge also uses.
+ */
+internal suspend fun <T> withDivergenceLock(
+    namespaceId: String,
+    block: suspend () -> T,
+): T = divergenceLockFor(namespaceId).withLock { block() }
 
 private val divergenceLocksGuard = Mutex()
 private val divergenceLocks = mutableMapOf<String, Mutex>()

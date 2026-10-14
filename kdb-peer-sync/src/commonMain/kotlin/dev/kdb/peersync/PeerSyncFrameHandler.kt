@@ -118,13 +118,17 @@ internal class PeerSyncFrameHandler(
         authorizePeerSync()
         // putCommit always stores, regardless of what happens to "main" below (component 39
         // spec §5: history must never be lost, only the branch-pointer decision is gated).
-        for (commit in msg.commits) {
-            if (dag.hasCommit(commit.hash)) continue
-            try {
-                dag.putCommit(commit, requireParents = true)
-                cfg.materializeCommit?.invoke(commit)
-            } catch (e: Exception) {
-                throw PeerSyncException("failed to apply commit ${commit.hash.toHex()}", e)
+        // Under the divergence lock: materializing stages into the same storage a concurrent
+        // push's auto-merge stages into.
+        withDivergenceLock(cfg.namespaceId) {
+            for (commit in msg.commits) {
+                if (dag.hasCommit(commit.hash)) continue
+                try {
+                    dag.putCommit(commit, requireParents = true)
+                    cfg.materializeCommit?.invoke(commit)
+                } catch (e: Exception) {
+                    throw PeerSyncException("failed to apply commit ${commit.hash.toHex()}", e)
+                }
             }
         }
         val incomingHead = msg.commits.lastOrNull()?.hash

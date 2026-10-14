@@ -348,4 +348,49 @@ class PeerSyncConflictDetectionTest {
             assertTrue(tree.contains(docIdA))
             assertTrue(tree.contains(docIdB))
         }
+
+    /**
+     * Regression for the same test's second CI-only failure (a RemotePeerException, PR #263's
+     * run): over v2, a REF_UPDATE that fast-forwards main applied the adopted commits to live
+     * state only *after* resolveDivergence released the namespace lock. A concurrent push that
+     * diverged then auto-merged on top of the new head before that head's tree was built, so
+     * storage.commitTree failed with "missing parent tree" and the host answered PEER_ERROR.
+     * [materializeCommit] yielding first forces that interleaving deterministically.
+     */
+    @Test
+    fun concurrentV2RefUpdates_fastForwardMaterializesBeforeAMergeBuildsOnIt() =
+        runTest {
+            val ns = "app/concurrent-ref-update"
+            val host = Side(inMemoryCommitDag(ns), InMemoryStorageAdapter())
+            val genesis = host.dag.head()
+            val docIdA = KdbUuid.random()
+            val docIdB = KdbUuid.random()
+            val commitA = writeDoc(Side(inMemoryCommitDag(ns), InMemoryStorageAdapter()), ns, genesis, docIdA, """{"v":"a"}""")
+            val commitB = writeDoc(Side(inMemoryCommitDag(ns), InMemoryStorageAdapter()), ns, genesis, docIdB, """{"v":"b"}""")
+            storeCommits(host.dag, listOf(commitA, commitB))
+            val hostNs =
+                PeerSyncNamespace(
+                    ns,
+                    host.dag,
+                    host.storage,
+                    materializeCommit = { commit ->
+                        yield()
+                        stageTree(host, ns, commit)
+                    },
+                )
+
+            val outcomes =
+                listOf(
+                    async { applyRef(hostNs, SyncV2.REF_BRANCH, MAIN_BRANCH, commitA.hash) },
+                    async { applyRef(hostNs, SyncV2.REF_BRANCH, MAIN_BRANCH, commitB.hash) },
+                ).awaitAll()
+
+            assertEquals(listOf(SyncV2.OUTCOME_FAST_FORWARDED, SyncV2.OUTCOME_MERGED), outcomes.map { it.outcome })
+            val head = host.dag.head()
+            assertTrue(host.dag.isAncestor(commitA.hash, head), "commitA dropped off main")
+            assertTrue(host.dag.isAncestor(commitB.hash, head), "commitB dropped off main")
+            val tree = host.dag.getDocumentTreeOrThrow(host.dag.getCommitOrThrow(head).documentTreeHash)
+            assertTrue(tree.contains(docIdA))
+            assertTrue(tree.contains(docIdB))
+        }
 }
