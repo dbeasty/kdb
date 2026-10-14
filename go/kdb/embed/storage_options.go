@@ -143,6 +143,10 @@ type StorageOptions struct {
 	// references yet (attachstore.Config.UploadGrace): the longest a client may take between
 	// uploading an attachment and committing it. Zero uses the default, one hour.
 	AttachmentUploadGrace time.Duration
+	// AttachmentDeltaStepBytes bounds the work one maintenance pass spends diffing replaced
+	// attachment versions into deltas (attachstore.Config.DeltaStepBytes); a larger version is
+	// diffed over several passes. Zero uses the default, 4 GiB.
+	AttachmentDeltaStepBytes int64
 
 	// CloseCompactionBytes bounds the SSTable merge closing the namespace may do: close merges
 	// the tables only when they hold at most this many bytes, and otherwise leaves them to the

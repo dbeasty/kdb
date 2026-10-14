@@ -128,7 +128,8 @@ func (rt *EmbeddedKdbRuntime) SetAttachmentHistory(h AttachmentHistory) {
 }
 
 // SetAttachmentConfig tunes the attachment store (size limit, chunking, deltas, upload grace). It
-// replaces the whole configuration, StorageOptions.AttachmentUploadGrace included. Takes effect for
+// replaces the whole configuration, StorageOptions.AttachmentUploadGrace and
+// AttachmentDeltaStepBytes included. Takes effect for
 // stores opened afterwards.
 func (rt *EmbeddedKdbRuntime) SetAttachmentConfig(cfg attachstore.Config) {
 	rt.attach.mu.Lock()
@@ -522,6 +523,9 @@ func (rt *EmbeddedKdbRuntime) referencedAttachmentHashes(namespaceID string, wan
 type AttachmentMaintenance struct {
 	Deltas  int // replaced versions re-stored as deltas
 	Removed int // blobs deleted
+	// DeltaPending: the pass spent its delta budget (attachstore.Config.DeltaStepBytes) before
+	// the replaced versions were all done; the next pass goes on where this one stopped.
+	DeltaPending bool
 }
 
 // CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll) and deletes the
@@ -585,7 +589,7 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		return out, err
 	}
 	deltaErr := rt.deltaReplaced(d, store, keep, changes, &out)
-	if deltaErr == nil && len(changes) > 0 {
+	if deltaErr == nil && len(changes) > 0 && !out.DeltaPending {
 		deltaErr = store.SetMark(heads)
 	}
 	out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
@@ -597,8 +601,12 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 
 // deltaReplaced re-stores, for each put in changes, the version it replaced in its commit's first
 // parent as a delta against it, when both are kept. A version gone missing or corrupt is left
-// alone; any other failure stops the pass, so the mark is not moved past work not done.
+// alone; any other failure stops the pass, so the mark is not moved past work not done. So does
+// spending the pass's budget (attachstore.Config.DeltaStepBytes): the delta in progress carries
+// over, and the next pass, finding the same changes, finishes it - a multi-GB version is diffed
+// over several passes, none of them long.
 func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *attachstore.Store, keep map[codec.Hash]bool, changes []attachmentChange, out *AttachmentMaintenance) error {
+	budget := store.Config().DeltaStepBytes
 	for _, ch := range changes {
 		if len(ch.commit.ParentHashes) == 0 {
 			continue
@@ -612,15 +620,24 @@ func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *att
 			if !ok || prev.ContentHash == put.ContentHash || !keep[prev.ContentHash] || !keep[put.ContentHash] {
 				continue
 			}
-			did, err := store.StoreAsDelta(prev.ContentHash, put.ContentHash)
+			if budget <= 0 {
+				out.DeltaPending = true
+				return nil
+			}
+			did, used, err := store.DeltaStep(prev.ContentHash, put.ContentHash, budget)
+			budget -= used
 			if errors.Is(err, attachstore.ErrNotFound) || errors.Is(err, attachstore.ErrCorrupt) {
 				continue
 			}
 			if err != nil {
 				return err
 			}
-			if did {
+			switch did {
+			case attachstore.DeltaStored:
 				out.Deltas++
+			case attachstore.DeltaPending:
+				out.DeltaPending = true
+				return nil
 			}
 		}
 	}
