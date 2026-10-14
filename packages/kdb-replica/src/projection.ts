@@ -18,12 +18,16 @@
  *   write, as the source will hold it once the entries ahead of it are applied.
  * - A document with a write still in the outbox keeps its local state against incoming pages,
  *   until the source decides. A conflicting or refused write puts the source's state back.
+ * - A write may change a document's attachments: the entry then carries the document's whole set
+ *   after it, and the hash of the set it replaced (the source applies it only if it still holds
+ *   that set). An attachment-only write keeps the body (keepBody) and is still guarded by its
+ *   base hash. The blobs are uploaded before the entry is sent (sync.ts).
  */
 
 import { fromUtf8, toHex, utf8 } from "./bytes.ts";
 import { contentHash } from "./commit.ts";
 import { sha256 } from "./sha256.ts";
-import { decodeAttachmentSet, encodeAttachmentSet, sortAttachments, type Attachment } from "./attachments.ts";
+import { decodeAttachmentSet, encodeAttachmentSet, setHash, sortAttachments, type Attachment } from "./attachments.ts";
 import { prefixEnd, type Batch, type KvStore } from "./store.ts";
 
 /** The local name Go gives a projection (peersync.ProjectionNamespace). */
@@ -31,11 +35,49 @@ export function projectionNamespace(ns: string, filter: string): string {
   return `${ns}.projection-${toHex(sha256(utf8(filter.trim()))).slice(0, 8)}`;
 }
 
+/** An attachment as PROJECT_WRITE, PROJECT_PAGE and TREE_NODES list it. */
+export interface WireAttachment {
+  id: string;
+  name: string;
+  hash: string;
+  size: number;
+  mime?: string;
+}
+
 export interface WriteBackDoc {
   docId: string;
   body?: string;
   deleted?: boolean;
   baseHash?: string;
+  /** The write left the body alone: only the attachments changed. */
+  keepBody?: boolean;
+  /** attachments is the document's whole set after the write; attachmentsBase the set it replaced. */
+  attachmentsChanged?: boolean;
+  attachments?: WireAttachment[];
+  attachmentsBase?: string;
+}
+
+/** One document of a local write: json null deletes it, undefined keeps its body; attachments, when
+ * given, is its whole attachment set after the write. */
+export interface LocalWrite {
+  docId: string;
+  json?: string | null;
+  attachments?: Attachment[];
+}
+
+export function toWireAttachments(set: readonly Attachment[]): WireAttachment[] {
+  return set.map((a) => ({ id: a.id, name: a.name, hash: a.contentHash, size: Number(a.size), mime: a.mime }));
+}
+
+export function fromWireAttachments(items: readonly WireAttachment[] | undefined): Attachment[] {
+  return sortAttachments((items ?? []).map((a) => ({
+    id: a.id.toLowerCase(), name: a.name, scheme: 1, contentHash: a.hash.toLowerCase(), size: BigInt(a.size), mime: a.mime ?? "",
+  })));
+}
+
+/** The hash a write-back names a document's attachment set by: "" for none. */
+function baseSetHash(set: readonly Attachment[]): string {
+  return set.length === 0 ? "" : setHash(sortAttachments([...set]));
 }
 
 export interface OutboxEntry {
@@ -63,7 +105,7 @@ export interface ProjectPage {
   next: string;
   done: boolean;
   /** Every written document's whole attachment set at atHex; a written document absent has none. */
-  attachments?: Record<string, { id: string; name: string; hash: string; size: number; mime?: string }[]>;
+  attachments?: Record<string, WireAttachment[]>;
 }
 
 export class ReadOnlyProjectionError extends Error {
@@ -173,7 +215,7 @@ export class ProjectionNamespace {
   }
 
   /** Writes locally and queues the write for the source, as one transaction. */
-  write(docs: { docId: string; json: string | null }[], txId: string): Promise<OutboxEntry> {
+  write(docs: LocalWrite[], txId: string): Promise<OutboxEntry> {
     return this.#lock.run(async () => {
       if (!this.#meta.writeBack) {
         throw new ReadOnlyProjectionError(`kdb replica: ${this.name} is filtered without write-back, so it is read-only here`);
@@ -183,18 +225,34 @@ export class ProjectionNamespace {
       const counts = new Map<string, number>();
       // A document written twice in one call: the second write's base is the first's result.
       const staged = new Map<string, string | null>();
+      const stagedSets = new Map<string, Attachment[]>();
       for (const d of docs) {
         const id = d.docId.toLowerCase();
         const before = staged.has(id) ? (staged.get(id) ?? undefined) : await this.get(id);
-        staged.set(id, d.json);
+        const json = d.json === undefined ? (before ?? null) : d.json;
+        staged.set(id, json);
         const wb: WriteBackDoc = { docId: id };
         if (before !== undefined) wb.baseHash = contentHash(id, before);
-        if (d.json === null) {
+        if (d.json === undefined) {
+          if (before === undefined) throw new Error(`kdb replica: ${this.name}/${id} is not here to attach to`);
+          wb.keepBody = true;
+        } else if (d.json === null) {
           wb.deleted = true;
           batch.set(this.#docKey(id), null);
+          batch.set(this.#attachKey(id), null); // a deleted document keeps no attachments
+          stagedSets.set(id, []);
         } else {
           wb.body = d.json;
           batch.set(this.#docKey(id), utf8(d.json));
+        }
+        if (d.attachments !== undefined && d.json !== null) {
+          const prev = stagedSets.get(id) ?? (await this.attachments(id));
+          const next = sortAttachments([...d.attachments]);
+          wb.attachmentsChanged = true;
+          wb.attachments = toWireAttachments(next);
+          wb.attachmentsBase = baseSetHash(prev);
+          stagedSets.set(id, next);
+          batch.set(this.#attachKey(id), next.length > 0 ? encodeAttachmentSet(next) : null);
         }
         entry.docs.push(wb);
         counts.set(id, (counts.get(id) ?? (await this.#pendingCount(id))) + 1);
@@ -220,7 +278,7 @@ export class ProjectionNamespace {
    * Records the source's decision on entry. Applied: the entry leaves the outbox. Not applied:
    * its documents go back to the source's state (current), and the entry leaves the outbox.
    */
-  resolve(entry: OutboxEntry, current: { docId: string; body?: string; absent?: boolean }[] | null): Promise<void> {
+  resolve(entry: OutboxEntry, current: { docId: string; body?: string; absent?: boolean; attachments?: WireAttachment[] }[] | null): Promise<void> {
     return this.#lock.run(async () => {
       const batch: Batch = new Map([[this.#outboxKey(entry.seq), null]]);
       for (const d of entry.docs) {
@@ -228,7 +286,11 @@ export class ProjectionNamespace {
         batch.set(this.#pendingKey(d.docId), n > 0 ? utf8(String(n)) : null);
       }
       for (const c of current ?? []) {
-        batch.set(this.#docKey(c.docId), c.absent || c.body === undefined ? null : utf8(c.body));
+        const gone = c.absent || c.body === undefined;
+        batch.set(this.#docKey(c.docId), gone ? null : utf8(c.body!));
+        // The source's attachments go back with its body (bytes fetched on read).
+        const set = gone ? [] : fromWireAttachments(c.attachments);
+        batch.set(this.#attachKey(c.docId), set.length > 0 ? encodeAttachmentSet(set) : null);
       }
       await this.#commit(batch, this.#meta);
     });
@@ -253,10 +315,8 @@ export class ProjectionNamespace {
         if ((await this.get(id)) !== w.body) changed.push(id);
         batch.set(this.#docKey(id), utf8(w.body));
         // Every written document comes with its whole attachment set; absent means none.
-        const set: Attachment[] = (listed.get(id) ?? []).map((a) => ({
-          id: a.id.toLowerCase(), name: a.name, scheme: 1, contentHash: a.hash, size: BigInt(a.size), mime: a.mime ?? "",
-        }));
-        batch.set(this.#attachKey(id), set.length > 0 ? encodeAttachmentSet(sortAttachments(set)) : null);
+        const set = fromWireAttachments(listed.get(id));
+        batch.set(this.#attachKey(id), set.length > 0 ? encodeAttachmentSet(set) : null);
       }
       for (const raw of page.deletes) {
         const id = raw.toLowerCase();

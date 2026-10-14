@@ -210,4 +210,65 @@ describe("filtered replica against a Go node", { skip }, () => {
     assert.equal(await wb.get(ns, id), `{"region":"EU","v":1}`, "the source's state is back");
     assert.equal(wb.status().namespaces[ns]!.pending, 0);
   });
+
+  // --- attachment write-back (docs/kdb-attachments-plan.md) -------------------------------------
+
+  async function hostAttachments(ns: string, id: string): Promise<{ id: string; name: string; hash: string; size: number }[]> {
+    return (await host.cmd({ op: "attachments", ns, id })).attachments as { id: string; name: string; hash: string; size: number }[];
+  }
+
+  test("attachments written on a write-back replica reach the source, bytes and all", async () => {
+    const ns = "shop/attach-wb";
+    const id = randomUuid();
+    await host.put(ns, id, { region: "EU", n: 1 });
+    const r = await filtered(ns);
+    await r.syncNow();
+    const big = new Uint8Array(3 * 1024 * 1024 + 11).map((_, i) => (i * 7) & 0xff); // several chunks
+    await r.putAttachment(ns, id, "scan.bin", big);
+    await r.putAttachment(ns, id, "note.txt", new TextEncoder().encode("hello"), "text/plain");
+    assert.equal(r.status().namespaces[ns]!.pending, 2);
+    assert.deepEqual((await r.readAttachment(ns, id, { name: "scan.bin" })).length, big.length, "readable locally at once");
+    await r.syncNow();
+    assert.equal(r.lastProjectionResults[0]!.applied, 2);
+    const atHost = await hostAttachments(ns, id);
+    assert.deepEqual(atHost.map((a) => a.name).sort(), ["note.txt", "scan.bin"]);
+    assert.equal(atHost.find((a) => a.name === "scan.bin")!.size, big.length);
+
+    // A fresh replica reads the bytes back from the source.
+    const other = await filtered(ns, { writeBack: false });
+    await other.syncNow();
+    assert.deepEqual(await other.readAttachment(ns, id, { name: "scan.bin" }), big);
+
+    // A JSON-only write-back leaves the document's attachments alone at the source.
+    await r.put(ns, id, { region: "EU", n: 2 });
+    await r.syncNow();
+    assert.equal((await host.docs(ns))[id], `{"region":"EU","n":2}`);
+    assert.equal((await hostAttachments(ns, id)).length, 2, "a body write-back must not drop attachments");
+
+    // Rename and delete go back too; an attachment-only change at the source comes down.
+    await r.deleteAttachment(ns, id, { name: "note.txt" });
+    await r.syncNow();
+    assert.deepEqual((await hostAttachments(ns, id)).map((a) => a.name), ["scan.bin"]);
+    await host.cmd({ op: "attach", ns, id, name: "from-host.txt", mime: "text/plain", text: "from the host" });
+    await r.syncNow();
+    assert.deepEqual((await r.attachments(ns, id)).map((a) => a.name).sort(), ["from-host.txt", "scan.bin"]);
+    assert.equal(new TextDecoder().decode(await r.readAttachment(ns, id, { name: "from-host.txt" })), "from the host");
+  });
+
+  test("an attachment write the source changed meanwhile is a conflict: the source's attachments come back", async () => {
+    const ns = "shop/attach-conflict";
+    const id = randomUuid();
+    await host.put(ns, id, { region: "EU" });
+    const r = await filtered(ns);
+    await r.syncNow();
+    const events: ConflictEvent[] = [];
+    r.on("conflict", (e) => events.push(e));
+    await r.putAttachment(ns, id, "mine.txt", new TextEncoder().encode("replica"));
+    await host.cmd({ op: "attach", ns, id, name: "theirs.txt", mime: "text/plain", text: "host" });
+    await r.syncNow();
+    assert.equal(events[0]?.outcome, "conflict");
+    assert.deepEqual((await r.attachments(ns, id)).map((a) => a.name), ["theirs.txt"]);
+    assert.equal(new TextDecoder().decode(await r.readAttachment(ns, id, { name: "theirs.txt" })), "host");
+    assert.deepEqual((await hostAttachments(ns, id)).map((a) => a.name), ["theirs.txt"]);
+  });
 });
