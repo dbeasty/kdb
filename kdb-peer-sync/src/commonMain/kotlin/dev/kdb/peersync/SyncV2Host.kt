@@ -76,6 +76,7 @@ internal class SyncV2HostSession(
                 is SyncV2Message.RefsRequest -> SyncV2Message.RefsResult(msg.correlationId, msg.namespaces.map { refs(it) })
                 is SyncV2Message.FetchRequest -> fetch(msg)
                 is SyncV2Message.RefUpdate -> refUpdate(msg)
+                is SyncV2Message.SnapshotFetch -> snapshotPage(msg)
                 else -> throw UnsupportedFrameException(frameName(msg))
             }
         return SyncV2Codec.encode(reply)
@@ -127,11 +128,16 @@ internal class SyncV2HostSession(
         peerAttachments = SyncV2.CAP_ATTACHMENTS in caps
         return SyncV2Message.HelloAck(
             m.correlationId, accepted = true, nodeId = nodeId, protocol = SyncV2.PROTOCOL, capabilities = caps,
-            refs = if (granted) listOf(refsOf(ns.namespaceId, ns.dag)) else emptyList(),
+            refs = if (granted) listOf(localRefs()) else emptyList(),
         )
     }
 
-    private fun capabilities(): List<String> = if (ns.blobs == null) SyncV2.CAPABILITIES - SyncV2.CAP_ATTACHMENTS else SyncV2.CAPABILITIES
+    private fun capabilities(): List<String> =
+        SyncV2.CAPABILITIES.filter {
+            (it != SyncV2.CAP_ATTACHMENTS || ns.blobs != null) && (it != SyncV2.CAP_SNAPSHOT || ns.snapshots != null)
+        }
+
+    private suspend fun localRefs(): NamespaceRefs = refsOf(ns.namespaceId, ns.dag, ns.snapshots?.shallowRoots().orEmpty())
 
     /** Re-authorizes on every frame, so a grant revoked mid-session takes effect at once. */
     private suspend fun authorize(namespace: String) {
@@ -141,7 +147,7 @@ internal class SyncV2HostSession(
 
     private suspend fun refs(namespace: String): NamespaceRefs {
         authorize(namespace)
-        return refsOf(ns.namespaceId, ns.dag)
+        return localRefs()
     }
 
     /**
@@ -228,6 +234,51 @@ internal class SyncV2HostSession(
         if (m.more) return ack
         val res = applyRef(ns, m.kind, m.ref, KdbHash.fromHex(m.newHex))
         return ack.copy(outcome = res.outcome, headHex = res.head.toHex(), conflictBytes = res.conflict?.let(::encodeConflictReport))
+    }
+
+    /**
+     * One page of this node's state at main's head, documents in id order after [m]'s cursor (Go's
+     * snapshotPage). Only the head: the documents are read from live storage, and a peer asks for
+     * the head it was just told of. The last page carries the head's attachment table.
+     */
+    private suspend fun snapshotPage(m: SyncV2Message.SnapshotFetch): SyncV2Message.SnapshotPage {
+        authorize(m.namespace)
+        val snapshots = ns.snapshots ?: throw UnsupportedFrameException("SNAPSHOT_FETCH")
+        val head = ns.dag.head()
+        if (m.atHex.isNotEmpty() && m.atHex != head.toHex()) {
+            throw RemotePeerException(PeerErrorCodes.NOT_FOUND, "this node serves a snapshot of its head ${head.toHex()} only, not ${m.atHex}")
+        }
+        val commit = ns.dag.getCommitOrThrow(head)
+        if (!peerAttachments && commit.attachmentTreeHash != null) throw AttachmentsUnsupportedException(m.namespace, commit.hash.toHex())
+        val tree = snapshots.headTree(commit)
+        // Canonical lowercase ids sort as their bytes do, which is the order a cursor names.
+        val ids = tree.entries.keys.map { it to it.toString() }.sortedBy { it.second }.filter { it.second > m.after }
+        val budget = if (m.maxBytes <= 0) DEFAULT_PAGE_BYTES else m.maxBytes
+        val docs = ArrayList<SnapshotDoc>()
+        var size = 0
+        var i = 0
+        while (i < ids.size) {
+            val chunk = ids.subList(i, minOf(ids.size, i + 128))
+            val bodies = snapshots.documentsAtHead(chunk.map { it.first })
+            var stop = false
+            for ((j, d) in bodies.withIndex()) {
+                val id = chunk[j]
+                val body = d?.json ?: throw PeerSyncException("peer sync: document ${id.second} of ${head.toHex()} has no body here")
+                if (docs.isNotEmpty() && size + body.length > budget) {
+                    stop = true
+                    break
+                }
+                size += body.length + 64
+                docs += SnapshotDoc(id.second, body)
+            }
+            if (stop) break
+            i += chunk.size
+        }
+        val done = docs.size == ids.size
+        val tables = if (done && commit.attachmentTreeHash != null) ns.dag.packAttachmentTables(listOf(head)) else null
+        return SyncV2Message.SnapshotPage(
+            m.correlationId, m.namespace, commit, docs, if (done) "" else docs.last().docId, done, tree.size, tables,
+        )
     }
 
     /** Aborts unfinished uploads. The connection's owner calls it when the connection ends. */

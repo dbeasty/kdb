@@ -48,6 +48,8 @@ public object SyncV2 {
     public const val PACK_PAGE: Int = 0x2b
     public const val REF_UPDATE: Int = 0x2c
     public const val REF_UPDATE_ACK: Int = 0x2d
+    public const val SNAPSHOT_FETCH: Int = 0x2e
+    public const val SNAPSHOT_PAGE: Int = 0x2f
 
     // Capabilities (go/kdb/wire SyncCap*). A Kotlin node advertises only what it implements: the
     // session uses the intersection, so a Go peer never sends it snapshot, graft, squash, filter or
@@ -57,9 +59,13 @@ public object SyncV2 {
     public const val CAP_ZSTD_PACK: String = "zstd-pack"
     public const val CAP_ATTACHMENTS: String = "attachments"
 
+    /** SNAPSHOT_FETCH/PAGE: a fresh node bootstraps from a peer's state at a commit instead of its
+     * history - which a peer holding a shallow root or a retention floor cannot send. */
+    public const val CAP_SNAPSHOT: String = "snapshot"
+
     /** What this build's v2 host and client do. Not "stubs": neither side stores an archived
      * parent sent in place of its commit, and a page carrying one is refused. */
-    public val CAPABILITIES: List<String> = listOf(CAP_BRANCHES, CAP_TAGS, CAP_ZSTD_PACK, CAP_ATTACHMENTS)
+    public val CAPABILITIES: List<String> = listOf(CAP_BRANCHES, CAP_TAGS, CAP_SNAPSHOT, CAP_ZSTD_PACK, CAP_ATTACHMENTS)
 
     public const val ACCESS_PULL: String = "pull"
     public const val ACCESS_PUSH: String = "push"
@@ -75,7 +81,7 @@ public object SyncV2 {
     public const val OUTCOME_CONFLICT: String = "conflict"
 
     /** Whether [code] is a v2 sync frame this module frames itself. */
-    public fun isSyncFrame(code: Int): Boolean = code in PEER_ERROR..REF_UPDATE_ACK
+    public fun isSyncFrame(code: Int): Boolean = code in PEER_ERROR..SNAPSHOT_PAGE
 }
 
 /** Go's wire.ErrorCode values a peer sends in PEER_ERROR and in per-entry blob errors. */
@@ -183,6 +189,36 @@ public sealed class SyncV2Message {
         val zstd: Boolean = false,
     ) : SyncV2Message()
 
+    /** One page of a peer's state at a commit, in document-id order after [after] (Go's
+     * SnapshotFetchMessage). [atHex] empty: the host's main head, which the page names. */
+    public data class SnapshotFetch(
+        override val correlationId: Int,
+        val namespace: String,
+        val atHex: String = "",
+        val after: String = "",
+        val maxBytes: Int = 0,
+    ) : SyncV2Message()
+
+    /** Answers SNAPSHOT_FETCH. [commit] is on every page; the last ([done]) carries the commit's
+     * packed attachment table when it has one (Go's SnapshotPageMessage). */
+    public data class SnapshotPage(
+        override val correlationId: Int,
+        val namespace: String,
+        val commit: KdbCommit,
+        val docs: List<SnapshotDoc>,
+        val next: String = "",
+        val done: Boolean,
+        val total: Int,
+        val attachmentTables: ByteArray? = null,
+    ) : SyncV2Message() {
+        override fun equals(other: Any?): Boolean =
+            other is SnapshotPage && correlationId == other.correlationId && namespace == other.namespace &&
+                commit == other.commit && docs == other.docs && next == other.next && done == other.done &&
+                total == other.total && (attachmentTables?.contentEquals(other.attachmentTables ?: ByteArray(0)) ?: (other.attachmentTables == null))
+
+        override fun hashCode(): Int = listOf(correlationId, namespace, commit.hash, docs, next, done, total).hashCode()
+    }
+
     public data class RefUpdateAck(
         override val correlationId: Int,
         val namespace: String,
@@ -202,6 +238,12 @@ public sealed class SyncV2Message {
         override fun hashCode(): Int = listOf(correlationId, namespace, kind, ref, outcome, headHex, stored).hashCode()
     }
 }
+
+/** One document of a snapshot page. */
+public data class SnapshotDoc(
+    val docId: String,
+    val body: String,
+)
 
 /** A frame this module could not read: the connection is dropped, as Go does. */
 public class SyncV2DecodeException(message: String) : PeerSyncException(message)
@@ -306,6 +348,41 @@ public object SyncV2Codec {
                             if (msg.zstd) put("commitsZstd", true)
                         },
                     )
+                is SyncV2Message.SnapshotFetch ->
+                    Triple(
+                        SyncV2.SNAPSHOT_FETCH,
+                        "snapshotFetch",
+                        buildJsonObject {
+                            put("namespace", msg.namespace)
+                            if (msg.atHex.isNotEmpty()) put("atHex", msg.atHex)
+                            if (msg.after.isNotEmpty()) put("after", msg.after)
+                            if (msg.maxBytes != 0) put("maxBytes", msg.maxBytes)
+                        },
+                    )
+                is SyncV2Message.SnapshotPage ->
+                    Triple(
+                        SyncV2.SNAPSHOT_PAGE,
+                        "snapshotPage",
+                        buildJsonObject {
+                            put("namespace", msg.namespace)
+                            put("commitPayload", toBase64(CommitPushCodec.encodeCommits(listOf(msg.commit))))
+                            put(
+                                "docs",
+                                JsonArray(
+                                    msg.docs.map {
+                                        buildJsonObject {
+                                            put("id", it.docId)
+                                            put("body", it.body)
+                                        }
+                                    },
+                                ),
+                            )
+                            if (msg.next.isNotEmpty()) put("next", msg.next)
+                            put("done", msg.done)
+                            put("total", msg.total)
+                            msg.attachmentTables?.takeIf { it.isNotEmpty() }?.let { put("attachmentTables", toBase64(it)) }
+                        },
+                    )
                 is SyncV2Message.RefUpdateAck ->
                     Triple(
                         SyncV2.REF_UPDATE_ACK,
@@ -364,6 +441,8 @@ public object SyncV2Codec {
                 "packPage" -> SyncV2.PACK_PAGE
                 "refUpdate" -> SyncV2.REF_UPDATE
                 "refUpdateAck" -> SyncV2.REF_UPDATE_ACK
+                "snapshotFetch" -> SyncV2.SNAPSHOT_FETCH
+                "snapshotPage" -> SyncV2.SNAPSHOT_PAGE
                 else -> throw SyncV2DecodeException("peer sync: unknown v2 message kind '$kind'")
             }
         if (expected != code) throw SyncV2DecodeException("peer sync: frame type 0x${code.toString(16)} carries '$kind'")
@@ -398,6 +477,15 @@ public object SyncV2Codec {
                         commitsFrom(fromBase64(b.strOrNull("commitsPayload")), b.bool("commitsZstd")), stubsFrom(b),
                         b.bool("more"), b.bool("commitsZstd"),
                     )
+                "snapshotFetch" -> SyncV2Message.SnapshotFetch(cid, b.str("namespace"), b.str("atHex"), b.str("after"), b.int("maxBytes"))
+                "snapshotPage" -> {
+                    val commits = CommitPushCodec.decodeCommits(fromBase64(b.strOrNull("commitPayload")))
+                    if (commits.size != 1) throw SyncV2DecodeException("peer sync: snapshotPage must carry exactly one commit")
+                    SyncV2Message.SnapshotPage(
+                        cid, b.str("namespace"), commits[0], b.objects("docs").map { SnapshotDoc(it.str("id"), it.str("body")) },
+                        b.str("next"), b.bool("done"), b.int("total"), b.strOrNull("attachmentTables")?.let(::fromBase64),
+                    )
+                }
                 else ->
                     SyncV2Message.RefUpdateAck(
                         cid, b.str("namespace"), b.str("kind"), b.str("ref"), b.str("outcome"), b.str("headHex"),

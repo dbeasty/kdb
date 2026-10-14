@@ -23,6 +23,7 @@ import dev.kdb.embed.PutAttachmentOptions
 import dev.kdb.embed.getAttachment
 import dev.kdb.embed.listAttachments
 import dev.kdb.embed.peerBlobStore
+import dev.kdb.embed.peerSnapshots
 import dev.kdb.embed.putAttachment
 import dev.kdb.transport.tcp.defaultTcpWireTransport
 import dev.kdb.wire.defaultWireCodec
@@ -309,6 +310,9 @@ internal object CliCommands {
                 PeerClientConfig(
                     session.namespaceId, session.config.nodeId, peerUri,
                     blobs = session.runtime.embedded.peerBlobStore(session.namespaceId),
+                    // A fresh namespace whose peer cannot send its history (a shallow root, a
+                    // retention floor) bootstraps from the peer's state, durably.
+                    snapshots = session.runtime.embedded.peerSnapshots(session.namespaceId),
                 ),
             )
         val result = peerSession.syncBidirectional()

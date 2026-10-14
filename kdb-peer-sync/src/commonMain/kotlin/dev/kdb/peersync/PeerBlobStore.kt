@@ -53,3 +53,31 @@ public class PeerBlobCorruptException(
     message: String,
     cause: Throwable? = null,
 ) : PeerSyncException(message, cause)
+
+/**
+ * Snapshot bootstrap for one namespace (go/kdb/peersync/snapshot.go): a fresh node takes a peer's
+ * state at a commit instead of its history, and a node serves its own state at its head. kdb-embed
+ * implements it over the runtime (installSnapshot, which a file runtime makes durable as Go's
+ * PersistSnapshot does).
+ */
+public interface PeerSnapshots {
+    /** Whether the namespace is fresh - main at its genesis, nothing else - so a snapshot may be installed. */
+    public suspend fun canInstall(): Boolean
+
+    /** Installs [root]'s state: [documents] must hash to its tree, and [attachmentTables] (packed)
+     * hold its attachment table when it has one. Durable before it returns. */
+    public suspend fun install(
+        root: dev.kdb.document.KdbCommit,
+        documents: List<dev.kdb.document.KdbDocument>,
+        attachmentTables: ByteArray?,
+    )
+
+    /** Commits held without their parents (roots of installed snapshots), advertised as shallow. */
+    public suspend fun shallowRoots(): List<KdbHash>
+
+    /** The live tree at main's head, [head]: document id to content hash. */
+    public suspend fun headTree(head: dev.kdb.document.KdbCommit): dev.kdb.document.DocumentTree
+
+    /** The documents of [ids] as they are at main's head (null for one not there). */
+    public suspend fun documentsAtHead(ids: List<dev.kdb.codec.KdbUuid>): List<dev.kdb.document.KdbDocument?>
+}

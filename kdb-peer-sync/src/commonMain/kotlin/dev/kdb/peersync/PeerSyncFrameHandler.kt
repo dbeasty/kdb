@@ -34,7 +34,7 @@ internal class PeerSyncFrameHandler(
             val session =
                 v2 ?: SyncV2HostSession(
                     wire,
-                    PeerSyncNamespace(cfg.namespaceId, dag, storage, cfg.blobs, cfg.materializeCommit, cfg.conflictPolicy),
+                    PeerSyncNamespace(cfg.namespaceId, dag, storage, cfg.blobs, cfg.materializeCommit, cfg.conflictPolicy, cfg.snapshots),
                     cfg.nodeId,
                     auth,
                     connectionContext,

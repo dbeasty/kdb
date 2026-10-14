@@ -25,6 +25,8 @@ public class PeerSyncNamespace(
     public val blobs: PeerBlobStore? = null,
     public val materializeCommit: CommitMaterializer? = null,
     public val conflictPolicy: ConflictPolicy = ConflictPolicy.STRICT,
+    /** Snapshot bootstrap and serving; null: neither (the capability is not advertised). */
+    public val snapshots: PeerSnapshots? = null,
 )
 
 /** One ref, as v2 names it. */
@@ -40,6 +42,7 @@ internal data class NamedRef(
 internal suspend fun refsOf(
     namespaceId: String,
     dag: CommitDag,
+    shallow: List<KdbHash> = emptyList(),
 ): NamespaceRefs {
     val branches = LinkedHashMap<String, String>()
     for (b in dag.listBranches()) {
@@ -47,7 +50,7 @@ internal suspend fun refsOf(
         branches[b.name] = b.headHash.toHex()
     }
     val tags = dag.listTags().associate { it.name to it.commitHash.toHex() }
-    return NamespaceRefs(namespaceId, branches, tags)
+    return NamespaceRefs(namespaceId, branches, tags, shallow = shallow.map { it.toHex() }.sorted())
 }
 
 /** main, then the other branches, then tags, each sorted (Go's orderedRefs). */
