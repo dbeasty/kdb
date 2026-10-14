@@ -517,10 +517,15 @@ Example:
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb file get myapp/files --id 00000000-0000-0000-0000-0000000000f1 -o ./report-copy.pdf"
 ```
 
-**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. The Go `kdb` binary uses the same on-disk layout and KDBP-framed delta segments as Kotlin file mode; **either CLI can read data written by the other** on the same `--data-dir` (same SHA-256 and commit payload rules). The exception is a namespace Go started from a peer's
-snapshot or caught up by squash: part of its state is held only in Go's checkpoint, which Kotlin
-doesn't read. Kotlin refuses to open such a namespace (its `meta.json` lists `shallowRoots`) until
-Go has deepened it.
+**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation rebuilds the namespace on open: from Go's checkpoint plus the delta segments written after it when there is a usable one, otherwise by replaying the whole delta log; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. The Go `kdb` binary uses the same on-disk layout and KDBP-framed delta segments as Kotlin file mode; **either CLI can read data written by the other** on the same `--data-dir` (same SHA-256 and commit payload rules). A namespace Go started from a peer's
+snapshot or caught up by squash holds part of its state only in Go's checkpoint; Kotlin opens it
+from that checkpoint, and refuses it (as Go does) only when the checkpoint is missing or unusable.
+
+Kotlin reads checkpoint formats 2 to 6, and validates one against the log the way Go does
+(segment fingerprints, the truncation floor, damage) before using it. It does not read Go's graph
+segments: a checkpoint written with `graph.file` on that names graph segments for commits it does
+not carry makes Kotlin replay the log instead. A checkpoint Kotlin can't use costs a slower open,
+never a different answer. Kotlin reads Go's checkpoints but never writes one.
 
 **Workspace lock:** File mode takes an exclusive lock on `{dataDir}/.kdb.lock` while a process has the database open (CLI, JDBC `jdbc:kdb:file://…`, or your app via `openFileRuntime`). On macOS/Linux the Go CLI uses `flock(2)` on that file. A second process opening the same `--data-dir` fails with a clear error naming the holder PID when known. Only one live writer per workspace.
 
@@ -2018,10 +2023,11 @@ recorded length and its intact frames still end at the checkpoint's commit. It t
 the checkpoint, logs which frames are damaged, and only the bodies in those frames are unreadable
 until a scrub repairs them.
 - A log that was cut short or replaced is still distrusted, as before.
-- Kotlin, which replays without checkpoints, refuses to open such a log rather than serve less than
-  was committed.
+- Kotlin opens such a log from the checkpoint too, but only when every live document's body is
+  still readable; when a damaged frame held one, it replays instead, and that replay refuses the log
+  rather than serve less than was committed.
 - A log Go has repaired still holds the damaged frame, because repair appends and never rewrites.
-  So Kotlin refuses that log too.
+  Its repaired bodies are in the repair's own frames, so Kotlin opens it from the checkpoint.
 
 ### Joining, catching up, and retention
 
@@ -2058,9 +2064,10 @@ How the policy behaves:
 - It does not undo a squash that already happened. To fill the gap, deepen that replica
   (`POST …/deepen`).
 
-The Kotlin CLI refuses to open a namespace that has caught up by squash. The jumped-to state is
-held only in Go's checkpoint, which Kotlin doesn't read, so a replay of the log alone would serve
-the older values. Once deepened, the namespace opens in Kotlin again.
+The Kotlin CLI opens a namespace that has caught up by squash from Go's checkpoint, which is the
+only record of the jumped-to state. If that checkpoint is missing or unusable, Kotlin refuses the
+namespace, since a replay of the log alone would serve the older values. Once deepened, the
+namespace replays correctly as well.
 
 **Retention.** Under `history=none`, retention won't delete commits that an active peer hasn't
 been seen to receive. That covers peers this node pushes to and peers that fetch from it.

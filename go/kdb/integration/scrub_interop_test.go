@@ -20,10 +20,11 @@ import (
 
 // TestKotlinReadsAGoLogRepairedByScrub: a Go data directory whose delta log has a damaged frame,
 // repaired by a scrub from a peer (a kdb:repair/1 commit rewriting the damaged body), read by the
-// Kotlin CLI. The damaged frame is still in the log - repair appends, it never rewrites - and
-// Kotlin, which has no checkpoints and always replays, cannot replay past it. What it must never
-// do is serve something wrong or silently less: each read is either exactly what Go holds or a
-// loud refusal naming the damage.
+// Kotlin CLI. The damaged frame is still in the log - repair appends, it never rewrites - so a
+// replay cannot get past it. Go's checkpoint already holds what the damaged frame recorded, and
+// fingerprinted the segment as it is, damage and all; the repaired body is in the repair commit's
+// frame. So Kotlin opens from the checkpoint (CheckpointOpen.kt) and must read every document
+// exactly as Go holds it.
 func TestKotlinReadsAGoLogRepairedByScrub(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs the Kotlin CLI through gradle")
@@ -89,21 +90,21 @@ func TestKotlinReadsAGoLogRepairedByScrub(t *testing.T) {
 	}
 	rt.Close()
 
+	want := newCPDoc()
 	for i, id := range ids {
-		out := kotlinCLIResult(t, repo, "--data-dir", root, "get", ns, id.String())
-		switch {
-		case out.code == 0 && sameJSON(lastLine(out.stdout), bodies[i]):
-		case out.code != 0 && strings.Contains(out.stderr, "corrupt"):
-			// A loud refusal: Kotlin replays the whole log and stops at the damaged frame.
-		default:
-			t.Errorf("Kotlin read %q for document %d (exit %d, stderr %q), Go holds %s - neither the value nor a refusal", out.stdout, i, out.code, out.stderr, bodies[i])
-		}
+		want.live[id] = bodies[i]
+	}
+	got := checkKotlinReads(t, repo, root, want)
+	if !got.fromCheckpoint {
+		t.Fatalf("Kotlin did not open the repaired namespace from its checkpoint; stderr:\n%s", tail(got.stderr))
 	}
 }
 
 // TestKotlinRefusesRatherThanRollingBackADamagedNewestSegment: damage in the middle of the newest
 // delta segment, with intact commits after it, is not a torn tail. Kotlin's replay used to treat
 // it as one and silently drop every commit after the damage (as Go's did); it must refuse instead.
+// Go's checkpoint does not save it: the damaged frame holds the only copy of a live document's
+// body, so Kotlin cannot open from the checkpoint either, and replays - which refuses.
 func TestKotlinRefusesRatherThanRollingBackADamagedNewestSegment(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs the Kotlin CLI through gradle")

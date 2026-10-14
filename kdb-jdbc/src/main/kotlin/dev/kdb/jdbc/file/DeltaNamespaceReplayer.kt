@@ -1,6 +1,7 @@
 package dev.kdb.jdbc.file
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.dag.CheckpointRestorableDag
 import dev.kdb.dag.CommitDag
 import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbCommit
@@ -11,6 +12,7 @@ import dev.kdb.storage.DeltaRecord
 import dev.kdb.storage.DeltaSegmentReader
 import dev.kdb.storage.StorageAdapter
 import dev.kdb.storage.delta.DamagedSegmentException
+import dev.kdb.storage.delta.DefaultDeltaSegmentReader
 import dev.kdb.storage.delta.DeltaSegmentScanner
 
 /** Replay's "the log is missing data": commits whose parents no segment holds. */
@@ -36,13 +38,25 @@ internal class MissingParentsException(
  *     the rule Go's replay applies, N5).
  */
 public object DeltaNamespaceReplayer {
+    /**
+     * [afterSequence] >= 0 resumes after a checkpoint: only segments above it are read (Go's
+     * replayDeltaNamespaceFrom). [shallow] are commits admitted without their parents when the log
+     * has none for them - a namespace marker's shallow and graft roots, as Go admits them.
+     */
     public suspend fun replay(
         dag: CommitDag,
         storage: StorageAdapter,
         deltaReader: DeltaSegmentReader,
         decisions: CrossNamespaceDecisions? = null,
+        afterSequence: Long = -1,
+        shallow: Set<KdbHash> = emptySet(),
     ): KdbHash {
-        val segments = deltaReader.listSegments()
+        val segments =
+            when {
+                afterSequence < 0 -> deltaReader.listSegments()
+                deltaReader is DefaultDeltaSegmentReader -> deltaReader.listSegmentsAfter(afterSequence)
+                else -> deltaReader.listSegments().filter { it.sequenceNumber > afterSequence }
+            }
         val allCommits = mutableListOf<KdbCommit>()
         // Segments other than the newest whose tails were torn - see the missing-parents case below.
         val torn = mutableListOf<Pair<Long, DeltaSegmentScanner.CorruptFrameException>>()
@@ -90,7 +104,7 @@ public object DeltaNamespaceReplayer {
             }
         }
         try {
-            applyCommitsTopologically(dag, storage, withoutUncommittedGroups(dag, allCommits, decisions))
+            applyCommitsTopologically(dag, storage, withoutUncommittedGroups(dag, allCommits, decisions), shallow)
         } catch (e: MissingParentsException) {
             // A torn tail is never built on: what never finished writing was never acknowledged.
             // Later commits naming parents the log no longer holds therefore mean an older
@@ -148,6 +162,7 @@ public object DeltaNamespaceReplayer {
         dag: CommitDag,
         storage: StorageAdapter,
         commits: List<KdbCommit>,
+        shallow: Set<KdbHash> = emptySet(),
     ) {
         var pending = commits.filterNot { dag.hasCommit(it.hash) }
         while (pending.isNotEmpty()) {
@@ -156,6 +171,13 @@ public object DeltaNamespaceReplayer {
             for (commit in pending) {
                 val ready = commit.parentHashes.all { dag.hasCommit(it) }
                 if (!ready) {
+                    if (commit.hash in shallow && dag is CheckpointRestorableDag) {
+                        // A known history horizon: stored as it was admitted, without applying it
+                        // or moving main (Go's PutShallowCommit in applyCommitsTopologically).
+                        dag.putShallowCommit(commit)
+                        progressed = true
+                        continue
+                    }
                     next += commit
                     continue
                 }

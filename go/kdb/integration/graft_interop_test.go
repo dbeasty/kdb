@@ -18,13 +18,14 @@ import (
 // TestKotlinReadsAGoNamespaceThatGraftedAnUnrelatedHistory: C, a Go file-backed namespace, grafts
 // the snapshot root of a peer whose history nobody else holds and merges it (Phase 11). Its log
 // now holds a commit without parents that is not genesis - the grafted root - and the peer's
-// commits above it as side history; main reaches them only through the merge. The Kotlin CLI,
-// which always replays the whole log, reads the directory: every document must read exactly as Go
-// holds it, or the read must be a loud refusal - never a wrong or missing value.
+// commits above it as side history; main reaches them only through the merge. The Kotlin CLI
+// reads the directory: every document must read exactly as Go holds it, or the read must be a
+// loud refusal - never a wrong or missing value.
 //
-// Today it is the refusal: Kotlin's replayer has no shallow roots (it refuses a Go namespace
-// bootstrapped from a snapshot the same way) and applies every logged commit to main, where Go
-// applies only commits that extend it. Reading grafted namespaces from Kotlin needs both ported.
+// Kotlin opens it from Go's checkpoint (CheckpointOpen.kt), which holds main as Go settled it, and
+// admits the marker's graft roots without their parents when it replays. Its replay still applies
+// every logged commit to main, where Go applies only commits that extend it, so a full replay
+// (no usable checkpoint) may still refuse; the refusal stays an accepted outcome.
 func TestKotlinReadsAGoNamespaceThatGraftedAnUnrelatedHistory(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs the Kotlin CLI through gradle")

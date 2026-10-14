@@ -22,7 +22,8 @@ private const val MAIN_BRANCH = "main"
 
 internal class InMemoryCommitDag(
     override val namespaceId: String,
-) : CommitDag {
+) : CommitDag,
+    CheckpointRestorableDag {
     private val mutex = Mutex()
 
     private val commits = LinkedHashMap<KdbHash, KdbCommit>()
@@ -40,6 +41,10 @@ internal class InMemoryCommitDag(
     private val pins = LinkedHashMap<KdbHash, Int>()
     /** Attachment tables by root (see AttachmentTables.kt). */
     private val attachments = AttachmentTableCache()
+    /** Commits restored from a checkpoint whose operations are still only in the log - see
+     * [CheckpointRestorableDag]. Held with an empty operation list until [hydrateLocked] loads it. */
+    private val opsMissing = HashSet<KdbHash>()
+    private var opsLoader: (suspend (KdbHash) -> KdbCommit?)? = null
 
     init {
         trees[DocumentTree.EMPTY.treeHash] = DocumentTree.EMPTY
@@ -91,7 +96,91 @@ internal class InMemoryCommitDag(
             hexSorted.filter { it.startsWith(p) }.map { KdbHash.fromHex(it) }
         }
 
-    override suspend fun getCommit(hash: KdbHash): KdbCommit? = mutex.withLock { commits[hash] }
+    override suspend fun getCommit(hash: KdbHash): KdbCommit? = mutex.withLock { commitLocked(hash) }
+
+    /** commits[hash], with its operations loaded if a checkpoint restored it without them. */
+    private suspend fun commitLocked(hash: KdbHash): KdbCommit? {
+        val c = commits[hash] ?: return null
+        return if (hash in opsMissing) hydrateLocked(c) else c
+    }
+
+    private suspend fun hydrateLocked(stripped: KdbCommit): KdbCommit {
+        val loader =
+            opsLoader
+                ?: throw DagConsistencyException(
+                    "the operations of commit ${stripped.hash.toHex()} were restored from a checkpoint without " +
+                        "them, and nothing here can load them",
+                    namespaceId,
+                    stripped.hash,
+                )
+        val full =
+            try {
+                loader(stripped.hash)
+            } catch (e: DagConsistencyException) {
+                throw e
+            } catch (e: Exception) {
+                throw DagConsistencyException(
+                    "loading the operations of commit ${stripped.hash.toHex()} from the delta log failed: ${e.message}",
+                    namespaceId,
+                    stripped.hash,
+                    e,
+                )
+            } ?: throw DagConsistencyException(
+                "the operations of commit ${stripped.hash.toHex()} are in no delta segment on disk",
+                namespaceId,
+                stripped.hash,
+            )
+        if (full.hash != stripped.hash || computeCommitHash(full) != stripped.hash) {
+            throw DagConsistencyException("loaded operations do not reproduce their commit's hash", namespaceId, stripped.hash)
+        }
+        commits[stripped.hash] = full
+        opsMissing.remove(stripped.hash)
+        return full
+    }
+
+    override suspend fun restoreCheckpoint(
+        commits: Sequence<CheckpointCommit>,
+        branches: List<KdbBranch>,
+        tags: List<KdbTag>,
+    ): Unit =
+        mutex.withLock {
+            for (cc in commits) {
+                val c = cc.commit
+                if (this.commits.containsKey(c.hash)) continue
+                this.commits[c.hash] = c
+                insertHex(c.hash.toHex())
+                if (!txIndex.containsKey(c.transactionId)) txIndex[c.transactionId] = c.hash
+                if (cc.operationCount > 0 && c.operations.isEmpty()) opsMissing += c.hash
+            }
+            for (b in branches) {
+                requireCommitPresentLocked(b.headHash)
+                this.branches[b.name] = b
+            }
+            for (t in tags) this.tags[t.name] = t
+        }
+
+    override suspend fun restoreCommitOperations(commits: List<KdbCommit>): Unit =
+        mutex.withLock {
+            for (c in commits) {
+                if (computeCommitHash(c) != c.hash) {
+                    throw DagConsistencyException("checkpointed operations do not reproduce their commit's hash", namespaceId, c.hash)
+                }
+                if (!this.commits.containsKey(c.hash)) continue
+                this.commits[c.hash] = c
+                opsMissing.remove(c.hash)
+            }
+        }
+
+    override suspend fun putShallowCommit(commit: KdbCommit): Unit =
+        mutex.withLock {
+            putCommitLocked(commit, requireParents = false, verifyAttachments = false)
+        }
+
+    override fun setOperationsLoader(loader: (suspend (KdbHash) -> KdbCommit?)?) {
+        opsLoader = loader
+    }
+
+    override suspend fun commitsWithoutOperations(): Int = mutex.withLock { opsMissing.size }
 
     override suspend fun getCommitOrThrow(hash: KdbHash): KdbCommit =
         mutex.withLock {
@@ -103,7 +192,7 @@ internal class InMemoryCommitDag(
                     it.archiveLocation,
                 )
             }
-            commits[hash]
+            commitLocked(hash)
                 ?: throw VersionNotFoundException(
                     "commit not found",
                     namespaceId,
@@ -215,7 +304,18 @@ internal class InMemoryCommitDag(
         return deriveAttachmentTable(
             namespaceId,
             commit,
-            { commits[it] },
+            { h ->
+                if (h in opsMissing) {
+                    // Replaying a table forward needs operations this DAG would have to load; a
+                    // checkpoint seeds the heads' tables, so only an older commit's table gets here.
+                    throw DagConsistencyException(
+                        "attachment table: commit ${h.toHex()} was restored from a checkpoint without its operations",
+                        namespaceId,
+                        h,
+                    )
+                }
+                commits[h]
+            },
             { attachments.get(it) },
             { root, t -> attachments.put(root, t) },
         )
@@ -278,7 +378,7 @@ internal class InMemoryCommitDag(
 
     override suspend fun getCommitByTransactionId(txId: KdbUuid): KdbCommit? =
         mutex.withLock {
-            txIndex[txId]?.let { commits[it] }
+            txIndex[txId]?.let { commitLocked(it) }
         }
 
     override suspend fun stubCommit(
@@ -499,7 +599,7 @@ internal class InMemoryCommitDag(
                     out.add(TraversalEntry.Stubbed(stub))
                     continue
                 }
-                val c = commits[h] ?: continue
+                val c = commitLocked(h) ?: continue
                 out.add(TraversalEntry.Full(c))
                 for (p in c.parentHashes) enqueue(p)
             }

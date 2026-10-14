@@ -2,7 +2,6 @@ package integration
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -20,13 +19,13 @@ import (
 // TestKotlinReadsAGoNamespaceThatCaughtUpBySquash: B, a Go file-backed namespace, catches up with
 // A by squash (docs/kdb-memory-cassandra-plan.md C7) - it jumps to A's head, which it admits as a
 // shallow root that only its checkpoint records, since a commit's operations are relative to its
-// real parent and could not be replayed onto B's old head. The Kotlin CLI, which replays the log
-// and reads no checkpoint, then reads the directory: every document must read exactly as Go holds
-// it, or the read must be a loud refusal - never a wrong or missing value. Run with a write on top
-// of the squash (the log then holds a commit whose parent it lacks) and without one (the log ends
-// at B's head before the squash, so a replay alone would serve that older state, as Kotlin did
-// before it read the marker's shallow roots): both are refused. Once B has deepened the gap from
-// A, its log is whole again, and Kotlin must read every document exactly.
+// real parent and could not be replayed onto B's old head. The Kotlin CLI then reads the
+// directory, and every document must read exactly as Go holds it. A replay of the log alone cannot
+// get there - with a write on top of the squash the log holds a commit whose parent it lacks, and
+// without one it ends at B's head before the squash, whose older state a replay would serve - so
+// Kotlin opens it from Go's checkpoint (CheckpointOpen.kt; it refused such namespaces before it
+// read checkpoints, #209). Once B has deepened the gap from A, its log is whole again, and the
+// reads must still be exact.
 func TestKotlinReadsAGoNamespaceThatCaughtUpBySquash(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs the Kotlin CLI through gradle")
@@ -135,22 +134,10 @@ func runKotlinReadsSquash(t *testing.T, repo string, writeOnTop, deepen bool) {
 	fileRT.Close()
 	closed = true
 
-	check := func(id codec.UUID, body string, present bool) {
-		t.Helper()
-		out := kotlinCLIResult(t, repo, "--data-dir", root, "get", ns, id.String())
-		refusal := kotlinError(out.stderr)
-		switch {
-		case out.code == 0 && present && sameJSON(lastLine(out.stdout), body):
-		case !present && out.code != 0 && strings.Contains(refusal, "document not found"):
-		case out.code != 0 && !deepen && strings.Contains(refusal, "shallow root"):
-			t.Logf("Kotlin refuses the squashed namespace loudly for %s: %s", id, refusal)
-		default:
-			t.Errorf("Kotlin read %q for %s (exit %d, error %q), Go holds %q (present %v) - neither the value nor a refusal",
-				out.stdout, id, out.code, refusal, body, present)
-		}
+	// Deleted by the backlog: Kotlin must not serve its old value.
+	got := checkKotlinReads(t, repo, root, &cpDoc{live: want, gone: map[codec.UUID]bool{ids[0]: true}})
+	if !deepen && !got.fromCheckpoint {
+		t.Fatalf("Kotlin read a squashed namespace without its checkpoint; stderr:\n%s", tail(got.stderr))
 	}
-	for id, body := range want {
-		check(id, body, true)
-	}
-	check(ids[0], "", false) // deleted by the backlog: Kotlin must not serve its old value
+	t.Logf("from checkpoint %v (v%d, %s)", got.fromCheckpoint, got.version, openLine(got.stderr))
 }

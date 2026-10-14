@@ -116,9 +116,6 @@ type attachmentState struct {
 	memShim *storio.InMemoryPlatformIO // for a runtime with no platform I/O of its own
 	history AttachmentHistory
 	config  attachstore.Config
-	// replaced are (old, new) content hashes from replacing commits, for CompactAttachments to
-	// try as deltas. Best effort: lost on restart, which only means those stay whole.
-	replaced [][2]codec.Hash
 }
 
 // SetAttachmentHistory chooses how much attachment history this runtime keeps.
@@ -254,7 +251,6 @@ func (rt *EmbeddedKdbRuntime) RenameAttachment(namespaceID string, docID codec.U
 // putAttachmentRef resolves which attachment to write (see PutAttachmentOptions) and commits it.
 func (rt *EmbeddedKdbRuntime) putAttachmentRef(namespaceID string, docID, id codec.UUID, name string, ref document.AttachmentRef) (codec.Hash, AttachmentInfo, error) {
 	var put document.AttachmentPutOp
-	var prev *document.Attachment
 	c, err := rt.commitAttachmentOps(namespaceID, docID, func(set document.AttachmentSet) ([]document.Op, error) {
 		var existing document.Attachment
 		var found bool
@@ -270,7 +266,6 @@ func (rt *EmbeddedKdbRuntime) putAttachmentRef(namespaceID string, docID, id cod
 			if attName == "" {
 				attName = existing.Name
 			}
-			prev = &existing
 		}
 		if attID == (codec.UUID{}) {
 			fresh, err := codec.RandomUUID()
@@ -288,11 +283,6 @@ func (rt *EmbeddedKdbRuntime) putAttachmentRef(namespaceID string, docID, id cod
 	})
 	if err != nil {
 		return codec.Hash{}, AttachmentInfo{}, err
-	}
-	if prev != nil && prev.ContentHash != ref.ContentHash {
-		rt.attach.mu.Lock()
-		rt.attach.replaced = append(rt.attach.replaced, [2]codec.Hash{prev.ContentHash, ref.ContentHash})
-		rt.attach.mu.Unlock()
 	}
 	return c, AttachmentInfo{DocID: docID, ID: put.AttachmentID, Name: put.Name,
 		ContentHash: put.ContentHash, Size: put.Size, Mime: put.Mime}, nil
@@ -457,17 +447,25 @@ func (rt *EmbeddedKdbRuntime) headAttachmentHashes(namespaceID string) (map[code
 	return keep, nil
 }
 
+// attachmentChange is a commit whose attachment root differs from its first parent's, and the
+// attachment puts it carries.
+type attachmentChange struct {
+	commit document.Commit
+	puts   []document.AttachmentPutOp
+}
+
 // referencedAttachmentHashes is every content hash any commit reachable from a branch or tag
 // references - what AttachmentHistoryAll keeps. It reads the operations only of commits whose
-// attachment root differs from their first parent's.
-func (rt *EmbeddedKdbRuntime) referencedAttachmentHashes(namespaceID string) (map[codec.Hash]bool, error) {
+// attachment root differs from their first parent's. It also returns the heads it walked from
+// and, oldest first, the changing commits wanted accepts (none when wanted is nil).
+func (rt *EmbeddedKdbRuntime) referencedAttachmentHashes(namespaceID string, wanted func(codec.Hash) bool) (map[codec.Hash]bool, []codec.Hash, []attachmentChange, error) {
 	keep, err := rt.headAttachmentHashes(namespaceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	d, err := rt.inMemoryDAG()
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	var heads []codec.Hash
 	for _, b := range d.ListBranches() {
@@ -476,6 +474,7 @@ func (rt *EmbeddedKdbRuntime) referencedAttachmentHashes(namespaceID string) (ma
 	for _, t := range d.ListTags() {
 		heads = append(heads, t.CommitHash)
 	}
+	var changes []attachmentChange
 	seen := map[codec.Hash]bool{}
 	for _, head := range heads {
 		for _, e := range d.Walk(head, nil, 1<<30) {
@@ -495,16 +494,25 @@ func (rt *EmbeddedKdbRuntime) referencedAttachmentHashes(namespaceID string) (ma
 			}
 			ops, err := d.CommitOperations(c.Hash)
 			if err != nil {
-				return nil, err
+				return nil, nil, nil, err
 			}
+			change := attachmentChange{commit: c}
 			for _, op := range ops {
 				if put, ok := op.(document.AttachmentPutOp); ok {
 					keep[put.ContentHash] = true
+					change.puts = append(change.puts, put)
 				}
+			}
+			if wanted != nil && len(change.puts) > 0 && wanted(c.Hash) {
+				changes = append(changes, change)
 			}
 		}
 	}
-	return keep, nil
+	// Walk goes newest first; a parent's table is then usually cached when its child's is asked.
+	for i, j := 0, len(changes)-1; i < j; i, j = i+1, j-1 {
+		changes[i], changes[j] = changes[j], changes[i]
+	}
+	return keep, heads, changes, nil
 }
 
 // AttachmentMaintenance is what CompactAttachments did.
@@ -517,6 +525,12 @@ type AttachmentMaintenance struct {
 // standalone blobs nothing keeps: under AttachmentHistoryLatest anything a branch or tag head does
 // not reference, under AttachmentHistoryAll anything no reachable commit references (an upload
 // that was never committed). Maintain calls it; it is safe to call at any time.
+//
+// Replacements are read from the DAG, so every way a commit arrives counts - PutAttachment, a
+// transaction from a client or SQL, peer sync: a commit that puts an attachment whose first parent
+// had a different version of it (same document, same attachment ID) makes the pair (old, new), and
+// old is re-stored as a delta against new. The store's mark records the heads each pass went
+// through, so the next one, after a restart too, looks only at commits since.
 func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (AttachmentMaintenance, error) {
 	var out AttachmentMaintenance
 	if rt.ReadOnly {
@@ -524,37 +538,90 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 	}
 	rt.attach.mu.Lock()
 	history := rt.attach.history
-	replaced := rt.attach.replaced
-	rt.attach.replaced = nil
 	_, opened := rt.attach.stores[namespaceID]
 	rt.attach.mu.Unlock()
 	store := rt.AttachmentStore(namespaceID)
 	if !opened {
-		// Nothing written through this runtime yet; still collect what an earlier one left.
+		// Nothing written through this runtime yet; still collect (and delta) what an earlier
+		// one or another commit path left.
 		if blobs, err := store.LargeBlobs(); err != nil || len(blobs) == 0 {
 			return out, err
 		}
 	}
-	var keep map[codec.Hash]bool
-	var err error
 	if history == AttachmentHistoryLatest {
-		keep, err = rt.headAttachmentHashes(namespaceID)
-	} else {
-		keep, err = rt.referencedAttachmentHashes(namespaceID)
-		for _, pair := range replaced {
-			if !keep[pair[0]] || !keep[pair[1]] {
+		keep, err := rt.headAttachmentHashes(namespaceID)
+		if err != nil {
+			return out, err
+		}
+		out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
+		return out, err
+	}
+	d, err := rt.inMemoryDAG()
+	if err != nil {
+		return out, err
+	}
+	mark, err := store.Mark()
+	if err != nil {
+		return out, err
+	}
+	var known []codec.Hash
+	for _, h := range mark {
+		if d.HasCommit(h) {
+			known = append(known, h)
+		}
+	}
+	done := map[codec.Hash]struct{}{}
+	if len(known) > 0 {
+		done = d.AncestorSetOf(known)
+	}
+	keep, heads, changes, err := rt.referencedAttachmentHashes(namespaceID, func(h codec.Hash) bool {
+		_, ok := done[h]
+		return !ok
+	})
+	if err != nil {
+		return out, err
+	}
+	deltaErr := rt.deltaReplaced(d, store, keep, changes, &out)
+	if deltaErr == nil && len(changes) > 0 {
+		deltaErr = store.SetMark(heads)
+	}
+	out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
+	if deltaErr != nil {
+		return out, deltaErr
+	}
+	return out, err
+}
+
+// deltaReplaced re-stores, for each put in changes, the version it replaced in its commit's first
+// parent as a delta against it, when both are kept. A version gone missing or corrupt is left
+// alone; any other failure stops the pass, so the mark is not moved past work not done.
+func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *attachstore.Store, keep map[codec.Hash]bool, changes []attachmentChange, out *AttachmentMaintenance) error {
+	for _, ch := range changes {
+		if len(ch.commit.ParentHashes) == 0 {
+			continue
+		}
+		parent, err := d.AttachmentTableAt(ch.commit.ParentHashes[0])
+		if err != nil {
+			continue // a shallow root's parent: nothing here to delta against
+		}
+		for _, put := range ch.puts {
+			prev, ok := parent.Get(put.DocID, put.AttachmentID)
+			if !ok || prev.ContentHash == put.ContentHash || !keep[prev.ContentHash] || !keep[put.ContentHash] {
 				continue
 			}
-			if did, err := store.StoreAsDelta(pair[0], pair[1]); err == nil && did {
+			did, err := store.StoreAsDelta(prev.ContentHash, put.ContentHash)
+			if errors.Is(err, attachstore.ErrNotFound) || errors.Is(err, attachstore.ErrCorrupt) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if did {
 				out.Deltas++
 			}
 		}
 	}
-	if err != nil {
-		return out, err
-	}
-	out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
-	return out, err
+	return nil
 }
 
 // PutAttachmentBlob stores r's bytes in namespaceID's attachment store, durably, without committing

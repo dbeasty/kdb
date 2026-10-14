@@ -245,6 +245,49 @@ public open class ServerStorageEngine(
         }
     }
 
+    /**
+     * Replaces the committed live tree wholesale, with no document bodies behind it yet - a
+     * namespace opened from Go's checkpoint (Go: ServerEngine.RestoreLiveTree). Staged writes and
+     * every committed body are dropped. Until [installBodies] has supplied a body for every entry,
+     * a read of the rest finds nothing, so a caller must check [documentsWithoutBody] is empty
+     * before serving anything from this engine.
+     */
+    public suspend fun restoreLiveTree(restored: DocumentTree) {
+        pending.discardAll()
+        treeMu.withLock {
+            docs.clear()
+            tree = restored
+        }
+    }
+
+    /** The committed live tree. */
+    public suspend fun liveTree(): DocumentTree = treeMu.withLock { tree }
+
+    /**
+     * Supplies bodies for live-tree entries. Each must be the version the tree names - its content
+     * hash is checked - or [IllegalArgumentException] is thrown and nothing after it installed.
+     */
+    public suspend fun installBodies(bodies: Collection<KdbDocument>) {
+        treeMu.withLock {
+            for (doc in bodies) {
+                require(tree.hashFor(doc.id) == doc.contentHash) {
+                    "document ${doc.id} version ${doc.contentHash.toHex()} is not the one the live tree names"
+                }
+                docs.put(doc)
+            }
+        }
+    }
+
+    /** The live-tree entries (id to content hash) with no body installed for that version. */
+    public suspend fun documentsWithoutBody(): Map<KdbUuid, KdbHash> =
+        treeMu.withLock {
+            val out = LinkedHashMap<KdbUuid, KdbHash>()
+            for ((id, h) in tree.entries) {
+                if (docs.get(id)?.contentHash != h) out[id] = h
+            }
+            out
+        }
+
     override suspend fun flush(namespaceId: String) {
         memTable.flush()
         wal?.sync()

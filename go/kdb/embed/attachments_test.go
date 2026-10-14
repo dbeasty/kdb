@@ -389,3 +389,74 @@ func TestSeveralNamedAttachmentsPerRecord(t *testing.T) {
 		t.Fatalf("count after delete %d", n)
 	}
 }
+
+// commitAttachmentPut commits a plain transaction putting data as id's attachment attID - the
+// way a client, SQL or peer sync commits one, not PutAttachment.
+func commitAttachmentPut(t *testing.T, rt *embed.EmbeddedKdbRuntime, id, attID codec.UUID, data []byte) codec.Hash {
+	t.Helper()
+	h, n, err := rt.PutAttachmentBlob(attachNS, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, _ := rt.DAG.Head()
+	c, _ := rt.DAG.GetCommitOrThrow(head)
+	tree, err := rt.Storage.CommitTree(attachNS, c.DocumentTreeHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txID, _ := codec.RandomUUID()
+	put := document.AttachmentPutOp{DocID: id, AttachmentID: attID, Name: "file",
+		Scheme: document.AttachmentHashSchemeChunked1, ContentHash: h, Size: n, Mime: "x/y"}
+	tx := document.Transaction{ID: txID, BaseVersion: head, Operations: []document.Op{put}, Timestamp: codec.TimestampNow(), AuthorNodeID: txID}
+	commit, err := rt.DAG.AppendCommit(tx, head, tree, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return commit.Hash
+}
+
+// A replacement committed as a plain transaction is re-stored as a delta too: maintenance reads
+// replacements from the DAG. Its mark makes a second pass, and one after a restart, redo nothing,
+// while a replacement committed after the restart is still found.
+func TestTransactionReplacementIsStoredAsDelta(t *testing.T) {
+	root := t.TempDir()
+	rt := openAttachRuntime(t, root, storage.HistoryModeFull)
+	id, attID := codec.UUID{MSB: 7}, codec.UUID{MSB: 7, LSB: 1}
+	putAttachDoc(t, rt, id, `{}`)
+	r := rand.New(rand.NewSource(11))
+	base := make([]byte, 80_000)
+	r.Read(base)
+	version := func(i int) []byte {
+		v := append([]byte(nil), base...)
+		copy(v[i*7000:], []byte("an edit committed through a transaction"))
+		return v
+	}
+	var commits []codec.Hash
+	for i := 0; i < 2; i++ {
+		commits = append(commits, commitAttachmentPut(t, rt, id, attID, version(i)))
+	}
+	compact := func(want int) {
+		t.Helper()
+		res, err := rt.CompactAttachments(attachNS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Deltas != want || res.Removed != 0 {
+			t.Fatalf("maintenance %+v, want %d deltas and nothing removed", res, want)
+		}
+	}
+	compact(1)
+	compact(0) // the mark: nothing left to do
+
+	rt.Close()
+	rt = openAttachRuntime(t, root, storage.HistoryModeFull)
+	defer rt.Close()
+	compact(0) // the mark survived the restart (and Collect)
+	commits = append(commits, commitAttachmentPut(t, rt, id, attID, version(2)))
+	compact(1)
+	for i, c := range commits {
+		if got, _ := readNamed(t, rt, id, embed.AttachmentByID(attID), c); !bytes.Equal(got, version(i)) {
+			t.Fatalf("version %d reads back wrong after compaction", i)
+		}
+	}
+}
