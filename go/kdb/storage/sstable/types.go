@@ -332,17 +332,17 @@ type CompactionResult struct {
 	// Dropped is how many keys the keep predicate refused - superseded
 	// document versions that will never be asked for again.
 	Dropped int
-	// Output names the table that replaced them, empty when the merge had
-	// nothing to write.
-	Output string
+	// Outputs names the tables that replaced them - one run, in key order - empty when the merge
+	// had nothing to write.
+	Outputs []string
 	// Postponed is set when a bounded caller (engine.CompactBlobStoreUpTo) found the tables too
 	// large to merge then: the bytes they hold, or -1 when the shim could not say. Zero for a
 	// merge that ran or had nothing to do.
 	Postponed int64
 }
 
-// Compact merges every registered table into one, when there are more than
-// trigger of them, keeping only the keys keep accepts.
+// Compact merges every registered table into one run (see DefaultCompactionTrigger), when they
+// form at least trigger runs, keeping only the keys keep accepts.
 //
 // keep is what turns this from a deduplicator into a garbage collector,
 // and the difference decides whether the store is bounded at all. Merging
@@ -394,7 +394,7 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	// immediately when no lookup holds one, otherwise when the last one lets go.
 	pinned := s.pin()
 	defer s.release(pinned)
-	if len(pinned) < trigger {
+	if countRuns(pinned) < trigger {
 		return CompactionResult{}, nil
 	}
 	s.removePartialTables()
@@ -417,26 +417,35 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	// and is the only way a delete ever reclaims its own space.
 	// The merge counts the keys keep refuses, so the result can say how much was reclaimed
 	// rather than only how many files were rewritten.
-	merged, dropped, err := compact(ctx, s.io, s.namespaceID, outLevel, ordered, true, keep)
+	//
+	// Each input is read through the sidecar the store has open for it (building it where it is
+	// missing), so the merge reads sorted, mapped indexes instead of loading footers.
+	sources, err := openMergeSources(s.io, ordered, s.sidecarFor)
+	if err != nil {
+		return CompactionResult{}, err
+	}
+	merged, dropped, err := compact(ctx, s.io, s.namespaceID, outLevel, ordered, sources, true, keep)
+	closeMergeSources(sources)
 	switch {
 	case err == ErrNothingToCompact:
-		merged = Handle{}
+		merged = nil
 	case err != nil:
 		return CompactionResult{}, err
+	}
+	outputs := make(map[string]struct{}, len(merged))
+	for _, h := range merged {
+		outputs[h.SegmentName] = struct{}{}
 	}
 
 	s.mu.Lock()
 	// Keep any table registered while the merge ran (a concurrent memtable flush): only the
-	// inputs are replaced. Assigning []Handle{merged} outright dropped such a table from the
+	// inputs are replaced. Assigning the merge's output outright dropped such a table from the
 	// store until the next open rediscovered it.
 	merging := make(map[string]struct{}, len(ordered))
 	for _, in := range ordered {
 		merging[in.SegmentName] = struct{}{}
 	}
-	var next []Handle
-	if merged.SegmentName != "" {
-		next = append(next, merged)
-	}
+	next := append([]Handle(nil), merged...)
 	for _, t := range s.tables {
 		if _, ok := merging[t.SegmentName]; !ok {
 			next = append(next, t)
@@ -450,11 +459,14 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	// Each input is doomed here, under the lock that also guards pin, so from this point no new
 	// reader can take it (it is no longer registered) and the last of the existing ones - this
 	// compaction's own release included - deletes it.
-	result := CompactionResult{Merged: len(ordered), Output: merged.SegmentName, Dropped: dropped}
+	result := CompactionResult{Merged: len(ordered), Dropped: dropped}
+	for _, h := range merged {
+		result.Outputs = append(result.Outputs, h.SegmentName)
+	}
 	var now []string
 	var unmap []*sidecarSlot
 	for _, in := range ordered {
-		if in.SegmentName == merged.SegmentName {
+		if _, ok := outputs[in.SegmentName]; ok {
 			continue
 		}
 		s.indexes.remove(in.SegmentName)
@@ -476,7 +488,7 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	// block only for a registered table, under the lock the swap held. Every block of theirs that
 	// can ever be in the cache is already there, so this cannot miss one.
 	for _, in := range ordered {
-		if in.SegmentName != merged.SegmentName {
+		if _, ok := outputs[in.SegmentName]; !ok {
 			s.cache.RemoveSegment(in.SegmentName)
 		}
 	}
@@ -531,6 +543,14 @@ func (s *LsmBlobStore) TableBytes() (int64, bool) {
 		total += n
 	}
 	return total, true
+}
+
+// RunCount reports how many runs the registered tables form - what DefaultCompactionTrigger
+// counts. A flushed table is a run of its own; the tables one merge wrote are one run.
+func (s *LsmBlobStore) RunCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return countRuns(s.tables)
 }
 
 // AddTable registers a flushed table.

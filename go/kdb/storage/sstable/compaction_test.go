@@ -50,7 +50,7 @@ func TestCompactMergesEveryKey(t *testing.T) {
 	a := writeTable(t, shim, ns, 0, map[string]string{"a": "1", "b": "2"}, nil)
 	b := writeTable(t, shim, ns, 0, map[string]string{"c": "3"}, nil)
 
-	merged, err := Compact(shim, ns, 1, []Handle{a, b}, false, nil)
+	merged, err := compactOne(shim, ns, 1, []Handle{a, b}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestCompactCollapsesDuplicates(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		inputs = append(inputs, writeTable(t, shim, ns, 0, map[string]string{"a": "1", "b": "2"}, nil))
 	}
-	merged, err := Compact(shim, ns, 1, inputs, false, nil)
+	merged, err := compactOne(shim, ns, 1, inputs, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestCompactLastWriterWins(t *testing.T) {
 	older := writeTable(t, shim, ns, 0, map[string]string{"a": "old"}, nil)
 	newer := writeTable(t, shim, ns, 0, map[string]string{"a": "new"}, nil)
 
-	merged, err := Compact(shim, ns, 1, []Handle{older, newer}, false, nil)
+	merged, err := compactOne(shim, ns, 1, []Handle{older, newer}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestCompactKeepsTombstonesUnlessToldOtherwise(t *testing.T) {
 
 	// Kept: the merge might not cover every table holding the key, so
 	// dropping the tombstone would resurrect it.
-	merged, err := Compact(shim, ns, 1, []Handle{withValue, withDelete}, false, nil)
+	merged, err := compactOne(shim, ns, 1, []Handle{withValue, withDelete}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestCompactKeepsTombstonesUnlessToldOtherwise(t *testing.T) {
 
 	// Dropped: this merge covered everything, so nothing older can hold
 	// the key and the tombstone has nothing left to shadow.
-	merged, err = Compact(shim, ns, 1, []Handle{withValue, withDelete}, true, nil)
+	merged, err = compactOne(shim, ns, 1, []Handle{withValue, withDelete}, true, nil)
 	if err != ErrNothingToCompact {
 		if err != nil {
 			t.Fatal(err)
@@ -155,7 +155,7 @@ func TestCompactDoesNotResurrectADeletedKey(t *testing.T) {
 	older := writeTable(t, shim, ns, 0, map[string]string{"a": "1", "b": "2"}, nil)
 	newer := writeTable(t, shim, ns, 0, map[string]string{"c": "3"}, []string{"a"})
 
-	merged, err := Compact(shim, ns, 1, []Handle{older, newer}, false, nil)
+	merged, err := compactOne(shim, ns, 1, []Handle{older, newer}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,11 +176,11 @@ func TestCompactIsDeterministic(t *testing.T) {
 	a := writeTable(t, shim, ns, 0, map[string]string{"a": "1", "b": "2", "c": "3"}, nil)
 	b := writeTable(t, shim, ns, 0, map[string]string{"d": "4"}, nil)
 
-	first, err := Compact(shim, ns, 1, []Handle{a, b}, false, nil)
+	first, err := compactOne(shim, ns, 1, []Handle{a, b}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Compact(shim, ns, 1, []Handle{a, b}, false, nil)
+	second, err := compactOne(shim, ns, 1, []Handle{a, b}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestDroppingATombstoneAlsoDropsTheValueUnderIt(t *testing.T) {
 	older := writeTable(t, shim, ns, 0, map[string]string{"gone": "value", "kept": "value"}, nil)
 	newer := writeTable(t, shim, ns, 0, nil, []string{"gone"})
 
-	merged, err := Compact(shim, ns, 1, []Handle{older, newer}, true, nil)
+	merged, err := compactOne(shim, ns, 1, []Handle{older, newer}, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +450,7 @@ func TestStreamedCompactionIsByteIdenticalToFinish(t *testing.T) {
 			// footer's fourth field and the hash's marker byte are in the comparison too.
 			a := bigTable(t, shim, ns, 1500, 2000, 1, nil)
 			b := bigTable(t, shim, ns, 1500, 2000, 2, []string{"key-1-000007", "key-1-000100", "gone"})
-			merged, err := Compact(shim, ns, 1, []Handle{a, b}, false, nil)
+			merged, err := compactOne(shim, ns, 1, []Handle{a, b}, false, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -690,4 +690,16 @@ func sortedKeys[V any](m map[codec.Hash]V) []codec.Hash {
 		return false
 	})
 	return out
+}
+
+// compactOne is Compact for a merge small enough to write a single table.
+func compactOne(shim storage.PlatformIOShim, ns string, level int, inputs []Handle, dropTombstones bool, keep func(codec.Hash) bool) (Handle, error) {
+	out, err := Compact(shim, ns, level, inputs, dropTombstones, keep)
+	if err != nil {
+		return Handle{}, err
+	}
+	if len(out) != 1 {
+		return Handle{}, fmt.Errorf("the merge wrote %d tables, want 1", len(out))
+	}
+	return out[0], nil
 }

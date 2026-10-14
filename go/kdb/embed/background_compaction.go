@@ -55,7 +55,7 @@ type backgroundCompaction struct {
 // storage.ReclaimManual nothing is destroyed until asked, and a merge drops unreachable versions).
 // Returns nil, having started nothing, otherwise.
 func startBackgroundCompaction(eng *engine.ServerEngine, namespaceID string) *backgroundCompaction {
-	if eng == nil || eng.BlobTableCount() < sstable.DefaultCompactionTrigger || !eng.ReclaimMode().Reclaims() {
+	if eng == nil || eng.BlobRunCount() < sstable.DefaultCompactionTrigger || !eng.ReclaimMode().Reclaims() {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -69,8 +69,8 @@ func startBackgroundCompaction(eng *engine.ServerEngine, namespaceID string) *ba
 		case err != nil:
 			log.Printf("kdb: namespace %s: background sstable merge failed (%v) - it keeps its current tables", namespaceID, err)
 		case c.Removed > 0:
-			log.Printf("kdb: namespace %s: merged %d sstables into one in the background, removed %d, dropped %d unreachable version(s)",
-				namespaceID, c.Merged, c.Removed, c.Dropped)
+			log.Printf("kdb: namespace %s: merged %d sstables into %d in the background, removed %d, dropped %d unreachable version(s)",
+				namespaceID, c.Merged, len(c.Outputs), c.Removed, c.Dropped)
 		}
 	}()
 	return b

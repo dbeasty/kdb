@@ -2,10 +2,12 @@ package sstable
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
+	"crypto/sha256"
 	"fmt"
-	"math"
-	"sort"
+	"os"
+	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -31,16 +33,31 @@ import (
 // answer for a value. Only tombstones can, and they are handled explicitly
 // below.
 
-// DefaultCompactionTrigger is how many tables a store may accumulate
-// before a compaction is worth running.
+// DefaultCompactionTrigger is how many runs a store may accumulate before a compaction is
+// worth running. A run is what one flush or one merge wrote: a flushed table alone, or the
+// tables a merge split its output into (see runOf).
 //
 // Four, because the cost of merging is proportional to the live data and
 // the benefit is proportional to the duplication, so the trigger wants to
 // be small - but every compaction rewrites everything, so triggering on
 // two would rewrite the whole store on every other flush.
+//
+// Runs rather than tables, because a merge now writes several tables: counting tables, a store
+// whose last merge wrote four would merge again on every pass.
 const DefaultCompactionTrigger = 4
 
-// Compact merges inputs into one table at outLevel and returns it.
+// A merge's output is split into tables of at most mergeTableBytes of blocks or mergeTableKeys
+// keys, whichever comes first, so what a merge holds for its output - one table's footer index -
+// is bounded however large the store is. The keys of one merge's tables do not overlap, and a
+// lookup skips the ones that cannot hold a key by their Bloom filters (sidecar.go).
+//
+// A variable for tests, which shrink it to split small merges.
+var (
+	mergeTableBytes int64 = 64 << 20
+	mergeTableKeys        = 1 << 20
+)
+
+// Compact merges inputs into a run of tables at outLevel and returns them, in key order.
 //
 // inputs are given oldest-first, so a later table's opinion about a key
 // wins - which for values is a formality (identical keys carry identical
@@ -59,6 +76,9 @@ const DefaultCompactionTrigger = 4
 // because every version is a distinct content hash and none of them is a
 // duplicate of anything. Passing nil keeps everything, which is what a
 // store whose reachability the caller cannot determine must do.
+//
+// Inputs are read through their sidecars where they have one (sidecar.go), and otherwise through
+// their footers - see openMergeSources.
 func Compact(
 	io storage.PlatformIOShim,
 	namespaceID string,
@@ -66,7 +86,7 @@ func Compact(
 	inputs []Handle,
 	dropTombstones bool,
 	keep func(codec.Hash) bool,
-) (Handle, error) {
+) ([]Handle, error) {
 	return CompactContext(context.Background(), io, namespaceID, outLevel, inputs, dropTombstones, keep)
 }
 
@@ -75,10 +95,10 @@ func Compact(
 const compactionCheckEvery = 4096
 
 // CompactContext is Compact that gives up when ctx is done, returning ctx's error and leaving
-// no table behind. Abandoning is always safe: the output is written under a partial name
-// (io.SegmentNameBuilder.SSTablePartial) that nothing registers as a table, and is deleted when
+// no table behind. Abandoning is always safe: the output is written under partial names
+// (io.SegmentNameBuilder.SSTablePartial) that nothing registers as tables, and is deleted when
 // the merge stops, so the inputs stay exactly as they were. Once the last key is written the
-// footer and rename run to the end - they are the short tail of the merge.
+// footer and renames run to the end - they are the short tail of the merge.
 func CompactContext(
 	ctx context.Context,
 	io storage.PlatformIOShim,
@@ -87,102 +107,97 @@ func CompactContext(
 	inputs []Handle,
 	dropTombstones bool,
 	keep func(codec.Hash) bool,
-) (Handle, error) {
-	h, _, err := compact(ctx, io, namespaceID, outLevel, inputs, dropTombstones, keep)
-	return h, err
+) ([]Handle, error) {
+	if len(inputs) == 0 {
+		return nil, fmt.Errorf("sstable: compaction needs at least one input table")
+	}
+	sources, err := openMergeSources(io, inputs, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer closeMergeSources(sources)
+	out, _, err := compact(ctx, io, namespaceID, outLevel, inputs, sources, dropTombstones, keep)
+	return out, err
 }
 
-// compact is CompactContext that also reports how many distinct keys keep refused - what
-// LsmBlobStore.CompactContext reports as reclaimed, counted here because this is where every key
-// is asked about exactly once.
+// compact merges what sources yield - sources[i] is inputs[i]'s index, in key order - and also
+// reports how many distinct keys keep refused: what LsmBlobStore.CompactContext reports as
+// reclaimed, counted here because this is where every key is asked about exactly once.
+//
+// The merge holds no per-key state. It used to read every input's whole index into memory, sort
+// it and only then write - 60 bytes per key of the store, 680 MB to merge the 49 tables of a
+// 10M-document namespace. Every input's index is already sorted on disk (its sidecar), so the
+// inputs are instead read side by side in key order, a batch per input at a time, and each key's
+// final owner is decided as its entries meet: the newest input holding it, the same winner the
+// index-loading merge chose. What a merge holds is a batch per input and one output table's index.
+//
+// Deciding every key's owner before writing it is still what keeps a dropped tombstone from
+// resurrecting the value under it: a key is written, or dropped, once, after every input's
+// opinion of it has been seen.
 func compact(
 	ctx context.Context,
 	io storage.PlatformIOShim,
 	namespaceID string,
 	outLevel int,
 	inputs []Handle,
+	sources []mergeSource,
 	dropTombstones bool,
 	keep func(codec.Hash) bool,
-) (Handle, int, error) {
-	if len(inputs) == 0 {
-		return Handle{}, 0, fmt.Errorf("sstable: compaction needs at least one input table")
+) ([]Handle, int, error) {
+	cursors := make(mergeHeap, 0, len(sources))
+	for i, src := range sources {
+		c := &mergeCursor{src: src, input: i, buf: make([]indexEntry, mergeBatch)}
+		ok, err := c.advance()
+		if err != nil {
+			return nil, 0, fmt.Errorf("sstable: compaction could not read %s: %w", inputs[i].SegmentName, err)
+		}
+		if ok {
+			cursors = append(cursors, c)
+		}
 	}
+	heap.Init(&cursors)
 
-	// Two passes, and the first reads indexes only.
-	//
-	// A single streaming pass that wrote each input's entries in turn was
-	// the obvious implementation and was wrong: dropping a tombstone meant
-	// skipping it, which left whatever an *earlier* input had written for
-	// that key standing - resurrecting the value the tombstone deleted.
-	// Deciding every key's final owner before writing anything makes that
-	// impossible to express.
-	//
-	// Values are deliberately not held here. Every input's index goes into one slice, which is
-	// sorted by key and then by where each entry came from, so a key's last entry is its final
-	// owner: the latest input, and within an input its last footer line - the same winner a map
-	// filled input by input chose. The slice then becomes the output's own index (see below), so
-	// a merge holds about 60 bytes per key in all; the map, sorted key list and output index it
-	// used to hold were three times that.
-	merge, err := loadMergeOrder(ctx, io, inputs)
+	w, err := newRunWriter(io, namespaceID, outLevel)
 	if err != nil {
-		return Handle{}, 0, err
-	}
-	sort.Sort(merge)
-
-	// Streamed: each value is read, encoded and appended as its key comes up, so the merge holds
-	// the index and one batch of blocks rather than every value in the store. It used to collect
-	// them all in a DefaultWriter and write at Finish - 2.7 GB of heap to merge 471 MB of tables.
-	//
-	// Streaming means a file exists while the merge runs, so it is written under a partial name
-	// and renamed once complete: DiscoverTables registers every name under sstable/, and a table
-	// a crash left half-written there would be read as one. A shim that cannot rename writes the
-	// table's own name directly, which leaves that window open for it; both shims in this
-	// codebase rename.
-	fileID, err := codec.RandomUUID()
-	if err != nil {
-		return Handle{}, 0, err
-	}
-	name := storio.SegmentNameBuilder.SSTable(namespaceID, outLevel, fileID.String())
-	writing := name
-	renamer, canRename := io.(storage.SegmentRenamer)
-	if canRename {
-		writing = storio.SegmentNameBuilder.SSTablePartial(namespaceID, fileID.String())
+		return nil, 0, err
 	}
 	done := false
 	defer func() {
 		if !done {
-			// Cancelled, failed, or nothing to write: whatever was appended goes. Deleting a
-			// segment that was never created is not an error.
-			_ = io.DeleteSegment(writing)
+			// Cancelled, failed, or nothing to write: whatever was written goes.
+			w.abort()
 		}
 	}()
 
-	// Sorted, so the output is deterministic: the same inputs produce the
-	// same file hash, which is what makes a compaction verifiable and
-	// repeatable rather than merely successful.
-	//
-	// The output index is written over the merge slice itself. Entry w of the output is appended
-	// only after entry r >= w of the merge has been read, so nothing is overwritten before it is
-	// used, and the slice never has to grow.
-	b := newTableBuilder(io, writing, 0)
-	b.index = merge.entries[:0]
 	readers := make([]*DefaultReader, len(inputs))
 	for i, in := range inputs {
 		readers[i] = NewDefaultReader(io, in)
 	}
-	wrote, dropped := 0, 0
-	for r, n := 0, 0; r < len(merge.entries); n++ {
+	dropped := 0
+	for n := 0; len(cursors) > 0; n++ {
 		if n%compactionCheckEvery == 0 {
 			if err := ctx.Err(); err != nil {
-				return Handle{}, 0, err
+				return nil, 0, err
 			}
 		}
-		// The last of this key's entries is its final owner.
-		for r+1 < len(merge.entries) && merge.entries[r+1].key == merge.entries[r].key {
-			r++
+		// Every input's entry for the smallest key, oldest input first (the heap breaks ties by
+		// input), so the last one taken is the key's final owner.
+		key := cursors[0].head().key
+		var bh BlockHandle
+		input := -1
+		for len(cursors) > 0 && cursors[0].head().key == key {
+			c := cursors[0]
+			bh, input = c.head().handle, c.input
+			ok, err := c.advance()
+			if err != nil {
+				return nil, 0, fmt.Errorf("sstable: compaction could not read %s: %w", inputs[c.input].SegmentName, err)
+			}
+			if ok {
+				heap.Fix(&cursors, 0)
+			} else {
+				heap.Pop(&cursors)
+			}
 		}
-		key, bh, input := merge.entries[r].key, merge.entries[r].handle, merge.input(r)
-		r++
 		if keep != nil && !keep(key) {
 			// Unreachable: the caller says nothing can ask for this key
 			// again. Dropping it is the only way a superseded version ever
@@ -195,125 +210,363 @@ func compact(
 			if dropTombstones {
 				continue
 			}
-			b.delete(key)
-			wrote++
+			if err := w.delete(key); err != nil {
+				return nil, 0, err
+			}
 			continue
 		}
 		value, err := readers[input].ReadBlockAt(bh)
 		if err != nil {
-			return Handle{}, 0, fmt.Errorf(
+			return nil, 0, fmt.Errorf(
 				"sstable: compaction could not read a block of %s: %w", inputs[input].SegmentName, err)
 		}
-		if err := b.put(key, value); err != nil {
-			return Handle{}, 0, err
+		if err := w.put(key, value); err != nil {
+			return nil, 0, err
 		}
-		wrote++
 	}
-	if wrote == 0 {
+	out, err := w.commit()
+	if err != nil {
+		return nil, 0, err
+	}
+	done = true
+	if len(out) == 0 {
 		// Every input was empty, or was nothing but tombstones being
 		// dropped. Finish would write a table with no entries, which is a
 		// file that can only ever cost a read.
-		return Handle{}, dropped, ErrNothingToCompact
+		return nil, dropped, ErrNothingToCompact
 	}
-	tableSize, fileHash, err := b.finish()
+	return out, dropped, nil
+}
+
+// ErrNothingToCompact reports a merge whose inputs held nothing worth
+// writing out. Not a failure: the caller deletes the inputs and is done.
+var ErrNothingToCompact = fmt.Errorf("sstable: the inputs hold nothing to write")
+
+// mergeBatch is how many index entries a merge reads from one input at a time: 64 KB per input.
+const mergeBatch = 1024
+
+// mergeSource yields one input's index entries in key order, each key at most once.
+type mergeSource interface {
+	// fill copies up to len(buf) next entries into buf and reports how many; 0 at the end.
+	fill(buf []indexEntry) (int, error)
+	close()
+}
+
+// sidecarSource reads a table's sidecar, whose entries are sorted and unique by construction.
+// The entries are copied out a batch at a time under the mapping's fault guard, so a sidecar
+// truncated underneath fails the merge rather than crashing it.
+type sidecarSource struct {
+	sc    *sidecar
+	pos   int
+	owned bool // close unmaps it: opened for this merge, not borrowed from a store
+}
+
+func (s *sidecarSource) fill(buf []indexEntry) (int, error) {
+	n := min(len(buf), s.sc.count-s.pos)
+	if n <= 0 {
+		return 0, nil
+	}
+	err := s.sc.region.Guard(func([]byte) {
+		for i := 0; i < n; i++ {
+			at := (s.pos + i) * sidecarEntrySize
+			rec := s.sc.entries[at : at+sidecarEntrySize]
+			copy(buf[i].key.Bytes[:], rec[:32])
+			buf[i].handle = decodeSidecarHandle(rec)
+		}
+	})
 	if err != nil {
-		return Handle{}, 0, err
+		return 0, err
 	}
-	if canRename {
-		if err := renamer.RenameSegment(writing, name); err != nil {
-			return Handle{}, 0, err
-		}
-		// From here a failure deletes the table under its own name, which is complete but not
-		// registered: discovered by a later open it would merely duplicate the inputs' keys.
-		writing = name
-	}
-	if err := io.SealSegment(name); err != nil {
-		return Handle{}, 0, err
-	}
-	done = true
-	writeSidecar(io, name, b.index, tableSize, fileHash)
-	return Handle{FileHash: fileHash, Level: outLevel, SegmentName: name}, dropped, nil
+	s.pos += n
+	return n, nil
 }
 
-// mergeOrder is every input's index entries in one slice, with each entry's position in load
-// order alongside: inputs oldest first, each in its footer's order. Sorting by key and then by
-// that position puts a key's entries oldest to newest.
-type mergeOrder struct {
+func (s *sidecarSource) close() {
+	if s.owned {
+		s.sc.close()
+	}
+}
+
+// sliceSource serves a table's index from memory, sorted: for a table with no usable sidecar.
+type sliceSource struct {
 	entries []indexEntry
-	ords    []uint32
-	// ends[i] is one past the last position input i's entries were loaded at.
-	ends []int
+	pos     int
 }
 
-func (m *mergeOrder) Len() int { return len(m.entries) }
-
-func (m *mergeOrder) Less(i, j int) bool {
-	if c := bytes.Compare(m.entries[i].key.Bytes[:], m.entries[j].key.Bytes[:]); c != 0 {
-		return c < 0
-	}
-	return m.ords[i] < m.ords[j]
+func (s *sliceSource) fill(buf []indexEntry) (int, error) {
+	n := copy(buf, s.entries[s.pos:])
+	s.pos += n
+	return n, nil
 }
 
-func (m *mergeOrder) Swap(i, j int) {
-	m.entries[i], m.entries[j] = m.entries[j], m.entries[i]
-	m.ords[i], m.ords[j] = m.ords[j], m.ords[i]
-}
+func (s *sliceSource) close() {}
 
-// input is the input the entry now at position i came from.
-func (m *mergeOrder) input(i int) int {
-	ord := int(m.ords[i])
-	return sort.Search(len(m.ends), func(k int) bool { return ord < m.ends[k] })
-}
-
-// loadMergeOrder reads every input's footer index into one mergeOrder, sized up front from the
-// footers' lengths so the slice is allocated once.
-func loadMergeOrder(ctx context.Context, io storage.PlatformIOShim, inputs []Handle) (*mergeOrder, error) {
-	type footer struct {
-		size     int64
-		indexLen int
-	}
-	footers := make([]footer, len(inputs))
-	capacity := 0
-	for i, in := range inputs {
-		r := NewDefaultReader(io, in)
-		size, err := r.segmentSize()
-		if err == nil && size >= 40+footerTrailerSize {
-			footers[i].size = size
-			footers[i].indexLen, err = r.readFooterIndexLen(size)
-		}
+// openMergeSources opens a mergeSource per input. sidecarOf, when non-nil, supplies a table's
+// sidecar (a store passes the ones it has open, building them where missing); otherwise each
+// input's sidecar file is opened if it has a valid one. An input without one is read from its
+// footer and sorted in memory - its whole index, so a merge of inputs without sidecars (sidecars
+// turned off, or a shim with no local files) holds every key again, as merges did before sidecars
+// existed.
+func openMergeSources(io storage.PlatformIOShim, inputs []Handle, sidecarOf func(Handle) *sidecar) ([]mergeSource, error) {
+	paths := sidecarResolver(io)
+	sources := make([]mergeSource, 0, len(inputs))
+	for _, in := range inputs {
+		src, err := openMergeSource(io, paths, in, sidecarOf)
 		if err != nil {
+			closeMergeSources(sources)
 			// One unreadable table must not cost the whole store its
 			// compaction, and must not silently drop the keys it held
 			// either - so the compaction is abandoned rather than
 			// completed with a hole in it.
 			return nil, fmt.Errorf("sstable: compaction could not read %s: %w", in.SegmentName, err)
 		}
-		capacity += footers[i].indexLen/minFooterLine + 1
+		sources = append(sources, src)
 	}
-	m := &mergeOrder{entries: make([]indexEntry, 0, capacity), ends: make([]int, len(inputs))}
-	for i, in := range inputs {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if footers[i].size > 0 {
-			var err error
-			m.entries, err = NewDefaultReader(io, in).appendIndexEntries(m.entries, footers[i].size, footers[i].indexLen)
-			if err != nil {
-				return nil, fmt.Errorf("sstable: compaction could not read %s: %w", in.SegmentName, err)
-			}
-		}
-		m.ends[i] = len(m.entries)
-	}
-	if len(m.entries) > math.MaxUint32 {
-		return nil, fmt.Errorf("sstable: %d entries is more than one compaction can order", len(m.entries))
-	}
-	m.ords = make([]uint32, len(m.entries))
-	for i := range m.ords {
-		m.ords[i] = uint32(i)
-	}
-	return m, nil
+	return sources, nil
 }
 
-// ErrNothingToCompact reports a merge whose inputs held nothing worth
-// writing out. Not a failure: the caller deletes the inputs and is done.
-var ErrNothingToCompact = fmt.Errorf("sstable: the inputs hold nothing to write")
+func openMergeSource(io storage.PlatformIOShim, paths storage.LocalPathResolver, in Handle, sidecarOf func(Handle) *sidecar) (mergeSource, error) {
+	if sidecarOf != nil {
+		if sc := sidecarOf(in); sc != nil {
+			return &sidecarSource{sc: sc}, nil
+		}
+	}
+	r := NewDefaultReader(io, in)
+	size, err := r.segmentSize()
+	if err != nil {
+		return nil, err
+	}
+	if size < 40+footerTrailerSize {
+		return &sliceSource{}, nil // no footer, so no entries - as Index reads it
+	}
+	if sidecarOf == nil {
+		if path, ok := sidecarPath(paths, in.SegmentName); ok {
+			if _, fileHash, err := r.identity(); err == nil {
+				if sc, err := openSidecar(path, size, fileHash); err == nil {
+					return &sidecarSource{sc: sc, owned: true}, nil
+				}
+			}
+		}
+	}
+	entries, err := r.indexEntries(size)
+	if err != nil {
+		return nil, err
+	}
+	return &sliceSource{entries: sortIndexEntries(entries)}, nil
+}
+
+func closeMergeSources(sources []mergeSource) {
+	for _, s := range sources {
+		s.close()
+	}
+}
+
+// mergeCursor is one input's position in a merge: a batch of its entries and where in it.
+type mergeCursor struct {
+	src   mergeSource
+	input int
+	buf   []indexEntry
+	i, n  int
+}
+
+func (c *mergeCursor) head() *indexEntry { return &c.buf[c.i] }
+
+// advance moves to the next entry, refilling the batch when it is used up, and reports false at
+// the input's end.
+func (c *mergeCursor) advance() (bool, error) {
+	if c.n > 0 {
+		c.i++
+	}
+	if c.i < c.n {
+		return true, nil
+	}
+	n, err := c.src.fill(c.buf)
+	if err != nil {
+		return false, err
+	}
+	c.i, c.n = 0, n
+	return n > 0, nil
+}
+
+// mergeHeap orders cursors by their current key, then by input, oldest first.
+type mergeHeap []*mergeCursor
+
+func (h mergeHeap) Len() int { return len(h) }
+
+func (h mergeHeap) Less(i, j int) bool {
+	if c := bytes.Compare(h[i].head().key.Bytes[:], h[j].head().key.Bytes[:]); c != 0 {
+		return c < 0
+	}
+	return h[i].input < h[j].input
+}
+
+func (h mergeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *mergeHeap) Push(x any) { *h = append(*h, x.(*mergeCursor)) }
+
+func (h *mergeHeap) Pop() any {
+	old := *h
+	c := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return c
+}
+
+// runWriter writes a merge's output as a run of tables, starting a new one whenever the current
+// one reaches mergeTableBytes or mergeTableKeys.
+//
+// Every table is written under its partial name and renamed only once the last is complete
+// (commit), because DiscoverTables registers every name under sstable/ and a table a crash left
+// half-written there would be read as one. A crash part way through the renames leaves some of
+// the run registered beside its inputs, which is harmless: every key is the hash of its value, so
+// they hold the same bytes, and the next merge takes them in. A shim that cannot rename writes the
+// tables' own names directly, which leaves that window open for it; both shims in this codebase
+// rename.
+//
+// Each table's sidecar is written as soon as the table is complete, at its final name's path, so
+// the table's index can be dropped before the next table starts.
+type runWriter struct {
+	io          storage.PlatformIOShim
+	namespaceID string
+	level       int
+	runID       string
+	renamer     storage.SegmentRenamer
+
+	b      *tableBuilder
+	tables []runTable
+	// index and buf are the finished table's, reused by the next.
+	index []indexEntry
+	buf   []byte
+}
+
+type runTable struct {
+	writing, name string // writing is the partial name until commit renames it to name
+	fileHash      codec.Hash
+}
+
+func newRunWriter(io storage.PlatformIOShim, namespaceID string, level int) (*runWriter, error) {
+	runID, err := codec.RandomUUID()
+	if err != nil {
+		return nil, err
+	}
+	w := &runWriter{io: io, namespaceID: namespaceID, level: level, runID: runID.String()}
+	w.renamer, _ = io.(storage.SegmentRenamer)
+	return w, nil
+}
+
+// runTableID names a run's seq'th table: the run's id and a sequence number, which is how runOf
+// tells a merge's tables from flushed ones and from each other merge's.
+func runTableID(runID string, seq int) string { return fmt.Sprintf("%s.%04d", runID, seq) }
+
+// runOf names the run a table belongs to: its file name before the sequence number for a merge's
+// table, and the whole file name for a flushed table (or one merged before merges were split),
+// which is a run of its own.
+func runOf(segmentName string) string {
+	base := segmentName[strings.LastIndexByte(segmentName, '/')+1:]
+	if i := strings.LastIndexByte(base, '.'); i > 0 {
+		return segmentName[:len(segmentName)-len(base)+i]
+	}
+	return segmentName
+}
+
+// countRuns reports how many runs tables hold.
+func countRuns(tables []Handle) int {
+	runs := make(map[string]struct{}, len(tables))
+	for _, t := range tables {
+		runs[runOf(t.SegmentName)] = struct{}{}
+	}
+	return len(runs)
+}
+
+func (w *runWriter) start() {
+	id := runTableID(w.runID, len(w.tables))
+	t := runTable{name: storio.SegmentNameBuilder.SSTable(w.namespaceID, w.level, id)}
+	t.writing = t.name
+	if w.renamer != nil {
+		t.writing = storio.SegmentNameBuilder.SSTablePartial(w.namespaceID, id)
+	}
+	w.tables = append(w.tables, t)
+	if w.buf == nil {
+		w.b = newTableBuilder(w.io, t.writing, 0)
+		return
+	}
+	w.b = &tableBuilder{shim: w.io, segmentName: t.writing, buf: w.buf[:0], index: w.index[:0], hash: sha256.New()}
+}
+
+func (w *runWriter) put(key codec.Hash, value []byte) error {
+	if w.b == nil {
+		w.start()
+	}
+	if err := w.b.put(key, value); err != nil {
+		return err
+	}
+	return w.maybeFinish()
+}
+
+func (w *runWriter) delete(key codec.Hash) error {
+	if w.b == nil {
+		w.start()
+	}
+	w.b.delete(key)
+	return w.maybeFinish()
+}
+
+func (w *runWriter) maybeFinish() error {
+	if w.b.offset < mergeTableBytes && len(w.b.index) < mergeTableKeys {
+		return nil
+	}
+	return w.finishTable()
+}
+
+// finishTable completes the current table and writes its sidecar.
+func (w *runWriter) finishTable() error {
+	b := w.b
+	w.b = nil
+	size, fileHash, err := b.finish()
+	if err != nil {
+		return err
+	}
+	t := &w.tables[len(w.tables)-1]
+	t.fileHash = fileHash
+	writeSidecar(w.io, t.name, b.index, size, fileHash)
+	w.index, w.buf = b.index, b.buf
+	return nil
+}
+
+// commit completes the last table and gives every table its own name, sealed.
+func (w *runWriter) commit() ([]Handle, error) {
+	if w.b != nil {
+		if err := w.finishTable(); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]Handle, 0, len(w.tables))
+	for i := range w.tables {
+		t := &w.tables[i]
+		if t.writing != t.name {
+			if err := w.renamer.RenameSegment(t.writing, t.name); err != nil {
+				return nil, err
+			}
+			// From here a failure deletes the table under its own name, which is complete but
+			// not registered: discovered by a later open it would merely duplicate the inputs'
+			// keys.
+			t.writing = t.name
+		}
+		if err := w.io.SealSegment(t.name); err != nil {
+			return nil, err
+		}
+		out = append(out, Handle{FileHash: t.fileHash, Level: w.level, SegmentName: t.name})
+	}
+	return out, nil
+}
+
+// abort deletes every table the merge wrote, and their sidecars. Deleting a segment that was
+// never created is not an error.
+func (w *runWriter) abort() {
+	paths := sidecarResolver(w.io)
+	for _, t := range w.tables {
+		_ = w.io.DeleteSegment(t.writing)
+		if path, ok := sidecarPath(paths, t.name); ok {
+			_ = os.Remove(path)
+		}
+	}
+}
