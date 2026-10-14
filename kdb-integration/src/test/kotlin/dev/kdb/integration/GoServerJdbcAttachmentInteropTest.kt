@@ -2,6 +2,7 @@ package dev.kdb.integration
 
 import dev.kdb.jdbc.AttachmentContentHash
 import dev.kdb.jdbc.KdbAttachmentException
+import dev.kdb.jdbc.KdbAttachmentRangeException
 import dev.kdb.jdbc.KdbAttachmentSelector
 import dev.kdb.jdbc.KdbAttachments
 import dev.kdb.jdbc.KdbDriver
@@ -312,7 +313,65 @@ class GoServerJdbcAttachmentInteropTest {
             assertNotNull(att.info(doc, KdbAttachmentSelector.byName("a")))
         }
 
+    @Test
+    fun verifiedRangeReadsAgainstGo() =
+        connect { conn ->
+            assertTrue(conn.unwrap(KdbRemoteConnection::class.java).attachmentProofsSupported, "Go server did not agree attachment-proofs")
+            val doc = newDoc(conn, "ranges")
+            val att = conn.unwrap(KdbAttachments::class.java)
+            // document's range-proof golden attachment: 4 MiB + 5 bytes, byte i = i mod 251.
+            val data = ByteArray(4 * MIB + 5) { (it % 251).toByte() }
+            val size = data.size.toLong()
+            val put = att.put(doc, data, KdbPutAttachmentOptions(name = "r.bin"))
+            assertEquals("1a57b9052a9bae5f2bbaa720791a30f99ea84caecaa0898551c84d1746d3ae27", put.info.hashHex)
+            val ref = KdbAttachmentSelector.byName("r.bin")
+            for ((off, length) in listOf(0L to 10L, MIB + 100L to 50L, MIB - 10L to 20L, 100L to 4L * MIB + 7 - 100, 0L to -1L, size - 1 to 1L, size to -1L, 2L * MIB + 1 to 0L)) {
+                val s = att.openRange(doc, ref, null, off, length)
+                val got = s.use { it.readAllBytes() }
+                val end = if (length >= 0) minOf(size, off + length) else size
+                assertContentEquals(data.copyOfRange(off.toInt(), end.toInt()), got, "range $off+$length")
+                assertEquals(put.commitHex, s.commitHex)
+                assertFalse(s.superseded)
+            }
+            val past = assertFailsWith<KdbAttachmentRangeException> { att.openRange(doc, ref, null, size + 1, 1) }
+            assertEquals(size, past.size)
+            // A failed open leaves no read pinned: more of them than a connection's read limit.
+            repeat(70) { assertFailsWith<KdbAttachmentRangeException> { att.openRange(doc, ref, null, size + 1, 1) } }
+            val p = ByteArray(10)
+            assertEquals(3, att.readAt(doc, ref, null, p, size - 3))
+            assertContentEquals(data.copyOfRange((size - 3).toInt(), size.toInt()), p.copyOf(3))
+
+            // A java.sql.Blob over it, 1-based.
+            val blob = att.blob(doc, ref)!!
+            assertEquals(size, blob.length())
+            assertContentEquals(data.copyOfRange(MIB - 1, MIB + 9), blob.getBytes(MIB.toLong(), 10))
+            assertContentEquals(data.copyOfRange(3 * MIB, 4 * MIB + 5), blob.getBinaryStream(3L * MIB + 1, MIB + 5L).readAllBytes())
+
+            // A range pins its version and reports a newer one at the end of its range (Go's close reply).
+            att.openRange(doc, ref, null, MIB - 1L, 2L * MIB).use { s ->
+                val head = ByteArray(2)
+                assertEquals(2, s.readNBytes(head, 0, 2))
+                connect { other ->
+                    other.unwrap(KdbAttachments::class.java).put(doc, "replaced".encodeToByteArray(), KdbPutAttachmentOptions(name = "r.bin"))
+                }
+                val rest = s.readAllBytes()
+                assertContentEquals(data.copyOfRange(MIB - 1, 3 * MIB - 1), head + rest)
+                assertTrue(s.superseded, "the range read did not report the newer version")
+            }
+            // The old version stays readable by commit, and the blob kept it.
+            assertContentEquals(data.copyOfRange((size - 5).toInt(), size.toInt()), att.getRange(doc, ref, put.commitHex, size - 5, 100))
+            assertContentEquals(data.copyOf(4), blob.getBytes(1, 4))
+
+            // A zero-byte attachment: its one empty chunk is proved.
+            att.put(doc, ByteArray(0), KdbPutAttachmentOptions(name = "empty"))
+            for (length in listOf(-1L, 0L, 10L)) {
+                assertEquals(0, att.openRange(doc, KdbAttachmentSelector.byName("empty"), null, 0, length).use { it.readAllBytes() }.size)
+            }
+            assertFailsWith<KdbAttachmentRangeException> { att.openRange(doc, KdbAttachmentSelector.byName("empty"), null, 1, 1) }
+        }
+
     private companion object {
         const val NS = "app/data"
+        const val MIB = 1 shl 20
     }
 }

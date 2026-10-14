@@ -97,6 +97,32 @@ private fun BinReader.info(wireType: Int): WireAttachmentInfo {
     return WireAttachmentInfo(id, name, hash, size, mime)
 }
 
+/** One nested field per chunk proof: 1 its leaf index (left out when 0), 2 each path hash, as 32
+ * raw bytes, bottom up. Proof hashes are list elements: written whatever their value. */
+private fun BinWriter.proofs(field: Int, chunks: List<WireBlobChunkProof>) {
+    for (c in chunks) {
+        nested(field) {
+            int(1, c.leaf)
+            for (h in c.path) bytesField(2, h.bytes)
+        }
+    }
+}
+
+private fun BinReader.proof(wireType: Int): WireBlobChunkProof {
+    val c = nested(wireType)
+    var leaf = 0L
+    val path = ArrayList<KdbHash>()
+    c.forEachField { cf, cwt ->
+        when (cf) {
+            1 -> leaf = c.long(cwt)
+            2 -> path.add(c.hash(cwt))
+            else -> return@forEachField false
+        }
+        true
+    }
+    return WireBlobChunkProof(leaf, path)
+}
+
 /** Writes [message]'s body to [w] if it is an attachment message; false otherwise. */
 internal fun encodeAttachmentBody(w: BinWriter, message: WireMessage): Boolean {
     when (val m = message) {
@@ -127,6 +153,7 @@ internal fun encodeAttachmentBody(w: BinWriter, message: WireMessage): Boolean {
             w.int(8, m.maxBytes)
             w.string(9, m.readId)
             w.bool(10, m.close)
+            w.bool(11, m.proofs)
         }
         is WireMessage.AttachmentData -> {
             w.string(1, m.namespace)
@@ -139,6 +166,9 @@ internal fun encodeAttachmentBody(w: BinWriter, message: WireMessage): Boolean {
             w.bool(8, m.eof)
             w.bool(9, m.superseded)
             w.err(10, m.error, m.errorCode)
+            w.hash(12, m.tree)
+            w.proofs(13, m.chunks)
+            w.int(14, m.scheme.toLong())
         }
         is WireMessage.AttachmentList -> {
             w.string(1, m.namespace)
@@ -176,13 +206,7 @@ internal fun encodeAttachmentBody(w: BinWriter, message: WireMessage): Boolean {
                     hash(4, p.tree)
                     int(5, p.offset)
                     bytes(6, p.data)
-                    for (c in p.chunks) {
-                        nested(7) {
-                            int(1, c.leaf)
-                            // Proof hashes are list elements: written whatever their value.
-                            for (h in c.path) bytesField(2, h.bytes)
-                        }
-                    }
+                    proofs(7, p.chunks)
                     bool(8, p.eof)
                     bool(9, p.superseded)
                     err(10, p.error, p.errorCode)
@@ -254,6 +278,7 @@ internal fun decodeAttachmentBody(header: WireHeader, r: BinReader): WireMessage
             var maxBytes = 0L
             var readId = ""
             var close = false
+            var proofs = false
             r.forEachField { f, wt ->
                 when (f) {
                     1 -> namespace = r.string(wt)
@@ -266,12 +291,13 @@ internal fun decodeAttachmentBody(header: WireHeader, r: BinReader): WireMessage
                     8 -> maxBytes = r.long(wt)
                     9 -> readId = r.string(wt)
                     10 -> close = r.bool(wt)
+                    11 -> proofs = r.bool(wt)
                     else -> return@forEachField false
                 }
                 true
             }
             WireMessage.AttachmentGet(
-                header, namespace, sessionId, docId, attachmentId, name, asOfHex, offset, maxBytes, readId, close,
+                header, namespace, sessionId, docId, attachmentId, name, asOfHex, offset, maxBytes, readId, close, proofs,
             )
         }
         WireMessageType.ATTACHMENT_DATA -> {
@@ -286,6 +312,9 @@ internal fun decodeAttachmentBody(header: WireHeader, r: BinReader): WireMessage
             var superseded = false
             var error: String? = null
             var errorCode: String? = null
+            var tree: KdbHash? = null
+            val chunks = ArrayList<WireBlobChunkProof>()
+            var scheme = 0
             r.forEachField { f, wt ->
                 when (f) {
                     1 -> namespace = r.string(wt)
@@ -299,12 +328,16 @@ internal fun decodeAttachmentBody(header: WireHeader, r: BinReader): WireMessage
                     9 -> superseded = r.bool(wt)
                     10 -> error = r.string(wt)
                     11 -> errorCode = r.string(wt)
+                    12 -> tree = r.hash(wt)
+                    13 -> chunks.add(r.proof(wt))
+                    14 -> scheme = r.int(wt)
                     else -> return@forEachField false
                 }
                 true
             }
             WireMessage.AttachmentData(
                 header, namespace, readId, docId, info, commitHex, offset, data, eof, superseded, error, errorCode,
+                tree, chunks, scheme,
             )
         }
         WireMessageType.ATTACHMENT_LIST -> {
@@ -422,20 +455,7 @@ private fun decodeBlobPart(r: BinReader): WireBlobFetchPart {
             4 -> tree = r.hash(wt)
             5 -> offset = r.long(wt)
             6 -> data = r.bytes(wt)
-            7 -> {
-                val c = r.nested(wt)
-                var leaf = 0L
-                val path = ArrayList<KdbHash>()
-                c.forEachField { cf, cwt ->
-                    when (cf) {
-                        1 -> leaf = c.long(cwt)
-                        2 -> path.add(c.hash(cwt))
-                        else -> return@forEachField false
-                    }
-                    true
-                }
-                chunks.add(WireBlobChunkProof(leaf, path))
-            }
+            7 -> chunks.add(r.proof(wt))
             8 -> eof = r.bool(wt)
             9 -> superseded = r.bool(wt)
             10 -> error = r.string(wt)

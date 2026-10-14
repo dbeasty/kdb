@@ -9,7 +9,13 @@ import dev.kdb.schema.SchemaField
 import dev.kdb.server.KdbServerRuntime
 import dev.kdb.server.SqlWireHost
 import dev.kdb.transport.ws.JvmNetworkWebSocketServer
+import dev.kdb.wire.HandshakePayload
 import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
+import dev.kdb.wire.SUPPORTED_WIRE_FEATURES
+import dev.kdb.wire.WIRE_FEATURE_ATTACHMENTS
+import dev.kdb.wire.WIRE_FEATURE_ATTACHMENT_PROOFS
+import dev.kdb.wire.WIRE_FEATURE_BINARY
+import dev.kdb.wire.WireClientMode
 import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
@@ -127,6 +133,21 @@ class AttachmentUnsupportedTest {
             assertEquals(42, reply.header.correlationId)
             assertEquals("UNSUPPORTED", reply.errorCode)
 
+            // Offered every feature, it acks neither attachments nor attachment-proofs.
+            val hs =
+                WireMessage.Handshake(
+                    WireHeader(WireMessageType.HANDSHAKE, KDB_WIRE_PROTOCOL_VERSION, 43, 0),
+                    HandshakePayload(
+                        nodeId = "t", namespaces = listOf(ns), localHeads = emptyMap(), clientMode = WireClientMode.SQL_CLIENT,
+                        wireFeatures = SUPPORTED_WIRE_FEATURES,
+                    ),
+                )
+            val ack = wire.decode(host.handleFrame(wire.encode(hs))!!) as WireMessage.HandshakeAck
+            assertTrue(ack.response.accepted)
+            assertTrue(WIRE_FEATURE_BINARY in ack.response.wireFeatures, "${ack.response.wireFeatures}")
+            assertFalse(WIRE_FEATURE_ATTACHMENTS in ack.response.wireFeatures)
+            assertFalse(WIRE_FEATURE_ATTACHMENT_PROOFS in ack.response.wireFeatures)
+
             val server = JvmNetworkWebSocketServer()
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val job =
@@ -139,8 +160,12 @@ class AttachmentUnsupportedTest {
             try {
                 DriverManager.getConnection("jdbc:kdb://127.0.0.1:${server.port}/$ns").use { conn ->
                     assertFalse(conn.unwrap(KdbRemoteConnection::class.java).attachmentsSupported)
+                    assertFalse(conn.unwrap(KdbRemoteConnection::class.java).attachmentProofsSupported)
                     val att = conn.unwrap(KdbAttachments::class.java)
                     assertFailsWith<SQLFeatureNotSupportedException> { att.list(KdbUuid.random().toString()) }
+                    val doc = KdbUuid.random().toString()
+                    assertFailsWith<SQLFeatureNotSupportedException> { att.openRange(doc, KdbAttachmentSelector.byName("a"), null, 0, -1) }
+                    assertFailsWith<SQLFeatureNotSupportedException> { att.readAt(doc, KdbAttachmentSelector.byName("a"), null, ByteArray(1), 0) }
                     conn.prepareStatement("SELECT _doc FROM users WHERE userId = ?").use { ps ->
                         ps.setBytes(1, byteArrayOf(1))
                         assertFailsWith<SQLFeatureNotSupportedException> { ps.executeQuery() }

@@ -499,7 +499,13 @@ public sealed class WireMessage {
     /** Reads one attachment of a document - by [attachmentId], or by [name] - as of [asOfHex] (empty:
      * the session's read head), from [offset], at most [maxBytes] (0: a server default). The first
      * page's result carries a readId that pins the version; later pages send it back. [close] (with
-     * a readId) ends a read early. */
+     * a readId) ends a read early; its result's superseded says whether the attachment has changed
+     * since the read began.
+     *
+     * [proofs] (behind [WIRE_FEATURE_ATTACHMENT_PROOFS]) asks for verifiable pages: the server rounds
+     * [offset] down and the page's end up to 1 MiB chunk boundaries (the end at most to the
+     * attachment's), and the result carries the blob's tree and an audit path per chunk, as
+     * BLOB_FETCH does. */
     public data class AttachmentGet(
         override val header: WireHeader,
         val namespace: String,
@@ -512,10 +518,16 @@ public sealed class WireMessage {
         val maxBytes: Long = 0,
         val readId: String = "",
         val close: Boolean = false,
+        val proofs: Boolean = false,
     ) : WireMessage()
 
     /** One page of an attachment. [eof] marks the last; [superseded], on the last page, says the
-     * document's attachment changed since the read began. */
+     * document's attachment changed since the read began.
+     *
+     * Answering a get with proofs, [data] covers whole chunks from a chunk-aligned [offset] (the last
+     * may be short), [chunks] proves each (bottom-up audit paths to [tree]) and [scheme] is the
+     * content hash's scheme (1); info.hash is then attachmentIdentity(tree, info.size). A zero-byte
+     * attachment's page proves its one empty chunk. */
     public class AttachmentData(
         override val header: WireHeader,
         public val namespace: String,
@@ -529,22 +541,25 @@ public sealed class WireMessage {
         public val superseded: Boolean = false,
         public val error: String? = null,
         public val errorCode: String? = null,
+        public val tree: KdbHash? = null,
+        public val chunks: List<WireBlobChunkProof> = emptyList(),
+        public val scheme: Int = 0,
     ) : WireMessage() {
         override fun equals(other: Any?): Boolean =
             other is AttachmentData && header == other.header && namespace == other.namespace &&
                 readId == other.readId && docId == other.docId && info == other.info &&
                 commitHex == other.commitHex && offset == other.offset && data.contentEquals(other.data) &&
                 eof == other.eof && superseded == other.superseded && error == other.error &&
-                errorCode == other.errorCode
+                errorCode == other.errorCode && tree == other.tree && chunks == other.chunks && scheme == other.scheme
 
         override fun hashCode(): Int =
-            listOf(header, namespace, readId, docId, info, commitHex, offset, eof, superseded, error, errorCode)
+            listOf(header, namespace, readId, docId, info, commitHex, offset, eof, superseded, error, errorCode, tree, chunks, scheme)
                 .hashCode() * 31 + data.contentHashCode()
 
         override fun toString(): String =
             "AttachmentData(header=$header, namespace=$namespace, readId=$readId, docId=$docId, info=$info, " +
                 "commitHex=$commitHex, offset=$offset, data=${data.size} bytes, eof=$eof, superseded=$superseded, " +
-                "error=$error, errorCode=$errorCode)"
+                "error=$error, errorCode=$errorCode, tree=$tree, chunks=$chunks, scheme=$scheme)"
     }
 
     /** Lists a document's attachments as of [asOfHex] (empty: the read head). */

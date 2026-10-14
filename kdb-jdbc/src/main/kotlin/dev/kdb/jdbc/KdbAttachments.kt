@@ -85,12 +85,37 @@ public data class KdbPutAttachmentOptions
  * A refusal from the attachment API: the server's error and its typed code (NOT_FOUND, CONFLICT,
  * UNAUTHORIZED, UNSUPPORTED, ...). For an interrupted upload, [uploadState] says where to resume.
  */
-public class KdbAttachmentException(
+public open class KdbAttachmentException(
     message: String,
     public val errorCode: String? = null,
     public val uploadState: KdbUploadState? = null,
     cause: Throwable? = null,
 ) : SQLException(message, sqlStateFor(errorCode), cause)
+
+/**
+ * Attachment bytes that do not match their content hash (Go's ErrAttachmentCorrupt): a chunk whose
+ * inclusion proof fails, bytes no proof covers, a tree that does not hash to the content hash - or
+ * the server's own INTEGRITY refusal. A verified ranged read throws it before handing out any byte
+ * of the page it found wrong; from a stream's read it arrives as the cause of an IOException.
+ */
+public class KdbAttachmentIntegrityException(
+    message: String,
+    cause: Throwable? = null,
+) : KdbAttachmentException(message, "INTEGRITY", null, cause)
+
+/**
+ * A ranged read starting past the attachment's end (Go's AttachmentRangeError). [size] is the
+ * attachment's length, or -1 when the offset (negative) was refused before the server was asked.
+ */
+public class KdbAttachmentRangeException(
+    public val offset: Long,
+    public val size: Long,
+) : KdbAttachmentException(
+        if (size < 0) "attachment offset $offset is negative" else "attachment offset $offset is past its $size bytes",
+    ) {
+    /** SQLSTATE 22011, substring error. */
+    override fun getSQLState(): String = "22011"
+}
 
 private fun sqlStateFor(code: String?): String? =
     when (code) {
@@ -98,6 +123,7 @@ private fun sqlStateFor(code: String?): String? =
         "NOT_FOUND" -> "02000"
         "UNAUTHORIZED" -> "42501"
         "UNSUPPORTED" -> "0A000"
+        "INTEGRITY" -> "XX001"
         else -> null
     }
 
@@ -106,6 +132,9 @@ internal interface AttachmentHost {
     val namespace: String
     val sessionId: String
     val attachmentsAgreed: Boolean
+
+    /** Whether the server agreed `attachment-proofs` too: verified ranged reads. */
+    val attachmentProofsAgreed: Boolean
     val inTransaction: Boolean
     val authorNodeId: KdbUuid
 
@@ -124,6 +153,9 @@ internal interface AttachmentHost {
  * - Downloads ([open]) stream page by page from a read that pins the version it started on, and a
  *   whole-attachment read is verified against the attachment's content hash before its last bytes
  *   are handed out.
+ * - Ranged reads ([openRange], [readAt], [getRange], and [blob]'s positioned reads; wire feature
+ *   `attachment-proofs`) fetch whole chunks with their Merkle inclusion proofs and verify each chunk
+ *   before handing out any of its bytes, without downloading the rest of the attachment.
  * - [put], [rename] and [delete] commit at once, as their own transaction (an AttachmentPut or
  *   AttachmentDelete op through TX_COMMIT); inside a manual JDBC transaction use SQL instead
  *   (`UPDATE .. SET ATTACHMENT 'name' = STREAM ?`), which commits with it.
@@ -213,6 +245,95 @@ public class KdbAttachments internal constructor(
         return KdbAttachmentInputStream(host, parseDoc(docId), selector, asOfHex ?: "", offset, pageBytes).also {
             it.start()
         }
+    }
+
+    /**
+     * Opens [length] bytes of one attachment from [offset] ([length] -1: to the end; a range running
+     * past the end stops there), as of [asOfHex] (null: the read head) - Go's OpenAttachmentRange.
+     * Every chunk the range touches is checked against the content hash with its RFC 6962 inclusion
+     * proof before any of its bytes is handed out, so a mismatch is a [KdbAttachmentIntegrityException]
+     * with no bad byte returned; the rest of the attachment is never downloaded. The stream pins its
+     * version like [open], and reports [KdbAttachmentRangeInputStream.superseded] once the range has
+     * been read.
+     *
+     * An offset past the end is a [KdbAttachmentRangeException]; the server must have agreed the
+     * `attachment-proofs` wire feature (else SQLFeatureNotSupportedException).
+     */
+    public fun openRange(
+        docId: String,
+        selector: KdbAttachmentSelector,
+        asOfHex: String?,
+        offset: Long,
+        length: Long,
+    ): KdbAttachmentRangeInputStream {
+        requireAgreed()
+        if (!host.attachmentProofsAgreed) throw java.sql.SQLFeatureNotSupportedException(PROOFS_NOT_AGREED)
+        if (offset < 0) throw KdbAttachmentRangeException(offset, -1)
+        if (length < -1) throw SQLException("invalid attachment range length $length")
+        val doc = parseDoc(docId)
+        return KdbAttachmentRangeInputStream(host, doc, selector, asOfHex ?: "", offset, length).also { it.start() }
+    }
+
+    /**
+     * Reads up to [length] bytes of one attachment from [offset], verified (see [openRange]): fewer
+     * only when the attachment ends first, none at its end.
+     */
+    public fun getRange(
+        docId: String,
+        selector: KdbAttachmentSelector,
+        asOfHex: String?,
+        offset: Long,
+        length: Int,
+    ): ByteArray {
+        if (length < 0) throw SQLException("invalid attachment range length $length")
+        return openRange(docId, selector, asOfHex, offset, length.toLong()).use { s ->
+            try {
+                s.readAllBytes()
+            } catch (e: IOException) {
+                throw unwrapRead(e)
+            }
+        }
+    }
+
+    /**
+     * Reads into [buffer] (all of it) from [position] of one attachment, as of [asOfHex] (null: the
+     * head) - Go's ReadAttachmentAt, like a positional read: returns how many bytes were read, fewer
+     * than buffer.size only when the attachment ends first (0 at its end). Each call is its own
+     * read, so to read one version across calls pass a commit as [asOfHex] (a stream's
+     * [KdbAttachmentRangeInputStream.commitHex], say). A position past the end is a
+     * [KdbAttachmentRangeException].
+     */
+    public fun readAt(
+        docId: String,
+        selector: KdbAttachmentSelector,
+        asOfHex: String?,
+        buffer: ByteArray,
+        position: Long,
+    ): Int =
+        openRange(docId, selector, asOfHex, position, buffer.size.toLong()).use { s ->
+            try {
+                readFully(s, buffer, buffer.size)
+            } catch (e: IOException) {
+                throw unwrapRead(e)
+            }
+        }
+
+    /**
+     * One attachment as a read-only java.sql.Blob, pinned to the version current at [asOfHex] (null:
+     * the read head) as of this call: every read of it sees those bytes. [java.sql.Blob.getBytes] and
+     * [java.sql.Blob.getBinaryStream] with a position read verified ranges ([openRange]); the
+     * whole-blob stream is verified against the content hash ([open]). Null when [docId] has no
+     * attachment matching [selector].
+     */
+    @JvmOverloads
+    public fun blob(
+        docId: String,
+        selector: KdbAttachmentSelector,
+        asOfHex: String? = null,
+    ): KdbAttachmentBlob? {
+        val (items, commit) = runBlocking { listSuspend(parseDoc(docId), asOfHex ?: "") }
+        val info = selector.find(items) ?: return null
+        return KdbAttachmentBlob(this, docId, info, commit.ifEmpty { asOfHex ?: "" })
     }
 
     /** One attachment's bytes, whole and verified. Large attachments are better read with [open]. */
@@ -439,6 +560,12 @@ public class KdbAttachments internal constructor(
         const val DEFAULT_PAGE_BYTES: Int = 1 shl 20
         const val ATTACHMENTS_NOT_AGREED: String =
             "the server did not agree the 'attachments' wire feature: it cannot store or serve attachments"
+        const val PROOFS_NOT_AGREED: String =
+            "the server did not agree the 'attachment-proofs' wire feature: it cannot serve verified ranged reads"
+
+        /** A stream read's IOException as the typed SQLException it wraps, when it wraps one. */
+        fun unwrapRead(e: IOException): SQLException =
+            e.cause as? SQLException ?: KdbAttachmentException(e.message ?: "attachment read failed", cause = e)
 
         fun hdr(type: WireMessageType): WireHeader = WireHeader(type, KDB_WIRE_PROTOCOL_VERSION, 0, 0)
 

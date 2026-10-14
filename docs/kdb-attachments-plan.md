@@ -194,8 +194,10 @@ identity = SHA-256(0x02 || be64(size) || tree)
   any of its bytes, and trims the pages to the caller's range. An offset past the end fails
   `SCHEMA_VIOLATION` with `Info` still set (clients raise a typed range error); a `Close` reply
   carries `Superseded`, so a range that ends before the attachment does still learns it. Go
-  `OpenAttachmentRange` / `ReadAttachmentAt`; the TS and Kotlin clients and JDBC
-  `Blob.getBytes(pos, len)` / `getBinaryStream(pos, len)` mirror them.
+  `OpenAttachmentRange` / `ReadAttachmentAt`; TS `openAttachmentRange` / `readAttachmentAt`; Kotlin
+  `KdbAttachments.openRange` / `readAt` / `getRange`, and `KdbAttachments.blob()`, a `java.sql.Blob`
+  whose `getBytes(pos, len)` / `getBinaryStream(pos, len)` read verified ranges. The Kotlin server
+  acks neither feature.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
   (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
   Kotlin server answers the messages `UNSUPPORTED`.
