@@ -171,6 +171,10 @@ func (h *V2Host) attachmentUpload(m wire.AttachmentUploadMessage) (wire.Message,
 		if r, err := env.Attachments.Open(m.Expect); err == nil {
 			out.Hash, out.Size, out.Received = m.Expect, r.Size(), r.Size()
 			_ = r.Close()
+			// The REF_UPDATE referencing it comes next: hold the blob until it does.
+			if _, err := env.Attachments.Hold(m.Expect); err != nil {
+				return nil, err
+			}
 			return out, nil
 		}
 	}

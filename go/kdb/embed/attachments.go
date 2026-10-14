@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sort"
 	"sync"
 
@@ -125,7 +126,8 @@ func (rt *EmbeddedKdbRuntime) SetAttachmentHistory(h AttachmentHistory) {
 	rt.attach.mu.Unlock()
 }
 
-// SetAttachmentConfig tunes the attachment store (size limit, chunking, deltas). Takes effect for
+// SetAttachmentConfig tunes the attachment store (size limit, chunking, deltas, upload grace). It
+// replaces the whole configuration, StorageOptions.AttachmentUploadGrace included. Takes effect for
 // stores opened afterwards.
 func (rt *EmbeddedKdbRuntime) SetAttachmentConfig(cfg attachstore.Config) {
 	rt.attach.mu.Lock()
@@ -622,6 +624,24 @@ func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *att
 		}
 	}
 	return nil
+}
+
+// attachmentsCommitted ends the upload hold (attachstore.Config.UploadGrace) on the blobs a
+// durable commit references: from here on its references keep them.
+func (rt *EmbeddedKdbRuntime) attachmentsCommitted(c document.Commit) {
+	ns := c.NamespaceID
+	if ns == "" {
+		ns = rt.DefaultNamespace
+	}
+	var hashes []codec.Hash
+	for _, op := range c.Operations {
+		if put, ok := op.(document.AttachmentPutOp); ok {
+			hashes = append(hashes, put.ContentHash)
+		}
+	}
+	if err := rt.AttachmentStore(ns).Committed(hashes...); err != nil {
+		log.Printf("kdb: namespace %s: attachment store: %v", ns, err)
+	}
 }
 
 // PutAttachmentBlob stores r's bytes in namespaceID's attachment store, durably, without committing
