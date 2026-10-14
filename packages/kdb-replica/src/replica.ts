@@ -16,7 +16,7 @@ import { ReplicaNamespace } from "./namespace.ts";
 import { PeerConnection, type ConflictReport } from "./peer.ts";
 import { CachedStore, type KvStore } from "./store.ts";
 import { ProjectionNamespace, type LocalWrite } from "./projection.ts";
-import { BlobStore, BlobUnavailableError } from "./blobs.ts";
+import { BlobStore, BlobUnavailableError, type BlobCacheStats } from "./blobs.ts";
 import type { Attachment } from "./attachments.ts";
 import { syncNamespace, syncProjection, type CatchUp, type NamespaceSyncResult, type ProjectionSyncResult } from "./sync.ts";
 
@@ -50,6 +50,12 @@ export interface ReplicaOptions {
   live?: boolean;
   /** Page size asked of the host, in bytes. */
   pageBytes?: number;
+  /**
+   * Bytes of fetched attachments kept; least recently used are evicted past it, and fetched again
+   * when read (default 256 MiB; 0 keeps everything). Attachments written here and not yet uploaded
+   * are never evicted.
+   */
+  blobCacheBytes?: number;
   /** Start syncing at once (default true). */
   autoSync?: boolean;
   /**
@@ -122,7 +128,7 @@ export class Replica {
   private constructor(opts: ReplicaOptions, store: CachedStore) {
     this.#opts = opts;
     this.#store = store;
-    this.#blobs = new BlobStore(store);
+    this.#blobs = new BlobStore(store, opts.blobCacheBytes);
   }
 
   static async open(opts: ReplicaOptions): Promise<Replica> {
@@ -268,6 +274,20 @@ export class Replica {
     }
     const a = await this.#find(ns, docId, sel);
     return this.write(ns, [{ kind: "attachmentDelete", docId, attachmentId: a.id }]);
+  }
+
+  /** What the attachment byte cache holds. */
+  blobCache(): Promise<BlobCacheStats> {
+    return this.#blobs.stats();
+  }
+
+  /**
+   * Evicts fetched attachment bytes, least recently used first, down to targetBytes of them (0
+   * frees every one; default: the cache's bound). Bytes written here and not yet uploaded stay.
+   * Returns the bytes freed; what was evicted is fetched again when read.
+   */
+  evictBlobs(targetBytes?: number): Promise<number> {
+    return this.#blobs.evict(targetBytes);
   }
 
   // --- events and status -------------------------------------------------------------------------

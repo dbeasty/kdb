@@ -317,8 +317,11 @@ changed after the first draft of this plan: a record has **several named attachm
   (`attachmentsChanged`, `attachments`), guarded by the hash of the set it replaced (`attachmentsBase`),
   and an attachment-only write keeps the body (`keepBody`). Blobs written here upload on the projection
   session before the PROJECT_WRITE. A refused write puts the source's attachments back with its body.
+- **Fetched bytes are a bounded cache** (`blobCacheBytes`, default 256 MiB; 0 keeps everything): the least
+  recently used blobs are evicted past it and fetched again, verified, when read. Bytes written here are
+  pinned until the host holds them and never evicted. `blobCache()` reports usage, `evictBlobs(target)` frees
+  on demand.
 - **Not yet:**
-  - evicting fetched blobs: they are kept until the replica is destroyed;
   - attachments in the Kotlin replica, which refuses commits carrying them.
 - **Bytes are lazy on the replica.** The replica stores refs and fetches bytes on first read or by a prefetch
   policy, with a blob cache under its own budget. Blobs it wrote and the host has not yet confirmed are pinned.
