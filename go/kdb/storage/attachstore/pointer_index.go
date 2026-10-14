@@ -26,8 +26,11 @@ import (
 //   - Entries live in sorted runs, <ns>/attachment/x-<seq>, newest first, and a bounded overlay
 //     of the changes since the newest run. A full overlay is written as a run; a run at least a
 //     quarter the size of the one below it is merged into it, so there are few runs and an entry
-//     is rewritten a few times, not once per change. A lookup reads the overlay, then binary
-//     searches each run.
+//     is rewritten a few times, not once per change. A run ends in fences, the first hash of
+//     every block of fenceEvery entries, so a lookup reads the overlay, then per run finds its
+//     block through the fences and searches that one block. Both go through an LRU of run blocks
+//     bounded by bytes (Config.PointerCacheBytes again), so the fences and the hot blocks stay
+//     in memory without memory growing with the blob count.
 //   - The pointers themselves (inline bytes and all) are read from their segments on demand and
 //     kept in an LRU bounded by bytes (Config.PointerCacheBytes).
 //
@@ -105,7 +108,22 @@ const defaultIndexOverlay = 16 << 10
 
 type indexRun struct {
 	name string
-	n    int64 // entries
+	n    int64 // entries; the fences follow them
+}
+
+// A run block is fenceEvery entries; a fence block, fencesPerBlock fences.
+const (
+	fenceEvery     = 128
+	fencesPerBlock = 512
+)
+
+func (r indexRun) fences() int64 { return (r.n + fenceEvery - 1) / fenceEvery }
+
+// blockKey names one block of a run: data block i, or (fence) fence block i.
+type blockKey struct {
+	run   string
+	fence bool
+	i     int64
 }
 
 // pointerIndex is the index (see above). Not safe for concurrent use: the store calls it under mu.
@@ -115,6 +133,7 @@ type pointerIndex struct {
 	max     int // overlay entries before it is written as a run
 	overlay map[codec.Hash]indexEntry
 	runs    []indexRun // newest first
+	blocks  *lru[blockKey, []byte]
 	seq     int
 	// Runs merged away while an each is reading them, deleted once none is.
 	iterating int
@@ -122,11 +141,43 @@ type pointerIndex struct {
 	spillErr  bool // a run could not be written: the overlay grows instead (logged once)
 }
 
-func newPointerIndex(shim storage.PlatformIOShim, prefix string, max int) *pointerIndex {
+func newPointerIndex(shim storage.PlatformIOShim, prefix string, max int, cacheBytes int64) *pointerIndex {
 	if max <= 0 {
 		max = defaultIndexOverlay
 	}
-	return &pointerIndex{shim: shim, prefix: prefix, max: max, overlay: map[codec.Hash]indexEntry{}}
+	blocks := newLRU[blockKey](cacheBytes, func(b []byte) int64 { return int64(len(b)) + 96 })
+	return &pointerIndex{shim: shim, prefix: prefix, max: max, overlay: map[codec.Hash]indexEntry{}, blocks: blocks}
+}
+
+// block returns block k of run r, from the cache or the run.
+func (x *pointerIndex) block(r indexRun, k blockKey) ([]byte, error) {
+	if b, ok := x.blocks.get(k); ok {
+		return b, nil
+	}
+	off, n, size := k.i*fenceEvery*entryBytes, min(int64(fenceEvery), r.n-k.i*fenceEvery), int64(entryBytes)
+	if k.fence {
+		off, n, size = r.n*entryBytes+k.i*fencesPerBlock*32, min(int64(fencesPerBlock), r.fences()-k.i*fencesPerBlock), 32
+	}
+	b, err := x.shim.ReadFromSegment(r.name, off, int(n*size))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) != n*size {
+		return nil, fmt.Errorf("attachstore: pointer index %s is short at %d", r.name, off)
+	}
+	b = append([]byte(nil), b...)
+	x.blocks.put(k, b)
+	return b, nil
+}
+
+func (x *pointerIndex) fence(r indexRun, i int64) (codec.Hash, error) {
+	b, err := x.block(r, blockKey{run: r.name, fence: true, i: i / fencesPerBlock})
+	if err != nil {
+		return codec.Hash{}, err
+	}
+	var h codec.Hash
+	copy(h.Bytes[:], b[(i%fencesPerBlock)*32:])
+	return h, nil
 }
 
 func (x *pointerIndex) isRun(name string) bool { return strings.HasPrefix(name, x.prefix+"x-") }
@@ -149,17 +200,31 @@ func (x *pointerIndex) get(h codec.Hash) (indexEntry, bool, error) {
 }
 
 func (x *pointerIndex) search(r indexRun, h codec.Hash) (indexEntry, bool, error) {
-	lo, hi := int64(0), r.n
+	// The last block whose fence is at most h.
+	lo, hi := int64(0), r.fences()
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		b, err := x.shim.ReadFromSegment(r.name, mid*entryBytes, entryBytes)
+		f, err := x.fence(r, mid)
 		if err != nil {
 			return indexEntry{}, false, err
 		}
-		if len(b) != entryBytes {
-			return indexEntry{}, false, fmt.Errorf("attachstore: pointer index %s is short at entry %d", r.name, mid)
+		if bytes.Compare(f.Bytes[:], h.Bytes[:]) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
-		got, e := decodeEntry(b)
+	}
+	if lo == 0 {
+		return indexEntry{}, false, nil // before the run's first entry
+	}
+	b, err := x.block(r, blockKey{run: r.name, i: lo - 1})
+	if err != nil {
+		return indexEntry{}, false, err
+	}
+	lo, hi = 0, int64(len(b)/entryBytes)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		got, e := decodeEntry(b[mid*entryBytes:])
 		switch c := bytes.Compare(got.Bytes[:], h.Bytes[:]); {
 		case c == 0:
 			return e, true, nil
@@ -407,10 +472,11 @@ func (c *runCursor) next() { c.off += entryBytes }
 
 // runWriter streams entries, in hash order, into a new run.
 type runWriter struct {
-	x   *pointerIndex
-	run indexRun
-	buf []byte
-	err error
+	x      *pointerIndex
+	run    indexRun
+	buf    []byte
+	fences []byte // written after the entries
+	err    error
 }
 
 func (x *pointerIndex) newWriter() *runWriter {
@@ -424,6 +490,9 @@ func (w *runWriter) add(h codec.Hash, e indexEntry) {
 	}
 	if w.buf == nil {
 		w.buf = make([]byte, 0, 4096*entryBytes)
+	}
+	if w.run.n%fenceEvery == 0 {
+		w.fences = append(w.fences, h.Bytes[:]...)
 	}
 	w.buf = appendEntry(w.buf, h, e)
 	w.run.n++
@@ -445,6 +514,9 @@ func (w *runWriter) finish() (indexRun, error) {
 		return w.run, nil
 	}
 	w.write()
+	if w.err == nil {
+		_, w.err = w.x.shim.AppendToSegment(w.run.name, w.fences)
+	}
 	if w.err == nil {
 		w.err = w.x.shim.FlushSegment(w.run.name)
 	}

@@ -121,9 +121,9 @@ type Config struct {
 	// UploadGrace is how long Collect keeps a finished blob no commit references yet: the longest
 	// an upload may wait for the commit that references it. Default one hour.
 	UploadGrace time.Duration
-	// PointerCacheBytes bounds the pointers (a small blob's bytes included) kept in memory; the
-	// rest are read from their segments through the pointer index (pointer_index.go). Default
-	// 4 MiB.
+	// PointerCacheBytes bounds the pointers (a small blob's bytes included) kept in memory, and
+	// separately the pointer index's blocks; the rest are read from their segments through the
+	// index (pointer_index.go). Default 4 MiB each.
 	PointerCacheBytes int64
 
 	// For tests: the pointer index's overlay, in entries, before it is written as a run.
@@ -250,7 +250,7 @@ func New(shim storage.PlatformIOShim, namespaceID string, small SmallBlobs, cfg 
 		prefix:   prefix,
 		small:    small,
 		cfg:      cfg,
-		idx:      newPointerIndex(shim, prefix, cfg.indexOverlay),
+		idx:      newPointerIndex(shim, prefix, cfg.indexOverlay, cfg.PointerCacheBytes),
 		cache:    newLRU[codec.Hash](cfg.PointerCacheBytes, pointerCost),
 		uploads:  map[string]struct{}{},
 		verified: newLRU[string](rememberedEntries, one[bool]),
@@ -343,12 +343,12 @@ func (s *Store) replaceLocked(h codec.Hash, p pointer) error {
 	return nil
 }
 
-// ResidentPointers is how many pointers the store holds in memory, and how many index entries
-// wait in its overlay to be written as a run.
-func (s *Store) ResidentPointers() (pointers, overlay int) {
+// ResidentPointers is how many pointers the store holds in memory, how many index entries wait in
+// its overlay to be written as a run, and the bytes of index blocks it caches.
+func (s *Store) ResidentPointers() (pointers, overlay int, indexBytes int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cache.len(), len(s.idx.overlay)
+	return s.cache.len(), len(s.idx.overlay), s.idx.blocks.used
 }
 
 // Pointer formats. v3 adds the finish time after the size; v2 is still read.

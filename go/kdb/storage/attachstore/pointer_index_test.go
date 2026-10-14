@@ -20,7 +20,10 @@ func bounded(cfg Config) Config {
 // checkResident fails the test if s holds more pointers, or index changes, than its bounds allow.
 func checkResident(t *testing.T, s *Store) {
 	t.Helper()
-	pointers, overlay := s.ResidentPointers()
+	pointers, overlay, indexBytes := s.ResidentPointers()
+	if indexBytes > s.cfg.PointerCacheBytes {
+		t.Fatalf("%d bytes of index blocks resident, over %d", indexBytes, s.cfg.PointerCacheBytes)
+	}
 	if max := int(s.cfg.PointerCacheBytes / 256); pointers > max {
 		t.Fatalf("%d pointers resident, over the %d the cache allows", pointers, max)
 	}
