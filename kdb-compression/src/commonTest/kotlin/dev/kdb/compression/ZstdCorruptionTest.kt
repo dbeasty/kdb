@@ -16,7 +16,7 @@ import kotlin.test.fail
  * the pure-Kotlin encoder always write it; KDB's formats also CRC the compressed bodies they store.
  */
 open class ZstdCorruptionTest {
-    /** Kept small enough for the 2s Kotlin/JS (mocha) test timeout; ZstdCorruptionJvmTest runs far more. */
+    /** Kept modest for Kotlin/JS (see the mocha timeout in build.gradle.kts); ZstdCorruptionJvmTest runs far more. */
     protected open val mutationsPerFrame: Int = 150
 
     private val original = ZstdTestCorpus.json(20_000)
