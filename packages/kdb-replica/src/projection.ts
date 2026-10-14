@@ -168,9 +168,12 @@ export class ProjectionNamespace {
       const batch: Batch = new Map();
       const entry: OutboxEntry = { seq: this.#meta.nextSeq, txId, docs: [] };
       const counts = new Map<string, number>();
+      // A document written twice in one call: the second write's base is the first's result.
+      const staged = new Map<string, string | null>();
       for (const d of docs) {
         const id = d.docId.toLowerCase();
-        const before = await this.get(id);
+        const before = staged.has(id) ? (staged.get(id) ?? undefined) : await this.get(id);
+        staged.set(id, d.json);
         const wb: WriteBackDoc = { docId: id };
         if (before !== undefined) wb.baseHash = contentHash(id, before);
         if (d.json === null) {
