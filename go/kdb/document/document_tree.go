@@ -116,6 +116,46 @@ func (t DocumentTree) With(docID codec.UUID, contentHash codec.Hash) (DocumentTr
 	return DocumentTree{TreeHash: nh.rootHash(), size: newSize, trie: nh}, nil
 }
 
+// WithAll is With for each of entries in turn - the same tree, the same hash - built with each
+// node it touches hashed once rather than once per entry. For adding many documents at a time:
+// a snapshot install's batches.
+func (t DocumentTree) WithAll(entries []TreeEntry) (DocumentTree, error) {
+	if len(entries) == 0 {
+		return t, nil
+	}
+	items := make([]trieItem, len(entries))
+	for i, en := range entries {
+		items[i] = trieItem{key: uuidKey(en.DocID), hash: en.ContentHash}
+	}
+	// Sorted by key, and the last of any key wins - With's order of application.
+	sort.SliceStable(items, func(i, j int) bool { return bytes.Compare(items[i].key[:], items[j].key[:]) < 0 })
+	w := 0
+	for i := range items {
+		if w > 0 && items[w-1].key == items[i].key {
+			items[w-1] = items[i]
+			continue
+		}
+		items[w] = items[i]
+		w++
+	}
+	items = items[:w]
+	h := t.trieRootOrBuild()
+	newSize := t.Size()
+	for i := range items {
+		if _, existed := h.get(keyUUID(&items[i].key)); !existed {
+			newSize++
+		}
+	}
+	nh := trieWithAll(h, items)
+	return DocumentTree{TreeHash: nh.rootHash(), size: newSize, trie: nh}, nil
+}
+
+// TreeEntry is one document's entry in a tree: for DocumentTree.WithAll.
+type TreeEntry struct {
+	DocID       codec.UUID
+	ContentHash codec.Hash
+}
+
 func (t DocumentTree) Without(docID codec.UUID) (DocumentTree, error) {
 	h := t.trieRootOrBuild()
 	_, existed := h.get(docID)

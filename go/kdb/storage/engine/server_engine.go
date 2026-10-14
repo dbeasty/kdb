@@ -162,6 +162,10 @@ type ServerEngine struct {
 	// update from that pass is preserved; only the "when" changed.
 	treeMu sync.Mutex
 	tree   document.DocumentTree
+	// snapshotBodies is the tree ApplySnapshotBatch last built from the empty tree with every
+	// body written to the blob store as it went (valid while snapshotBodiesSet); under treeMu.
+	snapshotBodies    codec.Hash
+	snapshotBodiesSet bool
 	// treeFile, when set, pages the live tree's cold records to segment files
 	// (document.TreeFile); every tree this engine installs is bound to it.
 	treeFile *document.TreeFile
@@ -546,6 +550,18 @@ func (e *ServerEngine) GetDocument(namespaceID string, docID codec.UUID, atCommi
 // or a version the loader cannot find reports "not found" rather than an
 // error, matching what a miss meant when this store never evicted.
 func (e *ServerEngine) loadCold(docID codec.UUID, contentHash codec.Hash) (document.Document, bool, error) {
+	doc, found, err := e.readCold(docID, contentHash)
+	if err != nil || !found {
+		return document.Document{}, false, err
+	}
+	e.docsByHash.Put(contentHash, doc)
+	return doc, true, nil
+}
+
+// readCold is loadCold without the re-admission: it finds the version in the blob store or
+// through the cold loader and hands it back, leaving docsByHash as it was. For a reader that will
+// not read the version again soon (ReadDocumentsThrough).
+func (e *ServerEngine) readCold(docID codec.UUID, contentHash codec.Hash) (document.Document, bool, error) {
 	// The blob store first, and only under the mode that writes into it:
 	// there the delta log may have been truncated, so it is both the
 	// faster answer and, for anything older than the retained window, the
@@ -556,7 +572,6 @@ func (e *ServerEngine) loadCold(docID codec.UUID, contentHash codec.Hash) (docum
 			return document.Document{}, false, err
 		} else if found {
 			e.coldLoads.Add(1)
-			e.docsByHash.Put(contentHash, doc)
 			return doc, true, nil
 		}
 	}
@@ -569,7 +584,6 @@ func (e *ServerEngine) loadCold(docID codec.UUID, contentHash codec.Hash) (docum
 		return document.Document{}, false, err
 	}
 	e.coldLoads.Add(1)
-	e.docsByHash.Put(contentHash, doc)
 	return doc, true, nil
 }
 
@@ -914,6 +928,9 @@ func (e *ServerEngine) commitTreeLocked(namespaceID string, parentTreeHash codec
 	bounded := e.boundedLiveBodies()
 	track := bounded && e.durabilityTracking.Load()
 	var durable []codec.Hash
+	if len(puts) > 0 || len(deletes) > 0 {
+		e.snapshotBodiesSet = false // see ApplySnapshotBatch
+	}
 	for _, id := range deletes {
 		if prev, ok := e.tree.HashFor(id); ok && !bounded {
 			e.docsByHash.Unpin(prev)

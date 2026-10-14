@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"runtime"
 	"slices"
+	"sort"
 	"sync"
 	"unsafe"
 
@@ -401,6 +402,93 @@ func trieWith(h *trieTree, id codec.UUID, contentHash codec.Hash) *trieTree {
 	putEdit(e)
 	runtime.KeepAlive(h)
 	return out
+}
+
+// trieWithAll is trieWith for a batch: items sorted by key, no key twice. Each node the batch
+// touches is hashed once, where inserting the items one at a time hashes the nodes near the root
+// once per item - which, building a large tree a page at a time, was most of the cost of
+// building it.
+func trieWithAll(h *trieTree, items []trieItem) *trieTree {
+	var s *trieSlab
+	var root tref
+	var gen uint32
+	if h == nil {
+		s = newTrieSlab()
+	} else {
+		h = h.rebased()
+		s, root, gen = h.slab, h.root, h.gen
+	}
+	e := getEdit(s.view())
+	// A batch makes a record per new leaf and node - a few per item - which an edit's own buffer
+	// (sized for one update, and dropped when large) would grow into by doubling, every batch.
+	if bp, _ := batchRecs.Get().(*[]editRec); bp != nil {
+		e.recs = *bp
+	}
+	if want := 4*len(items) + 2*trieDepth + 4; len(e.recs) < want {
+		e.recs = make([]editRec, want)
+	}
+	nr := e.insertMany(root, items, 0)
+	out := h
+	if nr != root {
+		out = s.commit(e, nr, gen)
+		s.maybeRewrite(out)
+	}
+	recs := e.recs
+	e.recs = nil
+	putEdit(e)
+	batchRecs.Put(&recs)
+	runtime.KeepAlive(h)
+	return out
+}
+
+// batchRecs keeps trieWithAll's record buffers between batches.
+var batchRecs sync.Pool
+
+// insertMany is insert for items sorted by key, no key twice: the subtree r at depth with all of
+// them set, built as inserting them one by one would build it (the shape below a node depends only
+// on the entries beneath it), with each new node made once.
+func (e *trieEdit) insertMany(r tref, items []trieItem, depth int) tref {
+	if len(items) == 1 {
+		return e.insert(r, &items[0].key, items[0].hash, depth)
+	}
+	if r == 0 {
+		return e.buildMany(items, depth)
+	}
+	if e.isLeaf(r) {
+		// One existing entry below here: it joins the items, unless one of them replaces it.
+		id, c := e.leafEntry(r)
+		i := sort.Search(len(items), func(i int) bool { return bytes.Compare(items[i].key[:], id[:]) >= 0 })
+		if i < len(items) && items[i].key == id {
+			return e.buildMany(items, depth)
+		}
+		merged := make([]trieItem, 0, len(items)+1)
+		merged = append(append(append(merged, items[:i]...), trieItem{key: id, hash: c}), items[i:]...)
+		return e.buildMany(merged, depth)
+	}
+	children := e.children(r)
+	changed := false
+	forEachRun(items, depth, func(nib int, run []trieItem) {
+		if nc := e.insertMany(children[nib], run, depth+1); nc != children[nib] {
+			children[nib], changed = nc, true
+		}
+	})
+	if !changed {
+		return r
+	}
+	return e.newNode(&children)
+}
+
+// buildMany is the subtree at depth holding exactly items (sorted, distinct, at least one).
+func (e *trieEdit) buildMany(items []trieItem, depth int) tref {
+	if len(items) == 1 || depth == trieDepth {
+		last := &items[len(items)-1]
+		return e.newLeaf(&last.key, last.hash, depth)
+	}
+	var children [16]tref
+	forEachRun(items, depth, func(nib int, run []trieItem) {
+		children[nib] = e.buildMany(run, depth+1)
+	})
+	return e.newNode(&children)
 }
 
 // trieWithout returns the tree h without id (h itself if id is absent).
