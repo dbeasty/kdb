@@ -66,6 +66,10 @@ type Options struct {
 	Kind string
 	// Keys extracts the keys of one commit.
 	Keys KeyFunc
+	// HashKeys says Keys emits exactly the commit's hash. A segment is then scanned for hashes
+	// alone - each frame's payload SHA-256, no decode (storage.DeltaHashStreamer) - when the
+	// reader can; Keys is used otherwise.
+	HashKeys bool
 }
 
 const (
@@ -369,14 +373,22 @@ func (x *Index) scan(streamer storage.DeltaCommitStreamer, seg storage.DeltaSegm
 		off int64
 	}
 	var recs []rec
-	stream := streamer.StreamCommits
-	if dr, ok := x.reader.(storage.DamageTolerantReader); ok {
-		stream = dr.StreamCommitsPastDamage
+	var err error
+	if hs, ok := x.reader.(storage.DeltaHashStreamer); ok && x.opts.HashKeys {
+		err = hs.StreamCommitHashesPastDamage(seg, func(h codec.Hash, offset int64) error {
+			recs = append(recs, rec{h, offset})
+			return nil
+		})
+	} else {
+		stream := streamer.StreamCommits
+		if dr, ok := x.reader.(storage.DamageTolerantReader); ok {
+			stream = dr.StreamCommitsPastDamage
+		}
+		err = stream(seg, func(c document.Commit, offset int64) error {
+			x.opts.Keys(c, func(h codec.Hash) { recs = append(recs, rec{h, offset}) })
+			return nil
+		})
 	}
-	err := stream(seg, func(c document.Commit, offset int64) error {
-		x.opts.Keys(c, func(h codec.Hash) { recs = append(recs, rec{h, offset}) })
-		return nil
-	})
 	var corrupt *delta.CorruptFrameError
 	if err != nil && !errors.As(err, &corrupt) {
 		return nil, err
