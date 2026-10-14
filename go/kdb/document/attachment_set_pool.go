@@ -60,7 +60,7 @@ type AttachmentSetPool struct {
 	track       bool
 	written     map[codec.Hash]struct{}
 	prevWritten map[codec.Hash]struct{}
-	stats   AttachmentSetPoolStats
+	stats       AttachmentSetPoolStats
 }
 
 type poolEntry struct {
