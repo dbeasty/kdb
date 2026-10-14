@@ -772,7 +772,23 @@ type SqlResultMessage struct {
 	// SqlExecMessage.Continuation (with the same SQL and parameters) for the next page. Empty on
 	// the last page and on every unpaged reply.
 	ContinuationToken string
+	// CellKinds, when set, is the kind of every cell in Rows, row by row: what each string is the
+	// text of. It is what tells a NULL from an empty string, and a number from text that looks
+	// like one. Additive: nil from an older server, and an older client ignores it.
+	CellKinds []CellKind
 }
+
+// CellKind is the SQL type of one result cell; its value travels as text in SqlResult.Rows.
+type CellKind byte
+
+const (
+	CellKindString CellKind = 0 // also what an older server's cells are
+	CellKindNull   CellKind = 1 // the row's string is ""
+	CellKindLong   CellKind = 2 // a base-10 int64
+	CellKindDouble CellKind = 3 // strconv.FormatFloat(v, 'g', -1, 64)
+	CellKindBool   CellKind = 4 // "1" or "0" from a Go server, "true" or "false" from the Kotlin one
+	CellKindJSON   CellKind = 5 // a JSON document or value
+)
 
 func (m SqlResultMessage) Header() Header { return m.H }
 

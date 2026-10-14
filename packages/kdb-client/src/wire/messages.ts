@@ -170,6 +170,11 @@ export interface SqlResultDto {
   retryAfterMs?: number | null;
   /** Paged SELECT: present while more rows remain; send it back as `continuation`. */
   continuation?: string | null;
+  /**
+   * Every cell's kind, one decimal digit each, row by row: 0 text, 1 NULL, 2 integer, 3 double,
+   * 4 boolean, 5 JSON. Absent from servers that predate it.
+   */
+  cellKinds?: string | null;
 }
 
 export interface TxCommitDto {

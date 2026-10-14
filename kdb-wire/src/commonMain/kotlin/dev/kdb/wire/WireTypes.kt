@@ -361,6 +361,9 @@ public sealed class WireMessage {
         // these since Component 51. Layer 16 §9.6 populates UNIQUE_VIOLATION / SCHEMA_VIOLATION here.
         val errorCode: String? = null,
         val retryAfterMs: Int? = null,
+        /** Every cell's kind, one decimal digit each, row by row: the SQL type each string in
+         * [rows] is the text of (SqlCellKind). Null from a server that predates it. */
+        val cellKinds: String? = null,
     ) : WireMessage()
 
     /** One lexical arm of a SEARCH (Layer 16 §11): [index] is a FULLTEXT index name or the first field
@@ -452,8 +455,25 @@ public fun defaultWireCodec(encoding: PayloadEncoding = PayloadEncoding.KDB_BINA
  * A codec like this one that also encodes in the negotiated [features]' formats - the list a
  * handshake ack carries. Decoding is unaffected: every codec decodes every encoding tag.
  */
-public fun WireCodec.withWireFeatures(features: List<String>): WireCodec =
-    DefaultWireCodec(encoding, binaryFrames = WIRE_FEATURE_BINARY in features)
+public fun WireCodec.withWireFeatures(features: List<String>): WireCodec {
+    val binary = WIRE_FEATURE_BINARY in features
+    return DefaultWireCodec(
+        encoding,
+        binaryFrames = binary,
+        binaryFrames2 = binary && WIRE_FEATURE_BINARY_2 in features,
+        zstdFrames = binary && WIRE_FEATURE_ZSTD in features,
+    )
+}
+
+/** The SQL type of one result cell, as [WireMessage.SqlResult.cellKinds] digits name it. */
+public object SqlCellKind {
+    public const val STRING: Int = 0
+    public const val NULL: Int = 1
+    public const val LONG: Int = 2
+    public const val DOUBLE: Int = 3
+    public const val BOOL: Int = 4
+    public const val JSON: Int = 5
+}
 
 public interface HandshakeNegotiator {
     public fun negotiate(local: HandshakePayload, remote: HandshakePayload): HandshakeAckPayload

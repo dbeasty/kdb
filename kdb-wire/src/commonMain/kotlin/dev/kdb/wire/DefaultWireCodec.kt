@@ -1,27 +1,41 @@
 package dev.kdb.wire
 
+import dev.kdb.compression.ZstdCompression
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 internal class DefaultWireCodec(
     override val encoding: PayloadEncoding,
-    // Encode messages that have a binary form as tag-2 bodies (WIRE_FEATURE_BINARY).
+    // Encode the core messages as tag-2 bodies (WIRE_FEATURE_BINARY), Search too
+    // (WIRE_FEATURE_BINARY_2), and large bodies as tag-3 zstd frames (WIRE_FEATURE_ZSTD).
     private val binaryFrames: Boolean = false,
+    private val binaryFrames2: Boolean = false,
+    private val zstdFrames: Boolean = false,
 ) : WireCodec {
     private val json = Json { ignoreUnknownKeys = true }
 
     override fun encode(message: WireMessage): ByteArray {
-        if (binaryFrames) {
+        val type = message.header.messageType
+        if (binaryFrames && coreBinaryForm(type) || binaryFrames2 && moreBinaryForm(type)) {
             val body = encodeBinaryBody(message)
             if (body != null) {
+                var tag = TAG_BINARY
+                var payload = body
+                if (zstdFrames && body.size >= ZSTD_FRAME_THRESHOLD) {
+                    val packed = ZstdCompression.compress(body, 1)
+                    if (packed.size < body.size) {
+                        tag = TAG_BINARY_ZSTD
+                        payload = packed
+                    }
+                }
                 val header =
                     WireHeader(
-                        messageType = message.header.messageType,
+                        messageType = type,
                         protocolVersion = message.header.protocolVersion,
                         correlationId = message.header.correlationId,
-                        payloadLength = 1 + body.size,
+                        payloadLength = 1 + payload.size,
                     )
-                return encodeFrameOnly(header, byteArrayOf(TAG_BINARY) + body)
+                return encodeFrameOnly(header, byteArrayOf(tag) + payload)
             }
         }
         val body = encodePayloadBody(message)
@@ -49,6 +63,18 @@ internal class DefaultWireCodec(
         val tag = frame[payloadOffset].toInt()
         if (tag == TAG_BINARY.toInt()) {
             return decodeBinaryBody(header, frame, payloadOffset + 1, payloadOffset + header.payloadLength)
+        }
+        if (tag == TAG_BINARY_ZSTD.toInt()) {
+            val raw =
+                try {
+                    ZstdCompression.decompress(
+                        frame.copyOfRange(payloadOffset + 1, payloadOffset + header.payloadLength),
+                        DEFAULT_MAX_FRAME_BYTES,
+                    )
+                } catch (e: Exception) {
+                    throw WireDecodeException("invalid zstd frame body: ${e.message}")
+                }
+            return decodeBinaryBody(header, raw, 0, raw.size)
         }
         val body = frame.copyOfRange(payloadOffset + 1, payloadOffset + header.payloadLength)
         // KDB_BINARY (0) and JSON (1) both use the UTF-8 JSON envelope; 2 is a binary body.

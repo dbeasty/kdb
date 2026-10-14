@@ -144,8 +144,8 @@ var benchCodecs = []struct {
 	codec *DefaultCodec
 }{
 	{"json", NewCodec(EncodingJSON)},
-	{"binary", NewCodec(EncodingJSON).WithWireFeatures([]string{WireFeatureBinary})},
-	{"binary+zstd", NewCodec(EncodingJSON).WithWireFeatures([]string{WireFeatureBinary, WireFeatureZstd})},
+	{"binary", NewCodec(EncodingJSON).WithWireFeatures([]string{WireFeatureBinary, WireFeatureBinary2})},
+	{"binary+zstd", NewCodec(EncodingJSON).WithWireFeatures(SupportedWireFeatures)},
 }
 
 func benchEncode(b *testing.B, msg Message, pooled bool) {
@@ -236,4 +236,43 @@ func TestSetCorrelationIDMatchesAFreshEncode(t *testing.T) {
 			t.Fatalf("cid %d: decoded %d (%v)", cid, h.CorrelationID, err)
 		}
 	}
+}
+
+// moreSamples are messages binary-frames-2 covers: a 100-operation stream delta and a 20-hit
+// search result with bodies.
+func moreSamples() (DeltaCommitMessage, SearchResultMessage) {
+	doc := `{"name":"x<y>","n":1,"nested":{"a":[1,2,3]},"s":"line\nbreak"}`
+	ops := make([]document.Op, 100)
+	for i := range ops {
+		ops[i] = document.WriteOp{DocID: codec.UUID{MSB: int64(i), LSB: 7}, Patch: doc}
+	}
+	delta := DeltaCommitMessage{H: Header{MessageType: MsgDeltaCommit, ProtocolVersion: KdbWireProtocolVersion, CorrelationID: 3},
+		Payload: DeltaCommitPayload{Namespace: "ns", TimestampMicros: 1, Operations: ops}}
+	hits := make([]SearchHit, 20)
+	for i := range hits {
+		hits[i] = SearchHit{DocID: fmt.Sprintf("0b6f3c1e-2a4d-4e8f-9a1b-%012d", i), Score: 1 / float64(i+1), JSON: &doc}
+	}
+	search := SearchResultMessage{H: Header{MessageType: MsgSearchResult, ProtocolVersion: KdbWireProtocolVersion, CorrelationID: 4},
+		Namespace: "ns", Hits: hits, ResolvedCommitHex: "ab"}
+	return delta, search
+}
+
+func BenchmarkCodecEncodePooledDeltaCommit100(b *testing.B) {
+	d, _ := moreSamples()
+	benchEncode(b, d, true)
+}
+
+func BenchmarkCodecDecodeDeltaCommit100(b *testing.B) {
+	d, _ := moreSamples()
+	benchDecode(b, d)
+}
+
+func BenchmarkCodecEncodePooledSearchResult20(b *testing.B) {
+	_, s := moreSamples()
+	benchEncode(b, s, true)
+}
+
+func BenchmarkCodecDecodeSearchResult20(b *testing.B) {
+	_, s := moreSamples()
+	benchDecode(b, s)
 }

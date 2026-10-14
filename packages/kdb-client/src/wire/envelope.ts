@@ -6,7 +6,15 @@
  */
 
 import { KdbProtocolError } from "../errors.ts";
-import { decodeBinaryBody, ENCODING_BINARY, encodeBinaryBody } from "./binary.ts";
+import {
+  decodeBinaryBody,
+  ENCODING_BINARY,
+  ENCODING_BINARY_ZSTD,
+  encodeBinaryBody,
+  hasBinaryForm,
+  WIRE_FEATURE_BINARY,
+  zstdDecompress,
+} from "./binary.ts";
 import {
   decodeFrameBody,
   ENCODING_JSON,
@@ -24,21 +32,24 @@ export interface WireMessage<K extends MessageKind = MessageKind, P = unknown> {
   header?: FrameHeader;
 }
 
+const CORE_BINARY: ReadonlySet<string> = new Set([WIRE_FEATURE_BINARY]);
+
 /**
- * Builds a frame carrying one message. With `binary` (the handshake agreed
- * WIRE_FEATURE_BINARY), a kind that has a binary form goes out as a binary body; every other
- * kind, and every message on a JSON connection, as the JSON envelope.
+ * Builds a frame carrying one message. `features` are the wire features the handshake agreed
+ * (`true` is WIRE_FEATURE_BINARY alone): a kind they give a binary form goes out as a binary
+ * body; every other kind, and every message on a JSON connection, as the JSON envelope.
  */
 export function encodeMessage(
   kind: MessageKind,
   correlationId: number,
   payload: unknown,
   maxFrameBytes?: number,
-  binary = false,
+  features: boolean | ReadonlySet<string> = false,
 ): Uint8Array {
   const options: { maxFrameBytes?: number } = {};
   if (maxFrameBytes !== undefined) options.maxFrameBytes = maxFrameBytes;
-  if (binary) {
+  const agreed = features === true ? CORE_BINARY : features === false ? undefined : features;
+  if (agreed !== undefined && hasBinaryForm(kind, agreed)) {
     const body = encodeBinaryBody(kind, payload);
     if (body !== undefined) {
       return encodeFrameBody(TYPE_CODE_BY_KIND[kind], correlationId, ENCODING_BINARY, body, options);
@@ -55,8 +66,20 @@ export function encodeMessage(
  * TYPE_CODE_BY_KIND's note on handshakeAck sharing 0x01 with handshake.
  */
 export function decodeMessage(frame: Uint8Array, maxFrameBytes?: number): WireMessage {
-  const { header, encodingTag, body } = decodeFrameBody(frame, maxFrameBytes);
-  if (encodingTag === ENCODING_BINARY) {
+  const decoded = decodeFrameBody(frame, maxFrameBytes);
+  const { header, encodingTag } = decoded;
+  let body = decoded.body;
+  if (encodingTag === ENCODING_BINARY_ZSTD) {
+    if (zstdDecompress === null) {
+      throw new KdbProtocolError("kdb: a zstd frame arrived, but this runtime has no zstd decoder");
+    }
+    try {
+      body = zstdDecompress(body);
+    } catch (cause) {
+      throw new KdbProtocolError("kdb: invalid zstd frame body", { cause });
+    }
+  }
+  if (encodingTag === ENCODING_BINARY || encodingTag === ENCODING_BINARY_ZSTD) {
     // A binary body has no `kind`: it is the header's type code, which is unambiguous here
     // because the handshake and its ack - the one pair sharing a code - never go binary.
     const { kind, payload } = decodeBinaryBody(header.typeCode, body);

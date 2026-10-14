@@ -292,6 +292,8 @@ type sqlResultDto struct {
 	RetryAfterMs *int       `json:"retryAfterMs,omitempty"`
 	// Continuation is the paged-SELECT token (SqlResultMessage.ContinuationToken).
 	Continuation string `json:"continuation,omitempty"`
+	// CellKinds is SqlResultMessage.CellKinds as one digit per cell, row by row ("0125...").
+	CellKinds string `json:"cellKinds,omitempty"`
 }
 
 type txCommitDto struct {
