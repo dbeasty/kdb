@@ -7,8 +7,14 @@ kotlin {
     jvm()
 
     js(IR) {
-        browser()
-        nodejs()
+        // AttachmentProofTest.merkleTreeMatchesRfc6962 checks every inclusion proof of every tree up to
+        // 70 leaves against the recursive RFC 6962 reference (~0.4s locally). On CI's js shard,
+        // `jsTest --parallel` runs every module's karma Chrome and mocha node tests at once on a
+        // 4-vCPU runner, which pushed it past mocha's default 2s timeout - a bare "Error", not a
+        // failed assertion. Raised as in kdb-compression and kdb-storage-chunking.
+        val jsTestTimeout = "60s"
+        browser { testTask { useMocha { timeout = jsTestTimeout } } }
+        nodejs { testTask { useMocha { timeout = jsTestTimeout } } }
     }
 
     linuxX64()
