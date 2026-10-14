@@ -18,6 +18,8 @@ const (
 	binOpDelete          = 2
 	binOpFileWrite       = 3
 	binOpSchemaMigration = 4
+	binOpAttachmentPut   = 5
+	binOpAttachmentDel   = 6
 )
 
 func appendMoreBinaryBody(b []byte, message Message) ([]byte, bool) {
@@ -205,6 +207,15 @@ func appendOp(b []byte, op document.Op) []byte {
 		b = appendInt(b, 1, binOpSchemaMigration)
 		b = appendUUID(b, 7, o.MigrationID)
 		return appendRawString(b, 8, o.MigrationPayload)
+	case document.AttachmentPutOp:
+		b = appendInt(b, 1, binOpAttachmentPut)
+		b = appendUUID(b, 2, o.DocID)
+		b = appendBytes(b, 6, o.ContentHash.Bytes[:])
+		b = appendInt(b, 9, o.Size)
+		return appendRawString(b, 10, o.Mime)
+	case document.AttachmentDeleteOp:
+		b = appendInt(b, 1, binOpAttachmentDel)
+		return appendUUID(b, 2, o.DocID)
 	default:
 		return b
 	}
@@ -595,6 +606,8 @@ func decodeOp(r *binReader) document.Op {
 		fileWrite         document.FileWriteOp
 		migration         document.SchemaMigrationOp
 		hasPatch, hasPath bool
+		attach            document.AttachmentPutOp
+		hasAttachHash     bool
 	)
 	for f, wt, ok := r.next(); ok; f, wt, ok = r.next() {
 		switch f {
@@ -614,8 +627,15 @@ func decodeOp(r *binReader) document.Op {
 			migration.MigrationID = r.uuid(wt)
 		case 8:
 			migration.MigrationPayload = r.str(wt)
+		case 9:
+			attach.Size = r.int(wt)
+		case 10:
+			attach.Mime = r.str(wt)
 		default:
 			r.skip(wt)
+		}
+		if f == 6 {
+			hasAttachHash = true
 		}
 	}
 	if r.err != nil {
@@ -638,6 +658,15 @@ func decodeOp(r *binReader) document.Op {
 		return fileWrite
 	case binOpSchemaMigration:
 		return migration
+	case binOpAttachmentPut:
+		if !hasAttachHash || attach.Size < 0 {
+			r.fail("binary attachmentPut operation has no content hash or a negative size")
+			return nil
+		}
+		attach.DocID, attach.ContentHash = write.DocID, fileWrite.BlobHash
+		return attach
+	case binOpAttachmentDel:
+		return document.AttachmentDeleteOp{DocID: write.DocID}
 	default:
 		r.fail("unknown operation kind in binary body")
 		return nil
