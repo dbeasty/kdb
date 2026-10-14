@@ -3,16 +3,22 @@ package sstable
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
+	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 )
 
 // smallMergeTables shrinks a merge's output tables for the length of a test.
@@ -330,5 +336,74 @@ func TestCrashDuringARunsRenamesIsHarmless(t *testing.T) {
 	}
 	if len(names) != len(reopened.Tables()) {
 		t.Fatalf("%d segments on disk for %d tables", len(names), len(reopened.Tables()))
+	}
+}
+
+// A merge reading an input's sidecar drops the pages it has read from the process's resident set,
+// so a merge of many inputs does not end with all their sidecars resident.
+func TestSidecarSourceDoesNotLeaveItsPagesResident(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("DropPages is a no-op here")
+	}
+	if !mmapfile.Supported {
+		t.Skip("sidecars need mmap")
+	}
+	const n = 1 << 20 // 48 MB of entries
+	path := filepath.Join(t.TempDir(), "t.sidx")
+	var fileHash codec.Hash
+	func() {
+		entries := make([]indexEntry, n)
+		for i := range entries {
+			binary.BigEndian.PutUint64(entries[i].key.Bytes[:], uint64(i))
+			entries[i].handle = BlockHandle{Offset: int64(i) * 100, CompressedSize: 90}
+		}
+		if err := writeSidecarFile(path, entries, 12345, fileHash); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	sc, err := openSidecar(path, 12345, fileHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.close()
+	runtime.GC()
+	debug.FreeOSMemory()
+	rss := func() int64 {
+		out, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(os.Getpid())).Output()
+		if err != nil {
+			t.Skipf("ps: %v", err)
+		}
+		kb, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+		return kb << 10
+	}
+	// Opening verified the whole file (its checksum), which touched every page; drop them so the
+	// read below starts from nothing resident.
+	if err := sc.region.DropPages(0, len(sc.region.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	before := rss()
+	src := &sidecarSource{sc: sc}
+	buf := make([]indexEntry, mergeBatch)
+	read := 0
+	for {
+		got, err := src.fill(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == 0 {
+			break
+		}
+		if want := uint64(read); binary.BigEndian.Uint64(buf[0].key.Bytes[:]) != want {
+			t.Fatalf("entry %d has the wrong key", read)
+		}
+		read += got
+	}
+	after := rss()
+	t.Logf("RSS %d MB before reading a %d MB sidecar, %d MB after", before>>20, n*sidecarEntrySize>>20, after>>20)
+	if read != n {
+		t.Fatalf("read %d entries, want %d", read, n)
+	}
+	if grown := after - before; grown > 16<<20 {
+		t.Fatalf("RSS grew %d MB reading the sidecar: its pages were left resident", grown>>20)
 	}
 }
