@@ -3,6 +3,7 @@ package sstable
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -166,7 +167,24 @@ func pickMerge(runs []mergeRun, sized bool, trigger int) (lo, hi int, full bool)
 // they are, being older than anything this build writes.
 
 // agePrefix is the age part of a name written at t.
-func agePrefix(t time.Time) string { return fmt.Sprintf("%016x", t.UnixNano()) }
+//
+// Ages are strictly increasing within the process: Windows' clock ticks far coarser than a flush,
+// so two tables written back to back could share a timestamp and sort by their random UUIDs.
+func agePrefix(t time.Time) string {
+	ageMu.Lock()
+	defer ageMu.Unlock()
+	n := t.UnixNano()
+	if n <= lastAge {
+		n = lastAge + 1
+	}
+	lastAge = n
+	return fmt.Sprintf("%016x", n)
+}
+
+var (
+	ageMu   sync.Mutex
+	lastAge int64
+)
 
 // ageOf is the age part of a table's name, all zeros for a name without one.
 func ageOf(segmentName string) string {
