@@ -332,6 +332,9 @@ type CompactionResult struct {
 	// Dropped is how many keys the keep predicate refused - superseded
 	// document versions that will never be asked for again.
 	Dropped int
+	// Full is set when the merge took every table in the store - the merge that may drop
+	// tombstones - rather than a window of its newest runs (tiering.go).
+	Full bool
 	// Outputs names the tables that replaced them - one run, in key order - empty when the merge
 	// had nothing to write.
 	Outputs []string
@@ -385,6 +388,16 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 // a merge running in the background of an open namespace, which closing the namespace must be
 // able to stop rather than wait out.
 func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep func(codec.Hash) bool) (CompactionResult, error) {
+	return s.CompactContextUpTo(ctx, trigger, keep, -1)
+}
+
+// CompactContextUpTo is CompactContext for a caller that must stay bounded: when the merge that is
+// due would read more than maxBytes of tables, it merges nothing and reports those bytes in
+// Postponed (-1 when the shim cannot size them). A negative maxBytes is no bound.
+//
+// Which tables the merge takes is decided here - see tiering.go - so a bounded caller can still
+// merge a window of small new runs in a store too large to merge whole.
+func (s *LsmBlobStore) CompactContextUpTo(ctx context.Context, trigger int, keep func(codec.Hash) bool, maxBytes int64) (CompactionResult, error) {
 	if trigger < 2 {
 		trigger = 2
 	}
@@ -394,27 +407,52 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	// immediately when no lookup holds one, otherwise when the last one lets go.
 	pinned := s.pin()
 	defer s.release(pinned)
-	if countRuns(pinned) < trigger {
+	runs := runsNewestFirst(pinned)
+	sized := sizeRuns(s.io, runs)
+	lo, hi, full := pickMerge(runs, sized, trigger)
+	if hi == 0 {
 		return CompactionResult{}, nil
 	}
-	s.removePartialTables()
-	// Oldest first, so a later table's opinion wins in the merge.
-	// A copy: the pinned slice is shared with concurrent lookups and is reversed here.
-	ordered := append([]Handle(nil), pinned...)
-	for i, j := 0, len(ordered)-1; i < j; i, j = i+1, j-1 {
-		ordered[i], ordered[j] = ordered[j], ordered[i]
-	}
-	// One level below the deepest input, so the output is older than
-	// anything flushed after it and newer than nothing that survives.
-	outLevel := 0
-	for _, h := range ordered {
-		if h.Level+1 > outLevel {
-			outLevel = h.Level + 1
+	if maxBytes >= 0 {
+		var bytes int64
+		for _, r := range runs[lo:hi] {
+			bytes += r.bytes
+		}
+		if !sized {
+			return CompactionResult{Postponed: -1}, nil
+		}
+		if bytes > maxBytes {
+			return CompactionResult{Postponed: bytes}, nil
 		}
 	}
-	// Every table in the store is going in, so a tombstone here cannot be
-	// shadowing a key in a table that is staying: dropping them is safe
-	// and is the only way a delete ever reclaims its own space.
+	s.removePartialTables()
+	// Oldest first, so a later table's opinion wins in the merge: the window's tables in search
+	// order (newest first), reversed.
+	var ordered []Handle
+	for i := hi - 1; i >= lo; i-- {
+		tables := runs[i].tables
+		for j := len(tables) - 1; j >= 0; j-- {
+			ordered = append(ordered, tables[j])
+		}
+	}
+	// A full merge's output goes one level below the deepest input, so it is older than anything
+	// flushed after it and newer than nothing that survives. A window's output takes the window's
+	// place instead: the oldest input's level, and its slot in the table list (below), which is
+	// what keeps it newer than every run older than the window and older than every run newer.
+	outLevel := 0
+	if full {
+		for _, h := range ordered {
+			if h.Level+1 > outLevel {
+				outLevel = h.Level + 1
+			}
+		}
+	} else {
+		outLevel = ordered[0].Level
+	}
+	// A full merge takes every table in the store, so a tombstone here cannot
+	// be shadowing a key in a table that is staying: dropping them is safe
+	// and is the only way a delete ever reclaims its own space. A window's
+	// merge keeps them.
 	// The merge counts the keys keep refuses, so the result can say how much was reclaimed
 	// rather than only how many files were rewritten.
 	//
@@ -424,7 +462,7 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	if err != nil {
 		return CompactionResult{}, err
 	}
-	merged, dropped, err := compact(ctx, s.io, s.namespaceID, outLevel, ordered, sources, true, keep)
+	merged, dropped, err := compact(ctx, s.io, s.namespaceID, outLevel, ordered, sources, full, keep)
 	closeMergeSources(sources)
 	switch {
 	case err == ErrNothingToCompact:
@@ -445,10 +483,15 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	for _, in := range ordered {
 		merging[in.SegmentName] = struct{}{}
 	}
-	next := append([]Handle(nil), merged...)
+	var next []Handle
+	if full {
+		next = append(next, merged...)
+	}
 	for _, t := range s.tables {
 		if _, ok := merging[t.SegmentName]; !ok {
 			next = append(next, t)
+		} else if !full && t.SegmentName == ordered[0].SegmentName {
+			next = append(next, merged...) // the window's slot: see outLevel
 		}
 	}
 	s.setTablesLocked(next)
@@ -459,7 +502,7 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	// Each input is doomed here, under the lock that also guards pin, so from this point no new
 	// reader can take it (it is no longer registered) and the last of the existing ones - this
 	// compaction's own release included - deletes it.
-	result := CompactionResult{Merged: len(ordered), Dropped: dropped}
+	result := CompactionResult{Merged: len(ordered), Dropped: dropped, Full: full}
 	for _, h := range merged {
 		result.Outputs = append(result.Outputs, h.SegmentName)
 	}
@@ -543,6 +586,31 @@ func (s *LsmBlobStore) TableBytes() (int64, bool) {
 		total += n
 	}
 	return total, true
+}
+
+// PendingMerge reports the bytes of tables the next merge would read - what CompactContextUpTo
+// compares with its bound - and whether one is due at all. bytes is -1 when the shim cannot size
+// them. For a caller that wants to know before doing the work a merge needs first.
+func (s *LsmBlobStore) PendingMerge(trigger int) (bytes int64, due bool) {
+	if trigger < 2 {
+		trigger = 2
+	}
+	s.mu.Lock()
+	order := append([]Handle(nil), s.searchOrderLocked()...)
+	s.mu.Unlock()
+	runs := runsNewestFirst(order)
+	sized := sizeRuns(s.io, runs)
+	lo, hi, _ := pickMerge(runs, sized, trigger)
+	if hi == 0 {
+		return 0, false
+	}
+	if !sized {
+		return -1, true
+	}
+	for _, r := range runs[lo:hi] {
+		bytes += r.bytes
+	}
+	return bytes, true
 }
 
 // RunCount reports how many runs the registered tables form - what DefaultCompactionTrigger
