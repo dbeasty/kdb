@@ -62,4 +62,5 @@ export { decodeMessage, encodeMessage } from "./wire/envelope.ts";
 export { MSG } from "./wire/messages.ts";
 export type { MessageKind, TransactionDto } from "./wire/messages.ts";
 export { isUuid, randomUuid } from "./wire/uuid.ts";
-export type { Transport } from "./transport/types.ts";
+export type { Transport, TransportConnectOptions } from "./transport/types.ts";
+export { connectWebSocket } from "./transport/websocket.ts";

@@ -1,6 +1,6 @@
 # Client replica (memory plan Track D)
 
-Status: **design; owner decisions recorded in §10.** Written 2026-10-13 against `origin/main` 0399daf.
+Status: **design; owner decisions recorded in §10.** Progress: PR 1 (core) #217; PR 2 (full-mode sync) stacked on it. Written 2026-10-13 against `origin/main` 0399daf.
 No code yet. File references are relative to `go/kdb/` unless they start with a repo-level directory.
 
 Inputs: `kdb-memory-cassandra-plan.md` Track D (fixed constraints), `kdb-distributed-plan.md` §3.11–3.14,
@@ -306,6 +306,16 @@ Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-p
 - **D12 Kotlin store: the Kotlin embed runtime** (§3.3), which first needs shallow roots in Kotlin's replayer.
 
 ## 11. PR plan
+
+**Found while building PR 2:**
+- A namespace starts at a deterministic genesis commit on every node (`dag.NewInMemoryCommitDag`). The replica
+  starts there too (`genesisCommit`). Otherwise two replicas that write before their first sync create unrelated
+  roots, and the host refuses to merge them.
+- SQUASH_HEAD's `backlog` is 0 unless the host's DAG has generation numbers (`AncestryPruning`, implied by the
+  graph file). A host opened with zero `FileRuntimeOptions` never reports a backlog, so `auto` never squashes
+  against it: Go's own client behaves the same. Deployed hosts read the environment, where the graph file is
+  on by default.
+- The replica never merges, so pushes go before pulls: the opposite order to Go's `SyncV2`, which merges locally.
 
 Each PR is tested against a real Go node. A `go/cmd/kdb-replicahost` helper runs a file host with the peer
 WebSocket and TCP listeners, auth on, and test hooks (seed N commits, write a document, read the head). It prints
