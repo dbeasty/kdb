@@ -119,6 +119,10 @@ func classifiedError(errMsg string, code *wire.ErrorCode, retryAfterMs *int) err
 		return &NotHomeError{Message: errMsg, Home: homeAddr(errMsg)}
 	case wire.ErrorCodeNotFound:
 		return fmt.Errorf("%w: %s", ErrNotFound, errMsg)
+	case wire.ErrorCodeIntegrity:
+		// The server's stored attachment bytes no longer match their content hash - the only
+		// data a client-facing reply refuses as INTEGRITY.
+		return fmt.Errorf("%w: %s", ErrAttachmentCorrupt, errMsg)
 	default:
 		return fmt.Errorf("kdb: %s", errMsg)
 	}

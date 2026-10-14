@@ -83,7 +83,8 @@ public data class KdbPutAttachmentOptions
 
 /**
  * A refusal from the attachment API: the server's error and its typed code (NOT_FOUND, CONFLICT,
- * UNAUTHORIZED, UNSUPPORTED, ...). For an interrupted upload, [uploadState] says where to resume.
+ * UNAUTHORIZED, UNSUPPORTED, INTEGRITY, ...). For an interrupted upload, [uploadState] says where to
+ * resume. INTEGRITY is always the subclass [KdbAttachmentCorruptException].
  */
 public open class KdbAttachmentException(
     message: String,
@@ -93,15 +94,27 @@ public open class KdbAttachmentException(
 ) : SQLException(message, sqlStateFor(errorCode), cause)
 
 /**
- * Attachment bytes that do not match their content hash (Go's ErrAttachmentCorrupt): a chunk whose
- * inclusion proof fails, bytes no proof covers, a tree that does not hash to the content hash - or
- * the server's own INTEGRITY refusal. A verified ranged read throws it before handing out any byte
- * of the page it found wrong; from a stream's read it arrives as the cause of an IOException.
+ * Attachment bytes do not match their content hash, so the copy they came from is unusable: the
+ * server refused to serve its stored copy (wire code INTEGRITY - from a read's first page, a later
+ * page, or SQL `ATTACHMENT()`), or a download failed this driver's own verification. Retrying the
+ * same server cannot help; read from another replica, or have this one repaired. SQLState XX001
+ * (data_corrupted). Go's `client.ErrAttachmentCorrupt`, TS's `KdbAttachmentCorruptError`.
  */
-public class KdbAttachmentIntegrityException(
+public class KdbAttachmentCorruptException(
     message: String,
     cause: Throwable? = null,
-) : KdbAttachmentException(message, "INTEGRITY", null, cause)
+) : KdbAttachmentException(message, INTEGRITY, cause = cause) {
+    internal companion object {
+        const val INTEGRITY = "INTEGRITY"
+    }
+}
+
+/** The exception a server's (error, errorCode) reply turns into. */
+internal fun attachmentException(
+    message: String,
+    code: String?,
+): KdbAttachmentException =
+    if (code == KdbAttachmentCorruptException.INTEGRITY) KdbAttachmentCorruptException(message) else KdbAttachmentException(message, code)
 
 /**
  * A ranged read starting past the attachment's end (Go's AttachmentRangeError). [size] is the
@@ -251,7 +264,7 @@ public class KdbAttachments internal constructor(
      * Opens [length] bytes of one attachment from [offset] ([length] -1: to the end; a range running
      * past the end stops there), as of [asOfHex] (null: the read head) - Go's OpenAttachmentRange.
      * Every chunk the range touches is checked against the content hash with its RFC 6962 inclusion
-     * proof before any of its bytes is handed out, so a mismatch is a [KdbAttachmentIntegrityException]
+     * proof before any of its bytes is handed out, so a mismatch is a [KdbAttachmentCorruptException]
      * with no bad byte returned; the rest of the attachment is never downloaded. The stream pins its
      * version like [open], and reports [KdbAttachmentRangeInputStream.superseded] once the range has
      * been read.
@@ -509,7 +522,7 @@ public class KdbAttachments internal constructor(
             host.request(WireMessage.AttachmentList(hdr(WireMessageType.ATTACHMENT_LIST), host.namespace, host.sessionId, doc, asOfHex))
         val r = reply as? WireMessage.AttachmentListResult
             ?: throw KdbAttachmentException("unexpected list reply: ${reply.header.messageType}")
-        if (r.error != null) throw KdbAttachmentException(r.error!!, r.errorCode)
+        if (r.error != null) throw attachmentException(r.error!!, r.errorCode)
         return r.items.map { it.toInfo() } to r.commitHex
     }
 
@@ -525,7 +538,7 @@ public class KdbAttachments internal constructor(
             )
         return when (reply) {
             is WireMessage.SqlResult -> {
-                if (reply.error != null) throw KdbAttachmentException(reply.error!!, reply.errorCode)
+                if (reply.error != null) throw attachmentException(reply.error!!, reply.errorCode)
                 reply.resolvedCommitHex
             }
             is WireMessage.ConflictReport -> throw KdbAttachmentException("transaction conflict", "CONFLICT")
@@ -667,7 +680,7 @@ public class KdbAttachmentInputStream internal constructor(
         val data = reply as? WireMessage.AttachmentData
             ?: throw IOException("unexpected attachment reply: ${reply.header.messageType}")
         if (data.error != null) {
-            throw IOException(data.error, KdbAttachmentException(data.error!!, data.errorCode))
+            throw IOException(data.error, attachmentException(data.error!!, data.errorCode))
         }
         return data
     }
@@ -699,7 +712,8 @@ public class KdbAttachmentInputStream internal constructor(
         if (hash != null) {
             val got = hash.finishHex()
             if (got != info.hashHex) {
-                throw IOException("attachment ${info.id} failed verification: content hash $got, expected ${info.hashHex}")
+                val msg = "attachment ${info.id} failed verification: content hash $got, expected ${info.hashHex}"
+                throw IOException(msg, KdbAttachmentCorruptException(msg))
             }
         }
     }

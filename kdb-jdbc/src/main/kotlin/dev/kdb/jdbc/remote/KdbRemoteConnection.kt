@@ -6,6 +6,7 @@ import dev.kdb.jdbc.KdbDatabaseMetaData
 import dev.kdb.jdbc.KdbJdbcUrl
 import dev.kdb.jdbc.transportConnectOptions
 import dev.kdb.jdbc.AttachmentHost
+import dev.kdb.jdbc.KdbAttachmentCorruptException
 import dev.kdb.jdbc.KdbAttachments
 import dev.kdb.jdbc.KdbBinding
 import dev.kdb.jdbc.KdbPreparedStatement
@@ -188,6 +189,8 @@ public class KdbRemoteConnection(
         return when (reply) {
             is WireMessage.SqlResult -> {
                 if (reply.error != null) {
+                    // INTEGRITY: an ATTACHMENT() read hit the server's damaged stored copy.
+                    if (reply.errorCode == "INTEGRITY") throw KdbAttachmentCorruptException(reply.error!!)
                     throw SQLException(reply.error)
                 }
                 val bufferedDml = attachmentsSupported && !reply.readOnly && !isTransactionControl(sql)

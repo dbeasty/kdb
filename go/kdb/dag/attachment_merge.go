@@ -187,25 +187,7 @@ func mergeAttachmentSets(base, ours, theirs document.AttachmentSet) document.Att
 	return out
 }
 
-// attachmentSetOps are the operations that turn doc's attachments from before into after: removals
-// and renames first (as deletes), so no put lands on a name still taken, then the puts.
+// attachmentSetOps is document.AttachmentSetOps.
 func attachmentSetOps(doc codec.UUID, before, after document.AttachmentSet) []document.Op {
-	prev, next := byID(before), byID(after)
-	var dels, puts []document.Op
-	for _, a := range before {
-		n, ok := next[a.ID]
-		if !ok || n.Name != a.Name {
-			dels = append(dels, document.AttachmentDeleteOp{DocID: doc, AttachmentID: a.ID})
-		}
-	}
-	sorted := append(document.AttachmentSet(nil), after...)
-	sort.Slice(sorted, func(i, j int) bool { return uuidLess(sorted[i].ID, sorted[j].ID) })
-	for _, a := range sorted {
-		if p, ok := prev[a.ID]; ok && p == a {
-			continue
-		}
-		puts = append(puts, document.AttachmentPutOp{DocID: doc, AttachmentID: a.ID, Name: a.Name,
-			Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
-	}
-	return append(dels, puts...)
+	return document.AttachmentSetOps(doc, before, after)
 }

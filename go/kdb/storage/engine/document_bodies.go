@@ -265,7 +265,7 @@ func (e *ServerEngine) CompactBlobStoreUpTo(maxBytes int64) (sstable.CompactionR
 			return sstable.CompactionResult{}, err
 		}
 	}
-	if len(e.blobStore.Tables()) < sstable.DefaultCompactionTrigger {
+	if e.blobStore.RunCount() < sstable.DefaultCompactionTrigger {
 		return sstable.CompactionResult{}, nil
 	}
 	if total, ok := e.blobStore.TableBytes(); !ok || total > maxBytes {
@@ -346,6 +346,15 @@ func (e *ServerEngine) reachableBlobKeys() func(codec.Hash) bool {
 // attachments. fn is called once per compaction and returns the predicate for it.
 func (e *ServerEngine) SetExtraReachable(fn func() func(codec.Hash) bool) {
 	e.extraReachable.Store(&fn)
+}
+
+// BlobRunCount is how many runs this namespace's SSTables form - what a merge's trigger
+// (sstable.DefaultCompactionTrigger) counts, since one merge writes several tables.
+func (e *ServerEngine) BlobRunCount() int {
+	if e.blobStore == nil {
+		return 0
+	}
+	return e.blobStore.RunCount()
 }
 
 // BlobTableCount is how many SSTables this namespace currently has

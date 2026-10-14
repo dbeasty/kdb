@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -277,11 +278,12 @@ func TestOnlyTheLatestAttachmentIsKept(t *testing.T) {
 }
 
 // Under the default (all history), maintenance keeps every committed version - re-storing replaced
-// ones as deltas when that is much smaller - and removes uploads no commit references.
+// ones as deltas when that is much smaller - and removes uploads no commit references once their
+// upload grace is over.
 func TestAllHistoryKeepsVersionsAsDeltas(t *testing.T) {
 	root := t.TempDir()
 	rt := openAttachRuntime(t, root, storage.HistoryModeFull)
-	defer rt.Close()
+	defer func() { rt.Close() }()
 	id := codec.UUID{MSB: 4}
 	putAttachDoc(t, rt, id, `{}`)
 	r := rand.New(rand.NewSource(9))
@@ -299,16 +301,27 @@ func TestAllHistoryKeepsVersionsAsDeltas(t *testing.T) {
 		commits = append(commits, c)
 		versions = append(versions, v)
 	}
-	// An upload no commit references.
-	if _, err := rt.AttachmentStore(attachNS).Put(bytes.NewReader(bytes.Repeat([]byte("orphan"), 10_000))); err != nil {
+	// An upload no commit references: held for its grace, as its commit may still come.
+	orphan, err := rt.AttachmentStore(attachNS).Put(bytes.NewReader(bytes.Repeat([]byte("orphan"), 10_000)))
+	if err != nil {
 		t.Fatal(err)
 	}
 	res, err := rt.CompactAttachments(attachNS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Deltas != 2 || res.Removed != 1 {
-		t.Fatalf("maintenance %+v, want 2 deltas and the orphan removed", res)
+	if res.Deltas != 2 || res.Removed != 0 {
+		t.Fatalf("maintenance %+v, want 2 deltas and the orphan held", res)
+	}
+	// Past the grace (a store opened with a short one), the orphan goes and the versions stay.
+	rt.Close()
+	rt = openAttachRuntime(t, root, storage.HistoryModeFull)
+	rt.SetAttachmentConfig(attachstore.Config{SmallMaxBytes: 1 << 10, UploadGrace: time.Nanosecond})
+	if res, err = rt.CompactAttachments(attachNS); err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := rt.HasAttachmentBlob(attachNS, orphan.Hash); res.Removed != 1 || has {
+		t.Fatalf("maintenance %+v (orphan still stored: %v), want the orphan removed", res, has)
 	}
 	for i, c := range commits {
 		if got, _ := readAttachment(t, rt, id, c); !bytes.Equal(got, versions[i]) {

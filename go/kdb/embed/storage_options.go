@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -137,6 +138,11 @@ type StorageOptions struct {
 	// lets the next open skip the delta log; every open then replays it in
 	// full. Off by default.
 	DisableCheckpoints bool
+
+	// AttachmentUploadGrace is how long the attachment store keeps a finished upload no commit
+	// references yet (attachstore.Config.UploadGrace): the longest a client may take between
+	// uploading an attachment and committing it. Zero uses the default, one hour.
+	AttachmentUploadGrace time.Duration
 
 	// CloseCompactionBytes bounds the SSTable merge closing the namespace may do: close merges
 	// the tables only when they hold at most this many bytes, and otherwise leaves them to the

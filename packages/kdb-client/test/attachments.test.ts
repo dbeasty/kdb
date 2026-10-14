@@ -17,7 +17,7 @@ import {
   sqlBytes,
   uploadChunks,
 } from "../src/attachments.ts";
-import { KdbUnsupportedError } from "../src/errors.ts";
+import { KdbAttachmentCorruptError, KdbUnsupportedError } from "../src/errors.ts";
 import {
   ATTACHMENT_CHUNK_BYTES,
   attachmentChunkCount,
@@ -166,6 +166,14 @@ describe("attachment messages", () => {
     assert.equal(encodeAttachmentBody("sqlExec", {}), undefined);
   });
 
+  it("carries an INTEGRITY refusal through the binary frame", () => {
+    const error = "attachstore: stored bytes do not match their content hash: chunk 2 of ab";
+    const body = encodeAttachmentBody("attachmentData", { namespace: "ns", readId: "r1", error, errorCode: "INTEGRITY" })!;
+    const decoded = decodeAttachmentBody(0x47, body)!.payload as { error: string; errorCode: string };
+    assert.equal(decoded.errorCode, "INTEGRITY");
+    assert.equal(decoded.error, error);
+  });
+
   it("skips unknown fields and rejects a malformed UUID", () => {
     // Field 15 (varint 1) then namespace: a newer peer's field is ignored.
     const body = Uint8Array.of(0x78, 0x01, 0x0a, 0x01, 0x61);
@@ -271,6 +279,8 @@ class AttachmentStore {
   failAt = -1;
   /** Flips a byte of this chunk in the bytes served after the proofs were computed (-1: none). */
   tamperChunk = -1;
+  /** Refuses the page at this offset (and SQL) as a server whose stored copy is damaged does. */
+  damagedAt = -1;
   #ids = 0;
   features = ["binary-frames", "binary-frames-2", WIRE_FEATURE_ATTACHMENTS, WIRE_FEATURE_ATTACHMENT_PROOFS];
 
@@ -369,6 +379,17 @@ class AttachmentStore {
           }
           Object.assign(proof, { tree: toHex(tree.root), chunks, scheme: 1 });
         }
+        if (this.damagedAt >= 0 && offset <= this.damagedAt && this.damagedAt < offset + page) {
+          this.reads.delete(readId);
+          return {
+            kind: "attachmentData",
+            payload: {
+              namespace: NS, readId, docId: p.docId,
+              error: `attachstore: stored bytes do not match their content hash: chunk 0 of ${read.info.hash}`,
+              errorCode: "INTEGRITY",
+            },
+          };
+        }
         const data = read.data.subarray(offset, offset + page);
         const eof = offset + data.length >= read.data.length;
         if (eof) this.reads.delete(readId);
@@ -388,6 +409,15 @@ class AttachmentStore {
       }
       case "sqlExec":
         this.sql.push(p.parametersJson as string | null);
+        if (this.damagedAt >= 0) {
+          return {
+            kind: "sqlResult",
+            payload: {
+              namespace: NS, sessionId: "sess-1", columns: [], rows: [], rowsAffected: 0, resolvedCommitHex: "", readOnly: true,
+              generatedIds: [], error: "ATTACHMENT(\"x\"): attachstore: stored bytes do not match their content hash", errorCode: "INTEGRITY",
+            },
+          };
+        }
         return {
           kind: "sqlResult",
           payload: {
@@ -550,6 +580,41 @@ describe("client attachments", () => {
     // Unverified reads (and partial ones) hand everything over.
     assert.equal((await client.readAttachment(NS, DOC_A, "x", { verify: false })).data.length, 10);
     assert.equal((await client.readAttachment(NS, DOC_A, "x", { offset: 3 })).data.length, 7);
+  });
+
+  it("types a server's refusal of its damaged stored copy as KdbAttachmentCorruptError", async () => {
+    const store = new AttachmentStore();
+    const client = await store.client();
+    await client.putAttachment(NS, DOC_A, gen(10), { name: "x" });
+
+    // The first page.
+    store.damagedAt = 0;
+    await assert.rejects(client.readAttachment(NS, DOC_A, "x"), (e: unknown) => {
+      assert.ok(e instanceof KdbAttachmentCorruptError, String(e));
+      assert.ok(!(e instanceof KdbIntegrityError), "not this client's verification");
+      assert.equal(e.code, "INTEGRITY");
+      return true;
+    });
+
+    // A later page, after an intact first one.
+    store.damagedAt = 5;
+    const reader = await client.getAttachment(NS, DOC_A, "x");
+    const seen: number[] = [];
+    await assert.rejects(
+      (async () => {
+        for await (const page of reader) seen.push(page.length);
+      })(),
+      KdbAttachmentCorruptError,
+    );
+    assert.deepEqual(seen, [4]);
+
+    // SQL ATTACHMENT().
+    await assert.rejects(client.queryValues(NS, "SELECT ATTACHMENT('x') FROM t"), KdbAttachmentCorruptError);
+
+    // This client's own verification failing is the same kind of error.
+    store.damagedAt = -1;
+    store.corrupt = true;
+    await assert.rejects(client.readAttachment(NS, DOC_A, "x"), KdbAttachmentCorruptError);
   });
 
   it("closes a read broken off early", async () => {

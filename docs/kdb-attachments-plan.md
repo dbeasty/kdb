@@ -150,6 +150,19 @@ identity = SHA-256(0x02 || be64(size) || tree)
   - Larger versions stay whole. A streaming rolling-hash delta for multi-GB files is a follow-up.
 - **GC.** `Collect` deletes what the keep-set rejects, keeps the bases of kept deltas, and deletes
   segments no pointer names (unfinished uploads).
+- **Upload grace.** Every writer uploads first and commits after (client API, SQL `STREAM ?`, a
+  replica's push), so `Collect` keeps a finished blob no commit references yet for `UploadGrace`
+  (default one hour; `StorageOptions.AttachmentUploadGrace` in embed, `--attachment-upload-grace` /
+  `KDB_ATTACHMENT_UPLOAD_GRACE` / `attachmentUploadGrace` on the service).
+  - The finish time is in the pointer (format `KDBATP3`; `KDBATP2` still reads, with no grace), so
+    the hold survives a restart between upload and commit.
+  - A wire upload's `Expect` (the store already has the blob) and a re-upload of a stored blob
+    restart the grace through `Store.Hold`. The pointer is rewritten only when its recorded time is
+    half a grace old.
+  - The hold ends once the commit referencing the blob is durable (`PersistingCommitDAG` calls
+    `Store.Committed`), or a `Collect` sees it referenced; references alone decide after that, so a
+    replaced version is not kept for an hour. After a restart, a blob whose recorded finish time
+    is within the grace is held again until a `Collect` sees it referenced.
 
 ## Embed API (done)
 
@@ -187,6 +200,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
   last page, `Close`), `ATTACHMENT_LIST`/`_RESULT` 0x48/0x49; `CellKindBytes` (6); parameters
   `{"$bytes": b64}` and `{"$attachment": {hash, size}}`; error code `NOT_FOUND`. Creating,
   replacing, renaming and deleting are ordinary transactions with attachment ops.
+- **Damaged stored bytes** (`attachstore.ErrCorrupt`: a chunk, the leaves or a delta that no
+  longer hash to what they are stored under) are refused with error code `INTEGRITY` on every
+  reply that reads them - `ATTACHMENT_DATA` (first or later page), SQL `ATTACHMENT()`, and a
+  `BLOB_FETCH` entry - logged at error level with namespace/doc/attachment/hash and counted in
+  `kdb_attachment_corrupt_reads_total`. Clients type it: Go `client.ErrAttachmentCorrupt`, TS
+  `KdbAttachmentCorruptError`, Kotlin `KdbAttachmentCorruptException` (SQLState `XX001`) - the
+  same error as the client's own failed verification. The remedy is another replica or repair,
+  never a retry against the same node.
 - **Verified ranged reads**, feature `attachment-proofs`: `ATTACHMENT_GET` with `Proofs` (11) gets
   pages rounded to 1 MiB chunk boundaries (at most 4 MiB), and `ATTACHMENT_DATA` carries the blob's
   `Tree` (12), each chunk's RFC 6962 audit path (13, BLOB_FETCH's encoding) and `Scheme` (14). A
@@ -197,7 +218,7 @@ identity = SHA-256(0x02 || be64(size) || tree)
   `OpenAttachmentRange` / `ReadAttachmentAt`; TS `openAttachmentRange` / `readAttachmentAt`; Kotlin
   `KdbAttachments.openRange` / `readAt` / `getRange`, and `KdbAttachments.blob()`, a `java.sql.Blob`
   whose `getBytes(pos, len)` / `getBinaryStream(pos, len)` read verified ranges. The Kotlin server
-  acks neither feature.
+  acks neither feature. A chunk failing its proof is the same corrupt error as below.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
   (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
   Kotlin server answers the messages `UNSUPPORTED`.
@@ -226,17 +247,26 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - **Kotlin engine parity** (`kdb-document`, `kdb-dag`, `kdb-transaction`, `kdb-embed`): hashes,
   tables, roots, merges, preflight and conflicts identical to Go (checked against Go fixtures); a
   Kotlin attachment store and embed API.
+- **Write-back projections** (follow-up): `PROJECT_WRITE` docs carry a document's whole
+  attachment set after the write (`attachmentsChanged`, `attachments`), guarded by the set the
+  projection held (`attachmentsBase`), and attachment-only writes (`keepBody`); a refused write
+  reports the source's attachments. A projection session may upload and `BLOB_FETCH`. Delta pages
+  also list documents whose attachments alone changed. A JSON-only write-back no longer wipes the
+  document's attachments at the source (it was a delete plus a write; now a replace). The Go
+  projection node keeps attachments both ways.
+- **Pushed grafts** (follow-up): the pusher uploads the root's blobs before `GRAFT_PUSH`; the host
+  keeps the table from the last page, refuses a graft with attachments it lacks the table or bytes
+  of, and seeds the table. Tables seeded from peers (graft, boundary, snapshot) are persisted
+  (`kdb:attachment-seeds:<ns>`) and seeded again on open, so a crash before the first checkpoint
+  keeps them.
 - **Tests**: unit and golden tests per layer, two-node sync, TS live interop against Go, e2e
   (`test_attachments.py`), upgrade (`test_upgrade.py`: mixed mesh, rollback refused).
 
 ## Known limits
 
-- **Write-back projections** take document writes only: a replica's attachment changes are not
-  yet carried by `PROJECT_WRITE` (the replica session extends it).
-- **A graft pushed to a host** (`GRAFT_PUSH`) does not carry the root's attachment table.
 - **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
 - **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
-- **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
+- **The Kotlin store** has its own on-disk layout, no deltas, no read leases and no upload grace; Kotlin does not
   read Go's v5 checkpoint and graph formats and has no blob peer transfer.
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.
 

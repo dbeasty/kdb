@@ -25,7 +25,7 @@ import java.sql.SQLException
  *
  * [info] and [commitHex] describe the version the read pinned; [superseded], once the range has
  * been read (or the stream closed), says a newer version exists or the attachment was removed. A
- * bad page fails a read with an IOException whose cause is a [KdbAttachmentIntegrityException].
+ * bad page fails a read with an IOException whose cause is a [KdbAttachmentCorruptException].
  */
 public class KdbAttachmentRangeInputStream internal constructor(
     private val host: AttachmentHost,
@@ -103,7 +103,7 @@ public class KdbAttachmentRangeInputStream internal constructor(
      * inside the range. Throws before anything of a bad page is kept. */
     private fun take(res: WireMessage.AttachmentData) {
         if (res.error != null) {
-            if (res.errorCode == "INTEGRITY") throw KdbAttachmentIntegrityException(res.error!!)
+            if (res.errorCode == "INTEGRITY") throw KdbAttachmentCorruptException(res.error!!)
             throw KdbAttachmentException(res.error!!, res.errorCode)
         }
         if (end < 0) {
@@ -117,9 +117,9 @@ public class KdbAttachmentRangeInputStream internal constructor(
             if (res.scheme != ATTACHMENT_HASH_SCHEME_CHUNKED_1) {
                 throw KdbAttachmentException("attachment content hash scheme ${res.scheme} is not supported", "UNSUPPORTED")
             }
-            val t = tree ?: throw KdbAttachmentIntegrityException("attachment ${info.id}: the server sent no Merkle tree hash")
+            val t = tree ?: throw KdbAttachmentCorruptException("attachment ${info.id}: the server sent no Merkle tree hash")
             if (attachmentIdentity(t, info.size).toHex() != info.hashHex) {
-                throw KdbAttachmentIntegrityException(
+                throw KdbAttachmentCorruptException(
                     "attachment ${info.id}: tree ${t.toHex()} and size ${info.size} do not hash to its content hash ${info.hashHex}",
                 )
             }
@@ -131,7 +131,7 @@ public class KdbAttachmentRangeInputStream internal constructor(
         pageOff += res.data.size
         if (res.data.isEmpty() && !res.eof) throw KdbAttachmentException("empty attachment page at ${res.offset} before the end")
         if (res.eof && pageOff != info.size) {
-            throw KdbAttachmentIntegrityException("attachment ${info.id} ended at byte $pageOff of ${info.size}")
+            throw KdbAttachmentCorruptException("attachment ${info.id} ended at byte $pageOff of ${info.size}")
         }
         val from = next - res.offset
         val to = minOf(end, pageOff) - res.offset
@@ -159,14 +159,14 @@ public class KdbAttachmentRangeInputStream internal constructor(
             val idx = first + i
             if (proof.leaf != idx) throw KdbAttachmentException("attachment proof for chunk ${proof.leaf} where $idx was expected")
             val n = minOf(ATTACHMENT_CHUNK_BYTES.toLong(), size - idx * ATTACHMENT_CHUNK_BYTES)
-            if (n < 0 || data.size - at < n) throw KdbAttachmentIntegrityException("attachment ${info.id}: chunk $idx is short")
+            if (n < 0 || data.size - at < n) throw KdbAttachmentCorruptException("attachment ${info.id}: chunk $idx is short")
             if (!verifyMerkleInclusion(chunkLeafHash(data, at, n.toInt()), idx, leaves, proof.path, tree)) {
-                throw KdbAttachmentIntegrityException("attachment ${info.id}: chunk $idx does not match its content hash")
+                throw KdbAttachmentCorruptException("attachment ${info.id}: chunk $idx does not match its content hash")
             }
             at += n.toInt()
         }
         if (at != data.size) {
-            throw KdbAttachmentIntegrityException("attachment ${info.id}: ${data.size - at} bytes at ${pageOffset + at} no proof covers")
+            throw KdbAttachmentCorruptException("attachment ${info.id}: ${data.size - at} bytes at ${pageOffset + at} no proof covers")
         }
     }
 

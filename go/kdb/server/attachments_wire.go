@@ -278,12 +278,19 @@ func (h *sqlWireConnHandler) handleAttachmentList(msg wire.AttachmentListMessage
 
 func (h *sqlWireConnHandler) handleAttachmentGet(msg wire.AttachmentGetMessage) wire.Message {
 	out := wire.AttachmentDataMessage{H: header(msg.H.CorrelationID, wire.MsgAttachmentData), Namespace: msg.Namespace, ReadID: msg.ReadID, DocID: msg.DocID}
+	reads := &h.attachReads
+	var rd *attachmentRead
 	fail := func(err error) wire.Message {
+		// A damaged stored copy goes out as INTEGRITY (errCodeFor), and to the log: the client
+		// can read another replica, but only an operator can repair this one.
+		if rd != nil {
+			attachstore.ReportCorrupt(err, "namespace", rd.ns, "doc", rd.doc, "attachment", rd.info.ID, "name", rd.info.Name, "hash", rd.info.Hash.Hex(), "offset", msg.Offset)
+		} else {
+			attachstore.ReportCorrupt(err, "namespace", msg.Namespace, "doc", msg.DocID, "attachment", msg.AttachmentID, "name", msg.Name)
+		}
 		out.Error, out.ErrorCode = err.Error(), errCodeFor(err)
 		return out
 	}
-	reads := &h.attachReads
-	var rd *attachmentRead
 	if msg.ReadID != "" {
 		reads.mu.Lock()
 		rd = reads.m[msg.ReadID]
@@ -451,5 +458,9 @@ func heldBlob(store *attachstore.Store, h codec.Hash) (attachstore.Info, bool) {
 		return attachstore.Info{}, false
 	}
 	defer r.Close()
+	// The client skips the bytes and commits a reference next: hold the blob until it does.
+	if _, err := store.Hold(h); err != nil {
+		return attachstore.Info{}, false
+	}
 	return attachstore.Info{Hash: h, Size: r.Size()}, true
 }

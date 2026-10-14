@@ -287,6 +287,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.MaintenanceSweep != nil },
 		},
 		{
+			key: "governance.attachmentUploadGrace", flag: "attachment-upload-grace", env: "KDB_ATTACHMENT_UPLOAD_GRACE",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "how long a finished attachment upload that no commit references yet is kept before maintenance may collect it - the longest a client may take between uploading an attachment and committing it. Applies to namespaces opened after it is set",
+			value:  dur(func(s ServiceSettings) time.Duration { return s.AttachmentUploadGrace }),
+			inFile: func(f *ServiceFile) bool { return f.AttachmentUploadGrace != nil },
+		},
+		{
 			key: "governance.maintenanceMaxDefer", flag: "maintenance-max-defer", env: "KDB_MAINTENANCE_MAX_DEFER",
 			scope: ScopeProcess, mutability: MutabilityLive, unit: "ticks",
 			help:      "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway. The busiest server is the one whose log grows fastest, so this bound is what stops load starving reclamation; -1 never forces and risks exactly that",

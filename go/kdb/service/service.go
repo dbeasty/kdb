@@ -111,6 +111,7 @@ func Main() {
 	fs.StringVar(&flagVals.AdminAddr, "admin-addr", flagVals.AdminAddr, "operational HTTP endpoint (host:port) serving /healthz, /readyz, /metrics (Prometheus), /debug/vars, /debug/pprof - plain HTTP with no auth, so bind it to localhost or a private interface, never the public network (empty to disable)")
 	fs.DurationVar(&flagVals.DrainTimeout, "drain-timeout", flagVals.DrainTimeout, "on SIGTERM/SIGINT, how long to wait for already-admitted writes to finish before closing storage anyway - new writes are rejected immediately either way, and storage stays crash-consistent even when the deadline is hit (the WAL/delta replay path covers whatever didn't get flushed)")
 	fs.DurationVar(&flagVals.MaintenanceInterval, "maintenance-interval", flagVals.MaintenanceInterval, "how often to consider a background maintenance pass per namespace - checkpoint, reclaim delta segments past the retention window (history=none), compact the blob store. Ticks with nothing to do are cheap, and a pass waits for a moment with no write in flight (bounded, so sustained load cannot starve it). 0 reclaims only at close")
+	fs.DurationVar(&flagVals.AttachmentUploadGrace, "attachment-upload-grace", flagVals.AttachmentUploadGrace, "how long a finished attachment upload that no commit references yet is kept before maintenance may collect it - the longest a client may take between uploading an attachment and committing it")
 	fs.DurationVar(&flagVals.MaintenanceSweep, "maintenance-sweep", flagVals.MaintenanceSweep, "how long the maintenance loop may go without a pass while a namespace is idle - retention expires by wall clock with no commit involved, so this is what catches a window that aged out of a namespace nobody is writing to")
 	fs.IntVar(&flagVals.MaintenanceMaxDefer, "maintenance-max-defer", flagVals.MaintenanceMaxDefer, "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway; -1 never forces one through, which risks a busy server never reclaiming")
 	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
@@ -272,6 +273,7 @@ func Main() {
 		opts.Storage.Compression = &compression
 		opts.Storage.AsyncSyncIntervalMillis = int64(cfg.AsyncSyncIntervalMS)
 		opts.Storage.SyncMode = syncMode
+		opts.Storage.AttachmentUploadGrace = cfg.AttachmentUploadGrace
 		var nodeID codec.UUID
 		if nodeID, err = embed.LoadOrCreateNodeID(dataDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: node identity: %v\n", err)

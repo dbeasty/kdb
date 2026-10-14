@@ -579,6 +579,10 @@ func SyncProjection(w wire.Codec, transport stream.Transport, cfg ProjectionConf
 	defer conn.Close()
 	var wb WriteBackTarget
 	caps := []string{wire.SyncCapFilter}
+	at0, holdsAttachments := cfg.Target.(AttachmentProjectionTarget)
+	if holdsAttachments {
+		caps = append(caps, wire.SyncCapAttachments)
+	}
 	if cfg.WriteBack {
 		var ok bool
 		if wb, ok = cfg.Target.(WriteBackTarget); !ok {
@@ -603,12 +607,20 @@ func SyncProjection(w wire.Codec, transport stream.Transport, cfg ProjectionConf
 		return ProjectionResult{}, NewError("peer refused the projection session: "+reason, nil)
 	}
 	var res ProjectionResult
+	c.caps = reply.(wire.SyncHelloAckMessage).Capabilities
+	if !containsString(c.caps, wire.SyncCapAttachments) {
+		holdsAttachments = false // the source moves no attachments: the projection keeps none
+	}
+	var attachEnv IngestEnv
+	if holdsAttachments {
+		attachEnv.Attachments = at0.AttachmentStore()
+	}
 	if wb != nil {
 		if !slices.Contains(reply.(wire.SyncHelloAckMessage).Capabilities, wire.SyncCapWriteBack) {
 			return res, NewError("peer does not accept write-back to "+cfg.Namespace, nil)
 		}
 		// Writes go first, so the pull that follows already carries what the source made of them.
-		if err := pushWrites(c, wb, cfg.Namespace, &res); err != nil {
+		if err := pushWrites(c, wb, cfg.Namespace, attachEnv, &res); err != nil {
 			return res, err
 		}
 	}
@@ -647,6 +659,13 @@ func SyncProjection(w wire.Codec, transport stream.Transport, cfg ProjectionConf
 			}
 			ops = append(ops, document.DeleteOp{DocID: id})
 		}
+		if holdsAttachments {
+			attachOps, err := c.projectedAttachmentOps(at0, attachEnv, cfg.Namespace, page)
+			if err != nil {
+				return res, err
+			}
+			ops = append(ops, attachOps...)
+		}
 		res.Writes += len(page.Writes)
 		res.Deletes += len(page.Deletes)
 		if page.Done && page.Reset {
@@ -677,12 +696,16 @@ func SyncProjection(w wire.Codec, transport stream.Transport, cfg ProjectionConf
 // pushWrites sends every pending write in order. A write the source decides on - applied or not -
 // is resolved and the next one goes; anything else (the source unavailable, not the home, the
 // connection gone) stops here with the rest still pending, to go again next sync.
-func pushWrites(c *v2Conn, wb WriteBackTarget, ns string, res *ProjectionResult) error {
+func pushWrites(c *v2Conn, wb WriteBackTarget, ns string, attachEnv IngestEnv, res *ProjectionResult) error {
 	pending, err := wb.PendingWrites()
 	if err != nil {
 		return err
 	}
 	for _, w := range pending {
+		// The blobs a write attaches go up first; the source checks they are there.
+		if err := c.uploadBlobs(attachEnv, ns, []document.Commit{writeBlobs(w)}); err != nil {
+			return err
+		}
 		reply, err := c.request(wire.ProjectWriteMessage{
 			H: header(wire.MsgProjectWrite, c.next()), Namespace: ns, TxID: w.TxID.String(), Docs: w.Docs,
 		})
@@ -700,6 +723,12 @@ func pushWrites(c *v2Conn, wb WriteBackTarget, ns string, res *ProjectionResult)
 			res.Rejected++
 		default:
 			return NewError("unknown write-back outcome "+r.Outcome, nil)
+		}
+		if r.Outcome != wire.WriteBackApplied && attachEnv.Attachments != nil {
+			// Put back as the source has it - attachments included, so their bytes first.
+			if err := c.fetchCurrentBlobs(attachEnv, ns, r); err != nil {
+				return err
+			}
 		}
 		if err := wb.ResolveWrite(w, r); err != nil {
 			return err

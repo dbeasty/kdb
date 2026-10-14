@@ -360,6 +360,9 @@ func (c *v2Conn) graftRootsFor(cfg V2ClientConfig, env IngestEnv, remote wire.Na
 		if !env.Resolution.Chain.AllowsUnrelated() || !containsString(c.caps, wire.SyncCapGraft) {
 			return fmt.Sprintf("not pushed: the peer holds none of the history below this node's root %s, and cannot graft it", root.Hex()), nil
 		}
+		if err := c.uploadTableBlobs(env, remote.Namespace, root); err != nil {
+			return "", err
+		}
 		for after := ""; ; {
 			page, err := snapshotPage(env, root, after, cfg.PageBytes)
 			if err != nil {
@@ -391,6 +394,10 @@ func (c *v2Conn) pushBoundaryStates(cfg V2ClientConfig, env IngestEnv, remote wi
 	}
 	var sent []string
 	for _, gap := range gaps {
+		// The host cannot fetch from a node that dialled it: the state's attachment bytes go up first.
+		if err := c.uploadTableBlobs(env, remote.Namespace, gap); err != nil {
+			return sent, err
+		}
 		for after := ""; ; {
 			state, err := snapshotPage(env, gap, after, cfg.PageBytes)
 			if err != nil {

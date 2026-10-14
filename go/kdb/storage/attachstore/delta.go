@@ -2,7 +2,7 @@ package attachstore
 
 import (
 	"encoding/binary"
-	"errors"
+	"fmt"
 )
 
 // Binary deltas, git-pack style: a target is a sequence of instructions against a base - copy a
@@ -35,7 +35,8 @@ const (
 	cachePages = 4
 )
 
-var errDeltaCorrupt = errors.New("attachstore: corrupt delta")
+// errDeltaCorrupt is a stored delta that does not parse: damaged bytes, like any other ErrCorrupt.
+var errDeltaCorrupt = fmt.Errorf("%w: corrupt delta", ErrCorrupt)
 
 // pageCache serves single bytes and short runs of a source a page at a time.
 type pageCache struct {

@@ -9,7 +9,7 @@
  * rules, and can share a commit with document writes (Transaction.attachments).
  */
 
-import { KdbError, KdbNotFoundError, type KdbErrorOptions } from "./errors.ts";
+import { KdbAttachmentCorruptError, KdbError, KdbNotFoundError, type KdbErrorOptions } from "./errors.ts";
 import { ATTACHMENT_CHUNK_BYTES, bytesToBase64 } from "./wire/attachments.ts";
 import type { CallOptions } from "./operations.ts";
 
@@ -140,13 +140,16 @@ export class KdbUploadError extends KdbError {
   }
 }
 
-/** Bytes did not match the content hash they were checked against. */
-export class KdbIntegrityError extends KdbError {
+/**
+ * Bytes did not match the content hash this client checked them against. A
+ * KdbAttachmentCorruptError, like a server's refusal of its own damaged copy.
+ */
+export class KdbIntegrityError extends KdbAttachmentCorruptError {
   readonly expectedHash: string;
   readonly actualHash: string;
 
   constructor(message: string, expectedHash: string, actualHash: string) {
-    super(message, { code: "INTEGRITY" });
+    super(message);
     this.expectedHash = expectedHash;
     this.actualHash = actualHash;
   }

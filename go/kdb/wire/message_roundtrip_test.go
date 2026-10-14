@@ -2,6 +2,7 @@ package wire_test
 
 import (
 	"bytes"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -787,18 +788,20 @@ func TestRoundTripTxCommitMulti(t *testing.T) {
 func TestRoundTripProjectWrite(t *testing.T) {
 	msg := wire.ProjectWriteMessage{
 		H: wire.Header{MessageType: wire.MsgProjectWrite, CorrelationID: 9}, Namespace: "app/data", TxID: "tx-1",
-		Docs: []wire.WriteBackDoc{{DocID: "a", Body: `{"x":1}`, BaseHash: "ab"}, {DocID: "b", Deleted: true}},
+		Docs: []wire.WriteBackDoc{{DocID: "a", Body: `{"x":1}`, BaseHash: "ab"}, {DocID: "b", Deleted: true},
+			{DocID: "c", KeepBody: true, BaseHash: "cd", AttachmentsChanged: true, AttachmentsBase: "ef",
+				Attachments: []wire.TreeAttachment{{ID: "i", Name: "n", Hash: "h", Size: 3, Mime: "m"}}}},
 	}
 	back := roundTrip(t, msg).(wire.ProjectWriteMessage)
-	if back.TxID != "tx-1" || len(back.Docs) != 2 || back.Docs[0] != msg.Docs[0] || back.Docs[1] != msg.Docs[1] {
+	if back.TxID != "tx-1" || !reflect.DeepEqual(back.Docs, msg.Docs) {
 		t.Fatalf("round trip changed the message: %+v", back)
 	}
 	res := wire.ProjectWriteResultMessage{
 		H: wire.Header{MessageType: wire.MsgProjectWriteResult, CorrelationID: 9}, Namespace: "app/data",
-		Outcome: wire.WriteBackConflict, Reason: "changed", Current: []wire.WriteBackCurrent{{DocID: "a", Body: `{"x":2}`}, {DocID: "b", Absent: true}},
+		Outcome: wire.WriteBackConflict, Reason: "changed", Current: []wire.WriteBackCurrent{{DocID: "a", Body: `{"x":2}`, Attachments: []wire.TreeAttachment{{ID: "i", Name: "n", Hash: "h"}}}, {DocID: "b", Absent: true}},
 	}
 	rb := roundTrip(t, res).(wire.ProjectWriteResultMessage)
-	if rb.Outcome != wire.WriteBackConflict || len(rb.Current) != 2 || rb.Current[1] != res.Current[1] {
+	if rb.Outcome != wire.WriteBackConflict || !reflect.DeepEqual(rb.Current, res.Current) {
 		t.Fatalf("round trip changed the result: %+v", rb)
 	}
 }

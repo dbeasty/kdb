@@ -31,6 +31,7 @@ var fieldToKey = map[string]string{
 	"DrainTimeout":           "governance.drainTimeout",
 	"MaintenanceInterval":    "governance.maintenanceInterval",
 	"MaintenanceSweep":       "governance.maintenanceSweep",
+	"AttachmentUploadGrace":  "governance.attachmentUploadGrace",
 	"MaintenanceMaxDefer":    "governance.maintenanceMaxDefer",
 	"TLSCert":                "tls.certFile",
 	"TLSKey":                 "tls.keyFile",
@@ -114,7 +115,7 @@ func envProbeValue(key string) string {
 		"governance.maintenanceMaxDefer":
 		return "4242"
 	case "governance.abortAfter", "governance.drainTimeout", "governance.maintenanceInterval",
-		"governance.maintenanceSweep":
+		"governance.maintenanceSweep", "governance.attachmentUploadGrace":
 		return "7m"
 	case "log.level":
 		return "debug"

@@ -29,6 +29,13 @@
 // started on, whatever commits, maintenance or GC happen meanwhile. Pins are leases
 // (Config.ReadLease): a reader that stalls past its lease is released by the next Collect and fails
 // with ErrReadLeaseExpired, so a stuck client cannot hold storage forever.
+//
+// Uploads are held. Every writer uploads first and commits after - the client API, SQL's STREAM ?,
+// a replica's push - so a finished blob no commit references yet is not garbage. A pointer records
+// when its upload finished, and Collect keeps an unreferenced blob for Config.UploadGrace after
+// that (Hold restarts the grace for a blob a client skips uploading because the store has it). The
+// hold ends early once the commit referencing the blob is durable (Committed), or a Collect sees it
+// referenced: from then on references alone decide.
 package attachstore
 
 import (
@@ -38,11 +45,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -57,8 +66,26 @@ var ErrNotFound = errors.New("attachstore: blob not found")
 // ErrTooLarge reports an upload past Config.MaxBytes.
 var ErrTooLarge = errors.New("attachstore: attachment exceeds the size limit")
 
-// ErrCorrupt reports stored bytes that do not hash to what they are stored under.
+// ErrCorrupt reports stored bytes that do not hash to what they are stored under: this node's copy
+// is damaged. Servers send it as wire.ErrorCodeIntegrity, so a reader can go to another replica.
 var ErrCorrupt = errors.New("attachstore: stored bytes do not match their content hash")
+
+var corruptReads atomic.Int64
+
+// CorruptReads is how many reads ReportCorrupt has seen fail with ErrCorrupt, process-wide.
+func CorruptReads() int64 { return corruptReads.Load() }
+
+// ReportCorrupt logs err at error level with attrs (slog key/value pairs naming what was read) and
+// counts it in CorruptReads if it is ErrCorrupt, and reports whether it was. Whoever turns a read's
+// error into a reply calls it, so damaged bytes are seen by an operator, not just by the client.
+func ReportCorrupt(err error, attrs ...any) bool {
+	if !errors.Is(err, ErrCorrupt) {
+		return false
+	}
+	corruptReads.Add(1)
+	slog.Error("kdb: stored attachment bytes are corrupt", append(attrs, "err", err)...)
+	return true
+}
 
 // ErrReadLeaseExpired reports a read that outlived its lease (Config.ReadLease) and was released.
 var ErrReadLeaseExpired = errors.New("attachstore: read lease expired")
@@ -81,6 +108,9 @@ type Config struct {
 	HashWorkers int
 	// ReadLease is how long a reader may hold its pins. Default one hour.
 	ReadLease time.Duration
+	// UploadGrace is how long Collect keeps a finished blob no commit references yet: the longest
+	// an upload may wait for the commit that references it. Default one hour.
+	UploadGrace time.Duration
 }
 
 func (c Config) withDefaults() Config {
@@ -101,6 +131,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ReadLease <= 0 {
 		c.ReadLease = time.Hour
+	}
+	if c.UploadGrace <= 0 {
+		c.UploadGrace = time.Hour
 	}
 	return c
 }
@@ -124,6 +157,9 @@ type pointer struct {
 	// per small blob, and every attachment byte in the attachment store's own segments, which is
 	// what a backup copies. Checked against the content hash when the pointer is read.
 	inline []byte
+	// finished is when the blob's upload last finished (or was last held): the start of its
+	// UploadGrace. Zero in a pointer written before the field existed.
+	finished time.Time
 }
 
 // Store holds one namespace's attachment blobs.
@@ -137,10 +173,11 @@ type Store struct {
 	mu       sync.Mutex
 	loaded   bool
 	pointers map[codec.Hash]pointer
-	uploads  map[string]struct{} // segments being written, which Collect must leave alone
-	verified map[string]bool     // leaves segments whose leaves are known to hash to their root
-	pinned   map[string]int      // segment -> open readers using it
-	deferred map[string]bool     // segments to delete once unpinned
+	uploads  map[string]struct{}      // segments being written, which Collect must leave alone
+	held     map[codec.Hash]time.Time // finished blobs no Collect has seen referenced, and since when
+	verified map[string]bool          // leaves segments whose leaves are known to hash to their root
+	pinned   map[string]int           // segment -> open readers using it
+	deferred map[string]bool          // segments to delete once unpinned
 	readers  map[*Reader]struct{}
 	// The mark (mark.go): the newest readable one, its segment, and the highest generation any
 	// mark segment has, readable or not, so the next one is never written over a torn one.
@@ -165,6 +202,7 @@ func New(shim storage.PlatformIOShim, namespaceID string, small SmallBlobs, cfg 
 		cfg:      cfg.withDefaults(),
 		pointers: map[codec.Hash]pointer{},
 		uploads:  map[string]struct{}{},
+		held:     map[codec.Hash]time.Time{},
 		verified: map[string]bool{},
 		pinned:   map[string]int{},
 		deferred: map[string]bool{},
@@ -211,11 +249,20 @@ func (s *Store) loadLocked() error {
 			s.pointers[h] = p
 		}
 	}
+	for h, p := range s.pointers {
+		if !p.finished.IsZero() {
+			s.held[h] = p.finished
+		}
+	}
 	s.loaded = true
 	return nil
 }
 
-const pointerMagic = "KDBATP2"
+// Pointer formats. v3 adds the finish time after the size; v2 is still read.
+const (
+	pointerMagicV2 = "KDBATP2"
+	pointerMagic   = "KDBATP3"
+)
 
 func (s *Store) pointerName(h codec.Hash, gen int) string {
 	return fmt.Sprintf("%sh-%s.%06d", s.prefix, h.Hex(), gen)
@@ -232,6 +279,7 @@ func encodePointer(p pointer) []byte {
 	}
 	b = append(b, flags)
 	b = binary.BigEndian.AppendUint64(b, uint64(p.size))
+	b = binary.BigEndian.AppendUint64(b, uint64(p.finished.UnixNano()))
 	for _, s := range []string{p.segment, p.leaves} {
 		b = binary.AppendUvarint(b, uint64(len(s)))
 		b = append(b, s...)
@@ -259,7 +307,18 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 		return pointer{}, codec.Hash{}, false
 	}
 	raw, err := s.shim.ReadFromSegment(name, 0, 4096)
-	if err != nil || len(raw) < len(pointerMagic)+1+8+2+4 || string(raw[:len(pointerMagic)]) != pointerMagic {
+	if err != nil || len(raw) < len(pointerMagic) {
+		return pointer{}, codec.Hash{}, false
+	}
+	header := len(pointerMagic) + 1 + 8 // magic, flags, size
+	switch string(raw[:len(pointerMagic)]) {
+	case pointerMagic:
+		header += 8 // finish time
+	case pointerMagicV2:
+	default:
+		return pointer{}, codec.Hash{}, false
+	}
+	if len(raw) < header+2+4 {
 		return pointer{}, codec.Hash{}, false
 	}
 	if raw[len(pointerMagic)]&2 != 0 {
@@ -268,7 +327,7 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 		if n < 0 || n > 64<<20 {
 			return pointer{}, codec.Hash{}, false
 		}
-		if raw, err = s.shim.ReadFromSegment(name, 0, len(pointerMagic)+1+8+2+int(n)+4); err != nil {
+		if raw, err = s.shim.ReadFromSegment(name, 0, header+2+int(n)+4); err != nil {
 			return pointer{}, codec.Hash{}, false
 		}
 	}
@@ -281,6 +340,12 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 	off++
 	p.size = int64(binary.BigEndian.Uint64(body[off:]))
 	off += 8
+	if off < header {
+		if t := int64(binary.BigEndian.Uint64(body[off:])); t > 0 {
+			p.finished = time.Unix(0, t)
+		}
+		off += 8
+	}
 	for _, dst := range []*string{&p.segment, &p.leaves} {
 		l, k := binary.Uvarint(body[off:])
 		if k <= 0 || uint64(len(body)-off-k) < l {
@@ -307,9 +372,13 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 }
 
 // writePointerLocked makes p the durable pointer for h. Must hold mu.
+// A p with no finish time keeps the current pointer's.
 func (s *Store) writePointerLocked(h codec.Hash, p pointer) (pointer, error) {
 	if cur, ok := s.pointers[h]; ok {
 		p.gen = cur.gen + 1
+		if p.finished.IsZero() {
+			p.finished = cur.finished
+		}
 	}
 	p.name = s.pointerName(h, p.gen)
 	if err := s.writeSegment(p.name, encodePointer(p)); err != nil {
@@ -468,13 +537,15 @@ func (u *Upload) Finish() (Info, error) {
 			return Info{}, err
 		}
 		if _, ok := s.pointers[info.Hash]; ok {
-			return info, nil
+			return info, s.holdLocked(info.Hash, time.Now())
 		}
-		p, err := s.writePointerLocked(info.Hash, pointer{size: u.size, inline: append([]byte{}, last...)})
+		now := time.Now()
+		p, err := s.writePointerLocked(info.Hash, pointer{size: u.size, inline: append([]byte{}, last...), finished: now})
 		if err != nil {
 			return Info{}, err
 		}
 		s.pointers[info.Hash] = p
+		s.held[info.Hash] = now
 		return info, nil
 	}
 	if u.segment == "" {
@@ -518,15 +589,67 @@ func (u *Upload) Finish() (Info, error) {
 	if _, ok := s.pointers[info.Hash]; ok {
 		_ = s.shim.DeleteSegment(u.segment) // already stored: keep the one copy
 		_ = s.shim.DeleteSegment(leavesSeg)
-		return info, nil
+		return info, s.holdLocked(info.Hash, time.Now())
 	}
-	p, err := s.writePointerLocked(info.Hash, pointer{segment: u.segment, leaves: leavesSeg, size: u.size})
+	now := time.Now()
+	p, err := s.writePointerLocked(info.Hash, pointer{segment: u.segment, leaves: leavesSeg, size: u.size, finished: now})
 	if err != nil {
 		return Info{}, err
 	}
 	s.pointers[info.Hash] = p
+	s.held[info.Hash] = now
 	s.verified[leavesSeg] = true
 	return info, nil
+}
+
+// Hold restarts h's upload grace, as if it had just been uploaded: for a client about to commit a
+// reference to a blob it did not upload because the store already holds it (a wire upload's
+// Expect). It reports whether the store holds h as a standalone blob; a blob in the ordinary blob
+// store (written before attachments had their own segments) has no grace to restart.
+func (s *Store) Hold(h codec.Hash) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return false, err
+	}
+	if _, ok := s.pointers[h]; !ok {
+		return false, nil
+	}
+	return true, s.holdLocked(h, time.Now())
+}
+
+// Committed ends the hold on blobs a durable commit references: from here on references alone
+// decide, so a version replaced before the next Collect is not kept for the rest of its grace.
+// (Collect also ends the hold on any blob it finds referenced.)
+func (s *Store) Committed(hashes ...codec.Hash) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	for _, h := range hashes {
+		delete(s.held, h)
+	}
+	return nil
+}
+
+// holdLocked starts h's grace at now. The pointer is rewritten with the new time only once the
+// recorded one is half a grace old, so the hold survives a restart without a write per upload of a
+// blob uploaded often. Must hold mu; h must have a pointer.
+func (s *Store) holdLocked(h codec.Hash, now time.Time) error {
+	s.held[h] = now
+	cur := s.pointers[h]
+	if now.Sub(cur.finished) < s.cfg.UploadGrace/2 {
+		return nil
+	}
+	next := cur
+	next.finished = now
+	p, err := s.writePointerLocked(h, next)
+	if err != nil {
+		return err
+	}
+	s.pointers[h] = p // the old generation is no longer named, and Collect retires it
+	return nil
 }
 
 func (s *Store) writeLeaves(leaves []*codec.Hash) (string, error) {
@@ -635,12 +758,14 @@ func (s *Store) deleteOrDeferLocked(name string) {
 	_ = s.shim.DeleteSegment(name)
 }
 
-// Collect deletes every standalone blob keep rejects - except the bases of kept deltas - and every
-// segment no pointer names (uploads that never finished, pointers superseded by a higher
-// generation). Segments an open reader has pinned are deleted when it closes. Readers past their
-// lease are released first. It reports how many blobs it removed.
+// Collect deletes every standalone blob keep rejects - except the bases of kept deltas, and blobs
+// within their upload grace (Config.UploadGrace) - and every segment no pointer names (uploads that
+// never finished, pointers superseded by a higher generation). Segments an open reader has pinned
+// are deleted when it closes. Readers past their lease are released first. It reports how many
+// blobs it removed.
 func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
-	s.expireReaders(time.Now())
+	now := time.Now()
+	s.expireReaders(now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.loadLocked(); err != nil {
@@ -648,8 +773,13 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 	}
 	live := map[codec.Hash]bool{}
 	for h := range s.pointers {
-		if keep(h) {
+		since, held := s.held[h]
+		switch {
+		case keep(h):
 			live[h] = true
+			delete(s.held, h) // committed: references decide from here on
+		case held && now.Sub(since) < s.cfg.UploadGrace:
+			live[h] = true // uploaded, its commit still to come
 		}
 	}
 	for h := range live { // a kept delta keeps its chain
@@ -661,6 +791,7 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 	for h := range s.pointers {
 		if !live[h] {
 			delete(s.pointers, h)
+			delete(s.held, h)
 			removed++
 		}
 	}
