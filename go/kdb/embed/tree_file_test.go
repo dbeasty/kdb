@@ -216,10 +216,14 @@ func TestTreeFileHistoryDoesNotPinSegments(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Let the last write-out and its rebase land, and the collector release what they freed.
-	deadline := time.Now().Add(10 * time.Second)
+	// Let the last write-out and its rebase land, and the collector release what they freed. The
+	// wait is for the bound asserted below, and long: every segment that lands rebases all ~3000
+	// history trees before the one it supersedes can go, which under -race on a CI runner takes
+	// minutes (10 s, and waiting only for DefaultTreeMaxSegments, failed main with 6-24 left).
+	limit := 2*opts.Storage.TreeMaxSegments + 1
+	deadline := time.Now().Add(2 * time.Minute)
 	files := treeSegments(t, root, ns)
-	for time.Now().Before(deadline) && len(files) > document.DefaultTreeMaxSegments {
+	for time.Now().Before(deadline) && len(files) > limit {
 		runtime.GC()
 		time.Sleep(10 * time.Millisecond)
 		files = treeSegments(t, root, ns)
@@ -230,7 +234,7 @@ func TestTreeFileHistoryDoesNotPinSegments(t *testing.T) {
 	}
 	files = treeSegments(t, root, ns)
 	t.Logf("%d segment files on disk with the namespace open: %v; history trees held: %d", len(files), files, eng.HistoryTreesResident())
-	if len(files) > 2*opts.Storage.TreeMaxSegments+1 {
+	if len(files) > limit {
 		t.Fatalf("%d segment files on disk: history is pinning superseded segments", len(files))
 	}
 	// Every historical tree still held reads exactly its documents.
