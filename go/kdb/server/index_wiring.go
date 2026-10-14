@@ -175,18 +175,27 @@ func (p *RegistryIndexProvider) rebuild(only []codec.UUID) error {
 }
 
 // rebuildLocked is rebuild with persistMu held, so no flush captures a store mid-rebuild.
+//
+// It also holds applyMu, so no commit is applied to the stores while one is rebuilt: a commit
+// applied mid-rebuild landed in a store the scan was replacing and was lost or left stale (CREATE
+// INDEX under concurrent writes left an entry for a field the document no longer had). The scan
+// is at the registry's head, not the DAG's: a commit already in the DAG can be waiting on
+// applyMu to reach the stores, and a scan that included it would have it applied twice.
 func (p *RegistryIndexProvider) rebuildLocked(only []codec.UUID) error {
-	head, err := p.runtime.Runtime.DAG.Head()
-	if err != nil {
-		return err
+	p.applyMu.Lock()
+	defer p.applyMu.Unlock()
+	head, ok := p.registry.Head()
+	if !ok {
+		var err error
+		if head, err = p.runtime.Runtime.DAG.Head(); err != nil {
+			return err
+		}
 	}
 	if _, err := p.registry.RebuildFromScan(p.runtime.scanAtCommit(head), head, only); err != nil {
 		return err
 	}
 	if len(only) == 0 {
-		p.applyMu.Lock()
 		p.inconsistent = false
-		p.applyMu.Unlock()
 	}
 	p.kickFlush()
 	return nil

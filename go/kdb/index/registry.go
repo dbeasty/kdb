@@ -29,6 +29,9 @@ type Registry struct {
 	// genSeq hands out store generations. It is registry-wide, so a store created under an id
 	// that an earlier (dropped) store used never repeats that store's generation.
 	genSeq atomic.Uint64
+	// epoch changes (under mu) whenever a store is added or removed. A write prepared at another
+	// epoch is prepared again when it commits (PreparedWrite.Commit).
+	epoch atomic.Uint64
 }
 
 type registryEntry struct {
@@ -64,6 +67,7 @@ func (r *Registry) Add(desc Descriptor) (Store, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.epoch.Add(1)
 	for _, e := range r.entries {
 		if e.desc.IndexID == desc.IndexID {
 			return nil, fmt.Errorf("index %s already registered", desc.IndexID)
@@ -93,6 +97,7 @@ func (r *Registry) Add(desc Descriptor) (Store, error) {
 func (r *Registry) Remove(name string) (Descriptor, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.epoch.Add(1)
 	for i, e := range r.entries {
 		if e.desc.IndexName() == name {
 			r.entries = append(r.entries[:i], r.entries[i+1:]...)
@@ -192,6 +197,11 @@ type PreparedWrite struct {
 	docID    codec.UUID
 	puts     []preparedStorePut
 	isDelete bool
+	// jsonText and epoch let Commit prepare the write again when stores were added or removed
+	// since it was prepared: a store CREATE INDEX added after the prepare, and rebuilt by a scan
+	// at a head without this commit, would otherwise never get this document's update.
+	jsonText string
+	epoch    uint64
 }
 
 type preparedStorePut struct {
@@ -205,8 +215,9 @@ type preparedStorePut struct {
 func (r *Registry) PrepareWrite(docID codec.UUID, jsonText string) (*PreparedWrite, error) {
 	r.mu.RLock()
 	entries := append([]*registryEntry(nil), r.entries...)
+	epoch := r.epoch.Load()
 	r.mu.RUnlock()
-	pw := &PreparedWrite{registry: r, docID: docID}
+	pw := &PreparedWrite{registry: r, docID: docID, jsonText: jsonText, epoch: epoch}
 	for _, e := range entries {
 		p, err := e.store.PrepareDocument(docID, jsonText)
 		if err != nil {
@@ -243,6 +254,13 @@ func (p *PreparedWrite) Commit(commitHash codec.Hash) ([]Hint, error) {
 			})
 		}
 	} else {
+		if p.epoch != r.epoch.Load() {
+			fresh, err := r.PrepareWrite(p.docID, p.jsonText)
+			if err != nil {
+				return hints, err
+			}
+			p.puts, p.epoch = fresh.puts, fresh.epoch
+		}
 		for _, sp := range p.puts {
 			r.touch(sp.entry)
 			h, err := sp.put.Apply(commitHash)
