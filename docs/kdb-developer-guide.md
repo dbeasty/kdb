@@ -100,7 +100,7 @@ The Go library, grouped by role (`go/kdb/<pkg>`):
 |---|---|
 | **Model and codec** | `codec` (KDB binary codec, hashes, UUIDs), `document` (documents, commits, ops, trees), `json`, `schema`, `error` (stable numeric error codes) |
 | **History** | `dag` (commit DAG, branches, tags, walk), `compaction`, `tier` |
-| **Storage** | `storage` (adapter interface), `storage/{wal,memtable,sstable,delta,engine,io,io/s3,mem}`, `compression`, `file` (attachments), `backup`, `integrity`, `recovery` |
+| **Storage** | `storage` (adapter interface), `storage/{wal,memtable,sstable,delta,engine,io,io/s3,mem}`, `compression`, `storage/attachstore` (attachment blobs - see [attachments plan](kdb-attachments-plan.md)), `file` (earlier file records), `backup`, `integrity`, `recovery` |
 | **Runtime** | `embed` (open a namespace on disk or in memory, the `Host`), `transaction`, `index` (+ `index/stores`, `fulltext`, `vector`), `sql`, `query`, `policy`, `script` (stored procedures), `compute` |
 | **Server** | `server` (the engine behind every listener), `service` (the `kdb-service` main), `config`, `control` (HTTP control plane + UI), `metrics`, `inspect`, `version`, `auth` |
 | **Network** | `wire` (frames and messages), `transport/{core,tcp,ws}`, `stream`, `client`, `driver` (`database/sql`), `peersync`, `replication`, `syncnode` |

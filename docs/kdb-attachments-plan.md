@@ -1,6 +1,8 @@
 # Attachments: named binary attachments on records
 
-Status: in progress. PR 1 (model, storage, GC, embed API) implements the parts marked **done**. It
+Status: built. PR 1 (#214: model, storage, GC, embed API) and the follow-up PR (SQL, wire,
+server, Go/TS/Kotlin clients, peer sync, migration, backups, Kotlin engine parity, upgrade e2e)
+implement everything below; what is still open is under "Known limits". It
 replaces the "the JSON record holds a blobHash" design
 (`docs/kdb-spec-layer1-component3b-file-attachments.md`). Old `FileWriteOp` and `blobHash` data
 stays readable, and nothing new writes it.
@@ -167,45 +169,62 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - **Small blobs under history=none.** Small attachment blobs live in the engine's blob store, so its
   history=none compaction keeps them through `ServerEngine.SetExtraReachable`.
 
-## Next PRs
+## Built in the follow-up PR
 
-- **PR 2, SQL.**
-  - `INSERT ... WITH ATTACHMENT [<name>] <bytes> [MIME ...]` (several per row allowed),
-    `UPDATE ... SET ATTACHMENT <name|id> = <bytes>`, and `DROP ATTACHMENT <name|id>`.
-  - The `_attachments` virtual column, which lists `{id, name, size, mime, hash}`.
-  - `ATTACHMENT(<name|id>)` and `ATTACHMENT_COUNT()`.
-  - `<bytes>` is one of `X'..'`, `FROM_BASE64(..)`, `?` or `STREAM ?`.
-  - `CellBytes`, `ParamBytes` and `MaxSqlLiteralBytes`.
-- **PR 3, wire, server and Go client.**
-  - Wire feature `attachments`, which requires `binary-frames`.
-  - `ATTACHMENT_BEGIN`/`CHUNK`/`END` uploads (resumable) and `ATTACHMENT_GET`/`DATA` downloads
-    (ranged, verified per chunk, carrying a final `superseded` notice), with codes 0x44–0x4F.
-  - A change-stream event for attachment changes.
-  - `CellKindBytes`.
-  - The Go client API.
-- **PR 4, TS and Kotlin clients** (JDBC `setBytes`/`setBinaryStream`/`getBytes`/`getBinaryStream`).
-- **PR 5, peer sync, migration and upgrade e2e.**
-  - `BLOB_FETCH` is 0x42/0x43, gated on peer capability `attachments`. Requirements agreed with the
-    client-replica session (Track D, codes 0x50–0x57):
-    - **Entries:** each is `(docId, attachmentId, commit, hash, offset, maxBytes)`; every chunk
-      carries the total size and its inclusion proof.
-    - **Batched,** with results in request order and the response paged by bytes.
-    - **Any readable old ref.** The server checks read permission on the document and that the table
-      at the commit references the hash.
-    - **Per-entry errors,** including "not retained" and "superseded".
-    - **Tree diffs:** `TREE_NODES` gets a tree selector so the attachment table is diffed like the
-      document tree.
-  - Squash, snapshot, graft and boundary transfers diff the attachment root and fetch blobs before
-    `PersistSquash` or the checkpoint.
-  - Projected pages carry refs, and a replica can upload (both pending the owner's decision D7 in
-    the replica plan).
-  - `kdb file migrate <ns>`.
-  - Upgrade e2e, covering an old binary meeting checkpoint v5, graph v5, the new op branches and a
-    backup.
-- **PR 6, Kotlin parity.** Kotlin attachment tables, the store, writes and the embed API, checked
-  against the same goldens. `BLOB_FETCH` parity waits on Kotlin peer sync v2.
+- **SQL** (`sql/attachments.go`): `INSERT ... WITH ATTACHMENT ['name' =] <bytes> [MIME ..]`,
+  `UPDATE ... SET ATTACHMENT <sel> = <bytes>`, `DROP ATTACHMENT <sel>`, `RENAME ATTACHMENT <sel>
+  TO 'n'` (`<sel>` a name or `ID '<uuid>'`); `_attachments`, `ATTACHMENT()`, `ATTACHMENT_COUNT()`,
+  `ATTACHMENT_SIZE()`, `ATTACHMENT_MIME()`, `FROM_BASE64()`, `X'..'`; `STREAM ?` binds an upload.
+  The engine reaches the attachment store through `sql.SetAttachmentBlobs`.
+- **Wire** (`wire/attachment_ops.go`), feature `attachments`, always binary bodies, goldens pinned
+  for TS and Kotlin: `ATTACHMENT_UPLOAD`/`_RESULT` 0x44/0x45 (resumable; `Expect` skips a blob
+  the server holds), `ATTACHMENT_GET`/`DATA` 0x46/0x47 (paged, pinned `ReadID`, `Superseded` on the
+  last page, `Close`), `ATTACHMENT_LIST`/`_RESULT` 0x48/0x49; `CellKindBytes` (6); parameters
+  `{"$bytes": b64}` and `{"$attachment": {hash, size}}`; error code `NOT_FOUND`. Creating,
+  replacing, renaming and deleting are ordinary transactions with attachment ops.
+- **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
+  (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
+  Kotlin server answers the messages `UNSUPPORTED`.
+- **Peer sync** (`peersync/attachments.go`), capability `attachments`:
+  - `BLOB_FETCH`/`_RESULT` 0x42/0x43, entries `(docId, attachmentId, commit, hash, offset,
+    maxBytes)`, batched, paged by bytes, per-entry errors, each chunk with its RFC 6962 audit path;
+  - a puller fetches what a page attaches before storing it; a pusher uploads over the sync
+    session (`ATTACHMENT_UPLOAD` + `Expect`) before its `REF_UPDATE`;
+  - `TREE_NODES` with `Tree: "attachments"` serves the attachment trie, with each listed document's
+    attachments; `PROJECT_PAGE` writes carry their attachments;
+  - snapshots carry the commit's packed table (graft and boundary extension too); squash catch-up
+    is refused for a head with attachments (replay);
+  - a peer without the capability is refused commits carrying attachments (typed `UNSUPPORTED`).
+- **Merges** (`dag/attachment_merge.go`): every two-parent commit carries the attachment ops that
+  three-way merge its parents' tables against their merge base (per attachment ID; a version beats
+  a removal; ties by a fixed order; a contested name is kept by the smaller ID). Go and Kotlin
+  produce the same merge commits.
+- **Small blobs inline**: a blob up to `SmallMaxBytes` is stored in its pointer segment, so every
+  attachment byte is in the attachment store's own segments (blobs an earlier build put in the
+  engine's blob store are still read from there).
+- **Backups and restore**: attachment segments are backed up after the log in content-addressed
+  parts of at most 64 MiB (deduplicated across incremental backups); `FetchToDir` and
+  `HybridRestore` bring them back.
+- **`kdb file ls|put|get|rm|migrate`**; `MigrateFileAttachments` moves the earlier design's
+  `blobHash` file records to attachments.
+- **Kotlin engine parity** (`kdb-document`, `kdb-dag`, `kdb-transaction`, `kdb-embed`): hashes,
+  tables, roots, merges, preflight and conflicts identical to Go (checked against Go fixtures); a
+  Kotlin attachment store and embed API.
+- **Tests**: unit and golden tests per layer, two-node sync, TS live interop against Go, e2e
+  (`test_attachments.py`), upgrade (`test_upgrade.py`: mixed mesh, rollback refused).
 
-## Known limits of PR 1
+## Known limits
+
+- **Write-back projections** take document writes only: a replica's attachment changes are not
+  yet carried by `PROJECT_WRITE` (the replica session extends it).
+- **A graft pushed to a host** (`GRAFT_PUSH`) does not carry the root's attachment table.
+- **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
+- **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
+- **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
+  read Go's v5 checkpoint and graph formats and has no blob peer transfer.
+- **Downgrade** after attachments exist is impossible: older builds refuse the log.
+
+## Known limits of PR 1 (still open unless listed above as built)
 
 - **No peer blob transfer yet.** Commits and roots replicate, but blobs do not until PR 5.
 - **All-history GC walks commit headers.** It loads ops only for commits whose root changed. A
