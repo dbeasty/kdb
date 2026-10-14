@@ -166,6 +166,11 @@ identity = SHA-256(0x02 || be64(size) || tree)
   mode) and collects:
   - in latest mode, everything a branch or tag head does not reference;
   - in all-history mode, everything no reachable commit references.
+- **Replacements come from the DAG.** A commit that puts an attachment whose first parent held a
+  different version (same document and attachment ID) makes the pair, however the commit arrived:
+  embedded `PutAttachment`, a client or SQL transaction, or peer sync. The store's mark segment
+  (`<ns>/attachment/m-<gen>`) records the branch and tag heads of the last pass, so the next one,
+  after a restart too, reads only the commits since.
 - **Small blobs under history=none.** Small attachment blobs live in the engine's blob store, so its
   history=none compaction keeps them through `ServerEngine.SetExtraReachable`.
 

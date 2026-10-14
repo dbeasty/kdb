@@ -142,6 +142,11 @@ type Store struct {
 	pinned   map[string]int      // segment -> open readers using it
 	deferred map[string]bool     // segments to delete once unpinned
 	readers  map[*Reader]struct{}
+	// The mark (mark.go): the newest readable one, its segment, and the highest generation any
+	// mark segment has, readable or not, so the next one is never written over a torn one.
+	mark    []codec.Hash
+	markSeg string
+	markGen int
 }
 
 // SegmentPrefix is the name prefix of every segment namespaceID's attachment store writes - for a
@@ -183,7 +188,18 @@ func (s *Store) loadLocked() error {
 	if err != nil {
 		return err
 	}
+	markGen := -1
 	for _, name := range names {
+		if strings.HasPrefix(name, s.prefix+"m-") {
+			gen, commits, ok := s.readMark(name)
+			if g, err := strconv.Atoi(strings.TrimPrefix(name, s.prefix+"m-")); err == nil && g > s.markGen {
+				s.markGen = g
+			}
+			if ok && gen > markGen {
+				markGen, s.markSeg, s.mark = gen, name, commits
+			}
+			continue
+		}
 		if !strings.HasPrefix(name, s.prefix+"h-") {
 			continue
 		}
@@ -648,7 +664,7 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 			removed++
 		}
 	}
-	referenced := map[string]bool{}
+	referenced := map[string]bool{s.markSeg: true}
 	for _, p := range s.pointers {
 		referenced[p.name] = true
 		referenced[p.segment] = true
