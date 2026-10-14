@@ -10,12 +10,24 @@ import (
 
 // EncodeCommits serializes commits for CommitPush payloads.
 func EncodeCommits(commits []document.Commit) ([]byte, error) {
+	return EncodeCommitsWithPayloads(commits, nil)
+}
+
+// EncodeCommitsWithPayloads is EncodeCommits taking known[i], when set, as commits[i]'s encoding
+// instead of encoding it again. The caller vouches that known[i] is commits[i].ToPayloadBytes() -
+// a payload whose SHA-256 is the commit's hash; the receiver checks that hash as for any commit.
+func EncodeCommitsWithPayloads(commits []document.Commit, known [][]byte) ([]byte, error) {
 	payloads := make([][]byte, len(commits))
 	total := 4
 	for i, c := range commits {
-		b, err := c.ToPayloadBytes()
-		if err != nil {
-			return nil, err
+		var b []byte
+		if i < len(known) && known[i] != nil {
+			b = known[i]
+		} else {
+			var err error
+			if b, err = c.ToPayloadBytes(); err != nil {
+				return nil, err
+			}
 		}
 		payloads[i] = b
 		total += 4 + len(b)
