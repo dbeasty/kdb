@@ -236,6 +236,7 @@ jobs:
   # must be byte-identical to Go's, so the golden vectors are regenerated and diffed like the client's.
   ts-replica:
     runs-on: ubuntu-latest
+    needs: [ts-client]
     defaults:
       run:
         working-directory: packages/kdb-replica
@@ -247,6 +248,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go/go.mod
+      # The replica reuses @kdb/client's framing and transports (a file: dependency).
+      - name: Build @kdb/client
+        run: cd ../kdb-client && npm ci && npm run build
       - name: Install
         run: npm ci
       - name: Typecheck
@@ -261,6 +265,7 @@ jobs:
             git diff --stat -- test/golden
             exit 1
           fi
+      # Includes the live interop suite, which builds go/cmd/kdb-replicahost and syncs against it.
       - name: Test
         run: npm test
       - name: Build

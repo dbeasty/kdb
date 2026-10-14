@@ -20,7 +20,7 @@ test("fast-forwarding Go's chain step by step, through a merge, reaches every de
   const store = new MemoryStore();
   const ns = await ReplicaNamespace.open(store, chain.namespace, NODE);
   for (const step of chain.steps) {
-    assert.equal(ns.head, step.from || null);
+    assert.equal(ns.head, step.from);
     await ns.fastForward(step.commits.map((h) => byHash.get(h)!), step.to);
     assert.equal(ns.head, step.to);
     assert.equal(await ns.rootHash(), byHash.get(step.to)!.treeHash);

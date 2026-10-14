@@ -11,10 +11,10 @@
  * checks out.
  */
 
-import { fromHex, fromUtf8, toHex, utf8, uuidBytes } from "./bytes.ts";
-import { buildCommit, contentHash, decodeCommit, type Commit, type Op } from "./commit.ts";
+import { fromHex, fromUtf8, toHex, utf8, uuidBytes, uuidString } from "./bytes.ts";
+import { buildCommit, contentHash, decodeCommit, genesisCommit, type Commit, type Op } from "./commit.ts";
 import { prefixEnd, type Batch, type KvStore } from "./store.ts";
-import { TrieEdit, TrieReader } from "./trie.ts";
+import { foldLeaf, TrieEdit, TrieReader } from "./trie.ts";
 
 export class TreeMismatchError extends Error {
   override name = "TreeMismatchError";
@@ -42,6 +42,30 @@ export interface NamespaceMeta {
   pending: string[];
   /** The highest commit timestamp seen or made, so local timestamps never go backwards. */
   lastMicros: string;
+  /**
+   * A head this namespace is converging to by snapshot or tree diff, set while documents are
+   * being installed in pages. While it is set, the documents are a mix of the old head's and the
+   * target's, so the namespace takes no local writes; a sync resumes the convergence, and the
+   * target becomes the head only once the built tree is the target's.
+   */
+  target?: { hash: string; payloadHex: string; via: "snapshot" | "diff"; after: string } | undefined;
+  /** The host's main as of the last sync: the oldHex a push proposes to move. */
+  remoteMain?: string | undefined;
+}
+
+export class ReplicaBusyError extends Error {
+  override name = "ReplicaBusyError";
+}
+
+/** One position of the trie, as TREE_NODES reports it (go/kdb/document/document_tree_node.go). */
+export interface TreeNodeView {
+  prefix: string;
+  /** "" when the subtree is empty. */
+  hash: string;
+  /** 16 child hashes, "" for an empty child; empty when the subtree is empty. */
+  children: string[];
+  /** id -> content hash, when the subtree holds no more than the entry limit. */
+  entries: Map<string, string> | null;
 }
 
 export function namespaceKey(name: string): string {
@@ -129,13 +153,22 @@ export class ReplicaNamespace {
   static async open(store: KvStore, name: string, nodeId: string): Promise<ReplicaNamespace> {
     const raw = await store.get(ReplicaNamespace.metaKey(name));
     if (raw) return new ReplicaNamespace(store, JSON.parse(fromUtf8(raw)) as NamespaceMeta);
-    const meta: NamespaceMeta = { name, nodeId, head: null, pending: [], lastMicros: "0" };
-    await store.apply(new Map([[ReplicaNamespace.metaKey(name), utf8(JSON.stringify(meta))]]));
+    const genesis = genesisCommit(name);
+    const meta: NamespaceMeta = { name, nodeId, head: genesis.hash, pending: [], lastMicros: "0" };
+    await store.apply(new Map([
+      [ReplicaNamespace.metaKey(name), utf8(JSON.stringify(meta))],
+      [`c/${namespaceKey(name)}/${genesis.hash}`, genesis.payload],
+    ]));
     return new ReplicaNamespace(store, meta);
   }
 
   get head(): string | null {
     return this.#meta.head;
+  }
+
+  /** Whether the namespace is still at its genesis, holding nothing: what a snapshot bootstraps. */
+  get isEmpty(): boolean {
+    return this.#meta.head === genesisCommit(this.name).hash && this.#meta.pending.length === 0 && !this.#meta.target;
   }
 
   get pending(): readonly string[] {
@@ -219,6 +252,7 @@ export class ReplicaNamespace {
       if (this.#meta.pending.length > 0) {
         throw new NotFastForwardError("kdb replica: local commits are not yet pushed; push before pulling");
       }
+      if (this.#meta.target) throw new NotFastForwardError("kdb replica: finish converging before fast-forwarding");
       if (target === this.#meta.head) return [];
       const byHash = new Map(commits.map((c) => [c.hash, c]));
       const tip = byHash.get(target);
@@ -256,9 +290,8 @@ export class ReplicaNamespace {
       queue.push(...c.parents);
     }
     if (head === null) {
-      // A replica with no head starts from a genesis chain; a later root comes by snapshot.
       if (!roots || [...seen].some((h) => !byHash.has(h))) {
-        throw new NotFastForwardError("kdb replica: an empty namespace needs the whole history or a snapshot");
+        throw new NotFastForwardError("kdb replica: a namespace with no head needs the whole history or a snapshot");
       }
     } else if (!reached) {
       throw new NotFastForwardError(`kdb replica: ${target} does not descend from the head ${head}`);
@@ -279,6 +312,9 @@ export class ReplicaNamespace {
    */
   commitLocal(ops: Op[], opts: { transactionId: string; message?: string; nowMicros?: bigint }): Promise<Commit> {
     return this.#lock.run(async () => {
+      if (this.#meta.target) {
+        throw new ReplicaBusyError(`kdb replica: ${this.name} is being brought up to date; retry once it has synced`);
+      }
       const batch: Batch = new Map();
       const edit = await this.#stage(ops, batch);
       const tree = await edit.finish();
@@ -305,6 +341,157 @@ export class ReplicaNamespace {
       this.#meta = JSON.parse(fromUtf8(batch.get(ReplicaNamespace.metaKey(this.name))!)) as NamespaceMeta;
       return c;
     });
+  }
+
+  get target(): NamespaceMeta["target"] {
+    return this.#meta.target;
+  }
+
+  get remoteMain(): string | undefined {
+    return this.#meta.remoteMain;
+  }
+
+  get nodeId(): string {
+    return this.#meta.nodeId;
+  }
+
+  async #commitMeta(batch: Batch, meta: NamespaceMeta): Promise<void> {
+    this.#writeMeta(batch, meta);
+    await this.#store.apply(batch);
+    this.#meta = meta;
+  }
+
+  /** Records the host's main as of this sync. */
+  setRemoteMain(hash: string | undefined): Promise<void> {
+    return this.#lock.run(() => this.#commitMeta(new Map(), { ...this.#meta, remoteMain: hash }));
+  }
+
+  /**
+   * Starts converging to target by `via`; a no-op if already converging to it. Refused while
+   * local commits are unpushed: a replica never drops them.
+   */
+  beginConverge(target: Commit, via: "snapshot" | "diff"): Promise<void> {
+    return this.#lock.run(async () => {
+      if (this.#meta.target?.hash === target.hash && this.#meta.target.via === via) return;
+      if (this.#meta.pending.length > 0) {
+        throw new NotFastForwardError("kdb replica: local commits are not yet pushed; push before converging");
+      }
+      await this.#commitMeta(new Map(), {
+        ...this.#meta, target: { hash: target.hash, payloadHex: toHex(target.payload), via, after: "" },
+      });
+    });
+  }
+
+  /**
+   * Applies one page of a convergence: final states for some documents (null deletes), and the
+   * cursor to resume after. Unverified until finishConverge, but durable, so an interrupted
+   * convergence resumes rather than restarts.
+   */
+  applyConvergePage(docs: Iterable<[string, string | null]>, after: string): Promise<void> {
+    return this.#lock.run(async () => {
+      const t = this.#meta.target;
+      if (!t) throw new Error("kdb replica: not converging");
+      const ops: Op[] = [];
+      for (const [id, json] of docs) {
+        ops.push(json === null ? { kind: "delete", docId: id } : { kind: "write", docId: id, json });
+      }
+      const batch: Batch = new Map();
+      const edit = await this.#stage(ops, batch);
+      await edit.finish();
+      edit.writeTo(batch);
+      await this.#commitMeta(batch, { ...this.#meta, target: { ...t, after } });
+    });
+  }
+
+  /**
+   * Completes a convergence: the built tree must be the target's. Then the target is the head, a
+   * root this replica holds without its history. Throws TreeMismatchError otherwise, and stays
+   * converging - a diff against the target's tree then repairs whatever differs.
+   */
+  finishConverge(): Promise<void> {
+    return this.#lock.run(async () => {
+      const t = this.#meta.target;
+      if (!t) return;
+      const tip = decodeCommit(fromHex(t.payloadHex));
+      const built = await this.#trie.rootHash();
+      if (built !== tip.treeHash) throw new TreeMismatchError(tip.hash, tip.treeHash, built);
+      const batch: Batch = new Map();
+      this.#replaceHead(batch, tip, maxMicros(this.#meta.lastMicros, [tip]));
+      const meta = JSON.parse(fromUtf8(batch.get(ReplicaNamespace.metaKey(this.name))!)) as NamespaceMeta;
+      meta.target = undefined;
+      await this.#commitMeta(batch, meta);
+    });
+  }
+
+  /** Marks the oldest n pending commits as held by the host. */
+  markPushed(n: number, remoteMain: string): Promise<void> {
+    return this.#lock.run(async () => {
+      const pending = this.#meta.pending.slice(n);
+      const batch: Batch = new Map();
+      // Pushed commits other than the head are history the replica does not keep.
+      for (const h of this.#meta.pending.slice(0, n)) if (h !== this.#meta.head) batch.set(this.#commitKey(h), null);
+      await this.#commitMeta(batch, { ...this.#meta, pending, remoteMain });
+    });
+  }
+
+  /** The unpushed local commits, oldest first. */
+  async pendingCommits(): Promise<Commit[]> {
+    const out: Commit[] = [];
+    for (const h of this.#meta.pending) {
+      const c = await this.commit(h);
+      if (!c) throw new Error(`kdb replica: pending commit ${h} is missing from the store`);
+      out.push(c);
+    }
+    return out;
+  }
+
+  /**
+   * The subtree at prefix, as Go's DocumentTree.Node reports it, so a diff against a host's
+   * TREE_NODES compares like with like - including for a subtree stored folded into one leaf.
+   */
+  async treeNode(prefix: string, entryLimit: number): Promise<TreeNodeView> {
+    const empty: TreeNodeView = { prefix, hash: "", children: [], entries: null };
+    let at = "";
+    let rec = await this.#trie.record(at);
+    while (rec && !rec.leaf && at.length < prefix.length) {
+      at = prefix.slice(0, at.length + 1);
+      rec = await this.#trie.record(at);
+    }
+    if (!rec) return empty;
+    const depth = prefix.length;
+    if (rec.leaf) {
+      const idHex = toHex(rec.id);
+      if (!idHex.startsWith(prefix)) return empty;
+      const children = new Array<string>(16).fill("");
+      if (depth < 32) children[Number.parseInt(idHex[depth]!, 16)] = toHex(foldLeaf(rec.id, rec.content, depth + 1));
+      return {
+        prefix,
+        hash: toHex(foldLeaf(rec.id, rec.content, depth)),
+        children,
+        entries: entryLimit >= 1 ? new Map([[uuidString(rec.id), toHex(rec.content)]]) : null,
+      };
+    }
+    const children: string[] = [];
+    for (let i = 0; i < 16; i++) {
+      const h = toHex(rec.children.subarray(i * 32, i * 32 + 32));
+      children.push(/^0+$/.test(h) ? "" : h);
+    }
+    let entries: Map<string, string> | null = null;
+    if (entryLimit > 0) {
+      entries = new Map();
+      const found = entries;
+      const stop = new Error("stop");
+      try {
+        await this.#trie.walk((id, ch) => {
+          found.set(id, ch);
+          if (found.size > entryLimit) throw stop;
+        }, prefix);
+      } catch (e) {
+        if (e !== stop) throw e;
+        entries = null;
+      }
+    }
+    return { prefix, hash: toHex(rec.hash!), children, entries };
   }
 
   /** Every document as (id, contentHash), in id order, from the trie. */

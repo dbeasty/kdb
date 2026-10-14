@@ -1,0 +1,285 @@
+// Command kdb-replicahost is the KDB node @kdb/replica's live interop tests sync against
+// (docs/kdb-client-replica-plan.md §11). It is a real sync node - syncnode.Node, serving peer sync
+// v2 over WebSocket exactly as a cloud mounting Node.Handler does - with bearer-token auth, and a
+// line protocol on stdin so a test can write to it and read it back.
+//
+// Prints one line to stdout when ready:
+//
+//	ready ws://127.0.0.1:PORT/kdb/sync
+//
+// then reads one JSON command per stdin line and answers each with one JSON line on stdout:
+//
+//	{"op":"put","ns":"app/u/1","id":"<uuid>","json":"{...}"}       -> {"head":"<hex>"}
+//	{"op":"commit","ns":"app/u/1","ops":[{"id":..,"json":..}|{"id":..,"delete":true}]} -> {"head":..}
+//	{"op":"seed","ns":"app/u/1","commits":2000,"docs":10}          -> {"head":..}
+//	{"op":"head","ns":"app/u/1"}                                   -> {"head":..,"tree":..}
+//	{"op":"docs","ns":"app/u/1"}                                   -> {"docs":{"<id>":"<json>"}}
+//
+// Tokens: "rw-token" may pull and push every namespace; "ro-token" may only pull; anything else is
+// refused. Namespaces under "secret/" are refused to both. The process exits when stdin closes, so a
+// killed test runner never leaves it behind.
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+
+	"github.com/limidus/kdb/go/kdb/auth"
+	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/embed"
+	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/server"
+	"github.com/limidus/kdb/go/kdb/syncnode"
+)
+
+type tokenEngine struct{}
+
+func (tokenEngine) Authenticator() auth.Authenticator { return tokenEngine{} }
+func (tokenEngine) Authorizer() auth.Authorizer       { return tokenEngine{} }
+
+func (tokenEngine) Authenticate(_ context.Context, c auth.Credentials) (auth.Principal, error) {
+	if c.Token != nil {
+		switch *c.Token {
+		case "rw-token":
+			return auth.Principal{ID: "rw"}, nil
+		case "ro-token":
+			return auth.Principal{ID: "ro"}, nil
+		}
+	}
+	return auth.Principal{}, errors.New("unauthenticated: bad or missing token")
+}
+
+func namespaceOf(a auth.Action) string {
+	switch x := a.(type) {
+	case auth.PeerSyncAction:
+		return x.Namespace
+	case auth.PeerPullAction:
+		return x.Namespace
+	case auth.PeerPushAction:
+		return x.Namespace
+	case auth.StreamSubscribeAction:
+		return x.Namespace
+	case auth.DocumentReadAction:
+		return x.Namespace
+	case auth.DocumentWriteAction:
+		return x.Namespace
+	case auth.DocumentDeleteAction:
+		return x.Namespace
+	}
+	return ""
+}
+
+func (tokenEngine) Authorize(_ context.Context, p auth.Principal, a auth.Action) error {
+	if strings.HasPrefix(namespaceOf(a), "secret/") {
+		return errors.New("forbidden: secret namespace")
+	}
+	if p.ID == "ro" {
+		switch a.(type) {
+		case auth.PeerSyncAction, auth.PeerPushAction, auth.DocumentWriteAction, auth.DocumentDeleteAction:
+			return errors.New("forbidden: read-only token")
+		}
+	}
+	return nil
+}
+
+type opDto struct {
+	ID     string `json:"id"`
+	JSON   string `json:"json"`
+	Delete bool   `json:"delete"`
+}
+
+type command struct {
+	Op      string  `json:"op"`
+	NS      string  `json:"ns"`
+	ID      string  `json:"id"`
+	JSON    string  `json:"json"`
+	Ops     []opDto `json:"ops"`
+	Commits int     `json:"commits"`
+	Docs    int     `json:"docs"`
+}
+
+type host struct {
+	set *server.NamespaceSet
+}
+
+func (h *host) runtime(ns string) (*server.KdbServerRuntime, error) {
+	return h.set.Resolve(ns, true)
+}
+
+func (h *host) commit(ns string, ops []document.Op) (codec.Hash, error) {
+	rt, err := h.runtime(ns)
+	if err != nil {
+		return codec.Hash{}, err
+	}
+	head, err := rt.Runtime.DAG.Head()
+	if err != nil {
+		return codec.Hash{}, err
+	}
+	tx := document.Transaction{ID: mustRandomUUID(), BaseVersion: head, Operations: ops, Timestamp: codec.TimestampNow()}
+	c, err := rt.Commit(ns, tx, "", auth.Principal{ID: "host"})
+	return c.Hash, err
+}
+
+func mustRandomUUID() codec.UUID {
+	u, err := codec.RandomUUID()
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+func (h *host) handle(c command) (any, error) {
+	switch c.Op {
+	case "put":
+		id, err := codec.ParseUUID(c.ID)
+		if err != nil {
+			return nil, err
+		}
+		head, err := h.commit(c.NS, []document.Op{document.WriteOp{DocID: id, Patch: c.JSON}})
+		return map[string]string{"head": head.Hex()}, err
+	case "commit":
+		var ops []document.Op
+		for _, o := range c.Ops {
+			id, err := codec.ParseUUID(o.ID)
+			if err != nil {
+				return nil, err
+			}
+			if o.Delete {
+				ops = append(ops, document.DeleteOp{DocID: id})
+			} else {
+				ops = append(ops, document.WriteOp{DocID: id, Patch: o.JSON})
+			}
+		}
+		head, err := h.commit(c.NS, ops)
+		return map[string]string{"head": head.Hex()}, err
+	case "seed":
+		var head codec.Hash
+		for i := 0; i < c.Commits; i++ {
+			id := codec.DerivedUUID(fmt.Sprintf("seed:%s:%d", c.NS, i%max(c.Docs, 1)))
+			var err error
+			head, err = h.commit(c.NS, []document.Op{document.WriteOp{DocID: id, Patch: fmt.Sprintf(`{"n":%d}`, i)}})
+			if err != nil {
+				return nil, err
+			}
+		}
+		return map[string]string{"head": head.Hex()}, nil
+	case "head":
+		rt, err := h.runtime(c.NS)
+		if err != nil {
+			return nil, err
+		}
+		hash, commit, ok, err := rt.Runtime.DAG.HeadCommit()
+		if err != nil || !ok {
+			return map[string]string{"head": "", "tree": ""}, err
+		}
+		return map[string]string{"head": hash.Hex(), "tree": commit.DocumentTreeHash.Hex()}, nil
+	case "docs":
+		rt, err := h.runtime(c.NS)
+		if err != nil {
+			return nil, err
+		}
+		tree, err := rt.HeadTree()
+		if err != nil {
+			return nil, err
+		}
+		docs := map[string]string{}
+		var ferr error
+		tree.Walk(func(id codec.UUID, _ codec.Hash) bool {
+			body, _, found, err := rt.GetDocument(c.NS, id)
+			if err != nil {
+				ferr = err
+				return false
+			}
+			if found {
+				docs[id.String()] = body
+			}
+			return true
+		})
+		return map[string]any{"docs": docs}, ferr
+	}
+	return nil, fmt.Errorf("unknown op %q", c.Op)
+}
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:0", "HTTP listen address")
+	dir := flag.String("dir", "", "data directory (empty: in memory)")
+	flag.Parse()
+
+	var fileHost *embed.Host
+	var rt *embed.EmbeddedKdbRuntime
+	var err error
+	const primaryNS = "replicahost/primary"
+	if *dir != "" {
+		if fileHost, err = embed.OpenFileHost(*dir, embed.FileRuntimeOptionsFromEnv()); err == nil {
+			rt, err = fileHost.Namespace(embed.CatalogFromNamespace(primaryNS), primaryNS, schema.None())
+		}
+	} else {
+		rt, err = embed.OpenMemoryRuntime(embed.CatalogFromNamespace(primaryNS), primaryNS, schema.None())
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "kdb-replicahost: open:", err)
+		os.Exit(1)
+	}
+	primary := server.NewKdbServerRuntime(rt)
+	primary.AuthEngine = tokenEngine{}
+	primary.PeerCreateOnPush = true
+	var set *server.NamespaceSet
+	if fileHost != nil {
+		set = server.NewNamespaceSet(fileHost.Transactions())
+	} else {
+		set = server.NewNamespaceSet(nil)
+	}
+	if err := set.Add(primary); err != nil {
+		fmt.Fprintln(os.Stderr, "kdb-replicahost:", err)
+		os.Exit(1)
+	}
+	node, err := syncnode.Open(fileHost, set, primary, syncnode.Config{DataDir: *dir})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "kdb-replicahost: sync node:", err)
+		os.Exit(1)
+	}
+	set.SetOpener(node.Opener(nil))
+	if err := node.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "kdb-replicahost: start:", err)
+		os.Exit(1)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/kdb/sync", node.Handler())
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "kdb-replicahost: listen:", err)
+		os.Exit(1)
+	}
+	go func() { _ = http.Serve(ln, mux) }()
+	fmt.Printf("ready ws://%s/kdb/sync\n", ln.Addr().String())
+
+	h := &host{set: set}
+	in := bufio.NewScanner(os.Stdin)
+	in.Buffer(make([]byte, 1<<20), 64<<20)
+	out := json.NewEncoder(os.Stdout)
+	for in.Scan() {
+		var c command
+		var res any
+		if err = json.Unmarshal(in.Bytes(), &c); err == nil {
+			res, err = h.handle(c)
+		}
+		if err != nil {
+			_ = out.Encode(map[string]string{"error": err.Error()})
+			continue
+		}
+		_ = out.Encode(res)
+	}
+	node.Close()
+	if fileHost != nil {
+		_ = fileHost.Close()
+	}
+}

@@ -213,6 +213,24 @@ export function encodeCommitList(commits: readonly { payload: Uint8Array }[]): U
   return out;
 }
 
+/**
+ * The commit every namespace starts at, on every node (go/kdb/dag NewInMemoryCommitDag): fixed
+ * transaction and author ids, timestamp zero, no ops, the empty tree. A replica starts there too,
+ * so what it writes before it ever syncs still shares a root with the host's history.
+ */
+export function genesisCommit(namespace: string): Commit {
+  return buildCommit({
+    parents: [],
+    namespace,
+    transactionId: "00000000-0000-4000-8000-000000000001",
+    timestampMicros: 0n,
+    authorNodeId: "00000000-0000-4000-8000-000000000002",
+    ops: [],
+    treeHash: "0".repeat(64),
+    message: "genesis",
+  });
+}
+
 /** Content hash of a document: SHA-256 of `DocumentBody{1: uuid id, 2: string json}`. */
 export function contentHash(docId: string, json: string): string {
   const w = new Writer();

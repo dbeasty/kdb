@@ -13,6 +13,7 @@ import (
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
 )
 
@@ -61,7 +62,7 @@ type treeEditFixture struct {
 }
 
 type chainStepFixture struct {
-	From    string   `json:"from"` // "" = empty namespace
+	From    string   `json:"from"` // the namespace's genesis for the first step
 	To      string   `json:"to"`
 	Commits []string `json:"commits"` // the range from..to, in no particular order
 	// Docs is the document set at To: what a replica fast-forwarded there must hold.
@@ -160,6 +161,19 @@ func buildReplicaCommits() []replicaCommitFixture {
 			document.FileWriteOp{Path: "/a/b.txt", BlobHash: fixedHash("blob")},
 			document.SchemaMigrationOp{MigrationID: b, MigrationPayload: `{"v":2}`},
 		}, fixedHash("tree3"), nil, "")))
+	// Every namespace starts at this commit on every node (dag.NewInMemoryCommitDag), so a replica
+	// that writes before it ever syncs still shares a root with the host.
+	for _, ns := range []string{"app/u/42", "orders"} {
+		d, err := dag.NewInMemoryCommitDag(ns)
+		if err != nil {
+			fail(err)
+		}
+		_, genesis, ok, err := d.HeadCommit()
+		if err != nil || !ok {
+			fail(fmt.Errorf("genesis of %s: %v", ns, err))
+		}
+		out = append(out, commitFixture("genesis:"+ns, genesis))
+	}
 	long := make([]document.Op, 0, 200)
 	for i := 0; i < 200; i++ {
 		id := codec.DerivedUUID(fmt.Sprint("doc-", i))
@@ -318,7 +332,15 @@ func buildChain() chainFixture {
 	w := func(i int, v string) document.Op { return document.WriteOp{DocID: ids[i], Patch: v} }
 	d := func(i int) document.Op { return document.DeleteOp{DocID: ids[i]} }
 
-	c1 := commit(nil, state{}, []document.Op{w(0, `{"v":1}`), w(1, `{"v":1}`), w(2, `{"v":1}`)})
+	nsDag, err := dag.NewInMemoryCommitDag(ns)
+	if err != nil {
+		fail(err)
+	}
+	_, genesis, _, err := nsDag.HeadCommit()
+	if err != nil {
+		fail(err)
+	}
+	c1 := commit([]codec.Hash{genesis.Hash}, state{}, []document.Op{w(0, `{"v":1}`), w(1, `{"v":1}`), w(2, `{"v":1}`)})
 	c2 := commit([]codec.Hash{c1.Hash}, states[c1.Hash], []document.Op{w(0, `{"v":2}`), d(1)})
 	c3 := commit([]codec.Hash{c2.Hash}, states[c2.Hash], []document.Op{w(3, `{"v":3}`), w(0, `{"v":3}`)})
 	a1 := commit([]codec.Hash{c3.Hash}, states[c3.Hash], []document.Op{w(4, `{"a":1}`), w(2, `{"a":1}`)})
@@ -351,7 +373,7 @@ func buildChain() chainFixture {
 		f.Commits = append(f.Commits, commitFixture(fmt.Sprint("chain", i), c))
 	}
 	step := func(from *document.Commit, to document.Commit, rng ...document.Commit) {
-		s := chainStepFixture{To: to.Hash.Hex(), Docs: map[string]string{}}
+		s := chainStepFixture{From: genesis.Hash.Hex(), To: to.Hash.Hex(), Docs: map[string]string{}}
 		if from != nil {
 			s.From = from.Hash.Hex()
 		}

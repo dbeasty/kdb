@@ -32,3 +32,14 @@ export {
   topoSort,
   type NamespaceMeta,
 } from "./namespace.ts";
+export { ReplicaBusyError, type TreeNodeView } from "./namespace.ts";
+export { PeerConnection, RemoteError, ProtocolError, type ConflictReport, type NamespaceRefs } from "./peer.ts";
+export { syncNamespace, type CatchUp, type NamespaceSyncResult } from "./sync.ts";
+export {
+  openReplica,
+  Replica,
+  type ChangeEvent,
+  type ConflictEvent,
+  type ReplicaOptions,
+  type ReplicaStatus,
+} from "./replica.ts";
