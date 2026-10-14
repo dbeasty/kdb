@@ -74,8 +74,9 @@ type MaintenanceOptions struct {
 	// ReclaimUnset leaves the individual fields alone.
 	Reclaim storage.ReclaimMode
 
-	// CompactTables is the number of SSTables that justifies a pass on
-	// its own, independent of whether anything has been committed. Zero
+	// CompactTables is the number of SSTable runs (a flushed table, or the
+	// tables one merge wrote) that justifies a pass on its own,
+	// independent of whether anything has been committed. Zero
 	// uses sstable.DefaultCompactionTrigger, which is what
 	// CompactBlobStore itself applies.
 	CompactTables int
@@ -504,7 +505,7 @@ func (s *MaintenanceScheduler) needsWork(now time.Time) bool {
 	// 2. A table backlog, which builds from memtable flushes rather than
 	//    from commits and so can outlive a quiet head.
 	if eng, ok := s.rt.Storage.(*engine.ServerEngine); ok {
-		if eng.BlobTableCount() >= s.opts.CompactTables {
+		if eng.BlobRunCount() >= s.opts.CompactTables {
 			return true
 		}
 	}

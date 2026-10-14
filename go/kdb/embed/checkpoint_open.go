@@ -593,8 +593,8 @@ func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID 
 	}
 	res.TablesMerged, res.TablesRemoved, res.VersionsDropped = c.Merged, c.Removed, c.Dropped
 	if c.Removed > 0 {
-		log.Printf("kdb: namespace %s: merged %d sstables into one, removed %d, dropped %d unreachable version(s)",
-			namespaceID, c.Merged, c.Removed, c.Dropped)
+		log.Printf("kdb: namespace %s: merged %d sstables into %d, removed %d, dropped %d unreachable version(s)",
+			namespaceID, c.Merged, len(c.Outputs), c.Removed, c.Dropped)
 	}
 	return res
 }
