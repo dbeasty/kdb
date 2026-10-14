@@ -122,8 +122,12 @@ func (s *pageSpool) readerSized(maxBytes, limit, bufBytes int) (func() ([]wire.S
 	read := 0
 	// held is a document read past the end of the previous batch: the one that did not fit.
 	var held *wire.SnapshotDoc
+	// Each batch is sized like the one before it: batches of one spool are much alike, and
+	// growing a fresh slice by doubling for every batch was a third of what reading back cost.
+	lastLen := 0
 	return func() ([]wire.SnapshotDoc, error) {
-		var batch []wire.SnapshotDoc
+		batch := make([]wire.SnapshotDoc, 0, lastLen+1)
+		defer func() { lastLen = max(lastLen, len(batch)) }()
 		size := 0
 		if held != nil {
 			batch, size, held = append(batch, *held), len(held.Body), nil

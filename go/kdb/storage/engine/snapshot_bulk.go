@@ -63,8 +63,9 @@ func (e *ServerEngine) ReadDocumentsThrough(namespaceID string, docIDs []codec.U
 //     Unbounded, docsByHash holds and pins the live tree as always.
 //   - No document locations are stashed: there is no log position to file them under.
 //
-// The tree is built exactly as CommitTree builds it (With per document, a tree object per batch),
-// so the tree hash a caller checks against the snapshot's commit means the same thing.
+// The tree is the one CommitTree would build (DocumentTree.WithAll builds With's tree, hashing
+// each node once per batch; a tree object per batch), so the tree hash a caller checks against
+// the snapshot's commit means the same thing.
 //
 // An engine with no durable blob store (an in-memory target) takes the ordinary path.
 func (e *ServerEngine) ApplySnapshotBatch(namespaceID string, docs []document.Document) (document.DocumentTree, error) {
@@ -94,15 +95,29 @@ func (e *ServerEngine) applySnapshotBatchLocked(docs []document.Document) (docum
 	chained := e.tree.Size() == 0 || (e.snapshotBodiesSet && e.tree.TreeHash == e.snapshotBodies)
 	e.snapshotBodiesSet = false
 	base := e.tree
+	// A batch of distinct ids in order - what a snapshot sends - is added to the tree in one pass,
+	// each node it touches hashed once rather than once per document: with every insert rehashing
+	// its path to the root, the tree was most of an install's time at 10M documents. Anything
+	// else is added a document at a time, as CommitTree would.
+	ascending := true
+	for i := 1; i < len(docs) && ascending; i++ {
+		ascending = idAfter(docs[i].ID, docs[i-1].ID)
+	}
 	changed := make([]TreeChange, 0, len(docs))
+	var entries []document.TreeEntry
+	if ascending {
+		entries = make([]document.TreeEntry, 0, len(docs))
+	}
 	for _, doc := range docs {
 		h := hasher.Hash(doc.ID, doc.JSON)
 		changed = append(changed, TreeChange{DocID: doc.ID, ContentHash: h})
 		// Put copies the value into the memtable's arena, so the body's own bytes can be lent.
 		e.memTable.Put(h, unsafe.Slice(unsafe.StringData(doc.JSON), len(doc.JSON)))
-		prev, hadPrev := e.tree.HashFor(doc.ID)
 		if !bounded {
 			// CommitTree's pin discipline, unbounded: the live tree's versions stay pinned.
+			// Distinct ids read the same previous version from the batch's base as from the
+			// tree with the batch's earlier documents in it.
+			prev, hadPrev := e.tree.HashFor(doc.ID)
 			if !hadPrev || prev != h {
 				e.docsByHash.Pin(h)
 			}
@@ -111,8 +126,18 @@ func (e *ServerEngine) applySnapshotBatchLocked(docs []document.Document) (docum
 				e.docsByHash.Unpin(prev)
 			}
 		}
+		if ascending {
+			entries = append(entries, document.TreeEntry{DocID: doc.ID, ContentHash: h})
+			continue
+		}
 		var err error
 		if e.tree, err = e.tree.With(doc.ID, h); err != nil {
+			return document.DocumentTree{}, err
+		}
+	}
+	if ascending {
+		var err error
+		if e.tree, err = e.tree.WithAll(entries); err != nil {
 			return document.DocumentTree{}, err
 		}
 	}
@@ -126,6 +151,14 @@ func (e *ServerEngine) applySnapshotBatchLocked(docs []document.Document) (docum
 	e.publishTreeLocked(e.tree, len(changed))
 	e.treesMu.Unlock()
 	return e.tree, nil
+}
+
+// idAfter reports whether a sorts after b in a tree's order (the order of their bytes).
+func idAfter(a, b codec.UUID) bool {
+	if a.MSB != b.MSB {
+		return uint64(a.MSB) > uint64(b.MSB)
+	}
+	return uint64(a.LSB) > uint64(b.LSB)
 }
 
 // snapshotBodiesCover reports whether every version tree names is already in the blob store
