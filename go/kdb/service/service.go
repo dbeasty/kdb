@@ -114,6 +114,7 @@ func Main() {
 	fs.DurationVar(&flagVals.AttachmentUploadGrace, "attachment-upload-grace", flagVals.AttachmentUploadGrace, "how long a finished attachment upload that no commit references yet is kept before maintenance may collect it - the longest a client may take between uploading an attachment and committing it")
 	fs.DurationVar(&flagVals.MaintenanceSweep, "maintenance-sweep", flagVals.MaintenanceSweep, "how long the maintenance loop may go without a pass while a namespace is idle - retention expires by wall clock with no commit involved, so this is what catches a window that aged out of a namespace nobody is writing to")
 	fs.IntVar(&flagVals.AttachmentDeltaStepMB, "attachment-delta-step-mb", flagVals.AttachmentDeltaStepMB, "how many MiB one maintenance pass reads diffing replaced attachment versions into deltas; a larger version is diffed over several passes (0: 4096)")
+	fs.BoolVar(&flagVals.AttachmentDeltas, "attachment-deltas", flagVals.AttachmentDeltas, "re-store a replaced attachment version as a delta against its successor when that saves space; false keeps every version as the original file, whole, and maintenance turns deltas already stored back into whole files")
 	fs.IntVar(&flagVals.MaintenanceMaxDefer, "maintenance-max-defer", flagVals.MaintenanceMaxDefer, "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway; -1 never forces one through, which risks a busy server never reclaiming")
 	fs.StringVar(&flagVals.ControlAddr, "control-addr", flagVals.ControlAddr, "control-plane HTTP listen address (host:port) serving the JSON control API and, unless --control-ui=false, the embedded control UI: namespaces, commit history, per-commit diffs, schema, and the resolved configuration with provenance. Unlike --admin-addr it authenticates every request against the same auth engine the wire listeners use - but that engine is still the static \"user:pass\" bearer until real tokens land, so bind this privately (empty to disable)")
 	fs.BoolVar(&flagVals.ControlWrite, "control-write", flagVals.ControlWrite, "allow the control plane's mutating endpoints. Off by default: turning the control plane on is not, by itself, a decision to let a browser write to the database. Nothing mutating is implemented yet, so today this only decides whether such a request is refused as forbidden or reported as not-yet-built")
@@ -276,6 +277,7 @@ func Main() {
 		opts.Storage.SyncMode = syncMode
 		opts.Storage.AttachmentUploadGrace = cfg.AttachmentUploadGrace
 		opts.Storage.AttachmentDeltaStepBytes = int64(cfg.AttachmentDeltaStepMB) << 20
+		opts.Storage.DisableAttachmentDeltas = !cfg.AttachmentDeltas
 		var nodeID codec.UUID
 		if nodeID, err = embed.LoadOrCreateNodeID(dataDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: node identity: %v\n", err)

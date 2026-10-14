@@ -130,7 +130,7 @@ func (rt *EmbeddedKdbRuntime) SetAttachmentHistory(h AttachmentHistory) {
 
 // SetAttachmentConfig tunes the attachment store (size limit, chunking, deltas, upload grace). It
 // replaces the whole configuration, StorageOptions.AttachmentUploadGrace and
-// AttachmentDeltaStepBytes included. Takes effect for
+// AttachmentDeltaStepBytes and DisableAttachmentDeltas included. Takes effect for
 // stores opened afterwards.
 func (rt *EmbeddedKdbRuntime) SetAttachmentConfig(cfg attachstore.Config) {
 	rt.attach.mu.Lock()
@@ -737,6 +737,10 @@ type AttachmentMaintenance struct {
 	// DeltaPending: the pass spent its delta budget (attachstore.Config.DeltaStepBytes) before
 	// the replaced versions were all done; the next pass goes on where this one stopped.
 	DeltaPending bool
+	// Inflated: versions stored as deltas turned back into whole copies, because deltas are
+	// disabled (attachstore.Config.DisableDeltas). InflatePending: the pass's budget ran out first.
+	Inflated       int
+	InflatePending bool
 	// Under AttachmentHistoryAll: the commits read for the references they add (only those since
 	// the last pass, unless the reference index was rebuilt).
 	Scanned int
@@ -758,10 +762,11 @@ func (rt *EmbeddedKdbRuntime) AttachmentSetPoolStats() document.AttachmentSetPoo
 	return d.AttachmentSetPool().Stats()
 }
 
-// CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll) and deletes the
-// standalone blobs nothing keeps: under AttachmentHistoryLatest anything a branch or tag head does
-// not reference, under AttachmentHistoryAll anything no reachable commit references (an upload
-// that was never committed). Maintain calls it; it is safe to call at any time.
+// CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll; with
+// attachstore.Config.DisableDeltas it instead turns any stored deltas back into whole copies) and
+// deletes the standalone blobs nothing keeps: under AttachmentHistoryLatest anything a branch or
+// tag head does not reference, under AttachmentHistoryAll anything no reachable commit references
+// (an upload that was never committed). Maintain calls it; it is safe to call at any time.
 //
 // Replacements are read from the DAG, so every way a commit arrives counts - PutAttachment, a
 // transaction from a client or SQL, peer sync: a commit that puts an attachment whose first parent
@@ -790,18 +795,33 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		if err != nil {
 			return out, err
 		}
-		out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
-		return out, err
+		if out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] }); err != nil || !store.Config().DisableDeltas {
+			return out, err
+		}
+		return out, inflateDeltas(store, &out)
 	}
 	d, err := rt.inMemoryDAG()
 	if err != nil {
 		return out, err
 	}
+	heads := branchAndTagHeads(d)
+	if store.Config().DisableDeltas {
+		// Every version stays whole: no replacements are looked for (the heads are the stops),
+		// and the mark stays where it is, so turning deltas back on diffs the versions replaced
+		// meanwhile.
+		refs, _, err := rt.attachmentReferences(d, store, heads, heads, &out)
+		if err != nil {
+			return out, err
+		}
+		if out.Removed, err = store.Collect(func(h codec.Hash) bool { return refs.Has(h) }); err != nil {
+			return out, err
+		}
+		return out, inflateDeltas(store, &out)
+	}
 	mark, err := store.Mark()
 	if err != nil {
 		return out, err
 	}
-	heads := branchAndTagHeads(d)
 	// Deltas are owed for the commits the last pass that finished its deltas did not go through:
 	// those above the mark. Usually the mark is the reference index's heads and the commits are the
 	// same; after a pass that stopped early (an error, DeltaPending) the mark lags and they are
@@ -826,6 +846,39 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		return out, deltaErr
 	}
 	return out, err
+}
+
+// inflateDeltas turns versions stored as deltas back into whole copies, within the pass's budget
+// (attachstore.Config.DeltaStepBytes): with deltas disabled every version is the original file. A
+// version gone missing or corrupt is left as it is.
+func inflateDeltas(store *attachstore.Store, out *AttachmentMaintenance) error {
+	deltas, err := store.Deltas()
+	if err != nil {
+		return err
+	}
+	budget := store.Config().DeltaStepBytes
+	for _, h := range deltas {
+		if budget <= 0 {
+			out.InflatePending = true
+			return nil
+		}
+		done, used, err := store.InflateStep(h, budget)
+		budget -= used
+		if errors.Is(err, attachstore.ErrNotFound) || errors.Is(err, attachstore.ErrCorrupt) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !done {
+			out.InflatePending = true
+			return nil
+		}
+		if used > 0 {
+			out.Inflated++
+		}
+	}
+	return nil
 }
 
 // deltaReplaced re-stores, for each put in changes, the version it replaced in its commit's first

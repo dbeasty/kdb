@@ -108,6 +108,10 @@ type Config struct {
 	// DeltaStepBytes is how much work - bytes indexed, encoded or verified - one DeltaStep does
 	// when its caller names no budget, and so one maintenance pass. Default 4 GiB.
 	DeltaStepBytes int64
+	// DisableDeltas keeps every version whole, as uploaded: DeltaStep (and StoreAsDelta) store
+	// nothing. Deltas stored before it was set still read; InflateStep turns them back into
+	// whole copies, which maintenance does while this is set.
+	DisableDeltas bool
 	// DeltaMaxDepth bounds a delta chain - how many deltas a read goes through. Default 8.
 	DeltaMaxDepth int
 	// HashWorkers bounds the chunks hashed at once during an upload. Default GOMAXPROCS.
@@ -210,6 +214,7 @@ type Store struct {
 	// declined the pairs whose delta was not worth storing (this process need not try them again).
 	deltaMu  sync.Mutex
 	job      *deltaJob
+	inflate  *inflateJob // inflate.go: a delta being turned back into a whole copy
 	declined map[[2]codec.Hash]struct{}
 }
 
@@ -818,9 +823,16 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 			live[p.base] = true
 		}
 	}
-	if job := s.job; job != nil && (!live[job.old] || !live[job.base]) && s.deltaMu.TryLock() {
-		s.dropJobLocked() // its versions are going; no step can be running, we hold deltaMu
-		s.deltaMu.Unlock()
+	if (s.job != nil && (!live[s.job.old] || !live[s.job.base])) || (s.inflate != nil && !live[s.inflate.h]) {
+		if s.deltaMu.TryLock() { // no step can be running while we hold it
+			if s.job != nil && (!live[s.job.old] || !live[s.job.base]) {
+				s.dropJobLocked() // its versions are going
+			}
+			if s.inflate != nil && !live[s.inflate.h] {
+				s.dropInflateLocked()
+			}
+			s.deltaMu.Unlock()
+		}
 	}
 	removed := 0
 	for h := range s.pointers {

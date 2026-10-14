@@ -301,6 +301,13 @@ func serviceSpecs() []settingSpec {
 			inFile: func(f *ServiceFile) bool { return f.AttachmentDeltaStepMB != nil },
 		},
 		{
+			key: "governance.attachmentDeltas", flag: "attachment-deltas", env: "KDB_ATTACHMENT_DELTAS",
+			scope: ScopeProcess, mutability: MutabilityRestart,
+			help:   "re-store a replaced attachment version as a delta against its successor when that saves space. Off, every version is kept as the original file, whole, and maintenance turns deltas already stored back into whole files. Applies to namespaces opened after it is set",
+			value:  yn(func(s ServiceSettings) bool { return s.AttachmentDeltas }),
+			inFile: func(f *ServiceFile) bool { return f.AttachmentDeltas != nil },
+		},
+		{
 			key: "governance.maintenanceMaxDefer", flag: "maintenance-max-defer", env: "KDB_MAINTENANCE_MAX_DEFER",
 			scope: ScopeProcess, mutability: MutabilityLive, unit: "ticks",
 			help:      "how many consecutive ticks write load may postpone a due maintenance pass before it runs anyway. The busiest server is the one whose log grows fastest, so this bound is what stops load starving reclamation; -1 never forces and risks exactly that",

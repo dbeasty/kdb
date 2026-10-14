@@ -387,3 +387,87 @@ func TestVerifyKeepsTheWholeCopyOfABadDelta(t *testing.T) {
 		t.Fatalf("the bad delta's segments were left: %v", names)
 	}
 }
+
+// With deltas disabled every version stays whole: nothing is encoded or written.
+func TestDisableDeltasKeepsEveryVersionWhole(t *testing.T) {
+	s, shim, _ := newTestStore(t, tinyDeltas(Config{DisableDeltas: true}))
+	v := versions(rand.New(rand.NewSource(18)), 2, 3*chunk)
+	oi, _ := s.Put(bytes.NewReader(v[0]))
+	ni, _ := s.Put(bytes.NewReader(v[1]))
+	before, _ := shim.ListSegments("app/data")
+	if out, used, err := s.DeltaStep(oi.Hash, ni.Hash, 0); err != nil || out != DeltaSkipped || used != 0 {
+		t.Fatalf("a step with deltas disabled: %v %d %v", out, used, err)
+	}
+	if did, err := s.StoreAsDelta(oi.Hash, ni.Hash); err != nil || did {
+		t.Fatalf("StoreAsDelta with deltas disabled: %v %v", did, err)
+	}
+	if after, _ := shim.ListSegments("app/data"); len(after) != len(before) {
+		t.Fatalf("segments %v became %v", before, after)
+	}
+	if got := readBack(t, s, oi.Hash); !bytes.Equal(got, v[0]) {
+		t.Fatal("the old version reads wrong")
+	}
+}
+
+// With deltas disabled, InflateStep turns deltas stored before - a whole chain of them - back into
+// whole copies, in bounded steps, while a reader open on one finishes on the delta it opened.
+func TestInflateTurnsDeltasBackIntoWholeCopies(t *testing.T) {
+	s, shim, small := newTestStore(t, tinyDeltas(Config{}))
+	v := versions(rand.New(rand.NewSource(19)), 3, 3*chunk+77)
+	var h []codec.Hash
+	for _, b := range v {
+		info, _ := s.Put(bytes.NewReader(b))
+		h = append(h, info.Hash)
+	}
+	for i := len(h) - 2; i >= 0; i-- {
+		if did, err := s.StoreAsDelta(h[i], h[i+1]); err != nil || !did {
+			t.Fatalf("delta %d: %v %v", i, did, err)
+		}
+	}
+	off := New(shim, "app/data", small, tinyDeltas(Config{DisableDeltas: true}))
+	if d, _ := off.Deltas(); len(d) != 2 {
+		t.Fatalf("%d deltas, want 2", len(d))
+	}
+	rd, err := off.Open(h[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []codec.Hash{h[1], h[0]} {
+		steps := 0
+		for {
+			steps++
+			done, used, err := off.InflateStep(x, 1<<20)
+			if err != nil || used > 1<<20 {
+				t.Fatalf("inflate: %v (used %d)", err, used)
+			}
+			if done {
+				break
+			}
+		}
+		if steps < 4 {
+			t.Fatalf("inflated in %d steps; the budget did not bound them", steps)
+		}
+	}
+	if d, _ := off.Deltas(); len(d) != 0 {
+		t.Fatalf("still deltas: %v", d)
+	}
+	got := make([]byte, len(v[0]))
+	if _, err := rd.ReadAt(got, 0); err != nil || !bytes.Equal(got, v[0]) {
+		t.Fatalf("the reader open across the inflate: %v", err)
+	}
+	rd.Close()
+	for i, x := range h {
+		if got := readBack(t, off, x); !bytes.Equal(got, v[i]) {
+			t.Fatalf("version %d reads wrong", i)
+		}
+	}
+	if _, err := off.Collect(func(codec.Hash) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if names, _ := shim.ListSegments("app/data"); len(names) != 9 { // 3 pointers, segments, leaves
+		t.Fatalf("left behind: %v", names)
+	}
+	if done, used, err := off.InflateStep(h[2], 0); !done || used != 0 || err != nil {
+		t.Fatalf("a whole blob: %v %d %v", done, used, err)
+	}
+}

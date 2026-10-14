@@ -79,7 +79,7 @@ func (s *Store) DeltaStep(old, base codec.Hash, budget int64) (DeltaOutcome, int
 	if budget <= 0 {
 		budget = s.cfg.DeltaStepBytes
 	}
-	if old == base || old == emptyHash || base == emptyHash {
+	if old == base || old == emptyHash || base == emptyHash || s.cfg.DisableDeltas {
 		return DeltaSkipped, 0, nil
 	}
 	s.deltaMu.Lock()

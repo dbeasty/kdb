@@ -33,6 +33,7 @@ var fieldToKey = map[string]string{
 	"MaintenanceSweep":       "governance.maintenanceSweep",
 	"AttachmentUploadGrace":  "governance.attachmentUploadGrace",
 	"AttachmentDeltaStepMB":  "governance.attachmentDeltaStepMB",
+	"AttachmentDeltas":       "governance.attachmentDeltas",
 	"MaintenanceMaxDefer":    "governance.maintenanceMaxDefer",
 	"TLSCert":                "tls.certFile",
 	"TLSKey":                 "tls.keyFile",
@@ -108,7 +109,7 @@ func envProbeValue(key string) string {
 		return "true"
 	case "control.settingsPersist", "control.promote":
 		return "true"
-	case "control.ui":
+	case "control.ui", "governance.attachmentDeltas":
 		// Defaults to on, so "true" would be indistinguishable from nothing happening.
 		return "false"
 	case "memory.budgetMB", "memory.limitMB", "memory.reserveMB",

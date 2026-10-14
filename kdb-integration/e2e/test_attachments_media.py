@@ -275,6 +275,25 @@ def test_a_version_over_the_pass_budget_is_diffed_over_many_passes(tmp_path):
         srv.stop()
 
 
+def test_with_deltas_off_every_version_stays_the_original_file(tmp_path):
+    """--attachment-deltas=false: a small edit that would be a delta is not one - maintenance
+    keeps both versions whole, and both read back exactly."""
+    v1 = mf.make_bin(tmp_path / "v1", 8 * CHUNK)
+    v2 = mf.insert_bytes(tmp_path / "v1", tmp_path / "v2", 3 * CHUNK + 4321, b"inserted!" * 50)
+    srv = maintained_server(extra_args=["--attachment-deltas=false"]).start()
+    try:
+        doc = doc_id(0xC260)
+        upsert(srv, doc, {"id": doc})
+        c1 = attach(srv, doc, "f", tmp_path / "v1")["commit"]
+        c2 = attach(srv, doc, "f", tmp_path / "v2")["commit"]
+        settled = wait_stored_settles(srv, timeout=30, quiet=3.0)
+        assert settled >= v1.size + v2.size, (settled, v1.size, v2.size)
+        check_read(srv, doc, "f", v1, tmp_path, as_of=c1, tag=".v1")
+        check_read(srv, doc, "f", v2, tmp_path, as_of=c2, tag=".v2")
+    finally:
+        srv.stop()
+
+
 def test_reencoded_video_is_stored_whole_negative_control(tmp_path):
     """V3: re-encoding changes nearly every byte, so no delta is worth keeping: the store holds
     both versions about whole, and both still decode frame by frame."""

@@ -147,6 +147,11 @@ type StorageOptions struct {
 	// attachment versions into deltas (attachstore.Config.DeltaStepBytes); a larger version is
 	// diffed over several passes. Zero uses the default, 4 GiB.
 	AttachmentDeltaStepBytes int64
+	// DisableAttachmentDeltas keeps every attachment version as the original file, whole:
+	// maintenance never re-stores a replaced version as a delta (attachstore.Config.DisableDeltas).
+	// Maintenance turns deltas already stored back into whole copies. Off by default - deltas
+	// are on.
+	DisableAttachmentDeltas bool
 
 	// CloseCompactionBytes bounds the SSTable merge closing the namespace may do: close merges
 	// the tables only when they hold at most this many bytes, and otherwise leaves them to the
