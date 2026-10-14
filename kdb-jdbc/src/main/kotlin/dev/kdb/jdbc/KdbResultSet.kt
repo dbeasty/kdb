@@ -117,6 +117,9 @@ public fun queryResultSet(result: QueryResult): ResultSet {
                         is String -> state.getBigDecimal(state.findColumn(args[0] as String))
                         else -> unsupported(method)
                     }
+                "getBytes" -> state.getBytes(state.columnIndex(args[0]))
+                "getBinaryStream" -> state.getBytes(state.columnIndex(args[0]))?.let { java.io.ByteArrayInputStream(it) }
+                "getBlob" -> state.getBytes(state.columnIndex(args[0]))?.let { javax.sql.rowset.serial.SerialBlob(it) }
                 "getTimestamp" ->
                     when (args[0]) {
                         is Int -> state.getTimestamp(args[0] as Int)
@@ -151,6 +154,33 @@ private class ResultSetState(
         if (closed) throw SQLException("ResultSet is closed")
         rowIndex++
         return rowIndex < result.rows.size
+    }
+
+    fun columnIndex(arg: Any?): Int =
+        when (arg) {
+            is Int -> arg
+            is String -> findColumn(arg)
+            else -> throw SQLException("invalid column reference: $arg")
+        }
+
+    private fun binary(columnIndex: Int): Boolean = result.columns[columnIndex - 1].sqlType.equals("VARBINARY", ignoreCase = true)
+
+    /**
+     * A binary cell's bytes. Network results carry bytes as base64 text in a VARBINARY column
+     * (wire CellKindBytes); any other column's text is returned as its UTF-8 bytes.
+     */
+    fun getBytes(columnIndex: Int): ByteArray? {
+        val c = cell(columnIndex)
+        wasNull = c is SqlCell.Null
+        if (c is SqlCell.Null) return null
+        if (binary(columnIndex) && c is SqlCell.StringVal) {
+            return try {
+                java.util.Base64.getDecoder().decode(c.value)
+            } catch (e: IllegalArgumentException) {
+                throw SQLException("column $columnIndex: invalid binary cell: ${e.message}")
+            }
+        }
+        return getString(columnIndex)?.encodeToByteArray()
     }
 
     fun findColumn(label: String): Int {
@@ -209,6 +239,7 @@ private class ResultSetState(
     }
 
     fun getObject(columnIndex: Int): Any? {
+        if (binary(columnIndex)) return getBytes(columnIndex)
         val c = cell(columnIndex)
         wasNull = c is SqlCell.Null
         return when (c) {
@@ -264,6 +295,7 @@ private class KdbResultSetMetaData(
             "DECIMAL" -> Types.DECIMAL
             "TIMESTAMP" -> Types.TIMESTAMP
             "JSON" -> Types.LONGVARCHAR
+            "VARBINARY" -> Types.VARBINARY
             else -> Types.VARCHAR
         }
 
@@ -303,7 +335,8 @@ private class KdbResultSetMetaData(
 
     override fun isDefinitelyWritable(column: Int): Boolean = false
 
-    override fun getColumnClassName(column: Int): String = "java.lang.String"
+    override fun getColumnClassName(column: Int): String =
+        if (getColumnType(column) == Types.VARBINARY) "[B" else "java.lang.String"
 }
 
 private fun unsupported(method: Method): Nothing =

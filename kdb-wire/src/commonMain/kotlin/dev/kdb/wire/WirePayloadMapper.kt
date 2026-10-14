@@ -324,6 +324,11 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         retryAfterMs = retryAfterMs,
                     ),
             )
+
+        is WireMessage.AttachmentUpload, is WireMessage.AttachmentUploadResult, is WireMessage.AttachmentGet,
+        is WireMessage.AttachmentData, is WireMessage.AttachmentList, is WireMessage.AttachmentListResult,
+        is WireMessage.BlobFetch, is WireMessage.BlobFetchResult,
+        -> throw IllegalArgumentException("${header.messageType} has no JSON form: it is always a binary body")
     }
 
 internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =

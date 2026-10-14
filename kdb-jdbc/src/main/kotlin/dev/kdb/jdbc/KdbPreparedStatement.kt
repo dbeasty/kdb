@@ -12,8 +12,8 @@ public class KdbPreparedStatement(
     connection: KdbSqlConnection,
     private val sql: String,
 ) : KdbStatement(connection), PreparedStatement {
-    private val bindingSlots = mutableListOf<SqlParameter?>()
-    private val batchBindings = mutableListOf<List<SqlParameter>>()
+    private val bindingSlots = mutableListOf<KdbBinding?>()
+    private val batchBindings = mutableListOf<List<KdbBinding>>()
 
     override fun executeQuery(): ResultSet {
         checkOpen()
@@ -30,11 +30,11 @@ public class KdbPreparedStatement(
 
     private fun executeUpdateReturningKeys(
         sql: String,
-        parameters: List<SqlParameter>,
+        parameters: List<KdbBinding>,
     ): Pair<List<String>, Int> {
         connection.checkWritable()
         val hybridResult =
-            connection.blocking { connection.executeHybrid(qualifyTable(sql), parameters) }
+            connection.blocking { connection.executeHybridBound(qualifyTable(sql), parameters) }
         return hybridResult.result.generatedIds to hybridResult.result.rowsAffected
     }
 
@@ -122,7 +122,9 @@ public class KdbPreparedStatement(
     override fun setBytes(
         parameterIndex: Int,
         x: ByteArray?,
-    ) = unsupported()
+    ) {
+        bindRaw(parameterIndex, if (x == null) KdbBinding.Plain(SqlParameter.NullParam) else KdbBinding.Bytes(x.copyOf()))
+    }
 
     override fun setDate(
         parameterIndex: Int,
@@ -166,19 +168,25 @@ public class KdbPreparedStatement(
     override fun setBinaryStream(
         parameterIndex: Int,
         x: InputStream?,
-    ) = unsupported()
+    ) {
+        bindStream(parameterIndex, x, -1)
+    }
 
     override fun setBinaryStream(
         parameterIndex: Int,
         x: InputStream?,
         length: Int,
-    ) = unsupported()
+    ) {
+        bindStream(parameterIndex, x, length.toLong())
+    }
 
     override fun setBinaryStream(
         parameterIndex: Int,
         x: InputStream?,
         length: Long,
-    ) = unsupported()
+    ) {
+        bindStream(parameterIndex, x, length)
+    }
 
     override fun setObject(
         parameterIndex: Int,
@@ -191,6 +199,9 @@ public class KdbPreparedStatement(
             is Long -> setLong(parameterIndex, x)
             is Int -> setInt(parameterIndex, x)
             is Boolean -> setBoolean(parameterIndex, x)
+            is ByteArray -> setBytes(parameterIndex, x)
+            is InputStream -> setBinaryStream(parameterIndex, x)
+            is Blob -> setBlob(parameterIndex, x)
             else -> setString(parameterIndex, x.toString())
         }
     }
@@ -227,12 +238,16 @@ public class KdbPreparedStatement(
     override fun setBlob(
         parameterIndex: Int,
         x: Blob?,
-    ) = unsupported()
+    ) {
+        if (x == null) bind(parameterIndex, SqlParameter.NullParam) else bindStream(parameterIndex, x.binaryStream, x.length())
+    }
 
     override fun setBlob(
         parameterIndex: Int,
         inputStream: InputStream?,
-    ) = unsupported()
+    ) {
+        bindStream(parameterIndex, inputStream, -1)
+    }
 
     override fun setClob(
         parameterIndex: Int,
@@ -323,7 +338,9 @@ public class KdbPreparedStatement(
         parameterIndex: Int,
         inputStream: InputStream?,
         length: Long,
-    ) = unsupported()
+    ) {
+        bindStream(parameterIndex, inputStream, length)
+    }
 
     override fun setNClob(
         parameterIndex: Int,
@@ -374,6 +391,32 @@ public class KdbPreparedStatement(
     private fun bind(
         parameterIndex: Int,
         value: SqlParameter,
+    ) = bindRaw(parameterIndex, KdbBinding.Plain(value))
+
+    private fun bindStream(
+        parameterIndex: Int,
+        input: InputStream?,
+        length: Long,
+    ) {
+        if (input == null) {
+            bind(parameterIndex, SqlParameter.NullParam)
+        } else {
+            bindRaw(parameterIndex, KdbBinding.Stream(input, length))
+        }
+    }
+
+    /** Binds an already uploaded blob (see KdbAttachments.upload) as an attachment reference. */
+    public fun setAttachmentRef(
+        parameterIndex: Int,
+        hashHex: String,
+        size: Long,
+    ) {
+        bindRaw(parameterIndex, KdbBinding.AttachmentRef(hashHex, size))
+    }
+
+    private fun bindRaw(
+        parameterIndex: Int,
+        value: KdbBinding,
     ) {
         if (parameterIndex < 1) {
             throw SQLException("parameter index must be >= 1")
@@ -384,7 +427,7 @@ public class KdbPreparedStatement(
         bindingSlots[parameterIndex - 1] = value
     }
 
-    private fun resolvedBindings(): List<SqlParameter> {
+    private fun resolvedBindings(): List<KdbBinding> {
         if (bindingSlots.isEmpty()) {
             return emptyList()
         }
