@@ -389,6 +389,17 @@ export async function syncProjection(conn: PeerConnection, p: ProjectionNamespac
   if (p.writeBack) {
     if (!conn.has("writeback")) throw new ProtocolError(`kdb replica: the host does not take write-back for ${p.name}`);
     for (const entry of await p.outbox()) {
+      // The source checks a write's blobs are there: the ones written here go up first.
+      const uploaded: string[] = [];
+      for (const d of entry.docs) {
+        for (const a of d.attachments ?? []) {
+          const m = opts.blobs ? await opts.blobs.meta(a.hash) : undefined;
+          if (m?.pinned && !uploaded.includes(a.hash)) {
+            await opts.blobs!.upload(conn, p.name, a.hash);
+            uploaded.push(a.hash);
+          }
+        }
+      }
       let r: ProjectWriteResult;
       try {
         r = await conn.projectWrite(p.name, entry.txId, entry.docs);
@@ -400,6 +411,7 @@ export async function syncProjection(conn: PeerConnection, p: ProjectionNamespac
         }
         throw e;
       }
+      for (const h of uploaded) await opts.blobs?.unpin(h); // the source holds them now
       if (r.outcome === "applied") {
         await p.resolve(entry, null);
         res.applied++;
