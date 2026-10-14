@@ -1,6 +1,8 @@
 package dag
 
 import (
+	"fmt"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 )
@@ -108,7 +110,7 @@ func (d *InMemoryCommitDag) attachmentTableLocked(commit codec.Hash) (document.A
 		}
 		if got := next.Root(); got == nil || *got != *c.AttachmentTreeHash {
 			return document.AttachmentTable{}, NewConsistencyError(
-				"attachment table: replaying the commit's operations does not reproduce its attachment root",
+				fmt.Sprintf("attachment table: replaying the commit's %d operations does not reproduce its attachment root (ops %+v base len %d got %v want %s)", len(c.Operations), c.Operations, table.Len(), next.Root(), c.AttachmentTreeHash.Hex()),
 				d.NamespaceID, &c.Hash)
 		}
 		d.attachments.put(*c.AttachmentTreeHash, next)

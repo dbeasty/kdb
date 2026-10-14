@@ -21,6 +21,12 @@ func opToDto(op document.Op) opDto {
 	case document.SchemaMigrationOp:
 		id := o.MigrationID.String()
 		return opDto{Kind: "schemaMigration", MigrationID: &id, MigrationPayload: &o.MigrationPayload}
+	case document.AttachmentPutOp:
+		id, h, size, mime := o.DocID.String(), o.ContentHash.Hex(), o.Size, o.Mime
+		return opDto{Kind: "attachmentPut", DocID: &id, BlobHashHex: &h, Size: &size, Mime: &mime}
+	case document.AttachmentDeleteOp:
+		id := o.DocID.String()
+		return opDto{Kind: "attachmentDelete", DocID: &id}
 	default:
 		return opDto{Kind: "unknown"}
 	}
@@ -64,6 +70,31 @@ func opFromDto(d opDto) (document.Op, error) {
 			return nil, err
 		}
 		return document.SchemaMigrationOp{MigrationID: id, MigrationPayload: *d.MigrationPayload}, nil
+	case "attachmentPut":
+		if d.DocID == nil || d.BlobHashHex == nil || d.Size == nil || d.Mime == nil {
+			return nil, fmt.Errorf("attachmentPut missing fields")
+		}
+		id, err := codec.UUIDFromString(*d.DocID)
+		if err != nil {
+			return nil, err
+		}
+		h, err := codec.HashFromHex(*d.BlobHashHex)
+		if err != nil {
+			return nil, err
+		}
+		if *d.Size < 0 {
+			return nil, fmt.Errorf("attachmentPut size is negative")
+		}
+		return document.AttachmentPutOp{DocID: id, ContentHash: h, Size: *d.Size, Mime: *d.Mime}, nil
+	case "attachmentDelete":
+		if d.DocID == nil {
+			return nil, fmt.Errorf("attachmentDelete missing docId")
+		}
+		id, err := codec.UUIDFromString(*d.DocID)
+		if err != nil {
+			return nil, err
+		}
+		return document.AttachmentDeleteOp{DocID: id}, nil
 	default:
 		return nil, fmt.Errorf("unknown op kind: %s", d.Kind)
 	}

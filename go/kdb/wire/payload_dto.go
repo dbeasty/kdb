@@ -316,6 +316,9 @@ type opDto struct {
 	BlobHashHex      *string `json:"blobHashHex,omitempty"`
 	MigrationID      *string `json:"migrationId,omitempty"`
 	MigrationPayload *string `json:"migrationPayload,omitempty"`
+	// attachmentPut: the attachment's content hash (in blobHashHex), size and media type.
+	Size *int64  `json:"size,omitempty"`
+	Mime *string `json:"mime,omitempty"`
 }
 
 type indexHintDto struct {

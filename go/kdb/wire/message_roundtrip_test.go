@@ -892,3 +892,28 @@ func TestHomeRequestRoundTrip(t *testing.T) {
 		t.Fatalf("result: %+v", res)
 	}
 }
+
+func TestRoundTripDeltaCommitAttachmentOps(t *testing.T) {
+	id := mustUUID(t, "6f9619ff-8b86-d011-b42d-00cf4fc964ff")
+	ops := []document.Op{
+		document.AttachmentPutOp{DocID: id, ContentHash: repeatHex(9), Size: 1 << 33, Mime: "image/png"},
+		document.AttachmentPutOp{DocID: id, ContentHash: repeatHex(8), Size: 0, Mime: ""},
+		document.AttachmentDeleteOp{DocID: id},
+	}
+	msg := wire.DeltaCommitMessage{
+		H:       testHeader(4, wire.MsgDeltaCommit),
+		Payload: wire.DeltaCommitPayload{Namespace: "app/data", CommitHash: repeatHex(1), ParentHash: repeatHex(2), Operations: ops},
+	}
+	back, ok := roundTrip(t, msg).(wire.DeltaCommitMessage)
+	if !ok {
+		t.Fatal("wrong message type")
+	}
+	if len(back.Payload.Operations) != len(ops) {
+		t.Fatalf("ops: %+v", back.Payload.Operations)
+	}
+	for i := range ops {
+		if back.Payload.Operations[i] != ops[i] {
+			t.Fatalf("op %d: got %+v, want %+v", i, back.Payload.Operations[i], ops[i])
+		}
+	}
+}

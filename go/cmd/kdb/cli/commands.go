@@ -420,6 +420,10 @@ func cmdShow(cfg Config, rt *embed.EmbeddedKdbRuntime, c ShowCmd) int {
 					fmt.Printf("  write   %s\n", o.DocID.String())
 				case document.DeleteOp:
 					fmt.Printf("  delete  %s\n", o.DocID.String())
+				case document.AttachmentPutOp:
+					fmt.Printf("  attach  %s  %d bytes %s\n", o.DocID.String(), o.Size, o.Mime)
+				case document.AttachmentDeleteOp:
+					fmt.Printf("  detach  %s\n", o.DocID.String())
 				}
 			}
 		}

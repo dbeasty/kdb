@@ -288,10 +288,24 @@ func (e *ServerEngine) reachableBlobKeys() func(codec.Hash) bool {
 		live[h] = struct{}{}
 		return true
 	})
-	return func(h codec.Hash) bool {
-		_, ok := live[h]
-		return ok
+	// Attachment blobs packed into this store are kept by their own rule (embed's attachment
+	// tables), which the live tree knows nothing about.
+	var extra func(codec.Hash) bool
+	if fn := e.extraReachable.Load(); fn != nil {
+		extra = (*fn)()
 	}
+	return func(h codec.Hash) bool {
+		if _, ok := live[h]; ok {
+			return true
+		}
+		return extra != nil && extra(h)
+	}
+}
+
+// SetExtraReachable adds a rule for blobs reachableBlobKeys must keep besides the live tree's -
+// attachments. fn is called once per compaction and returns the predicate for it.
+func (e *ServerEngine) SetExtraReachable(fn func() func(codec.Hash) bool) {
+	e.extraReachable.Store(&fn)
 }
 
 // BlobTableCount is how many SSTables this namespace currently has

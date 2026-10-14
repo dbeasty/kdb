@@ -301,7 +301,9 @@ func cpStrFrom(v codec.Value) (string, error) {
 // version 2 - see legacyCheckpointMaxEntries. Packed commits are counted at their smallest size,
 // which overstates how many there are: a namespace near the bound is written as version 4.
 func legacyCheckpointFits(cp namespaceCheckpoint) bool {
-	if len(cp.GraphRefs) > 0 || len(cp.GraphHidden) > 0 {
+	// Version 2 writes commits as generic records with no attachment root, and has no place for
+	// the attachment tables: a namespace with attachments is always written as version 5.
+	if len(cp.GraphRefs) > 0 || len(cp.GraphHidden) > 0 || cp.HasAttachments {
 		return false
 	}
 	n := cp.LiveTree.Size() + len(cp.State.Commits) + len(cp.State.PackedCommits)/dag.PackedCommitMinBytes
