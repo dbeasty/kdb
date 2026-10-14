@@ -65,7 +65,7 @@ func (b *Builder) Attach(docID, attachmentID codec.UUID, name string, contentHas
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.ops = append(b.ops, document.AttachmentPutOp{DocID: docID, AttachmentID: attachmentID, Name: name,
-		ContentHash: contentHash, Size: size, Mime: mime})
+		Scheme: document.AttachmentHashSchemeChunked1, ContentHash: contentHash, Size: size, Mime: mime})
 	return b
 }
 
@@ -74,6 +74,14 @@ func (b *Builder) Detach(docID, attachmentID codec.UUID) *Builder {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.ops = append(b.ops, document.AttachmentDeleteOp{DocID: docID, AttachmentID: attachmentID})
+	return b
+}
+
+// Append appends an operation as it is - one a SQL statement or a client already built.
+func (b *Builder) Append(op document.Op) *Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ops = append(b.ops, op)
 	return b
 }
 

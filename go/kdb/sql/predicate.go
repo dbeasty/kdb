@@ -26,6 +26,7 @@ type evalEnv struct {
 	aliases map[string]Expr
 	regexes map[string]*regexp.Regexp
 	scores  map[string]*searchHits
+	attach  *attachEnv // nil: no attachment table (attachments read as none)
 }
 
 func newEvalEnv(sch schema.KdbSchema, params []Parameter, from TableRef) *evalEnv {
@@ -57,7 +58,9 @@ const (
 	colDoc   = "_doc"
 )
 
-func isReservedColumn(name string) bool { return name == colKdbID || name == colDoc || name == "*" }
+func isReservedColumn(name string) bool {
+	return name == colKdbID || name == colDoc || name == colAttachments || name == "*"
+}
 
 // stripTableAlias removes a leading "<table>." or "<alias>." from a column path (§2).
 func stripTableAlias(name string, from TableRef) string {
@@ -96,6 +99,8 @@ func (env *evalEnv) columnValues(name string, d *evalDoc, expand bool) []kdbjson
 			return []kdbjson.Value{root}
 		}
 		return nil
+	case colAttachments:
+		return []kdbjson.Value{attachmentsJSON(env.attach.set(d.doc.ID))}
 	}
 	root := d.tree()
 	if root == nil {
@@ -300,6 +305,9 @@ func (env *evalEnv) likeRegexp(pattern string, caseInsensitive bool) *regexp.Reg
 // single row (the planner keeps them out of WHERE).
 func (env *evalEnv) functionCell(call ExprFunctionCall, d *evalDoc) Cell {
 	name := strings.ToLower(call.Name)
+	if c, ok := env.attachmentFunctionCell(name, call, d); ok {
+		return c
+	}
 	switch name {
 	case "array_contains", "array_contains_any":
 		if len(call.Args) < 2 {
@@ -418,6 +426,10 @@ func parameterToCell(params []Parameter, index int) Cell {
 		return CellBool{Value: p.Value}
 	case ParamVector:
 		return CellJSON{JSON: vectorJSON(p.Value)}
+	case ParamBytes:
+		return CellBytes{Value: p.Value}
+	case ParamAttachmentRef:
+		return cellAttachmentRef{ref: p}
 	case ParamNull:
 		return CellNull{}
 	default:

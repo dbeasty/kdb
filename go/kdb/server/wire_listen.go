@@ -905,6 +905,8 @@ func (h *sqlWireConnHandler) execDML(msg wire.SqlExecMessage, sess *KdbSession, 
 			builder.Write(o.DocID, o.Patch)
 		case document.DeleteOp:
 			builder.Delete(o.DocID)
+		case document.AttachmentPutOp, document.AttachmentDeleteOp:
+			builder.Append(o)
 		}
 	}
 	return wire.SqlResultMessage{

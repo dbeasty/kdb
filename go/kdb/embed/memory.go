@@ -20,6 +20,7 @@ func OpenMemoryRuntime(catalog, namespaceID string, sch schema.KdbSchema) (*Embe
 		Schema:           sch,
 		DefaultNamespace: namespaceID,
 	}
+	rt.registerAttachmentBlobs()
 	if !sch.IsNone() {
 		if err := syncEmbedSchema(rt, namespaceID, sch); err != nil {
 			return nil, err

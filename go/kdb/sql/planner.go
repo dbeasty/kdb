@@ -235,6 +235,16 @@ func (v *validator) check(e Expr, allowAliases, allowAggregates bool) error {
 				return NewPlanningError(strings.ToUpper(name)+" takes exactly one argument", "")
 			}
 			return v.check(ex.Args[0], false, false)
+		case isAttachmentFunction(name):
+			if err := checkAttachmentFunctionArity(name, len(ex.Args)); err != nil {
+				return err
+			}
+			for _, a := range ex.Args {
+				if err := v.check(a, false, false); err != nil {
+					return err
+				}
+			}
+			return nil
 		case isScalarFunction(name):
 			if name == "array_length" && len(ex.Args) != 1 {
 				return NewPlanningError("ARRAY_LENGTH takes exactly one argument", "")

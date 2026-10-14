@@ -13,6 +13,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
+	"github.com/limidus/kdb/go/kdb/transaction"
 )
 
 // Attachments: binary attachments on documents (docs/kdb-attachments-plan.md). A document has any
@@ -170,6 +171,17 @@ func (rt *EmbeddedKdbRuntime) AttachmentStore(namespaceID string) *attachstore.S
 		})
 	}
 	return s
+}
+
+// registerAttachmentBlobs lets the transaction engine's preflight find this runtime's attachment
+// blobs (large ones live outside the storage adapter's blob store), for every commit path - the
+// server's, the driver's - not only PutAttachment's. Undone when the runtime closes.
+func (rt *EmbeddedKdbRuntime) registerAttachmentBlobs() {
+	store := rt.Storage
+	transaction.RegisterAttachmentBlobs(store, func(namespaceID string, h codec.Hash) (bool, error) {
+		return rt.AttachmentStore(namespaceID).Has(h)
+	})
+	rt.AddCloseHook(func() { transaction.RegisterAttachmentBlobs(store, nil) })
 }
 
 // attachmentTables is the DAG capability attachments need.
@@ -544,4 +556,27 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 	}
 	out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
 	return out, err
+}
+
+// PutAttachmentBlob stores r's bytes in namespaceID's attachment store, durably, without committing
+// anything: a transaction that references them commits separately (SQL, the wire upload).
+func (rt *EmbeddedKdbRuntime) PutAttachmentBlob(namespaceID string, r io.Reader) (codec.Hash, int64, error) {
+	if err := rt.AssertWritable(); err != nil {
+		return codec.Hash{}, 0, err
+	}
+	info, err := rt.AttachmentStore(namespaceID).Put(r)
+	if err != nil {
+		return codec.Hash{}, 0, err
+	}
+	return info.Hash, info.Size, nil
+}
+
+// HasAttachmentBlob reports whether namespaceID's attachment store holds h.
+func (rt *EmbeddedKdbRuntime) HasAttachmentBlob(namespaceID string, h codec.Hash) (bool, error) {
+	return rt.AttachmentStore(namespaceID).Has(h)
+}
+
+// ReadAttachmentBlob reads a whole blob, failing if it is over limit bytes.
+func (rt *EmbeddedKdbRuntime) ReadAttachmentBlob(namespaceID string, h codec.Hash, limit int64) ([]byte, error) {
+	return rt.AttachmentStore(namespaceID).ReadAll(h, limit)
 }

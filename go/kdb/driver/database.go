@@ -223,6 +223,7 @@ func newNamespace(id string, rt *embed.EmbeddedKdbRuntime) (*namespace, error) {
 	ns.engine = transaction.NewEngineWithOptions(transaction.ConflictPolicyStrict, nil,
 		transaction.EngineOptions{UniqueKeys: ns.uniques, Preconditions: true})
 	ns.sqlEngine = sql.NewEngine(rt.Storage, ns.d)
+	sql.SetAttachmentBlobs(ns.sqlEngine, rt)
 	if err := ns.rebuildUniques(); err != nil {
 		return nil, err
 	}

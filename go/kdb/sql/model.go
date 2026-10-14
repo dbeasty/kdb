@@ -114,6 +114,8 @@ type UpdateStatement struct {
 	Table       TableRef
 	Assignments []Assignment
 	Where       Expr
+	// Attachments are the SET list's attachment items (attachments.go).
+	Attachments []AttachmentChange
 }
 
 // Assignment is one SET target = value pair.
@@ -133,6 +135,8 @@ type InsertStatement struct {
 	Table   TableRef
 	Columns []string
 	Rows    [][]Expr
+	// Attachments are the WITH ATTACHMENT clauses, applied to every inserted row (attachments.go).
+	Attachments []AttachmentSpec
 }
 
 // CreateTableStatement is CREATE TABLE ...
@@ -408,6 +412,8 @@ type QueryContext struct {
 	// document id.
 	keyset    bool
 	scanAfter *codec.UUID
+	// attach is the query's attachment table access, set by ExecuteSelect (attachments.go).
+	attach *attachEnv
 }
 
 // PageRequest asks for rows [Offset, Offset+Size) of a SELECT's result, in the order the query

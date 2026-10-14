@@ -394,9 +394,10 @@ func (s *KdbServerRuntime) rebuildSQLEngineLocked() {
 		// Deliberately NewEngine, not NewEngineWithIndexes(.., nil): a nil provider stored in a
 		// non-nil interface would make the engine believe it has one.
 		s.sqlEngine = sql.NewEngine(store, s.dag)
-		return
+	} else {
+		s.sqlEngine = sql.NewEngineWithIndexes(store, s.dag, s.sqlIndexProvider)
 	}
-	s.sqlEngine = sql.NewEngineWithIndexes(store, s.dag, s.sqlIndexProvider)
+	sql.SetAttachmentBlobs(s.sqlEngine, s.Runtime)
 }
 
 // SetSearchProvider installs (or, with nil, removes) the provider that serves SEARCH frames -

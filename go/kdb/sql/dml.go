@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"encoding/base64"
 	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -19,6 +20,11 @@ type DMLExecutor struct {
 // ExecuteInsert returns Write ops for each VALUES row.
 func (d *DMLExecutor) ExecuteInsert(insert InsertStatement, ctx QueryContext) ([]document.Op, error) {
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, insert.Table)
+	env.attach = ctx.attach
+	var writer *attachmentWriter
+	if len(insert.Attachments) > 0 {
+		writer = newAttachmentWriter(d.Executor, ctx.NamespaceID)
+	}
 	var ops []document.Op
 	for _, values := range insert.Rows {
 		if len(insert.Columns) != len(values) {
@@ -39,6 +45,13 @@ func (d *DMLExecutor) ExecuteInsert(insert InsertStatement, ctx QueryContext) ([
 			return nil, err
 		}
 		ops = append(ops, document.WriteOp{DocID: id, Patch: jsonText})
+		if writer != nil {
+			attachOps, err := writer.insertAttachmentOps(env, insert.Attachments, id)
+			if err != nil {
+				return nil, err
+			}
+			ops = append(ops, attachOps...)
+		}
 	}
 	return ops, nil
 }
@@ -46,10 +59,11 @@ func (d *DMLExecutor) ExecuteInsert(insert InsertStatement, ctx QueryContext) ([
 // ExecuteUpdate returns one Write op per matching document with the SET assignments applied.
 // Values are evaluated against the pre-update document; `_doc` replaces the whole body.
 func (d *DMLExecutor) ExecuteUpdate(upd UpdateStatement, ctx QueryContext) ([]document.Op, error) {
-	if len(upd.Assignments) == 0 {
+	if len(upd.Assignments) == 0 && len(upd.Attachments) == 0 {
 		return nil, NewPlanningError("UPDATE needs at least one assignment", "")
 	}
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, upd.Table)
+	env.attach = ctx.attach
 	v := &validator{sch: ctx.Schema, from: upd.Table}
 	for _, a := range upd.Assignments {
 		path := stripTableAlias(a.Path, upd.Table)
@@ -67,8 +81,22 @@ func (d *DMLExecutor) ExecuteUpdate(upd UpdateStatement, ctx QueryContext) ([]do
 	if err != nil {
 		return nil, err
 	}
+	var writer *attachmentWriter
+	if len(upd.Attachments) > 0 {
+		writer = newAttachmentWriter(d.Executor, ctx.NamespaceID)
+	}
 	var ops []document.Op
 	for _, ed := range docs {
+		if writer != nil {
+			attachOps, err := writer.updateAttachmentOps(env, upd.Attachments, ed, ctx.attach.set(ed.doc.ID))
+			if err != nil {
+				return nil, err
+			}
+			ops = append(ops, attachOps...)
+			if len(upd.Assignments) == 0 {
+				continue
+			}
+		}
 		jsonText := ed.doc.JSON
 		for _, a := range upd.Assignments {
 			jsonText, err = assignPath(jsonText, stripTableAlias(a.Path, upd.Table), env.cell(a.Value, ed))
@@ -166,6 +194,9 @@ func cellToJSONValue(cell Cell) (kdbjson.Value, error) {
 		return kdbjson.NumberValue{V: c.Value}, nil
 	case CellBool:
 		return kdbjson.BoolValue{V: c.Value}, nil
+	case CellBytes:
+		// bytes written into the JSON body are base64 text; attachments are the place for bytes
+		return kdbjson.StringValue{V: base64.StdEncoding.EncodeToString(c.Value)}, nil
 	case CellJSON:
 		v, err := kdbjson.ParseValue(c.JSON)
 		if err != nil {

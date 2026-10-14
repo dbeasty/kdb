@@ -1,6 +1,9 @@
 package transaction
 
 import (
+	"reflect"
+	"sync"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -24,7 +27,37 @@ type BlobPresence interface {
 	HasBlob(contentHash codec.Hash) (bool, error)
 }
 
-func hasBlob(store storage.Adapter, h codec.Hash) bool {
+// AttachmentBlobs answers, for one storage adapter, whether a namespace's attachment store holds a
+// blob. Large attachments live outside the adapter's blob store (storage/attachstore), so a runtime
+// registers its attachment stores here and preflight asks them first.
+type AttachmentBlobs func(namespaceID string, contentHash codec.Hash) (bool, error)
+
+var attachmentBlobs sync.Map // storage.Adapter -> AttachmentBlobs
+
+// RegisterAttachmentBlobs makes preflight ask fn whether an attachment blob is stored for
+// transactions against store. A nil fn removes the registration.
+func RegisterAttachmentBlobs(store storage.Adapter, fn AttachmentBlobs) {
+	if !keyable(store) {
+		return
+	}
+	if fn == nil {
+		attachmentBlobs.Delete(store)
+		return
+	}
+	attachmentBlobs.Store(store, fn)
+}
+
+func keyable(store storage.Adapter) bool {
+	return store != nil && reflect.TypeOf(store).Comparable()
+}
+
+func hasBlob(store storage.Adapter, namespaceID string, h codec.Hash) bool {
+	if !keyable(store) {
+		// not a map key (a non-comparable adapter value): only its own capability can answer
+	} else if fn, ok := attachmentBlobs.Load(store); ok {
+		has, err := fn.(AttachmentBlobs)(namespaceID, h)
+		return err == nil && has
+	}
 	if bp, ok := store.(BlobPresence); ok {
 		has, err := bp.HasBlob(h)
 		return err == nil && has
@@ -85,7 +118,7 @@ func preflightAttachments(
 			detail = "attachment size is negative"
 		case !presentAt(put.DocID):
 			detail = "no such document: an attachment needs its document"
-		case !hasBlob(store, put.ContentHash):
+		case !hasBlob(store, namespaceID, put.ContentHash):
 			detail = "attachment blob not stored: " + put.ContentHash.Hex()
 		}
 		if detail != "" {

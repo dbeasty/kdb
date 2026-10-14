@@ -399,6 +399,8 @@ func (s *Server) runDML(w http.ResponseWriter, r *http.Request, req sqlRequest, 
 			builder.Write(o.DocID, o.Patch)
 		case document.DeleteOp:
 			builder.Delete(o.DocID)
+		case document.AttachmentPutOp, document.AttachmentDeleteOp:
+			builder.Append(o)
 		}
 	}
 	tx, err := builder.Build(codec.Timestamp{})
