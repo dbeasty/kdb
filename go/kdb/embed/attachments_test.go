@@ -506,6 +506,11 @@ func TestAVersionOverThePassBudgetIsDiffedOverSeveralPasses(t *testing.T) {
 		if got, _ := readAttachment(t, rt, id, commits[0]); !bytes.Equal(got, v0) {
 			t.Fatalf("pass %d: the old version reads wrong", passes)
 		}
+		if passes > 1 && (res.Scanned != 0 || res.Rebuilt) {
+			// The reference index moved past these commits on the first pass; the delta work is
+			// found again from the mark, which did not.
+			t.Fatalf("pass %d read %d commits for references (%+v)", passes, res.Scanned, res)
+		}
 		if res.Deltas == 1 {
 			break
 		}

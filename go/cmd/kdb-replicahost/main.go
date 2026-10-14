@@ -268,8 +268,12 @@ func (h *host) handle(c command) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		set, err := table.List(id)
+		if err != nil {
+			return nil, err
+		}
 		list := []map[string]any{}
-		for _, a := range table.List(id) {
+		for _, a := range set {
 			list = append(list, map[string]any{"id": a.ID.String(), "name": a.Name, "hash": a.ContentHash.Hex(), "size": a.Size, "mime": a.Mime})
 		}
 		return map[string]any{"attachments": list}, nil

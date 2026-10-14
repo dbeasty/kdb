@@ -199,13 +199,25 @@ func detectAttachmentConflicts(
 		return nil, nil
 	}
 	// One attachment moved, or (for a document delete) any of the document's.
+	var readErr error
 	attachmentChanged := func(doc, att codec.UUID) bool {
-		b, bok := base.Get(doc, att)
-		t, tok := target.Get(doc, att)
+		b, bok, err := base.Get(doc, att)
+		if err != nil {
+			readErr = err
+			return true
+		}
+		t, tok, err := target.Get(doc, att)
+		if err != nil {
+			readErr = err
+			return true
+		}
 		return bok != tok || b != t
 	}
+	// The trie holds each document's set hash, so comparing them reads no set.
 	documentChanged := func(doc codec.UUID) bool {
-		return base.List(doc).Hash() != target.List(doc).Hash()
+		b, bok := base.SetHash(doc)
+		t, tok := target.SetHash(doc)
+		return bok != tok || b != t
 	}
 	var out []OperationConflict
 	for index, op := range tx.Operations {
@@ -223,6 +235,9 @@ func detectAttachmentConflicts(
 			id, changed = o.DocID, documentChanged(o.DocID)
 		default:
 			continue
+		}
+		if readErr != nil {
+			return nil, readErr
 		}
 		baseDoc, _ := store.GetDocument(namespaceID, id, baseTreeHash)
 		existingDoc, _ := store.GetDocument(namespaceID, id, targetTreeHash)

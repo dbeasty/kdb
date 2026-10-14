@@ -57,7 +57,11 @@ func (f *projectionFixture) localAttach(doc codec.UUID, name string, data []byte
 	id := mustRandomUUID(f.t)
 	if a, ok := func() (document.Attachment, bool) {
 		table, _ := rt.dag.AttachmentTableAt(head)
-		return table.GetByName(doc, name)
+		a, ok, err := table.GetByName(doc, name)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		return a, ok
 	}(); ok {
 		id = a.ID
 	}

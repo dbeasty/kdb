@@ -223,6 +223,11 @@ func (h *Host) openNamespace(
 		// Some bodies exist only in the blob store; cold reads must look there.
 		eng.SetBodiesExternal(true)
 	}
+	// Before any table is seeded or derived: the set pool spills to the blob store rather than
+	// keeping every set the namespace's history ever had.
+	if err := useAttachmentSetStore(d, eng, opts.ReadOnly, opts.Storage.AttachmentSetBudgetBytes); err != nil {
+		return nil, nil, err
+	}
 	// Attachment tables peer sync seeded for commits whose history is not here (a graft's or a
 	// boundary's root): replay derives the tables of the commits above them from these.
 	if err := seedPersistedAttachmentTables(io, d, namespaceID); err != nil {
@@ -308,6 +313,9 @@ func (h *Host) openNamespace(
 	rt.attach.config.UploadGrace = opts.Storage.AttachmentUploadGrace
 	rt.attach.config.DeltaStepBytes = opts.Storage.AttachmentDeltaStepBytes
 	rt.registerAttachmentBlobs()
+	// From the start, not from the first attachment store opened: a history=none blob store
+	// merge before then would drop attachment blobs and spilled attachment sets.
+	rt.installAttachmentReachability(namespaceID)
 	if persisting != nil {
 		persisting.SetAttachmentsCommitted(rt.attachmentsCommitted)
 	}

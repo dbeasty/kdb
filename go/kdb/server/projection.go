@@ -99,7 +99,7 @@ func (p projectionTarget) AttachmentsOf(doc codec.UUID) (document.AttachmentSet,
 	if err != nil {
 		return nil, err
 	}
-	return table.List(doc), nil
+	return table.List(doc)
 }
 
 // AttachmentStore is where the projection keeps its attachments' bytes.
