@@ -362,8 +362,10 @@ identity = SHA-256(0x02 || be64(size) || tree)
   rebuild at open): the shim has no streaming or prefix listing, so that listing - and Collect's
   sweep, a 16-byte key per segment a kept pointer names - is transient memory that grows with the
   blob count. A rebuild of the reference index reads all of retained history once.
-- **The Kotlin store** reads a pointer from its segment on every lookup (no pointer map), but keeps
-  every hold in memory, loads them all at first use, and builds a referenced set in `collect`.
+- **The Kotlin store's pointer map.** Kotlin's `AttachmentBlobStore` still holds every pointer
+  (inline bytes included) and every hold in memory, loaded at first use, as Go's did before
+  `pointer_index.go`; `collect` builds a referenced set of every kept segment. It ignores Go's
+  `x-` index runs, and its `collect` deleting them is harmless (Go rebuilds them at open).
 - **Delta jobs restart after a crash.** Progress is in memory, so a restart mid-job redoes it from
   the start. Versions found not worth a delta are remembered per process only.
 - **The Kotlin store** shares Go's layout (above) but encodes a delta in one call, not in budgeted

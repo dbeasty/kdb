@@ -47,7 +47,10 @@ public const val DEFAULT_ATTACHMENT_DELTA_MAX_DEPTH: Int = 8
  *    readable blob;
  *  - `m-<generation>`: the mark ([mark]), the heads delta compaction last went through;
  *  - `r-<generation>`: Go's reference index for its GC, which this build neither reads nor writes,
- *    and [collect] leaves alone.
+ *    and [collect] leaves alone;
+ *  - `x-<seq>`: Go's pointer index runs, which Go rebuilds from the pointers whenever it opens a
+ *    store and never trusts across a restart: this build ignores them, and [collect] retiring them
+ *    as unreferenced is harmless.
  *
  * Readers pin. [open] pins every segment the read resolves to - bytes, leaves, a delta's whole base
  * chain - and [AttachmentReader.close] releases them; [storeAsDelta] and [collect] defer deleting a
