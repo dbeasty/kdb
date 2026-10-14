@@ -34,6 +34,16 @@ var ErrNotEmpty = errors.New("peer sync: a snapshot can only be installed into a
 // snapshotPageScan is that algorithm, kept for a state whose tree cannot be resolved as a trie and
 // for a cursor that is not a canonical id; both serve identical pages.
 func snapshotPage(env IngestEnv, at codec.Hash, after string, maxBytes int) (wire.SnapshotPageMessage, error) {
+	page, err := snapshotPageDocs(env, at, after, maxBytes)
+	if err != nil || !page.Done || page.Commit.AttachmentTreeHash == nil {
+		return page, err
+	}
+	// The last page carries the commit's attachment table (see SnapshotPageMessage).
+	page.AttachmentTables, err = env.DAG.PackAttachmentTables([]codec.Hash{page.Commit.Hash})
+	return page, err
+}
+
+func snapshotPageDocs(env IngestEnv, at codec.Hash, after string, maxBytes int) (wire.SnapshotPageMessage, error) {
 	commit, err := env.DAG.GetCommitOrThrow(at)
 	if err != nil {
 		return wire.SnapshotPageMessage{}, err

@@ -111,6 +111,12 @@ func squashHeadPage(env IngestEnv, m wire.SquashHeadMessage) (wire.SquashHeadRes
 		return res, nil
 	}
 	res.Commit = head
+	if head.AttachmentTreeHash != nil {
+		// A squash jumps the receiver over the commits that attached; it would hold refs it has
+		// neither the table nor the blobs for. Replay carries both (attachments.go).
+		res.Refused = "the namespace has attachments: catch up by replay"
+		return res, nil
+	}
 	have, err := codec.HashFromHex(m.HaveHex)
 	if err != nil || !env.DAG.HasCommit(have) {
 		return res, nil

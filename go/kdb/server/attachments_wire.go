@@ -159,6 +159,13 @@ func (h *sqlWireConnHandler) handleAttachmentUpload(msg wire.AttachmentUploadMes
 	ups.sweepLocked(now)
 	id := msg.UploadID
 	var up *attachmentUpload
+	if id == "" && msg.Expect != (codec.Hash{}) {
+		ups.mu.Unlock()
+		if info, ok := heldBlob(rt.Runtime.AttachmentStore(ns), msg.Expect); ok {
+			return reply(&attachmentUpload{received: info.Size, done: &info}, "", nil)
+		}
+		ups.mu.Lock()
+	}
 	if id == "" {
 		if len(ups.m) >= attachmentUploadsPerRun {
 			ups.mu.Unlock()
@@ -379,4 +386,17 @@ func (h *sqlWireConnHandler) attachmentSuperseded(rd *attachmentRead) bool {
 		return true // removed, or the document is gone
 	}
 	return now.ContentHash != rd.info.Hash
+}
+
+// heldBlob reports whether store holds h, and its size.
+func heldBlob(store *attachstore.Store, h codec.Hash) (attachstore.Info, bool) {
+	if has, err := store.Has(h); err != nil || !has {
+		return attachstore.Info{}, false
+	}
+	r, err := store.Open(h)
+	if err != nil {
+		return attachstore.Info{}, false
+	}
+	defer r.Close()
+	return attachstore.Info{Hash: h, Size: r.Size()}, true
 }

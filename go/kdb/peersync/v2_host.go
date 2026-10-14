@@ -106,6 +106,9 @@ type V2Host struct {
 	// serially; pushMu guards it anyway.
 	pushMu      sync.Mutex
 	pushWaiting map[string]int
+
+	// uploads are this session's attachment blob uploads (attachments.go).
+	uploads hostUploads
 }
 
 type hostFetch struct {
@@ -185,7 +188,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome, wire.SyncCapZstdPack, wire.SyncCapSquash}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome, wire.SyncCapZstdPack, wire.SyncCapSquash, wire.SyncCapAttachments}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -355,6 +358,10 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}
 		res.H = header(wire.MsgSquashHeadResult, m.H.CorrelationID)
 		return res, nil
+	case wire.BlobFetchMessage:
+		return h.blobFetch(m)
+	case wire.AttachmentUploadMessage:
+		return h.attachmentUpload(m)
 	case wire.ObjectFetchMessage:
 		env, err := h.env(m.Namespace, false, dirPull)
 		if err != nil {

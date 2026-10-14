@@ -21,6 +21,24 @@ type TreeNodesMessage struct {
 	Prefixes []string
 	// EntryLimit lists a subtree's entries when it holds at most this many.
 	EntryLimit int
+	// Tree selects which tree: "" the document tree, TreeAttachments the attachment table (entries
+	// are document id to attachment-set hash, with each listed document's attachments). The
+	// attachment table is found by commit, CommitHex (empty: the host's main head); TreeHex is
+	// then ignored and the result's TreeHex is the table's root ("" for an empty table).
+	Tree      string
+	CommitHex string
+}
+
+// TreeAttachments is TreeNodesMessage.Tree for the attachment table (needs SyncCapAttachments).
+const TreeAttachments = "attachments"
+
+// TreeAttachment is one attachment in a TREE_NODES result of the attachment table.
+type TreeAttachment struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Hash string `json:"hash"`
+	Size int64  `json:"size"`
+	Mime string `json:"mime,omitempty"`
 }
 
 func (m TreeNodesMessage) Header() Header { return m.H }
@@ -33,6 +51,8 @@ type TreeNodeInfo struct {
 	Children   []string
 	HasEntries bool
 	Entries    map[string]string
+	// Attachments, for the attachment table, are each listed document's attachments.
+	Attachments map[string][]TreeAttachment
 }
 
 // TreeNodesResultMessage answers TREE_NODES (TREE_NODES_RESULT 0x35), one node per prefix asked
@@ -79,14 +99,17 @@ type treeNodesDto struct {
 	TreeHex    string   `json:"treeHex,omitempty"`
 	Prefixes   []string `json:"prefixes"`
 	EntryLimit int      `json:"entryLimit,omitempty"`
+	Tree       string   `json:"tree,omitempty"`
+	CommitHex  string   `json:"commitHex,omitempty"`
 }
 
 type treeNodeInfoDto struct {
-	Prefix     string            `json:"prefix"`
-	Hash       string            `json:"hash,omitempty"`
-	Children   []string          `json:"children,omitempty"`
-	HasEntries bool              `json:"hasEntries,omitempty"`
-	Entries    map[string]string `json:"entries,omitempty"`
+	Prefix      string                      `json:"prefix"`
+	Hash        string                      `json:"hash,omitempty"`
+	Children    []string                    `json:"children,omitempty"`
+	HasEntries  bool                        `json:"hasEntries,omitempty"`
+	Entries     map[string]string           `json:"entries,omitempty"`
+	Attachments map[string][]TreeAttachment `json:"attachments,omitempty"`
 }
 
 type treeNodesResultDto struct {
@@ -117,6 +140,7 @@ func encodeRepairMessage(msg Message) (payloadEnvelope, bool, error) {
 	case TreeNodesMessage:
 		return payloadEnvelope{Kind: "treeNodes", TreeNodes: &treeNodesDto{
 			Namespace: m.Namespace, TreeHex: m.TreeHex, Prefixes: m.Prefixes, EntryLimit: m.EntryLimit,
+			Tree: m.Tree, CommitHex: m.CommitHex,
 		}}, true, nil
 	case TreeNodesResultMessage:
 		nodes := make([]treeNodeInfoDto, len(m.Nodes))
@@ -151,7 +175,8 @@ func decodeRepairMessage(header Header, env payloadEnvelope) (Message, bool, err
 		if d == nil {
 			return nil, true, newDecodeError("missing treeNodes body")
 		}
-		return TreeNodesMessage{H: header, Namespace: d.Namespace, TreeHex: d.TreeHex, Prefixes: d.Prefixes, EntryLimit: d.EntryLimit}, true, nil
+		return TreeNodesMessage{H: header, Namespace: d.Namespace, TreeHex: d.TreeHex, Prefixes: d.Prefixes, EntryLimit: d.EntryLimit,
+			Tree: d.Tree, CommitHex: d.CommitHex}, true, nil
 	case "treeNodesResult":
 		d := env.TreeNodesResult
 		if d == nil {

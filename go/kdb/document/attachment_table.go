@@ -302,6 +302,15 @@ func (t AttachmentTable) DeleteAll(docID codec.UUID) (AttachmentTable, error) {
 	return t.setDoc(docID, before, nil)
 }
 
+// Tree is the table's document trie: document id to attachment-set hash. Its TreeHash is Root
+// when the table is not empty.
+func (t AttachmentTable) Tree() DocumentTree {
+	if t.sets == nil {
+		return EmptyDocumentTree()
+	}
+	return t.tree
+}
+
 // WalkDocuments visits every document with attachments and the hash of its set, until visit
 // returns false.
 func (t AttachmentTable) WalkDocuments(visit func(docID codec.UUID, setHash codec.Hash) bool) {

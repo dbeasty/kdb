@@ -42,6 +42,10 @@ const (
 // result names the upload, and every later chunk carries it with the Offset it starts at (the
 // bytes received so far - so an interrupted upload resumes from the result's Received). Final
 // finishes the upload: the blob is durable when the result of a Final chunk returns its hash.
+//
+// Expect, on a first chunk, names the blob about to be sent: a server that already holds it
+// answers with its hash and size at once (an upload that is already finished), and the sender
+// sends nothing more. Peer sync pushes use it to send only the blobs the host lacks.
 type AttachmentUploadMessage struct {
 	H         Header
 	Namespace string
@@ -50,6 +54,7 @@ type AttachmentUploadMessage struct {
 	Offset    int64
 	Data      []byte
 	Final     bool
+	Expect    codec.Hash
 }
 
 func (m AttachmentUploadMessage) Header() Header { return m.H }
@@ -261,6 +266,7 @@ func appendAttachmentBody(b []byte, message Message) ([]byte, bool) {
 		b = appendInt(b, 4, m.Offset)
 		b = appendBytes(b, 5, m.Data)
 		b = appendBool(b, 6, m.Final)
+		b = appendHash(b, 7, m.Expect)
 	case AttachmentUploadResultMessage:
 		b = appendString(b, 1, m.Namespace)
 		b = appendString(b, 2, m.UploadID)
@@ -367,6 +373,8 @@ func decodeAttachmentBody(header Header, r *binReader) (Message, bool) {
 				m.Data = cloneBytes(r.bytes(wt))
 			case 6:
 				m.Final = r.bool(wt)
+			case 7:
+				m.Expect = r.hash(wt)
 			default:
 				r.skip(wt)
 			}

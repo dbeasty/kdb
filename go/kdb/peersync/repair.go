@@ -76,6 +76,12 @@ func treeNodesPage(env IngestEnv, m wire.TreeNodesMessage) (wire.TreeNodesResult
 	if len(m.Prefixes) > MaxTreeNodePrefixes {
 		return wire.TreeNodesResultMessage{}, fmt.Errorf("peer sync: TREE_NODES asks for %d prefixes, at most %d", len(m.Prefixes), MaxTreeNodePrefixes)
 	}
+	if m.Tree == wire.TreeAttachments {
+		return attachmentTreeNodesPage(env, m)
+	}
+	if m.Tree != "" {
+		return wire.TreeNodesResultMessage{}, fmt.Errorf("peer sync: TREE_NODES of unknown tree %q", m.Tree)
+	}
 	var th codec.Hash
 	var err error
 	if m.TreeHex == "" {

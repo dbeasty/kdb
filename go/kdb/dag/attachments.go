@@ -28,11 +28,24 @@ const attachmentCacheSize = 64
 type attachmentCache struct {
 	tables map[codec.Hash]document.AttachmentTable
 	order  []codec.Hash // insertion order, oldest first, for eviction
+	// pinned are seeded tables - a checkpoint's heads', a snapshot's or graft's root's - never
+	// evicted: a commit with no history below it here can only get its table from a seed.
+	pinned map[codec.Hash]document.AttachmentTable
 }
 
 func (c *attachmentCache) get(root codec.Hash) (document.AttachmentTable, bool) {
+	if t, ok := c.pinned[root]; ok {
+		return t, true
+	}
 	t, ok := c.tables[root]
 	return t, ok
+}
+
+func (c *attachmentCache) pin(root codec.Hash, t document.AttachmentTable) {
+	if c.pinned == nil {
+		c.pinned = make(map[codec.Hash]document.AttachmentTable)
+	}
+	c.pinned[root] = t
 }
 
 func (c *attachmentCache) put(root codec.Hash, t document.AttachmentTable) {
@@ -65,7 +78,8 @@ func (d *InMemoryCommitDag) SeedAttachmentTable(table document.AttachmentTable) 
 		return
 	}
 	d.mu.Lock()
-	d.attachments.put(*root, table)
+	d.attachments.pin(*root, table)
+	d.sawAttachments = true
 	d.mu.Unlock()
 }
 
@@ -177,13 +191,19 @@ func (d *InMemoryCommitDag) HasAttachments() bool {
 
 // PackAttachmentTables packs the attachment tables at commits (deduplicated by root; commits
 // without attachments contribute nothing), for a checkpoint to carry its heads' tables.
-func (d *InMemoryCommitDag) PackAttachmentTables(commits []codec.Hash) ([]byte, error) {
+//
+// optional commits are packed when their tables can be found and skipped otherwise - a shallow
+// root's, which a node that has since replaced its seed cannot rebuild.
+func (d *InMemoryCommitDag) PackAttachmentTables(commits []codec.Hash, optional ...codec.Hash) ([]byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	seen := map[codec.Hash]bool{}
 	var tables []document.AttachmentTable
-	for _, c := range commits {
+	for i, c := range append(append([]codec.Hash(nil), commits...), optional...) {
 		t, err := d.attachmentTableLocked(c)
+		if err != nil && i >= len(commits) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

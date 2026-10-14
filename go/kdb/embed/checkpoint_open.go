@@ -306,7 +306,8 @@ func saveCheckpointThrough(
 		for _, t := range state.Tags {
 			heads = append(heads, t.CommitHash)
 		}
-		if attachTables, err = d.PackAttachmentTables(heads); err != nil {
+		// Shallow roots too: nothing below them is held here, so their tables come only from a seed.
+		if attachTables, err = d.PackAttachmentTables(heads, d.ShallowRoots()...); err != nil {
 			return err
 		}
 	}

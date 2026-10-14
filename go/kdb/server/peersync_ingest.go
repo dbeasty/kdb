@@ -51,6 +51,7 @@ func (s *KdbServerRuntime) PeerIngestEnv() peersync.IngestEnv {
 		Conflicts:           s.Conflicts,
 		CanInstallSnapshot:  s.Runtime.CanInstallSnapshot,
 		StagingDir:          s.peerStagingDir(),
+		Attachments:         s.Runtime.AttachmentStore(s.Runtime.DefaultNamespace),
 		SnapshotInstalled: func(root document.Commit) error {
 			// The documents arrived without commits the unique registry could be told about, so
 			// it is rebuilt from the tree they built.
