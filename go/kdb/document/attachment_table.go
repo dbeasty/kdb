@@ -302,6 +302,23 @@ func (t AttachmentTable) DeleteAll(docID codec.UUID) (AttachmentTable, error) {
 	return t.setDoc(docID, before, nil)
 }
 
+// WalkDocuments visits every document with attachments and the hash of its set, until visit
+// returns false.
+func (t AttachmentTable) WalkDocuments(visit func(docID codec.UUID, setHash codec.Hash) bool) {
+	if t.Documents() == 0 {
+		return
+	}
+	t.tree.Walk(visit)
+}
+
+// SetHash is the hash of docID's attachment set; ok=false when it has none.
+func (t AttachmentTable) SetHash(docID codec.UUID) (codec.Hash, bool) {
+	if t.Documents() == 0 {
+		return codec.Hash{}, false
+	}
+	return t.tree.HashFor(docID)
+}
+
 // Walk visits every attachment, documents in no particular order and each document's in ID
 // order, until visit returns false.
 func (t AttachmentTable) Walk(visit func(docID codec.UUID, a Attachment) bool) {
