@@ -187,6 +187,15 @@ identity = SHA-256(0x02 || be64(size) || tree)
   last page, `Close`), `ATTACHMENT_LIST`/`_RESULT` 0x48/0x49; `CellKindBytes` (6); parameters
   `{"$bytes": b64}` and `{"$attachment": {hash, size}}`; error code `NOT_FOUND`. Creating,
   replacing, renaming and deleting are ordinary transactions with attachment ops.
+- **Verified ranged reads**, feature `attachment-proofs`: `ATTACHMENT_GET` with `Proofs` (11) gets
+  pages rounded to 1 MiB chunk boundaries (at most 4 MiB), and `ATTACHMENT_DATA` carries the blob's
+  `Tree` (12), each chunk's RFC 6962 audit path (13, BLOB_FETCH's encoding) and `Scheme` (14). A
+  client checks `AttachmentIdentity(Tree, Size) == Hash` and every chunk's proof before handing out
+  any of its bytes, and trims the pages to the caller's range. An offset past the end fails
+  `SCHEMA_VIOLATION` with `Info` still set (clients raise a typed range error); a `Close` reply
+  carries `Superseded`, so a range that ends before the attachment does still learns it. Go
+  `OpenAttachmentRange` / `ReadAttachmentAt`; the TS and Kotlin clients and JDBC
+  `Blob.getBytes(pos, len)` / `getBinaryStream(pos, len)` mirror them.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
   (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
   Kotlin server answers the messages `UNSUPPORTED`.
