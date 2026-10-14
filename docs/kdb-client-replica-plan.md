@@ -95,8 +95,10 @@ engine.
 Go-compatible delta log. A Kotlin replica's data directory is therefore readable by Go tools and the Kotlin CLI,
 and the Go↔Kotlin physical-format goldens cover it. What that needs first:
 
-- **Shallow roots in Kotlin's replayer.** Every replica root is a shallow root (snapshot, squash). Kotlin refuses
-  namespaces whose marker lists `shallowRoots` (#209, `NamespaceMarker.kt`). The Kotlin replayer must learn Go's
+- **Shallow roots in Kotlin's replayer.** Every replica root is a shallow root (snapshot, squash). *Done for
+  reading (feat/kotlin-checkpoint):* Kotlin opens such namespaces from Go's checkpoint (`CheckpointOpen.kt`) and
+  refuses them only when the checkpoint is unusable. Writing a checkpoint from Kotlin is still open.
+  Before that change it refused namespaces whose marker lists `shallowRoots` (#209, `NamespaceMarker.kt`). The Kotlin replayer must learn Go's
   rule (`embed/delta_replay.go applyCommitsTopologically`): a logged shallow root is admitted without applying its
   ops or moving main, and the state comes from the checkpoint. Squash's durability is a checkpoint, so Kotlin must
   also *write* a checkpoint that Go and Kotlin both read. This is the largest Kotlin item and lands as its own PR

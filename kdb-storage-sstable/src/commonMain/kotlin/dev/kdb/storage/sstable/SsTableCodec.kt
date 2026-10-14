@@ -274,3 +274,40 @@ public class DefaultSsTableReader(
             ((tail[2].toInt() and 0xFF) shl 8) or (tail[3].toInt() and 0xFF)
     }
 }
+
+/**
+ * The values [segmentName]'s table holds for those of [keys] it has, read with one pass over the
+ * file instead of one footer parse per key ([DefaultSsTableReader.lookup] re-reads the footer
+ * every time). Keys the table tombstones or lacks are absent from the result. For bulk lookups
+ * against tables written by either runtime - a namespace opened from Go's checkpoint looks up
+ * every live document's body this way.
+ *
+ * @throws IllegalArgumentException or IllegalStateException for a table that will not parse or a
+ *   block that fails its CRC.
+ */
+public suspend fun readSsTableValues(
+    ioShim: PlatformIoShim,
+    segmentName: String,
+    keys: Set<KdbHash>,
+): Map<KdbHash, ByteArray> {
+    val raw = ioShim.readFromSegment(segmentName, 0, Int.MAX_VALUE)
+    if (raw.size < 40 + SsTableCodec.FOOTER_TRAILER_SIZE) return emptyMap()
+    val t = raw.size - SsTableCodec.FOOTER_TRAILER_SIZE
+    val indexLen =
+        ((raw[t].toInt() and 0xFF) shl 24) or ((raw[t + 1].toInt() and 0xFF) shl 16) or
+            ((raw[t + 2].toInt() and 0xFF) shl 8) or (raw[t + 3].toInt() and 0xFF)
+    val bodyLen = 40 + indexLen
+    val footerStart = t - bodyLen
+    require(indexLen >= 0 && footerStart >= 0) { "sstable $segmentName: footer overruns the file" }
+    val index = SsTableCodec.parseFooter(raw.copyOfRange(footerStart, t))
+    val out = HashMap<KdbHash, ByteArray>()
+    for (k in keys) {
+        val bh = index[k] ?: continue
+        if (bh.deleted) continue
+        val start = bh.offset.toInt()
+        val end = start + SsTableCodec.BLOCK_HEADER_SIZE + bh.compressedSize
+        require(bh.offset >= 0 && end <= footerStart) { "sstable $segmentName: block for ${k.toHex()} overruns the file" }
+        out[k] = SsTableCodec.decodeBlock(raw.copyOfRange(start, end))
+    }
+    return out
+}

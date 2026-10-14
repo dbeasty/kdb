@@ -1,5 +1,6 @@
 package dev.kdb.jdbc.file
 
+import dev.kdb.codec.KdbHash
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.inMemoryCommitDag
 import dev.kdb.index.IndexCatalog
@@ -12,11 +13,16 @@ import dev.kdb.query.hybrid.hybridQueryEngine
 import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
 import dev.kdb.sql.sqlEngine
+import dev.kdb.storage.DeltaSegmentReader
+import dev.kdb.storage.PlatformIoShim
+import dev.kdb.storage.StorageAdapter
 import dev.kdb.storage.StorageEngineConfig
+import dev.kdb.storage.delta.DefaultDeltaSegmentReader
 import dev.kdb.storage.engine.DefaultStorageEngineFactory
 import dev.kdb.storage.engine.ServerStorageEngine
 import dev.kdb.storage.engine.StorageEngineTarget
 import dev.kdb.storage.io.FileBackedPlatformIoShimFactory
+import dev.kdb.storage.io.SegmentNameBuilder
 import dev.kdb.storage.io.PlatformIoConfig
 import kotlinx.coroutines.runBlocking
 
@@ -30,9 +36,6 @@ public fun openFileRuntime(
     acquireDirectoryLock: Boolean = true,
     lockHolder: String = "kdb-jdbc",
 ): EmbeddedKdbRuntime {
-    // Before anything is opened or locked: a namespace Go holds shallow roots for cannot be
-    // rebuilt from its log, and a replay would serve older or missing documents as current.
-    NamespaceMarker.requireReplayable(dataRoot, namespaceId)
     if (acquireDirectoryLock) {
         DataDirectoryLockRegistry.acquire(dataRoot, lockHolder)
     }
@@ -59,10 +62,7 @@ public fun openFileRuntime(
     val deltaWriter =
         handle.deltaWriter
             ?: error("SERVER storage engine requires delta writer for file mode")
-    val baseDag = inMemoryCommitDag(namespaceId)
-  runBlocking {
-        DeltaNamespaceReplayer.replay(baseDag, handle.adapter, handle.deltaReader!!, CrossNamespaceDecisions(dataRoot))
-    }
+    val baseDag = runBlocking { restoreNamespace(dataRoot, namespaceId, io, handle.adapter, handle.deltaReader!!) }
     val dag: CommitDag =
         PersistingCommitDag(
             baseDag,
@@ -119,4 +119,51 @@ public fun openFileRuntime(
         indexStoreFactory = storeFactory,
         attachmentShim = io,
     )
+}
+
+/**
+ * Rebuilds the namespace's DAG and live state: from Go's checkpoint and the log after it when the
+ * checkpoint is usable (CheckpointOpen), else by replaying the whole log - Go's restoreNamespace.
+ * A full replay is refused, as Go refuses it, where it cannot rebuild the namespace: one with
+ * shallow roots (state only the checkpoint holds) or a truncated log.
+ */
+private suspend fun restoreNamespace(
+    dataRoot: String,
+    namespaceId: String,
+    io: PlatformIoShim,
+    storage: StorageAdapter,
+    reader: DeltaSegmentReader,
+): CommitDag {
+    val marker = NamespaceMarker.roots(dataRoot, namespaceId)
+    fun hashes(hexes: List<String>): Set<KdbHash> = hexes.mapNotNull { runCatching { KdbHash.fromHex(it) }.getOrNull() }.toSet()
+    val graft = hashes(marker.graftRoots)
+    val decisions = CrossNamespaceDecisions(dataRoot)
+    val engine = storage as? ServerStorageEngine
+    val opener =
+        if (engine != null && reader is DefaultDeltaSegmentReader) {
+            CheckpointOpen(dataRoot, namespaceId, io, engine, reader, decisions, hashes(marker.shallowRoots), graft)
+        } else {
+            null
+        }
+    opener?.open()?.let { return it }
+    val why = opener?.whyNot ?: "this storage engine cannot restore one"
+    if (marker.shallowRoots.isNotEmpty()) {
+        throw ShallowNamespaceException(namespaceId, marker.shallowRoots, "the checkpoint: $why")
+    }
+    val deltaPrefix = SegmentNameBuilder.namespacePrefix(namespaceId) + "delta/"
+    val lowest =
+        io.listSegments(namespaceId)
+            .filter { it.startsWith(deltaPrefix) }
+            .mapNotNull { SegmentNameBuilder.parseDeltaSequencedFileName(it.removePrefix(deltaPrefix)) }
+            .minOrNull()
+    if (lowest != null && lowest > 0) {
+        // Sequences start at zero and are never reused: segments below this were deleted.
+        throw TruncatedLogException(namespaceId, lowest, "the checkpoint: $why")
+    }
+    if (why != "there is none") {
+        System.err.println("kdb: namespace $namespaceId: ignoring the checkpoint and replaying the log in full - $why")
+    }
+    val dag = inMemoryCommitDag(namespaceId)
+    DeltaNamespaceReplayer.replay(dag, storage, reader, decisions, shallow = graft)
+    return dag
 }

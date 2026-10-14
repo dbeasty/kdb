@@ -55,4 +55,11 @@ public class ShardedDocStore {
         }
         return out
     }
+
+    /** Drops every document. */
+    public suspend fun clear() {
+        for (sh in shards) {
+            sh.mutex.withLock { sh.docs.clear() }
+        }
+    }
 }

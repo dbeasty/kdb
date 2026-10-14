@@ -18,6 +18,7 @@ dependencies {
     implementation(project(":kdb-storage-delta"))
     implementation(project(":kdb-storage-engine"))
     implementation(project(":kdb-storage-io"))
+    implementation(project(":kdb-storage-sstable"))
     implementation(project(":kdb-transaction"))
     implementation(project(":kdb-stream"))
     implementation(project(":kdb-transport-core"))
