@@ -491,6 +491,16 @@ func (r *DefaultReader) indexEntries(size int64) ([]indexEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Sized once from the footer's length: a line is at least minFooterLine bytes, so this is an
+	// upper bound on the entry count, and growing the slice by appending instead allocated about
+	// five times its final size on the way there.
+	return r.appendIndexEntries(make([]indexEntry, 0, indexLen/minFooterLine+1), size, indexLen)
+}
+
+// appendIndexEntries is indexEntries appending to out, for a caller gathering the entries of
+// several tables into one slice (a compaction). indexLen is the table's, from readFooterIndexLen.
+func (r *DefaultReader) appendIndexEntries(out []indexEntry, size int64, indexLen int) ([]indexEntry, error) {
+	var err error
 	footerStart := size - int64(40+indexLen) - footerTrailerSize
 	if footerStart < 0 {
 		return nil, fmt.Errorf("sstable: %s footer overruns the file", r.handle.SegmentName)
@@ -502,10 +512,6 @@ func (r *DefaultReader) indexEntries(size int64) ([]indexEntry, error) {
 	if len(head) != 8 || readInt(head, 0) != footerMagic {
 		return nil, fmt.Errorf("sstable: %s has no footer magic", r.handle.SegmentName)
 	}
-	// Sized once from the footer's length: a line is at least minFooterLine bytes, so this is an
-	// upper bound on the entry count, and growing the slice by appending instead allocated about
-	// five times its final size on the way there.
-	out := make([]indexEntry, 0, indexLen/minFooterLine+1)
 	// One buffer for the whole read: the tail of a line split across chunks is moved to its front
 	// and the next chunk read in after it.
 	buf := make([]byte, 0, footerChunk+128)

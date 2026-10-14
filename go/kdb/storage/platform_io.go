@@ -69,6 +69,29 @@ type LocalPathResolver interface {
 	LocalSegmentPath(segmentName string) (path string, ok bool)
 }
 
+// SegmentRenamer is implemented by shims that can move a segment to a new name in one step: a
+// reader listing the namespace sees the segment under its old name or its new one, never neither
+// and never a copy under both. Crash-safe in the same sense - after a crash the segment is under
+// one name or the other.
+//
+// For a writer whose output must not be visible until it is complete - an SSTable merge, which
+// streams its output for as long as the merge runs, and which DiscoverTables would otherwise
+// register half-written after a crash. RenameSegment makes the segment's bytes durable (as far as
+// the shim's flush setting makes anything durable) before giving it the new name, so a crash
+// cannot leave the new name holding less than was written under the old one.
+//
+// The segment must not be sealed: sealing is what hands a segment to replicas, and a segment is
+// sealed under the name it will keep. to must not exist.
+//
+// Optional, like SegmentSizer.
+type SegmentRenamer interface {
+	RenameSegment(from, to string) error
+}
+
+// ErrRenameUnsupported is returned by a SegmentRenamer that forwards to a layer which cannot
+// rename.
+var ErrRenameUnsupported = errors.New("segment rename not available from this storage layer")
+
 // SegmentGenerationer is implemented by shims that can name the current incarnation of a segment:
 // a number that stays the same for as long as the segment is only appended to, and changes when it
 // is deleted - by truncation, retention or repair - and whatever later carries its name is a new

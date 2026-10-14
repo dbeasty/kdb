@@ -1,12 +1,15 @@
 package sstable
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/storage"
+	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
 // SSTable compaction: merging the tables a run of memtable flushes leaves
@@ -71,11 +74,11 @@ func Compact(
 // enough that a cancelled merge stops within milliseconds, rarely enough to cost nothing.
 const compactionCheckEvery = 4096
 
-// CompactContext is Compact that gives up when ctx is done, returning ctx's error and writing
-// nothing. Abandoning is always safe: the writer buffers every entry until Finish, so a merge
-// cancelled before Finish has created no file, and its inputs stay exactly as they were. Once
-// Finish has begun it runs to the end - it is the short tail of the merge, and a table half
-// written by a cancellation would be the one outcome worse than finishing.
+// CompactContext is Compact that gives up when ctx is done, returning ctx's error and leaving
+// no table behind. Abandoning is always safe: the output is written under a partial name
+// (io.SegmentNameBuilder.SSTablePartial) that nothing registers as a table, and is deleted when
+// the merge stops, so the inputs stay exactly as they were. Once the last key is written the
+// footer and rename run to the end - they are the short tail of the merge.
 func CompactContext(
 	ctx context.Context,
 	io storage.PlatformIOShim,
@@ -85,8 +88,24 @@ func CompactContext(
 	dropTombstones bool,
 	keep func(codec.Hash) bool,
 ) (Handle, error) {
+	h, _, err := compact(ctx, io, namespaceID, outLevel, inputs, dropTombstones, keep)
+	return h, err
+}
+
+// compact is CompactContext that also reports how many distinct keys keep refused - what
+// LsmBlobStore.CompactContext reports as reclaimed, counted here because this is where every key
+// is asked about exactly once.
+func compact(
+	ctx context.Context,
+	io storage.PlatformIOShim,
+	namespaceID string,
+	outLevel int,
+	inputs []Handle,
+	dropTombstones bool,
+	keep func(codec.Hash) bool,
+) (Handle, int, error) {
 	if len(inputs) == 0 {
-		return Handle{}, fmt.Errorf("sstable: compaction needs at least one input table")
+		return Handle{}, 0, fmt.Errorf("sstable: compaction needs at least one input table")
 	}
 
 	// Two passes, and the first reads indexes only.
@@ -98,97 +117,203 @@ func CompactContext(
 	// Deciding every key's final owner before writing anything makes that
 	// impossible to express.
 	//
-	// Values are deliberately not held here. The index is
-	// key -> BlockHandle, tens of bytes per key, so this stays proportional
-	// to the key count rather than to the data - the same bargain every
-	// other index in this engine makes.
-	type owner struct {
-		input  int
-		handle BlockHandle
+	// Values are deliberately not held here. Every input's index goes into one slice, which is
+	// sorted by key and then by where each entry came from, so a key's last entry is its final
+	// owner: the latest input, and within an input its last footer line - the same winner a map
+	// filled input by input chose. The slice then becomes the output's own index (see below), so
+	// a merge holds about 60 bytes per key in all; the map, sorted key list and output index it
+	// used to hold were three times that.
+	merge, err := loadMergeOrder(ctx, io, inputs)
+	if err != nil {
+		return Handle{}, 0, err
 	}
-	indexes := make([]map[codec.Hash]BlockHandle, len(inputs))
-	final := make(map[codec.Hash]owner)
-	for i, in := range inputs {
-		if err := ctx.Err(); err != nil {
-			return Handle{}, err
-		}
-		index, err := NewDefaultReader(io, in).Index()
-		if err != nil {
-			// One unreadable table must not cost the whole store its
-			// compaction, and must not silently drop the keys it held
-			// either - so the compaction is abandoned rather than
-			// completed with a hole in it.
-			return Handle{}, fmt.Errorf("sstable: compaction could not read %s: %w", in.SegmentName, err)
-		}
-		indexes[i] = index
-		for key, bh := range index {
-			final[key] = owner{input: i, handle: bh}
-		}
+	sort.Sort(merge)
+
+	// Streamed: each value is read, encoded and appended as its key comes up, so the merge holds
+	// the index and one batch of blocks rather than every value in the store. It used to collect
+	// them all in a DefaultWriter and write at Finish - 2.7 GB of heap to merge 471 MB of tables.
+	//
+	// Streaming means a file exists while the merge runs, so it is written under a partial name
+	// and renamed once complete: DiscoverTables registers every name under sstable/, and a table
+	// a crash left half-written there would be read as one. A shim that cannot rename writes the
+	// table's own name directly, which leaves that window open for it; both shims in this
+	// codebase rename.
+	fileID, err := codec.RandomUUID()
+	if err != nil {
+		return Handle{}, 0, err
 	}
+	name := storio.SegmentNameBuilder.SSTable(namespaceID, outLevel, fileID.String())
+	writing := name
+	renamer, canRename := io.(storage.SegmentRenamer)
+	if canRename {
+		writing = storio.SegmentNameBuilder.SSTablePartial(namespaceID, fileID.String())
+	}
+	done := false
+	defer func() {
+		if !done {
+			// Cancelled, failed, or nothing to write: whatever was appended goes. Deleting a
+			// segment that was never created is not an error.
+			_ = io.DeleteSegment(writing)
+		}
+	}()
 
 	// Sorted, so the output is deterministic: the same inputs produce the
 	// same file hash, which is what makes a compaction verifiable and
 	// repeatable rather than merely successful.
-	writer := NewDefaultWriter(io, namespaceID, outLevel)
-	wrote := 0
-	for n, key := range sortedKeys(final) {
+	//
+	// The output index is written over the merge slice itself. Entry w of the output is appended
+	// only after entry r >= w of the merge has been read, so nothing is overwritten before it is
+	// used, and the slice never has to grow.
+	b := newTableBuilder(io, writing, 0)
+	b.index = merge.entries[:0]
+	readers := make([]*DefaultReader, len(inputs))
+	for i, in := range inputs {
+		readers[i] = NewDefaultReader(io, in)
+	}
+	wrote, dropped := 0, 0
+	for r, n := 0, 0; r < len(merge.entries); n++ {
 		if n%compactionCheckEvery == 0 {
 			if err := ctx.Err(); err != nil {
-				return Handle{}, err
+				return Handle{}, 0, err
 			}
 		}
-		o := final[key]
+		// The last of this key's entries is its final owner.
+		for r+1 < len(merge.entries) && merge.entries[r+1].key == merge.entries[r].key {
+			r++
+		}
+		key, bh, input := merge.entries[r].key, merge.entries[r].handle, merge.input(r)
+		r++
 		if keep != nil && !keep(key) {
 			// Unreachable: the caller says nothing can ask for this key
 			// again. Dropping it is the only way a superseded version ever
 			// stops costing disk - see LsmBlobStore.Compact for what makes
 			// a "no" here safe.
+			dropped++
 			continue
 		}
-		if o.handle.Deleted {
+		if bh.Deleted {
 			if dropTombstones {
 				continue
 			}
-			writer.Delete(key)
+			b.delete(key)
 			wrote++
 			continue
 		}
-		value, err := NewDefaultReader(io, inputs[o.input]).ReadBlockAt(o.handle)
+		value, err := readers[input].ReadBlockAt(bh)
 		if err != nil {
-			return Handle{}, fmt.Errorf(
-				"sstable: compaction could not read a block of %s: %w", inputs[o.input].SegmentName, err)
+			return Handle{}, 0, fmt.Errorf(
+				"sstable: compaction could not read a block of %s: %w", inputs[input].SegmentName, err)
 		}
-		writer.Put(key, value)
+		if err := b.put(key, value); err != nil {
+			return Handle{}, 0, err
+		}
 		wrote++
 	}
 	if wrote == 0 {
 		// Every input was empty, or was nothing but tombstones being
 		// dropped. Finish would write a table with no entries, which is a
 		// file that can only ever cost a read.
-		return Handle{}, ErrNothingToCompact
+		return Handle{}, dropped, ErrNothingToCompact
 	}
-	return writer.Finish()
+	tableSize, fileHash, err := b.finish()
+	if err != nil {
+		return Handle{}, 0, err
+	}
+	if canRename {
+		if err := renamer.RenameSegment(writing, name); err != nil {
+			return Handle{}, 0, err
+		}
+		// From here a failure deletes the table under its own name, which is complete but not
+		// registered: discovered by a later open it would merely duplicate the inputs' keys.
+		writing = name
+	}
+	if err := io.SealSegment(name); err != nil {
+		return Handle{}, 0, err
+	}
+	done = true
+	writeSidecar(io, name, b.index, tableSize, fileHash)
+	return Handle{FileHash: fileHash, Level: outLevel, SegmentName: name}, dropped, nil
+}
+
+// mergeOrder is every input's index entries in one slice, with each entry's position in load
+// order alongside: inputs oldest first, each in its footer's order. Sorting by key and then by
+// that position puts a key's entries oldest to newest.
+type mergeOrder struct {
+	entries []indexEntry
+	ords    []uint32
+	// ends[i] is one past the last position input i's entries were loaded at.
+	ends []int
+}
+
+func (m *mergeOrder) Len() int { return len(m.entries) }
+
+func (m *mergeOrder) Less(i, j int) bool {
+	if c := bytes.Compare(m.entries[i].key.Bytes[:], m.entries[j].key.Bytes[:]); c != 0 {
+		return c < 0
+	}
+	return m.ords[i] < m.ords[j]
+}
+
+func (m *mergeOrder) Swap(i, j int) {
+	m.entries[i], m.entries[j] = m.entries[j], m.entries[i]
+	m.ords[i], m.ords[j] = m.ords[j], m.ords[i]
+}
+
+// input is the input the entry now at position i came from.
+func (m *mergeOrder) input(i int) int {
+	ord := int(m.ords[i])
+	return sort.Search(len(m.ends), func(k int) bool { return ord < m.ends[k] })
+}
+
+// loadMergeOrder reads every input's footer index into one mergeOrder, sized up front from the
+// footers' lengths so the slice is allocated once.
+func loadMergeOrder(ctx context.Context, io storage.PlatformIOShim, inputs []Handle) (*mergeOrder, error) {
+	type footer struct {
+		size     int64
+		indexLen int
+	}
+	footers := make([]footer, len(inputs))
+	capacity := 0
+	for i, in := range inputs {
+		r := NewDefaultReader(io, in)
+		size, err := r.segmentSize()
+		if err == nil && size >= 40+footerTrailerSize {
+			footers[i].size = size
+			footers[i].indexLen, err = r.readFooterIndexLen(size)
+		}
+		if err != nil {
+			// One unreadable table must not cost the whole store its
+			// compaction, and must not silently drop the keys it held
+			// either - so the compaction is abandoned rather than
+			// completed with a hole in it.
+			return nil, fmt.Errorf("sstable: compaction could not read %s: %w", in.SegmentName, err)
+		}
+		capacity += footers[i].indexLen/minFooterLine + 1
+	}
+	m := &mergeOrder{entries: make([]indexEntry, 0, capacity), ends: make([]int, len(inputs))}
+	for i, in := range inputs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if footers[i].size > 0 {
+			var err error
+			m.entries, err = NewDefaultReader(io, in).appendIndexEntries(m.entries, footers[i].size, footers[i].indexLen)
+			if err != nil {
+				return nil, fmt.Errorf("sstable: compaction could not read %s: %w", in.SegmentName, err)
+			}
+		}
+		m.ends[i] = len(m.entries)
+	}
+	if len(m.entries) > math.MaxUint32 {
+		return nil, fmt.Errorf("sstable: %d entries is more than one compaction can order", len(m.entries))
+	}
+	m.ords = make([]uint32, len(m.entries))
+	for i := range m.ords {
+		m.ords[i] = uint32(i)
+	}
+	return m, nil
 }
 
 // ErrNothingToCompact reports a merge whose inputs held nothing worth
 // writing out. Not a failure: the caller deletes the inputs and is done.
 var ErrNothingToCompact = fmt.Errorf("sstable: the inputs hold nothing to write")
-
-// sortedKeys orders a key set by its bytes, so a compaction's output does
-// not depend on Go's map iteration order.
-func sortedKeys[V any](m map[codec.Hash]V) []codec.Hash {
-	out := make([]codec.Hash, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := out[i].Bytes, out[j].Bytes
-		for x := range a {
-			if a[x] != b[x] {
-				return a[x] < b[x]
-			}
-		}
-		return false
-	})
-	return out
-}

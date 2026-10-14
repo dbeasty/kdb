@@ -320,6 +320,56 @@ func (f *FileBackedPlatformIO) DeleteSegment(segmentName string) error {
 	return f.store.Delete(segmentName)
 }
 
+// RenameSegment implements storage.SegmentRenamer. The segment is flushed first, with fsync when
+// the shim is configured to fsync, so the new name never comes to hold less than was written under
+// the old one; the store then renames it and makes the rename durable.
+//
+// Both names' locks are held, taken in name order so two renames between the same pair cannot
+// deadlock. A store that cannot rename (one written against SegmentByteStore alone) reports
+// storage.ErrRenameUnsupported.
+func (f *FileBackedPlatformIO) RenameSegment(from, to string) error {
+	if err := ValidateSegmentName(from); err != nil {
+		return err
+	}
+	if err := ValidateSegmentName(to); err != nil {
+		return err
+	}
+	if from == to {
+		return &PlatformIOError{Message: "rename to the same name", SegmentName: from}
+	}
+	renamer, ok := f.store.(segmentStoreRenamer)
+	if !ok {
+		return storage.ErrRenameUnsupported
+	}
+	first, second := f.mutexFor(from), f.mutexFor(to)
+	if to < from {
+		first, second = second, first
+	}
+	first.Lock()
+	defer first.Unlock()
+	second.Lock()
+	defer second.Unlock()
+	f.globalMu.Lock()
+	_, sealed := f.sealedSegments[from]
+	f.globalMu.Unlock()
+	if sealed {
+		// Sealed is when replicas get their copy, under the name it had then.
+		return &PlatformIOError{Message: "cannot rename a sealed segment", SegmentName: from}
+	}
+	if err := f.store.Flush(from, f.config.FsyncOnFlush); err != nil {
+		return &PlatformIOError{Message: "rename flush failed: " + err.Error(), SegmentName: from, Cause: err}
+	}
+	if err := renamer.Rename(from, to); err != nil {
+		return &PlatformIOError{Message: "rename failed: " + err.Error(), SegmentName: from, Cause: err}
+	}
+	f.globalMu.Lock()
+	delete(f.generations, from)
+	delete(f.generations, to)
+	delete(f.sealedSegments, to)
+	f.globalMu.Unlock()
+	return nil
+}
+
 func (f *FileBackedPlatformIO) AvailableBytes() (int64, error) {
 	return f.store.AvailableBytes()
 }
@@ -410,3 +460,4 @@ func (f *FileBackedPlatformIO) LocalSegmentPath(segmentName string) (string, boo
 }
 
 var _ storage.LocalPathResolver = (*FileBackedPlatformIO)(nil)
+var _ storage.SegmentRenamer = (*FileBackedPlatformIO)(nil)

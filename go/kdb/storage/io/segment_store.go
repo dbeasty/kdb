@@ -38,3 +38,10 @@ type segmentStoreSizer interface {
 type segmentStoreLocalPather interface {
 	LocalSegmentPath(segmentName string) (string, bool)
 }
+
+// segmentStoreRenamer is the optional SegmentByteStore counterpart of storage.SegmentRenamer.
+// The segment's bytes are already flushed as the shim's settings require; the store makes the
+// new name durable.
+type segmentStoreRenamer interface {
+	Rename(from, to string) error
+}
