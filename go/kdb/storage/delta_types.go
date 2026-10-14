@@ -50,6 +50,15 @@ type DeltaSegmentWriter interface {
 // Implementations that can stream should; callers should type-assert for
 // this and fall back to ReadAll, so a reader that cannot stream still
 // works. *delta.DefaultReader implements it.
+// DeltaPayloadReader hands back a commit's payload bytes exactly as framed in the log - the
+// commit's canonical encoding, whose SHA-256 is its hash - without decoding them. A host serving a
+// peer puts them in a pack as they are (peersync's forwarded payloads).
+type DeltaPayloadReader interface {
+	// ReadPayloadAt calls fn with the decompressed payload of the frame at frameOffset. The
+	// payload is valid only during the call.
+	ReadPayloadAt(segment DeltaSegmentRef, frameOffset int64, fn func(payload []byte) error) error
+}
+
 type DeltaCommitStreamer interface {
 	// StreamCommits hands each commit in segment to fn along with the byte
 	// offset of the frame it came from. The offset is what lets a caller

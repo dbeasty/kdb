@@ -132,12 +132,14 @@ type InMemoryCommitDag struct {
 	// SetOperationsLoader for why the bound is only safe with a loader.
 	// opsLoader is read on the (cold) load path only, hence atomic rather
 	// than mu; every other field here is guarded by mu.
-	opsLoader   atomic.Pointer[CommitOperationsLoader]
-	opsBudget   int64
-	opsResident int64
-	opsLRU      *list.List
-	opsElem     map[codec.Hash]*list.Element
-	opsEvicted  map[codec.Hash]struct{}
+	opsLoader atomic.Pointer[CommitOperationsLoader]
+	// payloadLoader reads a commit's logged payload back undecoded (SetPayloadLoader).
+	payloadLoader atomic.Pointer[CommitPayloadLoader]
+	opsBudget     int64
+	opsResident   int64
+	opsLRU        *list.List
+	opsElem       map[codec.Hash]*list.Element
+	opsEvicted    map[codec.Hash]struct{}
 
 	// graph is which of the on-disk commit graph features this namespace
 	// is running with. Zero value is the behaviour that predates all of

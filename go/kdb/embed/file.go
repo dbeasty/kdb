@@ -208,6 +208,7 @@ func (h *Host) openNamespace(
 		closeOpsLoader = opsLoader.index.Close
 		opsLoader.index.SetDir(deltaIndexDirPath(dataRoot, namespaceID), opts.ReadOnly)
 		d.SetOperationsLoader(opsLoader.load, storage.ResolvedCommitOpsBytes(cfg))
+		d.SetPayloadLoader(opsLoader.payload)
 	}
 	if eng != nil {
 		// Per-segment sidecars for the version locations of sealed segments, so the cold
