@@ -132,6 +132,8 @@ func writeSectionedCheckpoint(shim storage.PlatformIOShim, cp namespaceCheckpoin
 	}); err != nil {
 		return err
 	}
+	// Both walks touched every page of the tree's mapped segments; let them go.
+	cp.LiveTree.DropMappedPages()
 	previous := currentSectionKey(shim, cp.NamespaceID)
 	raw, err := encodeCheckpointWith(cp, &section)
 	if err != nil {
