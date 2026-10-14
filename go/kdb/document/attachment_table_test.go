@@ -1,6 +1,7 @@
 package document
 
 import (
+	"encoding/hex"
 	"reflect"
 	"testing"
 
@@ -155,5 +156,23 @@ func TestAttachmentRefHashIsStable(t *testing.T) {
 	r := AttachmentRef{ContentHash: attachHash(0xab), Size: 1234567, Mime: "image/png"}
 	if got := r.Hash().Hex(); got != attachmentRefGolden {
 		t.Fatalf("ref hash %s, want %s - changing it breaks every attachment root", got, attachmentRefGolden)
+	}
+}
+
+func TestAttachmentCommitGoldenBytes(t *testing.T) {
+	id, _ := codec.UUIDFromString("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
+	ops := []Op{
+		WriteOp{DocID: id, Patch: `{"a":1}`},
+		AttachmentPutOp{DocID: id, ContentHash: attachHash(0xab), Size: 1234567, Mime: "image/png"},
+		AttachmentDeleteOp{DocID: id},
+	}
+	root := attachHash(0xcd)
+	c, err := BuildCommitWithAttachments([]codec.Hash{attachHash(1)}, "app/data", id, codec.Timestamp{EpochMillis: 1750000000000, MicroRemainder: 5}, id, ops, attachHash(2), nil, "m", &root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := c.ToPayloadBytes()
+	if got := hex.EncodeToString(b); got != attachmentCommitGolden || c.Hash.Hex() != attachmentCommitGoldenHash {
+		t.Fatalf("commit encoding changed:\n got %s %s", got, c.Hash.Hex())
 	}
 }

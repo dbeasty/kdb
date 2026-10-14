@@ -3,3 +3,11 @@ package document
 // attachmentRefGolden pins AttachmentRef.Hash for TestAttachmentRefHashIsStable: SHA-256 of
 // 'A' | 32 x 0xab | be64(1234567) | be32(9) | "image/png", computed independently.
 const attachmentRefGolden = "56bceea2e09e70d29a834bd3190e8211a40b2a4eb77c931439ce22bb6c0658d5"
+
+// attachmentCommitGolden is a commit with a write, an attachment put and delete, and an
+// attachment root, as Go encodes it; kdb-document's AttachmentCommitGoldenTest decodes the same
+// bytes in Kotlin.
+const (
+	attachmentCommitGolden     = "a602010a0101010101010101010101010101010101010101010101010101010101010101010209086170702f64617461030f6f9619ff8b86d011b42d00cf4fc964ff040505605ba09d370600050f6f9619ff8b86d011b42d00cf4fc964ff060a03001c010f6f9619ff8b86d011b42d00cf4fc964ff0209077b2261223a317d044a010f6f9619ff8b86d011b42d00cf4fc964ff020fabababababababababababababababababababababababababababababababab030587d6120000000000040909696d6167652f706e670512010f6f9619ff8b86d011b42d00cf4fc964ff070f02020202020202020202020202020202020202020202020202020202020202020909016d0a0e01cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+	attachmentCommitGoldenHash = "6a3444f1692884a2d93beffc5107f6fa96c9d87cce3b43438d1e532e7a06ee76"
+)

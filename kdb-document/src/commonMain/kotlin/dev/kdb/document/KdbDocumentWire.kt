@@ -16,6 +16,8 @@ internal object DocFqn {
     const val OP_DELETE = "$NS.OpDelete"
     const val OP_FILE_WRITE = "$NS.OpFileWrite"
     const val OP_SCHEMA_MIGRATION = "$NS.OpSchemaMigration"
+    const val OP_ATTACHMENT_PUT = "$NS.OpAttachmentPut"
+    const val OP_ATTACHMENT_DELETE = "$NS.OpAttachmentDelete"
     const val DOC_TREE_ENTRY = "$NS.DocumentTreeEntry"
     const val COMMIT_PAYLOAD = "$NS.CommitPayload"
     const val COMMIT_STUB_WIRE = "$NS.CommitStubWire"
@@ -73,10 +75,31 @@ private fun buildRegistry(): KdbTypeRegistry {
                     FieldSchema(2, "migrationPayload", KdbType.Primitive(PhysicalKind.STRING)),
                 ),
         )
+    // One attachment per record (docs/kdb-attachments-plan.md). Appended: a branch's position is its tag.
+    val opAttachmentPut =
+        RecordSchema(
+            name = "OpAttachmentPut",
+            namespace = DocFqn.NS,
+            fields =
+                listOf(
+                    FieldSchema(1, "docId", uuidTy),
+                    FieldSchema(2, "contentHash", hashRef),
+                    FieldSchema(3, "size", KdbType.Primitive(PhysicalKind.INT64)),
+                    FieldSchema(4, "mime", KdbType.Primitive(PhysicalKind.STRING)),
+                ),
+        )
+    val opAttachmentDelete =
+        RecordSchema(
+            name = "OpAttachmentDelete",
+            namespace = DocFqn.NS,
+            fields = listOf(FieldSchema(1, "docId", uuidTy)),
+        )
     reg.registerRecord(opWrite)
     reg.registerRecord(opDelete)
     reg.registerRecord(opFileWrite)
     reg.registerRecord(opSchemaMigration)
+    reg.registerRecord(opAttachmentPut)
+    reg.registerRecord(opAttachmentDelete)
 
     val kdbOpWire =
         KdbType.Union(
@@ -85,6 +108,8 @@ private fun buildRegistry(): KdbTypeRegistry {
                 KdbType.Ref(DocFqn.OP_DELETE),
                 KdbType.Ref(DocFqn.OP_FILE_WRITE),
                 KdbType.Ref(DocFqn.OP_SCHEMA_MIGRATION),
+                KdbType.Ref(DocFqn.OP_ATTACHMENT_PUT),
+                KdbType.Ref(DocFqn.OP_ATTACHMENT_DELETE),
             ),
         )
 
@@ -132,6 +157,14 @@ private fun buildRegistry(): KdbTypeRegistry {
                         default = dev.kdb.codec.KdbValue.Null,
                     ),
                     FieldSchema(9, "message", KdbType.Primitive(PhysicalKind.STRING)),
+                    // The commit's attachment table root; omitted (null) when it has none, so a
+                    // commit without attachments hashes as before.
+                    FieldSchema(
+                        10,
+                        "attachmentTreeHash",
+                        KdbType.Nullable(hashRef),
+                        default = dev.kdb.codec.KdbValue.Null,
+                    ),
                 ),
         )
     reg.registerRecord(commitPayload)

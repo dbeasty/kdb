@@ -16,6 +16,9 @@ internal fun SqlAuthSupport.writeAuthorizerFor(principal: Principal?): WriteAuth
             when (op) {
                 is KdbOp.Write -> AuthAction.DocumentWrite(namespaceId, op.docId.toString())
                 is KdbOp.Delete -> AuthAction.DocumentDelete(namespaceId, op.docId.toString())
+                // An attachment is part of its document: it takes the document's write permission.
+                is KdbOp.AttachmentPut -> AuthAction.DocumentWrite(namespaceId, op.docId.toString())
+                is KdbOp.AttachmentDelete -> AuthAction.DocumentWrite(namespaceId, op.docId.toString())
                 is KdbOp.FileWrite -> null
                 is KdbOp.SchemaMigration -> null
             }
