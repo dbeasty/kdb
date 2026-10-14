@@ -112,7 +112,7 @@ type TreeFile struct {
 	failed  bool // a write failed; stop writing, keep serving from what is mapped and the heap
 	// background counts rewrites in flight (maybeRewrite), which Close waits for: one that
 	// outlived it could take the same next sequence as a TreeFile reopened on the directory, and
-	// both rename onto one path.
+	// both rename onto one path. It counts onWrite calls in flight (wrote) too.
 	background sync.WaitGroup
 }
 
@@ -149,7 +149,7 @@ func NewTreeFile(opts TreeFileOptions) (*TreeFile, error) {
 var ErrTreeFileUnsupported = errors.New("document: tree files are not supported on this platform")
 
 // Close stops the binding deleting files - a later open of the same namespace may be using them -
-// and waits for a background rewrite in flight to finish.
+// and waits for a background rewrite or onWrite call in flight to finish.
 func (f *TreeFile) Close() {
 	if f == nil {
 		return
@@ -1121,20 +1121,30 @@ func (s *trieSlab) writeOut(f *TreeFile, h *trieTree, docs int, full bool) (*tre
 // SetOnWrite has fn called, on a goroutine of its own, each time a segment of f has been written
 // and trees made before it can be rebased onto it (DocumentTree.Rebased). The holder of trees
 // that are never updated - the engine's history - rebases them there, or they keep the
-// segments they refer into mapped and on disk until they are dropped.
+// segments they refer into mapped and on disk until they are dropped. Close waits for a call in
+// flight, so fn must not wait for f to close.
 func (f *TreeFile) SetOnWrite(fn func()) {
 	f.mu.Lock()
 	f.onWrite = fn
 	f.mu.Unlock()
 }
 
+// wrote starts onWrite, counted in background so Close waits for it: it reads the segments it
+// rebases onto, and one that outlived Close would be reading files a backup or repair may then
+// rewrite under it (a SIGBUS once one is truncated). None starts once f is closed.
 func (f *TreeFile) wrote() {
 	f.mu.Lock()
 	fn := f.onWrite
-	f.mu.Unlock()
-	if fn != nil {
-		go fn()
+	if fn == nil || f.closed {
+		f.mu.Unlock()
+		return
 	}
+	f.background.Add(1)
+	f.mu.Unlock()
+	go func() {
+		defer f.background.Done()
+		fn()
+	}()
 }
 
 // --- Public API ------------------------------------------------------------------------------
