@@ -150,6 +150,16 @@ identity = SHA-256(0x02 || be64(size) || tree)
   - Larger versions stay whole. A streaming rolling-hash delta for multi-GB files is a follow-up.
 - **GC.** `Collect` deletes what the keep-set rejects, keeps the bases of kept deltas, and deletes
   segments no pointer names (unfinished uploads).
+- **Upload grace.** Every writer uploads first and commits after (client API, SQL `STREAM ?`, a
+  replica's push), so `Collect` keeps a finished blob no commit references yet for `UploadGrace`
+  (default one hour).
+  - The finish time is in the pointer (format `KDBATP3`; `KDBATP2` still reads, with no grace), so
+    the hold survives a restart between upload and commit.
+  - A wire upload's `Expect` (the store already has the blob) and a re-upload of a stored blob
+    restart the grace through `Store.Hold`. The pointer is rewritten only when its recorded time is
+    half a grace old.
+  - The hold ends as soon as a `Collect` sees the blob referenced; references alone decide after
+    that, so a replaced version is not kept for an hour.
 
 ## Embed API (done)
 
@@ -225,7 +235,7 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - **A graft pushed to a host** (`GRAFT_PUSH`) does not carry the root's attachment table.
 - **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
 - **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
-- **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
+- **The Kotlin store** has its own on-disk layout, no deltas, no read leases and no upload grace; Kotlin does not
   read Go's v5 checkpoint and graph formats and has no blob peer transfer.
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.
 

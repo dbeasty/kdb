@@ -398,5 +398,9 @@ func heldBlob(store *attachstore.Store, h codec.Hash) (attachstore.Info, bool) {
 		return attachstore.Info{}, false
 	}
 	defer r.Close()
+	// The client skips the bytes and commits a reference next: hold the blob until it does.
+	if _, err := store.Hold(h); err != nil {
+		return attachstore.Info{}, false
+	}
 	return attachstore.Info{Hash: h, Size: r.Size()}, true
 }

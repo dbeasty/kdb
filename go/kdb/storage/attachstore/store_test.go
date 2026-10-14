@@ -2,6 +2,7 @@ package attachstore
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"math/rand"
@@ -233,7 +234,7 @@ func versions(r *rand.Rand, n, size int) [][]byte {
 // Replaced versions stored as deltas read back the same, a chain reads back at every step, and
 // Collect keeps a delta's base.
 func TestStoreAsDeltaAndCollect(t *testing.T) {
-	s, shim, _ := newTestStore(t, Config{})
+	s, shim, _ := newTestStore(t, Config{UploadGrace: time.Nanosecond})
 	v := versions(rand.New(rand.NewSource(5)), 4, 2*chunk+100)
 	var hashes []codec.Hash
 	for _, b := range v {
@@ -271,7 +272,7 @@ func TestStoreAsDeltaAndCollect(t *testing.T) {
 // A read in flight finishes on the version it opened while maintenance turns it into a delta and
 // GC collects it; the storage it pinned goes when it closes.
 func TestReadersFinishOnTheirVersion(t *testing.T) {
-	s, shim, _ := newTestStore(t, Config{})
+	s, shim, _ := newTestStore(t, Config{UploadGrace: time.Nanosecond})
 	v := versions(rand.New(rand.NewSource(6)), 2, 2*chunk+7)
 	old, _ := s.Put(bytes.NewReader(v[0]))
 	newer, _ := s.Put(bytes.NewReader(v[1]))
@@ -425,5 +426,124 @@ func TestMarkSurvivesReopenAndCollect(t *testing.T) {
 	}
 	if marks != 1 {
 		t.Fatalf("%d mark segments left, want 1: %v", marks, names)
+	}
+}
+
+// A finished upload no commit references yet survives Collect for its grace - in this store and in
+// one reopened over it - and is collected after.
+func TestAFinishedUploadIsHeldForItsGrace(t *testing.T) {
+	for name, size := range map[string]int{"inline": 300, "standalone": 2*chunk + 11} {
+		t.Run(name, func(t *testing.T) {
+			s, shim, small := newTestStore(t, Config{})
+			b := randomBytes(rand.New(rand.NewSource(7)), size)
+			info, err := s.Put(bytes.NewReader(b))
+			if err != nil {
+				t.Fatal(err)
+			}
+			none := func(codec.Hash) bool { return false }
+			if n, err := s.Collect(none); err != nil || n != 0 {
+				t.Fatalf("collected %d, %v: an upload awaiting its commit", n, err)
+			}
+			if !bytes.Equal(readBack(t, s, info.Hash), b) {
+				t.Fatal("held blob reads back wrong")
+			}
+			again := New(shim, "app/data", small, Config{}) // a restart between upload and commit
+			if n, err := again.Collect(none); err != nil || n != 0 {
+				t.Fatalf("reopened store collected %d, %v", n, err)
+			}
+			if !bytes.Equal(readBack(t, again, info.Hash), b) {
+				t.Fatal("held blob reads back wrong after reopen")
+			}
+			expired := New(shim, "app/data", small, Config{UploadGrace: time.Nanosecond})
+			if n, err := expired.Collect(none); err != nil || n != 1 {
+				t.Fatalf("collected %d, %v after the grace", n, err)
+			}
+			if has, _ := expired.Has(info.Hash); has {
+				t.Fatal("blob still stored after its grace")
+			}
+			if names, _ := shim.ListSegments("app/data"); len(names) != 0 {
+				t.Fatalf("segments left after collection: %v", names)
+			}
+		})
+	}
+}
+
+// Once a Collect sees a blob referenced, references alone decide: dropping the reference frees it
+// without waiting out the grace.
+func TestTheHoldEndsOnceTheBlobIsReferenced(t *testing.T) {
+	s, _, _ := newTestStore(t, Config{})
+	info, err := s.Put(bytes.NewReader(randomBytes(rand.New(rand.NewSource(8)), chunk+5)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Collect(func(h codec.Hash) bool { return h == info.Hash }); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.Collect(func(codec.Hash) bool { return false }); err != nil || n != 1 {
+		t.Fatalf("collected %d, %v: a dereferenced blob", n, err)
+	}
+}
+
+// Uploading a blob again, or holding it (a wire upload's Expect), restarts its grace - durably,
+// so a reopened store keeps it too.
+func TestReuploadAndHoldRestartTheGrace(t *testing.T) {
+	for _, how := range []string{"reupload", "hold"} {
+		t.Run(how, func(t *testing.T) {
+			s, shim, small := newTestStore(t, Config{UploadGrace: time.Hour})
+			b := randomBytes(rand.New(rand.NewSource(9)), chunk+5)
+			info, err := s.Put(bytes.NewReader(b))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Age the upload past its grace, on disk too.
+			s.mu.Lock()
+			p := s.pointers[info.Hash]
+			p.finished = time.Now().Add(-2 * time.Hour)
+			if p, err = s.writePointerLocked(info.Hash, p); err != nil {
+				t.Fatal(err)
+			}
+			s.pointers[info.Hash] = p
+			s.held[info.Hash] = p.finished
+			s.mu.Unlock()
+			if how == "reupload" {
+				if _, err := s.Put(bytes.NewReader(b)); err != nil {
+					t.Fatal(err)
+				}
+			} else if held, err := s.Hold(info.Hash); err != nil || !held {
+				t.Fatalf("Hold = %v, %v", held, err)
+			}
+			none := func(codec.Hash) bool { return false }
+			if n, err := s.Collect(none); err != nil || n != 0 {
+				t.Fatalf("collected %d, %v after the grace restarted", n, err)
+			}
+			again := New(shim, "app/data", small, Config{UploadGrace: time.Hour})
+			if n, err := again.Collect(none); err != nil || n != 0 {
+				t.Fatalf("reopened store collected %d, %v", n, err)
+			}
+			if !bytes.Equal(readBack(t, again, info.Hash), b) {
+				t.Fatal("blob reads back wrong")
+			}
+		})
+	}
+}
+
+// A v2 pointer (no finish time) still reads, and has no grace.
+func TestAVersion2PointerReadsWithoutAGrace(t *testing.T) {
+	s, shim, small := newTestStore(t, Config{})
+	b := []byte("written by an older build")
+	h := document.AttachmentContentHash(b)
+	enc := encodePointer(pointer{size: int64(len(b)), inline: b})
+	v2 := append([]byte(pointerMagicV2), enc[len(pointerMagic)])
+	v2 = append(v2, enc[len(pointerMagic)+1:len(pointerMagic)+9]...) // flags, size
+	v2 = append(v2, enc[len(pointerMagic)+17:len(enc)-4]...)         // names, bytes
+	sum := sha256.Sum256(v2)
+	if err := s.writeSegment(s.pointerName(h, 0), append(v2, sum[:4]...)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readBack(t, s, h), b) {
+		t.Fatal("v2 pointer reads back wrong")
+	}
+	if n, err := New(shim, "app/data", small, Config{}).Collect(func(codec.Hash) bool { return false }); err != nil || n != 1 {
+		t.Fatalf("collected %d, %v: a v2 pointer has no grace", n, err)
 	}
 }
