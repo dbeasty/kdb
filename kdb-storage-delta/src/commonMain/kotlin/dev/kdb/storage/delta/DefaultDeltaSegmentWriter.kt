@@ -45,6 +45,9 @@ public class DefaultDeltaSegmentWriter(
     override val currentSizeBytes: Long get() = sizeBytes
     override val isSealed: Boolean get() = sealed
 
+    /** This segment's sequence number: a checkpoint written while it is open claims only the ones below it. */
+    public val sequence: Long get() = sequenceNumber
+
     override suspend fun append(record: DeltaRecord): Long =
         mutex.withLock {
             check(!sealed) { "segment sealed" }

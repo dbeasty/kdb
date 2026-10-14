@@ -97,7 +97,8 @@ and the Go↔Kotlin physical-format goldens cover it. What that needs first:
 
 - **Shallow roots in Kotlin's replayer.** Every replica root is a shallow root (snapshot, squash). *Done for
   reading (feat/kotlin-checkpoint):* Kotlin opens such namespaces from Go's checkpoint (`CheckpointOpen.kt`) and
-  refuses them only when the checkpoint is unusable. Writing a checkpoint from Kotlin is still open.
+  refuses them only when the checkpoint is unusable. *Writing (2026-10-14):* Kotlin writes Go's format (decision
+  in §11, "Kotlin persistence").
   Before that change it refused namespaces whose marker lists `shallowRoots` (#209, `NamespaceMarker.kt`). The Kotlin replayer must learn Go's
   rule (`embed/delta_replay.go applyCommitsTopologically`): a logged shallow root is admitted without applying its
   ops or moving main, and the state comes from the checkpoint. Squash's durability is a checkpoint, so Kotlin must
@@ -401,20 +402,34 @@ changed after the first draft of this plan: a record has **several named attachm
 - The TS zstd decoder runs at about 150 to 280 MB/s, against about 1.1 GB/s for Node's native decoder, which
   Node keeps using. A 4 MiB page decodes in about 20 ms in a browser.
 
-**Kotlin persistence (decision needed, 2026-10-14).** D12 says the Kotlin replica stores into the Kotlin embed
-runtime. A survey of both runtimes found the following:
-- Kotlin keeps no checkpoints and rebuilds a namespace by replaying its delta log from genesis.
-- Go keeps a snapshot or squash root only in its checkpoint (v2 to v5) plus its blob store, never in the log.
+**Kotlin persistence (decided 2026-10-14: option (a)).** D12 says the Kotlin replica stores into the Kotlin
+embed runtime. A survey of both runtimes found the following:
+- Kotlin kept no checkpoints and rebuilt a namespace by replaying its delta log from genesis.
+- Go keeps a snapshot or squash root only in its checkpoint plus its blob store, never in the log.
 - So a Kotlin runtime that can reopen a replica needs one of two things:
-  - **(a)** a Kotlin port of Go's checkpoint read/write (about 2,800 Go lines, plus graph segments for v3,
-    the packed tree for v4 and attachments for v5);
+  - **(a)** Kotlin reads and writes Go's checkpoint format;
   - **(b)** a new delta-log record, "root state", holding a root commit and the documents it set, which both
-    replayers learn. That is a versioned on-disk change with golden fixtures in both trees, and old readers
-    refuse it loudly.
-- **(b) is recommended.** It is much smaller, keeps the log self-sufficient for Kotlin, and Go could use it to
-  log squash and snapshot roots instead of depending on a checkpoint.
-- Until this is decided, the Kotlin engine runs against the same `ReplicaStore` interface as the TS one, with an
-  in-memory implementation.
+    replayers learn.
+
+**Decision (owner, 2026-10-14): (a). Kotlin writes Go's checkpoint format, so both runtimes use one format.
+(b) is rejected:** no new log record, and Go keeps recording squash and snapshot roots in its checkpoint as
+it does now. Where that stands:
+- Kotlin reads checkpoint versions 2, 4, 5 and 6 (#225, `CheckpointOpen.kt`).
+- Kotlin writes what Go writes now (#270, `GoCheckpointWriter.kt`): version 2 for a namespace of at most
+  20,000 entries without attachments, otherwise version 6 (record plus a CRC'd section, written section first,
+  then the record, then the old section is deleted). It does not write 3, 4 or 5, and neither does Go.
+- The Kotlin file runtime writes checkpoints when Go does (`NamespaceCheckpointer.kt`, wired in
+  `openFileRuntime`). One is written right after an open that replayed the whole log. Another is written at
+  `EmbeddedKdbRuntime.close()`, after the delta writer is sealed, and is skipped when nothing changed. The CLI,
+  JDBC connections and `kdb-service` shutdown now close the runtime.
+- Kotlin writes no checkpoint where it could claim a segment it does not hold whole (another runtime still
+  appending to it), or over a checkpoint it cannot read (a newer format, or Go's graph segment references).
+- Interop is tested both ways in `kdb-integration` `CheckpointInteropTest`, against `go/cmd/kdb-cpinterop`.
+  Go opens Kotlin checkpoints: v2, v6 at 21,000 entries, attachments, a snapshot root with writes on top, and
+  the post-replay checkpoint. Kotlin opens a Go squash, writes on top, and Go reopens it from Kotlin's
+  checkpoint. Heads, trees, refs, documents, attachment roots and shallow roots must be equal, and Go must not
+  replay the log in full.
+- The Kotlin replica's on-disk store builds on this; see PR 5b below.
 
 **Found while building PR 3:**
 - A host refuses a full replica's push into a single-home namespace in two ways. Without a handover point it

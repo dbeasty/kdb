@@ -63,6 +63,39 @@ public class EmbeddedKdbRuntime(
      * from - by namespace. A file runtime fills it from the namespace marker at open. */
     public val shallowRoots: MutableMap<String, MutableSet<KdbHash>> = mutableMapOf()
 
+    private val closeMutex = Mutex()
+    private val closeHooks = mutableListOf<suspend () -> Unit>()
+    private var closed = false
+
+    /** Runs [hook] at [close], after the hooks added before it. A file runtime adds one that writes
+     * the namespace's checkpoint (Go's checkpointOnClose); a memory runtime has none. */
+    public suspend fun addCloseHook(hook: suspend () -> Unit) {
+        closeMutex.withLock { closeHooks.add(hook) }
+    }
+
+    /**
+     * Ends the runtime: an orderly shutdown, after which nothing more is written to it. Runs each
+     * close hook once; a hook that throws does not stop the others, and the first failure is
+     * rethrown after they have all run. Closing again does nothing.
+     */
+    public suspend fun close() {
+        val hooks =
+            closeMutex.withLock {
+                if (closed) return
+                closed = true
+                closeHooks.toList()
+            }
+        var failure: Throwable? = null
+        for (hook in hooks) {
+            try {
+                hook()
+            } catch (e: Throwable) {
+                if (failure == null) failure = e
+            }
+        }
+        failure?.let { throw it }
+    }
+
     // Component 44 (Layer 12): a single hook point every commit path shares -
     // EmbedWrites.commitViaEngine notifies through this after every successful commit,
     // regardless of whether the caller is kdb-server's KdbServerRuntime.commit() (the SQL wire
