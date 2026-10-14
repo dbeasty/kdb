@@ -17,6 +17,7 @@ import dev.kdb.transaction.BlobPresence
 import dev.kdb.transaction.transactionEngine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.time.Duration
 
 /*
  * Attachments: binary attachments on documents (docs/kdb-attachments-plan.md) - the Kotlin
@@ -116,6 +117,7 @@ internal class AttachmentState {
     val stores = mutableMapOf<String, AttachmentBlobStore>()
     var history = AttachmentHistory.ALL
     var maxBytes = 0L
+    var uploadGrace = DEFAULT_ATTACHMENT_UPLOAD_GRACE
 }
 
 /** Chooses how much attachment history this runtime keeps. */
@@ -128,11 +130,33 @@ public suspend fun EmbeddedKdbRuntime.setAttachmentMaxBytes(maxBytes: Long) {
     attachments.mutex.withLock { attachments.maxBytes = maxBytes }
 }
 
+/**
+ * How long, for stores opened afterwards, an uploaded attachment no commit references yet is kept
+ * by [compactAttachments]: the longest an upload may wait for its commit. Default
+ * [DEFAULT_ATTACHMENT_UPLOAD_GRACE]; not positive restores it. The hold ends as soon as a commit
+ * referencing the attachment is durable.
+ */
+public suspend fun EmbeddedKdbRuntime.setAttachmentUploadGrace(grace: Duration) {
+    attachments.mutex.withLock { attachments.uploadGrace = grace }
+}
+
 /** [namespaceId]'s attachment store, opened on first use. */
 public suspend fun EmbeddedKdbRuntime.attachmentStore(namespaceId: String = defaultNamespace): AttachmentBlobStore =
     attachments.mutex.withLock {
-        attachments.stores.getOrPut(namespaceId) { AttachmentBlobStore(attachmentShim, namespaceId, attachments.maxBytes) }
+        attachments.stores.getOrPut(namespaceId) {
+            AttachmentBlobStore(attachmentShim, namespaceId, attachments.maxBytes, attachments.uploadGrace)
+        }
     }
+
+/** Ends the upload hold on the blobs [commit] puts, once it is durable (commitViaEngine). A
+ * failure only leaves the hold to [compactAttachments], which ends it on finding the blob referenced. */
+internal suspend fun EmbeddedKdbRuntime.attachmentsCommitted(
+    namespaceId: String,
+    commit: KdbCommit,
+) {
+    val hashes = commit.operations.mapNotNull { (it as? KdbOp.AttachmentPut)?.contentHash }
+    if (hashes.isNotEmpty()) runCatching { attachmentStore(namespaceId).committed(hashes) }
+}
 
 /** The attachment table at [commit] (null: main's head). */
 public suspend fun EmbeddedKdbRuntime.attachmentTableAt(commit: KdbHash? = null): AttachmentTable = dag.attachmentTableAt(commit ?: dag.head())
@@ -302,7 +326,9 @@ private suspend fun EmbeddedKdbRuntime.referencedAttachmentHashes(): Set<KdbHash
 /**
  * Deletes the blobs nothing keeps: under [AttachmentHistory.LATEST] anything a branch or tag head
  * does not reference, under [AttachmentHistory.ALL] anything no reachable commit references (an
- * upload never committed). A blob being read is removed when its reader closes. Safe at any time.
+ * upload never committed) - but neither while it is within its upload grace
+ * ([setAttachmentUploadGrace]), its commit perhaps still to come. A blob being read is removed
+ * when its reader closes. Safe at any time.
  */
 public suspend fun EmbeddedKdbRuntime.compactAttachments(namespaceId: String = defaultNamespace): AttachmentMaintenance {
     val history = attachments.mutex.withLock { attachments.history }

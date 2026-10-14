@@ -378,11 +378,11 @@ export class PeerConnection {
    */
   async treeNodes(namespace: string, treeHex: string, prefixes: string[], entryLimit = DEFAULT_TREE_ENTRY_LIMIT, opts: { tree?: "attachments"; commitHex?: string } = {}): Promise<{ treeHex: string; nodes: WireTreeNode[]; attachments: Record<string, TreeAttachmentWire[]> }> {
     const r = await this.request(MSG.TREE_NODES, { namespace, treeHex, prefixes, entryLimit, ...opts }, "treeNodesResult");
-    return {
-      treeHex: String(r.treeHex ?? ""),
-      nodes: (r.nodes as WireTreeNode[] | undefined) ?? [],
-      attachments: (r.attachments as Record<string, TreeAttachmentWire[]> | undefined) ?? {},
-    };
+    const nodes = (r.nodes as WireTreeNode[] | undefined) ?? [];
+    // The host lists each node's documents' attachments on the node (wire.TreeNodeInfo.Attachments).
+    const attachments: Record<string, TreeAttachmentWire[]> = {};
+    for (const n of nodes) Object.assign(attachments, n.attachments ?? {});
+    return { treeHex: String(r.treeHex ?? ""), nodes, attachments };
   }
 
   /** BLOB_FETCH: parts of attachment blobs, each with chunk proofs (verified by the caller). */
@@ -463,6 +463,8 @@ export interface WireTreeNode {
   children?: string[];
   hasEntries?: boolean;
   entries?: Record<string, string>;
+  /** For the attachment table: each listed document's attachments. */
+  attachments?: Record<string, TreeAttachmentWire[]>;
 }
 
 /** go/kdb/error/payloads.go ConflictReport. */

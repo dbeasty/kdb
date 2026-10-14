@@ -1,5 +1,9 @@
 # Nightly long-running e2e: slow load/compaction/large-history scenarios plus (when secrets are
 # configured) the LocalStack S3 backup variant (kdb-finish-up-plan Phase 3.2 CI wiring).
+#
+# Also the full suites PR CI (ci.yml) runs a fast subset of: the whole Go suite without -short -
+# heap-scale and other measurement tests, every Go<->Kotlin interop test, the kill -9 tests at full
+# iterations - under the race detector on Linux and plainly on Windows, and `./gradlew build`.
 name: E2E Nightly
 
 on:
@@ -8,6 +12,96 @@ on:
   workflow_dispatch:
 
 jobs:
+  go-race-full:
+    # The shards of ci.yml's go-test, without -short and without the test cache.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [embed, server, integration, storage, index, rest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          cache-key: race-${{ matrix.shard }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Use the Gradle build cache in the interop tests' gradle runs
+        run: printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+      - name: Go test (${{ matrix.shard }}, full)
+        env:
+          GO_TEST_JSON_DIR: ${{ runner.temp }}/go-test-json
+        run: scripts/ci/go-test-shard.sh linux-race ${{ matrix.shard }} -count=1 -timeout 45m
+      - name: Upload go test -json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-test-json-nightly-linux-race-${{ matrix.shard }}
+          path: ${{ runner.temp }}/go-test-json/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  go-windows-full:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [embed, server, rest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          cache-key: windows-${{ matrix.shard }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Go test (${{ matrix.shard }}, full)
+        shell: bash
+        env:
+          GO_TEST_JSON_DIR: ${{ runner.temp }}/go-test-json
+        run: |
+          printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+          scripts/ci/go-test-shard.sh windows ${{ matrix.shard }} -count=1 -timeout 45m
+      - name: Upload go test -json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-test-json-nightly-windows-${{ matrix.shard }}
+          path: ${{ runner.temp }}/go-test-json/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  kotlin-build:
+    # What ci.yml's kotlin-test jobs split three ways, as one plain build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          cache-key: kotlin-jvm
+      - name: ./gradlew build
+        run: ./gradlew build --parallel --continue --no-daemon
+      - name: Upload Kotlin test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotlin-test-results-nightly
+          path: |
+            **/build/test-results/**/*.xml
+            **/build/reports/tests/**
+          retention-days: 14
+          if-no-files-found: ignore
+
   e2e-slow:
     runs-on: ubuntu-latest
     steps:
@@ -24,6 +118,9 @@ jobs:
           cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
       - name: Install pytest
         run: pip install -q -r kdb-integration/e2e/requirements.txt
+      - name: Install ffmpeg
+        # The attachment tests generate and decode MP4 media (kdb-integration/e2e/media_fixtures.py).
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
       - name: Run slow + destructive scenarios
         working-directory: kdb-integration/e2e
         # Upgrade tests have their own job (e2e-upgrade), which builds the previous release.

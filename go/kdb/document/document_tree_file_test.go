@@ -465,6 +465,9 @@ func rebaseHistory(history []held) {
 // stays exactly what it was - and, the trees' copies being shared, costs no more heap than not
 // rebasing (the control, which keeps the superseded segments mapped instead).
 func TestTreeFileRebasedHistoryReleasesSegments(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heavy: minutes under -race on a CI runner; runs nightly, or without -short")
+	}
 	var controlInUse int
 	for _, rebase := range []bool{false, true} {
 		r := rand.New(rand.NewSource(18))
@@ -607,4 +610,108 @@ func TestTreeFileStampSkipsFullChecksum(t *testing.T) {
 	if n := treeFullVerifies.Load() - before; n != 1 {
 		t.Fatalf("a segment whose stamp changed was checksummed %d times, want 1", n)
 	}
+}
+
+// TestTreeFileCloseWaitsForOnWrite: Close does not return while an onWrite call (the engine's
+// rebase of its held trees, which reads the segments) is still running, and none starts after it.
+// One that outlived Close faulted (SIGBUS) once a test rewrote a segment it was reading.
+func TestTreeFileCloseWaitsForOnWrite(t *testing.T) {
+	r := rand.New(rand.NewSource(21))
+	f := newTestTreeFile(t, 1<<20)
+	tree, err := OpenTreePacked(packedOf(randomEntriesFrom(r, testIDs(r, 2000))), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	f.SetOnWrite(func() {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+	})
+	id, h := testIDs(r, 1)[0], codec.Hash{Bytes: [32]byte{7}}
+	if tree, err = tree.With(id, h); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveTreeSegment(tree, tree.AppendPacked(nil)); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	closed := make(chan struct{})
+	go func() { f.Close(); close(closed) }()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while an onWrite call was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-closed
+	f.wrote()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("onWrite ran %d times; want 1, and none after Close", n)
+	}
+	waitRewrites(tree)
+}
+
+// Dropping the mapped segments' pages loses nothing: readers walking the tree while pages are
+// dropped, again and again, see every entry, and the tree's hash and contents are unchanged after.
+func TestDropMappedPagesKeepsTheTreeReadable(t *testing.T) {
+	r := rand.New(rand.NewSource(29))
+	f := newTestTreeFile(t, 16<<10)
+	universe := testIDs(r, 3000)
+	entries := randomEntriesFrom(r, universe)
+	tree, err := OpenTreePacked(packedOf(entries), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, mapped := tree.Paged(); !mapped {
+		t.Skip("the tree is not mapped from a segment; nothing to drop")
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan string, 8)
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				n := 0
+				tree.Walk(func(id codec.UUID, h codec.Hash) bool {
+					if entries[id] != h {
+						errs <- "a walk read an entry that differs after its pages were dropped"
+						return false
+					}
+					n++
+					return true
+				})
+				if n != len(entries) {
+					errs <- "a walk missed entries after pages were dropped"
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 50; i++ {
+		tree.DropMappedPages()
+	}
+	close(stop)
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Fatal(e)
+	}
+	again, err := BuildTrieDocumentTreePacked(packedOf(entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree.TreeHash != again.TreeHash || tree.Size() != len(entries) {
+		t.Fatal("the tree changed across dropping its pages")
+	}
+	DocumentTree{}.DropMappedPages() // an unbound tree: a no-op
 }

@@ -107,6 +107,34 @@ def run_kdb(
     )
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--shard",
+        default=None,
+        metavar="I/N",
+        help="run only shard I of N (1-based), dealing the selected tests round-robin - CI's e2e matrix",
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):
+    """--shard I/N keeps every Nth selected test. trylast, so it deals out what -m and -k left: the
+    shards of one selection together run exactly that selection. Round-robin rather than by file
+    keeps a file's 3- and 5-node parametrizations, its slowest tests, apart."""
+    spec = config.getoption("--shard")
+    if not spec:
+        return
+    index, count = (int(x) for x in spec.split("/"))
+    if not 1 <= index <= count:
+        raise pytest.UsageError(f"--shard {spec}: want I/N with 1 <= I <= N")
+    keep, drop = [], []
+    for position, item in enumerate(items):
+        (keep if position % count == index - 1 else drop).append(item)
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+    items[:] = keep
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     """Records each phase's report on the test item (item.rep_setup / rep_call / rep_teardown),

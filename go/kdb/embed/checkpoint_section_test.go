@@ -145,6 +145,9 @@ func TestCheckpointV6SectionRoundTripsAndRetires(t *testing.T) {
 // to a version 6 checkpoint and reopens from it with every document intact - with a tree file,
 // by mapping the tree segment the record's digest names.
 func TestRuntimeReopensFromCheckpointV6(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes past the legacy checkpoint bound; runs nightly, or without -short")
+	}
 	for _, treeFile := range []bool{false, true} {
 		t.Run(map[bool]string{false: "heap-tree", true: "tree-file"}[treeFile], func(t *testing.T) {
 			if treeFile {

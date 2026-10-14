@@ -71,6 +71,12 @@ public data class ReplicaOptions(
     val pageBytes: Int = DEFAULT_PAGE_BYTES,
     /** Start syncing at once and on every local write; false syncs only on [Replica.syncNow]. */
     val autoSync: Boolean = true,
+    /**
+     * Bytes of fetched attachments kept; the least recently used are evicted past it and fetched
+     * again when read (0 keeps everything). Attachments written here and not yet uploaded are never
+     * evicted.
+     */
+    val blobCacheBytes: Long = DEFAULT_BLOB_CACHE_BYTES,
 )
 
 public enum class ChangeSource { LOCAL, REMOTE }
@@ -131,7 +137,17 @@ public class Replica private constructor(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /** Attachment bytes held here: fetched on read, or written here and pinned until uploaded. */
-    public val blobs: BlobStore = BlobStore(store)
+    public val blobs: BlobStore = BlobStore(store, opts.blobCacheBytes)
+
+    /** What the attachment byte cache holds. */
+    public suspend fun blobCache(): BlobCacheStats = blobs.stats()
+
+    /**
+     * Evicts fetched attachment bytes, least recently used first, down to [targetBytes] of them (0
+     * frees every one; null: the cache's bound). Bytes written here and not yet uploaded stay.
+     * Returns the bytes freed; what was evicted is fetched again when read.
+     */
+    public suspend fun evictBlobs(targetBytes: Long? = null): Long = blobs.evict(targetBytes)
     private val ns = LinkedHashMap<String, ReplicaNamespace>()
     private val proj = LinkedHashMap<String, ProjectionNamespace>()
     private val outboxSizes = MutableStateFlow<Map<String, Int>>(emptyMap())

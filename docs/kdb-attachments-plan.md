@@ -163,6 +163,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
     `Store.Committed`), or a `Collect` sees it referenced; references alone decide after that, so a
     replaced version is not kept for an hour. After a restart, a blob whose recorded finish time
     is within the grace is held again until a `Collect` sees it referenced.
+  - Kotlin (`AttachmentBlobStore`) holds the same way, default one hour,
+    `setAttachmentUploadGrace` on the embed runtime. Its pointer format is unchanged: the hold is an
+    empty `g-<hash>.<millis>` segment written before the pointer, since the shim cannot replace a
+    segment atomically and an older build would read a new pointer format as torn and delete the
+    blob. A pointer with no hold segment (stored before holds existed) has no grace. A re-upload
+    restarts the grace (rewritten once half a grace old). The hold ends when `commitViaEngine`
+    commits a put (the file runtime's commit is durable by then) or a collect sees the blob
+    referenced; the hold segment is deleted then, so unlike Go a restart does not revive it.
 
 ## Embed API (done)
 
@@ -208,6 +216,17 @@ identity = SHA-256(0x02 || be64(size) || tree)
   `KdbAttachmentCorruptError`, Kotlin `KdbAttachmentCorruptException` (SQLState `XX001`) - the
   same error as the client's own failed verification. The remedy is another replica or repair,
   never a retry against the same node.
+- **Verified ranged reads**, feature `attachment-proofs`: `ATTACHMENT_GET` with `Proofs` (11) gets
+  pages rounded to 1 MiB chunk boundaries (at most 4 MiB), and `ATTACHMENT_DATA` carries the blob's
+  `Tree` (12), each chunk's RFC 6962 audit path (13, BLOB_FETCH's encoding) and `Scheme` (14). A
+  client checks `AttachmentIdentity(Tree, Size) == Hash` and every chunk's proof before handing out
+  any of its bytes, and trims the pages to the caller's range. An offset past the end fails
+  `SCHEMA_VIOLATION` with `Info` still set (clients raise a typed range error); a `Close` reply
+  carries `Superseded`, so a range that ends before the attachment does still learns it. Go
+  `OpenAttachmentRange` / `ReadAttachmentAt`; TS `openAttachmentRange` / `readAttachmentAt`; Kotlin
+  `KdbAttachments.openRange` / `readAt` / `getRange`, and `KdbAttachments.blob()`, a `java.sql.Blob`
+  whose `getBytes(pos, len)` / `getBinaryStream(pos, len)` read verified ranges. The Kotlin server
+  acks neither feature. A chunk failing its proof is the same corrupt error as below.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
   (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
   Kotlin server answers the messages `UNSUPPORTED`.
@@ -255,7 +274,7 @@ identity = SHA-256(0x02 || be64(size) || tree)
 
 - **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
 - **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
-- **The Kotlin store** has its own on-disk layout, no deltas, no read leases and no upload grace; Kotlin does not
+- **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
   read Go's v5 checkpoint and graph formats and has no blob peer transfer.
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.
 

@@ -1,77 +1,182 @@
 name: CI
 
+# PR checks are sized to finish in a few minutes: the Go suite runs as shards in parallel, with
+# -short; Kotlin runs one job per target against a Gradle build cache; and nothing waits on another
+# job it does not use. What -short leaves out - the heap-scale and other measurement tests, the soak
+# iterations, the full Go<->Kotlin interop set - and the plain `./gradlew build` run every night in
+# e2e-nightly.yml. How to run each piece locally: docs/ci.md.
 on:
   workflow_dispatch:
-  push:
   pull_request:
+  # Branch pushes without a PR used to run everything too, so every PR ran CI twice and queued
+  # behind itself. main still runs on push: that run is what refreshes the caches PRs restore.
+  push:
+    branches: [main]
+
+concurrency:
+  # A new push to a PR supersedes the run still going for the previous one.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # .github/actions/setup-go-cached: only main's runs write the Go caches.
+  SAVE_GO_CACHE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
-  integration:
+  go-checks:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - id: go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          cache-key: checks
+      - name: Go format check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Go vet
+        run: go vet ./...
+      - name: Go Windows cross-compile
+        # Cheap guard that runs on every push; go-windows below is what actually exercises it.
+        run: GOOS=windows GOARCH=amd64 go vet ./...
+      - name: Go WASM build
+        run: |
+          GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
+          GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/embed/
+          GOOS=js GOARCH=wasm go build -tags kdb_lite -o /dev/null ./wasm/embed/
+          go vet -tags kdb_lite ./kdb/storage/io/s3
+      - name: Backup and restore drill
+        # Live backup -> verify -> restore into a fresh dir while the service is down -> restart
+        # -> compare documents and head. Also run as a Go test (TestBackupRestoreDrill, nightly);
+        # this step keeps the operator-facing script itself from rotting and prints its log on
+        # failure.
+        run: ../scripts/backup-restore-drill.sh 100
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
+
+  # The Go suite under the race detector, as shards balanced by measured duration - see
+  # scripts/ci/go-test-shard.sh for what each shard runs (`go-test-shard.sh list linux-race`).
+  # -short: heavy tests skip or scale down here and run in full nightly. Results come from Go's
+  # test cache when neither a package nor anything it depends on changed since main's last run.
+  go-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [embed, server, integration, storage, index, rest]
+    steps:
+      - uses: actions/checkout@v4
+      - id: go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          cache-key: race-${{ matrix.shard }}
+      # The Go<->Kotlin interop smoke in kdb/integration runs the Kotlin CLI through gradle.
+      - if: matrix.shard == 'integration'
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-          cache: gradle
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      # :kdb-integration:e2ePython drives the same pytest harness the e2e job
-      # runs, and that harness launches the real Go service - it fails with
-      # "KDB_SERVICE_BIN not set and go/bin/kdb-service not built" without
-      # these. This job had neither Go nor the binaries, so e2ePython could
-      # never have passed here; e2e passes because it does exactly this first.
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go/go.mod
-      - name: Build Go binaries
-        run: |
-          make build-go
-          cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
-      - name: Install pytest
-        run: pip install -q -r kdb-integration/e2e/requirements.txt
-      - name: Run integration tests
+      - if: matrix.shard == 'integration'
+        uses: gradle/actions/setup-gradle@v4
+      - if: matrix.shard == 'integration'
+        name: Use the Gradle build cache in every gradle run, including the tests' own
+        run: printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+      - name: Go test (${{ matrix.shard }})
         env:
-          # this job builds kdb-service above: the JVM-against-Go tests must run, not skip
-          KDB_REQUIRE_GO_SERVICE: "1"
-        run: ./gradlew :kdb-integration:test :kdb-integration:e2ePython --no-daemon
-      - name: Upload e2e failure evidence
-        # Data directories, every launch's service log and kdb-inspect output, kept by
-        # preserve_evidence() when a crash or cluster scenario fails - the only way to examine a
-        # failure that shows up on a runner and not on a laptop (issue #43).
-        if: failure()
+          GO_TEST_JSON_DIR: ${{ runner.temp }}/go-test-json
+        run: scripts/ci/go-test-shard.sh linux-race ${{ matrix.shard }} -short -timeout 10m
+      - name: Upload go test -json (shard balancing data)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-evidence-integration-${{ github.run_attempt }}
-          path: kdb-integration/e2e/evidence/
+          name: go-test-json-linux-race-${{ matrix.shard }}
+          path: ${{ runner.temp }}/go-test-json/
+          retention-days: 7
           if-no-files-found: ignore
-          retention-days: 14
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
+  go-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [embed, server, rest]
+    steps:
+      - uses: actions/checkout@v4
+      - id: go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          cache-key: windows-${{ matrix.shard }}
+      - name: Go test (${{ matrix.shard }})
+        # No -race: it needs cgo, and the race-enabled run on Linux already covers data races.
+        # What this job is for is Windows file semantics - sharing modes, LockFileEx, rename and
+        # delete of open files - which only a real Windows filesystem exercises.
+        shell: bash
+        env:
+          GO_TEST_JSON_DIR: ${{ runner.temp }}/go-test-json
+        run: scripts/ci/go-test-shard.sh windows ${{ matrix.shard }} -short -timeout 10m
+      - name: Upload go test -json (shard balancing data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-test-json-windows-${{ matrix.shard }}
+          path: ${{ runner.temp }}/go-test-json/
+          retention-days: 7
+          if-no-files-found: ignore
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
+
+  # `./gradlew build` split by target. Together the three run every task `build` runs on Linux
+  # (checked with --dry-run; macosArm64 only runs on a macOS host): jvm also compiles every source
+  # set's common metadata (allMetadataJar) - `test allTests` never did, which is how an expect
+  # declaration only the metadata compiler rejects once broke `build` on main unnoticed. The plain
+  # `./gradlew build` runs nightly. With the build cache main's runs fill, a module and the modules
+  # that depend on it only compile and test again when they changed.
   kotlin-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: jvm
+            tasks: jvmTest test allMetadataJar
+          - target: js
+            tasks: jsTest jsJar jsBrowserDistribution
+          - target: native
+            tasks: linuxX64Test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-          cache: gradle
+      - uses: gradle/actions/setup-gradle@v4
       # kdb-replica's live tests build go/cmd/kdb-replicahost and sync against it; the Go they use
       # is the module's, as in the TS jobs (they skip when there is no Go).
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
-      - name: Build and run the full Kotlin test suite
-        # `build` rather than `test allTests`: it runs everything those did (through
-        # `check`, which covers the Multiplatform jvmTest/jsTest/linuxX64Test that a bare
-        # `test` never reaches - see the "MPP test-CI gap" finding in
-        # docs/kdb-finish-up-plan.md) and also compiles each source set's common metadata.
-        # `test allTests` never compiles that, which is how an expect declaration that only
-        # the metadata compiler rejects kept `./gradlew build` broken on main unnoticed.
-        # macosArm64's tasks only run on a macOS host, so they're skipped here.
-        run: ./gradlew build --no-daemon
+          cache-key: kotlin-${{ matrix.target }}
+      - name: Kotlin ${{ matrix.target }} (${{ matrix.tasks }})
+        run: ./gradlew ${{ matrix.tasks }} --build-cache --parallel --continue --no-daemon
       # Gradle's console output gives the failing assertion's *line* but not its
       # message, and for a test whose body is a runBlocking { } it reports the
       # builder's line rather than the assert's - so a failure here can name a
@@ -83,71 +188,49 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: kotlin-test-results
+          name: kotlin-test-results-${{ matrix.target }}
           path: |
             **/build/test-results/**/*.xml
             **/build/reports/tests/**
           retention-days: 14
           if-no-files-found: ignore
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
-  go-test:
+  integration:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-java@v4
         with:
-          go-version-file: go/go.mod
-      - name: Go vet
-        run: go vet ./...
-      - name: Go format check
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "The following files are not gofmt-formatted:"
-            echo "$unformatted"
-            exit 1
-          fi
-      - name: Go test
-        # The race detector multiplies the heap-scale tests' cost; embed and index/vector run close
-        # to Go's default 10m per-package timeout on hosted runners. A hang still fails, at 25m.
-        run: go test -race -timeout 25m ./...
-      - name: Backup and restore drill
-        # Live backup -> verify -> restore into a fresh dir while the service is down -> restart
-        # -> compare documents and head. Also run as a Go test (TestBackupRestoreDrill); this step
-        # keeps the operator-facing script itself from rotting and prints its log on failure.
-        run: ../scripts/backup-restore-drill.sh 100
-      - name: Go WASM build
-        run: |
-          GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/demo/
-          GOOS=js GOARCH=wasm go build -o /dev/null ./wasm/embed/
-          GOOS=js GOARCH=wasm go build -tags kdb_lite -o /dev/null ./wasm/embed/
-          go vet -tags kdb_lite ./kdb/storage/io/s3
-      - name: Go Windows cross-compile
-        # Cheap guard that runs on every push; go-windows below is what actually exercises it.
-        run: GOOS=windows GOARCH=amd64 go vet ./...
-
-  go-windows:
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: go
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      # The JVM-against-Go tests launch the real Go service.
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
-      - name: Go build
-        run: go build ./...
-      - name: Go test
-        # No -race: it needs cgo, and the race-enabled run on Linux already covers data races.
-        # What this job is for is Windows file semantics - sharing modes, LockFileEx, rename and
-        # delete of open files - which only a real Windows filesystem exercises.
-        # kdb/embed runs about Go's default 10m per-package timeout on hosted Windows runners
-        # (timed out mid-TestOpenCostPerCommitDoesNotGrow); same 25m as the Linux race job.
-        run: go test -timeout 25m ./...
+          cache-key: binaries
+      - name: Build Go binaries
+        run: |
+          make build-go
+          cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
+      - name: Run integration tests
+        env:
+          # this job builds kdb-service above: the JVM-against-Go tests must run, not skip
+          KDB_REQUIRE_GO_SERVICE: "1"
+        # :kdb-integration:e2ePython is not run here any more: it ran the same pytest scenarios
+        # as the e2e job (4 minutes of them), differing only in driving the test_cli_* files
+        # with the JVM CLI - which e2e-interop now does.
+        run: ./gradlew :kdb-integration:test --build-cache --parallel --no-daemon
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
   ts-client:
     runs-on: ubuntu-latest
@@ -162,9 +245,10 @@ jobs:
       # Go is needed for two things: regenerating the golden fixtures to prove they still match
       # the real encoder, and the live interop suite, which starts an actual Go server and
       # drives it from the TypeScript client over a real WebSocket.
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: ts-client
       - name: Install
         run: npm ci
       - name: Typecheck
@@ -187,12 +271,17 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
   # @kdb/codegen (Component 63 phase 2). Needs the built @kdb/client (a file: dependency) and Go for
-  # the end-to-end suite, which runs the generated typed layer against a real Go server.
+  # the end-to-end suite, which runs the generated typed layer against a real Go server. It builds
+  # the client itself, so it does not wait for ts-client.
   ts-codegen:
     runs-on: ubuntu-latest
-    needs: [ts-client]
     defaults:
       run:
         working-directory: packages/kdb-codegen
@@ -201,9 +290,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: ts-codegen
       - name: Build @kdb/client
         run: cd ../kdb-client && npm ci && npm run build
       - name: Install
@@ -212,12 +302,16 @@ jobs:
         run: npm run typecheck
       - name: Test
         run: npm test
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
   # @kdb/embed (Component 63 phase 3): the Go engine compiled to WebAssembly, tested in Node against
   # the same typed suite and differentially against a real Go server.
   ts-embed:
     runs-on: ubuntu-latest
-    needs: [ts-client, ts-codegen]
     defaults:
       run:
         working-directory: packages/kdb-embed
@@ -226,9 +320,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: ts-embed
       - name: Build @kdb/client and @kdb/codegen
         run: |
           (cd ../kdb-client && npm ci && npm run build)
@@ -239,12 +334,16 @@ jobs:
         run: npm test
       - name: Typecheck
         run: npm run typecheck
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
   # @kdb/replica (docs/kdb-client-replica-plan.md): a native TS replica. Its commit codec and trie
   # must be byte-identical to Go's, so the golden vectors are regenerated and diffed like the client's.
   ts-replica:
     runs-on: ubuntu-latest
-    needs: [ts-client]
     defaults:
       run:
         working-directory: packages/kdb-replica
@@ -253,9 +352,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: ts-replica
       # The replica reuses @kdb/client's framing and transports (a file: dependency).
       - name: Build @kdb/client
         run: cd ../kdb-client && npm ci && npm run build
@@ -278,20 +378,27 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
   go-interop:
     runs-on: ubuntu-latest
-    needs: [integration, go-test]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-          cache: gradle
-      - uses: actions/setup-go@v5
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Use the Gradle build cache
+        run: printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: go-interop
       - name: Start JVM kdb-service (SQL wire over WebSocket)
         run: |
           ./gradlew :kdb-service:runService --no-daemon \
@@ -342,6 +449,11 @@ jobs:
           name: kdb-service-interop-log
           path: /tmp/kdb-service.log
           if-no-files-found: ignore
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
   # gomobile packaging (docs/kdb-distributed-implementation-plan.md Phase 16.8): an app embeds KDB's
   # sync node through a small gomobile-shaped facade (go/mobile/kdbsync) - binding go/kdb/embed
@@ -349,15 +461,15 @@ jobs:
   # sizes go to the job summary so growth is visible from one PR to the next.
   mobile-android:
     runs-on: ubuntu-latest
-    needs: [go-test]
     defaults:
       run:
         working-directory: go
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: mobile-android
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -379,18 +491,23 @@ jobs:
             echo "| kdbsync.aar | $(stat -c %s "$RUNNER_TEMP/kdbsync.aar") |"
             unzip -l "$RUNNER_TEMP/kdbsync.aar" | awk '/\.so$/ {print "| " $4 " (uncompressed) | " $1 " |"}'
           } >> "$GITHUB_STEP_SUMMARY"
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
   mobile-ios:
     runs-on: macos-latest
-    needs: [go-test]
     defaults:
       run:
         working-directory: go
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: mobile-ios
       - name: Install gomobile and gobind (the module's pinned x/mobile)
         # Both: gomobile shells out to gobind, and without it every bind fails with
         # "gobind was not found. Please run gomobile init before trying again".
@@ -407,15 +524,26 @@ jobs:
               echo "| $(basename "$(dirname "$(dirname "$f")")") | $(stat -f %z "$f") |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
 
+  # The pytest scenarios against the real Go service, dealt round-robin over three jobs
+  # (conftest.py's --shard): server/cluster/destructive; interop/slow/s3 excluded.
   e2e:
     runs-on: ubuntu-latest
-    needs: [go-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: binaries
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -425,9 +553,12 @@ jobs:
           cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
       - name: Install pytest
         run: pip install -q -r kdb-integration/e2e/requirements.txt
-      - name: Run e2e scenarios (server/cluster/destructive; interop/slow/s3 excluded)
+      - name: Install ffmpeg
+        # The attachment tests generate and decode MP4 media (kdb-integration/e2e/media_fixtures.py).
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - name: Run e2e scenarios (shard ${{ matrix.shard }} of 3)
         working-directory: kdb-integration/e2e
-        run: python -m pytest -v
+        run: python -m pytest -v --durations=15 --shard ${{ matrix.shard }}/3
       - name: Upload e2e failure evidence
         # Data directories, every launch's service log and kdb-inspect output, kept by
         # preserve_evidence() when a crash or cluster scenario fails - the only way to examine a
@@ -435,24 +566,23 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-evidence-${{ github.run_attempt }}
+          name: e2e-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
           path: kdb-integration/e2e/evidence/
           if-no-files-found: ignore
           retention-days: 14
 
   e2e-interop:
     runs-on: ubuntu-latest
-    needs: [e2e, kotlin-test]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-          cache: gradle
-      - uses: actions/setup-go@v5
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
+          cache-key: binaries
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -461,7 +591,7 @@ jobs:
           make build-go
           cd go && go build -o bin/kdb-e2e-helper ./cmd/kdb-e2e-helper
       - name: Build JVM CLI classpath
-        run: ./gradlew :kdb-cli:writeCliClasspath :kdb-cli:jar --no-daemon
+        run: ./gradlew :kdb-cli:writeCliClasspath :kdb-cli:jar --build-cache --parallel --no-daemon
       - name: Install pytest
         run: pip install -q -r kdb-integration/e2e/requirements.txt
       - name: Run interop e2e scenarios (differential Go vs JVM CLI)
@@ -469,6 +599,13 @@ jobs:
         env:
           KDB_CLI_CLASSPATH_FILE: ${{ github.workspace }}/kdb-cli/build/cli-classpath.txt
         run: python -m pytest -v -m interop
+      - name: Run the CLI scenarios against the JVM CLI
+        # The e2e job runs these against the Go CLI; with a classpath and no KDB_CLI_BIN they
+        # drive the JVM one, which :kdb-integration:e2ePython used to cover.
+        working-directory: kdb-integration/e2e
+        env:
+          KDB_CLI_CLASSPATH_FILE: ${{ github.workspace }}/kdb-cli/build/cli-classpath.txt
+        run: python -m pytest -v test_cli_*.py
 
   # Both toolchains, because the golden fixtures now run in both directions: Kotlin exports the
   # ones Go checks, Go exports the ones Kotlin checks. Either encoder drifting is a physical
@@ -482,16 +619,17 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-          cache: gradle
-      - uses: actions/setup-go@v5
+      - uses: gradle/actions/setup-gradle@v4
+      - id: go
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go/go.mod
-          cache-dependency-path: go/go.sum
+          cache-key: golden
       - name: Regenerate the Kotlin-side fixtures
+        # --rerun-tasks: the exporters must run, not come from the build cache.
         run: |
           ./gradlew :kdb-integration:test --tests "dev.kdb.integration.ExportGoldenTest" \
                     :kdb-storage-wal:jvmTest :kdb-storage-sstable:jvmTest \
-                    :kdb-storage-delta:jvmTest :kdb-compression:jvmTest --rerun-tasks --no-daemon
+                    :kdb-storage-delta:jvmTest :kdb-compression:jvmTest --rerun-tasks --parallel --no-daemon
       # This both regenerates the Go-side fixtures and verifies each side against the other's,
       # so a genuine incompatibility fails here as a test failure rather than only as drift.
       - name: Regenerate the Go-side fixtures and run the conformance suite
@@ -512,3 +650,9 @@ jobs:
             echo "$untracked"
             exit 1
           fi
+      - if: env.SAVE_GO_CACHE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go.outputs.paths }}
+          key: ${{ steps.go.outputs.key }}
+

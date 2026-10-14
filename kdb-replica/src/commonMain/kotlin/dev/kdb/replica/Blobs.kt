@@ -1,6 +1,9 @@
 package dev.kdb.replica
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbTimestamp
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import dev.kdb.document.ATTACHMENT_CHUNK_BYTES
 import dev.kdb.document.attachmentContentHash
 import dev.kdb.document.attachmentIdentity
@@ -19,7 +22,34 @@ internal data class BlobMeta(
     val have: List<Long> = emptyList(),
     /** Written here and not yet confirmed by the host. */
     val pinned: Boolean = false,
+    /** When the blob was last written or read here (ms since the epoch), for eviction. */
+    val used: Long = 0,
 )
+
+/** What the blob cache holds. */
+public data class BlobCacheStats(
+    /** Bytes of every blob held, pinned or not. */
+    val bytes: Long,
+    val blobs: Int,
+    /** Bytes of pinned blobs: written here, not yet uploaded - never evicted. */
+    val pinnedBytes: Long,
+    /** The bound on unpinned bytes; 0 for none. */
+    val limit: Long,
+)
+
+/** Default bound on the bytes of fetched attachments kept. */
+public const val DEFAULT_BLOB_CACHE_BYTES: Long = 256L shl 20
+
+/** A read refreshes a blob's recency at most this often, so reading is not a write each time. */
+private const val TOUCH_EVERY_MS = 60_000L
+
+private fun nowMs(): Long = KdbTimestamp.now().epochMillis
+
+/** The bytes a blob's held chunks take (every chunk is 1 MiB but the last). */
+private fun heldBytes(m: BlobMeta): Long {
+    val n = chunkCount(m.size)
+    return m.have.sumOf { i -> if (i == n - 1) m.size - i * ATTACHMENT_CHUNK_BYTES else ATTACHMENT_CHUNK_BYTES.toLong() }
+}
 
 internal fun chunkCount(size: Long): Long = maxOf(1L, (size + ATTACHMENT_CHUNK_BYTES - 1) / ATTACHMENT_CHUNK_BYTES)
 
@@ -29,8 +59,17 @@ internal fun chunkCount(size: Long): Long = maxOf(1L, (size + ATTACHMENT_CHUNK_B
  * with its RFC 6962 audit path - and kept by content hash in 1 MiB chunks, so a blob shared by
  * several attachments is stored once and an interrupted read resumes. A blob the replica wrote is
  * pinned until the host holds it. The store layout is the TS replica's (`bm/<hash>`, `b/<hash>/<i>`).
+ *
+ * Fetched bytes are a cache, not the replica's data: the host keeps every blob a commit references,
+ * so what is evicted here is fetched again on the next read. The cache is bounded by bytes
+ * ([cacheBytes]; 0 for no bound) and evicts the least recently used blobs first - never a pinned
+ * one, whose bytes exist nowhere else yet. It is trimmed after every fetch and every unpin, and on
+ * demand ([evict]).
  */
-public class BlobStore(private val store: ReplicaStore) {
+public class BlobStore(private val store: ReplicaStore, cacheBytes: Long = DEFAULT_BLOB_CACHE_BYTES) {
+    private val limit = maxOf(0L, cacheBytes)
+    private val evicting = Mutex()
+
     private fun metaKey(hash: String) = "bm/$hash"
 
     private fun chunkKey(hash: String, i: Long) = "b/$hash/${i.toString().padStart(8, '0')}"
@@ -55,14 +94,65 @@ public class BlobStore(private val store: ReplicaStore) {
             val from = (i * ATTACHMENT_CHUNK_BYTES).toInt()
             batch[chunkKey(hash, i)] = data.copyOfRange(from, minOf(data.size, from + ATTACHMENT_CHUNK_BYTES))
         }
-        batch[metaKey(hash)] = encodeMeta(BlobMeta(data.size.toLong(), (0 until n).toList(), pinned = true))
+        batch[metaKey(hash)] = encodeMeta(BlobMeta(data.size.toLong(), (0 until n).toList(), pinned = true, used = nowMs()))
         store.apply(batch)
         return hash
     }
 
+    /** The host holds [hash] now: it becomes a cache entry like any fetched blob. */
     public suspend fun unpin(hash: String) {
         val m = meta(hash) ?: return
-        if (m.pinned) store.apply(Batch().apply { put(metaKey(hash), encodeMeta(m.copy(pinned = false))) })
+        if (m.pinned) {
+            store.apply(Batch().apply { put(metaKey(hash), encodeMeta(m.copy(pinned = false, used = nowMs()))) })
+            trim()
+        }
+    }
+
+    private suspend fun metas(): List<Pair<String, BlobMeta>> =
+        store.scan("bm/", prefixEnd("bm/")).map { (k, v) ->
+            k.removePrefix("bm/") to metaJson.decodeFromString(BlobMeta.serializer(), v.decodeToString())
+        }
+
+    /** What the cache holds. */
+    public suspend fun stats(): BlobCacheStats {
+        var bytes = 0L
+        var pinnedBytes = 0L
+        val all = metas()
+        for ((_, m) in all) {
+            val held = heldBytes(m)
+            bytes += held
+            if (m.pinned) pinnedBytes += held
+        }
+        return BlobCacheStats(bytes, all.size, pinnedBytes, limit)
+    }
+
+    /**
+     * Evicts unpinned blobs, least recently used first, until the unpinned bytes are at most [target]
+     * (default: the cache's bound; with no bound, nothing). Returns the bytes freed.
+     */
+    public suspend fun evict(target: Long? = null): Long =
+        evicting.withLock { evictLocked(target ?: if (limit > 0) limit else Long.MAX_VALUE, null) }
+
+    /** Trims to the bound, keeping [keep] - the blob just fetched, which its reader is about to use. */
+    internal suspend fun trim(keep: String? = null): Long =
+        if (limit == 0L) 0L else evicting.withLock { evictLocked(limit, keep) }
+
+    private suspend fun evictLocked(target: Long, keep: String?): Long {
+        val unpinnedMetas = metas().filter { !it.second.pinned }
+        var unpinned = unpinnedMetas.sumOf { heldBytes(it.second) }
+        if (unpinned <= target) return 0L
+        var freed = 0L
+        for ((hash, m) in unpinnedMetas.filter { it.first != keep }.sortedBy { it.second.used }) {
+            if (unpinned <= target) break
+            val batch = Batch()
+            batch[metaKey(hash)] = null
+            for (i in m.have) batch[chunkKey(hash, i)] = null
+            store.apply(batch)
+            val n = heldBytes(m)
+            unpinned -= n
+            freed += n
+        }
+        return freed
     }
 
     internal suspend fun chunk(hash: String, i: Long): ByteArray? = store.get(chunkKey(hash, i))
@@ -76,11 +166,13 @@ public class BlobStore(private val store: ReplicaStore) {
         val out = ByteArray(m.size.toInt())
         var off = 0
         for (i in 0 until n) {
-            val c = chunk(hash, i) ?: return null
+            val c = chunk(hash, i) ?: return null // evicted under the read: the caller fetches it again
             c.copyInto(out, off)
             off += c.size
         }
         if (off.toLong() != m.size) throw BlobUnavailableException("kdb replica: blob $hash is held damaged")
+        val now = nowMs()
+        if (!m.pinned && now - m.used > TOUCH_EVERY_MS) store.apply(Batch().apply { put(metaKey(hash), encodeMeta(m.copy(used = now))) })
         return out
     }
 
@@ -144,11 +236,13 @@ public class BlobStore(private val store: ReplicaStore) {
                 batch[chunkKey(hash, proof.leaf)] = data
                 have.add(proof.leaf)
             }
-            meta = meta.copy(size = size, have = have.sorted())
+            meta = meta.copy(size = size, have = have.sorted(), used = nowMs())
             batch[metaKey(hash)] = encodeMeta(meta)
             store.apply(batch)
         }
-        return read(hash) ?: throw BlobUnavailableException("kdb replica: blob $hash is incomplete")
+        val out = read(hash) ?: throw BlobUnavailableException("kdb replica: blob $hash is incomplete")
+        trim(hash)
+        return out
     }
 
     /**

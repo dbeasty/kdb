@@ -47,6 +47,9 @@ public suspend fun commitViaEngine(
             // Component 44: the one place every commit path (SQL wire, embedded JDBC, any
             // future caller) converges, so notifying here is what actually covers all of them.
             runtime.notifyCommit(namespaceId, result.commit)
+            // The commit is durable here (a file runtime's DAG persists it before putCommit
+            // returns), so the blobs it puts need no upload grace any more.
+            runtime.attachmentsCommitted(namespaceId, result.commit)
             result.commit
         }
         is TransactionResult.Conflict ->

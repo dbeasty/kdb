@@ -317,8 +317,10 @@ changed after the first draft of this plan: a record has **several named attachm
   (`attachmentsChanged`, `attachments`), guarded by the hash of the set it replaced (`attachmentsBase`),
   and an attachment-only write keeps the body (`keepBody`). Blobs written here upload on the projection
   session before the PROJECT_WRITE. A refused write puts the source's attachments back with its body.
-- **Not yet:**
-  - evicting fetched blobs: they are kept until the replica is destroyed.
+- **Fetched bytes are a bounded cache** (`blobCacheBytes`, default 256 MiB; 0 keeps everything): the least
+  recently used blobs are evicted past it and fetched again, verified, when read. Bytes written here are
+  pinned until the host holds them and never evicted. `blobCache()` reports usage, `evictBlobs(target)` frees
+  on demand.
 
 **As built in Kotlin (`kdb-replica`, mirroring the TS replica):**
 - Every item above, full and filtered, with the same store layout (`a/`, `t/<ns>%att/`, `bm/`, `b/`). The

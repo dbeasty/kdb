@@ -213,3 +213,54 @@ public fun verifyMerkleInclusion(
     }
     return sn == 0L && r == tree
 }
+
+/**
+ * Every level of an RFC 6962 tree, so that each audit path costs O(log n) rather than the O(n) of
+ * [merkleInclusionProof] (Go's document.MerkleTree). Built bottom up, a level's unpaired last node
+ * is carried up unchanged, which gives the same tree as RFC 6962's split at the largest power of two
+ * below n. No leaves: the tree of one empty chunk.
+ */
+public class MerkleTree(
+    leaves: List<KdbHash>,
+) {
+    private val levels: List<List<KdbHash>> // levels[0] the leaves, the last level the root alone
+
+    init {
+        val all = ArrayList<List<KdbHash>>()
+        var level: List<KdbHash> = if (leaves.isEmpty()) listOf(chunkLeafHash(ByteArray(0))) else leaves.toList()
+        all.add(level)
+        while (level.size > 1) {
+            val next = ArrayList<KdbHash>((level.size + 1) / 2)
+            for (i in 0 until (level.size + 1) / 2) {
+                next.add(if (2 * i + 1 < level.size) merkleNode(level[2 * i], level[2 * i + 1]) else level[2 * i])
+            }
+            all.add(next)
+            level = next
+        }
+        levels = all
+    }
+
+    /** The tree's leaf count. */
+    public val leaves: Int get() = levels[0].size
+
+    /** The tree hash. */
+    public fun root(): KdbHash = levels[levels.size - 1][0]
+
+    /** Leaf [index]'s audit path, bottom up, as [merkleInclusionProof] gives it. */
+    public fun proof(index: Int): List<KdbHash> {
+        val path = ArrayList<KdbHash>()
+        var i = index
+        for (l in 0 until levels.size - 1) {
+            val level = levels[l]
+            val sib = i xor 1
+            if (sib < level.size) path.add(level[sib])
+            i = i shr 1
+        }
+        return path
+    }
+}
+
+/** How many scheme-1 chunks, so leaves, an attachment of [size] bytes has: a zero-byte attachment
+ * has one, of the empty chunk. */
+public fun attachmentChunkCount(size: Long): Long =
+    if (size <= 0) 1 else (size + ATTACHMENT_CHUNK_BYTES - 1) / ATTACHMENT_CHUNK_BYTES

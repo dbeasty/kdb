@@ -20,6 +20,12 @@ import { uuidFromBytes, uuidToBytes } from "./uuid.ts";
 
 /** The wire feature: the peer speaks these messages, CellKindBytes and $bytes/$attachment params. */
 export const WIRE_FEATURE_ATTACHMENTS = "attachments";
+/**
+ * The wire feature: the peer answers an ATTACHMENT_GET with `proofs` set with chunk-aligned pages
+ * carrying each chunk's RFC 6962 audit path, so a range can be verified without reading the rest.
+ * Only meaningful with WIRE_FEATURE_ATTACHMENTS.
+ */
+export const WIRE_FEATURE_ATTACHMENT_PROOFS = "attachment-proofs";
 
 /** Scheme 1's chunk size, and the size of every upload chunk this client sends. */
 export const ATTACHMENT_CHUNK_BYTES = 1 << 20;
@@ -71,6 +77,17 @@ export interface AttachmentGetDto {
   maxBytes?: number;
   readId?: string;
   close?: boolean;
+  /**
+   * Ask for verifiable pages (WIRE_FEATURE_ATTACHMENT_PROOFS): the server rounds the offset down
+   * and the page end up to 1 MiB chunk boundaries and proves each chunk.
+   */
+  proofs?: boolean;
+}
+
+/** One chunk's inclusion proof: its leaf index and audit path (hex hashes, bottom up). */
+export interface ChunkProofDto {
+  leaf: number;
+  path: string[];
 }
 
 export interface AttachmentDataDto {
@@ -85,6 +102,12 @@ export interface AttachmentDataDto {
   superseded: boolean;
   error: string;
   errorCode: string;
+  /** Answering a get with proofs: the blob's Merkle tree hash, hex ("" when absent). */
+  tree: string;
+  /** Answering a get with proofs: one proof per whole chunk the page carries. */
+  chunks: ChunkProofDto[];
+  /** Answering a get with proofs: the content hash's scheme (1). */
+  scheme: number;
 }
 
 export interface AttachmentListDto {
@@ -159,6 +182,20 @@ function infoField(w: Writer, field: number, info: unknown): void {
   w.bytesField(field, sub.finish());
 }
 
+/** One nested field per chunk proof: 1 the leaf (omitted when 0), 2 each path hash's 32 raw bytes. */
+function proofFields(w: Writer, field: number, chunks: unknown): void {
+  for (const c of (chunks as ChunkProofDto[] | undefined) ?? []) {
+    const sub = new Writer();
+    sub.int(1, c.leaf);
+    for (const h of c.path) {
+      const b = fromHex(h);
+      if (b.length !== 32) throw new KdbProtocolError(`kdb: proof hash is not 32 bytes: ${h}`);
+      sub.bytesField(2, b);
+    }
+    w.bytesField(field, sub.finish());
+  }
+}
+
 /** Encodes an attachment message's binary body; undefined for any other kind. */
 export function encodeAttachmentBody(kind: MessageKind, payload: unknown): Uint8Array | undefined {
   const p = (payload ?? {}) as Dto;
@@ -191,6 +228,7 @@ export function encodeAttachmentBody(kind: MessageKind, payload: unknown): Uint8
       w.int(8, n(p.maxBytes));
       w.string(9, s(p.readId));
       w.bool(10, p.close === true);
+      w.bool(11, p.proofs === true);
       break;
     case "attachmentData":
       w.string(1, s(p.namespace));
@@ -203,6 +241,9 @@ export function encodeAttachmentBody(kind: MessageKind, payload: unknown): Uint8
       w.bool(8, p.eof === true);
       w.bool(9, p.superseded === true);
       errFields(w, 10, p);
+      hashField(w, 12, p.tree);
+      proofFields(w, 13, p.chunks);
+      w.int(14, n(p.scheme));
       break;
     case "attachmentList":
       w.string(1, s(p.namespace));
@@ -264,6 +305,21 @@ function readInfo(r: Reader, wt: number): AttachmentInfoDto {
   return info;
 }
 
+function readProof(r: Reader, wt: number): ChunkProofDto {
+  const sub = new Reader(r.bytes(wt));
+  const proof: ChunkProofDto = { leaf: 0, path: [] };
+  while (!sub.done) {
+    const { field, wireType } = sub.next();
+    if (field === 1) proof.leaf = sub.int(wireType);
+    else if (field === 2) {
+      const b = sub.bytes(wireType);
+      if (b.length !== 32) throw malformed("proof hash is not 32 bytes");
+      proof.path.push(toHex(b));
+    } else sub.skip(wireType);
+  }
+  return proof;
+}
+
 type FieldReader = (r: Reader, wt: number, p: Dto) => void;
 const str = (key: string): FieldReader => (r, wt, p) => { p[key] = r.string(wt); };
 const int = (key: string): FieldReader => (r, wt, p) => { p[key] = r.int(wt); };
@@ -273,6 +329,7 @@ const uuid = (key: string): FieldReader => (r, wt, p) => { p[key] = readUuid(r, 
 const hash = (key: string): FieldReader => (r, wt, p) => { p[key] = readHash(r, wt); };
 const info = (key: string): FieldReader => (r, wt, p) => { p[key] = readInfo(r, wt); };
 const infoList = (key: string): FieldReader => (r, wt, p) => { (p[key] as AttachmentInfoDto[]).push(readInfo(r, wt)); };
+const proofList = (key: string): FieldReader => (r, wt, p) => { (p[key] as ChunkProofDto[]).push(readProof(r, wt)); };
 
 const emptyInfo = (): AttachmentInfoDto => ({ id: "", name: "", hash: "", size: 0, mime: "" });
 
@@ -293,21 +350,23 @@ const SCHEMAS: Record<string, { fields: Record<number, FieldReader>; zero: () =>
     fields: {
       1: str("namespace"), 2: str("sessionId"), 3: uuid("docId"), 4: uuid("attachmentId"), 5: str("name"),
       6: str("asOfHex"), 7: int("offset"), 8: int("maxBytes"), 9: str("readId"), 10: bool("close"),
+      11: bool("proofs"),
     },
     zero: () => ({
       namespace: "", sessionId: "", docId: "", attachmentId: "", name: "", asOfHex: "", offset: 0,
-      maxBytes: 0, readId: "", close: false,
+      maxBytes: 0, readId: "", close: false, proofs: false,
     }),
   },
   attachmentData: {
     fields: {
       1: str("namespace"), 2: str("readId"), 3: uuid("docId"), 4: info("info"), 5: str("commitHex"),
       6: int("offset"), 7: bytes("data"), 8: bool("eof"), 9: bool("superseded"), 10: str("error"),
-      11: str("errorCode"),
+      11: str("errorCode"), 12: hash("tree"), 13: proofList("chunks"), 14: int("scheme"),
     },
     zero: () => ({
       namespace: "", readId: "", docId: "", info: emptyInfo(), commitHex: "", offset: 0,
       data: new Uint8Array(0), eof: false, superseded: false, error: "", errorCode: "",
+      tree: "", chunks: [], scheme: 0,
     }),
   },
   attachmentList: {
@@ -463,4 +522,125 @@ export async function attachmentContentHash(data: Uint8Array): Promise<string> {
   const h = new AttachmentHasher();
   await h.update(data);
   return h.digest();
+}
+
+// --- Merkle proofs (scheme 1, RFC 6962) -------------------------------------------------------
+
+/** A chunk's leaf hash: SHA-256(0x00 || chunk). */
+export function chunkLeafHash(chunk: Uint8Array): Promise<Uint8Array> {
+  return sha256([LEAF, chunk]);
+}
+
+/** An inner node's hash: SHA-256(0x01 || left || right). */
+export function merkleNodeHash(left: Uint8Array, right: Uint8Array): Promise<Uint8Array> {
+  return sha256([NODE, left, right]);
+}
+
+/** The scheme-1 content hash (lowercase hex) of a blob of `size` bytes whose Merkle tree hash is `tree`. */
+export async function attachmentIdentity(tree: Uint8Array, size: number): Promise<string> {
+  const be = new Uint8Array(8);
+  new DataView(be.buffer).setBigUint64(0, BigInt(size), false);
+  return toHex(await sha256([IDENTITY, be, tree]));
+}
+
+/** How many scheme-1 chunks (so leaves) a blob of `size` bytes has: a zero-byte blob has one, empty. */
+export function attachmentChunkCount(size: number): number {
+  return size <= 0 ? 1 : Math.ceil(size / ATTACHMENT_CHUNK_BYTES);
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Checks that `leaf` is leaf `index` of a tree of `n` leaves whose hash is `tree`, given its audit
+ * path (sibling hashes, bottom up) - RFC 6962 §2.1.1, as go/kdb/document.VerifyMerkleInclusion.
+ */
+export async function verifyMerkleInclusion(
+  leaf: Uint8Array,
+  index: number,
+  n: number,
+  proof: readonly Uint8Array[],
+  tree: Uint8Array,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(index) || index < 0 || index >= n) return false;
+  // Plain arithmetic rather than bitwise operators, which would truncate past 2^31 leaves.
+  let fn = index;
+  let sn = n - 1;
+  let r = leaf;
+  for (const p of proof) {
+    if (sn === 0) return false;
+    if (fn % 2 === 1 || fn === sn) {
+      r = await merkleNodeHash(p, r);
+      while (fn % 2 === 0 && fn !== 0) {
+        fn = Math.floor(fn / 2);
+        sn = Math.floor(sn / 2);
+      }
+    } else {
+      r = await merkleNodeHash(r, p);
+    }
+    fn = Math.floor(fn / 2);
+    sn = Math.floor(sn / 2);
+  }
+  return sn === 0 && sameBytes(r, tree);
+}
+
+/**
+ * Every level of an RFC 6962 tree, so each audit path is O(log n) (go/kdb/document.MerkleTree).
+ * Built bottom up: a level's unpaired last node is carried up unchanged, which gives the same tree
+ * as RFC 6962's split at the largest power of two below n.
+ */
+export class MerkleTree {
+  readonly #levels: Uint8Array[][];
+
+  private constructor(levels: Uint8Array[][]) {
+    this.#levels = levels;
+  }
+
+  /** The tree over `leaves` (none: the tree of one empty chunk). */
+  static async build(leaves: readonly Uint8Array[]): Promise<MerkleTree> {
+    let level = leaves.length > 0 ? [...leaves] : [await chunkLeafHash(new Uint8Array(0))];
+    const levels = [level];
+    while (level.length > 1) {
+      const next: Uint8Array[] = [];
+      for (let i = 0; i < level.length; i += 2) {
+        next.push(i + 1 < level.length ? await merkleNodeHash(level[i]!, level[i + 1]!) : level[i]!);
+      }
+      levels.push(next);
+      level = next;
+    }
+    return new MerkleTree(levels);
+  }
+
+  /** The leaf hashes of a blob held in memory, cut into 1 MiB chunks. */
+  static async leavesOf(data: Uint8Array): Promise<Uint8Array[]> {
+    const leaves: Uint8Array[] = [];
+    for (let off = 0; off < data.length || off === 0; off += ATTACHMENT_CHUNK_BYTES) {
+      leaves.push(await chunkLeafHash(data.subarray(off, off + ATTACHMENT_CHUNK_BYTES)));
+      if (off + ATTACHMENT_CHUNK_BYTES >= data.length) break;
+    }
+    return leaves;
+  }
+
+  get leafCount(): number {
+    return this.#levels[0]!.length;
+  }
+
+  /** The tree hash. */
+  get root(): Uint8Array {
+    return this.#levels.at(-1)![0]!;
+  }
+
+  /** Leaf `index`'s audit path, bottom up. */
+  proof(index: number): Uint8Array[] {
+    const path: Uint8Array[] = [];
+    for (const level of this.#levels.slice(0, -1)) {
+      const sib = index % 2 === 0 ? index + 1 : index - 1;
+      if (sib < level.length) path.push(level[sib]!);
+      index = Math.floor(index / 2);
+    }
+    return path;
+  }
 }

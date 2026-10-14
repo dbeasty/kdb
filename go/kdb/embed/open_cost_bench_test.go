@@ -78,6 +78,9 @@ func dataDirBytes(tb testing.TB, root string) int64 {
 // bounds that Track A exists to hold; the numbers themselves are logged so
 // a regression shows its shape, not just a failure.
 func TestOpenCostOfGrowingDocument(t *testing.T) {
+	if testing.Short() {
+		t.Skip("open-cost measurement; runs nightly, or without -short")
+	}
 	for _, pad := range []int{0, 3000} {
 		t.Run(fmt.Sprintf("pad%d", pad), func(t *testing.T) {
 			root, finalDoc := growingDocumentStore(t, 463, pad)

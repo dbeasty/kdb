@@ -52,6 +52,9 @@ func treeDocID(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d
 // reopened by mapping the segment the checkpoint tagged (no build), every document reading back
 // as written - and the same data reopened with tree.file off reads the same.
 func TestTreeFileLifecycleThroughRuntime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heavy: minutes under -race on a CI runner; runs nightly, or without -short")
+	}
 	skipIfNoMmap(t)
 	root := t.TempDir()
 	const ns = "test/treefile"
@@ -199,6 +202,9 @@ func TestTreeFileReadOnlyMapsWithoutWriting(t *testing.T) {
 // through many compactions only the newest chain stays - while every historical tree the store
 // holds still reads as it did.
 func TestTreeFileHistoryDoesNotPinSegments(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heavy: minutes under -race on a CI runner; runs nightly, or without -short")
+	}
 	skipIfNoMmap(t)
 	root := t.TempDir()
 	const ns = "test/treefile-history"
@@ -250,6 +256,9 @@ func TestTreeFileHistoryDoesNotPinSegments(t *testing.T) {
 // A closed namespace with a paged tree leaves nothing behind in the heap: no path from the
 // tree file's callbacks or the segments' cleanups keeps the engine or the tree alive.
 func TestTreeFileClosedNamespaceIsCollected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heap measurement over many segments; runs nightly, or without -short")
+	}
 	skipIfNoMmap(t)
 	root := t.TempDir()
 	const ns = "test/treefile-closed"

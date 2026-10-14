@@ -83,6 +83,51 @@ class LiveAttachmentsTest {
     // --- full mode -----------------------------------------------------------------------------
 
     @Test
+    fun fetchedBytesAreABoundedCacheAndPinnedBytesStay() =
+        runBlocking {
+            val h = host()
+            val ns = "app/u/kt-evict"
+            val mib = 1L shl 20
+            val docs = List(3) { randomUuid() }
+            val texts = docs.indices.map { i -> ('a' + i).toString().repeat((3 * mib).toInt()) }
+            for ((i, id) in docs.withIndex()) {
+                h.put(ns, id, """{"i":$i}""")
+                h.attach(ns, id, "f.txt", texts[i])
+            }
+            suspend fun open(autoSync: Boolean = false) =
+                Replica.open(
+                    ReplicaOptions(
+                        store = MemoryReplicaStore(), url = h.url, namespaces = listOf(NamespaceSpec.Full(ns)),
+                        token = "rw-token", autoSync = autoSync, blobCacheBytes = 7 * mib,
+                    ),
+                ).also { opened += it }
+            val r = open()
+            r.syncNow()
+            suspend fun read(i: Int) = r.readAttachment(ns, docs[i], name = "f.txt").decodeToString()
+            assertEquals(texts[0], read(0))
+            assertEquals(texts[1], read(1))
+            assertEquals(6 * mib, r.blobCache().bytes)
+            assertEquals(texts[2], read(2)) // 9 MiB fetched: the least recently used goes
+            val stats = r.blobCache()
+            assertTrue(stats.bytes <= 7 * mib, "cache holds ${stats.bytes} bytes, over its bound")
+            assertEquals(2, stats.blobs)
+            assertEquals(texts[0], read(0), "an evicted blob is fetched again, verified, on read")
+
+            // Bytes written here and not yet uploaded are never evicted; once the host holds them they are.
+            val mine = ByteArray((2 * mib).toInt()) { 7 }
+            val local = open()
+            local.syncNow()
+            local.putAttachment(ns, docs[0], "mine.bin", mine)
+            assertEquals(0L, local.evictBlobs(0))
+            assertEquals(2 * mib, local.blobCache().pinnedBytes)
+            local.syncNow() // uploads, then unpins
+            assertEquals(0L, local.blobCache().pinnedBytes)
+            assertEquals(2 * mib, local.evictBlobs(0))
+            assertEquals(0L, local.blobCache().bytes)
+            assertContentEquals(mine, local.readAttachment(ns, docs[0], name = "mine.bin"), "fetched back from the host")
+        }
+
+    @Test
     fun attachmentRefsReplayWithTheirCommitsAndEveryRootIsVerified() =
         runBlocking {
             val h = host()

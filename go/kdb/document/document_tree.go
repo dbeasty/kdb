@@ -219,8 +219,12 @@ func (t DocumentTree) WritePacked(w io.Writer) (int64, error) {
 		return int64(n), err
 	}
 	const flushAt = 64 << 10
+	// A whole-tree walk touches every page of a mapped tree's segments: let the ones behind it go
+	// as it goes, so a checkpoint's walk of a 10M-document tree does not hold ~900 MB resident at
+	// its end. Pages it comes back to fault in again.
+	const dropEvery = 64 << 20
 	buf := make([]byte, 0, flushAt+PackedTreeEntrySize)
-	var written int64
+	var written, sinceDrop int64
 	var werr error
 	t.Walk(func(id codec.UUID, h codec.Hash) bool {
 		buf = id.AppendBytes(buf)
@@ -228,11 +232,16 @@ func (t DocumentTree) WritePacked(w io.Writer) (int64, error) {
 		if len(buf) >= flushAt {
 			n, err := w.Write(buf)
 			written += int64(n)
+			sinceDrop += int64(n)
 			if err != nil {
 				werr = err
 				return false
 			}
 			buf = buf[:0]
+			if sinceDrop >= dropEvery {
+				t.DropMappedPages()
+				sinceDrop = 0
+			}
 		}
 		return true
 	})

@@ -66,7 +66,11 @@ func sideEnv(s side, ns string) IngestEnv {
 // and for arbitrary cursors, including ones that are not a canonical id (which fall back to the
 // original algorithm).
 func TestSnapshotPagesMatchScan(t *testing.T) {
-	for _, n := range []int{0, 1, 7, 300, 2_500} {
+	sizes := []int{0, 1, 7, 300, 2_500}
+	if testing.Short() {
+		sizes = sizes[:4] // 2,500 runs nightly, or without -short
+	}
+	for _, n := range sizes {
 		ns := fmt.Sprintf("app/snap-pages-%d", n)
 		s := newSide(t, ns)
 		var at codec.Hash
@@ -164,6 +168,9 @@ func pageAllocBytes(t *testing.T, env IngestEnv, at codec.Hash, page func(after 
 // namespace. The original pager is measured alongside to show the test can tell the difference:
 // it collected and sorted every id after the cursor, per page.
 func TestSnapshotPageCostIsThePage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocation measurement over a 40,000-document namespace; runs nightly, or without -short")
+	}
 	type cost struct{ seek, scan uint64 }
 	var costs []cost
 	for _, n := range []int{4_000, 40_000} {
