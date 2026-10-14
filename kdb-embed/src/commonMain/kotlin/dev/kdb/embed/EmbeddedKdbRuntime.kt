@@ -55,6 +55,14 @@ public class EmbeddedKdbRuntime(
     /** Attachment stores and settings (EmbedAttachments.kt). */
     internal val attachments: AttachmentState = AttachmentState()
 
+    /** Makes a snapshot install durable before it is applied (EmbedSnapshot.kt): a file runtime
+     * sets it; a memory runtime keeps none. */
+    public var snapshotPersistence: SnapshotPersistence? = null
+
+    /** Commits this runtime holds without their parents - roots of snapshots it was bootstrapped
+     * from - by namespace. A file runtime fills it from the namespace marker at open. */
+    public val shallowRoots: MutableMap<String, MutableSet<KdbHash>> = mutableMapOf()
+
     // Component 44 (Layer 12): a single hook point every commit path shares -
     // EmbedWrites.commitViaEngine notifies through this after every successful commit,
     // regardless of whether the caller is kdb-server's KdbServerRuntime.commit() (the SQL wire
