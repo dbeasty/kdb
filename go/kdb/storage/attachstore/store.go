@@ -38,11 +38,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -57,8 +59,26 @@ var ErrNotFound = errors.New("attachstore: blob not found")
 // ErrTooLarge reports an upload past Config.MaxBytes.
 var ErrTooLarge = errors.New("attachstore: attachment exceeds the size limit")
 
-// ErrCorrupt reports stored bytes that do not hash to what they are stored under.
+// ErrCorrupt reports stored bytes that do not hash to what they are stored under: this node's copy
+// is damaged. Servers send it as wire.ErrorCodeIntegrity, so a reader can go to another replica.
 var ErrCorrupt = errors.New("attachstore: stored bytes do not match their content hash")
+
+var corruptReads atomic.Int64
+
+// CorruptReads is how many reads ReportCorrupt has seen fail with ErrCorrupt, process-wide.
+func CorruptReads() int64 { return corruptReads.Load() }
+
+// ReportCorrupt logs err at error level with attrs (slog key/value pairs naming what was read) and
+// counts it in CorruptReads if it is ErrCorrupt, and reports whether it was. Whoever turns a read's
+// error into a reply calls it, so damaged bytes are seen by an operator, not just by the client.
+func ReportCorrupt(err error, attrs ...any) bool {
+	if !errors.Is(err, ErrCorrupt) {
+		return false
+	}
+	corruptReads.Add(1)
+	slog.Error("kdb: stored attachment bytes are corrupt", append(attrs, "err", err)...)
+	return true
+}
 
 // ErrReadLeaseExpired reports a read that outlived its lease (Config.ReadLease) and was released.
 var ErrReadLeaseExpired = errors.New("attachstore: read lease expired")

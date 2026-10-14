@@ -155,6 +155,26 @@ class AttachmentWireTest {
     }
 
     @Test
+    fun integrityRefusalsRoundTrip() {
+        // A server refusing its damaged stored copy (Go: attachstore.ErrCorrupt -> INTEGRITY), on a
+        // read page and on a BLOB_FETCH entry: the code survives the binary frame, as a string.
+        val codec = defaultWireCodec().withWireFeatures(SUPPORTED_WIRE_FEATURES)
+        val msg = "attachstore: stored bytes do not match their content hash: chunk 2 of ab"
+        val data = WireMessage.AttachmentData(h(3, WireMessageType.ATTACHMENT_DATA), "ns", "r1", error = msg, errorCode = "INTEGRITY")
+        val back = codec.decode(codec.encode(data)) as WireMessage.AttachmentData
+        assertEquals("INTEGRITY", back.errorCode)
+        assertEquals(msg, back.error)
+        val fetch =
+            WireMessage.BlobFetchResult(
+                h(4, WireMessageType.BLOB_FETCH_RESULT), "ns",
+                listOf(WireBlobFetchPart(index = 0, hash = repeatHash(1), error = msg, errorCode = "INTEGRITY")),
+            )
+        val part = (codec.decode(codec.encode(fetch)) as WireMessage.BlobFetchResult).parts.single()
+        assertEquals("INTEGRITY", part.errorCode)
+        assertEquals(msg, part.error)
+    }
+
+    @Test
     fun malformedUuidIsADecodeError() {
         // ATTACHMENT_LIST with a 2-byte docId (field 3).
         val body = hex("02" + "1a020102")

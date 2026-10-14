@@ -15,6 +15,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/metrics"
 	"github.com/limidus/kdb/go/kdb/storage"
+	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 	"github.com/limidus/kdb/go/kdb/version"
 )
@@ -338,6 +339,8 @@ func (a *AdminServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		draining = 1
 	}
 	fmt.Fprintf(&b, "# HELP kdb_draining Whether the runtime is refusing new writes for shutdown.\n# TYPE kdb_draining gauge\nkdb_draining %d\n", draining)
+
+	fmt.Fprintf(&b, "# HELP kdb_attachment_corrupt_reads_total Attachment reads refused because the stored bytes no longer match their content hash.\n# TYPE kdb_attachment_corrupt_reads_total counter\nkdb_attachment_corrupt_reads_total %d\n", attachstore.CorruptReads())
 
 	a.writeGovernanceMetrics(&b)
 	a.writeNamespaceMetrics(&b)

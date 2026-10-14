@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/limidus/kdb/go/kdb/sql"
+	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
@@ -14,6 +15,10 @@ import (
 // special-case for other reasons but which still deserve a code here for a client that only
 // looks at ErrorCode).
 func classifyError(err error) (wire.ErrorCode, *int) {
+	if errors.Is(err, attachstore.ErrCorrupt) {
+		// This node's stored copy is damaged: no retry here helps, another replica might.
+		return wire.ErrorCodeIntegrity, nil
+	}
 	var busy *BusyError
 	if errors.As(err, &busy) {
 		ms := int(busy.RetryAfter().Milliseconds())
