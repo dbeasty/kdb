@@ -273,6 +273,36 @@ func TestRunsReopenInTheOrderTheyWereWritten(t *testing.T) {
 	}
 }
 
+// Ages never tie, however coarse the clock: Windows' reads the same time for consecutive flushes,
+// and two tables of one age sort by their random UUIDs.
+func TestAgesAreStrictlyIncreasing(t *testing.T) {
+	prev := nextAge()
+	for i := 0; i < 10000; i++ {
+		age := nextAge()
+		if age <= prev {
+			t.Fatalf("age %s after %s", age, prev)
+		}
+		prev = age
+	}
+}
+
+// A table found on disk with an age ahead of the clock - written before the clock stepped back -
+// still sorts before every table written after it.
+func TestAgesFollowTheNewestTableFound(t *testing.T) {
+	ahead := time.Now().Add(time.Hour).UnixNano()
+	noteAge(fmt.Sprintf("ns/app/docs/sstable/L0/%016x-00000000-0000-0000-0000-000000000000", ahead))
+	age, err := strconv.ParseUint(nextAge(), 16, 64)
+	if err != nil || int64(age) <= ahead {
+		t.Fatalf("age %d, %v after a table aged %d", age, err, ahead)
+	}
+	// Kotlin's names, and this package's before ages, carry none; they leave ages alone.
+	before := lastAge.Load()
+	noteAge("ns/app/docs/sstable/L0/00000000-0000-0000-0000-000000000000")
+	if lastAge.Load() != before {
+		t.Fatal("an ageless name moved the ages")
+	}
+}
+
 func (s *LsmBlobStore) searchOrderForTest() []Handle {
 	s.mu.Lock()
 	defer s.mu.Unlock()

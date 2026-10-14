@@ -2,7 +2,9 @@ package sstable
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -163,10 +165,45 @@ func pickMerge(runs []mergeRun, sized bool, trigger int) (lo, hi int, full bool)
 // table holds identically, but not for a tombstone.
 //
 // Tables named before this (a bare UUID) have no age; they count as the oldest, which is what
-// they are, being older than anything this build writes.
+// they are, being older than anything this build writes. Kotlin names its tables that way too.
+//
+// Ages are never equal. Two tables of one age sort by their UUIDs, which is to say at random, and
+// a wall clock alone does not keep ages apart: Windows' ticks are coarse enough that consecutive
+// flushes read the same time, and any clock can step back. So an age is the wall time or one past
+// the last age this process gave out or found on disk (noteAge), whichever is later.
 
-// agePrefix is the age part of a name written at t.
-func agePrefix(t time.Time) string { return fmt.Sprintf("%016x", t.UnixNano()) }
+// lastAge is the newest age this process has given out or seen in a table's name.
+var lastAge atomic.Int64
+
+// nextAge is the age part of a name written now: later than every age before it.
+func nextAge() string {
+	now := time.Now().UnixNano()
+	for {
+		last := lastAge.Load()
+		age := now
+		if age <= last {
+			age = last + 1
+		}
+		if lastAge.CompareAndSwap(last, age) {
+			return fmt.Sprintf("%016x", age)
+		}
+	}
+}
+
+// noteAge makes every later nextAge newer than the table named segmentName, so tables written after
+// a restart sort after those written before it even when the clock has gone back since.
+func noteAge(segmentName string) {
+	age, err := strconv.ParseUint(ageOf(segmentName), 16, 64)
+	if err != nil || int64(age) <= 0 {
+		return
+	}
+	for {
+		last := lastAge.Load()
+		if int64(age) <= last || lastAge.CompareAndSwap(last, int64(age)) {
+			return
+		}
+	}
+}
 
 // ageOf is the age part of a table's name, all zeros for a name without one.
 func ageOf(segmentName string) string {
