@@ -14,7 +14,7 @@
  *   leaf, of the empty chunk.
  */
 
-import { compareBytes, concat, fromHex, fromUtf8, toHex, utf8, uuidBytes } from "./bytes.ts";
+import { compareBytes, concat, fromHex, fromUtf8, toHex, utf8, uuidBytes, uuidString } from "./bytes.ts";
 import type { Op } from "./commit.ts";
 import { sha256 } from "./sha256.ts";
 import type { Batch, KvStore } from "./store.ts";
@@ -154,11 +154,11 @@ interface StoredAttachment {
   mime: string;
 }
 
-function encodeSet(set: readonly Attachment[]): Uint8Array {
+export function encodeAttachmentSet(set: readonly Attachment[]): Uint8Array {
   return utf8(JSON.stringify(set.map((a): StoredAttachment => ({ ...a, size: a.size.toString() }))));
 }
 
-function decodeSet(b: Uint8Array): Attachment[] {
+export function decodeAttachmentSet(b: Uint8Array): Attachment[] {
   return (JSON.parse(fromUtf8(b)) as StoredAttachment[]).map((a) => ({ ...a, size: BigInt(a.size) }));
 }
 
@@ -192,7 +192,7 @@ export class AttachmentEdit {
     let s = this.#sets.get(id);
     if (!s) {
       const b = await this.#store.get(this.#key(id));
-      s = b ? decodeSet(b) : [];
+      s = b ? decodeAttachmentSet(b) : [];
       this.#sets.set(id, s);
     }
     return s;
@@ -224,6 +224,12 @@ export class AttachmentEdit {
     this.#sets.set(docId.toLowerCase(), sortAttachments([...set]));
   }
 
+  /** Every document the store holds a set for: what a whole-table replacement must clear. */
+  async heldDocuments(): Promise<string[]> {
+    const base = `a/${this.#nsKey}/`;
+    return (await this.#store.scan(base, base + "\uffff")).map(([k]) => k.slice(base.length));
+  }
+
   /** The table's root after the edit: undefined when the table is empty, as a commit states it. */
   async finish(): Promise<string | undefined> {
     const trie = new TrieEdit(this.#store, attachmentTrieKey(this.#nsKey));
@@ -239,18 +245,66 @@ export class AttachmentEdit {
   writeTo(batch: Batch): void {
     if (!this.#trie) throw new Error("kdb replica: finish the attachment edit before writing it");
     this.#trie.writeTo(batch);
-    for (const [id, set] of this.#sets) batch.set(this.#key(id), set.length === 0 ? null : encodeSet(set));
+    for (const [id, set] of this.#sets) batch.set(this.#key(id), set.length === 0 ? null : encodeAttachmentSet(set));
   }
 }
 
 /** A document's attachments as the replica holds them. */
 export async function attachmentsOf(store: KvStore, nsKey: string, docId: string): Promise<Attachment[]> {
   const b = await store.get(`a/${nsKey}/${docId.toLowerCase()}`);
-  return b ? decodeSet(b) : [];
+  return b ? decodeAttachmentSet(b) : [];
 }
 
 /** The attachment table's current root, undefined when empty. */
 export async function attachmentRoot(store: KvStore, nsKey: string): Promise<string | undefined> {
   const r = await new TrieReader(store, attachmentTrieKey(nsKey)).rootHash();
   return /^0+$/.test(r) ? undefined : r;
+}
+
+/**
+ * The first attachment table in a packed list (go/kdb/document AppendPackedAttachmentTables), as
+ * a snapshot's last page carries the snapshot commit's: per table `uvarint(entries)`, then per
+ * attachment docId(16) ‖ attachmentId(16) ‖ uvarint(len) name ‖ scheme ‖ contentHash(32) ‖
+ * be64 size ‖ uvarint(len) mime.
+ */
+export function parsePackedAttachmentTable(packed: Uint8Array): Map<string, Attachment[]> {
+  let off = 0;
+  const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
+  const uv = (): number => {
+    let v = 0, mul = 1;
+    for (let i = 0; i < 10; i++) {
+      if (off >= packed.length) throw new AttachmentError("packed attachment tables are truncated");
+      const b = packed[off++]!;
+      v += (b & 0x7f) * mul;
+      if ((b & 0x80) === 0) return v;
+      mul *= 128;
+    }
+    throw new AttachmentError("packed attachment tables: bad varint");
+  };
+  const take = (n: number): Uint8Array => {
+    if (off + n > packed.length) throw new AttachmentError("packed attachment tables are truncated");
+    const b = packed.subarray(off, off + n);
+    off += n;
+    return b;
+  };
+  const out = new Map<string, Attachment[]>();
+  if (packed.length === 0) return out;
+  const tables = uv();
+  if (tables === 0) return out;
+  const entries = uv();
+  for (let i = 0; i < entries; i++) {
+    const doc = uuidString(take(16));
+    const id = uuidString(take(16));
+    const name = fromUtf8(take(uv()));
+    const scheme = take(1)[0]!;
+    const contentHash = toHex(take(32));
+    const size = view.getBigInt64(off);
+    off += 8;
+    const mime = fromUtf8(take(uv()));
+    const list = out.get(doc) ?? [];
+    list.push({ id, name, scheme, contentHash, size, mime });
+    out.set(doc, list);
+  }
+  for (const list of out.values()) sortAttachments(list);
+  return out;
 }

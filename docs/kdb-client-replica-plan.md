@@ -1,8 +1,8 @@
 # Client replica (memory plan Track D)
 
 Status: **design; owner decisions recorded in §10.** Progress: PR 1 (core) #217, PR 2 (full-mode sync) #218 and PR 3 (filtered mode) #219 are merged. The
-rest (browser zstd, REFS_WATCH, the Kotlin engine, attachments) goes in one PR on top of the attachments
-session's BLOB_FETCH PR, as the owner asked on 2026-10-14. Written 2026-10-13 against `origin/main` 0399daf.
+rest (browser zstd, REFS_WATCH, the Kotlin engine, attachments) is one PR on top of the attachments
+session's PR #223, as the owner asked on 2026-10-14. The pager test fix is #222. Written 2026-10-13 against `origin/main` 0399daf.
 No code yet. File references are relative to `go/kdb/` unless they start with a repo-level directory.
 
 Inputs: `kdb-memory-cassandra-plan.md` Track D (fixed constraints), `kdb-distributed-plan.md` §3.11–3.14,
@@ -291,8 +291,31 @@ changed after the first draft of this plan: a record has **several named attachm
   - the tree is RFC 6962 (SHA-256(0x01 ‖ L ‖ R));
   - the identity is SHA-256(0x02 ‖ be64 size ‖ tree);
   - an empty blob is one empty leaf.
-- **Goldens:** `go/kdb/document/attachment_golden_test.go` (ref, set, "hello", commit). Until the attachments PR,
-  the TS decoder refuses commits that carry field 10 or op kinds 5 and 6, rather than misreading them.
+- **Goldens:** `go/kdb/document/attachment_golden_test.go` (ref, set, "hello", commit), plus
+  `packages/kdb-replica/test/golden/attachments.json`, generated from Go's `AttachmentTable` (60 table steps,
+  content hashes up to 5 MiB), and the binary frame goldens in `go/kdb/wire/attachment_ops_test.go`.
+
+**As built in TS (on #223):**
+- **Full mode.**
+  - The replica advertises the `attachments` capability; hosts refuse attachment commits to peers that don't.
+  - Fast-forwards and local commits maintain the table and verify every root.
+  - A snapshot takes the packed table from its last page.
+  - A diff convergence diffs the attachment trie with `TREE_NODES tree:"attachments"` and checks each set
+    against its hash.
+- **Reads** (`readAttachment`) fetch lazily with BLOB_FETCH at the namespace's head commit and verify each chunk's
+  RFC 6962 proof against the part's tree. They keep chunks by content hash in the store, so a read resumes.
+- **Writes** (`putAttachment`, `deleteAttachment`) keep the bytes pinned. A push uploads them with
+  ATTACHMENT_UPLOAD (`expect` first, so a blob the host holds is not resent) before the REF_UPDATE, and unpins
+  them once the push is accepted.
+- **Filtered mode** keeps each written document's attachment set from PROJECT_PAGE and reads bytes at the
+  page's `atHex`.
+- **Not yet:**
+  - writing attachments through write-back: PROJECT_WRITE carries no attachment ops, and the host's write-back
+    takes document writes only;
+  - attachment-only changes on a filtered namespace: they write no document, so they show when the document
+    next changes;
+  - evicting fetched blobs: they are kept until the replica is destroyed;
+  - attachments in the Kotlin replica, which refuses commits carrying them.
 - **Bytes are lazy on the replica.** The replica stores refs and fetches bytes on first read or by a prefetch
   policy, with a blob cache under its own budget. Blobs it wrote and the host has not yet confirmed are pinned.
 - **BLOB_FETCH 0x42/0x43:** each entry is `(docId, attachmentId, commit, hash, offset, maxBytes)`.

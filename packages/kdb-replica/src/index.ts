@@ -62,3 +62,5 @@ export {
   type AttachmentRef,
 } from "./attachments.ts";
 export { AttachmentRootMismatchError } from "./namespace.ts";
+export { BlobStore, BlobUnavailableError } from "./blobs.ts";
+export { parsePackedAttachmentTable } from "./attachments.ts";

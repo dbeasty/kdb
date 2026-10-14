@@ -15,7 +15,7 @@ import { fromHex, fromUtf8, toHex, utf8, uuidBytes, uuidString } from "./bytes.t
 import { buildCommit, contentHash, decodeCommit, genesisCommit, type Commit, type Op } from "./commit.ts";
 import { prefixEnd, type Batch, type KvStore } from "./store.ts";
 import { foldLeaf, TrieEdit, TrieReader } from "./trie.ts";
-import { AttachmentEdit, AttachmentError, attachmentRoot, attachmentsOf, type Attachment } from "./attachments.ts";
+import { AttachmentEdit, AttachmentError, attachmentRoot, attachmentsOf, attachmentTrieKey, type Attachment } from "./attachments.ts";
 
 export class TreeMismatchError extends Error {
   override name = "TreeMismatchError";
@@ -439,6 +439,28 @@ export class ReplicaNamespace {
   }
 
   /**
+   * Sets attachment sets during a convergence: whole replacement (a snapshot's packed table: every
+   * other set goes) or per document (a diff). Unverified until finishConverge, like the pages.
+   */
+  applyConvergeAttachments(sets: Map<string, Attachment[]>, whole: boolean): Promise<void> {
+    return this.#lock.run(async () => {
+      if (!this.#meta.target) throw new Error("kdb replica: not converging");
+      const att = new AttachmentEdit(this.#store, this.key);
+      if (whole) for (const id of await att.heldDocuments()) if (!sets.has(id)) att.set(id, []);
+      for (const [id, set] of sets) att.set(id, set);
+      await att.finish();
+      const batch: Batch = new Map();
+      att.writeTo(batch);
+      await this.#commitMeta(batch, this.#meta);
+    });
+  }
+
+  /** The attachment table's root as the replica holds it now. */
+  attachmentRoot(): Promise<string | undefined> {
+    return attachmentRoot(this.#store, this.key);
+  }
+
+  /**
    * Completes a convergence: the built tree must be the target's. Then the target is the head, a
    * root this replica holds without its history. Throws TreeMismatchError otherwise, and stays
    * converging - a diff against the target's tree then repairs whatever differs.
@@ -486,13 +508,14 @@ export class ReplicaNamespace {
    * The subtree at prefix, as Go's DocumentTree.Node reports it, so a diff against a host's
    * TREE_NODES compares like with like - including for a subtree stored folded into one leaf.
    */
-  async treeNode(prefix: string, entryLimit: number): Promise<TreeNodeView> {
+  async treeNode(prefix: string, entryLimit: number, tree: "documents" | "attachments" = "documents"): Promise<TreeNodeView> {
     const empty: TreeNodeView = { prefix, hash: "", children: [], entries: null };
+    const trie = tree === "documents" ? this.#trie : new TrieReader(this.#store, attachmentTrieKey(this.key));
     let at = "";
-    let rec = await this.#trie.record(at);
+    let rec = await trie.record(at);
     while (rec && !rec.leaf && at.length < prefix.length) {
       at = prefix.slice(0, at.length + 1);
-      rec = await this.#trie.record(at);
+      rec = await trie.record(at);
     }
     if (!rec) return empty;
     const depth = prefix.length;
@@ -519,7 +542,7 @@ export class ReplicaNamespace {
       const found = entries;
       const stop = new Error("stop");
       try {
-        await this.#trie.walk((id, ch) => {
+        await trie.walk((id, ch) => {
           found.set(id, ch);
           if (found.size > entryLimit) throw stop;
         }, prefix);

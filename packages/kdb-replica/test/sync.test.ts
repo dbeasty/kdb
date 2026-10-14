@@ -201,23 +201,62 @@ describe("replica against a Go node", { skip }, () => {
     await host.cmd({ op: "detach", ns, id: doc, name: "b.txt" });
     const [res] = await r.syncNow();
     assert.equal(res!.route, "replay");
-    const atts = await r.namespace(ns).attachments(doc);
+    const atts = await r.attachments(ns, doc);
     assert.deepEqual(atts.map((a) => [a.name, a.mime, a.size]), [["a.txt", "text/plain", 5n]]);
     assert.equal(atts[0]!.contentHash, attachmentContentHash(utf8("hello")));
-    assert.equal((await r.namespace(ns).attachments(other)).length, 1);
+    // Bytes are lazy: the first read fetches them by BLOB_FETCH, verified chunk by chunk.
+    assert.equal(new TextDecoder().decode(await r.readAttachment(ns, doc, { name: "a.txt" })), "hello");
+    assert.equal((await r.attachments(ns, other)).length, 1);
     // A document delete takes its attachments with it, in Go and here.
     await host.cmd({ op: "commit", ns, ops: [{ id: other, delete: true }] });
     await r.syncNow();
-    assert.deepEqual(await r.namespace(ns).attachments(other), []);
+    assert.deepEqual(await r.attachments(ns, other), []);
     assert.equal(r.namespace(ns).head, (await host.head(ns)).head);
-
   });
 
-  // A host merge drops one side's attachment changes: the merge commit carries no attachment ops,
-  // and its attachment root is its first parent's table (reported to the attachments session,
-  // 2026-10-14). The replica's root check catches it - it applies the other side's puts - so this
-  // fails about half the time, by which parent sorts first. todo until the host merges attachments.
-  test("concurrent attachment and document writes merge with both", { todo: "host merges drop one side's attachments" }, async () => {
+  test("a snapshot bootstrap takes the attachment table; reads fetch large blobs in verified chunks", async () => {
+    const ns = "app/u/attach-boot";
+    const doc = randomUuid();
+    await host.put(ns, doc, { title: "big" });
+    const big = "0123456789abcdef".repeat(200_000); // 3.2 MB: four chunks, the last short
+    await host.cmd({ op: "attach", ns, id: doc, name: "big.bin", mime: "application/octet-stream", text: big });
+    await host.cmd({ op: "attach", ns, id: doc, name: "small.txt", mime: "text/plain", text: "tiny" });
+    const r = await replica(ns);
+    const [res] = await r.syncNow();
+    assert.equal(res!.route, "snapshot");
+    const head = await r.namespace(ns).headCommit();
+    assert.ok(head?.attachmentRoot, "the snapshot commit has attachments");
+    assert.equal(await r.namespace(ns).attachmentRoot(), head!.attachmentRoot);
+    assert.deepEqual((await r.attachments(ns, doc)).map((a) => a.name).sort(), ["big.bin", "small.txt"]);
+    const bytes = await r.readAttachment(ns, doc, { name: "big.bin" });
+    assert.equal(bytes.length, big.length);
+    assert.equal(new TextDecoder().decode(bytes), big);
+  });
+
+  test("an attachment written on the replica uploads before its commit, and the host holds it", async () => {
+    const ns = "app/u/attach-up";
+    const doc = randomUuid();
+    await host.put(ns, doc, { title: "upload" });
+    const r = await replica(ns);
+    await r.syncNow();
+    const data = utf8("from the replica ".repeat(100_000)); // 1.7 MB: two chunks
+    const local = await r.putAttachment(ns, doc, "note.txt", data, "text/plain");
+    const [res] = await r.syncNow();
+    assert.equal(res!.pushOutcome, "fast-forwarded");
+    assert.equal((await host.head(ns)).head, local);
+    const listed = (await host.cmd({ op: "attachments", ns, id: doc })).attachments as { name: string; hash: string; size: number }[];
+    assert.deepEqual(listed.map((a) => [a.name, a.hash, a.size]), [["note.txt", attachmentContentHash(data), data.length]]);
+    // A second replica reads it from the host.
+    const other = await replica(ns);
+    await other.syncNow();
+    assert.deepEqual(await other.readAttachment(ns, doc, { name: "note.txt" }), data);
+    // And deletes travel the same way.
+    await r.deleteAttachment(ns, doc, { name: "note.txt" });
+    await r.syncNow();
+    assert.deepEqual((await host.cmd({ op: "attachments", ns, id: doc })).attachments, []);
+  });
+
+  test("concurrent attachment and document writes merge with both", async () => {
     const ns = "app/u/attach-merge";
     const doc = randomUuid();
     await host.put(ns, doc, { title: "base" });
@@ -225,12 +264,14 @@ describe("replica against a Go node", { skip }, () => {
     await r.syncNow();
     await host.cmd({ op: "attach", ns, id: doc, name: "a.txt", mime: "text/plain", text: "hello" });
     await r.syncNow();
-    await r.put(ns, doc, { title: "edited on the replica" });
-    await host.cmd({ op: "attach", ns, id: doc, name: "d.txt", mime: "text/plain", text: "merged" });
-    const [merged] = await r.syncNow();
-    assert.equal(merged!.pushOutcome, "merged");
-    assert.equal(r.namespace(ns).head, (await host.head(ns)).head);
-    assert.deepEqual((await r.namespace(ns).attachments(doc)).map((a) => a.name).sort(), ["a.txt", "d.txt"]);
+    for (let round = 0; round < 4; round++) { // both parent orders, whichever hashes first
+      await r.put(ns, doc, { title: `edited ${round}` });
+      await host.cmd({ op: "attach", ns, id: doc, name: `d${round}.txt`, mime: "text/plain", text: `merged ${round}` });
+      const [merged] = await r.syncNow();
+      assert.equal(merged!.pushOutcome, "merged");
+      assert.equal(r.namespace(ns).head, (await host.head(ns)).head);
+    }
+    assert.deepEqual((await r.attachments(ns, doc)).map((a) => a.name).sort(), ["a.txt", "d0.txt", "d1.txt", "d2.txt", "d3.txt"]);
   });
 
   test("a namespace larger than the cache syncs within the cache's budget", async () => {

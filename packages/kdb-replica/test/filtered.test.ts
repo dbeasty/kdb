@@ -86,6 +86,24 @@ describe("filtered replica against a Go node", { skip }, () => {
     assert.deepEqual(Object.keys(await docsOf(r, ns)).sort(), ids.slice(10, 30));
   });
 
+  test("a filtered namespace holds its documents' attachment refs and reads their bytes", async () => {
+    const ns = "shop/attached";
+    const eu = randomUuid(), us = randomUuid();
+    await host.put(ns, eu, { region: "EU" });
+    await host.put(ns, us, { region: "US" });
+    await host.cmd({ op: "attach", ns, id: eu, name: "invoice.pdf", mime: "application/pdf", text: "%PDF eu" });
+    await host.cmd({ op: "attach", ns, id: us, name: "invoice.pdf", mime: "application/pdf", text: "%PDF us" });
+    const r = await filtered(ns, { writeBack: false });
+    await r.syncNow();
+    assert.deepEqual((await r.attachments(ns, eu)).map((a) => a.name), ["invoice.pdf"]);
+    assert.deepEqual(await r.attachments(ns, us), [], "a document outside the filter brings no refs");
+    assert.equal(new TextDecoder().decode(await r.readAttachment(ns, eu, { name: "invoice.pdf" })), "%PDF eu");
+    // A document leaving the filter takes its refs with it.
+    await host.put(ns, eu, { region: "US" });
+    await r.syncNow();
+    assert.deepEqual(await r.attachments(ns, eu), []);
+  });
+
   test("an interrupted transfer resumes where it stopped", async () => {
     const ns = "shop/resume";
     for (let i = 0; i < 30; i++) await host.put(ns, randomUuid(), { region: "EU", i, pad: "z".repeat(50) });

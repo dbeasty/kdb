@@ -18,6 +18,7 @@
 //	{"op":"setHome","ns":..} / {"op":"clearHome","ns":..}           -> {}  (another node is home)
 //	{"op":"attach","ns":..,"id":..,"name":..,"mime":..,"text":..}  -> {"head","attachmentId","contentHash"}
 //	{"op":"detach","ns":..,"id":..,"name":..}                       -> {"head"}
+//	{"op":"attachments","ns":..,"id":..}                            -> {"attachments":[{id,name,hash,size,mime}]}
 //
 // Tokens: "rw-token" may pull and push every namespace; "ro-token" may only pull; anything else is
 // refused. Namespaces under "secret/" are refused to both. The process exits when stdin closes, so a
@@ -250,6 +251,28 @@ func (h *host) handle(c command) (any, error) {
 			return nil, err
 		}
 		return map[string]string{"head": head.Hex(), "attachmentId": info.ID.String(), "contentHash": info.ContentHash.Hex()}, nil
+	case "attachments":
+		rt, err := h.runtime(c.NS)
+		if err != nil {
+			return nil, err
+		}
+		id, err := codec.ParseUUID(c.ID)
+		if err != nil {
+			return nil, err
+		}
+		head, err := rt.Runtime.DAG.Head()
+		if err != nil {
+			return nil, err
+		}
+		table, err := rt.Runtime.AttachmentTableAt(head)
+		if err != nil {
+			return nil, err
+		}
+		list := []map[string]any{}
+		for _, a := range table.List(id) {
+			list = append(list, map[string]any{"id": a.ID.String(), "name": a.Name, "hash": a.ContentHash.Hex(), "size": a.Size, "mime": a.Mime})
+		}
+		return map[string]any{"attachments": list}, nil
 	case "denyRead", "allowRead":
 		h.engine.mu.Lock()
 		h.engine.unreadable[c.NS+"/"+c.ID] = c.Op == "denyRead"

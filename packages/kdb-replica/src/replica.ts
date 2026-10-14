@@ -16,6 +16,8 @@ import { ReplicaNamespace } from "./namespace.ts";
 import { PeerConnection, type ConflictReport } from "./peer.ts";
 import { CachedStore, type KvStore } from "./store.ts";
 import { ProjectionNamespace } from "./projection.ts";
+import { BlobStore, BlobUnavailableError } from "./blobs.ts";
+import type { Attachment } from "./attachments.ts";
 import { syncNamespace, syncProjection, type CatchUp, type NamespaceSyncResult, type ProjectionSyncResult } from "./sync.ts";
 
 export interface ReplicaOptions {
@@ -115,9 +117,12 @@ export class Replica {
   }
   #status = { connected: false, lastSyncAt: null as number | null, lastError: null as string | null };
 
+  readonly #blobs: BlobStore;
+
   private constructor(opts: ReplicaOptions, store: CachedStore) {
     this.#opts = opts;
     this.#store = store;
+    this.#blobs = new BlobStore(store);
   }
 
   static async open(opts: ReplicaOptions): Promise<Replica> {
@@ -211,6 +216,58 @@ export class Replica {
 
   delete(ns: string, id: string): Promise<string> {
     return this.write(ns, [{ kind: "delete", docId: id }]);
+  }
+
+  // --- attachments (plan §9) ---------------------------------------------------------------------
+
+  /** A document's attachments: refs held locally, bytes fetched on read. */
+  attachments(ns: string, docId: string): Promise<Attachment[]> {
+    return this.#local(ns).attachments(docId);
+  }
+
+  async #find(ns: string, docId: string, sel: { name?: string; id?: string }): Promise<Attachment> {
+    const a = (await this.attachments(ns, docId)).find((x) => (sel.id ? x.id === sel.id.toLowerCase() : x.name === sel.name));
+    if (!a) throw new BlobUnavailableError(`kdb replica: ${ns}/${docId} has no attachment ${sel.id ?? JSON.stringify(sel.name)}`);
+    return a;
+  }
+
+  /**
+   * An attachment's bytes: from the local blob store when held, else fetched from the host by
+   * BLOB_FETCH (every chunk verified against the content hash) and kept for next time.
+   */
+  async readAttachment(ns: string, docId: string, sel: { name?: string; id?: string }): Promise<Uint8Array> {
+    const a = await this.#find(ns, docId, sel);
+    const held = await this.#blobs.read(a.contentHash);
+    if (held) return held;
+    const full = this.#ns.get(ns);
+    const commitHex = full ? full.head : this.projection(ns).lastSource;
+    if (!commitHex) throw new BlobUnavailableError(`kdb replica: ${ns} has not synced yet`);
+    const { conn } = await this.#connect();
+    try {
+      return await this.#blobs.fetch(conn, ns, { docId, attachmentId: a.id, commitHex, hash: a.contentHash }, Number(a.size));
+    } finally {
+      if (conn !== this.#conn) await conn.close();
+    }
+  }
+
+  /**
+   * Adds or replaces the attachment called name on a document (full mode): the bytes are kept
+   * here, pinned, and go up before the commit that references them is pushed.
+   */
+  async putAttachment(ns: string, docId: string, name: string, data: Uint8Array, mime = "application/octet-stream"): Promise<string> {
+    if (!this.#ns.has(ns)) throw new Error(`kdb replica: attachments are written in full mode only; ${ns} is filtered`);
+    const hash = await this.#blobs.putLocal(data);
+    const existing = (await this.attachments(ns, docId)).find((a) => a.name === name);
+    return this.write(ns, [{
+      kind: "attachmentPut", docId, attachmentId: existing?.id ?? randomUuid(), name, scheme: 1,
+      contentHash: hash, size: BigInt(data.length), mime,
+    }]);
+  }
+
+  async deleteAttachment(ns: string, docId: string, sel: { name?: string; id?: string }): Promise<string> {
+    if (!this.#ns.has(ns)) throw new Error(`kdb replica: attachments are written in full mode only; ${ns} is filtered`);
+    const a = await this.#find(ns, docId, sel);
+    return this.write(ns, [{ kind: "attachmentDelete", docId, attachmentId: a.id }]);
   }
 
   // --- events and status -------------------------------------------------------------------------
@@ -330,6 +387,7 @@ export class Replica {
           const r = await syncNamespace(conn, ns, conn.refs.find((x) => x.namespace === name), {
             catchUp: this.#opts.catchUp ?? "auto",
             pageBytes: this.#opts.pageBytes,
+            blobs: this.#blobs,
           });
           results.push(r);
           if (r.changed.length > 0) this.#emit("change", { namespace: name, ids: r.changed, source: "remote" });
