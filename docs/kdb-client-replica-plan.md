@@ -99,6 +99,17 @@ and the Go↔Kotlin physical-format goldens cover it. What that needs first:
   ops or moving main, and the state comes from the checkpoint. Squash's durability is a checkpoint, so Kotlin must
   also *write* a checkpoint that Go and Kotlin both read. This is the largest Kotlin item and lands as its own PR
   before the Kotlin replica.
+- **What Go actually persists for a shallow root** (from the squash session, 2026-10-13). A squash root T is
+  *not* logged: `PersistSquash` makes it durable by a checkpoint through the current log position with main at T,
+  plus `meta.json` `shallowRoots` and `bodiesExternal=true`. The bodies the squash changed are materialized into
+  the blob store (`MaterializeBodies`), not into any log frame. A snapshot root (`PersistSnapshot`) has the same
+  shape, with `ThroughSequence=-1`. Commits logged after T name T as their parent, and T is absent from the log.
+  So Kotlin must restore Go's checkpoint (DAG state, live tree, `HeadCommits` payloads), read bodies from the blob
+  store, and replay the log after the checkpoint. Admitting logged shallow roots alone is not enough. Deepened
+  namespaces already open in Kotlin. `graftRoots` are separate and stay refused for now.
+- #209's refusal is one call, `NamespaceMarker.requireReplayable` at the top of `openFileRuntime`. 5a replaces it
+  for markers Kotlin can restore and keeps it for any it cannot. `go/kdb/integration/squash_interop_test.go`
+  then tightens from "a refusal mentioning shallow root" to exact values.
 - **Android**: `kdb-jdbc` is a plain JVM module (`java.nio.file`, API 26+) and `kdb-compression` uses zstd-jni,
   which ships Android binaries. Both need an Android build check; the pure-Kotlin zstd codec is the fallback.
 - **Memory**: the Kotlin runtime's resident structures (it has none of Go's Track A work) bound how large a
