@@ -3,6 +3,7 @@ package dev.kdb.dag
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
+import dev.kdb.document.AttachmentTable
 import dev.kdb.document.CommitStub
 import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbBranch
@@ -175,6 +176,36 @@ public interface CommitDag {
         syntheticSchemaHash: KdbHash?,
         message: String = "compaction",
     ): KdbCommit
+
+    /**
+     * The attachment table at [commit] (docs/kdb-attachments-plan.md): its first parent's table with
+     * its operations applied, each step checked against the root the commit recorded. Throws
+     * [DagConsistencyException] when a commit's recorded root cannot be reproduced. The default
+     * derives through [getCommit] without caching; [inMemoryCommitDag] caches by root.
+     */
+    public suspend fun attachmentTableAt(commit: KdbHash): AttachmentTable = deriveAttachmentTableUncached(commit)
+
+    /** Caches [table] as the table whose root it is - for a checkpoint restoring its heads' tables.
+     * An empty table needs no seed. A DAG without a cache ignores it. */
+    public suspend fun seedAttachmentTable(table: AttachmentTable) {}
+
+    /** Packs the attachment tables at [commits] (deduplicated by root; commits without attachments
+     * contribute nothing) for a checkpoint; null when there are none. Go's PackAttachmentTables. */
+    public suspend fun packAttachmentTables(commits: List<KdbHash>): ByteArray? {
+        val seen = mutableSetOf<KdbHash>()
+        val tables = mutableListOf<AttachmentTable>()
+        for (c in commits) {
+            val t = attachmentTableAt(c)
+            val root = t.root ?: continue
+            if (seen.add(root)) tables.add(t)
+        }
+        return if (tables.isEmpty()) null else AttachmentTable.pack(tables)
+    }
+
+    /** Seeds the tables [packAttachmentTables] packed. */
+    public suspend fun seedPackedAttachmentTables(packed: ByteArray) {
+        for (t in AttachmentTable.parsePacked(packed)) seedAttachmentTable(t)
+    }
 
     public suspend fun resolveRef(ref: CommitRef): KdbHash? {
         when (ref) {
