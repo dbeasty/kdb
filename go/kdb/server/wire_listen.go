@@ -20,6 +20,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/sql"
+	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 	"github.com/limidus/kdb/go/kdb/stream"
 	"github.com/limidus/kdb/go/kdb/transaction"
 	"github.com/limidus/kdb/go/kdb/transport/core"
@@ -1444,6 +1445,7 @@ func sqlResultError(correlationID int, namespace, sessionID, errMsg string) wire
 // populating ErrorCode/RetryAfterMs from err's concrete type - see upsertErrorClassified's doc
 // comment; same reasoning, TxCommit's call site instead of Upsert's.
 func sqlResultErrorClassified(correlationID int, namespace, sessionID string, err error) wire.Message {
+	attachstore.ReportCorrupt(err, "namespace", namespace, "via", "sql")
 	errMsg := err.Error()
 	code, retryAfterMs := classifyError(err)
 	return wire.SqlResultMessage{

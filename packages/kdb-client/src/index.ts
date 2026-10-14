@@ -54,6 +54,7 @@ export type {
 export {
   KdbError,
   KdbAbortedError,
+  KdbAttachmentCorruptError,
   KdbBusyError,
   KdbClosedError,
   KdbConflictError,

@@ -151,6 +151,19 @@ export class KdbLockError extends KdbError {
   }
 }
 
+/**
+ * Attachment bytes do not match their content hash, so the copy they came from is unusable: the
+ * server refused to serve its stored copy (wire code INTEGRITY - a read's first page, a later page,
+ * or SQL `ATTACHMENT()`), or a download failed this client's own verification
+ * ({@link KdbIntegrityError}, a subclass). Retrying the same server cannot help; read from another
+ * replica, or have this one repaired. Mirrors `client.ErrAttachmentCorrupt` in go/kdb/client.
+ */
+export class KdbAttachmentCorruptError extends KdbError {
+  constructor(message: string, options: KdbErrorOptions = {}) {
+    super(message, { code: "INTEGRITY", ...options });
+  }
+}
+
 /** A transport-level failure: the socket or WebSocket, not the protocol. */
 export class KdbTransportError extends KdbError {}
 
@@ -216,6 +229,10 @@ export function classifiedError(
       return new KdbDeadlineExceededError(`kdb: deadline exceeded: ${message}`, options);
     case "UNAUTHORIZED":
       return new KdbUnauthenticatedError(`kdb: unauthorized: ${message}`, options);
+    case "INTEGRITY":
+      // The server's stored attachment bytes no longer match their content hash - the only data
+      // a client-facing reply refuses as INTEGRITY.
+      return new KdbAttachmentCorruptError(`kdb: attachment corrupt: ${message}`, options);
     default:
       return new KdbError(`kdb: ${message}`, options);
   }

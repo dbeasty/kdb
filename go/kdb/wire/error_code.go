@@ -40,8 +40,10 @@ const (
 	// ErrorCodeNamespaceMismatch: a peer-sync frame named a namespace this connection does not
 	// serve. Never retry unmodified - connect to the listener that serves it.
 	ErrorCodeNamespaceMismatch ErrorCode = "NAMESPACE_MISMATCH"
-	// ErrorCodeIntegrity: data a peer sent does not verify - a commit whose history does not
-	// build the tree it declares. Never retry; the sending node's history is inconsistent.
+	// ErrorCodeIntegrity: data does not verify against the hash it is stored or sent under - a
+	// commit whose history does not build the tree it declares, or attachment bytes the server
+	// (or a peer serving BLOB_FETCH) holds that no longer match their content hash. Never retry
+	// against the same node: its copy is damaged. Read from another replica, or repair this one.
 	ErrorCodeIntegrity ErrorCode = "INTEGRITY"
 	// ErrorCodeNotHome: the namespace is single-home and this node is not its home. The message
 	// names the home ("home=<addr>"); write there. Retrying here cannot succeed.

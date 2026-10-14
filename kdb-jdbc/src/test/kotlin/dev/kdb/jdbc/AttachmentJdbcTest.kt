@@ -130,6 +130,44 @@ class AttachmentJdbcTest {
             server.corruptReads = true
             val e = assertFailsWith<IOException> { att.get(doc, KdbAttachmentSelector.byName("a")) }
             assertTrue(e.message!!.contains("verification"), e.message)
+            assertTrue(e.cause is KdbAttachmentCorruptException, "verification failure is typed: ${e.cause}")
+        }
+
+    @Test
+    fun serverRefusingItsDamagedCopyIsTyped() =
+        withFakeServer { server, conn ->
+            val att = conn.unwrap(KdbAttachments::class.java)
+            att.pageBytes = 1 shl 20
+            val bytes = pattern(3 * (1 shl 20))
+            att.put(doc, bytes, KdbPutAttachmentOptions(name = "a"))
+
+            // The first page: thrown as is.
+            server.damagedAt = 5
+            val first = assertFailsWith<KdbAttachmentCorruptException> { att.get(doc, KdbAttachmentSelector.byName("a")) }
+            assertEquals("INTEGRITY", first.errorCode)
+            assertEquals("XX001", first.sqlState)
+
+            // A later page, after an intact first one: the stream's IOException carries it.
+            server.damagedAt = (2L shl 20) + 5
+            att.open(doc, KdbAttachmentSelector.byName("a")).use { s ->
+                val head = ByteArray(1 shl 20)
+                assertEquals(head.size, s.readNBytes(head, 0, head.size))
+                val later = assertFailsWith<IOException> { s.readAllBytes() }
+                val cause = later.cause
+                assertTrue(cause is KdbAttachmentCorruptException, "later page: $cause")
+            }
+
+            // SQL ATTACHMENT().
+            val sql =
+                assertFailsWith<KdbAttachmentCorruptException> {
+                    conn.createStatement().use { it.executeQuery("SELECT ATTACHMENT('a') FROM docs") }
+                }
+            assertEquals("XX001", sql.sqlState)
+
+            // Other refusals stay what they were.
+            server.damagedAt = -1
+            val missing = assertFailsWith<KdbAttachmentException> { att.get(doc, KdbAttachmentSelector.byName("nope")) }
+            assertFalse(missing is KdbAttachmentCorruptException)
         }
 
     @Test
@@ -220,6 +258,9 @@ class AttachmentJdbcTest {
         var failChunkAt = -1L
         var corruptReads = false
 
+        /** Refuses the page holding this offset (and SQL) as a server whose stored copy is damaged does. */
+        var damagedAt = -1L
+
         fun headHex(): String = head.toString(16).padStart(64, '0')
 
         fun hdr(
@@ -281,6 +322,14 @@ class AttachmentJdbcTest {
                     }
                     is WireMessage.SqlExec -> {
                         lastParams = m.parametersJson
+                        if (damagedAt >= 0) {
+                            return replyCodec.encode(
+                                WireMessage.SqlResult(
+                                    hdr(corr, WireMessageType.SQL_RESULT), m.namespace, m.sessionId, emptyList(), emptyList(), 0, "", true,
+                                    error = "ATTACHMENT(\"a\"): attachstore: stored bytes do not match their content hash", errorCode = "INTEGRITY",
+                                ),
+                            )
+                        }
                         val b64 = Base64.getEncoder().encodeToString("hi there".encodeToByteArray())
                         WireMessage.SqlResult(
                             hdr(corr, WireMessageType.SQL_RESULT), m.namespace, m.sessionId, listOf("bin", "n"),
@@ -346,6 +395,13 @@ class AttachmentJdbcTest {
             pins[readId] = info to commit
             val bytes = blobs[info.hash!!.toHex()]!!
             val end = minOf(bytes.size.toLong(), m.offset + (if (m.maxBytes > 0) m.maxBytes else 4L shl 20)).toInt()
+            if (damagedAt in m.offset until end) {
+                pins.remove(readId)
+                return WireMessage.AttachmentData(
+                    h, m.namespace, readId, m.docId,
+                    error = "attachstore: stored bytes do not match their content hash: chunk 0 of ${info.hash!!.toHex()}", errorCode = "INTEGRITY",
+                )
+            }
             val data = bytes.copyOfRange(m.offset.toInt(), end)
             if (corruptReads && data.isNotEmpty()) data[0] = (data[0] + 1).toByte()
             val eof = end == bytes.size

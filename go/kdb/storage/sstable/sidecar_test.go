@@ -386,7 +386,7 @@ func TestCompactionKeepsSidecarsConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Merged != 5 || res.Removed != 5 || res.Output == "" {
+	if res.Merged != 5 || res.Removed != 5 || len(res.Outputs) != 1 {
 		t.Fatalf("compaction %+v", res)
 	}
 	if res.Dropped != len(dropped) {
