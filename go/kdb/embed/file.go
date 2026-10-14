@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -184,7 +185,10 @@ func (h *Host) openNamespace(
 			MaxSegments:   opts.Storage.TreeMaxSegments,
 			ReadOnly:      opts.ReadOnly,
 		})
-		if err != nil {
+		if errors.Is(err, document.ErrTreeFileUnsupported) {
+			// tree.file is on by default; a platform without file mapping (Windows) keeps the
+			// live tree in memory, and saying so on every open would only be noise.
+		} else if err != nil {
 			log.Printf("kdb: namespace %s: tree.file is on but unusable here (%v) - the live tree stays in memory", namespaceID, err)
 		} else {
 			treeFile = tf
