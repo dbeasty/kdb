@@ -8,7 +8,7 @@
 
 export { connect, Client, backoffDelay, decodeConflictError, DEFAULT_REQUEST_TIMEOUT_MS } from "./client.ts";
 export { CLIENT_VERSION, checkServerCompatible } from "./version.ts";
-export type { ConnectOptions, Lease, TlsOptions } from "./client.ts";
+export type { ConnectOptions, JsonValue, Lease, SqlValue, TlsOptions } from "./client.ts";
 
 export type {
   CallOptions,
@@ -51,7 +51,13 @@ export {
   encodeFrameBody,
   FrameReader,
 } from "./wire/frame.ts";
-export { decodeBinaryBody, encodeBinaryBody, WIRE_FEATURE_BINARY } from "./wire/binary.ts";
+export {
+  decodeBinaryBody,
+  encodeBinaryBody,
+  WIRE_FEATURE_BINARY,
+  WIRE_FEATURE_BINARY_2,
+  WIRE_FEATURE_ZSTD,
+} from "./wire/binary.ts";
 export { decodeMessage, encodeMessage } from "./wire/envelope.ts";
 export { MSG } from "./wire/messages.ts";
 export type { MessageKind, TransactionDto } from "./wire/messages.ts";

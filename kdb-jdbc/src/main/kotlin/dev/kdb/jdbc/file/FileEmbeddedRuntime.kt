@@ -30,6 +30,9 @@ public fun openFileRuntime(
     acquireDirectoryLock: Boolean = true,
     lockHolder: String = "kdb-jdbc",
 ): EmbeddedKdbRuntime {
+    // Before anything is opened or locked: a namespace Go holds shallow roots for cannot be
+    // rebuilt from its log, and a replay would serve older or missing documents as current.
+    NamespaceMarker.requireReplayable(dataRoot, namespaceId)
     if (acquireDirectoryLock) {
         DataDirectoryLockRegistry.acquire(dataRoot, lockHolder)
     }

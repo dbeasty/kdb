@@ -276,6 +276,7 @@ func messageToEnvelope(msg Message) (PayloadEnvelope, error) {
 				ErrorCode:         m.ErrorCode,
 				RetryAfterMs:      m.RetryAfterMs,
 				Continuation:      m.ContinuationToken,
+				CellKinds:         cellKindsToDigits(m.CellKinds),
 			},
 		}, nil
 	case TxCommitMessage:
@@ -631,6 +632,7 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 			Error: s.Error, GeneratedIDs: s.GeneratedIDs,
 			ErrorCode: s.ErrorCode, RetryAfterMs: s.RetryAfterMs,
 			ContinuationToken: s.Continuation,
+			CellKinds:         cellKindsFromDigits(s.CellKinds),
 		}, nil
 	case "txCommit":
 		c := env.TxCommit
@@ -691,4 +693,29 @@ func envelopeToMessage(header Header, env payloadEnvelope) (Message, error) {
 		}
 		return nil, newDecodeError("unknown payload kind: " + env.Kind)
 	}
+}
+
+// cellKindsToDigits writes cell kinds for the JSON envelope, one decimal digit each.
+func cellKindsToDigits(kinds []CellKind) string {
+	if len(kinds) == 0 {
+		return ""
+	}
+	b := make([]byte, len(kinds))
+	for i, k := range kinds {
+		b[i] = '0' + byte(k)
+	}
+	return string(b)
+}
+
+func cellKindsFromDigits(s string) []CellKind {
+	if s == "" {
+		return nil
+	}
+	kinds := make([]CellKind, len(s))
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= '0' && c <= '9' {
+			kinds[i] = CellKind(c - '0')
+		}
+	}
+	return kinds
 }

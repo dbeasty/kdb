@@ -21,7 +21,7 @@ import { after, before, describe, it } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { connect, type Client, WIRE_FEATURE_BINARY } from "../src/index.ts";
+import { connect, type Client, WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2 } from "../src/index.ts";
 import { KdbNotFoundError, KdbPreconditionError } from "../src/errors.ts";
 import { randomUuid } from "../src/wire/uuid.ts";
 
@@ -94,8 +94,14 @@ for (const jsonOnly of [false, true]) describe(`live interop against the Go serv
   });
 
   it("agrees binary frames unless asked not to", () => {
-    assert.deepEqual(client.wireFeatures, jsonOnly ? [] : [WIRE_FEATURE_BINARY]);
+    if (jsonOnly) {
+      assert.deepEqual(client.wireFeatures, []);
+      return;
+    }
+    assert.ok(client.wireFeatures.includes(WIRE_FEATURE_BINARY));
+    assert.ok(client.wireFeatures.includes(WIRE_FEATURE_BINARY_2));
   });
+
 
   it("round trips a document through putJSON and get", async () => {
     const docId = randomUuid();
@@ -392,5 +398,15 @@ for (const jsonOnly of [false, true]) describe(`live interop against the Go serv
       assert.ok(page.rows.length <= 50);
     }
     assert.equal(pages, 3); // 130 rows at the clamped page size of 49
+  });
+
+  it("returns typed cells from queryValues", async () => {
+    // players is the table an earlier case created: name and level are VARCHAR, so the typed
+    // cells here are text, an integer count and a parsed JSON document.
+    const named = await client.queryValues(NS, "SELECT name, level, _doc FROM players WHERE name = 'Alice'");
+    assert.deepEqual(named.rows[0]!.slice(0, 2), ["Alice", "7"]);
+    assert.deepEqual(named.rows[0]![2], { name: "Alice", level: "7" });
+    const counted = await client.queryValues(NS, "SELECT COUNT(*) FROM players WHERE name = 'Alice'");
+    assert.deepEqual(counted.rows, [[1]]);
   });
 });

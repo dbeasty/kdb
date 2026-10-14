@@ -139,6 +139,11 @@ func (c *v2Conn) trySquash(cfg V2ClientConfig, env IngestEnv, ns string, remoteM
 	if route == CatchUpReplay || env.DAG.HasCommit(remoteMain) {
 		return false, nil
 	}
+	if env.SquashRefused != "" {
+		// A namespace that refuses to serve squashes keeps full history here too: the host may
+		// not know the policy yet, and taking a squash from it would leave this replica the gap.
+		return false, nil
+	}
 	if !slices.Contains(c.caps, wire.SyncCapSquash) || !slices.Contains(c.caps, wire.SyncCapRepair) {
 		return false, nil
 	}
@@ -146,13 +151,9 @@ func (c *v2Conn) trySquash(cfg V2ClientConfig, env IngestEnv, ns string, remoteM
 	if err != nil || !ok {
 		return false, err
 	}
-	reply, err := c.request(wire.SquashHeadMessage{H: header(wire.MsgSquashHead, c.next()), Namespace: ns, HaveHex: local.Hash.Hex()})
+	head, err := c.squashHead(ns, local.Hash)
 	if err != nil {
 		return false, err
-	}
-	head, isHead := reply.(wire.SquashHeadResultMessage)
-	if !isHead {
-		return false, NewError(fmt.Sprintf("expected SQUASH_HEAD_RESULT, got %T", reply), nil)
 	}
 	if head.Refused != "" || !head.Descends {
 		return false, nil
@@ -198,6 +199,29 @@ func (c *v2Conn) trySquash(cfg V2ClientConfig, env IngestEnv, ns string, remoteM
 	res.Squashed = target.Hash.Hex()
 	res.SquashedBacklog = head.Backlog
 	return true, nil
+}
+
+// squashHead asks the peer for ns's head and whether it descends from have (SQUASH_HEAD).
+func (c *v2Conn) squashHead(ns string, have codec.Hash) (wire.SquashHeadResultMessage, error) {
+	reply, err := c.request(wire.SquashHeadMessage{H: header(wire.MsgSquashHead, c.next()), Namespace: ns, HaveHex: have.Hex()})
+	if err != nil {
+		return wire.SquashHeadResultMessage{}, err
+	}
+	head, isHead := reply.(wire.SquashHeadResultMessage)
+	if !isHead {
+		return wire.SquashHeadResultMessage{}, NewError(fmt.Sprintf("expected SQUASH_HEAD_RESULT, got %T", reply), nil)
+	}
+	return head, nil
+}
+
+// SquashHead asks the peer what a squash catch-up of ns from have would jump to - its head,
+// whether that descends from have, and the backlog - or why it refuses one. For tools and tests;
+// a pull asks this itself.
+func (s *RepairSession) SquashHead(ns string, have codec.Hash) (wire.SquashHeadResultMessage, error) {
+	if !slices.Contains(s.caps, wire.SyncCapSquash) {
+		return wire.SquashHeadResultMessage{}, fmt.Errorf("peer sync: the peer does not serve squash catch-ups")
+	}
+	return s.conn.squashHead(ns, have)
 }
 
 // InstallSquash moves env's main from its head from to target, a descendant of it whose

@@ -137,7 +137,8 @@ type IngestEnv struct {
 	// is all a memory runtime has.
 	SquashInstalled func(root document.Commit, changed map[codec.Hash]string) error
 	// SquashRefused, when set, makes this namespace refuse to serve squash catch-ups, saying why -
-	// for one that must keep full history on every replica. Peers then replay.
+	// for one that must keep full history on every replica. Peers then replay. A pull into it
+	// does not squash either.
 	SquashRefused string
 	// MaxClockSkew refuses a commit timestamped further than this past local wall time. Commits
 	// are timestamped at least one microsecond after their parents, so a single commit from a node

@@ -19,18 +19,45 @@
  */
 
 import { KdbProtocolError } from "../errors.ts";
-import { type MessageKind, MSG } from "./messages.ts";
+import { type MessageKind, MSG, TYPE_CODE_BY_KIND as TYPE_CODE } from "./messages.ts";
 
 export const WIRE_FEATURE_BINARY = "binary-frames";
+/**
+ * The rest of the client message set in binary - for this client, the lease messages. A separate
+ * feature because a peer that shipped with WIRE_FEATURE_BINARY alone cannot decode those bodies.
+ */
+export const WIRE_FEATURE_BINARY_2 = "binary-frames-2";
+/** Tag-3 frames: a zstd frame of a tag-2 body. Offered only where a zstd decoder exists. */
+export const WIRE_FEATURE_ZSTD = "zstd-frames";
 export const ENCODING_BINARY = 0x02;
+export const ENCODING_BINARY_ZSTD = 0x03;
 
 const WT_VARINT = 0;
 const WT_FIXED64 = 1;
 const WT_BYTES = 2;
 const WT_FIXED32 = 5;
 
+/** Kinds binary-frames-2 adds, which go binary only when that feature was agreed. */
+const BINARY_2_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
+  "lockAcquire",
+  "lockRenew",
+  "lockRelease",
+  "lockResult",
+]);
+
+/** Whether `kind` goes out binary on a connection that agreed `features`. */
+export function hasBinaryForm(kind: MessageKind, features: ReadonlySet<string>): boolean {
+  if (!features.has(WIRE_FEATURE_BINARY)) return false;
+  if (BINARY_2_KINDS.has(kind)) return features.has(WIRE_FEATURE_BINARY_2);
+  return BINARY_KIND_BY_TYPE_CODE.has(TYPE_CODE[kind]);
+}
+
 /** Kinds with a binary form, by type code. The handshake (0x01) never has one. */
 export const BINARY_KIND_BY_TYPE_CODE: ReadonlyMap<number, MessageKind> = new Map<number, MessageKind>([
+  [MSG.LOCK_ACQUIRE, "lockAcquire"],
+  [MSG.LOCK_RENEW, "lockRenew"],
+  [MSG.LOCK_RELEASE, "lockRelease"],
+  [MSG.LOCK_RESULT, "lockResult"],
   [MSG.SESSION_BEGIN, "sessionBegin"],
   [MSG.SESSION_BEGIN_ACK, "sessionBeginAck"],
   [MSG.SQL_EXEC, "sqlExec"],
@@ -316,6 +343,25 @@ export function encodeBinaryBody(kind: MessageKind, payload: unknown): Uint8Arra
       w.optString(4, str(p.errorCode));
       w.optInt(5, num(p.retryAfterMs));
       break;
+    case "lockAcquire":
+    case "lockRenew":
+    case "lockRelease":
+      w.string(1, str(p.namespace));
+      w.string(2, str(p.sessionId));
+      w.string(3, str(p.docId));
+      w.int(4, num(p.ttlMillis));
+      break;
+    case "lockResult":
+      w.string(1, str(p.namespace));
+      w.string(2, str(p.sessionId));
+      w.string(3, str(p.docId));
+      w.bool(4, p.granted === true);
+      w.int(5, num(p.fence));
+      w.int(6, num(p.expiresAtMillis));
+      w.optString(7, str(p.holderSessionId));
+      w.optString(8, str(p.error));
+      w.optString(9, str(p.errorCode));
+      break;
     default:
       return undefined;
   }
@@ -346,6 +392,10 @@ function encodeSqlResult(w: Writer, p: Dto): void {
   w.optString(10, str(p.errorCode));
   w.optInt(11, num(p.retryAfterMs));
   w.string(12, str(p.continuation));
+  // Field 13: every cell's kind, one byte each, row by row. The DTO carries them as the JSON
+  // envelope does: one decimal digit per cell.
+  const kinds = str(p.cellKinds);
+  if (kinds) w.bytesField(13, Uint8Array.from(kinds, (c) => c.charCodeAt(0) - 48));
 }
 
 function uvarintLen(v: number): number {
@@ -400,6 +450,9 @@ export function decodeBinaryBody(typeCode: number, body: Uint8Array): { kind: Me
       case "row":
         (lists[key] ??= []).push(decodeRow(r.bytes(wireType)));
         break;
+      case "kinds":
+        p[key] = Array.from(r.bytes(wireType), (k) => String.fromCharCode(48 + Math.min(k, 9))).join("");
+        break;
     }
   }
   Object.assign(p, lists);
@@ -417,7 +470,7 @@ function decodeRow(b: Uint8Array): string[] {
   return cells;
 }
 
-type FieldType = "s" | "i" | "b" | "y" | "ls" | "row";
+type FieldType = "s" | "i" | "b" | "y" | "ls" | "row" | "kinds";
 
 const FIELDS: Record<string, Record<number, [string, FieldType]>> = {
   sessionBegin: { 1: ["namespace", "s"], 2: ["sessionId", "s"], 3: ["readConsistency", "s"], 4: ["baseVersionHex", "s"] },
@@ -427,6 +480,7 @@ const FIELDS: Record<string, Record<number, [string, FieldType]>> = {
     1: ["namespace", "s"], 2: ["sessionId", "s"], 3: ["columns", "ls"], 4: ["rows", "row"],
     5: ["rowsAffected", "i"], 6: ["resolvedCommitHex", "s"], 7: ["readOnly", "b"], 8: ["error", "s"],
     9: ["generatedIds", "ls"], 10: ["errorCode", "s"], 11: ["retryAfterMs", "i"], 12: ["continuation", "s"],
+    13: ["cellKinds", "kinds"],
   },
   txCommit: { 1: ["namespace", "s"], 2: ["sessionId", "s"], 3: ["transactionBytes", "y"] },
   txRollback: { 1: ["namespace", "s"], 2: ["sessionId", "s"] },
@@ -438,6 +492,13 @@ const FIELDS: Record<string, Record<number, [string, FieldType]>> = {
   },
   upsert: { 1: ["namespace", "s"], 2: ["docId", "s"], 3: ["json", "s"], 4: ["sessionId", "s"] },
   upsertResult: { 1: ["namespace", "s"], 2: ["commitHex", "s"], 3: ["error", "s"], 4: ["errorCode", "s"], 5: ["retryAfterMs", "i"] },
+  lockAcquire: { 1: ["namespace", "s"], 2: ["sessionId", "s"], 3: ["docId", "s"], 4: ["ttlMillis", "i"] },
+  lockRenew: { 1: ["namespace", "s"], 2: ["sessionId", "s"], 3: ["docId", "s"], 4: ["ttlMillis", "i"] },
+  lockRelease: { 1: ["namespace", "s"], 2: ["sessionId", "s"], 3: ["docId", "s"] },
+  lockResult: {
+    1: ["namespace", "s"], 2: ["sessionId", "s"], 3: ["docId", "s"], 4: ["granted", "b"], 5: ["fence", "i"],
+    6: ["expiresAtMillis", "i"], 7: ["holderSessionId", "s"], 8: ["error", "s"], 9: ["errorCode", "s"],
+  },
 };
 
 /**
@@ -460,4 +521,26 @@ const DEFAULTS: Record<string, Dto> = {
   documentGetResult: { namespace: "", docId: "", commitHex: "" },
   upsert: { namespace: "", docId: "", json: "" },
   upsertResult: { namespace: "", commitHex: "" },
+  lockAcquire: { namespace: "", sessionId: "", docId: "", ttlMillis: 0 },
+  lockRenew: { namespace: "", sessionId: "", docId: "", ttlMillis: 0 },
+  lockRelease: { namespace: "", sessionId: "", docId: "" },
+  lockResult: { namespace: "", sessionId: "", docId: "", granted: false, fence: 0, expiresAtMillis: 0 },
 };
+
+/**
+ * The runtime's zstd decoder, when it has one: Node's zlib.zstdDecompressSync (22.15+, 23.8+),
+ * found without a static import so this module still loads in a browser. Null elsewhere - and
+ * then the client does not offer WIRE_FEATURE_ZSTD.
+ */
+export const zstdDecompress: ((data: Uint8Array) => Uint8Array) | null = (() => {
+  const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
+  const zlib = proc?.getBuiltinModule?.("node:zlib") as
+    | { zstdDecompressSync?: (data: Uint8Array, options?: { maxOutputLength?: number }) => Uint8Array }
+    | undefined;
+  const fn = zlib?.zstdDecompressSync;
+  if (typeof fn !== "function") return null;
+  return (data: Uint8Array) => {
+    const out = fn(data, { maxOutputLength: 16 * 1024 * 1024 });
+    return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+  };
+})();

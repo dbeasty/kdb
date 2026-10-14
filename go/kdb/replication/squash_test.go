@@ -321,3 +321,95 @@ func TestSquashDeclinedForSmallBacklogsAndDivergence(t *testing.T) {
 		t.Fatalf("B's own document is gone after a squash-route sync (%v)", err)
 	}
 }
+
+// A namespace whose catch-up policy refuses squash keeps full history on every replica: a host
+// holding the policy answers SQUASH_HEAD with a refusal, and a catchup=squash peer replays the
+// whole backlog instead, converging with every commit and no shallow root. A receiver holding
+// the policy does not squash either, even from a host that does not know it yet.
+func TestSquashRefusedByCatchUpPolicy(t *testing.T) {
+	ns := "app/data"
+	a, b := fileNode(t, ns), fileNode(t, ns)
+	ma := listen(t, a, ns)
+	ids := make([]codec.UUID, 10)
+	for i := range ids {
+		ids[i], _ = codec.RandomUUID()
+	}
+	backlog := func(from int) {
+		t.Helper()
+		for i := 0; i < 200; i++ {
+			if _, err := a.Upsert(ns, ids[i%len(ids)], fmt.Sprintf(`{"v":%d}`, from+i), auth.Principal{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	backlog(0)
+	syncRoute(t, b, ma, ns, peersync.CatchUpReplay)
+
+	// The host refuses, and says why.
+	a.SetCatchUpPolicy(&server.CatchUpPolicy{RefuseSquash: true, Reason: "audit: full history everywhere"})
+	backlog(1000)
+	_, local, _, err := b.PeerIngestEnv().DAG.HeadCommit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := squashHeadOf(t, b, ma, ns, local.Hash)
+	if reply.Refused != "audit: full history everywhere" {
+		t.Fatalf("SQUASH_HEAD from a refusing host: %+v", reply)
+	}
+	if res := syncRoute(t, b, ma, ns, peersync.CatchUpSquash); res.Squashed != "" {
+		t.Fatalf("a squash was taken from a host that refuses them: %+v", res)
+	}
+	requireFullHistory(t, a, b, ns, ids)
+
+	// The receiver holds the policy, the host no longer does: still a replay.
+	a.SetCatchUpPolicy(nil)
+	b.SetCatchUpPolicy(&server.CatchUpPolicy{RefuseSquash: true})
+	backlog(2000)
+	if reply := squashHeadOf(t, b, ma, ns, head(t, b)); reply.Refused != "" || !reply.Descends {
+		t.Fatalf("the host stopped refusing, but SQUASH_HEAD says %+v", reply)
+	}
+	if res := syncRoute(t, b, ma, ns, peersync.CatchUpSquash); res.Squashed != "" {
+		t.Fatalf("a receiver whose policy refuses squash took one: %+v", res)
+	}
+	requireFullHistory(t, a, b, ns, ids)
+
+	// With neither refusing, the same route squashes - the refusal above was the policy's doing.
+	b.SetCatchUpPolicy(nil)
+	backlog(3000)
+	if res := syncRoute(t, b, ma, ns, peersync.CatchUpSquash); res.Squashed != head(t, a).Hex() {
+		t.Fatalf("with no policy the squash route did not squash: %+v", res)
+	}
+}
+
+// requireFullHistory checks b converged with a on every document and every commit, with no
+// shallow root - what replaying, rather than squashing, leaves.
+func requireFullHistory(t *testing.T, a, b *server.KdbServerRuntime, ns string, ids []codec.UUID) {
+	t.Helper()
+	if head(t, a) != head(t, b) {
+		t.Fatalf("heads differ: %s and %s", head(t, a).Hex(), head(t, b).Hex())
+	}
+	requireSameDocuments(t, a, b, ns, ids)
+	if commitCount(b) != commitCount(a) {
+		t.Fatalf("B holds %d commits, A %d", commitCount(b), commitCount(a))
+	}
+	if roots := b.PeerIngestEnv().DAG.ShallowRoots(); len(roots) != 0 {
+		t.Fatalf("B has %d shallow roots", len(roots))
+	}
+}
+
+// squashHeadOf asks the node listening at to, as from, what a squash of ns from have would do.
+func squashHeadOf(t *testing.T, from *server.KdbServerRuntime, to meshNode, ns string, have codec.Hash) wire.SquashHeadResultMessage {
+	t.Helper()
+	s, err := peersync.OpenRepairSession(wire.NewCodec(wire.EncodingJSON), newCounting(), peersync.V2ClientConfig{
+		NodeID: from.NodeID.String(), PeerURI: to.addr, Namespaces: []string{ns},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reply, err := s.SquashHead(ns, have)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reply
+}

@@ -1,15 +1,32 @@
 package wire
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/limidus/kdb/go/kdb/document"
+)
 
 // Binary bodies of the client load-path messages (see binary.go for the encoding). Field numbers
 // are part of the protocol: never renumber or reuse one, only add.
 
-// hasBinaryForm reports whether t is encoded as a binary body on a binary connection.
-func hasBinaryForm(t MessageType) bool {
+// coreBinaryForm reports whether t is one of the load-path messages WireFeatureBinary covers.
+func coreBinaryForm(t MessageType) bool {
 	switch t {
 	case MsgSessionBegin, MsgSessionBeginAck, MsgSqlExec, MsgSqlResult, MsgTxCommit, MsgTxRollback,
 		MsgConflictReport, MsgDocumentGet, MsgDocumentGetResult, MsgUpsert, MsgUpsertResult:
+		return true
+	default:
+		return false
+	}
+}
+
+// moreBinaryForm reports whether t is one of the messages WireFeatureBinary2 adds
+// (binary_messages_more.go).
+func moreBinaryForm(t MessageType) bool {
+	switch t {
+	case MsgLockAcquire, MsgLockRenew, MsgLockRelease, MsgLockResult, MsgSearch, MsgSearchResult,
+		MsgHistoryList, MsgHistoryResult, MsgRevert, MsgRevertResult, MsgTxCommitMulti,
+		MsgTxCommitMultiResult, MsgDeltaCommit:
 		return true
 	default:
 		return false
@@ -76,7 +93,7 @@ func appendBinaryBody(b []byte, message Message) ([]byte, bool) {
 		b = appendOptErrorCode(b, 4, m.ErrorCode)
 		b = appendOptInt(b, 5, m.RetryAfterMs)
 	default:
-		return b, false
+		return appendMoreBinaryBody(b, message)
 	}
 	return b, true
 }
@@ -94,7 +111,7 @@ func binarySizeHint(message Message) int {
 		for _, row := range m.Rows {
 			n += 6
 			for _, cell := range row {
-				n += len(cell) + 5
+				n += len(cell) + 6
 			}
 		}
 		return n
@@ -106,6 +123,24 @@ func binarySizeHint(message Message) int {
 		return fixed + len(m.JSON)
 	case TxCommitMessage:
 		return fixed + len(m.TransactionBytes)
+	case DeltaCommitMessage:
+		n := fixed + len(m.Payload.SchemaDeltaBytes)
+		for _, op := range m.Payload.Operations {
+			n += 64
+			if w, ok := op.(document.WriteOp); ok {
+				n += len(w.Patch)
+			}
+		}
+		return n
+	case SearchResultMessage:
+		n := fixed
+		for _, h := range m.Hits {
+			n += 64
+			if h.JSON != nil {
+				n += len(*h.JSON)
+			}
+		}
+		return n
 	case SqlExecMessage:
 		n := fixed + len(m.SQL) + len(m.Continuation)
 		if m.ParametersJSON != nil {
@@ -147,6 +182,14 @@ func appendSqlResult(b []byte, m SqlResultMessage) []byte {
 	b = appendOptErrorCode(b, 10, m.ErrorCode)
 	b = appendOptInt(b, 11, m.RetryAfterMs)
 	b = appendString(b, 12, m.ContinuationToken)
+	// Field 13: every cell's kind, one byte each, row by row (SqlResultMessage.CellKinds).
+	if len(m.CellKinds) > 0 {
+		b = appendKey(b, 13, wtBytes)
+		b = binary.AppendUvarint(b, uint64(len(m.CellKinds)))
+		for _, k := range m.CellKinds {
+			b = append(b, byte(k))
+		}
+	}
 	return b
 }
 
@@ -338,7 +381,11 @@ func decodeBinaryBody(header Header, body []byte) (Message, error) {
 		}
 		msg = m
 	default:
-		return nil, newDecodeError("message type has no binary form")
+		m, ok := decodeMoreBinaryBody(header, r)
+		if !ok {
+			return nil, newDecodeError("message type has no binary form")
+		}
+		msg = m
 	}
 	if r.err != nil {
 		return nil, r.err
@@ -426,6 +473,12 @@ func decodeSqlResult(header Header, body []byte) (SqlResultMessage, error) {
 			m.RetryAfterMs = r.optInt(wt)
 		case 12:
 			m.ContinuationToken = r.str(wt)
+		case 13:
+			p := r.bytes(wt)
+			m.CellKinds = make([]CellKind, len(p))
+			for i, k := range p {
+				m.CellKinds[i] = CellKind(k)
+			}
 		default:
 			r.skip(wt)
 		}

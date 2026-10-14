@@ -240,6 +240,34 @@ func (s *Server) handleSetResolution(w http.ResponseWriter, r *http.Request, _ a
 	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "rules": body.Rules, "hash": c.Hash(), "version": c.EffectiveVersion()})
 }
 
+// GET /v1/ns/{ns}/catchup - the namespace's catch-up policy: whether it refuses squash catch-ups.
+func (s *Server) handleCatchUp(w http.ResponseWriter, _ *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	p := rt.CatchUpPolicyOf()
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "refuseSquash": p.RefuseSquash, "reason": p.Reason, "thisNode": rt.NodeID.String()})
+}
+
+// PUT /v1/ns/{ns}/catchup - {"refuseSquash": true, "reason": "..."} makes every node refuse to
+// serve the namespace's squash catch-ups, so every replica keeps full history (peers asking for
+// one replay instead); {"refuseSquash": false} allows them again. Recorded as a replicated
+// definition.
+func (s *Server) handleSetCatchUp(w http.ResponseWriter, r *http.Request, _ auth.Principal, ns string, rt *serverRuntime) {
+	var body server.CatchUpPolicy
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if rt.Meta == nil {
+		writeError(w, http.StatusConflict, "no_metadata", "this process has no metadata namespace, which catch-up policies are recorded in")
+		return
+	}
+	if err := rt.Meta.SetCatchUp(ns, body); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	p := rt.CatchUpPolicyOf()
+	writeJSON(w, http.StatusOK, map[string]any{"namespace": ns, "refuseSquash": p.RefuseSquash, "reason": p.Reason})
+}
+
 // GET /v1/ns/{ns}/procedures - the namespace's stored procedures: each name with the hash of the
 // source this node holds. A chain that calls one pins that hash, so comparing this listing across
 // nodes is how an operator sees why a namespace has stopped merging.

@@ -70,6 +70,7 @@ func main() {
 
 	writeJSON(filepath.Join(dir, "frames.json"), buildFrames())
 	writeJSON(filepath.Join(dir, "binary-frames.json"), buildBinaryFrames())
+	writeJSON(filepath.Join(dir, "binary-frames-2.json"), buildBinaryFrames2())
 	writeJSON(filepath.Join(dir, "hashes.json"), buildHashes())
 	writeJSON(filepath.Join(dir, "transactions.json"), buildTransactions())
 	fmt.Println("wrote fixtures to", dir)
@@ -256,6 +257,92 @@ func buildBinaryFrames() []frameFixture {
 			CorrelationID: tc.msg.Header().CorrelationID,
 			FrameHex:      hex.EncodeToString(frame),
 			EnvelopeJSON:  envelope,
+		})
+	}
+	return out
+}
+
+// buildBinaryFrames2 is the same pairing for what binary-frames-2 adds - leases, search, history,
+// revert, cross-namespace commit, DeltaCommit - plus a SqlResult carrying cell kinds, and one
+// zstd-compressed (tag 3) frame, whose frameHex a decoder must read back to envelopeJson.
+func buildBinaryFrames2() []frameFixture {
+	jsonCodec := wire.NewCodec(wire.EncodingJSON)
+	binCodec := jsonCodec.WithWireFeatures([]string{wire.WireFeatureBinary, wire.WireFeatureBinary2})
+	zstdCodec := jsonCodec.WithWireFeatures(wire.SupportedWireFeatures)
+	head := "00" + hex.EncodeToString(make([]byte, 31))
+	docID := "6f9619ff-8b86-d011-b42d-00cf4fc964ff"
+	doc := `{"name":"ada","quote":"\"q\""}`
+	busy := wire.ErrorCodeBusy
+	retry := 250
+	holder := "sess-2"
+	minScore, weight := 0.25, 2.0
+	big := make([][]string, 400)
+	for i := range big {
+		big[i] = []string{fmt.Sprintf("u%d", i), `{"name":"user","tags":["a","b"],"active":true}`}
+	}
+	id := mustUUID(docID)
+	cases := []struct {
+		name  string
+		msg   wire.Message
+		codec *wire.DefaultCodec
+	}{
+		{"lockAcquire", wire.LockAcquireMessage{H: hdr(wire.MsgLockAcquire, 20), Namespace: "app/users", SessionID: "sess-1", DocID: docID, TTLMillis: 30000}, binCodec},
+		{"lockRenew", wire.LockRenewMessage{H: hdr(wire.MsgLockRenew, 21), Namespace: "app/users", SessionID: "sess-1", DocID: docID, TTLMillis: 5000}, binCodec},
+		{"lockRelease", wire.LockReleaseMessage{H: hdr(wire.MsgLockRelease, 22), Namespace: "app/users", SessionID: "sess-1", DocID: docID}, binCodec},
+		{"lockResultGranted", wire.LockResultMessage{H: hdr(wire.MsgLockResult, 20), Namespace: "app/users", SessionID: "sess-1", DocID: docID, Granted: true, Fence: 7, ExpiresAtMillis: 1750000000000}, binCodec},
+		{"lockResultHeld", wire.LockResultMessage{H: hdr(wire.MsgLockResult, 23), Namespace: "app/users", SessionID: "sess-1", DocID: docID, HolderSessionID: &holder, Error: strptr("held"), ErrorCode: &busy}, binCodec},
+		{"search", wire.SearchMessage{H: hdr(wire.MsgSearch, 24), Namespace: "app/users",
+			Text:   &wire.SearchTextArm{Index: "body", Query: "ada lovelace", Depth: 50, MinScore: &minScore},
+			Vector: &wire.SearchVectorArm{Index: "emb", Vector: []float64{0.5, -1, 0.125}, Weight: &weight},
+			Fusion: "weighted", Limit: 10, IncludeJSON: true}, binCodec},
+		{"searchResult", wire.SearchResultMessage{H: hdr(wire.MsgSearchResult, 24), Namespace: "app/users", ResolvedCommitHex: head,
+			Hits: []wire.SearchHit{{DocID: docID, Score: 0.75, JSON: &doc}, {DocID: docID, Score: 0.5}}}, binCodec},
+		{"searchResultError", wire.SearchResultMessage{H: hdr(wire.MsgSearchResult, 25), Namespace: "app/users", Error: strptr("busy"), ErrorCode: &busy, RetryAfterMs: &retry}, binCodec},
+		{"historyList", wire.HistoryListMessage{H: hdr(wire.MsgHistoryList, 26), Namespace: "app/users", From: "HEAD~2", Skip: 1, Limit: 20}, binCodec},
+		{"historyResult", wire.HistoryResultMessage{H: hdr(wire.MsgHistoryResult, 26), Namespace: "app/users", ResolvedHex: head,
+			Commits: []wire.HistoryCommit{{CommitHex: head, ParentHexes: []string{head}, TransactionID: docID, TimestampMicros: 1750000000000000, AuthorNodeID: docID, TreeHex: head, Message: "m", OperationCount: -1}}}, binCodec},
+		{"revert", wire.RevertMessage{H: hdr(wire.MsgRevert, 27), Namespace: "app/users", To: head}, binCodec},
+		{"revertResult", wire.RevertResultMessage{H: hdr(wire.MsgRevertResult, 27), Namespace: "app/users", CommitHex: head, TargetHex: head, Restored: 3, Removed: 1}, binCodec},
+		{"txCommitMulti", wire.TxCommitMultiMessage{H: hdr(wire.MsgTxCommitMulti, 28), SessionID: "sess-1",
+			Parts: []wire.TxCommitMultiPart{{Namespace: "a", TransactionBytes: []byte(`{"id":"x"}`)}, {Namespace: "b", TransactionBytes: []byte(`{}`)}}}, binCodec},
+		{"txCommitMultiResult", wire.TxCommitMultiResultMessage{H: hdr(wire.MsgTxCommitMultiResult, 28), GroupID: docID,
+			Parts: []wire.TxCommitMultiResultPart{{Namespace: "a", CommitHex: head}}}, binCodec},
+		{"deltaCommit", wire.DeltaCommitMessage{H: hdr(wire.MsgDeltaCommit, 29), Payload: wire.DeltaCommitPayload{
+			Namespace: "app/users", CommitHash: mustHash(head), TimestampMicros: 1750000000000000,
+			Operations: []document.Op{document.WriteOp{DocID: id, Patch: doc}, document.DeleteOp{DocID: id}}}}, binCodec},
+		{"sqlResultTyped", wire.SqlResultMessage{H: hdr(wire.MsgSqlResult, 30), Namespace: "app/users", SessionID: "sess-1",
+			Columns: []string{"name", "n", "x", "note", "doc"}, Rows: [][]string{{"ada", "42", "1.5", "", doc}, {"bob", "-7", "0.25", "", "null"}},
+			CellKinds: []wire.CellKind{0, 2, 3, 1, 5, 0, 2, 3, 0, 5}, ReadOnly: true}, binCodec},
+		{"sqlResultZstd", wire.SqlResultMessage{H: hdr(wire.MsgSqlResult, 31), Namespace: "app/users", SessionID: "sess-1",
+			Columns: []string{"id", "doc"}, Rows: big, ReadOnly: true}, zstdCodec},
+	}
+	out := make([]frameFixture, 0, len(cases))
+	for _, tc := range cases {
+		frame, err := tc.codec.Encode(tc.msg)
+		if err != nil {
+			fail(fmt.Errorf("%s: %w", tc.name, err))
+		}
+		wantTag := byte(2)
+		if tc.codec == zstdCodec {
+			wantTag = 3
+		}
+		if frame[wire.FrameHeaderSize] != wantTag {
+			fail(fmt.Errorf("%s: tag %d, want %d", tc.name, frame[wire.FrameHeaderSize], wantTag))
+		}
+		jsonFrame, err := jsonCodec.Encode(tc.msg)
+		if err != nil {
+			fail(fmt.Errorf("%s: %w", tc.name, err))
+		}
+		envelope := string(jsonFrame[wire.FrameHeaderSize+1:])
+		var probe struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal([]byte(envelope), &probe); err != nil {
+			fail(fmt.Errorf("%s: %w", tc.name, err))
+		}
+		out = append(out, frameFixture{
+			Name: tc.name, Kind: probe.Kind, TypeCode: int(tc.msg.Header().MessageType),
+			CorrelationID: tc.msg.Header().CorrelationID, FrameHex: hex.EncodeToString(frame), EnvelopeJSON: envelope,
 		})
 	}
 	return out

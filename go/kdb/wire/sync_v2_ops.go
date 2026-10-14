@@ -147,6 +147,11 @@ type PackPageMessage struct {
 	// Zstd sends the commits payload zstd-compressed; only to a peer with SyncCapZstdPack. Set by
 	// the sender; on a decoded message it reports how the page arrived.
 	Zstd bool
+	// Payloads, when set by the sender, are Commits' canonical encodings (ToPayloadBytes) already
+	// in hand - read from the sender's log - aligned with Commits; a nil entry is encoded from its
+	// commit. The bytes sent are the same either way; this only spares the sender a decode and a
+	// re-encode per commit. Never set on a decoded message.
+	Payloads [][]byte
 }
 
 func (m PackPageMessage) Header() Header { return m.H }
@@ -290,12 +295,18 @@ const packZstdLevel = 1
 const maxPackPayload = 256 << 20
 
 func encodeCommitsPayload(commits []document.Commit, zstd bool) ([]byte, error) {
+	return encodePayloadsPayload(commits, nil, zstd)
+}
+
+// encodePayloadsPayload is encodeCommitsPayload with some commits' encodings already in hand
+// (PackPageMessage.Payloads).
+func encodePayloadsPayload(commits []document.Commit, payloads [][]byte, zstd bool) ([]byte, error) {
 	if !zstd {
-		return EncodeCommits(commits)
+		return EncodeCommitsWithPayloads(commits, payloads)
 	}
 	// The uncompressed page is laid out in a reused buffer: only its compressed form leaves.
 	bp := getPackBuf()
-	payload, err := appendCommits((*bp)[:0], commits)
+	payload, err := appendCommits((*bp)[:0], commits, payloads)
 	if err != nil {
 		putPackBuf(bp, payload)
 		return nil, err
@@ -390,7 +401,7 @@ func encodeSyncV2Message(msg Message) (payloadEnvelope, bool, error) {
 			Namespace: m.Namespace, Wants: hashesToHex(m.Wants), Haves: hashesToHex(m.Haves), MaxBytes: m.MaxBytes,
 		}}, true, nil
 	case PackPageMessage:
-		payload, err := encodeCommitsPayload(m.Commits, m.Zstd)
+		payload, err := encodePayloadsPayload(m.Commits, m.Payloads, m.Zstd)
 		if err != nil {
 			return payloadEnvelope{}, true, err
 		}

@@ -7,12 +7,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/wire"
 )
 
 func binaryCodec(features ...string) *wire.DefaultCodec {
 	if len(features) == 0 {
-		features = []string{wire.WireFeatureBinary}
+		features = []string{wire.WireFeatureBinary, wire.WireFeatureBinary2}
 	}
 	return wire.NewCodec(wire.EncodingJSON).WithWireFeatures(features)
 }
@@ -39,6 +41,7 @@ func binaryMessages() []wire.Message {
 			Rows:         [][]string{{"1", `{"a":"q\"uote"}`, ""}, {"2", "", "é"}, {}},
 			RowsAffected: 3, ResolvedCommitHex: "ef", ReadOnly: true, Error: strp(""), GeneratedIDs: []string{"g1", ""},
 			ErrorCode: codep(wire.ErrorCodeBusy), RetryAfterMs: intp(0), ContinuationToken: "tok",
+			CellKinds: []wire.CellKind{wire.CellKindLong, wire.CellKindJSON, wire.CellKindNull, wire.CellKindLong, wire.CellKindString, wire.CellKindString},
 		},
 		wire.SqlResultMessage{H: h(wire.MsgSqlResult), RowsAffected: -1, RetryAfterMs: intp(-5)},
 		wire.TxCommitMessage{H: h(wire.MsgTxCommit), Namespace: "n", SessionID: "s", TransactionBytes: []byte{0, 1, 2, 255}},
@@ -53,7 +56,63 @@ func binaryMessages() []wire.Message {
 		wire.UpsertMessage{H: h(wire.MsgUpsert), Namespace: "n", DocID: "d", JSON: `{"k":1}`, SessionID: "s"},
 		wire.UpsertResultMessage{H: h(wire.MsgUpsertResult), Namespace: "n", CommitHex: "cc", Error: strp("x"), ErrorCode: codep(wire.ErrorCodeUnavailable), RetryAfterMs: intp(9)},
 		wire.UpsertResultMessage{H: h(wire.MsgUpsertResult)},
+		wire.LockAcquireMessage{H: h(wire.MsgLockAcquire), Namespace: "n", SessionID: "s", DocID: "d", TTLMillis: 30000},
+		wire.LockRenewMessage{H: h(wire.MsgLockRenew), Namespace: "n", SessionID: "s", DocID: "d", TTLMillis: 1},
+		wire.LockReleaseMessage{H: h(wire.MsgLockRelease), Namespace: "n", SessionID: "s", DocID: "d"},
+		wire.LockResultMessage{H: h(wire.MsgLockResult), Namespace: "n", SessionID: "s", DocID: "d", Granted: true, Fence: 1<<63 + 5, ExpiresAtMillis: 1750000000000, HolderSessionID: strp(""), Error: strp("e"), ErrorCode: codep(wire.ErrorCodeBusy)},
+		wire.LockResultMessage{H: h(wire.MsgLockResult)},
+		wire.SearchMessage{
+			H: h(wire.MsgSearch), Namespace: "n", SessionID: "s",
+			Text:   &wire.SearchTextArm{Index: "body", Query: "q \"x\"", Depth: 20, MinScore: floatp(0), Weight: floatp(0.25)},
+			Vector: &wire.SearchVectorArm{Index: "emb", Vector: []float64{0, -1.5, 3e300}, Depth: 5},
+			Fusion: "weighted", Limit: 10, IncludeJSON: true, AtCommitHex: "ab",
+		},
+		wire.SearchMessage{H: h(wire.MsgSearch), Text: &wire.SearchTextArm{}},
+		wire.SearchResultMessage{
+			H: h(wire.MsgSearchResult), Namespace: "n", ResolvedCommitHex: "cd",
+			Hits:  []wire.SearchHit{{DocID: "a", Score: 0.5, JSON: strp(`{"a":1}`)}, {DocID: "b"}},
+			Error: strp("x"), ErrorCode: codep(wire.ErrorCodeBusy), RetryAfterMs: intp(4),
+		},
+		wire.SearchResultMessage{H: h(wire.MsgSearchResult)},
+		wire.HistoryListMessage{H: h(wire.MsgHistoryList), Namespace: "n", From: "HEAD~3", Skip: 2, Limit: 50},
+		wire.HistoryResultMessage{
+			H: h(wire.MsgHistoryResult), Namespace: "n", ResolvedHex: "ee",
+			Commits: []wire.HistoryCommit{
+				{CommitHex: "c1", ParentHexes: []string{"p1", "p2"}, TransactionID: "t", TimestampMicros: 1700000000000000, AuthorNodeID: "a", TreeHex: "tr", Message: "m", OperationCount: -1, Stubbed: true},
+				{CommitHex: "c2"},
+			},
+		},
+		wire.HistoryResultMessage{H: h(wire.MsgHistoryResult), Error: strp("no"), ErrorCode: codep(wire.ErrorCodeBusy), RetryAfterMs: intp(1)},
+		wire.RevertMessage{H: h(wire.MsgRevert), Namespace: "n", To: "HEAD~1"},
+		wire.RevertResultMessage{H: h(wire.MsgRevertResult), Namespace: "n", CommitHex: "c", TargetHex: "t", Restored: 3, Removed: 1, Error: strp(""), ErrorCode: codep(wire.ErrorCodeConflict), RetryAfterMs: intp(0)},
+		wire.TxCommitMultiMessage{H: h(wire.MsgTxCommitMulti), SessionID: "s", Parts: []wire.TxCommitMultiPart{{Namespace: "a", TransactionBytes: []byte{1, 2}}, {Namespace: "b"}}},
+		wire.TxCommitMultiResultMessage{H: h(wire.MsgTxCommitMultiResult), GroupID: "g", Parts: []wire.TxCommitMultiResultPart{{Namespace: "a", CommitHex: "c"}}},
+		wire.TxCommitMultiResultMessage{H: h(wire.MsgTxCommitMultiResult), FailedNamespace: "b", ConflictReport: []byte(`{}`), Error: strp("conflict"), ErrorCode: codep(wire.ErrorCodeConflict), RetryAfterMs: intp(7)},
+		deltaCommitSample(h(wire.MsgDeltaCommit)),
+		wire.DeltaCommitMessage{H: h(wire.MsgDeltaCommit)},
 	}
+}
+
+func floatp(v float64) *float64 { return &v }
+
+func deltaCommitSample(h wire.Header) wire.DeltaCommitMessage {
+	id := codec.UUID{MSB: -1, LSB: 42}
+	key := ""
+	return wire.DeltaCommitMessage{H: h, Payload: wire.DeltaCommitPayload{
+		Namespace: "n", CommitHash: repeatHex(1), ParentHash: repeatHex(2), TimestampMicros: 1700000000000001,
+		Operations: []document.Op{
+			document.WriteOp{DocID: id, Patch: `{"a":"\n"}`, Replace: true},
+			document.WriteOp{DocID: id, Patch: ""},
+			document.DeleteOp{DocID: id},
+			document.FileWriteOp{Path: "f/x", BlobHash: repeatHex(3)},
+			document.SchemaMigrationOp{MigrationID: id, MigrationPayload: "p"},
+		},
+		IndexHints: []wire.IndexHint{
+			{IndexID: id, FieldName: "f", IndexType: "HASH", Action: "ADD", DocID: id, Key: &key, CommitHash: repeatHex(4)},
+			{IndexID: id},
+		},
+		SchemaDeltaBytes: []byte{9, 8},
+	}}
 }
 
 func TestBinaryFramesRoundTripEveryMessage(t *testing.T) {
@@ -308,5 +367,34 @@ func TestHandshakeCarriesWireFeatures(t *testing.T) {
 	frame, _ = c.Encode(wire.HandshakeMessage{H: testHeader(1, wire.MsgHandshake)})
 	if strings.Contains(string(frame), "wireFeatures") {
 		t.Fatal("an empty offer still wrote the wireFeatures key")
+	}
+}
+
+// Clients that shipped with binary-frames decode only the core load-path bodies, so the rest of
+// the set goes binary only under binary-frames-2.
+func TestTheRestOfTheSetNeedsBinaryFrames2(t *testing.T) {
+	core := binaryCodec(wire.WireFeatureBinary)
+	full := binaryCodec(wire.WireFeatureBinary, wire.WireFeatureBinary2)
+	for _, msg := range []wire.Message{
+		wire.LockResultMessage{H: testHeader(1, wire.MsgLockResult), Namespace: "n"},
+		wire.SearchResultMessage{H: testHeader(1, wire.MsgSearchResult), Namespace: "n"},
+		deltaCommitSample(testHeader(1, wire.MsgDeltaCommit)),
+	} {
+		frame, err := core.Encode(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tag := frame[wire.FrameHeaderSize]; tag != 1 {
+			t.Fatalf("%T under binary-frames alone: tag %d, want JSON", msg, tag)
+		}
+		if frame, _ = full.Encode(msg); frame[wire.FrameHeaderSize] != 2 {
+			t.Fatalf("%T under binary-frames-2 is not binary", msg)
+		}
+	}
+	if wire.NewCodec(wire.EncodingJSON).WithWireFeatures([]string{wire.WireFeatureBinary2}).BinaryFrames() {
+		t.Fatal("binary-frames-2 without binary-frames enabled binary frames")
+	}
+	if got := wire.NegotiateWireFeatures([]string{wire.WireFeatureBinary2}); got != nil {
+		t.Fatalf("binary-frames-2 alone negotiated %v", got)
 	}
 }

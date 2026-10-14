@@ -13,6 +13,30 @@ import (
 // recorded the commit in the first place. See SetOperationsLoader.
 type CommitOperationsLoader func(hash codec.Hash) ([]document.Op, error)
 
+// CommitPayloadLoader returns a commit's payload as logged - its canonical encoding, whose SHA-256
+// is its hash - or false when the log cannot supply it.
+type CommitPayloadLoader func(hash codec.Hash) ([]byte, bool, error)
+
+// SetPayloadLoader installs the loader LoggedPayload reads through; nil removes it.
+func (d *InMemoryCommitDag) SetPayloadLoader(loader CommitPayloadLoader) {
+	if loader == nil {
+		d.payloadLoader.Store(nil)
+		return
+	}
+	d.payloadLoader.Store(&loader)
+}
+
+// LoggedPayload is hash's payload read from the log without decoding it, for a host that sends
+// commits on as they are: false when no loader is installed or the log does not hold the commit,
+// and the caller encodes the commit itself.
+func (d *InMemoryCommitDag) LoggedPayload(hash codec.Hash) ([]byte, bool, error) {
+	loader := d.payloadLoader.Load()
+	if loader == nil {
+		return nil, false, nil
+	}
+	return (*loader)(hash)
+}
+
 // SetOperationsLoader bounds how many bytes of commit *operations* this
 // DAG keeps resident, and installs the loader that re-reads the ones it
 // drops. Both together or neither: dropping operations with nothing able
