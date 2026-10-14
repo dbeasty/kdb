@@ -99,7 +99,28 @@ identity = SHA-256(0x02 || be64(size) || tree)
   - Changing one attachment re-hashes its document's set and O(depth) trie nodes.
   - `Root()` is nil for an empty table, and a nil root is omitted from the commit payload, so a
     commit without attachments hashes exactly as before.
-  - API: `List`, `Count`, `Get(doc, id)`, `GetByName`, `Put`, `Delete`, `DeleteAll`, `Walk`.
+  - API: `List`, `Count`, `Get(doc, id)`, `GetByName`, `Put`, `Delete`, `DeleteAll`, `Walk`. The
+    reads return an error: a set can be on disk (below).
+- **Set pool** (`document/attachment_set_pool.go`). Sets live in a pool keyed by their hash and
+  shared by every table of a DAG.
+  - Backed by a store, the pool keeps about a budget of sets in memory: 8 MiB by default,
+    `StorageOptions.AttachmentSetBudgetBytes` / `KDB_ATTACHMENT_SET_BUDGET`. It writes a set out
+    when it evicts it, the first time. A set it does not hold is read back and checked against its
+    hash. A set the store lacks or has wrong is an error (`ErrAttachmentSetMissing`,
+    `ErrAttachmentSetCorrupt`), never an empty or different set.
+  - The file runtime's store is the namespace's blob store. Writes go to the memtable without a WAL
+    record: every table a process holds was seeded or derived in that process, which put its sets
+    first, so a crash loses nothing anyone reads. Read-only runtimes and engines without platform
+    I/O keep every set in memory, as before.
+  - Under history=none the blob store's merge keeps the sets of the branch, tag and seeded tables,
+    and the sets written in the last two maintenance passes (a commit may still be on its way). The
+    DAG then drops its cached tables of other commits, which are rebuilt from history if asked
+    for. A set a new table names again is written again when evicted.
+  - Seeded tables and transactions' tables join the DAG's pool, so what is derived from them is
+    bounded too.
+  - Kotlin keeps no store. Its tables share their sets through a persistent map (`UuidHamt`), so a
+    cached version costs what changed. Before, every change copied the whole map, which cost time
+    in every document and up to 64 full copies across cached tables.
 - **The DAG derives every root** (`dag/attachments.go`).
   - A commit's table is its first parent's table with the commit's ops applied.
   - Tables are cached by root. A miss is rebuilt from the nearest cached ancestor, and each step is
@@ -211,6 +232,18 @@ identity = SHA-256(0x02 || be64(size) || tree)
   mode) and collects:
   - in latest mode, everything a branch or tag head does not reference;
   - in all-history mode, everything no reachable commit references.
+- **Reference index** (`attachstore/ref_index.go`, segment `<ns>/attachment/r-<gen>`). All-history
+  collection keeps a durable index: the content hashes the history below some heads references,
+  those heads, and a token for where retained history ends (`dag.HistoryFloor`: the horizon and
+  the number of stubbed commits).
+  - A pass whose recorded heads are still below the current ones, on the same floor, reads only the
+    commits since (`dag.CommitsAbove`, a generation-ordered walk).
+  - Anything else rebuilds the index from retained history once: a truncation, an archive, a deleted
+    or reset branch, or a lost or torn index.
+  - A commit whose parent is not here (a shallow root, a truncated floor) contributes its whole
+    table.
+  - The index is read per pass and not held between passes. `AttachmentMaintenance` reports
+    `Scanned` and `Rebuilt`.
 - **Replacements come from the DAG.** A commit that puts an attachment whose first parent held a
   different version (same document and attachment ID) makes the pair, however the commit arrived:
   embedded `PutAttachment`, a client or SQL transaction, or peer sync. The store's mark segment
@@ -296,7 +329,11 @@ identity = SHA-256(0x02 || be64(size) || tree)
 
 ## Known limits
 
-- **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
+- **The store's pointer map.** `attachstore.Store` holds one pointer per stored blob in memory, so
+  under all-history its size still grows with the number of versions. Paging it like the set pool is
+  a follow-up.
+- **A collection pass** still lists every stored blob (`Collect`), and a rebuild of the reference
+  index reads all of retained history once.
 - **Delta jobs restart after a crash.** Progress is in memory, so a restart mid-job redoes it from
   the start. Versions found not worth a delta are remembered per process only.
 - **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
@@ -306,11 +343,8 @@ identity = SHA-256(0x02 || be64(size) || tree)
 ## Known limits of PR 1 (still open unless listed above as built)
 
 - **No peer blob transfer yet.** Commits and roots replicate, but blobs do not until PR 5.
-- **All-history GC walks commit headers.** It loads ops only for commits whose root changed. A
-  per-namespace attachment index would avoid the walk.
-- **Set pool.** The set pool (ref metadata only, never bytes) lives in memory and grows with
-  attachment versions. Spilling it, or rebuilding sets on demand, is a follow-up for very large
-  version counts.
+- ~~All-history GC walks commit headers~~: replaced by the reference index.
+- ~~Set pool held in memory~~: bounded and spilled to the blob store.
 - **Backups.** Backups do not copy attachment segments yet, and a restored node must seed its
   tables (PR 5).
 - **Delta size.** Lifted: versions of any size are delta-encoded (see Deltas above).

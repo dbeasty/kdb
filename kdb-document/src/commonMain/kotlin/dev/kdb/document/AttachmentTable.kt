@@ -178,7 +178,10 @@ public class AttachmentSet internal constructor(
  */
 public class AttachmentTable private constructor(
     private val tree: DocumentTree, // docId -> AttachmentSet.hash()
-    private val sets: Map<KdbUuid, AttachmentSet>,
+    // docId -> its set, shared between versions of the table (UuidHamt): a change copies one path,
+    // so a cached table costs what changed, not every document again. Go keeps a set pool by hash
+    // instead, spilled to the blob store; nothing here grows with history, so none is needed.
+    private val sets: UuidHamt<AttachmentSet>,
     /** The number of attachments, across all documents. */
     public val size: Int,
 ) {
@@ -187,10 +190,10 @@ public class AttachmentTable private constructor(
 
     /** The commit's attachmentTreeHash for this table: null when it is empty, so a commit with no
      * attachments carries no field and hashes as it always did. */
-    public val root: KdbHash? get() = if (sets.isEmpty()) null else tree.treeHash
+    public val root: KdbHash? get() = if (sets.size == 0) null else tree.treeHash
 
     /** The documents with attachments. */
-    public val documentIds: Set<KdbUuid> get() = sets.keys
+    public val documentIds: Set<KdbUuid> get() = sets.keys()
 
     /** [docId]'s attachments, in ID order (empty when it has none). */
     public fun list(docId: KdbUuid): AttachmentSet = sets[docId] ?: AttachmentSet.EMPTY
@@ -213,9 +216,9 @@ public class AttachmentTable private constructor(
         after: AttachmentSet,
     ): AttachmentTable =
         if (after.isEmpty()) {
-            AttachmentTable(tree.without(docId), sets - docId, size - before.size)
+            AttachmentTable(tree.without(docId), sets.remove(docId), size - before.size)
         } else {
-            AttachmentTable(tree.with(docId, after.hash()), sets + (docId to after), size - before.size + after.size)
+            AttachmentTable(tree.with(docId, after.hash()), sets.put(docId, after), size - before.size + after.size)
         }
 
     /** The table with [docId]'s attachment a.id set to [a] - created, or replaced (bytes and name). */
@@ -252,7 +255,7 @@ public class AttachmentTable private constructor(
 
     /** Every (docId, attachment), documents in unsigned id order (the trie's), each in ID order. */
     public fun entries(): Sequence<Pair<KdbUuid, Attachment>> =
-        sets.keys.sortedWith(ATTACHMENT_ID_ORDER).asSequence().flatMap { d -> sets.getValue(d).asSequence().map { d to it } }
+        sets.keys().sortedWith(ATTACHMENT_ID_ORDER).asSequence().flatMap { d -> sets[d]!!.asSequence().map { d to it } }
 
     /**
      * The table after [ops]: an AttachmentPut creates or replaces one attachment, an
@@ -281,7 +284,7 @@ public class AttachmentTable private constructor(
     override fun toString(): String = "AttachmentTable(root=${root?.toHex()}, size=$size, documents=$documents)"
 
     public companion object {
-        public val EMPTY: AttachmentTable = AttachmentTable(DocumentTree.EMPTY, emptyMap(), 0)
+        public val EMPTY: AttachmentTable = AttachmentTable(DocumentTree.EMPTY, UuidHamt.empty(), 0)
 
         /**
          * Packs tables for a checkpoint (Go's AppendPackedAttachmentTables): a uvarint count, then per

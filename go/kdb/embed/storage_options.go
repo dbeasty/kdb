@@ -186,6 +186,11 @@ type StorageOptions struct {
 	// (document.DefaultTreeMaxSegments when not positive). For tests; there is no setting for it.
 	TreeMaxSegments int
 
+	// AttachmentSetBudgetBytes is how much memory the attachment set pool keeps sets in before it
+	// spills them to the namespace's blob store (document.DefaultAttachmentSetBudget when not
+	// positive). Every set any version of the attachment table had stays readable, from disk.
+	AttachmentSetBudgetBytes int64
+
 	// SyncMode selects the physical sync primitive every flush uses. The zero
 	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous
 	// hardcoded behavior; storio.SyncModeFast trades power-loss protection for
@@ -274,6 +279,7 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	opts.Storage.Graph = graphSettingsFromEnv()
 	opts.Storage.TreeFile = envBool("KDB_TREE_FILE")
 	opts.Storage.TreeResidentBytes = envBytes("KDB_TREE_RESIDENT_BYTES")
+	opts.Storage.AttachmentSetBudgetBytes = envBytes("KDB_ATTACHMENT_SET_BUDGET")
 	return opts
 }
 

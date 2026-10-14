@@ -23,6 +23,33 @@ func att(id byte, name string, content byte) Attachment {
 		AttachmentRef: AttachmentRef{Scheme: AttachmentHashSchemeChunked1, ContentHash: attachHash(content), Size: int64(content), Mime: "x/y"}}
 }
 
+func cnt(t *testing.T, tab AttachmentTable, doc codec.UUID) int {
+	t.Helper()
+	n, err := tab.Count(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func get(t *testing.T, tab AttachmentTable, doc, id codec.UUID) (Attachment, bool) {
+	t.Helper()
+	a, ok, err := tab.Get(doc, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, ok
+}
+
+func byName(t *testing.T, tab AttachmentTable, doc codec.UUID, name string) (Attachment, bool) {
+	t.Helper()
+	a, ok, err := tab.GetByName(doc, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, ok
+}
+
 func TestAttachmentOpsRoundTripThroughACommit(t *testing.T) {
 	id := codec.UUID{MSB: 1, LSB: 2}
 	attID := codec.UUID{MSB: 3, LSB: 4}
@@ -93,13 +120,13 @@ func TestAttachmentTableHoldsSeveralPerDocument(t *testing.T) {
 	if tab, err = tab.Put(other, att(1, "a.png", 9)); err != nil {
 		t.Fatal(err) // the same name and ID on another document is fine
 	}
-	if tab.Count(doc) != 3 || tab.Len() != 4 || tab.Documents() != 2 {
-		t.Fatalf("count %d len %d docs %d", tab.Count(doc), tab.Len(), tab.Documents())
+	if cnt(t, tab, doc) != 3 || tab.Len() != 4 || tab.Documents() != 2 {
+		t.Fatalf("count %d len %d docs %d", cnt(t, tab, doc), tab.Len(), tab.Documents())
 	}
-	if a, ok := tab.GetByName(doc, "b.pdf"); !ok || a.ID != att(2, "", 0).ID {
+	if a, ok := byName(t, tab, doc, "b.pdf"); !ok || a.ID != att(2, "", 0).ID {
 		t.Fatal("lookup by name")
 	}
-	if a, ok := tab.Get(doc, att(3, "", 0).ID); !ok || a.Name != "c.txt" {
+	if a, ok := get(t, tab, doc, att(3, "", 0).ID); !ok || a.Name != "c.txt" {
 		t.Fatal("lookup by id")
 	}
 	// Replace one: its bytes and name change, its ID stays, the others are untouched.
@@ -107,13 +134,13 @@ func TestAttachmentTableHoldsSeveralPerDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, _ := replaced.Get(doc, att(2, "", 0).ID); a.Name != "b-v2.pdf" || a.ContentHash != attachHash(7) {
+	if a, _ := get(t, replaced, doc, att(2, "", 0).ID); a.Name != "b-v2.pdf" || a.ContentHash != attachHash(7) {
 		t.Fatalf("replaced: %+v", a)
 	}
-	if _, ok := replaced.GetByName(doc, "b.pdf"); ok {
+	if _, ok := byName(t, replaced, doc, "b.pdf"); ok {
 		t.Fatal("the old name still resolves")
 	}
-	if a, _ := replaced.Get(doc, att(1, "", 0).ID); a.ContentHash != attachHash(1) || replaced.Count(doc) != 3 {
+	if a, _ := get(t, replaced, doc, att(1, "", 0).ID); a.ContentHash != attachHash(1) || cnt(t, replaced, doc) != 3 {
 		t.Fatal("replacing one attachment changed another")
 	}
 	// A name another attachment of the document has is refused.
@@ -130,11 +157,11 @@ func TestAttachmentTableHoldsSeveralPerDocument(t *testing.T) {
 	}
 	// Deleting one keeps the rest; deleting all empties the document.
 	one, _ := tab.Delete(doc, att(1, "", 0).ID)
-	if one.Count(doc) != 2 {
+	if cnt(t, one, doc) != 2 {
 		t.Fatal("delete removed more than one")
 	}
 	none, _ := one.DeleteAll(doc)
-	if none.Count(doc) != 0 || none.Documents() != 1 {
+	if cnt(t, none, doc) != 0 || none.Documents() != 1 {
 		t.Fatal("DeleteAll")
 	}
 	// The root depends on contents, not on the order they were set in.
@@ -161,15 +188,15 @@ func TestAttachmentTableApply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if t1.Count(a) != 2 {
-		t.Fatalf("count %d", t1.Count(a))
+	if cnt(t, t1, a) != 2 {
+		t.Fatalf("count %d", cnt(t, t1, a))
 	}
 	t2, _ := t1.Apply([]Op{DeleteOp{DocID: a}})
-	if t2.Count(a) != 0 || t2.Root() != nil {
+	if cnt(t, t2, a) != 0 || t2.Root() != nil {
 		t.Fatal("a document delete left attachments")
 	}
 	t3, _ := t1.Apply([]Op{AttachmentDeleteOp{DocID: a, AttachmentID: idA}, put(idA, "again", 3)})
-	if got, ok := t3.Get(a, idA); !ok || got.ContentHash != attachHash(3) || got.Name != "again" {
+	if got, ok := get(t, t3, a, idA); !ok || got.ContentHash != attachHash(3) || got.Name != "again" {
 		t.Fatal("a put after a delete in the same ops was lost")
 	}
 	if _, err := (AttachmentTable{}).Apply([]Op{put(idA, "x", 1), put(idB, "x", 2)}); err == nil {
@@ -188,7 +215,10 @@ func TestPackedAttachmentTablesRoundTrip(t *testing.T) {
 	tab, _ = tab.Put(doc, att(1, "a.png", 1))
 	tab, _ = tab.Put(doc, att(2, "b ☃", 2))
 	tab, _ = tab.Put(other, att(3, "c", 3))
-	packed := AppendPackedAttachmentTables(nil, []AttachmentTable{tab, {}})
+	packed, err := AppendPackedAttachmentTables(nil, []AttachmentTable{tab, {}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	back, err := ParsePackedAttachmentTables(packed)
 	if err != nil {
 		t.Fatal(err)

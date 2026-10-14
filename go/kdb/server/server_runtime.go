@@ -764,7 +764,13 @@ func (s *KdbServerRuntime) clientWrite(tx document.Transaction, run func() (docu
 		st.loaded = false
 		return c, err
 	}
-	if w, ok := s.pendingWrite(c); ok && st.loaded {
+	w, ok, werr := s.pendingWrite(c)
+	if werr != nil {
+		// The commit landed; its pending write is read from the DAG again on the next load.
+		st.loaded = false
+		return c, nil
+	}
+	if ok && st.loaded {
 		st.pending = append(st.pending, w)
 	}
 	return c, nil

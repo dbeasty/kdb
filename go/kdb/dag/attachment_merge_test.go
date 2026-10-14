@@ -49,7 +49,7 @@ func TestMergeKeepsBothSidesAttachments(t *testing.T) {
 			p0, p1 = p1, p0
 		}
 		m := b.mergeCommit("M", p0, p1, treeWith(t, x), document.WriteOp{DocID: x, Patch: `{"a":1}`})
-		a, ok := tableAt(t, b.dag, m.Hash).GetByName(x, "d.txt")
+		a, ok := abyName(t, tableAt(t, b.dag, m.Hash), x, "d.txt")
 		if !ok || a.ContentHash != h(1) {
 			t.Fatalf("attachFirst=%v: merge lost d.txt (%+v)", attachFirst, a)
 		}
@@ -87,21 +87,21 @@ func TestMergeAttachmentConflicts(t *testing.T) {
 	}
 	want := map[string]byte{"keep": 1, "gone": 30, "new": 50}
 	for name, content := range want {
-		a, ok := t1.GetByName(x, name)
+		a, ok := abyName(t, t1, x, name)
 		if !ok || a.ContentHash != h(content) {
 			t.Errorf("%s: %+v %v", name, a, ok)
 		}
 	}
-	if a, _ := t1.Get(x, k2); a.ContentHash != h(20) && a.ContentHash != h(21) {
+	if a, _ := aget(t, t1, x, k2); a.ContentHash != h(20) && a.ContentHash != h(21) {
 		t.Errorf("both: %+v", a)
 	}
-	if a, ok := t1.Get(x, k4); !ok || a.Name != "new~"+k4.String()[:8] {
+	if a, ok := aget(t, t1, x, k4); !ok || a.Name != "new~"+k4.String()[:8] {
 		t.Errorf("k4 renamed to %q", a.Name)
 	}
 
 	// A document the merged tree no longer has keeps no attachments.
 	gone := b.mergeCommit("m3", ours.Hash, theirs.Hash, treeWith(t), document.DeleteOp{DocID: x})
-	if tableAt(t, b.dag, gone.Hash).Count(x) != 0 {
+	if acount(t, tableAt(t, b.dag, gone.Hash), x) != 0 {
 		t.Fatal("a deleted document kept attachments through a merge")
 	}
 }

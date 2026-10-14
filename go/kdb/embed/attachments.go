@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -160,18 +161,71 @@ func (rt *EmbeddedKdbRuntime) AttachmentStore(namespaceID string) *attachstore.S
 	}
 	s := attachstore.New(shim, namespaceID, small, rt.attach.config)
 	rt.attach.stores[namespaceID] = s
-	if eng, ok := rt.Storage.(*engine.ServerEngine); ok {
-		// Under history=none the blob store keeps only what the live tree names; attachment
-		// blobs packed into it must count too.
-		eng.SetExtraReachable(func() func(codec.Hash) bool {
-			keep, err := rt.headAttachmentHashes(namespaceID)
-			if err != nil {
-				return func(codec.Hash) bool { return true } // unsure: keep everything
-			}
-			return func(h codec.Hash) bool { return keep[h] }
-		})
-	}
+	rt.installAttachmentReachability(namespaceID)
 	return s
+}
+
+// installAttachmentReachability tells the engine's blob store, which under history=none keeps
+// only what the live tree names, what else it must keep: attachment blobs packed into it, and the
+// attachment sets the DAG's set pool spilled into it (engineSetStore).
+func (rt *EmbeddedKdbRuntime) installAttachmentReachability(namespaceID string) {
+	eng, ok := rt.Storage.(*engine.ServerEngine)
+	if !ok {
+		return
+	}
+	eng.SetExtraReachable(func() func(codec.Hash) bool {
+		var written map[codec.Hash]struct{}
+		d, err := rt.inMemoryDAG()
+		if err == nil {
+			pool := d.AttachmentSetPool()
+			pool.TrackWritten(true)
+			written = pool.TakeWritten()
+		}
+		keep, err := rt.headAttachmentHashes(namespaceID, true)
+		if err != nil {
+			return func(codec.Hash) bool { return true } // unsure: keep everything
+		}
+		if d != nil {
+			// A cached table of an older commit may name sets about to go; asked again, it is
+			// rebuilt from the heads' and seeds' tables kept here.
+			d.ForgetAttachmentTablesExcept(branchAndTagHeads(d))
+		}
+		return func(h codec.Hash) bool {
+			if keep[h] {
+				return true
+			}
+			_, w := written[h]
+			return w
+		}
+	})
+}
+
+// engineSetStore keeps the attachment sets a DAG's pool evicts in the namespace's blob store,
+// unlogged: a set is rebuilt by whatever derived it, so a crash may lose the unflushed ones.
+type engineSetStore struct{ eng *engine.ServerEngine }
+
+func (s engineSetStore) WriteAttachmentSet(h codec.Hash, encoded []byte) error {
+	return s.eng.WriteUnloggedBlob(h, encoded)
+}
+
+func (s engineSetStore) ReadAttachmentSet(h codec.Hash) ([]byte, bool, error) {
+	b, err := s.eng.ReadBlob(h)
+	return b, b != nil, err
+}
+
+// useAttachmentSetStore bounds d's attachment set pool by spilling to eng's blob store, when the
+// engine writes one to disk and may (not read-only).
+func useAttachmentSetStore(d *dag.InMemoryCommitDag, eng *engine.ServerEngine, readOnly bool, budget int64) error {
+	if eng == nil || readOnly || !eng.SpillsBlobs() {
+		return nil
+	}
+	if err := d.SetAttachmentSetStore(engineSetStore{eng}, budget); err != nil {
+		return err
+	}
+	if eng.HistoryMode() == storage.HistoryModeNone {
+		d.AttachmentSetPool().TrackWritten(true)
+	}
+	return nil
 }
 
 // registerAttachmentBlobs lets the transaction engine's preflight find this runtime's attachment
@@ -245,7 +299,11 @@ func (rt *EmbeddedKdbRuntime) RenameAttachment(namespaceID string, docID codec.U
 	if err != nil {
 		return codec.Hash{}, AttachmentInfo{}, err
 	}
-	a, ok := sel.find(table.List(docID))
+	set, err := table.List(docID)
+	if err != nil {
+		return codec.Hash{}, AttachmentInfo{}, err
+	}
+	a, ok := sel.find(set)
 	if !ok {
 		return codec.Hash{}, AttachmentInfo{}, fmt.Errorf("%w: %s of %s", ErrNoAttachment, sel, docID)
 	}
@@ -329,7 +387,11 @@ func (rt *EmbeddedKdbRuntime) commitAttachmentOps(namespaceID string, docID code
 	if err != nil {
 		return codec.Hash{}, err
 	}
-	ops, err := plan(table.List(docID))
+	set, err := table.List(docID)
+	if err != nil {
+		return codec.Hash{}, err
+	}
+	ops, err := plan(set)
 	if err != nil {
 		return codec.Hash{}, err
 	}
@@ -421,16 +483,11 @@ func (rt *EmbeddedKdbRuntime) attachmentSetAt(docID codec.UUID, commit codec.Has
 	if err != nil {
 		return nil, err
 	}
-	return table.List(docID), nil
+	return table.List(docID)
 }
 
-// headAttachmentHashes is every content hash a branch or tag head's attachment table references.
-func (rt *EmbeddedKdbRuntime) headAttachmentHashes(namespaceID string) (map[codec.Hash]bool, error) {
-	d, err := rt.inMemoryDAG()
-	if err != nil {
-		return nil, err
-	}
-	keep := map[codec.Hash]bool{}
+// branchAndTagHeads are the commits garbage collection keeps history from, sorted and distinct.
+func branchAndTagHeads(d *dag.InMemoryCommitDag) []codec.Hash {
 	var heads []codec.Hash
 	for _, b := range d.ListBranches() {
 		heads = append(heads, b.HeadHash)
@@ -438,15 +495,43 @@ func (rt *EmbeddedKdbRuntime) headAttachmentHashes(namespaceID string) (map[code
 	for _, t := range d.ListTags() {
 		heads = append(heads, t.CommitHash)
 	}
-	for _, h := range heads {
+	return attachstore.SortHashes(heads)
+}
+
+// headAttachmentHashes is every content hash a branch or tag head's attachment table references.
+// With sets it also holds the hashes of those tables' attachment sets and of the seeded tables'
+// sets: what a store collecting attachment sets must keep (attachmentSetRule).
+func (rt *EmbeddedKdbRuntime) headAttachmentHashes(namespaceID string, sets bool) (map[codec.Hash]bool, error) {
+	d, err := rt.inMemoryDAG()
+	if err != nil {
+		return nil, err
+	}
+	keep := map[codec.Hash]bool{}
+	for _, h := range branchAndTagHeads(d) {
 		table, err := d.AttachmentTableAt(h)
 		if err != nil {
 			return nil, err
 		}
-		table.Walk(func(_ codec.UUID, a document.Attachment) bool {
+		if sets {
+			table.WalkDocuments(func(_ codec.UUID, set codec.Hash) bool {
+				keep[set] = true
+				return true
+			})
+		}
+		if err := table.Walk(func(_ codec.UUID, a document.Attachment) bool {
 			keep[a.ContentHash] = true
 			return true
-		})
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if sets {
+		for _, t := range d.PinnedAttachmentTables() {
+			t.WalkDocuments(func(_ codec.UUID, set codec.Hash) bool {
+				keep[set] = true
+				return true
+			})
+		}
 	}
 	return keep, nil
 }
@@ -458,65 +543,191 @@ type attachmentChange struct {
 	puts   []document.AttachmentPutOp
 }
 
-// referencedAttachmentHashes is every content hash any commit reachable from a branch or tag
-// references - what AttachmentHistoryAll keeps. It reads the operations only of commits whose
-// attachment root differs from their first parent's. It also returns the heads it walked from
-// and, oldest first, the changing commits wanted accepts (none when wanted is nil).
-func (rt *EmbeddedKdbRuntime) referencedAttachmentHashes(namespaceID string, wanted func(codec.Hash) bool) (map[codec.Hash]bool, []codec.Hash, []attachmentChange, error) {
-	keep, err := rt.headAttachmentHashes(namespaceID)
+// attachmentReferences is every content hash a commit reachable from heads references - what
+// AttachmentHistoryAll keeps - as the store's reference index brought up to date (attachstore
+// RefIndex). When the recorded index still describes the history below its heads (the heads are
+// below the current ones and the history floor is the same) only the commits above them are read,
+// and of those only the operations of commits whose attachment root differs from their first
+// parent's; otherwise all of retained history is read once and the index rebuilt. A commit whose
+// history is not here (a shallow root, a truncated floor) contributes its whole table, which is
+// where its references came from.
+//
+// It also returns, oldest first, the commits above markStops that put attachments: the ones the
+// delta pass still owes. They are the commits read here when markStops are the index's heads, and
+// are walked separately otherwise.
+func (rt *EmbeddedKdbRuntime) attachmentReferences(d *dag.InMemoryCommitDag, store *attachstore.Store, heads, markStops []codec.Hash, out *AttachmentMaintenance) (attachstore.RefIndex, []attachmentChange, error) {
+	floor := d.HistoryFloor()
+	prev, ok, err := store.RefIndex()
 	if err != nil {
-		return nil, nil, nil, err
+		return attachstore.RefIndex{}, nil, err
 	}
-	d, err := rt.inMemoryDAG()
-	if err != nil {
-		return nil, nil, nil, err
+	incremental := ok && prev.Floor == floor && stillBelow(d, prev.Heads, heads)
+	var stops, refs []codec.Hash
+	if incremental {
+		stops, refs = prev.Heads, prev.Refs
 	}
-	var heads []codec.Hash
-	for _, b := range d.ListBranches() {
-		heads = append(heads, b.HeadHash)
-	}
-	for _, t := range d.ListTags() {
-		heads = append(heads, t.CommitHash)
-	}
+	var added []codec.Hash
 	var changes []attachmentChange
-	seen := map[codec.Hash]bool{}
-	for _, head := range heads {
-		for _, e := range d.Walk(head, nil, 1<<30) {
-			full, ok := e.(dag.FullEntry)
-			if !ok || seen[full.Commit.Hash] {
-				continue
-			}
-			c := full.Commit
-			seen[c.Hash] = true
-			if c.AttachmentTreeHash == nil {
-				continue
-			}
-			if len(c.ParentHashes) > 0 {
-				if p, ok := d.GetCommit(c.ParentHashes[0]); ok && p.AttachmentTreeHash != nil && *p.AttachmentTreeHash == *c.AttachmentTreeHash {
+	fallback := false
+	above := d.CommitsAbove(heads, stops)
+	sameStops := sameHashes(attachstore.SortHashes(append([]codec.Hash(nil), markStops...)), stops)
+	out.Scanned, out.Rebuilt = len(above), !incremental
+	for _, h := range above {
+		c, ok := d.GetCommit(h)
+		if !ok || c.AttachmentTreeHash == nil {
+			continue
+		}
+		if len(c.ParentHashes) > 0 {
+			p, ok := d.GetCommit(c.ParentHashes[0])
+			if !ok {
+				table, err := d.AttachmentTableAt(h)
+				if err != nil {
+					// Nothing here can say what it holds: keep what the heads reference, as a
+					// walk of the heads alone would.
+					fallback = true
 					continue
 				}
-			}
-			ops, err := d.CommitOperations(c.Hash)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			change := attachmentChange{commit: c}
-			for _, op := range ops {
-				if put, ok := op.(document.AttachmentPutOp); ok {
-					keep[put.ContentHash] = true
-					change.puts = append(change.puts, put)
+				if err := table.Walk(func(_ codec.UUID, a document.Attachment) bool {
+					added = append(added, a.ContentHash)
+					return true
+				}); err != nil {
+					return attachstore.RefIndex{}, nil, err
 				}
+				continue
 			}
-			if wanted != nil && len(change.puts) > 0 && wanted(c.Hash) {
+			if p.AttachmentTreeHash != nil && *p.AttachmentTreeHash == *c.AttachmentTreeHash {
+				continue
+			}
+		}
+		change, err := readAttachmentChange(d, c)
+		if err != nil {
+			return attachstore.RefIndex{}, nil, err
+		}
+		for _, put := range change.puts {
+			added = append(added, put.ContentHash)
+		}
+		if sameStops && len(change.puts) > 0 {
+			changes = append(changes, change)
+		}
+	}
+	if !sameStops {
+		// The delta pass is behind the index: its changes come from the mark.
+		for _, h := range d.CommitsAbove(heads, markStops) {
+			c, ok := d.GetCommit(h)
+			if !ok || c.AttachmentTreeHash == nil || len(c.ParentHashes) == 0 {
+				continue
+			}
+			p, ok := d.GetCommit(c.ParentHashes[0])
+			if !ok || (p.AttachmentTreeHash != nil && *p.AttachmentTreeHash == *c.AttachmentTreeHash) {
+				continue
+			}
+			change, err := readAttachmentChange(d, c)
+			if err != nil {
+				return attachstore.RefIndex{}, nil, err
+			}
+			if len(change.puts) > 0 {
 				changes = append(changes, change)
 			}
 		}
 	}
-	// Walk goes newest first; a parent's table is then usually cached when its child's is asked.
+	if fallback {
+		keep, err := rt.headAttachmentHashes(d.NamespaceID, false)
+		if err != nil {
+			return attachstore.RefIndex{}, nil, err
+		}
+		for h := range keep {
+			added = append(added, h)
+		}
+	}
+	ix := attachstore.RefIndex{Heads: heads, Floor: floor, Refs: mergeHashes(refs, attachstore.SortHashes(added))}
+	if !incremental || len(added) > 0 || !sameHashes(prev.Heads, heads) {
+		if err := store.SetRefIndex(ix); err != nil {
+			// The index in hand is right; only the next pass is slower.
+			log.Printf("kdb: namespace %s: attachment reference index: %v", d.NamespaceID, err)
+		}
+	}
+	// CommitsAbove goes newest first; a parent's table is then usually cached when its child's is
+	// asked.
 	for i, j := 0, len(changes)-1; i < j; i, j = i+1, j-1 {
 		changes[i], changes[j] = changes[j], changes[i]
 	}
-	return keep, heads, changes, nil
+	return ix, changes, nil
+}
+
+// readAttachmentChange is c with the attachment puts its operations carry.
+func readAttachmentChange(d *dag.InMemoryCommitDag, c document.Commit) (attachmentChange, error) {
+	ops, err := d.CommitOperations(c.Hash)
+	if err != nil {
+		return attachmentChange{}, err
+	}
+	change := attachmentChange{commit: c}
+	for _, op := range ops {
+		if put, ok := op.(document.AttachmentPutOp); ok {
+			change.puts = append(change.puts, put)
+		}
+	}
+	return change, nil
+}
+
+// stillBelow reports whether every commit of old is still here and at or below one of heads - so
+// the history below old is still part of what heads keep, and nothing was taken from it.
+func stillBelow(d *dag.InMemoryCommitDag, old, heads []codec.Hash) bool {
+	tests := make([]func(codec.Hash) bool, len(heads))
+	for i, h := range heads {
+		tests[i] = d.AncestorTest(h)
+	}
+	for _, o := range old {
+		if !d.HasCommit(o) {
+			return false
+		}
+		below := false
+		for _, t := range tests {
+			if t(o) {
+				below = true
+				break
+			}
+		}
+		if !below {
+			return false
+		}
+	}
+	return true
+}
+
+func sameHashes(a, b []codec.Hash) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeHashes merges two sorted, distinct lists into one.
+func mergeHashes(a, b []codec.Hash) []codec.Hash {
+	if len(b) == 0 {
+		return a
+	}
+	out := make([]codec.Hash, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch c := bytes.Compare(a[i].Bytes[:], b[j].Bytes[:]); {
+		case c < 0:
+			out = append(out, a[i])
+			i++
+		case c > 0:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i, j = i+1, j+1
+		}
+	}
+	out = append(out, a[i:]...)
+	return append(out, b[j:]...)
 }
 
 // AttachmentMaintenance is what CompactAttachments did.
@@ -530,13 +741,32 @@ type AttachmentMaintenance struct {
 	// disabled (attachstore.Config.DisableDeltas). InflatePending: the pass's budget ran out first.
 	Inflated       int
 	InflatePending bool
+	// Under AttachmentHistoryAll: the commits read for the references they add (only those since
+	// the last pass, unless the reference index was rebuilt).
+	Scanned int
+	Rebuilt bool // the reference index was built from all of retained history
+}
+
+// AttachmentSetPoolContains reports whether the attachment set pool holds h in memory.
+func (rt *EmbeddedKdbRuntime) AttachmentSetPoolContains(h codec.Hash) bool {
+	d, err := rt.inMemoryDAG()
+	return err == nil && d.AttachmentSetPool().Contains(h)
+}
+
+// AttachmentSetPoolStats describes the attachment set pool of the runtime's DAG.
+func (rt *EmbeddedKdbRuntime) AttachmentSetPoolStats() document.AttachmentSetPoolStats {
+	d, err := rt.inMemoryDAG()
+	if err != nil {
+		return document.AttachmentSetPoolStats{}
+	}
+	return d.AttachmentSetPool().Stats()
 }
 
 // CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll; with
 // attachstore.Config.DisableDeltas it instead turns any stored deltas back into whole copies) and
 // deletes the standalone blobs nothing keeps: under AttachmentHistoryLatest anything a branch or
-// tag head does not reference, under AttachmentHistoryAll anything no reachable commit references (an upload
-// that was never committed). Maintain calls it; it is safe to call at any time.
+// tag head does not reference, under AttachmentHistoryAll anything no reachable commit references
+// (an upload that was never committed). Maintain calls it; it is safe to call at any time.
 //
 // Replacements are read from the DAG, so every way a commit arrives counts - PutAttachment, a
 // transaction from a client or SQL, peer sync: a commit that puts an attachment whose first parent
@@ -561,7 +791,7 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		}
 	}
 	if history == AttachmentHistoryLatest {
-		keep, err := rt.headAttachmentHashes(namespaceID)
+		keep, err := rt.headAttachmentHashes(namespaceID, false)
 		if err != nil {
 			return out, err
 		}
@@ -570,48 +800,48 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		}
 		return out, inflateDeltas(store, &out)
 	}
-	if store.Config().DisableDeltas {
-		// Every version stays whole. The mark stays where it is, so turning deltas back on
-		// diffs the versions replaced meanwhile.
-		keep, _, _, err := rt.referencedAttachmentHashes(namespaceID, nil)
-		if err != nil {
-			return out, err
-		}
-		if out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] }); err != nil {
-			return out, err
-		}
-		return out, inflateDeltas(store, &out)
-	}
 	d, err := rt.inMemoryDAG()
 	if err != nil {
 		return out, err
+	}
+	heads := branchAndTagHeads(d)
+	if store.Config().DisableDeltas {
+		// Every version stays whole: no replacements are looked for (the heads are the stops),
+		// and the mark stays where it is, so turning deltas back on diffs the versions replaced
+		// meanwhile.
+		refs, _, err := rt.attachmentReferences(d, store, heads, heads, &out)
+		if err != nil {
+			return out, err
+		}
+		if out.Removed, err = store.Collect(func(h codec.Hash) bool { return refs.Has(h) }); err != nil {
+			return out, err
+		}
+		return out, inflateDeltas(store, &out)
 	}
 	mark, err := store.Mark()
 	if err != nil {
 		return out, err
 	}
+	// Deltas are owed for the commits the last pass that finished its deltas did not go through:
+	// those above the mark. Usually the mark is the reference index's heads and the commits are the
+	// same; after a pass that stopped early (an error, DeltaPending) the mark lags and they are
+	// walked from it again.
 	var known []codec.Hash
 	for _, h := range mark {
 		if d.HasCommit(h) {
 			known = append(known, h)
 		}
 	}
-	done := map[codec.Hash]struct{}{}
-	if len(known) > 0 {
-		done = d.AncestorSetOf(known)
-	}
-	keep, heads, changes, err := rt.referencedAttachmentHashes(namespaceID, func(h codec.Hash) bool {
-		_, ok := done[h]
-		return !ok
-	})
+	refs, changes, err := rt.attachmentReferences(d, store, heads, known, &out)
 	if err != nil {
 		return out, err
 	}
+	keep := func(h codec.Hash) bool { return refs.Has(h) }
 	deltaErr := rt.deltaReplaced(d, store, keep, changes, &out)
-	if deltaErr == nil && len(changes) > 0 && !out.DeltaPending {
+	if deltaErr == nil && !out.DeltaPending && !sameHashes(mark, heads) {
 		deltaErr = store.SetMark(heads)
 	}
-	out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
+	out.Removed, err = store.Collect(keep)
 	if deltaErr != nil {
 		return out, deltaErr
 	}
@@ -657,7 +887,7 @@ func inflateDeltas(store *attachstore.Store, out *AttachmentMaintenance) error {
 // spending the pass's budget (attachstore.Config.DeltaStepBytes): the delta in progress carries
 // over, and the next pass, finding the same changes, finishes it - a multi-GB version is diffed
 // over several passes, none of them long.
-func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *attachstore.Store, keep map[codec.Hash]bool, changes []attachmentChange, out *AttachmentMaintenance) error {
+func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *attachstore.Store, keep func(codec.Hash) bool, changes []attachmentChange, out *AttachmentMaintenance) error {
 	budget := store.Config().DeltaStepBytes
 	for _, ch := range changes {
 		if len(ch.commit.ParentHashes) == 0 {
@@ -668,8 +898,11 @@ func (rt *EmbeddedKdbRuntime) deltaReplaced(d *dag.InMemoryCommitDag, store *att
 			continue // a shallow root's parent: nothing here to delta against
 		}
 		for _, put := range ch.puts {
-			prev, ok := parent.Get(put.DocID, put.AttachmentID)
-			if !ok || prev.ContentHash == put.ContentHash || !keep[prev.ContentHash] || !keep[put.ContentHash] {
+			prev, ok, err := parent.Get(put.DocID, put.AttachmentID)
+			if err != nil {
+				return err
+			}
+			if !ok || prev.ContentHash == put.ContentHash || !keep(prev.ContentHash) || !keep(put.ContentHash) {
 				continue
 			}
 			if budget <= 0 {
@@ -767,7 +1000,11 @@ func (r *EmbeddedKdbRuntime) PersistAttachmentSeed(packed []byte) error {
 			kept = append(kept, t)
 		}
 	}
-	return r.shim.WriteSnapshot(key, document.AppendPackedAttachmentTables(nil, kept))
+	out, err := document.AppendPackedAttachmentTables(nil, kept)
+	if err != nil {
+		return err
+	}
+	return r.shim.WriteSnapshot(key, out)
 }
 
 func seedPersistedAttachmentTables(shim storage.PlatformIOShim, d *dag.InMemoryCommitDag, namespaceID string) error {
