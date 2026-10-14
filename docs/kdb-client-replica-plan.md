@@ -1,6 +1,6 @@
 # Client replica (memory plan Track D)
 
-Status: **design; owner decisions recorded in §10.** Progress: PR 1 (core) #217; PR 2 (full-mode sync) stacked on it. Written 2026-10-13 against `origin/main` 0399daf.
+Status: **design; owner decisions recorded in §10.** Progress: PR 1 (core) #217 merged; PR 2 (full-mode sync) #218; PR 3 (filtered mode) stacked on #218. Written 2026-10-13 against `origin/main` 0399daf.
 No code yet. File references are relative to `go/kdb/` unless they start with a repo-level directory.
 
 Inputs: `kdb-memory-cassandra-plan.md` Track D (fixed constraints), `kdb-distributed-plan.md` §3.11–3.14,
@@ -145,13 +145,17 @@ document those commits touch: a v1 commit carries its bodies inside its hash.
   Pages are applied atomically, each with its final states, so an interrupted transfer resumes from the last
   complete source.
 - **Bootstrap = filtered snapshot**: PROJECT_FETCH with no `fromHex` is a reset, a cursor-paged
-  (`after`/`next`) filtered snapshot. An id-range filter is a predicate on `_id`
-  (`_id >= '…' AND _id < '…'`); the host change in §4.3 makes that a seek, not a scan.
+  (`after`/`next`) filtered snapshot. An id-range filter is a predicate on the id column `kdb_id`
+  (`kdb_id >= '…' AND kdb_id < '…'`, or BETWEEN, with canonical-id prefixes); the host change in §4.3 makes
+  that a seek to the range's start and a stop at its end.
 - **Catch-up**: PROJECT_FETCH from the last complete source commit returns the net effect, which the host must
   compute the C7 way (§4.3). If `fromHex` is not an ancestor (below a floor, or squashed away), the host sends a
   reset, which the replica applies as a diff against what it holds.
-- **Filter change** (a new filter or new rights): a new filter is a new projection namespace. A rights change is
-  handled because every delta re-evaluates read rights.
+- **Filter change** (a new filter or new rights): a new filter is a new projection namespace. A delta re-evaluates
+  read rights only for documents that changed, so a document that loses read access leaves the replica when it next
+  changes, and one that gains it arrives when it next changes. An immediate rights change needs a reset (a new
+  transfer from `fromHex` = ""), which the app can ask for. A host-side "rights epoch" that forces a reset is future
+  work.
 
 ### 4.3 Host-side fixes the filtered mode needs (Go peersync; coordinate first)
 
@@ -159,11 +163,16 @@ Both are in `peersync/projection.go`, are internal to the host, and change no me
 
 1. **Reset is O(namespace) per page.** `projectPage` walks the whole tree, collects every id after the cursor
    and sorts them, *for every page*: the O(D²/page) shape C5 removed from `snapshotPage`. Use C5's
-   `snapshotPageSeek` cursor seek in the trie, and recognise an `_id` range in the filter to bound the walk.
+   `snapshotPageSeek` cursor seek in the trie, and recognise a `kdb_id` range in the filter to bound the walk.
+   **Done in PR 3** (`projectionPager.resetSeek`, `filterIDRange`).
 2. **Delta is a replay, recomputed per page.** The incremental path calls `commitsBetween(at, from)` and
    `netEffect` on *every page*, which is O(backlog) per page and is replay-shaped, not C7-shaped. Replace it with
    `document.DiffTrees(fromTree, atTree)`, cursor-ordered by id: O(changed documents), independent of how many
-   commits the replica missed. This is the projection's equivalent of squash.
+   commits the replica missed. This is the projection's equivalent of squash. **Done in PR 3**
+   (`projectionPager.deltaDiff`): 2,000 commits rewriting 5 documents cost about 235 allocations,
+   against 6,289 for the replay pager, and the cost does not grow with the backlog.
+   Both new pagers fall back to the originals when a tree cannot be resolved, and a test pins their pages
+   to the originals' pages over random histories.
 
 The squash, replay-allocation and attachments sessions all work in `peersync/`; these changes touch only the
 projection paths, and I will confirm with them before starting.
@@ -255,30 +264,37 @@ Codes 0x50–0x57 are reserved for the replica by the B4 session (2026-10-13). B
 
 ## 9. Attachments (with the B4 session's PR 5)
 
-Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-plan.md` (PR 5):
+Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-plan.md` (PR #214). The model
+changed after the first draft of this plan: a record has **several named attachments**.
 
-- Refs (`AttachmentPutOp`/`AttachmentDeleteOp`, `AttachmentTreeHash`) travel in commits, so `full` mode gets them
-  through FETCH/PACK_PAGE with no extra work. The engine verifies the attachment root as it does the tree.
+- **Ops in commits.** AttachmentPut (op kind 5) has fields 1 docId, 2 attachmentId (UUID), 3 name, 4 scheme
+  (int32, 1), 5 contentHash, 6 size and 7 mime. AttachmentDelete (op kind 6) has fields 1 docId and
+  2 attachmentId. Commit field 10 is `attachmentTreeHash`, omitted when the table is empty. Full mode receives all
+  of these through FETCH/PACK_PAGE.
+- **The second trie** maps docId → set hash, with the document trie's hashing.
+  - Set hash: `'S'`, then for each attachment in id order: id(16), be32 len(name), name, refHash.
+  - refHash: SHA-256(`'A'` ‖ scheme ‖ contentHash ‖ be64 size ‖ be32 len(mime) ‖ mime).
+  - The replica keeps this trie to verify `attachmentTreeHash`, as it does the document tree.
+- **Content hash scheme 1:**
+  - leaves are SHA-256(0x00 ‖ chunk) over 1 MiB chunks;
+  - the tree is RFC 6962 (SHA-256(0x01 ‖ L ‖ R));
+  - the identity is SHA-256(0x02 ‖ be64 size ‖ tree);
+  - an empty blob is one empty leaf.
+- **Goldens:** `go/kdb/document/attachment_golden_test.go` (ref, set, "hello", commit). Until the attachments PR,
+  the TS decoder refuses commits that carry field 10 or op kinds 5 and 6, rather than misreading them.
 - **Bytes are lazy on the replica.** The replica stores refs and fetches bytes on first read or by a prefetch
-  policy (`attachments: "lazy" | "eager" | (ref) => boolean`), with a blob cache under its own budget. Blobs it
-  wrote and the host has not yet confirmed are pinned.
-- **BLOB_FETCH 0x42/0x43**, per entry `(docId, commit, hash, offset, maxBytes)`: a ranged and resumable read
-  (each chunk carries the total size), batched, streamed in request order and paged by bytes, with per-entry
-  errors ("not retained", "forbidden"). Authorized by read rights on `docId` at `commit`, so lazy fetch of any
-  readable old ref works.
-- **Squash/snapshot**: TREE_NODES gains a tree selector, so squash diffs the attachment table with the same
-  mechanism. Missing blobs are *not* fetched before install on a replica (lazy), unlike a node.
-- The native replica must decode op kinds 5/6 and payload field 10, and keep the attachment table as a second
-  trie (same hashing, ref hash as leaf content) to verify `AttachmentTreeHash`. Golden vectors come from #214's
-  `AttachmentCommitGoldenTest`.
-- **Two gaps to settle with B4** (raised in §10 D7):
-  1. **Projections carry no attachment refs.** `ProjectPageMessage.writes` is `{id, body}`. A filtered replica
-     needs `{id, body, attachment?: {hash, contentHash, size, mime}}`, plus the source commit (`atHex`, already
-     there) for BLOB_FETCH's `commit`.
-  2. **Upload from a replica.** A host adopting a pushed commit fetches missing blobs from the *sender*, but a
-     replica serves nothing. A replica must upload first: the 0x44+ client messages (ATTACHMENT_BEGIN/CHUNK/END)
-     on the sync connection, or a blob-push message on the sync protocol. Then it pushes the commit or
-     PROJECT_WRITE that references them. Resumable for mobile.
+  policy, with a blob cache under its own budget. Blobs it wrote and the host has not yet confirmed are pinned.
+- **BLOB_FETCH 0x42/0x43:** each entry is `(docId, attachmentId, commit, hash, offset, maxBytes)`.
+  - Reads are ranged and resumable; each chunk carries the total size.
+  - Requests are batched, results stream in request order, and the response is paged by bytes.
+  - Errors are per entry ("not retained", "forbidden").
+  - The host authorizes by read rights on `docId` at `commit`.
+- **Squash and snapshot:** TREE_NODES gains a tree selector, so the attachment table is diffed by the same
+  mechanism. Blobs are not fetched before install on a replica.
+- **Filtered replicas (D7, confirmed by the owner):** PROJECT_PAGE.writes carry each document's refs
+  `{attachmentId, name, scheme, contentHash, size, mime}`, and BLOB_FETCH's `commit` is the page's `atHex`.
+- **Uploads (D7, confirmed by the owner):** a sync session accepts ATTACHMENT_BEGIN/CHUNK/END. The replica uploads
+  before the REF_UPDATE or PROJECT_WRITE that references the blob, targeting `(docId, attachmentId|name)`.
 
 ## 10. Decisions
 
@@ -291,12 +307,12 @@ Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-p
   (commit format v2, `kdb-distributed-plan.md` §3.13) stays gated.
 - **D5 Live updates: poll first, `REFS_WATCH 0x50 / REFS_CHANGED 0x51` later.**
 
+**Confirmed by the owner (2026-10-13, via the B4 session):** D7.
+
 **Proceeding on the recommendation unless the owner objects:**
 - **D4** Host fixes to projections (§4.3) in PR 3: a cursor seek for reset and `DiffTrees` for delta. Go peersync
   projection paths only, no wire change, coordinated with the peersync sessions first.
 - **D6** Single-home namespaces are filtered/write-back only on a replica; full mode is refused.
-- **D7** Ask B4 to add attachment refs to PROJECT_PAGE and to accept blob upload on a sync session; the replica's
-  attachment PR follows B4's PR 5.
 - **D9** The replica keeps no history (head plus unpushed commits).
 
 - **D10 Local queries (TS):** get by id, ordered scans, id ranges, a predicate callback, and app-declared
@@ -316,6 +332,14 @@ Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-p
   against it: Go's own client behaves the same. Deployed hosts read the environment, where the graph file is
   on by default.
 - The replica never merges, so pushes go before pulls: the opposite order to Go's `SyncV2`, which merges locally.
+
+**Found while building PR 3:**
+- A host refuses a full replica's push into a single-home namespace in two ways. Without a handover point it
+  answers NOT_HOME on writes. Once it knows `Since`, a replicated commit made after that point by a node other than
+  the home is a `StaleFenceError`, sent as CONFLICT. The replica maps both to `SingleHomeError`. It recognises the
+  second by its message, because the wire has no code of its own for it.
+- Full mode learns that a namespace is single-home only on its first refused push. Reading the home from
+  META_VIEW at open, so that full mode is refused up front (D6), is left for the Kotlin/TS meta work.
 
 Each PR is tested against a real Go node. A `go/cmd/kdb-replicahost` helper runs a file host with the peer
 WebSocket and TCP listeners, auth on, and test hooks (seed N commits, write a document, read the head). It prints

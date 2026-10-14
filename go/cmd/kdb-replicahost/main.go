@@ -14,6 +14,8 @@
 //	{"op":"seed","ns":"app/u/1","commits":2000,"docs":10}          -> {"head":..}
 //	{"op":"head","ns":"app/u/1"}                                   -> {"head":..,"tree":..}
 //	{"op":"docs","ns":"app/u/1"}                                   -> {"docs":{"<id>":"<json>"}}
+//	{"op":"denyRead","ns":..,"id":..} / {"op":"allowRead",..}       -> {}  (per-document read rights)
+//	{"op":"setHome","ns":..} / {"op":"clearHome","ns":..}           -> {}  (another node is home)
 //
 // Tokens: "rw-token" may pull and push every namespace; "ro-token" may only pull; anything else is
 // refused. Namespaces under "secret/" are refused to both. The process exits when stdin closes, so a
@@ -31,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -41,10 +44,15 @@ import (
 	"github.com/limidus/kdb/go/kdb/syncnode"
 )
 
-type tokenEngine struct{}
+// tokenEngine authenticates the test tokens and authorizes by them; unreadable lists the documents
+// ("ns/id") no token may read, for per-document read rights.
+type tokenEngine struct {
+	mu         *sync.Mutex
+	unreadable map[string]bool
+}
 
-func (tokenEngine) Authenticator() auth.Authenticator { return tokenEngine{} }
-func (tokenEngine) Authorizer() auth.Authorizer       { return tokenEngine{} }
+func (e tokenEngine) Authenticator() auth.Authenticator { return e }
+func (e tokenEngine) Authorizer() auth.Authorizer       { return e }
 
 func (tokenEngine) Authenticate(_ context.Context, c auth.Credentials) (auth.Principal, error) {
 	if c.Token != nil {
@@ -74,17 +82,27 @@ func namespaceOf(a auth.Action) string {
 		return x.Namespace
 	case auth.DocumentDeleteAction:
 		return x.Namespace
+	case auth.TxCommitAction:
+		return x.Namespace
 	}
 	return ""
 }
 
-func (tokenEngine) Authorize(_ context.Context, p auth.Principal, a auth.Action) error {
+func (e tokenEngine) Authorize(_ context.Context, p auth.Principal, a auth.Action) error {
 	if strings.HasPrefix(namespaceOf(a), "secret/") {
 		return errors.New("forbidden: secret namespace")
 	}
+	if r, ok := a.(auth.DocumentReadAction); ok && p.ID != "host" {
+		e.mu.Lock()
+		denied := e.unreadable[r.Namespace+"/"+r.DocID]
+		e.mu.Unlock()
+		if denied {
+			return errors.New("forbidden: document not readable")
+		}
+	}
 	if p.ID == "ro" {
 		switch a.(type) {
-		case auth.PeerSyncAction, auth.PeerPushAction, auth.DocumentWriteAction, auth.DocumentDeleteAction:
+		case auth.PeerSyncAction, auth.PeerPushAction, auth.DocumentWriteAction, auth.DocumentDeleteAction, auth.TxCommitAction:
 			return errors.New("forbidden: read-only token")
 		}
 	}
@@ -108,7 +126,8 @@ type command struct {
 }
 
 type host struct {
-	set *server.NamespaceSet
+	set    *server.NamespaceSet
+	engine tokenEngine
 }
 
 func (h *host) runtime(ns string) (*server.KdbServerRuntime, error) {
@@ -205,6 +224,28 @@ func (h *host) handle(c command) (any, error) {
 			return true
 		})
 		return map[string]any{"docs": docs}, ferr
+	case "denyRead", "allowRead":
+		h.engine.mu.Lock()
+		h.engine.unreadable[c.NS+"/"+c.ID] = c.Op == "denyRead"
+		h.engine.mu.Unlock()
+		return map[string]string{}, nil
+	case "setHome", "clearHome":
+		rt, err := h.runtime(c.NS)
+		if err != nil {
+			return nil, err
+		}
+		if c.Op == "clearHome" {
+			rt.SetHome(nil)
+		} else {
+			// Another node is home since this head: this one refuses writes to the namespace with
+			// NOT_HOME, and replicated commits written after the handover by anyone but the home.
+			head, err := rt.Runtime.DAG.Head()
+			if err != nil {
+				return nil, err
+			}
+			rt.SetHome(&server.Home{Node: "elsewhere", Addr: "ws://elsewhere/kdb/sync", Fence: 1, Since: head.Hex()})
+		}
+		return map[string]string{}, nil
 	}
 	return nil, fmt.Errorf("unknown op %q", c.Op)
 }
@@ -230,7 +271,8 @@ func main() {
 		os.Exit(1)
 	}
 	primary := server.NewKdbServerRuntime(rt)
-	primary.AuthEngine = tokenEngine{}
+	engine := tokenEngine{mu: &sync.Mutex{}, unreadable: map[string]bool{}}
+	primary.AuthEngine = engine
 	primary.PeerCreateOnPush = true
 	var set *server.NamespaceSet
 	if fileHost != nil {
@@ -262,7 +304,7 @@ func main() {
 	go func() { _ = http.Serve(ln, mux) }()
 	fmt.Printf("ready ws://%s/kdb/sync\n", ln.Addr().String())
 
-	h := &host{set: set}
+	h := &host{set: set, engine: engine}
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 1<<20), 64<<20)
 	out := json.NewEncoder(os.Stdout)

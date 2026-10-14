@@ -43,3 +43,11 @@ export {
   type ReplicaOptions,
   type ReplicaStatus,
 } from "./replica.ts";
+export {
+  ProjectionNamespace,
+  ReadOnlyProjectionError,
+  projectionNamespace,
+  type OutboxEntry,
+  type WriteBackDoc,
+} from "./projection.ts";
+export { SingleHomeError, syncProjection, type ProjectionSyncResult } from "./sync.ts";
