@@ -310,6 +310,8 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("PUT /v1/ns/{ns}/home", s.nsWrite(s.handleAssignHome))
 	mux.Handle("GET /v1/ns/{ns}/resolution", s.nsRead(s.handleResolution))
 	mux.Handle("PUT /v1/ns/{ns}/resolution", s.nsWrite(s.handleSetResolution))
+	mux.Handle("GET /v1/ns/{ns}/catchup", s.nsRead(s.handleCatchUp))
+	mux.Handle("PUT /v1/ns/{ns}/catchup", s.nsWrite(s.handleSetCatchUp))
 	mux.Handle("GET /v1/ns/{ns}/procedures", s.nsRead(s.handleProcedures))
 	mux.Handle("GET /v1/ns/{ns}/procedures/{name}", s.nsRead(s.handleProcedure))
 	mux.Handle("PUT /v1/ns/{ns}/procedures/{name}", s.nsWrite(s.handleSetProcedure))

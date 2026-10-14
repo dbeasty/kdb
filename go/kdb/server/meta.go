@@ -79,6 +79,8 @@ type metaDoc struct {
 	Home *Home `json:"home,omitempty"`
 	// Resolution is a conflict resolution chain (kind "resolution"); no rules means none.
 	Resolution *peersync.ResolutionChain `json:"resolution,omitempty"`
+	// CatchUp is a catch-up policy (kind "catchup"); one refusing nothing means none.
+	CatchUp *CatchUpPolicy `json:"catchUp,omitempty"`
 	// Source is a stored procedure's JavaScript (kind "procedure"), under Name. There is no
 	// revision number: the source is the revision, and its hash is what a resolution chain pins
 	// and what peers compare - a counter would only be a second answer to the same question, and
@@ -179,6 +181,7 @@ func metaHomeID(ns string) codec.UUID   { return codec.DerivedUUID("kdb:meta/hom
 func metaResolutionID(ns string) codec.UUID {
 	return codec.DerivedUUID("kdb:meta/resolution/" + ns)
 }
+func metaCatchUpID(ns string) codec.UUID { return codec.DerivedUUID("kdb:meta/catchup/" + ns) }
 func metaProcedureID(ns, name string) codec.UUID {
 	return codec.DerivedUUID("kdb:meta/procedure/" + ns + "/" + name)
 }
@@ -330,6 +333,31 @@ func (m *MetaStore) SetResolution(ns string, c peersync.ResolutionChain) error {
 	}
 	d := metaDoc{Kind: "resolution", Namespace: ns, Resolution: &c}
 	if err := m.put(metaResolutionID(ns), d); err != nil {
+		return err
+	}
+	if IsNamespacePattern(ns) {
+		return m.reconcileLocked()
+	}
+	if rt, ok := m.set.Get(ns); ok {
+		m.apply(rt, d)
+	}
+	return nil
+}
+
+// SetCatchUp records ns's catch-up policy - a namespace or a pattern - and applies it here at
+// once. It replicates like any definition; until it has reached a node, that node may still serve
+// a squash of ns, but a node that holds the policy also refuses to take one.
+func (m *MetaStore) SetCatchUp(ns string, p CatchUpPolicy) error {
+	if m == nil {
+		return fmt.Errorf("no metadata namespace: catch-up policies are recorded in it")
+	}
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	if err := validNamespaceOrPattern(ns); err != nil {
+		return err
+	}
+	d := metaDoc{Kind: "catchup", Namespace: ns, CatchUp: &p}
+	if err := m.put(metaCatchUpID(ns), d); err != nil {
 		return err
 	}
 	if IsNamespacePattern(ns) {
@@ -652,6 +680,13 @@ func (m *MetaStore) apply(rt *KdbServerRuntime, d metaDoc) {
 			if !c.Supported() {
 				err = &peersync.ErrUnsupportedChainVersion{Version: c.Version}
 			}
+		}
+	case "catchup":
+		if d.CatchUp == nil {
+			rt.SetCatchUpPolicy(nil)
+		} else {
+			p := *d.CatchUp
+			rt.SetCatchUpPolicy(&p)
 		}
 	case "procedure":
 		if d.Dropped {

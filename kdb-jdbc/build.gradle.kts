@@ -24,6 +24,7 @@ dependencies {
     implementation(project(":kdb-transport-ws"))
     implementation(project(":kdb-wire"))
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.serialization.json)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.hikari)
