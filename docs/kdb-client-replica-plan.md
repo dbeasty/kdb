@@ -310,13 +310,18 @@ changed after the first draft of this plan: a record has **several named attachm
   ATTACHMENT_UPLOAD (`expect` first, so a blob the host holds is not resent) before the REF_UPDATE, and unpins
   them once the push is accepted.
 - **Filtered mode** keeps each written document's attachment set from PROJECT_PAGE and reads bytes at the
-  page's `atHex`.
+  page's `atHex`. Attachment-only changes at the source arrive too: a delta's last page lists those
+  documents as writes of their unchanged body.
+- **Filtered write-back** takes attachment writes (`putAttachment`, `deleteAttachment`, attachment ops in
+  `write`). The outbox entry carries the document's whole attachment set after the write
+  (`attachmentsChanged`, `attachments`), guarded by the hash of the set it replaced (`attachmentsBase`),
+  and an attachment-only write keeps the body (`keepBody`). Blobs written here upload on the projection
+  session before the PROJECT_WRITE. A refused write puts the source's attachments back with its body.
+- **Fetched bytes are a bounded cache** (`blobCacheBytes`, default 256 MiB; 0 keeps everything): the least
+  recently used blobs are evicted past it and fetched again, verified, when read. Bytes written here are
+  pinned until the host holds them and never evicted. `blobCache()` reports usage, `evictBlobs(target)` frees
+  on demand.
 - **Not yet:**
-  - writing attachments through write-back: PROJECT_WRITE carries no attachment ops, and the host's write-back
-    takes document writes only;
-  - attachment-only changes on a filtered namespace: they write no document, so they show when the document
-    next changes;
-  - evicting fetched blobs: they are kept until the replica is destroyed;
   - attachments in the Kotlin replica, which refuses commits carrying them.
 - **Bytes are lazy on the replica.** The replica stores refs and fetches bytes on first read or by a prefetch
   policy, with a blob cache under its own budget. Blobs it wrote and the host has not yet confirmed are pinned.

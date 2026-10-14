@@ -188,6 +188,42 @@ describe("replica against a Go node", { skip }, () => {
     await until("the replica's write to reach the host", async () => (await host.docs(ns))[mine] !== undefined);
   });
 
+  test("fetched attachment bytes are a bounded cache: least recently used are evicted and fetched again; pinned bytes stay", async () => {
+    const ns = "app/u/evict";
+    const MiB = 1024 * 1024;
+    const docs = [randomUuid(), randomUuid(), randomUuid()];
+    const texts = docs.map((_, i) => String.fromCharCode(97 + i).repeat(3 * MiB)); // 3 MiB each, distinct
+    for (const [i, id] of docs.entries()) {
+      await host.put(ns, id, { i });
+      await host.cmd({ op: "attach", ns, id, name: "f.txt", mime: "text/plain", text: texts[i] });
+    }
+    const r = await replica(ns, { blobCacheBytes: 7 * MiB });
+    await r.syncNow();
+    const read = async (i: number) => new TextDecoder().decode(await r.readAttachment(ns, docs[i]!, { name: "f.txt" }));
+    assert.equal(await read(0), texts[0]);
+    assert.equal(await read(1), texts[1]);
+    assert.equal((await r.blobCache()).bytes, 6 * MiB);
+    assert.equal(await read(2), texts[2]); // 9 MiB fetched: the least recently used goes
+    let stats = await r.blobCache();
+    assert.ok(stats.bytes <= 7 * MiB, `cache holds ${stats.bytes} bytes, over its bound`);
+    assert.equal(stats.blobs, 2);
+    assert.equal(await read(0), texts[0], "an evicted blob is fetched again, verified, on read");
+
+    // Bytes written here and not yet uploaded are never evicted; once the host holds them they are.
+    const mine = new Uint8Array(2 * MiB).fill(7);
+    const local = await replica(ns, { blobCacheBytes: 7 * MiB, autoSync: false });
+    await local.syncNow();
+    await local.putAttachment(ns, docs[0]!, "mine.bin", mine);
+    assert.equal(await local.evictBlobs(0), 0);
+    assert.equal((await local.blobCache()).pinnedBytes, 2 * MiB);
+    await local.syncNow(); // uploads, then unpins
+    stats = await local.blobCache();
+    assert.equal(stats.pinnedBytes, 0);
+    assert.equal(await local.evictBlobs(0), 2 * MiB);
+    assert.equal((await local.blobCache()).bytes, 0);
+    assert.deepEqual(await local.readAttachment(ns, docs[0]!, { name: "mine.bin" }), mine, "fetched back from the host");
+  });
+
   test("attachment refs replay with their commits, and every attachment root is verified", async () => {
     const ns = "app/u/attach";
     const doc = randomUuid(), other = randomUuid();

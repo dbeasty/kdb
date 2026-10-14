@@ -15,8 +15,8 @@ import type { Op } from "./commit.ts";
 import { ReplicaNamespace } from "./namespace.ts";
 import { PeerConnection, type ConflictReport } from "./peer.ts";
 import { CachedStore, type KvStore } from "./store.ts";
-import { ProjectionNamespace } from "./projection.ts";
-import { BlobStore, BlobUnavailableError } from "./blobs.ts";
+import { ProjectionNamespace, type LocalWrite } from "./projection.ts";
+import { BlobStore, BlobUnavailableError, type BlobCacheStats } from "./blobs.ts";
 import type { Attachment } from "./attachments.ts";
 import { syncNamespace, syncProjection, type CatchUp, type NamespaceSyncResult, type ProjectionSyncResult } from "./sync.ts";
 
@@ -50,6 +50,12 @@ export interface ReplicaOptions {
   live?: boolean;
   /** Page size asked of the host, in bytes. */
   pageBytes?: number;
+  /**
+   * Bytes of fetched attachments kept; least recently used are evicted past it, and fetched again
+   * when read (default 256 MiB; 0 keeps everything). Attachments written here and not yet uploaded
+   * are never evicted.
+   */
+  blobCacheBytes?: number;
   /** Start syncing at once (default true). */
   autoSync?: boolean;
   /**
@@ -122,7 +128,7 @@ export class Replica {
   private constructor(opts: ReplicaOptions, store: CachedStore) {
     this.#opts = opts;
     this.#store = store;
-    this.#blobs = new BlobStore(store);
+    this.#blobs = new BlobStore(store, opts.blobCacheBytes);
   }
 
   static async open(opts: ReplicaOptions): Promise<Replica> {
@@ -193,11 +199,7 @@ export class Replica {
   async write(ns: string, ops: Op[], message?: string): Promise<string> {
     const p = this.#proj.get(ns);
     if (p) {
-      const docs = ops.map((o) => {
-        if (o.kind === "write") return { docId: o.docId, json: o.json };
-        if (o.kind === "delete") return { docId: o.docId, json: null };
-        throw new Error(`kdb replica: a filtered namespace takes document writes and deletes only, not ${o.kind}`);
-      });
+      const docs = await projectionWrites(p, ops);
       const entry = await p.write(docs, randomUuid());
       this.#outboxSizes.set(ns, (this.#outboxSizes.get(ns) ?? 0) + 1);
       this.#emit("change", { namespace: ns, ids: docs.map((d) => d.docId), source: "local" });
@@ -255,7 +257,9 @@ export class Replica {
    * here, pinned, and go up before the commit that references them is pushed.
    */
   async putAttachment(ns: string, docId: string, name: string, data: Uint8Array, mime = "application/octet-stream"): Promise<string> {
-    if (!this.#ns.has(ns)) throw new Error(`kdb replica: attachments are written in full mode only; ${ns} is filtered`);
+    if (!this.#ns.has(ns) && !this.#proj.get(ns)?.writeBack) {
+      throw new Error(`kdb replica: ${ns} is filtered without write-back, so it is read-only here`);
+    }
     const hash = await this.#blobs.putLocal(data);
     const existing = (await this.attachments(ns, docId)).find((a) => a.name === name);
     return this.write(ns, [{
@@ -265,9 +269,25 @@ export class Replica {
   }
 
   async deleteAttachment(ns: string, docId: string, sel: { name?: string; id?: string }): Promise<string> {
-    if (!this.#ns.has(ns)) throw new Error(`kdb replica: attachments are written in full mode only; ${ns} is filtered`);
+    if (!this.#ns.has(ns) && !this.#proj.get(ns)?.writeBack) {
+      throw new Error(`kdb replica: ${ns} is filtered without write-back, so it is read-only here`);
+    }
     const a = await this.#find(ns, docId, sel);
     return this.write(ns, [{ kind: "attachmentDelete", docId, attachmentId: a.id }]);
+  }
+
+  /** What the attachment byte cache holds. */
+  blobCache(): Promise<BlobCacheStats> {
+    return this.#blobs.stats();
+  }
+
+  /**
+   * Evicts fetched attachment bytes, least recently used first, down to targetBytes of them (0
+   * frees every one; default: the cache's bound). Bytes written here and not yet uploaded stay.
+   * Returns the bytes freed; what was evicted is fetched again when read.
+   */
+  evictBlobs(targetBytes?: number): Promise<number> {
+    return this.#blobs.evict(targetBytes);
   }
 
   // --- events and status -------------------------------------------------------------------------
@@ -398,7 +418,7 @@ export class Replica {
       }
       for (const [name, p] of this.#proj) {
         try {
-          const r = await syncProjection(conn, p, { catchUp: "auto", pageBytes: this.#opts.pageBytes });
+          const r = await syncProjection(conn, p, { catchUp: "auto", pageBytes: this.#opts.pageBytes, blobs: this.#blobs });
           projections.push(r);
           this.#outboxSizes.set(name, await p.outboxSize());
           if (r.changed.length > 0) this.#emit("change", { namespace: name, ids: [...new Set(r.changed)], source: "remote" });
@@ -465,4 +485,51 @@ export class Replica {
 
 export function openReplica(opts: ReplicaOptions): Promise<Replica> {
   return Replica.open(opts);
+}
+
+/**
+ * A filtered namespace's local write from ops: each document's final body (or deletion) and, if
+ * its attachments change, its whole attachment set after the ops - starting from what it holds.
+ */
+async function projectionWrites(p: ProjectionNamespace, ops: Op[]): Promise<LocalWrite[]> {
+  const order: string[] = [];
+  const out = new Map<string, LocalWrite>();
+  const doc = (id: string): LocalWrite => {
+    const key = id.toLowerCase();
+    let w = out.get(key);
+    if (!w) {
+      w = { docId: key };
+      out.set(key, w);
+      order.push(key);
+    }
+    return w;
+  };
+  for (const o of ops) {
+    switch (o.kind) {
+      case "write":
+        doc(o.docId).json = o.json;
+        break;
+      case "delete": {
+        const w = doc(o.docId);
+        w.json = null;
+        w.attachments = undefined;
+        break;
+      }
+      case "attachmentPut":
+      case "attachmentDelete": {
+        const w = doc(o.docId);
+        if (w.json === null) throw new Error(`kdb replica: ${o.docId} is deleted by the same write`);
+        const set = (w.attachments ?? (await p.attachments(w.docId))).filter((a) => a.id !== o.attachmentId.toLowerCase());
+        if (o.kind === "attachmentPut") {
+          if (set.some((a) => a.name === o.name)) throw new Error(`kdb replica: ${o.docId} already has an attachment named ${o.name}`);
+          set.push({ id: o.attachmentId.toLowerCase(), name: o.name, scheme: o.scheme, contentHash: o.contentHash, size: o.size, mime: o.mime });
+        }
+        w.attachments = set;
+        break;
+      }
+      default:
+        throw new Error(`kdb replica: a filtered namespace does not take ${(o as Op).kind}`);
+    }
+  }
+  return order.map((k) => out.get(k)!);
 }

@@ -167,3 +167,58 @@ func VerifyMerkleInclusion(leaf codec.Hash, index, n int, proof []codec.Hash, tr
 	}
 	return sn == 0 && r == tree
 }
+
+// MerkleTree holds every level of an RFC 6962 tree, so that each audit path costs O(log n) rather
+// than the O(n) of MerkleInclusionProof. Built bottom up, a level's unpaired last node is carried
+// up unchanged, which gives the same tree as RFC 6962's split at the largest power of two below n.
+type MerkleTree struct {
+	levels [][]codec.Hash // levels[0] the leaves, the last level the root alone
+}
+
+// NewMerkleTree builds the tree over leaves (none: the tree of one empty chunk).
+func NewMerkleTree(leaves []codec.Hash) *MerkleTree {
+	if len(leaves) == 0 {
+		leaves = []codec.Hash{ChunkLeafHash(nil)}
+	}
+	t := &MerkleTree{levels: [][]codec.Hash{leaves}}
+	for level := leaves; len(level) > 1; {
+		next := make([]codec.Hash, (len(level)+1)/2)
+		for i := range next {
+			if 2*i+1 < len(level) {
+				next[i] = merkleNode(level[2*i], level[2*i+1])
+			} else {
+				next[i] = level[2*i]
+			}
+		}
+		t.levels = append(t.levels, next)
+		level = next
+	}
+	return t
+}
+
+// Leaves is the tree's leaf count.
+func (t *MerkleTree) Leaves() int { return len(t.levels[0]) }
+
+// Root is the tree hash.
+func (t *MerkleTree) Root() codec.Hash { return t.levels[len(t.levels)-1][0] }
+
+// Proof is leaf index's audit path, as MerkleInclusionProof gives it.
+func (t *MerkleTree) Proof(index int) []codec.Hash {
+	var path []codec.Hash
+	for _, level := range t.levels[:len(t.levels)-1] {
+		if sib := index ^ 1; sib < len(level) {
+			path = append(path, level[sib])
+		}
+		index >>= 1
+	}
+	return path
+}
+
+// AttachmentChunkCount is how many scheme-1 chunks, so leaves, an attachment of size bytes has: a
+// zero-byte attachment has one, of the empty chunk.
+func AttachmentChunkCount(size int64) int64 {
+	if size <= 0 {
+		return 1
+	}
+	return (size + AttachmentChunkBytes - 1) / AttachmentChunkBytes
+}

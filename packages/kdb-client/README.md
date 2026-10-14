@@ -96,6 +96,19 @@ an operation for `Transaction.attachments`, so attachments can commit together w
 writes. In SQL, a `Uint8Array` argument binds as bytes, `sqlAttachment(blob)` binds an uploaded
 blob (`STREAM ?`), and `queryValues` returns bytes cells (`ATTACHMENT('name')`) as `Uint8Array`.
 
+Part of an attachment can be read verified, without the rest, from a server that also agrees
+`attachment-proofs`: every 1 MiB chunk the range touches is checked against the content hash with
+its Merkle inclusion proof before any of its bytes is handed out.
+
+```ts
+const reader = await client.openAttachmentRange(ns, docId, "video.mp4", { offset: 5_000_000, length: 65_536 });
+for await (const part of reader) { /* ... */ }
+const bytes = await client.readAttachmentAt(ns, docId, "video.mp4", 5_000_000, 65_536); // shorter at the end
+```
+
+An offset past the end throws `KdbAttachmentRangeError`. (`ReadAttachmentOptions.offset` is a
+cheaper, unverified partial read.)
+
 ## Error handling
 
 Everything thrown extends `KdbError`, which carries the server's `code` and `retryAfterMs` when

@@ -346,6 +346,53 @@ func report(t *testing.T, phase, detail string) {
 	t.Helper()
 	live := liveHeapBytes()
 	t.Logf("PHASE %-10s liveHeap=%s rss=%s peakRSS=%s mapped=%s | %s", phase, mb(live), mb(currentRSS()), mb(peakRSS()), mb(mmapfile.MappedBytes()), detail)
+	if b := lastRSSPeak.Load(); b != nil {
+		t.Logf("RSSPEAK %-10s rss=%s = goRuntime %s (heap objects %s) + mappedResident %s (of %s mapped) + other %s",
+			phase, mb(b.rss), mb(b.goTotal), mb(b.heapObjects), mb(b.mappedResident), mb(b.mapped), mb(b.rss-b.goTotal-b.mappedResident))
+	}
+}
+
+// rssBreakdown is the process's resident memory at one instant, split into what the Go runtime
+// holds, what mapped files (storage/mmapfile) have resident, and the rest - file pages mapped by
+// other means, allocator memory outside Go, the binary itself.
+type rssBreakdown struct {
+	rss, goTotal, heapObjects, mappedResident, mapped int64
+}
+
+// lastRSSPeak is the breakdown at the RSS peak of the phase sampled last (KDB_MEMPROFILE_RSS=1).
+var lastRSSPeak atomic.Pointer[rssBreakdown]
+
+// sampleRSS records the breakdown at the highest RSS seen until done closes. Each sample runs ps,
+// so it samples every 50 ms, not every 2 ms like the heap.
+func sampleRSS(done <-chan struct{}) {
+	lastRSSPeak.Store(nil)
+	samples := []metrics.Sample{
+		{Name: "/memory/classes/total:bytes"},
+		{Name: "/memory/classes/heap/released:bytes"},
+		{Name: "/memory/classes/heap/objects:bytes"},
+	}
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	var peak rssBreakdown
+	for {
+		if rss := currentRSS(); rss > peak.rss {
+			metrics.Read(samples)
+			peak = rssBreakdown{
+				rss:            rss,
+				goTotal:        int64(samples[0].Value.Uint64() - samples[1].Value.Uint64()),
+				heapObjects:    int64(samples[2].Value.Uint64()),
+				mappedResident: mmapfile.ResidentBytesUncached(),
+				mapped:         mmapfile.MappedBytes(),
+			}
+			p := peak
+			lastRSSPeak.Store(&p)
+		}
+		select {
+		case <-done:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 func currentRSS() int64 {
@@ -365,6 +412,9 @@ type heapSampler struct {
 
 func sampleHeap() *heapSampler {
 	s := &heapSampler{done: make(chan struct{})}
+	if os.Getenv("KDB_MEMPROFILE_RSS") == "1" {
+		go sampleRSS(s.done)
+	}
 	go func() {
 		sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
 		tick := time.NewTicker(2 * time.Millisecond)

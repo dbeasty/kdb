@@ -35,9 +35,17 @@ public const val WIRE_FEATURE_ZSTD: String = "zstd-frames"
  * (the Kotlin server does not, so it leaves it out of its ack). */
 public const val WIRE_FEATURE_ATTACHMENTS: String = "attachments"
 
+/** The peer answers an ATTACHMENT_GET with proofs set with chunk-aligned pages carrying each
+ * chunk's RFC 6962 audit path, so a client can verify a range of an attachment without reading the
+ * rest. Only meaningful with [WIRE_FEATURE_ATTACHMENTS] (the Kotlin server acks neither). */
+public const val WIRE_FEATURE_ATTACHMENT_PROOFS: String = "attachment-proofs"
+
 /** Every feature this build's codec implements, in the order a client offers them. */
 public val SUPPORTED_WIRE_FEATURES: List<String> =
-    listOf(WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD, WIRE_FEATURE_ATTACHMENTS)
+    listOf(
+        WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD, WIRE_FEATURE_ATTACHMENTS,
+        WIRE_FEATURE_ATTACHMENT_PROOFS,
+    )
 
 /** The features in [offered] this build supports; what a server acks. The others extend or
  * compress binary frames, so without [WIRE_FEATURE_BINARY] none is agreed. */

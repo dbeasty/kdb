@@ -25,8 +25,10 @@ import {
   attachmentContentHash,
   connect,
   KdbAttachmentNotFoundError,
+  KdbAttachmentRangeError,
   KdbUnsupportedError,
   sqlAttachment,
+  WIRE_FEATURE_ATTACHMENT_PROOFS,
   WIRE_FEATURE_ATTACHMENTS,
   type Client,
 } from "../src/index.ts";
@@ -242,6 +244,82 @@ describe("live attachments against the Go server", { skip: goAvailable() ? false
     assert.ok(parts.length >= 5, `${parts.length} pages`);
     assert.equal(Buffer.compare(Buffer.concat(parts), Buffer.from(data)), 0);
     assert.equal(reader.superseded, true);
+  });
+
+  it("reads verified ranges, checked chunk by chunk against the content hash", async (t) => {
+    if (!needsMessages(t)) return;
+    assert.ok(client.wireFeatures.includes(WIRE_FEATURE_ATTACHMENT_PROOFS), client.wireFeatures.join(","));
+    await client.exec(NS, "INSERT INTO files (title) VALUES ('ranged')");
+    const docId = await docIdOf("files", "ranged");
+    const MIB = 1024 * 1024;
+    // go/kdb/document's range-proof golden attachment: five chunks, the last 5 bytes.
+    const data = new Uint8Array(4 * MIB + 5);
+    for (let i = 0; i < data.length; i++) data[i] = i % 251;
+    const size = data.length;
+    const put = await client.putAttachment(NS, docId, data, { name: "r.bin" });
+    assert.equal(put.attachment.hash, "1a57b9052a9bae5f2bbaa720791a30f99ea84caecaa0898551c84d1746d3ae27");
+
+    const cases: Array<[number, number]> = [
+      [0, 10],
+      [MIB + 100, 50],
+      [MIB - 10, 20], // across a chunk boundary
+      [100, 4 * MIB + 7 - 100], // across pages, cut at the end
+      [2 * MIB - 3, MIB + 6], // three chunks
+      [3 * MIB, -1],
+      [size - 1, 1], // last byte
+      [2 * MIB + 1, 0],
+      [size, -1], // exactly at the end
+    ];
+    for (const [offset, length] of cases) {
+      const reader = await client.openAttachmentRange(NS, docId, "r.bin", { offset, length });
+      const parts: Uint8Array[] = [];
+      for await (const part of reader) parts.push(part);
+      const end = length >= 0 ? Math.min(size, offset + length) : size;
+      assert.equal(Buffer.compare(Buffer.concat(parts), Buffer.from(data.subarray(offset, end))), 0, `${offset}+${length}`);
+      assert.equal(reader.commit, put.commit);
+      assert.equal(reader.superseded, false);
+    }
+    assert.deepEqual(await client.readAttachmentAt(NS, docId, "r.bin", size - 3, 10), data.subarray(size - 3));
+
+    const past = await client.readAttachmentAt(NS, docId, "r.bin", size + 1, 1).then(
+      () => assert.fail("read past the end"),
+      (e: unknown) => e,
+    );
+    assert.ok(past instanceof KdbAttachmentRangeError, String(past));
+    assert.equal(past.size, size);
+    // Refused opens leave no read pinned: far more than the connection's 64 reads still work.
+    for (let i = 0; i < 70; i++) {
+      await assert.rejects(client.readAttachmentAt(NS, docId, "r.bin", size + 1, 1), KdbAttachmentRangeError);
+    }
+    // So do ranges released at their end, short of the attachment's.
+    for (let i = 0; i < 70; i++) {
+      assert.equal((await client.readAttachmentAt(NS, docId, "r.bin", i, 1))[0], i % 251);
+    }
+
+    // A range pins its version and reports a newer one at its end, though not the attachment's.
+    const reader = await client.openAttachmentRange(NS, docId, "r.bin", { offset: MIB - 1, length: 2 * MIB });
+    const parts: Uint8Array[] = [];
+    let replaced = false;
+    for await (const part of reader) {
+      parts.push(part);
+      if (!replaced) {
+        replaced = true;
+        await client.putAttachment(NS, docId, utf8("replaced"), { name: "r.bin" });
+      }
+    }
+    assert.equal(Buffer.compare(Buffer.concat(parts), Buffer.from(data.subarray(MIB - 1, 3 * MIB - 1))), 0);
+    assert.equal(reader.superseded, true);
+    // The old version stays readable by commit.
+    assert.deepEqual(await client.readAttachmentAt(NS, docId, "r.bin", size - 5, -1, { asOf: put.commit }), data.subarray(size - 5));
+
+    // A zero-byte attachment proves its one empty chunk.
+    await client.putAttachment(NS, docId, new Uint8Array(0), { name: "empty" });
+    for (const length of [-1, 0, 10]) {
+      const r = await client.openAttachmentRange(NS, docId, "empty", { length });
+      assert.equal(r.info.size, 0);
+      for await (const part of r) assert.equal(part.length, 0);
+    }
+    await assert.rejects(client.readAttachmentAt(NS, docId, "empty", 1, 1), KdbAttachmentRangeError);
   });
 
   it("commits attachment operations in one transaction with a document write", async (t) => {

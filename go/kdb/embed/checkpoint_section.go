@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
@@ -10,6 +11,7 @@ import (
 	"hash/crc32"
 	"io"
 	"log"
+	"os"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
@@ -130,6 +132,8 @@ func writeSectionedCheckpoint(shim storage.PlatformIOShim, cp namespaceCheckpoin
 	}); err != nil {
 		return err
 	}
+	// Both walks touched every page of the tree's mapped segments; let them go.
+	cp.LiveTree.DropMappedPages()
 	previous := currentSectionKey(shim, cp.NamespaceID)
 	raw, err := encodeCheckpointWith(cp, &section)
 	if err != nil {
@@ -190,55 +194,146 @@ func sectionFromRecord(rec codec.RecordValue) (checkpointSection, error) {
 	return s, nil
 }
 
-// readCheckpointSection hands fn the section's packed tree and packed commits, verified: magic,
-// lengths, CRC and the tree's digest. The bytes are valid only during fn - mapped from the file
-// where the shim keeps it locally and the platform maps files, read into the heap otherwise.
-func readCheckpointSection(shim storage.PlatformIOShim, s checkpointSection, fn func(tree, commits []byte) error) error {
-	use := func(raw []byte) error {
-		want := checkpointSectionHeader + s.treeLen + s.commitsLen + 4
-		if int64(len(raw)) != want {
-			return fmt.Errorf("kdb: checkpoint section %s is %d bytes, the record says %d", s.key, len(raw), want)
-		}
-		if !bytes.Equal(raw[:8], checkpointSectionMagic[:]) ||
-			int64(binary.LittleEndian.Uint64(raw[8:])) != s.treeLen ||
-			int64(binary.LittleEndian.Uint64(raw[16:])) != s.commitsLen {
+// readCheckpointSection verifies the section - magic, lengths, CRC and the tree's digest - and
+// returns its packed commits, in the heap, plus withTree, which hands its fn the packed tree.
+//
+// Verified by reading the file through a small buffer, not by mapping it: read pages go to the page
+// cache, not to this process's resident set, and a mapped section touched whole for its checksum
+// put 484 MB into RSS at a 10M-document open. withTree maps only the tree's bytes, and only if the
+// caller needs them - with a tree file the tree is attached by digest and it is never called. A
+// store without local files has the section read into the heap, as before.
+func readCheckpointSection(shim storage.PlatformIOShim, s checkpointSection) (commits []byte, withTree func(fn func(tree []byte) error) error, err error) {
+	want := checkpointSectionHeader + s.treeLen + s.commitsLen + 4
+	checkHeader := func(hdr []byte) error {
+		if !bytes.Equal(hdr[:8], checkpointSectionMagic[:]) ||
+			int64(binary.LittleEndian.Uint64(hdr[8:])) != s.treeLen ||
+			int64(binary.LittleEndian.Uint64(hdr[16:])) != s.commitsLen {
 			return fmt.Errorf("kdb: checkpoint section %s does not match its record", s.key)
 		}
-		body := raw[:len(raw)-4]
-		if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(raw[len(raw)-4:]) {
-			return fmt.Errorf("kdb: checkpoint section %s fails its checksum", s.key)
-		}
-		tree := body[checkpointSectionHeader : checkpointSectionHeader+s.treeLen]
-		if sha256.Sum256(tree) != s.treeDigest {
-			return fmt.Errorf("kdb: checkpoint section %s holds a different tree than its record names", s.key)
-		}
-		return fn(tree, body[checkpointSectionHeader+s.treeLen:])
+		return nil
 	}
-	if ss, ok := shim.(storage.SnapshotStreamer); ok && mmapfile.Supported {
+	if ss, ok := shim.(storage.SnapshotStreamer); ok {
 		if path, ok := ss.LocalSnapshotPath(s.key); ok {
-			if m, err := mmapfile.Open(path); err == nil {
-				defer m.Close()
-				region, err := m.Acquire()
-				if err != nil {
-					return err
-				}
-				defer region.Release()
-				var inner error
-				if gerr := region.Guard(func(b []byte) { inner = use(b) }); gerr != nil {
-					return gerr
-				}
-				return inner
+			if commits, err := verifySectionFile(path, s, want, checkHeader); err != nil {
+				return nil, nil, err
+			} else {
+				return commits, func(fn func(tree []byte) error) error { return withSectionTree(path, s, fn) }, nil
 			}
 		}
 	}
 	raw, err := shim.ReadSnapshot(s.key)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if raw == nil {
-		return fmt.Errorf("kdb: checkpoint section %s is missing", s.key)
+		return nil, nil, fmt.Errorf("kdb: checkpoint section %s is missing", s.key)
 	}
-	return use(raw)
+	if int64(len(raw)) != want {
+		return nil, nil, fmt.Errorf("kdb: checkpoint section %s is %d bytes, the record says %d", s.key, len(raw), want)
+	}
+	if err := checkHeader(raw); err != nil {
+		return nil, nil, err
+	}
+	body := raw[:len(raw)-4]
+	if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(raw[len(raw)-4:]) {
+		return nil, nil, fmt.Errorf("kdb: checkpoint section %s fails its checksum", s.key)
+	}
+	tree := body[checkpointSectionHeader : checkpointSectionHeader+s.treeLen]
+	if sha256.Sum256(tree) != s.treeDigest {
+		return nil, nil, fmt.Errorf("kdb: checkpoint section %s holds a different tree than its record names", s.key)
+	}
+	return body[checkpointSectionHeader+s.treeLen:], func(fn func([]byte) error) error { return fn(tree) }, nil
+}
+
+// verifySectionFile streams the section file at path through its checks and returns the commits.
+func verifySectionFile(path string, s checkpointSection, want int64, checkHeader func([]byte) error) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("kdb: checkpoint section %s is missing", s.key)
+		}
+		return nil, err
+	}
+	defer f.Close()
+	if st, err := f.Stat(); err != nil {
+		return nil, err
+	} else if st.Size() != want {
+		return nil, fmt.Errorf("kdb: checkpoint section %s is %d bytes, the record says %d", s.key, st.Size(), want)
+	}
+	r := bufio.NewReaderSize(f, 1<<20)
+	crc := crc32.NewIEEE()
+	var hdr [checkpointSectionHeader]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	if err := checkHeader(hdr[:]); err != nil {
+		return nil, err
+	}
+	crc.Write(hdr[:])
+	th := sha256.New()
+	if _, err := io.CopyN(io.MultiWriter(crc, th), r, s.treeLen); err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(th.Sum(nil), s.treeDigest[:]) {
+		return nil, fmt.Errorf("kdb: checkpoint section %s holds a different tree than its record names", s.key)
+	}
+	commits := make([]byte, s.commitsLen)
+	if _, err := io.ReadFull(r, commits); err != nil {
+		return nil, err
+	}
+	crc.Write(commits)
+	var sum [4]byte
+	if _, err := io.ReadFull(r, sum[:]); err != nil {
+		return nil, err
+	}
+	if crc.Sum32() != binary.LittleEndian.Uint32(sum[:]) {
+		return nil, fmt.Errorf("kdb: checkpoint section %s fails its checksum", s.key)
+	}
+	return commits, nil
+}
+
+// withSectionTree hands fn the packed tree of the already-verified section file at path: mapped
+// where the platform maps files, read into the heap otherwise. Its digest is checked again on the
+// bytes fn gets, since the file was read once and mapped afterwards.
+func withSectionTree(path string, s checkpointSection, fn func(tree []byte) error) error {
+	use := func(tree []byte) error {
+		if sha256.Sum256(tree) != s.treeDigest {
+			return fmt.Errorf("kdb: checkpoint section %s changed after it was verified", s.key)
+		}
+		return fn(tree)
+	}
+	lo, hi := int(checkpointSectionHeader), int(checkpointSectionHeader+s.treeLen)
+	if mmapfile.Supported {
+		if m, err := mmapfile.Open(path); err == nil {
+			defer m.Close()
+			region, err := m.Acquire()
+			if err != nil {
+				return err
+			}
+			defer region.Release()
+			var inner error
+			if gerr := region.Guard(func(b []byte) {
+				if len(b) < hi {
+					inner = fmt.Errorf("kdb: checkpoint section %s shrank after it was verified", s.key)
+					return
+				}
+				inner = use(b[lo:hi])
+			}); gerr != nil {
+				return gerr
+			}
+			return inner
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tree := make([]byte, s.treeLen)
+	if _, err := f.ReadAt(tree, int64(lo)); err != nil {
+		return err
+	}
+	return use(tree)
 }
 
 func logTreeSegmentFailure(namespaceID string, err error) {

@@ -6,8 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 )
 
 // Zone is the graduated pressure level kdb-spec-layer13 Component 48 §5.5 defines. Policy is
@@ -292,25 +290,23 @@ func (g *MemoryGuard) zoneFor(used float64, from Zone) Zone {
 // controller is available - non-Linux hosts, or a Linux host not running inside one.
 //
 // Mapped files (storage/mmapfile: the commit graph, the live tree file, the delta-index and
-// SSTable index sidecars) are page cache, not Go heap, and the two paths account for them
-// differently:
+// SSTable index sidecars) are not charged on either path. Every mapping KDB makes is read-only
+// (PROT_READ, MAP_SHARED), so its pages are always clean: the OS drops them under pressure without
+// writing anything back and refaults them if they are read again. They cost performance when memory
+// is short, never memory safety - and memory safety is what the zones protect.
 //
-//   - cgroup path: mapped pages are charged as page cache, so nothing is added here. Pages that
-//     age onto the inactive LRU are reclaimable and are meant to stop counting; ones that keep
-//     being read stay on the active list and stay counted.
-//   - no-cgroup path (macOS, bare Linux): runtime/metrics knows nothing about the page cache, so
-//     the mapped pages that are resident right now are added (mmapfile.ResidentBytes). Not the
-//     whole mapped size: with the graph, the tree and every index sidecar mapped, charging each
-//     file whole put the guard into a pressure zone and shed load long before memory was short,
-//     for pages the OS can drop at will. Resident is still an over-count of what is unrecoverable
-//     (clean resident pages are reclaimable too) but it is bounded by what is actually in memory.
-//     ResidentBytes is cached for a second or more, so a burst of paging-in shows up a sample or
-//     few late, which the guard's moving average spans anyway.
+//   - cgroup path: mapped pages are page cache in memory.current; the working set already leaves
+//     out the inactive ones, and the active ones are what is being read right now.
+//   - no-cgroup path (macOS, bare Linux): only what the Go runtime holds. This used to add the
+//     resident mapped pages (#199) and, before that, every mapping's full size: at 10M documents a
+//     merge that had read its input sidecars, or an open that had read its checkpoint, left over a
+//     gigabyte of such pages resident, and the guard read that as pressure and shed load while the
+//     heap was a few hundred MB.
 func currentMemoryUsageBytes() float64 {
 	if v, ok := cgroupMemoryCurrentBytes(); ok {
 		return float64(v)
 	}
-	return goRuntimeFootprintBytes() + float64(mmapfile.ResidentBytes())
+	return goRuntimeFootprintBytes()
 }
 
 // goRuntimeFootprintBytes is what the Go runtime has mapped and not released.

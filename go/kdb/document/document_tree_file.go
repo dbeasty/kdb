@@ -535,6 +535,31 @@ func (s *trieSlab) retireSegment(g *treeSegment) {
 }
 
 // unmap closes g's mapping, and deletes its file when del and nothing needs it on disk.
+// DropMappedPages releases the resident pages of every tree segment t's slab has mapped. A walk of
+// the whole tree - a checkpoint packs it twice - touches every page of every segment; left mapped
+// they stay resident (nearly 1 GB at 10M documents) and, read twice, count as active page cache
+// in a cgroup's working set. The mappings are read-only and file-backed, so nothing is lost: a
+// later read faults the page back in. A no-op for a tree not bound to a file.
+func (t DocumentTree) DropMappedPages() {
+	h := t.trie
+	if h == nil {
+		return
+	}
+	s := h.slab
+	s.mu.Lock() // unmap runs under it: a segment cannot be released mid-drop
+	defer s.mu.Unlock()
+	p := s.segs.p.Load()
+	if p == nil {
+		return
+	}
+	for _, g := range *p {
+		if g.unmapped || g.region == nil {
+			continue
+		}
+		_ = g.region.DropPages(0, len(g.region.Bytes()))
+	}
+}
+
 func (g *treeSegment) unmap(del bool) {
 	if g.unmapped {
 		return

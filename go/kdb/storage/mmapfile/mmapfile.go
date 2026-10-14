@@ -25,6 +25,7 @@ package mmapfile
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -79,8 +80,9 @@ var resident struct {
 
 // ResidentBytes reports how many bytes of the live mappings are in memory now: the pages the OS
 // would have to give up, or keep, rather than the address space they span. Clean mapped pages
-// are reclaimable page cache, so a large mapping read only in part costs only that part; this is
-// the figure to budget against where nothing else (a cgroup) accounts for page cache.
+// are reclaimable page cache, so a large mapping read only in part costs only that part. A figure
+// for reporting: the memory guard does not charge mapped pages at all, since every KDB mapping is
+// read-only and so always clean and reclaimable (server.currentMemoryUsageBytes).
 //
 // Counted with mincore(2), which reports residency in the page cache, so a page counts whether
 // this process or another brought it in. Where mincore is unavailable the full mapped size is
@@ -96,6 +98,15 @@ func ResidentBytes() int64 {
 		resident.ttl = max(residentCacheTTL, residentCostFactor*done.Sub(now))
 	}
 	return min(resident.bytes, MappedBytes())
+}
+
+// ResidentBytesUncached is ResidentBytes counted now, bypassing its cache: for measurement
+// harnesses that sample residency at a known moment. It costs a full mincore pass every call, so
+// nothing on a hot path should use it.
+func ResidentBytesUncached() int64 {
+	resident.mu.Lock()
+	defer resident.mu.Unlock()
+	return min(residentBytesNow(), MappedBytes())
 }
 
 // residentBytesNow counts resident bytes across every live mapping, uncached. The caller holds
@@ -233,6 +244,34 @@ func (r *Region) Guard(fn func([]byte)) (err error) {
 	}()
 	fn(r.m.data)
 	return nil
+}
+
+// DropPages tells the kernel the mapped pages wholly inside [off, off+n) will not be read again
+// soon, so they leave the process's resident set now rather than when the mapping is closed. For a
+// reader that walks a mapping once, front to back - a merge reading its inputs' sidecars - and
+// would otherwise keep every page it has passed resident until the end.
+//
+// Only whole pages are dropped: the partial pages at either end stay, so a caller can drop what is
+// behind its read position without losing the page it is in. The bytes are unchanged - the mapping
+// is read-only and file-backed - and reading them again faults them back in. A no-op off Linux and
+// Darwin.
+func (r *Region) DropPages(off, n int) error {
+	data := r.m.data
+	if off < 0 || n < 0 || off+n > len(data) {
+		return fmt.Errorf("mmapfile: DropPages(%d, %d) outside a %d-byte mapping", off, n, len(data))
+	}
+	start, end := wholePages(off, n, os.Getpagesize())
+	if end <= start {
+		return nil
+	}
+	return dropResident(data[start:end])
+}
+
+// wholePages is the span of the whole pages inside [off, off+n), empty (end <= start) when there
+// is none. Mappings start on a page boundary, so offsets into one are page-aligned where the file's
+// are.
+func wholePages(off, n, page int) (start, end int) {
+	return (off + page - 1) / page * page, (off + n) / page * page
 }
 
 // Release returns the reference. Safe to call more than once.

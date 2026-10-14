@@ -87,7 +87,11 @@ func randomCommit(r *rand.Rand) Commit {
 // path, and for corrupted ones.
 func TestDirectCommitCodecMatchesGeneric(t *testing.T) {
 	r := rand.New(rand.NewSource(1))
-	for i := 0; i < 400; i++ {
+	commits := 400
+	if testing.Short() {
+		commits = 100 // all 400 run nightly, or without -short
+	}
+	for i := 0; i < commits; i++ {
 		c := randomCommit(r)
 		want := genericEncodeCommit(t, c)
 		got, err := c.ToPayloadBytes()

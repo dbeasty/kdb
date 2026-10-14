@@ -234,6 +234,10 @@ func TestForeignGroupPartIsFlagged(t *testing.T) {
 // took 1,000 writes while apart converge over a real socket - one merge, one head - and each
 // one's index agrees with its documents afterwards.
 func TestTwoServersConvergeWithIndexes(t *testing.T) {
+	writes := 1000
+	if testing.Short() {
+		writes = 200 // the full 1,000 run nightly, or without -short
+	}
 	a, b := newTestRuntime(t), newTestRuntime(t)
 	providers := map[string]*RegistryIndexProvider{}
 	for name, rt := range map[string]*KdbServerRuntime{"a": a, "b": b} {
@@ -247,7 +251,7 @@ func TestTwoServersConvergeWithIndexes(t *testing.T) {
 			t.Fatal(err)
 		}
 		providers[name] = p
-		for i := 0; i < 1000; i++ {
+		for i := 0; i < writes; i++ {
 			putDoc(t, rt, `{"tag":"from`+name+`"}`)
 		}
 	}
@@ -287,8 +291,8 @@ func TestTwoServersConvergeWithIndexes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(hits) != 1000 {
-				t.Errorf("node %s: index finds %d documents tagged %s, want 1000", name, len(hits), tag)
+			if len(hits) != writes {
+				t.Errorf("node %s: index finds %d documents tagged %s, want %d", name, len(hits), tag, writes)
 			}
 		}
 	}

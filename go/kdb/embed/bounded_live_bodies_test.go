@@ -89,6 +89,9 @@ func requireAllLive(tb testing.TB, rt *embed.EmbeddedKdbRuntime, ids []codec.UUI
 // near its budget - which, at 64 shards of at least 64 KiB each, cannot go below 4 MiB - every live document still reads back exactly, including after a reopen, and the
 // cold path is what served them. Without the flag the store holds every live body, as before.
 func TestBoundedLiveBodiesServeLiveDataLargerThanTheCache(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heap measurement; runs nightly, or without -short")
+	}
 	for _, mode := range []storage.HistoryMode{storage.HistoryModeFull, storage.HistoryModeNone} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			root := t.TempDir()

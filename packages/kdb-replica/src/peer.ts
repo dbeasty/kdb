@@ -484,7 +484,8 @@ export interface ProjectWriteResult {
   outcome: string;
   commitHex: string;
   reason: string;
-  current: { docId: string; body?: string; absent?: boolean }[];
+  /** The source's state of every document named, at commitHex - attachments included. */
+  current: { docId: string; body?: string; absent?: boolean; attachments?: { id: string; name: string; hash: string; size: number; mime?: string }[] }[];
 }
 
 export interface RefUpdateAck {

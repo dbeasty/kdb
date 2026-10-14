@@ -12,7 +12,7 @@ package integration
 // so far - so recovery is also exercised on top of recovered data, kill after kill. The child runs
 // with GOMAXPROCS=2, the shape of a CI runner, where the e2e failure was seen.
 //
-// KDB_KILL9_ITERATIONS sets the number of kills (default 3, and the test is skipped under -short);
+// KDB_KILL9_ITERATIONS sets the number of kills (default 3, and 1 under -short);
 // soak it with e.g. KDB_KILL9_ITERATIONS=200 go test -run TestServerKill9 ./kdb/integration/.
 // KDB_KILL9_SERVICE_ARGS adds space-separated kdb-service flags, e.g. "--sync-mode fast" to soak
 // another durability setting, or "--durability async" - which may lose acknowledged writes by
@@ -231,10 +231,10 @@ func (a *ackedWrites) record(doc string, v int) {
 }
 
 func TestServerKill9LosesNoAcknowledgedWrite(t *testing.T) {
-	if testing.Short() {
-		t.Skip("spawns kdb-service and kills it repeatedly")
-	}
 	iterations := 3
+	if testing.Short() {
+		iterations = 1 // the PR smoke; the nightly runs 3 and soaks 150
+	}
 	if v := os.Getenv("KDB_KILL9_ITERATIONS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
