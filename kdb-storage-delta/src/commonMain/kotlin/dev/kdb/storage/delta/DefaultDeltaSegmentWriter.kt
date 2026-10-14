@@ -270,7 +270,14 @@ public class DefaultDeltaSegmentReader(
      * @throws UnreadableSegmentException if a listed segment cannot be read, unless it was
      *   deleted in the meantime - never a silent omission.
      */
-    override suspend fun listSegments(): List<DeltaSegmentRef> {
+    override suspend fun listSegments(): List<DeltaSegmentRef> = listSegmentsAfter(-1)
+
+    /**
+     * [listSegments] restricted to sequences above [afterSequence], reading only those: resuming
+     * after a checkpoint (Go's DeltaSegmentRangeLister), where listing scans each segment it
+     * returns and the ones the checkpoint covers must not be read at all.
+     */
+    public suspend fun listSegmentsAfter(afterSequence: Long): List<DeltaSegmentRef> {
         val prefix = SegmentNameBuilder.namespacePrefix(namespaceId) + "delta/"
         val names = ioShim.listSegments(namespaceId).filter { it.startsWith(prefix) }
         val legacy = mutableListOf<String>()
@@ -282,6 +289,7 @@ public class DefaultDeltaSegmentReader(
                 legacy += name
                 continue
             }
+            if (seq <= afterSequence) continue
             val ref =
                 try {
                     scanSegmentRef(name, seq)
