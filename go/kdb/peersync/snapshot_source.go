@@ -44,13 +44,13 @@ var (
 	snapshotSortMinDocs = 100_000
 	// snapshotRunBytes is how many bytes of bodies one sorted run holds: what building the copy
 	// holds in memory at once.
-	snapshotRunBytes = 32 << 20
+	snapshotRunBytes = 16 << 20
 )
 
 const (
 	// snapshotRunBatchBytes is how much of each run a cursor holds while merging: a batch of
 	// documents and a read buffer of this size each.
-	snapshotRunBatchBytes = 32 << 10
+	snapshotRunBatchBytes = 16 << 10
 	// snapshotSourceIdle is how long a copy no page has used is kept.
 	snapshotSourceIdle = 2 * time.Minute
 	// maxSourceCursors bounds the cursors a copy keeps for reuse: one per peer paging it.
@@ -126,8 +126,8 @@ func (s *sortedBodies) build(env IngestEnv, streamer storage.TreeBodyStreamer, t
 				return err
 			}
 		}
-		if err := run.w.Flush(); err != nil {
-			return run.writeErr(err)
+		if err := run.seal(); err != nil {
+			return err
 		}
 		clear(recs)
 		recs, size = recs[:0], 0
