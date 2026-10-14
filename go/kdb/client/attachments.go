@@ -38,6 +38,25 @@ const AttachmentChunkBytes = 1 << 20
 // replica, or have it repaired; retrying the same server cannot help.
 var ErrAttachmentCorrupt = errors.New("kdb: attachment bytes do not match their content hash")
 
+// ErrAttachmentRange is what an AttachmentRangeError matches with errors.Is.
+var ErrAttachmentRange = errors.New("kdb: offset outside the attachment")
+
+// AttachmentRangeError reports a ranged read starting past the attachment's end. Size is the
+// attachment's length, or -1 when the offset was refused before the server was asked.
+type AttachmentRangeError struct {
+	Offset int64
+	Size   int64
+}
+
+func (e *AttachmentRangeError) Error() string {
+	if e.Size < 0 {
+		return fmt.Sprintf("kdb: attachment offset %d is negative", e.Offset)
+	}
+	return fmt.Sprintf("kdb: attachment offset %d is past its %d bytes", e.Offset, e.Size)
+}
+
+func (e *AttachmentRangeError) Is(target error) bool { return target == ErrAttachmentRange }
+
 // AttachmentInfo describes one attachment.
 type AttachmentInfo struct {
 	ID   string
@@ -230,7 +249,8 @@ func fromWireInfo(in wire.AttachmentInfo) AttachmentInfo {
 }
 
 // AttachmentReader streams one attachment, verifying its bytes against the content hash. It reads
-// the version that was current when it was opened, to the end, whatever commits meanwhile.
+// the version that was current when it was opened, to the end (or the end of its range), whatever
+// commits meanwhile.
 type AttachmentReader struct {
 	c          *Client
 	ctx        context.Context
@@ -245,6 +265,14 @@ type AttachmentReader struct {
 	superseded bool
 	merkle     document.MerkleBuilder
 	chunk      []byte
+
+	// A ranged read (OpenAttachmentRange): pages are whole chunks from pageOff, each proved against
+	// tree, and only [offset, end) of them is handed out.
+	ranged  bool
+	length  int64 // as asked; -1 to the end
+	end     int64 // -1 until the first page gives the size
+	pageOff int64
+	tree    codec.Hash
 }
 
 // Info describes the attachment being read.
@@ -253,8 +281,8 @@ func (r *AttachmentReader) Info() AttachmentInfo { return r.info }
 // Commit is the commit the attachment was read at.
 func (r *AttachmentReader) Commit() string { return r.commit }
 
-// Superseded, after the last byte has been read, reports that the attachment has changed since the
-// read began: a newer version exists, or it was removed.
+// Superseded, after the last byte has been read (of the range, for a ranged read), reports that the
+// attachment has changed since the read began: a newer version exists, or it was removed.
 func (r *AttachmentReader) Superseded() bool { return r.superseded }
 
 // OpenAttachment opens one of docID's attachments as of asOf (empty: the head).
@@ -262,16 +290,11 @@ func (c *Client) OpenAttachment(ctx context.Context, ns, docID string, ref Attac
 	if err := c.requireAttachments(); err != nil {
 		return nil, err
 	}
-	doc, err := codec.UUIDFromString(docID)
+	msg, err := attachmentGet(c, ns, docID, ref, asOf)
 	if err != nil {
-		return nil, fmt.Errorf("kdb: invalid docID: %w", err)
+		return nil, err
 	}
-	msg := wire.AttachmentGetMessage{H: hdr(c, wire.MsgAttachmentGet), Namespace: ns, DocID: doc, Name: ref.Name, AsOfHex: asOf, MaxBytes: AttachmentChunkBytes}
-	if ref.ID != "" {
-		if msg.AttachmentID, err = codec.UUIDFromString(ref.ID); err != nil {
-			return nil, fmt.Errorf("kdb: invalid attachment ID: %w", err)
-		}
-	}
+	msg.MaxBytes = AttachmentChunkBytes
 	r := &AttachmentReader{c: c, ctx: ctx, ns: ns}
 	if err := r.fetch(msg); err != nil {
 		return nil, err
@@ -280,6 +303,134 @@ func (c *Client) OpenAttachment(ctx context.Context, ns, docID string, ref Attac
 		return nil, err
 	}
 	return r, nil
+}
+
+func attachmentGet(c *Client, ns, docID string, ref AttachmentRef, asOf string) (wire.AttachmentGetMessage, error) {
+	doc, err := codec.UUIDFromString(docID)
+	if err != nil {
+		return wire.AttachmentGetMessage{}, fmt.Errorf("kdb: invalid docID: %w", err)
+	}
+	msg := wire.AttachmentGetMessage{H: hdr(c, wire.MsgAttachmentGet), Namespace: ns, DocID: doc, Name: ref.Name, AsOfHex: asOf}
+	if ref.ID != "" {
+		if msg.AttachmentID, err = codec.UUIDFromString(ref.ID); err != nil {
+			return wire.AttachmentGetMessage{}, fmt.Errorf("kdb: invalid attachment ID: %w", err)
+		}
+	}
+	return msg, nil
+}
+
+// OpenAttachmentRange opens length bytes of one of docID's attachments from offset (length -1: to
+// the end; a range running past the end stops there), as of asOf (empty: the head). Every chunk is
+// checked against the content hash with its inclusion proof before any of its bytes is returned,
+// so a mismatch is ErrAttachmentCorrupt with no bad byte handed out. An offset past the end is an
+// AttachmentRangeError. The server must have agreed the "attachment-proofs" wire feature.
+func (c *Client) OpenAttachmentRange(ctx context.Context, ns, docID string, ref AttachmentRef, asOf string, offset, length int64) (*AttachmentReader, error) {
+	if err := c.requireAttachments(); err != nil {
+		return nil, err
+	}
+	if !slices.Contains(c.features, wire.WireFeatureAttachmentProofs) {
+		return nil, &UnsupportedError{Message: "the server did not agree the attachment-proofs wire feature"}
+	}
+	if offset < 0 {
+		return nil, &AttachmentRangeError{Offset: offset, Size: -1}
+	}
+	if length < -1 {
+		return nil, fmt.Errorf("kdb: invalid attachment range length %d", length)
+	}
+	msg, err := attachmentGet(c, ns, docID, ref, asOf)
+	if err != nil {
+		return nil, err
+	}
+	msg.Offset, msg.Proofs = offset, true
+	msg.MaxBytes = wire.MaxAttachmentChunkBytes
+	if length >= 0 {
+		msg.MaxBytes = min(max(length, 1), wire.MaxAttachmentChunkBytes)
+	}
+	r := &AttachmentReader{c: c, ctx: ctx, ns: ns, ranged: true, offset: offset, length: length, end: -1, pageOff: offset / AttachmentChunkBytes * AttachmentChunkBytes}
+	reply, err := c.request(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+	res, ok := reply.(wire.AttachmentDataMessage)
+	if !ok {
+		return nil, fmt.Errorf("kdb: expected ATTACHMENT_DATA, got %T", reply)
+	}
+	if res.Error != "" && res.Info.ID != (codec.UUID{}) && offset > res.Info.Size {
+		return nil, &AttachmentRangeError{Offset: offset, Size: res.Info.Size}
+	}
+	if err := r.takeVerified(res); err != nil {
+		if r.readID != "" {
+			_ = r.Close()
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
+// takeVerified checks a ranged read's page - every chunk against the content hash by its proof -
+// and keeps the part of it inside the range.
+func (r *AttachmentReader) takeVerified(res wire.AttachmentDataMessage) error {
+	if res.Error != "" {
+		return attachmentError(res.Error, res.ErrorCode)
+	}
+	if r.end < 0 {
+		r.readID, r.info, r.commit = res.ReadID, fromWireInfo(res.Info), res.CommitHex
+		r.tree, r.end = res.Tree, res.Info.Size
+		if length := r.end - r.offset; r.length >= 0 && r.length < length {
+			r.end = r.offset + r.length
+		}
+		if res.Scheme != int(document.AttachmentHashSchemeChunked1) {
+			return fmt.Errorf("kdb: attachment content hash scheme %d is not supported", res.Scheme)
+		}
+		if document.AttachmentIdentity(res.Tree, res.Info.Size).Hex() != r.info.Hash {
+			return ErrAttachmentCorrupt
+		}
+	}
+	if res.Offset != r.pageOff || res.Tree != r.tree {
+		return fmt.Errorf("kdb: attachment page at %d, expected %d", res.Offset, r.pageOff)
+	}
+	if err := verifyChunks(res.Data, res.Offset, r.info.Size, res.Chunks, r.tree); err != nil {
+		return err
+	}
+	r.pageOff += int64(len(res.Data))
+	if len(res.Data) == 0 && !res.EOF {
+		return fmt.Errorf("kdb: empty attachment page at %d before the end", res.Offset)
+	}
+	from, to := r.offset-res.Offset, min(r.end, r.pageOff)-res.Offset
+	r.page = nil
+	if from < to {
+		r.page = res.Data[from:to]
+	}
+	r.eof, r.superseded = res.EOF, res.Superseded
+	return nil
+}
+
+// verifyChunks checks that data, read from offset (a chunk boundary) of an attachment of size
+// bytes, is whole chunks each proved by chunks against tree, and nothing more.
+func verifyChunks(data []byte, offset, size int64, chunks []wire.BlobChunkProof, tree codec.Hash) error {
+	leaves := document.AttachmentChunkCount(size)
+	first := offset / AttachmentChunkBytes
+	if offset%AttachmentChunkBytes != 0 {
+		return fmt.Errorf("kdb: attachment page at %d is not chunk-aligned", offset)
+	}
+	for i, proof := range chunks {
+		idx := first + int64(i)
+		if proof.Leaf != idx {
+			return fmt.Errorf("kdb: attachment proof for chunk %d where %d was expected", proof.Leaf, idx)
+		}
+		n := min(AttachmentChunkBytes, size-idx*AttachmentChunkBytes)
+		if n < 0 || int64(len(data)) < n {
+			return ErrAttachmentCorrupt
+		}
+		if !document.VerifyMerkleInclusion(document.ChunkLeafHash(data[:n]), int(idx), int(leaves), proof.Path, tree) {
+			return ErrAttachmentCorrupt
+		}
+		data = data[n:]
+	}
+	if len(data) != 0 {
+		return ErrAttachmentCorrupt // bytes no proof covers
+	}
+	return nil
 }
 
 func (r *AttachmentReader) fetch(msg wire.AttachmentGetMessage) error {
@@ -311,6 +462,19 @@ func (r *AttachmentReader) Read(p []byte) (int, error) {
 		if r.eof {
 			return 0, io.EOF
 		}
+		if r.ranged {
+			if r.pageOff >= r.end {
+				// The range is read, short of the attachment's end: release the pinned read.
+				if err := r.Close(); err != nil {
+					return 0, err
+				}
+				return 0, io.EOF
+			}
+			if err := r.nextVerified(); err != nil {
+				return 0, err
+			}
+			continue
+		}
 		if err := r.fetch(wire.AttachmentGetMessage{H: hdr(r.c, wire.MsgAttachmentGet), Namespace: r.ns,
 			ReadID: r.readID, Offset: r.offset, MaxBytes: AttachmentChunkBytes}); err != nil {
 			return 0, err
@@ -323,6 +487,19 @@ func (r *AttachmentReader) Read(p []byte) (int, error) {
 	r.page = r.page[n:]
 	r.offset += int64(n)
 	return n, nil
+}
+
+func (r *AttachmentReader) nextVerified() error {
+	reply, err := r.c.request(r.ctx, wire.AttachmentGetMessage{H: hdr(r.c, wire.MsgAttachmentGet), Namespace: r.ns,
+		ReadID: r.readID, Offset: r.pageOff, MaxBytes: min(r.end-r.pageOff, wire.MaxAttachmentChunkBytes), Proofs: true})
+	if err != nil {
+		return err
+	}
+	res, ok := reply.(wire.AttachmentDataMessage)
+	if !ok {
+		return fmt.Errorf("kdb: expected ATTACHMENT_DATA, got %T", reply)
+	}
+	return r.takeVerified(res)
 }
 
 // verify feeds a fetched page to the content hash, checking it when the page is the last.
@@ -356,8 +533,30 @@ func (r *AttachmentReader) Close() error {
 		return nil
 	}
 	r.closed = true
-	_, err := r.c.request(r.ctx, wire.AttachmentGetMessage{H: hdr(r.c, wire.MsgAttachmentGet), Namespace: r.ns, ReadID: r.readID, Close: true})
+	reply, err := r.c.request(r.ctx, wire.AttachmentGetMessage{H: hdr(r.c, wire.MsgAttachmentGet), Namespace: r.ns, ReadID: r.readID, Close: true})
+	if done, ok := reply.(wire.AttachmentDataMessage); ok && err == nil && done.Error == "" {
+		// A server that reports it says whether the attachment changed while it was read.
+		r.superseded = done.Superseded
+	}
 	return err
+}
+
+// ReadAttachmentAt reads len(p) bytes of one of docID's attachments from off, as of asOf (empty:
+// the head), like io.ReaderAt: fewer than len(p) bytes come with io.EOF. Each call is its own read,
+// so to read one version across calls pass a commit as asOf (an AttachmentReader's Commit, say).
+// Every byte is verified by its chunk's inclusion proof; off past the end is an
+// AttachmentRangeError.
+func (c *Client) ReadAttachmentAt(ctx context.Context, ns, docID string, ref AttachmentRef, asOf string, p []byte, off int64) (int, error) {
+	r, err := c.OpenAttachmentRange(ctx, ns, docID, ref, asOf, off, int64(len(p)))
+	if err != nil {
+		return 0, err
+	}
+	defer r.Close()
+	n, err := io.ReadFull(r, p)
+	if errors.Is(err, io.ErrUnexpectedEOF) || (err == io.EOF && len(p) > 0) {
+		err = io.EOF
+	}
+	return n, err
 }
 
 // ReadAttachment reads a whole attachment into memory.

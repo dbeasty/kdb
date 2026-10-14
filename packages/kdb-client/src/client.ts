@@ -26,6 +26,7 @@ import {
 } from "./errors.ts";
 import {
   KdbAttachmentNotFoundError,
+  KdbAttachmentRangeError,
   KdbIntegrityError,
   KdbUploadError,
   findAttachment,
@@ -34,6 +35,7 @@ import {
   uploadChunks,
   type AttachmentBlob,
   type AttachmentInfo,
+  type AttachmentRangeOptions,
   type AttachmentReader,
   type AttachmentSelector,
   type AttachmentSource,
@@ -54,7 +56,7 @@ import type {
 } from "./operations.ts";
 import { connectWebSocket } from "./transport/websocket.ts";
 import { schemeOf, type Transport } from "./transport/types.ts";
-import { bytesFromWire, bytesToWire, utf8Decode, utf8Encode } from "./wire/bytes.ts";
+import { bytesFromWire, bytesToWire, fromHex, toHex, utf8Decode, utf8Encode } from "./wire/bytes.ts";
 import {
   WIRE_FEATURE_BINARY,
   WIRE_FEATURE_BINARY_2,
@@ -65,9 +67,16 @@ import { decodeMessage, encodeMessage, isClientKind, type WireMessage } from "./
 import { DEFAULT_MAX_FRAME_BYTES, KDB_WIRE_PROTOCOL_VERSION } from "./wire/frame.ts";
 import { contentHash } from "./wire/hash.ts";
 import {
+  ATTACHMENT_CHUNK_BYTES,
   ATTACHMENT_HASH_SCHEME_CHUNKED_1,
   AttachmentHasher,
+  attachmentChunkCount,
+  attachmentIdentity,
   base64ToBytes,
+  chunkLeafHash,
+  MAX_ATTACHMENT_CHUNK_BYTES,
+  verifyMerkleInclusion,
+  WIRE_FEATURE_ATTACHMENT_PROOFS,
   WIRE_FEATURE_ATTACHMENTS,
   type AttachmentDataDto,
   type AttachmentInfoDto,
@@ -110,8 +119,14 @@ export interface TlsOptions {
 /** What the handshake offers: binary frames, and zstd frames where this runtime can read them. */
 const OFFERED_WIRE_FEATURES: string[] =
   zstdDecompress === null
-    ? [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ATTACHMENTS]
-    : [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD, WIRE_FEATURE_ATTACHMENTS];
+    ? [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ATTACHMENTS, WIRE_FEATURE_ATTACHMENT_PROOFS]
+    : [
+        WIRE_FEATURE_BINARY,
+        WIRE_FEATURE_BINARY_2,
+        WIRE_FEATURE_ZSTD,
+        WIRE_FEATURE_ATTACHMENTS,
+        WIRE_FEATURE_ATTACHMENT_PROOFS,
+      ];
 
 /**
  * One typed SQL cell (queryValues): null for NULL, a number for an integer that fits one exactly
@@ -864,19 +879,107 @@ export class Client implements KdbOperations {
     options: ReadAttachmentOptions = {},
   ): Promise<{ info: AttachmentInfo; data: Uint8Array; commit: CommitHash; superseded: boolean }> {
     const reader = await this.getAttachment(ns, docId, selector, options);
-    const parts: Uint8Array[] = [];
-    let len = 0;
-    for await (const part of reader) {
-      parts.push(part);
-      len += part.length;
-    }
-    const data = new Uint8Array(len);
-    let off = 0;
-    for (const p of parts) {
-      data.set(p, off);
-      off += p.length;
-    }
+    const data = await collectBytes(reader);
     return { info: reader.info, data, commit: reader.commit, superseded: reader.superseded };
+  }
+
+  /**
+   * Opens a verified read of part of one attachment: `options.length` bytes from `options.offset`
+   * (length omitted or -1: to the end; a range running past the end stops there). Every 1 MiB
+   * chunk the range touches is checked against the attachment's content hash with its Merkle
+   * inclusion proof before any of its bytes is handed out, so tampering throws KdbIntegrityError
+   * with no bad byte delivered. Returns once the first page has arrived and checked out.
+   *
+   * An offset past the end (or negative) throws KdbAttachmentRangeError. The server must have
+   * agreed the "attachment-proofs" wire feature, else KdbUnsupportedError. The read pins the
+   * version it started on; once the range is consumed it is released, and `superseded` says
+   * whether a newer version committed meanwhile.
+   */
+  async openAttachmentRange(
+    ns: string,
+    docId: string,
+    selector: AttachmentSelector,
+    options: AttachmentRangeOptions = {},
+  ): Promise<AttachmentReader> {
+    assertUuid(docId);
+    this.#requireAttachments("openAttachmentRange");
+    if (!this.#features.has(WIRE_FEATURE_ATTACHMENT_PROOFS)) {
+      throw new KdbUnsupportedError(
+        "openAttachmentRange",
+        `the connection did not agree wire feature "${WIRE_FEATURE_ATTACHMENT_PROOFS}" (an older server)`,
+      );
+    }
+    const offset = options.offset ?? 0;
+    const length = options.length ?? -1;
+    if (!Number.isSafeInteger(offset)) throw new RangeError(`kdb: invalid attachment range offset ${offset}`);
+    if (!Number.isSafeInteger(length) || length < -1) {
+      throw new RangeError(`kdb: invalid attachment range length ${length}`);
+    }
+    if (offset < 0) throw new KdbAttachmentRangeError(offset, -1);
+    const state = await this.#ensureNamespace(ns, options);
+    const { id, name, text } = selectorParts(selector);
+
+    const getPage = async (readId: string, at: number, maxBytes: number, close: boolean): Promise<AttachmentDataDto> => {
+      const reply = await this.#request(
+        "attachmentGet",
+        readId
+          ? { namespace: ns, sessionId: state.sessionId, docId, readId, offset: at, maxBytes, close, proofs: !close }
+          : {
+              namespace: ns,
+              sessionId: state.sessionId,
+              docId,
+              attachmentId: id ?? "",
+              name: name ?? "",
+              asOfHex: options.asOf ?? "",
+              offset: at,
+              maxBytes,
+              proofs: true,
+            },
+        options,
+        "openAttachmentRange",
+      );
+      return this.#expect<AttachmentDataDto>(reply, "attachmentData");
+    };
+    const fetchPage = async (readId: string, at: number, maxBytes: number, close = false): Promise<AttachmentDataDto> => {
+      const page = await getPage(readId, at, maxBytes, close);
+      if (!close) this.#throwIfAttachmentError(page.error, page.errorCode, ns, docId, text);
+      return page;
+    };
+
+    const maxBytes = length >= 0 ? Math.min(Math.max(length, 1), MAX_ATTACHMENT_CHUNK_BYTES) : MAX_ATTACHMENT_CHUNK_BYTES;
+    const first = await getPage("", offset, maxBytes, false);
+    // Past the end the server refuses the get but still says how long the attachment is.
+    if (first.error && first.info.id !== "" && offset > first.info.size) {
+      throw new KdbAttachmentRangeError(offset, first.info.size);
+    }
+    this.#throwIfAttachmentError(first.error, first.errorCode, ns, docId, text);
+    const reader = new RangedAttachmentReader(first, offset, length, fetchPage);
+    try {
+      await reader.takeFirst(first);
+    } catch (error) {
+      await reader.cancel();
+      throw error;
+    }
+    return reader;
+  }
+
+  /**
+   * Reads `length` bytes of one attachment from `offset` (-1: to the end), verified chunk by
+   * chunk as `openAttachmentRange` does - like an io.ReaderAt: fewer bytes come back at the end,
+   * none at exactly the end, and an offset past it throws KdbAttachmentRangeError. Each call is its
+   * own read; to read one version across calls, pass a commit as `options.asOf` (a reader's
+   * `commit`, say).
+   */
+  async readAttachmentAt(
+    ns: string,
+    docId: string,
+    selector: AttachmentSelector,
+    offset: number,
+    length: number,
+    options: Omit<AttachmentRangeOptions, "offset" | "length"> = {},
+  ): Promise<Uint8Array> {
+    const reader = await this.openAttachmentRange(ns, docId, selector, { ...options, offset, length });
+    return collectBytes(reader);
   }
 
   /** Renames one attachment, keeping its ID and bytes, as its own commit. */
@@ -1547,22 +1650,7 @@ class PagedAttachmentReader implements AttachmentReader {
   }
 
   stream(): ReadableStream<Uint8Array> {
-    const it = this[Symbol.asyncIterator]();
-    return new ReadableStream<Uint8Array>({
-      pull: async (controller) => {
-        try {
-          const { done, value } = await it.next();
-          if (done) controller.close();
-          else controller.enqueue(value);
-        } catch (error) {
-          controller.error(error);
-        }
-      },
-      cancel: async () => {
-        await it.return(undefined);
-        await this.cancel();
-      },
-    });
+    return readerStream(this);
   }
 
   async cancel(): Promise<void> {
@@ -1570,6 +1658,210 @@ class PagedAttachmentReader implements AttachmentReader {
     this.#eof = true;
     this.#first = undefined;
     await this.#fetch(this.#readId, this.#offset, true).catch(() => undefined);
+  }
+}
+
+/** A reader's pages as a web ReadableStream; cancelling the stream cancels the read. */
+function readerStream(reader: AttachmentReader): ReadableStream<Uint8Array> {
+  const it = reader[Symbol.asyncIterator]();
+  return new ReadableStream<Uint8Array>({
+    pull: async (controller) => {
+      try {
+        const { done, value } = await it.next();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel: async () => {
+      await it.return?.(undefined);
+      await reader.cancel();
+    },
+  });
+}
+
+/** Every byte a reader yields, in one array. */
+async function collectBytes(reader: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const parts: Uint8Array[] = [];
+  let len = 0;
+  for await (const part of reader) {
+    parts.push(part);
+    len += part.length;
+  }
+  if (parts.length === 1) return parts[0]!;
+  const data = new Uint8Array(len);
+  let off = 0;
+  for (const p of parts) {
+    data.set(p, off);
+    off += p.length;
+  }
+  return data;
+}
+
+type RangeFetch = (readId: string, at: number, maxBytes: number, close?: boolean) => Promise<AttachmentDataDto>;
+
+/**
+ * A verified ranged read (openAttachmentRange). Pages are whole chunks from a chunk-aligned offset,
+ * each proved against the blob's Merkle tree, whose hash (with the size) must be the content hash;
+ * only [offset, end) of them is handed out, and only once the whole page has checked out.
+ */
+class RangedAttachmentReader implements AttachmentReader {
+  readonly info: AttachmentInfo;
+  readonly commit: string;
+  #superseded = false;
+  #readId: string;
+  readonly #offset: number;
+  /** Where the range ends: offset + length, cut at the attachment's end. */
+  readonly #end: number;
+  /** Where the next page starts: always a chunk boundary, or the attachment's end. */
+  #pageOff: number;
+  #tree: Uint8Array = new Uint8Array(0);
+  #treeHex = "";
+  /** The verified, trimmed bytes of the last page, not yet handed out. */
+  #pending: Uint8Array | undefined;
+  /** The server ended the read (EOF page), or it was closed. */
+  #eof = false;
+  #started = false;
+  readonly #fetch: RangeFetch;
+
+  constructor(first: AttachmentDataDto, offset: number, length: number, fetch: RangeFetch) {
+    this.info = infoFromDto(first.info);
+    this.commit = first.commitHex;
+    this.#readId = first.readId;
+    this.#offset = offset;
+    this.#end = length >= 0 ? Math.min(first.info.size, offset + length) : first.info.size;
+    this.#pageOff = offset - (offset % ATTACHMENT_CHUNK_BYTES);
+    this.#fetch = fetch;
+  }
+
+  get superseded(): boolean {
+    return this.#superseded;
+  }
+
+  /** Checks the first page: the hash scheme, the tree against the content hash, then its chunks. */
+  async takeFirst(page: AttachmentDataDto): Promise<void> {
+    this.#eof = page.eof;
+    if (page.scheme !== ATTACHMENT_HASH_SCHEME_CHUNKED_1) {
+      throw new KdbProtocolError(`kdb: attachment content hash scheme ${page.scheme} is not supported`);
+    }
+    if (page.tree === "") throw new KdbProtocolError("kdb: attachment page carries no Merkle tree hash");
+    this.#treeHex = page.tree;
+    this.#tree = fromHex(page.tree);
+    const identity = await attachmentIdentity(this.#tree, this.info.size);
+    if (identity !== this.info.hash) {
+      throw new KdbIntegrityError(
+        `kdb: attachment ${this.info.id}'s Merkle tree and size hash to ${identity}, not its content hash ${this.info.hash}`,
+        this.info.hash,
+        identity,
+      );
+    }
+    await this.#take(page);
+  }
+
+  async #take(page: AttachmentDataDto): Promise<void> {
+    if (page.offset !== this.#pageOff || page.tree !== this.#treeHex) {
+      throw new KdbProtocolError(`kdb: attachment page at ${page.offset}, expected ${this.#pageOff}`);
+    }
+    await this.#verifyChunks(page);
+    this.#pageOff += page.data.length;
+    if (page.data.length === 0 && !page.eof) {
+      throw new KdbProtocolError(`kdb: empty attachment page at ${page.offset} before the end`);
+    }
+    if (page.eof && this.#pageOff !== this.info.size) {
+      throw new KdbProtocolError(`kdb: attachment read ended at ${this.#pageOff} of ${this.info.size} bytes`);
+    }
+    const from = Math.max(0, this.#offset - page.offset);
+    const to = Math.min(this.#end, this.#pageOff) - page.offset;
+    this.#pending = from < to ? page.data.subarray(from, to) : undefined;
+    this.#eof = page.eof;
+    if (page.eof) this.#superseded = page.superseded;
+  }
+
+  /** The page's data is whole chunks from its (aligned) offset, each proved, and nothing more. */
+  async #verifyChunks(page: AttachmentDataDto): Promise<void> {
+    if (page.offset % ATTACHMENT_CHUNK_BYTES !== 0) {
+      throw new KdbProtocolError(`kdb: attachment page at ${page.offset} is not chunk-aligned`);
+    }
+    const size = this.info.size;
+    const leaves = attachmentChunkCount(size);
+    const first = page.offset / ATTACHMENT_CHUNK_BYTES;
+    let data = page.data;
+    for (const [i, proof] of page.chunks.entries()) {
+      const index = first + i;
+      if (proof.leaf !== index) {
+        throw new KdbProtocolError(`kdb: attachment proof for chunk ${proof.leaf} where ${index} was expected`);
+      }
+      const n = Math.min(ATTACHMENT_CHUNK_BYTES, size - index * ATTACHMENT_CHUNK_BYTES);
+      if (n < 0 || data.length < n) throw this.#corrupt(`chunk ${index} is short`);
+      const leaf = await chunkLeafHash(data.subarray(0, n));
+      const path = proof.path.map((h) => fromHex(h));
+      if (!(await verifyMerkleInclusion(leaf, index, leaves, path, this.#tree))) {
+        throw this.#corrupt(`chunk ${index} (leaf ${toHex(leaf)}) is not in its Merkle tree`);
+      }
+      data = data.subarray(n);
+    }
+    if (data.length !== 0) throw this.#corrupt(`${data.length} bytes at the page's end carry no proof`);
+  }
+
+  #corrupt(what: string): KdbIntegrityError {
+    return new KdbIntegrityError(
+      `kdb: attachment ${this.info.id} does not match its content hash ${this.info.hash}: ${what}`,
+      this.info.hash,
+      "",
+    );
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<Uint8Array, void, undefined> {
+    if (this.#started) throw new KdbError("kdb: an attachment reader can be read only once");
+    this.#started = true;
+    let finished = false;
+    try {
+      for (;;) {
+        const part = this.#pending;
+        this.#pending = undefined;
+        if (part !== undefined) yield part;
+        if (this.#eof) {
+          finished = true;
+          return;
+        }
+        if (this.#pageOff >= this.#end) {
+          // The range is read, short of the attachment's end: release the pinned read, learning
+          // from the close whether a newer version committed meanwhile.
+          finished = true;
+          await this.#close(true);
+          return;
+        }
+        const page = await this.#fetch(
+          this.#readId,
+          this.#pageOff,
+          Math.min(this.#end - this.#pageOff, MAX_ATTACHMENT_CHUNK_BYTES),
+        );
+        if (page.readId) this.#readId = page.readId;
+        await this.#take(page);
+      }
+    } finally {
+      if (!finished) await this.cancel();
+    }
+  }
+
+  stream(): ReadableStream<Uint8Array> {
+    return readerStream(this);
+  }
+
+  async cancel(): Promise<void> {
+    await this.#close(false);
+  }
+
+  async #close(report: boolean): Promise<void> {
+    if (this.#eof || !this.#readId) return;
+    this.#eof = true;
+    this.#pending = undefined;
+    const reply = await this.#fetch(this.#readId, this.#pageOff, 0, true).catch((error: unknown) => {
+      if (report) throw error;
+      return undefined;
+    });
+    if (reply !== undefined && !reply.error) this.#superseded = reply.superseded;
   }
 }
 

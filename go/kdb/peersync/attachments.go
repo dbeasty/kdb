@@ -123,17 +123,14 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 		return fail(wire.ErrorCodeNotFound, "blob %s is not retained here: %v", e.Hash.Hex(), err)
 	}
 	defer r.Close()
-	n := (a.Size + chunk - 1) / chunk
-	if n == 0 {
-		n = 1
-	}
-	leaves := make([]codec.Hash, n)
+	leaves := make([]codec.Hash, document.AttachmentChunkCount(a.Size))
 	for i := range leaves {
 		if leaves[i], err = r.ChunkLeaf(int64(i)); err != nil {
 			return failRead(wire.ErrorCodeIntegrity, err)
 		}
 	}
-	part.Size, part.Tree = a.Size, document.MerkleTreeHash(leaves)
+	tree := document.NewMerkleTree(leaves)
+	part.Size, part.Tree = a.Size, tree.Root()
 	want := e.MaxBytes
 	if want <= 0 || want > budget {
 		want = budget
@@ -149,7 +146,7 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 	part.Data = data
 	for off := e.Offset; off < end || (a.Size == 0 && off == 0 && len(part.Chunks) == 0); off += chunk {
 		idx := int(off / chunk)
-		part.Chunks = append(part.Chunks, wire.BlobChunkProof{Leaf: int64(idx), Path: document.MerkleInclusionProof(leaves, idx)})
+		part.Chunks = append(part.Chunks, wire.BlobChunkProof{Leaf: int64(idx), Path: tree.Proof(idx)})
 		if a.Size == 0 {
 			break
 		}

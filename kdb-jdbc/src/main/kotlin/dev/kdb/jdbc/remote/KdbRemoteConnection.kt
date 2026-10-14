@@ -27,6 +27,7 @@ import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
 import dev.kdb.wire.SUPPORTED_WIRE_FEATURES
 import dev.kdb.wire.SqlCellKind
 import dev.kdb.wire.WIRE_FEATURE_ATTACHMENTS
+import dev.kdb.wire.WIRE_FEATURE_ATTACHMENT_PROOFS
 import dev.kdb.wire.TransactionWireCodec
 import dev.kdb.wire.WireCapabilitySet
 import dev.kdb.wire.WireClientMode
@@ -66,6 +67,11 @@ public class KdbRemoteConnection(
      * takes `{"$bytes": ..}` / `{"$attachment": ..}` parameters. Only the Go server does. */
     public val attachmentsSupported: Boolean get() = WIRE_FEATURE_ATTACHMENTS in agreedFeatures
 
+    /** Whether the server agreed [WIRE_FEATURE_ATTACHMENT_PROOFS] as well: it serves verified ranged
+     * reads ([KdbAttachments.openRange]). */
+    public val attachmentProofsSupported: Boolean
+        get() = attachmentsSupported && WIRE_FEATURE_ATTACHMENT_PROOFS in agreedFeatures
+
     private val authorNodeId = KdbUuid.random()
 
     private val attachmentHost =
@@ -73,6 +79,7 @@ public class KdbRemoteConnection(
             override val namespace: String get() = url.namespaceId
             override val sessionId: String get() = this@KdbRemoteConnection.sessionId
             override val attachmentsAgreed: Boolean get() = attachmentsSupported
+            override val attachmentProofsAgreed: Boolean get() = attachmentProofsSupported
             override val inTransaction: Boolean get() = !autoCommit
             override val authorNodeId: KdbUuid get() = this@KdbRemoteConnection.authorNodeId
 

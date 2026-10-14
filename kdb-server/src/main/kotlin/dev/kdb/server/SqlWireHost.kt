@@ -48,6 +48,7 @@ import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.SqlCellKind
 import dev.kdb.wire.WIRE_FEATURE_ATTACHMENTS
+import dev.kdb.wire.WIRE_FEATURE_ATTACHMENT_PROOFS
 import dev.kdb.wire.negotiateWireFeatures
 import dev.kdb.wire.withWireFeatures
 import kotlinx.coroutines.sync.Mutex
@@ -147,8 +148,9 @@ public class SqlWireHost(
 
     /**
      * This server does not serve attachments (the Go server does; docs/kdb-attachments-plan.md), and
-     * never acks [WIRE_FEATURE_ATTACHMENTS]. A client that sends one of these anyway gets a typed
-     * UNSUPPORTED answer on the request's correlation id, rather than no reply at all.
+     * never acks [WIRE_FEATURE_ATTACHMENTS] or [WIRE_FEATURE_ATTACHMENT_PROOFS]. A client that sends
+     * one of these anyway gets a typed UNSUPPORTED answer on the request's correlation id, rather
+     * than no reply at all.
      */
     private fun attachmentsUnsupported(message: WireMessage): WireMessage {
         val corr = message.header.correlationId
@@ -311,8 +313,10 @@ public class SqlWireHost(
         sessions.begin(ns, ReadConsistency.READ_COMMITTED, principal = principal)
         // Wire features are agreed only on an accepted handshake. The ack is a JSON frame either
         // way (a handshake has no binary form), so the client reads it before switching anything.
-        // Attachments are left out: this server answers their messages only with UNSUPPORTED.
-        val features = negotiateWireFeatures(msg.request.wireFeatures) - WIRE_FEATURE_ATTACHMENTS
+        // Attachments are left out: this server answers their messages only with UNSUPPORTED. So is
+        // attachment-proofs, which only means anything with them.
+        val features =
+            negotiateWireFeatures(msg.request.wireFeatures) - WIRE_FEATURE_ATTACHMENTS - WIRE_FEATURE_ATTACHMENT_PROOFS
         if (features.isNotEmpty()) replyWire = wire.withWireFeatures(features)
         return handshakeAck(msg, accepted = true, head, rejectionReason = null, wireFeatures = features)
     }

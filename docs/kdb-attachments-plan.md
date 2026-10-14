@@ -208,6 +208,17 @@ identity = SHA-256(0x02 || be64(size) || tree)
   `KdbAttachmentCorruptError`, Kotlin `KdbAttachmentCorruptException` (SQLState `XX001`) - the
   same error as the client's own failed verification. The remedy is another replica or repair,
   never a retry against the same node.
+- **Verified ranged reads**, feature `attachment-proofs`: `ATTACHMENT_GET` with `Proofs` (11) gets
+  pages rounded to 1 MiB chunk boundaries (at most 4 MiB), and `ATTACHMENT_DATA` carries the blob's
+  `Tree` (12), each chunk's RFC 6962 audit path (13, BLOB_FETCH's encoding) and `Scheme` (14). A
+  client checks `AttachmentIdentity(Tree, Size) == Hash` and every chunk's proof before handing out
+  any of its bytes, and trims the pages to the caller's range. An offset past the end fails
+  `SCHEMA_VIOLATION` with `Info` still set (clients raise a typed range error); a `Close` reply
+  carries `Superseded`, so a range that ends before the attachment does still learns it. Go
+  `OpenAttachmentRange` / `ReadAttachmentAt`; TS `openAttachmentRange` / `readAttachmentAt`; Kotlin
+  `KdbAttachments.openRange` / `readAt` / `getRange`, and `KdbAttachments.blob()`, a `java.sql.Blob`
+  whose `getBytes(pos, len)` / `getBinaryStream(pos, len)` read verified ranges. The Kotlin server
+  acks neither feature. A chunk failing its proof is the same corrupt error as below.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
   (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
   Kotlin server answers the messages `UNSUPPORTED`.
