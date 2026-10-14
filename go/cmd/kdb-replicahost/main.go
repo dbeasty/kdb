@@ -16,6 +16,8 @@
 //	{"op":"docs","ns":"app/u/1"}                                   -> {"docs":{"<id>":"<json>"}}
 //	{"op":"denyRead","ns":..,"id":..} / {"op":"allowRead",..}       -> {}  (per-document read rights)
 //	{"op":"setHome","ns":..} / {"op":"clearHome","ns":..}           -> {}  (another node is home)
+//	{"op":"attach","ns":..,"id":..,"name":..,"mime":..,"text":..}  -> {"head","attachmentId","contentHash"}
+//	{"op":"detach","ns":..,"id":..,"name":..}                       -> {"head"}
 //
 // Tokens: "rw-token" may pull and push every namespace; "ro-token" may only pull; anything else is
 // refused. Namespaces under "secret/" are refused to both. The process exits when stdin closes, so a
@@ -124,6 +126,9 @@ type command struct {
 	Ops     []opDto `json:"ops"`
 	Commits int     `json:"commits"`
 	Docs    int     `json:"docs"`
+	Name    string  `json:"name"`
+	Mime    string  `json:"mime"`
+	Text    string  `json:"text"`
 }
 
 type host struct {
@@ -225,6 +230,26 @@ func (h *host) handle(c command) (any, error) {
 			return true
 		})
 		return map[string]any{"docs": docs}, ferr
+	case "attach", "detach":
+		rt, err := h.runtime(c.NS)
+		if err != nil {
+			return nil, err
+		}
+		id, err := codec.ParseUUID(c.ID)
+		if err != nil {
+			return nil, err
+		}
+		var head codec.Hash
+		var info embed.AttachmentInfo
+		if c.Op == "attach" {
+			head, info, err = rt.Runtime.PutAttachment(c.NS, id, strings.NewReader(c.Text), embed.PutAttachmentOptions{Name: c.Name, Mime: c.Mime})
+		} else {
+			head, err = rt.Runtime.DeleteAttachment(c.NS, id, embed.AttachmentSelector{Name: c.Name})
+		}
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{"head": head.Hex(), "attachmentId": info.ID.String(), "contentHash": info.ContentHash.Hex()}, nil
 	case "denyRead", "allowRead":
 		h.engine.mu.Lock()
 		h.engine.unreadable[c.NS+"/"+c.ID] = c.Op == "denyRead"

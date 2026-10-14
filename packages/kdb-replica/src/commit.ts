@@ -15,7 +15,18 @@ export type Op =
   | { kind: "write"; docId: string; json: string }
   | { kind: "delete"; docId: string }
   | { kind: "fileWrite"; path: string; blobHash: string }
-  | { kind: "schemaMigration"; migrationId: string; payload: string };
+  | { kind: "schemaMigration"; migrationId: string; payload: string }
+  | {
+      kind: "attachmentPut";
+      docId: string;
+      attachmentId: string;
+      name: string;
+      scheme: number;
+      contentHash: string;
+      size: bigint;
+      mime: string;
+    }
+  | { kind: "attachmentDelete"; docId: string; attachmentId: string };
 
 export interface CommitFields {
   parents: string[]; // hex
@@ -27,6 +38,8 @@ export interface CommitFields {
   treeHash: string; // hex
   schemaHash?: string | undefined; // hex
   message: string;
+  /** The root of the commit's attachment table; absent when the table is empty (field 10). */
+  attachmentRoot?: string | undefined; // hex
 }
 
 export interface Commit extends CommitFields {
@@ -35,6 +48,8 @@ export interface Commit extends CommitFields {
 }
 
 const OP_WRITE = 0, OP_DELETE = 1, OP_FILE_WRITE = 2, OP_SCHEMA_MIGRATION = 3;
+// Attachment ops (docs/kdb-attachments-plan.md): union branches appended after the others.
+const OP_ATTACHMENT_PUT = 4, OP_ATTACHMENT_DELETE = 5;
 
 function hash32(hex: string, what: string): Uint8Array {
   const b = fromHex(hex);
@@ -65,6 +80,23 @@ function writeOp(w: Writer, op: Op): void {
         r.field(2, Tag.String).string(op.payload);
       });
       return;
+    case "attachmentPut":
+      w.byte(OP_ATTACHMENT_PUT).record((r) => {
+        r.field(1, Tag.Fixed).raw(uuidBytes(op.docId));
+        r.field(2, Tag.Fixed).raw(uuidBytes(op.attachmentId));
+        r.field(3, Tag.String).string(op.name);
+        r.field(4, Tag.Int32).int32(op.scheme);
+        r.field(5, Tag.Fixed).raw(hash32(op.contentHash, "attachment content hash"));
+        r.field(6, Tag.Int64).int64(op.size);
+        r.field(7, Tag.String).string(op.mime);
+      });
+      return;
+    case "attachmentDelete":
+      w.byte(OP_ATTACHMENT_DELETE).record((r) => {
+        r.field(1, Tag.Fixed).raw(uuidBytes(op.docId));
+        r.field(2, Tag.Fixed).raw(uuidBytes(op.attachmentId));
+      });
+      return;
   }
 }
 
@@ -82,6 +114,7 @@ export function encodeCommitPayload(c: CommitFields): Uint8Array {
     r.field(7, Tag.Fixed).raw(hash32(c.treeHash, "tree hash"));
     if (c.schemaHash !== undefined) r.field(8, Tag.Union).byte(1).raw(hash32(c.schemaHash, "schema hash"));
     r.field(9, Tag.String).string(c.message);
+    if (c.attachmentRoot !== undefined) r.field(10, Tag.Union).byte(1).raw(hash32(c.attachmentRoot, "attachment root"));
   });
   return w.bytes();
 }
@@ -123,6 +156,31 @@ function readOp(r: Reader): Op {
         return false;
       });
       return { kind: "schemaMigration", migrationId: docId, payload };
+    case OP_ATTACHMENT_PUT: {
+      let attachmentId = "", name = "", scheme = 0, ch = "", size = 0n, mime = "";
+      r.record((id, tag, f) => {
+        switch (id) {
+          case 1: expectTag(id, tag, Tag.Fixed); docId = uuidString(f.raw(16)); return true;
+          case 2: expectTag(id, tag, Tag.Fixed); attachmentId = uuidString(f.raw(16)); return true;
+          case 3: expectTag(id, tag, Tag.String); name = f.string(); return true;
+          case 4: expectTag(id, tag, Tag.Int32); scheme = f.int32(); return true;
+          case 5: expectTag(id, tag, Tag.Fixed); ch = toHex(f.raw(32)); return true;
+          case 6: expectTag(id, tag, Tag.Int64); size = f.int64(); return true;
+          case 7: expectTag(id, tag, Tag.String); mime = f.string(); return true;
+        }
+        return false;
+      });
+      return { kind: "attachmentPut", docId, attachmentId, name, scheme, contentHash: ch, size, mime };
+    }
+    case OP_ATTACHMENT_DELETE: {
+      let attachmentId = "";
+      r.record((id, tag, f) => {
+        if (id === 1) { expectTag(id, tag, Tag.Fixed); docId = uuidString(f.raw(16)); return true; }
+        if (id === 2) { expectTag(id, tag, Tag.Fixed); attachmentId = uuidString(f.raw(16)); return true; }
+        return false;
+      });
+      return { kind: "attachmentDelete", docId, attachmentId };
+    }
     default:
       throw new DecodeError(`unknown op branch ${branch}`);
   }
@@ -164,6 +222,13 @@ export function decodeCommit(payload: Uint8Array): Commit {
         return true;
       }
       case 9: expectTag(id, tag, Tag.String); c.message = f.string(); return true;
+      case 10: {
+        expectTag(id, tag, Tag.Union);
+        const present = f.byte();
+        if (present === 1) c.attachmentRoot = toHex(f.raw(32));
+        else if (present !== 0) throw new DecodeError("bad nullable marker");
+        return true;
+      }
       default:
         return false;
     }

@@ -5,7 +5,8 @@
 
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
-import { randomUuid } from "../src/bytes.ts";
+import { attachmentContentHash } from "../src/attachments.ts";
+import { randomUuid, utf8 } from "../src/bytes.ts";
 import { openReplica, type Replica, type ReplicaOptions } from "../src/replica.ts";
 import { MemoryStore } from "../src/store.ts";
 import { goAvailable, startHost, type Host } from "./host.ts";
@@ -185,6 +186,51 @@ describe("replica against a Go node", { skip }, () => {
     const mine = randomUuid();
     await r.put(ns, mine, { from: "replica" });
     await until("the replica's write to reach the host", async () => (await host.docs(ns))[mine] !== undefined);
+  });
+
+  test("attachment refs replay with their commits, and every attachment root is verified", async () => {
+    const ns = "app/u/attach";
+    const doc = randomUuid(), other = randomUuid();
+    await host.put(ns, doc, { title: "with files" });
+    await host.put(ns, other, { title: "other" });
+    const r = await replica(ns);
+    await r.syncNow(); // a snapshot of a namespace with no attachments yet
+    await host.cmd({ op: "attach", ns, id: doc, name: "a.txt", mime: "text/plain", text: "hello" });
+    await host.cmd({ op: "attach", ns, id: doc, name: "b.txt", mime: "text/plain", text: "world" });
+    await host.cmd({ op: "attach", ns, id: other, name: "c.txt", mime: "text/plain", text: "!" });
+    await host.cmd({ op: "detach", ns, id: doc, name: "b.txt" });
+    const [res] = await r.syncNow();
+    assert.equal(res!.route, "replay");
+    const atts = await r.namespace(ns).attachments(doc);
+    assert.deepEqual(atts.map((a) => [a.name, a.mime, a.size]), [["a.txt", "text/plain", 5n]]);
+    assert.equal(atts[0]!.contentHash, attachmentContentHash(utf8("hello")));
+    assert.equal((await r.namespace(ns).attachments(other)).length, 1);
+    // A document delete takes its attachments with it, in Go and here.
+    await host.cmd({ op: "commit", ns, ops: [{ id: other, delete: true }] });
+    await r.syncNow();
+    assert.deepEqual(await r.namespace(ns).attachments(other), []);
+    assert.equal(r.namespace(ns).head, (await host.head(ns)).head);
+
+  });
+
+  // A host merge drops one side's attachment changes: the merge commit carries no attachment ops,
+  // and its attachment root is its first parent's table (reported to the attachments session,
+  // 2026-10-14). The replica's root check catches it - it applies the other side's puts - so this
+  // fails about half the time, by which parent sorts first. todo until the host merges attachments.
+  test("concurrent attachment and document writes merge with both", { todo: "host merges drop one side's attachments" }, async () => {
+    const ns = "app/u/attach-merge";
+    const doc = randomUuid();
+    await host.put(ns, doc, { title: "base" });
+    const r = await replica(ns);
+    await r.syncNow();
+    await host.cmd({ op: "attach", ns, id: doc, name: "a.txt", mime: "text/plain", text: "hello" });
+    await r.syncNow();
+    await r.put(ns, doc, { title: "edited on the replica" });
+    await host.cmd({ op: "attach", ns, id: doc, name: "d.txt", mime: "text/plain", text: "merged" });
+    const [merged] = await r.syncNow();
+    assert.equal(merged!.pushOutcome, "merged");
+    assert.equal(r.namespace(ns).head, (await host.head(ns)).head);
+    assert.deepEqual((await r.namespace(ns).attachments(doc)).map((a) => a.name).sort(), ["a.txt", "d.txt"]);
   });
 
   test("a namespace larger than the cache syncs within the cache's budget", async () => {

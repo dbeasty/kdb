@@ -15,6 +15,7 @@ import { fromHex, fromUtf8, toHex, utf8, uuidBytes, uuidString } from "./bytes.t
 import { buildCommit, contentHash, decodeCommit, genesisCommit, type Commit, type Op } from "./commit.ts";
 import { prefixEnd, type Batch, type KvStore } from "./store.ts";
 import { foldLeaf, TrieEdit, TrieReader } from "./trie.ts";
+import { AttachmentEdit, AttachmentError, attachmentRoot, attachmentsOf, type Attachment } from "./attachments.ts";
 
 export class TreeMismatchError extends Error {
   override name = "TreeMismatchError";
@@ -26,6 +27,16 @@ export class TreeMismatchError extends Error {
     this.commit = commit;
     this.declared = declared;
     this.built = built;
+  }
+}
+
+/** A commit's attachment root is not the table the replica built (or could build) for it. */
+export class AttachmentRootMismatchError extends Error {
+  override name = "AttachmentRootMismatchError";
+  readonly commit: string;
+  constructor(commit: string, declared: string | undefined, built: string | undefined) {
+    super(`kdb replica: commit ${commit} declares attachment root ${declared ?? "(none)"}, the replica has ${built ?? "(none)"}`);
+    this.commit = commit;
   }
 }
 
@@ -206,6 +217,11 @@ export class ReplicaNamespace {
     return b ? fromUtf8(b.subarray(32)) : undefined;
   }
 
+  /** The document's attachments, by id. */
+  attachments(id: string): Promise<Attachment[]> {
+    return attachmentsOf(this.#store, this.key, id);
+  }
+
   /** The document's content hash, or undefined. */
   async contentHashOf(id: string): Promise<string | undefined> {
     const b = await this.#store.get(this.#docKey(id));
@@ -265,6 +281,20 @@ export class ReplicaNamespace {
       const built = await edit.finish();
       if (built !== tip.treeHash) throw new TreeMismatchError(target, tip.treeHash, built);
       edit.writeTo(batch);
+      // Attachments: every op of the range in order. A commit's table is its first parent's plus
+      // its own ops, so this is right for a linear range; across a merge it is checked like the
+      // tree - against the root the target declares - and a mismatch writes nothing.
+      const att = new AttachmentEdit(this.#store, this.key);
+      let attRoot: string | undefined;
+      try {
+        for (const c of ordered) await att.apply(c.ops);
+        attRoot = await att.finish();
+      } catch (e) {
+        if (!(e instanceof AttachmentError)) throw e;
+        throw new AttachmentRootMismatchError(target, tip.attachmentRoot, `unappliable (${e.message})`);
+      }
+      if (attRoot !== tip.attachmentRoot) throw new AttachmentRootMismatchError(target, tip.attachmentRoot, attRoot);
+      att.writeTo(batch);
       this.#replaceHead(batch, tip, maxMicros(this.#meta.lastMicros, ordered));
       await this.#store.apply(batch);
       this.#meta = JSON.parse(fromUtf8(batch.get(ReplicaNamespace.metaKey(this.name))!)) as NamespaceMeta;
@@ -319,6 +349,10 @@ export class ReplicaNamespace {
       const edit = await this.#stage(ops, batch);
       const tree = await edit.finish();
       edit.writeTo(batch);
+      const att = new AttachmentEdit(this.#store, this.key);
+      await att.apply(ops);
+      const attachmentRoot = await att.finish();
+      att.writeTo(batch);
       const now = opts.nowMicros ?? BigInt(Date.now()) * 1000n;
       const last = BigInt(this.#meta.lastMicros);
       const ts = now > last ? now : last + 1n;
@@ -331,6 +365,7 @@ export class ReplicaNamespace {
         ops,
         treeHash: tree,
         message: opts.message ?? "",
+        attachmentRoot,
       });
       batch.set(this.#commitKey(c.hash), c.payload);
       // The head's own payload stays: a pending commit's parent may be needed for a push.
@@ -415,6 +450,8 @@ export class ReplicaNamespace {
       const tip = decodeCommit(fromHex(t.payloadHex));
       const built = await this.#trie.rootHash();
       if (built !== tip.treeHash) throw new TreeMismatchError(tip.hash, tip.treeHash, built);
+      const attRoot = await attachmentRoot(this.#store, this.key);
+      if (attRoot !== tip.attachmentRoot) throw new AttachmentRootMismatchError(tip.hash, tip.attachmentRoot, attRoot);
       const batch: Batch = new Map();
       this.#replaceHead(batch, tip, maxMicros(this.#meta.lastMicros, [tip]));
       const meta = JSON.parse(fromUtf8(batch.get(ReplicaNamespace.metaKey(this.name))!)) as NamespaceMeta;

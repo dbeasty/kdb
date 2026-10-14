@@ -22,6 +22,7 @@ export interface CommitFixture {
   ops: (Op & Record<string, unknown>)[];
   treeHash: string;
   schemaHash?: string;
+  attachmentRoot?: string;
   message: string;
 }
 
@@ -45,6 +46,24 @@ export interface ChainFixture {
   namespace: string;
   commits: CommitFixture[];
   steps: { from: string; to: string; commits: string[]; docs: Record<string, string> }[];
+}
+
+/** A fixture op (go/cmd/kdb-tsfixtures replicaOpFixture) as an Op. */
+export function opFromFixture(o: Record<string, unknown>): Op {
+  const str = (k: string) => String(o[k] ?? "");
+  switch (o.kind) {
+    case "write": return { kind: "write", docId: str("docId"), json: str("json") };
+    case "delete": return { kind: "delete", docId: str("docId") };
+    case "fileWrite": return { kind: "fileWrite", path: str("path"), blobHash: str("blobHash") };
+    case "schemaMigration": return { kind: "schemaMigration", migrationId: str("migrationId"), payload: str("payload") };
+    case "attachmentPut":
+      return {
+        kind: "attachmentPut", docId: str("docId"), attachmentId: str("attachmentId"), name: str("name"),
+        scheme: Number(o.scheme ?? 0), contentHash: str("contentHash"), size: BigInt(Number(o.size ?? 0)), mime: str("mime"),
+      };
+    case "attachmentDelete": return { kind: "attachmentDelete", docId: str("docId"), attachmentId: str("attachmentId") };
+  }
+  throw new Error(`unknown fixture op ${String(o.kind)}`);
 }
 
 export function load<T>(file: string): T {

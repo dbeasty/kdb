@@ -18,13 +18,19 @@ import (
 )
 
 type replicaOpFixture struct {
-	Kind        string `json:"kind"`
-	DocID       string `json:"docId,omitempty"`
-	JSON        string `json:"json,omitempty"`
-	Path        string `json:"path,omitempty"`
-	BlobHash    string `json:"blobHash,omitempty"`
-	MigrationID string `json:"migrationId,omitempty"`
-	Payload     string `json:"payload,omitempty"`
+	Kind         string `json:"kind"`
+	DocID        string `json:"docId,omitempty"`
+	JSON         string `json:"json,omitempty"`
+	Path         string `json:"path,omitempty"`
+	BlobHash     string `json:"blobHash,omitempty"`
+	MigrationID  string `json:"migrationId,omitempty"`
+	Payload      string `json:"payload,omitempty"`
+	AttachmentID string `json:"attachmentId,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Scheme       int    `json:"scheme,omitempty"`
+	ContentHash  string `json:"contentHash,omitempty"`
+	Size         int64  `json:"size,omitempty"`
+	Mime         string `json:"mime,omitempty"`
 }
 
 type replicaCommitFixture struct {
@@ -39,6 +45,7 @@ type replicaCommitFixture struct {
 	Ops             []replicaOpFixture `json:"ops"`
 	TreeHash        string             `json:"treeHash"`
 	SchemaHash      string             `json:"schemaHash,omitempty"`
+	AttachmentRoot  string             `json:"attachmentRoot,omitempty"`
 	Message         string             `json:"message"`
 }
 
@@ -80,6 +87,7 @@ func writeReplicaFixtures(dir string) {
 	writeJSON(filepath.Join(dir, "trees.json"), buildTrees())
 	writeJSON(filepath.Join(dir, "tree-edits.json"), buildTreeEdits())
 	writeJSON(filepath.Join(dir, "chain.json"), buildChain())
+	writeAttachmentFixtures(dir)
 }
 
 func fixedHash(seed string) codec.Hash {
@@ -118,6 +126,9 @@ func commitFixture(name string, c document.Commit) replicaCommitFixture {
 	if c.SchemaHash != nil {
 		f.SchemaHash = c.SchemaHash.Hex()
 	}
+	if c.AttachmentTreeHash != nil {
+		f.AttachmentRoot = c.AttachmentTreeHash.Hex()
+	}
 	for _, op := range c.Operations {
 		switch o := op.(type) {
 		case document.WriteOp:
@@ -128,6 +139,8 @@ func commitFixture(name string, c document.Commit) replicaCommitFixture {
 			f.Ops = append(f.Ops, replicaOpFixture{Kind: "fileWrite", Path: o.Path, BlobHash: o.BlobHash.Hex()})
 		case document.SchemaMigrationOp:
 			f.Ops = append(f.Ops, replicaOpFixture{Kind: "schemaMigration", MigrationID: o.MigrationID.String(), Payload: o.MigrationPayload})
+		case document.AttachmentPutOp, document.AttachmentDeleteOp:
+			f.Ops = append(f.Ops, attachmentOpFixture(o))
 		}
 	}
 	return f
