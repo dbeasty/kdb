@@ -303,6 +303,78 @@ func TestAgesFollowTheNewestTableFound(t *testing.T) {
 	}
 }
 
+// agelessTable is writeTable under a name without an age, as Kotlin names its tables.
+func agelessTable(t *testing.T, shim *storio.InMemoryPlatformIO, ns string, fileID string, puts map[string]string, deletes []string) Handle {
+	t.Helper()
+	h := writeTable(t, shim, ns, 0, puts, deletes)
+	name := storio.SegmentNameBuilder.SSTable(ns, 0, fileID)
+	size, err := shim.SegmentSize(h.SegmentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := shim.ReadFromSegment(h.SegmentName, 0, int(size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shim.AppendToSegment(name, b); err != nil {
+		t.Fatal(err)
+	}
+	if err := shim.SealSegment(name); err != nil {
+		t.Fatal(err)
+	}
+	if err := shim.DeleteSegment(h.SegmentName); err != nil {
+		t.Fatal(err)
+	}
+	if ageOf(name) != noAge {
+		t.Fatalf("%s has an age", name)
+	}
+	return Handle{Level: 0, SegmentName: name}
+}
+
+// Tables named without an age are older than every table with one, wherever a listing puts them:
+// a bare UUID starting "f" lists after every age this century, and was registered as the newest,
+// so it shadowed a later delete.
+func TestAgelessTablesReopenAsTheOldest(t *testing.T) {
+	shim := testShim(t)
+	ns := "app/docs"
+	agelessTable(t, shim, ns, "f0000000-0000-4000-8000-000000000000", map[string]string{"gone": "value"}, nil)
+	writeTable(t, shim, ns, 0, map[string]string{"kept": "value"}, []string{"gone"})
+	store := NewLsmBlobStore(shim, ns, NewBlockCache(1<<20))
+	if err := store.DiscoverTables(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(keyFor([]byte("gone"))); got != nil {
+		t.Fatalf("a delete written after an ageless table is shadowed by it: %q", got)
+	}
+	if got := store.Get(keyFor([]byte("kept"))); string(got) != "value" {
+		t.Fatalf("kept reads %q", got)
+	}
+}
+
+// A window whose oldest run is ageless takes every older ageless run at its level, so its output -
+// ageless too - is the only one there and cannot tie with another when the store reopens.
+func TestWindowsTakeEveryOlderAgelessRun(t *testing.T) {
+	aged := "ns/app/docs/sstable/L0/18de7c433619e988-00000000-0000-4000-8000-000000000000"
+	run := func(level int, name string) mergeRun {
+		return mergeRun{tables: []Handle{{Level: level, SegmentName: name}}, bytes: 1}
+	}
+	ageless := func(level int, id string) mergeRun {
+		return run(level, fmt.Sprintf("ns/app/docs/sstable/L%d/%s-0000-4000-8000-000000000000", level, id))
+	}
+	runs := []mergeRun{run(0, aged), ageless(0, "a0000000"), ageless(0, "b0000000"), ageless(0, "c0000000"), ageless(1, "d0000000")}
+	for _, tc := range []struct{ hi, want int }{
+		{0, 0}, // no merge
+		{1, 1}, // ends at an aged run
+		{2, 4}, // ends at an ageless run: takes the rest at L0, not L1's
+		{4, 4},
+		{5, 5},
+	} {
+		if got := pastAgeless(runs, tc.hi); got != tc.want {
+			t.Errorf("pastAgeless(.., %d) = %d, want %d", tc.hi, got, tc.want)
+		}
+	}
+}
+
 func (s *LsmBlobStore) searchOrderForTest() []Handle {
 	s.mu.Lock()
 	defer s.mu.Unlock()

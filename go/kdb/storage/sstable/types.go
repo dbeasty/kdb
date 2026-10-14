@@ -639,22 +639,25 @@ func (s *LsmBlobStore) AddTable(handle Handle) {
 // That is fine for a pure cache and fatal for the tree objects that let a
 // historical read resolve by address (see engine/tree_objects.go).
 //
-// Registration order is file-listing order, not write order, which for
-// this store is not the problem it would be for a general LSM: every key
-// here is the hash of the value stored under it, so two tables holding the
-// same key hold identical bytes and "which is newer" cannot change an
-// answer. Tombstones would break that, and nothing tombstones a
-// content-addressed object.
+// Tables register oldest first, by the age in their names (byAge, see
+// tiering.go), so a lookup searches them in the order they were written and
+// a tombstone shadows what it did before the restart. Tables named without
+// an age - Kotlin's, and this package's older ones - register first, in name
+// order.
 func (s *LsmBlobStore) DiscoverTables() error {
 	names, err := s.io.ListSegments(s.namespaceID)
 	if err != nil {
 		return err
 	}
 	prefix := storio.SegmentNameBuilder.NamespacePrefix(s.namespaceID) + "sstable/"
+	var tables []string
 	for _, name := range names {
-		if !strings.HasPrefix(name, prefix) {
-			continue
+		if strings.HasPrefix(name, prefix) {
+			tables = append(tables, name)
 		}
+	}
+	byAge(tables)
+	for _, name := range tables {
 		level := 0
 		rest := name[len(prefix):]
 		if slash := strings.IndexByte(rest, '/'); slash > 1 && rest[0] == 'L' {
