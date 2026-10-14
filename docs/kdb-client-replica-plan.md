@@ -83,16 +83,26 @@ await orders.get(id); orders.scan({ from, to, where: d => d.total > 10 });
 db.syncNow(); db.status(); db.on("change", …); db.on("conflict", r => …); await db.close();
 ```
 
-### 3.3 Kotlin (`kdb-replica`, multiplatform: JVM and Android first)
+### 3.3 Kotlin (`kdb-replica`, JVM and Android)
 
 Same design and API shape. It reuses `kdb-document` (commit codec, trie, content hash), `kdb-codec`,
-`kdb-compression` (zstd) and `kdb-wire` framing. New code: the v2 client messages in `kdb-wire`, the replica
-engine, and the replica store (a file-backed key-value store on JVM/Android).
+`kdb-compression` (zstd) and `kdb-wire` framing. New code: the v2 client messages in `kdb-wire`, and the replica
+engine.
 
-The replica store is **not** Kotlin's `FileEmbeddedRuntime`, so #209's shallow-root refusal in the Kotlin replayer
-does not block it: the replica records its own root. A Kotlin *node* learning shallow roots is a separate item.
-The Android target needs `kdb-compression`'s JVM zstd (zstd-jni) checked on Android, or the pure-Kotlin codec used
-there.
+**Storage is the Kotlin embed runtime** (owner, D12): `FileEmbeddedRuntime` in `kdb-jdbc/.../file/`, the
+Go-compatible delta log. A Kotlin replica's data directory is therefore readable by Go tools and the Kotlin CLI,
+and the Go↔Kotlin physical-format goldens cover it. What that needs first:
+
+- **Shallow roots in Kotlin's replayer.** Every replica root is a shallow root (snapshot, squash). Kotlin refuses
+  namespaces whose marker lists `shallowRoots` (#209, `NamespaceMarker.kt`). The Kotlin replayer must learn Go's
+  rule (`embed/delta_replay.go applyCommitsTopologically`): a logged shallow root is admitted without applying its
+  ops or moving main, and the state comes from the checkpoint. Squash's durability is a checkpoint, so Kotlin must
+  also *write* a checkpoint that Go and Kotlin both read. This is the largest Kotlin item and lands as its own PR
+  before the Kotlin replica.
+- **Android**: `kdb-jdbc` is a plain JVM module (`java.nio.file`, API 26+) and `kdb-compression` uses zstd-jni,
+  which ships Android binaries. Both need an Android build check; the pure-Kotlin zstd codec is the fallback.
+- **Memory**: the Kotlin runtime's resident structures (it has none of Go's Track A work) bound how large a
+  namespace a Kotlin replica can hold. Measure in the Kotlin PR, and use filtered mode for large namespaces.
 
 ## 4. What the replica holds
 
@@ -154,6 +164,8 @@ patterns; projection requests are authorized one by one, as today.
 
 ## 5. Storage and memory bounds
 
+This section is the TS replica's store; Kotlin uses its embed runtime (§3.3).
+
 **Store**: a small key-value interface (`get`, `getMany`, ordered `scan`, atomic `apply(batch)`), with a memory
 backend (tests), an IndexedDB backend (browser) and a file backend (Node; JVM/Android in Kotlin). Keys:
 
@@ -164,7 +176,7 @@ backend (tests), an IndexedDB backend (browser) and a file backend (Node; JVM/An
 | `t/<ns>/<nibble prefix>` | trie node: 16 child hashes, or a folded leaf | written per apply; enough to recompute a root and to answer TREE_NODES diffs locally |
 | `c/<ns>/<hash>` | head commit payload, plus unpushed local commits | the push queue for full mode |
 | `o/<ns>/<seq>` | write-back outbox entries | filtered mode |
-| `i/<ns>/<index>/<key>/<uuid>` | optional secondary index entries | D10 |
+| `i/<ns>/<index>/<key>/<uuid>` | app-declared secondary index entries on a JSON path | D10 |
 
 - **Atomicity**: one apply (a pack page's fast-forward, a snapshot page, a projection page, a local write) is one
   backend transaction. The head moves in the same transaction as the documents and trie nodes. On IndexedDB this is
@@ -276,7 +288,11 @@ Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-p
   attachment PR follows B4's PR 5.
 - **D9** The replica keeps no history (head plus unpushed commits).
 
-**Still open (asked 2026-10-13):** D10 local query surface, D11 browser zstd, D12 Kotlin store.
+- **D10 Local queries (TS):** get by id, ordered scans, id ranges, a predicate callback, and app-declared
+  secondary indexes on JSON paths (equality and range). No local SQL.
+- **D11 Browser zstd:** a decode-only TS port of the pure-Kotlin decoder in `kdb-compression`, checked against the
+  Go golden vectors. Until it lands, browsers do not advertise `zstd-pack`.
+- **D12 Kotlin store: the Kotlin embed runtime** (§3.3), which first needs shallow roots in Kotlin's replayer.
 
 ## 11. PR plan
 
@@ -292,6 +308,7 @@ equal, conflicts reported, unreadable documents never sent.
 | 2 | v2 client + full mode: hello/auth, snapshot bootstrap, FETCH/PACK_PAGE fast-forward, squash catch-up, `catchUp=auto`, local commits pushed by REF_UPDATE, poll loop, zstd on Node | Against `kdb-replicahost`: bootstrap; catch-up by replay and by squash (asserts which route ran); push + host merge + pull; reopen; bad token; two replicas converge; memory stays under budget on a namespace larger than it |
 | 3 | Filtered mode + write-back + conflicts + single-home, plus the projection host fixes (§4.3) | Filter and read rights; un-match deletes; id range; offline writes queue and apply on reconnect; conflict event and resolution; NOT_HOME keeps the write pending; host reset cost O(page) |
 | 4 | Browser: zstd decoder (D11), Chromium smoke page, `navigator.storage.persist` | Golden zstd vectors; browser page test |
-| 5 | Kotlin `kdb-replica` (JVM, Android target): v2 messages in `kdb-wire`, engine, file store | Interop test against `kdb-replicahost` under `./gradlew build` (skipped without Go, as the TS tests skip) |
+| 5a | Kotlin shallow roots: replay admits logged shallow roots; checkpoint written and read in Go's format; #209's refusal lifted | Go writes a squashed namespace, Kotlin opens it, and the reverse (`go/kdb/integration` runCli pattern) |
+| 5b | Kotlin `kdb-replica` (JVM, Android target): v2 messages in `kdb-wire`, engine over `FileEmbeddedRuntime` | Interop test against `kdb-replicahost` under `./gradlew build` (skipped without Go, as the TS tests skip) |
 | 6 | Attachments (after B4 PR 5), TS then Kotlin | Lazy fetch, ranged resume, upload then push, a filtered replica gets only its documents' blobs |
 | 7 | `REFS_WATCH`/`REFS_CHANGED` | A change is visible on the replica without a poll tick |
