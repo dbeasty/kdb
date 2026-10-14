@@ -6,6 +6,7 @@ import dev.kdb.config.resolveKdbProductConfig
 import dev.kdb.embed.EmbeddedKdbRuntime
 import dev.kdb.embed.materializeCommit
 import dev.kdb.embed.openMemoryRuntimeBlocking
+import dev.kdb.embed.peerBlobStore
 import dev.kdb.embed.runPeerSyncOverWebSocketListen
 import dev.kdb.embed.runStreamOverWebSocketListen
 import dev.kdb.stream.StreamBroadcastHub
@@ -147,6 +148,8 @@ public fun main(args: Array<String>) {
                 materializeCommit(runtime, config.namespace, commit)
                 streamHub.publish(publishedCommitFrom(commit))
             },
+            // v2 peers fetch the namespace's attachment blobs (BLOB_FETCH) and upload theirs.
+            blobs = runtime.peerBlobStore(config.namespace),
         )
     val peerHostFactory = peerSyncHostFactory(wire, runtime.dag, runtime.storage, peerHostConfig, auth)
     val sqlHostFactory =

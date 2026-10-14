@@ -57,8 +57,8 @@ func checkShard(t *testing.T, sh *docHashShard) {
 		bytes += int64(r.n) + docHashEntryOverhead
 		live += int64(r.n)
 		if r.n > 0 {
-			if sh.chunks[r.chunk] == nil || int(r.off+r.n) > len(sh.chunks[r.chunk]) {
-				t.Fatalf("slot %d addresses %d+%d of chunk %d (len %d)", i, r.off, r.n, r.chunk, len(sh.chunks[r.chunk]))
+			if off := r.off &^ slotReferenced; sh.chunks[r.chunk] == nil || int(off+r.n) > len(sh.chunks[r.chunk]) {
+				t.Fatalf("slot %d addresses %d+%d of chunk %d (len %d)", i, off, r.n, r.chunk, len(sh.chunks[r.chunk]))
 			}
 			chunkLive[r.chunk] += int64(r.n)
 		}
@@ -213,12 +213,17 @@ func TestDocArenaLRUOrder(t *testing.T) {
 	if got, want := lruOrder(sh), []codec.Hash{shardHash(3), shardHash(2), shardHash(1), shardHash(0)}; fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("order after puts: %v", got)
 	}
-	s.Get(shardHash(0)) // 0 becomes most recent; 1 is now least
+	// A read marks 0 referenced rather than moving it (second-chance eviction): the ring order is
+	// unchanged, and the evictor passes over 0 once instead.
+	s.Get(shardHash(0))
 	s.Pin(shardHash(2)) // off the ring
-	if got, want := lruOrder(sh), []codec.Hash{shardHash(0), shardHash(3), shardHash(1)}; fmt.Sprint(got) != fmt.Sprint(want) {
+	if got, want := lruOrder(sh), []codec.Hash{shardHash(3), shardHash(1), shardHash(0)}; fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("order after get+pin: %v", got)
 	}
-	s.Put(shardHash(4), bodyFor(4, size)) // over budget by one: evicts 1
+	if i, _ := sh.index.find(sh.slots, ptrHash(shardHash(0))); sh.slots[i].off&slotReferenced == 0 {
+		t.Fatal("a read did not mark the version referenced")
+	}
+	s.Put(shardHash(4), bodyFor(4, size)) // over budget by one: 0 gets its second chance, 1 goes
 	if _, ok := s.Get(shardHash(1)); ok {
 		t.Fatal("least recently used version survived eviction")
 	}
@@ -370,3 +375,5 @@ func TestDocArenaAccountingMatchesHeap(t *testing.T) {
 		})
 	}
 }
+
+func ptrHash(h codec.Hash) *codec.Hash { return &h }

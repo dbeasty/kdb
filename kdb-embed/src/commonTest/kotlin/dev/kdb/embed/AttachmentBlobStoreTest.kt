@@ -5,10 +5,7 @@ import dev.kdb.document.ATTACHMENT_CHUNK_BYTES
 import dev.kdb.document.attachmentContentHash
 import dev.kdb.document.kdbSha256
 import dev.kdb.storage.mem.InMemoryPlatformIoShim
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.withContext
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -45,7 +42,16 @@ class AttachmentBlobStoreTest {
         return out
     }
 
-    private suspend fun sleep(d: Duration) = withContext(Dispatchers.Default) { delay(d) }
+    /** A clock the test steps, so grace and lease checks do not race the runner's speed. */
+    private class StepClock {
+        var nanos = 1_700_000_000_000_000_000L
+
+        fun advance(d: Duration) {
+            nanos += d.inWholeNanoseconds
+        }
+    }
+
+    private fun AttachmentBlobStore.on(c: StepClock) = apply { clock = { c.nanos } }
 
     private suspend fun AttachmentBlobStore.readBack(h: KdbHash): ByteArray {
         val r = open(h)
@@ -180,10 +186,11 @@ class AttachmentBlobStoreTest {
     @Test
     fun aStalledReaderLeaseExpires() =
         runTest {
-            val s = AttachmentBlobStore(InMemoryPlatformIoShim(), ns, readLease = 1.milliseconds)
+            val c = StepClock()
+            val s = AttachmentBlobStore(InMemoryPlatformIoShim(), ns, readLease = 1.milliseconds).on(c)
             val blob = s.putBytes(random(8, 2 * chunk))
             val r = s.open(blob.hash)
-            sleep(10.milliseconds)
+            c.advance(10.milliseconds)
             s.collect { false }
             assertFailsWith<AttachmentReadLeaseExpiredException> { r.readAll() }
             r.close()
@@ -237,15 +244,17 @@ class AttachmentBlobStoreTest {
     fun aFinishedUploadIsHeldForItsGrace() =
         runTest {
             val shim = InMemoryPlatformIoShim()
+            val c = StepClock()
             val grace = 50.milliseconds
-            val small = AttachmentBlobStore(shim, ns, uploadGrace = grace).putBytes(random(10, 100))
-            val large = AttachmentBlobStore(shim, ns, uploadGrace = grace).putBytes(random(11, chunk + 1))
+            val small = AttachmentBlobStore(shim, ns, uploadGrace = grace).on(c).putBytes(random(10, 100))
+            val large = AttachmentBlobStore(shim, ns, uploadGrace = grace).on(c).putBytes(random(11, chunk + 1))
             shim.appendToSegment("ns/$ns/attachment/u-abandoned", ByteArray(10)) // a crashed upload: no grace
-            val s = AttachmentBlobStore(shim, ns, uploadGrace = grace) // the hold survives a reopen
+            val s = AttachmentBlobStore(shim, ns, uploadGrace = grace).on(c) // the hold survives a reopen
+            c.advance(grace - 1.milliseconds)
             assertEquals(0, s.collect { false })
             assertFalse("ns/$ns/attachment/u-abandoned" in shim.listSegments(ns))
             assertTrue(s.has(small.hash) && s.has(large.hash))
-            sleep(100.milliseconds)
+            c.advance(1.milliseconds)
             assertEquals(2, s.collect { false })
             assertEquals(emptyList(), shim.listSegments(ns))
         }
@@ -254,19 +263,22 @@ class AttachmentBlobStoreTest {
     fun holdAndReuploadRestartTheGrace() =
         runTest {
             val shim = InMemoryPlatformIoShim()
+            val c = StepClock()
             val grace = 400.milliseconds
-            val s = AttachmentBlobStore(shim, ns, uploadGrace = grace)
+            val s = AttachmentBlobStore(shim, ns, uploadGrace = grace).on(c)
             val a = s.putBytes(random(12, 100))
             val b = s.putBytes(random(13, 100))
-            sleep(250.milliseconds)
+            c.advance(250.milliseconds)
             assertTrue(s.hold(a.hash))
             s.putBytes(random(13, 100))
             assertFalse(s.hold(KdbHash(ByteArray(32))))
-            sleep(250.milliseconds)
+            c.advance(250.milliseconds)
             // Past the first grace, within the restarted one - and recorded, so a reopened store sees it.
-            assertEquals(0, AttachmentBlobStore(shim, ns, uploadGrace = grace).collect { false })
-            sleep(300.milliseconds)
-            assertEquals(2, AttachmentBlobStore(shim, ns, uploadGrace = grace).collect { false })
+            assertEquals(0, AttachmentBlobStore(shim, ns, uploadGrace = grace).on(c).collect { false })
+            c.advance(150.milliseconds - 1.milliseconds)
+            assertEquals(0, AttachmentBlobStore(shim, ns, uploadGrace = grace).on(c).collect { false })
+            c.advance(1.milliseconds)
+            assertEquals(2, AttachmentBlobStore(shim, ns, uploadGrace = grace).on(c).collect { false })
             assertFalse(AttachmentBlobStore(shim, ns).has(b.hash))
         }
 

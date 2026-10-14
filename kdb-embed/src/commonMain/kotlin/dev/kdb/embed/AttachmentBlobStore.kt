@@ -104,6 +104,9 @@ public class AttachmentBlobStore(
     private var markSeg = ""
     private var markGen = 0
 
+    /** What grace and lease times are read from, in epoch ns. Tests set it to step time. */
+    internal var clock: () -> Long = ::nowNanos
+
     // ---- pointers ----
 
     internal class Pointer(
@@ -339,9 +342,9 @@ public class AttachmentBlobStore(
             mutex.withLock {
                 loadLocked()
                 if (hash in pointers) {
-                    holdLocked(hash, nowNanos())
+                    holdLocked(hash, clock())
                 } else {
-                    val now = nowNanos()
+                    val now = clock()
                     pointers[hash] = writePointerLocked(hash, Pointer(0, "", "", "", size, false, false, null, last, now))
                     held[hash] = now
                 }
@@ -363,9 +366,9 @@ public class AttachmentBlobStore(
             if (hash in pointers) {
                 runCatching { shim.deleteSegment(segment) } // already stored: keep the one copy
                 runCatching { shim.deleteSegment(leavesSeg) }
-                holdLocked(hash, nowNanos())
+                holdLocked(hash, clock())
             } else {
-                val now = nowNanos()
+                val now = clock()
                 pointers[hash] = writePointerLocked(hash, Pointer(0, "", segment, leavesSeg, size, false, false, null, null, now))
                 held[hash] = now
                 verified += leavesSeg
@@ -404,7 +407,7 @@ public class AttachmentBlobStore(
         mutex.withLock {
             loadLocked()
             if (hash !in pointers) return@withLock false
-            holdLocked(hash, nowNanos())
+            holdLocked(hash, clock())
             true
         }
 
@@ -473,7 +476,7 @@ public class AttachmentBlobStore(
      * now: the segments it reads from are not deleted until it is closed, or its lease runs out.
      */
     public suspend fun open(hash: KdbHash): AttachmentReader {
-        val deadline = nowNanos() + readLease.inWholeNanoseconds
+        val deadline = clock() + readLease.inWholeNanoseconds
         if (hash == EMPTY_HASH) return AttachmentReader(this, hash, 0, MemSource(ByteArray(0)), "", deadline)
         val reader: AttachmentReader
         val chain: List<Pair<KdbHash, Pointer>>
@@ -680,7 +683,7 @@ public class AttachmentBlobStore(
      * closes. Readers past their lease are released first. Returns how many blobs were removed.
      */
     public suspend fun collect(keep: (KdbHash) -> Boolean): Int {
-        val now = nowNanos()
+        val now = clock()
         expireReaders(now)
         return mutex.withLock {
             loadLocked()

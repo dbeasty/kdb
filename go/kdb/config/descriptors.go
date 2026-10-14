@@ -630,7 +630,7 @@ func envOnlySpecs() []envOnlySpec {
 		{
 			key: "cache.boundedLiveBodies", env: "KDB_BOUNDED_LIVE_BODIES",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
-			help:  "let live document versions be evicted from memory once their commit is logged, so live data need not fit in memory (default off: every live version stays resident)",
+			help:  "let live document versions be evicted from memory once their commit is logged, so live data need not fit in memory (default on; off keeps every live version resident)",
 			parse: onOff,
 		},
 		{
@@ -666,7 +666,7 @@ func envOnlySpecs() []envOnlySpec {
 		{
 			key: "tree.file", env: "KDB_TREE_FILE",
 			scope: ScopeNamespace, mutability: MutabilityNamespaceReopen,
-			help:  "page the live document tree's cold records to mapped segment files (ns/<namespace>/tree/) so its heap does not grow with the namespace (default off). The files are a rebuildable cache; Linux and macOS only, ignored elsewhere",
+			help:  "page the live document tree's cold records to mapped segment files (ns/<namespace>/tree/) so its heap does not grow with the namespace (default on; off holds it in the heap). The files are a rebuildable cache; Linux and macOS only, ignored elsewhere",
 			parse: onOff,
 		},
 		{

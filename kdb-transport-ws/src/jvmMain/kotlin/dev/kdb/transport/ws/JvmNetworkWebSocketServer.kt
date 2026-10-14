@@ -43,6 +43,26 @@ public class JvmNetworkWebSocketServer(
     var listenPath: String = "/"
         private set
 
+    // Handlers by request path: one server can serve several listeners on its port (kdb-service's
+    // peer sync at /kdb and its commit stream at /kdb/stream), each bound by its own path.
+    private val routes = ConcurrentHashMap<String, suspend (WireConnection) -> Unit>()
+
+    private fun routeKey(path: String): String = path.trimEnd('/').ifEmpty { "/" }
+
+    /** Serves [path] on this server's port with [handler] too. */
+    fun addRoute(
+        path: String,
+        handler: suspend (WireConnection) -> Unit,
+    ) {
+        routes[routeKey(path.ifEmpty { "/" })] = handler
+    }
+
+    /** Stops serving [path]; returns how many paths are still served. */
+    fun removeRoute(path: String): Int {
+        routes.remove(routeKey(path.ifEmpty { "/" }))
+        return routes.size
+    }
+
     val listenUri: String
         get() {
             val scheme = if (secure) "kdb-wss" else "kdb-ws"
@@ -70,6 +90,7 @@ public class JvmNetworkWebSocketServer(
             serverSocket = ss
             port = ss.localPort
             listenPath = path.ifEmpty { "/" }
+            addRoute(listenPath, handler)
             scope.launch {
                 while (isActive) {
                     val socket =
@@ -90,8 +111,8 @@ public class JvmNetworkWebSocketServer(
                     active.incrementAndGet()
                     launch {
                         try {
-                            val (conn, headers) = acceptWebSocket(socket, listenPath)
-                            handler(
+                            val (conn, headers, route) = acceptWebSocket(socket)
+                            route(
                                 JvmAttributedWebSocketConnection(
                                     conn,
                                     dev.kdb.transport.core.WireConnectionAttributes(httpHeaders = headers),
@@ -134,19 +155,14 @@ public class JvmNetworkWebSocketServer(
         }
     }
 
-    private fun acceptWebSocket(
-        socket: Socket,
-        expectedPath: String,
-    ): Pair<JvmSocketWebSocketConnection, Map<String, String>> {
+    private fun acceptWebSocket(socket: Socket): Triple<JvmSocketWebSocketConnection, Map<String, String>, suspend (WireConnection) -> Unit> {
         socket.tcpNoDelay = true
         val input = BufferedInputStream(socket.getInputStream())
         val output = BufferedOutputStream(socket.getOutputStream())
         val request = WebSocketFraming.readHttpHeaders(input)
         val firstLine = request.line(0)
-        val path = firstLine.split(' ').getOrNull(1) ?: "/"
-        if (path != expectedPath && path != expectedPath.trimEnd('/')) {
-            throw TransportException("unexpected WebSocket path: $path")
-        }
+        val path = (firstLine.split(' ').getOrNull(1) ?: "/").substringBefore('?')
+        val route = routes[routeKey(path)] ?: throw TransportException("unexpected WebSocket path: $path")
         val key =
             request.headers["sec-websocket-key"]
                 ?: throw TransportException("missing Sec-WebSocket-Key")
@@ -159,7 +175,7 @@ public class JvmNetworkWebSocketServer(
         output.write(response.toByteArray(StandardCharsets.US_ASCII))
         output.flush()
         val conn = JvmSocketWebSocketConnection(socket, input, output, options)
-        return conn to request.headers
+        return Triple(conn, request.headers, route)
     }
 }
 

@@ -47,18 +47,25 @@ internal class DefaultPeerSyncClient(
     private var correlation = 2000
 
     override suspend fun connect(config: PeerClientConfig): PeerSession {
-        val conn =
-            when (transport) {
-                is OptionAwareWireTransport ->
-                    transport.connect(
-                        config.peerUri,
-                        TransportConnectOptions(
-                            connectHeaders = config.connectionContext.toHttpHeaders(),
-                            tls = config.tls,
-                        ),
-                    )
-                else -> transport.connect(config.peerUri)
-            }
+        if (config.protocolV2) {
+            val conn = open(config)
+            connection = conn
+            val ns =
+                PeerSyncNamespace(
+                    config.namespaceId, dag, storage, config.blobs, config.materializeCommit, config.conflictPolicy,
+                )
+            val session =
+                try {
+                    openV2Session(wire, conn, ns, config)
+                } catch (e: Throwable) {
+                    disconnect()
+                    throw e
+                }
+            if (session != null) return session
+            // A v1-only peer: v1 on a fresh connection, as Go's SyncV2 falls back.
+            disconnect()
+        }
+        val conn = open(config)
         connection = conn
         val localHead = dag.head()
         val hs =
@@ -83,6 +90,19 @@ internal class DefaultPeerSyncClient(
         val remoteHead = KdbHash.fromHex(remoteHex)
         return DefaultPeerSession(this, dag, storage, config.namespaceId, remoteHead, conn, config.conflictPolicy)
     }
+
+    private suspend fun open(config: PeerClientConfig): WireConnection =
+        when (transport) {
+            is OptionAwareWireTransport ->
+                transport.connect(
+                    config.peerUri,
+                    TransportConnectOptions(
+                        connectHeaders = config.connectionContext.toHttpHeaders(),
+                        tls = config.tls,
+                    ),
+                )
+            else -> transport.connect(config.peerUri)
+        }
 
     override suspend fun disconnect() {
         connection?.close()
