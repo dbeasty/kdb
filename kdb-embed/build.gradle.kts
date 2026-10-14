@@ -6,8 +6,20 @@ plugins {
 kotlin {
     jvm()
     js(IR) {
-        browser()
-        nodejs()
+        // The attachment store tests encode binary deltas over multi-chunk (1 MiB+) versions: a
+        // rolling hash per byte, which Kotlin/JS's emulated Long makes slow enough to pass Mocha's
+        // default 2s on a shared runner.
+        val jsTestTimeout = "30s"
+        browser {
+            testTask {
+                useMocha { timeout = jsTestTimeout }
+            }
+        }
+        nodejs {
+            testTask {
+                useMocha { timeout = jsTestTimeout }
+            }
+        }
         binaries.executable()
     }
 

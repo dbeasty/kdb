@@ -103,7 +103,10 @@ public data class PutAttachmentOptions(
 
 /** What [compactAttachments] did. */
 public data class AttachmentMaintenance(
+    /** Blobs deleted. */
     val removed: Int,
+    /** Replaced versions re-stored as deltas. */
+    val deltas: Int = 0,
 )
 
 /** A pinned, verifying read of one attachment version, with what it is. Close the [reader]. */
@@ -309,29 +312,116 @@ private suspend fun EmbeddedKdbRuntime.headAttachmentHashes(): MutableSet<KdbHas
     return keep
 }
 
-/** Every content hash any commit reachable from a branch or tag references. */
-private suspend fun EmbeddedKdbRuntime.referencedAttachmentHashes(): Set<KdbHash> {
+/** A commit whose attachment root differs from its first parent's, and the attachment puts it carries. */
+private class AttachmentChange(
+    val commit: KdbCommit,
+    val puts: List<KdbOp.AttachmentPut>,
+)
+
+/**
+ * Every content hash any commit reachable from a branch or tag references - what
+ * [AttachmentHistory.ALL] keeps - reading the operations only of commits whose attachment root
+ * differs from their first parent's. Also returns the heads walked from and, oldest first, the
+ * changing commits [wanted] accepts (none when it is null). Go's referencedAttachmentHashes.
+ */
+private suspend fun EmbeddedKdbRuntime.referencedAttachmentHashes(
+    wanted: ((KdbHash) -> Boolean)? = null,
+): Triple<Set<KdbHash>, List<KdbHash>, List<AttachmentChange>> {
     val keep = headAttachmentHashes()
+    val heads = heads()
+    val changes = ArrayList<AttachmentChange>()
     val seen = mutableSetOf<KdbHash>()
-    for (head in heads()) {
+    for (head in heads) {
         for (e in dag.walk(head)) {
             val c = (e as? TraversalEntry.Full)?.commit ?: continue
             if (!seen.add(c.hash) || c.attachmentTreeHash == null) continue
-            for (op in c.operations) if (op is KdbOp.AttachmentPut) keep += op.contentHash
+            val parent = c.parentHashes.firstOrNull()?.let { dag.getCommit(it) }
+            if (parent != null && parent.attachmentTreeHash == c.attachmentTreeHash) continue
+            val puts = c.operations.filterIsInstance<KdbOp.AttachmentPut>()
+            for (put in puts) keep += put.contentHash
+            if (wanted != null && puts.isNotEmpty() && wanted(c.hash)) changes += AttachmentChange(c, puts)
         }
     }
-    return keep
+    changes.reverse() // the walk goes newest first
+    return Triple(keep, heads, changes)
 }
 
 /**
- * Deletes the blobs nothing keeps: under [AttachmentHistory.LATEST] anything a branch or tag head
- * does not reference, under [AttachmentHistory.ALL] anything no reachable commit references (an
- * upload never committed) - but neither while it is within its upload grace
- * ([setAttachmentUploadGrace]), its commit perhaps still to come. A blob being read is removed
- * when its reader closes. Safe at any time.
+ * Re-stores replaced versions as deltas (under [AttachmentHistory.ALL]) and deletes the blobs
+ * nothing keeps: under [AttachmentHistory.LATEST] anything a branch or tag head does not reference,
+ * under [AttachmentHistory.ALL] anything no reachable commit references (an upload never committed)
+ * - but neither while it is within its upload grace ([setAttachmentUploadGrace]), its commit perhaps
+ * still to come. A blob being read is removed when its reader closes. Safe at any time.
+ *
+ * Replacements are read from the DAG, as Go's CompactAttachments reads them, so every way a commit
+ * arrives counts: a commit that puts an attachment whose first parent had a different version of
+ * it (same document, same attachment ID) makes the pair (old, new), and old is re-stored as a delta
+ * against new. The store's mark records the heads each pass went through, so the next one, after a
+ * restart too, looks only at commits since.
  */
 public suspend fun EmbeddedKdbRuntime.compactAttachments(namespaceId: String = defaultNamespace): AttachmentMaintenance {
     val history = attachments.mutex.withLock { attachments.history }
-    val keep = if (history == AttachmentHistory.LATEST) headAttachmentHashes() else referencedAttachmentHashes()
-    return AttachmentMaintenance(attachmentStore(namespaceId).collect { it in keep })
+    val store = attachmentStore(namespaceId)
+    if (history == AttachmentHistory.LATEST) {
+        val keep = headAttachmentHashes()
+        return AttachmentMaintenance(store.collect { it in keep })
+    }
+    val done = HashSet<KdbHash>()
+    for (h in store.mark()) {
+        if (h in done || !dag.hasCommit(h)) continue
+        for (e in dag.walk(h)) {
+            when (e) {
+                is TraversalEntry.Full -> done += e.commit.hash
+                is TraversalEntry.Stubbed -> done += e.stub.originalHash
+            }
+        }
+    }
+    val (keep, heads, changes) = referencedAttachmentHashes { it !in done }
+    var deltas = 0
+    var deltaError: Throwable? = null
+    try {
+        deltas = deltaReplaced(store, keep, changes)
+        if (changes.isNotEmpty()) store.setMark(heads)
+    } catch (e: Throwable) {
+        deltaError = e
+    }
+    val removed = store.collect { it in keep }
+    deltaError?.let { throw it }
+    return AttachmentMaintenance(removed, deltas)
+}
+
+/**
+ * Re-stores, for each put in [changes], the version it replaced in its commit's first parent as a
+ * delta against it, when both are kept. A version gone missing or corrupt is left alone; any other
+ * failure stops the pass, so the mark is not moved past work not done.
+ */
+private suspend fun EmbeddedKdbRuntime.deltaReplaced(
+    store: AttachmentBlobStore,
+    keep: Set<KdbHash>,
+    changes: List<AttachmentChange>,
+): Int {
+    var deltas = 0
+    for (ch in changes) {
+        val parentHash = ch.commit.parentHashes.firstOrNull() ?: continue
+        val parent =
+            try {
+                dag.attachmentTableAt(parentHash)
+            } catch (_: Exception) {
+                continue // a shallow root's parent: nothing here to delta against
+            }
+        for (put in ch.puts) {
+            val prev = parent.get(put.docId, put.attachmentId) ?: continue
+            if (prev.contentHash == put.contentHash || prev.contentHash !in keep || put.contentHash !in keep) continue
+            val did =
+                try {
+                    store.storeAsDelta(prev.contentHash, put.contentHash)
+                } catch (_: AttachmentBlobNotFoundException) {
+                    false
+                } catch (_: AttachmentCorruptException) {
+                    false
+                }
+            if (did) deltas++
+        }
+    }
+    return deltas
 }
