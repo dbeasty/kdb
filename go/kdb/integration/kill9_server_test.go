@@ -325,6 +325,20 @@ func TestServerKill9LosesNoAcknowledgedWrite(t *testing.T) {
 			}(w)
 		}
 
+		if iterations == 1 {
+			// One kill (the -short smoke) has no later iterations to make up for a kill that
+			// lands before the load got going - on a Windows runner 150 ms can be one write. So
+			// the one kill waits for some acknowledged writes, then comes at a random moment.
+			for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+				acked.mu.Lock()
+				n := acked.n
+				acked.mu.Unlock()
+				if n >= 10 {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
 		time.Sleep(time.Duration(150+rng.Intn(900)) * time.Millisecond)
 		srv.kill9()
 		cancel()

@@ -14,8 +14,10 @@ on:
     branches: [main]
 
 concurrency:
-  # A new push to a PR supersedes the run still going for the previous one.
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # A new push to a PR supersedes the run still going for the previous one. Each push to main is
+  # its own group: GitHub keeps only one pending run per group and cancels the rest, which skipped
+  # main commits while the queue was long.
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
