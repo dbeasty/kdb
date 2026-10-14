@@ -54,12 +54,12 @@ public object SyncV2 {
     // tree-node frames, and never answers it with them.
     public const val CAP_BRANCHES: String = "branches"
     public const val CAP_TAGS: String = "tags"
-    public const val CAP_STUBS: String = "stubs"
     public const val CAP_ZSTD_PACK: String = "zstd-pack"
     public const val CAP_ATTACHMENTS: String = "attachments"
 
-    /** What this build's v2 host and client do. */
-    public val CAPABILITIES: List<String> = listOf(CAP_BRANCHES, CAP_TAGS, CAP_STUBS, CAP_ZSTD_PACK, CAP_ATTACHMENTS)
+    /** What this build's v2 host and client do. Not "stubs": neither side stores an archived
+     * parent sent in place of its commit, and a page carrying one is refused. */
+    public val CAPABILITIES: List<String> = listOf(CAP_BRANCHES, CAP_TAGS, CAP_ZSTD_PACK, CAP_ATTACHMENTS)
 
     public const val ACCESS_PULL: String = "pull"
     public const val ACCESS_PUSH: String = "push"
