@@ -1,6 +1,6 @@
 # Client replica (memory plan Track D)
 
-Status: **design, awaiting owner decisions (§10).** Written 2026-10-13 against `origin/main` 0399daf.
+Status: **design; owner decisions recorded in §10.** Written 2026-10-13 against `origin/main` 0399daf.
 No code yet. File references are relative to `go/kdb/` unless they start with a repo-level directory.
 
 Inputs: `kdb-memory-cassandra-plan.md` Track D (fixed constraints), `kdb-distributed-plan.md` §3.11–3.14,
@@ -8,78 +8,91 @@ Inputs: `kdb-memory-cassandra-plan.md` Track D (fixed constraints), `kdb-distrib
 (PR #214), and a survey of the code. No separate offline-sync design exists in `docs/` or in a live session,
 so this document is the first.
 
-## 1. What already exists (and decides most of the design)
+## 1. What already exists
 
 | Piece | What it is | Consequence for the replica |
 |---|---|---|
-| `@kdb/embed` (`packages/kdb-embed`, `go/wasm/embed`) | **The Go engine compiled to WASM**, fronted by `server.FrameHost`. Durable through `PersistentFs` (`packages/kdb-embed/src/fs.ts`), a TS implementation of the `fs` object Go's js/wasm runtime calls, written behind to IndexedDB in 64 KiB chunks. | "The TS embed's storage layer" is Go's own delta log, checkpoints and graph files on a TS filesystem. There is no TS commit codec, trie, DAG or storage engine to reuse, and none is needed. |
-| `go/mobile/kdbsync` | A full Go node for gomobile (`bind -target=android|ios`): `embed.OpenFileHost` + `syncnode.Node`, peers over `ws://`/`wss://`/`tcp://`, bearer token, `SyncBoth`. | The Android/iOS replica already exists in its "whole namespace" form. It lacks only the projection, catch-up and conflict options. |
+| `@kdb/embed` (`packages/kdb-embed`, `go/wasm/embed`) | **The Go engine compiled to WASM**, fronted by `server.FrameHost`. Durable through `PersistentFs` (`packages/kdb-embed/src/fs.ts`), a TS implementation of the `fs` object Go's js/wasm runtime calls, written behind to IndexedDB in 64 KiB chunks. | Its storage layer is a whole-file-tree image held in memory, so a native replica reuses its IndexedDB backend's transaction discipline, not its shape (§5). There is no TS commit codec, trie or DAG to reuse. |
+| `go/mobile/kdbsync` | A full Go node for gomobile (`bind -target=android|ios`): `embed.OpenFileHost` + `syncnode.Node`, peers over `ws://`/`wss://`/`tcp://`, bearer token, `SyncBoth`. | The same role, as a full Go node on device. It stays available for apps that accept gomobile; the Kotlin replica is the native alternative. |
 | peersync v2 (`peersync/`, `wire/sync_v2_ops.go`) | FETCH/PACK_PAGE with zstd packs, SNAPSHOT_FETCH, SQUASH_HEAD + TREE_NODES + OBJECT_FETCH, PROJECT_FETCH/PAGE/WRITE/WRITE_RESULT, REF_UPDATE, HOME_REQUEST. JSON envelope over TCP or WebSocket (`/kdb/sync`). | Everything a replica needs is already a peersync message, *including* filtered bootstrap and write-back (projections). |
 | `peersync.SyncProjection` + `server/writeback.go` | A KDB-SQL filter per namespace; host filters per commit and per principal (`DocumentReadAction`); local projection namespace `<ns>.projection-<hash>`; write-back with a content-hash precondition, idempotent tx ids, the projection's DAG as outbox. | Filtered replica + offline write queue + per-document read rights are built. Two host-side costs need fixing (§4.3). |
 | `replication.Replicator` / `syncnode.Node` | Peer config (`catchup=`, `Filter`, `WriteBack`, `PreferSnapshot`), interval sync, backoff, conflict queue. | The replica is a `syncnode.Node` with a client-shaped configuration, not a new loop. |
 | Kotlin `kdb-peer-sync` | **v1 only** (HANDSHAKE, COMMIT_FETCH, COMMIT_PUSH); Kotlin's replayer refuses `shallowRoots` (#209). No Android target in Gradle. | A Kotlin-native replica means writing a v2 client *and* shallow-root support in Kotlin's storage. See §10 D2. |
 | `@kdb/client` | Binary wire frames (#202), WS/TCP, zstd *decode* on Node only. | Not the replica: it stays the thin RPC client. The replica exposes the same `Client`/`KdbOperations` surface (§11.3 of Component 63). |
 
-**The central observation.** The plan's constraint "one pack format, no separate client sync protocol" is met
-most strongly by not writing a second implementation at all: the replica *is* the Go node, compiled to WASM for
-the browser and Node and to gomobile for Android/iOS, speaking peersync v2 unchanged. The plan's "start from the
-JS zstd" predates the Go→WASM decision for `@kdb/embed` (Component 63 §13.6); the WASM already contains Go's zstd,
-so no JS zstd is needed. A native TS reimplementation would duplicate the commit codec, the trie, the DAG,
-squash, snapshot install, projection apply and conflict handling, and would drift (the same reason §11.2 chose
-WASM).
+**Route (owner, 2026-10-13): native replicas in TS and in Kotlin.** Both speak peersync v2 directly, with the
+same messages a Go node uses. Neither embeds the Go engine. That rules out the obvious shortcut (the Go engine
+already inside `@kdb/embed`'s WASM, or `kdbsync` via gomobile). In exchange, the browser bundle stays small, and
+neither platform depends on Go's runtime or a 31 MB WASM. The cost is a second (TS) and third (Kotlin) peersync
+client, so **parity is enforced by golden vectors generated from Go** and by live interop tests against a Go node
+in every PR.
 
 ## 2. Which clients first
 
-**Recommendation: TS (browser and Node) first, through `@kdb/embed`; Android/iOS second, through `kdbsync`;
-Kotlin-native last and only on evidence (§10 D2).**
-
-- TS first: `@kdb/embed` has the storage and the engine, and is missing exactly one thing to sync, a transport.
-  Go's `net` does not exist under js/wasm, so `transport/ws` cannot dial from the browser or Node. The work is a
-  `stream.Transport` backed by the JS `WebSocket` (§3.1).
-- Android/iOS second: `kdbsync` works today; it gains the options in §4–§6 and a small Kotlin/Swift facade.
-- Kotlin-native: v2 client, shallow roots in the Kotlin replayer, projections and write-back in Kotlin. That is
-  most of the Go peersync client again. Only worth it if a JVM/Android app cannot take a gomobile AAR.
+**TS first (browser and Node), then Kotlin (JVM and Android).** TS has no commit codec, trie or DAG today. Kotlin
+has all three (`kdb-document`, multiplatform, hash-identical to Go), but its peer sync is v1, and its replayer
+refuses shallow roots. Doing TS first fixes the replica's semantics against the Go host. Kotlin then ports the
+same design, reusing its existing codec and trie.
 
 ## 3. Shape of the replica
 
-### 3.1 TS: `openReplica` in `@kdb/embed`
+A replica is deliberately **much less than a node**. That is what makes two native implementations affordable:
+
+- **It never merges.** In full mode it pushes its local commits first (REF_UPDATE); the host merges them
+  (`outcome: merged`); then it pulls, which is now a fast-forward. A fast-forward is all the replica ever applies:
+  topo-sort the fetched range, keep each document's last op (merge commits carry every document their parents
+  disagree on), apply, and require the built tree hash to equal the target commit's `documentTreeHash`. This
+  mirrors `peersync/ingest.go` `fastForward`/`netEffect`/`applyAndVerify`. A Strict conflict on push comes back as
+  a `ConflictReport` and is the app's to resolve (§7).
+- **It keeps no history** beyond its head and its unpushed commits. Its root is a shallow root: a snapshot,
+  squash or fast-forward target. Older states come from the host.
+- **It serves nothing.** No host side, no listener, no deepen, no graft, no backup.
+- **It runs no SQL.** Local reads are get-by-id, ordered scans, id ranges and a predicate callback, with optional
+  secondary indexes on JSON paths declared by the app. KDB-SQL stays on the server (open decision D10).
+
+### 3.1 Components (TS, new package `@kdb/replica`)
+
+| Component | Port of | Verified by |
+|---|---|---|
+| Canonical codec subset: `CommitPayload` encode/decode, ops (Write, Delete; attachment ops later), `DocumentBody` | `codec/wirecodec.go`, `document/wire.go`, `document/kdb_commit.go`; extends `@kdb/client`'s `wire/hash.ts` | Golden commit vectors from Go (`go/cmd/kdb-tsfixtures` gains `commits.json`): bytes and hash |
+| SHA-256, **synchronous**, pure TS | - | NIST vectors. WebCrypto is async per call, and the trie needs ~30 hashes per insert (leaf folding), so a promise per hash is too slow. Node uses `node:crypto` when present. |
+| Document trie: 16-ary nibble Merkle, leaf `0x00‖uuid‖contentHash`, internal `0x01‖16×32B`, single-entry subtrees folded | `document/document_tree_trie.go` | Golden tree vectors (sets of ids and content hashes → root); random differential test against a Go helper |
+| Persistent trie storage: nodes keyed by nibble prefix, written per commit, LRU-cached | - | Reopen tests; budget test |
+| peersync v2 client: SYNC_HELLO, REFS, FETCH/PACK_PAGE, SNAPSHOT_FETCH/PAGE, SQUASH_HEAD, TREE_NODES, OBJECT_FETCH, REF_UPDATE, PROJECT_*, PEER_ERROR; JSON envelope | `peersync/v2_client.go`, `squash.go`, `snapshot.go`, `projection.go` | Live interop against a Go node |
+| Framing and transports | Reuse `@kdb/client`'s `wire/frame.ts` and its WebSocket/TCP transports | Existing tests |
+| zstd **decode** for packs | Node: `zlib.zstdDecompressSync` (as `@kdb/client` does). Browser: a TS port of the pure-Kotlin decoder in `kdb-compression` (the "JS zstd" the plan names) | Go zstd golden vectors (`go/kdb/interop/zstd_physical_golden_test.go`). The replica advertises `zstd-pack` only when it has a decoder; pushes go uncompressed (the host accepts both). |
+| Replica store | Modelled on `@kdb/embed`'s `FsBackend` (atomic `apply` batch; IndexedDB backend with strict durability) but **key-value and paged**, not a whole-file-tree image | Crash and reload tests, as `persist.test.ts` does |
+| Replica engine: modes, bootstrap, catch-up, push, projections, write-back, conflict events, poll loop | `replication/replicator.go` behaviour | Live interop |
+
+### 3.2 API
 
 ```ts
 const db = await openReplica({
-  name: "app",                       // IndexedDB database / directory name
+  store: indexedDbStore("app"),      // or memoryStore(), fileStore(dir) on Node
   peer: { url: "wss://api.example.com/kdb/sync", token: () => auth.currentToken() },
   namespaces: [
-    { ns: "app/u/42", mode: "full" },                                    // §4.1
-    { ns: "orders", mode: "filtered", filter: "region = 'EU'", writeBack: true }, // §4.2
+    { ns: "app/u/42", mode: "full" },                                              // §4.1
+    { ns: "orders", mode: "filtered", filter: "region = 'EU'", writeBack: true },  // §4.2
   ],
-  catchUp: "auto",                   // default; "replay" | "squash" | "auto"
-  memory: { budgetBytes: 64 << 20 }, // §5
+  catchUp: "auto",                   // "replay" | "squash" | "auto"
+  memory: { cacheBytes: 32 << 20 },  // §5
 });
-db.client          // the ordinary @kdb/client Client (KdbOperations) over the local engine
-db.syncNow(); db.status(); db.on("conflict", r => …); db.on("change", …); await db.close();
+const orders = db.namespace("orders");
+await orders.put(id, { region: "EU", total: 12 });
+await orders.get(id); orders.scan({ from, to, where: d => d.total > 10 });
+db.syncNow(); db.status(); db.on("change", …); db.on("conflict", r => …); await db.close();
 ```
 
-- **Go side** (`go/wasm/embed`): `open` gains a `replica` option. It builds a `syncnode.Node` over the same
-  `embed.Host`, with `replication.PeerConfig`s whose transport is `transport/jsws` (new, `//go:build js`): a
-  `stream.Transport` whose `Connect` calls back into TS to open a `WebSocket`, with frames carried exactly as
-  the existing loopback does. One WebSocket message is one frame, as `transport/ws` already requires. No wire
-  change.
-- **Token refresh**: `Credentials` is already a callback in `PeerConfig` (`kdbsync.go:87`); `jsws` asks TS for the
-  current token on every connect. In the browser, `WebSocket` cannot set an `Authorization` header, so the token
-  goes in `SYNC_HELLO.token` (already supported, `v2_host.go:374`).
-- **Node**: the same API. Storage is a `PersistentFs` over a real directory, or the Node `fs` that `wasm_exec`
-  wires by default. A Node service that can run a native binary should just run `kdb-service` with `--peer`; the
-  replica is for code that must stay in-process.
-- **Workers**: in the browser, the engine runs in a dedicated worker; the main thread holds only the `Client`
-  over a `MessagePort` loopback. Sync, checkpoints and zstd then never block the UI. OPFS sync access handles
-  (§5) are only available in a worker anyway.
+### 3.3 Kotlin (`kdb-replica`, multiplatform: JVM and Android first)
 
-### 3.2 Android/iOS: `kdbsync`
+Same design and API shape. It reuses `kdb-document` (commit codec, trie, content hash), `kdb-codec`,
+`kdb-compression` (zstd) and `kdb-wire` framing. New code: the v2 client messages in `kdb-wire`, the replica
+engine, and the replica store (a file-backed key-value store on JVM/Android).
 
-`AddPeer` gains the options it does not expose today: `filter`, `writeBack`, `catchUp`, `preferSnapshot`
-(all already in `replication.PeerConfig`), plus a conflict callback and a change callback (gomobile
-interfaces). A thin Kotlin module (`kdb-replica-android`, an AAR wrapping the gomobile output) gives it a Kotlin
-API matching the TS one. This is PR 5.
+The replica store is **not** Kotlin's `FileEmbeddedRuntime`, so #209's shallow-root refusal in the Kotlin replayer
+does not block it: the replica records its own root. A Kotlin *node* learning shallow roots is a separate item.
+The Android target needs `kdb-compression`'s JVM zstd (zstd-jni) checked on Android, or the pure-Kotlin codec used
+there.
 
 ## 4. What the replica holds
 
@@ -97,15 +110,19 @@ document those commits touch: a v1 commit carries its bodies inside its hash.
   shallow root. Then FETCH/PACK_PAGE.
 - **Catch-up**: `catchup=auto` by default (C7): SQUASH_HEAD → TREE_NODES diff → OBJECT_FETCH → shallow root.
   Fast-forward only; a replica with local unpushed commits falls back to replay (it pushes first, then pulls).
-- History below the shallow root is absent; `deepen` can fetch it on demand.
+- **Auto rule** (the Go rule, `squash.go:84-91`): squash when the backlog is ≥ 1000 commits and ≥ 2× the changed
+  documents; otherwise FETCH/PACK_PAGE and fast-forward. When the host refuses squash, replay.
+- The replica keeps no history below its root. As-of reads go to the host.
 
 ### 4.2 `filtered`: a projection, per-document read rights
 
 - PROJECT_FETCH with a KDB-SQL filter. The host evaluates the filter **and** `DocumentReadAction` per document;
   documents the principal cannot read never arrive, and documents that stop matching (or lose read access) arrive
   as deletes.
-- Kept in the local `<ns>.projection-<hash>` namespace with locally authored commits that name the source
-  commit they reach. Locally queryable and indexable like any namespace.
+- Held locally as documents plus the last complete source commit (`atHex`); a native replica needs no locally
+  authored commits for it (Go's `ProjectionTarget` keeps them only because a node stores everything as commits).
+  Pages are applied atomically, each with its final states, so an interrupted transfer resumes from the last
+  complete source.
 - **Bootstrap = filtered snapshot**: PROJECT_FETCH with no `fromHex` is a reset, a cursor-paged
   (`after`/`next`) filtered snapshot. An id-range filter is a predicate on `_id`
   (`_id >= '…' AND _id < '…'`); the host change in §4.3 makes that a seek, not a scan.
@@ -137,24 +154,32 @@ patterns; projection requests are authorized one by one, as today.
 
 ## 5. Storage and memory bounds
 
-The engine's own bounds (Tracks A–C) apply unchanged, because it is the same engine: off-heap graph, trie
-slab and pages, bounded body cache, chunked adoption, squash's O(diff) install. What the replica adds is the
-**filesystem underneath**, which is where the browser loses today.
+**Store**: a small key-value interface (`get`, `getMany`, ordered `scan`, atomic `apply(batch)`), with a memory
+backend (tests), an IndexedDB backend (browser) and a file backend (Node; JVM/Android in Kotlin). Keys:
 
-| Platform | Storage | Today | Needed |
-|---|---|---|---|
-| Browser | `PersistentFs` → IndexedDB | **whole file tree resident in memory**; the README says memory ≈ data × 2 | **Paged `PersistentFs`**: metadata resident, 64 KiB chunks loaded on read, an LRU of clean chunks under `memory.budgetBytes`, dirty chunks pinned until their `fsync` transaction commits. Then an **OPFS** backend (sync access handles, in the worker) as the fast path where available, with IndexedDB as the fallback. |
-| Node | real directory | fine | nothing |
-| Android/iOS | app data dir via `kdbsync` | fine | nothing |
+| Prefix | Value | Notes |
+|---|---|---|
+| `m/` | replica metadata: node id, per-namespace mode, head, root, last projection source, schema version | resident |
+| `d/<ns>/<uuid>` | document body + content hash | id-ordered, so scans and id ranges are key ranges |
+| `t/<ns>/<nibble prefix>` | trie node: 16 child hashes, or a folded leaf | written per apply; enough to recompute a root and to answer TREE_NODES diffs locally |
+| `c/<ns>/<hash>` | head commit payload, plus unpushed local commits | the push queue for full mode |
+| `o/<ns>/<seq>` | write-back outbox entries | filtered mode |
+| `i/<ns>/<index>/<key>/<uuid>` | optional secondary index entries | D10 |
 
-- **Budget defaults**: 64 MiB browser engine + 32 MiB fs page cache; set by `memory.budgetBytes`, split by the
-  existing memory guard. The engine's history mode defaults to `NONE` on a replica: the replica keeps the head,
-  and history comes from the cloud on demand (`deepen`, as-of reads through the cloud).
+- **Atomicity**: one apply (a pack page's fast-forward, a snapshot page, a projection page, a local write) is one
+  backend transaction. The head moves in the same transaction as the documents and trie nodes. On IndexedDB this is
+  one `readwrite` transaction with `durability: "strict"`, as `@kdb/embed`'s backend does.
+- **Memory bound**: nothing is loaded whole. Two LRU caches (trie nodes and document bodies) share
+  `memory.cacheBytes` (default 32 MiB). A fetch in progress holds at most one page (≤ 4 MiB, the FETCH default) plus
+  the documents it touches. Snapshot install builds the trie bottom-up from id-ordered pages, so it never holds
+  the namespace. A squash diff walks TREE_NODES level by level. Peak memory is O(cache + page), independent of
+  namespace size: this is decision 1 of the memory plan, applied on the client.
 - **Quota**: the browser can evict storage. `openReplica` calls `navigator.storage.persist()` and reports the
-  result. An evicted replica is detected on open (marker missing) and re-bootstraps; local unsynced writes are
-  lost in that case, and `status()` says so ahead of time when persistence was denied.
-- **Encryption at rest**: the store-level toggle (`kdb-spec-layer14`) applies unchanged, since it is the same
-  engine. The key comes from the app. Not in the first PRs.
+  result. An evicted replica is detected on open (metadata missing) and re-bootstraps. `status()` warns ahead of
+  time that unsynced local writes would be lost when persistence was denied.
+- **Encryption at rest**: later; per-store, matching the "toggle, whole store" scope of the engine's encryption.
+- **Format**: versioned by a schema number in `m/`. A replica is a cache of the host, so an incompatible upgrade
+  may re-bootstrap after pushing pending writes. It never has to migrate.
 
 ## 6. Live updates
 
@@ -176,18 +201,20 @@ Codes 0x50–0x57 are reserved for the replica by the B4 session (2026-10-13). B
 
 | Mode | Local write | Offline | Conflict |
 |---|---|---|---|
-| `full`, multi-leader | A real local commit through the write gate | Commits accumulate in the local DAG; nothing else to queue | REF_UPDATE → host merges by policy. A Strict conflict returns a `ConflictReport` (`refUpdateAck.conflictBytes`) and lands in the local conflict queue; `db.on("conflict")` raises it, and the app resolves with `ResolveConflict` (existing). |
-| `filtered` + `writeBack` | A local commit on the projection namespace (optimistic: visible at once) | The projection's DAG is the outbox (`PendingWrites`), oldest first, idempotent tx ids | PROJECT_WRITE applies each doc with a `baseHash` precondition. `conflict`/`refused` return `current[]`; `ResolveWrite` resets those docs to the source state and keeps the attempt. The replica turns that into the same `ConflictReport` shape for `db.on("conflict")`, so the app has one conflict type. |
+| `full`, multi-leader | A real local commit: canonical payload, parent = local head, tree hash recomputed, `authorNodeId` = the replica's id, HLC timestamp | Unpushed commits are the queue (`c/`), a chain on the last host-confirmed head | REF_UPDATE → host merges by policy. A Strict conflict returns a `ConflictReport` (`refUpdateAck.conflictBytes`) and is kept with the local commits; `db.on("conflict")` raises it. The app resolves by writing a new local commit on top of the host's head (with `rebase` helpers: keep mine, take theirs, per document) or by discarding its commits. |
+| `filtered` + `writeBack` | Applied to the local projection at once (optimistic), and appended to the outbox with its `baseHash` | The outbox (`o/`), oldest first, each entry with a tx id fixed when it is written, so a resend after a lost reply is idempotent (the role `WriteBackTxID` plays in Go) | PROJECT_WRITE applies each doc with a `baseHash` precondition. `conflict`/`refused` return `current[]`; `ResolveWrite` resets those docs to the source state and keeps the attempt. The replica turns that into the same `ConflictReport` shape for `db.on("conflict")`, so the app has one conflict type. |
 | `single-home` namespace | **Only through write-back.** A full-mode replica of a single-home namespace is read-only locally (its commits would be fenced or refused with NOT_HOME). | Queued in the projection outbox; a NOT_HOME or unreachable home is a PEER_ERROR, so the write stays pending | Same as filtered. |
 
 - So a single-home namespace is held in `filtered` mode (the filter can be `TRUE`). `openReplica` enforces this
-  from the namespace policy in `_kdb/meta` (the replica reads its view through META_VIEW, as `ScopedMeta` does)
-  and refuses `mode: "full"` with a clear error.
+  from the namespace policy it reads through META_VIEW (as `ScopedMeta` does) and refuses `mode: "full"` with a
+  clear error.
 - **Ordering across namespaces**: a cross-namespace transaction written on the replica is pushed as its
   `CommitGroup` parts; projection write-back is per namespace. A group spanning a projection is refused locally
   rather than half-applied. This matches the distributed plan's rule for groups the replica cannot check.
-- **Durability of the queue**: it is the engine's log, so it inherits `fsync`. A pending write survives reload
-  and crash, as the existing `persist` tests prove for commits.
+- **Durability of the queue**: a local write is acknowledged only after its store transaction commits, so a pending
+  write survives reload and crash.
+- **Clock**: the host refuses commits whose timestamp is skewed (`checkSkew`). The replica keeps an HLC seeded
+  from the host's commit timestamps it has seen, so a phone with a wrong clock still produces acceptable commits.
 
 ## 8. Auth and read rights
 
@@ -218,6 +245,9 @@ Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-p
   readable old ref works.
 - **Squash/snapshot**: TREE_NODES gains a tree selector, so squash diffs the attachment table with the same
   mechanism. Missing blobs are *not* fetched before install on a replica (lazy), unlike a node.
+- The native replica must decode op kinds 5/6 and payload field 10, and keep the attachment table as a second
+  trie (same hashing, ref hash as leaf content) to verify `AttachmentTreeHash`. Golden vectors come from #214's
+  `AttachmentCommitGoldenTest`.
 - **Two gaps to settle with B4** (raised in §10 D7):
   1. **Projections carry no attachment refs.** `ProjectPageMessage.writes` is `{id, body}`. A filtered replica
      needs `{id, body, attachment?: {hash, contentHash, size, mime}}`, plus the source commit (`atHex`, already
@@ -227,63 +257,41 @@ Agreed with the B4 session on 2026-10-13 and recorded in `docs/kdb-attachments-p
      on the sync connection, or a blob-push message on the sync protocol. Then it pushes the commit or
      PROJECT_WRITE that references them. Resumable for mobile.
 
-## 10. Open decisions for the owner
+## 10. Decisions
 
-**D1. Implementation route for TS.** *Recommended: (a).*
-(a) The replica is the Go engine in `@kdb/embed`'s WASM, plus a JS-WebSocket transport. One implementation,
-peersync unchanged, inherits squash, snapshot, projections, conflicts and attachments as they land.
-Cost: a 4.7 MB brotli download, and browser memory depends on the paged fs (§5).
-(b) A native TS replica: commit codec, trie, DAG, v2 client and a storage engine in TS. Small bundle, but it is
-a third implementation of peersync, and the plan's "one pack format" then has to be enforced by golden tests
-instead of by construction.
+**Decided (owner, 2026-10-13):**
+- **D1 TS route: native TS replica** (not the Go engine in WASM).
+- **D2 Kotlin route: Kotlin-native v2 client** (not gomobile `kdbsync`).
+- **D3 Filtered mode = projections** (PROJECT_FETCH/PROJECT_WRITE). A filtered replica cannot hold real source
+  commits without receiving documents it may not read. "One pack format" therefore means "no new client protocol":
+  whole-namespace replicas use FETCH/PACK_PAGE, snapshot and squash exactly as nodes do. The verifiable partial clone
+  (commit format v2, `kdb-distributed-plan.md` §3.13) stays gated.
+- **D5 Live updates: poll first, `REFS_WATCH 0x50 / REFS_CHANGED 0x51` later.**
 
-**D2. Kotlin/Android route.** *Recommended: (a) now, (b) only on demand.*
-(a) Android/iOS via `kdbsync` (gomobile) with a Kotlin facade. No Kotlin peersync work.
-(b) Kotlin-native v2 client in `kdb-peer-sync`: v2 messages, zstd packs, snapshot, squash, projections, write
-back, plus shallow roots in Kotlin's replayer (it refuses them today, #209) and an Android target for the
-storage modules. Several thousand lines, and a second client implementation to keep in step.
-(c) Both: (a) for apps, plus a read-only Kotlin v2 pull (FETCH/PACK_PAGE + snapshot) to lift the v1 limit
-for JVM tooling.
+**Proceeding on the recommendation unless the owner objects:**
+- **D4** Host fixes to projections (§4.3) in PR 3: a cursor seek for reset and `DiffTrees` for delta. Go peersync
+  projection paths only, no wire change, coordinated with the peersync sessions first.
+- **D6** Single-home namespaces are filtered/write-back only on a replica; full mode is refused.
+- **D7** Ask B4 to add attachment refs to PROJECT_PAGE and to accept blob upload on a sync session; the replica's
+  attachment PR follows B4's PR 5.
+- **D9** The replica keeps no history (head plus unpushed commits).
 
-**D3. Filtered mode = projections (PROJECT_*).** *Recommended: yes.* A filtered replica cannot hold real source
-commits without receiving documents it may not read, so the filtered path is the existing projection messages
-rather than FETCH/PACK_PAGE. This reads "one pack format" as "no new client protocol", which projections satisfy,
-rather than "only FETCH/PACK_PAGE". The verifiable alternative (commit format v2, `kdb-distributed-plan.md` §3.13)
-stays gated.
-
-**D4. Host fixes to projections (§4.3).** *Recommended: yes, in PR 2.* A cursor seek for reset and `DiffTrees`
-for delta. These touch Go peersync, but only the projection paths, with no wire change.
-
-**D5. Live updates.** *Recommended: poll in PR 1, `REFS_WATCH 0x50/0x51` in a later PR.* Or poll only, and
-leave push to the app (for example a web-push "sync now").
-
-**D6. Single-home namespaces on the replica** are filtered/write-back only, and full mode is refused.
-*Recommended: yes.* The alternative is a full replica forwarding writes online-only, which gives up offline
-writes.
-
-**D7. Attachments gaps (§9).** *Recommended: ask B4 to add refs to PROJECT_PAGE in PR 5, and to allow blob
-upload on the sync connection* (ATTACHMENT_BEGIN/CHUNK/END accepted on a peersync session). The replica's
-attachment PR then follows B4's PR 5.
-
-**D8. Browser storage engine.** *Recommended: a paged IndexedDB `PersistentFs` first (PR 4), OPFS second.* Or
-OPFS-only (worker-only, simpler and faster, but Safari's OPFS sync handles are recent).
-
-**D9. Replica history default.** *Recommended: `NONE`* (head only, history fetched on demand). `FULL` keeps
-every version the replica has seen, which mostly matters for offline as-of reads.
+**Still open (asked 2026-10-13):** D10 local query surface, D11 browser zstd, D12 Kotlin store.
 
 ## 11. PR plan
 
-Each PR is tested against a real Go node: a `go/cmd/kdb-replicahost` helper (a file host with `--peer-http`,
-auth on, a seeded namespace, printing `ready ws://…/kdb/sync`), spawned by `node --test` in the style of
-`packages/kdb-client/test/interop.test.ts`. A Go-side test in `go/kdb/integration` checks the cloud's view
-(hashes equal, conflicts queued, documents absent where not readable).
+Each PR is tested against a real Go node. A `go/cmd/kdb-replicahost` helper runs a file host with the peer
+WebSocket and TCP listeners, auth on, and test hooks (seed N commits, write a document, read the head). It prints
+`ready ws://…/kdb/sync` and is spawned by the TS tests in the style of `packages/kdb-client/test/interop.test.ts`.
+The Kotlin tests drive the same helper. A Go-side test in `go/kdb/integration` checks the host's view: hashes
+equal, conflicts reported, unreadable documents never sent.
 
 | PR | Scope | Tests |
 |---|---|---|
-| 1 | `transport/jsws` (js-only), the `replica` option in `go/wasm/embed`, `openReplica` in `@kdb/embed` with `full` mode, poll loop, `status`/`change` events, token callback | Node replica bootstraps from the Go host and catches up; local writes push; reopen keeps state; bad token refused; two replicas converge through the host |
-| 2 | Snapshot bootstrap and `catchup=auto` defaults; `filtered` mode; projection host fixes (§4.3) | Long-offline full replica catches up by squash (asserts SQUASH_HEAD used and commits not replayed); filtered replica: filter, read rights, un-match deletes, id-range; reset cost O(page) (allocation test on the host) |
-| 3 | Write-back, conflict events, single-home rules | Offline writes queue → reconnect → applied; a conflict surfaces as a `ConflictReport` and resolves; NOT_HOME keeps the write pending; full-mode refused for single-home |
-| 4 | Paged `PersistentFs` (+ memory budget), worker host, OPFS backend | Resident bytes stay under budget while syncing a namespace larger than the budget; crash-recovery and reload tests from `persist.test.ts` pass on the paged fs; Chromium page test |
-| 5 | `kdbsync` options + Kotlin facade (per D2) | Go test: device in filtered and full mode against a cloud; Kotlin facade unit tests under `./gradlew build` |
-| 6 | Attachments (after B4 PR 5) | Lazy fetch, ranged resume after a dropped connection, upload then push, filtered replica receives only its documents' blobs |
-| 7 | `REFS_WATCH`/`REFS_CHANGED` (if D5) | Change visible on the replica without a poll tick |
+| 1 | `@kdb/replica` core: codec subset, sync SHA-256, trie, KV store (memory + IndexedDB), fixture generator for commit and trie vectors | Golden commit/trie/content-hash vectors from Go; store atomicity; trie reopen |
+| 2 | v2 client + full mode: hello/auth, snapshot bootstrap, FETCH/PACK_PAGE fast-forward, squash catch-up, `catchUp=auto`, local commits pushed by REF_UPDATE, poll loop, zstd on Node | Against `kdb-replicahost`: bootstrap; catch-up by replay and by squash (asserts which route ran); push + host merge + pull; reopen; bad token; two replicas converge; memory stays under budget on a namespace larger than it |
+| 3 | Filtered mode + write-back + conflicts + single-home, plus the projection host fixes (§4.3) | Filter and read rights; un-match deletes; id range; offline writes queue and apply on reconnect; conflict event and resolution; NOT_HOME keeps the write pending; host reset cost O(page) |
+| 4 | Browser: zstd decoder (D11), Chromium smoke page, `navigator.storage.persist` | Golden zstd vectors; browser page test |
+| 5 | Kotlin `kdb-replica` (JVM, Android target): v2 messages in `kdb-wire`, engine, file store | Interop test against `kdb-replicahost` under `./gradlew build` (skipped without Go, as the TS tests skip) |
+| 6 | Attachments (after B4 PR 5), TS then Kotlin | Lazy fetch, ranged resume, upload then push, a filtered replica gets only its documents' blobs |
+| 7 | `REFS_WATCH`/`REFS_CHANGED` | A change is visible on the replica without a poll tick |
