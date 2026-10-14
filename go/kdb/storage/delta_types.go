@@ -59,6 +59,12 @@ type DeltaPayloadReader interface {
 	ReadPayloadAt(segment DeltaSegmentRef, frameOffset int64, fn func(payload []byte) error) error
 }
 
+// DeltaHashStreamer streams a segment's commit hashes and frame offsets, past damaged frames,
+// without decoding the commits (each hash is the SHA-256 of the frame's payload).
+type DeltaHashStreamer interface {
+	StreamCommitHashesPastDamage(segment DeltaSegmentRef, fn func(hash codec.Hash, frameOffset int64) error) error
+}
+
 type DeltaCommitStreamer interface {
 	// StreamCommits hands each commit in segment to fn along with the byte
 	// offset of the frame it came from. The offset is what lets a caller

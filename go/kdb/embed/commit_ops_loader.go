@@ -32,8 +32,9 @@ func newCommitOpsLoader(reader storage.DeltaSegmentReader) *commitOpsLoader {
 	return &commitOpsLoader{
 		reader: reader,
 		index: deltaindex.New(reader, deltaindex.Options{
-			Kind: "commits",
-			Keys: func(c document.Commit, emit func(codec.Hash)) { emit(c.Hash) },
+			Kind:     "commits",
+			Keys:     func(c document.Commit, emit func(codec.Hash)) { emit(c.Hash) },
+			HashKeys: true,
 		}),
 	}
 }
