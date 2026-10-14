@@ -240,6 +240,35 @@ internal class InMemoryCommitDag(
         return next.root
     }
 
+    /** The attachment ops a two-parent commit needs beyond its own: see AttachmentMerge.kt. */
+    private fun mergeAttachmentOpsLocked(
+        ownOps: List<dev.kdb.document.KdbOp>,
+        parents: List<KdbHash>,
+        tree: DocumentTree,
+    ): List<dev.kdb.document.KdbOp> {
+        if (parents.size != 2) return emptyList()
+        val oursRoot = commits[parents[0]]?.attachmentTreeHash
+        val theirsRoot = commits[parents[1]]?.attachmentTreeHash
+        if (oursRoot == theirsRoot) return emptyList()
+        val ours = attachmentTableLocked(parents[0])
+        val theirs = attachmentTableLocked(parents[1])
+        val base = mergeBasesLocked(parents[0], parents[1]).firstOrNull()?.let { attachmentTableLocked(it) } ?: AttachmentTable.EMPTY
+        return mergeAttachmentOps(ownOps, base, ours, theirs, tree)
+    }
+
+    /** The nearest common ancestors of [a] and [b], sorted by hash bytes - Go's MergeBases. A common
+     * ancestor is redundant exactly when it is a parent of another common ancestor (every commit
+     * between two common ancestors is itself one). */
+    private fun mergeBasesLocked(
+        a: KdbHash,
+        b: KdbHash,
+    ): List<KdbHash> {
+        val common = ancestorClosureLocked(a) intersect ancestorClosureLocked(b)
+        val redundant = mutableSetOf<KdbHash>()
+        for (c in common) expandParentsLocked(c)?.forEach { if (it in common) redundant += it }
+        return (common - redundant).filter { commits.containsKey(it) || stubs.containsKey(it) }.sortedBy { it.toHex() }
+    }
+
     override suspend fun attachmentTableAt(commit: KdbHash): AttachmentTable = mutex.withLock { attachmentTableLocked(commit) }
 
     override suspend fun seedAttachmentTable(table: AttachmentTable) {
@@ -614,7 +643,9 @@ internal class InMemoryCommitDag(
         branchToAdvance: String,
     ): KdbCommit {
         for (p in parents) requireCommitPresentLocked(p)
-        val attachRoot = attachmentRootLocked(transaction.operations, parents)
+        // A merge carries the attachment operations that merge its parents' tables (AttachmentMerge.kt).
+        val operations = transaction.operations + mergeAttachmentOpsLocked(transaction.operations, parents, newDocumentTree)
+        val attachRoot = attachmentRootLocked(operations, parents)
         trees[newDocumentTree.treeHash] = newDocumentTree
         val commit =
             KdbCommit.build(
@@ -623,7 +654,7 @@ internal class InMemoryCommitDag(
                 transactionId = transaction.id,
                 timestamp = transaction.timestamp,
                 authorNodeId = transaction.authorNodeId,
-                operations = transaction.operations,
+                operations = operations,
                 documentTreeHash = newDocumentTree.treeHash,
                 schemaHash = schemaHash,
                 message = message,
