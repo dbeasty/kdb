@@ -64,6 +64,14 @@ type bodyRec struct {
 	prev, next uint32
 }
 
+// slotReferenced, in a record's off, marks an unpinned version read since the evictor last passed
+// it (second-chance / CLOCK eviction). Get sets it instead of moving the record to the front of
+// the recency ring: with live bodies bounded every live version is unpinned, so every read of a
+// hot document rewrote the ring under the shard lock, and heavy concurrent reads of overlapping
+// documents ran 29% slower than with the versions pinned. off never needs the bit - it is an
+// offset inside one chunk, below bodyArenaMaxChunk, and 0 for a large body's own chunk.
+const slotReferenced = 1 << 31
+
 // bodyRecBytes is what one slot costs in the slot array.
 const bodyRecBytes = int64(unsafe.Sizeof(bodyRec{}))
 
@@ -246,7 +254,15 @@ func (sh *docHashShard) evictLocked() {
 	}
 	evicted := false
 	for sh.bytes > sh.budget && sh.head != noSlot {
-		sh.removeSlot(sh.slots[sh.head].prev)
+		tail := sh.slots[sh.head].prev
+		if r := &sh.slots[tail]; r.off&slotReferenced != 0 {
+			// Read since the last pass: a second chance. Clearing the bit bounds the loop - every
+			// rotation clears one - and making the tail the head moves it to the front in O(1).
+			r.off &^= slotReferenced
+			sh.head = tail
+			continue
+		}
+		sh.removeSlot(tail)
 		evicted = true
 	}
 	if evicted {
@@ -278,10 +294,12 @@ func (s *shardedDocByHashStore) Get(h codec.Hash) (document.Document, bool) {
 		return document.Document{}, false
 	}
 	r := &sh.slots[i]
-	if r.pins == 0 {
-		sh.lruMoveToFront(i)
+	if r.pins == 0 && r.off&slotReferenced == 0 {
+		// Written only when not set already: a store on every read of a hot version bounces its
+		// cache line between cores, which is most of what the ring update cost.
+		r.off |= slotReferenced
 	}
-	doc := document.Document{ID: r.id, JSON: sh.bodyString(r.chunk, r.off, r.n)}
+	doc := document.Document{ID: r.id, JSON: sh.bodyString(r.chunk, r.off&^slotReferenced, r.n)}
 	sh.mu.Unlock()
 	return doc, true
 }
@@ -678,7 +696,8 @@ func (sh *docHashShard) compactLocked() {
 			r.chunk = uint32(c)
 			continue
 		}
-		b := oldChunks[r.chunk][r.off : r.off+r.n]
+		off := r.off &^ slotReferenced
+		b := oldChunks[r.chunk][off : off+r.n]
 		r.chunk, r.off = sh.appendBody(unsafe.String(&b[0], len(b)))
 	}
 	sh.compacted++
