@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/storage/mmapfile"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -277,6 +278,7 @@ func TestKotlinOpensFromGoCheckpoint(t *testing.T) {
 	})
 
 	t.Run("packed-large-tree-file", func(t *testing.T) {
+		skipWithoutMmap(t)
 		root, want := t.TempDir(), newCPDoc()
 		rt, s := openCP(t, root, cpOptions(func(o *embed.FileRuntimeOptions) { o.Storage.TreeFile = true }))
 		seedDocs(t, s, want, largeEntries, 1000)
@@ -335,6 +337,7 @@ func TestKotlinOpensFromGoCheckpoint(t *testing.T) {
 	})
 
 	t.Run("graph-file-with-segments", func(t *testing.T) {
+		skipWithoutMmap(t)
 		// history=full with graph segments on disk: the checkpoint references them for the commits
 		// it does not carry (fields 11/12), which this build does not read - so Kotlin replays the
 		// log, and every read is still right.
@@ -569,5 +572,15 @@ func copyTree(t *testing.T, from, to string) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// skipWithoutMmap skips a case that needs Go to write tree or graph segments: where files cannot be
+// mapped (Windows) Go keeps both in the heap and writes neither, which is correct, so there is
+// nothing for the case to check.
+func skipWithoutMmap(t *testing.T) {
+	t.Helper()
+	if !mmapfile.Supported {
+		t.Skip("needs mapped tree/graph segments, which this platform does not write")
 	}
 }
