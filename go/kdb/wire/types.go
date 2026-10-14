@@ -121,6 +121,16 @@ const (
 	MsgHomeRequestResult  MessageType = 0x3F
 	MsgSquashHead         MessageType = 0x40
 	MsgSquashHeadResult   MessageType = 0x41
+	// Attachments (attachment_ops.go). 0x4A-0x4F are reserved for more attachment messages,
+	// 0x50-0x57 for the client replica.
+	MsgBlobFetch              MessageType = 0x42
+	MsgBlobFetchResult        MessageType = 0x43
+	MsgAttachmentUpload       MessageType = 0x44
+	MsgAttachmentUploadResult MessageType = 0x45
+	MsgAttachmentGet          MessageType = 0x46
+	MsgAttachmentData         MessageType = 0x47
+	MsgAttachmentList         MessageType = 0x48
+	MsgAttachmentListResult   MessageType = 0x49
 
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
@@ -259,6 +269,22 @@ func (t MessageType) String() string {
 		return "SQUASH_HEAD"
 	case MsgSquashHeadResult:
 		return "SQUASH_HEAD_RESULT"
+	case MsgBlobFetch:
+		return "BLOB_FETCH"
+	case MsgBlobFetchResult:
+		return "BLOB_FETCH_RESULT"
+	case MsgAttachmentUpload:
+		return "ATTACHMENT_UPLOAD"
+	case MsgAttachmentUploadResult:
+		return "ATTACHMENT_UPLOAD_RESULT"
+	case MsgAttachmentGet:
+		return "ATTACHMENT_GET"
+	case MsgAttachmentData:
+		return "ATTACHMENT_DATA"
+	case MsgAttachmentList:
+		return "ATTACHMENT_LIST"
+	case MsgAttachmentListResult:
+		return "ATTACHMENT_LIST_RESULT"
 	default:
 		return "UNKNOWN"
 	}
@@ -396,6 +422,22 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgSquashHead, true
 	case 0x41:
 		return MsgSquashHeadResult, true
+	case 0x42:
+		return MsgBlobFetch, true
+	case 0x43:
+		return MsgBlobFetchResult, true
+	case 0x44:
+		return MsgAttachmentUpload, true
+	case 0x45:
+		return MsgAttachmentUploadResult, true
+	case 0x46:
+		return MsgAttachmentGet, true
+	case 0x47:
+		return MsgAttachmentData, true
+	case 0x48:
+		return MsgAttachmentList, true
+	case 0x49:
+		return MsgAttachmentListResult, true
 	default:
 		return 0, false
 	}
@@ -788,6 +830,7 @@ const (
 	CellKindDouble CellKind = 3 // strconv.FormatFloat(v, 'g', -1, 64)
 	CellKindBool   CellKind = 4 // "1" or "0" from a Go server, "true" or "false" from the Kotlin one
 	CellKindJSON   CellKind = 5 // a JSON document or value
+	CellKindBytes  CellKind = 6 // binary (an attachment): standard base64 of the bytes
 )
 
 func (m SqlResultMessage) Header() Header { return m.H }

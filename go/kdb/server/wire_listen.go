@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1490,6 +1491,8 @@ func cellKind(c sql.Cell) wire.CellKind {
 		return wire.CellKindBool
 	case sql.CellJSON:
 		return wire.CellKindJSON
+	case sql.CellBytes:
+		return wire.CellKindBytes
 	default:
 		return wire.CellKindString
 	}
@@ -1515,6 +1518,8 @@ func cellToString(c sql.Cell) string {
 		return "0"
 	case sql.CellJSON:
 		return v.JSON
+	case sql.CellBytes:
+		return base64.StdEncoding.EncodeToString(v.Value)
 	default:
 		return fmt.Sprintf("%v", c)
 	}
@@ -1545,6 +1550,12 @@ func decodeParametersJSON(raw *string) ([]sql.Parameter, error) {
 			} else {
 				params[i] = sql.ParamDouble{Value: t}
 			}
+		case map[string]any:
+			p, err := objectParam(t, i)
+			if err != nil {
+				return nil, err
+			}
+			params[i] = p
 		case []any:
 			// A JSON array of numbers is the vector parameter type (kdb-spec-layer16 §9.1),
 			// which SIMILARITY takes. An array holding anything else is a client mistake worth
@@ -1559,6 +1570,38 @@ func decodeParametersJSON(raw *string) ([]sql.Parameter, error) {
 		}
 	}
 	return params, nil
+}
+
+// objectParam decodes the object parameter forms (wire feature "attachments"):
+//
+//	{"$bytes": "<standard base64>"}                      bytes (sql.ParamBytes)
+//	{"$attachment": {"hash": "<hex>", "size": <n>}}      an uploaded blob (sql.ParamAttachmentRef)
+func objectParam(obj map[string]any, index int) (sql.Parameter, error) {
+	if raw, ok := obj["$bytes"]; ok && len(obj) == 1 {
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("parameter %d: $bytes must be a base64 string", index)
+		}
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %d: $bytes is not valid base64", index)
+		}
+		return sql.ParamBytes{Value: b}, nil
+	}
+	if raw, ok := obj["$attachment"]; ok && len(obj) == 1 {
+		ref, ok := raw.(map[string]any)
+		hashHex, okH := ref["hash"].(string)
+		size, okS := ref["size"].(float64)
+		if !ok || !okH || !okS || size < 0 {
+			return nil, fmt.Errorf("parameter %d: $attachment must be {\"hash\": hex, \"size\": n}", index)
+		}
+		h, err := codec.HashFromHex(hashHex)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %d: $attachment hash: %v", index, err)
+		}
+		return sql.ParamAttachmentRef{ContentHash: h, Size: int64(size)}, nil
+	}
+	return nil, fmt.Errorf("unsupported object parameter at index %d (want {\"$bytes\": ..} or {\"$attachment\": ..})", index)
 }
 
 // vectorParam converts a decoded JSON array into sql.ParamVector.

@@ -60,7 +60,7 @@ const (
 )
 
 // SupportedWireFeatures is every feature this build implements, in the order a client offers them.
-var SupportedWireFeatures = []string{WireFeatureBinary, WireFeatureBinary2, WireFeatureZstd}
+var SupportedWireFeatures = []string{WireFeatureBinary, WireFeatureBinary2, WireFeatureZstd, WireFeatureAttachments}
 
 // NegotiateWireFeatures returns the features in offered that this build supports, in this build's
 // order. A server acks with it; a client passes the ack's list to DefaultCodec.WithWireFeatures.
