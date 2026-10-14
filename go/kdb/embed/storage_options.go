@@ -138,6 +138,19 @@ type StorageOptions struct {
 	// full. Off by default.
 	DisableCheckpoints bool
 
+	// CloseCompactionBytes bounds the SSTable merge closing the namespace may do: close merges
+	// the tables only when they hold at most this many bytes, and otherwise leaves them to the
+	// next maintenance pass or to the background merge the next open starts. Zero uses
+	// DefaultCloseCompactionBytes; negative means close never merges. Close used to merge every
+	// table whatever their size, which made it take time proportional to the namespace (14 s
+	// for 3M documents).
+	CloseCompactionBytes int64
+	// DisableBackgroundCompaction stops a writable open from merging the namespace's SSTables in
+	// the background when it finds enough of them (sstable.DefaultCompactionTrigger). That merge
+	// is what keeps the table count bounded for a runtime that never runs maintenance; closing
+	// the namespace cancels it rather than waiting for it. Off by default.
+	DisableBackgroundCompaction bool
+
 	// Graph selects how much of the on-disk commit graph work is active
 	// for this namespace - see docs/kdb-commit-graph-on-disk.md, and
 	// dag.GraphSettings for what each field turns on.
