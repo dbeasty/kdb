@@ -2,6 +2,7 @@ package sstable
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -106,6 +107,34 @@ func mergeMaxRuns(trigger int) int { return 3 * trigger }
 //	full merges      17x      167x    1,667x
 //	tiered          2.8x      4.1x      6.2x   (at most 12 runs)
 func pickMerge(runs []mergeRun, sized bool, trigger int) (lo, hi int, full bool) {
+	lo, hi, _ = pickWindow(runs, sized, trigger)
+	hi = pastAgeless(runs, hi)
+	return lo, hi, hi > 0 && lo == 0 && hi == len(runs)
+}
+
+// pastAgeless widens a window ending at hi over every older ageless run at its oldest run's level,
+// when that oldest run is ageless itself. The window's output takes its oldest input's age and
+// level (newRunWriter), here zero; beside another ageless run at that level the two would tie, and
+// a tie sorts by name - at random - when the store reopens. Swallowing them leaves the output the
+// only ageless run at its level. Ageless runs are a level's oldest (DiscoverTables registers them
+// first and every table this build writes has an age), so they are all at the window's old end.
+func pastAgeless(runs []mergeRun, hi int) int {
+	if hi == 0 || hi == len(runs) || !runs[hi-1].ageless() {
+		return hi
+	}
+	level := runs[hi-1].tables[0].Level
+	for hi < len(runs) && runs[hi].ageless() && runs[hi].tables[0].Level == level {
+		hi++
+	}
+	return hi
+}
+
+// ageless reports a run named without an age: Kotlin's tables, and this package's before ages.
+func (r mergeRun) ageless() bool {
+	return len(r.tables) > 0 && ageOf(r.tables[0].SegmentName) == noAge
+}
+
+func pickWindow(runs []mergeRun, sized bool, trigger int) (lo, hi int, full bool) {
 	m := len(runs)
 	if m < trigger {
 		return 0, 0, false
@@ -156,7 +185,7 @@ func pickMerge(runs []mergeRun, sized bool, trigger int) (lo, hi int, full bool)
 // A table's file name starts with its age: 16 hex digits of nanoseconds, then a random UUID (and,
 // for a merge's table, its sequence in the run). Names sort by age, and that is what DiscoverTables
 // relies on to register a level's tables in the order they were written - the order a lookup
-// searches them in - because it registers them in listing order.
+// searches them in - because it registers them in that order (byAge).
 //
 // A flushed table's age is when it was written. A merge's tables take their oldest input's age,
 // so they sort where that input did: the place in the search order the merge gave them (see
@@ -166,6 +195,8 @@ func pickMerge(runs []mergeRun, sized bool, trigger int) (lo, hi int, full bool)
 //
 // Tables named before this (a bare UUID) have no age; they count as the oldest, which is what
 // they are, being older than anything this build writes. Kotlin names its tables that way too.
+// Their order among themselves is their names', the same on every open; a merge that takes one
+// takes every older one beside it (pastAgeless), so its output never ties with one.
 //
 // Ages are never equal. Two tables of one age sort by their UUIDs, which is to say at random, and
 // a wall clock alone does not keep ages apart: Windows' ticks are coarse enough that consecutive
@@ -211,7 +242,22 @@ func ageOf(segmentName string) string {
 	if len(base) > 17 && base[16] == '-' && isLowerHex(base[:16]) {
 		return base[:16]
 	}
-	return strings.Repeat("0", 16)
+	return noAge
+}
+
+// noAge is ageOf a name without an age.
+const noAge = "0000000000000000"
+
+// byAge sorts table names oldest first: by age, and ageless names by name. A listing's order is
+// not it - a bare UUID can sort anywhere among names that start with an age.
+func byAge(names []string) {
+	sort.SliceStable(names, func(i, j int) bool {
+		ai, aj := ageOf(names[i]), ageOf(names[j])
+		if ai != aj {
+			return ai < aj
+		}
+		return names[i] < names[j]
+	})
 }
 
 func isLowerHex(s string) bool {
