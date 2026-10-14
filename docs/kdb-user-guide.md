@@ -517,7 +517,10 @@ Example:
 ./gradlew :kdb-cli:runCli --args="--data-dir ~/.kdb file get myapp/files --id 00000000-0000-0000-0000-0000000000f1 -o ./report-copy.pdf"
 ```
 
-**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. The Go `kdb` binary uses the same on-disk layout and KDBP-framed delta segments as Kotlin file mode; **either CLI can read data written by the other** on the same `--data-dir` (same SHA-256 and commit payload rules).
+**Persistence:** Namespace data lives under `{dataDir}/ns/{namespaceId}/` (delta log, WAL, SSTables). Each CLI invocation replays the delta log on open; commits from a prior `put` are visible to a later `get` or `query` with the same `--data-dir`. The Go `kdb` binary uses the same on-disk layout and KDBP-framed delta segments as Kotlin file mode; **either CLI can read data written by the other** on the same `--data-dir` (same SHA-256 and commit payload rules). The exception is a namespace Go started from a peer's
+snapshot or caught up by squash: part of its state is held only in Go's checkpoint, which Kotlin
+doesn't read. Kotlin refuses to open such a namespace (its `meta.json` lists `shallowRoots`) until
+Go has deepened it.
 
 **Workspace lock:** File mode takes an exclusive lock on `{dataDir}/.kdb.lock` while a process has the database open (CLI, JDBC `jdbc:kdb:file://…`, or your app via `openFileRuntime`). On macOS/Linux the Go CLI uses `flock(2)` on that file. A second process opening the same `--data-dir` fails with a clear error naming the holder PID when known. Only one live writer per workspace.
 
@@ -1990,6 +1993,10 @@ How the policy behaves:
 - `GET …/catchup` shows the policy; `{"refuseSquash": false}` allows squashes again.
 - It does not undo a squash that already happened. To fill the gap, deepen that replica
   (`POST …/deepen`).
+
+The Kotlin CLI refuses to open a namespace that has caught up by squash. The jumped-to state is
+held only in Go's checkpoint, which Kotlin doesn't read, so a replay of the log alone would serve
+the older values. Once deepened, the namespace opens in Kotlin again.
 
 **Retention.** Under `history=none`, retention won't delete commits that an active peer hasn't
 been seen to receive. That covers peers this node pushes to and peers that fetch from it.
