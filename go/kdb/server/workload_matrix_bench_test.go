@@ -71,11 +71,22 @@ func newWorkloadServer(b *testing.B, ns string) (*KdbServerRuntime, func()) {
 //
 // The closer is idempotent, so callers defer it and the registered cleanup stays as a backstop
 // for the paths that return early.
+//
+// Storage starts from what a deployed node gets - embed.FileRuntimeOptionsFromEnv, so the graph
+// file is on as it is by default, and KDB_TREE_FILE=1 / KDB_BOUNDED_LIVE_BODIES=1 run the matrix
+// with those - and takes the durability settings opts names. It used to start from a bare
+// StorageOptions{}, which left the graph file off: the matrix measured a configuration no
+// deployment ran. KDB_GRAPH_FILE=0 reproduces those numbers for comparison with older runs.
 func newWorkloadServerWithOptions(b *testing.B, ns string, opts embed.StorageOptions) (*KdbServerRuntime, func()) {
 	b.Helper()
+	storageOpts := embed.FileRuntimeOptionsFromEnv().Storage
+	if opts.Durability != 0 || opts.SyncMode != 0 || opts.AsyncSyncIntervalMillis != 0 {
+		storageOpts.Durability, storageOpts.SyncMode, storageOpts.AsyncSyncIntervalMillis =
+			opts.Durability, opts.SyncMode, opts.AsyncSyncIntervalMillis
+	}
 	rt, err := embed.OpenFileRuntimeWithOptions(
 		b.TempDir(), "bench", ns, schema.None(),
-		embed.FileRuntimeOptions{Storage: opts},
+		embed.FileRuntimeOptions{Storage: storageOpts},
 	)
 	if err != nil {
 		b.Fatalf("OpenFileRuntimeWithOptions: %v", err)
