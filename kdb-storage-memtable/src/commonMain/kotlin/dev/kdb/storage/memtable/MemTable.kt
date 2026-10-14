@@ -2,7 +2,6 @@ package dev.kdb.storage.memtable
 
 import dev.kdb.codec.KdbHash
 import dev.kdb.storage.PlatformIoShim
-import dev.kdb.storage.sstable.DefaultSsTableWriter
 import dev.kdb.storage.sstable.LsmBlobStore
 import dev.kdb.storage.sstable.SsTableHandle
 import kotlinx.coroutines.sync.Mutex
@@ -124,7 +123,7 @@ public class MemTableManager(
             val snap = active
             pendingFlush = snap
             active = SortedMemTable()
-            val writer = DefaultSsTableWriter(ioShim, namespaceId, level)
+            val writer = blobStore.newWriter(level)
             var count = 0
             for ((k, v) in snap.snapshotEntries()) {
                 // Tombstones are written, not skipped. Skipping them is what made a delete of an

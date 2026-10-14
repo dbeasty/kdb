@@ -87,9 +87,27 @@ type LsmBlobStore struct {
 	// sidecar bookkeeping (sidecar_store.go), guarded by mu.
 	sidecarState
 
+	// seq names the tables this store's writers finish (NewWriter).
+	seq *Sequence
+
 	// afterSearchOrder, when set, runs between a lookup taking its table list and reading any
 	// table - the window a concurrent compaction used to delete an input in. Tests only.
 	afterSearchOrder func()
+}
+
+// NewWriter returns a writer for a table this store will hold: named with the store's sequence, so
+// it sorts after every table the store holds (see tiering.go).
+func (s *LsmBlobStore) NewWriter(level int) *DefaultWriter {
+	w := NewDefaultWriter(s.io, s.namespaceID, level)
+	w.seq = s.seq
+	return w
+}
+
+// NewWriterUnique is NewWriter as NewDefaultWriterUnique.
+func (s *LsmBlobStore) NewWriterUnique(level, n int) *DefaultWriter {
+	w := NewDefaultWriterUnique(s.io, s.namespaceID, level, n)
+	w.seq = s.seq
+	return w
 }
 
 // NewLsmBlobStore returns an LSM blob store.
@@ -101,6 +119,7 @@ func NewLsmBlobStore(io storage.PlatformIOShim, namespaceID string, cache *Block
 		indexes:     newTableIndexCache(DefaultIndexCacheBytes),
 		readers:     make(map[string]int),
 		doomed:      make(map[string]struct{}),
+		seq:         NewSequence(io, namespaceID),
 	}
 	if r := sidecarResolver(io); r != nil {
 		s.sidecarPaths = r
@@ -623,6 +642,7 @@ func (s *LsmBlobStore) RunCount() int {
 
 // AddTable registers a flushed table.
 func (s *LsmBlobStore) AddTable(handle Handle) {
+	s.seq.Observe(handle.SegmentName)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Copy rather than append in place so a Get holding the old slice header keeps reading a
@@ -665,8 +685,8 @@ func (s *LsmBlobStore) DiscoverTables() error {
 				level = n
 			}
 		}
-		noteAge(name)
 		s.AddTable(Handle{Level: level, SegmentName: name})
 	}
+	s.seq.listedAll()
 	return nil
 }

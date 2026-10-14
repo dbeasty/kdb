@@ -433,7 +433,7 @@ func (mgr *Manager) Flush(level int) (sstable.Handle, error) {
 
 	entries := snap.snapshotEntries()
 	// The generation's own index made its keys unique.
-	writer := sstable.NewDefaultWriterUnique(mgr.io, mgr.namespaceID, level, len(entries))
+	writer := mgr.blobStore.NewWriterUnique(level, len(entries))
 	count := 0
 	for _, e := range entries {
 		// Tombstones are written, not skipped. Skipping them is what made a delete of an

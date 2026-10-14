@@ -273,38 +273,66 @@ func TestRunsReopenInTheOrderTheyWereWritten(t *testing.T) {
 	}
 }
 
-// Ages never tie, however coarse the clock: Windows' reads the same time for consecutive flushes,
-// and two tables of one age sort by their random UUIDs.
-func TestAgesAreStrictlyIncreasing(t *testing.T) {
-	prev := nextAge()
-	for i := 0; i < 10000; i++ {
-		age := nextAge()
-		if age <= prev {
-			t.Fatalf("age %s after %s", age, prev)
+// A store's tables are numbered 1, 2, 3...: a sequence, not a clock, so no clock's resolution
+// (Windows' reads the same time for consecutive flushes) can make two tie.
+func TestTablesAreNumberedInSequence(t *testing.T) {
+	shim := testShim(t)
+	store := NewLsmBlobStore(shim, "app/docs", NewBlockCache(1<<20))
+	for i := 1; i <= 3; i++ {
+		w := store.NewWriter(0)
+		w.Put(keyFor([]byte(fmt.Sprint(i))), []byte("v"))
+		h, err := w.Finish()
+		if err != nil {
+			t.Fatal(err)
 		}
-		prev = age
+		if want := fmt.Sprintf("%016x", i); ageOf(h.SegmentName) != want {
+			t.Fatalf("table %d is %s, want age %s", i, h.SegmentName, want)
+		}
+		store.AddTable(h)
 	}
 }
 
-// A table found on disk with an age ahead of the clock - written before the clock stepped back -
-// still sorts before every table written after it.
-func TestAgesFollowTheNewestTableFound(t *testing.T) {
-	ahead := time.Now().Add(time.Hour).UnixNano()
-	noteAge(fmt.Sprintf("ns/app/docs/sstable/L0/%016x-00000000-0000-0000-0000-000000000000", ahead))
-	age, err := strconv.ParseUint(nextAge(), 16, 64)
-	if err != nil || int64(age) <= ahead {
-		t.Fatalf("age %d, %v after a table aged %d", age, err, ahead)
+// A sequence carries on above the highest age on disk - a clock-era name's included - whether the
+// store listed the namespace (DiscoverTables) or not, and for a writer made without a store.
+func TestSequenceContinuesAboveTablesOnDisk(t *testing.T) {
+	shim := testShim(t)
+	ns := "app/docs"
+	const clockEra = 0x18de7c433619e988
+	tableNamed(t, shim, ns, fmt.Sprintf("%016x-00000000-0000-4000-8000-000000000000", clockEra), map[string]string{"a": "v"}, nil)
+	agelessTable(t, shim, ns, "ffffffff-0000-4000-8000-000000000000", map[string]string{"b": "v"}, nil)
+	ageOfNext := func(w *DefaultWriter) uint64 {
+		t.Helper()
+		w.Put(keyFor([]byte("c")), []byte("v"))
+		h, err := w.Finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := shim.DeleteSegment(h.SegmentName); err != nil {
+			t.Fatal(err)
+		}
+		age, err := strconv.ParseUint(ageOf(h.SegmentName), 16, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return age
 	}
-	// Kotlin's names, and this package's before ages, carry none; they leave ages alone.
-	before := lastAge.Load()
-	noteAge("ns/app/docs/sstable/L0/00000000-0000-0000-0000-000000000000")
-	if lastAge.Load() != before {
-		t.Fatal("an ageless name moved the ages")
+	discovered := NewLsmBlobStore(shim, ns, NewBlockCache(1<<20))
+	if err := discovered.DiscoverTables(); err != nil {
+		t.Fatal(err)
+	}
+	if got := ageOfNext(discovered.NewWriter(0)); got != clockEra+1 {
+		t.Errorf("after DiscoverTables: age %x, want %x", got, clockEra+1)
+	}
+	if got := ageOfNext(NewLsmBlobStore(shim, ns, NewBlockCache(1<<20)).NewWriter(0)); got != clockEra+1 {
+		t.Errorf("without DiscoverTables: age %x, want %x", got, clockEra+1)
+	}
+	if got := ageOfNext(NewDefaultWriter(shim, ns, 0)); got != clockEra+1 {
+		t.Errorf("without a store: age %x, want %x", got, clockEra+1)
 	}
 }
 
-// agelessTable is writeTable under a name without an age, as Kotlin names its tables.
-func agelessTable(t *testing.T, shim *storio.InMemoryPlatformIO, ns string, fileID string, puts map[string]string, deletes []string) Handle {
+// tableNamed is writeTable under the given file name.
+func tableNamed(t *testing.T, shim *storio.InMemoryPlatformIO, ns string, fileID string, puts map[string]string, deletes []string) Handle {
 	t.Helper()
 	h := writeTable(t, shim, ns, 0, puts, deletes)
 	name := storio.SegmentNameBuilder.SSTable(ns, 0, fileID)
@@ -325,10 +353,17 @@ func agelessTable(t *testing.T, shim *storio.InMemoryPlatformIO, ns string, file
 	if err := shim.DeleteSegment(h.SegmentName); err != nil {
 		t.Fatal(err)
 	}
-	if ageOf(name) != noAge {
-		t.Fatalf("%s has an age", name)
-	}
 	return Handle{Level: 0, SegmentName: name}
+}
+
+// agelessTable is writeTable under a name without an age, as Kotlin names its tables.
+func agelessTable(t *testing.T, shim *storio.InMemoryPlatformIO, ns string, fileID string, puts map[string]string, deletes []string) Handle {
+	t.Helper()
+	h := tableNamed(t, shim, ns, fileID, puts, deletes)
+	if ageOf(h.SegmentName) != noAge {
+		t.Fatalf("%s has an age", h.SegmentName)
+	}
+	return h
 }
 
 // Tables named without an age are older than every table with one, wherever a listing puts them:
