@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -221,7 +220,7 @@ func startKdbService(t *testing.T, repo, dir, ns string) *kdbService {
 		"--args=--data-dir "+dir+" --namespace "+ns+" --peer-sync --listen-ws "+listen+" --listen-sql-ws "+sql)
 	cmd.Dir = repo
 	cmd.Env = append(os.Environ(), "TERM=dumb")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	inOwnProcessGroup(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -282,13 +281,13 @@ func (s *kdbService) stop() {
 	if s.cmd.Process == nil {
 		return
 	}
-	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
+	signalGroup(s.cmd, false)
 	done := make(chan struct{})
 	go func() { _ = s.cmd.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(20 * time.Second):
-		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+		signalGroup(s.cmd, true)
 		<-done
 	}
 }
