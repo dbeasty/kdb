@@ -34,6 +34,71 @@ func (c *Client) QueryRaw(ctx context.Context, ns string, sqlText string, args [
 	return result.Columns, result.Rows, nil
 }
 
+// QueryValues runs one SQL SELECT and returns each cell as a typed Go value: nil for NULL, int64,
+// float64, bool, string, or json.RawMessage for a JSON document or value. Unlike QueryRaw it
+// tells a NULL from an empty string and a number from text that looks like one.
+//
+// The types come from the server (wire.SqlResultMessage.CellKinds). A server that predates them
+// sends none, and then every cell is returned as a string - NULL included, as "".
+func (c *Client) QueryValues(ctx context.Context, ns string, sqlText string, args []any) (columns []string, rows [][]any, err error) {
+	result, err := c.execSql(ctx, ns, sqlText, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err = typedRows(result.Rows, result.cellKinds)
+	return result.Columns, rows, err
+}
+
+// typedRows converts text cells to the values their kinds name. kinds is row by row, one per
+// cell; nil means the server sent none and every cell stays a string.
+func typedRows(rows [][]string, kinds []wire.CellKind) ([][]any, error) {
+	n := 0
+	for _, row := range rows {
+		n += len(row)
+	}
+	if kinds != nil && len(kinds) != n {
+		return nil, fmt.Errorf("kdb: result has %d cells but %d cell kinds", n, len(kinds))
+	}
+	values := make([]any, n)
+	out := make([][]any, len(rows))
+	k := 0
+	for i, row := range rows {
+		start := k
+		for _, cell := range row {
+			kind := wire.CellKindString
+			if kinds != nil {
+				kind = kinds[k]
+			}
+			v, err := typedCell(cell, kind)
+			if err != nil {
+				return nil, err
+			}
+			values[k] = v
+			k++
+		}
+		out[i] = values[start:k:k]
+	}
+	return out, nil
+}
+
+func typedCell(cell string, kind wire.CellKind) (any, error) {
+	switch kind {
+	case wire.CellKindNull:
+		return nil, nil
+	case wire.CellKindLong:
+		return strconv.ParseInt(cell, 10, 64)
+	case wire.CellKindDouble:
+		return strconv.ParseFloat(cell, 64)
+	case wire.CellKindBool:
+		return cell == "1" || cell == "true", nil // Go servers write 1/0, the Kotlin one true/false
+	case wire.CellKindJSON:
+		return json.RawMessage(cell), nil
+	default:
+		// A kind this build does not know yet is still text.
+		return cell, nil
+	}
+}
+
 // Exec runs one non-SELECT SQL statement (schema/DDL). Most of Zolik's write paths should
 // prefer PutJSON/Upsert/Commit; Exec exists for DDL and the occasional write better expressed as
 // SQL. An INSERT is auto-committed immediately (this call is one client-visible unit of work,
@@ -113,6 +178,7 @@ type sqlExecResult struct {
 	continuation string
 	Columns      []string
 	Rows         [][]string
+	cellKinds    []wire.CellKind
 	needsCommit  bool
 	rowsAffected int
 	resolvedHex  string
@@ -161,7 +227,7 @@ func (c *Client) execSqlPaged(ctx context.Context, ns, sessionID string, sqlText
 	if result.Error != nil {
 		return sqlExecResult{}, classifiedError(*result.Error, result.ErrorCode, result.RetryAfterMs)
 	}
-	return sqlExecResult{Columns: result.Columns, Rows: result.Rows, needsCommit: !result.ReadOnly,
+	return sqlExecResult{Columns: result.Columns, Rows: result.Rows, cellKinds: result.CellKinds, needsCommit: !result.ReadOnly,
 		rowsAffected: result.RowsAffected, resolvedHex: result.ResolvedCommitHex,
 		continuation: result.ContinuationToken}, nil
 }

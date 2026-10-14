@@ -38,6 +38,10 @@ type SubscriberConfig struct {
 	// document. A document that stops matching (or that the subscriber may no longer read)
 	// arrives as a delete. A resume must use the same filter as the position it resumes from.
 	Filter string
+	// JSONOnly keeps the subscription on the JSON envelope. By default the handshake offers the
+	// binary wire features, and a hub that acks them sends DeltaCommit frames as binary bodies;
+	// an older hub, or the Kotlin one, acks none and sends JSON as before.
+	JSONOnly bool
 }
 
 // PublishedCommit is a commit broadcast to subscribers.

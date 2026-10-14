@@ -42,6 +42,8 @@ function load<T>(file: string): T {
 export const frameFixtures = load<FrameFixture[]>("frames.json");
 /** The same shape: frameHex is a binary (tag 2) frame, envelopeJson that message as JSON. */
 export const binaryFrameFixtures = load<FrameFixture[]>("binary-frames.json");
+/** binary-frames-2 messages, typed cells and a zstd (tag 3) frame. */
+export const binaryFrame2Fixtures = load<FrameFixture[]>("binary-frames-2.json");
 export const hashFixtures = load<HashFixture[]>("hashes.json");
 export const transactionFixtures = load<TransactionFixture[]>("transactions.json");
 

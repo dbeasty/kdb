@@ -140,6 +140,20 @@ func (t *Tx) QueryRaw(ctx context.Context, sqlText string, args ...any) ([]strin
 	return r.Columns, r.Rows, nil
 }
 
+// QueryValues runs a SELECT inside the transaction and returns typed cells (see
+// Client.QueryValues).
+func (t *Tx) QueryValues(ctx context.Context, sqlText string, args ...any) ([]string, [][]any, error) {
+	if err := t.checkOpen(); err != nil {
+		return nil, nil, err
+	}
+	r, err := t.c.execSqlOnSession(ctx, t.ns, t.sessionID, sqlText, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := typedRows(r.Rows, r.cellKinds)
+	return r.Columns, rows, err
+}
+
 // Commit applies every buffered write, in every namespace the transaction touched, or none. It
 // returns the new commit in the transaction's own namespace (its current head, if the
 // transaction wrote only elsewhere).

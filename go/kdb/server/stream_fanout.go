@@ -149,22 +149,22 @@ func opsBytes(ops []document.Op) int {
 	return n
 }
 
-// view returns e's operations through filter (keyed by its text), with their frames, computing
-// them on first use. h supplies the codec and namespace.
-func (h *StreamHub) view(e *fanoutEntry, filterKey string, filter sql.Expr) *fanoutView {
+// view returns e's operations through filter, with their frames in c's encoding, computing them
+// on first use. key names the filter and the encoding together; h supplies the namespace.
+func (h *StreamHub) view(e *fanoutEntry, key string, filter sql.Expr, c wire.Codec) *fanoutView {
 	e.mu.Lock()
 	if e.views == nil {
 		e.views = map[string]*fanoutView{}
 	}
-	v, ok := e.views[filterKey]
+	v, ok := e.views[key]
 	if !ok {
 		v = &fanoutView{}
-		e.views[filterKey] = v
+		e.views[key] = v
 	}
 	e.mu.Unlock()
 	v.once.Do(func() {
 		v.ops = filterView(filter, e.commit.Operations)
-		v.frames, v.err = h.encodeDelta(e.commit.Hash, e.commit.ParentHashes[0], e.commit.Timestamp.EpochMicros(), v.ops)
+		v.frames, v.err = h.encodeDelta(c, e.commit.Hash, e.commit.ParentHashes[0], e.commit.Timestamp.EpochMicros(), v.ops)
 		if v.err == nil {
 			n := 0
 			for _, f := range v.frames {
@@ -203,7 +203,7 @@ func filterView(filter sql.Expr, ops []document.Op) []document.Op {
 
 // encodeDelta encodes the operations taking a subscriber from parent to commit as deltaCommit
 // frames, split by bytes (see sendDelta), each under correlation id 0.
-func (h *StreamHub) encodeDelta(commit, parent codec.Hash, ts int64, ops []document.Op) ([][]byte, error) {
+func (h *StreamHub) encodeDelta(c wire.Codec, commit, parent codec.Hash, ts int64, ops []document.Op) ([][]byte, error) {
 	parts := splitOpsByBytes(ops, maxDeltaFrameOpBytes)
 	frames := make([][]byte, len(parts))
 	for i, part := range parts {
@@ -211,7 +211,7 @@ func (h *StreamHub) encodeDelta(commit, parent codec.Hash, ts int64, ops []docum
 		if i < len(parts)-1 {
 			named = parent
 		}
-		frame, err := h.wire.Encode(wire.DeltaCommitMessage{
+		frame, err := c.Encode(wire.DeltaCommitMessage{
 			H: wire.Header{MessageType: wire.MsgDeltaCommit, ProtocolVersion: wire.KdbWireProtocolVersion},
 			Payload: wire.DeltaCommitPayload{
 				Namespace: h.namespaceID, CommitHash: named, ParentHash: parent,
@@ -230,13 +230,13 @@ func (h *StreamHub) encodeDelta(commit, parent codec.Hash, ts int64, ops []docum
 // The filtered view and its frames are shared with every subscriber with the same filter; the
 // read check is sub's own. If it denies anything, sub's frames are encoded for it alone.
 func (h *StreamHub) sendCommit(sub *registeredSubscriber, e *fanoutEntry) error {
-	v := h.view(e, sub.filterKey, sub.filter)
+	v := h.view(e, sub.viewKey, sub.filter, sub.codec)
 	if v.err != nil {
 		return v.err
 	}
 	if sub.checkReads {
 		if own, denied := h.readChecked(sub, v.ops); denied {
-			frames, err := h.encodeDelta(e.commit.Hash, e.commit.ParentHashes[0], e.commit.Timestamp.EpochMicros(), own)
+			frames, err := h.encodeDelta(sub.codec, e.commit.Hash, e.commit.ParentHashes[0], e.commit.Timestamp.EpochMicros(), own)
 			if err != nil {
 				return err
 			}

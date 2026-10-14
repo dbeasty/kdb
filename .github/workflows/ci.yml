@@ -137,7 +137,9 @@ jobs:
         # No -race: it needs cgo, and the race-enabled run on Linux already covers data races.
         # What this job is for is Windows file semantics - sharing modes, LockFileEx, rename and
         # delete of open files - which only a real Windows filesystem exercises.
-        run: go test ./...
+        # kdb/embed runs about Go's default 10m per-package timeout on hosted Windows runners
+        # (timed out mid-TestOpenCostPerCommitDoesNotGrow); same 25m as the Linux race job.
+        run: go test -timeout 25m ./...
 
   ts-client:
     runs-on: ubuntu-latest

@@ -230,6 +230,7 @@ internal fun WireMessage.toEnvelope(): WirePayloadEnvelope =
                         generatedIds = generatedIds,
                         errorCode = errorCode,
                         retryAfterMs = retryAfterMs,
+                        cellKinds = cellKinds,
                     ),
             )
 
@@ -518,6 +519,7 @@ internal fun WirePayloadEnvelope.toMessage(header: WireHeader): WireMessage =
                 s.generatedIds,
                 s.errorCode,
                 s.retryAfterMs,
+                s.cellKinds,
             )
         }
 

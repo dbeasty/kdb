@@ -81,6 +81,11 @@ type registeredSubscriber struct {
 	// checkReads is whether each document is checked against principal before it is sent. Off
 	// for an anonymous hub, which is documented to show everything to everyone.
 	checkReads bool
+	// codec encodes this subscriber's frames: the hub's own, or that with the wire features its
+	// handshake agreed (binary DeltaCommit bodies). viewKey is filterKey plus the encoding, so
+	// subscribers share fan-out frames only with subscribers that read the same encoding.
+	codec   wire.Codec
+	viewKey string
 
 	// position is the commit this subscriber holds, as far as the hub knows: its resume point,
 	// then the last frame sent. Owned by sendLoop.
@@ -270,7 +275,7 @@ const maxDeltaFrameOpBytes = 4 << 20
 // This is the tree-delta path, which is per subscriber: its operations depend on the
 // subscriber's position. Per-commit catch-up goes through sendCommit, which shares the work.
 func (h *StreamHub) sendDelta(sub *registeredSubscriber, commit, parent codec.Hash, ts int64, ops []document.Op) error {
-	frames, err := h.encodeDelta(commit, parent, ts, h.visible(sub, ops))
+	frames, err := h.encodeDelta(sub.codec, commit, parent, ts, h.visible(sub, ops))
 	if err != nil {
 		return err
 	}
@@ -486,7 +491,16 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 		}
 		position = p
 	}
+	subCodec, viewKey, features := h.wire, filterKey, wire.NegotiateWireFeatures(msg.Request.WireFeatures)
+	if dc, ok := h.wire.(*wire.DefaultCodec); ok && slices.Contains(features, wire.WireFeatureBinary2) {
+		subCodec = dc.WithWireFeatures(features)
+		viewKey = filterKey + "\x00" + strings.Join(features, ",")
+	} else {
+		features = nil
+	}
 	sub := &registeredSubscriber{
+		codec:      subCodec,
+		viewKey:    viewKey,
 		nodeID:     msg.Request.NodeID,
 		conn:       conn,
 		lastAck:    &position,
@@ -510,6 +524,7 @@ func (h *StreamHub) handleHandshake(conn stream.ConnectionHandle, msg wire.Hands
 			NegotiatedEncoding: wire.EncodingJSON,
 			ProtocolVersion:    wire.KdbWireProtocolVersion,
 			RemoteHeads:        map[string]string{h.namespaceID: head.Hex()},
+			WireFeatures:       features,
 		},
 	}
 	frame, err := h.wire.Encode(ack)

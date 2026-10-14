@@ -793,7 +793,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID, err)
 		}
 	}
-	rows := rowsToStrings(result.Rows)
+	rows, kinds := rowsToStrings(result.Rows)
 	// Bound the reply by bytes as well as rows (B1). MaxResultRows alone let 10k rows of 2 KB
 	// through to the encoder, which refused the 20 MB frame - and the client heard nothing. A
 	// paged request ends its page early instead, and the continuation picks up from the first
@@ -811,7 +811,11 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 			return sqlResultErrorClassified(msg.H.CorrelationID, msg.Namespace, msg.SessionID,
 				&ReplyTooLargeError{Bytes: total, Limit: rt.MaxResultBytes(), What: "result", Remedy: remedy})
 		}
-		rows = rows[:fit]
+		cells := 0
+		for _, row := range rows[:fit] {
+			cells += len(row)
+		}
+		rows, kinds = rows[:fit], kinds[:cells]
 		result.More = true
 	}
 	if grant != nil {
@@ -830,6 +834,7 @@ func (h *sqlWireConnHandler) execRead(msg wire.SqlExecMessage, sess *KdbSession,
 		SessionID:         msg.SessionID,
 		Columns:           columnNames(result.Columns),
 		Rows:              rows,
+		CellKinds:         kinds,
 		RowsAffected:      result.RowsAffected,
 		ResolvedCommitHex: head.Hex(),
 		ReadOnly:          true,
@@ -1449,16 +1454,43 @@ func columnNames(cols []sql.ResultColumn) []string {
 	return names
 }
 
-func rowsToStrings(rows []sql.QueryRow) [][]string {
-	out := make([][]string, len(rows))
-	for i, row := range rows {
-		cells := make([]string, len(row.Values))
-		for j, v := range row.Values {
-			cells[j] = cellToString(v)
-		}
-		out[i] = cells
+// rowsToStrings renders rows as the wire's text cells, and returns every cell's kind alongside,
+// row by row (wire.SqlResultMessage.CellKinds). All rows' cells share one backing array.
+func rowsToStrings(rows []sql.QueryRow) ([][]string, []wire.CellKind) {
+	n := 0
+	for _, row := range rows {
+		n += len(row.Values)
 	}
-	return out
+	out := make([][]string, len(rows))
+	cells := make([]string, n)
+	kinds := make([]wire.CellKind, n)
+	k := 0
+	for i, row := range rows {
+		start := k
+		for _, v := range row.Values {
+			cells[k], kinds[k] = cellToString(v), cellKind(v)
+			k++
+		}
+		out[i] = cells[start:k:k]
+	}
+	return out, kinds
+}
+
+func cellKind(c sql.Cell) wire.CellKind {
+	switch c.(type) {
+	case sql.CellNull:
+		return wire.CellKindNull
+	case sql.CellLong:
+		return wire.CellKindLong
+	case sql.CellDouble:
+		return wire.CellKindDouble
+	case sql.CellBool:
+		return wire.CellKindBool
+	case sql.CellJSON:
+		return wire.CellKindJSON
+	default:
+		return wire.CellKindString
+	}
 }
 
 func cellToString(c sql.Cell) string {

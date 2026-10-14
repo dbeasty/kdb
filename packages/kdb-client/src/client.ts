@@ -35,7 +35,12 @@ import type {
 import { connectWebSocket } from "./transport/websocket.ts";
 import { schemeOf, type Transport } from "./transport/types.ts";
 import { bytesFromWire, bytesToWire, utf8Decode, utf8Encode } from "./wire/bytes.ts";
-import { WIRE_FEATURE_BINARY } from "./wire/binary.ts";
+import {
+  WIRE_FEATURE_BINARY,
+  WIRE_FEATURE_BINARY_2,
+  WIRE_FEATURE_ZSTD,
+  zstdDecompress,
+} from "./wire/binary.ts";
 import { decodeMessage, encodeMessage, isClientKind, type WireMessage } from "./wire/envelope.ts";
 import { DEFAULT_MAX_FRAME_BYTES, KDB_WIRE_PROTOCOL_VERSION } from "./wire/frame.ts";
 import { contentHash } from "./wire/hash.ts";
@@ -71,6 +76,21 @@ export interface TlsOptions {
   servername?: string;
   rejectUnauthorized?: boolean;
 }
+
+/** What the handshake offers: binary frames, and zstd frames where this runtime can read them. */
+const OFFERED_WIRE_FEATURES: string[] =
+  zstdDecompress === null
+    ? [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2]
+    : [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD];
+
+/**
+ * One typed SQL cell (queryValues): null for NULL, a number for an integer that fits one exactly
+ * (a bigint otherwise) or a double, a boolean, a string, or the parsed value of a JSON cell.
+ */
+export type SqlValue = null | number | bigint | boolean | string | JsonValue;
+
+/** A parsed JSON value. */
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface ConnectOptions {
   /** "user:secret", matching wire.HandshakePayload.Token. Omit against a server with no RBAC. */
@@ -160,8 +180,8 @@ export async function connect(addr: string, options: ConnectOptions = {}): Promi
 export class Client implements KdbOperations {
   readonly #transport: Transport;
   readonly #maxFrameBytes: number;
-  /** The handshake agreed binary frames (WIRE_FEATURE_BINARY): requests go out binary. */
-  #binary = false;
+  /** The wire features the handshake agreed; requests go out in their encodings. */
+  #features: ReadonlySet<string> = new Set();
   readonly #requestTimeoutMs: number;
   readonly #authorNodeId: string;
   readonly #pending = new Map<number, PendingRequest>();
@@ -205,7 +225,7 @@ export class Client implements KdbOperations {
       protocolVersion: KDB_WIRE_PROTOCOL_VERSION,
     };
     if (options.token !== undefined && options.token !== "") request.token = options.token;
-    if (!options.jsonOnly) request.wireFeatures = [WIRE_FEATURE_BINARY];
+    if (!options.jsonOnly) request.wireFeatures = OFFERED_WIRE_FEATURES;
 
     const callOptions: CallOptions = {};
     if (options.signal !== undefined) callOptions.signal = options.signal;
@@ -228,12 +248,15 @@ export class Client implements KdbOperations {
       );
     }
     // Binary frames only once the server has said it reads them. The ack itself is JSON.
-    this.#binary = !options.jsonOnly && (ack.wireFeatures ?? []).includes(WIRE_FEATURE_BINARY);
+    const acked = new Set(options.jsonOnly ? [] : (ack.wireFeatures ?? []));
+    this.#features = acked.has(WIRE_FEATURE_BINARY)
+      ? new Set(OFFERED_WIRE_FEATURES.filter((f) => acked.has(f)))
+      : new Set();
   }
 
   /** The wire features the handshake agreed; empty when the connection is on the JSON envelope. */
   get wireFeatures(): string[] {
-    return this.#binary ? [WIRE_FEATURE_BINARY] : [];
+    return [...this.#features];
   }
 
   async close(): Promise<void> {
@@ -482,6 +505,21 @@ export class Client implements KdbOperations {
     return { columns: result.columns, rows: result.rows };
   }
 
+  /**
+   * Runs a SELECT and returns typed cells (SqlValue), which tells a NULL from "" and a number from
+   * text. The types come from the server; one that predates them sends none, and then every cell
+   * is a string, NULL included as "".
+   */
+  async queryValues(
+    ns: string,
+    sql: string,
+    args: unknown[] = [],
+    options: CallOptions = {},
+  ): Promise<{ columns: string[]; rows: SqlValue[][] }> {
+    const result = await this.#execSql(ns, sql, args, options);
+    return { columns: result.columns, rows: typedRows(result.rows, result.cellKinds) };
+  }
+
   async *queryRawPages(
     ns: string,
     sql: string,
@@ -718,6 +756,7 @@ export class Client implements KdbOperations {
     readOnly: boolean;
     rowsAffected: number;
     continuation: string | undefined;
+    cellKinds: string | undefined;
   }> {
     const state = await this.#ensureNamespace(ns, options);
     const reply = await this.#request(
@@ -744,6 +783,7 @@ export class Client implements KdbOperations {
       readOnly: result.readOnly,
       rowsAffected: result.rowsAffected ?? 0,
       continuation: result.continuation || undefined,
+      cellKinds: result.cellKinds || undefined,
     };
   }
 
@@ -855,7 +895,7 @@ export class Client implements KdbOperations {
       });
 
       try {
-        this.#transport.send(encodeMessage(kind, correlationId, payload, this.#maxFrameBytes, this.#binary));
+        this.#transport.send(encodeMessage(kind, correlationId, payload, this.#maxFrameBytes, this.#features));
       } catch (error) {
         this.#settle(correlationId, () =>
           reject(
@@ -1051,4 +1091,35 @@ export function backoffDelay(attempt: number, error: KdbError): number {
     if (scaled < capMs) capMs = scaled;
   }
   return Math.floor(Math.random() * (capMs + 1));
+}
+
+/**
+ * Converts text cells to the values their kinds name. `kinds` is one decimal digit per cell, row
+ * by row (SqlResult's cellKinds); undefined leaves every cell a string.
+ */
+function typedRows(rows: string[][], kinds: string | undefined): SqlValue[][] {
+  if (kinds === undefined) return rows;
+  let k = 0;
+  return rows.map((row) =>
+    row.map((cell) => {
+      const kind = kinds.charCodeAt(k++) - 48;
+      switch (kind) {
+        case 1: // NULL
+          return null;
+        case 2: {
+          // int64: exact as a number while it fits one, a bigint past that.
+          const n = Number(cell);
+          return Number.isSafeInteger(n) ? n : BigInt(cell);
+        }
+        case 3:
+          return Number(cell);
+        case 4:
+          return cell === "1" || cell === "true"; // Go writes 1/0, the JVM server true/false
+        case 5:
+          return JSON.parse(cell) as JsonValue;
+        default:
+          return cell;
+      }
+    }),
+  );
 }

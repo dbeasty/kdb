@@ -127,6 +127,11 @@ func (s *defaultSubscriber) Connect(cfg SubscriberConfig) (*Connection, error) {
 		f := cfg.Filter
 		hs.Request.Filter = &f
 	}
+	if !cfg.JSONOnly {
+		// Frames are decoded by their own encoding tag, so offering is all a subscriber does: it
+		// sends nothing but acks, which stay JSON.
+		hs.Request.WireFeatures = wire.SupportedWireFeatures
+	}
 	go s.readLoop(conn, stop)
 	frame, err := s.wire.Encode(hs)
 	if err != nil {

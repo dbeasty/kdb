@@ -96,6 +96,44 @@ func flushDelete(t testing.TB, srv *KdbServerRuntime, i int) {
 
 // verifyIndexesMatchScan checks every single-field index against the documents at head: each
 // value's lookup lists exactly the documents carrying it, and nothing else is indexed.
+// explainIndexMismatch says, for each document only one side lists, what the scan read and
+// whether that body is the version head's tree names: a mismatch there is storage returning a
+// wrong version, not an index holding a wrong entry.
+func explainIndexMismatch(srv *KdbServerRuntime, head codec.Hash, got, want []string, bodies map[codec.UUID]string) string {
+	in := func(xs []string) map[string]bool {
+		m := map[string]bool{}
+		for _, x := range xs {
+			m[x] = true
+		}
+		return m
+	}
+	g, w := in(got), in(want)
+	tree, terr := srv.HeadTree()
+	var b strings.Builder
+	fmt.Fprintf(&b, "head %s", head.Hex())
+	for _, side := range []struct {
+		name string
+		ids  []string
+		in   map[string]bool
+	}{{"only in index", got, w}, {"only in scan", want, g}} {
+		for _, s := range side.ids {
+			if side.in[s] {
+				continue
+			}
+			id, _ := codec.ParseUUID(s)
+			body := bodies[id]
+			bodyHash, herr := document.Document{ID: id, JSON: body}.ContentHash()
+			treeHash, inTree := codec.Hash{}, false
+			if terr == nil {
+				treeHash, inTree = tree.HashFor(id)
+			}
+			fmt.Fprintf(&b, "\n  %s %s: scan body %q (hash %s, err %v); head tree names %s (present %v)",
+				side.name, s, body, bodyHash.Hex()[:12], herr, treeHash.Hex()[:12], inTree)
+		}
+	}
+	return b.String()
+}
+
 func verifyIndexesMatchScan(t testing.TB, srv *KdbServerRuntime, p *RegistryIndexProvider) {
 	t.Helper()
 	head, err := srv.Runtime.DAG.Head()
@@ -103,12 +141,14 @@ func verifyIndexesMatchScan(t testing.TB, srv *KdbServerRuntime, p *RegistryInde
 		t.Fatal(err)
 	}
 	docs := map[codec.UUID]map[string]any{}
+	bodies := map[codec.UUID]string{}
 	if err := srv.scanAtCommit(head)(func(id codec.UUID, body string) bool {
 		var m map[string]any
 		if err := json.Unmarshal([]byte(body), &m); err != nil {
 			t.Fatal(err)
 		}
 		docs[id] = m
+		bodies[id] = body
 		return true
 	}); err != nil {
 		t.Fatal(err)
@@ -134,7 +174,8 @@ func verifyIndexesMatchScan(t testing.TB, srv *KdbServerRuntime, p *RegistryInde
 				t.Fatal(err)
 			}
 			if got, exp := idStrings(ids), sorted(want[v]); strings.Join(got, ",") != strings.Join(exp, ",") {
-				t.Fatalf("index %s, %s = %s: got %d docs, want %d\ngot  %v\nwant %v", d.IndexName(), d.FieldName, v, len(got), len(exp), got, exp)
+				t.Fatalf("index %s, %s = %s: got %d docs, want %d\ngot  %v\nwant %v\n%s", d.IndexName(), d.FieldName, v, len(got), len(exp), got, exp,
+					explainIndexMismatch(srv, head, got, exp, bodies))
 			}
 		}
 		if d.Type == index.IndexTypeBTree {
