@@ -152,6 +152,8 @@ private suspend fun installCheckpoints(
     cp.foreignOnDisk = restored.foreignCheckpoint
     restored.fromCheckpoint?.let { cp.remember(it.segments) }
     val writerSeq = (writer as? DefaultDeltaSegmentWriter)?.sequence
+    // A squash catch-up is durable only through a checkpoint (Go's PersistSquash).
+    if (writerSeq != null) rt.squashPersistence = FileSquashPersistence(dataRoot, io, cp, writerSeq)
     var current = restored.fromCheckpoint != null && restored.tailSegments == 0
     if (!current && restored.replayedInFull && writerSeq != null && writerSeq > 0) {
         // Strictly below the writer's own segment: that one takes this session's commits.

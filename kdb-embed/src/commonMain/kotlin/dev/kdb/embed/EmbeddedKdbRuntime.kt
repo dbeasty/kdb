@@ -59,6 +59,10 @@ public class EmbeddedKdbRuntime(
      * sets it; a memory runtime keeps none. */
     public var snapshotPersistence: SnapshotPersistence? = null
 
+    /** Makes a squash catch-up durable after it is applied (EmbedSquash.kt): a file runtime sets
+     * it; a memory runtime keeps none. */
+    public var squashPersistence: SquashPersistence? = null
+
     /** Commits this runtime holds without their parents - roots of snapshots it was bootstrapped
      * from - by namespace. A file runtime fills it from the namespace marker at open. */
     public val shallowRoots: MutableMap<String, MutableSet<KdbHash>> = mutableMapOf()

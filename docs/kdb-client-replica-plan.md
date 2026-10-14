@@ -429,7 +429,20 @@ it does now. Where that stands:
   the post-replay checkpoint. Kotlin opens a Go squash, writes on top, and Go reopens it from Kotlin's
   checkpoint. Heads, trees, refs, documents, attachment roots and shallow roots must be equal, and Go must not
   replay the log in full.
-- The Kotlin replica's on-disk store builds on this; see PR 5b below.
+- The Kotlin replica's on-disk store is built on it (`kdb-replica` `FileReplicaNamespace`, JVM):
+  - `ReplicaOptions.fullNamespaces = fileNamespaces(dir)` keeps each full-mode namespace in a Kotlin
+    file runtime.
+  - A fast-forward logs the host's real commits.
+  - A snapshot bootstrap is the runtime's durable `installSnapshot`.
+  - A squash is the new `installSquash` (kdb-embed), made durable by `FileSquashPersistence`, which works
+    as Go's `PersistSquash` does: bodies to SSTables, a checkpoint through the log, then the marker's
+    shallow root.
+  - Commits still to push, the host's main and the author id are in `ns/<ns>/replica.json`, written
+    atomically.
+  - `FileReplicaTest` reopens a squash-bootstrapped replica with an unpushed write, then has Go open
+    its directory without a full replay.
+  - Not yet on disk: filtered namespaces, attachment bytes and a convergence's pages. An interrupted
+    bootstrap starts again, and a squash re-diffs.
 
 **Found while building PR 3:**
 - A host refuses a full replica's push into a single-home namespace in two ways. Without a handover point it

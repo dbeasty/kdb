@@ -77,6 +77,13 @@ public data class ReplicaOptions(
      * evicted.
      */
     val blobCacheBytes: Long = DEFAULT_BLOB_CACHE_BYTES,
+    /**
+     * Where full-mode namespaces live: null keeps them in [store]. On the JVM, `fileNamespaces(dir)`
+     * keeps each in a Kotlin file runtime - a node's on-disk format, Go's checkpoints included - so a
+     * replica reopens from disk (plan §3.3, D12). Filtered namespaces and attachment bytes stay in
+     * [store].
+     */
+    val fullNamespaces: (suspend (name: String, nodeId: String) -> ReplicaNamespace)? = null,
 )
 
 public enum class ChangeSource { LOCAL, REMOTE }
@@ -199,7 +206,7 @@ public class Replica private constructor(
                         val size = p.outboxSize()
                         r.outboxSizes.update { it + (spec.ns to size) }
                     }
-                    is NamespaceSpec.Full -> r.ns[spec.ns] = ReplicaNamespace.open(store, spec.ns, nodeId)
+                    is NamespaceSpec.Full -> r.ns[spec.ns] = options.fullNamespaces?.invoke(spec.ns, nodeId) ?: ReplicaNamespace.open(store, spec.ns, nodeId)
                 }
             }
             if (options.autoSync) r.schedule(0)
@@ -565,7 +572,16 @@ public class Replica private constructor(
         conn = null
         c?.close()
         scope.cancel()
+        var failure: Exception? = null
+        for (n in ns.values) {
+            try {
+                n.close()
+            } catch (e: Exception) {
+                if (failure == null) failure = e
+            }
+        }
         store.close()
+        failure?.let { throw it }
     }
 }
 
