@@ -484,3 +484,71 @@ func TestShimAppendsAreDurableAcrossManySegments(t *testing.T) {
 		}
 	})
 }
+
+// RenameSegment moves a segment's bytes to the new name and leaves nothing under the old one -
+// what an SSTable merge relies on to make its output visible only once it is complete.
+func TestShimRenameMovesTheSegment(t *testing.T) {
+	forEachShim(t, func(t *testing.T, shim storage.PlatformIOShim) {
+		renamer, ok := shim.(storage.SegmentRenamer)
+		if !ok {
+			t.Fatalf("%T does not rename", shim)
+		}
+		from := storio.SegmentNameBuilder.SSTablePartial(testNS, "f1")
+		to := storio.SegmentNameBuilder.SSTable(testNS, 1, "f1")
+		for _, part := range []string{"hello ", "world"} {
+			if _, err := shim.AppendToSegment(from, []byte(part)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := renamer.RenameSegment(from, to); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		if got, err := shim.ListSegments(testNS); err != nil || len(got) != 1 || got[0] != to {
+			t.Fatalf("after rename the namespace lists %v, %v; want only %s", got, err, to)
+		}
+		got, err := shim.ReadFromSegment(to, 0, 64)
+		if err != nil || string(got) != "hello world" {
+			t.Fatalf("renamed segment reads %q, %v", got, err)
+		}
+		if _, err := shim.ReadFromSegment(from, 0, 1); err == nil {
+			t.Error("the old name was still readable after the rename")
+		}
+		// The renamed segment seals like any other, and its old name is free again.
+		if err := shim.SealSegment(to); err != nil {
+			t.Fatal(err)
+		}
+		if size, err := shim.AppendToSegment(from, []byte("x")); err != nil || size != 1 {
+			t.Fatalf("append to the freed old name: size %d, %v", size, err)
+		}
+	})
+}
+
+// A sealed segment has been handed to replicas under its name, and an existing target would be
+// overwritten: both are refused, and neither segment is touched.
+func TestShimRenameRefusals(t *testing.T) {
+	forEachShim(t, func(t *testing.T, shim storage.PlatformIOShim) {
+		renamer := shim.(storage.SegmentRenamer)
+		sealed := storio.SegmentNameBuilder.SSTablePartial(testNS, "sealed")
+		open := storio.SegmentNameBuilder.SSTablePartial(testNS, "open")
+		existing := storio.SegmentNameBuilder.SSTable(testNS, 1, "existing")
+		for _, name := range []string{sealed, open, existing} {
+			if _, err := shim.AppendToSegment(name, []byte(name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := shim.SealSegment(sealed); err != nil {
+			t.Fatal(err)
+		}
+		if err := renamer.RenameSegment(sealed, storio.SegmentNameBuilder.SSTable(testNS, 1, "x")); err == nil {
+			t.Error("a sealed segment was renamed")
+		}
+		if err := renamer.RenameSegment(open, existing); err == nil {
+			t.Error("a rename overwrote an existing segment")
+		}
+		for _, name := range []string{sealed, open, existing} {
+			if got, err := shim.ReadFromSegment(name, 0, 256); err != nil || string(got) != name {
+				t.Fatalf("%s reads %q, %v after a refused rename", name, got, err)
+			}
+		}
+	})
+}

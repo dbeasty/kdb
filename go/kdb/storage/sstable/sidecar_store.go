@@ -144,26 +144,6 @@ func (s *LsmBlobStore) markSidecarBad(segment string) {
 	}
 }
 
-// forEachKey calls fn for every key table h holds, from its sidecar or its footer index. The
-// caller must hold h pinned.
-func (s *LsmBlobStore) forEachKey(h Handle, fn func(codec.Hash, BlockHandle)) error {
-	if sc := s.sidecarFor(h); sc != nil {
-		if err := sc.forEach(func(k codec.Hash, bh BlockHandle) bool { fn(k, bh); return true }); err == nil {
-			return nil
-		}
-		// A fault part way: the footer has every key, and the callers here are idempotent per key.
-		s.markSidecarBad(h.SegmentName)
-	}
-	index, err := s.indexFor(h)
-	if err != nil {
-		return err
-	}
-	for k, bh := range index {
-		fn(k, bh)
-	}
-	return nil
-}
-
 // takeSidecarLocked removes segment's slot, for a table being retired. Callers hold s.mu and must
 // pass the result to closeSidecars once they have released it.
 func (s *LsmBlobStore) takeSidecarLocked(segment string) *sidecarSlot {

@@ -1158,6 +1158,20 @@ func (r *DefaultReader) SkimSegment(segment storage.DeltaSegmentRef) (storage.Se
 	return skim, err
 }
 
+// StreamCommitHashesPastDamage implements storage.DeltaHashStreamer: StreamCommitsPastDamage
+// handing fn each frame's commit hash - the SHA-256 of its payload - without decoding the commit.
+// For an index whose keys are commit hashes, decoding every commit only to read its hash was
+// ~3 KB of allocation per commit when the newest segment, which has no sidecar, was scanned.
+func (r *DefaultReader) StreamCommitHashesPastDamage(segment storage.DeltaSegmentRef, fn func(codec.Hash, int64) error) error {
+	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
+	raw, err := r.shim.ReadFromSegment(segmentName, 0, maxScannedSegmentBytes)
+	if err != nil {
+		return err
+	}
+	_, err = ScanHashesSkippingCorrupt(raw, func(s ScannedCommit) error { return fn(s.CommitHash, int64(s.FrameOffset)) })
+	return err
+}
+
 // StreamCommitsPastDamage implements storage.DamageTolerantReader: StreamCommits over the whole
 // file, skipping damaged frames instead of stopping at the first.
 func (r *DefaultReader) StreamCommitsPastDamage(segment storage.DeltaSegmentRef, fn func(document.Commit, int64) error) error {

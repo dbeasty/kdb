@@ -128,6 +128,29 @@ func (s *InMemoryPlatformIO) DeleteSegment(segmentName string) error {
 	return nil
 }
 
+// RenameSegment implements storage.SegmentRenamer, refusing what FileBackedPlatformIO refuses.
+func (s *InMemoryPlatformIO) RenameSegment(from, to string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, ok := s.segments[from]
+	if !ok {
+		return fmt.Errorf("unknown segment %s", from)
+	}
+	if _, sealed := s.sealed[from]; sealed {
+		return &PlatformIOError{Message: "cannot rename a sealed segment", SegmentName: from}
+	}
+	if _, exists := s.segments[to]; exists || from == to {
+		return &PlatformIOError{Message: "rename target already exists", SegmentName: to}
+	}
+	s.segments[to] = data
+	delete(s.segments, from)
+	delete(s.generations, from)
+	delete(s.generations, to)
+	return nil
+}
+
+var _ storage.SegmentRenamer = (*InMemoryPlatformIO)(nil)
+
 // SegmentGeneration implements storage.SegmentGenerationer, as FileBackedPlatformIO does.
 func (s *InMemoryPlatformIO) SegmentGeneration(segmentName string) (uint64, bool) {
 	s.mu.Lock()

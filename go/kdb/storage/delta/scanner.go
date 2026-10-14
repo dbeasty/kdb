@@ -1,11 +1,13 @@
 package delta
 
 import (
+	"crypto/sha256"
 	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/compression"
 	"github.com/limidus/kdb/go/kdb/document"
+	"github.com/limidus/kdb/go/kdb/storage/bufpool"
 )
 
 const frameHeaderSize = PageFrameHeaderSize
@@ -368,10 +370,44 @@ func ScanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, err
 	return skipped, err
 }
 
+// ScanHashesSkippingCorrupt is ScanSkippingCorrupt handing fn only each frame's commit hash and
+// offset (ScannedCommit.Commit is zero): the SHA-256 of the frame's payload, which is the commit's
+// hash, computed without decoding the commit. A frame whose payload would not decode yields a hash
+// no commit has rather than being skipped.
+func ScanHashesSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, error) {
+	skipped, _, err := scanSkippingCorruptWith(bytes, fn, hashFrame)
+	return skipped, err
+}
+
+// hashFrame is a scan's decode step for ScanHashesSkippingCorrupt.
+func hashFrame(frame []byte) (ScannedCommit, error) {
+	payload, bp, err := framePayload(frame)
+	if err != nil {
+		return ScannedCommit{}, err
+	}
+	h := codec.Hash{Bytes: sha256.Sum256(payload)}
+	if bp != nil {
+		bufpool.Put(bp)
+	}
+	return ScannedCommit{CommitHash: h}, nil
+}
+
 // scanSkippingCorrupt is ScanSkippingCorrupt, also reporting where the last complete frame it
 // walked - intact or damaged - ends.
 func scanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, int, error) {
-	var codec PageCodec
+	var pc PageCodec
+	return scanSkippingCorruptWith(bytes, fn, func(frame []byte) (ScannedCommit, error) {
+		commit, err := pc.parseCommit(frame)
+		if err != nil {
+			return ScannedCommit{}, err
+		}
+		return ScannedCommit{CommitHash: commit.Hash, Commit: commit}, nil
+	})
+}
+
+// scanSkippingCorruptWith is scanSkippingCorrupt with decode turning each CRC-valid frame into
+// what fn is handed (its FrameOffset is set here).
+func scanSkippingCorruptWith(bytes []byte, fn func(ScannedCommit) error, decode func(frame []byte) (ScannedCommit, error)) ([]int, int, error) {
 	var skipped []int
 	offset := 0
 	framesEnd := 0
@@ -393,13 +429,14 @@ func scanSkippingCorrupt(bytes []byte, fn func(ScannedCommit) error) ([]int, int
 			offset = frameEnd
 			continue
 		}
-		commit, err := codec.parseCommit(frame)
+		sc, err := decode(frame)
 		if err != nil {
 			skipped = append(skipped, offset)
 			offset = frameEnd
 			continue
 		}
-		if err := fn(ScannedCommit{CommitHash: commit.Hash, Commit: commit, FrameOffset: offset}); err != nil {
+		sc.FrameOffset = offset
+		if err := fn(sc); err != nil {
 			return skipped, framesEnd, err
 		}
 		offset = frameEnd

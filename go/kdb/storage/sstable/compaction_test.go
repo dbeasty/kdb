@@ -5,9 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/storage"
 	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
@@ -385,29 +389,265 @@ func TestBlobStoreCompactContextCancelledLeavesTheTables(t *testing.T) {
 	}
 }
 
-// Cancelled part-way through the key loop, not just before it starts.
+// bigTable writes n keys whose values are incompressible and valueBytes long, so a merge of it
+// appends many finishBufferBytes batches - unlike a table of short values, whose merge writes
+// nothing at all until its footer.
+func bigTable(t *testing.T, shim storage.PlatformIOShim, ns string, n, valueBytes int, seed int64, deletes []string) Handle {
+	t.Helper()
+	rng := rand.New(rand.NewSource(seed))
+	w := NewDefaultWriter(shim, ns, 0)
+	for i := 0; i < n; i++ {
+		v := make([]byte, valueBytes)
+		rng.Read(v)
+		w.Put(keyFor([]byte(fmt.Sprintf("key-%d-%06d", seed, i))), v)
+	}
+	for _, k := range deletes {
+		w.Delete(keyFor([]byte(k)))
+	}
+	h, err := w.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+func readSegment(t *testing.T, shim storage.PlatformIOShim, name string) []byte {
+	t.Helper()
+	size, err := shim.(storage.SegmentSizer).SegmentSize(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := shim.ReadFromSegment(name, 0, int(size))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// noRenameShim hides the in-memory shim's RenameSegment, as a shim written against
+// storage.PlatformIOShim alone would lack it.
+type noRenameShim struct{ storage.PlatformIOShim }
+
+func (s noRenameShim) SegmentSize(name string) (int64, error) {
+	return s.PlatformIOShim.(storage.SegmentSizer).SegmentSize(name)
+}
+
+// The merge streams its output, and the stream must lay out exactly the file a writer holding
+// every entry until Finish lays out - same blocks, same footer, same file hash - or tables merged
+// by this build would differ from what every other build (and Kotlin) writes for the same entries.
+func TestStreamedCompactionIsByteIdenticalToFinish(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		shim func() storage.PlatformIOShim
+	}{
+		{"renames", func() storage.PlatformIOShim { return testShim(t) }},
+		{"no-rename", func() storage.PlatformIOShim { return noRenameShim{testShim(t)} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shim := tc.shim()
+			ns := "app/docs"
+			// Several megabytes, so the merge appends many batches; tombstones kept, so the
+			// footer's fourth field and the hash's marker byte are in the comparison too.
+			a := bigTable(t, shim, ns, 1500, 2000, 1, nil)
+			b := bigTable(t, shim, ns, 1500, 2000, 2, []string{"key-1-000007", "key-1-000100", "gone"})
+			merged, err := Compact(shim, ns, 1, []Handle{a, b}, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The same final entries, sorted, through the buffering writer.
+			final := map[codec.Hash]BlockHandle{}
+			for _, in := range []Handle{a, b} {
+				index, err := NewDefaultReader(shim, in).Index()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for k, bh := range index {
+					final[k] = bh
+				}
+			}
+			owner := func(k codec.Hash) Handle {
+				if _, ok := mustIndex(t, shim, b)[k]; ok {
+					return b
+				}
+				return a
+			}
+			w := NewDefaultWriter(shim, ns, 1)
+			for _, k := range sortedKeys(final) {
+				if final[k].Deleted {
+					w.Delete(k)
+					continue
+				}
+				v, err := NewDefaultReader(shim, owner(k)).ReadBlockAt(final[k])
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.Put(k, v)
+			}
+			want, err := w.Finish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if merged.FileHash != want.FileHash {
+				t.Fatalf("file hash %s, want %s", merged.FileHash.Hex(), want.FileHash.Hex())
+			}
+			got, exp := readSegment(t, shim, merged.SegmentName), readSegment(t, shim, want.SegmentName)
+			if len(exp) < 3*finishBufferBytes {
+				t.Fatalf("only %d bytes: the merge did not span several append batches", len(exp))
+			}
+			if !bytes.Equal(got, exp) {
+				t.Fatalf("streamed table differs from the buffered one (%d vs %d bytes)", len(got), len(exp))
+			}
+			if !strings.HasPrefix(merged.SegmentName, storio.SegmentNameBuilder.NamespacePrefix(ns)+"sstable/L1/") {
+				t.Fatalf("merged table is named %s", merged.SegmentName)
+			}
+		})
+	}
+}
+
+func mustIndex(t *testing.T, shim storage.PlatformIOShim, h Handle) map[codec.Hash]BlockHandle {
+	t.Helper()
+	index, err := NewDefaultReader(shim, h).Index()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return index
+}
+
+// Cancelled part-way through the key loop, after blocks have been appended: the partial output
+// is deleted, so the merge leaves no file behind. Run against a shim that renames, where the
+// output is under its partial name, and one that cannot, where it is under the table's own name.
 func TestCompactContextStopsMidMerge(t *testing.T) {
-	shim := testShim(t)
-	ns := "app/docs"
-	puts := map[string]string{}
-	for i := 0; i < 3*compactionCheckEvery; i++ {
-		puts[fmt.Sprintf("key-%06d", i)] = "v"
+	for _, tc := range []struct {
+		name string
+		shim func() storage.PlatformIOShim
+	}{
+		{"renames", func() storage.PlatformIOShim { return testShim(t) }},
+		{"no-rename", func() storage.PlatformIOShim { return noRenameShim{testShim(t)} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shim := tc.shim()
+			ns := "app/docs"
+			in := bigTable(t, shim, ns, 3*compactionCheckEvery, 1000, 1, nil)
+			before, _ := shim.ListSegments(ns)
+			ctx, cancel := context.WithCancel(context.Background())
+			calls := 0
+			var during []string
+			keep := func(codec.Hash) bool {
+				if calls++; calls == compactionCheckEvery+1 {
+					during, _ = shim.ListSegments(ns)
+					cancel()
+				}
+				return true
+			}
+			if _, err := CompactContext(ctx, shim, ns, 1, []Handle{in}, false, keep); !errors.Is(err, context.Canceled) {
+				t.Fatalf("got %v, want context.Canceled", err)
+			}
+			if len(during) != len(before)+1 {
+				t.Fatalf("no output was being written when the merge was cancelled: %v", during)
+			}
+			if _, renames := shim.(storage.SegmentRenamer); renames {
+				for _, name := range during {
+					if name != in.SegmentName && !strings.HasPrefix(name, storio.SegmentNameBuilder.SSTablePartialPrefix(ns)) {
+						t.Fatalf("a merge in progress wrote under %s, a name DiscoverTables registers", name)
+					}
+				}
+			}
+			if after, _ := shim.ListSegments(ns); len(after) != len(before) {
+				t.Fatalf("a merge cancelled mid-way left a file: %v -> %v", before, after)
+			}
+		})
 	}
-	in := writeTable(t, shim, ns, 0, puts, nil)
-	before, _ := shim.ListSegments(ns)
-	ctx, cancel := context.WithCancel(context.Background())
-	calls := 0
-	keep := func(codec.Hash) bool {
-		if calls++; calls == compactionCheckEvery+1 {
-			cancel()
+}
+
+// crashingShim stands in for a process that dies mid-merge: once crashAfter appends to a partial
+// table have gone through, the next one panics and nothing the merge does afterwards - its
+// cleanup included - reaches storage.
+type crashingShim struct {
+	*storio.InMemoryPlatformIO
+	crashAfter int
+	appends    int
+	crashed    bool
+}
+
+func (s *crashingShim) AppendToSegment(name string, b []byte) (int64, error) {
+	if s.crashed {
+		return 0, errors.New("process is dead")
+	}
+	if strings.Contains(name, "sstable-partial/") {
+		if s.appends++; s.appends > s.crashAfter {
+			s.crashed = true
+			panic("crash")
 		}
-		return true
 	}
-	if _, err := CompactContext(ctx, shim, ns, 1, []Handle{in}, false, keep); !errors.Is(err, context.Canceled) {
-		t.Fatalf("got %v, want context.Canceled", err)
+	return s.InMemoryPlatformIO.AppendToSegment(name, b)
+}
+
+func (s *crashingShim) DeleteSegment(name string) error {
+	if s.crashed {
+		return errors.New("process is dead")
 	}
-	if after, _ := shim.ListSegments(ns); len(after) != len(before) {
-		t.Fatalf("a merge cancelled mid-way left a file: %d -> %d segments", len(before), len(after))
+	return s.InMemoryPlatformIO.DeleteSegment(name)
+}
+
+// A merge that dies mid-write leaves its partial table on disk, and the next open must not
+// register it: a half-written table has no footer, or worse, a footer-shaped tail. The next merge
+// then removes it.
+func TestCrashMidMergeLeavesNothingDiscoverable(t *testing.T) {
+	shim := &crashingShim{InMemoryPlatformIO: testShim(t), crashAfter: 2}
+	ns := "app/docs"
+	store := NewLsmBlobStore(shim, ns, NewBlockCache(1<<20))
+	for i := 0; i < DefaultCompactionTrigger; i++ {
+		store.AddTable(bigTable(t, shim, ns, 500, 2000, int64(i), nil))
+	}
+	inputs := map[string]bool{}
+	for _, h := range store.Tables() {
+		inputs[h.SegmentName] = true
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the merge did not reach the crash")
+			}
+		}()
+		_, _ = store.Compact(DefaultCompactionTrigger, nil)
+	}()
+	partials := func() (n int) {
+		names, _ := shim.InMemoryPlatformIO.ListSegments(ns)
+		for _, name := range names {
+			if strings.HasPrefix(name, storio.SegmentNameBuilder.SSTablePartialPrefix(ns)) {
+				n++
+			}
+		}
+		return n
+	}
+	if partials() != 1 {
+		t.Fatalf("the crash left %d partial tables, want the one it was writing", partials())
+	}
+
+	// The next process.
+	shim.crashed = false
+	reopened := NewLsmBlobStore(shim, ns, NewBlockCache(1<<20))
+	if err := reopened.DiscoverTables(); err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Tables(); len(got) != len(inputs) {
+		t.Fatalf("reopen registered %d tables, want the %d inputs", len(got), len(inputs))
+	}
+	for _, h := range reopened.Tables() {
+		if !inputs[h.SegmentName] {
+			t.Fatalf("reopen registered %s, which the crashed merge wrote", h.SegmentName)
+		}
+	}
+	shim.crashAfter = 1 << 30
+	if res, err := reopened.Compact(DefaultCompactionTrigger, nil); err != nil || res.Merged != len(inputs) {
+		t.Fatalf("merge after the crash: %+v, %v", res, err)
+	}
+	if partials() != 0 {
+		t.Fatal("the merge after the crash left the crashed merge's partial table")
+	}
+	if got := reopened.Get(keyFor([]byte("key-3-000499"))); len(got) != 2000 {
+		t.Fatalf("a key reads %d bytes after the merges", len(got))
 	}
 }
 
@@ -432,4 +672,22 @@ func TestBlobStoreTableBytes(t *testing.T) {
 	if n, ok := store.TableBytes(); !ok || n != want {
 		t.Fatalf("TableBytes = %d, %v; want %d", n, ok, want)
 	}
+}
+
+// sortedKeys orders a key set by its bytes, as a compaction orders its output.
+func sortedKeys[V any](m map[codec.Hash]V) []codec.Hash {
+	out := make([]codec.Hash, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i].Bytes, out[j].Bytes
+		for x := range a {
+			if a[x] != b[x] {
+				return a[x] < b[x]
+			}
+		}
+		return false
+	})
+	return out
 }

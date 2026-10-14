@@ -185,6 +185,17 @@ func (s *PrimaryWithReplicas) LocalSegmentPath(segmentName string) (string, bool
 	return "", false
 }
 
+// Rename forwards to the primary alone. Sinks receive a segment when it is sealed, and an
+// unsealed segment is the only kind that may be renamed (storage.SegmentRenamer), so no sink has
+// anything under the old name to move.
+func (s *PrimaryWithReplicas) Rename(from, to string) error {
+	r, ok := s.primary.(segmentStoreRenamer)
+	if !ok {
+		return storage.ErrRenameUnsupported
+	}
+	return r.Rename(from, to)
+}
+
 func (s *PrimaryWithReplicas) List(prefix string) ([]string, error) {
 	return s.primary.List(prefix)
 }

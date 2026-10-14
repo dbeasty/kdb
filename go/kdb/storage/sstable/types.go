@@ -397,6 +397,7 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	if len(pinned) < trigger {
 		return CompactionResult{}, nil
 	}
+	s.removePartialTables()
 	// Oldest first, so a later table's opinion wins in the merge.
 	// A copy: the pinned slice is shared with concurrent lookups and is reversed here.
 	ordered := append([]Handle(nil), pinned...)
@@ -414,27 +415,9 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 	// Every table in the store is going in, so a tombstone here cannot be
 	// shadowing a key in a table that is staying: dropping them is safe
 	// and is the only way a delete ever reclaims its own space.
-	// Counted before the merge so the result can say how much was
-	// reclaimed rather than only how many files were rewritten.
-	dropped := 0
-	if keep != nil {
-		seen := make(map[codec.Hash]struct{})
-		for _, h := range ordered {
-			if err := ctx.Err(); err != nil {
-				return CompactionResult{}, err
-			}
-			_ = s.forEachKey(h, func(k codec.Hash, _ BlockHandle) {
-				if _, ok := seen[k]; ok {
-					return
-				}
-				seen[k] = struct{}{}
-				if !keep(k) {
-					dropped++
-				}
-			})
-		}
-	}
-	merged, err := CompactContext(ctx, s.io, s.namespaceID, outLevel, ordered, true, keep)
+	// The merge counts the keys keep refuses, so the result can say how much was reclaimed
+	// rather than only how many files were rewritten.
+	merged, dropped, err := compact(ctx, s.io, s.namespaceID, outLevel, ordered, true, keep)
 	switch {
 	case err == ErrNothingToCompact:
 		merged = Handle{}
@@ -509,6 +492,26 @@ func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep fun
 		result.Removed++
 	}
 	return result, nil
+}
+
+// removePartialTables deletes the partial tables a merge left behind when its process died
+// mid-write (see CompactContext). Nothing reads them - they are outside the names DiscoverTables
+// registers - so they cost only disk, and only until the next merge.
+//
+// Run by a merge, under compactMu, rather than by DiscoverTables: an open does not know that no
+// merge is writing one right now (a read-only open beside a writable one does not), while a merge
+// holding compactMu is the only writer of this namespace's partial tables there is.
+func (s *LsmBlobStore) removePartialTables() {
+	names, err := s.io.ListSegments(s.namespaceID)
+	if err != nil {
+		return
+	}
+	prefix := storio.SegmentNameBuilder.SSTablePartialPrefix(s.namespaceID)
+	for _, name := range names {
+		if strings.HasPrefix(name, prefix) {
+			_ = s.io.DeleteSegment(name)
+		}
+	}
 }
 
 // TableBytes reports how many bytes the registered tables occupy on disk, and false when the

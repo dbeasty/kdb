@@ -64,6 +64,9 @@ func TestMemoryProfile(t *testing.T) {
 	// KDB_MEMPROFILE_NOBGMERGE=1 keeps an open from merging the tables close left behind, so the
 	// open and reads phases measure them as they are (StorageOptions.DisableBackgroundCompaction).
 	opts.Storage.DisableBackgroundCompaction = os.Getenv("KDB_MEMPROFILE_NOBGMERGE") == "1"
+	// KDB_MEMPROFILE_CLOSEMERGE=bytes lets close merge tables up to that size
+	// (StorageOptions.CloseCompactionBytes), so the checkpoint phase measures a full SSTable merge.
+	opts.Storage.CloseCompactionBytes = int64(envOr("KDB_MEMPROFILE_CLOSEMERGE", 0))
 	if m := os.Getenv("KDB_MEMPROFILE_MEMORY"); m != "" {
 		opts.Storage.Graph.Memory = dag.GraphMemory(m) // "go" or "kdb"; ignored by builds without it
 	}
