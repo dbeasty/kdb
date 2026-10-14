@@ -67,6 +67,9 @@ func openHeapPerCommit(t *testing.T, commits int) float64 {
 // each and making the graph O(n squared) to build, to serve a prefix
 // lookup that scanned it linearly anyway.
 func TestOpenCostPerCommitDoesNotGrow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("open-cost measurement; runs nightly, or without -short")
+	}
 	small := openHeapPerCommit(t, 1500)
 	large := openHeapPerCommit(t, 6000)
 	t.Logf("open cost: %.0f bytes/commit at 1.5k commits, %.0f at 6k", small, large)

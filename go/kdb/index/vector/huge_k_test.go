@@ -57,6 +57,9 @@ func mustUUID2(tb testing.TB, s string) codec.UUID {
 }
 
 func TestNearestNeighboursWithHugeKIsBoundedByTheIndex(t *testing.T) {
+	if testing.Short() {
+		t.Skip("time and allocation bounds over a 20,000-vector index; runs nightly, or without -short")
+	}
 	const n, dims = 20000, 32
 	s, vecs := bigStore(t, n, dims)
 	q := vecs[123]

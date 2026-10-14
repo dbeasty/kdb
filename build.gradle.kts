@@ -32,6 +32,19 @@ allprojects {
     group = "dev.kdb"
     version = kdbVersion
 
+    // The commit attributes below make every jar differ from one commit to the next. Without this,
+    // every test task (and every compile that has a jar on its classpath) would see a changed input
+    // and miss the build cache on every commit, even in a module nobody touched - which is what
+    // lets CI reuse main's results.
+    normalization {
+        runtimeClasspath {
+            metaInf {
+                ignoreAttribute("Implementation-Commit")
+                ignoreAttribute("Implementation-Commit-Dirty")
+            }
+        }
+    }
+
     tasks.withType<Jar>().configureEach {
         manifest {
             attributes(

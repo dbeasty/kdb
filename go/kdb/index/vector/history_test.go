@@ -218,9 +218,13 @@ func (w *vWorld) run(n int, sideEvents bool) {
 }
 
 func TestVectorMatchesReference(t *testing.T) {
+	seeds := int64(6)
+	if testing.Short() {
+		seeds = 2 // all 6 run nightly, or without -short
+	}
 	for _, window := range []int{-1, 8, 40} {
 		for _, threshold := range []int{1 << 20, -1} {
-			for seed := int64(1); seed <= 6; seed++ {
+			for seed := int64(1); seed <= seeds; seed++ {
 				for _, side := range []bool{false, true} {
 					w := newVWorld(t, seed*10+int64(window), window, threshold)
 					w.run(700, side)
