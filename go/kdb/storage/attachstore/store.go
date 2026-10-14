@@ -299,8 +299,8 @@ type Info struct {
 type Upload struct {
 	s       *Store
 	size    int64
-	cur     []byte // the chunk being filled
-	segment string // set once the upload outgrows the small store
+	cur     []byte        // the chunk being filled
+	segment string        // set once the upload outgrows the small store
 	leaves  []*codec.Hash // one slot per chunk, filled by a hashing worker
 	pending sync.WaitGroup
 	sem     chan struct{}

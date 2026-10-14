@@ -984,6 +984,13 @@ func (r *DefaultReader) ReadCommitAt(segment storage.DeltaSegmentRef, frameOffse
 	return r.readCommitFrame(segmentName, frameOffset)
 }
 
+// ReadPayloadAt implements storage.DeltaPayloadReader: the frame's decompressed payload, through
+// the frame cache, with no decode.
+func (r *DefaultReader) ReadPayloadAt(segment storage.DeltaSegmentRef, frameOffset int64, fn func(payload []byte) error) error {
+	segmentName := storio.SegmentNameBuilder.DeltaSequenced(segment.NamespaceID, segment.SequenceNumber)
+	return r.withFramePayload(segmentName, frameOffset, fn)
+}
+
 // ReadDocumentAt implements storage.DeltaDocumentReader: it calls fn with the patch of every write
 // of docID in the commit framed at frameOffset, in order, until fn returns false - without
 // decoding the rest of the commit (see document.ScanCommitWrites). The patch is valid only during

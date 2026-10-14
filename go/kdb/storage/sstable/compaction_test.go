@@ -2,6 +2,8 @@ package sstable
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -343,5 +345,91 @@ func TestBlobStoreCompactDoesNotResurrectDeletedKeys(t *testing.T) {
 		if got := store.Get(keyFor([]byte(k))); string(got) != want {
 			t.Fatalf("%s reads %q, want %q", k, got, want)
 		}
+	}
+}
+
+// A cancelled merge writes nothing and leaves every table registered and readable: what closing
+// a namespace relies on when it stops a background merge rather than waiting for it.
+func TestBlobStoreCompactContextCancelledLeavesTheTables(t *testing.T) {
+	shim := testShim(t)
+	ns := "app/docs"
+	store := NewLsmBlobStore(shim, ns, NewBlockCache(1<<20))
+	for i := 0; i < 6; i++ {
+		store.AddTable(writeTable(t, shim, ns, 0, map[string]string{fmt.Sprintf("k%d", i): fmt.Sprintf("v%d", i)}, nil))
+	}
+	before, err := shim.ListSegments(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.CompactContext(ctx, DefaultCompactionTrigger, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled merge returned %v, want context.Canceled", err)
+	}
+	after, err := shim.ListSegments(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) || len(store.Tables()) != 6 {
+		t.Fatalf("a cancelled merge changed the store: %d -> %d segments, %d tables registered",
+			len(before), len(after), len(store.Tables()))
+	}
+	for i := 0; i < 6; i++ {
+		if got := store.Get(keyFor([]byte(fmt.Sprintf("k%d", i)))); string(got) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("k%d reads %q after a cancelled merge", i, got)
+		}
+	}
+	// And the store merges normally afterwards.
+	if res, err := store.Compact(DefaultCompactionTrigger, nil); err != nil || res.Merged != 6 {
+		t.Fatalf("merge after a cancelled one: %+v, %v", res, err)
+	}
+}
+
+// Cancelled part-way through the key loop, not just before it starts.
+func TestCompactContextStopsMidMerge(t *testing.T) {
+	shim := testShim(t)
+	ns := "app/docs"
+	puts := map[string]string{}
+	for i := 0; i < 3*compactionCheckEvery; i++ {
+		puts[fmt.Sprintf("key-%06d", i)] = "v"
+	}
+	in := writeTable(t, shim, ns, 0, puts, nil)
+	before, _ := shim.ListSegments(ns)
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	keep := func(codec.Hash) bool {
+		if calls++; calls == compactionCheckEvery+1 {
+			cancel()
+		}
+		return true
+	}
+	if _, err := CompactContext(ctx, shim, ns, 1, []Handle{in}, false, keep); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if after, _ := shim.ListSegments(ns); len(after) != len(before) {
+		t.Fatalf("a merge cancelled mid-way left a file: %d -> %d segments", len(before), len(after))
+	}
+}
+
+// TableBytes adds up what the registered tables occupy.
+func TestBlobStoreTableBytes(t *testing.T) {
+	shim := testShim(t)
+	ns := "app/docs"
+	store := NewLsmBlobStore(shim, ns, NewBlockCache(1<<20))
+	if n, ok := store.TableBytes(); !ok || n != 0 {
+		t.Fatalf("empty store: %d, %v", n, ok)
+	}
+	var want int64
+	for i := 0; i < 3; i++ {
+		h := writeTable(t, shim, ns, 0, map[string]string{fmt.Sprintf("k%d", i): "value"}, nil)
+		store.AddTable(h)
+		n, err := shim.SegmentSize(h.SegmentName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want += n
+	}
+	if n, ok := store.TableBytes(); !ok || n != want {
+		t.Fatalf("TableBytes = %d, %v; want %d", n, ok, want)
 	}
 }

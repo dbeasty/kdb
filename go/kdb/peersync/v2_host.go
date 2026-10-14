@@ -116,7 +116,7 @@ type hostFetch struct {
 // fetchPage serves a FETCH_REQUEST: the next page of the session's transfer when the request
 // continues it - same namespace and wants, and the peer names the last page's tips as held -
 // and otherwise a transfer worked out afresh, which is what every page used to be.
-func (h *V2Host) fetchPage(env IngestEnv, m wire.FetchRequestMessage) ([]document.Commit, []document.CommitStub, bool, error) {
+func (h *V2Host) fetchPage(env IngestEnv, m wire.FetchRequestMessage) ([]document.Commit, [][]byte, []document.CommitStub, bool, error) {
 	h.fetchMu.Lock()
 	defer h.fetchMu.Unlock()
 	var cur *missingCursor
@@ -128,17 +128,17 @@ func (h *V2Host) fetchPage(env IngestEnv, m wire.FetchRequestMessage) ([]documen
 		if cur == nil {
 			cur = newMissingCursor(env.DAG, m.Wants, m.Haves)
 		}
-		commits, stubs, done, err := cur.page(env.DAG, m.MaxBytes)
+		commits, payloads, stubs, done, err := cur.pagePayloads(env.DAG, m.MaxBytes)
 		if errors.Is(err, errCursorStale) && attempt == 0 {
 			cur = nil
 			continue
 		}
 		if err != nil || done {
 			h.fetch = nil
-			return commits, stubs, done, err
+			return commits, payloads, stubs, done, err
 		}
 		h.fetch = &hostFetch{namespace: m.Namespace, cursor: cur}
-		return commits, stubs, done, nil
+		return commits, payloads, stubs, done, nil
 	}
 }
 
@@ -248,7 +248,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		if err != nil {
 			return nil, err
 		}
-		commits, stubs, done, err := h.fetchPage(env, m)
+		commits, payloads, stubs, done, err := h.fetchPage(env, m)
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +260,7 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}
 		return wire.PackPageMessage{
 			H: header(wire.MsgPackPage, m.H.CorrelationID), Namespace: m.Namespace,
-			Commits: commits, Stubs: stubs, Done: done, Zstd: zstd,
+			Commits: commits, Payloads: payloads, Stubs: stubs, Done: done, Zstd: zstd,
 		}, nil
 	case wire.RefUpdateMessage:
 		return h.refUpdate(m)

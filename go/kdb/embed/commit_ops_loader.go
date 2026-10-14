@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"crypto/sha256"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -63,6 +64,32 @@ func (l *commitOpsLoader) load(hash codec.Hash) ([]document.Op, error) {
 		return nil, &CommitOperationsUnavailableError{CommitHash: hash}
 	}
 	return commit.Operations, nil
+}
+
+// payload is the commit's logged payload, copied out of the frame, when the log holds it: false
+// when the reader cannot hand payloads back or no frame is recorded for hash. The payload's SHA-256
+// is checked against hash - the location index is a cache and the frame is the authority - so a
+// stale entry reports false rather than another commit's bytes.
+func (l *commitOpsLoader) payload(hash codec.Hash) ([]byte, bool, error) {
+	pr, ok := l.reader.(storage.DeltaPayloadReader)
+	if !ok {
+		return nil, false, nil
+	}
+	loc, ok, err := l.index.Lookup(hash)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	var out []byte
+	if err := pr.ReadPayloadAt(loc.Segment, loc.FrameOffset, func(p []byte) error {
+		out = append([]byte(nil), p...)
+		return nil
+	}); err != nil {
+		return nil, false, err
+	}
+	if sum := sha256.Sum256(out); sum != hash.Bytes {
+		return nil, false, nil
+	}
+	return out, true, nil
 }
 
 // CommitOperationsUnavailableError reports a commit whose operations the

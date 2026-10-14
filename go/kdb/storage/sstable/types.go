@@ -1,6 +1,7 @@
 package sstable
 
 import (
+	"context"
 	"sort"
 	"strconv"
 	"strings"
@@ -334,6 +335,10 @@ type CompactionResult struct {
 	// Output names the table that replaced them, empty when the merge had
 	// nothing to write.
 	Output string
+	// Postponed is set when a bounded caller (engine.CompactBlobStoreUpTo) found the tables too
+	// large to merge then: the bytes they hold, or -1 when the shim could not say. Zero for a
+	// merge that ran or had nothing to do.
+	Postponed int64
 }
 
 // Compact merges every registered table into one, when there are more than
@@ -372,6 +377,14 @@ type CompactionResult struct {
 // close it, most simply by making discovery prefer the newest file rather
 // than listing order.
 func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (CompactionResult, error) {
+	return s.CompactContext(context.Background(), trigger, keep)
+}
+
+// CompactContext is Compact that abandons the merge when ctx is done, returning ctx's error with
+// every table left as it was - see sstable.CompactContext for why abandoning is always safe. For
+// a merge running in the background of an open namespace, which closing the namespace must be
+// able to stop rather than wait out.
+func (s *LsmBlobStore) CompactContext(ctx context.Context, trigger int, keep func(codec.Hash) bool) (CompactionResult, error) {
 	if trigger < 2 {
 		trigger = 2
 	}
@@ -407,6 +420,9 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 	if keep != nil {
 		seen := make(map[codec.Hash]struct{})
 		for _, h := range ordered {
+			if err := ctx.Err(); err != nil {
+				return CompactionResult{}, err
+			}
 			_ = s.forEachKey(h, func(k codec.Hash, _ BlockHandle) {
 				if _, ok := seen[k]; ok {
 					return
@@ -418,7 +434,7 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 			})
 		}
 	}
-	merged, err := Compact(s.io, s.namespaceID, outLevel, ordered, true, keep)
+	merged, err := CompactContext(ctx, s.io, s.namespaceID, outLevel, ordered, true, keep)
 	switch {
 	case err == ErrNothingToCompact:
 		merged = Handle{}
@@ -493,6 +509,25 @@ func (s *LsmBlobStore) Compact(trigger int, keep func(codec.Hash) bool) (Compact
 		result.Removed++
 	}
 	return result, nil
+}
+
+// TableBytes reports how many bytes the registered tables occupy on disk, and false when the
+// shim cannot say without reading every table (see storage.SegmentSizer) - a caller deciding
+// whether a merge is small enough to run now should then treat it as not small.
+func (s *LsmBlobStore) TableBytes() (int64, bool) {
+	sizer, ok := s.io.(storage.SegmentSizer)
+	if !ok {
+		return 0, false
+	}
+	var total int64
+	for _, h := range s.Tables() {
+		n, err := sizer.SegmentSize(h.SegmentName)
+		if err != nil {
+			return 0, false
+		}
+		total += n
+	}
+	return total, true
 }
 
 // AddTable registers a flushed table.

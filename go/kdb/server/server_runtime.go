@@ -210,6 +210,9 @@ type KdbServerRuntime struct {
 	home atomic.Pointer[Home]
 	// resolution is the namespace's conflict resolution chain, a replicated definition (nil: none).
 	resolution atomic.Pointer[peersync.ResolutionChain]
+	// catchUp is the namespace's catch-up policy, a replicated definition (nil: squash allowed) -
+	// see catchup_policy.go.
+	catchUp atomic.Pointer[CatchUpPolicy]
 	// procs holds the namespace's stored procedures by name, also replicated definitions - see
 	// procedures.go.
 	procs procsField

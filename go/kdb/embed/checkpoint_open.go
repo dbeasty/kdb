@@ -11,6 +11,7 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/storage"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
+	"github.com/limidus/kdb/go/kdb/storage/sstable"
 )
 
 // restoreNamespace brings d and store up to the namespace's durable state,
@@ -379,6 +380,7 @@ func checkpointOnClose(
 	namespaceID string,
 	window storage.RetentionWindow,
 	disabled bool,
+	compactLimit int64,
 ) {
 	if r == nil {
 		return
@@ -387,9 +389,14 @@ func checkpointOnClose(
 	// checkpoint can claim the newest segment, which is the widest floor
 	// any truncation will ever get. Under history=full this is a plain
 	// checkpoint and deletes nothing.
+	//
+	// The SSTable merge is the exception, bounded by compactLimit: it costs
+	// time proportional to the tables rather than to anything close has to
+	// do, so a store larger than the limit is left to maintenance - see
+	// background_compaction.go.
 	res, err := checkpointAndTruncate(
 		d, store, r, shim, namespaceID, highestSegmentSequence(r), window, time.Now(), disabled,
-		liveReclaim(store))
+		liveReclaim(store), compactLimit)
 	if err != nil {
 		log.Printf("kdb: namespace %s: could not write a checkpoint on close (%v) - the next open will replay the log", namespaceID, err)
 		return
@@ -483,6 +490,7 @@ func checkpointAndTruncate(
 	now time.Time,
 	disabled bool,
 	reclaim storage.ReclaimMode,
+	compactLimit int64,
 ) (TruncationResult, error) {
 	if disabled || r == nil || shim == nil || through < 0 {
 		return TruncationResult{}, nil
@@ -530,7 +538,7 @@ func checkpointAndTruncate(
 		if err := saveCheckpoint(d, store, r, shim, namespaceID, through, currentFloor(r), disabled); err != nil {
 			return TruncationResult{}, err
 		}
-		return withCompaction(TruncationResult{FloorSequence: currentFloor(r)}, eng, namespaceID), nil
+		return withCompaction(TruncationResult{FloorSequence: currentFloor(r)}, eng, namespaceID, compactLimit), nil
 	}
 
 	plan, err := planTruncation(d, store, r, through, window, now)
@@ -541,13 +549,13 @@ func checkpointAndTruncate(
 		return TruncationResult{}, err
 	}
 	if plan.IsEmpty() {
-		return withCompaction(TruncationResult{FloorSequence: plan.Floor}, eng, namespaceID), nil
+		return withCompaction(TruncationResult{FloorSequence: plan.Floor}, eng, namespaceID, compactLimit), nil
 	}
 	res, err := applyTruncation(store, r, shim, namespaceID, plan)
 	if err != nil {
 		return res, err
 	}
-	return withCompaction(res, eng, namespaceID), nil
+	return withCompaction(res, eng, namespaceID, compactLimit), nil
 }
 
 // withCompaction runs the SSTable merge and folds what it reclaimed into
@@ -562,11 +570,25 @@ func checkpointAndTruncate(
 // any truncation have already succeeded and are the operations the caller
 // asked for; failing them because a space optimization did not run would
 // turn a partial success into a reported failure.
-func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID string) TruncationResult {
-	c, err := eng.CompactBlobStore()
+//
+// limit is compactWhole for maintenance, which merges whatever is there,
+// and a byte bound for close (engine.CompactBlobStoreUpTo), which merges
+// only a store that small.
+func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID string, limit int64) TruncationResult {
+	var c sstable.CompactionResult
+	var err error
+	if limit == compactWhole {
+		c, err = eng.CompactBlobStore()
+	} else {
+		c, err = eng.CompactBlobStoreUpTo(limit)
+	}
 	if err != nil {
 		log.Printf("kdb: namespace %s: could not compact the blob store (%v) - it keeps its current tables", namespaceID, err)
 		return res
+	}
+	if c.Postponed != 0 {
+		log.Printf("kdb: namespace %s: left %d sstables (%s) unmerged at close, over the %d-byte close limit - maintenance or the next open merges them",
+			namespaceID, eng.BlobTableCount(), postponedBytes(c.Postponed), limit)
 	}
 	res.TablesMerged, res.TablesRemoved, res.VersionsDropped = c.Merged, c.Removed, c.Dropped
 	if c.Removed > 0 {
@@ -574,6 +596,16 @@ func withCompaction(res TruncationResult, eng *engine.ServerEngine, namespaceID 
 			namespaceID, c.Merged, c.Removed, c.Dropped)
 	}
 	return res
+}
+
+// compactWhole is withCompaction's limit for a pass that merges every table whatever their size.
+const compactWhole int64 = -1
+
+func postponedBytes(n int64) string {
+	if n < 0 {
+		return "size unknown"
+	}
+	return fmt.Sprintf("%d bytes", n)
 }
 
 // SnapshotCheckpointMissingError refuses to open a namespace bootstrapped from a peer's snapshot

@@ -270,6 +270,21 @@ var errCursorStale = fmt.Errorf("peer sync: the missing commits changed while pa
 // page returns the next page - commits with operations, up to maxBytes estimated (at least one)
 // - and the stubs of archived parents it names. done reports whether it holds all that is left.
 func (c *missingCursor) page(d *dag.InMemoryCommitDag, maxBytes int) (commits []document.Commit, stubs []document.CommitStub, done bool, err error) {
+	commits, _, stubs, done, err = c.pageFrom(d, maxBytes, false)
+	return commits, stubs, done, err
+}
+
+// pagePayloads is page for a host filling a pack (C4 in docs/kdb-memory-cassandra-plan.md): a
+// commit the log holds comes back as its logged payload - the exact bytes the pack carries, whose
+// SHA-256 is the commit's hash - and its commit without operations, which nothing but the
+// payload needs. That spares the host a frame decode, a rehash and a re-encode per commit; a
+// commit the log cannot supply (not logged yet, or no log) is loaded and encoded as before,
+// with a nil payload.
+func (c *missingCursor) pagePayloads(d *dag.InMemoryCommitDag, maxBytes int) (commits []document.Commit, payloads [][]byte, stubs []document.CommitStub, done bool, err error) {
+	return c.pageFrom(d, maxBytes, true)
+}
+
+func (c *missingCursor) pageFrom(d *dag.InMemoryCommitDag, maxBytes int, wantPayloads bool) (commits []document.Commit, payloads [][]byte, stubs []document.CommitStub, done bool, err error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultPageBytes
 	}
@@ -278,19 +293,35 @@ func (c *missingCursor) page(d *dag.InMemoryCommitDag, maxBytes int) (commits []
 	for _, h := range c.order {
 		cm, ok := d.GetCommit(h)
 		if !ok {
-			return nil, nil, false, errCursorStale
+			return nil, nil, nil, false, errCursorStale
 		}
-		ops, err := d.CommitOperations(h)
-		if err != nil {
-			return nil, nil, false, err
+		var payload []byte
+		n := 0
+		if wantPayloads {
+			p, logged, err := d.LoggedPayload(h)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			if logged {
+				payload, cm.Operations, n = p, nil, len(p)
+			}
 		}
-		cm.Operations = ops
-		n := commitSize(cm)
+		if payload == nil {
+			ops, err := d.CommitOperations(h)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			cm.Operations = ops
+			n = commitSize(cm)
+		}
 		if len(commits) > 0 && size+n > maxBytes {
 			break
 		}
 		size += n
 		commits = append(commits, cm)
+		if wantPayloads {
+			payloads = append(payloads, payload)
+		}
 		for _, p := range cm.ParentHashes {
 			if s, ok := c.stubs[p]; ok && !containsStub(stubs, p) {
 				stubs = append(stubs, s)
@@ -298,7 +329,7 @@ func (c *missingCursor) page(d *dag.InMemoryCommitDag, maxBytes int) (commits []
 		}
 	}
 	c.pageLen, c.pageTips, c.pageStubs = len(commits), pageTips(commits), stubs
-	return commits, stubs, c.pageLen == len(c.order), nil
+	return commits, payloads, stubs, c.pageLen == len(c.order), nil
 }
 
 func containsStub(stubs []document.CommitStub, h codec.Hash) bool {

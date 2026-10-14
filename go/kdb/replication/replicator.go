@@ -491,6 +491,10 @@ func (l *peerLoop) cycle() (peersync.V2Result, error) {
 				slog.Info("replication: bootstrapped a namespace from a peer's snapshot", "peer", l.peer.Name,
 					"namespace", ns.Namespace, "root", ns.Snapshot)
 			}
+			if ns.Squashed != "" {
+				slog.Info("replication: caught up by squash", "peer", l.peer.Name, "namespace", ns.Namespace,
+					"head", ns.Squashed, "backlog", ns.SquashedBacklog)
+			}
 			if len(ns.Grafted) > 0 {
 				slog.Info("replication: grafted an unrelated history", "peer", l.peer.Name, "namespace", ns.Namespace, "roots", ns.Grafted)
 			}

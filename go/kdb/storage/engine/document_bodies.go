@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -241,6 +242,45 @@ func (e *ServerEngine) LiveBodiesDurable() bool {
 // retention question, and a full-history namespace pays exactly the same
 // duplication.
 func (e *ServerEngine) CompactBlobStore() (sstable.CompactionResult, error) {
+	return e.CompactBlobStoreContext(context.Background())
+}
+
+// CompactBlobStoreUpTo is CompactBlobStore for a caller that must stay bounded: it merges only
+// when the tables, once the memtable is flushed, hold at most maxBytes, and otherwise merges
+// nothing and reports the bytes it left in Postponed.
+//
+// All or nothing, deliberately, rather than a merge of some of the tables. A merge of every
+// table is the one whose safety the store already argues - tombstones may be dropped because
+// nothing older survives, and their order against the tables left behind cannot matter because
+// none are left - so bounding which merges run, rather than what a merge covers, keeps every one
+// of those arguments as it is. This is what closing a namespace calls: a small namespace is
+// still merged on every close, as it always was, and a large one leaves its merge to the next
+// maintenance pass instead of making close time grow with the namespace.
+func (e *ServerEngine) CompactBlobStoreUpTo(maxBytes int64) (sstable.CompactionResult, error) {
+	if e.blobStore == nil || e.config.IOShim == nil {
+		return sstable.CompactionResult{}, nil
+	}
+	if e.memTable != nil {
+		if _, err := e.memTable.Flush(0); err != nil {
+			return sstable.CompactionResult{}, err
+		}
+	}
+	if len(e.blobStore.Tables()) < sstable.DefaultCompactionTrigger {
+		return sstable.CompactionResult{}, nil
+	}
+	if total, ok := e.blobStore.TableBytes(); !ok || total > maxBytes {
+		if !ok {
+			total = -1
+		}
+		return sstable.CompactionResult{Postponed: total}, nil
+	}
+	return e.CompactBlobStoreContext(context.Background())
+}
+
+// CompactBlobStoreContext is CompactBlobStore that abandons the merge, leaving every table as it
+// was, when ctx is done. For a merge in the background of an open namespace, which closing it
+// cancels rather than waits out.
+func (e *ServerEngine) CompactBlobStoreContext(ctx context.Context) (sstable.CompactionResult, error) {
 	if e.blobStore == nil || e.config.IOShim == nil {
 		return sstable.CompactionResult{}, nil
 	}
@@ -259,7 +299,7 @@ func (e *ServerEngine) CompactBlobStore() (sstable.CompactionResult, error) {
 			return sstable.CompactionResult{}, err
 		}
 	}
-	return e.blobStore.Compact(sstable.DefaultCompactionTrigger, e.reachableBlobKeys())
+	return e.blobStore.CompactContext(ctx, sstable.DefaultCompactionTrigger, e.reachableBlobKeys())
 }
 
 // reachableBlobKeys reports which blob keys are still worth keeping, or

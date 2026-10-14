@@ -1,6 +1,7 @@
 package sstable
 
 import (
+	"context"
 	"fmt"
 	"sort"
 
@@ -63,6 +64,27 @@ func Compact(
 	dropTombstones bool,
 	keep func(codec.Hash) bool,
 ) (Handle, error) {
+	return CompactContext(context.Background(), io, namespaceID, outLevel, inputs, dropTombstones, keep)
+}
+
+// compactionCheckEvery is how many keys a merge handles between looks at its context: often
+// enough that a cancelled merge stops within milliseconds, rarely enough to cost nothing.
+const compactionCheckEvery = 4096
+
+// CompactContext is Compact that gives up when ctx is done, returning ctx's error and writing
+// nothing. Abandoning is always safe: the writer buffers every entry until Finish, so a merge
+// cancelled before Finish has created no file, and its inputs stay exactly as they were. Once
+// Finish has begun it runs to the end - it is the short tail of the merge, and a table half
+// written by a cancellation would be the one outcome worse than finishing.
+func CompactContext(
+	ctx context.Context,
+	io storage.PlatformIOShim,
+	namespaceID string,
+	outLevel int,
+	inputs []Handle,
+	dropTombstones bool,
+	keep func(codec.Hash) bool,
+) (Handle, error) {
 	if len(inputs) == 0 {
 		return Handle{}, fmt.Errorf("sstable: compaction needs at least one input table")
 	}
@@ -87,6 +109,9 @@ func Compact(
 	indexes := make([]map[codec.Hash]BlockHandle, len(inputs))
 	final := make(map[codec.Hash]owner)
 	for i, in := range inputs {
+		if err := ctx.Err(); err != nil {
+			return Handle{}, err
+		}
 		index, err := NewDefaultReader(io, in).Index()
 		if err != nil {
 			// One unreadable table must not cost the whole store its
@@ -106,7 +131,12 @@ func Compact(
 	// repeatable rather than merely successful.
 	writer := NewDefaultWriter(io, namespaceID, outLevel)
 	wrote := 0
-	for _, key := range sortedKeys(final) {
+	for n, key := range sortedKeys(final) {
+		if n%compactionCheckEvery == 0 {
+			if err := ctx.Err(); err != nil {
+				return Handle{}, err
+			}
+		}
 		o := final[key]
 		if keep != nil && !keep(key) {
 			// Unreachable: the caller says nothing can ask for this key

@@ -61,6 +61,9 @@ func TestMemoryProfile(t *testing.T) {
 	opts.Storage.TreeResidentBytes = int64(envOr("KDB_MEMPROFILE_TREE_RESIDENT", 0))
 	// KDB_MEMPROFILE_BOUNDED=1 lets live versions be evicted (StorageOptions.BoundedLiveBodies).
 	opts.Storage.BoundedLiveBodies = os.Getenv("KDB_MEMPROFILE_BOUNDED") == "1"
+	// KDB_MEMPROFILE_NOBGMERGE=1 keeps an open from merging the tables close left behind, so the
+	// open and reads phases measure them as they are (StorageOptions.DisableBackgroundCompaction).
+	opts.Storage.DisableBackgroundCompaction = os.Getenv("KDB_MEMPROFILE_NOBGMERGE") == "1"
 	if m := os.Getenv("KDB_MEMPROFILE_MEMORY"); m != "" {
 		opts.Storage.Graph.Memory = dag.GraphMemory(m) // "go" or "kdb"; ignored by builds without it
 	}
