@@ -147,9 +147,11 @@ identity = SHA-256(0x02 || be64(size) || tree)
   `DeltaMaxBytes` can still cap the size diffed; it is unlimited by default.
   - **Feature flag: store originals only.** `Config.DisableDeltas` (`StorageOptions.DisableAttachmentDeltas`
     in embed; `--attachment-deltas=false` / `KDB_ATTACHMENT_DELTAS` / `attachmentDeltas` on the
-    service, restart) keeps every version whole, as uploaded. Deltas already stored still read.
-    Maintenance leaves the mark where it is while off, so turning deltas back on diffs the
-    versions replaced meanwhile.
+    service, restart) keeps every version whole, as uploaded. Deltas already stored are turned
+    back into whole copies by maintenance (`Store.InflateStep`, in `DeltaStepBytes` steps that
+    resume across passes; reads stay pinned to what they opened). This needs the disk space of the
+    whole copies. Maintenance leaves the mark where it is while off, so turning deltas back on
+    diffs the versions replaced meanwhile.
   - **Chunks first.** A target chunk whose leaf equals the base's leaf at the same offset is a copy
     instruction without reading a byte, so an in-place edit to a TB file costs the chunks touched.
   - **Index only what did not match.** Only base chunks with no equal target chunk at their

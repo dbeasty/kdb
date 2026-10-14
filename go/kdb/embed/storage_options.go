@@ -149,7 +149,8 @@ type StorageOptions struct {
 	AttachmentDeltaStepBytes int64
 	// DisableAttachmentDeltas keeps every attachment version as the original file, whole:
 	// maintenance never re-stores a replaced version as a delta (attachstore.Config.DisableDeltas).
-	// Deltas already stored still read. Off by default - deltas are on.
+	// Maintenance turns deltas already stored back into whole copies. Off by default - deltas
+	// are on.
 	DisableAttachmentDeltas bool
 
 	// CloseCompactionBytes bounds the SSTable merge closing the namespace may do: close merges

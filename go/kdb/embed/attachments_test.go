@@ -590,3 +590,63 @@ func TestAttachmentDeltasOffKeepsOriginalsAndOnCatchesUp(t *testing.T) {
 		}
 	}
 }
+
+// Deltas stored while they were on are turned back into the original files once they are off.
+func TestAttachmentDeltasOffInflatesExistingDeltas(t *testing.T) {
+	root := t.TempDir()
+	opts := embed.FileRuntimeOptions{}
+	opts.Storage.MemoryBudgetBytes = 4 << 20
+	opts.Storage.HistoryMode = storage.HistoryModeFull
+	rt, err := embed.OpenFileRuntimeWithOptions(root, "app", attachNS, schema.None(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { rt.Close() }()
+	id := codec.UUID{MSB: 46}
+	putAttachDoc(t, rt, id, `{}`)
+	r := rand.New(rand.NewSource(46))
+	base := make([]byte, 2<<20+500)
+	r.Read(base)
+	var commits []codec.Hash
+	var versions [][]byte
+	for i := 0; i < 3; i++ {
+		v := append([]byte(nil), base...)
+		copy(v[i*7000:], []byte("a small edit"))
+		c, _, err := rt.PutAttachment(attachNS, id, bytes.NewReader(v), embed.PutAttachmentOptions{Name: "file", Mime: "x/y"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		commits, versions = append(commits, c), append(versions, v)
+	}
+	if res, err := rt.CompactAttachments(attachNS); err != nil || res.Deltas != 2 {
+		t.Fatalf("deltas on: %+v %v", res, err)
+	}
+	rt.Close()
+	opts.Storage.DisableAttachmentDeltas = true
+	opts.Storage.AttachmentDeltaStepBytes = 1 << 20
+	if rt, err = embed.OpenFileRuntimeWithOptions(root, "app", attachNS, schema.None(), opts); err != nil {
+		t.Fatal(err)
+	}
+	inflated := 0
+	for pass := 0; ; pass++ {
+		res, err := rt.CompactAttachments(attachNS)
+		if err != nil || res.Deltas != 0 {
+			t.Fatalf("pass %d: %+v %v", pass, res, err)
+		}
+		inflated += res.Inflated
+		if !res.InflatePending {
+			break
+		}
+		if pass > 50 {
+			t.Fatal("never finished inflating")
+		}
+	}
+	if d, _ := rt.AttachmentStore(attachNS).Deltas(); inflated != 2 || len(d) != 0 {
+		t.Fatalf("inflated %d, still deltas %v", inflated, d)
+	}
+	for i, c := range commits {
+		if got, _ := readAttachment(t, rt, id, c); !bytes.Equal(got, versions[i]) {
+			t.Fatalf("version %d reads wrong after inflating", i)
+		}
+	}
+}

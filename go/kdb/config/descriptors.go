@@ -303,7 +303,7 @@ func serviceSpecs() []settingSpec {
 		{
 			key: "governance.attachmentDeltas", flag: "attachment-deltas", env: "KDB_ATTACHMENT_DELTAS",
 			scope: ScopeProcess, mutability: MutabilityRestart,
-			help:   "re-store a replaced attachment version as a delta against its successor when that saves space. Off, every version is kept as the original file, whole; deltas already stored still read. Applies to namespaces opened after it is set",
+			help:   "re-store a replaced attachment version as a delta against its successor when that saves space. Off, every version is kept as the original file, whole, and maintenance turns deltas already stored back into whole files. Applies to namespaces opened after it is set",
 			value:  yn(func(s ServiceSettings) bool { return s.AttachmentDeltas }),
 			inFile: func(f *ServiceFile) bool { return f.AttachmentDeltas != nil },
 		},

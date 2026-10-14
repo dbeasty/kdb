@@ -526,12 +526,16 @@ type AttachmentMaintenance struct {
 	// DeltaPending: the pass spent its delta budget (attachstore.Config.DeltaStepBytes) before
 	// the replaced versions were all done; the next pass goes on where this one stopped.
 	DeltaPending bool
+	// Inflated: versions stored as deltas turned back into whole copies, because deltas are
+	// disabled (attachstore.Config.DisableDeltas). InflatePending: the pass's budget ran out first.
+	Inflated       int
+	InflatePending bool
 }
 
-// CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll, unless
-// attachstore.Config.DisableDeltas keeps them whole) and deletes the
-// standalone blobs nothing keeps: under AttachmentHistoryLatest anything a branch or tag head does
-// not reference, under AttachmentHistoryAll anything no reachable commit references (an upload
+// CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll; with
+// attachstore.Config.DisableDeltas it instead turns any stored deltas back into whole copies) and
+// deletes the standalone blobs nothing keeps: under AttachmentHistoryLatest anything a branch or
+// tag head does not reference, under AttachmentHistoryAll anything no reachable commit references (an upload
 // that was never committed). Maintain calls it; it is safe to call at any time.
 //
 // Replacements are read from the DAG, so every way a commit arrives counts - PutAttachment, a
@@ -561,8 +565,10 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		if err != nil {
 			return out, err
 		}
-		out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
-		return out, err
+		if out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] }); err != nil || !store.Config().DisableDeltas {
+			return out, err
+		}
+		return out, inflateDeltas(store, &out)
 	}
 	if store.Config().DisableDeltas {
 		// Every version stays whole. The mark stays where it is, so turning deltas back on
@@ -571,8 +577,10 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		if err != nil {
 			return out, err
 		}
-		out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
-		return out, err
+		if out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] }); err != nil {
+			return out, err
+		}
+		return out, inflateDeltas(store, &out)
 	}
 	d, err := rt.inMemoryDAG()
 	if err != nil {
@@ -608,6 +616,39 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 		return out, deltaErr
 	}
 	return out, err
+}
+
+// inflateDeltas turns versions stored as deltas back into whole copies, within the pass's budget
+// (attachstore.Config.DeltaStepBytes): with deltas disabled every version is the original file. A
+// version gone missing or corrupt is left as it is.
+func inflateDeltas(store *attachstore.Store, out *AttachmentMaintenance) error {
+	deltas, err := store.Deltas()
+	if err != nil {
+		return err
+	}
+	budget := store.Config().DeltaStepBytes
+	for _, h := range deltas {
+		if budget <= 0 {
+			out.InflatePending = true
+			return nil
+		}
+		done, used, err := store.InflateStep(h, budget)
+		budget -= used
+		if errors.Is(err, attachstore.ErrNotFound) || errors.Is(err, attachstore.ErrCorrupt) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !done {
+			out.InflatePending = true
+			return nil
+		}
+		if used > 0 {
+			out.Inflated++
+		}
+	}
+	return nil
 }
 
 // deltaReplaced re-stores, for each put in changes, the version it replaced in its commit's first

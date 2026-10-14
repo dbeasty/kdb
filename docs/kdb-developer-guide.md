@@ -1585,7 +1585,7 @@ Settings carry a mutability: *restart*, *live* (changeable through the control p
 | `--maintenance-interval` | `KDB_MAINTENANCE_INTERVAL` | `maintenanceInterval` | 5m | live | checkpoint/reclaim/compact tick (0 = at close only) |
 | `--maintenance-sweep` | `KDB_MAINTENANCE_SWEEP` | `maintenanceSweep` | 30m | live | max time an idle namespace goes without a pass |
 | `--attachment-upload-grace` | `KDB_ATTACHMENT_UPLOAD_GRACE` | `attachmentUploadGrace` | 1h | restart | how long a finished, not yet committed attachment upload is kept from GC |
-| `--attachment-deltas` | `KDB_ATTACHMENT_DELTAS` | `attachmentDeltas` | true | restart | false keeps every attachment version as the original file, whole (existing deltas still read) |
+| `--attachment-deltas` | `KDB_ATTACHMENT_DELTAS` | `attachmentDeltas` | true | restart | false keeps every attachment version as the original file, whole, and maintenance turns existing deltas back into whole files |
 | `--attachment-delta-step-mb` | `KDB_ATTACHMENT_DELTA_STEP_MB` | `attachmentDeltaStepMb` | 4096 | restart | how many MiB one maintenance pass reads diffing replaced attachment versions into deltas; larger versions take several passes |
 | `--maintenance-max-defer` | `KDB_MAINTENANCE_MAX_DEFER` | `maintenanceMaxDefer` | 6 | live | ticks write load may postpone a pass |
 | `--control-addr` | `KDB_CONTROL_ADDR` | `controlAddr` | off | restart | control-plane HTTP API + UI (authenticated) |
