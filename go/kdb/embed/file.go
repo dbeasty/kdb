@@ -327,8 +327,13 @@ func (h *Host) openNamespace(
 	// releases the directory lock (kdb-spec-layer13 Component 47 §2.4/§4.5) - previously nothing
 	// retained handle past this function returning, so even a clean process exit never flushed
 	// the delta writer, sealed its segment, or reached ServerEngine.Close()'s final WAL sync.
+	// Set at the end of the open, once nothing can fail it; see startBackgroundCompaction.
+	var bgCompaction *backgroundCompaction
 	storageClose := func() error {
 		var firstErr error
+		// First: a merge still running would otherwise hold the store's tables through the
+		// shutdown below. Cancelling it costs nothing - it has written nothing until it finishes.
+		bgCompaction.stop()
 		// Drain the commit log first: under DurabilityAsync there can be
 		// records queued but not yet written, and sealing the segment out from
 		// under them would drop acknowledged commits on a clean shutdown.
@@ -349,7 +354,8 @@ func (h *Host) openNamespace(
 			// After the seal, so no segment can gain another commit and the
 			// checkpoint can claim the newest one - see checkpointOnClose.
 			checkpointOnClose(d, store, handle.DeltaReader(), io, namespaceID,
-				liveRetention(store, opts.Storage.Retain), opts.Storage.DisableCheckpoints)
+				liveRetention(store, opts.Storage.Retain), opts.Storage.DisableCheckpoints,
+				closeCompactionLimit(opts.Storage.CloseCompactionBytes))
 		}
 		if err := handle.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -382,7 +388,7 @@ func (h *Host) openNamespace(
 			res, err := checkpointAndTruncate(
 				d, store, r, io, namespaceID, through,
 				rt.withPeerFloor(liveRetention(store, opts.Storage.Retain), now), now, opts.Storage.DisableCheckpoints,
-				liveReclaim(store))
+				liveReclaim(store), compactWhole)
 			// The maintenance pass is where the graph file catches up with the commits appended
 			// since it was written; a no-op until the resident tier passes the rebuild threshold.
 			if _, gerr := d.MaybeRebuildGraphFile(); gerr != nil {
@@ -409,6 +415,9 @@ func (h *Host) openNamespace(
 	var budget storage.BudgetParticipant
 	if eng != nil {
 		budget = namespaceBudget{eng: eng, dag: d, pinnedOps: opts.Storage.CommitOpsBytes > 0}
+	}
+	if eng != nil && !opts.ReadOnly && !opts.Storage.DisableBackgroundCompaction {
+		bgCompaction = startBackgroundCompaction(eng, namespaceID)
 	}
 	return &namespaceEntry{rt: rt, close: storageClose}, budget, nil
 }
