@@ -111,9 +111,15 @@ private suspend fun materializeSingleCommit(
             is KdbOp.Write ->
                 runtime.storage.putDocument(namespaceId, KdbDocument(op.docId, op.patch))
             is KdbOp.Delete -> runtime.storage.deleteDocument(namespaceId, op.docId)
-            // Attachments are not in the document tree; their table is the commit's attachment root.
+            // Attachments are not in the document tree: the DAG derives their table (below).
             is KdbOp.FileWrite, is KdbOp.SchemaMigration, is KdbOp.AttachmentPut, is KdbOp.AttachmentDelete -> {}
         }
+    }
+    // A commit carrying attachments has its table derived and checked against its recorded root now,
+    // so a synced commit whose attachment root does not follow from its history fails here rather
+    // than on the first attachment read.
+    if (commit.attachmentTreeHash != null) {
+        runtime.dag.attachmentTableAt(commit.hash)
     }
     runtime.storage.commitTree(namespaceId, parentTree)
     // See commitViaEngine: document indexes exist on schemaless namespaces too (§9.2).

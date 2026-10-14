@@ -117,5 +117,6 @@ public fun openFileRuntime(
         policyRegistry = policies,
         indexBlobs = blobs,
         indexStoreFactory = storeFactory,
+        attachmentShim = io,
     )
 }
