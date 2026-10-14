@@ -565,3 +565,39 @@ func withProjectedAttachments(env IngestEnv, page *wire.ProjectPageMessage) erro
 	}
 	return nil
 }
+
+// AttachmentsUnsupportedError refuses to send a peer of an older build commits that carry
+// attachments: it cannot decode them. Upgrade the peer; until then the namespace does not sync
+// with it (rolling upgrades work as long as no attachment is written before every node runs a build
+// that has them).
+type AttachmentsUnsupportedError struct {
+	Namespace string
+	Commit    string
+}
+
+func (e *AttachmentsUnsupportedError) Error() string {
+	return fmt.Sprintf("peer sync: namespace %s has attachments (commit %s) and the peer's build does not support them - upgrade it", e.Namespace, e.Commit)
+}
+
+// carriesAttachments reports the first commit an attachment-unaware peer could not decode.
+func carriesAttachments(commits []document.Commit) (codec.Hash, bool) {
+	for _, c := range commits {
+		if c.AttachmentTreeHash != nil || document.TouchesAttachments(c.Operations, false) {
+			return c.Hash, true
+		}
+	}
+	return codec.Hash{}, false
+}
+
+func (h *V2Host) checkPeerAttachments(ns string, commits []document.Commit) error {
+	h.mu.Lock()
+	ok := h.peerAttachments
+	h.mu.Unlock()
+	if ok {
+		return nil
+	}
+	if c, bad := carriesAttachments(commits); bad {
+		return &AttachmentsUnsupportedError{Namespace: ns, Commit: c.Hex()}
+	}
+	return nil
+}

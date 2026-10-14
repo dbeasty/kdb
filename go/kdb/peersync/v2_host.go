@@ -84,6 +84,9 @@ type V2Host struct {
 	helloAt time.Time
 	// zstdPack: the session negotiated SyncCapZstdPack, so pages go to the peer compressed.
 	zstdPack bool
+	// peerAttachments: the peer understands attachments (SyncCapAttachments). A peer that does not
+	// cannot decode a commit that carries them, and is refused one (attachments.go).
+	peerAttachments bool
 	granted  map[string]bool
 	// access is each granted namespace's direction limit: "" both, wire.AccessPull or AccessPush.
 	access map[string]string
@@ -255,6 +258,9 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := h.checkPeerAttachments(m.Namespace, commits); err != nil {
+			return nil, err
+		}
 		h.mu.Lock()
 		peer, since, zstd := h.peer, h.helloAt, h.zstdPack
 		h.mu.Unlock()
@@ -287,6 +293,9 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}
 		page, err := snapshotPage(env, at, m.After, m.MaxBytes)
 		if err != nil {
+			return nil, err
+		}
+		if err := h.checkPeerAttachments(m.Namespace, []document.Commit{page.Commit}); err != nil {
 			return nil, err
 		}
 		page.H = header(wire.MsgSnapshotPage, m.H.CorrelationID)
@@ -462,6 +471,7 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 	caps := intersect(h.capabilities(), m.Capabilities)
 	h.mu.Lock()
 	h.zstdPack = slices.Contains(caps, wire.SyncCapZstdPack)
+	h.peerAttachments = slices.Contains(caps, wire.SyncCapAttachments)
 	h.mu.Unlock()
 	return wire.SyncHelloAckMessage{
 		H: header(wire.MsgSyncHelloAck, m.H.CorrelationID), Accepted: true,

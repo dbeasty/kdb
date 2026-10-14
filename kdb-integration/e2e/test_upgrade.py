@@ -552,3 +552,64 @@ def test_rollback_after_a_crash_is_safe_once_this_build_recovers_and_stops_clean
         n.restart(service_bin=PREV)
     acked.check(c, "rolled back to v0.6.2 after recovering on this build")
     converge(c, acked, "v0.6.2 after a recovered rollback")
+
+
+# -- attachments (docs/kdb-attachments-plan.md) ----------------------------------------------
+
+def test_attachments_wait_for_every_node_to_be_upgraded(make_cluster, tmp_path):
+    """A mixed mesh syncs as long as no attachment exists. Once an upgraded node writes one, the
+    older node is refused those commits with a typed error naming the upgrade - it keeps its head,
+    keeps serving, and does not crash on a commit it cannot decode - and once it is upgraded the
+    mesh converges with the attachment's bytes on every node."""
+    import hashlib
+    import os
+
+    from server_fixtures import attach, read_attachment
+
+    c = make_cluster(2, service_bins=[PREV, PREV])
+    acked = Acked()
+    doc = owned_docs(0, 1)[0]
+    put(c.nodes[0], doc, {"id": doc, "title": "report"})
+    converge(c, acked, "both old")
+    c.switch_binary(0, NEW)
+    converge(c, acked, "n0 upgraded, no attachments yet")
+
+    data = os.urandom(2 * 1024 * 1024 + 7)
+    path = tmp_path / "a.bin"
+    path.write_bytes(data)
+    attach(c.nodes[0], doc, "a.bin", str(path))
+    old_head = head(c.nodes[1])
+    time.sleep(4)  # several sync rounds
+    assert c.nodes[1].proc.poll() is None, "the old node died on attachment commits"
+    assert head(c.nodes[1]) == old_head, "the old node took in commits it cannot decode"
+    assert documents(c.nodes[1]), "the old node stopped serving"
+
+    c.switch_binary(1, NEW)
+    converge(c, acked, "all new")
+    for n in c.nodes:
+        got = read_attachment(n, doc, "a.bin")
+        assert got.get("sha256") == hashlib.sha256(data).hexdigest(), (n.binary, got)
+
+
+def test_rollback_after_attachments_is_refused_by_the_old_binary(tmp_path):
+    """Downgrade is not supported, and attachments make it impossible: commits carrying them do
+    not decode on an older build. What matters is that the old binary refuses to open the data
+    dir rather than serving it with the attachment commits silently missing. (Its message suggests
+    `kdb-inspect repair-segments` - which must NOT be run with the old build on this log; see
+    docs/kdb-user-guide.md, Attachments.)"""
+    import os
+
+    from server_fixtures import KdbServer, attach
+
+    a = KdbServer().start()
+    try:
+        doc = owned_docs(0, 1)[0]
+        put(a, doc, {"id": doc})
+        p = tmp_path / "x"
+        p.write_bytes(os.urandom(1024 * 1024 + 1))
+        attach(a, doc, "x", str(p))
+        a.stop()
+        with pytest.raises(RuntimeError, match="exited early"):
+            a.restart(service_bin=PREV)
+    finally:
+        a.stop()

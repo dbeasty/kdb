@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/limidus/kdb/go/kdb/auth"
@@ -104,4 +105,51 @@ func mustUUIDString(t *testing.T, s string) codec.UUID {
 		t.Fatal(err)
 	}
 	return id
+}
+
+// A peer of an older build cannot decode a commit that carries attachments: it is refused them with
+// a typed error naming the upgrade, in either direction, and nothing is half-synced.
+func TestV2RefusesAttachmentsToAPeerWithoutThem(t *testing.T) {
+	const ns = "app/data"
+	withoutAttachments := func(caps []string) []string {
+		var out []string
+		for _, c := range caps {
+			if c != wire.SyncCapAttachments {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	newCaps := peersync.ClientCapabilities
+	defer func() { peersync.ClientCapabilities = newCaps }()
+
+	a := newNamespaceSetRuntimes(t, ns)[ns]
+	b := newNamespaceSetRuntimes(t, ns)[ns]
+	x := mustRandomUUID(t)
+	if _, err := b.Upsert(ns, x, `{"on":"b"}`, auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.Runtime.PutAttachment(ns, x, bytes.NewReader([]byte("new")), embed.PutAttachmentOptions{Name: "n"}); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := ListenPeerSync("tcp://127.0.0.1:0?bind=true", b, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	// a pretends to be an older build: it does not offer the capability.
+	peersync.ClientCapabilities = withoutAttachments(newCaps)
+	res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(core.DefaultConnectOptions()), peersync.V2ClientConfig{
+		NodeID: a.NodeID.String() + "-old", PeerURI: "tcp://" + ln.Addr().String(), Namespaces: []string{ns}, Local: a.PeerNamespaces(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Namespaces) != 1 || res.Namespaces[0].Err == nil || !strings.Contains(res.Namespaces[0].Err.Error(), "upgrade") {
+		t.Fatalf("an old peer was not refused attachment commits: %+v", res.Namespaces)
+	}
+	if a.dag.HasAttachments() {
+		t.Fatal("the old peer took in attachment commits")
+	}
 }

@@ -531,6 +531,21 @@ def sql_exec(server: KdbServer, sql: str, **kw) -> subprocess.CompletedProcess:
                   "--sql", sql, **kw)
 
 
+def attach(server: KdbServer, doc_id: str, name: str, path: str, **kw) -> dict:
+    """Attaches the file at path to doc_id under name (the Go client's PutAttachment)."""
+    r = helper("attach", "--addr", server.sql_addr, "--namespace", server.namespace,
+               "--doc-id", doc_id, "--name", name, "--file", path, **kw)
+    return json.loads(r.stdout)
+
+
+def read_attachment(server: KdbServer, doc_id: str, name: str, **kw) -> dict:
+    """{"sha256", "size", "hash"} of doc_id's attachment name, read whole and verified, or
+    {"missing": True}."""
+    r = helper("read-attachment", "--addr", server.sql_addr, "--namespace", server.namespace,
+               "--doc-id", doc_id, "--name", name, **kw)
+    return json.loads(r.stdout)
+
+
 def sql_query(server: KdbServer, sql: str, **kw) -> list[list[str]]:
     """Returns the raw string rows of a SELECT."""
     r = helper("query", "--addr", server.sql_addr, "--namespace", server.namespace,

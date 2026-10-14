@@ -595,6 +595,12 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 			if err != nil {
 				return err
 			}
+			if !containsString(c.caps, wire.SyncCapAttachments) {
+				if bad, ok := carriesAttachments(commits); ok {
+					res.RefErrors[ref.key()] = (&AttachmentsUnsupportedError{Namespace: remote.Namespace, Commit: bad.Hex()}).Error()
+					break
+				}
+			}
 			if err := c.uploadBlobs(env, remote.Namespace, commits); err != nil {
 				return err
 			}
