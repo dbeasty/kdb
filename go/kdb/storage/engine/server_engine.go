@@ -451,6 +451,25 @@ func (e *ServerEngine) WriteKeyedBlob(hash codec.Hash, bytes []byte) error {
 	return nil
 }
 
+// SpillsBlobs reports whether this engine's blob store writes out to SSTables - what
+// WriteUnloggedBlob needs to keep memory bounded. An engine without platform I/O keeps every blob
+// in its memtable.
+func (e *ServerEngine) SpillsBlobs() bool {
+	return e.memTable != nil && e.config.IOShim != nil
+}
+
+// WriteUnloggedBlob puts bytes under key in the blob store without a WAL record: for data its
+// writer can rebuild (an attachment set, document.AttachmentSetStore), which a crash before the
+// memtable flushes loses harmlessly. It flushes the memtable when that is due, like a commit.
+func (e *ServerEngine) WriteUnloggedBlob(key codec.Hash, bytes []byte) error {
+	if e.memTable == nil {
+		return errors.New("engine: no blob store")
+	}
+	e.memTable.Put(key, bytes)
+	e.maybeFlushMemtable()
+	return nil
+}
+
 func (e *ServerEngine) ReadBlob(contentHash codec.Hash) ([]byte, error) {
 	b := e.memTable.Get(contentHash)
 	if b == nil {

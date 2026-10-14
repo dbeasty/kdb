@@ -24,8 +24,9 @@ import (
 // Kotlin's AttachmentBlobStore (kdb-embed) writes and reads this package's layout segment for
 // segment. These tests pin that both ways:
 //
-//   - golden bytes: a pointer of each kind and a delta, which Kotlin's AttachmentStoreGoldenTest
-//     must encode identically;
+//   - golden bytes: a pointer of each kind and a format-1 delta (the format Kotlin writes; Go
+//     writes format 2 and reads both), which Kotlin's AttachmentBlobStoreTest must encode
+//     identically;
 //   - fixture stores: one store built by each implementation from the same recipe (fixtureRecipe;
 //     Kotlin's GoAttachStoreFixtureTest has the twin), dumped segment by segment. Each side opens
 //     the other's dump, reads every blob back, and collects without losing anything.
@@ -96,6 +97,10 @@ func buildFixture(t *testing.T) *storio.InMemoryPlatformIO {
 		t.Fatalf("StoreAsDelta: %v %v", did, err)
 	}
 	if err := s.SetMark(fixtureMark()); err != nil {
+		t.Fatal(err)
+	}
+	// The reference index (GC's note, r-<gen>): Kotlin does not use it, but must leave it alone.
+	if err := s.SetRefIndex(RefIndex{Heads: fixtureMark(), Refs: SortHashes(append([]codec.Hash(nil), hashes...))}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Collect(func(codec.Hash) bool { return true }); err != nil { // retire the replaced pointer
@@ -193,7 +198,7 @@ func loadDump(t *testing.T, path string) *storio.InMemoryPlatformIO {
 }
 
 // checkFixture opens a store built from the recipe and reads it all back.
-func checkFixture(t *testing.T, shim *storio.InMemoryPlatformIO) {
+func checkFixture(t *testing.T, shim *storio.InMemoryPlatformIO, wantFramed bool) {
 	t.Helper()
 	before, _ := shim.ListSegments(fixtureNS)
 	s := New(shim, fixtureNS, nil, Config{})
@@ -229,6 +234,9 @@ func checkFixture(t *testing.T, shim *storio.InMemoryPlatformIO) {
 	if !p.delta {
 		t.Fatal("the replaced version is not stored as a delta")
 	}
+	if p.framed != wantFramed {
+		t.Fatalf("the delta is framed=%v, want %v (Go writes format 2, Kotlin format 1)", p.framed, wantFramed)
+	}
 	if mark, _ := s.Mark(); len(mark) != 2 || mark[0] != fixtureMark()[0] || mark[1] != fixtureMark()[1] {
 		t.Fatalf("mark %v", mark)
 	}
@@ -246,11 +254,11 @@ func TestGoFixtureForKotlin(t *testing.T) {
 	if os.Getenv("KDB_WRITE_FIXTURES") == "1" {
 		dumpSegments(t, buildFixture(t), path)
 	}
-	checkFixture(t, loadDump(t, path)) // what Kotlin reads stays readable here
+	checkFixture(t, loadDump(t, path), true) // what Kotlin reads stays readable here
 }
 
 func TestKotlinFixtureReadsInGo(t *testing.T) {
-	checkFixture(t, loadDump(t, filepath.Join("testdata", "kotlin-store.dump.gz")))
+	checkFixture(t, loadDump(t, filepath.Join("testdata", "kotlin-store.dump.gz")), false)
 }
 
 // Golden encodings Kotlin's AttachmentStoreGoldenTest reproduces byte for byte.
@@ -266,7 +274,7 @@ func TestKotlinGoldenEncodings(t *testing.T) {
 	}
 	newer := fixtureText(400000, 7)
 	var d []byte
-	if err := encodeDelta(memSource(newer), memSource(fixtureEdit(newer)), func(b []byte) error { d = append(d, b...); return nil }); err != nil {
+	if err := encodeDeltaV1(memSource(newer), memSource(fixtureEdit(newer)), func(b []byte) error { d = append(d, b...); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(d)

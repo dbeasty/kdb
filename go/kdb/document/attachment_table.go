@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
-	"sync"
 	"unicode/utf8"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -27,7 +26,10 @@ import (
 // The table reuses the document trie as its Merkle structure, mapping each document id to the
 // hash of the document's attachment set (AttachmentSet.Hash). Changing one attachment re-hashes
 // that document's set and O(depth) trie nodes, and shares every other node with the parent's
-// table. Sets sit in a pool keyed by that hash, shared by every version of the table.
+// table. Sets sit in a pool keyed by that hash, shared by every version of the table
+// (AttachmentSetPool, attachment_set_pool.go); a pool backed by a store keeps only some in memory,
+// so a lookup can fail - reading the store, or finding it disagrees with the trie - and every read
+// that needs a set returns that error rather than an empty or different set.
 
 // MaxAttachmentNameBytes bounds an attachment name.
 const MaxAttachmentNameBytes = 255
@@ -156,34 +158,41 @@ func (s AttachmentSet) without(id codec.UUID) (AttachmentSet, bool) {
 // Tables are values: Put and Delete return a new table and leave the receiver as it was.
 type AttachmentTable struct {
 	tree  DocumentTree // docID -> AttachmentSet.Hash
-	sets  *setPool
+	sets  *AttachmentSetPool
 	total int // attachments across all documents
 }
 
-// setPool holds every AttachmentSet any version of a table has used, by hash. It only grows.
-type setPool struct {
-	mu   sync.RWMutex
-	sets map[codec.Hash]AttachmentSet
-}
-
-func (p *setPool) put(s AttachmentSet) codec.Hash {
-	h := s.Hash()
-	p.mu.Lock()
-	p.sets[h] = s
-	p.mu.Unlock()
-	return h
-}
-
-func (p *setPool) get(h codec.Hash) (AttachmentSet, bool) {
-	p.mu.RLock()
-	s, ok := p.sets[h]
-	p.mu.RUnlock()
-	return s, ok
-}
-
-// EmptyAttachmentTable returns a table with no attachments.
+// EmptyAttachmentTable returns a table with no attachments, over a pool of its own that keeps
+// every set in memory. A DAG derives its tables from its own pool's Empty instead.
 func EmptyAttachmentTable() AttachmentTable {
-	return AttachmentTable{tree: EmptyDocumentTree(), sets: &setPool{sets: map[codec.Hash]AttachmentSet{}}}
+	return NewAttachmentSetPool(nil, 0).Empty()
+}
+
+// Pool is the pool the table's sets are in; nil for the zero table.
+func (t AttachmentTable) Pool() *AttachmentSetPool { return t.sets }
+
+// InPool returns the same table with its sets in p: t itself when they already are, otherwise a
+// copy whose every set has been put into p (reading each from t's pool).
+func (t AttachmentTable) InPool(p *AttachmentSetPool) (AttachmentTable, error) {
+	if t.Documents() == 0 {
+		return p.Empty(), nil
+	}
+	if t.sets == p {
+		return t, nil
+	}
+	var err error
+	t.tree.Walk(func(_ codec.UUID, h codec.Hash) bool {
+		var s AttachmentSet
+		if s, err = t.sets.get(h); err != nil {
+			return false
+		}
+		_, err = p.put(s)
+		return err == nil
+	})
+	if err != nil {
+		return AttachmentTable{}, err
+	}
+	return AttachmentTable{tree: t.tree, sets: p, total: t.total}, nil
 }
 
 func (t AttachmentTable) init() AttachmentTable {
@@ -214,34 +223,49 @@ func (t AttachmentTable) Root() *codec.Hash {
 	return &h
 }
 
-// List returns docID's attachments, sorted by name; nil when it has none.
-func (t AttachmentTable) List(docID codec.UUID) AttachmentSet {
+// List returns docID's attachments, in ID order; nil when it has none. The error is the pool's:
+// a set it could not read back, or read back wrong.
+func (t AttachmentTable) List(docID codec.UUID) (AttachmentSet, error) {
 	if t.Documents() == 0 {
-		return nil
+		return nil, nil
 	}
 	h, ok := t.tree.HashFor(docID)
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	s, _ := t.sets.get(h)
-	return s
+	s, err := t.sets.get(h)
+	if err != nil {
+		return nil, fmt.Errorf("attachments of %s: %w", docID, err)
+	}
+	return s, nil
 }
 
 // Count is how many attachments docID has.
-func (t AttachmentTable) Count(docID codec.UUID) int { return len(t.List(docID)) }
+func (t AttachmentTable) Count(docID codec.UUID) (int, error) {
+	s, err := t.List(docID)
+	return len(s), err
+}
 
 // Get returns docID's attachment id.
-func (t AttachmentTable) Get(docID, id codec.UUID) (Attachment, bool) {
-	s := t.List(docID)
-	if i, ok := s.find(id); ok {
-		return s[i], true
+func (t AttachmentTable) Get(docID, id codec.UUID) (Attachment, bool, error) {
+	s, err := t.List(docID)
+	if err != nil {
+		return Attachment{}, false, err
 	}
-	return Attachment{}, false
+	if i, ok := s.find(id); ok {
+		return s[i], true, nil
+	}
+	return Attachment{}, false, nil
 }
 
 // GetByName returns docID's attachment called name.
-func (t AttachmentTable) GetByName(docID codec.UUID, name string) (Attachment, bool) {
-	return t.List(docID).ByName(name)
+func (t AttachmentTable) GetByName(docID codec.UUID, name string) (Attachment, bool, error) {
+	s, err := t.List(docID)
+	if err != nil {
+		return Attachment{}, false, err
+	}
+	a, ok := s.ByName(name)
+	return a, ok, nil
 }
 
 func (t AttachmentTable) setDoc(docID codec.UUID, before, after AttachmentSet) (AttachmentTable, error) {
@@ -250,7 +274,10 @@ func (t AttachmentTable) setDoc(docID codec.UUID, before, after AttachmentSet) (
 	if len(after) == 0 {
 		tree, err = t.tree.Without(docID)
 	} else {
-		tree, err = t.tree.With(docID, t.sets.put(after))
+		var h codec.Hash
+		if h, err = t.sets.put(after); err == nil {
+			tree, err = t.tree.With(docID, h)
+		}
 	}
 	if err != nil {
 		return t, err
@@ -274,7 +301,10 @@ func (t AttachmentTable) Put(docID codec.UUID, a Attachment) (AttachmentTable, e
 		return t, fmt.Errorf("attachment %s of %s: unknown content hash scheme %d", a.ID, docID, a.Scheme)
 	}
 	t = t.init()
-	before := t.List(docID)
+	before, err := t.List(docID)
+	if err != nil {
+		return t, err
+	}
 	after, err := before.with(a)
 	if err != nil {
 		return t, err
@@ -285,7 +315,10 @@ func (t AttachmentTable) Put(docID codec.UUID, a Attachment) (AttachmentTable, e
 // Delete returns the table without docID's attachment id. Deleting one that is not there is a
 // no-op.
 func (t AttachmentTable) Delete(docID, id codec.UUID) (AttachmentTable, error) {
-	before := t.List(docID)
+	before, err := t.List(docID)
+	if err != nil {
+		return t, err
+	}
 	after, found := before.without(id)
 	if !found {
 		return t, nil
@@ -295,7 +328,10 @@ func (t AttachmentTable) Delete(docID, id codec.UUID) (AttachmentTable, error) {
 
 // DeleteAll returns the table without any of docID's attachments.
 func (t AttachmentTable) DeleteAll(docID codec.UUID) (AttachmentTable, error) {
-	before := t.List(docID)
+	before, err := t.List(docID)
+	if err != nil {
+		return t, err
+	}
 	if len(before) == 0 {
 		return t, nil
 	}
@@ -329,15 +365,17 @@ func (t AttachmentTable) SetHash(docID codec.UUID) (codec.Hash, bool) {
 }
 
 // Walk visits every attachment, documents in no particular order and each document's in ID
-// order, until visit returns false.
-func (t AttachmentTable) Walk(visit func(docID codec.UUID, a Attachment) bool) {
+// order, until visit returns false. It stops at, and returns, a set the pool cannot give back.
+func (t AttachmentTable) Walk(visit func(docID codec.UUID, a Attachment) bool) error {
 	if t.Documents() == 0 {
-		return
+		return nil
 	}
+	var err error
 	t.tree.Walk(func(id codec.UUID, h codec.Hash) bool {
-		s, ok := t.sets.get(h)
-		if !ok {
-			return true
+		var s AttachmentSet
+		if s, err = t.sets.get(h); err != nil {
+			err = fmt.Errorf("attachments of %s: %w", id, err)
+			return false
 		}
 		for _, a := range s {
 			if !visit(id, a) {
@@ -346,6 +384,7 @@ func (t AttachmentTable) Walk(visit func(docID codec.UUID, a Attachment) bool) {
 		}
 		return true
 	})
+	return err
 }
 
 // Apply returns the table after ops: an AttachmentPutOp creates or replaces one attachment, an
@@ -391,7 +430,7 @@ func TouchesAttachments(ops []Op, tableNonEmpty bool) bool {
 // uvarint attachment count and its attachments (doc id 16 | attachment id 16 | name length
 // uvarint | name | scheme 1 | content hash 32 | size u64 big-endian | mime length uvarint | mime).
 // Empty tables are skipped.
-func AppendPackedAttachmentTables(dst []byte, tables []AttachmentTable) []byte {
+func AppendPackedAttachmentTables(dst []byte, tables []AttachmentTable) ([]byte, error) {
 	n := 0
 	for _, t := range tables {
 		if t.Len() > 0 {
@@ -404,7 +443,7 @@ func AppendPackedAttachmentTables(dst []byte, tables []AttachmentTable) []byte {
 			continue
 		}
 		dst = binary.AppendUvarint(dst, uint64(t.Len()))
-		t.Walk(func(id codec.UUID, a Attachment) bool {
+		err := t.Walk(func(id codec.UUID, a Attachment) bool {
 			dst = binary.BigEndian.AppendUint64(dst, uint64(id.MSB))
 			dst = binary.BigEndian.AppendUint64(dst, uint64(id.LSB))
 			dst = binary.BigEndian.AppendUint64(dst, uint64(a.ID.MSB))
@@ -418,12 +457,22 @@ func AppendPackedAttachmentTables(dst []byte, tables []AttachmentTable) []byte {
 			dst = append(dst, a.Mime...)
 			return true
 		})
+		if err != nil {
+			return nil, err
+		}
 	}
-	return dst
+	return dst, nil
 }
 
-// ParsePackedAttachmentTables reverses AppendPackedAttachmentTables.
+// ParsePackedAttachmentTables reverses AppendPackedAttachmentTables, each table over a pool of its
+// own.
 func ParsePackedAttachmentTables(packed []byte) ([]AttachmentTable, error) {
+	return ParsePackedAttachmentTablesInto(nil, packed)
+}
+
+// ParsePackedAttachmentTablesInto is ParsePackedAttachmentTables with every table over pool (each
+// over its own when pool is nil).
+func ParsePackedAttachmentTablesInto(pool *AttachmentSetPool, packed []byte) ([]AttachmentTable, error) {
 	if len(packed) == 0 {
 		return nil, nil
 	}
@@ -495,6 +544,9 @@ func ParsePackedAttachmentTables(packed []byte) ([]AttachmentTable, error) {
 			byDoc[id] = set
 		}
 		t := EmptyAttachmentTable()
+		if pool != nil {
+			t = pool.Empty()
+		}
 		for _, id := range order {
 			if t, err = t.setDoc(id, nil, byDoc[id]); err != nil {
 				return nil, err

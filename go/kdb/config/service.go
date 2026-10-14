@@ -82,6 +82,14 @@ type ServiceSettings struct {
 	// is kept before maintenance may collect it: the longest a client may take between
 	// uploading an attachment and committing it (embed.StorageOptions.AttachmentUploadGrace).
 	AttachmentUploadGrace time.Duration
+	// AttachmentDeltaStepMB bounds the work, in MiB read, one maintenance pass spends diffing
+	// replaced attachment versions into deltas; a larger version is diffed over several passes
+	// (embed.StorageOptions.AttachmentDeltaStepBytes). 0 uses the default, 4 GiB.
+	AttachmentDeltaStepMB int
+	// AttachmentDeltas re-stores a replaced attachment version as a delta against its successor
+	// when that is worth it. Off, every version is kept as the original file, whole
+	// (embed.StorageOptions.DisableAttachmentDeltas). On by default.
+	AttachmentDeltas bool
 	// MaintenanceMaxDefer is how many consecutive ticks write load may postpone a due
 	// maintenance pass before it runs anyway. Negative never forces, which risks a busy server
 	// never reclaiming; 0 uses the embed default.
@@ -154,6 +162,7 @@ func DefaultServiceSettings() ServiceSettings {
 		MaintenanceSweep:    30 * time.Minute,
 		// Comfortably above any upload->commit gap a client takes; see AttachmentUploadGrace.
 		AttachmentUploadGrace: time.Hour,
+		AttachmentDeltas:      true,
 		MaintenanceMaxDefer:   6,
 		// Off by default: a browser-reachable control plane is a deliberate exposure decision,
 		// exactly as WSAddr is.
@@ -212,6 +221,8 @@ type ServiceFile struct {
 	MaintenanceSweep       *string         `json:"maintenanceSweep"`
 	MaintenanceMaxDefer    *int            `json:"maintenanceMaxDefer"`
 	AttachmentUploadGrace  *string         `json:"attachmentUploadGrace"`
+	AttachmentDeltaStepMB  *int            `json:"attachmentDeltaStepMb"`
+	AttachmentDeltas       *bool           `json:"attachmentDeltas"`
 	TLS                    *ServiceTLSFile `json:"tls"`
 	LogLevel               *string         `json:"logLevel"`
 	LogFormat              *string         `json:"logFormat"`
@@ -315,6 +326,8 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		if err := setDurationIf(&s.AttachmentUploadGrace, file.AttachmentUploadGrace, "attachmentUploadGrace"); err != nil {
 			return s, err
 		}
+		setIf(&s.AttachmentDeltaStepMB, file.AttachmentDeltaStepMB)
+		setIf(&s.AttachmentDeltas, file.AttachmentDeltas)
 		if file.MaintenanceMaxDefer != nil {
 			s.MaintenanceMaxDefer = *file.MaintenanceMaxDefer
 		}
@@ -437,6 +450,12 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envDuration("KDB_ATTACHMENT_UPLOAD_GRACE", &s.AttachmentUploadGrace); err != nil {
 		return s, err
 	}
+	if err := envInt("KDB_ATTACHMENT_DELTA_STEP_MB", &s.AttachmentDeltaStepMB); err != nil {
+		return s, err
+	}
+	if err := envBool("KDB_ATTACHMENT_DELTAS", &s.AttachmentDeltas); err != nil {
+		return s, err
+	}
 	if err := envInt("KDB_MAINTENANCE_MAX_DEFER", &s.MaintenanceMaxDefer); err != nil {
 		return s, err
 	}
@@ -496,6 +515,8 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"maintenance-interval", func() { s.MaintenanceInterval = flags.MaintenanceInterval }},
 		{"maintenance-sweep", func() { s.MaintenanceSweep = flags.MaintenanceSweep }},
 		{"attachment-upload-grace", func() { s.AttachmentUploadGrace = flags.AttachmentUploadGrace }},
+		{"attachment-delta-step-mb", func() { s.AttachmentDeltaStepMB = flags.AttachmentDeltaStepMB }},
+		{"attachment-deltas", func() { s.AttachmentDeltas = flags.AttachmentDeltas }},
 		{"maintenance-max-defer", func() { s.MaintenanceMaxDefer = flags.MaintenanceMaxDefer }},
 		{"tls-cert", func() { s.TLSCert = flags.TLSCert }},
 		{"tls-key", func() { s.TLSKey = flags.TLSKey }},

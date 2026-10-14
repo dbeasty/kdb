@@ -43,8 +43,9 @@ These are the owner's decisions from 2026-10-13. Later decisions supersede earli
    - Large blobs are standalone segments.
    - S3 will get its own strategy later. Everything goes through the platform I/O shim, which
      already has an S3 implementation.
-6. **Git-like deltas where small.** The newest version is always whole. A replaced version is
-   re-stored as a delta against its successor when that is under half its size.
+6. **Git-like deltas, any size.** The newest version is always whole. A replaced version is
+   re-stored as a delta against its successor when that is under half its size - whatever its
+   size, with memory bounded independent of it.
 7. **History setting.** Keep all attachment history (`AttachmentHistoryAll`, the default) or only
    the latest (`AttachmentHistoryLatest`).
 8. **Bytes are never held whole.** Reads stream chunks from storage. A read follows the same
@@ -98,7 +99,28 @@ identity = SHA-256(0x02 || be64(size) || tree)
   - Changing one attachment re-hashes its document's set and O(depth) trie nodes.
   - `Root()` is nil for an empty table, and a nil root is omitted from the commit payload, so a
     commit without attachments hashes exactly as before.
-  - API: `List`, `Count`, `Get(doc, id)`, `GetByName`, `Put`, `Delete`, `DeleteAll`, `Walk`.
+  - API: `List`, `Count`, `Get(doc, id)`, `GetByName`, `Put`, `Delete`, `DeleteAll`, `Walk`. The
+    reads return an error: a set can be on disk (below).
+- **Set pool** (`document/attachment_set_pool.go`). Sets live in a pool keyed by their hash and
+  shared by every table of a DAG.
+  - Backed by a store, the pool keeps about a budget of sets in memory: 8 MiB by default,
+    `StorageOptions.AttachmentSetBudgetBytes` / `KDB_ATTACHMENT_SET_BUDGET`. It writes a set out
+    when it evicts it, the first time. A set it does not hold is read back and checked against its
+    hash. A set the store lacks or has wrong is an error (`ErrAttachmentSetMissing`,
+    `ErrAttachmentSetCorrupt`), never an empty or different set.
+  - The file runtime's store is the namespace's blob store. Writes go to the memtable without a WAL
+    record: every table a process holds was seeded or derived in that process, which put its sets
+    first, so a crash loses nothing anyone reads. Read-only runtimes and engines without platform
+    I/O keep every set in memory, as before.
+  - Under history=none the blob store's merge keeps the sets of the branch, tag and seeded tables,
+    and the sets written in the last two maintenance passes (a commit may still be on its way). The
+    DAG then drops its cached tables of other commits, which are rebuilt from history if asked
+    for. A set a new table names again is written again when evicted.
+  - Seeded tables and transactions' tables join the DAG's pool, so what is derived from them is
+    bounded too.
+  - Kotlin keeps no store. Its tables share their sets through a persistent map (`UuidHamt`), so a
+    cached version costs what changed. Before, every change copied the whole map, which cost time
+    in every document and up to 64 full copies across cached tables.
 - **The DAG derives every root** (`dag/attachments.go`).
   - A commit's table is its first parent's table with the commit's ops applied.
   - Tables are cached by root. A miss is rebuilt from the nearest cached ancestor, and each step is
@@ -134,20 +156,43 @@ identity = SHA-256(0x02 || be64(size) || tree)
   - Sequential (`Read`) and random access (`ReadAt`, for ranged fetches).
   - Each chunk is checked against its stored leaf before it is returned. Leaves are checked once
     against the root by streaming them.
-  - A delta is read through its instruction index, so only the base ranges and literal bytes a read
-    touches are fetched, and no version is rebuilt in memory.
+  - A delta is read through its instructions, so only the base ranges and literal bytes a read
+    touches are fetched, and no version is rebuilt in memory. A format 2 delta's instructions are
+    framed and indexed on disk: a read loads one frame (at most 4096 instructions) at a time.
 - **Read pins.** An open reader pins every segment it resolved, including a delta's base chain.
-  - `StoreAsDelta` and `Collect` queue a pinned segment for deletion, and the last reader to close
+  - Delta jobs and `Collect` queue a pinned segment for deletion, and the last reader to close
     deletes it.
   - Pins are leases (`ReadLease`, default one hour). A stalled reader is released by the next
     `Collect` and fails with `ErrReadLeaseExpired`.
-- **Deltas** (`delta.go`).
-  - Encoding indexes the base by block hash, with the block size scaled so the index stays under
-    about 1M entries, then rolls a hash over the target through 1 MiB page caches. Neither version
-    is held whole.
-  - A version is diffed only if its size is within `DeltaMaxBytes` (default 256 MiB, because that
-    bounds the index), and chain depth is capped at 8.
-  - Larger versions stay whole. A streaming rolling-hash delta for multi-GB files is a follow-up.
+- **Deltas** (`delta.go`, `deltajob.go`). Any size; chain depth is capped at 8 (`DeltaMaxDepth`).
+  `DeltaMaxBytes` can still cap the size diffed; it is unlimited by default.
+  - **Feature flag: store originals only.** `Config.DisableDeltas` (`StorageOptions.DisableAttachmentDeltas`
+    in embed; `--attachment-deltas=false` / `KDB_ATTACHMENT_DELTAS` / `attachmentDeltas` on the
+    service, restart) keeps every version whole, as uploaded. Deltas already stored are turned
+    back into whole copies by maintenance (`Store.InflateStep`, in `DeltaStepBytes` steps that
+    resume across passes; reads stay pinned to what they opened). This needs the disk space of the
+    whole copies. Maintenance leaves the mark where it is while off, so turning deltas back on
+    diffs the versions replaced meanwhile.
+  - **Chunks first.** A target chunk whose leaf equals the base's leaf at the same offset is a copy
+    instruction without reading a byte, so an in-place edit to a TB file costs the chunks touched.
+  - **Index only what did not match.** Only base chunks with no equal target chunk at their
+    offset are indexed, by block hash; the block grows with those bytes so the index stays under
+    `DeltaIndexEntries` (default 1M, ~40 MB) whatever the size.
+  - **Rolling hash where content shifted.** The target is scanned with a rolling hash through a
+    few cached pages; a hit is extended backwards and forwards by page compares, and by whole
+    chunks again where the offsets line up. Neither version is held whole.
+  - **Format 2** (pointer flag 4): frames (literal bytes, then that frame's instructions), a
+    32-byte-per-frame index and a footer (`KDBDLT2`). Format 1 deltas (written before this, at
+    most 256 MiB) still read. The layout is documented in `delta.go`.
+  - **Bounded, resumable steps.** A delta job runs in phases - index the base, encode, verify
+    every chunk of the delta against the old version's leaves, swap the pointer - in steps of
+    `DeltaStepBytes` (default 4 GiB; `--attachment-delta-step-mb` / `KDB_ATTACHMENT_DELTA_STEP_MB` /
+    `attachmentDeltaStepMb` on the service). A maintenance pass that runs out of budget stops
+    with the job pending and its mark unmoved; the next pass resumes it. Between steps it holds
+    no pins or locks, only its index and progress.
+  - **Crash safety.** Nothing replaces the whole copy until the delta has been read back and
+    verified; the swap is the usual higher-generation pointer. A crash mid-job leaves only
+    unnamed segments, which `Collect` retires, and the job starts over (progress is in memory).
 - **GC.** `Collect` deletes what the keep-set rejects, keeps the bases of kept deltas, and deletes
   segments no pointer names (unfinished uploads).
 - **Upload grace.** Every writer uploads first and commits after (client API, SQL `STREAM ?`, a
@@ -163,14 +208,8 @@ identity = SHA-256(0x02 || be64(size) || tree)
     `Store.Committed`), or a `Collect` sees it referenced; references alone decide after that, so a
     replaced version is not kept for an hour. After a restart, a blob whose recorded finish time
     is within the grace is held again until a `Collect` sees it referenced.
-  - Kotlin (`AttachmentBlobStore`) holds the same way, default one hour,
-    `setAttachmentUploadGrace` on the embed runtime. Its pointer format is unchanged: the hold is an
-    empty `g-<hash>.<millis>` segment written before the pointer, since the shim cannot replace a
-    segment atomically and an older build would read a new pointer format as torn and delete the
-    blob. A pointer with no hold segment (stored before holds existed) has no grace. A re-upload
-    restarts the grace (rewritten once half a grace old). The hold ends when `commitViaEngine`
-    commits a put (the file runtime's commit is durable by then) or a collect sees the blob
-    referenced; the hold segment is deleted then, so unlike Go a restart does not revive it.
+  - Kotlin (`AttachmentBlobStore`) holds the same way, in the same pointer field, default one
+    hour (`setAttachmentUploadGrace` on the embed runtime); `hold()` is Go's `Hold`.
 
 ## Embed API (done)
 
@@ -187,6 +226,18 @@ identity = SHA-256(0x02 || be64(size) || tree)
   mode) and collects:
   - in latest mode, everything a branch or tag head does not reference;
   - in all-history mode, everything no reachable commit references.
+- **Reference index** (`attachstore/ref_index.go`, segment `<ns>/attachment/r-<gen>`). All-history
+  collection keeps a durable index: the content hashes the history below some heads references,
+  those heads, and a token for where retained history ends (`dag.HistoryFloor`: the horizon and
+  the number of stubbed commits).
+  - A pass whose recorded heads are still below the current ones, on the same floor, reads only the
+    commits since (`dag.CommitsAbove`, a generation-ordered walk).
+  - Anything else rebuilds the index from retained history once: a truncation, an archive, a deleted
+    or reset branch, or a lost or torn index.
+  - A commit whose parent is not here (a shallow root, a truncated floor) contributes its whole
+    table.
+  - The index is read per pass and not held between passes. `AttachmentMaintenance` reports
+    `Scanned` and `Rebuilt`.
 - **Replacements come from the DAG.** A commit that puts an attachment whose first parent held a
   different version (same document and attachment ID) makes the pair, however the commit arrived:
   embedded `PutAttachment`, a client or SQL transaction, or peer sync. The store's mark segment
@@ -226,10 +277,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
   `OpenAttachmentRange` / `ReadAttachmentAt`; TS `openAttachmentRange` / `readAttachmentAt`; Kotlin
   `KdbAttachments.openRange` / `readAt` / `getRange`, and `KdbAttachments.blob()`, a `java.sql.Blob`
   whose `getBytes(pos, len)` / `getBinaryStream(pos, len)` read verified ranges. The Kotlin server
-  acks neither feature. A chunk failing its proof is the same corrupt error as below.
+  acks both features and serves them as Go's does. A chunk failing its proof is the same corrupt error as below.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
-  (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
-  Kotlin server answers the messages `UNSUPPORTED`.
+  (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); **Kotlin
+  server** (`kdb-server` `AttachmentsWire.kt`, a port of `attachments_wire.go`: server-owned
+  resumable uploads with `Expect`, pinned paged reads, proofs, `INTEGRITY`, `SCHEMA_VIOLATION` with
+  `Info`, `Superseded`). The JDBC driver takes the Go server's SQL dialect (plain JSON parameters,
+  DML buffered until `TX_COMMIT`) from the handshake ack's `serverVersion`, which only Go sends -
+  not from the `attachments` feature, which both servers ack.
 - **Peer sync** (`peersync/attachments.go`), capability `attachments`:
   - `BLOB_FETCH`/`_RESULT` 0x42/0x43, entries `(docId, attachmentId, commit, hash, offset,
     maxBytes)`, batched, paged by bytes, per-entry errors, each chunk with its RFC 6962 audit path;
@@ -255,6 +310,17 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - **Kotlin engine parity** (`kdb-document`, `kdb-dag`, `kdb-transaction`, `kdb-embed`): hashes,
   tables, roots, merges, preflight and conflicts identical to Go (checked against Go fixtures); a
   Kotlin attachment store and embed API.
+- **Kotlin store on Go's layout** (`kdb-embed` `AttachmentBlobStore.kt`, `AttachmentDelta.kt`): the
+  same segments as `attachstore` - `KDBATP3` pointers (`KDBATP2` read) with small blobs inline,
+  bytes and leaves segments, the `m-<gen>` mark - so either build opens and maintains a data
+  directory the other wrote; it leaves Go's `r-<gen>` reference index alone. Reads pin their whole
+  delta chain under a lease (`readLease`, default one hour, `AttachmentReadLeaseExpiredException`);
+  `storeAsDelta` and `collect` defer deleting pinned segments. `compactAttachments` re-stores
+  replaced versions as deltas from the DAG's replaced pairs and records the heads in the mark, as
+  Go's `CompactAttachments` does. Kotlin reads delta formats 1 and 2 and writes format 1 (Go reads
+  it). Pinned both ways by Go-generated goldens (pointers, format-1 delta bytes) and by a fixture
+  store each side builds from one recipe and the other opens (`attachstore/kotlin_fixture_test.go`,
+  kdb-jdbc `GoAttachStoreFixtureTest`).
 - **Write-back projections** (follow-up): `PROJECT_WRITE` docs carry a document's whole
   attachment set after the write (`attachmentsChanged`, `attachments`), guarded by the set the
   projection held (`attachmentsBase`), and attachment-only writes (`keepBody`); a refused write
@@ -272,20 +338,28 @@ identity = SHA-256(0x02 || be64(size) || tree)
 
 ## Known limits
 
-- **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
-- **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
-- **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
-  read Go's v5 checkpoint and graph formats and has no blob peer transfer.
+- **The store's pointer map.** `attachstore.Store` holds one pointer per stored blob in memory, so
+  under all-history its size still grows with the number of versions. Paging it like the set pool is
+  a follow-up.
+- **A collection pass** still lists every stored blob (`Collect`), and a rebuild of the reference
+  index reads all of retained history once.
+- **Delta jobs restart after a crash.** Progress is in memory, so a restart mid-job redoes it from
+  the start. Versions found not worth a delta are remembered per process only.
+- **The Kotlin store** shares Go's layout (above) but encodes a delta in one call, not in budgeted
+  steps, and only up to `deltaMaxBytes` (256 MiB); it has no `DisableDeltas` / inflate, and its GC
+  walks history rather than keeping the reference index.
+- **The Kotlin server** has no attachment SQL (`SET ATTACHMENT`, `ATTACHMENT()`: the Kotlin SQL
+  engine has none; the driver says so for binary parameters), no maintenance loop calling
+  `compactAttachments`, and answers `BLOB_FETCH` `UNSUPPORTED` (Kotlin peer sync is v1 only).
+- **Kotlin** reads Go's checkpoints (#225) but derives no attachment table for a commit below a
+  checkpoint's heads (their ops are not loaded for it).
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.
 
 ## Known limits of PR 1 (still open unless listed above as built)
 
 - **No peer blob transfer yet.** Commits and roots replicate, but blobs do not until PR 5.
-- **All-history GC walks commit headers.** It loads ops only for commits whose root changed. A
-  per-namespace attachment index would avoid the walk.
-- **Set pool.** The set pool (ref metadata only, never bytes) lives in memory and grows with
-  attachment versions. Spilling it, or rebuilding sets on demand, is a follow-up for very large
-  version counts.
+- ~~All-history GC walks commit headers~~: replaced by the reference index.
+- ~~Set pool held in memory~~: bounded and spilled to the blob store.
 - **Backups.** Backups do not copy attachment segments yet, and a restored node must seed its
   tables (PR 5).
-- **Delta size.** Versions over `DeltaMaxBytes` are not delta-encoded.
+- **Delta size.** Lifted: versions of any size are delta-encoded (see Deltas above).

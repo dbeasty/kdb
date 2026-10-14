@@ -1,5 +1,7 @@
 package dev.kdb.replica
 
+import dev.kdb.document.KdbOp
+
 /**
  * One sync of one namespace over an open v2 connection (packages/kdb-replica/src/sync.ts).
  *
@@ -24,7 +26,12 @@ public enum class CatchUp { REPLAY, SQUASH, AUTO }
 public const val AUTO_SQUASH_MIN_BACKLOG: Int = 1000
 public const val AUTO_SQUASH_BACKLOG_PER_CHANGE: Int = 2
 
-public data class SyncOptions(val catchUp: CatchUp = CatchUp.AUTO, val pageBytes: Int = DEFAULT_PAGE_BYTES)
+public data class SyncOptions(
+    val catchUp: CatchUp = CatchUp.AUTO,
+    val pageBytes: Int = DEFAULT_PAGE_BYTES,
+    /** Where blobs the replica wrote wait for upload (needed to push commits with attachments). */
+    val blobs: BlobStore? = null,
+)
 
 public data class NamespaceSyncResult(
     val namespace: String,
@@ -104,6 +111,8 @@ public suspend fun syncNamespace(
 
 private suspend fun push(conn: PeerConnection, ns: ReplicaNamespace, remoteMain: String, opts: SyncOptions): RefUpdateAck {
     val commits = ns.pendingCommits()
+    // The host stores a commit only once it holds the blobs it references: upload first (plan §9).
+    val uploaded = uploadPinned(conn, ns.name, opts.blobs, commits.flatMap { c -> c.ops.filterIsInstance<KdbOp.AttachmentPut>().map { it.contentHash.toHex() } })
     var page = ArrayList<ReplicaCommit>()
     var size = 0
     for ((i, c) in commits.withIndex()) {
@@ -112,7 +121,10 @@ private suspend fun push(conn: PeerConnection, ns: ReplicaNamespace, remoteMain:
         val last = i == commits.size - 1
         if (!last && size < opts.pageBytes) continue
         val ack = conn.refUpdate(ns.name, remoteMain, ns.head!!, page, !last)
-        if (last) return ack
+        if (last) {
+            if (ack.outcome != "conflict") for (h in uploaded) opts.blobs?.unpin(h)
+            return ack
+        }
         page = ArrayList()
         size = 0
     }
@@ -145,7 +157,14 @@ private suspend fun resumeConverge(
             if (!p.done) after = p.next
             ns.applyConvergePage(p.docs.map { it.id to it.json }, after)
             p.docs.mapTo(changed) { it.id }
-            if (p.done) break
+            if (p.done) {
+                // The last page carries the commit's whole attachment table: the replica has no
+                // history to derive it from.
+                if (p.commit.attachmentRoot != null || ns.attachmentRoot() != null) {
+                    ns.applyConvergeAttachments(parsePackedAttachmentTable(p.attachmentTables), whole = true)
+                }
+                break
+            }
             page = null
         }
         try {
@@ -154,10 +173,13 @@ private suspend fun resumeConverge(
         } catch (_: TreeMismatchException) {
             // A snapshot laid over what an earlier, interrupted attempt left can disagree with the
             // target; a diff against the target's tree repairs exactly that.
+        } catch (_: AttachmentRootMismatchException) {
+            // Likewise for the attachment table: the diff below repairs it set by set.
         }
     }
-    val tree = ReplicaCommit.decode(hexToBytes(ns.target!!.payloadHex)).treeHash
-    changed += converge(conn, ns, tree, null)
+    val target = ReplicaCommit.decode(hexToBytes(ns.target!!.payloadHex))
+    changed += converge(conn, ns, target.treeHash, null)
+    convergeAttachments(conn, ns, target)
     ns.finishConverge()
     return changed
 }
@@ -185,6 +207,7 @@ private suspend fun catchUp(
             if (squash) {
                 ns.beginConverge(target, "diff")
                 val changed = converge(conn, ns, target.treeHash, diff)
+                convergeAttachments(conn, ns, target)
                 ns.finishConverge()
                 return "squash" to changed
             }
@@ -233,16 +256,29 @@ private class Diff(
 private fun fromWire(n: WireTreeNode): TreeNodeView =
     TreeNodeView(n.prefix, n.hash, n.children, if (n.hasEntries) n.entries else null)
 
-private suspend fun diffTrees(conn: PeerConnection, ns: ReplicaNamespace, treeHex: String): Diff {
+/**
+ * Diffs the namespace's document tree against the host's tree [treeHex] or, with [attachmentsAt],
+ * its attachment table against that commit's; the host's listed attachment sets go into [sets].
+ */
+private suspend fun diffTrees(
+    conn: PeerConnection,
+    ns: ReplicaNamespace,
+    treeHex: String,
+    attachmentsAt: String? = null,
+    sets: MutableMap<String, List<WireAttachment>>? = null,
+): Diff {
     val changes = ArrayList<Pair<String, String>>()
     var frontier = listOf("")
+    val kind = if (attachmentsAt == null) TreeKind.DOCUMENTS else TreeKind.ATTACHMENTS
     while (frontier.isNotEmpty()) {
         val next = ArrayList<String>()
         for (batch in frontier.chunked(MAX_TREE_NODE_PREFIXES)) {
-            val remote = conn.treeNodes(ns.name, treeHex, batch).map(::fromWire)
+            val nodes = conn.treeNodes(ns.name, treeHex, batch, attachmentsAt = attachmentsAt)
+            if (sets != null) for (n in nodes) for ((id, list) in n.attachments) sets[id.lowercase()] = list
+            val remote = nodes.map(::fromWire)
             if (remote.size != batch.size) throw ProtocolException("kdb replica: TREE_NODES answered the wrong number of nodes")
             for ((j, prefix) in batch.withIndex()) {
-                val l = ns.treeNode(prefix, DEFAULT_TREE_ENTRY_LIMIT)
+                val l = ns.treeNode(prefix, DEFAULT_TREE_ENTRY_LIMIT, kind)
                 val r = remote[j]
                 if (l.hash == r.hash) continue
                 if ((l.entries != null || l.hash.isEmpty()) && (r.entries != null || r.hash.isEmpty())) {
@@ -297,6 +333,44 @@ private suspend fun converge(conn: PeerConnection, ns: ReplicaNamespace, treeHex
     return diff.changes.map { it.first }
 }
 
+/**
+ * Makes the namespace's attachment table equal the target commit's: a diff of the attachment tries
+ * (TREE_NODES with tree "attachments"), taking each differing document's whole set from the host's
+ * listing and checking it against the set hash the host's trie names.
+ */
+private suspend fun convergeAttachments(conn: PeerConnection, ns: ReplicaNamespace, target: ReplicaCommit) {
+    if (ns.attachmentRoot() == target.attachmentRoot) return
+    if (!conn.has("attachments")) throw ProtocolException("kdb replica: ${ns.name} has attachments, and the host does not serve them")
+    val listed = HashMap<String, List<WireAttachment>>()
+    val diff = diffTrees(conn, ns, "", target.hash, listed)
+    val sets = LinkedHashMap<String, List<ReplicaAttachment>>()
+    for ((id, h) in diff.changes) {
+        if (h.isEmpty()) {
+            sets[id] = emptyList()
+            continue
+        }
+        val set = listed[id.lowercase()].toReplicaSet()
+        if (set.isEmpty() || attachmentSetHash(set) != h) {
+            throw ProtocolException("kdb replica: the host's attachment set for $id does not match its hash")
+        }
+        sets[id] = set
+    }
+    ns.applyConvergeAttachments(sets, whole = false)
+}
+
+/** Uploads the blobs among [hashes] that were written here and are still pinned; returns them. */
+private suspend fun uploadPinned(conn: PeerConnection, namespace: String, blobs: BlobStore?, hashes: List<String>): List<String> {
+    if (blobs == null) return emptyList()
+    val uploaded = ArrayList<String>()
+    for (h in hashes.distinct()) {
+        if (!blobs.pinned(h)) continue
+        if (!conn.has("attachments")) throw ProtocolException("kdb replica: the host does not take attachments for $namespace")
+        blobs.upload(conn, namespace, h)
+        uploaded += h
+    }
+    return uploaded
+}
+
 // --- filtered namespaces (plan §4.2) ----------------------------------------------------------
 
 public data class RejectedWrite(
@@ -329,6 +403,14 @@ public suspend fun syncProjection(conn: PeerConnection, p: ProjectionNamespace, 
     if (p.writeBack) {
         if (!conn.has("writeback")) throw ProtocolException("kdb replica: the host does not take write-back for ${p.name}")
         for (entry in p.outbox()) {
+            // The source checks a write's blobs are there: the ones written here go up first.
+            val uploaded =
+                try {
+                    uploadPinned(conn, p.name, opts.blobs, entry.docs.flatMap { d -> d.attachments.orEmpty().map { it.hash.lowercase() } })
+                } catch (e: RemoteException) {
+                    deferred = "${e.code}: ${e.remoteMessage}"
+                    break
+                }
             val r =
                 try {
                     conn.projectWrite(p.name, entry.txId, entry.docs)
@@ -337,6 +419,7 @@ public suspend fun syncProjection(conn: PeerConnection, p: ProjectionNamespace, 
                     deferred = "${e.code}: ${e.remoteMessage}"
                     break
                 }
+            for (h in uploaded) opts.blobs?.unpin(h) // the source holds them now
             if (r.outcome == "applied") {
                 p.resolve(entry, null)
                 applied++

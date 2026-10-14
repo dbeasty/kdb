@@ -2,6 +2,8 @@ package dev.kdb.replica
 
 import dev.kdb.wire.DEFAULT_MAX_FRAME_BYTES
 import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
+import dev.kdb.wire.WireMessage
+import dev.kdb.wire.defaultWireCodec
 import dev.kdb.wire.validateFrameLength
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -33,6 +35,12 @@ public object SyncMsg {
     public const val OBJECT_FETCH_RESULT: Int = 0x37
     public const val SQUASH_HEAD: Int = 0x40
     public const val SQUASH_HEAD_RESULT: Int = 0x41
+
+    /** Attachments (docs/kdb-attachments-plan.md): always binary bodies (kdb-wire's codec). */
+    public const val BLOB_FETCH: Int = 0x42
+    public const val BLOB_FETCH_RESULT: Int = 0x43
+    public const val ATTACHMENT_UPLOAD: Int = 0x44
+    public const val ATTACHMENT_UPLOAD_RESULT: Int = 0x45
     public const val REFS_WATCH: Int = 0x50
     public const val REFS_CHANGED: Int = 0x51
 
@@ -56,10 +64,16 @@ public object SyncMsg {
 private const val FRAME_HEADER_SIZE = 12
 private const val ENCODING_JSON: Byte = 1
 
-/** A decoded v2 frame: its header fields and its JSON envelope `{"kind": .., "<kind>": {..}}`. */
-internal class SyncFrame(val code: Int, val correlationId: Int, val envelope: JsonObject) {
-    val kind: String get() = envelope.str("kind")
+/**
+ * A decoded v2 frame: its header fields and its JSON envelope `{"kind": .., "<kind>": {..}}`, or,
+ * for the attachment messages, which are always binary bodies, the message kdb-wire decoded.
+ */
+internal class SyncFrame(val code: Int, val correlationId: Int, val envelope: JsonObject, val binary: WireMessage? = null) {
+    val kind: String get() = if (binary != null) "binary" else envelope.str("kind")
 }
+
+/** kdb-wire's codec, for the binary attachment bodies (tag 2, or 3 when zstd-compressed). */
+internal val attachmentCodec = defaultWireCodec()
 
 internal val wireJson = Json { ignoreUnknownKeys = true }
 
@@ -95,6 +109,15 @@ internal fun decodeSyncFrame(frame: ByteArray): SyncFrame {
     val code = readLe(frame, 4, 2)
     val correlationId = readLe(frame, 8, 4)
     val tag = frame[FRAME_HEADER_SIZE].toInt()
+    if (tag == 2 || tag == 3) {
+        val msg =
+            try {
+                attachmentCodec.decode(frame)
+            } catch (e: Exception) {
+                throw ProtocolException("kdb replica: undecodable binary frame 0x${code.toString(16)}: ${e.message}", e)
+            }
+        return SyncFrame(code, correlationId, JsonObject(emptyMap()), msg)
+    }
     // 0 (KDB_BINARY) carries the JSON envelope too, as kdb-wire's decoder treats it.
     if (tag != 0 && tag != 1) throw ProtocolException("kdb replica: unsupported payload encoding tag $tag")
     val text = frame.decodeToString(FRAME_HEADER_SIZE + 1, total)

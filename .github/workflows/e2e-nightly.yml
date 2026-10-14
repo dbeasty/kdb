@@ -30,7 +30,7 @@ jobs:
           java-version: "21"
       - uses: gradle/actions/setup-gradle@v4
       - name: Use the Gradle build cache in the interop tests' gradle runs
-        run: printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+        run: mkdir -p "${GRADLE_USER_HOME:-$HOME/.gradle}" && printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties"
       - name: Go test (${{ matrix.shard }}, full)
         env:
           GO_TEST_JSON_DIR: ${{ runner.temp }}/go-test-json
@@ -65,7 +65,10 @@ jobs:
         env:
           GO_TEST_JSON_DIR: ${{ runner.temp }}/go-test-json
         run: |
-          printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+          # setup-gradle moves the Gradle user home (D:\a\.gradle); ~/.gradle does not exist here.
+          gh_home="$(cygpath -u "${GRADLE_USER_HOME:-$HOME/.gradle}")"
+          mkdir -p "$gh_home"
+          printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> "$gh_home/gradle.properties"
           scripts/ci/go-test-shard.sh windows ${{ matrix.shard }} -count=1 -timeout 45m
       - name: Upload go test -json
         if: always()
@@ -90,7 +93,9 @@ jobs:
         with:
           cache-key: kotlin-jvm
       - name: ./gradlew build
-        run: ./gradlew build --parallel --continue --no-daemon
+        # Serial, as CI ran it before the split: some JS tests only fit Mocha's 2 s timeout when
+        # they do not share the runner with parallel compiles.
+        run: ./gradlew build --continue --no-daemon
       - name: Upload Kotlin test reports
         if: failure()
         uses: actions/upload-artifact@v4

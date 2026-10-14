@@ -99,9 +99,19 @@ type Config struct {
 	SmallMaxBytes int64
 	// MaxBytes caps one attachment. Zero (the default) is no limit.
 	MaxBytes int64
-	// DeltaMaxBytes is the largest version StoreAsDelta will encode. Encoding indexes the base and
-	// pages through both versions, so it bounds the index, not the bytes held. Default 256 MiB.
+	// DeltaMaxBytes is the largest version StoreAsDelta will encode. Zero (the default) is no
+	// limit: encoding holds a bounded index and a few pages, never a version (delta.go).
 	DeltaMaxBytes int64
+	// DeltaIndexEntries bounds the base index a delta encoding holds (about 40 bytes an entry):
+	// the block it indexes grows with the base's unmatched bytes to stay under it. Default 1M.
+	DeltaIndexEntries int
+	// DeltaStepBytes is how much work - bytes indexed, encoded or verified - one DeltaStep does
+	// when its caller names no budget, and so one maintenance pass. Default 4 GiB.
+	DeltaStepBytes int64
+	// DisableDeltas keeps every version whole, as uploaded: DeltaStep (and StoreAsDelta) store
+	// nothing. Deltas stored before it was set still read; InflateStep turns them back into
+	// whole copies, which maintenance does while this is set.
+	DisableDeltas bool
 	// DeltaMaxDepth bounds a delta chain - how many deltas a read goes through. Default 8.
 	DeltaMaxDepth int
 	// HashWorkers bounds the chunks hashed at once during an upload. Default GOMAXPROCS.
@@ -111,6 +121,11 @@ type Config struct {
 	// UploadGrace is how long Collect keeps a finished blob no commit references yet: the longest
 	// an upload may wait for the commit that references it. Default one hour.
 	UploadGrace time.Duration
+
+	// For tests: page and frame sizes small enough that a few-MB version takes the paths a
+	// multi-GB one does.
+	deltaPageBytes int64
+	deltaFrameOps  int
 }
 
 func (c Config) withDefaults() Config {
@@ -120,8 +135,17 @@ func (c Config) withDefaults() Config {
 	if c.SmallMaxBytes > chunk {
 		c.SmallMaxBytes = chunk
 	}
-	if c.DeltaMaxBytes <= 0 {
-		c.DeltaMaxBytes = 256 << 20
+	if c.DeltaIndexEntries <= 0 {
+		c.DeltaIndexEntries = defaultIndexEntries
+	}
+	if c.DeltaStepBytes <= 0 {
+		c.DeltaStepBytes = 4 << 30
+	}
+	if c.deltaPageBytes <= 0 {
+		c.deltaPageBytes = defaultPageBytes
+	}
+	if c.deltaFrameOps <= 0 {
+		c.deltaFrameOps = defaultFrameOps
 	}
 	if c.DeltaMaxDepth <= 0 {
 		c.DeltaMaxDepth = 8
@@ -152,6 +176,7 @@ type pointer struct {
 	leaves  string     // the segment holding the chunk leaf hashes
 	size    int64      // the blob's length
 	delta   bool       // segment is a delta against base
+	framed  bool       // the delta is format 2 (delta.go)
 	base    codec.Hash // for a delta: the blob it applies to
 	// inline holds a small blob's bytes in the pointer itself (no segment, no leaves): one file
 	// per small blob, and every attachment byte in the attachment store's own segments, which is
@@ -184,6 +209,13 @@ type Store struct {
 	mark    []codec.Hash
 	markSeg string
 	markGen int
+
+	// Delta jobs (deltajob.go): deltaMu serialises their steps; job is the one in progress, and
+	// declined the pairs whose delta was not worth storing (this process need not try them again).
+	deltaMu  sync.Mutex
+	job      *deltaJob
+	inflate  *inflateJob // inflate.go: a delta being turned back into a whole copy
+	declined map[[2]codec.Hash]struct{}
 }
 
 // SegmentPrefix is the name prefix of every segment namespaceID's attachment store writes - for a
@@ -207,6 +239,7 @@ func New(shim storage.PlatformIOShim, namespaceID string, small SmallBlobs, cfg 
 		pinned:   map[string]int{},
 		deferred: map[string]bool{},
 		readers:  map[*Reader]struct{}{},
+		declined: map[[2]codec.Hash]struct{}{},
 	}
 }
 
@@ -277,6 +310,9 @@ func encodePointer(p pointer) []byte {
 	if p.inline != nil {
 		flags |= 2
 	}
+	if p.framed {
+		flags |= 4
+	}
 	b = append(b, flags)
 	b = binary.BigEndian.AppendUint64(b, uint64(p.size))
 	b = binary.BigEndian.AppendUint64(b, uint64(p.finished.UnixNano()))
@@ -336,7 +372,7 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 		return pointer{}, codec.Hash{}, false
 	}
 	off := len(pointerMagic)
-	p := pointer{gen: gen, name: name, delta: body[off]&1 != 0}
+	p := pointer{gen: gen, name: name, delta: body[off]&1 != 0, framed: body[off]&4 != 0}
 	off++
 	p.size = int64(binary.BigEndian.Uint64(body[off:]))
 	off += 8
@@ -787,6 +823,17 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 			live[p.base] = true
 		}
 	}
+	if (s.job != nil && (!live[s.job.old] || !live[s.job.base])) || (s.inflate != nil && !live[s.inflate.h]) {
+		if s.deltaMu.TryLock() { // no step can be running while we hold it
+			if s.job != nil && (!live[s.job.old] || !live[s.job.base]) {
+				s.dropJobLocked() // its versions are going
+			}
+			if s.inflate != nil && !live[s.inflate.h] {
+				s.dropInflateLocked()
+			}
+			s.deltaMu.Unlock()
+		}
+	}
 	removed := 0
 	for h := range s.pointers {
 		if !live[h] {
@@ -808,6 +855,9 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 	for _, name := range names {
 		if !strings.HasPrefix(name, s.prefix) || referenced[name] {
 			continue
+		}
+		if _, ok := s.isRefIndex(name); ok {
+			continue // SetRefIndex retires older ones itself
 		}
 		if _, writing := s.uploads[name]; writing {
 			continue

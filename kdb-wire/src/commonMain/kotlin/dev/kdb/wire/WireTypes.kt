@@ -460,7 +460,9 @@ public sealed class WireMessage {
 
     /** One chunk of a blob upload. The first has no [uploadId]; the result names the upload, and
      * every later chunk carries it with the [offset] it starts at (the bytes received so far, so an
-     * interrupted upload resumes from the result's received). [final] finishes the upload. */
+     * interrupted upload resumes from the result's received). [final] finishes the upload.
+     * [expect], on a first chunk, names the blob the upload will be (Go's Expect, field 7): a host
+     * that already holds it answers with its hash and no uploadId, so the rest is not sent. */
     public class AttachmentUpload(
         override val header: WireHeader,
         public val namespace: String,

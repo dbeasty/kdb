@@ -45,7 +45,9 @@ public const val DEFAULT_ATTACHMENT_DELTA_MAX_DEPTH: Int = 8
  *    up to [smallMaxBytes], holding the bytes inline. A pointer is replaced (whole -> delta, a new
  *    finish time) by writing the next generation before the old one goes, so a crash leaves a
  *    readable blob;
- *  - `m-<generation>`: the mark ([mark]), the heads delta compaction last went through.
+ *  - `m-<generation>`: the mark ([mark]), the heads delta compaction last went through;
+ *  - `r-<generation>`: Go's reference index for its GC, which this build neither reads nor writes,
+ *    and [collect] leaves alone.
  *
  * Readers pin. [open] pins every segment the read resolves to - bytes, leaves, a delta's whole base
  * chain - and [AttachmentReader.close] releases them; [storeAsDelta] and [collect] defer deleting a
@@ -717,6 +719,8 @@ public class AttachmentBlobStore(
             }
             for (name in shim.listSegments(namespaceId)) {
                 if (!name.startsWith(prefix) || name in referenced || name in uploads) continue
+                // Go's reference index (r-<gen>), a note for its GC: Go retires older ones itself.
+                if (name.startsWith(prefix + "r-")) continue
                 deleteOrDeferLocked(name)
             }
             removed

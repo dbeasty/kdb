@@ -143,6 +143,15 @@ type StorageOptions struct {
 	// references yet (attachstore.Config.UploadGrace): the longest a client may take between
 	// uploading an attachment and committing it. Zero uses the default, one hour.
 	AttachmentUploadGrace time.Duration
+	// AttachmentDeltaStepBytes bounds the work one maintenance pass spends diffing replaced
+	// attachment versions into deltas (attachstore.Config.DeltaStepBytes); a larger version is
+	// diffed over several passes. Zero uses the default, 4 GiB.
+	AttachmentDeltaStepBytes int64
+	// DisableAttachmentDeltas keeps every attachment version as the original file, whole:
+	// maintenance never re-stores a replaced version as a delta (attachstore.Config.DisableDeltas).
+	// Maintenance turns deltas already stored back into whole copies. Off by default - deltas
+	// are on.
+	DisableAttachmentDeltas bool
 
 	// CloseCompactionBytes bounds the SSTable merge closing the namespace may do: close merges
 	// the tables only when they hold at most this many bytes, and otherwise leaves them to the
@@ -176,6 +185,11 @@ type StorageOptions struct {
 	// TreeMaxSegments is the longest chain of tree segments before a compaction
 	// (document.DefaultTreeMaxSegments when not positive). For tests; there is no setting for it.
 	TreeMaxSegments int
+
+	// AttachmentSetBudgetBytes is how much memory the attachment set pool keeps sets in before it
+	// spills them to the namespace's blob store (document.DefaultAttachmentSetBudget when not
+	// positive). Every set any version of the attachment table had stays readable, from disk.
+	AttachmentSetBudgetBytes int64
 
 	// SyncMode selects the physical sync primitive every flush uses. The zero
 	// value is storio.SyncModeFull (F_FULLFSYNC on darwin) - the previous
@@ -265,6 +279,7 @@ func FileRuntimeOptionsFromEnv() FileRuntimeOptions {
 	opts.Storage.Graph = graphSettingsFromEnv()
 	opts.Storage.TreeFile = envBool("KDB_TREE_FILE")
 	opts.Storage.TreeResidentBytes = envBytes("KDB_TREE_RESIDENT_BYTES")
+	opts.Storage.AttachmentSetBudgetBytes = envBytes("KDB_ATTACHMENT_SET_BUDGET")
 	return opts
 }
 

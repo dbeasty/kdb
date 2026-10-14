@@ -16,14 +16,38 @@ public data class WriteBackDoc(
     val body: String? = null,
     val deleted: Boolean = false,
     val baseHash: String? = null,
+    /** The write left the body alone: only the attachments changed. */
+    val keepBody: Boolean = false,
+    /** [attachments] is the document's whole set after the write; [attachmentsBase] the set it replaced. */
+    val attachmentsChanged: Boolean = false,
+    val attachments: List<WireAttachment>? = null,
+    /** The set hash of the attachments the replica held before the write; "" for none. */
+    val attachmentsBase: String? = null,
+)
+
+/**
+ * One document of a local write on a filtered namespace: [json] its new body, or null to delete it
+ * - unless [keepBody], when the body stays as it is. [attachments], when given, is its whole
+ * attachment set after the write.
+ */
+public data class LocalWrite(
+    val docId: String,
+    val json: String?,
+    val keepBody: Boolean = false,
+    val attachments: List<ReplicaAttachment>? = null,
 )
 
 /** A write-back transaction queued for the source, with the tx id fixed when it was written. */
 @Serializable
 public data class OutboxEntry(val seq: Long, val txId: String, val docs: List<WriteBackDoc>)
 
-/** A source document's state as PROJECT_WRITE_RESULT reports it. */
-public data class CurrentDoc(val docId: String, val body: String?, val absent: Boolean)
+/** A source document's state as PROJECT_WRITE_RESULT reports it, attachments included. */
+public data class CurrentDoc(
+    val docId: String,
+    val body: String?,
+    val absent: Boolean,
+    val attachments: List<WireAttachment> = emptyList(),
+)
 
 /** A transfer in progress: resumed with the same from, at and cursor. */
 @Serializable
@@ -48,6 +72,8 @@ public data class ProjectPage(
     val deletes: List<String>,
     val next: String,
     val done: Boolean,
+    /** Every written document's whole attachment set at [atHex]; a written document absent has none. */
+    val attachments: Map<String, List<WireAttachment>> = emptyMap(),
 )
 
 public class ReadOnlyProjectionException(message: String) : RuntimeException(message)
@@ -72,6 +98,11 @@ public class ReadOnlyProjectionException(message: String) : RuntimeException(mes
  *   write, as the source will hold it once the entries ahead of it are applied.
  * - A document with a write still in the outbox keeps its local state against incoming pages,
  *   until the source decides. A conflicting or refused write puts the source's state back.
+ * - Each document's attachment set (refs; bytes are fetched on read at the last source commit)
+ *   comes with every page that writes it. A write may change a document's attachments: the entry
+ *   then carries the document's whole set after it, and the hash of the set it replaced (the
+ *   source applies it only if it still holds that set). An attachment-only write keeps the body
+ *   (keepBody) and is still guarded by its base hash. The blobs go up before the entry (Sync.kt).
  */
 public class ProjectionNamespace private constructor(
     private val store: ReplicaStore,
@@ -111,6 +142,11 @@ public class ProjectionNamespace private constructor(
 
     private fun pendingKey(id: String) = "p/$key/${id.lowercase()}"
 
+    private fun attachKey(id: String) = attachmentSetKey(key, id)
+
+    /** The document's attachments as of the last transfer (refs; bytes are fetched on read), in id order. */
+    public suspend fun attachments(id: String): List<ReplicaAttachment> = attachmentsOf(store, key, id)
+
     private fun outboxKey(seq: Long) = "o/$key/${seq.toString().padStart(16, '0')}"
 
     private suspend fun commit(batch: Batch, m: ProjectionMeta) {
@@ -132,6 +168,10 @@ public class ProjectionNamespace private constructor(
 
     /** Writes locally and queues the write for the source, as one transaction. A null json deletes. */
     public suspend fun write(docs: List<Pair<String, String?>>, txId: String): OutboxEntry =
+        writeDocs(docs.map { (id, json) -> LocalWrite(id, json) }, txId)
+
+    /** Writes locally - bodies and attachment sets - and queues the write for the source, as one transaction. */
+    public suspend fun writeDocs(docs: List<LocalWrite>, txId: String): OutboxEntry =
         lock.withLock {
             if (!meta.writeBack) {
                 throw ReadOnlyProjectionException("kdb replica: $name is filtered without write-back, so it is read-only here")
@@ -141,17 +181,38 @@ public class ProjectionNamespace private constructor(
             val out = ArrayList<WriteBackDoc>()
             // A document written twice in one call: its second base is the first write's result.
             val staged = HashMap<String, String?>()
-            for ((rawId, json) in docs) {
-                val id = rawId.lowercase()
+            val stagedSets = HashMap<String, List<ReplicaAttachment>>()
+            for (d in docs) {
+                val id = d.docId.lowercase()
                 val before = if (staged.containsKey(id)) staged[id] else get(id)
                 val baseHash = before?.let { contentHash(id, it) }
-                out +=
-                    if (json == null) {
-                        WriteBackDoc(docId = id, deleted = true, baseHash = baseHash)
-                    } else {
-                        WriteBackDoc(docId = id, body = json, baseHash = baseHash)
-                    }
-                batch[docKey(id)] = json?.encodeToByteArray()
+                val json = if (d.keepBody) before else d.json
+                var wb: WriteBackDoc
+                if (d.keepBody) {
+                    if (before == null) throw IllegalArgumentException("kdb replica: $name/$id is not here to attach to")
+                    wb = WriteBackDoc(docId = id, keepBody = true, baseHash = baseHash)
+                } else if (json == null) {
+                    wb = WriteBackDoc(docId = id, deleted = true, baseHash = baseHash)
+                    batch[docKey(id)] = null
+                    batch[attachKey(id)] = null // a deleted document keeps no attachments
+                    stagedSets[id] = emptyList()
+                } else {
+                    wb = WriteBackDoc(docId = id, body = json, baseHash = baseHash)
+                    batch[docKey(id)] = json.encodeToByteArray()
+                }
+                if (d.attachments != null && json != null) {
+                    val prev = stagedSets[id] ?: attachments(id)
+                    val next = sortAttachments(d.attachments)
+                    wb =
+                        wb.copy(
+                            attachmentsChanged = true,
+                            attachments = next.map { it.toWire() },
+                            attachmentsBase = baseSetHash(prev),
+                        )
+                    stagedSets[id] = next
+                    batch[attachKey(id)] = if (next.isEmpty()) null else encodeAttachmentSet(next)
+                }
+                out += wb
                 staged[id] = json
                 counts[id] = (counts[id] ?: pendingCount(id)) + 1
             }
@@ -183,7 +244,11 @@ public class ProjectionNamespace private constructor(
             for (d in entry.docs) counts[d.docId] = (counts[d.docId] ?: pendingCount(d.docId)) - 1
             for ((id, n) in counts) batch[pendingKey(id)] = if (n > 0) n.toString().encodeToByteArray() else null
             for (c in current.orEmpty()) {
-                batch[docKey(c.docId)] = if (c.absent || c.body == null) null else c.body.encodeToByteArray()
+                val gone = c.absent || c.body == null
+                batch[docKey(c.docId)] = if (gone) null else c.body!!.encodeToByteArray()
+                // The source's attachments go back with its body (bytes fetched on read).
+                val set = if (gone) emptyList() else c.attachments.toReplicaSet()
+                batch[attachKey(c.docId)] = if (set.isEmpty()) null else encodeAttachmentSet(set)
             }
             commit(batch, meta)
         }
@@ -198,18 +263,23 @@ public class ProjectionNamespace private constructor(
             val batch = Batch()
             val changed = ArrayList<String>()
             val delivered = HashSet<String>()
+            val listed = page.attachments.mapKeys { it.key.lowercase() }
             for (w in page.writes) {
                 val id = w.id.lowercase()
                 delivered.add(id)
                 if (pendingCount(id) > 0) continue
-                if (get(id) != w.json) changed.add(id)
+                // Every written document comes with its whole attachment set; absent means none.
+                val set = listed[id].toReplicaSet()
+                if (get(id) != w.json || attachments(id) != set) changed.add(id)
                 batch[docKey(id)] = w.json.encodeToByteArray()
+                batch[attachKey(id)] = if (set.isEmpty()) null else encodeAttachmentSet(set)
             }
             for (raw in page.deletes) {
                 val id = raw.lowercase()
                 if (pendingCount(id) > 0) continue
                 if (get(id) != null) changed.add(id)
                 batch[docKey(id)] = null
+                batch[attachKey(id)] = null
             }
             if (page.reset) {
                 // The page stands for every id after the cursor up to its next (to the end when
@@ -221,6 +291,7 @@ public class ProjectionNamespace private constructor(
                     val id = k.substring(base.length)
                     if (id in delivered || pendingCount(id) > 0) continue
                     batch[k] = null
+                    batch[attachKey(id)] = null
                     changed.add(id)
                 }
             }

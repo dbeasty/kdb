@@ -82,7 +82,7 @@ func TestDeltaRoundTrip(t *testing.T) {
 	}
 	for name, target := range cases {
 		var d []byte
-		if err := encodeDelta(memSource(base), memSource(target), func(b []byte) error {
+		if err := encodeDeltaV1(memSource(base), memSource(target), func(b []byte) error {
 			d = append(d, b...)
 			return nil
 		}); err != nil {
@@ -347,7 +347,7 @@ func TestPointerGenerationsAfterACrash(t *testing.T) {
 	s.mu.Unlock()
 	seg := s.prefix + "u-crash"
 	var d []byte
-	encodeDelta(memSource(v[1]), memSource(v[0]), func(b []byte) error { d = append(d, b...); return nil })
+	encodeDeltaV1(memSource(v[1]), memSource(v[0]), func(b []byte) error { d = append(d, b...); return nil })
 	shim.AppendToSegment(seg, d)
 	s.mu.Lock()
 	if _, err := s.writePointerLocked(oi.Hash, pointer{segment: seg, leaves: cur.leaves, size: int64(len(v[0])), delta: true, base: ni.Hash}); err != nil {
@@ -453,6 +453,12 @@ func TestAFinishedUploadIsHeldForItsGrace(t *testing.T) {
 			}
 			if !bytes.Equal(readBack(t, again, info.Hash), b) {
 				t.Fatal("held blob reads back wrong after reopen")
+			}
+			// The reopened store's hold starts at the pointer's recorded wall-clock time, which
+			// carries no monotonic reading; Windows' wall clock is coarse enough that a fast Put
+			// and this Collect read the same instant, still inside even a 1ns grace.
+			for put := time.Now().Round(0); !time.Now().Round(0).After(put); {
+				time.Sleep(time.Millisecond)
 			}
 			expired := New(shim, "app/data", small, Config{UploadGrace: time.Nanosecond})
 			if n, err := expired.Collect(none); err != nil || n != 1 {

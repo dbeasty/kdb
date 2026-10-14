@@ -87,13 +87,17 @@ func TestAttachmentKotlinFixtures(t *testing.T) {
 		proof = append(proof, p.Bytes[:]...)
 	}
 	tab := kotlinFixtureTable(t)
+	packed, err := AppendPackedAttachmentTables(nil, []AttachmentTable{tab})
+	if err != nil {
+		t.Fatal(err)
+	}
 	got := map[string]string{
 		"multiChunk":  AttachmentContentHash(data).Hex(),
 		"threeChunks": AttachmentContentHash(data[:3*AttachmentChunkBytes]).Hex(),
 		"empty":       AttachmentContentHash(nil).Hex(),
 		"proof2":      hex.EncodeToString(proof),
 		"tableRoot":   tab.Root().Hex(),
-		"packed":      hex.EncodeToString(AppendPackedAttachmentTables(nil, []AttachmentTable{tab})),
+		"packed":      hex.EncodeToString(packed),
 		"commitHash":  kotlinFixtureCommit(t).Hash.Hex(),
 	}
 	want := map[string]string{

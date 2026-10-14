@@ -32,6 +32,8 @@ var fieldToKey = map[string]string{
 	"MaintenanceInterval":    "governance.maintenanceInterval",
 	"MaintenanceSweep":       "governance.maintenanceSweep",
 	"AttachmentUploadGrace":  "governance.attachmentUploadGrace",
+	"AttachmentDeltaStepMB":  "governance.attachmentDeltaStepMB",
+	"AttachmentDeltas":       "governance.attachmentDeltas",
 	"MaintenanceMaxDefer":    "governance.maintenanceMaxDefer",
 	"TLSCert":                "tls.certFile",
 	"TLSKey":                 "tls.keyFile",
@@ -107,12 +109,12 @@ func envProbeValue(key string) string {
 		return "true"
 	case "control.settingsPersist", "control.promote":
 		return "true"
-	case "control.ui":
+	case "control.ui", "governance.attachmentDeltas":
 		// Defaults to on, so "true" would be indistinguishable from nothing happening.
 		return "false"
 	case "memory.budgetMB", "memory.limitMB", "memory.reserveMB",
 		"governance.maxConnections", "governance.scanRowBudget", "governance.maxResultRows", "storage.asyncSyncIntervalMS",
-		"governance.maintenanceMaxDefer":
+		"governance.maintenanceMaxDefer", "governance.attachmentDeltaStepMB":
 		return "4242"
 	case "governance.abortAfter", "governance.drainTimeout", "governance.maintenanceInterval",
 		"governance.maintenanceSweep", "governance.attachmentUploadGrace":

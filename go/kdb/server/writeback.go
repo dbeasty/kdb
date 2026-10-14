@@ -100,9 +100,10 @@ func (s *KdbServerRuntime) localWriteMessage(tx document.Transaction) string {
 			}
 		}
 		if attaches[id] {
-			set := setHashHex(table.List(id))
-			if set == "" {
-				set = "-"
+			// The trie holds the set's hash: no set is read.
+			set := "-"
+			if h, ok := table.SetHash(id); ok {
+				set = h.Hex()
 			}
 			base += "@" + set
 		}
@@ -140,10 +141,10 @@ func parseLocalWrite(msg string) (ids []codec.UUID, bases map[codec.UUID]string,
 // pendingWrite turns a local write commit into what is sent: each document's final state, from
 // the commit's ops (which hold full bodies) and, for one whose attachments it changed, its
 // attachment set after the commit - and its bases.
-func (s *KdbServerRuntime) pendingWrite(c document.Commit) (peersync.PendingWrite, bool) {
+func (s *KdbServerRuntime) pendingWrite(c document.Commit) (peersync.PendingWrite, bool, error) {
 	ids, bases, ok := parseLocalWrite(c.Message)
 	if !ok {
-		return peersync.PendingWrite{}, false
+		return peersync.PendingWrite{}, false, nil
 	}
 	final := map[codec.UUID]*string{}
 	touched := map[codec.UUID]bool{}
@@ -159,7 +160,7 @@ func (s *KdbServerRuntime) pendingWrite(c document.Commit) (peersync.PendingWrit
 		}
 	}
 	var table document.AttachmentTable
-	tableErr := error(nil)
+	var tableErr error
 	w := peersync.PendingWrite{Commit: c.Hash, TxID: peersync.WriteBackTxID(c.Hash)}
 	for _, id := range ids {
 		base, attachBase, attaches := strings.Cut(bases[id], "@")
@@ -176,15 +177,22 @@ func (s *KdbServerRuntime) pendingWrite(c document.Commit) (peersync.PendingWrit
 			if table.Documents() == 0 && tableErr == nil {
 				table, tableErr = s.dag.AttachmentTableAt(c.Hash)
 			}
+			if tableErr != nil {
+				return peersync.PendingWrite{}, false, tableErr
+			}
+			set, err := table.List(id)
+			if err != nil {
+				return peersync.PendingWrite{}, false, err
+			}
 			d.AttachmentsChanged = true
-			d.Attachments = toTreeAttachments(table.List(id))
+			d.Attachments = toTreeAttachments(set)
 			if attachBase != "-" {
 				d.AttachmentsBase = attachBase
 			}
 		}
 		w.Docs = append(w.Docs, d)
 	}
-	return w, true
+	return w, true, nil
 }
 
 // resolvedCommit reads which local write a decision commit decided on.
@@ -222,7 +230,11 @@ func (s *KdbServerRuntime) loadPendingLocked() error {
 		if !ok {
 			break
 		}
-		if w, ok := s.pendingWrite(c); ok {
+		w, ok, err := s.pendingWrite(c)
+		if err != nil {
+			return err
+		}
+		if ok {
 			pending = append(pending, w)
 		} else if r, ok := resolvedCommit(c.Message); ok && stop == nil {
 			stop = &r
@@ -432,7 +444,10 @@ func (s *KdbServerRuntime) ApplyWriteBack(principal auth.Principal, m wire.Proje
 		if err != nil {
 			return refusedWrite("document " + d.DocID + ": " + err.Error()), nil
 		}
-		have := table.List(id)
+		have, err := table.List(id)
+		if err != nil {
+			return wire.ProjectWriteResultMessage{}, err
+		}
 		if setHashHex(have) != d.AttachmentsBase {
 			// Changed at the source since the projection's copy. Judged here, against the head
 			// read above; a change landing after it is a conflict the commit itself detects.
@@ -495,8 +510,10 @@ func (s *KdbServerRuntime) notApplied(principal auth.Principal, ids []codec.UUID
 				// With the attachments at the same commit, so the projection is put back whole.
 				if h, err := codec.HashFromHex(at); err == nil {
 					if table, err := s.dag.AttachmentTableAt(h); err == nil {
-						cur.Attachments = toTreeAttachments(table.List(id))
-						res.CommitHex = at
+						if set, err := table.List(id); err == nil {
+							cur.Attachments = toTreeAttachments(set)
+							res.CommitHex = at
+						}
 					}
 				}
 			}

@@ -47,7 +47,7 @@ func (d *InMemoryCommitDag) mergeAttachmentOpsLocked(tx document.Transaction, pa
 	if sameRoot(ours.Root(), theirs.Root()) {
 		return nil, nil
 	}
-	base := document.EmptyAttachmentTable()
+	base := d.attachments.setPool().Empty()
 	if bases := d.mergeBasesLocked([]codec.Hash{parents[0]}, []codec.Hash{parents[1]}); len(bases) > 0 {
 		if base, err = d.attachmentTableLocked(bases[0]); err != nil {
 			return nil, err
@@ -89,11 +89,23 @@ func (d *InMemoryCommitDag) mergeAttachmentOpsLocked(tx document.Transaction, pa
 
 	var ops []document.Op
 	for _, doc := range docs {
+		o, err := ours.List(doc)
+		if err != nil {
+			return nil, err
+		}
 		var merged document.AttachmentSet
 		if tree.Contains(doc) {
-			merged = mergeAttachmentSets(base.List(doc), ours.List(doc), theirs.List(doc))
+			b, err := base.List(doc)
+			if err != nil {
+				return nil, err
+			}
+			th, err := theirs.List(doc)
+			if err != nil {
+				return nil, err
+			}
+			merged = mergeAttachmentSets(b, o, th)
 		}
-		ops = append(ops, attachmentSetOps(doc, ours.List(doc), merged)...)
+		ops = append(ops, attachmentSetOps(doc, o, merged)...)
 	}
 	return ops, nil
 }
