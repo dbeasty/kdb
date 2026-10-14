@@ -52,7 +52,7 @@ internal class DefaultPeerSyncClient(
             connection = conn
             val ns =
                 PeerSyncNamespace(
-                    config.namespaceId, dag, storage, config.blobs, config.materializeCommit, config.conflictPolicy,
+                    config.namespaceId, dag, storage, config.blobs, config.materializeCommit, config.conflictPolicy, config.snapshots,
                 )
             val session =
                 try {

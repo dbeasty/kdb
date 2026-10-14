@@ -1,7 +1,11 @@
 package dev.kdb.peersync
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbUuid
+import dev.kdb.document.AttachmentTable
 import dev.kdb.document.KdbCommit
+import dev.kdb.document.KdbDocument
+import dev.kdb.document.KdbOp
 import dev.kdb.error.ConflictReport
 import dev.kdb.stream.WireConnection
 import dev.kdb.wire.WireCodec
@@ -82,6 +86,7 @@ internal class V2PeerSession(
     private val ns: PeerSyncNamespace,
     private var remote: NamespaceRefs,
     private val pageBytes: Int = DEFAULT_PAGE_BYTES,
+    private val preferSnapshot: Boolean = false,
 ) : PeerSession {
     override val namespaceId: String get() = ns.namespaceId
 
@@ -116,7 +121,7 @@ internal class V2PeerSession(
     suspend fun close() = connection.close()
 
     /** This session paging by [bytes] (tests: one commit a page). */
-    internal fun withPageBytes(bytes: Int): V2PeerSession = V2PeerSession(conn, connection, ns, remote, bytes)
+    internal fun withPageBytes(bytes: Int): V2PeerSession = V2PeerSession(conn, connection, ns, remote, bytes, preferSnapshot)
 
     private suspend fun result(r: V2SyncResult): PeerSyncResult {
         val head = ns.dag.head()
@@ -126,6 +131,7 @@ internal class V2PeerSession(
     /** Pulls every ref the peer advertises (Go's v2Conn.pull). */
     suspend fun pull(): V2SyncResult {
         if (remote.access == SyncV2.ACCESS_PUSH) return V2SyncResult()
+        if (needsSnapshot()) bootstrapFromSnapshot()
         var haves = localHeads()
         var pulled = 0
         val local = LinkedHashMap<String, String>()
@@ -178,7 +184,7 @@ internal class V2PeerSession(
         var pushed = 0
         val outcomes = LinkedHashMap<String, String>()
         val refErrors = LinkedHashMap<String, String>()
-        for (ref in orderedRefs(refsOf(ns.namespaceId, ns.dag))) {
+        for (ref in orderedRefs(refsOf(ns.namespaceId, ns.dag, ns.snapshots?.shallowRoots().orEmpty()))) {
             val remoteHex = if (ref.kind == SyncV2.REF_TAG) remote.tags[ref.name] else remote.branches[ref.name]
             if (remoteHex == ref.hex) continue
             val local = KdbHash.fromHex(ref.hex)
@@ -224,6 +230,59 @@ internal class V2PeerSession(
         }
     }
 
+    /**
+     * Go's needsSnapshot: this namespace is fresh, the peer's main is elsewhere, and the peer cannot
+     * send the history behind it (a shallow root, a retention floor) - or a snapshot is preferred.
+     */
+    private suspend fun needsSnapshot(): Boolean {
+        val snapshots = ns.snapshots ?: return false
+        if (SyncV2.CAP_SNAPSHOT !in conn.caps) return false
+        val main = remote.branches[MAIN_BRANCH] ?: return false
+        if (main == ns.dag.head().toHex() || !snapshots.canInstall()) return false
+        return preferSnapshot || remote.shallow.isNotEmpty() || remote.historyFloorHex.isNotEmpty()
+    }
+
+    /**
+     * Takes the peer's state at its main head (Go's InstallSnapshot): every page, checked to be of
+     * the same commit; then the blobs its attachment table names, each chunk checked - before
+     * anything is installed, so the node never lists an attachment it lacks bytes of; then the
+     * install, durable before main moves.
+     */
+    private suspend fun bootstrapFromSnapshot() {
+        val snapshots = ns.snapshots!!
+        val at = remote.branches.getValue(MAIN_BRANCH)
+        val docs = ArrayList<KdbDocument>()
+        var root: KdbCommit? = null
+        var tables: ByteArray? = null
+        var after = ""
+        while (true) {
+            val page =
+                conn.requestSync(SyncV2Message.SnapshotFetch(conn.next(), ns.namespaceId, at, after, pageBytes)) as? SyncV2Message.SnapshotPage
+                    ?: throw PeerSyncException("peer sync: expected SNAPSHOT_PAGE")
+            if (page.commit.hash.toHex() != at || (root != null && page.commit.hash != root.hash)) {
+                throw PeerSyncException("peer sync: snapshot pages of ${page.commit.hash.toHex()}, asked for $at")
+            }
+            root = page.commit
+            for (d in page.docs) docs += KdbDocument(KdbUuid.fromString(d.docId), d.body)
+            if (page.done) {
+                tables = page.attachmentTables
+                break
+            }
+            if (page.docs.isEmpty() || page.next.isEmpty()) throw PeerSyncException("peer sync: a snapshot page made no progress")
+            after = page.next
+        }
+        val r = root!!
+        val attachRoot = r.attachmentTreeHash
+        if (attachRoot != null && attachments) {
+            val table =
+                tables?.let { AttachmentTable.parsePacked(it) }?.firstOrNull { it.root == attachRoot }
+                    ?: throw PeerSyncException("peer sync: the snapshot of ${r.hash.toHex()} has attachments but not their table")
+            val puts = table.entries().map { (doc, a) -> KdbOp.AttachmentPut(doc, a.id, a.name, a.scheme, a.contentHash, a.size, a.mime) }.toList()
+            fetchBlobs(conn, ns.blobs!!, ns.namespaceId, listOf(r.copy(operations = puts)))
+        }
+        snapshots.install(r, docs, tables)
+    }
+
     private suspend fun localHeads(): List<KdbHash> =
         (ns.dag.listBranches().map { it.headHash } + ns.dag.listTags().map { it.commitHash }).distinct()
 
@@ -242,7 +301,10 @@ internal suspend fun openV2Session(
     config: PeerClientConfig,
 ): V2PeerSession? {
     val conn = V2Conn(wire, connection, config.requestTimeoutMillis)
-    val caps = if (ns.blobs == null) SyncV2.CAPABILITIES - SyncV2.CAP_ATTACHMENTS else SyncV2.CAPABILITIES
+    val caps =
+        SyncV2.CAPABILITIES.filter {
+            (it != SyncV2.CAP_ATTACHMENTS || ns.blobs != null) && (it != SyncV2.CAP_SNAPSHOT || ns.snapshots != null)
+        }
     val ctx = config.connectionContext
     val reply =
         try {
@@ -261,5 +323,5 @@ internal suspend fun openV2Session(
     val refs =
         ack.refs.firstOrNull { it.namespace == ns.namespaceId }
             ?: throw PeerSyncException("peer sync: the peer did not grant namespace ${ns.namespaceId}")
-    return V2PeerSession(conn, connection, ns, refs)
+    return V2PeerSession(conn, connection, ns, refs, preferSnapshot = config.preferSnapshot)
 }

@@ -67,6 +67,10 @@ public object InMemoryWireTransportHub {
             return link
         }
 
+        internal suspend fun remove(link: ClientLink) {
+            clientsMutex.withLock { clients -= link }
+        }
+
         public suspend fun serverSend(frame: ByteArray) {
             val snapshot = clientsMutex.withLock { clients.toList() }
             for (c in snapshot) {
@@ -85,10 +89,13 @@ public object InMemoryWireTransportHub {
 
             override suspend fun close() {
                 serverToClient.close()
+                hub.remove(this)
             }
 
-            internal suspend fun deliverFromServer(frame: ByteArray) {
-                serverToClient.send(frame)
+            /** A client that closed takes no more frames: delivering to it is a no-op, not a failure
+             * for every client still connected. */
+            internal fun deliverFromServer(frame: ByteArray) {
+                serverToClient.trySend(frame)
             }
 
             override fun tryPoll(): ByteArray? = serverToClient.tryReceive().getOrNull()

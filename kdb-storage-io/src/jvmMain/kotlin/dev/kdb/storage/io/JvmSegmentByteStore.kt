@@ -143,7 +143,19 @@ internal class JvmSegmentByteStore(private val root: File) : SegmentByteStore {
     override suspend fun writeSnapshot(key: String, data: ByteArray) {
         val f = snapFile(key)
         f.parentFile?.mkdirs()
-        f.writeBytes(data)
+        // Temp file, fsync, rename, directory fsync - as Go's OS store writes a snapshot. A
+        // checkpoint can be a namespace's only record of its state (one installed from a peer's
+        // snapshot), so a crash mid-write must leave the old file whole, never a torn new one.
+        val tmp = File(f.parentFile, f.name + ".tmp")
+        java.io.FileOutputStream(tmp).use { out ->
+            out.write(data)
+            out.fd.sync()
+        }
+        java.nio.file.Files.move(
+            tmp.toPath(), f.toPath(),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+        )
+        runCatching { java.nio.channels.FileChannel.open(f.parentFile.toPath(), java.nio.file.StandardOpenOption.READ).use { it.force(true) } }
         val legacy = legacySnapFile(key)
         if (legacy != f) legacy.delete()
     }

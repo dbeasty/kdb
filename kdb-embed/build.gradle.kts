@@ -58,6 +58,12 @@ kotlin {
                 implementation(project(":kdb-transport-ws"))
             }
         }
+        val jvmTest by getting {
+            dependencies {
+                implementation(project(":kdb-stream"))
+                implementation(project(":kdb-wire"))
+            }
+        }
         val jsMain by getting {
             dependencies {
                 implementation(project(":kdb-auth"))

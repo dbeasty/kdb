@@ -337,6 +337,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
   byte; a Kotlin host's `BLOB_FETCH_RESULT` byte-identical to Go's for the same blob) and a
   real-process interop test both ways, with multi-chunk blobs and a chunk damaged on disk
   (`integration/attachments_peersync_interop_test.go`).
+- **Kotlin snapshot bootstrap** (`SNAPSHOT_FETCH`/`PAGE`, capability `snapshot`): a fresh Kotlin
+  namespace whose peer cannot send its history (a shallow root, a retention floor) takes the peer's
+  state at its head; the blobs its attachment table names are fetched and checked before anything is
+  installed. A file runtime persists it as Go's `PersistSnapshot` does - bodies as SSTables, a Go
+  checkpoint written byte for byte as Go writes it (`GoCheckpointWriter`: version 2, or 6 with the
+  attachment table), then the marker naming the root - so it reopens in Kotlin and in Go. A Kotlin
+  host serves its head's state and advertises its shallow roots. Pinned by Go-generated checkpoint
+  goldens (`embed/kotlin_checkpoint_golden_test.go`) and `integration/snapshot_peersync_interop_test.go`.
 - **Write-back projections** (follow-up): `PROJECT_WRITE` docs carry a document's whole
   attachment set after the write (`attachmentsChanged`, `attachments`), guarded by the set the
   projection held (`attachmentsBase`), and attachment-only writes (`keepBody`); a refused write
@@ -375,11 +383,12 @@ identity = SHA-256(0x02 || be64(size) || tree)
   engine has none; the driver says so for binary parameters), no maintenance loop calling
   `compactAttachments`, and answers `BLOB_FETCH` `UNSUPPORTED` on its SQL listener (blobs travel
   on the peer-sync listener).
-- **Kotlin peer sync** speaks only the v2 capabilities above: a Go peer never sends it snapshots,
+- **Kotlin peer sync** speaks the v2 capabilities above plus `snapshot`: a Go peer never sends it
   grafts, boundary states, squash catch-up, filters, `TREE_NODES`, projections, write-back, watches
-  or archived-commit stubs, and a Kotlin node cannot bootstrap from a peer whose history it cannot
-  replay (a shallow root or retention floor). One namespace per Kotlin host. A pull stores every page
-  it fetched even when main is not then adopted (as v1 did).
+  or archived-commit stubs. A Kotlin host serves a snapshot of its head only. One namespace per
+  Kotlin host. A pull stores every page it fetched even when main is not then adopted (as v1 did).
+- **Kotlin checkpoints** are written only by a snapshot install (through sequence -1): Kotlin never
+  checkpoints at close, so every open restores the install's checkpoint and replays the log after it.
 - **Kotlin** reads Go's checkpoints (#225) but derives no attachment table for a commit below a
   checkpoint's heads (their ops are not loaded for it).
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.

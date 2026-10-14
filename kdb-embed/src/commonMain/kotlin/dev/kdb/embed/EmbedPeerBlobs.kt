@@ -64,3 +64,37 @@ private class EmbedPeerBlobStore(
         override suspend fun close() = r.close()
     }
 }
+
+/** [namespaceId]'s snapshot bootstrap and serving for peer sync: install through [installSnapshot]
+ * (durable first, in a file runtime), serve documents at the head. Pass it as
+ * PeerClientConfig.snapshots / PeerHostConfig.snapshots. */
+public fun EmbeddedKdbRuntime.peerSnapshots(namespaceId: String = defaultNamespace): dev.kdb.peersync.PeerSnapshots {
+    val rt = this
+    return object : dev.kdb.peersync.PeerSnapshots {
+        override suspend fun canInstall(): Boolean = rt.canInstallSnapshot(namespaceId)
+
+        override suspend fun install(
+            root: dev.kdb.document.KdbCommit,
+            documents: List<dev.kdb.document.KdbDocument>,
+            attachmentTables: ByteArray?,
+        ) = rt.installSnapshot(namespaceId, SnapshotState(root, documents, attachmentTables))
+
+        override suspend fun shallowRoots(): List<KdbHash> = rt.shallowRootsOf(namespaceId)
+
+        // A commit synced in has its documents in storage but no tree in the DAG: the tree is built
+        // from storage once, checked against the commit, and kept for the pages that follow.
+        override suspend fun headTree(head: dev.kdb.document.KdbCommit): dev.kdb.document.DocumentTree {
+            rt.dag.getDocumentTree(head.documentTreeHash)?.let { return it }
+            val entries = HashMap<dev.kdb.codec.KdbUuid, KdbHash>()
+            rt.storage.scanDocuments(namespaceId, head.documentTreeHash) { batch -> for (d in batch) entries[d.id] = d.contentHash }
+            val tree = dev.kdb.document.DocumentTree.build(entries)
+            check(tree.treeHash == head.documentTreeHash) { "the live documents do not hash to ${head.hash.toHex()}'s tree" }
+            rt.dag.putDocumentTree(tree)
+            return tree
+        }
+
+        override suspend fun documentsAtHead(ids: List<dev.kdb.codec.KdbUuid>): List<dev.kdb.document.KdbDocument?> =
+            // Storage reads take the tree's hash (an in-memory adapter keys its trees by it).
+            rt.storage.getDocuments(namespaceId, ids, rt.dag.getCommitOrThrow(rt.dag.head()).documentTreeHash)
+    }
+}

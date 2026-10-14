@@ -105,7 +105,9 @@ private suspend fun materializeSingleCommit(
     commit: dev.kdb.document.KdbCommit,
 ) {
     val parent = commit.parentHashes.firstOrNull() ?: return
-    val parentTree = runtime.dag.getCommitOrThrow(parent).documentTreeHash
+    // A commit held without its parents is a shallow root (a snapshot installed from a peer): its
+    // state was installed whole, so there is nothing of it to apply.
+    val parentTree = runtime.dag.getCommit(parent)?.documentTreeHash ?: return
     for (op in commit.operations) {
         when (op) {
             is KdbOp.Write ->

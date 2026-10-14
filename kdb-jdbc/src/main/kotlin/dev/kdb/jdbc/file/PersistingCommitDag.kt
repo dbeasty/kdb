@@ -3,6 +3,8 @@ package dev.kdb.jdbc.file
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
+import dev.kdb.dag.CheckpointCommit
+import dev.kdb.dag.CheckpointRestorableDag
 import dev.kdb.dag.CommitDag
 import dev.kdb.dag.CommitDiff
 import dev.kdb.dag.CommitRef
@@ -18,8 +20,28 @@ import dev.kdb.document.KdbTransaction
 internal class PersistingCommitDag(
     private val delegate: CommitDag,
     private val persistence: DeltaCommitPersistence,
-) : CommitDag {
+) : CommitDag,
+    CheckpointRestorableDag {
     override val namespaceId: String get() = delegate.namespaceId
+
+    // Restoring and shallow roots go to the in-memory DAG without logging: a checkpoint holds that
+    // state (Go logs neither), and a logged shallow root would meet missing parents on a replay.
+    private val restorable: CheckpointRestorableDag
+        get() = delegate as? CheckpointRestorableDag ?: error("the underlying DAG cannot restore a checkpoint")
+
+    override suspend fun restoreCheckpoint(
+        commits: Sequence<CheckpointCommit>,
+        branches: List<KdbBranch>,
+        tags: List<KdbTag>,
+    ) = restorable.restoreCheckpoint(commits, branches, tags)
+
+    override suspend fun restoreCommitOperations(commits: List<KdbCommit>) = restorable.restoreCommitOperations(commits)
+
+    override suspend fun putShallowCommit(commit: KdbCommit) = restorable.putShallowCommit(commit)
+
+    override fun setOperationsLoader(loader: (suspend (KdbHash) -> KdbCommit?)?) = restorable.setOperationsLoader(loader)
+
+    override suspend fun commitsWithoutOperations(): Int = restorable.commitsWithoutOperations()
 
     override suspend fun lookupHashPrefix(hexPrefixLower: String): List<KdbHash> =
         delegate.lookupHashPrefix(hexPrefixLower)

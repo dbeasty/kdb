@@ -23,6 +23,9 @@ public data class PeerHostConfig(
      * (ATTACHMENT_UPLOAD). Null: this node advertises no attachment support, and a peer whose
      * commits carry attachments is refused them. */
     val blobs: PeerBlobStore? = null,
+    /** Serves this node's state at its head to a peer bootstrapping from a snapshot, and
+     * advertises the roots of snapshots this node was bootstrapped from. */
+    val snapshots: PeerSnapshots? = null,
 )
 
 public data class PeerClientConfig(
@@ -42,6 +45,10 @@ public data class PeerClientConfig(
     val protocolV2: Boolean = true,
     /** How long a request waits for its reply. */
     val requestTimeoutMillis: Long = 30_000,
+    /** Snapshot bootstrap for a fresh namespace; null: always replay history. */
+    val snapshots: PeerSnapshots? = null,
+    /** Bootstrap a fresh namespace from a snapshot even when the peer could send all its history. */
+    val preferSnapshot: Boolean = false,
 )
 
 public data class DagSyncPlan(

@@ -118,7 +118,13 @@ public fun openFileRuntime(
         indexBlobs = blobs,
         indexStoreFactory = storeFactory,
         attachmentShim = io,
-    )
+    ).also { rt ->
+        // A snapshot installed from a peer is made durable as Go makes it (FileSnapshotPersistence),
+        // and the roots earlier installs left are known again.
+        rt.snapshotPersistence = FileSnapshotPersistence(dataRoot, io)
+        val roots = NamespaceMarker.shallowRoots(dataRoot, namespaceId).mapNotNull { runCatching { KdbHash.fromHex(it) }.getOrNull() }
+        if (roots.isNotEmpty()) rt.shallowRoots[namespaceId] = roots.toMutableSet()
+    }
 }
 
 /**
