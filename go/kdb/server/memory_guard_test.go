@@ -196,9 +196,12 @@ func sparseMapping(t *testing.T, size int64) *mmapfile.Mapping {
 // mappedCharge is what the guard's off-cgroup reading adds on top of the Go runtime's footprint.
 func mappedCharge() float64 { return currentMemoryUsageBytes() - goRuntimeFootprintBytes() }
 
-// Off a cgroup, mapped pages that are in memory must show up in what the guard measures -
-// otherwise a hot mapped commit graph is invisible to the zones on macOS.
-func TestMemoryUsageChargesResidentMappedPagesOffCgroup(t *testing.T) {
+// Off a cgroup, mapped pages - read-only, so always clean and reclaimable - are not charged even
+// when every one of them is resident: they cost performance under pressure, never memory safety.
+func TestMemoryUsageDoesNotChargeResidentMappedPagesOffCgroup(t *testing.T) {
+	if _, ok := cgroupMemoryCurrentBytes(); ok {
+		t.Skip("running under a cgroup: the guard reads the cgroup's working set instead")
+	}
 	const size = 64 << 20
 	m := sparseMapping(t, size)
 	r, err := m.Acquire()
@@ -215,17 +218,11 @@ func TestMemoryUsageChargesResidentMappedPagesOffCgroup(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// ResidentBytes is cached for about a second: wait for a reading taken after the touch.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		diff := mappedCharge()
-		if diff >= size*9/10 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("read all of a 64MB mapping but the guard charged only %.0f bytes for it", diff)
-		}
-		time.Sleep(100 * time.Millisecond)
+	if resident := mmapfile.ResidentBytesUncached(); resident < size*9/10 {
+		t.Skipf("the read left only %d of %d bytes resident; nothing to check", resident, size)
+	}
+	if charged := mappedCharge(); charged > size/10 {
+		t.Fatalf("a fully read 64MB read-only mapping raised the guard's reading by %.0f bytes", charged)
 	}
 }
 
@@ -238,8 +235,6 @@ func TestMemoryUsageDoesNotChargeUntouchedMappingOffCgroup(t *testing.T) {
 	const size = 256 << 20
 	before := mappedCharge()
 	_ = sparseMapping(t, size)
-	// Past the ResidentBytes cache interval, so the reading below was counted with the mapping live.
-	time.Sleep(1200 * time.Millisecond)
 	if grew := mappedCharge() - before; grew >= size/2 {
 		t.Fatalf("an untouched 256MB mapping raised the guard's reading by %.0f bytes", grew)
 	}
