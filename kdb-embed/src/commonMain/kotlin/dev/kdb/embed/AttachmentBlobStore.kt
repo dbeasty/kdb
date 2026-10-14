@@ -1,6 +1,7 @@
 package dev.kdb.embed
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
 import dev.kdb.document.ATTACHMENT_CHUNK_BYTES
 import dev.kdb.document.AttachmentHasher
@@ -10,6 +11,11 @@ import dev.kdb.document.merkleTreeHash
 import dev.kdb.storage.PlatformIoShim
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
+
+/** How long [AttachmentBlobStore.collect] keeps a finished upload no commit references yet, unless told otherwise. */
+public val DEFAULT_ATTACHMENT_UPLOAD_GRACE: Duration = 1.hours
 
 /**
  * Attachment bytes for one namespace (docs/kdb-attachments-plan.md, "Storage"): one blob per
@@ -20,7 +26,18 @@ import kotlinx.coroutines.sync.withLock
  *  - `u-<uuid>`: a blob's bytes, streamed under a random name while its hash is not yet known;
  *  - `h-<hash>`: the blob's pointer - a header naming its bytes segment, its size, and its chunk
  *    (leaf) hashes - written, flushed and sealed only once the bytes are, so a crash leaves either a
- *    readable blob or an unreferenced upload that [collect] removes.
+ *    readable blob or an unreferenced upload that [collect] removes;
+ *  - `g-<hash>.<millis>`: an empty segment recording when the blob's upload grace started (below).
+ *
+ * Uploads are held. A writer uploads first and commits after, so a finished blob no commit references
+ * yet is not garbage: [collect] keeps it for [uploadGrace] after its upload finished. The start is in
+ * the hold segment's name, written before the pointer, so the hold survives a restart; a blob stored
+ * before holds existed has none, and has no grace. A re-upload of a stored blob restarts the grace.
+ * The hold ends as soon as a durable commit references the blob ([committed]), or a [collect] sees it
+ * referenced: from then on references alone decide, so a version replaced before the next collect is
+ * not kept for the rest of its grace. (A hold is its own segment, not a pointer field, so a pointer
+ * never has to be rewritten - the shim cannot replace a segment atomically - and an older build,
+ * which ignores segments it does not know, still reads every pointer.)
  *
  * Reads verify: [open] checks the stored leaves fold to the content hash, and every chunk is checked
  * against its leaf before a byte of it is handed out. An open reader pins its blob: [delete] and
@@ -34,12 +51,20 @@ public class AttachmentBlobStore(
     private val namespaceId: String,
     /** Caps one attachment; 0 is no limit. */
     public val maxBytes: Long = 0,
+    /** How long [collect] keeps a finished upload no commit references yet: the longest an upload
+     * may wait for its commit. Not positive: [DEFAULT_ATTACHMENT_UPLOAD_GRACE]. */
+    uploadGrace: Duration = DEFAULT_ATTACHMENT_UPLOAD_GRACE,
 ) {
+    public val uploadGrace: Duration = if (uploadGrace.isPositive()) uploadGrace else DEFAULT_ATTACHMENT_UPLOAD_GRACE
+
     private val prefix = "ns/$namespaceId/attachment-kt/"
     private val mutex = Mutex()
     private val pins = mutableMapOf<KdbHash, Int>()
     private val doomed = mutableMapOf<KdbHash, String>() // pinned blobs to remove on last release: hash -> bytes segment
     private val uploading = mutableSetOf<String>() // upload segments in flight, which collect must leave
+    private val holds = mutableMapOf<KdbHash, Long>() // held blobs: hash -> when the grace started (epoch ms)
+    private val holdSegments = mutableMapOf<KdbHash, MutableList<String>>() // their hold segments on disk
+    private var holdsLoaded = false
 
     private fun pointerName(h: KdbHash) = prefix + "h-" + h.toHex()
 
@@ -83,12 +108,15 @@ public class AttachmentBlobStore(
         val size = hasher.size
         mutex.withLock {
             uploading -= upload
+            loadHoldsLocked()
             if (readPointer(hash) != null) {
                 // Already stored: the upload was a duplicate. A removal queued behind a reader is
-                // called off - the blob is wanted again.
+                // called off - the blob is wanted again - and its grace restarts.
                 doomed.remove(hash)
                 shim.deleteSegment(upload)
+                holdLocked(hash)
             } else {
+                holdLocked(hash) // before the pointer: a pointer is never without its hold
                 val ptr = pointerName(hash)
                 runCatching { shim.deleteSegment(ptr) } // a torn pointer from a crash
                 shim.appendToSegment(ptr, encodePointer(upload, size, hasher.leafHashes))
@@ -128,6 +156,7 @@ public class AttachmentBlobStore(
 
     private suspend fun deleteLocked(hash: KdbHash) {
         val ptr = readPointer(hash) ?: return
+        releaseHoldLocked(hash)
         if ((pins[hash] ?: 0) > 0) {
             doomed[hash] = ptr.segment
             return
@@ -137,13 +166,28 @@ public class AttachmentBlobStore(
     }
 
     /**
-     * Deletes every blob [keep] rejects (deferred while read), and every bytes segment no pointer
-     * names - uploads a crash interrupted. Returns how many blobs were removed.
+     * Ends the hold on blobs a durable commit references: from here on references alone decide.
+     * ([collect] also ends the hold on any blob it finds referenced.)
+     */
+    public suspend fun committed(hashes: Collection<KdbHash>) {
+        mutex.withLock {
+            loadHoldsLocked()
+            for (h in hashes) releaseHoldLocked(h)
+        }
+    }
+
+    /**
+     * Deletes every blob [keep] rejects (deferred while read) unless it is within its upload grace
+     * ([uploadGrace]), and every bytes segment no pointer names - uploads a crash interrupted.
+     * Returns how many blobs were removed.
      */
     public suspend fun collect(keep: (KdbHash) -> Boolean): Int =
         mutex.withLock {
+            loadHoldsLocked()
+            val now = nowMillis()
             val names = shim.listSegments(namespaceId).filter { it.startsWith(prefix) }
             val referenced = mutableSetOf<String>()
+            val stored = mutableSetOf<KdbHash>()
             var removed = 0
             for (name in names) {
                 if (!name.startsWith(prefix + "h-")) continue
@@ -153,12 +197,23 @@ public class AttachmentBlobStore(
                     shim.deleteSegment(name) // torn
                     continue
                 }
-                if (keep(h) || h in doomed) {
-                    referenced += ptr.segment
-                } else {
-                    deleteLocked(h)
-                    if (h in doomed) referenced += ptr.segment
-                    removed++
+                val since = holds[h]
+                when {
+                    keep(h) -> {
+                        releaseHoldLocked(h) // committed: references decide from here on
+                        referenced += ptr.segment
+                        stored += h
+                    }
+                    h in doomed -> referenced += ptr.segment
+                    since != null && now - since < uploadGrace.inWholeMilliseconds -> {
+                        referenced += ptr.segment // uploaded, its commit still to come
+                        stored += h
+                    }
+                    else -> {
+                        deleteLocked(h)
+                        if (h in doomed) referenced += ptr.segment
+                        removed++
+                    }
                 }
             }
             for (name in names) {
@@ -166,8 +221,60 @@ public class AttachmentBlobStore(
                     shim.deleteSegment(name)
                 }
             }
+            // A hold whose blob is gone, or that a crash left before its pointer was written.
+            for (h in holdSegments.keys.toList()) if (h !in stored) releaseHoldLocked(h)
             removed
         }
+
+    /** Reads the hold segments once. Must hold [mutex]. */
+    private suspend fun loadHoldsLocked() {
+        if (holdsLoaded) return
+        for (name in shim.listSegments(namespaceId)) {
+            if (!name.startsWith(prefix + "g-")) continue
+            val (h, at) = parseHold(name) ?: continue
+            holdSegments.getOrPut(h) { mutableListOf() } += name
+            holds[h] = maxOf(holds[h] ?: at, at)
+        }
+        holdsLoaded = true
+    }
+
+    /**
+     * Starts [h]'s grace now. The hold segment is rewritten only once the recorded start is half a
+     * grace old, so the hold survives a restart without a write per upload of a blob uploaded often.
+     * Must hold [mutex].
+     */
+    private suspend fun holdLocked(h: KdbHash) {
+        val now = nowMillis()
+        val old = holdSegments[h].orEmpty()
+        val recorded = old.mapNotNull { parseHold(it)?.second }.maxOrNull()
+        holds[h] = now
+        if (recorded != null && now - recorded < uploadGrace.inWholeMilliseconds / 2) return
+        val name = prefix + "g-" + h.toHex() + "." + now
+        if (name !in old) {
+            shim.appendToSegment(name, ByteArray(0))
+            shim.flushSegment(name)
+            shim.sealSegment(name)
+        }
+        for (o in old) if (o != name) runCatching { shim.deleteSegment(o) }
+        holdSegments[h] = mutableListOf(name)
+    }
+
+    /** Ends [h]'s hold, in memory and on disk. Must hold [mutex]. */
+    private suspend fun releaseHoldLocked(h: KdbHash) {
+        holds.remove(h)
+        holdSegments.remove(h)?.forEach { runCatching { shim.deleteSegment(it) } }
+    }
+
+    private fun parseHold(name: String): Pair<KdbHash, Long>? {
+        val rest = name.removePrefix(prefix + "g-")
+        val dot = rest.lastIndexOf('.')
+        if (dot < 0) return null
+        val h = runCatching { KdbHash.fromHex(rest.substring(0, dot)) }.getOrNull() ?: return null
+        val at = rest.substring(dot + 1).toLongOrNull() ?: return null
+        return h to at
+    }
+
+    private fun nowMillis(): Long = KdbTimestamp.now().epochMillis
 
     internal suspend fun release(hash: KdbHash) {
         mutex.withLock {

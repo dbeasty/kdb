@@ -5,7 +5,10 @@ import dev.kdb.document.ATTACHMENT_CHUNK_BYTES
 import dev.kdb.document.AttachmentException
 import dev.kdb.document.attachmentContentHash
 import dev.kdb.storage.mem.InMemoryPlatformIoShim
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -13,6 +16,9 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 /** The embed attachment API - go/kdb/embed/attachments.go's behaviour, in Kotlin. */
 class EmbedAttachmentsTest {
@@ -22,6 +28,9 @@ class EmbedAttachmentsTest {
         n: Int,
         seed: Int,
     ): ByteArray = ByteArray(n) { (it * 31 + seed).toByte() }
+
+    /** Waits in real time (runTest's own clock is virtual) - for an upload grace to run out. */
+    private suspend fun sleep(d: Duration) = withContext(Dispatchers.Default) { delay(d) }
 
     private suspend fun EmbeddedKdbRuntime.read(
         doc: KdbUuid,
@@ -93,11 +102,15 @@ class EmbedAttachmentsTest {
     fun historySettingsAndCompaction() =
         runTest {
             val rt = openMemoryRuntime("c", ns)
+            rt.setAttachmentUploadGrace(50.milliseconds)
             val doc = KdbUuid.fromString(putJson(rt, ns, "{}"))
             val (c1, _) = rt.putAttachment(ns, doc, AttachmentSource.of(bytes(1000, 1)), PutAttachmentOptions(name = "f"))
             rt.putAttachment(ns, doc, AttachmentSource.of(bytes(1000, 2)), PutAttachmentOptions(name = "f"))
-            // An upload never committed.
+            // An upload never committed: held for its grace (its commit may yet come), then collected.
             val orphan = rt.attachmentStore(ns).put(AttachmentSource.of(bytes(10, 3)))
+            assertEquals(0, rt.compactAttachments(ns).removed)
+            assertTrue(rt.attachmentStore(ns).has(orphan.hash))
+            sleep(100.milliseconds)
             assertEquals(1, rt.compactAttachments(ns).removed)
             assertFalse(rt.attachmentStore(ns).has(orphan.hash))
             assertContentEquals(bytes(1000, 1), rt.read(doc, AttachmentSelector.ByName("f"), c1.hash))
@@ -153,5 +166,89 @@ class EmbedAttachmentsTest {
             bad.close()
             // A size limit.
             assertFailsWith<AttachmentTooLargeException> { AttachmentBlobStore(shim, ns, maxBytes = 5).put(AttachmentSource.of(ByteArray(6))) }
+        }
+
+    @Test
+    fun anUploadIsHeldForItsCommit() =
+        runTest {
+            val store = AttachmentBlobStore(InMemoryPlatformIoShim(), ns)
+            val blob = store.put(AttachmentSource.of(bytes(100, 5)))
+            assertEquals(0, store.collect { false })
+            val r = store.open(blob.hash)
+            assertContentEquals(bytes(100, 5), r.readAll())
+            r.close()
+        }
+
+    @Test
+    fun aHeldUploadIsCollectedAfterItsGrace() =
+        runTest {
+            val shim = InMemoryPlatformIoShim()
+            val store = AttachmentBlobStore(shim, ns, uploadGrace = 30.milliseconds)
+            val blob = store.put(AttachmentSource.of(bytes(100, 6)))
+            // An upload a crash interrupted: bytes and no pointer. It has no grace.
+            shim.appendToSegment("ns/$ns/attachment-kt/u-abandoned", bytes(10, 7))
+            assertEquals(0, store.collect { false })
+            assertTrue(store.has(blob.hash))
+            assertFalse("ns/$ns/attachment-kt/u-abandoned" in shim.listSegments(ns))
+            sleep(80.milliseconds)
+            assertEquals(1, store.collect { false })
+            assertFalse(store.has(blob.hash))
+            assertEquals(emptyList(), shim.listSegments(ns)) // bytes, pointer and hold all gone
+        }
+
+    @Test
+    fun aDurableCommitEndsTheHold() =
+        runTest {
+            // In the store: once committed, references alone decide.
+            val store = AttachmentBlobStore(InMemoryPlatformIoShim(), ns)
+            val blob = store.put(AttachmentSource.of(bytes(100, 8)))
+            store.committed(listOf(blob.hash))
+            assertEquals(1, store.collect { false })
+
+            // Through the runtime, under the default (hour-long) grace: a version committed and then
+            // replaced goes at the next compaction, not an hour later.
+            val rt = openMemoryRuntime("c", ns)
+            rt.setAttachmentHistory(AttachmentHistory.LATEST)
+            val doc = KdbUuid.fromString(putJson(rt, ns, "{}"))
+            val (c1, _) = rt.putAttachment(ns, doc, AttachmentSource.of(bytes(1000, 1)), PutAttachmentOptions(name = "f"))
+            rt.putAttachment(ns, doc, AttachmentSource.of(bytes(1000, 2)), PutAttachmentOptions(name = "f"))
+            assertEquals(1, rt.compactAttachments(ns).removed)
+            assertFailsWith<AttachmentNotRetainedException> { rt.read(doc, AttachmentSelector.ByName("f"), c1.hash) }
+            assertContentEquals(bytes(1000, 2), rt.read(doc, AttachmentSelector.ByName("f")))
+        }
+
+    @Test
+    fun aReopenedStoreKeepsTheHold() =
+        runTest {
+            val shim = InMemoryPlatformIoShim()
+            val held = AttachmentBlobStore(shim, ns).put(AttachmentSource.of(bytes(100, 9)))
+            val committed = AttachmentBlobStore(shim, ns).put(AttachmentSource.of(bytes(100, 10)))
+            AttachmentBlobStore(shim, ns).committed(listOf(committed.hash))
+            val reopened = AttachmentBlobStore(shim, ns)
+            assertEquals(1, reopened.collect { false }) // the committed one: its hold ended for good
+            assertTrue(reopened.has(held.hash))
+            assertFalse(reopened.has(committed.hash))
+
+            // A blob stored before holds existed (no hold segment) has no grace.
+            for (g in shim.listSegments(ns).filter { it.contains("/g-") }) shim.deleteSegment(g)
+            assertEquals(1, AttachmentBlobStore(shim, ns).collect { false })
+            assertFalse(AttachmentBlobStore(shim, ns).has(held.hash))
+        }
+
+    @Test
+    fun aReuploadRestartsTheGrace() =
+        runTest {
+            val shim = InMemoryPlatformIoShim()
+            val grace = 1.seconds
+            val blob = AttachmentBlobStore(shim, ns, uploadGrace = grace).put(AttachmentSource.of(bytes(100, 11)))
+            sleep(600.milliseconds)
+            AttachmentBlobStore(shim, ns, uploadGrace = grace).put(AttachmentSource.of(bytes(100, 11)))
+            sleep(600.milliseconds)
+            // Past the first upload's grace, within the second's - and recorded, so a reopened store sees it.
+            assertEquals(0, AttachmentBlobStore(shim, ns, uploadGrace = grace).collect { false })
+            assertEquals(1, shim.listSegments(ns).count { it.contains("/g-") })
+            sleep(600.milliseconds)
+            assertEquals(1, AttachmentBlobStore(shim, ns, uploadGrace = grace).collect { false })
+            assertFalse(AttachmentBlobStore(shim, ns).has(blob.hash))
         }
 }

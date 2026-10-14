@@ -163,6 +163,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
     `Store.Committed`), or a `Collect` sees it referenced; references alone decide after that, so a
     replaced version is not kept for an hour. After a restart, a blob whose recorded finish time
     is within the grace is held again until a `Collect` sees it referenced.
+  - Kotlin (`AttachmentBlobStore`) holds the same way, default one hour,
+    `setAttachmentUploadGrace` on the embed runtime. Its pointer format is unchanged: the hold is an
+    empty `g-<hash>.<millis>` segment written before the pointer, since the shim cannot replace a
+    segment atomically and an older build would read a new pointer format as torn and delete the
+    blob. A pointer with no hold segment (stored before holds existed) has no grace. A re-upload
+    restarts the grace (rewritten once half a grace old). The hold ends when `commitViaEngine`
+    commits a put (the file runtime's commit is durable by then) or a collect sees the blob
+    referenced; the hold segment is deleted then, so unlike Go a restart does not revive it.
 
 ## Embed API (done)
 
@@ -266,7 +274,7 @@ identity = SHA-256(0x02 || be64(size) || tree)
 
 - **All-history GC** walks commit headers; the set pool is held in memory (see PR 1's limits).
 - **Deltas** apply only to versions within `DeltaMaxBytes` (256 MiB).
-- **The Kotlin store** has its own on-disk layout, no deltas, no read leases and no upload grace; Kotlin does not
+- **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
   read Go's v5 checkpoint and graph formats and has no blob peer transfer.
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.
 
