@@ -14,27 +14,6 @@ import (
 	"github.com/limidus/kdb/go/kdb/storage/engine"
 )
 
-// sstableSidecarFiles lists ns's SSTables and their index sidecars, relative to the namespace directory.
-func sstableSidecarFiles(t *testing.T, dataRoot, ns string) (tables, sidecars []string) {
-	t.Helper()
-	nsDir := filepath.Join(dataRoot, "ns", filepath.FromSlash(ns))
-	filepath.WalkDir(nsDir, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		rel, _ := filepath.Rel(nsDir, p)
-		rel = filepath.ToSlash(rel)
-		switch {
-		case strings.HasPrefix(rel, "sstable/"):
-			tables = append(tables, rel)
-		case strings.HasPrefix(rel, "sstidx/"):
-			sidecars = append(sidecars, rel)
-		}
-		return nil
-	})
-	return tables, sidecars
-}
-
 // probeEveryTable looks up a key no table holds, which asks every table.
 func probeEveryTable(t *testing.T, rt *embed.EmbeddedKdbRuntime) {
 	t.Helper()

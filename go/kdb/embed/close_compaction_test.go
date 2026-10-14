@@ -2,6 +2,9 @@ package embed_test
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -149,4 +152,25 @@ func TestCloseDuringABackgroundMerge(t *testing.T) {
 	rt := closeCompactionRuntime(t, root, 1, false, false)
 	defer rt.Close()
 	requireLatest(t, rt, latest, "after closes that raced a background merge")
+}
+
+// sstableSidecarFiles lists ns's SSTables and their index sidecars, relative to the namespace directory.
+func sstableSidecarFiles(t *testing.T, dataRoot, ns string) (tables, sidecars []string) {
+	t.Helper()
+	nsDir := filepath.Join(dataRoot, "ns", filepath.FromSlash(ns))
+	filepath.WalkDir(nsDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(nsDir, p)
+		rel = filepath.ToSlash(rel)
+		switch {
+		case strings.HasPrefix(rel, "sstable/"):
+			tables = append(tables, rel)
+		case strings.HasPrefix(rel, "sstidx/"):
+			sidecars = append(sidecars, rel)
+		}
+		return nil
+	})
+	return tables, sidecars
 }
