@@ -26,12 +26,19 @@ import (
 // Phase 1. Callers (FileBackedPlatformIO) already serialize Append calls
 // per segment, so the handle cache itself only needs to guard the map,
 // not each write.
+//
+// Only segments still being written keep a handle: MarkSealed closes and
+// forgets one, so handles grow with the segments open for appending, not
+// with every segment the process has ever written
+// (docs/kdb-memory-cassandra-plan.md: memory a bounded cache).
 type OSByteStore struct {
 	root             string
 	syncMode         SyncMode
 	preallocateBytes int64
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// handles holds a write handle per segment being appended to, until it is sealed, deleted,
+	// renamed or released.
 	handles map[string]*openSegment
 	// readers caches read-only handles so a read does not open, stat and close a file. Reading
 	// every document after a restart (a scan, or a cold get) goes through here once per document,
@@ -45,10 +52,6 @@ const maxReadHandles = 512
 type openSegment struct {
 	file *os.File
 	size int64 // atomic
-	// sealed is set by MarkSealed and cleared by any later append (atomic). Sealing is otherwise
-	// advisory - the handle stays open - so this is what lets Stamp vouch for a segment this
-	// process wrote and will not append to again.
-	sealed int32
 }
 
 func NewOSByteStore(config PlatformIOConfig) (*OSByteStore, error) {
@@ -147,6 +150,12 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 		// logical end by scanning frames instead (plan doc §3.3), since the
 		// file size of a preallocated segment says nothing about how much of
 		// it is data.
+		//
+		// That holds within one process as well as across a restart: MarkSealed
+		// drops a segment's handle, so a segment sealed earlier by this process
+		// would come back through here too, and is safe only because nothing
+		// appends to a sealed segment (FileBackedPlatformIO refuses one it
+		// recently sealed; the writers never return to one they sealed).
 		logicalSize = info.Size()
 	default:
 		return nil, err
@@ -165,6 +174,16 @@ func (s *OSByteStore) openFor(segmentName string) (*openSegment, error) {
 }
 
 func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
+	size, err := s.appendOnce(segmentName, bytes)
+	if err != nil && errors.Is(err, os.ErrClosed) {
+		// The handle was closed and dropped under us (released, or sealed by a caller not
+		// serialized with this append); the write did not happen, so reopen and write once more.
+		size, err = s.appendOnce(segmentName, bytes)
+	}
+	return size, err
+}
+
+func (s *OSByteStore) appendOnce(segmentName string, bytes []byte) (int64, error) {
 	seg, err := s.openFor(segmentName)
 	if err != nil {
 		return 0, err
@@ -183,10 +202,6 @@ func (s *OSByteStore) Append(segmentName string, bytes []byte) (int64, error) {
 	// FileBackedPlatformIO (see this type's doc comment), which is what makes
 	// load-then-advance safe here.
 	offset := atomic.LoadInt64(&seg.size)
-	if atomic.LoadInt32(&seg.sealed) != 0 {
-		// Written after its seal (a repair, say): no longer something Stamp may vouch for.
-		atomic.StoreInt32(&seg.sealed, 0)
-	}
 	if _, err := seg.file.WriteAt(bytes, offset); err != nil {
 		return 0, err
 	}
@@ -217,20 +232,18 @@ func (s *OSByteStore) Size(segmentName string) (int64, error) {
 }
 
 // Stamp reports a segment's size and modification time, or ok=false while this process holds it
-// open for appending and has not sealed it: such a segment's contents are still changing, so
-// nothing may be cached against them.
+// open for appending: such a segment's contents are still changing, so nothing may be cached
+// against them. Sealing drops the handle (MarkSealed), so a sealed segment is stamped from the
+// file, exactly as one written by an earlier process is - for a preallocated delta segment that
+// is the padded file length, not the logical end, and the same stamp a later process will see.
 func (s *OSByteStore) Stamp(segmentName string) (size, modNanos int64, ok bool, err error) {
 	s.mu.Lock()
-	seg, open := s.handles[segmentName]
+	_, open := s.handles[segmentName]
 	s.mu.Unlock()
-	if open && atomic.LoadInt32(&seg.sealed) == 0 {
+	if open {
 		return 0, 0, false, nil
 	}
 	info, err := os.Stat(s.pathFor(segmentName))
-	if err == nil && open {
-		// The logical size, which is what a scan reads to; a preallocated file is longer.
-		return atomic.LoadInt64(&seg.size), info.ModTime().UnixNano(), true, nil
-	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, 0, false, &PlatformIOError{Message: "segment does not exist", SegmentName: segmentName, Cause: err}
@@ -385,10 +398,16 @@ func (s *OSByteStore) Flush(segmentName string, fsync bool) error {
 	seg, ok := s.handles[segmentName]
 	s.mu.Unlock()
 	if ok {
-		return syncFile(seg.file, s.syncMode)
+		err := syncFile(seg.file, s.syncMode)
+		if !errors.Is(err, os.ErrClosed) {
+			return err
+		}
+		// Sealed (or released) and closed since the lookup - FlushSegment runs concurrently with
+		// appends and seals, by design. Closing does not sync, so sync through a one-off handle:
+		// any descriptor on the file flushes what was written through the closed one.
 	}
-	// No open handle yet (e.g. Flush called before any Append in this
-	// process): fall back to a one-off open, matching prior behavior.
+	// No open handle (Flush called before any Append in this process, or
+	// after the segment was sealed): fall back to a one-off open.
 	//
 	// Opened for writing where possible: Windows refuses FlushFileBuffers on a handle without
 	// write access, where unix fsyncs a read-only descriptor happily. A file this process cannot
@@ -428,15 +447,21 @@ func (s *OSByteStore) Close() error {
 	return firstErr
 }
 
+// MarkSealed closes and forgets the segment's write handle: a sealed segment is not appended to
+// again (delta OpenWriter starts a new segment, an SSTable is written once), so keeping the handle
+// only held a descriptor and its state for every segment the process ever wrote. Persisted
+// segments are discovered by listing and scanning, so nothing else needs recording - with no
+// handle, Stamp vouches for the segment from the file and Size reports the file's length.
+//
+// Callers flush first (FileBackedPlatformIO.SealSegment); closing does not sync. A Flush racing
+// the close falls back to a fresh handle, and an append that loses the race reopens the segment.
 func (s *OSByteStore) MarkSealed(segmentName string) error {
-	// Sealing is advisory: persisted segments are discovered by listing + scanning, and the
-	// handle stays open. It is recorded only so Stamp can tell a finished segment from one still
-	// being written.
 	s.mu.Lock()
 	seg, ok := s.handles[segmentName]
+	delete(s.handles, segmentName)
 	s.mu.Unlock()
 	if ok {
-		atomic.StoreInt32(&seg.sealed, 1)
+		return seg.file.Close()
 	}
 	return nil
 }
