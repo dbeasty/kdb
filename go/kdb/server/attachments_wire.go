@@ -12,6 +12,7 @@ import (
 
 	"github.com/limidus/kdb/go/kdb/auth"
 	"github.com/limidus/kdb/go/kdb/codec"
+	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/embed"
 	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 	"github.com/limidus/kdb/go/kdb/wire"
@@ -66,6 +67,10 @@ type attachmentRead struct {
 	doc    codec.UUID
 	info   wire.AttachmentInfo
 	commit codec.Hash
+
+	treeOnce sync.Once
+	tree     *document.MerkleTree
+	treeErr  error
 }
 
 // attachmentReads is one connection's open reads.
@@ -291,7 +296,8 @@ func (h *sqlWireConnHandler) handleAttachmentGet(msg wire.AttachmentGetMessage) 
 		}
 		if msg.Close {
 			_ = rd.reader.Close()
-			out.EOF = true
+			out.Info, out.CommitHex, out.EOF = rd.info, rd.commit.Hex(), true
+			out.Superseded = h.attachmentSuperseded(rd)
 			return out
 		}
 	} else {
@@ -333,18 +339,41 @@ func (h *sqlWireConnHandler) handleAttachmentGet(msg wire.AttachmentGetMessage) 
 		reads.mu.Unlock()
 	}
 	out.Info, out.CommitHex = rd.info, rd.commit.Hex()
-	max := msg.MaxBytes
-	if max <= 0 {
-		max = attachmentPageDefault
+	page := msg.MaxBytes
+	if page <= 0 {
+		page = attachmentPageDefault
 	}
-	if max > wire.MaxAttachmentChunkBytes {
-		max = wire.MaxAttachmentChunkBytes
+	if page > wire.MaxAttachmentChunkBytes {
+		page = wire.MaxAttachmentChunkBytes
 	}
 	off := msg.Offset
 	if off < 0 || off > rd.info.Size {
-		return fail(fmt.Errorf("offset %d outside the attachment's %d bytes", off, rd.info.Size))
+		// Info stays on the error, so the client learns the size it overran.
+		h.closeRead(out.ReadID)
+		out.ReadID = ""
+		out.Error, out.ErrorCode = fmt.Sprintf("offset %d outside the attachment's %d bytes", off, rd.info.Size), wire.ErrorCodeSchemaViolation
+		return out
 	}
-	n := min(max, rd.info.Size-off)
+	if msg.Proofs {
+		// Whole chunks, so the client can check every one before handing out any of its bytes.
+		const chunk = document.AttachmentChunkBytes
+		end := (off + page + chunk - 1) / chunk * chunk
+		off = off / chunk * chunk
+		end = min(rd.info.Size, max(end, off+chunk), off+wire.MaxAttachmentChunkBytes)
+		page = end - off
+		tree, err := rd.merkleTree()
+		if err != nil {
+			h.closeRead(out.ReadID)
+			out.ReadID = ""
+			out.Error, out.ErrorCode = err.Error(), wire.ErrorCodeIntegrity
+			return out
+		}
+		out.Tree, out.Scheme = tree.Root(), int(document.AttachmentHashSchemeChunked1)
+		for i := off / chunk; i < document.AttachmentChunkCount(rd.info.Size) && (i*chunk < end || rd.info.Size == 0); i++ {
+			out.Chunks = append(out.Chunks, wire.BlobChunkProof{Leaf: i, Path: tree.Proof(int(i))})
+		}
+	}
+	n := min(page, rd.info.Size-off)
 	buf := make([]byte, n)
 	got, err := rd.reader.ReadAt(buf, off)
 	if err != nil && !(errors.Is(err, io.EOF) && int64(got) == n) {
@@ -358,6 +387,30 @@ func (h *sqlWireConnHandler) handleAttachmentGet(msg wire.AttachmentGetMessage) 
 		out.Superseded = h.attachmentSuperseded(rd)
 	}
 	return out
+}
+
+// merkleTree is the read's blob's Merkle tree, built from the store's leaf hashes on the first page
+// that asks for proofs and kept for the rest of the read. It must hash, with the size, to the
+// content hash the read serves.
+func (rd *attachmentRead) merkleTree() (*document.MerkleTree, error) {
+	rd.treeOnce.Do(func() {
+		leaves := make([]codec.Hash, document.AttachmentChunkCount(rd.info.Size))
+		for i := range leaves {
+			l, err := rd.reader.ChunkLeaf(int64(i))
+			if err != nil {
+				rd.treeErr = err
+				return
+			}
+			leaves[i] = l
+		}
+		tree := document.NewMerkleTree(leaves)
+		if document.AttachmentIdentity(tree.Root(), rd.info.Size) != rd.info.Hash {
+			rd.treeErr = fmt.Errorf("attachment %s: stored chunk hashes do not build its content hash", rd.info.Hash.Hex())
+			return
+		}
+		rd.tree = tree
+	})
+	return rd.tree, rd.treeErr
 }
 
 func (h *sqlWireConnHandler) closeRead(id string) {

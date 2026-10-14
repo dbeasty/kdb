@@ -12,8 +12,8 @@ import (
 	"github.com/limidus/kdb/go/kdb/document"
 	"github.com/limidus/kdb/go/kdb/schema"
 	"github.com/limidus/kdb/go/kdb/storage"
-	storio "github.com/limidus/kdb/go/kdb/storage/io"
 	"github.com/limidus/kdb/go/kdb/storage/engine"
+	storio "github.com/limidus/kdb/go/kdb/storage/io"
 )
 
 func sectionTestShim(t *testing.T) (storage.PlatformIOShim, string) {

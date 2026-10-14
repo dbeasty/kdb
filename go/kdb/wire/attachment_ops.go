@@ -29,6 +29,10 @@ const (
 	// CellKindBytes and the $bytes / $attachment SQL parameters. Only meaningful with
 	// WireFeatureBinary.
 	WireFeatureAttachments = "attachments"
+	// WireFeatureAttachmentProofs: the peer answers an ATTACHMENT_GET with Proofs set with
+	// chunk-aligned pages carrying each chunk's RFC 6962 audit path, so a client can verify a range
+	// of an attachment without reading the rest. Only meaningful with WireFeatureAttachments.
+	WireFeatureAttachmentProofs = "attachment-proofs"
 	// SyncCapAttachments: the host serves BLOB_FETCH, accepts ATTACHMENT_UPLOAD on a sync session,
 	// and TREE_NODES with Tree "attachments".
 	SyncCapAttachments = "attachments"
@@ -78,7 +82,12 @@ func (m AttachmentUploadResultMessage) Header() Header { return m.H }
 // AsOfHex (empty: the session's read head), from Offset, at most MaxBytes (0: a server default).
 // The first page opens a read that pins that version: its result's ReadID, sent with each later
 // page, keeps reading the same bytes even if a newer version commits meanwhile. Close (with a
-// ReadID) ends a read early.
+// ReadID) ends a read early; its result's Superseded says whether the attachment has changed since
+// the read began.
+//
+// Proofs (behind WireFeatureAttachmentProofs) asks for verifiable pages: the server rounds Offset
+// down and the page's end up to 1 MiB chunk boundaries (the end at most to the attachment's), and
+// the result carries the blob's Tree and an audit path per chunk, as BLOB_FETCH does.
 type AttachmentGetMessage struct {
 	H            Header
 	Namespace    string
@@ -91,6 +100,7 @@ type AttachmentGetMessage struct {
 	MaxBytes     int64
 	ReadID       string
 	Close        bool
+	Proofs       bool
 }
 
 func (m AttachmentGetMessage) Header() Header { return m.H }
@@ -107,6 +117,11 @@ type AttachmentInfo struct {
 // AttachmentDataMessage is one page of an attachment. EOF marks the last; the read is then closed.
 // Superseded, on the last page, says the document's attachment has changed since the read began -
 // a newer version exists (or it was removed).
+//
+// Answering a get with Proofs, Data covers whole chunks from a chunk-aligned Offset (the last may
+// be short), Chunks proves each, bottom-up audit paths to Tree, and Scheme is the content hash's
+// scheme (1); Info.Hash is then AttachmentIdentity(Tree, Info.Size). A zero-byte attachment's
+// page proves its one empty chunk.
 type AttachmentDataMessage struct {
 	H          Header
 	Namespace  string
@@ -120,6 +135,9 @@ type AttachmentDataMessage struct {
 	Superseded bool
 	Error      string
 	ErrorCode  ErrorCode
+	Tree       codec.Hash
+	Chunks     []BlobChunkProof
+	Scheme     int
 }
 
 func (m AttachmentDataMessage) Header() Header { return m.H }
@@ -285,6 +303,7 @@ func appendAttachmentBody(b []byte, message Message) ([]byte, bool) {
 		b = appendInt(b, 8, m.MaxBytes)
 		b = appendString(b, 9, m.ReadID)
 		b = appendBool(b, 10, m.Close)
+		b = appendBool(b, 11, m.Proofs)
 	case AttachmentDataMessage:
 		b = appendString(b, 1, m.Namespace)
 		b = appendString(b, 2, m.ReadID)
@@ -296,6 +315,9 @@ func appendAttachmentBody(b []byte, message Message) ([]byte, bool) {
 		b = appendBool(b, 8, m.EOF)
 		b = appendBool(b, 9, m.Superseded)
 		b = appendErr(b, 10, m.Error, m.ErrorCode)
+		b = appendHash(b, 12, m.Tree)
+		b = appendProofs(b, 13, m.Chunks)
+		b = appendInt(b, 14, int64(m.Scheme))
 	case AttachmentListMessage:
 		b = appendString(b, 1, m.Namespace)
 		b = appendString(b, 2, m.SessionID)
@@ -331,17 +353,7 @@ func appendAttachmentBody(b []byte, message Message) ([]byte, bool) {
 				b = appendHash(b, 4, p.Tree)
 				b = appendInt(b, 5, p.Offset)
 				b = appendBytes(b, 6, p.Data)
-				for _, c := range p.Chunks {
-					b = appendNested(b, 7, func(b []byte) []byte {
-						if c.Leaf != 0 {
-							b = appendInt(b, 1, c.Leaf)
-						}
-						for _, h := range c.Path {
-							b = appendBytes(b, 2, h.Bytes[:])
-						}
-						return b
-					})
-				}
+				b = appendProofs(b, 7, p.Chunks)
 				b = appendBool(b, 8, p.EOF)
 				b = appendBool(b, 9, p.Superseded)
 				return appendErr(b, 10, p.Error, p.ErrorCode)
@@ -427,6 +439,8 @@ func decodeAttachmentBody(header Header, r *binReader) (Message, bool) {
 				m.ReadID = r.str(wt)
 			case 10:
 				m.Close = r.bool(wt)
+			case 11:
+				m.Proofs = r.bool(wt)
 			default:
 				r.skip(wt)
 			}
@@ -458,6 +472,12 @@ func decodeAttachmentBody(header Header, r *binReader) (Message, bool) {
 				m.Error = r.str(wt)
 			case 11:
 				m.ErrorCode = ErrorCode(r.str(wt))
+			case 12:
+				m.Tree = r.hash(wt)
+			case 13:
+				m.Chunks = append(m.Chunks, r.proof(wt))
+			case 14:
+				m.Scheme = int(r.int(wt))
 			default:
 				r.skip(wt)
 			}
@@ -577,26 +597,7 @@ func (r *binReader) blobPart() BlobFetchPart {
 		case 6:
 			p.Data = cloneBytes(r.bytes(wt))
 		case 7:
-			sub := r.sub(wt)
-			var c BlobChunkProof
-			for f, wt, ok := sub.next(); ok; f, wt, ok = sub.next() {
-				switch f {
-				case 1:
-					c.Leaf = sub.int(wt)
-				case 2:
-					var h codec.Hash
-					raw := sub.bytes(wt)
-					if len(raw) != len(h.Bytes) {
-						sub.fail("proof hash is not 32 bytes")
-					}
-					copy(h.Bytes[:], raw)
-					c.Path = append(c.Path, h)
-				default:
-					sub.skip(wt)
-				}
-			}
-			r.adopt(&sub)
-			p.Chunks = append(p.Chunks, c)
+			p.Chunks = append(p.Chunks, r.proof(wt))
 		case 8:
 			p.EOF = r.bool(wt)
 		case 9:
@@ -610,4 +611,44 @@ func (r *binReader) blobPart() BlobFetchPart {
 		}
 	}
 	return p
+}
+
+// appendProofs writes one nested field per chunk proof: 1 its leaf index (left out when 0), 2 each
+// path hash, as 32 raw bytes, bottom up.
+func appendProofs(b []byte, field int, chunks []BlobChunkProof) []byte {
+	for _, c := range chunks {
+		b = appendNested(b, field, func(b []byte) []byte {
+			if c.Leaf != 0 {
+				b = appendInt(b, 1, c.Leaf)
+			}
+			for _, h := range c.Path {
+				b = appendBytes(b, 2, h.Bytes[:])
+			}
+			return b
+		})
+	}
+	return b
+}
+
+func (r *binReader) proof(wt int) BlobChunkProof {
+	sub := r.sub(wt)
+	var c BlobChunkProof
+	for f, wt, ok := sub.next(); ok; f, wt, ok = sub.next() {
+		switch f {
+		case 1:
+			c.Leaf = sub.int(wt)
+		case 2:
+			var h codec.Hash
+			raw := sub.bytes(wt)
+			if len(raw) != len(h.Bytes) {
+				sub.fail("proof hash is not 32 bytes")
+			}
+			copy(h.Bytes[:], raw)
+			c.Path = append(c.Path, h)
+		default:
+			sub.skip(wt)
+		}
+	}
+	r.adopt(&sub)
+	return c
 }
