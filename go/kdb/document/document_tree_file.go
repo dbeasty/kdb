@@ -110,6 +110,10 @@ type TreeFile struct {
 	onWrite func()
 	closed  bool
 	failed  bool // a write failed; stop writing, keep serving from what is mapped and the heap
+	// background counts rewrites in flight (maybeRewrite), which Close waits for: one that
+	// outlived it could take the same next sequence as a TreeFile reopened on the directory, and
+	// both rename onto one path.
+	background sync.WaitGroup
 }
 
 // treeFile is the slab's view of its binding.
@@ -144,7 +148,8 @@ func NewTreeFile(opts TreeFileOptions) (*TreeFile, error) {
 // ErrTreeFileUnsupported means trees cannot be paged on this host.
 var ErrTreeFileUnsupported = errors.New("document: tree files are not supported on this platform")
 
-// Close stops the binding deleting files: a later open of the same namespace may be using them.
+// Close stops the binding deleting files - a later open of the same namespace may be using them -
+// and waits for a background rewrite in flight to finish.
 func (f *TreeFile) Close() {
 	if f == nil {
 		return
@@ -152,6 +157,19 @@ func (f *TreeFile) Close() {
 	f.mu.Lock()
 	f.closed = true
 	f.mu.Unlock()
+	f.background.Wait()
+}
+
+// startBackground registers a background write, refusing once f stops being writable. Under mu,
+// so none can start after Close has marked f closed and begun waiting.
+func (f *TreeFile) startBackground() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.opts.ReadOnly || f.closed || f.failed {
+		return false
+	}
+	f.background.Add(1)
+	return true
 }
 
 func (f *TreeFile) segPath(seq uint64) string {
@@ -1059,10 +1077,15 @@ func (s *trieSlab) maybeRewrite(h *trieTree) {
 	if live*recBytes < f.opts.ResidentBytes || since*recBytes < f.opts.ResidentBytes/2 {
 		return
 	}
-	if !f.writable() || !s.rewriting.CompareAndSwap(false, true) {
+	if !s.rewriting.CompareAndSwap(false, true) {
+		return
+	}
+	if !f.startBackground() {
+		s.rewriting.Store(false)
 		return
 	}
 	go func() {
+		defer f.background.Done()
 		defer s.rewriting.Store(false)
 		if _, err := s.writeOut(f, h, -1, false); err != nil {
 			f.fail(err)
