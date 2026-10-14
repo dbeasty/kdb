@@ -21,6 +21,7 @@ import dev.kdb.wire.WireHeader
 import dev.kdb.wire.WireMessage
 import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.defaultWireCodec
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.runBlocking
 import java.security.MessageDigest
 import kotlin.test.Test
@@ -250,6 +251,67 @@ class SyncV2AttachmentsTest {
                 assertEquals(remote.dag.head(), local.dag.head())
                 client.disconnect()
             }
+        }
+
+    /** A peer that drops the connection fails the request at once, not after the request timeout. */
+    @Test
+    fun aDroppedConnectionFailsTheRequestAtOnce() =
+        runBlocking {
+            val incoming = kotlinx.coroutines.channels.Channel<ByteArray>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            val conn =
+                object : dev.kdb.stream.WireConnection {
+                    override suspend fun send(frame: ByteArray) {
+                        incoming.close() // the peer hangs up instead of answering
+                    }
+
+                    override fun incoming() = incoming.receiveAsFlow()
+
+                    override suspend fun close() {}
+                }
+            val started = System.nanoTime()
+            val e =
+                assertFailsWith<PeerSyncException> {
+                    V2Conn(wire, conn, 30_000).requestSync(SyncV2Message.Hello(1, "n", 2, emptyList(), listOf("ns")))
+                }
+            assertTrue("closed the connection" in e.message!!, e.message)
+            assertTrue(System.nanoTime() - started < 5_000_000_000L, "took the timeout")
+        }
+
+    /** A transfer of many pages works the missing set out once; asking for a page again (its tips
+     * not named as held) gets the same page, and the pages together are every commit, parents first. */
+    @Test
+    fun aMultiPageFetchWalksHistoryOnce() =
+        runBlocking {
+            val ns = "app/cursor"
+            val node = Node(ns)
+            repeat(15) { node.attach(KdbUuid.random(), KdbUuid.random(), "f$it", byteArrayOf(it.toByte())) }
+            val head = node.dag.head()
+            val genesis = node.dag.walk(head).last().let { (it as dev.kdb.dag.TraversalEntry.Full).commit.hash }
+            val session = SyncV2HostSession(wire, node.namespace, "host", dev.kdb.auth.AllowAllAuth, dev.kdb.auth.ConnectionContext.EMPTY)
+            session.handleFrame(SyncV2Codec.encode(SyncV2Message.Hello(1, "peer", 2, SyncV2.CAPABILITIES, listOf(ns))))
+            val got = ArrayList<KdbCommit>()
+            var haves = listOf(genesis)
+            var cid = 2
+            fun page(h: List<KdbHash>) =
+                runBlocking {
+                    SyncV2Codec.decode(session.handleFrame(SyncV2Codec.encode(SyncV2Message.FetchRequest(cid++, ns, listOf(head), h, 1)))) as SyncV2Message.PackPage
+                }
+            var p = page(haves)
+            assertEquals(p.commits.map { it.hash }, page(haves).commits.map { it.hash }, "a repeated request moved on")
+            while (true) {
+                got += p.commits
+                if (p.done) break
+                haves = listOf(genesis) + pageTips(p.commits)
+                p = page(haves)
+            }
+            assertEquals(30, got.size)
+            assertEquals(1, session.missingWalks)
+            val seen = HashSet<KdbHash>(listOf(genesis))
+            for (c in got) {
+                assertTrue(c.parentHashes.all { it in seen }, "parent after child")
+                seen += c.hash
+            }
+            session.close()
         }
 
     @Test
