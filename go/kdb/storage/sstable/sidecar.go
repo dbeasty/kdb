@@ -302,6 +302,7 @@ type sidecar struct {
 	fanoutBits  int
 	fanout      []byte
 	entries     []byte
+	entriesOff  int // where entries starts in the mapping
 	bloom       []byte
 	bloomBlocks uint64
 	bytes       int64
@@ -324,6 +325,11 @@ func openSidecar(path string, tableSize int64, fileHash codec.Hash) (*sidecar, e
 		sc.close()
 		return nil, fmt.Errorf("sstable: sidecar %s: %w", path, err)
 	}
+	// The checksum pass read every page, and a lookup needs a few of them - a filter block, a
+	// fanout entry, a handful of index pages. Leaving them all resident cost the whole file per
+	// table opened: a merge opening the sidecars of 49 inputs raised RSS by ~180 MB before
+	// reading any of them. Pages a lookup does need fault back in from the page cache.
+	_ = r.DropPages(0, m.Size())
 	return sc, nil
 }
 
@@ -376,6 +382,7 @@ func (sc *sidecar) verify(tableSize int64, fileHash codec.Hash) (err error) {
 		sc.count, sc.fanoutBits, sc.bloomBlocks = int(count), int(fanoutBits), blocks
 		sc.fanout = data[l.fanoutOff : l.fanoutOff+4<<fanoutBits]
 		sc.entries = data[l.entriesOff : l.entriesOff+l.count*sidecarEntrySize]
+		sc.entriesOff = l.entriesOff
 		sc.bloom = data[l.bloomOff:l.trailerOff]
 		prev := uint32(0)
 		for p := 0; p < 1<<fanoutBits; p++ {

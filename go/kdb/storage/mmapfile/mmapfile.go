@@ -25,6 +25,7 @@ package mmapfile
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -233,6 +234,34 @@ func (r *Region) Guard(fn func([]byte)) (err error) {
 	}()
 	fn(r.m.data)
 	return nil
+}
+
+// DropPages tells the kernel the mapped pages wholly inside [off, off+n) will not be read again
+// soon, so they leave the process's resident set now rather than when the mapping is closed. For a
+// reader that walks a mapping once, front to back - a merge reading its inputs' sidecars - and
+// would otherwise keep every page it has passed resident until the end.
+//
+// Only whole pages are dropped: the partial pages at either end stay, so a caller can drop what is
+// behind its read position without losing the page it is in. The bytes are unchanged - the mapping
+// is read-only and file-backed - and reading them again faults them back in. A no-op off Linux and
+// Darwin.
+func (r *Region) DropPages(off, n int) error {
+	data := r.m.data
+	if off < 0 || n < 0 || off+n > len(data) {
+		return fmt.Errorf("mmapfile: DropPages(%d, %d) outside a %d-byte mapping", off, n, len(data))
+	}
+	start, end := wholePages(off, n, os.Getpagesize())
+	if end <= start {
+		return nil
+	}
+	return dropResident(data[start:end])
+}
+
+// wholePages is the span of the whole pages inside [off, off+n), empty (end <= start) when there
+// is none. Mappings start on a page boundary, so offsets into one are page-aligned where the file's
+// are.
+func wholePages(off, n, page int) (start, end int) {
+	return (off + page - 1) / page * page, (off + n) / page * page
 }
 
 // Release returns the reference. Safe to call more than once.

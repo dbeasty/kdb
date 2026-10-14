@@ -255,15 +255,28 @@ type mergeSource interface {
 // sidecarSource reads a table's sidecar, whose entries are sorted and unique by construction.
 // The entries are copied out a batch at a time under the mapping's fault guard, so a sidecar
 // truncated underneath fails the merge rather than crashing it.
+//
+// The pages it has read are dropped from the process's resident set as it goes (DropPages), every
+// sidecarDropEvery bytes and at the end. A merge reads each input's sidecar once, front to back,
+// and without this every page it passed stayed resident until the input was unmapped after the
+// merge: about 480 MB of a 10M-document namespace's merge. A lookup that needs one of those pages
+// faults it back in from the page cache.
 type sidecarSource struct {
 	sc    *sidecar
 	pos   int
 	owned bool // close unmaps it: opened for this merge, not borrowed from a store
+	// dropFrom is the byte offset, in the mapping, up to which pages have been dropped.
+	dropFrom int
 }
+
+// sidecarDropEvery is how many bytes of entries a sidecarSource reads between drops: one call per
+// megabyte, against one per batch.
+const sidecarDropEvery = 1 << 20
 
 func (s *sidecarSource) fill(buf []indexEntry) (int, error) {
 	n := min(len(buf), s.sc.count-s.pos)
 	if n <= 0 {
+		s.dropRead(true)
 		return 0, nil
 	}
 	err := s.sc.region.Guard(func([]byte) {
@@ -278,7 +291,28 @@ func (s *sidecarSource) fill(buf []indexEntry) (int, error) {
 		return 0, err
 	}
 	s.pos += n
+	s.dropRead(false)
 	return n, nil
+}
+
+// dropRead drops the pages of the entries read so far: once sidecarDropEvery bytes have built up,
+// or all of them when final. Only whole pages go (DropPages), and the next drop starts from the
+// last page boundary reached, so the page a read stopped inside is dropped next time instead of
+// never. A failure costs only residency, so it is ignored.
+func (s *sidecarSource) dropRead(final bool) {
+	if s.dropFrom == 0 {
+		s.dropFrom = s.sc.entriesOff
+	}
+	end := s.sc.entriesOff + s.pos*sidecarEntrySize
+	if !final && end-s.dropFrom < sidecarDropEvery {
+		return
+	}
+	if final {
+		end = len(s.sc.region.Bytes())
+	}
+	_ = s.sc.region.DropPages(s.dropFrom, end-s.dropFrom)
+	page := os.Getpagesize()
+	s.dropFrom = max(s.dropFrom, end/page*page)
 }
 
 func (s *sidecarSource) close() {
