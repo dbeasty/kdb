@@ -109,6 +109,9 @@ public data class HandshakeAckPayload(
     val rejectionReason: String? = null,
     /** The offered features the server accepted. Neither side sends a frame in one until it is here. */
     val wireFeatures: List<String> = emptyList(),
+    /** The release version of the server that sent the ack (Go's ServerVersion: "0.7.1", "0.0.0-dev"
+     * from source). The Go server always sends it; the Kotlin server leaves it empty. */
+    val serverVersion: String = "",
 )
 
 public data class DeltaCommitPayload(
@@ -468,6 +471,8 @@ public sealed class WireMessage {
         public val offset: Long = 0,
         public val data: ByteArray = ByteArray(0),
         public val final: Boolean = false,
+        /** On a first chunk, the blob about to be sent: a server already holding it answers with
+         * its hash and size at once (and holds it for the commit), and the client skips the bytes. */
         public val expect: KdbHash? = null,
     ) : WireMessage() {
         public fun copy(header: WireHeader): AttachmentUpload =

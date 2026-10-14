@@ -1,5 +1,8 @@
 package dev.kdb.server
 
+import dev.kdb.embed.attachmentStore
+import dev.kdb.transaction.BlobPresence
+
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
@@ -130,12 +133,21 @@ public class KdbServerRuntime(
         writeCoordinatorFor(namespaceId).run { rebuildInto(registry, namespaceId, schema) }
     }
 
+    /** In-flight attachment uploads (ATTACHMENT_UPLOAD): the server's, so an upload resumes on a
+     * new connection. */
+    public val attachmentUploads: ServerAttachmentUploads = ServerAttachmentUploads()
+
+    /** Preflight asks the namespace's attachment store whether a blob an AttachmentPut references
+     * is there - uploads go to it, not to the document blob store. */
+    private fun blobPresenceFor(namespaceId: String): BlobPresence = BlobPresence { runtime.attachmentStore(namespaceId).has(it) }
+
     public suspend fun engineFor(namespaceId: String): TransactionEngine =
         engineMutex.withLock {
             engines.getOrPut(namespaceId) {
                 transactionEngine(
                     runtime.policyRegistry.get(namespaceId).conflict,
                     uniqueKeys = uniqueKeysLocked(namespaceId),
+                    blobPresence = blobPresenceFor(namespaceId),
                 )
             }
         }
@@ -146,7 +158,7 @@ public class KdbServerRuntime(
     private suspend fun upsertEngineFor(namespaceId: String): TransactionEngine =
         engineMutex.withLock {
             upsertEngines.getOrPut(namespaceId) {
-                transactionEngine(ConflictPolicy.LAST_WRITE, uniqueKeys = uniqueKeysLocked(namespaceId))
+                transactionEngine(ConflictPolicy.LAST_WRITE, uniqueKeys = uniqueKeysLocked(namespaceId), blobPresence = blobPresenceFor(namespaceId))
             }
         }
 

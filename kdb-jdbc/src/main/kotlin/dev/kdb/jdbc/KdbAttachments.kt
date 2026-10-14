@@ -573,6 +573,9 @@ public class KdbAttachments internal constructor(
         const val DEFAULT_PAGE_BYTES: Int = 1 shl 20
         const val ATTACHMENTS_NOT_AGREED: String =
             "the server did not agree the 'attachments' wire feature: it cannot store or serve attachments"
+        const val BINARY_SQL_UNSUPPORTED: String =
+            "this server takes no binary SQL parameters (its SQL has no attachment statements): " +
+                "write attachments through KdbAttachments"
         const val PROOFS_NOT_AGREED: String =
             "the server did not agree the 'attachment-proofs' wire feature: it cannot serve verified ranged reads"
 

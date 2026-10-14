@@ -208,14 +208,8 @@ identity = SHA-256(0x02 || be64(size) || tree)
     `Store.Committed`), or a `Collect` sees it referenced; references alone decide after that, so a
     replaced version is not kept for an hour. After a restart, a blob whose recorded finish time
     is within the grace is held again until a `Collect` sees it referenced.
-  - Kotlin (`AttachmentBlobStore`) holds the same way, default one hour,
-    `setAttachmentUploadGrace` on the embed runtime. Its pointer format is unchanged: the hold is an
-    empty `g-<hash>.<millis>` segment written before the pointer, since the shim cannot replace a
-    segment atomically and an older build would read a new pointer format as torn and delete the
-    blob. A pointer with no hold segment (stored before holds existed) has no grace. A re-upload
-    restarts the grace (rewritten once half a grace old). The hold ends when `commitViaEngine`
-    commits a put (the file runtime's commit is durable by then) or a collect sees the blob
-    referenced; the hold segment is deleted then, so unlike Go a restart does not revive it.
+  - Kotlin (`AttachmentBlobStore`) holds the same way, in the same pointer field, default one
+    hour (`setAttachmentUploadGrace` on the embed runtime); `hold()` is Go's `Hold`.
 
 ## Embed API (done)
 
@@ -283,10 +277,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
   `OpenAttachmentRange` / `ReadAttachmentAt`; TS `openAttachmentRange` / `readAttachmentAt`; Kotlin
   `KdbAttachments.openRange` / `readAt` / `getRange`, and `KdbAttachments.blob()`, a `java.sql.Blob`
   whose `getBytes(pos, len)` / `getBinaryStream(pos, len)` read verified ranges. The Kotlin server
-  acks neither feature. A chunk failing its proof is the same corrupt error as below.
+  acks both features and serves them as Go's does. A chunk failing its proof is the same corrupt error as below.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
-  (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
-  Kotlin server answers the messages `UNSUPPORTED`.
+  (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); **Kotlin
+  server** (`kdb-server` `AttachmentsWire.kt`, a port of `attachments_wire.go`: server-owned
+  resumable uploads with `Expect`, pinned paged reads, proofs, `INTEGRITY`, `SCHEMA_VIOLATION` with
+  `Info`, `Superseded`). The JDBC driver takes the Go server's SQL dialect (plain JSON parameters,
+  DML buffered until `TX_COMMIT`) from the handshake ack's `serverVersion`, which only Go sends -
+  not from the `attachments` feature, which both servers ack.
 - **Peer sync** (`peersync/attachments.go`), capability `attachments`:
   - `BLOB_FETCH`/`_RESULT` 0x42/0x43, entries `(docId, attachmentId, commit, hash, offset,
     maxBytes)`, batched, paged by bytes, per-entry errors, each chunk with its RFC 6962 audit path;
@@ -312,6 +310,17 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - **Kotlin engine parity** (`kdb-document`, `kdb-dag`, `kdb-transaction`, `kdb-embed`): hashes,
   tables, roots, merges, preflight and conflicts identical to Go (checked against Go fixtures); a
   Kotlin attachment store and embed API.
+- **Kotlin store on Go's layout** (`kdb-embed` `AttachmentBlobStore.kt`, `AttachmentDelta.kt`): the
+  same segments as `attachstore` - `KDBATP3` pointers (`KDBATP2` read) with small blobs inline,
+  bytes and leaves segments, the `m-<gen>` mark - so either build opens and maintains a data
+  directory the other wrote; it leaves Go's `r-<gen>` reference index alone. Reads pin their whole
+  delta chain under a lease (`readLease`, default one hour, `AttachmentReadLeaseExpiredException`);
+  `storeAsDelta` and `collect` defer deleting pinned segments. `compactAttachments` re-stores
+  replaced versions as deltas from the DAG's replaced pairs and records the heads in the mark, as
+  Go's `CompactAttachments` does. Kotlin reads delta formats 1 and 2 and writes format 1 (Go reads
+  it). Pinned both ways by Go-generated goldens (pointers, format-1 delta bytes) and by a fixture
+  store each side builds from one recipe and the other opens (`attachstore/kotlin_fixture_test.go`,
+  kdb-jdbc `GoAttachStoreFixtureTest`).
 - **Write-back projections** (follow-up): `PROJECT_WRITE` docs carry a document's whole
   attachment set after the write (`attachmentsChanged`, `attachments`), guarded by the set the
   projection held (`attachmentsBase`), and attachment-only writes (`keepBody`); a refused write
@@ -336,8 +345,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
   index reads all of retained history once.
 - **Delta jobs restart after a crash.** Progress is in memory, so a restart mid-job redoes it from
   the start. Versions found not worth a delta are remembered per process only.
-- **The Kotlin store** has its own on-disk layout, no deltas and no read leases; Kotlin does not
-  read Go's v5 checkpoint and graph formats and has no blob peer transfer.
+- **The Kotlin store** shares Go's layout (above) but encodes a delta in one call, not in budgeted
+  steps, and only up to `deltaMaxBytes` (256 MiB); it has no `DisableDeltas` / inflate, and its GC
+  walks history rather than keeping the reference index.
+- **The Kotlin server** has no attachment SQL (`SET ATTACHMENT`, `ATTACHMENT()`: the Kotlin SQL
+  engine has none; the driver says so for binary parameters), no maintenance loop calling
+  `compactAttachments`, and answers `BLOB_FETCH` `UNSUPPORTED` (Kotlin peer sync is v1 only).
+- **Kotlin** reads Go's checkpoints (#225) but derives no attachment table for a commit below a
+  checkpoint's heads (their ops are not loaded for it).
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.
 
 ## Known limits of PR 1 (still open unless listed above as built)
