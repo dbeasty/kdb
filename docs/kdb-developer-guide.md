@@ -1187,7 +1187,8 @@ primary, syncnode.Config{Peers: ...})`; `node.Handler()` mounts peer sync on you
 phones use `go/mobile/kdbsync`. Everything else about topology, filtered peers, resolution chains,
 the control plane's conflict endpoints and recovery is in the
 [user guide](kdb-user-guide.md#peer-sync-and-replication). Go and Kotlin interoperate over sync
-protocol v1 only; v2 (messages `0x26`-`0x3F`) is Go-only.
+protocol v2's core - `SYNC_HELLO` to `REF_UPDATE_ACK` (`0x26`-`0x2D`) with attachment blobs (`BLOB_FETCH`,
+`ATTACHMENT_UPLOAD`) - and v1; the rest of v2 (`0x2E`-`0x41`: snapshots, projections, grafts, squash) is Go-only.
 
 ---
 

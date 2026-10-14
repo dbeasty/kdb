@@ -1729,8 +1729,9 @@ kdb --data-dir /var/lib/kdb resolve site/berlin/orders --all --take remote --ori
 Other namespaces keep the old rule, where commit rights are enough.
 
 **Across nodes and versions.**
-- Peer sync protocol v1, which Kotlin peers speak, carries no chain hash. So a namespace with a chain
-  never merges over v1: divergences are queued, and `main` is pushed only as a fast-forward.
+- Kotlin peers advertise no chain hash (they have no resolution chains; v1 carries none at all). So a
+  namespace with a chain never merges with a Kotlin peer: divergences are queued, and `main` is pushed
+  only as a fast-forward.
 - Kotlin reads the resulting history (the merge and `kdb:resolve/1` commits) like any other.
 - The Go CLI's `kdb sync` and `kdb resolve` read the chain from the data directory's `_kdb/meta`.
 - `kdb resolution <ns>` shows the chain.
