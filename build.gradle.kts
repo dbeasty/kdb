@@ -32,6 +32,22 @@ allprojects {
     group = "dev.kdb"
     version = kdbVersion
 
+    // Mocha's default 2s per-test timeout is too tight for CI's js shard: `jsTest --parallel` runs
+    // every module's karma Chrome and node tests at once on a 4-vCPU runner, and whichever CPU-heavy
+    // test is unlucky that run (ZstdCorruptionTest, AttachmentProofTest, VectorStoreTest...) fails
+    // with a bare "Error" (node: "Error at node:internal/timers"). Set here, on whatever framework the
+    // target chose: calling useMocha on a browser task would replace karma and stop testing in Chrome.
+    tasks.withType<org.jetbrains.kotlin.gradle.targets.js.testing.KotlinJsTest>().configureEach {
+        onTestFrameworkSet {
+            when (this) {
+                is org.jetbrains.kotlin.gradle.targets.js.testing.mocha.KotlinMocha -> timeout = "60s"
+                is org.jetbrains.kotlin.gradle.targets.js.testing.karma.KotlinKarma ->
+                    useConfigDirectory(rootProject.file("gradle/karma.config.d"))
+                else -> {}
+            }
+        }
+    }
+
     // The commit attributes below make every jar differ from one commit to the next. Without this,
     // every test task (and every compile that has a jar on its classpath) would see a changed input
     // and miss the build cache on every commit, even in a module nobody touched - which is what

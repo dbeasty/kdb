@@ -5,14 +5,8 @@ plugins {
 kotlin {
     jvm()
     js(IR) {
-        // VectorStoreTest.hnswRecallAtTenIsAtLeastNinetyFivePercent builds a 2,000-vector HNSW graph
-        // and runs exact and approximate searches (~0.8s locally). On CI's js shard,
-        // `jsTest --parallel` runs every module's karma Chrome and mocha node tests at once on a
-        // 4-vCPU runner, which pushed it past mocha's default 2s timeout - a bare "Error", not a
-        // recall miss. Raised as in kdb-compression and kdb-storage-chunking.
-        val jsTestTimeout = "60s"
-        browser { testTask { useMocha { timeout = jsTestTimeout } } }
-        nodejs { testTask { useMocha { timeout = jsTestTimeout } } }
+        browser()
+        nodejs()
     }
     linuxX64()
     macosArm64()
