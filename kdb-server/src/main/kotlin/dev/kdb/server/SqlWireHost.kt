@@ -49,6 +49,8 @@ import dev.kdb.wire.WireMessageType
 import dev.kdb.wire.SqlCellKind
 import dev.kdb.wire.negotiateWireFeatures
 import dev.kdb.wire.withWireFeatures
+import dev.kdb.wire.defaultWireCodec
+import dev.kdb.wire.PayloadEncoding
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonPrimitive
@@ -83,8 +85,15 @@ public class SqlWireHost(
     /** The codec replies are encoded with: [wire], until a handshake agrees wire features (binary
      * frames), then [wire] with those features. Requests are decoded by [wire] either way, since
      * decoding goes by each frame's own encoding tag. */
+    /** Replies are JSON-tagged frames (plus the agreed features' forms) and the ack says JSON, as
+     * the Go server's are, whatever [wire] encodes: a client that reads only JSON envelopes (the TS
+     * client) ignores a frame of any other tag, and checks the ack's negotiatedEncoding. Requests
+     * are decoded by [wire], which reads every tag. */
+    private val jsonWire: WireCodec = defaultWireCodec(PayloadEncoding.JSON)
+
     @Volatile
-    private var replyWire: WireCodec = wire
+    private var replyWire: WireCodec = jsonWire
+
 
     /** Test-only seam (Component 74 §12): invoked with the session id at the start of every SqlExec,
      * inside the per-session lock, so a test can hold one session's statement open and prove that
@@ -299,7 +308,7 @@ public class SqlWireHost(
         // Wire features are agreed only on an accepted handshake. The ack is a JSON frame either
         // way (a handshake has no binary form), so the client reads it before switching anything.
         val features = negotiateWireFeatures(msg.request.wireFeatures)
-        if (features.isNotEmpty()) replyWire = wire.withWireFeatures(features)
+        if (features.isNotEmpty()) replyWire = jsonWire.withWireFeatures(features)
         return handshakeAck(msg, accepted = true, head, rejectionReason = null, wireFeatures = features)
     }
 
@@ -314,7 +323,7 @@ public class SqlWireHost(
             header(msg.header.correlationId, WireMessageType.HANDSHAKE),
             dev.kdb.wire.HandshakeAckPayload(
                 accepted = accepted,
-                negotiatedEncoding = wire.encoding,
+                negotiatedEncoding = PayloadEncoding.JSON,
                 protocolVersion = KDB_WIRE_PROTOCOL_VERSION,
                 remoteHeads = mapOf(defaultNamespace to headHex),
                 rejectionReason = rejectionReason,

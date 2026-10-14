@@ -447,6 +447,21 @@ jobs:
             echo "interop test(s) reported SKIP - KDB_JVM_SQL_WS_URI wasn't honored, failing the job"
             exit 1
           fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: TS client against the Kotlin server (attachments)
+        working-directory: packages/kdb-client
+        env:
+          KDB_JVM_SQL_WS_URI: ws://127.0.0.1:17444/kdb
+        run: |
+          npm ci
+          set -o pipefail
+          node --test test/interop-kotlin-attachments.test.ts | tee /tmp/ts-interop.log
+          if grep -q 'KDB_JVM_SQL_WS_URI not set' /tmp/ts-interop.log; then
+            echo "the TS interop suite skipped - KDB_JVM_SQL_WS_URI wasn't honored, failing the job"
+            exit 1
+          fi
       - name: Stop kdb-service
         if: always()
         run: kill "$(cat /tmp/kdb-service.pid)" 2>/dev/null || true

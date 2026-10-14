@@ -321,6 +321,10 @@ identity = SHA-256(0x02 || be64(size) || tree)
   it). Pinned both ways by Go-generated goldens (pointers, format-1 delta bytes) and by a fixture
   store each side builds from one recipe and the other opens (`attachstore/kotlin_fixture_test.go`,
   kdb-jdbc `GoAttachStoreFixtureTest`).
+  Live interop against the real Kotlin service: the Go client (`client/jvm_attachments_interop_test.go`,
+  tag `interop`) and the TS client (`packages/kdb-client/test/interop-kotlin-attachments.test.ts`,
+  which connects with `skipVersionCheck`: the Kotlin server reports no `serverVersion`), both run
+  by CI's go-interop job. Kotlin JDBC against the Go server is `GoServerJdbcAttachmentInteropTest`.
 - **Kotlin peer sync v2 with blobs** (`kdb-peer-sync` `SyncV2*.kt`, `PeerBlobTransfer.kt`): a
   Kotlin v2 host and client (`SYNC_HELLO`, `REFS_REQUEST`, `FETCH_REQUEST`/`PACK_PAGE`,
   `REF_UPDATE`/`_ACK`, `PEER_ERROR`; Go's JSON frames) that advertise `branches`, `tags`,
