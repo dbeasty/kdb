@@ -106,7 +106,8 @@ func testProjectionPagersMatch(t *testing.T, filterSQL string) {
 	walker := env.Storage.(storage.TreeWalker)
 	ids := make([]codec.UUID, 400)
 	for i := range ids {
-		ids[i], _ = codec.RandomUUID()
+		// Seeded, so a failure reproduces: the pages depend on where ids fall.
+		ids[i] = codec.UUID{MSB: rng.Int63() - rng.Int63(), LSB: rng.Int63() - rng.Int63()}
 	}
 	version := 0
 	write := func(id codec.UUID) document.Op {
@@ -169,8 +170,15 @@ func testProjectionPagersMatch(t *testing.T, filterSQL string) {
 				pp := pager(at, after, maxBytes)
 				return pp.deltaReplay(at.Hash, from)
 			})
-			if !reflect.DeepEqual(diff, replay) {
-				t.Fatalf("delta %v at %d bytes: diff served %+v\nreplay served %+v", r, maxBytes, diff, replay)
+			// The two delta pagers send the same changes but may split them differently: replay
+			// passes over ops the diff never sees (a document created and deleted inside the range),
+			// so it can find a page full one op later and end with an empty page. Both are valid
+			// transfers, so compare what they deliver, and that every page keeps to the budget.
+			if dw, rw := deltaContent(diff), deltaContent(replay); !reflect.DeepEqual(dw, rw) {
+				t.Fatalf("delta %v at %d bytes: diff delivered %+v\nreplay delivered %+v", r, maxBytes, dw, rw)
+			}
+			for _, pages := range [][]wire.ProjectPageMessage{diff, replay} {
+				checkPageBudget(t, pages, maxBytes)
 			}
 		}
 	}
@@ -258,4 +266,39 @@ func mustFilter(t *testing.T, s string) sql.Expr {
 		t.Fatal(err)
 	}
 	return e
+}
+
+// deltaContent is what a delta transfer delivers, page boundaries aside.
+func deltaContent(pages []wire.ProjectPageMessage) (out struct {
+	Writes  []wire.SnapshotDoc
+	Deletes []string
+}) {
+	for _, p := range pages {
+		out.Writes = append(out.Writes, p.Writes...)
+		out.Deletes = append(out.Deletes, p.Deletes...)
+	}
+	return out
+}
+
+// checkPageBudget: a page goes over maxBytes by at most the one entry that crossed it, and only
+// the last page is Done.
+func checkPageBudget(t *testing.T, pages []wire.ProjectPageMessage, maxBytes int) {
+	t.Helper()
+	for i, p := range pages {
+		size, largest := 0, 0
+		for _, w := range p.Writes {
+			size += len(w.Body)
+			largest = max(largest, len(w.Body))
+		}
+		size += 40 * len(p.Deletes)
+		if len(p.Deletes) > 0 {
+			largest = max(largest, 40)
+		}
+		if size > maxBytes+largest {
+			t.Fatalf("page %d holds %d bytes, over the %d budget by more than one entry", i, size, maxBytes)
+		}
+		if p.Done != (i == len(pages)-1) {
+			t.Fatalf("page %d of %d: Done=%v", i, len(pages), p.Done)
+		}
+	}
 }
