@@ -10,7 +10,37 @@ export { connect, Client, backoffDelay, decodeConflictError, DEFAULT_REQUEST_TIM
 export { CLIENT_VERSION, checkServerCompatible } from "./version.ts";
 export type { ConnectOptions, JsonValue, Lease, SqlValue, TlsOptions } from "./client.ts";
 
+export {
+  KdbAttachmentNotFoundError,
+  KdbIntegrityError,
+  KdbUploadError,
+  sqlAttachment,
+  sqlBytes,
+} from "./attachments.ts";
 export type {
+  AttachmentBlob,
+  AttachmentInfo,
+  AttachmentReader,
+  AttachmentSelector,
+  AttachmentSource,
+  ListAttachmentsOptions,
+  PutAttachmentOptions,
+  ReadAttachmentOptions,
+  UploadAttachmentOptions,
+} from "./attachments.ts";
+export {
+  ATTACHMENT_CHUNK_BYTES,
+  AttachmentHasher,
+  attachmentContentHash,
+  decodeAttachmentBody,
+  encodeAttachmentBody,
+  WIRE_FEATURE_ATTACHMENTS,
+} from "./wire/attachments.ts";
+
+export type {
+  AttachmentDeleteOp,
+  AttachmentOp,
+  AttachmentPutOp,
   CallOptions,
   CommitHash,
   CompareAndSwapOptions,

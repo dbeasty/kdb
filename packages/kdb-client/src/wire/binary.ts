@@ -75,7 +75,7 @@ const textEncoder = new TextEncoder();
 // Not fatal: Go's JSON encoder replaces invalid UTF-8 with U+FFFD, and so does this.
 const textDecoder = new TextDecoder("utf-8");
 
-class Writer {
+export class Writer {
   #buf = new Uint8Array(256);
   #len = 0;
 
@@ -164,7 +164,7 @@ class Writer {
   }
 }
 
-class Reader {
+export class Reader {
   readonly #b: Uint8Array;
   #off = 0;
 
@@ -258,7 +258,7 @@ class Reader {
   }
 }
 
-function malformed(what: string): KdbProtocolError {
+export function malformed(what: string): KdbProtocolError {
   return new KdbProtocolError(`kdb: malformed binary body: ${what}`);
 }
 
