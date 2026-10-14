@@ -2,6 +2,7 @@ package codec
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -49,6 +50,12 @@ func (u UUID) Bytes() []byte {
 	writeBE64(u.MSB, out, 0)
 	writeBE64(u.LSB, out, 8)
 	return out
+}
+
+// AppendBytes appends Bytes' 16 bytes to dst without allocating them separately.
+func (u UUID) AppendBytes(dst []byte) []byte {
+	dst = binary.BigEndian.AppendUint64(dst, uint64(u.MSB))
+	return binary.BigEndian.AppendUint64(dst, uint64(u.LSB))
 }
 
 // UUIDFromString parses a canonical lowercase/uppercase UUID string.

@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -199,6 +200,14 @@ func checkpointRegistry() *schema.Registry {
 				{ID: 14, Name: "commitsPacked", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
 				// Version 5: the heads' attachment tables, packed - see dag.PackAttachmentTables.
 				{ID: 15, Name: "attachmentTables", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
+				// Version 6: the live tree and the commits are in a section snapshot of their own
+				// (checkpoint_section.go), named here with what verifies it.
+				{ID: 16, Name: "sectionKey", Type: cpStr, Default: codec.StringValue{}},
+				{ID: 17, Name: "treeDigest", Type: cpHash, Default: codec.FixedValue{V: make([]byte, 32)}},
+				{ID: 18, Name: "treeEntries", Type: cpI64, Default: codec.Int64Value{}},
+				{ID: 19, Name: "treeBytes", Type: cpI64, Default: codec.Int64Value{}},
+				{ID: 20, Name: "commitsBytes", Type: cpI64, Default: codec.Int64Value{}},
+				{ID: 21, Name: "commitsHaveAttachments", Type: schema.Prim(schema.PhysicalBool), Default: codec.BoolValue{}},
 			},
 		})
 		r.Freeze()
@@ -327,19 +336,23 @@ func saveTreeSegment(cp namespaceCheckpoint, packed []byte) {
 }
 
 func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
-	if legacyCheckpointFits(cp) {
+	return encodeCheckpointWith(cp, nil)
+}
+
+// encodeCheckpointWith is encodeCheckpoint for a checkpoint whose packed tree and commits are in
+// section (version 6, checkpoint_section.go) rather than in the record: the record then names the
+// section and carries everything else. nil section is versions 2, 4 and 5, unchanged.
+func encodeCheckpointWith(cp namespaceCheckpoint, section *checkpointSection) ([]byte, error) {
+	if section == nil && legacyCheckpointFits(cp) {
 		saveTreeSegment(cp, nil)
 		return encodeLegacyCheckpoint(cp)
 	}
-	// Commits are packed (dag/checkpoint_packed.go): a snapshot hands them over packed already, and
-	// any listed as structs are packed here, so a checkpoint never holds a codec record per commit.
-	packedCommits := cp.State.PackedCommits
-	if len(cp.State.Commits) > 0 {
-		more, err := dag.PackCheckpointCommits(cp.State.Commits)
-		if err != nil {
+	var packedCommits []byte
+	if section == nil {
+		var err error
+		if packedCommits, err = checkpointPackedCommits(cp); err != nil {
 			return nil, err
 		}
-		packedCommits = append(append([]byte(nil), packedCommits...), more...)
 	}
 
 	branches := make([]codec.Value, 0, len(cp.State.Branches))
@@ -362,8 +375,11 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		}})
 	}
 
-	packedTree := cp.LiveTree.AppendPacked(make([]byte, 0, cp.LiveTree.Size()*document.PackedTreeEntrySize))
-	saveTreeSegment(cp, packedTree)
+	var packedTree []byte
+	if section == nil {
+		packedTree = cp.LiveTree.AppendPacked(make([]byte, 0, cp.LiveTree.Size()*document.PackedTreeEntrySize))
+		saveTreeSegment(cp, packedTree)
+	}
 
 	segs := make([]codec.Value, 0, len(cp.Segments))
 	for _, sg := range cp.Segments {
@@ -399,10 +415,23 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		8:  codec.ArrayValue{Elements: segs},
 		9:  codec.ArrayValue{Elements: heads},
 		10: codec.Int64Value{V: cp.FloorSequence},
-		13: codec.BytesValue{V: packedTree},
-		14: codec.BytesValue{V: packedCommits},
-		15: codec.BytesValue{V: cp.AttachmentTables},
 	}}
+	if section == nil {
+		root.Fields[13] = codec.BytesValue{V: packedTree}
+		root.Fields[14] = codec.BytesValue{V: packedCommits}
+		root.Fields[15] = codec.BytesValue{V: cp.AttachmentTables}
+	} else {
+		root.Fields[1] = codec.Int32Value{V: checkpointSectionFormatVersion}
+		if cp.HasAttachments {
+			root.Fields[15] = codec.BytesValue{V: cp.AttachmentTables}
+		}
+		root.Fields[16] = codec.StringValue{V: section.key}
+		root.Fields[17] = codec.FixedValue{V: section.treeDigest[:]}
+		root.Fields[18] = codec.Int64Value{V: int64(section.entries)}
+		root.Fields[19] = codec.Int64Value{V: section.treeLen}
+		root.Fields[20] = codec.Int64Value{V: section.commitsLen}
+		root.Fields[21] = codec.BoolValue{V: cp.HasAttachments}
+	}
 	if len(cp.GraphRefs) > 0 {
 		refs := make([]codec.Value, 0, len(cp.GraphRefs))
 		for _, r := range cp.GraphRefs {
@@ -519,12 +548,14 @@ func encodeLegacyCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 }
 
 func decodeCheckpoint(namespaceID string, raw []byte) (namespaceCheckpoint, error) {
-	return decodeCheckpointWith(namespaceID, raw, nil)
+	return decodeCheckpointWith(namespaceID, raw, nil, nil)
 }
 
 // decodeCheckpointWith is decodeCheckpoint building the live tree through tf when it is not nil:
 // mapped from a segment written for this checkpoint, or built to one, instead of the heap.
-func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile) (namespaceCheckpoint, error) {
+// shim, when set, is where a version 6 record's section is read from; without it such a record is
+// an error, and the open replays the log.
+func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile, shim storage.PlatformIOShim) (namespaceCheckpoint, error) {
 	var out namespaceCheckpoint
 	v, err := codec.DecodeBytes(raw, checkpointType, checkpointRegistry())
 	if err != nil {
@@ -539,10 +570,10 @@ func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile)
 		return out, fmt.Errorf("kdb: checkpoint: missing format version")
 	}
 	if version.V != checkpointFormatVersion && version.V != checkpointGraphFormatVersion && version.V != checkpointPackedFormatVersion &&
-		version.V != checkpointAttachFormatVersion {
+		version.V != checkpointAttachFormatVersion && version.V != checkpointSectionFormatVersion {
 		return out, fmt.Errorf(
 			"kdb: checkpoint is format version %d, this build reads versions %d-%d",
-			version.V, checkpointFormatVersion, checkpointAttachFormatVersion)
+			version.V, checkpointFormatVersion, checkpointSectionFormatVersion)
 	}
 	ns, err := cpStrFrom(rec.Fields[2])
 	if err != nil {
@@ -695,7 +726,38 @@ func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile)
 		}
 		live[id] = h
 	}
-	if packed, ok := rec.Fields[13].(codec.BytesValue); ok && version.V >= checkpointPackedFormatVersion {
+	if version.V == checkpointSectionFormatVersion {
+		if len(live) > 0 {
+			return out, fmt.Errorf("kdb: checkpoint: version 6 lists live documents as records")
+		}
+		section, err := sectionFromRecord(rec)
+		if err != nil {
+			return out, err
+		}
+		if shim == nil {
+			return out, errors.New("kdb: checkpoint: version 6 needs its section, and no store was given to read it from")
+		}
+		if hasAttach, _ := rec.Fields[21].(codec.BoolValue); hasAttach.V {
+			out.HasAttachments = true
+			if at, ok := rec.Fields[15].(codec.BytesValue); ok {
+				out.AttachmentTables = at.V
+			}
+		}
+		if err := readCheckpointSection(shim, section, func(tree, commits []byte) error {
+			// Copied: RestoreCheckpoint decodes them after this returns and the section is unmapped.
+			out.State.PackedCommits = append([]byte(nil), commits...)
+			if t, ok := document.OpenTreeDigest(section.treeDigest, section.entries, tf); ok {
+				out.LiveTree = t
+				return nil
+			}
+			// Built from the mapped image: the trie copies every entry into its own slab.
+			t, err := document.OpenTreePacked(tree, tf)
+			out.LiveTree = t
+			return err
+		}); err != nil {
+			return out, err
+		}
+	} else if packed, ok := rec.Fields[13].(codec.BytesValue); ok && version.V >= checkpointPackedFormatVersion {
 		if len(live) > 0 {
 			return out, fmt.Errorf("kdb: checkpoint: live tree stored both packed and as records")
 		}
@@ -1036,7 +1098,7 @@ func readCheckpointWith(shim storage.PlatformIOShim, namespaceID string, tf *doc
 	if err != nil || len(raw) == 0 {
 		return namespaceCheckpoint{}, false
 	}
-	cp, err := decodeCheckpointWith(namespaceID, raw, tf)
+	cp, err := decodeCheckpointWith(namespaceID, raw, tf, shim)
 	if err != nil {
 		return namespaceCheckpoint{}, false
 	}
@@ -1044,6 +1106,12 @@ func readCheckpointWith(shim storage.PlatformIOShim, namespaceID string, tf *doc
 }
 
 func writeCheckpoint(shim storage.PlatformIOShim, cp namespaceCheckpoint) error {
+	// Past the legacy bound every checkpoint is version 6: the tree and commits in a section of
+	// their own, streamed where the store can (checkpoint_section.go). Versions 3-5 are still read,
+	// so an older data dir migrates by itself at its next checkpoint; they are no longer written.
+	if !legacyCheckpointFits(cp) {
+		return writeSectionedCheckpoint(shim, cp)
+	}
 	raw, err := encodeCheckpoint(cp)
 	if err != nil {
 		return err

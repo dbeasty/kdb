@@ -3,6 +3,7 @@ package document
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"sort"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -184,7 +185,7 @@ const PackedTreeEntrySize = 16 + 32
 func (t DocumentTree) AppendPacked(dst []byte) []byte {
 	start := len(dst)
 	t.Walk(func(id codec.UUID, h codec.Hash) bool {
-		dst = append(dst, id.Bytes()...)
+		dst = id.AppendBytes(dst)
 		dst = append(dst, h.Bytes[:]...)
 		return true
 	})
@@ -206,6 +207,40 @@ func (t DocumentTree) AppendPacked(dst []byte) []byte {
 		dst = append(dst[:start], sorted...)
 	}
 	return dst
+}
+
+// WritePacked writes exactly the bytes AppendPacked appends, through a small buffer, and returns
+// how many it wrote: a checkpoint streams its tree section this way instead of holding a packed
+// image of the whole tree (480 MB at 10M documents).
+func (t DocumentTree) WritePacked(w io.Writer) (int64, error) {
+	if t.Entries != nil { // map-backed: unordered, so packed and sorted whole (small trees only)
+		b := t.AppendPacked(nil)
+		n, err := w.Write(b)
+		return int64(n), err
+	}
+	const flushAt = 64 << 10
+	buf := make([]byte, 0, flushAt+PackedTreeEntrySize)
+	var written int64
+	var werr error
+	t.Walk(func(id codec.UUID, h codec.Hash) bool {
+		buf = id.AppendBytes(buf)
+		buf = append(buf, h.Bytes[:]...)
+		if len(buf) >= flushAt {
+			n, err := w.Write(buf)
+			written += int64(n)
+			if err != nil {
+				werr = err
+				return false
+			}
+			buf = buf[:0]
+		}
+		return true
+	})
+	if werr != nil {
+		return written, werr
+	}
+	n, err := w.Write(buf)
+	return written + int64(n), err
 }
 
 // BuildTrieDocumentTreePacked builds a trie-backed tree from AppendPacked's output without an

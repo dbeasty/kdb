@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"sync/atomic"
 )
 
@@ -65,6 +67,29 @@ type SegmentIntoReader interface {
 //
 // Optional: ok is false for a shim (or a store beneath one) with no local files, and callers keep
 // whatever path they had without it.
+// SnapshotStreamer is implemented by shims that can write a snapshot as a stream and name the
+// local file it is kept in. A checkpoint's tree section is written through it - hundreds of MB at
+// 10M documents that need never exist in the heap whole - and mapped back at open. Unlike a
+// LocalPathResolver path, a snapshot written this way is an ordinary snapshot of the shim.
+type SnapshotStreamer interface {
+	WriteSnapshotStream(key string, write func(w io.Writer) error) error
+	// LocalSnapshotPath names the file key's snapshot is kept in; ok is false without local files.
+	LocalSnapshotPath(key string) (path string, ok bool)
+}
+
+// WriteSnapshotStream writes key's snapshot through shim's SnapshotStreamer, or buffers it and
+// writes it whole for a shim without one.
+func WriteSnapshotStream(shim PlatformIOShim, key string, write func(w io.Writer) error) error {
+	if ss, ok := shim.(SnapshotStreamer); ok {
+		return ss.WriteSnapshotStream(key, write)
+	}
+	var buf bytes.Buffer
+	if err := write(&buf); err != nil {
+		return err
+	}
+	return shim.WriteSnapshot(key, buf.Bytes())
+}
+
 type LocalPathResolver interface {
 	LocalSegmentPath(segmentName string) (path string, ok bool)
 }
