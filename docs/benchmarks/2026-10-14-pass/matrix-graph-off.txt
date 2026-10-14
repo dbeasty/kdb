@@ -1,0 +1,184 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/limidus/kdb/go/kdb/server
+cpu: Apple M3 Max
+BenchmarkWorkloadRead/single-user/overlapping-16         	11398342	       211.8 ns/op	   4722215 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/overlapping-16         	11152614	       208.8 ns/op	   4789640 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/overlapping-16         	11204875	       209.4 ns/op	   4775921 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/overlapping-16         	11412610	       211.4 ns/op	   4731227 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/overlapping-16         	11578021	       212.3 ns/op	   4709498 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/overlapping-16    	57567474	        42.55 ns/op	  23501212 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/overlapping-16    	61096750	        40.66 ns/op	  24591179 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/overlapping-16    	59049487	        43.66 ns/op	  22906269 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/overlapping-16    	43490275	        48.11 ns/op	  20786926 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/overlapping-16    	56129194	        47.22 ns/op	  21175393 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/non-overlapping-16     	13202076	       180.3 ns/op	   5547609 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/non-overlapping-16     	13396179	       179.1 ns/op	   5583342 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/non-overlapping-16     	12916743	       184.3 ns/op	   5425444 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/non-overlapping-16     	13062554	       183.2 ns/op	   5458644 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/single-user/non-overlapping-16     	13089439	       180.1 ns/op	   5551132 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/non-overlapping-16         	15121840	       155.9 ns/op	   6414305 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/non-overlapping-16         	15089625	       155.8 ns/op	   6417205 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/non-overlapping-16         	15518131	       155.4 ns/op	   6435868 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/non-overlapping-16         	15599524	       156.4 ns/op	   6392053 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadRead/heavy-multi-user/non-overlapping-16         	15114368	       158.2 ns/op	   6321066 ops/sec	     160 B/op	       3 allocs/op
+BenchmarkWorkloadWriteInsert/single-user-16                       	     589	   4033860 ns/op	       247.9 ops/sec	   17302 B/op	      83 allocs/op
+BenchmarkWorkloadWriteInsert/single-user-16                       	     594	   4105718 ns/op	       243.6 ops/sec	   14414 B/op	      83 allocs/op
+BenchmarkWorkloadWriteInsert/single-user-16                       	     577	   4264906 ns/op	       234.5 ops/sec	   17498 B/op	      83 allocs/op
+BenchmarkWorkloadWriteInsert/single-user-16                       	     476	   4679790 ns/op	       213.7 ops/sec	    9430 B/op	      83 allocs/op
+BenchmarkWorkloadWriteInsert/single-user-16                       	     586	   4081331 ns/op	       245.0 ops/sec	   14535 B/op	      83 allocs/op
+BenchmarkWorkloadWriteInsert/heavy-multi-user-16                  	   91274	     26603 ns/op	     37590 ops/sec	    9877 B/op	      79 allocs/op
+BenchmarkWorkloadWriteInsert/heavy-multi-user-16                  	   99266	     25394 ns/op	     39380 ops/sec	    9272 B/op	      79 allocs/op
+BenchmarkWorkloadWriteInsert/heavy-multi-user-16                  	  100029	     25604 ns/op	     39057 ops/sec	    9150 B/op	      79 allocs/op
+BenchmarkWorkloadWriteInsert/heavy-multi-user-16                  	  101179	     26387 ns/op	     37897 ops/sec	    9229 B/op	      79 allocs/op
+BenchmarkWorkloadWriteInsert/heavy-multi-user-16                  	   98005	     25590 ns/op	     39078 ops/sec	    9284 B/op	      79 allocs/op
+BenchmarkWorkloadUpdate/single-user/overlapping-16                	     591	   4171731 ns/op	       239.7 ops/sec	    8908 B/op	     100 allocs/op
+BenchmarkWorkloadUpdate/single-user/overlapping-16                	     542	   4224259 ns/op	       236.7 ops/sec	   10074 B/op	      97 allocs/op
+BenchmarkWorkloadUpdate/single-user/overlapping-16                	     496	   4111727 ns/op	       243.2 ops/sec	    7070 B/op	      97 allocs/op
+BenchmarkWorkloadUpdate/single-user/overlapping-16                	     598	   4056803 ns/op	       246.5 ops/sec	    9947 B/op	      97 allocs/op
+BenchmarkWorkloadUpdate/single-user/overlapping-16                	     594	   4098453 ns/op	       244.0 ops/sec	   14612 B/op	      97 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/overlapping-16           	   86944	     27501 ns/op	     36362 ops/sec	   12895 B/op	     110 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/overlapping-16           	   90816	     27860 ns/op	     35894 ops/sec	   12708 B/op	     114 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/overlapping-16           	   95778	     28301 ns/op	     35334 ops/sec	   12603 B/op	     114 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/overlapping-16           	2026/10/14 07:35:41 kdb: rotated to delta segment 1
+BenchmarkWorkloadUpdate/heavy-multi-user/overlapping-16           	   90561	     29246 ns/op	     34193 ops/sec	   13464 B/op	     115 allocs/op
+BenchmarkWorkloadUpdate/single-user/non-overlapping-16            	     571	   4539688 ns/op	       220.3 ops/sec	   14795 B/op	     103 allocs/op
+BenchmarkWorkloadUpdate/single-user/non-overlapping-16            	     524	   4377023 ns/op	       228.5 ops/sec	   13373 B/op	     100 allocs/op
+BenchmarkWorkloadUpdate/single-user/non-overlapping-16            	     542	   4155341 ns/op	       240.7 ops/sec	   10141 B/op	     100 allocs/op
+BenchmarkWorkloadUpdate/single-user/non-overlapping-16            	     591	   4390203 ns/op	       227.8 ops/sec	   13084 B/op	     100 allocs/op
+BenchmarkWorkloadUpdate/single-user/non-overlapping-16            	     591	   4172001 ns/op	       239.7 ops/sec	   14687 B/op	     100 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/non-overlapping-16       	  108121	     27053 ns/op	     36964 ops/sec	   12561 B/op	     110 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/non-overlapping-16       	   91857	     42436 ns/op	     23565 ops/sec	   12057 B/op	     114 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/non-overlapping-16       	   51904	     54101 ns/op	     18484 ops/sec	   13244 B/op	     121 allocs/op
+BenchmarkWorkloadUpdate/heavy-multi-user/non-overlapping-16       	2026/10/14 07:36:31 kdb: rotated to delta segment 1
+BenchmarkWorkloadUpdate/heavy-multi-user/non-overlapping-16       	   49968	     46236 ns/op	     21628 ops/sec	    8830 B/op	     105 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/overlapping-16        	    1508	   1621483 ns/op	       616.7 ops/sec	    3470 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/overlapping-16        	    1453	   1718542 ns/op	       581.9 ops/sec	    3969 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/overlapping-16        	    1443	   1755301 ns/op	       569.7 ops/sec	    3804 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/overlapping-16        	    1462	   1695855 ns/op	       589.7 ops/sec	    2662 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/overlapping-16        	    1494	   1859186 ns/op	       537.9 ops/sec	    4816 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/overlapping-16   	  259672	     10669 ns/op	     93726 ops/sec	    2851 B/op	      25 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/overlapping-16   	  245340	      9542 ns/op	    104797 ops/sec	    2053 B/op	      23 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/overlapping-16   	  234248	      9294 ns/op	    107593 ops/sec	    2331 B/op	      23 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/overlapping-16   	2026/10/14 07:37:42 kdb: rotated to delta segment 1
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/overlapping-16   	  243432	     10789 ns/op	     92691 ops/sec	    2689 B/op	      26 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/non-overlapping-16    	    1491	   1664617 ns/op	       600.7 ops/sec	    3498 B/op	      23 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/non-overlapping-16    	    1387	   1649967 ns/op	       606.1 ops/sec	    2929 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/non-overlapping-16    	    1496	   1697678 ns/op	       589.0 ops/sec	    4845 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/non-overlapping-16    	    1360	   1673774 ns/op	       597.5 ops/sec	    3965 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/single-user/non-overlapping-16    	    1432	   1680896 ns/op	       594.9 ops/sec	    3846 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/non-overlapping-16         	  252996	      9497 ns/op	    105296 ops/sec	    2037 B/op	      22 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/non-overlapping-16         	  241278	      9549 ns/op	    104723 ops/sec	    2180 B/op	      23 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/non-overlapping-16         	  251644	     10728 ns/op	     93215 ops/sec	    2780 B/op	      26 allocs/op
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/non-overlapping-16         	2026/10/14 07:38:49 kdb: rotated to delta segment 1
+BenchmarkWorkloadMixedReadWrite/heavy-multi-user/non-overlapping-16         	  251228	     10846 ns/op	     92199 ops/sec	    3004 B/op	      26 allocs/op
+BenchmarkWorkloadTransaction/single-user/overlapping-16                     	     277	   8703844 ns/op	         0 conflicts/op	       114.9 ops/sec	   33771 B/op	     114 allocs/op
+BenchmarkWorkloadTransaction/single-user/overlapping-16                     	     290	   8335897 ns/op	         0 conflicts/op	       120.0 ops/sec	   14976 B/op	     112 allocs/op
+BenchmarkWorkloadTransaction/single-user/overlapping-16                     	     289	   8144165 ns/op	         0 conflicts/op	       122.8 ops/sec	   19171 B/op	     112 allocs/op
+BenchmarkWorkloadTransaction/single-user/overlapping-16                     	     295	   8336219 ns/op	         0 conflicts/op	       120.0 ops/sec	   31710 B/op	     113 allocs/op
+BenchmarkWorkloadTransaction/single-user/overlapping-16                     	     285	   8427339 ns/op	         0 conflicts/op	       118.7 ops/sec	   13139 B/op	     112 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/overlapping-16                	   45921	     48185 ns/op	         2.021 conflicts/op	     20753 ops/sec	   20618 B/op	     320 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/overlapping-16                	   49638	     54486 ns/op	         2.035 conflicts/op	     18353 ops/sec	   23305 B/op	     337 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/overlapping-16                	   48406	     48623 ns/op	         2.029 conflicts/op	     20566 ops/sec	   19742 B/op	     328 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/overlapping-16                	   49759	     47951 ns/op	         2.030 conflicts/op	     20855 ops/sec	   20475 B/op	     328 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/overlapping-16                	2026/10/14 07:39:39 kdb: rotated to delta segment 1
+BenchmarkWorkloadTransaction/single-user/non-overlapping-16                 	     295	   7337014 ns/op	         0 conflicts/op	       136.3 ops/sec	   20082 B/op	     117 allocs/op
+BenchmarkWorkloadTransaction/single-user/non-overlapping-16                 	     321	   7758398 ns/op	         0 conflicts/op	       128.9 ops/sec	   15276 B/op	     115 allocs/op
+BenchmarkWorkloadTransaction/single-user/non-overlapping-16                 	     398	   7998615 ns/op	         0 conflicts/op	       125.0 ops/sec	   12215 B/op	     116 allocs/op
+BenchmarkWorkloadTransaction/single-user/non-overlapping-16                 	     292	   8241314 ns/op	         0 conflicts/op	       121.3 ops/sec	   13840 B/op	     115 allocs/op
+BenchmarkWorkloadTransaction/single-user/non-overlapping-16                 	     297	   8591426 ns/op	         0 conflicts/op	       116.4 ops/sec	   19619 B/op	     115 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/non-overlapping-16            	   50071	     47123 ns/op	         0 conflicts/op	     21221 ops/sec	   10742 B/op	     116 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/non-overlapping-16            	   53988	     52707 ns/op	         0 conflicts/op	     18973 ops/sec	   13355 B/op	     131 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/non-overlapping-16            	   49353	     52848 ns/op	         0 conflicts/op	     18922 ops/sec	   13075 B/op	     136 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/non-overlapping-16            	   50629	     46849 ns/op	         0 conflicts/op	     21345 ops/sec	   11201 B/op	     121 allocs/op
+BenchmarkWorkloadTransaction/heavy-multi-user/non-overlapping-16            	   49958	     52773 ns/op	         0 conflicts/op	     18949 ops/sec	   12748 B/op	     135 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/single-user-16                 	     288	   8264084 ns/op	       121.0 ops/sec	   20993 B/op	      83 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/single-user-16                 	     294	   8887655 ns/op	       112.5 ops/sec	   26217 B/op	      83 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/single-user-16                 	     276	   8297968 ns/op	       120.5 ops/sec	   27516 B/op	      84 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/single-user-16                 	     274	   8584551 ns/op	       116.5 ops/sec	    9754 B/op	      83 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/single-user-16                 	     278	   9066868 ns/op	       110.3 ops/sec	   15569 B/op	      83 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/heavy-multi-user-16            	   50593	     44180 ns/op	     22635 ops/sec	    9611 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/heavy-multi-user-16            	   91059	     26367 ns/op	     37926 ops/sec	    9401 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/heavy-multi-user-16            	   94840	     25705 ns/op	     38903 ops/sec	    9233 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/heavy-multi-user-16            	   98299	     25249 ns/op	     39605 ops/sec	    9041 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/sync-full/insert/heavy-multi-user-16            	   94692	     26769 ns/op	     37356 ops/sec	    9358 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/single-user-16                 	     566	   4490972 ns/op	       222.7 ops/sec	    9644 B/op	     102 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/single-user-16                 	     595	   4092588 ns/op	       244.3 ops/sec	    9948 B/op	     102 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/single-user-16                 	     505	   4300806 ns/op	       232.5 ops/sec	    9880 B/op	     102 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/single-user-16                 	     564	   4123731 ns/op	       242.5 ops/sec	   12453 B/op	     102 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/single-user-16                 	     561	   4375973 ns/op	       228.5 ops/sec	    9733 B/op	     102 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/heavy-multi-user-16            	   87870	     26235 ns/op	     38117 ops/sec	   13028 B/op	     109 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/heavy-multi-user-16            	   97905	     26402 ns/op	     37876 ops/sec	   12482 B/op	     108 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/heavy-multi-user-16            	  101241	     26976 ns/op	     37070 ops/sec	   12409 B/op	     108 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/heavy-multi-user-16            	   90883	     26677 ns/op	     37486 ops/sec	   12650 B/op	     109 allocs/op
+BenchmarkWorkloadDurability/sync-full/update/heavy-multi-user-16            	  102903	     26608 ns/op	     37583 ops/sec	   12189 B/op	     108 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/single-user-16            	     567	   4290600 ns/op	       233.1 ops/sec	   12863 B/op	     119 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/single-user-16            	     548	   4209942 ns/op	       237.5 ops/sec	   16017 B/op	     119 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/single-user-16            	     571	   4721017 ns/op	       211.8 ops/sec	   15284 B/op	     118 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/single-user-16            	     576	   4269449 ns/op	       234.2 ops/sec	   15589 B/op	     119 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/single-user-16            	     576	   4352303 ns/op	       229.8 ops/sec	   12422 B/op	     118 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/heavy-multi-user-16       	   44925	     50018 ns/op	     19993 ops/sec	   26337 B/op	     413 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/heavy-multi-user-16       	   48782	     47929 ns/op	     20864 ops/sec	   25105 B/op	     412 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/heavy-multi-user-16       	   48655	     49506 ns/op	     20200 ops/sec	   24884 B/op	     412 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/heavy-multi-user-16       	   49735	     48579 ns/op	     20585 ops/sec	   25339 B/op	     412 allocs/op
+BenchmarkWorkloadDurability/sync-full/transaction/heavy-multi-user-16       	   48970	     49789 ns/op	     20085 ops/sec	   24392 B/op	     409 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/single-user-16               	  118504	     25105 ns/op	     39832 ops/sec	    9987 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/single-user-16               	   99418	     25493 ns/op	     39226 ops/sec	    9448 B/op	      78 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/single-user-16               	  118378	     25391 ns/op	     39385 ops/sec	    9621 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/single-user-16               	  109653	     25130 ns/op	     39793 ops/sec	    9180 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/single-user-16               	  106092	     24946 ns/op	     40087 ops/sec	    9232 B/op	      78 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/heavy-multi-user-16          	   91410	     29297 ns/op	     34134 ops/sec	   10510 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/heavy-multi-user-16          	   94160	     28442 ns/op	     35159 ops/sec	    9607 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/heavy-multi-user-16          	   90864	     28796 ns/op	     34727 ops/sec	    9638 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/heavy-multi-user-16          	   90325	     29364 ns/op	     34055 ops/sec	    9676 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/insert/heavy-multi-user-16          	   90060	     28497 ns/op	     35092 ops/sec	    9789 B/op	      79 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/single-user-16               	  113955	     23546 ns/op	     42471 ops/sec	   13302 B/op	     108 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/single-user-16               	  106232	     23806 ns/op	     42006 ops/sec	   12310 B/op	     108 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/single-user-16               	  114580	     24103 ns/op	     41488 ops/sec	   12581 B/op	     108 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/single-user-16               	  115814	     24321 ns/op	     41117 ops/sec	   12747 B/op	     107 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/single-user-16               	  120182	     24019 ns/op	     41633 ops/sec	   12626 B/op	     107 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/heavy-multi-user-16          	  100071	     28852 ns/op	     34660 ops/sec	   13042 B/op	     108 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/heavy-multi-user-16          	  105516	     28442 ns/op	     35160 ops/sec	   11835 B/op	     107 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/heavy-multi-user-16          	   96696	     28560 ns/op	     35014 ops/sec	   12392 B/op	     107 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/heavy-multi-user-16          	  102063	     28153 ns/op	     35520 ops/sec	   12664 B/op	     109 allocs/op
+BenchmarkWorkloadDurability/async-100ms/update/heavy-multi-user-16          	  103392	     28210 ns/op	     35448 ops/sec	   12505 B/op	     109 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/single-user-16          	  114514	     24436 ns/op	     40923 ops/sec	   13558 B/op	     123 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/single-user-16          	  117416	     24071 ns/op	     41544 ops/sec	   12481 B/op	     123 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/single-user-16          	  111920	     24990 ns/op	     40015 ops/sec	   12483 B/op	     123 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/single-user-16          	  121754	     24357 ns/op	     41056 ops/sec	   12503 B/op	     123 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/single-user-16          	  112435	     24128 ns/op	     41445 ops/sec	   12203 B/op	     123 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/heavy-multi-user-16     	   51933	     50662 ns/op	     19739 ops/sec	   28919 B/op	     410 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/heavy-multi-user-16     	   53344	     50459 ns/op	     19818 ops/sec	   26084 B/op	     410 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/heavy-multi-user-16     	   49923	     50370 ns/op	     19853 ops/sec	   25992 B/op	     410 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/heavy-multi-user-16     	   52567	     50205 ns/op	     19918 ops/sec	   26349 B/op	     410 allocs/op
+BenchmarkWorkloadDurability/async-100ms/transaction/heavy-multi-user-16     	   55053	     50875 ns/op	     19656 ops/sec	   25743 B/op	     411 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/single-user-16               	  120631	     21240 ns/op	     47081 ops/sec	    7243 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/single-user-16               	  125034	     22102 ns/op	     45244 ops/sec	    7312 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/single-user-16               	  126621	     21617 ns/op	     46260 ops/sec	    7315 B/op	      75 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/single-user-16               	  124675	     21593 ns/op	     46311 ops/sec	    7313 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/single-user-16               	  123054	     22004 ns/op	     45447 ops/sec	    7287 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/heavy-multi-user-16          	   93036	     28402 ns/op	     35209 ops/sec	    7091 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/heavy-multi-user-16          	   94126	     28373 ns/op	     35245 ops/sec	    7063 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/heavy-multi-user-16          	   92306	     28103 ns/op	     35584 ops/sec	    7102 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/heavy-multi-user-16          	   96706	     27391 ns/op	     36509 ops/sec	    7023 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/insert/heavy-multi-user-16          	   96154	     27780 ns/op	     35997 ops/sec	    7036 B/op	      74 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/single-user-16               	  137108	     19383 ns/op	     51593 ops/sec	    9812 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/single-user-16               	  138879	     20559 ns/op	     48640 ops/sec	    9507 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/single-user-16               	  138595	     19799 ns/op	     50507 ops/sec	    9501 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/single-user-16               	  141979	     20156 ns/op	     49613 ops/sec	    9463 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/single-user-16               	  137473	     20230 ns/op	     49431 ops/sec	    9544 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/heavy-multi-user-16          	  101244	     26169 ns/op	     38213 ops/sec	    9603 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/heavy-multi-user-16          	  115056	     26380 ns/op	     37908 ops/sec	    9710 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/heavy-multi-user-16          	  111754	     25627 ns/op	     39021 ops/sec	    9646 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/heavy-multi-user-16          	  113750	     25841 ns/op	     38699 ops/sec	    9846 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/update/heavy-multi-user-16          	  109722	     25441 ns/op	     39306 ops/sec	    9774 B/op	     100 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/single-user-16          	  134050	     20489 ns/op	     48806 ops/sec	    9863 B/op	     115 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/single-user-16          	  129506	     21173 ns/op	     47231 ops/sec	    9896 B/op	     115 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/single-user-16          	  137145	     20655 ns/op	     48415 ops/sec	    9800 B/op	     115 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/single-user-16          	  137738	     20514 ns/op	     48747 ops/sec	    9788 B/op	     115 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/single-user-16          	  134400	     20932 ns/op	     47773 ops/sec	    9852 B/op	     115 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/heavy-multi-user-16     	   50070	     49459 ns/op	     20219 ops/sec	   21848 B/op	     405 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/heavy-multi-user-16     	   56721	     48849 ns/op	     20471 ops/sec	   22050 B/op	     406 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/heavy-multi-user-16     	   58296	     48278 ns/op	     20713 ops/sec	   22254 B/op	     406 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/heavy-multi-user-16     	   54973	     47397 ns/op	     21099 ops/sec	   21808 B/op	     405 allocs/op
+BenchmarkWorkloadDurability/memory-only/transaction/heavy-multi-user-16     	   55792	     47716 ns/op	     20957 ops/sec	   21873 B/op	     406 allocs/op
