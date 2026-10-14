@@ -34,8 +34,9 @@ import kotlin.test.fail
  * client to a Kotlin stand-in; this proves the two trees agree on the real frames, parameter forms
  * and SQL.
  *
- * Skipped when the binary is not built, except under CI (CI=true), where the integration job builds
- * it first and a skip would hide a broken setup.
+ * Skipped when the binary is not built, except where KDB_REQUIRE_GO_SERVICE=1 - the CI integration
+ * job, which builds it first, so a skip there would hide a broken setup. (CI's kotlin-test job runs
+ * `./gradlew build` without Go binaries, and skips.)
  */
 class GoServerJdbcAttachmentInteropTest {
     init {
@@ -53,7 +54,7 @@ class GoServerJdbcAttachmentInteropTest {
     fun startGoServer() {
         val bin = serviceBinary()
         if (bin == null) {
-            if (System.getenv("CI") == "true") fail("kdb-service not built (KDB_SERVICE_BIN / go/bin/kdb-service) - run make build-go")
+            if (System.getenv("KDB_REQUIRE_GO_SERVICE") == "1") fail("kdb-service not built (KDB_SERVICE_BIN / go/bin/kdb-service) - run make build-go")
             Assume.assumeTrue("kdb-service not built; run make build-go or set KDB_SERVICE_BIN", false)
             return
         }
