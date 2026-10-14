@@ -58,6 +58,11 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: gradle
+      # kdb-replica's live tests build go/cmd/kdb-replicahost and sync against it; the Go they use
+      # is the module's, as in the TS jobs (they skip when there is no Go).
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
       - name: Build and run the full Kotlin test suite
         # `build` rather than `test allTests`: it runs everything those did (through
         # `check`, which covers the Multiplatform jvmTest/jsTest/linuxX64Test that a bare

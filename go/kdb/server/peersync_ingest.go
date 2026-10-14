@@ -243,6 +243,7 @@ func (n serverLocalNode) Advanced(step peersync.AdvanceStep) error {
 			rt.CommitListener(rt.Runtime.DefaultNamespace, c)
 		}
 	}
+	rt.notifyHeadWatchers()
 	return firstErr
 }
 

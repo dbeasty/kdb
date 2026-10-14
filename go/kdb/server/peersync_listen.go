@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -87,6 +88,8 @@ type peerSyncConnHandler struct {
 	codec   wire.Codec
 	// cc is the connection's transport-provided auth context.
 	cc auth.ConnectionContext
+	// conn is the connection being served, for frames the host sends unasked (REFS_CHANGED).
+	conn stream.ConnectionHandle
 }
 
 // ServePeerSyncConnection serves peer sync - v1 against namespaceID, v2 across every namespace
@@ -117,6 +120,14 @@ func newPeerSyncConnHandler(codec wire.Codec, runtime *KdbServerRuntime, namespa
 	return &peerSyncConnHandler{host: host, runtime: runtime, codec: codec, cc: cc}
 }
 
+// send writes a frame the host sends unasked; the connection serializes it with replies.
+func (h *peerSyncConnHandler) send(frame []byte) error {
+	if h.conn == nil {
+		return errors.New("peer sync: connection not open")
+	}
+	return h.conn.Send(frame)
+}
+
 // handle routes a frame to the v1 or v2 host. The protocol is fixed by the connection's first
 // frame: SYNC_HELLO opens a v2 session over every namespace this process serves; anything else
 // is v1 against the listener's one namespace, as before v2 existed.
@@ -145,6 +156,14 @@ func (h *peerSyncConnHandler) handle(frame []byte, first bool) ([]byte, error) {
 					}
 					return rt.ApplyWriteBack(principal, m)
 				},
+				WatchHead: func(ns string, fn func()) (func(), error) {
+					rt, err := h.runtime.namespaceSet().Resolve(ns, false)
+					if err != nil {
+						return nil, err
+					}
+					return rt.WatchHead(fn), nil
+				},
+				Send: h.send,
 				OnCaughtUp: func(ns, peer string, since time.Time) {
 					if rt, ok := h.runtime.namespaceSet().Get(ns); ok {
 						rt.NoteInboundPeer(peer, since)
@@ -166,6 +185,7 @@ func (h *peerSyncConnHandler) run(conn stream.ConnectionHandle) {
 			h.v2.Close()
 		}
 	}()
+	h.conn = conn
 	first := true
 	for frame := range conn.Incoming() {
 		response, err := h.handle(frame, first)

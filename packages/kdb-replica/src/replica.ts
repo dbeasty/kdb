@@ -16,6 +16,8 @@ import { ReplicaNamespace } from "./namespace.ts";
 import { PeerConnection, type ConflictReport } from "./peer.ts";
 import { CachedStore, type KvStore } from "./store.ts";
 import { ProjectionNamespace } from "./projection.ts";
+import { BlobStore, BlobUnavailableError } from "./blobs.ts";
+import type { Attachment } from "./attachments.ts";
 import { syncNamespace, syncProjection, type CatchUp, type NamespaceSyncResult, type ProjectionSyncResult } from "./sync.ts";
 
 export interface ReplicaOptions {
@@ -35,12 +37,27 @@ export interface ReplicaOptions {
   catchUp?: CatchUp;
   /** Bytes of trie nodes and document bodies kept in memory; the rest is read from the store. */
   memory?: { cacheBytes?: number };
-  /** Milliseconds between sync rounds; 0 syncs only on writes and syncNow(). Default 5000. */
+  /**
+   * Milliseconds between sync rounds; 0 syncs only on writes, changes and syncNow(). Default 5000,
+   * or 60000 while the host is reporting changes (live).
+   */
   pollMs?: number;
+  /**
+   * Keep the connection open between rounds and ask the host to report changes (REFS_WATCH), so
+   * remote writes arrive without waiting for a poll. Default true; a host without the watch
+   * capability is polled.
+   */
+  live?: boolean;
   /** Page size asked of the host, in bytes. */
   pageBytes?: number;
   /** Start syncing at once (default true). */
   autoSync?: boolean;
+  /**
+   * In a browser, ask for persistent storage (navigator.storage.persist) so the browser does not
+   * evict the replica - and with it any writes not yet synced - under storage pressure. Default
+   * true; status().storagePersisted reports the answer.
+   */
+  persistStorage?: boolean;
 }
 
 export interface ChangeEvent {
@@ -66,6 +83,11 @@ export interface ReplicaStatus {
   namespaces: Record<string, { mode: "full" | "filtered"; head: string | null; pending: number; converging: boolean; lastSource?: string }>;
   /** Bytes the read cache holds now; never more than memory.cacheBytes. */
   residentBytes: number;
+  /**
+   * Whether the browser granted persistent storage: false means it may evict the replica, losing
+   * unsynced writes; null outside a browser or when not asked.
+   */
+  storagePersisted: boolean | null;
 }
 
 type Listener<T> = (e: T) => void;
@@ -95,9 +117,12 @@ export class Replica {
   }
   #status = { connected: false, lastSyncAt: null as number | null, lastError: null as string | null };
 
+  readonly #blobs: BlobStore;
+
   private constructor(opts: ReplicaOptions, store: CachedStore) {
     this.#opts = opts;
     this.#store = store;
+    this.#blobs = new BlobStore(store);
   }
 
   static async open(opts: ReplicaOptions): Promise<Replica> {
@@ -119,11 +144,16 @@ export class Replica {
       }
     }
     r.#nodeId = fromUtf8(nodeId);
+    const storage = (globalThis as { navigator?: { storage?: { persist?: () => Promise<boolean> } } }).navigator?.storage;
+    if (opts.persistStorage !== false && typeof storage?.persist === "function") {
+      r.#persisted = await storage.persist().catch(() => false);
+    }
     if (opts.autoSync !== false) r.#schedule(0);
     return r;
   }
 
   #nodeId = "";
+  #persisted: boolean | null = null;
 
   /** A full-mode namespace. */
   namespace(name: string): ReplicaNamespace {
@@ -188,6 +218,58 @@ export class Replica {
     return this.write(ns, [{ kind: "delete", docId: id }]);
   }
 
+  // --- attachments (plan §9) ---------------------------------------------------------------------
+
+  /** A document's attachments: refs held locally, bytes fetched on read. */
+  attachments(ns: string, docId: string): Promise<Attachment[]> {
+    return this.#local(ns).attachments(docId);
+  }
+
+  async #find(ns: string, docId: string, sel: { name?: string; id?: string }): Promise<Attachment> {
+    const a = (await this.attachments(ns, docId)).find((x) => (sel.id ? x.id === sel.id.toLowerCase() : x.name === sel.name));
+    if (!a) throw new BlobUnavailableError(`kdb replica: ${ns}/${docId} has no attachment ${sel.id ?? JSON.stringify(sel.name)}`);
+    return a;
+  }
+
+  /**
+   * An attachment's bytes: from the local blob store when held, else fetched from the host by
+   * BLOB_FETCH (every chunk verified against the content hash) and kept for next time.
+   */
+  async readAttachment(ns: string, docId: string, sel: { name?: string; id?: string }): Promise<Uint8Array> {
+    const a = await this.#find(ns, docId, sel);
+    const held = await this.#blobs.read(a.contentHash);
+    if (held) return held;
+    const full = this.#ns.get(ns);
+    const commitHex = full ? full.head : this.projection(ns).lastSource;
+    if (!commitHex) throw new BlobUnavailableError(`kdb replica: ${ns} has not synced yet`);
+    const { conn } = await this.#connect();
+    try {
+      return await this.#blobs.fetch(conn, ns, { docId, attachmentId: a.id, commitHex, hash: a.contentHash }, Number(a.size));
+    } finally {
+      if (conn !== this.#conn) await conn.close();
+    }
+  }
+
+  /**
+   * Adds or replaces the attachment called name on a document (full mode): the bytes are kept
+   * here, pinned, and go up before the commit that references them is pushed.
+   */
+  async putAttachment(ns: string, docId: string, name: string, data: Uint8Array, mime = "application/octet-stream"): Promise<string> {
+    if (!this.#ns.has(ns)) throw new Error(`kdb replica: attachments are written in full mode only; ${ns} is filtered`);
+    const hash = await this.#blobs.putLocal(data);
+    const existing = (await this.attachments(ns, docId)).find((a) => a.name === name);
+    return this.write(ns, [{
+      kind: "attachmentPut", docId, attachmentId: existing?.id ?? randomUuid(), name, scheme: 1,
+      contentHash: hash, size: BigInt(data.length), mime,
+    }]);
+  }
+
+  async deleteAttachment(ns: string, docId: string, sel: { name?: string; id?: string }): Promise<string> {
+    if (!this.#ns.has(ns)) throw new Error(`kdb replica: attachments are written in full mode only; ${ns} is filtered`);
+    const a = await this.#find(ns, docId, sel);
+    return this.write(ns, [{ kind: "attachmentDelete", docId, attachmentId: a.id }]);
+  }
+
   // --- events and status -------------------------------------------------------------------------
 
   /** Subscribes to an event; returns the unsubscribe function. */
@@ -218,7 +300,7 @@ export class Replica {
         converging: p.transfer !== undefined, lastSource: p.lastSource,
       };
     }
-    return { ...this.#status, namespaces, residentBytes: this.#store.residentBytes };
+    return { ...this.#status, namespaces, residentBytes: this.#store.residentBytes, storagePersisted: this.#persisted };
   }
 
   // --- sync --------------------------------------------------------------------------------------
@@ -238,7 +320,7 @@ export class Replica {
         this.#again = false;
         this.#schedule(0);
       } else {
-        const poll = this.#opts.pollMs ?? 5000;
+        const poll = this.#opts.pollMs ?? (this.#watching ? 60_000 : 5000);
         const backoff = this.#failures > 0 ? Math.min(60_000, 500 * 2 ** Math.min(this.#failures, 7)) : 0;
         if (backoff > 0) this.#schedule(backoff);
         else if (poll > 0) this.#schedule(poll);
@@ -260,14 +342,42 @@ export class Replica {
     }, ms);
   }
 
-  async #round(): Promise<NamespaceSyncResult[]> {
+  /** The open connection, reused across rounds while live; null when there is none. */
+  #conn: PeerConnection | null = null;
+  #watching = false;
+
+  async #connect(): Promise<{ conn: PeerConnection; fresh: boolean }> {
+    if (this.#conn && !this.#conn.closed) return { conn: this.#conn, fresh: false };
     const token = typeof this.#opts.peer.token === "function" ? await this.#opts.peer.token() : this.#opts.peer.token;
-    const nodeId = this.#nodeId;
+    // Filtered namespaces' sources are named too: where the token may also sync one, the host
+    // grants it, and the replica can watch it.
+    const names = [...new Set([...this.#ns.keys(), ...this.#proj.keys()])];
+    const conn = await PeerConnection.open(this.#opts.peer.url, {
+      nodeId: this.#nodeId, token, namespaces: names, connect: this.#opts.peer.connect,
+    });
+    conn.onClose(() => {
+      if (this.#conn === conn) {
+        this.#conn = null;
+        this.#watching = false;
+        this.#status.connected = false;
+        this.#schedule(this.#closed ? 0 : 1000);
+      }
+    });
+    return { conn, fresh: true };
+  }
+
+  get #live(): boolean {
+    return this.#opts.live !== false && this.#opts.autoSync !== false;
+  }
+
+  async #round(): Promise<NamespaceSyncResult[]> {
     let conn: PeerConnection | null = null;
+    let keep = false;
     try {
-      conn = await PeerConnection.open(this.#opts.peer.url, {
-        nodeId, token, namespaces: [...this.#ns.keys()], connect: this.#opts.peer.connect,
-      });
+      const c = await this.#connect();
+      conn = c.conn;
+      // A reused connection's hello refs are stale: ask again.
+      if (!c.fresh) conn.refs = await conn.refs_(conn.refs.map((r) => r.namespace));
       this.#status.connected = true;
       const results: NamespaceSyncResult[] = [];
       const projections: ProjectionSyncResult[] = [];
@@ -277,6 +387,7 @@ export class Replica {
           const r = await syncNamespace(conn, ns, conn.refs.find((x) => x.namespace === name), {
             catchUp: this.#opts.catchUp ?? "auto",
             pageBytes: this.#opts.pageBytes,
+            blobs: this.#blobs,
           });
           results.push(r);
           if (r.changed.length > 0) this.#emit("change", { namespace: name, ids: r.changed, source: "remote" });
@@ -316,6 +427,14 @@ export class Replica {
       this.#status.lastError = errors.length > 0 ? errors.join("; ") : null;
       this.#failures = errors.length > 0 ? this.#failures + 1 : 0;
       this.#lastProjections = projections;
+      if (this.#live && conn.has("watch")) {
+        keep = true;
+        this.#conn = conn;
+        if (!this.#watching && conn.refs.length > 0) {
+          this.#watching = true;
+          await conn.watch(conn.refs.map((r) => r.namespace), () => this.#schedule(0));
+        }
+      }
       this.#emit("sync", results);
       if (errors.length > 0) throw new Error(`kdb replica: sync failed for ${errors.join("; ")}`);
       return results;
@@ -324,8 +443,12 @@ export class Replica {
       if (!this.#status.lastError.startsWith("kdb replica: sync failed")) this.#failures++;
       throw e;
     } finally {
-      this.#status.connected = false;
-      await conn?.close();
+      if (!keep) {
+        if (this.#conn === conn) this.#conn = null;
+        this.#watching = false;
+        this.#status.connected = false;
+        await conn?.close();
+      }
     }
   }
 
@@ -333,6 +456,9 @@ export class Replica {
     this.#closed = true;
     if (this.#timer) clearTimeout(this.#timer);
     await this.#running?.catch(() => undefined);
+    const conn = this.#conn;
+    this.#conn = null;
+    await conn?.close();
     await this.#store.close();
   }
 }

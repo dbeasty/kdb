@@ -67,6 +67,11 @@ type V2HostConfig struct {
 	// fast-forwards main is adopted before the push's last page arrives. 0 means
 	// DefaultAdoptEveryBytes; negative adopts only on the last page.
 	AdoptEveryBytes int
+	// WatchHead and Send, both set, let a session watch namespaces (REFS_WATCH): WatchHead calls
+	// fn after each commit that moves ns's head, until cancel, and must not block; Send writes an
+	// unsolicited frame to the session's connection. Unset, the host does not offer SyncCapWatch.
+	WatchHead func(ns string, fn func()) (cancel func(), err error)
+	Send      func(frame []byte) error
 }
 
 // V2Host serves one v2 peer-sync connection.
@@ -112,6 +117,8 @@ type V2Host struct {
 
 	// uploads are this session's attachment blob uploads (attachments.go).
 	uploads hostUploads
+	// watch is the session's REFS_WATCH, if any (see watch.go).
+	watch *refsWatch
 }
 
 type hostFetch struct {
@@ -243,6 +250,8 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		return nil, errors.New("peer sync: SYNC_HELLO must come first")
 	}
 	switch m := msg.(type) {
+	case wire.RefsWatchMessage:
+		return h.startWatch(m)
 	case wire.RefsRequestMessage:
 		refs, err := h.refs(m.Namespaces)
 		if err != nil {
@@ -481,10 +490,14 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 }
 
 func (h *V2Host) capabilities() []string {
-	if h.cfg.WriteBack == nil {
-		return HostCapabilities
+	caps := HostCapabilities
+	if h.cfg.WriteBack != nil {
+		caps = append(slices.Clone(caps), wire.SyncCapWriteBack)
 	}
-	return append(slices.Clone(HostCapabilities), wire.SyncCapWriteBack)
+	if h.cfg.WatchHead != nil && h.cfg.Send != nil {
+		caps = append(slices.Clone(caps), wire.SyncCapWatch)
+	}
+	return caps
 }
 
 // projectWrite hands a projection's write to the source. The namespace must be one the session
@@ -726,6 +739,7 @@ func (h *V2Host) stageGraftPage(env IngestEnv, page wire.SnapshotPageMessage) (*
 // Close releases what the session staged and never finished: pushed grafts whose last page did
 // not arrive. The connection's owner calls it when the connection ends.
 func (h *V2Host) Close() {
+	h.stopWatch()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for ns, stage := range h.grafts {

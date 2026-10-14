@@ -16,6 +16,8 @@ import { fromHex } from "./bytes.ts";
 import { contentHash, decodeCommit, type Commit } from "./commit.ts";
 import { ReplicaNamespace, type TreeNodeView } from "./namespace.ts";
 import type { ProjectionNamespace, WriteBackDoc } from "./projection.ts";
+import { parsePackedAttachmentTable, setHash, sortAttachments, type Attachment } from "./attachments.ts";
+import type { BlobStore } from "./blobs.ts";
 
 export class SingleHomeError extends Error {
   override name = "SingleHomeError";
@@ -35,6 +37,15 @@ import {
 
 export type CatchUp = "replay" | "squash" | "auto";
 
+/** One attachment as TREE_NODES and PROJECT_PAGE list it. */
+export interface TreeAttachmentWire {
+  id: string;
+  name: string;
+  hash: string;
+  size: number;
+  mime?: string;
+}
+
 /** go/kdb/peersync/squash.go: auto squashes from this backlog, at this many commits per change. */
 export const AUTO_SQUASH_MIN_BACKLOG = 1000;
 export const AUTO_SQUASH_BACKLOG_PER_CHANGE = 2;
@@ -42,6 +53,8 @@ export const AUTO_SQUASH_BACKLOG_PER_CHANGE = 2;
 export interface SyncOptions {
   catchUp: CatchUp;
   pageBytes?: number;
+  /** Where blobs the replica wrote wait for upload (needed to push commits with attachments). */
+  blobs?: BlobStore;
 }
 
 export interface NamespaceSyncResult {
@@ -122,6 +135,18 @@ export async function syncNamespace(
 
 async function push(conn: PeerConnection, ns: ReplicaNamespace, remoteMain: string, opts: SyncOptions) {
   const commits = await ns.pendingCommits();
+  // The host stores a commit only once it holds the blobs it references: upload first (plan §9).
+  const uploaded: string[] = [];
+  for (const c of commits) {
+    for (const op of c.ops) {
+      if (op.kind !== "attachmentPut" || !opts.blobs) continue;
+      const m = await opts.blobs.meta(op.contentHash);
+      if (m?.pinned && !uploaded.includes(op.contentHash)) {
+        await opts.blobs.upload(conn, ns.name, op.contentHash);
+        uploaded.push(op.contentHash);
+      }
+    }
+  }
   const limit = opts.pageBytes ?? 4 << 20;
   let page: Commit[] = [];
   let size = 0;
@@ -132,7 +157,10 @@ async function push(conn: PeerConnection, ns: ReplicaNamespace, remoteMain: stri
     const last = i === commits.length - 1;
     if (!last && size < limit) continue;
     const ack = await conn.refUpdate(ns.name, remoteMain, ns.head!, page, !last);
-    if (last) return ack;
+    if (last) {
+      if (ack.outcome !== "conflict") for (const h of uploaded) await opts.blobs?.unpin(h);
+      return ack;
+    }
     page = [];
     size = 0;
   }
@@ -166,7 +194,14 @@ async function resumeConverge(
       after = page.done ? after : page.next;
       await ns.applyConvergePage(docs, after);
       changed.push(...docs.map(([id]) => id));
-      if (page.done) break;
+      if (page.done) {
+        // The last page carries the commit's whole attachment table: the replica has no history
+        // to derive it from.
+        if (page.commit.attachmentRoot !== undefined || (await ns.attachmentRoot()) !== undefined) {
+          await ns.applyConvergeAttachments(parsePackedAttachmentTable(page.attachmentTables), true);
+        }
+        break;
+      }
       page = undefined;
     }
     try {
@@ -177,8 +212,9 @@ async function resumeConverge(
       // target; a diff against the target's tree repairs exactly that.
     }
   }
-  const tree = decodeCommit(fromHex(ns.target!.payloadHex)).treeHash;
-  changed.push(...(await converge(conn, ns, tree)));
+  const target = decodeCommit(fromHex(ns.target!.payloadHex));
+  changed.push(...(await converge(conn, ns, target.treeHash)));
+  await convergeAttachments(conn, ns, target);
   await ns.finishConverge();
   return changed;
 }
@@ -200,6 +236,7 @@ async function catchUp(conn: PeerConnection, ns: ReplicaNamespace, remoteMain: s
       if (squash) {
         await ns.beginConverge(target, "diff");
         const changed = await converge(conn, ns, target.treeHash, diff);
+        await convergeAttachments(conn, ns, target);
         await ns.finishConverge();
         return { route: "squash", changed };
       }
@@ -254,18 +291,28 @@ function fromWire(n: WireTreeNode): TreeNodeView {
   };
 }
 
-async function diffTrees(conn: PeerConnection, ns: ReplicaNamespace, treeHex: string): Promise<Diff> {
+async function diffTrees(
+  conn: PeerConnection,
+  ns: ReplicaNamespace,
+  treeHex: string,
+  attachmentsAt?: string,
+  sets?: Map<string, TreeAttachmentWire[]>,
+): Promise<Diff> {
   const changes: [string, string][] = [];
   let frontier = [""];
   while (frontier.length > 0) {
     const next: string[] = [];
     for (let i = 0; i < frontier.length; i += MAX_TREE_NODE_PREFIXES) {
       const batch = frontier.slice(i, i + MAX_TREE_NODE_PREFIXES);
-      const remote = (await conn.treeNodes(ns.name, treeHex, batch)).nodes.map(fromWire);
+      const res = attachmentsAt === undefined
+        ? await conn.treeNodes(ns.name, treeHex, batch)
+        : await conn.treeNodes(ns.name, "", batch, DEFAULT_TREE_ENTRY_LIMIT, { tree: "attachments", commitHex: attachmentsAt });
+      for (const [id, list] of Object.entries(res.attachments)) sets?.set(id.toLowerCase(), list);
+      const remote = res.nodes.map(fromWire);
       if (remote.length !== batch.length) throw new ProtocolError("kdb replica: TREE_NODES answered the wrong number of nodes");
       for (let j = 0; j < batch.length; j++) {
         const prefix = batch[j]!;
-        const l = await ns.treeNode(prefix, DEFAULT_TREE_ENTRY_LIMIT);
+        const l = await ns.treeNode(prefix, DEFAULT_TREE_ENTRY_LIMIT, attachmentsAt === undefined ? "documents" : "attachments");
         const r = remote[j]!;
         if (l.hash === r.hash) continue;
         if ((l.entries || l.hash === "") && (r.entries || r.hash === "")) {
@@ -376,4 +423,30 @@ export async function syncProjection(conn: PeerConnection, p: ProjectionNamespac
   }
   res.lastSource = p.lastSource;
   return res;
+}
+
+/**
+ * Makes the namespace's attachment table equal the target commit's: a diff of the attachment
+ * tries (TREE_NODES with tree "attachments"), taking each differing document's whole set from the
+ * host's listing and checking it against the set hash the host's trie names.
+ */
+async function convergeAttachments(conn: PeerConnection, ns: ReplicaNamespace, target: Commit): Promise<void> {
+  if ((await ns.attachmentRoot()) === target.attachmentRoot) return;
+  if (!conn.has("attachments")) throw new ProtocolError(`kdb replica: ${ns.name} has attachments, and the host does not serve them`);
+  const listed = new Map<string, TreeAttachmentWire[]>();
+  const diff = await diffTrees(conn, ns, "", target.hash, listed);
+  const sets = new Map<string, Attachment[]>();
+  for (const [id, h] of diff.changes) {
+    if (h === "") {
+      sets.set(id, []);
+      continue;
+    }
+    const set: Attachment[] = (listed.get(id) ?? []).map((a) => ({
+      id: a.id.toLowerCase(), name: a.name, scheme: 1, contentHash: a.hash, size: BigInt(a.size), mime: a.mime ?? "",
+    }));
+    sortAttachments(set);
+    if (setHash(set) !== h) throw new ProtocolError(`kdb replica: the host's attachment set for ${id} does not match its hash`);
+    sets.set(id, set);
+  }
+  await ns.applyConvergeAttachments(sets, false);
 }

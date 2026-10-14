@@ -344,8 +344,11 @@ func (s *NamespaceSet) commitAcross(parts []NamespaceTransaction, principal auth
 			return err
 		}
 		for _, c := range result.Commits {
-			if rt, ok := s.Get(c.Namespace); ok && rt.CommitListener != nil {
-				rt.CommitListener(c.Namespace, c.Commit)
+			if rt, ok := s.Get(c.Namespace); ok {
+				if rt.CommitListener != nil {
+					rt.CommitListener(c.Namespace, c.Commit)
+				}
+				rt.notifyHeadWatchers()
 			}
 		}
 		return nil

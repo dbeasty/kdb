@@ -23,6 +23,7 @@
 import { fromUtf8, toHex, utf8 } from "./bytes.ts";
 import { contentHash } from "./commit.ts";
 import { sha256 } from "./sha256.ts";
+import { decodeAttachmentSet, encodeAttachmentSet, sortAttachments, type Attachment } from "./attachments.ts";
 import { prefixEnd, type Batch, type KvStore } from "./store.ts";
 
 /** The local name Go gives a projection (peersync.ProjectionNamespace). */
@@ -61,6 +62,8 @@ export interface ProjectPage {
   deletes: string[];
   next: string;
   done: boolean;
+  /** Every written document's whole attachment set at atHex; a written document absent has none. */
+  attachments?: Record<string, { id: string; name: string; hash: string; size: number; mime?: string }[]>;
 }
 
 export class ReadOnlyProjectionError extends Error {
@@ -127,6 +130,16 @@ export class ProjectionNamespace {
     return `d/${this.key}/${id.toLowerCase()}`;
   }
 
+  #attachKey(id: string): string {
+    return `a/${this.key}/${id.toLowerCase()}`;
+  }
+
+  /** The document's attachments as of the last transfer (refs; bytes are fetched on read). */
+  async attachments(id: string): Promise<Attachment[]> {
+    const b = await this.#store.get(this.#attachKey(id));
+    return b ? decodeAttachmentSet(b) : [];
+  }
+
   #pendingKey(id: string): string {
     return `p/${this.key}/${id.toLowerCase()}`;
   }
@@ -168,9 +181,12 @@ export class ProjectionNamespace {
       const batch: Batch = new Map();
       const entry: OutboxEntry = { seq: this.#meta.nextSeq, txId, docs: [] };
       const counts = new Map<string, number>();
+      // A document written twice in one call: the second write's base is the first's result.
+      const staged = new Map<string, string | null>();
       for (const d of docs) {
         const id = d.docId.toLowerCase();
-        const before = await this.get(id);
+        const before = staged.has(id) ? (staged.get(id) ?? undefined) : await this.get(id);
+        staged.set(id, d.json);
         const wb: WriteBackDoc = { docId: id };
         if (before !== undefined) wb.baseHash = contentHash(id, before);
         if (d.json === null) {
@@ -229,18 +245,25 @@ export class ProjectionNamespace {
       const batch: Batch = new Map();
       const changed: string[] = [];
       const delivered = new Set<string>();
+      const listed = new Map(Object.entries(page.attachments ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
       for (const w of page.writes) {
         const id = w.id.toLowerCase();
         delivered.add(id);
         if ((await this.#pendingCount(id)) > 0) continue;
         if ((await this.get(id)) !== w.body) changed.push(id);
         batch.set(this.#docKey(id), utf8(w.body));
+        // Every written document comes with its whole attachment set; absent means none.
+        const set: Attachment[] = (listed.get(id) ?? []).map((a) => ({
+          id: a.id.toLowerCase(), name: a.name, scheme: 1, contentHash: a.hash, size: BigInt(a.size), mime: a.mime ?? "",
+        }));
+        batch.set(this.#attachKey(id), set.length > 0 ? encodeAttachmentSet(sortAttachments(set)) : null);
       }
       for (const raw of page.deletes) {
         const id = raw.toLowerCase();
         if ((await this.#pendingCount(id)) > 0) continue;
         if ((await this.get(id)) !== undefined) changed.push(id);
         batch.set(this.#docKey(id), null);
+        batch.set(this.#attachKey(id), null);
       }
       if (page.reset) {
         // The page stands for every id after the cursor up to its next (to the end when done):
@@ -252,6 +275,7 @@ export class ProjectionNamespace {
           const id = k.slice(base.length);
           if (delivered.has(id) || (await this.#pendingCount(id)) > 0) continue;
           batch.set(k, null);
+          batch.set(this.#attachKey(id), null);
           changed.push(id);
         }
       }

@@ -552,6 +552,8 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgAttachmentData, "ATTACHMENT_DATA"},
 		{wire.MsgAttachmentList, "ATTACHMENT_LIST"},
 		{wire.MsgAttachmentListResult, "ATTACHMENT_LIST_RESULT"},
+		{wire.MsgRefsWatch, "REFS_WATCH"},
+		{wire.MsgRefsChanged, "REFS_CHANGED"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)

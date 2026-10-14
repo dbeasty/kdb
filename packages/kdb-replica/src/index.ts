@@ -51,3 +51,16 @@ export {
   type WriteBackDoc,
 } from "./projection.ts";
 export { SingleHomeError, syncProjection, type ProjectionSyncResult } from "./sync.ts";
+export {
+  AttachmentEdit,
+  AttachmentError,
+  ContentHasher,
+  attachmentContentHash,
+  refHash,
+  setHash,
+  type Attachment,
+  type AttachmentRef,
+} from "./attachments.ts";
+export { AttachmentRootMismatchError } from "./namespace.ts";
+export { BlobStore, BlobUnavailableError } from "./blobs.ts";
+export { parsePackedAttachmentTable } from "./attachments.ts";

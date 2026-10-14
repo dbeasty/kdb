@@ -75,6 +75,12 @@ export class Writer {
     return this.leb(b.length).raw(b);
   }
 
+  int32(v: number): this {
+    const b = new Uint8Array(4);
+    new DataView(b.buffer).setInt32(0, v, true);
+    return this.raw(b);
+  }
+
   int64(v: bigint): this {
     const b = new Uint8Array(8);
     new DataView(b.buffer).setBigInt64(0, v, true);
@@ -147,6 +153,11 @@ export class Reader {
 
   string(): string {
     return fromUtf8(this.raw(this.leb()));
+  }
+
+  int32(): number {
+    const b = this.raw(4);
+    return new DataView(b.buffer, b.byteOffset, 4).getInt32(0, true);
   }
 
   int64(): bigint {

@@ -16,6 +16,9 @@
 //	{"op":"docs","ns":"app/u/1"}                                   -> {"docs":{"<id>":"<json>"}}
 //	{"op":"denyRead","ns":..,"id":..} / {"op":"allowRead",..}       -> {}  (per-document read rights)
 //	{"op":"setHome","ns":..} / {"op":"clearHome","ns":..}           -> {}  (another node is home)
+//	{"op":"attach","ns":..,"id":..,"name":..,"mime":..,"text":..}  -> {"head","attachmentId","contentHash"}
+//	{"op":"detach","ns":..,"id":..,"name":..}                       -> {"head"}
+//	{"op":"attachments","ns":..,"id":..}                            -> {"attachments":[{id,name,hash,size,mime}]}
 //
 // Tokens: "rw-token" may pull and push every namespace; "ro-token" may only pull; anything else is
 // refused. Namespaces under "secret/" are refused to both. The process exits when stdin closes, so a
@@ -32,6 +35,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -123,6 +127,9 @@ type command struct {
 	Ops     []opDto `json:"ops"`
 	Commits int     `json:"commits"`
 	Docs    int     `json:"docs"`
+	Name    string  `json:"name"`
+	Mime    string  `json:"mime"`
+	Text    string  `json:"text"`
 }
 
 type host struct {
@@ -224,6 +231,48 @@ func (h *host) handle(c command) (any, error) {
 			return true
 		})
 		return map[string]any{"docs": docs}, ferr
+	case "attach", "detach":
+		rt, err := h.runtime(c.NS)
+		if err != nil {
+			return nil, err
+		}
+		id, err := codec.ParseUUID(c.ID)
+		if err != nil {
+			return nil, err
+		}
+		var head codec.Hash
+		var info embed.AttachmentInfo
+		if c.Op == "attach" {
+			head, info, err = rt.Runtime.PutAttachment(c.NS, id, strings.NewReader(c.Text), embed.PutAttachmentOptions{Name: c.Name, Mime: c.Mime})
+		} else {
+			head, err = rt.Runtime.DeleteAttachment(c.NS, id, embed.AttachmentSelector{Name: c.Name})
+		}
+		if err != nil {
+			return nil, err
+		}
+		return map[string]string{"head": head.Hex(), "attachmentId": info.ID.String(), "contentHash": info.ContentHash.Hex()}, nil
+	case "attachments":
+		rt, err := h.runtime(c.NS)
+		if err != nil {
+			return nil, err
+		}
+		id, err := codec.ParseUUID(c.ID)
+		if err != nil {
+			return nil, err
+		}
+		head, err := rt.Runtime.DAG.Head()
+		if err != nil {
+			return nil, err
+		}
+		table, err := rt.Runtime.AttachmentTableAt(head)
+		if err != nil {
+			return nil, err
+		}
+		list := []map[string]any{}
+		for _, a := range table.List(id) {
+			list = append(list, map[string]any{"id": a.ID.String(), "name": a.Name, "hash": a.ContentHash.Hex(), "size": a.Size, "mime": a.Mime})
+		}
+		return map[string]any{"attachments": list}, nil
 	case "denyRead", "allowRead":
 		h.engine.mu.Lock()
 		h.engine.unreadable[c.NS+"/"+c.ID] = c.Op == "denyRead"
@@ -253,6 +302,12 @@ func (h *host) handle(c command) (any, error) {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:0", "HTTP listen address")
 	dir := flag.String("dir", "", "data directory (empty: in memory)")
+	serve := flag.Bool("serve", false, "serve until killed instead of reading commands from stdin (browser tests)")
+	var seeds []string
+	flag.Func("seed", "ns:N - write N documents ({\"region\":\"EU\"|\"US\"}) to ns before serving; repeatable", func(v string) error {
+		seeds = append(seeds, v)
+		return nil
+	})
 	flag.Parse()
 
 	var fileHost *embed.Host
@@ -302,9 +357,28 @@ func main() {
 		os.Exit(1)
 	}
 	go func() { _ = http.Serve(ln, mux) }()
-	fmt.Printf("ready ws://%s/kdb/sync\n", ln.Addr().String())
 
 	h := &host{set: set, engine: engine}
+	for _, sd := range seeds {
+		ns, n, ok := strings.Cut(sd, ":")
+		count, err := strconv.Atoi(n)
+		if !ok || err != nil {
+			fmt.Fprintln(os.Stderr, "kdb-replicahost: -seed wants ns:N, got", sd)
+			os.Exit(2)
+		}
+		for i := 0; i < count; i++ {
+			id := codec.DerivedUUID(fmt.Sprintf("seed:%s:%d", ns, i))
+			region := []string{"EU", "US"}[i%2]
+			if _, err := h.commit(ns, []document.Op{document.WriteOp{DocID: id, Patch: fmt.Sprintf(`{"region":%q,"i":%d}`, region, i)}}); err != nil {
+				fmt.Fprintln(os.Stderr, "kdb-replicahost: seed:", err)
+				os.Exit(1)
+			}
+		}
+	}
+	fmt.Printf("ready ws://%s/kdb/sync\n", ln.Addr().String())
+	if *serve {
+		select {}
+	}
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 1<<20), 64<<20)
 	out := json.NewEncoder(os.Stdout)

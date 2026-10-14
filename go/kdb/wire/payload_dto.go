@@ -74,6 +74,8 @@ type payloadEnvelope struct {
 	HomeRequest        *homeRequestDto        `json:"homeRequest,omitempty"`
 	HomeRequestResult  *homeRequestResultDto  `json:"homeRequestResult,omitempty"`
 	SquashHead         *squashHeadDto         `json:"squashHead,omitempty"`
+	RefsWatch          *refsWatchDto          `json:"refsWatch,omitempty"`
+	RefsChanged        *refsChangedDto        `json:"refsChanged,omitempty"`
 	SquashHeadResult   *squashHeadResultDto   `json:"squashHeadResult,omitempty"`
 	CommitPush         *commitPushDto         `json:"commitPush,omitempty"`
 	CommitPushAck      *commitPushAckDto      `json:"commitPushAck,omitempty"`

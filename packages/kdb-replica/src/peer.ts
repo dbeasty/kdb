@@ -10,9 +10,21 @@
  *   as silence.
  */
 
-import { connectWebSocket, decodeFrame, encodeFrame, type Transport } from "@kdb/client";
+import { connectWebSocket, decodeFrameBody, encodeFrame, encodeFrameBody, type Transport } from "@kdb/client";
+import type { TreeAttachmentWire } from "./sync.ts";
+import {
+  decodeAttachmentUploadResult,
+  decodeBlobFetchResult,
+  encodeAttachmentUpload,
+  encodeBlobFetch,
+  type BlobFetchEntry,
+  type BlobFetchResult,
+  type UploadChunk,
+  type UploadResult,
+} from "./binwire.ts";
 import { decodeCommitList, encodeCommitList, type Commit } from "./commit.ts";
 import type { ProjectPage, WriteBackDoc } from "./projection.ts";
+import { zstdDecompress as zstdDecompressPortable } from "./zstd.ts";
 
 export const MSG = {
   PEER_ERROR: 0x25,
@@ -36,7 +48,17 @@ export const MSG = {
   PROJECT_WRITE_RESULT: 0x33,
   SQUASH_HEAD: 0x40,
   SQUASH_HEAD_RESULT: 0x41,
+  /** Client replica codes (0x50-0x57 reserved): watch refs, and the host's reports. */
+  REFS_WATCH: 0x50,
+  REFS_CHANGED: 0x51,
+  /** Attachments (docs/kdb-attachments-plan.md), always binary bodies. */
+  BLOB_FETCH: 0x42,
+  BLOB_FETCH_RESULT: 0x43,
+  ATTACHMENT_UPLOAD: 0x44,
+  ATTACHMENT_UPLOAD_RESULT: 0x45,
 } as const;
+
+const ENCODING_BINARY = 0x02;
 
 const KIND_BY_CODE: Record<number, string> = {
   [MSG.SYNC_HELLO]: "syncHello",
@@ -49,6 +71,7 @@ const KIND_BY_CODE: Record<number, string> = {
   [MSG.SQUASH_HEAD]: "squashHead",
   [MSG.PROJECT_FETCH]: "projectFetch",
   [MSG.PROJECT_WRITE]: "projectWrite",
+  [MSG.REFS_WATCH]: "refsWatch",
 };
 
 export const SYNC_PROTOCOL_VERSION = 2;
@@ -101,8 +124,11 @@ export function fromBase64(s: string | undefined | null): Uint8Array {
 
 // --- zstd ----------------------------------------------------------------------------------------
 
-/** Node's zstd decoder when the runtime has one (22.15+); packs are only compressed if offered. */
-const zstdDecompress: ((data: Uint8Array) => Uint8Array) | null = (() => {
+/**
+ * zstd for packs: Node's native decoder when the runtime has one (22.15+), else the TS port of
+ * kdb-compression's decoder (zstd.ts), so browsers get compressed packs too (plan D11).
+ */
+const nativeZstd: ((data: Uint8Array) => Uint8Array) | null = (() => {
   const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
   const zlib = proc?.getBuiltinModule?.("node:zlib") as
     | { zstdDecompressSync?: (d: Uint8Array, o?: { maxOutputLength?: number }) => Uint8Array }
@@ -110,17 +136,20 @@ const zstdDecompress: ((data: Uint8Array) => Uint8Array) | null = (() => {
   const fn = zlib?.zstdDecompressSync;
   if (typeof fn !== "function") return null;
   return (d) => {
-    const out = fn(d, { maxOutputLength: 256 << 20 });
+    const out = fn(d, { maxOutputLength: MAX_PACK_PAYLOAD });
     return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
   };
 })();
 
-export const canDecodeZstd = zstdDecompress !== null;
+/** The most a pack's commits may inflate to (go/kdb/wire maxPackPayload). */
+const MAX_PACK_PAYLOAD = 256 << 20;
+
+const zstdDecompress = nativeZstd ?? ((d: Uint8Array) => zstdDecompressPortable(d, MAX_PACK_PAYLOAD));
+
 
 function commitsFrom(payload: string | undefined, zstd: boolean | undefined): Commit[] {
   let bytes = fromBase64(payload);
   if (zstd) {
-    if (!zstdDecompress) throw new ProtocolError("kdb replica: the peer sent a zstd pack this runtime cannot decode");
     bytes = zstdDecompress(bytes);
   }
   return decodeCommitList(bytes);
@@ -145,6 +174,8 @@ export class PeerConnection {
   readonly #timeoutMs: number;
   readonly #pending = new Map<number, { resolve: (e: Envelope) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   #next = 1;
+  #watch: { id: number; onChange: (refs: NamespaceRefs[]) => void } | null = null;
+  #closeHandlers: ((cause: Error) => void)[] = [];
   #closed: Error | null = null;
   caps: string[] = [];
   remoteNodeId = "";
@@ -162,8 +193,7 @@ export class PeerConnection {
     const t = await (opts.connect ?? ((u) => connectWebSocket(u)))(url);
     const conn = new PeerConnection(t, opts.timeoutMs ?? 30_000);
     try {
-      const caps = ["snapshot", "repair", "squash", "filter", "writeback"];
-      if (canDecodeZstd) caps.push("zstd-pack");
+      const caps = ["snapshot", "repair", "squash", "filter", "writeback", "watch", "zstd-pack", "attachments"];
       const hello: Record<string, unknown> = {
         nodeId: opts.nodeId, protocol: SYNC_PROTOCOL_VERSION, capabilities: caps, namespaces: opts.namespaces,
       };
@@ -181,15 +211,33 @@ export class PeerConnection {
   }
 
   #onFrame(frame: Uint8Array): void {
-    let decoded;
+    let decoded: { header: { correlationId: number; typeCode: number }; envelope: Envelope };
     try {
-      decoded = decodeFrame(frame);
+      const { header, encodingTag, body } = decodeFrameBody(frame);
+      // JSON envelopes for v2 messages; binary bodies for the attachment messages, which are
+      // handed over undecoded with their type code.
+      const envelope: Envelope = encodingTag === ENCODING_BINARY
+        ? { kind: "binary", typeCode: header.typeCode, body: body.slice() }
+        : (JSON.parse(new TextDecoder().decode(body)) as Envelope);
+      decoded = { header, envelope };
     } catch (e) {
       this.#fail(e instanceof Error ? e : new ProtocolError(String(e)));
       return;
     }
     const p = this.#pending.get(decoded.header.correlationId);
-    if (!p) return;
+    if (!p) {
+      // An unasked REFS_CHANGED, under the watch's correlation id.
+      const env = decoded.envelope as Envelope;
+      if (this.#watch && decoded.header.correlationId === this.#watch.id && env.kind === "refsChanged") {
+        const refs = ((env.refsChanged as { refs?: NamespaceRefs[] } | undefined)?.refs) ?? [];
+        try {
+          this.#watch.onChange(refs);
+        } catch {
+          // the listener's failure is its own
+        }
+      }
+      return;
+    }
     this.#pending.delete(decoded.header.correlationId);
     clearTimeout(p.timer);
     p.resolve(decoded.envelope as Envelope);
@@ -203,28 +251,57 @@ export class PeerConnection {
       p.reject(err);
     }
     this.#pending.clear();
+    for (const h of this.#closeHandlers) h(err);
   }
 
-  /** Sends one request and returns the body of its reply, which must be of kind `expect`. */
-  request(code: number, body: Record<string, unknown>, expect: string): Promise<Record<string, unknown>> {
+  /** Whether the connection has ended. */
+  get closed(): boolean {
+    return this.#closed !== null;
+  }
+
+  /** Called once when the connection ends, for whatever reason. */
+  onClose(handler: (cause: Error) => void): void {
+    if (this.#closed) handler(this.#closed);
+    else this.#closeHandlers.push(handler);
+  }
+
+  #exchange(what: string, frame: (id: number) => Uint8Array): Promise<Envelope> {
     if (this.#closed) return Promise.reject(this.#closed);
-    const kind = KIND_BY_CODE[code];
-    if (!kind) return Promise.reject(new ProtocolError(`kdb replica: no request kind for 0x${code.toString(16)}`));
     const id = this.#next++;
     return new Promise<Envelope>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
-        reject(new ProtocolError(`kdb replica: no reply to ${kind} within ${this.#timeoutMs} ms`));
+        reject(new ProtocolError(`kdb replica: no reply to ${what} within ${this.#timeoutMs} ms`));
       }, this.#timeoutMs);
       this.#pending.set(id, { resolve, reject, timer });
       try {
-        this.#t.send(encodeFrame(code, id, { kind, [kind]: body }));
+        this.#t.send(frame(id));
       } catch (e) {
         clearTimeout(timer);
         this.#pending.delete(id);
         reject(e);
       }
-    }).then((env) => {
+    });
+  }
+
+  /** Sends a binary-bodied request and returns the binary body of its reply, of type `expect`. */
+  async requestBinary(code: number, body: Uint8Array, expect: number): Promise<Uint8Array> {
+    const env = await this.#exchange(`0x${code.toString(16)}`, (id) => encodeFrameBody(code, id, ENCODING_BINARY, body));
+    if (env.kind === "peerError") {
+      const pe = (env.peerError ?? {}) as { code?: string; message?: string; namespace?: string };
+      throw new RemoteError(pe.code ?? "UNKNOWN", pe.message ?? "", pe.namespace ?? "");
+    }
+    if (env.kind !== "binary" || env.typeCode !== expect) {
+      throw new ProtocolError(`kdb replica: expected binary 0x${expect.toString(16)}, got ${env.kind}`);
+    }
+    return env.body as Uint8Array;
+  }
+
+  /** Sends one request and returns the body of its reply, which must be of kind `expect`. */
+  request(code: number, body: Record<string, unknown>, expect: string): Promise<Record<string, unknown>> {
+    const kind = KIND_BY_CODE[code];
+    if (!kind) return Promise.reject(new ProtocolError(`kdb replica: no request kind for 0x${code.toString(16)}`));
+    return this.#exchange(kind, (id) => encodeFrame(code, id, { kind, [kind]: body })).then((env) => {
       if (env.kind === "peerError") {
         const pe = (env.peerError ?? {}) as { code?: string; message?: string; namespace?: string };
         throw new RemoteError(pe.code ?? "UNKNOWN", pe.message ?? "", pe.namespace ?? "");
@@ -250,6 +327,17 @@ export class PeerConnection {
     return (r.refs as NamespaceRefs[] | undefined) ?? [];
   }
 
+  /**
+   * Watches namespaces (REFS_WATCH): returns their refs now, then calls onChange with the refs of
+   * those that move, until the connection ends. Replaces any earlier watch on this connection.
+   */
+  async watch(namespaces: string[], onChange: (refs: NamespaceRefs[]) => void): Promise<NamespaceRefs[]> {
+    const id = this.#next; // the request's correlation id, which the host's reports reuse
+    this.#watch = { id, onChange };
+    const r = await this.request(MSG.REFS_WATCH, { namespaces }, "refsChanged");
+    return (r.refs as NamespaceRefs[] | undefined) ?? [];
+  }
+
   async fetch(namespace: string, wants: string[], haves: string[], maxBytes = DEFAULT_PAGE_BYTES): Promise<{ commits: Commit[]; done: boolean }> {
     const r = await this.request(MSG.FETCH_REQUEST, { namespace, wants, haves, maxBytes }, "packPage");
     if (Array.isArray(r.stubs) && r.stubs.length > 0) {
@@ -268,6 +356,7 @@ export class PeerConnection {
       next: String(r.next ?? ""),
       done: Boolean(r.done),
       total: Number(r.total ?? 0),
+      attachmentTables: fromBase64(r.attachmentTables as string | undefined),
     };
   }
 
@@ -283,9 +372,27 @@ export class PeerConnection {
     };
   }
 
-  async treeNodes(namespace: string, treeHex: string, prefixes: string[], entryLimit = DEFAULT_TREE_ENTRY_LIMIT): Promise<{ treeHex: string; nodes: WireTreeNode[] }> {
-    const r = await this.request(MSG.TREE_NODES, { namespace, treeHex, prefixes, entryLimit }, "treeNodesResult");
-    return { treeHex: String(r.treeHex ?? ""), nodes: (r.nodes as WireTreeNode[] | undefined) ?? [] };
+  /**
+   * TREE_NODES: the document tree treeHex, or with tree "attachments" the attachment table at
+   * commitHex (entries map document ids to set hashes, and attachments lists their sets).
+   */
+  async treeNodes(namespace: string, treeHex: string, prefixes: string[], entryLimit = DEFAULT_TREE_ENTRY_LIMIT, opts: { tree?: "attachments"; commitHex?: string } = {}): Promise<{ treeHex: string; nodes: WireTreeNode[]; attachments: Record<string, TreeAttachmentWire[]> }> {
+    const r = await this.request(MSG.TREE_NODES, { namespace, treeHex, prefixes, entryLimit, ...opts }, "treeNodesResult");
+    return {
+      treeHex: String(r.treeHex ?? ""),
+      nodes: (r.nodes as WireTreeNode[] | undefined) ?? [],
+      attachments: (r.attachments as Record<string, TreeAttachmentWire[]> | undefined) ?? {},
+    };
+  }
+
+  /** BLOB_FETCH: parts of attachment blobs, each with chunk proofs (verified by the caller). */
+  async blobFetch(namespace: string, entries: readonly BlobFetchEntry[], maxBytes = 8 << 20): Promise<BlobFetchResult> {
+    return decodeBlobFetchResult(await this.requestBinary(MSG.BLOB_FETCH, encodeBlobFetch(namespace, entries, maxBytes), MSG.BLOB_FETCH_RESULT));
+  }
+
+  /** ATTACHMENT_UPLOAD: one chunk of a blob upload on the sync session. */
+  async upload(chunk: UploadChunk): Promise<UploadResult> {
+    return decodeAttachmentUploadResult(await this.requestBinary(MSG.ATTACHMENT_UPLOAD, encodeAttachmentUpload(chunk), MSG.ATTACHMENT_UPLOAD_RESULT));
   }
 
   async objectFetch(namespace: string, items: { id: string; contentHash: string; treeHex?: string }[]): Promise<{ docs: { id: string; body: string }[]; missing: string[] }> {
@@ -305,6 +412,7 @@ export class PeerConnection {
       deletes: (r.deletes as string[] | undefined) ?? [],
       next: String(r.next ?? ""),
       done: Boolean(r.done),
+      attachments: (r.attachments as Record<string, TreeAttachmentWire[]> | undefined) ?? {},
     };
   }
 
@@ -338,6 +446,8 @@ export interface SnapshotPage {
   next: string;
   done: boolean;
   total: number;
+  /** On the last page of a commit with attachments: its packed attachment table. */
+  attachmentTables: Uint8Array;
 }
 
 export interface SquashHead {

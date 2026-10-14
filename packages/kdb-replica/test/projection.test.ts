@@ -51,3 +51,12 @@ test("the outbox survives reopening, in order", async () => {
   const again = await ProjectionNamespace.open(store, "ns", "TRUE", true);
   assert.deepEqual((await again.outbox()).map((e) => e.docs[0]!.docId), Array.from({ length: 12 }, (_, i) => id(i)));
 });
+
+test("a document written twice in one write: the second's base is the first's result", async () => {
+  const p = await ProjectionNamespace.open(new MemoryStore(), "ns", "TRUE", true);
+  const e = await p.write([{ docId: id(1), json: `{"v":1}` }, { docId: id(1), json: `{"v":2}` }], "22222222-2222-4222-8222-222222222222");
+  const { contentHash } = await import("../src/commit.ts");
+  assert.equal(e.docs[0]!.baseHash, undefined, "a create");
+  assert.equal(e.docs[1]!.baseHash, contentHash(id(1), `{"v":1}`));
+  assert.equal(await p.get(id(1)), `{"v":2}`);
+});

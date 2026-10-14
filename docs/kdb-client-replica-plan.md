@@ -1,6 +1,8 @@
 # Client replica (memory plan Track D)
 
-Status: **design; owner decisions recorded in §10.** Progress: PR 1 (core) #217 merged; PR 2 (full-mode sync) #218; PR 3 (filtered mode) stacked on #218. Written 2026-10-13 against `origin/main` 0399daf.
+Status: **design; owner decisions recorded in §10.** Progress: PR 1 (core) #217, PR 2 (full-mode sync) #218 and PR 3 (filtered mode) #219 are merged. The
+rest (browser zstd, REFS_WATCH, the Kotlin engine, attachments) is one PR on top of the attachments
+session's PR #223, as the owner asked on 2026-10-14. The pager test fix is #222. Written 2026-10-13 against `origin/main` 0399daf.
 No code yet. File references are relative to `go/kdb/` unless they start with a repo-level directory.
 
 Inputs: `kdb-memory-cassandra-plan.md` Track D (fixed constraints), `kdb-distributed-plan.md` §3.11–3.14,
@@ -220,11 +222,20 @@ peersync has no head announcement. The replicator syncs on an interval (30 s) an
 - **v1 (no protocol change)**: poll. A cheap REFS_REQUEST every N seconds while the page is visible and online,
   with backoff when hidden or offline, and an immediate sync on `online`/`visibilitychange`. A REFS round trip
   for unchanged refs is a few hundred bytes.
-- **v2 (proposed, codes reserved)**: `REFS_WATCH 0x50` / `REFS_CHANGED 0x51`. The client asks the host to send
+- **v2 (built)**: `REFS_WATCH 0x50` / `REFS_CHANGED 0x51`. The client asks the host to send
   a REFS_CHANGED frame on the open sync connection when a watched namespace's head moves. The client then
   FETCHes (or PROJECT_FETCHes). The host side is a hook on the namespace's commit notifier (the one the stream
   listener already uses), coalesced per namespace. For projections, the host only says "the source moved"; the
   filter is evaluated on the next PROJECT_FETCH, so the watch leaks nothing beyond "something changed".
+
+As built:
+- The host answers REFS_WATCH with REFS_CHANGED carrying the watched namespaces' refs. It then sends unasked
+  REFS_CHANGED frames under the watch's correlation id, coalesced over 25 ms, with the namespaces that moved.
+- It learns that a head moved from `KdbServerRuntime.WatchHead`, fed from the same three points as
+  `CommitListener`.
+- Watches are authorized like REFS, so the host re-authorizes each namespace on every report.
+- The replica keeps the connection open between rounds while live. It syncs on each report and polls only every
+  60 s as a fallback. A filtered namespace is watched only where the token may also sync its source.
 
 Codes 0x50–0x57 are reserved for the replica by the B4 session (2026-10-13). Bump `nextFreeMessageCode` in
 `wire/message_roundtrip_test.go` when adding them.
@@ -280,8 +291,31 @@ changed after the first draft of this plan: a record has **several named attachm
   - the tree is RFC 6962 (SHA-256(0x01 ‖ L ‖ R));
   - the identity is SHA-256(0x02 ‖ be64 size ‖ tree);
   - an empty blob is one empty leaf.
-- **Goldens:** `go/kdb/document/attachment_golden_test.go` (ref, set, "hello", commit). Until the attachments PR,
-  the TS decoder refuses commits that carry field 10 or op kinds 5 and 6, rather than misreading them.
+- **Goldens:** `go/kdb/document/attachment_golden_test.go` (ref, set, "hello", commit), plus
+  `packages/kdb-replica/test/golden/attachments.json`, generated from Go's `AttachmentTable` (60 table steps,
+  content hashes up to 5 MiB), and the binary frame goldens in `go/kdb/wire/attachment_ops_test.go`.
+
+**As built in TS (on #223):**
+- **Full mode.**
+  - The replica advertises the `attachments` capability; hosts refuse attachment commits to peers that don't.
+  - Fast-forwards and local commits maintain the table and verify every root.
+  - A snapshot takes the packed table from its last page.
+  - A diff convergence diffs the attachment trie with `TREE_NODES tree:"attachments"` and checks each set
+    against its hash.
+- **Reads** (`readAttachment`) fetch lazily with BLOB_FETCH at the namespace's head commit and verify each chunk's
+  RFC 6962 proof against the part's tree. They keep chunks by content hash in the store, so a read resumes.
+- **Writes** (`putAttachment`, `deleteAttachment`) keep the bytes pinned. A push uploads them with
+  ATTACHMENT_UPLOAD (`expect` first, so a blob the host holds is not resent) before the REF_UPDATE, and unpins
+  them once the push is accepted.
+- **Filtered mode** keeps each written document's attachment set from PROJECT_PAGE and reads bytes at the
+  page's `atHex`.
+- **Not yet:**
+  - writing attachments through write-back: PROJECT_WRITE carries no attachment ops, and the host's write-back
+    takes document writes only;
+  - attachment-only changes on a filtered namespace: they write no document, so they show when the document
+    next changes;
+  - evicting fetched blobs: they are kept until the replica is destroyed;
+  - attachments in the Kotlin replica, which refuses commits carrying them.
 - **Bytes are lazy on the replica.** The replica stores refs and fetches bytes on first read or by a prefetch
   policy, with a blob cache under its own budget. Blobs it wrote and the host has not yet confirmed are pinned.
 - **BLOB_FETCH 0x42/0x43:** each entry is `(docId, attachmentId, commit, hash, offset, maxBytes)`.
@@ -332,6 +366,32 @@ changed after the first draft of this plan: a record has **several named attachm
   against it: Go's own client behaves the same. Deployed hosts read the environment, where the graph file is
   on by default.
 - The replica never merges, so pushes go before pulls: the opposite order to Go's `SyncV2`, which merges locally.
+
+**Found while building the browser and watch work:**
+- The browser smoke page (`packages/kdb-replica/test/browser/smoke.html`) ran in Chromium against
+  `kdb-replicahost -serve -seed …`. It covered:
+  - snapshot bootstrap into IndexedDB;
+  - a local write surviving a reload, then pushed;
+  - write-back;
+  - a second replica catching up by replay through a zstd pack decoded by the TS port.
+  The page is run by hand, as `@kdb/embed`'s browser pages are; CI runs the Node suites.
+- The TS zstd decoder runs at about 150 to 280 MB/s, against about 1.1 GB/s for Node's native decoder, which
+  Node keeps using. A 4 MiB page decodes in about 20 ms in a browser.
+
+**Kotlin persistence (decision needed, 2026-10-14).** D12 says the Kotlin replica stores into the Kotlin embed
+runtime. A survey of both runtimes found the following:
+- Kotlin keeps no checkpoints and rebuilds a namespace by replaying its delta log from genesis.
+- Go keeps a snapshot or squash root only in its checkpoint (v2 to v5) plus its blob store, never in the log.
+- So a Kotlin runtime that can reopen a replica needs one of two things:
+  - **(a)** a Kotlin port of Go's checkpoint read/write (about 2,800 Go lines, plus graph segments for v3,
+    the packed tree for v4 and attachments for v5);
+  - **(b)** a new delta-log record, "root state", holding a root commit and the documents it set, which both
+    replayers learn. That is a versioned on-disk change with golden fixtures in both trees, and old readers
+    refuse it loudly.
+- **(b) is recommended.** It is much smaller, keeps the log self-sufficient for Kotlin, and Go could use it to
+  log squash and snapshot roots instead of depending on a checkpoint.
+- Until this is decided, the Kotlin engine runs against the same `ReplicaStore` interface as the TS one, with an
+  in-memory implementation.
 
 **Found while building PR 3:**
 - A host refuses a full replica's push into a single-home namespace in two ways. Without a handover point it

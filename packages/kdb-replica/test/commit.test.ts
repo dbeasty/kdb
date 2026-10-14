@@ -11,9 +11,12 @@ import {
   type CommitFields,
 } from "../src/commit.ts";
 import { DecodeError } from "../src/codec.ts";
-import { load, type CommitFixture } from "./golden.ts";
+import { load, opFromFixture, type CommitFixture } from "./golden.ts";
 
-const commits = load<CommitFixture[]>("commits.json");
+const commits = [
+  ...load<CommitFixture[]>("commits.json"),
+  ...load<{ commits: CommitFixture[] }>("attachments.json").commits,
+];
 
 function fields(f: CommitFixture): CommitFields {
   return {
@@ -22,17 +25,11 @@ function fields(f: CommitFixture): CommitFields {
     transactionId: f.transactionId,
     timestampMicros: BigInt(f.timestampMicros),
     authorNodeId: f.authorNodeId,
-    ops: f.ops.map((o) => {
-      switch (o.kind) {
-        case "write": return { kind: "write", docId: o.docId, json: o.json ?? "" };
-        case "delete": return { kind: "delete", docId: o.docId };
-        case "fileWrite": return { kind: "fileWrite", path: o.path, blobHash: o.blobHash };
-        case "schemaMigration": return { kind: "schemaMigration", migrationId: o.migrationId, payload: o.payload };
-      }
-    }),
+    ops: f.ops.map((o) => opFromFixture(o)),
     treeHash: f.treeHash,
     schemaHash: f.schemaHash,
     message: f.message,
+    attachmentRoot: f.attachmentRoot,
   };
 }
 
@@ -43,6 +40,7 @@ for (const f of commits) {
     const { hash: _h, payload: _p, ...got } = c;
     const want = fields(f);
     if (want.schemaHash === undefined) delete want.schemaHash;
+    if (want.attachmentRoot === undefined) delete want.attachmentRoot;
     assert.deepEqual(got, want);
   });
 
