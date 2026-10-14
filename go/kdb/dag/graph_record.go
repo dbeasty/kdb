@@ -132,7 +132,7 @@ func encodeRecord(r []byte, c document.Commit, gen uint32, nsIdx uint16) {
 
 // decodeRecord rebuilds the commit r describes. msg and extra come from wherever the tier keeps
 // variable-length data; everything returned is a copy, never a reference into r.
-func decodeRecord(r []byte, ns, msg string, extra []codec.Hash, ops []document.Op) document.Commit {
+func decodeRecord(r []byte, ns, msg string, extra []codec.Hash, ops []document.Op, attach *codec.Hash) document.Commit {
 	c := document.Commit{
 		Hash:             recHash(r),
 		NamespaceID:      ns,
@@ -158,6 +158,10 @@ func decodeRecord(r []byte, ns, msg string, extra []codec.Hash, ops []document.O
 		var sc codec.Hash
 		copy(sc.Bytes[:], r[grSchema:grSchema+32])
 		c.SchemaHash = &sc
+	}
+	if attach != nil {
+		root := *attach
+		c.AttachmentTreeHash = &root
 	}
 	return c
 }

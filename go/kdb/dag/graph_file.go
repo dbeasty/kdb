@@ -57,6 +57,8 @@ import (
 //	XPOS    n x u32          positions of commits with any external parent - what Horizon reads
 //	MSGI    n x 12           (pos u32, off u32, len u32) for commits with a message, sorted by pos
 //	MSGS    bytes            messages
+//	ATTR    n x 36           (pos u32, root 32) for commits with an attachment root, sorted by pos
+//	                         (version 5; a version 4 segment has no such section)
 //	footer  (off u64, len u64, codec u32) per section | count u64 | txCount u64 | crc32c of all
 //	        before | magic
 //
@@ -84,7 +86,9 @@ import (
 
 const (
 	graphMagic       = "KDBGRAF4"
-	graphVersion     = 4
+	graphVersion     = 5
+	// graphVersionNoAttach is the layout before ATTR, read as a segment with no attachment roots.
+	graphVersionNoAttach = 4
 	graphFooterMagic = 0x4B474634 // "KGF4"
 	graphHeaderFixed = 8 + 4 + 4 + 8 + 4
 
@@ -126,10 +130,19 @@ const (
 	secXPos
 	secMsgI
 	secMsgs
+	secAttr
 	secCount
 )
 
 const graphFooterSize = secCount*20 + 8 + 8 + 4 + 4
+
+// footerSizeFor is the footer of a segment of version v, which has one section fewer before ATTR.
+func footerSizeFor(v uint32) (size, sections int) {
+	if v == graphVersionNoAttach {
+		return (secCount-1)*20 + 8 + 8 + 4 + 4, secCount - 1
+	}
+	return graphFooterSize, secCount
+}
 
 // sectionCodecPlain is the only section codec this build reads or writes.
 const sectionCodecPlain = 0
@@ -208,14 +221,22 @@ func openGraphBase(path, namespaceID string) (*graphBase, error) {
 
 func (b *graphBase) parse(namespaceID string) error {
 	data := b.region.Bytes()
-	if len(data) < graphHeaderFixed+graphFooterSize {
+	if len(data) < graphHeaderFixed+graphFooterSize-20 {
 		return errors.New("too short")
 	}
-	f := data[len(data)-graphFooterSize:]
-	if le.Uint32(f[graphFooterSize-4:]) != graphFooterMagic {
+	version := le.Uint32(data[8:])
+	if version != graphVersion && version != graphVersionNoAttach {
+		return fmt.Errorf("version %d, this build reads %d and %d", version, graphVersionNoAttach, graphVersion)
+	}
+	footerSize, sections := footerSizeFor(version)
+	if len(data) < graphHeaderFixed+footerSize {
+		return errors.New("too short")
+	}
+	f := data[len(data)-footerSize:]
+	if le.Uint32(f[footerSize-4:]) != graphFooterMagic {
 		return errors.New("bad footer magic")
 	}
-	want := le.Uint32(f[graphFooterSize-8:])
+	want := le.Uint32(f[footerSize-8:])
 	// The one pass that touches every page runs under a fault guard: a file that shrank
 	// underneath the mapping is an unusable file, not a crash.
 	var got uint32
@@ -229,9 +250,6 @@ func (b *graphBase) parse(namespaceID string) error {
 	if string(data[:8]) != graphMagic {
 		return errors.New("bad magic")
 	}
-	if v := le.Uint32(data[8:]); v != graphVersion {
-		return fmt.Errorf("version %d, this build reads %d", v, graphVersion)
-	}
 	b.full = le.Uint32(data[12:])&graphFlagFull != 0
 	b.seq = le.Uint64(data[16:])
 	nsLen := int(le.Uint32(data[24:]))
@@ -242,8 +260,8 @@ func (b *graphBase) parse(namespaceID string) error {
 	if b.ns != namespaceID {
 		return fmt.Errorf("written for namespace %q", b.ns)
 	}
-	body := len(data) - graphFooterSize
-	for i := 0; i < secCount; i++ {
+	body := len(data) - footerSize
+	for i := 0; i < sections; i++ {
 		off, n := int(le.Uint64(f[i*20:])), int(le.Uint64(f[i*20+8:]))
 		if off < 0 || n < 0 || off > body || n > body-off {
 			return fmt.Errorf("section %d overruns file", i)
@@ -253,13 +271,14 @@ func (b *graphBase) parse(namespaceID string) error {
 		}
 		b.sec[i] = data[off : off+n]
 	}
-	b.count = int(le.Uint64(f[secCount*20:]))
-	b.txCount = int(le.Uint64(f[secCount*20+8:]))
+	b.count = int(le.Uint64(f[sections*20:]))
+	b.txCount = int(le.Uint64(f[sections*20+8:]))
 	switch {
 	case len(b.sec[secOIDS]) != b.count*32, len(b.sec[secCDAT]) != b.count*cdatSize,
 		len(b.sec[secTIDX]) != b.txCount*4, len(b.sec[secFanout]) != 256*4,
 		len(b.sec[secAuth])%16 != 0, len(b.sec[secSchm])%32 != 0, len(b.sec[secExt])%32 != 0,
-		len(b.sec[secEdge])%4 != 0, len(b.sec[secXPos])%4 != 0, len(b.sec[secMsgI])%12 != 0:
+		len(b.sec[secEdge])%4 != 0, len(b.sec[secXPos])%4 != 0, len(b.sec[secMsgI])%12 != 0,
+		len(b.sec[secAttr])%36 != 0:
 		return errors.New("section sizes disagree with the counts")
 	}
 	for i := range b.fanout {
@@ -356,10 +375,23 @@ func (b *graphBase) message(pos int) string {
 	return string(b.sec[secMsgs][off : off+l])
 }
 
+// attachRoot is the attachment root of the commit at pos, nil when it has none.
+func (b *graphBase) attachRoot(pos int) *codec.Hash {
+	at := b.sec[secAttr]
+	n := len(at) / 36
+	i := sort.Search(n, func(i int) bool { return int(le.Uint32(at[i*36:])) >= pos })
+	if i == n || int(le.Uint32(at[i*36:])) != pos {
+		return nil
+	}
+	var h codec.Hash
+	copy(h.Bytes[:], at[i*36+4:i*36+36])
+	return &h
+}
+
 // commit rebuilds the document.Commit at pos. Everything returned is a copy.
 func (b *graphBase) commit(pos int, ops []document.Op) document.Commit {
 	src := b.toSource(pos)
-	return decodeRecord(src.rec[:], b.ns, src.msg, src.extra, ops)
+	return decodeRecord(src.rec[:], b.ns, src.msg, src.extra, ops, src.attach)
 }
 
 // toSource converts the commit at pos back into the resident tier's record form, for a rewrite
@@ -384,7 +416,7 @@ func (b *graphBase) toSource(pos int) graphSource {
 		c.ParentHashes = append(c.ParentHashes, p)
 		return true
 	})
-	src := graphSource{msg: b.message(pos)}
+	src := graphSource{msg: b.message(pos), attach: b.attachRoot(pos)}
 	if len(c.ParentHashes) > 2 {
 		src.extra = c.ParentHashes[2:]
 	}
@@ -475,9 +507,10 @@ func (b *graphBase) externalParentPositions() []byte { return b.sec[secXPos] }
 
 // graphSource is one commit to write: its record, message and extra parents.
 type graphSource struct {
-	rec   [graphRecordSize]byte
-	msg   string
-	extra []codec.Hash
+	rec    [graphRecordSize]byte
+	msg    string
+	extra  []codec.Hash
+	attach *codec.Hash // the commit's attachment root, if it has one
 }
 
 func (s *graphSource) hash() []byte { return s.rec[grHash : grHash+32] }
@@ -580,6 +613,7 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, open func
 		xpos      []byte
 		msgi      []byte
 		msgs      bytes.Buffer
+		attr      []byte
 	)
 	ref := func(h codec.Hash) (uint32, bool) {
 		if p, ok := posOf(h); ok {
@@ -662,6 +696,10 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, open func
 		if external {
 			xpos = le.AppendUint32(xpos, uint32(pos))
 		}
+		if src.attach != nil {
+			attr = le.AppendUint32(attr, uint32(pos))
+			attr = append(attr, src.attach.Bytes[:]...)
+		}
 		if src.msg != "" {
 			msgi = le.AppendUint32(msgi, uint32(pos))
 			msgi = le.AppendUint32(msgi, uint32(msgs.Len()))
@@ -705,7 +743,7 @@ func writeGraphSegment(dir, namespaceID string, seq uint64, full bool, open func
 	for _, s := range []struct {
 		id   int
 		data []byte
-	}{{secAuth, authors}, {secSchm, schemas}, {secExt, ext}, {secEdge, edges}, {secXPos, xpos}, {secMsgI, msgi}, {secMsgs, msgs.Bytes()}} {
+	}{{secAuth, authors}, {secSchm, schemas}, {secExt, ext}, {secEdge, edges}, {secXPos, xpos}, {secMsgI, msgi}, {secMsgs, msgs.Bytes()}, {secAttr, attr}} {
 		begin(s.id)
 		write(s.data)
 		end(s.id)

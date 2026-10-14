@@ -133,6 +133,11 @@ type InMemoryCommitDag struct {
 	// opsLoader is read on the (cold) load path only, hence atomic rather
 	// than mu; every other field here is guarded by mu.
 	opsLoader   atomic.Pointer[CommitOperationsLoader]
+
+	// attachments caches attachment tables by root (attachments.go). Guarded by mu.
+	attachments attachmentCache
+	// sawAttachments is set once any commit with an attachment root is stored. Guarded by mu.
+	sawAttachments bool
 	opsBudget   int64
 	opsResident int64
 	opsLRU      *list.List
@@ -1031,10 +1036,14 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 			)
 		}
 	}
+	attachRoot, err := d.attachmentRootLocked(tx, parents)
+	if err != nil {
+		return document.Commit{}, err
+	}
 	d.putTreeLocked(newDocumentTree)
-	commit, err := document.BuildCommit(
+	commit, err := document.BuildCommitWithAttachments(
 		parents, d.NamespaceID, tx.ID, d.causalTimestampLocked(tx.Timestamp, parents), tx.AuthorNodeID,
-		tx.Operations, newDocumentTree.TreeHash, schemaHash, message,
+		tx.Operations, newDocumentTree.TreeHash, schemaHash, message, attachRoot,
 	)
 	if err != nil {
 		return document.Commit{}, err
@@ -1098,6 +1107,13 @@ func (d *InMemoryCommitDag) Squash(
 	for _, h := range squashHashes {
 		if !d.isResidentLocked(h) {
 			return document.Commit{}, NewConsistencyError("squash target missing", d.NamespaceID, &h)
+		}
+		// The synthetic commit has no parents and no operations, so an attachment table could
+		// not be derived for it; a window carrying attachments is refused rather than squashed
+		// into a commit whose attachments nothing can reproduce.
+		if c, _ := d.commitLocked(h); c.AttachmentTreeHash != nil {
+			return document.Commit{}, NewCompactionSafetyError(
+				"squash window holds commits with attachments", d.NamespaceID, h, "attachments")
 		}
 	}
 	for _, b := range d.branches {

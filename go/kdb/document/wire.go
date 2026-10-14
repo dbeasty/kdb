@@ -20,6 +20,8 @@ var (
 	fqnOpDelete      = wireNS + ".OpDelete"
 	fqnOpFileWrite   = wireNS + ".OpFileWrite"
 	fqnOpSchemaMigr  = wireNS + ".OpSchemaMigration"
+	fqnOpAttachPut   = wireNS + ".OpAttachmentPut"
+	fqnOpAttachDel   = wireNS + ".OpAttachmentDelete"
 )
 
 var (
@@ -65,11 +67,29 @@ func WireRegistry() *schema.Registry {
 			},
 		})
 
+		// One attachment per record (docs/kdb-attachments-plan.md). Appended, never inserted: a
+		// branch's position is its wire tag.
+		r.RegisterRecord(&schema.RecordSchema{
+			Name: "OpAttachmentPut", Namespace: wireNS,
+			Fields: []schema.FieldSchema{
+				{ID: 1, Name: "docId", Type: uuidPrim},
+				{ID: 2, Name: "contentHash", Type: hashRef},
+				{ID: 3, Name: "size", Type: schema.Prim(schema.PhysicalInt64)},
+				{ID: 4, Name: "mime", Type: schema.Prim(schema.PhysicalString)},
+			},
+		})
+		r.RegisterRecord(&schema.RecordSchema{
+			Name: "OpAttachmentDelete", Namespace: wireNS,
+			Fields: []schema.FieldSchema{{ID: 1, Name: "docId", Type: uuidPrim}},
+		})
+
 		kdbOpWire := schema.Union{Branches: []schema.Type{
 			schema.Ref{FullyQualifiedName: fqnOpWrite},
 			schema.Ref{FullyQualifiedName: fqnOpDelete},
 			schema.Ref{FullyQualifiedName: fqnOpFileWrite},
 			schema.Ref{FullyQualifiedName: fqnOpSchemaMigr},
+			schema.Ref{FullyQualifiedName: fqnOpAttachPut},
+			schema.Ref{FullyQualifiedName: fqnOpAttachDel},
 		}}
 
 		r.RegisterRecord(&schema.RecordSchema{
@@ -98,6 +118,9 @@ func WireRegistry() *schema.Registry {
 				{ID: 7, Name: "documentTreeHash", Type: hashRef},
 				{ID: 8, Name: "schemaHash", Type: schema.Nullable{Inner: hashRef}, Default: codec.Null},
 				{ID: 9, Name: "message", Type: schema.Prim(schema.PhysicalString)},
+				// The root of the commit's attachment table (AttachmentTable.Root). Omitted when the
+				// table is empty, so a commit with no attachments hashes exactly as before it existed.
+				{ID: 10, Name: "attachmentTreeHash", Type: schema.Nullable{Inner: hashRef}, Default: codec.Null},
 			},
 		})
 		r.RegisterRecord(&schema.RecordSchema{
