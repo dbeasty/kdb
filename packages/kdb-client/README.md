@@ -74,6 +74,28 @@ One `Client` is one connection is one KDB session — hold it for the process li
 opening one per request. Concurrent calls on a single client are fine; requests are matched to
 replies by correlation id.
 
+## Attachments
+
+A document can carry named binary attachments. Against a server that agrees the `attachments`
+wire feature (binary frames; not `jsonOnly`):
+
+```ts
+const { attachment } = await client.putAttachment(ns, docId, file.stream(), { name: "scan.pdf", mime: "application/pdf" });
+const items = await client.listAttachments(ns, docId);          // [{ id, name, hash, size, mime }]
+for await (const page of await client.getAttachment(ns, docId, "scan.pdf")) { /* ... */ }
+const { data } = await client.readAttachment(ns, docId, { id: attachment.id });
+await client.renameAttachment(ns, docId, "scan.pdf", "contract.pdf");
+await client.deleteAttachment(ns, docId, "contract.pdf");
+```
+
+Sources may be a `Uint8Array`, `Blob`, `ReadableStream` or (async) iterable; uploads go in 1 MiB
+chunks and a `KdbUploadError` carries what resumes one. Reads are checked against the
+attachment's content hash as they stream (the last page is withheld until it verifies;
+`KdbIntegrityError` otherwise). `uploadAttachment` stores bytes only; `prepareAttachment` returns
+an operation for `Transaction.attachments`, so attachments can commit together with document
+writes. In SQL, a `Uint8Array` argument binds as bytes, `sqlAttachment(blob)` binds an uploaded
+blob (`STREAM ?`), and `queryValues` returns bytes cells (`ATTACHMENT('name')`) as `Uint8Array`.
+
 ## Error handling
 
 Everything thrown extends `KdbError`, which carries the server's `code` and `retryAfterMs` when

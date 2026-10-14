@@ -6,6 +6,7 @@
  */
 
 import { KdbProtocolError } from "../errors.ts";
+import { decodeAttachmentBody, encodeAttachmentBody } from "./attachments.ts";
 import {
   decodeBinaryBody,
   ENCODING_BINARY,
@@ -48,6 +49,11 @@ export function encodeMessage(
 ): Uint8Array {
   const options: { maxFrameBytes?: number } = {};
   if (maxFrameBytes !== undefined) options.maxFrameBytes = maxFrameBytes;
+  // Attachment messages are always binary bodies: they have no JSON form at all.
+  const attachmentBody = encodeAttachmentBody(kind, payload);
+  if (attachmentBody !== undefined) {
+    return encodeFrameBody(TYPE_CODE_BY_KIND[kind], correlationId, ENCODING_BINARY, attachmentBody, options);
+  }
   const agreed = features === true ? CORE_BINARY : features === false ? undefined : features;
   if (agreed !== undefined && hasBinaryForm(kind, agreed)) {
     const body = encodeBinaryBody(kind, payload);
@@ -82,7 +88,8 @@ export function decodeMessage(frame: Uint8Array, maxFrameBytes?: number): WireMe
   if (encodingTag === ENCODING_BINARY || encodingTag === ENCODING_BINARY_ZSTD) {
     // A binary body has no `kind`: it is the header's type code, which is unambiguous here
     // because the handshake and its ack - the one pair sharing a code - never go binary.
-    const { kind, payload } = decodeBinaryBody(header.typeCode, body);
+    const { kind, payload } =
+      decodeAttachmentBody(header.typeCode, body) ?? decodeBinaryBody(header.typeCode, body);
     return { kind, payload, correlationId: header.correlationId, header };
   }
   if (encodingTag !== ENCODING_JSON) {
