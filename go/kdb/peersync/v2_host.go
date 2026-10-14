@@ -84,7 +84,10 @@ type V2Host struct {
 	helloAt time.Time
 	// zstdPack: the session negotiated SyncCapZstdPack, so pages go to the peer compressed.
 	zstdPack bool
-	granted  map[string]bool
+	// peerAttachments: the peer understands attachments (SyncCapAttachments). A peer that does not
+	// cannot decode a commit that carries them, and is refused one (attachments.go).
+	peerAttachments bool
+	granted         map[string]bool
 	// access is each granted namespace's direction limit: "" both, wire.AccessPull or AccessPush.
 	access map[string]string
 	peer   string
@@ -106,6 +109,9 @@ type V2Host struct {
 	// serially; pushMu guards it anyway.
 	pushMu      sync.Mutex
 	pushWaiting map[string]int
+
+	// uploads are this session's attachment blob uploads (attachments.go).
+	uploads hostUploads
 }
 
 type hostFetch struct {
@@ -185,7 +191,7 @@ func NewV2Host(w wire.Codec, cfg V2HostConfig, engine auth.Engine, ctx auth.Conn
 }
 
 // HostCapabilities are what a v2 host of this build can do.
-var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome, wire.SyncCapZstdPack, wire.SyncCapSquash}
+var HostCapabilities = []string{wire.SyncCapBranches, wire.SyncCapTags, wire.SyncCapStubs, wire.SyncCapSnapshot, wire.SyncCapFilter, wire.SyncCapRepair, wire.SyncCapDocFetch, wire.SyncCapGraft, wire.SyncCapMetaView, wire.SyncCapHome, wire.SyncCapZstdPack, wire.SyncCapSquash, wire.SyncCapAttachments}
 
 // HandleFrame serves one frame, returning the reply. Every request gets one; failures are
 // PEER_ERROR. Only a frame that cannot be decoded at all returns an error, and the caller drops
@@ -252,6 +258,9 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := h.checkPeerAttachments(m.Namespace, commits); err != nil {
+			return nil, err
+		}
 		h.mu.Lock()
 		peer, since, zstd := h.peer, h.helloAt, h.zstdPack
 		h.mu.Unlock()
@@ -284,6 +293,9 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}
 		page, err := snapshotPage(env, at, m.After, m.MaxBytes)
 		if err != nil {
+			return nil, err
+		}
+		if err := h.checkPeerAttachments(m.Namespace, []document.Commit{page.Commit}); err != nil {
 			return nil, err
 		}
 		page.H = header(wire.MsgSnapshotPage, m.H.CorrelationID)
@@ -355,6 +367,10 @@ func (h *V2Host) serve(msg wire.Message) (wire.Message, error) {
 		}
 		res.H = header(wire.MsgSquashHeadResult, m.H.CorrelationID)
 		return res, nil
+	case wire.BlobFetchMessage:
+		return h.blobFetch(m)
+	case wire.AttachmentUploadMessage:
+		return h.attachmentUpload(m)
 	case wire.ObjectFetchMessage:
 		env, err := h.env(m.Namespace, false, dirPull)
 		if err != nil {
@@ -455,6 +471,7 @@ func (h *V2Host) hello(m wire.SyncHelloMessage) (wire.Message, error) {
 	caps := intersect(h.capabilities(), m.Capabilities)
 	h.mu.Lock()
 	h.zstdPack = slices.Contains(caps, wire.SyncCapZstdPack)
+	h.peerAttachments = slices.Contains(caps, wire.SyncCapAttachments)
 	h.mu.Unlock()
 	return wire.SyncHelloAckMessage{
 		H: header(wire.MsgSyncHelloAck, m.H.CorrelationID), Accepted: true,
@@ -834,6 +851,9 @@ func (h *V2Host) projectFetch(m wire.ProjectFetchMessage) (wire.Message, error) 
 	}
 	page, err := projectPage(env, filter, canRead, m.FromHex, m.AtHex, m.After, m.MaxBytes)
 	if err != nil {
+		return nil, err
+	}
+	if err := withProjectedAttachments(env, &page); err != nil {
 		return nil, err
 	}
 	page.H = header(wire.MsgProjectPage, m.H.CorrelationID)

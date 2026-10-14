@@ -553,6 +553,10 @@ type SnapshotPageMessage struct {
 	Done bool
 	// Total is how many documents the whole snapshot holds.
 	Total int
+	// AttachmentTables, on the last page of a snapshot of a commit with attachments, is the
+	// commit's attachment table (dag.PackAttachmentTables): the receiver has no history to derive
+	// it from. It is keyed by the root its entries hash to, so it cannot answer for another one.
+	AttachmentTables []byte
 }
 
 func (m SnapshotPageMessage) Header() Header { return m.H }
@@ -576,6 +580,7 @@ type snapshotPageDto struct {
 	Next          string           `json:"next,omitempty"`
 	Done          bool             `json:"done"`
 	Total         int              `json:"total"`
+	AttachTables  []byte           `json:"attachmentTables,omitempty"`
 }
 
 func encodeSnapshotV2Message(msg Message) (payloadEnvelope, bool, error) {
@@ -595,6 +600,7 @@ func encodeSnapshotV2Message(msg Message) (payloadEnvelope, bool, error) {
 		}
 		return payloadEnvelope{Kind: "snapshotPage", SnapshotPage: &snapshotPageDto{
 			Namespace: m.Namespace, CommitPayload: payload, Docs: docs, Next: m.Next, Done: m.Done, Total: m.Total,
+			AttachTables: m.AttachmentTables,
 		}}, true, nil
 	}
 	return payloadEnvelope{}, false, nil
@@ -624,7 +630,8 @@ func decodeSnapshotV2Message(header Header, env payloadEnvelope) (Message, bool,
 		for i, x := range d.Docs {
 			docs[i] = SnapshotDoc{DocID: x.DocID, Body: x.Body}
 		}
-		return SnapshotPageMessage{H: header, Namespace: d.Namespace, Commit: commits[0], Docs: docs, Next: d.Next, Done: d.Done, Total: d.Total}, true, nil
+		return SnapshotPageMessage{H: header, Namespace: d.Namespace, Commit: commits[0], Docs: docs, Next: d.Next, Done: d.Done, Total: d.Total,
+			AttachmentTables: d.AttachTables}, true, nil
 	}
 	return nil, false, nil
 }
@@ -661,6 +668,10 @@ type ProjectPageMessage struct {
 	Deletes []string
 	Next    string
 	Done    bool
+	// Attachments, for a written document with attachments at AtHex, is all of them (a written
+	// document absent here has none). A change to attachments alone writes no document: a replica
+	// finds those by diffing the attachment table (TREE_NODES, Tree TreeAttachments).
+	Attachments map[string][]TreeAttachment
 }
 
 func (m ProjectPageMessage) Header() Header { return m.H }
@@ -760,13 +771,14 @@ type projectFetchDto struct {
 }
 
 type projectPageDto struct {
-	Namespace string           `json:"namespace"`
-	AtHex     string           `json:"atHex"`
-	Reset     bool             `json:"reset,omitempty"`
-	Writes    []snapshotDocDto `json:"writes,omitempty"`
-	Deletes   []string         `json:"deletes,omitempty"`
-	Next      string           `json:"next,omitempty"`
-	Done      bool             `json:"done"`
+	Namespace string                      `json:"namespace"`
+	AtHex     string                      `json:"atHex"`
+	Reset     bool                        `json:"reset,omitempty"`
+	Writes    []snapshotDocDto            `json:"writes,omitempty"`
+	Deletes   []string                    `json:"deletes,omitempty"`
+	Next      string                      `json:"next,omitempty"`
+	Done      bool                        `json:"done"`
+	Attach    map[string][]TreeAttachment `json:"attachments,omitempty"`
 }
 
 func encodeProjectionMessage(msg Message) (payloadEnvelope, bool, error) {
@@ -782,6 +794,7 @@ func encodeProjectionMessage(msg Message) (payloadEnvelope, bool, error) {
 		}
 		return payloadEnvelope{Kind: "projectPage", ProjectPage: &projectPageDto{
 			Namespace: m.Namespace, AtHex: m.AtHex, Reset: m.Reset, Writes: writes, Deletes: m.Deletes, Next: m.Next, Done: m.Done,
+			Attach: m.Attachments,
 		}}, true, nil
 	case ProjectWriteMessage:
 		docs := make([]writeBackDocDto, len(m.Docs))
@@ -818,7 +831,8 @@ func decodeProjectionMessage(header Header, env payloadEnvelope) (Message, bool,
 		for i, x := range d.Writes {
 			writes[i] = SnapshotDoc{DocID: x.DocID, Body: x.Body}
 		}
-		return ProjectPageMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, Reset: d.Reset, Writes: writes, Deletes: d.Deletes, Next: d.Next, Done: d.Done}, true, nil
+		return ProjectPageMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, Reset: d.Reset, Writes: writes, Deletes: d.Deletes, Next: d.Next, Done: d.Done,
+			Attachments: d.Attach}, true, nil
 	case "projectWrite":
 		d := env.ProjectWrite
 		if d == nil {

@@ -193,7 +193,10 @@ func (h *frameHandler) classify(err error) wire.ErrorCode {
 	var mismatch *TreeMismatchError
 	var authErr *auth.AuthorizationError
 	var boundary *PushBelowBoundaryError
+	var noAttach *AttachmentsUnsupportedError
 	switch {
+	case errors.As(err, &noAttach):
+		return wire.ErrorCodeUnsupported
 	case errors.As(err, &boundary):
 		return wire.ErrorCodeShallowBoundary
 	case errors.As(err, &ns):

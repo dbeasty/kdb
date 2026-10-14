@@ -544,6 +544,14 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 		{wire.MsgHomeRequestResult, "HOME_REQUEST_RESULT"},
 		{wire.MsgSquashHead, "SQUASH_HEAD"},
 		{wire.MsgSquashHeadResult, "SQUASH_HEAD_RESULT"},
+		{wire.MsgBlobFetch, "BLOB_FETCH"},
+		{wire.MsgBlobFetchResult, "BLOB_FETCH_RESULT"},
+		{wire.MsgAttachmentUpload, "ATTACHMENT_UPLOAD"},
+		{wire.MsgAttachmentUploadResult, "ATTACHMENT_UPLOAD_RESULT"},
+		{wire.MsgAttachmentGet, "ATTACHMENT_GET"},
+		{wire.MsgAttachmentData, "ATTACHMENT_DATA"},
+		{wire.MsgAttachmentList, "ATTACHMENT_LIST"},
+		{wire.MsgAttachmentListResult, "ATTACHMENT_LIST_RESULT"},
 	} {
 		if tc.mt.String() != tc.name {
 			t.Errorf("%#x: name is %q, want %q", uint16(tc.mt), tc.mt.String(), tc.name)
@@ -570,7 +578,7 @@ func TestMessageTypeCodesAndNames(t *testing.T) {
 }
 
 // nextFreeMessageCode is the lowest opcode not yet assigned; bump it with every new message.
-const nextFreeMessageCode = 0x42
+const nextFreeMessageCode = 0x4A
 
 func TestClientModeAndEncodingNames(t *testing.T) {
 	for _, m := range []wire.ClientMode{

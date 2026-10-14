@@ -37,6 +37,14 @@ export const MSG = {
   LOCK_RENEW: 0x1a,
   LOCK_RELEASE: 0x1b,
   LOCK_RESULT: 0x1c,
+  // Attachments (go/kdb/wire/attachment_ops.go): always binary bodies, behind wire feature
+  // "attachments". 0x42/0x43 (BLOB_FETCH) are peer-only and not spoken by this client.
+  ATTACHMENT_UPLOAD: 0x44,
+  ATTACHMENT_UPLOAD_RESULT: 0x45,
+  ATTACHMENT_GET: 0x46,
+  ATTACHMENT_DATA: 0x47,
+  ATTACHMENT_LIST: 0x48,
+  ATTACHMENT_LIST_RESULT: 0x49,
 } as const;
 
 /**
@@ -60,7 +68,13 @@ export type MessageKind =
   | "lockAcquire"
   | "lockRenew"
   | "lockRelease"
-  | "lockResult";
+  | "lockResult"
+  | "attachmentUpload"
+  | "attachmentUploadResult"
+  | "attachmentGet"
+  | "attachmentData"
+  | "attachmentList"
+  | "attachmentListResult";
 
 /**
  * Which type code to stamp on an outbound frame of each kind.
@@ -91,6 +105,12 @@ export const TYPE_CODE_BY_KIND: Record<MessageKind, number> = {
   lockRenew: MSG.LOCK_RENEW,
   lockRelease: MSG.LOCK_RELEASE,
   lockResult: MSG.LOCK_RESULT,
+  attachmentUpload: MSG.ATTACHMENT_UPLOAD,
+  attachmentUploadResult: MSG.ATTACHMENT_UPLOAD_RESULT,
+  attachmentGet: MSG.ATTACHMENT_GET,
+  attachmentData: MSG.ATTACHMENT_DATA,
+  attachmentList: MSG.ATTACHMENT_LIST,
+  attachmentListResult: MSG.ATTACHMENT_LIST_RESULT,
 };
 
 /** Client mode strings (`ClientMode.String()`, go/kdb/wire/types.go:241-247). */
@@ -172,7 +192,7 @@ export interface SqlResultDto {
   continuation?: string | null;
   /**
    * Every cell's kind, one decimal digit each, row by row: 0 text, 1 NULL, 2 integer, 3 double,
-   * 4 boolean, 5 JSON. Absent from servers that predate it.
+   * 4 boolean, 5 JSON, 6 bytes (the cell is standard base64). Absent from servers that predate it.
    */
   cellKinds?: string | null;
 }
@@ -283,7 +303,7 @@ export interface TransactionDto {
 }
 
 export interface OpDto {
-  kind: "write" | "delete" | "fileWrite" | "schemaMigration";
+  kind: "write" | "delete" | "fileWrite" | "schemaMigration" | "attachmentPut" | "attachmentDelete";
   docId?: string;
   /** For a write: the whole document JSON, as a string containing JSON. */
   patch?: string;
@@ -296,6 +316,17 @@ export interface OpDto {
   blobHashHex?: string;
   migrationId?: string;
   migrationPayload?: string;
+  /**
+   * attachmentPut / attachmentDelete (go/kdb/wire/op_mapper.go): the attachment's ID and, for a
+   * put, its name, content hash scheme, size and media type - its content hash travels in
+   * blobHashHex. A put must carry every one of them (mime may be ""): Go's decoder rejects an
+   * attachmentPut missing any.
+   */
+  attachmentId?: string;
+  name?: string;
+  scheme?: number;
+  size?: number;
+  mime?: string;
 }
 
 /** Kinds travel as enum constant names, matching kotlinx.serialization's convention. */

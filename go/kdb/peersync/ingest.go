@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 	"time"
 
 	"github.com/limidus/kdb/go/kdb/codec"
@@ -149,6 +150,10 @@ type IngestEnv struct {
 	// a snapshot's pages before they are installed, a pushed graft's before it is verified - so
 	// memory holds a page, not the namespace. Empty uses the system temporary directory.
 	StagingDir string
+	// Attachments is the namespace's attachment blob store: where pulled blobs are written, and
+	// what BLOB_FETCH serves and pushes upload from (attachments.go). nil: this node moves no
+	// attachment blobs - commits still carry their refs.
+	Attachments *attachstore.Store
 }
 
 // DefaultMaxClockSkew is how far ahead of this node's clock a replicated commit may be.

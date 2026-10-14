@@ -24,7 +24,27 @@ import {
   type ConflictDetail,
   type ErrorCode,
 } from "./errors.ts";
+import {
+  KdbAttachmentNotFoundError,
+  KdbIntegrityError,
+  KdbUploadError,
+  findAttachment,
+  selectorParts,
+  sqlParam,
+  uploadChunks,
+  type AttachmentBlob,
+  type AttachmentInfo,
+  type AttachmentReader,
+  type AttachmentSelector,
+  type AttachmentSource,
+  type ListAttachmentsOptions,
+  type PutAttachmentOptions,
+  type ReadAttachmentOptions,
+  type UploadAttachmentOptions,
+} from "./attachments.ts";
 import type {
+  AttachmentOp,
+  AttachmentPutOp,
   CallOptions,
   CommitHash,
   CompareAndSwapOptions,
@@ -44,6 +64,16 @@ import {
 import { decodeMessage, encodeMessage, isClientKind, type WireMessage } from "./wire/envelope.ts";
 import { DEFAULT_MAX_FRAME_BYTES, KDB_WIRE_PROTOCOL_VERSION } from "./wire/frame.ts";
 import { contentHash } from "./wire/hash.ts";
+import {
+  ATTACHMENT_HASH_SCHEME_CHUNKED_1,
+  AttachmentHasher,
+  base64ToBytes,
+  WIRE_FEATURE_ATTACHMENTS,
+  type AttachmentDataDto,
+  type AttachmentInfoDto,
+  type AttachmentListResultDto,
+  type AttachmentUploadResultDto,
+} from "./wire/attachments.ts";
 import {
   CLIENT_MODE_SQL,
   READ_COMMITTED,
@@ -80,14 +110,15 @@ export interface TlsOptions {
 /** What the handshake offers: binary frames, and zstd frames where this runtime can read them. */
 const OFFERED_WIRE_FEATURES: string[] =
   zstdDecompress === null
-    ? [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2]
-    : [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD];
+    ? [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ATTACHMENTS]
+    : [WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD, WIRE_FEATURE_ATTACHMENTS];
 
 /**
  * One typed SQL cell (queryValues): null for NULL, a number for an integer that fits one exactly
- * (a bigint otherwise) or a double, a boolean, a string, or the parsed value of a JSON cell.
+ * (a bigint otherwise) or a double, a boolean, a string, the parsed value of a JSON cell, or the
+ * bytes of a binary cell (an ATTACHMENT() read, an X'..' literal).
  */
-export type SqlValue = null | number | bigint | boolean | string | JsonValue;
+export type SqlValue = null | number | bigint | boolean | string | JsonValue | Uint8Array;
 
 /** A parsed JSON value. */
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -459,6 +490,7 @@ export class Client implements KdbOperations {
         ...(write.replace ? { replace: true } : {}),
       })),
       ...(tx.deletes ?? []).map((docId): OpDto => ({ kind: "delete", docId: assertUuid(docId) })),
+      ...(tx.attachments ?? []).map(attachmentOpDto),
     ];
     const preconditions: PreconditionDto[] | undefined = tx.preconditions?.length
       ? tx.preconditions.map((p) =>
@@ -617,6 +649,308 @@ export class Client implements KdbOperations {
     }
   }
 
+  // --- attachments --------------------------------------------------------------------------
+
+  /**
+   * Stores bytes in the namespace's attachment store and returns their content hash and size -
+   * nothing references them yet. Commit a reference with `commit` (Transaction.attachments) or
+   * bind it in SQL with `sqlAttachment`; `putAttachment` does both steps. Sent in 1 MiB chunks,
+   * one in flight at a time; the blob is durable once this resolves.
+   *
+   * A failure part way throws KdbUploadError, whose `uploadId` and `received` resume the upload
+   * (options.resume) with the source re-opened at `received`.
+   */
+  async uploadAttachment(
+    ns: string,
+    data: AttachmentSource,
+    options: UploadAttachmentOptions = {},
+  ): Promise<AttachmentBlob> {
+    this.#requireAttachments("uploadAttachment");
+    const state = await this.#ensureNamespace(ns, options);
+    let uploadId = options.resume?.uploadId ?? "";
+    let received = options.resume?.received ?? 0;
+    const hasher = options.verify === false || options.resume ? undefined : new AttachmentHasher();
+
+    for await (const { data: chunk, last } of uploadChunks(data)) {
+      let result: AttachmentUploadResultDto;
+      try {
+        const reply = await this.#request(
+          "attachmentUpload",
+          {
+            namespace: ns,
+            sessionId: state.sessionId,
+            uploadId,
+            offset: received,
+            data: chunk,
+            final: last,
+          },
+          options,
+          "uploadAttachment",
+        );
+        result = this.#expect<AttachmentUploadResultDto>(reply, "attachmentUploadResult");
+      } catch (cause) {
+        throw new KdbUploadError(
+          `kdb: attachment upload interrupted after ${received} bytes`,
+          uploadId,
+          received,
+          { cause, ...(cause instanceof KdbError && cause.code ? { code: cause.code } : {}) },
+        );
+      }
+      if (result.uploadId) uploadId = result.uploadId;
+      if (result.error) {
+        const cause = classifiedError(result.error, (result.errorCode || undefined) as ErrorCode | undefined);
+        throw new KdbUploadError(
+          `kdb: attachment upload failed: ${result.error}`,
+          uploadId,
+          result.received || received,
+          { cause, ...(cause.code ? { code: cause.code } : {}) },
+        );
+      }
+      if (result.received !== received + chunk.length) {
+        throw new KdbUploadError(
+          `kdb: attachment upload: server has ${result.received} bytes, expected ${received + chunk.length}`,
+          uploadId,
+          result.received,
+        );
+      }
+      received = result.received;
+      await hasher?.update(chunk);
+      options.onProgress?.(received);
+      if (last) {
+        if (!result.hash || result.size !== received) {
+          throw new KdbProtocolError(
+            `kdb: attachment upload finished without a content hash (size ${result.size}, sent ${received})`,
+          );
+        }
+        if (hasher) {
+          const local = await hasher.digest();
+          if (local !== result.hash) {
+            throw new KdbIntegrityError(
+              `kdb: uploaded attachment hashes to ${result.hash} on the server, ${local} here`,
+              local,
+              result.hash,
+            );
+          }
+        }
+        return { hash: result.hash, size: result.size };
+      }
+    }
+    throw new KdbProtocolError("kdb: attachment upload ended without a final chunk");
+  }
+
+  /**
+   * Uploads `data` and resolves which attachment of `docId` it is to become, returning the
+   * operation for Transaction.attachments - so attachments can share a commit with document
+   * writes. Nothing is committed. See PutAttachmentOptions for how `id` / `name` pick it.
+   */
+  async prepareAttachment(
+    ns: string,
+    docId: string,
+    data: AttachmentSource,
+    options: PutAttachmentOptions = {},
+  ): Promise<AttachmentPutOp> {
+    assertUuid(docId);
+    if (options.id !== undefined) assertUuid(options.id, "attachment id");
+    this.#requireAttachments("prepareAttachment");
+    // Resolve first: a failed lookup should not cost an upload.
+    let id = options.id;
+    let name = options.name;
+    let mime = options.mime;
+    if (id === undefined && name === undefined) {
+      id = randomUuid();
+      name = id;
+    } else if (id === undefined || name === undefined || mime === undefined) {
+      const items = await this.listAttachments(ns, docId, options);
+      const existing = findAttachment(items, id !== undefined ? { id } : { name: name! });
+      id ??= existing?.id ?? randomUuid();
+      name ??= existing?.name ?? id;
+      mime ??= existing?.mime;
+    }
+    const blob = await this.uploadAttachment(ns, data, options);
+    return { kind: "put", docId, id, name, hash: blob.hash, size: blob.size, mime: mime ?? "" };
+  }
+
+  /**
+   * Creates or replaces one attachment of a document, as its own commit. With `name` alone an
+   * existing attachment of that name is replaced (keeping its ID and, unless `mime` is given, its
+   * media type); with neither `id` nor `name` a new attachment is created, named after its ID.
+   */
+  async putAttachment(
+    ns: string,
+    docId: string,
+    data: AttachmentSource,
+    options: PutAttachmentOptions = {},
+  ): Promise<{ commit: CommitHash; attachment: AttachmentInfo }> {
+    const op = await this.prepareAttachment(ns, docId, data, options);
+    const commit = await this.#commitAttachmentOps(ns, [op], options);
+    return {
+      commit,
+      attachment: { id: op.id, name: op.name, hash: op.hash, size: op.size, mime: op.mime ?? "" },
+    };
+  }
+
+  /** A document's attachments, sorted by name. Empty for a document with none (or no document). */
+  async listAttachments(
+    ns: string,
+    docId: string,
+    options: ListAttachmentsOptions = {},
+  ): Promise<AttachmentInfo[]> {
+    assertUuid(docId);
+    this.#requireAttachments("listAttachments");
+    const state = await this.#ensureNamespace(ns, options);
+    const reply = await this.#request(
+      "attachmentList",
+      { namespace: ns, sessionId: state.sessionId, docId, asOfHex: options.asOf ?? "" },
+      options,
+      "listAttachments",
+    );
+    const result = this.#expect<AttachmentListResultDto>(reply, "attachmentListResult");
+    this.#throwIfAttachmentError(result.error, result.errorCode, ns, docId);
+    return result.items.map(infoFromDto);
+  }
+
+  async countAttachments(ns: string, docId: string, options: ListAttachmentsOptions = {}): Promise<number> {
+    return (await this.listAttachments(ns, docId, options)).length;
+  }
+
+  /**
+   * Opens a read of one attachment and returns once its first page has arrived - so a missing
+   * attachment throws KdbAttachmentNotFoundError here, and `info` is known before any byte is
+   * consumed. The rest is read page by page as the reader is iterated.
+   */
+  async getAttachment(
+    ns: string,
+    docId: string,
+    selector: AttachmentSelector,
+    options: ReadAttachmentOptions = {},
+  ): Promise<AttachmentReader> {
+    assertUuid(docId);
+    this.#requireAttachments("getAttachment");
+    const state = await this.#ensureNamespace(ns, options);
+    const { id, name, text } = selectorParts(selector);
+    const offset = Math.max(0, Math.floor(options.offset ?? 0));
+    const maxBytes = options.pageBytes && options.pageBytes > 0 ? Math.floor(options.pageBytes) : 0;
+    const fetchPage = async (readId: string, at: number, close = false): Promise<AttachmentDataDto> => {
+      const reply = await this.#request(
+        "attachmentGet",
+        readId
+          ? { namespace: ns, sessionId: state.sessionId, docId, readId, offset: at, maxBytes, close }
+          : {
+              namespace: ns,
+              sessionId: state.sessionId,
+              docId,
+              attachmentId: id ?? "",
+              name: name ?? "",
+              asOfHex: options.asOf ?? "",
+              offset: at,
+              maxBytes,
+            },
+        options,
+        "getAttachment",
+      );
+      const page = this.#expect<AttachmentDataDto>(reply, "attachmentData");
+      if (!close) this.#throwIfAttachmentError(page.error, page.errorCode, ns, docId, text);
+      return page;
+    };
+    const first = await fetchPage("", offset);
+    return new PagedAttachmentReader(first, offset, options.verify !== false && offset === 0, fetchPage);
+  }
+
+  /** Reads one attachment whole. Verified against its content hash unless options.verify is false. */
+  async readAttachment(
+    ns: string,
+    docId: string,
+    selector: AttachmentSelector,
+    options: ReadAttachmentOptions = {},
+  ): Promise<{ info: AttachmentInfo; data: Uint8Array; commit: CommitHash; superseded: boolean }> {
+    const reader = await this.getAttachment(ns, docId, selector, options);
+    const parts: Uint8Array[] = [];
+    let len = 0;
+    for await (const part of reader) {
+      parts.push(part);
+      len += part.length;
+    }
+    const data = new Uint8Array(len);
+    let off = 0;
+    for (const p of parts) {
+      data.set(p, off);
+      off += p.length;
+    }
+    return { info: reader.info, data, commit: reader.commit, superseded: reader.superseded };
+  }
+
+  /** Renames one attachment, keeping its ID and bytes, as its own commit. */
+  async renameAttachment(
+    ns: string,
+    docId: string,
+    selector: AttachmentSelector,
+    newName: string,
+    options: CallOptions = {},
+  ): Promise<CommitHash> {
+    const existing = await this.#resolveAttachment(ns, docId, selector, options);
+    return this.#commitAttachmentOps(
+      ns,
+      [{ kind: "put", docId, id: existing.id, name: newName, hash: existing.hash, size: existing.size, mime: existing.mime }],
+      options,
+    );
+  }
+
+  /**
+   * Removes one attachment, as its own commit. By ID it commits the delete directly; by name it
+   * looks the ID up first, and throws KdbAttachmentNotFoundError when there is none of that name.
+   */
+  async deleteAttachment(
+    ns: string,
+    docId: string,
+    selector: AttachmentSelector,
+    options: CallOptions = {},
+  ): Promise<CommitHash> {
+    assertUuid(docId);
+    const { id } = selectorParts(selector);
+    const attachmentId =
+      id !== undefined
+        ? assertUuid(id, "attachment id")
+        : (await this.#resolveAttachment(ns, docId, selector, options)).id;
+    return this.#commitAttachmentOps(ns, [{ kind: "delete", docId, id: attachmentId }], options);
+  }
+
+  async #resolveAttachment(
+    ns: string,
+    docId: string,
+    selector: AttachmentSelector,
+    options: CallOptions,
+  ): Promise<AttachmentInfo> {
+    const found = findAttachment(await this.listAttachments(ns, docId, options), selector);
+    if (!found) throw new KdbAttachmentNotFoundError(ns, docId, selectorParts(selector).text);
+    return found;
+  }
+
+  async #commitAttachmentOps(ns: string, ops: AttachmentOp[], options: CallOptions): Promise<CommitHash> {
+    const state = await this.#ensureNamespace(ns, options);
+    const tx = this.#buildTransaction(state.head, ops.map(attachmentOpDto), undefined);
+    return this.#commitTransaction(ns, state, tx, options);
+  }
+
+  #requireAttachments(operation: string): void {
+    if (!this.#features.has(WIRE_FEATURE_ATTACHMENTS)) {
+      throw new KdbUnsupportedError(
+        operation,
+        `the connection did not agree wire feature "${WIRE_FEATURE_ATTACHMENTS}" ` +
+          "(an older or JVM server, or a jsonOnly connection)",
+      );
+    }
+  }
+
+  #throwIfAttachmentError(error: string, code: string, ns: string, docId: string, attachment?: string): void {
+    if (!error) return;
+    if (code === "NOT_FOUND") {
+      throw attachment !== undefined
+        ? new KdbAttachmentNotFoundError(ns, docId, attachment)
+        : new KdbNotFoundError(ns, docId);
+    }
+    throw classifiedError(error, (code || undefined) as ErrorCode | undefined);
+  }
+
   // --- internals ----------------------------------------------------------------------------
 
   async #lockRequest(
@@ -765,7 +1099,7 @@ export class Client implements KdbOperations {
         namespace: ns,
         sessionId: state.sessionId,
         sql,
-        parametersJson: args.length > 0 ? JSON.stringify(args) : null,
+        parametersJson: args.length > 0 ? JSON.stringify(args.map(sqlParam)) : null,
         ...(paging
           ? {
               pageSize: paging.pageSize,
@@ -875,8 +1209,11 @@ export class Client implements KdbOperations {
             unsupportedOp
               ? new KdbUnsupportedError(
                   unsupportedOp,
-                  "the server did not answer - the JVM kdb-server implements only " +
-                    "sessionBegin/sqlExec/txCommit, not the 0x14-0x1C document, upsert and lease messages",
+                  kind.startsWith("attachment")
+                    ? "the server did not answer - it agreed the attachments feature but does not " +
+                        "serve the 0x44-0x49 attachment messages"
+                    : "the server did not answer - the JVM kdb-server implements only " +
+                        "sessionBegin/sqlExec/txCommit, not the 0x14-0x1C document, upsert and lease messages",
                 )
               : new KdbError(`kdb: request "${kind}" timed out after ${timeoutMs}ms`, {
                   code: "DEADLINE_EXCEEDED",
@@ -1093,6 +1430,149 @@ export function backoffDelay(attempt: number, error: KdbError): number {
   return Math.floor(Math.random() * (capMs + 1));
 }
 
+function infoFromDto(d: AttachmentInfoDto): AttachmentInfo {
+  return { id: d.id, name: d.name, hash: d.hash, size: d.size, mime: d.mime };
+}
+
+/** An attachment operation as the transaction JSON carries it (go/kdb/wire/op_mapper.go). */
+function attachmentOpDto(op: AttachmentOp): OpDto {
+  const docId = assertUuid(op.docId);
+  const attachmentId = assertUuid(op.id, "attachment id");
+  if (op.kind === "delete") return { kind: "attachmentDelete", docId, attachmentId };
+  if (!/^[0-9a-f]{64}$/.test(op.hash)) {
+    throw new TypeError(`kdb: attachment hash must be 64 lowercase hex digits, got ${JSON.stringify(op.hash)}`);
+  }
+  if (!Number.isSafeInteger(op.size) || op.size < 0) {
+    throw new TypeError(`kdb: attachment size must be a non-negative integer, got ${op.size}`);
+  }
+  // Every field, mime included even when "": Go rejects an attachmentPut missing any.
+  return {
+    kind: "attachmentPut",
+    docId,
+    attachmentId,
+    name: op.name,
+    scheme: ATTACHMENT_HASH_SCHEME_CHUNKED_1,
+    blobHashHex: op.hash,
+    size: op.size,
+    mime: op.mime ?? "",
+  };
+}
+
+/**
+ * AttachmentReader over ATTACHMENT_GET pages. The first page is already in hand; each later one
+ * is asked for with the read's ID (which pins the version) from where the last ended.
+ */
+class PagedAttachmentReader implements AttachmentReader {
+  readonly info: AttachmentInfo;
+  readonly commit: string;
+  #superseded: boolean;
+  #first: AttachmentDataDto | undefined;
+  #readId: string;
+  #offset: number;
+  #eof: boolean;
+  #started = false;
+  readonly #hasher: AttachmentHasher | undefined;
+  readonly #fetch: (readId: string, at: number, close?: boolean) => Promise<AttachmentDataDto>;
+
+  constructor(
+    first: AttachmentDataDto,
+    offset: number,
+    verify: boolean,
+    fetch: (readId: string, at: number, close?: boolean) => Promise<AttachmentDataDto>,
+  ) {
+    this.info = infoFromDto(first.info);
+    this.commit = first.commitHex;
+    this.#superseded = first.superseded;
+    this.#first = first;
+    this.#readId = first.readId;
+    this.#offset = offset;
+    this.#eof = first.eof;
+    this.#hasher = verify ? new AttachmentHasher() : undefined;
+    this.#fetch = fetch;
+  }
+
+  get superseded(): boolean {
+    return this.#superseded;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<Uint8Array, void, undefined> {
+    if (this.#started) throw new KdbError("kdb: an attachment reader can be read only once");
+    this.#started = true;
+    let finished = false;
+    try {
+      for (;;) {
+        let page = this.#first;
+        this.#first = undefined;
+        if (page === undefined) {
+          page = await this.#fetch(this.#readId, this.#offset);
+          if (page.readId) this.#readId = page.readId;
+        }
+        if (page.offset !== this.#offset) {
+          throw new KdbProtocolError(`kdb: attachment page starts at ${page.offset}, expected ${this.#offset}`);
+        }
+        this.#offset += page.data.length;
+        this.#eof = page.eof;
+        if (page.eof) this.#superseded = page.superseded;
+        if (this.#hasher) {
+          await this.#hasher.update(page.data);
+          // The last page is handed over only once the whole blob checks out.
+          if (page.eof) await this.#verify();
+        }
+        if (page.eof) {
+          finished = true;
+          if (page.data.length > 0) yield page.data;
+          return;
+        }
+        if (page.data.length === 0) {
+          throw new KdbProtocolError("kdb: attachment page carried no data and did not end the read");
+        }
+        yield page.data;
+      }
+    } finally {
+      // Broken off early (or failed): tell the server to drop the read, best effort.
+      if (!finished && !this.#eof) await this.cancel();
+    }
+  }
+
+  async #verify(): Promise<void> {
+    const actual = await this.#hasher!.digest();
+    if (this.#offset !== this.info.size || actual !== this.info.hash) {
+      throw new KdbIntegrityError(
+        `kdb: attachment ${this.info.id} read ${this.#offset} bytes hashing to ${actual}; ` +
+          `expected ${this.info.size} bytes hashing to ${this.info.hash}`,
+        this.info.hash,
+        actual,
+      );
+    }
+  }
+
+  stream(): ReadableStream<Uint8Array> {
+    const it = this[Symbol.asyncIterator]();
+    return new ReadableStream<Uint8Array>({
+      pull: async (controller) => {
+        try {
+          const { done, value } = await it.next();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      cancel: async () => {
+        await it.return(undefined);
+        await this.cancel();
+      },
+    });
+  }
+
+  async cancel(): Promise<void> {
+    if (this.#eof || !this.#readId) return;
+    this.#eof = true;
+    this.#first = undefined;
+    await this.#fetch(this.#readId, this.#offset, true).catch(() => undefined);
+  }
+}
+
 /**
  * Converts text cells to the values their kinds name. `kinds` is one decimal digit per cell, row
  * by row (SqlResult's cellKinds); undefined leaves every cell a string.
@@ -1117,6 +1597,8 @@ function typedRows(rows: string[][], kinds: string | undefined): SqlValue[][] {
           return cell === "1" || cell === "true"; // Go writes 1/0, the JVM server true/false
         case 5:
           return JSON.parse(cell) as JsonValue;
+        case 6:
+          return base64ToBytes(cell);
         default:
           return cell;
       }

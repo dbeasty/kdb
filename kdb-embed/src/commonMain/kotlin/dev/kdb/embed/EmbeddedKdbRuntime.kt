@@ -19,7 +19,9 @@ import dev.kdb.schema.KdbSchema
 import dev.kdb.schema.isNone
 import dev.kdb.sql.SqlEngine
 import dev.kdb.sql.sqlEngine
+import dev.kdb.storage.PlatformIoShim
 import dev.kdb.storage.StorageAdapter
+import dev.kdb.storage.mem.InMemoryPlatformIoShim
 import dev.kdb.storage.mem.InMemoryStorageAdapter
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -46,7 +48,13 @@ public class EmbeddedKdbRuntime(
     /** The factory every index-creating path in this runtime must use (schema sync, SQL
      * `CREATE INDEX`, catalog reload), so every store shares [indexBlobs]. */
     public val indexStoreFactory: IndexStoreFactory = compositeIndexStoreFactory(dag, storage, blobs = indexBlobs),
+    /** Where attachment bytes live ([AttachmentBlobStore]); a file runtime passes its data
+     * directory's shim, a memory runtime keeps them in memory. */
+    public val attachmentShim: PlatformIoShim = InMemoryPlatformIoShim(),
 ) {
+    /** Attachment stores and settings (EmbedAttachments.kt). */
+    internal val attachments: AttachmentState = AttachmentState()
+
     // Component 44 (Layer 12): a single hook point every commit path shares -
     // EmbedWrites.commitViaEngine notifies through this after every successful commit,
     // regardless of whether the caller is kdb-server's KdbServerRuntime.commit() (the SQL wire

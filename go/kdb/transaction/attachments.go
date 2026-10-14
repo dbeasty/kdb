@@ -1,6 +1,10 @@
 package transaction
 
 import (
+	"reflect"
+	"sync"
+	"weak"
+
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/dag"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -24,7 +28,63 @@ type BlobPresence interface {
 	HasBlob(contentHash codec.Hash) (bool, error)
 }
 
-func hasBlob(store storage.Adapter, h codec.Hash) bool {
+// AttachmentBlobSource answers whether a namespace's attachment store holds a blob. Large
+// attachments live outside the storage adapter's blob store (storage/attachstore), so the runtime
+// that owns an adapter registers itself here and preflight asks it first.
+type AttachmentBlobSource interface {
+	HasAttachmentBlob(namespaceID string, contentHash codec.Hash) (bool, error)
+}
+
+// attachmentBlobs maps an adapter's address to a weak lookup of the runtime that owns it. Neither
+// is held: a runtime dropped without Close is collected as before, and its entry then answers
+// nothing (and is removed).
+var attachmentBlobs sync.Map // uintptr -> func() AttachmentBlobSource
+
+// RegisterAttachmentBlobs makes preflight ask owner whether an attachment blob is stored, for
+// transactions against store. owner is held weakly. A nil owner removes the registration.
+func RegisterAttachmentBlobs[T any, P interface {
+	*T
+	AttachmentBlobSource
+}](store storage.Adapter, owner P) {
+	key, ok := adapterKey(store)
+	if !ok {
+		return
+	}
+	if owner == nil {
+		attachmentBlobs.Delete(key)
+		return
+	}
+	w := weak.Make((*T)(owner))
+	attachmentBlobs.Store(key, func() AttachmentBlobSource {
+		if p := w.Value(); p != nil {
+			return P(p)
+		}
+		return nil
+	})
+}
+
+// adapterKey is store's address, for an adapter that is a pointer.
+func adapterKey(store storage.Adapter) (uintptr, bool) {
+	if store == nil {
+		return 0, false
+	}
+	v := reflect.ValueOf(store)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return 0, false
+	}
+	return v.Pointer(), true
+}
+
+func hasBlob(store storage.Adapter, namespaceID string, h codec.Hash) bool {
+	if key, ok := adapterKey(store); ok {
+		if fn, ok := attachmentBlobs.Load(key); ok {
+			if src := fn.(func() AttachmentBlobSource)(); src != nil {
+				has, err := src.HasAttachmentBlob(namespaceID, h)
+				return err == nil && has
+			}
+			attachmentBlobs.Delete(key) // its runtime is gone
+		}
+	}
 	if bp, ok := store.(BlobPresence); ok {
 		has, err := bp.HasBlob(h)
 		return err == nil && has
@@ -85,7 +145,7 @@ func preflightAttachments(
 			detail = "attachment size is negative"
 		case !presentAt(put.DocID):
 			detail = "no such document: an attachment needs its document"
-		case !hasBlob(store, put.ContentHash):
+		case !hasBlob(store, namespaceID, put.ContentHash):
 			detail = "attachment blob not stored: " + put.ContentHash.Hex()
 		}
 		if detail != "" {

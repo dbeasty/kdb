@@ -18,7 +18,10 @@ export interface Request {
   correlationId: number;
 }
 
-export type Responder = (request: Request) => { kind: MessageKind; payload: unknown } | undefined;
+type Reply = { kind: MessageKind; payload: unknown } | undefined;
+
+/** May answer asynchronously (a Promise), e.g. to hash what it was sent. */
+export type Responder = (request: Request) => Reply | Promise<Reply>;
 
 export class FakeServer implements Transport {
   readonly requests: Request[] = [];
@@ -54,6 +57,14 @@ export class FakeServer implements Transport {
     this.requests.push(request);
 
     const reply = this.#responder(request);
+    if (reply instanceof Promise) {
+      void reply.then((r) => this.#reply(r, message.correlationId));
+      return;
+    }
+    this.#reply(reply, message.correlationId);
+  }
+
+  #reply(reply: Reply, correlationId: number): void {
     // undefined means "the server says nothing" - the silent-drop failure mode that makes a
     // per-request deadline a correctness requirement rather than a nicety.
     if (!reply) return;
@@ -62,7 +73,7 @@ export class FakeServer implements Transport {
     // promise before the caller had registered it.
     queueMicrotask(() => {
       if (this.#closed) return;
-      const replyFrame = encodeMessage(reply.kind, message.correlationId, reply.payload);
+      const replyFrame = encodeMessage(reply.kind, correlationId, reply.payload);
       for (const handler of this.#frameHandlers) handler(replyFrame);
     });
   }

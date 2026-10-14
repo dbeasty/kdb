@@ -56,3 +56,31 @@ func TestAttachmentRootCommitBypassesDirectCodec(t *testing.T) {
 		t.Fatalf("decode lost the root: %+v %v", back.AttachmentTreeHash, err)
 	}
 }
+
+// A logged commit's document writes are read back by ScanCommitWrites, which walks the payload
+// without decoding it: attachment ops and the attachment root must not stop it.
+func TestScanCommitWritesPastAttachments(t *testing.T) {
+	doc := codec.UUID{MSB: 1}
+	root := codec.Hash{}
+	root.Bytes[3] = 9
+	ops := []Op{
+		AttachmentPutOp{DocID: doc, AttachmentID: codec.UUID{MSB: 2}, Name: "a", Scheme: AttachmentHashSchemeChunked1, ContentHash: root, Size: 3},
+		WriteOp{DocID: doc, Patch: `{"x":1}`},
+		AttachmentDeleteOp{DocID: doc, AttachmentID: codec.UUID{MSB: 2}},
+	}
+	c, err := BuildCommitWithAttachments(nil, "ns", codec.UUID{MSB: 3}, codec.TimestampFromEpochMicros(1), codec.UUID{MSB: 4}, ops, codec.Hash{}, nil, "", &root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := c.ToPayloadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := ScanCommitWrites(payload, doc, func(p []byte) bool { got = string(p); return true }); err != nil {
+		t.Fatal(err)
+	}
+	if got != `{"x":1}` {
+		t.Fatalf("scanned %q", got)
+	}
+}

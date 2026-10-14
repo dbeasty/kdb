@@ -81,7 +81,7 @@ func (c *DefaultCodec) EncodePooled(message Message) (frame []byte, release func
 }
 
 func (c *DefaultCodec) encodeInto(fw *frameWriter, message Message) error {
-	if t := message.Header().MessageType; c.binary && coreBinaryForm(t) || c.binary2 && moreBinaryForm(t) {
+	if t := message.Header().MessageType; c.binary && coreBinaryForm(t) || c.binary2 && moreBinaryForm(t) || attachmentBinaryForm(t) {
 		if hint := FrameHeaderSize + 1 + binarySizeHint(message); cap(fw.buf) < hint {
 			fw.buf = make([]byte, FrameHeaderSize, hint)
 		} else {

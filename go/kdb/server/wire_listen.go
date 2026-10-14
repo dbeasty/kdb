@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -187,6 +189,8 @@ type sqlWireConnHandler struct {
 	// let two already-spawned goroutines race for it.
 	sessionMu    sync.Mutex
 	sessionTails map[string]chan struct{}
+	// attachReads are this connection's open attachment reads (attachments_wire.go).
+	attachReads attachmentReads
 }
 
 func newSqlWireConnHandler(codec wire.Codec, runtime *KdbServerRuntime) *sqlWireConnHandler {
@@ -335,6 +339,17 @@ func sessionIDOf(message wire.Message) (string, bool) {
 		return msg.SessionID, true
 	case wire.LockReleaseMessage:
 		return msg.SessionID, true
+	case wire.AttachmentUploadMessage:
+		// Chunks of one upload apply in the order they were sent, so a client may pipeline them.
+		if msg.UploadID != "" {
+			return "upload:" + msg.UploadID, true
+		}
+		return "", false
+	case wire.AttachmentGetMessage:
+		if msg.ReadID != "" {
+			return "read:" + msg.ReadID, true
+		}
+		return "", false
 	default:
 		return "", false
 	}
@@ -343,6 +358,7 @@ func sessionIDOf(message wire.Message) (string, bool) {
 // closeAllSessions releases every lock and drops every session belonging to this connection.
 // Safe to call more than once; a second call finds nothing left to do.
 func (h *sqlWireConnHandler) closeAllSessions() {
+	h.attachReads.closeAll()
 	for _, sess := range h.sessions.All() {
 		h.sessionRuntime(sess).DocumentLocks.ReleaseAll(sess.ID.Value)
 		sess.ClearLeases()
@@ -475,6 +491,12 @@ func (h *sqlWireConnHandler) dispatch(message wire.Message) wire.Message {
 		return h.handleRevert(msg)
 	case wire.TxCommitMultiMessage:
 		return h.handleTxCommitMulti(msg)
+	case wire.AttachmentUploadMessage:
+		return h.handleAttachmentUpload(msg)
+	case wire.AttachmentGetMessage:
+		return h.handleAttachmentGet(msg)
+	case wire.AttachmentListMessage:
+		return h.handleAttachmentList(msg)
 	default:
 		return nil
 	}
@@ -905,6 +927,8 @@ func (h *sqlWireConnHandler) execDML(msg wire.SqlExecMessage, sess *KdbSession, 
 			builder.Write(o.DocID, o.Patch)
 		case document.DeleteOp:
 			builder.Delete(o.DocID)
+		case document.AttachmentPutOp, document.AttachmentDeleteOp:
+			builder.Append(o)
 		}
 	}
 	return wire.SqlResultMessage{
@@ -1488,6 +1512,8 @@ func cellKind(c sql.Cell) wire.CellKind {
 		return wire.CellKindBool
 	case sql.CellJSON:
 		return wire.CellKindJSON
+	case sql.CellBytes:
+		return wire.CellKindBytes
 	default:
 		return wire.CellKindString
 	}
@@ -1513,23 +1539,31 @@ func cellToString(c sql.Cell) string {
 		return "0"
 	case sql.CellJSON:
 		return v.JSON
+	case sql.CellBytes:
+		return base64.StdEncoding.EncodeToString(v.Value)
 	default:
 		return fmt.Sprintf("%v", c)
 	}
 }
 
-// decodeParametersJSON decodes a wire SqlExec ParametersJSON string (a JSON array of scalars,
-// matching Kotlin's decodeSqlParameters) into []sql.Parameter.
+// decodeParametersJSON decodes a wire SqlExec ParametersJSON string into []sql.Parameter. Each
+// element is a plain JSON scalar, an array of numbers (a vector), an attachment object form
+// (objectParam), or Kotlin's tagged {"t":..,"v":..} form (taggedParam) - so a Kotlin client that
+// encodes parameters the way the Kotlin server decodes them works against this server too.
 func decodeParametersJSON(raw *string) ([]sql.Parameter, error) {
 	if raw == nil || *raw == "" {
 		return nil, nil
 	}
-	var values []any
-	if err := json.Unmarshal([]byte(*raw), &values); err != nil {
+	var elems []json.RawMessage
+	if err := json.Unmarshal([]byte(*raw), &elems); err != nil {
 		return nil, err
 	}
-	params := make([]sql.Parameter, len(values))
-	for i, v := range values {
+	params := make([]sql.Parameter, len(elems))
+	for i, elem := range elems {
+		var v any
+		if err := json.Unmarshal(elem, &v); err != nil {
+			return nil, err
+		}
 		switch t := v.(type) {
 		case nil:
 			params[i] = sql.ParamNull{}
@@ -1543,6 +1577,20 @@ func decodeParametersJSON(raw *string) ([]sql.Parameter, error) {
 			} else {
 				params[i] = sql.ParamDouble{Value: t}
 			}
+		case map[string]any:
+			if _, tagged := t["t"]; tagged {
+				p, err := taggedParam(elem, i)
+				if err != nil {
+					return nil, err
+				}
+				params[i] = p
+				continue
+			}
+			p, err := objectParam(t, i)
+			if err != nil {
+				return nil, err
+			}
+			params[i] = p
 		case []any:
 			// A JSON array of numbers is the vector parameter type (kdb-spec-layer16 §9.1),
 			// which SIMILARITY takes. An array holding anything else is a client mistake worth
@@ -1557,6 +1605,95 @@ func decodeParametersJSON(raw *string) ([]sql.Parameter, error) {
 		}
 	}
 	return params, nil
+}
+
+// objectParam decodes the object parameter forms (wire feature "attachments"):
+//
+//	{"$bytes": "<standard base64>"}                      bytes (sql.ParamBytes)
+//	{"$attachment": {"hash": "<hex>", "size": <n>}}      an uploaded blob (sql.ParamAttachmentRef)
+func objectParam(obj map[string]any, index int) (sql.Parameter, error) {
+	if raw, ok := obj["$bytes"]; ok && len(obj) == 1 {
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("parameter %d: $bytes must be a base64 string", index)
+		}
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %d: $bytes is not valid base64", index)
+		}
+		return sql.ParamBytes{Value: b}, nil
+	}
+	if raw, ok := obj["$attachment"]; ok && len(obj) == 1 {
+		ref, ok := raw.(map[string]any)
+		hashHex, okH := ref["hash"].(string)
+		size, okS := ref["size"].(float64)
+		if !ok || !okH || !okS || size < 0 {
+			return nil, fmt.Errorf("parameter %d: $attachment must be {\"hash\": hex, \"size\": n}", index)
+		}
+		h, err := codec.HashFromHex(hashHex)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %d: $attachment hash: %v", index, err)
+		}
+		return sql.ParamAttachmentRef{ContentHash: h, Size: int64(size)}, nil
+	}
+	return nil, fmt.Errorf("unsupported object parameter at index %d (want {\"$bytes\": ..} or {\"$attachment\": ..})", index)
+}
+
+// taggedParam decodes Kotlin's tagged parameter form (dev.kdb.sql.encodeSqlParameters, what the
+// Kotlin JDBC driver and CLI send to a server that did not agree "attachments"):
+//
+//	{"t":"n"}  {"t":"s","v":"x"}  {"t":"i","v":7}  {"t":"d","v":1.5}  {"t":"b","v":true}  {"t":"v","v":[0.5,1]}
+//
+// "i" is decoded exactly (json.Number), so a Long beyond 2^53 is not rounded through a float64.
+func taggedParam(elem json.RawMessage, index int) (sql.Parameter, error) {
+	var p struct {
+		T string          `json:"t"`
+		V json.RawMessage `json:"v"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(elem))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return nil, fmt.Errorf("parameter %d: tagged parameter: %v", index, err)
+	}
+	bad := func(want string) error {
+		return fmt.Errorf("parameter %d: tagged parameter %q needs a %s \"v\"", index, p.T, want)
+	}
+	switch p.T {
+	case "n":
+		return sql.ParamNull{}, nil
+	case "s":
+		var s string
+		if json.Unmarshal(p.V, &s) != nil {
+			return nil, bad("string")
+		}
+		return sql.ParamString{Value: s}, nil
+	case "i":
+		var n int64
+		if json.Unmarshal(p.V, &n) != nil {
+			return nil, bad("integer")
+		}
+		return sql.ParamInt{Value: n}, nil
+	case "d":
+		var f float64
+		if json.Unmarshal(p.V, &f) != nil {
+			return nil, bad("number")
+		}
+		return sql.ParamDouble{Value: f}, nil
+	case "b":
+		var b bool
+		if json.Unmarshal(p.V, &b) != nil {
+			return nil, bad("boolean")
+		}
+		return sql.ParamBool{Value: b}, nil
+	case "v":
+		var vals []any
+		if json.Unmarshal(p.V, &vals) != nil {
+			return nil, bad("number array")
+		}
+		return vectorParam(vals, index)
+	default:
+		return nil, fmt.Errorf("parameter %d: unknown tagged parameter type %q", index, p.T)
+	}
 }
 
 // vectorParam converts a decoded JSON array into sql.ParamVector.

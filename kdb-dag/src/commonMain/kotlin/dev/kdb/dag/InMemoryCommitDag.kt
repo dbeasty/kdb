@@ -3,6 +3,8 @@ package dev.kdb.dag
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
+import dev.kdb.document.AttachmentException
+import dev.kdb.document.AttachmentTable
 import dev.kdb.document.CommitStub
 import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbBranch
@@ -10,6 +12,7 @@ import dev.kdb.document.KdbCommit
 import dev.kdb.document.KdbTag
 import dev.kdb.document.KdbTransaction
 import dev.kdb.document.computeCommitHash
+import dev.kdb.document.touchesAttachments
 import dev.kdb.error.IceStorageException
 import dev.kdb.error.VersionNotFoundException
 import kotlinx.coroutines.sync.Mutex
@@ -35,6 +38,8 @@ internal class InMemoryCommitDag(
     private val txIndex = LinkedHashMap<KdbUuid, KdbHash>()
     /** Live retention pins, keyed by commit hash, ref-counted. See [CommitDag.pin]. */
     private val pins = LinkedHashMap<KdbHash, Int>()
+    /** Attachment tables by root (see AttachmentTables.kt). */
+    private val attachments = AttachmentTableCache()
 
     init {
         trees[DocumentTree.EMPTY.treeHash] = DocumentTree.EMPTY
@@ -123,6 +128,7 @@ internal class InMemoryCommitDag(
     private fun putCommitLocked(
         commit: KdbCommit,
         requireParents: Boolean,
+        verifyAttachments: Boolean = true,
     ) {
         if (commits.containsKey(commit.hash)) return
         val recomputed = computeCommitHash(commit)
@@ -133,6 +139,7 @@ internal class InMemoryCommitDag(
                 commit.hash,
             )
         }
+        if (verifyAttachments) verifyAttachmentRootLocked(commit)
         if (requireParents && commit.parentHashes.isNotEmpty()) {
             for (p in commit.parentHashes) {
                 if (!commits.containsKey(p) && !stubs.containsKey(p)) {
@@ -157,6 +164,116 @@ internal class InMemoryCommitDag(
         if (!txIndex.containsKey(commit.transactionId)) {
             txIndex[commit.transactionId] = commit.hash
         }
+    }
+
+    /**
+     * Checks a received commit's attachmentTreeHash against its first parent's table with its
+     * operations applied, when that parent is here and its table derivable; otherwise the check
+     * happens when the table is first derived (attachmentTableAt). A commit whose recorded root
+     * disagrees is refused.
+     */
+    private fun verifyAttachmentRootLocked(commit: KdbCommit) {
+        val parentHash = commit.parentHashes.firstOrNull() ?: return
+        val parent = commits[parentHash] ?: return
+        val inherited = parent.attachmentTreeHash
+        if (!touchesAttachments(commit.operations, inherited != null)) {
+            if (commit.attachmentTreeHash != inherited) {
+                throw DagConsistencyException(
+                    "attachment root differs from the parent's, but the commit changes no attachment",
+                    namespaceId,
+                    commit.hash,
+                )
+            }
+            return
+        }
+        val base =
+            try {
+                attachmentTableLocked(parentHash)
+            } catch (_: DagConsistencyException) {
+                return // the parent's own history cannot be derived here: verified lazily, if ever
+            }
+        val next =
+            try {
+                base.apply(commit.operations)
+            } catch (e: AttachmentException) {
+                throw DagConsistencyException("attachment table: ${e.message}", namespaceId, commit.hash, e)
+            }
+        if (next.root != commit.attachmentTreeHash) {
+            throw DagConsistencyException(
+                "attachment root does not match the parent's table with the commit's operations applied",
+                namespaceId,
+                commit.hash,
+            )
+        }
+        next.root?.let { attachments.put(it, next) }
+    }
+
+    private fun attachmentTableLocked(commit: KdbHash): AttachmentTable {
+        if (stubs.containsKey(commit)) {
+            throw DagConsistencyException("attachment table: commit archived", namespaceId, commit)
+        }
+        return deriveAttachmentTable(
+            namespaceId,
+            commit,
+            { commits[it] },
+            { attachments.get(it) },
+            { root, t -> attachments.put(root, t) },
+        )
+    }
+
+    /** The attachment root of a commit on [parents] carrying [operations]: the first parent's table
+     * with them applied, or the parent's root unchanged when they touch no attachment. */
+    private fun attachmentRootLocked(
+        operations: List<dev.kdb.document.KdbOp>,
+        parents: List<KdbHash>,
+    ): KdbHash? {
+        val inherited = parents.firstOrNull()?.let { commits[it]?.attachmentTreeHash }
+        if (!touchesAttachments(operations, inherited != null)) return inherited
+        val base = if (inherited != null) attachmentTableLocked(parents[0]) else AttachmentTable.EMPTY
+        val next =
+            try {
+                base.apply(operations)
+            } catch (e: AttachmentException) {
+                throw DagConsistencyException("attachment table: ${e.message}", namespaceId, null, e)
+            }
+        next.root?.let { attachments.put(it, next) }
+        return next.root
+    }
+
+    /** The attachment ops a two-parent commit needs beyond its own: see AttachmentMerge.kt. */
+    private fun mergeAttachmentOpsLocked(
+        ownOps: List<dev.kdb.document.KdbOp>,
+        parents: List<KdbHash>,
+        tree: DocumentTree,
+    ): List<dev.kdb.document.KdbOp> {
+        if (parents.size != 2) return emptyList()
+        val oursRoot = commits[parents[0]]?.attachmentTreeHash
+        val theirsRoot = commits[parents[1]]?.attachmentTreeHash
+        if (oursRoot == theirsRoot) return emptyList()
+        val ours = attachmentTableLocked(parents[0])
+        val theirs = attachmentTableLocked(parents[1])
+        val base = mergeBasesLocked(parents[0], parents[1]).firstOrNull()?.let { attachmentTableLocked(it) } ?: AttachmentTable.EMPTY
+        return mergeAttachmentOps(ownOps, base, ours, theirs, tree)
+    }
+
+    /** The nearest common ancestors of [a] and [b], sorted by hash bytes - Go's MergeBases. A common
+     * ancestor is redundant exactly when it is a parent of another common ancestor (every commit
+     * between two common ancestors is itself one). */
+    private fun mergeBasesLocked(
+        a: KdbHash,
+        b: KdbHash,
+    ): List<KdbHash> {
+        val common = ancestorClosureLocked(a) intersect ancestorClosureLocked(b)
+        val redundant = mutableSetOf<KdbHash>()
+        for (c in common) expandParentsLocked(c)?.forEach { if (it in common) redundant += it }
+        return (common - redundant).filter { commits.containsKey(it) || stubs.containsKey(it) }.sortedBy { it.toHex() }
+    }
+
+    override suspend fun attachmentTableAt(commit: KdbHash): AttachmentTable = mutex.withLock { attachmentTableLocked(commit) }
+
+    override suspend fun seedAttachmentTable(table: AttachmentTable) {
+        val root = table.root ?: return
+        mutex.withLock { attachments.put(root, table) }
     }
 
     override suspend fun getCommitByTransactionId(txId: KdbUuid): KdbCommit? =
@@ -526,6 +643,9 @@ internal class InMemoryCommitDag(
         branchToAdvance: String,
     ): KdbCommit {
         for (p in parents) requireCommitPresentLocked(p)
+        // A merge carries the attachment operations that merge its parents' tables (AttachmentMerge.kt).
+        val operations = transaction.operations + mergeAttachmentOpsLocked(transaction.operations, parents, newDocumentTree)
+        val attachRoot = attachmentRootLocked(operations, parents)
         trees[newDocumentTree.treeHash] = newDocumentTree
         val commit =
             KdbCommit.build(
@@ -534,12 +654,14 @@ internal class InMemoryCommitDag(
                 transactionId = transaction.id,
                 timestamp = transaction.timestamp,
                 authorNodeId = transaction.authorNodeId,
-                operations = transaction.operations,
+                operations = operations,
                 documentTreeHash = newDocumentTree.treeHash,
                 schemaHash = schemaHash,
                 message = message,
+                attachmentTreeHash = attachRoot,
             )
-        putCommitLocked(commit, requireParents = true)
+        // The root was derived just now from the same parent and operations.
+        putCommitLocked(commit, requireParents = true, verifyAttachments = false)
         val b =
             branches[branchToAdvance]
                 ?: throw DagConsistencyException(
@@ -604,11 +726,21 @@ internal class InMemoryCommitDag(
                     boundary.toHex(),
                 )
             for (h in squashHashes) {
-                if (!commits.containsKey(h)) {
-                    throw DagConsistencyException(
-                        "squash target missing",
+                val c =
+                    commits[h]
+                        ?: throw DagConsistencyException(
+                            "squash target missing",
+                            namespaceId,
+                            h,
+                        )
+                // The synthetic commit has no parents and no operations, so an attachment table
+                // could not be derived for it; a window carrying attachments is refused (as in Go).
+                if (c.attachmentTreeHash != null) {
+                    throw CompactionSafetyException(
+                        "squash window holds commits with attachments",
                         namespaceId,
                         h,
+                        "attachments",
                     )
                 }
             }

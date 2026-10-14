@@ -96,6 +96,9 @@ func (e *defaultEngine) ExecuteDML(sqlText string, ctx QueryContext) (DMLResult,
 	if err != nil {
 		return DMLResult{}, err
 	}
+	if ctx.attach == nil {
+		ctx.attach = e.executor.newAttachEnv(ctx)
+	}
 	var ops []document.Op
 	switch s := stmt.(type) {
 	case StmtInsert:
@@ -103,13 +106,16 @@ func (e *defaultEngine) ExecuteDML(sqlText string, ctx QueryContext) (DMLResult,
 		if err != nil {
 			return DMLResult{}, err
 		}
-		ids := make([]string, len(ops))
-		for i, op := range ops {
+		var ids []string
+		for _, op := range ops {
 			if w, ok := op.(document.WriteOp); ok {
-				ids[i] = w.DocID.String()
+				ids = append(ids, w.DocID.String())
 			}
 		}
-		return DMLResult{Operations: ops, RowsAffected: len(ops), GeneratedIDs: ids}, nil
+		if ctx.attach.err != nil {
+			return DMLResult{}, ctx.attach.err
+		}
+		return DMLResult{Operations: ops, RowsAffected: len(ids), GeneratedIDs: ids}, nil
 	case StmtUpdate:
 		ops, err = e.dml.ExecuteUpdate(s.Update, ctx)
 	case StmtDelete:
@@ -117,8 +123,11 @@ func (e *defaultEngine) ExecuteDML(sqlText string, ctx QueryContext) (DMLResult,
 	default:
 		return DMLResult{}, NewPlanningError("not a DML statement", sqlText)
 	}
+	if err == nil {
+		err = ctx.attach.err
+	}
 	if err != nil {
 		return DMLResult{}, err
 	}
-	return DMLResult{Operations: ops, RowsAffected: len(ops)}, nil
+	return DMLResult{Operations: ops, RowsAffected: rowsAffected(ops)}, nil
 }

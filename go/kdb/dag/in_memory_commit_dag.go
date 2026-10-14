@@ -1043,6 +1043,14 @@ func (d *InMemoryCommitDag) appendCommitLocked(
 			)
 		}
 	}
+	// A merge carries the attachment operations that merge its parents' tables (attachment_merge.go).
+	mergeOps, err := d.mergeAttachmentOpsLocked(tx, parents, newDocumentTree)
+	if err != nil {
+		return document.Commit{}, err
+	}
+	if len(mergeOps) > 0 {
+		tx.Operations = append(append([]document.Op(nil), tx.Operations...), mergeOps...)
+	}
 	attachRoot, err := d.attachmentRootLocked(tx, parents)
 	if err != nil {
 		return document.Commit{}, err

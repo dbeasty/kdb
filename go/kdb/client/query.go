@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -93,6 +94,8 @@ func typedCell(cell string, kind wire.CellKind) (any, error) {
 		return cell == "1" || cell == "true", nil // Go servers write 1/0, the Kotlin one true/false
 	case wire.CellKindJSON:
 		return json.RawMessage(cell), nil
+	case wire.CellKindBytes:
+		return base64.StdEncoding.DecodeString(cell)
 	default:
 		// A kind this build does not know yet is still text.
 		return cell, nil

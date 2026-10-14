@@ -22,6 +22,8 @@ type Executor struct {
 	// IndexProvider, when non-nil, serves index-backed access paths and the search functions
 	// (kdb-spec-layer16 §9). Nil means no indexes: lookups full-scan, MATCH/SIMILARITY fail.
 	IndexProvider IndexProvider
+	// Attachments, when non-nil, stores and reads attachment bytes (SetAttachmentBlobs).
+	Attachments AttachmentBlobs
 
 	// scanIDsOnly reproduces the fetch-by-id full scan this replaced (scan for ids, then fetch
 	// each document again). Tests only: it is the oracle that the single-fetch scan returns
@@ -34,6 +36,17 @@ type Executor struct {
 // pushed down to id resolution only when nothing before it (ORDER BY, DISTINCT, grouping)
 // depends on seeing every row.
 func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual Expr, ctx QueryContext) (QueryResult, error) {
+	if ctx.attach == nil {
+		ctx.attach = e.newAttachEnv(ctx)
+	}
+	res, err := e.executeSelect(query, plan, residual, ctx)
+	if err == nil && ctx.attach.err != nil {
+		return QueryResult{}, ctx.attach.err
+	}
+	return res, err
+}
+
+func (e *Executor) executeSelect(query SelectQuery, plan PhysicalPlan, residual Expr, ctx QueryContext) (QueryResult, error) {
 	// A table-less SELECT is answered before anything touches the DAG or storage. That
 	// ordering is the point, not an optimization: `SELECT 1` is what a connection pool sends to
 	// check liveness, and resolving a commit for it would make the probe fail on an empty
@@ -47,6 +60,7 @@ func (e *Executor) ExecuteSelect(query SelectQuery, plan PhysicalPlan, residual 
 	// Aggregates are no longer dispatched to a separate path here: grouped and ungrouped
 	// queries share the pipeline below, which is what lets a GROUP BY key be projected.
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, query.From)
+	env.attach = ctx.attach
 	env.aliases = projectionAliases(query)
 	if err := e.resolveSearches(query, env, ctx); err != nil {
 		return QueryResult{}, err
@@ -500,6 +514,7 @@ func distinctRows(rows []QueryRow) []QueryRow {
 func (e *Executor) executeSingleRowSelect(query SelectQuery, ctx QueryContext) (QueryResult, error) {
 	row := emptyDoc
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, query.From)
+	env.attach = ctx.attach
 	env.aliases = projectionAliases(query)
 	doc := newEvalDoc(row)
 
@@ -963,6 +978,7 @@ func (e *Executor) matchingDocs(where Expr, from TableRef, ctx QueryContext) ([]
 		return nil, "", err
 	}
 	env := newEvalEnv(ctx.Schema, ctx.Parameters, from)
+	env.attach = ctx.attach
 	if err := e.resolveSearches(q, env, ctx); err != nil {
 		return nil, "", err
 	}
@@ -1157,6 +1173,8 @@ func columnsFor(query SelectQuery, sch schema.KdbSchema) []ResultColumn {
 				source = ColumnSourceKdbID
 			case col == colDoc:
 				sqlType, source = "JSON", ColumnSourceDocJSON
+			case col == colAttachments:
+				sqlType = "JSON"
 			default:
 				if f, ok := sch.Field(col); ok {
 					sqlType = f.Type.SQLTypeName()
@@ -1182,8 +1200,12 @@ func expressionSQLType(e Expr) string {
 		return "DOUBLE"
 	case ExprFunctionCall:
 		switch ex.Name {
-		case "count", "array_length":
+		case "count", "array_length", "attachment_count", "attachment_size":
 			return "BIGINT"
+		case "attachment", "from_base64":
+			return "VARBINARY"
+		case "attachment_mime":
+			return "VARCHAR"
 		case "avg":
 			return "DOUBLE"
 		case "array_contains", "array_contains_any":

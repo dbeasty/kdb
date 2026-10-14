@@ -426,6 +426,8 @@ func cellValue(cell sql.Cell) driver.Value {
 		return v.Value
 	case sql.CellJSON:
 		return v.JSON
+	case sql.CellBytes:
+		return v.Value
 	default:
 		return fmt.Sprint(v)
 	}

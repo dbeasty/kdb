@@ -50,12 +50,16 @@ public interface TransactionEngine {
  * against this registry and rejects violations as [TransactionResult.SchemaError] with
  * [dev.kdb.error.ViolationType.UNIQUE_CONSTRAINT]; the registry is updated only once the commit is in
  * the DAG, and rebuilt when a commit changes the schema. Null keeps the pre-Layer-16 behaviour.
+ *
+ * [blobPresence] answers whether an attachment's blob is stored, for the attachment preflight (see
+ * Attachments.kt); null asks the storage adapter.
  */
 public fun transactionEngine(
     conflictPolicy: ConflictPolicy,
     customResolver: ConflictResolver? = null,
     uniqueKeys: UniqueKeyRegistry? = null,
-): TransactionEngine = DefaultTransactionEngine(conflictPolicy, customResolver, uniqueKeys)
+    blobPresence: BlobPresence? = null,
+): TransactionEngine = DefaultTransactionEngine(conflictPolicy, customResolver, uniqueKeys, blobPresence)
 
 public suspend fun transactionBuilder(
     namespaceId: String,

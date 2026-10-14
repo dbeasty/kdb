@@ -300,6 +300,7 @@ func (h *Host) openNamespace(
 		txn:              h.txn,
 		recovery:         recovery,
 	}
+	rt.registerAttachmentBlobs()
 	if !opts.ReadOnly {
 		rt.snapshot = &snapshotSupport{
 			dag: d, store: store, shim: io, dataRoot: dataRoot, namespaceID: namespaceID,

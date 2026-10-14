@@ -41,8 +41,37 @@ export interface Transaction {
    * document is not an error; the commit just records nothing for it.
    */
   deletes?: string[];
+  /**
+   * Attachment operations in the same commit, after the writes and deletes. Build a put with
+   * Client.prepareAttachment (which uploads the bytes and resolves the attachment's ID), or by
+   * hand from an uploaded blob.
+   */
+  attachments?: AttachmentOp[];
   preconditions?: Precondition[];
 }
+
+/**
+ * Creates or replaces one attachment of a document - by `id`, under `name` - with an uploaded blob
+ * (`hash`, `size`). The same ID with a new name renames it.
+ */
+export interface AttachmentPutOp {
+  kind: "put";
+  docId: string;
+  id: string;
+  name: string;
+  hash: string;
+  size: number;
+  mime?: string;
+}
+
+/** Removes one attachment of a document, by ID. */
+export interface AttachmentDeleteOp {
+  kind: "delete";
+  docId: string;
+  id: string;
+}
+
+export type AttachmentOp = AttachmentPutOp | AttachmentDeleteOp;
 
 export interface CallOptions {
   signal?: AbortSignal;

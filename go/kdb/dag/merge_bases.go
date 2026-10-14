@@ -28,6 +28,11 @@ import (
 func (d *InMemoryCommitDag) MergeBases(as, bs []codec.Hash) []codec.Hash {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.mergeBasesLocked(as, bs)
+}
+
+// mergeBasesLocked is MergeBases' body. Must hold mu exclusively.
+func (d *InMemoryCommitDag) mergeBasesLocked(as, bs []codec.Hash) []codec.Hash {
 	var out []codec.Hash
 	if d.ensureGenerationsLocked() {
 		out = d.removeRedundantLocked(d.paintDownToCommonLocked(as, bs, d.generationLocked), d.generationLocked)

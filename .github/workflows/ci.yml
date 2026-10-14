@@ -33,6 +33,9 @@ jobs:
       - name: Install pytest
         run: pip install -q -r kdb-integration/e2e/requirements.txt
       - name: Run integration tests
+        env:
+          # this job builds kdb-service above: the JVM-against-Go tests must run, not skip
+          KDB_REQUIRE_GO_SERVICE: "1"
         run: ./gradlew :kdb-integration:test :kdb-integration:e2ePython --no-daemon
       - name: Upload e2e failure evidence
         # Data directories, every launch's service log and kdb-inspect output, kept by

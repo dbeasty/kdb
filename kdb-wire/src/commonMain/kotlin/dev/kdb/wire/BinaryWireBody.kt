@@ -29,8 +29,15 @@ public const val WIRE_FEATURE_BINARY_2: String = "binary-frames-2"
 /** Tag-3 frames: a zstd frame of a tag-2 body, used for bodies of 8 KiB or more. */
 public const val WIRE_FEATURE_ZSTD: String = "zstd-frames"
 
-/** Every feature this build implements, in the order a client offers them. */
-public val SUPPORTED_WIRE_FEATURES: List<String> = listOf(WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD)
+/** The attachment client messages (ATTACHMENT_UPLOAD/GET/LIST, 0x44-0x49), CellKindBytes result
+ * cells and the `{"$bytes": ..}` / `{"$attachment": ..}` SQL parameters. Only meaningful with
+ * [WIRE_FEATURE_BINARY]. This codec speaks it; a server acks it only if it serves those messages
+ * (the Kotlin server does not, so it leaves it out of its ack). */
+public const val WIRE_FEATURE_ATTACHMENTS: String = "attachments"
+
+/** Every feature this build's codec implements, in the order a client offers them. */
+public val SUPPORTED_WIRE_FEATURES: List<String> =
+    listOf(WIRE_FEATURE_BINARY, WIRE_FEATURE_BINARY_2, WIRE_FEATURE_ZSTD, WIRE_FEATURE_ATTACHMENTS)
 
 /** The features in [offered] this build supports; what a server acks. The others extend or
  * compress binary frames, so without [WIRE_FEATURE_BINARY] none is agreed. */
@@ -61,12 +68,12 @@ internal const val ZSTD_FRAME_THRESHOLD: Int = 8 shl 10
 
 internal const val TAG_BINARY: Byte = 2
 
-private const val WT_VARINT = 0
-private const val WT_FIXED64 = 1
-private const val WT_BYTES = 2
-private const val WT_FIXED32 = 5
+internal const val WT_VARINT = 0
+internal const val WT_FIXED64 = 1
+internal const val WT_BYTES = 2
+internal const val WT_FIXED32 = 5
 
-private class BinWriter {
+internal class BinWriter {
     var buf = ByteArray(256)
     var len = 0
 
@@ -158,7 +165,7 @@ private class BinWriter {
     fun finish(): ByteArray = buf.copyOf(len)
 }
 
-private class BinReader(val b: ByteArray, var off: Int, val end: Int) {
+internal class BinReader(val b: ByteArray, var off: Int, val end: Int) {
     val done: Boolean get() = off >= end
 
     fun uvarint(): Long {
@@ -384,7 +391,7 @@ internal fun encodeBinaryBody(message: WireMessage): ByteArray? {
             w.optString(4, message.errorCode)
             w.optInt(5, message.retryAfterMs)
         }
-        else -> return null
+        else -> if (!encodeAttachmentBody(w, message)) return null
     }
     return w.finish()
 }
@@ -658,7 +665,9 @@ internal fun decodeBinaryBody(
             }
             WireMessage.UpsertResult(header, namespace, commitHex, error, errorCode, retryAfterMs)
         }
-        else -> throw WireDecodeException("message type ${header.messageType} has no binary form")
+        else ->
+            decodeAttachmentBody(header, r)
+                ?: throw WireDecodeException("message type ${header.messageType} has no binary form")
     }
 }
 

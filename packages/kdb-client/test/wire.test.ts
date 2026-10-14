@@ -145,6 +145,8 @@ describe("FrameReader", () => {
 describe("envelope", () => {
   it("round trips every client message kind", () => {
     for (const kind of Object.keys(TYPE_CODE_BY_KIND) as MessageKind[]) {
+      // Attachment messages are always binary, with no JSON envelope form (attachments.test.ts).
+      if (kind.startsWith("attachment")) continue;
       const payload = { namespace: "app/users", marker: kind };
       const decoded = decodeMessage(encodeMessage(kind, 42, payload));
       assert.equal(decoded.kind, kind);

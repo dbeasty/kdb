@@ -93,7 +93,10 @@ func appendBinaryBody(b []byte, message Message) ([]byte, bool) {
 		b = appendOptErrorCode(b, 4, m.ErrorCode)
 		b = appendOptInt(b, 5, m.RetryAfterMs)
 	default:
-		return appendMoreBinaryBody(b, message)
+		if out, ok := appendMoreBinaryBody(b, message); ok {
+			return out, true
+		}
+		return appendAttachmentBody(b, message)
 	}
 	return b, true
 }
@@ -382,6 +385,9 @@ func decodeBinaryBody(header Header, body []byte) (Message, error) {
 		msg = m
 	default:
 		m, ok := decodeMoreBinaryBody(header, r)
+		if !ok {
+			m, ok = decodeAttachmentBody(header, r)
+		}
 		if !ok {
 			return nil, newDecodeError("message type has no binary form")
 		}

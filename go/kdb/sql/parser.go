@@ -399,7 +399,15 @@ func (p *rdParser) parseInsert() (InsertStatement, error) {
 			break
 		}
 	}
-	return InsertStatement{Table: table, Columns: columns, Rows: rows}, nil
+	ins := InsertStatement{Table: table, Columns: columns, Rows: rows}
+	if p.matchKeyword("WITH") {
+		specs, err := p.parseWithAttachments()
+		if err != nil {
+			return InsertStatement{}, err
+		}
+		ins.Attachments = specs
+	}
+	return ins, nil
 }
 
 func (p *rdParser) parseUpdate() (UpdateStatement, error) {
@@ -407,11 +415,24 @@ func (p *rdParser) parseUpdate() (UpdateStatement, error) {
 	if err != nil {
 		return UpdateStatement{}, err
 	}
-	if err := p.expectKeyword("SET"); err != nil {
-		return UpdateStatement{}, err
+	// SET may be left out when the list starts with DROP or RENAME ATTACHMENT.
+	if !p.matchKeyword("SET") && !p.peekKeyword("DROP") && !p.peekKeyword("RENAME") {
+		return UpdateStatement{}, p.parseError("expected SET")
 	}
 	var assignments []Assignment
+	var attachments []AttachmentChange
 	for {
+		if kind := p.matchAttachmentItem(); kind >= 0 {
+			ch, err := p.parseAttachmentChange(kind)
+			if err != nil {
+				return UpdateStatement{}, err
+			}
+			attachments = append(attachments, ch)
+			if !p.matchChar(',') {
+				break
+			}
+			continue
+		}
 		path, err := p.readIdentifier()
 		if err != nil {
 			return UpdateStatement{}, err
@@ -435,7 +456,7 @@ func (p *rdParser) parseUpdate() (UpdateStatement, error) {
 			return UpdateStatement{}, err
 		}
 	}
-	return UpdateStatement{Table: table, Assignments: assignments, Where: where}, nil
+	return UpdateStatement{Table: table, Assignments: assignments, Where: where, Attachments: attachments}, nil
 }
 
 func (p *rdParser) parseDelete() (DeleteStatement, error) {
@@ -576,6 +597,7 @@ func (p *rdParser) parseTableRef() (TableRef, error) {
 // clauseKeywords are words that can follow a table reference or a projection and so must not
 // be swallowed as an alias.
 var clauseKeywords = map[string]bool{
+	"RENAME": true, "DROP": true,
 	"WHERE": true, "SET": true, "ORDER": true, "GROUP": true, "LIMIT": true, "OFFSET": true,
 	"FROM": true, "HAVING": true, "ON": true, "USING": true, "WITH": true, "AND": true,
 	"OR": true, "NOT": true, "AS": true, "VALUES": true, "INTO": true, "BY": true,
@@ -804,6 +826,9 @@ func (p *rdParser) parsePrimary() (Expr, error) {
 			return nil, err
 		}
 		return e, nil
+	case (c == 'X' || c == 'x') && p.pos+1 < len(p.input) && p.input[p.pos+1] == '\'':
+		p.consume()
+		return p.parseBytesLiteral()
 	case c == '_' || unicode.IsLetter(rune(c)):
 		return p.parseIdentifierExpr()
 	default:
@@ -1143,6 +1168,38 @@ func (p *rdParser) expectKeyword(kw string) error {
 		return p.parseError("expected " + kw)
 	}
 	return nil
+}
+
+// peekKeyword reports whether kw is next, without consuming it.
+func (p *rdParser) peekKeyword(kw string) bool {
+	save, last := p.pos, p.lastKeyword
+	ok := p.matchKeyword(kw)
+	p.pos, p.lastKeyword = save, last
+	return ok
+}
+
+// matchAttachmentItem consumes the start of an UPDATE attachment item - ATTACHMENT <sel> (not a
+// column named attachment, which is followed by '='), DROP ATTACHMENT, RENAME ATTACHMENT - and
+// returns its kind, or -1 having consumed nothing.
+func (p *rdParser) matchAttachmentItem() AttachmentChangeKind {
+	save, last := p.pos, p.lastKeyword
+	switch {
+	case p.matchKeyword("DROP"):
+		if p.peekKeyword("ATTACHMENT") {
+			return AttachmentDrop
+		}
+	case p.matchKeyword("RENAME"):
+		if p.peekKeyword("ATTACHMENT") {
+			return AttachmentRename
+		}
+	case p.matchKeyword("ATTACHMENT"):
+		p.skipWS()
+		if p.peek() != '=' && p.pos < len(p.input) {
+			return AttachmentSet
+		}
+	}
+	p.pos, p.lastKeyword = save, last
+	return -1
 }
 
 func (p *rdParser) matchKeyword(kw string) bool {

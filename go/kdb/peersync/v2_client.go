@@ -252,8 +252,11 @@ func (c *v2Conn) pull(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 	defer leavePull(env.DAG, gate, held)
 	if needsSnapshot(env, remote, cfg.PreferSnapshot) {
 		at := remote.Branches[mainBranch]
-		installed, err := InstallSnapshot(env, c.snapshotFetcher(cfg, remote.Namespace, at))
+		installed, err := InstallSnapshot(env, seedingSnapshotPages(env, c.snapshotFetcher(cfg, remote.Namespace, at)))
 		if err != nil {
+			return err
+		}
+		if err := c.fetchTableBlobs(env, remote.Namespace, installed.Hash); err != nil {
 			return err
 		}
 		res.Snapshot = installed.Hash.Hex()
@@ -456,6 +459,10 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 		if !ok {
 			return haves, NewError(fmt.Sprintf("expected PACK_PAGE, got %T", reply), nil)
 		}
+		// The blobs the page attaches come first: no stored commit names bytes this node lacks.
+		if err := c.fetchBlobs(env, ns, page.Commits); err != nil {
+			return haves, err
+		}
 		n, err := StoreCommits(env, page.Commits, page.Stubs)
 		res.Pulled += n
 		res.Received += len(page.Commits)
@@ -467,7 +474,10 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 			// this node's root descends from it (see boundary.go). Take its state, then store.
 			if gaps := gapsBelowBoundary(env, page.Commits, shallow); len(gaps) > 0 {
 				for _, gap := range gaps {
-					if ferr := extendBoundary(env, gap, c.snapshotFetcher(cfg, ns, gap.parent.Hex())); ferr != nil {
+					if ferr := extendBoundary(env, gap, seedingSnapshotPages(env, c.snapshotFetcher(cfg, ns, gap.parent.Hex()))); ferr != nil {
+						return haves, ferr
+					}
+					if ferr := c.fetchTableBlobs(env, ns, gap.parent); ferr != nil {
 						return haves, ferr
 					}
 					res.BoundaryExtended = append(res.BoundaryExtended, gap.parent.Hex())
@@ -485,8 +495,11 @@ func (c *v2Conn) fetchRef(cfg V2ClientConfig, env IngestEnv, gate *pullGate, ns 
 			}
 			// The peer's history is rooted where this node's is not, and the namespace merges
 			// unrelated histories: graft the root, then the page stores.
-			if _, gerr := Graft(env, root, c.snapshotFetcher(cfg, ns, root.Hex())); gerr != nil {
+			if _, gerr := Graft(env, root, seedingSnapshotPages(env, c.snapshotFetcher(cfg, ns, root.Hex()))); gerr != nil {
 				return haves, env.noteUnrelated(root, fmt.Errorf("%w; grafting it failed: %v", err, gerr))
+			}
+			if ferr := c.fetchTableBlobs(env, ns, root); ferr != nil {
+				return haves, ferr
 			}
 			res.Grafted = append(res.Grafted, root.Hex())
 			n, err = StoreCommits(env, page.Commits, page.Stubs)
@@ -580,6 +593,15 @@ func (c *v2Conn) push(cfg V2ClientConfig, env IngestEnv, remote wire.NamespaceRe
 				commits, stubs, done, err = cursor.page(env.DAG, cfg.PageBytes)
 			}
 			if err != nil {
+				return err
+			}
+			if !containsString(c.caps, wire.SyncCapAttachments) {
+				if bad, ok := carriesAttachments(commits); ok {
+					res.RefErrors[ref.key()] = (&AttachmentsUnsupportedError{Namespace: remote.Namespace, Commit: bad.Hex()}).Error()
+					break
+				}
+			}
+			if err := c.uploadBlobs(env, remote.Namespace, commits); err != nil {
 				return err
 			}
 			reply, err := c.request(wire.RefUpdateMessage{

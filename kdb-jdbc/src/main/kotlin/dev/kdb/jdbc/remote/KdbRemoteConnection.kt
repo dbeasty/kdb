@@ -1,9 +1,13 @@
 package dev.kdb.jdbc.remote
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbUuid
 import dev.kdb.jdbc.KdbDatabaseMetaData
 import dev.kdb.jdbc.KdbJdbcUrl
 import dev.kdb.jdbc.transportConnectOptions
+import dev.kdb.jdbc.AttachmentHost
+import dev.kdb.jdbc.KdbAttachments
+import dev.kdb.jdbc.KdbBinding
 import dev.kdb.jdbc.KdbPreparedStatement
 import dev.kdb.jdbc.KdbSqlConnection
 import dev.kdb.jdbc.KdbStatement
@@ -21,6 +25,7 @@ import dev.kdb.wire.HandshakePayload
 import dev.kdb.wire.KDB_WIRE_PROTOCOL_VERSION
 import dev.kdb.wire.SUPPORTED_WIRE_FEATURES
 import dev.kdb.wire.SqlCellKind
+import dev.kdb.wire.WIRE_FEATURE_ATTACHMENTS
 import dev.kdb.wire.TransactionWireCodec
 import dev.kdb.wire.WireCapabilitySet
 import dev.kdb.wire.WireClientMode
@@ -51,8 +56,43 @@ public class KdbRemoteConnection(
             transport.connect(url.networkWebSocketUri(), url.transportConnectOptions())
         }
     private val rpc = WireRpcClient(wire, socket)
+
+    /** The wire features the server agreed in the handshake. */
+    @Volatile
+    private var agreedFeatures: List<String> = emptyList()
+
+    /** Whether the server agreed [WIRE_FEATURE_ATTACHMENTS]: it serves the attachment messages and
+     * takes `{"$bytes": ..}` / `{"$attachment": ..}` parameters. Only the Go server does. */
+    public val attachmentsSupported: Boolean get() = WIRE_FEATURE_ATTACHMENTS in agreedFeatures
+
+    private val authorNodeId = KdbUuid.random()
+
+    private val attachmentHost =
+        object : AttachmentHost {
+            override val namespace: String get() = url.namespaceId
+            override val sessionId: String get() = this@KdbRemoteConnection.sessionId
+            override val attachmentsAgreed: Boolean get() = attachmentsSupported
+            override val inTransaction: Boolean get() = !autoCommit
+            override val authorNodeId: KdbUuid get() = this@KdbRemoteConnection.authorNodeId
+
+            override fun checkWritable() = this@KdbRemoteConnection.checkWritable()
+
+            override suspend fun request(message: WireMessage): WireMessage {
+                checkOpen()
+                return rpc.request(message)
+            }
+        }
+
+    private val attachments = KdbAttachments(attachmentHost)
+
+    /** The attachment API (also `unwrap(KdbAttachments::class.java)`); its calls fail with
+     * SQLFeatureNotSupportedException unless [attachmentsSupported]. */
+    public fun attachments(): KdbAttachments = attachments
     private var closed = false
     private var autoCommit = true
+
+    /** Go dialect only: the manual transaction has DML buffered on the server session. */
+    private var bufferedWrites = false
     private var readOnly = url.readOnly
     private var sessionId: String = ""
     private var readConsistency = ReadConsistency.READ_COMMITTED
@@ -81,6 +121,7 @@ public class KdbRemoteConnection(
         }
         // Binary frames only once the server has acked them; an older server acks none.
         val features = negotiateWireFeatures(hs.response.wireFeatures)
+        agreedFeatures = features
         if (features.isNotEmpty()) rpc.useCodec(wire.withWireFeatures(features))
         val begin =
             rpc.request(
@@ -98,8 +139,35 @@ public class KdbRemoteConnection(
     override suspend fun executeHybrid(
         sql: String,
         parameters: List<SqlParameter>,
+    ): HybridQueryResult = executeHybridBound(sql, parameters.map { KdbBinding.Plain(it) })
+
+    override suspend fun executeHybridBound(
+        sql: String,
+        bindings: List<KdbBinding>,
     ): HybridQueryResult {
         checkOpen()
+        val parametersJson =
+            if (attachmentsSupported) {
+                // A server that agreed attachments takes the plain JSON parameter forms (Go's
+                // decodeParametersJSON), binary ones included. Streams are uploaded first.
+                val resolved =
+                    bindings.map { b ->
+                        if (b is KdbBinding.Stream) {
+                            val blob = attachments.uploadSuspend(b.input, b.length, null)
+                            KdbBinding.AttachmentRef(blob.hashHex, blob.size)
+                        } else {
+                            b
+                        }
+                    }
+                encodePlainParameters(resolved)
+            } else {
+                encodeSqlParameters(
+                    bindings.map {
+                        (it as? KdbBinding.Plain)?.parameter
+                            ?: throw SQLFeatureNotSupportedException(KdbAttachments.ATTACHMENTS_NOT_AGREED)
+                    },
+                )
+            }
         val reply =
             rpc.request(
                 WireMessage.SqlExec(
@@ -107,7 +175,7 @@ public class KdbRemoteConnection(
                     namespace = url.namespaceId,
                     sessionId = sessionId,
                     sql = sql,
-                    parametersJson = encodeSqlParameters(parameters),
+                    parametersJson = parametersJson,
                 ),
             )
         return when (reply) {
@@ -115,9 +183,14 @@ public class KdbRemoteConnection(
                 if (reply.error != null) {
                     throw SQLException(reply.error)
                 }
+                val bufferedDml = attachmentsSupported && !reply.readOnly && !isTransactionControl(sql)
+                if (bufferedDml && !autoCommit) bufferedWrites = true
+                val resolvedCommitHex =
+                    if (bufferedDml && autoCommit) commitBufferedDml() else reply.resolvedCommitHex
+                val binary = binaryColumns(reply.columns.size, reply.rows, reply.cellKinds)
                 val columns =
-                    reply.columns.map {
-                        ResultColumn(it, "VARCHAR", ColumnSource.EXPRESSION)
+                    reply.columns.mapIndexed { i, name ->
+                        ResultColumn(name, if (binary[i]) "VARBINARY" else "VARCHAR", ColumnSource.EXPRESSION)
                     }
                 val rows = typedRows(reply.rows, reply.cellKinds)
                 HybridQueryResult(
@@ -128,7 +201,7 @@ public class KdbRemoteConnection(
                             rowsAffected = reply.rowsAffected,
                             generatedIds = reply.generatedIds,
                         ),
-                    resolvedCommit = KdbHash.fromHex(reply.resolvedCommitHex),
+                    resolvedCommit = KdbHash.fromHex(resolvedCommitHex),
                     readOnly = reply.readOnly,
                 )
             }
@@ -136,6 +209,37 @@ public class KdbRemoteConnection(
                 throw SQLException("transaction conflict", "40001")
             else -> throw SQLException("unexpected wire reply: ${reply.header.messageType}")
         }
+    }
+
+    /**
+     * The Go server buffers a session's DML until TX_COMMIT (its own client commits after every
+     * Exec); the Kotlin server commits autocommit DML itself. Without this, an autocommit INSERT
+     * against Go reported its row count and was never committed. Keyed on [attachmentsSupported],
+     * the same Go-dialect switch the parameter encoding uses: only the Go server agrees it.
+     */
+    private suspend fun commitBufferedDml(): String {
+        val reply =
+            rpc.request(
+                WireMessage.TxCommit(
+                    WireHeader(WireMessageType.TX_COMMIT, KDB_WIRE_PROTOCOL_VERSION, 0, 0),
+                    namespace = url.namespaceId,
+                    sessionId = sessionId,
+                    transactionBytes = ByteArray(0),
+                ),
+            )
+        return when (reply) {
+            is WireMessage.ConflictReport -> throw SQLException("transaction conflict", "40001")
+            is WireMessage.SqlResult -> {
+                if (reply.error != null) throw SQLException(reply.error)
+                reply.resolvedCommitHex
+            }
+            else -> throw SQLException("unexpected commit reply: ${reply.header.messageType}")
+        }
+    }
+
+    private fun isTransactionControl(sql: String): Boolean {
+        val word = sql.trimStart().takeWhile { it.isLetter() }.uppercase()
+        return word == "BEGIN" || word == "START" || word == "COMMIT" || word == "ROLLBACK" || word == "END"
     }
 
     override fun namespaceForTable(table: String): String = url.namespaceForTable(table)
@@ -186,6 +290,14 @@ public class KdbRemoteConnection(
     }
 
     private suspend fun execTransactionControl(sql: String) {
+        // The Go server refuses a COMMIT with nothing buffered ("no pending transaction to
+        // commit") and keeps no autocommit mode of its own, so a manual transaction that only read
+        // (or was rolled back) ends without one - otherwise conn.commit() after a SELECT failed.
+        if (sql != "BEGIN") {
+            val hadWrites = bufferedWrites
+            bufferedWrites = false
+            if (sql == "COMMIT" && attachmentsSupported && !hadWrites) return
+        }
         val reply =
             rpc.request(
                 WireMessage.SqlExec(
@@ -222,11 +334,30 @@ public class KdbRemoteConnection(
                         SqlCellKind.DOUBLE -> cell.toDoubleOrNull()?.let { SqlCell.DoubleVal(it) } ?: SqlCell.StringVal(cell)
                         SqlCellKind.BOOL -> SqlCell.BoolVal(cell == "1" || cell == "true")
                         SqlCellKind.JSON -> SqlCell.JsonVal(cell)
+                        // The base64 text stays a string; its VARBINARY column makes getBytes decode it.
                         else -> SqlCell.StringVal(cell)
                     }
                 },
             )
         }
+    }
+
+    /** Which columns hold binary cells (CellKindBytes): the ResultSet reads those as VARBINARY. */
+    private fun binaryColumns(
+        width: Int,
+        rows: List<List<String>>,
+        kinds: String?,
+    ): BooleanArray {
+        val out = BooleanArray(width)
+        if (kinds == null) return out
+        var k = 0
+        for (row in rows) {
+            for (c in row.indices) {
+                if (k < kinds.length && kinds[k] - '0' == SqlCellKind.BYTES && c < width) out[c] = true
+                k++
+            }
+        }
+        return out
     }
 
     override fun setTransactionIsolation(level: Int) {
@@ -264,8 +395,14 @@ public class KdbRemoteConnection(
     override fun getWarnings(): SQLWarning? = null
     override fun clearWarnings() {}
     override fun nativeSQL(sql: String): String = sql
-    override fun <T> unwrap(iface: Class<T>): T = throw SQLFeatureNotSupportedException()
-    override fun isWrapperFor(iface: Class<*>): Boolean = false
+    override fun <T> unwrap(iface: Class<T>): T =
+        when {
+            iface.isInstance(this) -> iface.cast(this)
+            iface == KdbAttachments::class.java -> iface.cast(attachments)
+            else -> throw SQLException("not a wrapper for ${iface.name}")
+        }
+
+    override fun isWrapperFor(iface: Class<*>): Boolean = iface.isInstance(this) || iface == KdbAttachments::class.java
     override fun abort(executor: Executor?) { close() }
     override fun setNetworkTimeout(executor: Executor?, milliseconds: Int) {}
     override fun getNetworkTimeout(): Int = 0

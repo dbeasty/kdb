@@ -16,6 +16,8 @@ export type ErrorCode =
   | "SCHEMA_VIOLATION"
   | "UNIQUE_VIOLATION"
   | "UNAUTHORIZED"
+  | "UNSUPPORTED"
+  | "INTEGRITY"
   | "INTERNAL";
 
 export interface KdbErrorOptions {

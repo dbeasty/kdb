@@ -41,7 +41,7 @@ for native servers, the CLI, `database/sql`, WASM, and mobile bindings.
 | CLI persistence (`--data-dir`) | Kotlin & Go: `put` / `get` / `query` survive separate CLI invocations (delta log + SERVER engine); Go uses `flock` on `{dataDir}/.kdb.lock` while open |
 | Published Maven / npm artifacts | Not yet; use Gradle composite build or project dependency from source |
 | Full git-style CLI (branch, merge, `schema migrate`, …) | Specified in [§11](kdb-spec.md#11-cli-interface); not in v1 CLI |
-| **File attachments** (`file put` / `get` / `meta`, ZIP, bundles, `fileId` GUID) | Implemented — see [file attachments spec](kdb-spec-layer1-component3b-file-attachments.md) |
+| **Attachments** — binary files on records, several per record, by ID or name | Go: embed API, SQL, wire + Go/TS/JDBC clients, peer sync, backups. Kotlin engine: model and embed API. See [Attachments](#attachments). (The earlier `blobHash` file records migrate with `kdb file migrate`.) |
 | **Stored procedures** (`:kdb-script`, `go/kdb/script`, sandboxed JS) | Reachable as **conflict resolvers** on the Go server — replicated definitions, a `procedure` chain rule and a procedure-backed resolver authority (see [Deciding conflicts with your own code](#deciding-conflicts-with-your-own-code)). As a general-purpose callable API still library-level: no wire protocol frame or CLI subcommand — see [Component 32 spec](kdb-spec-layer11-component32-stored-procedures.md) |
 
 ---
@@ -636,6 +636,70 @@ Things that commonly surprise people (full list in
   coercing — compare like with like.
 - Reads resolve a commit, but documents are materialised from current committed state; exact
   point-in-time document reconstruction is a known gap.
+
+## Attachments
+
+A record (document) can carry any number of binary **attachments** - photos, PDFs, archives of any
+size. Each has a permanent **ID** (a UUID) and a **name** unique within its record (the ID's
+string form if none is given); either one refers to it. Attachments never touch the record's JSON
+or its content hash, commit atomically with it, and are versioned with it: a read as of a commit
+gets the attachments as of that commit. Reading an attachment takes the record's read permission,
+changing one its write permission.
+
+Bytes are identified by a Merkle hash over 1 MiB chunks and checked chunk by chunk as they are
+read; reads stream (nothing is held whole in memory) and finish on the version they started on even
+if a newer one commits meanwhile - the reader is told it was superseded. There is no size limit by
+default (`attachstore.Config.MaxBytes`).
+
+**SQL**
+
+```sql
+INSERT INTO docs (title) VALUES ('report')
+  WITH ATTACHMENT 'report.pdf' = ? MIME 'application/pdf', ATTACHMENT 'thumb.png' = X'89504e47...';
+UPDATE docs SET ATTACHMENT 'report.pdf' = STREAM ?            -- replace (keeps the ID and type)
+  WHERE title = 'report';
+UPDATE docs RENAME ATTACHMENT 'thumb.png' TO 'cover.png', DROP ATTACHMENT ID '0b6f3c1e-...';
+SELECT title, _attachments, ATTACHMENT_COUNT(), ATTACHMENT_SIZE('report.pdf') FROM docs;
+SELECT ATTACHMENT('cover.png') FROM docs WHERE title = 'report';   -- bytes, up to 16 MiB
+```
+
+Bytes are `X'hex'`, `FROM_BASE64('...')`, a string, a bytes parameter, or `STREAM ?` bound to a
+blob uploaded beforehand (how large files go: the statement never carries them). `_attachments`
+is a JSON array of `{id, name, size, mime, hash}`.
+
+**Clients**
+
+- Go (`go/kdb/client`): `PutAttachment`, `OpenAttachment` (an `io.Reader`), `ReadAttachment`,
+  `ListAttachments`, `RenameAttachment`, `DeleteAttachment`, `UploadAttachment` (+ `ResumeUpload`),
+  `Transaction.Attachments`; SQL parameters `client.Bytes` and `client.Blob`.
+- TypeScript (`@kdb/client`): `putAttachment`, `getAttachment`, `readAttachment`,
+  `listAttachments`, `uploadAttachment`, `renameAttachment`, `deleteAttachment`.
+- JDBC: `setBytes`, `setBinaryStream` / `setBlob` (uploaded, then bound), `getBytes` /
+  `getBinaryStream` / `getBlob`; `conn.unwrap(KdbAttachments.class)` for the attachment API.
+- Embedded Go (`embed`): `PutAttachment`, `GetAttachment`, `ListAttachments`, ... and
+  `SetAttachmentHistory(AttachmentHistoryAll | AttachmentHistoryLatest)`.
+
+**Command line**
+
+```bash
+kdb file put myapp/docs <docId> ./report.pdf --mime application/pdf
+kdb file ls myapp/docs <docId>
+kdb file get myapp/docs <docId> report.pdf -o out.pdf
+kdb file rm myapp/docs <docId> report.pdf
+kdb file migrate myapp/docs --dry-run      # earlier blobHash file records -> attachments
+```
+
+**Storage and history.** Large attachments are stored as their own segments, small ones inline;
+replaced versions are kept as deltas against the next version when small. With history `Latest`,
+only the attachments branch and tag heads reference are kept. Backups include attachments
+(incremental backups re-upload only new ones) and restores bring them back.
+
+**Replication and upgrades.** Peers move the bytes themselves (verified per chunk). Every node must
+run a build with attachments before the first one is written: a node of an older build is refused
+commits carrying attachments (it keeps serving what it has) until it is upgraded. Downgrading after
+attachments exist is not possible - an older build refuses to open the data directory. Do **not**
+run an older build's `kdb-inspect repair-segments` on such a log: it would quarantine commits it
+merely cannot decode.
 
 ---
 

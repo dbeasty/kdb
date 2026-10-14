@@ -7,6 +7,7 @@ import dev.kdb.dag.CommitDag
 import dev.kdb.dag.CommitDiff
 import dev.kdb.dag.CommitRef
 import dev.kdb.dag.TraversalEntry
+import dev.kdb.document.AttachmentTable
 import dev.kdb.document.CommitStub
 import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbBranch
@@ -148,6 +149,10 @@ internal class PersistingCommitDag(
         persistence.persist(commit)
         return commit
     }
+
+    override suspend fun attachmentTableAt(commit: KdbHash): AttachmentTable = delegate.attachmentTableAt(commit)
+
+    override suspend fun seedAttachmentTable(table: AttachmentTable) = delegate.seedAttachmentTable(table)
 
     override suspend fun compactableBefore(
         boundary: KdbHash,

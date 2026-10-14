@@ -14,7 +14,9 @@ package recovery
 
 import (
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/storage/attachstore"
 	"sort"
+	"strings"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -100,6 +102,9 @@ func HybridRestore(sources []Source, namespaceID string, comp storage.Compressio
 	if _, err := writer.Seal(); err != nil {
 		return nil, fmt.Errorf("sealing restored log: %w", err)
 	}
+	if err := restoreAttachmentSegments(sources, namespaceID, out); err != nil {
+		return nil, err
+	}
 
 	sort.Strings(used)
 	return &Result{
@@ -159,4 +164,44 @@ func topologicalOrder(union map[string]document.Commit, genesis codec.Hash) (ord
 	}
 	sort.Strings(missing)
 	return ordered, missing
+}
+
+// restoreAttachmentSegments copies the attachment store's segments (storage/attachstore) from the
+// sources, each name once: they are written once and never changed, so any source holding a name
+// holds its bytes. Collection on the restored namespace removes whatever no commit references.
+func restoreAttachmentSegments(sources []Source, namespaceID string, out storage.PlatformIOShim) error {
+	prefix := attachstore.SegmentPrefix(namespaceID)
+	done := map[string]bool{}
+	for _, src := range sources {
+		names, err := src.Shim.ListSegments(namespaceID)
+		if err != nil {
+			return fmt.Errorf("listing attachment segments of %q: %w", src.Label, err)
+		}
+		for _, name := range names {
+			if !strings.HasPrefix(name, prefix) || done[name] {
+				continue
+			}
+			for off := int64(0); ; {
+				data, err := src.Shim.ReadFromSegment(name, off, 16<<20)
+				if err != nil {
+					return fmt.Errorf("reading attachment segment %s from %q: %w", name, src.Label, err)
+				}
+				if len(data) == 0 {
+					break
+				}
+				if _, err := out.AppendToSegment(name, data); err != nil {
+					return err
+				}
+				off += int64(len(data))
+			}
+			if err := out.FlushSegment(name); err != nil {
+				return err
+			}
+			if err := out.SealSegment(name); err != nil {
+				return err
+			}
+			done[name] = true
+		}
+	}
+	return nil
 }

@@ -196,6 +196,10 @@ func filterView(filter sql.Expr, ops []document.Op) []document.Op {
 			out = append(out, o)
 		case document.DeleteOp:
 			out = append(out, o)
+		case document.AttachmentPutOp, document.AttachmentDeleteOp:
+			// Attachment changes carry no body to filter on; they pass, and the read check that
+			// follows still decides whether the subscriber may see their document.
+			out = append(out, o)
 		}
 	}
 	return out
@@ -251,24 +255,44 @@ func (h *StreamHub) sendCommit(sub *registeredSubscriber, e *fanoutEntry) error 
 // itself is returned, unchanged and uncopied.
 func (h *StreamHub) readChecked(sub *registeredSubscriber, ops []document.Op) (own []document.Op, denied bool) {
 	authz := h.runtime.AuthEngine.Authorizer()
+	canRead := func(id codec.UUID) bool {
+		return authz.Authorize(context.Background(), sub.principal, auth.DocumentReadAction{Namespace: h.namespaceID, DocID: id.String()}) == nil
+	}
 	for i, op := range ops {
-		w, ok := op.(document.WriteOp)
-		if !ok {
-			continue
-		}
-		if authz.Authorize(context.Background(), sub.principal, auth.DocumentReadAction{Namespace: h.namespaceID, DocID: w.DocID.String()}) == nil {
+		var replacement document.Op
+		switch o := op.(type) {
+		case document.WriteOp:
+			if canRead(o.DocID) {
+				continue
+			}
+			replacement = document.DeleteOp{DocID: o.DocID}
+		case document.AttachmentPutOp:
+			if canRead(o.DocID) {
+				continue
+			}
+		case document.AttachmentDeleteOp:
+			if canRead(o.DocID) {
+				continue
+			}
+		default:
 			continue
 		}
 		if !denied {
 			own = append(make([]document.Op, 0, len(ops)), ops...)
 			denied = true
 		}
-		own[i] = document.DeleteOp{DocID: w.DocID}
+		own[i] = replacement // nil: an attachment change of a document sub may not read, dropped below
 	}
 	if !denied {
 		return ops, false
 	}
-	return own, true
+	kept := own[:0]
+	for _, op := range own {
+		if op != nil {
+			kept = append(kept, op)
+		}
+	}
+	return kept, true
 }
 
 // sendFrames sends each of frames to sub under a correlation id of its own. frames may be shared
