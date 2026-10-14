@@ -142,6 +142,44 @@ class NetworkWebSocketWireTransportTest {
         return wire.encode(hs)
     }
 
+    /** Two listeners on one fixed port at different paths (kdb-service's peer sync and stream):
+     * the second used to fail to bind; now each path reaches its own handler, and the port is
+     * released once both stop. */
+    @Test
+    fun twoListenersShareAFixedPortByPath() =
+        runBlocking {
+            val port = java.net.ServerSocket(0).use { it.localPort }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            fun answer(cid: Int): suspend (dev.kdb.stream.WireConnection) -> Unit =
+                { conn ->
+                    conn.incoming().collect {
+                        conn.send(wire.encode(hello(cid)))
+                    }
+                }
+            val a = scope.launch { transport.listen("kdb-ws://127.0.0.1:$port/kdb?bind=true", dev.kdb.transport.core.TransportConnectOptions(), answer(1)) }
+            delay(200)
+            val b = scope.launch { transport.listen("kdb-ws://127.0.0.1:$port/kdb/stream?bind=true", dev.kdb.transport.core.TransportConnectOptions(), answer(2)) }
+            delay(200)
+            for ((path, cid) in listOf("/kdb" to 1, "/kdb/stream" to 2)) {
+                val client = transport.connect("kdb-ws://127.0.0.1:$port$path")
+                client.send(wire.encode(hello(9)))
+                assertEquals(cid, wire.decode(waitForFrame(client)).header.correlationId, path)
+                client.close()
+            }
+            a.cancel()
+            b.cancel()
+            a.join()
+            b.join()
+            java.net.ServerSocket(port).close() // released
+            scope.cancel()
+        }
+
+    private fun hello(cid: Int) =
+        WireMessage.Handshake(
+            WireHeader(WireMessageType.HANDSHAKE, KDB_WIRE_PROTOCOL_VERSION, cid, 0),
+            HandshakePayload(nodeId = "n", namespaces = listOf("demo"), localHeads = emptyMap(), clientMode = WireClientMode.FULL_PEER),
+        )
+
     private suspend fun awaitServerPort(server: JvmNetworkWebSocketServer) {
         repeat(500) {
             if (server.port != 0) return

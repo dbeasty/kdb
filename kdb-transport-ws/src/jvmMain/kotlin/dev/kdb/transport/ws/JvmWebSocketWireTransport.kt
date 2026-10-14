@@ -13,6 +13,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 public class JvmWebSocketWireTransport : WebSocketWireTransport {
     private var networkServer: JvmNetworkWebSocketServer? = null
@@ -52,9 +54,8 @@ public class JvmWebSocketWireTransport : WebSocketWireTransport {
         }
         val parsed = WebSocketTransportUriParser.parse(uri)
         require(parsed.query["bind"] == "true") { "listen URI requires bind=true: $uri" }
-        val server = JvmNetworkWebSocketServer(options = options, secure = parsed.secure)
-        networkServer = server
-        server.start(parsed.host, parsed.port, parsed.path) { conn ->
+        val path = parsed.path.ifEmpty { "/" }
+        val route: suspend (WireConnection) -> Unit = { conn ->
             listenScope.launch {
                 try {
                     handler(conn)
@@ -65,10 +66,57 @@ public class JvmWebSocketWireTransport : WebSocketWireTransport {
                 }
             }
         }
+        val (server, key) = SharedServers.acquire(parsed.host, parsed.port, path, parsed.secure, options, route)
+        networkServer = server
         try {
             awaitCancellation()
         } finally {
-            server.stop()
+            SharedServers.release(key, server, path)
+        }
+    }
+
+    /**
+     * Network servers by bound host:port. A second listen on a fixed host:port another listener
+     * already serves - at another path - adds its path to that server rather than binding the port
+     * again (which failed: kdb-service's peer sync at /kdb and its stream at /kdb/stream share a
+     * port by default). Port 0 always binds a server of its own.
+     */
+    private object SharedServers {
+        private val mutex = Mutex()
+        private val servers = HashMap<String, JvmNetworkWebSocketServer>()
+
+        suspend fun acquire(
+            host: String,
+            port: Int,
+            path: String,
+            secure: Boolean,
+            options: TransportConnectOptions,
+            route: suspend (WireConnection) -> Unit,
+        ): Pair<JvmNetworkWebSocketServer, String?> =
+            mutex.withLock {
+                val key = if (port == 0) null else "$host:$port"
+                key?.let { servers[it] }?.let { existing ->
+                    existing.addRoute(path, route)
+                    return@withLock existing to key
+                }
+                val server = JvmNetworkWebSocketServer(options = options, secure = secure)
+                server.start(host, port, path, route)
+                if (key != null) servers[key] = server
+                server to key
+            }
+
+        suspend fun release(
+            key: String?,
+            server: JvmNetworkWebSocketServer,
+            path: String,
+        ) {
+            val stop =
+                mutex.withLock {
+                    val left = server.removeRoute(path)
+                    if (left == 0 && key != null && servers[key] === server) servers.remove(key)
+                    left == 0
+                }
+            if (stop) server.stop()
         }
     }
 }
