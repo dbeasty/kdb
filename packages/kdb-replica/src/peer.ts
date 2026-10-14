@@ -13,6 +13,7 @@
 import { connectWebSocket, decodeFrame, encodeFrame, type Transport } from "@kdb/client";
 import { decodeCommitList, encodeCommitList, type Commit } from "./commit.ts";
 import type { ProjectPage, WriteBackDoc } from "./projection.ts";
+import { zstdDecompress as zstdDecompressPortable } from "./zstd.ts";
 
 export const MSG = {
   PEER_ERROR: 0x25,
@@ -36,6 +37,9 @@ export const MSG = {
   PROJECT_WRITE_RESULT: 0x33,
   SQUASH_HEAD: 0x40,
   SQUASH_HEAD_RESULT: 0x41,
+  /** Client replica codes (0x50-0x57 reserved): watch refs, and the host's reports. */
+  REFS_WATCH: 0x50,
+  REFS_CHANGED: 0x51,
 } as const;
 
 const KIND_BY_CODE: Record<number, string> = {
@@ -49,6 +53,7 @@ const KIND_BY_CODE: Record<number, string> = {
   [MSG.SQUASH_HEAD]: "squashHead",
   [MSG.PROJECT_FETCH]: "projectFetch",
   [MSG.PROJECT_WRITE]: "projectWrite",
+  [MSG.REFS_WATCH]: "refsWatch",
 };
 
 export const SYNC_PROTOCOL_VERSION = 2;
@@ -101,8 +106,11 @@ export function fromBase64(s: string | undefined | null): Uint8Array {
 
 // --- zstd ----------------------------------------------------------------------------------------
 
-/** Node's zstd decoder when the runtime has one (22.15+); packs are only compressed if offered. */
-const zstdDecompress: ((data: Uint8Array) => Uint8Array) | null = (() => {
+/**
+ * zstd for packs: Node's native decoder when the runtime has one (22.15+), else the TS port of
+ * kdb-compression's decoder (zstd.ts), so browsers get compressed packs too (plan D11).
+ */
+const nativeZstd: ((data: Uint8Array) => Uint8Array) | null = (() => {
   const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
   const zlib = proc?.getBuiltinModule?.("node:zlib") as
     | { zstdDecompressSync?: (d: Uint8Array, o?: { maxOutputLength?: number }) => Uint8Array }
@@ -110,17 +118,20 @@ const zstdDecompress: ((data: Uint8Array) => Uint8Array) | null = (() => {
   const fn = zlib?.zstdDecompressSync;
   if (typeof fn !== "function") return null;
   return (d) => {
-    const out = fn(d, { maxOutputLength: 256 << 20 });
+    const out = fn(d, { maxOutputLength: MAX_PACK_PAYLOAD });
     return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
   };
 })();
 
-export const canDecodeZstd = zstdDecompress !== null;
+/** The most a pack's commits may inflate to (go/kdb/wire maxPackPayload). */
+const MAX_PACK_PAYLOAD = 256 << 20;
+
+const zstdDecompress = nativeZstd ?? ((d: Uint8Array) => zstdDecompressPortable(d, MAX_PACK_PAYLOAD));
+
 
 function commitsFrom(payload: string | undefined, zstd: boolean | undefined): Commit[] {
   let bytes = fromBase64(payload);
   if (zstd) {
-    if (!zstdDecompress) throw new ProtocolError("kdb replica: the peer sent a zstd pack this runtime cannot decode");
     bytes = zstdDecompress(bytes);
   }
   return decodeCommitList(bytes);
@@ -145,6 +156,8 @@ export class PeerConnection {
   readonly #timeoutMs: number;
   readonly #pending = new Map<number, { resolve: (e: Envelope) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   #next = 1;
+  #watch: { id: number; onChange: (refs: NamespaceRefs[]) => void } | null = null;
+  #closeHandlers: ((cause: Error) => void)[] = [];
   #closed: Error | null = null;
   caps: string[] = [];
   remoteNodeId = "";
@@ -162,8 +175,7 @@ export class PeerConnection {
     const t = await (opts.connect ?? ((u) => connectWebSocket(u)))(url);
     const conn = new PeerConnection(t, opts.timeoutMs ?? 30_000);
     try {
-      const caps = ["snapshot", "repair", "squash", "filter", "writeback"];
-      if (canDecodeZstd) caps.push("zstd-pack");
+      const caps = ["snapshot", "repair", "squash", "filter", "writeback", "watch", "zstd-pack"];
       const hello: Record<string, unknown> = {
         nodeId: opts.nodeId, protocol: SYNC_PROTOCOL_VERSION, capabilities: caps, namespaces: opts.namespaces,
       };
@@ -189,7 +201,19 @@ export class PeerConnection {
       return;
     }
     const p = this.#pending.get(decoded.header.correlationId);
-    if (!p) return;
+    if (!p) {
+      // An unasked REFS_CHANGED, under the watch's correlation id.
+      const env = decoded.envelope as Envelope;
+      if (this.#watch && decoded.header.correlationId === this.#watch.id && env.kind === "refsChanged") {
+        const refs = ((env.refsChanged as { refs?: NamespaceRefs[] } | undefined)?.refs) ?? [];
+        try {
+          this.#watch.onChange(refs);
+        } catch {
+          // the listener's failure is its own
+        }
+      }
+      return;
+    }
     this.#pending.delete(decoded.header.correlationId);
     clearTimeout(p.timer);
     p.resolve(decoded.envelope as Envelope);
@@ -203,6 +227,18 @@ export class PeerConnection {
       p.reject(err);
     }
     this.#pending.clear();
+    for (const h of this.#closeHandlers) h(err);
+  }
+
+  /** Whether the connection has ended. */
+  get closed(): boolean {
+    return this.#closed !== null;
+  }
+
+  /** Called once when the connection ends, for whatever reason. */
+  onClose(handler: (cause: Error) => void): void {
+    if (this.#closed) handler(this.#closed);
+    else this.#closeHandlers.push(handler);
   }
 
   /** Sends one request and returns the body of its reply, which must be of kind `expect`. */
@@ -247,6 +283,17 @@ export class PeerConnection {
 
   async refs_(namespaces: string[]): Promise<NamespaceRefs[]> {
     const r = await this.request(MSG.REFS_REQUEST, { namespaces }, "refsResult");
+    return (r.refs as NamespaceRefs[] | undefined) ?? [];
+  }
+
+  /**
+   * Watches namespaces (REFS_WATCH): returns their refs now, then calls onChange with the refs of
+   * those that move, until the connection ends. Replaces any earlier watch on this connection.
+   */
+  async watch(namespaces: string[], onChange: (refs: NamespaceRefs[]) => void): Promise<NamespaceRefs[]> {
+    const id = this.#next; // the request's correlation id, which the host's reports reuse
+    this.#watch = { id, onChange };
+    const r = await this.request(MSG.REFS_WATCH, { namespaces }, "refsChanged");
     return (r.refs as NamespaceRefs[] | undefined) ?? [];
   }
 

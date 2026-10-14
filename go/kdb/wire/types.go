@@ -132,6 +132,10 @@ const (
 	MsgAttachmentList         MessageType = 0x48
 	MsgAttachmentListResult   MessageType = 0x49
 
+	// Client replica (docs/kdb-client-replica-plan.md); 0x50-0x57 are reserved for it.
+	MsgRefsWatch   MessageType = 0x50
+	MsgRefsChanged MessageType = 0x51
+
 	// Aliases for callers using SQL-prefixed names.
 	MsgSQLExec   = MsgSqlExec
 	MsgSQLResult = MsgSqlResult
@@ -285,6 +289,10 @@ func (t MessageType) String() string {
 		return "ATTACHMENT_LIST"
 	case MsgAttachmentListResult:
 		return "ATTACHMENT_LIST_RESULT"
+	case MsgRefsWatch:
+		return "REFS_WATCH"
+	case MsgRefsChanged:
+		return "REFS_CHANGED"
 	default:
 		return "UNKNOWN"
 	}
@@ -438,6 +446,10 @@ func MessageTypeFromCode(code uint16) (MessageType, bool) {
 		return MsgAttachmentList, true
 	case 0x49:
 		return MsgAttachmentListResult, true
+	case 0x50:
+		return MsgRefsWatch, true
+	case 0x51:
+		return MsgRefsChanged, true
 	default:
 		return 0, false
 	}

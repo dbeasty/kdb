@@ -89,6 +89,9 @@ type KdbServerRuntime struct {
 	// notification; existing callers see no behavior change.
 	CommitListener func(namespaceID string, commit document.Commit)
 
+	// headWatch are peer sync sessions watching this namespace's head (WatchHead).
+	headWatch headWatchers
+
 	refCount atomic.Int32
 	closeMu  sync.Mutex
 
@@ -917,6 +920,7 @@ func (s *KdbServerRuntime) runTransaction(tx document.Transaction, principal aut
 		if s.CommitListener != nil {
 			s.CommitListener(s.Runtime.DefaultNamespace, r.Commit)
 		}
+		s.notifyHeadWatchers()
 		return r.Commit, nil
 	case transaction.ResultConflict:
 		// Sampled here, at the moment of failure, rather than when the response is shaped: the

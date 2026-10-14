@@ -35,8 +35,17 @@ export interface ReplicaOptions {
   catchUp?: CatchUp;
   /** Bytes of trie nodes and document bodies kept in memory; the rest is read from the store. */
   memory?: { cacheBytes?: number };
-  /** Milliseconds between sync rounds; 0 syncs only on writes and syncNow(). Default 5000. */
+  /**
+   * Milliseconds between sync rounds; 0 syncs only on writes, changes and syncNow(). Default 5000,
+   * or 60000 while the host is reporting changes (live).
+   */
   pollMs?: number;
+  /**
+   * Keep the connection open between rounds and ask the host to report changes (REFS_WATCH), so
+   * remote writes arrive without waiting for a poll. Default true; a host without the watch
+   * capability is polled.
+   */
+  live?: boolean;
   /** Page size asked of the host, in bytes. */
   pageBytes?: number;
   /** Start syncing at once (default true). */
@@ -254,7 +263,7 @@ export class Replica {
         this.#again = false;
         this.#schedule(0);
       } else {
-        const poll = this.#opts.pollMs ?? 5000;
+        const poll = this.#opts.pollMs ?? (this.#watching ? 60_000 : 5000);
         const backoff = this.#failures > 0 ? Math.min(60_000, 500 * 2 ** Math.min(this.#failures, 7)) : 0;
         if (backoff > 0) this.#schedule(backoff);
         else if (poll > 0) this.#schedule(poll);
@@ -276,14 +285,42 @@ export class Replica {
     }, ms);
   }
 
-  async #round(): Promise<NamespaceSyncResult[]> {
+  /** The open connection, reused across rounds while live; null when there is none. */
+  #conn: PeerConnection | null = null;
+  #watching = false;
+
+  async #connect(): Promise<{ conn: PeerConnection; fresh: boolean }> {
+    if (this.#conn && !this.#conn.closed) return { conn: this.#conn, fresh: false };
     const token = typeof this.#opts.peer.token === "function" ? await this.#opts.peer.token() : this.#opts.peer.token;
-    const nodeId = this.#nodeId;
+    // Filtered namespaces' sources are named too: where the token may also sync one, the host
+    // grants it, and the replica can watch it.
+    const names = [...new Set([...this.#ns.keys(), ...this.#proj.keys()])];
+    const conn = await PeerConnection.open(this.#opts.peer.url, {
+      nodeId: this.#nodeId, token, namespaces: names, connect: this.#opts.peer.connect,
+    });
+    conn.onClose(() => {
+      if (this.#conn === conn) {
+        this.#conn = null;
+        this.#watching = false;
+        this.#status.connected = false;
+        this.#schedule(this.#closed ? 0 : 1000);
+      }
+    });
+    return { conn, fresh: true };
+  }
+
+  get #live(): boolean {
+    return this.#opts.live !== false && this.#opts.autoSync !== false;
+  }
+
+  async #round(): Promise<NamespaceSyncResult[]> {
     let conn: PeerConnection | null = null;
+    let keep = false;
     try {
-      conn = await PeerConnection.open(this.#opts.peer.url, {
-        nodeId, token, namespaces: [...this.#ns.keys()], connect: this.#opts.peer.connect,
-      });
+      const c = await this.#connect();
+      conn = c.conn;
+      // A reused connection's hello refs are stale: ask again.
+      if (!c.fresh) conn.refs = await conn.refs_(conn.refs.map((r) => r.namespace));
       this.#status.connected = true;
       const results: NamespaceSyncResult[] = [];
       const projections: ProjectionSyncResult[] = [];
@@ -332,6 +369,14 @@ export class Replica {
       this.#status.lastError = errors.length > 0 ? errors.join("; ") : null;
       this.#failures = errors.length > 0 ? this.#failures + 1 : 0;
       this.#lastProjections = projections;
+      if (this.#live && conn.has("watch")) {
+        keep = true;
+        this.#conn = conn;
+        if (!this.#watching && conn.refs.length > 0) {
+          this.#watching = true;
+          await conn.watch(conn.refs.map((r) => r.namespace), () => this.#schedule(0));
+        }
+      }
       this.#emit("sync", results);
       if (errors.length > 0) throw new Error(`kdb replica: sync failed for ${errors.join("; ")}`);
       return results;
@@ -340,8 +385,12 @@ export class Replica {
       if (!this.#status.lastError.startsWith("kdb replica: sync failed")) this.#failures++;
       throw e;
     } finally {
-      this.#status.connected = false;
-      await conn?.close();
+      if (!keep) {
+        if (this.#conn === conn) this.#conn = null;
+        this.#watching = false;
+        this.#status.connected = false;
+        await conn?.close();
+      }
     }
   }
 
@@ -349,6 +398,9 @@ export class Replica {
     this.#closed = true;
     if (this.#timer) clearTimeout(this.#timer);
     await this.#running?.catch(() => undefined);
+    const conn = this.#conn;
+    this.#conn = null;
+    await conn?.close();
     await this.#store.close();
   }
 }

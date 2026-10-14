@@ -7,7 +7,8 @@
   Serve the repository root over HTTP (python3 -m http.server --directory <repo>), run
   `go run ./cmd/kdb-replicahost -dir <tmp> -serve -seed shop/browser:20 -seed shop/browser-eu:5` from go/, then open
     /packages/kdb-replica/test/browser/smoke.html?ws=<the host's ws:// URL>
-  It syncs, writes, reloads itself once, and checks the write survived and reached the host.
+  It syncs, writes, reloads itself once, and checks the write survived and reached the host, and
+  that a second replica catches up by replay through a zstd pack decoded in the browser.
   The outcome is in #result and window.smokeResult: {"ok":true,...} or {"ok":false,"error":...}.
 -->
 <script type="importmap">
@@ -28,11 +29,11 @@
     document.getElementById("result").textContent = JSON.stringify(r, null, 2);
   };
 
-  async function open() {
+  async function open(name = dbName, only = false) {
     return openReplica({
-      store: await IndexedDbStore.open(dbName),
+      store: await IndexedDbStore.open(name),
       peer: { url: ws, token: "rw-token" },
-      namespaces: [
+      namespaces: only ? [{ ns }] : [
         { ns },
         { ns: ns + "-eu", mode: "filtered", filter: "region = 'EU'", writeBack: true },
       ],
@@ -44,6 +45,12 @@
     if (!ws) throw new Error("pass ?ws=ws://host:port/kdb/sync");
     if (phase === "1") {
       await IndexedDbStore.destroy(dbName);
+      await IndexedDbStore.destroy(dbName + "-b");
+      // A second replica, bootstrapped now, catches up by replay in phase 2: a FETCH pack, which
+      // the host zstd-compresses and the browser decodes with the TS decoder.
+      const b = await open(dbName + "-b", true);
+      await b.syncNow();
+      await b.close();
       const r = await open();
       const [full] = await r.syncNow();
       const seeded = (await r.scan(ns)).length;
@@ -62,10 +69,14 @@
       const proj = r.lastProjectionResults[0];
       const status = r.status();
       await r.close();
-      const ok = first.seeded === 20 && survived !== undefined && pendingAfterReload === 1 &&
+      const b = await open(dbName + "-b", true);
+      const [caught] = await b.syncNow();
+      const bSurvived = await b.get(ns, marker);
+      await b.close();
+      const ok = caught.route === "replay" && bSurvived === survived && first.seeded === 20 && survived !== undefined && pendingAfterReload === 1 &&
         full.pushOutcome === "fast-forwarded" && status.namespaces[ns].pending === 0 &&
         proj.applied === 1 && status.namespaces[ns + "-eu"].pending === 0;
-      out({ ok, first, survived, pendingAfterReload, pushOutcome: full.pushOutcome, head: status.namespaces[ns].head, writeBackApplied: proj.applied });
+      out({ ok, secondReplicaRoute: caught.route, first, survived, pendingAfterReload, pushOutcome: full.pushOutcome, head: status.namespaces[ns].head, writeBackApplied: proj.applied });
     }
   } catch (e) {
     out({ ok: false, error: String(e && e.stack || e) });

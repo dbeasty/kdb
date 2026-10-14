@@ -165,6 +165,28 @@ describe("replica against a Go node", { skip }, () => {
     await assert.rejects(ro.syncNow(), /read-only/);
   });
 
+  test("live: a host write reaches the replica by REFS_WATCH, with no poll", async () => {
+    const ns = "app/u/live";
+    await host.put(ns, randomUuid(), { v: 1 });
+    const r = await replica(ns, { autoSync: true, pollMs: 3_600_000 });
+    const until = async (what: string, ok: () => Promise<boolean>) => {
+      for (let i = 0; i < 100; i++) {
+        if (await ok()) return;
+        await new Promise((res) => setTimeout(res, 50));
+      }
+      assert.fail(`timed out waiting for ${what}`);
+    };
+    await until("the first sync", async () => r.namespace(ns).head === (await host.head(ns)).head);
+    const id = randomUuid();
+    await host.put(ns, id, { pushed: "live" });
+    await until("the host's write to arrive", async () => (await r.get(ns, id)) !== undefined);
+    assert.equal(r.status().connected, true, "the connection stays open while live");
+    // And a local write goes up without a poll either.
+    const mine = randomUuid();
+    await r.put(ns, mine, { from: "replica" });
+    await until("the replica's write to reach the host", async () => (await host.docs(ns))[mine] !== undefined);
+  });
+
   test("a namespace larger than the cache syncs within the cache's budget", async () => {
     const ns = "app/u/big";
     const body = { pad: "y".repeat(300) };
