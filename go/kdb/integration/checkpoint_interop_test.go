@@ -584,3 +584,125 @@ func skipWithoutMmap(t *testing.T) {
 		t.Skip("needs mapped tree/graph segments, which this platform does not write")
 	}
 }
+
+// TestKotlinReadsGoAttachmentsAfterACheckpointOpen: after opening from Go's checkpoint (v5 or v6:
+// a namespace with attachments), Kotlin's attachment tables and bytes must be Go's - at main's head,
+// whose table the checkpoint seeds, and at older commits, whose tables Kotlin rebuilds by loading
+// those commits' operations from the log (the checkpoint carries none). Go attaches, replaces,
+// renames and deletes across several commits, with plain document writes between them so the older
+// commits are no branch's head.
+func TestKotlinReadsGoAttachmentsAfterACheckpointOpen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the Kotlin CLI through gradle")
+	}
+	repo := findRepoRoot(t)
+	root, want := t.TempDir(), newCPDoc()
+	rt, s := openCP(t, root, cpOptions(nil))
+	ids := seedDocs(t, s, want, 12, 4)
+	docA, docB := ids[2], ids[3]
+	bytesOf := func(n, seed int) []byte {
+		b := make([]byte, n)
+		x := uint32(seed*2654435761 + 1)
+		for i := range b {
+			x ^= x << 13
+			x ^= x >> 17
+			x ^= x << 5
+			b[i] = byte(x)
+		}
+		return b
+	}
+	idA, idB := randomID(t), randomID(t)
+	var commits []codec.Hash
+	step := func(c codec.Hash, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		commits = append(commits, c)
+		// A plain write after every attachment change: the change's commit is no head afterwards.
+		writeBatch(t, s, want, map[codec.UUID]string{ids[0]: fmt.Sprintf(`{"after":%d}`, len(commits))})
+	}
+	put := func(doc, id codec.UUID, name string, b []byte) (codec.Hash, error) {
+		c, _, err := rt.PutAttachment(cpNS, doc, bytes.NewReader(b), embed.PutAttachmentOptions{ID: id, Name: name, Mime: "application/octet-stream"})
+		return c, err
+	}
+	step(put(docA, idA, "a.txt", []byte("small attachment, version one")))
+	step(put(docB, idB, "b.bin", bytesOf(3<<20, 1))) // several chunks
+	step(put(docA, idA, "a.txt", []byte("small attachment, version two - replaced")))
+	step(put(docA, randomID(t), "second.txt", bytesOf(70_000, 2)))
+	c, _, err := rt.RenameAttachment(cpNS, docB, embed.AttachmentByID(idB), "renamed.bin")
+	step(c, err)
+	step(rt.DeleteAttachment(cpNS, docA, embed.AttachmentByName("second.txt")))
+	head, err := s.PeerIngestEnv().DAG.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commits = append(commits, head)
+
+	type entry struct {
+		name, hash string
+		size       int64
+		bytes      []byte
+	}
+	goTables := map[codec.Hash]map[codec.UUID][]entry{}
+	for _, at := range commits {
+		goTables[at] = map[codec.UUID][]entry{}
+		for _, doc := range []codec.UUID{docA, docB} {
+			infos, err := rt.ListAttachments(cpNS, doc, at)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, in := range infos {
+				b, err := rt.ReadAttachmentBlob(cpNS, in.ContentHash, in.Size)
+				if err != nil {
+					t.Fatal(err)
+				}
+				goTables[at][doc] = append(goTables[at][doc], entry{in.Name, in.ContentHash.Hex(), in.Size, b})
+			}
+			sort.Slice(goTables[at][doc], func(i, j int) bool { return goTables[at][doc][i].name < goTables[at][doc][j].name })
+		}
+	}
+	rt.Close()
+
+	out := t.TempDir()
+	fromCheckpoint := false
+	for i, at := range commits {
+		for _, doc := range []codec.UUID{docA, docB} {
+			res := kotlinCLIResult(t, repo, "--data-dir", root, "attach", "list", cpNS, doc.String(), "--at", at.Hex())
+			if res.code != 0 {
+				t.Fatalf("Kotlin attach list at commit %d: exit %d\n%s", i, res.code, tail(res.stderr))
+			}
+			fromCheckpoint = fromCheckpoint || strings.Contains(res.stderr, "opened from its checkpoint")
+			var got []string
+			for _, l := range strings.Split(res.stdout, "\n") {
+				if strings.Count(l, "\t") == 2 {
+					got = append(got, l)
+				}
+			}
+			var wantLines []string
+			for _, e := range goTables[at][doc] {
+				wantLines = append(wantLines, fmt.Sprintf("%s\t%s\t%d", e.name, e.hash, e.size))
+			}
+			if strings.Join(got, "\n") != strings.Join(wantLines, "\n") {
+				t.Fatalf("commit %d (%s), document %s: Kotlin's attachments\n%s\nGo's\n%s",
+					i, at.Hex()[:12], doc, strings.Join(got, "\n"), strings.Join(wantLines, "\n"))
+			}
+			for _, e := range goTables[at][doc] {
+				path := filepath.Join(out, fmt.Sprintf("%d-%s-%s", i, doc, e.name))
+				res := kotlinCLIResult(t, repo, "--data-dir", root, "attach", "get", cpNS, doc.String(), e.name, path, "--at", at.Hex())
+				if res.code != 0 {
+					t.Fatalf("Kotlin attach get %s at commit %d: exit %d\n%s", e.name, i, res.code, tail(res.stderr))
+				}
+				b, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(b, e.bytes) {
+					t.Fatalf("Kotlin read %d bytes of %s at commit %d, Go holds %d (%v)", len(b), e.name, i, len(e.bytes), err)
+				}
+			}
+		}
+	}
+	if !fromCheckpoint {
+		t.Fatal("Kotlin never said it opened from the checkpoint")
+	}
+	// The document bodies too, and the open's format.
+	requireCheckpointOpen(t, checkKotlinReads(t, repo, root, want), 5, 6)
+}

@@ -7,6 +7,7 @@ import dev.kdb.document.DocumentTree
 import dev.kdb.document.KdbCommit
 import dev.kdb.document.KdbOp
 import dev.kdb.document.KdbTransaction
+import dev.kdb.document.attachmentContentHash
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -101,5 +102,51 @@ class CheckpointRestoreTest {
             assertFailsWith<DagConsistencyException> {
                 dag.putShallowCommit(commits[1].copy(message = "not its hash"))
             }
+        }
+
+    @Test
+    fun anOlderCommitsAttachmentTableIsRebuiltFromLoadedOperations() =
+        runTest {
+            // Attachment changes, then plain writes: the changes' commits are no head, so the
+            // checkpoint seeds only the head's table and the older ones must be replayed.
+            val source = inMemoryCommitDag("app/t")
+            val doc = KdbUuid.random()
+            val att = KdbUuid.random()
+            val v1 = attachmentContentHash("one".encodeToByteArray())
+            val v2 = attachmentContentHash("two!".encodeToByteArray())
+            val made = mutableListOf<KdbCommit>()
+            for ((i, ops) in listOf(
+                listOf(KdbOp.Write(doc, """{"d":1}"""), KdbOp.AttachmentPut(doc, att, "a.txt", 1, v1, 3, "")),
+                listOf(KdbOp.AttachmentPut(doc, att, "a.txt", 1, v2, 4, "")),
+                listOf(KdbOp.Write(doc, """{"d":2}""")),
+            ).withIndex()) {
+                val head = source.head()
+                made += source.appendCommit(
+                    KdbTransaction(KdbUuid.random(), head, ops, KdbTimestamp(1_700_000_000_000L + i), KdbUuid.random()),
+                    head,
+                    DocumentTree.EMPTY,
+                    null,
+                )
+            }
+            val want = made.map { source.attachmentTableAt(it.hash) }
+
+            val dag = inMemoryCommitDag("app/t")
+            val r = dag as CheckpointRestorableDag
+            r.setOperationsLoader { h -> made.firstOrNull { it.hash == h } }
+            r.restoreCheckpoint(made.asSequence().map { stripped(it) }, source.listBranches(), emptyList())
+            r.restoreCommitOperations(listOf(made.last()))
+            dag.seedAttachmentTable(want.last())
+            assertEquals(2, r.commitsWithoutOperations())
+            for ((i, c) in made.withIndex()) {
+                val got = dag.attachmentTableAt(c.hash)
+                assertEquals(want[i].root, got.root, "commit $i")
+                assertEquals(want[i].list(doc), got.list(doc), "commit $i")
+            }
+            assertEquals(v1, dag.attachmentTableAt(made[0].hash).list(doc).single().contentHash)
+
+            // With no way to load them, the older table is an error - never one built from no operations.
+            val blind = inMemoryCommitDag("app/t") as CheckpointRestorableDag
+            blind.restoreCheckpoint(made.asSequence().map { stripped(it) }, source.listBranches(), emptyList())
+            assertFailsWith<DagConsistencyException> { (blind as CommitDag).attachmentTableAt(made[0].hash) }
         }
 }

@@ -3,6 +3,7 @@ package dev.kdb.cli
 import dev.kdb.codec.KdbHash
 import dev.kdb.codec.KdbTimestamp
 import dev.kdb.codec.KdbUuid
+import dev.kdb.dag.CommitRef
 import dev.kdb.dag.TraversalEntry
 import dev.kdb.query.hybrid.HybridQueryRequest
 import dev.kdb.schema.KdbSchema
@@ -134,6 +135,7 @@ internal object CliCommands {
         openCliRuntime(config, cmd.namespace).use { rt ->
             val runtime = rt.embedded
             val docId = KdbUuid.fromString(cmd.args[0])
+            val asOf = cmd.at?.let { runtime.dag.resolveRefOrThrow(CommitRef.ByHash(it)) }
             when (cmd.action) {
                 "put" -> {
                     val bytes = Path.of(cmd.args[2]).toFile().readBytes()
@@ -150,7 +152,7 @@ internal object CliCommands {
                     }
                 }
                 "get" -> {
-                    val read = runtime.getAttachment(cmd.namespace, docId, AttachmentSelector.ByName(cmd.args[1]))
+                    val read = runtime.getAttachment(cmd.namespace, docId, AttachmentSelector.ByName(cmd.args[1]), asOf)
                     try {
                         Path.of(cmd.args[2]).toFile().outputStream().use { out ->
                             val buf = ByteArray(1 shl 20)
@@ -165,7 +167,7 @@ internal object CliCommands {
                     }
                 }
                 else ->
-                    for (a in runtime.listAttachments(cmd.namespace, docId)) {
+                    for (a in runtime.listAttachments(cmd.namespace, docId, asOf)) {
                         println("${a.name}\t${a.contentHash.toHex()}\t${a.size}")
                     }
             }

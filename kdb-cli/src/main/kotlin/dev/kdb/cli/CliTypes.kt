@@ -94,7 +94,13 @@ internal sealed class CoreCliCommand : CliCommand {
     data class Sync(val namespace: String, val peerUri: String) : CoreCliCommand()
 
     /** `attach put|get|list`: a document's attachments (docs/kdb-attachments-plan.md). */
-    data class Attach(val action: String, val namespace: String, val args: List<String>) : CoreCliCommand()
+    data class Attach(
+        val action: String,
+        val namespace: String,
+        val args: List<String>,
+        /** `--at <commit>` (a hash or a prefix of 7+ hex digits): read the table as of that commit. */
+        val at: String? = null,
+    ) : CoreCliCommand()
 
     data class Shell(val namespace: String) : CoreCliCommand()
 
@@ -191,11 +197,16 @@ private fun parseCoreArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
             "attach" -> {
                 val usage =
                     "usage: kdb attach put <namespace> <docId> <name> <path> [mime] | " +
-                        "attach get <namespace> <docId> <name> <out-path> | attach list <namespace> <docId>"
-                require(rest.size >= 4) { usage }
-                val need = mapOf("put" to 6, "get" to 6, "list" to 4)[rest[1]] ?: throw IllegalArgumentException(usage)
-                require(rest.size >= need) { usage }
-                CoreCliCommand.Attach(rest[1], rest[2], rest.drop(3))
+                        "attach get <namespace> <docId> <name> <out-path> [--at <commit>] | " +
+                        "attach list <namespace> <docId> [--at <commit>]"
+                val atIx = rest.indexOf("--at")
+                val at = if (atIx >= 0) requireNotNull(rest.getOrNull(atIx + 1)) { usage } else null
+                val plain = if (atIx >= 0) rest.filterIndexed { i, _ -> i != atIx && i != atIx + 1 } else rest
+                require(plain.size >= 4) { usage }
+                val need = mapOf("put" to 6, "get" to 6, "list" to 4)[plain[1]] ?: throw IllegalArgumentException(usage)
+                require(plain.size >= need) { usage }
+                require(at == null || plain[1] != "put") { "attach put writes at main's head; --at is for get and list" }
+                CoreCliCommand.Attach(plain[1], plain[2], plain.drop(3), at)
             }
             "shell" -> {
                 require(rest.size >= 2) { "usage: kdb shell <namespace>" }
