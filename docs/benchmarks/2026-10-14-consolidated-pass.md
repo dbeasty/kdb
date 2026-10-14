@@ -127,3 +127,39 @@ over both sides:
 
 Next for the memory plan: make the snapshot path O(page) in memory on both sides at 10M, and fix the
 bounded-bodies read contention. Then rerun this acceptance.
+
+## 10M acceptance rerun: PASS (main `780697e`, after #257, #258, #266, #276, #277)
+
+```
+KDB_MEMPROFILE_RSS=1 BOOTSTRAP=1 scripts/memory-acceptance.sh   # graph.file + tree.file + bounded bodies
+```
+
+Namespace on disk 3,417 MB; budget (a quarter) 854 MB. Load 3.5-6 (memory figures are not load-sensitive).
+
+| Phase | Peak heap | Live heap | Peak RSS | Verdict | Earlier today |
+|---|---:|---:|---:|---|---:|
+| open | 10.6 MB | 6.5 MB | 40 MB | ok | 10.3 MB |
+| reads (200k point reads) | 270 MB | 48.5 MB | 1,651 MB | ok | 316 MB |
+| fullread (all 10M) | 58 MB | 58 MB | 1,547 MB | ok | 58 MB |
+| writes (20k updates) | 135 MB | 86.5 MB | 552 MB | ok | 141 MB |
+| checkpoint (close) | 43 MB | 2.6 MB | 215 MB | ok | 51 MB |
+| **bootstrap** (empty node installs a snapshot) | **501 MB** | – | – | **ok** (both nodes) | 15,716 MB |
+
+The peer bootstrap at 10M (`TestSnapshotScale`, both nodes in one process):
+
+| | Earlier today | Now |
+|---|---:|---:|
+| peak heap | 15.7 GB | **501 MB** |
+| time | 34 min | **2 m 58 s** |
+| allocated | 94 GB | 52 GB |
+| live afterwards | 3.8 GB | about none (−8.8 MiB) |
+| on the wire | 2.9 GB | 2.9 GB |
+
+What closed it:
+- #266: the receiver writes snapshot bodies straight to the blob store (no pin or admit), and `DocumentTree.WithAll` adds a sorted batch in one pass. The host serves big snapshots from an id-sorted on-disk copy.
+- #276: cuts the bootstrap's transient heap further (904 MB).
+- #277: a tree segment's extern table stays in the mapping instead of a heap copy (141 MB at the peak).
+
+Close leaves the SSTable merge (1.6-1.7 GB of 49 tables) to maintenance or the next open, as designed since #215.
+
+**This closes the memory plan's acceptance:** every phase of one node's life, and a peer bootstrap, stays within a quarter of the data's size at 10M documents.
