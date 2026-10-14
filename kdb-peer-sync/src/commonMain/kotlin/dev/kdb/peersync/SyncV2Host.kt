@@ -1,0 +1,211 @@
+package dev.kdb.peersync
+
+import dev.kdb.auth.AuthAction
+import dev.kdb.auth.AuthEngine
+import dev.kdb.auth.ConnectionAuthSupport
+import dev.kdb.auth.ConnectionContext
+import dev.kdb.auth.KdbAuthorizationException
+import dev.kdb.auth.Principal
+import dev.kdb.codec.KdbHash
+import dev.kdb.wire.WireCodec
+import dev.kdb.wire.WireMessage
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+
+/**
+ * One v2 peer-sync connection, host side (Go's V2Host): SYNC_HELLO, REFS_REQUEST, FETCH_REQUEST,
+ * REF_UPDATE, and the attachment frames BLOB_FETCH and ATTACHMENT_UPLOAD. A Kotlin host holds one
+ * namespace, and grants it when the hello's patterns select it.
+ *
+ * Every request gets a reply; a failure is a PEER_ERROR, never a dropped connection. Only a frame
+ * that cannot be decoded at all throws.
+ */
+internal class SyncV2HostSession(
+    private val wire: WireCodec,
+    private val ns: PeerSyncNamespace,
+    private val nodeId: String,
+    private val auth: AuthEngine,
+    private val connectionContext: ConnectionContext,
+) {
+    private var helloDone = false
+    private var granted = false
+    private var principal: Principal? = null
+    private var zstdPack = false
+    private var peerAttachments = false
+    private var connectionAuth = ConnectionAuthSupport(auth, connectionContext)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val blobs = ns.blobs?.let { BlobHostSession(ns.dag, it, scope) }
+
+    /** Serves one frame - a v2 sync frame or an attachment frame - returning the reply. */
+    suspend fun handleFrame(frame: ByteArray): ByteArray {
+        val code = frameTypeCode(frame)
+        val cid = frameCorrelationId(frame)
+        return try {
+            if (SyncV2.isSyncFrame(code)) {
+                serveSync(SyncV2Codec.decode(frame))
+            } else {
+                serveWire(wire.decode(frame))
+            }
+        } catch (e: SyncV2DecodeException) {
+            throw e
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            SyncV2Codec.encode(SyncV2Message.PeerError(cid, ns.namespaceId, classify(e), e.message ?: e.toString()))
+        }
+    }
+
+    private fun classify(e: Throwable): String =
+        when (e) {
+            is AttachmentsUnsupportedException -> PeerErrorCodes.UNSUPPORTED
+            is UnsupportedFrameException -> PeerErrorCodes.UNSUPPORTED
+            is NotGrantedException -> PeerErrorCodes.UNAUTHORIZED
+            is KdbAuthorizationException -> PeerErrorCodes.UNAUTHORIZED
+            is RemotePeerException -> e.errorCode
+            else -> PeerErrorCodes.INTERNAL
+        }
+
+    private suspend fun serveSync(msg: SyncV2Message): ByteArray {
+        if (msg is SyncV2Message.Hello) return SyncV2Codec.encode(hello(msg))
+        if (!helloDone) throw PeerSyncException("peer sync: SYNC_HELLO must come first")
+        val reply: SyncV2Message =
+            when (msg) {
+                is SyncV2Message.RefsRequest -> SyncV2Message.RefsResult(msg.correlationId, msg.namespaces.map { refs(it) })
+                is SyncV2Message.FetchRequest -> fetch(msg)
+                is SyncV2Message.RefUpdate -> refUpdate(msg)
+                else -> throw UnsupportedFrameException(frameName(msg))
+            }
+        return SyncV2Codec.encode(reply)
+    }
+
+    private suspend fun serveWire(msg: WireMessage): ByteArray {
+        if (!helloDone) throw PeerSyncException("peer sync: SYNC_HELLO must come first")
+        val reply: WireMessage =
+            when (msg) {
+                is WireMessage.BlobFetch -> {
+                    authorize(msg.namespace)
+                    (blobs ?: throw UnsupportedFrameException("BLOB_FETCH")).blobFetch(msg)
+                }
+                is WireMessage.AttachmentUpload -> {
+                    authorize(msg.namespace)
+                    (blobs ?: throw UnsupportedFrameException("ATTACHMENT_UPLOAD")).upload(msg)
+                }
+                else -> throw UnsupportedFrameException(msg.header.messageType.name)
+            }
+        return wire.encode(reply)
+    }
+
+    private suspend fun hello(m: SyncV2Message.Hello): SyncV2Message.HelloAck {
+        fun reject(reason: String) =
+            SyncV2Message.HelloAck(m.correlationId, accepted = false, nodeId = nodeId, protocol = SyncV2.PROTOCOL, reason = reason)
+        if (nodeId.isNotEmpty() && m.nodeId == nodeId) {
+            return reject(
+                "peer sync: the connecting node has this node's own identity $nodeId; a copied data root must take a new node id",
+            )
+        }
+        // Credentials in the hello win; without any, the transport's (an HTTP upgrade's headers).
+        if (m.user != null || m.password != null || m.token != null) {
+            connectionAuth = ConnectionAuthSupport(auth, connectionContext.copy(user = m.user, password = m.password, token = m.token))
+        }
+        val p =
+            try {
+                connectionAuth.authenticateConnection()
+            } catch (e: Throwable) {
+                return reject(connectionAuth.authFailureMessage(e))
+            }
+        principal = p
+        // A pattern is a request: a namespace it selects that this principal may sync is granted,
+        // one it may not is left out rather than refusing the whole hello.
+        val selected = selectNamespaces(m.namespaces, listOf(ns.namespaceId)).isNotEmpty()
+        granted = selected && runCatching { connectionAuth.authorize(p, AuthAction.PeerSync(ns.namespaceId)) }.isSuccess
+        helloDone = true
+        val caps = capabilities().filter { it in m.capabilities }
+        zstdPack = SyncV2.CAP_ZSTD_PACK in caps
+        peerAttachments = SyncV2.CAP_ATTACHMENTS in caps
+        return SyncV2Message.HelloAck(
+            m.correlationId, accepted = true, nodeId = nodeId, protocol = SyncV2.PROTOCOL, capabilities = caps,
+            refs = if (granted) listOf(refsOf(ns.namespaceId, ns.dag)) else emptyList(),
+        )
+    }
+
+    private fun capabilities(): List<String> = if (ns.blobs == null) SyncV2.CAPABILITIES - SyncV2.CAP_ATTACHMENTS else SyncV2.CAPABILITIES
+
+    /** Re-authorizes on every frame, so a grant revoked mid-session takes effect at once. */
+    private suspend fun authorize(namespace: String) {
+        if (!granted || namespace != ns.namespaceId) throw NotGrantedException(namespace)
+        connectionAuth.authorize(principal, AuthAction.PeerSync(ns.namespaceId))
+    }
+
+    private suspend fun refs(namespace: String): NamespaceRefs {
+        authorize(namespace)
+        return refsOf(ns.namespaceId, ns.dag)
+    }
+
+    private suspend fun fetch(m: SyncV2Message.FetchRequest): SyncV2Message.PackPage {
+        authorize(m.namespace)
+        val (commits, done) = pageOf(missingCommits(ns.dag, m.wants, m.haves), m.maxBytes)
+        if (!peerAttachments) {
+            firstCommitWithAttachments(commits)?.let { throw AttachmentsUnsupportedException(m.namespace, it.hash.toHex()) }
+        }
+        return SyncV2Message.PackPage(m.correlationId, m.namespace, commits, done = done, zstd = zstdPack)
+    }
+
+    private suspend fun refUpdate(m: SyncV2Message.RefUpdate): SyncV2Message.RefUpdateAck {
+        authorize(m.namespace)
+        if (m.stubs.isNotEmpty()) throw UnsupportedFrameException("REF_UPDATE with archived-commit stubs")
+        val stored =
+            try {
+                storeCommits(ns.dag, m.commits)
+            } catch (e: Exception) {
+                throw PeerSyncException("peer sync: storing a pushed page: ${e.message}", e)
+            }
+        val ack = SyncV2Message.RefUpdateAck(m.correlationId, m.namespace, m.kind, m.ref, SyncV2.OUTCOME_STORED, stored = stored)
+        if (m.more) return ack
+        val res = applyRef(ns, m.kind, m.ref, KdbHash.fromHex(m.newHex))
+        return ack.copy(outcome = res.outcome, headHex = res.head.toHex(), conflictBytes = res.conflict?.let(::encodeConflictReport))
+    }
+
+    /** Aborts unfinished uploads. The connection's owner calls it when the connection ends. */
+    fun close() {
+        blobs?.close()
+        scope.cancel()
+    }
+
+    private fun frameName(m: SyncV2Message): String = m::class.simpleName ?: "frame"
+}
+
+/** A frame this host does not serve (Go's UnsupportedFrameError): answered UNSUPPORTED. */
+internal class UnsupportedFrameException(what: String) : PeerSyncException("peer sync: $what is not supported by this node")
+
+/** A frame naming a namespace the session was not granted (Go's NotGrantedError). */
+internal class NotGrantedException(namespace: String) : PeerSyncException("peer sync: namespace \"$namespace\" was not granted to this session")
+
+/** Whether [pattern] selects [namespace]: "*" one segment, "**" any number (Go's MatchNamespace). */
+internal fun matchNamespace(
+    pattern: String,
+    namespace: String,
+): Boolean = matchSegments(pattern.split("/"), namespace.split("/"))
+
+private fun matchSegments(
+    pat: List<String>,
+    segs: List<String>,
+): Boolean {
+    if (pat.isEmpty()) return segs.isEmpty()
+    return when (pat[0]) {
+        "**" -> (0..segs.size).any { matchSegments(pat.drop(1), segs.drop(it)) }
+        "*" -> segs.isNotEmpty() && matchSegments(pat.drop(1), segs.drop(1))
+        else -> segs.isNotEmpty() && segs[0] == pat[0] && matchSegments(pat.drop(1), segs.drop(1))
+    }
+}
+
+/** The namespaces of [available] that match a pattern and no "!" exclusion, sorted (Go's SelectNamespaces). */
+internal fun selectNamespaces(
+    patterns: List<String>,
+    available: List<String>,
+): List<String> {
+    val include = patterns.filter { !it.startsWith("!") }
+    val exclude = patterns.filter { it.startsWith("!") }.map { it.substring(1) }
+    return available.filter { n -> include.any { matchNamespace(it, n) } && exclude.none { matchNamespace(it, n) } }.sorted()
+}

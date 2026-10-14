@@ -321,6 +321,18 @@ identity = SHA-256(0x02 || be64(size) || tree)
   it). Pinned both ways by Go-generated goldens (pointers, format-1 delta bytes) and by a fixture
   store each side builds from one recipe and the other opens (`attachstore/kotlin_fixture_test.go`,
   kdb-jdbc `GoAttachStoreFixtureTest`).
+- **Kotlin peer sync v2 with blobs** (`kdb-peer-sync` `SyncV2*.kt`, `PeerBlobTransfer.kt`): a
+  Kotlin v2 host and client (`SYNC_HELLO`, `REFS_REQUEST`, `FETCH_REQUEST`/`PACK_PAGE`,
+  `REF_UPDATE`/`_ACK`, `PEER_ERROR`; Go's JSON frames) that advertise `branches`, `tags`,
+  `zstd-pack` and `attachments`. The host serves `BLOB_FETCH` with each chunk's audit path and takes
+  `ATTACHMENT_UPLOAD` (with `Expect`); the client fetches a page's blobs, checking every chunk,
+  before storing the page, and uploads before its `REF_UPDATE`. Commits carrying attachments are
+  refused to a peer without the capability, both ways. kdb-service and `kdb sync` use it (with the
+  embed store through `peerBlobStore`); `kdb attach put|get|list` drives attachments from the CLI.
+  A v1-only peer still gets v1. Pinned by Go-generated golden frames (v2 sync frames byte for
+  byte; a Kotlin host's `BLOB_FETCH_RESULT` byte-identical to Go's for the same blob) and a
+  real-process interop test both ways, with multi-chunk blobs and a chunk damaged on disk
+  (`integration/attachments_peersync_interop_test.go`).
 - **Write-back projections** (follow-up): `PROJECT_WRITE` docs carry a document's whole
   attachment set after the write (`attachmentsChanged`, `attachments`), guarded by the set the
   projection held (`attachmentsBase`), and attachment-only writes (`keepBody`); a refused write
@@ -350,7 +362,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
   walks history rather than keeping the reference index.
 - **The Kotlin server** has no attachment SQL (`SET ATTACHMENT`, `ATTACHMENT()`: the Kotlin SQL
   engine has none; the driver says so for binary parameters), no maintenance loop calling
-  `compactAttachments`, and answers `BLOB_FETCH` `UNSUPPORTED` (Kotlin peer sync is v1 only).
+  `compactAttachments`, and answers `BLOB_FETCH` `UNSUPPORTED` on its SQL listener (blobs travel
+  on the peer-sync listener).
+- **Kotlin peer sync** speaks only the v2 capabilities above: a Go peer never sends it snapshots,
+  grafts, boundary states, squash catch-up, filters, `TREE_NODES`, projections, write-back, watches
+  or archived-commit stubs, and a Kotlin node cannot bootstrap from a peer whose history it cannot
+  replay (a shallow root or retention floor). One namespace per Kotlin host. Each page works the
+  missing set out afresh (Go keeps a cursor), and a pull stores every page it fetched even when main
+  is not then adopted (as v1 did).
 - **Kotlin** reads Go's checkpoints (#225) but derives no attachment table for a commit below a
   checkpoint's heads (their ops are not loaded for it).
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.

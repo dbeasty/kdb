@@ -870,7 +870,9 @@ sequenceDiagram
 
 ## 14. Distribution: peer sync, replication, merge, conflict procedures
 
-Distribution is **Go-only** beyond v1 (Kotlin `kdb-peer-sync` implements protocol v1 only).
+Distribution is **Go-only** beyond the core of v2: Kotlin `kdb-peer-sync` speaks v1 and v2's hello, refs, fetch
+and ref-update frames with the `branches`, `tags`, `zstd-pack` and `attachments` capabilities (blob transfer
+included), and none of snapshot, graft, squash, filters, projections or watches.
 
 ![Diagram 8](diagrams/system-08.svg)
 
@@ -1404,7 +1406,7 @@ Verified against code; the old documents should be corrected or marked historica
 - No `AS OF` grammar (suffix clauses via the hybrid front end); `compute`/WebGPU is a CPU stub with no caller.
 
 **Distribution**
-- Kotlin implements sync v1 only; the Kotlin runtime cannot run cross-namespace groups; Kotlin merges are
+- Kotlin implements sync v1 and v2's core (no snapshot, graft, squash, filters, projections); the Kotlin runtime cannot run cross-namespace groups; Kotlin merges are
   non-deterministic, so in-merge procedure parity is out.
 - Stream listener serves the primary namespace only; peer and stream listeners lack the connection cap and header
   admitter.

@@ -39,6 +39,9 @@ private fun printUsage() {
           log <namespace>
           status <namespace>
           sync <namespace> <peer-uri>
+          attach put <namespace> <docId> <name> <path> [mime]
+          attach get <namespace> <docId> <name> <out-path>
+          attach list <namespace> <docId>   one line per attachment: name, hash, size
           shell <namespace>          interactive REPL (put, query, get, …)
           unlock                     remove stale .kdb.lock after a crash
 

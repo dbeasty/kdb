@@ -22,6 +22,7 @@ kotlin {
         commonMain.dependencies {
             implementation(project(":kdb-auth"))
             implementation(project(":kdb-codec"))
+            implementation(project(":kdb-compression"))
             implementation(project(":kdb-dag"))
             implementation(project(":kdb-document"))
             // api, not implementation: component 39's public surface exposes both of these
@@ -36,6 +37,7 @@ kotlin {
             implementation(project(":kdb-transport-core"))
             implementation(project(":kdb-wire"))
             implementation(libs.kotlinx.coroutines.core)
+            implementation(libs.kotlinx.serialization.json)
         }
         commonTest.dependencies {
             implementation(libs.kotlin.test)

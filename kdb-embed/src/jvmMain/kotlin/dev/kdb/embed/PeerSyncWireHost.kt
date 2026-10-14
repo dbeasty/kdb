@@ -43,6 +43,11 @@ public suspend fun runPeerSyncOverWebSocketListen(
 ) {
     transport.listen(listenUri, transportOptions) { conn ->
         val ctx = connectionContextFor(conn)
-        perConnection(conn, hostFactory(ctx))
+        val host = hostFactory(ctx)
+        try {
+            perConnection(conn, host)
+        } finally {
+            host.stop() // a per-connection host releases what the connection left unfinished
+        }
     }
 }

@@ -17,6 +17,13 @@ import dev.kdb.jdbc.file.releaseStaleDataDirectoryLock
 import dev.kdb.config.requireNetworkPeerSyncEnabled
 import dev.kdb.peersync.PeerClientConfig
 import dev.kdb.peersync.peerSyncClient
+import dev.kdb.embed.AttachmentSelector
+import dev.kdb.embed.AttachmentSource
+import dev.kdb.embed.PutAttachmentOptions
+import dev.kdb.embed.getAttachment
+import dev.kdb.embed.listAttachments
+import dev.kdb.embed.peerBlobStore
+import dev.kdb.embed.putAttachment
 import dev.kdb.transport.tcp.defaultTcpWireTransport
 import dev.kdb.wire.defaultWireCodec
 import kotlinx.coroutines.runBlocking
@@ -33,6 +40,7 @@ internal object CliCommands {
                 is CoreCliCommand.Log -> runBlocking { cmdLog(config, command) }
                 is CoreCliCommand.Status -> runBlocking { cmdStatus(config, command) }
                 is CoreCliCommand.Sync -> runBlocking { cmdSync(config, command) }
+                is CoreCliCommand.Attach -> runBlocking { cmdAttach(config, command) }
                 is CoreCliCommand.Shell -> runShell(config, command.namespace)
                 is CoreCliCommand.Unlock -> cmdUnlock(config)
                 is FileCliWrapper -> runBlocking { cmdFile(config, command.command) }
@@ -118,6 +126,49 @@ internal object CliCommands {
     private suspend fun cmdQuery(config: CliConfig, cmd: CoreCliCommand.Query): Int {
         openCliRuntime(config, cmd.namespace).use { rt ->
             executeQuery(CliSession(config, cmd.namespace, rt), cmd.sql)
+        }
+        return 0
+    }
+
+    private suspend fun cmdAttach(config: CliConfig, cmd: CoreCliCommand.Attach): Int {
+        openCliRuntime(config, cmd.namespace).use { rt ->
+            val runtime = rt.embedded
+            val docId = KdbUuid.fromString(cmd.args[0])
+            when (cmd.action) {
+                "put" -> {
+                    val bytes = Path.of(cmd.args[2]).toFile().readBytes()
+                    val (commit, info) =
+                        runtime.putAttachment(
+                            cmd.namespace, docId, AttachmentSource.of(bytes),
+                            PutAttachmentOptions(name = cmd.args[1], mime = cmd.args.getOrElse(3) { "" }),
+                        )
+                    if (!config.quiet) {
+                        println(
+                            "{\"id\":\"${info.id}\",\"hash\":\"${info.contentHash.toHex()}\",\"size\":${info.size}," +
+                                "\"commit\":\"${commit.hash.toHex()}\"}",
+                        )
+                    }
+                }
+                "get" -> {
+                    val read = runtime.getAttachment(cmd.namespace, docId, AttachmentSelector.ByName(cmd.args[1]))
+                    try {
+                        Path.of(cmd.args[2]).toFile().outputStream().use { out ->
+                            val buf = ByteArray(1 shl 20)
+                            while (true) {
+                                val n = read.reader.read(buf)
+                                if (n <= 0) break
+                                out.write(buf, 0, n)
+                            }
+                        }
+                    } finally {
+                        read.reader.close()
+                    }
+                }
+                else ->
+                    for (a in runtime.listAttachments(cmd.namespace, docId)) {
+                        println("${a.name}\t${a.contentHash.toHex()}\t${a.size}")
+                    }
+            }
         }
         return 0
     }
@@ -251,9 +302,14 @@ internal object CliCommands {
                 session.runtime.embedded.dag,
                 session.runtime.embedded.storage,
             )
+        // v2, with attachments: a pull fetches the blobs its commits attach before storing them, a
+        // push uploads them before proposing its ref.
         val peerSession =
             client.connect(
-                PeerClientConfig(session.namespaceId, session.config.nodeId, peerUri),
+                PeerClientConfig(
+                    session.namespaceId, session.config.nodeId, peerUri,
+                    blobs = session.runtime.embedded.peerBlobStore(session.namespaceId),
+                ),
             )
         val result = peerSession.syncBidirectional()
         if (!session.config.quiet) {

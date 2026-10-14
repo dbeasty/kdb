@@ -18,54 +18,62 @@ internal fun readInt32Le(buf: ByteArray, offset: Int): Int =
 public class FrameStreamReader(
     private val maxFrameBytes: Int = dev.kdb.wire.DEFAULT_MAX_FRAME_BYTES,
 ) {
-    private val pending = mutableListOf<Byte>()
+    // The bytes received and not yet framed are buf[start, end). A byte array, not a list of
+    // boxed bytes taken one at a time from the front: that made a frame of n bytes cost O(n^2),
+    // so a multi-megabyte frame (a peer-sync blob page) never finished arriving.
+    private var buf = ByteArray(0)
+    private var start = 0
+    private var end = 0
 
-    public fun feed(chunk: ByteArray): List<ByteArray> {
-        if (chunk.isNotEmpty()) {
-            pending.addAll(chunk.toList())
-        }
-        return drainCompleteFrames()
-    }
+    public fun feed(chunk: ByteArray): List<ByteArray> = feed(chunk, 0, chunk.size)
 
     public fun feed(chunk: ByteArray, offset: Int, length: Int): List<ByteArray> {
         if (length > 0) {
-            for (i in offset until offset + length) {
-                pending.add(chunk[i])
+            if (end + length > buf.size) {
+                val live = end - start
+                if (live + length > buf.size) {
+                    val grown = ByteArray(maxOf(live + length, buf.size * 2, 8192))
+                    buf.copyInto(grown, 0, start, end)
+                    buf = grown
+                } else {
+                    buf.copyInto(buf, 0, start, end)
+                }
+                start = 0
+                end = live
             }
+            chunk.copyInto(buf, end, offset, offset + length)
+            end += length
         }
         return drainCompleteFrames()
     }
 
     public fun reset() {
-        pending.clear()
+        start = 0
+        end = 0
     }
 
-    public val bufferedBytes: Int get() = pending.size
+    public val bufferedBytes: Int get() = end - start
 
     private fun drainCompleteFrames(): List<ByteArray> {
         val out = mutableListOf<ByteArray>()
-        while (true) {
-            if (pending.size < 4) break
-            val header = pending.take(4).toByteArray()
+        while (end - start >= 4) {
             val frameLength =
                 try {
-                    val len = readInt32Le(header, 0)
+                    val len = readInt32Le(buf, start)
                     validateFrameLength(len, maxFrameBytes)
                     len
                 } catch (e: FrameTooLargeException) {
-                    pending.clear()
+                    reset()
                     throw e
                 } catch (e: WireDecodeException) {
-                    pending.clear()
+                    reset()
                     throw e
                 }
-            if (pending.size < frameLength) break
-            val frame = ByteArray(frameLength)
-            for (i in 0 until frameLength) {
-                frame[i] = pending.removeAt(0)
-            }
-            out += frame
+            if (end - start < frameLength) break
+            out += buf.copyOfRange(start, start + frameLength)
+            start += frameLength
         }
+        if (start == end) reset()
         return out
     }
 }

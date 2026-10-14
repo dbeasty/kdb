@@ -93,6 +93,9 @@ internal sealed class CoreCliCommand : CliCommand {
 
     data class Sync(val namespace: String, val peerUri: String) : CoreCliCommand()
 
+    /** `attach put|get|list`: a document's attachments (docs/kdb-attachments-plan.md). */
+    data class Attach(val action: String, val namespace: String, val args: List<String>) : CoreCliCommand()
+
     data class Shell(val namespace: String) : CoreCliCommand()
 
     data object Unlock : CoreCliCommand()
@@ -184,6 +187,15 @@ private fun parseCoreArgs(args: Array<String>): Pair<CliConfig, CliCommand?> {
             "sync" -> {
                 require(rest.size >= 3) { "usage: kdb sync <namespace> <peer-uri>" }
                 CoreCliCommand.Sync(rest[1], rest[2])
+            }
+            "attach" -> {
+                val usage =
+                    "usage: kdb attach put <namespace> <docId> <name> <path> [mime] | " +
+                        "attach get <namespace> <docId> <name> <out-path> | attach list <namespace> <docId>"
+                require(rest.size >= 4) { usage }
+                val need = mapOf("put" to 6, "get" to 6, "list" to 4)[rest[1]] ?: throw IllegalArgumentException(usage)
+                require(rest.size >= need) { usage }
+                CoreCliCommand.Attach(rest[1], rest[2], rest.drop(3))
             }
             "shell" -> {
                 require(rest.size >= 2) { "usage: kdb shell <namespace>" }

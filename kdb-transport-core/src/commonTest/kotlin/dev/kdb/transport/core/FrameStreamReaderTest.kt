@@ -23,6 +23,28 @@ class FrameStreamReaderTest {
         return out
     }
 
+    /** A multi-megabyte frame arriving in socket-sized reads, followed by a small one in the same
+     * read: it used to cost O(n^2) (a list of boxed bytes taken from the front) and never finished. */
+    @Test
+    fun framer_largeFrameInSmallReads() {
+        val big = frame(12 shl 20)
+        for (i in 12 until big.size) big[i] = (i * 31).toByte()
+        val small = frame(3)
+        val stream = big + small
+        val reader = FrameStreamReader()
+        val out = ArrayList<ByteArray>()
+        var off = 0
+        while (off < stream.size) {
+            val n = minOf(8192, stream.size - off)
+            out += reader.feed(stream, off, n)
+            off += n
+        }
+        assertEquals(2, out.size)
+        assertTrue(out[0].contentEquals(big))
+        assertTrue(out[1].contentEquals(small))
+        assertEquals(0, reader.bufferedBytes)
+    }
+
     @Test
     fun framer_singleFrame() {
         val f = frame(4)
