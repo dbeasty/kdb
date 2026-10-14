@@ -121,7 +121,13 @@ type Config struct {
 	// UploadGrace is how long Collect keeps a finished blob no commit references yet: the longest
 	// an upload may wait for the commit that references it. Default one hour.
 	UploadGrace time.Duration
+	// PointerCacheBytes bounds the pointers (a small blob's bytes included) kept in memory; the
+	// rest are read from their segments through the pointer index (pointer_index.go). Default
+	// 4 MiB.
+	PointerCacheBytes int64
 
+	// For tests: the pointer index's overlay, in entries, before it is written as a run.
+	indexOverlay int
 	// For tests: page and frame sizes small enough that a few-MB version takes the paths a
 	// multi-GB one does.
 	deltaPageBytes int64
@@ -159,6 +165,9 @@ func (c Config) withDefaults() Config {
 	if c.UploadGrace <= 0 {
 		c.UploadGrace = time.Hour
 	}
+	if c.PointerCacheBytes <= 0 {
+		c.PointerCacheBytes = 4 << 20
+	}
 	return c
 }
 
@@ -195,14 +204,17 @@ type Store struct {
 	small  SmallBlobs
 	cfg    Config
 
-	mu       sync.Mutex
-	loaded   bool
-	pointers map[codec.Hash]pointer
-	uploads  map[string]struct{}      // segments being written, which Collect must leave alone
-	held     map[codec.Hash]time.Time // finished blobs no Collect has seen referenced, and since when
-	verified map[string]bool          // leaves segments whose leaves are known to hash to their root
-	pinned   map[string]int           // segment -> open readers using it
-	deferred map[string]bool          // segments to delete once unpinned
+	mu     sync.Mutex
+	loaded bool
+	// Every blob's pointer, through the index (pointer_index.go), and the recently used ones. An
+	// index entry also says whether the blob is held: a finished upload no Collect has seen
+	// referenced, and since when.
+	idx      *pointerIndex
+	cache    *lru[codec.Hash, pointer]
+	uploads  map[string]struct{} // segments being written, which Collect must leave alone
+	verified *lru[string, bool]  // leaves segments whose leaves are known to hash to their root
+	pinned   map[string]int      // segment -> open readers using it
+	deferred map[string]bool     // segments to delete once unpinned
 	readers  map[*Reader]struct{}
 	// The mark (mark.go): the newest readable one, its segment, and the highest generation any
 	// mark segment has, readable or not, so the next one is never written over a torn one.
@@ -215,8 +227,12 @@ type Store struct {
 	deltaMu  sync.Mutex
 	job      *deltaJob
 	inflate  *inflateJob // inflate.go: a delta being turned back into a whole copy
-	declined map[[2]codec.Hash]struct{}
+	declined *lru[[2]codec.Hash, struct{}]
 }
+
+// How many leaves segments known good, and declined delta pairs, a store remembers: both only
+// save repeating work.
+const rememberedEntries = 64 << 10
 
 // SegmentPrefix is the name prefix of every segment namespaceID's attachment store writes - for a
 // backup, which copies them.
@@ -226,20 +242,22 @@ func SegmentPrefix(namespaceID string) string {
 
 // New returns the store for namespaceID. small may be nil, which keeps every blob standalone.
 func New(shim storage.PlatformIOShim, namespaceID string, small SmallBlobs, cfg Config) *Store {
+	cfg = cfg.withDefaults()
+	prefix := SegmentPrefix(namespaceID)
 	return &Store{
 		shim:     shim,
 		ns:       namespaceID,
-		prefix:   SegmentPrefix(namespaceID),
+		prefix:   prefix,
 		small:    small,
-		cfg:      cfg.withDefaults(),
-		pointers: map[codec.Hash]pointer{},
+		cfg:      cfg,
+		idx:      newPointerIndex(shim, prefix, cfg.indexOverlay),
+		cache:    newLRU[codec.Hash](cfg.PointerCacheBytes, pointerCost),
 		uploads:  map[string]struct{}{},
-		held:     map[codec.Hash]time.Time{},
-		verified: map[string]bool{},
+		verified: newLRU[string](rememberedEntries, one[bool]),
 		pinned:   map[string]int{},
 		deferred: map[string]bool{},
 		readers:  map[*Reader]struct{}{},
-		declined: map[[2]codec.Hash]struct{}{},
+		declined: newLRU[[2]codec.Hash](rememberedEntries, one[struct{}]),
 	}
 }
 
@@ -250,7 +268,7 @@ func (s *Store) Config() Config { return s.cfg }
 // cannot tell zero bytes from none - and always present.
 var emptyHash = document.AttachmentContentHash(nil)
 
-// loadLocked reads every pointer segment once. Must hold mu.
+// loadLocked reads every pointer segment once, into the index. Must hold mu.
 func (s *Store) loadLocked() error {
 	if s.loaded {
 		return nil
@@ -260,6 +278,7 @@ func (s *Store) loadLocked() error {
 		return err
 	}
 	markGen := -1
+	sort.Strings(names)
 	for _, name := range names {
 		if strings.HasPrefix(name, s.prefix+"m-") {
 			gen, commits, ok := s.readMark(name)
@@ -271,24 +290,65 @@ func (s *Store) loadLocked() error {
 			}
 			continue
 		}
-		if !strings.HasPrefix(name, s.prefix+"h-") {
-			continue
-		}
-		p, h, ok := s.readPointer(name)
-		if !ok {
-			continue // torn by a crash: its blob is unreachable through it, and Collect retires it
-		}
-		if cur, have := s.pointers[h]; !have || p.gen > cur.gen {
-			s.pointers[h] = p
-		}
 	}
-	for h, p := range s.pointers {
-		if !p.finished.IsZero() {
-			s.held[h] = p.finished
-		}
+	if err := s.rebuildIndex(names, time.Now()); err != nil {
+		return err
 	}
 	s.loaded = true
 	return nil
+}
+
+// getLocked returns h's pointer: from the cache, or read from the segment the index names. A
+// pointer that no longer reads is ErrCorrupt. Must hold mu, loaded.
+func (s *Store) getLocked(h codec.Hash) (pointer, bool, error) {
+	if p, ok := s.cache.get(h); ok {
+		return p, true, nil
+	}
+	e, ok, err := s.idx.get(h)
+	if err != nil || !ok {
+		return pointer{}, false, err
+	}
+	name := s.pointerName(h, e.gen)
+	p, ph, ok := s.readPointer(name)
+	if !ok || ph != h {
+		return pointer{}, false, fmt.Errorf("%w: pointer %s does not read", ErrCorrupt, name)
+	}
+	s.cache.put(h, p)
+	return p, true, nil
+}
+
+// hasLocked reports whether h has a pointer, without reading it. Must hold mu, loaded.
+func (s *Store) hasLocked(h codec.Hash) (bool, error) {
+	if _, ok := s.cache.get(h); ok {
+		return true, nil
+	}
+	_, ok, err := s.idx.get(h)
+	return ok, err
+}
+
+// setLocked makes p, just written, h's pointer, held since held (UnixNano; 0 is not held).
+// Must hold mu, loaded.
+func (s *Store) setLocked(h codec.Hash, p pointer, held int64) {
+	s.idx.put(h, entryFor(p, held))
+	s.cache.put(h, p)
+}
+
+// replaceLocked makes p, just written, h's pointer, keeping h's hold. Must hold mu, loaded.
+func (s *Store) replaceLocked(h codec.Hash, p pointer) error {
+	e, _, err := s.idx.get(h)
+	if err != nil {
+		return err
+	}
+	s.setLocked(h, p, e.held)
+	return nil
+}
+
+// ResidentPointers is how many pointers the store holds in memory, and how many index entries
+// wait in its overlay to be written as a run.
+func (s *Store) ResidentPointers() (pointers, overlay int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cache.len(), len(s.idx.overlay)
 }
 
 // Pointer formats. v3 adds the finish time after the size; v2 is still read.
@@ -410,7 +470,11 @@ func (s *Store) readPointer(name string) (pointer, codec.Hash, bool) {
 // writePointerLocked makes p the durable pointer for h. Must hold mu.
 // A p with no finish time keeps the current pointer's.
 func (s *Store) writePointerLocked(h codec.Hash, p pointer) (pointer, error) {
-	if cur, ok := s.pointers[h]; ok {
+	cur, ok, err := s.getLocked(h)
+	if err != nil {
+		return pointer{}, err
+	}
+	if ok {
 		p.gen = cur.gen + 1
 		if p.finished.IsZero() {
 			p.finished = cur.finished
@@ -572,7 +636,10 @@ func (u *Upload) Finish() (Info, error) {
 		if err := s.loadLocked(); err != nil {
 			return Info{}, err
 		}
-		if _, ok := s.pointers[info.Hash]; ok {
+		if have, err := s.hasLocked(info.Hash); err != nil || have {
+			if err != nil {
+				return Info{}, err
+			}
 			return info, s.holdLocked(info.Hash, time.Now())
 		}
 		now := time.Now()
@@ -580,8 +647,7 @@ func (u *Upload) Finish() (Info, error) {
 		if err != nil {
 			return Info{}, err
 		}
-		s.pointers[info.Hash] = p
-		s.held[info.Hash] = now
+		s.setLocked(info.Hash, p, now.UnixNano())
 		return info, nil
 	}
 	if u.segment == "" {
@@ -622,7 +688,11 @@ func (u *Upload) Finish() (Info, error) {
 	if err := s.loadLocked(); err != nil {
 		return Info{}, err
 	}
-	if _, ok := s.pointers[info.Hash]; ok {
+	have, err := s.hasLocked(info.Hash)
+	if err != nil {
+		return Info{}, err
+	}
+	if have {
 		_ = s.shim.DeleteSegment(u.segment) // already stored: keep the one copy
 		_ = s.shim.DeleteSegment(leavesSeg)
 		return info, s.holdLocked(info.Hash, time.Now())
@@ -632,9 +702,8 @@ func (u *Upload) Finish() (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	s.pointers[info.Hash] = p
-	s.held[info.Hash] = now
-	s.verified[leavesSeg] = true
+	s.setLocked(info.Hash, p, now.UnixNano())
+	s.verified.put(leavesSeg, true)
 	return info, nil
 }
 
@@ -648,8 +717,8 @@ func (s *Store) Hold(h codec.Hash) (bool, error) {
 	if err := s.loadLocked(); err != nil {
 		return false, err
 	}
-	if _, ok := s.pointers[h]; !ok {
-		return false, nil
+	if have, err := s.hasLocked(h); err != nil || !have {
+		return false, err
 	}
 	return true, s.holdLocked(h, time.Now())
 }
@@ -664,7 +733,14 @@ func (s *Store) Committed(hashes ...codec.Hash) error {
 		return err
 	}
 	for _, h := range hashes {
-		delete(s.held, h)
+		e, ok, err := s.idx.get(h)
+		if err != nil {
+			return err
+		}
+		if ok && e.held != 0 {
+			e.held = 0
+			s.idx.put(h, e)
+		}
 	}
 	return nil
 }
@@ -673,9 +749,12 @@ func (s *Store) Committed(hashes ...codec.Hash) error {
 // recorded one is half a grace old, so the hold survives a restart without a write per upload of a
 // blob uploaded often. Must hold mu; h must have a pointer.
 func (s *Store) holdLocked(h codec.Hash, now time.Time) error {
-	s.held[h] = now
-	cur := s.pointers[h]
+	cur, _, err := s.getLocked(h)
+	if err != nil {
+		return err
+	}
 	if now.Sub(cur.finished) < s.cfg.UploadGrace/2 {
+		s.setLocked(h, cur, now.UnixNano())
 		return nil
 	}
 	next := cur
@@ -684,7 +763,7 @@ func (s *Store) holdLocked(h codec.Hash, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	s.pointers[h] = p // the old generation is no longer named, and Collect retires it
+	s.setLocked(h, p, now.UnixNano()) // the old generation is no longer named, and Collect retires it
 	return nil
 }
 
@@ -755,7 +834,10 @@ func (s *Store) Has(h codec.Hash) (bool, error) {
 	}
 	s.mu.Lock()
 	err := s.loadLocked()
-	_, ok := s.pointers[h]
+	ok := false
+	if err == nil {
+		ok, err = s.hasLocked(h)
+	}
 	s.mu.Unlock()
 	if err != nil || ok {
 		return ok, err
@@ -774,12 +856,12 @@ func (s *Store) LargeBlobs() ([]codec.Hash, error) {
 	if err := s.loadLocked(); err != nil {
 		return nil, err
 	}
-	out := make([]codec.Hash, 0, len(s.pointers))
-	for h := range s.pointers {
+	var out []codec.Hash
+	err := s.idx.each(func(h codec.Hash, _ indexEntry) error {
 		out = append(out, h)
-	}
-	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Bytes[:], out[j].Bytes[:]) < 0 })
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 
 // deleteOrDeferLocked deletes a segment, or queues it while a reader has it pinned. Must hold mu.
@@ -799,6 +881,10 @@ func (s *Store) deleteOrDeferLocked(name string) {
 // never finished, pointers superseded by a higher generation). Segments an open reader has pinned
 // are deleted when it closes. Readers past their lease are released first. It reports how many
 // blobs it removed.
+//
+// It streams the pointer index twice - once for the bases kept deltas need that nothing else
+// keeps, once to decide - so keep is asked about a blob more than once, and no pointer has to be
+// in memory. The segment sweep holds a key of each segment a kept pointer names (pointer_index.go).
 func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 	now := time.Now()
 	s.expireReaders(now)
@@ -807,53 +893,102 @@ func (s *Store) Collect(keep func(codec.Hash) bool) (int, error) {
 	if err := s.loadLocked(); err != nil {
 		return 0, err
 	}
-	live := map[codec.Hash]bool{}
-	for h := range s.pointers {
-		since, held := s.held[h]
-		switch {
-		case keep(h):
-			live[h] = true
-			delete(s.held, h) // committed: references decide from here on
-		case held && now.Sub(since) < s.cfg.UploadGrace:
-			live[h] = true // uploaded, its commit still to come
+	grace := s.cfg.UploadGrace
+	// Bases a kept (or held) delta reads through that are neither kept nor held: a kept delta
+	// keeps its chain.
+	rescued := map[codec.Hash]bool{}
+	err := s.idx.each(func(h codec.Hash, e indexEntry) error {
+		if !e.delta || !(keep(h) || e.heldAt(now, grace)) {
+			return nil
 		}
-	}
-	for h := range live { // a kept delta keeps its chain
-		for p, ok := s.pointers[h]; ok && p.delta && !live[p.base]; p, ok = s.pointers[p.base] {
-			live[p.base] = true
+		for b := e.base; !rescued[b] && !keep(b); {
+			be, ok, err := s.idx.get(b)
+			if err != nil {
+				return err
+			}
+			if !ok || be.heldAt(now, grace) {
+				return nil // missing (reads fail as they would have), or held: walked itself
+			}
+			rescued[b] = true
+			if !be.delta {
+				return nil
+			}
+			b = be.base
 		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
-	if (s.job != nil && (!live[s.job.old] || !live[s.job.base])) || (s.inflate != nil && !live[s.inflate.h]) {
-		if s.deltaMu.TryLock() { // no step can be running while we hold it
-			if s.job != nil && (!live[s.job.old] || !live[s.job.base]) {
+	live := func(h codec.Hash) (bool, error) {
+		if keep(h) || rescued[h] {
+			return true, nil
+		}
+		e, ok, err := s.idx.get(h)
+		return ok && e.heldAt(now, grace), err
+	}
+	if s.job != nil || s.inflate != nil {
+		dropJob, dropInflate := false, false
+		if s.job != nil {
+			oldLive, err := live(s.job.old)
+			if err != nil {
+				return 0, err
+			}
+			baseLive, err := live(s.job.base)
+			if err != nil {
+				return 0, err
+			}
+			dropJob = !oldLive || !baseLive
+		}
+		if s.inflate != nil {
+			l, err := live(s.inflate.h)
+			if err != nil {
+				return 0, err
+			}
+			dropInflate = !l
+		}
+		if (dropJob || dropInflate) && s.deltaMu.TryLock() { // no step can be running while we hold it
+			if dropJob {
 				s.dropJobLocked() // its versions are going
 			}
-			if s.inflate != nil && !live[s.inflate.h] {
+			if dropInflate {
 				s.dropInflateLocked()
 			}
 			s.deltaMu.Unlock()
 		}
 	}
 	removed := 0
-	for h := range s.pointers {
-		if !live[h] {
-			delete(s.pointers, h)
-			delete(s.held, h)
+	referenced := []nameKey{keyOf(s.markSeg)}
+	err = s.idx.each(func(h codec.Hash, e indexEntry) error {
+		kept := keep(h)
+		if !kept && !rescued[h] && !e.heldAt(now, grace) {
+			s.idx.remove(h)
+			s.cache.drop(h)
 			removed++
+			return nil
 		}
+		if e.held != 0 && (kept || !e.heldAt(now, grace)) {
+			e.held = 0 // committed: references decide from here on
+			s.idx.put(h, e)
+		}
+		referenced = append(referenced, keyOf(s.pointerName(h, e.gen)), e.seg, e.leaves)
+		return nil
+	})
+	if err != nil {
+		return removed, err
 	}
-	referenced := map[string]bool{s.markSeg: true}
-	for _, p := range s.pointers {
-		referenced[p.name] = true
-		referenced[p.segment] = true
-		referenced[p.leaves] = true
+	sort.Slice(referenced, func(i, j int) bool { return bytes.Compare(referenced[i][:], referenced[j][:]) < 0 })
+	isReferenced := func(name string) bool {
+		k := keyOf(name)
+		i := sort.Search(len(referenced), func(i int) bool { return bytes.Compare(referenced[i][:], k[:]) >= 0 })
+		return i < len(referenced) && referenced[i] == k
 	}
 	names, err := s.shim.ListSegments(s.ns)
 	if err != nil {
 		return removed, err
 	}
 	for _, name := range names {
-		if !strings.HasPrefix(name, s.prefix) || referenced[name] {
+		if !strings.HasPrefix(name, s.prefix) || s.idx.isRun(name) || isReferenced(name) {
 			continue
 		}
 		if _, ok := s.isRefIndex(name); ok {

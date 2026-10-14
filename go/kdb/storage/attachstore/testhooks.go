@@ -15,7 +15,10 @@ func (s *Store) CorruptForTest(h codec.Hash, off int64) error {
 	if err := s.loadLocked(); err != nil {
 		return err
 	}
-	p, ok := s.pointers[h]
+	p, ok, err := s.getLocked(h)
+	if err != nil {
+		return err
+	}
 	if !ok || p.segment == "" || p.delta {
 		return fmt.Errorf("attachstore: %s is not stored whole in a segment", h.Hex())
 	}
@@ -30,6 +33,6 @@ func (s *Store) CorruptForTest(h codec.Hash, off int64) error {
 	if err := s.shim.DeleteSegment(p.segment); err != nil {
 		return err
 	}
-	_, err := s.shim.AppendToSegment(p.segment, raw)
+	_, err = s.shim.AppendToSegment(p.segment, raw)
 	return err
 }

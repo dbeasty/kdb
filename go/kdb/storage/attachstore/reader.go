@@ -378,7 +378,10 @@ func (s *Store) resolveLocked(h codec.Hash) ([]resolved, bool, error) {
 	var chain []resolved
 	at := h
 	for {
-		p, ok := s.pointers[at]
+		p, ok, err := s.getLocked(at)
+		if err != nil {
+			return nil, false, err
+		}
 		if !ok {
 			if len(chain) == 0 {
 				return nil, false, nil
@@ -523,7 +526,7 @@ func segmentLength(shim storage.PlatformIOShim, name string) (int64, error) {
 // verifyLeaves checks once per leaves segment that the stored leaves hash to h, streaming them.
 func (s *Store) verifyLeaves(h codec.Hash, p pointer) error {
 	s.mu.Lock()
-	ok := s.verified[p.leaves]
+	_, ok := s.verified.get(p.leaves)
 	s.mu.Unlock()
 	if ok {
 		return nil
@@ -547,7 +550,7 @@ func (s *Store) verifyLeaves(h codec.Hash, p pointer) error {
 		return fmt.Errorf("%w: leaves of %s", ErrCorrupt, h.Hex())
 	}
 	s.mu.Lock()
-	s.verified[p.leaves] = true
+	s.verified.put(p.leaves, true)
 	s.mu.Unlock()
 	return nil
 }

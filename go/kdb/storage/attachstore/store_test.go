@@ -44,6 +44,21 @@ func newTestStore(t *testing.T, cfg Config) (*Store, *storio.InMemoryPlatformIO,
 	return New(shim, "app/data", small, cfg), shim, small
 }
 
+// pointerOf returns h's current pointer, failing the test if it has none.
+func pointerOf(t *testing.T, s *Store, h codec.Hash) pointer {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		t.Fatal(err)
+	}
+	p, ok, err := s.getLocked(h)
+	if err != nil || !ok {
+		t.Fatalf("pointer of %s: %v %v", h.Hex(), ok, err)
+	}
+	return p
+}
+
 func randomBytes(r *rand.Rand, n int) []byte {
 	b := make([]byte, n)
 	r.Read(b)
@@ -143,9 +158,10 @@ func TestBlobsRoundTripUnderTheirChunkedHash(t *testing.T) {
 		if _, inSmall := small.m[info.Hash]; inSmall {
 			t.Fatalf("%d bytes: written to the engine's blob store", n)
 		}
-		s.mu.Lock()
-		p := s.pointers[info.Hash]
-		s.mu.Unlock()
+		if n == 0 {
+			continue // the empty blob is never stored (emptyHash)
+		}
+		p := pointerOf(t, s, info.Hash)
 		if wantInline := n > 0 && int64(n) <= s.cfg.SmallMaxBytes; (p.inline != nil) != wantInline || (wantInline && p.segment != "") {
 			t.Fatalf("%d bytes: inline = %v, segment %q", n, p.inline != nil, p.segment)
 		}
@@ -169,9 +185,7 @@ func TestCorruptChunkIsCaughtAtTheChunk(t *testing.T) {
 	s, shim, _ := newTestStore(t, Config{})
 	data := randomBytes(rand.New(rand.NewSource(3)), 3*chunk)
 	info, _ := s.Put(bytes.NewReader(data))
-	s.mu.Lock()
-	seg := s.pointers[info.Hash].segment
-	s.mu.Unlock()
+	seg := pointerOf(t, s, info.Hash).segment
 	raw, _ := shim.ReadFromSegment(seg, 0, 3*chunk)
 	raw[2*chunk+5] ^= 0xff
 	shim.DeleteSegment(seg)
@@ -342,9 +356,7 @@ func TestPointerGenerationsAfterACrash(t *testing.T) {
 	v := versions(rand.New(rand.NewSource(8)), 2, chunk+500)
 	oi, _ := s.Put(bytes.NewReader(v[0]))
 	ni, _ := s.Put(bytes.NewReader(v[1]))
-	s.mu.Lock()
-	cur := s.pointers[oi.Hash]
-	s.mu.Unlock()
+	cur := pointerOf(t, s, oi.Hash)
 	seg := s.prefix + "u-crash"
 	var d []byte
 	encodeDeltaV1(memSource(v[1]), memSource(v[0]), func(b []byte) error { d = append(d, b...); return nil })
@@ -502,14 +514,13 @@ func TestReuploadAndHoldRestartTheGrace(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Age the upload past its grace, on disk too.
-			s.mu.Lock()
-			p := s.pointers[info.Hash]
+			p := pointerOf(t, s, info.Hash)
 			p.finished = time.Now().Add(-2 * time.Hour)
+			s.mu.Lock()
 			if p, err = s.writePointerLocked(info.Hash, p); err != nil {
 				t.Fatal(err)
 			}
-			s.pointers[info.Hash] = p
-			s.held[info.Hash] = p.finished
+			s.setLocked(info.Hash, p, p.finished.UnixNano())
 			s.mu.Unlock()
 			if how == "reupload" {
 				if _, err := s.Put(bytes.NewReader(b)); err != nil {
