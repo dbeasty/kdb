@@ -2,6 +2,8 @@ package wire
 
 import (
 	"fmt"
+	"sync"
+
 	kzstd "github.com/klauspost/compress/zstd"
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/compression"
@@ -288,11 +290,19 @@ const packZstdLevel = 1
 const maxPackPayload = 256 << 20
 
 func encodeCommitsPayload(commits []document.Commit, zstd bool) ([]byte, error) {
-	payload, err := EncodeCommits(commits)
-	if err != nil || !zstd {
-		return payload, err
+	if !zstd {
+		return EncodeCommits(commits)
 	}
-	return compression.Compress(payload, packZstdLevel)
+	// The uncompressed page is laid out in a reused buffer: only its compressed form leaves.
+	bp := getPackBuf()
+	payload, err := appendCommits((*bp)[:0], commits)
+	if err != nil {
+		putPackBuf(bp, payload)
+		return nil, err
+	}
+	out, err := compression.Compress(payload, packZstdLevel)
+	putPackBuf(bp, payload)
+	return out, err
 }
 
 func decodeCommitsPayload(payload []byte, zstd bool) ([]document.Commit, error) {
@@ -302,13 +312,37 @@ func decodeCommitsPayload(payload []byte, zstd bool) ([]document.Commit, error) 
 		if err := hdr.Decode(payload); err == nil && hdr.HasFCS && hdr.FrameContentSize > maxPackPayload {
 			return nil, newDecodeError(fmt.Sprintf("commits payload declares %d bytes, more than %d", hdr.FrameContentSize, maxPackPayload))
 		}
-		raw, err := compression.Decompress(payload, maxPackPayload)
+		// Inflated into a pooled buffer: DecodeCommits copies out everything a commit keeps, so
+		// the inflated page is garbage the moment it returns - a page-sized allocation per page.
+		bp := getPackBuf()
+		raw, err := compression.DecompressInto(*bp, payload, maxPackPayload)
 		if err != nil {
+			putPackBuf(bp, nil)
 			return nil, newDecodeError("commits payload: " + err.Error())
 		}
-		payload = raw
+		commits, err := DecodeCommits(raw)
+		putPackBuf(bp, raw)
+		return commits, err
 	}
 	return DecodeCommits(payload)
+}
+
+// maxPooledPackBuf bounds a page buffer kept for reuse: a default page is 4 MiB, and a rare
+// larger one should not stay pinned.
+const maxPooledPackBuf = 16 << 20
+
+// packBufPool holds page buffers, for a page's uncompressed bytes on either side of a transfer.
+// Pooled rather than held: a page is megabytes, and an idle node should not keep one.
+var packBufPool = sync.Pool{New: func() any { return new([]byte) }}
+
+func getPackBuf() *[]byte { return packBufPool.Get().(*[]byte) }
+
+// putPackBuf returns bp, keeping used's storage in it if used grew it within the bound.
+func putPackBuf(bp *[]byte, used []byte) {
+	if used != nil && cap(used) <= maxPooledPackBuf {
+		*bp = used[:0]
+	}
+	packBufPool.Put(bp)
 }
 
 func refsToDto(refs []NamespaceRefs) []namespaceRefsDto {

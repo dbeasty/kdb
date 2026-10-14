@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 
 	"github.com/limidus/kdb/go/kdb/codec"
 	"github.com/limidus/kdb/go/kdb/document"
@@ -10,6 +11,38 @@ import (
 
 // EncodeCommits serializes commits for CommitPush payloads.
 func EncodeCommits(commits []document.Commit) ([]byte, error) {
+	return appendCommits(nil, commits)
+}
+
+// appendCommits appends EncodeCommits's bytes to dst. Sized first, then each commit's payload is
+// written straight into the one buffer: a page used to cost an allocation per commit for bytes
+// that were copied once and dropped.
+func appendCommits(dst []byte, commits []document.Commit) ([]byte, error) {
+	total := 4
+	for i := range commits {
+		n := commits[i].PayloadSize()
+		if n < 0 {
+			each, err := encodeCommitsEach(commits)
+			return append(dst, each...), err
+		}
+		total += 4 + n
+	}
+	out := slices.Grow(dst, total)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(commits)))
+	for i := range commits {
+		o := len(out)
+		out = append(out, 0, 0, 0, 0)
+		var err error
+		if out, err = commits[i].AppendPayloadBytes(out); err != nil {
+			return dst, err
+		}
+		binary.LittleEndian.PutUint32(out[o:], uint32(len(out)-o-4))
+	}
+	return out, nil
+}
+
+// encodeCommitsEach is EncodeCommits for a page with a commit PayloadSize cannot size.
+func encodeCommitsEach(commits []document.Commit) ([]byte, error) {
 	payloads := make([][]byte, len(commits))
 	total := 4
 	for i, c := range commits {
@@ -33,7 +66,8 @@ func EncodeCommits(commits []document.Commit) ([]byte, error) {
 	return out, nil
 }
 
-// DecodeCommits deserializes commits from CommitPush payload bytes.
+// DecodeCommits deserializes commits from CommitPush payload bytes. The commits share no memory
+// with bytes, which the caller may reuse once it returns (decodeCommitsPayload pools it).
 func DecodeCommits(bytes []byte) ([]document.Commit, error) {
 	if len(bytes) < 4 {
 		return nil, nil

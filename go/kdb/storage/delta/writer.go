@@ -138,17 +138,27 @@ func (w *DefaultWriter) AppendBatch(records []storage.DeltaRecord) ([]int64, err
 	}()
 	next := w.sizeBytes
 	for _, record := range records {
-		frame, err := w.pageCodec.Frame(record.CommitPayload, w.config.CompressionCodec)
+		// Framed straight onto the end of buf (PageCodec.AppendFrame).
+		start := len(buf)
+		var err error
+		buf, err = w.pageCodec.AppendFrame(buf, record.CommitPayload, w.config.CompressionCodec)
 		if err != nil {
+			buf = buf[:start]
 			if werr := write(); werr != nil {
 				return offsets, werr
 			}
 			return offsets, err
 		}
-		if limit > 0 && len(buf) > 0 && len(buf)+len(frame) > limit {
+		frameLen := len(buf) - start
+		if limit > 0 && start > 0 && len(buf) > limit {
+			// This frame would take the write past the cap: write the frames before it, and
+			// start the next write with it.
+			frame := append([]byte(nil), buf[start:]...)
+			buf = buf[:start]
 			if err := write(); err != nil {
 				return offsets, err
 			}
+			buf = append(buf, frame...)
 		}
 		if w.firstCommit == nil {
 			h := record.CommitHash
@@ -157,8 +167,7 @@ func (w *DefaultWriter) AppendBatch(records []storage.DeltaRecord) ([]int64, err
 		h := record.CommitHash
 		w.lastCommit = &h
 		offsets = append(offsets, next)
-		next += int64(len(frame))
-		buf = append(buf, frame...)
+		next += int64(frameLen)
 		pending++
 	}
 	if err := write(); err != nil {
