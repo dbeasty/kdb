@@ -318,8 +318,25 @@ changed after the first draft of this plan: a record has **several named attachm
   and an attachment-only write keeps the body (`keepBody`). Blobs written here upload on the projection
   session before the PROJECT_WRITE. A refused write puts the source's attachments back with its body.
 - **Not yet:**
-  - evicting fetched blobs: they are kept until the replica is destroyed;
-  - attachments in the Kotlin replica, which refuses commits carrying them.
+  - evicting fetched blobs: they are kept until the replica is destroyed.
+
+**As built in Kotlin (`kdb-replica`, mirroring the TS replica):**
+- Every item above, full and filtered, with the same store layout (`a/`, `t/<ns>%att/`, `bm/`, `b/`). The
+  hashing is kdb-document's (`AttachmentSet.hash`, scheme-1 content hash, `verifyMerkleInclusion`,
+  `AttachmentTable.parsePacked`); the table lives in the store, node by node, like the document trie.
+- The binary BLOB_FETCH / ATTACHMENT_UPLOAD bodies are kdb-wire's codec. kdb-wire's `AttachmentUpload` gained
+  Go's `expect` (field 7) for this.
+- The replica makes no merge commits: the host merges a push, and the replica fast-forwards to the host's merge,
+  checking its attachment root, so the merged table is Go's three-way merge.
+- A full namespace with unpushed local commits reads blobs at the host's last-seen main, not at its local head,
+  which the host does not know.
+- Live tests (`LiveAttachmentsTest`) against `kdb-replicahost`: replay with roots verified, a snapshot with a
+  3.2 MB blob read in verified chunks, a 1.7 MB upload read back by a second replica, merges with attachments on
+  both sides in both parent orders, a diff convergence of the table by TREE_NODES, and filtered reads,
+  write-back and conflicts.
+- The host refuses SQUASH_HEAD for a namespace with attachments (`go/kdb/peersync/squash.go`), so auto and squash
+  catch-up replay such a namespace. The TREE_NODES path runs only when a diff convergence is under way, such as
+  the repair after a snapshot.
 - **Bytes are lazy on the replica.** The replica stores refs and fetches bytes on first read or by a prefetch
   policy, with a blob cache under its own budget. Blobs it wrote and the host has not yet confirmed are pinned.
 - **BLOB_FETCH 0x42/0x43:** each entry is `(docId, attachmentId, commit, hash, offset, maxBytes)`.

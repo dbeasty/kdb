@@ -1,7 +1,12 @@
 package dev.kdb.replica
 
+import dev.kdb.codec.KdbHash
 import dev.kdb.compression.ZstdCompression
 import dev.kdb.stream.WireConnection
+import dev.kdb.wire.WireBlobFetchEntry
+import dev.kdb.wire.WireHeader
+import dev.kdb.wire.WireMessage
+import dev.kdb.wire.WireMessageType
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -78,6 +83,8 @@ public data class SnapshotPage(
     val next: String,
     val done: Boolean,
     val total: Int,
+    /** On the last page of a commit with attachments: its packed attachment table. */
+    val attachmentTables: ByteArray = ByteArray(0),
 )
 
 public data class SquashHead(
@@ -93,6 +100,8 @@ public data class WireTreeNode(
     val children: List<String>,
     val hasEntries: Boolean,
     val entries: Map<String, String>,
+    /** On the attachment tree: each listed document's whole attachment set. */
+    val attachments: Map<String, List<WireAttachment>> = emptyMap(),
 )
 
 public data class ProjectWriteResult(
@@ -168,7 +177,7 @@ public class PeerConnection private constructor(
                         put("protocol", SYNC_PROTOCOL_VERSION)
                         // zstd-pack: kdb-compression decodes zstd, so packs may come compressed.
                         // Pushes go uncompressed; the host accepts both.
-                        put("capabilities", stringArray(listOf("snapshot", "repair", "squash", "filter", "writeback", "watch", "zstd-pack")))
+                        put("capabilities", stringArray(listOf("snapshot", "repair", "squash", "filter", "writeback", "watch", "zstd-pack", "attachments")))
                         put("namespaces", stringArray(namespaces))
                         if (token != null) put("token", token)
                     }
@@ -258,6 +267,17 @@ public class PeerConnection private constructor(
         watcher: ((List<NamespaceRefs>) -> Unit)? = null,
     ): JsonObject {
         val kind = SyncMsg.requestKinds[code] ?: throw ProtocolException("kdb replica: no request kind for 0x${code.toString(16)}")
+        val frame = exchange(kind, watcher) { id -> encodeSyncFrame(code, id, envelope(kind, body)) }
+        if (frame.kind != expect) throw ProtocolException("kdb replica: expected $expect, got ${frame.kind}")
+        return frame.envelope[expect] as? JsonObject ?: JsonObject(emptyMap())
+    }
+
+    /** Sends one frame built for its correlation id and returns the reply; a PEER_ERROR throws. */
+    private suspend fun exchange(
+        what: String,
+        watcher: ((List<NamespaceRefs>) -> Unit)? = null,
+        frame: (Int) -> ByteArray,
+    ): SyncFrame {
         val waiter = CompletableDeferred<SyncFrame>()
         val id =
             lock.withLock {
@@ -268,23 +288,38 @@ public class PeerConnection private constructor(
                 id
             }
         try {
-            transport.send(encodeSyncFrame(code, id, envelope(kind, body)))
+            transport.send(frame(id))
         } catch (e: Throwable) {
             lock.withLock { pending.remove(id) }
             throw ProtocolException("kdb replica: send failed: ${e.message}", e)
         }
-        val frame =
+        val reply =
             withTimeoutOrNull(timeoutMs) { waiter.await() }
                 ?: run {
                     lock.withLock { pending.remove(id) }
-                    throw ProtocolException("kdb replica: no reply to $kind within $timeoutMs ms")
+                    throw ProtocolException("kdb replica: no reply to $what within $timeoutMs ms")
                 }
-        if (frame.kind == "peerError") {
-            val pe = frame.envelope["peerError"] as? JsonObject ?: JsonObject(emptyMap())
+        if (reply.kind == "peerError") {
+            val pe = reply.envelope["peerError"] as? JsonObject ?: JsonObject(emptyMap())
             throw RemoteException(pe.str("code").ifEmpty { "UNKNOWN" }, pe.str("message"), pe.str("namespace"))
         }
-        if (frame.kind != expect) throw ProtocolException("kdb replica: expected $expect, got ${frame.kind}")
-        return frame.envelope[expect] as? JsonObject ?: JsonObject(emptyMap())
+        return reply
+    }
+
+    /**
+     * Sends an attachment message (always a binary body, kdb-wire's codec) and returns the binary
+     * reply, which must be of type [expect].
+     */
+    private suspend fun requestBinary(type: WireMessageType, expect: WireMessageType, build: (WireHeader) -> WireMessage): WireMessage {
+        val frame =
+            exchange("0x${type.code.toString(16)}") { id ->
+                attachmentCodec.encode(build(WireHeader(type, correlationId = id, payloadLength = 0)))
+            }
+        val msg = frame.binary
+        if (msg == null || msg.header.messageType != expect) {
+            throw ProtocolException("kdb replica: expected binary ${expect.name}, got ${msg?.header?.messageType ?: frame.kind}")
+        }
+        return msg
     }
 
     public suspend fun close() {
@@ -361,6 +396,7 @@ public class PeerConnection private constructor(
             next = r.str("next"),
             done = r.bool("done"),
             total = r.int("total"),
+            attachmentTables = fromBase64(r.strOrNull("attachmentTables")),
         )
     }
 
@@ -383,20 +419,30 @@ public class PeerConnection private constructor(
         )
     }
 
+    /**
+     * TREE_NODES: nodes of the document tree [treeHex], or with [attachmentsAt] (a commit hash) of
+     * that commit's attachment table, whose entries map document ids to set hashes and whose nodes
+     * list those documents' sets (per node, as go/kdb/peersync/attachments.go writes them).
+     */
     public suspend fun treeNodes(
         namespace: String,
         treeHex: String,
         prefixes: List<String>,
         entryLimit: Int = DEFAULT_TREE_ENTRY_LIMIT,
+        attachmentsAt: String? = null,
     ): List<WireTreeNode> {
         val r =
             request(
                 SyncMsg.TREE_NODES,
                 buildJsonObject {
                     put("namespace", namespace)
-                    put("treeHex", treeHex)
+                    if (treeHex.isNotEmpty()) put("treeHex", treeHex)
                     put("prefixes", stringArray(prefixes))
                     put("entryLimit", entryLimit)
+                    if (attachmentsAt != null) {
+                        put("tree", "attachments")
+                        put("commitHex", attachmentsAt)
+                    }
                 },
                 "treeNodesResult",
             )
@@ -407,9 +453,33 @@ public class PeerConnection private constructor(
                 children = n.strings("children"),
                 hasEntries = n.bool("hasEntries"),
                 entries = (n["entries"] as? JsonObject)?.mapValues { (it.value as? JsonPrimitive)?.contentOrNull.orEmpty() }.orEmpty(),
+                attachments = attachmentMap(n["attachments"]),
             )
         }
     }
+
+    /** BLOB_FETCH: parts of attachment blobs, each with chunk proofs (verified by the caller, [BlobStore]). */
+    public suspend fun blobFetch(
+        namespace: String,
+        entries: List<WireBlobFetchEntry>,
+        maxBytes: Long = 8L shl 20,
+    ): WireMessage.BlobFetchResult =
+        requestBinary(WireMessageType.BLOB_FETCH, WireMessageType.BLOB_FETCH_RESULT) { h ->
+            WireMessage.BlobFetch(h, namespace, entries, maxBytes)
+        } as WireMessage.BlobFetchResult
+
+    /** ATTACHMENT_UPLOAD: one chunk of a blob upload on this sync session. */
+    public suspend fun upload(
+        namespace: String,
+        uploadId: String,
+        offset: Long,
+        data: ByteArray,
+        final: Boolean,
+        expect: KdbHash?,
+    ): WireMessage.AttachmentUploadResult =
+        requestBinary(WireMessageType.ATTACHMENT_UPLOAD, WireMessageType.ATTACHMENT_UPLOAD_RESULT) { h ->
+            WireMessage.AttachmentUpload(h, namespace, uploadId = uploadId, offset = offset, data = data, final = final, expect = expect)
+        } as WireMessage.AttachmentUploadResult
 
     /** OBJECT_FETCH: bodies by (id, content hash) at [treeHex]; returns the docs and the missing ids. */
     public suspend fun objectFetch(
@@ -470,6 +540,7 @@ public class PeerConnection private constructor(
             deletes = r.strings("deletes"),
             next = r.str("next"),
             done = r.bool("done"),
+            attachments = attachmentMap(r["attachments"]),
         )
     }
 
@@ -490,6 +561,12 @@ public class PeerConnection private constructor(
                                         if (d.body != null) put("body", d.body)
                                         if (d.deleted) put("deleted", true)
                                         if (d.baseHash != null) put("baseHash", d.baseHash)
+                                        if (d.keepBody) put("keepBody", true)
+                                        if (d.attachmentsChanged) {
+                                            put("attachmentsChanged", true)
+                                            put("attachments", wireAttachments(d.attachments.orEmpty()))
+                                            put("attachmentsBase", d.attachmentsBase.orEmpty())
+                                        }
                                     },
                                 )
                             }
@@ -502,7 +579,10 @@ public class PeerConnection private constructor(
             outcome = r.str("outcome"),
             commitHex = r.str("commitHex"),
             reason = r.str("reason"),
-            current = r.objects("current").map { CurrentDoc(it.str("docId"), it.strOrNull("body"), it.bool("absent")) },
+            current =
+                r.objects("current").map {
+                    CurrentDoc(it.str("docId"), it.strOrNull("body"), it.bool("absent"), attachmentList(it["attachments"]))
+                },
         )
     }
 
@@ -557,6 +637,29 @@ internal fun JsonObject.strings(k: String): List<String> =
     (this[k] as? JsonArray)?.mapNotNull { it.prim()?.contentOrNull }.orEmpty()
 
 internal fun JsonObject.objects(k: String): List<JsonObject> = (this[k] as? JsonArray)?.filterIsInstance<JsonObject>().orEmpty()
+
+internal fun attachmentList(e: JsonElement?): List<WireAttachment> =
+    (e as? JsonArray)?.filterIsInstance<JsonObject>().orEmpty().map {
+        WireAttachment(it.str("id"), it.str("name"), it.str("hash"), it.long("size"), it.str("mime"))
+    }
+
+internal fun attachmentMap(e: JsonElement?): Map<String, List<WireAttachment>> =
+    (e as? JsonObject)?.mapValues { attachmentList(it.value) }.orEmpty()
+
+internal fun wireAttachments(list: List<WireAttachment>): JsonArray =
+    buildJsonArray {
+        for (a in list) {
+            add(
+                buildJsonObject {
+                    put("id", a.id)
+                    put("name", a.name)
+                    put("hash", a.hash)
+                    put("size", a.size)
+                    if (a.mime.isNotEmpty()) put("mime", a.mime)
+                },
+            )
+        }
+    }
 
 private fun refsFrom(o: JsonObject): NamespaceRefs =
     NamespaceRefs(

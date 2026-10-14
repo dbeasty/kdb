@@ -155,6 +155,22 @@ class AttachmentWireTest {
     }
 
     @Test
+    fun uploadExpectIsField7AndRoundTrips() {
+        // Go's AttachmentUploadMessage.Expect: appendHash(b, 7, m.Expect), a 32-byte bytes field.
+        val codec = defaultWireCodec()
+        val expect = KdbHash(ByteArray(32) { 0xab.toByte() })
+        val msg = WireMessage.AttachmentUpload(h(3, WireMessageType.ATTACHMENT_UPLOAD), "ns", data = byteArrayOf(1), expect = expect)
+        val frame = codec.encode(msg)
+        assertTrue(toHex(frame).endsWith("2a0101" + "3a20" + "ab".repeat(32)), toHex(frame))
+        val back = codec.decode(frame) as WireMessage.AttachmentUpload
+        assertEquals(expect, back.expect)
+        assertEquals(null, (codec.decode(codec.encode(msg.copyWithoutExpect())) as WireMessage.AttachmentUpload).expect)
+    }
+
+    private fun WireMessage.AttachmentUpload.copyWithoutExpect() =
+        WireMessage.AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final)
+
+    @Test
     fun integrityRefusalsRoundTrip() {
         // A server refusing its damaged stored copy (Go: attachstore.ErrCorrupt -> INTEGRITY), on a
         // read page and on a BLOB_FETCH entry: the code survives the binary frame, as a string.
