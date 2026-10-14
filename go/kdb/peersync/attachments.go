@@ -1,8 +1,15 @@
 package peersync
 
 import (
+	"sort"
+
+	"context"
+	"github.com/limidus/kdb/go/kdb/schema"
+	"github.com/limidus/kdb/go/kdb/sql"
+
 	"errors"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/auth"
 	"io"
 	"sync"
 
@@ -37,8 +44,13 @@ const (
 
 func (h *V2Host) blobFetch(m wire.BlobFetchMessage) (wire.Message, error) {
 	env, err := h.env(m.Namespace, false, dirPull)
+	var canRead func(codec.UUID) bool
 	if err != nil {
-		return nil, err
+		// A projection session (a replica) reads what its subscription and document reads allow.
+		var perr error
+		if env, canRead, perr = h.projectionEnv(m.Namespace, false); perr != nil {
+			return nil, err
+		}
 	}
 	if env.Attachments == nil {
 		return nil, &UnsupportedFrameError{Type: m.H.MessageType}
@@ -58,6 +70,11 @@ func (h *V2Host) blobFetch(m wire.BlobFetchMessage) (wire.Message, error) {
 		if budget <= 0 {
 			out.More = true
 			break
+		}
+		if canRead != nil && !canRead(e.DocID) {
+			out.Parts = append(out.Parts, wire.BlobFetchPart{Index: i, Hash: e.Hash, Offset: e.Offset,
+				Error: "document " + e.DocID.String() + " is not readable by this session", ErrorCode: wire.ErrorCodeUnauthorized})
+			continue
 		}
 		part, used := serveBlobEntry(env, e, budget, head)
 		part.Index = i
@@ -161,7 +178,11 @@ type hostUpload struct {
 func (h *V2Host) attachmentUpload(m wire.AttachmentUploadMessage) (wire.Message, error) {
 	env, err := h.env(m.Namespace, false, dirPush)
 	if err != nil {
-		return nil, err
+		// A write-back projection uploads the blobs its writes attach before PROJECT_WRITE.
+		var perr error
+		if env, _, perr = h.projectionEnv(m.Namespace, true); perr != nil {
+			return nil, err
+		}
 	}
 	if env.Attachments == nil {
 		return nil, &UnsupportedFrameError{Type: m.H.MessageType}
@@ -525,8 +546,33 @@ func seedingSnapshotPages(env IngestEnv, fetch func(after string) (wire.Snapshot
 		if err := env.DAG.SeedPackedAttachmentTables(page.AttachmentTables); err != nil {
 			return page, fmt.Errorf("peer sync: snapshot attachment table: %w", err)
 		}
+		if env.AttachmentTableSeeded != nil {
+			if err := env.AttachmentTableSeeded(page.AttachmentTables); err != nil {
+				return page, err
+			}
+		}
 		return page, nil
 	}
+}
+
+// tableBlobs is commit's attachment table as puts of one synthetic commit, named commit - so
+// fetchBlobs asks for them at it, and uploadBlobs sends them. ok=false when commit has none.
+func tableBlobs(env IngestEnv, commit codec.Hash) (document.Commit, bool, error) {
+	cm, err := env.DAG.GetCommitOrThrow(commit)
+	if err != nil || cm.AttachmentTreeHash == nil {
+		return document.Commit{}, false, err
+	}
+	table, err := env.DAG.AttachmentTableAt(commit)
+	if err != nil {
+		return document.Commit{}, false, err
+	}
+	synthetic := document.Commit{Hash: commit}
+	table.Walk(func(doc codec.UUID, a document.Attachment) bool {
+		synthetic.Operations = append(synthetic.Operations, document.AttachmentPutOp{DocID: doc, AttachmentID: a.ID,
+			Name: a.Name, Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
+		return true
+	})
+	return synthetic, true, nil
 }
 
 // fetchTableBlobs takes in every blob commit's attachment table names that this node lacks - after
@@ -535,22 +581,68 @@ func (c *v2Conn) fetchTableBlobs(env IngestEnv, ns string, commit codec.Hash) er
 	if env.Attachments == nil || !containsString(c.caps, wire.SyncCapAttachments) {
 		return nil
 	}
-	cm, err := env.DAG.GetCommitOrThrow(commit)
-	if err != nil || cm.AttachmentTreeHash == nil {
+	synthetic, ok, err := tableBlobs(env, commit)
+	if err != nil || !ok {
 		return err
 	}
-	table, err := env.DAG.AttachmentTableAt(commit)
-	if err != nil {
-		return err
-	}
-	// As puts of one synthetic commit, so fetchBlobs asks for them at commit.
-	synthetic := document.Commit{Hash: commit}
-	table.Walk(func(doc codec.UUID, a document.Attachment) bool {
-		synthetic.Operations = append(synthetic.Operations, document.AttachmentPutOp{DocID: doc, AttachmentID: a.ID,
-			Name: a.Name, Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
-		return true
-	})
 	return c.fetchBlobs(env, ns, []document.Commit{synthetic})
+}
+
+// uploadTableBlobs sends the host every blob commit's attachment table names, before a pushed
+// graft or boundary state of commit - the host cannot fetch from a node that dialled it.
+func (c *v2Conn) uploadTableBlobs(env IngestEnv, ns string, commit codec.Hash) error {
+	if env.Attachments == nil || !containsString(c.caps, wire.SyncCapAttachments) {
+		return nil
+	}
+	synthetic, ok, err := tableBlobs(env, commit)
+	if err != nil || !ok {
+		return err
+	}
+	return c.uploadBlobs(env, ns, []document.Commit{synthetic})
+}
+
+// admitGraftAttachments seeds a pushed graft's attachment table before its root is admitted, and
+// refuses a graft whose root has attachments this node would then hold neither the table nor the
+// bytes of.
+func admitGraftAttachments(env IngestEnv, stage *graftStage) error {
+	root := stage.commit.AttachmentTreeHash
+	if root == nil {
+		return nil
+	}
+	if len(stage.attachTables) == 0 {
+		return fmt.Errorf("peer sync: pushed graft of %s has attachments but not their table - the pusher must be upgraded", stage.commit.Hash.Hex())
+	}
+	tables, err := document.ParsePackedAttachmentTables(stage.attachTables)
+	if err != nil {
+		return fmt.Errorf("peer sync: pushed graft attachment table: %w", err)
+	}
+	var table *document.AttachmentTable
+	for i := range tables {
+		if r := tables[i].Root(); r != nil && *r == *root {
+			table = &tables[i]
+		}
+	}
+	if table == nil {
+		return fmt.Errorf("peer sync: pushed graft of %s carries no attachment table with its root %s", stage.commit.Hash.Hex(), root.Hex())
+	}
+	if env.Attachments != nil {
+		var missing error
+		table.Walk(func(_ codec.UUID, a document.Attachment) bool {
+			if has, err := env.Attachments.Has(a.ContentHash); err != nil || !has {
+				missing = fmt.Errorf("peer sync: pushed graft of %s attaches %s, which was not uploaded", stage.commit.Hash.Hex(), a.ContentHash.Hex())
+				return false
+			}
+			return true
+		})
+		if missing != nil {
+			return missing
+		}
+	}
+	env.DAG.SeedAttachmentTable(*table)
+	if env.AttachmentTableSeeded != nil {
+		return env.AttachmentTableSeeded(document.AppendPackedAttachmentTables(nil, []document.AttachmentTable{*table}))
+	}
+	return nil
 }
 
 // withProjectedAttachments adds each written document's attachments at the page's commit.
@@ -616,4 +708,223 @@ func (h *V2Host) checkPeerAttachments(ns string, commits []document.Commit) erro
 		return &AttachmentsUnsupportedError{Namespace: ns, Commit: c.Hex()}
 	}
 	return nil
+}
+
+// projectionEnv is the namespace for a projection session's attachment frames: a subscriber may
+// read the blobs of documents it may read, and - on a host taking write-back - one that may commit
+// may upload. canRead answers per document.
+func (h *V2Host) projectionEnv(ns string, write bool) (IngestEnv, func(codec.UUID) bool, error) {
+	h.mu.Lock()
+	principal := h.principal
+	h.mu.Unlock()
+	authz := h.auth.Authorizer()
+	if err := authz.Authorize(context.Background(), principal, auth.StreamSubscribeAction{Namespace: ns}); err != nil {
+		return IngestEnv{}, nil, err
+	}
+	if write {
+		if h.cfg.WriteBack == nil {
+			return IngestEnv{}, nil, &UnsupportedFrameError{Type: wire.MsgAttachmentUpload}
+		}
+		if err := authz.Authorize(context.Background(), principal, auth.TxCommitAction{Namespace: ns}); err != nil {
+			return IngestEnv{}, nil, err
+		}
+	}
+	env, err := h.cfg.Namespaces.Env(ns, false)
+	if err != nil {
+		return IngestEnv{}, nil, err
+	}
+	return env, func(id codec.UUID) bool {
+		return authz.Authorize(context.Background(), principal, auth.DocumentReadAction{Namespace: ns, DocID: id.String()}) == nil
+	}, nil
+}
+
+// withAttachmentOnlyChanges adds, to the last page of a delta transfer, every document in the
+// projection whose attachments changed between the transfer's commits while its body did not: the
+// pagers diff document trees, which an attachment change leaves alone. Each goes as a write of its
+// (unchanged) body, so withProjectedAttachments then carries its new set.
+func withAttachmentOnlyChanges(env IngestEnv, page *wire.ProjectPageMessage, filter sql.Expr, canRead func(codec.UUID) bool, fromHex string) error {
+	if page.Reset || !page.Done || fromHex == "" || !env.DAG.HasAttachments() {
+		return nil
+	}
+	from, err := codec.HashFromHex(fromHex)
+	if err != nil {
+		return nil
+	}
+	at, err := codec.HashFromHex(page.AtHex)
+	if err != nil {
+		return err
+	}
+	before, err := env.DAG.AttachmentTableAt(from)
+	if err != nil {
+		return nil // the start is not resolvable here: the pagers already sent a reset
+	}
+	after, err := env.DAG.AttachmentTableAt(at)
+	if err != nil {
+		return err
+	}
+	if sameRootPtr(before.Root(), after.Root()) {
+		return nil
+	}
+	changed := map[codec.UUID]bool{}
+	sets := map[codec.UUID]codec.Hash{}
+	after.WalkDocuments(func(id codec.UUID, h codec.Hash) bool {
+		sets[id] = h
+		return true
+	})
+	before.WalkDocuments(func(id codec.UUID, h codec.Hash) bool {
+		if now, ok := sets[id]; !ok || now != h {
+			changed[id] = true
+		}
+		delete(sets, id)
+		return true
+	})
+	for id := range sets {
+		changed[id] = true
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+	// Documents the transfer already wrote or deleted carry their own state.
+	seen := map[string]bool{}
+	for _, w := range page.Writes {
+		seen[w.DocID] = true
+	}
+	for _, d := range page.Deletes {
+		seen[d] = true
+	}
+	atCommit, err := env.DAG.GetCommitOrThrow(at)
+	if err != nil {
+		return err
+	}
+	ids := make([]codec.UUID, 0, len(changed))
+	for id := range changed {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+	for _, id := range ids {
+		if seen[id.String()] {
+			continue
+		}
+		doc, err := env.Storage.GetDocument(env.NamespaceID, id, atCommit.DocumentTreeHash)
+		if err != nil {
+			return err
+		}
+		if doc == nil || !sql.EvalPredicate(filter, *doc, schema.None(), nil) || (canRead != nil && !canRead(id)) {
+			continue
+		}
+		page.Writes = append(page.Writes, wire.SnapshotDoc{DocID: id.String(), Body: doc.JSON})
+	}
+	return nil
+}
+
+func sameRootPtr(a, b *codec.Hash) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// AttachmentProjectionTarget is a projection target that keeps the attachments of the documents it
+// holds: page writes carry each document's set (applied as attachment operations, after the blobs
+// are fetched), and a write-back sends its writes' sets (after uploading the blobs).
+type AttachmentProjectionTarget interface {
+	AttachmentsOf(doc codec.UUID) (document.AttachmentSet, error)
+	AttachmentStore() *attachstore.Store
+}
+
+func parseTreeAttachments(items []wire.TreeAttachment) (document.AttachmentSet, error) {
+	out := make(document.AttachmentSet, 0, len(items))
+	for _, it := range items {
+		id, err := codec.ParseUUID(it.ID)
+		if err != nil {
+			return nil, err
+		}
+		h, err := codec.HashFromHex(it.Hash)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, document.Attachment{ID: id, Name: it.Name, AttachmentRef: document.AttachmentRef{
+			Scheme: document.AttachmentHashSchemeChunked1, ContentHash: h, Size: it.Size, Mime: it.Mime}})
+	}
+	return out, nil
+}
+
+// projectedAttachmentOps are the attachment operations that give every document a page writes the
+// set the page carries for it, its blobs fetched first.
+func (c *v2Conn) projectedAttachmentOps(t AttachmentProjectionTarget, env IngestEnv, ns string, page wire.ProjectPageMessage) ([]document.Op, error) {
+	at, err := codec.HashFromHex(page.AtHex)
+	if err != nil {
+		return nil, err
+	}
+	fetch := document.Commit{Hash: at}
+	var ops []document.Op
+	for _, w := range page.Writes {
+		id, err := codec.ParseUUID(w.DocID)
+		if err != nil {
+			return nil, err
+		}
+		want, err := parseTreeAttachments(page.Attachments[w.DocID])
+		if err != nil {
+			return nil, err
+		}
+		have, err := t.AttachmentsOf(id)
+		if err != nil {
+			return nil, err
+		}
+		docOps := document.AttachmentSetOps(id, have, want)
+		for _, op := range docOps {
+			if put, ok := op.(document.AttachmentPutOp); ok {
+				fetch.Operations = append(fetch.Operations, put)
+			}
+		}
+		ops = append(ops, docOps...)
+	}
+	if err := c.fetchBlobs(env, ns, []document.Commit{fetch}); err != nil {
+		return nil, err
+	}
+	return ops, nil
+}
+
+// writeBlobs is a pending write's attachments as puts, for uploadBlobs.
+func writeBlobs(w PendingWrite) document.Commit {
+	var c document.Commit
+	for _, d := range w.Docs {
+		id, err := codec.ParseUUID(d.DocID)
+		if err != nil || !d.AttachmentsChanged {
+			continue
+		}
+		set, err := parseTreeAttachments(d.Attachments)
+		if err != nil {
+			continue
+		}
+		for _, a := range set {
+			c.Operations = append(c.Operations, document.AttachmentPutOp{DocID: id, AttachmentID: a.ID, Name: a.Name,
+				Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
+		}
+	}
+	return c
+}
+
+// fetchCurrentBlobs fetches the blobs of the source's current state a refused write reports.
+func (c *v2Conn) fetchCurrentBlobs(env IngestEnv, ns string, r wire.ProjectWriteResultMessage) error {
+	at, err := codec.HashFromHex(r.CommitHex)
+	if err != nil {
+		return nil // no commit to fetch at: nothing with attachments was reported
+	}
+	fetch := document.Commit{Hash: at}
+	for _, cur := range r.Current {
+		id, err := codec.ParseUUID(cur.DocID)
+		if err != nil {
+			continue
+		}
+		set, err := parseTreeAttachments(cur.Attachments)
+		if err != nil {
+			return err
+		}
+		for _, a := range set {
+			fetch.Operations = append(fetch.Operations, document.AttachmentPutOp{DocID: id, AttachmentID: a.ID, Name: a.Name,
+				Scheme: a.Scheme, ContentHash: a.ContentHash, Size: a.Size, Mime: a.Mime})
+		}
+	}
+	return c.fetchBlobs(env, ns, []document.Commit{fetch})
 }

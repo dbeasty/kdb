@@ -3,6 +3,7 @@ package embed
 import (
 	"errors"
 	"fmt"
+	"github.com/limidus/kdb/go/kdb/storage"
 	"io"
 	"log"
 	"sort"
@@ -665,4 +666,51 @@ func (rt *EmbeddedKdbRuntime) HasAttachmentBlob(namespaceID string, h codec.Hash
 // ReadAttachmentBlob reads a whole blob, failing if it is over limit bytes.
 func (rt *EmbeddedKdbRuntime) ReadAttachmentBlob(namespaceID string, h codec.Hash, limit int64) ([]byte, error) {
 	return rt.AttachmentStore(namespaceID).ReadAll(h, limit)
+}
+
+func attachmentSeedsKey(namespaceID string) string { return "kdb:attachment-seeds:" + namespaceID }
+
+// PersistAttachmentSeed makes an attachment table peer sync seeded (packed: dag.PackAttachmentTables)
+// durable, for a commit this node holds no history below - a graft's or a boundary extension's root
+// - whose table no replay could derive. Kept with the namespace's earlier seeds, deduplicated by
+// root, and seeded again on every open.
+func (r *EmbeddedKdbRuntime) PersistAttachmentSeed(packed []byte) error {
+	if r.shim == nil || len(packed) == 0 {
+		return nil
+	}
+	key := attachmentSeedsKey(r.DefaultNamespace)
+	tables, err := document.ParsePackedAttachmentTables(packed)
+	if err != nil {
+		return err
+	}
+	if prev, err := r.shim.ReadSnapshot(key); err == nil && len(prev) > 0 {
+		old, err := document.ParsePackedAttachmentTables(prev)
+		if err != nil {
+			return err
+		}
+		tables = append(old, tables...)
+	}
+	seen := map[codec.Hash]bool{}
+	kept := tables[:0]
+	for _, t := range tables {
+		if root := t.Root(); root != nil && !seen[*root] {
+			seen[*root] = true
+			kept = append(kept, t)
+		}
+	}
+	return r.shim.WriteSnapshot(key, document.AppendPackedAttachmentTables(nil, kept))
+}
+
+func seedPersistedAttachmentTables(shim storage.PlatformIOShim, d *dag.InMemoryCommitDag, namespaceID string) error {
+	if shim == nil {
+		return nil
+	}
+	raw, err := shim.ReadSnapshot(attachmentSeedsKey(namespaceID))
+	if err != nil || len(raw) == 0 {
+		return nil // none recorded
+	}
+	if err := d.SeedPackedAttachmentTables(raw); err != nil {
+		return fmt.Errorf("kdb: namespace %s: persisted attachment tables: %w", namespaceID, err)
+	}
+	return nil
 }
