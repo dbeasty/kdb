@@ -662,6 +662,7 @@ func (s *LsmBlobStore) DiscoverTables() error {
 				level = n
 			}
 		}
+		noteAge(name)
 		s.AddTable(Handle{Level: level, SegmentName: name})
 	}
 	return nil
