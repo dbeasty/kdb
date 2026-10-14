@@ -321,6 +321,10 @@ identity = SHA-256(0x02 || be64(size) || tree)
   it). Pinned both ways by Go-generated goldens (pointers, format-1 delta bytes) and by a fixture
   store each side builds from one recipe and the other opens (`attachstore/kotlin_fixture_test.go`,
   kdb-jdbc `GoAttachStoreFixtureTest`).
+  Live interop against the real Kotlin service: the Go client (`client/jvm_attachments_interop_test.go`,
+  tag `interop`) and the TS client (`packages/kdb-client/test/interop-kotlin-attachments.test.ts`,
+  which connects with `skipVersionCheck`: the Kotlin server reports no `serverVersion`), both run
+  by CI's go-interop job. Kotlin JDBC against the Go server is `GoServerJdbcAttachmentInteropTest`.
 - **Write-back projections** (follow-up): `PROJECT_WRITE` docs carry a document's whole
   attachment set after the write (`attachmentsChanged`, `attachments`), guarded by the set the
   projection held (`attachmentsBase`), and attachment-only writes (`keepBody`); a refused write
