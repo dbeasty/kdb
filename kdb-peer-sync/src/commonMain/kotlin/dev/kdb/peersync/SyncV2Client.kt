@@ -6,8 +6,8 @@ import dev.kdb.error.ConflictReport
 import dev.kdb.stream.WireConnection
 import dev.kdb.wire.WireCodec
 import dev.kdb.wire.WireMessage
-import kotlinx.coroutines.delay
-import kotlin.time.TimeSource
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** One v2 connection's request/reply plumbing: sync frames are JSON envelopes, attachment frames
  * kdb-wire's binary ones, and a PEER_ERROR reply to either is thrown as [RemotePeerException]. */
@@ -33,24 +33,28 @@ internal class V2Conn(
 
     private suspend fun request(frame: ByteArray, cid: Int): ByteArray {
         conn.send(frame)
-        val deadline = TimeSource.Monotonic.markNow()
-        var idle = 0L
-        while (deadline.elapsedNow().inWholeMilliseconds < timeoutMillis) {
-            val reply = conn.tryPoll()
-            if (reply == null) {
-                // Back off from a spin to a few milliseconds: a reply usually lands at once.
-                delay(minOf(5L, idle++ / 64))
-                continue
+        // The incoming flow, not tryPoll: a poll cannot tell "no reply yet" from "the peer is gone",
+        // so a dropped connection used to cost the whole timeout. The flow ends (or throws the
+        // transport's error) the moment the connection closes. Collecting it again for the next
+        // request is fine: it reads the connection's channel without cancelling it.
+        val reply =
+            try {
+                withTimeoutOrNull(timeoutMillis) { conn.incoming().first { frameCorrelationId(it) == cid } }
+                    ?: throw PeerSyncException("peer sync: no reply to correlation $cid within ${timeoutMillis}ms")
+            } catch (e: NoSuchElementException) {
+                throw PeerSyncException("peer sync: the peer closed the connection before replying to correlation $cid", e)
+            } catch (e: PeerSyncException) {
+                throw e
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                throw PeerSyncException("peer sync: the connection failed before a reply to correlation $cid: ${e.message}", e)
             }
-            idle = 0
-            if (frameCorrelationId(reply) != cid) continue
-            if (frameTypeCode(reply) == SyncV2.PEER_ERROR) {
-                val e = SyncV2Codec.decode(reply) as SyncV2Message.PeerError
-                throw RemotePeerException(e.code, e.message)
-            }
-            return reply
+        if (frameTypeCode(reply) == SyncV2.PEER_ERROR) {
+            val e = SyncV2Codec.decode(reply) as SyncV2Message.PeerError
+            throw RemotePeerException(e.code, e.message)
         }
-        throw PeerSyncException("peer sync: no reply to correlation $cid within ${timeoutMillis}ms")
+        return reply
     }
 }
 

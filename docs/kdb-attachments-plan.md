@@ -378,9 +378,8 @@ identity = SHA-256(0x02 || be64(size) || tree)
 - **Kotlin peer sync** speaks only the v2 capabilities above: a Go peer never sends it snapshots,
   grafts, boundary states, squash catch-up, filters, `TREE_NODES`, projections, write-back, watches
   or archived-commit stubs, and a Kotlin node cannot bootstrap from a peer whose history it cannot
-  replay (a shallow root or retention floor). One namespace per Kotlin host. Each page works the
-  missing set out afresh (Go keeps a cursor), and a pull stores every page it fetched even when main
-  is not then adopted (as v1 did).
+  replay (a shallow root or retention floor). One namespace per Kotlin host. A pull stores every page
+  it fetched even when main is not then adopted (as v1 did).
 - **Kotlin** reads Go's checkpoints (#225) but derives no attachment table for a commit below a
   checkpoint's heads (their ops are not loaded for it).
 - **Downgrade** after attachments exist is impossible: older builds refuse the log.

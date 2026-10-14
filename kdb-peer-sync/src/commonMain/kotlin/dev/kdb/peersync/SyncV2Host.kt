@@ -7,6 +7,7 @@ import dev.kdb.auth.ConnectionContext
 import dev.kdb.auth.KdbAuthorizationException
 import dev.kdb.auth.Principal
 import dev.kdb.codec.KdbHash
+import dev.kdb.document.KdbCommit
 import dev.kdb.wire.WireCodec
 import dev.kdb.wire.WireMessage
 import kotlinx.coroutines.CoroutineScope
@@ -143,13 +144,75 @@ internal class SyncV2HostSession(
         return refsOf(ns.namespaceId, ns.dag)
     }
 
+    /**
+     * The session's fetch in progress (Go's missingCursor): what the peer still lacks, in the order
+     * pages serve it, and the last page served. Working the missing set out walks every commit the
+     * peer's haves reach, so doing it for every page made a long transfer quadratic. A request that
+     * continues the transfer - the same wants, naming the last page's tips as held - takes the next
+     * page from here; anything else starts over. A page refused and asked for again is the same page.
+     */
+    private class FetchCursor(
+        val wants: List<KdbHash>,
+        val order: List<KdbHash>,
+    ) {
+        var pos = 0 // order[pos..] is what the peer does not hold yet
+        var pageLen = 0
+        var pageTips: List<KdbHash> = emptyList()
+        var lastHaves: Set<KdbHash> = emptySet() // what the request for the last page named
+
+        /** The same request again (a page refused or lost): the same page. */
+        fun repeats(m: SyncV2Message.FetchRequest): Boolean = m.wants == wants && m.haves.toSet() == lastHaves
+
+        fun continues(m: SyncV2Message.FetchRequest): Boolean =
+            pageLen > 0 && m.wants == wants && m.haves.toSet().containsAll(pageTips)
+    }
+
+    private var fetchCursor: FetchCursor? = null
+
+    /** How many times the session worked a missing set out (tests: once per transfer). */
+    internal var missingWalks = 0
+        private set
+
+    /** The next page from [order] at [from]: commits loaded only as far as the page reaches (at least one),
+     * and whether that is all of them; null when one of them is gone from the DAG. */
+    private suspend fun pageFromOrder(
+        order: List<KdbHash>,
+        from: Int,
+        maxBytes: Int,
+    ): Pair<List<KdbCommit>, Boolean>? {
+        val budget = if (maxBytes <= 0) DEFAULT_PAGE_BYTES else maxBytes
+        val page = ArrayList<KdbCommit>()
+        var size = 0
+        for (i in from until order.size) {
+            val c = ns.dag.getCommit(order[i]) ?: return null
+            val bytes = c.toPayloadBytes().size + 4
+            if (page.isNotEmpty() && size + bytes > budget) break
+            size += bytes
+            page += c
+        }
+        return page to (from + page.size == order.size)
+    }
+
     private suspend fun fetch(m: SyncV2Message.FetchRequest): SyncV2Message.PackPage {
         authorize(m.namespace)
-        val (commits, done) = pageOf(missingCommits(ns.dag, m.wants, m.haves), m.maxBytes)
-        if (!peerAttachments) {
-            firstCommitWithAttachments(commits)?.let { throw AttachmentsUnsupportedException(m.namespace, it.hash.toHex()) }
+        var cur = fetchCursor?.takeIf { it.continues(m) || it.repeats(m) }
+        if (cur != null && !cur.repeats(m)) cur.pos += cur.pageLen
+        // A commit the cursor ordered can be gone (squashed since): then work the set out afresh.
+        var paged = cur?.let { pageFromOrder(it.order, it.pos, m.maxBytes) }
+        if (cur == null || paged == null) {
+            cur = FetchCursor(m.wants, missingCommits(ns.dag, m.wants, m.haves).map { it.hash })
+            missingWalks++
+            paged = pageFromOrder(cur.order, 0, m.maxBytes) ?: throw PeerSyncException("peer sync: the missing commits changed while paging")
         }
-        return SyncV2Message.PackPage(m.correlationId, m.namespace, commits, done = done, zstd = zstdPack)
+        val (page, done) = paged
+        cur.pageLen = page.size
+        cur.pageTips = pageTips(page)
+        cur.lastHaves = m.haves.toSet()
+        fetchCursor = if (done) null else cur
+        if (!peerAttachments) {
+            firstCommitWithAttachments(page)?.let { throw AttachmentsUnsupportedException(m.namespace, it.hash.toHex()) }
+        }
+        return SyncV2Message.PackPage(m.correlationId, m.namespace, page, done = done, zstd = zstdPack)
     }
 
     private suspend fun refUpdate(m: SyncV2Message.RefUpdate): SyncV2Message.RefUpdateAck {
