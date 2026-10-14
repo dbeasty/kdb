@@ -114,7 +114,7 @@ func goldenBlob() []byte {
 
 // blobFetchGolden is what a host holding goldenBlob, attached at a commit main still names, answers
 // to two BLOB_FETCH requests: the whole blob, then from its second chunk at most one chunk plus an
-// entry for a blob it does not hold. Each is the frame's length and SHA-256.
+// entry at an offset off a chunk boundary. Each is the frame's length and SHA-256.
 func blobFetchGoldenFrames(t *testing.T) [][]byte {
 	d, err := dag.NewInMemoryCommitDag("app/data")
 	if err != nil {
@@ -157,14 +157,16 @@ func blobFetchGoldenFrames(t *testing.T) [][]byte {
 	entry := wire.BlobFetchEntry{DocID: goldenDoc, AttachmentID: goldenAtt, CommitHex: c.Hash.Hex(), Hash: info.Hash}
 	second := entry
 	second.Offset, second.MaxBytes = document.AttachmentChunkBytes, 1
-	missing := entry
-	missing.Hash = goldenHash(5)
-	return [][]byte{serve(20, []wire.BlobFetchEntry{entry}), serve(21, []wire.BlobFetchEntry{second, missing})}
+	// An entry failing on its own, with a message naming nothing commit-specific: an offset off a
+	// chunk boundary.
+	misaligned := entry
+	misaligned.Offset = 5
+	return [][]byte{serve(20, []wire.BlobFetchEntry{entry}), serve(21, []wire.BlobFetchEntry{second, misaligned})}
 }
 
 var blobFetchGolden = []string{
 	"cdcdca2b753a88122500887dba0820046c9314c7d98e4310c1f9bbfd12d38dcf", // 2621728 bytes
-	"84aa833f5b7d8048859ef81ee26997677b7e95c9f624a0013b1fa17e7c66cd14", // 1049048 bytes
+	"59ed88a2d317077f63a780101e055b5cb1fe9c4ce8a296e36acc342e0cda900d", // 1048869 bytes
 }
 
 func TestKotlinSyncV2GoldenFrames(t *testing.T) {

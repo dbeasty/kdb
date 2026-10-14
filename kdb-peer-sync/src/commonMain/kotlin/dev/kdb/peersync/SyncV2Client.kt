@@ -111,6 +111,9 @@ internal class V2PeerSession(
 
     suspend fun close() = connection.close()
 
+    /** This session paging by [bytes] (tests: one commit a page). */
+    internal fun withPageBytes(bytes: Int): V2PeerSession = V2PeerSession(conn, connection, ns, remote, bytes)
+
     private suspend fun result(r: V2SyncResult): PeerSyncResult {
         val head = ns.dag.head()
         return PeerSyncResult(r.pulled, r.pushed, head, computeSyncPlan(ns.dag, head, remoteHead), r.conflict)
@@ -177,11 +180,10 @@ internal class V2PeerSession(
             val local = KdbHash.fromHex(ref.hex)
             val known = remoteTargets().filter { ns.dag.hasCommit(it) }
             val missing = missingCommits(ns.dag, listOf(local), known)
-            if (!attachments) {
-                firstCommitWithAttachments(missing)?.let {
-                    refErrors[ref.key] = AttachmentsUnsupportedException(ns.namespaceId, it.hash.toHex()).message!!
-                    continue
-                }
+            val unsendable = if (attachments) null else firstCommitWithAttachments(missing)
+            if (unsendable != null) {
+                refErrors[ref.key] = AttachmentsUnsupportedException(ns.namespaceId, unsendable.hash.toHex()).message!!
+                continue
             }
             val ack = sendRef(ref, missing, remoteHex ?: "")
             pushed += ack.stored
