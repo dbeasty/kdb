@@ -52,33 +52,46 @@ func pageCodecID(c storage.CompressionCodec) (byte, error) {
 // PageCodec frames commit payloads in KDBP pages.
 type PageCodec struct{}
 
-func (PageCodec) Frame(payload []byte, codec storage.CompressionCodec) ([]byte, error) {
+func (c PageCodec) Frame(payload []byte, codec storage.CompressionCodec) ([]byte, error) {
+	// Sized for the uncompressed body: a zstd frame of a small, incompressible payload runs a few
+	// bytes over, and AppendFrame's append grows it then.
+	out, err := c.AppendFrame(make([]byte, 0, PageFrameHeaderSize+len(payload)), payload, codec)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AppendFrame appends payload's frame - Frame's bytes - to dst, compressing straight into it. A
+// writer laying many frames into one buffer (DefaultWriter.AppendBatch) then pays no allocation
+// per frame: Frame used to compress into a buffer of its own and copy that into a frame of its
+// own, two payload-sized allocations per commit logged, for bytes copied once more into the
+// batch.
+func (PageCodec) AppendFrame(dst, payload []byte, codec storage.CompressionCodec) ([]byte, error) {
 	id, err := pageCodecID(codec)
 	if err != nil {
 		// Previously the unknown-codec branch fell through to compressing
 		// anyway, which wrote bytes no configuration could describe.
-		return nil, err
+		return dst, err
 	}
-	var body []byte
+	start := len(dst)
+	dst = append(dst, 0x4B, 0x44, 0x42, 0x50, PageFormatVersion, id, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 	switch id {
 	case pageCodecNone:
-		body = payload
+		dst = append(dst, payload...)
 	default:
-		body, err = compression.Compress(payload, 3)
+		framed, err := compression.CompressAppend(dst, payload, 3)
 		if err != nil {
-			return nil, err
+			return dst[:start], err
 		}
+		dst = framed
 	}
-	out := make([]byte, PageFrameHeaderSize+len(body))
-	out[0], out[1], out[2], out[3] = 0x4B, 0x44, 0x42, 0x50
-	out[4] = PageFormatVersion
-	out[5] = id
-	out[6], out[7] = 0, 0
-	writeInt(out, 8, len(body))
-	writeInt(out, 12, len(payload))
-	writeInt(out, 16, int(compression.CRC32All(body)))
-	copy(out[PageFrameHeaderSize:], body)
-	return out, nil
+	hdr, body := dst[start:], dst[start+PageFrameHeaderSize:]
+	writeInt(hdr, 8, len(body))
+	writeInt(hdr, 12, len(payload))
+	writeInt(hdr, 16, int(compression.CRC32All(body)))
+	return dst, nil
 }
 
 // Parse decodes one whole frame (header included) using the codec the frame

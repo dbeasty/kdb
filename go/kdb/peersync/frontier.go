@@ -18,12 +18,12 @@ const MaxPendingTips = 64
 // and the frontier stays the size of the history's width, not its length. Capped at max, oldest
 // dropped first. Returns a new slice; frontier is not modified.
 func foldFrontier(frontier []codec.Hash, page []document.Commit, max int) []codec.Hash {
-	named := make(map[codec.Hash]struct{}, len(page))
-	for _, c := range page {
-		for _, p := range c.ParentHashes {
-			named[p] = struct{}{}
-		}
-	}
+	named := namedParents(page)
+	return foldTips(frontier, named, tipsOf(page, named), max)
+}
+
+// foldTips is foldFrontier given the page's namedParents and its tips.
+func foldTips(frontier []codec.Hash, named map[codec.Hash]struct{}, tips []codec.Hash, max int) []codec.Hash {
 	out := make([]codec.Hash, 0, len(frontier)+2)
 	seen := make(map[codec.Hash]struct{}, len(frontier)+2)
 	for _, h := range frontier {
@@ -36,7 +36,7 @@ func foldFrontier(frontier []codec.Hash, page []document.Commit, max int) []code
 		seen[h] = struct{}{}
 		out = append(out, h)
 	}
-	for _, h := range pageTips(page) {
+	for _, h := range tips {
 		if _, dup := seen[h]; dup {
 			continue
 		}

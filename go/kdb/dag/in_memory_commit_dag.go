@@ -420,8 +420,13 @@ func (d *InMemoryCommitDag) putCommitLocked(commit document.Commit, requireParen
 		d.txIndex[commit.TransactionID] = commit.Hash
 	}
 	// A commit arriving here can be the one the head already names (delta replay onto a
-	// head pointed at a not-yet-resident hash), so the snapshot has to be rebuilt.
-	d.publishHeadLocked()
+	// head pointed at a not-yet-resident hash), so the snapshot has to be rebuilt. Any other
+	// commit leaves it as it was - the branches did not move, and the head's operations are
+	// pinned against the eviction trackOpsLocked ran - so it is not rebuilt for each of the
+	// commits a catch-up stores ahead of moving the head.
+	if s := d.head.Load(); s == nil || s.hash == commit.Hash {
+		d.publishHeadLocked()
+	}
 	return nil
 }
 
