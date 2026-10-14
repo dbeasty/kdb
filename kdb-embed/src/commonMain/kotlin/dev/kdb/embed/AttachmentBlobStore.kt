@@ -39,6 +39,7 @@ public class AttachmentBlobStore(
     private val mutex = Mutex()
     private val pins = mutableMapOf<KdbHash, Int>()
     private val doomed = mutableMapOf<KdbHash, String>() // pinned blobs to remove on last release: hash -> bytes segment
+    private val uploading = mutableSetOf<String>() // upload segments in flight, which collect must leave
 
     private fun pointerName(h: KdbHash) = prefix + "h-" + h.toHex()
 
@@ -48,6 +49,7 @@ public class AttachmentBlobStore(
      */
     public suspend fun put(source: AttachmentSource): StoredAttachmentBlob {
         val upload = prefix + "u-" + KdbUuid.random()
+        mutex.withLock { uploading += upload }
         val hasher = AttachmentHasher()
         val buf = ByteArray(ATTACHMENT_CHUNK_BYTES)
         var wroteAny = false
@@ -73,12 +75,14 @@ public class AttachmentBlobStore(
             shim.flushSegment(upload)
             shim.sealSegment(upload)
         } catch (e: Throwable) {
+            mutex.withLock { uploading -= upload }
             runCatching { shim.deleteSegment(upload) }
             throw e
         }
         val hash = hasher.finish()
         val size = hasher.size
         mutex.withLock {
+            uploading -= upload
             if (readPointer(hash) != null) {
                 // Already stored: the upload was a duplicate. A removal queued behind a reader is
                 // called off - the blob is wanted again.
@@ -149,7 +153,7 @@ public class AttachmentBlobStore(
                     shim.deleteSegment(name) // torn
                     continue
                 }
-                if (keep(h)) {
+                if (keep(h) || h in doomed) {
                     referenced += ptr.segment
                 } else {
                     deleteLocked(h)
@@ -158,7 +162,7 @@ public class AttachmentBlobStore(
                 }
             }
             for (name in names) {
-                if (name.startsWith(prefix + "u-") && name !in referenced && doomed.values.none { it == name }) {
+                if (name.startsWith(prefix + "u-") && name !in referenced && name !in uploading && doomed.values.none { it == name }) {
                     shim.deleteSegment(name)
                 }
             }
