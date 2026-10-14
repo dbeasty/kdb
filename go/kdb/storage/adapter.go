@@ -134,3 +134,33 @@ type TreePinner interface {
 	PinTree(treeHash codec.Hash)
 	UnpinTree(treeHash codec.Hash)
 }
+
+// ThroughReader is implemented by adapters that can read documents without caching them: what a
+// snapshot page wants, since it reads each document of the namespace once. treeHash is a document
+// tree hash, as for Adapter's atCommit; the result is GetDocuments'. Optional: a caller that finds
+// it missing uses GetDocuments.
+type ThroughReader interface {
+	ReadDocumentsThrough(namespaceID string, docIDs []codec.UUID, treeHash codec.Hash) ([]*document.Document, error)
+}
+
+// SnapshotApplier is implemented by adapters that can take a peer's snapshot into an empty
+// namespace in batches more cheaply than PutDocument and CommitTree: ApplySnapshotBatch is
+// PutDocument for each of docs followed by CommitTree, returning the tree, for a caller that adds
+// documents in ascending id order to a namespace that holds nothing else. Optional: a caller that
+// finds it missing uses PutDocument and CommitTree.
+type SnapshotApplier interface {
+	ApplySnapshotBatch(namespaceID string, docs []document.Document) (document.DocumentTree, error)
+}
+
+// ErrTreeBodiesUnsupported: see TreeBodyStreamer.
+var ErrTreeBodiesUnsupported = errors.New("storage: this adapter cannot stream a tree's bodies")
+
+// TreeBodyStreamer is implemented by adapters that can hand over the bodies a tree names in
+// whatever order is cheapest for them to read - for the engine, the order of its log - rather
+// than one random read per document. fn sees each (document, body) the tree names that the
+// adapter finds that way, possibly more than once and never in any promised order; a document it
+// does not find is read the ordinary way. A body is fn's to keep: it shares no buffer that would
+// keep anything else alive. ErrTreeBodiesUnsupported when it cannot do this at all.
+type TreeBodyStreamer interface {
+	StreamTreeBodies(namespaceID string, tree document.DocumentTree, fn func(docID codec.UUID, body string) error) error
+}

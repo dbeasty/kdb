@@ -47,6 +47,9 @@ const (
 )
 
 func encodeBlock(payload []byte, compress bool) ([]byte, error) {
+	if compress {
+		return appendBlock(nil, payload)
+	}
 	var body []byte
 	var err error
 	id := blockCodecNone
@@ -67,6 +70,26 @@ func encodeBlock(payload []byte, compress bool) ([]byte, error) {
 	writeInt(out, 8, len(payload))
 	writeInt(out, 12, int(compression.CRC32All(body)))
 	copy(out[blockHeaderSize:], body)
+	return out, nil
+}
+
+// appendBlock is encodeBlock(payload, true) appended to dst: compressed straight into place
+// behind its header, rather than into a buffer of its own that is then copied into a block that
+// is then copied into the table's write buffer - three allocations per value, and a memtable
+// flush writes one block per value.
+func appendBlock(dst, payload []byte) ([]byte, error) {
+	start := len(dst)
+	dst = append(dst, make([]byte, blockHeaderSize)...)
+	out, err := compression.CompressAppend(dst, payload, 3)
+	if err != nil {
+		return nil, err
+	}
+	body := out[start+blockHeaderSize:]
+	out[start] = blockFormatVersion
+	out[start+1] = blockCodecZSTD
+	writeInt(out, start+4, len(body))
+	writeInt(out, start+8, len(payload))
+	writeInt(out, start+12, int(compression.CRC32All(body)))
 	return out, nil
 }
 
@@ -244,6 +267,8 @@ type DefaultWriter struct {
 	// identical logical tables got different content hashes in the two languages.
 	entries []kv
 	pos     map[codec.Hash]int
+	// unique: the caller puts each key once (NewDefaultWriterUnique), so pos is not kept.
+	unique bool
 }
 
 type kv struct {
@@ -261,6 +286,22 @@ func (w *DefaultWriter) Put(key codec.Hash, value []byte) {
 	w.set(kv{key: key, value: append([]byte(nil), value...)})
 }
 
+// NewDefaultWriterUnique is NewDefaultWriter for a caller that puts or deletes each key once and
+// knows how many it will: the entries are sized up front and there is no last-word-wins index to
+// keep - a memtable generation, whose keys its own index already made unique.
+func NewDefaultWriterUnique(io storage.PlatformIOShim, namespaceID string, level, n int) *DefaultWriter {
+	w := NewDefaultWriter(io, namespaceID, level)
+	w.unique = true
+	w.entries = make([]kv, 0, n)
+	return w
+}
+
+// PutShared is Put without the copy, for a caller whose value will not change before Finish
+// returns - a memtable generation being flushed, which nothing writes to any more.
+func (w *DefaultWriter) PutShared(key codec.Hash, value []byte) {
+	w.set(kv{key: key, value: value})
+}
+
 // Delete records a tombstone for key. No block is written - the footer index entry alone carries
 // the fact - so a table of nothing but deletes costs one index line per key.
 func (w *DefaultWriter) Delete(key codec.Hash) {
@@ -271,6 +312,10 @@ func (w *DefaultWriter) Delete(key codec.Hash) {
 // is kept. A later Delete of an already-Put key therefore replaces it with a tombstone in place
 // rather than leaving a stale block ahead of it, and vice versa.
 func (w *DefaultWriter) set(e kv) {
+	if w.unique {
+		w.entries = append(w.entries, e)
+		return
+	}
 	if i, ok := w.pos[e.key]; ok {
 		w.entries[i] = e
 		return
@@ -361,6 +406,15 @@ func writeSidecar(shim storage.PlatformIOShim, segmentName string, index []index
 	}
 }
 
+// zstdBound is the most zstd can expand n bytes: ZSTD_COMPRESSBOUND.
+func zstdBound(n int) int {
+	bound := n + n>>8
+	if n < 128<<10 {
+		bound += (128<<10 - n) >> 11
+	}
+	return bound
+}
+
 // tableBuilder lays a table out as its entries arrive: each value is encoded and appended (in
 // finishBufferBytes batches) when it is put, and only the footer index - tens of bytes per key -
 // stays in memory until finish. The entries must arrive in the order the table is to hold them;
@@ -395,16 +449,21 @@ func newTableBuilder(shim storage.PlatformIOShim, segmentName string, entries in
 
 // put appends value's block under key.
 func (b *tableBuilder) put(key codec.Hash, value []byte) error {
-	block, err := encodeBlock(value, true)
-	if err != nil {
-		return err
-	}
-	if len(b.buf) > 0 && len(b.buf)+len(block) > finishBufferBytes {
+	// A block is never larger than its value plus its header and zstd's frame overhead, so
+	// flushing first whenever that would not fit keeps the buffer within finishBufferBytes as
+	// before, with the block encoded straight into it.
+	if len(b.buf) > 0 && len(b.buf)+blockHeaderSize+zstdBound(len(value)) > finishBufferBytes {
 		if err := b.flush(); err != nil {
 			return err
 		}
 	}
-	b.buf = append(b.buf, block...)
+	start := len(b.buf)
+	out, err := appendBlock(b.buf, value)
+	if err != nil {
+		return err
+	}
+	b.buf = out
+	block := out[start:]
 	// CompressedSize is the compressed body's own length - excluding encodeBlock's
 	// header (compSize/uncompSize/crc) - matching what Get() expects when it later reads
 	// bh.CompressedSize+blockHeaderSize bytes starting at Offset. This used to store

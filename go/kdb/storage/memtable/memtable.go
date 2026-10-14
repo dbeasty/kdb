@@ -431,9 +431,11 @@ func (mgr *Manager) Flush(level int) (sstable.Handle, error) {
 	mgr.active = NewSortedTable()
 	mgr.mu.Unlock()
 
-	writer := sstable.NewDefaultWriter(mgr.io, mgr.namespaceID, level)
+	entries := snap.snapshotEntries()
+	// The generation's own index made its keys unique.
+	writer := sstable.NewDefaultWriterUnique(mgr.io, mgr.namespaceID, level, len(entries))
 	count := 0
-	for _, e := range snap.snapshotEntries() {
+	for _, e := range entries {
 		// Tombstones are written, not skipped. Skipping them is what made a delete of an
 		// already-flushed key temporary: the tombstone lived only in the memtable, so the next
 		// flush erased the only record that the key had been deleted, and the value reappeared
@@ -441,7 +443,9 @@ func (mgr *Manager) Flush(level int) (sstable.Handle, error) {
 		if e.deleted {
 			writer.Delete(e.key)
 		} else {
-			writer.Put(e.key, e.value)
+			// The generation is frozen (it is no longer active, so nothing puts to it), so
+			// its arena's bytes can be written as they are.
+			writer.PutShared(e.key, e.value)
 		}
 		count++
 	}

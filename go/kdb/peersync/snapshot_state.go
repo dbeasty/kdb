@@ -52,6 +52,13 @@ func stateAt(env IngestEnv, walker storage.TreeWalker, commit document.Commit) (
 			return env.Storage.GetDocuments(env.NamespaceID, ids, commit.DocumentTreeHash)
 		},
 	}
+	if through, ok := env.Storage.(storage.ThroughReader); ok {
+		// A snapshot reads every document once: filling the cache with them would only evict
+		// what the node's own readers want.
+		direct.read = func(ids []codec.UUID) ([]*document.Document, error) {
+			return through.ReadDocumentsThrough(env.NamespaceID, ids, commit.DocumentTreeHash)
+		}
+	}
 	if resolver, ok := env.Storage.(storage.TreeResolver); ok {
 		direct.tree = func() (document.DocumentTree, bool, error) {
 			return resolver.TreeAt(commit.DocumentTreeHash)

@@ -98,6 +98,15 @@ func (c *DefaultCodec) encodeInto(fw *frameWriter, message Message) error {
 			return finishFrame(fw, message)
 		}
 	}
+	if page, ok := message.(SnapshotPageMessage); ok {
+		fw.reset()
+		fw.buf = append(fw.buf, encodingTag(c.encoding))
+		var err error
+		if fw.buf, err = appendSnapshotPageJSON(fw.buf, page); err != nil {
+			return err
+		}
+		return finishFrame(fw, message)
+	}
 	env, err := messageToEnvelope(message)
 	if err != nil {
 		return err

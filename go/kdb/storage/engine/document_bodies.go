@@ -127,6 +127,11 @@ func (e *ServerEngine) MaterializeLiveBodies() error {
 	}
 	defer e.bodiesExternal.Store(true)
 	tree := e.LiveTree()
+	if e.snapshotBodiesCover(tree) {
+		// Installed from a snapshot that wrote each body as it arrived: nothing is missing, and
+		// walking millions of entries to confirm it is the cost this skips.
+		return e.flushBodies()
+	}
 	var missing []treeEntryRef
 	tree.Walk(func(id codec.UUID, h codec.Hash) bool {
 		if e.memTable.Get(h) != nil {
@@ -159,6 +164,11 @@ func (e *ServerEngine) MaterializeLiveBodies() error {
 		}
 		e.memTable.Put(m.contentHash, []byte(doc.JSON))
 	}
+	return e.flushBodies()
+}
+
+// flushBodies makes what has been written to the blob store durable.
+func (e *ServerEngine) flushBodies() error {
 	if _, err := e.memTable.Flush(0); err != nil {
 		return err
 	}

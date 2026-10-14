@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"unsafe"
 
 	"github.com/limidus/kdb/go/kdb/wire"
 )
@@ -103,13 +104,21 @@ func (s *pageSpool) each(maxBytes, limit int, fn func(docs []wire.SnapshotDoc) e
 // reader returns a function yielding the spool's documents in order, in batches as each makes
 // them; an empty batch means the end. Each batch is a fresh slice the caller may keep.
 func (s *pageSpool) reader(maxBytes, limit int) (func() ([]wire.SnapshotDoc, error), error) {
-	if err := s.w.Flush(); err != nil {
-		return nil, s.writeErr(err)
+	return s.readerSized(maxBytes, limit, spoolBufferBytes)
+}
+
+// readerSized is reader with a read buffer of bufBytes: small for a reader that is one of many
+// open at once (a merge of sorted runs).
+func (s *pageSpool) readerSized(maxBytes, limit, bufBytes int) (func() ([]wire.SnapshotDoc, error), error) {
+	if s.w.Buffered() > 0 {
+		if err := s.w.Flush(); err != nil {
+			return nil, s.writeErr(err)
+		}
 	}
 	if maxBytes <= 0 {
 		maxBytes = DefaultPageBytes
 	}
-	r := bufio.NewReaderSize(io.NewSectionReader(s.f, 0, s.size), spoolBufferBytes)
+	r := bufio.NewReaderSize(io.NewSectionReader(s.f, 0, s.size), bufBytes)
 	read := 0
 	// held is a document read past the end of the previous batch: the one that did not fit.
 	var held *wire.SnapshotDoc
@@ -136,7 +145,8 @@ func (s *pageSpool) reader(maxBytes, limit int) (func() ([]wire.SnapshotDoc, err
 				return nil, s.readErr(err)
 			}
 			read++
-			d := wire.SnapshotDoc{DocID: string(buf[:idLen]), Body: string(buf[idLen:])}
+			// The strings share buf, which nothing writes again: one copy per document, not three.
+			d := wire.SnapshotDoc{DocID: unsafe.String(unsafe.SliceData(buf), idLen), Body: unsafe.String(unsafe.SliceData(buf[idLen:]), bodyLen)}
 			if len(batch) > 0 && size+len(d.Body) > maxBytes {
 				held = &d
 				return batch, nil

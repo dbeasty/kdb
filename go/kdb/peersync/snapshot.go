@@ -66,7 +66,10 @@ func snapshotPageDocs(env IngestEnv, at codec.Hash, after string, maxBytes int) 
 		}
 		if ok {
 			if cursor, ok := snapshotCursor(after); ok {
-				return snapshotPageSeek(env, state, tree, commit, cursor, maxBytes)
+				src := sortedBodiesFor(env, commit.Hash, tree)
+				cur := src.cursorAt(after)
+				defer src.release(cur)
+				return snapshotPageSeek(env, state, tree, commit, cursor, cur, maxBytes)
 			}
 		}
 	}
@@ -92,8 +95,10 @@ func snapshotCursor(after string) (*codec.UUID, bool) {
 }
 
 // snapshotPageSeek is snapshotPage over an ordered tree: it seeks to the cursor and reads forward,
-// so the work is the page's documents plus the trie's depth, whatever the namespace's size.
-func snapshotPageSeek(env IngestEnv, state snapshotState, tree document.DocumentTree, commit document.Commit, cursor *codec.UUID, maxBytes int) (wire.SnapshotPageMessage, error) {
+// so the work is the page's documents plus the trie's depth, whatever the namespace's size. Bodies
+// come from bodies, a cursor over the snapshot's sorted copy, where it has them (see
+// snapshot_source.go); nil reads every one from storage.
+func snapshotPageSeek(env IngestEnv, state snapshotState, tree document.DocumentTree, commit document.Commit, cursor *codec.UUID, bodies *bodyCursor, maxBytes int) (wire.SnapshotPageMessage, error) {
 	page := wire.SnapshotPageMessage{Namespace: env.NamespaceID, Commit: commit, Total: tree.Size(), Done: true}
 	size := 0
 	ids := make([]codec.UUID, 0, snapshotChunk)
@@ -110,6 +115,17 @@ func snapshotPageSeek(env IngestEnv, state snapshotState, tree document.Document
 		}
 		if len(ids) == 0 {
 			return page, nil
+		}
+		if bodies != nil && bodies.err == nil {
+			// One at a time, so the cursor never passes the end of the page: the next page
+			// continues from where this one stopped, with the same cursor.
+			full, err := pageFromCursor(&page, &size, state, bodies, ids, commit, maxBytes)
+			if err != nil || full {
+				return page, err
+			}
+			last := ids[len(ids)-1]
+			cursor = &last
+			continue
 		}
 		docs, err := state.read(ids)
 		if err != nil {
@@ -185,6 +201,10 @@ func snapshotPageScan(env IngestEnv, state snapshotState, commit document.Commit
 //  2. Install, under the node's serialization (for the server, its write gate). The namespace is
 //     checked to be empty again, then the staged documents are applied in page-sized batches,
 //     the tree they built checked against the commit's, the root admitted and main moved.
+//     Storage that takes a snapshot in bulk (storage.SnapshotApplier: the server engine) writes
+//     each batch's bodies straight to its blob store and holds none of them, so the install's
+//     memory is a batch whatever the namespace's size; anything else gets PutDocument and
+//     CommitTree per batch.
 //
 // The gate cannot be let go between batches of phase 2: storage has one live tree per namespace
 // (CommitTree builds on it, not on the tree it is passed), so a local commit taken between two
@@ -282,18 +302,34 @@ func InstallSnapshot(env IngestEnv, fetch func(after string) (wire.SnapshotPageM
 		}
 		// Applied in page-sized batches, each committed as it goes rather than staging the whole
 		// namespace: the pending set is memory, and a snapshot is by definition all of it.
+		//
+		// Storage that can take a snapshot in bulk (storage.SnapshotApplier) does: the ordinary
+		// path holds every body in memory until the install is made durable.
 		var built document.DocumentTree
+		applier, bulk := env.Storage.(storage.SnapshotApplier)
+		batch := make([]document.Document, 0, snapshotChunk)
 		applyErr := spool.each(DefaultPageBytes, -1, func(docs []wire.SnapshotDoc) error {
+			batch = batch[:0]
 			for _, d := range docs {
 				id, err := codec.ParseUUID(d.DocID)
 				if err != nil {
 					return err
 				}
-				if err := env.Storage.PutDocument(env.NamespaceID, document.Document{ID: id, JSON: d.Body}); err != nil {
-					return err
-				}
+				batch = append(batch, document.Document{ID: id, JSON: d.Body})
 			}
-			b, err := env.Storage.CommitTree(env.NamespaceID, tree)
+			var b document.DocumentTree
+			var err error
+			if bulk {
+				b, err = applier.ApplySnapshotBatch(env.NamespaceID, batch)
+			} else {
+				for _, d := range batch {
+					if err := env.Storage.PutDocument(env.NamespaceID, d); err != nil {
+						return err
+					}
+				}
+				b, err = env.Storage.CommitTree(env.NamespaceID, tree)
+			}
+			clear(batch)
 			if err != nil {
 				return err
 			}
