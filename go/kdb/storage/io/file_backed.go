@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 
 	"github.com/limidus/kdb/go/kdb/storage"
@@ -16,20 +15,26 @@ type FileBackedPlatformIO struct {
 	config PlatformIOConfig
 	store  SegmentByteStore
 
+	// segmentLocks are the per-segment locks: a fixed array of stripes chosen by a hash of the
+	// name (see segmentLocks), so they cost the same at a hundred segments as at ten million.
+	// Appends, seals, restores and deletes take a segment's lock exclusively; reads (and
+	// size/stamp queries) share it. A read must not see an append half-applied - a positional
+	// read racing a write can return the front of a frame without its tail - but two reads never
+	// disturb each other: OSByteStore reads with pread on a shared handle (ReadAt), which needs
+	// no lock and keeps no file position. Reads used to take the lock exclusively too, so
+	// concurrent cold reads of one segment queued behind each other for the length of every
+	// disk read.
+	segmentLocks segmentLocks
+
+	// globalMu guards sealed and generations.
 	globalMu sync.Mutex
-	// segmentMu holds one lock per segment. Appends, seals, restores and deletes take it
-	// exclusively; reads (and size/stamp queries) share it. A read must not see an append
-	// half-applied - a positional read racing a write can return the front of a frame without
-	// its tail - but two reads never disturb each other: OSByteStore reads with pread on a shared
-	// handle (ReadAt), which needs no lock and keeps no file position. Reads used to take the
-	// lock exclusively too, so concurrent cold reads of one segment queued behind each other for
-	// the length of every disk read.
-	segmentMu      map[string]*sync.RWMutex
-	sealedSegments map[string]struct{}
+	// sealed is what this process has sealed or restored, bounded (see sealedSegments).
+	sealed *sealedSegments
 	// generations names each segment's current incarnation (storage.SegmentGenerationer). Assigned
 	// on first ask and forgotten when the segment is deleted, restored or its namespace released,
-	// so whatever carries the name afterwards is asked about under a new number.
-	generations map[string]uint64
+	// so whatever carries the name afterwards is asked about under a new number - and, past a
+	// bound, forgotten anyway, which costs a cache miss (see segmentGenerations).
+	generations *segmentGenerations
 }
 
 // HasArchive reports whether the store beneath this shim keeps a copy of what it deletes, which
@@ -55,7 +60,7 @@ func (f *FileBackedPlatformIO) RestoreSegment(segmentName string) error {
 	if !ok {
 		return fmt.Errorf("this storage has no archive to restore %s from", segmentName)
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.Lock()
 	defer mu.Unlock()
 	if err := store.RestoreSegment(segmentName); err != nil {
@@ -65,8 +70,8 @@ func (f *FileBackedPlatformIO) RestoreSegment(segmentName string) error {
 	// nothing appends to it again. Recording that keeps a later writer from treating it as the
 	// open segment and appending into history.
 	f.globalMu.Lock()
-	f.sealedSegments[segmentName] = struct{}{}
-	delete(f.generations, segmentName)
+	f.sealed.restore(segmentName)
+	f.generations.forget(segmentName)
 	f.globalMu.Unlock()
 	return nil
 }
@@ -74,23 +79,11 @@ func (f *FileBackedPlatformIO) RestoreSegment(segmentName string) error {
 // NewFileBackedPlatformIO wraps a SegmentByteStore with shared locking.
 func NewFileBackedPlatformIO(config PlatformIOConfig, store SegmentByteStore) *FileBackedPlatformIO {
 	return &FileBackedPlatformIO{
-		config:         config,
-		store:          store,
-		segmentMu:      make(map[string]*sync.RWMutex),
-		sealedSegments: make(map[string]struct{}),
-		generations:    make(map[string]uint64),
+		config:      config,
+		store:       store,
+		sealed:      newSealedSegments(defaultSealedMemory),
+		generations: newSegmentGenerations(defaultGenerationMemory),
 	}
-}
-
-func (f *FileBackedPlatformIO) mutexFor(segmentName string) *sync.RWMutex {
-	f.globalMu.Lock()
-	defer f.globalMu.Unlock()
-	m, ok := f.segmentMu[segmentName]
-	if !ok {
-		m = &sync.RWMutex{}
-		f.segmentMu[segmentName] = m
-	}
-	return m
 }
 
 // MaxAppendBytes is the largest single append this shim will accept. Writers that build a
@@ -121,11 +114,11 @@ func (f *FileBackedPlatformIO) AppendToSegment(segmentName string, bytes []byte)
 			SegmentName: segmentName,
 		}
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.Lock()
 	defer mu.Unlock()
 	f.globalMu.Lock()
-	_, sealed := f.sealedSegments[segmentName]
+	sealed := f.sealed.has(segmentName)
 	f.globalMu.Unlock()
 	if sealed {
 		return 0, &PlatformIOError{Message: "segment sealed", SegmentName: segmentName}
@@ -144,7 +137,7 @@ func (f *FileBackedPlatformIO) ReadFromSegment(segmentName string, offset int64,
 	if offset < 0 || length < 0 {
 		return nil, &PlatformIOError{Message: "negative offset or length", SegmentName: segmentName}
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.RLock()
 	defer mu.RUnlock()
 	b, err := f.store.Read(segmentName, offset, length)
@@ -166,7 +159,7 @@ func (f *FileBackedPlatformIO) ReadFromSegmentInto(segmentName string, offset in
 	if offset < 0 {
 		return 0, &PlatformIOError{Message: "negative offset or length", SegmentName: segmentName}
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.RLock()
 	defer mu.RUnlock()
 	n, err := readIntoStore(f.store, segmentName, offset, dst)
@@ -204,7 +197,7 @@ func (f *FileBackedPlatformIO) SegmentSize(segmentName string) (int64, error) {
 	if !ok {
 		return 0, storage.ErrSegmentSizeUnknown
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.RLock()
 	defer mu.RUnlock()
 	n, err := sz.Size(segmentName)
@@ -232,7 +225,7 @@ func (f *FileBackedPlatformIO) SegmentStamp(segmentName string) (storage.Segment
 	if !has {
 		return storage.SegmentStamp{}, false, nil
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.RLock()
 	defer mu.RUnlock()
 	size, mod, ok, err := st.Stamp(segmentName)
@@ -244,7 +237,7 @@ func (f *FileBackedPlatformIO) SegmentStamp(segmentName string) (storage.Segment
 
 var _ storage.SegmentStamper = (*FileBackedPlatformIO)(nil)
 
-// FlushSegment deliberately does NOT take mutexFor(segmentName): that
+// FlushSegment deliberately does NOT take segmentName's lock: that
 // mutex also guards AppendToSegment, and group commit relies on new
 // appends being able to proceed (and register with the GroupCommitter)
 // *while* a physical fsync is in flight. Sharing the lock here would
@@ -268,11 +261,11 @@ func (f *FileBackedPlatformIO) SealSegment(segmentName string) error {
 	if err := ValidateSegmentName(segmentName); err != nil {
 		return err
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.Lock()
 	defer mu.Unlock()
 	f.globalMu.Lock()
-	if _, ok := f.sealedSegments[segmentName]; ok {
+	if f.sealed.has(segmentName) {
 		f.globalMu.Unlock()
 		return nil
 	}
@@ -284,7 +277,7 @@ func (f *FileBackedPlatformIO) SealSegment(segmentName string) error {
 		return &PlatformIOError{Message: "seal failed: " + err.Error(), SegmentName: segmentName, Cause: err}
 	}
 	f.globalMu.Lock()
-	f.sealedSegments[segmentName] = struct{}{}
+	f.sealed.seal(segmentName)
 	f.globalMu.Unlock()
 	return nil
 }
@@ -311,13 +304,12 @@ func (f *FileBackedPlatformIO) DeleteSegment(segmentName string) error {
 	if err := ValidateSegmentName(segmentName); err != nil {
 		return err
 	}
-	mu := f.mutexFor(segmentName)
+	mu := f.segmentLocks.forName(segmentName)
 	mu.Lock()
 	defer mu.Unlock()
 	f.globalMu.Lock()
-	delete(f.sealedSegments, segmentName)
-	delete(f.segmentMu, segmentName)
-	delete(f.generations, segmentName)
+	f.sealed.forget(segmentName)
+	f.generations.forget(segmentName)
 	f.globalMu.Unlock()
 	return f.store.Delete(segmentName)
 }
@@ -326,7 +318,7 @@ func (f *FileBackedPlatformIO) DeleteSegment(segmentName string) error {
 // the shim is configured to fsync, so the new name never comes to hold less than was written under
 // the old one; the store then renames it and makes the rename durable.
 //
-// Both names' locks are held, taken in name order so two renames between the same pair cannot
+// Both names' locks are held, taken in stripe order so two renames between the same pair cannot
 // deadlock. A store that cannot rename (one written against SegmentByteStore alone) reports
 // storage.ErrRenameUnsupported.
 func (f *FileBackedPlatformIO) RenameSegment(from, to string) error {
@@ -343,16 +335,9 @@ func (f *FileBackedPlatformIO) RenameSegment(from, to string) error {
 	if !ok {
 		return storage.ErrRenameUnsupported
 	}
-	first, second := f.mutexFor(from), f.mutexFor(to)
-	if to < from {
-		first, second = second, first
-	}
-	first.Lock()
-	defer first.Unlock()
-	second.Lock()
-	defer second.Unlock()
+	defer f.segmentLocks.lockPair(from, to)()
 	f.globalMu.Lock()
-	_, sealed := f.sealedSegments[from]
+	sealed := f.sealed.has(from)
 	f.globalMu.Unlock()
 	if sealed {
 		// Sealed is when replicas get their copy, under the name it had then.
@@ -365,9 +350,9 @@ func (f *FileBackedPlatformIO) RenameSegment(from, to string) error {
 		return &PlatformIOError{Message: "rename failed: " + err.Error(), SegmentName: from, Cause: err}
 	}
 	f.globalMu.Lock()
-	delete(f.generations, from)
-	delete(f.generations, to)
-	delete(f.sealedSegments, to)
+	f.generations.forget(from)
+	f.generations.forget(to)
+	f.sealed.forget(to)
 	f.globalMu.Unlock()
 	return nil
 }
@@ -417,12 +402,7 @@ var _ storage.PlatformIOShim = (*FileBackedPlatformIO)(nil)
 func (f *FileBackedPlatformIO) SegmentGeneration(segmentName string) (uint64, bool) {
 	f.globalMu.Lock()
 	defer f.globalMu.Unlock()
-	g, ok := f.generations[segmentName]
-	if !ok {
-		g = storage.NextSegmentGeneration()
-		f.generations[segmentName] = g
-	}
-	return g, true
+	return f.generations.get(segmentName, storage.NextSegmentGeneration), true
 }
 
 var _ storage.SegmentGenerationer = (*FileBackedPlatformIO)(nil)
@@ -448,23 +428,10 @@ func (f *FileBackedPlatformIOFactory) Open(config PlatformIOConfig) (storage.Pla
 // store's handles for them - for a namespace that has closed (see HandleReleaser).
 func (f *FileBackedPlatformIO) ReleaseHandles(prefix string) error {
 	f.globalMu.Lock()
-	for name := range f.segmentMu {
-		if strings.HasPrefix(name, prefix) {
-			delete(f.segmentMu, name)
-		}
-	}
-	for name := range f.sealedSegments {
-		if strings.HasPrefix(name, prefix) {
-			delete(f.sealedSegments, name)
-		}
-	}
+	f.sealed.forgetPrefix(prefix)
 	// A namespace that closed may be changed by another process before it opens again, so it
 	// comes back under new generations and nothing cached about it before is asked for again.
-	for name := range f.generations {
-		if strings.HasPrefix(name, prefix) {
-			delete(f.generations, name)
-		}
-	}
+	f.generations.forgetPrefix(prefix)
 	f.globalMu.Unlock()
 	if r, ok := f.store.(HandleReleaser); ok {
 		return r.ReleaseHandles(prefix)
