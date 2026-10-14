@@ -15,12 +15,19 @@
 import { fromHex } from "./bytes.ts";
 import { contentHash, decodeCommit, type Commit } from "./commit.ts";
 import { ReplicaNamespace, type TreeNodeView } from "./namespace.ts";
+import type { ProjectionNamespace, WriteBackDoc } from "./projection.ts";
+
+export class SingleHomeError extends Error {
+  override name = "SingleHomeError";
+}
 import {
   DEFAULT_TREE_ENTRY_LIMIT,
   MAX_OBJECT_FETCH_ITEMS,
   MAX_TREE_NODE_PREFIXES,
   ProtocolError,
+  RemoteError,
   type ConflictReport,
+  type ProjectWriteResult,
   type NamespaceRefs,
   type PeerConnection,
   type WireTreeNode,
@@ -70,7 +77,23 @@ export async function syncNamespace(
     if (remote.access === "pull") {
       throw new ProtocolError(`kdb replica: ${ns.name} is read-only for this token; its local commits cannot be pushed`);
     }
-    const ack = await push(conn, ns, remoteMain, opts);
+    let ack;
+    try {
+      ack = await push(conn, ns, remoteMain, opts);
+    } catch (e) {
+      // NOT_HOME, or - once the host knows the handover point - its refusal of a commit made after
+      // it by a node that is not the home (server.StaleFenceError, sent as CONFLICT; the wire has
+      // no code of its own for it, so it is recognised by its message).
+      if (e instanceof RemoteError && (e.code === "NOT_HOME" || (e.code === "CONFLICT" && /home is now at fence/.test(e.message)))) {
+        // Plan D6: a single-home namespace takes writes only at its home, so a replica that wants
+        // to write it holds it filtered with write-back, which queues writes until the home is
+        // reachable. Its local commits here can never be pushed.
+        throw new SingleHomeError(
+          `kdb replica: ${ns.name} is single-home (${e.message}); open it with mode "filtered" and writeBack to write to it`,
+        );
+      }
+      throw e;
+    }
     res.pushOutcome = ack.outcome;
     if (ack.outcome === "conflict") {
       res.conflict = ack.conflict;
@@ -296,4 +319,61 @@ async function converge(conn: PeerConnection, ns: ReplicaNamespace, treeHex: str
     await ns.applyConvergePage(page, chunk.at(-1)![0]);
   }
   return diff.changes.map(([id]) => id);
+}
+
+// --- filtered namespaces (plan §4.2) ------------------------------------------------------------
+
+export interface ProjectionSyncResult {
+  namespace: string;
+  filter: string;
+  /** Outbox entries the source applied this round. */
+  applied: number;
+  /** Outbox entries the source did not apply: their documents went back to the source's state. */
+  rejected: { txId: string; outcome: string; reason: string; docs: WriteBackDoc[]; current: ProjectWriteResult["current"] }[];
+  /** Why write-back stopped early (a transient refusal such as NOT_HOME); the rest stays queued. */
+  deferred?: string;
+  reset: boolean;
+  changed: string[];
+  lastSource: string;
+}
+
+export async function syncProjection(conn: PeerConnection, p: ProjectionNamespace, opts: SyncOptions): Promise<ProjectionSyncResult> {
+  const res: ProjectionSyncResult = { namespace: p.name, filter: p.filter, applied: 0, rejected: [], reset: false, changed: [], lastSource: p.lastSource };
+  if (p.writeBack) {
+    if (!conn.has("writeback")) throw new ProtocolError(`kdb replica: the host does not take write-back for ${p.name}`);
+    for (const entry of await p.outbox()) {
+      let r: ProjectWriteResult;
+      try {
+        r = await conn.projectWrite(p.name, entry.txId, entry.docs);
+      } catch (e) {
+        if (e instanceof RemoteError) {
+          // Transient at the source (not its home, busy): keep the queue, in order, for next time.
+          res.deferred = `${e.code}: ${e.message}`;
+          break;
+        }
+        throw e;
+      }
+      if (r.outcome === "applied") {
+        await p.resolve(entry, null);
+        res.applied++;
+      } else {
+        await p.resolve(entry, r.current);
+        res.rejected.push({ txId: entry.txId, outcome: r.outcome, reason: r.reason, docs: entry.docs, current: r.current });
+        res.changed.push(...r.current.map((c) => c.docId));
+      }
+    }
+  }
+  const t = await p.beginTransfer();
+  let at = t.at, after = t.after;
+  for (;;) {
+    const page = await conn.projectFetch(p.name, p.filter, t.from, at, after, opts.pageBytes);
+    if (at === "") at = page.atHex;
+    if (page.atHex !== at) throw new ProtocolError(`kdb replica: projection page is at ${page.atHex}, not ${at}`);
+    res.reset ||= page.reset;
+    res.changed.push(...(await p.applyPage(t.from, after, page)));
+    if (page.done) break;
+    after = page.next;
+  }
+  res.lastSource = p.lastSource;
+  return res;
 }

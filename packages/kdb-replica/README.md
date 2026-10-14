@@ -10,7 +10,10 @@ import { openReplica, IndexedDbStore } from "@kdb/replica";
 const db = await openReplica({
   store: await IndexedDbStore.open("my-app"),
   peer: { url: "wss://api.example.com/kdb/sync", token: () => auth.currentToken() },
-  namespaces: [{ ns: "app/u/42" }],
+  namespaces: [
+    { ns: "app/u/42" },                                                      // the whole namespace
+    { ns: "shop/orders", mode: "filtered", filter: "region = 'EU'", writeBack: true },
+  ],
 });
 await db.put("app/u/42", id, { theme: "dark" }); // local, durable, pushed in the background
 await db.get("app/u/42", id);
@@ -18,12 +21,13 @@ db.on("change", (e) => render(e.ids));
 db.on("conflict", (e) => askUser(e.report));
 ```
 
-**Status: whole-namespace replicas** (plan PR 2). Filtered replicas with write-back come next.
+**Status:** whole-namespace replicas (plan PR 2) and filtered replicas with write-back (PR 3).
 
 | Part | What it is |
 |---|---|
 | `openReplica` / `Replica` | Local reads and writes, sync rounds (poll, after a write, `syncNow()`), `change` / `conflict` / `sync` events, `status()`. |
 | Sync (`syncNamespace`) | Pushes local commits (REF_UPDATE; the host merges, the replica never does). Pulls with the messages nodes use: a snapshot (SNAPSHOT_FETCH) for an empty namespace, then either replay (FETCH/PACK_PAGE) or squash (SQUASH_HEAD + TREE_NODES + OBJECT_FETCH), chosen like Go's `catchup=auto`. |
+| Filtered (`ProjectionNamespace`, `syncProjection`) | PROJECT_FETCH: the documents matching a filter that the token may read, kept by delta (or reset) transfers that resume when interrupted. With `writeBack`, local writes apply at once, queue in a durable outbox, and go to the source by PROJECT_WRITE. A conflict or refusal puts the source's state back and raises `conflict`. A single-home source defers writes until its home is reachable. |
 | `decodeCommit` / `buildCommit` / `genesisCommit` | The canonical `CommitPayload` codec. Hashes are SHA-256 of the payload bytes, as in Go. |
 | `TrieEdit` / `TrieReader` | KDB's 16-ary Merkle document trie, stored node by node so it is never resident. |
 | `MemoryStore`, `IndexedDbStore`, `CachedStore` | An ordered key-value store with atomic, durable batches, and a byte-bounded read cache. |

@@ -15,7 +15,8 @@ import type { Op } from "./commit.ts";
 import { ReplicaNamespace } from "./namespace.ts";
 import { PeerConnection, type ConflictReport } from "./peer.ts";
 import { CachedStore, type KvStore } from "./store.ts";
-import { syncNamespace, type CatchUp, type NamespaceSyncResult } from "./sync.ts";
+import { ProjectionNamespace } from "./projection.ts";
+import { syncNamespace, syncProjection, type CatchUp, type NamespaceSyncResult, type ProjectionSyncResult } from "./sync.ts";
 
 export interface ReplicaOptions {
   store: KvStore;
@@ -26,8 +27,11 @@ export interface ReplicaOptions {
     /** Opens the transport; WebSocket by default. Tests and Node TCP callers pass their own. */
     connect?: (url: string) => Promise<Transport>;
   };
-  /** Full-mode namespaces (filtered ones arrive with write-back, plan PR 3). */
-  namespaces: { ns: string; mode?: "full" }[];
+  /**
+   * The namespaces held. "full" (the default) holds the whole namespace with real commits;
+   * "filtered" holds what matches filter and the token may read, and is read-only unless writeBack.
+   */
+  namespaces: ({ ns: string; mode?: "full" } | { ns: string; mode: "filtered"; filter: string; writeBack?: boolean })[];
   catchUp?: CatchUp;
   /** Bytes of trie nodes and document bodies kept in memory; the rest is read from the store. */
   memory?: { cacheBytes?: number };
@@ -48,15 +52,18 @@ export interface ChangeEvent {
 export interface ConflictEvent {
   namespace: string;
   report: ConflictReport | undefined;
-  /** The local commits the host refused, still held. */
+  /** Full mode: the local commits the host refused, still held. Filtered: none (the write was undone). */
   pending: readonly string[];
+  /** Filtered mode: the source's decision ("conflict" or "refused") and why. */
+  outcome?: string;
+  reason?: string;
 }
 
 export interface ReplicaStatus {
   connected: boolean;
   lastSyncAt: number | null;
   lastError: string | null;
-  namespaces: Record<string, { head: string | null; pending: number; converging: boolean }>;
+  namespaces: Record<string, { mode: "full" | "filtered"; head: string | null; pending: number; converging: boolean; lastSource?: string }>;
   /** Bytes the read cache holds now; never more than memory.cacheBytes. */
   residentBytes: number;
 }
@@ -73,12 +80,19 @@ export class Replica {
   readonly #opts: ReplicaOptions;
   readonly #store: CachedStore;
   readonly #ns = new Map<string, ReplicaNamespace>();
+  readonly #proj = new Map<string, ProjectionNamespace>();
+  readonly #outboxSizes = new Map<string, number>();
   readonly #listeners: { [K in keyof Events]: Set<Listener<Events[K]>> } = { change: new Set(), conflict: new Set(), sync: new Set() };
   #timer: ReturnType<typeof setTimeout> | null = null;
   #running: Promise<NamespaceSyncResult[]> | null = null;
   #again = false;
   #closed = false;
   #failures = 0;
+  #lastProjections: ProjectionSyncResult[] = [];
+  /** What the last round did to the filtered namespaces. */
+  get lastProjectionResults(): readonly ProjectionSyncResult[] {
+    return this.#lastProjections;
+  }
   #status = { connected: false, lastSyncAt: null as number | null, lastError: null as string | null };
 
   private constructor(opts: ReplicaOptions, store: CachedStore) {
@@ -94,31 +108,72 @@ export class Replica {
       nodeId = utf8(randomUuid());
       await store.apply(new Map([["m/node", nodeId]]));
     }
-    for (const { ns } of opts.namespaces) {
-      r.#ns.set(ns, await ReplicaNamespace.open(store, ns, fromUtf8(nodeId)));
+    for (const spec of opts.namespaces) {
+      if (r.#ns.has(spec.ns) || r.#proj.has(spec.ns)) throw new Error(`kdb replica: ${spec.ns} is listed twice`);
+      if (spec.mode === "filtered") {
+        const p = await ProjectionNamespace.open(store, spec.ns, spec.filter, spec.writeBack ?? false);
+        r.#proj.set(spec.ns, p);
+        r.#outboxSizes.set(spec.ns, await p.outboxSize());
+      } else {
+        r.#ns.set(spec.ns, await ReplicaNamespace.open(store, spec.ns, fromUtf8(nodeId)));
+      }
     }
+    r.#nodeId = fromUtf8(nodeId);
     if (opts.autoSync !== false) r.#schedule(0);
     return r;
   }
 
+  #nodeId = "";
+
+  /** A full-mode namespace. */
   namespace(name: string): ReplicaNamespace {
     const ns = this.#ns.get(name);
-    if (!ns) throw new Error(`kdb replica: ${name} is not one of this replica's namespaces`);
+    if (!ns) throw new Error(`kdb replica: ${name} is not one of this replica's full namespaces`);
     return ns;
+  }
+
+  /** A filtered namespace. */
+  projection(name: string): ProjectionNamespace {
+    const p = this.#proj.get(name);
+    if (!p) throw new Error(`kdb replica: ${name} is not one of this replica's filtered namespaces`);
+    return p;
+  }
+
+  #local(name: string): ReplicaNamespace | ProjectionNamespace {
+    const n = this.#ns.get(name) ?? this.#proj.get(name);
+    if (!n) throw new Error(`kdb replica: ${name} is not one of this replica's namespaces`);
+    return n;
   }
 
   // --- local reads and writes --------------------------------------------------------------------
 
   get(ns: string, id: string): Promise<string | undefined> {
-    return this.namespace(ns).get(id);
+    return this.#local(ns).get(id);
   }
 
   scan(ns: string, opts?: { after?: string; before?: string; limit?: number }) {
-    return this.namespace(ns).scan(opts);
+    return this.#local(ns).scan(opts);
   }
 
-  /** Writes documents in one local commit, durable before it resolves, and schedules a push. */
+  /**
+   * Writes documents locally, durable before it resolves, and schedules a sync. Full mode: one
+   * local commit, pushed as is. Filtered with write-back: one write-back transaction. Returns the
+   * commit hash or the write-back transaction id.
+   */
   async write(ns: string, ops: Op[], message?: string): Promise<string> {
+    const p = this.#proj.get(ns);
+    if (p) {
+      const docs = ops.map((o) => {
+        if (o.kind === "write") return { docId: o.docId, json: o.json };
+        if (o.kind === "delete") return { docId: o.docId, json: null };
+        throw new Error(`kdb replica: a filtered namespace takes document writes and deletes only, not ${o.kind}`);
+      });
+      const entry = await p.write(docs, randomUuid());
+      this.#outboxSizes.set(ns, (this.#outboxSizes.get(ns) ?? 0) + 1);
+      this.#emit("change", { namespace: ns, ids: docs.map((d) => d.docId), source: "local" });
+      this.#schedule(50);
+      return entry.txId;
+    }
     const c = await this.namespace(ns).commitLocal(ops, { transactionId: randomUuid(), message });
     this.#emit("change", { namespace: ns, ids: ops.flatMap((o) => (o.kind === "write" || o.kind === "delete" ? [o.docId] : [])), source: "local" });
     this.#schedule(50);
@@ -155,7 +210,13 @@ export class Replica {
   status(): ReplicaStatus {
     const namespaces: ReplicaStatus["namespaces"] = {};
     for (const [name, ns] of this.#ns) {
-      namespaces[name] = { head: ns.head, pending: ns.pending.length, converging: ns.target !== undefined };
+      namespaces[name] = { mode: "full", head: ns.head, pending: ns.pending.length, converging: ns.target !== undefined };
+    }
+    for (const [name, p] of this.#proj) {
+      namespaces[name] = {
+        mode: "filtered", head: null, pending: this.#outboxSizes.get(name) ?? 0,
+        converging: p.transfer !== undefined, lastSource: p.lastSource,
+      };
     }
     return { ...this.#status, namespaces, residentBytes: this.#store.residentBytes };
   }
@@ -201,7 +262,7 @@ export class Replica {
 
   async #round(): Promise<NamespaceSyncResult[]> {
     const token = typeof this.#opts.peer.token === "function" ? await this.#opts.peer.token() : this.#opts.peer.token;
-    const nodeId = [...this.#ns.values()][0]?.nodeId ?? randomUuid();
+    const nodeId = this.#nodeId;
     let conn: PeerConnection | null = null;
     try {
       conn = await PeerConnection.open(this.#opts.peer.url, {
@@ -209,6 +270,7 @@ export class Replica {
       });
       this.#status.connected = true;
       const results: NamespaceSyncResult[] = [];
+      const projections: ProjectionSyncResult[] = [];
       const errors: string[] = [];
       for (const [name, ns] of this.#ns) {
         try {
@@ -223,9 +285,37 @@ export class Replica {
           errors.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
+      for (const [name, p] of this.#proj) {
+        try {
+          const r = await syncProjection(conn, p, { catchUp: "auto", pageBytes: this.#opts.pageBytes });
+          projections.push(r);
+          this.#outboxSizes.set(name, await p.outboxSize());
+          if (r.changed.length > 0) this.#emit("change", { namespace: name, ids: [...new Set(r.changed)], source: "remote" });
+          for (const rej of r.rejected) {
+            this.#emit("conflict", {
+              namespace: name, pending: [], outcome: rej.outcome, reason: rej.reason,
+              report: {
+                transactionId: rej.txId, baseHash: "", targetHash: "",
+                conflicts: rej.docs.map((d) => {
+                  const cur = rej.current.find((c) => c.docId === d.docId);
+                  return {
+                    documentId: d.docId, operationType: "CONCURRENT_WRITE",
+                    ...(d.deleted ? {} : { localDoc: d.body }),
+                    ...(cur && !cur.absent ? { incomingDoc: cur.body } : {}),
+                  };
+                }),
+              },
+            });
+          }
+          if (r.deferred) errors.push(`${name}: write-back deferred: ${r.deferred}`);
+        } catch (e) {
+          errors.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
       this.#status.lastSyncAt = Date.now();
       this.#status.lastError = errors.length > 0 ? errors.join("; ") : null;
       this.#failures = errors.length > 0 ? this.#failures + 1 : 0;
+      this.#lastProjections = projections;
       this.#emit("sync", results);
       if (errors.length > 0) throw new Error(`kdb replica: sync failed for ${errors.join("; ")}`);
       return results;

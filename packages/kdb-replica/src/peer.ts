@@ -12,6 +12,7 @@
 
 import { connectWebSocket, decodeFrame, encodeFrame, type Transport } from "@kdb/client";
 import { decodeCommitList, encodeCommitList, type Commit } from "./commit.ts";
+import type { ProjectPage, WriteBackDoc } from "./projection.ts";
 
 export const MSG = {
   PEER_ERROR: 0x25,
@@ -29,6 +30,10 @@ export const MSG = {
   TREE_NODES_RESULT: 0x35,
   OBJECT_FETCH: 0x36,
   OBJECT_FETCH_RESULT: 0x37,
+  PROJECT_FETCH: 0x30,
+  PROJECT_PAGE: 0x31,
+  PROJECT_WRITE: 0x32,
+  PROJECT_WRITE_RESULT: 0x33,
   SQUASH_HEAD: 0x40,
   SQUASH_HEAD_RESULT: 0x41,
 } as const;
@@ -42,6 +47,8 @@ const KIND_BY_CODE: Record<number, string> = {
   [MSG.TREE_NODES]: "treeNodes",
   [MSG.OBJECT_FETCH]: "objectFetch",
   [MSG.SQUASH_HEAD]: "squashHead",
+  [MSG.PROJECT_FETCH]: "projectFetch",
+  [MSG.PROJECT_WRITE]: "projectWrite",
 };
 
 export const SYNC_PROTOCOL_VERSION = 2;
@@ -155,7 +162,7 @@ export class PeerConnection {
     const t = await (opts.connect ?? ((u) => connectWebSocket(u)))(url);
     const conn = new PeerConnection(t, opts.timeoutMs ?? 30_000);
     try {
-      const caps = ["snapshot", "repair", "squash"];
+      const caps = ["snapshot", "repair", "squash", "filter", "writeback"];
       if (canDecodeZstd) caps.push("zstd-pack");
       const hello: Record<string, unknown> = {
         nodeId: opts.nodeId, protocol: SYNC_PROTOCOL_VERSION, capabilities: caps, namespaces: opts.namespaces,
@@ -289,6 +296,28 @@ export class PeerConnection {
     };
   }
 
+  async projectFetch(namespace: string, filter: string, fromHex: string, atHex: string, after: string, maxBytes = DEFAULT_PAGE_BYTES): Promise<ProjectPage> {
+    const r = await this.request(MSG.PROJECT_FETCH, { namespace, filter, fromHex, atHex, after, maxBytes }, "projectPage");
+    return {
+      atHex: String(r.atHex ?? ""),
+      reset: Boolean(r.reset),
+      writes: (r.writes as { id: string; body: string }[] | undefined) ?? [],
+      deletes: (r.deletes as string[] | undefined) ?? [],
+      next: String(r.next ?? ""),
+      done: Boolean(r.done),
+    };
+  }
+
+  async projectWrite(namespace: string, txId: string, docs: WriteBackDoc[]): Promise<ProjectWriteResult> {
+    const r = await this.request(MSG.PROJECT_WRITE, { namespace, txId, docs }, "projectWriteResult");
+    return {
+      outcome: String(r.outcome ?? ""),
+      commitHex: String(r.commitHex ?? ""),
+      reason: String(r.reason ?? ""),
+      current: (r.current as ProjectWriteResult["current"] | undefined) ?? [],
+    };
+  }
+
   async refUpdate(namespace: string, oldHex: string, newHex: string, commits: readonly Commit[], more: boolean): Promise<RefUpdateAck> {
     const r = await this.request(MSG.REF_UPDATE, {
       namespace, kind: "branch", ref: "main", oldHex, newHex,
@@ -338,6 +367,14 @@ export interface ConflictReport {
     incomingDoc?: string;
     actualContentHash?: string;
   }[];
+}
+
+export interface ProjectWriteResult {
+  /** "applied", "conflict" or "refused". */
+  outcome: string;
+  commitHex: string;
+  reason: string;
+  current: { docId: string; body?: string; absent?: boolean }[];
 }
 
 export interface RefUpdateAck {
