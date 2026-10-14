@@ -79,8 +79,9 @@ var resident struct {
 
 // ResidentBytes reports how many bytes of the live mappings are in memory now: the pages the OS
 // would have to give up, or keep, rather than the address space they span. Clean mapped pages
-// are reclaimable page cache, so a large mapping read only in part costs only that part; this is
-// the figure to budget against where nothing else (a cgroup) accounts for page cache.
+// are reclaimable page cache, so a large mapping read only in part costs only that part. A figure
+// for reporting: the memory guard does not charge mapped pages at all, since every KDB mapping is
+// read-only and so always clean and reclaimable (server.currentMemoryUsageBytes).
 //
 // Counted with mincore(2), which reports residency in the page cache, so a page counts whether
 // this process or another brought it in. Where mincore is unavailable the full mapped size is
