@@ -31,7 +31,11 @@ import (
 // AttachmentChunkBytes is the upload chunk and default read page size.
 const AttachmentChunkBytes = 1 << 20
 
-// ErrAttachmentCorrupt reports downloaded bytes that do not match their content hash.
+// ErrAttachmentCorrupt reports attachment bytes that do not match their content hash: either the
+// download failed this client's verification, or the server refused to serve its stored copy
+// because that copy no longer matches (wire code INTEGRITY - from an attachment read, a later page
+// of one, or a SQL ATTACHMENT()). Either way that server's copy is unusable: read from another
+// replica, or have it repaired; retrying the same server cannot help.
 var ErrAttachmentCorrupt = errors.New("kdb: attachment bytes do not match their content hash")
 
 // AttachmentInfo describes one attachment.

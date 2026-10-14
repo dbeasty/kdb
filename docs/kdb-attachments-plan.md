@@ -187,6 +187,14 @@ identity = SHA-256(0x02 || be64(size) || tree)
   last page, `Close`), `ATTACHMENT_LIST`/`_RESULT` 0x48/0x49; `CellKindBytes` (6); parameters
   `{"$bytes": b64}` and `{"$attachment": {hash, size}}`; error code `NOT_FOUND`. Creating,
   replacing, renaming and deleting are ordinary transactions with attachment ops.
+- **Damaged stored bytes** (`attachstore.ErrCorrupt`: a chunk, the leaves or a delta that no
+  longer hash to what they are stored under) are refused with error code `INTEGRITY` on every
+  reply that reads them - `ATTACHMENT_DATA` (first or later page), SQL `ATTACHMENT()`, and a
+  `BLOB_FETCH` entry - logged at error level with namespace/doc/attachment/hash and counted in
+  `kdb_attachment_corrupt_reads_total`. Clients type it: Go `client.ErrAttachmentCorrupt`, TS
+  `KdbAttachmentCorruptError`, Kotlin `KdbAttachmentCorruptException` (SQLState `XX001`) - the
+  same error as the client's own failed verification. The remedy is another replica or repair,
+  never a retry against the same node.
 - **Server** (`server/attachments_wire.go`); **Go client** (`client/attachments.go`); **TS client**
   (`packages/kdb-client`); **Kotlin wire codec, client and JDBC** (`kdb-wire`, `kdb-jdbc`); the
   Kotlin server answers the messages `UNSUPPORTED`.

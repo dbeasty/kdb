@@ -422,7 +422,8 @@ func (env *evalEnv) attachmentFunctionCell(name string, call ExprFunctionCall, d
 	}
 	b, err := env.attach.blobs.ReadAttachmentBlob(env.attach.ns, a.ContentHash, MaxSqlAttachmentReadBytes)
 	if err != nil {
-		env.attach.fail(err)
+		// Wrapped, not flattened: the server classifies a damaged stored copy by errors.Is.
+		env.attach.fail(fmt.Errorf("ATTACHMENT(%q) (ID %s) of document %s: %w", a.Name, a.ID, d.doc.ID, err))
 		return CellNull{}, true
 	}
 	return CellBytes{Value: b}, true

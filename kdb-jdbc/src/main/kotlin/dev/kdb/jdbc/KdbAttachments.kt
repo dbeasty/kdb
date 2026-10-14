@@ -83,14 +83,38 @@ public data class KdbPutAttachmentOptions
 
 /**
  * A refusal from the attachment API: the server's error and its typed code (NOT_FOUND, CONFLICT,
- * UNAUTHORIZED, UNSUPPORTED, ...). For an interrupted upload, [uploadState] says where to resume.
+ * UNAUTHORIZED, UNSUPPORTED, INTEGRITY, ...). For an interrupted upload, [uploadState] says where to
+ * resume. INTEGRITY is always the subclass [KdbAttachmentCorruptException].
  */
-public class KdbAttachmentException(
+public open class KdbAttachmentException(
     message: String,
     public val errorCode: String? = null,
     public val uploadState: KdbUploadState? = null,
     cause: Throwable? = null,
 ) : SQLException(message, sqlStateFor(errorCode), cause)
+
+/**
+ * Attachment bytes do not match their content hash, so the copy they came from is unusable: the
+ * server refused to serve its stored copy (wire code INTEGRITY - from a read's first page, a later
+ * page, or SQL `ATTACHMENT()`), or a download failed this driver's own verification. Retrying the
+ * same server cannot help; read from another replica, or have this one repaired. SQLState XX001
+ * (data_corrupted). Go's `client.ErrAttachmentCorrupt`, TS's `KdbAttachmentCorruptError`.
+ */
+public class KdbAttachmentCorruptException(
+    message: String,
+    cause: Throwable? = null,
+) : KdbAttachmentException(message, INTEGRITY, cause = cause) {
+    internal companion object {
+        const val INTEGRITY = "INTEGRITY"
+    }
+}
+
+/** The exception a server's (error, errorCode) reply turns into. */
+internal fun attachmentException(
+    message: String,
+    code: String?,
+): KdbAttachmentException =
+    if (code == KdbAttachmentCorruptException.INTEGRITY) KdbAttachmentCorruptException(message) else KdbAttachmentException(message, code)
 
 private fun sqlStateFor(code: String?): String? =
     when (code) {
@@ -98,6 +122,7 @@ private fun sqlStateFor(code: String?): String? =
         "NOT_FOUND" -> "02000"
         "UNAUTHORIZED" -> "42501"
         "UNSUPPORTED" -> "0A000"
+        "INTEGRITY" -> "XX001"
         else -> null
     }
 
@@ -388,7 +413,7 @@ public class KdbAttachments internal constructor(
             host.request(WireMessage.AttachmentList(hdr(WireMessageType.ATTACHMENT_LIST), host.namespace, host.sessionId, doc, asOfHex))
         val r = reply as? WireMessage.AttachmentListResult
             ?: throw KdbAttachmentException("unexpected list reply: ${reply.header.messageType}")
-        if (r.error != null) throw KdbAttachmentException(r.error!!, r.errorCode)
+        if (r.error != null) throw attachmentException(r.error!!, r.errorCode)
         return r.items.map { it.toInfo() } to r.commitHex
     }
 
@@ -404,7 +429,7 @@ public class KdbAttachments internal constructor(
             )
         return when (reply) {
             is WireMessage.SqlResult -> {
-                if (reply.error != null) throw KdbAttachmentException(reply.error!!, reply.errorCode)
+                if (reply.error != null) throw attachmentException(reply.error!!, reply.errorCode)
                 reply.resolvedCommitHex
             }
             is WireMessage.ConflictReport -> throw KdbAttachmentException("transaction conflict", "CONFLICT")
@@ -540,7 +565,7 @@ public class KdbAttachmentInputStream internal constructor(
         val data = reply as? WireMessage.AttachmentData
             ?: throw IOException("unexpected attachment reply: ${reply.header.messageType}")
         if (data.error != null) {
-            throw IOException(data.error, KdbAttachmentException(data.error!!, data.errorCode))
+            throw IOException(data.error, attachmentException(data.error!!, data.errorCode))
         }
         return data
     }
@@ -572,7 +597,8 @@ public class KdbAttachmentInputStream internal constructor(
         if (hash != null) {
             val got = hash.finishHex()
             if (got != info.hashHex) {
-                throw IOException("attachment ${info.id} failed verification: content hash $got, expected ${info.hashHex}")
+                val msg = "attachment ${info.id} failed verification: content hash $got, expected ${info.hashHex}"
+                throw IOException(msg, KdbAttachmentCorruptException(msg))
             }
         }
     }

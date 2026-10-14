@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -151,5 +152,47 @@ func TestV2RefusesAttachmentsToAPeerWithoutThem(t *testing.T) {
 	}
 	if a.dag.HasAttachments() {
 		t.Fatal("the old peer took in attachment commits")
+	}
+}
+
+// A peer whose stored copy of a blob is damaged refuses it in BLOB_FETCH with a per-entry INTEGRITY
+// error - not NOT_FOUND (which a puller skips past) and not an untyped failure - so the puller knows
+// the blob exists but must come from another peer. Nothing is half-synced.
+func TestV2BlobFetchRefusesCorruptBlobAsIntegrity(t *testing.T) {
+	const ns = "app/data"
+	a := newNamespaceSetRuntimes(t, ns)[ns]
+	b := newNamespaceSetRuntimes(t, ns)[ns]
+	y := mustRandomUUID(t)
+	if _, err := b.Upsert(ns, y, `{"on":"b"}`, auth.Principal{}); err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("damaged on b's disk "), 200_000) // 4 MB: four chunks
+	_, info, err := b.Runtime.PutAttachment(ns, y, bytes.NewReader(data), embed.PutAttachmentOptions{Name: "b.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := info.ContentHash
+	if err := b.Runtime.AttachmentStore(ns).CorruptForTest(h, 1<<20+3); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := ListenPeerSync("tcp://127.0.0.1:0?bind=true", b, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	before, _ := a.dag.Head()
+	res, err := peersync.SyncV2(wire.NewCodec(wire.EncodingJSON), tcp.NewTransport(core.DefaultConnectOptions()), peersync.V2ClientConfig{
+		NodeID: a.NodeID.String() + "-a", PeerURI: "tcp://" + ln.Addr().String(),
+		Namespaces: []string{ns}, Local: a.PeerNamespaces(),
+	})
+	if err == nil && len(res.Namespaces) == 1 {
+		err = res.Namespaces[0].Err
+	}
+	var remote *peersync.RemoteError
+	if !errors.As(err, &remote) || remote.Code != wire.ErrorCodeIntegrity || !strings.Contains(remote.Message, h.Hex()) {
+		t.Fatalf("pulling a damaged blob: %v", err)
+	}
+	if after, _ := a.dag.Head(); after != before {
+		t.Fatal("the commit landed without its blob")
 	}
 }

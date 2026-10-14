@@ -73,6 +73,15 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 		part.Error, part.ErrorCode = fmt.Sprintf(format, args...), code
 		return part, 0
 	}
+	// failRead is a failed read of the blob's stored bytes: INTEGRITY when this node's copy is
+	// damaged (logged - the puller tries another peer, but only an operator repairs this one),
+	// otherwise the code given.
+	failRead := func(code wire.ErrorCode, err error) (wire.BlobFetchPart, int64) {
+		if attachstore.ReportCorrupt(err, "namespace", env.NamespaceID, "doc", e.DocID, "attachment", e.AttachmentID, "hash", e.Hash.Hex(), "via", "blob_fetch") {
+			code = wire.ErrorCodeIntegrity
+		}
+		return fail(code, "blob %s: %v", e.Hash.Hex(), err)
+	}
 	commit, err := codec.HashFromHex(e.CommitHex)
 	if err != nil {
 		return fail(wire.ErrorCodeSchemaViolation, "invalid commit: %v", err)
@@ -90,6 +99,9 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 		return fail(wire.ErrorCodeSchemaViolation, "offset %d is not a chunk boundary within %d bytes", e.Offset, a.Size)
 	}
 	r, err := env.Attachments.Open(e.Hash)
+	if errors.Is(err, attachstore.ErrCorrupt) {
+		return failRead(wire.ErrorCodeIntegrity, err)
+	}
 	if err != nil {
 		return fail(wire.ErrorCodeNotFound, "blob %s is not retained here: %v", e.Hash.Hex(), err)
 	}
@@ -101,7 +113,7 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 	leaves := make([]codec.Hash, n)
 	for i := range leaves {
 		if leaves[i], err = r.ChunkLeaf(int64(i)); err != nil {
-			return fail(wire.ErrorCodeIntegrity, "blob %s: %v", e.Hash.Hex(), err)
+			return failRead(wire.ErrorCodeIntegrity, err)
 		}
 	}
 	part.Size, part.Tree = a.Size, document.MerkleTreeHash(leaves)
@@ -114,7 +126,7 @@ func serveBlobEntry(env IngestEnv, e wire.BlobFetchEntry, budget int64, head *do
 	data := make([]byte, end-e.Offset)
 	if len(data) > 0 {
 		if _, err := r.ReadAt(data, e.Offset); err != nil && !errors.Is(err, io.EOF) {
-			return fail(wire.ErrorCodeIntegrity, "blob %s: %v", e.Hash.Hex(), err)
+			return failRead(wire.ErrorCodeInternal, err)
 		}
 	}
 	part.Data = data
