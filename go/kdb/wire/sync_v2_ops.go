@@ -668,6 +668,10 @@ type ProjectPageMessage struct {
 	Deletes []string
 	Next    string
 	Done    bool
+	// Attachments, for a written document with attachments at AtHex, is all of them (a written
+	// document absent here has none). A change to attachments alone writes no document: a replica
+	// finds those by diffing the attachment table (TREE_NODES, Tree TreeAttachments).
+	Attachments map[string][]TreeAttachment
 }
 
 func (m ProjectPageMessage) Header() Header { return m.H }
@@ -767,13 +771,14 @@ type projectFetchDto struct {
 }
 
 type projectPageDto struct {
-	Namespace string           `json:"namespace"`
-	AtHex     string           `json:"atHex"`
-	Reset     bool             `json:"reset,omitempty"`
-	Writes    []snapshotDocDto `json:"writes,omitempty"`
-	Deletes   []string         `json:"deletes,omitempty"`
-	Next      string           `json:"next,omitempty"`
-	Done      bool             `json:"done"`
+	Namespace string                      `json:"namespace"`
+	AtHex     string                      `json:"atHex"`
+	Reset     bool                        `json:"reset,omitempty"`
+	Writes    []snapshotDocDto            `json:"writes,omitempty"`
+	Deletes   []string                    `json:"deletes,omitempty"`
+	Next      string                      `json:"next,omitempty"`
+	Done      bool                        `json:"done"`
+	Attach    map[string][]TreeAttachment `json:"attachments,omitempty"`
 }
 
 func encodeProjectionMessage(msg Message) (payloadEnvelope, bool, error) {
@@ -789,6 +794,7 @@ func encodeProjectionMessage(msg Message) (payloadEnvelope, bool, error) {
 		}
 		return payloadEnvelope{Kind: "projectPage", ProjectPage: &projectPageDto{
 			Namespace: m.Namespace, AtHex: m.AtHex, Reset: m.Reset, Writes: writes, Deletes: m.Deletes, Next: m.Next, Done: m.Done,
+			Attach: m.Attachments,
 		}}, true, nil
 	case ProjectWriteMessage:
 		docs := make([]writeBackDocDto, len(m.Docs))
@@ -825,7 +831,8 @@ func decodeProjectionMessage(header Header, env payloadEnvelope) (Message, bool,
 		for i, x := range d.Writes {
 			writes[i] = SnapshotDoc{DocID: x.DocID, Body: x.Body}
 		}
-		return ProjectPageMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, Reset: d.Reset, Writes: writes, Deletes: d.Deletes, Next: d.Next, Done: d.Done}, true, nil
+		return ProjectPageMessage{H: header, Namespace: d.Namespace, AtHex: d.AtHex, Reset: d.Reset, Writes: writes, Deletes: d.Deletes, Next: d.Next, Done: d.Done,
+			Attachments: d.Attach}, true, nil
 	case "projectWrite":
 		d := env.ProjectWrite
 		if d == nil {

@@ -843,6 +843,9 @@ func (h *V2Host) projectFetch(m wire.ProjectFetchMessage) (wire.Message, error) 
 	if err != nil {
 		return nil, err
 	}
+	if err := withProjectedAttachments(env, &page); err != nil {
+		return nil, err
+	}
 	page.H = header(wire.MsgProjectPage, m.H.CorrelationID)
 	return page, nil
 }

@@ -123,6 +123,23 @@ func ScanCommitWrites(payload []byte, docID codec.UUID, fn func(patch []byte) bo
 			default:
 				return NewCommitDecodeError("schemaHash", nil)
 			}
+		case 10: // attachmentTreeHash: nullable Hash32
+			if err := f.expectTag(tag, schema.PhysicalUnion); err != nil {
+				return err
+			}
+			m, err := f.byte("attachmentTreeHash")
+			if err != nil {
+				return err
+			}
+			switch m {
+			case 0:
+			case 1:
+				if err := f.skip(32, "attachmentTreeHash"); err != nil {
+					return err
+				}
+			default:
+				return NewCommitDecodeError("attachmentTreeHash", nil)
+			}
 		default:
 			// An unknown field, skipped as the codec skips one: primitives only.
 			if err := f.skipPrimitive(tag); err != nil {
@@ -154,7 +171,7 @@ func (s *commitScanner) scanOperations(docID codec.UUID, fn func([]byte) bool, s
 		if err != nil {
 			return err
 		}
-		if branch > 3 {
+		if branch > 5 { // 4, 5: attachment put and delete
 			return NewCommitDecodeError("operation: unknown union branch", nil)
 		}
 		body, err := s.lenPrefixed("operation")

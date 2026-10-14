@@ -536,3 +536,32 @@ func (c *v2Conn) fetchTableBlobs(env IngestEnv, ns string, commit codec.Hash) er
 	})
 	return c.fetchBlobs(env, ns, []document.Commit{synthetic})
 }
+
+// withProjectedAttachments adds each written document's attachments at the page's commit.
+func withProjectedAttachments(env IngestEnv, page *wire.ProjectPageMessage) error {
+	if len(page.Writes) == 0 || !env.DAG.HasAttachments() {
+		return nil
+	}
+	at, err := codec.HashFromHex(page.AtHex)
+	if err != nil {
+		return err
+	}
+	table, err := env.DAG.AttachmentTableAt(at)
+	if err != nil {
+		return err
+	}
+	for _, w := range page.Writes {
+		id, err := codec.ParseUUID(w.DocID)
+		if err != nil {
+			continue
+		}
+		for _, a := range table.List(id) {
+			if page.Attachments == nil {
+				page.Attachments = map[string][]wire.TreeAttachment{}
+			}
+			page.Attachments[w.DocID] = append(page.Attachments[w.DocID], wire.TreeAttachment{
+				ID: a.ID.String(), Name: a.Name, Hash: a.ContentHash.Hex(), Size: a.Size, Mime: a.Mime})
+		}
+	}
+	return nil
+}

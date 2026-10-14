@@ -57,6 +57,11 @@ Commands:
   tag list <namespace>
   tag create <namespace> <name> [rev] [message]
   tag delete <namespace> <name>
+  file ls <namespace> <docId>
+  file put <namespace> <docId> <path> [--name NAME] [--mime TYPE]
+  file get <namespace> <docId> <name|id> [-o PATH]
+  file rm <namespace> <docId> <name|id>
+  file migrate <namespace> [--dry-run] [--strip]
   unlock
   node status
   sync <namespace> <peer-addr> [--pull|--push] [--user U --password-env VAR]
@@ -184,6 +189,8 @@ func parseCommand(rest []string) (Command, error) {
 		return RevertCmd{Namespace: rest[1], Revision: rest[2]}, nil
 	case "tag":
 		return parseTagCommand(rest[1:])
+	case "file":
+		return parseFileCommand(rest[1:])
 	case "status":
 		if len(rest) < 2 {
 			return nil, fmt.Errorf("usage: kdb status <namespace>")
