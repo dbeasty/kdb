@@ -29,11 +29,16 @@ class AsyncDurabilityJvmTest {
     @Test
     fun asyncDurability_syncsOnTimerNotPerWrite() =
         runBlocking {
+            // An interval no runner outlasts while writing: any sync seen here was made inline.
+            val idleWal = FakeWal()
+            val idle = ServerStorageEngine("ns", config(Durability.ASYNC, asyncIntervalMs = 60_000), idleWal)
+            repeat(50) { idle.writeBlob(byteArrayOf(it.toByte())) }
+            assertEquals(0, idleWal.syncCalls, "async writes must not sync inline")
+            idle.stopAsyncSync()
+
             val wal = FakeWal()
             val engine = ServerStorageEngine("ns", config(Durability.ASYNC, asyncIntervalMs = 20), wal)
             repeat(50) { engine.writeBlob(byteArrayOf(it.toByte())) }
-            assertEquals(0, wal.syncCalls, "async writes must not sync inline")
-
             delay(80)
             assertTrue(wal.syncCalls > 0, "expected at least one background sync after waiting")
             assertTrue(wal.syncCalls < 50, "expected batching, not one sync per write")
