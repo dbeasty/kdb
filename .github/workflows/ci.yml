@@ -14,8 +14,10 @@ on:
     branches: [main]
 
 concurrency:
-  # A new push to a PR supersedes the run still going for the previous one.
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # A new push to a PR supersedes the run still going for the previous one. Each push to main is
+  # its own group: GitHub keeps only one pending run per group and cancels the rest, which skipped
+  # main commits while the queue was long.
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -91,7 +93,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
       - if: matrix.shard == 'integration'
         name: Use the Gradle build cache in every gradle run, including the tests' own
-        run: printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+        run: mkdir -p "${GRADLE_USER_HOME:-$HOME/.gradle}" && printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties"
       - name: Go test (${{ matrix.shard }})
         env:
           GO_TEST_JSON_DIR: ${{ runner.temp }}/go-test-json
@@ -175,8 +177,14 @@ jobs:
         uses: ./.github/actions/setup-go-cached
         with:
           cache-key: kotlin-${{ matrix.target }}
+      # The JS tests run under Mocha's 2 s per-test timeout, and a few heavy ones (zstd corruption
+      # scans, HNSW recall) exceed it when they share the runner's 4 cores with Kotlin compiles.
+      # So js compiles everything in parallel first, then runs the tests two at a time.
+      - name: Kotlin js (compile)
+        if: matrix.target == 'js'
+        run: ./gradlew compileTestDevelopmentExecutableKotlinJs jsJar jsBrowserDistribution --build-cache --parallel --no-daemon
       - name: Kotlin ${{ matrix.target }} (${{ matrix.tasks }})
-        run: ./gradlew ${{ matrix.tasks }} --build-cache --parallel --continue --no-daemon
+        run: ./gradlew ${{ matrix.tasks }} --build-cache --parallel ${{ matrix.target == 'js' && '--max-workers=2' || '' }} --continue --no-daemon
       # Gradle's console output gives the failing assertion's *line* but not its
       # message, and for a test whose body is a runBlocking { } it reports the
       # builder's line rather than the assert's - so a failure here can name a
@@ -394,7 +402,7 @@ jobs:
           java-version: "21"
       - uses: gradle/actions/setup-gradle@v4
       - name: Use the Gradle build cache
-        run: printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> ~/.gradle/gradle.properties
+        run: mkdir -p "${GRADLE_USER_HOME:-$HOME/.gradle}" && printf 'org.gradle.caching=true\norg.gradle.parallel=true\n' >> "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties"
       - id: go
         uses: ./.github/actions/setup-go-cached
         with:
