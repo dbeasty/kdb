@@ -122,13 +122,13 @@ private suspend fun applyMain(
     ns: PeerSyncNamespace,
     proposed: KdbHash,
 ): RefOutcome {
-    val before = ns.dag.head()
-    return when (val o = resolveDivergence(ns.dag, ns.storage, ns.namespaceId, proposed, ns.conflictPolicy)) {
-        CommitPushOutcome.FastForwarded -> {
-            // Live state follows main: the commits main just took on, parents first.
-            ns.materializeCommit?.let { apply -> for (c in missingCommits(ns.dag, listOf(proposed), listOf(before))) apply(c) }
-            RefOutcome(SyncV2.OUTCOME_FAST_FORWARDED, ns.dag.head())
-        }
+    // Live state follows main: the commits main just took on, parents first - applied under the
+    // divergence lock, so a concurrent push cannot merge onto the new head before its tree exists.
+    val apply = ns.materializeCommit
+    val onFastForward: (suspend (KdbHash) -> Unit)? =
+        apply?.let { { before -> for (c in missingCommits(ns.dag, listOf(proposed), listOf(before))) apply(c) } }
+    return when (val o = resolveDivergence(ns.dag, ns.storage, ns.namespaceId, proposed, ns.conflictPolicy, onFastForward)) {
+        CommitPushOutcome.FastForwarded -> RefOutcome(SyncV2.OUTCOME_FAST_FORWARDED, ns.dag.head())
         CommitPushOutcome.NoOp -> RefOutcome(SyncV2.OUTCOME_NOOP, ns.dag.head())
         is CommitPushOutcome.Merged -> RefOutcome(SyncV2.OUTCOME_MERGED, ns.dag.head())
         is CommitPushOutcome.Conflict -> RefOutcome(SyncV2.OUTCOME_CONFLICT, ns.dag.head(), o.report)
