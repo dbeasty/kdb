@@ -297,6 +297,24 @@ internal class InMemoryCommitDag(
         next.root?.let { attachments.put(it, next) }
     }
 
+    /**
+     * Loads the operations of every commit [deriveAttachmentTable] will replay to build [start]'s
+     * table: first parents back to the nearest commit whose table is cached (a checkpoint seeds
+     * the heads') or has no root. A checkpoint restores commits without operations, and replaying
+     * a table forward over those would be replaying nothing. Cheap when [start]'s table is cached.
+     */
+    private suspend fun hydrateAttachmentChainLocked(start: KdbHash) {
+        if (opsMissing.isEmpty()) return
+        var at = start
+        while (true) {
+            val c = commits[at] ?: return
+            val root = c.attachmentTreeHash ?: return
+            if (attachments.get(root) != null) return
+            if (at in opsMissing) hydrateLocked(c)
+            at = c.parentHashes.firstOrNull() ?: return
+        }
+    }
+
     private fun attachmentTableLocked(commit: KdbHash): AttachmentTable {
         if (stubs.containsKey(commit)) {
             throw DagConsistencyException("attachment table: commit archived", namespaceId, commit)
@@ -305,16 +323,19 @@ internal class InMemoryCommitDag(
             namespaceId,
             commit,
             { h ->
-                if (h in opsMissing) {
-                    // Replaying a table forward needs operations this DAG would have to load; a
-                    // checkpoint seeds the heads' tables, so only an older commit's table gets here.
+                val c = commits[h]
+                val replayed = c?.attachmentTreeHash?.let { attachments.get(it) == null } ?: false
+                if (h in opsMissing && replayed) {
+                    // hydrateAttachmentChainLocked loads these first; a caller that did not is a
+                    // bug, and replaying no operations would build a wrong table. (A commit that
+                    // ends the walk - no root, or a cached table - is read but never replayed.)
                     throw DagConsistencyException(
                         "attachment table: commit ${h.toHex()} was restored from a checkpoint without its operations",
                         namespaceId,
                         h,
                     )
                 }
-                commits[h]
+                c
             },
             { attachments.get(it) },
             { root, t -> attachments.put(root, t) },
@@ -369,7 +390,11 @@ internal class InMemoryCommitDag(
         return (common - redundant).filter { commits.containsKey(it) || stubs.containsKey(it) }.sortedBy { it.toHex() }
     }
 
-    override suspend fun attachmentTableAt(commit: KdbHash): AttachmentTable = mutex.withLock { attachmentTableLocked(commit) }
+    override suspend fun attachmentTableAt(commit: KdbHash): AttachmentTable =
+        mutex.withLock {
+            hydrateAttachmentChainLocked(commit)
+            attachmentTableLocked(commit)
+        }
 
     override suspend fun seedAttachmentTable(table: AttachmentTable) {
         val root = table.root ?: return
@@ -705,6 +730,9 @@ internal class InMemoryCommitDag(
         message: String,
     ): KdbCommit =
         mutex.withLock {
+            if (touchesAttachments(transaction.operations, commits[parentHash]?.attachmentTreeHash != null)) {
+                hydrateAttachmentChainLocked(parentHash)
+            }
             appendCommitLocked(
                 transaction,
                 listOf(parentHash),
@@ -724,6 +752,14 @@ internal class InMemoryCommitDag(
         message: String,
     ): KdbCommit =
         mutex.withLock {
+            // The tables mergeAttachmentOpsLocked merges: both parents' and their merge base's.
+            if (commits[primaryParent]?.attachmentTreeHash != commits[mergedParent]?.attachmentTreeHash) {
+                hydrateAttachmentChainLocked(primaryParent)
+                hydrateAttachmentChainLocked(mergedParent)
+                mergeBasesLocked(primaryParent, mergedParent).firstOrNull()?.let { hydrateAttachmentChainLocked(it) }
+            } else if (touchesAttachments(transaction.operations, commits[primaryParent]?.attachmentTreeHash != null)) {
+                hydrateAttachmentChainLocked(primaryParent)
+            }
             appendCommitLocked(
                 transaction,
                 listOf(primaryParent, mergedParent),

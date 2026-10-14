@@ -527,6 +527,13 @@ segments: a checkpoint written with `graph.file` on that names graph segments fo
 not carry makes Kotlin replay the log instead. A checkpoint Kotlin can't use costs a slower open,
 never a different answer. Kotlin reads Go's checkpoints but never writes one.
 
+Attachments survive the same open. The checkpoint carries the attachment tables of branch and tag
+heads, and Kotlin rebuilds an older commit's table by loading that commit's history from the delta
+log the first time it is asked, so `kdb attach list <namespace> <docId> --at <commit>` and
+`kdb attach get <namespace> <docId> <name> <out-path> --at <commit>` give Go's answer at any commit
+the log still holds. Under `history=none`, an older commit whose segments were truncated has no
+table to rebuild, and the read fails rather than guessing.
+
 **Workspace lock:** File mode takes an exclusive lock on `{dataDir}/.kdb.lock` while a process has the database open (CLI, JDBC `jdbc:kdb:file://…`, or your app via `openFileRuntime`). On macOS/Linux the Go CLI uses `flock(2)` on that file. A second process opening the same `--data-dir` fails with a clear error naming the holder PID when known. Only one live writer per workspace.
 
 If your app crashes and leaves the lock file behind, the OS releases the underlying lock when the process exits; you can remove a leftover file with:
