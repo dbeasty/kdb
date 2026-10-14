@@ -455,7 +455,7 @@ path, `catalog/name` (`myapp/users`, or deeper: `site/berlin/orders`); the catal
 segment. On disk it is `<dataRoot>/ns/<namespace>/`. A namespace is also, to SQL, **one table**
 (the name after `FROM` is validated but the rows always come from the connection's namespace; use
 `<catalog>.<name>` to reach another namespace inside a transaction). Reserved namespaces:
-`_kdb/meta` (replicated definitions such as resolution chains and procedures) and
+`_kdb/meta` (replicated definitions such as resolution chains, procedures and catch-up policies) and
 `_system/users`, `_system/roles` (the RBAC registry).
 
 **Document.** A UUID plus a JSON object stored **byte-exact** (nothing injected, keys never
@@ -1172,7 +1172,10 @@ rule decides). Verified with two local servers; node A is the hub, node B pulls 
 `--peer` (repeatable, or `KDB_PEERS` `;`-separated) has the fields `name`, `addr`, `namespaces`
 (patterns joined by `|`; `*` one segment, `**` any depth, `!` excludes), `mode`
 (`both|pull|push`), `interval`, `user`, `password-env`, `create`, `bootstrap=snapshot`,
-`writeback`, `filter=` (last, may contain commas) and `readthrough`. Other relevant flags:
+`writeback`, `catchup=replay|squash|auto`, `catchup-ns=pattern:route|…`, `filter=` (last, may contain
+commas) and `readthrough`. A namespace that must keep full history on every replica refuses squash
+catch-ups through its replicated catch-up policy (`PUT /v1/ns/{ns}/catchup {"refuseSquash": true}`,
+or `MetaStore.SetCatchUp` in Go); peers then replay it. Other relevant flags:
 `--peer-conflict-policy strict|last-write`, `--peer-create-namespaces`, `--peer-retention-grace`,
 `--peer-http host:port` (peer sync over WebSocket at `/kdb/sync`, plain HTTP, terminate TLS in
 front). One-shot CLI equivalents exist: `kdb sync <ns> <peer-addr> [--pull|--push]`,

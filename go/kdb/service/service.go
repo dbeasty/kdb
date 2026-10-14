@@ -65,7 +65,7 @@ func Main() {
 	var peerCreateNamespaces bool
 	var peerRetentionGrace time.Duration
 	fs.DurationVar(&peerRetentionGrace, "peer-retention-grace", 7*24*time.Hour, "history truncation (history=none) keeps every commit a replication peer active within this long has not yet been seen to receive - both peers this node pushes to (--peer) and peers that fetch from it. A peer silent for longer stops holding history back and catches up by snapshot if it returns")
-	fs.Func("peer", "an outbound replication peer, repeatable: name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both|pull|push,interval=30s,user=u,password-env=VAR,create=true - this node keeps the matching namespaces in sync with it (see docs/kdb-distributed-plan.md). KDB_PEERS holds the same, ';'-separated", func(v string) error {
+	fs.Func("peer", "an outbound replication peer, repeatable: name=cloud,addr=tcps://cloud:4242,namespaces=site/*|shared/*,mode=both|pull|push,interval=30s,user=u,password-env=VAR,create=true,catchup=replay|squash|auto,catchup-ns=pattern:route - this node keeps the matching namespaces in sync with it (see docs/kdb-distributed-plan.md; a namespace whose catch-up policy refuses squash, PUT /v1/ns/{ns}/catchup, is always replayed). KDB_PEERS holds the same, ';'-separated", func(v string) error {
 		peerSpecs = append(peerSpecs, v)
 		return nil
 	})

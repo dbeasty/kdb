@@ -1243,6 +1243,8 @@ side of a pair needs `--peer`: it pushes its writes (right after each commit) an
 | `user`, `password-env` | credentials. The password is read from the named environment variable, never from the flag |
 | `create=true` | let a pull create namespaces this node doesn't hold yet |
 | `bootstrap=snapshot` | an empty namespace starts from a snapshot of the peer's current state instead of its whole history |
+| `catchup=replay\|squash\|auto` | how a pull that is behind on main catches up: `replay` (default) fetches every commit; `squash` jumps straight to the peer's head and skips the commits in between; `auto` squashes only a large backlog. See [Joining, catching up, and retention](#joining-catching-up-and-retention) |
+| `catchup-ns=pattern:route\|…` | `catchup` for the namespaces matching each pattern, first match wins: `catchup=auto,catchup-ns=app/audit:replay` |
 | `writeback=true` | a filtered peer's projection takes writes and sends them to the source (see below) |
 | `filter=` | keep only the documents of one namespace that match a SQL condition (see below). Always the last field, because the condition may contain commas |
 
@@ -1960,6 +1962,34 @@ until a scrub repairs them.
 installs the peer's current documents and starts from there. The snapshot is verified against the
 commit it claims, and it survives crashes like any other state. An empty node joining a peer that
 itself only has recent history bootstraps from a snapshot automatically.
+
+**Catching up by squash.** A node far behind a peer on main normally replays every commit it
+missed. With `catchup=squash` (or `auto`, for large backlogs) on the `--peer`, it instead jumps
+straight to the peer's head:
+- It fetches only the documents that differ and checks them against the head's tree hash.
+- It takes the head as a shallow root, the same as a snapshot bootstrap.
+- The commits in between are not fetched. [Deepen](#getting-history-back-after-a-snapshot-join-deepen) can fetch them later.
+
+A squash is only a fast-forward. A node with commits of its own that the peer lacks replays, and
+the replay merges them.
+
+**Refusing squash catch-ups.** A namespace that must keep full history on every replica (an audit
+trail, say) can refuse squashes. Peers then replay it whatever their `catchup` says:
+
+```bash
+curl -X PUT http://node:7070/v1/ns/app%2Faudit/catchup \
+  -d '{"refuseSquash": true, "reason": "audit trail: full history on every replica"}'
+```
+
+How the policy behaves:
+- It is a replicated definition in `_kdb/meta`, like a resolution chain, so every node holding it
+  refuses.
+- A pattern (`app%2Faudit%2F**`) covers every matching namespace.
+- A node that holds the policy also won't *take* a squash of that namespace from a peer that has
+  not received the policy yet.
+- `GET …/catchup` shows the policy; `{"refuseSquash": false}` allows squashes again.
+- It does not undo a squash that already happened. To fill the gap, deepen that replica
+  (`POST …/deepen`).
 
 **Retention.** Under `history=none`, retention won't delete commits that an active peer hasn't
 been seen to receive. That covers peers this node pushes to and peers that fetch from it.
