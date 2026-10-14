@@ -10,6 +10,7 @@ import { describe, it } from "node:test";
 import { Client } from "../src/client.ts";
 import {
   KdbAttachmentNotFoundError,
+  KdbAttachmentRangeError,
   KdbIntegrityError,
   KdbUploadError,
   sqlAttachment,
@@ -19,16 +20,22 @@ import {
 import { KdbUnsupportedError } from "../src/errors.ts";
 import {
   ATTACHMENT_CHUNK_BYTES,
+  attachmentChunkCount,
   attachmentContentHash,
   AttachmentHasher,
+  attachmentIdentity,
   base64ToBytes,
   bytesToBase64,
   decodeAttachmentBody,
   encodeAttachmentBody,
+  MAX_ATTACHMENT_CHUNK_BYTES,
+  MerkleTree,
+  verifyMerkleInclusion,
+  WIRE_FEATURE_ATTACHMENT_PROOFS,
   WIRE_FEATURE_ATTACHMENTS,
   type AttachmentInfoDto,
 } from "../src/wire/attachments.ts";
-import { bytesFromWire } from "../src/wire/bytes.ts";
+import { bytesFromWire, toHex } from "../src/wire/bytes.ts";
 import { decodeMessage, encodeMessage } from "../src/wire/envelope.ts";
 import { FRAME_HEADER_SIZE } from "../src/wire/frame.ts";
 import type { MessageKind, OpDto, TransactionDto } from "../src/wire/messages.ts";
@@ -90,6 +97,23 @@ const SAMPLES: Array<{ kind: MessageKind; correlationId: number; payload: Record
       items: [INFO, { id: DOC, name: "b", hash: rep("08"), size: 0, mime: "" }],
     },
   },
+  // A verified ranged read (attachment-proofs): the get asks for proofs, the page covers whole
+  // chunks and proves each - leaf 0 with an empty-field leaf, leaf 1 short.
+  {
+    kind: "attachmentGet",
+    correlationId: 5,
+    payload: { namespace: "app/data", docId: DOC, name: "photo.png", offset: 2 ** 20 + 7, maxBytes: 100, proofs: true },
+  },
+  {
+    kind: "attachmentData",
+    correlationId: 5,
+    payload: {
+      namespace: "app/data", readId: "r10", docId: DOC,
+      info: { id: ATT, name: "photo.png", hash: rep("07"), size: 2 ** 20 + 2, mime: "" }, commitHex: COMMIT,
+      data: Uint8Array.of(4, 5, 6), eof: true, tree: rep("06"), scheme: 1,
+      chunks: [{ leaf: 0, path: [rep("01")] }, { leaf: 1, path: [rep("02")] }],
+    },
+  },
 ];
 
 /** attachmentGoldenFrames, the same order. */
@@ -101,6 +125,9 @@ const GOLDEN = [
   "d00000004700010002000000020a086170702f64617461120272391a106f9619ff8b86d011b42d00cf4fc964ff22500a100b6f3c1e2a4d4e8f9a1b3c5d7e9f1a2b120970686f746f2e706e671a2007070707070707070707070707070707070707070707070707070707070707072080808080202a09696d6167652f706e672a4030333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033308080403a05627974657340014801",
   "2d0000004800010003000000020a086170702f64617461120273311a106f9619ff8b86d011b42d00cf4fc964ff",
   "e40000004900010003000000020a086170702f646174611240303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330331a500a100b6f3c1e2a4d4e8f9a1b3c5d7e9f1a2b120970686f746f2e706e671a2007070707070707070707070707070707070707070707070707070707070707072080808080202a09696d6167652f706e671a370a106f9619ff8b86d011b42d00cf4fc964ff1201621a200808080808080808080808080808080808080808080808080808080808080808",
+  // Go indices 7 and 8 are BLOB_FETCH / BLOB_FETCH_RESULT (peer-only); these are 9 and 10.
+  "3c0000004600010005000000020a086170702f646174611a106f9619ff8b86d011b42d00cf4fc964ff2a0970686f746f2e706e673887804040645801",
+  "2a0100004700010005000000020a086170702f6461746112037231301a106f9619ff8b86d011b42d00cf4fc964ff22430a100b6f3c1e2a4d4e8f9a1b3c5d7e9f1a2b120970686f746f2e706e671a200707070707070707070707070707070707070707070707070707070707070707208280402a40303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333a030405064001622006060606060606060606060606060606060606060606060606060606060606066a22122001010101010101010101010101010101010101010101010101010101010101016a240801122002020202020202020202020202020202020202020202020202020202020202027001",
 ];
 
 describe("attachment messages", () => {
@@ -133,6 +160,7 @@ describe("attachment messages", () => {
     assert.deepEqual(decoded.payload, {
       namespace: "", readId: "", docId: "", info: { id: "", name: "", hash: "", size: 0, mime: "" }, commitHex: "",
       offset: 0, data: new Uint8Array(0), eof: false, superseded: false, error: "", errorCode: "",
+      tree: "", chunks: [], scheme: 0,
     });
     assert.equal(decodeAttachmentBody(0x10, new Uint8Array(0)), undefined);
     assert.equal(encodeAttachmentBody("sqlExec", {}), undefined);
@@ -232,7 +260,8 @@ class AttachmentStore {
   readonly blobs = new Map<string, Uint8Array>();
   readonly docs = new Map<string, AttachmentInfoDto[]>();
   readonly uploads = new Map<string, Uint8Array[]>();
-  readonly reads = new Map<string, { data: Uint8Array; info: AttachmentInfoDto }>();
+  readonly reads = new Map<string, { data: Uint8Array; info: AttachmentInfoDto; docId: string }>();
+  readonly trees = new Map<string, MerkleTree>();
   readonly txs: TransactionDto[] = [];
   readonly sql: Array<string | null> = [];
   pageBytes = 4;
@@ -240,8 +269,10 @@ class AttachmentStore {
   corrupt = false;
   /** Fails the upload chunk at this offset once. */
   failAt = -1;
+  /** Flips a byte of this chunk in the bytes served after the proofs were computed (-1: none). */
+  tamperChunk = -1;
   #ids = 0;
-  features = ["binary-frames", "binary-frames-2", WIRE_FEATURE_ATTACHMENTS];
+  features = ["binary-frames", "binary-frames-2", WIRE_FEATURE_ATTACHMENTS, WIRE_FEATURE_ATTACHMENT_PROOFS];
 
   readonly server = new FakeServer((r) => this.#respond(r));
 
@@ -293,8 +324,13 @@ class AttachmentStore {
       case "attachmentGet": {
         let readId = p.readId as string;
         if (readId && p.close) {
+          const read = this.reads.get(readId);
           this.reads.delete(readId);
-          return { kind: "attachmentData", payload: { namespace: NS, readId } };
+          if (!read) return { kind: "attachmentData", payload: { namespace: NS, readId } };
+          return {
+            kind: "attachmentData",
+            payload: { namespace: NS, readId, info: read.info, commitHex: HEAD_ONE, eof: true, superseded: this.#superseded(read) },
+          };
         }
         if (!readId) {
           const items = this.docs.get(p.docId as string) ?? [];
@@ -302,17 +338,46 @@ class AttachmentStore {
           if (!info) return { kind: "attachmentData", payload: { namespace: NS, error: "no such attachment", errorCode: "NOT_FOUND" } };
           let data = this.blobs.get(info.hash)!;
           if (this.corrupt) data = data.map((b, i) => (i === 0 ? b ^ 1 : b));
+          if (this.tamperChunk >= 0) data = data.map((b, i) => (i === this.tamperChunk * ATTACHMENT_CHUNK_BYTES + 3 ? b ^ 0xff : b));
           readId = `r-${++this.#ids}`;
-          this.reads.set(readId, { data, info });
+          this.reads.set(readId, { data, info, docId: p.docId as string });
         }
         const read = this.reads.get(readId)!;
-        const offset = p.offset as number;
-        const data = read.data.subarray(offset, offset + this.pageBytes);
+        const size = read.info.size;
+        let offset = p.offset as number;
+        if (offset < 0 || offset > size) {
+          // As the Go server: the read is dropped, but the info stays on the error.
+          this.reads.delete(readId);
+          return {
+            kind: "attachmentData",
+            payload: { namespace: NS, info: read.info, commitHex: HEAD_ONE, error: `offset ${offset} outside the attachment's ${size} bytes`, errorCode: "SCHEMA_VIOLATION" },
+          };
+        }
+        let page = Math.min(p.proofs ? (p.maxBytes as number) || MAX_ATTACHMENT_CHUNK_BYTES : this.pageBytes, MAX_ATTACHMENT_CHUNK_BYTES);
+        const proof: Record<string, unknown> = {};
+        if (p.proofs) {
+          // Go's alignment rule: whole chunks, at least one, at most 4 MiB, never past the end.
+          const chunk = ATTACHMENT_CHUNK_BYTES;
+          let end = Math.ceil((offset + page) / chunk) * chunk;
+          offset -= offset % chunk;
+          end = Math.min(size, Math.max(end, offset + chunk), offset + MAX_ATTACHMENT_CHUNK_BYTES);
+          page = end - offset;
+          const tree = await this.#tree(read.info.hash);
+          const chunks = [];
+          for (let i = offset / chunk; i < attachmentChunkCount(size) && (i * chunk < end || size === 0); i++) {
+            chunks.push({ leaf: i, path: tree.proof(i).map(toHex) });
+          }
+          Object.assign(proof, { tree: toHex(tree.root), chunks, scheme: 1 });
+        }
+        const data = read.data.subarray(offset, offset + page);
         const eof = offset + data.length >= read.data.length;
         if (eof) this.reads.delete(readId);
         return {
           kind: "attachmentData",
-          payload: { namespace: NS, readId, docId: p.docId, info: read.info, commitHex: HEAD_ONE, offset, data, eof },
+          payload: {
+            namespace: NS, readId, docId: p.docId, info: read.info, commitHex: HEAD_ONE, offset, data, eof,
+            superseded: eof && this.#superseded(read), ...proof,
+          },
         };
       }
       case "txCommit": {
@@ -333,6 +398,21 @@ class AttachmentStore {
       default:
         return undefined;
     }
+  }
+
+  /** Whether the read's attachment has since been replaced or removed. */
+  #superseded(read: { info: AttachmentInfoDto; docId: string }): boolean {
+    const now = (this.docs.get(read.docId) ?? []).find((i) => i.id === read.info.id);
+    return now?.hash !== read.info.hash;
+  }
+
+  async #tree(hash: string): Promise<MerkleTree> {
+    let tree = this.trees.get(hash);
+    if (!tree) {
+      tree = await MerkleTree.build(await MerkleTree.leavesOf(this.blobs.get(hash)!));
+      this.trees.set(hash, tree);
+    }
+    return tree;
   }
 
   #apply(op: OpDto): void {
@@ -535,3 +615,258 @@ describe("client attachments", () => {
     assert.deepEqual(rows, [[new TextEncoder().encode("hello"), 1], [null, null]]);
   });
 });
+
+// --- verified ranged reads -----------------------------------------------------------------------
+
+/** The range-proof golden attachment (go/kdb/document/attachment_proof_test.go): 4 MiB + 5 bytes, byte i = i % 251. */
+function rangeBytes(): Uint8Array {
+  const b = new Uint8Array(4 * ATTACHMENT_CHUNK_BYTES + 5);
+  for (let i = 0; i < b.length; i++) b[i] = i % 251;
+  return b;
+}
+
+const RANGE_GOLDEN_HASH = "1a57b9052a9bae5f2bbaa720791a30f99ea84caecaa0898551c84d1746d3ae27";
+const RANGE_GOLDEN_TREE = "b6b9d1a58b2d9dc4d118b3347037b67ed5ba981c51684aad96da01b56091d758";
+const RANGE_GOLDEN_LEAF = [
+  "f4e53704c07aef05b5b12a89d6c1e54292fa7d9d8c3ee431c40b6f6ef6d19280",
+  "23124c5e2cfe3dc827a1b85edc1a2da44b2797cfaccc2120830b0663a818c044",
+  "eff5a4ce2d94f327c9dc3df962c7a293b9dd39731f7ad77cf9c000ae46893633",
+  "4e4be56a1af3ce8199934fa45f00954b81a1789f1bdd37fd0c9a176bb84e9c61",
+  "80c33e07ae030ed1db9a08ac474659b0bb3a4c92abf785750c4030adbc37c9b3",
+];
+const RANGE_GOLDEN_PATH = [
+  [RANGE_GOLDEN_LEAF[1]!, "43d36e796ccb572050e71018e752c7b68495fdc5b025bf606d7d249205fc80fb", RANGE_GOLDEN_LEAF[4]!],
+  [RANGE_GOLDEN_LEAF[0]!, "43d36e796ccb572050e71018e752c7b68495fdc5b025bf606d7d249205fc80fb", RANGE_GOLDEN_LEAF[4]!],
+  [RANGE_GOLDEN_LEAF[3]!, "1661cb740559458c2a1dce898f8f510ea07d28501f983c733aec692565131eb7", RANGE_GOLDEN_LEAF[4]!],
+  [RANGE_GOLDEN_LEAF[2]!, "1661cb740559458c2a1dce898f8f510ea07d28501f983c733aec692565131eb7", RANGE_GOLDEN_LEAF[4]!],
+  ["b70f08b29c8bc80f288233ea601ba8396567682f18ca787267d5c695ec190f78"],
+];
+
+describe("attachment Merkle proofs (RFC 6962)", () => {
+  it("reproduces Go's range-proof goldens: tree, leaves and audit paths, each verifying", async () => {
+    const data = rangeBytes();
+    const leaves = await MerkleTree.leavesOf(data);
+    const tree = await MerkleTree.build(leaves);
+    assert.equal(await attachmentContentHash(data), RANGE_GOLDEN_HASH);
+    assert.equal(toHex(tree.root), RANGE_GOLDEN_TREE);
+    assert.equal(await attachmentIdentity(tree.root, data.length), RANGE_GOLDEN_HASH);
+    assert.equal(tree.leafCount, 5);
+    assert.deepEqual(leaves.map(toHex), RANGE_GOLDEN_LEAF);
+    for (const [i, leaf] of leaves.entries()) {
+      const path = tree.proof(i);
+      assert.deepEqual(path.map(toHex), RANGE_GOLDEN_PATH[i], `leaf ${i}`);
+      assert.ok(await verifyMerkleInclusion(leaf, i, 5, path, tree.root), `leaf ${i} verifies`);
+      // Any other position, count or path fails.
+      assert.ok(!(await verifyMerkleInclusion(leaf, (i + 1) % 5, 5, path, tree.root)), `leaf ${i} elsewhere`);
+      assert.ok(!(await verifyMerkleInclusion(leaf, i, 9, path, tree.root)), `leaf ${i} of 9`);
+      assert.ok(!(await verifyMerkleInclusion(leaf, i, 5, path.slice(1), tree.root)), `leaf ${i} short path`);
+    }
+    assert.deepEqual([0, 1, ATTACHMENT_CHUNK_BYTES, ATTACHMENT_CHUNK_BYTES + 1].map(attachmentChunkCount), [1, 1, 1, 2]);
+  });
+
+  it("builds the RFC 6962 tree for every leaf count, each path verifying", async () => {
+    for (let n = 1; n <= 20; n++) {
+      const leaves = await Promise.all(Array.from({ length: n }, (_, i) => MerkleTree.leavesOf(Uint8Array.of(i, n)).then((l) => l[0]!)));
+      const tree = await MerkleTree.build(leaves);
+      for (let i = 0; i < n; i++) {
+        assert.ok(await verifyMerkleInclusion(leaves[i]!, i, n, tree.proof(i), tree.root), `n=${n} leaf ${i}`);
+      }
+    }
+    // The empty tree is the tree of one empty chunk, whose identity is the zero-byte content hash.
+    const empty = await MerkleTree.build([]);
+    assert.equal(await attachmentIdentity(empty.root, 0), HASH_GOLDENS[0]![1]);
+  });
+});
+
+describe("client verified ranged reads", () => {
+  const MIB = ATTACHMENT_CHUNK_BYTES;
+
+  async function setup(data = rangeBytes(), name = "r.bin") {
+    const store = new AttachmentStore();
+    const client = await store.client();
+    await client.putAttachment(NS, DOC_A, data, { name });
+    return { store, client, data };
+  }
+
+  it("offers attachment-proofs in the handshake", async () => {
+    const { store, client } = await setup(Uint8Array.of(1));
+    assert.ok((store.server.requests[0]!.payload.wireFeatures as string[]).includes(WIRE_FEATURE_ATTACHMENT_PROOFS));
+    assert.ok(client.wireFeatures.includes(WIRE_FEATURE_ATTACHMENT_PROOFS));
+  });
+
+  it("reads verified ranges anywhere in the attachment", async () => {
+    const { client, data } = await setup();
+    const size = data.length;
+    const cases: Array<[string, number, number]> = [
+      ["start", 0, 10],
+      ["mid-chunk", MIB + 100, 50],
+      ["across a chunk boundary", MIB - 10, 20],
+      ["across pages", 100, 4 * MIB + 7 - 100],
+      ["whole", 0, -1],
+      ["from a chunk boundary to the end", 3 * MIB, -1],
+      ["into the short last chunk", 4 * MIB - 3, -1],
+      ["last byte", size - 1, 1],
+      ["past the end is cut", size - 2, 100],
+      ["empty mid-way", 2 * MIB + 1, 0],
+      ["at the end", size, -1],
+      ["at the end, with a length", size, 5],
+    ];
+    for (const [what, offset, length] of cases) {
+      const reader = await client.openAttachmentRange(NS, DOC_A, "r.bin", { offset, length });
+      const parts: Uint8Array[] = [];
+      for await (const part of reader) parts.push(part);
+      const end = length >= 0 ? Math.min(size, offset + length) : size;
+      assert.equal(Buffer.compare(Buffer.concat(parts), Buffer.from(data.subarray(offset, end))), 0, what);
+      assert.equal(reader.info.size, size, what);
+      assert.equal(reader.superseded, false, what);
+      assert.equal(reader.commit, HEAD_ONE, what);
+    }
+  });
+
+  it("asks for chunk-aligned pages of at most 4 MiB, with proofs", async () => {
+    const { store, client, data } = await setup();
+    const got = await client.readAttachmentAt(NS, DOC_A, "r.bin", 100, 4 * MIB + 7 - 100);
+    assert.equal(Buffer.compare(Buffer.from(got), Buffer.from(data.subarray(100, 4 * MIB + 7))), 0);
+    const gets = store.server.requests.filter((r) => r.kind === "attachmentGet").map((r) => r.payload);
+    assert.deepEqual(
+      gets.map((g) => [g.readId, g.offset, g.maxBytes, g.proofs, g.close]),
+      [
+        // The range [100, 4 MiB + 7) is cut at the attachment's end, 4 MiB + 5, from the second page on.
+        ["", 100, 4 * MIB + 7 - 100, true, false],
+        ["r-2", 4 * MIB, 5, true, false],
+      ],
+    );
+    assert.equal(store.reads.size, 0);
+  });
+
+  it("releases the pinned read at the range's end, reporting superseded from the close", async () => {
+    const { store, client, data } = await setup();
+    const reader = await client.openAttachmentRange(NS, DOC_A, "r.bin", { offset: MIB - 1, length: 2 * MIB });
+    assert.equal(store.reads.size, 1);
+    await client.putAttachment(NS, DOC_A, utf8("replaced"), { name: "r.bin" });
+    const parts: Uint8Array[] = [];
+    for await (const part of reader) parts.push(part);
+    assert.equal(Buffer.compare(Buffer.concat(parts), Buffer.from(data.subarray(MIB - 1, 3 * MIB - 1))), 0);
+    assert.equal(reader.superseded, true);
+    const last = store.server.requests.at(-1)!;
+    assert.equal(last.kind, "attachmentGet");
+    assert.equal(last.payload.close, true);
+    assert.equal(store.reads.size, 0);
+
+    // Unchanged: a range short of the end is closed too, and reports false.
+    const { store: s2, client: c2 } = await setup();
+    const quiet = await c2.openAttachmentRange(NS, DOC_A, "r.bin", { offset: 5, length: 5 });
+    for await (const _ of quiet) void _;
+    assert.equal(quiet.superseded, false);
+    assert.equal(s2.server.requests.at(-1)!.payload.close, true);
+    assert.equal(s2.reads.size, 0);
+
+    // A range reaching the end takes superseded from the EOF page; no close is sent.
+    const { store: s3, client: c3, data: d3 } = await setup();
+    const tail = await c3.openAttachmentRange(NS, DOC_A, "r.bin", { offset: d3.length - 3 });
+    await c3.putAttachment(NS, DOC_A, utf8("newer"), { name: "r.bin" });
+    for await (const _ of tail) void _;
+    assert.equal(tail.superseded, false, "the EOF page came with the open, before the replace");
+    assert.ok(!s3.server.requests.some((r) => r.kind === "attachmentGet" && r.payload.close));
+  });
+
+  it("cancel closes the read", async () => {
+    const { store, client } = await setup();
+    const reader = await client.openAttachmentRange(NS, DOC_A, "r.bin", { offset: 0, length: -1 });
+    await reader.cancel();
+    assert.equal(store.server.requests.at(-1)!.payload.close, true);
+    assert.equal(store.reads.size, 0);
+  });
+
+  it("reads like an io.ReaderAt: short at the tail, empty at the end, a typed error past it", async () => {
+    const { store, client, data } = await setup();
+    const size = data.length;
+    assert.deepEqual(await client.readAttachmentAt(NS, DOC_A, "r.bin", 2 * MIB - 5, 10), data.subarray(2 * MIB - 5, 2 * MIB + 5));
+    assert.deepEqual(await client.readAttachmentAt(NS, DOC_A, "r.bin", size - 3, 10), data.subarray(size - 3));
+    assert.equal((await client.readAttachmentAt(NS, DOC_A, "r.bin", size, 10)).length, 0);
+
+    const past = await client.readAttachmentAt(NS, DOC_A, "r.bin", size + 10, 1).then(
+      () => assert.fail("read past the end"),
+      (e: unknown) => e,
+    );
+    assert.ok(past instanceof KdbAttachmentRangeError);
+    assert.equal(past.offset, size + 10);
+    assert.equal(past.size, size);
+    assert.equal(store.reads.size, 0, "the refused read is not left pinned");
+
+    const before = store.server.requests.length;
+    const negative = await client.openAttachmentRange(NS, DOC_A, "r.bin", { offset: -1 }).then(
+      () => assert.fail("negative offset"),
+      (e: unknown) => e,
+    );
+    assert.ok(negative instanceof KdbAttachmentRangeError);
+    assert.equal(negative.size, -1);
+    assert.equal(store.server.requests.length, before, "a negative offset is refused without asking");
+    await assert.rejects(client.openAttachmentRange(NS, DOC_A, "nope", { offset: 0 }), KdbAttachmentNotFoundError);
+  });
+
+  it("proves the one empty chunk of a zero-byte attachment", async () => {
+    const { client } = await setup(new Uint8Array(0), "empty");
+    for (const length of [-1, 0, 10]) {
+      const reader = await client.openAttachmentRange(NS, DOC_A, "empty", { length });
+      assert.equal(reader.info.size, 0);
+      assert.equal((await collect(reader)).length, 0, `length ${length}`);
+    }
+    await assert.rejects(client.readAttachmentAt(NS, DOC_A, "empty", 1, 1), KdbAttachmentRangeError);
+  });
+
+  it("rejects a tampered chunk before handing out any byte of its page", async () => {
+    const data = rangeBytes().subarray(0, 2 * MIB + 10); // three chunks
+    const { store, client } = await setup(data);
+    store.tamperChunk = 1;
+    // Chunk 0 is sound, so a range inside it reads.
+    assert.deepEqual(await client.readAttachmentAt(NS, DOC_A, "r.bin", 5, 100), data.subarray(5, 105));
+    // A range touching chunk 1 fails at the open: no bytes at all, not even chunk 0's.
+    for (const [offset, length] of [[MIB + 100, 10], [MIB - 10, 20], [0, -1]] as const) {
+      await assert.rejects(client.openAttachmentRange(NS, DOC_A, "r.bin", { offset, length }), KdbIntegrityError, `${offset}+${length}`);
+    }
+    assert.equal(store.reads.size, 0, "the failed opens closed their reads");
+  });
+
+  it("fails a later page over a tampered chunk, having handed out only the sound pages", async () => {
+    const { store, client } = await setup(); // five chunks: pages of chunks 0-3, then 4
+    store.tamperChunk = 4;
+    const pages = await client.openAttachmentRange(NS, DOC_A, "r.bin", { offset: 10 });
+    const seen: number[] = [];
+    await assert.rejects(
+      (async () => {
+        for await (const part of pages) seen.push(part.length);
+      })(),
+      KdbIntegrityError,
+    );
+    assert.deepEqual(seen, [4 * MIB - 10]);
+    assert.equal(store.reads.size, 0);
+  });
+
+  it("rejects a tree that does not hash to the content hash", async () => {
+    const { store, client } = await setup();
+    const real = store.trees;
+    const fake = await MerkleTree.build([await MerkleTree.leavesOf(utf8("other")).then((l) => l[0]!)]);
+    for (const k of store.blobs.keys()) real.set(k, fake);
+    await assert.rejects(client.openAttachmentRange(NS, DOC_A, "r.bin", { offset: 0, length: 1 }), KdbIntegrityError);
+  });
+
+  it("needs the attachment-proofs feature", async () => {
+    const store = new AttachmentStore();
+    store.features = ["binary-frames", WIRE_FEATURE_ATTACHMENTS];
+    const client = await store.client();
+    await assert.rejects(client.openAttachmentRange(NS, DOC_A, "r.bin"), KdbUnsupportedError);
+    await assert.rejects(client.readAttachmentAt(NS, DOC_A, "r.bin", 0, 1), KdbUnsupportedError);
+    // The unverified API is unaffected.
+    await client.putAttachment(NS, DOC_A, Uint8Array.of(1, 2, 3), { name: "x" });
+    assert.deepEqual((await client.readAttachment(NS, DOC_A, "x")).data, Uint8Array.of(1, 2, 3));
+  });
+});
+
+const utf8 = (text: string) => new TextEncoder().encode(text);
+
+async function collect(reader: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const parts: Uint8Array[] = [];
+  for await (const part of reader) parts.push(part);
+  return new Uint8Array(Buffer.concat(parts));
+}

@@ -12,6 +12,7 @@ export type { ConnectOptions, JsonValue, Lease, SqlValue, TlsOptions } from "./c
 
 export {
   KdbAttachmentNotFoundError,
+  KdbAttachmentRangeError,
   KdbIntegrityError,
   KdbUploadError,
   sqlAttachment,
@@ -20,6 +21,7 @@ export {
 export type {
   AttachmentBlob,
   AttachmentInfo,
+  AttachmentRangeOptions,
   AttachmentReader,
   AttachmentSelector,
   AttachmentSource,
@@ -31,11 +33,19 @@ export type {
 export {
   ATTACHMENT_CHUNK_BYTES,
   AttachmentHasher,
+  attachmentChunkCount,
   attachmentContentHash,
+  attachmentIdentity,
+  chunkLeafHash,
   decodeAttachmentBody,
   encodeAttachmentBody,
+  merkleNodeHash,
+  MerkleTree,
+  verifyMerkleInclusion,
+  WIRE_FEATURE_ATTACHMENT_PROOFS,
   WIRE_FEATURE_ATTACHMENTS,
 } from "./wire/attachments.ts";
+export type { ChunkProofDto } from "./wire/attachments.ts";
 
 export type {
   AttachmentDeleteOp,

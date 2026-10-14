@@ -78,7 +78,11 @@ export interface PutAttachmentOptions extends UploadAttachmentOptions {
 export interface ReadAttachmentOptions extends CallOptions {
   /** Read as of this commit (hex); default: the session's read head. */
   asOf?: string;
-  /** Start this many bytes in. A partial read is not hash-verified. */
+  /**
+   * Start this many bytes in. Such a partial read is NOT hash-verified: for a verified part of an
+   * attachment use `openAttachmentRange` / `readAttachmentAt`, which check every chunk against the
+   * content hash with its Merkle inclusion proof.
+   */
   offset?: number;
   /** The most bytes one page may carry; 0 or omitted lets the server choose. */
   pageBytes?: number;
@@ -90,12 +94,22 @@ export interface ReadAttachmentOptions extends CallOptions {
   verify?: boolean;
 }
 
+/** A verified ranged read (`openAttachmentRange`, `readAttachmentAt`). */
+export interface AttachmentRangeOptions extends CallOptions {
+  /** Read as of this commit (hex); default: the session's read head. */
+  asOf?: string;
+  /** Where the range starts; default 0. Past the attachment's end throws KdbAttachmentRangeError. */
+  offset?: number;
+  /** How many bytes; omitted or -1 reads to the end. A range running past the end stops there. */
+  length?: number;
+}
+
 export interface ListAttachmentsOptions extends CallOptions {
   asOf?: string;
 }
 
 /**
- * One attachment being read, page by page. Iterate it (for await) or take `stream()`, once: the
+ * One attachment (or, from `openAttachmentRange`, one range of it) being read, page by page. Iterate it (for await) or take `stream()`, once: the
  * read pins the version it started on, so every page comes from the same bytes even if a newer
  * version commits meanwhile - and `superseded`, once the read is done, says whether one did.
  */
@@ -103,7 +117,10 @@ export interface AttachmentReader extends AsyncIterable<Uint8Array> {
   readonly info: AttachmentInfo;
   /** The commit the read resolved to, hex. */
   readonly commit: string;
-  /** After the last page: the document's attachment has changed (or gone) since the read began. */
+  /**
+   * After the last page (of the range, for a ranged read): the document's attachment has changed
+   * (or gone) since the read began.
+   */
   readonly superseded: boolean;
   /** The bytes as a web ReadableStream. */
   stream(): ReadableStream<Uint8Array>;
@@ -132,6 +149,25 @@ export class KdbIntegrityError extends KdbError {
     super(message, { code: "INTEGRITY" });
     this.expectedHash = expectedHash;
     this.actualHash = actualHash;
+  }
+}
+
+/**
+ * A ranged read started outside the attachment: past its end, or at a negative offset. `size` is
+ * the attachment's length, or -1 when the offset was refused before the server was asked.
+ */
+export class KdbAttachmentRangeError extends KdbError {
+  readonly offset: number;
+  readonly size: number;
+
+  constructor(offset: number, size: number) {
+    super(
+      size < 0
+        ? `kdb: attachment offset ${offset} is negative`
+        : `kdb: attachment offset ${offset} is past its ${size} bytes`,
+    );
+    this.offset = offset;
+    this.size = size;
   }
 }
 
