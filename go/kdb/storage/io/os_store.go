@@ -491,6 +491,35 @@ func (s *OSByteStore) Delete(segmentName string) error {
 // it then; something does now (the control plane asks whether a promotion's copy will fit), and a
 // wrong answer to "is there room" is worse than no answer - so where the platform cannot say, this
 // returns an error rather than a number.
+// Rename implements segmentStoreRenamer. The handles open on from are closed first - a renamed
+// file keeps its descriptors on unix but not everywhere, and from is finished with anyway - and the
+// directory holding to is synced afterwards so the rename survives a power loss.
+func (s *OSByteStore) Rename(from, to string) error {
+	s.dropReader(from)
+	s.dropReader(to)
+	s.mu.Lock()
+	seg, ok := s.handles[from]
+	delete(s.handles, from)
+	s.mu.Unlock()
+	if ok {
+		if err := seg.file.Close(); err != nil {
+			return err
+		}
+	}
+	dst := s.pathFor(to)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return fmt.Errorf("rename target %s already exists", to)
+	}
+	if err := fsx.Rename(s.pathFor(from), dst); err != nil {
+		return err
+	}
+	_ = fsx.SyncDir(filepath.Dir(dst))
+	return nil
+}
+
 func (s *OSByteStore) AvailableBytes() (int64, error) {
 	return availableBytes(s.root)
 }

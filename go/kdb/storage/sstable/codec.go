@@ -2,8 +2,10 @@ package sstable
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"strconv"
 	"strings"
 
@@ -133,23 +135,71 @@ type indexEntry struct {
 // (Kotlin was missing this trailer too) - the two must stay byte-for-byte identical; see
 // go/testdata/golden/codec's regenerated fixtures.
 func buildFooter(index []indexEntry, fileHash codec.Hash) []byte {
-	lines := make([]string, 0, len(index))
-	for _, e := range index {
-		bh := e.handle
-		line := fmt.Sprintf("%s:%d:%d", e.key.Hex(), bh.Offset, bh.CompressedSize)
-		if bh.Deleted {
-			line += ":" + tombstoneFlag
+	var out []byte
+	_ = encodeFooter(index, fileHash, make([]byte, 0, 64<<10), func(b []byte) error {
+		out = append(out, b...)
+		return nil
+	})
+	return out
+}
+
+// encodeFooter lays out exactly what buildFooter returns, a buffer at a time: it fills buf (from
+// its start, up to its capacity) and hands it to emit whenever another line might not fit, and
+// once more at the end. emit must be done with the bytes when it returns.
+//
+// For a table writer, which appends the footer as it is encoded. The footer is one text line per
+// key, and building it whole - the lines, then their join, then the footer around it - held
+// about three copies of the index text at once, the last allocation of a merge and its largest
+// after the values: some 800 MB for the 3M keys of a 3M-document namespace.
+func encodeFooter(index []indexEntry, fileHash codec.Hash, buf []byte, emit func([]byte) error) error {
+	// indexLen comes before the lines, so it is counted first.
+	indexLen := 0
+	var scratch [maxFooterLine]byte
+	for i, e := range index {
+		if i > 0 {
+			indexLen++
 		}
-		lines = append(lines, line)
+		indexLen += len(appendFooterIndexLine(scratch[:0], e))
 	}
-	indexBytes := []byte(strings.Join(lines, "\n"))
-	footer := make([]byte, 8+len(indexBytes)+32+footerTrailerSize)
-	writeInt(footer, 0, footerMagic)
-	writeInt(footer, 4, len(indexBytes))
-	copy(footer[8:], indexBytes)
-	copy(footer[8+len(indexBytes):8+len(indexBytes)+32], fileHash.Bytes[:])
-	writeInt(footer, len(footer)-footerTrailerSize, len(indexBytes))
-	return footer
+	var word [4]byte
+	writeInt(word[:], 0, footerMagic)
+	buf = append(buf[:0], word[:]...)
+	writeInt(word[:], 0, indexLen)
+	buf = append(buf, word[:]...)
+	for i, e := range index {
+		if len(buf) > 0 && len(buf)+1+maxFooterLine > cap(buf) {
+			if err := emit(buf); err != nil {
+				return err
+			}
+			buf = buf[:0]
+		}
+		if i > 0 {
+			buf = append(buf, '\n')
+		}
+		buf = appendFooterIndexLine(buf, e)
+	}
+	buf = append(buf, fileHash.Bytes[:]...)
+	buf = append(buf, word[:]...) // the trailer: indexLen again
+	return emit(buf)
+}
+
+// maxFooterLine bounds appendFooterIndexLine's output: the key, two colons, two int64s in decimal
+// and the tombstone field.
+const maxFooterLine = 64 + 1 + 20 + 1 + 20 + 2
+
+// appendFooterIndexLine appends e's footer index line, "<hex>:<offset>:<size>" plus ":1" for a
+// tombstone, without its newline.
+func appendFooterIndexLine(dst []byte, e indexEntry) []byte {
+	dst = hex.AppendEncode(dst, e.key.Bytes[:])
+	dst = append(dst, ':')
+	dst = strconv.AppendInt(dst, e.handle.Offset, 10)
+	dst = append(dst, ':')
+	dst = strconv.AppendInt(dst, int64(e.handle.CompressedSize), 10)
+	if e.handle.Deleted {
+		dst = append(dst, ':')
+		dst = append(dst, tombstoneFlag...)
+	}
+	return dst
 }
 
 func parseFooter(footer []byte) (map[codec.Hash]BlockHandle, error) {
@@ -247,13 +297,13 @@ type appendLimiter interface{ MaxAppendBytes() int }
 // with roughly 108,000 commits once its documents, tree objects and version locations are
 // counted - at which point compaction failed and quietly kept its existing tables. The
 // in-memory shim has no ceiling, which is why no memory-backed test could see it.
-func (w *DefaultWriter) appendAll(segmentName string, b []byte) (int64, error) {
+func appendAll(shim storage.PlatformIOShim, segmentName string, b []byte) (int64, error) {
 	limit := 0
-	if l, ok := w.io.(appendLimiter); ok {
+	if l, ok := shim.(appendLimiter); ok {
 		limit = l.MaxAppendBytes()
 	}
 	if limit <= 0 || len(b) <= limit {
-		return w.io.AppendToSegment(segmentName, b)
+		return shim.AppendToSegment(segmentName, b)
 	}
 	var size int64
 	for off := 0; off < len(b); off += limit {
@@ -261,7 +311,7 @@ func (w *DefaultWriter) appendAll(segmentName string, b []byte) (int64, error) {
 		if end > len(b) {
 			end = len(b)
 		}
-		n, err := w.io.AppendToSegment(segmentName, b[off:end])
+		n, err := shim.AppendToSegment(segmentName, b[off:end])
 		if err != nil {
 			return 0, err
 		}
@@ -275,96 +325,146 @@ func (w *DefaultWriter) appendAll(segmentName string, b []byte) (int64, error) {
 const finishBufferBytes = 1 << 20
 
 func (w *DefaultWriter) Finish() (Handle, error) {
-	blocks := make([]indexEntry, 0, len(w.entries))
 	fileID, err := codec.RandomUUID()
 	if err != nil {
 		return Handle{}, err
 	}
 	segmentName := io.SegmentNameBuilder.SSTable(w.namespaceID, w.level, fileID.String())
-	// Blocks are gathered and appended finishBufferBytes at a time, not one append per block: an
-	// append is a positional write, a system call each, and at ~150 us apiece on macOS a 10k-entry
-	// flush spent 1.6 s in them for 2 MB of data - every memtable flush and compaction paid it.
-	var offset int64
-	buf := make([]byte, 0, finishBufferBytes)
-	flush := func() error {
-		if len(buf) == 0 {
-			return nil
-		}
-		size, err := w.appendAll(segmentName, buf)
-		if err != nil {
-			return err
-		}
-		if size != offset {
-			return fmt.Errorf("sstable: %s is %d bytes after an append, expected %d", segmentName, size, offset)
-		}
-		buf = buf[:0]
-		return nil
-	}
+	b := newTableBuilder(w.io, segmentName, len(w.entries))
 	for _, e := range w.entries {
 		if e.deleted {
-			blocks = append(blocks, indexEntry{key: e.key, handle: BlockHandle{Deleted: true}})
+			b.delete(e.key)
 			continue
 		}
-		block, err := encodeBlock(e.value, true)
-		if err != nil {
+		if err := b.put(e.key, e.value); err != nil {
 			return Handle{}, err
 		}
-		if len(buf) > 0 && len(buf)+len(block) > finishBufferBytes {
-			if err := flush(); err != nil {
-				return Handle{}, err
-			}
-		}
-		buf = append(buf, block...)
-		newSize := offset + int64(len(block))
-		// CompressedSize is the compressed body's own length - excluding encodeBlock's
-		// header (compSize/uncompSize/crc) - matching what Get() expects when it later reads
-		// bh.CompressedSize+blockHeaderSize bytes starting at Offset. This used to store
-		// len(block) (the full header+body length) instead, over-reading a header's worth of
-		// bytes into whatever followed - the next block,
-		// or the footer for the last one - on every single Get().
-		blocks = append(blocks, indexEntry{
-			key:    e.key,
-			handle: BlockHandle{Offset: offset, CompressedSize: len(block) - blockHeaderSize},
-		})
-		offset = newSize
 	}
-	if err := flush(); err != nil {
-		return Handle{}, err
-	}
-	// Hashed as a stream rather than into one buffer. The preimage is every key and value in
-	// the table, so materialising it doubled the table's bytes in memory at the moment a
-	// compaction was already holding the most - and it bought nothing, since the digest of a
-	// byte sequence does not depend on how it was fed in.
-	h := sha256.New()
-	for _, e := range w.entries {
-		h.Write(e.key.Bytes[:])
-		if e.deleted {
-			// A marker byte, so "deleted K" and "wrote K with an empty value" hash differently.
-			// Safe to introduce: no segment written before tombstones existed contains one.
-			h.Write([]byte{0xFF})
-			continue
-		}
-		h.Write(e.value)
-	}
-	fileHash, err := codec.HashFromBytes(h.Sum(nil))
-	if err != nil {
-		return Handle{}, err
-	}
-	footer := buildFooter(blocks, fileHash)
-	tableSize, err := w.appendAll(segmentName, footer)
+	tableSize, fileHash, err := b.finish()
 	if err != nil {
 		return Handle{}, err
 	}
 	if err := w.io.SealSegment(segmentName); err != nil {
 		return Handle{}, err
 	}
-	// The table is complete and sealed; its sidecar is an optional extra written after it (see
-	// sidecar.go). A failure here costs the table its fast index, never its data: a lookup finds
-	// no sidecar and reads the footer, as every table did before sidecars, and rebuilds it.
-	if path, ok := sidecarPath(sidecarResolver(w.io), segmentName); ok {
-		_ = writeSidecarFile(path, blocks, tableSize, fileHash)
-	}
+	writeSidecar(w.io, segmentName, b.index, tableSize, fileHash)
 	return Handle{FileHash: fileHash, Level: w.level, SegmentName: segmentName}, nil
+}
+
+// writeSidecar writes a finished, sealed table's sidecar. The sidecar is an optional extra
+// written after the table (see sidecar.go): a failure here costs the table its fast index, never
+// its data - a lookup finds no sidecar and reads the footer, as every table did before sidecars,
+// and rebuilds it.
+func writeSidecar(shim storage.PlatformIOShim, segmentName string, index []indexEntry, tableSize int64, fileHash codec.Hash) {
+	if path, ok := sidecarPath(sidecarResolver(shim), segmentName); ok {
+		_ = writeSidecarFile(path, index, tableSize, fileHash)
+	}
+}
+
+// tableBuilder lays a table out as its entries arrive: each value is encoded and appended (in
+// finishBufferBytes batches) when it is put, and only the footer index - tens of bytes per key -
+// stays in memory until finish. The entries must arrive in the order the table is to hold them;
+// DefaultWriter.Finish feeds its first-insertion order and a compaction its sorted keys.
+//
+// A table used to be built only from a DefaultWriter that held every value until Finish, so a
+// compaction, which reads every surviving value of the store, held the whole store in memory:
+// 2.7 GB of heap to merge 471 MB of tables at 3M documents.
+type tableBuilder struct {
+	shim        storage.PlatformIOShim
+	segmentName string
+	// Blocks are gathered and appended finishBufferBytes at a time, not one append per block: an
+	// append is a positional write, a system call each, and at ~150 us apiece on macOS a 10k-entry
+	// flush spent 1.6 s in them for 2 MB of data - every memtable flush and compaction paid it.
+	buf    []byte
+	offset int64
+	index  []indexEntry
+	// Hashed as a stream rather than into one buffer: the preimage is every key and value in the
+	// table, and the digest of a byte sequence does not depend on how it was fed in.
+	hash hash.Hash
+}
+
+func newTableBuilder(shim storage.PlatformIOShim, segmentName string, entries int) *tableBuilder {
+	return &tableBuilder{
+		shim:        shim,
+		segmentName: segmentName,
+		buf:         make([]byte, 0, finishBufferBytes),
+		index:       make([]indexEntry, 0, entries),
+		hash:        sha256.New(),
+	}
+}
+
+// put appends value's block under key.
+func (b *tableBuilder) put(key codec.Hash, value []byte) error {
+	block, err := encodeBlock(value, true)
+	if err != nil {
+		return err
+	}
+	if len(b.buf) > 0 && len(b.buf)+len(block) > finishBufferBytes {
+		if err := b.flush(); err != nil {
+			return err
+		}
+	}
+	b.buf = append(b.buf, block...)
+	// CompressedSize is the compressed body's own length - excluding encodeBlock's
+	// header (compSize/uncompSize/crc) - matching what Get() expects when it later reads
+	// bh.CompressedSize+blockHeaderSize bytes starting at Offset. This used to store
+	// len(block) (the full header+body length) instead, over-reading a header's worth of
+	// bytes into whatever followed - the next block,
+	// or the footer for the last one - on every single Get().
+	b.index = append(b.index, indexEntry{
+		key:    key,
+		handle: BlockHandle{Offset: b.offset, CompressedSize: len(block) - blockHeaderSize},
+	})
+	b.offset += int64(len(block))
+	b.hash.Write(key.Bytes[:])
+	b.hash.Write(value)
+	return nil
+}
+
+// delete records a tombstone for key: an index entry and no block.
+func (b *tableBuilder) delete(key codec.Hash) {
+	b.index = append(b.index, indexEntry{key: key, handle: BlockHandle{Deleted: true}})
+	b.hash.Write(key.Bytes[:])
+	// A marker byte, so "deleted K" and "wrote K with an empty value" hash differently.
+	// Safe to introduce: no segment written before tombstones existed contains one.
+	b.hash.Write([]byte{0xFF})
+}
+
+func (b *tableBuilder) flush() error {
+	if len(b.buf) == 0 {
+		return nil
+	}
+	size, err := appendAll(b.shim, b.segmentName, b.buf)
+	if err != nil {
+		return err
+	}
+	// Flushed before a block is added, so offset is where the buffered blocks end.
+	if size != b.offset {
+		return fmt.Errorf("sstable: %s is %d bytes after an append, expected %d", b.segmentName, size, b.offset)
+	}
+	b.buf = b.buf[:0]
+	return nil
+}
+
+// finish appends what is buffered and the footer, and returns the table's size and file hash.
+// It does not seal the segment: a compaction renames it first.
+func (b *tableBuilder) finish() (int64, codec.Hash, error) {
+	if err := b.flush(); err != nil {
+		return 0, codec.Hash{}, err
+	}
+	fileHash, err := codec.HashFromBytes(b.hash.Sum(nil))
+	if err != nil {
+		return 0, codec.Hash{}, err
+	}
+	var tableSize int64
+	err = encodeFooter(b.index, fileHash, b.buf, func(p []byte) error {
+		tableSize, err = appendAll(b.shim, b.segmentName, p)
+		return err
+	})
+	if err != nil {
+		return 0, codec.Hash{}, err
+	}
+	return tableSize, fileHash, nil
 }
 
 // DefaultReader reads from one SSTable handle.

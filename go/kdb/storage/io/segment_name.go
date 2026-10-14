@@ -89,6 +89,19 @@ func (segmentNameBuilder) SSTable(namespaceID string, level int, fileID string) 
 	return fmt.Sprintf("ns/%s/%s/L%d/%s", namespaceID, SegmentKindSSTable.String(), level, fileID)
 }
 
+// SSTablePartial names an SSTable while it is still being written. It sits beside the sstable/
+// directory rather than in it, so nothing that registers tables - this build's DiscoverTables or
+// an older one's, which take every name under sstable/ - can mistake a half-written table for a
+// finished one. The writer renames it to its SSTable name once the footer is down.
+func (b segmentNameBuilder) SSTablePartial(namespaceID string, fileID string) string {
+	return b.SSTablePartialPrefix(namespaceID) + fileID
+}
+
+// SSTablePartialPrefix is the prefix every SSTablePartial name in namespaceID starts with.
+func (segmentNameBuilder) SSTablePartialPrefix(namespaceID string) string {
+	return fmt.Sprintf("ns/%s/%s-partial/", namespaceID, SegmentKindSSTable.String())
+}
+
 func (segmentNameBuilder) NamespacePrefix(namespaceID string) string {
 	return "ns/" + namespaceID + "/"
 }
