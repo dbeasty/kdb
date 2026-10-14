@@ -262,8 +262,9 @@ type treeSegment struct {
 	root     tref // local
 	rootHash [32]byte
 	docs     int
-	externs  []segExtern // as written
-	ext      []tref      // the externs resolved to slab references (register)
+	nExterns uint32 // externs as written stay in the mapping, 16 bytes each at extOff
+	extOff   int
+	ext      []tref // the externs resolved to slab references (register)
 	deps     []*treeSegment
 	refs     int // references from outside the segment; under the slab lock
 	unmapped bool
@@ -272,6 +273,13 @@ type treeSegment struct {
 type segExtern struct {
 	seq uint64
 	ref tref
+}
+
+// extern is the i-th extern as written (from 0), read from the mapping: a segment flushed on top
+// of a large tree can have millions, and a heap copy of them is only needed while registering.
+func (g *treeSegment) extern(i int) segExtern {
+	e := g.data[g.extOff+i*16:]
+	return segExtern{seq: binary.LittleEndian.Uint64(e), ref: tref(binary.LittleEndian.Uint32(e[8:]))}
 }
 
 func (g *treeSegment) leafAt(local uint32) *leafRec {
@@ -405,16 +413,12 @@ func openTreeSegment(f *TreeFile, path string, trusted bool) (g *treeSegment, er
 	}
 	g = &treeSegment{
 		path: path, file: f, mapping: m, region: region, data: data,
-		leaves: leaves, nodes: nodes,
+		leaves: leaves, nodes: nodes, nExterns: externs, extOff: extOff,
 		nodeOff: treeSegHeader + int(leaves)*leafRecSize,
 		root:    tref(le.Uint32(hdr[24:])),
 		docs:    int(le.Uint64(hdr[32:])),
 	}
 	copy(g.rootHash[:], hdr[40:72])
-	for i := 0; i < int(externs); i++ {
-		e := data[extOff+i*16:]
-		g.externs = append(g.externs, segExtern{seq: le.Uint64(e), ref: tref(le.Uint32(e[8:]))})
-	}
 	if base := filepath.Base(path); strings.HasPrefix(base, "tree-") {
 		g.seq, _ = strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(base, "tree-"), treeSegSuffix), 10, 64)
 	}
@@ -440,7 +444,7 @@ func (g *treeSegment) checkRef(c tref) error {
 	case c == 0:
 		return nil
 	case c&refFile != 0:
-		if i := uint32(c & refIndexMask); i == 0 || i > uint32(len(g.externs)) || c&(refLeaf|refLocal) != 0 {
+		if i := uint32(c & refIndexMask); i == 0 || i > g.nExterns || c&(refLeaf|refLocal) != 0 {
 			return fmt.Errorf("document: tree segment %s: extern reference %d out of range", g.path, i)
 		}
 	case c&refLeaf != 0:
@@ -463,9 +467,10 @@ func (s *trieSlab) register(g *treeSegment) error {
 	if p := s.segs.p.Load(); p != nil {
 		cur = *p
 	}
-	ext := make([]tref, len(g.externs))
+	ext := make([]tref, g.nExterns)
 	var deps []*treeSegment
-	for i, e := range g.externs {
+	for i := range ext {
+		e := g.extern(i)
 		d := s.segBySeq(e.seq)
 		if d == nil {
 			return fmt.Errorf("document: tree segment %s refers to segment %d, which is not mapped", g.path, e.seq)
@@ -907,7 +912,8 @@ func attachChain(f *TreeFile, top *treeSegment, trusted map[uint64]bool) (*trieT
 		if depth > 64 {
 			return fmt.Errorf("document: tree segment chain under %s is too long", top.path)
 		}
-		for _, e := range g.externs {
+		for i := range int(g.nExterns) {
+			e := g.extern(i)
 			if s.segBySeq(e.seq) != nil {
 				continue
 			}

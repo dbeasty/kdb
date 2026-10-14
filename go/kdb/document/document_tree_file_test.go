@@ -715,3 +715,58 @@ func TestDropMappedPagesKeepsTheTreeReadable(t *testing.T) {
 	}
 	DocumentTree{}.DropMappedPages() // an unbound tree: a no-op
 }
+
+// TestTreeSegmentOpenLeavesExternsMapped: a segment flushed on top of a large tree refers to
+// millions of records in older segments (10M-document bootstrap: ~9M externs, 141 MB). Opening
+// it must not copy that table to the heap: register reads it from the mapping into the 4-byte
+// resolved form, and nothing else needs the written form.
+func TestTreeSegmentOpenLeavesExternsMapped(t *testing.T) {
+	r := rand.New(rand.NewSource(23))
+	f := newTestTreeFile(t, 256<<10)
+	const n = 100_000
+	packed := make([]byte, n*PackedTreeEntrySize)
+	r.Read(packed)
+	items := packedItems(packed)
+	sort.Slice(items, func(a, b int) bool { return bytes.Compare(items[a].key[:], items[b].key[:]) < 0 })
+	tree, err := OpenTreePacked(packed, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20000; i++ {
+		var h codec.Hash
+		r.Read(h.Bytes[:])
+		if tree, err = tree.With(keyUUID(&items[r.Intn(n)].key), h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitRewrites(tree)
+	var most *treeSegment
+	for _, g := range *tree.trie.slab.segs.p.Load() {
+		if most == nil || g.nExterns > most.nExterns {
+			most = g
+		}
+	}
+	if most == nil || most.nExterns < 1000 {
+		t.Fatalf("no segment with many externs to open (most: %+v)", most)
+	}
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	g, err := openTreeSegment(f, most.path, true)
+	runtime.ReadMemStats(&m1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range int(g.nExterns) {
+		if g.extern(i) != most.extern(i) {
+			t.Fatalf("extern %d reads %+v from the reopened segment, %+v from the open one", i, g.extern(i), most.extern(i))
+		}
+	}
+	g.region.Release()
+	g.mapping.Close()
+	alloc := m1.TotalAlloc - m0.TotalAlloc
+	t.Logf("segment with %d externs: open allocated %d bytes", g.nExterns, alloc)
+	if alloc > 16<<10 {
+		t.Fatalf("opening a segment with %d externs allocated %d bytes: the extern table was copied", g.nExterns, alloc)
+	}
+	runtime.KeepAlive(tree)
+}
