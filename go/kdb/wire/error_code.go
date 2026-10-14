@@ -52,6 +52,9 @@ const (
 	// knows this code sends the state with GRAFT_PUSH on the same session and retries the page
 	// (peersync.PushBelowBoundaryError); retrying unmodified cannot succeed.
 	ErrorCodeShallowBoundary ErrorCode = "SHALLOW_BOUNDARY"
+	// ErrorCodeNotFound: what the request names does not exist - an attachment, a document, or an
+	// attachment version no longer retained. Never retry unmodified.
+	ErrorCodeNotFound ErrorCode = "NOT_FOUND"
 	// ErrorCodeInternal: unclassified - the fallback when no more specific code applies.
 	ErrorCodeInternal ErrorCode = "INTERNAL"
 )

@@ -188,6 +188,8 @@ type sqlWireConnHandler struct {
 	// let two already-spawned goroutines race for it.
 	sessionMu    sync.Mutex
 	sessionTails map[string]chan struct{}
+	// attachReads are this connection's open attachment reads (attachments_wire.go).
+	attachReads attachmentReads
 }
 
 func newSqlWireConnHandler(codec wire.Codec, runtime *KdbServerRuntime) *sqlWireConnHandler {
@@ -336,6 +338,17 @@ func sessionIDOf(message wire.Message) (string, bool) {
 		return msg.SessionID, true
 	case wire.LockReleaseMessage:
 		return msg.SessionID, true
+	case wire.AttachmentUploadMessage:
+		// Chunks of one upload apply in the order they were sent, so a client may pipeline them.
+		if msg.UploadID != "" {
+			return "upload:" + msg.UploadID, true
+		}
+		return "", false
+	case wire.AttachmentGetMessage:
+		if msg.ReadID != "" {
+			return "read:" + msg.ReadID, true
+		}
+		return "", false
 	default:
 		return "", false
 	}
@@ -344,6 +357,7 @@ func sessionIDOf(message wire.Message) (string, bool) {
 // closeAllSessions releases every lock and drops every session belonging to this connection.
 // Safe to call more than once; a second call finds nothing left to do.
 func (h *sqlWireConnHandler) closeAllSessions() {
+	h.attachReads.closeAll()
 	for _, sess := range h.sessions.All() {
 		h.sessionRuntime(sess).DocumentLocks.ReleaseAll(sess.ID.Value)
 		sess.ClearLeases()
@@ -476,6 +490,12 @@ func (h *sqlWireConnHandler) dispatch(message wire.Message) wire.Message {
 		return h.handleRevert(msg)
 	case wire.TxCommitMultiMessage:
 		return h.handleTxCommitMulti(msg)
+	case wire.AttachmentUploadMessage:
+		return h.handleAttachmentUpload(msg)
+	case wire.AttachmentGetMessage:
+		return h.handleAttachmentGet(msg)
+	case wire.AttachmentListMessage:
+		return h.handleAttachmentList(msg)
 	default:
 		return nil
 	}

@@ -117,6 +117,8 @@ func classifiedError(errMsg string, code *wire.ErrorCode, retryAfterMs *int) err
 		return &UnsupportedError{Message: errMsg}
 	case wire.ErrorCodeNotHome:
 		return &NotHomeError{Message: errMsg, Home: homeAddr(errMsg)}
+	case wire.ErrorCodeNotFound:
+		return fmt.Errorf("%w: %s", ErrNotFound, errMsg)
 	default:
 		return fmt.Errorf("kdb: %s", errMsg)
 	}
@@ -203,6 +205,8 @@ type Transaction struct {
 	// Deletes removes documents by id, in the same commit as Writes. Conflict detection covers
 	// them exactly as it covers writes: a document changed since BaseVersion is not deleted.
 	Deletes []string
+	// Attachments are attachment changes committed after Writes and Deletes (attachments.go).
+	Attachments []AttachmentChange
 }
 
 // operations turns tx's writes and deletes into document operations, writes first.
@@ -221,6 +225,13 @@ func (tx Transaction) operations() ([]document.Op, error) {
 			return nil, fmt.Errorf("kdb: invalid docID %q: %w", d, err)
 		}
 		ops = append(ops, document.DeleteOp{DocID: id})
+	}
+	for _, a := range tx.Attachments {
+		op, err := a.op()
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
 	}
 	if len(ops) == 0 {
 		return nil, fmt.Errorf("kdb: transaction for namespace %q has no writes or deletes", tx.Namespace)

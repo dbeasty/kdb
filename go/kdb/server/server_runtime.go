@@ -157,6 +157,8 @@ type KdbServerRuntime struct {
 	// runtimes) or a *embed.PersistingCommitDAG's delegate (file-backed runtimes). nil only if
 	// Runtime.DAG is some third, unsupported dag.CommitDAG implementation.
 	dag *dag.InMemoryCommitDag
+	// attachUploads are the attachment uploads in progress (attachments_wire.go).
+	attachUploads attachmentUploads
 	// persister is non-nil only for file-backed runtimes. commitWith calls Engine.Commit against
 	// dag directly (Engine needs the concrete type; PersistingCommitDAG can't be passed to it -
 	// see Persist's own doc comment), which bypasses PersistingCommitDAG.AppendCommit and
