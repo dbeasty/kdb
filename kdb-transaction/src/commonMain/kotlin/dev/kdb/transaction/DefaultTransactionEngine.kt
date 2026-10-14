@@ -346,9 +346,15 @@ internal class DefaultTransactionEngine(
                 schemaFrame.rollingSchema.schemaHash
             }
 
+        // Record what was stored, not what was asked for (Go: operationsAsStored in
+        // go/kdb/transaction/default_engine.go). A merge-patch write is merged over the existing
+        // document above, but replay (DeltaNamespaceReplayer, Go's delta_replay) reads a logged
+        // write as the whole document - so logging the patch rebuilt a smaller document than the
+        // one this commit's tree hash records. Substituting the staged document leaves one reading
+        // of the op, and the commit hash covers it exactly as Go's does.
         val commit =
             dag.appendCommit(
-                transaction,
+                transaction.copy(operations = operationsAsStored(transaction.operations, writes)),
                 anchorCommit,
                 newTree,
                 schemaHashWire,
@@ -361,6 +367,22 @@ internal class DefaultTransactionEngine(
         }
 
         return TransactionResult.Success(commit, commit.documentTreeHash)
+    }
+
+    /**
+     * Replaces each [KdbOp.Write]'s patch with the document that was actually staged for it, leaving
+     * every other operation untouched. The result is never a replace write: replace is a property
+     * of the request only and not part of the encoded op.
+     */
+    private fun operationsAsStored(
+        ops: List<KdbOp>,
+        writes: Map<Int, KdbDocument>,
+    ): List<KdbOp> {
+        if (writes.isEmpty()) return ops
+        return ops.mapIndexed { index, op ->
+            val doc = writes[index]
+            if (op is KdbOp.Write && doc != null) KdbOp.Write(op.docId, doc.json) else op
+        }
     }
 
     private suspend fun detectConflicts(
