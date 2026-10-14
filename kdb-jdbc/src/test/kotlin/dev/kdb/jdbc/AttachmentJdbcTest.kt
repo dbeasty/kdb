@@ -47,8 +47,9 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * The JDBC attachment client against a stand-in for the Go server's attachment handling (the Go
- * server does not serve these messages yet on this branch): it speaks the same frames - the codec is
+ * The JDBC attachment client against a stand-in for the Go server's attachment handling (the real
+ * Go server is exercised by kdb-integration's GoServerJdbcAttachmentInteropTest; this one covers
+ * failure paths a real server will not produce on demand): it speaks the same frames - the codec is
  * pinned to Go's golden frames in kdb-wire - and keeps blobs, uploads, read pins and an attachment
  * table in memory, applying committed AttachmentPut / AttachmentDelete ops the way the Go engine does.
  */
@@ -161,6 +162,8 @@ class AttachmentJdbcTest {
                 ps.setString(4, "x")
                 ps.setNull(5, Types.VARCHAR)
                 ps.executeUpdate()
+                // Autocommit: the driver commits what the (Go-style) server buffered.
+                assertEquals(1, server.sqlCommits)
                 val params = Json.parseToJsonElement(server.lastParams!!) as JsonArray
                 assertEquals(Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3)), params[0].jsonObject["\$bytes"]!!.jsonPrimitive.content)
                 val ref = params[1].jsonObject["\$attachment"] as JsonObject
@@ -213,6 +216,7 @@ class AttachmentJdbcTest {
         val pins = HashMap<String, Pair<WireAttachmentInfo, String>>()
         var head = 0
         var lastParams: String? = null
+        var sqlCommits = 0
         var failChunkAt = -1L
         var corruptReads = false
 
@@ -250,6 +254,14 @@ class AttachmentJdbcTest {
                         )
                     is WireMessage.AttachmentGet -> get(corr, m)
                     is WireMessage.TxCommit -> {
+                        if (m.transactionBytes.isEmpty()) {
+                            // Like Go: commits the DML the session buffered.
+                            sqlCommits++
+                            head++
+                            return replyCodec.encode(
+                                WireMessage.SqlResult(hdr(corr, WireMessageType.SQL_RESULT), m.namespace, m.sessionId, emptyList(), emptyList(), 0, headHex(), false),
+                            )
+                        }
                         val tx = TransactionWireCodec.decode(m.transactionBytes)
                         for (op in tx.operations) {
                             when (op) {
@@ -272,7 +284,10 @@ class AttachmentJdbcTest {
                         val b64 = Base64.getEncoder().encodeToString("hi there".encodeToByteArray())
                         WireMessage.SqlResult(
                             hdr(corr, WireMessageType.SQL_RESULT), m.namespace, m.sessionId, listOf("bin", "n"),
-                            listOf(listOf(b64, "1"), listOf("", "")), 1, headHex(), false, cellKinds = "6211",
+                            listOf(listOf(b64, "1"), listOf("", "")), 1, headHex(),
+                            // Like Go: a read is readOnly; DML is buffered and not.
+                            readOnly = m.sql.trimStart().startsWith("SELECT", ignoreCase = true),
+                            cellKinds = "6211",
                         )
                     }
                     else -> return null

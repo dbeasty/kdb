@@ -155,6 +155,50 @@ func TestDecodeParametersJSONDecodesVectors(t *testing.T) {
 	}
 }
 
+// TestDecodeParametersJSONAcceptsKotlinTaggedForm: the Kotlin JDBC driver and CLI encode
+// parameters as dev.kdb.sql.encodeSqlParameters does - {"t":..,"v":..} - when the server did not
+// agree "attachments". Go decoded only the plain forms, so every bound statement from such a
+// client failed with "unsupported object parameter". The strings below are exactly what Kotlin
+// emits; a Long past 2^53 must come through exactly, not rounded via float64.
+func TestDecodeParametersJSONAcceptsKotlinTaggedForm(t *testing.T) {
+	raw := `[{"t":"n"},{"t":"s","v":"x"},{"t":"i","v":9007199254740993},{"t":"d","v":1.5},` +
+		`{"t":"b","v":true},{"t":"v","v":[0.5,-1.0]},{"t":"i","v":-7},"plain"]`
+	params, err := decodeParametersJSON(&raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []sql.Parameter{
+		sql.ParamNull{},
+		sql.ParamString{Value: "x"},
+		sql.ParamInt{Value: 9007199254740993},
+		sql.ParamDouble{Value: 1.5},
+		sql.ParamBool{Value: true},
+		sql.ParamVector{Value: []float32{0.5, -1}},
+		sql.ParamInt{Value: -7},
+		sql.ParamString{Value: "plain"},
+	}
+	if len(params) != len(want) {
+		t.Fatalf("got %d params, want %d", len(params), len(want))
+	}
+	for i := range want {
+		if fmt.Sprintf("%#v", params[i]) != fmt.Sprintf("%#v", want[i]) {
+			t.Fatalf("param %d = %#v, want %#v", i, params[i], want[i])
+		}
+	}
+	for _, bad := range []string{
+		`[{"t":"i","v":1.5}]`,
+		`[{"t":"s","v":3}]`,
+		`[{"t":"q","v":1}]`,
+		`[{"t":"s","v":"x","extra":1}]`,
+		`[{"t":"v","v":["a"]}]`,
+	} {
+		b := bad
+		if _, err := decodeParametersJSON(&b); err == nil {
+			t.Errorf("%s: expected an error", bad)
+		}
+	}
+}
+
 // TestCellToStringCoversEveryCellKind pins the wire encoding of each result cell, including the
 // boolean kind added with the predicate work - without a case of its own it would have gone out
 // as Go's "{true}" struct rendering.

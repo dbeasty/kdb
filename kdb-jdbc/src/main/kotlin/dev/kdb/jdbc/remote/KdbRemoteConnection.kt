@@ -90,6 +90,9 @@ public class KdbRemoteConnection(
     public fun attachments(): KdbAttachments = attachments
     private var closed = false
     private var autoCommit = true
+
+    /** Go dialect only: the manual transaction has DML buffered on the server session. */
+    private var bufferedWrites = false
     private var readOnly = url.readOnly
     private var sessionId: String = ""
     private var readConsistency = ReadConsistency.READ_COMMITTED
@@ -180,6 +183,10 @@ public class KdbRemoteConnection(
                 if (reply.error != null) {
                     throw SQLException(reply.error)
                 }
+                val bufferedDml = attachmentsSupported && !reply.readOnly && !isTransactionControl(sql)
+                if (bufferedDml && !autoCommit) bufferedWrites = true
+                val resolvedCommitHex =
+                    if (bufferedDml && autoCommit) commitBufferedDml() else reply.resolvedCommitHex
                 val binary = binaryColumns(reply.columns.size, reply.rows, reply.cellKinds)
                 val columns =
                     reply.columns.mapIndexed { i, name ->
@@ -194,7 +201,7 @@ public class KdbRemoteConnection(
                             rowsAffected = reply.rowsAffected,
                             generatedIds = reply.generatedIds,
                         ),
-                    resolvedCommit = KdbHash.fromHex(reply.resolvedCommitHex),
+                    resolvedCommit = KdbHash.fromHex(resolvedCommitHex),
                     readOnly = reply.readOnly,
                 )
             }
@@ -202,6 +209,37 @@ public class KdbRemoteConnection(
                 throw SQLException("transaction conflict", "40001")
             else -> throw SQLException("unexpected wire reply: ${reply.header.messageType}")
         }
+    }
+
+    /**
+     * The Go server buffers a session's DML until TX_COMMIT (its own client commits after every
+     * Exec); the Kotlin server commits autocommit DML itself. Without this, an autocommit INSERT
+     * against Go reported its row count and was never committed. Keyed on [attachmentsSupported],
+     * the same Go-dialect switch the parameter encoding uses: only the Go server agrees it.
+     */
+    private suspend fun commitBufferedDml(): String {
+        val reply =
+            rpc.request(
+                WireMessage.TxCommit(
+                    WireHeader(WireMessageType.TX_COMMIT, KDB_WIRE_PROTOCOL_VERSION, 0, 0),
+                    namespace = url.namespaceId,
+                    sessionId = sessionId,
+                    transactionBytes = ByteArray(0),
+                ),
+            )
+        return when (reply) {
+            is WireMessage.ConflictReport -> throw SQLException("transaction conflict", "40001")
+            is WireMessage.SqlResult -> {
+                if (reply.error != null) throw SQLException(reply.error)
+                reply.resolvedCommitHex
+            }
+            else -> throw SQLException("unexpected commit reply: ${reply.header.messageType}")
+        }
+    }
+
+    private fun isTransactionControl(sql: String): Boolean {
+        val word = sql.trimStart().takeWhile { it.isLetter() }.uppercase()
+        return word == "BEGIN" || word == "START" || word == "COMMIT" || word == "ROLLBACK" || word == "END"
     }
 
     override fun namespaceForTable(table: String): String = url.namespaceForTable(table)
@@ -252,6 +290,14 @@ public class KdbRemoteConnection(
     }
 
     private suspend fun execTransactionControl(sql: String) {
+        // The Go server refuses a COMMIT with nothing buffered ("no pending transaction to
+        // commit") and keeps no autocommit mode of its own, so a manual transaction that only read
+        // (or was rolled back) ends without one - otherwise conn.commit() after a SELECT failed.
+        if (sql != "BEGIN") {
+            val hadWrites = bufferedWrites
+            bufferedWrites = false
+            if (sql == "COMMIT" && attachmentsSupported && !hadWrites) return
+        }
         val reply =
             rpc.request(
                 WireMessage.SqlExec(
