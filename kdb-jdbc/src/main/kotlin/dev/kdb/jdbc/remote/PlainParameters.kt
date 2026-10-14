@@ -17,8 +17,8 @@ import java.util.Base64
  * `{"$attachment": {"hash": "<hex>", "size": n}}`.
  *
  * The Kotlin server's own form is the tagged `{"t": .., "v": ..}` of dev.kdb.sql.encodeSqlParameters,
- * which the Go server does not read; this form is used when the server agreed `attachments` (which
- * only the Go server does). A [KdbBinding.Stream] must have been uploaded (resolved to an
+ * which the Kotlin server reads but older Go servers do not; this form is used when the server
+ * agreed `attachments` (which only the Go server does). A [KdbBinding.Stream] must have been uploaded (resolved to an
  * [KdbBinding.AttachmentRef]) before it gets here.
  */
 internal fun encodePlainParameters(bindings: List<KdbBinding>): String? {

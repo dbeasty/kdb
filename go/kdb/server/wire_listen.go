@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1545,18 +1546,24 @@ func cellToString(c sql.Cell) string {
 	}
 }
 
-// decodeParametersJSON decodes a wire SqlExec ParametersJSON string (a JSON array of scalars,
-// matching Kotlin's decodeSqlParameters) into []sql.Parameter.
+// decodeParametersJSON decodes a wire SqlExec ParametersJSON string into []sql.Parameter. Each
+// element is a plain JSON scalar, an array of numbers (a vector), an attachment object form
+// (objectParam), or Kotlin's tagged {"t":..,"v":..} form (taggedParam) - so a Kotlin client that
+// encodes parameters the way the Kotlin server decodes them works against this server too.
 func decodeParametersJSON(raw *string) ([]sql.Parameter, error) {
 	if raw == nil || *raw == "" {
 		return nil, nil
 	}
-	var values []any
-	if err := json.Unmarshal([]byte(*raw), &values); err != nil {
+	var elems []json.RawMessage
+	if err := json.Unmarshal([]byte(*raw), &elems); err != nil {
 		return nil, err
 	}
-	params := make([]sql.Parameter, len(values))
-	for i, v := range values {
+	params := make([]sql.Parameter, len(elems))
+	for i, elem := range elems {
+		var v any
+		if err := json.Unmarshal(elem, &v); err != nil {
+			return nil, err
+		}
 		switch t := v.(type) {
 		case nil:
 			params[i] = sql.ParamNull{}
@@ -1571,6 +1578,14 @@ func decodeParametersJSON(raw *string) ([]sql.Parameter, error) {
 				params[i] = sql.ParamDouble{Value: t}
 			}
 		case map[string]any:
+			if _, tagged := t["t"]; tagged {
+				p, err := taggedParam(elem, i)
+				if err != nil {
+					return nil, err
+				}
+				params[i] = p
+				continue
+			}
 			p, err := objectParam(t, i)
 			if err != nil {
 				return nil, err
@@ -1622,6 +1637,63 @@ func objectParam(obj map[string]any, index int) (sql.Parameter, error) {
 		return sql.ParamAttachmentRef{ContentHash: h, Size: int64(size)}, nil
 	}
 	return nil, fmt.Errorf("unsupported object parameter at index %d (want {\"$bytes\": ..} or {\"$attachment\": ..})", index)
+}
+
+// taggedParam decodes Kotlin's tagged parameter form (dev.kdb.sql.encodeSqlParameters, what the
+// Kotlin JDBC driver and CLI send to a server that did not agree "attachments"):
+//
+//	{"t":"n"}  {"t":"s","v":"x"}  {"t":"i","v":7}  {"t":"d","v":1.5}  {"t":"b","v":true}  {"t":"v","v":[0.5,1]}
+//
+// "i" is decoded exactly (json.Number), so a Long beyond 2^53 is not rounded through a float64.
+func taggedParam(elem json.RawMessage, index int) (sql.Parameter, error) {
+	var p struct {
+		T string          `json:"t"`
+		V json.RawMessage `json:"v"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(elem))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&p); err != nil {
+		return nil, fmt.Errorf("parameter %d: tagged parameter: %v", index, err)
+	}
+	bad := func(want string) error {
+		return fmt.Errorf("parameter %d: tagged parameter %q needs a %s \"v\"", index, p.T, want)
+	}
+	switch p.T {
+	case "n":
+		return sql.ParamNull{}, nil
+	case "s":
+		var s string
+		if json.Unmarshal(p.V, &s) != nil {
+			return nil, bad("string")
+		}
+		return sql.ParamString{Value: s}, nil
+	case "i":
+		var n int64
+		if json.Unmarshal(p.V, &n) != nil {
+			return nil, bad("integer")
+		}
+		return sql.ParamInt{Value: n}, nil
+	case "d":
+		var f float64
+		if json.Unmarshal(p.V, &f) != nil {
+			return nil, bad("number")
+		}
+		return sql.ParamDouble{Value: f}, nil
+	case "b":
+		var b bool
+		if json.Unmarshal(p.V, &b) != nil {
+			return nil, bad("boolean")
+		}
+		return sql.ParamBool{Value: b}, nil
+	case "v":
+		var vals []any
+		if json.Unmarshal(p.V, &vals) != nil {
+			return nil, bad("number array")
+		}
+		return vectorParam(vals, index)
+	default:
+		return nil, fmt.Errorf("parameter %d: unknown tagged parameter type %q", index, p.T)
+	}
 }
 
 // vectorParam converts a decoded JSON array into sql.ParamVector.
