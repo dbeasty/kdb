@@ -743,14 +743,15 @@ func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile,
 				out.AttachmentTables = at.V
 			}
 		}
-		if err := readCheckpointSection(shim, section, func(tree, commits []byte) error {
-			// Copied: RestoreCheckpoint decodes them after this returns and the section is unmapped.
-			out.State.PackedCommits = append([]byte(nil), commits...)
-			if t, ok := document.OpenTreeDigest(section.treeDigest, section.entries, tf); ok {
-				out.LiveTree = t
-				return nil
-			}
-			// Built from the mapped image: the trie copies every entry into its own slab.
+		commits, withTree, err := readCheckpointSection(shim, section)
+		if err != nil {
+			return out, err
+		}
+		out.State.PackedCommits = commits
+		if t, ok := document.OpenTreeDigest(section.treeDigest, section.entries, tf); ok {
+			out.LiveTree = t
+		} else if err := withTree(func(tree []byte) error {
+			// Built from the section's image: the trie copies every entry into its own slab.
 			t, err := document.OpenTreePacked(tree, tf)
 			out.LiveTree = t
 			return err

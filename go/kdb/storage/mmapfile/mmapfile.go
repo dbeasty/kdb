@@ -98,6 +98,15 @@ func ResidentBytes() int64 {
 	return min(resident.bytes, MappedBytes())
 }
 
+// ResidentBytesUncached is ResidentBytes counted now, bypassing its cache: for measurement
+// harnesses that sample residency at a known moment. It costs a full mincore pass every call, so
+// nothing on a hot path should use it.
+func ResidentBytesUncached() int64 {
+	resident.mu.Lock()
+	defer resident.mu.Unlock()
+	return min(residentBytesNow(), MappedBytes())
+}
+
 // residentBytesNow counts resident bytes across every live mapping, uncached. The caller holds
 // resident.mu, which owns the mincore buffer.
 func residentBytesNow() int64 {

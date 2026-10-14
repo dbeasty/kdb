@@ -381,7 +381,7 @@ func sampleRSS(done <-chan struct{}) {
 				rss:            rss,
 				goTotal:        int64(samples[0].Value.Uint64() - samples[1].Value.Uint64()),
 				heapObjects:    int64(samples[2].Value.Uint64()),
-				mappedResident: mmapfile.ResidentBytes(),
+				mappedResident: mmapfile.ResidentBytesUncached(),
 				mapped:         mmapfile.MappedBytes(),
 			}
 			p := peak
