@@ -118,6 +118,9 @@ func (e *defaultEngine) plan(
 	if fileViolations := preflightFileWrites(tx, store); len(fileViolations) > 0 {
 		return PreparedCommit{}, ResultSchemaError{Violations: fileViolations}, nil
 	}
+	if attachViolations := preflightAttachments(tx, d.NamespaceID, store, targetDocTreeHash); len(attachViolations) > 0 {
+		return PreparedCommit{}, ResultSchemaError{Violations: attachViolations}, nil
+	}
 	schemaFrame := runSchemaPhase(tx, store, d.NamespaceID, incomingSchema, baselineDocTreeHash)
 	if len(schemaFrame.violations) > 0 {
 		return PreparedCommit{}, ResultSchemaError{Violations: schemaFrame.violations}, nil
@@ -148,6 +151,11 @@ func (e *defaultEngine) plan(
 		conflicts = nil
 	default:
 		conflicts = detectConflicts(tx, d.NamespaceID, store, baseDocTreeHash, targetDocTreeHash, writes, guarded)
+		attachConflicts, err := detectAttachmentConflicts(tx, d.NamespaceID, d, store, baseDocTreeHash, targetDocTreeHash, anchorCommit, guarded)
+		if err != nil {
+			return PreparedCommit{}, nil, err
+		}
+		conflicts = append(conflicts, attachConflicts...)
 	}
 
 	if len(conflicts) > 0 && e.conflictPolicy == ConflictPolicyStrict {

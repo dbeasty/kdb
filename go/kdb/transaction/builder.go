@@ -57,6 +57,24 @@ func (b *Builder) FileWrite(path string, blobHash codec.Hash) *Builder {
 	return b
 }
 
+// Attach sets docID's attachment to the stored blob contentHash names (size bytes, of type mime),
+// in the same commit as the builder's other operations. The blob must already be stored - put
+// its bytes first (embed's PutAttachment does both).
+func (b *Builder) Attach(docID codec.UUID, contentHash codec.Hash, size int64, mime string) *Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ops = append(b.ops, document.AttachmentPutOp{DocID: docID, ContentHash: contentHash, Size: size, Mime: mime})
+	return b
+}
+
+// Detach removes docID's attachment, leaving the document.
+func (b *Builder) Detach(docID codec.UUID) *Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ops = append(b.ops, document.AttachmentDeleteOp{DocID: docID})
+	return b
+}
+
 // SchemaMigration appends a schema migration op.
 func (b *Builder) SchemaMigration(migration schema.SchemaMigration) error {
 	payload, err := EncodeMigration(migration)

@@ -172,3 +172,41 @@ func (d *InMemoryCommitDag) HasAttachments() bool {
 	}
 	return false
 }
+
+// PackAttachmentTables packs the attachment tables at commits (deduplicated by root; commits
+// without attachments contribute nothing), for a checkpoint to carry its heads' tables.
+func (d *InMemoryCommitDag) PackAttachmentTables(commits []codec.Hash) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	seen := map[codec.Hash]bool{}
+	var tables []document.AttachmentTable
+	for _, c := range commits {
+		t, err := d.attachmentTableLocked(c)
+		if err != nil {
+			return nil, err
+		}
+		root := t.Root()
+		if root == nil || seen[*root] {
+			continue
+		}
+		seen[*root] = true
+		tables = append(tables, t)
+	}
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	return document.AppendPackedAttachmentTables(nil, tables), nil
+}
+
+// SeedPackedAttachmentTables caches the tables PackAttachmentTables packed. Each is keyed by the
+// root its own entries hash to, so a table only ever answers for the commits that name that root.
+func (d *InMemoryCommitDag) SeedPackedAttachmentTables(packed []byte) error {
+	tables, err := document.ParsePackedAttachmentTables(packed)
+	if err != nil {
+		return err
+	}
+	for _, t := range tables {
+		d.SeedAttachmentTable(t)
+	}
+	return nil
+}

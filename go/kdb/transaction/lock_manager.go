@@ -368,18 +368,14 @@ func (m *LockManager) AcquireAllForTransaction(
 	return leases, nil
 }
 
-// DocumentIDsIn returns the distinct document ids referenced by write/delete operations.
+// DocumentIDsIn returns the distinct document ids referenced by write, delete and attachment
+// operations - an attachment change is a change to its document for locking purposes.
 func DocumentIDsIn(operations []document.Op) []codec.UUID {
 	seen := make(map[codec.UUID]struct{})
 	var out []codec.UUID
 	for _, op := range operations {
-		var docID codec.UUID
-		switch o := op.(type) {
-		case document.WriteOp:
-			docID = o.DocID
-		case document.DeleteOp:
-			docID = o.DocID
-		default:
+		docID, ok := document.OpDocID(op)
+		if !ok {
 			continue
 		}
 		if _, ok := seen[docID]; ok {

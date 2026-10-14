@@ -51,12 +51,9 @@ func evaluatePreconditions(
 		if !declared || pre.Kind == document.ExpectAny {
 			continue
 		}
-		var docID codec.UUID
-		switch o := op.(type) {
-		case document.WriteOp:
-			docID = o.DocID
-		case document.DeleteOp:
-			docID = o.DocID
+		docID, named := document.OpDocID(op)
+		switch {
+		case named:
 		default:
 			// Preconditions describe a document's state; an op that names no document has none
 			// to assert about. Treated as a client error for the same reason as a malformed

@@ -125,6 +125,10 @@ func restoreNamespace(
 		log.Printf("kdb: namespace %s: checkpoint could not be restored (%v) - replaying the log in full", namespaceID, err)
 		return mustReplay()
 	}
+	if err := d.SeedPackedAttachmentTables(cp.AttachmentTables); err != nil {
+		log.Printf("kdb: namespace %s: checkpoint attachment tables unreadable (%v) - replaying the log in full", namespaceID, err)
+		return mustReplay()
+	}
 	eng.RestoreLiveTree(namespaceID, cp.LiveTree)
 	// Historical trees are the one thing a checkpoint does not carry. They
 	// stay derivable from the log and are built only if something reads at
@@ -290,21 +294,38 @@ func saveCheckpointThrough(
 		}
 		headPayloads = append(headPayloads, payload)
 	}
+	// The heads' attachment tables, so opening the namespace finds them without replaying the
+	// history that built them (which history=none may have truncated).
+	var attachTables []byte
+	if d.HasAttachments() {
+		heads := make([]codec.Hash, 0, len(state.Branches)+len(state.Tags))
+		for _, b := range state.Branches {
+			heads = append(heads, b.HeadHash)
+		}
+		for _, t := range state.Tags {
+			heads = append(heads, t.CommitHash)
+		}
+		if attachTables, err = d.PackAttachmentTables(heads); err != nil {
+			return err
+		}
+	}
 	liveTree := eng.LiveTree()
 	if d.HasProvisional() || d.ProvisionalGeneration() != provisionalGen {
 		return ErrCheckpointDeferred
 	}
 	rememberCheckpointFingerprints(r, segments)
 	if err := writeCheckpoint(shim, namespaceCheckpoint{
-		NamespaceID:     namespaceID,
-		ThroughSequence: through,
-		FloorSequence:   floor,
-		State:           state,
-		LiveTree:        liveTree,
-		Segments:        segments,
-		HeadCommits:     headPayloads,
-		GraphRefs:       graphRefs,
-		GraphHidden:     graphHidden,
+		NamespaceID:      namespaceID,
+		ThroughSequence:  through,
+		FloorSequence:    floor,
+		State:            state,
+		LiveTree:         liveTree,
+		Segments:         segments,
+		HeadCommits:      headPayloads,
+		GraphRefs:        graphRefs,
+		GraphHidden:      graphHidden,
+		HasAttachments:   d.HasAttachments(),
+		AttachmentTables: attachTables,
 	}); err != nil {
 		return err
 	}

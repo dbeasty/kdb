@@ -189,3 +189,87 @@ func TouchesAttachments(ops []Op, tableNonEmpty bool) bool {
 	}
 	return false
 }
+
+// AppendPackedAttachmentTables packs tables for a checkpoint: a uvarint count, then per table a
+// uvarint entry count and its entries (doc id 16 | content hash 32 | size u64 big-endian | mime
+// length uvarint | mime). Empty tables are skipped.
+func AppendPackedAttachmentTables(dst []byte, tables []AttachmentTable) []byte {
+	n := 0
+	for _, t := range tables {
+		if t.Len() > 0 {
+			n++
+		}
+	}
+	dst = binary.AppendUvarint(dst, uint64(n))
+	for _, t := range tables {
+		if t.Len() == 0 {
+			continue
+		}
+		dst = binary.AppendUvarint(dst, uint64(t.Len()))
+		t.Walk(func(id codec.UUID, r AttachmentRef) bool {
+			dst = binary.BigEndian.AppendUint64(dst, uint64(id.MSB))
+			dst = binary.BigEndian.AppendUint64(dst, uint64(id.LSB))
+			dst = append(dst, r.ContentHash.Bytes[:]...)
+			dst = binary.BigEndian.AppendUint64(dst, uint64(r.Size))
+			dst = binary.AppendUvarint(dst, uint64(len(r.Mime)))
+			dst = append(dst, r.Mime...)
+			return true
+		})
+	}
+	return dst
+}
+
+// ParsePackedAttachmentTables reverses AppendPackedAttachmentTables.
+func ParsePackedAttachmentTables(packed []byte) ([]AttachmentTable, error) {
+	if len(packed) == 0 {
+		return nil, nil
+	}
+	off := 0
+	uv := func() (uint64, error) {
+		v, n := binary.Uvarint(packed[off:])
+		if n <= 0 {
+			return 0, fmt.Errorf("attachment tables: malformed count at %d", off)
+		}
+		off += n
+		return v, nil
+	}
+	count, err := uv()
+	if err != nil {
+		return nil, err
+	}
+	var out []AttachmentTable
+	for i := uint64(0); i < count; i++ {
+		entries, err := uv()
+		if err != nil {
+			return nil, err
+		}
+		t := EmptyAttachmentTable()
+		for j := uint64(0); j < entries; j++ {
+			if len(packed)-off < 16+32+8 {
+				return nil, fmt.Errorf("attachment tables: entry truncated at %d", off)
+			}
+			id := codec.UUID{MSB: int64(binary.BigEndian.Uint64(packed[off:])), LSB: int64(binary.BigEndian.Uint64(packed[off+8:]))}
+			var r AttachmentRef
+			copy(r.ContentHash.Bytes[:], packed[off+16:off+48])
+			r.Size = int64(binary.BigEndian.Uint64(packed[off+48:]))
+			off += 56
+			ml, err := uv()
+			if err != nil {
+				return nil, err
+			}
+			if uint64(len(packed)-off) < ml {
+				return nil, fmt.Errorf("attachment tables: mime truncated at %d", off)
+			}
+			r.Mime = string(packed[off : off+int(ml)])
+			off += int(ml)
+			if t, err = t.Put(id, r); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, t)
+	}
+	if off != len(packed) {
+		return nil, fmt.Errorf("attachment tables: %d trailing bytes", len(packed)-off)
+	}
+	return out, nil
+}
