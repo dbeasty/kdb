@@ -151,7 +151,10 @@ func TestColdIndexSidecarsServeTheReplayStrategy(t *testing.T) {
 				requireAllLive(t, rt, ids, texts, "after truncation")
 				after := len(sidecarFiles(t, root))
 				t.Logf("truncated %d segments; sidecars %d -> %d", res.Removed, before, after)
-				if after > before-res.Removed+1 {
+				// The newest segments have no sidecar yet, so truncation can remove more
+				// segments than there were sidecars.
+				left := max(before-res.Removed, 0)
+				if after > left+1 {
 					t.Fatalf("%d sidecars before truncating %d segments, %d after: the deleted segments' sidecars stayed", before, res.Removed, after)
 				}
 			}
