@@ -15,7 +15,7 @@ outputs:
     value: ${{ steps.paths.outputs.paths }}
   key:
     description: The key to save them under.
-    value: go-${{ runner.os }}-${{ inputs.cache-key }}-${{ hashFiles('go/go.sum') }}-${{ github.sha }}
+    value: ${{ steps.paths.outputs.key }}
 runs:
   using: composite
   steps:
@@ -28,6 +28,8 @@ runs:
     - id: paths
       shell: bash
       run: |
+        # (hashFiles is not available in a composite action's outputs, so the key is made here.)
+        echo "key=go-${{ runner.os }}-${{ inputs.cache-key }}-${{ hashFiles('go/go.sum') }}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
         {
           echo "paths<<EOF"
           go env GOCACHE
@@ -37,7 +39,7 @@ runs:
     - uses: actions/cache/restore@v4
       with:
         path: ${{ steps.paths.outputs.paths }}
-        key: go-${{ runner.os }}-${{ inputs.cache-key }}-${{ hashFiles('go/go.sum') }}-${{ github.sha }}
+        key: ${{ steps.paths.outputs.key }}
         restore-keys: |
           go-${{ runner.os }}-${{ inputs.cache-key }}-${{ hashFiles('go/go.sum') }}-
           go-${{ runner.os }}-${{ inputs.cache-key }}-
