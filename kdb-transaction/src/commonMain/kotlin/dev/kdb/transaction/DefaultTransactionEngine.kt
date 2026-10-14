@@ -16,6 +16,7 @@ internal class DefaultTransactionEngine(
     override val conflictPolicy: ConflictPolicy,
     override val customResolver: ConflictResolver?,
     private val uniqueKeys: UniqueKeyRegistry? = null,
+    private val blobPresence: BlobPresence? = null,
 ) : TransactionEngine {
 
     override suspend fun commit(
@@ -182,6 +183,11 @@ internal class DefaultTransactionEngine(
         if (fileViolations.isNotEmpty()) {
             return TransactionResult.SchemaError(fileViolations)
         }
+        val attachmentViolations =
+            preflightAttachments(transaction, dag.namespaceId, dag, storage, blobPresence, targetDocTreeHash, anchorCommit)
+        if (attachmentViolations.isNotEmpty()) {
+            return TransactionResult.SchemaError(attachmentViolations)
+        }
 
         val schemaFrame =
             runSchemaPhase(
@@ -208,7 +214,16 @@ internal class DefaultTransactionEngine(
                         baseDocTreeHash,
                         targetDocTreeHash,
                         writes,
-                    )
+                    ) +
+                        detectAttachmentConflicts(
+                            transaction,
+                            dag.namespaceId,
+                            dag,
+                            storage,
+                            baseDocTreeHash,
+                            targetDocTreeHash,
+                            anchorCommit,
+                        )
             }
 
         if (conflicts.isNotEmpty() && conflictPolicy == ConflictPolicy.STRICT) {
@@ -571,12 +586,7 @@ internal class DefaultTransactionEngine(
             conflicts =
                 conflicts.map { c ->
                     ConflictItem(
-                        documentId =
-                            when (val op = c.op) {
-                                is KdbOp.Write -> op.docId.toString()
-                                is KdbOp.Delete -> op.docId.toString()
-                                else -> ""
-                            },
+                        documentId = c.op.addressedDocId()?.toString() ?: "",
                         operationType = c.type,
                         localDoc = c.existingDoc?.json,
                         incomingDoc =

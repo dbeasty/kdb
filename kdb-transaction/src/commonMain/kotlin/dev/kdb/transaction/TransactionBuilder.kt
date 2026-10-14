@@ -58,6 +58,33 @@ public class TransactionBuilder(
         return this
     }
 
+    /** Sets one of [docId]'s attachments - created or replaced - to bytes already stored under
+     * [contentHash] (Go's Builder.Attach). */
+    public suspend fun attach(
+        docId: KdbUuid,
+        attachmentId: KdbUuid,
+        name: String,
+        contentHash: KdbHash,
+        size: Long,
+        mime: String = "",
+    ): TransactionBuilder {
+        mutex.withLock {
+            ops += KdbOp.AttachmentPut(docId, attachmentId, name, ATTACHMENT_HASH_SCHEME_CHUNKED_1, contentHash, size, mime)
+        }
+        return this
+    }
+
+    /** Removes one of [docId]'s attachments (Go's Builder.Detach). */
+    public suspend fun detach(
+        docId: KdbUuid,
+        attachmentId: KdbUuid,
+    ): TransactionBuilder {
+        mutex.withLock {
+            ops += KdbOp.AttachmentDelete(docId, attachmentId)
+        }
+        return this
+    }
+
     public suspend fun schemaMigration(migration: SchemaMigration): TransactionBuilder {
         mutex.withLock {
             ops +=
