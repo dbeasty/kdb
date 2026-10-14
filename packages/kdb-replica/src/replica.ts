@@ -41,6 +41,12 @@ export interface ReplicaOptions {
   pageBytes?: number;
   /** Start syncing at once (default true). */
   autoSync?: boolean;
+  /**
+   * In a browser, ask for persistent storage (navigator.storage.persist) so the browser does not
+   * evict the replica - and with it any writes not yet synced - under storage pressure. Default
+   * true; status().storagePersisted reports the answer.
+   */
+  persistStorage?: boolean;
 }
 
 export interface ChangeEvent {
@@ -66,6 +72,11 @@ export interface ReplicaStatus {
   namespaces: Record<string, { mode: "full" | "filtered"; head: string | null; pending: number; converging: boolean; lastSource?: string }>;
   /** Bytes the read cache holds now; never more than memory.cacheBytes. */
   residentBytes: number;
+  /**
+   * Whether the browser granted persistent storage: false means it may evict the replica, losing
+   * unsynced writes; null outside a browser or when not asked.
+   */
+  storagePersisted: boolean | null;
 }
 
 type Listener<T> = (e: T) => void;
@@ -119,11 +130,16 @@ export class Replica {
       }
     }
     r.#nodeId = fromUtf8(nodeId);
+    const storage = (globalThis as { navigator?: { storage?: { persist?: () => Promise<boolean> } } }).navigator?.storage;
+    if (opts.persistStorage !== false && typeof storage?.persist === "function") {
+      r.#persisted = await storage.persist().catch(() => false);
+    }
     if (opts.autoSync !== false) r.#schedule(0);
     return r;
   }
 
   #nodeId = "";
+  #persisted: boolean | null = null;
 
   /** A full-mode namespace. */
   namespace(name: string): ReplicaNamespace {
@@ -218,7 +234,7 @@ export class Replica {
         converging: p.transfer !== undefined, lastSource: p.lastSource,
       };
     }
-    return { ...this.#status, namespaces, residentBytes: this.#store.residentBytes };
+    return { ...this.#status, namespaces, residentBytes: this.#store.residentBytes, storagePersisted: this.#persisted };
   }
 
   // --- sync --------------------------------------------------------------------------------------

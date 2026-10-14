@@ -32,6 +32,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -253,6 +254,12 @@ func (h *host) handle(c command) (any, error) {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:0", "HTTP listen address")
 	dir := flag.String("dir", "", "data directory (empty: in memory)")
+	serve := flag.Bool("serve", false, "serve until killed instead of reading commands from stdin (browser tests)")
+	var seeds []string
+	flag.Func("seed", "ns:N - write N documents ({\"region\":\"EU\"|\"US\"}) to ns before serving; repeatable", func(v string) error {
+		seeds = append(seeds, v)
+		return nil
+	})
 	flag.Parse()
 
 	var fileHost *embed.Host
@@ -302,9 +309,28 @@ func main() {
 		os.Exit(1)
 	}
 	go func() { _ = http.Serve(ln, mux) }()
-	fmt.Printf("ready ws://%s/kdb/sync\n", ln.Addr().String())
 
 	h := &host{set: set, engine: engine}
+	for _, sd := range seeds {
+		ns, n, ok := strings.Cut(sd, ":")
+		count, err := strconv.Atoi(n)
+		if !ok || err != nil {
+			fmt.Fprintln(os.Stderr, "kdb-replicahost: -seed wants ns:N, got", sd)
+			os.Exit(2)
+		}
+		for i := 0; i < count; i++ {
+			id := codec.DerivedUUID(fmt.Sprintf("seed:%s:%d", ns, i))
+			region := []string{"EU", "US"}[i%2]
+			if _, err := h.commit(ns, []document.Op{document.WriteOp{DocID: id, Patch: fmt.Sprintf(`{"region":%q,"i":%d}`, region, i)}}); err != nil {
+				fmt.Fprintln(os.Stderr, "kdb-replicahost: seed:", err)
+				os.Exit(1)
+			}
+		}
+	}
+	fmt.Printf("ready ws://%s/kdb/sync\n", ln.Addr().String())
+	if *serve {
+		select {}
+	}
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 1<<20), 64<<20)
 	out := json.NewEncoder(os.Stdout)

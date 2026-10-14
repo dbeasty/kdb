@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>@kdb/replica browser smoke</title>
+<!--
+  The replica in a real browser: IndexedDB storage, the browser's WebSocket, and a reload.
+
+  Serve the repository root over HTTP (python3 -m http.server --directory <repo>), run
+  `go run ./cmd/kdb-replicahost -dir <tmp> -serve -seed shop/browser:20 -seed shop/browser-eu:5` from go/, then open
+    /packages/kdb-replica/test/browser/smoke.html?ws=<the host's ws:// URL>
+  It syncs, writes, reloads itself once, and checks the write survived and reached the host.
+  The outcome is in #result and window.smokeResult: {"ok":true,...} or {"ok":false,"error":...}.
+-->
+<script type="importmap">
+  { "imports": { "@kdb/client": "/packages/kdb-client/dist/index.js" } }
+</script>
+<pre id="result">running…</pre>
+<script type="module">
+  import { openReplica, IndexedDbStore } from "/packages/kdb-replica/dist/index.js";
+
+  const params = new URLSearchParams(location.search);
+  const ws = params.get("ws");
+  const phase = params.get("phase") ?? "1";
+  const ns = "shop/browser";
+  const dbName = "kdb-replica-smoke";
+  const marker = "0b5e0000-0000-4000-8000-00000000b10b";
+  const out = (r) => {
+    window.smokeResult = r;
+    document.getElementById("result").textContent = JSON.stringify(r, null, 2);
+  };
+
+  async function open() {
+    return openReplica({
+      store: await IndexedDbStore.open(dbName),
+      peer: { url: ws, token: "rw-token" },
+      namespaces: [
+        { ns },
+        { ns: ns + "-eu", mode: "filtered", filter: "region = 'EU'", writeBack: true },
+      ],
+      autoSync: false,
+    });
+  }
+
+  try {
+    if (!ws) throw new Error("pass ?ws=ws://host:port/kdb/sync");
+    if (phase === "1") {
+      await IndexedDbStore.destroy(dbName);
+      const r = await open();
+      const [full] = await r.syncNow();
+      const seeded = (await r.scan(ns)).length;
+      await r.put(ns, marker, { from: "browser", at: Date.now() });
+      await r.put(ns + "-eu", "0b5e0000-0000-4000-8000-0000000000e0", { region: "EU", from: "browser" });
+      const status = r.status();
+      await r.close();
+      sessionStorage.setItem("smoke1", JSON.stringify({ route: full.route, seeded, pendingBeforeReload: status.namespaces[ns].pending, persisted: status.storagePersisted }));
+      location.search = "?ws=" + encodeURIComponent(ws) + "&phase=2";
+    } else {
+      const first = JSON.parse(sessionStorage.getItem("smoke1"));
+      const r = await open();
+      const survived = await r.get(ns, marker);
+      const pendingAfterReload = r.status().namespaces[ns].pending;
+      const [full] = await r.syncNow();
+      const proj = r.lastProjectionResults[0];
+      const status = r.status();
+      await r.close();
+      const ok = first.seeded === 20 && survived !== undefined && pendingAfterReload === 1 &&
+        full.pushOutcome === "fast-forwarded" && status.namespaces[ns].pending === 0 &&
+        proj.applied === 1 && status.namespaces[ns + "-eu"].pending === 0;
+      out({ ok, first, survived, pendingAfterReload, pushOutcome: full.pushOutcome, head: status.namespaces[ns].head, writeBackApplied: proj.applied });
+    }
+  } catch (e) {
+    out({ ok: false, error: String(e && e.stack || e) });
+  }
+</script>
