@@ -18,6 +18,8 @@ const (
 	binOpDelete          = 2
 	binOpFileWrite       = 3
 	binOpSchemaMigration = 4
+	binOpAttachmentPut   = 5
+	binOpAttachmentDel   = 6
 )
 
 func appendMoreBinaryBody(b []byte, message Message) ([]byte, bool) {
@@ -205,6 +207,19 @@ func appendOp(b []byte, op document.Op) []byte {
 		b = appendInt(b, 1, binOpSchemaMigration)
 		b = appendUUID(b, 7, o.MigrationID)
 		return appendRawString(b, 8, o.MigrationPayload)
+	case document.AttachmentPutOp:
+		b = appendInt(b, 1, binOpAttachmentPut)
+		b = appendUUID(b, 2, o.DocID)
+		b = appendBytes(b, 6, o.ContentHash.Bytes[:])
+		b = appendInt(b, 9, o.Size)
+		b = appendRawString(b, 10, o.Mime)
+		b = appendUUID(b, 11, o.AttachmentID)
+		b = appendRawString(b, 12, o.Name)
+		return appendInt(b, 13, int64(o.Scheme))
+	case document.AttachmentDeleteOp:
+		b = appendInt(b, 1, binOpAttachmentDel)
+		b = appendUUID(b, 2, o.DocID)
+		return appendUUID(b, 11, o.AttachmentID)
 	default:
 		return b
 	}
@@ -595,6 +610,8 @@ func decodeOp(r *binReader) document.Op {
 		fileWrite         document.FileWriteOp
 		migration         document.SchemaMigrationOp
 		hasPatch, hasPath bool
+		attach            document.AttachmentPutOp
+		hasAttachHash     bool
 	)
 	for f, wt, ok := r.next(); ok; f, wt, ok = r.next() {
 		switch f {
@@ -614,8 +631,21 @@ func decodeOp(r *binReader) document.Op {
 			migration.MigrationID = r.uuid(wt)
 		case 8:
 			migration.MigrationPayload = r.str(wt)
+		case 9:
+			attach.Size = r.int(wt)
+		case 10:
+			attach.Mime = r.str(wt)
+		case 11:
+			attach.AttachmentID = r.uuid(wt)
+		case 12:
+			attach.Name = r.str(wt)
+		case 13:
+			attach.Scheme = byte(r.int(wt))
 		default:
 			r.skip(wt)
+		}
+		if f == 6 {
+			hasAttachHash = true
 		}
 	}
 	if r.err != nil {
@@ -638,6 +668,15 @@ func decodeOp(r *binReader) document.Op {
 		return fileWrite
 	case binOpSchemaMigration:
 		return migration
+	case binOpAttachmentPut:
+		if !hasAttachHash || attach.Size < 0 {
+			r.fail("binary attachmentPut operation has no content hash or a negative size")
+			return nil
+		}
+		attach.DocID, attach.ContentHash = write.DocID, fileWrite.BlobHash
+		return attach
+	case binOpAttachmentDel:
+		return document.AttachmentDeleteOp{DocID: write.DocID, AttachmentID: attach.AttachmentID}
 	default:
 		r.fail("unknown operation kind in binary body")
 		return nil

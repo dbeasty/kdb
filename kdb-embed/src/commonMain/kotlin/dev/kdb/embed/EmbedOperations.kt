@@ -111,7 +111,8 @@ private suspend fun materializeSingleCommit(
             is KdbOp.Write ->
                 runtime.storage.putDocument(namespaceId, KdbDocument(op.docId, op.patch))
             is KdbOp.Delete -> runtime.storage.deleteDocument(namespaceId, op.docId)
-            is KdbOp.FileWrite, is KdbOp.SchemaMigration -> {}
+            // Attachments are not in the document tree; their table is the commit's attachment root.
+            is KdbOp.FileWrite, is KdbOp.SchemaMigration, is KdbOp.AttachmentPut, is KdbOp.AttachmentDelete -> {}
         }
     }
     runtime.storage.commitTree(namespaceId, parentTree)

@@ -16,6 +16,9 @@ type Commit struct {
 	DocumentTreeHash codec.Hash
 	SchemaHash       *codec.Hash
 	Message          string
+	// AttachmentTreeHash is the root of the attachment table at this commit (AttachmentTable),
+	// nil when no document has an attachment. Part of the hashed payload only when set.
+	AttachmentTreeHash *codec.Hash
 }
 
 func commitPayloadRecord(
@@ -28,6 +31,7 @@ func commitPayloadRecord(
 	documentTreeHash codec.Hash,
 	schemaHash *codec.Hash,
 	message string,
+	attachmentTreeHash *codec.Hash,
 ) codec.Value {
 	parentEls := make([]codec.Value, len(parentHashes))
 	for i, h := range parentHashes {
@@ -51,13 +55,17 @@ func commitPayloadRecord(
 	if schemaHash != nil {
 		fields[8] = hashVal(*schemaHash)
 	}
+	// Omitted when nil for the same reason: a commit with no attachments keeps its hash.
+	if attachmentTreeHash != nil {
+		fields[10] = hashVal(*attachmentTreeHash)
+	}
 	return codec.RecordValue{Fields: fields}
 }
 
 func (c *Commit) ToCommitPayloadValue() codec.Value {
 	return commitPayloadRecord(
 		c.ParentHashes, c.NamespaceID, c.TransactionID, c.Timestamp, c.AuthorNodeID,
-		c.Operations, c.DocumentTreeHash, c.SchemaHash, c.Message,
+		c.Operations, c.DocumentTreeHash, c.SchemaHash, c.Message, c.AttachmentTreeHash,
 	)
 }
 
@@ -104,11 +112,29 @@ func BuildCommit(
 	schemaHash *codec.Hash,
 	message string,
 ) (Commit, error) {
+	return BuildCommitWithAttachments(parentHashes, namespaceID, transactionID, timestamp, authorNodeID,
+		operations, documentTreeHash, schemaHash, message, nil)
+}
+
+// BuildCommitWithAttachments is BuildCommit for a commit whose attachment table is not empty:
+// attachmentTreeHash is its root (nil for none).
+func BuildCommitWithAttachments(
+	parentHashes []codec.Hash,
+	namespaceID string,
+	transactionID codec.UUID,
+	timestamp codec.Timestamp,
+	authorNodeID codec.UUID,
+	operations []Op,
+	documentTreeHash codec.Hash,
+	schemaHash *codec.Hash,
+	message string,
+	attachmentTreeHash *codec.Hash,
+) (Commit, error) {
 	c := Commit{
 		ParentHashes: parentHashes, NamespaceID: namespaceID,
 		TransactionID: transactionID, Timestamp: timestamp, AuthorNodeID: authorNodeID,
 		Operations: operations, DocumentTreeHash: documentTreeHash, SchemaHash: schemaHash,
-		Message: message,
+		Message: message, AttachmentTreeHash: attachmentTreeHash,
 	}
 	h, err := ComputeCommitHash(c)
 	if err != nil {
@@ -204,11 +230,23 @@ func parseCommitFromRecord(rec codec.RecordValue, hash codec.Hash) (Commit, erro
 	if !ok {
 		return Commit{}, NewCommitDecodeError("message", nil)
 	}
+	var attachH *codec.Hash
+	switch af := rec.Fields[10].(type) {
+	case nil, codec.NullValue:
+	case codec.FixedValue:
+		h, err := codec.HashFromBytes(af.V)
+		if err != nil {
+			return Commit{}, NewCommitDecodeError("attachmentTreeHash", nil)
+		}
+		attachH = &h
+	default:
+		return Commit{}, NewCommitDecodeError("attachmentTreeHash", nil)
+	}
 	return Commit{
 		Hash: hash, ParentHashes: parents, NamespaceID: ns.V,
 		TransactionID: txID, Timestamp: ts, AuthorNodeID: author,
 		Operations: ops, DocumentTreeHash: docTreeH, SchemaHash: schemaH,
-		Message: msg.V,
+		Message: msg.V, AttachmentTreeHash: attachH,
 	}, nil
 }
 

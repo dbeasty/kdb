@@ -36,6 +36,12 @@ const checkpointGraphFormatVersion = 3
 // a field it does not know.
 const checkpointPackedFormatVersion = 4
 
+// checkpointAttachFormatVersion is version 4 for a namespace with attachments: packed commits may
+// carry an attachment root (a flag older builds do not know, so they must refuse the file rather
+// than misread it), and field 15 holds the heads' attachment tables. A namespace without
+// attachments keeps writing version 4.
+const checkpointAttachFormatVersion = 5
+
 // legacyCheckpointMaxEntries is the largest namespace - live documents plus commits - whose
 // checkpoint is still written as version 2, the format every release since v0.6.2 reads.
 //
@@ -191,6 +197,8 @@ func checkpointRegistry() *schema.Registry {
 				{ID: 13, Name: "liveTreePacked", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
 				// Version 4: the commits, packed - see dag/checkpoint_packed.go.
 				{ID: 14, Name: "commitsPacked", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
+				// Version 5: the heads' attachment tables, packed - see dag.PackAttachmentTables.
+				{ID: 15, Name: "attachmentTables", Type: schema.Prim(schema.PhysicalBytes), Default: codec.BytesValue{}},
 			},
 		})
 		r.Freeze()
@@ -219,6 +227,11 @@ type namespaceCheckpoint struct {
 	// out; GraphHidden the records in them for commits since deleted. History=full only.
 	GraphRefs   []dag.GraphSegmentRef
 	GraphHidden []codec.Hash
+	// HasAttachments makes the checkpoint version 5 (checkpointAttachFormatVersion): its commits
+	// may carry attachment roots, which older builds would misread. AttachmentTables are the
+	// heads' attachment tables, packed (dag.PackAttachmentTables).
+	HasAttachments   bool
+	AttachmentTables []byte
 }
 
 // checkpointSegment fingerprints one delta segment a checkpoint covers.
@@ -288,7 +301,9 @@ func cpStrFrom(v codec.Value) (string, error) {
 // version 2 - see legacyCheckpointMaxEntries. Packed commits are counted at their smallest size,
 // which overstates how many there are: a namespace near the bound is written as version 4.
 func legacyCheckpointFits(cp namespaceCheckpoint) bool {
-	if len(cp.GraphRefs) > 0 || len(cp.GraphHidden) > 0 {
+	// Version 2 writes commits as generic records with no attachment root, and has no place for
+	// the attachment tables: a namespace with attachments is always written as version 5.
+	if len(cp.GraphRefs) > 0 || len(cp.GraphHidden) > 0 || cp.HasAttachments {
 		return false
 	}
 	n := cp.LiveTree.Size() + len(cp.State.Commits) + len(cp.State.PackedCommits)/dag.PackedCommitMinBytes
@@ -370,6 +385,9 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 	}
 
 	version := int32(checkpointPackedFormatVersion)
+	if cp.HasAttachments {
+		version = checkpointAttachFormatVersion
+	}
 	root := codec.RecordValue{Fields: map[int]codec.Value{
 		1:  codec.Int32Value{V: version},
 		2:  codec.StringValue{V: cp.NamespaceID},
@@ -383,6 +401,7 @@ func encodeCheckpoint(cp namespaceCheckpoint) ([]byte, error) {
 		10: codec.Int64Value{V: cp.FloorSequence},
 		13: codec.BytesValue{V: packedTree},
 		14: codec.BytesValue{V: packedCommits},
+		15: codec.BytesValue{V: cp.AttachmentTables},
 	}}
 	if len(cp.GraphRefs) > 0 {
 		refs := make([]codec.Value, 0, len(cp.GraphRefs))
@@ -519,10 +538,11 @@ func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile)
 	if !ok {
 		return out, fmt.Errorf("kdb: checkpoint: missing format version")
 	}
-	if version.V != checkpointFormatVersion && version.V != checkpointGraphFormatVersion && version.V != checkpointPackedFormatVersion {
+	if version.V != checkpointFormatVersion && version.V != checkpointGraphFormatVersion && version.V != checkpointPackedFormatVersion &&
+		version.V != checkpointAttachFormatVersion {
 		return out, fmt.Errorf(
 			"kdb: checkpoint is format version %d, this build reads versions %d-%d",
-			version.V, checkpointFormatVersion, checkpointPackedFormatVersion)
+			version.V, checkpointFormatVersion, checkpointAttachFormatVersion)
 	}
 	ns, err := cpStrFrom(rec.Fields[2])
 	if err != nil {
@@ -602,6 +622,10 @@ func decodeCheckpointWith(namespaceID string, raw []byte, tf *document.TreeFile)
 			dag.CheckpointCommit{Commit: c, OperationCount: int(count.V)})
 	}
 
+	if at, ok := rec.Fields[15].(codec.BytesValue); ok && version.V >= checkpointAttachFormatVersion {
+		out.HasAttachments = true
+		out.AttachmentTables = at.V
+	}
 	if pc, ok := rec.Fields[14].(codec.BytesValue); ok && version.V >= checkpointPackedFormatVersion {
 		// Kept packed: RestoreCheckpoint decodes one commit at a time, so the list never exists
 		// as structs.

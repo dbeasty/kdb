@@ -16,6 +16,9 @@ import (
 
 // EmbeddedKdbRuntime composes DAG + storage for embedded use.
 type EmbeddedKdbRuntime struct {
+	// attach is this runtime's attachment stores and settings (attachments.go).
+	attach attachmentState
+
 	Catalog          string
 	DAG              dag.CommitDAG
 	Storage          storage.Adapter
@@ -102,10 +105,18 @@ func (rt *EmbeddedKdbRuntime) Maintain() (TruncationResult, error) {
 	if err := rt.AssertWritable(); err != nil {
 		return TruncationResult{}, err
 	}
-	if rt.maintain == nil {
-		return TruncationResult{}, nil
+	var res TruncationResult
+	if rt.maintain != nil {
+		var err error
+		if res, err = rt.maintain(); err != nil {
+			return res, err
+		}
 	}
-	return rt.maintain()
+	// Attachment blobs: deltas for replaced versions, and the ones nothing keeps.
+	if _, err := rt.CompactAttachments(rt.DefaultNamespace); err != nil {
+		return res, err
+	}
+	return res, nil
 }
 
 // CompactHistory reclaims now, whatever this namespace's reclaim mode says,

@@ -128,6 +128,9 @@ public fun documentIdsIn(operations: List<KdbOp>): Set<KdbUuid> =
         when (op) {
             is KdbOp.Write -> op.docId
             is KdbOp.Delete -> op.docId
+            // An attachment change is a change to its document for locking purposes.
+            is KdbOp.AttachmentPut -> op.docId
+            is KdbOp.AttachmentDelete -> op.docId
             is KdbOp.FileWrite, is KdbOp.SchemaMigration -> null
         }
     }.toSet()

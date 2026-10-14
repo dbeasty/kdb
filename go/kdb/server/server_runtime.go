@@ -1039,6 +1039,12 @@ func (s *KdbServerRuntime) authorizeOperations(tx document.Transaction, principa
 			action = auth.DocumentWriteAction{Namespace: s.Runtime.DefaultNamespace, DocID: o.DocID.String()}
 		case document.DeleteOp:
 			action = auth.DocumentDeleteAction{Namespace: s.Runtime.DefaultNamespace, DocID: o.DocID.String()}
+		case document.AttachmentPutOp:
+			// An attachment is part of its document: changing it takes the document's write
+			// permission - there is no separate attachment ACL.
+			action = auth.DocumentWriteAction{Namespace: s.Runtime.DefaultNamespace, DocID: o.DocID.String()}
+		case document.AttachmentDeleteOp:
+			action = auth.DocumentWriteAction{Namespace: s.Runtime.DefaultNamespace, DocID: o.DocID.String()}
 		default:
 			continue
 		}

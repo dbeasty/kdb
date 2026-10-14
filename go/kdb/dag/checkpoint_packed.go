@@ -19,9 +19,35 @@ import (
 // Per commit, little-endian:
 //
 //	hash 32 | tree 32 | tx 16 | author 16 | epochMs i64 | micro u16 | flags u8 | nParents u8 |
-//	opCount u32 | msgLen u32 | parents nParents x 32 | schema 32 (if flags&1) | message msgLen
+//	opCount u32 | msgLen u32 | parents nParents x 32 | schema 32 (if flags&1) |
+//	attachment root 32 (if flags&2) | message msgLen
+//
+// flags&2 is newer than the format: a checkpoint holding such a commit is written with a newer
+// version (PackedCommitsHaveAttachments), so an older build refuses it instead of misreading it.
 
 const packedCommitFixed = 32 + 32 + 16 + 16 + 8 + 2 + 1 + 1 + 4 + 4
+
+const (
+	packedFlagSchema = 1
+	packedFlagAttach = 2
+)
+
+// PackedCommitsHaveAttachments reports whether any commit in packed carries an attachment root -
+// the case a checkpoint must be written with a version older builds refuse.
+func PackedCommitsHaveAttachments(packed []byte) bool {
+	for off := 0; off+packedCommitFixed <= len(packed); {
+		f := packed[off : off+packedCommitFixed]
+		if f[106]&packedFlagAttach != 0 {
+			return true
+		}
+		n := packedCommitFixed + int(f[107])*32 + int(binary.LittleEndian.Uint32(f[112:]))
+		if f[106]&packedFlagSchema != 0 {
+			n += 32
+		}
+		off += n
+	}
+	return false
+}
 
 // PackedCommitMinBytes is the smallest a packed commit can be (no parents, schema or message), so
 // len(packed)/PackedCommitMinBytes is an upper bound on how many commits packed holds.
@@ -41,7 +67,10 @@ func appendPackedCommit(dst []byte, c document.Commit, opCount int) ([]byte, err
 	binary.LittleEndian.PutUint64(fixed[96:], uint64(c.Timestamp.EpochMillis))
 	binary.LittleEndian.PutUint16(fixed[104:], uint16(c.Timestamp.MicroRemainder))
 	if c.SchemaHash != nil {
-		fixed[106] = 1
+		fixed[106] |= packedFlagSchema
+	}
+	if c.AttachmentTreeHash != nil {
+		fixed[106] |= packedFlagAttach
 	}
 	fixed[107] = byte(len(c.ParentHashes))
 	binary.LittleEndian.PutUint32(fixed[108:], uint32(opCount))
@@ -52,6 +81,9 @@ func appendPackedCommit(dst []byte, c document.Commit, opCount int) ([]byte, err
 	}
 	if c.SchemaHash != nil {
 		dst = append(dst, c.SchemaHash.Bytes[:]...)
+	}
+	if c.AttachmentTreeHash != nil {
+		dst = append(dst, c.AttachmentTreeHash.Bytes[:]...)
 	}
 	return append(dst, c.Message...), nil
 }
@@ -70,12 +102,15 @@ func ForEachPackedCommit(packed []byte, namespaceID string, fn func(CheckpointCo
 		c.TransactionID = codec.UUID{MSB: int64(binary.LittleEndian.Uint64(f[64:])), LSB: int64(binary.LittleEndian.Uint64(f[72:]))}
 		c.AuthorNodeID = codec.UUID{MSB: int64(binary.LittleEndian.Uint64(f[80:])), LSB: int64(binary.LittleEndian.Uint64(f[88:]))}
 		c.Timestamp = codec.Timestamp{EpochMillis: int64(binary.LittleEndian.Uint64(f[96:])), MicroRemainder: int(binary.LittleEndian.Uint16(f[104:]))}
-		hasSchema, nParents := f[106]&1 != 0, int(f[107])
+		hasSchema, hasAttach, nParents := f[106]&packedFlagSchema != 0, f[106]&packedFlagAttach != 0, int(f[107])
 		opCount := int(binary.LittleEndian.Uint32(f[108:]))
 		msgLen := int(binary.LittleEndian.Uint32(f[112:]))
 		off += packedCommitFixed
 		need := nParents*32 + msgLen
 		if hasSchema {
+			need += 32
+		}
+		if hasAttach {
 			need += 32
 		}
 		if len(packed)-off < need {
@@ -92,6 +127,12 @@ func ForEachPackedCommit(packed []byte, namespaceID string, fn func(CheckpointCo
 			var sh codec.Hash
 			copy(sh.Bytes[:], packed[off:off+32])
 			c.SchemaHash = &sh
+			off += 32
+		}
+		if hasAttach {
+			var ah codec.Hash
+			copy(ah.Bytes[:], packed[off:off+32])
+			c.AttachmentTreeHash = &ah
 			off += 32
 		}
 		c.Message = string(packed[off : off+msgLen])

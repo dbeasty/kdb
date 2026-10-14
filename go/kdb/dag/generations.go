@@ -20,6 +20,9 @@ func (d *InMemoryCommitDag) isResidentLocked(hash codec.Hash) bool {
 // it a generation number derived from whichever of its parents are here.
 // Must hold mu.
 func (d *InMemoryCommitDag) storeCommitLocked(c document.Commit) {
+	if c.AttachmentTreeHash != nil {
+		d.sawAttachments = true
+	}
 	gen := uint32(0)
 	if d.graph.AncestryPruning {
 		gen = d.deriveGenerationLocked(c)

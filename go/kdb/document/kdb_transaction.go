@@ -16,4 +16,9 @@ type Transaction struct {
 	// assertions", which is every transaction built before preconditions existed. Not part of
 	// the commit: see the Precondition doc comment.
 	Preconditions []Precondition
+
+	// Attachments, when set, is the attachment table after this transaction, and the DAG records
+	// its root as the commit's AttachmentTreeHash. nil (the usual case) lets the DAG derive it:
+	// the first parent's table with Operations applied. Not part of the commit itself.
+	Attachments *AttachmentTable
 }

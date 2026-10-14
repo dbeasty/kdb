@@ -230,6 +230,12 @@ func (a *InMemoryStorageAdapter) WriteBlob(bytes []byte) (codec.Hash, error) {
 	return h, nil
 }
 
+// WriteKeyedBlob stores bytes under a key the caller computed (see engine.ServerEngine).
+func (a *InMemoryStorageAdapter) WriteKeyedBlob(key codec.Hash, bytes []byte) error {
+	a.blobStore.WriteBlob(key, append([]byte(nil), bytes...))
+	return nil
+}
+
 func (a *InMemoryStorageAdapter) IngestDeltaSegment(segment storage.DeltaSegmentRef) error {
 	return fmt.Errorf("memory adapter cannot ingest delta segment %s", segment.SegmentID.String())
 }

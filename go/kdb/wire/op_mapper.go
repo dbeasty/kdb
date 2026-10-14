@@ -21,6 +21,14 @@ func opToDto(op document.Op) opDto {
 	case document.SchemaMigrationOp:
 		id := o.MigrationID.String()
 		return opDto{Kind: "schemaMigration", MigrationID: &id, MigrationPayload: &o.MigrationPayload}
+	case document.AttachmentPutOp:
+		id, att, name, scheme := o.DocID.String(), o.AttachmentID.String(), o.Name, int(o.Scheme)
+		h, size, mime := o.ContentHash.Hex(), o.Size, o.Mime
+		return opDto{Kind: "attachmentPut", DocID: &id, AttachmentID: &att, Name: &name, Scheme: &scheme,
+			BlobHashHex: &h, Size: &size, Mime: &mime}
+	case document.AttachmentDeleteOp:
+		id, att := o.DocID.String(), o.AttachmentID.String()
+		return opDto{Kind: "attachmentDelete", DocID: &id, AttachmentID: &att}
 	default:
 		return opDto{Kind: "unknown"}
 	}
@@ -64,6 +72,40 @@ func opFromDto(d opDto) (document.Op, error) {
 			return nil, err
 		}
 		return document.SchemaMigrationOp{MigrationID: id, MigrationPayload: *d.MigrationPayload}, nil
+	case "attachmentPut":
+		if d.DocID == nil || d.AttachmentID == nil || d.Name == nil || d.Scheme == nil || d.BlobHashHex == nil || d.Size == nil || d.Mime == nil {
+			return nil, fmt.Errorf("attachmentPut missing fields")
+		}
+		id, err := codec.UUIDFromString(*d.DocID)
+		if err != nil {
+			return nil, err
+		}
+		att, err := codec.UUIDFromString(*d.AttachmentID)
+		if err != nil {
+			return nil, err
+		}
+		h, err := codec.HashFromHex(*d.BlobHashHex)
+		if err != nil {
+			return nil, err
+		}
+		if *d.Size < 0 || *d.Scheme < 0 || *d.Scheme > 255 {
+			return nil, fmt.Errorf("attachmentPut size or scheme out of range")
+		}
+		return document.AttachmentPutOp{DocID: id, AttachmentID: att, Name: *d.Name, Scheme: byte(*d.Scheme),
+			ContentHash: h, Size: *d.Size, Mime: *d.Mime}, nil
+	case "attachmentDelete":
+		if d.DocID == nil || d.AttachmentID == nil {
+			return nil, fmt.Errorf("attachmentDelete missing fields")
+		}
+		id, err := codec.UUIDFromString(*d.DocID)
+		if err != nil {
+			return nil, err
+		}
+		att, err := codec.UUIDFromString(*d.AttachmentID)
+		if err != nil {
+			return nil, err
+		}
+		return document.AttachmentDeleteOp{DocID: id, AttachmentID: att}, nil
 	default:
 		return nil, fmt.Errorf("unknown op kind: %s", d.Kind)
 	}

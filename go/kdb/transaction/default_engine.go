@@ -450,8 +450,10 @@ func toReport(tx document.Transaction, anchor codec.Hash, conflicts []OperationC
 				s := c.IncomingDoc.JSON
 				incoming = &s
 			}
-		case document.DeleteOp:
-			docID = op.DocID.String()
+		default:
+			if id, ok := document.OpDocID(op); ok {
+				docID = id.String()
+			}
 		}
 		var local *string
 		if c.ExistingDoc != nil {

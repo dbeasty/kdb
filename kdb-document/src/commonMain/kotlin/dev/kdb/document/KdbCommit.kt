@@ -21,6 +21,7 @@ internal fun commitPayloadRecord(
     documentTreeHash: KdbHash,
     schemaHash: KdbHash?,
     message: String,
+    attachmentTreeHash: KdbHash? = null,
 ): KdbValue.RecordVal =
     KdbValue.RecordVal(
         buildMap {
@@ -40,6 +41,9 @@ internal fun commitPayloadRecord(
                 },
             )
             put(9, KdbValue.StringVal(message))
+            // Null like schemaHash: the encoder leaves a field at its null default out of the bytes,
+            // so a commit with no attachments hashes as it did before the field existed.
+            put(10, if (attachmentTreeHash == null) KdbValue.Null else KdbValue.FixedVal(attachmentTreeHash.bytes.copyOf()))
         },
     )
 
@@ -57,6 +61,8 @@ public data class KdbCommit(
     val documentTreeHash: KdbHash,
     val schemaHash: KdbHash?,
     val message: String = "",
+    /** The commit's attachment table root (Go's Commit.AttachmentTreeHash); null when it has none. */
+    val attachmentTreeHash: KdbHash? = null,
 ) {
     public fun toCommitPayloadValue(): KdbValue =
         commitPayloadRecord(
@@ -69,6 +75,7 @@ public data class KdbCommit(
             documentTreeHash,
             schemaHash,
             message,
+            attachmentTreeHash,
         )
 
     public fun toPayloadBytes(): ByteArray {
@@ -173,6 +180,12 @@ public data class KdbCommit(
             val msg =
                 (rec.fields[9] as? KdbValue.StringVal)?.v
                     ?: throw CommitDecodeException("message")
+            val attachH =
+                when (val f = rec.fields[10]) {
+                    null, KdbValue.Null -> null
+                    is KdbValue.FixedVal -> KdbHash.fromBytes(f.v.copyOf())
+                    else -> throw CommitDecodeException("attachmentTreeHash")
+                }
             return KdbCommit(
                 hash = hash,
                 parentHashes = parents,
@@ -184,6 +197,7 @@ public data class KdbCommit(
                 documentTreeHash = KdbHash.fromBytes(docTreeH),
                 schemaHash = schemaH,
                 message = msg,
+                attachmentTreeHash = attachH,
             )
         }
     }

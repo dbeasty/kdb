@@ -51,6 +51,8 @@ type nodeStore struct {
 	messages map[codec.Hash]string
 	ops      map[codec.Hash][]document.Op
 	extra    map[codec.Hash][]codec.Hash // parents beyond the second
+	// attach is the attachment root of resident commits that have one (grFlagAttach).
+	attachRoots map[codec.Hash]codec.Hash
 
 	// segs is the segment tier, newest first.
 	segs []*graphBase
@@ -318,6 +320,14 @@ func (s *nodeStore) put(c document.Commit, gen uint32) {
 	} else if s.extra != nil {
 		delete(s.extra, c.Hash)
 	}
+	if c.AttachmentTreeHash != nil {
+		if s.attachRoots == nil {
+			s.attachRoots = make(map[codec.Hash]codec.Hash)
+		}
+		s.attachRoots[c.Hash] = *c.AttachmentTreeHash
+	} else if s.attachRoots != nil {
+		delete(s.attachRoots, c.Hash)
+	}
 	if c.Message != "" {
 		if s.messages == nil {
 			s.messages = make(map[codec.Hash]string)
@@ -378,7 +388,16 @@ func (s *nodeStore) delete(h codec.Hash) {
 	delete(s.messages, h)
 	delete(s.ops, h)
 	delete(s.extra, h)
+	delete(s.attachRoots, h)
 	delete(s.genOverride, h)
+}
+
+// attachRoot is h's attachment root when the resident tier holds one, else nil.
+func (s *nodeStore) attachRoot(h codec.Hash) *codec.Hash {
+	if r, ok := s.attachRoots[h]; ok {
+		return &r
+	}
+	return nil
 }
 
 // commit rebuilds the document.Commit for h. It allocates the parent slice, so a path that only
@@ -393,7 +412,7 @@ func (s *nodeStore) commit(h codec.Hash) (document.Commit, bool) {
 	}
 	if i, ok := s.index[h]; ok {
 		r := s.at(i)
-		return decodeRecord(r, s.namespaces[recNsIdx(r)], s.messages[h], s.extra[h], s.ops[h]), true
+		return decodeRecord(r, s.namespaces[recNsIdx(r)], s.messages[h], s.extra[h], s.ops[h], s.attachRoot(h)), true
 	}
 	if b, pos, ok := s.segPos(h); ok {
 		return b.commit(pos, s.ops[h]), true
@@ -540,7 +559,7 @@ func (s *nodeStore) snapshotForSegment(full bool, include func(codec.Hash, []byt
 		if !include(h, r) || (!full && s.inAnySegment(h)) {
 			continue
 		}
-		src := graphSource{msg: s.messages[h], extra: s.extra[h]}
+		src := graphSource{msg: s.messages[h], extra: s.extra[h], attach: s.attachRoot(h)}
 		copy(src.rec[:], r)
 		// Whether the commit wrote anything is not in the record until now: resident, it is
 		// answered by the ops side map and the DAG's eviction set. On disk the record must say.
@@ -775,6 +794,7 @@ func (s *nodeStore) attach(nb *graphBase, replaced []*graphBase) {
 			s.freeSlot(h, i)
 			delete(s.messages, h)
 			delete(s.extra, h)
+			delete(s.attachRoots, h)
 			continue
 		}
 		if gen, ok := replacedVisible(h); ok {
@@ -820,6 +840,7 @@ func (s *nodeStore) attach(nb *graphBase, replaced []*graphBase) {
 	s.index = shrunk(s.index)
 	s.messages = shrunk(s.messages)
 	s.extra = shrunk(s.extra)
+	s.attachRoots = shrunk(s.attachRoots)
 }
 
 // shrunk returns m in a map sized for what it holds now.
@@ -896,6 +917,7 @@ func (s *nodeStore) attachTrusted(segs []*graphBase, hidden []codec.Hash) {
 			s.freeSlot(h, i)
 			delete(s.messages, h)
 			delete(s.extra, h)
+			delete(s.attachRoots, h)
 		}
 	}
 }

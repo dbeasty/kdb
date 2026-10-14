@@ -56,8 +56,11 @@ func opBodyLen(op Op) int {
 }
 
 // commitBodyLen is the length of c's CommitPayload record body, or -1 if c has an operation the
-// direct encoder does not know.
+// direct encoder does not know or an attachment root.
 func commitBodyLen(c *Commit) int {
+	if c.AttachmentTreeHash != nil {
+		return -1 // field 10: left to the generic codec
+	}
 	n := 2 + lebLenOf(len(c.ParentHashes)) + 32*len(c.ParentHashes)
 	n += 2 + lebLenOf(len(c.NamespaceID)) + len(c.NamespaceID)
 	n += 2 + 16 // transactionId

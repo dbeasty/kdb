@@ -22,6 +22,10 @@ func describeOp(op document.Op) opView {
 		return opView{Kind: "delete", DocID: o.DocID.String()}
 	case document.FileWriteOp:
 		return opView{Kind: "fileWrite", Path: o.Path}
+	case document.AttachmentPutOp:
+		return opView{Kind: "attachmentPut", DocID: o.DocID.String(), Path: o.Name, Bytes: int(min(o.Size, int64(^uint(0)>>1)))}
+	case document.AttachmentDeleteOp:
+		return opView{Kind: "attachmentDelete", DocID: o.DocID.String(), Path: o.AttachmentID.String()}
 	default:
 		// A new op kind should show up as something rather than vanish from the list; an operator
 		// counting operations against OpCount would otherwise see a silent discrepancy.

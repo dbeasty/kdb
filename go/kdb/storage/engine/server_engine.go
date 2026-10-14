@@ -19,8 +19,10 @@ import (
 
 // ServerEngine is the server-side LSM storage engine with optional WAL.
 type ServerEngine struct {
-	namespaceID string
-	config      storage.StorageEngineConfig
+	// extraReachable, when set, is SetExtraReachable's rule.
+	extraReachable atomic.Pointer[func() func(codec.Hash) bool]
+	namespaceID    string
+	config         storage.StorageEngineConfig
 	// bodiesExternal is set once some document bodies exist only in the blob store - see
 	// MaterializeLiveBodies - so cold reads consult it in every history mode.
 	bodiesExternal atomic.Bool
@@ -413,6 +415,14 @@ func (e *ServerEngine) WriteBlob(bytes []byte) (codec.Hash, error) {
 	if err != nil {
 		return codec.Hash{}, err
 	}
+	return hash, e.WriteKeyedBlob(hash, bytes)
+}
+
+// WriteKeyedBlob is WriteBlob under a key the caller computed - an attachment's chunked content
+// hash (document.AttachmentContentHash) rather than the plain SHA-256 WriteBlob uses. Same WAL
+// record, same durability; the store's key space already holds keys that are not a plain hash of
+// their bytes (tree objects, document locations).
+func (e *ServerEngine) WriteKeyedBlob(hash codec.Hash, bytes []byte) error {
 	if e.wal != nil {
 		result, err := e.wal.Append(wal.Record{
 			Timestamp: codec.TimestampNow(),
@@ -420,13 +430,13 @@ func (e *ServerEngine) WriteBlob(bytes []byte) (codec.Hash, error) {
 			Payload:   wal.EncodePutBlob(wal.PutBlob{ContentHash: hash, Bytes: bytes}),
 		})
 		if err != nil {
-			return codec.Hash{}, err
+			return err
 		}
 		switch e.config.Durability {
 		case storage.DurabilitySync:
 			fsyncStart := time.Now()
 			if err := e.groupCommit.SyncTo(result.Sequence, e.wal.Sync); err != nil {
-				return codec.Hash{}, err
+				return err
 			}
 			metrics.Default.Record(metrics.StageFsyncWait, time.Since(fsyncStart))
 		case storage.DurabilityAsync:
@@ -438,7 +448,7 @@ func (e *ServerEngine) WriteBlob(bytes []byte) (codec.Hash, error) {
 		}
 	}
 	e.memTable.Put(hash, bytes)
-	return hash, nil
+	return nil
 }
 
 func (e *ServerEngine) ReadBlob(contentHash codec.Hash) ([]byte, error) {

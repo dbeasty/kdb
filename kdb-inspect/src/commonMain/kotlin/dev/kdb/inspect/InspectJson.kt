@@ -109,6 +109,14 @@ public object InspectJson {
                     migrationId = op.migrationId.toString(),
                     migrationPayload = op.migrationPayload,
                 )
+            is KdbOp.AttachmentPut ->
+                OpJsonDto(
+                    kind = "attachmentPut",
+                    docId = op.docId.toString(),
+                    blobHash = op.contentHash.toHex(),
+                )
+            is KdbOp.AttachmentDelete ->
+                OpJsonDto(kind = "attachmentDelete", docId = op.docId.toString())
         }
 
     internal fun hintDto(hint: IndexHint): IndexHintJsonDto =
