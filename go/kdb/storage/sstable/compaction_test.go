@@ -436,6 +436,9 @@ func (s noRenameShim) SegmentSize(name string) (int64, error) {
 // every entry until Finish lays out - same blocks, same footer, same file hash - or tables merged
 // by this build would differ from what every other build (and Kotlin) writes for the same entries.
 func TestStreamedCompactionIsByteIdenticalToFinish(t *testing.T) {
+	if testing.Short() {
+		t.Skip("merges several megabytes; runs nightly, or without -short")
+	}
 	for _, tc := range []struct {
 		name string
 		shim func() storage.PlatformIOShim
@@ -518,6 +521,9 @@ func mustIndex(t *testing.T, shim storage.PlatformIOShim, h Handle) map[codec.Ha
 // is deleted, so the merge leaves no file behind. Run against a shim that renames, where the
 // output is under its partial name, and one that cannot, where it is under the table's own name.
 func TestCompactContextStopsMidMerge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a table of several compaction-check intervals; runs nightly, or without -short")
+	}
 	for _, tc := range []struct {
 		name string
 		shim func() storage.PlatformIOShim

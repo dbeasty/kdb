@@ -465,6 +465,9 @@ func rebaseHistory(history []held) {
 // stays exactly what it was - and, the trees' copies being shared, costs no more heap than not
 // rebasing (the control, which keeps the superseded segments mapped instead).
 func TestTreeFileRebasedHistoryReleasesSegments(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heavy: minutes under -race on a CI runner; runs nightly, or without -short")
+	}
 	var controlInUse int
 	for _, rebase := range []bool{false, true} {
 		r := rand.New(rand.NewSource(18))

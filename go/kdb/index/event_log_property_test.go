@@ -247,7 +247,11 @@ func (w *propWorld) run(n int, sideEvents bool) {
 }
 
 func TestEventLogMatchesReferenceUnbounded(t *testing.T) {
-	for seed := int64(1); seed <= 20; seed++ {
+	seeds := int64(20)
+	if testing.Short() {
+		seeds = 4 // all 20 run nightly, or without -short
+	}
+	for seed := int64(1); seed <= seeds; seed++ {
 		w := newPropWorld(t, seed, -1)
 		w.run(1500, true)
 		if w.unavailable != 0 {
@@ -257,8 +261,12 @@ func TestEventLogMatchesReferenceUnbounded(t *testing.T) {
 }
 
 func TestEventLogMatchesReferenceBounded(t *testing.T) {
+	seeds := int64(12)
+	if testing.Short() {
+		seeds = 3 // all 12 run nightly, or without -short
+	}
 	for _, window := range []int{8, 40, 200} {
-		for seed := int64(1); seed <= 12; seed++ {
+		for seed := int64(1); seed <= seeds; seed++ {
 			for _, side := range []bool{false, true} {
 				w := newPropWorld(t, seed*1000+int64(window), window)
 				w.run(1500, side)

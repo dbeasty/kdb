@@ -208,8 +208,12 @@ func (w *ftWorld) run(n int, sideEvents bool) {
 }
 
 func TestFullTextMatchesReference(t *testing.T) {
+	seeds := int64(10)
+	if testing.Short() {
+		seeds = 3 // all 10 run nightly, or without -short
+	}
 	for _, window := range []int{-1, 6, 30, 150} {
-		for seed := int64(1); seed <= 10; seed++ {
+		for seed := int64(1); seed <= seeds; seed++ {
 			for _, side := range []bool{false, true} {
 				w := newFTWorld(t, seed*100+int64(window), window)
 				w.run(1000, side)

@@ -176,6 +176,9 @@ func TestHistoryWalkStaysLinear(t *testing.T) {
 // namespace open cost memory proportional to how many times it had been
 // written.
 func TestTreeMemoryDoesNotFollowCommitCount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("heap measurement; runs nightly, or without -short")
+	}
 	measure := func(n int) float64 {
 		root := t.TempDir()
 		rt := tinyTreeBudgetRuntime(t, root, storage.HistoryStrategyObjects)

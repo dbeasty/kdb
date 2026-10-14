@@ -1,0 +1,43 @@
+name: Set up Go with a build and test cache
+description: >
+  actions/setup-go plus a restore of GOCACHE and GOMODCACHE that main's runs keep current. Each job
+  passes its own cache-key, so a shard restores what that shard compiled (and, for go test, the
+  results it may reuse). Only pushes to main save: the job ends with actions/cache/save using this
+  action's outputs, under `if: env.SAVE_GO_CACHE == 'true'` - see ci.yml. A pull request restores
+  main's newest entry and saves nothing, so PR runs never evict the caches main depends on.
+inputs:
+  cache-key:
+    description: Distinguishes this job's cache from other jobs' (e.g. race-embed, windows-rest).
+    required: true
+outputs:
+  paths:
+    description: The directories to save at the end of the job.
+    value: ${{ steps.paths.outputs.paths }}
+  key:
+    description: The key to save them under.
+    value: go-${{ runner.os }}-${{ inputs.cache-key }}-${{ hashFiles('go/go.sum') }}-${{ github.sha }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: go/go.mod
+        # setup-go's own cache looks for go.sum at the repository root and finds none ("Dependencies
+        # file is not found"), so before this action every job compiled from cold.
+        cache: false
+    - id: paths
+      shell: bash
+      run: |
+        {
+          echo "paths<<EOF"
+          go env GOCACHE
+          go env GOMODCACHE
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+    - uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.paths.outputs.paths }}
+        key: go-${{ runner.os }}-${{ inputs.cache-key }}-${{ hashFiles('go/go.sum') }}-${{ github.sha }}
+        restore-keys: |
+          go-${{ runner.os }}-${{ inputs.cache-key }}-${{ hashFiles('go/go.sum') }}-
+          go-${{ runner.os }}-${{ inputs.cache-key }}-
