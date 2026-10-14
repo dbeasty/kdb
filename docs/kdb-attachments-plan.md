@@ -127,7 +127,20 @@ These are the owner's decisions, recorded in the order they were made (2026-10-1
   - `CellKindBytes`.
   - Client `PutAttachment`/`GetAttachment`/`DeleteAttachment` and `DocWrite.Attachment`.
 - **PR 4, TS and Kotlin clients** (JDBC `setBytes`/`setBinaryStream`/`getBytes`/`getBinaryStream`).
-- **PR 5, peer sync, migration and upgrade e2e.**
+- **PR 5, peer sync, migration and upgrade e2e.** `BLOB_FETCH` requirements, agreed with the
+  client-replica session (Track D, codes 0x50-0x57):
+  - **Ranged:** each entry is `(docId, commit, hash, offset, maxBytes)`, and every chunk carries the
+    blob's total size. A replica resumes a large blob after a reconnect.
+  - **Batched:** several entries per request, results streamed in request order, the response paged
+    by bytes.
+  - **Any readable old ref** (replicas fetch lazily). The entry names its document and a commit, so
+    the server checks the principal's read permission on that document and that the table at that
+    commit references the hash. No reverse index from hash to documents is needed.
+  - **Per-entry errors:** missing, unreadable or not retained (latest-only history) gets its own
+    error; the rest of the batch is still served.
+  - **Tree diffs:** attachment table nodes are served through `TREE_NODES` with a tree selector
+    field, so squash and snapshot diff both tables by one mechanism.
+- **PR 5, remaining items:**
   - Commits already carry the ops and the root.
   - The receiver fetches missing blobs by hash (`BLOB_FETCH`, 0x42/0x43) before adopting, gated on
     peer capability `attachments`; a peer without it gets a typed refusal.
