@@ -232,6 +232,40 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+  # @kdb/replica (docs/kdb-client-replica-plan.md): a native TS replica. Its commit codec and trie
+  # must be byte-identical to Go's, so the golden vectors are regenerated and diffed like the client's.
+  ts-replica:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/kdb-replica
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Check golden fixtures are current
+        run: |
+          cd ../../go && go run ./cmd/kdb-tsfixtures
+          cd ../packages/kdb-replica
+          if ! git diff --quiet -- test/golden; then
+            echo "Golden fixtures are out of date - the Go commit or trie format changed."
+            echo "Run: cd go && go run ./cmd/kdb-tsfixtures"
+            git diff --stat -- test/golden
+            exit 1
+          fi
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+
   go-interop:
     runs-on: ubuntu-latest
     needs: [integration, go-test]
