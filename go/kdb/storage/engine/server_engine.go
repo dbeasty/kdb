@@ -21,8 +21,8 @@ import (
 type ServerEngine struct {
 	// extraReachable, when set, is SetExtraReachable's rule.
 	extraReachable atomic.Pointer[func() func(codec.Hash) bool]
-	namespaceID string
-	config      storage.StorageEngineConfig
+	namespaceID    string
+	config         storage.StorageEngineConfig
 	// bodiesExternal is set once some document bodies exist only in the blob store - see
 	// MaterializeLiveBodies - so cold reads consult it in every history mode.
 	bodiesExternal atomic.Bool

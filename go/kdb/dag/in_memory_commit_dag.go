@@ -132,17 +132,17 @@ type InMemoryCommitDag struct {
 	// SetOperationsLoader for why the bound is only safe with a loader.
 	// opsLoader is read on the (cold) load path only, hence atomic rather
 	// than mu; every other field here is guarded by mu.
-	opsLoader   atomic.Pointer[CommitOperationsLoader]
+	opsLoader atomic.Pointer[CommitOperationsLoader]
 
 	// attachments caches attachment tables by root (attachments.go). Guarded by mu.
 	attachments attachmentCache
 	// sawAttachments is set once any commit with an attachment root is stored. Guarded by mu.
 	sawAttachments bool
-	opsBudget   int64
-	opsResident int64
-	opsLRU      *list.List
-	opsElem     map[codec.Hash]*list.Element
-	opsEvicted  map[codec.Hash]struct{}
+	opsBudget      int64
+	opsResident    int64
+	opsLRU         *list.List
+	opsElem        map[codec.Hash]*list.Element
+	opsEvicted     map[codec.Hash]struct{}
 
 	// graph is which of the on-disk commit graph features this namespace
 	// is running with. Zero value is the behaviour that predates all of

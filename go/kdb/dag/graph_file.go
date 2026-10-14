@@ -85,12 +85,12 @@ import (
 // rebuilt - and a full flush of a file this size would stall every neighbouring writer on macOS.
 
 const (
-	graphMagic       = "KDBGRAF4"
-	graphVersion     = 5
+	graphMagic   = "KDBGRAF4"
+	graphVersion = 5
 	// graphVersionNoAttach is the layout before ATTR, read as a segment with no attachment roots.
 	graphVersionNoAttach = 4
-	graphFooterMagic = 0x4B474634 // "KGF4"
-	graphHeaderFixed = 8 + 4 + 4 + 8 + 4
+	graphFooterMagic     = 0x4B474634 // "KGF4"
+	graphHeaderFixed     = 8 + 4 + 4 + 8 + 4
 
 	graphFlagFull = 1 // this segment supersedes every segment with a lower sequence number
 
