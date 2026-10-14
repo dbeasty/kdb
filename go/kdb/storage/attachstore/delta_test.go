@@ -387,3 +387,24 @@ func TestVerifyKeepsTheWholeCopyOfABadDelta(t *testing.T) {
 		t.Fatalf("the bad delta's segments were left: %v", names)
 	}
 }
+
+// With deltas disabled every version stays whole: nothing is encoded or written.
+func TestDisableDeltasKeepsEveryVersionWhole(t *testing.T) {
+	s, shim, _ := newTestStore(t, tinyDeltas(Config{DisableDeltas: true}))
+	v := versions(rand.New(rand.NewSource(18)), 2, 3*chunk)
+	oi, _ := s.Put(bytes.NewReader(v[0]))
+	ni, _ := s.Put(bytes.NewReader(v[1]))
+	before, _ := shim.ListSegments("app/data")
+	if out, used, err := s.DeltaStep(oi.Hash, ni.Hash, 0); err != nil || out != DeltaSkipped || used != 0 {
+		t.Fatalf("a step with deltas disabled: %v %d %v", out, used, err)
+	}
+	if did, err := s.StoreAsDelta(oi.Hash, ni.Hash); err != nil || did {
+		t.Fatalf("StoreAsDelta with deltas disabled: %v %v", did, err)
+	}
+	if after, _ := shim.ListSegments("app/data"); len(after) != len(before) {
+		t.Fatalf("segments %v became %v", before, after)
+	}
+	if got := readBack(t, s, oi.Hash); !bytes.Equal(got, v[0]) {
+		t.Fatal("the old version reads wrong")
+	}
+}

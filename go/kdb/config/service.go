@@ -86,6 +86,10 @@ type ServiceSettings struct {
 	// replaced attachment versions into deltas; a larger version is diffed over several passes
 	// (embed.StorageOptions.AttachmentDeltaStepBytes). 0 uses the default, 4 GiB.
 	AttachmentDeltaStepMB int
+	// AttachmentDeltas re-stores a replaced attachment version as a delta against its successor
+	// when that is worth it. Off, every version is kept as the original file, whole
+	// (embed.StorageOptions.DisableAttachmentDeltas). On by default.
+	AttachmentDeltas bool
 	// MaintenanceMaxDefer is how many consecutive ticks write load may postpone a due
 	// maintenance pass before it runs anyway. Negative never forces, which risks a busy server
 	// never reclaiming; 0 uses the embed default.
@@ -158,6 +162,7 @@ func DefaultServiceSettings() ServiceSettings {
 		MaintenanceSweep:    30 * time.Minute,
 		// Comfortably above any upload->commit gap a client takes; see AttachmentUploadGrace.
 		AttachmentUploadGrace: time.Hour,
+		AttachmentDeltas:      true,
 		MaintenanceMaxDefer:   6,
 		// Off by default: a browser-reachable control plane is a deliberate exposure decision,
 		// exactly as WSAddr is.
@@ -217,6 +222,7 @@ type ServiceFile struct {
 	MaintenanceMaxDefer    *int            `json:"maintenanceMaxDefer"`
 	AttachmentUploadGrace  *string         `json:"attachmentUploadGrace"`
 	AttachmentDeltaStepMB  *int            `json:"attachmentDeltaStepMb"`
+	AttachmentDeltas       *bool           `json:"attachmentDeltas"`
 	TLS                    *ServiceTLSFile `json:"tls"`
 	LogLevel               *string         `json:"logLevel"`
 	LogFormat              *string         `json:"logFormat"`
@@ -321,6 +327,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 			return s, err
 		}
 		setIf(&s.AttachmentDeltaStepMB, file.AttachmentDeltaStepMB)
+		setIf(&s.AttachmentDeltas, file.AttachmentDeltas)
 		if file.MaintenanceMaxDefer != nil {
 			s.MaintenanceMaxDefer = *file.MaintenanceMaxDefer
 		}
@@ -446,6 +453,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envInt("KDB_ATTACHMENT_DELTA_STEP_MB", &s.AttachmentDeltaStepMB); err != nil {
 		return s, err
 	}
+	if err := envBool("KDB_ATTACHMENT_DELTAS", &s.AttachmentDeltas); err != nil {
+		return s, err
+	}
 	if err := envInt("KDB_MAINTENANCE_MAX_DEFER", &s.MaintenanceMaxDefer); err != nil {
 		return s, err
 	}
@@ -506,6 +516,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"maintenance-sweep", func() { s.MaintenanceSweep = flags.MaintenanceSweep }},
 		{"attachment-upload-grace", func() { s.AttachmentUploadGrace = flags.AttachmentUploadGrace }},
 		{"attachment-delta-step-mb", func() { s.AttachmentDeltaStepMB = flags.AttachmentDeltaStepMB }},
+		{"attachment-deltas", func() { s.AttachmentDeltas = flags.AttachmentDeltas }},
 		{"maintenance-max-defer", func() { s.MaintenanceMaxDefer = flags.MaintenanceMaxDefer }},
 		{"tls-cert", func() { s.TLSCert = flags.TLSCert }},
 		{"tls-key", func() { s.TLSKey = flags.TLSKey }},

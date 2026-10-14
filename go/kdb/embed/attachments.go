@@ -129,7 +129,7 @@ func (rt *EmbeddedKdbRuntime) SetAttachmentHistory(h AttachmentHistory) {
 
 // SetAttachmentConfig tunes the attachment store (size limit, chunking, deltas, upload grace). It
 // replaces the whole configuration, StorageOptions.AttachmentUploadGrace and
-// AttachmentDeltaStepBytes included. Takes effect for
+// AttachmentDeltaStepBytes and DisableAttachmentDeltas included. Takes effect for
 // stores opened afterwards.
 func (rt *EmbeddedKdbRuntime) SetAttachmentConfig(cfg attachstore.Config) {
 	rt.attach.mu.Lock()
@@ -528,7 +528,8 @@ type AttachmentMaintenance struct {
 	DeltaPending bool
 }
 
-// CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll) and deletes the
+// CompactAttachments re-stores replaced versions as deltas (AttachmentHistoryAll, unless
+// attachstore.Config.DisableDeltas keeps them whole) and deletes the
 // standalone blobs nothing keeps: under AttachmentHistoryLatest anything a branch or tag head does
 // not reference, under AttachmentHistoryAll anything no reachable commit references (an upload
 // that was never committed). Maintain calls it; it is safe to call at any time.
@@ -557,6 +558,16 @@ func (rt *EmbeddedKdbRuntime) CompactAttachments(namespaceID string) (Attachment
 	}
 	if history == AttachmentHistoryLatest {
 		keep, err := rt.headAttachmentHashes(namespaceID)
+		if err != nil {
+			return out, err
+		}
+		out.Removed, err = store.Collect(func(h codec.Hash) bool { return keep[h] })
+		return out, err
+	}
+	if store.Config().DisableDeltas {
+		// Every version stays whole. The mark stays where it is, so turning deltas back on
+		// diffs the versions replaced meanwhile.
+		keep, _, _, err := rt.referencedAttachmentHashes(namespaceID, nil)
 		if err != nil {
 			return out, err
 		}

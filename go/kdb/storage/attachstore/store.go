@@ -108,6 +108,9 @@ type Config struct {
 	// DeltaStepBytes is how much work - bytes indexed, encoded or verified - one DeltaStep does
 	// when its caller names no budget, and so one maintenance pass. Default 4 GiB.
 	DeltaStepBytes int64
+	// DisableDeltas keeps every version whole, as uploaded: DeltaStep (and StoreAsDelta) store
+	// nothing. Deltas already stored still read.
+	DisableDeltas bool
 	// DeltaMaxDepth bounds a delta chain - how many deltas a read goes through. Default 8.
 	DeltaMaxDepth int
 	// HashWorkers bounds the chunks hashed at once during an upload. Default GOMAXPROCS.

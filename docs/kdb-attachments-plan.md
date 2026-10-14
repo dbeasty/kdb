@@ -145,6 +145,11 @@ identity = SHA-256(0x02 || be64(size) || tree)
     `Collect` and fails with `ErrReadLeaseExpired`.
 - **Deltas** (`delta.go`, `deltajob.go`). Any size; chain depth is capped at 8 (`DeltaMaxDepth`).
   `DeltaMaxBytes` can still cap the size diffed; it is unlimited by default.
+  - **Feature flag: store originals only.** `Config.DisableDeltas` (`StorageOptions.DisableAttachmentDeltas`
+    in embed; `--attachment-deltas=false` / `KDB_ATTACHMENT_DELTAS` / `attachmentDeltas` on the
+    service, restart) keeps every version whole, as uploaded. Deltas already stored still read.
+    Maintenance leaves the mark where it is while off, so turning deltas back on diffs the
+    versions replaced meanwhile.
   - **Chunks first.** A target chunk whose leaf equals the base's leaf at the same offset is a copy
     instruction without reading a byte, so an in-place edit to a TB file costs the chunks touched.
   - **Index only what did not match.** Only base chunks with no equal target chunk at their

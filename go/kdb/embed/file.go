@@ -307,6 +307,7 @@ func (h *Host) openNamespace(
 	}
 	rt.attach.config.UploadGrace = opts.Storage.AttachmentUploadGrace
 	rt.attach.config.DeltaStepBytes = opts.Storage.AttachmentDeltaStepBytes
+	rt.attach.config.DisableDeltas = opts.Storage.DisableAttachmentDeltas
 	rt.registerAttachmentBlobs()
 	if persisting != nil {
 		persisting.SetAttachmentsCommitted(rt.attachmentsCommitted)
