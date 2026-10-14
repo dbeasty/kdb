@@ -3,7 +3,9 @@ package document
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding"
 	"encoding/binary"
+	"hash"
 	"runtime"
 	"slices"
 	"sort"
@@ -95,15 +97,71 @@ func leafHash(uuidBytes []byte, contentHash codec.Hash) [32]byte {
 }
 
 // internalHashOfOnlyChild is the internal-node hash for the case that matters to
-// compression: an internal node with one occupied slot. The preimage buffer
-// starts zeroed and trieZero is all-zero, so the absent siblings need no
-// writing at all.
+// compression: an internal node with one occupied slot. The preimage is 0x01 and sixteen
+// 32-byte slots with only nib's set - nine SHA-256 blocks - and everything before nib's slot is
+// the same for every child. So the hash resumes from the state after those constant whole
+// blocks (onlyChildMidstate), skipping 0 to 7 of the nine, 3.5 on average; the result is the
+// hash of the full preimage, byte for byte. Spines of these are about half of every insert.
 func internalHashOfOnlyChild(nib int, childHash [32]byte) [32]byte {
-	var buf [1 + 16*32]byte
-	buf[0] = 0x01
-	copy(buf[1+nib*32:], childHash[:])
-	return sha256.Sum256(buf[:])
+	sh := spineHashers.Get().(*spineHasher)
+	h := sh.onlyChild(nib, childHash)
+	spineHashers.Put(sh)
+	return h
 }
+
+func (sh *spineHasher) onlyChild(nib int, childHash [32]byte) [32]byte {
+	skip := onlyChildSkip[nib]
+	if skip == 0 {
+		sh.buf = [1 + 16*32]byte{0x01}
+		copy(sh.buf[1+nib*32:], childHash[:])
+		return sha256.Sum256(sh.buf[:])
+	}
+	if err := sh.u.UnmarshalBinary(onlyChildMidstate[nib]); err != nil {
+		panic(err) // a state this package marshalled itself
+	}
+	// What is left of the preimage after the skipped blocks: zeros, then the child, then zeros.
+	tail := sh.buf[:1+16*32-skip]
+	clear(tail)
+	copy(tail[1+nib*32-skip:], childHash[:])
+	sh.d.Write(tail)
+	sh.d.Sum(sh.sum[:0])
+	return sh.sum
+}
+
+// spineHasher keeps the preimage tail and the digest together, so that handing them to the
+// hash.Hash interface does not move a buffer to the heap on every round.
+type spineHasher struct {
+	d   hash.Hash
+	u   encoding.BinaryUnmarshaler
+	buf [1 + 16*32]byte
+	sum [32]byte
+}
+
+// onlyChildSkip[nib] is how many leading bytes of nib's single-child preimage are whole SHA-256
+// blocks of the constant prefix (0x01, then zeros up to nib's slot), and onlyChildMidstate[nib]
+// the hash state after them.
+var onlyChildSkip, onlyChildMidstate = func() (skip [16]int, state [16][]byte) {
+	for nib := range 16 {
+		skip[nib] = (1 + nib*32) / sha256.BlockSize * sha256.BlockSize
+		prefix := make([]byte, skip[nib])
+		if len(prefix) > 0 {
+			prefix[0] = 0x01
+		}
+		d := sha256.New()
+		d.Write(prefix)
+		st, err := d.(encoding.BinaryMarshaler).MarshalBinary()
+		if err != nil {
+			panic(err)
+		}
+		state[nib] = st
+	}
+	return skip, state
+}()
+
+var spineHashers = sync.Pool{New: func() any {
+	d := sha256.New()
+	return &spineHasher{d: d, u: d.(encoding.BinaryUnmarshaler)}
+}}
 
 // foldLeaf is the hash of the subtree rooted at depth that holds exactly the
 // one entry (uuidBytes, contentHash) - the spine that used to be built out of
@@ -112,9 +170,14 @@ func internalHashOfOnlyChild(nib int, childHash [32]byte) [32]byte {
 // single-entry tree.
 func foldLeaf(uuidBytes []byte, contentHash codec.Hash, depth int) [32]byte {
 	h := leafHash(uuidBytes, contentHash)
-	for d := trieDepth - 1; d >= depth; d-- {
-		h = internalHashOfOnlyChild(nibbleAt(uuidBytes, d), h)
+	if depth >= trieDepth {
+		return h
 	}
+	sh := spineHashers.Get().(*spineHasher)
+	for d := trieDepth - 1; d >= depth; d-- {
+		h = sh.onlyChild(nibbleAt(uuidBytes, d), h)
+	}
+	spineHashers.Put(sh)
 	return h
 }
 
