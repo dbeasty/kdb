@@ -121,15 +121,15 @@ public class InMemoryStorageAdapter(
                     ?: error("missing parent tree $parentTreeHash")
             val dels = pendingDeletes.remove(namespaceId) ?: mutableSetOf()
             val puts = pendingPuts.remove(namespaceId) ?: mutableMapOf()
-            val next = base.entries.toMutableMap()
+            // Incremental (O(delta)), not a copy of base rebuilt from scratch per commit.
+            var built = base
             for (id in dels) {
-                next.remove(id)
+                built = built.without(id)
             }
             for ((id, doc) in puts) {
                 rememberDocumentLocked(doc)
-                next[id] = doc.contentHash
+                built = built.with(id, doc.contentHash)
             }
-            val built = DocumentTree.build(next)
             trees[built.treeHash] = built
             built
         }
