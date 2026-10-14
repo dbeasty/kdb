@@ -153,6 +153,11 @@ func (p *AttachmentSetPool) put(s AttachmentSet) (codec.Hash, error) {
 	defer p.mu.Unlock()
 	if e, ok := p.entries[h]; ok {
 		p.lru.MoveToFront(e)
+		if p.track {
+			// Named by a new table: while a collecting store may since have dropped the copy
+			// this was read from, write it again when evicted, and record it.
+			e.Value.(*poolEntry).stored = false
+		}
 		return h, nil
 	}
 	p.insertLocked(h, s, false)
@@ -174,9 +179,7 @@ func (p *AttachmentSetPool) evictLocked() error {
 	for p.bytes > p.budget && p.lru.Len() > 1 {
 		el := p.lru.Back()
 		e := el.Value.(*poolEntry)
-		// While a collecting store may drop what it holds (TrackWritten), stored proves nothing:
-		// write the set again, and record it, so the next collections keep it.
-		if !e.stored || p.track {
+		if !e.stored {
 			if err := p.store.WriteAttachmentSet(e.hash, AppendAttachmentSet(nil, e.set)); err != nil {
 				return fmt.Errorf("attachment set %s: spilling to the store: %w", e.hash.Hex(), err)
 			}

@@ -268,6 +268,22 @@ func TestAttachmentSetsSpillToTheBlobStore(t *testing.T) {
 			if mode == storage.HistoryModeFull {
 				checkHistory()
 			} else {
+				// More merges with no set written: the written-set grace runs out, and only the
+				// heads' use keeps their sets.
+				for k := 0; k < 12; k++ {
+					// Writes to other documents make the runs a merge needs.
+					filler := codec.UUID{MSB: 900 + int64(k)}
+					putAttachDoc(t, rt, filler, `{}`)
+					fv := []byte(strings.Repeat("f", 5+k))
+					putVersion(t, rt, filler, fv)
+					latest[filler] = fv
+					res, err := eng.CompactBlobStore()
+					if err != nil {
+						t.Fatal(err)
+					}
+					dropped += res.Dropped
+				}
+				checkHeads()
 				if dropped == 0 {
 					t.Fatal("no blob store merge dropped anything")
 				}
