@@ -207,10 +207,15 @@ func measureSync(t *testing.T, sync func(*countingTransport) int) syncMeasure {
 // fileNode is newNode on disk: a file-backed runtime, so what a sync leaves resident is what a
 // real node would keep, not the whole history. Writes are acknowledged before fsync - the seeding
 // would otherwise be bound by the disk, and the receiver's fsyncs are not what is measured.
+//
+// It starts from what a deployed node gets (embed.FileRuntimeOptionsFromEnv: the graph file on, and
+// KDB_TREE_FILE / KDB_BOUNDED_LIVE_BODIES honoured, so the scale tests can be run with them), with
+// asynchronous durability.
 func fileNode(t *testing.T, ns string) *server.KdbServerRuntime {
 	t.Helper()
-	rt, err := embed.OpenFileRuntimeWithOptions(t.TempDir(), "app", ns, schema.None(),
-		embed.FileRuntimeOptions{Storage: embed.StorageOptions{Durability: storage.DurabilityAsync}})
+	opts := embed.FileRuntimeOptionsFromEnv()
+	opts.Storage.Durability = storage.DurabilityAsync
+	rt, err := embed.OpenFileRuntimeWithOptions(t.TempDir(), "app", ns, schema.None(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
