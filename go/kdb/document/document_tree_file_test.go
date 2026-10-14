@@ -612,6 +612,48 @@ func TestTreeFileStampSkipsFullChecksum(t *testing.T) {
 	}
 }
 
+// TestTreeFileCloseWaitsForOnWrite: Close does not return while an onWrite call (the engine's
+// rebase of its held trees, which reads the segments) is still running, and none starts after it.
+// One that outlived Close faulted (SIGBUS) once a test rewrote a segment it was reading.
+func TestTreeFileCloseWaitsForOnWrite(t *testing.T) {
+	r := rand.New(rand.NewSource(21))
+	f := newTestTreeFile(t, 1<<20)
+	tree, err := OpenTreePacked(packedOf(randomEntriesFrom(r, testIDs(r, 2000))), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	f.SetOnWrite(func() {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+	})
+	id, h := testIDs(r, 1)[0], codec.Hash{Bytes: [32]byte{7}}
+	if tree, err = tree.With(id, h); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveTreeSegment(tree, tree.AppendPacked(nil)); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	closed := make(chan struct{})
+	go func() { f.Close(); close(closed) }()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while an onWrite call was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-closed
+	f.wrote()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("onWrite ran %d times; want 1, and none after Close", n)
+	}
+	waitRewrites(tree)
+}
+
 // Dropping the mapped segments' pages loses nothing: readers walking the tree while pages are
 // dropped, again and again, see every entry, and the tree's hash and contents are unchanged after.
 func TestDropMappedPagesKeepsTheTreeReadable(t *testing.T) {
