@@ -300,7 +300,11 @@ func (h *Host) openNamespace(
 		txn:              h.txn,
 		recovery:         recovery,
 	}
+	rt.attach.config.UploadGrace = opts.Storage.AttachmentUploadGrace
 	rt.registerAttachmentBlobs()
+	if persisting != nil {
+		persisting.SetAttachmentsCommitted(rt.attachmentsCommitted)
+	}
 	if !opts.ReadOnly {
 		rt.snapshot = &snapshotSupport{
 			dag: d, store: store, shim: io, dataRoot: dataRoot, namespaceID: namespaceID,

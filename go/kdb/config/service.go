@@ -78,6 +78,10 @@ type ServiceSettings struct {
 	// namespace is idle. Retention is partly a function of wall-clock time, so "nothing has been
 	// written" is not the same as "nothing can be reclaimed". 0 uses the embed default.
 	MaintenanceSweep time.Duration
+	// AttachmentUploadGrace is how long a finished attachment upload no commit references yet
+	// is kept before maintenance may collect it: the longest a client may take between
+	// uploading an attachment and committing it (embed.StorageOptions.AttachmentUploadGrace).
+	AttachmentUploadGrace time.Duration
 	// MaintenanceMaxDefer is how many consecutive ticks write load may postpone a due
 	// maintenance pass before it runs anyway. Negative never forces, which risks a busy server
 	// never reclaiming; 0 uses the embed default.
@@ -148,7 +152,9 @@ func DefaultServiceSettings() ServiceSettings {
 		// that has nothing to do costs three in-memory probes per tick to establish that.
 		MaintenanceInterval: 5 * time.Minute,
 		MaintenanceSweep:    30 * time.Minute,
-		MaintenanceMaxDefer: 6,
+		// Comfortably above any upload->commit gap a client takes; see AttachmentUploadGrace.
+		AttachmentUploadGrace: time.Hour,
+		MaintenanceMaxDefer:   6,
 		// Off by default: a browser-reachable control plane is a deliberate exposure decision,
 		// exactly as WSAddr is.
 		ControlAddr:  "",
@@ -205,6 +211,7 @@ type ServiceFile struct {
 	MaintenanceInterval    *string         `json:"maintenanceInterval"`
 	MaintenanceSweep       *string         `json:"maintenanceSweep"`
 	MaintenanceMaxDefer    *int            `json:"maintenanceMaxDefer"`
+	AttachmentUploadGrace  *string         `json:"attachmentUploadGrace"`
 	TLS                    *ServiceTLSFile `json:"tls"`
 	LogLevel               *string         `json:"logLevel"`
 	LogFormat              *string         `json:"logFormat"`
@@ -303,6 +310,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 			return s, err
 		}
 		if err := setDurationIf(&s.MaintenanceSweep, file.MaintenanceSweep, "maintenanceSweep"); err != nil {
+			return s, err
+		}
+		if err := setDurationIf(&s.AttachmentUploadGrace, file.AttachmentUploadGrace, "attachmentUploadGrace"); err != nil {
 			return s, err
 		}
 		if file.MaintenanceMaxDefer != nil {
@@ -424,6 +434,9 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 	if err := envDuration("KDB_MAINTENANCE_SWEEP", &s.MaintenanceSweep); err != nil {
 		return s, err
 	}
+	if err := envDuration("KDB_ATTACHMENT_UPLOAD_GRACE", &s.AttachmentUploadGrace); err != nil {
+		return s, err
+	}
 	if err := envInt("KDB_MAINTENANCE_MAX_DEFER", &s.MaintenanceMaxDefer); err != nil {
 		return s, err
 	}
@@ -482,6 +495,7 @@ func ResolveService(file *ServiceFile, lookupEnv func(string) (string, bool), fl
 		{"drain-timeout", func() { s.DrainTimeout = flags.DrainTimeout }},
 		{"maintenance-interval", func() { s.MaintenanceInterval = flags.MaintenanceInterval }},
 		{"maintenance-sweep", func() { s.MaintenanceSweep = flags.MaintenanceSweep }},
+		{"attachment-upload-grace", func() { s.AttachmentUploadGrace = flags.AttachmentUploadGrace }},
 		{"maintenance-max-defer", func() { s.MaintenanceMaxDefer = flags.MaintenanceMaxDefer }},
 		{"tls-cert", func() { s.TLSCert = flags.TLSCert }},
 		{"tls-key", func() { s.TLSKey = flags.TLSKey }},

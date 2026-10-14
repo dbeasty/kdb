@@ -547,3 +547,19 @@ func TestAVersion2PointerReadsWithoutAGrace(t *testing.T) {
 		t.Fatalf("collected %d, %v: a v2 pointer has no grace", n, err)
 	}
 }
+
+// Committed ends the hold at once, before any Collect has seen the reference: a version committed
+// and replaced between two passes is not kept for the rest of its grace.
+func TestCommittedEndsTheHold(t *testing.T) {
+	s, _, _ := newTestStore(t, Config{})
+	info, err := s.Put(bytes.NewReader(randomBytes(rand.New(rand.NewSource(10)), chunk+5)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Committed(info.Hash); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.Collect(func(codec.Hash) bool { return false }); err != nil || n != 1 {
+		t.Fatalf("collected %d, %v: a committed, since dereferenced blob", n, err)
+	}
+}

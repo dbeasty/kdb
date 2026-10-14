@@ -34,7 +34,8 @@
 // a replica's push - so a finished blob no commit references yet is not garbage. A pointer records
 // when its upload finished, and Collect keeps an unreferenced blob for Config.UploadGrace after
 // that (Hold restarts the grace for a blob a client skips uploading because the store has it). The
-// hold ends early once a Collect sees the blob referenced: from then on references alone decide.
+// hold ends early once the commit referencing the blob is durable (Committed), or a Collect sees it
+// referenced: from then on references alone decide.
 package attachstore
 
 import (
@@ -595,6 +596,21 @@ func (s *Store) Hold(h codec.Hash) (bool, error) {
 		return false, nil
 	}
 	return true, s.holdLocked(h, time.Now())
+}
+
+// Committed ends the hold on blobs a durable commit references: from here on references alone
+// decide, so a version replaced before the next Collect is not kept for the rest of its grace.
+// (Collect also ends the hold on any blob it finds referenced.)
+func (s *Store) Committed(hashes ...codec.Hash) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	for _, h := range hashes {
+		delete(s.held, h)
+	}
+	return nil
 }
 
 // holdLocked starts h's grace at now. The pointer is rewritten with the new time only once the

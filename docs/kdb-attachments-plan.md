@@ -152,14 +152,17 @@ identity = SHA-256(0x02 || be64(size) || tree)
   segments no pointer names (unfinished uploads).
 - **Upload grace.** Every writer uploads first and commits after (client API, SQL `STREAM ?`, a
   replica's push), so `Collect` keeps a finished blob no commit references yet for `UploadGrace`
-  (default one hour).
+  (default one hour; `StorageOptions.AttachmentUploadGrace` in embed, `--attachment-upload-grace` /
+  `KDB_ATTACHMENT_UPLOAD_GRACE` / `attachmentUploadGrace` on the service).
   - The finish time is in the pointer (format `KDBATP3`; `KDBATP2` still reads, with no grace), so
     the hold survives a restart between upload and commit.
   - A wire upload's `Expect` (the store already has the blob) and a re-upload of a stored blob
     restart the grace through `Store.Hold`. The pointer is rewritten only when its recorded time is
     half a grace old.
-  - The hold ends as soon as a `Collect` sees the blob referenced; references alone decide after
-    that, so a replaced version is not kept for an hour.
+  - The hold ends once the commit referencing the blob is durable (`PersistingCommitDAG` calls
+    `Store.Committed`), or a `Collect` sees it referenced; references alone decide after that, so a
+    replaced version is not kept for an hour. After a restart, a blob whose recorded finish time
+    is within the grace is held again until a `Collect` sees it referenced.
 
 ## Embed API (done)
 

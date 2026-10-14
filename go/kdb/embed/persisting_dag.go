@@ -21,6 +21,41 @@ type PersistingCommitDAG struct {
 	// not be acknowledged before the group is decided - see PersistAsync. Set and read under
 	// whatever serializes this namespace's writers, like the queue order itself.
 	barrier atomic.Pointer[TxnGroup]
+
+	// attachmentsCommitted, when set, hears every commit that puts an attachment once the commit
+	// is durable - see SetAttachmentsCommitted.
+	attachmentsCommitted atomic.Pointer[func(document.Commit)]
+}
+
+// SetAttachmentsCommitted has fn called with each commit carrying an attachment put once a wait
+// for its durability succeeds: the attachment store keeps an uploaded blob only until the commit
+// referencing it is durable (attachstore.Config.UploadGrace), and references keep it after that.
+func (d *PersistingCommitDAG) SetAttachmentsCommitted(fn func(document.Commit)) {
+	d.attachmentsCommitted.Store(&fn)
+}
+
+// afterDurable calls the attachments hook once wait succeeds, for a commit that puts one.
+func (d *PersistingCommitDAG) afterDurable(c document.Commit, wait func() error) func() error {
+	hook := d.attachmentsCommitted.Load()
+	if hook == nil || !putsAttachment(c) {
+		return wait
+	}
+	return func() error {
+		if err := wait(); err != nil {
+			return err
+		}
+		(*hook)(c)
+		return nil
+	}
+}
+
+func putsAttachment(c document.Commit) bool {
+	for _, op := range c.Operations {
+		if _, ok := op.(document.AttachmentPutOp); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // NewPersistingCommitDAG persists commits with DurabilitySync - every Persist
@@ -137,7 +172,7 @@ func (d *PersistingCommitDAG) Persist(c document.Commit) error {
 func (d *PersistingCommitDAG) PersistAsync(c document.Commit) (wait func() error, err error) {
 	// No writer at all, or DurabilityMemoryOnly: nothing is written down.
 	if d.log == nil {
-		return func() error { return nil }, nil
+		return d.afterDurable(c, func() error { return nil }), nil
 	}
 	rec, err := deltaRecordFor(c)
 	if err != nil {
@@ -147,7 +182,7 @@ func (d *PersistingCommitDAG) PersistAsync(c document.Commit) (wait func() error
 	if err != nil {
 		return nil, err
 	}
-	return chainOnBarrier(wait, d.barrier.Load(), d.log.durability == storage.DurabilitySync), nil
+	return d.afterDurable(c, chainOnBarrier(wait, d.barrier.Load(), d.log.durability == storage.DurabilitySync)), nil
 }
 
 // chainOnBarrier extends a durability wait with the decision of the group queued ahead of it.
