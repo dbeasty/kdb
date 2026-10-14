@@ -1,6 +1,5 @@
 package dev.kdb.jdbc
 
-import dev.kdb.sql.SqlParameter
 import java.sql.Connection
 import java.sql.ResultSet
 import java.sql.SQLException
@@ -22,11 +21,11 @@ open class KdbStatement(
 
     internal fun executeQuery(
         sql: String,
-        parameters: List<SqlParameter>,
+        parameters: List<KdbBinding>,
     ): ResultSet {
         checkOpen()
         val normalized = qualifyTable(sql)
-        val result = connection.blocking { connection.executeHybrid(normalized, parameters) }
+        val result = connection.blocking { connection.executeHybridBound(normalized, parameters) }
         return queryResultSet(result.result)
     }
 
@@ -46,18 +45,18 @@ open class KdbStatement(
 
     internal fun executeUpdate(
         sql: String,
-        parameters: List<SqlParameter>,
+        parameters: List<KdbBinding>,
     ): Int {
         connection.checkWritable()
         val hybridResult =
-            connection.blocking { connection.executeHybrid(qualifyTable(sql), parameters) }
+            connection.blocking { connection.executeHybridBound(qualifyTable(sql), parameters) }
         lastGeneratedKeys = hybridResult.result.generatedIds
         return hybridResult.result.rowsAffected
     }
 
     internal fun execute(
         sql: String,
-        parameters: List<SqlParameter>,
+        parameters: List<KdbBinding>,
     ): Boolean {
         val upper = sql.trimStart().uppercase()
         return if (upper.startsWith("SELECT")) {
@@ -65,7 +64,7 @@ open class KdbStatement(
             true
         } else {
             connection.checkWritable()
-            connection.blocking { connection.executeHybrid(qualifyTable(sql), parameters) }
+            connection.blocking { connection.executeHybridBound(qualifyTable(sql), parameters) }
             false
         }
     }

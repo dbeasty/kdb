@@ -16,7 +16,9 @@ internal class DefaultWireCodec(
 
     override fun encode(message: WireMessage): ByteArray {
         val type = message.header.messageType
-        if (binaryFrames && coreBinaryForm(type) || binaryFrames2 && moreBinaryForm(type)) {
+        // Attachment messages are binary whatever was agreed: they have no JSON form, and are only
+        // ever sent to a peer that negotiated them.
+        if (binaryFrames && coreBinaryForm(type) || binaryFrames2 && moreBinaryForm(type) || attachmentBinaryForm(type)) {
             val body = encodeBinaryBody(message)
             if (body != null) {
                 var tag = TAG_BINARY

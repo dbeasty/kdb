@@ -105,6 +105,30 @@ public class KdbConnection(
     override suspend fun executeHybrid(
         sql: String,
         parameters: List<SqlParameter>,
+    ): HybridQueryResult =
+        try {
+            executeEmbedded(sql, parameters)
+        } catch (e: dev.kdb.sql.SqlParseException) {
+            throw attachmentSqlRefusal(sql, e) ?: e
+        } catch (e: dev.kdb.sql.SqlPlanningException) {
+            throw attachmentSqlRefusal(sql, e) ?: e
+        }
+
+    /** The embedded engine has no attachment SQL yet: a statement using it that the engine could not
+     * parse or plan is refused as unsupported, saying why, rather than as a bare syntax error. */
+    private fun attachmentSqlRefusal(
+        sql: String,
+        cause: Exception,
+    ): SQLFeatureNotSupportedException? =
+        if (ATTACHMENT_SQL.containsMatchIn(sql)) {
+            SQLFeatureNotSupportedException("$ATTACHMENTS_NEED_NETWORK (${cause.message})", "0A000", cause)
+        } else {
+            null
+        }
+
+    private suspend fun executeEmbedded(
+        sql: String,
+        parameters: List<SqlParameter>,
     ): HybridQueryResult {
         val namespaceId = resolveNamespace(sql)
         val stmt = defaultSqlParser().parse(sql.trim())

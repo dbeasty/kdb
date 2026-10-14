@@ -82,6 +82,9 @@ internal class WireRpcClient(
             is WireMessage.TxCommit -> message.copy(header = header)
             is WireMessage.TxRollback -> message.copy(header = header)
             is WireMessage.TransactionReplay -> message.copy(header = header)
+            is WireMessage.AttachmentUpload -> message.copy(header = header)
+            is WireMessage.AttachmentGet -> message.copy(header = header)
+            is WireMessage.AttachmentList -> message.copy(header = header)
             else -> message
         }
     }

@@ -1,6 +1,7 @@
 package dev.kdb.wire
 
 import dev.kdb.codec.KdbHash
+import dev.kdb.codec.KdbUuid
 import dev.kdb.compaction.CompactionIntent
 import dev.kdb.document.KdbCommit
 import dev.kdb.document.KdbOp
@@ -50,6 +51,18 @@ public enum class WireMessageType(public val code: Short) {
     // Layer 16 Component 69 hybrid search (0x18..0x1C are Go's CommitPushAck and lock ops).
     SEARCH(0x1D),
     SEARCH_RESULT(0x1E),
+
+    // Attachments (go/kdb/wire/attachment_ops.go). Always binary bodies (tag 2); the client ones are
+    // sent only once WIRE_FEATURE_ATTACHMENTS is agreed, BLOB_FETCH only to a peer with that
+    // capability.
+    BLOB_FETCH(0x42),
+    BLOB_FETCH_RESULT(0x43),
+    ATTACHMENT_UPLOAD(0x44),
+    ATTACHMENT_UPLOAD_RESULT(0x45),
+    ATTACHMENT_GET(0x46),
+    ATTACHMENT_DATA(0x47),
+    ATTACHMENT_LIST(0x48),
+    ATTACHMENT_LIST_RESULT(0x49),
     ;
 
     public companion object {
@@ -438,6 +451,192 @@ public sealed class WireMessage {
         val namespace: String,
         val sessionId: String,
     ) : WireMessage()
+
+    // Attachments (go/kdb/wire/attachment_ops.go; field numbers in AttachmentWireBody.kt). Each is
+    // always a binary body. An absent UUID or hash is null (Go's zero value); an absent error null.
+
+    /** One chunk of a blob upload. The first has no [uploadId]; the result names the upload, and
+     * every later chunk carries it with the [offset] it starts at (the bytes received so far, so an
+     * interrupted upload resumes from the result's received). [final] finishes the upload. */
+    public class AttachmentUpload(
+        override val header: WireHeader,
+        public val namespace: String,
+        public val sessionId: String = "",
+        public val uploadId: String = "",
+        public val offset: Long = 0,
+        public val data: ByteArray = ByteArray(0),
+        public val final: Boolean = false,
+    ) : WireMessage() {
+        public fun copy(header: WireHeader): AttachmentUpload =
+            AttachmentUpload(header, namespace, sessionId, uploadId, offset, data, final)
+
+        override fun equals(other: Any?): Boolean =
+            other is AttachmentUpload && header == other.header && namespace == other.namespace &&
+                sessionId == other.sessionId && uploadId == other.uploadId && offset == other.offset &&
+                data.contentEquals(other.data) && final == other.final
+
+        override fun hashCode(): Int =
+            listOf(header, namespace, sessionId, uploadId, offset, final).hashCode() * 31 + data.contentHashCode()
+
+        override fun toString(): String =
+            "AttachmentUpload(header=$header, namespace=$namespace, sessionId=$sessionId, uploadId=$uploadId, " +
+                "offset=$offset, data=${data.size} bytes, final=$final)"
+    }
+
+    /** Answers an upload chunk: the bytes received so far and, after the final chunk, the blob's
+     * content hash and size. */
+    public data class AttachmentUploadResult(
+        override val header: WireHeader,
+        val namespace: String,
+        val uploadId: String = "",
+        val received: Long = 0,
+        val hash: KdbHash? = null,
+        val size: Long = 0,
+        val error: String? = null,
+        val errorCode: String? = null,
+    ) : WireMessage()
+
+    /** Reads one attachment of a document - by [attachmentId], or by [name] - as of [asOfHex] (empty:
+     * the session's read head), from [offset], at most [maxBytes] (0: a server default). The first
+     * page's result carries a readId that pins the version; later pages send it back. [close] (with
+     * a readId) ends a read early. */
+    public data class AttachmentGet(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String = "",
+        val docId: KdbUuid? = null,
+        val attachmentId: KdbUuid? = null,
+        val name: String = "",
+        val asOfHex: String = "",
+        val offset: Long = 0,
+        val maxBytes: Long = 0,
+        val readId: String = "",
+        val close: Boolean = false,
+    ) : WireMessage()
+
+    /** One page of an attachment. [eof] marks the last; [superseded], on the last page, says the
+     * document's attachment changed since the read began. */
+    public class AttachmentData(
+        override val header: WireHeader,
+        public val namespace: String,
+        public val readId: String = "",
+        public val docId: KdbUuid? = null,
+        public val info: WireAttachmentInfo = WireAttachmentInfo(),
+        public val commitHex: String = "",
+        public val offset: Long = 0,
+        public val data: ByteArray = ByteArray(0),
+        public val eof: Boolean = false,
+        public val superseded: Boolean = false,
+        public val error: String? = null,
+        public val errorCode: String? = null,
+    ) : WireMessage() {
+        override fun equals(other: Any?): Boolean =
+            other is AttachmentData && header == other.header && namespace == other.namespace &&
+                readId == other.readId && docId == other.docId && info == other.info &&
+                commitHex == other.commitHex && offset == other.offset && data.contentEquals(other.data) &&
+                eof == other.eof && superseded == other.superseded && error == other.error &&
+                errorCode == other.errorCode
+
+        override fun hashCode(): Int =
+            listOf(header, namespace, readId, docId, info, commitHex, offset, eof, superseded, error, errorCode)
+                .hashCode() * 31 + data.contentHashCode()
+
+        override fun toString(): String =
+            "AttachmentData(header=$header, namespace=$namespace, readId=$readId, docId=$docId, info=$info, " +
+                "commitHex=$commitHex, offset=$offset, data=${data.size} bytes, eof=$eof, superseded=$superseded, " +
+                "error=$error, errorCode=$errorCode)"
+    }
+
+    /** Lists a document's attachments as of [asOfHex] (empty: the read head). */
+    public data class AttachmentList(
+        override val header: WireHeader,
+        val namespace: String,
+        val sessionId: String = "",
+        val docId: KdbUuid? = null,
+        val asOfHex: String = "",
+    ) : WireMessage()
+
+    /** A document's attachments, sorted by name, as of [commitHex]. */
+    public data class AttachmentListResult(
+        override val header: WireHeader,
+        val namespace: String,
+        val commitHex: String = "",
+        val items: List<WireAttachmentInfo> = emptyList(),
+        val error: String? = null,
+        val errorCode: String? = null,
+    ) : WireMessage()
+
+    /** A batch of blob reads (peer sync, BLOB_FETCH 0x42). [maxBytes] bounds the result page. */
+    public data class BlobFetch(
+        override val header: WireHeader,
+        val namespace: String,
+        val entries: List<WireBlobFetchEntry> = emptyList(),
+        val maxBytes: Long = 0,
+    ) : WireMessage()
+
+    /** Answers BLOB_FETCH, parts in request order; [more] when some entry had no room. */
+    public data class BlobFetchResult(
+        override val header: WireHeader,
+        val namespace: String,
+        val parts: List<WireBlobFetchPart> = emptyList(),
+        val more: Boolean = false,
+        val error: String? = null,
+        val errorCode: String? = null,
+    ) : WireMessage()
+}
+
+/** One attachment of a document (Go's wire.AttachmentInfo). */
+public data class WireAttachmentInfo(
+    val id: KdbUuid? = null,
+    val name: String = "",
+    val hash: KdbHash? = null,
+    val size: Long = 0,
+    val mime: String = "",
+)
+
+/** Part of one attachment blob asked for by BLOB_FETCH (Go's wire.BlobFetchEntry). */
+public data class WireBlobFetchEntry(
+    val docId: KdbUuid? = null,
+    val attachmentId: KdbUuid? = null,
+    val commitHex: String = "",
+    val hash: KdbHash? = null,
+    val offset: Long = 0,
+    val maxBytes: Long = 0,
+)
+
+/** One chunk's RFC 6962 audit path: [leaf] is its index. */
+public data class WireBlobChunkProof(
+    val leaf: Long = 0,
+    val path: List<KdbHash> = emptyList(),
+)
+
+/** The answer to one BLOB_FETCH entry, by its [index] in the request (Go's wire.BlobFetchPart). */
+public class WireBlobFetchPart(
+    public val index: Int = 0,
+    public val hash: KdbHash? = null,
+    public val size: Long = 0,
+    public val tree: KdbHash? = null,
+    public val offset: Long = 0,
+    public val data: ByteArray = ByteArray(0),
+    public val chunks: List<WireBlobChunkProof> = emptyList(),
+    public val eof: Boolean = false,
+    public val superseded: Boolean = false,
+    public val error: String? = null,
+    public val errorCode: String? = null,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is WireBlobFetchPart && index == other.index && hash == other.hash && size == other.size &&
+            tree == other.tree && offset == other.offset && data.contentEquals(other.data) &&
+            chunks == other.chunks && eof == other.eof && superseded == other.superseded &&
+            error == other.error && errorCode == other.errorCode
+
+    override fun hashCode(): Int =
+        listOf(index, hash, size, tree, offset, chunks, eof, superseded, error, errorCode).hashCode() * 31 +
+            data.contentHashCode()
+
+    override fun toString(): String =
+        "WireBlobFetchPart(index=$index, hash=$hash, size=$size, tree=$tree, offset=$offset, " +
+            "data=${data.size} bytes, chunks=$chunks, eof=$eof, superseded=$superseded, error=$error, errorCode=$errorCode)"
 }
 
 public interface WireCodec {
@@ -473,6 +672,9 @@ public object SqlCellKind {
     public const val DOUBLE: Int = 3
     public const val BOOL: Int = 4
     public const val JSON: Int = 5
+
+    /** Binary (an attachment's bytes, an X'..' literal): the row string is standard base64. */
+    public const val BYTES: Int = 6
 }
 
 public interface HandshakeNegotiator {
