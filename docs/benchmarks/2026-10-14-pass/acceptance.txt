@@ -1,0 +1,16 @@
+    memory_profile_test.go:148: PHASE open       liveHeap=6.4MB rss=32.0MB peakRSS=40.2MB mapped=927.2MB | took=282ms peakHeapDuringOpen=10.3MB
+    memory_profile_test.go:184: PHASE reads      liveHeap=125.4MB rss=1683.3MB peakRSS=1715.7MB mapped=1401.3MB | 200000 point reads in 36.343s, heap after open 6.4MB, peakHeapDuringReads=316.2MB
+    memory_profile_test.go:207: PHASE fullread   liveHeap=57.9MB rss=1759.7MB peakRSS=1759.7MB mapped=1401.3MB | 10000000 reads in 4m13.516s; heap after open 6.4MB, after full read 57.9MB (+5 B/doc); forced GC after open 230µs (mark CPU 340µs), after full read 2.81ms (mark CPU 5.33ms); GC CPU during the pass 2128 ms of 4046494 ms
+    memory_profile_test.go:234: PHASE writes     liveHeap=88.2MB rss=556.7MB peakRSS=556.7MB mapped=906.7MB | 20000 updates in 5.618s, heap after open 6.4MB, peakHeapDuringWrites=140.7MB
+    memory_profile_test.go:261: PHASE checkpoint liveHeap=9.8MB rss=84.0MB peakRSS=230.0MB mapped=0.0MB | close+checkpoint took 4.498s, allocated 40.2MB, peakHeapDuringClose=50.5MB
+    snapshot_scale_test.go:70: seeded 10000000 documents in 10000 commits in 3m39.802s
+    snapshot_scale_test.go:116: snapshot    10000000   2874.0 MiB       531  15716.1 MiB            -  94179.8 MiB   3776.2 MiB         19ms 34m23.605s
+namespace on disk: 3358 MB; budget (a quarter, at least 256 MB): 839 MB
+phase          peak heap    live heap     peak RSS  verdict
+open              10.3 MB        6.4 MB       40.2 MB  ok
+reads            316.2 MB      125.4 MB     1715.7 MB  ok
+fullread          57.9 MB       57.9 MB     1759.7 MB  ok
+writes           140.7 MB       88.2 MB      556.7 MB  ok
+checkpoint        50.5 MB        9.8 MB      230.0 MB  ok
+bootstrap      15716.1 MB          -             -     OVER (both nodes)
+FAIL: at least one phase's peak heap is over the budget
