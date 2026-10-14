@@ -1,8 +1,10 @@
 package io
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
@@ -380,6 +382,29 @@ func (f *FileBackedPlatformIO) ReadSnapshot(key string) ([]byte, error) {
 
 func (f *FileBackedPlatformIO) WriteSnapshot(key string, data []byte) error {
 	return f.store.WriteSnapshot(key, data)
+}
+
+// WriteSnapshotStream implements storage.SnapshotStreamer when the store underneath can stream;
+// otherwise it buffers the contents and writes them whole.
+func (f *FileBackedPlatformIO) WriteSnapshotStream(key string, write func(w io.Writer) error) error {
+	if ss, ok := f.store.(interface {
+		WriteSnapshotStream(string, func(io.Writer) error) error
+	}); ok {
+		return ss.WriteSnapshotStream(key, write)
+	}
+	var buf bytes.Buffer
+	if err := write(&buf); err != nil {
+		return err
+	}
+	return f.store.WriteSnapshot(key, buf.Bytes())
+}
+
+// LocalSnapshotPath implements storage.SnapshotStreamer for a store with local files.
+func (f *FileBackedPlatformIO) LocalSnapshotPath(key string) (string, bool) {
+	if lp, ok := f.store.(interface{ LocalSnapshotPath(string) (string, bool) }); ok {
+		return lp.LocalSnapshotPath(key)
+	}
+	return "", false
 }
 
 func (f *FileBackedPlatformIO) DeleteSnapshot(key string) error {

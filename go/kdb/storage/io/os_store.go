@@ -1,6 +1,7 @@
 package io
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -582,6 +583,22 @@ func (s *OSByteStore) ReadSnapshot(key string) ([]byte, error) {
 // while it was only ever a cache the log could rebuild, and not once it can be the only record
 // of state (a namespace bootstrapped from a peer's snapshot), where a torn write would lose it.
 func (s *OSByteStore) WriteSnapshot(key string, data []byte) error {
+	return s.WriteSnapshotStream(key, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// LocalSnapshotPath is where key's snapshot file is, for a reader that maps it instead of reading
+// it into the heap (an embed checkpoint's tree section). ok is always true here.
+func (s *OSByteStore) LocalSnapshotPath(key string) (string, bool) {
+	return s.snapPathFor(key), true
+}
+
+// WriteSnapshotStream is WriteSnapshot with the contents written by write, through a buffer,
+// instead of held in memory whole: the same temp file, fsync and rename, so a crash leaves the
+// previous contents or the new ones, never a mix.
+func (s *OSByteStore) WriteSnapshotStream(key string, write func(w io.Writer) error) error {
 	p := s.snapPathFor(key)
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -591,7 +608,12 @@ func (s *OSByteStore) WriteSnapshot(key string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if _, err := tmp.Write(data); err != nil {
+	bw := bufio.NewWriterSize(tmp, 1<<20)
+	err = write(bw)
+	if err == nil {
+		err = bw.Flush()
+	}
+	if err != nil {
 		tmp.Close()
 		fsx.Remove(tmp.Name())
 		return err

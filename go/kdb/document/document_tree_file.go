@@ -1163,6 +1163,16 @@ func (t DocumentTree) Paged() (bound, mapped bool) {
 	return t.trie.slab.file.Load() != nil, t.trie.root&refFile != 0
 }
 
+// OpenTreeDigest maps the segment SaveTreeSegmentDigest tagged with digest, holding entries
+// documents, when f has it: an open from a checkpoint that records its tree's digest needs none of
+// the tree's bytes then. false means the caller builds the tree from its packed image instead.
+func OpenTreeDigest(digest [32]byte, entries int, f *TreeFile) (DocumentTree, bool) {
+	if f == nil || entries == 0 {
+		return DocumentTree{}, false
+	}
+	return f.attachDigest(digest, entries)
+}
+
 // OpenTreePacked is BuildTrieDocumentTreePacked for a namespace with a tree file: it maps the
 // segment written for exactly this packed image if there is one, and otherwise builds a segment
 // from the image straight to the file. On any failure it builds in the heap, bound to f.
@@ -1386,6 +1396,12 @@ func BindTreeFile(t DocumentTree, f *TreeFile) DocumentTree {
 // exactly t is on disk and tagged with the image's digest, so the next open maps it (and the
 // chain under it) instead of building anything. A no-op for a tree not bound to a writable file.
 func SaveTreeSegment(t DocumentTree, packed []byte) error {
+	return SaveTreeSegmentDigest(t, sha256.Sum256(packed))
+}
+
+// SaveTreeSegmentDigest is SaveTreeSegment for a caller that has the packed image's digest but not
+// the image: a checkpoint that streams its tree section (embed checkpoint v6).
+func SaveTreeSegmentDigest(t DocumentTree, digest [32]byte) error {
 	h := t.trie
 	if h == nil || h.root == 0 {
 		return nil
@@ -1394,7 +1410,6 @@ func SaveTreeSegment(t DocumentTree, packed []byte) error {
 	if f == nil || !f.writable() {
 		return nil
 	}
-	digest := sha256.Sum256(packed)
 	s := h.slab
 	var g *treeSegment
 	if h.root&refFile != 0 {
