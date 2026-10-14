@@ -87,7 +87,7 @@ type V2Host struct {
 	// peerAttachments: the peer understands attachments (SyncCapAttachments). A peer that does not
 	// cannot decode a commit that carries them, and is refused one (attachments.go).
 	peerAttachments bool
-	granted  map[string]bool
+	granted         map[string]bool
 	// access is each granted namespace's direction limit: "" both, wire.AccessPull or AccessPush.
 	access map[string]string
 	peer   string
