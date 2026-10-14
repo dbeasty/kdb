@@ -51,7 +51,21 @@ internal class TrieNode(
     val children: Array<TrieNode?>? = null,
 )
 
-internal class TrieLeaf(val uuid: KdbUuid, val hash: KdbHash)
+/**
+ * Also the entry DocumentTree's map view hands out, so iterating a tree allocates nothing per
+ * entry. equals/hashCode follow the Map.Entry contract, so a tree's entries compare equal to a
+ * plain map's.
+ */
+internal class TrieLeaf(val uuid: KdbUuid, val hash: KdbHash) : Map.Entry<KdbUuid, KdbHash> {
+    override val key: KdbUuid get() = uuid
+    override val value: KdbHash get() = hash
+
+    override fun equals(other: Any?): Boolean = other is Map.Entry<*, *> && other.key == uuid && other.value == hash
+
+    override fun hashCode(): Int = uuid.hashCode() xor hash.hashCode()
+
+    override fun toString(): String = "$uuid=$hash"
+}
 
 private fun uuidBytes(id: KdbUuid): ByteArray {
     val out = ByteArray(16)
@@ -220,6 +234,85 @@ private fun trieDeleteAt(node: TrieNode?, ub: ByteArray, id: KdbUuid, depth: Int
         return newLeafNode(uuidBytes(onlyLeaf.uuid), onlyLeaf.uuid, onlyLeaf.hash, depth)
     }
     return TrieNode(hash = internalHash(children), children = children)
+}
+
+/** The nibble of [id] at [depth], read straight from its halves rather than a byte copy. */
+private fun nibbleOf(id: KdbUuid, depth: Int): Int {
+    val half = if (depth < 16) id.msb else id.lsb
+    return ((half ushr (60 - 4 * (depth % 16))) and 0xf).toInt()
+}
+
+/**
+ * The content hash [root] holds for [id], or null. Read-only, so unlike insert/delete it has no
+ * Go counterpart to keep in step: it only follows the path the hashing code built.
+ */
+internal fun trieGet(root: TrieNode?, id: KdbUuid): KdbHash? {
+    var node = root
+    var depth = 0
+    while (node != null) {
+        val leaf = node.leaf
+        if (leaf != null) return if (leaf.uuid == id) leaf.hash else null
+        val children = node.children ?: return null
+        if (depth == TRIE_DEPTH) return null
+        node = children[nibbleOf(id, depth)]
+        depth++
+    }
+    return null
+}
+
+/** Every leaf beneath [root], in nibble order, which is UUID byte (and canonical string) order. */
+internal class TrieLeafIterator(root: TrieNode?) : Iterator<TrieLeaf> {
+    // Internal nodes on the current path, each with the next child slot to visit.
+    private val nodes = ArrayList<TrieNode>()
+    private val slots = ArrayList<Int>()
+    private var next: TrieLeaf? = null
+
+    init {
+        if (root != null) descend(root)
+    }
+
+    private fun descend(start: TrieNode) {
+        val leaf = start.leaf
+        if (leaf != null) {
+            next = leaf
+            return
+        }
+        nodes.add(start)
+        slots.add(0)
+        advance()
+    }
+
+    private fun advance() {
+        next = null
+        while (nodes.isNotEmpty()) {
+            val top = nodes.size - 1
+            val children = nodes[top].children
+            var i = slots[top]
+            while (children != null && i < children.size && children[i] == null) i++
+            if (children == null || i >= children.size) {
+                nodes.removeAt(top)
+                slots.removeAt(top)
+                continue
+            }
+            slots[top] = i + 1
+            val child = children[i]!!
+            val leaf = child.leaf
+            if (leaf != null) {
+                next = leaf
+                return
+            }
+            nodes.add(child)
+            slots.add(0)
+        }
+    }
+
+    override fun hasNext(): Boolean = next != null
+
+    override fun next(): TrieLeaf {
+        val out = next ?: throw NoSuchElementException()
+        advance()
+        return out
+    }
 }
 
 /** Constructs a trie from scratch (O(n)); see trieBuild's Go counterpart. */
